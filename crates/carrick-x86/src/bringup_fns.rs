@@ -219,12 +219,32 @@ pub fn plan_windows(image: &AddressSpace, layout: BringupLayout) -> Result<Windo
     });
     crate::fault::add_fault_windows(&mut regions, layout);
 
-    Ok(WindowPlan { regions })
+    // Carry the images' read-only page spans so `build_pml4` can re-apply the
+    // per-segment write protection the merged regions escalated away. Clamp
+    // below the null guard (those pages were skipped above).
+    let ro_spans = image
+        .ro_spans()
+        .iter()
+        .filter_map(|span| {
+            let end = span.start.checked_add(span.len)?;
+            let start = span.start.max(LINUX_NULL_GUARD_END);
+            (end > start).then_some(carrick_mem::elf::RoSpan {
+                start,
+                len: end - start,
+                exec: span.exec,
+            })
+        })
+        .collect();
+
+    Ok(WindowPlan { regions, ro_spans })
 }
 
 /// Build the x86-64 4-level page-table image (CR3 = `layout.pml4_base`) for the
 /// plan. All mappings are identity (VA == GPA). The kernel-only regions are
-/// supervisor-only; user regions carry per-segment W/X bits.
+/// supervisor-only; user regions carry per-REGION W/X bits, then the images'
+/// read-only page spans (`plan.ro_spans`) are re-applied over the built tables
+/// so `.text`/`.rodata` leaves lose R/W (a guest store #PFs with PFEC.P=1 →
+/// SEGV_ACCERR) — the merged regions escalated writability away.
 pub fn build_pml4(plan: &WindowPlan, layout: BringupLayout) -> Result<Vec<u8>, TrapError> {
     let mut maps: Vec<Pml4MapSpec> = Vec::with_capacity(plan.regions.len());
     for r in &plan.regions {
@@ -243,12 +263,30 @@ pub fn build_pml4(plan: &WindowPlan, layout: BringupLayout) -> Result<Vec<u8>, T
             exec: r.exec,
         });
     }
-    pml4_tables(
+    let bytes = pml4_tables(
         &maps,
         layout.pml4_base,
         crate::vmm::X86_PML4_CAPACITY as usize,
     )
-    .map_err(|e| TrapError::Hypervisor(format!("carrick-x86: pml4_tables: {e:?}")))
+    .map_err(|e| TrapError::Hypervisor(format!("carrick-x86: pml4_tables: {e:?}")))?;
+    if plan.ro_spans.is_empty() {
+        return Ok(bytes);
+    }
+    // Same editor the runtime `protect_range` path uses, so a later guest
+    // `mprotect` composes with these edits (2 MiB leaves split on demand; the
+    // sequential table allocator is re-discovered by `Pml4Manager::new`).
+    let mut mgr = carrick_mem::pml4::Pml4Manager::new(bytes, layout.pml4_base);
+    for span in &plan.ro_spans {
+        let Ok(len) = usize::try_from(span.len) else {
+            continue;
+        };
+        // Best-effort per span: a span the plan's windows do not map
+        // (BadAddress) is skipped — protection is an upgrade and must never
+        // block bring-up; a skipped span degrades to the historical
+        // (writable) behaviour.
+        let _ = mgr.set_readonly(span.start, len, span.exec);
+    }
+    Ok(mgr.into_bytes())
 }
 
 // ─── program_longmode_entry ──────────────────────────────────────────────────
@@ -865,6 +903,42 @@ mod tests {
             "last byte of the mmap arena must be mapped"
         );
         assert_eq!(mgr.translate(arena_end), None);
+    }
+
+    #[test]
+    fn build_pml4_applies_image_ro_spans_to_leaves() {
+        use carrick_mem::pml4::{PML4_NX, PML4_P, PML4_RW, walk_descriptors};
+
+        // The synthetic image's single LOAD is R+X at 0x400000: plan_windows
+        // must carry that page as an ro_span, and build_pml4 must clear R/W on
+        // its leaf (keeping it present + executable) while the merged region's
+        // OTHER pages keep the escalated writable mapping — a guest store to
+        // its own .text/.rodata #PFs (PFEC.P=1 → SEGV_ACCERR) as on Linux.
+        let image = synthetic_x86_image();
+        let layout = test_layout();
+        let plan = plan_windows(&image, layout).expect("window plan");
+        assert!(
+            plan.ro_spans
+                .iter()
+                .any(|s| s.start == 0x400000 && s.len == 0x1000 && s.exec),
+            "plan carries the image's read-only span: {:?}",
+            plan.ro_spans
+        );
+
+        let bytes = build_pml4(&plan, layout).expect("build PML4");
+        let ro_leaf = walk_descriptors(&bytes, layout.pml4_base, 0x400000)[3];
+        assert_ne!(ro_leaf & PML4_P, 0, "RO leaf stays present");
+        assert_eq!(ro_leaf & PML4_RW, 0, "RO leaf loses R/W");
+        assert_eq!(ro_leaf & PML4_NX, 0, "exec span keeps the leaf executable");
+
+        // The heap window (writable region, no span) keeps R/W.
+        let heap_walk = walk_descriptors(&bytes, layout.pml4_base, LINUX_HEAP_BASE);
+        let heap_leaf = if heap_walk[3] != 0 {
+            heap_walk[3]
+        } else {
+            heap_walk[2] // 2 MiB PS leaf
+        };
+        assert_ne!(heap_leaf & PML4_RW, 0, "heap leaf stays writable");
     }
 
     #[test]

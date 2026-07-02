@@ -111,6 +111,27 @@ pub fn walk_descriptors(bytes: &[u8], base: u64, va: u64) -> [u64; 4] {
     out
 }
 
+/// Reconstruct the spare-pool bump cursor from an existing table image: one
+/// past the LAST non-zero spare page. The pristine boot image has an all-zero
+/// spare tail (cursor = `SPARE_START_OFFSET`, the historical constant), but the
+/// boot-time ELF read-only-span pass now allocates spare sub-tables BEFORE the
+/// runtime manager is (lazily) built from the live backing — resetting the
+/// cursor over those live tables would re-hand them out and corrupt the walk.
+/// Taking one-past-the-LAST non-zero page (not the first all-zero page) also
+/// treats any zeroed hole as used — safe (wasted at worst), never re-issued.
+fn discover_next_free_spare(bytes: &[u8]) -> u64 {
+    let mut next = SPARE_START_OFFSET;
+    let mut off = SPARE_START_OFFSET;
+    while (off + PT_PAGE) as usize <= bytes.len() {
+        let page = &bytes[off as usize..(off + PT_PAGE) as usize];
+        if page.iter().any(|&b| b != 0) {
+            next = off + PT_PAGE;
+        }
+        off += PT_PAGE;
+    }
+    next
+}
+
 /// Mutable editor over a copy of the page-table region bytes.
 ///
 /// `Clone` is used by `fork`: the child needs its OWN manager (it gets a
@@ -144,10 +165,11 @@ pub struct PageTableManager {
 
 impl PageTableManager {
     pub fn new(bytes: Vec<u8>, base: u64) -> Self {
+        let next_free = discover_next_free_spare(&bytes);
         Self {
             bytes,
             base,
-            next_free: SPARE_START_OFFSET,
+            next_free,
             free_tables: Vec::new(),
             multi_vcpu: false,
             dirty: Vec::new(),
@@ -179,7 +201,9 @@ impl PageTableManager {
         }
     }
 
-    #[cfg(test)]
+    /// Consume the manager, returning the (possibly edited) table-region bytes.
+    /// Used by the boot-time ELF read-only-span pass, which edits the pristine
+    /// `stage1_identity_page_tables` image before it is mapped into the guest.
     pub fn into_bytes(self) -> Vec<u8> {
         self.bytes
     }
@@ -583,7 +607,33 @@ impl PageTableManager {
             } else if block_start >= va && block_end <= end {
                 // The whole covering block is inside the range and needs the
                 // change: edit it in place at this level (no split).
-                self.write_desc(off, Self::desc_for(op, block_start, level));
+                //
+                // Protection edits are IN PLACE (flip VALID/AP/UXN, keep the
+                // descriptor's output address and remaining attributes). For
+                // identity pages this is bit-identical to rebuilding from the
+                // VA; for a NON-identity leaf — a `map_aliased` alias (e.g. a
+                // PROT_NONE `MAP_SHARED` file mapping) or a `repoint_private`
+                // private-overlay leaf — it preserves the recorded IPA instead
+                // of clobbering it with a meaningless identity PA (which would
+                // silently repoint a private overlay back at the SHARED page).
+                // Only a never-populated descriptor (0: no address recorded)
+                // is rebuilt from the identity VA, preserving the historical
+                // arena behaviour.
+                let new_desc = match op {
+                    PtOp::Invalidate => desc & !VALID,
+                    PtOp::ReadOnly { exec } | PtOp::ReadWrite { exec } if desc != 0 => {
+                        let ap = match op {
+                            PtOp::ReadOnly { .. } => AP_RO,
+                            _ => AP_RW,
+                        };
+                        let uxn = if exec { 0 } else { UXN };
+                        (desc & !AP_MASK & !UXN) | ap | uxn | VALID
+                    }
+                    PtOp::ReadOnly { .. } | PtOp::ReadWrite { .. } => {
+                        Self::desc_for(op, block_start, level)
+                    }
+                };
+                self.write_desc(off, new_desc);
                 changed = true;
                 cur = block_end;
             } else {
@@ -1289,5 +1339,36 @@ mod tests {
         let bytes = mgr.into_bytes();
         let mut mgr2 = PageTableManager::new(bytes, LINUX_PAGE_TABLES_BASE);
         assert!(!mgr2.is_valid(va), "edit survived round-trip through bytes");
+    }
+
+    #[test]
+    fn new_rediscovers_bump_cursor_over_boot_edited_tables() {
+        // The boot ELF read-only-span pass edits the pristine image (splitting
+        // blocks -> allocating spare tables) BEFORE the runtime manager is
+        // lazily rebuilt from the live backing. The rebuilt manager must
+        // re-discover the bump cursor instead of resetting it — a reset would
+        // re-hand-out the live sub-tables and corrupt the walk.
+        let mut boot = manager();
+        boot.set_multi_vcpu(true); // the boot pass suppresses coalescing
+        let ro_va = 0x40_0000; // image-shaped low VA inside a 2 MiB boot block
+        boot.set_readonly(ro_va, 0x2000, true)
+            .expect("boot RO span");
+        let (used, _, _) = boot.pool_stats();
+        assert!(used >= 1, "boot edit allocated spare table(s)");
+
+        let mut rebuilt = PageTableManager::new(boot.into_bytes(), LINUX_PAGE_TABLES_BASE);
+        let (rebuilt_used, _, _) = rebuilt.pool_stats();
+        assert_eq!(rebuilt_used, used, "cursor re-discovered, not reset");
+        // The boot edit is visible and intact through the rebuilt manager.
+        assert_eq!(rebuilt.ap_bits(ro_va), AP_RO);
+        assert_eq!(rebuilt.ap_bits(ro_va + 0x2000), AP_RW, "past the span");
+        // A new split allocates a FRESH page (cursor really advanced past the
+        // boot-allocated tables) and must not clobber the boot edit.
+        rebuilt
+            .set_prot_none(LINUX_MMAP_BASE + 0x10_0000, 0x1000)
+            .expect("fresh split");
+        let (after, _, _) = rebuilt.pool_stats();
+        assert!(after > rebuilt_used, "fresh table allocated");
+        assert_eq!(rebuilt.ap_bits(ro_va), AP_RO, "boot edit survives");
     }
 }

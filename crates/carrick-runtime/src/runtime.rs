@@ -1118,9 +1118,15 @@ where
                 len,
                 payload,
                 file,
+                prot_none,
             } => {
                 // Back a dynamic high-VA mmap; complete with the VA.
                 runtime.map_host_alias(va, ipa, len, &payload, file)?;
+                if prot_none && let Ok(l) = usize::try_from(len) {
+                    // Guest-inaccessible PROT_NONE alias (see the threaded
+                    // loop's arm): invalidate the fresh leaves best-effort.
+                    let _ = runtime.protect_range(va.raw(), l, 0);
+                }
                 runtime.complete_syscall(va.raw() as i64)?;
                 last_syscall_retval = Some(va.raw() as i64);
             }
