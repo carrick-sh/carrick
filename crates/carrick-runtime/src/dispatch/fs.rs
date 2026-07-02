@@ -2367,15 +2367,19 @@ impl SyscallDispatcher {
     /// the SIGIO, deliver nothing — when the owner's ns id has no host mapping
     /// (`host_target == None`), matching the `kill(2)` path's ESRCH intent: a
     /// translation MISS must NOT fall back to the raw ns value reinterpreted as a
-    /// host pid, which would signal an unrelated process. `Some((target,
-    /// tid_required))` feeds `bootstrap_signal_send_as`; a negative `target` is a
-    /// process group (`F_OWNER_PGRP`).
-    fn fasync_signal_target(owner_type: i32, host_target: Option<u32>) -> Option<(i64, bool)> {
+    /// host pid, which would signal an unrelated process. The `Some` target feeds
+    /// `bootstrap_signal_send_as`: `F_OWNER_PGRP` is a HOST process group,
+    /// `F_OWNER_TID` a HOST thread, anything else the owner's HOST pid.
+    fn fasync_signal_target(
+        owner_type: i32,
+        host_target: Option<u32>,
+    ) -> Option<crate::dispatch::signal::SignalTarget> {
+        use crate::dispatch::signal::SignalTarget;
         let host = host_target?;
         Some(match owner_type {
-            LINUX_F_OWNER_PGRP => (-(host as i64), false),
-            LINUX_F_OWNER_TID => (host as i64, true),
-            _ => (host as i64, false),
+            LINUX_F_OWNER_PGRP => SignalTarget::HostProcessGroup(HostPid(host)),
+            LINUX_F_OWNER_TID => SignalTarget::HostThread(HostPid(host)),
+            _ => SignalTarget::HostProcess(HostPid(host)),
         })
     }
 
@@ -2411,30 +2415,24 @@ impl SyscallDispatcher {
             owner.sig
         };
         // owner_pid is the F_SETOWN value as the guest set it (a PID-namespace id
-        // from the owner's getpid()); bootstrap_signal_send_as wants a HOST pid
-        // (it compares against the host pid for self-detection), so translate
-        // ns -> host exactly as the guest kill(2) path does. Under an active PID
-        // namespace the owner's ns-pid (e.g. fcntl31's 2) is NOT its host pid, so
-        // sending the raw ns id delivered the SIGIO to the wrong process.
+        // from the owner's getpid()); bootstrap_signal_send_as wants a HOST-domain
+        // target (it compares against the host pid for self-detection), so
+        // translate ns -> host exactly as the guest kill(2) path does. Under an
+        // active PID namespace the owner's ns-pid (e.g. fcntl31's 2) is NOT its
+        // host pid, so sending the raw ns id delivered the SIGIO to the wrong
+        // process.
         let ns = owner.owner_pid as u32;
         let host_target = match owner.owner_type {
             LINUX_F_OWNER_PGRP => crate::namespace::pid::ns_to_host_pgid(ns),
             _ => crate::namespace::pid::ns_to_host_or_self(ns),
         };
-        let Some((target, tid_required)) =
-            Self::fasync_signal_target(owner.owner_type, host_target)
-        else {
+        let Some(target) = Self::fasync_signal_target(owner.owner_type, host_target) else {
             // No host target for this ns owner → drop (no wrong-target signal).
             return;
         };
         // caller_euid = None: kernel-internal I/O-signal delivery is not gated by
         // the writer's euid (it is the kernel sending on the owner's behalf).
-        let _ = crate::dispatch::signal::bootstrap_signal_send_as(
-            target,
-            tid_required,
-            signum as u64,
-            None,
-        );
+        let _ = crate::dispatch::signal::bootstrap_signal_send_as(target, signum as u64, None);
     }
 
     /// True iff `fd` refers to a pipe / socket / character device — kinds with
@@ -9471,21 +9469,22 @@ mod tests {
 
     #[test]
     fn fasync_signal_target_resolves_by_owner_kind() {
+        use crate::dispatch::signal::SignalTarget;
         // A successful translation routes by owner kind: PID (and the default)
-        // target that pid with no tid requirement; TID targets that tid
-        // (tid_required); PGRP targets the NEGATED pgid (a process-group target
-        // for bootstrap_signal_send_as).
+        // target that host pid; TID targets that host tid; PGRP targets the
+        // host process group (bootstrap_signal_send_as reconstructs the
+        // kill(2) negated-pgid encoding).
         assert_eq!(
             SyscallDispatcher::fasync_signal_target(LINUX_F_OWNER_PID, Some(42)),
-            Some((42, false))
+            Some(SignalTarget::HostProcess(HostPid(42)))
         );
         assert_eq!(
             SyscallDispatcher::fasync_signal_target(LINUX_F_OWNER_TID, Some(42)),
-            Some((42, true))
+            Some(SignalTarget::HostThread(HostPid(42)))
         );
         assert_eq!(
             SyscallDispatcher::fasync_signal_target(LINUX_F_OWNER_PGRP, Some(7)),
-            Some((-7, false))
+            Some(SignalTarget::HostProcessGroup(HostPid(7)))
         );
     }
 
