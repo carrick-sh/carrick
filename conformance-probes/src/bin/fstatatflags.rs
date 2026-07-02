@@ -15,7 +15,9 @@ fn main() {
     // mkdir EEXIST, ignored).
     mkdir("/tmp", 0o777);
 
-    let path = "/tmp/p";
+    // run-probe.sh decodes and executes the probe itself as /tmp/p; use a
+    // distinct data path so Linux does not reject O_TRUNC with ETXTBSY.
+    let path = "/tmp/fstatatflags-seed";
     if !seed_file(path) {
         println!("seed=ERR:{}", errno());
         return;
