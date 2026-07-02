@@ -41,6 +41,7 @@
 use crate::fs_backend::{
     FsBackend, MemoryBackend, OverlayEntry, OverlayEntryKind, SharedFileContents,
 };
+use crate::linux_abi::LinuxErrno;
 use crate::linux_abi::{
     LINUX_EACCES, LINUX_EEXIST, LINUX_EFBIG, LINUX_EINVAL, LINUX_EISDIR, LINUX_ENOENT,
     LINUX_ENOTDIR, LINUX_ENOTEMPTY, LINUX_EROFS,
@@ -195,7 +196,7 @@ impl RootFsVfs {
         want_excl: bool,
         want_trunc: bool,
         writable_request: bool,
-    ) -> Result<OpenDispatchResult, i32> {
+    ) -> Result<OpenDispatchResult, LinuxErrno> {
         if !(want_create && want_excl)
             && let Some(entry) = self.overlay.shared_file_entry(path, want_trunc)
         {

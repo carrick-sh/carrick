@@ -42,6 +42,7 @@
 //! cannot be lost (Go's `netpollBreak` depends on this). The in-memory state is
 //! the source of truth; the host pipe is the wakeup channel.
 
+use crate::linux_abi::LinuxErrno;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
@@ -540,7 +541,7 @@ impl FileContents {
         }
     }
 
-    pub(super) fn write_at(&mut self, offset: usize, bytes: &[u8]) -> Result<(), i32> {
+    pub(super) fn write_at(&mut self, offset: usize, bytes: &[u8]) -> Result<(), LinuxErrno> {
         let end = offset.checked_add(bytes.len()).ok_or(LINUX_EFBIG)?;
         if end as u64 > crate::vfs::MAX_IN_MEMORY_FILE_SIZE {
             return Err(crate::linux_abi::LINUX_EFBIG);
@@ -582,7 +583,7 @@ fn insert_dirty_range(
     dirty: &mut BTreeMap<usize, Vec<u8>>,
     offset: usize,
     bytes: &[u8],
-) -> Result<(), i32> {
+) -> Result<(), LinuxErrno> {
     if bytes.is_empty() {
         return Ok(());
     }

@@ -487,9 +487,7 @@ pub mod runtime {
                     runtime.complete_syscall(value)?;
                 }
                 DispatchOutcome::Errno { errno } => {
-                    runtime.complete_syscall(
-                        crate::linux_abi::LinuxErrno::new(errno).guest_retval(),
-                    )?;
+                    runtime.complete_syscall(errno.guest_retval())?;
                 }
                 DispatchOutcome::Exit { code } => {
                     return Ok(RunResult {
@@ -734,7 +732,7 @@ pub mod runtime {
         waiter: &mut crate::io_wait::ThreadWaiter,
     ) -> Result<DispatchOutcome, RuntimeError> {
         use crate::io_wait::{WaitFd, WaitResult};
-        const EINTR: i32 = crate::linux_abi::LINUX_EINTR;
+        const EINTR: crate::linux_abi::LinuxErrno = crate::linux_abi::LINUX_EINTR;
         let mut poll_deadline: Option<std::time::Instant> = None;
         loop {
             // `dispatch` returns `DispatchError`, absorbed via `#[from]`.
@@ -1427,8 +1425,10 @@ pub(crate) const fn syscall_shim_enabled() -> bool {
 pub use carrick_host_bsd::bsd_to_linux_errno as host_to_linux_errno;
 
 #[cfg(feature = "platform-linux")]
-pub fn host_to_linux_errno(host: i32) -> i32 {
-    host
+pub fn host_to_linux_errno(host: i32) -> carrick_abi::LinuxErrno {
+    // On a Linux host the host errno space already IS the Linux errno space —
+    // the identity translation just enters the typed domain.
+    carrick_abi::LinuxErrno::new(host)
 }
 
 #[cfg(any(
@@ -1734,7 +1734,7 @@ pub mod host_signal {
     feature = "platform-netbsd"
 ))]
 pub mod io_wait {
-    use carrick_abi::SigBlockMask;
+    use carrick_abi::{LinuxErrno, SigBlockMask};
     use std::os::fd::RawFd;
     use std::time::{Duration, Instant};
 
@@ -1773,7 +1773,7 @@ pub mod io_wait {
         Ready,
         TimedOut,
         Interrupted,
-        Errno(i32),
+        Errno(LinuxErrno),
     }
 
     /// The Linux per-thread blocking-I/O waiter (Phase C). Where the macOS

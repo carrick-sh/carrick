@@ -6,6 +6,7 @@
 //! platform); they are re-exported here for existing call sites.
 //! Free functions reached via `use super::*`.
 use super::*;
+use crate::linux_abi::LinuxErrno;
 
 pub(crate) fn load_execve_image(
     dispatcher: &SyscallDispatcher,
@@ -15,7 +16,7 @@ pub(crate) fn load_execve_image(
     // interpreters are pushed as their UTF-8 bytes.
     argv: Vec<Vec<u8>>,
     env: Vec<Vec<u8>>,
-) -> Result<AddressSpace, i32> {
+) -> Result<AddressSpace, LinuxErrno> {
     use crate::linux_abi::LINUX_ENOENT;
     let argv = if argv.is_empty() {
         vec![path.as_bytes().to_vec()]

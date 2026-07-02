@@ -17,13 +17,13 @@ impl SyscallDispatcher {
         if mode & !(LINUX_R_OK | LINUX_W_OK | LINUX_X_OK) != 0
             || !linux_access_flags_are_supported(flags)
         {
-            return Ok(LINUX_EINVAL.into());
+            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
         }
 
         let path = read_guest_c_string(memory, pathname)?;
         if path.is_empty() {
             if flags & LINUX_AT_EMPTY_PATH == 0 {
-                return Ok(LINUX_ENOENT.into());
+                return Ok(DispatchOutcome::errno(LINUX_ENOENT));
             }
             if dirfd == LINUX_AT_FDCWD {
                 let cwd = self.io.cwd.read().clone();
@@ -132,7 +132,12 @@ impl SyscallDispatcher {
     /// DAC for `open(2)` on `--fs host`. `access` is the O_ACCMODE bits;
     /// `want_create` is set for O_CREAT. Returns `Some(errno)` to deny.
     /// Root bypasses (so we short-circuit when euid==0).
-    pub(super) fn dac_open_check(&self, path: &str, access: u64, want_create: bool) -> Option<i32> {
+    pub(super) fn dac_open_check(
+        &self,
+        path: &str,
+        access: u64,
+        want_create: bool,
+    ) -> Option<LinuxErrno> {
         let creds = self.cred_snapshot();
         if creds.euid == 0 {
             return None;
@@ -190,7 +195,7 @@ impl SyscallDispatcher {
 
     /// Verify the caller has search (X) permission on every ancestor directory
     /// of `path`. Returns `Some(EACCES)` on the first non-searchable parent.
-    fn dac_ancestors_searchable(&self, path: &str, uid: u32, gid: u32) -> Option<i32> {
+    fn dac_ancestors_searchable(&self, path: &str, uid: u32, gid: u32) -> Option<LinuxErrno> {
         let p = std::path::Path::new(path);
         // ancestors() yields the path itself first; skip it — we only gate the
         // parent directories.

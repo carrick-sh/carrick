@@ -32,7 +32,6 @@ use crate::linux_abi::{
 };
 use zerocopy::{FromBytes, IntoBytes};
 
-const EINVAL: i32 = 22;
 const U32: u32 = 4;
 const SUPPORTED_SETUP_FLAGS: u32 = 0;
 
@@ -149,6 +148,15 @@ enum AsyncOutcome {
     Block(i32, i16),
 }
 
+/// An errno in the io_uring CQE `res` field: the CQE result is the Linux
+/// syscall retval domain narrowed to the wire's `i32` — negative errno on
+/// failure. Routes through THE negation choke point
+/// ([`LinuxErrno::guest_retval`]); the narrowing cast is lossless (errnos are
+/// 1..=4095).
+fn cqe_err(e: crate::linux_abi::LinuxErrno) -> i32 {
+    e.guest_retval() as i32
+}
+
 /// Opcodes serviced via the kqueue/ThreadWaiter readiness path (SEND/RECV on
 /// sockets, POLL_ADD) — they may need to wait, so the enter loop routes them
 /// through `try_async_op` rather than the synchronous `io_uring_run_op`.
@@ -203,7 +211,7 @@ pub(crate) fn complete_sqe(
     let res = match sqe.opcode {
         LINUX_IORING_OP_NOP => 0,
         op if opcode_serviced(op) => io(sqe),
-        _ => -EINVAL,
+        _ => cqe_err(LINUX_EINVAL),
     };
     LinuxIoUringCqe {
         user_data: sqe.user_data,
@@ -452,7 +460,7 @@ impl SyscallDispatcher {
                     }
                 },
                 Some(sqe) => self.io_uring_run_op(memory, sqe),
-                None => -LINUX_EFAULT,
+                None => cqe_err(LINUX_EFAULT),
             };
             let cqe = LinuxIoUringCqe {
                 user_data: sqe.map(|s| s.user_data).unwrap_or(0),
@@ -483,7 +491,7 @@ impl SyscallDispatcher {
             LINUX_IORING_OP_NOP => 0,
             LINUX_IORING_OP_READ => {
                 let Some(hfd) = self.regular_host_file_fd(sqe.fd) else {
-                    return -LINUX_EINVAL;
+                    return cqe_err(LINUX_EINVAL);
                 };
                 let len = sqe.len as usize;
                 let mut buf = vec![0u8; len];
@@ -499,23 +507,23 @@ impl SyscallDispatcher {
                     Ok(got) => {
                         let got = got as usize;
                         if memory.write_bytes(sqe.addr, &buf[..got]).is_err() {
-                            return -LINUX_EFAULT;
+                            return cqe_err(LINUX_EFAULT);
                         }
                         got as i32
                     }
-                    Err(e) => -e,
+                    Err(e) => cqe_err(e),
                 }
             }
             LINUX_IORING_OP_WRITE => {
                 let Some(hfd) = self.regular_host_file_write_fd(sqe.fd) else {
                     return if self.regular_host_file_fd(sqe.fd).is_some() {
-                        -LINUX_EBADF
+                        cqe_err(LINUX_EBADF)
                     } else {
-                        -LINUX_EINVAL
+                        cqe_err(LINUX_EINVAL)
                     };
                 };
                 let Ok(buf) = memory.read_bytes(sqe.addr, sqe.len as usize) else {
-                    return -LINUX_EFAULT;
+                    return cqe_err(LINUX_EFAULT);
                 };
                 let n = unsafe {
                     libc::pwrite(
@@ -527,15 +535,15 @@ impl SyscallDispatcher {
                 };
                 match n.host_syscall_errno() {
                     Ok(put) => put as i32,
-                    Err(e) => -e,
+                    Err(e) => cqe_err(e),
                 }
             }
             LINUX_IORING_OP_READV => {
                 let Some(hfd) = self.regular_host_file_fd(sqe.fd) else {
-                    return -LINUX_EINVAL;
+                    return cqe_err(LINUX_EINVAL);
                 };
                 let Some(iovs) = read_iovecs(memory, sqe.addr, sqe.len as usize) else {
-                    return -LINUX_EFAULT;
+                    return cqe_err(LINUX_EFAULT);
                 };
                 let total: usize = iovs.iter().map(|v| v.iov_len as usize).sum();
                 let mut buf = vec![0u8; total];
@@ -552,27 +560,27 @@ impl SyscallDispatcher {
                         let got = got as usize;
                         // Scatter the bytes read across the iovecs in order.
                         if scatter_to_iovecs(memory, &iovs, &buf[..got]).is_err() {
-                            return -LINUX_EFAULT;
+                            return cqe_err(LINUX_EFAULT);
                         }
                         got as i32
                     }
-                    Err(e) => -e,
+                    Err(e) => cqe_err(e),
                 }
             }
             LINUX_IORING_OP_WRITEV => {
                 let Some(hfd) = self.regular_host_file_write_fd(sqe.fd) else {
                     return if self.regular_host_file_fd(sqe.fd).is_some() {
-                        -LINUX_EBADF
+                        cqe_err(LINUX_EBADF)
                     } else {
-                        -LINUX_EINVAL
+                        cqe_err(LINUX_EINVAL)
                     };
                 };
                 let Some(iovs) = read_iovecs(memory, sqe.addr, sqe.len as usize) else {
-                    return -LINUX_EFAULT;
+                    return cqe_err(LINUX_EFAULT);
                 };
                 // Gather the iovecs into one buffer, then a single pwrite.
                 let Ok(buf) = gather_iovecs(memory, &iovs) else {
-                    return -LINUX_EFAULT;
+                    return cqe_err(LINUX_EFAULT);
                 };
                 let n = unsafe {
                     libc::pwrite(
@@ -584,16 +592,16 @@ impl SyscallDispatcher {
                 };
                 match n.host_syscall_errno() {
                     Ok(put) => put as i32,
-                    Err(e) => -e,
+                    Err(e) => cqe_err(e),
                 }
             }
             LINUX_IORING_OP_FSYNC => {
                 let Some(hfd) = self.regular_host_file_fd(sqe.fd) else {
-                    return -LINUX_EINVAL;
+                    return cqe_err(LINUX_EINVAL);
                 };
                 match unsafe { libc::fsync(hfd.get()) }.host_syscall_errno() {
                     Ok(_) => 0,
-                    Err(e) => -e,
+                    Err(e) => cqe_err(e),
                 }
             }
             LINUX_IORING_OP_CLOSE => {
@@ -611,10 +619,10 @@ impl SyscallDispatcher {
                         self.io.io_uring_instances.write().remove(&sqe.fd);
                         0
                     }
-                    None => -LINUX_EBADF,
+                    None => cqe_err(LINUX_EBADF),
                 }
             }
-            _ => -LINUX_EINVAL,
+            _ => cqe_err(LINUX_EINVAL),
         }
     }
 
@@ -626,7 +634,7 @@ impl SyscallDispatcher {
         match sqe.opcode {
             LINUX_IORING_OP_RECV => {
                 let Some(hfd) = self.host_socket_fd(sqe.fd) else {
-                    return AsyncOutcome::Ready(-LINUX_EINVAL);
+                    return AsyncOutcome::Ready(cqe_err(LINUX_EINVAL));
                 };
                 let len = sqe.len as usize;
                 let mut buf = vec![0u8; len];
@@ -642,20 +650,20 @@ impl SyscallDispatcher {
                     Ok(got) => {
                         let got = got as usize;
                         if memory.write_bytes(sqe.addr, &buf[..got]).is_err() {
-                            return AsyncOutcome::Ready(-LINUX_EFAULT);
+                            return AsyncOutcome::Ready(cqe_err(LINUX_EFAULT));
                         }
                         AsyncOutcome::Ready(got as i32)
                     }
                     Err(e) if e == LINUX_EAGAIN => AsyncOutcome::Block(hfd.get(), libc::POLLIN),
-                    Err(e) => AsyncOutcome::Ready(-e),
+                    Err(e) => AsyncOutcome::Ready(cqe_err(e)),
                 }
             }
             LINUX_IORING_OP_SEND => {
                 let Some(hfd) = self.host_socket_fd(sqe.fd) else {
-                    return AsyncOutcome::Ready(-LINUX_EINVAL);
+                    return AsyncOutcome::Ready(cqe_err(LINUX_EINVAL));
                 };
                 let Ok(buf) = memory.read_bytes(sqe.addr, sqe.len as usize) else {
-                    return AsyncOutcome::Ready(-LINUX_EFAULT);
+                    return AsyncOutcome::Ready(cqe_err(LINUX_EFAULT));
                 };
                 let n = unsafe {
                     libc::send(
@@ -668,15 +676,15 @@ impl SyscallDispatcher {
                 match n.host_syscall_errno() {
                     Ok(put) => AsyncOutcome::Ready(put as i32),
                     Err(e) if e == LINUX_EAGAIN => AsyncOutcome::Block(hfd.get(), libc::POLLOUT),
-                    Err(e) => AsyncOutcome::Ready(-e),
+                    Err(e) => AsyncOutcome::Ready(cqe_err(e)),
                 }
             }
             LINUX_IORING_OP_RECVMSG => {
                 let Some(hfd) = self.host_socket_fd(sqe.fd) else {
-                    return AsyncOutcome::Ready(-LINUX_EINVAL);
+                    return AsyncOutcome::Ready(cqe_err(LINUX_EINVAL));
                 };
                 let Some(iovs) = read_msghdr_iovecs(memory, sqe.addr) else {
-                    return AsyncOutcome::Ready(-LINUX_EFAULT);
+                    return AsyncOutcome::Ready(cqe_err(LINUX_EFAULT));
                 };
                 let total: usize = iovs.iter().map(|v| v.iov_len as usize).sum();
                 let mut buf = vec![0u8; total];
@@ -692,23 +700,23 @@ impl SyscallDispatcher {
                     Ok(got) => {
                         let got = got as usize;
                         if scatter_to_iovecs(memory, &iovs, &buf[..got]).is_err() {
-                            return AsyncOutcome::Ready(-LINUX_EFAULT);
+                            return AsyncOutcome::Ready(cqe_err(LINUX_EFAULT));
                         }
                         AsyncOutcome::Ready(got as i32)
                     }
                     Err(e) if e == LINUX_EAGAIN => AsyncOutcome::Block(hfd.get(), libc::POLLIN),
-                    Err(e) => AsyncOutcome::Ready(-e),
+                    Err(e) => AsyncOutcome::Ready(cqe_err(e)),
                 }
             }
             LINUX_IORING_OP_SENDMSG => {
                 let Some(hfd) = self.host_socket_fd(sqe.fd) else {
-                    return AsyncOutcome::Ready(-LINUX_EINVAL);
+                    return AsyncOutcome::Ready(cqe_err(LINUX_EINVAL));
                 };
                 let Some(iovs) = read_msghdr_iovecs(memory, sqe.addr) else {
-                    return AsyncOutcome::Ready(-LINUX_EFAULT);
+                    return AsyncOutcome::Ready(cqe_err(LINUX_EFAULT));
                 };
                 let Ok(buf) = gather_iovecs(memory, &iovs) else {
-                    return AsyncOutcome::Ready(-LINUX_EFAULT);
+                    return AsyncOutcome::Ready(cqe_err(LINUX_EFAULT));
                 };
                 let n = unsafe {
                     libc::send(
@@ -721,7 +729,7 @@ impl SyscallDispatcher {
                 match n.host_syscall_errno() {
                     Ok(put) => AsyncOutcome::Ready(put as i32),
                     Err(e) if e == LINUX_EAGAIN => AsyncOutcome::Block(hfd.get(), libc::POLLOUT),
-                    Err(e) => AsyncOutcome::Ready(-e),
+                    Err(e) => AsyncOutcome::Ready(cqe_err(e)),
                 }
             }
             LINUX_IORING_OP_ACCEPT => {
@@ -741,15 +749,15 @@ impl SyscallDispatcher {
                     DispatchOutcome::Errno { errno } if errno == LINUX_EAGAIN => {
                         match self.host_socket_fd(sqe.fd) {
                             Some(h) => AsyncOutcome::Block(h.get(), libc::POLLIN),
-                            None => AsyncOutcome::Ready(-LINUX_EINVAL),
+                            None => AsyncOutcome::Ready(cqe_err(LINUX_EINVAL)),
                         }
                     }
-                    DispatchOutcome::Errno { errno } => AsyncOutcome::Ready(-errno),
+                    DispatchOutcome::Errno { errno } => AsyncOutcome::Ready(cqe_err(errno)),
                     DispatchOutcome::WaitOnFds { fds, .. } => match fds.first() {
                         Some((h, e)) => AsyncOutcome::Block(h, e),
-                        None => AsyncOutcome::Ready(-LINUX_EAGAIN),
+                        None => AsyncOutcome::Ready(cqe_err(LINUX_EAGAIN)),
                     },
-                    _ => AsyncOutcome::Ready(-LINUX_EINVAL),
+                    _ => AsyncOutcome::Ready(cqe_err(LINUX_EINVAL)),
                 }
             }
             LINUX_IORING_OP_CONNECT => {
@@ -757,12 +765,12 @@ impl SyscallDispatcher {
                 // POLLOUT while in progress; we map its outcome to the ring.
                 match self.connect_common(sqe.fd, sqe.addr, sqe.off as u32, memory) {
                     DispatchOutcome::Returned { value } => AsyncOutcome::Ready(value as i32),
-                    DispatchOutcome::Errno { errno } => AsyncOutcome::Ready(-errno),
+                    DispatchOutcome::Errno { errno } => AsyncOutcome::Ready(cqe_err(errno)),
                     DispatchOutcome::WaitOnFds { fds, .. } => match fds.first() {
                         Some((h, e)) => AsyncOutcome::Block(h, e),
-                        None => AsyncOutcome::Ready(-LINUX_EINVAL),
+                        None => AsyncOutcome::Ready(cqe_err(LINUX_EINVAL)),
                     },
-                    _ => AsyncOutcome::Ready(-LINUX_EINVAL),
+                    _ => AsyncOutcome::Ready(cqe_err(LINUX_EINVAL)),
                 }
             }
             LINUX_IORING_OP_POLL_ADD => {
@@ -770,7 +778,7 @@ impl SyscallDispatcher {
                     .host_socket_fd(sqe.fd)
                     .or_else(|| self.regular_host_file_fd(sqe.fd))
                 else {
-                    return AsyncOutcome::Ready(-LINUX_EINVAL);
+                    return AsyncOutcome::Ready(cqe_err(LINUX_EINVAL));
                 };
                 let want = (sqe.op_flags & 0xFFFF) as i16;
                 let mut pfd = libc::pollfd {
@@ -784,7 +792,7 @@ impl SyscallDispatcher {
                     AsyncOutcome::Block(hfd.get(), want)
                 }
             }
-            _ => AsyncOutcome::Ready(-LINUX_EINVAL),
+            _ => AsyncOutcome::Ready(cqe_err(LINUX_EINVAL)),
         }
     }
 }
@@ -860,7 +868,7 @@ mod tests {
         let c = complete_sqe(&sqe(200, 0x11), |_| {
             panic!("unknown opcode must not call io")
         });
-        assert_eq!(c.res, -EINVAL);
+        assert_eq!(c.res, cqe_err(LINUX_EINVAL));
         assert_eq!(c.user_data, 0x11);
     }
 

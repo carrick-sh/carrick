@@ -181,7 +181,9 @@ fn closing_ptmx_master_removes_pts_entry() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 2 },
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(2)
+        },
         "/dev/pts/0 must be ENOENT after master close"
     );
 }

@@ -158,7 +158,7 @@ fn mmap_anonymous_reservations_fit_in_runtime_arena() {
 
 #[test]
 fn mmap_rejects_unknown_map_flag_bits() {
-    const LINUX_EINVAL: i32 = 22;
+    const LINUX_EINVAL: LinuxErrno = LinuxErrno::new(22);
     let mut memory = AddressSpace::from_segments(
         0,
         [(LINUX_MMAP_BASE, rwx_perms(), Vec::new(), LINUX_MMAP_SIZE)],
@@ -396,7 +396,9 @@ fn mm_lock_msync_mincore_stubs_validate_args_and_succeed() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 22 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(22)
+        }
     );
     assert_eq!(
         dispatcher
@@ -409,7 +411,9 @@ fn mm_lock_msync_mincore_stubs_validate_args_and_succeed() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 12 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(12)
+        }
     );
 
     assert_eq!(
@@ -454,7 +458,9 @@ fn mm_lock_msync_mincore_stubs_validate_args_and_succeed() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 22 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(22)
+        }
     );
     assert_eq!(
         dispatcher
@@ -544,7 +550,9 @@ fn mremap_bootstrap_accepts_shrinking_and_rejects_growth_with_enomem() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 12 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(12)
+        }
     );
     assert_eq!(
         dispatcher
@@ -557,7 +565,9 @@ fn mremap_bootstrap_accepts_shrinking_and_rejects_growth_with_enomem() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 22 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(22)
+        }
     );
     assert_eq!(
         dispatcher
@@ -570,7 +580,9 @@ fn mremap_bootstrap_accepts_shrinking_and_rejects_growth_with_enomem() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 22 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(22)
+        }
     );
     assert_eq!(
         dispatcher
@@ -583,7 +595,9 @@ fn mremap_bootstrap_accepts_shrinking_and_rejects_growth_with_enomem() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 22 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(22)
+        }
     );
 
     assert!(reporter.finish().unhandled_syscalls.is_empty());
@@ -693,7 +707,9 @@ fn madvise_accepts_common_advice_for_mapped_ranges() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 22 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(22)
+        }
     );
     assert_eq!(
         dispatcher
@@ -706,7 +722,9 @@ fn madvise_accepts_common_advice_for_mapped_ranges() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 22 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(22)
+        }
     );
     assert_eq!(
         dispatcher
@@ -719,7 +737,9 @@ fn madvise_accepts_common_advice_for_mapped_ranges() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 12 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(12)
+        }
     );
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }

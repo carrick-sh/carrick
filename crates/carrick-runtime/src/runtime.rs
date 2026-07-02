@@ -937,7 +937,7 @@ where
             | DispatchOutcome::WaitOnProcExit { .. }
             | DispatchOutcome::WaitOnSignals { .. }
             | DispatchOutcome::WaitOnSleep { .. } => {
-                let value = LinuxErrno::new(crate::linux_abi::LINUX_EINTR).guest_retval();
+                let value = crate::linux_abi::LINUX_EINTR.guest_retval();
                 runtime.complete_syscall(value)?;
                 last_syscall_retval = Some(value);
             }
@@ -973,7 +973,7 @@ where
                 last_syscall_retval = Some(value);
             }
             DispatchOutcome::Errno { errno } => {
-                let value = LinuxErrno::new(errno).guest_retval();
+                let value = errno.guest_retval();
                 runtime.complete_syscall(value)?;
                 last_syscall_retval = Some(value);
             }
@@ -1083,7 +1083,7 @@ where
                         stop_after_traced_exec(&dispatcher);
                     }
                     Err(errno) => {
-                        let value = LinuxErrno::new(errno).guest_retval();
+                        let value = errno.guest_retval();
                         runtime.complete_syscall(value)?;
                         last_syscall_retval = Some(value);
                     }
@@ -1156,7 +1156,7 @@ where
                 // `dispatch_threaded` path (run_vcpu_until_exit). The
                 // single-threaded loops here always pass `thread: None`, so
                 // the dispatcher never produces them.
-                let value = LinuxErrno::new(crate::linux_abi::LINUX_ENOSYS).guest_retval();
+                let value = crate::linux_abi::LINUX_ENOSYS.guest_retval();
                 runtime.complete_syscall(value)?;
                 last_syscall_retval = Some(value);
             }
@@ -1171,8 +1171,8 @@ where
             // Docker oracle to localise a divergence (wrong errno) or the last
             // syscall before a hang (no return line printed).
             if let Some(e) = LinuxErrno::from_guest_retval(ret) {
-                let e = e.get() as u32;
                 let ename = crate::linux_abi::errno_name(e).unwrap_or("?");
+                let e = e.get();
                 eprintln!("trap#{traps}:   -> errno={e} ({ename})");
             } else {
                 eprintln!("trap#{traps}:   -> ret={ret:#x} ({ret})");
@@ -1568,13 +1568,13 @@ fn shared_futex_wait(
             || crate::fork_quiesce::is_quiescing()
             || crate::fork_quiesce::exec_replacing_other_thread(this_tid)
         {
-            return LinuxErrno::new(crate::linux_abi::LINUX_EINTR).guest_retval();
+            return crate::linux_abi::LINUX_EINTR.guest_retval();
         }
         let slice_us: u32 = match deadline {
             Some(dl) => {
                 let now = std::time::Instant::now();
                 if now >= dl {
-                    return LinuxErrno::new(crate::linux_abi::LINUX_ETIMEDOUT).guest_retval();
+                    return crate::linux_abi::LINUX_ETIMEDOUT.guest_retval();
                 }
                 u32::try_from((dl - now).as_micros().min(20_000)).unwrap_or(20_000)
             }
@@ -1700,7 +1700,7 @@ pub(crate) fn maybe_redirect_to_rosetta<A: AsRef<[u8]>>(
     // argv items are opaque bytes (Linux ABI); accept String (initial entry)
     // or Vec<u8> (execve) and always return the byte form.
     argv: &[A],
-) -> Option<Result<RosettaRedirect, i32>> {
+) -> Option<Result<RosettaRedirect, LinuxErrno>> {
     use crate::linux_abi::LINUX_ENOENT;
 
     // Consult the binfmt_misc registry (magic/mask). A native (aarch64) or
@@ -1757,7 +1757,8 @@ fn rosetta_argv(target_path: &str, orig_argv: &[Vec<u8>]) -> Vec<Vec<u8>> {
 /// Build the `RuntimeError` for "this is an x86_64 binary but Rosetta 2 is not
 /// available on the host" — surfaced from the initial-load call sites (the
 /// execve path returns the bare `-errno` instead).
-fn rosetta_unavailable(errno: i32, path: &str) -> RuntimeError {
+fn rosetta_unavailable(errno: LinuxErrno, path: &str) -> RuntimeError {
+    let errno = errno.get();
     RuntimeError::FsBackend(anyhow::anyhow!(
         "{path}: x86_64 binary requires Apple Rosetta 2 at {ROSETTA_INTERPRETER} \
          (errno {errno}); is Rosetta installed for Linux? \

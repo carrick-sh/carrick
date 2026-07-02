@@ -79,13 +79,13 @@ pub fn shared_wait_sliced(
     let deadline = timeout.map(|d| Instant::now() + d);
     loop {
         if interrupted() {
-            return -i64::from(LINUX_EINTR);
+            return LINUX_EINTR.guest_retval();
         }
         let slice_ns: i64 = match deadline {
             Some(dl) => {
                 let now = Instant::now();
                 if now >= dl {
-                    return -i64::from(LINUX_ETIMEDOUT);
+                    return LINUX_ETIMEDOUT.guest_retval();
                 }
                 i64::try_from((dl - now).as_nanos())
                     .unwrap_or(SHARED_FUTEX_MAX_SLICE_NS)

@@ -232,7 +232,7 @@ where
             self.kicker.kick(target);
             0
         } else {
-            LinuxErrno::new(crate::linux_abi::LINUX_ESRCH).guest_retval()
+            crate::linux_abi::LINUX_ESRCH.guest_retval()
         };
         self.complete_returned(engine, retval)
     }
@@ -318,8 +318,7 @@ where
             // syscall that returned EINTR, restart it instead of surfacing the
             // EINTR.
             let restart_syscall = interrupted_pc.is_none()
-                && last_syscall_retval
-                    == Some(LinuxErrno::new(crate::linux_abi::LINUX_EINTR).guest_retval())
+                && last_syscall_retval == Some(crate::linux_abi::LINUX_EINTR.guest_retval())
                 && action.sa_flags & crate::linux_abi::LINUX_SA_RESTART != 0
                 && trap.last_syscall_nr().is_some_and(is_restartable_syscall);
             // Wire form for the sigframe build (see the synchronous-fault arm).

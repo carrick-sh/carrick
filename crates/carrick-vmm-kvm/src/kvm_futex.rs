@@ -294,7 +294,7 @@ mod tests {
         );
         assert_eq!(
             r,
-            -i64::from(LINUX_ETIMEDOUT),
+            LINUX_ETIMEDOUT.guest_retval(),
             "shared_wait with no waker must time out with -ETIMEDOUT"
         );
     }
@@ -310,7 +310,7 @@ mod tests {
         let r = futex.shared_wait(word, 0, Some(Duration::from_secs(5)), &|| true);
         assert_eq!(
             r,
-            -i64::from(LINUX_EINTR),
+            LINUX_EINTR.guest_retval(),
             "shared_wait must return -EINTR when the predicate is set"
         );
     }

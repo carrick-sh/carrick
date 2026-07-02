@@ -49,6 +49,7 @@
 //!     process delivery uses `libc::kill` with the host signal number.
 
 use super::*;
+use crate::linux_abi::LinuxErrno;
 use std::path::PathBuf;
 
 syscall_table! {
@@ -145,7 +146,7 @@ fn ensure_dir() {
 /// Validate a guest mqueue name and map it to a backing-file path. The name must
 /// start with `/`, contain no other `/`, be non-empty after the slash, and be at
 /// most `NAME_MAX` chars (mq_overview(7)). Returns `Err(errno)` otherwise.
-fn name_to_path(name: &str) -> Result<PathBuf, i32> {
+fn name_to_path(name: &str) -> Result<PathBuf, LinuxErrno> {
     // The mq_open(2) SYSCALL receives the queue name with the leading '/' already
     // stripped by the C library (glibc/musl validate the leading slash in the
     // mq_open(3) wrapper, then pass name+1 to the syscall — the kernel keys the
@@ -172,7 +173,7 @@ struct MqLock {
 impl MqLock {
     /// Open `path` O_RDWR and take an `F_OFD_SETLKW` write lock over the whole
     /// file (l_start=0, l_len=0 means "to EOF and beyond"). Blocks until granted.
-    fn acquire(path: &str) -> Result<Self, i32> {
+    fn acquire(path: &str) -> Result<Self, LinuxErrno> {
         let cpath = std::ffi::CString::new(path.as_bytes()).map_err(|_| LINUX_EINVAL)?;
         let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDWR) }.host_syscall_errno()?;
         let mut fl: libc::flock = unsafe { core::mem::zeroed() };
@@ -204,7 +205,7 @@ impl MqLock {
     }
 
     /// pread the whole backing file under the lock.
-    fn read_all(&self, size: usize) -> Result<Vec<u8>, i32> {
+    fn read_all(&self, size: usize) -> Result<Vec<u8>, LinuxErrno> {
         let mut buf = vec![0u8; size];
         let mut done = 0usize;
         while done < size {
@@ -226,7 +227,7 @@ impl MqLock {
     }
 
     /// pwrite a range back into the backing file under the lock.
-    fn write_at(&self, off: usize, bytes: &[u8]) -> Result<(), i32> {
+    fn write_at(&self, off: usize, bytes: &[u8]) -> Result<(), LinuxErrno> {
         let mut done = 0usize;
         while done < bytes.len() {
             let n = unsafe {
@@ -293,7 +294,7 @@ struct MqFd {
 impl SyscallDispatcher {
     /// Pull the Mqueue description for `fd`, or `Err(EBADF)` if `fd` is not an
     /// open message-queue descriptor.
-    fn mq_fd(&self, fd: i32) -> Result<MqFd, i32> {
+    fn mq_fd(&self, fd: i32) -> Result<MqFd, LinuxErrno> {
         let open_file = self.open_file(fd).ok_or(LINUX_EBADF)?;
         let open = open_file.description.read();
         match &*open {
@@ -780,7 +781,10 @@ fn mq_wait_interrupted(this: &SyscallDispatcher, tid: crate::thread::ThreadId) -
 /// negative `tv_sec`, a negative `tv_nsec`, or an out-of-range `tv_nsec` is
 /// EINVAL (mq_timedsend01/mq_timedreceive01 entries 10/11/12). Returns the
 /// deadline as a wall-clock `(secs, nsecs)`, or `None` for "no timeout".
-fn read_abs_deadline(memory: &impl GuestMemory, addr: u64) -> Result<Option<(i64, i64)>, i32> {
+fn read_abs_deadline(
+    memory: &impl GuestMemory,
+    addr: u64,
+) -> Result<Option<(i64, i64)>, LinuxErrno> {
     if addr == 0 {
         return Ok(None);
     }
@@ -807,7 +811,7 @@ fn deadline_expired(deadline: Option<(i64, i64)>) -> bool {
 /// Try to enqueue one message. Returns `Ok(true)` if enqueued, `Ok(false)` if
 /// the queue is full, `Err(errno)` on a host/file error. Fires a one-shot
 /// `mq_notify` registration on the empty→non-empty transition.
-fn mq_try_send(mq: &MqFd, prio: u32, payload: &[u8]) -> Result<bool, i32> {
+fn mq_try_send(mq: &MqFd, prio: u32, payload: &[u8]) -> Result<bool, LinuxErrno> {
     let lock = MqLock::acquire(&mq.path)?;
     let size = file_size(mq.max_msg, mq.msg_size);
     let mut buf = lock.read_all(size)?;
@@ -889,7 +893,7 @@ fn mq_try_send(mq: &MqFd, prio: u32, payload: &[u8]) -> Result<bool, i32> {
 
 /// Try to dequeue the highest-priority (FIFO-within-priority) message. Returns
 /// `Ok(Some((prio, payload)))`, `Ok(None)` if empty, `Err(errno)` on error.
-fn mq_try_receive(mq: &MqFd) -> Result<Option<(u32, Vec<u8>)>, i32> {
+fn mq_try_receive(mq: &MqFd) -> Result<Option<(u32, Vec<u8>)>, LinuxErrno> {
     let lock = MqLock::acquire(&mq.path)?;
     let size = file_size(mq.max_msg, mq.msg_size);
     let mut buf = lock.read_all(size)?;
@@ -947,7 +951,7 @@ fn mq_try_receive(mq: &MqFd) -> Result<Option<(u32, Vec<u8>)>, i32> {
 /// Clear `pid`'s notify registration (mq_notify(NULL)). A no-op if a different
 /// pid (or no one) is registered — Linux's mq_notify(NULL) only removes the
 /// CALLER's registration.
-fn mq_clear_notify(mq: &MqFd, pid: i32) -> Result<(), i32> {
+fn mq_clear_notify(mq: &MqFd, pid: i32) -> Result<(), LinuxErrno> {
     let lock = MqLock::acquire(&mq.path)?;
     let size = file_size(mq.max_msg, mq.msg_size);
     let mut buf = lock.read_all(size)?;
@@ -965,7 +969,12 @@ fn mq_clear_notify(mq: &MqFd, pid: i32) -> Result<(), i32> {
 
 /// Register `pid`'s one-shot notify (mq_notify(non-NULL)). EBUSY if a DIFFERENT
 /// pid is already registered (mq_notify(3)).
-fn mq_register_notify(mq: &MqFd, pid: i32, sigev_notify: i32, signo: i32) -> Result<(), i32> {
+fn mq_register_notify(
+    mq: &MqFd,
+    pid: i32,
+    sigev_notify: i32,
+    signo: i32,
+) -> Result<(), LinuxErrno> {
     let lock = MqLock::acquire(&mq.path)?;
     let size = file_size(mq.max_msg, mq.msg_size);
     let mut buf = lock.read_all(size)?;

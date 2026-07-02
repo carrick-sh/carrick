@@ -3,6 +3,7 @@
 //! symlink-following canonicalization across the rootfs layers. Pure
 //! `impl SyscallDispatcher` move.
 use super::*;
+use crate::linux_abi::LinuxErrno;
 
 impl SyscallDispatcher {
     /// Layered "is this a directory?" probe used by mkdirat / openat
@@ -30,7 +31,7 @@ impl SyscallDispatcher {
     /// Layered metadata probe. Mirrors the rootfs-or-synthetic chain
     /// used by stat / faccessat sites, but consults the overlay first
     /// and respects deletions.
-    pub(crate) fn layered_metadata(&self, path: &str) -> Result<RootFsMetadata, i32> {
+    pub(crate) fn layered_metadata(&self, path: &str) -> Result<RootFsMetadata, LinuxErrno> {
         use crate::vfs::Vfs as _;
         // Consult the VFS mounts (/dev, /dev/pts, /proc, /sys) FIRST so stat of
         // /dev/ptmx, /dev/pts/N, /dev/tty, and synthetic /proc /sys paths
@@ -86,7 +87,7 @@ impl SyscallDispatcher {
     /// cross-mount symlink they can't follow gets misclassified as a plain
     /// File.) Mounts answer for their subtree; otherwise the overlay-aware
     /// `lookup_nofollow` does.
-    pub(crate) fn layered_lstat(&self, path: &str) -> Result<RootFsMetadata, i32> {
+    pub(crate) fn layered_lstat(&self, path: &str) -> Result<RootFsMetadata, LinuxErrno> {
         if let Some(m) = self.fs.vfs_mounts.resolve(path)
             && let Ok(md) = m.vfs.lookup_nofollow(&m.full_path)
         {
@@ -98,7 +99,7 @@ impl SyscallDispatcher {
             .map(|md| vfs_md_to_rootfs_md(path, &md))
     }
 
-    pub(super) fn canonicalize_following(&self, path: &str) -> Result<String, i32> {
+    pub(super) fn canonicalize_following(&self, path: &str) -> Result<String, LinuxErrno> {
         let mut cur = path.to_string();
         for _ in 0..40 {
             let md = self.layered_lstat(&cur)?;
@@ -129,7 +130,10 @@ impl SyscallDispatcher {
     /// overwrite of a broken symlink as a file). Only the O_CREAT path uses this;
     /// a plain open still gets ENOENT for a broken symlink via
     /// `canonicalize_following`.
-    pub(super) fn canonicalize_following_allow_missing(&self, path: &str) -> Result<String, i32> {
+    pub(super) fn canonicalize_following_allow_missing(
+        &self,
+        path: &str,
+    ) -> Result<String, LinuxErrno> {
         let mut cur = path.to_string();
         for _ in 0..40 {
             let md = match self.layered_lstat(&cur) {

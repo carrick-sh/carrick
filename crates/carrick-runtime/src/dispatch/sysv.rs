@@ -29,6 +29,7 @@
 //!     orthogonal subsystems; the same file-backed approach would work.
 
 use super::*;
+use crate::linux_abi::LinuxErrno;
 
 syscall_table! {
     /// Per-module syscall routing for the `sysv` subsystem (Task A1).
@@ -275,7 +276,7 @@ pub(super) fn shmget_open(
     key: i32,
     size: usize,
     flags: u64,
-) -> Result<i32, i32> {
+) -> Result<i32, LinuxErrno> {
     SysvShmState::ensure_dir();
 
     let mode = (flags & 0o7777) as u32;
@@ -358,7 +359,10 @@ pub(super) fn shmget_open(
 
 /// Open the backing file for `shmid` and return a host fd suitable for
 /// mmap(MAP_SHARED). Caller owns the fd. On error returns `Err(linux_errno)`.
-pub(super) fn shmat_open_fd(state: &mut SysvShmState, shmid: i32) -> Result<(i32, usize), i32> {
+pub(super) fn shmat_open_fd(
+    state: &mut SysvShmState,
+    shmid: i32,
+) -> Result<(i32, usize), LinuxErrno> {
     let segment = state
         .segments
         .get(&shmid)
@@ -372,7 +376,7 @@ pub(super) fn shmat_open_fd(state: &mut SysvShmState, shmid: i32) -> Result<(i32
 
 /// Unlink the backing file for `shmid`. Existing mmaps remain valid (Linux
 /// semantics). The shmid is invalidated for future attaches.
-pub(super) fn shmctl_rmid(state: &mut SysvShmState, shmid: i32) -> Result<(), i32> {
+pub(super) fn shmctl_rmid(state: &mut SysvShmState, shmid: i32) -> Result<(), LinuxErrno> {
     let segment = state
         .segments
         .remove(&shmid)
@@ -464,7 +468,7 @@ impl SyscallDispatcher {
             // be flushed on arm64, so an alias IPA must never be reused).
             let Some(ipa) = crate::memory::alloc_alias_ipa(map_len) else {
                 unsafe { libc::close(host_fd) };
-                return Ok(LINUX_ENOMEM.into());
+                return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
             };
             let va = crate::memory::LINUX_HIGH_VA_THRESHOLD
                 + (ipa - crate::memory::LINUX_ALIAS_IPA_BASE);
@@ -998,7 +1002,7 @@ impl SyscallDispatcher {
             // limit before forwarding to the host.
             const LINUX_SEMMSL: i32 = 32000;
             if (nsems as i32) > LINUX_SEMMSL {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             let rc = unsafe {
                 carrick_portable::semget(key as i32 as libc::key_t, nsems as i32, semflg as i32)
@@ -1395,7 +1399,7 @@ fn sysv_semctl<M: GuestMemory>(
 }
 
 /// Number of semaphores in the set, via host IPC_STAT.
-fn host_sem_nsems(semid: i32) -> Result<usize, i32> {
+fn host_sem_nsems(semid: i32) -> Result<usize, LinuxErrno> {
     let mut ds: carrick_portable::SemidDs = unsafe { core::mem::zeroed() };
     let rc = unsafe { carrick_portable::semctl_ptr(semid, 0, libc::IPC_STAT, &mut ds) };
     rc.host_syscall_errno()

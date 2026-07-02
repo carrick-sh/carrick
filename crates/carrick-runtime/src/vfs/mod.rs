@@ -111,11 +111,11 @@ pub(crate) fn is_synthetic_virtual_file(path: &str, ctx: &SyntheticProcContext) 
 
 use std::path::PathBuf;
 
-/// Linux errno code reported by a [`Vfs`] failure. Plain `i32` matches
-/// the dispatcher's existing error pipeline (e.g. the `LINUX_ENOENT`
-/// constants in `dispatch.rs`), so leaf-level mounts can return raw
-/// errno values without going through a translation layer.
-pub type VfsError = i32;
+/// Linux errno reported by a [`Vfs`] failure. The typed [`LinuxErrno`]
+/// matches the dispatcher's error pipeline (the `LINUX_E*` constants and
+/// `DispatchError::Errno`), so leaf-level mounts return typed errno values
+/// with no translation layer.
+pub type VfsError = crate::linux_abi::LinuxErrno;
 
 #[derive(Debug)]
 pub struct WatchFd {

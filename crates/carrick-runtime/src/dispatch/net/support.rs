@@ -68,6 +68,7 @@
 //! and read/write the Linux `epoll_event` struct for the [`super`] epoll
 //! handlers.
 
+use crate::linux_abi::LinuxErrno;
 use std::collections::VecDeque;
 
 use zerocopy::{FromBytes, IntoBytes};
@@ -84,7 +85,7 @@ pub(super) fn read_epoll_event(
     memory: &impl GuestMemory,
     address: u64,
     guest_abi: LinuxGuestAbi,
-) -> Result<LinuxEpollEvent, i32> {
+) -> Result<LinuxEpollEvent, LinuxErrno> {
     match guest_abi {
         LinuxGuestAbi::Aarch64 => read_kernel_struct(memory, address),
         LinuxGuestAbi::X86_64 => {
@@ -232,12 +233,12 @@ pub(super) fn write_epoll_events<M: GuestMemory>(
             .ok_or(DispatchError::LengthTooLarge(u64::MAX))?;
         let address = events_address.checked_add(offset).ok_or(LINUX_EFAULT);
         let Ok(address) = address else {
-            return Ok(LINUX_EFAULT.into());
+            return Ok(DispatchOutcome::errno(LINUX_EFAULT));
         };
         match guest_abi {
             LinuxGuestAbi::Aarch64 => {
                 if write_kernel_struct_raw(memory, address, event).is_err() {
-                    return Ok(LINUX_EFAULT.into());
+                    return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                 }
             }
             LinuxGuestAbi::X86_64 => {
@@ -246,7 +247,7 @@ pub(super) fn write_epoll_events<M: GuestMemory>(
                     data: event.data,
                 };
                 if write_kernel_struct_raw(memory, address, &wire).is_err() {
-                    return Ok(LINUX_EFAULT.into());
+                    return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                 }
             }
         }
@@ -360,7 +361,10 @@ pub(super) fn host_fd_has_oob(_host_fd: i32) -> bool {
     false
 }
 
-pub(super) fn read_pollfd(memory: &impl GuestMemory, address: u64) -> Result<LinuxPollFd, i32> {
+pub(super) fn read_pollfd(
+    memory: &impl GuestMemory,
+    address: u64,
+) -> Result<LinuxPollFd, LinuxErrno> {
     read_kernel_struct(memory, address)
 }
 
@@ -368,7 +372,7 @@ pub(super) fn read_fd_set(
     memory: &impl GuestMemory,
     address: u64,
     nfds: usize,
-) -> Result<Vec<u8>, i32> {
+) -> Result<Vec<u8>, LinuxErrno> {
     let length = linux_fd_set_len(nfds).ok_or(LINUX_EINVAL)?;
     memory.read_bytes(address, length).map_err(|_| LINUX_EFAULT)
 }
@@ -1377,7 +1381,7 @@ pub(in crate::dispatch) fn read_linux_sockaddr(
     addr: u64,
     addrlen: u32,
     _family_hint: i32,
-) -> Result<Vec<u8>, i32> {
+) -> Result<Vec<u8>, LinuxErrno> {
     if addr == 0 || addrlen < 2 {
         return Err(LINUX_EINVAL);
     }
@@ -1600,22 +1604,25 @@ pub(super) fn write_sockopt_value<M: GuestMemory>(
 ) -> Result<DispatchOutcome, DispatchError> {
     let guest_optlen = match memory.read_bytes(optlen_addr, 4) {
         Ok(b) => u32::from_ne_bytes([b[0], b[1], b[2], b[3]]),
-        Err(_) => return Ok(LINUX_EFAULT.into()),
+        Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
     };
     let n = (guest_optlen as usize).min(value.len());
     if optval_addr != 0 && n > 0 && memory.write_bytes(optval_addr, &value[..n]).is_err() {
-        return Ok(LINUX_EFAULT.into());
+        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
     }
     if memory
         .write_bytes(optlen_addr, &(n as u32).to_ne_bytes())
         .is_err()
     {
-        return Ok(LINUX_EFAULT.into());
+        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
     }
     Ok(DispatchOutcome::Returned { value: 0 })
 }
 
-pub(super) fn read_linux_msghdr(memory: &impl GuestMemory, addr: u64) -> Result<LinuxMsghdr, i32> {
+pub(super) fn read_linux_msghdr(
+    memory: &impl GuestMemory,
+    addr: u64,
+) -> Result<LinuxMsghdr, LinuxErrno> {
     read_kernel_struct(memory, addr)
 }
 

@@ -4,6 +4,7 @@ use carrick_runtime::compat::{CompatEvent, CompatReporter, SyscallArgs};
 use carrick_runtime::dispatch::{
     DispatchOutcome, GuestMemory, LinearMemory, SyscallDispatcher, SyscallRequest,
 };
+use carrick_runtime::linux_abi::LinuxErrno;
 use carrick_runtime::memory::LINUX_HEAP_BASE;
 use carrick_runtime::rootfs::{LayerSource, RootFs};
 use carrick_runtime::thread::{FutexTable, ThreadRegistry};
@@ -114,7 +115,7 @@ fn shared_dispatcher_services_syscalls_from_multiple_host_threads() {
 fn shared_dispatcher_services_thread_registry_and_futex_syscalls() {
     const LINUX_FUTEX_WAIT: u64 = 0;
     const LINUX_FUTEX_PRIVATE_FLAG: u64 = 128;
-    const LINUX_EAGAIN: i32 = 11;
+    const LINUX_EAGAIN: LinuxErrno = LinuxErrno::new(11);
 
     let dispatcher = Arc::new(SyscallDispatcher::new());
     let reporter = CompatReporter::default();
@@ -695,7 +696,12 @@ fn shared_dispatcher_reports_unknown_syscalls_without_serialized_fallback() {
             &futex,
         )
         .unwrap();
-    assert_eq!(outcome, DispatchOutcome::Errno { errno: 38 });
+    assert_eq!(
+        outcome,
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(38)
+        }
+    );
     assert_eq!(reporter.snapshot().summary.unhandled_syscall_invocations, 1);
 }
 

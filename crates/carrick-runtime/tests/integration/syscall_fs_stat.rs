@@ -254,7 +254,9 @@ fn faccessat2_supports_bootstrap_access_flags_and_fd_checks() {
         // motd-link points at the 0o644 regular file "motd": even as root,
         // X_OK on a regular file with no execute bit set returns EACCES, which
         // is exactly what real Linux does.
-        DispatchOutcome::Errno { errno: 13 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(13)
+        }
     );
     assert_eq!(
         dispatcher
@@ -313,7 +315,9 @@ fn faccessat2_supports_bootstrap_access_flags_and_fd_checks() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 22 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(22)
+        }
     );
     assert_eq!(
         dispatcher
@@ -326,7 +330,9 @@ fn faccessat2_supports_bootstrap_access_flags_and_fd_checks() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 22 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(22)
+        }
     );
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
@@ -622,7 +628,9 @@ fn statx_writes_basic_rootfs_fd_and_symlink_metadata() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 22 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(22)
+        }
     );
     assert_eq!(
         dispatcher
@@ -642,7 +650,9 @@ fn statx_writes_basic_rootfs_fd_and_symlink_metadata() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 22 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(22)
+        }
     );
     assert_eq!(
         dispatcher
@@ -662,7 +672,9 @@ fn statx_writes_basic_rootfs_fd_and_symlink_metadata() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 14 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(14)
+        }
     );
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
@@ -983,7 +995,9 @@ fn faccessat2_dotdot_after_missing_intermediate_returns_enoent() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 2 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(2)
+        }
     );
 }
 

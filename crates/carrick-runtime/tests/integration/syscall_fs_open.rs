@@ -337,7 +337,12 @@ fn ioctl_writes_packed_winsize_and_reports_unknown_requests() {
         // rows/cols come from the live terminal; just confirm they are non-zero.
         assert!(winsize.ws_row > 0 && winsize.ws_col > 0);
     } else {
-        assert_eq!(outcome, DispatchOutcome::Errno { errno: 25 });
+        assert_eq!(
+            outcome,
+            DispatchOutcome::Errno {
+                errno: LinuxErrno::new(25)
+            }
+        );
     }
 
     assert_eq!(
@@ -348,7 +353,9 @@ fn ioctl_writes_packed_winsize_and_reports_unknown_requests() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 25 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(25)
+        }
     );
     let report = reporter.finish();
     assert!(report.unhandled_syscalls.is_empty());
@@ -378,7 +385,12 @@ fn ioctl_tcgets_writes_default_termios_for_stdio_and_enotty_for_files() {
     if stdin_is_tty {
         assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
     } else {
-        assert_eq!(outcome, DispatchOutcome::Errno { errno: 25 });
+        assert_eq!(
+            outcome,
+            DispatchOutcome::Errno {
+                errno: LinuxErrno::new(25)
+            }
+        );
     }
 
     // 2. TCGETS on bogus fd 99 → EBADF.
@@ -390,7 +402,9 @@ fn ioctl_tcgets_writes_default_termios_for_stdio_and_enotty_for_files() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 9 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(9)
+        }
     );
 
     // 3. TCGETS on a rootfs-backed file fd → ENOTTY.
@@ -428,7 +442,9 @@ fn ioctl_tcgets_writes_default_termios_for_stdio_and_enotty_for_files() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 25 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(25)
+        }
     );
 
     // 4. TCSETS on fd 0 with a valid termios buffer. On a real backing TTY
@@ -461,10 +477,17 @@ fn ioctl_tcgets_writes_default_termios_for_stdio_and_enotty_for_files() {
                     &reporter,
                 )
                 .unwrap(),
-            DispatchOutcome::Errno { errno: 14 }
+            DispatchOutcome::Errno {
+                errno: LinuxErrno::new(14)
+            }
         );
     } else {
-        assert_eq!(outcome, DispatchOutcome::Errno { errno: 25 });
+        assert_eq!(
+            outcome,
+            DispatchOutcome::Errno {
+                errno: LinuxErrno::new(25)
+            }
+        );
     }
 
     assert!(reporter.finish().unhandled_ioctls.is_empty());
@@ -501,7 +524,12 @@ fn ioctl_tcgets2_is_recognized_and_mirrors_tcgets() {
         let tail = memory.read_bytes(0x4000 + 36, 8).unwrap();
         assert_eq!(tail.len(), 8);
     } else {
-        assert_eq!(outcome, DispatchOutcome::Errno { errno: 25 });
+        assert_eq!(
+            outcome,
+            DispatchOutcome::Errno {
+                errno: LinuxErrno::new(25)
+            }
+        );
     }
 
     // 2. TCGETS2 on a bogus fd → EBADF (recognized, validated before tty-ness).
@@ -513,7 +541,9 @@ fn ioctl_tcgets2_is_recognized_and_mirrors_tcgets() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 9 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(9)
+        }
     );
 
     // 3. TCSETS2 on fd 0 mirrors TCSETS (success on a tty, ENOTTY otherwise).
@@ -530,7 +560,12 @@ fn ioctl_tcgets2_is_recognized_and_mirrors_tcgets() {
     if stdin_is_tty {
         assert_eq!(set_outcome, DispatchOutcome::Returned { value: 0 });
     } else {
-        assert_eq!(set_outcome, DispatchOutcome::Errno { errno: 25 });
+        assert_eq!(
+            set_outcome,
+            DispatchOutcome::Errno {
+                errno: LinuxErrno::new(25)
+            }
+        );
     }
 
     // The regression guard, robust whether or not CI gives us a tty: TCGETS2 /
@@ -591,7 +626,9 @@ fn tty_ioctls_handle_pgrp_sid_and_controlling_terminal_calls() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 9 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(9)
+        }
     );
 
     // TIOCSPGRP on stdio with pgid=1 → 0; with pgid=99 → EPERM.
@@ -615,7 +652,9 @@ fn tty_ioctls_handle_pgrp_sid_and_controlling_terminal_calls() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 1 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(1)
+        }
     );
 
     // TIOCSCTTY / TIOCNOTTY on stdio → 0.
@@ -675,7 +714,9 @@ fn tty_ioctls_handle_pgrp_sid_and_controlling_terminal_calls() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 25 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(25)
+        }
     );
     assert_eq!(
         dispatcher
@@ -688,7 +729,9 @@ fn tty_ioctls_handle_pgrp_sid_and_controlling_terminal_calls() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 25 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(25)
+        }
     );
 
     assert!(reporter.finish().unhandled_ioctls.is_empty());
@@ -923,7 +966,9 @@ fn flock_accepts_bootstrap_advisory_locks_on_open_files() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 22 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(22)
+        }
     );
     assert_eq!(
         dispatcher
@@ -933,7 +978,9 @@ fn flock_accepts_bootstrap_advisory_locks_on_open_files() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 9 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(9)
+        }
     );
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
@@ -1008,7 +1055,12 @@ fn openat_missing_rootfs_file_returns_enoent() {
         )
         .unwrap();
 
-    assert_eq!(outcome, DispatchOutcome::Errno { errno: 2 });
+    assert_eq!(
+        outcome,
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(2)
+        }
+    );
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 
@@ -1104,7 +1156,9 @@ fn openat2_reads_open_how_and_opens_readonly_rootfs_paths() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 22 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(22)
+        }
     );
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
@@ -1174,7 +1228,9 @@ fn open_o_tmpfile_creates_anonymous_writable_file() {
             56,
             [LINUX_AT_FDCWD, 0, LINUX_O_TMPFILE, 0o600, 0, 0]
         ),
-        DispatchOutcome::Errno { errno: 22 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(22)
+        }
     );
 }
 
@@ -1526,7 +1582,7 @@ fn fcntl_setlease_wrlck_conflicts_with_a_second_opener() {
     const LINUX_F_RDLCK: u64 = 0;
     const LINUX_F_WRLCK: u64 = 1;
     const LINUX_O_RDONLY: u64 = 0;
-    const EAGAIN: i32 = 11;
+    const EAGAIN: LinuxErrno = LinuxErrno::new(11);
     let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
         "etc/leased",
         b"lease fixture\n".as_slice(),
@@ -1874,7 +1930,9 @@ fn fcntl_on_bare_stdio_succeeds_not_ebadf() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 9 },
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(9)
+        },
         "fcntl(F_SETFL) on an invalid fd must still be EBADF",
     );
 }
@@ -1971,7 +2029,9 @@ fn close_range_frees_pty_master_entry() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 2 },
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(2)
+        },
         "/dev/pts/0 must be ENOENT after close_range frees the master"
     );
 }
@@ -2175,7 +2235,9 @@ fn x86_private_dup2_installs_requested_fd_and_allows_same_fd_noop() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 22 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(22)
+        }
     );
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }

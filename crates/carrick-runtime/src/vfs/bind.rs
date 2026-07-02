@@ -89,7 +89,7 @@ fn map_io_error(e: std::io::Error) -> VfsError {
     host_to_linux_errno(raw)
 }
 
-fn host_open_errno() -> i32 {
+fn host_open_errno() -> VfsError {
     let raw = carrick_portable::errno();
     host_to_linux_errno(raw)
 }

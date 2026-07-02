@@ -419,6 +419,7 @@ dependencies = [
 name = "carrick-host-linux"
 version = "0.1.0"
 dependencies = [
+ "carrick-abi",
  "carrick-hal",
  "libc",
 ]

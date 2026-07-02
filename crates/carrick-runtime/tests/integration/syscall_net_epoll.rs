@@ -89,7 +89,9 @@ fn fionread_and_fionbio_bootstrap_succeed_for_valid_fds() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 9 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(9)
+        }
     );
 
     // FIONREAD on unknown fd 99 → EBADF too.
@@ -101,7 +103,9 @@ fn fionread_and_fionbio_bootstrap_succeed_for_valid_fds() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 9 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(9)
+        }
     );
 
     assert!(reporter.finish().unhandled_ioctls.is_empty());
@@ -221,7 +225,9 @@ fn fionbio_updates_pipe_status_flags_and_host_nonblocking_mode() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 11 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(11)
+        }
     );
 
     memory.write_bytes(0x4020, &0_i32.to_le_bytes()).unwrap();
@@ -290,7 +296,9 @@ fn eventfd2_read_write_round_trip_uses_packed_counter() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 11 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(11)
+        }
     );
 
     memory
@@ -379,7 +387,9 @@ fn pipe2_writes_packed_fd_pair_and_round_trips_bytes() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 11 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(11)
+        }
     );
 
     memory.write_bytes(0x4040, b"pipe data").unwrap();
@@ -457,7 +467,9 @@ fn pipe2_duplicate_writer_keeps_pipe_open_until_all_writers_close() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 11 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(11)
+        }
     );
     assert_eq!(
         dispatcher
@@ -551,7 +563,9 @@ fn timerfd_settime_read_round_trip_uses_packed_records() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 11 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(11)
+        }
     );
 
     let one_shot = LinuxItimerspec {
@@ -595,7 +609,9 @@ fn timerfd_settime_read_round_trip_uses_packed_records() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 11 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(11)
+        }
     );
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
@@ -1673,7 +1689,9 @@ fn epoll_wakes_accepted_socket_after_peer_write() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 115 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(115)
+        }
     );
     add_epoll_interest(&mut dispatcher, &mut memory, &reporter, 4, 5, 0x5020);
 
@@ -1698,7 +1716,7 @@ fn epoll_wakes_accepted_socket_after_peer_write() {
             .unwrap()
         {
             DispatchOutcome::Returned { value } => break value as u64,
-            DispatchOutcome::Errno { errno: 11 } => {
+            DispatchOutcome::Errno { errno } if errno == LinuxErrno::new(11) => {
                 let _ = dispatch_with_wait(
                     &mut dispatcher,
                     SyscallRequest::new(22, SyscallArgs::from([4, 0x5100, 8, 100, 0, 0])),
@@ -1726,7 +1744,9 @@ fn epoll_wakes_accepted_socket_after_peer_write() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 11 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(11)
+        }
     );
     let initial_count = match dispatcher
         .dispatch(
@@ -1891,7 +1911,9 @@ fn threaded_epoll_wait_wakes_when_peer_thread_writes_to_accepted_socket() {
             client_tid,
             SyscallRequest::new(203, SyscallArgs::from([5, 0x4030, 16, 0, 0, 0])),
         ),
-        DispatchOutcome::Errno { errno: 115 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(115)
+        }
     );
     add_epoll_interest_threaded(&threaded, &memory, client_tid, 4, 5, 0x5020);
 
@@ -1917,7 +1939,7 @@ fn threaded_epoll_wait_wakes_when_peer_thread_writes_to_accepted_socket() {
             ),
         ) {
             DispatchOutcome::Returned { value } => break value as u64,
-            DispatchOutcome::Errno { errno: 11 } => {
+            DispatchOutcome::Errno { errno } if errno == LinuxErrno::new(11) => {
                 let _ = dispatch_threaded_with_wait(
                     &threaded,
                     &memory,
@@ -1937,7 +1959,9 @@ fn threaded_epoll_wait_wakes_when_peer_thread_writes_to_accepted_socket() {
             server_tid,
             SyscallRequest::new(63, SyscallArgs::from([accepted_fd, 0x5200, 64, 0, 0, 0])),
         ),
-        DispatchOutcome::Errno { errno: 11 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(11)
+        }
     );
     let initial_count = match dispatch_threaded_once(
         &threaded,
@@ -2550,7 +2574,9 @@ fn pselect6_invalid_fd_returns_ebadf() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 9 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(9)
+        }
     );
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }

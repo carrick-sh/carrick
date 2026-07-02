@@ -1,6 +1,7 @@
 //! Filesystem and I/O state owned by the syscall dispatcher.
 
 use super::super::*;
+use crate::linux_abi::LinuxErrno;
 use std::sync::atomic::AtomicU64;
 
 /// Owned filesystem-subsystem state. Split out of `SyscallDispatcher` so
@@ -124,7 +125,7 @@ impl IoState {
     }
 }
 
-pub(super) fn flush_host_fd(host_fd: i32) -> Result<(), i32> {
+pub(super) fn flush_host_fd(host_fd: i32) -> Result<(), LinuxErrno> {
     unsafe { libc::fsync(host_fd) }.host_syscall_errno()?;
     #[cfg(target_os = "macos")]
     if strict_durability_enabled() {

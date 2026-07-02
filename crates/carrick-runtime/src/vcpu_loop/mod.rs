@@ -139,7 +139,7 @@ mod macos_helper_stubs {
         path: &str,
         argv: Vec<Vec<u8>>,
         env: Vec<Vec<u8>>,
-    ) -> Result<AddressSpace, i32> {
+    ) -> Result<AddressSpace, crate::linux_abi::LinuxErrno> {
         use crate::linux_abi::LINUX_ENOENT;
         let argv = if argv.is_empty() {
             vec![path.as_bytes().to_vec()]
@@ -578,8 +578,8 @@ where
         }
         let Some(ret) = ret else { return };
         if let Some(e) = LinuxErrno::from_guest_retval(ret) {
-            let e = e.get() as u32;
             let ename = crate::linux_abi::errno_name(e).unwrap_or("?");
+            let e = e.get();
             eprintln!(
                 "tid#{} trap#{traps}:   -> errno={e} ({ename})",
                 self.this_tid
@@ -940,8 +940,12 @@ where
         Ok(value)
     }
 
-    pub(super) fn complete_errno(&self, engine: &mut E, errno: i32) -> Result<i64, RuntimeError> {
-        self.complete_returned(engine, LinuxErrno::new(errno).guest_retval())
+    pub(super) fn complete_errno(
+        &self,
+        engine: &mut E,
+        errno: LinuxErrno,
+    ) -> Result<i64, RuntimeError> {
+        self.complete_returned(engine, errno.guest_retval())
     }
 }
 
