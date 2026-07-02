@@ -1,0 +1,144 @@
+rules:
+  # ── Typed-domain baseline (docs/typed-interfaces-audit.md) ──────────────────
+  # Each rule below encodes a bug SHAPE this codebase actually shipped. They are
+  # ERROR severity: the typed replacements exist, so a new raw instance is a
+  # regression of the baseline, not a style nit.
+
+  # rt_sigtimedwait wedged forever because a wait SET was complemented into a
+  # block MASK (`!wait_set`). SigSet/SigBlockMask now make that unrepresentable;
+  # a fresh raw complement of a wait-set is the old bug reappearing.
+  - id: carrick-no-raw-wait-set-complement
+    languages: [rust]
+    severity: ERROR
+    paths:
+      exclude:
+        - crates/carrick-abi/src/lib.rs # SigBlockMask::for_signal_wait itself
+    message: |
+      Complementing a wait-set into a block mask on raw integers is the
+      rt_sigtimedwait(set=∅) hang shape (bd824605). Use carrick_abi::SigSet /
+      SigBlockMask with a NAMED constructor (for_signal_wait / blocking_all_of)
+      instead of `!wait_set` arithmetic.
+    patterns:
+      - pattern: "!$WS"
+      - metavariable-regex:
+          metavariable: $WS
+          regex: '.*wait_set.*'
+
+  # Signal masks are bit `signum - 1` (the kernel sigset_t layout). A bare
+  # `1 << signum` is the execve ignored-mask off-by-one landmine (fixed in the
+  # SigSet migration). Build bits via SigSet::with / sigmask_bit, never by hand.
+  - id: carrick-no-raw-signum-bit
+    languages: [rust]
+    severity: ERROR
+    paths:
+      exclude:
+        - crates/carrick-abi/src/lib.rs # SigSet's own implementation
+    patterns:
+      - pattern-either:
+          - pattern: 1u64 << $S
+          - pattern: 1 << $S
+      - pattern-not: 1u64 << ($T - 1)
+      - pattern-not: 1 << ($T - 1)
+      - metavariable-regex:
+          metavariable: $S
+          regex: '.*sig(num|no).*'
+    message: |
+      Bit `signum` is the WRONG convention (sigset_t is bit `signum - 1`) — the
+      execve ignored-mask off-by-one class. Use carrick_abi::SigSet::with(signum)
+      or the sigmask_bit helper; never shift a signum by hand.
+
+  # NsPid exists to make host/ns pid confusion a compile error. Wrapping a
+  # host-pid-named value in it defeats the guard (wait4/ptrace shipped this).
+  - id: carrick-no-host-pid-in-nspid
+    languages: [rust]
+    severity: ERROR
+    patterns:
+      - pattern: NsPid($X)
+      - metavariable-regex:
+          metavariable: $X
+          regex: '.*host.*'
+    message: |
+      A host pid inside NsPid silently double-translates downstream
+      (.to_host()/.names_self()) — the wait4/ptrace anti-pattern (77a82c15).
+      Keep the value as HostPid or an honestly-named host-domain integer.
+
+  # The private normalized syscall numbers derive from PrivateX86Ordinal so two
+  # entries can never collide (alarm dispatched as epoll_create when they were
+  # hand-numbered). A fresh hand-numbered constant re-opens that class.
+  - id: carrick-no-hand-numbered-private-syscall
+    languages: [rust]
+    severity: ERROR
+    patterns:
+      - pattern-either:
+          - pattern: "const $NAME: u64 = u64::MAX - $N;"
+          - pattern: "pub const $NAME: u64 = u64::MAX - $N;"
+      - metavariable-regex:
+          metavariable: $NAME
+          regex: '.*(SYSCALL|PRIVATE|X86|_NR).*'
+    message: |
+      Hand-numbered private syscall constants collided once (alarm ==
+      epoll_create, bd62a25c). Add a PrivateX86Ordinal variant and derive the
+      constant via private_x86_number(...) instead.
+
+  # AGENTS.md rule, now mechanical: a function-local `const LINUX_*` used in a
+  # match arm degrades to a catch-all binding if the import is later dropped
+  # (deny(unreachable_patterns) catches the SYMPTOM; this catches the setup).
+  # ABI constants live in carrick-abi.
+  - id: carrick-no-function-local-linux-const
+    languages: [rust]
+    severity: ERROR
+    paths:
+      exclude:
+        - crates/carrick-abi/
+    patterns:
+      - pattern-inside: |
+          fn $F(...) { ... }
+      - pattern-either:
+          - pattern: "const $C: $T = $V;"
+      - metavariable-regex:
+          metavariable: $C
+          regex: '^LINUX_'
+    message: |
+      Function-local LINUX_* constants are the match-arm shadowing footgun
+      (AGENTS.md) and drift from the single ABI table. Define it in carrick-abi
+      and import it.
+
+  # SYS_* locals are the same footgun shape but pervasive in test scaffolding;
+  # surfaced as a warning rather than a gate.
+  - id: carrick-avoid-function-local-sys-const
+    languages: [rust]
+    severity: WARNING
+    paths:
+      exclude:
+        - crates/carrick-abi/
+    patterns:
+      - pattern-inside: |
+          fn $F(...) { ... }
+      - pattern-either:
+          - pattern: "const $C: $T = $V;"
+      - metavariable-regex:
+          metavariable: $C
+          regex: '^SYS_'
+    message: |
+      Function-local SYS_* constant — prefer the carrick-abi syscall tables so a
+      dropped import can never turn a match arm into a catch-all binding.
+
+  # Errno negation has ONE choke point (LinuxErrno::guest_retval). A fresh
+  # inline negation can double-negate a pre-negated value with no error.
+  - id: carrick-no-inline-errno-negation
+    languages: [rust]
+    severity: ERROR
+    paths:
+      exclude:
+        - crates/carrick-abi/src/lib.rs # the choke point itself
+        - crates/carrick-host/          # host-errno domain by contract
+        - crates/carrick-portable/      # host-errno domain by contract
+    patterns:
+      - pattern: "-($E as i64)"
+      - metavariable-regex:
+          metavariable: $E
+          regex: '.*err(no)?.*'
+    message: |
+      Errno → guest retval negation happens in exactly one place:
+      carrick_abi::LinuxErrno::guest_retval() (and from_guest_retval for the
+      reverse). Inline negations reintroduce the double-negation class.
