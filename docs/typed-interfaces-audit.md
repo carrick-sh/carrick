@@ -138,7 +138,7 @@ each new site re-implements the mask test by hand.
 | 7 | `SigSet`/`SigBlockMask` through signal-core + host_signal + io_wait chains + `SignalState` fields | TODO — mechanical, ~5 files, agent-mapped site list in this doc's source survey |
 | 8 | `CanonicalNr`/`NativeNr` newtypes on `RawSyscall`/`SyscallRequest` | TODO |
 | 9 | `GuestVa`/`Gpa`/`HostVa` in carrick-mem + engine translation chains | TODO — largest win for the memory subsystem, pairs with the durable-memory work |
-| 10 | `Errno` newtype with a single negation choke point | TODO — biggest churn, do last |
+| 10 | `Errno` newtype with a single negation choke point | done (this series) — `LinuxErrno` newtype + single negation choke point (`guest_retval`/`from_guest_retval`); `DispatchOutcome::Errno` field migration deferred |
 | 11 | bitflags for epoll/splice/eventfd/msg/wait flag words; hoist function-local `LINUX_*` consts to carrick-abi | TODO — opportunistic per-file |
 
 Ground rules for every stage: newtypes are `#[repr(transparent)]`-equivalent
