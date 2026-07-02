@@ -630,7 +630,8 @@ fn reportable_status_flags(raw: u64) -> u64 {
 /// One host interface with an IPv4 address: `(name, flags_host, sin_addr_be)`
 /// where `flags_host` is the host's raw `ifa_flags` and `sin_addr_be` is the
 /// 4-byte network-order IPv4 address. Built from `getifaddrs(3)`, which every
-/// supported host provides. SIOCGIFCONF reports exactly the AF_INET interfaces.
+/// supported host provides. SIOCGIFCONF reports Carrick's Linux-facing
+/// interface view, not Darwin's raw names.
 struct HostInet4Iface {
     name: String,
     flags_host: u32,
@@ -639,7 +640,8 @@ struct HostInet4Iface {
 
 /// Enumerate host interfaces that have an IPv4 address, in `getifaddrs` order.
 /// Used to service the `SIOCGIFCONF`/`SIOCGIFFLAGS`/`SIOCGIFADDR` family — we
-/// never fabricate interfaces; the list is whatever the host kernel reports.
+/// normalize names to the same guest-visible `lo`/`eth0` namespace as rtnetlink
+/// and `/proc/net`.
 fn host_inet4_interfaces() -> Vec<HostInet4Iface> {
     let mut out: Vec<HostInet4Iface> = Vec::new();
     let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
@@ -674,7 +676,54 @@ fn host_inet4_interfaces() -> Vec<HostInet4Iface> {
     }
     // SAFETY: free the list getifaddrs allocated.
     unsafe { libc::freeifaddrs(head) };
+    linux_guest_inet4_interfaces(out)
+}
+
+fn linux_guest_inet4_interfaces(ifaces: Vec<HostInet4Iface>) -> Vec<HostInet4Iface> {
+    let eth_host_name = ifaces
+        .iter()
+        .map(|iface| iface.name.as_str())
+        .filter(|name| name.starts_with("en"))
+        .min()
+        .map(str::to_owned);
+
+    let mut out = Vec::new();
+    let mut have_lo = false;
+    let mut have_eth = false;
+    for mut iface in ifaces {
+        if iface.name == "lo0" || iface.name == "lo" {
+            if have_lo {
+                continue;
+            }
+            have_lo = true;
+            iface.name = "lo".to_owned();
+            out.push(iface);
+        } else if eth_host_name.as_deref() == Some(iface.name.as_str()) {
+            if have_eth {
+                continue;
+            }
+            have_eth = true;
+            iface.name = "eth0".to_owned();
+            out.push(iface);
+        }
+    }
     out
+}
+
+fn linux_if_indextoname(index: i32) -> Option<&'static str> {
+    match index {
+        1 => Some("lo"),
+        2 => Some("eth0"),
+        _ => None,
+    }
+}
+
+fn linux_if_nametoindex(name: &str) -> Option<i32> {
+    match name {
+        "lo" => Some(1),
+        "eth0" => Some(2),
+        _ => None,
+    }
 }
 
 /// Translate a host's BSD/Linux `ifa_flags` bitmask to the Linux `IFF_*` flag
@@ -5025,22 +5074,13 @@ impl SyscallDispatcher {
                                 i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
                             if ifindex <= 0 {
                                 DispatchOutcome::errno(LINUX_ENODEV)
+                            } else if let Some(name) = linux_if_indextoname(ifindex) {
+                                let mut ifreq_name = [0u8; LINUX_IFNAMSIZ];
+                                let len = name.len().min(ifreq_name.len().saturating_sub(1));
+                                ifreq_name[..len].copy_from_slice(&name.as_bytes()[..len]);
+                                write_packed(&mut *cx.memory, arg, &ifreq_name)
                             } else {
-                                let mut name_buf = [0 as libc::c_char; 16];
-                                // SAFETY: `name_buf` is writable storage with Linux IFNAMSIZ bytes.
-                                let ptr = unsafe {
-                                    libc::if_indextoname(ifindex as u32, name_buf.as_mut_ptr())
-                                };
-                                if ptr.is_null() {
-                                    DispatchOutcome::errno(LINUX_ENODEV)
-                                } else {
-                                    let mut ifreq_name = [0u8; 16];
-                                    // SAFETY: successful if_indextoname returns a NUL-terminated name.
-                                    let name = unsafe { std::ffi::CStr::from_ptr(ptr) }.to_bytes();
-                                    let len = name.len().min(ifreq_name.len().saturating_sub(1));
-                                    ifreq_name[..len].copy_from_slice(&name[..len]);
-                                    write_packed(&mut *cx.memory, arg, &ifreq_name)
-                                }
+                                DispatchOutcome::errno(LINUX_ENODEV)
                             }
                         }
                         _ => DispatchOutcome::errno(LINUX_ENOTTY),
@@ -5057,19 +5097,15 @@ impl SyscallDispatcher {
                             if end == 0 {
                                 DispatchOutcome::errno(LINUX_ENODEV)
                             } else {
-                                let Ok(name) = std::ffi::CString::new(&bytes[..end]) else {
-                                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-                                };
-                                // SAFETY: `name` is a NUL-terminated interface name.
-                                let ifindex = unsafe { libc::if_nametoindex(name.as_ptr()) };
-                                if ifindex == 0 {
-                                    DispatchOutcome::errno(LINUX_ENODEV)
-                                } else {
+                                let name = String::from_utf8_lossy(&bytes[..end]);
+                                if let Some(ifindex) = linux_if_nametoindex(&name) {
                                     write_packed(
                                         &mut *cx.memory,
-                                        arg + 16,
-                                        &(ifindex as i32).to_le_bytes(),
+                                        arg + LINUX_IFNAMSIZ as u64,
+                                        &ifindex.to_le_bytes(),
                                     )
+                                } else {
+                                    DispatchOutcome::errno(LINUX_ENODEV)
                                 }
                             }
                         }
@@ -9422,6 +9458,39 @@ impl SyscallDispatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inet4_ioctl_view_uses_linux_interface_names() {
+        let ifaces = vec![
+            HostInet4Iface {
+                name: "lo0".to_owned(),
+                flags_host: libc::IFF_UP as u32 | libc::IFF_LOOPBACK as u32,
+                addr_be: [127, 0, 0, 1],
+            },
+            HostInet4Iface {
+                name: "utun0".to_owned(),
+                flags_host: libc::IFF_UP as u32,
+                addr_be: [10, 0, 0, 1],
+            },
+            HostInet4Iface {
+                name: "en4".to_owned(),
+                flags_host: libc::IFF_UP as u32 | libc::IFF_MULTICAST as u32,
+                addr_be: [192, 0, 2, 4],
+            },
+            HostInet4Iface {
+                name: "en0".to_owned(),
+                flags_host: libc::IFF_UP as u32 | libc::IFF_MULTICAST as u32,
+                addr_be: [192, 0, 2, 1],
+            },
+        ];
+
+        let ifaces = linux_guest_inet4_interfaces(ifaces);
+        let names: Vec<_> = ifaces.iter().map(|iface| iface.name.as_str()).collect();
+        assert_eq!(names, ["lo", "eth0"]);
+        assert_eq!(ifaces[1].addr_be, [192, 0, 2, 1]);
+        assert_eq!(linux_if_nametoindex("lo"), Some(1));
+        assert_eq!(linux_if_indextoname(2), Some("eth0"));
+    }
 
     #[test]
     fn fasync_signal_target_drops_on_ns_translation_miss() {
