@@ -735,6 +735,7 @@ pub mod runtime {
         use crate::io_wait::{WaitFd, WaitResult};
         const EINTR: crate::linux_abi::LinuxErrno = crate::linux_abi::LINUX_EINTR;
         let mut poll_deadline: Option<std::time::Instant> = None;
+        let mut sleep_deadline: Option<std::time::Instant> = None;
         loop {
             // `dispatch` returns `DispatchError`, absorbed via `#[from]`.
             let outcome = dispatcher.dispatch(request, memory, reporter)?;
@@ -809,14 +810,30 @@ pub mod runtime {
                     }
                     WaitResult::Errno(errno) => return Ok(DispatchOutcome::Errno { errno }),
                 },
-                DispatchOutcome::WaitOnSleep { duration } => {
-                    match waiter.wait(&[], Some(duration), carrick_abi::SigBlockMask::NONE) {
+                DispatchOutcome::WaitOnSleep {
+                    duration,
+                    remaining,
+                } => {
+                    let deadline =
+                        *sleep_deadline.get_or_insert_with(|| std::time::Instant::now() + duration);
+                    let now = std::time::Instant::now();
+                    if now >= deadline {
+                        return Ok(DispatchOutcome::Returned { value: 0 });
+                    }
+                    match waiter.wait(&[], Some(deadline - now), carrick_abi::SigBlockMask::NONE) {
                         // Empty fd set: only TimedOut (sleep elapsed) is expected.
                         WaitResult::Ready | WaitResult::TimedOut => {
-                            return Ok(DispatchOutcome::Returned { value: 0 });
+                            if std::time::Instant::now() >= deadline {
+                                return Ok(DispatchOutcome::Returned { value: 0 });
+                            }
+                            continue;
                         }
                         WaitResult::Interrupted => {
-                            return Ok(DispatchOutcome::Errno { errno: EINTR });
+                            return Ok(crate::dispatch::complete_interrupted_sleep(
+                                memory,
+                                remaining,
+                                deadline.saturating_duration_since(std::time::Instant::now()),
+                            ));
                         }
                         WaitResult::Errno(errno) => return Ok(DispatchOutcome::Errno { errno }),
                     }

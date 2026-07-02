@@ -1348,6 +1348,7 @@ pub enum DispatchOutcome {
     /// time; an ABSTIME clock_nanosleep is pre-converted by the handler.
     WaitOnSleep {
         duration: Duration,
+        remaining: Option<GuestPtr>,
     },
 }
 
@@ -3686,6 +3687,25 @@ fn linux_timespec_from_duration(duration: Duration) -> LinuxTimespec {
         duration.as_secs() as i64,
         i64::from(duration.subsec_nanos()),
     )
+}
+
+pub(crate) fn complete_interrupted_sleep(
+    memory: &mut impl GuestMemory,
+    remaining: Option<GuestPtr>,
+    duration: Duration,
+) -> DispatchOutcome {
+    if let Some(address) = remaining {
+        let rem = linux_timespec_from_duration(duration);
+        match write_kernel_struct(memory, address.0, &rem) {
+            DispatchOutcome::Returned { value: 0 } => {}
+            _ => {
+                return DispatchOutcome::Errno {
+                    errno: LINUX_EFAULT,
+                };
+            }
+        }
+    }
+    DispatchOutcome::Errno { errno: LINUX_EINTR }
 }
 
 fn linux_timeval_from_duration(duration: Duration) -> LinuxTimeval {

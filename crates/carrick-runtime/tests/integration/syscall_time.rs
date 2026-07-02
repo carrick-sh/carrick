@@ -6,6 +6,7 @@
 #[path = "common/syscall_support.rs"]
 mod support;
 
+use carrick_runtime::dispatch::GuestPtr;
 use carrick_runtime::linux_abi::{LINUX_CLOCK_THREAD_CPUTIME_ID, LINUX_SIGPROF, LinuxSysinfo};
 use support::*;
 
@@ -135,6 +136,48 @@ fn nanosleep_accepts_packed_timespec_and_rejects_invalid_inputs() {
         }
     );
     assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
+fn relative_sleeps_carry_remaining_time_pointer_for_eintr() {
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x80]);
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    memory
+        .write_bytes(0x4000, LinuxTimespec::new(5, 0).as_bytes())
+        .unwrap();
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(101, SyscallArgs::from([0x4000, 0x4020, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::WaitOnSleep {
+            duration: std::time::Duration::from_secs(5),
+            remaining: Some(GuestPtr(0x4020)),
+        }
+    );
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    115,
+                    SyscallArgs::from([LINUX_CLOCK_MONOTONIC, 0, 0x4000, 0x4030, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::WaitOnSleep {
+            duration: std::time::Duration::from_secs(5),
+            remaining: Some(GuestPtr(0x4030)),
+        }
+    );
 }
 
 #[test]
