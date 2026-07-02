@@ -1420,28 +1420,29 @@ impl SyscallDispatcher {
         }
     }
 
-    fn set_socket_pending_error(&self, fd: i32, errno: i32) {
+    fn set_socket_pending_error(&self, fd: i32, errno: carrick_abi::LinuxErrno) {
         if let Some(open_file) = self.open_file(fd)
             && let OpenDescription::HostSocket { base, .. } = &mut *open_file.description.write()
         {
-            base.set_pending_socket_error(errno);
+            base.set_pending_socket_error(errno.get());
         }
     }
 
-    fn take_socket_pending_error(&self, fd: i32) -> Option<i32> {
+    fn take_socket_pending_error(&self, fd: i32) -> Option<carrick_abi::LinuxErrno> {
         let open_file = self.open_file(fd)?;
         let mut open = open_file.description.write();
         let OpenDescription::HostSocket { base, .. } = &mut *open else {
             return None;
         };
         base.take_pending_socket_error()
+            .map(carrick_abi::LinuxErrno::new)
     }
 
-    fn set_socket_error_after_send(&self, fd: i32, errno: i32) {
+    fn set_socket_error_after_send(&self, fd: i32, errno: carrick_abi::LinuxErrno) {
         if let Some(open_file) = self.open_file(fd)
             && let OpenDescription::HostSocket { base, .. } = &mut *open_file.description.write()
         {
-            base.set_socket_error_after_send(errno);
+            base.set_socket_error_after_send(errno.get());
         }
     }
 
@@ -1510,7 +1511,7 @@ impl SyscallDispatcher {
         guest_peer: std::net::SocketAddr,
         host_peer: HostSocketAddr,
         protocol: PortProtocol,
-    ) -> Result<(), i32> {
+    ) -> Result<(), carrick_abi::LinuxErrno> {
         if family == libc::AF_INET
             && self.network.spec.mode == carrick_spec::NetworkMode::Bridge
             && self
@@ -3867,7 +3868,7 @@ impl SyscallDispatcher {
                         }
                     }
                     Ok(BindTarget::Unchanged) => {}
-                    Err(_) => return Ok(carrick_abi::LINUX_EADDRNOTAVAIL.into()),
+                    Err(_) => return Ok(DispatchOutcome::errno(carrick_abi::LINUX_EADDRNOTAVAIL)),
                 }
             }
             // AF_UNIX pathname sockets are bound at a stable host path (see
@@ -4001,7 +4002,7 @@ impl SyscallDispatcher {
                     this.socket_reuseport(fd.0),
                 )
             {
-                return Ok(errno.into());
+                return Ok(DispatchOutcome::errno(errno));
             }
             let rc = unsafe { libc::listen(host_fd.get(), backlog) };
             if let Err(errno) = rc.host_syscall_errno() {
@@ -4083,7 +4084,7 @@ impl SyscallDispatcher {
                             && this.io_is_nonblocking(fd, 0)
                         {
                             this.set_socket_pending_error(fd, carrick_abi::LINUX_ECONNREFUSED);
-                            return Ok(LINUX_EINPROGRESS.into());
+                            return Ok(DispatchOutcome::errno(LINUX_EINPROGRESS));
                         }
                         if errno == carrick_abi::LINUX_ECONNREFUSED
                             && protocol == PortProtocol::Udp
@@ -4107,13 +4108,13 @@ impl SyscallDispatcher {
                                     protocol,
                                 ));
                             } else {
-                                return Ok(errno.into());
+                                return Ok(DispatchOutcome::errno(errno));
                             }
                         } else {
-                            return Ok(errno.into());
+                            return Ok(DispatchOutcome::errno(errno));
                         }
                     }
-                    Err(_) => return Ok(carrick_abi::LINUX_ECONNREFUSED.into()),
+                    Err(_) => return Ok(DispatchOutcome::errno(carrick_abi::LINUX_ECONNREFUSED)),
                 }
                 }
             }
@@ -4161,7 +4162,7 @@ impl SyscallDispatcher {
                     host_peer,
                     protocol,
                 ) {
-                    return Ok(errno.into());
+                    return Ok(DispatchOutcome::errno(errno));
                 }
                 rewritten_connect = Some((guest_peer, host_peer, protocol));
             }
@@ -4311,7 +4312,7 @@ impl SyscallDispatcher {
                 && let Some(linux_bytes) = socket_addr_to_linux_sockaddr(guest_local.0)
             {
                 if write_linux_sockaddr(memory, addr_addr, addrlen_addr, &linux_bytes).is_err() {
-                    return Ok(LINUX_EFAULT.into());
+                    return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                 }
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
@@ -4361,7 +4362,7 @@ impl SyscallDispatcher {
                 && let Some(linux_bytes) = socket_addr_to_linux_sockaddr(guest_peer.0)
             {
                 if write_linux_sockaddr(memory, addr_addr, addrlen_addr, &linux_bytes).is_err() {
-                    return Ok(LINUX_EFAULT.into());
+                    return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                 }
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
@@ -4464,8 +4465,8 @@ impl SyscallDispatcher {
                     {
                         return Ok(DispatchOutcome::Returned { value: len as i64 });
                     }
-                    Ok(ConnectTarget::Denied(errno)) => return Ok(errno.into()),
-                    Err(_) => return Ok(carrick_abi::LINUX_ECONNREFUSED.into()),
+                    Ok(ConnectTarget::Denied(errno)) => return Ok(DispatchOutcome::errno(errno)),
+                    Err(_) => return Ok(DispatchOutcome::errno(carrick_abi::LINUX_ECONNREFUSED)),
                 }
             }
             // A send on an unconnected STREAM socket: Linux returns EPIPE
@@ -4548,18 +4549,18 @@ impl SyscallDispatcher {
             if let Some((payload, source)) = this.synthetic_datagram_drain(fd) {
                 let take = payload.len().min(len);
                 if take > 0 && memory.write_bytes(buf_addr, &payload[..take]).is_err() {
-                    return Ok(LINUX_EFAULT.into());
+                    return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                 }
                 if src_addr != 0
                     && src_len_addr != 0
                     && write_linux_sockaddr(memory, src_addr, src_len_addr, &source).is_err()
                 {
-                    return Ok(LINUX_EFAULT.into());
+                    return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                 }
                 return Ok(DispatchOutcome::Returned { value: take as i64 });
             }
             if let Some(errno) = this.take_socket_pending_error(fd) {
-                return Ok(errno.into());
+                return Ok(DispatchOutcome::errno(errno));
             }
             // When the caller wants the source address back, Linux's
             // move_addr_to_user reads the in/out length as a *signed* int and
@@ -4666,7 +4667,7 @@ impl SyscallDispatcher {
                     host_to_linux_sockaddr(&host_source, family, true)
                 };
                 if write_linux_sockaddr(memory, src_addr, src_len_addr, &linux_bytes).is_err() {
-                    return Ok(LINUX_EFAULT.into());
+                    return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                 }
             }
             Ok(outcome)
@@ -5072,7 +5073,7 @@ impl SyscallDispatcher {
                         memory,
                         optval_addr,
                         optlen_addr,
-                        &linux_err.to_ne_bytes(),
+                        &linux_err.get().to_ne_bytes(),
                     );
                 }
                 let mut host_err: i32 = 0;
@@ -5394,7 +5395,7 @@ impl SyscallDispatcher {
                         .write_bytes(iov.iov_base, &payload[cursor..cursor + take])
                         .is_err()
                     {
-                        return Ok(LINUX_EFAULT.into());
+                        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                     }
                     cursor += take;
                     remaining -= take;
@@ -5407,7 +5408,7 @@ impl SyscallDispatcher {
                         .write_bytes(msg.name, &source[..write_len as usize])
                         .is_err()
                 {
-                    return Ok(LINUX_EFAULT.into());
+                    return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                 }
                 let _ = memory.write_bytes(
                     msg_addr + core::mem::offset_of!(LinuxMsghdr, namelen) as u64,
