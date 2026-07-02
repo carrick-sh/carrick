@@ -16,6 +16,17 @@
 //!
 //! Every wait is bounded so a lost readiness edge reports `false` instead of
 //! hanging the harness.
+//!
+//! The server keeps ONE receive buffer across the headers and body phases.
+//! Whenever the server's first read of the connection is delayed past the
+//! client's 5 ms timer (trivially common under the parallel gate's load), the
+//! kernel coalesces headers+body and the headers-phase drain consumes BOTH; a
+//! phase-local buffer would silently DISCARD the body and then wait 2 s for
+//! bytes that can never arrive. Real Linux fails that variant identically
+//! (verified via the Docker oracle with the 5 ms wait removed), so the
+//! carry-over is required for the probe to measure the wakeup — the thing
+//! under test — rather than its own scheduling luck. When the body genuinely
+//! arrives after the drain, the epoll wait is exercised exactly as before.
 
 use std::net::{TcpListener, TcpStream};
 use std::os::fd::AsRawFd;
@@ -83,16 +94,23 @@ fn wait_timeout_only(epfd: i32, fd: i32) -> bool {
     n == 0
 }
 
-fn read_until(fd: i32, needle: &[u8], deadline: Instant) -> bool {
+/// Read from `fd` into the caller's connection-lifetime buffer until `needle`
+/// is present in it, EAGAIN (caller waits and retries), EOF/error, or the
+/// deadline. `seen` accumulates across calls so bytes drained past one phase's
+/// needle (coalesced headers+body) stay visible to the next phase instead of
+/// being dropped — see the module docs.
+fn read_until(fd: i32, seen: &mut Vec<u8>, needle: &[u8], deadline: Instant) -> bool {
     let mut buf = [0u8; 256];
-    let mut seen = Vec::new();
-    while Instant::now() < deadline {
+    loop {
+        if seen.windows(needle.len()).any(|w| w == needle) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
         let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
         if n > 0 {
             seen.extend_from_slice(&buf[..n as usize]);
-            if seen.windows(needle.len()).any(|w| w == needle) {
-                return true;
-            }
             continue;
         }
         if n == 0 {
@@ -107,7 +125,6 @@ fn read_until(fd: i32, needle: &[u8], deadline: Instant) -> bool {
         }
         return false;
     }
-    false
 }
 
 fn write_all_nonblock(fd: i32, bytes: &[u8], deadline: Instant) -> bool {
@@ -196,8 +213,11 @@ fn run_once(server_epfd: i32, client_epfd: i32) -> bool {
         return false;
     }
 
+    // One receive buffer for the CONNECTION, shared by both phases (see module
+    // docs: a phase-local buffer drops a coalesced body).
+    let mut seen: Vec<u8> = Vec::new();
     let headers_seen = loop {
-        let got_headers = read_until(server_fd, b"\r\n\r\n", deadline);
+        let got_headers = read_until(server_fd, &mut seen, b"\r\n\r\n", deadline);
         if got_headers {
             break true;
         }
@@ -216,7 +236,7 @@ fn run_once(server_epfd: i32, client_epfd: i32) -> bool {
     }
 
     let body_seen = loop {
-        let got_body = read_until(server_fd, BODY, deadline);
+        let got_body = read_until(server_fd, &mut seen, BODY, deadline);
         if got_body {
             break true;
         }
