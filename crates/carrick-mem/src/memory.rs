@@ -203,6 +203,7 @@ pub const IDENTITY_OFF_UID: u64 = 0x04;
 pub const IDENTITY_OFF_EUID: u64 = 0x08;
 pub const IDENTITY_OFF_GID: u64 = 0x0C;
 pub const IDENTITY_OFF_EGID: u64 = 0x10;
+pub const IDENTITY_OFF_SHIM_ENABLED: u64 = 0x14;
 // Linux aarch64 syscall numbers serviced by the EL1 identity fast path, paired
 // with the page offset holding the answer. Pure per-process register reads with
 // no host involvement (see docs/syscall-shim-design.md).
@@ -2105,37 +2106,56 @@ fn enc_beq(pc: u64, target: u64) -> u32 {
     let imm19 = (((target as i64 - pc as i64) >> 2) as u32) & 0x7FFFF;
     0x5400_0000 | (imm19 << 5)
 }
+fn enc_cbz_xn(reg: u32, pc: u64, target: u64) -> u32 {
+    let imm19 = (((target as i64 - pc as i64) >> 2) as u32) & 0x7FFFF;
+    0xB400_0000 | (imm19 << 5) | (reg & 0x1F)
+}
 // `cbz x0, <target>`: branch if x0 == 0. imm19 (units of 4) in bits[23:5], Rt=0.
 fn enc_cbz_x0(pc: u64, target: u64) -> u32 {
-    let imm19 = (((target as i64 - pc as i64) >> 2) as u32) & 0x7FFFF;
-    0xB400_0000 | (imm19 << 5)
+    enc_cbz_xn(0, pc, target)
+}
+// `movz xn, #imm16, lsl #(hw*16)`.
+fn enc_movz_xn(reg: u32, imm16: u16, hw: u32) -> u32 {
+    0xD280_0000 | (hw << 21) | (u32::from(imm16) << 5) | (reg & 0x1F)
 }
 // `movz x0, #imm16, lsl #(hw*16)`.
 fn enc_movz_x0(imm16: u16, hw: u32) -> u32 {
-    0xD280_0000 | (hw << 21) | (u32::from(imm16) << 5)
+    enc_movz_xn(0, imm16, hw)
+}
+// `movk xn, #imm16, lsl #(hw*16)`.
+fn enc_movk_xn(reg: u32, imm16: u16, hw: u32) -> u32 {
+    0xF280_0000 | (hw << 21) | (u32::from(imm16) << 5) | (reg & 0x1F)
 }
 // `movk x0, #imm16, lsl #(hw*16)`.
 fn enc_movk_x0(imm16: u16, hw: u32) -> u32 {
-    0xF280_0000 | (hw << 21) | (u32::from(imm16) << 5)
+    enc_movk_xn(0, imm16, hw)
+}
+fn enc_ldr_wt_xn(rt: u32, rn: u32, off: u64) -> u32 {
+    0xB940_0000 | (((off as u32 / 4) & 0xFFF) << 10) | ((rn & 0x1F) << 5) | (rt & 0x1F)
 }
 // `ldr w0, [x0, #off]` (off must be a multiple of 4).
 fn enc_ldr_w0_x0(off: u64) -> u32 {
-    0xB940_0000 | (((off as u32 / 4) & 0xFFF) << 10)
+    enc_ldr_wt_xn(0, 0, off)
 }
 
 /// Like [`el1_vectors_bytes`], but the lower-EL synchronous slot (0x400) holds
 /// the syscall-shim dispatcher: a `cmp x8`/`b.eq` chain that services the
 /// [`IDENTITY_SYSCALLS`] directly at EL1 (loading the answer from the identity
 /// page into `x0` and `eret`-ing — zero VM exits), falling through to the
-/// legacy `hvc #2; eret` for everything else. Every other slot is unchanged.
+/// legacy `hvc #2; eret` for everything else. If the runtime clears the
+/// `IDENTITY_OFF_SHIM_ENABLED` flag, the whole shim falls through as well; this
+/// is required once seccomp is active because filters must see identity syscalls
+/// before they execute. Every other slot is unchanged.
 ///
 /// The dispatcher clobbers only NZCV (the `cmp`s) and — on the intercepted
-/// paths — `x0` (the syscall return register). `eret` restores EL0's PSTATE
-/// from SPSR_EL1, so the flag clobber is invisible; the fallthrough path leaves
-/// `x0..x5,x8` untouched so the host sees an unperturbed syscall frame. The
-/// per-syscall handlers live in the page's `nop` tail (past the 2 KiB vector
-/// table), branch-reachable from the slot, and build the (kernel-hole, AP=00)
-/// identity-page address in `x0` only AFTER the eligibility decision.
+/// paths — `x0` (the syscall return register). The pre-dispatch enabled guard
+/// uses `x16`, which Linux's syscall ABI does not preserve for callers; the
+/// fallthrough path still leaves `x0..x5,x8` untouched so the host sees an
+/// unperturbed syscall frame. `eret` restores EL0's PSTATE from SPSR_EL1, so
+/// the flag clobber is invisible. The per-syscall handlers live in the page's
+/// `nop` tail (past the 2 KiB vector table), branch-reachable from the slot, and
+/// build the (kernel-hole, AP=00) identity-page address in `x0` only AFTER the
+/// eligibility decision.
 pub fn el1_vectors_bytes_shim() -> Vec<u8> {
     // Start from the legacy page (all slots = eret, 0x400 = hvc #2; eret, tail
     // = nop) and overwrite the sync slot + the handler tail.
@@ -2161,6 +2181,17 @@ pub fn el1_vectors_bytes_shim() -> Vec<u8> {
 
     let dispatch = AARCH64_VECTOR_LOWER_EL_SYNC_OFFSET;
     let mut cursor = dispatch;
+    const GUARD_REG: u32 = 16;
+    put(&mut bytes, cursor, enc_movz_xn(GUARD_REG, lo, 0));
+    put(&mut bytes, cursor + 4, enc_movk_xn(GUARD_REG, mid, 1));
+    put(&mut bytes, cursor + 8, enc_movk_xn(GUARD_REG, hi, 2));
+    put(
+        &mut bytes,
+        cursor + 12,
+        enc_ldr_wt_xn(GUARD_REG, GUARD_REG, IDENTITY_OFF_SHIM_ENABLED),
+    );
+    let guard_cbz = cursor + 16;
+    cursor += 20;
     for (i, &(nr, off)) in IDENTITY_SYSCALLS.iter().enumerate() {
         let handler = HANDLER_BASE + i * HANDLER_LEN;
         // dispatcher: cmp x8,#nr ; b.eq handler
@@ -2201,6 +2232,11 @@ pub fn el1_vectors_bytes_shim() -> Vec<u8> {
     );
     put(&mut bytes, gettid_handler + 8, AARCH64_ERET_OPCODE);
     // Fallthrough: not intercepted -> forward to the host like the legacy slot.
+    put(
+        &mut bytes,
+        guard_cbz,
+        enc_cbz_xn(GUARD_REG, guard_cbz as u64, fallthrough as u64),
+    );
     put(&mut bytes, fallthrough, AARCH64_HVC_SYSCALL_OPCODE);
     put(&mut bytes, fallthrough + 4, AARCH64_ERET_OPCODE);
     debug_assert!(
@@ -3049,9 +3085,24 @@ mod el1_shim_tests {
             None
         }
     }
+    fn decode_ldr_w16_x16(op: u32) -> Option<u64> {
+        if op & !(0xFFF << 10) == (0xB940_0000 | (16 << 5) | 16) {
+            Some((((op >> 10) & 0xFFF) as u64) * 4)
+        } else {
+            None
+        }
+    }
     /// `movz x0, #imm16, lsl #(hw*16)` → Some((imm16, hw)).
     fn decode_movz_x0(op: u32) -> Option<(u64, u32)> {
         if op & 0xFF80_001F == 0xD280_0000 {
+            Some((((op >> 5) & 0xFFFF) as u64, (op >> 21) & 0x3))
+        } else {
+            None
+        }
+    }
+    /// `movz x16, #imm16, lsl #(hw*16)` → Some((imm16, hw)).
+    fn decode_movz_x16(op: u32) -> Option<(u64, u32)> {
+        if op & 0xFF80_001F == (0xD280_0000 | 16) {
             Some((((op >> 5) & 0xFFFF) as u64, (op >> 21) & 0x3))
         } else {
             None
@@ -3065,9 +3116,26 @@ mod el1_shim_tests {
             None
         }
     }
+    /// `movk x16, #imm16, lsl #(hw*16)` → Some((imm16, hw)).
+    fn decode_movk_x16(op: u32) -> Option<(u64, u32)> {
+        if op & 0xFF80_001F == (0xF280_0000 | 16) {
+            Some((((op >> 5) & 0xFFFF) as u64, (op >> 21) & 0x3))
+        } else {
+            None
+        }
+    }
     /// `cbz x0, <target>` at byte offset `pc` → Some(absolute target offset).
     fn decode_cbz_x0(op: u32, pc: usize) -> Option<usize> {
         if op & 0xFF00_001F != 0xB400_0000 {
+            return None;
+        }
+        let imm19 = ((op >> 5) & 0x7FFFF) as i64;
+        let signed = (imm19 << 45) >> 45;
+        Some((pc as i64 + (signed << 2)) as usize)
+    }
+    /// `cbz x16, <target>` at byte offset `pc` → Some(absolute target offset).
+    fn decode_cbz_x16(op: u32, pc: usize) -> Option<usize> {
+        if op & 0xFF00_001F != (0xB400_0000 | 16) {
             return None;
         }
         let imm19 = ((op >> 5) & 0x7FFFF) as i64;
@@ -3089,9 +3157,30 @@ mod el1_shim_tests {
         let mut pc = AARCH64_VECTOR_LOWER_EL_SYNC_OFFSET;
         let mut page_seen: Vec<(u16, u64)> = Vec::new();
         let mut sysreg_seen: Vec<u16> = Vec::new();
+        let (lo, hw0) = decode_movz_x16(rd_u32(&bytes, pc)).expect("guard movz x16");
+        let (mid, hw1) = decode_movk_x16(rd_u32(&bytes, pc + 4)).expect("guard movk #16");
+        let (hi, hw2) = decode_movk_x16(rd_u32(&bytes, pc + 8)).expect("guard movk #32");
+        assert_eq!((hw0, hw1, hw2), (0, 1, 2), "guard base built lo/mid/hi");
+        assert_eq!(
+            lo | (mid << 16) | (hi << 32),
+            LINUX_IDENTITY_PAGE_BASE,
+            "guard must address the identity page"
+        );
+        assert_eq!(
+            decode_ldr_w16_x16(rd_u32(&bytes, pc + 12)).expect("guard ldr w16"),
+            IDENTITY_OFF_SHIM_ENABLED
+        );
+        let guard_cbz_pc = pc + 16;
+        let guard_fallthrough =
+            decode_cbz_x16(rd_u32(&bytes, guard_cbz_pc), guard_cbz_pc).expect("guard cbz x16");
+        pc += 20;
         loop {
             let op = rd_u32(&bytes, pc);
             if op == HVC2 {
+                assert_eq!(
+                    pc, guard_fallthrough,
+                    "disabled shim guard must branch to the host-trap fallthrough"
+                );
                 assert_eq!(
                     rd_u32(&bytes, pc + 4),
                     ERET,
@@ -3164,14 +3253,12 @@ mod el1_shim_tests {
     fn shim_dispatcher_fits_in_its_vector_slot() {
         let bytes = el1_vectors_bytes_shim();
         let mut pc = AARCH64_VECTOR_LOWER_EL_SYNC_OFFSET;
-        while rd_u32(&bytes, pc) != HVC2 {
-            pc += 8;
+        let slot_end = AARCH64_VECTOR_LOWER_EL_SYNC_OFFSET + AARCH64_VECTOR_SLOT_SIZE;
+        while pc + 4 <= slot_end && rd_u32(&bytes, pc) != HVC2 {
+            pc += 4;
         }
         // hvc #2 + eret must both fit before the next slot boundary.
-        assert!(
-            pc + 8 <= AARCH64_VECTOR_LOWER_EL_SYNC_OFFSET + AARCH64_VECTOR_SLOT_SIZE,
-            "dispatcher overruns its 0x80 slot"
-        );
+        assert!(pc + 8 <= slot_end, "dispatcher overruns its 0x80 slot");
     }
 
     /// Current-EL SYNCHRONOUS slots (0x000 SP_EL0, 0x200 SP_ELx) fail loud via
@@ -3308,10 +3395,9 @@ mod el1_shim_tests {
             .iter()
             .find(|r| r.start == LINUX_EL1_VECTORS_BASE)
             .expect("EL1 vector region must be present");
-        assert_eq!(
-            rd_u32(region.bytes(), AARCH64_VECTOR_LOWER_EL_SYNC_OFFSET),
-            enc_cmp_x8_imm(172),
-            "sync slot must start with `cmp x8,#172` (getpid)"
+        assert!(
+            decode_movz_x16(rd_u32(region.bytes(), AARCH64_VECTOR_LOWER_EL_SYNC_OFFSET)).is_some(),
+            "sync slot must start with the x16 identity-page enabled guard"
         );
     }
 

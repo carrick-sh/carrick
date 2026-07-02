@@ -583,7 +583,7 @@ impl SyscallDispatcher {
     /// Returns 0 on success, EFAULT/EINVAL on a bad program.
     fn install_seccomp_filter<M: GuestMemory>(
         &self,
-        memory: &M,
+        memory: &mut M,
         fprog_ptr: u64,
     ) -> DispatchOutcome {
         // struct sock_fprog { unsigned short len; <pad>; sock_filter *filter; }
@@ -615,6 +615,22 @@ impl SyscallDispatcher {
             return DispatchOutcome::errno(LINUX_EINVAL);
         };
         self.seccomp.install(prog);
+        self.disable_identity_syscall_shim(memory);
+        DispatchOutcome::Returned { value: 0 }
+    }
+
+    fn disable_identity_syscall_shim<M: GuestMemory>(&self, memory: &mut M) {
+        if crate::syscall_shim_enabled() {
+            let _ = memory.write_bytes(
+                crate::memory::LINUX_IDENTITY_PAGE_BASE + crate::memory::IDENTITY_OFF_SHIM_ENABLED,
+                &0u32.to_le_bytes(),
+            );
+        }
+    }
+
+    fn install_seccomp_strict<M: GuestMemory>(&self, memory: &mut M) -> DispatchOutcome {
+        self.seccomp.install_strict();
+        self.disable_identity_syscall_shim(memory);
         DispatchOutcome::Returned { value: 0 }
     }
 
@@ -824,11 +840,11 @@ impl SyscallDispatcher {
             // are not differentiated in v1.
             match operation as u32 {
                 crate::seccomp::SECCOMP_SET_MODE_FILTER => {
-                    Ok(this.install_seccomp_filter(&*cx.memory, args.0))
+                    Ok(this.install_seccomp_filter(&mut *cx.memory, args.0))
                 }
-                // STRICT mode (allow only read/write/exit/sigreturn) is not
-                // emulated yet; unknown operations are EINVAL.
-                crate::seccomp::SECCOMP_SET_MODE_STRICT => Ok(DispatchOutcome::errno(LINUX_ENOSYS)),
+                crate::seccomp::SECCOMP_SET_MODE_STRICT => {
+                    Ok(this.install_seccomp_strict(&mut *cx.memory))
+                }
                 _ => Ok(DispatchOutcome::errno(LINUX_EINVAL)),
             }
         }
@@ -988,8 +1004,8 @@ impl SyscallDispatcher {
                 // accepted as a no-op record (not differentiated). arg2 is the
                 // mode; arg3 is the `struct sock_fprog *` for FILTER mode.
                 LINUX_PR_SET_SECCOMP => match arg2 {
-                    LINUX_SECCOMP_MODE_FILTER => this.install_seccomp_filter(&*memory, arg3),
-                    LINUX_SECCOMP_MODE_STRICT => DispatchOutcome::Returned { value: 0 },
+                    LINUX_SECCOMP_MODE_FILTER => this.install_seccomp_filter(memory, arg3),
+                    LINUX_SECCOMP_MODE_STRICT => this.install_seccomp_strict(memory),
                     _ => DispatchOutcome::errno(LINUX_EINVAL),
                 },
                 // PR_GET_SECCOMP: 2 if a filter is installed, else 0 (Linux

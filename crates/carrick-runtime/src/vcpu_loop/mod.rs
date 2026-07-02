@@ -427,6 +427,10 @@ pub(crate) fn stamp_identity_page<M: GuestMemory>(memory: &mut M, dispatcher: &S
         (crate::memory::IDENTITY_OFF_EUID, id.euid),
         (crate::memory::IDENTITY_OFF_GID, id.gid),
         (crate::memory::IDENTITY_OFF_EGID, id.egid),
+        (
+            crate::memory::IDENTITY_OFF_SHIM_ENABLED,
+            u32::from(dispatcher.identity_fast_path_enabled()),
+        ),
     ] {
         // Best-effort: the page is only absent when the shim is off (handled
         // above) or on a non-HVF stub; a stamp failure can't corrupt the guest.
