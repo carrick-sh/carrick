@@ -2240,7 +2240,10 @@ impl HvfVmState {
             let Some(mapping) = self.mapping_for_range(lookup_address, chunk_len) else {
                 return Err(MemoryError::OutOfBounds { address, length });
             };
-            if require_guest_writable && !mapping.guest_writable {
+            if require_guest_writable
+                && (!mapping.guest_writable
+                    || self.protections.range_no_write(chunk_address, chunk_len))
+            {
                 return Err(MemoryError::OutOfBounds { address, length });
             }
             checked += chunk_len;
@@ -2520,7 +2523,10 @@ impl HvfVmState {
     }
 
     pub(crate) fn guest_range_is_writable(&self, address: u64, length: usize) -> bool {
-        self.mapping_for_range(address, length).is_some() && !self.range_no_access(address, length)
+        !self.range_no_access(address, length)
+            && self
+                .validate_guest_write_range(address, length, true)
+                .is_ok()
     }
 
     /// M:N reclaim — BLOCK side. Snapshot this vCPU and DESTROY it (freeing one
@@ -2874,7 +2880,9 @@ impl HvfVmState {
         // single-threaded after fork, so it gets a private copy of the parent's
         // ranges at the fork point.
         self.protections = if is_child {
-            std::sync::Arc::new(MemoryProtections::from_ranges(self.protections.snapshot()))
+            std::sync::Arc::new(MemoryProtections::from_snapshot(
+                self.protections.snapshot_all(),
+            ))
         } else {
             std::sync::Arc::clone(&self.protections)
         };

@@ -554,9 +554,23 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         // PROT_NONE gated on the guest VA in the default `write_bytes`; backing
         // lookup on the translated IPA (see `read_bytes_raw`). For a
         // `repoint_private` overlay the syscall write lands in the PRIVATE overlay
-        // backing the guest reads, not the shared aperture. The backend's
-        // `translated_write` ALSO enforces the guest-visible WRITE permission (HVF
-        // returns EFAULT on a read-only mapping — audit M1); KVM models none.
+        // backing the guest reads, not the shared aperture.
+        //
+        // Dynamic read-only ranges (`mprotect(PROT_READ)` / read-only mmap) are
+        // keyed on the guest VA in the shared protection table so a sibling vCPU's
+        // syscall write observes the change. The backend's `translated_write` may
+        // additionally enforce per-mapping write intent (HVF's boot/file mappings).
+        if !bytes.is_empty()
+            && self
+                .vm
+                .protections()
+                .is_some_and(|p| p.range_no_write(address, bytes.len()))
+        {
+            return Err(MemoryError::OutOfBounds {
+                address,
+                length: bytes.len(),
+            });
+        }
         let ipa = self.syscall_buffer_ipa(GuestVa(address), bytes.len()).raw();
         self.vm.translated_write(address, ipa, bytes)
     }
@@ -573,6 +587,9 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
 
     fn guest_range_is_writable(&self, address: u64, length: usize) -> bool {
         self.vm.guest_range_is_writable(address, length)
+            && self.vm.protections().is_none_or(|p| {
+                !p.range_no_access(address, length) && !p.range_no_write(address, length)
+            })
     }
 
     fn host_ptr_for_read(&self, address: u64, len: usize) -> Option<*const u8> {
@@ -590,6 +607,12 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
     /// TLB via `pt_edit_and_flush` + the EL0-fault→SIGSEGV path.
     fn set_no_access(&mut self, address: u64, len: usize, no_access: bool) {
         self.vm.set_no_access(address, len, no_access);
+    }
+
+    fn set_no_write(&mut self, address: u64, len: usize, no_write: bool) {
+        if let Some(protections) = self.vm.protections() {
+            protections.set_no_write(address, len, no_write);
+        }
     }
 
     /// Scrub the physical backing of `[address, address+len)`, BYPASSING the

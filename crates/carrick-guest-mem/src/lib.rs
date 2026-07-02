@@ -226,8 +226,9 @@ pub trait GuestMemory {
     }
 
     /// PERMISSION-CHECKED guest write. DEFAULT: PROT_NONE gate then
-    /// [`write_bytes_raw`](Self::write_bytes_raw). (The per-mapping WRITE
-    /// permission gate is backend-local; HVF enforces it inside `write_bytes_raw`.)
+    /// [`write_bytes_raw`](Self::write_bytes_raw). Backends/engines that model
+    /// guest read-only syscall buffers add the no-write gate in their concrete
+    /// write path so carrick-internal unchecked writes can bypass it.
     fn write_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
         // The SHARED default gates a write on the PROT_NONE set only. The READ-ONLY
         // write gate (`range_no_write`, the analog of HVF's
@@ -347,6 +348,14 @@ pub trait GuestMemory {
     /// memory error to EFAULT gets it for free. Default: no-op (the in-memory
     /// backend and unit tests don't model protections).
     fn set_no_access(&mut self, _address: u64, _len: usize, _no_access: bool) {}
+
+    /// Mark a guest range read-only for syscall writes (`no_write=true`) or clear
+    /// it when the range becomes writable/unmapped. This is the host-side EFAULT
+    /// counterpart to guest-visible page-table write protection: a syscall that
+    /// writes into a `PROT_READ` buffer must fail with `EFAULT`, while reads from
+    /// the same buffer remain allowed. Default: no-op for memory models that do
+    /// not track read-only syscall buffers.
+    fn set_no_write(&mut self, _address: u64, _len: usize, _no_write: bool) {}
 
     /// Change the guest-VISIBLE protection of `[address, address+len)` by
     /// editing the EL1 stage-1 page descriptors and flushing the stage-1 TLB,

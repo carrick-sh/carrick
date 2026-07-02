@@ -394,6 +394,10 @@ impl<V: X86Vmm> GuestMemory for X86EngineCore<V> {
         self.protections.set_no_access(address, len, no_access);
     }
 
+    fn set_no_write(&mut self, address: u64, len: usize, no_write: bool) {
+        self.protections.set_no_write(address, len, no_write);
+    }
+
     /// Resolve a guest futex VA to the host address of its `MAP_SHARED` backing
     /// (the boot aperture OR a runtime file-backed alias), so a cross-process
     /// futex routes through the bare-`SYS_futex` shared path instead of the
