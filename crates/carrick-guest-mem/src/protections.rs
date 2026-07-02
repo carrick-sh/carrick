@@ -25,8 +25,8 @@
 //! outer lock and `set_no_access`/`range_no_access` both take `&self`. The HVF
 //! and KVM backends both hold an `Arc<MemoryProtections>` and clone it into each
 //! sibling; a `fork(2)` child gets an INDEPENDENT copy (the Linux COW of the
-//! whole process duplicates the underlying `Vec`, or `MemoryProtections::from_ranges`
-//! over a `MemoryProtections::snapshot`); `execve` starts fresh
+//! whole process duplicates the underlying `Vec`, or `MemoryProtections::snapshot`
+//! plus `MemoryProtections::from_snapshot`); `execve` starts fresh
 //! (`MemoryProtections::default`).
 //!
 //! [`GuestMemory`]: crate::GuestMemory
@@ -124,10 +124,9 @@ pub struct MemoryProtections {
 }
 
 impl MemoryProtections {
-    /// Seed the PROT_NONE set from an existing range list (e.g. a `fork(2)` child
-    /// taking an independent copy of the parent's [`snapshot`](Self::snapshot)).
-    /// The no-write set starts empty (the common case; a forked engine re-derives
-    /// it, or — for x86 — the whole `Arc` is COW-copied so this path is unused).
+    /// Seed the PROT_NONE set from an existing range list. The no-write set starts
+    /// empty; use [`Self::from_snapshot`] when cloning full syscall-path protection
+    /// state across fork.
     pub fn from_ranges(ranges: Vec<(u64, u64)>) -> Self {
         Self {
             no_access: RangeSet::from_ranges(ranges),
@@ -138,6 +137,22 @@ impl MemoryProtections {
     /// A point-in-time copy of the PROT_NONE ranges.
     pub fn snapshot(&self) -> Vec<(u64, u64)> {
         self.no_access.snapshot()
+    }
+
+    /// A point-in-time copy of both syscall-path protection sets.
+    pub fn snapshot_all(&self) -> ProtectionSnapshot {
+        ProtectionSnapshot {
+            no_access: self.no_access.snapshot(),
+            no_write: self.no_write.snapshot(),
+        }
+    }
+
+    /// Seed both syscall-path protection sets from a fork-time snapshot.
+    pub fn from_snapshot(snapshot: ProtectionSnapshot) -> Self {
+        Self {
+            no_access: RangeSet::from_ranges(snapshot.no_access),
+            no_write: RangeSet::from_ranges(snapshot.no_write),
+        }
     }
 
     /// True if `[address, address+length)` overlaps any PROT_NONE range — a syscall
@@ -162,6 +177,13 @@ impl MemoryProtections {
     pub fn set_no_write(&self, address: u64, len: usize, no_write: bool) {
         self.no_write.set(address, len, no_write);
     }
+}
+
+/// Fork-time copy of syscall-path protection state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProtectionSnapshot {
+    pub no_access: Vec<(u64, u64)>,
+    pub no_write: Vec<(u64, u64)>,
 }
 
 #[cfg(test)]
@@ -218,5 +240,18 @@ mod tests {
             !p.range_no_write(0x5500, 0x10),
             "writable again clears no_write"
         );
+    }
+
+    #[test]
+    fn full_snapshot_preserves_no_write() {
+        let p = MemoryProtections::default();
+        p.set_no_access(0x1000, 0x1000, true);
+        p.set_no_write(0x4000, 0x1000, true);
+
+        let cloned = MemoryProtections::from_snapshot(p.snapshot_all());
+
+        assert!(cloned.range_no_access(0x1800, 0x10));
+        assert!(cloned.range_no_write(0x4800, 0x10));
+        assert!(!cloned.range_no_access(0x4800, 0x10));
     }
 }
