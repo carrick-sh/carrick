@@ -34,7 +34,9 @@ fn wait_proc_exit_recovers_when_kqueue_fd_closed_mid_wait() {
 
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let mut waiter = ThreadWaiter::new(unsafe { libc::getpid() });
+        let mut waiter = ThreadWaiter::new(
+            carrick_runtime::thread::ThreadId::main_from_host_pid_value(unsafe { libc::getpid() }),
+        );
         // Simulate the fork-storm race: the per-thread kqueue fd is closed out
         // from under us, so the next kevent returns EBADF.
         waiter.debug_close_kqueue();

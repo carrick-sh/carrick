@@ -63,7 +63,7 @@ where
             let raw = self
                 .futex
                 .wait_prepared_for_thread(wait, timeout, self.this_tid, &|| {
-                    crate::host_signal::has_pending_for(self.this_tid)
+                    crate::host_signal::has_pending_for(self.this_tid.raw())
                         || crate::fork_quiesce::is_quiescing()
                         || crate::fork_quiesce::exec_replacing_other_thread(self.this_tid)
                 });
@@ -72,8 +72,8 @@ where
                 // no re-bind) over reclaiming another thread's — esp. an exited one.
                 let new = match old_slot {
                     Some(p) => carrick_hal::vcpu_sched::global()
-                        .acquire_preferring(self.this_tid as u64, p),
-                    None => carrick_hal::vcpu_sched::global().acquire(self.this_tid as u64),
+                        .acquire_preferring(self.this_tid.raw() as u64, p),
+                    None => carrick_hal::vcpu_sched::global().acquire(self.this_tid.raw() as u64),
                 };
                 carrick_hal::vcpu_sched::set_current_lease(new);
                 if engine.reclaim_refreshes_kicker() {
@@ -95,7 +95,7 @@ where
                 }
                 let prev = old_slot.unwrap_or(new.slot);
                 crate::probes::mn_reclaim(
-                    self.this_tid,
+                    self.this_tid.raw(),
                     prev,
                     new.slot,
                     if new.slot == prev { 1 } else { 2 },
@@ -103,7 +103,7 @@ where
             } else if engine.reclaims() {
                 // A reclaiming backend that PARKED (uncontended — kept its vCPU).
                 let slot = carrick_hal::vcpu_sched::current_slot().unwrap_or(0);
-                crate::probes::mn_reclaim(self.this_tid, slot, slot, 0);
+                crate::probes::mn_reclaim(self.this_tid.raw(), slot, slot, 0);
             }
             let outcome = match raw {
                 FutexWaitOutcome::Woken => 0,
@@ -131,7 +131,7 @@ where
         timeout: Option<Duration>,
     ) -> Result<i64, RuntimeError> {
         let interrupted = || {
-            crate::host_signal::has_pending_for(self.this_tid)
+            crate::host_signal::has_pending_for(self.this_tid.raw())
                 || crate::fork_quiesce::is_quiescing()
                 || crate::fork_quiesce::exec_replacing_other_thread(self.this_tid)
         };
@@ -168,7 +168,7 @@ where
             0
         };
         let tid = self.registry.register_child(clear_addr);
-        let tid_bytes = tid.to_le_bytes();
+        let tid_bytes = tid.raw().to_le_bytes();
         if parent_tid_addr != 0 {
             let _ = engine.write_bytes(parent_tid_addr, &tid_bytes);
         }
@@ -217,10 +217,10 @@ where
                 // RAII guard frees it on EVERY exit path (including the early
                 // `!is_live` return below) except a full-process `_exit`, where
                 // process death frees it anyway.
-                let lease = carrick_hal::vcpu_sched::global().acquire(tid as u64);
+                let lease = carrick_hal::vcpu_sched::global().acquire(tid.raw() as u64);
                 carrick_hal::vcpu_sched::set_current_lease(lease);
                 crate::probes::mn_admit(
-                    tid,
+                    tid.raw(),
                     lease.slot,
                     carrick_hal::vcpu_sched::global()
                         .budget()
@@ -248,7 +248,7 @@ where
                     let _cleanup_gate = crate::fork_quiesce::begin_exit_cleanup();
                     drop(topo);
                     child_kicker.unregister(tid);
-                    crate::host_signal::forget_thread(tid);
+                    crate::host_signal::forget_thread(tid.raw());
                     child_kernel.dispatcher.forget_thread_signal_state(tid);
                     return;
                 }
@@ -297,19 +297,19 @@ where
                             Ok(VcpuLoopOutcome::TrapLimit(_)) | Ok(VcpuLoopOutcome::ThreadDone) => {
                             }
                             Err(e) => {
-                                tracing::error!(tid, error = %e, "thread sibling vCPU loop failed");
+                                tracing::error!(tid = tid.raw(), error = %e, "thread sibling vCPU loop failed");
                                 // Exit-cleanup gate (see handle_thread_exit).
                                 let _cleanup_gate = crate::fork_quiesce::begin_exit_cleanup();
                                 cleanup_registry.exit(tid);
                                 cleanup_kicker.unregister(tid);
-                                crate::host_signal::forget_thread(tid);
+                                crate::host_signal::forget_thread(tid.raw());
                                 cleanup_kernel.dispatcher.forget_thread_signal_state(tid);
                             }
                         }
                     }
                     Err(e) => {
                         drop(topo);
-                        tracing::error!(tid, error = %e, "thread sibling vCPU failed to start");
+                        tracing::error!(tid = tid.raw(), error = %e, "thread sibling vCPU failed to start");
                         child_registry.exit(tid);
                     }
                 }
@@ -348,7 +348,7 @@ where
         }
         let last = self.registry.exit(self.this_tid);
         self.kicker.unregister(self.this_tid);
-        crate::host_signal::forget_thread(self.this_tid);
+        crate::host_signal::forget_thread(self.this_tid.raw());
         kernel.dispatcher.forget_thread_signal_state(self.this_tid);
         if last {
             let result = assemble_run_result(kernel, code, traps, false);
@@ -414,7 +414,7 @@ where
         let removed = self.registry.remove_all_except(self.this_tid);
         for tid in removed {
             self.kicker.unregister(tid);
-            crate::host_signal::forget_thread(tid);
+            crate::host_signal::forget_thread(tid.raw());
             kernel.dispatcher.forget_thread_signal_state(tid);
         }
         kernel.end_exec_replacement();

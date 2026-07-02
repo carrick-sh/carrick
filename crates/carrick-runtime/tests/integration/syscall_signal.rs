@@ -139,7 +139,7 @@ fn rt_sig_family_bootstrap_validates_args_and_returns_sensible_errnos() {
     // rt_sigsuspend(mask=0x4000, sigsetsize=8) -> EINTR. A deliverable signal is
     // pending, so the suspend wakes promptly (rt_sigsuspend now installs the
     // mask and waits for a deliverable signal rather than returning instantly).
-    dispatcher.mark_signal_pending(0, 10);
+    dispatcher.mark_signal_pending(ThreadId::NONE, 10);
     assert_eq!(
         dispatcher
             .dispatch(
@@ -150,7 +150,10 @@ fn rt_sig_family_bootstrap_validates_args_and_returns_sensible_errnos() {
             .unwrap(),
         DispatchOutcome::Errno { errno: LINUX_EINTR }
     );
-    assert_eq!(dispatcher.take_deliverable_pending(0), Some(10));
+    assert_eq!(
+        dispatcher.take_deliverable_pending(ThreadId::NONE),
+        Some(10)
+    );
     // rt_sigsuspend with wrong sigsetsize -> EINVAL.
     assert_eq!(
         dispatcher
@@ -657,7 +660,7 @@ fn rt_sigsuspend_applies_mask_then_returns_eintr_on_pending_signal() {
 
     // Signal 10 already pending for the (no-thread-context) tid 0; with a
     // suspend mask of 0 (block nothing) it is immediately deliverable.
-    dispatcher.mark_signal_pending(0, 10);
+    dispatcher.mark_signal_pending(ThreadId::NONE, 10);
     memory.write_bytes(0x4000, &0u64.to_le_bytes()).unwrap();
 
     // rt_sigsuspend(mask_ptr=0x4000, sigsetsize=8) -> EINTR (4).
@@ -672,7 +675,10 @@ fn rt_sigsuspend_applies_mask_then_returns_eintr_on_pending_signal() {
         DispatchOutcome::Errno { errno: 4 }
     );
     // The pre-suspend mask (0) is restored, not left as the suspend mask.
-    assert_eq!(dispatcher.signal_mask_for(0), carrick_abi::SigSet::EMPTY);
+    assert_eq!(
+        dispatcher.signal_mask_for(ThreadId::NONE),
+        carrick_abi::SigSet::EMPTY
+    );
 }
 
 #[test]
@@ -689,10 +695,10 @@ fn rt_sigsuspend_restores_nondefault_mask_when_no_handler_runs() {
 
     // Original mask: block SIGRTMIN+... say signal 12 (bit 1<<11). Non-default.
     let original = carrick_abi::SigSet::EMPTY.with(12);
-    dispatcher.restore_signal_mask(0, original);
+    dispatcher.restore_signal_mask(ThreadId::NONE, original);
 
     // Signal 10 pending for tid 0, NO handler installed (default disposition).
-    dispatcher.mark_signal_pending(0, 10);
+    dispatcher.mark_signal_pending(ThreadId::NONE, 10);
     // suspend_mask = 0 (unblock everything) so signal 10 wakes it immediately.
     memory.write_bytes(0x4000, &0u64.to_le_bytes()).unwrap();
 
@@ -709,7 +715,7 @@ fn rt_sigsuspend_restores_nondefault_mask_when_no_handler_runs() {
     // No handler ran → rt_sigsuspend restored the original mask itself, NOT the
     // suspend mask (0). The bug left it at the suspend mask.
     assert_eq!(
-        dispatcher.signal_mask_for(0),
+        dispatcher.signal_mask_for(ThreadId::NONE),
         original,
         "rt_sigsuspend must restore the original mask when no handler runs"
     );
@@ -756,7 +762,7 @@ fn signalfd_read_drains_pending_masked_signals() {
     );
 
     // Mark SIGUSR1 pending for tid 0 (the harness ctx_tid).
-    dispatcher.mark_signal_pending(0, 10);
+    dispatcher.mark_signal_pending(ThreadId::NONE, 10);
 
     // read drains one 128-byte signalfd_siginfo; ssi_signo == 10.
     assert_eq!(
@@ -791,8 +797,12 @@ fn rt_sigtimedwait_writes_full_siginfo_from_queued_payload() {
     let mut dispatcher = SyscallDispatcher::new();
 
     // Queue a payload for SIGUSR1 (10) on tid 0 and mark it pending.
-    dispatcher.mark_signal_pending(0, 10);
-    dispatcher.record_pending_siginfo(0, 10, LinuxSiginfo::kill(10, SI_QUEUE, 1234, 5678));
+    dispatcher.mark_signal_pending(ThreadId::NONE, 10);
+    dispatcher.record_pending_siginfo(
+        ThreadId::NONE,
+        10,
+        LinuxSiginfo::kill(10, SI_QUEUE, 1234, 5678),
+    );
 
     // rt_sigtimedwait(set={10}@0x4000, info=0x4100, timeout=NULL, size=8).
     memory

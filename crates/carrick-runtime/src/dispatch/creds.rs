@@ -496,7 +496,10 @@ impl SyscallDispatcher {
             let sibling = cx
                 .thread
                 .as_ref()
-                .is_some_and(|t| t.registry.is_live(who.0 as crate::thread::ThreadId));
+                .is_some_and(|t| {
+                    t.registry
+                        .is_live(crate::thread::ThreadId::from_guest_supplied_tid(who.0))
+                });
             if which == LINUX_PRIO_PROCESS && !is_self_priority_target(who.0) && !sibling {
                 return Ok(LINUX_ESRCH.into());
             }
@@ -532,7 +535,10 @@ impl SyscallDispatcher {
             let sibling = cx
                 .thread
                 .as_ref()
-                .is_some_and(|t| t.registry.is_live(who.0 as crate::thread::ThreadId));
+                .is_some_and(|t| {
+                    t.registry
+                        .is_live(crate::thread::ThreadId::from_guest_supplied_tid(who.0))
+                });
             if which == LINUX_PRIO_PROCESS && !is_self_priority_target(who.0) && !sibling {
                 return Ok(LINUX_ESRCH.into());
             }

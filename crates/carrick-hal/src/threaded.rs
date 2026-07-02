@@ -10,7 +10,98 @@ use carrick_guest_mem::GuestMemory;
 use crate::error::{OsError, Reg, SysReg};
 use crate::trap::{ForkOutcome, SyscallTrap, TrapError};
 
-pub type ThreadId = i32;
+/// The process-local thread/vCPU **registry key**.
+///
+/// This is the key a guest thread is filed under in every per-process table:
+/// the vCPU kick registry, the `ThreadRegistry`, the private-futex park
+/// tokens, and the per-thread signal bookkeeping. It is NOT a host thread
+/// identity (that axis is the mach-port `ThreadPort`) and NOT the
+/// guest-visible tid (the runtime's `guest_visible_tid` derives that from this
+/// key at the `gettid`//proc seam).
+///
+/// The field is private and there is deliberately NO general
+/// `From<i32>`/`from_raw` (docs/typed-interfaces-audit.md P1.3): construction
+/// goes through the named semantic constructors below, and the raw value
+/// escapes only at wire/libc/probe boundaries via [`ThreadId::raw`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ThreadId(i32);
+
+impl ThreadId {
+    /// The "no thread context" sentinel — numeric 0, exactly the value the raw
+    /// `i32` code used (`ctx_tid` returns it when a syscall is dispatched with
+    /// no thread context). Compares unequal to every real registry key.
+    pub const NONE: ThreadId = ThreadId(0);
+
+    /// The MAIN guest thread's registry key, deliberately seeded from this
+    /// process's host pid. This is the identity the tree relies on:
+    /// main-key == host pid == ns-base pid, which is what lets
+    /// `guest_visible_tid` reconcile the main thread's key to the guest's
+    /// ns-pid and lets guest-supplied tids index the registry untranslated.
+    pub fn main_from_host_pid() -> Self {
+        Self(std::process::id() as i32)
+    }
+
+    /// [`ThreadId::main_from_host_pid`] for a caller that already holds the
+    /// host-pid VALUE (e.g. captured around a fork boundary). The argument is
+    /// a HOST pid by contract — never a guest/ns pid.
+    pub fn main_from_host_pid_value(host_pid: i32) -> Self {
+        Self(host_pid)
+    }
+
+    /// A GUEST-SUPPLIED tid (ns domain: `tgkill`/`tkill` targets,
+    /// `/proc/<tid>` lookups, `F_SETOWN_EX` ids) entering the registry-key
+    /// space UNTRANSLATED.
+    ///
+    /// Convention: this works today because the main thread's key == host pid
+    /// == ns-base pid, and worker keys are handed to the guest untranslated —
+    /// so the guest hands back exactly the registry key. This constructor
+    /// NAMES that crossing without changing it: no translation, no checks.
+    pub fn from_guest_supplied_tid(tid: i32) -> Self {
+        Self(tid)
+    }
+
+    /// A registry key ROUND-TRIPPING back from one of carrick's own raw-`i32`
+    /// wire tables (the signal-core pending/xsig tables, whose publish sites
+    /// exported the key with [`ThreadId::raw`]). Re-enters the value unchanged
+    /// — this is NOT a general `from_raw`: only use it where the value's
+    /// provenance is a prior `raw()` export of a registry key.
+    pub fn from_wire_key(raw: i32) -> Self {
+        Self(raw)
+    }
+
+    /// A key allocated by the thread registry's monotonic counter
+    /// (`ThreadRegistry::register_child`'s `next_tid.fetch_add`). Only the
+    /// registry allocation path should construct through this.
+    pub fn from_registry_allocation(raw: i32) -> Self {
+        Self(raw)
+    }
+
+    /// A synthetic registry key for TESTS (concurrency harnesses that
+    /// fabricate worker keys like `100 + w`). Not for production code.
+    pub fn synthetic_for_tests(raw: i32) -> Self {
+        Self(raw)
+    }
+
+    /// The raw key value, escaping to a wire/libc/probe boundary (signal-core
+    /// pending tables, USDT probes, guest tid byte writes, park tokens).
+    pub fn raw(self) -> i32 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for ThreadId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// Serializes as the bare `i32` key (diagnostics/event-ring payloads keep
+/// their pre-newtype wire shape).
+impl serde::Serialize for ThreadId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(serializer)
+    }
+}
 
 /// Cross-thread "force this vCPU out of the guest" primitive.
 /// HVF: `hv_vcpus_exit`. KVM: `pthread_kill(tid, KICK_SIGNAL)` -> `KVM_RUN` EINTR.
@@ -149,6 +240,10 @@ mod generic_registry_tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    fn t(raw: i32) -> ThreadId {
+        ThreadId::synthetic_for_tests(raw)
+    }
+
     struct CountingHandle(Arc<AtomicU64>);
     impl VcpuKickDyn for CountingHandle {
         fn kick(&self) {
@@ -160,10 +255,10 @@ mod generic_registry_tests {
     fn register_unregister_count() {
         let r = GenericVcpuRegistry::new();
         assert_eq!(r.count(), 0);
-        r.register(1, Box::new(CountingHandle(Arc::new(AtomicU64::new(0)))));
-        r.register(2, Box::new(CountingHandle(Arc::new(AtomicU64::new(0)))));
+        r.register(t(1), Box::new(CountingHandle(Arc::new(AtomicU64::new(0)))));
+        r.register(t(2), Box::new(CountingHandle(Arc::new(AtomicU64::new(0)))));
         assert_eq!(r.count(), 2);
-        r.unregister(1);
+        r.unregister(t(1));
         assert_eq!(r.count(), 1);
     }
 
@@ -172,9 +267,9 @@ mod generic_registry_tests {
         let r = GenericVcpuRegistry::new();
         let c1 = Arc::new(AtomicU64::new(0));
         let c2 = Arc::new(AtomicU64::new(0));
-        r.register(1, Box::new(CountingHandle(Arc::clone(&c1))));
-        r.register(2, Box::new(CountingHandle(Arc::clone(&c2))));
-        r.kick_all_except(1);
+        r.register(t(1), Box::new(CountingHandle(Arc::clone(&c1))));
+        r.register(t(2), Box::new(CountingHandle(Arc::clone(&c2))));
+        r.kick_all_except(t(1));
         assert_eq!(c1.load(Ordering::SeqCst), 0, "caller must not be kicked");
         assert_eq!(c2.load(Ordering::SeqCst), 1, "the other vCPU is kicked");
         r.kick_all();
@@ -185,14 +280,14 @@ mod generic_registry_tests {
     #[test]
     fn in_guest_flag_handshake() {
         let r = GenericVcpuRegistry::new();
-        let _flag = r.register_in_guest(1);
-        r.register_in_guest(2);
-        assert!(!r.any_other_in_guest(1));
-        r.set_in_guest(2, true);
-        assert!(r.any_other_in_guest(1), "tid 2 is in-guest");
-        assert!(!r.any_other_in_guest(2), "except self → false");
-        r.set_in_guest(2, false);
-        assert!(!r.any_other_in_guest(1));
+        let _flag = r.register_in_guest(t(1));
+        r.register_in_guest(t(2));
+        assert!(!r.any_other_in_guest(t(1)));
+        r.set_in_guest(t(2), true);
+        assert!(r.any_other_in_guest(t(1)), "tid 2 is in-guest");
+        assert!(!r.any_other_in_guest(t(2)), "except self → false");
+        r.set_in_guest(t(2), false);
+        assert!(!r.any_other_in_guest(t(1)));
     }
 }
 
