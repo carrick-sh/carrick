@@ -68,7 +68,8 @@ use crate::guest_setup_x86::{
     SYSCALL_DOORBELL_PORT, USER_CS64_SEL, USER_SS_SEL, VM_SEGID_SYSMEM, X86_FP_SCRATCH_GPA,
     X86_FP_STUB_GPA, X86_GDT_GPA, X86_MEM_SIZE, X86_PML4_CAPACITY, X86_PML4_GPA, bring_up_x86_elf,
     fault_scratch_gpa, fault_scratch_record_from_bytes, fault_stack_frame_len,
-    fault_user_context_from_bytes, program_x86_vcpu_longmode_entry, snapshot_x86_bhyve,
+    fault_user_context_from_bytes, program_x86_vcpu_longmode_entry, program_x86_vcpu_reclaim_entry,
+    snapshot_x86_bhyve,
 };
 use crate::vmm::{BhyveSharedVm, BhyveVcpu, BhyveVm, Vcpu};
 use crate::vmm_x86::{
@@ -1852,17 +1853,60 @@ impl X86Vmm for BhyveVmm {
     fn rebind_to_slot(&mut self, slot: carrick_hal::SlotId, state: &[u8]) -> Result<(), TrapError> {
         let id = slot as c_int;
         let cur = self.h.slot().id;
-        // Re-open the recycled (already-activated, long-mode) vCPU and swap it in —
-        // only if the slot actually changed (re-binding to the SAME id is a no-op
-        // for the handle; the saved state is restored below regardless).
+        // Re-open the recycled vCPU and swap it in — only if the slot actually
+        // changed (re-binding to the SAME id is a no-op for the handle; the
+        // saved state is restored below regardless; `id == cur` implies this
+        // engine was RUNNING on that vCPU, so it is materialized).
         if id != cur {
-            let vm = self.h.slot().vm.clone();
-            let vcpu = vm
+            let shared = self.h.slot().vm.clone();
+            let (vcpu, fresh) = shared
                 .reopen_vcpu(id)
                 .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
             self.h.vcpu.store(vcpu.vcpu, Ordering::SeqCst);
-            let mut s = self.h.slot();
-            s.id = id;
+            {
+                let mut s = self.h.slot();
+                s.id = id;
+            }
+            if fresh {
+                // The pool granted a slot no thread spawn ever materialized on
+                // this VM (e.g. right after an execve rebuilt a fresh VM, the
+                // LIFO free list surfaces never-used high ids). The kernel vCPU
+                // is power-on fresh: not runnable state for the restore below —
+                // vm_run itself EINVALs a never-activated vCPU (now activated by
+                // reopen_vcpu), the XRSTOR stub needs CR4.OSXSAVE + XCR0.AVX,
+                // and the guest's next sysretq needs STAR. Re-establish the
+                // first-bring-up invariant: program long mode + ring-0 segments
+                // and drive the doorbell-terminated MSR/XCR0 blob to completion
+                // IN-GUEST, then fall through to the ordinary restore (which
+                // overwrites every register the blob parked on).
+                let vm = BhyveVm::from_shared(self.h.slot().vm.clone());
+                let mut bvcpu = self.h.as_bhyve();
+                program_x86_vcpu_reclaim_entry(&mut bvcpu, &vm, id)
+                    .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+                // Preserve `started` across the drive: run()'s EINTR-kick arm
+                // clears it, and a false `started` would make the FP/AVX
+                // restore below a silent no-op (set_xsave's not-yet-running
+                // gate) — the reclaimed thread's `started` state belongs to
+                // the THREAD (parked at a real syscall), not this blob run.
+                let was_started = self.h.started.load(Ordering::SeqCst);
+                let mut driver = BhyveX86Vcpu {
+                    h: Arc::clone(&self.h),
+                };
+                loop {
+                    match driver.run()? {
+                        X86Exit::FpDoorbell => break,
+                        // Spurious VT-x re-entry / cross-thread kick — re-run.
+                        X86Exit::Kicked => continue,
+                        other => {
+                            return Err(TrapError::Hypervisor(format!(
+                                "bhyve reclaim: fresh-slot MSR/XCR0 blob did not reach \
+                                 its doorbell (unexpected exit {other:?})"
+                            )));
+                        }
+                    }
+                }
+                self.h.started.store(was_started, Ordering::SeqCst);
+            }
         }
         // A reclaim snapshot that failed to capture is returned EMPTY (or short)
         // by `save_guest_state`; refuse to restore zeroed/garbage state rather than
