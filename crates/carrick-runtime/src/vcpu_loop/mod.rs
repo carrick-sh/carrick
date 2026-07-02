@@ -47,6 +47,7 @@ use crate::compat::CompatReporter;
 use crate::dispatch::{
     DispatchError, DispatchOutcome, GuestMemory, ProcMapsEntry, SyscallDispatcher, SyscallRequest,
 };
+use crate::linux_abi::LinuxErrno;
 use crate::memory::AddressSpace;
 use crate::run_result::{RunResult, RuntimeError};
 use crate::thread::{FutexTable, ThreadId, ThreadRegistry};
@@ -576,8 +577,8 @@ where
             return;
         }
         let Some(ret) = ret else { return };
-        if (-4095..0).contains(&ret) {
-            let e = (-ret) as u32;
+        if let Some(e) = LinuxErrno::from_guest_retval(ret) {
+            let e = e.get() as u32;
             let ename = crate::linux_abi::errno_name(e).unwrap_or("?");
             eprintln!(
                 "tid#{} trap#{traps}:   -> errno={e} ({ename})",
@@ -940,7 +941,7 @@ where
     }
 
     pub(super) fn complete_errno(&self, engine: &mut E, errno: i32) -> Result<i64, RuntimeError> {
-        self.complete_returned(engine, -(errno as i64))
+        self.complete_returned(engine, LinuxErrno::new(errno).guest_retval())
     }
 }
 

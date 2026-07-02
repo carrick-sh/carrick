@@ -120,6 +120,7 @@ use crate::compat::CompatReporter;
 use crate::dispatch::{
     DispatchOutcome, GuestMemory, MemoryError, SyscallDispatcher, SyscallRequest,
 };
+use crate::linux_abi::LinuxErrno;
 use crate::memory::{AddressSpace, AddressSpaceError};
 use crate::rootfs::RootFs;
 
@@ -936,7 +937,7 @@ where
             | DispatchOutcome::WaitOnProcExit { .. }
             | DispatchOutcome::WaitOnSignals { .. }
             | DispatchOutcome::WaitOnSleep { .. } => {
-                let value = -(crate::linux_abi::LINUX_EINTR as i64);
+                let value = LinuxErrno::new(crate::linux_abi::LINUX_EINTR).guest_retval();
                 runtime.complete_syscall(value)?;
                 last_syscall_retval = Some(value);
             }
@@ -972,7 +973,7 @@ where
                 last_syscall_retval = Some(value);
             }
             DispatchOutcome::Errno { errno } => {
-                let value = -(errno as i64);
+                let value = LinuxErrno::new(errno).guest_retval();
                 runtime.complete_syscall(value)?;
                 last_syscall_retval = Some(value);
             }
@@ -1082,7 +1083,7 @@ where
                         stop_after_traced_exec(&dispatcher);
                     }
                     Err(errno) => {
-                        let value = -(errno as i64);
+                        let value = LinuxErrno::new(errno).guest_retval();
                         runtime.complete_syscall(value)?;
                         last_syscall_retval = Some(value);
                     }
@@ -1155,7 +1156,7 @@ where
                 // `dispatch_threaded` path (run_vcpu_until_exit). The
                 // single-threaded loops here always pass `thread: None`, so
                 // the dispatcher never produces them.
-                let value = -(crate::linux_abi::LINUX_ENOSYS as i64);
+                let value = LinuxErrno::new(crate::linux_abi::LINUX_ENOSYS).guest_retval();
                 runtime.complete_syscall(value)?;
                 last_syscall_retval = Some(value);
             }
@@ -1169,8 +1170,8 @@ where
             // stream a request+result log — the reducer aligns it against the
             // Docker oracle to localise a divergence (wrong errno) or the last
             // syscall before a hang (no return line printed).
-            if (-4095..0).contains(&ret) {
-                let e = (-ret) as u32;
+            if let Some(e) = LinuxErrno::from_guest_retval(ret) {
+                let e = e.get() as u32;
                 let ename = crate::linux_abi::errno_name(e).unwrap_or("?");
                 eprintln!("trap#{traps}:   -> errno={e} ({ename})");
             } else {
@@ -1567,13 +1568,13 @@ fn shared_futex_wait(
             || crate::fork_quiesce::is_quiescing()
             || crate::fork_quiesce::exec_replacing_other_thread(this_tid)
         {
-            return -(crate::linux_abi::LINUX_EINTR as i64);
+            return LinuxErrno::new(crate::linux_abi::LINUX_EINTR).guest_retval();
         }
         let slice_us: u32 = match deadline {
             Some(dl) => {
                 let now = std::time::Instant::now();
                 if now >= dl {
-                    return -(crate::linux_abi::LINUX_ETIMEDOUT as i64);
+                    return LinuxErrno::new(crate::linux_abi::LINUX_ETIMEDOUT).guest_retval();
                 }
                 u32::try_from((dl - now).as_micros().min(20_000)).unwrap_or(20_000)
             }

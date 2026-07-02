@@ -2161,6 +2161,52 @@ const _: () = assert!(
 );
 assert_layout!(LinuxSigevent, sigev_value @ 0, sigev_signo @ 8, sigev_notify @ 12);
 
+/// A POSITIVE Linux errno (the `LINUX_E*` domain). The guest-visible retval is
+/// its single negation — made in exactly ONE place
+/// ([`LinuxErrno::guest_retval`]) so a pre-negated value can never be
+/// double-negated and a positive errno can never leak as a "success" retval.
+/// Debug builds assert the 1..=4095 kernel errno range at construction.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct LinuxErrno(i32);
+
+impl LinuxErrno {
+    /// Wrap a positive errno constant/translation result.
+    #[inline]
+    #[track_caller]
+    pub fn new(errno: i32) -> Self {
+        debug_assert!(
+            (1..=4095).contains(&errno),
+            "errno {errno} outside the kernel's 1..=4095 range"
+        );
+        LinuxErrno(errno)
+    }
+
+    /// The positive errno value (reporting, siginfo, comparisons).
+    #[inline]
+    pub const fn get(self) -> i32 {
+        self.0
+    }
+
+    /// THE negation choke point: the raw retval the guest receives.
+    #[inline]
+    pub const fn guest_retval(self) -> i64 {
+        -(self.0 as i64)
+    }
+
+    /// Recover the errno from a guest retval in the kernel's errno window,
+    /// `None` for any other value (a legitimate negative return is NOT an
+    /// errno). Replaces the ad-hoc `(-ret) as u32` re-derivations.
+    #[inline]
+    #[allow(clippy::manual_range_contains)] // `RangeInclusive::contains` is not const.
+    pub const fn from_guest_retval(ret: i64) -> Option<LinuxErrno> {
+        if ret >= -4095 && ret <= -1 {
+            Some(LinuxErrno(-ret as i32))
+        } else {
+            None
+        }
+    }
+}
+
 // ===== ABI constants moved from dispatch.rs (Goal #3, pub set) =====
 pub const LINUX_EPERM: i32 = 1;
 pub const LINUX_ENOENT: i32 = 2;
