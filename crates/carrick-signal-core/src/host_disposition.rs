@@ -39,6 +39,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// used so a concurrent install never loses a bit.
 static INSTALLED_MASK: AtomicU64 = AtomicU64::new(0);
 
+/// `INSTALLED_MASK` is process-global, and Rust runs tests in one binary in
+/// parallel. Any test that mutates the install mask must hold this lock.
+#[cfg(test)]
+pub(crate) static MASK_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Mark `signum` as having a mirrored host disposition. Returns `true` iff the bit
 /// was ALREADY set (so the caller can early-return as an idempotent no-op). A
 /// `signum` outside 1..=64 is ignored and reported as "already installed" so the
@@ -119,14 +124,6 @@ pub fn is_host_routable(signum: i32) -> bool {
 mod tests {
     use super::*;
 
-    /// `INSTALLED_MASK` is a process-global `static`, so the two tests that
-    /// mutate it (`mark`/`clear`/`clear_all`) must NOT run concurrently — cargo
-    /// runs tests in one binary in parallel, and one test's `clear_all` racing
-    /// another's assertions flakes under load. Serialize just those two; the
-    /// `is_host_routable` classification tests touch no shared state. Poison-
-    /// recovering so a panic in one test doesn't cascade-fail the other.
-    static MASK_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn standard_catchable_signals_are_routable() {
         // The signals a sibling's host kill could otherwise terminate us with.
@@ -184,7 +181,7 @@ mod tests {
 
     #[test]
     fn installed_mask_mark_clear_roundtrip() {
-        let _serialize = MASK_TEST_LOCK
+        let _serialize = super::MASK_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         clear_all();
