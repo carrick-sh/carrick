@@ -2442,7 +2442,7 @@ pub mod itimer {
 
     pub use carrick_timer_core::itimer::*;
 
-    use std::time::Duration;
+    use carrick_timer_core::TimerSpecNs;
 
     /// Spawn the fallback timer thread for `which`. The timing-loop body is
     /// shared (`carrick_timer_core::itimer::run_fallback`); the per-fire action
@@ -2453,19 +2453,12 @@ pub mod itimer {
     /// itimers fire off real guest CPU time (Task 3 wired the source) and never
     /// while the guest is idle. At most one thread per `which` is live — a
     /// disarm/re-arm bumps the generation so the old thread exits.
-    pub fn spawn_fallback_timer(
-        which: usize,
-        generation: u64,
-        value: Duration,
-        interval: Duration,
-    ) {
-        let value_ns = u64::try_from(value.as_nanos()).unwrap_or(u64::MAX);
-        let interval_ns = u64::try_from(interval.as_nanos()).unwrap_or(u64::MAX);
+    pub fn spawn_fallback_timer(which: usize, generation: u64, spec: TimerSpecNs) {
         let signum = signum_for(which);
         let _ = std::thread::Builder::new()
             .name(format!("carrick-itimer-{which}"))
             .spawn(move || {
-                run_fallback(which, generation, value_ns, interval_ns, || {
+                run_fallback(which, generation, spec, || {
                     crate::timer_delivery::deliver(signum);
                 });
             });
@@ -2489,13 +2482,13 @@ pub mod posix_timer {
     };
 
     /// (Re-)arm timer `id`. Returns the PREVIOUS spec (for `timer_settime`'s
-    /// old_value). A `value_ns == 0` disarms. A non-zero value spawns a firing
-    /// thread (the shared timer-core loop) that delivers `signum` after `value`
-    /// then every `interval`, until the timer is re-armed or deleted (generation
-    /// bump).
-    pub fn arm(id: i32, value_ns: u64, interval_ns: u64) -> Option<PosixTimerSpec> {
-        let armed = carrick_timer_core::posix::arm(id, value_ns, interval_ns)?;
-        if value_ns > 0 {
+    /// old_value). A `spec.value == 0` disarms. A non-zero value spawns a
+    /// firing thread (the shared timer-core loop) that delivers `signum` after
+    /// `spec.value` then every `spec.interval`, until the timer is re-armed or
+    /// deleted (generation bump).
+    pub fn arm(id: i32, spec: carrick_timer_core::TimerSpecNs) -> Option<PosixTimerSpec> {
+        let armed = carrick_timer_core::posix::arm(id, spec)?;
+        if spec.value > 0 {
             let signum = armed.signum;
             let generation = armed.generation;
             let slot = armed.slot.clone();
@@ -2505,13 +2498,7 @@ pub mod posix_timer {
             let _ = std::thread::Builder::new()
                 .name(format!("carrick-ptimer-{id}"))
                 .spawn(move || {
-                    carrick_timer_core::posix::run_fallback(
-                        slot,
-                        generation,
-                        value_ns,
-                        interval_ns,
-                        on_fire,
-                    );
+                    carrick_timer_core::posix::run_fallback(slot, generation, spec, on_fire);
                 });
         }
         Some(armed.old)

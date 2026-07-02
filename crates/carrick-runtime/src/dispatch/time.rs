@@ -43,6 +43,8 @@
 //!
 //! Methods are `impl` blocks on [`SyscallDispatcher`]; see [`super`] for the
 //! dispatcher struct and the normalized dispatch table.
+use carrick_timer_core::TimerSpecNs;
+
 use super::*;
 
 syscall_table! {
@@ -80,15 +82,18 @@ syscall_table! {
     266 => clock_adjtime,
 }
 
-/// Pack a `(value_ns, interval_ns)` pair into a `LinuxItimerspec` (the Linux
-/// kernel ABI `struct __kernel_itimerspec`). Used by `timer_settime`'s
+/// Pack a timer's `(value, interval)` ns pair into a `LinuxItimerspec` (the
+/// Linux kernel ABI `struct __kernel_itimerspec`). Used by `timer_settime`'s
 /// `old_value` and `timer_gettime`'s `cur_value` writes.
-fn build_itimerspec_ns(value_ns: u64, interval_ns: u64) -> LinuxItimerspec {
+fn build_itimerspec_ns(spec: TimerSpecNs) -> LinuxItimerspec {
     let split = |ns: u64| LinuxTimespec {
         tv_sec: i64::try_from(ns / 1_000_000_000).unwrap_or(i64::MAX),
         tv_nsec: i64::try_from(ns % 1_000_000_000).unwrap_or(0),
     };
-    LinuxItimerspec::new(split(interval_ns), split(value_ns))
+    // WIRE order: `LinuxItimerspec::new(it_interval, it_value)` — interval
+    // FIRST, matching the struct's field order. Taking the typed pair means no
+    // caller ever has to re-perform (and possibly re-swap) that transposition.
+    LinuxItimerspec::new(split(spec.interval), split(spec.value))
 }
 
 impl SyscallDispatcher {
@@ -316,13 +321,11 @@ impl SyscallDispatcher {
                         None => crate::itimer::disarm(idx),
                     }
                 } else {
-                    let interval_ns = u64::try_from(interval.as_nanos()).unwrap_or(u64::MAX);
-                    let arm_value_ns = u64::try_from(value.as_nanos()).unwrap_or(u64::MAX);
+                    let spec_ns = TimerSpecNs::from_durations(value, interval);
                     let needs_periodic = !interval.is_zero() && value != interval;
                     // Write the neutral slot state FIRST (timer-core), then ask
                     // the backend to initiate delivery.
-                    let generation =
-                        crate::itimer::arm(idx, arm_value_ns, interval_ns, needs_periodic);
+                    let generation = crate::itimer::arm(idx, spec_ns, needs_periodic);
 
                     let signum = crate::itimer::signum_for(idx);
                     let signal_name = match signum {
@@ -344,11 +347,10 @@ impl SyscallDispatcher {
                     // the shared wall-clock fallback thread (KVM, or an HVF
                     // process with no pump kqueue yet). No registered backend (a
                     // backing-loop-less unit test) also falls back.
-                    let owned = crate::timer_delivery::delivery().is_some_and(|d| {
-                        d.arm_itimer(idx, arm_value_ns, interval_ns, needs_periodic, signum)
-                    });
+                    let owned = crate::timer_delivery::delivery()
+                        .is_some_and(|d| d.arm_itimer(idx, spec_ns, needs_periodic, signum));
                     if !owned {
-                        crate::itimer::spawn_fallback_timer(idx, generation, value, interval);
+                        crate::itimer::spawn_fallback_timer(idx, generation, spec_ns);
                     }
                 }
             }
@@ -381,13 +383,13 @@ impl SyscallDispatcher {
                 interval,
             });
 
-            let value_ns = u64::try_from(value.as_nanos()).unwrap_or(u64::MAX);
-            let generation = crate::itimer::arm(idx, value_ns, 0, false);
+            let spec_ns = TimerSpecNs::from_durations(value, interval);
+            let generation = crate::itimer::arm(idx, spec_ns, false);
             let signum = crate::itimer::signum_for(idx);
             let owned = crate::timer_delivery::delivery()
-                .is_some_and(|d| d.arm_itimer(idx, value_ns, 0, false, signum));
+                .is_some_and(|d| d.arm_itimer(idx, spec_ns, false, signum));
             if !owned {
-                crate::itimer::spawn_fallback_timer(idx, generation, value, interval);
+                crate::itimer::spawn_fallback_timer(idx, generation, spec_ns);
             }
 
             Ok(DispatchOutcome::Returned {
@@ -486,6 +488,10 @@ impl SyscallDispatcher {
             let (interval_dur, value_dur) = itimerspec_durations(spec)?;
             let interval_ns =
                 interval_dur.map_or(0, |d| u64::try_from(duration_to_nanos(d)).unwrap_or(u64::MAX));
+            // Not `TimerSpecNs::from_durations`: the value leg has its own
+            // shape (None disarms; a TIMER_ABSTIME deadline becomes a relative
+            // interval floored at 1ns), so it can't share the plain
+            // Duration-pair saturation.
             let value_ns = match value_dur {
                 None => 0, // all-zero it_value disarms (Linux semantics)
                 Some(deadline) => {
@@ -503,6 +509,10 @@ impl SyscallDispatcher {
                     }
                 }
             };
+            let spec_ns = TimerSpecNs {
+                value: value_ns,
+                interval: interval_ns,
+            };
             // Route the arm through the backend `TimerDelivery` (HVF/KVM each
             // spawn their own firing mechanism; signum/si_value were captured at
             // timer_create and live on the slot, so only value/interval pass). No
@@ -510,17 +520,16 @@ impl SyscallDispatcher {
             // neutral registry directly (no firing thread, matching the old
             // pump-less path).
             let old = match crate::timer_delivery::delivery() {
-                Some(d) => d.arm_posix(id, value_ns, interval_ns),
-                None => crate::posix_timer::arm(id, value_ns, interval_ns),
+                Some(d) => d.arm_posix(id, spec_ns),
+                None => crate::posix_timer::arm(id, spec_ns),
             };
             if old_ptr.0 != 0 {
                 let prev = old.unwrap_or(crate::posix_timer::PosixTimerSpec {
                     signum: 0,
-                    value_ns: 0,
-                    interval_ns: 0,
+                    spec: TimerSpecNs::DISARM,
                     si_value: 0,
                 });
-                let old_spec = build_itimerspec_ns(prev.value_ns, prev.interval_ns);
+                let old_spec = build_itimerspec_ns(prev.spec);
                 if memory
                     .write_bytes(old_ptr.0, old_spec.as_bytes())
                     .is_err()
@@ -535,13 +544,13 @@ impl SyscallDispatcher {
         fn timer_gettime(this, cx, timer_id: u64, cur_ptr: GuestPtr) {
             let memory = &mut *cx.memory;
             let id = timer_id as i64 as i32;
-            let Some((value_ns, interval_ns)) = crate::posix_timer::remaining(id) else {
+            let Some(remaining) = crate::posix_timer::remaining(id) else {
                 return Ok(LINUX_EINVAL.into());
             };
             if cur_ptr.0 == 0 {
                 return Ok(LINUX_EFAULT.into());
             }
-            let spec = build_itimerspec_ns(value_ns, interval_ns);
+            let spec = build_itimerspec_ns(remaining);
             memory.write_bytes(cur_ptr.0, spec.as_bytes())?;
             Ok(DispatchOutcome::Returned { value: 0 })
         }

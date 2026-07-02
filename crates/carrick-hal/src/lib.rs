@@ -50,7 +50,7 @@ pub mod signal_pump;
 pub mod vcpu_sched;
 pub use vcpu_sched::{SlotId, SlotLease, VcpuScheduler, Yield};
 pub mod timer_delivery;
-pub use timer_delivery::{PosixTimerSpec, TimerArm, TimerDelivery};
+pub use timer_delivery::{PosixTimerSpec, TimerArm, TimerDelivery, TimerSpecNs};
 pub mod guest_arch;
 pub use guest_arch::{GuestArch, PageTableCodec, PtGranule, SyscallRemap, SyscallTable};
 pub mod aarch64_arch;

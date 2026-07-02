@@ -6,7 +6,7 @@
 
 pub use carrick_timer_core::itimer::*;
 
-use std::time::Duration;
+use carrick_timer_core::TimerSpecNs;
 
 /// Fallback delivery for runtimes that do not have a signal-pump kqueue. The
 /// threaded runtime uses EVFILT_TIMER so a busy-waiting vCPU can be kicked; this
@@ -16,13 +16,11 @@ use std::time::Duration;
 /// Spawns the thread; the timing loop body is shared
 /// (`carrick_timer_core::itimer::run_fallback`). The per-fire action (probe +
 /// publish the process signal) is HVF-specific.
-pub fn spawn_fallback_timer(which: usize, generation: u64, value: Duration, interval: Duration) {
-    let value_ns = u64::try_from(value.as_nanos()).unwrap_or(u64::MAX);
-    let interval_ns = u64::try_from(interval.as_nanos()).unwrap_or(u64::MAX);
+pub fn spawn_fallback_timer(which: usize, generation: u64, spec: TimerSpecNs) {
     let _ = std::thread::Builder::new()
         .name("carrick-itimer-fallback".to_owned())
         .spawn(move || {
-            run_fallback(which, generation, value_ns, interval_ns, || {
+            run_fallback(which, generation, spec, || {
                 let signum = signum_for(which);
                 crate::probes::itimer_fire(signum, 1);
                 crate::host_signal::publish_process_signal(signum);

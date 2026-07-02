@@ -21,8 +21,7 @@ impl carrick_hal::TimerDelivery for NvmmTimerDelivery {
     fn arm_itimer(
         &self,
         _which: usize,
-        _value_ns: u64,
-        _interval_ns: u64,
+        _spec: carrick_hal::timer_delivery::TimerSpecNs,
         _needs_periodic: bool,
         _signum: i32,
     ) -> bool {
@@ -36,11 +35,10 @@ impl carrick_hal::TimerDelivery for NvmmTimerDelivery {
     fn arm_posix(
         &self,
         id: i32,
-        value_ns: u64,
-        interval_ns: u64,
+        spec: carrick_hal::timer_delivery::TimerSpecNs,
     ) -> Option<carrick_hal::timer_delivery::PosixTimerSpec> {
-        let armed = carrick_timer_core::posix::arm(id, value_ns, interval_ns)?;
-        if value_ns > 0 {
+        let armed = carrick_timer_core::posix::arm(id, spec)?;
+        if spec.value > 0 {
             let signum = armed.signum;
             let generation = armed.generation;
             let slot = armed.slot.clone();
@@ -52,20 +50,14 @@ impl carrick_hal::TimerDelivery for NvmmTimerDelivery {
             let _ = std::thread::Builder::new()
                 .name(format!("carrick-ptimer-{id}"))
                 .spawn(move || {
-                    carrick_timer_core::posix::run_fallback(
-                        slot,
-                        generation,
-                        value_ns,
-                        interval_ns,
-                        on_fire,
-                    );
+                    carrick_timer_core::posix::run_fallback(slot, generation, spec, on_fire);
                 });
         }
         Some(armed.old)
     }
 
     fn disarm_posix(&self, id: i32) {
-        let _ = carrick_timer_core::posix::arm(id, 0, 0);
+        let _ = carrick_timer_core::posix::arm(id, carrick_timer_core::TimerSpecNs::DISARM);
     }
 
     fn current_arm(&self, which: usize) -> Option<carrick_hal::timer_delivery::TimerArm> {

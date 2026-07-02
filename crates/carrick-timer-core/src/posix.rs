@@ -20,6 +20,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::{CpuNs, TimerSpecNs};
+
 /// One POSIX timer's arm spec (`timer_settime` value/interval + the signum to
 /// deliver). `si_value` carries the `sigev_value` payload for the `SI_TIMER`
 /// `siginfo` (default 0; not yet plumbed through the arm path).
@@ -27,10 +29,9 @@ use std::time::{Duration, Instant};
 pub struct PosixTimerSpec {
     /// Linux signum to deliver on expiry (sigev_signo).
     pub signum: i32,
-    /// First expiry, in ns. 0 disarms.
-    pub value_ns: u64,
-    /// Repeat period in ns. 0 = one-shot.
-    pub interval_ns: u64,
+    /// The value/interval ns pair (`spec.value == 0` disarms,
+    /// `spec.interval == 0` = one-shot).
+    pub spec: TimerSpecNs,
     /// `sigev_value` payload delivered in the `SI_TIMER` siginfo. Default 0.
     pub si_value: i64,
 }
@@ -58,8 +59,7 @@ impl PosixTimerSlot {
             clock_id,
             spec: Mutex::new(PosixTimerSpec {
                 signum,
-                value_ns: 0,
-                interval_ns: 0,
+                spec: TimerSpecNs::DISARM,
                 si_value: 0,
             }),
             armed_at_ns: AtomicU64::new(0),
@@ -127,20 +127,20 @@ pub struct PosixArm {
 }
 
 /// Replace the slot's spec and bump its generation. Returns `None` for an
-/// unknown id. On a non-disarm arm (`value_ns != 0`) records the arm timestamp;
-/// the caller is responsible for spawning the firing thread (the publish + kick
-/// is backend-specific). A `value_ns == 0` disarms; the caller skips spawning.
-pub fn arm(id: i32, value_ns: u64, interval_ns: u64) -> Option<PosixArm> {
+/// unknown id. On a non-disarm arm (`spec.value != 0`) records the arm
+/// timestamp; the caller is responsible for spawning the firing thread (the
+/// publish + kick is backend-specific). A `spec.value == 0` disarms; the caller
+/// skips spawning.
+pub fn arm(id: i32, spec: TimerSpecNs) -> Option<PosixArm> {
     let slot = {
         let mut guard = registry();
         let map = ensure_registry(&mut guard);
         map.get(&id).cloned()
     }?;
     let old = {
-        let mut spec = slot.spec.lock().unwrap_or_else(|e| e.into_inner());
-        let old = *spec;
-        spec.value_ns = value_ns;
-        spec.interval_ns = interval_ns;
+        let mut cur = slot.spec.lock().unwrap_or_else(|e| e.into_inner());
+        let old = *cur;
+        cur.spec = spec;
         old
     };
     slot.overruns.store(0, Ordering::SeqCst);
@@ -148,7 +148,7 @@ pub fn arm(id: i32, value_ns: u64, interval_ns: u64) -> Option<PosixArm> {
         .generation
         .fetch_add(1, Ordering::SeqCst)
         .wrapping_add(1);
-    if value_ns == 0 {
+    if spec.value == 0 {
         slot.armed_at_ns.store(0, Ordering::SeqCst);
     } else {
         slot.armed_at_ns.store(now_ns(), Ordering::SeqCst);
@@ -187,29 +187,28 @@ fn is_cpu_clock(clock_id: i32) -> bool {
 /// CPU-time clocks (they all fired off wall-clock). Branches on the timer's
 /// clock: a CPU-time clock drives off the aggregate guest CPU total (so the timer
 /// only advances while the guest actually burns CPU); every other clock is
-/// wall-clock. `value_ns` is the first expiry, `interval_ns == 0` is one-shot.
-/// Retires on a generation bump (disarm/re-arm).
+/// wall-clock. `spec.value` is the first expiry, `spec.interval == 0` is
+/// one-shot. Retires on a generation bump (disarm/re-arm).
 pub fn run_fallback(
     slot: std::sync::Arc<PosixTimerSlot>,
     generation: u64,
-    value_ns: u64,
-    interval_ns: u64,
+    spec: TimerSpecNs,
     on_fire: impl Fn(),
 ) {
     if is_cpu_clock(slot.clock_id) {
-        run_fallback_cpu(&slot, generation, value_ns, interval_ns, &on_fire);
+        run_fallback_cpu(&slot, generation, spec, &on_fire);
         return;
     }
-    std::thread::sleep(Duration::from_nanos(value_ns));
+    std::thread::sleep(Duration::from_nanos(spec.value));
     if !generation_matches(&slot, generation) {
         return;
     }
     on_fire();
-    if interval_ns == 0 {
+    if spec.interval == 0 {
         return;
     }
     loop {
-        std::thread::sleep(Duration::from_nanos(interval_ns));
+        std::thread::sleep(Duration::from_nanos(spec.interval));
         if !generation_matches(&slot, generation) {
             return;
         }
@@ -226,12 +225,11 @@ pub fn run_fallback(
 fn run_fallback_cpu(
     slot: &PosixTimerSlot,
     generation: u64,
-    value_ns: u64,
-    interval_ns: u64,
+    spec: TimerSpecNs,
     on_fire: &impl Fn(),
 ) {
     let start = carrick_host::guest_cpu::total_ns_including_active();
-    let mut due = start.saturating_add(value_ns);
+    let mut due = start.saturating_add(spec.value);
     let mut fired = false;
     loop {
         if !generation_matches(slot, generation) {
@@ -239,8 +237,8 @@ fn run_fallback_cpu(
         }
         let now = carrick_host::guest_cpu::total_ns_including_active();
         if now < due {
-            let delay = crate::itimer::cpu_timer_recheck_delay_ns(due - now);
-            std::thread::sleep(Duration::from_nanos(delay));
+            let delay = crate::itimer::cpu_timer_recheck_delay_ns(CpuNs(due - now));
+            std::thread::sleep(Duration::from_nanos(delay.raw()));
             continue;
         }
         if fired {
@@ -248,30 +246,36 @@ fn run_fallback_cpu(
         }
         on_fire();
         fired = true;
-        if interval_ns == 0 {
+        if spec.interval == 0 {
             return;
         }
-        due = now.saturating_add(interval_ns);
+        due = now.saturating_add(spec.interval);
     }
 }
 
 /// Compute the remaining value/interval for a timer. Returns `None` for an
 /// unknown id (Linux `EINVAL`).
-pub fn remaining(id: i32) -> Option<(u64, u64)> {
+pub fn remaining(id: i32) -> Option<TimerSpecNs> {
     let slot = {
         let mut guard = registry();
         let map = ensure_registry(&mut guard);
         map.get(&id).cloned()
     }?;
-    let spec = *slot.spec.lock().unwrap_or_else(|e| e.into_inner());
+    let spec = slot.spec.lock().unwrap_or_else(|e| e.into_inner()).spec;
     let armed_at = slot.armed_at_ns.load(Ordering::SeqCst);
-    if armed_at == 0 || spec.value_ns == 0 {
+    if armed_at == 0 || spec.value == 0 {
         // Disarmed: remaining=0 (Linux convention).
-        return Some((0, spec.interval_ns));
+        return Some(TimerSpecNs {
+            value: 0,
+            interval: spec.interval,
+        });
     }
     let elapsed = now_ns().saturating_sub(armed_at);
-    let remaining = spec.value_ns.saturating_sub(elapsed);
-    Some((remaining, spec.interval_ns))
+    let remaining = spec.value.saturating_sub(elapsed);
+    Some(TimerSpecNs {
+        value: remaining,
+        interval: spec.interval,
+    })
 }
 
 /// Remove a timer. Returns whether the id existed.
@@ -338,10 +342,16 @@ mod tests {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let id = create(0, 14); // CLOCK_MONOTONIC=0, SIGALRM=14
         assert!(exists(id));
-        let _ = arm(id, 1_000_000_000, 0);
-        let (rem, interval) = remaining(id).expect("known id");
-        assert!(rem > 0);
-        assert_eq!(interval, 0);
+        let _ = arm(
+            id,
+            TimerSpecNs {
+                value: 1_000_000_000,
+                interval: 0,
+            },
+        );
+        let rem = remaining(id).expect("known id");
+        assert!(rem.value > 0);
+        assert_eq!(rem.interval, 0);
         assert!(delete(id));
         assert!(!exists(id));
         assert!(remaining(id).is_none());
@@ -351,7 +361,13 @@ mod tests {
     fn getoverrun_starts_at_zero() {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let id = create(0, 14);
-        let _ = arm(id, 50_000_000, 0);
+        let _ = arm(
+            id,
+            TimerSpecNs {
+                value: 50_000_000,
+                interval: 0,
+            },
+        );
         assert_eq!(getoverrun(id), Some(0));
         let _ = delete(id);
     }
@@ -363,7 +379,13 @@ mod tests {
         // child sees the not-found result (the syscall layer maps that to EINVAL).
         let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let id = create(0, 14); // CLOCK_MONOTONIC=0, SIGALRM=14
-        let _ = arm(id, 1_000_000_000, 0);
+        let _ = arm(
+            id,
+            TimerSpecNs {
+                value: 1_000_000_000,
+                interval: 0,
+            },
+        );
         assert!(exists(id));
         assert_eq!(getoverrun(id), Some(0));
         assert!(remaining(id).is_some());

@@ -8,8 +8,9 @@
 //! delivery glue differs.
 //!
 //! `signum`/`si_value` for a POSIX timer are captured at `timer_create` (carried
-//! on the slot), NOT at arm time — so `arm_posix` takes only `id`/value/interval,
-//! matching `carrick_timer_core::posix::arm`.
+//! on the slot), NOT at arm time — so `arm_posix` takes only `id` + the
+//! value/interval spec, matching `carrick_timer_core::posix::arm`.
+pub use carrick_timer_core::TimerSpecNs;
 pub use carrick_timer_core::itimer::TimerArm;
 pub use carrick_timer_core::posix::PosixTimerSpec;
 
@@ -23,8 +24,7 @@ pub trait TimerDelivery: Send + Sync {
     fn arm_itimer(
         &self,
         which: usize,
-        value_ns: u64,
-        interval_ns: u64,
+        spec: TimerSpecNs,
         needs_periodic: bool,
         signum: i32,
     ) -> bool;
@@ -34,15 +34,15 @@ pub trait TimerDelivery: Send + Sync {
     fn disarm_itimer(&self, which: usize);
 
     /// (Re-)arm POSIX per-process timer `id`. `signum`/`si_value` were captured
-    /// at `timer_create` and live on the slot, so only value/interval are
-    /// passed here. Returns the PREVIOUS spec (`timer_settime`'s `old_value`),
-    /// or `None` for an unknown id. A `value_ns == 0` disarms. Delegates slot
-    /// mutation to `carrick_timer_core::posix::arm`; the backend spawns its
-    /// firing mechanism (KVM/HVF: a wall-clock thread).
-    fn arm_posix(&self, id: i32, value_ns: u64, interval_ns: u64) -> Option<PosixTimerSpec>;
+    /// at `timer_create` and live on the slot, so only the value/interval spec
+    /// is passed here. Returns the PREVIOUS spec (`timer_settime`'s
+    /// `old_value`), or `None` for an unknown id. A `spec.value == 0` disarms.
+    /// Delegates slot mutation to `carrick_timer_core::posix::arm`; the backend
+    /// spawns its firing mechanism (KVM/HVF: a wall-clock thread).
+    fn arm_posix(&self, id: i32, spec: TimerSpecNs) -> Option<PosixTimerSpec>;
 
-    /// Disarm POSIX timer `id` (a `value_ns == 0` arm); bumps generation so any
-    /// in-flight firing thread retires.
+    /// Disarm POSIX timer `id` (a `spec.value == 0` arm); bumps generation so
+    /// any in-flight firing thread retires.
     fn disarm_posix(&self, id: i32);
 
     /// Reconstruct the current arm for fork replay (HVF re-applies the
