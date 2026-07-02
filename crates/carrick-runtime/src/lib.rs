@@ -1309,12 +1309,17 @@ pub mod runtime {
             .collect();
         host.extract_layers(&layer_paths)
             .map_err(|e| RuntimeError::FsBackend(anyhow::anyhow!("extract OCI layers: {e}")))?;
-        let guest_hostname = spec
+        // OWNED (not a borrow of `spec`): the threaded run loop below moves the
+        // dispatcher into per-vCPU threads, so a hostname tied to `spec`'s
+        // lifetime would escape to `'static` (E0521). The macOS path threads an
+        // owned `Cow` for the same reason.
+        let guest_hostname: String = spec
             .hostname
             .as_deref()
             .filter(|hostname| !hostname.is_empty())
-            .unwrap_or_else(crate::execute::guest_hostname);
-        seed_linux_baseline_gaps(&mut host, guest_hostname);
+            .map(str::to_owned)
+            .unwrap_or_else(|| crate::execute::guest_hostname().to_owned());
+        seed_linux_baseline_gaps(&mut host, &guest_hostname);
 
         // 2. Build the dispatcher rooted at the extracted rootfs. This is a
         //    sandboxed container fs (extracted OCI layers on a cap-std overlay):
