@@ -941,9 +941,12 @@ pub const LINUX_NLM_F_MULTI: u16 = 0x2;
 // Interface flags / types we report for `lo`.
 pub const LINUX_IFF_UP: u32 = 0x1;
 pub const LINUX_IFF_BROADCAST: u32 = 0x2;
+pub const LINUX_IFF_DEBUG: u32 = 0x4;
 pub const LINUX_IFF_LOOPBACK: u32 = 0x8;
 pub const LINUX_IFF_POINTOPOINT: u32 = 0x10;
 pub const LINUX_IFF_RUNNING: u32 = 0x40;
+pub const LINUX_IFF_NOARP: u32 = 0x80;
+pub const LINUX_IFF_PROMISC: u32 = 0x100;
 pub const LINUX_IFF_MULTICAST: u32 = 0x1000;
 pub const LINUX_ARPHRD_ETHER: u16 = 1;
 pub const LINUX_ARPHRD_LOOPBACK: u16 = 772;
@@ -2761,6 +2764,15 @@ pub const LINUX_PRIO_PGRP: u64 = 1;
 pub const LINUX_PRIO_USER: u64 = 2;
 pub const LINUX_DEFAULT_UMASK: u32 = 0o022;
 pub const LINUX_RLIM_INFINITY: u64 = u64::MAX;
+// getrlimit/setrlimit/prlimit64 resource numbers (asm-generic resource.h;
+// shared by aarch64 and x86_64). Only the resources carrick treats specially
+// are named; a resource >= RLIM_NLIMITS is EINVAL.
+pub const LINUX_RLIMIT_DATA: u64 = 2;
+pub const LINUX_RLIMIT_STACK: u64 = 3;
+pub const LINUX_RLIMIT_NPROC: u64 = 6;
+pub const LINUX_RLIMIT_NOFILE: u64 = 7;
+pub const LINUX_RLIMIT_AS: u64 = 9;
+pub const LINUX_RLIM_NLIMITS: u64 = 16;
 pub const LINUX_RUSAGE_SELF: i32 = 0;
 pub const LINUX_RUSAGE_CHILDREN: i32 = -1;
 pub const LINUX_RUSAGE_THREAD: i32 = 1;
@@ -2785,6 +2797,7 @@ pub const LINUX_EPOLLRDHUP: u32 = 0x2000;
 pub const LINUX_EPOLLET: u32 = 0x8000_0000;
 pub const LINUX_EPOLLONESHOT: u32 = 0x4000_0000;
 pub const LINUX_EPOLLEXCLUSIVE: u32 = 0x1000_0000;
+pub const LINUX_EPOLLWAKEUP: u32 = 0x2000_0000;
 // inotify(7) event-mask bits (asm-generic `linux/inotify.h`; shared by every
 // arch carrick targets). Both the watch mask passed to `inotify_add_watch` and
 // the `mask` field of a returned `struct inotify_event` use this layout.
@@ -2860,6 +2873,10 @@ pub const LINUX_FUTEX_CMP_REQUEUE: u64 = 4;
 pub const LINUX_FUTEX_LOCK_PI: u64 = 6;
 pub const LINUX_FUTEX_UNLOCK_PI: u64 = 7;
 pub const LINUX_FUTEX_TRYLOCK_PI: u64 = 8;
+/// Bitset variants of WAIT/WAKE: identical semantics with a 32-bit wake mask in
+/// arg6. carrick treats a full-mask bitset op as its plain counterpart.
+pub const LINUX_FUTEX_WAIT_BITSET: u64 = 9;
+pub const LINUX_FUTEX_WAKE_BITSET: u64 = 10;
 pub const LINUX_FUTEX_CMD_MASK: u64 = 0x7f;
 pub const LINUX_FUTEX_PRIVATE_FLAG: u64 = 128;
 pub const LINUX_FUTEX_CLOCK_REALTIME: u64 = 256;
@@ -3221,6 +3238,82 @@ bitflags! {
         const WRITE = LINUX_PROT_WRITE;
         const EXEC = LINUX_PROT_EXEC;
     }
+
+    /// `epoll_event.events` interest/readiness bits. The wire word stays a raw
+    /// `u32` in [`LinuxEpollEvent`]; convert with `from_bits_retain` at the
+    /// read/write seam — Linux epoll ACCEPTS unknown event bits (they are
+    /// simply never reported), so no site may reject on unknown bits.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct LinuxEpollEvents: u32 {
+        const IN = LINUX_EPOLLIN;
+        const PRI = LINUX_EPOLLPRI;
+        const OUT = LINUX_EPOLLOUT;
+        const ERR = LINUX_EPOLLERR;
+        const HUP = LINUX_EPOLLHUP;
+        const RDHUP = LINUX_EPOLLRDHUP;
+        const EXCLUSIVE = LINUX_EPOLLEXCLUSIVE;
+        const WAKEUP = LINUX_EPOLLWAKEUP;
+        const ONESHOT = LINUX_EPOLLONESHOT;
+        const ET = LINUX_EPOLLET;
+    }
+
+    /// `splice`/`vmsplice`/`tee` flag bits. The full set IS the supported set
+    /// (`LINUX_SPLICE_SUPPORTED_FLAGS`), so `from_bits(...)` returning `None`
+    /// is exactly the historical `flags & !SUPPORTED != 0` EINVAL rejection.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct LinuxSpliceFlags: u64 {
+        const MOVE = LINUX_SPLICE_F_MOVE;
+        const NONBLOCK = LINUX_SPLICE_F_NONBLOCK;
+        const MORE = LINUX_SPLICE_F_MORE;
+        const GIFT = LINUX_SPLICE_F_GIFT;
+    }
+
+    /// `eventfd2` flag bits. The full set is the supported set, so
+    /// `from_bits(...)` `None` is the historical unknown-bit EINVAL. NONBLOCK/
+    /// CLOEXEC share the `O_*` values (Linux defines `EFD_*` from them).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct LinuxEfdFlags: u64 {
+        const SEMAPHORE = LINUX_EFD_SEMAPHORE;
+        const NONBLOCK = LINUX_EFD_NONBLOCK;
+        const CLOEXEC = LINUX_EFD_CLOEXEC;
+    }
+
+    /// `send*`/`recv*` `msg_flags` bits. Linux mostly IGNORES unknown flag
+    /// bits on these syscalls, so sites convert with `from_bits_retain` and
+    /// test with `.contains()` — never reject on unknown bits here.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct LinuxMsgFlags: i32 {
+        const OOB = LINUX_MSG_OOB;
+        const PEEK = LINUX_MSG_PEEK;
+        const DONTROUTE = LINUX_MSG_DONTROUTE;
+        const CTRUNC = LINUX_MSG_CTRUNC;
+        const TRUNC = LINUX_MSG_TRUNC;
+        const DONTWAIT = LINUX_MSG_DONTWAIT;
+        const EOR = LINUX_MSG_EOR;
+        const WAITALL = LINUX_MSG_WAITALL;
+        const ERRQUEUE = LINUX_MSG_ERRQUEUE;
+        const NOSIGNAL = LINUX_MSG_NOSIGNAL;
+        const CMSG_CLOEXEC = LINUX_MSG_CMSG_CLOEXEC;
+    }
+
+    /// `wait4`/`waitid` option bits. WSTOPPED is `waitid`'s alias for
+    /// WUNTRACED (same value, 2). Each syscall accepts a DIFFERENT subset —
+    /// see [`LinuxWaitOptions::WAITID_SUPPORTED`] /
+    /// [`LinuxWaitOptions::WAIT4_SUPPORTED`]; unknown bits are EINVAL there,
+    /// preserved via those exact masks.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct LinuxWaitOptions: u64 {
+        const WNOHANG = LINUX_WNOHANG;
+        const WUNTRACED = LINUX_WUNTRACED;
+        /// `waitid` spelling of WUNTRACED (identical bit).
+        const WSTOPPED = LINUX_WSTOPPED;
+        const WEXITED = LINUX_WEXITED;
+        const WCONTINUED = LINUX_WCONTINUED;
+        const WNOWAIT = LINUX_WNOWAIT;
+        const WNOTHREAD = LINUX_WNOTHREAD;
+        const WALL = LINUX_WALL;
+        const WCLONE = LINUX_WCLONE;
+    }
 }
 
 impl LinuxProtFlags {
@@ -3269,6 +3362,18 @@ impl LinuxSocketTypeFlags {
     pub const SUPPORTED_MASK: i32 = Self::NONBLOCK.bits() | Self::CLOEXEC.bits();
 }
 
+impl LinuxWaitOptions {
+    /// The `waitid` state selectors (WEXITED | WSTOPPED | WCONTINUED); at
+    /// least one must be set or the call is EINVAL.
+    pub const WAITID_STATE_MASK: Self = Self::from_bits_retain(LINUX_WAITID_STATE_MASK);
+    /// Exactly [`LINUX_WAITID_SUPPORTED_FLAGS`]: any option bit outside this
+    /// set is EINVAL for `waitid`.
+    pub const WAITID_SUPPORTED: Self = Self::from_bits_retain(LINUX_WAITID_SUPPORTED_FLAGS);
+    /// Exactly [`LINUX_WAIT4_SUPPORTED_FLAGS`]: any option bit outside this
+    /// set is EINVAL for `wait4`.
+    pub const WAIT4_SUPPORTED: Self = Self::from_bits_retain(LINUX_WAIT4_SUPPORTED_FLAGS);
+}
+
 pub const LINUX_SOCKET_TYPE_SUPPORTED_MASK: u64 = LinuxSocketTypeFlags::SUPPORTED_MASK as u64
     | LINUX_SOCK_STREAM as u64
     | LINUX_SOCK_DGRAM as u64
@@ -3283,6 +3388,9 @@ pub const LINUX_MSG_DONTWAIT: i32 = 0x0040;
 pub const LINUX_MSG_EOR: i32 = 0x0080;
 pub const LINUX_MSG_CTRUNC: i32 = 0x0008;
 pub const LINUX_MSG_WAITALL: i32 = 0x0100;
+/// Read from the socket's error queue (`IP_RECVERR` timestamps etc.). carrick
+/// keeps no error queue, so the queue is always empty.
+pub const LINUX_MSG_ERRQUEUE: i32 = 0x2000;
 pub const LINUX_MSG_NOSIGNAL: i32 = 0x4000;
 pub const LINUX_MSG_CMSG_CLOEXEC: i32 = 0x4000_0000_u32 as i32;
 // Linux socket option levels and names. Linux numbers them as small
@@ -3311,6 +3419,10 @@ pub const LINUX_CMSG_ALIGN: usize = 8;
 pub const LINUX_SOL_IP: i32 = 0; // IPPROTO_IP
 pub const LINUX_SOL_TCP: i32 = 6; // IPPROTO_TCP
 pub const LINUX_SOL_UDP: i32 = 17; // IPPROTO_UDP
+/// Linux protocol number for UDP-Lite (RFC 3828). macOS has no such protocol;
+/// carrick backs it with a plain UDP socket (only the checksum-coverage
+/// sockopts differ, accepted as no-ops).
+pub const LINUX_IPPROTO_UDPLITE: i32 = 136;
 pub const LINUX_SOL_IPV6: i32 = 41; // IPPROTO_IPV6
 
 // IPPROTO_IP / IPPROTO_IPV6 option numbers differ from macOS, so they must be
@@ -3814,6 +3926,43 @@ mod kernel_abi_tests {
         assert_eq!(LinuxSocketTypeFlags::SUPPORTED_MASK & (1_i32 << 30), 0);
 
         assert_eq!(LinuxFdFlags::CLOEXEC.bits(), LINUX_FD_CLOEXEC);
+    }
+
+    #[test]
+    fn stage11_flag_types_match_their_consts() {
+        // Splice/eventfd: the type's FULL set is the supported set, so the
+        // dispatch sites' `from_bits(...)`-is-None rejection is bit-identical
+        // to the historical `flags & !SUPPORTED != 0` EINVAL test.
+        assert_eq!(LinuxSpliceFlags::all().bits(), LINUX_SPLICE_SUPPORTED_FLAGS);
+        assert_eq!(
+            LinuxEfdFlags::all().bits(),
+            LINUX_EFD_SEMAPHORE | LINUX_EFD_NONBLOCK | LINUX_EFD_CLOEXEC
+        );
+        // Wait options: the per-syscall supported masks stay bit-identical to
+        // the raw consts the dispatch sites used to test against.
+        assert_eq!(
+            LinuxWaitOptions::WAITID_SUPPORTED.bits(),
+            LINUX_WAITID_SUPPORTED_FLAGS
+        );
+        assert_eq!(
+            LinuxWaitOptions::WAIT4_SUPPORTED.bits(),
+            LINUX_WAIT4_SUPPORTED_FLAGS
+        );
+        assert_eq!(
+            LinuxWaitOptions::WAITID_STATE_MASK.bits(),
+            LINUX_WAITID_STATE_MASK
+        );
+        assert_eq!(LinuxWaitOptions::WSTOPPED, LinuxWaitOptions::WUNTRACED);
+        // Epoll events / msg flags carry UNKNOWN bits through from_bits_retain
+        // (both syscalls ignore unknown bits rather than reject them).
+        assert_eq!(
+            LinuxEpollEvents::from_bits_retain(u32::MAX).bits(),
+            u32::MAX
+        );
+        assert_eq!(LinuxEpollEvents::ET.bits(), LINUX_EPOLLET);
+        assert_eq!(LinuxMsgFlags::from_bits_retain(-1).bits(), -1);
+        assert_eq!(LinuxMsgFlags::CMSG_CLOEXEC.bits(), LINUX_MSG_CMSG_CLOEXEC);
+        assert_eq!(LinuxMsgFlags::ERRQUEUE.bits(), LINUX_MSG_ERRQUEUE);
     }
 
     #[test]

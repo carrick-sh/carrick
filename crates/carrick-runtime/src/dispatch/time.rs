@@ -705,7 +705,6 @@ impl SyscallDispatcher {
         // getrlimit(2) (syscall 163) — the older 2-arg form glibc and Apple
         // Rosetta still use. Equivalent to prlimit64 reading the current limit.
         fn getrlimit(this, cx, resource: u64, rlimit: GuestPtr) {
-            const LINUX_RLIM_NLIMITS: u64 = 16;
             if resource >= LINUX_RLIM_NLIMITS {
                 return Ok(LINUX_EINVAL.into());
             }
@@ -750,8 +749,6 @@ impl SyscallDispatcher {
             // Valid resources are 0..=15 (RLIMIT_CPU..RLIMIT_RTTIME); carrick
             // previously treated unknown resources as RLIM_INFINITY and
             // "succeeded".
-            const LINUX_RLIM_NLIMITS: u64 = 16;
-            const LINUX_RLIMIT_NOFILE: u64 = 7;
             if resource >= LINUX_RLIM_NLIMITS {
                 return Ok(LINUX_EINVAL.into());
             }
@@ -806,8 +803,7 @@ fn effective_rlimit(
     nofile_soft: u64,
     overrides: &[Option<LinuxRlimit>; 16],
 ) -> LinuxRlimit {
-    // RLIMIT_NOFILE = 7; its soft cap is authoritative in io.nofile_soft.
-    const LINUX_RLIMIT_NOFILE: u64 = 7;
+    // RLIMIT_NOFILE's soft cap is authoritative in io.nofile_soft.
     if resource != LINUX_RLIMIT_NOFILE
         && let Some(Some(limit)) = overrides.get(resource as usize)
     {
@@ -820,11 +816,6 @@ fn effective_rlimit(
 /// Shared so the old 2-arg and new 4-arg forms agree. `nofile_soft` is threaded
 /// in because RLIMIT_NOFILE's soft cap is dynamic (set via setrlimit).
 fn rlimit_for_resource(resource: u64, nofile_soft: u64) -> LinuxRlimit {
-    const LINUX_RLIMIT_DATA: u64 = 2;
-    const LINUX_RLIMIT_STACK: u64 = 3;
-    const LINUX_RLIMIT_NPROC: u64 = 6;
-    const LINUX_RLIMIT_NOFILE: u64 = 7;
-    const LINUX_RLIMIT_AS: u64 = 9;
     // The fd hard cap carrick exposes; mirrors fs::state::NOFILE_HARD (private).
     const NOFILE_HARD: u64 = 1024 * 1024;
     match resource {

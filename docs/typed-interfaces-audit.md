@@ -119,11 +119,13 @@ ns error saturates instead of failing.
 
 ### P2 — flag words doing ad-hoc `& LINUX_*` tests
 
-Typed already: clone/mmap/prot/open/at/futex-flags/socket-type/fd-flags.
-Still raw (reject-unknown-bits semantics NOT enforced): epoll events (`u32`),
-splice flags, eventfd2 flags, msg flags (`i32`), wait options, prctl option,
-fcntl cmd, ioctl request. These are lower risk (validated per-site today) but
-each new site re-implements the mask test by hand.
+Typed already: clone/mmap/prot/open/at/futex-flags/socket-type/fd-flags, and
+(stage 11) epoll events (`u32`), splice flags, eventfd2 flags, msg flags
+(`i32`), wait options. Still raw: prctl option, fcntl cmd, ioctl request
+(selectors, not flag words — a future enum stage, not bitflags). Each typed
+group preserves its per-site accept/reject choice: splice/eventfd2 REJECT
+unknown bits (`from_bits`), epoll/msg IGNORE them (`from_bits_retain`), wait
+options keep their exact per-syscall supported masks.
 
 ## Migration plan (staged, each stage independently green)
 
@@ -135,11 +137,13 @@ each new site re-implements the mask test by hand.
 | 4 | `HostFd` newtype at the guest→host accessor seam (fd_helpers returns, splice/tee/sendfile plumbing) | done (this series) |
 | 5 | Stop `NsPid` carrying host pids (wait4/ptrace → `HostPid`) | done (this series) |
 | 6 | Fix the execve `ignored_mask` raw-signum convention → `SigSet` (bit=signum-1) on both ends | done (this series) |
-| 7 | `SigSet`/`SigBlockMask` through signal-core + host_signal + io_wait chains + `SignalState` fields | TODO — mechanical, ~5 files, agent-mapped site list in this doc's source survey |
-| 8 | `CanonicalNr`/`NativeNr` newtypes on `RawSyscall`/`SyscallRequest` | TODO |
-| 9 | `GuestVa`/`Gpa`/`HostVa` in carrick-mem + engine translation chains | TODO — largest win for the memory subsystem, pairs with the durable-memory work |
+| 7 | `SigSet`/`SigBlockMask` through signal-core + host_signal + io_wait chains + `SignalState` fields | done (this series) — raw survives only at wire/atomic/sigframe boundaries |
+| 8 | `CanonicalNr`/`NativeNr` newtypes on `RawSyscall`/`SyscallRequest` | done (this series) — `SyscallRemap::Direct` table stays u64 (its uniqueness test is authoritative) |
+| 9 | `GuestVa`/`Gpa`/`HostVa` in carrick-mem + engine translation chains | done (this series) — `GuestMemory`/`GuestVmBackend` trait addresses deferred (pairs with durable-memory) |
 | 10 | `Errno` newtype with a single negation choke point | done (this series) — `LinuxErrno` newtype + single negation choke point (`guest_retval`/`from_guest_retval`); `DispatchOutcome::Errno` field migration deferred |
-| 11 | bitflags for epoll/splice/eventfd/msg/wait flag words; hoist function-local `LINUX_*` consts to carrick-abi | TODO — opportunistic per-file |
+| 11 | bitflags for epoll/splice/eventfd/msg/wait flag words; hoist function-local `LINUX_*` consts to carrick-abi | done (this series) — `LinuxEpollEvents`/`LinuxSpliceFlags`/`LinuxEfdFlags`/`LinuxMsgFlags`/`LinuxWaitOptions`; per-site accept/reject semantics preserved bit-identically (`from_bits` where supported == full set, `from_bits_retain` where unknown bits are ignored); function-local `LINUX_*` consts hoisted (flock l_type, IFF_*, FUTEX_*_BITSET, RLIMIT_*, IPPROTO_UDPLITE, MSG_ERRQUEUE) — `carrick-no-function-local-linux-const` semgrep gate at zero |
+| 12 | P1.6: timer `value_ns`/`interval_ns` pairs → typed `TimerNs`/spec struct through timer-core + hal `timer_delivery` + VMM impls | TODO |
+| 13 | P1.3 remainder: `bootstrap_signal_send(target: i64)`'s host-pid-vs-tid bool → typed target enum; `ThreadId` newtype (largest tid-domain change, own series) | TODO |
 
 Ground rules for every stage: newtypes are `#[repr(transparent)]`-equivalent
 zero-cost wrappers; constructors are NAMED for semantics (the `SigBlockMask::

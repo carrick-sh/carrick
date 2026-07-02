@@ -289,7 +289,9 @@ impl SyscallDispatcher {
         _last_ready: u32,
         _write_backpressured: bool,
     ) -> carrick_hal::event::Interest {
-        let mut interest = epoll_interest_for(events);
+        // Wire→typed seam: the guest event word is a raw u32; epoll ACCEPTS
+        // unknown bits, so retain them rather than reject.
+        let mut interest = epoll_interest_for(LinuxEpollEvents::from_bits_retain(events));
         // A one-way pipe/FIFO read end is never writable under Linux, so it must
         // never carry a write filter. FreeBSD's kqueue arms `EVFILT_WRITE` on a
         // pipe read end and fires it immediately (the read end is reported
@@ -341,7 +343,7 @@ impl SyscallDispatcher {
                     host_fd.get(),
                     pack_epoll_udata(sfd, sgen),
                     union_interest,
-                    epoll_host_trigger_mode(union_events),
+                    epoll_host_trigger_mode(LinuxEpollEvents::from_bits_retain(union_events)),
                 );
             }
             None => {
@@ -853,7 +855,9 @@ impl SyscallDispatcher {
     /// EAGAIN (true) rather than block: the guest fd is O_NONBLOCK, or the call
     /// carries MSG_DONTWAIT.
     pub(super) fn io_is_nonblocking(&self, fd: i32, msg_flags: i32) -> bool {
-        self.fd_status_flags(fd) & LINUX_O_NONBLOCK != 0 || (msg_flags & LINUX_MSG_DONTWAIT) != 0
+        // from_bits_retain: send/recv IGNORE unknown msg_flags bits.
+        self.fd_status_flags(fd) & LINUX_O_NONBLOCK != 0
+            || LinuxMsgFlags::from_bits_retain(msg_flags).contains(LinuxMsgFlags::DONTWAIT)
     }
 
     /// True iff `fd` is an eventfd. An eventfd is always POLLOUT-ready (its
@@ -1135,9 +1139,6 @@ impl SyscallDispatcher {
     }
 
     fn host_socket_install(&self, family: i32, type_: i32, protocol: i32) -> DispatchOutcome {
-        // Linux protocol number for UDP-Lite (RFC 3828); macOS has no such
-        // protocol, so it's backed by a plain UDP socket below.
-        const LINUX_IPPROTO_UDPLITE: i32 = 136;
         // Strip the Linux-only SOCK_NONBLOCK / SOCK_CLOEXEC bits before
         // we hand the type to macOS, then set them on the resulting fd
         // by hand.
@@ -1775,13 +1776,18 @@ impl SyscallDispatcher {
 
         fn eventfd2(this, cx, initial_value: u64, flags: u64) {
 
-            if flags & !(LINUX_EFD_SEMAPHORE | LINUX_EFD_NONBLOCK | LINUX_EFD_CLOEXEC) != 0 {
+            // `from_bits` rejects exactly the historical
+            // `& !(SEMAPHORE|NONBLOCK|CLOEXEC)` set: the type's full set IS
+            // the supported set.
+            let Some(efd_flags) = LinuxEfdFlags::from_bits(flags) else {
                 return Ok(LINUX_EINVAL.into());
-            }
+            };
             let description = OpenDescription::EventFd {
                 state: Arc::new(EventFdState::new(initial_value)),
-                semaphore: flags & LINUX_EFD_SEMAPHORE != 0,
-                base: OpenDescriptionBase::new(flags & LINUX_EFD_NONBLOCK),
+                semaphore: efd_flags.contains(LinuxEfdFlags::SEMAPHORE),
+                // EFD_NONBLOCK == O_NONBLOCK, so the isolated bit IS the
+                // status-flag word the base expects.
+                base: OpenDescriptionBase::new((efd_flags & LinuxEfdFlags::NONBLOCK).bits()),
             };
             Ok(this.install_fd(description, linux_fd_flags_from_open_flags(flags)))
 
@@ -1920,7 +1926,9 @@ impl SyscallDispatcher {
                                 host_fd.get(),
                                 pack_epoll_udata(fd, reg_gen),
                                 effective,
-                                epoll_host_trigger_mode(ev_events),
+                                epoll_host_trigger_mode(LinuxEpollEvents::from_bits_retain(
+                                    ev_events,
+                                )),
                             );
                         });
                         crate::event_ring::rec(
@@ -1966,7 +1974,9 @@ impl SyscallDispatcher {
                                 host_fd.get(),
                                 pack_epoll_udata(fd, reg_gen),
                                 effective,
-                                epoll_host_trigger_mode(event.events),
+                                epoll_host_trigger_mode(LinuxEpollEvents::from_bits_retain(
+                                    event.events,
+                                )),
                             );
                         });
                     }
@@ -2030,6 +2040,8 @@ impl SyscallDispatcher {
                             }
                             kqueue.with_mux(|mux| match survivor {
                                 Some((sfd, sgen)) => {
+                                    let union_events =
+                                        LinuxEpollEvents::from_bits_retain(union_events);
                                     let _ = mux.register_io(
                                         host_fd.get(),
                                         pack_epoll_udata(sfd, sgen),
@@ -3909,8 +3921,8 @@ impl SyscallDispatcher {
             // error queue, so it's always empty → EAGAIN (recv01/recvfrom01),
             // matching Linux when no error is queued. Checked after the socket
             // lookup so a bad/non-socket fd still surfaces EBADF/ENOTSOCK.
-            const LINUX_MSG_ERRQUEUE: i32 = 0x2000;
-            if flags & LINUX_MSG_ERRQUEUE != 0 {
+            // (from_bits_retain: recv IGNORES other unknown flag bits.)
+            if LinuxMsgFlags::from_bits_retain(flags).contains(LinuxMsgFlags::ERRQUEUE) {
                 return Ok(LINUX_EAGAIN.into());
             }
             // When the caller wants the source address back, Linux's
@@ -4795,7 +4807,9 @@ impl SyscallDispatcher {
         // OUTSIDE the I/O closure so it happens exactly once on success.
         let host_fds: Vec<i32> = received_host_fds.borrow_mut().drain(..).collect();
         if matches!(outcome, DispatchOutcome::Returned { value } if value >= 0) {
-            let cloexec = flags & LINUX_MSG_CMSG_CLOEXEC != 0;
+            // from_bits_retain: recvmsg IGNORES unknown msg_flags bits.
+            let cloexec =
+                LinuxMsgFlags::from_bits_retain(flags).contains(LinuxMsgFlags::CMSG_CLOEXEC);
             let mut guest_fds = Vec::with_capacity(host_fds.len());
             for hfd in host_fds {
                 match self.install_received_host_fd(hfd, cloexec) {
