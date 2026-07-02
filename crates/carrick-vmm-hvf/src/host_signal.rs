@@ -378,20 +378,20 @@ pub fn is_tracked_child(child_pid: i32) -> bool {
 /// run delivery — without waking siblings for a signal that isn't theirs. Wraps
 /// the neutral core check with the HVF xsignal-ring peek.
 pub fn has_pending_for(tid: i32) -> bool {
-    if xsig_has_unblocked_for_self(0) {
+    if xsig_has_unblocked_for_self(carrick_abi::SigBlockMask::NONE) {
         return true;
     }
     carrick_signal_core::has_pending_for(tid)
 }
 
-/// Like [`has_pending_for`], but a signal blocked by `block_mask` (bit
-/// `signum-1`) does NOT count as deliverable-for-waking. Used by a blocking
+/// Like [`has_pending_for`], but a signal blocked by `block_mask` does NOT
+/// count as deliverable-for-waking. Used by a blocking
 /// `epoll_pwait`/`ppoll`/`pselect6` whose temporary sigmask blocks a signal:
 /// the signal stays pending (delivered after the syscall, per the persistent
-/// mask) but must not break the wait. `block_mask == 0` is identical to
+/// mask) but must not break the wait. `SigBlockMask::NONE` is identical to
 /// [`has_pending_for`]. SIGKILL/SIGSTOP can't be blocked, matching the kernel.
 /// Wraps the neutral core check with the HVF xsignal-ring peek.
-pub fn has_unblocked_pending_for(tid: i32, block_mask: u64) -> bool {
+pub fn has_unblocked_pending_for(tid: i32, block_mask: carrick_abi::SigBlockMask) -> bool {
     // A queued cross-process signal may be sitting in the xsignal ring. Peek at
     // the ring without consuming it so a temporary ppoll/epoll_pwait mask can
     // keep genuinely blocked signals pending until the syscall returns.
@@ -1372,16 +1372,22 @@ mod tests {
         let _ = xsig_drain_for_self();
 
         let signum = crate::linux_abi::LINUX_SIGUSR1;
-        let blocked = thread_pending_bit(signum);
+        let blocked =
+            carrick_abi::SigBlockMask::blocking_all_of(carrick_abi::SigSet::EMPTY.with(signum));
         assert!(xsig_enqueue(std::process::id() as i32, signum, 0, 42, 0, 0));
         mark_xsig_dirty();
 
         assert!(has_pending_for(900_050));
-        assert!(has_unblocked_pending_for(900_050, 0));
+        assert!(has_unblocked_pending_for(
+            900_050,
+            carrick_abi::SigBlockMask::NONE
+        ));
         assert!(!has_unblocked_pending_for(900_050, blocked));
         assert!(has_unblocked_pending_for(
             900_050,
-            thread_pending_bit(crate::linux_abi::LINUX_SIGUSR2)
+            carrick_abi::SigBlockMask::blocking_all_of(
+                carrick_abi::SigSet::EMPTY.with(crate::linux_abi::LINUX_SIGUSR2)
+            )
         ));
 
         // `xsig_drain_for_self` clears the dirty flag, leaving the ring clean.
@@ -1509,12 +1515,15 @@ mod tests {
         publish_pending_for(tid, 12);
 
         assert_eq!(
-            take_pending_in_for(tid, 1u64 << (LINUX_SIGINT - 1)),
+            take_pending_in_for(tid, carrick_abi::SigSet::EMPTY.with(LINUX_SIGINT)),
             NO_PENDING_SIGNAL
         );
-        assert_eq!(take_pending_in_for(tid, 1u64 << (12 - 1)), 12);
         assert_eq!(
-            take_pending_in_for(tid, 1u64 << (12 - 1)),
+            take_pending_in_for(tid, carrick_abi::SigSet::EMPTY.with(12)),
+            12
+        );
+        assert_eq!(
+            take_pending_in_for(tid, carrick_abi::SigSet::EMPTY.with(12)),
             NO_PENDING_SIGNAL
         );
         drain_pending_pipe();

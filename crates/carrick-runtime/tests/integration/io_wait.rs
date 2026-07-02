@@ -33,7 +33,7 @@ fn kqueue_wait_still_observes_readable_socket_with_listener_write_interest() {
             WaitFd::raw(listener.as_raw_fd(), libc::POLLIN | libc::POLLOUT),
         ],
         Some(Duration::from_millis(100)),
-        0,
+        carrick_abi::SigBlockMask::NONE,
     );
 
     assert!(matches!(result, WaitResult::Ready));
@@ -75,7 +75,7 @@ fn kqueue_wait_wakes_when_peer_writes_after_registration() {
                 WaitFd::raw(listener_fd, libc::POLLIN | libc::POLLOUT),
             ],
             Some(Duration::from_millis(500)),
-            0,
+            carrick_abi::SigBlockMask::NONE,
         )
     });
 

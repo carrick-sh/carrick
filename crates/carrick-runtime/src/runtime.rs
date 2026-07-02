@@ -1086,7 +1086,8 @@ where
                 // the restored x0 IS the syscall return value the
                 // pre-empted caller observes.
                 let restored_sigmask = runtime.restore_from_sigframe()?;
-                dispatcher.restore_signal_mask(this_tid, restored_sigmask);
+                dispatcher
+                    .restore_signal_mask(this_tid, carrick_abi::SigSet::from_raw(restored_sigmask));
                 // Deliver the NEXT pending signal (if any) before resuming the
                 // restored context — the kernel delivers all deliverable pending
                 // signals back-to-back before returning to userspace. The just-
@@ -1241,7 +1242,7 @@ fn dispatch_single_threaded_syscall<M: GuestMemory>(
                             match waiter.wait(
                                 &[crate::io_wait::WaitFd::raw(write.host_fd(), libc::POLLOUT)],
                                 None,
-                                0,
+                                carrick_abi::SigBlockMask::NONE,
                             ) {
                                 WaitResult::Ready => continue,
                                 WaitResult::Interrupted => {
@@ -1272,7 +1273,7 @@ fn dispatch_single_threaded_syscall<M: GuestMemory>(
                 sig_mask,
             } => {
                 waiter.ensure_full();
-                match waiter.wait(&fds, timeout, sig_mask.raw_block_bits()) {
+                match waiter.wait(&fds, timeout, sig_mask.block_mask()) {
                     WaitResult::Ready => continue,
                     WaitResult::TimedOut => {
                         return Ok(DispatchOutcome::Returned { value: on_timeout });
@@ -1294,7 +1295,7 @@ fn dispatch_single_threaded_syscall<M: GuestMemory>(
                 clear_on_timeout,
             } => {
                 waiter.ensure_full();
-                match waiter.wait(&fds, timeout, sig_mask.raw_block_bits()) {
+                match waiter.wait(&fds, timeout, sig_mask.block_mask()) {
                     // A fd became ready -> re-dispatch; the handler re-reads the
                     // (untouched) input sets and reports the now-ready fds.
                     WaitResult::Ready => continue,
@@ -1339,7 +1340,7 @@ fn dispatch_single_threaded_syscall<M: GuestMemory>(
                         None
                     }
                 };
-                match waiter.wait_poll(&fds, timeout, sig_mask.raw_block_bits()) {
+                match waiter.wait_poll(&fds, timeout, sig_mask.block_mask()) {
                     WaitResult::Ready => continue,
                     WaitResult::TimedOut => {
                         return Ok(DispatchOutcome::Returned { value: on_timeout });
@@ -1356,7 +1357,7 @@ fn dispatch_single_threaded_syscall<M: GuestMemory>(
             }
             DispatchOutcome::WaitOnProcExit { pid, sig_mask } => {
                 waiter.ensure_full();
-                match waiter.wait_proc_exit(pid, sig_mask.raw_block_bits()) {
+                match waiter.wait_proc_exit(pid, sig_mask.block_mask()) {
                     // Ready (child exited) -> re-dispatch the waitid to reap.
                     WaitResult::Ready => continue,
                     // Interrupted (signal/quiesce) -> EINTR; the guest re-issues.
@@ -1386,7 +1387,7 @@ fn dispatch_single_threaded_syscall<M: GuestMemory>(
                     }
                 };
                 waiter.ensure_full();
-                match waiter.wait(&[], Some(slice), block_mask.raw()) {
+                match waiter.wait(&[], Some(slice), block_mask) {
                     WaitResult::Ready => continue,
                     WaitResult::Interrupted => {
                         // An unblocked pending signal OUTSIDE the wait set must
@@ -1425,7 +1426,7 @@ fn dispatch_single_threaded_syscall<M: GuestMemory>(
                     return Ok(DispatchOutcome::Returned { value: 0 });
                 }
                 waiter.ensure_full();
-                match waiter.wait(&[], Some(deadline - now), 0) {
+                match waiter.wait(&[], Some(deadline - now), carrick_abi::SigBlockMask::NONE) {
                     WaitResult::Ready => continue,
                     WaitResult::TimedOut => {
                         if Instant::now() >= deadline {

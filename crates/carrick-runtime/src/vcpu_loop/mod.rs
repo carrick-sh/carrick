@@ -640,7 +640,7 @@ where
                                 match self.waiter.wait(
                                     &[crate::io_wait::WaitFd::raw(write.host_fd(), libc::POLLOUT)],
                                     None,
-                                    0,
+                                    carrick_abi::SigBlockMask::NONE,
                                 ) {
                                     crate::io_wait::WaitResult::Ready => continue,
                                     crate::io_wait::WaitResult::Interrupted => {
@@ -679,7 +679,7 @@ where
                     match self.waiter.wait_with_dispatch_pending(
                         &fds,
                         timeout,
-                        sig_mask.raw_block_bits(),
+                        sig_mask.block_mask(),
                         || {
                             kernel
                                 .dispatcher
@@ -715,7 +715,7 @@ where
                     match self.waiter.wait_with_dispatch_pending(
                         &fds,
                         timeout,
-                        sig_mask.raw_block_bits(),
+                        sig_mask.block_mask(),
                         || {
                             kernel
                                 .dispatcher
@@ -769,7 +769,7 @@ where
                     match self.waiter.wait_poll_with_dispatch_pending(
                         &fds,
                         timeout,
-                        sig_mask.raw_block_bits(),
+                        sig_mask.block_mask(),
                         || {
                             kernel
                                 .dispatcher
@@ -799,7 +799,7 @@ where
                     crate::run_state::publish(crate::run_state::RunState::Blocked);
                     match self.waiter.wait_proc_exit_with_dispatch_pending(
                         pid,
-                        sig_mask.raw_block_bits(),
+                        sig_mask.block_mask(),
                         || {
                             // waitpid carries WaitSigMask::Additive: its set is
                             // `non_interrupting_signal_mask` (a persistent-mask
@@ -840,7 +840,7 @@ where
                     };
                     self.waiter.ensure_full();
                     crate::run_state::publish(crate::run_state::RunState::Blocked);
-                    match self.waiter.wait(&[], Some(slice), block_mask.raw()) {
+                    match self.waiter.wait(&[], Some(slice), block_mask) {
                         crate::io_wait::WaitResult::Ready => continue,
                         crate::io_wait::WaitResult::TimedOut => {
                             if signal_wait_expired(signal_wait_deadline) {
@@ -891,7 +891,11 @@ where
                     }
                     self.waiter.ensure_full();
                     crate::run_state::publish(crate::run_state::RunState::Blocked);
-                    match self.waiter.wait(&[], Some(deadline - now), 0) {
+                    match self.waiter.wait(
+                        &[],
+                        Some(deadline - now),
+                        carrick_abi::SigBlockMask::NONE,
+                    ) {
                         crate::io_wait::WaitResult::Ready => continue,
                         crate::io_wait::WaitResult::TimedOut => {
                             if Instant::now() >= deadline {
@@ -1365,9 +1369,10 @@ where
                         }
                         Err(e) => return Err(e.into()),
                     };
-                    kernel
-                        .dispatcher
-                        .restore_signal_mask(state.this_tid, restored_sigmask);
+                    kernel.dispatcher.restore_signal_mask(
+                        state.this_tid,
+                        carrick_abi::SigSet::from_raw(restored_sigmask),
+                    );
                     // Deliver the next pending signal (if any) before resuming,
                     // but at the just-restored user PC, not as another
                     // syscall-boundary signal. On x86, `rt_sigreturn` restores

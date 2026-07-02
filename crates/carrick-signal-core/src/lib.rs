@@ -33,6 +33,7 @@ pub mod xsig;
 
 pub use backend::HostSignalGlue;
 
+use carrick_abi::{SigBlockMask, SigSet};
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
@@ -56,21 +57,22 @@ pub fn thread_pending_bit(signum: i32) -> u64 {
     }
 }
 
-/// Lowest pending signum in a pending bitmask (caller ensures `mask != 0`).
-pub fn lowest_pending_signum(mask: u64) -> i32 {
-    (mask.trailing_zeros() as i32) + 1
+/// Lowest pending signum in a pending set (`NO_PENDING_SIGNAL` when empty;
+/// callers historically ensured non-empty).
+pub fn lowest_pending_signum(mask: SigSet) -> i32 {
+    mask.lowest_signum().unwrap_or(NO_PENDING_SIGNAL)
 }
 
-/// Whether `signum` is deliverable given a temporary `block_mask` (bit
-/// `signum-1`). SIGKILL(9)/SIGSTOP(19) can never be blocked, so they are always
-/// deliverable even if their bit is set in `block_mask`.
-pub fn signal_unblocked_by_mask(signum: i32, block_mask: u64) -> bool {
+/// Whether `signum` is deliverable given a temporary `block_mask`.
+/// SIGKILL(9)/SIGSTOP(19) can never be blocked, so they are always deliverable
+/// even if they are in `block_mask`.
+pub fn signal_unblocked_by_mask(signum: i32, block_mask: SigBlockMask) -> bool {
     let bit = thread_pending_bit(signum);
     if bit == 0 {
         return false;
     }
     let always_deliverable = thread_pending_bit(LINUX_SIGKILL) | thread_pending_bit(LINUX_SIGSTOP);
-    bit & (!block_mask | always_deliverable) != 0
+    bit & (!block_mask.raw() | always_deliverable) != 0
 }
 
 /// Linux SIGKILL — can never be caught, blocked, or ignored.
@@ -128,20 +130,22 @@ pub fn publish_pending_for(tid: i32, signum: i32) {
     }
 }
 
-/// Pop the lowest pending process-directed signum from `PROC_PENDING` whose bit
-/// is also set in `wait_set` (pass `!0` to accept any). Returns `0` if none.
-/// `take_pending_for` can run concurrently on every vCPU kicked for one
-/// process-directed signal, so draining the bit must be compare/exchange based:
-/// a `load` + `compare_exchange` lets multiple threads observe and deliver the
-/// same pending bit at most once total.
-fn take_proc_pending_in(wait_set: u64) -> i32 {
+/// Pop the lowest pending process-directed signum from `PROC_PENDING` that is
+/// also in `wait_set` (pass `SigSet::EMPTY.complement()` to accept any).
+/// Returns `0` if none. `take_pending_for` can run concurrently on every vCPU
+/// kicked for one process-directed signal, so draining the bit must be
+/// compare/exchange based: a `load` + `compare_exchange` lets multiple threads
+/// observe and deliver the same pending bit at most once total. The store is a
+/// raw `AtomicU64` in wire form (bit `signum-1`); the typed set converts at the
+/// atomic load/CAS boundary.
+fn take_proc_pending_in(wait_set: SigSet) -> i32 {
     loop {
         let mask = PROC_PENDING.load(Ordering::SeqCst);
-        let candidates = mask & wait_set;
+        let candidates = mask & wait_set.raw();
         if candidates == 0 {
             return NO_PENDING_SIGNAL;
         }
-        let signum = lowest_pending_signum(candidates);
+        let signum = lowest_pending_signum(SigSet::from_raw(candidates));
         let bit = thread_pending_bit(signum);
         let next = mask & !bit;
         if PROC_PENDING
@@ -164,7 +168,7 @@ pub fn take_pending_for(tid: i32) -> i32 {
             && let Some(mask) = map.get_mut(&tid)
             && *mask != 0
         {
-            let signum = lowest_pending_signum(*mask);
+            let signum = lowest_pending_signum(SigSet::from_raw(*mask));
             *mask &= *mask - 1; // clear the lowest set bit
             if *mask == 0 {
                 map.remove(&tid);
@@ -172,24 +176,25 @@ pub fn take_pending_for(tid: i32) -> i32 {
             return signum;
         }
     }
-    take_proc_pending_in(!0)
+    take_proc_pending_in(SigSet::EMPTY.complement())
 }
 
-/// Drain a signal pending for `tid` only if it intersects `wait_set` (bit
-/// `signum-1`). Used by `rt_sigtimedwait`: signals outside the waited set must
-/// remain pending for normal delivery instead of being consumed and requeued.
-pub fn take_pending_in_for(tid: i32, wait_set: u64) -> i32 {
+/// Drain a signal pending for `tid` only if it intersects `wait_set`. Used by
+/// `rt_sigtimedwait`: signals outside the waited set must remain pending for
+/// normal delivery instead of being consumed and requeued.
+pub fn take_pending_in_for(tid: i32, wait_set: SigSet) -> i32 {
     {
-        // `wait_set` uses the same bit `signum-1` convention as the mask, so a
-        // bitwise AND yields the pending signums that are in the waited set;
-        // drain only the lowest, leaving the rest pending for normal delivery.
+        // The stored per-tid mask is wire form (bit `signum-1`), the same
+        // convention as `wait_set.raw()`, so a bitwise AND yields the pending
+        // signums that are in the waited set; drain only the lowest, leaving
+        // the rest pending for normal delivery.
         let mut guard = lock_thread_pending();
         if let Some(map) = guard.as_mut()
             && let Some(mask) = map.get_mut(&tid)
         {
-            let in_set_bits = *mask & wait_set;
+            let in_set_bits = *mask & wait_set.raw();
             if in_set_bits != 0 {
-                let signum = lowest_pending_signum(in_set_bits);
+                let signum = lowest_pending_signum(SigSet::from_raw(in_set_bits));
                 *mask &= !thread_pending_bit(signum);
                 if *mask == 0 {
                     map.remove(&tid);
@@ -215,15 +220,15 @@ pub fn thread_pending_has(tid: i32) -> bool {
 }
 
 /// True iff a thread-directed signal for `tid` is pending AND deliverable given
-/// `block_mask` (bit `signum-1`). A signal whose bit is blocked does not count,
-/// except SIGKILL/SIGSTOP which can never be blocked.
-pub fn thread_pending_deliverable(tid: i32, block_mask: u64) -> bool {
+/// `block_mask`. A blocked signal does not count, except SIGKILL/SIGSTOP which
+/// can never be blocked.
+pub fn thread_pending_deliverable(tid: i32, block_mask: SigBlockMask) -> bool {
     let always_deliverable = thread_pending_bit(LINUX_SIGKILL) | thread_pending_bit(LINUX_SIGSTOP);
     let mut guard = lock_thread_pending();
     guard
         .as_mut()
         .and_then(|map| map.get(&tid))
-        .is_some_and(|&mask| mask & (!block_mask | always_deliverable) != 0)
+        .is_some_and(|&mask| mask & (!block_mask.raw() | always_deliverable) != 0)
 }
 
 /// Is a signal deliverable to `tid` pending? True for a thread-directed signal
@@ -236,13 +241,13 @@ pub fn has_pending_for(tid: i32) -> bool {
     thread_pending_has(tid)
 }
 
-/// Like [`has_pending_for`], but a signal blocked by `block_mask` (bit
-/// `signum-1`) does NOT count as deliverable-for-waking. SIGKILL/SIGSTOP can't
-/// be blocked, matching the kernel. The pure (no-glue) form used by the KVM
-/// backend; the HVF backend wraps it to also peek its xsignal ring.
-pub fn has_unblocked_pending_for(tid: i32, block_mask: u64) -> bool {
+/// Like [`has_pending_for`], but a signal blocked by `block_mask` does NOT
+/// count as deliverable-for-waking. SIGKILL/SIGSTOP can't be blocked, matching
+/// the kernel. The pure (no-glue) form used by the KVM backend; the HVF backend
+/// wraps it to also peek its xsignal ring.
+pub fn has_unblocked_pending_for(tid: i32, block_mask: SigBlockMask) -> bool {
     let always_deliverable = thread_pending_bit(LINUX_SIGKILL) | thread_pending_bit(LINUX_SIGSTOP);
-    let deliverable = |mask: u64| mask & (!block_mask | always_deliverable) != 0;
+    let deliverable = |mask: u64| mask & (!block_mask.raw() | always_deliverable) != 0;
     if deliverable(PROC_PENDING.load(Ordering::SeqCst)) {
         return true;
     }
@@ -254,13 +259,15 @@ pub fn has_process_pending() -> bool {
     PROC_PENDING.load(Ordering::SeqCst) != 0
 }
 
-/// Current process-directed pending mask (bit `signum-1`).
-pub fn proc_pending_mask() -> u64 {
-    PROC_PENDING.load(Ordering::SeqCst)
+/// Current process-directed pending set.
+pub fn proc_pending_mask() -> SigSet {
+    SigSet::from_raw(PROC_PENDING.load(Ordering::SeqCst))
 }
 
 /// Atomically OR `bit` into the process-directed pending mask. Lock-free, so
-/// callable from an async host signal handler.
+/// callable from an async host signal handler. Deliberately kept in raw wire
+/// form (bit `signum-1`, from [`pending_bit`]/[`thread_pending_bit`]): this is
+/// the async-signal-safe single-bit store op at the atomic boundary.
 pub fn proc_pending_fetch_or(bit: u64) {
     PROC_PENDING.fetch_or(bit, Ordering::SeqCst);
 }
@@ -276,7 +283,7 @@ pub fn publish_process_signal(signum: i32) {
 
 /// Take (drain) the lowest process-directed pending signum, or `0` if none.
 pub fn take_process_pending() -> i32 {
-    take_proc_pending_in(!0)
+    take_proc_pending_in(SigSet::EMPTY.complement())
 }
 
 /// Clear the process-directed pending mask (fork / supervisor-fork reinit).
@@ -424,7 +431,7 @@ mod tests {
             .as_ref()
             .and_then(|map| map.get(&tid))
             .filter(|&&mask| mask != 0)
-            .map(|&mask| lowest_pending_signum(mask))
+            .map(|&mask| lowest_pending_signum(SigSet::from_raw(mask)))
             .unwrap_or(NO_PENDING_SIGNAL)
     }
 }
