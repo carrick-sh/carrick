@@ -376,7 +376,7 @@ fn rebuild_request_from_state(state: &ContainerState) -> carrick_engine::CliRunR
         debug_state_path: None,
         fs: c.fs,
         pid: c.pid,
-        network: c.network,
+        network: effective_network.network,
         network_bridge: bridge_network_name(effective_network),
         network_container: c.network_container.clone(),
         network_namespace_id: Some(
@@ -1877,6 +1877,43 @@ mod tests {
 
         assert_eq!(req.network_bridge.as_deref(), Some("compose_default"));
         assert_eq!(req.network_aliases, vec!["api".to_string()]);
+    }
+
+    #[test]
+    fn rebuild_request_for_shared_network_uses_targets_current_mode() {
+        let target_id = format!("target-{}", std::process::id());
+        let sidecar_id = format!("sidecar-{}", std::process::id());
+        let mut target = sample_state();
+        target.id = target_id.clone();
+        target.name = Some("target".to_string());
+        target.config.network = carrick_spec::NetworkMode::None;
+        target.config.api_network_mode = Some("none".to_string());
+        target.config.network_aliases.clear();
+        target.config.network_attachments.clear();
+        target.create().expect("persist target");
+
+        let mut sidecar = sample_state();
+        sidecar.id = sidecar_id;
+        sidecar.name = Some("sidecar".to_string());
+        sidecar.config.network = carrick_spec::NetworkMode::Bridge;
+        sidecar.config.api_network_mode = Some(format!("container:{target_id}"));
+        sidecar.config.network_container = Some(target_id.clone());
+        sidecar.config.network_attachments.clear();
+
+        let req = rebuild_request_from_state(&sidecar);
+
+        assert_eq!(req.network, carrick_spec::NetworkMode::None);
+        assert_eq!(
+            req.network_namespace_id.as_deref(),
+            Some(target_id.as_str())
+        );
+        assert_eq!(req.network_container.as_deref(), Some(target_id.as_str()));
+        assert_eq!(req.network_bridge, None);
+        assert!(req.network_attachments.is_empty());
+        assert_eq!(req.network_ipv4, None);
+        assert!(req.network_aliases.is_empty());
+
+        let _ = ContainerState::remove(&target_id);
     }
 
     #[test]
