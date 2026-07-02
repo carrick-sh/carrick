@@ -2251,6 +2251,10 @@ impl SyscallDispatcher {
         }
     }
 
+    pub(crate) fn identity_fast_path_enabled(&self) -> bool {
+        !self.seccomp.is_active()
+    }
+
     // (see `watch_addr` below)
 
     /// Multi-threaded dispatch through a shared dispatcher reference. Handlers

@@ -279,6 +279,7 @@ fn load_operand(ins: &SockFilter, data: &SeccompData) -> u32 {
 #[derive(Debug, Default)]
 pub(crate) struct SeccompState {
     filters: Mutex<Vec<Vec<SockFilter>>>,
+    strict: Mutex<bool>,
 }
 
 impl SeccompState {
@@ -287,15 +288,22 @@ impl SeccompState {
         self.filters.lock().push(prog);
     }
 
+    pub(crate) fn install_strict(&self) {
+        *self.strict.lock() = true;
+    }
+
     pub(crate) fn is_active(&self) -> bool {
-        !self.filters.lock().is_empty()
+        *self.strict.lock() || !self.filters.lock().is_empty()
     }
 
     /// Evaluate all installed filters against `data` and return the winning
     /// (most restrictive) cBPF value, or `SECCOMP_RET_ALLOW` if none installed.
     pub(crate) fn check(&self, data: &SeccompData) -> u32 {
-        let filters = self.filters.lock();
         let mut result = SECCOMP_RET_ALLOW;
+        if *self.strict.lock() && !strict_mode_allows(data) {
+            result = SECCOMP_RET_KILL_PROCESS;
+        }
+        let filters = self.filters.lock();
         for prog in filters.iter() {
             let ret = eval_filter(prog, data);
             if action_severity(ret) < action_severity(result) {
@@ -303,6 +311,14 @@ impl SeccompState {
             }
         }
         result
+    }
+}
+
+fn strict_mode_allows(data: &SeccompData) -> bool {
+    match data.arch {
+        AUDIT_ARCH_AARCH64 => matches!(data.nr, 63 | 64 | 93 | 94 | 139),
+        AUDIT_ARCH_X86_64 => matches!(data.nr, 0 | 1 | 15 | 60 | 231),
+        _ => false,
     }
 }
 
@@ -573,6 +589,55 @@ mod tests {
         assert_eq!(
             state.check(&data_for(172)) & SECCOMP_RET_ACTION_FULL,
             SECCOMP_RET_KILL_PROCESS
+        );
+    }
+
+    #[test]
+    fn strict_mode_kills_everything_except_linux_strict_set() {
+        let state = SeccompState::default();
+        state.install_strict();
+        assert!(state.is_active());
+
+        for nr in [63, 64, 93, 94, 139] {
+            assert_eq!(
+                state.check(&SeccompData::for_guest(
+                    nr,
+                    carrick_abi::LinuxGuestAbi::Aarch64,
+                    [0; 6]
+                )),
+                SECCOMP_RET_ALLOW,
+                "aarch64 strict mode should allow syscall {nr}"
+            );
+        }
+        assert_eq!(
+            state.check(&SeccompData::for_guest(
+                57,
+                carrick_abi::LinuxGuestAbi::Aarch64,
+                [0; 6]
+            )) & SECCOMP_RET_ACTION_FULL,
+            SECCOMP_RET_KILL_PROCESS,
+            "aarch64 strict mode should kill close(2)"
+        );
+
+        for nr in [0, 1, 15, 60, 231] {
+            assert_eq!(
+                state.check(&SeccompData::for_guest(
+                    nr,
+                    carrick_abi::LinuxGuestAbi::X86_64,
+                    [0; 6]
+                )),
+                SECCOMP_RET_ALLOW,
+                "x86_64 strict mode should allow syscall {nr}"
+            );
+        }
+        assert_eq!(
+            state.check(&SeccompData::for_guest(
+                3,
+                carrick_abi::LinuxGuestAbi::X86_64,
+                [0; 6]
+            )) & SECCOMP_RET_ACTION_FULL,
+            SECCOMP_RET_KILL_PROCESS,
+            "x86_64 strict mode should kill close(2)"
         );
     }
 }
