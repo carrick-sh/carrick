@@ -492,23 +492,27 @@ pub fn self_ns_ppid() -> u32 {
 /// visibility (§5.4). No-op when ns is off or signum out of range.
 pub fn set_init_handler(signum: i32, installed: bool) {
     let Some(r) = region() else { return };
-    if !(1..=63).contains(&signum) {
+    // Standard sigset_t convention (bit `signum-1`) via SigSet. This word
+    // briefly used the raw bit=signum convention — the execve ignored-mask
+    // off-by-one class the typed-domains semgrep gate now rejects. SigSet
+    // also lifts the old 1..=63 cap (a shift-overflow guard, not semantics)
+    // to the full 1..=64 signal range; out-of-range signums are a no-op.
+    let bits = carrick_abi::SigSet::EMPTY.with(signum).raw();
+    if bits == 0 {
         return;
     }
-    let bit = 1u64 << signum;
     if installed {
-        r.init_sig_handlers.fetch_or(bit, Ordering::Release);
+        r.init_sig_handlers.fetch_or(bits, Ordering::Release);
     } else {
-        r.init_sig_handlers.fetch_and(!bit, Ordering::Release);
+        r.init_sig_handlers.fetch_and(!bits, Ordering::Release);
     }
 }
 
 /// Whether the ns-init has a handler installed for `signum`.
 pub fn init_handles(signum: i32) -> bool {
     match region() {
-        Some(r) if (1..=63).contains(&signum) => {
-            r.init_sig_handlers.load(Ordering::Acquire) & (1u64 << signum) != 0
-        }
+        Some(r) => carrick_abi::SigSet::from_raw(r.init_sig_handlers.load(Ordering::Acquire))
+            .contains(signum),
         _ => false,
     }
 }

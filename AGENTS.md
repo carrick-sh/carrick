@@ -75,7 +75,8 @@ compile/lint/test only.
 | `just clippy` | `cargo clippy --workspace --all-targets -- -D warnings` (no-panic gate). |
 | `just fmt` / `just fmt-check` | Apply / check formatting. |
 | `just doc` | `RUSTDOCFLAGS="-D warnings" cargo doc` gate. |
-| **`just ci`** | **Full local gate: `fmt-check → clippy → check → doc → test → test-integration`. Run this before every push.** |
+| `just lint-domains` | Typed-domain semgrep gate ([`.semgrep/typed-domains.yml`](.semgrep/typed-domains.yml)) — blocks shipped bug shapes; see Engineering standards. |
+| **`just ci`** | **Full local gate: `fmt-check → clippy → lint-domains → deny → check → doc → test → test-integration`. Run this before every push.** |
 | `just conformance-quick` 🔏 | Fast smoke regression vs the Docker oracle. |
 | `just conformance [TIER]` 🔏 | Language/LTP conformance vs Docker (default tier `full`). |
 | `just conformance-probes` 🔏 | Line-exact ABI probe gate vs Docker. |
@@ -242,6 +243,36 @@ Use **real debuggers, not `eprintln!`** — and never ship debug spam. Full guid
   Clean-room only: derive ABIs from man-pages/specs and the differential Docker
   oracle (strace/observe behaviour, diff verdicts). This is non-negotiable.
   (Reading LTP *test* source — the oracle itself — is a separate, grayer matter.)
+- **Typed domain values are the baseline — bare `u64`/`i32` never crosses a
+  semantic boundary.** Three shipped bugs (the `!wait_set` polarity hang, the
+  `alarm`↔`epoll_create` private-number collision, the poll int-vs-timespec
+  timeout) all reduce to "two domains shared one integer type". The rules,
+  ranked audit, and staged plan live in
+  [`docs/typed-interfaces-audit.md`](docs/typed-interfaces-audit.md):
+  - Use the existing types; don't re-raw them: `Fd`/`HostFd` (guest vs host
+    descriptors), `NsPid`/`HostPid` (translate, never wrap the wrong domain),
+    `Signal`, `GuestPtr`/`GuestLen`, `SigSet`/`SigBlockMask`/`WaitSigMask`
+    (set vs park-mask polarity), `CanonicalNr`/`NativeNr` (syscall numbering),
+    `GuestVa`/`Gpa`/`HostVa` (address spaces), `LinuxErrno`
+    (`guest_retval()` is THE negation point), and the `bitflags` types.
+  - New number/flag tables derive from an ordinal enum or `bitflags!` — never
+    hand-numbered constants (add a compile-time uniqueness assert when a table
+    can't be an enum).
+  - Where polarity or direction matters, the type has NO general `from_raw`:
+    construction goes through a NAMED semantic constructor
+    (`SigBlockMask::for_signal_wait`, `WaitSigMask::Additive/Replace`). Raw
+    escapes only at libc/wire/atomic boundaries via explicit `.raw()`/`.get()`.
+  - Enforcement is mechanical, not aspirational: workspace-`deny`ed
+    `unreachable_patterns` + `bindings_with_variant_name` (the unimported-const
+    match-arm catch-all is a build failure), and **`just lint-domains`** — the
+    semgrep gate ([`.semgrep/typed-domains.yml`](.semgrep/typed-domains.yml))
+    that blocks the shipped bug shapes (raw wait-set complements, bit=`signum`
+    masks, host pids in `NsPid`, hand-numbered private numbers, function-local
+    `LINUX_*` consts, inline errno negation). It runs inside `just ci`.
+  - Mechanical migrations go through
+    [`scripts/migrate/rewrite.py`](scripts/migrate/rewrite.py) (count-asserted,
+    all-or-nothing rewrite specs) so a repeated-shape pass is a reviewable
+    artifact, not a pile of hand edits.
 - **No pragmatic shortcuts — fix the root cause.** If a backend has a bug, fix the
   backend; don't gate it with a shell hack, swap a real implementation for a
   cheaper approximation, or paper over it. If you catch yourself reaching for a
