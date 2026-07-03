@@ -333,7 +333,14 @@ impl SyscallDispatcher {
         // (child) watch, IN_EXCL_UNLINK suppresses events once the child name is
         // gone from the directory; signal that by checking whether the child path
         // still resolves (inotify12 #2: write to an unlinked-but-open fd).
-        let child_unlinked = !self.path_exists(&path);
+        //
+        // `path_exists` is a resolve+stat (the cap-std containment walk). It is
+        // ONLY consumed by the child (parent-dir) watch, so compute it lazily:
+        // when no watch exists on the parent dir — e.g. a watch on the file
+        // ITSELF, as in the inotify09 write-beating loop — skip it entirely. This
+        // is the difference between a ~38µs and a ~few-µs write on a watched file.
+        let child_unlinked =
+            self.fs.inotify_registry.parent_watch_exists_for(&path) && !self.path_exists(&path);
         self.fs.inotify_registry.notify_self(&path, mask, is_dir);
         self.fs
             .inotify_registry
