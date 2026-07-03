@@ -22,7 +22,7 @@ pub mod fault;
 pub mod vdso;
 pub mod vmm;
 
-pub use bringup::{fp_stub_bytes, msr_init_blob, run_fp_stub};
+pub use bringup::{MsrInitBlob, fp_stub_bytes, msr_init_blob, run_fp_stub};
 pub use bringup_fns::{
     BringupLayout, LongModeSegmentState, X86VcpuSnapshot, build_pml4, load_x86_elf_image,
     long_mode_segment_state, plan_windows, program_longmode_entry, program_user_segments, restore,
