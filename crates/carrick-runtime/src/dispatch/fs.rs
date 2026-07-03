@@ -1181,14 +1181,6 @@ impl SyscallDispatcher {
         memory: &impl GuestMemory,
         reporter: &CompatReporter,
     ) -> Result<DispatchOutcome, DispatchError> {
-        // O_TMPFILE names a directory via `dirfd` and creates an unnamed inode;
-        // carrick's implementation ignores `pathname` entirely, and the guest is
-        // allowed to pass a null pointer for it (glibc's `O_TMPFILE` path does).
-        // Read the guest string only for the non-TMPFILE opens that actually use
-        // it, so a null/unmapped pathname doesn't wrongly EFAULT an O_TMPFILE open.
-        if LinuxOpenFlags::from_bits_retain(flags).contains(LinuxOpenFlags::TMPFILE) {
-            return self.open_at_path_string(dirfd, "", flags, mode, reporter);
-        }
         let path = read_guest_c_string(memory, pathname)?;
         self.open_at_path_string(dirfd, &path, flags, mode, reporter)
     }
