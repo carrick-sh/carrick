@@ -2249,6 +2249,30 @@ Pid:\t{pid}\nPPid:\t{ppid}\nThreads:\t{n}\n",
         }
     }
 
+    if let Some(state) = crate::run_state::published_stat_char(pid) {
+        let ppid = unsafe { libc::getppid() } as u32;
+        let me = std::process::id();
+        let comm = self_comm;
+        return match rest {
+            "stat" => Some(proc_stat_line(pid, comm, state, ppid, me, me, 1, 0).into_bytes()),
+            "comm" => Some(format!("{comm}\n").into_bytes()),
+            "cmdline" => {
+                let mut b = comm.as_bytes().to_vec();
+                b.push(0);
+                Some(b)
+            }
+            "status" => Some(
+                format!(
+                    "Name:\t{comm}\nState:\t{state} ({long})\nTgid:\t{me}\n\
+Pid:\t{pid}\nPPid:\t{ppid}\nThreads:\t1\n",
+                    long = proc_state_long(state),
+                )
+                .into_bytes(),
+            ),
+            _ => None,
+        };
+    }
+
     // PID namespace (§5.3): the guest addresses `/proc/<ns_pid>/…` by ns-pid.
     // Translate it to the host pid for the host-backed lookups, but keep the
     // ns-pid for the displayed `Pid:` field; translate the host ppid/pgid back
