@@ -2407,6 +2407,7 @@ pub mod timer_delivery {
         if let Some(d) = lock().as_ref() {
             carrick_signal_core::publish_process_signal(signum);
             d.kicker.kick_all();
+            crate::thread::notify_current_futex_signal_pending();
         }
     }
 
