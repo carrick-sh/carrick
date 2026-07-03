@@ -111,13 +111,15 @@ This plan is therefore a master remediation ledger. Each task below is an indepe
 - Produces: total guest-to-host and host-to-guest signal handling for ambiguous Linux/BSD numbers.
 - Consumes: existing `SIGNUM_XLATE`, `linux_to_host_signum`, and `host_to_linux_signum`.
 
-- [ ] Add table tests for `SIGPWR`, `SIGSTKFLT`, `SIGURG`, `SIGUSR1`, `SIGIO`, and host `SIGINFO`.
-- [ ] Decide the Linux-visible policy for signals that have no safe BSD host signal carrier: emulate in carrick's explicit-signal ring, reject sends with Linux `EINVAL`, or map to an internal carrier plus metadata.
-- [ ] Implement the policy without identity-fallback collisions.
-- [ ] Ensure Ctrl+T/host `SIGINFO` is ignored or handled as a host-control signal, not delivered to the guest as Linux `SIGIO`.
-- [ ] Verify host unit tests on macOS and target BSD build/tests where available.
+- [x] Add table tests for `SIGPWR`, `SIGSTKFLT`, `SIGURG`, `SIGUSR1`, `SIGIO`, and host `SIGINFO`.
+- [x] Decide the Linux-visible policy for signals that have no safe BSD host signal carrier: emulate in carrick's explicit-signal ring, reject sends with Linux `EINVAL`, or map to an internal carrier plus metadata.
+- [x] Implement the policy without identity-fallback collisions.
+- [x] Ensure Ctrl+T/host `SIGINFO` is ignored or handled as a host-control signal, not delivered to the guest as Linux `SIGIO`.
+- [x] Verify host unit tests on macOS and target BSD build/tests where available.
 - [ ] Run a guest probe that sends and observes the affected signals under the BSD host lane.
-- [ ] Commit as `fix(bsd): avoid signal number collisions`.
+- [x] Commit as `fix(bsd): avoid signal number collisions`.
+
+**Local evidence:** `cargo test -p carrick-host-bsd signum --lib`, `cargo test -p carrick-runtime cross_process_xsig_policy_routes_unhostable_signals --lib`, `cargo test -p carrick-runtime wait_status_tests --lib`, `cargo test -p carrick-runtime sigdeath_marker --lib`, `cargo test -p carrick-vmm-hvf host_signal --lib`, `cargo test -p carrick-vmm-bhyve --lib signal`, `cargo test -p carrick-vmm-nvmm --lib signal`, and `cargo check --manifest-path conformance-probes/Cargo.toml --target aarch64-unknown-linux-musl --bin bsd_signal_xlate` pass. The new `bsd_signal_xlate` probe still needs a BSD host-lane runtime run.
 
 ## Task 3: Harden Fork-Coherent Runtime Registries
 

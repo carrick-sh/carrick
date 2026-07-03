@@ -2550,9 +2550,8 @@ fn translate_wait_status_darwin(status: i32) -> i32 {
 
 /// Wait-status translation that first honours a forked-child signal-death marker.
 /// On a BSD host `forked_child_die_by_signal` `_exit(128+N)`s (and drops a marker)
-/// when the host signal for a default-TERMINATE Linux signal is itself
-/// default-IGNORE (Linux SIGPOLL 29 → BSD SIGIO 23, Linux SIGSTKFLT 16 → BSD
-/// SIGURG 16). Reconstruct the `WIFSIGNALED(N)` status the guest's wait4 must
+/// when the host signal for a default-TERMINATE Linux signal cannot faithfully
+/// represent the Linux signal death. Reconstruct the `WIFSIGNALED(N)` status the guest's wait4 must
 /// observe; otherwise fall through to the plain host→guest translation. A pure
 /// no-op on a Linux host (no marker is ever written there — `consume_sigdeath_marker`
 /// is a compile-time `None`).
@@ -2807,9 +2806,9 @@ mod futex_timeout_tests {
 
 // `translate_child_wait_status` reconstructs `WIFSIGNALED` from a forked-child
 // signal-death marker. This only applies off Linux, where some default-TERMINATE
-// Linux signals map to default-IGNORE host signals (SIGPOLL 29 → BSD SIGIO,
-// SIGSTKFLT 16 → BSD SIGURG) and the child could only `_exit(128+N)` + drop a
-// marker. On Linux the marker is never written, so the test is compiled out.
+// Linux signals cannot be represented faithfully as host signalled deaths and
+// the child could only `_exit(128+N)` + drop a marker. On Linux the marker is
+// never written, so the test is compiled out.
 #[cfg(all(test, not(target_os = "linux")))]
 mod wait_status_tests {
     use super::*;
@@ -2842,13 +2841,24 @@ mod wait_status_tests {
 
     #[test]
     fn sigstkflt_child_death_reconstructs_wifsignaled() {
-        // SIGSTKFLT (16) is the other default-TERMINATE→default-IGNORE mapping.
+        // SIGSTKFLT (16) has no BSD carrier.
         let host_pid = 0x7FFE_0002u32;
         crate::exec_helpers::plant_sigdeath_marker_for_test(host_pid, 16);
 
         let status = translate_child_wait_status(host_pid, exited(128 + 16));
         assert!(libc::WIFSIGNALED(status), "status {status:#x}");
         assert_eq!(libc::WTERMSIG(status), 16);
+    }
+
+    #[test]
+    fn sigpwr_child_death_reconstructs_wifsignaled() {
+        // SIGPWR (30) has no BSD carrier; BSD 30 is SIGUSR1.
+        let host_pid = 0x7FFE_0004u32;
+        crate::exec_helpers::plant_sigdeath_marker_for_test(host_pid, 30);
+
+        let status = translate_child_wait_status(host_pid, exited(128 + 30));
+        assert!(libc::WIFSIGNALED(status), "status {status:#x}");
+        assert_eq!(libc::WTERMSIG(status), 30);
     }
 
     #[test]
