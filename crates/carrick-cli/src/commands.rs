@@ -208,6 +208,10 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             // handler / alloc_alias_ipa — prevents cross-process alias-IPA reuse
             // in the unflushable shared stage-2 TLB).
             carrick_runtime::memory::init_alias_ipa_allocator();
+            // Same reason: force the fork-coherent fs-resolve generation word
+            // into existence in the ROOT before any guest fork, so every
+            // descendant shares the one MAP_SHARED page.
+            carrick_runtime::fs_resolve_cache::init();
             let mut dispatcher = if rootfs_layers.is_empty() {
                 SyscallDispatcher::new()
             } else {
@@ -579,6 +583,10 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             // two guest processes ever reuse an alias IPA in the shared hv_vm
             // (a latent cross-process stage-2 coherence hazard). See alloc_alias_ipa.
             carrick_runtime::memory::init_alias_ipa_allocator();
+            // Same reason: force the fork-coherent fs-resolve generation word
+            // into existence in the ROOT before any guest fork, so every
+            // descendant shares the one MAP_SHARED page.
+            carrick_runtime::fs_resolve_cache::init();
 
             // Detached (`carrick run -d`): fork into the background under a
             // per-container supervisor, print the id, and return. Manage it with

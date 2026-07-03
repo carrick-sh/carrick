@@ -141,6 +141,30 @@ syscall_table! {
     45 => sys_truncate,
     77 => tee,
 }
+
+/// Canonical (AArch64) numbers of the syscalls that STRUCTURALLY mutate the path
+/// namespace — create/remove/rename a directory, symlink, or special node.
+/// These are the only fs syscalls that can change how an UNRELATED path
+/// resolves, so a successful one must invalidate the fork-coherent resolve
+/// cache ([`crate::fs_resolve_cache`]). The numbers mirror the `=> handler` arms
+/// in the `syscall_table!` above; content-only writes (write/pwrite/ftruncate)
+/// are deliberately EXCLUDED so a syscall-bound write loop keeps its cached
+/// resolves. Bumping is unconditional (even on a failed mutation) — a spurious
+/// invalidation only costs a re-resolve, whereas missing one would serve a
+/// stale path, and these syscalls are never in a hot loop.
+pub(crate) fn is_structural_namespace_mutation(canonical_nr: u64) -> bool {
+    matches!(
+        canonical_nr,
+        33      // mknodat
+            | 34  // mkdirat
+            | 35  // unlinkat  (unlink + rmdir via AT_REMOVEDIR)
+            | 36  // symlinkat
+            | 37  // linkat
+            | 38  // renameat
+            | 276 // renameat2
+    )
+}
+
 mod access;
 mod fd_helpers;
 mod pathres;
@@ -3350,8 +3374,56 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn resolve_at_path(&self, dirfd: u64, path: &str) -> Result<String, LinuxErrno> {
+        // Cache only AT_FDCWD absolute paths: their resolution is independent of
+        // the cwd and of any dirfd, so the guest path string alone is a complete
+        // key. (Relative / dirfd-anchored paths would need those in the key; they
+        // are rare in the syscall-bound hot loops this targets.) The cache is
+        // validated against a fork-coherent generation bumped on structural fs
+        // mutations, so a create/delete/rename/symlink correctly invalidates it.
+        // Only successful resolutions are cached; errors re-resolve.
+        // Build a cache key when the resolution is fully determined by the
+        // guest path plus (for a relative path) the cwd:
+        //   - absolute path      -> the path itself (cwd/dirfd irrelevant)
+        //   - AT_FDCWD + relative -> cwd + '\0' + path, so a later chdir keys a
+        //     different entry rather than serving a stale one (LTP fuzzy-sync
+        //     tests chdir into their tmpdir and pass a relative name).
+        // A relative path through a REAL dirfd depends on that fd's directory,
+        // so it is not keyed here.
+        let is_atfdcwd = (dirfd as i32) as i64 as u64 == LINUX_AT_FDCWD;
+        let cache_key: Option<String> = if std::path::Path::new(path).is_absolute() {
+            Some(path.to_owned())
+        } else if is_atfdcwd {
+            Some(format!("{}\u{0}{}", self.io.cwd.read(), path))
+        } else {
+            None
+        };
+        // Sample the generation at ENTRY, before reading any fs state: a new
+        // entry is stamped with this, so a mutation racing our resolve (which
+        // bumps to a higher generation) leaves the entry born stale.
+        let gen_at_entry = crate::fs_resolve_cache::current_generation();
+        if let Some(ref key) = cache_key {
+            // Validate the lookup against the FRESH current generation (read
+            // now, not `gen_at_entry`) so a mutation between entry and here also
+            // invalidates.
+            if let Some(hit) = self
+                .fs
+                .resolve_cache
+                .get(key, crate::fs_resolve_cache::current_generation())
+            {
+                // Still enforce DAC search permission per call — it depends on
+                // live creds, not the path structure (a no-op for root, the hot
+                // case). The resolution itself is what the cache elides.
+                self.check_search_access(&hit)?;
+                return Ok(hit);
+            }
+        }
         let resolved = self.resolve_at_path_inner(dirfd, path)?;
         self.check_search_access(&resolved)?;
+        if let Some(key) = cache_key {
+            self.fs
+                .resolve_cache
+                .put(key, resolved.clone(), gen_at_entry);
+        }
         Ok(resolved)
     }
 
