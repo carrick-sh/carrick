@@ -175,7 +175,7 @@ where
     pub(super) fn complete_shared_futex_wait(
         &self,
         engine: &mut E,
-        host_addr: usize,
+        location: carrick_guest_mem::SharedFutexLocation,
         waiter_key: usize,
         value: u32,
         timeout: Option<Duration>,
@@ -193,13 +193,9 @@ where
                 self.this_tid.raw(),
                 crate::run_state::RunState::Blocked,
             );
-            let retval = self.platform_futex.shared_wait(
-                host_addr,
-                waiter_key,
-                value,
-                timeout,
-                &interrupted,
-            );
+            let retval =
+                self.platform_futex
+                    .shared_wait(location, waiter_key, value, timeout, &interrupted);
             crate::thread::set_current_thread_state(self.this_tid, 'R');
             crate::run_state::publish_guest_tid(
                 self.this_tid.raw(),

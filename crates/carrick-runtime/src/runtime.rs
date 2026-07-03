@@ -1132,7 +1132,7 @@ where
                 last_syscall_retval = Some(va.raw() as i64);
             }
             DispatchOutcome::SharedFutexWait {
-                host_addr,
+                location,
                 waiter_key,
                 value,
                 timeout,
@@ -1145,19 +1145,19 @@ where
                 // root cause of LTP pause01 TBROKing on
                 // `tst_checkpoint_wake ETIMEDOUT`.
                 let retval =
-                    shared_futex_wait(HostVa(host_addr), waiter_key, value, timeout, this_tid);
+                    shared_futex_wait(location.wait_addr(), waiter_key, value, timeout, this_tid);
                 runtime.complete_syscall(retval)?;
                 last_syscall_retval = Some(retval);
             }
             DispatchOutcome::SharedFutexWake {
-                host_addr,
+                location,
                 waiter_key,
                 count,
             } => {
                 // Cross-process MAP_SHARED futex wake from a single-threaded
                 // guest (LTP tst_checkpoint_wake). Same __ulock one-at-a-time +
                 // sched_yield as the threaded loop's PlatformFutex::shared_wake.
-                let retval = shared_futex_wake(host_addr, waiter_key, count);
+                let retval = shared_futex_wake(location.wait_addr().raw(), waiter_key, count);
                 runtime.complete_syscall(retval)?;
                 last_syscall_retval = Some(retval);
             }
@@ -1820,11 +1820,11 @@ impl<M: GuestMemory, T: SyscallTrap> GuestMemory for SplitView<'_, M, T> {
     fn unmap_alias_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
         self.mem.unmap_alias_range(address, len)
     }
-    fn shared_futex_host_addr(&self, guest_addr: u64) -> Option<usize> {
-        self.mem.shared_futex_host_addr(guest_addr)
-    }
-    fn shared_futex_uses_mirror(&self) -> bool {
-        self.mem.shared_futex_uses_mirror()
+    fn shared_futex_location(
+        &self,
+        guest_addr: u64,
+    ) -> Option<carrick_guest_mem::SharedFutexLocation> {
+        self.mem.shared_futex_location(guest_addr)
     }
 }
 

@@ -14,8 +14,8 @@
 
 use std::sync::Arc;
 
-use carrick_guest_mem::{Gpa, GuestVa, HostVa, MemoryError, X8664SyscallFrame};
-use carrick_hal::{GuestVmBackend, TrapError, VcpuKick, VcpuRegistry};
+use carrick_guest_mem::{Gpa, GuestVa, MemoryError, X8664SyscallFrame};
+use carrick_hal::{GuestVmBackend, SharedFutexLocation, TrapError, VcpuKick, VcpuRegistry};
 
 use crate::bringup_fns::{self, BringupLayout, X86VcpuSnapshot};
 
@@ -236,32 +236,12 @@ pub trait X86Vmm: Sized + GuestVmBackend {
     // NOTE: `write_gpa` / `host_ptr` / `host_ptr_mut` are inherited from the shared
     // [`GuestVmBackend`] supertrait (ISA-neutral, signature-identical with aarch64).
 
-    /// Host virtual address of the `len`-byte futex word at guest-physical `gpa`,
-    /// but ONLY when that word lies in a `MAP_SHARED` window whose backing is the
-    /// SAME physical page in parent and child across `fork(2)` — the boot-mapped
-    /// shared aperture OR a runtime file-backed `MAP_SHARED` alias. Such a word is
-    /// a valid cross-process rendezvous target for a bare host `SYS_futex`, so the
-    /// engine routes it through `PlatformFutex::shared_wait/shared_wake` instead of
-    /// the per-process parking lot. `None` for a private/anon (COW) word — those
-    /// stay in-process. Default `None`: a bring-up backend with no shared windows
-    /// keeps every futex private. The KVM backend overrides it (`GuestRam` tracks
-    /// `WindowKind::Shared`); bhyve/NVMM can adopt it when they grow shared
-    /// windows. Without this, every cross-process futex on x86 fell to the
-    /// per-process parking lot and a forked child's `FUTEX_WAKE` never reached a
-    /// parent parked in `FUTEX_WAIT` on the same `/dev/shm` page (`ltpcheckpoint`'s
-    /// reverse direction, gating ~10 LTP signal tests via `tst_checkpoint`).
-    fn shared_futex_host_addr(&self, _gpa: Gpa, _len: usize) -> Option<HostVa> {
+    /// Fork-coherent host location of the `len`-byte futex word at guest-physical
+    /// `gpa`, but ONLY when that word lies in a `MAP_SHARED` window. Direct
+    /// backends return the guest word's real host address. Bhyve returns a typed
+    /// mirror slot because its per-VM guest word is not shared across `fork(2)`.
+    fn shared_futex_location(&self, _gpa: Gpa, _len: usize) -> Option<SharedFutexLocation> {
         None
-    }
-
-    /// Whether [`Self::shared_futex_host_addr`] returns a SEPARATE mirror word
-    /// (bhyve, whose per-VM guest word is not shared across `fork(2)`) rather
-    /// than the guest word itself (KVM/NVMM share it). When true a `FUTEX_WAKE`
-    /// publishes the waker's word into the mirror; when false that publish is
-    /// skipped (the guest already wrote the shared word — republishing would race
-    /// and revert a concurrent peer update). Default: false.
-    fn shared_futex_uses_mirror(&self) -> bool {
-        false
     }
 
     /// Whether `va` lies in a guest memory RESERVATION that is not yet committed

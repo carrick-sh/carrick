@@ -33,7 +33,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use carrick_abi::LinuxProtFlags;
 use carrick_guest_mem::{Gpa, GuestVa, HostVa, MemoryError};
-use carrick_hal::{GuestVmBackend, TrapError};
+use carrick_hal::{GuestVmBackend, SharedFutexLocation, TrapError};
 use carrick_mem::memory::AddressSpace;
 use carrick_mem::pml4::{Pml4Manager, walk_descriptors};
 use carrick_x86::{
@@ -258,8 +258,10 @@ impl X86Vmm for KvmVmm {
     /// `GuestRam` already tracks this for the aarch64 lane; expose it on the x86
     /// `X86Vmm` seam so the shared engine routes the cross-process futex through
     /// the bare-`SYS_futex` shared path (`ltpcheckpoint` reverse direction).
-    fn shared_futex_host_addr(&self, gpa: Gpa, len: usize) -> Option<HostVa> {
-        self.ram.shared_futex_host_addr(gpa.raw(), len).map(HostVa)
+    fn shared_futex_location(&self, gpa: Gpa, len: usize) -> Option<SharedFutexLocation> {
+        self.ram
+            .shared_futex_host_addr(gpa.raw(), len)
+            .map(|word| SharedFutexLocation::Direct { word: HostVa(word) })
     }
 
     fn protect_range(&mut self, address: u64, len: usize, prot: u64) -> Result<(), MemoryError> {

@@ -1534,38 +1534,42 @@ impl SyscallDispatcher {
             // its "mirror" IS the guest word). A no-op on HVF/KVM, where this private
             // descriptor word never resolved to a mirror anyway. This is the one
             // non-PRIVATE word whose waker is the host, not the guest.
-            let shared_host_addr = if futex_flags.contains(LinuxFutexFlags::PRIVATE)
+            let shared_location = if futex_flags.contains(LinuxFutexFlags::PRIVATE)
                 || thread.registry.is_clear_child_tid_addr(address.0)
             {
                 None
             } else {
-                memory.shared_futex_host_addr(address.0)
+                memory.shared_futex_location(address.0)
             };
             crate::probes::futex_route(
                 address.0,
                 command as i32,
-                if shared_host_addr.is_some() { 1 } else { 0 },
-                shared_host_addr.map(|h| h as u64).unwrap_or(0),
+                if shared_location.is_some() { 1 } else { 0 },
+                shared_location
+                    .map(|location| location.wait_addr().raw() as u64)
+                    .unwrap_or(0),
             );
 
             Ok(match command {
                 LINUX_FUTEX_WAKE => {
-                    if let Some(host_addr) = shared_host_addr {
+                    if let Some(location) = shared_location {
                         // Publish the waker's current word value to the fork-coherent
                         // host word BEFORE waking, so a WAITer (possibly in another
                         // process) observes the change the waker just made to its own
-                        // guest word. No-op on HVF/KVM (host_addr IS the guest word);
+                        // guest word. No-op on HVF/KVM (the wait address IS the guest word);
                         // load-bearing on bhyve, whose per-VM sysmem copy of the word
                         // is not shared across the fork — the umtx waits/wakes on this
                         // mirror, not on the divergent per-process copies.
-                        shared_futex_store(host_addr, word);
+                        if location.is_mirror() {
+                            shared_futex_store(location, word);
+                        }
                         // Cross-process (MAP_SHARED) wake: route through the
                         // `PlatformFutex::shared_wake` seam (the wake counterpart
                         // of `SharedFutexWait`) so HVF's __ulock (one-at-a-time +
                         // sched_yield) or KVM's host SYS_futex is reached
                         // uniformly. The loop completes with the count woken.
                         return Ok(DispatchOutcome::SharedFutexWake {
-                            host_addr,
+                            location,
                             waiter_key: address.0 as usize,
                             count: value,
                         });
@@ -1582,9 +1586,9 @@ impl SyscallDispatcher {
                     // stale per-VM sysmem copy, and publish it back into the guest word
                     // so the caller's retry loop (tst_checkpoint_wait &c.) re-reads what
                     // another process wrote instead of spinning on the stale value.
-                    let current = if let Some(host_addr) = shared_host_addr {
-                        let mirror = shared_futex_load(host_addr);
-                        if mirror != word {
+                    let current = if let Some(location) = shared_location {
+                        let mirror = shared_futex_load(location);
+                        if mirror != word && location.is_mirror() {
                             let _ = memory.write_bytes(address.0, &mirror.to_ne_bytes());
                         }
                         mirror
@@ -1614,9 +1618,9 @@ impl SyscallDispatcher {
                                 .unwrap_or(std::time::Duration::ZERO),
                         )
                     };
-                    if let Some(host_addr) = shared_host_addr {
+                    if let Some(location) = shared_location {
                         return Ok(DispatchOutcome::SharedFutexWait {
-                            host_addr,
+                            location,
                             waiter_key: address.0 as usize,
                             value,
                             timeout,
@@ -1651,7 +1655,7 @@ impl SyscallDispatcher {
                     if raw_command == LINUX_FUTEX_CMP_REQUEUE && word != val3 {
                         return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
                     }
-                    if let Some(host_addr) = shared_host_addr {
+                    if let Some(location) = shared_location {
                         // Shared path: no native requeue → wake nr_wake+nr_requeue
                         // (correct per the spurious-wake-tolerant futex contract),
                         // routed through the `PlatformFutex::shared_wake` seam.
@@ -1659,7 +1663,7 @@ impl SyscallDispatcher {
                             .saturating_add(nr_requeue as u64)
                             .min(u32::MAX as u64) as u32;
                         return Ok(DispatchOutcome::SharedFutexWake {
-                            host_addr,
+                            location,
                             waiter_key: uaddr2 as usize,
                             count: total,
                         });
@@ -2571,10 +2575,10 @@ fn translate_child_wait_status(host_pid: u32, status: i32) -> i32 {
 /// (the shared aperture on HVF/KVM, the bhyve futex mirror on bhyve). Atomic to
 /// match the guest's own atomic access to the same word.
 #[inline]
-fn shared_futex_load(host_addr: usize) -> u32 {
-    // SAFETY: host_addr is a live 4-byte-aligned host word from shared_futex_host_addr.
+fn shared_futex_load(location: carrick_guest_mem::SharedFutexLocation) -> u32 {
+    // SAFETY: the wait address is a live 4-byte-aligned host word from shared_futex_location.
     unsafe {
-        (*(host_addr as *const std::sync::atomic::AtomicU32))
+        (*(location.wait_addr().raw() as *const std::sync::atomic::AtomicU32))
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 }
@@ -2584,10 +2588,10 @@ fn shared_futex_load(host_addr: usize) -> u32 {
 /// self-store (harmless no-op); on bhyve it pushes the value into the shared mirror
 /// the umtx waits/wakes on (the per-VM sysmem copy is NOT shared across the fork).
 #[inline]
-fn shared_futex_store(host_addr: usize, value: u32) {
+fn shared_futex_store(location: carrick_guest_mem::SharedFutexLocation, value: u32) {
     // SAFETY: as in shared_futex_load.
     unsafe {
-        (*(host_addr as *const std::sync::atomic::AtomicU32))
+        (*(location.wait_addr().raw() as *const std::sync::atomic::AtomicU32))
             .store(value, std::sync::atomic::Ordering::SeqCst)
     }
 }

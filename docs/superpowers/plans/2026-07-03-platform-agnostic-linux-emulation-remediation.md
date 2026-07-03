@@ -89,13 +89,15 @@ This plan is therefore a master remediation ledger. Each task below is an indepe
 - Produces: a typed shared-futex location enum such as `SharedFutexLocation::Direct { host_addr }` and `SharedFutexLocation::Mirror { value_addr, waiter_addr }`.
 - Consumes: existing `PlatformFutex::shared_wait/shared_wake` and x86 VMM shared-futex resolution.
 
-- [ ] Add a failing unit test that routes a non-mirror shared futex through the FreeBSD wait path and proves the current API cannot distinguish it from a mirror slot.
-- [ ] Replace `shared_futex_host_addr` plus `shared_futex_uses_mirror` with one typed result so the waiter counter address is provided by the backend, not inferred.
-- [ ] Change FreeBSD `_umtx_op` wait/wake helpers to receive the explicit waiter counter address only for mirror slots.
-- [ ] Keep direct shared futex words on hosts that have true shared backing from touching adjacent guest memory.
-- [ ] Verify with `cargo test -p carrick-x86` and the bhyve backend unit tests.
+- [x] Add a failing unit test that routes a non-mirror shared futex through the FreeBSD wait path and proves the current API cannot distinguish it from a mirror slot.
+- [x] Replace `shared_futex_host_addr` plus `shared_futex_uses_mirror` with one typed result so the waiter counter address is provided by the backend, not inferred.
+- [x] Change FreeBSD `_umtx_op` wait/wake helpers to receive the explicit waiter counter address only for mirror slots.
+- [x] Keep direct shared futex words on hosts that have true shared backing from touching adjacent guest memory.
+- [x] Verify with `cargo test -p carrick-x86` and the bhyve backend unit tests.
 - [ ] On FreeBSD, run the targeted shared-futex/LTP checkpoint gate that originally justified the mirror.
-- [ ] Commit as `fix(bhyve): type shared futex mirror waiters`.
+- [x] Commit as `fix(bhyve): type shared futex mirror waiters`.
+
+**Local evidence:** `cargo test -p carrick-thread --lib -- --test-threads=1`, `cargo test -p carrick-host --lib umtx`, `cargo test -p carrick-x86 --lib`, `cargo test -p carrick-runtime --lib shared_futex`, `cargo test -p carrick-vmm-kvm --lib kvm_futex`, `cargo test -p carrick-vmm-bhyve --lib futex`, and `cargo test -p carrick-vmm-nvmm --lib futex` pass on macOS. The FreeBSD target-host LTP checkpoint gate remains open.
 
 ## Task 2: Make BSD Signal Translation Collision-Aware
 

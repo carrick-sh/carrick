@@ -8,14 +8,20 @@
 
 use std::sync::Arc;
 
-use carrick_hal::SharedWaitStep;
+use carrick_hal::{SharedFutexLocation, SharedWaitStep};
 use carrick_thread::platform_futex::{FutexTableFutex, SharedFutexSyscall};
 use carrick_thread::thread::FutexTable;
 
 pub struct NvmmSharedFutex;
 
 impl SharedFutexSyscall for NvmmSharedFutex {
-    fn wait_one_slice(&self, host_addr: usize, val: u32, slice_ns: i64) -> SharedWaitStep {
+    fn wait_one_slice(
+        &self,
+        location: SharedFutexLocation,
+        val: u32,
+        slice_ns: i64,
+    ) -> SharedWaitStep {
+        let host_addr = location.wait_addr().raw();
         let slice_us = u32::try_from((slice_ns / 1_000).max(0)).unwrap_or(u32::MAX);
         let r = carrick_host::netbsd_futex::wait(host_addr, val, slice_us);
         // Shared ABI guard + observability: a non-{ETIMEDOUT,EINTR} NetBSD futex
@@ -30,7 +36,8 @@ impl SharedFutexSyscall for NvmmSharedFutex {
         )
     }
 
-    fn wake(&self, host_addr: usize, _waiter_key: usize, n: u32) -> i64 {
+    fn wake(&self, location: SharedFutexLocation, _waiter_key: usize, n: u32) -> i64 {
+        let host_addr = location.wait_addr().raw();
         let all = n > 1;
         carrick_host::netbsd_futex::wake(host_addr, all).max(0)
     }

@@ -41,16 +41,25 @@ mod imp {
     /// Wait while `*host_addr == value`. `timeout_us == 0` blocks indefinitely.
     /// Returns `>= 0` when woken or the value already differed, or `-errno`
     /// (`-ETIMEDOUT`, `-EINTR`, …).
-    pub fn wait(host_addr: usize, value: u32, timeout_us: u32) -> i64 {
-        // Register as a parked waiter in the mirror slot's `waiters` field (the host
-        // word at `host_addr` is the slot's `value`; `waiters` is the next u32, at
-        // `host_addr + 4`). A concurrent shared WAKE reads this to report a Linux-
-        // faithful woken count, which FreeBSD `_umtx_op(UMTX_OP_WAKE)` itself never does
-        // (it returns 0 on success). Held across the wait, decremented on every return.
-        // SAFETY: host_addr is the mirror slot's `value` word (bhyve always routes a
-        // shared futex through a FutexMirrorSlot); `value`+4 is its `waiters` field.
-        let waiters = unsafe { &*((host_addr + 4) as *const std::sync::atomic::AtomicU32) };
-        waiters.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    pub fn wait(
+        host_addr: usize,
+        waiter_count_addr: Option<usize>,
+        value: u32,
+        timeout_us: u32,
+    ) -> i64 {
+        // Register as a parked waiter only when the backend supplied a mirror
+        // slot's explicit `waiters` field. Direct shared words have no sidecar:
+        // adjacent memory belongs to the guest and must not be touched here.
+        // A concurrent shared WAKE reads this to report a Linux-faithful woken
+        // count, which FreeBSD `_umtx_op(UMTX_OP_WAKE)` itself never does (it
+        // returns 0 on success). Held across the wait, decremented on every return.
+        let waiters = waiter_count_addr.map(|addr| {
+            // SAFETY: caller supplied the mirror slot's explicit waiter-count field.
+            unsafe { &*(addr as *const std::sync::atomic::AtomicU32) }
+        });
+        if let Some(waiters) = waiters {
+            waiters.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
         // SAFETY: host_addr is a live 4-byte-aligned host MAP_SHARED word;
         // _umtx_op reads 4 bytes for the compare.
         let rc = unsafe {
@@ -80,26 +89,29 @@ mod imp {
                 )
             }
         };
-        waiters.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        if let Some(waiters) = waiters {
+            waiters.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
         if rc < 0 { neg_errno() } else { rc as i64 }
     }
 
     /// Wake waiters on `host_addr`. Returns `>= 0` on success, `-errno` otherwise.
-    pub fn wake(host_addr: usize, all: bool) -> i64 {
+    pub fn wake(host_addr: usize, waiter_count_addr: Option<usize>, all: bool) -> i64 {
         let n: libc::c_ulong = if all {
             libc::c_int::MAX as libc::c_ulong
         } else {
             1
         };
-        // Snapshot the parked-waiter count (mirror slot `waiters` at value+4) BEFORE the
-        // wake. FreeBSD UMTX_OP_WAKE returns 0 on success, but Linux FUTEX_WAKE — and
-        // tst_checkpoint_wake's retry loop — expect the NUMBER of waiters woken, so
-        // report min(parked, requested) instead of the umtx 0.
-        // SAFETY: host_addr is the mirror slot's `value`; `value`+4 is its `waiters`.
-        let waiters = unsafe {
-            (*((host_addr + 4) as *const std::sync::atomic::AtomicU32))
+        // Snapshot the parked-waiter count only when the caller supplies an
+        // explicit mirror slot. FreeBSD UMTX_OP_WAKE returns 0 on success, but
+        // Linux FUTEX_WAKE — and tst_checkpoint_wake's retry loop — expect the
+        // NUMBER of waiters woken, so report min(parked, requested) instead of
+        // the umtx 0 for mirror-backed waits.
+        let waiters = waiter_count_addr.map_or(0, |addr| unsafe {
+            // SAFETY: caller supplied the mirror slot's explicit waiter-count field.
+            (*(addr as *const std::sync::atomic::AtomicU32))
                 .load(std::sync::atomic::Ordering::SeqCst)
-        };
+        });
         // SAFETY: plain libc call against a live shared host address.
         let rc = unsafe {
             _umtx_op(
@@ -113,16 +125,25 @@ mod imp {
         if rc < 0 {
             return neg_errno();
         }
-        (u64::from(waiters)).min(n as u64) as i64
+        if waiter_count_addr.is_some() {
+            (u64::from(waiters)).min(n as u64) as i64
+        } else {
+            rc as i64
+        }
     }
 }
 
 #[cfg(not(target_os = "freebsd"))]
 mod imp {
-    pub fn wait(_host_addr: usize, _value: u32, _timeout_us: u32) -> i64 {
+    pub fn wait(
+        _host_addr: usize,
+        _waiter_count_addr: Option<usize>,
+        _value: u32,
+        _timeout_us: u32,
+    ) -> i64 {
         -(libc::ENOSYS as i64)
     }
-    pub fn wake(_host_addr: usize, _all: bool) -> i64 {
+    pub fn wake(_host_addr: usize, _waiter_count_addr: Option<usize>, _all: bool) -> i64 {
         -(libc::ENOSYS as i64)
     }
 }
@@ -132,13 +153,15 @@ pub use imp::{wait, wake};
 #[cfg(all(test, target_os = "freebsd"))]
 mod tests {
     use super::{wait, wake};
-    use std::sync::atomic::AtomicU32;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::thread;
+    use std::time::Duration;
 
     #[test]
     fn wait_times_out_with_etimedout() {
         let word = AtomicU32::new(7);
         let addr = &word as *const AtomicU32 as usize;
-        let rc = wait(addr, 7, 10_000); // value matches -> block; 10ms -> -ETIMEDOUT
+        let rc = wait(addr, None, 7, 10_000); // value matches -> block; 10ms -> -ETIMEDOUT
         assert_eq!(
             rc,
             -(libc::ETIMEDOUT as i64),
@@ -149,14 +172,62 @@ mod tests {
     fn wait_returns_immediately_when_value_differs() {
         let word = AtomicU32::new(1);
         let addr = &word as *const AtomicU32 as usize;
-        let rc = wait(addr, 0, 0); // compared value 0 != 1 -> must not block
+        let rc = wait(addr, None, 0, 0); // compared value 0 != 1 -> must not block
         assert!(rc >= 0, "value-differs must return >= 0, got {rc}");
     }
     #[test]
     fn wake_with_no_waiter_is_not_fatal() {
         let word = AtomicU32::new(0);
         let addr = &word as *const AtomicU32 as usize;
-        let rc = wake(addr, true);
+        let rc = wake(addr, None, true);
         assert!(rc >= 0, "wake with no waiter should be >= 0, got {rc}");
+    }
+
+    #[test]
+    fn direct_wake_does_not_read_adjacent_word_as_waiter_count() {
+        #[repr(C)]
+        struct DirectWord {
+            value: AtomicU32,
+            adjacent_guest_word: AtomicU32,
+        }
+
+        let word = DirectWord {
+            value: AtomicU32::new(0),
+            adjacent_guest_word: AtomicU32::new(99),
+        };
+        let addr = &word.value as *const AtomicU32 as usize;
+
+        let rc = wake(addr, None, false);
+
+        assert_eq!(
+            rc, 0,
+            "direct shared wake must not report a fake waiter from adjacent guest memory"
+        );
+    }
+
+    #[test]
+    fn direct_wait_does_not_increment_adjacent_word_as_waiter_count() {
+        #[repr(C)]
+        struct DirectWord {
+            value: AtomicU32,
+            adjacent_guest_word: AtomicU32,
+        }
+
+        let word = Box::leak(Box::new(DirectWord {
+            value: AtomicU32::new(0),
+            adjacent_guest_word: AtomicU32::new(99),
+        }));
+        let addr = &word.value as *const AtomicU32 as usize;
+
+        let waiter = thread::spawn(move || wait(addr, None, 0, 100_000));
+        thread::sleep(Duration::from_millis(10));
+
+        assert_eq!(
+            word.adjacent_guest_word.load(Ordering::SeqCst),
+            99,
+            "direct shared wait must not use adjacent guest memory as a waiter counter"
+        );
+        let rc = waiter.join().expect("waiter thread");
+        assert_eq!(rc, -(libc::ETIMEDOUT as i64));
     }
 }

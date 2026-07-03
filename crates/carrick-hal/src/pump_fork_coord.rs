@@ -219,7 +219,7 @@ mod tests {
         }
         fn shared_wait(
             &self,
-            _h: usize,
+            _location: SharedFutexLocation,
             _k: usize,
             _v: u32,
             _to: Option<Duration>,
@@ -227,7 +227,7 @@ mod tests {
         ) -> i64 {
             0
         }
-        fn shared_wake(&self, _h: usize, _k: usize, _n: u32) -> i64 {
+        fn shared_wake(&self, _location: SharedFutexLocation, _k: usize, _n: u32) -> i64 {
             0
         }
         fn requeue(&self, _f: u64, _t: u64, _w: u32, _r: u32) -> (u32, u32) {

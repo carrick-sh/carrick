@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex};
 
 use carrick_abi::LinuxSiginfo;
 use carrick_guest_mem::protections::MemoryProtections;
-use carrick_guest_mem::{Gpa, GuestMemory, GuestVa, HostVa, MemoryError};
+use carrick_guest_mem::{Gpa, GuestMemory, GuestVa, MemoryError, SharedFutexLocation};
 use carrick_hal::guest_arch::GuestArch as _;
 use carrick_hal::{
     ForkOutcome, GuestEntryRegs, OsError, RawSyscall, Reg, SlotId, SysReg, SyscallTrap,
@@ -626,12 +626,12 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
     /// routes a guest cross-process (`MAP_SHARED`) futex through the shared
     /// host-`SYS_futex` path on the same physical page. `None` for a private/COW
     /// word (those stay in-process via the parking-lot `FutexTable`).
-    fn shared_futex_host_addr(&self, guest_addr: u64) -> Option<usize> {
-        // The `GuestMemory` trait method itself stays raw (stage-9 scope); the
-        // backend seam below is typed GuestVa → HostVa.
+    fn shared_futex_location(&self, guest_addr: u64) -> Option<SharedFutexLocation> {
+        // The backend seam below is typed GuestVa -> HostVa. Aarch64 backends
+        // expose only direct shared-aperture words; bhyve-style mirrors are x86.
         self.vm
             .shared_futex_host_addr(GuestVa(guest_addr))
-            .map(HostVa::raw)
+            .map(|word| SharedFutexLocation::Direct { word })
     }
 
     /// Make a guest `mprotect`/`mmap`'s protection GUEST-visible by editing the
