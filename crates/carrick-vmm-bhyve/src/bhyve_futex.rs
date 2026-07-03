@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use carrick_hal::SharedWaitStep;
+use carrick_hal::{SharedFutexLocation, SharedWaitStep};
 use carrick_thread::platform_futex::{FutexTableFutex, SharedFutexSyscall};
 use carrick_thread::thread::FutexTable;
 
@@ -21,9 +21,16 @@ use carrick_thread::thread::FutexTable;
 pub struct BhyveSharedFutex;
 
 impl SharedFutexSyscall for BhyveSharedFutex {
-    fn wait_one_slice(&self, host_addr: usize, val: u32, slice_ns: i64) -> SharedWaitStep {
+    fn wait_one_slice(
+        &self,
+        location: SharedFutexLocation,
+        val: u32,
+        slice_ns: i64,
+    ) -> SharedWaitStep {
         let slice_us = u32::try_from((slice_ns / 1_000).max(0)).unwrap_or(u32::MAX);
-        let r = carrick_host::umtx::wait(host_addr, val, slice_us);
+        let host_addr = location.wait_addr().raw();
+        let waiter_count_addr = location.waiter_count_addr().map(|addr| addr.raw());
+        let r = carrick_host::umtx::wait(host_addr, waiter_count_addr, val, slice_us);
         // Shared ABI guard + observability: a non-{ETIMEDOUT,EINTR} `_umtx_op`
         // errno folds to a spurious wake (never `Error(raw)` — a raw FreeBSD errno
         // leaked here fatally aborts the guest's glibc nptl) and fires the
@@ -37,9 +44,11 @@ impl SharedFutexSyscall for BhyveSharedFutex {
         )
     }
 
-    fn wake(&self, host_addr: usize, _waiter_key: usize, n: u32) -> i64 {
+    fn wake(&self, location: SharedFutexLocation, _waiter_key: usize, n: u32) -> i64 {
         let all = n > 1;
-        let r = carrick_host::umtx::wake(host_addr, all);
+        let host_addr = location.wait_addr().raw();
+        let waiter_count_addr = location.waiter_count_addr().map(|addr| addr.raw());
+        let r = carrick_host::umtx::wake(host_addr, waiter_count_addr, all);
         r.max(0)
     }
 }

@@ -18,7 +18,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Once, OnceLock};
 
-use carrick_guest_mem::{Gpa, GuestMemory, GuestVa, HostVa, MemoryError};
+use carrick_guest_mem::{Gpa, GuestMemory, GuestVa, MemoryError, SharedFutexLocation};
 use carrick_hal::guest_arch::GuestArch as _;
 use carrick_hal::x8664_arch::{SegmentBaseRegs, SyscallNorm, X8664GuestArch, service_arch_prctl};
 use carrick_hal::{
@@ -415,18 +415,11 @@ impl<V: X86Vmm> GuestMemory for X86EngineCore<V> {
     /// `None`, so EVERY x86 cross-process futex fell to the per-process parking
     /// lot — a forked child's `FUTEX_WAKE` never reached a parent parked in
     /// `FUTEX_WAIT` on the same `/dev/shm` page (`ltpcheckpoint` reverse direction).
-    fn shared_futex_host_addr(&self, guest_addr: u64) -> Option<usize> {
+    fn shared_futex_location(&self, guest_addr: u64) -> Option<SharedFutexLocation> {
         // A futex word is a 4-byte u32. (The `GuestMemory` trait method itself
         // stays raw — stage-9 scope — but the VA→GPA→host chain below is typed.)
         let gpa = self.syscall_buffer_gpa(GuestVa(guest_addr), 4);
-        self.vm.shared_futex_host_addr(gpa, 4).map(HostVa::raw)
-    }
-
-    /// True only on a VMM whose `shared_futex_host_addr` returns a SEPARATE
-    /// mirror (bhyve); KVM/NVMM share the guest word across fork. Drives whether
-    /// a `FUTEX_WAKE` must publish the waker's word to the mirror.
-    fn shared_futex_uses_mirror(&self) -> bool {
-        self.vm.shared_futex_uses_mirror()
+        self.vm.shared_futex_location(gpa, 4)
     }
 
     /// x86-specific WRITE gate (the analog of HVF's `validate_guest_write_range`):

@@ -16,7 +16,7 @@
 
 use std::sync::Arc;
 
-use carrick_hal::SharedWaitStep;
+use carrick_hal::{SharedFutexLocation, SharedWaitStep};
 use carrick_thread::platform_futex::{FutexTableFutex, SharedFutexSyscall};
 use carrick_thread::thread::FutexTable;
 
@@ -33,7 +33,8 @@ pub struct HvfShared;
 impl SharedFutexSyscall for HvfShared {
     /// Pre-wait peek: read the current shared word so carrick-trace can see it
     /// before any wait commences (once, at the top of `shared_wait`).
-    fn pre_wait(&self, host_addr: usize, val: u32) {
+    fn pre_wait(&self, location: SharedFutexLocation, val: u32) {
+        let host_addr = location.wait_addr().raw();
         let host_value = unsafe { (host_addr as *const u32).read() };
         crate::probes::futex_route(host_addr as u64, 99, val as i32, host_value as u64);
     }
@@ -51,7 +52,13 @@ impl SharedFutexSyscall for HvfShared {
     /// re-checks; Linux `FUTEX_WAIT` returns 0), `Retry` for a slice timeout or
     /// signal nudge (the shared loop re-checks the deadline + interrupt), `Error`
     /// for any other terminal `-errno` (EFAULT agrees macOS↔Linux at 14).
-    fn wait_one_slice(&self, host_addr: usize, val: u32, slice_ns: i64) -> SharedWaitStep {
+    fn wait_one_slice(
+        &self,
+        location: SharedFutexLocation,
+        val: u32,
+        slice_ns: i64,
+    ) -> SharedWaitStep {
+        let host_addr = location.wait_addr().raw();
         // Re-validate the shared word at the TOP of every slice before re-parking.
         // A macOS os_sync wake can be LOST: `os_sync_wake_by_address` fires before
         // the waiter is parked (the cross-process wake-before-park race), and
@@ -98,7 +105,8 @@ impl SharedFutexSyscall for HvfShared {
     /// Wake up to `n` waiters on the shared-page word. Darwin's os_sync wake API
     /// reports success/failure rather than a Linux-style waiter count, so the
     /// host ulock wrapper uses its fork-shared parked-waiter table.
-    fn wake(&self, host_addr: usize, waiter_key: usize, n: u32) -> i64 {
+    fn wake(&self, location: SharedFutexLocation, waiter_key: usize, n: u32) -> i64 {
+        let host_addr = location.wait_addr().raw();
         carrick_host::ulock::wake_counted(host_addr, waiter_key, n)
     }
 }

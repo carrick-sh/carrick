@@ -17,7 +17,7 @@
 
 use std::sync::Arc;
 
-use carrick_hal::SharedWaitStep;
+use carrick_hal::{HostVa, SharedFutexLocation, SharedWaitStep};
 use carrick_thread::platform_futex::{FutexTableFutex, SharedFutexSyscall};
 use carrick_thread::thread::FutexTable;
 
@@ -97,7 +97,13 @@ fn futex_wake_by_address(host_addr: usize, n: u32) -> i64 {
 pub struct KvmSharedFutex;
 
 impl SharedFutexSyscall for KvmSharedFutex {
-    fn wait_one_slice(&self, host_addr: usize, val: u32, slice_ns: i64) -> SharedWaitStep {
+    fn wait_one_slice(
+        &self,
+        location: SharedFutexLocation,
+        val: u32,
+        slice_ns: i64,
+    ) -> SharedWaitStep {
+        let host_addr = location.wait_addr().raw();
         let r = futex_wait_on_address(host_addr, val, Some(slice_ns));
         if r == 0 {
             // Woken, or the word already differed from `val`. Linux FUTEX_WAIT
@@ -124,7 +130,8 @@ impl SharedFutexSyscall for KvmSharedFutex {
     /// `sched_yield` workaround on a SHARED address), the Linux kernel's
     /// `FUTEX_WAKE` is atomic and correct: a single `SYS_futex(FUTEX_WAKE, addr,
     /// n)` wakes up to `n` real waiters and returns the exact count.
-    fn wake(&self, host_addr: usize, _waiter_key: usize, n: u32) -> i64 {
+    fn wake(&self, location: SharedFutexLocation, _waiter_key: usize, n: u32) -> i64 {
+        let host_addr = location.wait_addr().raw();
         futex_wake_by_address(host_addr, n)
     }
 }
@@ -239,22 +246,27 @@ mod tests {
         p.cast::<AtomicU32>()
     }
 
+    fn shared_location(word: usize) -> SharedFutexLocation {
+        SharedFutexLocation::Direct { word: HostVa(word) }
+    }
+
     /// SHARED path: thread A `shared_wait` blocks on host `SYS_futex`; thread B
     /// stores a new value + `shared_wake` → A returns `0` (woken).
     #[test]
     fn shared_wait_woken_by_shared_wake() {
         let word = shared_word() as usize;
+        let location = shared_location(word);
         let atom = unsafe { &*(word as *const AtomicU32) };
         atom.store(0, Ordering::SeqCst);
 
         let futex = Arc::new(make_kvm_futex(Arc::new(FutexTable::new())));
         let f2 = Arc::clone(&futex);
         let waiter = thread::spawn(move || {
-            f2.shared_wait(word, word, 0, Some(Duration::from_secs(5)), &|| false)
+            f2.shared_wait(location, word, 0, Some(Duration::from_secs(5)), &|| false)
         });
         thread::sleep(Duration::from_millis(50));
         atom.store(1, Ordering::SeqCst);
-        let woke = futex.shared_wake(word, word, 1);
+        let woke = futex.shared_wake(location, word, 1);
         assert_eq!(woke, 1, "shared_wake must report one waiter woken");
         let r = waiter.join().expect("shared waiter join");
         assert_eq!(r, 0, "shared_wait must return 0 (woken) after shared_wake");
@@ -265,13 +277,14 @@ mod tests {
     #[test]
     fn shared_wait_value_mismatch_returns_immediately() {
         let word = shared_word() as usize;
+        let location = shared_location(word);
         let atom = unsafe { &*(word as *const AtomicU32) };
         atom.store(42, Ordering::SeqCst);
 
         let futex = make_kvm_futex(Arc::new(FutexTable::new()));
         let start = std::time::Instant::now();
         let r = futex.shared_wait(
-            word,
+            location,
             word,
             0,
             Some(Duration::from_secs(5)),
@@ -289,12 +302,13 @@ mod tests {
     #[test]
     fn shared_wait_times_out() {
         let word = shared_word() as usize;
+        let location = shared_location(word);
         let atom = unsafe { &*(word as *const AtomicU32) };
         atom.store(7, Ordering::SeqCst);
 
         let futex = make_kvm_futex(Arc::new(FutexTable::new()));
         let r = futex.shared_wait(
-            word,
+            location,
             word,
             7,
             Some(Duration::from_millis(120)),
@@ -311,11 +325,12 @@ mod tests {
     #[test]
     fn shared_wait_interrupted_returns_eintr() {
         let word = shared_word() as usize;
+        let location = shared_location(word);
         let atom = unsafe { &*(word as *const AtomicU32) };
         atom.store(0, Ordering::SeqCst);
 
         let futex = make_kvm_futex(Arc::new(FutexTable::new()));
-        let r = futex.shared_wait(word, word, 0, Some(Duration::from_secs(5)), &|| true);
+        let r = futex.shared_wait(location, word, 0, Some(Duration::from_secs(5)), &|| true);
         assert_eq!(
             r,
             LINUX_EINTR.guest_retval(),
@@ -327,8 +342,9 @@ mod tests {
     #[test]
     fn shared_wake_no_waiter_returns_zero() {
         let word = shared_word() as usize;
+        let location = shared_location(word);
         let futex = make_kvm_futex(Arc::new(FutexTable::new()));
-        let woke = futex.shared_wake(word, word, 1);
+        let woke = futex.shared_wake(location, word, 1);
         assert_eq!(woke, 0, "shared_wake with no waiter must return 0");
     }
 }

@@ -1333,7 +1333,7 @@ where
                         Some(state.complete_futex_wait(&mut engine, wait, timeout)?);
                 }
                 DispatchOutcome::SharedFutexWait {
-                    host_addr,
+                    location,
                     waiter_key,
                     value,
                     timeout,
@@ -1343,14 +1343,14 @@ where
                     // released. Interruptible by a signal deliverable to this thread.
                     last_syscall_retval = Some(state.complete_shared_futex_wait(
                         &mut engine,
-                        host_addr,
+                        location,
                         waiter_key,
                         value,
                         timeout,
                     )?);
                 }
                 DispatchOutcome::SharedFutexWake {
-                    host_addr,
+                    location,
                     waiter_key,
                     count,
                 } => {
@@ -1362,7 +1362,7 @@ where
                     // woken, matching the prior inline ulock loop's `break`).
                     let woke = state
                         .platform_futex
-                        .shared_wake(host_addr, waiter_key, count);
+                        .shared_wake(location, waiter_key, count);
                     last_syscall_retval = Some(state.complete_returned(&mut engine, woke.max(0))?);
                 }
                 DispatchOutcome::CloneThread {

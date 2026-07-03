@@ -43,7 +43,7 @@
 //!    tables); the latter edits the real stage-1 descriptors so the GUEST faults
 //!    mid-EL0-execution. The test backend, having no tables, implements only the
 //!    former and no-ops the latter.
-//!  - `shared_futex_host_addr` is the hook that turns a guest `MAP_SHARED` futex
+//!  - `shared_futex_location` is the hook that turns a guest `MAP_SHARED` futex
 //!    into a cross-PROCESS rendezvous: it yields a stable host VA only for the
 //!    shared aperture (the same physical page in every forked carrick process),
 //!    which `crate::ulock` keys an `os_sync_wait_on_address` SHARED wait on.
@@ -153,7 +153,7 @@ impl Gpa {
 /// A HOST VIRTUAL address (a real pointer in carrick's own address space).
 ///
 /// Distinct from [`GuestVa`] and [`Gpa`] because the translation chain
-/// (guest VA → GPA → host pointer, e.g. `shared_futex_host_addr`) carried all
+/// (guest VA → GPA → host pointer, e.g. `shared_futex_location`) carried all
 /// three as adjacent bare integers — a swap is page-aligned and alignment
 /// guards cannot catch it; only the type can. Deref via `raw()` at the
 /// pointer boundary.
@@ -165,6 +165,47 @@ impl HostVa {
     #[inline]
     pub const fn raw(self) -> usize {
         self.0
+    }
+}
+
+/// Fork-coherent host location for a guest `MAP_SHARED` futex word.
+///
+/// [`SharedFutexLocation::Direct`] means the host address is the actual guest
+/// futex word and can be waited/woken directly. [`SharedFutexLocation::Mirror`]
+/// means the backend uses a separate fork-shared mirror word and supplies the
+/// explicit waiter-counter address, if the host futex primitive needs one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
+pub enum SharedFutexLocation {
+    Direct { word: HostVa },
+    Mirror { word: HostVa, waiter_count: HostVa },
+}
+
+impl SharedFutexLocation {
+    #[inline]
+    pub const fn wait_addr(self) -> HostVa {
+        match self {
+            SharedFutexLocation::Direct { word }
+            | SharedFutexLocation::Mirror {
+                word,
+                waiter_count: _,
+            } => word,
+        }
+    }
+
+    #[inline]
+    pub const fn waiter_count_addr(self) -> Option<HostVa> {
+        match self {
+            SharedFutexLocation::Direct { word: _ } => None,
+            SharedFutexLocation::Mirror {
+                word: _,
+                waiter_count,
+            } => Some(waiter_count),
+        }
+    }
+
+    #[inline]
+    pub const fn is_mirror(self) -> bool {
+        matches!(self, SharedFutexLocation::Mirror { .. })
     }
 }
 
@@ -400,30 +441,12 @@ pub trait GuestMemory {
         Ok(())
     }
 
-    /// Host virtual address of the byte at `guest_addr`, but ONLY when it lies
-    /// in a host-`MAP_SHARED` guest region — i.e. the boot-mapped shared
-    /// aperture that backs guest `MAP_SHARED` mmaps. That backing is shared
-    /// across `fork(2)`, so the same physical page is visible to every carrick
-    /// process — which makes it a valid target for a cross-process futex via
-    /// the public `os_sync_wait_on_address` API with
-    /// `OS_SYNC_WAIT_ON_ADDRESS_SHARED` (keyed on the physical page; see
-    /// `crate::ulock`). Returns `None` for private/anon guest memory (those
-    /// futexes stay in-process via the parking-lot table). Default: `None`.
-    fn shared_futex_host_addr(&self, _guest_addr: u64) -> Option<usize> {
+    /// Fork-coherent host location for the guest futex word at `guest_addr`, but
+    /// ONLY when it lies in a guest `MAP_SHARED` region. Returns `None` for
+    /// private/anon guest memory, which stays in-process via the parking-lot
+    /// table. Default: `None`.
+    fn shared_futex_location(&self, _guest_addr: u64) -> Option<SharedFutexLocation> {
         None
-    }
-
-    /// Whether [`Self::shared_futex_host_addr`] returns a SEPARATE mirror word
-    /// rather than the guest word itself. True only on bhyve, whose per-VM guest
-    /// word is not shared across `fork(2)` (a vmmapi limitation), so a
-    /// cross-process `FUTEX_WAKE` must publish the waker's word into the shared
-    /// mirror. False on HVF/KVM, where the shared host backing IS the guest word
-    /// — the guest already wrote it before the wake syscall, so republishing a
-    /// (necessarily slightly stale) snapshot would race and REVERT a concurrent
-    /// peer update, desyncing cross-process futex/semaphore protocols. Default:
-    /// false.
-    fn shared_futex_uses_mirror(&self) -> bool {
-        false
     }
 
     /// Host pointer for a CONTIGUOUS guest range usable for zero-copy host I/O

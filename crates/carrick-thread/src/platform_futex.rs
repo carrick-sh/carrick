@@ -25,7 +25,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use carrick_hal::{FutexOutcome, PlatformFutex, SharedWaitStep, ThreadId, shared_wait_sliced};
+use carrick_hal::{
+    FutexOutcome, PlatformFutex, SharedFutexLocation, SharedWaitStep, ThreadId, shared_wait_sliced,
+};
 
 use crate::thread::{FutexTable, FutexWaitOutcome};
 
@@ -41,18 +43,23 @@ pub trait SharedFutexSyscall: Send + Sync {
     /// for a slice timeout / signal nudge (the loop re-checks the deadline +
     /// interrupt), or [`SharedWaitStep::Error`] for any other terminal `-errno`
     /// (in the value space the guest expects).
-    fn wait_one_slice(&self, host_addr: usize, val: u32, slice_ns: i64) -> SharedWaitStep;
+    fn wait_one_slice(
+        &self,
+        location: SharedFutexLocation,
+        val: u32,
+        slice_ns: i64,
+    ) -> SharedWaitStep;
 
-    /// Wake up to `n` waiters on the shared-page word at `host_addr`. Returns the
-    /// count woken (≥0) or `-errno`.
-    fn wake(&self, host_addr: usize, waiter_key: usize, n: u32) -> i64;
+    /// Wake up to `n` waiters on the shared-page word at `location`. Returns the
+    /// count woken (>=0) or `-errno`.
+    fn wake(&self, location: SharedFutexLocation, waiter_key: usize, n: u32) -> i64;
 
     /// Optional once-before-wait hook (default no-op), run once at the top of
     /// [`FutexTableFutex::shared_wait`] before the slice loop. A host can use it
     /// for a pre-wait observability peek at the shared word (HVF emits a
     /// carrick-trace `futex_route` probe here, which is why it previously kept its
     /// own `PlatformFutex` copy — this hook lets it fold onto the shared one).
-    fn pre_wait(&self, _host_addr: usize, _val: u32) {}
+    fn pre_wait(&self, _location: SharedFutexLocation, _val: u32) {}
 
     /// Optional logical-wait lifetime hooks. Hosts whose wake primitive does not
     /// return a waiter count can use these to track the full guest FUTEX_WAIT
@@ -138,23 +145,23 @@ impl<S: SharedFutexSyscall> PlatformFutex for FutexTableFutex<S> {
     /// classification is the host's (`SharedFutexSyscall::wait_one_slice`).
     fn shared_wait(
         &self,
-        host_addr: usize,
+        location: SharedFutexLocation,
         waiter_key: usize,
         value: u32,
         timeout: Option<Duration>,
         interrupted: &dyn Fn() -> bool,
     ) -> i64 {
-        self.shared.pre_wait(host_addr, value);
+        self.shared.pre_wait(location, value);
         self.shared.wait_start(waiter_key);
         let ret = shared_wait_sliced(timeout, interrupted, &|slice_ns| {
-            self.shared.wait_one_slice(host_addr, value, slice_ns)
+            self.shared.wait_one_slice(location, value, slice_ns)
         });
         self.shared.wait_end(waiter_key);
         ret
     }
 
-    fn shared_wake(&self, host_addr: usize, waiter_key: usize, n: u32) -> i64 {
-        self.shared.wake(host_addr, waiter_key, n)
+    fn shared_wake(&self, location: SharedFutexLocation, waiter_key: usize, n: u32) -> i64 {
+        self.shared.wake(location, waiter_key, n)
     }
 
     fn requeue(&self, from: u64, to: u64, wake: u32, requeue: u32) -> (u32, u32) {
@@ -169,5 +176,43 @@ impl<S: SharedFutexSyscall> PlatformFutex for FutexTableFutex<S> {
     #[inline]
     fn notify_signal_pending_for(&self, tid: ThreadId) {
         self.table.notify_signal_pending_for(tid);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use carrick_hal::HostVa;
+
+    struct RecordingShared;
+
+    impl SharedFutexSyscall for RecordingShared {
+        fn wait_one_slice(
+            &self,
+            location: SharedFutexLocation,
+            _val: u32,
+            _slice_ns: i64,
+        ) -> SharedWaitStep {
+            assert_eq!(location.wait_addr(), HostVa(0x1000));
+            assert_eq!(location.waiter_count_addr(), None);
+            SharedWaitStep::Woken
+        }
+
+        fn wake(&self, location: SharedFutexLocation, _waiter_key: usize, n: u32) -> i64 {
+            assert_eq!(location.wait_addr(), HostVa(0x1000));
+            assert_eq!(location.waiter_count_addr(), None);
+            i64::from(n)
+        }
+    }
+
+    #[test]
+    fn direct_shared_futex_location_does_not_expose_waiter_counter() {
+        let futex = FutexTableFutex::new(Arc::new(FutexTable::default()), RecordingShared);
+        let location = SharedFutexLocation::Direct {
+            word: HostVa(0x1000),
+        };
+
+        assert_eq!(futex.shared_wait(location, 0x2000, 7, None, &|| false), 0);
+        assert_eq!(futex.shared_wake(location, 0x2000, 3), 3);
     }
 }

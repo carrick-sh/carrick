@@ -6,6 +6,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use carrick_guest_mem::GuestMemory;
+pub use carrick_guest_mem::{HostVa, SharedFutexLocation};
 
 use crate::error::{OsError, Reg, SysReg};
 use crate::trap::{ForkOutcome, SyscallTrap, TrapError};
@@ -312,13 +313,13 @@ pub trait PlatformFutex: Send + Sync {
     fn private_wake(&self, addr: u64, n: u32) -> u32;
     fn shared_wait(
         &self,
-        host_addr: usize,
+        location: SharedFutexLocation,
         waiter_key: usize,
         val: u32,
         timeout: Option<Duration>,
         interrupted: &dyn Fn() -> bool,
     ) -> i64;
-    fn shared_wake(&self, host_addr: usize, waiter_key: usize, n: u32) -> i64;
+    fn shared_wake(&self, location: SharedFutexLocation, waiter_key: usize, n: u32) -> i64;
     fn requeue(&self, from: u64, to: u64, wake: u32, requeue: u32) -> (u32, u32);
     /// Wake every private-futex waiter so it re-checks its interrupt predicate
     /// (a process-directed signal became pending, or a fork/exec quiesce was
