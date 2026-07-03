@@ -63,17 +63,20 @@ const USER_SS_SEL: u64 = 0x1B;
 ///   xor eax, eax   31 C0         ; iff clear_rax
 ///   iretq          48 CF
 /// ```
-pub fn msr_init_blob(
-    lstar: u64,
-    star: u64,
-    sfmask: u64,
-    user_rip: u64,
-    user_rsp: u64,
-    user_rflags: u64,
-    clear_rax: bool,
-    entry_rdx: u64,
-    entry_rcx: u64,
-) -> Vec<u8> {
+#[derive(Clone, Copy, Debug)]
+pub struct MsrInitBlob {
+    pub lstar: u64,
+    pub star: u64,
+    pub sfmask: u64,
+    pub user_rip: u64,
+    pub user_rsp: u64,
+    pub user_rflags: u64,
+    pub clear_rax: bool,
+    pub entry_rdx: u64,
+    pub entry_rcx: u64,
+}
+
+pub fn msr_init_blob(spec: MsrInitBlob) -> Vec<u8> {
     let mut b = Vec::with_capacity(160);
 
     // Helper: emit WRMSR(msr, val). All three SYSCALL MSRs fit in EDX:EAX.
@@ -94,9 +97,9 @@ pub fn msr_init_blob(
         b.push(0x30);
     };
 
-    wrmsr(MSR_LSTAR, lstar);
-    wrmsr(MSR_STAR, star);
-    wrmsr(MSR_SF_MASK, sfmask);
+    wrmsr(MSR_LSTAR, spec.lstar);
+    wrmsr(MSR_STAR, spec.star);
+    wrmsr(MSR_SF_MASK, spec.sfmask);
 
     // Linux starts user code with all maskable SIMD exceptions masked
     // (MXCSR=0x1F80). Fresh bhyve sibling/reclaim vCPUs otherwise start with
@@ -133,21 +136,21 @@ pub fn msr_init_blob(
     b.extend_from_slice(&(USER_SS_SEL as u32).to_le_bytes());
 
     // RSP (large VA — use mov+push)
-    push_u64(&mut b, user_rsp);
+    push_u64(&mut b, spec.user_rsp);
 
     // RFLAGS (small — push imm32)
     b.push(0x68);
-    b.extend_from_slice(&(user_rflags as u32).to_le_bytes());
+    b.extend_from_slice(&(spec.user_rflags as u32).to_le_bytes());
 
     // CS (selector, small)
     b.push(0x68);
     b.extend_from_slice(&(USER_CS64_SEL as u32).to_le_bytes());
 
     // RIP (large VA — use mov+push)
-    push_u64(&mut b, user_rip);
+    push_u64(&mut b, spec.user_rip);
 
     // Optionally zero RAX (xor eax, eax = 31 C0).
-    if clear_rax {
+    if spec.clear_rax {
         b.push(0x31);
         b.push(0xC0);
     }
@@ -155,10 +158,10 @@ pub fn msr_init_blob(
     // Restore entry ABI registers clobbered by WRMSR/XSETBV.
     b.push(0x48);
     b.push(0xBA);
-    b.extend_from_slice(&entry_rdx.to_le_bytes());
+    b.extend_from_slice(&spec.entry_rdx.to_le_bytes());
     b.push(0x48);
     b.push(0xB9);
-    b.extend_from_slice(&entry_rcx.to_le_bytes());
+    b.extend_from_slice(&spec.entry_rcx.to_le_bytes());
 
     // iretq  (REX.W CF)
     b.push(0x48);
@@ -261,19 +264,33 @@ pub fn run_fp_stub<C: X86Vcpu>(
 mod tests {
     use super::*;
 
+    fn blob_spec(clear_rax: bool) -> MsrInitBlob {
+        MsrInitBlob {
+            lstar: 0,
+            star: 0,
+            sfmask: 0,
+            user_rip: 0x1000,
+            user_rsp: 0x2000,
+            user_rflags: 0x2,
+            clear_rax,
+            entry_rdx: 0,
+            entry_rcx: 0,
+        }
+    }
+
     #[test]
     fn msr_init_blob_is_nonempty_and_ends_with_iretq() {
-        let blob = msr_init_blob(
-            0x1000,
-            0x0013_0008_0000_0000,
-            0x4700,
-            0x40_0000,
-            0x7fff_0000,
-            0x2,
-            false,
-            0,
-            0,
-        );
+        let blob = msr_init_blob(MsrInitBlob {
+            lstar: 0x1000,
+            star: 0x0013_0008_0000_0000,
+            sfmask: 0x4700,
+            user_rip: 0x40_0000,
+            user_rsp: 0x7fff_0000,
+            user_rflags: 0x2,
+            clear_rax: false,
+            entry_rdx: 0,
+            entry_rcx: 0,
+        });
         assert!(!blob.is_empty());
         assert!(blob.len() <= 160, "blob must fit the scratch slot");
         // ends with `iretq` = 48 CF
@@ -290,8 +307,8 @@ mod tests {
 
     #[test]
     fn msr_init_blob_clear_rax_emits_xor_before_iretq() {
-        let with = msr_init_blob(0, 0, 0, 0x1000, 0x2000, 0x2, true, 0, 0);
-        let without = msr_init_blob(0, 0, 0, 0x1000, 0x2000, 0x2, false, 0, 0);
+        let with = msr_init_blob(blob_spec(true));
+        let without = msr_init_blob(blob_spec(false));
         // `with` has the extra `xor eax, eax` (31 C0) just before `iretq`.
         assert_eq!(with.len(), without.len() + 2);
         let n = with.len();
@@ -304,7 +321,7 @@ mod tests {
 
     #[test]
     fn msr_init_blob_masks_mxcsr_and_enables_avx_xcr0() {
-        let blob = msr_init_blob(0, 0, 0, 0x1000, 0x2000, 0x2, false, 0, 0);
+        let blob = msr_init_blob(blob_spec(false));
         let mxcsr_mask = [
             0x68, 0x80, 0x1F, 0x00, 0x00, // push 0x1F80
             0x0F, 0xAE, 0x14, 0x24, // ldmxcsr [rsp]
@@ -330,7 +347,11 @@ mod tests {
     fn msr_init_blob_restores_entry_rdx_rcx_before_iretq() {
         let rdx = 0x1122_3344_5566_7788u64;
         let rcx = 0xCAFE_F00D_DEAD_BEEFu64;
-        let blob = msr_init_blob(0, 0, 0, 0x1000, 0x2000, 0x2, true, rdx, rcx);
+        let blob = msr_init_blob(MsrInitBlob {
+            entry_rdx: rdx,
+            entry_rcx: rcx,
+            ..blob_spec(true)
+        });
         let n = blob.len();
         assert_eq!(&blob[n - 2..], &[0x48, 0xCF], "blob ends with iretq");
         let mut expect = vec![0x48, 0xBA];
