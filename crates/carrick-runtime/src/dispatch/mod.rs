@@ -649,7 +649,11 @@ mod abi_args;
 #[macro_use]
 mod creds;
 mod epoll_shim;
-pub(crate) use epoll_shim::{notify_inmem_epoll, register_epoll_kqueue, unregister_epoll_kqueue};
+pub(crate) use epoll_shim::{
+    after_fork_child as reset_epoll_wake_registry_after_fork_child, notify_inmem_epoll,
+    register_epoll_kqueue, unregister_epoll_kqueue,
+};
+pub(crate) use fifo_beacon::after_fork_child as reset_fifo_beacons_after_fork_child;
 mod fd_table;
 mod fifo_beacon;
 mod ioring;
