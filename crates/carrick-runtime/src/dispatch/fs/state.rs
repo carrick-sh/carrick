@@ -34,6 +34,15 @@ pub(in crate::dispatch) struct FsState {
     /// express for same-process operations. Empty (the common case) → the
     /// handlers' notify calls are a single `is_empty` read and return.
     pub(in crate::dispatch) inotify_registry: crate::inotify::InotifyRegistry,
+
+    /// Fork-coherent cache of `resolve_at_path` results (guest AT_FDCWD
+    /// absolute path -> canonical host-side path). Under `--fs host` a resolve
+    /// re-walks the path on the host (one-to-many `openat`s); a syscall-bound
+    /// loop on ONE stable path (LTP `tst_fuzzy_sync` `inotify_add_watch`) pays
+    /// it every iteration. Validated against a `MAP_SHARED` generation bumped
+    /// on structural fs mutations, so a sibling's mkdir/rename/unlink correctly
+    /// invalidates it. See [`crate::fs_resolve_cache`].
+    pub(in crate::dispatch) resolve_cache: crate::fs_resolve_cache::ResolveCache,
 }
 
 /// Owned I/O-subsystem state. Split out of `SyscallDispatcher` so the I/O
@@ -233,6 +242,7 @@ impl FsState {
             rootfs_vfs: crate::vfs::RootFsVfs::new(),
             pty_table,
             inotify_registry: crate::inotify::InotifyRegistry::default(),
+            resolve_cache: crate::fs_resolve_cache::ResolveCache::new(),
         }
     }
 }
