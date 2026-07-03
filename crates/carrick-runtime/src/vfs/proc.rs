@@ -2129,17 +2129,46 @@ fn synthetic_proc_self_stat(executable_path: &str) -> String {
     let comm = process_short_name(executable_path);
     let pid = std::process::id();
     let ppid = unsafe { libc::getppid() } as u32;
-    let nthreads = crate::current_thread_states().len().max(1);
+    let thread_states = crate::current_thread_states();
+    let nthreads = thread_states.len().max(1);
+    let state = proc_self_stat_state_from_threads(
+        &thread_states,
+        pid,
+        crate::namespace::pid::self_ns_pid(),
+    );
     proc_stat_line(
         pid,
         &comm,
-        'R',
+        state,
         ppid,
         pid,
         pid,
         nthreads,
         self_utime_ticks(),
     )
+}
+
+fn proc_self_stat_state_from_threads(
+    thread_states: &[(crate::thread::ThreadId, char)],
+    self_pid: u32,
+    self_ns_pid: u32,
+) -> char {
+    if let Some(state) = thread_states.iter().find_map(|(tid, state)| {
+        let raw = u32::try_from(tid.raw()).ok()?;
+        (raw == self_pid || raw == self_ns_pid).then_some(*state)
+    }) {
+        return state;
+    }
+
+    thread_states
+        .iter()
+        .filter_map(|(tid, state)| {
+            let raw = u32::try_from(tid.raw()).ok()?;
+            Some((raw, *state))
+        })
+        .min_by_key(|(raw, _)| *raw)
+        .map(|(_, state)| state)
+        .unwrap_or('R')
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3017,6 +3046,18 @@ mod tests {
             String::from_utf8(synthetic_file("/proc/self/stat", &demo_ctx()).unwrap()).unwrap();
         let n = line.trim_end().split(' ').count();
         assert_eq!(n, 52, "stat must have 52 fields: {line:?}");
+    }
+
+    #[test]
+    fn self_stat_state_uses_tracked_leader_state() {
+        let leader = crate::thread::ThreadId::synthetic_for_tests(1000);
+        let worker = crate::thread::ThreadId::synthetic_for_tests(1001);
+        let states = [(leader, 'S'), (worker, 'R')];
+
+        assert_eq!(proc_self_stat_state_from_threads(&states, 1000, 1), 'S');
+        assert_eq!(proc_self_stat_state_from_threads(&states, 2000, 1000), 'S');
+        assert_eq!(proc_self_stat_state_from_threads(&states, 2000, 1), 'S');
+        assert_eq!(proc_self_stat_state_from_threads(&[], 2000, 1), 'R');
     }
 
     #[test]
