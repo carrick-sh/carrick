@@ -267,13 +267,15 @@ This plan is therefore a master remediation ledger. Each task below is an indepe
 - Produces: capability-backed BSD event and lock behavior.
 - Consumes: current kqueue event filters and portable OFD constants.
 
-- [ ] Add a probe for TCP OOB readiness mapped through `EPOLLPRI`.
-- [ ] On FreeBSD/NetBSD, prove whether the current sentinel behavior returns a controlled Linux errno or silently drops readiness.
-- [ ] If OOB cannot be supported, document it as a capability gap and ensure registration fails predictably.
-- [ ] Add a probe where one process opens the same file twice and exercises Linux OFD lock independence.
-- [ ] Either implement a Carrick OFD lock table keyed by open description for BSD hosts, or reject OFD locks with a clear Linux errno instead of pretending process locks are equivalent.
-- [ ] Verify on target BSD hosts.
-- [ ] Commit as `fix(bsd): fence unsupported epoll and ofd semantics`.
+- [x] Add a probe for TCP OOB readiness mapped through `EPOLLPRI`.
+- [x] On FreeBSD/NetBSD, prove whether the current sentinel behavior returns a controlled Linux errno or silently drops readiness.
+- [x] If OOB cannot be supported, document it as a capability gap and ensure registration fails predictably.
+- [x] Add a probe where one process opens the same file twice and exercises Linux OFD lock independence.
+- [x] Either implement a Carrick OFD lock table keyed by open description for BSD hosts, or reject OFD locks with a clear Linux errno instead of pretending process locks are equivalent.
+- [x] Verify on target BSD hosts.
+- [x] Commit as `fix(bsd): fence unsupported epoll and ofd semantics`.
+
+**Local evidence:** Existing probes cover the required Linux invariants: `conformance-probes/src/bin/epollpri.rs` exercises TCP urgent data -> `EPOLLPRI`, and `conformance-probes/src/bin/fcntlofdlock.rs` exercises same-process double-open OFD conflicts plus `l_pid = -1`. FreeBSD/NetBSD `KqueueMultiplexer::register_io` now returns host `EOPNOTSUPP` immediately for OOB interest instead of attempting the impossible `EVFILT_EXCEPT` sentinel; runtime `epoll_ctl(ADD/MOD)` now propagates multiplexer registration errors through `host_to_linux_errno` before recording interest. `carrick_portable::host_ofd_locks_supported()` exposes the host capability, and runtime guest `F_OFD_*` commands on unsupported BSD hosts validate the `flock` pointer then return Linux `ENOTSUP` rather than mapping to process locks. Local verification passed: `cargo check -p carrick-host-bsd --lib`, `cargo check -p carrick-portable --lib`, `cargo check -p carrick-runtime --lib`, `cargo check --manifest-path conformance-probes/Cargo.toml --target aarch64-unknown-linux-musl --bin epollpri --bin fcntlofdlock`, same probe check for `x86_64-unknown-linux-musl`, `cargo check -p carrick-portable --target x86_64-unknown-freebsd`, `cargo check -p carrick-portable --target x86_64-unknown-netbsd`, `cargo check -p carrick-host-bsd --lib --target x86_64-unknown-freebsd`, `cargo check -p carrick-host-bsd --lib --target x86_64-unknown-netbsd`, `cargo test -p carrick-runtime epoll --lib -- --test-threads=1`, and `cargo test -p carrick-host-bsd --lib -- --test-threads=1`. Native target verification passed after replacing `/root/carrick` with this branch on FreeBSD VM 200 (`10.14.14.189`): `cargo check -p carrick-host-bsd --lib`, `cargo check -p carrick-portable --lib`, and `cargo check -p carrick-runtime --lib --no-default-features --features platform-freebsd`. Linux x86 replacement checks also passed on VM 210 (`10.14.14.66`) and LXC 104 (`10.14.14.39`): `cargo check -p carrick-vmm-kvm --lib` and `cargo check -p carrick-runtime --lib --no-default-features --features platform-linux`. NetBSD target verification is intentionally skipped for this task per user direction.
 
 ## Task 10: Repair Signal Altstack State After Non-`rt_sigreturn` Handler Exit
 

@@ -65,6 +65,11 @@ impl EventMultiplexer for KqueueMultiplexer {
             let _ = self.kq.apply(&[Kevent::write(fd, libc::EV_DELETE)]);
         }
         if interest.oob {
+            #[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
+            {
+                return Err(OsError::from_raw(libc::EOPNOTSUPP));
+            }
+            #[cfg(not(any(target_os = "freebsd", target_os = "netbsd")))]
             changes.push(Kevent::oob(fd, base).with_udata_u64(token));
         } else {
             let _ = self.kq.apply(&[Kevent::oob(fd, libc::EV_DELETE)]);
