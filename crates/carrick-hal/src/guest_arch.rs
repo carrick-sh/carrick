@@ -75,6 +75,11 @@ pub trait SyscallTable {
 
 /// The per-guest-ISA seam. One impl per guest CPU ISA, selected statically as
 /// `ThreadedEngine::Arch` (monomorphized — no syscall-hot-path vtable).
+///
+/// This is deliberately a bundle of the capabilities an engine needs when it is
+/// already generic over a guest ISA. Smaller associated traits (`Mmu`, `Table`)
+/// are split where a focused call site exists; avoid splitting the rest until a
+/// caller can consume the smaller capability without dragging the whole bundle.
 pub trait GuestArch: Copy + 'static {
     /// Raw per-ISA syscall register frame (aarch64: `Aarch64SyscallFrame`).
     type Frame: Copy;

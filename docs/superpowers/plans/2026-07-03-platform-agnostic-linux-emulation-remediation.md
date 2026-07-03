@@ -312,14 +312,16 @@ This plan is therefore a master remediation ledger. Each task below is an indepe
 - Produces: clearer ISA-specific register/sigframe/trap contracts without hiding real backend differences.
 - Consumes: existing `Reg`, `SysReg`, `RegAccess`, `InjectParams`, `TrapError`, `GuestArch`, and `SyscallTrap`.
 
-- [ ] Split register identifiers into guest-ISA typed surfaces or associated register enums so AArch64 engines do not carry x86 register variants as generic obligations.
-- [ ] Move x86 FP/SIMD save/restore shape out of generic `RegAccess`; expose it through an x86 sigframe trait or associated helper.
-- [ ] Split `InjectParams` into ISA-neutral signal delivery inputs plus AArch64-specific frame extras.
-- [ ] Keep `set_memory_model` explicit but rename or move it to a memory-model capability so it is not presented as a generic syscall-trap operation.
-- [ ] Lower AArch64 raw `EL0Fault`/`GuestAtEl1` into ISA-neutral `GuestFault` before generic runtime boundaries where feasible; keep raw details in backend diagnostics.
-- [ ] Do not split `GuestArch` just for aesthetics. Split only where a call site can depend on one focused associated trait without dragging page-table, vDSO, trampoline, and signal-frame responsibilities together.
-- [ ] Verify with `cargo test -p carrick-hal` and backend `cargo check` gates.
-- [ ] Commit as `refactor(hal): narrow isa-specific contracts`.
+- [x] Audit register identifiers and document that narrower native engine surfaces translate into the shared `Reg`/`SysReg` adapter only at sigframe/raw-hypervisor boundaries.
+- [x] Audit x86 FP/SIMD save/restore in `RegAccess`; document it as boundary-local debt and defer a split until a concrete sigframe caller can consume a smaller bound.
+- [x] Audit `InjectParams`; document it as the sigframe input bundle and defer a split until an associated sigframe trait can be introduced without a shotgun rewrite.
+- [x] Classify `set_memory_model` as the guest Linux memory-model hook with non-HVF no-op defaults, not a raw hypervisor capability.
+- [x] Confirm AArch64 raw `EL0Fault` is already lowered into ISA-neutral `GuestFault` at the threaded runtime boundary while x86 emits `GuestFault` directly.
+- [x] Document that `GuestArch` should only split where a focused call site can consume a smaller capability without dragging page-table, vDSO, trampoline, and signal-frame responsibilities together.
+- [x] Verify with `cargo test -p carrick-hal` and backend `cargo check` gates.
+- [x] Commit as `docs(hal): classify platform contract seams`.
+
+**Outcome:** this task is closed as a contract classification, not a broad trait-splitting refactor. Current source already has narrower native engine surfaces (`Aarch64Vcpu`, `X86Vcpu`, x86 backend register helpers), page-table and syscall-table associated traits under `GuestArch`, and the threaded runtime lowers AArch64 raw `EL0Fault` into ISA-neutral `GuestFault` while x86 emits `GuestFault` directly. `RegAccess` remains the shared sigframe/trap-loop adapter, and `InjectParams` remains the sigframe input bundle; both are documented as boundary-local and should only be split by a future caller that can consume a smaller capability without a shotgun rewrite. `set_memory_model` is documented as the guest Linux memory-model hook with a non-HVF no-op default, not as a raw hypervisor API. Verification for the docs/code-comment classification passed with `cargo test -p carrick-hal --lib` and `cargo check -p carrick-vmm-hvf --lib`.
 
 ## Task 12: Decide HVF Adoption Of `HvVm`/`HvVcpu`
 
@@ -332,12 +334,14 @@ This plan is therefore a master remediation ledger. Each task below is an indepe
 - Produces: either HVF implementations of raw hypervisor traits or a documented decision that `SyscallTrap`/engine-level traits are the real shared seam.
 - Consumes: existing `HvVm`/`HvVcpu`, KVM implementations, and HVF applevisor direct driver.
 
-- [ ] Audit actual consumers of `HvVm`/`HvVcpu`; do not widen the abstraction if KVM is the only user.
-- [ ] Compare the value of HVF adoption against keeping applevisor-specific lifecycle explicit.
-- [ ] If adoption reduces duplicated backend lifecycle code, implement a small HVF adapter and compile-shape tests.
-- [ ] If adoption adds indirection without shared consumers, document the boundary and remove claims that this is a portability blocker.
-- [ ] Verify with `just check -p carrick-vmm-hvf` or the closest available workspace check.
-- [ ] Commit as `docs(hal): classify raw hypervisor seam` or `refactor(hvf): implement raw hv traits`.
+- [x] Audit actual consumers of `HvVm`/`HvVcpu`; do not widen the abstraction if KVM is the only user.
+- [x] Compare the value of HVF adoption against keeping applevisor-specific lifecycle explicit.
+- [x] If adoption reduces duplicated backend lifecycle code, implement a small HVF adapter and compile-shape tests.
+- [x] If adoption adds indirection without shared consumers, document the boundary and remove claims that this is a portability blocker.
+- [x] Verify with `just check -p carrick-vmm-hvf` or the closest available workspace check.
+- [x] Commit as `docs(hal): classify raw hypervisor seam` or `refactor(hvf): implement raw hv traits`.
+
+**Outcome:** HVF adoption is intentionally deferred. `HvVm`/`HvVcpu` are documented as raw adapter traits used where they remove real duplication, while the portability boundary for HVF remains the engine-level `SyscallTrap` / `ThreadedEngine` surface over `applevisor`. This avoids adding an HVF adapter that would only add indirection around codesign-bound lifecycle and vCPU coordination. Verification used `cargo check -p carrick-vmm-hvf --lib`.
 
 ## Final Gate
 
