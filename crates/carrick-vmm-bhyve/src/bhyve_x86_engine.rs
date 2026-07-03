@@ -1356,10 +1356,19 @@ impl X86Vmm for BhyveVmm {
                     })?;
                     Ok(changed)
                 })?;
+                if flags.is_empty() {
+                    self.ram.reserve_no_access(page, run_len);
+                } else {
+                    self.ram.drop_reservation(page, run_len);
+                }
             } else {
                 // Defer to the demand-commit path: record the reservation so the
                 // first touch commits the leaf with this protection.
-                self.ram.reserve(page, run_len, writable, exec);
+                if flags.is_empty() {
+                    self.ram.reserve_no_access(page, run_len);
+                } else {
+                    self.ram.reserve(page, run_len, writable, exec);
+                }
             }
             page = run_end;
         }
@@ -1378,6 +1387,7 @@ impl X86Vmm for BhyveVmm {
             .commit_if_absent(page, 4096)
             .map_err(|e| MemoryError::HostMap(format!("bhyve demand_commit: {e}")))?
         {
+            CommitOutcome::NoAccess => Ok(false),
             CommitOutcome::AlreadyMapped => Ok(true),
             CommitOutcome::NotReserved => Ok(false),
             CommitOutcome::Committed {
