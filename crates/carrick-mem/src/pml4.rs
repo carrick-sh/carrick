@@ -9,11 +9,12 @@
 //! 51:12.
 //!
 //! Deliberately absent vs the aarch64 sibling (`page_table.rs`): block
-//! coalesce, the spare-table free list, and the multi-vCPU coalescing gate.
-//! The Phase 2 bring-up maps aligned low-VA regions with 2 MiB leaves and splits
-//! them lazily when protection edits need 4 KiB precision. Dynamic high aliases
-//! can allocate missing 4 KiB page-table pages from the same sequential table
-//! arena and install VA→GPA leaves.
+//! coalesce and the multi-vCPU coalescing gate. The Phase 2 bring-up maps
+//! aligned low-VA regions with 2 MiB leaves and splits them lazily when
+//! protection edits need 4 KiB precision. Dynamic high aliases can allocate
+//! missing 4 KiB page-table pages from the same sequential table arena and
+//! install VA→GPA leaves; alias `munmap` returns now-empty high-VA table pages to
+//! the manager-local free list so churn does not exhaust the fixed arena.
 
 use carrick_guest_mem::{Gpa, GuestVa};
 
@@ -357,6 +358,8 @@ pub struct Pml4Manager {
     base: u64,
     /// Byte offset of the next free table page in the sequential arena.
     next_free: usize,
+    /// Table pages whose parent descriptors were cleared by alias unmap.
+    free_tables: Vec<usize>,
 }
 
 impl Pml4Manager {
@@ -366,6 +369,7 @@ impl Pml4Manager {
             bytes,
             base,
             next_free,
+            free_tables: Vec::new(),
         }
     }
 
@@ -392,15 +396,112 @@ impl Pml4Manager {
         read_desc(&self.bytes, off)
     }
 
+    fn alloc_table_page(&mut self) -> Result<usize, Pml4Error> {
+        if let Some(off) = self.free_tables.pop() {
+            self.bytes[off..off + PT_PAGE].fill(0);
+            return Ok(off);
+        }
+        let new_off = self.next_free;
+        if new_off + PT_PAGE > self.bytes.len() {
+            return Err(Pml4Error::OutOfTables);
+        }
+        self.next_free += PT_PAGE;
+        Ok(new_off)
+    }
+
+    fn free_table_page(&mut self, off: usize) {
+        if off == 0 || off + PT_PAGE > self.bytes.len() {
+            return;
+        }
+        self.bytes[off..off + PT_PAGE].fill(0);
+        if !self.free_tables.contains(&off) {
+            self.free_tables.push(off);
+        }
+    }
+
+    fn table_is_empty(&self, off: usize) -> bool {
+        off + PT_PAGE <= self.bytes.len() && self.bytes[off..off + PT_PAGE].iter().all(|&b| b == 0)
+    }
+
     fn split_2m_leaf(&mut self, pd_leaf_off: usize) -> Result<usize, Pml4Error> {
-        split_2m_leaf_in(&mut self.bytes, &mut self.next_free, self.base, pd_leaf_off)
+        let desc = self.read_desc(pd_leaf_off);
+        if desc & PML4_PS == 0 {
+            return Err(Pml4Error::BadAddress);
+        }
+        let new_pt_off = self.alloc_table_page()?;
+        let base_gpa = desc & PML4_ADDR_MASK & !LARGE_2M_MASK;
+        let leaf_flags = desc & (PML4_P | PML4_RW | PML4_US | PML4_NX);
+        for index in 0..512usize {
+            let gpa = base_gpa + (index as u64) * PT_PAGE as u64;
+            write_desc(
+                &mut self.bytes,
+                new_pt_off + index * 8,
+                (gpa & PML4_ADDR_MASK) | leaf_flags,
+            );
+        }
+        let table_flags = PML4_P | PML4_RW | if desc & PML4_US != 0 { PML4_US } else { 0 };
+        write_desc(
+            &mut self.bytes,
+            pd_leaf_off,
+            ((self.base + new_pt_off as u64) & PML4_ADDR_MASK) | table_flags,
+        );
+        Ok(new_pt_off)
+    }
+
+    fn pd_offset_creating(&mut self, va: u64, user: bool) -> Result<usize, Pml4Error> {
+        let idx = indices(va);
+        let mut table_off = 0usize;
+        for &slot in idx.iter().take(2) {
+            let off = table_off + slot * 8;
+            let desc = self.read_desc(off);
+            if desc & PML4_P != 0 {
+                if desc & PML4_PS != 0 {
+                    return Err(Pml4Error::BadAddress);
+                }
+                if user && desc & PML4_US == 0 {
+                    write_desc(&mut self.bytes, off, desc | PML4_US);
+                }
+                table_off = self.pa_to_off(desc & PML4_ADDR_MASK)?;
+                continue;
+            }
+            let new_off = self.alloc_table_page()?;
+            let child_gpa = self.base + new_off as u64;
+            let inter =
+                (child_gpa & PML4_ADDR_MASK) | PML4_P | PML4_RW | if user { PML4_US } else { 0 };
+            write_desc(&mut self.bytes, off, inter);
+            table_off = new_off;
+        }
+        Ok(table_off)
     }
 
     /// Byte offset of the PT (level-3) table for `va`, creating missing
     /// intermediates from the sequential table arena. Used only for fresh alias
     /// mappings; ordinary protection edits require the leaf path to exist.
     fn leaf_offset_creating(&mut self, va: u64, user: bool) -> Result<usize, Pml4Error> {
-        descend_creating(&mut self.bytes, &mut self.next_free, self.base, va, user)
+        let idx = indices(va);
+        let mut table_off = 0usize;
+        for (level, &slot) in idx.iter().take(3).enumerate() {
+            let off = table_off + slot * 8;
+            let desc = self.read_desc(off);
+            if level == 2 && desc & PML4_P != 0 && desc & PML4_PS != 0 {
+                table_off = self.split_2m_leaf(off)?;
+                continue;
+            }
+            if desc & PML4_P != 0 {
+                if user && desc & PML4_US == 0 {
+                    write_desc(&mut self.bytes, off, desc | PML4_US);
+                }
+                table_off = self.pa_to_off(desc & PML4_ADDR_MASK)?;
+                continue;
+            }
+            let new_off = self.alloc_table_page()?;
+            let child_gpa = self.base + new_off as u64;
+            let inter =
+                (child_gpa & PML4_ADDR_MASK) | PML4_P | PML4_RW | if user { PML4_US } else { 0 };
+            write_desc(&mut self.bytes, off, inter);
+            table_off = new_off;
+        }
+        Ok(table_off)
     }
 
     /// Byte offset of the PT (level-3) leaf descriptor for `va`, splitting a
@@ -428,6 +529,77 @@ impl Pml4Manager {
             return Err(Pml4Error::BadAddress);
         }
         Ok(off)
+    }
+
+    fn clear_leaf_and_reclaim_empty_tables(
+        &mut self,
+        va: u64,
+        allow_large: bool,
+    ) -> Result<bool, Pml4Error> {
+        let idx = indices(va);
+        let mut table_off = 0usize;
+        let mut parents = Vec::with_capacity(3);
+        for (level, &slot) in idx.iter().take(3).enumerate() {
+            let off = table_off + slot * 8;
+            if off + 8 > self.bytes.len() {
+                return Err(Pml4Error::BadAddress);
+            }
+            let desc = self.read_desc(off);
+            if desc & PML4_P == 0 {
+                if level == 2 && desc & PML4_PS != 0 {
+                    if !allow_large {
+                        table_off = self.split_2m_leaf(off)?;
+                        parents.push((off, table_off));
+                        break;
+                    }
+                    write_desc(&mut self.bytes, off, 0);
+                    self.prune_empty_tables(&parents);
+                    return Ok(true);
+                }
+                if desc != 0 {
+                    return Err(Pml4Error::BadAddress);
+                }
+                return Ok(false);
+            }
+            if level == 2 && desc & PML4_PS != 0 {
+                if !allow_large {
+                    table_off = self.split_2m_leaf(off)?;
+                    parents.push((off, table_off));
+                    break;
+                }
+                write_desc(&mut self.bytes, off, 0);
+                self.prune_empty_tables(&parents);
+                return Ok(true);
+            }
+            if desc & PML4_PS != 0 {
+                return Err(Pml4Error::BadAddress);
+            }
+            let child_off = self.pa_to_off(desc & PML4_ADDR_MASK)?;
+            parents.push((off, child_off));
+            table_off = child_off;
+        }
+
+        let leaf_off = table_off + idx[3] * 8;
+        if leaf_off + 8 > self.bytes.len() {
+            return Err(Pml4Error::BadAddress);
+        }
+        let desc = self.read_desc(leaf_off);
+        if desc == 0 {
+            return Ok(false);
+        }
+        write_desc(&mut self.bytes, leaf_off, 0);
+        self.prune_empty_tables(&parents);
+        Ok(true)
+    }
+
+    fn prune_empty_tables(&mut self, parents: &[(usize, usize)]) {
+        for &(parent_desc_off, child_table_off) in parents.iter().rev() {
+            if !self.table_is_empty(child_table_off) {
+                break;
+            }
+            write_desc(&mut self.bytes, parent_desc_off, 0);
+            self.free_table_page(child_table_off);
+        }
     }
 
     /// Byte offset of a covering 2 MiB PD leaf for `va`, when the path exists
@@ -581,6 +753,41 @@ impl Pml4Manager {
         })
     }
 
+    /// Tear down an alias mapping for `munmap`: unlike `set_prot_none`, this
+    /// clears descriptor payloads and frees now-empty alias table pages for
+    /// reuse. Ordinary mprotect/PROT_NONE still preserves GPA metadata so
+    /// `set_rw` can restore the same mapping.
+    pub fn unmap_alias_range(&mut self, va: u64, len: usize) -> Result<bool, Pml4Error> {
+        if va & PAGE_MASK != 0 {
+            return Err(Pml4Error::Misaligned);
+        }
+        let end = va
+            .checked_add((len as u64).div_ceil(PT_PAGE as u64) * PT_PAGE as u64)
+            .ok_or(Pml4Error::NonCanonical)?;
+        if end > VA_LIMIT {
+            return Err(Pml4Error::NonCanonical);
+        }
+
+        let mut changed = false;
+        let mut cur = va;
+        while cur < end {
+            // Only collapse to a 2 MiB step when the PD actually holds a 2 MiB PS
+            // leaf here. A block previously split to a 4 KiB PT (a sub-2 MiB
+            // mprotect / partial munmap) leaves a present table pointer at the PD
+            // slot; taking the large step there would clear a SINGLE 4 KiB leaf and
+            // advance 2 MiB, silently skipping the other 511 (guest-accessible
+            // stale mappings after munmap + a leaked PT). Mirror `apply`'s guard;
+            // a non-present path (`Err`) also falls to 4 KiB, where
+            // `clear_leaf_and_reclaim_empty_tables` tolerates it as a no-op.
+            let large = cur & LARGE_2M_MASK == 0
+                && end - cur >= LARGE_2M
+                && matches!(self.large_2m_leaf_offset_for_edit(cur), Ok(Some(_)));
+            changed |= self.clear_leaf_and_reclaim_empty_tables(cur, large)?;
+            cur += if large { LARGE_2M } else { PT_PAGE as u64 };
+        }
+        Ok(changed)
+    }
+
     /// Install a user VA→GPA alias mapping at 4 KiB granularity, allocating any
     /// missing intermediate page tables from the existing table arena. Mirrors
     /// the aarch64 alias editor: aliases are user-executable, and `writable`
@@ -618,7 +825,6 @@ impl Pml4Manager {
         // permissive (no NX) — only the leaf gates execution.
         let leaf_bits =
             PML4_P | PML4_US | if writable { PML4_RW } else { 0 } | if exec { 0 } else { PML4_NX };
-        let base = self.base;
         // 2 MiB-aligned aliases (every large file/anon alias: the IPA is
         // 2 MiB-block-aligned and the alias VA is derived 2 MiB-aligned) map the
         // bulk as PD 2 MiB PS block leaves — ONE descriptor per 2 MiB, ZERO PT
@@ -632,8 +838,7 @@ impl Pml4Manager {
             for i in 0..blocks {
                 let cur_va = va + i * LARGE_2M;
                 let cur_gpa = gpa + i * LARGE_2M;
-                let pd_off =
-                    pd_offset_creating(&mut self.bytes, &mut self.next_free, base, cur_va, true)?;
+                let pd_off = self.pd_offset_creating(cur_va, true)?;
                 let leaf_off = pd_off + indices(cur_va)[2] * 8;
                 write_desc(
                     &mut self.bytes,
@@ -976,6 +1181,52 @@ mod tests {
     }
 
     #[test]
+    fn unmap_alias_range_tears_down_all_pages_of_a_split_2m_block() {
+        // A 2 MiB PS alias block that was later split to a 4 KiB PT (via a
+        // sub-2 MiB unmap) must still be FULLY torn down by a 2 MiB-aligned
+        // munmap. Choosing the 2 MiB step from alignment alone cleared one 4 KiB
+        // leaf and skipped the other 511 — leaving guest-accessible stale
+        // mappings after munmap and leaking the PT.
+        let va = 0x0100_0000_0000u64; // high, 2 MiB-aligned
+        let gpa = 0xA0_0000_0000u64; // 2 MiB-aligned
+        let bytes = pml4_tables(&[], BASE, 32 * PT_PAGE).expect("empty root image");
+        let mut mgr = Pml4Manager::new(bytes, BASE);
+        mgr.map_aliased(GuestVa(va), Gpa(gpa), LARGE_2M, true, true)
+            .expect("map 2 MiB PS alias block");
+        assert_ne!(
+            walk_descriptors(mgr.bytes(), BASE, va)[2] & PML4_PS,
+            0,
+            "alias starts as a 2 MiB PS block"
+        );
+
+        // Split the block by unmapping a single 4 KiB page inside it.
+        mgr.unmap_alias_range(va, 0x1000)
+            .expect("sub-2M unmap splits the block");
+        assert_eq!(
+            walk_descriptors(mgr.bytes(), BASE, va)[2] & PML4_PS,
+            0,
+            "block split to a 4 KiB PT"
+        );
+        assert_eq!(mgr.translate(va), None, "the unmapped 4 KiB page is gone");
+        assert_eq!(
+            mgr.translate(va + 0x1000),
+            Some(gpa + 0x1000),
+            "a sibling in the split block is still mapped"
+        );
+
+        // Tear the whole 2 MiB-aligned region down: every page must be unmapped.
+        mgr.unmap_alias_range(va, LARGE_2M as usize)
+            .expect("2 MiB-aligned tear-down");
+        for i in 0..(LARGE_2M / 0x1000) {
+            assert_eq!(
+                mgr.translate(va + i * 0x1000),
+                None,
+                "page {i} must be unmapped after the 2 MiB tear-down"
+            );
+        }
+    }
+
+    #[test]
     fn map_aliased_large_2m_alias_uses_block_leaves_not_per_2m_tables() {
         // A multi-GiB 2 MiB-aligned alias must map as 2 MiB PD block leaves (one
         // descriptor per 2 MiB, a handful of PD/PDPT tables total) and only the
@@ -1013,6 +1264,57 @@ mod tests {
         // The bulk is a 2 MiB PD block leaf (PS set at level 2), not a PT page.
         let walk = walk_descriptors(mgr.bytes(), BASE, va);
         assert_ne!(walk[2] & PML4_PS, 0, "bulk maps as a 2 MiB PD block leaf");
+    }
+
+    #[test]
+    fn unmap_alias_reclaims_empty_high_va_tables_for_reuse() {
+        // ProcessPool churn maps and unmaps many high-VA file aliases. A tiny
+        // table arena that can hold only one such subtree proves `munmap` must
+        // return empty alias tables to the allocator; otherwise the second map
+        // fails with OutOfTables even though the first alias is gone.
+        let arena = 3 * PT_PAGE;
+        let bytes = pml4_tables(&[], BASE, arena).expect("empty root image");
+        let mut mgr = Pml4Manager::new(bytes, BASE);
+        let first_va = 0x0100_0000_0000u64;
+        let first_gpa = 0x00a0_0000_0000u64;
+        let second_va = 0x0180_0000_0000u64;
+        let second_gpa = 0x00a0_0200_0000u64;
+
+        mgr.map_aliased(GuestVa(first_va), Gpa(first_gpa), LARGE_2M, true, true)
+            .expect("first high alias fits");
+        assert_eq!(mgr.translate(first_va), Some(first_gpa));
+
+        assert_eq!(mgr.unmap_alias_range(first_va, LARGE_2M as usize), Ok(true));
+        assert_eq!(mgr.translate(first_va), None, "first alias is unmapped");
+
+        mgr.map_aliased(GuestVa(second_va), Gpa(second_gpa), LARGE_2M, true, true)
+            .expect("second high alias reuses the reclaimed tables");
+        assert_eq!(mgr.translate(second_va), Some(second_gpa));
+    }
+
+    #[test]
+    fn unmap_alias_reclaims_prot_none_large_alias_tables() {
+        let arena = 3 * PT_PAGE;
+        let bytes = pml4_tables(&[], BASE, arena).expect("empty root image");
+        let mut mgr = Pml4Manager::new(bytes, BASE);
+        let first_va = 0x0100_0000_0000u64;
+        let first_gpa = 0x00a0_0000_0000u64;
+        let second_va = 0x0180_0000_0000u64;
+        let second_gpa = 0x00a0_0200_0000u64;
+
+        mgr.map_aliased(GuestVa(first_va), Gpa(first_gpa), LARGE_2M, true, true)
+            .expect("first high alias fits");
+        assert_eq!(mgr.set_prot_none(first_va, LARGE_2M as usize), Ok(true));
+        assert_eq!(
+            mgr.translate(first_va),
+            None,
+            "PROT_NONE alias is non-present"
+        );
+
+        assert_eq!(mgr.unmap_alias_range(first_va, LARGE_2M as usize), Ok(true));
+        mgr.map_aliased(GuestVa(second_va), Gpa(second_gpa), LARGE_2M, true, true)
+            .expect("PROT_NONE alias unmap reclaims the table pages");
+        assert_eq!(mgr.translate(second_va), Some(second_gpa));
     }
 
     #[test]
