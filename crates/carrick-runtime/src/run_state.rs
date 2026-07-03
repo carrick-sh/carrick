@@ -88,24 +88,44 @@ impl RunState {
 }
 
 // Linear-scan slot table in a shared mapping. Each slot is a single u64:
-//   bits  0..32  host pid (0 = empty slot)
+//   bits  0..32  id — host pid (process entry) or guest tid (worker entry)
 //   bits 32..40  encoded RunState (0 = unset)
-// A single atomic u64 store publishes pid+state together, so a reader never sees
-// a pid paired with another process's state (no torn cross-field read). A process
+//   bit  40      KIND_TID — set for a worker-thread entry, clear for a process
+// A single atomic u64 store publishes id+state together, so a reader never sees
+// an id paired with another owner's state (no torn cross-field read). A process
 // claims ANY free slot (and caches its index for O(1) republish), and a reader
-// scans for its pid — so a slot may sit anywhere (no home-index invariant), which
+// scans for its id — so a slot may sit anywhere (no home-index invariant), which
 // keeps full-table dead-slot reclamation correct (an evicted slot is readable
 // wherever it lands). 510 slots comfortably exceeds the live guest-process count
 // of any conformance workload; once full, a process whose slot can't be claimed
 // degrades to the host-state fallback (never a wrong state).
+//
+// Worker guest tids are `host_pid + k` (registry-allocated), so they share the
+// low-32 numbering space with host pids: a worker tid can numerically equal a
+// DIFFERENT process's host pid. The KIND_TID bit keeps those two disjoint — a
+// worker entry and a process entry with the same low-32 value occupy separate
+// slots (never clobber), and `published` prefers the process entry so a live
+// process's /proc state is never shadowed by an aliasing worker tid.
 const SLOTS: usize = 510;
 
 const PID_MASK: u64 = 0xffff_ffff;
 const STATE_SHIFT: u64 = 32;
 const STATE_MASK: u64 = 0xff;
+/// Distinguishes a worker-thread (guest tid) entry from a process (host pid)
+/// entry so the two never collide in the low-32 id space. Part of the slot KEY.
+const KIND_TID: u64 = 1 << 40;
+/// The bits that identify a slot's OWNER: the low-32 id plus the kind tag. Two
+/// publishers with the same key share a slot; different keys never clobber.
+const KEY_MASK: u64 = PID_MASK | KIND_TID;
 
 fn pack(pid: u32, state: RunState) -> u64 {
     (pid as u64) | (state.encode() << STATE_SHIFT)
+}
+
+/// Pack a worker-thread (guest tid) entry — a process `pack` with the KIND_TID
+/// tag set, so it never shares a slot with the host-pid entry of the same value.
+fn pack_tid(tid: u32, state: RunState) -> u64 {
+    pack(tid, state) | KIND_TID
 }
 
 fn unpack(raw: u64) -> Option<(u32, RunState)> {
@@ -184,7 +204,7 @@ pub fn publish(state: RunState) {
         tbl[cached].store(want, Ordering::Release);
         return;
     }
-    if let Some(slot) = claim_slot(tbl, pid, want) {
+    if let Some(slot) = claim_slot(tbl, want) {
         MY_SLOT.store(slot, Ordering::Relaxed);
     }
 }
@@ -199,7 +219,45 @@ fn publish_for(pid: u32, state: RunState) {
     }
     let tbl = table();
     let want = pack(pid, state);
-    let _ = claim_slot(tbl, pid, want);
+    let _ = claim_slot(tbl, want);
+}
+
+/// Publish a guest-visible WORKER thread id into the shared state table. Worker
+/// ids are not host pids (they can numerically equal another process's pid), so
+/// they go into a KIND_TID-tagged slot disjoint from any process entry — other
+/// guest processes can still poll `/proc/<tid>/stat` for them, fork-coherently,
+/// without clobbering a process's slot. A tid equal to this process's own pid is
+/// the thread-group LEADER, already covered by [`publish`], so it is skipped.
+pub fn publish_guest_tid(tid: i32, state: RunState) {
+    if let Ok(tid) = u32::try_from(tid) {
+        if tid == 0 || tid == std::process::id() {
+            return;
+        }
+        let tbl = table();
+        let _ = claim_slot(tbl, pack_tid(tid, state));
+    }
+}
+
+/// Remove a guest-visible worker thread id from the shared state table when that
+/// thread exits, so `/proc/<tid>` stops resolving through stale state. Clears
+/// ONLY the KIND_TID-tagged slot, never a process entry that shares the low-32
+/// value.
+pub fn clear_guest_tid(tid: i32) {
+    let Ok(tid) = u32::try_from(tid) else {
+        return;
+    };
+    if tid == 0 {
+        return;
+    }
+    let key = pack_tid(tid, RunState::Booting) & KEY_MASK;
+    let tbl = table();
+    for slot in tbl.iter() {
+        let raw = slot.load(Ordering::Acquire);
+        if raw & PID_MASK != 0 && raw & KEY_MASK == key {
+            slot.store(0, Ordering::Release);
+            return;
+        }
+    }
 }
 
 /// Find or claim this pid's slot, writing `want`. Returns the slot index, or
@@ -209,16 +267,18 @@ fn publish_for(pid: u32, state: RunState) {
 /// the slot may land anywhere, so the reader scans too — which is what makes
 /// full-table dead-slot reclamation correct (an evicted slot is readable wherever
 /// it lands, with no home-index invariant to violate).
-fn claim_slot(tbl: &[AtomicU64], pid: u32, want: u64) -> Option<usize> {
+fn claim_slot(tbl: &[AtomicU64], want: u64) -> Option<usize> {
+    // The owner KEY is the low-32 id PLUS the kind tag, so a worker-tid entry and
+    // a process-pid entry with the same low-32 value never share a slot.
+    let key = want & KEY_MASK;
     // First pass: reuse our own slot if present, else claim a free one.
     for (idx, slot) in tbl.iter().enumerate() {
         let cur = slot.load(Ordering::Relaxed);
-        let cur_pid = (cur & PID_MASK) as u32;
-        if cur_pid == pid {
+        if cur & KEY_MASK == key {
             slot.store(want, Ordering::Release); // already ours — update
             return Some(idx);
         }
-        if cur_pid == 0
+        if cur & PID_MASK == 0
             && slot
                 .compare_exchange(cur, want, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
@@ -234,7 +294,7 @@ fn claim_slot(tbl: &[AtomicU64], pid: u32, want: u64) -> Option<usize> {
         let cur = slot.load(Ordering::Relaxed);
         let cur_pid = (cur & PID_MASK) as u32;
         if cur_pid != 0
-            && cur_pid != pid
+            && cur & KEY_MASK != key
             && !pid_is_live(cur_pid)
             && slot
                 .compare_exchange(cur, want, Ordering::AcqRel, Ordering::Relaxed)
@@ -282,24 +342,33 @@ pub fn publish_child_booting(child_pid: u32) {
     publish_for(child_pid, RunState::Booting);
 }
 
-/// Read the published run-state of `pid` (any guest process). `None` if `pid`
-/// has no published slot — the caller then falls back to the host kernel state.
-/// Full linear scan (no home-index invariant): rare, /proc-read-only, and ~510
-/// relaxed loads is trivial.
+/// Read the published run-state of `pid` (any guest process, or a worker thread
+/// by its guest tid). `None` if nothing is published — the caller then falls back
+/// to the host kernel state. Full linear scan (no home-index invariant): rare,
+/// /proc-read-only, and ~510 relaxed loads is trivial.
+///
+/// A PROCESS entry for `pid` wins outright: if a live process holds this id, its
+/// state is authoritative and is never shadowed by a worker-tid entry that
+/// happens to alias the value. A worker-tid entry is returned only when no
+/// process entry claims the id (the genuine cross-process `/proc/<tid>` case).
 pub fn published(pid: u32) -> Option<RunState> {
     if pid == 0 {
         return None;
     }
     let tbl = table();
+    let mut tid_hit = None;
     for slot in tbl.iter() {
         let raw = slot.load(Ordering::Acquire);
         if let Some((p, st)) = unpack(raw)
             && p == pid
         {
-            return Some(st);
+            if raw & KIND_TID == 0 {
+                return Some(st); // a process entry for this id is authoritative
+            }
+            tid_hit = Some(st); // remember; used only if no process entry exists
         }
     }
-    None
+    tid_hit
 }
 
 /// The Linux `/proc/<pid>/stat` state char for `pid`, preferring the published
@@ -359,6 +428,62 @@ mod tests {
         }
         // An unpublished pid reads None (host-state fallback).
         assert_eq!(published(999_001), None);
+    }
+
+    /// Zero every slot (either kind) holding this low-32 id, so a test leaves the
+    /// process-shared table clean for the others.
+    fn wipe_id(id: u32) {
+        for slot in table().iter() {
+            if (slot.load(Ordering::Relaxed) & PID_MASK) as u32 == id {
+                slot.store(0, Ordering::Release);
+            }
+        }
+    }
+
+    #[test]
+    fn worker_tid_entry_does_not_collide_with_process_pid_entry() {
+        // A worker guest tid can numerically equal a DIFFERENT process's host pid.
+        // The two must occupy disjoint slots; the process entry is authoritative,
+        // and clearing the worker tid must not erase the process entry.
+        let id = 0x0BAD_F00D;
+        wipe_id(id);
+        publish_for(id, RunState::Running); // as if process host-pid==id booted
+        publish_guest_tid(id as i32, RunState::Blocked); // worker of another proc
+
+        // The process entry wins — never shadowed by the aliasing worker tid.
+        assert_eq!(published(id), Some(RunState::Running));
+        // Clearing the worker tid must NOT erase the process entry.
+        clear_guest_tid(id as i32);
+        assert_eq!(published(id), Some(RunState::Running));
+        wipe_id(id);
+    }
+
+    #[test]
+    fn worker_tid_visible_only_until_it_exits() {
+        // With no process claiming the id, a worker-tid entry resolves the genuine
+        // cross-process `/proc/<tid>` read, and disappears when the thread exits.
+        let tid = 0x0BAD_BEEF;
+        wipe_id(tid);
+        publish_guest_tid(tid as i32, RunState::Blocked);
+        assert_eq!(published(tid), Some(RunState::Blocked));
+        clear_guest_tid(tid as i32);
+        assert_eq!(published(tid), None);
+        wipe_id(tid);
+    }
+
+    #[test]
+    fn publish_guest_tid_skips_the_thread_group_leader() {
+        // The leader's tid equals the process pid; publish() already covers that
+        // slot, so publish_guest_tid must not add a separate worker entry for it.
+        let me = std::process::id();
+        wipe_id(me);
+        publish_guest_tid(me as i32, RunState::Blocked);
+        assert_eq!(
+            published(me),
+            None,
+            "no worker entry created for the leader"
+        );
+        wipe_id(me);
     }
 
     #[test]

@@ -60,6 +60,11 @@ where
             // /proc/<pid>/stat reads `S`. `Running` is re-published when the vCPU
             // resumes guest code after the wake (run_vcpu_until_exit top).
             crate::run_state::publish(crate::run_state::RunState::Blocked);
+            crate::thread::set_current_thread_state(self.this_tid, 'S');
+            crate::run_state::publish_guest_tid(
+                self.this_tid.raw(),
+                crate::run_state::RunState::Blocked,
+            );
             let raw = self
                 .futex
                 .wait_prepared_for_thread(wait, timeout, self.this_tid, &|| {
@@ -67,6 +72,11 @@ where
                         || crate::fork_quiesce::is_quiescing()
                         || crate::fork_quiesce::exec_replacing_other_thread(self.this_tid)
                 });
+            crate::thread::set_current_thread_state(self.this_tid, 'R');
+            crate::run_state::publish_guest_tid(
+                self.this_tid.raw(),
+                crate::run_state::RunState::Running,
+            );
             if let Some((st, old_slot)) = snapshot {
                 // Prefer the thread's OWN just-released slot (reuse its clean vCPU,
                 // no re-bind) over reclaiming another thread's — esp. an exited one.
@@ -178,12 +188,22 @@ where
         let retval = loop {
             // Genuine guest block (cross-process MAP_SHARED FUTEX_WAIT).
             crate::run_state::publish(crate::run_state::RunState::Blocked);
+            crate::thread::set_current_thread_state(self.this_tid, 'S');
+            crate::run_state::publish_guest_tid(
+                self.this_tid.raw(),
+                crate::run_state::RunState::Blocked,
+            );
             let retval = self.platform_futex.shared_wait(
                 host_addr,
                 waiter_key,
                 value,
                 timeout,
                 &interrupted,
+            );
+            crate::thread::set_current_thread_state(self.this_tid, 'R');
+            crate::run_state::publish_guest_tid(
+                self.this_tid.raw(),
+                crate::run_state::RunState::Running,
             );
             if retval == crate::linux_abi::LINUX_EINTR.guest_retval()
                 && crate::fork_quiesce::is_quiescing()
@@ -394,6 +414,7 @@ where
             self.futex.wake(addr, 1);
         }
         let last = self.registry.exit(self.this_tid);
+        crate::run_state::clear_guest_tid(self.this_tid.raw());
         self.kicker.unregister(self.this_tid);
         crate::host_signal::forget_thread(self.this_tid.raw());
         kernel.dispatcher.forget_thread_signal_state(self.this_tid);

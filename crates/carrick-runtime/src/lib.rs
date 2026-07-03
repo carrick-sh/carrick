@@ -210,10 +210,7 @@ pub use carrick_vmm_hvf::thread::current_thread_states;
     feature = "platform-netbsd"
 ))]
 pub fn current_thread_states() -> Vec<(thread::ThreadId, char)> {
-    thread::current_thread_ports()
-        .into_iter()
-        .map(|(tid, _port)| (tid, 'R'))
-        .collect()
+    thread::current_thread_state_chars()
 }
 
 // Under platform-linux there is no carrick-vmm-hvf to re-export `trap` from; the
