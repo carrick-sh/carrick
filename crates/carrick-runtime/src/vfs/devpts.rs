@@ -117,17 +117,13 @@ impl Default for PtyTable {
     }
 }
 
-unsafe extern "C" {
-    fn ptsname_r(fd: libc::c_int, buf: *mut libc::c_char, buflen: libc::size_t) -> libc::c_int;
-}
-
 fn last_error() -> i32 {
     carrick_portable::errno()
 }
 
 fn ptsname_r_owned(master: i32) -> Result<String, i32> {
     let mut buf = [0 as libc::c_char; 128];
-    let rc = unsafe { ptsname_r(master, buf.as_mut_ptr(), buf.len()) };
+    let rc = unsafe { carrick_portable::ptsname_r(master, buf.as_mut_ptr(), buf.len()) };
     if rc != 0 {
         let errno = if rc > 0 { rc } else { last_error() };
         return Err(errno);
