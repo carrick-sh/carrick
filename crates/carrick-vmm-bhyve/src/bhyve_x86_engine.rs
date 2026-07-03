@@ -2089,6 +2089,18 @@ impl X86Vmm for BhyveVmm {
         }
     }
 
+    fn sync_shared_file_aliases(&mut self) {
+        // bhyve backs guest file aliases with copied sysmem, not a live host
+        // MAP_SHARED mapping. Flush before every syscall so a following read,
+        // pread, stat-ish file operation, or fsync observes guest stores the way
+        // Linux's page cache-backed mapping would.
+        self.flush_shm_aliases();
+    }
+
+    fn needs_shared_file_alias_sync(&self) -> bool {
+        true
+    }
+
     fn execve_rebuild(
         &mut self,
         _vcpu: &mut Self::Vcpu,

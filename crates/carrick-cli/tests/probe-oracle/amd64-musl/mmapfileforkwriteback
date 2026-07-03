@@ -1,0 +1,8 @@
+26e9c786649c3f45
+setup_open=true
+setup_truncate=true
+setup_mmap=true
+child_saw_parent_pre=true
+parent_saw_child_map=true
+file_saw_child_write=true
+file_saw_parent_post=true

@@ -28,9 +28,32 @@ unsafe fn futex(uaddr: *mut u32, op: libc::c_int, val: u32) -> libc::c_long {
     )
 }
 
+unsafe fn make_pipe() -> Option<[libc::c_int; 2]> {
+    let mut fds = [-1, -1];
+    if libc::pipe(fds.as_mut_ptr()) == 0 {
+        Some(fds)
+    } else {
+        None
+    }
+}
+
+unsafe fn wait_ready(fd: libc::c_int, timeout_ms: i32) -> bool {
+    let mut pollfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let rc = libc::poll(&mut pollfd, 1, timeout_ms);
+    if rc <= 0 || (pollfd.revents & libc::POLLIN) == 0 {
+        return false;
+    }
+    let mut byte = 0u8;
+    libc::read(fd, &mut byte as *mut u8 as *mut libc::c_void, 1) == 1
+}
+
 fn main() {
     unsafe {
-        // A 4 KiB shared file mapping holding two u32 words: [0]=futex, [1]=ready.
+        // A 4 KiB shared file mapping holding the futex word.
         // Ensure /tmp exists (a bare run-elf rootfs may not have it).
         libc::mkdir(b"/tmp\0".as_ptr() as *const libc::c_char, 0o777);
         let path = b"/tmp/carrick_futexshare_ipc\0";
@@ -57,29 +80,38 @@ fn main() {
             return;
         }
         let futex_word = map as *mut u32;
-        let ready_word = (map as *mut u32).add(1);
         *futex_word = 0;
-        *ready_word = 0;
         compiler_fence(Ordering::SeqCst);
+        let Some(ready_pipe) = make_pipe() else {
+            println!("futex_shared_setup=false");
+            return;
+        };
 
         let pid = libc::fork();
         if pid == 0 {
+            libc::close(ready_pipe[0]);
             // Child: announce readiness, then block until the word changes.
-            *ready_word = 1;
+            let byte = [1u8];
+            let _ = libc::write(
+                ready_pipe[1],
+                byte.as_ptr() as *const libc::c_void,
+                byte.len(),
+            );
+            libc::close(ready_pipe[1]);
             compiler_fence(Ordering::SeqCst);
             while std::ptr::read_volatile(futex_word) == 0 {
                 futex(futex_word, FUTEX_WAIT, 0);
             }
             libc::_exit(0);
         }
+        libc::close(ready_pipe[1]);
 
         // Parent: wait for the child to be ready, then flip the word and wake.
         // Bound the whole thing so a broken cross-process wake reports false.
         let mut woke = false;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        while std::ptr::read_volatile(ready_word) == 0 && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
+        let _ = wait_ready(ready_pipe[0], 3000);
+        libc::close(ready_pipe[0]);
         *futex_word = 1;
         compiler_fence(Ordering::SeqCst);
         while std::time::Instant::now() < deadline {

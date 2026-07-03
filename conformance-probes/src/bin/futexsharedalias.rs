@@ -29,8 +29,50 @@ unsafe fn futex_wake(uaddr: *mut u32, val: u32) -> libc::c_long {
     )
 }
 
-unsafe fn wait_for_word(word: *mut u32, ready: *mut u32) -> ! {
-    std::ptr::write_volatile(ready, 1);
+unsafe fn make_pipe() -> Option<[libc::c_int; 2]> {
+    let mut fds = [-1, -1];
+    if libc::pipe(fds.as_mut_ptr()) == 0 {
+        Some(fds)
+    } else {
+        None
+    }
+}
+
+unsafe fn signal_ready(fd: libc::c_int) {
+    let byte = [1u8];
+    let _ = libc::write(fd, byte.as_ptr() as *const libc::c_void, byte.len());
+    libc::close(fd);
+}
+
+unsafe fn wait_ready(fd: libc::c_int, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        let now = Instant::now();
+        let remaining = if deadline > now {
+            deadline - now
+        } else {
+            Duration::ZERO
+        };
+        let timeout_ms = remaining.as_millis().min(i32::MAX as u128) as i32;
+        let mut pollfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let rc = libc::poll(&mut pollfd, 1, timeout_ms);
+        if rc > 0 && (pollfd.revents & libc::POLLIN) != 0 {
+            let mut byte = 0u8;
+            return libc::read(fd, &mut byte as *mut u8 as *mut libc::c_void, 1) == 1;
+        }
+        if rc == 0 {
+            break;
+        }
+    }
+    false
+}
+
+unsafe fn wait_for_word(word: *mut u32, ready_fd: libc::c_int) -> ! {
+    signal_ready(ready_fd);
     compiler_fence(Ordering::SeqCst);
     while std::ptr::read_volatile(word) == 0 {
         // Long enough that the parent can prove a single wake, but still
@@ -38,17 +80,6 @@ unsafe fn wait_for_word(word: *mut u32, ready: *mut u32) -> ! {
         let _ = futex_wait_timed(word, 0, 1000);
     }
     libc::_exit(0);
-}
-
-unsafe fn wait_until_word(word: *mut u32, expected: u32, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if std::ptr::read_volatile(word) == expected {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    false
 }
 
 unsafe fn wait_child(pid: i32, timeout: Duration) -> Option<i32> {
@@ -103,21 +134,29 @@ fn main() {
         }
 
         // word[0] and word[1] are distinct futexes on the same shared page.
-        // word[2] and word[3] are readiness flags.
         let words = map as *mut u32;
         let word_a = words.add(0);
         let word_b = words.add(1);
-        let ready_a = words.add(2);
-        let ready_b = words.add(3);
-        for i in 0..4 {
+        for i in 0..2 {
             std::ptr::write_volatile(words.add(i), 0);
         }
         compiler_fence(Ordering::SeqCst);
+        let (Some(ready_a_pipe), Some(ready_b_pipe)) = (make_pipe(), make_pipe()) else {
+            println!("futex_shared_alias_setup=false");
+            libc::munmap(map, 4096);
+            libc::close(fd);
+            libc::unlink(path.as_ptr() as *const libc::c_char);
+            return;
+        };
 
         let pid_b = libc::fork();
         if pid_b == 0 {
-            wait_for_word(word_b, ready_b);
+            libc::close(ready_b_pipe[0]);
+            libc::close(ready_a_pipe[0]);
+            libc::close(ready_a_pipe[1]);
+            wait_for_word(word_b, ready_b_pipe[1]);
         }
+        libc::close(ready_b_pipe[1]);
         if pid_b < 0 {
             println!("futex_shared_alias_setup=false");
             libc::munmap(map, 4096);
@@ -126,13 +165,16 @@ fn main() {
             return;
         }
 
-        let b_ready = wait_until_word(ready_b, 1, Duration::from_secs(2));
+        let b_ready = wait_ready(ready_b_pipe[0], Duration::from_secs(2));
+        libc::close(ready_b_pipe[0]);
         std::thread::sleep(Duration::from_millis(100));
 
         let pid_a = libc::fork();
         if pid_a == 0 {
-            wait_for_word(word_a, ready_a);
+            libc::close(ready_a_pipe[0]);
+            wait_for_word(word_a, ready_a_pipe[1]);
         }
+        libc::close(ready_a_pipe[1]);
         if pid_a < 0 {
             libc::kill(pid_b, libc::SIGKILL);
             let mut status = 0i32;
@@ -144,7 +186,8 @@ fn main() {
             return;
         }
 
-        let a_ready = wait_until_word(ready_a, 1, Duration::from_secs(2));
+        let a_ready = wait_ready(ready_a_pipe[0], Duration::from_secs(2));
+        libc::close(ready_a_pipe[0]);
         std::thread::sleep(Duration::from_millis(100));
 
         std::ptr::write_volatile(word_a, 1);
