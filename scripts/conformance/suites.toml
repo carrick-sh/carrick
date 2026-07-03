@@ -12672,6 +12672,12 @@ cmd = ["/opt/ltp/testcases/bin/inotify09"]
 verdict = "ltp"
 tier = "full"
 weight = "light"
+# tst_fuzzy_sync race test: ~790k raw clock_gettime + inotify/write/lseek
+# syscalls (bypasses the vDSO by design — real Linux does the syscalls too).
+# ~30x slower than native under carrick (each syscall is an HVF vmexit) — ~150s
+# vs Docker's ~5s. The tight 40s timeout is DELIBERATE: it stays a TIMEOUT until
+# the per-syscall dispatch cost is fixed, rather than being papered over by a
+# longer bound.
 timeout_s = 40
 carrick_flags = ["--raw", "--fs", "host"]
 
@@ -20163,6 +20169,9 @@ cmd = ["/opt/ltp/testcases/bin/setrlimit06"]
 verdict = "ltp"
 tier = "full"
 weight = "light"
+# Same tst_fuzzy_sync race pattern as ltp-inotify09: syscall-bound, far slower
+# than native under carrick. Tight 40s timeout kept DELIBERATELY red until the
+# per-syscall dispatch cost is fixed.
 timeout_s = 40
 carrick_flags = ["--raw", "--fs", "host"]
 
