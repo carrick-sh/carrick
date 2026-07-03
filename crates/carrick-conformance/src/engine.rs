@@ -104,6 +104,14 @@ pub(crate) fn carrick_argv(suite: &Suite, carrick_bin: &str, run_id: &str) -> Ve
     // A suite may still override this via its own carrick_flags (added below).
     a.push("--max-traps".to_string());
     a.push(usize::MAX.to_string());
+    // Docker `--pull always`: re-check the registry every run so a
+    // rebuilt+repushed conformance image (same tag, new digest) is re-pulled,
+    // never served stale from carrick's cache. This is the carrick-side guard
+    // against the LTP-oracle version skew (carrick ran 20240930 while the oracle
+    // was blessed against 20260529). The registry HEAD is cheap; only a moved
+    // tag re-downloads layers.
+    a.push("--pull".to_string());
+    a.push("always".to_string());
     a.extend(suite.carrick_flags.iter().cloned());
     if let Some(ep) = suite.entrypoint.as_ref().and_then(|e| e.for_carrick()) {
         a.push("--entrypoint".to_string());
@@ -400,6 +408,28 @@ fn kill_scoped(pid: i32, run_id: &str, engine: Engine, cleanup: Option<&CarrickC
 mod tests {
     use super::*;
     use crate::lane::DockerPlatform;
+
+    #[test]
+    fn carrick_argv_pulls_always_before_the_image() {
+        let suite = Suite::for_test("localhost:5050/ltp:arm64", &["true"]);
+
+        let argv = carrick_argv(&suite, "target/release/carrick", "conf-1");
+
+        // `--pull always` must be an envelope flag (before the image) so a
+        // rebuilt+repushed conformance image is re-pulled, never served stale —
+        // the LTP-version-skew guard on the carrick side.
+        let pull = argv
+            .windows(2)
+            .find(|w| w[0] == "--pull")
+            .map(|w| w[1].as_str());
+        assert_eq!(pull, Some("always"));
+        let pull_idx = argv.iter().position(|a| a == "--pull").expect("--pull");
+        let img_idx = argv
+            .iter()
+            .position(|a| a == "localhost:5050/ltp:arm64")
+            .expect("image");
+        assert!(pull_idx < img_idx, "--pull must precede the image");
+    }
 
     #[test]
     fn docker_argv_uses_requested_platform() {
