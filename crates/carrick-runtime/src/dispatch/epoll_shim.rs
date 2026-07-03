@@ -23,6 +23,15 @@ pub(crate) fn unregister_epoll_kqueue(fd: i32) {
     EPOLL_INMEM_KQUEUES.lock().retain(|&f| f != fd);
 }
 
+/// Drop the parent process's in-memory epoll wake-fd registry in a fork child.
+/// The real epoll/kqueue descriptors are inherited through the fd table, but
+/// this global list is process-local bookkeeping. Keeping the parent's wake fd
+/// numbers after fork can pulse unrelated descriptors if the child closes and
+/// reuses those numbers before any fresh epoll instance registers itself.
+pub(crate) fn after_fork_child() {
+    EPOLL_INMEM_KQUEUES.lock().clear();
+}
+
 /// Wake every epoll instance (via its `EVFILT_USER(0)`) so a thread blocked in
 /// `epoll_wait` re-checks in-memory fd readiness. Call when an eventfd/pipe/
 /// timerfd becomes readable. A coarse broadcast — a spurious wake just makes the
@@ -39,5 +48,29 @@ pub(crate) fn unregister_epoll_kqueue(fd: i32) {
 pub(crate) fn notify_inmem_epoll() {
     for &fd in EPOLL_INMEM_KQUEUES.lock().iter() {
         crate::event_mux::trigger_user_wake_fd(fd);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn registered_fds() -> Vec<i32> {
+        EPOLL_INMEM_KQUEUES.lock().clone()
+    }
+
+    #[test]
+    fn fork_child_reset_clears_inherited_wake_registry() {
+        unregister_epoll_kqueue(41);
+        unregister_epoll_kqueue(42);
+        register_epoll_kqueue(41);
+        register_epoll_kqueue(42);
+
+        after_fork_child();
+
+        assert!(
+            registered_fds().is_empty(),
+            "fork child must not retain parent epoll wake fds"
+        );
     }
 }

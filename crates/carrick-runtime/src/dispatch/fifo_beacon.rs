@@ -47,6 +47,10 @@ struct State {
 
 static STATE: LazyLock<Mutex<State>> = LazyLock::new(|| Mutex::new(State::default()));
 
+fn fd_is_open(fd: i32) -> bool {
+    fd >= 0 && unsafe { libc::fcntl(fd, libc::F_GETFD) } != -1
+}
+
 fn fifo_identity(host_fd: i32) -> Option<(u64, u64)> {
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     if unsafe { libc::fstat(host_fd, &mut st) } != 0 {
@@ -138,6 +142,37 @@ pub(crate) fn register_close(host_fd: i32) -> bool {
     false
 }
 
+/// Reconcile the process-local beacon registry after fork in the child.
+///
+/// The backing kernel fds are inherited, but this HashMap is only a snapshot of
+/// the parent's dispatcher state. If fork-child setup closes or rearranges guest
+/// fds, stale writer entries must not keep a beacon write fd open forever and
+/// suppress FIFO EOF readiness in the child.
+pub(crate) fn after_fork_child() {
+    let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    st.read_ends.retain(|fd, _| fd_is_open(*fd));
+
+    let read_ids: std::collections::HashSet<(u64, u64)> = st.read_ends.values().copied().collect();
+    let mut empty_unread_beacons = Vec::new();
+    for (id, beacon) in &mut st.beacons {
+        beacon.writer_bw.retain(|writer_fd, beacon_write_fd| {
+            if fd_is_open(*writer_fd) {
+                true
+            } else {
+                unsafe { libc::close(*beacon_write_fd) };
+                false
+            }
+        });
+        if beacon.writer_bw.is_empty() && !read_ids.contains(id) {
+            unsafe { libc::close(beacon.read_fd) };
+            empty_unread_beacons.push(*id);
+        }
+    }
+    for id in empty_unread_beacons {
+        st.beacons.remove(&id);
+    }
+}
+
 /// True iff `host_fd` is a FIFO read-end whose writers have all closed — decided
 /// by the KERNEL: poll the beacon read end for POLLHUP (it hangs up exactly when
 /// every writer's beacon-write fd has closed). macOS reports pipe HUP correctly,
@@ -158,4 +193,53 @@ pub(crate) fn read_end_at_eof(host_fd: i32) -> bool {
     };
     let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
     rc > 0 && pfd.revents & libc::POLLHUP != 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reset_state_for_test() {
+        let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
+        for beacon in st.beacons.values() {
+            unsafe { libc::close(beacon.read_fd) };
+            for fd in beacon.writer_bw.values() {
+                unsafe { libc::close(*fd) };
+            }
+        }
+        *st = State::default();
+    }
+
+    #[test]
+    fn fork_child_reset_drops_closed_fifo_beacon_writers() {
+        reset_state_for_test();
+        let mut beacon_pipe = [0i32; 2];
+        let mut read_fd_pipe = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(beacon_pipe.as_mut_ptr()) }, 0);
+        assert_eq!(unsafe { libc::pipe(read_fd_pipe.as_mut_ptr()) }, 0);
+
+        {
+            let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
+            st.read_ends.insert(read_fd_pipe[0], (1, 2));
+            st.beacons.insert(
+                (1, 2),
+                Beacon {
+                    read_fd: beacon_pipe[0],
+                    writer_bw: HashMap::from([(-1, beacon_pipe[1])]),
+                },
+            );
+        }
+
+        after_fork_child();
+
+        assert!(
+            read_end_at_eof(read_fd_pipe[0]),
+            "closed inherited FIFO writer bookkeeping must release the beacon"
+        );
+        unsafe {
+            libc::close(read_fd_pipe[0]);
+            libc::close(read_fd_pipe[1]);
+        }
+        reset_state_for_test();
+    }
 }

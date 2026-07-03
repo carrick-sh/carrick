@@ -358,6 +358,31 @@ mod tests {
     }
 
     #[test]
+    fn fork_child_close_cannot_free_parent_owned_pty() {
+        let mut t = PtyTable::new();
+        let n = t.insert("/dev/ttys-parent".into(), 100);
+
+        t.free_if_owner(n, 200);
+
+        assert_eq!(t.live_indices(), vec![n]);
+        assert_eq!(t.slave_name(n).as_deref(), Some("/dev/ttys-parent"));
+    }
+
+    #[test]
+    fn freed_parent_pty_index_is_not_resurrected_by_child_open() {
+        let mut t = PtyTable::new();
+        let parent = t.insert("/dev/ttys-parent".into(), 100);
+        t.free_if_owner(parent, 100);
+
+        t.free_if_owner(parent, 200);
+        let child = t.insert("/dev/ttys-child".into(), 200);
+
+        assert_ne!(child, parent);
+        assert_eq!(t.slave_name(parent), None);
+        assert_eq!(t.slave_name(child).as_deref(), Some("/dev/ttys-child"));
+    }
+
+    #[test]
     fn devpts_lookup_and_readdir_track_live_ptys() {
         use crate::vfs::{OpenContext, OpenFlags, Vfs};
         use parking_lot::Mutex;

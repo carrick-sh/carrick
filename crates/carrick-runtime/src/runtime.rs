@@ -1030,6 +1030,8 @@ where
                         // self-pipe is shared with the parent — give the child
                         // fresh ones so its parked-thread wakes are its own.
                         crate::host_signal::reinit_after_fork();
+                        crate::dispatch::reset_fifo_beacons_after_fork_child();
+                        crate::dispatch::reset_epoll_wake_registry_after_fork_child();
                         // Threads don't survive fork: re-arm the child's deadlock
                         // watchdog (shares the tree-global progress counter).
                         crate::deadlock_watchdog::arm();
