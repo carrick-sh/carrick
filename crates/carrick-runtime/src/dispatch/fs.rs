@@ -4518,6 +4518,12 @@ impl SyscallDispatcher {
                     if !this.fd_is_valid(fd.0) {
                         return Ok(DispatchOutcome::errno(LINUX_EBADF));
                     }
+                    if !carrick_portable::host_ofd_locks_supported() {
+                        return Ok(match validate_flock_arg(&*cx.memory, arg) {
+                            Ok(()) => DispatchOutcome::errno(LINUX_ENOTSUP),
+                            Err(errno) => DispatchOutcome::errno(errno),
+                        });
+                    }
                     match this.host_file_fd_for_flush(fd.0) {
                         Ok(Some(host_fd)) => {
                             forward_record_lock(&mut *cx.memory, host_fd, command, arg)
