@@ -122,6 +122,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 debug_state_path: None,
                 raw: !interactive,
                 json: false,
+                pull: crate::args::PullArg::Missing,
                 tty: interactive,
                 interactive,
                 fs: None,
@@ -320,11 +321,21 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 .as_deref()
                 .and_then(carrick_image::PlatformTarget::parse)
                 .unwrap_or_else(carrick_image::PlatformTarget::default_target);
-            // Cache short-circuit: if the image is already in the store for this
-            // platform, don't re-download (docker prints "Image is up to date").
-            // Note: this trusts the local cache and does not re-check the registry
-            // for a newer digest on a moving tag — a force/`--pull` follow-up.
-            if block_on_oci(store.load_pull_summary_for(&image, &target)).is_ok() {
+            // Cache short-circuit: skip the re-download only if the image is
+            // cached for this platform AND its tag has not MOVED in the registry
+            // (same tag, new digest). Re-checking the registry digest is what
+            // stops a rebuilt+repushed image from being silently served stale —
+            // the LTP-oracle version-skew that manufactured 278 false regressions.
+            // If the registry is unreachable, we keep trusting the cache so an
+            // offline `pull` still succeeds (see `tag_moved_since_pull`).
+            let cached = block_on_oci(store.load_pull_summary_for(&image, &target)).ok();
+            let up_to_date = cached.as_ref().is_some_and(|summary| {
+                let registry = block_on_oci(carrick_image::resolve_registry_tag_digest(
+                    &image, &store, &target,
+                ));
+                !carrick_image::tag_moved_since_pull(summary.digest.as_deref(), registry.as_deref())
+            });
+            if up_to_date {
                 println!("Status: Image is up to date for {}", image.canonical());
             } else {
                 block_on_oci(carrick_image::pull_image_with_platform(
@@ -490,6 +501,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             pid,
             detach,
             forward_env,
+            pull,
             command,
         } => {
             // Apply forwarded env BEFORE anything reads it (e.g. host_facts'
@@ -527,6 +539,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
 
             let req = carrick_engine::CliRunRequest {
                 image_ref: image,
+                pull: pull.into(),
                 platform,
                 args: command,
                 env_overrides,
@@ -739,6 +752,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             publish,
             stop_signal,
             stop_timeout,
+            pull,
             command,
         } => {
             let mut env_overrides = env;
@@ -758,6 +772,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             let parsed_network = parse_network_mode_arg(&network)?;
             let req = carrick_engine::CliRunRequest {
                 image_ref: image,
+                pull: pull.into(),
                 platform,
                 args: command,
                 env_overrides,
