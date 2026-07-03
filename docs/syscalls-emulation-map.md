@@ -80,7 +80,7 @@ cap-std with `--fs host`). Each open file is an `OpenDescription` behind an
 |---|---|---|---|---|
 | `openat`, `close`, `read`, `write`, `lseek` | 56,57,63,64,62 | Emulated (Full) | host `openat`/`close`/`read`/`write`/`lseek` via VFS | Stdio fds 0/1/2 special-cased; `O_DIRECTORY`/`O_NOFOLLOW`/`O_DIRECT` aarch64 constants are the corrected octal values. |
 | `readv`, `writev`, `pread64`, `pwrite64`, `preadv`, `pwritev`, `preadv2`, `pwritev2` | 65–70,286,287 | Emulated (Full→Partial) | host vector/positional I/O | Zero-length ops never touch the guest buffer; access-mode validated (`read` on `O_WRONLY` → `EBADF`); `preadv2`/`pwritev2` route to the vectored positional handlers and treat `RWF_HIPRI` as an advisory hint. |
-| `openat2` | 437 | Emulated (Partial) | host `openat` + `open_how` validation | Flags/mode passed through; `RESOLVE_*` path-restriction enforcement deferred. |
+| `openat2` | 437 | Emulated (Partial) | host `openat` + `open_how` validation | Flags/mode passed through; LTP-covered `RESOLVE_*` path-walk restrictions enforced. |
 | `dup`, `dup3`, `fcntl`, `close_range` | 23,24,25,436 | Emulated (Full) | host fd-table ops | `dup` allocates lowest-free fd incl. a closed 0/1/2; `F_SETFL O_NONBLOCK` propagates to the host fd; `F_GETLK`/`F_SETLEASE` recorded per-description. |
 | `pipe2` | 59 | Emulated (Full) | host `pipe` + flag fix-up | `O_NONBLOCK`/`O_CLOEXEC`/`O_DIRECT` honored; `FIONREAD` forwards to the host fd. |
 | `getdents64`, `getcwd`, `chdir`, `fchdir` | 61,17,49,50 | Emulated (Full) | host dir read + cwd tracking | |
