@@ -63,8 +63,8 @@
 //!     generation check).
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Weak};
 
 use parking_lot::Mutex as ParkingMutex;
 use parking_lot_core::{FilterOp, ParkResult, ParkToken, RequeueOp, UnparkResult, UnparkToken};
@@ -113,11 +113,27 @@ pub struct ThreadRegistry {
 /// read this process's thread tids + states. Set when the vCPU loop creates
 /// its registry and re-set in a forked child (which builds a fresh one).
 static CURRENT_REGISTRY: ParkingMutex<Option<Arc<ThreadRegistry>>> = ParkingMutex::new(None);
+static CURRENT_FUTEX_TABLE: ParkingMutex<Option<Weak<FutexTable>>> = ParkingMutex::new(None);
 
 /// Publish `registry` as this process's current registry. Called by the run
 /// loop at startup and after fork (the child has its own registry).
 pub fn set_current_registry(registry: Arc<ThreadRegistry>) {
     *CURRENT_REGISTRY.lock() = Some(registry);
+}
+
+/// Publish the process-private futex table for wake sources that live outside
+/// the runtime loop's `KernelState` (notably fallback timer-delivery threads).
+pub fn set_current_futex_table(table: &Arc<FutexTable>) {
+    *CURRENT_FUTEX_TABLE.lock() = Some(Arc::downgrade(table));
+}
+
+/// Wake private futex waiters for a process-directed signal fired from a helper
+/// thread. If the table has not been installed yet, there is no parked guest
+/// thread to wake.
+pub fn notify_current_futex_signal_pending() {
+    if let Some(table) = CURRENT_FUTEX_TABLE.lock().as_ref().and_then(Weak::upgrade) {
+        table.notify_signal_pending();
+    }
 }
 
 /// `tid`'s prctl/pthread-set name from the current process's registry, if set.
@@ -1131,6 +1147,28 @@ mod tests {
 
         // Indefinite wait with no waker, but the predicate eventually fires —
         // the signal notification wakes the parked thread immediately.
+        let outcome = table.wait(addr, None, &|| pending.load(Ordering::SeqCst));
+        assert_eq!(outcome, FutexWaitOutcome::Interrupted);
+
+        raiser.join().unwrap();
+    }
+
+    #[test]
+    fn current_futex_signal_notification_interrupts_waiter() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let table = Arc::new(FutexTable::new());
+        set_current_futex_table(&table);
+        let addr = 0xfeed_beef_u64;
+        let pending = Arc::new(AtomicBool::new(false));
+        let pending2 = Arc::clone(&pending);
+
+        let raiser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            pending2.store(true, Ordering::SeqCst);
+            notify_current_futex_signal_pending();
+        });
+
         let outcome = table.wait(addr, None, &|| pending.load(Ordering::SeqCst));
         assert_eq!(outcome, FutexWaitOutcome::Interrupted);
 
