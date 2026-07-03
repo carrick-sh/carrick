@@ -1768,13 +1768,24 @@ impl SyscallDispatcher {
         thread: Option<ThreadCtx>,
     ) -> Option<Result<DispatchOutcome, DispatchError>> {
         let handler = resolve_handler(request.number.raw())?;
+        let canonical_nr = request.number.raw();
         let mut ctx = SyscallCtx {
             request,
             memory,
             reporter,
             thread,
         };
-        Some(handler(self, &mut ctx))
+        let outcome = handler(self, &mut ctx);
+        // Single choke point for the fork-coherent resolve cache: a structural
+        // namespace mutation (mkdirat/unlinkat/symlinkat/linkat/renameat/
+        // renameat2/mknodat) can change how OTHER paths resolve, so bump the
+        // shared generation that invalidates every process's cache. Every guest
+        // syscall funnels through here exactly once; content writes are not in
+        // the set, so a syscall-bound write/lseek loop keeps its cached resolves.
+        if fs::is_structural_namespace_mutation(canonical_nr) {
+            crate::fs_resolve_cache::bump_generation();
+        }
+        Some(outcome)
     }
 
     /// Membership test: is `number` claimed by some dispatch module? Mirrors
