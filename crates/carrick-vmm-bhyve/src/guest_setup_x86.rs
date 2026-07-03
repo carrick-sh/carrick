@@ -1547,120 +1547,17 @@ pub fn msr_init_blob(
     entry_rdx: u64,
     entry_rcx: u64,
 ) -> Vec<u8> {
-    let mut b = Vec::with_capacity(128);
-
-    // Helper: emit WRMSR(msr, val).  All three SYSCALL MSRs fit in EDX:EAX.
-    let mut wrmsr = |msr: u32, val: u64| {
-        let lo = (val & 0xFFFF_FFFF) as u32;
-        let hi = (val >> 32) as u32;
-        // mov ecx, msr_num  (B9 id)
-        b.push(0xB9);
-        b.extend_from_slice(&msr.to_le_bytes());
-        // mov eax, lo       (B8 id)
-        b.push(0xB8);
-        b.extend_from_slice(&lo.to_le_bytes());
-        // mov edx, hi       (BA id)
-        b.push(0xBA);
-        b.extend_from_slice(&hi.to_le_bytes());
-        // wrmsr             (0F 30)
-        b.push(0x0F);
-        b.push(0x30);
-    };
-
-    // LSTAR WRMSR
-    wrmsr(MSR_LSTAR, lstar);
-    // STAR WRMSR
-    wrmsr(MSR_STAR, star);
-    // SF_MASK WRMSR
-    wrmsr(MSR_SF_MASK, sfmask);
-
-    // Mask all SIMD-FP exceptions before entering user code. A freshly-activated
-    // sibling vCPU starts with MXCSR=0 (every SSE exception UNMASKED), so a
-    // maskable exception in the guest (the Go compiler trips one; the lighter
-    // `go version` does not) raises #XF. Linux clone inherits the parent's masked
-    // MXCSR (0x1F80); replicate that here — we run in ring 0 with CR4.OSFXSR
-    // already set (inherited snap.cr4). RSP is the ring-0 scratch stack and the
-    // push/ldmxcsr/add is RSP-balanced, so the iretq frame below lands unchanged.
-    // (Harmless for the main vCPU — its own runtime overwrites MXCSR.)
-    //   push 0x1F80 ; ldmxcsr [rsp] ; add rsp, 8
-    b.extend_from_slice(&[0x68, 0x80, 0x1F, 0x00, 0x00]);
-    b.extend_from_slice(&[0x0F, 0xAE, 0x14, 0x24]);
-    b.extend_from_slice(&[0x48, 0x83, 0xC4, 0x08]);
-
-    // Enable AVX: program XCR0 = x87(0)|SSE(1)|AVX(2) = 0x7 via XSETBV, so the
-    // guest's AVX instructions (glibc/Go emit VZEROUPPER / VMOVDQA ymm) don't
-    // #UD. CR4.OSXSAVE is already set (snap.cr4 = 0x4_0620, OSXSAVE bit 18), and
-    // the blob runs in ring 0 where XSETBV is legal. SSE(1) MUST accompany AVX(2)
-    // or XSETBV #GPs. Mirrors KVM's KVM_SET_XCRS; bhyve has no
-    // host XCR0 API, so we do it from guest code. ECX/EAX/EDX are already clobbered
-    // by the WRMSRs above; RAX is reloaded by the iretq-frame pushes below.
-    //   xor ecx,ecx ; mov eax,7 ; xor edx,edx ; xsetbv
-    b.extend_from_slice(&[0x31, 0xC9]);
-    b.extend_from_slice(&[0xB8, 0x07, 0x00, 0x00, 0x00]);
-    b.extend_from_slice(&[0x31, 0xD2]);
-    b.extend_from_slice(&[0x0F, 0x01, 0xD1]);
-
-    // Build iretq frame.  push imm32 sign-extends; push rax from imm64 for
-    // large values (user_rip and user_rsp can exceed 0x7FFF_FFFF).
-    let push_u64 = |b: &mut Vec<u8>, val: u64| {
-        // mov rax, imm64  (REX.W B8 + 8-byte imm)
-        b.push(0x48);
-        b.push(0xB8);
-        b.extend_from_slice(&val.to_le_bytes());
-        // push rax  (50)
-        b.push(0x50);
-    };
-
-    // SS (selector, small — push imm32 sign-extends to 0x0000_0000_0000_001B)
-    b.push(0x68); // push imm32
-    b.extend_from_slice(&(USER_SS_SEL as u32).to_le_bytes());
-
-    // RSP (large VA — use mov+push)
-    push_u64(&mut b, user_rsp);
-
-    // RFLAGS (small — push imm32)
-    b.push(0x68);
-    b.extend_from_slice(&(user_rflags as u32).to_le_bytes());
-
-    // CS (selector, small)
-    b.push(0x68);
-    b.extend_from_slice(&(USER_CS64_SEL as u32).to_le_bytes());
-
-    // RIP (large VA — use mov+push)
-    push_u64(&mut b, user_rip);
-
-    // Optionally zero RAX (xor eax, eax = 31 C0) so a clone(2) child sees
-    // rax = 0. Placed AFTER the frame pushes (which clobber RAX via the
-    // mov rax, imm64 scratch) but BEFORE the iretq.
-    if clear_rax {
-        b.push(0x31);
-        b.push(0xC0);
-    }
-
-    // Restore the entry RDX and RCX LAST — the WRMSRs (mov edx,hi / mov ecx,msr)
-    // and the XSETBV (xor edx,edx / xor ecx,ecx) above CLOBBER them to 0. A real
-    // Linux `clone`/`clone3` child inherits the parent's full register file
-    // (except RAX=0 and RSP), and the glibc `clone3` wrapper's child path calls
-    // its thread fn via `call *%rdx` with the arg in a preserved register — so a
-    // clobbered RDX makes the child `call *0` and #PF at RIP=0 (the bhyve Go
-    // bring-up crash). musl's `clone` passes the fn on the child STACK, so it
-    // never noticed. RCX is the post-`syscall` return RIP the child should also
-    // inherit. `iretq` does NOT reload RDX/RCX, so values set here persist into
-    // ring 3. (Boot/main-vCPU callers pass 0/0, matching the prior XSETBV-zeroed
-    // state — no behaviour change there.)
-    //   mov rdx, imm64 (REX.W BA) ; mov rcx, imm64 (REX.W B9)
-    b.push(0x48);
-    b.push(0xBA);
-    b.extend_from_slice(&entry_rdx.to_le_bytes());
-    b.push(0x48);
-    b.push(0xB9);
-    b.extend_from_slice(&entry_rcx.to_le_bytes());
-
-    // iretq  (REX.W CF)
-    b.push(0x48);
-    b.push(0xCF);
-
-    b
+    carrick_x86::msr_init_blob(
+        lstar,
+        star,
+        sfmask,
+        user_rip,
+        user_rsp,
+        user_rflags,
+        clear_rax,
+        entry_rdx,
+        entry_rcx,
+    )
 }
 
 // ─── T6: BhyveGuestRam PML4 map specs ────────────────────────────────────────
@@ -3266,7 +3163,7 @@ mod tests {
         assert!(!windows[1].exec);
     }
 
-    /// msr_init_blob: smoke-check that the blob is non-empty, fits in 128 bytes,
+    /// msr_init_blob: smoke-check that the blob is non-empty, fits in 160 bytes,
     /// starts with B9 (mov ecx, imm32 for the first WRMSR), and ends with 48 CF
     /// (iretq).
     #[test]
@@ -3513,7 +3410,7 @@ mod tests {
     #[test]
     fn fixed_gpa_constants_within_lowmem() {
         for (name, gpa, size) in [
-            ("init_blob", X86_INIT_BLOB_GPA, 128u64),
+            ("init_blob", X86_INIT_BLOB_GPA, 160u64),
             ("gdt", X86_GDT_GPA, 4096),
             ("lstar", X86_LSTAR_GPA, 4096),
             ("pml4", X86_PML4_GPA, X86_PML4_CAPACITY as u64),

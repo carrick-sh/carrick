@@ -8,11 +8,8 @@
 //!   - [`fp_stub_bytes`] + [`run_fp_stub`] are used only when
 //!     `X86Vcpu::get_fp()` returns `None` (bhyve on FreeBSD 15.1: no FP getter).
 //!
-//! Stage-1 status: these are the **canonical copies** in `carrick-x86`. They are
-//! byte-for-byte equivalent to bhyve's `guest_setup_x86::{msr_init_blob,
-//! fp_stub_bytes}` and `trap_engine::run_fp_stub`, but the bhyve copies are left
-//! in place (Stage 4 deletes them and re-points bhyve at these). Nothing
-//! consumes these yet.
+//! These are the **canonical copies** in `carrick-x86`; backend-local copies
+//! should only survive while a backend is being migrated to the shared seam.
 
 use crate::vmm::{X86Exit, X86Reg, X86Vcpu};
 use carrick_hal::TrapError;
@@ -50,6 +47,10 @@ const USER_SS_SEL: u64 = 0x1B;
 /// `clear_rax` emits `xor eax, eax` before the `iretq` so a `clone(2)` child
 /// sees `rax = 0`.
 ///
+/// `entry_rdx` and `entry_rcx` restore the inherited child-entry registers that
+/// the WRMSR/XSETBV setup clobbers before `iretq`. glibc's clone trampoline can
+/// call through RDX, and RCX carries the post-`syscall` return RIP.
+///
 /// Encodings (Intel SDM vol. 2 / AMD64 APM):
 /// ```text
 ///   mov ecx, msr   B9 id
@@ -70,8 +71,10 @@ pub fn msr_init_blob(
     user_rsp: u64,
     user_rflags: u64,
     clear_rax: bool,
+    entry_rdx: u64,
+    entry_rcx: u64,
 ) -> Vec<u8> {
-    let mut b = Vec::with_capacity(128);
+    let mut b = Vec::with_capacity(160);
 
     // Helper: emit WRMSR(msr, val). All three SYSCALL MSRs fit in EDX:EAX.
     let mut wrmsr = |msr: u32, val: u64| {
@@ -94,6 +97,25 @@ pub fn msr_init_blob(
     wrmsr(MSR_LSTAR, lstar);
     wrmsr(MSR_STAR, star);
     wrmsr(MSR_SF_MASK, sfmask);
+
+    // Linux starts user code with all maskable SIMD exceptions masked
+    // (MXCSR=0x1F80). Fresh bhyve sibling/reclaim vCPUs otherwise start with
+    // MXCSR=0, which unmasks every SSE exception. We are running ring 0 with
+    // CR4.OSFXSR set, and this stack adjustment is balanced before the iretq
+    // frame is built.
+    //   push 0x1F80 ; ldmxcsr [rsp] ; add rsp, 8
+    b.extend_from_slice(&[0x68, 0x80, 0x1F, 0x00, 0x00]);
+    b.extend_from_slice(&[0x0F, 0xAE, 0x14, 0x24]);
+    b.extend_from_slice(&[0x48, 0x83, 0xC4, 0x08]);
+
+    // Enable AVX: XCR0 = x87(0)|SSE(1)|AVX(2) = 0x7. SSE must accompany AVX or
+    // XSETBV #GPs. KVM/NVMM can set this from host APIs; no-MSR/no-XCR host APIs
+    // use this guest blob.
+    //   xor ecx,ecx ; mov eax,7 ; xor edx,edx ; xsetbv
+    b.extend_from_slice(&[0x31, 0xC9]);
+    b.extend_from_slice(&[0xB8, 0x07, 0x00, 0x00, 0x00]);
+    b.extend_from_slice(&[0x31, 0xD2]);
+    b.extend_from_slice(&[0x0F, 0x01, 0xD1]);
 
     // Build iretq frame. push imm32 sign-extends; push rax from imm64 for large
     // values (user_rip and user_rsp can exceed 0x7FFF_FFFF).
@@ -129,6 +151,14 @@ pub fn msr_init_blob(
         b.push(0x31);
         b.push(0xC0);
     }
+
+    // Restore entry ABI registers clobbered by WRMSR/XSETBV.
+    b.push(0x48);
+    b.push(0xBA);
+    b.extend_from_slice(&entry_rdx.to_le_bytes());
+    b.push(0x48);
+    b.push(0xB9);
+    b.extend_from_slice(&entry_rcx.to_le_bytes());
 
     // iretq  (REX.W CF)
     b.push(0x48);
@@ -241,9 +271,11 @@ mod tests {
             0x7fff_0000,
             0x2,
             false,
+            0,
+            0,
         );
         assert!(!blob.is_empty());
-        assert!(blob.len() <= 128, "blob must fit the scratch slot");
+        assert!(blob.len() <= 160, "blob must fit the scratch slot");
         // ends with `iretq` = 48 CF
         let n = blob.len();
         assert_eq!(&blob[n - 2..], &[0x48, 0xCF], "blob must end with iretq");
@@ -258,15 +290,58 @@ mod tests {
 
     #[test]
     fn msr_init_blob_clear_rax_emits_xor_before_iretq() {
-        let with = msr_init_blob(0, 0, 0, 0x1000, 0x2000, 0x2, true);
-        let without = msr_init_blob(0, 0, 0, 0x1000, 0x2000, 0x2, false);
+        let with = msr_init_blob(0, 0, 0, 0x1000, 0x2000, 0x2, true, 0, 0);
+        let without = msr_init_blob(0, 0, 0, 0x1000, 0x2000, 0x2, false, 0, 0);
         // `with` has the extra `xor eax, eax` (31 C0) just before `iretq`.
         assert_eq!(with.len(), without.len() + 2);
         let n = with.len();
         assert_eq!(
-            &with[n - 4..n - 2],
+            &with[n - 24..n - 22],
             &[0x31, 0xC0],
-            "xor eax,eax precedes iretq"
+            "xor eax,eax precedes the RDX/RCX restore"
+        );
+    }
+
+    #[test]
+    fn msr_init_blob_masks_mxcsr_and_enables_avx_xcr0() {
+        let blob = msr_init_blob(0, 0, 0, 0x1000, 0x2000, 0x2, false, 0, 0);
+        let mxcsr_mask = [
+            0x68, 0x80, 0x1F, 0x00, 0x00, // push 0x1F80
+            0x0F, 0xAE, 0x14, 0x24, // ldmxcsr [rsp]
+            0x48, 0x83, 0xC4, 0x08, // add rsp,8
+        ];
+        assert!(
+            blob.windows(mxcsr_mask.len()).any(|w| w == mxcsr_mask),
+            "MXCSR mask sequence present"
+        );
+        let xsetbv = [
+            0x31, 0xC9, // xor ecx,ecx
+            0xB8, 0x07, 0x00, 0x00, 0x00, // mov eax,7
+            0x31, 0xD2, // xor edx,edx
+            0x0F, 0x01, 0xD1, // xsetbv
+        ];
+        assert!(
+            blob.windows(xsetbv.len()).any(|w| w == xsetbv),
+            "XCR0=7 xsetbv sequence present"
+        );
+    }
+
+    #[test]
+    fn msr_init_blob_restores_entry_rdx_rcx_before_iretq() {
+        let rdx = 0x1122_3344_5566_7788u64;
+        let rcx = 0xCAFE_F00D_DEAD_BEEFu64;
+        let blob = msr_init_blob(0, 0, 0, 0x1000, 0x2000, 0x2, true, rdx, rcx);
+        let n = blob.len();
+        assert_eq!(&blob[n - 2..], &[0x48, 0xCF], "blob ends with iretq");
+        let mut expect = vec![0x48, 0xBA];
+        expect.extend_from_slice(&rdx.to_le_bytes());
+        expect.push(0x48);
+        expect.push(0xB9);
+        expect.extend_from_slice(&rcx.to_le_bytes());
+        assert_eq!(
+            &blob[n - 22..n - 2],
+            &expect[..],
+            "RDX then RCX restored immediately before iretq"
         );
     }
 
