@@ -1182,15 +1182,17 @@ fn open_o_tmpfile_creates_anonymous_writable_file() {
         .unwrap()
     };
 
-    // openat(AT_FDCWD, <dir>, O_TMPFILE|O_RDWR, 0600); pathname is unused for
-    // O_TMPFILE, so a null pointer is fine.
+    memory.write_bytes(0x4000, b".\0").unwrap();
+
+    // openat(AT_FDCWD, ".", O_TMPFILE|O_RDWR, 0600); pathname must name a
+    // directory even though the resulting file is unnamed.
     let fd = match run(
         &mut dispatcher,
         &mut memory,
         56,
         [
             LINUX_AT_FDCWD,
-            0,
+            0x4000,
             LINUX_O_TMPFILE | LINUX_O_RDWR,
             0o600,
             0,
@@ -1226,7 +1228,7 @@ fn open_o_tmpfile_creates_anonymous_writable_file() {
             &mut dispatcher,
             &mut memory,
             56,
-            [LINUX_AT_FDCWD, 0, LINUX_O_TMPFILE, 0o600, 0, 0]
+            [LINUX_AT_FDCWD, 0x4000, LINUX_O_TMPFILE, 0o600, 0, 0]
         ),
         DispatchOutcome::Errno {
             errno: LinuxErrno::new(22)
@@ -1255,6 +1257,8 @@ fn open_o_tmpfile_materializes_via_proc_self_fd_linkat() {
         .unwrap()
     };
 
+    memory.write_bytes(0x4000, b".\0").unwrap();
+
     // openat(AT_FDCWD, ".", O_TMPFILE|O_RDWR, 0640)
     let fd = match run(
         &mut dispatcher,
@@ -1262,7 +1266,7 @@ fn open_o_tmpfile_materializes_via_proc_self_fd_linkat() {
         56,
         [
             LINUX_AT_FDCWD,
-            0,
+            0x4000,
             LINUX_O_TMPFILE | LINUX_O_RDWR,
             CREATE_MODE,
             0,
@@ -1364,6 +1368,8 @@ fn open_o_tmpfile_materialize_preserves_setuid_setgid_host_backend() {
         .unwrap()
     };
 
+    memory.write_bytes(0x4000, b".\0").unwrap();
+
     // openat(AT_FDCWD, ".", O_TMPFILE|O_RDWR, 07755) → a real anon host fd.
     let fd = match run(
         &mut dispatcher,
@@ -1371,7 +1377,7 @@ fn open_o_tmpfile_materialize_preserves_setuid_setgid_host_backend() {
         56,
         [
             LINUX_AT_FDCWD,
-            0,
+            0x4000,
             LINUX_O_TMPFILE | LINUX_O_RDWR,
             CREATE_MODE,
             0,
