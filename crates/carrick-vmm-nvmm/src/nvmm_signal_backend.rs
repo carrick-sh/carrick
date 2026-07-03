@@ -25,6 +25,9 @@ impl HostSignalGlue for NvmmGlue {
     /// The old `nvmm_disposition::is_nvmm_claimed` body: the four pumped signals,
     /// the SIGCHLD reaper + SIGPIPE (by LINUX number), and the kick/nudge.
     fn is_claimed(linux_signum: i32) -> bool {
+        if !carrick_host_bsd::signum::linux_signum_has_host_carrier(linux_signum) {
+            return true;
+        }
         if matches!(linux_signum, 1 | 2 | 3 | 15) {
             return true;
         }
