@@ -28,9 +28,9 @@ pub use futex::{
 };
 pub mod threaded;
 pub use threaded::{
-    FutexOutcome, GenericVcpuRegistry, GuestEntryRegs, HostForkCoordinator, PlatformFutex,
-    PreparedHostFork, RegAccess, ThreadId, ThreadedEngine, VcpuKick, VcpuKickDyn, VcpuRegistry,
-    aarch64_signal_pstate_source, read_aarch64_syscall_frame,
+    FutexOutcome, GenericVcpuRegistry, GuestEntryRegs, HostForkCoordinator, HostVa, PlatformFutex,
+    PreparedHostFork, RegAccess, SharedFutexLocation, ThreadId, ThreadedEngine, VcpuKick,
+    VcpuKickDyn, VcpuRegistry, aarch64_signal_pstate_source, read_aarch64_syscall_frame,
 };
 pub mod sigframe;
 pub mod signal_arrival;

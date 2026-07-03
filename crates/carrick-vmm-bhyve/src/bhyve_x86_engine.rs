@@ -53,6 +53,7 @@ use carrick_abi::LinuxProtFlags;
 use carrick_guest_mem::{Gpa, GuestVa, HostVa, MemoryError};
 use carrick_hal::GuestVmBackend;
 use carrick_hal::OsError;
+use carrick_hal::SharedFutexLocation;
 use carrick_hal::TrapError;
 use carrick_mem::memory::AddressSpace;
 use carrick_mem::pml4::Pml4Manager;
@@ -1241,7 +1242,7 @@ fn shared_futex_mirror_base() -> Option<usize> {
 /// Resolve a guest futex-word VA to the host address of its fork-coherent mirror word,
 /// claiming an open-addressed slot on first sight. `None` if the mmap failed or the
 /// table is full (the cross-process futex then degrades to the old per-VM behaviour).
-fn shared_futex_mirror_slot(key: u64) -> Option<usize> {
+fn shared_futex_mirror_slot(key: u64) -> Option<SharedFutexLocation> {
     use std::sync::atomic::Ordering::{AcqRel, Acquire};
     let base = shared_futex_mirror_base()?;
     let slots = base as *const FutexMirrorSlot;
@@ -1251,14 +1252,25 @@ fn shared_futex_mirror_slot(key: u64) -> Option<usize> {
         let slot = unsafe { &*slots.add(idx) };
         let cur = slot.key.load(Acquire);
         if cur == key {
-            return Some(&slot.value as *const _ as usize);
+            return Some(SharedFutexLocation::Mirror {
+                word: HostVa(&slot.value as *const _ as usize),
+                waiter_count: HostVa(&slot.waiters as *const _ as usize),
+            });
         }
         if cur == 0 {
             match slot.key.compare_exchange(0, key, AcqRel, Acquire) {
-                Ok(_) => return Some(&slot.value as *const _ as usize),
+                Ok(_) => {
+                    return Some(SharedFutexLocation::Mirror {
+                        word: HostVa(&slot.value as *const _ as usize),
+                        waiter_count: HostVa(&slot.waiters as *const _ as usize),
+                    });
+                }
                 // Lost the race to a peer claiming the SAME key — still ours to use.
                 Err(actual) if actual == key => {
-                    return Some(&slot.value as *const _ as usize);
+                    return Some(SharedFutexLocation::Mirror {
+                        word: HostVa(&slot.value as *const _ as usize),
+                        waiter_count: HostVa(&slot.waiters as *const _ as usize),
+                    });
                 }
                 // Claimed by a different key — keep probing.
                 Err(_) => {}
@@ -1283,7 +1295,7 @@ impl X86Vmm for BhyveVmm {
         Ok(())
     }
 
-    fn shared_futex_host_addr(&self, key: Gpa, _len: usize) -> Option<HostVa> {
+    fn shared_futex_location(&self, key: Gpa, _len: usize) -> Option<SharedFutexLocation> {
         // Cross-process futex coherence on bhyve: the per-VM guest word is NOT shared
         // across the fork (vmmapi limitation, see SHARED_FUTEX_MIRROR). `key` is the
         // futex-word VA (syscall_buffer_gpa is identity on bhyve) — stable across the
@@ -1298,16 +1310,7 @@ impl X86Vmm for BhyveVmm {
         // in-process table BEFORE reaching here (it recognises a live thread's
         // `clear_child_tid` address); see `dispatch/proc.rs`. Everything else — every
         // genuine `MAP_SHARED` (file or anon) cross-process futex — keeps the mirror.
-        shared_futex_mirror_slot(key.raw()).map(HostVa)
-    }
-
-    /// bhyve's `shared_futex_host_addr` returns a SEPARATE mirror slot (the per-VM
-    /// guest word is not fork-shared), so a `FUTEX_WAKE` MUST publish the waker's
-    /// word into that mirror for a cross-process waiter to observe it. (On
-    /// HVF/KVM this is false and the publish is skipped — host_addr IS the guest
-    /// word, so republishing would race and revert a concurrent peer update.)
-    fn shared_futex_uses_mirror(&self) -> bool {
-        true
+        shared_futex_mirror_slot(key.raw())
     }
 
     fn is_guest_reserved(&self, va: u64) -> bool {

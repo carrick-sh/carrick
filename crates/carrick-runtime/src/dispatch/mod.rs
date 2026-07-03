@@ -1202,7 +1202,7 @@ pub enum DispatchOutcome {
     /// dispatcher lock; the runtime waits interruptibly and completes the
     /// syscall. `value` is the expected futex word (the kernel re-compares).
     SharedFutexWait {
-        host_addr: usize,
+        location: carrick_guest_mem::SharedFutexLocation,
         waiter_key: usize,
         value: u32,
         timeout: Option<Duration>,
@@ -1218,7 +1218,7 @@ pub enum DispatchOutcome {
     /// requested wake count (`FUTEX_WAKE`'s `val`); the loop completes the syscall
     /// with the number actually woken.
     SharedFutexWake {
-        host_addr: usize,
+        location: carrick_guest_mem::SharedFutexLocation,
         waiter_key: usize,
         count: u32,
     },
@@ -3021,40 +3021,42 @@ fn dispatch_threaded_futex(
     // the in-process exit-wake, so the join HANGS (the immediate-`pthread_join`
     // failure; KVM is immune — its mirror IS the guest word). No-op on HVF/KVM, where
     // this private descriptor word never resolved to a mirror anyway.
-    let shared_host_addr = if futex_flags.contains(LinuxFutexFlags::PRIVATE)
+    let shared_location = if futex_flags.contains(LinuxFutexFlags::PRIVATE)
         || registry.is_clear_child_tid_addr(address)
     {
         None
     } else {
-        memory.shared_futex_host_addr(address)
+        memory.shared_futex_location(address)
     };
     crate::probes::futex_route(
         address,
         command as i32,
-        if shared_host_addr.is_some() { 1 } else { 0 },
-        shared_host_addr.map(|h| h as u64).unwrap_or(0),
+        if shared_location.is_some() { 1 } else { 0 },
+        shared_location
+            .map(|location| location.wait_addr().raw() as u64)
+            .unwrap_or(0),
     );
 
     match command {
         LINUX_FUTEX_WAKE => {
-            if let Some(host_addr) = shared_host_addr {
+            if let Some(location) = shared_location {
                 // Publish the waker's word to the SHARED MIRROR before the wake so
                 // a cross-process WAITer observes it — but ONLY on a backend that
                 // actually uses a separate mirror (bhyve, whose per-VM guest word
-                // is not shared across fork). On HVF/KVM `host_addr` IS the guest
+                // is not shared across fork). On HVF/KVM the wait address IS the guest
                 // word, which the waker already wrote before this FUTEX_WAKE
                 // syscall: republishing here is redundant AND races — the value we
                 // could write is necessarily a slightly stale snapshot, so it
                 // would OVERWRITE a concurrent peer update and REVERT it (measured
                 // ~3% of wakes), which desynced cross-process semaphores/barriers
                 // and hung cpython multiprocessing. So gate the publish on
-                // `shared_futex_uses_mirror()` and, when it IS needed, read the
+                // `SharedFutexLocation::Mirror` and, when it IS needed, read the
                 // word FRESH (not the stale top-of-handler `word`).
-                if memory.shared_futex_uses_mirror() {
+                if location.is_mirror() {
                     let fresh = read_futex_word(memory, address).unwrap_or(word);
-                    // SAFETY: host_addr is a live 4-byte-aligned host mirror word.
+                    // SAFETY: the wait address is a live 4-byte-aligned host mirror word.
                     unsafe {
-                        (*(host_addr as *const std::sync::atomic::AtomicU32))
+                        (*(location.wait_addr().raw() as *const std::sync::atomic::AtomicU32))
                             .store(fresh, std::sync::atomic::Ordering::SeqCst);
                     }
                 }
@@ -3066,7 +3068,7 @@ fn dispatch_threaded_futex(
                 // success cure) or KVM's host `SYS_futex(FUTEX_WAKE)`. The loop
                 // completes the syscall with the count woken.
                 return DispatchOutcome::SharedFutexWake {
-                    host_addr,
+                    location,
                     waiter_key: address as usize,
                     count: value,
                 };
@@ -3082,22 +3084,22 @@ fn dispatch_threaded_futex(
             // HVF/KVM). Compare THAT, not the possibly stale per-VM sysmem copy, and
             // publish it back to the guest word so the caller's retry loop re-reads what
             // another process wrote instead of spinning on the stale value (see proc.rs).
-            let current = if let Some(host_addr) = shared_host_addr {
-                // SAFETY: host_addr is a live 4-byte-aligned host word.
+            let current = if let Some(location) = shared_location {
+                // SAFETY: the wait address is a live 4-byte-aligned host word.
                 let mirror = unsafe {
-                    (*(host_addr as *const std::sync::atomic::AtomicU32))
+                    (*(location.wait_addr().raw() as *const std::sync::atomic::AtomicU32))
                         .load(std::sync::atomic::Ordering::SeqCst)
                 };
                 // On bhyve (separate mirror) sync the mirror -> the waiter's
                 // per-VM guest word so its retry loop re-reads what a peer wrote.
-                // On HVF/KVM host_addr IS the guest word, so this write-back is
+                // On HVF/KVM the wait address IS the guest word, so this write-back is
                 // redundant AND races exactly like the FUTEX_WAKE store-back: a
                 // concurrent peer write landing between the load above and this
                 // store reverts the peer's update, desyncing the protocol (the
                 // residual that hung multiprocessing test_thousand). Gate it on
                 // the mirror flag — `mirror` is already the authoritative current
                 // value used for the compare below regardless.
-                if mirror != word && memory.shared_futex_uses_mirror() {
+                if mirror != word && location.is_mirror() {
                     let _ = memory.write_bytes(address, &mirror.to_ne_bytes());
                 }
                 mirror
@@ -3142,12 +3144,12 @@ fn dispatch_threaded_futex(
                     }
                 }
             };
-            if let Some(host_addr) = shared_host_addr {
+            if let Some(location) = shared_location {
                 // The shared path's compare-and-wait is atomic in the kernel
                 // (__ulock UL_COMPARE_AND_WAIT re-checks the word), so no
                 // generation snapshot is needed here.
                 return DispatchOutcome::SharedFutexWait {
-                    host_addr,
+                    location,
                     waiter_key: address as usize,
                     value,
                     timeout,
@@ -3212,7 +3214,7 @@ fn dispatch_threaded_futex(
             // thundering-herd avoidance. Private/anon futexes — where glibc and
             // musl condvars and LTP futex_cmp_requeue01 actually live — take the
             // real parking-lot requeue below.
-            if let Some(host_addr) = shared_host_addr {
+            if let Some(location) = shared_location {
                 // Degrade the shared requeue to a wake of nr_wake + nr_requeue
                 // waiters (spurious-wakeup-safe; the woken guest re-checks and
                 // re-waits on uaddr2 itself). Route through the same
@@ -3221,7 +3223,7 @@ fn dispatch_threaded_futex(
                     .saturating_add(nr_requeue as u64)
                     .min(u32::MAX as u64) as u32;
                 return DispatchOutcome::SharedFutexWake {
-                    host_addr,
+                    location,
                     waiter_key: uaddr2 as usize,
                     count: total,
                 };
@@ -4333,12 +4335,14 @@ pub(super) fn read_u32(memory: &impl GuestMemory, address: u64) -> Result<u32, L
 pub(super) fn read_futex_word(memory: &impl GuestMemory, address: u64) -> Result<u32, LinuxErrno> {
     match read_u32(memory, address) {
         Ok(word) => Ok(word),
-        Err(errno) => match memory.shared_futex_host_addr(address) {
+        Err(errno) => match memory.shared_futex_location(address) {
             // SAFETY: a resolved shared host addr points into a live MAP_SHARED
             // region in THIS process — the identical pointer `shared_futex_wait`
             // reads at the wait site. `read_unaligned` avoids assuming stricter
             // alignment than the guest futex ABI's 4-byte guarantee.
-            Some(host_addr) => Ok(unsafe { (host_addr as *const u32).read_unaligned() }),
+            Some(location) => {
+                Ok(unsafe { (location.wait_addr().raw() as *const u32).read_unaligned() })
+            }
             None => Err(errno),
         },
     }
@@ -7171,8 +7175,13 @@ mod overlay_dispatch_tests {
                     length: bytes.len(),
                 })
             }
-            fn shared_futex_host_addr(&self, _guest_addr: u64) -> Option<usize> {
-                Some(&self.word as *const u32 as usize)
+            fn shared_futex_location(
+                &self,
+                _guest_addr: u64,
+            ) -> Option<carrick_guest_mem::SharedFutexLocation> {
+                Some(carrick_guest_mem::SharedFutexLocation::Direct {
+                    word: HostVa(&self.word as *const u32 as usize),
+                })
             }
         }
         // Software read fails, but the shared host pointer yields the word.
@@ -7250,7 +7259,10 @@ mod overlay_dispatch_tests {
             Ok(())
         }
 
-        fn shared_futex_host_addr(&self, _guest_addr: u64) -> Option<usize> {
+        fn shared_futex_location(
+            &self,
+            _guest_addr: u64,
+        ) -> Option<carrick_guest_mem::SharedFutexLocation> {
             self.shared_futex_lookups
                 .set(self.shared_futex_lookups.get() + 1);
             None
@@ -7317,7 +7329,7 @@ mod overlay_dispatch_tests {
     }
 
     /// Task 7 fix #4: a non-private `FUTEX_WAKE` whose word lives in a genuine
-    /// `MAP_SHARED` mapping (`shared_futex_host_addr` → `Some`) must be routed
+    /// `MAP_SHARED` mapping (`shared_futex_location` → `Some`) must be routed
     /// through the `PlatformFutex::shared_wake` seam — i.e. returned as a
     /// `DispatchOutcome::SharedFutexWake`, NOT a `Returned` from an inline
     /// `ulock::wake`. The loop then drives the backend wake (HVF __ulock / KVM
@@ -7339,12 +7351,19 @@ mod overlay_dispatch_tests {
                     length: bytes.len(),
                 })
             }
-            fn shared_futex_host_addr(&self, _guest_addr: u64) -> Option<usize> {
-                Some(&self.word as *const u32 as usize)
+            fn shared_futex_location(
+                &self,
+                _guest_addr: u64,
+            ) -> Option<carrick_guest_mem::SharedFutexLocation> {
+                Some(carrick_guest_mem::SharedFutexLocation::Direct {
+                    word: HostVa(&self.word as *const u32 as usize),
+                })
             }
         }
         let mut memory = SharedWord { word: 0 };
-        let host_addr = &memory.word as *const u32 as usize;
+        let location = carrick_guest_mem::SharedFutexLocation::Direct {
+            word: HostVa(&memory.word as *const u32 as usize),
+        };
         let reporter = CompatReporter::default();
         let futex = crate::thread::FutexTable::new();
         let registry =
@@ -7367,7 +7386,7 @@ mod overlay_dispatch_tests {
         assert_eq!(
             outcome,
             DispatchOutcome::SharedFutexWake {
-                host_addr,
+                location,
                 waiter_key: 0x10800,
                 count: 3,
             },
