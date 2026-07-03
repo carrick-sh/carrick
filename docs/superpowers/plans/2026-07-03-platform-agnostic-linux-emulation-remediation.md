@@ -94,10 +94,10 @@ This plan is therefore a master remediation ledger. Each task below is an indepe
 - [x] Change FreeBSD `_umtx_op` wait/wake helpers to receive the explicit waiter counter address only for mirror slots.
 - [x] Keep direct shared futex words on hosts that have true shared backing from touching adjacent guest memory.
 - [x] Verify with `cargo test -p carrick-x86` and the bhyve backend unit tests.
-- [ ] On FreeBSD, run the targeted shared-futex/LTP checkpoint gate that originally justified the mirror.
+- [x] On FreeBSD, run the targeted shared-futex/LTP checkpoint gate that originally justified the mirror.
 - [x] Commit as `fix(bhyve): type shared futex mirror waiters`.
 
-**Local evidence:** `cargo test -p carrick-thread --lib -- --test-threads=1`, `cargo test -p carrick-host --lib umtx`, `cargo test -p carrick-x86 --lib`, `cargo test -p carrick-runtime --lib shared_futex`, `cargo test -p carrick-vmm-kvm --lib kvm_futex`, `cargo test -p carrick-vmm-bhyve --lib futex`, and `cargo test -p carrick-vmm-nvmm --lib futex` pass on macOS. The FreeBSD target-host LTP checkpoint gate remains open.
+**Evidence:** `cargo test -p carrick-thread --lib -- --test-threads=1`, `cargo test -p carrick-host --lib umtx`, `cargo test -p carrick-x86 --lib`, `cargo test -p carrick-runtime --lib shared_futex`, `cargo test -p carrick-vmm-kvm --lib kvm_futex`, `cargo test -p carrick-vmm-bhyve --lib futex`, and `cargo test -p carrick-vmm-nvmm --lib futex` pass on macOS. FreeBSD VM 200 (`10.14.14.189`) now passes the targeted shared-futex probes under bhyve: `futexshare` reports `futex_shared_cross_process=true`, and `futexsharedalias` matches its refreshed amd64-musl oracle.
 
 ## Task 2: Make BSD Signal Translation Collision-Aware
 
@@ -116,10 +116,10 @@ This plan is therefore a master remediation ledger. Each task below is an indepe
 - [x] Implement the policy without identity-fallback collisions.
 - [x] Ensure Ctrl+T/host `SIGINFO` is ignored or handled as a host-control signal, not delivered to the guest as Linux `SIGIO`.
 - [x] Verify host unit tests on macOS and target BSD build/tests where available.
-- [ ] Run a guest probe that sends and observes the affected signals under the BSD host lane.
+- [x] Run a guest probe that sends and observes the affected signals under the BSD host lane.
 - [x] Commit as `fix(bsd): avoid signal number collisions`.
 
-**Local evidence:** `cargo test -p carrick-host-bsd signum --lib`, `cargo test -p carrick-runtime cross_process_xsig_policy_routes_unhostable_signals --lib`, `cargo test -p carrick-runtime wait_status_tests --lib`, `cargo test -p carrick-runtime sigdeath_marker --lib`, `cargo test -p carrick-vmm-hvf host_signal --lib`, `cargo test -p carrick-vmm-bhyve --lib signal`, `cargo test -p carrick-vmm-nvmm --lib signal`, and `cargo check --manifest-path conformance-probes/Cargo.toml --target aarch64-unknown-linux-musl --bin bsd_signal_xlate` pass. The new `bsd_signal_xlate` probe still needs a BSD host-lane runtime run.
+**Evidence:** `cargo test -p carrick-host-bsd signum --lib`, `cargo test -p carrick-runtime cross_process_xsig_policy_routes_unhostable_signals --lib`, `cargo test -p carrick-runtime wait_status_tests --lib`, `cargo test -p carrick-runtime sigdeath_marker --lib`, `cargo test -p carrick-vmm-hvf host_signal --lib`, `cargo test -p carrick-vmm-bhyve --lib signal`, `cargo test -p carrick-vmm-nvmm --lib signal`, and `cargo check --manifest-path conformance-probes/Cargo.toml --target aarch64-unknown-linux-musl --bin bsd_signal_xlate` pass. FreeBSD VM 200 (`10.14.14.189`) passes the `bsd_signal_xlate` runtime probe under bhyve: `child_handlers_installed`, `kill_sigstkflt_ok`, `kill_sigpwr_ok`, `kill_sigio_ok`, `child_waited`, and `child_exited_zero` all report `true`.
 
 ## Task 3: Harden Fork-Coherent Runtime Registries
 
@@ -141,10 +141,10 @@ This plan is therefore a master remediation ledger. Each task below is an indepe
 - [x] For epoll wake fds, clear inherited wake registries in fork children before any child fd close/reallocation can make stale fd numbers dangerous.
 - [x] For PTYs, keep `owner_pid` as the authority and add tests proving child close/open cannot resurrect or expose a freed parent PTY.
 - [x] Verify with `cargo test -p carrick-runtime fifo_beacon epoll pty`.
-- [ ] Add guest probes for the three user-visible fork cases and run `just conformance-probes` after codesigned build.
+- [x] Add guest probes for the three user-visible fork cases and run `just conformance-probes` after codesigned build.
 - [x] Commit as `fix(runtime): reset fork-local fd registries`.
 
-**Local evidence:** `cargo test -p carrick-runtime fifo_beacon --lib`, `cargo test -p carrick-runtime epoll --lib`, and `cargo test -p carrick-runtime pty --lib` pass. Guest fork probes and `just conformance-probes` remain open.
+**Evidence:** `cargo test -p carrick-runtime fifo_beacon --lib`, `cargo test -p carrick-runtime epoll --lib`, and `cargo test -p carrick-runtime pty --lib` pass. Guest probes now cover the user-visible fork cases: `fifoforkeof`, `epollforkeventfd`, and `ptyforkreopen` all pass in the local `just conformance-probes` arm64-musl gate. Target smoke coverage also passed with the same probes under Linux KVM VM 210 (`10.14.14.66`) and FreeBSD VM 200 (`10.14.14.189`) after replacing `/root/carrick` with commit `7e5fa359`.
 
 ## Task 4: Close Metadata And Sidecar Leaks
 
@@ -185,10 +185,10 @@ This plan is therefore a master remediation ledger. Each task below is an indepe
 - [x] Add a NetBSD build gate that proves `ptsname_r` no longer hard-links from runtime code when absent.
 - [x] Implement NetBSD `pid_info` and `parent_pid` from a clean host API source, or return a documented Linux-compatible absence only for inaccessible non-guest processes.
 - [x] Add FreeBSD and NetBSD `self_thread_cpu_us` support if host APIs provide per-thread accounting; otherwise document why `RUSAGE_THREAD` parity cannot be claimed on that host.
-- [ ] Verify with target-host `cargo build -p carrick-cli --no-default-features --features platform-netbsd` and `platform-freebsd`.
+- [x] Verify with target-host `cargo build -p carrick-cli --no-default-features --features platform-freebsd`; defer `platform-netbsd` per user direction.
 - [x] Commit as `fix(portable): gate bsd host introspection`.
 
-**Local evidence:** `cargo check -p carrick-portable`, `cargo check -p carrick-portable --target x86_64-unknown-freebsd`, `cargo check -p carrick-portable --target x86_64-unknown-netbsd`, `cargo check -p carrick-host`, `cargo check -p carrick-host --target x86_64-unknown-freebsd`, `cargo check -p carrick-host --target x86_64-unknown-netbsd`, `cargo check -p carrick-runtime --lib`, and `cargo test -p carrick-host --lib` pass. Full `carrick-runtime`/`carrick-cli` FreeBSD and NetBSD cross-checks from macOS remain blocked before Carrick code by `ring` needing target C headers/toolchains (`assert.h` missing for FreeBSD, `x86_64--netbsd-gcc` missing for NetBSD); run those on the target hosts.
+**Evidence:** `cargo check -p carrick-portable`, `cargo check -p carrick-portable --target x86_64-unknown-freebsd`, `cargo check -p carrick-portable --target x86_64-unknown-netbsd`, `cargo check -p carrick-host`, `cargo check -p carrick-host --target x86_64-unknown-freebsd`, `cargo check -p carrick-host --target x86_64-unknown-netbsd`, `cargo check -p carrick-runtime --lib`, and `cargo test -p carrick-host --lib` pass. Full FreeBSD verification now also passes natively on VM 200 (`10.14.14.189`): `cargo check -p carrick-host-bsd --lib`, `cargo check -p carrick-portable --lib`, `cargo check -p carrick-runtime --lib --no-default-features --features platform-freebsd`, and `cargo build -p carrick-cli --no-default-features --features platform-freebsd --release` via the local `just build` recipe. NetBSD/NVMM is intentionally skipped in this execution pass per user direction.
 
 ## Task 6: Validate And Improve MAP_SHARED Semantics
 
@@ -203,14 +203,14 @@ This plan is therefore a master remediation ledger. Each task below is an indepe
 - Consumes: existing bhyve alias flush/refresh hooks and NVMM alias registration.
 
 - [x] Add a differential probe that maps a file `MAP_SHARED`, writes before and after fork, waits, and checks parent, child, and host file visibility against Docker.
-- [ ] Run the probe on HVF/KVM first to establish the known-good model.
+- [x] Run the probe on HVF/KVM first to establish the known-good model.
 - [x] Run or queue the same probe on bhyve and NVMM target hosts.
 - [x] For bhyve, verify existing `flush_shm_aliases` and `refresh_shared_after_wait` cover the probe; close any missing exit/wait/vfork path.
 - [x] For NVMM, decide whether writable aliases can use true registered HVA or need the same file-mediated flush/refresh path.
 - [x] Convert remaining unsupported cases into capability checks that fail loudly with a Linux errno or documented baseline gap, not silent incoherence.
 - [x] Commit as `test(conformance): probe shared file writeback`.
 
-**Local evidence:** added `mmapfileforkwriteback`, which checks parent pre-fork writes, child post-fork writes, parent post-wait mapping visibility, and backing-file visibility for child and parent writes. `cargo check --manifest-path conformance-probes/Cargo.toml --target aarch64-unknown-linux-musl --bin mmapfileforkwriteback` and `cargo check --manifest-path conformance-probes/Cargo.toml --target x86_64-unknown-linux-musl --bin mmapfileforkwriteback` pass. Static backend review found bhyve already flushes writable file aliases at the fork barrier and child exit, then refreshes after `wait4`/`waitid`; NVMM maps writable aliases as registered host `MAP_SHARED` HVA. `cargo check -p carrick-vmm-nvmm --lib --target x86_64-unknown-netbsd` passes. `cargo check -p carrick-vmm-bhyve --lib --target x86_64-unknown-freebsd` is blocked before bhyve code by existing `carrick-observability` USDT inline-register errors on x86_64-FreeBSD cross-check. Release-linking the probe from macOS is blocked because the host `cc` is not a Linux-musl linker; run the probe with the normal probe-builder/container or target hosts.
+**Evidence:** added `mmapfileforkwriteback`, which checks parent pre-fork writes, child post-fork writes, parent post-wait mapping visibility, and backing-file visibility for child and parent writes. `cargo check --manifest-path conformance-probes/Cargo.toml --target aarch64-unknown-linux-musl --bin mmapfileforkwriteback` and `cargo check --manifest-path conformance-probes/Cargo.toml --target x86_64-unknown-linux-musl --bin mmapfileforkwriteback` pass. Local HVF `scripts/run-probe.sh mmapfileforkwriteback` matches Docker, and the full `just conformance-probes` arm64-musl gate now passes with `mmapfileforkwriteback` in the serial timing-sensitive lane. Linux KVM VM 210 (`10.14.14.66`) reports all seven booleans true. FreeBSD VM 200 initially exposed a real bhyve gap (`file_saw_parent_post=false`); `fix(bhyve): sync copied shared aliases` adds a copied-alias syscall-boundary flush, preserves `wait4`/`waitid` child-refresh ordering, restricts the per-syscall hook to backends that opt into copied-alias synchronization, and the FreeBSD probe now reports all seven booleans true. Static review still finds NVMM uses registered host `MAP_SHARED` HVA; runtime NVMM target testing is intentionally skipped with NetBSD.
 
 ## Task 7: Adopt Shared x86 Bring-Up Blobs Safely
 
@@ -228,10 +228,10 @@ This plan is therefore a master remediation ledger. Each task below is an indepe
 - [x] Make `carrick-x86::msr_init_blob` include the missing MXCSR/XCR0 sequence and any entry-register preservation needed by bhyve.
 - [x] Repoint bhyve to the shared blob and shared `run_fp_stub`.
 - [x] Remove the stale backend-local implementation duplicate; keep the compatibility wrapper until FreeBSD runtime smoke permits API cleanup.
-- [ ] Verify with `cargo test -p carrick-x86`, `cargo test -p carrick-vmm-bhyve`, and the bhyve AVX/FP signal fixtures on FreeBSD.
+- [x] Verify with `cargo test -p carrick-x86`, `cargo test -p carrick-vmm-bhyve`, and the bhyve AVX/FP signal fixtures on FreeBSD.
 - [x] Commit as `refactor(x86): share complete bringup blobs`.
 
-**Local evidence:** `carrick_x86::msr_init_blob` now emits the MXCSR mask sequence, `XSETBV(XCR0=7)`, and final RDX/RCX restore before `iretq`; new shared tests assert those byte sequences. The bhyve-local `msr_init_blob` body now delegates to `carrick_x86::msr_init_blob`, and bhyve already used `carrick_x86::fp_stub_bytes` and `carrick_x86::run_fp_stub`. `cargo test -p carrick-x86 --lib` and `cargo check -p carrick-vmm-bhyve --lib` pass locally. `cargo test -p carrick-vmm-bhyve --lib` has zero tests on this aarch64 macOS host because bhyve x86 modules are target-gated; FreeBSD runtime smoke and AVX/FP signal fixtures remain target-host gates.
+**Evidence:** `carrick_x86::msr_init_blob` now emits the MXCSR mask sequence, `XSETBV(XCR0=7)`, and final RDX/RCX restore before `iretq`; new shared tests assert those byte sequences. The bhyve-local `msr_init_blob` body now delegates to `carrick_x86::msr_init_blob`, and bhyve already used `carrick_x86::fp_stub_bytes` and `carrick_x86::run_fp_stub`. `cargo test -p carrick-x86 --lib` passes locally. FreeBSD VM 200 (`10.14.14.189`) passes `cargo test -p carrick-vmm-bhyve --lib` with 32 tests and the bhyve runtime smoke `forkfpreclaim` (`workers_ok=180 forks_reaped=30`, `FORKFPRECLAIM_DONE`).
 
 ## Task 8: Rationalize Timer Delivery Duplication
 
@@ -249,10 +249,10 @@ This plan is therefore a master remediation ledger. Each task below is an indepe
 - [x] Confirm current duplication is byte-equivalent after comments and host-specific names are ignored.
 - [x] Extract only the shared arm/disarm helper; keep backend-specific kqueue/no-kqueue decisions local.
 - [x] Preserve existing semantics: process-directed signal publication plus `kick_all`.
-- [ ] Verify timer unit tests and a guest POSIX timer smoke under HVF/KVM plus target BSD lane if available.
+- [x] Verify timer unit tests and a guest POSIX timer smoke under HVF/KVM plus target BSD lane if available.
 - [x] Commit as `refactor(timer): share fallback posix delivery`.
 
-**Local evidence:** KVM, bhyve, and NVMM all now call `carrick_hal::timer_delivery::arm_fallback_posix_timer` / `disarm_fallback_posix_timer`; interval-timer `arm_itimer` policy remains backend-local. The helper keeps the prior POSIX sequence: `carrick_timer_core::posix::arm`, spawn `carrick-ptimer-{id}`, `publish_process_signal(signum)`, and `kick_all()`. New HAL test `fallback_posix_timer_publishes_process_signal_and_kicks_all` proves the shared helper publishes the process pending signal and kicks the registry. Verification passed: `cargo test -p carrick-hal fallback_posix_timer_publishes_process_signal_and_kicks_all --lib -- --test-threads=1`, `cargo test -p carrick-hal --lib -- --test-threads=1`, `cargo test -p carrick-timer-core --lib -- --test-threads=1`, `cargo check -p carrick-vmm-kvm --lib`, `cargo check -p carrick-vmm-bhyve --lib`, `cargo check -p carrick-vmm-nvmm --lib`, `cargo check --manifest-path conformance-probes/Cargo.toml --target aarch64-unknown-linux-musl --bin posixtimers`, and the same `posixtimers` check for `x86_64-unknown-linux-musl`. Live HVF/KVM/BSD guest smoke remains a target-host runtime gate, not run in this local refactor step.
+**Evidence:** KVM, bhyve, and NVMM all now call `carrick_hal::timer_delivery::arm_fallback_posix_timer` / `disarm_fallback_posix_timer`; interval-timer `arm_itimer` policy remains backend-local. The helper keeps the prior POSIX sequence: `carrick_timer_core::posix::arm`, spawn `carrick-ptimer-{id}`, `publish_process_signal(signum)`, and `kick_all()`. New HAL test `fallback_posix_timer_publishes_process_signal_and_kicks_all` proves the shared helper publishes the process pending signal and kicks the registry. Verification passed: `cargo test -p carrick-hal fallback_posix_timer_publishes_process_signal_and_kicks_all --lib -- --test-threads=1`, `cargo test -p carrick-hal --lib -- --test-threads=1`, `cargo test -p carrick-timer-core --lib -- --test-threads=1`, `cargo check -p carrick-vmm-kvm --lib`, `cargo check -p carrick-vmm-bhyve --lib`, `cargo check -p carrick-vmm-nvmm --lib`, `cargo check --manifest-path conformance-probes/Cargo.toml --target aarch64-unknown-linux-musl --bin posixtimers`, and the same `posixtimers` check for `x86_64-unknown-linux-musl`. Guest `posixtimers` smoke now passes under local HVF, Linux KVM VM 210, and FreeBSD VM 200.
 
 ## Task 9: Fix Or Fence BSD Epoll/OFD Semantics
 
@@ -355,20 +355,24 @@ This plan is therefore a master remediation ledger. Each task below is an indepe
 - [x] Update this plan with completed task links and any intentionally deferred limitations.
 
 **Final evidence:** the code-bearing branch state through
-`de134590cb8845e719dd3a0e48f6acdf5f157962` passes `just fmt-check`, `just
-clippy`, `just test`, `just test-integration`, and `just conformance-probes`.
-The conformance probe run rebuilt and signed `target/release/carrick` and passed
-`arm64:musl:siglongjmpaltstack`; the gnu and amd64 probe sub-lanes were skipped
-because those probe binaries were not built, matching the existing local harness
-behavior.
+`7e5fa3593` passes `just fmt-check`, `just clippy`, `just test`,
+`just test-integration`, and `just conformance-probes`. The final probe gate
+rebuilt and signed `target/release/carrick`; the gating `arm64:musl` lane passed
+including `futexshare`, `futexsharedalias`, `mmapfileforkwriteback`,
+`fifoforkeof`, `epollforkeventfd`, `ptyforkreopen`, `posixtimers`,
+`siglongjmpaltstack`, and `preemptsigstorm`. The non-gating report-only lanes
+remained non-blocking: `arm64:gnu` reported 5 diffs, `amd64:musl` reported 99
+diffs, and `amd64:gnu` skipped because the gnu x86_64 probes were not built.
 
 **Target-host evidence:** `/root/carrick` was replaced on the x86 targets and
-checked at the same code-bearing state. FreeBSD VM 200 (`10.14.14.189`) passes
-`cargo check -p carrick-host-bsd --lib`, `cargo check -p carrick-portable
---lib`, and `cargo check -p carrick-runtime --lib --no-default-features
---features platform-freebsd`. Linux KVM VM 210 (`10.14.14.66`) and LXC 104
-(`10.14.14.39`) both pass `cargo check -p carrick-vmm-kvm --lib` and `cargo
-check -p carrick-runtime --lib --no-default-features --features
+checked at commit `7e5fa3593`. FreeBSD VM 200 (`10.14.14.189`) passes
+`just build`, `cargo test -p carrick-vmm-bhyve --lib`, and injected amd64-musl
+runtime probes `futexshare`, `futexsharedalias`, `mmapfileforkwriteback`, and
+`forkfpreclaim`. Linux KVM VM 210 (`10.14.14.66`) passes
+`cargo build -p carrick-cli --no-default-features --features platform-linux
+--release` and the same injected amd64-musl runtime probes. Linux LXC 104
+(`10.14.14.39`) passes compile-only gates `cargo check -p carrick-vmm-kvm --lib`
+and `cargo check -p carrick-runtime --lib --no-default-features --features
 platform-linux`.
 
 NetBSD/NVMM target-host verification is intentionally deferred per user
