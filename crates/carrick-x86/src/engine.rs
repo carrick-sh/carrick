@@ -28,7 +28,7 @@ use carrick_hal::{
 use carrick_mem::memory::{AddressSpace, LINUX_NULL_GUARD_END};
 
 use crate::bringup_fns::{self, BringupLayout, X86VcpuSnapshot};
-use crate::vmm::{X86Exit, X86FaultKind, X86Reg, X86Vcpu, X86Vmm};
+use crate::vmm::{X86_PML4_CAPACITY, X86Exit, X86FaultKind, X86Reg, X86Vcpu, X86Vmm};
 
 /// fxsave-area byte offsets (Intel SDM vol. 1 §10.5.1 "FXSAVE Area"):
 ///   MXCSR at +24, XMM0 at +160 (16 bytes each).
@@ -262,16 +262,22 @@ impl<V: X86Vmm> X86EngineCore<V> {
     }
 
     /// Whether `pc` lies inside carrick's supervisor-only kernel window (LSTAR
-    /// trampoline, GDT, PML4 tables, fault IDT/stubs/TSS/stacks/records). Every
-    /// backend lays the window out contiguously from `trampoline_base` (KVM
-    /// `guest_setup_x86`, bhyve, NVMM), with the fault tables appended last —
-    /// see [`crate::fault::add_fault_windows`]. A signal context must NEVER
-    /// capture such a PC: the pages are supervisor-only, so a `rt_sigreturn`
-    /// resuming there at ring 3 takes an instruction-fetch #PF (SEGV_ACCERR).
+    /// trampoline, GDT, PML4 tables, fault IDT/stubs/TSS/stacks/records). A
+    /// signal context must NEVER capture such a PC: the pages are supervisor-only,
+    /// so a `rt_sigreturn` resuming there at ring 3 takes an instruction-fetch
+    /// #PF (SEGV_ACCERR).
     fn is_kernel_window_pc(&self, pc: u64) -> bool {
-        let end =
+        fn contains(pc: u64, start: u64, len: u64) -> bool {
+            pc >= start && pc < start.saturating_add(len)
+        }
+
+        let fault_start = crate::fault::fault_idt_base(self.layout);
+        let fault_end =
             crate::fault::fault_record_base(self.layout) + crate::fault::X86_FAULT_SLOTS * 4096;
-        pc >= self.layout.trampoline_base && pc < end
+        contains(pc, self.layout.trampoline_base, 0x1000)
+            || contains(pc, self.layout.gdt_base, 0x1000)
+            || contains(pc, self.layout.pml4_base, X86_PML4_CAPACITY)
+            || (pc >= fault_start && pc < fault_end)
     }
 
     fn sysret_resume_at(&self, live_rip: u64) -> Option<SysretResume> {
@@ -1795,6 +1801,42 @@ mod tests {
         assert!(
             engine.vcpu.exits.is_empty(),
             "both scripted exits consumed (kick swallowed, syscall trapped)"
+        );
+    }
+
+    /// Bhyve keeps the LSTAR trampoline high while the PML4/fault-table window is
+    /// low. The kernel-window guard must still catch the trampoline page instead
+    /// of assuming one contiguous range from `trampoline_base` through the low
+    /// fault tables.
+    #[test]
+    fn kick_at_split_layout_doorbell_out_is_swallowed() {
+        let layout = BringupLayout {
+            trampoline_base: 0x002d_0000_0000,
+            gdt_base: 0x0050_0000,
+            pml4_base: 0x0060_0000,
+        };
+        let vcpu = TestVcpu {
+            rcx: 0x0040_9999,
+            r11: 0x246,
+            rip: layout.trampoline_base,
+            rflags: 0x2,
+            exits: [X86Exit::Kicked, plain_syscall_exit(layout.trampoline_base)].into(),
+            ..Default::default()
+        };
+        let mut engine = X86EngineCore::from_parts(TestVmm, vcpu, layout);
+        engine.sysret_resume = Some(SysretResume {
+            user_pc: 0x0040_1111,
+            user_rflags: 0x246,
+        });
+
+        let trapped = engine.next_syscall().expect("next_syscall");
+        assert!(
+            trapped.is_some(),
+            "split-layout trampoline kicks must be swallowed until the doorbell traps"
+        );
+        assert!(
+            engine.vcpu.exits.is_empty(),
+            "the kick was swallowed and the following syscall trapped"
         );
     }
 

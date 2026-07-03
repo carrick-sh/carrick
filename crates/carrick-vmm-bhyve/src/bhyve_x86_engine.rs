@@ -92,6 +92,12 @@ pub const BHYVE_X86_LAYOUT: BringupLayout = BringupLayout {
     pml4_base: X86_PML4_GPA,
 };
 
+const BHYVE_X86_SYSRET_RIP: u64 = carrick_mem::memory::LINUX_EL0_TRAMPOLINE_BASE + 2;
+
+fn should_surface_bhyve_kick(rip: u64, cs: u64) -> bool {
+    (cs & 3) == 3 || rip == BHYVE_X86_SYSRET_RIP
+}
+
 /// The per-thread CPU registers captured/restored across an M:N reclaim re-bind:
 /// the 16 GPRs + RIP + RFLAGS. Process-wide control regs (CR0/3/4, EFER, CS) are
 /// NOT included — identical across the process's threads, they persist on the
@@ -843,6 +849,11 @@ impl X86Vcpu for BhyveX86Vcpu {
                 // a spurious VT-x BOGUS just re-runs the guest.
                 NativeExit::Bogus => {
                     if self.h.kick_pending.swap(false, Ordering::SeqCst) {
+                        let rip = self.get_raw(VM_REG_GUEST_RIP)?;
+                        let cs = self.get_raw(VM_REG_GUEST_CS)?;
+                        if !should_surface_bhyve_kick(rip, cs) {
+                            continue;
+                        }
                         return Ok(X86Exit::Kicked);
                     }
                     // Spurious BOGUS with no pending kick: re-run the guest.
@@ -851,7 +862,12 @@ impl X86Vcpu for BhyveX86Vcpu {
                 // A cross-thread kick that returned EINTR.
                 NativeExit::Kicked => {
                     self.h.kick_pending.store(false, Ordering::SeqCst);
+                    let rip = self.get_raw(VM_REG_GUEST_RIP)?;
+                    let cs = self.get_raw(VM_REG_GUEST_CS)?;
                     self.h.started.store(false, Ordering::SeqCst);
+                    if !should_surface_bhyve_kick(rip, cs) {
+                        continue;
+                    }
                     return Ok(X86Exit::Kicked);
                 }
                 NativeExit::Hlt => return Ok(X86Exit::Halt),
@@ -2159,6 +2175,27 @@ pub fn engine_from_brought_up(bux: BroughtUpX86) -> X86EngineCore<BhyveVmm> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::guest_setup_x86::X86_INIT_BLOB_GPA;
+
+    #[test]
+    fn bhyve_ring0_kicks_are_swallowed_except_sysret() {
+        assert!(
+            !should_surface_bhyve_kick(X86_INIT_BLOB_GPA, 0x8),
+            "ring-0 init-blob kicks must re-enter"
+        );
+        assert!(
+            !should_surface_bhyve_kick(BHYVE_X86_LAYOUT.trampoline_base, 0x8),
+            "ring-0 LSTAR OUT kicks must re-enter until the doorbell traps"
+        );
+        assert!(
+            should_surface_bhyve_kick(BHYVE_X86_SYSRET_RIP, 0x8),
+            "SYSRET kicks surface so the shared engine can synthesize user context"
+        );
+        assert!(
+            should_surface_bhyve_kick(0x1000_1b25b, u64::from(USER_CS64_SEL)),
+            "ordinary ring-3 kicks surface for async signal delivery"
+        );
+    }
 
     /// A futex-word key resolves to a STABLE mirror slot (open-addressing claims it
     /// once and re-finds it thereafter).
