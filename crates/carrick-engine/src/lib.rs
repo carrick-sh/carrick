@@ -115,6 +115,9 @@ pub struct CliRunRequest {
     pub max_traps: usize,
     pub debug_state_path: Option<String>,
     pub fs: Option<FsBackendKind>,
+    /// Docker `--pull` policy for image resolution (`always`/`missing`/`never`).
+    /// Defaults to `Missing` (pull only when the image is absent locally).
+    pub pull: carrick_image::PullPolicy,
     /// PID namespace mode (`docker run --pid`). Defaults to `Private`.
     pub pid: PidMode,
     pub network: NetworkMode,
@@ -462,7 +465,7 @@ impl Engine {
         };
         let resolved = self
             .store
-            .resolve_with_platform(&image_ref, &target)
+            .resolve_with_platform_and_policy(&image_ref, &target, req.pull)
             .await
             .map_err(|e| anyhow::anyhow!("failed to resolve image: {}", e))?;
 
@@ -513,6 +516,7 @@ mod tests {
             max_traps: 100,
             debug_state_path: None,
             fs: Some(FsBackendKind::Host),
+            pull: carrick_image::PullPolicy::Missing,
             pid: PidMode::default(),
             network: NetworkMode::Host,
             network_bridge: None,
@@ -690,6 +694,7 @@ mod tests {
             max_traps: 100,
             debug_state_path: None,
             fs: Some(FsBackendKind::Host),
+            pull: carrick_image::PullPolicy::Missing,
             pid: PidMode::default(),
             network: NetworkMode::Host,
             network_bridge: None,
@@ -737,6 +742,7 @@ mod tests {
             max_traps: 100,
             debug_state_path: None,
             fs: Some(FsBackendKind::Host),
+            pull: carrick_image::PullPolicy::Missing,
             pid: PidMode::default(),
             network: NetworkMode::Host,
             network_bridge: None,
@@ -783,6 +789,7 @@ mod tests {
             max_traps: 100,
             debug_state_path: None,
             fs: Some(FsBackendKind::Host),
+            pull: carrick_image::PullPolicy::Missing,
             pid: PidMode::default(),
             network: NetworkMode::Host,
             network_bridge: None,
@@ -829,6 +836,7 @@ mod tests {
             max_traps: 100,
             debug_state_path: None,
             fs: Some(FsBackendKind::Host),
+            pull: carrick_image::PullPolicy::Missing,
             pid: PidMode::default(),
             network: NetworkMode::Host,
             network_bridge: None,
@@ -884,6 +892,7 @@ mod tests {
             max_traps: 100,
             debug_state_path: None,
             fs: Some(FsBackendKind::Host),
+            pull: carrick_image::PullPolicy::Missing,
             pid: PidMode::default(),
             network: NetworkMode::Host,
             network_bridge: None,
@@ -928,6 +937,7 @@ mod tests {
                 max_traps: 100,
                 debug_state_path: None,
                 fs: Some(FsBackendKind::Host),
+                pull: carrick_image::PullPolicy::Missing,
                 pid: PidMode::default(),
                 network: NetworkMode::Host,
                 network_bridge: None,

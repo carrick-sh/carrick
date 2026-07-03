@@ -360,6 +360,8 @@ fn rebuild_request_from_state(state: &ContainerState) -> carrick_engine::CliRunR
         .or(state.name.as_deref());
     carrick_engine::CliRunRequest {
         image_ref: state.image.clone(),
+        // Restart/exec reuses the already-resolved image; no re-pull.
+        pull: carrick_image::PullPolicy::Missing,
         platform: c.platform.clone(),
         args: state.command.clone(),
         env_overrides: c.env.clone(),
@@ -1151,6 +1153,8 @@ pub(crate) fn exec(
 
     let req = carrick_engine::CliRunRequest {
         image_ref: state.image.clone(),
+        // Restart/exec reuses the already-resolved image; no re-pull.
+        pull: carrick_image::PullPolicy::Missing,
         platform: state.config.platform.clone(),
         args: command,
         env_overrides,
