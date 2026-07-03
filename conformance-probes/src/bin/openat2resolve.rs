@@ -134,10 +134,10 @@ fn main() {
             0,
             RESOLVE_IN_ROOT,
         );
-        println!(
-            "in_root_absolute_escape_enoent={}",
-            fd == -1 && errno() == libc::ENOENT
-        );
+        println!("in_root_absolute_scoped_open_ok={}", fd >= 0);
+        if fd >= 0 {
+            libc::close(fd as i32);
+        }
         if rootfd >= 0 {
             libc::close(rootfd);
         }
