@@ -10,9 +10,51 @@
 //! `signum`/`si_value` for a POSIX timer are captured at `timer_create` (carried
 //! on the slot), NOT at arm time — so `arm_posix` takes only `id` + the
 //! value/interval spec, matching `carrick_timer_core::posix::arm`.
+use std::sync::Arc;
+
+use crate::threaded::VcpuRegistry;
+
 pub use carrick_timer_core::TimerSpecNs;
 pub use carrick_timer_core::itimer::TimerArm;
 pub use carrick_timer_core::posix::PosixTimerSpec;
+
+/// Arm a POSIX per-process timer using the shared fallback firing thread.
+///
+/// KVM, bhyve, and NVMM all lack the HVF kqueue timer pump path, so their
+/// delivery sequence is identical: mutate the neutral timer-core slot, spawn a
+/// per-arm fallback thread, publish the process-directed Linux signal, and kick
+/// every vCPU so any unblocked guest thread can observe it.
+pub fn arm_fallback_posix_timer(
+    id: i32,
+    spec: TimerSpecNs,
+    kicker: &Arc<dyn VcpuRegistry>,
+) -> Option<PosixTimerSpec> {
+    let armed = carrick_timer_core::posix::arm(id, spec)?;
+    if spec.value > 0 {
+        let signum = armed.signum;
+        let generation = armed.generation;
+        let slot = armed.slot.clone();
+        let kicker = Arc::clone(kicker);
+        let on_fire = move || {
+            carrick_signal_core::publish_process_signal(signum);
+            kicker.kick_all();
+        };
+        let _ = std::thread::Builder::new()
+            .name(format!("carrick-ptimer-{id}"))
+            .spawn(move || {
+                carrick_timer_core::posix::run_fallback(slot, generation, spec, on_fire);
+            });
+    }
+    Some(armed.old)
+}
+
+/// Disarm a POSIX timer driven by [`arm_fallback_posix_timer`].
+///
+/// `TimerSpecNs::DISARM` bumps the timer-core generation, causing any in-flight
+/// fallback thread to retire before it can publish another signal.
+pub fn disarm_fallback_posix_timer(id: i32) {
+    let _ = carrick_timer_core::posix::arm(id, TimerSpecNs::DISARM);
+}
 
 pub trait TimerDelivery: Send + Sync {
     /// Arm interval timer `which`. The neutral slot state is written by the
@@ -49,4 +91,60 @@ pub trait TimerDelivery: Send + Sync {
     /// `EVFILT_TIMER` on the fresh pump kq; KVM re-spawns the fallback thread).
     /// `None` if `which` is disarmed.
     fn current_arm(&self, which: usize) -> Option<TimerArm>;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
+
+    use super::*;
+    use crate::{GenericVcpuRegistry, ThreadId, VcpuKickDyn};
+
+    struct CountingKick(Arc<AtomicU64>);
+
+    impl VcpuKickDyn for CountingKick {
+        fn kick(&self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn fallback_posix_timer_publishes_process_signal_and_kicks_all() {
+        carrick_timer_core::posix::clear();
+        carrick_signal_core::clear_proc_pending();
+
+        let kicks = Arc::new(AtomicU64::new(0));
+        let registry = Arc::new(GenericVcpuRegistry::new());
+        registry.register(
+            ThreadId::synthetic_for_tests(1),
+            Box::new(CountingKick(Arc::clone(&kicks))),
+        );
+        let kicker: Arc<dyn VcpuRegistry> = registry;
+        let id = carrick_timer_core::posix::create(0, 14);
+
+        let old = arm_fallback_posix_timer(
+            id,
+            TimerSpecNs {
+                value: 1_000_000,
+                interval: 0,
+            },
+            &kicker,
+        )
+        .expect("known timer id should arm");
+
+        assert_eq!(old.signum, 14);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while kicks.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        assert_eq!(kicks.load(Ordering::SeqCst), 1);
+        assert_eq!(carrick_signal_core::take_process_pending(), 14);
+
+        disarm_fallback_posix_timer(id);
+        let _ = carrick_timer_core::posix::delete(id);
+        carrick_signal_core::clear_proc_pending();
+    }
 }
