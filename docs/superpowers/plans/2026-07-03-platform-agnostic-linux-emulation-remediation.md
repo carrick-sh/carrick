@@ -135,14 +135,16 @@ This plan is therefore a master remediation ledger. Each task below is an indepe
 - Produces: fork-aware cleanup hooks for process-local registries.
 - Consumes: existing dispatcher fork lifecycle, fd close paths, and `PtyTable::free_if_owner`.
 
-- [ ] Add a small `ForkLocalRegistry` pattern or explicit `after_fork_child` functions for FIFO beacon, epoll wake fd registry, and PTY table state.
-- [ ] Register those hooks at the existing post-fork child reset point.
-- [ ] For FIFO beacons, close inherited beacon write fds in children that do not own the guest writer fd, or key beacon writer entries by owner pid and ignore stale child copies.
-- [ ] For epoll wake fds, clear inherited wake registries in fork children before any child fd close/reallocation can make stale fd numbers dangerous.
-- [ ] For PTYs, keep `owner_pid` as the authority and add tests proving child close/open cannot resurrect or expose a freed parent PTY.
-- [ ] Verify with `cargo test -p carrick-runtime fifo_beacon epoll pty`.
+- [x] Add explicit `after_fork_child` functions for FIFO beacon and epoll wake fd registry, plus PTY table owner-state coverage.
+- [x] Register those hooks at the existing post-fork child reset point.
+- [x] For FIFO beacons, close inherited beacon write fds in children that do not own the guest writer fd, or key beacon writer entries by owner pid and ignore stale child copies.
+- [x] For epoll wake fds, clear inherited wake registries in fork children before any child fd close/reallocation can make stale fd numbers dangerous.
+- [x] For PTYs, keep `owner_pid` as the authority and add tests proving child close/open cannot resurrect or expose a freed parent PTY.
+- [x] Verify with `cargo test -p carrick-runtime fifo_beacon epoll pty`.
 - [ ] Add guest probes for the three user-visible fork cases and run `just conformance-probes` after codesigned build.
-- [ ] Commit as `fix(runtime): reset fork-local fd registries`.
+- [x] Commit as `fix(runtime): reset fork-local fd registries`.
+
+**Local evidence:** `cargo test -p carrick-runtime fifo_beacon --lib`, `cargo test -p carrick-runtime epoll --lib`, and `cargo test -p carrick-runtime pty --lib` pass. Guest fork probes and `just conformance-probes` remain open.
 
 ## Task 4: Close Metadata And Sidecar Leaks
 
