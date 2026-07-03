@@ -172,6 +172,7 @@ ci:
     j clippy
     j lint-domains
     j deny
+    j check-matrix
     if [ "{{os()}}" = "macos" ]; then
         j check --workspace
     else
@@ -211,6 +212,13 @@ conformance-kvm *ARGS:
 # Re-render docs/support-matrix.md from the latest results (no run).
 matrix:
     cargo run -p carrick-conformance -- --render-matrix
+
+# Drift gate: docs/support-matrix.md must equal a fresh render of the checked-in
+# baseline (scripts/conformance/baseline.jsonl). Deterministic, no conformance
+# run — catches a hand-edited matrix or a baseline/render-logic change that
+# forgot to re-render. Runs inside `just ci`.
+check-matrix:
+    cargo run -p carrick-conformance -- --check-matrix
 
 # Deterministic, line-exact ABI probe gate vs Docker (the precise gate; self-skips).
 # On the x86_64 fleet the AMD64 probe sets are built NATIVELY here (cheap: host
