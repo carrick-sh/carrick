@@ -6142,13 +6142,37 @@ impl SyscallDispatcher {
                     (read_len, bytes)
                 }
                 OpenDescription::SyntheticFile {
-                    contents, offset, ..
+                    path,
+                    contents,
+                    offset,
+                    ..
                 } => {
-                    let remaining: &[u8] = contents.get(*offset..).unwrap_or(&[]);
-                    let read_len = remaining.len().min(length);
-                    let bytes = remaining[..read_len].to_vec();
-                    *offset += read_len;
-                    (read_len, bytes)
+                    // `/proc/<pid>/mem` for the guest's own process is a synthetic
+                    // file whose reads translate the file offset as a GUEST VIRTUAL
+                    // ADDRESS and return that process's memory there (debuggers +
+                    // LTP read their own mappings this way). An unmapped VA is EIO,
+                    // like Linux. Every OTHER synthetic file serves its precomputed
+                    // byte blob.
+                    if crate::vfs::proc::is_proc_self_mem_path(path) {
+                        let va = *offset as u64;
+                        match memory.read_bytes(va, length) {
+                            Ok(bytes) => {
+                                let read_len = bytes.len();
+                                *offset += read_len;
+                                (read_len, bytes)
+                            }
+                            Err(_) => {
+                                drop(open);
+                                return Ok(DispatchOutcome::errno(carrick_abi::LINUX_EIO));
+                            }
+                        }
+                    } else {
+                        let remaining: &[u8] = contents.get(*offset..).unwrap_or(&[]);
+                        let read_len = remaining.len().min(length);
+                        let bytes = remaining[..read_len].to_vec();
+                        *offset += read_len;
+                        (read_len, bytes)
+                    }
                 }
                 OpenDescription::EventFd {
                     base,
