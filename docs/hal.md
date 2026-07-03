@@ -145,6 +145,44 @@ register access, guest memory access, signal/timer delivery, and vCPU
 coordination. The runtime owns the dispatcher and calls through the trait
 surfaces exposed by `carrick-hal`.
 
+## HAL Contract Classification
+
+The portability audit called out several HAL surfaces that look more generic
+than they really are. The current rule is:
+
+- `SyscallTrap`, `ThreadedEngine`, `GuestVmBackend`, `PlatformFutex`, and
+  `EventMultiplexer` are load-bearing runtime contracts. Runtime code should be
+  able to drive a backend through these without naming HVF, KVM, bhyve, or NVMM.
+- `HvVm` / `HvVcpu` are raw hypervisor adapter traits used where they remove
+  real duplication. KVM implements them for its VM/vCPU wrappers; bhyve also has
+  a raw adapter where it fits. HVF intentionally drives `applevisor` directly
+  because its lifecycle, vCPU coordination, and codesign-bound entitlement model
+  do not currently share useful code through the raw trait. Do not treat missing
+  HVF `HvVm` / `HvVcpu` impls as a correctness blocker by themselves.
+- `Reg` / `SysReg` and `RegAccess` are the sigframe/trap-loop register adapter,
+  not a promise that every engine supports every register variant. ISA-specific
+  engines expose narrower native surfaces (`Aarch64Vcpu`, `X86Vcpu`,
+  `X86Reg`-style backend helpers) and translate at the shared sigframe or raw
+  hypervisor boundary. Add new register variants only when a shared boundary
+  truly needs them.
+- `TrapError::EL0Fault` and `TrapError::GuestAtEl1` are AArch64 diagnostic
+  payloads. The generic threaded runtime lowers guest-deliverable AArch64 faults
+  to `GuestFault`; x86 backends emit `GuestFault` directly with an already
+  resolved Linux signal triple.
+- `SyscallTrap::set_memory_model` is the guest Linux memory-model syscall hook.
+  HVF uses it to program Apple Silicon TSO state for Rosetta-style guests;
+  non-HVF backends keep the no-op default. It should not grow into a generic raw
+  hypervisor capability surface.
+- `InjectParams` is intentionally still the sigframe input bundle, but its
+  architecture-specific fields should not spread beyond the per-ISA sigframe
+  builders. Split it only when a concrete caller can depend on a smaller
+  associated sigframe trait without forcing a shotgun rewrite through
+  `GuestArch`.
+- `GuestArch` is a monomorphized guest-ISA bundle. It already factors page-table
+  format and syscall tables into associated traits. Do not split it just for
+  aesthetics; split only when an engine or runtime call site needs one focused
+  capability without the rest of the bundle.
+
 ---
 
 ## Guest ISA Split

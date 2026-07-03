@@ -1,8 +1,12 @@
-//! The raw hypervisor layer: a backend-agnostic vCPU/VM surface.
+//! The raw hypervisor layer: a backend-agnostic vCPU/VM surface where it removes
+//! real backend duplication.
 //!
-//! KVM implements these in `carrick-vmm-kvm`. HVF adoption is deferred —
-//! `HvfTrapEngine` keeps driving `applevisor` directly — so on macOS these
-//! traits are defined but unimplemented in this spec.
+//! KVM implements these in `carrick-vmm-kvm`; bhyve implements them where the
+//! raw VM/vCPU shape fits its libvmmapi surface. HVF adoption is intentionally
+//! not a goal by itself: `HvfTrapEngine` drives `applevisor` directly because
+//! its lifecycle and vCPU coordination are currently better expressed at the
+//! engine level (`SyscallTrap` / `ThreadedEngine`) than through this raw trait.
+//! Treat this module as an adapter seam, not the required portability boundary.
 
 use crate::error::{MemPerms, OsError, Reg, SysReg};
 use carrick_mem::memory::AddressSpace;
