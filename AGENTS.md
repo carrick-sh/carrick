@@ -319,12 +319,32 @@ Use **real debuggers, not `eprintln!`** — and never ship debug spam. Full guid
 
 ## Commits, hooks & CI
 
-- **Conventional Commits: `type(scope): subject`** (imperative, lowercase, no
-  trailing period). Types in use: `feat`, `fix`, `refactor`, `docs`, `test`,
-  `diagnostics`. Real scopes: `bhyve`, `kvm`, `nvmm`, `runtime`, `conformance`,
-  `hal`, `host`, `bsd`, `linux`, `abi`, `arch`, `portable`, `x86`. Scope is
-  optional. End agent commits with a `Co-Authored-By:` trailer.
+- **Subject — Conventional Commits: `type(scope): subject`** (imperative,
+  lowercase, no trailing period, ≤~72 chars). Types in use: `feat`, `fix`,
+  `refactor`, `docs`, `test`, `diagnostics`. Real scopes: `bhyve`, `kvm`, `nvmm`,
+  `runtime`, `conformance`, `hal`, `host`, `bsd`, `linux`, `abi`, `arch`,
+  `portable`, `x86`. Scope is optional.
   - e.g. `feat(runtime): run x86_64 oci images on kvm`, `diagnostics(kvm): report registers on internal errors`.
+- **Body — write one; a lone subject line is NOT our style.** Reserve one-line
+  commits for the genuinely trivial (a typo, a version bump). Anything that
+  changes behaviour gets a blank line then a wrapped (~72-col) body a reviewer
+  can follow WITHOUT reading the diff. Cover, in order:
+  - **Why** — the root cause / the wrong behaviour and the Linux (or host)
+    semantics being matched. Name what broke and for whom — a workload, an LTP
+    case, a probe — never just "fix bug".
+  - **What** — the approach, plus any deliberate approximation or divergence from
+    exact Linux behaviour (be candid — honest status framing applies to commit
+    messages too, not just docs).
+  - **Verified** — how you proved it: the probe name, unit test, LTP case, or
+    Docker-oracle diff. "Definition of Done = live-verified end-to-end" — the
+    body is where you show the receipts; a red-first probe is worth naming.
+  - `-` bullets when a fix has distinct parts; prose for a single change. Write
+    symbols/paths as backticked identifiers so the message greps.
+- **Trailer — end agent commits with a `Co-Authored-By:`** crediting the agent
+  (model or tool) that did the work, one line after a blank line, matching the
+  surrounding history — e.g. `Co-Authored-By: Codex <codex@openai.com>`. When
+  rewording another agent's commits, reword the message but PRESERVE the original
+  author (reword, don't re-author).
 - **Hooks** (install once with `just install-hooks`): pre-commit runs `fmt-check`,
   pre-push runs `clippy`. **Never `git commit --no-verify`** to skip the fmt hook —
   if `fmt-check` fails, run `just fmt` and fix it. (If `cargo fmt` touches
