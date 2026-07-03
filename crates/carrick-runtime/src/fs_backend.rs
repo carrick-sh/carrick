@@ -1322,6 +1322,17 @@ pub struct HostFsBackend {
     /// `umount2(MNT_DETACH)`s it before the `TempDir` removes the scratch.
     /// Linux-only; always `None` on macOS (clonefile is already O(1)).
     overlay_mount: Option<std::path::PathBuf>,
+    /// Fork-coherent cache of `watch_fds`' path RESOLUTION — the (kind, resolved
+    /// host-relative path) that `lookup_kind` + `resolve_following` compute via
+    /// cap-std `symlink_metadata` (an openat-per-component walk). LTP
+    /// `tst_fuzzy_sync` tests re-run `inotify_add_watch` on the SAME path ~158k
+    /// times; caching this elides the walk, while `open_host_watch_fd` still
+    /// opens the kqueue fd fresh. Each entry is stamped with the shared fs
+    /// generation ([`crate::fs_resolve_cache`]) and served only while it still
+    /// matches, so a structural mutation in ANY process invalidates it. No fds
+    /// are cached, so — unlike `stat_cache` — it needs no per-pid drop. Value is
+    /// (stamped fs generation, resolved host-relative path).
+    watch_res_cache: parking_lot::Mutex<std::collections::HashMap<String, (u64, PathBuf)>>,
 }
 
 /// A cached `RealStat` plus the snapshot needed to revalidate it cheaply. The
@@ -1511,6 +1522,7 @@ impl HostFsBackend {
             cache_pid: std::sync::atomic::AtomicU32::new(0),
             use_stat_cache: stat_cache_enabled(),
             overlay_mount: None,
+            watch_res_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -1550,6 +1562,7 @@ impl HostFsBackend {
             cache_pid: std::sync::atomic::AtomicU32::new(0),
             use_stat_cache: stat_cache_enabled(),
             overlay_mount: None,
+            watch_res_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -3615,15 +3628,50 @@ impl FsBackend for HostFsBackend {
             ._scratch
             .as_ref()
             .ok_or(crate::linux_abi::LINUX_ENOSYS)?;
-        let kind = self
-            .lookup_kind(path)
-            .ok_or(crate::linux_abi::LINUX_ENOENT)?;
-        if matches!(kind, OverlayEntryKind::Deleted) {
-            return Err(crate::linux_abi::LINUX_ENOENT);
-        }
-        let normalized = self
-            .resolve_following(path)
-            .ok_or(crate::linux_abi::LINUX_EINVAL)?;
+        // Resolution cache: `inotify_add_watch` re-resolves the SAME path every
+        // iteration in the LTP fuzzy-sync loop, and `lookup_kind` +
+        // `resolve_following` each do a cap-std openat-per-component walk. Serve
+        // a cached resolved path while the shared fs generation is unchanged (a
+        // structural mutation in ANY process bumps it); the kqueue watch fd
+        // itself still opens fresh below. Sample the generation at entry for the
+        // store stamp, but validate a hit against the FRESH current generation
+        // so a mutation between entry and lookup also invalidates.
+        let gen_at_entry = crate::fs_resolve_cache::current_generation();
+        let cached = {
+            let now = crate::fs_resolve_cache::current_generation();
+            self.watch_res_cache
+                .lock()
+                .get(path)
+                .filter(|(g, _)| *g == now)
+                .map(|(_, n)| n.clone())
+        };
+        let normalized = match cached {
+            // A cached hit is never a tombstone — we don't store those.
+            Some(n) => n,
+            None => {
+                let kind = self
+                    .lookup_kind(path)
+                    .ok_or(crate::linux_abi::LINUX_ENOENT)?;
+                if matches!(kind, OverlayEntryKind::Deleted) {
+                    // Don't cache the tombstone — a re-create bumps the
+                    // generation and this re-resolves anyway.
+                    return Err(crate::linux_abi::LINUX_ENOENT);
+                }
+                let normalized = self
+                    .resolve_following(path)
+                    .ok_or(crate::linux_abi::LINUX_EINVAL)?;
+                {
+                    let mut guard = self.watch_res_cache.lock();
+                    // Bound it: distinct watched paths are normally few, but a
+                    // path-diverse guest must not grow this without limit.
+                    if guard.len() >= 8192 && !guard.contains_key(path) {
+                        guard.clear();
+                    }
+                    guard.insert(path.to_owned(), (gen_at_entry, normalized.clone()));
+                }
+                normalized
+            }
+        };
         let host_path = scratch.path().join(&normalized);
         let root_fd = open_host_watch_fd(&host_path)?;
         let metadata = std::fs::symlink_metadata(&host_path).map_err(io_error_to_linux_errno)?;
