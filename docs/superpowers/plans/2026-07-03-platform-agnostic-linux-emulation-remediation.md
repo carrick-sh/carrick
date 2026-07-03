@@ -288,12 +288,14 @@ This plan is therefore a master remediation ledger. Each task below is an indepe
 - Produces: a correct or explicitly bounded model for active signal-frame tracking.
 - Consumes: `handler_frames`, `sigaltstack`, `rt_sigreturn`, and signal delivery bookkeeping.
 
-- [ ] Add a Linux/Docker oracle probe where a signal handler on altstack exits via `siglongjmp`, then later signals and `sigaltstack(NULL, &old)` are observed.
-- [ ] Run the probe under Carrick to prove the reported stuck-on-altstack behavior.
-- [ ] Evaluate durable detection options: guest SP range reconciliation before `sigaltstack` queries, frame-token validation on delivery, or clearing stale frames when PC/SP prove the handler is no longer active.
-- [ ] Implement the smallest option that matches Docker for the probe without breaking nested signal handlers that return normally through `rt_sigreturn`.
-- [ ] Verify with the new probe plus existing signal unit tests.
-- [ ] Commit as `fix(runtime): reconcile altstack after siglongjmp`.
+- [x] Add a Linux/Docker oracle probe where a signal handler on altstack exits via `siglongjmp`, then later signals and `sigaltstack(NULL, &old)` are observed.
+- [x] Run the probe under Carrick to prove the reported stuck-on-altstack behavior.
+- [x] Evaluate durable detection options: guest SP range reconciliation before `sigaltstack` queries, frame-token validation on delivery, or clearing stale frames when PC/SP prove the handler is no longer active.
+- [x] Implement the smallest option that matches Docker for the probe without breaking nested signal handlers that return normally through `rt_sigreturn`.
+- [x] Verify with the new probe plus existing signal unit tests.
+- [x] Commit as `fix(runtime): reconcile altstack after siglongjmp`.
+
+**Local evidence:** added `siglongjmpaltstack`, which installs an `SA_ONSTACK` handler, exits the first handler via `siglongjmp`, confirms `sigaltstack(NULL, &old)` no longer reports `SS_ONSTACK`, replaces the altstack, and confirms the next signal uses the replacement stack. Native Linux VM 210 (`10.14.14.66`) reports all probe booleans true. Red-first Carrick check at pre-fix commit `5340692d` failed as expected: `after_longjmp_not_onstack=false`, `replace_altstack_ok=false`, `replace_altstack_errno=1`, and the second handler did not use the replacement altstack. The fix passes `cargo fmt --check`, `cargo check -p carrick-runtime --lib`, `cargo test -p carrick-runtime dispatch::signal::tests --lib`, `cargo check --manifest-path conformance-probes/Cargo.toml --target aarch64-unknown-linux-musl --bin siglongjmpaltstack`, `cargo check --manifest-path conformance-probes/Cargo.toml --target x86_64-unknown-linux-musl --bin siglongjmpaltstack`, `just build`, and `scripts/run-probe.sh siglongjmpaltstack` with `MATCH`.
 
 ## Task 11: Narrow HAL Contracts After Correctness Fixes
 

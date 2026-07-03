@@ -773,6 +773,10 @@ pub struct SyscallRequest {
     /// guests, the raw x86_64 UAPI number for x86_64 guests. seccomp filters are
     /// evaluated against this, not the normalized `number`.
     pub native_number: NativeNr,
+    /// Current guest stack pointer at the syscall trap, when the run loop can
+    /// cheaply read it from the vCPU. Legacy/synthetic dispatch paths leave
+    /// this absent.
+    pub current_guest_sp: Option<u64>,
 }
 
 /// Uniform context handed to every *normalized* syscall handler, so all
@@ -866,11 +870,17 @@ impl SyscallRequest {
             args,
             guest_abi: LinuxGuestAbi::Aarch64,
             native_number: NativeNr(number),
+            current_guest_sp: None,
         }
     }
 
     pub fn with_guest_abi(mut self, guest_abi: LinuxGuestAbi) -> Self {
         self.guest_abi = guest_abi;
+        self
+    }
+
+    pub fn with_current_guest_sp(mut self, current_guest_sp: Option<u64>) -> Self {
+        self.current_guest_sp = current_guest_sp;
         self
     }
 
@@ -892,6 +902,7 @@ impl SyscallRequest {
             // means no call site can forget it and mis-marshal the x86 path.
             guest_abi: raw.guest_abi,
             native_number: raw.native_number,
+            current_guest_sp: None,
         }
     }
 }

@@ -620,7 +620,8 @@ where
         let mut poll_deadline: Option<Instant> = None;
         loop {
             let request = SyscallRequest::from_raw(frame)
-                .with_guest_abi(<E::Arch as carrick_hal::GuestArch>::linux_guest_abi());
+                .with_guest_abi(<E::Arch as carrick_hal::GuestArch>::linux_guest_abi())
+                .with_current_guest_sp(engine.get_reg(carrick_hal::Reg::Sp).ok());
             let outcome =
                 dispatch_with_panic_backstop(request.number.raw(), self.this_tid, || {
                     kernel.dispatcher.dispatch_threaded(
