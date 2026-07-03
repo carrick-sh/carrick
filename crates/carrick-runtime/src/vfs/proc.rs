@@ -484,9 +484,30 @@ fn normalize_self_pid_path(path: &str) -> Cow<'_, str> {
     Cow::Borrowed(path)
 }
 
+/// True iff `path` is a `/proc/<pid>/mem` file (`self`, `thread-self`, or a
+/// numeric pid). Reads of such a file are NOT a byte blob: they translate the
+/// file offset as a GUEST VIRTUAL ADDRESS into the caller's OWN address space
+/// (see the `read` handler's `SyntheticFile` arm). Debuggers and LTP read their
+/// own mappings this way.
+pub(crate) fn is_proc_self_mem_path(path: &str) -> bool {
+    path.strip_prefix("/proc/")
+        .and_then(|rest| rest.strip_suffix("/mem"))
+        .is_some_and(|mid| {
+            mid == "self"
+                || mid == "thread-self"
+                || (!mid.is_empty() && mid.bytes().all(|b| b.is_ascii_digit()))
+        })
+}
+
 pub(crate) fn synthetic_file(path: &str, ctx: &SyntheticProcContext) -> Option<Vec<u8>> {
     let normalized = normalize_self_pid_path(path);
     let path = normalized.as_ref();
+    // `/proc/<pid>/mem` is a live-memory file, not a precomputed blob: return an
+    // EMPTY blob so it OPENS as a `SyntheticFile`; the `read` handler recognizes
+    // the path and translates the offset as a guest VA into guest memory.
+    if is_proc_self_mem_path(path) {
+        return Some(Vec::new());
+    }
     match path {
         "/proc/cmdline" => Some(synthetic_proc_cmdline().to_vec()),
         "/proc/config.gz" => Some(synthetic_proc_config_gz()),
@@ -2708,6 +2729,21 @@ fn per_thread_comm(tid: crate::thread::ThreadId, fallback: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recognizes_proc_self_mem_paths() {
+        // `/proc/<pid>/mem` for self, thread-self, or a numeric pid.
+        assert!(is_proc_self_mem_path("/proc/self/mem"));
+        assert!(is_proc_self_mem_path("/proc/thread-self/mem"));
+        assert!(is_proc_self_mem_path("/proc/1/mem"));
+        assert!(is_proc_self_mem_path("/proc/12345/mem"));
+        // Not a mem file: other proc files, a bad pid, or a deeper path.
+        assert!(!is_proc_self_mem_path("/proc/self/maps"));
+        assert!(!is_proc_self_mem_path("/proc/self/status"));
+        assert!(!is_proc_self_mem_path("/proc/meminfo"));
+        assert!(!is_proc_self_mem_path("/proc//mem"));
+        assert!(!is_proc_self_mem_path("/proc/self/mem/extra"));
+    }
 
     #[test]
     fn lookup_root_returns_directory() {
