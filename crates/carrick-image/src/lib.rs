@@ -369,6 +369,63 @@ pub async fn verify_login(
         .map_err(|e| OciBootstrapError::Auth(format!("login to {registry} failed: {e}")))
 }
 
+/// Decide whether a locally-cached image must be re-pulled because its tag has
+/// MOVED in the registry. `cached` is the digest recorded for the cached image
+/// (`PullSummary.digest`); `registry` is the tag's CURRENT digest resolved from
+/// the registry, or `None` when the registry could not be reached.
+///
+/// Policy: re-pull iff we successfully resolved a registry digest that differs
+/// from what we have (or we have no cached digest to trust). If the registry is
+/// unreachable (`None`), fall back to trusting the cache — an offline `pull`
+/// must not fail just because it can't re-verify a moving tag.
+pub fn tag_moved_since_pull(cached: Option<&str>, registry: Option<&str>) -> bool {
+    match (cached, registry) {
+        (_, None) => false,
+        (Some(c), Some(r)) => c != r,
+        (None, Some(_)) => true,
+    }
+}
+
+/// Resolve the digest the registry CURRENTLY serves for `image`'s tag, WITHOUT
+/// downloading layers (a manifest HEAD). Returns `None` when the registry is
+/// unreachable — an offline caller then keeps trusting its cache. This is the
+/// tag's top-level digest, the same value [`pull_image_with_platform`] records
+/// as `PullSummary.digest`, so [`tag_moved_since_pull`] compares like for like.
+pub async fn resolve_registry_tag_digest(
+    image: &ImageReference,
+    store: &ImageStore,
+    target: &PlatformTarget,
+) -> Option<String> {
+    let client = build_oci_client_for(target);
+    let auth = auth::resolve_auth(store.root(), image.registry()).ok()?;
+    client
+        .fetch_manifest_digest(image.as_oci_reference(), &auth)
+        .await
+        .ok()
+}
+
+/// Docker `--pull` semantics for a `run`. `Missing` is docker's default (pull
+/// only when the image is absent locally); `Always` re-checks the registry every
+/// run and re-pulls a moved tag; `Never` uses only the local cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PullPolicy {
+    Always,
+    Missing,
+    Never,
+}
+
+/// Whether a `run` under `policy` must (re-)pull, given whether the image is
+/// already `cached` and whether its tag has `moved` in the registry (from
+/// [`tag_moved_since_pull`], only meaningful for `Always`). `Never` never pulls
+/// — the caller errors if the image is absent.
+pub fn needs_pull(policy: PullPolicy, cached: bool, moved: bool) -> bool {
+    match policy {
+        PullPolicy::Never => false,
+        PullPolicy::Missing => !cached,
+        PullPolicy::Always => !cached || moved,
+    }
+}
+
 pub async fn pull_image(
     image: &ImageReference,
     store: &ImageStore,
@@ -586,17 +643,42 @@ impl ImageStore {
         image: &ImageReference,
         target: &PlatformTarget,
     ) -> Result<ResolvedImage, OciBootstrapError> {
-        let summary = match self.load_pull_summary_for(image, target).await {
-            Ok(summary) => summary,
-            Err(_) => {
-                eprintln!(
-                    "carrick: image {} ({}/{}) not in store; pulling…",
-                    image.canonical(),
-                    target.os,
-                    target.arch
-                );
-                pull_image_with_platform(image, self, target).await?
-            }
+        self.resolve_with_platform_and_policy(image, target, PullPolicy::Missing)
+            .await
+    }
+
+    /// Like [`resolve_with_platform`], but honours a Docker `--pull`
+    /// [`PullPolicy`]: `Missing` pulls only when the image is absent (docker's
+    /// default), `Always` re-checks the registry and re-pulls a MOVED tag (so a
+    /// rebuilt+repushed image is never served stale), and `Never` uses only the
+    /// local cache — erroring if the image is absent.
+    pub async fn resolve_with_platform_and_policy(
+        &self,
+        image: &ImageReference,
+        target: &PlatformTarget,
+        policy: PullPolicy,
+    ) -> Result<ResolvedImage, OciBootstrapError> {
+        let cached = self.load_pull_summary_for(image, target).await;
+        // Only `Always` pays the registry round-trip to detect a moved tag.
+        let moved = if matches!(policy, PullPolicy::Always) && cached.is_ok() {
+            let registry = resolve_registry_tag_digest(image, self, target).await;
+            let cached_digest = cached.as_ref().ok().and_then(|s| s.digest.as_deref());
+            tag_moved_since_pull(cached_digest, registry.as_deref())
+        } else {
+            false
+        };
+        let summary = if needs_pull(policy, cached.is_ok(), moved) {
+            eprintln!(
+                "carrick: image {} ({}/{}) — pulling…",
+                image.canonical(),
+                target.os,
+                target.arch
+            );
+            pull_image_with_platform(image, self, target).await?
+        } else {
+            // Not pulling: use the cache. For `Never` with no cached image this
+            // propagates the original "not in store" error.
+            cached?
         };
 
         let image_dir = summary.image_dir.clone();
@@ -1064,6 +1146,38 @@ fn layer_media_type(name: &str, bytes: &[u8]) -> &'static str {
 mod tests {
     use super::*;
     use oci_client::manifest::{IMAGE_MANIFEST_MEDIA_TYPE, ImageIndexEntry, Platform};
+
+    #[test]
+    fn pull_policy_follows_docker_semantics() {
+        use PullPolicy::*;
+        // never: never pull (caller errors if the image is absent).
+        assert!(!needs_pull(Never, false, false));
+        assert!(!needs_pull(Never, true, true));
+        // missing (docker default): pull only when the image is absent.
+        assert!(needs_pull(Missing, false, false));
+        assert!(!needs_pull(Missing, true, true)); // cached -> keep, even if moved
+        // always: pull when absent OR the tag moved; a cached, unchanged tag is
+        // up to date.
+        assert!(needs_pull(Always, false, false));
+        assert!(needs_pull(Always, true, true));
+        assert!(!needs_pull(Always, true, false));
+    }
+
+    #[test]
+    fn tag_moved_only_when_registry_digest_differs() {
+        // Unchanged tag: the registry digest equals the cached one -> up to date.
+        assert!(!tag_moved_since_pull(
+            Some("sha256:aaa"),
+            Some("sha256:aaa")
+        ));
+        // The tag moved to a new digest -> re-pull.
+        assert!(tag_moved_since_pull(Some("sha256:aaa"), Some("sha256:bbb")));
+        // Registry unreachable (None) -> trust the cache; an offline pull must
+        // not fail just because it can't re-verify a moving tag.
+        assert!(!tag_moved_since_pull(Some("sha256:aaa"), None));
+        // No cached digest, but the registry resolves -> re-pull to become current.
+        assert!(tag_moved_since_pull(None, Some("sha256:bbb")));
+    }
 
     fn entry(os: &str, arch: &str, variant: Option<&str>, digest: &str) -> ImageIndexEntry {
         ImageIndexEntry {

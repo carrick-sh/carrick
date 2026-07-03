@@ -49,6 +49,25 @@ pub(crate) struct Cli {
     pub(crate) command: Commands,
 }
 
+/// Docker `--pull` policy (`always`/`missing`/`never`). Local mirror of
+/// [`carrick_image::PullPolicy`] so `carrick-image` need not depend on clap.
+#[derive(Copy, Clone, Debug, clap::ValueEnum)]
+pub(crate) enum PullArg {
+    Always,
+    Missing,
+    Never,
+}
+
+impl From<PullArg> for carrick_image::PullPolicy {
+    fn from(p: PullArg) -> Self {
+        match p {
+            PullArg::Always => carrick_image::PullPolicy::Always,
+            PullArg::Missing => carrick_image::PullPolicy::Missing,
+            PullArg::Never => carrick_image::PullPolicy::Never,
+        }
+    }
+}
+
 #[derive(Debug, Subcommand)]
 pub(crate) enum Commands {
     InspectElf {
@@ -276,6 +295,11 @@ pub(crate) enum Commands {
         /// shares the host PID namespace (no remap).
         #[arg(long, value_enum, default_value_t = PidMode::Private)]
         pid: PidMode,
+        /// Docker `--pull` policy: `always` re-checks the registry and re-pulls a
+        /// moved tag, `missing` (default) pulls only when the image is absent,
+        /// `never` uses only the local cache.
+        #[arg(long, value_enum, default_value = "missing")]
+        pull: PullArg,
         /// Container network mode: host, bridge, none, or container:<id|name>.
         #[arg(long = "net", alias = "network", default_value = "host")]
         network: String,
@@ -366,6 +390,11 @@ pub(crate) enum Commands {
         fs: Option<FsBackendKind>,
         #[arg(long, value_enum, default_value_t = PidMode::Private)]
         pid: PidMode,
+        /// Docker `--pull` policy: `always` re-checks the registry and re-pulls a
+        /// moved tag, `missing` (default) pulls only when the image is absent,
+        /// `never` uses only the local cache.
+        #[arg(long, value_enum, default_value = "missing")]
+        pull: PullArg,
         /// Container network mode: host, bridge, none, or container:<id|name>.
         #[arg(long = "net", alias = "network", default_value = "host")]
         network: String,
