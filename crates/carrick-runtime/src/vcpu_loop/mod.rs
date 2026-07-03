@@ -1127,6 +1127,11 @@ where
             // /proc/<pid>/stat reads `R`. A genuine guest-blocking wait re-publishes
             // `Blocked` below for the duration of the park (see `block_guard`).
             crate::run_state::publish(crate::run_state::RunState::Running);
+            crate::thread::set_current_thread_state(state.this_tid, 'R');
+            crate::run_state::publish_guest_tid(
+                state.this_tid.raw(),
+                crate::run_state::RunState::Running,
+            );
             let next = engine.next_syscall();
             // Out of guest now (in host): a coordinator may proceed past us.
             state

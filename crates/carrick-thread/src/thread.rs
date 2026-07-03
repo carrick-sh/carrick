@@ -96,6 +96,10 @@ struct ThreadEntry {
     /// /proc handler then falls back to the executable basename. TASK_COMM_LEN
     /// is 16 (15 chars + NUL).
     name: Option<[u8; 16]>,
+    /// Guest-visible Linux `/proc/<tid>/stat` state for platforms that cannot
+    /// query a host kernel thread state through Mach. Defaults to running; the
+    /// runtime marks it sleeping around genuine blocking waits.
+    proc_state: char,
 }
 
 pub struct ThreadRegistry {
@@ -137,6 +141,23 @@ pub fn current_thread_ports() -> Vec<(ThreadId, ThreadPort)> {
         .unwrap_or_default()
 }
 
+/// This process's live `(tid, proc_state)` pairs, or empty if unset. Used by
+/// non-macOS backends where no Mach thread-state query exists.
+pub fn current_thread_state_chars() -> Vec<(ThreadId, char)> {
+    CURRENT_REGISTRY
+        .lock()
+        .as_ref()
+        .map(|r| r.thread_state_chars())
+        .unwrap_or_default()
+}
+
+/// Update one live thread's guest-visible `/proc` state in the current process.
+pub fn set_current_thread_state(tid: ThreadId, state: char) {
+    if let Some(registry) = CURRENT_REGISTRY.lock().as_ref() {
+        registry.set_thread_state(tid, state);
+    }
+}
+
 impl ThreadRegistry {
     pub fn new(main_tid: ThreadId) -> Self {
         let mut map = HashMap::new();
@@ -146,6 +167,7 @@ impl ThreadRegistry {
                 clear_child_tid: 0,
                 mach_port: 0,
                 name: None,
+                proc_state: 'R',
             },
         );
         Self {
@@ -162,6 +184,7 @@ impl ThreadRegistry {
                 clear_child_tid,
                 mach_port: 0,
                 name: None,
+                proc_state: 'R',
             },
         );
         tid
@@ -272,6 +295,22 @@ impl ThreadRegistry {
             .iter()
             .map(|(&tid, e)| (tid, e.mach_port))
             .collect()
+    }
+
+    /// Snapshot `(tid, state)` for every live thread.
+    pub fn thread_state_chars(&self) -> Vec<(ThreadId, char)> {
+        self.inner
+            .lock()
+            .iter()
+            .map(|(&tid, e)| (tid, e.proc_state))
+            .collect()
+    }
+
+    /// Set a live thread's guest-visible `/proc` state.
+    pub fn set_thread_state(&self, tid: ThreadId, state: char) {
+        if let Some(e) = self.inner.lock().get_mut(&tid) {
+            e.proc_state = state;
+        }
     }
 }
 
@@ -805,6 +844,20 @@ mod tests {
         assert!(t > ThreadId::synthetic_for_tests(1000));
         assert_eq!(reg.live_count(), 2);
         assert_eq!(reg.clear_child_tid(t), Some(0x4000));
+    }
+
+    #[test]
+    fn tracks_guest_visible_thread_state() {
+        let reg = ThreadRegistry::new(ThreadId::synthetic_for_tests(1000));
+        let t = reg.register_child(0);
+
+        let states = reg.thread_state_chars();
+        assert!(states.contains(&(ThreadId::synthetic_for_tests(1000), 'R')));
+        assert!(states.contains(&(t, 'R')));
+
+        reg.set_thread_state(t, 'S');
+        let states = reg.thread_state_chars();
+        assert!(states.contains(&(t, 'S')));
     }
 
     #[test]
