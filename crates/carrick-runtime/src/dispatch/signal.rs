@@ -249,6 +249,13 @@ fn namespace_member_standard_kill_needs_xsig(signum: i32) -> bool {
         )
 }
 
+fn altstack_contains_guest_sp(stack: LinuxSigaltstack, sp: u64) -> bool {
+    stack
+        .ss_sp
+        .checked_add(stack.ss_size)
+        .is_some_and(|top| sp > stack.ss_sp && sp <= top)
+}
+
 fn stop_self_by_signal(signum: i32) {
     let host_signum = crate::host_signal::linux_to_host_signum(signum);
     unsafe {
@@ -607,12 +614,26 @@ impl SyscallDispatcher {
 
     /// True iff `tid` is currently executing a signal handler ON its alternate
     /// signal stack (any active SA_ONSTACK frame). (audit M13)
-    fn is_on_altstack(&self, tid: crate::thread::ThreadId) -> bool {
-        self.signal
-            .lock()
+    fn is_on_altstack(&self, tid: crate::thread::ThreadId, current_guest_sp: Option<u64>) -> bool {
+        let mut signal = self.signal.lock();
+        let frame_says_on_alt = signal
             .handler_frames
             .get(&tid)
-            .is_some_and(|frames| frames.iter().any(|&on_alt| on_alt))
+            .is_some_and(|frames| frames.iter().any(|&on_alt| on_alt));
+        if !frame_says_on_alt {
+            return false;
+        }
+        let Some(sp) = current_guest_sp else {
+            return true;
+        };
+        let sp_on_alt = signal
+            .altstack
+            .get(&tid)
+            .is_some_and(|stack| altstack_contains_guest_sp(*stack, sp));
+        if !sp_on_alt {
+            signal.handler_frames.remove(&tid);
+        }
+        sp_on_alt
     }
 
     /// Pop the returning handler frame's alt-stack record (rt_sigreturn).
@@ -1380,7 +1401,7 @@ impl SyscallDispatcher {
                 .unwrap_or(crate::thread::ThreadId::NONE);
             let memory = &mut *cx.memory;
 
-            let on_altstack = this.is_on_altstack(tid);
+            let on_altstack = this.is_on_altstack(tid, cx.request.current_guest_sp);
             if old_ss != 0 {
                 let mut current = this
                     .signal
@@ -2743,7 +2764,7 @@ mod tests {
             },
         );
         // Not in a handler yet → not on the alt stack.
-        assert!(!d.is_on_altstack(tid));
+        assert!(!d.is_on_altstack(tid, None));
 
         // Enter an SA_ONSTACK handler → now executing on the alt stack.
         let mut on = LinuxSigaction::empty();
@@ -2751,23 +2772,53 @@ mod tests {
         on.sa_flags = crate::linux_abi::LINUX_SA_ONSTACK;
         d.enter_signal_handler(tid, 10, on);
         assert!(
-            d.is_on_altstack(tid),
+            d.is_on_altstack(tid, None),
             "SA_ONSTACK handler marks the thread on-stack"
         );
 
         // rt_sigreturn pops the frame → back off the alt stack.
         d.pop_handler_frame(tid);
-        assert!(!d.is_on_altstack(tid));
+        assert!(!d.is_on_altstack(tid, None));
 
         // A handler WITHOUT SA_ONSTACK does not mark the thread on-stack.
         let mut off = LinuxSigaction::empty();
         off.sa_handler = 0x9000;
         d.enter_signal_handler(tid, 11, off);
         assert!(
-            !d.is_on_altstack(tid),
+            !d.is_on_altstack(tid, None),
             "a non-SA_ONSTACK handler is not on the alt stack"
         );
         d.pop_handler_frame(tid);
+    }
+
+    #[test]
+    fn siglongjmp_stale_altstack_frame_is_reconciled_from_guest_sp() {
+        let d = SyscallDispatcher::new();
+        let tid = crate::thread::ThreadId::synthetic_for_tests(1);
+
+        d.signal.lock().altstack.insert(
+            tid,
+            LinuxSigaltstack {
+                ss_sp: 0x4000,
+                ss_flags: 0,
+                __pad: 0,
+                ss_size: 0x4000,
+            },
+        );
+        d.signal.lock().handler_frames.insert(tid, vec![true]);
+
+        assert!(
+            d.is_on_altstack(tid, Some(0x7000)),
+            "live SP inside altstack keeps SS_ONSTACK state"
+        );
+        assert!(
+            !d.is_on_altstack(tid, Some(0x9000)),
+            "SP outside altstack means siglongjmp escaped the handler frame"
+        );
+        assert!(
+            !d.signal.lock().handler_frames.contains_key(&tid),
+            "stale handler-frame bookkeeping should be cleared"
+        );
     }
 
     #[test]
