@@ -99,6 +99,7 @@ pub struct FutexTableFutex<S: SharedFutexSyscall> {
 impl<S: SharedFutexSyscall> FutexTableFutex<S> {
     /// Pair a process-private table with the host's shared-page syscall shim.
     pub fn new(table: Arc<FutexTable>, shared: S) -> Self {
+        crate::thread::set_current_futex_table(&table);
         Self { table, shared }
     }
 }
