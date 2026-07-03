@@ -459,6 +459,13 @@ pub trait X86Vmm: Sized + GuestVmBackend {
     /// consistent snapshot of the reaped child's writes).
     fn refresh_shared_after_wait(&mut self) {}
 
+    /// Publish any copied file-backed `MAP_SHARED` alias stores before a guest
+    /// syscall observes the backing file. No-op for direct shared-memory backends.
+    fn needs_shared_file_alias_sync(&self) -> bool {
+        false
+    }
+    fn sync_shared_file_aliases(&mut self) {}
+
     /// Restore a generic x86 vCPU snapshot onto a backend vCPU. The default
     /// uses the shared trait-level register writers; backends with stricter
     /// ioctl grouping requirements can override while keeping the x86 snapshot

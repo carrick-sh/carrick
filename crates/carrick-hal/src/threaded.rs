@@ -565,6 +565,14 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + GuestMemory + Send {
     /// nothing here; the KVM backend, which shares via a shadow that the suspended
     /// parent must copy back, overrides it. Default no-op.
     fn finish_vfork_parent(&mut self) {}
+    /// Backend hook before dispatching a guest syscall. Direct shared-memory
+    /// backends need nothing; a backend that emulates file-backed `MAP_SHARED`
+    /// with copied guest RAM can use this to publish guest stores before the
+    /// syscall observes the backing file.
+    fn needs_shared_file_alias_sync(&self) -> bool {
+        false
+    }
+    fn sync_shared_file_aliases(&mut self) {}
     fn release_vcpu_for_fork(&mut self) -> Result<(), TrapError> {
         Ok(())
     }
