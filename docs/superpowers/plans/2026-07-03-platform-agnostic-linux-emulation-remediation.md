@@ -345,14 +345,34 @@ This plan is therefore a master remediation ledger. Each task below is an indepe
 
 ## Final Gate
 
-- [ ] Run `just fmt-check`.
-- [ ] Run `just clippy`.
-- [ ] Run `just test`.
-- [ ] Run `just test-integration`.
-- [ ] Run `just conformance-probes` after `just build` on macOS.
-- [ ] Run target-host build gates for Linux/KVM, FreeBSD/bhyve, and NetBSD/NVMM for all tasks that touched those lanes.
-- [ ] Re-render docs/support artifacts only when the relevant command is part of the task.
-- [ ] Update this plan with completed task links and any intentionally deferred limitations.
+- [x] Run `just fmt-check`.
+- [x] Run `just clippy`.
+- [x] Run `just test`.
+- [x] Run `just test-integration`.
+- [x] Run `just conformance-probes` after `just build` on macOS.
+- [x] Run target-host build gates for Linux/KVM and FreeBSD/bhyve for all tasks that touched those lanes.
+- [x] Re-render docs/support artifacts only when the relevant command is part of the task.
+- [x] Update this plan with completed task links and any intentionally deferred limitations.
+
+**Final evidence:** the code-bearing branch state through
+`de134590cb8845e719dd3a0e48f6acdf5f157962` passes `just fmt-check`, `just
+clippy`, `just test`, `just test-integration`, and `just conformance-probes`.
+The conformance probe run rebuilt and signed `target/release/carrick` and passed
+`arm64:musl:siglongjmpaltstack`; the gnu and amd64 probe sub-lanes were skipped
+because those probe binaries were not built, matching the existing local harness
+behavior.
+
+**Target-host evidence:** `/root/carrick` was replaced on the x86 targets and
+checked at the same code-bearing state. FreeBSD VM 200 (`10.14.14.189`) passes
+`cargo check -p carrick-host-bsd --lib`, `cargo check -p carrick-portable
+--lib`, and `cargo check -p carrick-runtime --lib --no-default-features
+--features platform-freebsd`. Linux KVM VM 210 (`10.14.14.66`) and LXC 104
+(`10.14.14.39`) both pass `cargo check -p carrick-vmm-kvm --lib` and `cargo
+check -p carrick-runtime --lib --no-default-features --features
+platform-linux`.
+
+NetBSD/NVMM target-host verification is intentionally deferred per user
+direction for this execution pass.
 
 ## Recommended Execution Order
 
