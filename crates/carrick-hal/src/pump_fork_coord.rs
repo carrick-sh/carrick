@@ -14,6 +14,8 @@
 
 use std::sync::Arc;
 
+#[cfg(test)]
+use crate::threaded::SharedFutexLocation;
 use crate::threaded::{HostForkCoordinator, PreparedHostFork};
 use crate::{PlatformFutex, VcpuRegistry};
 

@@ -243,14 +243,16 @@ This plan is therefore a master remediation ledger. Each task below is an indepe
 - Test: timer-core/unit tests plus one POSIX timer guest probe
 
 **Interfaces:**
-- Produces: one shared fallback POSIX timer arm helper parameterized by kicker and thread id.
+- Produces: one shared fallback POSIX timer arm helper parameterized by kicker; backend `main_tid` fields remain construction metadata because delivery is process-directed.
 - Consumes: `carrick_timer_core::posix::run_fallback` and process-signal publication.
 
-- [ ] Confirm current duplication is byte-equivalent after comments and host-specific names are ignored.
-- [ ] Extract only the shared arm/disarm helper; keep backend-specific kqueue/no-kqueue decisions local.
-- [ ] Preserve existing semantics: process-directed signal publication plus `kick_all`.
+- [x] Confirm current duplication is byte-equivalent after comments and host-specific names are ignored.
+- [x] Extract only the shared arm/disarm helper; keep backend-specific kqueue/no-kqueue decisions local.
+- [x] Preserve existing semantics: process-directed signal publication plus `kick_all`.
 - [ ] Verify timer unit tests and a guest POSIX timer smoke under HVF/KVM plus target BSD lane if available.
-- [ ] Commit as `refactor(timer): share fallback posix delivery`.
+- [x] Commit as `refactor(timer): share fallback posix delivery`.
+
+**Local evidence:** KVM, bhyve, and NVMM all now call `carrick_hal::timer_delivery::arm_fallback_posix_timer` / `disarm_fallback_posix_timer`; interval-timer `arm_itimer` policy remains backend-local. The helper keeps the prior POSIX sequence: `carrick_timer_core::posix::arm`, spawn `carrick-ptimer-{id}`, `publish_process_signal(signum)`, and `kick_all()`. New HAL test `fallback_posix_timer_publishes_process_signal_and_kicks_all` proves the shared helper publishes the process pending signal and kicks the registry. Verification passed: `cargo test -p carrick-hal fallback_posix_timer_publishes_process_signal_and_kicks_all --lib -- --test-threads=1`, `cargo test -p carrick-hal --lib -- --test-threads=1`, `cargo test -p carrick-timer-core --lib -- --test-threads=1`, `cargo check -p carrick-vmm-kvm --lib`, `cargo check -p carrick-vmm-bhyve --lib`, `cargo check -p carrick-vmm-nvmm --lib`, `cargo check --manifest-path conformance-probes/Cargo.toml --target aarch64-unknown-linux-musl --bin posixtimers`, and the same `posixtimers` check for `x86_64-unknown-linux-musl`. Live HVF/KVM/BSD guest smoke remains a target-host runtime gate, not run in this local refactor step.
 
 ## Task 9: Fix Or Fence BSD Epoll/OFD Semantics
 
