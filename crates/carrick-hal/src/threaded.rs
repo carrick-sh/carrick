@@ -330,8 +330,11 @@ pub trait PlatformFutex: Send + Sync {
     fn notify_signal_pending_for(&self, tid: ThreadId);
 }
 
-/// Get/set the registers + V-regs the sigframe builder needs. Each engine
-/// already exposes `Reg`/`SysReg` get/set; this names the FP/SIMD regs too.
+/// Get/set the registers + FP/SIMD state the shared sigframe builders need.
+///
+/// This is a sigframe/trap-loop adapter, not a claim that every guest ISA has
+/// every [`Reg`] / [`SysReg`] variant. Narrower native engine traits translate
+/// into this shape at the shared boundary.
 pub trait RegAccess {
     fn get_reg(&self, r: Reg) -> Result<u64, OsError>;
     fn set_reg(&mut self, r: Reg, v: u64) -> Result<(), OsError>;
