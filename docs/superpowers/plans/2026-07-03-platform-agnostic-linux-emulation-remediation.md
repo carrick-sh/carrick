@@ -224,12 +224,14 @@ This plan is therefore a master remediation ledger. Each task below is an indepe
 - Produces: one byte-complete `msr_init_blob`/FP-stub implementation in `carrick-x86`.
 - Consumes: bhyve `NeedsRing0Blob` and `run_fp_stub` paths.
 
-- [ ] Add parity tests comparing the shared `carrick-x86` blob to the currently working bhyve blob, including MXCSR mask setup and `XCR0 = 0x7`.
-- [ ] Make `carrick-x86::msr_init_blob` include the missing MXCSR/XCR0 sequence and any entry-register preservation needed by bhyve.
-- [ ] Repoint bhyve to the shared blob and shared `run_fp_stub`.
-- [ ] Delete stale backend-local duplicates only after parity and runtime smoke pass.
+- [x] Add parity tests comparing the shared `carrick-x86` blob to the currently working bhyve blob, including MXCSR mask setup and `XCR0 = 0x7`.
+- [x] Make `carrick-x86::msr_init_blob` include the missing MXCSR/XCR0 sequence and any entry-register preservation needed by bhyve.
+- [x] Repoint bhyve to the shared blob and shared `run_fp_stub`.
+- [x] Remove the stale backend-local implementation duplicate; keep the compatibility wrapper until FreeBSD runtime smoke permits API cleanup.
 - [ ] Verify with `cargo test -p carrick-x86`, `cargo test -p carrick-vmm-bhyve`, and the bhyve AVX/FP signal fixtures on FreeBSD.
-- [ ] Commit as `refactor(x86): share complete bringup blobs`.
+- [x] Commit as `refactor(x86): share complete bringup blobs`.
+
+**Local evidence:** `carrick_x86::msr_init_blob` now emits the MXCSR mask sequence, `XSETBV(XCR0=7)`, and final RDX/RCX restore before `iretq`; new shared tests assert those byte sequences. The bhyve-local `msr_init_blob` body now delegates to `carrick_x86::msr_init_blob`, and bhyve already used `carrick_x86::fp_stub_bytes` and `carrick_x86::run_fp_stub`. `cargo test -p carrick-x86 --lib` and `cargo check -p carrick-vmm-bhyve --lib` pass locally. `cargo test -p carrick-vmm-bhyve --lib` has zero tests on this aarch64 macOS host because bhyve x86 modules are target-gated; FreeBSD runtime smoke and AVX/FP signal fixtures remain target-host gates.
 
 ## Task 8: Rationalize Timer Delivery Duplication
 
