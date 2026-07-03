@@ -618,7 +618,11 @@ where
         // readiness re-sample retries so a finite guest epoll/pidfd wait is not
         // restarted by the kqueue backstop.
         let mut poll_deadline: Option<Instant> = None;
+        let sync_shared_file_aliases = engine.needs_shared_file_alias_sync();
         loop {
+            if sync_shared_file_aliases && !matches!(frame.number.raw(), 260 | 95) {
+                engine.sync_shared_file_aliases();
+            }
             let request = SyscallRequest::from_raw(frame)
                 .with_guest_abi(<E::Arch as carrick_hal::GuestArch>::linux_guest_abi())
                 .with_current_guest_sp(engine.get_reg(carrick_hal::Reg::Sp).ok());

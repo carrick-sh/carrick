@@ -1320,6 +1320,14 @@ impl<V: X86Vmm> ThreadedEngine for X86EngineCore<V> {
         self.vm.finish_vfork_parent();
     }
 
+    fn needs_shared_file_alias_sync(&self) -> bool {
+        self.vm.needs_shared_file_alias_sync()
+    }
+
+    fn sync_shared_file_aliases(&mut self) {
+        self.vm.sync_shared_file_aliases();
+    }
+
     fn build_sibling_spec(&self, entry: GuestEntryRegs) -> Result<Self::SiblingSpec, TrapError> {
         let parent = bringup_fns::snapshot(&self.vcpu)?;
         let snapshot = bringup_fns::seed_entry(&parent, entry);

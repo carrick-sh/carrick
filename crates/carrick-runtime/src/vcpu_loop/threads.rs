@@ -209,6 +209,18 @@ where
             }
             break retval;
         };
+        if location.is_mirror() {
+            // A bhyve shared futex waits on a fork-coherent mirror word, while the
+            // guest loop rereads its process-private copied sysmem word after the
+            // wait returns. Pull the mirror value back so a successful wake that
+            // changed the word in another process is visible to the waiter before
+            // it resumes guest code.
+            let current = unsafe {
+                (*(location.wait_addr().raw() as *const std::sync::atomic::AtomicU32))
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            };
+            let _ = engine.write_bytes(waiter_key as u64, &current.to_ne_bytes());
+        }
         self.complete_returned(engine, retval)
     }
 

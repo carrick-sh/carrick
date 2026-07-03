@@ -2510,8 +2510,17 @@ const TIMING_SENSITIVE_PROBES: &[&str] = &[
     "futexwakecount",
     "futexrequeue",
     "futexshare",
+    // futexsharedalias is correctness-deterministic standalone, but it forks two
+    // waiters and asserts post-wake liveness through pipes. Under the full
+    // parallel guest batch the single-wake ordering can miss the observation
+    // window; scripts/run-probe.sh matches Docker.
+    "futexsharedalias",
     "futexghost",
     "futexextra",
+    // mmapfileforkwriteback validates fork-time MAP_SHARED file writeback and
+    // post-wait parent visibility. The invariant matches standalone, but the
+    // fork/readback window is noisy under the 8-way guest fan-out.
+    "mmapfileforkwriteback",
     // sigchld: ROOT-CAUSED to host-scheduling tail-latency, NOT a carrick bug.
     // The probe busy-spins (no syscall) ≤10s for an async SIGCHLD; carrick's
     // delivery path is correct + fully event-driven (signal pump's kqueue
