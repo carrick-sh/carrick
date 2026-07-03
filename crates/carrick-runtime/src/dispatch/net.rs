@@ -2278,16 +2278,21 @@ impl SyscallDispatcher {
                     if let Some(host_fd) = host_fd {
                         let ev_events = event.events;
                         let effective = this.epoll_effective_interest(fd, ev_events, 0, false);
-                        kqueue.with_mux(|mux| {
-                            let _ = mux.register_io(
+                        let register = kqueue.with_mux(|mux| {
+                            mux.register_io(
                                 host_fd.get(),
                                 pack_epoll_udata(fd, reg_gen),
                                 effective,
                                 epoll_host_trigger_mode(LinuxEpollEvents::from_bits_retain(
                                     ev_events,
                                 )),
-                            );
+                            )
                         });
+                        if let Err(err) = register {
+                            return Ok(DispatchOutcome::errno(crate::host_to_linux_errno(
+                                err.errno,
+                            )));
+                        }
                         crate::event_ring::rec(
                             crate::event_ring::EPADD,
                             kqueue.poll_fd(),
@@ -2326,16 +2331,21 @@ impl SyscallDispatcher {
                     let reg_gen = slot.reg_gen;
                     if let Some(host_fd) = host_fd {
                         let effective = this.epoll_effective_interest(fd, event.events, 0, false);
-                        kqueue.with_mux(|mux| {
-                            let _ = mux.register_io(
+                        let register = kqueue.with_mux(|mux| {
+                            mux.register_io(
                                 host_fd.get(),
                                 pack_epoll_udata(fd, reg_gen),
                                 effective,
                                 epoll_host_trigger_mode(LinuxEpollEvents::from_bits_retain(
                                     event.events,
                                 )),
-                            );
+                            )
                         });
+                        if let Err(err) = register {
+                            return Ok(DispatchOutcome::errno(crate::host_to_linux_errno(
+                                err.errno,
+                            )));
+                        }
                     }
                     clear_pending_epoll_ready(pending_ready, fd);
                     *slot = EpollInterest {

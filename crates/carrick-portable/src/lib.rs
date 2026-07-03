@@ -136,12 +136,25 @@ pub unsafe fn ptsname_r(
     }
 }
 
+/// Whether this host exposes real OFD (open file description) lock fcntl
+/// commands with Linux-compatible ownership semantics.
+#[cfg(not(any(target_os = "freebsd", target_os = "netbsd")))]
+pub const fn host_ofd_locks_supported() -> bool {
+    true
+}
+
+/// Whether this host exposes real OFD (open file description) lock fcntl
+/// commands with Linux-compatible ownership semantics.
+#[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
+pub const fn host_ofd_locks_supported() -> bool {
+    false
+}
+
 /// OFD (open file description) lock fcntl commands. Linux and macOS libc define
-/// `F_OFD_*`; FreeBSD and NetBSD have no OFD locks, so we map them to the regular
-/// (process) lock commands — the lock still takes effect, with per-process rather
-/// than per-open-file-description semantics. carrick translates the guest's Linux
-/// `F_OFD_*` to these for the host `fcntl(2)`. (The Linux ABI values the GUEST
-/// sends live in `carrick-abi`; these are the matching HOST command numbers.)
+/// `F_OFD_*`; FreeBSD and NetBSD have no OFD locks. On those hosts these retain
+/// the historical classic-lock fallback for internal best-effort users, but
+/// guest-facing syscall code must check [`host_ofd_locks_supported`] and reject
+/// `F_OFD_*` rather than presenting process locks as OFD locks.
 #[cfg(not(any(target_os = "freebsd", target_os = "netbsd")))]
 pub const F_OFD_GETLK: i32 = libc::F_OFD_GETLK;
 #[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
