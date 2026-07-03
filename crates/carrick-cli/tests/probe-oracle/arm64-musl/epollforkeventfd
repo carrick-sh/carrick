@@ -1,0 +1,7 @@
+7a9b4dc34dac0375
+setup_ok=true
+epoll_add_ok=true
+child_write_ok=true
+parent_epoll_woke=true
+parent_epollin=true
+eventfd_value_one=true
