@@ -92,11 +92,12 @@ use carrick_hal::x8664_arch::{X8664GuestArch, entry_trampoline_bytes};
 // Re-export GDT_LEN so callers (including tests/live_vcpu.rs) can assert the
 // 5-entry GDT limit without depending on carrick-hal directly.
 pub use carrick_hal::x8664_arch::GDT_LEN;
+use carrick_mem::elf::RoSpan;
 use carrick_mem::memory::{
     LINUX_EL0_TRAMPOLINE_BASE, LINUX_PAGE_TABLES_BASE, LINUX_PAGE_TABLES_SIZE, LINUX_STACK_SIZE,
     LINUX_STACK_TOP,
 };
-use carrick_mem::pml4::{Pml4MapSpec, pml4_tables};
+use carrick_mem::pml4::{Pml4Manager, Pml4MapSpec, pml4_tables};
 
 use crate::vmm::{BhyveVcpu, BhyveVm};
 use crate::vmm_x86::{
@@ -1001,19 +1002,20 @@ struct ShmAlias {
 struct RamInner {
     windows: Vec<BhyveWindow>,
     cursor: u64,
-    // Each reservation is `(start, end, writable, exec)`. `writable`/`exec` carry
-    // the guest PROT_WRITE/PROT_EXEC bits so a demand-committed page is mapped
-    // with the right leaf protection: a read-only (PROT_READ) reservation commits
-    // a PRESENT but read-only leaf, so a guest WRITE to it re-faults with
-    // PFEC.P=1 and the engine delivers SIGSEGV/SEGV_ACCERR (not silently allowing
-    // the store). A writable reservation commits an RW leaf (the common anon-arena
-    // case). `exec` gates the leaf NX bit: a non-exec (no PROT_EXEC) reservation
-    // commits an NX leaf, so a guest instruction FETCH from it #PFs (W^X), exactly
-    // as on Linux/KVM — instead of silently executing a data page.
-    reservations: Vec<(u64, u64, bool, bool)>,
+    // Each reservation is `(start, end, prot)`. `prot` carries the guest
+    // protection bits so demand-commit can distinguish PROT_NONE from PROT_READ:
+    // a PROT_NONE first touch must fault, not commit as a readable page.
+    reservations: Vec<(u64, u64, ReservationProt)>,
     // File-backed shm aliases to flush to their backing files at the fork
     // barrier (SysV-shm cross-process coherence — see `ShmAlias`).
     shm_aliases: Vec<ShmAlias>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReservationProt {
+    writable: bool,
+    exec: bool,
+    no_access: bool,
 }
 
 /// A handle to the shared guest-RAM plan. `Clone` shares the `Arc`, NOT the
@@ -1025,6 +1027,9 @@ pub struct BhyveGuestRam {
 
 /// Outcome of an atomic [`BhyveGuestRam::commit_if_absent`].
 pub enum CommitOutcome {
+    /// The page is PROT_NONE: do not commit backing; let the engine deliver the
+    /// guest fault so the signal path reports a protection failure.
+    NoAccess,
     /// A window already covers the page (a sibling won the race) — just re-run.
     AlreadyMapped,
     /// Not a known reservation — a genuine fault (deliver SIGSEGV).
@@ -1050,6 +1055,30 @@ pub const X86_GPA_CURSOR_START: u64 = 0x40_0000; // 4 MiB — above init blob/GD
 
 impl RamInner {
     fn reserve(&mut self, va: u64, len: usize, writable: bool, exec: bool) {
+        self.reserve_with_prot(
+            va,
+            len,
+            ReservationProt {
+                writable,
+                exec,
+                no_access: false,
+            },
+        );
+    }
+
+    fn reserve_no_access(&mut self, va: u64, len: usize) {
+        self.reserve_with_prot(
+            va,
+            len,
+            ReservationProt {
+                writable: false,
+                exec: false,
+                no_access: true,
+            },
+        );
+    }
+
+    fn reserve_with_prot(&mut self, va: u64, len: usize, prot: ReservationProt) {
         let start = va & !0xFFF;
         let end = (va.wrapping_add(len as u64).wrapping_add(0xFFF)) & !0xFFF;
         if end <= start {
@@ -1059,16 +1088,17 @@ impl RamInner {
         // protection of an already-reserved-but-uncommitted range) must adopt the
         // NEW protection, so punch out the overlap before inserting.
         self.drop_reservation(start, (end - start) as usize);
-        self.reservations.push((start, end, writable, exec));
+        self.reservations.push((start, end, prot));
         self.reservations.sort_by_key(|&(s, ..)| s);
-        // Coalesce only ADJACENT/overlapping ranges that AGREE on BOTH writability
-        // and exec; ranges of differing protection must stay distinct so each
-        // commits its own leaf protection.
-        let mut merged: Vec<(u64, u64, bool, bool)> = Vec::with_capacity(self.reservations.len());
-        for &(s, e, w, x) in &self.reservations {
+        // Coalesce only adjacent/overlapping ranges that agree on the full
+        // protection. Differing protection must stay distinct so each page takes
+        // the right demand-commit behavior.
+        let mut merged: Vec<(u64, u64, ReservationProt)> =
+            Vec::with_capacity(self.reservations.len());
+        for &(s, e, p) in &self.reservations {
             match merged.last_mut() {
-                Some(last) if s <= last.1 && last.2 == w && last.3 == x => last.1 = last.1.max(e),
-                _ => merged.push((s, e, w, x)),
+                Some(last) if s <= last.1 && last.2 == p => last.1 = last.1.max(e),
+                _ => merged.push((s, e, p)),
             }
         }
         self.reservations = merged;
@@ -1084,27 +1114,28 @@ impl RamInner {
     /// The `(writable, exec)` protection of the reservation covering `va`, or
     /// `None` if `va` is not in any reservation. Used by the demand-commit so the
     /// leaf protection (R/W and NX) matches the guest's requested `prot`.
-    fn reservation_prot(&self, va: u64) -> Option<(bool, bool)> {
+    fn reservation_prot(&self, va: u64) -> Option<ReservationProt> {
         let page = va & !0xFFF;
         self.reservations
             .iter()
             .find(|&&(s, e, ..)| page >= s && page < e)
-            .map(|&(_, _, w, x)| (w, x))
+            .map(|&(_, _, p)| p)
     }
 
     fn drop_reservation(&mut self, va: u64, len: usize) {
         let start = va & !0xFFF;
         let end = (va.wrapping_add(len as u64).wrapping_add(0xFFF)) & !0xFFF;
-        let mut out: Vec<(u64, u64, bool, bool)> = Vec::with_capacity(self.reservations.len() + 1);
-        for &(s, e, w, x) in &self.reservations {
+        let mut out: Vec<(u64, u64, ReservationProt)> =
+            Vec::with_capacity(self.reservations.len() + 1);
+        for &(s, e, p) in &self.reservations {
             if end <= s || start >= e {
-                out.push((s, e, w, x)); // disjoint — keep
+                out.push((s, e, p)); // disjoint — keep
             } else {
                 if s < start {
-                    out.push((s, start, w, x)); // left remainder (same protection)
+                    out.push((s, start, p)); // left remainder (same protection)
                 }
                 if end < e {
-                    out.push((end, e, w, x)); // right remainder (same protection)
+                    out.push((end, e, p)); // right remainder (same protection)
                 }
             }
         }
@@ -1252,6 +1283,13 @@ impl BhyveGuestRam {
         self.lock().reserve(va, len, writable, exec);
     }
 
+    /// Record a PROT_NONE range. Raw backing probes may still observe the
+    /// reservation, but a guest first touch must fault instead of allocating a
+    /// readable zero page.
+    pub fn reserve_no_access(&self, va: u64, len: usize) {
+        self.lock().reserve_no_access(va, len);
+    }
+
     /// True iff the page containing `va` lies in a reservation range.
     pub fn find_reservation(&self, va: u64) -> bool {
         self.lock().find_reservation(va)
@@ -1322,22 +1360,26 @@ impl BhyveGuestRam {
     /// from committing the same page to divergent GPAs.
     pub fn commit_if_absent(&self, va: u64, len: usize) -> Result<CommitOutcome, OsError> {
         let mut inner = self.lock();
+        let prot = inner.reservation_prot(va);
+        if prot.is_some_and(|p| p.no_access) {
+            return Ok(CommitOutcome::NoAccess);
+        }
         if inner.resolve(va, 1).is_some() {
             return Ok(CommitOutcome::AlreadyMapped);
         }
-        let Some((writable, exec)) = inner.reservation_prot(va) else {
+        let Some(prot) = prot else {
             return Ok(CommitOutcome::NotReserved);
         };
         // The window's `write`/`exec` flags mirror the reservation's protection so
         // a read-only page commits a read-only leaf and a non-exec page commits an
         // NX leaf (see `map_aliased` in `demand_commit`). Read this BEFORE
         // drop_reservation clears it.
-        let gpa = inner.add_bump(va & !0xFFF, len, true, writable, exec)?;
+        let gpa = inner.add_bump(va & !0xFFF, len, true, prot.writable, prot.exec)?;
         inner.drop_reservation(va, len);
         Ok(CommitOutcome::Committed {
             gpa,
-            writable,
-            exec,
+            writable: prot.writable,
+            exec: prot.exec,
         })
     }
 
@@ -1638,6 +1680,23 @@ pub fn pml4_map_specs(ram: &BhyveGuestRam) -> Vec<Pml4MapSpec> {
             exec: w.exec,
         })
         .collect()
+}
+
+fn build_bhyve_pml4(ram: &BhyveGuestRam, ro_spans: &[RoSpan]) -> Result<Vec<u8>, OsError> {
+    let specs = pml4_map_specs(ram);
+    let tables = pml4_tables(&specs, X86_PML4_GPA, X86_PML4_CAPACITY)
+        .map_err(|e| OsError::new(format!("bhyve: ELF PML4 build failed: {e:?}")))?;
+    if ro_spans.is_empty() {
+        return Ok(tables);
+    }
+    let mut mgr = Pml4Manager::new(tables, X86_PML4_GPA);
+    for span in ro_spans {
+        let Ok(len) = usize::try_from(span.len) else {
+            continue;
+        };
+        let _ = mgr.set_readonly(span.start, len, span.exec);
+    }
+    Ok(mgr.into_bytes())
 }
 
 // ─── T6: BroughtUpX86 + bring_up_x86 ─────────────────────────────────────────
@@ -2317,10 +2376,10 @@ pub fn bring_up_x86_elf(
         }
     }
 
-    // PML4 tables: map all the windows.
-    let specs = pml4_map_specs(&ram);
-    let tables = pml4_tables(&specs, X86_PML4_GPA, X86_PML4_CAPACITY)
-        .map_err(|e| OsError::new(format!("bhyve: ELF PML4 build failed: {e:?}")))?;
+    // PML4 tables: map all the windows, then re-apply ELF read-only spans that
+    // may have been widened by image-region permission merging before this
+    // compact-GPA pass.
+    let tables = build_bhyve_pml4(&ram, image.ro_spans())?;
     write_gpa(&vm, X86_PML4_GPA, &tables)?;
 
     // ── Step 4: program vCPU registers ───────────────────────────────────────
@@ -2984,7 +3043,7 @@ mod tests {
     /// starting at X86_GPA_CURSOR_START and advances monotonically.
     #[test]
     fn bhyve_guest_ram_bump_allocates_monotonically() {
-        let mut ram = BhyveGuestRam::new();
+        let ram = BhyveGuestRam::new();
         let gpa0 = ram.plan_gpa(1).expect("first alloc");
         assert_eq!(gpa0, X86_GPA_CURSOR_START);
         let gpa1 = ram.plan_gpa(4096).expect("second alloc");
@@ -3007,6 +3066,7 @@ mod tests {
     fn commit_writable(ram: &BhyveGuestRam, va: u64) -> bool {
         match ram.commit_if_absent(va, 4096).expect("commit") {
             CommitOutcome::Committed { writable, .. } => writable,
+            CommitOutcome::NoAccess => panic!("unexpected NoAccess for {va:#x}"),
             CommitOutcome::AlreadyMapped => panic!("unexpected AlreadyMapped for {va:#x}"),
             CommitOutcome::NotReserved => panic!("unexpected NotReserved for {va:#x}"),
         }
@@ -3055,6 +3115,37 @@ mod tests {
         ));
     }
 
+    /// A PROT_NONE reservation must not be demand-committed as a read-only page:
+    /// a first READ must fault, then a signal handler's mprotect(RW) must be able
+    /// to replace that reservation with a normal writable one.
+    #[test]
+    fn no_access_reservation_does_not_commit_until_reprotected() {
+        let ram = BhyveGuestRam::new();
+        let va = 0x60_0002_0000;
+
+        ram.reserve_no_access(va, 4096);
+        assert!(
+            ram.find_reservation(va),
+            "raw mprotect probes must still see the reserved mapping"
+        );
+        assert!(matches!(
+            ram.commit_if_absent(va, 4096).expect("no-access commit"),
+            CommitOutcome::NoAccess
+        ));
+        assert_eq!(
+            ram.resolve(va, 1),
+            None,
+            "PROT_NONE first touch must not allocate a readable backing"
+        );
+
+        ram.reserve(va, 4096, true, false);
+        assert!(
+            commit_writable(&ram, va),
+            "mprotect(RW) replaces no-access with a normal writable reservation"
+        );
+        assert!(ram.resolve(va, 1).is_some(), "RW retry commits backing");
+    }
+
     /// Reservations of differing protection do NOT coalesce: adjacent
     /// PROT_READ / PROT_WRITE mmaps each commit their own leaf protection.
     #[test]
@@ -3088,6 +3179,7 @@ mod tests {
         ram.reserve(va, 4096, true, true);
         let g1 = match ram.commit_if_absent(va, 4096).expect("commit") {
             CommitOutcome::Committed { gpa, .. } => gpa,
+            CommitOutcome::NoAccess => panic!("unexpected NoAccess"),
             _ => panic!("expected Committed"),
         };
         assert_eq!(ram.resolve(va, 1), Some(g1), "committed VA resolves to G1");
@@ -3101,6 +3193,7 @@ mod tests {
         ram.reserve(va, 4096, true, true);
         let g2 = match ram.commit_if_absent(va, 4096).expect("recommit") {
             CommitOutcome::Committed { gpa, .. } => gpa,
+            CommitOutcome::NoAccess => panic!("unexpected NoAccess on reuse"),
             _ => panic!("expected Committed on reuse"),
         };
         assert_ne!(
@@ -3145,7 +3238,7 @@ mod tests {
     /// 64 MiB lowmem window.
     #[test]
     fn bhyve_guest_ram_overflow_returns_error() {
-        let mut ram = BhyveGuestRam::new();
+        let ram = BhyveGuestRam::new();
         // Request more than X86_MEM_SIZE in one shot.
         let result = ram.plan_gpa(X86_MEM_SIZE + 1);
         assert!(result.is_err(), "overflow must return Err");
@@ -3330,7 +3423,7 @@ mod tests {
     /// pml4_map_specs converts BhyveGuestRam windows to Pml4MapSpec correctly.
     #[test]
     fn pml4_map_specs_round_trips_windows() {
-        let mut ram = BhyveGuestRam::new();
+        let ram = BhyveGuestRam::new();
         ram.add_fixed(0x1000_0000, 0x5000, 4096, true, true, false);
         ram.add_fixed(0x2000_0000, 0x6000, 8192, false, false, true);
         let specs = pml4_map_specs(&ram);
@@ -3343,6 +3436,40 @@ mod tests {
         assert_eq!(specs[1].va, 0x2000_0000);
         assert!(!specs[1].user);
         assert!(specs[1].exec);
+    }
+
+    /// The compact-GPA bhyve boot PML4 must re-apply ELF read-only spans after
+    /// window planning. The window may be writable because image-region merging
+    /// widened permissions, but a guest store to the span must still #PF.
+    #[test]
+    fn bhyve_pml4_applies_ro_spans_over_compact_gpa_windows() {
+        use carrick_mem::pml4::{PML4_NX, PML4_P, PML4_RW, walk_descriptors};
+
+        let ram = BhyveGuestRam::new();
+        ram.add_fixed(0x400000, X86_GPA_CURSOR_START, 0x3000, true, true, true);
+        let ro = [RoSpan {
+            start: 0x401000,
+            len: 0x1000,
+            exec: false,
+        }];
+        let tables = build_bhyve_pml4(&ram, &ro).expect("bhyve pml4");
+
+        let ro_leaf = walk_descriptors(&tables, X86_PML4_GPA, 0x401000)[3];
+        assert_ne!(ro_leaf & PML4_P, 0, "RO span leaf stays present");
+        assert_eq!(ro_leaf & PML4_RW, 0, "RO span leaf loses R/W");
+        assert_ne!(ro_leaf & PML4_NX, 0, "non-exec RO span gains NX");
+        assert_eq!(
+            ro_leaf & 0x000F_FFFF_FFFF_F000,
+            X86_GPA_CURSOR_START + 0x1000,
+            "compact VA->GPA mapping is preserved"
+        );
+
+        let writable_leaf = walk_descriptors(&tables, X86_PML4_GPA, 0x400000)[3];
+        assert_ne!(
+            writable_leaf & PML4_RW,
+            0,
+            "neighboring widened page remains writable"
+        );
     }
 
     /// The access-rights constants have the correct VT-x format.
