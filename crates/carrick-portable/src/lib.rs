@@ -88,6 +88,54 @@ pub fn set_errno(value: i32) {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+unsafe extern "C" {
+    #[link_name = "ptsname_r"]
+    fn darwin_ptsname_r(
+        fd: libc::c_int,
+        buf: *mut libc::c_char,
+        buflen: libc::size_t,
+    ) -> libc::c_int;
+}
+
+/// `ptsname_r(3)` with one stable libc-shaped signature.
+///
+/// The libc crate exposes this on Linux, FreeBSD, and NetBSD, but not Darwin.
+/// Darwin still provides the symbol, so keep the raw binding here instead of in
+/// runtime code.
+///
+/// # Safety
+///
+/// `buf` must be valid for writes of `buflen` bytes, and `fd` must be a pty
+/// master accepted by the host `ptsname_r`.
+#[inline]
+pub unsafe fn ptsname_r(
+    fd: libc::c_int,
+    buf: *mut libc::c_char,
+    buflen: libc::size_t,
+) -> libc::c_int {
+    #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
+    {
+        unsafe { libc::ptsname_r(fd, buf, buflen) }
+    }
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        unsafe { darwin_ptsname_r(fd, buf, buflen) }
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "macos",
+        target_os = "ios"
+    )))]
+    {
+        let _ = (fd, buf, buflen);
+        set_errno(libc::ENOSYS);
+        -1
+    }
+}
+
 /// OFD (open file description) lock fcntl commands. Linux and macOS libc define
 /// `F_OFD_*`; FreeBSD and NetBSD have no OFD locks, so we map them to the regular
 /// (process) lock commands — the lock still takes effect, with per-process rather

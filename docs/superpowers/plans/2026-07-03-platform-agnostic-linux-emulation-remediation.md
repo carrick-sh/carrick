@@ -181,12 +181,14 @@ This plan is therefore a master remediation ledger. Each task below is an indepe
 - Produces: cfg-correct pty naming, process ancestry, and thread CPU accounting.
 - Consumes: existing `carrick-portable` OS shim and `/proc` emulation call sites.
 
-- [ ] Move pty slave-name resolution behind `carrick-portable`; use `libc` functions where available and cfg out unsupported host calls cleanly.
-- [ ] Add a NetBSD build gate that proves `ptsname_r` no longer hard-links from runtime code when absent.
-- [ ] Implement NetBSD `pid_info` and `parent_pid` from a clean host API source, or return a documented Linux-compatible absence only for inaccessible non-guest processes.
-- [ ] Add FreeBSD and NetBSD `self_thread_cpu_us` support if host APIs provide per-thread accounting; otherwise document why `RUSAGE_THREAD` parity cannot be claimed on that host.
+- [x] Move pty slave-name resolution behind `carrick-portable`; use `libc` functions where available and cfg out unsupported host calls cleanly.
+- [x] Add a NetBSD build gate that proves `ptsname_r` no longer hard-links from runtime code when absent.
+- [x] Implement NetBSD `pid_info` and `parent_pid` from a clean host API source, or return a documented Linux-compatible absence only for inaccessible non-guest processes.
+- [x] Add FreeBSD and NetBSD `self_thread_cpu_us` support if host APIs provide per-thread accounting; otherwise document why `RUSAGE_THREAD` parity cannot be claimed on that host.
 - [ ] Verify with target-host `cargo build -p carrick-cli --no-default-features --features platform-netbsd` and `platform-freebsd`.
-- [ ] Commit as `fix(portable): gate bsd host introspection`.
+- [x] Commit as `fix(portable): gate bsd host introspection`.
+
+**Local evidence:** `cargo check -p carrick-portable`, `cargo check -p carrick-portable --target x86_64-unknown-freebsd`, `cargo check -p carrick-portable --target x86_64-unknown-netbsd`, `cargo check -p carrick-host`, `cargo check -p carrick-host --target x86_64-unknown-freebsd`, `cargo check -p carrick-host --target x86_64-unknown-netbsd`, `cargo check -p carrick-runtime --lib`, and `cargo test -p carrick-host --lib` pass. Full `carrick-runtime`/`carrick-cli` FreeBSD and NetBSD cross-checks from macOS remain blocked before Carrick code by `ring` needing target C headers/toolchains (`assert.h` missing for FreeBSD, `x86_64--netbsd-gcc` missing for NetBSD); run those on the target hosts.
 
 ## Task 6: Validate And Improve MAP_SHARED Semantics
 

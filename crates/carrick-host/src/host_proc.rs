@@ -475,14 +475,17 @@ mod imp {
 ///     procfs is not even mounted by default — `/proc/<pid>/stat` reads fail,
 ///     so the Linux path is inert there and returned zeros.)
 ///   * **FreeBSD** — `sysctl(KERN_PROC_PID)` → `struct kinfo_proc`, the BSD
-///     analogue of `/proc/<pid>/stat`: it carries ppid/pgid/state/comm/creds
-///     AND the resident/virtual size and a full `struct rusage` (maxrss, CPU,
-///     faults) for ANY pid the caller may signal. This is the durable,
-///     fork-coherent, cross-process kernel bookkeeping the project prefers over
-///     in-process shadow state.
+///     analogue of `/proc/<pid>/stat`.
+///   * **NetBSD** — `sysctl(KERN_PROC2, KERN_PROC_PID, ...)` →
+///     `struct kinfo_proc2`, the NetBSD analogue of `/proc/<pid>/stat`.
 ///
-/// Reads degrade to `None`/`false` on any failure (also keeping a host with
-/// neither surface — e.g. NetBSD until its `kinfo_proc2` path lands — inert).
+/// Both BSD records carry ppid/pgid/state/comm/creds and resident/virtual size
+/// for ANY pid the caller may inspect. This is the durable, fork-coherent,
+/// cross-process kernel bookkeeping the project prefers over in-process shadow
+/// state.
+///
+/// Reads degrade to `None`/`false` on any failure (also keeping any future host
+/// with neither surface inert).
 #[cfg(not(target_os = "macos"))]
 mod imp {
     use super::{GuestProcInfo, ResourceUsage};
@@ -551,6 +554,65 @@ mod imp {
         pub(super) fn comm(kp: &libc::kinfo_proc) -> String {
             let bytes: Vec<u8> = kp
                 .ki_comm
+                .iter()
+                .take_while(|&&c| c != 0)
+                .map(|&c| c as u8)
+                .collect();
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+    }
+
+    /// NetBSD `kinfo_proc2` via `sysctl(KERN_PROC2, KERN_PROC_PID)` — the BSD
+    /// source of truth for a process's identity, state, and resource usage.
+    #[cfg(target_os = "netbsd")]
+    mod netbsd {
+        /// Read exactly one `kinfo_proc2` for `pid`. NetBSD's KERN_PROC2 mib is
+        /// `{ CTL_KERN, KERN_PROC2, KERN_PROC_PID, pid, sizeof(kinfo_proc2), 1 }`.
+        pub(super) fn read_kinfo(pid: u32) -> Option<libc::kinfo_proc2> {
+            let mut mib: [libc::c_int; 6] = [
+                libc::CTL_KERN,
+                libc::KERN_PROC2,
+                libc::KERN_PROC_PID,
+                pid as libc::c_int,
+                std::mem::size_of::<libc::kinfo_proc2>() as libc::c_int,
+                1,
+            ];
+            let mut kp: libc::kinfo_proc2 = unsafe { std::mem::zeroed() };
+            let mut len = std::mem::size_of::<libc::kinfo_proc2>();
+            // SAFETY: a documented KERN_PROC2 mib and one correctly sized
+            // zeroed out-buffer. The kernel writes at most `len` bytes and
+            // updates `len` to what it wrote.
+            let rc = unsafe {
+                libc::sysctl(
+                    mib.as_mut_ptr(),
+                    mib.len() as libc::c_uint,
+                    &mut kp as *mut libc::kinfo_proc2 as *mut libc::c_void,
+                    &mut len,
+                    std::ptr::null(),
+                    0,
+                )
+            };
+            if rc == 0 && len >= std::mem::size_of::<libc::kinfo_proc2>() {
+                Some(kp)
+            } else {
+                None
+            }
+        }
+
+        /// The Linux `/proc/<pid>/stat` state char for a NetBSD `p_stat`.
+        pub(super) fn state_char(p_stat: i8) -> char {
+            match p_stat as libc::c_int {
+                libc::LSRUN | libc::LSIDL => 'R',
+                libc::LSSTOP => 'T',
+                libc::LSZOMB => 'Z',
+                _ => 'S',
+            }
+        }
+
+        /// `p_comm` (NUL-padded `c_char` array) as a Rust String.
+        pub(super) fn comm(kp: &libc::kinfo_proc2) -> String {
+            let bytes: Vec<u8> = kp
+                .p_comm
                 .iter()
                 .take_while(|&&c| c != 0)
                 .map(|&c| c as u8)
@@ -647,9 +709,22 @@ mod imp {
         })
     }
 
-    /// Any other non-macOS host without a wired process source (e.g. NetBSD
-    /// until `kinfo_proc2` lands): inert.
-    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+    /// NetBSD `pid_info`: read the `kinfo_proc2` directly (no procfs).
+    #[cfg(target_os = "netbsd")]
+    pub fn pid_info(pid: u32) -> Option<GuestProcInfo> {
+        let kp = netbsd::read_kinfo(pid)?;
+        Some(GuestProcInfo {
+            state: netbsd::state_char(kp.p_stat),
+            ppid: kp.p_ppid.max(0) as u32,
+            pgid: kp.p__pgid.max(0) as u32,
+            uid: kp.p_ruid,
+            gid: kp.p_rgid,
+            comm: netbsd::comm(&kp),
+        })
+    }
+
+    /// Any other non-macOS host without a wired process source: inert.
+    #[cfg(not(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd")))]
     pub fn pid_info(_pid: u32) -> Option<GuestProcInfo> {
         None
     }
@@ -665,7 +740,11 @@ mod imp {
     fn parent_pid(cur: u32) -> Option<u32> {
         freebsd::read_kinfo(cur).map(|kp| kp.ki_ppid.max(0) as u32)
     }
-    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+    #[cfg(target_os = "netbsd")]
+    fn parent_pid(cur: u32) -> Option<u32> {
+        netbsd::read_kinfo(cur).map(|kp| kp.p_ppid.max(0) as u32)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd")))]
     fn parent_pid(_cur: u32) -> Option<u32> {
         None
     }
@@ -807,7 +886,49 @@ mod imp {
             }
             Some(usage)
         }
-        #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+        #[cfg(target_os = "netbsd")]
+        {
+            let mut usage = ResourceUsage::default();
+
+            let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+            // SAFETY: getrusage(RUSAGE_SELF) fills `ru`; a zeroed rusage is a
+            // valid out-buffer.
+            let ru_ok = unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) } == 0;
+            if ru_ok {
+                let to_us = |tv: libc::timeval| tv.tv_sec as u64 * 1_000_000 + tv.tv_usec as u64;
+                usage.user_us = to_us(ru.ru_utime);
+                usage.system_us = to_us(ru.ru_stime);
+                usage.maxrss_bytes = (ru.ru_maxrss.max(0) as u64).saturating_mul(1024);
+                usage.majflt = ru.ru_majflt.max(0) as u64;
+            }
+
+            let mut ruc: libc::rusage = unsafe { std::mem::zeroed() };
+            // SAFETY: same contract for RUSAGE_CHILDREN.
+            if unsafe { libc::getrusage(libc::RUSAGE_CHILDREN, &mut ruc) } == 0 {
+                let to_us = |tv: libc::timeval| tv.tv_sec as u64 * 1_000_000 + tv.tv_usec as u64;
+                usage.child_user_us = to_us(ruc.ru_utime);
+                usage.child_system_us = to_us(ruc.ru_stime);
+            }
+
+            let mut kinfo_ok = false;
+            if let Some(kp) = netbsd::read_kinfo(std::process::id()) {
+                // SAFETY: sysconf(_SC_PAGESIZE) has no side effects; >0 on NetBSD.
+                let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(0) as u64;
+                usage.virtual_bytes = kp.p_vm_vsize.max(0) as u64;
+                usage.resident_bytes = (kp.p_vm_rssize.max(0) as u64).saturating_mul(page);
+                kinfo_ok = true;
+            }
+
+            if usage.maxrss_bytes < usage.resident_bytes {
+                usage.maxrss_bytes = usage.resident_bytes;
+            }
+
+            if !ru_ok && !kinfo_ok {
+                return None;
+            }
+            Some(usage)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd")))]
         {
             None
         }
@@ -821,9 +942,11 @@ mod imp {
     /// The dispatcher runs on the same host thread as the vCPU that issued
     /// the syscall, so "current thread" is the right scope — mirroring the
     /// macOS impl, which reads the calling host thread's
-    /// `thread_info(THREAD_BASIC_INFO)`. Non-Linux non-macOS stays inert.
+    /// `thread_info(THREAD_BASIC_INFO)`. FreeBSD exposes the same scope as
+    /// `RUSAGE_THREAD`; NetBSD's libc target does not expose an equivalent
+    /// per-thread rusage selector, so that host stays inert here.
     pub fn self_thread_cpu_us() -> Option<(u64, u64)> {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
         {
             let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
             // SAFETY: getrusage(RUSAGE_THREAD) fills `ru` for the calling
@@ -834,7 +957,7 @@ mod imp {
             let to_us = |tv: libc::timeval| tv.tv_sec as u64 * 1_000_000 + tv.tv_usec as u64;
             Some((to_us(ru.ru_utime), to_us(ru.ru_stime)))
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
         {
             None
         }
