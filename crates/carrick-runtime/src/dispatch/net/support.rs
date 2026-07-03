@@ -1568,6 +1568,19 @@ fn xattr_unix_path_for(host_path: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
+fn is_private_unix_host_path(host_path: &[u8]) -> bool {
+    let nul = host_path
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(host_path.len());
+    if nul == 0 {
+        return false;
+    }
+    use std::os::unix::ffi::OsStringExt;
+    let path = std::path::PathBuf::from(std::ffi::OsString::from_vec(host_path[..nul].to_vec()));
+    path.starts_with(unix_socket_host_dir())
+}
+
 /// Translate a Linux-formatted sockaddr (read from guest memory) into the
 /// macOS BSD form. Returns the host-formatted bytes ready to hand to
 /// libc::bind/connect/sendto.
@@ -1737,11 +1750,17 @@ pub(super) fn host_to_linux_sockaddr(
             // IT used (not carrick's <hash>.sock host node). Try this process's
             // registry first; on a miss (a peer bound by ANOTHER carrick process,
             // so its mapping isn't in our memory) read the guest path the binder
-            // stamped into the node's user.carrick.unix_path xattr; only a node
-            // with neither passes the raw host path through.
+            // stamped into the node's user.carrick.unix_path xattr. If this is one
+            // of Carrick's private hashed socket nodes and both metadata sources
+            // miss, return a family-only AF_UNIX address instead of leaking the
+            // raw host `<hash>.sock` path to the guest.
             let path_out = guest_unix_path_for(&host_path[..nul])
                 .or_else(|| xattr_unix_path_for(&host_path[..nul]));
-            let path_bytes: &[u8] = path_out.as_deref().unwrap_or(&host_path[..nul]);
+            let path_bytes: &[u8] = match path_out.as_deref() {
+                Some(path) => path,
+                None if is_private_unix_host_path(&host_path[..nul]) => &[],
+                None => &host_path[..nul],
+            };
             let mut out = vec![0u8; 2 + path_bytes.len()];
             out[0..2].copy_from_slice(&linux_family.to_ne_bytes());
             out[2..].copy_from_slice(path_bytes);
@@ -2464,6 +2483,29 @@ mod tests {
             guest_path,
             "must reverse-translate the host node to the guest sun_path via the xattr"
         );
+    }
+
+    #[test]
+    fn host_to_linux_sockaddr_unix_does_not_leak_private_hash_path_without_metadata() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = unix_socket_host_dir();
+        std::fs::create_dir_all(&dir).expect("create private unix dir");
+        let node = dir.join(format!("carrick-unmapped-{}.sock", std::process::id()));
+        std::fs::write(&node, b"").expect("create temp host node");
+
+        let mut bytes = vec![0u8, libc::AF_UNIX as u8];
+        bytes.extend_from_slice(node.as_os_str().as_bytes());
+        bytes.push(0);
+
+        let out = host_to_linux_sockaddr(&bytes, 0, false);
+        let _ = std::fs::remove_file(&node);
+
+        assert_eq!(
+            out.len(),
+            2,
+            "unmapped private carrick AF_UNIX host paths must not leak to the guest: {out:?}"
+        );
+        assert_eq!(u16::from_ne_bytes([out[0], out[1]]) as i32, LINUX_AF_UNIX);
     }
 
     #[test]

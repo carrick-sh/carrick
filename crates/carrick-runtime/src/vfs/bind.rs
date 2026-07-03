@@ -122,12 +122,6 @@ fn open_watch_fd(host: &Path) -> Result<i32, VfsError> {
 #[cfg(not(target_os = "macos"))]
 const LINK_OWNER_SIDECAR_PREFIX: &str = ".carrick-lnkown.";
 
-/// True iff `name` is a per-symlink owner sidecar (filtered from `readdir`).
-#[cfg(not(target_os = "macos"))]
-fn is_link_owner_sidecar_name(name: &str) -> bool {
-    name.starts_with(LINK_OWNER_SIDECAR_PREFIX)
-}
-
 /// The sidecar path for the symlink at host path `link`: same directory, name
 /// prefixed with [`LINK_OWNER_SIDECAR_PREFIX`]. `None` if `link` has no file
 /// name (e.g. is the root) — a symlink always has one, so this is defensive.
@@ -386,8 +380,7 @@ impl Vfs for BindVfs {
             let name = entry.file_name().to_string_lossy().into_owned();
             // Hide carrick's per-symlink owner sidecars (non-macOS owner store):
             // they are an internal metadata store, not guest-visible entries.
-            #[cfg(not(target_os = "macos"))]
-            if is_link_owner_sidecar_name(&name) {
+            if crate::fs_backend::is_internal_sidecar_name(&name) {
                 continue;
             }
             let file_type = entry.file_type().map_err(map_io_error)?;
@@ -809,6 +802,26 @@ mod tests {
         let vfs = BindVfs::new("/workspace", src.clone(), true);
         assert_eq!(vfs.rmdir("/workspace"), Err(LINUX_EROFS));
         assert_eq!(vfs.unlink("/workspace/x"), Err(LINUX_EROFS));
+        let _ = std::fs::remove_dir_all(&src);
+    }
+
+    #[test]
+    fn readdir_hides_internal_sidecar_entries() {
+        let src = std::env::temp_dir().join(format!("carrick-bind-sidecar-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&src);
+        std::fs::create_dir_all(&src).expect("create src");
+        std::fs::write(src.join("visible"), b"ok").expect("write visible");
+        std::fs::write(src.join(".carrick-lnkown.visible"), b"uid=0\n").expect("write sidecar");
+
+        let vfs = BindVfs::new("/workspace", src.clone(), false);
+        let names: Vec<_> = vfs
+            .readdir("/workspace")
+            .expect("readdir")
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+
+        assert_eq!(names, vec!["visible"]);
         let _ = std::fs::remove_dir_all(&src);
     }
 }

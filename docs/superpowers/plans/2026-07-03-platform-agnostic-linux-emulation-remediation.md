@@ -159,13 +159,15 @@ This plan is therefore a master remediation ledger. Each task below is an indepe
 - Produces: shared internal-metadata predicates and explicit AF_UNIX persistence failure behavior.
 - Consumes: bind-VFS symlink owner sidecars, rootfs overlay directory enumeration, xattr-backed AF_UNIX path stamps.
 
-- [ ] Move `is_link_owner_sidecar` or an equivalent predicate to a module usable by both bind and rootfs overlay enumeration.
-- [ ] Add a regression test where a rootfs directory contains `.carrick-lnkown.<name>` and assert guest readdir hides it.
-- [ ] Add NetBSD `copy_user_xattrs` using the host extattr/xattr API available on NetBSD, or make cache seeding preserve virtual uid/gid by avoiding metadata-dropping fast paths on NetBSD.
-- [ ] Change AF_UNIX bind persistence so xattr failure records an explicit non-persistent state; do not later leak a private host `<hash>.sock` path as if it were guest-visible truth.
-- [ ] Add a test for xattr-unavailable AF_UNIX nodes that expects either the original guest path from durable fallback metadata or a Linux-compatible failure, never host path leakage.
-- [ ] Verify with `cargo test -p carrick-runtime sidecar xattr unix`.
-- [ ] Commit as `fix(runtime): hide internal metadata across backends`.
+- [x] Move `is_link_owner_sidecar` or an equivalent predicate to a module usable by both bind and rootfs overlay enumeration.
+- [x] Add a regression test where a rootfs directory contains `.carrick-lnkown.<name>` and assert guest readdir hides it.
+- [x] Add NetBSD `copy_user_xattrs` using the host extattr/xattr API available on NetBSD, or make cache seeding preserve virtual uid/gid by avoiding metadata-dropping fast paths on NetBSD.
+- [x] Change AF_UNIX bind persistence so xattr failure records an explicit non-persistent state; do not later leak a private host `<hash>.sock` path as if it were guest-visible truth.
+- [x] Add a test for xattr-unavailable AF_UNIX nodes that expects either the original guest path from durable fallback metadata or a Linux-compatible failure, never host path leakage.
+- [x] Verify with `cargo test -p carrick-runtime sidecar xattr unix`.
+- [x] Commit as `fix(runtime): hide internal metadata across backends`.
+
+**Local evidence:** `cargo test -p carrick-runtime readdir_hides_internal_sidecar_entries --lib`, `cargo test -p carrick-runtime layered_directory_entries_hide_internal_sidecar_names --lib`, `cargo test -p carrick-runtime sidecar --lib`, `cargo test -p carrick-runtime unix --lib`, `cargo test -p carrick-runtime host_to_linux_sockaddr_unix_falls_back_to_xattr_across_processes --lib`, and `cargo check -p carrick-portable --target x86_64-unknown-netbsd` pass. NetBSD layer-cache fast seeding remains conservative: the current runtime does not enable the Linux/FreeBSD `replicate_tree` cache path on NetBSD, so no metadata-dropping seed path was added in this task; real NetBSD scratch-cache behavior remains a target-host gate.
 
 ## Task 5: Make NetBSD And BSD Host Introspection Buildable
 

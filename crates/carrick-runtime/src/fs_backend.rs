@@ -2648,8 +2648,15 @@ fn path_set_u32_xattr(dir: &cap_std::fs::Dir, rel: &Path, name: &[u8], val: u32)
 /// which is fork-coherent (a real on-disk file under the rootfs, inherited
 /// across `libc::fork`, NOT an in-process map) and resolved through the SAME
 /// cap-std `Dir` as the link itself. macOS keeps the XATTR_NOFOLLOW path above.
-#[cfg(not(target_os = "macos"))]
+const LINK_OWNER_SIDECAR_PREFIX: &str = ".carrick-lnkown.";
 const LINK_XATTR_SIDECAR_PREFIX: &str = ".carrick-lnkxattr.";
+
+/// True iff `name` is one of carrick's internal per-symlink sidecar files.
+/// Directory enumeration must hide these regardless of backend: they are
+/// metadata storage, not guest-visible files.
+pub(crate) fn is_internal_sidecar_name(name: &str) -> bool {
+    name.starts_with(LINK_OWNER_SIDECAR_PREFIX) || name.starts_with(LINK_XATTR_SIDECAR_PREFIX)
+}
 
 /// Map a carrick xattr name (`b"user.carrick.uid\0"`) to its short sidecar key
 /// (`uid`). Returns `None` for an unrecognised name (defensive; only the three
@@ -2675,12 +2682,6 @@ fn link_xattr_sidecar_rel(rel: &Path, key: &str) -> Option<std::path::PathBuf> {
         Some(parent) if !parent.as_os_str().is_empty() => parent.join(file),
         _ => std::path::PathBuf::from(file),
     })
-}
-
-/// True iff `name` is a per-symlink xattr sidecar (hidden from `readdir`).
-#[cfg(not(target_os = "macos"))]
-pub(crate) fn is_link_xattr_sidecar_name(name: &str) -> bool {
-    name.starts_with(LINK_XATTR_SIDECAR_PREFIX)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -3349,8 +3350,7 @@ impl FsBackend for HostFsBackend {
             let name = entry.file_name().to_string_lossy().into_owned();
             // Hide carrick's per-symlink xattr sidecars (non-macOS owner store):
             // an internal metadata file, not a guest-visible directory entry.
-            #[cfg(not(target_os = "macos"))]
-            if is_link_xattr_sidecar_name(&name) {
+            if is_internal_sidecar_name(&name) {
                 continue;
             }
             let kind = match entry.file_type() {
@@ -4522,6 +4522,9 @@ pub fn layered_directory_entries(
         match rootfs.directory_entries(dir) {
             Ok(entries) => {
                 for entry in entries {
+                    if is_internal_sidecar_name(&entry.name) {
+                        continue;
+                    }
                     if deleted.contains(&entry.name) {
                         continue;
                     }
@@ -4540,6 +4543,9 @@ pub fn layered_directory_entries(
     }
 
     for (name, kind) in overlay.child_names(dir) {
+        if is_internal_sidecar_name(&name) {
+            continue;
+        }
         if seen.contains(&name) || deleted.contains(&name) {
             continue;
         }
@@ -4721,6 +4727,19 @@ mod tests {
     #[test]
     fn memory_child_names_only_immediate() {
         scenario_child_names_only_immediate(&mut MemoryBackend::new());
+    }
+
+    #[test]
+    fn layered_directory_entries_hide_internal_sidecar_names() {
+        let b = MemoryBackend::new();
+        b.make_dir("/dir").unwrap();
+        b.create_file("/dir/visible").unwrap();
+        b.create_file("/dir/.carrick-lnkown.visible").unwrap();
+
+        let entries = layered_directory_entries(&b, None, "/dir").unwrap();
+        let names: Vec<_> = entries.into_iter().map(|entry| entry.name).collect();
+
+        assert_eq!(names, vec!["visible"]);
     }
 
     #[test]
