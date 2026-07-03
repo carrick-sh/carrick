@@ -1059,6 +1059,24 @@ impl InotifyRegistry {
         );
     }
 
+    /// Cheap test: does a watch exist on the PARENT directory of `child_path`
+    /// (the only kind of watch `notify_child_excl` can route an event to)? A
+    /// hot write path uses this to SKIP the expensive `path_exists`
+    /// (resolve+stat) that only feeds `IN_EXCL_UNLINK` — when the watch is on
+    /// the file ITSELF and not its parent dir (inotify09), there is no consumer,
+    /// so the stat is pure waste 158k times over. One `HashMap` lookup.
+    pub(crate) fn parent_watch_exists_for(&self, child_path: &str) -> bool {
+        let norm = normalize_watch_path(child_path);
+        let (parent, name) = split_parent_name(&norm);
+        if name.is_empty() {
+            return false;
+        }
+        self.by_path
+            .read()
+            .get(parent)
+            .is_some_and(|watches| !watches.is_empty())
+    }
+
     /// Emit a rename pair: `IN_MOVED_FROM` (basename of `from`) on `from`'s
     /// parent and `IN_MOVED_TO` (basename of `to`) on `to`'s parent, tied by one
     /// freshly drawn cookie *per watching instance* (the kernel pairs them by
