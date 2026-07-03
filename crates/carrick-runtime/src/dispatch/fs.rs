@@ -426,6 +426,18 @@ fn check_path_length(path: &str) -> Result<(), LinuxErrno> {
     Ok(())
 }
 
+fn path_is_under_or_equal(path: &str, root: &str) -> bool {
+    let path = path.trim_end_matches('/');
+    let root = root.trim_end_matches('/');
+    if root.is_empty() || root == "/" {
+        return true;
+    }
+    path == root
+        || path
+            .strip_prefix(root)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
 /// Host passthrough for tee(2). On Linux the guest pipes are real host kernel
 /// pipes, so the host tee(2) gives exact zero-consume semantics; on other hosts
 /// (macOS) there is no tee(2), so it stays ENOSYS as before.
@@ -1169,6 +1181,18 @@ impl SyscallDispatcher {
         memory: &impl GuestMemory,
         reporter: &CompatReporter,
     ) -> Result<DispatchOutcome, DispatchError> {
+        let path = read_guest_c_string(memory, pathname)?;
+        self.open_at_path_string(dirfd, &path, flags, mode, reporter)
+    }
+
+    fn open_at_path_string(
+        &self,
+        dirfd: u64,
+        path: &str,
+        flags: u64,
+        mode: u64,
+        reporter: &CompatReporter,
+    ) -> Result<DispatchOutcome, DispatchError> {
         let access = flags & LINUX_O_ACCMODE;
         if access != LINUX_O_RDONLY && access != LINUX_O_WRONLY && access != LINUX_O_RDWR {
             return Ok(DispatchOutcome::errno(LINUX_EINVAL));
@@ -1240,7 +1264,6 @@ impl SyscallDispatcher {
             return Ok(self.install_fd(description, linux_fd_flags_from_open_flags(flags)));
         }
 
-        let path = read_guest_c_string(memory, pathname)?;
         // An empty pathname is never valid for open()/openat(): the kernel's
         // path walk requires at least one component and returns ENOENT for ""
         // (openat has no AT_EMPTY_PATH — that flag is only for the *at() metadata
@@ -1261,7 +1284,7 @@ impl SyscallDispatcher {
         // (test_copyfile_nonexistent_dir). Note the raw guest bytes, before
         // resolution collapses the slash.
         let had_trailing_slash = path.len() > 1 && path.ends_with('/');
-        let path = self.resolve_at_path(dirfd, &path)?;
+        let path = self.resolve_at_path(dirfd, path)?;
         if want_create && had_trailing_slash {
             return Ok(DispatchOutcome::errno(LINUX_EISDIR));
         }
@@ -3165,6 +3188,165 @@ impl SyscallDispatcher {
             // the non-file kinds).
             _ => DispatchOutcome::Returned { value: 0 },
         }
+    }
+
+    fn openat2_checked_path<'a>(
+        &self,
+        dirfd: u64,
+        path: &'a str,
+        resolve: u64,
+    ) -> Result<std::borrow::Cow<'a, str>, LinuxErrno> {
+        const RESOLVE_NO_XDEV: u64 = 0x01;
+        const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+        const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+        const RESOLVE_BENEATH: u64 = 0x08;
+        const RESOLVE_IN_ROOT: u64 = 0x10;
+
+        if resolve == 0 {
+            return Ok(std::borrow::Cow::Borrowed(path));
+        }
+
+        let anchor = self.openat2_anchor_for_dirfd(dirfd)?;
+        let effective_path = if resolve & RESOLVE_IN_ROOT != 0 && Path::new(path).is_absolute() {
+            std::borrow::Cow::Owned(join_rootfs_path(&anchor, path.trim_start_matches('/')))
+        } else {
+            std::borrow::Cow::Borrowed(path)
+        };
+
+        if resolve & RESOLVE_BENEATH != 0 {
+            if Path::new(path).is_absolute() {
+                return Err(crate::linux_abi::LINUX_EXDEV);
+            }
+            let resolved = self.resolve_at_path(dirfd, path)?;
+            if !path_is_under_or_equal(&resolved, &anchor) {
+                return Err(crate::linux_abi::LINUX_EXDEV);
+            }
+        }
+
+        if resolve & RESOLVE_IN_ROOT != 0 && !Path::new(path).is_absolute() {
+            let resolved = self.resolve_at_path(dirfd, path)?;
+            if !path_is_under_or_equal(&resolved, &anchor) {
+                return Err(LINUX_ENOENT);
+            }
+        }
+
+        if resolve & RESOLVE_NO_XDEV != 0
+            && self.openat2_crosses_vfs_mount(&anchor, effective_path.as_ref())
+        {
+            return Err(crate::linux_abi::LINUX_EXDEV);
+        }
+
+        if resolve & (RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS) != 0
+            && self.openat2_touches_magic_link(&anchor, effective_path.as_ref())
+        {
+            return Err(crate::linux_abi::LINUX_ELOOP);
+        }
+
+        if resolve & RESOLVE_NO_SYMLINKS != 0
+            && self.openat2_touches_symlink(&anchor, effective_path.as_ref())?
+        {
+            return Err(crate::linux_abi::LINUX_ELOOP);
+        }
+
+        Ok(effective_path)
+    }
+
+    fn openat2_anchor_for_dirfd(&self, dirfd: u64) -> Result<String, LinuxErrno> {
+        let dirfd = (dirfd as i32) as i64 as u64;
+        if dirfd == LINUX_AT_FDCWD {
+            return Ok(self.cwd());
+        }
+        match self.open_file(dirfd as i32).as_ref() {
+            Some(open_file) => match &*open_file.description.read() {
+                OpenDescription::Directory { path, .. } => {
+                    if self.layered_metadata(path).is_err() {
+                        Err(LINUX_ENOENT)
+                    } else {
+                        Ok(path.clone())
+                    }
+                }
+                _ => Err(LINUX_ENOTDIR),
+            },
+            None if self.fd_is_valid(dirfd as i32) => Err(LINUX_ENOTDIR),
+            None => Err(LINUX_EBADF),
+        }
+    }
+
+    fn openat2_absolute_walk_path(&self, anchor: &str, path: &str) -> String {
+        if Path::new(path).is_absolute() {
+            join_rootfs_path("/", path)
+        } else {
+            join_rootfs_path(anchor, path)
+        }
+    }
+
+    fn openat2_crosses_vfs_mount(&self, anchor: &str, path: &str) -> bool {
+        let abs = self.openat2_absolute_walk_path(anchor, path);
+        let mut prefix = String::new();
+        for comp in abs.split('/').filter(|c| !c.is_empty() && *c != ".") {
+            if comp == ".." {
+                if let Some(pos) = prefix.rfind('/') {
+                    prefix.truncate(pos);
+                } else {
+                    prefix.clear();
+                }
+                continue;
+            }
+            prefix.push('/');
+            prefix.push_str(comp);
+            if self.fs.vfs_mounts.resolve(&prefix).is_some() {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn openat2_touches_magic_link(&self, anchor: &str, path: &str) -> bool {
+        let abs = self.openat2_absolute_walk_path(anchor, path);
+        let mut prefix = String::new();
+        for comp in abs.split('/').filter(|c| !c.is_empty() && *c != ".") {
+            if comp == ".." {
+                if let Some(pos) = prefix.rfind('/') {
+                    prefix.truncate(pos);
+                } else {
+                    prefix.clear();
+                }
+                continue;
+            }
+            prefix.push('/');
+            prefix.push_str(comp);
+            if proc_self_fd_number(&prefix).is_some()
+                || proc_self_magic_link(&prefix).is_some()
+                || proc_ns_link(&prefix).is_some()
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn openat2_touches_symlink(&self, anchor: &str, path: &str) -> Result<bool, LinuxErrno> {
+        let abs = self.openat2_absolute_walk_path(anchor, path);
+        let mut prefix = String::new();
+        for comp in abs.split('/').filter(|c| !c.is_empty() && *c != ".") {
+            if comp == ".." {
+                if let Some(pos) = prefix.rfind('/') {
+                    prefix.truncate(pos);
+                } else {
+                    prefix.clear();
+                }
+                continue;
+            }
+            prefix.push('/');
+            prefix.push_str(comp);
+            match self.layered_lstat(&prefix) {
+                Ok(md) if md.kind == RootFsEntryKind::Symlink => return Ok(true),
+                Ok(_) => {}
+                Err(errno) if errno == LINUX_ENOENT => {}
+                Err(errno) => return Err(errno),
+            }
+        }
+        Ok(false)
     }
 
     pub(super) fn resolve_at_path(&self, dirfd: u64, path: &str) -> Result<String, LinuxErrno> {
@@ -5567,12 +5749,12 @@ impl SyscallDispatcher {
             if resolve & !VALID_RESOLVE != 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            // Pass the real flags + mode through to the shared open path (which
-            // validates the open flags and yields EBADF for a bad dirfd / EFAULT
-            // for a bad pathname). carrick does not yet ENFORCE the RESOLVE_*
-            // path restrictions (tracked — openat202); accepting them lets normal
-            // opens through (openat201, previously rejected by a 2-flag whitelist).
-            this.open_at_path(arg0, arg1, flags, mode, &*cx.memory, cx.reporter)
+            let path = read_guest_c_string(&*cx.memory, arg1)?;
+            let path = match this.openat2_checked_path(arg0, &path, resolve) {
+                Ok(path) => path,
+                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+            };
+            this.open_at_path_string(arg0, path.as_ref(), flags, mode, cx.reporter)
 
         }
 
@@ -9595,5 +9777,243 @@ mod tests {
             "fd_open_paths insertions should be 0 for memory OpenDescription::File"
         );
         assert!(reporter.finish().unhandled_syscalls.is_empty());
+    }
+
+    #[test]
+    fn openat2_resolve_no_symlinks_rejects_link_path() {
+        let scratch = tempfile::tempdir().unwrap();
+        let dir = cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority())
+            .unwrap();
+        let backend = crate::fs_backend::HostFsBackend::from_existing_dir(dir);
+        backend
+            .set_file_contents("/target", b"payload".to_vec())
+            .unwrap();
+        backend.symlink("target", "/link").unwrap();
+
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.set_fs_backend(Box::new(backend));
+        let mut memory = LinearMemory::new(0x4000, vec![0; 0x1000]);
+        memory.write_bytes(0x4000, b"/link\0").unwrap();
+
+        assert_eq!(
+            dispatch_openat2_for_test(
+                &mut dispatcher,
+                &mut memory,
+                LINUX_AT_FDCWD,
+                0x4000,
+                LINUX_O_RDONLY,
+                0,
+                LINUX_RESOLVE_NO_SYMLINKS,
+            )
+            .unwrap(),
+            DispatchOutcome::errno(crate::linux_abi::LINUX_ELOOP)
+        );
+    }
+
+    #[test]
+    fn openat2_resolve_beneath_rejects_dotdot_escape() {
+        let backend = crate::fs_backend::MemoryBackend::new();
+        backend.make_dir("/root").unwrap();
+        backend.make_dir("/root/dir").unwrap();
+        backend
+            .set_file_contents("/root/outside", b"payload".to_vec())
+            .unwrap();
+
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.set_fs_backend(Box::new(backend));
+        let mut memory = LinearMemory::new(0x4000, vec![0; 0x1000]);
+        let reporter = CompatReporter::default();
+        memory.write_bytes(0x4000, b"/root/dir\0").unwrap();
+        let dirfd = match dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    56,
+                    SyscallArgs::from([
+                        LINUX_AT_FDCWD,
+                        0x4000,
+                        LINUX_O_RDONLY | crate::linux_abi::LINUX_O_DIRECTORY,
+                        0,
+                        0,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap()
+        {
+            DispatchOutcome::Returned { value } => value as u64,
+            other => panic!("directory open failed: {other:?}"),
+        };
+        memory.write_bytes(0x4100, b"../outside\0").unwrap();
+
+        assert_eq!(
+            dispatch_openat2_for_test(
+                &mut dispatcher,
+                &mut memory,
+                dirfd,
+                0x4100,
+                LINUX_O_RDONLY,
+                0,
+                LINUX_RESOLVE_BENEATH,
+            )
+            .unwrap(),
+            DispatchOutcome::errno(crate::linux_abi::LINUX_EXDEV)
+        );
+    }
+
+    #[test]
+    fn openat2_resolve_no_xdev_rejects_proc_mount_crossing() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let mut memory = LinearMemory::new(0x4000, vec![0; 0x1000]);
+        memory.write_bytes(0x4000, b"/proc/self/status\0").unwrap();
+
+        assert_eq!(
+            dispatch_openat2_for_test(
+                &mut dispatcher,
+                &mut memory,
+                LINUX_AT_FDCWD,
+                0x4000,
+                LINUX_O_RDONLY,
+                0,
+                LINUX_RESOLVE_NO_XDEV,
+            )
+            .unwrap(),
+            DispatchOutcome::errno(crate::linux_abi::LINUX_EXDEV)
+        );
+    }
+
+    #[test]
+    fn openat2_resolve_no_magiclinks_rejects_proc_fd_reopen() {
+        let backend = crate::fs_backend::MemoryBackend::new();
+        backend
+            .set_file_contents("/regular.bin", b"payload".to_vec())
+            .unwrap();
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.set_fs_backend(Box::new(backend));
+        let reporter = CompatReporter::default();
+        let mut memory = LinearMemory::new(0x4000, vec![0; 0x1000]);
+        memory.write_bytes(0x4000, b"/regular.bin\0").unwrap();
+        let fd = match dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    56,
+                    SyscallArgs::from([LINUX_AT_FDCWD, 0x4000, LINUX_O_RDONLY, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap()
+        {
+            DispatchOutcome::Returned { value } => value,
+            other => panic!("regular open failed: {other:?}"),
+        };
+        let proc_fd_path = format!("/proc/self/fd/{fd}\0");
+        memory.write_bytes(0x4100, proc_fd_path.as_bytes()).unwrap();
+
+        assert_eq!(
+            dispatch_openat2_for_test(
+                &mut dispatcher,
+                &mut memory,
+                LINUX_AT_FDCWD,
+                0x4100,
+                LINUX_O_RDONLY,
+                0,
+                LINUX_RESOLVE_NO_MAGICLINKS,
+            )
+            .unwrap(),
+            DispatchOutcome::errno(crate::linux_abi::LINUX_ELOOP)
+        );
+    }
+
+    #[test]
+    fn openat2_resolve_in_root_rejects_absolute_escape() {
+        let backend = crate::fs_backend::MemoryBackend::new();
+        backend.make_dir("/root").unwrap();
+        backend
+            .set_file_contents("/outside", b"payload".to_vec())
+            .unwrap();
+
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.set_fs_backend(Box::new(backend));
+        let mut memory = LinearMemory::new(0x4000, vec![0; 0x1000]);
+        let reporter = CompatReporter::default();
+        memory.write_bytes(0x4000, b"/root\0").unwrap();
+        let dirfd = match dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    56,
+                    SyscallArgs::from([
+                        LINUX_AT_FDCWD,
+                        0x4000,
+                        LINUX_O_RDONLY | crate::linux_abi::LINUX_O_DIRECTORY,
+                        0,
+                        0,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap()
+        {
+            DispatchOutcome::Returned { value } => value as u64,
+            other => panic!("root dir open failed: {other:?}"),
+        };
+        memory.write_bytes(0x4100, b"/outside\0").unwrap();
+
+        assert_eq!(
+            dispatch_openat2_for_test(
+                &mut dispatcher,
+                &mut memory,
+                dirfd,
+                0x4100,
+                LINUX_O_RDONLY,
+                0,
+                LINUX_RESOLVE_IN_ROOT,
+            )
+            .unwrap(),
+            DispatchOutcome::errno(crate::linux_abi::LINUX_ENOENT)
+        );
+    }
+
+    const LINUX_RESOLVE_NO_XDEV: u64 = 0x01;
+    const LINUX_RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+    const LINUX_RESOLVE_NO_SYMLINKS: u64 = 0x04;
+    const LINUX_RESOLVE_BENEATH: u64 = 0x08;
+    const LINUX_RESOLVE_IN_ROOT: u64 = 0x10;
+
+    fn dispatch_openat2_for_test(
+        dispatcher: &mut SyscallDispatcher,
+        memory: &mut LinearMemory,
+        dirfd: u64,
+        path_addr: u64,
+        flags: u64,
+        mode: u64,
+        resolve: u64,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        const HOW_ADDR: u64 = 0x4f00;
+        memory.write_bytes(HOW_ADDR, &flags.to_le_bytes()).unwrap();
+        memory
+            .write_bytes(HOW_ADDR + 8, &mode.to_le_bytes())
+            .unwrap();
+        memory
+            .write_bytes(HOW_ADDR + 16, &resolve.to_le_bytes())
+            .unwrap();
+        dispatcher.dispatch(
+            SyscallRequest::new(
+                437,
+                SyscallArgs::from([
+                    dirfd,
+                    path_addr,
+                    HOW_ADDR,
+                    crate::linux_abi::LINUX_OPEN_HOW_SIZE,
+                    0,
+                    0,
+                ]),
+            ),
+            memory,
+            &CompatReporter::default(),
+        )
     }
 }
