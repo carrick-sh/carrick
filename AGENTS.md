@@ -76,11 +76,12 @@ compile/lint/test only.
 | `just fmt` / `just fmt-check` | Apply / check formatting. |
 | `just doc` | `RUSTDOCFLAGS="-D warnings" cargo doc` gate. |
 | `just lint-domains` | Typed-domain semgrep gate ([`.semgrep/typed-domains.yml`](.semgrep/typed-domains.yml)) — blocks shipped bug shapes; see Engineering standards. |
-| **`just ci`** | **Full local gate: `fmt-check → clippy → lint-domains → deny → check → doc → test → test-integration`. Run this before every push.** |
+| **`just ci`** | **Full local gate: `fmt-check → clippy → lint-domains → deny → check-matrix → check → doc → test → test-integration`. Run this before every push.** |
 | `just conformance-quick` 🔏 | Fast smoke regression vs the Docker oracle. |
 | `just conformance [TIER]` 🔏 | Language/LTP conformance vs Docker (default tier `full`). |
 | `just conformance-probes` 🔏 | Line-exact ABI probe gate vs Docker. |
-| `just matrix` | Re-render [`docs/support-matrix.md`](docs/support-matrix.md). |
+| `just matrix` | Re-render [`docs/support-matrix.md`](docs/support-matrix.md) from a run's results. |
+| `just check-matrix` | Drift gate (in `just ci`): assert `docs/support-matrix.md` equals a fresh render of the checked-in `baseline.jsonl` (deterministic, no run). |
 | `just kvm-smoke` / `just kvm-smoke-lima` | KVM backend smoke (real `/dev/kvm`, via lima from macOS). |
 | `just install-hooks` | Install the git hooks (do this once per clone). |
 

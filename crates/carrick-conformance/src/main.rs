@@ -107,6 +107,12 @@ struct Args {
     /// Render docs/support-matrix.md from the latest results.jsonl and exit.
     #[arg(long)]
     render_matrix: bool,
+    /// Verify docs/support-matrix.md matches a fresh render of the checked-in
+    /// `--baseline`, exiting non-zero if it has drifted. Writes nothing to disk.
+    /// Deterministic and fast (no conformance run) — the `just ci` drift gate
+    /// that keeps the committed matrix in sync with the blessed baseline.
+    #[arg(long)]
+    check_matrix: bool,
     /// Print the planned carrick + docker argv for each suite, run nothing.
     #[arg(long)]
     dry_run: bool,
@@ -201,6 +207,31 @@ fn run() -> anyhow::Result<ExitCode> {
             args.jsonl.display()
         );
         return Ok(ExitCode::SUCCESS);
+    }
+
+    if args.check_matrix {
+        // Render from the CHECKED-IN baseline (the blessed ground truth), never a
+        // transient results.jsonl, so the check is deterministic and needs no
+        // conformance run. A mismatch means the committed matrix was hand-edited,
+        // or the baseline / render logic changed without re-rendering.
+        let reports = read_reports(&args.baseline)?;
+        let expected = matrix::render(&reports);
+        let committed = std::fs::read_to_string("docs/support-matrix.md") // nosemgrep
+            .map_err(|e| anyhow::anyhow!("cannot read docs/support-matrix.md ({e})"))?;
+        if committed == expected {
+            eprintln!(
+                "docs/support-matrix.md is in sync with {}",
+                args.baseline.display()
+            );
+            return Ok(ExitCode::SUCCESS);
+        }
+        eprintln!(
+            "docs/support-matrix.md is STALE vs {} — regenerate it with:\n  \
+             cargo run -p carrick-conformance -- --render-matrix --jsonl {}",
+            args.baseline.display(),
+            args.baseline.display()
+        );
+        return Ok(ExitCode::FAILURE);
     }
 
     if args.generate_suites {
