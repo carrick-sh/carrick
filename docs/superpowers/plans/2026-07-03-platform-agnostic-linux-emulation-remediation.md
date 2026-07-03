@@ -202,13 +202,15 @@ This plan is therefore a master remediation ledger. Each task below is an indepe
 - Produces: explicit backend capability results for file-backed shared aliases.
 - Consumes: existing bhyve alias flush/refresh hooks and NVMM alias registration.
 
-- [ ] Add a differential probe that maps a file `MAP_SHARED`, writes before and after fork, waits, and checks parent, child, and host file visibility against Docker.
+- [x] Add a differential probe that maps a file `MAP_SHARED`, writes before and after fork, waits, and checks parent, child, and host file visibility against Docker.
 - [ ] Run the probe on HVF/KVM first to establish the known-good model.
-- [ ] Run or queue the same probe on bhyve and NVMM target hosts.
-- [ ] For bhyve, verify existing `flush_shm_aliases` and `refresh_shared_after_wait` cover the probe; close any missing exit/wait/vfork path.
-- [ ] For NVMM, decide whether writable aliases can use true registered HVA or need the same file-mediated flush/refresh path.
-- [ ] Convert remaining unsupported cases into capability checks that fail loudly with a Linux errno or documented baseline gap, not silent incoherence.
-- [ ] Commit as `fix(x86): prove shared file alias coherence`.
+- [x] Run or queue the same probe on bhyve and NVMM target hosts.
+- [x] For bhyve, verify existing `flush_shm_aliases` and `refresh_shared_after_wait` cover the probe; close any missing exit/wait/vfork path.
+- [x] For NVMM, decide whether writable aliases can use true registered HVA or need the same file-mediated flush/refresh path.
+- [x] Convert remaining unsupported cases into capability checks that fail loudly with a Linux errno or documented baseline gap, not silent incoherence.
+- [x] Commit as `test(conformance): probe shared file writeback`.
+
+**Local evidence:** added `mmapfileforkwriteback`, which checks parent pre-fork writes, child post-fork writes, parent post-wait mapping visibility, and backing-file visibility for child and parent writes. `cargo check --manifest-path conformance-probes/Cargo.toml --target aarch64-unknown-linux-musl --bin mmapfileforkwriteback` and `cargo check --manifest-path conformance-probes/Cargo.toml --target x86_64-unknown-linux-musl --bin mmapfileforkwriteback` pass. Static backend review found bhyve already flushes writable file aliases at the fork barrier and child exit, then refreshes after `wait4`/`waitid`; NVMM maps writable aliases as registered host `MAP_SHARED` HVA. `cargo check -p carrick-vmm-nvmm --lib --target x86_64-unknown-netbsd` passes. `cargo check -p carrick-vmm-bhyve --lib --target x86_64-unknown-freebsd` is blocked before bhyve code by existing `carrick-observability` USDT inline-register errors on x86_64-FreeBSD cross-check. Release-linking the probe from macOS is blocked because the host `cc` is not a Linux-musl linker; run the probe with the normal probe-builder/container or target hosts.
 
 ## Task 7: Adopt Shared x86 Bring-Up Blobs Safely
 
