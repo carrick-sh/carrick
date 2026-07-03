@@ -29,6 +29,9 @@ impl HostSignalGlue for BhyveGlue {
     /// signals (1/2/3/15, numbered identically on both), the SIGCHLD reaper and
     /// SIGPIPE (by their LINUX numbers), and the reserved RT kick/nudge.
     fn is_claimed(linux_signum: i32) -> bool {
+        if !carrick_host_bsd::signum::linux_signum_has_host_carrier(linux_signum) {
+            return true;
+        }
         if matches!(linux_signum, 1 | 2 | 3 | 15) {
             return true;
         }

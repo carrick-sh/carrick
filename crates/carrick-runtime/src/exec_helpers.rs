@@ -260,10 +260,10 @@ fn sigdeath_marker_path(host_pid: u32) -> std::path::PathBuf {
 
 /// Parent side: consume the signal-death marker a just-reaped forked child left,
 /// returning the Linux signal it died by. `Some` only for a BSD-host child whose
-/// default-TERMINATE Linux signal mapped to a default-IGNORE host signal
-/// (SIGPOLL→SIGIO, SIGSTKFLT→SIGURG) and so could only `_exit(128+N)`; `None` on
-/// the normal host-signalled path. Always `None` on a Linux host (host signal
-/// numbers and dispositions match Linux, so the marker is never written).
+/// default-TERMINATE Linux signal could not be represented faithfully as a host
+/// signalled death, so it `_exit(128+N)`ed and left a marker. Always `None` on a
+/// Linux host (host signal numbers and dispositions match Linux, so the marker is
+/// never written).
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn consume_sigdeath_marker(host_pid: u32) -> Option<i32> {
     let path = sigdeath_marker_path(host_pid);
@@ -306,6 +306,11 @@ pub(crate) fn forked_child_die_by_signal(
     let _ = unsafe { libc::write(1, stdout_buf.as_ptr() as *const _, stdout_buf.len()) };
     let _ = unsafe { libc::write(2, stderr_buf.as_ptr() as *const _, stderr_buf.len()) };
     let host_signum = crate::host_signal::linux_to_host_signum(signum);
+    #[cfg(not(target_os = "linux"))]
+    if host_signum == 0 {
+        let _ = std::fs::write(sigdeath_marker_path(std::process::id()), [signum as u8]);
+        unsafe { libc::_exit(128 + signum) };
+    }
     unsafe {
         libc::signal(host_signum, libc::SIG_DFL);
         let mut set: libc::sigset_t = std::mem::zeroed();
@@ -315,12 +320,11 @@ pub(crate) fn forked_child_die_by_signal(
         libc::raise(host_signum);
         // Only reached if the host signal did NOT terminate us. On the BSDs the
         // host signal mapped from some default-TERMINATE Linux signals is itself
-        // default-IGNORE (Linux SIGPOLL 29 → BSD SIGIO 23, Linux SIGSTKFLT 16 →
-        // BSD SIGURG 16), so `raise` is a silent no-op. The child cannot make its
+        // default-IGNORE or otherwise not Linux-faithful, so `raise` may be a
+        // silent no-op or report the wrong host signal. The child cannot make its
         // OWN host wait status WIFSIGNALED, so leave a marker keyed by host pid:
         // the parent's wait4 reap reconstructs WIFSIGNALED(signum) from it instead
-        // of reporting `exited 128+signum` (LTP waitpid01: a SIGPOLL child would
-        // otherwise read as "exited 157" rather than "killed by SIGPOLL").
+        // of reporting `exited 128+signum`.
         #[cfg(not(target_os = "linux"))]
         let _ = std::fs::write(sigdeath_marker_path(std::process::id()), [signum as u8]);
         libc::_exit(128 + signum)

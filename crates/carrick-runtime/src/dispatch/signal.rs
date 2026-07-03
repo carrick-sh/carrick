@@ -235,6 +235,8 @@ fn is_rt_signal(signum: i32) -> bool {
 fn cross_process_needs_xsig(signum: i32) -> bool {
     signum == crate::linux_abi::LINUX_SIGCHLD
         || signum == crate::linux_abi::LINUX_SIGPIPE
+        || signum == crate::linux_abi::LINUX_SIGSTKFLT
+        || signum == crate::linux_abi::LINUX_SIGPWR
         || matches!(signum, 4 | 5 | 6 | 7 | 8 | 11)
         || is_rt_signal(signum)
 }
@@ -2252,9 +2254,12 @@ mod tests {
         // never mirror a guest disposition onto host SIGPIPE), so a plain host
         // kill is silently dropped — it MUST take the ring (LTP sigrelse01).
         assert!(cross_process_needs_xsig(crate::linux_abi::LINUX_SIGPIPE));
-        // SIGCHLD, the synchronous-fault set, and RT signals (no host number /
-        // host disposition owned by another mechanism) ride the ring too.
+        // SIGCHLD, Linux-only SIGSTKFLT/SIGPWR, the synchronous-fault set, and
+        // RT signals (no host number / host disposition owned by another
+        // mechanism) ride the ring too.
         assert!(cross_process_needs_xsig(crate::linux_abi::LINUX_SIGCHLD));
+        assert!(cross_process_needs_xsig(crate::linux_abi::LINUX_SIGSTKFLT));
+        assert!(cross_process_needs_xsig(crate::linux_abi::LINUX_SIGPWR));
         for s in [4, 5, 6, 7, 8, 11, 34] {
             assert!(cross_process_needs_xsig(s), "signum {s} must take the ring");
         }

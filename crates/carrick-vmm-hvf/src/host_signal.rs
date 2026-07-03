@@ -907,7 +907,8 @@ impl carrick_signal_core::HostSignalGlue for HvfGlue {
     fn is_claimed(linux_signum: i32) -> bool {
         // Unused for HVF's disposition (every `skip_*` is overridden); reported as
         // the uncatchable / carrick-managed set for completeness.
-        matches!(linux_signum, 9 | 13 | 17 | 19)
+        !carrick_host_bsd::signum::linux_signum_has_host_carrier(linux_signum)
+            || matches!(linux_signum, 9 | 13 | 17 | 19)
     }
 
     // ── real HVF signal characteristics ──
@@ -925,7 +926,9 @@ impl carrick_signal_core::HostSignalGlue for HvfGlue {
     /// neutral default: only the uncatchable (SIGKILL 9 / SIGSTOP 19) and the
     /// carrick-managed SIGPIPE(13)/SIGCHLD(17). (Was `ensure_host_handler`'s skip.)
     fn skip_install_routing(linux_signum: i32) -> bool {
-        !(1..=63).contains(&linux_signum) || matches!(linux_signum, 9 | 13 | 17 | 19)
+        !(1..=63).contains(&linux_signum)
+            || !carrick_host_bsd::signum::linux_signum_has_host_carrier(linux_signum)
+            || matches!(linux_signum, 9 | 13 | 17 | 19)
     }
 
     /// Mirroring a guest SIG_IGN/SIG_DFL ALSO skips the fault set + SIGINT:
@@ -934,6 +937,7 @@ impl carrick_signal_core::HostSignalGlue for HvfGlue {
     /// `set_host_ignore`/`set_host_default` skip.)
     fn skip_ignore_mirror(linux_signum: i32) -> bool {
         !(1..=63).contains(&linux_signum)
+            || !carrick_host_bsd::signum::linux_signum_has_host_carrier(linux_signum)
             || matches!(linux_signum, 2 | 4 | 5 | 6 | 7 | 8 | 9 | 11 | 13 | 17 | 19)
     }
 
@@ -941,7 +945,8 @@ impl carrick_signal_core::HostSignalGlue for HvfGlue {
     /// loop's own install-mask check handles the rest). (Was
     /// `reset_routed_handlers_after_execve`'s skip.)
     fn skip_execve_reset(linux_signum: i32) -> bool {
-        matches!(linux_signum, LINUX_SIGINT | 9 | 13 | 17 | 19)
+        !carrick_host_bsd::signum::linux_signum_has_host_carrier(linux_signum)
+            || matches!(linux_signum, LINUX_SIGINT | 9 | 13 | 17 | 19)
     }
 
     /// A real synchronous CPU fault (carrick's OWN bug, must crash visibly): the

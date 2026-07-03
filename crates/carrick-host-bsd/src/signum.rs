@@ -34,6 +34,15 @@
 //! | SIGURG   | 23    | 16  |
 //! | SIGIO    | 29    | 23  |
 //! | SIGSYS   | 31    | 12  |
+//!
+//! Linux SIGSTKFLT(16) and SIGPWR(30) have no BSD host carrier: BSD 16 is
+//! SIGURG and BSD 30 is SIGUSR1. Host SIGINFO(29) is also not a guest signal;
+//! Carrick uses it as an internal cross-process nudge.
+
+const NO_SIGNAL: i32 = 0;
+const LINUX_SIGSTKFLT: i32 = 16;
+const LINUX_SIGPWR: i32 = 30;
+const HOST_SIGINFO: i32 = 29;
 
 /// The divergent `(linux, bsd_host)` pairs. Every signal NOT listed maps
 /// identically. Shared by every BSD host (macOS / FreeBSD / NetBSD / OpenBSD /
@@ -51,11 +60,24 @@ pub const SIGNUM_XLATE: &[(i32, i32)] = &[
     (31, 12), // SIGSYS
 ];
 
+#[inline]
+pub fn linux_signum_has_host_carrier(linux: i32) -> bool {
+    !matches!(linux, LINUX_SIGSTKFLT | LINUX_SIGPWR)
+}
+
+#[inline]
+pub fn host_signum_has_guest_carrier(host: i32) -> bool {
+    host != HOST_SIGINFO
+}
+
 /// Translate a Linux (guest) signal number to the BSD host number. Identity for
 /// any signal not in [`SIGNUM_XLATE`] (the control set, faults, SIGKILL,
 /// SIGTERM, SIGALRM, the RT range 32..=64 — all numbered the same on both).
 #[inline]
 pub fn linux_to_host_signum(linux: i32) -> i32 {
+    if !linux_signum_has_host_carrier(linux) {
+        return NO_SIGNAL;
+    }
     SIGNUM_XLATE
         .iter()
         .find(|&&(l, _)| l == linux)
@@ -67,6 +89,9 @@ pub fn linux_to_host_signum(linux: i32) -> i32 {
 /// for any host number not in [`SIGNUM_XLATE`].
 #[inline]
 pub fn host_to_linux_signum(host: i32) -> i32 {
+    if !host_signum_has_guest_carrier(host) {
+        return NO_SIGNAL;
+    }
     SIGNUM_XLATE
         .iter()
         .find(|&&(_, h)| h == host)
@@ -114,5 +139,28 @@ mod tests {
             assert_eq!(linux_to_host_signum(s), s, "signum {s} must be identity");
             assert_eq!(host_to_linux_signum(s), s, "signum {s} must be identity");
         }
+    }
+
+    #[test]
+    fn linux_only_signals_do_not_identity_map_to_bsd_collisions() {
+        assert_eq!(
+            linux_to_host_signum(16),
+            0,
+            "Linux SIGSTKFLT has no BSD carrier; host 16 is SIGURG"
+        );
+        assert_eq!(
+            linux_to_host_signum(30),
+            0,
+            "Linux SIGPWR has no BSD carrier; host 30 is SIGUSR1"
+        );
+    }
+
+    #[test]
+    fn host_siginfo_is_internal_not_guest_sigio() {
+        assert_eq!(
+            host_to_linux_signum(29),
+            0,
+            "host SIGINFO is Carrick's internal nudge, not Linux SIGIO"
+        );
     }
 }
