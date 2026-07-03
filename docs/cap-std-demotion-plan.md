@@ -81,6 +81,28 @@ guest path is used until its real on-disk path is verified beneath
 `root_prefix`.** `fast_open_contained` already does this; the parent-fd pattern
 extends it (verify the parent chain, then a single-component `*at`).
 
+## Stage-2 security detail (traced from `open_raw_fd`)
+
+`open_raw_fd` already calls `resolve_following(path)` first, so `normalized`
+is symlink-FREE — the LEAF-symlink escape is already handled. The residual risk
+is narrow and specific:
+
+- **Pure open (no O_CREAT, no O_TRUNC): SAFE with F_GETPATH-after.** No side
+  effect; an out-of-root result is rejected before the fd is used. Convert this
+  branch first — it is the read/open hot path (`test_glob` opens for read).
+- **O_CREAT / O_TRUNC: NOT safe with F_GETPATH-after.** A TOCTOU where an
+  *intermediate* component is swapped to a symlink between `resolve_following`
+  and the single `openat` could create/truncate out-of-root before the check
+  rejects. Two options: (a) keep create/trunc on cap-std's per-component walk
+  (simplest, correct, and creates/truncs are rarer than reads); or (b)
+  `open_parent_contained` (verify the parent chain) then `openat(pfd, leaf,
+  O_CREAT|O_NOFOLLOW)` — but that changes Linux's create-through-final-symlink
+  semantics, so it needs the `symlinkmknod` probe to confirm parity. Prefer (a)
+  until a probe proves (b).
+
+The `xboundary` + `symlinkmknod` probes are the acceptance test for this exact
+distinction — do NOT convert the create/trunc branch without them green.
+
 ## Staged, TDD, probe-gated execution
 
 Each stage: (1) RED — a fast probe that walks N× today (e.g. a `glob` /
