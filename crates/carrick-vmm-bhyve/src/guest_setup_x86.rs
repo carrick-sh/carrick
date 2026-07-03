@@ -1547,7 +1547,7 @@ pub fn msr_init_blob(
     entry_rdx: u64,
     entry_rcx: u64,
 ) -> Vec<u8> {
-    carrick_x86::msr_init_blob(
+    carrick_x86::msr_init_blob(carrick_x86::MsrInitBlob {
         lstar,
         star,
         sfmask,
@@ -1557,7 +1557,7 @@ pub fn msr_init_blob(
         clear_rax,
         entry_rdx,
         entry_rcx,
-    )
+    })
 }
 
 // ─── T6: BhyveGuestRam PML4 map specs ────────────────────────────────────────
