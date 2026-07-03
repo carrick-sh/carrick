@@ -281,7 +281,7 @@ impl X86Vmm for KvmVmm {
     }
 
     fn unmap_alias_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
-        self.unmap_range(address, len)
+        self.edit_page_tables(address, len, |mgr| mgr.unmap_alias_range(address, len))
     }
 
     fn map_host_alias(
