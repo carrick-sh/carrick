@@ -115,6 +115,8 @@ syscall_table! {
     82 => fsync,
     83 => fdatasync,
     88 => utimensat,
+    262 => fanotify_init,
+    263 => fanotify_mark,
     267 => syncfs,
     84 => sync_file_range,
     451 => cachestat,
@@ -8121,6 +8123,16 @@ impl SyscallDispatcher {
                 Ok(()) => DispatchOutcome::Returned { value: 0 },
                 Err(errno) => DispatchOutcome::errno(errno),
             })
+        }
+
+        fn fanotify_init(this, cx, _flags: u64, _event_f_flags: u64) {
+            let _ = (this, cx);
+            Ok(DispatchOutcome::errno(LINUX_EPERM))
+        }
+
+        fn fanotify_mark(this, cx, _fanotify_fd: Fd, _flags: u64, _mask: u64, _dirfd: Fd, _pathname: GuestPtr) {
+            let _ = (this, cx);
+            Ok(DispatchOutcome::errno(LINUX_EPERM))
         }
 
         fn sync(this, cx) {
