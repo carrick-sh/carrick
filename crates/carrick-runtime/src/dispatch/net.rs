@@ -1721,6 +1721,9 @@ impl SyscallDispatcher {
                 return DispatchOutcome::errno(LINUX_EBADF);
             };
             match &*open_file.description.read() {
+                open if open.status_flags() & crate::linux_abi::LINUX_O_PATH != 0 => {
+                    return DispatchOutcome::errno(LINUX_EBADF);
+                }
                 OpenDescription::HostSocket {
                     host_fd,
                     family,
