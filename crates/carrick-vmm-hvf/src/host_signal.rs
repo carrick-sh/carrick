@@ -303,6 +303,8 @@ pub fn register_child_exit_watch(child_pid: i32, parent_tid: i32, exit_signal: i
         );
         if let Err(errno) = result {
             handle_child_exit_watch_arm_error(child_pid, errno);
+        } else {
+            publish_child_exit_if_waitable(child_pid);
         }
     }
 }
@@ -325,6 +327,8 @@ pub fn rearm_child_watches(kq: i32) {
         );
         if let Err(errno) = result {
             handle_child_exit_watch_arm_error(pid, errno);
+        } else {
+            publish_child_exit_if_waitable(pid);
         }
     }
 }
@@ -344,6 +348,30 @@ fn publish_child_exit_signal(child_pid: i32) -> bool {
     } else {
         false
     }
+}
+
+fn publish_child_exit_if_waitable(child_pid: i32) -> bool {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            child_pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+        )
+    };
+    if rc != 0 {
+        return false;
+    }
+    if info.si_pid == child_pid
+        && matches!(
+            info.si_code,
+            libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED
+        )
+    {
+        return publish_child_exit_signal(child_pid);
+    }
+    false
 }
 
 /// Resolve a child pid whose `NOTE_EXIT` fired to the `(parent_tid,
@@ -1197,6 +1225,43 @@ mod tests {
         );
         assert_eq!(take_pending_for(parent_tid), NO_PENDING_SIGNAL);
         assert!(!publish_child_exit_signal(child_pid));
+        drain_pump_pipe();
+    }
+
+    #[test]
+    fn waitable_child_exit_check_publishes_without_reaping() {
+        let _g = TEST_LOCK.lock();
+        reset_after_supervisor_fork();
+        PUMP_KQUEUE.store(-1, Ordering::SeqCst);
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed");
+        if child == 0 {
+            unsafe {
+                libc::_exit(0);
+            }
+        }
+        let parent_tid = 0x7FFD_0102;
+        register_child_exit_watch(child, parent_tid, crate::linux_abi::LINUX_SIGCHLD);
+
+        let mut published = false;
+        for _ in 0..100 {
+            if publish_child_exit_if_waitable(child) {
+                published = true;
+                break;
+            }
+            unsafe {
+                libc::usleep(10_000);
+            }
+        }
+        assert!(published, "waitable child exit was not published");
+        assert_eq!(
+            take_pending_for(parent_tid),
+            crate::linux_abi::LINUX_SIGCHLD
+        );
+
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(libc::WIFEXITED(status));
         drain_pump_pipe();
     }
 

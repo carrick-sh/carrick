@@ -765,28 +765,43 @@ impl SyscallDispatcher {
         memory: &impl GuestMemory,
     ) -> DispatchOutcome {
         let args_ptr = args_ptr.0;
-        // The Linux kernel only accepts size == one of the documented
-        // CLONE_ARGS_SIZE_VERn — anything else is EINVAL (clone302 / glibc's
-        // probe). Carrick had this as `< 8` which silently accepted a
-        // truncated args buffer and then forked anyway, fork-bombing into
-        // the rest of the probe.
         const CLONE_ARGS_SIZE_VER0: u64 = 64;
         const CLONE_ARGS_SIZE_VER1: u64 = 80;
         const CLONE_ARGS_SIZE_VER2: u64 = 88;
-        if !matches!(
-            args_size,
-            CLONE_ARGS_SIZE_VER0 | CLONE_ARGS_SIZE_VER1 | CLONE_ARGS_SIZE_VER2
-        ) {
+        const CLONE_ARGS_SIZE_MAX: u64 = LINUX_PAGE_SIZE;
+        let abi_size = <LinuxCloneArgs as KernelAbi>::ABI_SIZE as u64;
+        if args_size < CLONE_ARGS_SIZE_VER0 {
             return DispatchOutcome::errno(LINUX_EINVAL);
         }
+        if args_size > CLONE_ARGS_SIZE_MAX {
+            return DispatchOutcome::errno(LINUX_E2BIG);
+        }
 
-        let read_len = args_size.min(<LinuxCloneArgs as KernelAbi>::ABI_SIZE as u64) as usize;
+        let read_len = args_size.min(abi_size) as usize;
         let args = match read_kernel_prefix::<LinuxCloneArgs>(memory, args_ptr, read_len) {
             Ok(args) => args,
             Err(_) => {
                 return DispatchOutcome::errno(LINUX_EFAULT);
             }
         };
+        if args_size > abi_size {
+            let Some(extra_addr) = args_ptr.checked_add(abi_size) else {
+                return DispatchOutcome::errno(LINUX_EFAULT);
+            };
+            let extra_len = (args_size - abi_size) as usize;
+            let extra = match memory.read_bytes(extra_addr, extra_len) {
+                Ok(extra) => extra,
+                Err(_) => return DispatchOutcome::errno(LINUX_EFAULT),
+            };
+            if extra.iter().any(|&byte| byte != 0) {
+                return DispatchOutcome::errno(LINUX_E2BIG);
+            }
+        } else if !matches!(
+            args_size,
+            CLONE_ARGS_SIZE_VER0 | CLONE_ARGS_SIZE_VER1 | CLONE_ARGS_SIZE_VER2
+        ) {
+            return DispatchOutcome::errno(LINUX_EINVAL);
+        }
 
         let flags = args.flags;
         // Reject unknown flag bits (clone303 — kernel allows bits 8..34 only).
@@ -799,6 +814,19 @@ impl SyscallDispatcher {
         // Inconsistent stack/stack_size pair → EINVAL (clone05/08 shape). A
         // non-zero stack_size with a zero stack is gibberish; symmetric.
         if (args.stack == 0) != (args.stack_size == 0) {
+            return DispatchOutcome::errno(LINUX_EINVAL);
+        }
+        let vm = LinuxCloneFlags::VM.bits();
+        let sighand = LinuxCloneFlags::SIGHAND.bits();
+        let thread = LinuxCloneFlags::THREAD.bits();
+        if (flags & thread != 0 && flags & sighand == 0)
+            || (flags & sighand != 0 && flags & vm == 0)
+            || (flags & LinuxCloneFlags::FS.bits() != 0
+                && flags & LinuxCloneFlags::NEWNS.bits() != 0)
+        {
+            return DispatchOutcome::errno(LINUX_EINVAL);
+        }
+        if args.exit_signal != 0 && !crate::dispatch::signal::is_valid_signum(args.exit_signal) {
             return DispatchOutcome::errno(LINUX_EINVAL);
         }
         let thread_mask = LinuxCloneFlags::THREAD_MASK;
@@ -821,13 +849,19 @@ impl SyscallDispatcher {
         }
 
         let pidfd_out = if flags & LinuxCloneFlags::PIDFD.bits() != 0 {
+            if memory
+                .read_bytes(args.pidfd, core::mem::size_of::<i32>())
+                .is_err()
+            {
+                return DispatchOutcome::errno(LINUX_EFAULT);
+            }
             Some(args.pidfd)
         } else {
             None
         };
-        // clone3 carries the exit signal in its own field; mask to the low
-        // byte (signal domain) — faithful and bounded.
-        let exit_signal = (args.exit_signal & 0xff) as u32;
+        // clone3 carries the exit signal in its own field, unlike legacy clone's
+        // low-byte CSIGNAL encoding.
+        let exit_signal = args.exit_signal as u32;
         // vfork-for-exec: same classification as legacy clone (see `clone`).
         // clone3's `stack` is the BASE and `stack_size` the length, so the stack
         // POINTER (SP, which grows down on aarch64) is base+size — mirror the
@@ -1677,7 +1711,7 @@ impl SyscallDispatcher {
                         return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
                     }
                     if let Some(location) = shared_location {
-                        // Shared path: no native requeue → wake nr_wake+nr_requeue
+                        // Shared path: no native requeue -> wake nr_wake+nr_requeue
                         // (correct per the spurious-wake-tolerant futex contract),
                         // routed through the `PlatformFutex::shared_wake` seam.
                         let total = (nr_wake as u64)
@@ -2233,26 +2267,21 @@ impl SyscallDispatcher {
                 crate::guest_cpu::clear_child_ptrace_stop_pending(result as u32);
             }
             // Terminal reap of a child (not a WUNTRACED/WCONTINUED state report):
-            // CANCEL its async exit-signal watch. carrick's pump delivers a
-            // child-exit signal (default SIGCHLD) asynchronously off EVFILT_PROC/
-            // NOTE_EXIT on a separate thread; under load that delivery can LAG
-            // past this synchronous reap and land in the parent's NEXT operation.
-            // LTP kill12 relies on the opposite (Linux delivers SIGCHLD with the
-            // child's exit, before waitpid returns): its `chflag` (set by the
-            // parent's SIGCHLD handler) is then satisfied spuriously by a previous
-            // child's lagging exit-SIGCHLD, so the parent signals the next child
-            // before it has installed its SIG_IGN and the child dies by the test
-            // signal. Dropping the watch at reap suppresses that stale delivery.
-            // We CANCEL but do NOT re-deliver: a parent that wanted the SIGCHLD
-            // waited for it before reaping (the pump delivered it then, taking the
-            // watch — `take_child_exit_parent` here returns None), whereas a parent
-            // that reaps unconditionally (kill12, and reap-heavy signal storms like
-            // kill10) neither needs nor should be flooded with an extra per-reap
-            // SIGCHLD. The parked WaitOnProcExit path is woken+delivered by the
-            // pump in lock-step and never lags, so it is unaffected.
+            // resolve its async exit-signal watch. If the pump already delivered
+            // the signal, the watch is gone. If not, publish it synchronously before
+            // returning from wait4: Linux makes the child-exit signal observable by
+            // the time waitpid returns, and clone301 checks a caught SIGCHLD/SIGUSR2
+            // after reaping. Taking the watch here still prevents a later kqueue
+            // NOTE_EXIT from double-delivering a stale signal into the next test
+            // phase (the original kill12/kill10 failure mode).
             let terminal_reap = libc::WIFEXITED(host_status) || libc::WIFSIGNALED(host_status);
             if terminal_reap {
-                let _ = crate::host_signal::take_child_exit_parent(result);
+                if let Some((parent_tid, exit_signal)) =
+                    crate::host_signal::take_child_exit_parent(result)
+                    && exit_signal != 0
+                {
+                    crate::host_signal::publish_pending_for(parent_tid, exit_signal);
+                }
                 // The child host process is now dead; tear down its leaked host VM
                 // node (bhyve's named /dev/vmm/carrick-<pid>-* persists past the
                 // child's _exit). Sole, non-hanging teardown — no live holder. No-op
