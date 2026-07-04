@@ -139,6 +139,12 @@ oracle-cache edits are only used when the suite declaration itself changed.
   `ptraceattachinit` DIFFed on attach/wait/detach before matching Linux, while
   `ptraceattach` still covers the non-dumpable-parent `EPERM` case from
   `ltp-ptrace02`.
+- `ltp-clock_nanosleep01` MATCH after rejecting CPU-time clocks for
+  `clock_nanosleep`. Root cause fixed: Carrick kept `CLOCK_THREAD_CPUTIME_ID`
+  readable for `clock_gettime` but no longer treats it as sleepable; raw
+  `clock_nanosleep(CLOCK_THREAD_CPUTIME_ID, 0, ...)` now returns
+  `EOPNOTSUPP`, matching Linux. Red-first: `clocknanosleepcpu` DIFFed on the
+  raw syscall errno path before matching Linux line-for-line.
 
 ### Still open / next
 
@@ -149,6 +155,11 @@ oracle-cache edits are only used when the suite declaration itself changed.
   samples by a small oversleep margin. Treat this as timing-jitter evidence,
   not a prctl semantic blocker.
 - No remaining `ltp-ptrace*` gating item in the current focused checks.
+- `ltp-clock_nanosleep02` remains a timing inversion: Carrick passes all seven
+  threshold assertions, while direct Docker arm64 still fails "slept too long"
+  threshold cases. Do not paper this over by making Carrick sleep less
+  accurately; classify the oracle/jitter issue separately from
+  `clock_nanosleep01`'s errno fix.
 
 ## Top clusters (fix the shared root cause once → clears many)
 
