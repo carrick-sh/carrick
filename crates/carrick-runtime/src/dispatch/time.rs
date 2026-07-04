@@ -782,6 +782,9 @@ impl SyscallDispatcher {
                 if rlim_cur > rlim_max {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
+                if rlim_max > old.rlim_max {
+                    return Ok(DispatchOutcome::errno(LINUX_EPERM));
+                }
                 if resource == LINUX_RLIMIT_NOFILE {
                     // Honor the guest raising (or lowering) its fd soft limit,
                     // clamped to the hard limit we expose. The fd allocator
