@@ -3741,6 +3741,17 @@ fn linux_clock_duration(clock_id: u64) -> Option<Duration> {
     }
 }
 
+fn linux_clock_nanosleep_now(clock_id: u64) -> Result<Duration, LinuxErrno> {
+    if matches!(
+        clock_id,
+        LINUX_CLOCK_PROCESS_CPUTIME_ID | LINUX_CLOCK_THREAD_CPUTIME_ID
+    ) || dynamic_cpu_clock(clock_id).is_some()
+    {
+        return Err(LINUX_EOPNOTSUPP);
+    }
+    linux_clock_duration(clock_id).ok_or(LINUX_EINVAL)
+}
+
 /// Linux clock_getres resolution in nanoseconds, selected per clock id.
 ///
 /// The exact value is NOT a host-portable invariant: a CONFIG_HIGH_RES_TIMERS
