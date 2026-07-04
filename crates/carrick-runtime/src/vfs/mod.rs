@@ -277,6 +277,10 @@ pub enum VfsHandle {
 pub struct OpenContext<'a> {
     pub executable_path: Option<&'a str>,
     pub argv: Option<&'a [String]>,
+    /// Current process comm as recorded by `prctl(PR_SET_NAME)`.
+    pub task_comm: Option<&'a str>,
+    /// Current `prctl(PR_SET_TIMERSLACK)` value in nanoseconds.
+    pub timerslack_ns: u64,
     /// The ISA this guest reports about itself, so `/proc/cpuinfo` agrees with
     /// `uname(2)` for x86_64 guests. See [`GuestReportedArch`].
     pub guest_arch: GuestReportedArch,

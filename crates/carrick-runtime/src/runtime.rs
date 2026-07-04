@@ -1047,6 +1047,7 @@ where
                         // Re-stamp the identity page: the child's pid changed
                         // (ns-pid now registered), so a fast-path getpid is right.
                         stamp_identity_page(runtime, &dispatcher);
+                        dispatcher.proc_after_fork_child();
                         dispatcher.mem_after_fork_child();
                         dispatcher.sysv_after_fork_child();
                         // The child's pid changed; its waiter watches for

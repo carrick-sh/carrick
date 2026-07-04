@@ -64,7 +64,9 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use carrick_guest_mem::GuestVa;
 
-use crate::linux_abi::{LINUX_EACCES, LINUX_ENOENT, LINUX_ENOTDIR, LINUX_EROFS, LinuxErrno};
+use crate::linux_abi::{
+    LINUX_DEFAULT_TIMERSLACK_NS, LINUX_EACCES, LINUX_ENOENT, LINUX_ENOTDIR, LINUX_EROFS, LinuxErrno,
+};
 use crate::memory::{
     LINUX_EL0_TRAMPOLINE_BASE, LINUX_EL1_VECTORS_BASE, LINUX_HEAP_BASE, LINUX_HEAP_SIZE,
     LINUX_MMAP_BASE, LINUX_PAGE_TABLES_BASE, LINUX_RLIMIT_STACK_SOFT,
@@ -150,6 +152,10 @@ impl GuestMemoryRange {
 pub struct SyntheticProcContext {
     pub executable_path: String,
     pub argv: Vec<String>,
+    /// Current process comm as recorded by `prctl(PR_SET_NAME)`.
+    pub task_comm: String,
+    /// Current `prctl(PR_SET_TIMERSLACK)` value in nanoseconds.
+    pub timerslack_ns: u64,
     /// The ISA this guest reports about itself, so `/proc/cpuinfo` agrees with
     /// `uname(2)` for x86_64 guests (native x86 backends + Rosetta-translated).
     pub guest_arch: GuestReportedArch,
@@ -723,7 +729,7 @@ pub(crate) fn synthetic_file(path: &str, ctx: &SyntheticProcContext) -> Option<V
         "/proc/self/autogroup" => Some(b"/autogroup-0 nice 0\n".to_vec()),
         "/proc/self/cgroup" => Some(b"0::/\n".to_vec()),
         "/proc/self/cmdline" => Some(synthetic_proc_self_cmdline(&ctx.argv, &ctx.executable_path)),
-        "/proc/self/comm" => Some(synthetic_proc_self_comm(&ctx.executable_path).into_bytes()),
+        "/proc/self/comm" => Some(synthetic_proc_self_comm(ctx).into_bytes()),
         "/proc/self/environ" => Some(synthetic_proc_self_environ(&ctx.environ)),
         "/proc/self/io" => Some(synthetic_proc_self_io().to_vec()),
         "/proc/self/limits" => Some(synthetic_proc_self_limits().to_vec()),
@@ -748,7 +754,9 @@ pub(crate) fn synthetic_file(path: &str, ctx: &SyntheticProcContext) -> Option<V
         "/proc/self/status" => Some(synthetic_proc_self_status(ctx).into_bytes()),
         // A running/on-CPU task: syscall reports "running", wchan 0 (no newline).
         "/proc/self/syscall" => Some(b"running\n".to_vec()),
-        "/proc/self/timerslack_ns" => Some(b"50000\n".to_vec()),
+        "/proc/self/timerslack_ns" => {
+            Some(format!("{}\n", context_timerslack_ns(ctx)).into_bytes())
+        }
         "/proc/self/wchan" => Some(b"0".to_vec()),
         // User-namespace map files (user_namespaces(7)). For the initial
         // identity namespace these read as `0 0 4294967295` / `allow`, matching
@@ -779,7 +787,7 @@ pub(crate) fn synthetic_file(path: &str, ctx: &SyntheticProcContext) -> Option<V
             {
                 return Some(v);
             }
-            let self_comm = process_short_name(&ctx.executable_path);
+            let self_comm = context_task_comm(ctx);
             parse_proc_pid_path(path)
                 .and_then(|(pid, rest)| synthetic_proc_pid_file(pid, rest, &self_comm))
         }
@@ -1904,6 +1912,8 @@ impl Vfs for ProcVfs {
         let synth_ctx = SyntheticProcContext {
             executable_path: ctx.executable_path.unwrap_or("").to_owned(),
             argv: ctx.argv.unwrap_or(&[]).to_vec(),
+            task_comm: ctx.task_comm.unwrap_or("").to_owned(),
+            timerslack_ns: ctx.timerslack_ns,
             guest_arch: ctx.guest_arch,
             guest_hostname: ctx.guest_hostname.unwrap_or("").to_owned(),
             environ: ctx.environ.unwrap_or(&[]).to_vec(),
@@ -2437,8 +2447,22 @@ fn synthetic_proc_self_environ(environ: &[Vec<u8>]) -> Vec<u8> {
     bytes
 }
 
-fn synthetic_proc_self_comm(executable_path: &str) -> String {
-    let mut comm = process_short_name(executable_path);
+fn context_task_comm(ctx: &SyntheticProcContext) -> String {
+    if ctx.task_comm.is_empty() {
+        return process_short_name(&ctx.executable_path);
+    }
+    ctx.task_comm.clone()
+}
+
+fn context_timerslack_ns(ctx: &SyntheticProcContext) -> u64 {
+    if ctx.timerslack_ns == 0 {
+        return LINUX_DEFAULT_TIMERSLACK_NS;
+    }
+    ctx.timerslack_ns
+}
+
+fn synthetic_proc_self_comm(ctx: &SyntheticProcContext) -> String {
+    let mut comm = context_task_comm(ctx);
     comm.push('\n');
     comm
 }
