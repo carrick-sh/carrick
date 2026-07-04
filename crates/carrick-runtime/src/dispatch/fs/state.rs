@@ -1,8 +1,16 @@
 //! Filesystem and I/O state owned by the syscall dispatcher.
 
 use super::super::*;
-use crate::linux_abi::LinuxErrno;
+use crate::linux_abi::{LinuxDnotifyMask, LinuxErrno};
 use std::sync::atomic::AtomicU64;
+
+#[derive(Debug, Clone)]
+pub(in crate::dispatch) struct DnotifyRegistration {
+    pub(in crate::dispatch) fd: i32,
+    pub(in crate::dispatch) tid: crate::thread::ThreadId,
+    pub(in crate::dispatch) path: String,
+    pub(in crate::dispatch) mask: LinuxDnotifyMask,
+}
 
 /// Owned filesystem-subsystem state. Split out of `SyscallDispatcher` so
 /// the fs handlers borrow only the VFS state they touch instead of the
@@ -34,6 +42,12 @@ pub(in crate::dispatch) struct FsState {
     /// express for same-process operations. Empty (the common case) → the
     /// handlers' notify calls are a single `is_empty` read and return.
     pub(in crate::dispatch) inotify_registry: crate::inotify::InotifyRegistry,
+
+    /// Dnotify (`F_NOTIFY`) directory watches. Linux delivers `SIGIO` to the
+    /// fd's async owner on matching directory changes. Carrick implements the
+    /// same-process create/delete/rename cases exercised by LTP by piggybacking
+    /// on the existing dispatch-layer mutation hooks.
+    pub(in crate::dispatch) dnotify_registry: parking_lot::Mutex<Vec<DnotifyRegistration>>,
 
     /// Fork-coherent cache of `resolve_at_path` results (guest AT_FDCWD
     /// absolute path -> canonical host-side path). Under `--fs host` a resolve
@@ -242,6 +256,7 @@ impl FsState {
             rootfs_vfs: crate::vfs::RootFsVfs::new(),
             pty_table,
             inotify_registry: crate::inotify::InotifyRegistry::default(),
+            dnotify_registry: parking_lot::Mutex::new(Vec::new()),
             resolve_cache: crate::fs_resolve_cache::ResolveCache::new(),
         }
     }

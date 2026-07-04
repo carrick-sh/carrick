@@ -207,6 +207,7 @@ use crate::linux_abi::{
     LINUX_EAGAIN,
     LINUX_EALREADY,
     LINUX_EBADF,
+    LINUX_EBUSY,
     LINUX_EDEADLK,
     LINUX_EEXIST,
     LINUX_EFAULT,
@@ -532,6 +533,7 @@ use crate::linux_abi::{
     LinuxCloneArgs,
     LinuxCloneFlags,
     LinuxDirent64Header,
+    LinuxDnotifyMask,
     LinuxEfdFlags,
     LinuxEpollEvent,
     LinuxEpollEvents,
@@ -2135,6 +2137,27 @@ impl SyscallDispatcher {
     /// on every fd-close path (close, close_range, exec CLOEXEC sweep) so the
     /// PtyTable never desyncs from the real fd lifetime.
     pub(in crate::dispatch) fn close_open_file_and_free_pty(&self, open_file: &OpenFile) {
+        // Linux classic POSIX record locks are process-associated, and closing
+        // any fd for the same file releases every classic lock this process
+        // holds on that file. Carrick dup(2) aliases one HostFdRef in the shared
+        // open description, so closing a guest dup would otherwise skip the host
+        // close event and leave fcntl(F_SETLK) locks alive. Close a temporary
+        // duplicate to trigger the host kernel's process-lock release without
+        // shortening the shared description's actual fd lifetime. OFD locks are
+        // tied to the open file description and survive a non-final dup close.
+        let classic_lock_release_fd = match &*open_file.description.read() {
+            OpenDescription::HostFile { host_fd, .. } => Some(host_fd.raw()),
+            _ => None,
+        };
+        if let Some(host_fd) = classic_lock_release_fd {
+            let duped = unsafe { libc::dup(host_fd) };
+            if duped >= 0 {
+                unsafe {
+                    libc::close(duped);
+                }
+            }
+        }
+
         // Only act when THIS is the last reference (the host fd is actually
         // closing) — a dup'd fd sharing the Arc keeps the writer/pty alive.
         let last_ref = Arc::strong_count(&open_file.description) == 1;
