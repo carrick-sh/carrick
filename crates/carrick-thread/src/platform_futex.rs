@@ -22,11 +22,13 @@
 //! into the wait path); that is a per-host extra, not a divergence the shim must
 //! model. KVM and bhyve use `FutexTableFutex` directly.
 
+use std::cell::Cell;
 use std::sync::Arc;
 use std::time::Duration;
 
 use carrick_hal::{
-    FutexOutcome, PlatformFutex, SharedFutexLocation, SharedWaitStep, ThreadId, shared_wait_sliced,
+    FutexOutcome, HostVa, PlatformFutex, SharedFutexLocation, SharedWaitStep, ThreadId,
+    shared_wait_sliced,
 };
 
 use crate::thread::{FutexTable, FutexWaitOutcome};
@@ -46,6 +48,7 @@ pub trait SharedFutexSyscall: Send + Sync {
     fn wait_one_slice(
         &self,
         location: SharedFutexLocation,
+        waiter_key: usize,
         val: u32,
         slice_ns: i64,
     ) -> SharedWaitStep;
@@ -65,7 +68,37 @@ pub trait SharedFutexSyscall: Send + Sync {
     /// return a waiter count can use these to track the full guest FUTEX_WAIT
     /// lifetime rather than a single host wait slice.
     fn wait_start(&self, _waiter_key: usize) {}
+    fn wait_start_requeued(&self, waiter_key: usize) -> bool {
+        self.wait_start(waiter_key);
+        false
+    }
     fn wait_end(&self, _waiter_key: usize) {}
+    fn wait_end_requeued(
+        &self,
+        _location: SharedFutexLocation,
+        waiter_key: usize,
+        _value: u32,
+    ) -> bool {
+        self.wait_end(waiter_key);
+        true
+    }
+    fn try_complete_requeued(&self, _waiter_key: usize) -> bool {
+        false
+    }
+    fn take_requeue(&self, _waiter_key: usize) -> Option<(usize, usize, u32)> {
+        None
+    }
+    fn requeue(
+        &self,
+        _from: SharedFutexLocation,
+        _from_key: usize,
+        _to: SharedFutexLocation,
+        _to_key: usize,
+        _wake: u32,
+        _requeue: u32,
+    ) -> (u32, u32) {
+        (0, 0)
+    }
 }
 
 /// Classify one cross-process futex wait slice's raw host return into a
@@ -151,17 +184,75 @@ impl<S: SharedFutexSyscall> PlatformFutex for FutexTableFutex<S> {
         timeout: Option<Duration>,
         interrupted: &dyn Fn() -> bool,
     ) -> i64 {
-        self.shared.pre_wait(location, value);
-        self.shared.wait_start(waiter_key);
-        let ret = shared_wait_sliced(timeout, interrupted, &|slice_ns| {
-            self.shared.wait_one_slice(location, value, slice_ns)
-        });
-        self.shared.wait_end(waiter_key);
-        ret
+        let mut location = location;
+        let mut waiter_key = waiter_key;
+        let mut value = value;
+        let mut current_requeued = false;
+        loop {
+            self.shared.pre_wait(location, value);
+            let already_woken = if current_requeued {
+                self.shared.wait_start_requeued(waiter_key)
+            } else {
+                self.shared.wait_start(waiter_key);
+                false
+            };
+            if already_woken {
+                return 0;
+            }
+            let completed_requeued = Cell::new(false);
+            let ret = shared_wait_sliced(timeout, interrupted, &|slice_ns| {
+                if current_requeued && self.shared.try_complete_requeued(waiter_key) {
+                    completed_requeued.set(true);
+                    return SharedWaitStep::Woken;
+                }
+                self.shared
+                    .wait_one_slice(location, waiter_key, value, slice_ns)
+            });
+            if current_requeued {
+                if completed_requeued.get() {
+                    return 0;
+                }
+                let complete = self.shared.wait_end_requeued(location, waiter_key, value);
+                if complete {
+                    return 0;
+                }
+                if ret == 0 {
+                    continue;
+                }
+                return ret;
+            }
+            self.shared.wait_end(waiter_key);
+            if ret != 0 {
+                return ret;
+            }
+            let Some((next_host, next_key, next_value)) = self.shared.take_requeue(waiter_key)
+            else {
+                return ret;
+            };
+            location = SharedFutexLocation::Direct {
+                word: HostVa(next_host),
+            };
+            waiter_key = next_key;
+            value = next_value;
+            current_requeued = true;
+        }
     }
 
     fn shared_wake(&self, location: SharedFutexLocation, waiter_key: usize, n: u32) -> i64 {
         self.shared.wake(location, waiter_key, n)
+    }
+
+    fn shared_requeue(
+        &self,
+        from: SharedFutexLocation,
+        from_key: usize,
+        to: SharedFutexLocation,
+        to_key: usize,
+        wake: u32,
+        requeue: u32,
+    ) -> (u32, u32) {
+        self.shared
+            .requeue(from, from_key, to, to_key, wake, requeue)
     }
 
     fn requeue(&self, from: u64, to: u64, wake: u32, requeue: u32) -> (u32, u32) {
@@ -190,6 +281,7 @@ mod tests {
         fn wait_one_slice(
             &self,
             location: SharedFutexLocation,
+            _waiter_key: usize,
             _val: u32,
             _slice_ns: i64,
         ) -> SharedWaitStep {

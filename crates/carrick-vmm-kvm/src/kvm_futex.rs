@@ -100,6 +100,7 @@ impl SharedFutexSyscall for KvmSharedFutex {
     fn wait_one_slice(
         &self,
         location: SharedFutexLocation,
+        _waiter_key: usize,
         val: u32,
         slice_ns: i64,
     ) -> SharedWaitStep {

@@ -173,6 +173,7 @@ use crate::memory::AddressSpace;
 use carrick_aarch64::Aarch64VcpuSnapshot;
 use carrick_guest_mem::MemoryError;
 use serde::Serialize;
+use std::collections::HashMap;
 
 mod sysreg;
 use sysreg::*;
@@ -709,6 +710,192 @@ fn vcpu_created() {
     VCPU_LIVE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct GlobalVcpuPermit {
+    slot: usize,
+    fd: libc::c_int,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Default)]
+struct GlobalVcpuPermitState {
+    live: HashMap<u64, GlobalVcpuPermit>,
+    pending: Vec<usize>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn global_vcpu_permits() -> &'static std::sync::Mutex<GlobalVcpuPermitState> {
+    static PERMITS: std::sync::OnceLock<std::sync::Mutex<GlobalVcpuPermitState>> =
+        std::sync::OnceLock::new();
+    PERMITS.get_or_init(|| std::sync::Mutex::new(GlobalVcpuPermitState::default()))
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn close_global_vcpu_permit(permit: GlobalVcpuPermit) {
+    unsafe {
+        let _ = libc::close(permit.fd);
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn open_global_vcpu_slot(slot: usize) -> Option<libc::c_int> {
+    let dir = c"/tmp/carrick-hvf-vcpu-slots";
+    unsafe {
+        let _ = libc::mkdir(dir.as_ptr(), 0o700);
+    }
+    let Ok(path) = std::ffi::CString::new(format!("/tmp/carrick-hvf-vcpu-slots/slot-{slot}"))
+    else {
+        return None;
+    };
+    let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CREAT, 0o600) };
+    if fd < 0 {
+        return None;
+    }
+    let rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        Some(fd)
+    } else {
+        unsafe {
+            let _ = libc::close(fd);
+        }
+        None
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn acquire_global_vcpu_permit() -> GlobalVcpuPermit {
+    // `hv_vm_get_max_vcpu_count` is a per-VM ceiling. A fork storm creates many
+    // one-vCPU VMs, and HVF can exhaust host resources well below that per-VM
+    // count. Keep the cross-process gate conservative; the in-process scheduler
+    // still uses the full per-VM budget for guest threads.
+    let budget = (vcpu_gate::budget().max(1) as usize).min(4);
+    loop {
+        let mut state = global_vcpu_permits()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for slot in 0..budget {
+            if state.pending.contains(&slot) || state.live.values().any(|p| p.slot == slot) {
+                continue;
+            }
+            let Some(fd) = open_global_vcpu_slot(slot) else {
+                continue;
+            };
+            state.pending.push(slot);
+            return GlobalVcpuPermit { slot, fd };
+        }
+        drop(state);
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn forget_pending_global_vcpu_permit(state: &mut GlobalVcpuPermitState, slot: usize) {
+    if let Some(pos) = state.pending.iter().position(|&s| s == slot) {
+        state.pending.swap_remove(pos);
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn register_global_vcpu_permit(vcpu_id: u64, permit: GlobalVcpuPermit) {
+    let mut state = global_vcpu_permits()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    forget_pending_global_vcpu_permit(&mut state, permit.slot);
+    if let Some(old) = state.live.insert(vcpu_id, permit) {
+        close_global_vcpu_permit(old);
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn release_unregistered_global_vcpu_permit(permit: GlobalVcpuPermit) {
+    let mut state = global_vcpu_permits()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    forget_pending_global_vcpu_permit(&mut state, permit.slot);
+    drop(state);
+    close_global_vcpu_permit(permit);
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn release_global_vcpu_permit(vcpu_id: u64) {
+    let permit = global_vcpu_permits()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .live
+        .remove(&vcpu_id);
+    if let Some(permit) = permit {
+        close_global_vcpu_permit(permit);
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn reset_global_vcpu_permits_after_fork_child() {
+    let mut state = global_vcpu_permits()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let inherited = std::mem::take(&mut state.live);
+    state.pending.clear();
+    drop(state);
+    for (_, permit) in inherited {
+        close_global_vcpu_permit(permit);
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn create_vcpu_with_permit(
+    vm: &applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>,
+    permit: GlobalVcpuPermit,
+) -> Result<applevisor::vcpu::Vcpu, TrapError> {
+    match vm.vcpu_create() {
+        Ok(vcpu) => {
+            register_global_vcpu_permit(vcpu.id(), permit);
+            vcpu_created();
+            Ok(vcpu)
+        }
+        Err(e) => {
+            release_unregistered_global_vcpu_permit(permit);
+            Err(hvf_error(e))
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn create_vcpu(
+    vm: &applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>,
+) -> Result<applevisor::vcpu::Vcpu, TrapError> {
+    // Existing-VM vCPUs (thread siblings, reclaim/rebind, sibling fork rebuild)
+    // are admitted by the in-process scheduler. The file-lock permit below gates
+    // NEW HVF VMs/fork storms only; applying it here starves a multithreaded
+    // fork child behind its own one-vCPU ancestors.
+    match vm.vcpu_create() {
+        Ok(vcpu) => {
+            vcpu_created();
+            Ok(vcpu)
+        }
+        Err(e) => Err(hvf_error(e)),
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn create_vm_with_permit(
+    config: applevisor::vm::VirtualMachineConfig,
+) -> Result<
+    (
+        applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>,
+        GlobalVcpuPermit,
+    ),
+    TrapError,
+> {
+    let permit = acquire_global_vcpu_permit();
+    match virtual_machine_with_private_signals_blocked(config) {
+        Ok(vm) => Ok((vm, permit)),
+        Err(e) => {
+            release_unregistered_global_vcpu_permit(permit);
+            Err(hvf_error(e))
+        }
+    }
+}
+
 /// vCPU admission gate for sibling guest threads.
 ///
 /// Hypervisor.framework caps the number of vCPUs that may exist CONCURRENTLY in
@@ -794,7 +981,8 @@ fn enable_el0_counter_access(vcpu_id: applevisor_sys::hv_vcpu_t) {
     }
 }
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn vcpu_destroyed() {
+fn vcpu_destroyed(vcpu_id: u64) {
+    release_global_vcpu_permit(vcpu_id);
     VCPU_LIVE.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     // A slot freed: wake a sibling thread blocked in the admission gate.
     vcpu_gate::notify();
@@ -1321,9 +1509,8 @@ impl HvfVmState {
         let max_ipa = VirtualMachineConfig::get_max_ipa_size().map_err(hvf_error)?;
         let mut config = VirtualMachineConfig::new();
         config.set_ipa_size(max_ipa).map_err(hvf_error)?;
-        let vm = virtual_machine_with_private_signals_blocked(config).map_err(hvf_error)?;
-        let vcpu = vm.vcpu_create().map_err(hvf_error)?;
-        vcpu_created();
+        let (vm, permit) = create_vm_with_permit(config)?;
+        let vcpu = create_vcpu_with_permit(&vm, permit)?;
         enable_el0_counter_access(vcpu.id());
 
         let mut state = HvfVmState {
@@ -1681,8 +1868,7 @@ impl HvfVmState {
     /// Create a fresh vCPU bound to this VM (the boot/clone/fork/reclaim
     /// vcpu_create; admission is the bounded scheduler's job, NOT this path).
     pub(crate) fn add_vcpu(&mut self) -> Result<applevisor::vcpu::Vcpu, TrapError> {
-        let vcpu = self._vm.vcpu_create().map_err(hvf_error)?;
-        vcpu_created();
+        let vcpu = create_vcpu(&self._vm)?;
         enable_el0_counter_access(vcpu.id());
         self.vcpu_id = vcpu.id();
         self.vcpu_handle = vcpu.get_handle();
@@ -2570,8 +2756,11 @@ impl HvfVmState {
         self.reclaim_snapshot = Some(snap);
         // Raw destroy — only the owning thread may, and applevisor's Drop would
         // panic on the post-destroy handle.
-        let rc = unsafe { applevisor_sys::hv_vcpu_destroy(vcpu.id()) };
-        vcpu_destroyed();
+        let vcpu_id = vcpu.id();
+        let rc = unsafe { applevisor_sys::hv_vcpu_destroy(vcpu_id) };
+        if rc == 0 {
+            vcpu_destroyed(vcpu_id);
+        }
         if rc != 0 {
             return Err(TrapError::Hypervisor(format!(
                 "reclaim_park: hv_vcpu_destroy rc={rc:#x}"
@@ -2600,14 +2789,99 @@ impl HvfVmState {
             .reclaim_snapshot
             .take()
             .ok_or_else(|| TrapError::Hypervisor("reclaim_resume: no parked snapshot".into()))?;
-        let new_vcpu = self._vm.vcpu_create().map_err(hvf_error)?;
-        vcpu_created();
+        let new_vcpu = create_vcpu(&self._vm)?;
         enable_el0_counter_access(new_vcpu.id());
         self.vcpu_id = new_vcpu.id();
         self.vcpu_handle = new_vcpu.get_handle();
         // Replace the destroyed handle WITHOUT running applevisor's panicky Drop on
         // the (already hv_vcpu_destroy'd) old one — mirror the fork rebuild.
         std::mem::forget(std::mem::replace(vcpu, new_vcpu));
+        HvfInner::restore_vcpu_into(vcpu, &snap)?;
+        self.last_exit_class = snap.last_exit_class;
+        Ok(())
+    }
+
+    /// Single-threaded process shared-futex park. Unlike `reclaim_park`, this
+    /// destroys the whole VM, not just the vCPU, so a large process-fork fanout
+    /// parked in `FUTEX_WAIT` does not keep one HVF VM alive per waiter.
+    pub(crate) fn shared_wait_park(
+        &mut self,
+        vcpu: &mut applevisor::vcpu::Vcpu,
+    ) -> Result<(), TrapError> {
+        let snap = HvfInner::snapshot_vcpu_from(vcpu)?;
+        self.reclaim_snapshot = Some(snap);
+        let vcpu_id = vcpu.id();
+        let vcpu_rc = unsafe { applevisor_sys::hv_vcpu_destroy(vcpu_id) };
+        if vcpu_rc == 0 {
+            vcpu_destroyed(vcpu_id);
+        }
+        if vcpu_rc != 0 {
+            return Err(TrapError::Hypervisor(format!(
+                "shared_wait_park: hv_vcpu_destroy rc={vcpu_rc:#x}"
+            )));
+        }
+        let vm_rc = unsafe { applevisor_sys::hv_vm_destroy() };
+        if vm_rc != 0 {
+            return Err(TrapError::Hypervisor(format!(
+                "shared_wait_park: hv_vm_destroy rc={vm_rc:#x}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Resume a process parked by [`Self::shared_wait_park`]: create a fresh VM
+    /// and vCPU, re-map this process's existing host backings, then restore the
+    /// saved guest registers.
+    pub(crate) fn shared_wait_resume(
+        &mut self,
+        vcpu: &mut applevisor::vcpu::Vcpu,
+    ) -> Result<(), TrapError> {
+        use applevisor::prelude::*;
+
+        let snap = self.reclaim_snapshot.take().ok_or_else(|| {
+            TrapError::Hypervisor("shared_wait_resume: no parked snapshot".into())
+        })?;
+        let max_ipa = VirtualMachineConfig::get_max_ipa_size().map_err(hvf_error)?;
+        let mut config = VirtualMachineConfig::new();
+        config.set_ipa_size(max_ipa).map_err(hvf_error)?;
+        let (new_vm, permit) = create_vm_with_permit(config)?;
+        let new_vcpu = create_vcpu_with_permit(&new_vm, permit)?;
+        enable_el0_counter_access(new_vcpu.id());
+        self.vcpu_id = new_vcpu.id();
+        self.vcpu_handle = new_vcpu.get_handle();
+        std::mem::forget(std::mem::replace(vcpu, new_vcpu));
+        replace_destroyed_vm(self, new_vm);
+
+        for mapping in &self.mappings {
+            let r = unsafe {
+                applevisor_sys::hv_vm_map(
+                    mapping.host_addr.cast(),
+                    mapping.ipa,
+                    mapping.size,
+                    u64::from(mapping.perms),
+                )
+            };
+            if r != 0 {
+                return Err(TrapError::ChildMapFailed {
+                    host_addr: mapping.host_addr as u64,
+                    guest_start: mapping.ipa,
+                    size: mapping.size,
+                    code: r as u32,
+                });
+            }
+            if crate::memory::is_high_va(mapping.start) {
+                register_shared_alias(AliasBacking {
+                    start: mapping.start,
+                    ipa: mapping.ipa,
+                    host_addr: mapping.host_addr as usize,
+                    size: mapping.size,
+                    perms: u64::from(mapping.perms),
+                    guest_writable: mapping.guest_writable,
+                    guest_shared: mapping.guest_shared,
+                });
+            }
+        }
+
         HvfInner::restore_vcpu_into(vcpu, &snap)?;
         self.last_exit_class = snap.last_exit_class;
         Ok(())
@@ -2629,8 +2903,11 @@ impl HvfVmState {
         publish_sibling_fork_mappings(&self.mappings);
         let snap = HvfInner::snapshot_vcpu_from(vcpu)?;
         FORK_VCPU_SNAPSHOT.with(|s| *s.borrow_mut() = Some(snap));
-        let rc = unsafe { applevisor_sys::hv_vcpu_destroy(vcpu.id()) };
-        vcpu_destroyed();
+        let vcpu_id = vcpu.id();
+        let rc = unsafe { applevisor_sys::hv_vcpu_destroy(vcpu_id) };
+        if rc == 0 {
+            vcpu_destroyed(vcpu_id);
+        }
         // phase 3: a nonzero rc means this sibling FAILED to destroy its own
         // vCPU, so it stays live and the forker's hv_vm_destroy hits HV_BUSY.
         crate::probes::fork_quiesce(3, rc as i64, vcpu.id() as i64, unsafe { libc::getpid() });
@@ -2662,8 +2939,7 @@ impl HvfVmState {
             .lock()
             .clone()
             .unwrap_or_else(|| (*self._vm).clone());
-        let new_vcpu = new_vm.vcpu_create().map_err(hvf_error)?;
-        vcpu_created();
+        let new_vcpu = create_vcpu(&new_vm)?;
         enable_el0_counter_access(new_vcpu.id());
         self.vcpu_id = new_vcpu.id();
         self.vcpu_handle = new_vcpu.get_handle();
@@ -2683,8 +2959,11 @@ impl HvfVmState {
     /// `hv_vm_destroy` trips over the accumulated dead-thread vCPUs (HV_BUSY).
     /// Raw `hv_vcpu_destroy`, not applevisor's panicky wrapper.
     pub(crate) fn destroy_vcpu_on_thread_exit(&mut self, vcpu: &mut applevisor::vcpu::Vcpu) {
-        let _ = unsafe { applevisor_sys::hv_vcpu_destroy(vcpu.id()) };
-        vcpu_destroyed();
+        let vcpu_id = vcpu.id();
+        let rc = unsafe { applevisor_sys::hv_vcpu_destroy(vcpu_id) };
+        if rc == 0 {
+            vcpu_destroyed(vcpu_id);
+        }
     }
 
     /// Multithreaded fork — PRE-`libc::fork` half (the forking thread, single
@@ -2801,19 +3080,10 @@ impl HvfVmState {
         // tracked `vcpu_id` (the stale `HvfAarch64Vcpu` wrapper is replaced in
         // `fork_rebuild`, which DOES hold `&mut vcpu`).
         let vcpu_destroy_rc = unsafe { applevisor_sys::hv_vcpu_destroy(self.vcpu_id) };
-        vcpu_destroyed();
-        let vm_destroy_rc = unsafe { applevisor_sys::hv_vm_destroy() };
-        if std::env::var_os("CARRICK_FORK_DEBUG").is_some() {
-            eprintln!(
-                "[FORKDBG pid={}] teardown vcpu_id={:#x} vcpu_destroy_rc={:#x} vm_destroy_rc={:#x} live={} share_vm={}",
-                unsafe { libc::getpid() },
-                self.vcpu_id,
-                vcpu_destroy_rc,
-                vm_destroy_rc,
-                VCPU_LIVE.load(std::sync::atomic::Ordering::SeqCst),
-                share_vm,
-            );
+        if vcpu_destroy_rc == 0 {
+            vcpu_destroyed(self.vcpu_id);
         }
+        let vm_destroy_rc = unsafe { applevisor_sys::hv_vm_destroy() };
         // phase 2: a nonzero rc means a vCPU was still live at teardown — the
         // HV_BUSY root cause (the rebuilt VM is then corrupt and sibling
         // vcpu_create fails). Traceable via `carrick trace` fork__quiesce.
@@ -2854,33 +3124,14 @@ impl HvfVmState {
         // via fork). Each side independently re-registers the inherited host
         // buffers via raw `hv_vm_map`.
         let max_ipa = VirtualMachineConfig::get_max_ipa_size().map_err(hvf_error)?;
-        if std::env::var_os("CARRICK_FORK_DEBUG").is_some() {
-            eprintln!(
-                "[FORKDBG pid={}] fork_rebuild is_child={} max_ipa={:#x} (pre-create)",
-                unsafe { libc::getpid() },
-                is_child,
-                max_ipa,
-            );
-        }
         let mut config = VirtualMachineConfig::new();
         config.set_ipa_size(max_ipa).map_err(hvf_error)?;
-        let new_vm = virtual_machine_with_private_signals_blocked(config).map_err(hvf_error)?;
-        let new_vcpu = new_vm.vcpu_create().map_err(hvf_error)?;
-        vcpu_created();
-        enable_el0_counter_access(new_vcpu.id());
-        if std::env::var_os("CARRICK_FORK_DEBUG").is_some() {
-            eprintln!(
-                "[FORKDBG pid={}] fork_rebuild is_child={} new_vcpu_id={:#x} n_descs={}",
-                unsafe { libc::getpid() },
-                is_child,
-                new_vcpu.id(),
-                if is_child {
-                    child_descs.len()
-                } else {
-                    mapping_descs.len()
-                },
-            );
+        if is_child {
+            reset_global_vcpu_permits_after_fork_child();
         }
+        let (new_vm, permit) = create_vm_with_permit(config)?;
+        let new_vcpu = create_vcpu_with_permit(&new_vm, permit)?;
+        enable_el0_counter_access(new_vcpu.id());
         self.vcpu_id = new_vcpu.id();
         self.vcpu_handle = new_vcpu.get_handle();
 
@@ -3145,8 +3396,7 @@ impl HvfVmState {
         // The caller holds `fork_quiesce::topology_lock()`, so this read can't
         // race a fork's republish.
         let vm = rebuilt_vm_cell().lock().clone().unwrap_or(vm);
-        let vcpu = vm.vcpu_create().map_err(hvf_error)?;
-        vcpu_created();
+        let vcpu = create_vcpu(&vm)?;
         enable_el0_counter_access(vcpu.id());
 
         let mut state = HvfVmState {
@@ -3200,17 +3450,18 @@ impl HvfVmState {
         // Tear down the current HVF VM. Same dance as fork(): destroy vCPU then VM
         // via raw API (applevisor's Drop is bypassed).
         let inherited_vcpu_id = vcpu.id();
-        let _ = unsafe { applevisor_sys::hv_vcpu_destroy(inherited_vcpu_id) };
-        vcpu_destroyed();
+        let vcpu_destroy_rc = unsafe { applevisor_sys::hv_vcpu_destroy(inherited_vcpu_id) };
+        if vcpu_destroy_rc == 0 {
+            vcpu_destroyed(inherited_vcpu_id);
+        }
         let _ = unsafe { applevisor_sys::hv_vm_destroy() };
 
         // Create a fresh VM + vCPU.
         let max_ipa = VirtualMachineConfig::get_max_ipa_size().map_err(hvf_error)?;
         let mut config = VirtualMachineConfig::new();
         config.set_ipa_size(max_ipa).map_err(hvf_error)?;
-        let new_vm = virtual_machine_with_private_signals_blocked(config).map_err(hvf_error)?;
-        let new_vcpu = new_vm.vcpu_create().map_err(hvf_error)?;
-        vcpu_created();
+        let (new_vm, permit) = create_vm_with_permit(config)?;
+        let new_vcpu = create_vcpu_with_permit(&new_vm, permit)?;
         enable_el0_counter_access(new_vcpu.id());
         self.vcpu_id = new_vcpu.id();
         self.vcpu_handle = new_vcpu.get_handle();
@@ -3934,13 +4185,7 @@ fn set_region_fork_inheritance(host_addr: *mut u8, size: usize, inherit: libc::c
         ) -> libc::c_int;
     }
     let rc = unsafe { minherit(host_addr.cast(), size, inherit) };
-    if rc != 0 && std::env::var_os("CARRICK_FORK_DEBUG").is_some() {
-        eprintln!(
-            "[FORKDBG pid={}] minherit(host={host_addr:p}, size={size}, inherit={inherit}) failed: {}",
-            unsafe { libc::getpid() },
-            std::io::Error::last_os_error()
-        );
-    }
+    let _ = rc;
 }
 
 /// same pages. Called pre-fork while the guest vCPU is suspended (atomic, no

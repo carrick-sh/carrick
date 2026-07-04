@@ -43,7 +43,13 @@ mod imp {
     struct WaiterSlot {
         key: AtomicU64,
         count: AtomicU32,
-        _pad: AtomicU32,
+        requeue_wake: AtomicU32,
+        requeue_count: AtomicU32,
+        requeue_to_host: AtomicU64,
+        requeue_to_key: AtomicU64,
+        requeue_to_value: AtomicU32,
+        logical_requeued: AtomicU32,
+        logical_wake: AtomicU32,
     }
 
     #[link(name = "System")]
@@ -144,6 +150,35 @@ mod imp {
             .unwrap_or(0)
     }
 
+    fn consume_one(counter: &AtomicU32) -> bool {
+        let mut cur = counter.load(Ordering::Acquire);
+        while cur != 0 {
+            match counter.compare_exchange_weak(cur, cur - 1, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return true,
+                Err(next) => cur = next,
+            }
+        }
+        false
+    }
+
+    fn add_logical_requeued(waiter_key: usize, count: u32) {
+        if count == 0 {
+            return;
+        }
+        if let Some(slot) = waiter_slot(waiter_key) {
+            slot.logical_requeued.fetch_add(count, Ordering::AcqRel);
+        }
+    }
+
+    fn reserve_logical_wakes(waiter_key: usize, count: u32) {
+        if count == 0 {
+            return;
+        }
+        if let Some(slot) = waiter_slot(waiter_key) {
+            slot.logical_wake.fetch_add(count, Ordering::AcqRel);
+        }
+    }
+
     pub fn preinit_waiter_table() -> bool {
         waiter_table().is_some()
     }
@@ -156,18 +191,50 @@ mod imp {
 
     pub fn waiter_exit(host_addr: usize) {
         if let Some(slot) = waiter_slot(host_addr) {
-            let mut cur = slot.count.load(Ordering::Acquire);
-            while cur != 0 {
-                match slot.count.compare_exchange_weak(
-                    cur,
-                    cur - 1,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                ) {
-                    Ok(_) => break,
-                    Err(next) => cur = next,
-                }
-            }
+            let _ = consume_one(&slot.count);
+        }
+    }
+
+    pub fn requeued_waiter_enter(waiter_key: usize) -> bool {
+        let Some(slot) = waiter_slot(waiter_key) else {
+            return false;
+        };
+        if consume_one(&slot.logical_wake) {
+            let _ = consume_one(&slot.logical_requeued);
+            return true;
+        }
+        slot.count.fetch_add(1, Ordering::AcqRel);
+        if consume_one(&slot.logical_wake) {
+            let _ = consume_one(&slot.count);
+            let _ = consume_one(&slot.logical_requeued);
+            return true;
+        }
+        false
+    }
+
+    pub fn requeued_waiter_complete(waiter_key: usize) -> bool {
+        let Some(slot) = waiter_slot(waiter_key) else {
+            return false;
+        };
+        if consume_one(&slot.logical_wake) {
+            let _ = consume_one(&slot.count);
+            let _ = consume_one(&slot.logical_requeued);
+            return true;
+        }
+        false
+    }
+
+    pub fn requeued_waiter_exit(waiter_key: usize, _host_addr: usize, _value: u32) -> bool {
+        let Some(slot) = waiter_slot(waiter_key) else {
+            return true;
+        };
+        let had_credit = consume_one(&slot.logical_wake);
+        let _ = consume_one(&slot.count);
+        if had_credit {
+            let _ = consume_one(&slot.logical_requeued);
+            true
+        } else {
+            false
         }
     }
 
@@ -224,6 +291,45 @@ mod imp {
         if n == 0 {
             return 0;
         }
+        let Some(slot) = waiter_slot(waiter_key) else {
+            return 0;
+        };
+        let parked = slot.count.load(Ordering::Acquire);
+        let logical = slot.logical_requeued.load(Ordering::Acquire);
+        let target = parked.max(logical).min(n);
+        if target == 0 {
+            return 0;
+        }
+        let physical_target = parked.min(target);
+        let physical_woke = if physical_target == 0 {
+            0
+        } else if physical_target == 1 {
+            if wake(host_addr, false) >= 0 { 1 } else { 0 }
+        } else if physical_target >= parked {
+            if wake(host_addr, true) >= 0 {
+                physical_target
+            } else {
+                0
+            }
+        } else {
+            let mut woke = 0u32;
+            for _ in 0..physical_target {
+                if wake(host_addr, false) < 0 {
+                    break;
+                }
+                woke += 1;
+            }
+            woke
+        };
+        let logical_woke = target.min(logical);
+        reserve_logical_wakes(waiter_key, logical_woke);
+        i64::from(physical_woke.max(logical_woke))
+    }
+
+    fn wake_physical_counted(host_addr: usize, waiter_key: usize, n: u32) -> i64 {
+        if n == 0 {
+            return 0;
+        }
         let parked = waiter_count(waiter_key);
         if parked == 0 {
             return 0;
@@ -248,6 +354,75 @@ mod imp {
         }
         woke
     }
+
+    pub fn requeue_counted(
+        from_host_addr: usize,
+        from_waiter_key: usize,
+        to_host_addr: usize,
+        to_waiter_key: usize,
+        wake_count: u32,
+        requeue_count: u32,
+    ) -> (u32, u32) {
+        let parked = waiter_count(from_waiter_key);
+        if parked == 0 {
+            return (0, 0);
+        }
+        let total = parked.min(wake_count.saturating_add(requeue_count));
+        let wake_actual = wake_count.min(total);
+        let requeue_actual = requeue_count.min(total.saturating_sub(wake_actual));
+        if let Some(slot) = waiter_slot(from_waiter_key) {
+            let to_value = unsafe { (*(to_host_addr as *const AtomicU32)).load(Ordering::SeqCst) };
+            slot.requeue_to_host
+                .store(to_host_addr as u64, Ordering::Release);
+            slot.requeue_to_key
+                .store(to_waiter_key as u64, Ordering::Release);
+            slot.requeue_to_value.store(to_value, Ordering::Release);
+            slot.requeue_wake.store(wake_actual, Ordering::Release);
+            slot.requeue_count.store(requeue_actual, Ordering::Release);
+        }
+        let woke = wake_physical_counted(from_host_addr, from_waiter_key, total).max(0) as u32;
+        let wake_done = wake_actual.min(woke);
+        let requeue_done = requeue_actual.min(woke.saturating_sub(wake_done));
+        if requeue_done != 0 {
+            add_logical_requeued(to_waiter_key, requeue_done);
+        }
+        (wake_done, requeue_done)
+    }
+
+    pub fn take_requeue(waiter_key: usize) -> Option<(usize, usize, u32)> {
+        let slot = waiter_slot(waiter_key)?;
+        let mut wake = slot.requeue_wake.load(Ordering::Acquire);
+        while wake != 0 {
+            match slot.requeue_wake.compare_exchange_weak(
+                wake,
+                wake - 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return None,
+                Err(next) => wake = next,
+            }
+        }
+
+        let mut requeue = slot.requeue_count.load(Ordering::Acquire);
+        while requeue != 0 {
+            match slot.requeue_count.compare_exchange_weak(
+                requeue,
+                requeue - 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    let host = slot.requeue_to_host.load(Ordering::Acquire) as usize;
+                    let key = slot.requeue_to_key.load(Ordering::Acquire) as usize;
+                    let value = slot.requeue_to_value.load(Ordering::Acquire);
+                    return (host != 0 && key != 0).then_some((host, key, value));
+                }
+                Err(next) => requeue = next,
+            }
+        }
+        None
+    }
 }
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
@@ -261,14 +436,39 @@ mod imp {
     pub fn wake_counted(_host_addr: usize, _waiter_key: usize, _n: u32) -> i64 {
         -(libc::ENOSYS as i64)
     }
+    pub fn requeue_counted(
+        _from_host_addr: usize,
+        _from_waiter_key: usize,
+        _to_host_addr: usize,
+        _to_waiter_key: usize,
+        _wake_count: u32,
+        _requeue_count: u32,
+    ) -> (u32, u32) {
+        (0, 0)
+    }
+    pub fn take_requeue(_waiter_key: usize) -> Option<(usize, usize, u32)> {
+        None
+    }
     pub fn preinit_waiter_table() -> bool {
         true
     }
     pub fn waiter_enter(_host_addr: usize) {}
     pub fn waiter_exit(_host_addr: usize) {}
+    pub fn requeued_waiter_enter(_host_addr: usize) -> bool {
+        false
+    }
+    pub fn requeued_waiter_complete(_host_addr: usize) -> bool {
+        false
+    }
+    pub fn requeued_waiter_exit(_waiter_key: usize, _host_addr: usize, _value: u32) -> bool {
+        true
+    }
 }
 
-pub use imp::{preinit_waiter_table, wait, waiter_enter, waiter_exit, wake, wake_counted};
+pub use imp::{
+    preinit_waiter_table, requeue_counted, requeued_waiter_complete, requeued_waiter_enter,
+    requeued_waiter_exit, take_requeue, wait, waiter_enter, waiter_exit, wake, wake_counted,
+};
 
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 mod tests {

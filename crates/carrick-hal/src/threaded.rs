@@ -320,6 +320,17 @@ pub trait PlatformFutex: Send + Sync {
         interrupted: &dyn Fn() -> bool,
     ) -> i64;
     fn shared_wake(&self, location: SharedFutexLocation, waiter_key: usize, n: u32) -> i64;
+    fn shared_requeue(
+        &self,
+        _from: SharedFutexLocation,
+        _from_key: usize,
+        _to: SharedFutexLocation,
+        _to_key: usize,
+        _wake: u32,
+        _requeue: u32,
+    ) -> (u32, u32) {
+        (0, 0)
+    }
     fn requeue(&self, from: u64, to: u64, wake: u32, requeue: u32) -> (u32, u32);
     /// Wake every private-futex waiter so it re-checks its interrupt predicate
     /// (a process-directed signal became pending, or a fork/exec quiesce was
@@ -526,12 +537,26 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + GuestMemory + Send {
     fn save_guest_state(&mut self) -> Vec<u8> {
         Vec::new()
     }
+    /// Save state for a process-shared futex wait. Backends that can release
+    /// stronger host resources while parked may override this separately from
+    /// the generic private-futex reclaim path.
+    fn save_shared_wait_state(&mut self) -> Vec<u8> {
+        self.save_guest_state()
+    }
     /// Re-bind this engine to `slot`'s vCPU and restore `state` into it — called by
     /// the owning thread when it re-acquires a (possibly different) slot after a
     /// block. Only when [`reclaims`](Self::reclaims).
     fn rebind_to_slot(&mut self, slot: crate::SlotId, state: &[u8]) -> Result<(), TrapError> {
         let _ = (slot, state);
         Ok(())
+    }
+    /// Restore state saved by [`Self::save_shared_wait_state`].
+    fn rebind_shared_wait_state(
+        &mut self,
+        slot: crate::SlotId,
+        state: &[u8],
+    ) -> Result<(), TrapError> {
+        self.rebind_to_slot(slot, state)
     }
     fn build_sibling_spec(&self, entry: GuestEntryRegs) -> Result<Self::SiblingSpec, TrapError>;
     fn materialize_sibling(spec: Self::SiblingSpec) -> Result<Self, TrapError>

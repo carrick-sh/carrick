@@ -519,6 +519,14 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         Ok(zeroed_snapshot())
     }
 
+    fn save_shared_wait_state(
+        &mut self,
+        vcpu: &mut Self::Vcpu,
+    ) -> Result<Aarch64VcpuSnapshot, TrapError> {
+        self.state.shared_wait_park(&mut vcpu.0)?;
+        Ok(zeroed_snapshot())
+    }
+
     fn rebind_to_slot(
         &mut self,
         _slot: SlotId,
@@ -530,6 +538,15 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         // engine's `_snapshot` placeholder is ignored — HVF `take`s its own stashed
         // `reclaim_snapshot`. Slot id ignored (HVF recreates its OWN vCPU; no pool).
         self.state.reclaim_resume(&mut vcpu.0)
+    }
+
+    fn rebind_shared_wait_state(
+        &mut self,
+        _slot: SlotId,
+        _snapshot: &Aarch64VcpuSnapshot,
+        vcpu: &mut Self::Vcpu,
+    ) -> Result<(), TrapError> {
+        self.state.shared_wait_resume(&mut vcpu.0)
     }
 
     fn build_sibling_builder(

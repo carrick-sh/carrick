@@ -2919,6 +2919,8 @@ pub const LINUX_FUTEX_WAKE_BITSET: u64 = 10;
 pub const LINUX_FUTEX_CMD_MASK: u64 = 0x7f;
 pub const LINUX_FUTEX_PRIVATE_FLAG: u64 = 128;
 pub const LINUX_FUTEX_CLOCK_REALTIME: u64 = 256;
+pub const LINUX_FUTEX_32: u64 = 0x2;
+pub const LINUX_FUTEX_WAITV_MAX: u64 = 128;
 /// PI-futex owner-TID mask: the low 30 bits of the lock word hold the owner tid;
 /// the top two bits are FUTEX_WAITERS / FUTEX_OWNER_DIED.
 pub const LINUX_FUTEX_TID_MASK: u32 = 0x3fff_ffff;
