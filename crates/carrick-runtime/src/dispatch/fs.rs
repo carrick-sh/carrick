@@ -2466,6 +2466,42 @@ impl SyscallDispatcher {
         }
     }
 
+    pub(in crate::dispatch) fn host_pipe_capacity_state(
+        &self,
+        base: &OpenDescriptionBase,
+        pipe_id: u64,
+        is_read_end: bool,
+        bidirectional: bool,
+        host_fd: i32,
+    ) -> Option<(i64, usize)> {
+        let queued = if is_read_end || bidirectional {
+            host_pipe_readable_bytes(host_fd).ok().unwrap_or(0)
+        } else {
+            self.host_pipe_read_end_buffered_bytes(pipe_id)
+        };
+        Some((base.pipe_capacity(), queued))
+    }
+
+    fn host_pipe_read_end_buffered_bytes(&self, pipe_id: u64) -> usize {
+        let table = self.io.open_files.read();
+        for other in table.values() {
+            let Some(other_open) = other.description.try_read() else {
+                continue;
+            };
+            if let OpenDescription::HostPipe {
+                host_fd,
+                is_read_end: true,
+                pipe_id: other_pipe_id,
+                ..
+            } = &*other_open
+                && *other_pipe_id == pipe_id
+            {
+                return host_pipe_readable_bytes(host_fd.raw()).ok().unwrap_or(0);
+            }
+        }
+        0
+    }
+
     /// Reconcile the fork-coherent FASYNC registry with `fd`'s current
     /// description after an `O_ASYNC` / `F_SETOWN` / `F_SETSIG` change. If
     /// `O_ASYNC` is set on a host pipe/socket, arm `(dev, ino)` with the fd's
@@ -3035,8 +3071,10 @@ impl SyscallDispatcher {
                 match &mut *open {
                     OpenDescription::PipeWriter { pipe, .. } => return write_pipe(bytes, pipe),
                     OpenDescription::HostPipe {
+                        base,
                         host_fd,
                         is_read_end,
+                        pipe_id,
                         pty,
                         bidirectional,
                         write_kind,
@@ -3062,6 +3100,13 @@ impl SyscallDispatcher {
                                 Some(host_fd.clone()),
                                 nonblocking,
                                 *write_kind,
+                                self.host_pipe_capacity_state(
+                                    base,
+                                    *pipe_id,
+                                    *is_read_end,
+                                    *bidirectional,
+                                    host_fd.raw(),
+                                ),
                                 tid,
                                 false,
                             )
@@ -3074,6 +3119,7 @@ impl SyscallDispatcher {
                             Some(host_fd.clone()),
                             nonblocking,
                             HostWriteKind::SocketLike,
+                            None,
                             tid,
                             false,
                         );
@@ -3096,6 +3142,7 @@ impl SyscallDispatcher {
                             Some(host_fd.clone()),
                             nonblocking,
                             HostWriteKind::RegularFile,
+                            None,
                             tid,
                             false,
                         );
@@ -8258,8 +8305,10 @@ impl SyscallDispatcher {
                             return Ok(write_pipe(&bytes, pipe));
                         }
                         OpenDescription::HostPipe {
+                            base,
                             host_fd,
                             is_read_end,
+                            pipe_id,
                             pty,
                             bidirectional,
                             write_kind,
@@ -8287,6 +8336,13 @@ impl SyscallDispatcher {
                                 Some(host_fd.clone()),
                                 nonblocking,
                                 *write_kind,
+                                this.host_pipe_capacity_state(
+                                    base,
+                                    *pipe_id,
+                                    *is_read_end,
+                                    *bidirectional,
+                                    host_fd.raw(),
+                                ),
                                 cx.tid(),
                                 true,
                             );
@@ -8313,6 +8369,7 @@ impl SyscallDispatcher {
                                 Some(host_fd.clone()),
                                 nonblocking,
                                 HostWriteKind::SocketLike,
+                                None,
                                 cx.tid(),
                                 false,
                             );
@@ -8351,6 +8408,7 @@ impl SyscallDispatcher {
                                 Some(host_fd.clone()),
                                 nonblocking,
                                 HostWriteKind::RegularFile,
+                                None,
                                 cx.tid(),
                                 false,
                             ));
@@ -8472,6 +8530,7 @@ impl SyscallDispatcher {
                 host_fd: i32,
                 host_fd_owner: Option<HostFdRef>,
                 write_kind: HostWriteKind,
+                pipe_state: Option<(i64, usize)>,
                 sigpipe_on_epipe: bool,
                 append: bool,
             }
@@ -8480,8 +8539,10 @@ impl SyscallDispatcher {
                 let open = open_file.description.read();
                 match &*open {
                     OpenDescription::HostPipe {
+                        base,
                         host_fd,
                         is_read_end,
+                        pipe_id,
                         pty,
                         bidirectional,
                         write_kind,
@@ -8496,6 +8557,13 @@ impl SyscallDispatcher {
                             host_fd: host_fd.raw(),
                             host_fd_owner: Some(host_fd.clone()),
                             write_kind: *write_kind,
+                            pipe_state: this.host_pipe_capacity_state(
+                                base,
+                                *pipe_id,
+                                *is_read_end,
+                                *bidirectional,
+                                host_fd.raw(),
+                            ),
                             sigpipe_on_epipe: true,
                             append: false,
                         })
@@ -8504,6 +8572,7 @@ impl SyscallDispatcher {
                         host_fd: host_fd.raw(),
                         host_fd_owner: Some(host_fd.clone()),
                         write_kind: HostWriteKind::SocketLike,
+                        pipe_state: None,
                         sigpipe_on_epipe: false,
                         append: false,
                     }),
@@ -8520,6 +8589,7 @@ impl SyscallDispatcher {
                             host_fd: host_fd.raw(),
                             host_fd_owner: Some(host_fd.clone()),
                             write_kind: HostWriteKind::RegularFile,
+                            pipe_state: None,
                             sigpipe_on_epipe: false,
                             append: base.status_flags() & LINUX_O_APPEND != 0,
                         })
@@ -8545,6 +8615,7 @@ impl SyscallDispatcher {
                     target.host_fd_owner.clone(),
                     nonblocking,
                     target.write_kind,
+                    target.pipe_state,
                     cx.tid(),
                     target.sigpipe_on_epipe,
                 );
@@ -8595,8 +8666,10 @@ impl SyscallDispatcher {
                                 writeback = None;
                             }
                             OpenDescription::HostPipe {
+                                base,
                                 host_fd,
                                 is_read_end,
+                                pipe_id,
                                 pty,
                                 bidirectional,
                                 write_kind,
@@ -8613,6 +8686,13 @@ impl SyscallDispatcher {
                                     Some(host_fd.clone()),
                                     nonblocking,
                                     *write_kind,
+                                    this.host_pipe_capacity_state(
+                                        base,
+                                        *pipe_id,
+                                        *is_read_end,
+                                        *bidirectional,
+                                        host_fd.raw(),
+                                    ),
                                     cx.tid(),
                                     true,
                                 );
@@ -8625,6 +8705,7 @@ impl SyscallDispatcher {
                                     Some(host_fd.clone()),
                                     nonblocking,
                                     HostWriteKind::SocketLike,
+                                    None,
                                     cx.tid(),
                                     false,
                                 );
@@ -8652,6 +8733,7 @@ impl SyscallDispatcher {
                                     Some(host_fd.clone()),
                                     nonblocking,
                                     HostWriteKind::RegularFile,
+                                    None,
                                     cx.tid(),
                                     false,
                                 );
