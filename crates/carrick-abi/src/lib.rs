@@ -1146,6 +1146,76 @@ impl LinuxTimeval {
     }
 }
 
+pub const LINUX_TIME_ERROR: i64 = 5;
+pub const LINUX_STA_UNSYNC: i32 = 0x0040;
+pub const LINUX_ADJ_OFFSET_SINGLESHOT_FLAG_ONLY: u32 = 0x8000;
+
+#[repr(C, packed)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct LinuxTimex {
+    pub modes: u32,
+    pub _pad0: u32,
+    pub offset: i64,
+    pub freq: i64,
+    pub maxerror: i64,
+    pub esterror: i64,
+    pub status: i32,
+    pub _pad1: u32,
+    pub constant: i64,
+    pub precision: i64,
+    pub tolerance: i64,
+    pub time: LinuxTimeval,
+    pub tick: i64,
+    pub ppsfreq: i64,
+    pub jitter: i64,
+    pub shift: i32,
+    pub _pad2: u32,
+    pub stabil: i64,
+    pub jitcnt: i64,
+    pub calcnt: i64,
+    pub errcnt: i64,
+    pub stbcnt: i64,
+    pub tai: i32,
+    pub _pad3: [u32; 11],
+}
+
+impl LinuxTimex {
+    pub const fn new_read_state(time: LinuxTimeval) -> Self {
+        Self {
+            modes: 0,
+            _pad0: 0,
+            offset: 0,
+            freq: 0,
+            maxerror: 16_000_000,
+            esterror: 16_000_000,
+            status: LINUX_STA_UNSYNC,
+            _pad1: 0,
+            constant: 2,
+            precision: 1,
+            tolerance: 32_768_000,
+            time,
+            tick: 10_000,
+            ppsfreq: 0,
+            jitter: 0,
+            shift: 0,
+            _pad2: 0,
+            stabil: 0,
+            jitcnt: 0,
+            calcnt: 0,
+            errcnt: 0,
+            stbcnt: 0,
+            tai: 0,
+            _pad3: [0; 11],
+        }
+    }
+
+    pub const fn invalid_mode_error_state() -> Self {
+        Self::new_read_state(LinuxTimeval::new(0, 0))
+    }
+}
+
 #[repr(C, packed)]
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
@@ -2122,6 +2192,11 @@ kernel_abi!(LinuxCloneArgs, 88, "clone_args has eleven u64 fields");
 kernel_abi!(LinuxTimespec, 16, "timespec is tv_sec:i64 + tv_nsec:i64");
 kernel_abi!(LinuxItimerspec, 32, "itimerspec is two timespecs");
 kernel_abi!(LinuxTimeval, 16, "timeval is tv_sec:i64 + tv_usec:i64");
+kernel_abi!(
+    LinuxTimex,
+    208,
+    "timex is the 64-bit kernel time discipline ABI"
+);
 kernel_abi!(LinuxItimerval, 32, "itimerval is two timevals");
 kernel_abi!(
     LinuxTimezone,

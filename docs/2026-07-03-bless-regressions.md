@@ -139,6 +139,15 @@ oracle-cache edits are only used when the suite declaration itself changed.
   `ptraceattachinit` DIFFed on attach/wait/detach before matching Linux, while
   `ptraceattach` still covers the non-dumpable-parent `EPERM` case from
   `ltp-ptrace02`.
+- `ltp-adjtimex01`, `ltp-adjtimex02`, and `ltp-adjtimex03` MATCH after
+  exposing the read-only `adjtimex`/`clock_adjtime(CLOCK_REALTIME)` time
+  discipline state. Root causes fixed: `modes == 0` now writes a Linux-shaped
+  `timex` and returns `TIME_ERROR`, adjustment modes continue to fail with
+  `EPERM`, and the invalid one-shot mode writes error state before returning
+  `EINVAL`. Red-first: `adjtimexstate` DIFFed on read-only success and
+  one-shot invalid-mode errno before matching Linux line-for-line; Docker
+  syscall evidence was gathered with bpftrace against an unprivileged target
+  container.
 - `ltp-clock_nanosleep01` MATCH after rejecting CPU-time clocks for
   `clock_nanosleep`. Root cause fixed: Carrick kept `CLOCK_THREAD_CPUTIME_ID`
   readable for `clock_gettime` but no longer treats it as sleepable; raw
