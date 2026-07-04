@@ -514,6 +514,16 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         ))
     }
 
+    /// Save state for a process-shared futex wait. Defaults to the generic
+    /// vCPU-only reclaim; HVF overrides this for single-threaded process waits
+    /// so it can tear down the whole VM while the process is parked.
+    fn save_shared_wait_state(
+        &mut self,
+        vcpu: &mut Self::Vcpu,
+    ) -> Result<Aarch64VcpuSnapshot, TrapError> {
+        self.save_guest_state(vcpu)
+    }
+
     /// Re-bind to `slot`'s vCPU after a block (M:N reclaim wake), passing the
     /// engine-owned `vcpu`. HVF RECREATES the vCPU in its existing VM and restores
     /// the parked state, writing the new vCPU back through `vcpu`. KVM no-op.
@@ -525,6 +535,16 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
     ) -> Result<(), TrapError> {
         let _ = (slot, snapshot, vcpu);
         Ok(())
+    }
+
+    /// Restore state saved by [`Self::save_shared_wait_state`].
+    fn rebind_shared_wait_state(
+        &mut self,
+        slot: SlotId,
+        snapshot: &Aarch64VcpuSnapshot,
+        vcpu: &mut Self::Vcpu,
+    ) -> Result<(), TrapError> {
+        self.rebind_to_slot(slot, snapshot, vcpu)
     }
 
     /// Build the `Send` payload a `clone(CLONE_THREAD)` sibling needs to add its

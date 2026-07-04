@@ -106,6 +106,7 @@ syscall_table! {
     219 => keyctl,
     220 => clone,
     221 => execve,
+    449 => futex_waitv,
     281 => execveat,
     260 => wait4,
     277 => sys_seccomp,
@@ -1711,16 +1712,16 @@ impl SyscallDispatcher {
                         return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
                     }
                     if let Some(location) = shared_location {
-                        // Shared path: no native requeue -> wake nr_wake+nr_requeue
-                        // (correct per the spurious-wake-tolerant futex contract),
-                        // routed through the `PlatformFutex::shared_wake` seam.
-                        let total = (nr_wake as u64)
-                            .saturating_add(nr_requeue as u64)
-                            .min(u32::MAX as u64) as u32;
-                        return Ok(DispatchOutcome::SharedFutexWake {
-                            location,
-                            waiter_key: uaddr2 as usize,
-                            count: total,
+                        let Some(to_location) = memory.shared_futex_location(uaddr2) else {
+                            return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                        };
+                        return Ok(DispatchOutcome::SharedFutexRequeue {
+                            from: location,
+                            from_key: address.0 as usize,
+                            to: to_location,
+                            to_key: uaddr2 as usize,
+                            wake: nr_wake,
+                            requeue: nr_requeue,
                         });
                     }
                     let (woken, requeued) =
@@ -1731,6 +1732,26 @@ impl SyscallDispatcher {
                 }
                 _ => DispatchOutcome::errno(LINUX_ENOSYS),
             })
+        }
+
+        fn futex_waitv(
+            this,
+            cx,
+            waiters: GuestPtr,
+            nr_futexes: u64,
+            flags: u64,
+            timeout: GuestPtr,
+            clockid: u64,
+        ) {
+            Ok(dispatch_futex_waitv_args(
+                &mut *cx.memory,
+                cx.thread.map(|t| t.futex),
+                waiters.0,
+                nr_futexes,
+                flags,
+                timeout.0,
+                clockid,
+            ))
         }
 
         fn uname(this, cx, address: GuestPtr) {

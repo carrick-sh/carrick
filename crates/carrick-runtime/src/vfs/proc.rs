@@ -134,6 +134,10 @@ impl GuestMemoryRange {
         self.end.raw().saturating_sub(self.start.raw())
     }
 
+    pub fn is_empty(self) -> bool {
+        self.len() == 0
+    }
+
     fn overlap_bytes(self, start: u64, end: u64) -> u64 {
         let lo = self.start.raw().max(start);
         let hi = self.end.raw().min(end);
@@ -1343,10 +1347,31 @@ fn synthetic_proc_net_igmp6(network: &carrick_spec::NetworkNamespaceSpec) -> Vec
 pub(crate) fn synthetic_task_dir(pid: u32) -> Option<Vec<String>> {
     let own = crate::current_thread_states();
     if own.iter().any(|(t, _)| t.raw() as u32 == pid) {
-        return Some(own.iter().map(|(t, _)| t.to_string()).collect());
+        let self_host_pid = std::process::id();
+        let self_ns_pid = crate::namespace::pid::self_ns_pid();
+        return Some(
+            own.iter()
+                .map(|(t, _)| {
+                    let raw = t.raw() as u32;
+                    if raw == self_host_pid {
+                        self_ns_pid.to_string()
+                    } else {
+                        raw.to_string()
+                    }
+                })
+                .collect(),
+        );
     }
     if crate::host_proc::is_guest_process(pid) {
-        return Some(vec![pid.to_string()]);
+        let display_pid = if crate::namespace::pid::enabled() {
+            crate::namespace::pid::host_to_ns_or_self(pid)
+        } else {
+            pid
+        };
+        if display_pid == 0 {
+            return None;
+        }
+        return Some(vec![display_pid.to_string()]);
     }
     // The calling process is always its own live task, so `/proc/self` (which
     // resolves to `std::process::id()`) must stay openable even when no guest
@@ -2767,6 +2792,7 @@ CONFIG_INOTIFY_USER=y\n\
 CONFIG_DNOTIFY=y\n\
 CONFIG_BLK_DEV_LOOP=y\n\
 CONFIG_SYSVIPC=y\n\
+CONFIG_CHECKPOINT_RESTORE=y\n\
 CONFIG_SECCOMP=y\n\
 CONFIG_SECCOMP_FILTER=y\n\
 CONFIG_CGROUPS=y\n\
@@ -2916,12 +2942,8 @@ VmFlags: rd mr mw me\n"
 
 /// Parse the `start-end ...` of one `/proc/self/maps` line.
 fn maps_line_range(line: &str) -> Option<(u64, u64)> {
-    let Some(range) = line.split_whitespace().next() else {
-        return None;
-    };
-    let Some((lo, hi)) = range.split_once('-') else {
-        return None;
-    };
+    let range = line.split_whitespace().next()?;
+    let (lo, hi) = range.split_once('-')?;
     match (u64::from_str_radix(lo, 16), u64::from_str_radix(hi, 16)) {
         (Ok(lo), Ok(hi)) => Some((lo, hi)),
         _ => None,
@@ -3247,8 +3269,8 @@ mod tests {
     fn proc_maps_uses_vfs_owned_context() {
         // Reserve a 64 KiB heap region but set the program break partway in, at an
         // unaligned offset. Real Linux reports page-aligned VMA bounds, so the [heap]
-        // line must end at the break rounded UP to carrick's 16 KiB page — not at the
-        // raw break, and not at the full region end. 0x1234 rounds up to 0x4000.
+        // line must end at the break rounded UP to Linux's 4 KiB page — not at the
+        // raw break, and not at the full region end. 0x1234 rounds up to 0x2000.
         let ctx = SyntheticProcContext {
             executable_path: "/bin/demo".to_owned(),
             argv: vec!["/bin/demo".to_owned()],
@@ -3273,9 +3295,9 @@ mod tests {
         };
         let maps = String::from_utf8(synthetic_file("/proc/self/maps", &ctx).unwrap()).unwrap();
         assert!(maps.contains("[heap]"));
-        // The heap ends at the page-aligned break (0x1234 → 0x4000), proving the
+        // The heap ends at the page-aligned break (0x1234 -> 0x2000), proving the
         // VFS-owned brk_current drives the end rather than the reserved region end.
-        assert!(maps.contains(&format!("{:08x}", LINUX_HEAP_BASE + 0x4000)));
+        assert!(maps.contains(&format!("{:08x}", LINUX_HEAP_BASE + 0x2000)));
         assert!(!maps.contains(&format!("{:08x}", LINUX_HEAP_BASE + 0x10000)));
     }
 

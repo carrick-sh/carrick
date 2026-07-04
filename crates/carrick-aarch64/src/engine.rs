@@ -1216,6 +1216,13 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         }
     }
 
+    fn save_shared_wait_state(&mut self) -> Vec<u8> {
+        match self.vm.save_shared_wait_state(&mut self.vcpu) {
+            Ok(snap) => serialize_snapshot(&snap),
+            Err(_) => Vec::new(),
+        }
+    }
+
     fn rebind_to_slot(&mut self, slot: SlotId, state: &[u8]) -> Result<(), TrapError> {
         // HVF stashes the snapshot internally (it destroyed the vCPU in place), so
         // the serialized `state` is empty for it; reconstruct a snapshot only if
@@ -1224,6 +1231,12 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         // recreates the vCPU and writes it back through `&mut self.vcpu`.
         let snap = deserialize_snapshot(state).unwrap_or_else(zeroed_snapshot);
         self.vm.rebind_to_slot(slot, &snap, &mut self.vcpu)
+    }
+
+    fn rebind_shared_wait_state(&mut self, slot: SlotId, state: &[u8]) -> Result<(), TrapError> {
+        let snap = deserialize_snapshot(state).unwrap_or_else(zeroed_snapshot);
+        self.vm
+            .rebind_shared_wait_state(slot, &snap, &mut self.vcpu)
     }
 
     fn build_sibling_spec(&self, entry: GuestEntryRegs) -> Result<Self::SiblingSpec, TrapError> {

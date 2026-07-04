@@ -938,7 +938,9 @@ impl SyscallDispatcher {
             {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            let map_sharing = map_sharing.expect("validated mmap sharing");
+            let Some(map_sharing) = map_sharing else {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            };
             let length = match align_up_u64(length, LINUX_PAGE_SIZE) {
                 Some(length) => length,
                 None => {
