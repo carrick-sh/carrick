@@ -113,6 +113,7 @@ syscall_table! {
     278 => getrandom,
     424 => pidfd_send_signal,
     434 => pidfd_open,
+    438 => pidfd_getfd,
     93 | 94 => sys_exit,
     178 => gettid,
     435 => sys_clone3,
@@ -726,6 +727,20 @@ impl SyscallDispatcher {
             // yields None → EBADF. (CPython test_pidfd_send_signal.)
             OpenDescription::Directory { path, .. } => {
                 crate::vfs::proc::proc_pid_dir_host_pid(path).map(|p| p as i32)
+            }
+            _ => None,
+        }
+    }
+
+    fn pidfd_status_flags(&self, fd: i32) -> Option<u64> {
+        let open = self.open_file(fd)?;
+        let desc = open.description.read();
+        match &*desc {
+            OpenDescription::Pidfd { base, .. } => Some(base.status_flags()),
+            OpenDescription::Directory { path, .. }
+                if crate::vfs::proc::proc_pid_dir_host_pid(path).is_some() =>
+            {
+                Some(0)
             }
             _ => None,
         }
@@ -1973,6 +1988,12 @@ impl SyscallDispatcher {
             if si_pid == 0 && !guest_nohang {
                 if idtype == LINUX_P_PIDFD
                     && let Some(host_fd) = this.host_fd_for_poll(id as i32) {
+                        if this
+                            .pidfd_status_flags(id as i32)
+                            .is_some_and(|flags| flags & LINUX_O_NONBLOCK != 0)
+                        {
+                            return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
+                        }
                         return Ok(DispatchOutcome::WaitOnPollFds {
                             fds: WaitFds::raw_one(host_fd.get(), libc::POLLIN),
                             timeout: None,
@@ -2383,22 +2404,85 @@ impl SyscallDispatcher {
             Ok(this.open_pidfd(host_pid, flags))
         }
 
-        fn pidfd_send_signal(this, cx, fd: Fd, signum: u64, _info: GuestPtr, _flags: u64) {
+        fn pidfd_getfd(this, cx, _pidfd: Fd, _targetfd: u64, _flags: u64) {
+            // Carrick does not yet provide a safe cross-process guest-fd
+            // duplication path. Surface the same conservative denial that the
+            // Docker oracle reports under its container policy instead of
+            // advertising the syscall as absent with ENOSYS.
+            Ok(DispatchOutcome::errno(LINUX_EPERM))
+        }
+
+        fn pidfd_send_signal(this, cx, fd: Fd, signum: u64, info: GuestPtr, flags: u64) {
             let Some(host_pid) = this.pidfd_host_pid(fd.0) else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
+            if flags != 0 {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
             if signum == 0 {
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
             if !crate::dispatch::signal::is_valid_signum(signum) {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
+            let caller_euid = this.cred_snapshot().euid;
+            let target_euid = if host_pid as u32 == std::process::id() {
+                caller_euid
+            } else {
+                crate::cred_ipc::read_target(host_pid).unwrap_or(0)
+            };
+            if info.0 != 0 {
+                let bytes = match cx
+                    .memory
+                    .read_bytes(
+                        info.0,
+                        core::mem::size_of::<crate::linux_abi::LinuxSiginfo>(),
+                    )
+                {
+                    Ok(bytes) => bytes,
+                    Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
+                };
+                let mut user_info = match crate::linux_abi::LinuxSiginfo::read_from_bytes(&bytes) {
+                    Ok(info) => info,
+                    Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
+                };
+                let signum_i32 = signum as i32;
+                if user_info.si_signo != signum_i32 {
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                }
+                if caller_euid != 0 && caller_euid != target_euid {
+                    return Ok(DispatchOutcome::errno(LINUX_EPERM));
+                }
+                user_info.si_signo = signum_i32;
+                let value = user_info
+                    ._pad
+                    .get(0..8)
+                    .and_then(|b| b.try_into().ok())
+                    .map(i64::from_le_bytes)
+                    .unwrap_or(0);
+                if crate::host_signal::xsig_enqueue(
+                    host_pid,
+                    signum_i32,
+                    user_info.si_code,
+                    crate::namespace::pid::self_ns_pid() as i32,
+                    this.cred_snapshot().euid,
+                    value,
+                ) {
+                    crate::host_signal::xsig_nudge(host_pid);
+                    return Ok(DispatchOutcome::Returned { value: 0 });
+                }
+                return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
+            }
+            if caller_euid != 0 && caller_euid != target_euid {
+                return Ok(DispatchOutcome::errno(LINUX_EPERM));
+            }
             // A pidfd names exactly one process by the HOST pid recorded at
             // creation (pidfd_open rejects pid <= 0; CLONE_PIDFD registers the
             // fork child's host pid) — never a group or tid.
-            Ok(crate::dispatch::signal::bootstrap_signal_send(
+            Ok(crate::dispatch::signal::bootstrap_signal_send_as(
                 crate::dispatch::signal::SignalTarget::HostProcess(HostPid(host_pid as u32)),
                 signum,
+                Some(caller_euid),
             ))
         }
 
