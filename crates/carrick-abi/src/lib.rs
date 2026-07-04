@@ -2935,6 +2935,7 @@ pub const LINUX_TCGETS: u64 = 0x5401;
 pub const LINUX_TCSETS: u64 = 0x5402;
 pub const LINUX_TCSETSW: u64 = 0x5403;
 pub const LINUX_TCSETSF: u64 = 0x5404;
+pub const LINUX_TCGETA: u64 = 0x5405;
 // termios2 variants. glibc-aarch64 implements tcgetattr/tcsetattr (and thus
 // isatty(3), which goes through tcgetattr) via these — NOT the legacy
 // TCGETS/TCSETS above — so it can carry an arbitrary baud rate (BOTHER) in the
@@ -2947,6 +2948,8 @@ pub const LINUX_TCGETS2: u64 = 0x802c_542a;
 pub const LINUX_TCSETS2: u64 = 0x402c_542b;
 pub const LINUX_TCSETSW2: u64 = 0x402c_542c;
 pub const LINUX_TCSETSF2: u64 = 0x402c_542d;
+/// Size of the older Linux `struct termio` payload used by TCGETA.
+pub const LINUX_TERMIO_SIZE: usize = 18;
 /// Size of the Linux kernel-ABI `struct termios2` (TCGETS2/TCSETS2): the full
 /// [`LinuxTermios`] including the `c_ispeed`/`c_ospeed` tail = **44 bytes**.
 pub const LINUX_TERMIOS2_SIZE: usize = 44;
@@ -2957,6 +2960,8 @@ pub const LINUX_TCSBRK: u64 = 0x5409;
 pub const LINUX_TCXONC: u64 = 0x540A;
 pub const LINUX_TCFLSH: u64 = 0x540B;
 pub const LINUX_TCSBRKP: u64 = 0x5425;
+pub const LINUX_FICLONE: u64 = 0x4004_9409;
+pub const LINUX_RNDGETENTCNT: u64 = 0x8004_5200;
 // TCXONC actions (tcflow): suspend/resume output/input.
 pub const LINUX_TCOOFF: u64 = 0;
 pub const LINUX_TCOON: u64 = 1;
