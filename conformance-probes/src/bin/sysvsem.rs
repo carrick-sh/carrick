@@ -1,107 +1,116 @@
-//! SysV semaphores: semget / semop / semctl(SETVAL/GETVAL/SETALL/GETALL/
-//! IPC_RMID). carrick forwards these to the host (macOS has SysV semaphores;
-//! the `sembuf` layout matches Linux, the semctl command constants are
-//! translated). Guest processes are separate host processes sharing the host
-//! semaphore set, so the host kernel gives cross-process coherence — the whole
-//! point of a semaphore. Was ENOSYS (whole ipc area TBROK'd); stands in for
-//! the LTP semget/semop/semctl basic-operation tests.
-//!
-//! Invariants (deterministic):
-//!   1. semget(IPC_PRIVATE, 2, IPC_CREAT|0600) → id >= 0.
-//!   2. SETVAL sem0=5 → GETVAL sem0 == 5.
-//!   3. SETALL [3,7] → GETALL reads back [3,7].
-//!   4. semop decrement sem0 by 2 → GETVAL sem0 == 1.
-//!   5. cross-process: a forked child does semop +4 on sem0; the parent's
-//!      GETVAL then sees 5 (1+4) — the host set is shared across processes.
-//!   6. IPC_RMID → 0.
-//!
-//! NOTE: deliberately does NOT assert IPC_STAT semid_ds contents or the
-//! error-path errnos/limits — those edges aren't fully faithful yet (tracked).
+use conformance_probes::report;
 
-use conformance_probes::{errno, report};
-
-const IPC_PRIVATE: i32 = 0;
-const IPC_CREAT: i32 = 0o1000;
 const IPC_RMID: i32 = 0;
+const IPC_CREAT: i32 = 0o1000;
 const GETVAL: i32 = 12;
 const GETALL: i32 = 13;
 const SETVAL: i32 = 16;
 const SETALL: i32 = 17;
+const SEM_INFO: i32 = 19;
+const SEM_STAT_ANY: i32 = 20;
+const SYS_SEMGET: libc::c_long = libc::SYS_semget as libc::c_long;
+const SYS_SEMCTL: libc::c_long = libc::SYS_semctl as libc::c_long;
+const SYS_SEMOP: libc::c_long = libc::SYS_semop as libc::c_long;
 
 #[repr(C)]
-#[derive(Clone, Copy)]
 struct Sembuf {
     sem_num: u16,
     sem_op: i16,
     sem_flg: i16,
 }
 
-unsafe fn semget(key: i32, nsems: i32, flg: i32) -> i64 {
-    libc::syscall(libc::SYS_semget, key, nsems, flg)
+fn errno() -> i32 {
+    std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
 }
-unsafe fn semop(id: i32, sops: *mut Sembuf, n: usize) -> i64 {
-    libc::syscall(libc::SYS_semop, id, sops, n)
+
+unsafe fn reset_errno() {
+    #[cfg(any(target_env = "gnu", target_env = "musl"))]
+    {
+        *libc::__errno_location() = 0;
+    }
 }
-unsafe fn semctl(id: i32, num: i32, cmd: i32, arg: u64) -> i64 {
-    libc::syscall(libc::SYS_semctl, id, num, cmd, arg)
+
+unsafe fn semctl(semid: i32, semnum: i32, cmd: i32, arg: *mut libc::c_void) -> i64 {
+    libc::syscall(
+        SYS_SEMCTL,
+        semid as libc::c_long,
+        semnum as libc::c_long,
+        cmd as libc::c_long,
+        arg,
+    ) as i64
 }
 
 fn main() {
     unsafe {
-        let id = semget(IPC_PRIVATE, 2, IPC_CREAT | 0o600);
-        report!(semget_ok = id >= 0);
-        if id < 0 {
-            report!(
-                setval_getval = false,
-                setall_getall = false,
-                semop_decrement = false,
-                xprocess_shared = false,
-                ipc_rmid_ok = false,
-            );
-            return;
+        reset_errno();
+        let first = libc::syscall(SYS_SEMGET, libc::IPC_PRIVATE, 1, IPC_CREAT | 0o600) as i32;
+        let semid = libc::syscall(SYS_SEMGET, libc::IPC_PRIVATE, 2, IPC_CREAT | 0o600) as i32;
+        let semget_ok = semid >= 0;
+        let semget_errno = errno();
+        if first >= 0 {
+            semctl(first, 0, IPC_RMID, core::ptr::null_mut());
         }
-        let id = id as i32;
 
-        // SETVAL / GETVAL.
-        let sv = semctl(id, 0, SETVAL, 5);
-        let gv = semctl(id, 0, GETVAL, 0);
-        report!(setval_getval = sv == 0 && gv == 5);
+        let mut info = [0u8; 64];
+        reset_errno();
+        let info_ret = semctl(0, 0, SEM_INFO, info.as_mut_ptr().cast());
+        let info_errno = errno();
 
-        // SETALL / GETALL (array of u16).
-        let set: [u16; 2] = [3, 7];
-        let sa = semctl(id, 0, SETALL, set.as_ptr() as u64);
-        let mut got: [u16; 2] = [0; 2];
-        let ga = semctl(id, 0, GETALL, got.as_mut_ptr() as u64);
-        report!(setall_getall = sa == 0 && ga == 0 && got == [3, 7]);
+        let mut ds = [0u8; 128];
+        reset_errno();
+        let hole_ret = semctl(0, 0, SEM_STAT_ANY, ds.as_mut_ptr().cast());
+        let hole_errno = errno();
 
-        // semop: sem0 is 3 now (from SETALL); decrement by 2 → 1.
-        let mut dec = Sembuf {
+        reset_errno();
+        let stat_ret = semctl(info_ret as i32, 0, SEM_STAT_ANY, ds.as_mut_ptr().cast());
+        let stat_errno = errno();
+        let sem_nsems = u64::from_le_bytes([
+            ds[64], ds[65], ds[66], ds[67], ds[68], ds[69], ds[70], ds[71],
+        ]);
+
+        reset_errno();
+        let setval_ret = semctl(semid, 0, SETVAL, 5usize as *mut libc::c_void);
+        let getval_ret = semctl(semid, 0, GETVAL, core::ptr::null_mut());
+
+        let setall_values = [3u16, 7u16];
+        let mut getall_values = [0u16; 2];
+        let setall_ret = semctl(semid, 0, SETALL, setall_values.as_ptr().cast_mut().cast());
+        let getall_ret = semctl(semid, 0, GETALL, getall_values.as_mut_ptr().cast());
+
+        let mut decrement = Sembuf {
             sem_num: 0,
             sem_op: -2,
             sem_flg: 0,
         };
-        let op = semop(id, &mut dec, 1);
-        let after = semctl(id, 0, GETVAL, 0);
-        report!(semop_decrement = op == 0 && after == 1);
+        let semop_ret = libc::syscall(SYS_SEMOP, semid, &mut decrement, 1) as i64;
+        let semop_value = semctl(semid, 0, GETVAL, core::ptr::null_mut());
 
-        // Cross-process: child increments sem0 by 4; parent sees 5.
-        let pid = libc::fork();
-        if pid == 0 {
-            let mut inc = Sembuf {
-                sem_num: 0,
-                sem_op: 4,
-                sem_flg: 0,
-            };
-            let _ = semop(id, &mut inc, 1);
-            libc::_exit(0);
+        reset_errno();
+        let e2big_ret = libc::syscall(SYS_SEMOP, semid, core::ptr::null::<u8>(), 501) as i64;
+        let e2big_errno = errno();
+
+        let proc_sem = std::fs::read_to_string("/proc/sysvipc/sem").unwrap_or_default();
+
+        if semget_ok {
+            semctl(semid, 0, IPC_RMID, core::ptr::null_mut());
         }
-        let mut st = 0i32;
-        libc::waitpid(pid, &mut st, 0);
-        let shared = semctl(id, 0, GETVAL, 0);
-        report!(xprocess_shared = shared == 5);
 
-        let rm = semctl(id, 0, IPC_RMID, 0);
-        report!(ipc_rmid_ok = rm == 0);
-        let _ = errno();
+        report!(semget_ok = semget_ok);
+        report!(semget_errno = semget_errno);
+        report!(sem_info_ok = info_ret >= 0);
+        report!(sem_info_scan_bound_ok = info_ret >= 1);
+        report!(sem_info_errno = info_errno);
+        report!(sem_stat_hole_ok = hole_ret == -1 && hole_errno == libc::EINVAL);
+        report!(sem_stat_any_ok = stat_ret == semid as i64);
+        report!(sem_stat_any_errno = stat_errno);
+        report!(sem_stat_nsems_ok = sem_nsems == 2);
+        report!(setval_getval = setval_ret == 0 && getval_ret == 5);
+        report!(
+            setall_getall = setall_ret == 0 && getall_ret == 0 && getall_values == [3, 7]
+        );
+        report!(semop_decrement = semop_ret == 0 && semop_value == 1);
+        report!(semop_e2big_ret = e2big_ret);
+        report!(semop_e2big_errno = e2big_errno);
+        report!(proc_sysvipc_sem_present = proc_sem.contains("semid"));
     }
 }

@@ -143,6 +143,7 @@ pub struct SyntheticProcContext {
     pub sig_caught: u64,
     pub sig_shdpnd: u64,
     pub sysvipc_shm: String,
+    pub sysvipc_sem: String,
 }
 
 /// The three writable user-namespace map files (only the `self/` forms; writing
@@ -340,6 +341,10 @@ const SYSCTL_TABLE: &[(&str, Sysctl)] = &[
         Sysctl::Static(b"18446744073692774399\n"),
     ),
     ("/proc/sys/kernel/shmmni", Sysctl::Static(b"4096\n")),
+    (
+        "/proc/sys/kernel/sem",
+        Sysctl::Static(b"32000\t1024000000\t500\t32000\n"),
+    ),
     // Kernel taint flags: 0 = untainted. The LTP tst_test framework reads this at
     // setup/teardown for tests with `.taint_check` to detect kernel warnings/oopses;
     // a missing file made every such test TBROK in setup (tst_taint.c ENOENT).
@@ -566,6 +571,7 @@ pub(crate) fn synthetic_file(path: &str, ctx: &SyntheticProcContext) -> Option<V
         "/proc/stat" => Some(synthetic_proc_stat()),
         "/proc/swaps" => Some(synthetic_proc_swaps().to_vec()),
         "/proc/sysvipc/shm" => Some(ctx.sysvipc_shm.as_bytes().to_vec()),
+        "/proc/sysvipc/sem" => Some(ctx.sysvipc_sem.as_bytes().to_vec()),
         "/proc/uptime" => Some(synthetic_proc_uptime().into_bytes()),
         "/proc/version" => Some(synthetic_proc_version().to_vec()),
         "/proc/vmstat" => Some(synthetic_proc_vmstat().to_vec()),
@@ -1575,6 +1581,10 @@ impl Vfs for ProcVfs {
                     kind: EntryKind::Directory,
                 },
                 DirEnt {
+                    name: "sem".to_string(),
+                    kind: EntryKind::File,
+                },
+                DirEnt {
                     name: "shm".to_string(),
                     kind: EntryKind::File,
                 },
@@ -1699,6 +1709,7 @@ impl Vfs for ProcVfs {
             sig_caught: ctx.sig_caught,
             sig_shdpnd: ctx.sig_shdpnd,
             sysvipc_shm: ctx.sysvipc_shm.unwrap_or("").to_owned(),
+            sysvipc_sem: ctx.sysvipc_sem.unwrap_or("").to_owned(),
         };
         let Some(contents) = synthetic_file(path, &synth_ctx) else {
             return Err(crate::linux_abi::LINUX_ENOSYS);
