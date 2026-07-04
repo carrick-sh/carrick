@@ -1047,6 +1047,7 @@ where
                         // Re-stamp the identity page: the child's pid changed
                         // (ns-pid now registered), so a fast-path getpid is right.
                         stamp_identity_page(runtime, &dispatcher);
+                        dispatcher.mem_after_fork_child();
                         dispatcher.sysv_after_fork_child();
                         // The child's pid changed; its waiter watches for
                         // process-directed signals immediately, then upgrades
@@ -1818,6 +1819,12 @@ impl<M: GuestMemory, T: SyscallTrap> GuestMemory for SplitView<'_, M, T> {
     }
     fn write_bytes_raw(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
         self.mem.write_bytes_raw(address, bytes)
+    }
+    fn host_ptr_for_read(&self, address: u64, len: usize) -> Option<*const u8> {
+        self.mem.host_ptr_for_read(address, len)
+    }
+    fn host_ptr_for_write(&mut self, address: u64, len: usize) -> Option<*mut u8> {
+        self.mem.host_ptr_for_write(address, len)
     }
     fn zero_backing(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
         self.mem.zero_backing(address, len)

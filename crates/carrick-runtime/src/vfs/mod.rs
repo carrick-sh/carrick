@@ -96,7 +96,10 @@ pub use dev::DevVfs;
 pub use devpts::{DevptsVfs, PtyRole, PtyTable};
 pub use etc_services::EtcServicesVfs;
 pub use mount::VfsMounts;
-pub use proc::{GuestReportedArch, ProcMapSharing, ProcMapsEntry, ProcVfs, SyntheticProcContext};
+pub use proc::{
+    GuestMemoryRange, GuestReportedArch, ProcMapSharing, ProcMapsEntry, ProcVfs,
+    SyntheticProcContext,
+};
 pub use resolvconf::ResolvConfVfs;
 pub use rootfs::RootFsVfs;
 pub use sys::SysVfs;
@@ -289,6 +292,7 @@ pub struct OpenContext<'a> {
     /// The serialized ELF auxv byte image, for `/proc/self/auxv`.
     pub auxv: Option<&'a [u8]>,
     pub address_space_regions: Option<&'a [ProcMapsEntry]>,
+    pub locked_memory: Option<&'a [GuestMemoryRange]>,
     pub brk_current: u64,
     pub mmap_next: u64,
     pub ruid: u32,
