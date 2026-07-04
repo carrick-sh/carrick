@@ -343,9 +343,7 @@ pub fn mark_self_ptrace_stop_pending(signum: i32) {
 
 /// Clear and return the pending ptrace signal-stop marker once wait4 reports it.
 pub fn take_child_ptrace_stop_signal(pid: u32) -> Option<i32> {
-    let Some(slots) = child_slots() else {
-        return None;
-    };
+    let slots = child_slots()?;
     for slot in slots {
         if slot.pid.load(Ordering::Acquire) == pid as u64 {
             let signum = slot.ptrace_stop_signal.swap(0, Ordering::AcqRel);

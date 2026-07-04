@@ -1044,6 +1044,7 @@ fn write_all_at_fd(fd: i32, buf: &[u8], offset: libc::off_t) -> Result<(), Linux
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_msg_queue_progress(
     fd: i32,
     cbytes: u64,
@@ -1056,7 +1057,7 @@ fn write_msg_queue_progress(
     head: usize,
 ) -> Result<(), LinuxErrno> {
     let mut buf = [0u8; MSG_OFF_HEAD + 8 - MSG_OFF_CBYTES];
-    wr_u64(&mut buf, MSG_OFF_CBYTES - MSG_OFF_CBYTES, cbytes);
+    wr_u64(&mut buf, 0, cbytes);
     wr_u64(&mut buf, MSG_OFF_QNUM - MSG_OFF_CBYTES, qnum);
     wr_u64(&mut buf, MSG_OFF_STIME - MSG_OFF_CBYTES, stime);
     wr_u64(&mut buf, MSG_OFF_RTIME - MSG_OFF_CBYTES, rtime);
@@ -2843,7 +2844,7 @@ fn msg_queue_receive<M: GuestMemory>(
         return Ok(None);
     }
     let (head_message, next_head) = lock.read_record_at(head)?;
-    if selected_msg_index(&[head_message.clone()], wanted, flags) == Some(0) {
+    if selected_msg_index(std::slice::from_ref(&head_message), wanted, flags) == Some(0) {
         if head_message.payload.len() > msgsz && !flags.contains(MsgOpFlags::NOERROR) {
             return Err(LINUX_E2BIG);
         }
