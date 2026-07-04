@@ -1309,9 +1309,8 @@ pub mod runtime {
         // a carrick host process is driving. `init()` (called from the CLI's
         // `main` before any fork) already widened the writable window.
         {
-            let exec_path = &spec.executable;
-            let base = exec_path.rsplit('/').next().unwrap_or(exec_path);
-            crate::dispatch::set_host_process_name(base.as_bytes());
+            let cmdline = spec.argv.join(" ");
+            crate::dispatch::set_host_process_name(cmdline.as_bytes());
         }
 
         // 1. Extract the OCI layers onto a fresh cap-std scratch rootfs.

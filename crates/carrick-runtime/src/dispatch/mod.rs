@@ -2058,6 +2058,8 @@ impl SyscallDispatcher {
         let mut proc = self.proc.lock();
         proc.executable_path = abs.clone();
         proc.argv = if argv.is_empty() { vec![abs] } else { argv };
+        let base = path.rsplit('/').next().unwrap_or(&path);
+        proc.task_name = linux_task_name_from_bytes(base.as_bytes());
         proc.env = env;
         // A fresh image identity: clear the binfmt flag. The binfmt redirect
         // re-sets it (via set_binfmt_interpreted) iff THIS image is foreign-arch,

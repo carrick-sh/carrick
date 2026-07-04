@@ -2305,7 +2305,7 @@ fn guest_committed_vm_kb(ctx: &SyntheticProcContext, host_virtual_bytes: u64) ->
 }
 
 fn synthetic_proc_self_status(ctx: &SyntheticProcContext) -> String {
-    let comm = process_short_name(&ctx.executable_path);
+    let comm = context_task_comm(ctx);
     let sigign_hex = ctx.sig_ignored;
     let sigcgt_hex = ctx.sig_caught;
     let shdpnd_hex = ctx.sig_shdpnd;
