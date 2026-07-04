@@ -22,11 +22,11 @@
 //!
 //! What this does NOT implement (yet):
 //!   - SHM_REMAP.
-//!   - Complete SysV semaphore/message-queue parity; this module has partial
-//!     host-forwarded support for the cases conformance currently exercises.
+//!   - Complete SysV semaphore parity; this module still forwards semaphores to
+//!     host SysV semaphores with Carrick-owned guest metadata layered above.
 
 use super::*;
-use crate::linux_abi::{LINUX_ENOSPC, LinuxErrno};
+use crate::linux_abi::{LINUX_EIO, LINUX_ENOMSG, LINUX_ENOSPC, LinuxErrno};
 
 syscall_table! {
     /// Per-module syscall routing for the `sysv` subsystem (Task A1).
@@ -50,73 +50,15 @@ syscall_table! {
     197 => shmdt,
 }
 
-// The `libc` crate exposes the SysV semaphore family on macOS but NOT the
-// message-queue family, so declare those externs ourselves. Signatures per
-// macOS <sys/msg.h>.
-unsafe extern "C" {
-    fn msgget(key: libc::key_t, msgflg: libc::c_int) -> libc::c_int;
-    fn msgsnd(
-        msqid: libc::c_int,
-        msgp: *const libc::c_void,
-        msgsz: libc::size_t,
-        msgflg: libc::c_int,
-    ) -> libc::c_int;
-    fn msgrcv(
-        msqid: libc::c_int,
-        msgp: *mut libc::c_void,
-        msgsz: libc::size_t,
-        msgtyp: libc::c_long,
-        msgflg: libc::c_int,
-    ) -> libc::ssize_t;
-    fn msgctl(msqid: libc::c_int, cmd: libc::c_int, buf: *mut libc::c_void) -> libc::c_int;
-}
-
-/// macOS `struct msqid_ds` field offsets (measured via offsetof). Used to
-/// translate IPC_STAT into the Linux aarch64 `msqid64_ds` layout. Each host
-/// reads its msqid_ds the FAITHFUL way: Linux and FreeBSD read a NATIVE
-/// `libc::msqid_ds` by field name (the two field-naming conventions differ —
-/// `__key`/`__seq`/`__msg_cbytes` on Linux vs `key`/`seq`/`msg_cbytes` on
-/// FreeBSD — so each has its own arm below). macOS reads these raw offsets
-/// (libc lacks the type on macOS). NetBSD also lands on the macOS-offset path:
-/// libc 0.2 does NOT define `msqid_ds` for NetBSD, so a native read can't be
-/// expressed there — the macOS-offset path is the best-effort fallback (no NetBSD
-/// SysV-msg conformance box exists to bless a native layout). These constants are
-/// gated to the hosts that actually use them (macOS + NetBSD = "no native
-/// msqid_ds we read by name").
-#[cfg(any(target_os = "macos", target_os = "netbsd"))]
-const MACOS_MSQID_DS_SIZE: usize = 116;
-#[cfg(any(target_os = "macos", target_os = "netbsd"))]
-const MAC_MSG_CBYTES: usize = 32; // u64
-#[cfg(any(target_os = "macos", target_os = "netbsd"))]
-const MAC_MSG_QNUM: usize = 40; // u64
-#[cfg(any(target_os = "macos", target_os = "netbsd"))]
-const MAC_MSG_QBYTES: usize = 48; // u64
-#[cfg(any(target_os = "macos", target_os = "netbsd"))]
-const MAC_MSG_LSPID: usize = 56; // i32
-#[cfg(any(target_os = "macos", target_os = "netbsd"))]
-const MAC_MSG_LRPID: usize = 60; // i32
-#[cfg(any(target_os = "macos", target_os = "netbsd"))]
-const MAC_MSG_STIME: usize = 64; // time_t (read low 8)
-#[cfg(any(target_os = "macos", target_os = "netbsd"))]
-const MAC_MSG_RTIME: usize = 76; // time_t
-#[cfg(any(target_os = "macos", target_os = "netbsd"))]
-const MAC_MSG_CTIME: usize = 88; // time_t
-
 // Linux aarch64 `struct msqid64_ds` field offsets (asm-generic/msgbuf.h):
 // ipc64_perm(48), msg_stime@48, msg_rtime@56, msg_ctime@64, msg_cbytes@72,
 // msg_qnum@80, msg_qbytes@88, msg_lspid@96, msg_lrpid@100. Total 120.
-const LIN_MSG_STIME: usize = 48;
-const LIN_MSG_RTIME: usize = 56;
-const LIN_MSG_CTIME: usize = 64;
-const LIN_MSG_CBYTES: usize = 72;
-const LIN_MSG_QNUM: usize = 80;
 const LIN_MSG_QBYTES: usize = 88;
-const LIN_MSG_LSPID: usize = 96;
-const LIN_MSG_LRPID: usize = 100;
 const LINUX_MSQID_DS_SIZE: usize = 120;
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
@@ -180,6 +122,29 @@ pub(super) struct LinuxSemidDs {
 
 const _: () = assert!(core::mem::size_of::<LinuxSemidDs>() == 88);
 
+/// Linux aarch64 `struct msqid64_ds` (UAPI). 120 bytes: ipc64_perm(48), three
+/// 64-bit timestamps, cbytes/qnum/qbytes, last sender/receiver pids, and two
+/// reserved u64 slots. Carrick owns SysV message queue state, so `IPC_STAT`
+/// serializes directly from this metadata instead of translating a host
+/// `msqid_ds`.
+#[repr(C, packed)]
+#[derive(Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned, Default)]
+pub(super) struct LinuxMsqidDs {
+    pub msg_perm: LinuxIpcPerm, // 48
+    pub msg_stime: u64,         // 8
+    pub msg_rtime: u64,         // 8
+    pub msg_ctime: u64,         // 8
+    pub msg_cbytes: u64,        // 8
+    pub msg_qnum: u64,          // 8
+    pub msg_qbytes: u64,        // 8
+    pub msg_lspid: i32,         // 4
+    pub msg_lrpid: i32,         // 4
+    pub __unused4: u64,         // 8
+    pub __unused5: u64,         // 8
+}
+
+const _: () = assert!(core::mem::size_of::<LinuxMsqidDs>() == LINUX_MSQID_DS_SIZE);
+
 /// Host directory for SysV shmem backing files. World-writable + sticky so
 /// any carrick guest process (including a forked child running as the same
 /// uid) can attach to a segment a peer created.
@@ -205,6 +170,37 @@ const LINUX_SEMMSL: usize = 32000;
 const LINUX_SEMMNI: usize = 32000;
 const LINUX_SEMOPM: u32 = 500;
 const LINUX_SEMVMX: u32 = 32767;
+const LINUX_MSGMNI: usize = 32000;
+const LINUX_MSGMNB: u64 = 16384;
+const LINUX_MSGMAX: usize = 8192;
+const LINUX_MSG_STAT: u64 = 11;
+const LINUX_MSG_INFO: u64 = 12;
+const LINUX_MSG_STAT_ANY: u64 = 13;
+
+const MSG_QUEUE_MAGIC: u32 = 0x5356_4d51; // "SVMQ"
+const MSG_QUEUE_VERSION: u32 = 1;
+const MSG_QUEUE_HEADER_SIZE: usize = 128;
+const MSG_RECORD_HEADER_SIZE: usize = 16;
+const MSG_QUEUE_COMPACT_HEAD_THRESHOLD: usize = 64 * 1024;
+
+const MSG_OFF_MAGIC: usize = 0;
+const MSG_OFF_VERSION: usize = 4;
+const MSG_OFF_KEY: usize = 8;
+const MSG_OFF_ID: usize = 12;
+const MSG_OFF_MODE: usize = 16;
+const MSG_OFF_UID: usize = 20;
+const MSG_OFF_GID: usize = 24;
+const MSG_OFF_CUID: usize = 28;
+const MSG_OFF_CGID: usize = 32;
+const MSG_OFF_QBYTES: usize = 40;
+const MSG_OFF_CBYTES: usize = 48;
+const MSG_OFF_QNUM: usize = 56;
+const MSG_OFF_STIME: usize = 64;
+const MSG_OFF_RTIME: usize = 72;
+const MSG_OFF_CTIME: usize = 80;
+const MSG_OFF_LSPID: usize = 88;
+const MSG_OFF_LRPID: usize = 92;
+const MSG_OFF_HEAD: usize = 96;
 
 bitflags::bitflags! {
     #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -227,6 +223,14 @@ bitflags::bitflags! {
     #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
     struct SemOpFlags: u16 {
         const NOWAIT = 0o4000;
+    }
+
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    struct MsgOpFlags: u64 {
+        const NOWAIT = 0o4000;
+        const NOERROR = 0o10000;
+        const EXCEPT = 0o20000;
+        const COPY = 0o40000;
     }
 }
 
@@ -380,6 +384,81 @@ impl HostSemId {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct MsgQueueId(i32);
+
+impl MsgQueueId {
+    fn from_syscall_arg(value: u64) -> Result<Self, LinuxErrno> {
+        let raw = i32::try_from(value).map_err(|_| LINUX_EINVAL)?;
+        if raw < 0 {
+            Err(LINUX_EINVAL)
+        } else {
+            Ok(Self(raw))
+        }
+    }
+
+    fn raw(self) -> i32 {
+        self.0
+    }
+
+    fn as_i64(self) -> i64 {
+        i64::from(self.0)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct MsgKey(i32);
+
+impl MsgKey {
+    const PRIVATE: Self = Self(LINUX_IPC_PRIVATE);
+
+    fn from_syscall_arg(value: u64) -> Result<Self, LinuxErrno> {
+        i32::try_from(value).map(Self).map_err(|_| LINUX_EINVAL)
+    }
+
+    fn raw(self) -> i32 {
+        self.0
+    }
+
+    fn is_private(self) -> bool {
+        self == Self::PRIVATE
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct MsgType(i64);
+
+impl MsgType {
+    fn from_msgbuf(value: i64) -> Result<Self, LinuxErrno> {
+        if value <= 0 {
+            Err(LINUX_EINVAL)
+        } else {
+            Ok(Self(value))
+        }
+    }
+
+    fn from_syscall_arg(value: u64) -> Self {
+        Self(value as i64)
+    }
+
+    fn raw(self) -> i64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Debug)]
+struct MsgRecord {
+    msg_type: MsgType,
+    payload: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct MsgQueueMetrics {
+    queues: usize,
+    messages: usize,
+    bytes: u64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 struct LinuxSemValue(i32);
 
@@ -483,14 +562,11 @@ pub(super) struct SysvShmState {
     /// uniqueness — fork-safe because each forked carrick process has its
     /// own pid).
     private_counter: AtomicU32,
-    /// Host SysV message queues observed through guest `msgget`.
-    ///
-    /// macOS queues live in a host-global IPC namespace, while a Linux
-    /// container's IPC namespace is torn down when the container exits. Track
-    /// guest-visible queue IDs so the bootstrap carrick process can remove any
-    /// queue the guest forgot to `IPC_RMID`, avoiding stateful ENOSPC across LTP
-    /// runs.
-    message_queues: HashSet<i32>,
+    /// Carrick-owned SysV message queues created by this dispatcher. The queue
+    /// contents and metadata live in files under [`SHM_DIR`] so forked guest
+    /// processes see one Linux IPC namespace instead of per-process maps or
+    /// Darwin's host-global SysV queue pool.
+    message_queues: HashSet<MsgQueueId>,
     /// Host SysV semaphore sets observed through guest `semget`, with guest
     /// ownership/mode metadata layered over the host primitive.
     semaphores: HashMap<GuestSemId, SemSet>,
@@ -544,6 +620,63 @@ impl SysvShmState {
     }
 }
 
+struct SysvIpcService;
+
+impl SysvIpcService {
+    fn after_fork_child() {
+        MSG_QUEUE_FD_CACHE.with(|cache| cache.borrow_mut().refresh_for_current_process());
+    }
+
+    fn cleanup_process_exit(state: &mut SysvShmState) {
+        state.message_queues.clear();
+        cleanup_msg_queue_files_for_scope();
+    }
+
+    fn msg_table() -> String {
+        sysvipc_msg_table_from_files()
+    }
+
+    fn msgget(
+        state: &mut SysvShmState,
+        creds: &super::creds::CredState,
+        key: MsgKey,
+        flags: u64,
+    ) -> Result<MsgQueueId, LinuxErrno> {
+        msgget_open(state, creds, key, flags)
+    }
+
+    fn msgsnd(
+        id: MsgQueueId,
+        creds: &super::creds::CredState,
+        msg_type: MsgType,
+        payload: &[u8],
+    ) -> Result<bool, LinuxErrno> {
+        msg_queue_try_send(id, creds, msg_type, payload)
+    }
+
+    fn msgrcv<M: GuestMemory>(
+        cx: &mut SyscallCtx<M>,
+        id: MsgQueueId,
+        creds: &super::creds::CredState,
+        msgp: u64,
+        msgsz: usize,
+        wanted: MsgType,
+        flags: MsgOpFlags,
+    ) -> Result<Option<usize>, LinuxErrno> {
+        msg_queue_receive(cx, id, creds, msgp, msgsz, wanted, flags)
+    }
+
+    fn msgctl<M: GuestMemory>(
+        dispatcher: &SyscallDispatcher,
+        cx: &mut SyscallCtx<M>,
+        msqid: u64,
+        cmd: u64,
+        buf: u64,
+    ) -> Result<DispatchOutcome, LinuxErrno> {
+        sysv_msgctl(dispatcher, cx, msqid, cmd, buf)
+    }
+}
+
 fn sysv_run_scope() -> String {
     let raw = std::env::var("CARRICK_RUN_ID").unwrap_or_else(|_| {
         std::env::var("CARRICK_CONTAINER_ID")
@@ -564,6 +697,755 @@ fn shm_nattch_path(path: &std::path::Path) -> PathBuf {
     let mut out = path.as_os_str().to_os_string();
     out.push(".nattch");
     PathBuf::from(out)
+}
+
+fn rd_u32(buf: &[u8], off: usize) -> u32 {
+    match buf.get(off..off + 4) {
+        Some(b) => u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+        None => 0,
+    }
+}
+
+fn rd_i32(buf: &[u8], off: usize) -> i32 {
+    match buf.get(off..off + 4) {
+        Some(b) => i32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+        None => 0,
+    }
+}
+
+fn rd_u64(buf: &[u8], off: usize) -> u64 {
+    match buf.get(off..off + 8) {
+        Some(b) => u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]),
+        None => 0,
+    }
+}
+
+fn rd_i64(buf: &[u8], off: usize) -> i64 {
+    match buf.get(off..off + 8) {
+        Some(b) => i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]),
+        None => 0,
+    }
+}
+
+fn wr_u32(buf: &mut [u8], off: usize, value: u32) {
+    if let Some(dst) = buf.get_mut(off..off + 4) {
+        dst.copy_from_slice(&value.to_le_bytes());
+    }
+}
+
+fn wr_i32(buf: &mut [u8], off: usize, value: i32) {
+    if let Some(dst) = buf.get_mut(off..off + 4) {
+        dst.copy_from_slice(&value.to_le_bytes());
+    }
+}
+
+fn wr_u64(buf: &mut [u8], off: usize, value: u64) {
+    if let Some(dst) = buf.get_mut(off..off + 8) {
+        dst.copy_from_slice(&value.to_le_bytes());
+    }
+}
+
+fn wr_i64(buf: &mut [u8], off: usize, value: i64) {
+    if let Some(dst) = buf.get_mut(off..off + 8) {
+        dst.copy_from_slice(&value.to_le_bytes());
+    }
+}
+
+#[derive(Clone, Debug)]
+struct MsgQueueFile {
+    id: MsgQueueId,
+    key: i32,
+    mode: ShmPermMode,
+    uid: u32,
+    gid: u32,
+    cuid: u32,
+    cgid: u32,
+    qbytes: u64,
+    cbytes: u64,
+    stime: u64,
+    rtime: u64,
+    ctime: u64,
+    lspid: i32,
+    lrpid: i32,
+    qnum: u64,
+    messages: Vec<MsgRecord>,
+}
+
+impl MsgQueueFile {
+    fn new(id: MsgQueueId, key: i32, mode: ShmPermMode, creds: &super::creds::CredState) -> Self {
+        let now = unix_now_secs();
+        Self {
+            id,
+            key,
+            mode,
+            uid: creds.euid,
+            gid: creds.egid,
+            cuid: creds.euid,
+            cgid: creds.egid,
+            qbytes: LINUX_MSGMNB,
+            cbytes: 0,
+            stime: 0,
+            rtime: 0,
+            ctime: now,
+            lspid: 0,
+            lrpid: 0,
+            qnum: 0,
+            messages: Vec::new(),
+        }
+    }
+
+    fn can_admin(&self, creds: &super::creds::CredState) -> bool {
+        creds.euid == 0 || creds.euid == self.uid || creds.euid == self.cuid
+    }
+
+    fn can_read(&self, creds: &super::creds::CredState) -> bool {
+        creds.euid == 0
+            || if creds.euid == self.uid {
+                self.mode.owner_readable()
+            } else {
+                self.mode.other_readable()
+            }
+    }
+
+    fn can_write(&self, creds: &super::creds::CredState) -> bool {
+        creds.euid == 0
+            || if creds.euid == self.uid {
+                self.mode.owner_writable()
+            } else {
+                self.mode.other_writable()
+            }
+    }
+
+    fn parse(buf: &[u8]) -> Result<Self, LinuxErrno> {
+        if buf.len() < MSG_QUEUE_HEADER_SIZE
+            || rd_u32(buf, MSG_OFF_MAGIC) != MSG_QUEUE_MAGIC
+            || rd_u32(buf, MSG_OFF_VERSION) != MSG_QUEUE_VERSION
+        {
+            return Err(LINUX_EINVAL);
+        }
+        let header_qnum = rd_u64(buf, MSG_OFF_QNUM);
+        let stored_head = rd_u64(buf, MSG_OFF_HEAD);
+        let mut messages = Vec::new();
+        let mut off = usize::try_from(stored_head)
+            .ok()
+            .filter(|head| *head >= MSG_QUEUE_HEADER_SIZE && *head <= buf.len())
+            .unwrap_or(MSG_QUEUE_HEADER_SIZE);
+        while off < buf.len()
+            && u64::try_from(messages.len())
+                .map(|len| len < header_qnum)
+                .unwrap_or(false)
+        {
+            let Some(header) = buf.get(off..off + MSG_RECORD_HEADER_SIZE) else {
+                return Err(LINUX_EINVAL);
+            };
+            let msg_type = MsgType::from_msgbuf(rd_i64(header, 0))?;
+            let len = rd_u32(header, 8) as usize;
+            let data_off = off + MSG_RECORD_HEADER_SIZE;
+            let Some(payload) = buf.get(data_off..data_off + len) else {
+                return Err(LINUX_EINVAL);
+            };
+            messages.push(MsgRecord {
+                msg_type,
+                payload: payload.to_vec(),
+            });
+            off = data_off + len;
+        }
+        Ok(Self {
+            id: MsgQueueId(rd_i32(buf, MSG_OFF_ID)),
+            key: rd_i32(buf, MSG_OFF_KEY),
+            mode: ShmPermMode {
+                bits: rd_u32(buf, MSG_OFF_MODE),
+            },
+            uid: rd_u32(buf, MSG_OFF_UID),
+            gid: rd_u32(buf, MSG_OFF_GID),
+            cuid: rd_u32(buf, MSG_OFF_CUID),
+            cgid: rd_u32(buf, MSG_OFF_CGID),
+            qbytes: rd_u64(buf, MSG_OFF_QBYTES),
+            cbytes: rd_u64(buf, MSG_OFF_CBYTES),
+            stime: rd_u64(buf, MSG_OFF_STIME),
+            rtime: rd_u64(buf, MSG_OFF_RTIME),
+            ctime: rd_u64(buf, MSG_OFF_CTIME),
+            lspid: rd_i32(buf, MSG_OFF_LSPID),
+            lrpid: rd_i32(buf, MSG_OFF_LRPID),
+            qnum: messages.len() as u64,
+            messages,
+        })
+    }
+
+    fn serialize(&self) -> Vec<u8> {
+        let payload_len = self
+            .messages
+            .iter()
+            .map(|message| MSG_RECORD_HEADER_SIZE + message.payload.len())
+            .sum::<usize>();
+        let mut buf = vec![0u8; MSG_QUEUE_HEADER_SIZE + payload_len];
+        wr_u32(&mut buf, MSG_OFF_MAGIC, MSG_QUEUE_MAGIC);
+        wr_u32(&mut buf, MSG_OFF_VERSION, MSG_QUEUE_VERSION);
+        wr_i32(&mut buf, MSG_OFF_KEY, self.key);
+        wr_i32(&mut buf, MSG_OFF_ID, self.id.raw());
+        wr_u32(&mut buf, MSG_OFF_MODE, self.mode.raw());
+        wr_u32(&mut buf, MSG_OFF_UID, self.uid);
+        wr_u32(&mut buf, MSG_OFF_GID, self.gid);
+        wr_u32(&mut buf, MSG_OFF_CUID, self.cuid);
+        wr_u32(&mut buf, MSG_OFF_CGID, self.cgid);
+        wr_u64(&mut buf, MSG_OFF_QBYTES, self.qbytes);
+        wr_u64(&mut buf, MSG_OFF_CBYTES, self.cbytes);
+        wr_u64(&mut buf, MSG_OFF_QNUM, self.messages.len() as u64);
+        wr_u64(&mut buf, MSG_OFF_STIME, self.stime);
+        wr_u64(&mut buf, MSG_OFF_RTIME, self.rtime);
+        wr_u64(&mut buf, MSG_OFF_CTIME, self.ctime);
+        wr_i32(&mut buf, MSG_OFF_LSPID, self.lspid);
+        wr_i32(&mut buf, MSG_OFF_LRPID, self.lrpid);
+        wr_u64(&mut buf, MSG_OFF_HEAD, MSG_QUEUE_HEADER_SIZE as u64);
+        let mut off = MSG_QUEUE_HEADER_SIZE;
+        for message in &self.messages {
+            wr_i64(&mut buf, off, message.msg_type.raw());
+            wr_u32(&mut buf, off + 8, message.payload.len() as u32);
+            let data_off = off + MSG_RECORD_HEADER_SIZE;
+            buf[data_off..data_off + message.payload.len()].copy_from_slice(&message.payload);
+            off = data_off + message.payload.len();
+        }
+        buf
+    }
+
+    fn stat_bytes(&self) -> [u8; LINUX_MSQID_DS_SIZE] {
+        let ds = LinuxMsqidDs {
+            msg_perm: LinuxIpcPerm {
+                key: self.key,
+                uid: self.uid,
+                gid: self.gid,
+                cuid: self.cuid,
+                cgid: self.cgid,
+                mode: self.mode.raw(),
+                ..Default::default()
+            },
+            msg_stime: self.stime,
+            msg_rtime: self.rtime,
+            msg_ctime: self.ctime,
+            msg_cbytes: self.cbytes,
+            msg_qnum: self.qnum,
+            msg_qbytes: self.qbytes,
+            msg_lspid: self.lspid,
+            msg_lrpid: self.lrpid,
+            ..Default::default()
+        };
+        let mut out = [0u8; LINUX_MSQID_DS_SIZE];
+        out.copy_from_slice(zerocopy::IntoBytes::as_bytes(&ds));
+        out
+    }
+}
+
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn msg_queue_path_for_private(state: &SysvShmState) -> PathBuf {
+    PathBuf::from(SHM_DIR).join(format!(
+        "{}-msg-private-{}",
+        sysv_run_scope(),
+        state.private_name()
+    ))
+}
+
+fn msg_queue_path_for_key(key: i32) -> PathBuf {
+    PathBuf::from(SHM_DIR).join(format!("{}-msg-key-{}", sysv_run_scope(), key as u32))
+}
+
+fn msg_queue_path_for_id(id: MsgQueueId) -> PathBuf {
+    PathBuf::from(SHM_DIR).join(format!("{}-msg-id-{}", sysv_run_scope(), id.raw() as u32))
+}
+
+fn msg_queue_id_from_stat(st: &libc::stat) -> MsgQueueId {
+    MsgQueueId((st.st_ino as i32).max(1))
+}
+
+fn msg_queue_id_for_fd(fd: i32) -> Result<MsgQueueId, LinuxErrno> {
+    let mut st: libc::stat = unsafe { core::mem::zeroed() };
+    unsafe { libc::fstat(fd, &mut st) }
+        .host_syscall_errno()
+        .map(|_| msg_queue_id_from_stat(&st))
+}
+
+fn msg_queue_scope_prefix() -> String {
+    format!("{}-msg-", sysv_run_scope())
+}
+
+fn is_msg_queue_path(path: &std::path::Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with(&msg_queue_scope_prefix()))
+}
+
+fn is_msg_queue_id_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with(&msg_queue_scope_prefix()) && name.contains("-id-"))
+}
+
+fn read_exact_at_fd(fd: i32, buf: &mut [u8], offset: libc::off_t) -> Result<(), LinuxErrno> {
+    let mut done = 0usize;
+    while done < buf.len() {
+        let n = unsafe {
+            libc::pread(
+                fd,
+                buf[done..].as_mut_ptr() as *mut libc::c_void,
+                buf.len() - done,
+                offset + done as libc::off_t,
+            )
+        }
+        .host_syscall_errno()?;
+        if n == 0 {
+            return Err(LINUX_EINVAL);
+        }
+        done += n as usize;
+    }
+    Ok(())
+}
+
+fn write_all_at_fd(fd: i32, buf: &[u8], offset: libc::off_t) -> Result<(), LinuxErrno> {
+    let mut done = 0usize;
+    while done < buf.len() {
+        let n = unsafe {
+            libc::pwrite(
+                fd,
+                buf[done..].as_ptr() as *const libc::c_void,
+                buf.len() - done,
+                offset + done as libc::off_t,
+            )
+        }
+        .host_syscall_errno()?;
+        if n == 0 {
+            return Err(LINUX_EIO);
+        }
+        done += n as usize;
+    }
+    Ok(())
+}
+
+fn write_msg_queue_progress(
+    fd: i32,
+    cbytes: u64,
+    qnum: u64,
+    stime: u64,
+    rtime: u64,
+    ctime: u64,
+    lspid: i32,
+    lrpid: i32,
+    head: usize,
+) -> Result<(), LinuxErrno> {
+    let mut buf = [0u8; MSG_OFF_HEAD + 8 - MSG_OFF_CBYTES];
+    wr_u64(&mut buf, MSG_OFF_CBYTES - MSG_OFF_CBYTES, cbytes);
+    wr_u64(&mut buf, MSG_OFF_QNUM - MSG_OFF_CBYTES, qnum);
+    wr_u64(&mut buf, MSG_OFF_STIME - MSG_OFF_CBYTES, stime);
+    wr_u64(&mut buf, MSG_OFF_RTIME - MSG_OFF_CBYTES, rtime);
+    wr_u64(&mut buf, MSG_OFF_CTIME - MSG_OFF_CBYTES, ctime);
+    wr_i32(&mut buf, MSG_OFF_LSPID - MSG_OFF_CBYTES, lspid);
+    wr_i32(&mut buf, MSG_OFF_LRPID - MSG_OFF_CBYTES, lrpid);
+    wr_u64(&mut buf, MSG_OFF_HEAD - MSG_OFF_CBYTES, head as u64);
+    write_all_at_fd(fd, &buf, MSG_OFF_CBYTES as libc::off_t)
+}
+
+fn lookup_msg_queue_path(id: MsgQueueId) -> Result<PathBuf, LinuxErrno> {
+    SysvShmState::ensure_dir();
+    let direct = msg_queue_path_for_id(id);
+    if direct.exists() {
+        return Ok(direct);
+    }
+    let entries = std::fs::read_dir(SHM_DIR).map_err(|_| LINUX_EINVAL)?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !is_msg_queue_path(&path) {
+            continue;
+        }
+        let cpath = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+            .map_err(|_| LINUX_EINVAL)?;
+        let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDWR) };
+        if fd < 0 {
+            continue;
+        }
+        let candidate = msg_queue_id_for_fd(fd);
+        unsafe { libc::close(fd) };
+        if candidate.ok() == Some(id) {
+            return Ok(path);
+        }
+    }
+    Err(LINUX_EINVAL)
+}
+
+fn cleanup_msg_queue_files_for_scope() {
+    if let Ok(entries) = std::fs::read_dir(SHM_DIR) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if is_msg_queue_path(&path) {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CachedMsgQueueIdentity {
+    dev: libc::dev_t,
+    ino: libc::ino_t,
+}
+
+#[derive(Debug)]
+struct CachedMsgQueueFd {
+    fd: i32,
+    identity: CachedMsgQueueIdentity,
+}
+
+#[derive(Debug)]
+struct MsgQueueFdCache {
+    host_pid: libc::pid_t,
+    entries: HashMap<PathBuf, CachedMsgQueueFd>,
+}
+
+impl MsgQueueFdCache {
+    fn new() -> Self {
+        Self {
+            host_pid: unsafe { libc::getpid() },
+            entries: HashMap::new(),
+        }
+    }
+
+    fn refresh_for_current_process(&mut self) {
+        let host_pid = unsafe { libc::getpid() };
+        if self.host_pid == host_pid {
+            return;
+        }
+        for (_, entry) in self.entries.drain() {
+            unsafe { libc::close(entry.fd) };
+        }
+        self.host_pid = host_pid;
+    }
+}
+
+impl Drop for MsgQueueFdCache {
+    fn drop(&mut self) {
+        for (_, entry) in self.entries.drain() {
+            unsafe { libc::close(entry.fd) };
+        }
+    }
+}
+
+thread_local! {
+    static MSG_QUEUE_FD_CACHE: RefCell<MsgQueueFdCache> =
+        RefCell::new(MsgQueueFdCache::new());
+}
+
+fn msg_queue_identity(path: &Path) -> Result<CachedMsgQueueIdentity, LinuxErrno> {
+    let cpath =
+        std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| LINUX_EINVAL)?;
+    let mut st: libc::stat = unsafe { core::mem::zeroed() };
+    unsafe { libc::stat(cpath.as_ptr(), &mut st) }.host_syscall_errno()?;
+    Ok(CachedMsgQueueIdentity {
+        dev: st.st_dev,
+        ino: st.st_ino,
+    })
+}
+
+fn cached_msg_queue_fd(path: &Path) -> Result<i32, LinuxErrno> {
+    MSG_QUEUE_FD_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        cache.refresh_for_current_process();
+        if is_msg_queue_id_path(path)
+            && let Some(entry) = cache.entries.get(path)
+        {
+            return Ok(entry.fd);
+        }
+        let identity = msg_queue_identity(path)?;
+        if let Some(entry) = cache.entries.get(path)
+            && entry.identity == identity
+        {
+            return Ok(entry.fd);
+        }
+        if let Some(entry) = cache.entries.remove(path) {
+            unsafe { libc::close(entry.fd) };
+        }
+        let cpath = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+            .map_err(|_| LINUX_EINVAL)?;
+        let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDWR) }.host_syscall_errno()?;
+        cache
+            .entries
+            .insert(path.to_path_buf(), CachedMsgQueueFd { fd, identity });
+        Ok(fd)
+    })
+}
+
+struct MsgQueueLock {
+    fd: i32,
+    close_on_drop: bool,
+}
+
+impl MsgQueueLock {
+    fn acquire(path: &Path) -> Result<Self, LinuxErrno> {
+        let cpath = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+            .map_err(|_| LINUX_EINVAL)?;
+        let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDWR) }.host_syscall_errno()?;
+        Self::acquire_fd(fd, true)
+    }
+
+    fn acquire_cached(path: &Path) -> Result<Self, LinuxErrno> {
+        let fd = cached_msg_queue_fd(path)?;
+        Self::acquire_fd(fd, false)
+    }
+
+    fn acquire_fd(fd: i32, close_on_drop: bool) -> Result<Self, LinuxErrno> {
+        let mut fl: libc::flock = unsafe { core::mem::zeroed() };
+        #[allow(clippy::unnecessary_cast)]
+        {
+            fl.l_type = libc::F_WRLCK as i16;
+            fl.l_whence = libc::SEEK_SET as i16;
+        }
+        fl.l_start = 0;
+        fl.l_len = 0;
+        let rc = unsafe {
+            libc::fcntl(
+                fd,
+                carrick_portable::F_OFD_SETLKW,
+                &mut fl as *mut libc::flock,
+            )
+        };
+        if let Err(errno) = rc.host_syscall_errno() {
+            if close_on_drop {
+                unsafe { libc::close(fd) };
+            }
+            return Err(errno);
+        }
+        Ok(Self { fd, close_on_drop })
+    }
+
+    fn read_queue(&self) -> Result<MsgQueueFile, LinuxErrno> {
+        let mut st: libc::stat = unsafe { core::mem::zeroed() };
+        unsafe { libc::fstat(self.fd, &mut st) }.host_syscall_errno()?;
+        let size = usize::try_from(st.st_size).map_err(|_| LINUX_EINVAL)?;
+        let mut buf = vec![0u8; size.max(MSG_QUEUE_HEADER_SIZE)];
+        let mut done = 0usize;
+        while done < size {
+            let n = unsafe {
+                libc::pread(
+                    self.fd,
+                    buf[done..size].as_mut_ptr() as *mut libc::c_void,
+                    size - done,
+                    done as libc::off_t,
+                )
+            }
+            .host_syscall_errno()?;
+            if n == 0 {
+                break;
+            }
+            done += n as usize;
+        }
+        MsgQueueFile::parse(&buf[..size])
+    }
+
+    fn read_header(&self) -> Result<(MsgQueueFile, usize, usize), LinuxErrno> {
+        let mut buf = [0u8; MSG_QUEUE_HEADER_SIZE];
+        let mut done = 0usize;
+        while done < buf.len() {
+            let n = unsafe {
+                libc::pread(
+                    self.fd,
+                    buf[done..].as_mut_ptr() as *mut libc::c_void,
+                    buf.len() - done,
+                    done as libc::off_t,
+                )
+            }
+            .host_syscall_errno()?;
+            if n == 0 {
+                break;
+            }
+            done += n as usize;
+        }
+        if done < MSG_QUEUE_HEADER_SIZE {
+            return Err(LINUX_EINVAL);
+        }
+        if rd_u32(&buf, MSG_OFF_MAGIC) != MSG_QUEUE_MAGIC
+            || rd_u32(&buf, MSG_OFF_VERSION) != MSG_QUEUE_VERSION
+        {
+            return Err(LINUX_EINVAL);
+        }
+        let mut st: libc::stat = unsafe { core::mem::zeroed() };
+        unsafe { libc::fstat(self.fd, &mut st) }.host_syscall_errno()?;
+        let size = usize::try_from(st.st_size).map_err(|_| LINUX_EINVAL)?;
+        let head = usize::try_from(rd_u64(&buf, MSG_OFF_HEAD))
+            .ok()
+            .filter(|head| *head >= MSG_QUEUE_HEADER_SIZE && *head <= size)
+            .unwrap_or(MSG_QUEUE_HEADER_SIZE);
+        Ok((
+            MsgQueueFile {
+                id: MsgQueueId(rd_i32(&buf, MSG_OFF_ID)),
+                key: rd_i32(&buf, MSG_OFF_KEY),
+                mode: ShmPermMode {
+                    bits: rd_u32(&buf, MSG_OFF_MODE),
+                },
+                uid: rd_u32(&buf, MSG_OFF_UID),
+                gid: rd_u32(&buf, MSG_OFF_GID),
+                cuid: rd_u32(&buf, MSG_OFF_CUID),
+                cgid: rd_u32(&buf, MSG_OFF_CGID),
+                qbytes: rd_u64(&buf, MSG_OFF_QBYTES),
+                cbytes: rd_u64(&buf, MSG_OFF_CBYTES),
+                stime: rd_u64(&buf, MSG_OFF_STIME),
+                rtime: rd_u64(&buf, MSG_OFF_RTIME),
+                ctime: rd_u64(&buf, MSG_OFF_CTIME),
+                lspid: rd_i32(&buf, MSG_OFF_LSPID),
+                lrpid: rd_i32(&buf, MSG_OFF_LRPID),
+                qnum: rd_u64(&buf, MSG_OFF_QNUM),
+                messages: Vec::new(),
+            },
+            head,
+            size,
+        ))
+    }
+
+    fn write_queue(&self, queue: &MsgQueueFile) -> Result<(), LinuxErrno> {
+        let buf = queue.serialize();
+        unsafe { libc::ftruncate(self.fd, buf.len() as libc::off_t) }.host_syscall_errno()?;
+        let mut done = 0usize;
+        while done < buf.len() {
+            let n = unsafe {
+                libc::pwrite(
+                    self.fd,
+                    buf[done..].as_ptr() as *const libc::c_void,
+                    buf.len() - done,
+                    done as libc::off_t,
+                )
+            }
+            .host_syscall_errno()?;
+            if n == 0 {
+                return Err(LINUX_EIO);
+            }
+            done += n as usize;
+        }
+        Ok(())
+    }
+
+    fn append_message(
+        &self,
+        queue: &MsgQueueFile,
+        head: usize,
+        file_size: usize,
+        msg_type: MsgType,
+        payload: &[u8],
+    ) -> Result<(), LinuxErrno> {
+        let append_offset = if queue.qnum == 0 {
+            MSG_QUEUE_HEADER_SIZE
+        } else {
+            file_size
+        };
+        if queue.qnum == 0 {
+            unsafe { libc::ftruncate(self.fd, MSG_QUEUE_HEADER_SIZE as libc::off_t) }
+                .host_syscall_errno()?;
+        }
+        let mut rec = vec![0u8; MSG_RECORD_HEADER_SIZE + payload.len()];
+        wr_i64(&mut rec, 0, msg_type.raw());
+        wr_u32(&mut rec, 8, payload.len() as u32);
+        rec[MSG_RECORD_HEADER_SIZE..].copy_from_slice(payload);
+        write_all_at_fd(self.fd, &rec, append_offset as libc::off_t)?;
+        write_msg_queue_progress(
+            self.fd,
+            queue.cbytes.saturating_add(payload.len() as u64),
+            queue.qnum.saturating_add(1),
+            unix_now_secs(),
+            queue.rtime,
+            queue.ctime,
+            crate::namespace::pid::self_ns_pid() as i32,
+            queue.lrpid,
+            if queue.qnum == 0 {
+                MSG_QUEUE_HEADER_SIZE
+            } else {
+                head
+            },
+        )
+    }
+
+    fn read_record_at(&self, off: usize) -> Result<(MsgRecord, usize), LinuxErrno> {
+        let mut header = [0u8; MSG_RECORD_HEADER_SIZE];
+        read_exact_at_fd(self.fd, &mut header, off as libc::off_t)?;
+        let msg_type = MsgType::from_msgbuf(rd_i64(&header, 0))?;
+        let len = rd_u32(&header, 8) as usize;
+        let mut payload = vec![0u8; len];
+        if len > 0 {
+            read_exact_at_fd(
+                self.fd,
+                &mut payload,
+                (off + MSG_RECORD_HEADER_SIZE) as libc::off_t,
+            )?;
+        }
+        Ok((
+            MsgRecord { msg_type, payload },
+            off + MSG_RECORD_HEADER_SIZE + len,
+        ))
+    }
+
+    fn consume_head_message(
+        &self,
+        queue: &MsgQueueFile,
+        next_head: usize,
+        payload_len: usize,
+    ) -> Result<(), LinuxErrno> {
+        let next_qnum = queue.qnum.saturating_sub(1);
+        let next_cbytes = queue.cbytes.saturating_sub(payload_len as u64);
+        if next_qnum == 0 {
+            unsafe { libc::ftruncate(self.fd, MSG_QUEUE_HEADER_SIZE as libc::off_t) }
+                .host_syscall_errno()?;
+            write_msg_queue_progress(
+                self.fd,
+                next_cbytes,
+                next_qnum,
+                queue.stime,
+                unix_now_secs(),
+                queue.ctime,
+                queue.lspid,
+                crate::namespace::pid::self_ns_pid() as i32,
+                MSG_QUEUE_HEADER_SIZE,
+            )?;
+        } else {
+            write_msg_queue_progress(
+                self.fd,
+                next_cbytes,
+                next_qnum,
+                queue.stime,
+                unix_now_secs(),
+                queue.ctime,
+                queue.lspid,
+                crate::namespace::pid::self_ns_pid() as i32,
+                next_head,
+            )?;
+        }
+        if next_qnum > 0 && next_head >= MSG_QUEUE_COMPACT_HEAD_THRESHOLD {
+            let queue = self.read_queue()?;
+            self.write_queue(&queue)?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for MsgQueueLock {
+    fn drop(&mut self) {
+        let mut fl: libc::flock = unsafe { core::mem::zeroed() };
+        #[allow(clippy::unnecessary_cast)]
+        {
+            fl.l_type = libc::F_UNLCK as i16;
+            fl.l_whence = libc::SEEK_SET as i16;
+        }
+        fl.l_start = 0;
+        fl.l_len = 0;
+        let _ = unsafe {
+            libc::fcntl(
+                self.fd,
+                carrick_portable::F_OFD_SETLK,
+                &mut fl as *mut libc::flock,
+            )
+        };
+        if self.close_on_drop {
+            unsafe { libc::close(self.fd) };
+        }
+    }
 }
 
 fn with_shm_nattch_file<R>(
@@ -611,7 +1493,7 @@ fn adjust_shm_nattch(segment: &ShmSegment, delta: i64) -> u64 {
         };
         file.set_len(0)?;
         file.seek(SeekFrom::Start(0))?;
-        write!(file, "{next}\n")?;
+        writeln!(file, "{next}")?;
         Ok(next)
     })
     .unwrap_or_else(|_| {
@@ -802,6 +1684,41 @@ pub(super) fn shmid_ds_bytes(segment: &ShmSegment, _creds: &super::creds::CredSt
     out
 }
 
+fn sysvipc_msg_table_from_files() -> String {
+    let mut rows = String::from(
+        "       key      msqid perms      cbytes       qnum lspid lrpid   uid   gid  cuid  cgid      stime      rtime      ctime\n",
+    );
+    for id in sorted_msg_queue_ids() {
+        let Ok(path) = lookup_msg_queue_path(id) else {
+            continue;
+        };
+        let Ok(lock) = MsgQueueLock::acquire(&path) else {
+            continue;
+        };
+        let Ok(queue) = lock.read_queue() else {
+            continue;
+        };
+        rows.push_str(&format!(
+            "{:10} {:10} {:5o} {:11} {:10} {:5} {:5} {:5} {:5} {:5} {:5} {:10} {:10} {:10}\n",
+            queue.key,
+            queue.id.raw(),
+            queue.mode.perms(),
+            queue.cbytes,
+            queue.qnum,
+            queue.lspid,
+            queue.lrpid,
+            queue.uid,
+            queue.gid,
+            queue.cuid,
+            queue.cgid,
+            queue.stime,
+            queue.rtime,
+            queue.ctime,
+        ));
+    }
+    rows
+}
+
 // ===================================================================
 // Syscall handlers (wired into dispatch_sysv as 194/195/196/197).
 // ===================================================================
@@ -809,6 +1726,7 @@ pub(super) fn shmid_ds_bytes(segment: &ShmSegment, _creds: &super::creds::CredSt
 impl SyscallDispatcher {
     pub(crate) fn sysv_after_fork_child(&self) {
         let mut state = self.sysv.lock();
+        SysvIpcService::after_fork_child();
         let ids = state.attachments.values().copied().collect::<Vec<_>>();
         for shmid in ids {
             if let Some(seg) = state.segments.get_mut(&shmid) {
@@ -876,6 +1794,10 @@ impl SyscallDispatcher {
         rows
     }
 
+    pub(crate) fn sysvipc_msg_table(&self) -> String {
+        SysvIpcService::msg_table()
+    }
+
     pub(crate) fn note_sysv_remap_file_pages(
         &self,
         addr: u64,
@@ -917,10 +1839,10 @@ impl SyscallDispatcher {
         if self.is_forked_guest_process() {
             return;
         }
-        let (message_queues, semaphore_ids, shm_segments) = {
+        let (semaphore_ids, shm_segments) = {
             let mut state = self.sysv.lock();
+            SysvIpcService::cleanup_process_exit(&mut state);
             (
-                state.message_queues.drain().collect::<Vec<_>>(),
                 state
                     .semaphores
                     .drain()
@@ -933,9 +1855,6 @@ impl SyscallDispatcher {
                     .collect::<Vec<_>>(),
             )
         };
-        for msqid in message_queues {
-            let _ = unsafe { msgctl(msqid, libc::IPC_RMID, core::ptr::null_mut()) };
-        }
         for semid in semaphore_ids {
             let _ = unsafe { carrick_portable::semctl0(semid.raw(), 0, libc::IPC_RMID) };
         }
@@ -1268,360 +2187,133 @@ impl SyscallDispatcher {
             }
         }
 
-        /// msgget(key, msgflg): allocate/look up a SysV message queue.
-        /// Forwarded to the host (macOS has SysV message queues; IPC_CREAT/
-        /// IPC_EXCL share Linux's values). Cross-process for free.
+        /// msgget(key, msgflg): allocate/look up a Carrick-owned Linux SysV
+        /// message queue in this run's IPC namespace.
         fn msgget(this, cx, key: u64, msgflg: u64) {
-            let _ = (this, cx);
-            let rc = unsafe { msgget(key as i32 as libc::key_t, msgflg as i32) };
-            match rc.host_syscall_errno() {
-                Ok(id) => {
-                    this.sysv.lock().message_queues.insert(id);
-                    Ok(DispatchOutcome::Returned { value: id as i64 })
-                }
+            let _ = cx;
+            let creds = this.cred_snapshot();
+            let key = match MsgKey::from_syscall_arg(key) {
+                Ok(key) => key,
+                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+            };
+            let mut state = this.sysv.lock();
+            match SysvIpcService::msgget(&mut state, &creds, key, msgflg) {
+                Ok(id) => Ok(DispatchOutcome::Returned { value: id.as_i64() }),
                 Err(errno) => Ok(DispatchOutcome::errno(errno)),
             }
         }
 
-        /// msgsnd(msqid, msgp, msgsz, msgflg): send a message. The msgbuf
-        /// layout (`long mtype; char mtext[msgsz]`) is identical Linux↔macOS,
-        /// so the buffer forwards verbatim (8-byte mtype + msgsz payload).
+        /// msgsnd(msqid, msgp, msgsz, msgflg): append one typed message.
         fn msgsnd(this, cx, msqid: u64, msgp: GuestPtr, msgsz: u64, msgflg: u64) {
-            let _ = this;
-            let sz = msgsz as usize;
-            // Guard the 8+sz add: an overflow would wrap to a tiny read while the
-            // original huge msgsz is forwarded to the host. Linux EINVALs an
-            // oversized msgsz. Probe: msgoverflow.
+            let msqid = match MsgQueueId::from_syscall_arg(msqid) {
+                Ok(msqid) => msqid,
+                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+            };
+            let Ok(sz) = usize::try_from(msgsz) else {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            };
+            if sz > LINUX_MSGMAX {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
             let total = match sz.checked_add(8) {
                 Some(t) if t <= crate::dispatch::MAX_RW_COUNT => t,
                 _ => return Ok(DispatchOutcome::errno(LINUX_EINVAL)),
             };
-            // Read mtype (8) + payload (sz).
             let buf = match cx.memory.read_bytes(msgp.0, total) {
                 Ok(b) => b,
                 Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
             };
-            let rc = unsafe {
-                msgsnd(
-                    msqid as i32,
-                    buf.as_ptr() as *const libc::c_void,
-                    sz,
-                    msgflg as i32,
-                )
+            let mut type_bytes = [0u8; 8];
+            type_bytes.copy_from_slice(&buf[..8]);
+            let msg_type = match MsgType::from_msgbuf(i64::from_le_bytes(type_bytes)) {
+                Ok(msg_type) => msg_type,
+                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
             };
-            match rc.host_syscall_errno() {
-                Ok(_) => Ok(DispatchOutcome::Returned { value: 0 }),
-                Err(errno) => Ok(DispatchOutcome::errno(errno)),
+            let payload = buf[8..].to_vec();
+            let flags = MsgOpFlags::from_bits_retain(msgflg);
+            let creds = this.cred_snapshot();
+            let tid = cx.tid();
+            let _block_state = (!flags.contains(MsgOpFlags::NOWAIT))
+                .then(|| SysvSemBlockStateGuard::new(tid));
+            let mut saw_would_block = false;
+            loop {
+                match SysvIpcService::msgsnd(msqid, &creds, msg_type, &payload) {
+                    Ok(true) => return Ok(DispatchOutcome::Returned { value: 0 }),
+                    Ok(false) => {
+                        saw_would_block = true;
+                        if flags.contains(MsgOpFlags::NOWAIT) {
+                            return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
+                        }
+                        if sysv_msg_wait_interrupted(this, tid) {
+                            return Ok(DispatchOutcome::errno(LINUX_EINTR));
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                    Err(errno) if errno == LINUX_EINVAL && saw_would_block => {
+                        return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIDRM));
+                    }
+                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                }
             }
         }
 
-        /// msgrcv(msqid, msgp, msgsz, msgtyp, msgflg): receive a message into
-        /// `msgp` (`long mtype; char mtext[msgsz]`). Returns the payload byte
-        /// count received.
+        /// msgrcv(msqid, msgp, msgsz, msgtyp, msgflg): receive by Linux SysV
+        /// message-selection rules, including MSG_EXCEPT/MSG_COPY.
         fn msgrcv(this, cx, msqid: u64, msgp: GuestPtr, msgsz: u64, msgtyp: u64, msgflg: u64) {
-            let _ = this;
-            let sz = msgsz as usize;
-            // Bound the eager allocation and guard the 8+sz add (a huge msgsz
-            // would otherwise OOM-abort or wrap). Linux EINVALs oversized msgsz.
-            let total = match sz.checked_add(8) {
-                Some(t) if t <= crate::dispatch::MAX_RW_COUNT => t,
-                _ => return Ok(DispatchOutcome::errno(LINUX_EINVAL)),
+            let msqid = match MsgQueueId::from_syscall_arg(msqid) {
+                Ok(msqid) => msqid,
+                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
             };
-            let mut buf = vec![0u8; total];
-            let rc = unsafe {
-                msgrcv(
-                    msqid as i32,
-                    buf.as_mut_ptr() as *mut libc::c_void,
-                    sz,
-                    msgtyp as libc::c_long,
-                    msgflg as i32,
-                )
+            let Ok(sz) = usize::try_from(msgsz) else {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             };
-            match rc.host_syscall_errno() {
-                Ok(received) => {
-                    let received = received as usize;
-                    // Write back mtype (8) + the received payload.
-                    if cx
-                        .memory
-                        .write_bytes(msgp.0, &buf[..8 + received])
-                        .is_err()
-                    {
-                        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-                    }
-                    Ok(DispatchOutcome::Returned { value: received as i64 })
+            let Some(total) = sz.checked_add(8) else {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            };
+            if total > crate::dispatch::MAX_RW_COUNT {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
+            let flags = MsgOpFlags::from_bits_retain(msgflg);
+            if flags.contains(MsgOpFlags::COPY) {
+                if !flags.contains(MsgOpFlags::NOWAIT) || flags.contains(MsgOpFlags::EXCEPT) {
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
-                Err(errno) => Ok(DispatchOutcome::errno(errno)),
+            }
+            let msgtyp = MsgType::from_syscall_arg(msgtyp);
+            let creds = this.cred_snapshot();
+            let tid = cx.tid();
+            let _block_state = (!flags.contains(MsgOpFlags::NOWAIT))
+                .then(|| SysvSemBlockStateGuard::new(tid));
+            let mut saw_would_block = false;
+            loop {
+                match SysvIpcService::msgrcv(cx, msqid, &creds, msgp.0, sz, msgtyp, flags) {
+                    Ok(Some(received)) => {
+                        return Ok(DispatchOutcome::Returned { value: received as i64 });
+                    }
+                    Ok(None) => {
+                        saw_would_block = true;
+                        if flags.contains(MsgOpFlags::NOWAIT) {
+                            return Ok(DispatchOutcome::errno(LINUX_ENOMSG));
+                        }
+                        if sysv_msg_wait_interrupted(this, tid) {
+                            return Ok(DispatchOutcome::errno(LINUX_EINTR));
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                    Err(errno) if errno == LINUX_EINVAL && saw_would_block => {
+                        return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIDRM));
+                    }
+                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                }
             }
         }
 
-        /// msgctl(msqid, cmd, buf). IPC_RMID forwards; IPC_STAT fills a
-        /// best-effort msqid_ds (msg_qnum + msg_qbytes, the fields LTP reads);
-        /// IPC_SET is a no-op success.
+        /// msgctl(msqid, cmd, buf): operate on Carrick-owned Linux queue
+        /// metadata and serialized message contents.
         fn msgctl(this, cx, msqid: u64, cmd: u64, buf: u64) {
-            let _ = this;
-            match cmd {
-                LINUX_IPC_RMID => {
-                    let rc = unsafe { msgctl(msqid as i32, libc::IPC_RMID, core::ptr::null_mut()) };
-                    match rc.host_syscall_errno() {
-                        Ok(_) => {
-                            this.sysv.lock().message_queues.remove(&(msqid as i32));
-                            Ok(DispatchOutcome::Returned { value: 0 })
-                        }
-                        Err(errno) => Ok(DispatchOutcome::errno(errno)),
-                    }
-                }
-                #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-                LINUX_IPC_SET => {
-                    // Forward msg_qbytes (the IPC_SET field LTP msgctl02 lowers and
-                    // re-reads) to the host SysV queue; carrick backs msg queues
-                    // with real host queues, so IPC_STAT-after-SET reflects it.
-                    // Owner/perm changes aren't applied — carrick is one host
-                    // identity, not the guest uid.
-                    if buf == 0 {
-                        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-                    }
-                    let new_qbytes = match cx.memory.read_bytes(buf + LIN_MSG_QBYTES as u64, 8) {
-                        Ok(b) => {
-                            let mut a = [0u8; 8];
-                            a.copy_from_slice(&b);
-                            u64::from_le_bytes(a)
-                        }
-                        Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
-                    };
-                    let mut ds: libc::msqid_ds = unsafe { core::mem::zeroed() };
-                    if unsafe {
-                        libc::msgctl(msqid as i32, libc::IPC_STAT, &mut ds as *mut libc::msqid_ds)
-                    }
-                    .host_syscall_errno()
-                    .is_err()
-                    {
-                        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-                    }
-                    ds.msg_qbytes = new_qbytes as _;
-                    let rc = unsafe {
-                        libc::msgctl(msqid as i32, libc::IPC_SET, &mut ds as *mut libc::msqid_ds)
-                    };
-                    match rc.host_syscall_errno() {
-                        Ok(_) => Ok(DispatchOutcome::Returned { value: 0 }),
-                        Err(errno) => Ok(DispatchOutcome::errno(errno)),
-                    }
-                }
-                #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
-                LINUX_IPC_SET => {
-                    // macOS + NetBSD: no libc `msqid_ds` by name — round-trip the
-                    // host struct as a raw buffer and patch msg_qbytes at the
-                    // measured offset, the IPC_SET twin of the raw-buffer IPC_STAT
-                    // arm below.
-                    if buf == 0 {
-                        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-                    }
-                    let new_qbytes = match cx.memory.read_bytes(buf + LIN_MSG_QBYTES as u64, 8) {
-                        Ok(b) => {
-                            let mut a = [0u8; 8];
-                            a.copy_from_slice(&b);
-                            u64::from_le_bytes(a)
-                        }
-                        Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
-                    };
-                    let mut ds = [0u8; MACOS_MSQID_DS_SIZE];
-                    if unsafe {
-                        msgctl(msqid as i32, libc::IPC_STAT, ds.as_mut_ptr() as *mut libc::c_void)
-                    }
-                    .host_syscall_errno()
-                    .is_err()
-                    {
-                        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-                    }
-                    ds[MAC_MSG_QBYTES..MAC_MSG_QBYTES + 8].copy_from_slice(&new_qbytes.to_le_bytes());
-                    let rc = unsafe {
-                        msgctl(msqid as i32, libc::IPC_SET, ds.as_mut_ptr() as *mut libc::c_void)
-                    };
-                    match rc.host_syscall_errno() {
-                        Ok(_) => Ok(DispatchOutcome::Returned { value: 0 }),
-                        Err(errno) => Ok(DispatchOutcome::errno(errno)),
-                    }
-                }
-                #[cfg(target_os = "linux")]
-                LINUX_IPC_STAT => {
-                    // On a Linux host the kernel returns a NATIVE msqid_ds
-                    // (libc has the type), so read its fields by NAME rather than
-                    // re-deriving them from the macOS offsets — double-translating
-                    // the macOS layout against a Linux struct corrupts every field.
-                    // Only owner/creator come from the guest creds (carrick's host
-                    // process is not the guest uid); key/mode/times/counters are the
-                    // host kernel's truth.
-                    let mut ds: libc::msqid_ds = unsafe { core::mem::zeroed() };
-                    let rc = unsafe {
-                        libc::msgctl(
-                            msqid as i32,
-                            libc::IPC_STAT,
-                            &mut ds as *mut libc::msqid_ds,
-                        )
-                    };
-                    if let Err(errno) = rc.host_syscall_errno() {
-                        return Ok(DispatchOutcome::errno(errno));
-                    }
-                    if buf != 0 {
-                        let mut out = [0u8; LINUX_MSQID_DS_SIZE];
-                        let put8 = |out: &mut [u8], o: usize, v: u64| {
-                            out[o..o + 8].copy_from_slice(&v.to_le_bytes())
-                        };
-                        let put4 = |out: &mut [u8], o: usize, v: i32| {
-                            out[o..o + 4].copy_from_slice(&v.to_le_bytes())
-                        };
-                        put8(&mut out, LIN_MSG_STIME, ds.msg_stime as u64);
-                        put8(&mut out, LIN_MSG_RTIME, ds.msg_rtime as u64);
-                        put8(&mut out, LIN_MSG_CTIME, ds.msg_ctime as u64);
-                        put8(&mut out, LIN_MSG_CBYTES, ds.__msg_cbytes);
-                        put8(&mut out, LIN_MSG_QNUM, ds.msg_qnum);
-                        put8(&mut out, LIN_MSG_QBYTES, ds.msg_qbytes);
-                        put4(&mut out, LIN_MSG_LSPID, ds.msg_lspid);
-                        put4(&mut out, LIN_MSG_LRPID, ds.msg_lrpid);
-                        // Linux ipc64_perm — key@0,uid@4,gid@8,cuid@12,cgid@16,
-                        // mode@20(u32),seq@24(u16). owner/creator come from the GUEST
-                        // creds; key/mode/seq are the host kernel's.
-                        let creds = this.cred_snapshot();
-                        put4(&mut out, 0, ds.msg_perm.__key);
-                        put4(&mut out, 4, creds.euid as i32);
-                        put4(&mut out, 8, creds.egid as i32);
-                        put4(&mut out, 12, creds.euid as i32);
-                        put4(&mut out, 16, creds.egid as i32);
-                        out[20..24].copy_from_slice(&(ds.msg_perm.mode as u32).to_le_bytes());
-                        out[24..26].copy_from_slice(&ds.msg_perm.__seq.to_le_bytes());
-                        let memory = &mut *cx.memory;
-                        if memory.write_bytes(buf, &out).is_err() {
-                            return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-                        }
-                    }
-                    Ok(DispatchOutcome::Returned { value: 0 })
-                }
-                #[cfg(target_os = "freebsd")]
-                LINUX_IPC_STAT => {
-                    // On a FreeBSD host the kernel returns a NATIVE msqid_ds
-                    // (libc has the type), so read its fields by NAME — the
-                    // faithful equivalent of the Linux arm. FreeBSD's field
-                    // naming differs from Linux's (no leading underscores on the
-                    // ipc_perm `key`/`seq` and the queue uses `msg_cbytes`, not
-                    // `__msg_cbytes`), so this is a separate arm rather than a
-                    // widened `cfg`. Only owner/creator come from the GUEST creds
-                    // (carrick's host process is not the guest uid); key/mode/
-                    // times/counters are the host kernel's truth.
-                    let mut ds: libc::msqid_ds = unsafe { core::mem::zeroed() };
-                    let rc = unsafe {
-                        libc::msgctl(msqid as i32, libc::IPC_STAT, &mut ds as *mut libc::msqid_ds)
-                    };
-                    if let Err(errno) = rc.host_syscall_errno() {
-                        return Ok(DispatchOutcome::errno(errno));
-                    }
-                    if buf != 0 {
-                        let mut out = [0u8; LINUX_MSQID_DS_SIZE];
-                        let put8 = |out: &mut [u8], o: usize, v: u64| {
-                            out[o..o + 8].copy_from_slice(&v.to_le_bytes())
-                        };
-                        let put4 = |out: &mut [u8], o: usize, v: i32| {
-                            out[o..o + 4].copy_from_slice(&v.to_le_bytes())
-                        };
-                        put8(&mut out, LIN_MSG_STIME, ds.msg_stime as u64);
-                        put8(&mut out, LIN_MSG_RTIME, ds.msg_rtime as u64);
-                        put8(&mut out, LIN_MSG_CTIME, ds.msg_ctime as u64);
-                        put8(&mut out, LIN_MSG_CBYTES, ds.msg_cbytes as u64);
-                        put8(&mut out, LIN_MSG_QNUM, ds.msg_qnum as u64);
-                        put8(&mut out, LIN_MSG_QBYTES, ds.msg_qbytes as u64);
-                        put4(&mut out, LIN_MSG_LSPID, ds.msg_lspid);
-                        put4(&mut out, LIN_MSG_LRPID, ds.msg_lrpid);
-                        // Linux ipc64_perm — key@0,uid@4,gid@8,cuid@12,cgid@16,
-                        // mode@20(u32),seq@24(u16). owner/creator come from the GUEST
-                        // creds; key/mode/seq are the host kernel's. FreeBSD's
-                        // ipc_perm exposes the same fields under unprefixed names.
-                        let creds = this.cred_snapshot();
-                        // FreeBSD `key_t` is i64 (Linux's is i32); the Linux IPC
-                        // perm `key` field is 4 bytes, so narrow to i32.
-                        put4(&mut out, 0, ds.msg_perm.key as i32);
-                        put4(&mut out, 4, creds.euid as i32);
-                        put4(&mut out, 8, creds.egid as i32);
-                        put4(&mut out, 12, creds.euid as i32);
-                        put4(&mut out, 16, creds.egid as i32);
-                        out[20..24].copy_from_slice(&(ds.msg_perm.mode as u32).to_le_bytes());
-                        out[24..26].copy_from_slice(&ds.msg_perm.seq.to_le_bytes());
-                        let memory = &mut *cx.memory;
-                        if memory.write_bytes(buf, &out).is_err() {
-                            return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-                        }
-                    }
-                    Ok(DispatchOutcome::Returned { value: 0 })
-                }
-                #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
-                LINUX_IPC_STAT => {
-                    // macOS + NetBSD: libc has no `msqid_ds` we can read by name
-                    // (NetBSD doesn't define it in libc 0.2; macOS never did), so
-                    // stat into a raw buffer and extract the fields from the
-                    // MEASURED macOS offsets. macOS uses these offsets correctly;
-                    // NetBSD's native msqid_ds layout differs, so this path is
-                    // best-effort there (no NetBSD SysV-msg conformance box exists
-                    // to bless a native layout). The Linux and FreeBSD arms above
-                    // do the faithful by-name read for their hosts.
-                    let mut ds = [0u8; MACOS_MSQID_DS_SIZE];
-                    let rc = unsafe {
-                        msgctl(msqid as i32, libc::IPC_STAT, ds.as_mut_ptr() as *mut libc::c_void)
-                    };
-                    if let Err(errno) = rc.host_syscall_errno() {
-                        return Ok(DispatchOutcome::errno(errno));
-                    }
-                    let rd8 = |o: usize| {
-                        let mut a = [0u8; 8];
-                        a.copy_from_slice(&ds[o..o + 8]);
-                        u64::from_le_bytes(a)
-                    };
-                    let rd4 = |o: usize| {
-                        let mut a = [0u8; 4];
-                        a.copy_from_slice(&ds[o..o + 4]);
-                        i32::from_le_bytes(a)
-                    };
-                    if buf != 0 {
-                        let mut out = [0u8; LINUX_MSQID_DS_SIZE];
-                        let put8 = |out: &mut [u8], o: usize, v: u64| {
-                            out[o..o + 8].copy_from_slice(&v.to_le_bytes())
-                        };
-                        let put4 = |out: &mut [u8], o: usize, v: i32| {
-                            out[o..o + 4].copy_from_slice(&v.to_le_bytes())
-                        };
-                        put8(&mut out, LIN_MSG_STIME, rd8(MAC_MSG_STIME));
-                        put8(&mut out, LIN_MSG_RTIME, rd8(MAC_MSG_RTIME));
-                        put8(&mut out, LIN_MSG_CTIME, rd8(MAC_MSG_CTIME));
-                        put8(&mut out, LIN_MSG_CBYTES, rd8(MAC_MSG_CBYTES));
-                        put8(&mut out, LIN_MSG_QNUM, rd8(MAC_MSG_QNUM));
-                        put8(&mut out, LIN_MSG_QBYTES, rd8(MAC_MSG_QBYTES));
-                        put4(&mut out, LIN_MSG_LSPID, rd4(MAC_MSG_LSPID));
-                        put4(&mut out, LIN_MSG_LRPID, rd4(MAC_MSG_LRPID));
-                        // ipc64_perm (bytes 0..28): the macOS msg_perm sits at
-                        // offset 0 of msqid_ds — uid@0,gid@4,cuid@8,cgid@12,
-                        // mode@16(u16),_seq@18(u16),_key@20(i32). Map into the
-                        // Linux ipc64_perm — key@0,uid@4,gid@8,cuid@12,cgid@16,
-                        // mode@20(u32),seq@24(u16). key/mode/seq come from the
-                        // host stat; the owner/creator ids come from the GUEST
-                        // creds (carrick's macOS process is not the guest uid).
-                        // (msgctl01 reads msg_perm.key + msg_perm.mode.)
-                        let rd2 = |o: usize| {
-                            let mut a = [0u8; 2];
-                            a.copy_from_slice(&ds[o..o + 2]);
-                            u16::from_le_bytes(a)
-                        };
-                        let creds = this.cred_snapshot();
-                        put4(&mut out, 0, rd4(20)); // key
-                        put4(&mut out, 4, creds.euid as i32); // uid
-                        put4(&mut out, 8, creds.egid as i32); // gid
-                        put4(&mut out, 12, creds.euid as i32); // cuid
-                        put4(&mut out, 16, creds.egid as i32); // cgid
-                        out[20..24].copy_from_slice(&(rd2(16) as u32).to_le_bytes()); // mode
-                        out[24..26].copy_from_slice(&rd2(18).to_le_bytes()); // seq
-                        let memory = &mut *cx.memory;
-                        if memory.write_bytes(buf, &out).is_err() {
-                            return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-                        }
-                    }
-                    Ok(DispatchOutcome::Returned { value: 0 })
-                }
-                _ => Ok(DispatchOutcome::errno(LINUX_EINVAL)),
+            match SysvIpcService::msgctl(this, cx, msqid, cmd, buf) {
+                Ok(outcome) => Ok(outcome),
+                Err(errno) => Ok(DispatchOutcome::errno(errno)),
             }
         }
 
@@ -1764,6 +2456,427 @@ impl SyscallDispatcher {
             this.sysv_semctl(cx, semid as i32, semnum as i32, cmd, arg, &creds)
         }
     }
+}
+
+fn msgget_open(
+    state: &mut SysvShmState,
+    creds: &super::creds::CredState,
+    key: MsgKey,
+    flags: u64,
+) -> Result<MsgQueueId, LinuxErrno> {
+    SysvShmState::ensure_dir();
+    let mode = ShmPermMode::requested(flags);
+    let create_flags = IpcCreateFlags::from_bits_retain(flags);
+    let create = create_flags.contains(IpcCreateFlags::CREAT);
+    let exclusive = create_flags.contains(IpcCreateFlags::EXCL);
+    let path = if key.is_private() {
+        msg_queue_path_for_private(state)
+    } else {
+        msg_queue_path_for_key(key.raw())
+    };
+    let exists = path.exists();
+    if !key.is_private() && !exists && !create {
+        return Err(LINUX_ENOENT);
+    }
+    if !key.is_private() && exists && create && exclusive {
+        return Err(LINUX_EEXIST);
+    }
+    let must_create = key.is_private() || !exists;
+    if must_create && state.message_queues.len() >= LINUX_MSGMNI {
+        return Err(LINUX_ENOSPC);
+    }
+
+    if must_create {
+        let cpath = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+            .map_err(|_| LINUX_EINVAL)?;
+        let fd = unsafe {
+            libc::open(
+                cpath.as_ptr(),
+                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
+                0o600,
+            )
+        }
+        .host_syscall_errno()?;
+        let id = msg_queue_id_for_fd(fd);
+        unsafe { libc::close(fd) };
+        let id = id?;
+        let path = if key.is_private() {
+            let id_path = msg_queue_path_for_id(id);
+            std::fs::rename(&path, &id_path).map_err(|_| LINUX_EIO)?;
+            id_path
+        } else {
+            path
+        };
+        let lock = MsgQueueLock::acquire(&path)?;
+        let queue = MsgQueueFile::new(id, key.raw(), mode, creds);
+        lock.write_queue(&queue)?;
+        state.message_queues.insert(id);
+        return Ok(id);
+    }
+
+    let lock = MsgQueueLock::acquire(&path)?;
+    let queue = lock.read_queue()?;
+    let wants_read = flags & 0o400 != 0;
+    let wants_write = flags & 0o200 != 0;
+    if (wants_read && !queue.can_read(creds)) || (wants_write && !queue.can_write(creds)) {
+        return Err(LINUX_EACCES);
+    }
+    state.message_queues.insert(queue.id);
+    Ok(queue.id)
+}
+
+fn msg_queue_try_send(
+    id: MsgQueueId,
+    creds: &super::creds::CredState,
+    msg_type: MsgType,
+    payload: &[u8],
+) -> Result<bool, LinuxErrno> {
+    let path = lookup_msg_queue_path(id)?;
+    let lock = MsgQueueLock::acquire_cached(&path)?;
+    let (queue, head, file_size) = lock.read_header()?;
+    if !queue.can_write(creds) {
+        return Err(LINUX_EACCES);
+    }
+    let payload_len = payload.len() as u64;
+    let full_by_bytes = queue.cbytes.saturating_add(payload_len) > queue.qbytes;
+    let full_by_count = queue.qnum.saturating_add(1) > queue.qbytes;
+    if full_by_bytes || full_by_count {
+        return Ok(false);
+    }
+    lock.append_message(&queue, head, file_size, msg_type, payload)?;
+    Ok(true)
+}
+
+fn selected_msg_index(messages: &[MsgRecord], wanted: MsgType, flags: MsgOpFlags) -> Option<usize> {
+    if flags.contains(MsgOpFlags::COPY) {
+        return usize::try_from(wanted.raw())
+            .ok()
+            .filter(|idx| *idx < messages.len());
+    }
+    let wanted_raw = wanted.raw();
+    if wanted_raw == 0 {
+        return (!messages.is_empty()).then_some(0);
+    }
+    if wanted_raw > 0 {
+        if flags.contains(MsgOpFlags::EXCEPT) {
+            return messages
+                .iter()
+                .position(|message| message.msg_type.raw() != wanted_raw);
+        }
+        return messages
+            .iter()
+            .position(|message| message.msg_type.raw() == wanted_raw);
+    }
+
+    let limit = wanted_raw.checked_abs().unwrap_or(i64::MAX);
+    let mut best: Option<(usize, MsgType)> = None;
+    for (idx, message) in messages.iter().enumerate() {
+        if message.msg_type.raw() > limit {
+            continue;
+        }
+        let take = match best {
+            Some((_, best_type)) => message.msg_type < best_type,
+            None => true,
+        };
+        if take {
+            best = Some((idx, message.msg_type));
+        }
+    }
+    best.map(|(idx, _)| idx)
+}
+
+fn msg_queue_receive<M: GuestMemory>(
+    cx: &mut SyscallCtx<M>,
+    id: MsgQueueId,
+    creds: &super::creds::CredState,
+    msgp: u64,
+    msgsz: usize,
+    wanted: MsgType,
+    flags: MsgOpFlags,
+) -> Result<Option<usize>, LinuxErrno> {
+    let path = lookup_msg_queue_path(id)?;
+    let lock = MsgQueueLock::acquire_cached(&path)?;
+    let (queue_header, head, _) = lock.read_header()?;
+    if !queue_header.can_read(creds) {
+        return Err(LINUX_EACCES);
+    }
+    if queue_header.qnum == 0 {
+        return Ok(None);
+    }
+    let (head_message, next_head) = lock.read_record_at(head)?;
+    if selected_msg_index(&[head_message.clone()], wanted, flags) == Some(0) {
+        if head_message.payload.len() > msgsz && !flags.contains(MsgOpFlags::NOERROR) {
+            return Err(LINUX_E2BIG);
+        }
+        let copy_len = head_message.payload.len().min(msgsz);
+        let text_addr = msgp.checked_add(8).ok_or(LINUX_EFAULT)?;
+        if cx
+            .memory
+            .write_bytes(msgp, &head_message.msg_type.raw().to_le_bytes())
+            .is_err()
+        {
+            return Err(LINUX_EFAULT);
+        }
+        if copy_len > 0
+            && cx
+                .memory
+                .write_bytes(text_addr, &head_message.payload[..copy_len])
+                .is_err()
+        {
+            return Err(LINUX_EFAULT);
+        }
+        if !flags.contains(MsgOpFlags::COPY) {
+            lock.consume_head_message(&queue_header, next_head, head_message.payload.len())?;
+        }
+        return Ok(Some(copy_len));
+    }
+
+    let mut queue = lock.read_queue()?;
+    if !queue.can_read(creds) {
+        return Err(LINUX_EACCES);
+    }
+    let Some(idx) = selected_msg_index(&queue.messages, wanted, flags) else {
+        return Ok(None);
+    };
+    let message = queue.messages[idx].clone();
+    if message.payload.len() > msgsz && !flags.contains(MsgOpFlags::NOERROR) {
+        return Err(LINUX_E2BIG);
+    }
+    let copy_len = message.payload.len().min(msgsz);
+    let text_addr = msgp.checked_add(8).ok_or(LINUX_EFAULT)?;
+    if cx
+        .memory
+        .write_bytes(msgp, &message.msg_type.raw().to_le_bytes())
+        .is_err()
+    {
+        return Err(LINUX_EFAULT);
+    }
+    if copy_len > 0
+        && cx
+            .memory
+            .write_bytes(text_addr, &message.payload[..copy_len])
+            .is_err()
+    {
+        return Err(LINUX_EFAULT);
+    }
+    if !flags.contains(MsgOpFlags::COPY) {
+        let removed = queue.messages.remove(idx);
+        queue.cbytes = queue.cbytes.saturating_sub(removed.payload.len() as u64);
+        queue.qnum = queue.messages.len() as u64;
+        queue.rtime = unix_now_secs();
+        queue.lrpid = crate::namespace::pid::self_ns_pid() as i32;
+        lock.write_queue(&queue)?;
+    }
+    Ok(Some(copy_len))
+}
+
+fn sorted_msg_queue_ids() -> Vec<MsgQueueId> {
+    let mut ids = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(SHM_DIR) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !is_msg_queue_path(&path) {
+                continue;
+            }
+            let cpath = match std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) {
+                Ok(cpath) => cpath,
+                Err(_) => continue,
+            };
+            let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDWR) };
+            if fd < 0 {
+                continue;
+            }
+            if let Ok(id) = msg_queue_id_for_fd(fd) {
+                ids.push(id);
+            }
+            unsafe { libc::close(fd) };
+        }
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+fn msg_queue_metrics() -> MsgQueueMetrics {
+    let mut metrics = MsgQueueMetrics::default();
+    for id in sorted_msg_queue_ids() {
+        let Ok(path) = lookup_msg_queue_path(id) else {
+            continue;
+        };
+        let Ok(lock) = MsgQueueLock::acquire(&path) else {
+            continue;
+        };
+        let Ok(queue) = lock.read_queue() else {
+            continue;
+        };
+        metrics.queues = metrics.queues.saturating_add(1);
+        metrics.messages = metrics
+            .messages
+            .saturating_add(usize::try_from(queue.qnum).unwrap_or(usize::MAX));
+        metrics.bytes = metrics.bytes.saturating_add(queue.cbytes);
+    }
+    metrics
+}
+
+fn write_msginfo<M: GuestMemory>(
+    cx: &mut SyscallCtx<M>,
+    addr: u64,
+    metrics: MsgQueueMetrics,
+    cmd: u64,
+) -> Result<(), LinuxErrno> {
+    if addr == 0 {
+        return Ok(());
+    }
+    let mut out = [0u8; 36];
+    let put = |out: &mut [u8], idx: usize, value: i32| {
+        out[idx * 4..idx * 4 + 4].copy_from_slice(&value.to_le_bytes());
+    };
+    put(&mut out, 2, LINUX_MSGMAX as i32);
+    put(&mut out, 3, LINUX_MSGMNB as i32);
+    put(&mut out, 4, LINUX_MSGMNI as i32);
+    put(&mut out, 5, 8);
+    put(&mut out, 6, LINUX_MSGMNI as i32);
+    if cmd == LINUX_MSG_INFO {
+        put(&mut out, 0, metrics.queues as i32);
+        put(&mut out, 1, metrics.messages as i32);
+        put(&mut out, 6, metrics.bytes.min(i32::MAX as u64) as i32);
+    }
+    cx.memory.write_bytes(addr, &out).map_err(|_| LINUX_EFAULT)
+}
+
+fn msg_stat_by_index<M: GuestMemory>(
+    cx: &mut SyscallCtx<M>,
+    selector: u64,
+    buf: u64,
+    creds: &super::creds::CredState,
+    enforce_read_permission: bool,
+) -> Result<DispatchOutcome, LinuxErrno> {
+    if buf == 0 {
+        return Err(LINUX_EFAULT);
+    }
+    let ids = sorted_msg_queue_ids();
+    let id = usize::try_from(selector)
+        .ok()
+        .and_then(|index| ids.get(index).copied())
+        .or_else(|| MsgQueueId::from_syscall_arg(selector).ok())
+        .filter(|id| lookup_msg_queue_path(*id).is_ok())
+        .ok_or(LINUX_EINVAL)?;
+    let path = lookup_msg_queue_path(id)?;
+    let lock = MsgQueueLock::acquire(&path)?;
+    let queue = lock.read_queue()?;
+    if enforce_read_permission && !queue.can_read(creds) {
+        return Err(LINUX_EACCES);
+    }
+    if buf != 0 {
+        cx.memory
+            .write_bytes(buf, &queue.stat_bytes())
+            .map_err(|_| LINUX_EFAULT)?;
+    }
+    Ok(DispatchOutcome::Returned { value: id.as_i64() })
+}
+
+fn sysv_msgctl<M: GuestMemory>(
+    this: &SyscallDispatcher,
+    cx: &mut SyscallCtx<M>,
+    msqid: u64,
+    cmd: u64,
+    buf: u64,
+) -> Result<DispatchOutcome, LinuxErrno> {
+    let creds = this.cred_snapshot();
+    match cmd {
+        LINUX_IPC_INFO | LINUX_MSG_INFO => {
+            let metrics = msg_queue_metrics();
+            write_msginfo(cx, buf, metrics, cmd)?;
+            return Ok(DispatchOutcome::Returned {
+                value: (metrics.queues as i64 - 1).max(0),
+            });
+        }
+        LINUX_MSG_STAT | LINUX_MSG_STAT_ANY => {
+            return msg_stat_by_index(cx, msqid, buf, &creds, cmd == LINUX_MSG_STAT);
+        }
+        _ => {}
+    }
+
+    let msqid = MsgQueueId::from_syscall_arg(msqid)?;
+    match cmd {
+        LINUX_IPC_RMID => {
+            let path = lookup_msg_queue_path(msqid)?;
+            {
+                let lock = MsgQueueLock::acquire(&path)?;
+                let queue = lock.read_queue()?;
+                if !queue.can_admin(&creds) {
+                    return Err(LINUX_EPERM);
+                }
+            }
+            let _ = std::fs::remove_file(&path);
+            this.sysv.lock().message_queues.remove(&msqid);
+            Ok(DispatchOutcome::Returned { value: 0 })
+        }
+        LINUX_IPC_STAT => {
+            if buf == 0 {
+                return Err(LINUX_EFAULT);
+            }
+            let path = lookup_msg_queue_path(msqid)?;
+            let lock = MsgQueueLock::acquire(&path)?;
+            let queue = lock.read_queue()?;
+            if !queue.can_read(&creds) {
+                return Err(LINUX_EACCES);
+            }
+            cx.memory
+                .write_bytes(buf, &queue.stat_bytes())
+                .map_err(|_| LINUX_EFAULT)?;
+            Ok(DispatchOutcome::Returned { value: 0 })
+        }
+        LINUX_IPC_SET => {
+            if buf == 0 {
+                return Err(LINUX_EFAULT);
+            }
+            let uid_addr = buf.checked_add(4).ok_or(LINUX_EFAULT)?;
+            let gid_addr = buf.checked_add(8).ok_or(LINUX_EFAULT)?;
+            let mode_addr = buf.checked_add(20).ok_or(LINUX_EFAULT)?;
+            let qbytes_addr = buf
+                .checked_add(u64::try_from(LIN_MSG_QBYTES).map_err(|_| LINUX_EINVAL)?)
+                .ok_or(LINUX_EFAULT)?;
+            let read4 = |memory: &mut M, addr: u64| -> Result<u32, LinuxErrno> {
+                let bytes = memory.read_bytes(addr, 4).map_err(|_| LINUX_EFAULT)?;
+                Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+            };
+            let new_uid = read4(cx.memory, uid_addr)?;
+            let new_gid = read4(cx.memory, gid_addr)?;
+            let new_mode = read4(cx.memory, mode_addr)?;
+            let qbytes = cx
+                .memory
+                .read_bytes(qbytes_addr, 8)
+                .map_err(|_| LINUX_EFAULT)?;
+            let new_qbytes = u64::from_le_bytes([
+                qbytes[0], qbytes[1], qbytes[2], qbytes[3], qbytes[4], qbytes[5], qbytes[6],
+                qbytes[7],
+            ]);
+            if new_qbytes > LINUX_MSGMNB && creds.euid != 0 {
+                return Err(LINUX_EPERM);
+            }
+            let path = lookup_msg_queue_path(msqid)?;
+            let lock = MsgQueueLock::acquire(&path)?;
+            let mut queue = lock.read_queue()?;
+            if !queue.can_admin(&creds) {
+                return Err(LINUX_EPERM);
+            }
+            queue.uid = new_uid;
+            queue.gid = new_gid;
+            queue.mode = ShmPermMode::from_ipc_set(new_mode, queue.mode);
+            queue.qbytes = new_qbytes;
+            queue.ctime = unix_now_secs();
+            lock.write_queue(&queue)?;
+            Ok(DispatchOutcome::Returned { value: 0 })
+        }
+        _ => Err(LINUX_EINVAL),
+    }
+}
+
+fn sysv_msg_wait_interrupted(this: &SyscallDispatcher, tid: crate::thread::ThreadId) -> bool {
+    this.has_deliverable_dispatch_pending_for_wait(tid, carrick_abi::WaitSigMask::NONE)
+        || carrick_signal_core::xsig::xsig_has_unblocked_for_self(carrick_abi::SigBlockMask::NONE)
+        || carrick_signal_core::has_pending_for(tid.raw())
 }
 
 // Linux SysV semaphore command constants (linux/sem.h + ipc.h).

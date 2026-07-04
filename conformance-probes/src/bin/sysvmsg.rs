@@ -1,9 +1,7 @@
 //! SysV message queues: msgget / msgsnd / msgrcv / msgctl(IPC_STAT/IPC_RMID).
-//! carrick forwards these to the host (macOS has SysV msg queues; the msgbuf
-//! `{long mtype; char mtext[]}` layout + IPC_* constants match Linux, and the
-//! msqid_ds is field-translated for IPC_STAT). Guest processes are separate
-//! host processes sharing the host queue → cross-process for free. Was ENOSYS
-//! (the ipc area's other TBROK half). Stands in for LTP msgget/msgsnd/msgrcv.
+//! Carrick implements these as Linux SysV IPC objects owned by the runtime.
+//! The probe checks cross-process behavior because guest forks are real host
+//! processes and queue state must be fork-coherent inside one Carrick run.
 //!
 //! Invariants (deterministic):
 //!   1. msgget(IPC_PRIVATE, IPC_CREAT|0600) → id >= 0.
@@ -12,7 +10,8 @@
 //!   4. type-selective receive: with messages of type 5 and 7 queued,
 //!      msgrcv(type=7) returns the type-7 message (not the type-5 one).
 //!   5. cross-process: a forked child msgsnds; the parent msgrcvs it.
-//!   6. IPC_RMID → 0.
+//!   6. `/proc/sysvipc/msg` exposes the live queue table.
+//!   7. IPC_RMID → 0.
 
 use conformance_probes::{errno, report};
 
@@ -76,6 +75,7 @@ fn main() {
         m.mtext[..5].copy_from_slice(b"hello");
         let s = msgsnd(id, &m, 5, 0);
         let q1 = qnum(id);
+        let proc_msg = std::fs::read_to_string("/proc/sysvipc/msg").unwrap_or_default();
         let mut r = Msgbuf {
             mtype: 0,
             mtext: [0; 16],
@@ -86,6 +86,16 @@ fn main() {
             send_recv_roundtrip = s == 0 && rc == 5 && &r.mtext[..5] == b"hello" && r.mtype == 5,
             qnum_after_send_is_1 = q1 == 1,
             qnum_after_recv_is_0 = q0 == 0,
+        );
+        let proc_row = proc_msg.lines().skip(1).any(|line| {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            fields.get(1).and_then(|field| field.parse::<i32>().ok()) == Some(id)
+                && fields.get(3) == Some(&"5")
+                && fields.get(4) == Some(&"1")
+        });
+        report!(
+            proc_sysvipc_msg_present = proc_msg.contains("msqid"),
+            proc_sysvipc_msg_live_queue = proc_row,
         );
 
         // (4) type-selective receive: queue type 5 then type 7; ask for 7.
