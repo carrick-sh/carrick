@@ -569,7 +569,8 @@ fn adjtimex_and_clock_adjtime_return_eperm() {
     // 256 bytes is plenty to cover any plausible timex layout.
     memory.write_bytes(0x4000, &[0; 256]).unwrap();
 
-    // adjtimex with a valid pointer → EPERM.
+    // adjtimex with a valid pointer and adjustment mode → EPERM.
+    memory.write_bytes(0x4000, &1u32.to_ne_bytes()).unwrap();
     assert_eq!(
         dispatcher
             .dispatch(
