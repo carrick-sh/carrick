@@ -1413,6 +1413,9 @@ pub const LINUX_SI_USER: i32 = 0;
 /// `si_code` for a `sigqueue(3)`/`rt_sigqueueinfo(2)`-delivered signal — the
 /// handler's `si_value` carries the sender's payload.
 pub const LINUX_SI_QUEUE: i32 = -1;
+/// `si_code` for POSIX message-queue notifications (`mq_notify` with
+/// `SIGEV_SIGNAL`). Carries the sender identity and `sigev_value`.
+pub const LINUX_SI_MESGQ: i32 = -3;
 /// `si_code` for a `tkill(2)`/`tgkill(2)`-delivered signal (and glibc/musl
 /// `raise(3)`, which uses `tgkill`). Distinct from `SI_USER` (`kill(2)`).
 pub const LINUX_SI_TKILL: i32 = -6;
@@ -1468,6 +1471,15 @@ impl LinuxSiginfo {
     /// what `sigqueue(3)`/`rt_sigqueueinfo(2)` passed.
     pub fn rt_queue(si_signo: i32, si_pid: i32, si_uid: u32, si_value: i64) -> Self {
         let mut s = Self::kill(si_signo, LINUX_SI_QUEUE, si_pid, si_uid);
+        s._pad[0..8].copy_from_slice(&si_value.to_le_bytes());
+        s
+    }
+
+    /// Build an `SI_MESGQ` message-queue notification siginfo carrying
+    /// `sigev_value`. Linux uses the same `_rt` payload layout as `SI_QUEUE`:
+    /// `{ si_pid, si_uid, sigval si_value }`.
+    pub fn message_queue(si_signo: i32, si_pid: i32, si_uid: u32, si_value: i64) -> Self {
+        let mut s = Self::kill(si_signo, LINUX_SI_MESGQ, si_pid, si_uid);
         s._pad[0..8].copy_from_slice(&si_value.to_le_bytes());
         s
     }
