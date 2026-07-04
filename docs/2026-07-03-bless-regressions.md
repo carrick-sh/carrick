@@ -109,7 +109,12 @@ oracle-cache edits are only used when the suite declaration itself changed.
 
 ### Still open / next
 
-- `ltp-prctl09` is a count-level MATCH but still has differing assertion mix.
+- No remaining `ltp-prctl*` gating item in the current focused checks.
+  `ltp-prctl09` remains a non-gating timing-threshold MATCH with differing
+  assertion counts: direct Docker arm64 also fails the 25ms and 100ms
+  timer-slack cases, while Carrick additionally failed the 10ms case in two
+  samples by a small oversleep margin. Treat this as timing-jitter evidence,
+  not a prctl semantic blocker.
 
 ## Top clusters (fix the shared root cause once → clears many)
 
