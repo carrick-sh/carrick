@@ -4,6 +4,7 @@
 //!
 //! Invariants encoded:
 //!   * A child can request tracing with `PTRACE_TRACEME`.
+//!   * A second `PTRACE_TRACEME` from the same child fails with `EPERM`.
 //!   * The parent observes the child's signal stop through `waitpid(WUNTRACED)`.
 //!   * `PTRACE_CONT` resumes the stopped child, which can then exit normally.
 //!
@@ -50,6 +51,15 @@ fn main() {
             if !ptrace_traceme() {
                 libc::_exit(70);
             }
+            let repeat = libc::ptrace(
+                libc::PTRACE_TRACEME,
+                0,
+                core::ptr::null_mut::<libc::c_void>(),
+                0,
+            );
+            if repeat != -1 || errno() != libc::EPERM {
+                libc::_exit(71);
+            }
             libc::raise(libc::SIGSTOP);
             libc::_exit(42);
         }
@@ -90,6 +100,7 @@ fn main() {
             traceme_stopsig_is_sigstop = stop_sig == libc::SIGSTOP,
             traceme_exited_before_stop = exited_before_stop,
             traceme_early_exit_status = early_exit_status,
+            traceme_repeat_eperm = !exited_before_stop || early_exit_status != 71,
             ptrace_cont_ok = cont_ok,
             ptrace_cont_errno = cont_errno,
             ptrace_cont_errno_zero = cont_errno == 0,

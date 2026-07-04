@@ -1950,9 +1950,12 @@ impl SyscallDispatcher {
             };
 
             let result = match request {
-                0 => unsafe {
-                    carrick_portable::ptrace(carrick_portable::PT_TRACE_ME, 0, 0, 0)
-                },
+                0 => {
+                    if this.proc.lock().ptrace_traceme {
+                        return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EPERM));
+                    }
+                    unsafe { carrick_portable::ptrace(carrick_portable::PT_TRACE_ME, 0, 0, 0) }
+                }
                 7 => match host_pid(pid) {
                     Some(host) => unsafe {
                         carrick_portable::ptrace(
