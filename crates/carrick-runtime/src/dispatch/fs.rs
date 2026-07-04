@@ -206,6 +206,59 @@ fn host_pipe_readable_bytes(host_fd: i32) -> Result<usize, LinuxErrno> {
     usize::try_from(readable).map_err(|_| LINUX_EINVAL)
 }
 
+fn linux_termio_bytes(termios: &LinuxTermios) -> [u8; LINUX_TERMIO_SIZE] {
+    let c_iflag = termios.c_iflag;
+    let c_oflag = termios.c_oflag;
+    let c_cflag = termios.c_cflag;
+    let c_lflag = termios.c_lflag;
+    let c_line = termios.c_line;
+    let c_cc = termios.c_cc;
+    let mut out = [0u8; LINUX_TERMIO_SIZE];
+    out[0..2].copy_from_slice(&(c_iflag as u16).to_le_bytes());
+    out[2..4].copy_from_slice(&(c_oflag as u16).to_le_bytes());
+    out[4..6].copy_from_slice(&(c_cflag as u16).to_le_bytes());
+    out[6..8].copy_from_slice(&(c_lflag as u16).to_le_bytes());
+    out[8] = c_line;
+    out[9..17].copy_from_slice(&c_cc[..8]);
+    out
+}
+
+fn write_linux_termio(
+    memory: &mut impl GuestMemory,
+    address: u64,
+    termios: &LinuxTermios,
+) -> DispatchOutcome {
+    write_packed(memory, address, &linux_termio_bytes(termios))
+}
+
+fn host_fd_matches_device(host_fd: i32, path: &str) -> bool {
+    let mut fd_stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(host_fd, &mut fd_stat) } != 0 {
+        return false;
+    }
+    let Ok(c_path) = std::ffi::CString::new(path) else {
+        return false;
+    };
+    let mut path_stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::stat(c_path.as_ptr(), &mut path_stat) } != 0 {
+        return false;
+    }
+    (fd_stat.st_mode & libc::S_IFMT) == libc::S_IFCHR
+        && (path_stat.st_mode & libc::S_IFMT) == libc::S_IFCHR
+        && fd_stat.st_rdev == path_stat.st_rdev
+}
+
+fn fd_is_random_device(this: &SyscallDispatcher, fd: i32) -> bool {
+    this.open_file(fd).is_some_and(|open_file| {
+        let open = open_file.description.read();
+        let OpenDescription::HostPipe { host_fd, .. } = &*open else {
+            return false;
+        };
+        host_fd_matches_device(host_fd.raw(), "/dev/random")
+            || host_fd_matches_device(host_fd.raw(), "/dev/urandom")
+    })
+}
+
 fn gather_bounded_iovec_bytes(
     memory: &impl GuestMemory,
     iovecs: &[LinuxIovec],
@@ -5135,7 +5188,7 @@ impl SyscallDispatcher {
         fn ioctl(this, cx, fd: Fd, request: u64, arg: u64) {
 
             let fd: Fd = fd;
-            let ioctl_request = request;
+            let ioctl_request = request & u32::MAX as u64;
             // A tty *control* ioctl (tcsetpgrp/tcsetattr/winsize) issued on the
             // host pty from a background process group raises SIGTTOU regardless
             // of TOSTOP and would STOP the real carrick process. Linux suppresses
@@ -5202,13 +5255,15 @@ impl SyscallDispatcher {
                         this.pty_table().lock().set_locked(role.index, lock);
                         DispatchOutcome::Returned { value: 0 }
                     }
-                    LINUX_TCGETS | LINUX_TCGETS2 => {
+                    LINUX_TCGETA | LINUX_TCGETS | LINUX_TCGETS2 => {
                         let termios = crate::host_tty::get_host_termios(host_fd)
                             .unwrap_or_else(LinuxTermios::default_cooked);
                         // glibc-aarch64 tcgetattr on a pty slave uses TCGETS2
                         // (the full 44-byte termios2); musl uses 36-byte TCGETS.
                         if ioctl_request == LINUX_TCGETS2 {
                             write_termios2(&mut *cx.memory, arg, &termios)
+                        } else if ioctl_request == LINUX_TCGETA {
+                            write_linux_termio(&mut *cx.memory, arg, &termios)
                         } else {
                             write_kernel_struct(&mut *cx.memory, arg, &termios)
                         }
@@ -5509,6 +5564,22 @@ impl SyscallDispatcher {
                     write_kernel_struct(&mut *cx.memory, arg, &winsize)
                 }
                 LINUX_TIOCGWINSZ => DispatchOutcome::errno(LINUX_ENOTTY),
+                LINUX_TCGETA => {
+                    if !cx.memory.guest_range_is_writable(arg, LINUX_TERMIO_SIZE) {
+                        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                    }
+                    if !fd_is_tty(&this.io.open_files.read(), fd.0) {
+                        DispatchOutcome::errno(LINUX_ENOTTY)
+                    } else {
+                        let termios = if crate::host_tty::host_isatty(fd.0) {
+                            crate::host_tty::get_host_termios(fd.0)
+                                .unwrap_or_else(LinuxTermios::default_cooked)
+                        } else {
+                            LinuxTermios::default_cooked()
+                        };
+                        write_linux_termio(&mut *cx.memory, arg, &termios)
+                    }
+                }
                 LINUX_TCGETS | LINUX_TCGETS2 if fd_is_tty(&this.io.open_files.read(), fd.0) => {
                     // Mirror the live host terminal modes when available so
                     // `less`, `vi`, and an interactive shell see the actual
@@ -5533,6 +5604,23 @@ impl SyscallDispatcher {
                     }
                 }
                 LINUX_TCGETS | LINUX_TCGETS2 => DispatchOutcome::errno(LINUX_ENOTTY),
+                LINUX_RNDGETENTCNT => {
+                    if !fd_is_random_device(this, fd.0) {
+                        DispatchOutcome::errno(LINUX_ENOTTY)
+                    } else {
+                        write_packed(&mut *cx.memory, arg, &256i32.to_le_bytes())
+                    }
+                }
+                LINUX_FICLONE => {
+                    let src_fd = match i32::try_from(arg) {
+                        Ok(src_fd) => src_fd,
+                        Err(_) => return Ok(DispatchOutcome::errno(LINUX_EBADF)),
+                    };
+                    if !this.fd_is_valid(src_fd) || this.fd_is_o_path(src_fd) {
+                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                    }
+                    DispatchOutcome::errno(LINUX_EOPNOTSUPP)
+                }
                 LINUX_TCSETS
                 | LINUX_TCSETSW
                 | LINUX_TCSETSF

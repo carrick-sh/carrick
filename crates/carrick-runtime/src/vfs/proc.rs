@@ -338,6 +338,10 @@ const SYSCTL_TABLE: &[(&str, Sysctl)] = &[
         "/proc/sys/kernel/random/boot_id",
         Sysctl::Dynamic(sysctl_boot_id),
     ),
+    (
+        "/proc/sys/kernel/random/entropy_avail",
+        Sysctl::Static(b"256\n"),
+    ),
     // vm.* — carrick freely satisfies large anon mmaps, so "always overcommit"
     // (1) is the honest match; Redis warns loudly on anything else.
     ("/proc/sys/vm/overcommit_memory", Sysctl::Static(b"1\n")),
@@ -3034,6 +3038,7 @@ mod tests {
             ("/proc/sys/net/ipv4/tcp_rmem", "4096\t131072\t6291456\n"),
             ("/proc/sys/fs/file-nr", "256\t0\t1048576\n"),
             ("/proc/sys/fs/aio-max-nr", "65536\n"),
+            ("/proc/sys/kernel/random/entropy_avail", "256\n"),
         ] {
             let got = synthetic_file(path, &ctx()).unwrap();
             assert_eq!(String::from_utf8(got).unwrap(), want, "{path}");
