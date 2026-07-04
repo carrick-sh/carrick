@@ -188,13 +188,12 @@ impl Runtime {
                 }
             }
         }
-        // Name the host process `carrick: <basename>` up front so
+        // Name the host process `carrick: <argv>` up front so
         // it's identifiable in ps/Activity Monitor even before the
         // guest sets its own comm via prctl.
         {
-            let exec_path = &spec.executable;
-            let base = exec_path.rsplit('/').next().unwrap_or(exec_path);
-            crate::dispatch::set_host_process_name(base.as_bytes());
+            let cmdline = spec.argv.join(" ");
+            crate::dispatch::set_host_process_name(cmdline.as_bytes());
         }
 
         // The environment is already fully resolved by the engine layer
