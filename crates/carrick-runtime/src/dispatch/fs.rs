@@ -5540,11 +5540,21 @@ impl SyscallDispatcher {
                             DispatchOutcome::errno(LINUX_EINVAL)
                         }
                     }
-                    // carrick models exactly one initial ns per type, so there is
-                    // no accessible parent — EPERM (the linchpin ioctl_ns03 checks).
-                    LINUX_NS_GET_PARENT => DispatchOutcome::errno(LINUX_EPERM),
-                    // Every namespace object is owned by the one initial user
-                    // namespace; return a fresh fd on /proc/self/ns/user.
+                    // Only hierarchical namespaces answer NS_GET_PARENT. The
+                    // initial user/pid namespaces have no accessible parent
+                    // here (EPERM); non-hierarchical namespaces reject the
+                    // request with EINVAL.
+                    LINUX_NS_GET_PARENT if ns_type == "user" || ns_type == "pid" => {
+                        DispatchOutcome::errno(LINUX_EPERM)
+                    }
+                    LINUX_NS_GET_PARENT => DispatchOutcome::errno(LINUX_EINVAL),
+                    // A namespace's owning user namespace is exposed for
+                    // non-user namespaces. A user namespace fd itself has no
+                    // "owning user ns" to return in this model; Docker's oracle
+                    // reports EPERM for that shape (ioctl_ns04).
+                    LINUX_NS_GET_USERNS if ns_type == "user" => {
+                        DispatchOutcome::errno(LINUX_EPERM)
+                    }
                     LINUX_NS_GET_USERNS => this.install_proc_synthetic_bytes(
                         "/proc/self/ns/user",
                         Vec::new(),
