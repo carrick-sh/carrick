@@ -332,8 +332,6 @@ use crate::linux_abi::{
     LINUX_MAP_ANONYMOUS,
     LINUX_MAP_FIXED,
     LINUX_MAP_FIXED_NOREPLACE,
-    LINUX_MAP_PRIVATE,
-    LINUX_MAP_SHARED,
     LINUX_MAX_SIGNUM,
     LINUX_MCL_CURRENT,
     LINUX_MCL_FUTURE,
@@ -586,6 +584,8 @@ use crate::linux_abi::{
     LinuxX8664Stat,
     align_up_u64,
 };
+#[cfg(test)]
+use crate::linux_abi::{LINUX_MAP_PRIVATE, LINUX_MAP_SHARED};
 use crate::memory::{LINUX_HEAP_BASE, LINUX_HEAP_SIZE, LINUX_MMAP_BASE};
 use crate::overlay::OverlayEntry;
 use crate::rootfs::{RootFs, RootFsDirEntry, RootFsEntryKind, RootFsError, RootFsMetadata};
@@ -682,7 +682,7 @@ mod time;
 
 pub use proctitle::{init as proctitle_init, set_host_process_name};
 
-pub use crate::vfs::ProcMapsEntry;
+pub use crate::vfs::{ProcMapSharing, ProcMapsEntry};
 pub use abi_args::{Fd, GuestLen, GuestPtr, HostFd, HostPid, NsPid, Pid, Signal};
 use fd_table::*;
 
@@ -3984,6 +3984,13 @@ impl SyscallDispatcher {
             (sig_ignored.raw(), sig_caught.raw(), sig_shdpnd.raw());
         let proc = self.proc.lock();
         let mem = self.mem_snapshot();
+        let mut address_space_regions = mem.address_space_regions;
+        if !mem.dynamic_maps.is_empty() {
+            match &mut address_space_regions {
+                Some(regions) => regions.extend(mem.dynamic_maps),
+                None => address_space_regions = Some(mem.dynamic_maps),
+            }
+        }
         let creds = self.cred_snapshot();
         let groups = self.current_groups();
         crate::vfs::SyntheticProcContext {
@@ -3995,7 +4002,7 @@ impl SyscallDispatcher {
             open_fds: self.open_fd_numbers(),
             network: self.network.spec.clone(),
             auxv: mem.linux_auxv_image,
-            address_space_regions: mem.address_space_regions,
+            address_space_regions,
             brk_current: mem.brk_current,
             mmap_next: mem.mmap_next,
             ruid: creds.ruid,
