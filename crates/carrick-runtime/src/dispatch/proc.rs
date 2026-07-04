@@ -558,7 +558,7 @@ impl ProcState {
             guest_hostname: crate::execute::guest_hostname().to_string(),
             personality: 0,
             dumpable: 1,
-            task_name: linux_task_name_from_bytes(b"carrick"),
+            task_name: linux_task_name_from_bytes(b"exe"),
             pdeathsig: 0,
             keepcaps: 0,
             child_subreaper: 0,

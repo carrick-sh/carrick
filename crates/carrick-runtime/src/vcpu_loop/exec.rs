@@ -24,8 +24,8 @@ where
             .iter()
             .map(|a| String::from_utf8_lossy(a).into_owned())
             .collect();
-        let base = path.rsplit('/').next().unwrap_or(&path).to_owned();
-        crate::dispatch::set_host_process_name(base.as_bytes());
+        let cmdline = proc_argv.join(" ");
+        crate::dispatch::set_host_process_name(cmdline.as_bytes());
         let proc_env = env.clone();
         match load_execve_image(&kernel.dispatcher, &path, argv, env) {
             Ok(img) => {
