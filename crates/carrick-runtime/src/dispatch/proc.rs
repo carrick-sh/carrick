@@ -101,6 +101,9 @@ syscall_table! {
     162 => setdomainname,
     167 => prctl,
     168 => getcpu,
+    217 => add_key,
+    218 => request_key,
+    219 => keyctl,
     220 => clone,
     221 => execve,
     281 => execveat,
@@ -1811,6 +1814,18 @@ impl SyscallDispatcher {
         }
 
         fn setdomainname(this, cx) {
+            Ok(DispatchOutcome::errno(LINUX_EPERM))
+        }
+
+        fn add_key(this, cx) {
+            Ok(DispatchOutcome::errno(LINUX_EPERM))
+        }
+
+        fn request_key(this, cx) {
+            Ok(DispatchOutcome::errno(LINUX_EPERM))
+        }
+
+        fn keyctl(this, cx) {
             Ok(DispatchOutcome::errno(LINUX_EPERM))
         }
 
