@@ -157,49 +157,42 @@ oracle-cache edits are only used when the suite declaration itself changed.
 
 ### Still open / next
 
-**All 327 original regressions are resolved.** 301 of 327 are now MATCH in
-the committed baseline; zero are gating. The remaining 26 are non-gating
-known diffs (`verdict=diff, gating=false`) with `known_diffs` already
-blessed.
+**All 327 original regressions are resolved.** The committed baseline has zero
+`gating=true` rows, and `scripts/conformance/suites.toml` has no `known_gaps`.
+The deterministic matrix check is clean (`just check-matrix`, 2026-07-04):
+`docs/support-matrix.md` is in sync with `scripts/conformance/baseline.jsonl`.
 
-#### Remaining non-gating LTP diffs (carrick fails, Docker passes)
+The current LTP baseline still has 72 non-MATCH rows, all non-gating. They are
+not hidden regressions from the 20260529 re-bless cleanup:
 
-These require substantial implementation work and are documented for future
-prioritization:
-
-- `ltp-mremap01` (0p/1f/1313b vs 1p): first subcase returns EINVAL
-  (non-arena or high-VA address in the mremap grow path), cascading 1313
-  TBROK. `MREMAP_FIXED` flag is parsed but ignored (`_new_address` unused).
-- `ltp-mremap04` (0p/1f vs 1p): `MREMAP_FIXED` not implemented.
-- `ltp-mremap05` (2p/4f vs 7p): `MREMAP_FIXED | MAYMOVE` combination not
-  implemented.
-- `ltp-mprotect01` (1p/1f/2b vs 3p): missing EACCES for `mprotect(PROT_WRITE)`
-  on read-only file-backed mappings.
-- `ltp-mprotect03` (0p/1f vs 1p): child writing to PROT_READ page does not
-  show expected SIGSEGV exit status (stage-1 write-protection or waitpid
-  status encoding gap).
-- `ltp-msync03` (4p/2f vs 6p): memory-sync gap.
-- `ltp-open13` (0p/5f vs 5p): test child dies during LTP framework
-  `oom_score_adj` initialization before reaching the O_PATH tests. The
-  mmap O_PATH → EBADF guard (now fixed in `6ad6b982`) was also missing but
-  is not the LTP failure's root cause.
-
-#### Remaining non-gating LTP diffs (carrick TCONF, Docker TBROK)
-
-These are cases where carrick returns a cleaner failure than Docker:
-
-- `ltp-clock_gettime03`, `ltp-clock_nanosleep03`, `ltp-fcntl38`,
-  `ltp-fcntl39`, `ltp-futex_wake04`, `ltp-memfd_create03`,
+- 32 are unchanged known diffs (`verdict=diff`, `gating=false`,
+  `known_diffs` populated): `ltp-clock_gettime03`,
+  `ltp-clock_nanosleep03`, `ltp-connect01`, `ltp-fcntl11`, `ltp-fcntl17`,
+  `ltp-fcntl19`, `ltp-fcntl20`, `ltp-fcntl21`, `ltp-fcntl31`, `ltp-fcntl32`,
+  `ltp-fcntl38`, `ltp-fcntl39`, `ltp-futex_wake04`,
+  `ltp-get_robust_list01`, `ltp-memfd_create03`, `ltp-mlockall02`,
+  `ltp-mmap10`, `ltp-mmap14`, `ltp-mprotect01`, `ltp-mprotect03`,
+  `ltp-mprotect04`, `ltp-mremap01`, `ltp-mremap04`, `ltp-mremap05`,
+  `ltp-msync03`, `ltp-open13`, `ltp-open14`, `ltp-openat03`,
+  `ltp-recvfrom01`, `ltp-sendto01`, `ltp-setrlimit01`, and
   `ltp-setsockopt08`.
+- 40 are first-observation `NEW` rows with no prior baseline entry
+  (`gating=false`, `new_diffs` populated): `ltp-acct02`, `ltp-add_key05`,
+  `ltp-cachestat03`, `ltp-fallocate02`, `ltp-fcntl11_64`,
+  `ltp-fcntl17_64`, `ltp-fcntl19_64`, `ltp-fcntl20_64`, `ltp-fcntl21_64`,
+  `ltp-fcntl31_64`, `ltp-fcntl32_64`, `ltp-fcntl38_64`,
+  `ltp-fcntl39_64`, `ltp-fstatat01`, `ltp-io_uring01`,
+  `ltp-io_uring02`, `ltp-lchown02`, `ltp-linkat01`, `ltp-mincore01`,
+  `ltp-mknod08`, `ltp-msgget04`, `ltp-msgget05`, `ltp-msgrcv03`,
+  `ltp-nftw01`, `ltp-nftw6401`, `ltp-perf_event_open01`,
+  `ltp-process_madvise01`, `ltp-remap_file_pages01`, `ltp-renameat201`,
+  `ltp-renameat202`, `ltp-semget05`, `ltp-set_tid_address01`,
+  `ltp-setfsuid04`, `ltp-setgroups04`, `ltp-shmget05`, `ltp-shmget06`,
+  `ltp-sockioctl01`, `ltp-symlinkat01`, `ltp-sysinfo03`, and
+  `ltp-timerfd04`.
 
-#### Remaining non-gating LTP diffs (mixed)
-
-- `ltp-mlockall02` (1p/0f vs 1p/1f): Docker fails one assertion, carrick
-  does not — timing/privilege divergence.
-- `ltp-mmap14` (0p/1f vs 1p): carrick fails, Docker passes.
-- `ltp-setrlimit01` (3p/1f vs 3p/0f/2b): both sides have issues.
-- `ltp-prctl09`: timing-threshold MATCH with differing assertion counts.
-- `ltp-clock_nanosleep02`: timing inversion (carrick passes more).
+These non-gating rows are future prioritization work, not part of the original
+327-regression cleanup unless one becomes gating in a fresh run.
 
 #### Remaining non-gating ecosystem diffs
 
@@ -207,7 +200,7 @@ Go and CPython suites have long-standing known test differences (SCTP,
 symlink resolution, unshare, xattr, SSL timing) — all with `known_diffs`
 entries.
 
-## Top clusters (fix the shared root cause once → clears many)
+## Historical top clusters
 
 - **ltp-ioctl\*** — 13 suites
 - **ltp-fcntl\*** — 10 suites
