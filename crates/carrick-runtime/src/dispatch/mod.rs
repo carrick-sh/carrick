@@ -3831,6 +3831,14 @@ fn linux_task_name_from_bytes(bytes: &[u8]) -> [u8; LINUX_TASK_COMM_LEN] {
     name
 }
 
+fn linux_task_name_to_string(bytes: &[u8; LINUX_TASK_COMM_LEN]) -> String {
+    let length = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..length]).into_owned()
+}
+
 fn linux_statx_flags_are_supported(flags: u64) -> bool {
     const SUPPORTED: u64 = LINUX_AT_SYMLINK_NOFOLLOW
         | LINUX_AT_EMPTY_PATH
@@ -4192,6 +4200,8 @@ impl SyscallDispatcher {
         crate::vfs::SyntheticProcContext {
             executable_path: proc.executable_path.clone(),
             argv: proc.argv.clone(),
+            task_comm: linux_task_name_to_string(&proc.task_name),
+            timerslack_ns: proc.timerslack,
             guest_arch: proc.reported_arch(),
             guest_hostname: proc.guest_hostname().to_string(),
             environ: proc.env.clone(),

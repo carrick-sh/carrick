@@ -2208,6 +2208,8 @@ impl SyscallDispatcher {
         let proc = self.proc.lock();
         let exec_path = proc.executable_path.clone();
         let argv = proc.argv.clone();
+        let task_comm = linux_task_name_to_string(&proc.task_name);
+        let timerslack_ns = proc.timerslack;
         let env = proc.env.clone();
         let guest_arch = proc.reported_arch();
         let guest_hostname = proc.guest_hostname().to_string();
@@ -2232,6 +2234,8 @@ impl SyscallDispatcher {
         let ctx = crate::vfs::OpenContext {
             executable_path: Some(exec_path.as_str()),
             argv: Some(argv.as_slice()),
+            task_comm: Some(task_comm.as_str()),
+            timerslack_ns,
             guest_arch,
             guest_hostname: Some(guest_hostname.as_str()),
             environ: Some(env.as_slice()),

@@ -81,14 +81,22 @@ oracle-cache edits are only used when the suite declaration itself changed.
   permission checks, and `/proc/sys/kernel/ns_last_pid` exists as readonly.
 - `ltp-mlock*`: `ltp-mlock02`, `ltp-mlock05`, `ltp-mlock201`,
   `ltp-mlock202`, `ltp-mlock203`, `ltp-mlockall02` all MATCH.
+- `ltp-prctl05` and `ltp-prctl08` MATCH after the procfs/prctl view fix.
+  Root causes fixed: `/proc/self/comm` now reports the live `PR_SET_NAME`
+  comm instead of the executable basename, `/proc/self/timerslack_ns` reports
+  the live `PR_SET_TIMERSLACK` value, and forked children inherit a timer-slack
+  default equal to the parent's current slack. Red-first:
+  `procprctlview` DIFFed on `/proc/self/comm`, procfs timer slack, and the
+  forked-child reset-to-default case; pre-fix focused LTP regressed
+  `ltp-prctl05` at carrick[6/8] vs oracle[8/8] and `ltp-prctl08` at
+  carrick[10/14] vs oracle[14/14].
 
 ### Still open / next
 
-- `ltp-prctl*`: current focused run still regresses `ltp-prctl02`,
-  `ltp-prctl03`, `ltp-prctl05`, and `ltp-prctl08`; `ltp-prctl09` is a
-  count-level MATCH but still has differing assertion mix. Raw failure themes:
-  seccomp/securebits/capbset negative cases, child-subreaper reparenting,
-  `/proc/self/comm` after `PR_SET_NAME`, and `/proc/self/timerslack_ns`.
+- `ltp-prctl*`: current focused run still regresses `ltp-prctl02` and
+  `ltp-prctl03`; `ltp-prctl09` is a count-level MATCH but still has differing
+  assertion mix. Raw failure themes: seccomp/securebits/capbset negative cases
+  and child-subreaper reparenting.
 
 ## Top clusters (fix the shared root cause once → clears many)
 

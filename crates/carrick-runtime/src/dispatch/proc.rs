@@ -398,6 +398,9 @@ pub(super) struct ProcState {
     /// `prctl(PR_SET_TIMERSLACK)` per-process timer slack in nanoseconds
     /// (default 50000). Recorded and echoed back; carrick does not coarsen waits.
     pub timerslack: u64,
+    /// Default timer slack used by `PR_SET_TIMERSLACK(0)`. Linux gives a forked
+    /// child a default equal to the parent's current slack at fork time.
+    pub timerslack_default: u64,
     /// Per-resource `setrlimit`/`prlimit64` overrides, indexed by the Linux
     /// resource number (0..16). `None` = use the carrick default from
     /// `rlimit_for_resource`. RLIMIT_NOFILE is NOT stored here — its soft cap is
@@ -548,6 +551,7 @@ impl ProcState {
             child_subreaper: 0,
             no_new_privs: false,
             timerslack: LINUX_DEFAULT_TIMERSLACK_NS,
+            timerslack_default: LINUX_DEFAULT_TIMERSLACK_NS,
             rlimit_overrides: [None; 16],
             bootstrap_host_pid: std::process::id(),
             itimers: [None, None, None],
@@ -588,6 +592,11 @@ impl SyscallDispatcher {
     /// True after the process successfully called `ptrace(PTRACE_TRACEME)`.
     pub(crate) fn is_ptrace_traceme(&self) -> bool {
         self.proc.lock().ptrace_traceme
+    }
+
+    pub(crate) fn proc_after_fork_child(&self) {
+        let mut proc = self.proc.lock();
+        proc.timerslack_default = proc.timerslack;
     }
 
     /// Parse a `struct sock_fprog *` at `fprog_ptr` and install its cBPF program
@@ -1052,8 +1061,9 @@ impl SyscallDispatcher {
                 // PR_SET_TIMERSLACK: arg2 = new slack in ns (0 → reset to the
                 // default). PR_GET_TIMERSLACK returns the current slack.
                 LINUX_PR_SET_TIMERSLACK => {
+                    let default = this.proc.lock().timerslack_default;
                     let slack = if arg2 == 0 {
-                        LINUX_DEFAULT_TIMERSLACK_NS
+                        default
                     } else {
                         arg2
                     };
