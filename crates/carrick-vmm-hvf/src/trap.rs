@@ -251,6 +251,11 @@ pub struct GuestMappingPlan {
     /// When set, the trap engine programs TTBR0_EL1 / TCR_EL1 / MAIR_EL1
     /// and enables stage-1 (`SCTLR_EL1.M=1`).
     pub stage1_page_tables_base: Option<u64>,
+    /// Page-granular read-only guest-VA spans from non-writable ELF `PT_LOAD`
+    /// segments. Stage-1 already enforces these for guest stores; HVF also
+    /// seeds the shared syscall protection table from them so copyout-style
+    /// syscalls return `EFAULT` for `.text`/`.rodata` destinations.
+    pub ro_spans: Vec<carrick_mem::elf::RoSpan>,
     pub mappings: Vec<GuestMapping>,
 }
 
@@ -328,6 +333,7 @@ impl GuestMappingPlan {
             el0_trampoline_entry: address_space.el0_trampoline_entry(),
             el1_vectors_base: address_space.el1_vectors_base(),
             stage1_page_tables_base: address_space.stage1_page_tables_base(),
+            ro_spans: address_space.ro_spans().to_vec(),
             mappings,
         })
     }
@@ -1293,6 +1299,15 @@ pub struct ThreadSpec;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl HvfVmState {
+    fn seed_readonly_spans_from_plan(&self, plan: &GuestMappingPlan) {
+        for span in &plan.ro_spans {
+            let Ok(len) = usize::try_from(span.len) else {
+                continue;
+            };
+            self.protections.set_no_write(span.start, len, true);
+        }
+    }
+
     /// Create the VM + the (one) vCPU, map the guest address space, program the
     /// initial vCPU sysregs/trampoline, and return the `(state_without_vcpu,
     /// vcpu)` pair the shared engine owns separately. Consolidates the old
@@ -1329,6 +1344,7 @@ impl HvfVmState {
             fork_mapping_descs: Vec::new(),
             fork_child_descs: Vec::new(),
         };
+        state.seed_readonly_spans_from_plan(plan);
 
         for mapping in &plan.mappings {
             #[cfg(feature = "trace-hvf")]
@@ -3224,6 +3240,7 @@ impl HvfVmState {
         self.forked_no_exec = false; // execve gives a fresh VM: no longer a live forked-no-exec child
         // execve replaces the address space; any prior PROT_NONE ranges are gone.
         self.protections = std::sync::Arc::new(MemoryProtections::default());
+        self.seed_readonly_spans_from_plan(plan);
         self.page_tables = std::sync::Arc::new(parking_lot::Mutex::new(None));
         self.last_syscall_nr = None;
         self.last_syscall_orig_x0 = 0;

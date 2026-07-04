@@ -226,6 +226,12 @@ pub(super) fn write_epoll_events<M: GuestMemory>(
         LinuxGuestAbi::Aarch64 => <LinuxEpollEvent as KernelAbi>::ABI_SIZE,
         LinuxGuestAbi::X86_64 => <LinuxX8664EpollEvent as KernelAbi>::ABI_SIZE,
     };
+    let Some(total_size) = ready.len().checked_mul(event_size) else {
+        return Err(DispatchError::LengthTooLarge(u64::MAX));
+    };
+    if !memory.guest_range_is_writable(events_address, total_size) {
+        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+    }
     for (index, event) in ready.iter().enumerate() {
         let offset = index
             .checked_mul(event_size)

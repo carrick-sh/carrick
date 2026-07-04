@@ -642,6 +642,7 @@ impl SyscallDispatcher {
                 let prot_none = LinuxProtFlags::from_bits_truncate(prot).is_empty();
                 if prot_none && map_flags.contains(LinuxMmapFlags::ANONYMOUS) {
                     memory.set_no_access(address, length_usize, false);
+                    memory.set_no_write(address, length_usize, false);
                     memory.set_no_access(address, length_usize, true);
                     // protect_range runs UNCONDITIONALLY so a demand-paged backend
                     // (bhyve) records a reservation across the WHOLE mmap arena,
@@ -662,6 +663,7 @@ impl SyscallDispatcher {
                     && !mmap_address_uses_alias(address, length)
                 {
                     memory.set_no_access(address, length_usize, false);
+                    memory.set_no_write(address, length_usize, prot & LINUX_PROT_WRITE == 0);
                     // Unconditional (see the PROT_NONE arm above): reserve across
                     // the whole arena for demand-paged backends; fatal only in-arena.
                     if memory.protect_range(address, length_usize, prot).is_err() && in_arena {
@@ -770,6 +772,11 @@ impl SyscallDispatcher {
                     // clear it here, or reads/writes of guest buffers in this range
                     // wrongly EFAULT.
                     memory.set_no_access(address, length_usize, prot_none);
+                    memory.set_no_write(
+                        address,
+                        length_usize,
+                        !prot_none && prot & LINUX_PROT_WRITE == 0,
+                    );
                     return Ok(DispatchOutcome::MapHostAlias {
                         va: GuestVa(address),
                         ipa: Gpa(ipa),
@@ -791,6 +798,11 @@ impl SyscallDispatcher {
                 if prot_none {
                     memory.set_no_access(address, length_usize, true);
                 }
+                memory.set_no_write(
+                    address,
+                    length_usize,
+                    !prot_none && prot & LINUX_PROT_WRITE == 0,
+                );
                 // Make the requested protection guest-visible (also restores RW for
                 // a reused range). prot==0 here means file-backed PROT_NONE.
                 // Unconditional: reserve across the whole arena; fatal only in-arena.
