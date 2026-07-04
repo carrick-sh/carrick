@@ -1662,7 +1662,7 @@ impl SyscallDispatcher {
     }
 
     /// True iff `fd` refers to a synthetic AF_NETLINK socket.
-    fn fd_is_netlink(&self, fd: i32) -> bool {
+    pub(super) fn fd_is_netlink(&self, fd: i32) -> bool {
         self.open_file(fd)
             .is_some_and(|of| matches!(&*of.description.read(), OpenDescription::Netlink { .. }))
     }
@@ -1694,15 +1694,23 @@ impl SyscallDispatcher {
         }
     }
 
-    /// recvfrom path for netlink: drain queued reply bytes into guest memory.
+    /// recvfrom path for netlink: drain queued reply bytes into guest memory,
+    /// or block/EAGAIN while a blocking caller waits for a future kernel event.
     fn netlink_recv(
         &self,
         fd: i32,
         buf_addr: u64,
         len: usize,
+        flags: i32,
         memory: &mut impl GuestMemory,
     ) -> DispatchOutcome {
+        if len == 0 {
+            return DispatchOutcome::Returned { value: 0 };
+        }
         let chunk = self.netlink_drain(fd, len);
+        if chunk.is_empty() {
+            return self.empty_netlink_recv(fd, flags);
+        }
         if !chunk.is_empty() && memory.write_bytes(buf_addr, &chunk).is_err() {
             return DispatchOutcome::errno(LINUX_EFAULT);
         }
@@ -1724,6 +1732,40 @@ impl SyscallDispatcher {
         };
         let take = recv_queue.len().min(max);
         recv_queue.drain(..take).collect()
+    }
+
+    fn empty_netlink_recv(&self, fd: i32, flags: i32) -> DispatchOutcome {
+        if self.io_is_nonblocking(fd, flags) {
+            return DispatchOutcome::errno(LINUX_EAGAIN);
+        }
+        DispatchOutcome::WaitOnPollFds {
+            // Synthetic netlink sockets have no host fd to poll. A negative
+            // pollfd is ignored by poll(2), but keeps WaitOnPollFds in its
+            // internal "ready to re-sample" mode instead of completing the guest
+            // syscall with a timeout value.
+            fds: WaitFds::raw_one(-1, 0),
+            timeout: None,
+            on_timeout: 0,
+            sig_mask: carrick_abi::WaitSigMask::NONE,
+        }
+    }
+
+    /// Queue an asynchronous kernel-to-userspace netlink message on a synthetic
+    /// AF_NETLINK fd. POSIX mqueue `SIGEV_THREAD` uses this path: glibc registers
+    /// a NETLINK_ROUTE socket with `mq_notify`, then its helper thread blocks in
+    /// `recvfrom` waiting for the kernel's 32-byte notification record.
+    pub(super) fn enqueue_netlink_message(&self, fd: i32, bytes: &[u8]) -> Result<(), LinuxErrno> {
+        let Some(open_file) = self.open_file(fd) else {
+            return Err(LINUX_EBADF);
+        };
+        let mut open = open_file.description.write();
+        let OpenDescription::Netlink { recv_queue, .. } = &mut *open else {
+            return Err(LINUX_EBADF);
+        };
+        recv_queue.extend(bytes);
+        drop(open);
+        notify_inmem_epoll();
+        Ok(())
     }
 
     fn maybe_queue_dns_response(
@@ -4691,7 +4733,7 @@ impl SyscallDispatcher {
             // AF_NETLINK recv: drain the queued dump reply. The source address
             // (if requested) is the kernel: sockaddr_nl with pid=0.
             if this.fd_is_netlink(fd) {
-                let drained = this.netlink_recv(fd, buf_addr, len, memory);
+                let drained = this.netlink_recv(fd, buf_addr, len, flags, memory);
                 if let DispatchOutcome::Returned { .. } = drained
                     && src_addr != 0
                     && src_len_addr != 0
@@ -5499,7 +5541,13 @@ impl SyscallDispatcher {
         // the source sockaddr_nl (kernel; pid=0), and zero controllen/flags.
         if is_netlink {
             let total: usize = iovecs.iter().map(|iov| iov.iov_len as usize).sum();
+            if total == 0 {
+                return Ok(DispatchOutcome::Returned { value: 0 });
+            }
             let chunk = self.netlink_drain(fd, total);
+            if chunk.is_empty() {
+                return Ok(self.empty_netlink_recv(fd, flags));
+            }
             let n = chunk.len();
             let mut remaining = n;
             let mut cursor = 0usize;

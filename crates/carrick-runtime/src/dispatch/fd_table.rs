@@ -880,8 +880,9 @@ pub(super) enum OpenDescription {
     /// real fd (owned by the description's `host_fd` handle so `close`/`dup`/
     /// `poll` work for free), but the message data lives in the backing file,
     /// guarded by an OFD lock. The mqueue syscalls (`mq_timedsend`/
-    /// `mq_timedreceive`/…) operate on the file by re-opening it through the fd
-    /// here; ordinary `read`/`write` on the fd are EINVAL/EBADF (Linux rejects
+    /// `mq_timedreceive`/…) operate on a hidden hardlink to the backing object,
+    /// so `mq_unlink` can remove the public name while existing descriptors keep
+    /// working; ordinary `read`/`write` on the fd are EINVAL/EBADF (Linux rejects
     /// them on a mqd too).
     Mqueue {
         base: OpenDescriptionBase,
@@ -892,8 +893,9 @@ pub(super) enum OpenDescription {
         /// never be self-re-entrant and the serialization is true across
         /// processes.
         host_fd: HostFdRef,
-        /// Absolute host path of the backing file (under `/tmp/carrick-mqueue/`),
-        /// re-opened per operation for the OFD-locked RMW.
+        /// Absolute host path of the hidden backing object (under
+        /// `/tmp/carrick-mqueue/`), re-opened per operation for the OFD-locked
+        /// RMW.
         path: String,
         /// `mq_msgsize` the queue was created with (a send EMSGSIZEs above it; a
         /// receive EMSGSIZEs below it).
