@@ -5275,6 +5275,17 @@ enum HostWritePayload<'a> {
     Owned(Vec<u8>),
 }
 
+#[derive(Clone)]
+struct HostPipeWriteTarget {
+    host_fd: i32,
+    host_fd_owner: Option<HostFdRef>,
+    nonblocking: bool,
+    write_kind: HostWriteKind,
+    pipe_state: Option<(i64, usize)>,
+    tid: crate::thread::ThreadId,
+    sigpipe_on_epipe: bool,
+}
+
 impl<'a> HostWritePayload<'a> {
     fn as_slice(&self) -> &[u8] {
         match self {
@@ -5292,48 +5303,12 @@ impl<'a> HostWritePayload<'a> {
 }
 
 /// write(2) on a host-backed fd. Same lockless discipline as `read_host_pipe`.
-fn write_host_pipe(
-    bytes: &[u8],
-    host_fd: i32,
-    host_fd_owner: Option<HostFdRef>,
-    nonblocking: bool,
-    write_kind: HostWriteKind,
-    pipe_state: Option<(i64, usize)>,
-    tid: crate::thread::ThreadId,
-    sigpipe_on_epipe: bool,
-) -> DispatchOutcome {
-    write_host_pipe_payload(
-        HostWritePayload::Borrowed(bytes),
-        host_fd,
-        host_fd_owner,
-        nonblocking,
-        write_kind,
-        pipe_state,
-        tid,
-        sigpipe_on_epipe,
-    )
+fn write_host_pipe(bytes: &[u8], target: HostPipeWriteTarget) -> DispatchOutcome {
+    write_host_pipe_payload(HostWritePayload::Borrowed(bytes), target)
 }
 
-fn write_host_pipe_owned(
-    bytes: Vec<u8>,
-    host_fd: i32,
-    host_fd_owner: Option<HostFdRef>,
-    nonblocking: bool,
-    write_kind: HostWriteKind,
-    pipe_state: Option<(i64, usize)>,
-    tid: crate::thread::ThreadId,
-    sigpipe_on_epipe: bool,
-) -> DispatchOutcome {
-    write_host_pipe_payload(
-        HostWritePayload::Owned(bytes),
-        host_fd,
-        host_fd_owner,
-        nonblocking,
-        write_kind,
-        pipe_state,
-        tid,
-        sigpipe_on_epipe,
-    )
+fn write_host_pipe_owned(bytes: Vec<u8>, target: HostPipeWriteTarget) -> DispatchOutcome {
+    write_host_pipe_payload(HostWritePayload::Owned(bytes), target)
 }
 
 fn host_pipe_write_room(capacity: i64, queued: usize) -> Option<usize> {
@@ -5343,14 +5318,18 @@ fn host_pipe_write_room(capacity: i64, queued: usize) -> Option<usize> {
 
 fn write_host_pipe_payload(
     payload: HostWritePayload<'_>,
-    host_fd: i32,
-    host_fd_owner: Option<HostFdRef>,
-    nonblocking: bool,
-    write_kind: HostWriteKind,
-    pipe_state: Option<(i64, usize)>,
-    tid: crate::thread::ThreadId,
-    sigpipe_on_epipe: bool,
+    target: HostPipeWriteTarget,
 ) -> DispatchOutcome {
+    let HostPipeWriteTarget {
+        host_fd,
+        host_fd_owner,
+        nonblocking,
+        write_kind,
+        pipe_state,
+        tid,
+        sigpipe_on_epipe,
+    } = target;
+
     #[cfg(feature = "trace-io")]
     if !payload.as_slice().is_empty() {
         let bytes = payload.as_slice();
@@ -6046,13 +6025,15 @@ mod overlay_dispatch_tests {
         let bytes = vec![0xA5; 4 * 1024 * 1024];
         let outcome = write_host_pipe(
             &bytes,
-            fds[1],
-            None,
-            false,
-            HostWriteKind::PipeLike,
-            None,
-            crate::thread::ThreadId::synthetic_for_tests(0x7FFE_0101),
-            true,
+            HostPipeWriteTarget {
+                host_fd: fds[1],
+                host_fd_owner: None,
+                nonblocking: false,
+                write_kind: HostWriteKind::PipeLike,
+                pipe_state: None,
+                tid: crate::thread::ThreadId::synthetic_for_tests(0x7FFE_0101),
+                sigpipe_on_epipe: true,
+            },
         );
 
         unsafe {
@@ -6100,13 +6081,15 @@ mod overlay_dispatch_tests {
         let bytes = vec![0x5A; 64 * 1024];
         let outcome = write_host_pipe(
             &bytes,
-            fds[1],
-            None,
-            true,
-            HostWriteKind::PipeLike,
-            None,
-            crate::thread::ThreadId::synthetic_for_tests(0x7FFE_0103),
-            false,
+            HostPipeWriteTarget {
+                host_fd: fds[1],
+                host_fd_owner: None,
+                nonblocking: true,
+                write_kind: HostWriteKind::PipeLike,
+                pipe_state: None,
+                tid: crate::thread::ThreadId::synthetic_for_tests(0x7FFE_0103),
+                sigpipe_on_epipe: false,
+            },
         );
 
         unsafe {
@@ -6155,13 +6138,15 @@ mod overlay_dispatch_tests {
         let bytes = vec![0x5A; 64 * 1024];
         let outcome = write_host_pipe(
             &bytes,
-            fds[0],
-            None,
-            true,
-            HostWriteKind::SocketLike,
-            None,
-            crate::thread::ThreadId::synthetic_for_tests(0x7FFE_0104),
-            false,
+            HostPipeWriteTarget {
+                host_fd: fds[0],
+                host_fd_owner: None,
+                nonblocking: true,
+                write_kind: HostWriteKind::SocketLike,
+                pipe_state: None,
+                tid: crate::thread::ThreadId::synthetic_for_tests(0x7FFE_0104),
+                sigpipe_on_epipe: false,
+            },
         );
 
         unsafe {
