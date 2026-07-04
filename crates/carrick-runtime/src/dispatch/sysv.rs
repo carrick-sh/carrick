@@ -182,6 +182,8 @@ const MSG_QUEUE_VERSION: u32 = 1;
 const MSG_QUEUE_HEADER_SIZE: usize = 128;
 const MSG_RECORD_HEADER_SIZE: usize = 16;
 const MSG_QUEUE_COMPACT_HEAD_THRESHOLD: usize = 64 * 1024;
+const MSG_QUEUE_WAIT_WORD_BYTES: usize = std::mem::size_of::<std::sync::atomic::AtomicU32>();
+const MSG_QUEUE_WAIT_SLICE_US: u32 = 20_000;
 
 const MSG_OFF_MAGIC: usize = 0;
 const MSG_OFF_VERSION: usize = 4;
@@ -625,6 +627,7 @@ struct SysvIpcService;
 impl SysvIpcService {
     fn after_fork_child() {
         MSG_QUEUE_FD_CACHE.with(|cache| cache.borrow_mut().refresh_for_current_process());
+        MSG_QUEUE_WAIT_WORD_CACHE.with(|cache| cache.borrow_mut().refresh_for_current_process());
     }
 
     fn cleanup_process_exit(state: &mut SysvShmState) {
@@ -958,6 +961,12 @@ fn msg_queue_path_for_id(id: MsgQueueId) -> PathBuf {
     PathBuf::from(SHM_DIR).join(format!("{}-msg-id-{}", sysv_run_scope(), id.raw() as u32))
 }
 
+fn msg_queue_wait_path(path: &Path) -> PathBuf {
+    let mut out = path.as_os_str().to_os_string();
+    out.push(".wait");
+    PathBuf::from(out)
+}
+
 fn msg_queue_id_from_stat(st: &libc::stat) -> MsgQueueId {
     MsgQueueId((st.st_ino as i32).max(1))
 }
@@ -976,13 +985,23 @@ fn msg_queue_scope_prefix() -> String {
 fn is_msg_queue_path(path: &std::path::Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with(&msg_queue_scope_prefix()) && !name.ends_with(".wait"))
+}
+
+fn is_msg_queue_artifact_path(path: &std::path::Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
         .is_some_and(|name| name.starts_with(&msg_queue_scope_prefix()))
 }
 
 fn is_msg_queue_id_path(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| name.starts_with(&msg_queue_scope_prefix()) && name.contains("-id-"))
+        .is_some_and(|name| {
+            name.starts_with(&msg_queue_scope_prefix())
+                && name.contains("-id-")
+                && !name.ends_with(".wait")
+        })
 }
 
 fn read_exact_at_fd(fd: i32, buf: &mut [u8], offset: libc::off_t) -> Result<(), LinuxErrno> {
@@ -1079,7 +1098,7 @@ fn cleanup_msg_queue_files_for_scope() {
     if let Ok(entries) = std::fs::read_dir(SHM_DIR) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if is_msg_queue_path(&path) {
+            if is_msg_queue_artifact_path(&path) {
                 let _ = std::fs::remove_file(path);
             }
         }
@@ -1446,6 +1465,182 @@ impl Drop for MsgQueueLock {
             unsafe { libc::close(self.fd) };
         }
     }
+}
+
+#[derive(Debug)]
+struct MsgQueueWaitWord {
+    ptr: std::ptr::NonNull<std::sync::atomic::AtomicU32>,
+    len: usize,
+    fd: i32,
+    queue_identity: CachedMsgQueueIdentity,
+}
+
+impl MsgQueueWaitWord {
+    fn open(queue_path: &Path) -> Result<Self, LinuxErrno> {
+        let queue_identity = msg_queue_identity(queue_path)?;
+        let wait_path = msg_queue_wait_path(queue_path);
+        let cpath = std::ffi::CString::new(wait_path.as_os_str().as_encoded_bytes())
+            .map_err(|_| LINUX_EINVAL)?;
+        let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDWR | libc::O_CREAT, 0o600) }
+            .host_syscall_errno()?;
+        if let Err(errno) = unsafe { libc::ftruncate(fd, MSG_QUEUE_WAIT_WORD_BYTES as libc::off_t) }
+            .host_syscall_errno()
+        {
+            unsafe { libc::close(fd) };
+            return Err(errno);
+        }
+        let mapped = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                MSG_QUEUE_WAIT_WORD_BYTES,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            )
+        };
+        if mapped == libc::MAP_FAILED {
+            unsafe { libc::close(fd) };
+            return Err(LINUX_EINVAL);
+        }
+        let Some(ptr) = std::ptr::NonNull::new(mapped.cast::<std::sync::atomic::AtomicU32>())
+        else {
+            unsafe {
+                libc::munmap(mapped, MSG_QUEUE_WAIT_WORD_BYTES);
+                libc::close(fd);
+            }
+            return Err(LINUX_EINVAL);
+        };
+        Ok(Self {
+            ptr,
+            len: MSG_QUEUE_WAIT_WORD_BYTES,
+            fd,
+            queue_identity,
+        })
+    }
+
+    fn addr(&self) -> usize {
+        self.ptr.as_ptr() as usize
+    }
+
+    fn load(&self) -> u32 {
+        unsafe { self.ptr.as_ref() }.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn wake_all(&self) {
+        unsafe { self.ptr.as_ref() }.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let _ = carrick_host::ulock::wake(self.addr(), true);
+    }
+}
+
+impl Drop for MsgQueueWaitWord {
+    fn drop(&mut self) {
+        unsafe {
+            libc::munmap(self.ptr.as_ptr().cast(), self.len);
+            libc::close(self.fd);
+        }
+    }
+}
+
+#[derive(Debug)]
+struct MsgQueueWaitWordCache {
+    host_pid: libc::pid_t,
+    entries: HashMap<PathBuf, MsgQueueWaitWord>,
+}
+
+impl MsgQueueWaitWordCache {
+    fn new() -> Self {
+        Self {
+            host_pid: unsafe { libc::getpid() },
+            entries: HashMap::new(),
+        }
+    }
+
+    fn refresh_for_current_process(&mut self) {
+        let host_pid = unsafe { libc::getpid() };
+        if self.host_pid == host_pid {
+            return;
+        }
+        self.entries.clear();
+        self.host_pid = host_pid;
+    }
+
+    fn get(&mut self, queue_path: &Path) -> Result<&MsgQueueWaitWord, LinuxErrno> {
+        self.refresh_for_current_process();
+        let queue_identity = msg_queue_identity(queue_path)?;
+        let wait_path = msg_queue_wait_path(queue_path);
+        let needs_open = self
+            .entries
+            .get(&wait_path)
+            .is_none_or(|entry| entry.queue_identity != queue_identity);
+        if needs_open {
+            self.entries
+                .insert(wait_path.clone(), MsgQueueWaitWord::open(queue_path)?);
+        }
+        self.entries.get(&wait_path).ok_or(LINUX_EINVAL)
+    }
+
+    fn remove(&mut self, queue_path: &Path) {
+        self.entries.remove(&msg_queue_wait_path(queue_path));
+    }
+}
+
+thread_local! {
+    static MSG_QUEUE_WAIT_WORD_CACHE: RefCell<MsgQueueWaitWordCache> =
+        RefCell::new(MsgQueueWaitWordCache::new());
+}
+
+fn with_cached_msg_queue_wait_word<R>(
+    queue_path: &Path,
+    f: impl FnOnce(&MsgQueueWaitWord) -> R,
+) -> Result<R, LinuxErrno> {
+    MSG_QUEUE_WAIT_WORD_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        cache.get(queue_path).map(f)
+    })
+}
+
+fn remove_cached_msg_queue_wait_word(queue_path: &Path) {
+    MSG_QUEUE_WAIT_WORD_CACHE.with(|cache| cache.borrow_mut().remove(queue_path));
+}
+
+struct MsgQueueWaitToken {
+    word: MsgQueueWaitWord,
+    observed: u32,
+}
+
+impl MsgQueueWaitToken {
+    fn for_queue(id: MsgQueueId) -> Result<Self, LinuxErrno> {
+        let path = lookup_msg_queue_path(id)?;
+        let word = MsgQueueWaitWord::open(&path)?;
+        let observed = word.load();
+        Ok(Self { word, observed })
+    }
+
+    fn wait_until_changed(&self, interrupted: impl Fn() -> bool) -> Result<(), LinuxErrno> {
+        loop {
+            if interrupted() {
+                return Err(LINUX_EINTR);
+            }
+            if self.word.load() != self.observed {
+                return Ok(());
+            }
+            let rc =
+                carrick_host::ulock::wait(self.word.addr(), self.observed, MSG_QUEUE_WAIT_SLICE_US);
+            if rc >= 0 {
+                continue;
+            }
+            let errno = (-rc) as i32;
+            if errno == libc::ETIMEDOUT || errno == libc::EINTR {
+                continue;
+            }
+            return Ok(());
+        }
+    }
+}
+
+fn wake_msg_queue_waiters(path: &Path) {
+    let _ = with_cached_msg_queue_wait_word(path, MsgQueueWaitWord::wake_all);
 }
 
 fn with_shm_nattch_file<R>(
@@ -2247,7 +2442,26 @@ impl SyscallDispatcher {
                         if sysv_msg_wait_interrupted(this, tid) {
                             return Ok(DispatchOutcome::errno(LINUX_EINTR));
                         }
-                        std::thread::sleep(std::time::Duration::from_millis(2));
+                        if let Ok(token) = MsgQueueWaitToken::for_queue(msqid) {
+                            match SysvIpcService::msgsnd(msqid, &creds, msg_type, &payload) {
+                                Ok(true) => return Ok(DispatchOutcome::Returned { value: 0 }),
+                                Ok(false) => {
+                                    if let Err(errno) =
+                                        token.wait_until_changed(|| sysv_msg_wait_interrupted(this, tid))
+                                    {
+                                        return Ok(DispatchOutcome::errno(errno));
+                                    }
+                                }
+                                Err(errno) if errno == LINUX_EINVAL && saw_would_block => {
+                                    return Ok(DispatchOutcome::errno(
+                                        crate::linux_abi::LINUX_EIDRM,
+                                    ));
+                                }
+                                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                            }
+                        } else {
+                            std::thread::yield_now();
+                        }
                     }
                     Err(errno) if errno == LINUX_EINVAL && saw_would_block => {
                         return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIDRM));
@@ -2298,7 +2512,31 @@ impl SyscallDispatcher {
                         if sysv_msg_wait_interrupted(this, tid) {
                             return Ok(DispatchOutcome::errno(LINUX_EINTR));
                         }
-                        std::thread::sleep(std::time::Duration::from_millis(2));
+                        if let Ok(token) = MsgQueueWaitToken::for_queue(msqid) {
+                            match SysvIpcService::msgrcv(cx, msqid, &creds, msgp.0, sz, msgtyp, flags)
+                            {
+                                Ok(Some(received)) => {
+                                    return Ok(DispatchOutcome::Returned {
+                                        value: received as i64,
+                                    });
+                                }
+                                Ok(None) => {
+                                    if let Err(errno) =
+                                        token.wait_until_changed(|| sysv_msg_wait_interrupted(this, tid))
+                                    {
+                                        return Ok(DispatchOutcome::errno(errno));
+                                    }
+                                }
+                                Err(errno) if errno == LINUX_EINVAL && saw_would_block => {
+                                    return Ok(DispatchOutcome::errno(
+                                        crate::linux_abi::LINUX_EIDRM,
+                                    ));
+                                }
+                                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                            }
+                        } else {
+                            std::thread::yield_now();
+                        }
                     }
                     Err(errno) if errno == LINUX_EINVAL && saw_would_block => {
                         return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIDRM));
@@ -2544,6 +2782,7 @@ fn msg_queue_try_send(
         return Ok(false);
     }
     lock.append_message(&queue, head, file_size, msg_type, payload)?;
+    wake_msg_queue_waiters(&path);
     Ok(true)
 }
 
@@ -2627,6 +2866,7 @@ fn msg_queue_receive<M: GuestMemory>(
         }
         if !flags.contains(MsgOpFlags::COPY) {
             lock.consume_head_message(&queue_header, next_head, head_message.payload.len())?;
+            wake_msg_queue_waiters(&path);
         }
         return Ok(Some(copy_len));
     }
@@ -2666,6 +2906,7 @@ fn msg_queue_receive<M: GuestMemory>(
         queue.rtime = unix_now_secs();
         queue.lrpid = crate::namespace::pid::self_ns_pid() as i32;
         lock.write_queue(&queue)?;
+        wake_msg_queue_waiters(&path);
     }
     Ok(Some(copy_len))
 }
@@ -2808,7 +3049,10 @@ fn sysv_msgctl<M: GuestMemory>(
                     return Err(LINUX_EPERM);
                 }
             }
+            wake_msg_queue_waiters(&path);
+            remove_cached_msg_queue_wait_word(&path);
             let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(msg_queue_wait_path(&path));
             this.sysv.lock().message_queues.remove(&msqid);
             Ok(DispatchOutcome::Returned { value: 0 })
         }
