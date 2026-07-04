@@ -2809,6 +2809,7 @@ pub const LINUX_RLIMIT_DATA: u64 = 2;
 pub const LINUX_RLIMIT_STACK: u64 = 3;
 pub const LINUX_RLIMIT_NPROC: u64 = 6;
 pub const LINUX_RLIMIT_NOFILE: u64 = 7;
+pub const LINUX_RLIMIT_MEMLOCK: u64 = 8;
 pub const LINUX_RLIMIT_AS: u64 = 9;
 pub const LINUX_RLIM_NLIMITS: u64 = 16;
 pub const LINUX_RUSAGE_SELF: i32 = 0;
@@ -3230,6 +3231,22 @@ bitflags! {
         const HUGETLB = LINUX_MAP_HUGETLB;
         const FIXED_NOREPLACE = LINUX_MAP_FIXED_NOREPLACE;
         const DROPPABLE = LINUX_MAP_DROPPABLE;
+    }
+
+    /// `mlock2(2)` flag bits. The full supported set is just MLOCK_ONFAULT, so
+    /// `from_bits(...)` returning `None` is the Linux unknown-flag EINVAL path.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct LinuxMlock2Flags: u64 {
+        const ONFAULT = 0x01;
+    }
+
+    /// `mlockall(2)` flag bits. `MCL_ONFAULT` has a semantic precondition
+    /// checked by the dispatcher: it must be paired with CURRENT and/or FUTURE.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct LinuxMlockallFlags: u64 {
+        const CURRENT = LINUX_MCL_CURRENT;
+        const FUTURE = LINUX_MCL_FUTURE;
+        const ONFAULT = LINUX_MCL_ONFAULT;
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]

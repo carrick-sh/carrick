@@ -97,6 +97,14 @@ fn build_itimerspec_ns(spec: TimerSpecNs) -> LinuxItimerspec {
 }
 
 impl SyscallDispatcher {
+    pub(crate) fn effective_resource_limit(&self, resource: u64) -> LinuxRlimit {
+        let nofile_soft = self
+            .io
+            .nofile_soft
+            .load(std::sync::atomic::Ordering::Relaxed);
+        effective_rlimit(resource, nofile_soft, &self.proc.lock().rlimit_overrides)
+    }
+
     define_syscall! {
         fn timerfd_create(this, cx, clock_id: u64, flags: u64) {
             if linux_clock_duration(clock_id).is_none()

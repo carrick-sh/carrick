@@ -2227,6 +2227,7 @@ impl SyscallDispatcher {
             network: Some(&self.network.spec),
             auxv: Some(mem.linux_auxv_image.as_slice()),
             address_space_regions: address_space_regions.as_deref(),
+            locked_memory: Some(mem.locked_ranges.as_slice()),
             brk_current: mem.brk_current,
             mmap_next: mem.mmap_next,
             ruid: creds.ruid,

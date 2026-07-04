@@ -62,6 +62,8 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use carrick_guest_mem::GuestVa;
+
 use crate::linux_abi::{LINUX_EACCES, LINUX_ENOENT, LINUX_ENOTDIR, LINUX_EROFS, LinuxErrno};
 use crate::memory::{
     LINUX_EL0_TRAMPOLINE_BASE, LINUX_EL1_VECTORS_BASE, LINUX_HEAP_BASE, LINUX_HEAP_SIZE,
@@ -109,6 +111,36 @@ pub enum GuestReportedArch {
     X86_64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuestMemoryRange {
+    start: GuestVa,
+    end: GuestVa,
+}
+
+impl GuestMemoryRange {
+    pub fn new(start: GuestVa, end: GuestVa) -> Option<Self> {
+        (start < end).then_some(Self { start, end })
+    }
+
+    pub fn start(self) -> GuestVa {
+        self.start
+    }
+
+    pub fn end(self) -> GuestVa {
+        self.end
+    }
+
+    pub fn len(self) -> u64 {
+        self.end.raw().saturating_sub(self.start.raw())
+    }
+
+    fn overlap_bytes(self, start: u64, end: u64) -> u64 {
+        let lo = self.start.raw().max(start);
+        let hi = self.end.raw().min(end);
+        hi.saturating_sub(lo)
+    }
+}
+
 /// Minimal live state needed by synthetic `/proc` renderers.
 #[derive(Debug, Clone, Default)]
 pub struct SyntheticProcContext {
@@ -131,6 +163,7 @@ pub struct SyntheticProcContext {
     /// guest received on its stack, surfaced verbatim via `/proc/self/auxv`.
     pub auxv: Vec<u8>,
     pub address_space_regions: Option<Vec<ProcMapsEntry>>,
+    pub locked_memory: Vec<GuestMemoryRange>,
     pub brk_current: u64,
     pub mmap_next: u64,
     pub ruid: u32,
@@ -1747,6 +1780,7 @@ impl Vfs for ProcVfs {
             network: ctx.network.cloned().unwrap_or_default(),
             auxv: ctx.auxv.unwrap_or(&[]).to_vec(),
             address_space_regions: ctx.address_space_regions.map(|regions| regions.to_vec()),
+            locked_memory: ctx.locked_memory.unwrap_or(&[]).to_vec(),
             brk_current: ctx.brk_current,
             mmap_next: ctx.mmap_next,
             ruid: ctx.ruid,
@@ -2183,6 +2217,7 @@ fn synthetic_proc_self_status(ctx: &SyntheticProcContext) -> String {
     // set — capability-probing tools (apt/dpkg/setpriv) refuse to proceed if
     // they think they hold nothing (docs/namespaces-design.md §4.4).
     let cap_lines = crate::namespace::process::cap_status_lines();
+    let locked_kb = locked_memory_kb(ctx);
     format!(
         "Name:\t{comm}\n\
 Umask:\t0022\n\
@@ -2198,7 +2233,7 @@ FDSize:\t256\n\
 Groups:\t{groups}\n\
 VmPeak:\t{peak_kb:>8} kB\n\
 VmSize:\t{vsize_kb:>8} kB\n\
-VmLck:\t       0 kB\n\
+VmLck:\t{locked_kb:>8} kB\n\
 VmPin:\t       0 kB\n\
 VmHWM:\t{hwm_kb:>8} kB\n\
 VmRSS:\t{rss_kb:>8} kB\n\
@@ -2724,23 +2759,40 @@ fn synthetic_proc_self_mountinfo() -> &'static [u8] {
 28 26 0:28 / /dev/shm rw,nosuid,nodev - tmpfs shm rw\n"
 }
 
+fn locked_memory_kb(ctx: &SyntheticProcContext) -> u64 {
+    ctx.locked_memory
+        .iter()
+        .map(|range| range.len())
+        .sum::<u64>()
+        / 1024
+}
+
+fn locked_memory_overlap_kb(ctx: &SyntheticProcContext, start: u64, end: u64) -> u64 {
+    ctx.locked_memory
+        .iter()
+        .map(|range| range.overlap_bytes(start, end))
+        .sum::<u64>()
+        / 1024
+}
+
 /// The standard per-VMA smaps field block (proc(5)). The kB values are
-/// approximate (carrick has no per-page residency accounting); the LABELS and
-/// ordering are what memory profilers parse. `size_kb` is the VMA extent.
-fn smaps_region_fields(size_kb: u64) -> String {
+/// approximate; locked pages are reported as resident because Linux's mlock
+/// contract makes those pages resident and LTP checks that exact relationship.
+/// `size_kb` is the VMA extent.
+fn smaps_region_fields(size_kb: u64, locked_kb: u64) -> String {
     let pg = crate::linux_abi::LINUX_PAGE_SIZE / 1024;
     format!(
         "Size:           {size_kb:>8} kB\n\
 KernelPageSize: {pg:>8} kB\n\
 MMUPageSize:    {pg:>8} kB\n\
-Rss:                   0 kB\n\
-Pss:                   0 kB\n\
+Rss:            {locked_kb:>8} kB\n\
+Pss:            {locked_kb:>8} kB\n\
 Pss_Dirty:             0 kB\n\
 Shared_Clean:          0 kB\n\
 Shared_Dirty:          0 kB\n\
 Private_Clean:         0 kB\n\
 Private_Dirty:         0 kB\n\
-Referenced:            0 kB\n\
+Referenced:     {locked_kb:>8} kB\n\
 Anonymous:             0 kB\n\
 LazyFree:              0 kB\n\
 AnonHugePages:         0 kB\n\
@@ -2750,22 +2802,22 @@ Shared_Hugetlb:        0 kB\n\
 Private_Hugetlb:       0 kB\n\
 Swap:                  0 kB\n\
 SwapPss:               0 kB\n\
-Locked:                0 kB\n\
+Locked:         {locked_kb:>8} kB\n\
 VmFlags: rd mr mw me\n"
     )
 }
 
-/// Parse the `start-end ...` of one `/proc/self/maps` line into its size in kB.
-fn maps_line_size_kb(line: &str) -> u64 {
+/// Parse the `start-end ...` of one `/proc/self/maps` line.
+fn maps_line_range(line: &str) -> Option<(u64, u64)> {
     let Some(range) = line.split_whitespace().next() else {
-        return 0;
+        return None;
     };
     let Some((lo, hi)) = range.split_once('-') else {
-        return 0;
+        return None;
     };
     match (u64::from_str_radix(lo, 16), u64::from_str_radix(hi, 16)) {
-        (Ok(lo), Ok(hi)) => hi.saturating_sub(lo) / 1024,
-        _ => 0,
+        (Ok(lo), Ok(hi)) => Some((lo, hi)),
+        _ => None,
     }
 }
 
@@ -2778,7 +2830,14 @@ fn synthetic_proc_smaps(ctx: &SyntheticProcContext) -> String {
     for line in maps.lines() {
         out.push_str(line);
         out.push('\n');
-        out.push_str(&smaps_region_fields(maps_line_size_kb(line)));
+        let (size_kb, locked_kb) = match maps_line_range(line) {
+            Some((start, end)) => (
+                end.saturating_sub(start) / 1024,
+                locked_memory_overlap_kb(ctx, start, end),
+            ),
+            None => (0, 0),
+        };
+        out.push_str(&smaps_region_fields(size_kb, locked_kb));
     }
     out
 }
@@ -2788,10 +2847,10 @@ fn synthetic_proc_smaps(ctx: &SyntheticProcContext) -> String {
 fn synthetic_proc_smaps_rollup(ctx: &SyntheticProcContext) -> String {
     let host = crate::host_proc::self_resource_usage().unwrap_or_default();
     let rss_kb = host.resident_bytes / 1024;
+    let locked_kb = locked_memory_kb(ctx);
     // The rollup header spans the whole user address range, ending at the
     // reported stack top, mirroring what the kernel emits.
     let hi = LINUX_STACK_TOP;
-    let _ = ctx;
     format!(
         "{:016x}-{hi:016x} ---p 00000000 00:00 0                          [rollup]\n\
 Rss:            {rss_kb:>8} kB\n\
@@ -2814,7 +2873,7 @@ Shared_Hugetlb:        0 kB\n\
 Private_Hugetlb:       0 kB\n\
 Swap:                  0 kB\n\
 SwapPss:               0 kB\n\
-Locked:                0 kB\n",
+Locked:         {locked_kb:>8} kB\n",
         0u64,
     )
 }

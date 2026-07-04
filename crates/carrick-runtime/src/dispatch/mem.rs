@@ -71,6 +71,7 @@ syscall_table! {
     232 => mincore,
     233 => madvise,
     234 => remap_file_pages,
+    284 => mlock2,
     425 => io_uring_setup,
     426 => io_uring_enter,
     427 => io_uring_register,
@@ -130,6 +131,19 @@ pub(super) struct MemState {
     /// Ranges inside mapped files where Linux delivers SIGBUS on access: pages
     /// wholly beyond the backing file's EOF for a MAP_SHARED file mapping.
     pub bus_fault_ranges: Vec<(u64, u64)>,
+    /// Page-rounded guest virtual ranges currently counted as mlocked. Stored as
+    /// typed guest-VA ranges so `/proc` accounting cannot mix them with host or
+    /// physical addresses.
+    pub locked_ranges: Vec<crate::vfs::GuestMemoryRange>,
+    /// Guest-page resident ranges for Carrick-managed mappings where host
+    /// `mincore` is too coarse (notably 4 KiB Linux pages on a 16 KiB Darwin
+    /// host page).
+    pub resident_ranges: Vec<crate::vfs::GuestMemoryRange>,
+    /// Ranges whose `mincore` answer is derived from `resident_ranges`.
+    pub resident_tracked_ranges: Vec<crate::vfs::GuestMemoryRange>,
+    /// Shared-anon ranges that should fault once per guest page to become
+    /// resident, with the protection to restore after that first touch.
+    resident_fault_ranges: Vec<ResidentFaultRange>,
     /// MAP_GROWSDOWN VMAs that may expand downward on a stack fault:
     /// `(low_bound, current_start, end)`.
     pub growdown_ranges: Vec<(u64, u64, u64)>,
@@ -161,6 +175,10 @@ impl MemState {
             dynamic_maps: Vec::new(),
             remap_snapshots: std::collections::HashMap::new(),
             bus_fault_ranges: Vec::new(),
+            locked_ranges: Vec::new(),
+            resident_ranges: Vec::new(),
+            resident_tracked_ranges: Vec::new(),
+            resident_fault_ranges: Vec::new(),
             growdown_ranges: Vec::new(),
             linux_auxv_image: Vec::new(),
         }
@@ -173,6 +191,12 @@ impl MemState {
         self.address_space_regions = address_space_regions;
         self.linux_auxv_image = linux_auxv_image;
     }
+}
+
+#[derive(Clone, Copy)]
+struct ResidentFaultRange {
+    range: crate::vfs::GuestMemoryRange,
+    prot: LinuxProtFlags,
 }
 
 /// Insert `[addr, addr+len)` into `regions` (sorted by start), coalescing any
@@ -202,6 +226,246 @@ fn free_regions_insert(regions: &mut Vec<(u64, u64)>, addr: u64, len: u64) {
     }
     out.sort_by_key(|&(s, _)| s);
     *regions = out;
+}
+
+fn page_rounded_range(
+    address: GuestPtr,
+    length: u64,
+) -> Result<Option<crate::vfs::GuestMemoryRange>, LinuxErrno> {
+    if length == 0 {
+        return Ok(None);
+    }
+    let start = GuestVa(address.0 & !(LINUX_PAGE_SIZE - 1));
+    let end = address
+        .0
+        .checked_add(length)
+        .and_then(|end| end.checked_add(LINUX_PAGE_SIZE - 1))
+        .map(|end| GuestVa(end & !(LINUX_PAGE_SIZE - 1)))
+        .ok_or(LINUX_ENOMEM)?;
+    crate::vfs::GuestMemoryRange::new(start, end)
+        .map(Some)
+        .ok_or(LINUX_ENOMEM)
+}
+
+fn range_len_usize(range: crate::vfs::GuestMemoryRange) -> Result<usize, LinuxErrno> {
+    usize::try_from(range.len()).map_err(|_| LINUX_ENOMEM)
+}
+
+fn validate_mlock_range(
+    memory: &mut impl GuestMemory,
+    range: crate::vfs::GuestMemoryRange,
+    populate: bool,
+) -> Result<(), LinuxErrno> {
+    let len = range_len_usize(range)?;
+    if !populate && memory.host_ptr_for_read(range.start().raw(), len).is_some() {
+        return Ok(());
+    }
+    let mut page = range.start().raw();
+    while page < range.end().raw() {
+        if memory.read_bytes(page, 1).is_err() {
+            return Err(LINUX_ENOMEM);
+        }
+        page = page.checked_add(LINUX_PAGE_SIZE).ok_or(LINUX_ENOMEM)?;
+    }
+    Ok(())
+}
+
+fn locked_ranges_insert(
+    ranges: &mut Vec<crate::vfs::GuestMemoryRange>,
+    range: crate::vfs::GuestMemoryRange,
+) {
+    ranges.push(range);
+    ranges.sort_by_key(|range| range.start());
+    let mut merged: Vec<crate::vfs::GuestMemoryRange> = Vec::with_capacity(ranges.len());
+    for range in ranges.drain(..) {
+        if let Some(last) = merged.last_mut()
+            && range.start().raw() <= last.end().raw()
+        {
+            let end = GuestVa(last.end().raw().max(range.end().raw()));
+            if let Some(coalesced) = crate::vfs::GuestMemoryRange::new(last.start(), end) {
+                *last = coalesced;
+            }
+            continue;
+        }
+        merged.push(range);
+    }
+    *ranges = merged;
+}
+
+fn locked_ranges_remove(
+    ranges: &mut Vec<crate::vfs::GuestMemoryRange>,
+    remove: crate::vfs::GuestMemoryRange,
+) {
+    let mut out = Vec::with_capacity(ranges.len());
+    for range in ranges.drain(..) {
+        if remove.end() <= range.start() || remove.start() >= range.end() {
+            out.push(range);
+            continue;
+        }
+        if remove.start() > range.start()
+            && let Some(left) = crate::vfs::GuestMemoryRange::new(range.start(), remove.start())
+        {
+            out.push(left);
+        }
+        if remove.end() < range.end()
+            && let Some(right) = crate::vfs::GuestMemoryRange::new(remove.end(), range.end())
+        {
+            out.push(right);
+        }
+    }
+    *ranges = out;
+}
+
+fn locked_ranges_total(ranges: &[crate::vfs::GuestMemoryRange]) -> u64 {
+    ranges.iter().map(|range| range.len()).sum()
+}
+
+fn ranges_cover(
+    ranges: &[crate::vfs::GuestMemoryRange],
+    requested: crate::vfs::GuestMemoryRange,
+) -> bool {
+    let mut cursor = requested.start().raw();
+    for range in ranges {
+        if range.end().raw() <= cursor {
+            continue;
+        }
+        if range.start().raw() > cursor {
+            return false;
+        }
+        cursor = cursor.max(range.end().raw());
+        if cursor >= requested.end().raw() {
+            return true;
+        }
+    }
+    false
+}
+
+fn ranges_contain_page(ranges: &[crate::vfs::GuestMemoryRange], page: u64) -> bool {
+    ranges
+        .iter()
+        .any(|range| page >= range.start().raw() && page < range.end().raw())
+}
+
+fn exact_residency(
+    tracked: &[crate::vfs::GuestMemoryRange],
+    resident: &[crate::vfs::GuestMemoryRange],
+    address: u64,
+    pages: u64,
+) -> Option<Vec<u8>> {
+    let length = pages.checked_mul(LINUX_PAGE_SIZE)?;
+    let requested =
+        crate::vfs::GuestMemoryRange::new(GuestVa(address), GuestVa(address.checked_add(length)?))?;
+    if !ranges_cover(tracked, requested) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(usize::try_from(pages).ok()?);
+    for index in 0..pages {
+        let page = address.checked_add(index.checked_mul(LINUX_PAGE_SIZE)?)?;
+        out.push(u8::from(ranges_contain_page(resident, page)));
+    }
+    Some(out)
+}
+
+fn remove_fault_range(ranges: &mut Vec<ResidentFaultRange>, remove: crate::vfs::GuestMemoryRange) {
+    let mut out = Vec::with_capacity(ranges.len());
+    for fault in ranges.drain(..) {
+        let range = fault.range;
+        if remove.end() <= range.start() || remove.start() >= range.end() {
+            out.push(fault);
+            continue;
+        }
+        if remove.start() > range.start()
+            && let Some(left) = crate::vfs::GuestMemoryRange::new(range.start(), remove.start())
+        {
+            out.push(ResidentFaultRange {
+                range: left,
+                prot: fault.prot,
+            });
+        }
+        if remove.end() < range.end()
+            && let Some(right) = crate::vfs::GuestMemoryRange::new(remove.end(), range.end())
+        {
+            out.push(ResidentFaultRange {
+                range: right,
+                prot: fault.prot,
+            });
+        }
+    }
+    *ranges = out;
+}
+
+fn fault_range_intersections(
+    ranges: &[ResidentFaultRange],
+    populate: crate::vfs::GuestMemoryRange,
+) -> Vec<ResidentFaultRange> {
+    ranges
+        .iter()
+        .filter_map(|fault| {
+            let start = fault.range.start().raw().max(populate.start().raw());
+            let end = fault.range.end().raw().min(populate.end().raw());
+            crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(end)).map(|range| {
+                ResidentFaultRange {
+                    range,
+                    prot: fault.prot,
+                }
+            })
+        })
+        .collect()
+}
+
+fn host_page_size() -> u64 {
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page <= 0 {
+        LINUX_PAGE_SIZE
+    } else {
+        page as u64
+    }
+}
+
+fn align_down_runtime(value: u64, alignment: u64) -> u64 {
+    value - value % alignment
+}
+
+fn align_up_runtime(value: u64, alignment: u64) -> Option<u64> {
+    let rem = value % alignment;
+    if rem == 0 {
+        Some(value)
+    } else {
+        value.checked_add(alignment - rem)
+    }
+}
+
+fn mincore_residency(memory: &impl GuestMemory, address: u64, length: u64) -> Option<Vec<u8>> {
+    let len = usize::try_from(length).ok()?;
+    let ptr = memory.host_ptr_for_read(address, len)?;
+    let guest_pages = length.div_ceil(LINUX_PAGE_SIZE);
+    let mut guest_resident = vec![0u8; usize::try_from(guest_pages).ok()?];
+    let host_page = host_page_size();
+    let ptr_addr = ptr.addr() as u64;
+    let host_start = align_down_runtime(ptr_addr, host_page);
+    let host_prefix = ptr_addr.checked_sub(host_start)?;
+    let host_scan = align_up_runtime(host_prefix.checked_add(length)?, host_page)?;
+    let host_pages = host_scan.div_ceil(host_page);
+    let mut host_resident = vec![0u8; usize::try_from(host_pages).ok()?];
+    let host_len = usize::try_from(host_scan).ok()?;
+    #[cfg(target_os = "linux")]
+    let vec_ptr = host_resident.as_mut_ptr() as *mut libc::c_uchar;
+    #[cfg(not(target_os = "linux"))]
+    let vec_ptr = host_resident.as_mut_ptr() as *mut libc::c_char;
+    let rc = unsafe { libc::mincore(host_start as *mut libc::c_void, host_len, vec_ptr) };
+    if rc != 0 {
+        return None;
+    }
+    for (guest_index, resident) in guest_resident.iter_mut().enumerate() {
+        let guest_offset = (guest_index as u64).checked_mul(LINUX_PAGE_SIZE)?;
+        let host_index = usize::try_from((host_prefix + guest_offset) / host_page).ok()?;
+        *resident = host_resident.get(host_index).copied().unwrap_or(0) & 1;
+    }
+    Some(guest_resident)
+}
+
+fn mincore_page_is_mapped(memory: &impl GuestMemory, page: u64) -> bool {
+    memory.host_ptr_for_read(page, 1).is_some() || memory.read_bytes(page, 1).is_ok()
 }
 
 fn ranges_overlap(a_start: u64, a_len: u64, b_start: u64, b_end: u64) -> bool {
@@ -892,8 +1156,19 @@ impl SyscallDispatcher {
                     // the eager arena (mirrors the file-mmap arm); the
                     // host-side no_access gate is kept in sync for EFAULT.
                     let prot_none = prot_flags.is_empty();
-                    memory.set_no_access(addr, map_len_usize, prot_none);
-                    let _ = memory.protect_range(addr, map_len_usize, prot);
+                    memory.set_no_access(addr, map_len_usize, false);
+                    memory.set_no_write(
+                        addr,
+                        map_len_usize,
+                        !prot_none && !prot_flags.contains(LinuxProtFlags::WRITE),
+                    );
+                    if prot_none {
+                        memory.set_no_access(addr, map_len_usize, true);
+                        let _ = memory.protect_range(addr, map_len_usize, 0);
+                    } else {
+                        let _ = memory.protect_range(addr, map_len_usize, 0);
+                        this.track_resident_fault_range(addr, length, prot_flags);
+                    }
                     this.record_dynamic_mapping(
                         addr,
                         length,
@@ -1205,6 +1480,16 @@ impl SyscallDispatcher {
             if let Some(len) = align_up_u64(length, LINUX_PAGE_SIZE) {
                 this.remove_dynamic_mapping(address.0, len);
                 trim_ranges_for_range(&mut this.mem.lock().bus_fault_ranges, address.0, len);
+                if let Some(remove) = crate::vfs::GuestMemoryRange::new(
+                    GuestVa(address.0),
+                    GuestVa(address.0.saturating_add(len)),
+                ) {
+                    let mut mem = this.mem.lock();
+                    locked_ranges_remove(&mut mem.locked_ranges, remove);
+                    locked_ranges_remove(&mut mem.resident_ranges, remove);
+                    locked_ranges_remove(&mut mem.resident_tracked_ranges, remove);
+                    remove_fault_range(&mut mem.resident_fault_ranges, remove);
+                }
             }
             let freed = {
                 let mut mem = this.mem.lock();
@@ -1327,35 +1612,63 @@ impl SyscallDispatcher {
         }
 
         fn mlock(this, cx, address: GuestPtr, length: u64) {
-            let memory = &mut *cx.memory;
-            if length == 0 {
+            let Some(range) = page_rounded_range(address, length)? else {
                 return Ok(DispatchOutcome::Returned { value: 0 });
-            }
-            if memory.read_bytes(address.0, 1).is_err() {
-                return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
-            }
+            };
+            validate_mlock_range(&mut *cx.memory, range, true)?;
+            this.populate_resident_range(&mut *cx.memory, range)?;
+            this.add_locked_range(range)?;
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
         fn munlock(this, cx, address: GuestPtr, length: u64) {
-            let memory = &mut *cx.memory;
-            if length == 0 {
+            let Some(range) = page_rounded_range(address, length)? else {
                 return Ok(DispatchOutcome::Returned { value: 0 });
-            }
-            if memory.read_bytes(address.0, 1).is_err() {
-                return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
-            }
+            };
+            validate_mlock_range(&mut *cx.memory, range, false)?;
+            this.remove_locked_range(range);
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
         fn mlockall(this, cx, flags: u64) {
-            if flags == 0 || flags & !(LINUX_MCL_CURRENT | LINUX_MCL_FUTURE | LINUX_MCL_ONFAULT) != 0 {
+            let Some(flags) = LinuxMlockallFlags::from_bits(flags) else {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            };
+            if flags.is_empty()
+                || flags.contains(LinuxMlockallFlags::ONFAULT)
+                    && !flags.intersects(
+                        LinuxMlockallFlags::CURRENT | LinuxMlockallFlags::FUTURE,
+                    )
+            {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
+            if flags.contains(LinuxMlockallFlags::CURRENT) {
+                this.lock_current_mappings()?;
             }
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
         fn munlockall(this, cx) {
+            this.mem.lock().locked_ranges.clear();
+            Ok(DispatchOutcome::Returned { value: 0 })
+        }
+
+        fn mlock2(this, cx, address: GuestPtr, length: u64, flags: u64) {
+            let Some(flags) = LinuxMlock2Flags::from_bits(flags) else {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            };
+            let Some(range) = page_rounded_range(address, length)? else {
+                return Ok(DispatchOutcome::Returned { value: 0 });
+            };
+            validate_mlock_range(
+                &mut *cx.memory,
+                range,
+                !flags.contains(LinuxMlock2Flags::ONFAULT),
+            )?;
+            if !flags.contains(LinuxMlock2Flags::ONFAULT) {
+                this.populate_resident_range(&mut *cx.memory, range)?;
+            }
+            this.add_locked_range(range)?;
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
@@ -1369,7 +1682,7 @@ impl SyscallDispatcher {
             if length == 0 {
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
-            if memory.read_bytes(address.0, 1).is_err() {
+            if !mincore_page_is_mapped(memory, address.0) {
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
             }
             // Linux returns ENOMEM unless the WHOLE [address, address+length)
@@ -1383,12 +1696,12 @@ impl SyscallDispatcher {
                 Some(end) => end & !(LINUX_PAGE_SIZE - 1),
                 None => return Ok(DispatchOutcome::errno(LINUX_ENOMEM)),
             };
-            if memory.read_bytes(last_page, 1).is_err() {
+            if !mincore_page_is_mapped(memory, last_page) {
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
             }
             let mut page = address.0;
             while page <= last_page {
-                if memory.read_bytes(page, 1).is_err() {
+                if !mincore_page_is_mapped(memory, page) {
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 }
                 page = match page.checked_add(LINUX_PAGE_SIZE) {
@@ -1397,7 +1710,10 @@ impl SyscallDispatcher {
                 };
             }
             let pages = length.div_ceil(LINUX_PAGE_SIZE);
-            let bytes = vec![1u8; pages as usize];
+            let bytes = this
+                .exact_mincore_residency(address.0, pages)
+                .or_else(|| mincore_residency(memory, address.0, pages * LINUX_PAGE_SIZE))
+                .unwrap_or_else(|| vec![1u8; pages as usize]);
             memory.write_bytes(vec.0, &bytes)?;
             Ok(DispatchOutcome::Returned { value: 0 })
         }
@@ -1808,6 +2124,137 @@ impl SyscallDispatcher {
         fn io_uring_register(this, cx, _fd: Fd, _opcode: u64, _arg: GuestPtr, _nr_args: u64) {
             Ok(DispatchOutcome::errno(LINUX_ENOSYS))
         }
+    }
+}
+
+impl SyscallDispatcher {
+    fn track_resident_fault_range(&self, address: u64, length: u64, prot: LinuxProtFlags) {
+        let Some(range) = crate::vfs::GuestMemoryRange::new(
+            GuestVa(address),
+            GuestVa(address.saturating_add(length)),
+        ) else {
+            return;
+        };
+        let mut mem = self.mem.lock();
+        locked_ranges_insert(&mut mem.resident_tracked_ranges, range);
+        mem.resident_fault_ranges
+            .push(ResidentFaultRange { range, prot });
+    }
+
+    fn exact_mincore_residency(&self, address: u64, pages: u64) -> Option<Vec<u8>> {
+        let mem = self.mem.lock();
+        exact_residency(
+            &mem.resident_tracked_ranges,
+            &mem.resident_ranges,
+            address,
+            pages,
+        )
+    }
+
+    pub(crate) fn resident_fault_plan(&self, address: u64) -> Option<(u64, u64)> {
+        let page = address & !(LINUX_PAGE_SIZE - 1);
+        let mem = self.mem.lock();
+        mem.resident_fault_ranges
+            .iter()
+            .find(|fault| page >= fault.range.start().raw() && page < fault.range.end().raw())
+            .map(|fault| (page, fault.prot.bits()))
+    }
+
+    pub(crate) fn commit_resident_fault(&self, page: u64) {
+        let Some(range) =
+            crate::vfs::GuestMemoryRange::new(GuestVa(page), GuestVa(page + LINUX_PAGE_SIZE))
+        else {
+            return;
+        };
+        let mut mem = self.mem.lock();
+        locked_ranges_insert(&mut mem.resident_ranges, range);
+        remove_fault_range(&mut mem.resident_fault_ranges, range);
+    }
+
+    fn populate_resident_range(
+        &self,
+        memory: &mut impl GuestMemory,
+        range: crate::vfs::GuestMemoryRange,
+    ) -> Result<(), LinuxErrno> {
+        let faults = {
+            let mem = self.mem.lock();
+            fault_range_intersections(&mem.resident_fault_ranges, range)
+        };
+        for fault in &faults {
+            let len = range_len_usize(fault.range)?;
+            memory
+                .protect_range(fault.range.start().raw(), len, fault.prot.bits())
+                .map_err(|_| LINUX_ENOMEM)?;
+        }
+        let mut mem = self.mem.lock();
+        locked_ranges_insert(&mut mem.resident_ranges, range);
+        remove_fault_range(&mut mem.resident_fault_ranges, range);
+        Ok(())
+    }
+
+    fn add_locked_range(&self, range: crate::vfs::GuestMemoryRange) -> Result<(), LinuxErrno> {
+        let creds = self.cred_snapshot();
+        let memlock_limit = if creds.euid == 0 {
+            None
+        } else {
+            Some(self.effective_resource_limit(LINUX_RLIMIT_MEMLOCK).rlim_cur)
+        };
+        let mut mem = self.mem.lock();
+        let mut next = mem.locked_ranges.clone();
+        locked_ranges_insert(&mut next, range);
+        if let Some(limit) = memlock_limit {
+            if limit == 0 {
+                return Err(LINUX_EPERM);
+            }
+            if locked_ranges_total(&next) > limit {
+                return Err(LINUX_ENOMEM);
+            }
+        }
+        mem.locked_ranges = next;
+        Ok(())
+    }
+
+    fn remove_locked_range(&self, range: crate::vfs::GuestMemoryRange) {
+        locked_ranges_remove(&mut self.mem.lock().locked_ranges, range);
+    }
+
+    fn lock_current_mappings(&self) -> Result<(), LinuxErrno> {
+        let mem = self.mem.lock();
+        let mut ranges = mem.locked_ranges.clone();
+        if let Some(regions) = &mem.address_space_regions {
+            for region in regions {
+                if let Some(range) =
+                    crate::vfs::GuestMemoryRange::new(GuestVa(region.start), GuestVa(region.end))
+                {
+                    locked_ranges_insert(&mut ranges, range);
+                }
+            }
+        }
+        for region in &mem.dynamic_maps {
+            if let Some(range) =
+                crate::vfs::GuestMemoryRange::new(GuestVa(region.start), GuestVa(region.end))
+            {
+                locked_ranges_insert(&mut ranges, range);
+            }
+        }
+        drop(mem);
+
+        let creds = self.cred_snapshot();
+        if creds.euid != 0 {
+            let limit = self.effective_resource_limit(LINUX_RLIMIT_MEMLOCK).rlim_cur;
+            if limit == 0 {
+                return Err(LINUX_EPERM);
+            }
+            if locked_ranges_total(&ranges) > limit {
+                return Err(LINUX_ENOMEM);
+            }
+        }
+        self.mem.lock().locked_ranges = ranges;
+        Ok(())
+    }
+
+    pub(crate) fn mem_after_fork_child(&self) {
+        self.mem.lock().locked_ranges.clear();
     }
 }
 
