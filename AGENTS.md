@@ -183,6 +183,18 @@ If it fails in Docker too, it's not carrick's bug.
   routine gates run carrick-only. Single-run gating is non-deterministic
   (Go-under-HVF races); treat flaky flips as flakiness (retry / `known_gaps`),
   not regressions.
+- **Use `bpftrace` inside the Docker oracle for Linux syscall shape.** The LTP
+  image includes `bpftrace` (validated as `bpftrace v0.20.2`); prefer it over
+  guest `strace` when you only need the Docker/Linux side because it is lower
+  overhead and does not perturb the test as much. Run it in a separate
+  Docker-only phase (never alongside Carrick), with privileges and tracefs
+  mounted inside the container. Validate the tool before trusting a trace:
+  `docker run --rm --privileged --pid=host localhost:5050/ltp:arm64 sh -lc 'mount -t tracefs tracefs /sys/kernel/tracing 2>/dev/null || true; bpftrace -V; bpftrace -e "BEGIN { printf(\"ok\\n\"); exit(); }"'`.
+  Then trace the case with the same wrapper, for example:
+  `docker run --rm --privileged --pid=host localhost:5050/ltp:arm64 sh -lc 'mount -t tracefs tracefs /sys/kernel/tracing 2>/dev/null || true; bpftrace -e "..." -c /opt/ltp/testcases/bin/<case>'`.
+  If `bpftrace -l 'tracepoint:syscalls:*'` says
+  `/sys/kernel/tracing/available_events` is missing, the tracefs mount step was
+  skipped.
 - **The cache key is the suite *declaration*, not the image digest.** It is a
   stable JSON of `OracleKey` (image, cmd, env, `docker_platform`, verdict…), so
   the committed cache stays valid across machines that may not have the images.
