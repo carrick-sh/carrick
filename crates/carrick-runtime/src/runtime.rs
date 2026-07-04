@@ -861,7 +861,7 @@ where
     // it.
     let _termios_guard = crate::host_tty::TermiosRestoreGuard::new();
 
-    let this_tid = ThreadId::main_from_host_pid();
+    let mut this_tid = ThreadId::main_from_host_pid();
     // Per-thread blocking-I/O waiter (owns this thread's kqueue). Recreated in
     // a forked child below (kqueue is not inherited across fork).
     let mut waiter = crate::io_wait::ThreadWaiter::new(this_tid);
@@ -929,6 +929,7 @@ where
         )?;
 
         let mut last_syscall_retval: Option<i64> = None;
+        let mut signal_interrupted_pc: Option<u64> = None;
 
         match outcome {
             DispatchOutcome::WaitOnFds { .. }
@@ -1045,9 +1046,8 @@ where
                         // The child's pid changed; its waiter watches for
                         // process-directed signals immediately, then upgrades
                         // to a per-thread kqueue only if it parks.
-                        waiter = crate::io_wait::ThreadWaiter::process_only(
-                            ThreadId::main_from_host_pid(),
-                        );
+                        this_tid = ThreadId::main_from_host_pid();
+                        waiter = crate::io_wait::ThreadWaiter::process_only(this_tid);
                         0
                     }
                 };
@@ -1107,6 +1107,7 @@ where
                 // delivered, so this can't re-deliver it. `last_syscall_retval`
                 // is None on this path, so the next inject preserves the
                 // restored x0.
+                signal_interrupted_pc = Some(runtime.current_pc()?);
             }
             DispatchOutcome::SetMemoryModel { tso } => {
                 // Rosetta requested hardware x86_64 TSO on this vCPU. Toggle
@@ -1194,9 +1195,13 @@ where
             }
         }
 
-        if let Some(action) =
-            deliver_pending_signal(runtime, &dispatcher, last_syscall_retval, this_tid, None)?
-        {
+        if let Some(action) = deliver_pending_signal(
+            runtime,
+            &dispatcher,
+            last_syscall_retval,
+            this_tid,
+            signal_interrupted_pc,
+        )? {
             if let Some(signum) = action.stop_signal {
                 stop_by_signal(signum);
                 continue;

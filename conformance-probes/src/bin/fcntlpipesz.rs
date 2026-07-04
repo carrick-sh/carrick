@@ -6,10 +6,13 @@
 //!   - F_GETPIPE_SZ on a fresh pipe returns the default capacity (>= one page,
 //!     65536 today). Carrick previously returned a fixed LINUX_PIPE_BUF_SIZE
 //!     and had no F_SETPIPE_SZ, so a set then get diverged.
-//!   - F_SETPIPE_SZ(x) rounds x up to a page multiple (min one page, clamped to
-//!     the pipe-max ceiling) and RETURNS the rounded value; a subsequent
-//!     F_GETPIPE_SZ returns exactly that. default//2 is page-aligned, so it
-//!     round-trips exactly — the property CPython asserts.
+//!   - F_SETPIPE_SZ(x) rounds x up to a page multiple (min one page) and RETURNS
+//!     the rounded value; a subsequent F_GETPIPE_SZ returns exactly that.
+//!     default//2 is page-aligned, so it round-trips exactly — the property
+//!     CPython asserts.
+//!   - Invalid resizes are rejected: impossible sizes fail, shrinking below
+//!     queued bytes fails with EBUSY, and requests above
+//!     /proc/sys/fs/pipe-max-size fail with EPERM (LTP fcntl37).
 //!   - F_NOTIFY(dirfd, DN_MULTISHOT) SUCCEEDS on aarch64 Linux (the EINVAL the
 //!     CPython test guards against is 32-bit-arm only). macOS has no dnotify;
 //!     carrick accepts it as a no-op returning 0, matching the observable
@@ -18,7 +21,7 @@
 //! Deterministic booleans only — never the raw default size (it could differ
 //! across kernels); the booleans encode the RELATIONSHIPS the oracle holds.
 
-use conformance_probes::report;
+use conformance_probes::{errno, report};
 
 // Linux fcntl commands (aarch64 asm-generic). Not all are exposed by the musl
 // libc crate, so spell them out — clean-room, from the fcntl(2) man page.
@@ -29,6 +32,14 @@ const F_NOTIFY: i32 = 1026;
 // test picks specifically because it is > 2**31 (exercises the long-vs-int arg
 // path). 1<<31 == 0x80000000.
 const DN_MULTISHOT: i32 = 1 << 31;
+
+unsafe fn set_pipe_sz_raw(fd: i32, size: u64) -> i64 {
+    libc::syscall(libc::SYS_fcntl, fd, F_SETPIPE_SZ, size)
+}
+
+unsafe fn set_pipe_sz(fd: i32, size: i32) -> i32 {
+    libc::fcntl(fd, F_SETPIPE_SZ, size)
+}
 
 fn main() {
     unsafe {
@@ -73,11 +84,32 @@ fn main() {
             false
         };
 
+        let too_large_rc = set_pipe_sz_raw(wr, 1u64 << 31);
+        let too_large_rejected = too_large_rc == -1;
+
+        let queued = [0u8; 8192];
+        let queued_write = libc::write(wr, queued.as_ptr() as *const libc::c_void, queued.len());
+        let shrink_rc = set_pipe_sz(wr, 4096);
+        let shrink_below_queued_ebusy =
+            queued_write == queued.len() as isize && shrink_rc == -1 && errno() == libc::EBUSY;
+
+        let root_over_max_rc = set_pipe_sz(wr, 1024 * 1024 + 4096);
+        let root_over_max_eperm = root_over_max_rc == -1 && errno() == libc::EPERM;
+
+        let setuid_rc = libc::setuid(65534);
+        let over_max_rc = set_pipe_sz(wr, 2 * 1024 * 1024);
+        let unprivileged_over_max_eperm =
+            setuid_rc == 0 && over_max_rc == -1 && errno() == libc::EPERM;
+
         report!(
             getpipe_default_ge_4096 = getpipe_default_ge_4096,
             setpipe_ok = setpipe_ok,
             getpipe_eq_set = getpipe_eq_set,
             fnotify_ok = fnotify_ok,
+            setpipe_too_large_rejected = too_large_rejected,
+            setpipe_shrink_below_queued_ebusy = shrink_below_queued_ebusy,
+            setpipe_root_over_max_eperm = root_over_max_eperm,
+            setpipe_unprivileged_over_max_eperm = unprivileged_over_max_eperm,
         );
 
         libc::close(rd);

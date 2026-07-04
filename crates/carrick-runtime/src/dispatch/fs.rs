@@ -193,6 +193,13 @@ fn host_inode_pipe_id(host_fd: i32) -> u64 {
     st.st_ino as u64
 }
 
+fn host_pipe_readable_bytes(host_fd: i32) -> Result<usize, LinuxErrno> {
+    let mut readable: libc::c_int = 0;
+    let rc = unsafe { libc::ioctl(host_fd, libc::FIONREAD, &mut readable) };
+    rc.host_syscall_errno()?;
+    usize::try_from(readable).map_err(|_| LINUX_EINVAL)
+}
+
 fn gather_bounded_iovec_bytes(
     memory: &impl GuestMemory,
     iovecs: &[LinuxIovec],
@@ -1822,6 +1829,9 @@ impl SyscallDispatcher {
             self.inotify_self(&record_path, carrick_abi::LINUX_IN_OPEN);
             self.inotify_child(&record_path, carrick_abi::LINUX_IN_OPEN, opened_is_dir);
         }
+        if inotify_created {
+            self.dnotify_child(&record_path, LinuxDnotifyMask::CREATE);
+        }
         Ok(DispatchOutcome::Returned { value: fd as i64 })
     }
 
@@ -2400,6 +2410,56 @@ impl SyscallDispatcher {
         (ino != 0).then_some(ino)
     }
 
+    fn pipe_buffered_bytes(&self, fd: i32) -> Result<Option<usize>, LinuxErrno> {
+        let Some(open_file) = self.open_file(fd) else {
+            return if is_stdio_fd(fd) {
+                Ok(None)
+            } else {
+                Err(LINUX_EBADF)
+            };
+        };
+
+        let open = open_file.description.read();
+        match &*open {
+            OpenDescription::PipeReader { pipe, .. } | OpenDescription::PipeWriter { pipe, .. } => {
+                Ok(Some(pipe.lock().buffer.len()))
+            }
+            OpenDescription::HostPipe {
+                host_fd,
+                is_read_end: true,
+                ..
+            } => host_pipe_readable_bytes(host_fd.raw()).map(Some),
+            OpenDescription::HostPipe {
+                pipe_id,
+                bidirectional,
+                host_fd,
+                ..
+            } => {
+                if *bidirectional {
+                    return host_pipe_readable_bytes(host_fd.raw()).map(Some);
+                }
+                let pipe_id = *pipe_id;
+                drop(open);
+                let table = self.io.open_files.read();
+                for other in table.values() {
+                    let other_open = other.description.read();
+                    if let OpenDescription::HostPipe {
+                        host_fd,
+                        is_read_end: true,
+                        pipe_id: other_pipe_id,
+                        ..
+                    } = &*other_open
+                        && *other_pipe_id == pipe_id
+                    {
+                        return host_pipe_readable_bytes(host_fd.raw()).map(Some);
+                    }
+                }
+                Ok(Some(0))
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// Reconcile the fork-coherent FASYNC registry with `fd`'s current
     /// description after an `O_ASYNC` / `F_SETOWN` / `F_SETSIG` change. If
     /// `O_ASYNC` is set on a host pipe/socket, arm `(dev, ino)` with the fd's
@@ -2455,6 +2515,64 @@ impl SyscallDispatcher {
         })
     }
 
+    fn queue_self_sigpoll(
+        &self,
+        signum: i32,
+        fd: i32,
+        target_tid: Option<crate::thread::ThreadId>,
+    ) {
+        let info = carrick_abi::LinuxSiginfo::sigpoll(signum, carrick_abi::LINUX_POLL_MSG, 0, fd);
+        self.record_pending_siginfo(crate::thread::ThreadId::NONE, signum, info);
+        self.mark_signal_pending(crate::thread::ThreadId::NONE, signum);
+
+        let tid = target_tid
+            .filter(|tid| *tid != crate::thread::ThreadId::NONE)
+            .unwrap_or_else(crate::thread::ThreadId::main_from_host_pid);
+        self.record_pending_siginfo(tid, signum, info);
+        if !self.signal_blocked(tid, signum)
+            && let Some(action) = self.registered_signal_handler(signum)
+        {
+            self.record_pending_signal_action(tid, signum, action);
+        }
+        self.mark_signal_pending(tid, signum);
+    }
+
+    fn send_async_owner_signal(
+        &self,
+        owner_type: i32,
+        owner_pid: i32,
+        sig: i32,
+        fd: i32,
+        target_tid: Option<crate::thread::ThreadId>,
+    ) {
+        if owner_pid == 0 {
+            return;
+        }
+        let signum = if sig == 0 { LINUX_SIGIO } else { sig };
+        if owner_type != LINUX_F_OWNER_PGRP
+            && u32::try_from(owner_pid).ok() == Some(crate::namespace::pid::self_ns_pid())
+        {
+            self.queue_self_sigpoll(signum, fd, target_tid);
+            return;
+        }
+        let ns = owner_pid as u32;
+        let host_target = match owner_type {
+            LINUX_F_OWNER_PGRP => crate::namespace::pid::ns_to_host_pgid(ns),
+            _ => crate::namespace::pid::ns_to_host_or_self(ns),
+        };
+        let Some(target) = Self::fasync_signal_target(owner_type, host_target) else {
+            return;
+        };
+        if matches!(target, crate::dispatch::signal::SignalTarget::HostProcess(pid) if pid.0 == std::process::id())
+            || matches!(target, crate::dispatch::signal::SignalTarget::HostThread(pid) if pid.0 == std::process::id())
+        {
+            self.queue_self_sigpoll(signum, fd, target_tid);
+            return;
+        }
+        // Kernel-internal SIGIO delivery is not gated by the writer's euid.
+        let _ = crate::dispatch::signal::bootstrap_signal_send_as(target, signum as u64, None);
+    }
+
     /// Deliver the FASYNC (signal-driven I/O) signal after a guest write to a
     /// host pipe/socket made it readable. Looks up the pipe inode in the
     /// fork-coherent registry; if armed, sends the owner's `F_SETSIG` signal
@@ -2478,33 +2596,195 @@ impl SyscallDispatcher {
         let Some(owner) = carrick_signal_core::fasync::lookup(pipe_id) else {
             return;
         };
-        if owner.owner_pid == 0 {
+        // owner_pid is the F_SETOWN value as the guest set it (a PID-namespace id
+        // from the owner's getpid()); send_async_owner_signal translates it to a
+        // HOST-domain target exactly as the guest kill(2) path does.
+        self.send_async_owner_signal(owner.owner_type, owner.owner_pid, owner.sig, fd, None);
+    }
+
+    fn dnotify_register(
+        &self,
+        fd: i32,
+        mask: LinuxDnotifyMask,
+        tid: crate::thread::ThreadId,
+    ) -> Result<(), LinuxErrno> {
+        let Some(open_file) = self.open_file(fd) else {
+            return Err(LINUX_EBADF);
+        };
+        let path = match &*open_file.description.read() {
+            OpenDescription::Directory { path, .. } => path.clone(),
+            _ => match self.lookup_recorded_fd_open_path(fd) {
+                Some(path) => path,
+                None => return Err(LINUX_EINVAL),
+            },
+        };
+        let path = self.normalize_dnotify_path(&path);
+        let mut registry = self.fs.dnotify_registry.lock();
+        if mask.is_empty() {
+            registry.retain(|entry| entry.fd != fd);
+            return Ok(());
+        }
+        {
+            let mut desc = open_file.description.write();
+            if desc.owner().1 == 0 {
+                desc.set_owner(
+                    LINUX_F_OWNER_PID,
+                    crate::namespace::pid::self_ns_pid() as i32,
+                );
+            }
+        }
+        let effective_mask = mask - LinuxDnotifyMask::MULTISHOT;
+        if let Some(entry) = registry.iter_mut().find(|entry| entry.fd == fd) {
+            entry.path = path;
+            entry.mask = effective_mask;
+            entry.tid = tid;
+        } else {
+            registry.push(fs::DnotifyRegistration {
+                fd,
+                tid,
+                path,
+                mask: effective_mask,
+            });
+        }
+        Ok(())
+    }
+
+    fn dnotify_close_fd(&self, fd: i32) {
+        self.fs
+            .dnotify_registry
+            .lock()
+            .retain(|entry| entry.fd != fd);
+    }
+
+    fn normalize_dnotify_path(&self, path: &str) -> String {
+        let normalized = if Path::new(path).is_absolute() {
+            normalize_abs_path(path)
+        } else {
+            normalize_abs_path(&format!("{}/{}", self.cwd().trim_end_matches('/'), path))
+        };
+        if normalized == "/private/tmp" {
+            "/tmp".to_owned()
+        } else if let Some(rest) = normalized.strip_prefix("/private/tmp/") {
+            format!("/tmp/{rest}")
+        } else {
+            normalized
+        }
+    }
+
+    fn dnotify_path_matches(&self, watched: &str, event: &str) -> bool {
+        if watched == event {
+            return true;
+        }
+        let watched_canon = self
+            .canonicalize_following(watched)
+            .map(|path| self.normalize_dnotify_path(&path))
+            .unwrap_or_else(|_| watched.to_owned());
+        let event_canon = self
+            .canonicalize_following(event)
+            .map(|path| self.normalize_dnotify_path(&path))
+            .unwrap_or_else(|_| event.to_owned());
+        watched_canon == event || watched == event_canon || watched_canon == event_canon
+    }
+
+    pub(in crate::dispatch) fn dnotify_child(&self, path: &str, mask: LinuxDnotifyMask) {
+        self.dnotify_child_for_tid(path, mask, None);
+    }
+
+    fn dnotify_child_for_tid(
+        &self,
+        path: &str,
+        mask: LinuxDnotifyMask,
+        target_tid: Option<crate::thread::ThreadId>,
+    ) {
+        if !self.dnotify_event_supported(mask) {
             return;
         }
-        let signum = if owner.sig == 0 {
-            LINUX_SIGIO
-        } else {
-            owner.sig
-        };
-        // owner_pid is the F_SETOWN value as the guest set it (a PID-namespace id
-        // from the owner's getpid()); bootstrap_signal_send_as wants a HOST-domain
-        // target (it compares against the host pid for self-detection), so
-        // translate ns -> host exactly as the guest kill(2) path does. Under an
-        // active PID namespace the owner's ns-pid (e.g. fcntl31's 2) is NOT its
-        // host pid, so sending the raw ns id delivered the SIGIO to the wrong
-        // process.
-        let ns = owner.owner_pid as u32;
-        let host_target = match owner.owner_type {
-            LINUX_F_OWNER_PGRP => crate::namespace::pid::ns_to_host_pgid(ns),
-            _ => crate::namespace::pid::ns_to_host_or_self(ns),
-        };
-        let Some(target) = Self::fasync_signal_target(owner.owner_type, host_target) else {
-            // No host target for this ns owner → drop (no wrong-target signal).
+        let path = self.normalize_dnotify_path(path);
+        let Some(parent) = Path::new(&path).parent() else {
             return;
         };
-        // caller_euid = None: kernel-internal I/O-signal delivery is not gated by
-        // the writer's euid (it is the kernel sending on the owner's behalf).
-        let _ = crate::dispatch::signal::bootstrap_signal_send_as(target, signum as u64, None);
+        let parent = display_rootfs_path(parent);
+        self.dnotify_directory_for_tid(&parent, mask, target_tid);
+    }
+
+    fn dnotify_attrib(&self, path: &str) {
+        self.dnotify_attrib_for_tid(path, None);
+    }
+
+    fn dnotify_attrib_for_tid(&self, path: &str, target_tid: Option<crate::thread::ThreadId>) {
+        let path = self.normalize_dnotify_path(path);
+        let mut candidates = vec![path.clone()];
+        if let Some(parent) = Path::new(&path).parent() {
+            let parent = normalize_abs_path(&display_rootfs_path(parent));
+            if !candidates.contains(&parent) {
+                candidates.push(parent);
+            }
+        }
+        self.dnotify_directories_for_tid(&candidates, LinuxDnotifyMask::ATTRIB, target_tid);
+    }
+
+    fn dnotify_directory_for_tid(
+        &self,
+        path: &str,
+        mask: LinuxDnotifyMask,
+        target_tid: Option<crate::thread::ThreadId>,
+    ) {
+        if !self.dnotify_event_supported(mask) {
+            return;
+        }
+        let path = self.normalize_dnotify_path(path);
+        self.dnotify_directories_for_tid(&[path], mask, target_tid);
+    }
+
+    fn dnotify_directories_for_tid(
+        &self,
+        paths: &[String],
+        mask: LinuxDnotifyMask,
+        target_tid: Option<crate::thread::ThreadId>,
+    ) {
+        let registrations: Vec<_> = self
+            .fs
+            .dnotify_registry
+            .lock()
+            .iter()
+            .filter(|entry| {
+                entry.mask.intersects(mask)
+                    && paths
+                        .iter()
+                        .any(|path| self.dnotify_path_matches(&entry.path, path))
+            })
+            .cloned()
+            .collect();
+        let mut notified = std::collections::HashSet::new();
+        for entry in registrations {
+            if !notified.insert(entry.fd) {
+                continue;
+            }
+            if let Some(open_file) = self.open_file(entry.fd) {
+                let (owner_type, owner_pid, sig) = {
+                    let desc = open_file.description.read();
+                    let (owner_type, owner_pid) = desc.owner();
+                    (owner_type, owner_pid, desc.async_sig())
+                };
+                self.send_async_owner_signal(
+                    owner_type,
+                    owner_pid,
+                    sig,
+                    entry.fd,
+                    target_tid.or(Some(entry.tid)),
+                );
+            }
+        }
+    }
+
+    fn dnotify_event_supported(&self, mask: LinuxDnotifyMask) -> bool {
+        matches!(
+            mask,
+            LinuxDnotifyMask::CREATE
+                | LinuxDnotifyMask::DELETE
+                | LinuxDnotifyMask::RENAME
+                | LinuxDnotifyMask::ATTRIB
+        )
     }
 
     /// True iff `fd` refers to a pipe / socket / character device — kinds with
@@ -3008,6 +3288,7 @@ impl SyscallDispatcher {
         newpath: u64,
         flags: u64,
         memory: &impl GuestMemory,
+        target_tid: Option<crate::thread::ThreadId>,
     ) -> Result<DispatchOutcome, DispatchError> {
         const RENAME_NOREPLACE: u64 = 1;
         const RENAME_EXCHANGE: u64 = 2;
@@ -3061,6 +3342,7 @@ impl SyscallDispatcher {
                         self.inotify_move(&resolved_old, &resolved_new, old_is_dir);
                         self.inotify_move(&resolved_new, &resolved_old, new_is_dir);
                     }
+                    self.dnotify_child_for_tid(&resolved_old, LinuxDnotifyMask::RENAME, target_tid);
                     Ok(DispatchOutcome::Returned { value: 0 })
                 }
                 Err(errno) => Ok(DispatchOutcome::errno(errno)),
@@ -3095,7 +3377,8 @@ impl SyscallDispatcher {
         }
         // Capture the source kind before the move (for IN_ISDIR) only when
         // something is watching.
-        let moved_is_dir = if self.fs.inotify_registry.is_empty() {
+        let dnotify_rename_watched = !self.fs.dnotify_registry.lock().is_empty();
+        let moved_is_dir = if self.fs.inotify_registry.is_empty() && !dnotify_rename_watched {
             false
         } else {
             self.inotify_path_kind(&resolved_old).unwrap_or(false)
@@ -3118,6 +3401,9 @@ impl SyscallDispatcher {
                     self.fs
                         .inotify_registry
                         .rename_path(&resolved_old, &resolved_new);
+                }
+                if moved_is_dir {
+                    self.dnotify_child_for_tid(&resolved_old, LinuxDnotifyMask::RENAME, target_tid);
                 }
                 // A process whose cwd IS the renamed directory (or sits under it)
                 // must follow the move: Linux's cwd is an inode, but carrick tracks
@@ -3777,6 +4063,7 @@ impl SyscallDispatcher {
             return match m.vfs.chmod(&m.full_path, mode) {
                 Ok(()) => {
                     self.inotify_attrib(&resolved);
+                    self.dnotify_attrib(&resolved);
                     Ok(DispatchOutcome::Returned { value: 0 })
                 }
                 Err(errno) => Ok(DispatchOutcome::errno(errno)),
@@ -3785,6 +4072,7 @@ impl SyscallDispatcher {
         match self.fs.rootfs_vfs.overlay.set_mode(&resolved, mode) {
             Ok(()) | Err(crate::fs_backend::BackendError::Unsupported) => {
                 self.inotify_attrib(&resolved);
+                self.dnotify_attrib(&resolved);
                 Ok(DispatchOutcome::Returned { value: 0 })
             }
             Err(_) => Ok(DispatchOutcome::Returned { value: 0 }),
@@ -3922,6 +4210,7 @@ impl SyscallDispatcher {
                 );
             }
             self.clear_setid_on_chown(&path);
+            self.dnotify_attrib(&path);
         }
         DispatchOutcome::Returned { value: 0 }
     }
@@ -4348,32 +4637,48 @@ impl SyscallDispatcher {
                         return Ok(DispatchOutcome::errno(LINUX_EBADF));
                     }
                     // Linux rounds the requested size up to a whole number of
-                    // pages, enforces a one-page minimum, and clamps to the
-                    // /proc/sys/fs/pipe-max-size ceiling (default 1 MiB). The
-                    // rounded value is what a subsequent F_GETPIPE_SZ returns.
-                    // (arg as i64 then to u64 for the rounding math; a negative
-                    // request is huge-unsigned and clamps to the max.)
+                    // pages, enforces a one-page minimum, rejects impossible
+                    // signed-int sizes, rejects growth above
+                    // /proc/sys/fs/pipe-max-size without CAP_SYS_RESOURCE, and
+                    // refuses to shrink below the bytes already queued in the
+                    // pipe (fcntl37). Carrick does not model capabilities here,
+                    // so guest root does not bypass the per-user pipe ceiling.
                     const PIPE_MAX_SIZE: u64 = 1 << 20; // 1 MiB, Linux default
+                    if arg > i32::MAX as u64 {
+                        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                    }
                     let page = LINUX_PAGE_SIZE;
                     let requested = arg.max(1);
                     let rounded = requested.div_ceil(page).saturating_mul(page);
-                    let capacity = rounded.clamp(page, PIPE_MAX_SIZE) as i64;
+                    if rounded > PIPE_MAX_SIZE {
+                        return Ok(DispatchOutcome::errno(LINUX_EPERM));
+                    }
+                    let Some(buffered) = this.pipe_buffered_bytes(fd.0)? else {
+                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                    };
+                    if rounded < buffered as u64 {
+                        return Ok(DispatchOutcome::errno(LINUX_EBUSY));
+                    }
+                    let capacity = rounded.max(page) as i64;
                     open_file.description.write().set_pipe_capacity(capacity);
                     // macOS pipes expose no portable buffer-resize API, so this
                     // is bookkeeping only — but F_GETPIPE_SZ now reports it back
                     // exactly, which is the observable contract the guest checks.
                     DispatchOutcome::Returned { value: capacity }
                 }
-                // Directory-change notification (dnotify). macOS has no dnotify
-                // equivalent (and modern Linux apps prefer inotify, which carrick
-                // backs with kqueue EVFILT_VNODE). The guest contract a caller
-                // relies on here is only that the fcntl does not fail: on aarch64
-                // Linux this SUCCEEDS (the EINVAL skip is 32-bit-arm-only). Accept
-                // it as a no-op returning 0 — we don't actually arm an SIGIO
-                // notification, but no observable behaviour depends on that today.
+                // Directory-change notification (dnotify). It is obsolete, but
+                // LTP still asserts create/delete/rename SIGIO delivery for
+                // aarch64. Record a dispatch-layer directory watch and reuse the
+                // fd's F_SETOWN/F_SETSIG async owner for signal delivery.
                 LINUX_F_NOTIFY => {
                     if !this.fd_is_valid(fd.0) {
                         return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                    }
+                    let Some(mask) = LinuxDnotifyMask::from_bits(arg) else {
+                        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                    };
+                    if let Err(errno) = this.dnotify_register(fd.0, mask, cx.tid()) {
+                        return Ok(DispatchOutcome::errno(errno));
                     }
                     DispatchOutcome::Returned { value: 0 }
                 }
@@ -5845,6 +6150,7 @@ impl SyscallDispatcher {
                 this.io.closed_stdio.lock()[fd.0 as usize] = true;
             }
             this.io.splice_pushback.lock().remove(&fd.0);
+            this.dnotify_close_fd(fd.0);
             // inotify IN_CLOSE_WRITE/IN_CLOSE_NOWRITE for a watched regular file
             // or directory — emitted while the fd is still in the table so its
             // description (writability) and recorded path are still readable.
@@ -8591,6 +8897,7 @@ impl SyscallDispatcher {
                         {
                             Ok(()) => {
                                 this.stamp_new_node_owner(&materialize_path, fifo_mode);
+                                this.dnotify_child(&materialize_path, LinuxDnotifyMask::CREATE);
                                 DispatchOutcome::Returned { value: 0 }
                             }
                             Err(crate::fs_backend::BackendError::Unsupported) => {
@@ -8620,6 +8927,7 @@ impl SyscallDispatcher {
                         {
                             Ok(()) => {
                                 this.stamp_new_node_owner(&materialize_path, full_mode);
+                                this.dnotify_child(&materialize_path, LinuxDnotifyMask::CREATE);
                                 DispatchOutcome::Returned { value: 0 }
                             }
                             Err(crate::fs_backend::BackendError::Unsupported) => {
@@ -8648,6 +8956,7 @@ impl SyscallDispatcher {
                         {
                             Ok(()) => {
                                 this.stamp_new_node_owner(&materialize_path, sock_mode);
+                                this.dnotify_child(&materialize_path, LinuxDnotifyMask::CREATE);
                                 DispatchOutcome::Returned { value: 0 }
                             }
                             Err(crate::fs_backend::BackendError::Unsupported) => {
@@ -8677,6 +8986,7 @@ impl SyscallDispatcher {
                             .set_mode(&materialize_path, mode & 0o7777);
                     }
                     this.stamp_new_node_owner(&materialize_path, mode & 0o7777);
+                    this.dnotify_child(&materialize_path, LinuxDnotifyMask::CREATE);
                     Ok(DispatchOutcome::Returned { value: 0 })
                 }
                 Err(crate::fs_backend::BackendError::Unsupported) => Ok(DispatchOutcome::errno(LINUX_EROFS)),
@@ -8709,6 +9019,7 @@ impl SyscallDispatcher {
                         );
                         // inotify IN_CREATE|IN_ISDIR on the parent dir watch.
                         this.inotify_child(&resolved, carrick_abi::LINUX_IN_CREATE, true);
+                        this.dnotify_child(&resolved, LinuxDnotifyMask::CREATE);
                         Ok(DispatchOutcome::Returned { value: 0 })
                     }
                     Err(errno) => Ok(DispatchOutcome::errno(errno)),
@@ -8769,6 +9080,7 @@ impl SyscallDispatcher {
                     }
                     // inotify IN_CREATE|IN_ISDIR on the parent dir watch.
                     this.inotify_child(&resolved, carrick_abi::LINUX_IN_CREATE, true);
+                    this.dnotify_child(&resolved, LinuxDnotifyMask::CREATE);
                     Ok(DispatchOutcome::Returned { value: 0 })
                 }
                 Err(errno) => Ok(DispatchOutcome::errno(errno)),
@@ -8832,6 +9144,7 @@ impl SyscallDispatcher {
                 }
                 // inotify IN_ATTRIB (chmod is a metadata change).
                 this.inotify_attrib(&path);
+                this.dnotify_attrib_for_tid(&path, Some(cx.tid()));
             }
             Ok(DispatchOutcome::Returned { value: 0 })
 
@@ -9042,7 +9355,10 @@ impl SyscallDispatcher {
                 && let Some(result) = this.materialize_anon_fd_to(n, &resolved_new)
             {
                 return Ok(match result {
-                    Ok(()) => DispatchOutcome::Returned { value: 0 },
+                    Ok(()) => {
+                        this.dnotify_child(&resolved_new, LinuxDnotifyMask::CREATE);
+                        DispatchOutcome::Returned { value: 0 }
+                    }
                     Err(errno) => DispatchOutcome::errno(errno),
                 });
             }
@@ -9084,12 +9400,18 @@ impl SyscallDispatcher {
             // link returns ENOENT (not a corrupt link).
             if let Some(mnew) = this.fs.vfs_mounts.resolve(&resolved_new) {
                 return Ok(match mnew.vfs.link(&src, &resolved_new) {
-                    Ok(()) => DispatchOutcome::Returned { value: 0 },
+                    Ok(()) => {
+                        this.dnotify_child(&resolved_new, LinuxDnotifyMask::CREATE);
+                        DispatchOutcome::Returned { value: 0 }
+                    }
                     Err(errno) => DispatchOutcome::errno(errno),
                 });
             }
             match this.fs.rootfs_vfs.overlay.hard_link(&src, &resolved_new) {
-                Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
+                Ok(()) => {
+                    this.dnotify_child(&resolved_new, LinuxDnotifyMask::CREATE);
+                    Ok(DispatchOutcome::Returned { value: 0 })
+                }
                 Err(crate::fs_backend::BackendError::Unsupported) => {
                     // In-memory backend: emulate with a content copy (callers
                     // like dpkg only need the data, not shared inodes).
@@ -9112,7 +9434,10 @@ impl SyscallDispatcher {
                         .overlay
                         .set_file_contents(&resolved_new, contents)
                     {
-                        Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
+                        Ok(()) => {
+                            this.dnotify_child(&resolved_new, LinuxDnotifyMask::CREATE);
+                            Ok(DispatchOutcome::Returned { value: 0 })
+                        }
                         Err(_) => Ok(DispatchOutcome::errno(LINUX_EROFS)),
                     }
                 }
@@ -9145,7 +9470,10 @@ impl SyscallDispatcher {
             }
             if let Some(m) = this.fs.vfs_mounts.resolve(&resolved_link) {
                 return match m.vfs.symlink(&target_path, &m.full_path) {
-                    Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
+                    Ok(()) => {
+                        this.dnotify_child(&resolved_link, LinuxDnotifyMask::CREATE);
+                        Ok(DispatchOutcome::Returned { value: 0 })
+                    }
                     Err(errno) => Ok(DispatchOutcome::errno(errno)),
                 };
             }
@@ -9165,7 +9493,10 @@ impl SyscallDispatcher {
                 .overlay
                 .symlink(&target_path, &resolved_link)
             {
-                Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
+                Ok(()) => {
+                    this.dnotify_child(&resolved_link, LinuxDnotifyMask::CREATE);
+                    Ok(DispatchOutcome::Returned { value: 0 })
+                }
                 Err(crate::fs_backend::BackendError::Unsupported) => Ok(DispatchOutcome::errno(LINUX_EROFS)),
                 Err(_) => Ok(DispatchOutcome::errno(LINUX_EROFS)),
             }
@@ -9181,6 +9512,7 @@ impl SyscallDispatcher {
                 newpath.0,
                 0,
                 &*cx.memory,
+                Some(cx.tid()),
             )
 
         }
@@ -9215,6 +9547,7 @@ impl SyscallDispatcher {
                 newpath.0,
                 flags,
                 &*cx.memory,
+                Some(cx.tid()),
             )
 
         }
@@ -9383,6 +9716,7 @@ impl SyscallDispatcher {
                         carrick_abi::LINUX_IN_DELETE,
                         unlinked_is_dir,
                     );
+                    this.dnotify_child(&resolved, LinuxDnotifyMask::DELETE);
                     // To a watch ON the entry itself:
                     // - A directory (rmdir) has no link-count subtlety:
                     //   IN_DELETE_SELF → IN_IGNORED.
@@ -9809,6 +10143,113 @@ mod tests {
         assert_eq!(
             SyscallDispatcher::fasync_signal_target(LINUX_F_OWNER_PGRP, Some(7)),
             Some(SignalTarget::HostProcessGroup(HostPid(7)))
+        );
+    }
+
+    fn test_directory_open_file(path: &str) -> OpenFile {
+        let metadata = RootFsMetadata {
+            path: Path::new(path).to_path_buf(),
+            kind: RootFsEntryKind::Directory,
+            mode: 0o755,
+            size: 0,
+        };
+        OpenFile {
+            description: Arc::new(RwLock::new(OpenDescription::Directory {
+                path: path.to_owned(),
+                metadata,
+                entries: Vec::new(),
+                offset: 0,
+                base: OpenDescriptionBase::new(0),
+            })),
+            fd_flags: 0,
+        }
+    }
+
+    fn sigpoll_fd(info: carrick_abi::LinuxSiginfo) -> i32 {
+        i32::from_le_bytes(info._pad[0..4].try_into().unwrap())
+    }
+
+    #[test]
+    fn dnotify_child_attrib_queues_parent_before_child() {
+        let dispatcher = SyscallDispatcher::new();
+        let tid = crate::thread::ThreadId::main_from_host_pid();
+        let signum = 34;
+
+        let parent_fd = dispatcher
+            .install_fd_at_or_above(3, test_directory_open_file("/watched"))
+            .unwrap();
+        let child_fd = dispatcher
+            .install_fd_at_or_above(3, test_directory_open_file("/watched/child"))
+            .unwrap();
+        dispatcher
+            .open_file(parent_fd)
+            .unwrap()
+            .description
+            .write()
+            .set_async_sig(signum);
+        dispatcher
+            .open_file(child_fd)
+            .unwrap()
+            .description
+            .write()
+            .set_async_sig(signum);
+
+        dispatcher
+            .dnotify_register(
+                parent_fd,
+                LinuxDnotifyMask::ATTRIB | LinuxDnotifyMask::MULTISHOT,
+                tid,
+            )
+            .unwrap();
+        dispatcher
+            .dnotify_register(
+                child_fd,
+                LinuxDnotifyMask::ATTRIB | LinuxDnotifyMask::MULTISHOT,
+                tid,
+            )
+            .unwrap();
+
+        dispatcher.dnotify_attrib("/watched/child");
+
+        assert_eq!(
+            sigpoll_fd(dispatcher.take_pending_siginfo(tid, signum).unwrap()),
+            parent_fd
+        );
+        assert_eq!(
+            sigpoll_fd(dispatcher.take_pending_siginfo(tid, signum).unwrap()),
+            child_fd
+        );
+    }
+
+    #[test]
+    fn dnotify_child_attrib_matches_macos_private_tmp_alias() {
+        let dispatcher = SyscallDispatcher::new();
+        let tid = crate::thread::ThreadId::main_from_host_pid();
+        let signum = 34;
+
+        let parent_fd = dispatcher
+            .install_fd_at_or_above(3, test_directory_open_file("/private/tmp/watched"))
+            .unwrap();
+        dispatcher
+            .open_file(parent_fd)
+            .unwrap()
+            .description
+            .write()
+            .set_async_sig(signum);
+
+        dispatcher
+            .dnotify_register(
+                parent_fd,
+                LinuxDnotifyMask::ATTRIB | LinuxDnotifyMask::MULTISHOT,
+                tid,
+            )
+            .unwrap();
+
+        dispatcher.dnotify_attrib("/tmp/watched/child");
+
+        assert_eq!(
+            sigpoll_fd(dispatcher.take_pending_siginfo(tid, signum).unwrap()),
+            parent_fd
         );
     }
 

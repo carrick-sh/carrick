@@ -1416,6 +1416,8 @@ pub const LINUX_SI_QUEUE: i32 = -1;
 /// `si_code` for a `tkill(2)`/`tgkill(2)`-delivered signal (and glibc/musl
 /// `raise(3)`, which uses `tgkill`). Distinct from `SI_USER` (`kill(2)`).
 pub const LINUX_SI_TKILL: i32 = -6;
+/// `si_code` for poll/fasync/dnotify signals carrying `si_fd`.
+pub const LINUX_POLL_MSG: i32 = 3;
 
 #[repr(C, packed)]
 #[derive(
@@ -1467,6 +1469,19 @@ impl LinuxSiginfo {
     pub fn rt_queue(si_signo: i32, si_pid: i32, si_uid: u32, si_value: i64) -> Self {
         let mut s = Self::kill(si_signo, LINUX_SI_QUEUE, si_pid, si_uid);
         s._pad[0..8].copy_from_slice(&si_value.to_le_bytes());
+        s
+    }
+
+    /// Build a SIGPOLL/SIGIO-family siginfo carrying `{ si_band, si_fd }`.
+    /// On Linux aarch64 the `_sigpoll` member is `{ long si_band; int si_fd; }`
+    /// at offsets 16 and 24, so `si_band` occupies `si_addr` and `si_fd` starts
+    /// the trailing pad.
+    pub fn sigpoll(si_signo: i32, si_code: i32, si_band: i64, si_fd: i32) -> Self {
+        let mut s = Self::empty();
+        s.si_signo = si_signo;
+        s.si_code = si_code;
+        s.si_addr = si_band as u64;
+        s._pad[0..4].copy_from_slice(&si_fd.to_le_bytes());
         s
     }
 
@@ -2463,9 +2478,16 @@ pub const LINUX_F_OFD_SETLK: u64 = 37;
 pub const LINUX_F_OFD_SETLKW: u64 = 38;
 pub const LINUX_F_SETLEASE: u64 = 1024;
 pub const LINUX_F_GETLEASE: u64 = 1025;
-/// Directory-change notification (dnotify). macOS has no dnotify equivalent;
-/// carrick accepts the call as a no-op (see the fcntl handler comment).
+/// Directory-change notification (dnotify).
 pub const LINUX_F_NOTIFY: u64 = 1026;
+/// `F_NOTIFY` masks from fcntl(2).
+pub const LINUX_DN_ACCESS: u64 = 0x0000_0001;
+pub const LINUX_DN_MODIFY: u64 = 0x0000_0002;
+pub const LINUX_DN_CREATE: u64 = 0x0000_0004;
+pub const LINUX_DN_DELETE: u64 = 0x0000_0008;
+pub const LINUX_DN_RENAME: u64 = 0x0000_0010;
+pub const LINUX_DN_ATTRIB: u64 = 0x0000_0020;
+pub const LINUX_DN_MULTISHOT: u64 = 0x8000_0000;
 /// fcntl lock/lease type args (also l_type in struct flock).
 pub const LINUX_F_RDLCK: i32 = 0;
 pub const LINUX_F_WRLCK: i32 = 1;
@@ -3243,6 +3265,21 @@ bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct LinuxFdFlags: u64 {
         const CLOEXEC = LINUX_FD_CLOEXEC;
+    }
+
+    /// `F_NOTIFY` dnotify event bits. The raw `fcntl` argument is parsed at the
+    /// syscall boundary with `from_bits`; dispatch state stores this typed mask
+    /// so directory-change notifications cannot drift back into untyped `u64`
+    /// comparisons.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct LinuxDnotifyMask: u64 {
+        const ACCESS = LINUX_DN_ACCESS;
+        const MODIFY = LINUX_DN_MODIFY;
+        const CREATE = LINUX_DN_CREATE;
+        const DELETE = LINUX_DN_DELETE;
+        const RENAME = LINUX_DN_RENAME;
+        const ATTRIB = LINUX_DN_ATTRIB;
+        const MULTISHOT = LINUX_DN_MULTISHOT;
     }
 
     /// `mmap`/`mprotect` memory-protection bits. Previously tested as raw

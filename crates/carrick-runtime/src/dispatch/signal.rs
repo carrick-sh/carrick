@@ -2387,6 +2387,26 @@ mod tests {
     }
 
     #[test]
+    fn rt_signal_survives_handler_mask_restore() {
+        let d = SyscallDispatcher::new();
+        let tid = crate::thread::ThreadId::main_from_host_pid();
+        let signum = 34;
+        let action = LinuxSigaction {
+            sa_handler: 0x1000,
+            ..LinuxSigaction::empty()
+        };
+
+        d.mark_signal_pending(tid, signum);
+        d.mark_signal_pending(tid, signum);
+        assert_eq!(d.take_deliverable_pending(tid), Some(signum));
+        let saved = d.enter_signal_handler(tid, signum, action);
+        assert_eq!(d.take_deliverable_pending(tid), None);
+        d.restore_signal_mask(tid, saved);
+        assert_eq!(d.take_deliverable_pending(tid), Some(signum));
+        assert_eq!(d.take_deliverable_pending(tid), None);
+    }
+
+    #[test]
     fn wait_predicate_sees_shared_process_pending() {
         use carrick_abi::WaitSigMask;
 
