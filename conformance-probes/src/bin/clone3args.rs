@@ -27,6 +27,10 @@
 //!   * Inconsistent stack-size pair — `clone3({.stack=0, .stack_size=8192})`
 //!     returns -1 with errno in {EINVAL, ENOSYS}: stack==0 with non-zero
 //!     stack_size is rejected. (LTP clone05 / clone08 in spirit.)
+//!   * clone302 negative cases — bad extra-size user buffer, CLONE_SIGHAND
+//!     without CLONE_VM, CLONE_THREAD without CLONE_SIGHAND, CLONE_FS with
+//!     CLONE_NEWNS, invalid CLONE_PIDFD pointer, and invalid exit_signal are
+//!     rejected before forking.
 //!
 //! Deterministic output: booleans only. No pids, no raw errnos.
 //!
@@ -63,6 +67,27 @@ fn rejected_errno(er: i32) -> bool {
     er == libc::EINVAL || er == libc::ENOSYS
 }
 
+fn efault_or_blocked(er: i32) -> bool {
+    er == libc::EFAULT || er == libc::ENOSYS
+}
+
+unsafe fn rejected_without_child(
+    args: &mut CloneArgs,
+    size: usize,
+    errno_ok: fn(i32) -> bool,
+) -> bool {
+    let rc = clone3(args, size);
+    let er = errno();
+    if rc == 0 {
+        libc::_exit(0);
+    }
+    if rc > 0 {
+        let _ = reap(rc as i32);
+        return false;
+    }
+    rc == -1 && errno_ok(er)
+}
+
 fn case_happy_path() {
     unsafe {
         let mut args = CloneArgs::default();
@@ -90,6 +115,37 @@ fn case_happy_path() {
     }
 }
 
+fn case_extra_size_fault() {
+    unsafe {
+        const PAGE: usize = 4096;
+        let mapping = libc::mmap(
+            core::ptr::null_mut(),
+            PAGE * 2,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        );
+        if mapping == libc::MAP_FAILED {
+            report!(clone3_extra_size_efault_or_blocked = false);
+            return;
+        }
+        let second = (mapping as usize + PAGE) as *mut libc::c_void;
+        let _ = libc::mprotect(second, PAGE, libc::PROT_NONE);
+        let args_ptr =
+            (mapping as usize + PAGE - core::mem::size_of::<CloneArgs>()) as *mut CloneArgs;
+        *args_ptr = CloneArgs::default();
+        (*args_ptr).exit_signal = libc::SIGCHLD as u64;
+        let ok = rejected_without_child(
+            args_ptr.as_mut().unwrap(),
+            core::mem::size_of::<CloneArgs>() + 1,
+            efault_or_blocked,
+        );
+        let _ = libc::munmap(mapping, PAGE * 2);
+        report!(clone3_extra_size_efault_or_blocked = ok);
+    }
+}
+
 fn case_truncated_size() {
     unsafe {
         let mut args = CloneArgs::default();
@@ -103,6 +159,86 @@ fn case_truncated_size() {
             clone3_truncated_rc_minus_one = rc == -1,
             clone3_truncated_rejected = rc == -1 && rejected_errno(er),
         );
+    }
+}
+
+fn case_flag_consistency() {
+    const CLONE_VM: u64 = 0x0000_0100;
+    const CLONE_FS: u64 = 0x0000_0200;
+    const CLONE_SIGHAND: u64 = 0x0000_0800;
+    const CLONE_PIDFD: u64 = 0x0000_1000;
+    const CLONE_THREAD: u64 = 0x0001_0000;
+    const CLONE_NEWNS: u64 = 0x0002_0000;
+
+    unsafe {
+        let size = core::mem::size_of::<CloneArgs>();
+
+        let mut sighand_no_vm = CloneArgs {
+            flags: CLONE_SIGHAND,
+            exit_signal: libc::SIGCHLD as u64,
+            ..CloneArgs::default()
+        };
+        let sighand_no_vm_ok = rejected_without_child(&mut sighand_no_vm, size, rejected_errno);
+
+        let mut thread_no_sighand = CloneArgs {
+            flags: CLONE_VM | CLONE_THREAD,
+            exit_signal: libc::SIGCHLD as u64,
+            ..CloneArgs::default()
+        };
+        let thread_no_sighand_ok =
+            rejected_without_child(&mut thread_no_sighand, size, rejected_errno);
+
+        let mut fs_newns = CloneArgs {
+            flags: CLONE_FS | CLONE_NEWNS,
+            exit_signal: libc::SIGCHLD as u64,
+            ..CloneArgs::default()
+        };
+        let fs_newns_ok = rejected_without_child(&mut fs_newns, size, rejected_errno);
+
+        let mut invalid_pidfd = CloneArgs {
+            flags: CLONE_PIDFD,
+            pidfd: 1,
+            exit_signal: libc::SIGCHLD as u64,
+            ..CloneArgs::default()
+        };
+        let invalid_pidfd_ok = rejected_without_child(&mut invalid_pidfd, size, efault_or_blocked);
+
+        let mut invalid_signal = CloneArgs {
+            exit_signal: 0x100,
+            ..CloneArgs::default()
+        };
+        let invalid_signal_ok = rejected_without_child(&mut invalid_signal, size, rejected_errno);
+
+        report!(
+            clone3_sighand_no_vm_rejected = sighand_no_vm_ok,
+            clone3_thread_no_sighand_rejected = thread_no_sighand_ok,
+            clone3_fs_newns_rejected = fs_newns_ok,
+            clone3_invalid_pidfd_efault_or_blocked = invalid_pidfd_ok,
+            clone3_invalid_signal_rejected = invalid_signal_ok,
+        );
+    }
+}
+
+fn case_newpid_fork() {
+    const CLONE_NEWPID: u64 = 0x2000_0000;
+
+    unsafe {
+        let mut args = CloneArgs {
+            flags: CLONE_NEWPID,
+            exit_signal: libc::SIGCHLD as u64,
+            ..CloneArgs::default()
+        };
+        let rc = clone3(&mut args, core::mem::size_of::<CloneArgs>());
+        let er = errno();
+        let ok = if rc == 0 {
+            libc::_exit(0);
+        } else if rc > 0 {
+            let (_, status) = reap(rc as i32);
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
+        } else {
+            er == libc::ENOSYS || er == libc::EPERM
+        };
+        report!(clone3_newpid_fork_or_blocked = ok);
     }
 }
 
@@ -145,7 +281,10 @@ fn case_inconsistent_stack_pair() {
 
 fn main() {
     case_happy_path();
+    case_extra_size_fault();
     case_truncated_size();
+    case_flag_consistency();
+    case_newpid_fork();
     case_invalid_flag_bit();
     case_inconsistent_stack_pair();
 }

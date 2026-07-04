@@ -8317,6 +8317,7 @@ tier = "full"
 weight = "light"
 timeout_s = 40
 carrick_flags = ["--raw", "--fs", "host"]
+docker_flags = ["--security-opt", "seccomp=unconfined"]
 
 [[suite]]
 name = "ltp-clone302"
@@ -8328,6 +8329,7 @@ tier = "full"
 weight = "light"
 timeout_s = 40
 carrick_flags = ["--raw", "--fs", "host"]
+docker_flags = ["--security-opt", "seccomp=unconfined"]
 
 [[suite]]
 name = "ltp-clone303"
