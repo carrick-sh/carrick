@@ -90,7 +90,7 @@ const fn syscall(
 
 pub const fn handler_for_aarch64(number: u64) -> SyscallHandler {
     match number {
-        5..=17
+        0..=17
         | 23..=29
         | 32..=38
         | 43..=50
@@ -162,11 +162,11 @@ pub const fn compat_note_for_aarch64(number: u64) -> Option<&'static str> {
 // are unassigned on aarch64 and intentionally absent. MUST stay sorted by
 // number for the binary search in `lookup_aarch64`.
 const AARCH64_SYSCALLS: &[Syscall] = &[
-    syscall(0, "io_setup", "io", SupportLevel::Deferred),
-    syscall(1, "io_destroy", "io", SupportLevel::Deferred),
-    syscall(2, "io_submit", "io", SupportLevel::Deferred),
-    syscall(3, "io_cancel", "io", SupportLevel::Deferred),
-    syscall(4, "io_getevents", "io", SupportLevel::Deferred),
+    syscall(0, "io_setup", "io", SupportLevel::BringUp),
+    syscall(1, "io_destroy", "io", SupportLevel::BringUp),
+    syscall(2, "io_submit", "io", SupportLevel::BringUp),
+    syscall(3, "io_cancel", "io", SupportLevel::BringUp),
+    syscall(4, "io_getevents", "io", SupportLevel::BringUp),
     syscall(5, "setxattr", "fs", SupportLevel::BringUp),
     syscall(6, "lsetxattr", "fs", SupportLevel::BringUp),
     syscall(7, "fsetxattr", "fs", SupportLevel::BringUp),
