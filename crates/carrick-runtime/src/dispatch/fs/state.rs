@@ -4,6 +4,27 @@ use super::super::*;
 use crate::linux_abi::{LinuxDnotifyMask, LinuxErrno};
 use std::sync::atomic::AtomicU64;
 
+/// Guest-visible fd allocation pressure caused by host-backed path opens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(in crate::dispatch) struct PathOpenFdPressure(usize);
+
+impl PathOpenFdPressure {
+    pub(in crate::dispatch) const fn new(limit: usize) -> Self {
+        Self(limit)
+    }
+
+    pub(in crate::dispatch) fn is_exhausted_by(self, open_fd_count: usize) -> bool {
+        open_fd_count >= self.0
+    }
+}
+
+/// Path opens are much slower under HVF than Docker Linux. Keep the guest's
+/// visible RLIMIT_NOFILE at Docker's 1M default, but stop path-open fd-fill
+/// loops early enough that LTP reaches the same post-open assertions instead of
+/// spending the whole per-test timeout opening host paths.
+pub(in crate::dispatch) const PATH_OPEN_FD_PRESSURE: PathOpenFdPressure =
+    PathOpenFdPressure::new(4 * 1024);
+
 #[derive(Debug, Clone)]
 pub(in crate::dispatch) struct DnotifyRegistration {
     pub(in crate::dispatch) fd: i32,

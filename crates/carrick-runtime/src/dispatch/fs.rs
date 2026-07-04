@@ -1290,10 +1290,11 @@ impl SyscallDispatcher {
         // Path opens can be much slower under HVF than native Linux because
         // every guest open is a trap plus host VFS work. Keep the guest's
         // RLIMIT_NOFILE at Docker's 1M default, but bound path-open pressure so
-        // fd-fill tests hit a host-resource-style EMFILE quickly while
+        // fd-fill tests reach the post-open assertion quickly while
         // descriptor-only duplication can still allocate within RLIMIT_NOFILE.
-        const PATH_OPEN_SOFT_CEILING: usize = 64 * 1024;
-        if self.io.open_files.read().len() >= PATH_OPEN_SOFT_CEILING {
+        if crate::dispatch::fs::state::PATH_OPEN_FD_PRESSURE
+            .is_exhausted_by(self.io.open_files.read().len())
+        {
             return Ok(DispatchOutcome::errno(linux_errno::EMFILE));
         }
         let writable_request = access == LINUX_O_WRONLY || access == LINUX_O_RDWR;
