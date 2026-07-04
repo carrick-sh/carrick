@@ -950,6 +950,15 @@ impl SyscallDispatcher {
             let length_usize =
                 usize::try_from(length).map_err(|_| DispatchError::LengthTooLarge(length))?;
 
+            // An O_PATH descriptor is not open for I/O — mmap on it returns
+            // EBADF (LTP open13 maps an O_PATH fd and expects failure).
+            if !map_flags.contains(LinuxMmapFlags::ANONYMOUS)
+                && let Some(open_file) = this.open_file(fd.0)
+                && open_file.description.read().status_flags() & crate::linux_abi::LINUX_O_PATH != 0
+            {
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            }
+
             if !map_flags.contains(LinuxMmapFlags::ANONYMOUS)
                 && let Some(open_file) = this.open_file(fd.0)
                 && open_file.description.read().status_flags() & LINUX_O_ACCMODE == LINUX_O_WRONLY

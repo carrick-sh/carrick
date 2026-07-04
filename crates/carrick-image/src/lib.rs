@@ -647,7 +647,7 @@ impl ImageStore {
             .await
     }
 
-    /// Like [`resolve_with_platform`], but honours a Docker `--pull`
+    /// Like [`Self::resolve_with_platform`], but honours a Docker `--pull`
     /// [`PullPolicy`]: `Missing` pulls only when the image is absent (docker's
     /// default), `Always` re-checks the registry and re-pulls a MOVED tag (so a
     /// rebuilt+repushed image is never served stale), and `Never` uses only the

@@ -85,6 +85,24 @@ fn main() {
     let is_reg = (st.st_mode & libc::S_IFMT) == libc::S_IFREG;
     println!("fstat_ok={}", sr == 0 && is_reg);
 
+    // mmap() on an O_PATH fd → MAP_FAILED / EBADF. Linux refuses to map an
+    // O_PATH descriptor even with PROT_READ and MAP_PRIVATE (the descriptor is
+    // not open for I/O so there is nothing to map from).
+    let m = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            4096,
+            libc::PROT_READ,
+            libc::MAP_PRIVATE,
+            fd,
+            0,
+        )
+    };
+    println!(
+        "mmap_ebadf={}",
+        m == libc::MAP_FAILED && errno() == libc::EBADF
+    );
+
     unsafe { libc::close(fd) };
 }
 
