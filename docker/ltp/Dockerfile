@@ -29,10 +29,10 @@ RUN make autotools \
     && make -C pan install || true
 
 # Runtime image: just the built testcases + a shell. Keep ubuntu:24.04 base so
-# the dynamic loader / libc match what carrick already exercises. strace is a
-# carrick debugging aid for this local fixture (never deployed).
+# the dynamic loader / libc match what carrick already exercises. strace and
+# bpftrace are carrick debugging aids for this local fixture (never deployed).
 FROM ubuntu:24.04
-RUN apt-get update && apt-get install -y --no-install-recommends strace \
+RUN apt-get update && apt-get install -y --no-install-recommends strace bpftrace \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /opt/ltp /opt/ltp
 ENV PATH=/opt/ltp/testcases/bin:$PATH
