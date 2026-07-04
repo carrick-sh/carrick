@@ -588,11 +588,11 @@ impl SyscallDispatcher {
         }
 
         fn adjtimex(this, cx, address: GuestPtr) {
-            Ok(adjtimex_bootstrap(&*cx.memory, address.0))
+            Ok(adjtimex_bootstrap(&mut *cx.memory, address.0))
         }
 
         fn clock_adjtime(this, cx, clock_id: u64, address: GuestPtr) {
-            let memory = &*cx.memory;
+            let memory = &mut *cx.memory;
             if clock_id != LINUX_CLOCK_REALTIME {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }

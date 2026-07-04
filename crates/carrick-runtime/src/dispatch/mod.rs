@@ -146,6 +146,7 @@ use crate::compat::{CompatEvent, CompatReporter, SyscallArgs};
 use crate::fs_backend::FsBackend;
 use crate::linux_abi::{
     KernelAbi,
+    LINUX_ADJ_OFFSET_SINGLESHOT_FLAG_ONLY,
     // ABI constants moved from dispatch.rs (Goal #3, private set)
     LINUX_AF_INET,
     LINUX_AF_INET6,
@@ -529,6 +530,7 @@ use crate::linux_abi::{
     LINUX_TERMIOS2_SIZE,
     LINUX_TFD_CLOEXEC,
     LINUX_TFD_NONBLOCK,
+    LINUX_TIME_ERROR,
     LINUX_TIMER_ABSTIME,
     LINUX_TIOCGPGRP,
     LINUX_TIOCGPTN,
@@ -590,6 +592,7 @@ use crate::linux_abi::{
     LinuxTimerfdExpirations,
     LinuxTimespec,
     LinuxTimeval,
+    LinuxTimex,
     LinuxTimezone,
     LinuxTms,
     LinuxUtsname,
@@ -3824,22 +3827,29 @@ fn linux_timeval_usec_is_valid(tv: LinuxTimeval) -> bool {
     (0..1_000_000).contains(&usec)
 }
 
-fn adjtimex_bootstrap(memory: &impl GuestMemory, address: u64) -> DispatchOutcome {
-    if address == 0 {
-        return DispatchOutcome::Errno {
-            errno: LINUX_EFAULT,
+fn adjtimex_bootstrap(memory: &mut impl GuestMemory, address: u64) -> DispatchOutcome {
+    let timex = match read_kernel_struct::<LinuxTimex>(memory, address) {
+        Ok(timex) => timex,
+        Err(errno) => return DispatchOutcome::Errno { errno },
+    };
+    if timex.modes == 0 {
+        let current = LinuxTimex::new_read_state(linux_timeval_from_duration(realtime_duration()));
+        return match write_kernel_struct(memory, address, &current) {
+            DispatchOutcome::Returned { value: 0 } => DispatchOutcome::Returned {
+                value: LINUX_TIME_ERROR,
+            },
+            other => other,
         };
     }
-    // Probe the leading 8 bytes (modes + frequency word) to detect a bad
-    // pointer; we deliberately do not interpret the rest of the timex struct.
-    if memory.read_bytes(address, 8).is_err() {
-        return DispatchOutcome::Errno {
-            errno: LINUX_EFAULT,
+    if timex.modes == LINUX_ADJ_OFFSET_SINGLESHOT_FLAG_ONLY {
+        let invalid = LinuxTimex::invalid_mode_error_state();
+        return match write_kernel_struct(memory, address, &invalid) {
+            DispatchOutcome::Returned { value: 0 } => DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            },
+            other => other,
         };
     }
-    // We are unprivileged and we do not actually adjust the host clock.
-    // Real Linux short-circuits modes==0 to "return current clock state",
-    // but for bootstrap we always return EPERM and let glibc fall back.
     DispatchOutcome::Errno { errno: LINUX_EPERM }
 }
 
