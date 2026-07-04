@@ -142,7 +142,7 @@ fn privileged_op_stubs_return_eperm_or_enosys() {
             )
             .unwrap(),
         DispatchOutcome::Errno {
-            errno: LinuxErrno::new(38)
+            errno: LinuxErrno::new(3)
         }
     );
     // reboot / sethostname / setdomainname / settimeofday → EPERM.
@@ -608,6 +608,12 @@ fn seccomp_filter_blocks_the_targeted_syscall_with_errno() {
         run(&mut dispatcher, &mut memory, 172, [0; 6]),
         DispatchOutcome::Returned { value } if value > 0
     ));
+
+    // PR_SET_NO_NEW_PRIVS (38) is required before SECCOMP_SET_MODE_FILTER.
+    assert_eq!(
+        run(&mut dispatcher, &mut memory, 167, [38, 1, 0, 0, 0, 0]),
+        DispatchOutcome::Returned { value: 0 }
+    );
 
     // seccomp(SECCOMP_SET_MODE_FILTER=1, flags=0, &fprog) -> 0.
     assert_eq!(
