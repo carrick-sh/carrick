@@ -194,7 +194,10 @@ If it fails in Docker too, it's not carrick's bug.
   `docker run --rm --privileged --pid=host localhost:5050/ltp:arm64 sh -lc 'mount -t tracefs tracefs /sys/kernel/tracing 2>/dev/null || true; bpftrace -e "..." -c /opt/ltp/testcases/bin/<case>'`.
   If `bpftrace -l 'tracepoint:syscalls:*'` says
   `/sys/kernel/tracing/available_events` is missing, the tracefs mount step was
-  skipped.
+  skipped. Keep the trace attached to the Linux oracle's semantics, not just to
+  "what failed under Carrick": for example, Docker `mmap13` showed a shared file
+  mapping past EOF is `SIGBUS`/`BUS_ADRERR`, while `mmap18`'s first cases pass
+  because Linux grows the stack VMA before faulting.
 - **The cache key is the suite *declaration*, not the image digest.** It is a
   stable JSON of `OracleKey` (image, cmd, env, `docker_platform`, verdict…), so
   the committed cache stays valid across machines that may not have the images.
