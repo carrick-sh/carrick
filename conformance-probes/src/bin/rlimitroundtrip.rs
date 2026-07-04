@@ -8,6 +8,7 @@
 //!   - setrlimit(RLIMIT_STACK, {soft, prior_hard}) then getrlimit's soft matches.
 //!   - Resources are independent: setting CORE does not perturb STACK.
 //!   - rlim_cur > rlim_max is rejected with EINVAL.
+//!   - Raising a hard limit after lowering it is rejected with EPERM.
 
 use conformance_probes::{errno, report};
 
@@ -54,5 +55,12 @@ fn main() {
         };
         let rc = libc::setrlimit(libc::RLIMIT_CORE, &bad);
         report!(core_cur_gt_max_einval = rc == -1 && errno() == libc::EINVAL);
+
+        let raise_hard = libc::rlimit {
+            rlim_cur: 12345,
+            rlim_max: 67891,
+        };
+        let rc = libc::setrlimit(libc::RLIMIT_CORE, &raise_hard);
+        report!(core_raise_hard_eperm = rc == -1 && errno() == libc::EPERM);
     }
 }
