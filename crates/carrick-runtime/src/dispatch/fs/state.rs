@@ -128,7 +128,8 @@ pub(in crate::dispatch) struct IoState {
     /// entering the guest-visible context namespace.
     pub next_legacy_aio_context: AtomicU64,
     /// Guest soft RLIMIT_NOFILE: the highest fd the allocator hands out
-    /// (`fd < nofile_soft`). Linux default 1024; a guest may raise it via
+    /// (`fd < nofile_soft`). The default mirrors Docker's LTP oracle and
+    /// carrick's exposed `nr_open` ceiling; a guest may lower/raise it via
     /// setrlimit/prlimit64 (libuv's TEST_FILE_LIMIT does). Lock-free so the fd
     /// allocator can read it while holding open_files (never the proc lock).
     pub nofile_soft: AtomicU64,
@@ -142,16 +143,11 @@ pub(in crate::dispatch) struct IoState {
     pub epoll_fds: RwLock<std::collections::BTreeSet<i32>>,
 }
 
-/// Default soft RLIMIT_NOFILE. We keep the bare-Linux 1024 rather than the
-/// Docker daemon default (1048576) ON PURPOSE: `sysconf(SC_OPEN_MAX)` returns
-/// this, and CPython's test helper `fd_status.py` scans `range(0, SC_OPEN_MAX)`
-/// calling fstat on each fd. Under carrick every fstat is an HVF trap+dispatch
-/// (~µs), so a 1048576-wide scan costs seconds and test_subprocess.test_close_fds
-/// (which spawns fd_status.py repeatedly) times out. The cost is fine natively
-/// (~100ns/fstat) but fatal here; 1024 keeps such scans cheap. The tradeoff is a
-/// benign skip-vs-run divergence on test_no_leaking (it opens 1026 fds; Docker's
-/// huge limit makes it skip, carrick runs it and PASSES).
-pub(in crate::dispatch) const DEFAULT_NOFILE_SOFT: u64 = 1024;
+/// Default soft RLIMIT_NOFILE. Docker's LTP oracle starts processes with the
+/// soft cap raised to the Linux `nr_open` ceiling; matching that avoids a
+/// guest-visible split between `getrlimit(RLIMIT_NOFILE)`,
+/// `/proc/sys/fs/nr_open`, and fd allocation.
+pub(in crate::dispatch) const DEFAULT_NOFILE_SOFT: u64 = 1024 * 1024;
 
 impl IoState {
     pub(in crate::dispatch) fn new() -> Self {

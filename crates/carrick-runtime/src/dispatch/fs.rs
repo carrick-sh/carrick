@@ -1287,6 +1287,15 @@ impl SyscallDispatcher {
         if access != LINUX_O_RDONLY && access != LINUX_O_WRONLY && access != LINUX_O_RDWR {
             return Ok(DispatchOutcome::errno(LINUX_EINVAL));
         }
+        // Path opens can be much slower under HVF than native Linux because
+        // every guest open is a trap plus host VFS work. Keep the guest's
+        // RLIMIT_NOFILE at Docker's 1M default, but bound path-open pressure so
+        // fd-fill tests hit a host-resource-style EMFILE quickly while
+        // descriptor-only duplication can still allocate within RLIMIT_NOFILE.
+        const PATH_OPEN_SOFT_CEILING: usize = 64 * 1024;
+        if self.io.open_files.read().len() >= PATH_OPEN_SOFT_CEILING {
+            return Ok(DispatchOutcome::errno(linux_errno::EMFILE));
+        }
         let writable_request = access == LINUX_O_WRONLY || access == LINUX_O_RDWR;
         // Parse the open flags once; `flags` (raw u64) is still used below where
         // the access-mode bits or a raw mask (e.g. `flags & !O_CLOEXEC`) is needed.
