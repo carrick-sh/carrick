@@ -1738,6 +1738,32 @@ const LINUX_SETVAL: u64 = 16;
 const LINUX_SETALL: u64 = 17;
 const LINUX_SEM_IPC_NOWAIT: i16 = 0o4000; // IPC_NOWAIT in sem_flg
 
+struct SysvSemBlockStateGuard {
+    tid: crate::thread::ThreadId,
+}
+
+impl SysvSemBlockStateGuard {
+    fn new(tid: crate::thread::ThreadId) -> Self {
+        crate::run_state::publish(crate::run_state::RunState::Blocked);
+        crate::thread::set_current_thread_state(tid, 'S');
+        crate::run_state::publish_guest_tid(tid.raw(), crate::run_state::RunState::Blocked);
+        Self { tid }
+    }
+}
+
+impl Drop for SysvSemBlockStateGuard {
+    fn drop(&mut self) {
+        crate::thread::set_current_thread_state(self.tid, 'R');
+        crate::run_state::publish_guest_tid(self.tid.raw(), crate::run_state::RunState::Running);
+        crate::run_state::publish(crate::run_state::RunState::Running);
+    }
+}
+
+fn semop_may_block(sops: &[carrick_portable::Sembuf]) -> bool {
+    sops.iter()
+        .any(|s| s.sem_op <= 0 && s.sem_flg & LINUX_SEM_IPC_NOWAIT == 0)
+}
+
 /// Shared semop / semtimedop core. Reads the `nsops` sembuf entries (Linux ==
 /// macOS layout) and forwards to host `semop`. For a timed wait (macOS has no
 /// semtimedop) it retries an IPC_NOWAIT variant until the deadline, mapping a
@@ -1748,6 +1774,7 @@ fn sysv_semop<M: GuestMemory>(
     sops_addr: u64,
     nsops: usize,
     timeout: Option<LinuxTimespec>,
+    interrupted: &dyn Fn() -> bool,
 ) -> Result<DispatchOutcome, DispatchError> {
     if nsops == 0 {
         return Ok(DispatchOutcome::errno(LINUX_EINVAL));
@@ -1769,6 +1796,8 @@ fn sysv_semop<M: GuestMemory>(
             sem_flg: i16::from_le_bytes([bytes[o + 4], bytes[o + 5]]),
         });
     }
+    let may_block = semop_may_block(&sops);
+    let _block_state = may_block.then(|| SysvSemBlockStateGuard::new(cx.tid()));
 
     if timeout.is_none() {
         let rc = unsafe { carrick_portable::semop(semid, sops.as_mut_ptr(), nsops) };
@@ -1794,16 +1823,24 @@ fn sysv_semop<M: GuestMemory>(
     for s in &mut nowait {
         s.sem_flg |= LINUX_SEM_IPC_NOWAIT;
     }
+    let mut saw_would_block = false;
     loop {
+        if interrupted() {
+            return Ok(DispatchOutcome::errno(LINUX_EINTR));
+        }
         let mut attempt = nowait.clone();
         let rc = unsafe { carrick_portable::semop(semid, attempt.as_mut_ptr(), nsops) };
         match rc.host_syscall_errno() {
             Ok(_) => return Ok(DispatchOutcome::Returned { value: 0 }),
             Err(e) if e == LINUX_EAGAIN => {
+                saw_would_block = true;
                 if std::time::Instant::now() >= deadline {
                     return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
                 }
                 std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            Err(e) if e == LINUX_EINVAL && saw_would_block && may_block => {
+                return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIDRM));
             }
             Err(errno) => return Ok(DispatchOutcome::errno(errno)),
         }
@@ -1870,7 +1907,13 @@ impl SyscallDispatcher {
             Ok(host_id) => host_id,
             Err(errno) => return Ok(DispatchOutcome::errno(errno)),
         };
-        sysv_semop(cx, host_id.raw(), sops_addr, nsops, timeout)
+        let tid = cx.tid();
+        sysv_semop(cx, host_id.raw(), sops_addr, nsops, timeout, &|| {
+            crate::host_signal::has_unblocked_pending_for(
+                tid.raw(),
+                carrick_abi::SigBlockMask::NONE,
+            ) || self.has_deliverable_dispatch_pending_for_wait(tid, carrick_abi::WaitSigMask::NONE)
+        })
     }
 
     fn sysv_semctl<M: GuestMemory>(
