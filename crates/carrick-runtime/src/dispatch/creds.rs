@@ -779,6 +779,8 @@ impl SyscallDispatcher {
             let bootstrap_host_pid = this.proc.lock().bootstrap_host_pid;
             let value = if std::process::id() == bootstrap_host_pid {
                 LINUX_BOOTSTRAP_PID as i64
+            } else if let Some(parent) = crate::guest_cpu::adopted_parent_for_self() {
+                i64::from(parent)
             } else {
                 unsafe { libc::getppid() as i64 }
             };

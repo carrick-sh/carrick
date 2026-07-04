@@ -242,7 +242,26 @@ pub(crate) fn forked_child_exit(
     stdout_buf: impl AsRef<[u8]>,
     stderr_buf: impl AsRef<[u8]>,
 ) -> ! {
-    crate::guest_cpu::record_child_exit(std::process::id(), crate::guest_cpu::total_ns());
+    let pid = std::process::id();
+    crate::guest_cpu::adopt_children_of(pid);
+    let adopted_parent = crate::guest_cpu::adopted_parent_for(pid);
+    crate::guest_cpu::record_child_exit_status(
+        pid,
+        crate::guest_cpu::total_ns(),
+        (code & 0xff) << 8,
+        adopted_parent.is_some(),
+    );
+    if let Some(parent) = adopted_parent {
+        let _ = crate::host_signal::xsig_enqueue(
+            parent as i32,
+            crate::linux_abi::LINUX_SIGCHLD,
+            0,
+            pid as i32,
+            0,
+            0,
+        );
+        crate::host_signal::xsig_nudge(parent as i32);
+    }
     let stdout_buf = stdout_buf.as_ref();
     let stderr_buf = stderr_buf.as_ref();
     let _ = unsafe { libc::write(1, stdout_buf.as_ptr() as *const _, stdout_buf.len()) };
@@ -300,7 +319,26 @@ pub(crate) fn forked_child_die_by_signal(
     stdout_buf: impl AsRef<[u8]>,
     stderr_buf: impl AsRef<[u8]>,
 ) -> ! {
-    crate::guest_cpu::record_child_exit(std::process::id(), crate::guest_cpu::total_ns());
+    let pid = std::process::id();
+    crate::guest_cpu::adopt_children_of(pid);
+    let adopted_parent = crate::guest_cpu::adopted_parent_for(pid);
+    crate::guest_cpu::record_child_exit_status(
+        pid,
+        crate::guest_cpu::total_ns(),
+        signum & 0x7f,
+        adopted_parent.is_some(),
+    );
+    if let Some(parent) = adopted_parent {
+        let _ = crate::host_signal::xsig_enqueue(
+            parent as i32,
+            crate::linux_abi::LINUX_SIGCHLD,
+            0,
+            pid as i32,
+            0,
+            0,
+        );
+        crate::host_signal::xsig_nudge(parent as i32);
+    }
     let stdout_buf = stdout_buf.as_ref();
     let stderr_buf = stderr_buf.as_ref();
     let _ = unsafe { libc::write(1, stdout_buf.as_ptr() as *const _, stdout_buf.len()) };
