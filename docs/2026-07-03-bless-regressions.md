@@ -48,7 +48,12 @@ oracle-cache edits are only used when the suite declaration itself changed.
   `futexforkrequeue` all MATCH.
 - `ltp-mq*`: `ltp-mq_notify01`, `ltp-mq_notify02`, `ltp-mq_notify03`,
   `ltp-mq_open01`, `ltp-mq_timedreceive01`, `ltp-mq_timedsend01`,
-  `ltp-mq_unlink01` all MATCH.
+  `ltp-mq_unlink01` all MATCH after `a4e170b8`. Root causes fixed:
+  `SIGEV_THREAD` mqueue notifications now use glibc's netlink-helper ABI,
+  `SIGEV_SIGNAL` notifications carry `SI_MESGQ` siginfo, and open descriptors
+  survive `mq_unlink` through a hidden backing-object hardlink. Red-first:
+  clean `987009ec` regressed `ltp-mq_notify01` at carrick[2/3] vs oracle[7/7]
+  and `ltp-mq_notify03` at carrick[1/6] vs oracle[7/7].
 - SysV message queues: prior focused SysV msg cluster run passed 22/22.
 - SysV shared memory: `ltp-shmctl01`, `ltp-shmctl02`, `ltp-shmctl03`,
   `ltp-shmctl04`, `ltp-shmctl05`, `ltp-shmctl06`, `ltp-shmctl07`,
