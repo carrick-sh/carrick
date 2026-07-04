@@ -2486,6 +2486,7 @@ CONFIG_AIO=y\n\
 CONFIG_FHANDLE=y\n\
 CONFIG_INOTIFY_USER=y\n\
 CONFIG_DNOTIFY=y\n\
+CONFIG_BLK_DEV_LOOP=y\n\
 CONFIG_SYSVIPC=y\n\
 CONFIG_SECCOMP=y\n\
 CONFIG_SECCOMP_FILTER=y\n\
@@ -3628,6 +3629,17 @@ mod tests {
         ] {
             assert!(names.iter().any(|n| n == want), "/proc missing {want}");
         }
+    }
+
+    #[test]
+    fn proc_config_reports_loop_device_support() {
+        use std::io::Read;
+
+        let gz = synthetic_proc_config_gz();
+        let mut decoder = flate2::read::GzDecoder::new(&gz[..]);
+        let mut config = String::new();
+        decoder.read_to_string(&mut config).unwrap();
+        assert!(config.contains("CONFIG_BLK_DEV_LOOP=y"));
     }
 
     #[test]
