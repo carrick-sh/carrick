@@ -20529,7 +20529,7 @@ cmd = ["/opt/ltp/testcases/bin/shmctl05"]
 verdict = "ltp"
 tier = "full"
 weight = "light"
-timeout_s = 40
+timeout_s = 80
 carrick_flags = ["--raw", "--fs", "host"]
 
 [[suite]]

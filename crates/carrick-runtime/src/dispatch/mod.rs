@@ -4015,6 +4015,7 @@ impl SyscallDispatcher {
             sig_ignored,
             sig_caught,
             sig_shdpnd,
+            sysvipc_shm: self.sysvipc_shm_table(),
         }
     }
 }

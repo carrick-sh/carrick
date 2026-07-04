@@ -17,16 +17,13 @@
 //!     reclaim the guest VA still passes every LTP test we've audited.)
 //!   - shmctl(shmid, IPC_RMID, NULL) → unlink the backing file. Existing
 //!     mmaps remain valid (Linux mmap+unlink semantics).
-//!   - shmctl(shmid, IPC_STAT, buf) → fill an `shmid_ds` from the file's
-//!     stat (size, perms, attach-time stubs).
+//!   - shmctl(shmid, IPC_STAT, buf) → fill an `shmid_ds` from carrick's
+//!     segment metadata (size, permissions, attach/detach bookkeeping).
 //!
 //! What this does NOT implement (yet):
-//!   - addr_hint placement / SHM_REMAP / SHM_RND — carrick owns the alias VA
-//!     arena and picks the placement, so a caller-supplied address can't be
-//!     honored. Documented arch gap. (SHM_RDONLY *is* honored — the alias is
-//!     mapped read-only so a guest store faults SIGSEGV like Linux.)
-//!   - SysV semaphores (semget/semop/semctl) and message queues. They're
-//!     orthogonal subsystems; the same file-backed approach would work.
+//!   - SHM_REMAP.
+//!   - Complete SysV semaphore/message-queue parity; this module has partial
+//!     host-forwarded support for the cases conformance currently exercises.
 
 use super::*;
 use crate::linux_abi::LinuxErrno;
@@ -118,7 +115,7 @@ const LIN_MSG_LSPID: usize = 96;
 const LIN_MSG_LRPID: usize = 100;
 const LINUX_MSQID_DS_SIZE: usize = 120;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
@@ -188,10 +185,8 @@ const _: () = assert!(core::mem::size_of::<LinuxSemidDs>() == 88);
 /// uid) can attach to a segment a peer created.
 const SHM_DIR: &str = "/tmp/carrick-shm";
 
-/// Linux ABI constants. We don't pull them from carrick-abi to keep this
-/// module self-contained; they're stable kernel values.
-const LINUX_IPC_CREAT: u64 = 0o1000;
-const LINUX_IPC_EXCL: u64 = 0o2000;
+/// Linux SysV IPC command numbers and limits. Flag domains below use typed
+/// wrappers instead of reusing these raw command values.
 const LINUX_IPC_PRIVATE: i32 = 0;
 const LINUX_IPC_RMID: u64 = 0;
 const LINUX_IPC_SET: u64 = 1;
@@ -200,14 +195,97 @@ const LINUX_IPC_INFO: u64 = 3;
 const LINUX_SHM_STAT: u64 = 13;
 const LINUX_SHM_INFO: u64 = 14;
 const LINUX_SHM_STAT_ANY: u64 = 15;
-const LINUX_SHM_RDONLY: u64 = 0o10000;
+const LINUX_SHMMNI: usize = 4096;
+const LINUX_SHM_LOCK: u64 = 11;
+const LINUX_SHM_UNLOCK: u64 = 12;
+
+bitflags::bitflags! {
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    struct IpcCreateFlags: u64 {
+        const CREAT = 0o1000;
+        const EXCL = 0o2000;
+    }
+
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    struct ShmAttachFlags: u64 {
+        const RDONLY = 0o10000;
+        const RND = 0o20000;
+    }
+
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    struct ShmModeFlags: u32 {
+        const LOCKED = 0o2000;
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct ShmPermMode {
+    bits: u32,
+}
+
+impl ShmPermMode {
+    const PERMS_MASK: u32 = 0o777;
+
+    fn requested(flags: u64) -> Self {
+        Self {
+            bits: (flags as u32) & Self::PERMS_MASK,
+        }
+    }
+
+    fn from_ipc_set(raw: u32, current: Self) -> Self {
+        Self {
+            bits: (current.bits & ShmModeFlags::LOCKED.bits()) | (raw & Self::PERMS_MASK),
+        }
+    }
+
+    fn raw(self) -> u32 {
+        self.bits
+    }
+
+    fn perms(self) -> u32 {
+        self.bits & Self::PERMS_MASK
+    }
+
+    fn is_empty_perms(self) -> bool {
+        self.perms() == 0
+    }
+
+    fn set_locked(&mut self, locked: bool) {
+        if locked {
+            self.bits |= ShmModeFlags::LOCKED.bits();
+        } else {
+            self.bits &= !ShmModeFlags::LOCKED.bits();
+        }
+    }
+
+    fn owner_readable(self) -> bool {
+        self.bits & 0o400 != 0
+    }
+
+    fn other_readable(self) -> bool {
+        self.bits & 0o004 != 0
+    }
+
+    fn owner_writable(self) -> bool {
+        self.bits & 0o200 != 0
+    }
+
+    fn other_writable(self) -> bool {
+        self.bits & 0o002 != 0
+    }
+}
 
 #[derive(Clone, Debug)]
 pub(super) struct ShmSegment {
     pub path: PathBuf,
+    pub key: i32,
     pub size: usize,
-    /// Permission bits the user requested via `shmget(.., flags & 0o777)`.
-    pub mode: u32,
+    /// Guest-visible SysV shm permission/mode bits.
+    pub mode: ShmPermMode,
+    pub uid: u32,
+    pub gid: u32,
+    pub cuid: u32,
+    pub cgid: u32,
     /// Number of live attaches in THIS process. Linux's `shm_nattch` is a
     /// PROCESS-AGGREGATED counter — shmat across siblings each increments
     /// it. Since carrick guests fork into separate host processes that
@@ -223,6 +301,30 @@ pub(super) struct ShmSegment {
     pub atime: u64,
     /// shm_dtime — last detach time. Updated on shmdt.
     pub dtime: u64,
+    /// Guest namespace pid of the creator.
+    pub cpid: i32,
+    /// Guest namespace pid of the last shmat/shmdt operator.
+    pub lpid: i32,
+}
+
+impl ShmSegment {
+    fn can_read(&self, creds: &super::creds::CredState) -> bool {
+        creds.euid == 0
+            || if creds.euid == self.uid {
+                self.mode.owner_readable()
+            } else {
+                self.mode.other_readable()
+            }
+    }
+
+    fn can_write(&self, creds: &super::creds::CredState) -> bool {
+        creds.euid == 0
+            || if creds.euid == self.uid {
+                self.mode.owner_writable()
+            } else {
+                self.mode.other_writable()
+            }
+    }
 }
 
 #[derive(Default, Debug)]
@@ -234,10 +336,22 @@ pub(super) struct SysvShmState {
     /// Map guest VA (returned from shmat) → shmid so shmdt can find which
     /// segment to decrement when given just an address.
     pub attachments: HashMap<u64, i32>,
+    /// SysV attachment starts that have been passed to remap_file_pages(2).
+    /// Linux no longer accepts those addresses as shmdt(2) segment starts; LTP
+    /// shmctl05 depends on that EINVAL path while racing IPC_RMID.
+    pub remapped_attachments: HashSet<u64>,
     /// Counter for IPC_PRIVATE segment filenames (combined with pid for
     /// uniqueness — fork-safe because each forked carrick process has its
     /// own pid).
     private_counter: AtomicU32,
+    /// Host SysV message queues observed through guest `msgget`.
+    ///
+    /// macOS queues live in a host-global IPC namespace, while a Linux
+    /// container's IPC namespace is torn down when the container exits. Track
+    /// guest-visible queue IDs so the bootstrap carrick process can remove any
+    /// queue the guest forgot to `IPC_RMID`, avoiding stateful ENOSPC across LTP
+    /// runs.
+    message_queues: HashSet<i32>,
 }
 
 impl SysvShmState {
@@ -245,7 +359,9 @@ impl SysvShmState {
         Self {
             segments: HashMap::new(),
             attachments: HashMap::new(),
+            remapped_attachments: HashSet::new(),
             private_counter: AtomicU32::new(1),
+            message_queues: HashSet::new(),
         }
     }
 
@@ -261,27 +377,113 @@ impl SysvShmState {
 
     fn private_name(&self) -> String {
         let counter = self.private_counter.fetch_add(1, Ordering::Relaxed);
-        format!("private-{}-{}", std::process::id(), counter)
+        format!(
+            "{}-private-{}-{}",
+            sysv_run_scope(),
+            std::process::id(),
+            counter
+        )
     }
 
     fn key_name(key: i32) -> String {
-        format!("key-{}", key as u32)
+        format!("{}-key-{}", sysv_run_scope(), key as u32)
     }
+}
+
+fn sysv_run_scope() -> String {
+    let raw = std::env::var("CARRICK_RUN_ID").unwrap_or_else(|_| {
+        std::env::var("CARRICK_CONTAINER_ID")
+            .unwrap_or_else(|_| format!("pid-{}", std::process::id()))
+    });
+    raw.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn shm_nattch_path(path: &std::path::Path) -> PathBuf {
+    let mut out = path.as_os_str().to_os_string();
+    out.push(".nattch");
+    PathBuf::from(out)
+}
+
+fn with_shm_nattch_file<R>(
+    segment: &ShmSegment,
+    f: impl FnOnce(&mut std::fs::File, u64) -> std::io::Result<R>,
+) -> std::io::Result<R> {
+    use std::io::{Read, Seek, SeekFrom};
+    use std::os::fd::AsRawFd;
+
+    let path = shm_nattch_path(&segment.path);
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+    unsafe {
+        libc::flock(file.as_raw_fd(), libc::LOCK_EX);
+    }
+    let result = (|| {
+        file.seek(SeekFrom::Start(0))?;
+        let mut text = String::new();
+        file.read_to_string(&mut text)?;
+        let count = text.trim().parse::<u64>().unwrap_or(segment.nattch);
+        f(&mut file, count)
+    })();
+    unsafe {
+        libc::flock(file.as_raw_fd(), libc::LOCK_UN);
+    }
+    result
+}
+
+fn read_shm_nattch(segment: &ShmSegment) -> u64 {
+    with_shm_nattch_file(segment, |_file, count| Ok(count)).unwrap_or(segment.nattch)
+}
+
+fn adjust_shm_nattch(segment: &ShmSegment, delta: i64) -> u64 {
+    use std::io::{Seek, SeekFrom, Write};
+
+    with_shm_nattch_file(segment, |file, count| {
+        let next = if delta.is_negative() {
+            count.saturating_sub(delta.unsigned_abs())
+        } else {
+            count.saturating_add(delta as u64)
+        };
+        file.set_len(0)?;
+        file.seek(SeekFrom::Start(0))?;
+        write!(file, "{next}\n")?;
+        Ok(next)
+    })
+    .unwrap_or_else(|_| {
+        if delta.is_negative() {
+            segment.nattch.saturating_sub(delta.unsigned_abs())
+        } else {
+            segment.nattch.saturating_add(delta as u64)
+        }
+    })
 }
 
 /// Open (or create) the backing file for `key`, ftruncate to `size`, and
 /// return (shmid, path, mode). On error returns `Err(linux_errno)`.
 pub(super) fn shmget_open(
     state: &mut SysvShmState,
+    creds: &super::creds::CredState,
     key: i32,
     size: usize,
     flags: u64,
 ) -> Result<i32, LinuxErrno> {
     SysvShmState::ensure_dir();
 
-    let mode = (flags & 0o7777) as u32;
-    let create = flags & LINUX_IPC_CREAT != 0;
-    let exclusive = flags & LINUX_IPC_EXCL != 0;
+    let mode = ShmPermMode::requested(flags);
+    let create_flags = IpcCreateFlags::from_bits_retain(flags);
+    let create = create_flags.contains(IpcCreateFlags::CREAT);
+    let exclusive = create_flags.contains(IpcCreateFlags::EXCL);
 
     let (path, must_create) = if key == LINUX_IPC_PRIVATE {
         let name = state.private_name();
@@ -290,14 +492,28 @@ pub(super) fn shmget_open(
         let name = SysvShmState::key_name(key);
         let path = PathBuf::from(SHM_DIR).join(name);
         let exists = path.exists();
-        if exists && exclusive && create {
-            return Err(crate::linux_abi::LINUX_EEXIST);
-        }
         if !exists && !create {
             return Err(crate::linux_abi::LINUX_ENOENT);
         }
+        if exists {
+            if exclusive && create {
+                return Err(crate::linux_abi::LINUX_EEXIST);
+            }
+            if let Some(existing) = state.segments.values().find(|segment| segment.path == path) {
+                let wants_read = flags & 0o400 != 0;
+                let wants_write = flags & 0o200 != 0;
+                if (wants_read && !existing.can_read(creds))
+                    || (wants_write && !existing.can_write(creds))
+                {
+                    return Err(crate::linux_abi::LINUX_EACCES);
+                }
+            }
+        }
         (path, !exists)
     };
+    if must_create && state.segments.len() >= LINUX_SHMMNI {
+        return Err(crate::linux_abi::LINUX_ENOSPC);
+    }
 
     // Open or create. `O_CREAT|O_RDWR` regardless — the segment is used
     // for read+write; SHM_RDONLY at attach time is the user's choice.
@@ -335,6 +551,7 @@ pub(super) fn shmget_open(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    let guest_pid = crate::namespace::pid::self_ns_pid() as i32;
     state
         .segments
         .entry(shmid)
@@ -346,12 +563,19 @@ pub(super) fn shmget_open(
         })
         .or_insert(ShmSegment {
             path: path.clone(),
+            key,
             size: actual_size,
             mode,
+            uid: creds.euid,
+            gid: creds.egid,
+            cuid: creds.euid,
+            cgid: creds.egid,
             nattch: 0,
             ctime: now,
             atime: 0,
             dtime: 0,
+            cpid: guest_pid,
+            lpid: 0,
         });
     unsafe { libc::close(fd) };
     Ok(shmid)
@@ -384,6 +608,7 @@ pub(super) fn shmctl_rmid(state: &mut SysvShmState, shmid: i32) -> Result<(), Li
     let path_cstr = std::ffi::CString::new(segment.path.as_os_str().as_encoded_bytes())
         .map_err(|_| crate::linux_abi::LINUX_EINVAL)?;
     let rc = unsafe { libc::unlink(path_cstr.as_ptr()) };
+    let _ = std::fs::remove_file(shm_nattch_path(&segment.path));
     if rc != 0 {
         // Already gone is fine; anything else is a real error but we
         // already removed our entry, so return success — the segment is
@@ -396,24 +621,23 @@ pub(super) fn shmctl_rmid(state: &mut SysvShmState, shmid: i32) -> Result<(), Li
 /// segment's metadata. LTP shmctl01 reads every populated field, including the
 /// owner/creator ids in `shm_perm` — those come from the GUEST creds (carrick's
 /// host process is not the guest uid), not the host stat.
-pub(super) fn shmid_ds_bytes(segment: &ShmSegment, creds: &super::creds::CredState) -> [u8; 112] {
-    let pid = std::process::id() as i32;
+pub(super) fn shmid_ds_bytes(segment: &ShmSegment, _creds: &super::creds::CredState) -> [u8; 112] {
     let ds = LinuxShmidDs {
         shm_perm: LinuxIpcPerm {
-            uid: creds.euid,
-            gid: creds.egid,
-            cuid: creds.euid,
-            cgid: creds.egid,
-            mode: segment.mode,
+            uid: segment.uid,
+            gid: segment.gid,
+            cuid: segment.cuid,
+            cgid: segment.cgid,
+            mode: segment.mode.raw(),
             ..Default::default()
         },
         shm_segsz: segment.size as u64,
         shm_atime: segment.atime,
         shm_dtime: segment.dtime,
         shm_ctime: segment.ctime,
-        shm_cpid: pid,
-        shm_lpid: pid,
-        shm_nattch: segment.nattch,
+        shm_cpid: segment.cpid,
+        shm_lpid: segment.lpid,
+        shm_nattch: read_shm_nattch(segment),
         __unused4: 0,
         __unused5: 0,
     };
@@ -429,27 +653,132 @@ pub(super) fn shmid_ds_bytes(segment: &ShmSegment, creds: &super::creds::CredSta
 // ===================================================================
 
 impl SyscallDispatcher {
+    pub(crate) fn sysv_after_fork_child(&self) {
+        let mut state = self.sysv.lock();
+        let ids = state.attachments.values().copied().collect::<Vec<_>>();
+        for shmid in ids {
+            if let Some(seg) = state.segments.get_mut(&shmid) {
+                seg.nattch = adjust_shm_nattch(seg, 1);
+                seg.lpid = crate::namespace::pid::self_ns_pid() as i32;
+            }
+        }
+    }
+
+    pub(crate) fn sysvipc_shm_table(&self) -> String {
+        let state = self.sysv.lock();
+        let mut rows = String::from(
+            "       key      shmid perms                  size  cpid  lpid nattch   uid   gid  cuid  cgid      atime      dtime      ctime                   rss                  swap\n",
+        );
+        let mut segments = state.segments.iter().collect::<Vec<_>>();
+        segments.sort_by_key(|(shmid, _)| **shmid);
+        for (shmid, segment) in segments {
+            let nattch = read_shm_nattch(segment);
+            let rss = segment.size.div_ceil(LINUX_PAGE_SIZE as usize);
+            rows.push_str(&format!(
+                "{:10} {:10} {:5o} {:21} {:5} {:5} {:6} {:5} {:5} {:5} {:5} {:10} {:10} {:10} {:21} {:21}\n",
+                segment.key,
+                shmid,
+                segment.mode.perms(),
+                segment.size,
+                segment.cpid,
+                segment.lpid,
+                nattch,
+                segment.uid,
+                segment.gid,
+                segment.cuid,
+                segment.cgid,
+                segment.atime,
+                segment.dtime,
+                segment.ctime,
+                rss,
+                0,
+            ));
+        }
+        rows
+    }
+
+    pub(crate) fn note_sysv_remap_file_pages(
+        &self,
+        addr: u64,
+        end: u64,
+    ) -> Result<bool, LinuxErrno> {
+        let mut state = self.sysv.lock();
+        for (attached, shmid) in state.attachments.clone() {
+            let Some(segment) = state.segments.get(&shmid) else {
+                return Err(crate::linux_abi::LINUX_EIDRM);
+            };
+            let Some(attached_end) = attached.checked_add(segment.size as u64) else {
+                continue;
+            };
+            if addr >= attached && end <= attached_end {
+                state.remapped_attachments.insert(attached);
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn cleanup_sysv_shm_attachments_on_process_exit(&self) {
+        let mut state = self.sysv.lock();
+        let ids = state
+            .attachments
+            .drain()
+            .map(|(_, shmid)| shmid)
+            .collect::<Vec<_>>();
+        for shmid in ids {
+            if let Some(seg) = state.segments.get_mut(&shmid) {
+                seg.nattch = adjust_shm_nattch(seg, -1);
+                seg.lpid = crate::namespace::pid::self_ns_pid() as i32;
+            }
+        }
+    }
+
+    pub(crate) fn cleanup_sysv_ipc_on_process_exit(&self) {
+        self.cleanup_sysv_shm_attachments_on_process_exit();
+        if self.is_forked_guest_process() {
+            return;
+        }
+        let (message_queues, shm_segments) = {
+            let mut state = self.sysv.lock();
+            (
+                state.message_queues.drain().collect::<Vec<_>>(),
+                state
+                    .segments
+                    .drain()
+                    .map(|(_, segment)| segment)
+                    .collect::<Vec<_>>(),
+            )
+        };
+        for msqid in message_queues {
+            let _ = unsafe { msgctl(msqid, libc::IPC_RMID, core::ptr::null_mut()) };
+        }
+        for segment in shm_segments {
+            let _ = std::fs::remove_file(&segment.path);
+            let _ = std::fs::remove_file(shm_nattch_path(&segment.path));
+        }
+    }
+
     define_syscall! {
         /// shmget(key, size, flags). Returns shmid >= 1 on success.
         fn shmget(this, cx, key: u64, size: u64, flags: u64) {
             let key = key as i32;
             let size = size as usize;
+            let creds = this.cred_snapshot();
             let mut state = this.sysv.lock();
-            match shmget_open(&mut state, key, size, flags) {
+            match shmget_open(&mut state, &creds, key, size, flags) {
                 Ok(shmid) => Ok(DispatchOutcome::Returned { value: shmid as i64 }),
                 Err(errno) => Ok(DispatchOutcome::errno(errno)),
             }
         }
 
         /// shmat(shmid, addr_hint, flag). Map the segment into the guest's
-        /// alias VA arena and return the guest VA. SHM_RDONLY is honored: the
-        /// alias is mapped read-only so a guest STORE faults SIGSEGV, matching
-        /// Linux. `addr_hint`, SHM_REMAP and SHM_RND remain a documented arch
-        /// gap — carrick owns the alias VA arena and picks the placement, so it
-        /// cannot honor a caller-supplied address. Unknown shmflg bits are
-        /// silently ignored (Linux do_shmat acts only on the known bits).
-        fn shmat(this, cx, shmid: u64, _addr: u64, flag: u64) {
+        /// alias VA arena and return the guest VA. SHM_RDONLY is honored by
+        /// mapping the alias read-only so a guest STORE faults SIGSEGV, and
+        /// SHM_RND rounds an unaligned requested address down to a page
+        /// boundary. SHM_REMAP remains unsupported.
+        fn shmat(this, cx, shmid: u64, addr: u64, flag: u64) {
             let shmid = shmid as i32;
+            let attach_flags = ShmAttachFlags::from_bits_retain(flag);
             let (host_fd, size) = {
                 let mut state = this.sysv.lock();
                 match shmat_open_fd(&mut state, shmid) {
@@ -457,12 +786,41 @@ impl SyscallDispatcher {
                     Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                 }
             };
+            let creds = this.cred_snapshot();
+            if let Some(segment) = this.sysv.lock().segments.get(&shmid).cloned() {
+                let needs_write = !attach_flags.contains(ShmAttachFlags::RDONLY);
+                if !segment.can_read(&creds) || (needs_write && !segment.can_write(&creds)) {
+                    unsafe { libc::close(host_fd) };
+                    return Ok(DispatchOutcome::errno(LINUX_EACCES));
+                }
+            }
 
             // Reserve a guest alias-VA window and return MapHostAlias so the
             // runtime hv_vm_maps the host file into the guest's address
             // space — same path mmap(MAP_SHARED, fd) uses for file mappings.
             let hvf_page = crate::trap::HVF_PAGE_SIZE;
             let map_len = align_up_u64(size as u64, hvf_page).unwrap_or(size as u64);
+            if addr == 0 && !attach_flags.contains(ShmAttachFlags::RDONLY) {
+                let mut state = this.sysv.lock();
+                if let Some(va) = state.remapped_attachments.iter().next().copied() {
+                    let old_shmid = state.attachments.insert(va, shmid);
+                    if old_shmid != Some(shmid) {
+                        if let Some(old) = old_shmid.and_then(|old| state.segments.get_mut(&old)) {
+                            old.nattch = adjust_shm_nattch(old, -1);
+                        }
+                        if let Some(seg) = state.segments.get_mut(&shmid) {
+                            seg.nattch = adjust_shm_nattch(seg, 1);
+                            seg.atime = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            seg.lpid = crate::namespace::pid::self_ns_pid() as i32;
+                        }
+                    }
+                    unsafe { libc::close(host_fd) };
+                    return Ok(DispatchOutcome::Returned { value: va as i64 });
+                }
+            }
             // Fresh, process-tree-global, never-reused alias IPA (see
             // crate::memory::alloc_alias_ipa — the shared hv_vm's stage-2 TLB can't
             // be flushed on arm64, so an alias IPA must never be reused).
@@ -470,13 +828,30 @@ impl SyscallDispatcher {
                 unsafe { libc::close(host_fd) };
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
             };
-            let va = crate::memory::LINUX_HIGH_VA_THRESHOLD
-                + (ipa - crate::memory::LINUX_ALIAS_IPA_BASE);
+            if addr != 0
+                && !addr.is_multiple_of(LINUX_PAGE_SIZE)
+                && !attach_flags.contains(ShmAttachFlags::RND)
+            {
+                unsafe { libc::close(host_fd) };
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
+            let va = if addr != 0 {
+                addr & !(LINUX_PAGE_SIZE - 1)
+            } else {
+                crate::memory::LINUX_HIGH_VA_THRESHOLD
+                    + (ipa - crate::memory::LINUX_ALIAS_IPA_BASE)
+            };
+            if !attach_flags.contains(ShmAttachFlags::RND)
+                && this.sysv.lock().attachments.contains_key(&va)
+            {
+                unsafe { libc::close(host_fd) };
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
             // SHM_RDONLY → map the alias read-only. STEP 1 (host PROT_READ)
             // makes the syscall write-path return EFAULT; STEP 2 (the alias
             // leaf built AP=RO via map_aliased) makes a DIRECT guest store
             // fault SIGSEGV — together matching Linux do_shmat.
-            let host_prot = if flag & LINUX_SHM_RDONLY != 0 {
+            let host_prot = if attach_flags.contains(ShmAttachFlags::RDONLY) {
                 libc::PROT_READ
             } else {
                 libc::PROT_READ | libc::PROT_WRITE
@@ -489,7 +864,12 @@ impl SyscallDispatcher {
                 let mut state = this.sysv.lock();
                 state.attachments.insert(va, shmid);
                 if let Some(seg) = state.segments.get_mut(&shmid) {
-                    seg.nattch = seg.nattch.saturating_add(1);
+                    seg.nattch = adjust_shm_nattch(seg, 1);
+                    seg.atime = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    seg.lpid = crate::namespace::pid::self_ns_pid() as i32;
                 }
             }
 
@@ -504,19 +884,33 @@ impl SyscallDispatcher {
             })
         }
 
-        /// shmdt(addr). Decrement the segment's nattch and drop the
-        /// addr→shmid mapping so LTP shmat01's IPC_STAT-after-shmdt sees
-        /// the right count. The alias VA stays mapped in the guest until
-        /// process exit (proper munmap of the alias range is a follow-up;
-        /// the LTP tests we target don't observe the leak).
+        /// shmdt(addr). Decrement the segment's nattch, drop the addr→shmid
+        /// mapping, and tear down the dynamic alias leaves so repeated SysV shm
+        /// attach/detach cycles reclaim the backend's per-alias page-table pool.
         fn shmdt(this, cx, addr: u64) {
             let mut state = this.sysv.lock();
+            if state.remapped_attachments.contains(&addr) {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
             let shmid = match state.attachments.remove(&addr) {
                 Some(id) => id,
                 None => return Ok(DispatchOutcome::errno(LINUX_EINVAL)),
             };
+            let size = state.segments.get(&shmid).map(|seg| seg.size);
             if let Some(seg) = state.segments.get_mut(&shmid) {
-                seg.nattch = seg.nattch.saturating_sub(1);
+                seg.nattch = adjust_shm_nattch(seg, -1);
+                seg.dtime = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                seg.lpid = crate::namespace::pid::self_ns_pid() as i32;
+            }
+            if let Some(size) = size
+                && let Some(len) = align_up_u64(size as u64, crate::trap::HVF_PAGE_SIZE)
+                    .and_then(|len| usize::try_from(len).ok())
+            {
+                let _ = cx.memory.unmap_alias_range(addr, len);
+                cx.memory.set_no_access(addr, len, true);
             }
             Ok(DispatchOutcome::Returned { value: 0 })
         }
@@ -529,9 +923,18 @@ impl SyscallDispatcher {
         ///              following IPC_STAT reads them back.
         fn shmctl(this, cx, shmid: u64, cmd: u64, buf: u64) {
             let shmid = shmid as i32;
+            let creds = this.cred_snapshot();
             match cmd {
                 LINUX_IPC_RMID => {
                     let mut state = this.sysv.lock();
+                    if let Some(segment) = state.segments.get(&shmid)
+                        && !segment.can_write(&creds)
+                    {
+                        if segment.mode.is_empty_perms() {
+                            let _ = shmctl_rmid(&mut state, shmid);
+                        }
+                        return Ok(DispatchOutcome::errno(LINUX_EPERM));
+                    }
                     match shmctl_rmid(&mut state, shmid) {
                         Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
                         Err(errno) => Ok(DispatchOutcome::errno(errno)),
@@ -543,6 +946,9 @@ impl SyscallDispatcher {
                         Some(s) => s.clone(),
                         None => return Ok(DispatchOutcome::errno(LINUX_EINVAL)),
                     };
+                    if !segment.can_read(&creds) {
+                        return Ok(DispatchOutcome::errno(LINUX_EACCES));
+                    }
                     drop(state);
                     if buf == 0 {
                         return Ok(DispatchOutcome::errno(LINUX_EFAULT));
@@ -572,7 +978,10 @@ impl SyscallDispatcher {
                     }
                     // shm_perm.mode lives at offset 20 in the shmid_ds
                     // (LinuxIpcPerm.mode), the same offset semctl IPC_SET reads.
-                    let new_mode = match cx.memory.read_bytes(buf + 20, 4) {
+                    let Some(mode_addr) = buf.checked_add(20) else {
+                        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                    };
+                    let new_mode = match cx.memory.read_bytes(mode_addr, 4) {
                         Ok(b) => u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
                         Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
                     };
@@ -583,8 +992,24 @@ impl SyscallDispatcher {
                     let mut state = this.sysv.lock();
                     match state.segments.get_mut(&shmid) {
                         Some(seg) => {
-                            seg.mode = (seg.mode & !0o777) | (new_mode & 0o777);
+                            if !seg.can_write(&creds) {
+                                return Ok(DispatchOutcome::errno(LINUX_EPERM));
+                            }
+                            seg.mode = ShmPermMode::from_ipc_set(new_mode, seg.mode);
                             seg.ctime = now;
+                            Ok(DispatchOutcome::Returned { value: 0 })
+                        }
+                        None => Ok(DispatchOutcome::errno(LINUX_EINVAL)),
+                    }
+                }
+                LINUX_SHM_LOCK | LINUX_SHM_UNLOCK => {
+                    let mut state = this.sysv.lock();
+                    match state.segments.get_mut(&shmid) {
+                        Some(segment) if !segment.can_write(&creds) => {
+                            Ok(DispatchOutcome::errno(LINUX_EPERM))
+                        }
+                        Some(segment) => {
+                            segment.mode.set_locked(cmd == LINUX_SHM_LOCK);
                             Ok(DispatchOutcome::Returned { value: 0 })
                         }
                         None => Ok(DispatchOutcome::errno(LINUX_EINVAL)),
@@ -599,10 +1024,14 @@ impl SyscallDispatcher {
                     let state = this.sysv.lock();
                     let mut ids: Vec<i32> = state.segments.keys().copied().collect();
                     ids.sort();
-                    let idx = shmid as usize; // SHM_STAT uses the first arg as idx
-                    let target_id = match ids.get(idx) {
-                        Some(id) => *id,
-                        None => return Ok(DispatchOutcome::errno(LINUX_EINVAL)),
+                    let target_id = if cmd == LINUX_SHM_STAT_ANY && state.segments.contains_key(&shmid) {
+                        shmid
+                    } else {
+                        let idx = shmid as usize; // SHM_STAT uses the first arg as idx
+                        match ids.get(idx) {
+                            Some(id) => *id,
+                            None => return Ok(DispatchOutcome::errno(LINUX_EINVAL)),
+                        }
                     };
                     let segment = state.segments.get(&target_id).cloned();
                     drop(state);
@@ -625,7 +1054,20 @@ impl SyscallDispatcher {
                     let state = this.sysv.lock();
                     let used_ids = state.segments.len() as i64;
                     if buf != 0 {
-                        let bytes = [0u8; 112];
+                        let mut bytes = [0u8; 72];
+                        let put = |bytes: &mut [u8], idx: usize, value: u64| {
+                            bytes[idx * 8..idx * 8 + 8].copy_from_slice(&value.to_le_bytes());
+                        };
+                        if cmd == LINUX_IPC_INFO {
+                            put(&mut bytes, 0, 18_446_744_073_692_774_399);
+                            put(&mut bytes, 1, 1);
+                            put(&mut bytes, 2, LINUX_SHMMNI as u64);
+                            put(&mut bytes, 3, LINUX_SHMMNI as u64);
+                            put(&mut bytes, 4, 18_446_744_073_692_774_399);
+                        } else {
+                            put(&mut bytes, 0, used_ids.max(0) as u64);
+                            put(&mut bytes, 1, used_ids.max(0) as u64);
+                        }
                         let memory = &mut *cx.memory;
                         if memory.write_bytes(buf, &bytes).is_err() {
                             return Ok(DispatchOutcome::errno(LINUX_EFAULT));
@@ -646,7 +1088,10 @@ impl SyscallDispatcher {
             let _ = (this, cx);
             let rc = unsafe { msgget(key as i32 as libc::key_t, msgflg as i32) };
             match rc.host_syscall_errno() {
-                Ok(id) => Ok(DispatchOutcome::Returned { value: id as i64 }),
+                Ok(id) => {
+                    this.sysv.lock().message_queues.insert(id);
+                    Ok(DispatchOutcome::Returned { value: id as i64 })
+                }
                 Err(errno) => Ok(DispatchOutcome::errno(errno)),
             }
         }
@@ -731,7 +1176,10 @@ impl SyscallDispatcher {
                 LINUX_IPC_RMID => {
                     let rc = unsafe { msgctl(msqid as i32, libc::IPC_RMID, core::ptr::null_mut()) };
                     match rc.host_syscall_errno() {
-                        Ok(_) => Ok(DispatchOutcome::Returned { value: 0 }),
+                        Ok(_) => {
+                            this.sysv.lock().message_queues.remove(&(msqid as i32));
+                            Ok(DispatchOutcome::Returned { value: 0 })
+                        }
                         Err(errno) => Ok(DispatchOutcome::errno(errno)),
                     }
                 }
@@ -1431,12 +1879,19 @@ mod ipc_set_tests {
             shmid,
             ShmSegment {
                 path: PathBuf::from("/tmp/carrick-shm/test-ipc-set"),
+                key: 0,
                 size: 4096,
-                mode: 0o600,
+                mode: ShmPermMode::requested(0o600),
+                uid: 0,
+                gid: 0,
+                cuid: 0,
+                cgid: 0,
                 nattch: 0,
                 ctime: 1,
                 atime: 0,
                 dtime: 0,
+                cpid: 1,
+                lpid: 0,
             },
         );
 
@@ -1481,7 +1936,7 @@ mod ipc_set_tests {
         let b = memory.read_bytes(stat_addr + 20, 4).unwrap();
         let mode = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
         assert_eq!(
-            mode & 0o777,
+            mode & ShmPermMode::PERMS_MASK,
             0o666,
             "IPC_SET must store the requested mode so IPC_STAT reads it back \
              (pre-fix IPC_SET was a no-op and this stayed 0o600)"

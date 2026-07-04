@@ -303,6 +303,7 @@ pub struct OpenContext<'a> {
     pub sig_ignored: u64,
     pub sig_caught: u64,
     pub sig_shdpnd: u64,
+    pub sysvipc_shm: Option<&'a str>,
 }
 
 /// One mount's view of the filesystem: path metadata ([`lookup`](Vfs::lookup),

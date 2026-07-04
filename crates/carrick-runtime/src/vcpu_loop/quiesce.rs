@@ -560,6 +560,7 @@ where
                 // rebuilt.
                 stamp_identity_page(engine, &kernel.dispatcher);
                 stamp_guest_tid(engine, self.this_tid, &self.registry);
+                kernel.dispatcher.sysv_after_fork_child();
                 self.waiter = crate::io_wait::ThreadWaiter::new(self.this_tid);
                 let handle: Box<dyn carrick_hal::VcpuKickDyn> = Box::new(engine.kick_handle());
                 self.kicker.register(self.this_tid, handle);

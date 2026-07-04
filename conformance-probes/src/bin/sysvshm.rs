@@ -1,132 +1,180 @@
-//! SysV shared-memory probe: shmget / shmat / shmdt / shmctl(IPC_RMID).
-//! The LTP `kill05`/`kill07` tests TBROK because `shmget` returned ENOSYS;
-//! this probe pins the post-fix invariants down so a regression breaks
-//! `cargo test` line-exact against Docker.
-//!
-//! Invariants encoded:
-//!   1. shmget(IPC_PRIVATE, 4096, IPC_CREAT|0666) → shmid >= 1, errno=0.
-//!   2. shmat(shmid, NULL, 0) → a non-null mapped address.
-//!   3. Reads/writes through the mapping persist (byte we write, byte we
-//!      read back).
-//!   4. A forked child attaching the same shmid sees the byte the parent
-//!      wrote (the WHOLE POINT of shmem — cross-process coherence).
-//!   5. shmdt(addr) → returns 0.
-//!   6. shmctl(shmid, IPC_RMID, NULL) → returns 0.
-//!
-//! Deterministic output: booleans only. No PIDs, no addresses, no inodes.
-
 use conformance_probes::report;
-use std::time::{Duration, Instant};
 
-const IPC_PRIVATE: i32 = 0;
-const IPC_CREAT: i32 = 0o1000;
 const IPC_RMID: i32 = 0;
-const SIZE: usize = 4096;
+const SHM_STAT_ANY: i32 = 15;
+const SHM_INFO: i32 = 14;
+const SHM_RDONLY: i32 = 0o10000;
+const SHM_RND: i32 = 0o20000;
+const SYS_REMAP_FILE_PAGES: libc::c_long = 234;
 
-unsafe fn shmget(key: i32, size: usize, flags: i32) -> i64 {
-    libc::syscall(libc::SYS_shmget, key as i64, size as i64, flags as i64)
+fn errno() -> i32 {
+    std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
 }
 
-unsafe fn shmat(shmid: i32, addr: *const libc::c_void, flag: i32) -> *mut libc::c_void {
-    libc::syscall(libc::SYS_shmat, shmid as i64, addr, flag as i64) as *mut libc::c_void
+unsafe fn reset_errno() {
+    #[cfg(any(target_env = "gnu", target_env = "musl"))]
+    {
+        *libc::__errno_location() = 0;
+    }
 }
 
-unsafe fn shmdt(addr: *const libc::c_void) -> i64 {
-    libc::syscall(libc::SYS_shmdt, addr)
+unsafe fn cleanup_shm(shmid: i32) {
+    if shmid >= 0 {
+        libc::shmctl(shmid, IPC_RMID, core::ptr::null_mut());
+    }
 }
 
-unsafe fn shmctl(shmid: i32, cmd: i32, buf: *mut libc::c_void) -> i64 {
-    libc::syscall(libc::SYS_shmctl, shmid as i64, cmd as i64, buf)
+fn child_write_signal(addr: *mut libc::c_void) -> i32 {
+    unsafe {
+        let pid = libc::fork();
+        if pid == 0 {
+            *(addr as *mut u8) = 1;
+            libc::_exit(0);
+        }
+        let mut status = 0;
+        libc::wait4(pid, &mut status, 0, core::ptr::null_mut());
+        if libc::WIFSIGNALED(status) {
+            libc::WTERMSIG(status)
+        } else {
+            0
+        }
+    }
+}
+
+fn child_attach_status(shmid: i32, addr: *mut libc::c_void) -> i32 {
+    unsafe {
+        let pid = libc::fork();
+        if pid == 0 {
+            reset_errno();
+            let attached = libc::shmat(shmid, addr.cast_const(), 0);
+            if attached == addr {
+                libc::shmdt(attached);
+                libc::_exit(0);
+            }
+            let err = errno().clamp(0, 127);
+            libc::_exit(err);
+        }
+        let mut status = 0;
+        libc::wait4(pid, &mut status, 0, core::ptr::null_mut());
+        if libc::WIFEXITED(status) {
+            libc::WEXITSTATUS(status)
+        } else if libc::WIFSIGNALED(status) {
+            128 + libc::WTERMSIG(status)
+        } else {
+            -1
+        }
+    }
 }
 
 fn main() {
     unsafe {
-        let shmid = shmget(IPC_PRIVATE, SIZE, IPC_CREAT | 0o666);
-        // shmget(2): success → shmid >= 0 (Linux can return 0 for the first
-        // segment); error → -1.
-        report!(shmget_ok = shmid >= 0);
-        if shmid < 0 {
-            // Print stable falses for the line-aligned diff.
-            report!(
-                shmat_ok = false,
-                rw_roundtrip_ok = false,
-                xproc_coherence_ok = false,
-                shmdt_ok = false,
-                shmctl_rmid_ok = false,
-            );
-            return;
+        let page = libc::sysconf(libc::_SC_PAGESIZE) as usize;
+        let scratch = libc::shmget(libc::IPC_PRIVATE, page, libc::IPC_CREAT | 0o600);
+        let scratch_addr = if scratch >= 0 {
+            libc::shmat(scratch, core::ptr::null(), 0)
+        } else {
+            libc::MAP_FAILED
+        };
+        let reusable_addr = if scratch_addr == libc::MAP_FAILED {
+            core::ptr::null_mut()
+        } else {
+            libc::shmdt(scratch_addr);
+            scratch_addr
+        };
+        cleanup_shm(scratch);
+
+        let shmid = libc::shmget(libc::IPC_PRIVATE, page, libc::IPC_CREAT | 0o600);
+
+        let null_addr = if shmid >= 0 {
+            libc::shmat(shmid, core::ptr::null(), 0)
+        } else {
+            libc::MAP_FAILED
+        };
+        let null_attach_ok = null_addr != libc::MAP_FAILED;
+        if null_attach_ok {
+            libc::shmdt(null_addr);
         }
 
-        let addr = shmat(shmid as i32, core::ptr::null(), 0);
-        let shmat_ok = !addr.is_null() && addr as isize != -1;
-        report!(shmat_ok = shmat_ok);
-        if !shmat_ok {
-            report!(
-                rw_roundtrip_ok = false,
-                xproc_coherence_ok = false,
-                shmdt_ok = false,
-                shmctl_rmid_ok = false,
-            );
-            return;
+        reset_errno();
+        let aligned_addr = if shmid >= 0 && !reusable_addr.is_null() {
+            libc::shmat(shmid, reusable_addr.cast_const(), 0)
+        } else {
+            libc::MAP_FAILED
+        };
+        let aligned_errno = errno();
+        let aligned_attach_ok = aligned_addr == reusable_addr;
+        if aligned_addr != libc::MAP_FAILED {
+            libc::shmdt(aligned_addr);
         }
 
-        // (3) Write a sentinel and read it back.
-        let bytes = addr as *mut u8;
-        const SENTINEL: u8 = 0xA5;
-        core::ptr::write_volatile(bytes, SENTINEL);
-        // Memory barrier so other threads / forked children see the write.
-        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
-        let readback = core::ptr::read_volatile(bytes);
-        report!(rw_roundtrip_ok = readback == SENTINEL);
+        let child_aligned_status = if shmid >= 0 && !reusable_addr.is_null() {
+            child_attach_status(shmid, reusable_addr)
+        } else {
+            -1
+        };
 
-        // (4) Fork a child; child re-attaches the SAME shmid and reads.
-        //     Cross-process coherence: the byte parent wrote must be there.
-        // We use a pipe for the child to report its observation deterministically.
-        let mut pipefd = [0i32; 2];
-        if libc::pipe(pipefd.as_mut_ptr()) != 0 {
-            report!(
-                xproc_coherence_ok = false,
-                shmdt_ok = false,
-                shmctl_rmid_ok = false,
-            );
-            return;
+        reset_errno();
+        let rounded_addr = if shmid >= 0 && !reusable_addr.is_null() {
+            libc::shmat(shmid, reusable_addr.wrapping_add(page - 1).cast_const(), SHM_RND)
+        } else {
+            libc::MAP_FAILED
+        };
+        let rounded_errno = errno();
+        let rounded_attach_ok = rounded_addr == reusable_addr;
+        if rounded_addr != libc::MAP_FAILED {
+            libc::shmdt(rounded_addr);
         }
 
-        let pid = libc::fork();
-        if pid == 0 {
-            libc::close(pipefd[0]);
-            let child_addr = shmat(shmid as i32, core::ptr::null(), 0);
-            let ok = !child_addr.is_null()
-                && child_addr as isize != -1
-                && core::ptr::read_volatile(child_addr as *const u8) == SENTINEL;
-            let byte = if ok { 1u8 } else { 0u8 };
-            libc::write(pipefd[1], &byte as *const u8 as *const libc::c_void, 1);
-            libc::close(pipefd[1]);
-            libc::_exit(0);
-        }
-        libc::close(pipefd[1]);
-        let mut byte = 0u8;
-        let mut got = 0;
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while got == 0 && Instant::now() < deadline {
-            let n = libc::read(pipefd[0], &mut byte as *mut u8 as *mut libc::c_void, 1);
-            if n > 0 {
-                got = 1;
-            } else if n == 0 {
-                break;
-            }
-        }
-        libc::close(pipefd[0]);
-        let mut status = 0i32;
-        libc::waitpid(pid, &mut status, 0);
-        report!(xproc_coherence_ok = got == 1 && byte == 1);
+        reset_errno();
+        let readonly_addr = if shmid >= 0 && !reusable_addr.is_null() {
+            libc::shmat(shmid, reusable_addr.cast_const(), SHM_RDONLY)
+        } else {
+            libc::MAP_FAILED
+        };
+        let readonly_errno = errno();
+        let readonly_signal = if readonly_addr == libc::MAP_FAILED {
+            -1
+        } else {
+            let sig = child_write_signal(readonly_addr);
+            libc::shmdt(readonly_addr);
+            sig
+        };
 
-        // (5) shmdt.
-        let dt = shmdt(addr);
-        report!(shmdt_ok = dt == 0);
+        let mut shm_info = [0u8; 128];
+        reset_errno();
+        let max_index = libc::shmctl(shmid, SHM_INFO, shm_info.as_mut_ptr().cast());
+        let shm_info_errno = errno();
 
-        // (6) shmctl IPC_RMID.
-        let ctl = shmctl(shmid as i32, IPC_RMID, core::ptr::null_mut());
-        report!(shmctl_rmid_ok = ctl == 0);
+        let mut shmid_ds = core::mem::MaybeUninit::<libc::shmid_ds>::zeroed();
+        reset_errno();
+        let stat_any = if max_index >= 0 {
+            libc::shmctl(max_index, SHM_STAT_ANY, shmid_ds.as_mut_ptr())
+        } else {
+            -1
+        };
+        let stat_any_errno = errno();
+
+        reset_errno();
+        let remap_invalid = libc::syscall(SYS_REMAP_FILE_PAGES, 0, 0, 0, 0, 0);
+        let remap_invalid_errno = errno();
+
+        cleanup_shm(shmid);
+
+        report!(
+            null_attach_ok = null_attach_ok,
+            aligned_attach_ok = aligned_attach_ok,
+            aligned_errno = aligned_errno,
+            child_aligned_status = child_aligned_status,
+            rounded_attach_ok = rounded_attach_ok,
+            rounded_errno = rounded_errno,
+            readonly_errno = readonly_errno,
+            readonly_signal = readonly_signal,
+            shm_info_ok = max_index >= 0,
+            shm_info_errno = shm_info_errno,
+            stat_any_ok = stat_any >= 0,
+            stat_any_errno = stat_any_errno,
+            remap_invalid = remap_invalid,
+            remap_invalid_errno = remap_invalid_errno,
+        );
     }
 }

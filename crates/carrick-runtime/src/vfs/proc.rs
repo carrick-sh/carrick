@@ -142,6 +142,7 @@ pub struct SyntheticProcContext {
     pub sig_ignored: u64,
     pub sig_caught: u64,
     pub sig_shdpnd: u64,
+    pub sysvipc_shm: String,
 }
 
 /// The three writable user-namespace map files (only the `self/` forms; writing
@@ -330,6 +331,15 @@ const SYSCTL_TABLE: &[(&str, Sysctl)] = &[
     // Default 64-bit Linux pid ceiling. LTP (setpgid02) reads this to bound pid
     // scans; without it tst_test aborts with ENOENT.
     ("/proc/sys/kernel/pid_max", Sysctl::Static(b"4194304\n")),
+    (
+        "/proc/sys/kernel/shmall",
+        Sysctl::Static(b"18446744073692774399\n"),
+    ),
+    (
+        "/proc/sys/kernel/shmmax",
+        Sysctl::Static(b"18446744073692774399\n"),
+    ),
+    ("/proc/sys/kernel/shmmni", Sysctl::Static(b"4096\n")),
     // Kernel taint flags: 0 = untainted. The LTP tst_test framework reads this at
     // setup/teardown for tests with `.taint_check` to detect kernel warnings/oopses;
     // a missing file made every such test TBROK in setup (tst_taint.c ENOENT).
@@ -555,6 +565,7 @@ pub(crate) fn synthetic_file(path: &str, ctx: &SyntheticProcContext) -> Option<V
         "/proc/partitions" => Some(synthetic_proc_partitions().to_vec()),
         "/proc/stat" => Some(synthetic_proc_stat()),
         "/proc/swaps" => Some(synthetic_proc_swaps().to_vec()),
+        "/proc/sysvipc/shm" => Some(ctx.sysvipc_shm.as_bytes().to_vec()),
         "/proc/uptime" => Some(synthetic_proc_uptime().into_bytes()),
         "/proc/version" => Some(synthetic_proc_version().to_vec()),
         "/proc/vmstat" => Some(synthetic_proc_vmstat().to_vec()),
@@ -1393,6 +1404,7 @@ impl Default for ProcVfs {
 impl Vfs for ProcVfs {
     fn lookup(&self, path: &str) -> Result<Metadata, VfsError> {
         if path == "/proc"
+            || path == "/proc/sysvipc"
             || sysctl_is_dir(path)
             || proc_net_is_dir(path)
             || proc_ns_is_dir(path)
@@ -1532,6 +1544,10 @@ impl Vfs for ProcVfs {
                 name: "net".to_string(),
                 kind: EntryKind::Directory,
             });
+            entries.push(DirEnt {
+                name: "sysvipc".to_string(),
+                kind: EntryKind::Directory,
+            });
             // Enumerated host pids must be shown as the NAMESPACE pids the guest
             // sees (what getpid()/$!/status report), or a guest can't correlate
             // `ls /proc` with its own pids. Identity when no PID namespace is
@@ -1547,6 +1563,22 @@ impl Vfs for ProcVfs {
                 });
             }
             return Ok(entries);
+        }
+        if path == "/proc/sysvipc" {
+            return Ok(vec![
+                DirEnt {
+                    name: ".".to_string(),
+                    kind: EntryKind::Directory,
+                },
+                DirEnt {
+                    name: "..".to_string(),
+                    kind: EntryKind::Directory,
+                },
+                DirEnt {
+                    name: "shm".to_string(),
+                    kind: EntryKind::File,
+                },
+            ]);
         }
         if let Some(entries) = sysctl_dir_entries(path) {
             return Ok(entries);
@@ -1666,6 +1698,7 @@ impl Vfs for ProcVfs {
             sig_ignored: ctx.sig_ignored,
             sig_caught: ctx.sig_caught,
             sig_shdpnd: ctx.sig_shdpnd,
+            sysvipc_shm: ctx.sysvipc_shm.unwrap_or("").to_owned(),
         };
         let Some(contents) = synthetic_file(path, &synth_ctx) else {
             return Err(crate::linux_abi::LINUX_ENOSYS);

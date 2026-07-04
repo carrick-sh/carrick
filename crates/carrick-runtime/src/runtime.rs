@@ -946,8 +946,10 @@ where
             DispatchOutcome::Exit { code } => {
                 crate::probes::guest_exit(code);
                 if runtime.is_forked_child() || dispatcher.is_forked_guest_process() {
+                    dispatcher.cleanup_sysv_ipc_on_process_exit();
                     forked_child_exit(code, dispatcher.stdout(), dispatcher.stderr());
                 }
+                dispatcher.cleanup_sysv_ipc_on_process_exit();
                 return Ok(RunResult {
                     exit_code: code,
                     stdout: dispatcher.stdout().to_vec(),
@@ -959,8 +961,10 @@ where
             }
             DispatchOutcome::SignalDeath { signum } => {
                 if runtime.is_forked_child() || dispatcher.is_forked_guest_process() {
+                    dispatcher.cleanup_sysv_ipc_on_process_exit();
                     forked_child_die_by_signal(signum, dispatcher.stdout(), dispatcher.stderr());
                 }
+                dispatcher.cleanup_sysv_ipc_on_process_exit();
                 return Ok(RunResult {
                     exit_code: 128 + signum,
                     stdout: dispatcher.stdout().to_vec(),
@@ -1043,6 +1047,7 @@ where
                         // Re-stamp the identity page: the child's pid changed
                         // (ns-pid now registered), so a fast-path getpid is right.
                         stamp_identity_page(runtime, &dispatcher);
+                        dispatcher.sysv_after_fork_child();
                         // The child's pid changed; its waiter watches for
                         // process-directed signals immediately, then upgrades
                         // to a per-thread kqueue only if it parks.
@@ -1208,8 +1213,10 @@ where
             }
             if let Some(signum) = action.term_signal {
                 if runtime.is_forked_child() || dispatcher.is_forked_guest_process() {
+                    dispatcher.cleanup_sysv_ipc_on_process_exit();
                     forked_child_die_by_signal(signum, dispatcher.stdout(), dispatcher.stderr());
                 }
+                dispatcher.cleanup_sysv_ipc_on_process_exit();
                 return Ok(RunResult {
                     exit_code: 128 + signum,
                     stdout: dispatcher.stdout().to_vec(),
