@@ -206,8 +206,8 @@ struct ChildSlot {
     /// Wait status published by an adopted child, plus `exit_ready`.
     exit_status: AtomicU64,
     exit_ready: AtomicU64,
-    /// Non-zero while this child has an unreported ptrace signal-delivery stop.
-    ptrace_stop_pending: AtomicU64,
+    /// Linux signal number for an unreported ptrace signal-delivery stop, or 0.
+    ptrace_stop_signal: AtomicU64,
 }
 
 /// Create the shared child-exit table. MUST be called in the root guest before
@@ -260,6 +260,7 @@ pub fn register_child_with_parent(pid: u32, parent_pid: u32, subreaper_pid: u32)
             slot.parent_pid.store(parent_pid as u64, Ordering::Release);
             slot.subreaper_pid
                 .store(subreaper_pid as u64, Ordering::Release);
+            slot.ptrace_stop_signal.store(0, Ordering::Release);
             return;
         }
     }
@@ -276,7 +277,7 @@ pub fn register_child_with_parent(pid: u32, parent_pid: u32, subreaper_pid: u32)
             slot.guest_ns.store(0, Ordering::Relaxed);
             slot.exit_status.store(0, Ordering::Relaxed);
             slot.exit_ready.store(0, Ordering::Release);
-            slot.ptrace_stop_pending.store(0, Ordering::Release);
+            slot.ptrace_stop_signal.store(0, Ordering::Release);
             return;
         }
     }
@@ -327,27 +328,36 @@ pub fn adopted_parent_for(pid: u32) -> Option<u32> {
 }
 
 /// Mark the current process as having an unreported ptrace signal stop.
-pub fn mark_self_ptrace_stop_pending() {
+pub fn mark_self_ptrace_stop_pending(signum: i32) {
     let pid = std::process::id();
     register_child(pid);
     let Some(slots) = child_slots() else { return };
     for slot in slots {
         if slot.pid.load(Ordering::Acquire) == pid as u64 {
-            slot.ptrace_stop_pending.store(1, Ordering::Release);
+            slot.ptrace_stop_signal
+                .store(signum.max(0) as u64, Ordering::Release);
             return;
         }
     }
 }
 
-/// Clear the pending ptrace signal-stop marker once wait4 reports it.
-pub fn clear_child_ptrace_stop_pending(pid: u32) {
-    let Some(slots) = child_slots() else { return };
+/// Clear and return the pending ptrace signal-stop marker once wait4 reports it.
+pub fn take_child_ptrace_stop_signal(pid: u32) -> Option<i32> {
+    let Some(slots) = child_slots() else {
+        return None;
+    };
     for slot in slots {
         if slot.pid.load(Ordering::Acquire) == pid as u64 {
-            slot.ptrace_stop_pending.store(0, Ordering::Release);
-            return;
+            let signum = slot.ptrace_stop_signal.swap(0, Ordering::AcqRel);
+            return i32::try_from(signum).ok().filter(|s| *s != 0);
         }
     }
+    None
+}
+
+/// Clear the pending ptrace signal-stop marker once wait4 reports it.
+pub fn clear_child_ptrace_stop_pending(pid: u32) {
+    let _ = take_child_ptrace_stop_signal(pid);
 }
 
 /// Whether `pid` has an unreported ptrace signal-delivery stop.
@@ -357,7 +367,7 @@ pub fn child_has_ptrace_stop_pending(pid: u32) -> bool {
     };
     for slot in slots {
         if slot.pid.load(Ordering::Acquire) == pid as u64 {
-            return slot.ptrace_stop_pending.load(Ordering::Acquire) != 0;
+            return slot.ptrace_stop_signal.load(Ordering::Acquire) != 0;
         }
     }
     false
@@ -376,6 +386,7 @@ pub fn record_child_exit_status(pid: u32, guest_ns: u64, status: i32, status_rea
     for slot in slots {
         if slot.pid.load(Ordering::Acquire) == pid as u64 {
             slot.guest_ns.store(guest_ns, Ordering::Release);
+            slot.ptrace_stop_signal.store(0, Ordering::Release);
             if status_ready {
                 slot.exit_status
                     .store(status as u32 as u64, Ordering::Release);
@@ -399,7 +410,7 @@ pub fn record_child_exit_status(pid: u32, guest_ns: u64, status: i32, status_rea
                 slot.exit_status.store(0, Ordering::Relaxed);
                 slot.exit_ready.store(0, Ordering::Release);
             }
-            slot.ptrace_stop_pending.store(0, Ordering::Release);
+            slot.ptrace_stop_signal.store(0, Ordering::Release);
             return;
         }
     }
@@ -430,7 +441,7 @@ pub fn reap_adopted_child(waiter_pid: u32, target_pid: i32) -> Option<(u32, i32,
         slot.guest_ns.store(0, Ordering::Relaxed);
         slot.exit_status.store(0, Ordering::Relaxed);
         slot.exit_ready.store(0, Ordering::Release);
-        slot.ptrace_stop_pending.store(0, Ordering::Release);
+        slot.ptrace_stop_signal.store(0, Ordering::Release);
         slot.pid.store(0, Ordering::Release);
         return Some((pid as u32, status, ns));
     }
@@ -469,7 +480,7 @@ pub fn reap_child_guest_ns(pid: u32) -> u64 {
         if slot.pid.load(Ordering::Acquire) == pid as u64 {
             let ns = slot.guest_ns.load(Ordering::Acquire);
             slot.guest_ns.store(0, Ordering::Relaxed);
-            slot.ptrace_stop_pending.store(0, Ordering::Release);
+            slot.ptrace_stop_signal.store(0, Ordering::Release);
             slot.pid.store(0, Ordering::Release);
             return ns;
         }
@@ -539,24 +550,26 @@ mod tests {
         let slots = child_slots().unwrap();
         for slot in slots {
             if slot.pid.load(Ordering::Acquire) == pid as u64 {
-                slot.ptrace_stop_pending.store(1, Ordering::Release);
+                slot.ptrace_stop_signal.store(16, Ordering::Release);
                 break;
             }
         }
         assert!(child_has_ptrace_stop_pending(pid));
+        assert_eq!(take_child_ptrace_stop_signal(pid), Some(16));
+        assert!(!child_has_ptrace_stop_pending(pid));
 
         clear_child_ptrace_stop_pending(pid);
         assert!(!child_has_ptrace_stop_pending(pid));
 
         for slot in child_slots().unwrap() {
             if slot.pid.load(Ordering::Acquire) == pid as u64 {
-                slot.ptrace_stop_pending.store(1, Ordering::Release);
+                slot.ptrace_stop_signal.store(30, Ordering::Release);
                 break;
             }
         }
 
         record_child_exit(pid, 1234);
-        assert!(child_has_ptrace_stop_pending(pid));
+        assert!(!child_has_ptrace_stop_pending(pid));
         assert_eq!(reap_child_guest_ns(pid), 1234);
         assert!(!child_has_ptrace_stop_pending(pid));
     }

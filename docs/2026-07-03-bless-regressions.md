@@ -123,6 +123,12 @@ oracle-cache edits are only used when the suite declaration itself changed.
   cause fixed: a process that already requested tracing now gets `EPERM` on a
   second `PTRACE_TRACEME` instead of succeeding again. Red-first:
   `ptracetraceme` DIFFed on the repeated-traceme path before matching Linux.
+- `ltp-ptrace05` MATCH after ptrace signal-delivery stop fixes. Root cause
+  fixed: ptraced self-signals now publish the original Linux stop signal in the
+  fork-shared child table, use a host `SIGSTOP` carrier instead of relying on
+  Darwin signal dispositions, and skip host-to-Linux translation for already
+  synthetic guest wait statuses. Red-first: `ptracesequence` DIFFed on the
+  LTP-shaped signal sweep at signal 16 before matching Linux.
 
 ### Still open / next
 
@@ -132,9 +138,9 @@ oracle-cache edits are only used when the suite declaration itself changed.
   timer-slack cases, while Carrick additionally failed the 10ms case in two
   samples by a small oversleep margin. Treat this as timing-jitter evidence,
   not a prctl semantic blocker.
-- Remaining `ltp-ptrace*` gating items after the `ltp-ptrace01`/`02`/`03`
-  fixes: `ltp-ptrace05`, `ltp-ptrace06`, and `ltp-ptrace11`. Continue with
-  separate red-first reductions.
+- Remaining `ltp-ptrace*` gating items after the `ltp-ptrace01`/`02`/`03`/`05`
+  fixes: `ltp-ptrace06` and `ltp-ptrace11`. Continue with separate red-first
+  reductions.
 
 ## Top clusters (fix the shared root cause once → clears many)
 
