@@ -92,6 +92,23 @@ fn main() {
         }
     }
 
+    // Non-hierarchical namespaces reject NS_GET_PARENT with EINVAL.
+    {
+        let fd = open_ns("uts");
+        if fd < 0 {
+            println!("uts_parent_errno=ERR:{}", errno());
+        } else {
+            let r = unsafe { libc::ioctl(fd, NS_GET_PARENT) };
+            if r < 0 {
+                println!("uts_parent_errno={}", errno());
+            } else {
+                println!("uts_parent_errno=0");
+                unsafe { libc::close(r) };
+            }
+            unsafe { libc::close(fd) };
+        }
+    }
+
     // (e) Two opens of /proc/self/ns/user fstat to the same st_ino (same-ns
     //     equality). Print only the boolean, never the inode itself.
     {
@@ -121,6 +138,24 @@ fn main() {
             let r = unsafe { libc::ioctl(fd, NS_GET_USERNS) };
             println!("userns_from_uts_ok={}", r >= 0);
             if r >= 0 {
+                unsafe { libc::close(r) };
+            }
+            unsafe { libc::close(fd) };
+        }
+    }
+
+    // NS_GET_USERNS on a user namespace fd itself is denied by the Docker
+    // oracle's kernel policy.
+    {
+        let fd = open_ns("user");
+        if fd < 0 {
+            println!("userns_from_user_errno=ERR:{}", errno());
+        } else {
+            let r = unsafe { libc::ioctl(fd, NS_GET_USERNS) };
+            if r < 0 {
+                println!("userns_from_user_errno={}", errno());
+            } else {
+                println!("userns_from_user_errno=0");
                 unsafe { libc::close(r) };
             }
             unsafe { libc::close(fd) };
