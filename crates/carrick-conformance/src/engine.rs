@@ -104,14 +104,15 @@ pub(crate) fn carrick_argv(suite: &Suite, carrick_bin: &str, run_id: &str) -> Ve
     // A suite may still override this via its own carrick_flags (added below).
     a.push("--max-traps".to_string());
     a.push(usize::MAX.to_string());
-    // Docker `--pull always`: re-check the registry every run so a
-    // rebuilt+repushed conformance image (same tag, new digest) is re-pulled,
-    // never served stale from carrick's cache. This is the carrick-side guard
-    // against the LTP-oracle version skew (carrick ran 20240930 while the oracle
-    // was blessed against 20260529). The registry HEAD is cheap; only a moved
-    // tag re-downloads layers.
-    a.push("--pull".to_string());
-    a.push("always".to_string());
+    // NO per-run `--pull`: it defaults to `missing` (pull each image at most
+    // once). Version skew (a rebuilt+repushed image — same tag, new digest) is
+    // handled ONCE by the harness image-guard, which re-pulls moved images
+    // before phase 1. A per-run `--pull always` re-fetches the registry manifest
+    // for every one of the ~2000 suites — that pins `com.docker.backend` and the
+    // Docker VM at hundreds of % CPU, the exact carrick‖docker contention the
+    // two-phase gate exists to avoid, and it corrupts the timing-sensitive
+    // fuzzy-sync verdicts. The one-shot image-guard gives the same skew safety
+    // for free.
     a.extend(suite.carrick_flags.iter().cloned());
     if let Some(ep) = suite.entrypoint.as_ref().and_then(|e| e.for_carrick()) {
         a.push("--entrypoint".to_string());
@@ -410,25 +411,20 @@ mod tests {
     use crate::lane::DockerPlatform;
 
     #[test]
-    fn carrick_argv_pulls_always_before_the_image() {
+    fn carrick_argv_has_no_per_run_pull() {
         let suite = Suite::for_test("localhost:5050/ltp:arm64", &["true"]);
 
         let argv = carrick_argv(&suite, "target/release/carrick", "conf-1");
 
-        // `--pull always` must be an envelope flag (before the image) so a
-        // rebuilt+repushed conformance image is re-pulled, never served stale —
-        // the LTP-version-skew guard on the carrick side.
-        let pull = argv
-            .windows(2)
-            .find(|w| w[0] == "--pull")
-            .map(|w| w[1].as_str());
-        assert_eq!(pull, Some("always"));
-        let pull_idx = argv.iter().position(|a| a == "--pull").expect("--pull");
-        let img_idx = argv
-            .iter()
-            .position(|a| a == "localhost:5050/ltp:arm64")
-            .expect("image");
-        assert!(pull_idx < img_idx, "--pull must precede the image");
+        // No per-run `--pull`: `--pull always` re-fetches the registry manifest
+        // for every suite, pinning the Docker backend/VM at hundreds of % CPU in
+        // contention with carrick's HVF (and corrupting timing-sensitive fuzzy-
+        // sync verdicts). Version skew is handled ONCE by the harness image-guard;
+        // `--pull` defaults to `missing` (pull each image at most once).
+        assert!(
+            !argv.windows(2).any(|w| w[0] == "--pull"),
+            "carrick_argv must not add a per-run --pull; got {argv:?}"
+        );
     }
 
     #[test]
