@@ -5,8 +5,9 @@
 //! Time is one place where Linux and macOS genuinely differ at the ABI level,
 //! so this file is a translation layer over the host clocks rather than a
 //! reimplementation. The pivot is `linux_clock_duration` (in [`super`]): it maps
-//! a Linux `clock_id` to a host clock and returns a `Duration`, and every
-//! handler here funnels through it. Three things make that non-trivial:
+//! a Linux `clock_id` to a host clock and returns a `Duration`; handlers either
+//! use it directly or add syscall-specific capability checks around it. Three
+//! things make that non-trivial:
 //!
 //!   - **The clock-id numbers differ.** Linux and macOS do NOT agree on the
 //!     numeric `CLOCK_*` constants, so the Linux ids are matched explicitly and
@@ -198,8 +199,9 @@ impl SyscallDispatcher {
             if flags & !LINUX_TIMER_ABSTIME != 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            let Some(now) = linux_clock_duration(clock_id) else {
-                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            let now = match linux_clock_nanosleep_now(clock_id) {
+                Ok(now) => now,
+                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
             };
             let timespec = read_timespec(memory, request_address.0)?;
             let requested = match duration_from_linux_timespec(timespec) {
