@@ -194,8 +194,18 @@ const CHILD_SLOTS: usize = 256;
 struct ChildSlot {
     /// Child pid, or 0 for a free slot. Cross-process atomic (shared page).
     pid: AtomicU64,
+    /// Direct guest parent pid at fork time, or an adopted subreaper pid after
+    /// the direct parent exits.
+    parent_pid: AtomicU64,
+    /// Nearest subreaper ancestor this child should reparent to if orphaned.
+    subreaper_pid: AtomicU64,
+    /// Non-zero after `adopt_children_of` reparents this slot to a subreaper.
+    adopted: AtomicU64,
     /// The child's total guest CPU nanoseconds.
     guest_ns: AtomicU64,
+    /// Wait status published by an adopted child, plus `exit_ready`.
+    exit_status: AtomicU64,
+    exit_ready: AtomicU64,
     /// Non-zero while this child has an unreported ptrace signal-delivery stop.
     ptrace_stop_pending: AtomicU64,
 }
@@ -239,9 +249,17 @@ fn child_slots() -> Option<&'static [ChildSlot]> {
 
 /// Register a live child so descendants can publish metadata before exit.
 pub fn register_child(pid: u32) {
+    register_child_with_parent(pid, 0, 0);
+}
+
+/// Register a live child with enough ancestry to model child-subreaper adoption.
+pub fn register_child_with_parent(pid: u32, parent_pid: u32, subreaper_pid: u32) {
     let Some(slots) = child_slots() else { return };
     for slot in slots {
         if slot.pid.load(Ordering::Acquire) == pid as u64 {
+            slot.parent_pid.store(parent_pid as u64, Ordering::Release);
+            slot.subreaper_pid
+                .store(subreaper_pid as u64, Ordering::Release);
             return;
         }
     }
@@ -251,11 +269,61 @@ pub fn register_child(pid: u32) {
             .compare_exchange(0, pid as u64, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
+            slot.parent_pid.store(parent_pid as u64, Ordering::Release);
+            slot.subreaper_pid
+                .store(subreaper_pid as u64, Ordering::Release);
+            slot.adopted.store(0, Ordering::Release);
             slot.guest_ns.store(0, Ordering::Relaxed);
+            slot.exit_status.store(0, Ordering::Relaxed);
+            slot.exit_ready.store(0, Ordering::Release);
             slot.ptrace_stop_pending.store(0, Ordering::Release);
             return;
         }
     }
+}
+
+/// Reparent every live child of `parent_pid` to its recorded nearest subreaper.
+pub fn adopt_children_of(parent_pid: u32) {
+    let Some(slots) = child_slots() else { return };
+    for slot in slots {
+        if slot.pid.load(Ordering::Acquire) == 0 {
+            continue;
+        }
+        if slot.parent_pid.load(Ordering::Acquire) == parent_pid as u64 {
+            let subreaper = slot.subreaper_pid.load(Ordering::Acquire);
+            if subreaper != 0 {
+                slot.parent_pid.store(subreaper, Ordering::Release);
+                slot.adopted.store(1, Ordering::Release);
+            }
+        }
+    }
+}
+
+/// If the current process has been adopted by a subreaper, return that ppid.
+pub fn adopted_parent_for_self() -> Option<u32> {
+    let pid = std::process::id() as u64;
+    let slots = child_slots()?;
+    for slot in slots {
+        if slot.pid.load(Ordering::Acquire) == pid && slot.adopted.load(Ordering::Acquire) != 0 {
+            let parent = slot.parent_pid.load(Ordering::Acquire);
+            return u32::try_from(parent).ok().filter(|p| *p != 0);
+        }
+    }
+    None
+}
+
+/// Adopted parent to notify when `pid` exits, if any.
+pub fn adopted_parent_for(pid: u32) -> Option<u32> {
+    let slots = child_slots()?;
+    for slot in slots {
+        if slot.pid.load(Ordering::Acquire) == pid as u64
+            && slot.adopted.load(Ordering::Acquire) != 0
+        {
+            let parent = slot.parent_pid.load(Ordering::Acquire);
+            return u32::try_from(parent).ok().filter(|p| *p != 0);
+        }
+    }
+    None
 }
 
 /// Mark the current process as having an unreported ptrace signal stop.
@@ -298,10 +366,21 @@ pub fn child_has_ptrace_stop_pending(pid: u32) -> bool {
 /// Publish an exiting child's total guest CPU (nanoseconds) for its parent to
 /// reap. Called from the forked-child exit path.
 pub fn record_child_exit(pid: u32, guest_ns: u64) {
+    record_child_exit_status(pid, guest_ns, 0, false);
+}
+
+/// Publish an exiting child's guest CPU and, for adopted children, a wait status
+/// the subreaper can consume even though the host kernel cannot wait it.
+pub fn record_child_exit_status(pid: u32, guest_ns: u64, status: i32, status_ready: bool) {
     let Some(slots) = child_slots() else { return };
     for slot in slots {
         if slot.pid.load(Ordering::Acquire) == pid as u64 {
             slot.guest_ns.store(guest_ns, Ordering::Release);
+            if status_ready {
+                slot.exit_status
+                    .store(status as u32 as u64, Ordering::Release);
+                slot.exit_ready.store(1, Ordering::Release);
+            }
             return;
         }
     }
@@ -312,11 +391,74 @@ pub fn record_child_exit(pid: u32, guest_ns: u64) {
             .is_ok()
         {
             slot.guest_ns.store(guest_ns, Ordering::Release);
+            if status_ready {
+                slot.exit_status
+                    .store(status as u32 as u64, Ordering::Release);
+                slot.exit_ready.store(1, Ordering::Release);
+            } else {
+                slot.exit_status.store(0, Ordering::Relaxed);
+                slot.exit_ready.store(0, Ordering::Release);
+            }
             slot.ptrace_stop_pending.store(0, Ordering::Release);
             return;
         }
     }
     // Table full: drop (worst case, this child's CPU is omitted from cutime).
+}
+
+pub fn reap_adopted_child(waiter_pid: u32, target_pid: i32) -> Option<(u32, i32, u64)> {
+    let slots = child_slots()?;
+    for slot in slots {
+        let pid = slot.pid.load(Ordering::Acquire);
+        if pid == 0 || slot.adopted.load(Ordering::Acquire) == 0 {
+            continue;
+        }
+        if slot.parent_pid.load(Ordering::Acquire) != waiter_pid as u64 {
+            continue;
+        }
+        if target_pid > 0 && pid != target_pid as u64 {
+            continue;
+        }
+        if slot.exit_ready.load(Ordering::Acquire) == 0 {
+            continue;
+        }
+        let status = slot.exit_status.load(Ordering::Acquire) as u32 as i32;
+        let ns = slot.guest_ns.load(Ordering::Acquire);
+        slot.parent_pid.store(0, Ordering::Relaxed);
+        slot.subreaper_pid.store(0, Ordering::Relaxed);
+        slot.adopted.store(0, Ordering::Release);
+        slot.guest_ns.store(0, Ordering::Relaxed);
+        slot.exit_status.store(0, Ordering::Relaxed);
+        slot.exit_ready.store(0, Ordering::Release);
+        slot.ptrace_stop_pending.store(0, Ordering::Release);
+        slot.pid.store(0, Ordering::Release);
+        return Some((pid as u32, status, ns));
+    }
+    None
+}
+
+/// Return an adopted child that this waiter should block on until it publishes
+/// an exit status. `target_pid <= 0` means any adopted child, matching wait4's
+/// any-child/process-group sentinel handling at this layer.
+pub fn pending_adopted_child(waiter_pid: u32, target_pid: i32) -> Option<u32> {
+    let slots = child_slots()?;
+    for slot in slots {
+        let pid = slot.pid.load(Ordering::Acquire);
+        if pid == 0 || slot.adopted.load(Ordering::Acquire) == 0 {
+            continue;
+        }
+        if slot.parent_pid.load(Ordering::Acquire) != waiter_pid as u64 {
+            continue;
+        }
+        if target_pid > 0 && pid != target_pid as u64 {
+            continue;
+        }
+        if slot.exit_ready.load(Ordering::Acquire) != 0 {
+            continue;
+        }
+        return u32::try_from(pid).ok();
+    }
+    None
 }
 
 /// Drain a reaped child's published guest CPU nanoseconds (0 if none), freeing

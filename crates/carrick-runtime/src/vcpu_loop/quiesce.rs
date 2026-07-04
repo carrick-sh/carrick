@@ -378,7 +378,11 @@ where
                     );
                 }
                 crate::event_ring::rec(crate::event_ring::FORK, child_pid, 0, 0);
-                crate::guest_cpu::register_child(child_pid as u32);
+                crate::guest_cpu::register_child_with_parent(
+                    child_pid as u32,
+                    std::process::id(),
+                    kernel.dispatcher.subreaper_for_fork_child(),
+                );
                 // Seed the child's published run-state as Booting NOW, from the
                 // parent, before this fork returns — so a parent that polls
                 // /proc/<child>/stat immediately (pauseinterrupt2) sees `R`, not

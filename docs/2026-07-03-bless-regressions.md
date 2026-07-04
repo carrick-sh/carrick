@@ -98,12 +98,18 @@ oracle-cache edits are only used when the suite declaration itself changed.
   invalid-argument assertions run instead of being skipped as unsupported.
   Red-first: `prctlerrors` DIFFed on those valid-form and privilege-gated errno
   paths before matching Linux line-for-line.
+- `ltp-prctl03` MATCH after child-subreaper reparenting fixes. Root causes
+  fixed: `PR_SET_CHILD_SUBREAPER` state is not inherited by forked children,
+  descendants record their nearest subreaper ancestor at fork time, orphaned
+  children report the subreaper as `getppid()` under PID namespaces, and the
+  subreaper can block in `wait4` for an adopted descendant before consuming the
+  synthetic exit status. Red-first: `childsubreaper` DIFFed on inherited
+  subreaper state, orphan PPID, wait reaping, exit status, and SIGCHLD before
+  matching Linux line-for-line.
 
 ### Still open / next
 
-- `ltp-prctl*`: current focused run still regresses `ltp-prctl03`;
-  `ltp-prctl09` is a count-level MATCH but still has differing assertion mix.
-  Raw failure themes: child-subreaper reparenting and assertion-mix parity.
+- `ltp-prctl09` is a count-level MATCH but still has differing assertion mix.
 
 ## Top clusters (fix the shared root cause once → clears many)
 

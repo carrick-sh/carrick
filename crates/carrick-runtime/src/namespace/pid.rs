@@ -465,6 +465,11 @@ pub fn self_ns_ppid() -> u32 {
     if self_ns_pid() == NS_INIT_PID {
         return 0;
     }
+    if let Some(parent) = crate::guest_cpu::adopted_parent_for_self() {
+        return region()
+            .and_then(|r| r.host_to_ns(parent))
+            .unwrap_or(NS_INIT_PID);
+    }
     // Explicit orphan flag (set by the NsSupervisor the instant it sees the
     // parent die) — fast, race-free reparent-to-init.
     if is_orphaned(std::process::id()) {

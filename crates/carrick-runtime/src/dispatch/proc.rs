@@ -389,9 +389,17 @@ pub(super) struct ProcState {
     /// follow-up — the flag round-trips so libcap/init feature checks pass.
     pub keepcaps: i64,
     /// `prctl(PR_SET_CHILD_SUBREAPER)` flag (0 = not a subreaper, default).
-    /// Recorded and echoed back via PR_GET_CHILD_SUBREAPER; reparent-to-subreaper
-    /// semantics are a follow-up.
+    /// Recorded and echoed back via PR_GET_CHILD_SUBREAPER.
     pub child_subreaper: i64,
+    /// Host pid that set `child_subreaper`. The bit is copied by host `fork`,
+    /// but Linux does not inherit child-subreaper status; the owner separates
+    /// "this process is a subreaper" from "this process has a subreaper
+    /// ancestor".
+    pub child_subreaper_owner: u32,
+    /// Nearest subreaper ancestor inherited by fork descendants. This is not
+    /// reported by PR_GET_CHILD_SUBREAPER; it is the target used if this
+    /// process's direct parent exits.
+    pub subreaper_ancestor: u32,
     /// `prctl(PR_SET_NO_NEW_PRIVS)` bit. Once set it cannot be cleared (one-way
     /// latch). The precondition for an unprivileged seccomp filter install.
     pub no_new_privs: bool,
@@ -549,6 +557,8 @@ impl ProcState {
             pdeathsig: 0,
             keepcaps: 0,
             child_subreaper: 0,
+            child_subreaper_owner: 0,
+            subreaper_ancestor: 0,
             no_new_privs: false,
             timerslack: LINUX_DEFAULT_TIMERSLACK_NS,
             timerslack_default: LINUX_DEFAULT_TIMERSLACK_NS,
@@ -596,7 +606,28 @@ impl SyscallDispatcher {
 
     pub(crate) fn proc_after_fork_child(&self) {
         let mut proc = self.proc.lock();
+        if proc.child_subreaper != 0 {
+            proc.subreaper_ancestor = if proc.child_subreaper_owner != 0 {
+                proc.child_subreaper_owner
+            } else {
+                u32::try_from(unsafe { libc::getppid() }).unwrap_or(0)
+            };
+        }
+        proc.child_subreaper = 0;
+        proc.child_subreaper_owner = 0;
         proc.timerslack_default = proc.timerslack;
+    }
+
+    pub(crate) fn subreaper_for_fork_child(&self) -> u32 {
+        let proc = self.proc.lock();
+        let current = std::process::id();
+        if proc.child_subreaper != 0 && proc.child_subreaper_owner == current {
+            std::process::id()
+        } else if proc.child_subreaper != 0 && proc.child_subreaper_owner != 0 {
+            proc.child_subreaper_owner
+        } else {
+            proc.subreaper_ancestor
+        }
     }
 
     /// Parse a `struct sock_fprog *` at `fprog_ptr` and install its cBPF program
@@ -1071,11 +1102,22 @@ impl SyscallDispatcher {
                 // PR_SET_CHILD_SUBREAPER: any nonzero arg2 marks this process a
                 // subreaper. PR_GET_CHILD_SUBREAPER writes the value to *arg2.
                 LINUX_PR_SET_CHILD_SUBREAPER => {
-                    this.proc.lock().child_subreaper = i64::from(arg2 != 0);
+                    let mut proc = this.proc.lock();
+                    if arg2 != 0 {
+                        proc.child_subreaper = 1;
+                        proc.child_subreaper_owner = std::process::id();
+                    } else {
+                        proc.child_subreaper = 0;
+                        proc.child_subreaper_owner = 0;
+                    }
                     DispatchOutcome::Returned { value: 0 }
                 }
                 LINUX_PR_GET_CHILD_SUBREAPER => {
-                    let value = this.proc.lock().child_subreaper as i32;
+                    let proc = this.proc.lock();
+                    let value = i32::from(
+                        proc.child_subreaper != 0
+                            && proc.child_subreaper_owner == std::process::id(),
+                    );
                     memory.write_bytes(arg2, &value.to_ne_bytes())?;
                     DispatchOutcome::Returned { value: 0 }
                 }
@@ -2345,6 +2387,46 @@ impl SyscallDispatcher {
             let result = match result {
                 Ok(value) => value,
                 Err(errno) => {
+                    if errno == crate::linux_abi::LINUX_ECHILD
+                        && let Some((pid, status, guest_ns)) =
+                            crate::guest_cpu::reap_adopted_child(std::process::id(), host_target)
+                    {
+                        let child_user_us = guest_ns / 1000;
+                        crate::guest_cpu::add_reaped_child(child_user_us, 0);
+                        if rusage_addr.0 != 0 {
+                            let child_rusage = rusage_from_us(child_user_us, 0);
+                            if memory
+                                .write_bytes(rusage_addr.0, child_rusage.abi_bytes())
+                                .is_err()
+                            {
+                                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                            }
+                        }
+                        if wstatus_addr.0 != 0 {
+                            memory.write_bytes(wstatus_addr.0, &status.to_ne_bytes())?;
+                        }
+                        let value = if crate::namespace::pid::enabled() {
+                            crate::namespace::pid::host_to_ns_or_self(pid)
+                        } else {
+                            pid
+                        };
+                        return Ok(DispatchOutcome::Returned {
+                            value: i64::from(value),
+                        });
+                    }
+                    if host_options & libc::WNOHANG == 0
+                        && !options
+                            .intersects(LinuxWaitOptions::WUNTRACED | LinuxWaitOptions::WCONTINUED)
+                        && let Some(pid) =
+                            crate::guest_cpu::pending_adopted_child(std::process::id(), host_target)
+                    {
+                        let tid = Self::ctx_tid(cx);
+                        let non_interrupting = this.non_interrupting_signal_mask(tid);
+                        return Ok(DispatchOutcome::WaitOnProcExit {
+                            pid: pid as i32,
+                            sig_mask: carrick_abi::WaitSigMask::Additive(non_interrupting),
+                        });
+                    }
                     // A process-group wait (pid < -1) for a group the kernel
                     // can't find is ESRCH on Linux; macOS surfaces EINVAL for
                     // the bad pgid (LTP waitpid04 INT_MIN case). Remap only that
