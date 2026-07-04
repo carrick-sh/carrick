@@ -2217,6 +2217,7 @@ impl SyscallDispatcher {
             (sig_ignored.raw(), sig_caught.raw(), sig_shdpnd.raw());
         let sysvipc_shm = self.sysvipc_shm_table();
         let sysvipc_sem = self.sysvipc_sem_table();
+        let sysvipc_msg = self.sysvipc_msg_table();
         let ctx = crate::vfs::OpenContext {
             executable_path: Some(exec_path.as_str()),
             argv: Some(argv.as_slice()),
@@ -2242,6 +2243,7 @@ impl SyscallDispatcher {
             sig_shdpnd,
             sysvipc_shm: Some(sysvipc_shm.as_str()),
             sysvipc_sem: Some(sysvipc_sem.as_str()),
+            sysvipc_msg: Some(sysvipc_msg.as_str()),
         };
         let open_flags = LinuxOpenFlags::from_bits_retain(flags);
         let vfs_flags = crate::vfs::OpenFlags {
