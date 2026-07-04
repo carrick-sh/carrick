@@ -67,7 +67,11 @@ oracle-cache edits are only used when the suite declaration itself changed.
   `ltp-io_setup02`, `ltp-io_submit02`, `ltp-io_submit03`, `ltp-io_uring01`,
   `ltp-io_uring02` all MATCH.
 - `ltp-fanotify*`: `ltp-fanotify02`, `ltp-fanotify04`, `ltp-fanotify07`,
-  `ltp-fanotify08`, `ltp-fanotify11`, `ltp-fanotify12` all MATCH.
+  `ltp-fanotify08`, `ltp-fanotify11`, `ltp-fanotify12` all MATCH after
+  `be98f9d5`. Root cause fixed: `fanotify_init` and `fanotify_mark` now exist
+  as explicitly unsupported `EPERM` syscalls instead of false-passing the
+  Docker oracle. Red-first: clean `a55a26e6` reported carrick[Success] vs
+  oracle[0/1] for all six suites.
 - `ltp-request_key*`: `ltp-request_key01` through `ltp-request_key06` all MATCH.
 - `ltp-pidfd*` listed here: `ltp-pidfd_getfd01`, `ltp-pidfd_getfd02`,
   `ltp-pidfd_open04`, `ltp-pidfd_send_signal01`, `ltp-pidfd_send_signal02`,
