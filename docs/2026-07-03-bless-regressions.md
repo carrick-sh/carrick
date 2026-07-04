@@ -90,13 +90,20 @@ oracle-cache edits are only used when the suite declaration itself changed.
   forked-child reset-to-default case; pre-fix focused LTP regressed
   `ltp-prctl05` at carrick[6/8] vs oracle[8/8] and `ltp-prctl08` at
   carrick[10/14] vs oracle[14/14].
+- `ltp-prctl02` MATCH after prctl error-semantics fixes. Root causes fixed:
+  seccomp filter install now validates bad user pointers before the
+  no-new-privs/capability gate and otherwise returns `EACCES` when unprivileged,
+  `PR_SET_SECUREBITS`/`PR_CAPBSET_DROP` require `CAP_SETPCAP`, and the THP,
+  ambient capability, and speculation-control prctl forms are recognized so
+  invalid-argument assertions run instead of being skipped as unsupported.
+  Red-first: `prctlerrors` DIFFed on those valid-form and privilege-gated errno
+  paths before matching Linux line-for-line.
 
 ### Still open / next
 
-- `ltp-prctl*`: current focused run still regresses `ltp-prctl02` and
-  `ltp-prctl03`; `ltp-prctl09` is a count-level MATCH but still has differing
-  assertion mix. Raw failure themes: seccomp/securebits/capbset negative cases
-  and child-subreaper reparenting.
+- `ltp-prctl*`: current focused run still regresses `ltp-prctl03`;
+  `ltp-prctl09` is a count-level MATCH but still has differing assertion mix.
+  Raw failure themes: child-subreaper reparenting and assertion-mix parity.
 
 ## Top clusters (fix the shared root cause once → clears many)
 
