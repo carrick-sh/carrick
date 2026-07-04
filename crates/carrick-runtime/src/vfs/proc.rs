@@ -2701,7 +2701,7 @@ Max stack size            8388608              unlimited            bytes\n\
 Max core file size        0                    unlimited            bytes\n\
 Max resident set          unlimited            unlimited            bytes\n\
 Max processes             unlimited            unlimited            processes\n\
-Max open files            1024                 4096                 files\n\
+Max open files            1048576              1048576              files\n\
 Max locked memory         65536                65536                bytes\n\
 Max address space         unlimited            unlimited            bytes\n\
 Max file locks            unlimited            unlimited            locks\n\
