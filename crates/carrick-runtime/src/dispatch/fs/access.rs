@@ -248,6 +248,15 @@ impl SyscallDispatcher {
         if !crate::vfs::is_synthetic_virtual_file(path, &self.synthetic_proc_context()) {
             return None;
         }
-        Some(synthetic_readonly_access(mode))
+        Some(synthetic_readonly_access_for_path(path, mode))
     }
+}
+
+fn synthetic_readonly_access_for_path(path: &str, mode: u64) -> DispatchOutcome {
+    let write_errno = if crate::vfs::proc::is_sysctl_leaf_path(path) {
+        LINUX_EROFS
+    } else {
+        LINUX_EACCES
+    };
+    synthetic_readonly_access_with_errno(mode, write_errno)
 }

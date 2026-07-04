@@ -4651,10 +4651,12 @@ pub(super) fn dac_check(
 }
 
 fn synthetic_readonly_access(mode: u64) -> DispatchOutcome {
+    synthetic_readonly_access_with_errno(mode, LINUX_EACCES)
+}
+
+fn synthetic_readonly_access_with_errno(mode: u64, write_errno: LinuxErrno) -> DispatchOutcome {
     if mode & LINUX_W_OK != 0 {
-        DispatchOutcome::Errno {
-            errno: LINUX_EACCES,
-        }
+        DispatchOutcome::Errno { errno: write_errno }
     } else {
         DispatchOutcome::Returned { value: 0 }
     }
