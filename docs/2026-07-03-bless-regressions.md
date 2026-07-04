@@ -119,6 +119,10 @@ oracle-cache edits are only used when the suite declaration itself changed.
   for an existing target instead of treating the request as absent `ENOSYS`.
   Red-first: `ptraceattach` DIFFed on a non-dumpable parent attach attempt and
   now MATCHes Linux.
+- `ltp-ptrace03` MATCH after repeated `PTRACE_TRACEME` denial semantics. Root
+  cause fixed: a process that already requested tracing now gets `EPERM` on a
+  second `PTRACE_TRACEME` instead of succeeding again. Red-first:
+  `ptracetraceme` DIFFed on the repeated-traceme path before matching Linux.
 
 ### Still open / next
 
@@ -128,9 +132,9 @@ oracle-cache edits are only used when the suite declaration itself changed.
   timer-slack cases, while Carrick additionally failed the 10ms case in two
   samples by a small oversleep margin. Treat this as timing-jitter evidence,
   not a prctl semantic blocker.
-- Remaining `ltp-ptrace*` gating items after the `ltp-ptrace01`/`02` fixes:
-  `ltp-ptrace03`, `ltp-ptrace05`, `ltp-ptrace06`, and `ltp-ptrace11`.
-  Continue with separate red-first reductions.
+- Remaining `ltp-ptrace*` gating items after the `ltp-ptrace01`/`02`/`03`
+  fixes: `ltp-ptrace05`, `ltp-ptrace06`, and `ltp-ptrace11`. Continue with
+  separate red-first reductions.
 
 ## Top clusters (fix the shared root cause once → clears many)
 
