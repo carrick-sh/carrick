@@ -184,7 +184,8 @@ If it fails in Docker too, it's not carrick's bug.
   (Go-under-HVF races); treat flaky flips as flakiness (retry / `known_gaps`),
   not regressions.
 - **Use `bpftrace` inside the Docker oracle for Linux syscall shape.** The LTP
-  image includes `bpftrace` (validated as `bpftrace v0.20.2`); prefer it over
+  container already has `bpftrace` installed (validated as `bpftrace v0.20.2`);
+  use that in-container copy rather than a host-side tracer. Prefer it over
   guest `strace` when you only need the Docker/Linux side because it is lower
   overhead and does not perturb the test as much. Run it in a separate
   Docker-only phase (never alongside Carrick), with privileges and tracefs
