@@ -351,6 +351,7 @@ const SYSCTL_TABLE: &[(&str, Sysctl)] = &[
     ("/proc/sys/fs/file-max", Sysctl::Static(b"1048576\n")),
     ("/proc/sys/fs/file-nr", Sysctl::Static(b"256\t0\t1048576\n")),
     ("/proc/sys/fs/nr_open", Sysctl::Static(b"1048576\n")),
+    ("/proc/sys/fs/aio-max-nr", Sysctl::Static(b"65536\n")),
     ("/proc/sys/fs/pipe-max-size", Sysctl::Static(b"1048576\n")),
     ("/proc/sys/fs/overflowuid", Sysctl::Static(b"65534\n")),
     ("/proc/sys/fs/overflowgid", Sysctl::Static(b"65534\n")),
@@ -3032,6 +3033,7 @@ mod tests {
             ("/proc/sys/net/ipv4/ip_local_port_range", "32768\t60999\n"),
             ("/proc/sys/net/ipv4/tcp_rmem", "4096\t131072\t6291456\n"),
             ("/proc/sys/fs/file-nr", "256\t0\t1048576\n"),
+            ("/proc/sys/fs/aio-max-nr", "65536\n"),
         ] {
             let got = synthetic_file(path, &ctx()).unwrap();
             assert_eq!(String::from_utf8(got).unwrap(), want, "{path}");

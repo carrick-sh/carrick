@@ -56,6 +56,11 @@ syscall_table! {
     /// the other modules' tables. Add a `fs` syscall by adding an arm
     /// HERE — no shared routing table to edit.
     pub(crate) fn dispatch_fs;
+    0 => io_setup,
+    1 => io_destroy,
+    2 => io_submit,
+    3 => io_cancel,
+    4 => io_getevents,
     17 => getcwd,
     23 => dup,
     24 => dup3,
@@ -167,6 +172,7 @@ pub(crate) fn is_structural_namespace_mutation(canonical_nr: u64) -> bool {
 
 mod access;
 mod fd_helpers;
+mod legacy_aio;
 mod pathres;
 mod sendfile;
 mod stat;
@@ -4300,6 +4306,26 @@ impl SyscallDispatcher {
 
 impl SyscallDispatcher {
     define_syscall! {
+
+        fn io_setup(this, cx, nr_events: u64, ctxp: GuestPtr) {
+            legacy_aio::io_setup(this, cx, nr_events, ctxp)
+        }
+
+        fn io_destroy(this, _cx, raw_ctx: u64) {
+            legacy_aio::io_destroy(this, raw_ctx)
+        }
+
+        fn io_submit(this, cx, raw_ctx: u64, raw_count: u64, iocbpp: GuestPtr) {
+            legacy_aio::io_submit(this, cx, raw_ctx, raw_count, iocbpp)
+        }
+
+        fn io_cancel(this, cx, raw_ctx: u64, iocb: GuestPtr, result: GuestPtr) {
+            legacy_aio::io_cancel(this, cx, raw_ctx, iocb, result)
+        }
+
+        fn io_getevents(this, cx, raw_ctx: u64, min_nr: u64, nr: u64, events: GuestPtr, _timeout: GuestPtr) {
+            legacy_aio::io_getevents(this, cx, raw_ctx, min_nr, nr, events)
+        }
 
         fn getcwd(this, cx, address: GuestPtr, size: u64) {
 

@@ -12,6 +12,23 @@ pub(in crate::dispatch) struct DnotifyRegistration {
     pub(in crate::dispatch) mask: LinuxDnotifyMask,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(in crate::dispatch) struct LegacyAioContextId(u64);
+
+impl LegacyAioContextId {
+    pub(in crate::dispatch) fn from_guest(raw: u64) -> Option<Self> {
+        if raw == 0 { None } else { Some(Self(raw)) }
+    }
+
+    pub(in crate::dispatch) fn allocated_from(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    pub(in crate::dispatch) fn get(self) -> u64 {
+        self.0
+    }
+}
+
 /// Owned filesystem-subsystem state. Split out of `SyscallDispatcher` so
 /// the fs handlers borrow only the VFS state they touch instead of the
 /// whole dispatcher. Field semantics are unchanged from the former loose
@@ -102,6 +119,14 @@ pub(in crate::dispatch) struct IoState {
     /// than an `OpenDescription` variant so io_uring needs no new arm across the
     /// ~24 fd match sites; `mmap`/`io_uring_enter` look the ring up here.
     pub io_uring_instances: RwLock<HashMap<i32, crate::dispatch::ioring::IoUringState>>,
+    /// Minimal legacy Linux AIO contexts (`io_setup`/`io_destroy`/`io_submit`).
+    /// Carrick services the currently covered AIO contract synchronously, but
+    /// still needs a real context namespace so invalid-context checks match
+    /// Linux instead of degrading to ENOSYS/TCONF.
+    pub legacy_aio_contexts: RwLock<std::collections::BTreeSet<LegacyAioContextId>>,
+    /// Raw allocation counter. It is wrapped into `LegacyAioContextId` before
+    /// entering the guest-visible context namespace.
+    pub next_legacy_aio_context: AtomicU64,
     /// Guest soft RLIMIT_NOFILE: the highest fd the allocator hands out
     /// (`fd < nofile_soft`). Linux default 1024; a guest may raise it via
     /// setrlimit/prlimit64 (libuv's TEST_FILE_LIMIT does). Lock-free so the fd
@@ -142,6 +167,8 @@ impl IoState {
             fd_open_paths: RwLock::new(HashMap::new()),
             splice_pushback: Mutex::new(HashMap::new()),
             io_uring_instances: RwLock::new(HashMap::new()),
+            legacy_aio_contexts: RwLock::new(std::collections::BTreeSet::new()),
+            next_legacy_aio_context: AtomicU64::new(1),
             nofile_soft: AtomicU64::new(DEFAULT_NOFILE_SOFT),
             epoll_fds: RwLock::new(std::collections::BTreeSet::new()),
         }
