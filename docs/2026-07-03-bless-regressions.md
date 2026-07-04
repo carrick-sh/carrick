@@ -129,6 +129,16 @@ oracle-cache edits are only used when the suite declaration itself changed.
   Darwin signal dispositions, and skip host-to-Linux translation for already
   synthetic guest wait statuses. Red-first: `ptracesequence` DIFFed on the
   LTP-shaped signal sweep at signal 16 before matching Linux.
+- `ltp-ptrace06` MATCH after the ptrace signal-delivery stop fix above; the
+  same current tree reports all 48 invalid peek/poke address assertions as
+  matching Linux.
+- `ltp-ptrace11` MATCH after synthetic attach-stop support for pid 1. Root
+  cause fixed: Carrick no longer treats every `PTRACE_ATTACH` to an existing
+  task as `EPERM`; attaching the namespace init records a synthetic waitable
+  `SIGSTOP` attach stop and `PTRACE_DETACH` clears it. Red-first:
+  `ptraceattachinit` DIFFed on attach/wait/detach before matching Linux, while
+  `ptraceattach` still covers the non-dumpable-parent `EPERM` case from
+  `ltp-ptrace02`.
 
 ### Still open / next
 
@@ -138,9 +148,7 @@ oracle-cache edits are only used when the suite declaration itself changed.
   timer-slack cases, while Carrick additionally failed the 10ms case in two
   samples by a small oversleep margin. Treat this as timing-jitter evidence,
   not a prctl semantic blocker.
-- Remaining `ltp-ptrace*` gating items after the `ltp-ptrace01`/`02`/`03`/`05`
-  fixes: `ltp-ptrace06` and `ltp-ptrace11`. Continue with separate red-first
-  reductions.
+- No remaining `ltp-ptrace*` gating item in the current focused checks.
 
 ## Top clusters (fix the shared root cause once → clears many)
 

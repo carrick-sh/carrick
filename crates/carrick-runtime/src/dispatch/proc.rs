@@ -454,6 +454,11 @@ pub(super) struct ProcState {
     /// dispositions; Carrick needs this bit so the signal path can avoid routing
     /// those through the ordinary pending-signal queue.
     pub ptrace_traceme: bool,
+    /// Synthetic `PTRACE_ATTACH` target for the small attach/wait/detach surface
+    /// Carrick supports. Darwin cannot make an arbitrary guest pid waitable by
+    /// this process, so the dispatcher reports the attach stop itself.
+    pub ptrace_attached_pid: Option<u32>,
+    pub ptrace_attach_stop_pending: bool,
 }
 
 /// Default affinity mask for `ncpu` logical CPUs: the low `ncpu` bits set
@@ -568,6 +573,8 @@ impl ProcState {
             affinity: default_affinity(crate::host_facts::logical_cpu_count()),
             tso_enabled: false,
             ptrace_traceme: false,
+            ptrace_attached_pid: None,
+            ptrace_attach_stop_pending: false,
         }
     }
 
@@ -1974,17 +1981,37 @@ impl SyscallDispatcher {
                     None => return Ok(DispatchOutcome::errno(LINUX_ESRCH)),
                 },
                 17 => match host_pid(pid) {
-                    Some(host) => unsafe {
-                        carrick_portable::ptrace(
-                            carrick_portable::PT_DETACH,
-                            host,
-                            1,
-                            host_signal_data(),
-                        )
-                    },
+                    Some(host) => {
+                        {
+                            let mut proc = this.proc.lock();
+                            if proc.ptrace_attached_pid == Some(host as u32) {
+                                proc.ptrace_attached_pid = None;
+                                proc.ptrace_attach_stop_pending = false;
+                                return Ok(DispatchOutcome::Returned { value: 0 });
+                            }
+                        }
+                        unsafe {
+                            carrick_portable::ptrace(
+                                carrick_portable::PT_DETACH,
+                                host,
+                                1,
+                                host_signal_data(),
+                            )
+                        }
+                    }
                     None => return Ok(DispatchOutcome::errno(LINUX_ESRCH)),
                 },
                 LINUX_PTRACE_ATTACH => match host_pid(pid) {
+                    Some(host)
+                        if host > 0
+                            && pid.0 == LINUX_BOOTSTRAP_PID as i32
+                            && target_exists(host) =>
+                    {
+                        let mut proc = this.proc.lock();
+                        proc.ptrace_attached_pid = Some(host as u32);
+                        proc.ptrace_attach_stop_pending = true;
+                        return Ok(DispatchOutcome::Returned { value: 0 });
+                    }
                     Some(host) if host > 0 && target_exists(host) => {
                         return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EPERM));
                     }
@@ -2324,6 +2351,42 @@ impl SyscallDispatcher {
             }
             let mut host_status: i32 = 0;
             let mut host_rusage: libc::rusage = unsafe { std::mem::zeroed() };
+            let synthetic_attach_stop = {
+                let mut proc = this.proc.lock();
+                let attached = proc.ptrace_attached_pid;
+                let matches_target = attached.is_some_and(|attached| {
+                    host_target == attached as i32 || host_target == -1
+                });
+                if proc.ptrace_attach_stop_pending && matches_target {
+                    proc.ptrace_attach_stop_pending = false;
+                    attached
+                } else {
+                    None
+                }
+            };
+            if let Some(attached_host_pid) = synthetic_attach_stop {
+                if wstatus_addr.0 != 0 {
+                    let status = (LINUX_SIGSTOP << 8) | 0x7f;
+                    memory.write_bytes(wstatus_addr.0, &status.to_ne_bytes())?;
+                }
+                if rusage_addr.0 != 0 {
+                    let child_rusage = rusage_from_us(0, 0);
+                    if memory
+                        .write_bytes(rusage_addr.0, child_rusage.abi_bytes())
+                        .is_err()
+                    {
+                        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                    }
+                }
+                let value = if crate::namespace::pid::enabled() {
+                    crate::namespace::pid::host_to_ns_or_self(attached_host_pid)
+                } else {
+                    attached_host_pid
+                };
+                return Ok(DispatchOutcome::Returned {
+                    value: i64::from(value),
+                });
+            }
             // A ptraced child can become waitable for a signal-delivery stop
             // even without WUNTRACED. EVFILT_PROC/NOTE_EXIT would sleep past
             // that stop, so let Darwin's wait4 observe a published pending stop.
