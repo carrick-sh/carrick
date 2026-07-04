@@ -223,6 +223,11 @@ bitflags::bitflags! {
     struct ShmModeFlags: u32 {
         const LOCKED = 0o2000;
     }
+
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    struct SemOpFlags: u16 {
+        const NOWAIT = 0o4000;
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -375,6 +380,35 @@ impl HostSemId {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct LinuxSemValue(i32);
+
+impl LinuxSemValue {
+    const MAX: i32 = LINUX_SEMVMX as i32;
+
+    fn from_host(value: i32) -> Self {
+        Self(value)
+    }
+
+    fn checked_add(self, delta: i16) -> Option<Self> {
+        self.0
+            .checked_add(i32::from(delta))
+            .filter(|value| *value <= Self::MAX)
+            .map(Self)
+    }
+
+    fn checked_sub(self, delta: i16) -> Option<Self> {
+        self.0
+            .checked_sub(i32::from(delta.unsigned_abs()))
+            .filter(|value| *value >= 0)
+            .map(Self)
+    }
+
+    fn is_zero(self) -> bool {
+        self.0 == 0
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SemStatSelector {
     StatIndex(SemScanIndex),
@@ -409,6 +443,10 @@ impl SemScanIndex {
 }
 
 impl SemSet {
+    fn can_admin(&self, creds: &super::creds::CredState) -> bool {
+        creds.euid == 0 || creds.euid == self.uid || creds.euid == self.cuid
+    }
+
     fn can_read(&self, creds: &super::creds::CredState) -> bool {
         creds.euid == 0
             || if creds.euid == self.uid {
@@ -1736,7 +1774,6 @@ const LINUX_GETNCNT: u64 = 14;
 const LINUX_GETZCNT: u64 = 15;
 const LINUX_SETVAL: u64 = 16;
 const LINUX_SETALL: u64 = 17;
-const LINUX_SEM_IPC_NOWAIT: i16 = 0o4000; // IPC_NOWAIT in sem_flg
 
 struct SysvSemBlockStateGuard {
     tid: crate::thread::ThreadId,
@@ -1760,8 +1797,48 @@ impl Drop for SysvSemBlockStateGuard {
 }
 
 fn semop_may_block(sops: &[carrick_portable::Sembuf]) -> bool {
-    sops.iter()
-        .any(|s| s.sem_op <= 0 && s.sem_flg & LINUX_SEM_IPC_NOWAIT == 0)
+    sops.iter().any(|s| {
+        s.sem_op <= 0
+            && !SemOpFlags::from_bits_retain(s.sem_flg as u16).contains(SemOpFlags::NOWAIT)
+    })
+}
+
+fn validate_semop_value_ranges(
+    semid: i32,
+    sops: &[carrick_portable::Sembuf],
+) -> Result<(), LinuxErrno> {
+    let nsems = host_sem_nsems(semid)?;
+    let mut values: HashMap<u16, LinuxSemValue> = HashMap::new();
+    for sop in sops {
+        if usize::from(sop.sem_num) >= nsems {
+            return Err(LINUX_EFBIG);
+        }
+
+        let value = match values.get(&sop.sem_num).copied() {
+            Some(value) => value,
+            None => {
+                let host_cmd = linux_semctl_cmd_to_host(LINUX_GETVAL).ok_or(LINUX_EINVAL)?;
+                let raw =
+                    unsafe { carrick_portable::semctl0(semid, i32::from(sop.sem_num), host_cmd) };
+                let raw = raw.host_syscall_errno()?;
+                let value = LinuxSemValue::from_host(raw);
+                values.insert(sop.sem_num, value);
+                value
+            }
+        };
+
+        let next = match sop.sem_op.cmp(&0) {
+            std::cmp::Ordering::Greater => value.checked_add(sop.sem_op).ok_or(LINUX_ERANGE)?,
+            std::cmp::Ordering::Less => match value.checked_sub(sop.sem_op) {
+                Some(next) => next,
+                None => return Ok(()),
+            },
+            std::cmp::Ordering::Equal if value.is_zero() => value,
+            std::cmp::Ordering::Equal => return Ok(()),
+        };
+        values.insert(sop.sem_num, next);
+    }
+    Ok(())
 }
 
 /// Shared semop / semtimedop core. Reads the `nsops` sembuf entries (Linux ==
@@ -1796,6 +1873,9 @@ fn sysv_semop<M: GuestMemory>(
             sem_flg: i16::from_le_bytes([bytes[o + 4], bytes[o + 5]]),
         });
     }
+    if let Err(errno) = validate_semop_value_ranges(semid, &sops) {
+        return Ok(DispatchOutcome::errno(errno));
+    }
     let may_block = semop_may_block(&sops);
     let _block_state = may_block.then(|| SysvSemBlockStateGuard::new(cx.tid()));
 
@@ -1821,7 +1901,7 @@ fn sysv_semop<M: GuestMemory>(
         + std::time::Duration::from_nanos(total_ns.min(u64::MAX as u128) as u64);
     let mut nowait = sops.clone();
     for s in &mut nowait {
-        s.sem_flg |= LINUX_SEM_IPC_NOWAIT;
+        s.sem_flg |= SemOpFlags::NOWAIT.bits() as i16;
     }
     let mut saw_would_block = false;
     loop {
@@ -1952,7 +2032,7 @@ impl SyscallDispatcher {
             let Some(meta) = state.semaphores.get(&guest_semid) else {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             };
-            if matches!(cmd, LINUX_IPC_RMID | LINUX_IPC_SET) && !meta.can_write(creds) {
+            if matches!(cmd, LINUX_IPC_RMID | LINUX_IPC_SET) && !meta.can_admin(creds) {
                 return Ok(DispatchOutcome::errno(LINUX_EPERM));
             }
             meta.host_id

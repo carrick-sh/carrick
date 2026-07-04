@@ -252,6 +252,73 @@ unsafe fn semtimedop_interrupted_by_signal() -> bool {
     ok
 }
 
+unsafe fn semop_positive_overflow_erange() -> bool {
+    let semid = libc::syscall(SYS_SEMGET, libc::IPC_PRIVATE, 1, IPC_CREAT | 0o600) as i32;
+    if semid < 0 {
+        return false;
+    }
+    if semctl(semid, 0, SETVAL, 1usize as *mut libc::c_void) != 0 {
+        semctl(semid, 0, IPC_RMID, core::ptr::null_mut());
+        return false;
+    }
+
+    reset_errno();
+    let mut increment = Sembuf {
+        sem_num: 0,
+        sem_op: i16::MAX,
+        sem_flg: 0,
+    };
+    let ret = libc::syscall(SYS_SEMOP, semid, &mut increment, 1) as i64;
+    let value = semctl(semid, 0, GETVAL, core::ptr::null_mut());
+    semctl(semid, 0, IPC_RMID, core::ptr::null_mut());
+    ret == -1 && errno() == libc::ERANGE && value == 1
+}
+
+unsafe fn semtimedop_positive_overflow_erange() -> bool {
+    let semid = libc::syscall(SYS_SEMGET, libc::IPC_PRIVATE, 1, IPC_CREAT | 0o600) as i32;
+    if semid < 0 {
+        return false;
+    }
+    if semctl(semid, 0, SETVAL, 1usize as *mut libc::c_void) != 0 {
+        semctl(semid, 0, IPC_RMID, core::ptr::null_mut());
+        return false;
+    }
+
+    reset_errno();
+    let mut increment = Sembuf {
+        sem_num: 0,
+        sem_op: i16::MAX,
+        sem_flg: 0,
+    };
+    let timeout = libc::timespec {
+        tv_sec: 1,
+        tv_nsec: 0,
+    };
+    let ret = libc::syscall(SYS_SEMTIMEDOP, semid, &mut increment, 1, &timeout) as i64;
+    let value = semctl(semid, 0, GETVAL, core::ptr::null_mut());
+    semctl(semid, 0, IPC_RMID, core::ptr::null_mut());
+    ret == -1 && errno() == libc::ERANGE && value == 1
+}
+
+unsafe fn semctl_rmid_owner_ignores_mode() -> bool {
+    let pid = libc::fork();
+    if pid == 0 {
+        if libc::setuid(65_534) != 0 {
+            libc::_exit(2);
+        }
+        let semid = libc::syscall(SYS_SEMGET, libc::IPC_PRIVATE, 1, IPC_CREAT) as i32;
+        if semid < 0 {
+            libc::_exit(3);
+        }
+        let ok = semctl(semid, 0, IPC_RMID, core::ptr::null_mut()) == 0;
+        libc::_exit(if ok { 0 } else { 1 });
+    }
+    if pid < 0 {
+        return false;
+    }
+    wait_child_success(pid)
+}
+
 fn main() {
     unsafe {
         reset_errno();
@@ -311,6 +378,9 @@ fn main() {
         let zero_wait_sleeping = semop_zero_wait_child_reports_sleeping();
         let timed_rmid = semtimedop_interrupted_by_rmid();
         let timed_signal = semtimedop_interrupted_by_signal();
+        let semop_overflow = semop_positive_overflow_erange();
+        let timed_overflow = semtimedop_positive_overflow_erange();
+        let rmid_ignores_mode = semctl_rmid_owner_ignores_mode();
 
         report!(semget_ok = semget_ok);
         report!(semget_errno = semget_errno);
@@ -333,6 +403,9 @@ fn main() {
         report!(semop_zero_wait_child_sleeping = zero_wait_sleeping);
         report!(semtimedop_rmid_eidrm = timed_rmid);
         report!(semtimedop_signal_eintr = timed_signal);
+        report!(semop_positive_overflow_erange = semop_overflow);
+        report!(semtimedop_positive_overflow_erange = timed_overflow);
+        report!(semctl_rmid_owner_ignores_mode = rmid_ignores_mode);
         report!(proc_sysvipc_sem_present = proc_sem.contains("semid"));
     }
 }
