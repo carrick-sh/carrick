@@ -12671,14 +12671,18 @@ image = "localhost:5050/ltp:arm64"
 cmd = ["/opt/ltp/testcases/bin/inotify09"]
 verdict = "ltp"
 tier = "full"
-weight = "light"
-# tst_fuzzy_sync race test: ~790k raw clock_gettime + inotify/write/lseek
-# syscalls (bypasses the vDSO by design — real Linux does the syscalls too).
-# ~30x slower than native under carrick (each syscall is an HVF vmexit) — ~150s
-# vs Docker's ~5s. The tight 40s timeout is DELIBERATE: it stays a TIMEOUT until
-# the per-syscall dispatch cost is fixed, rather than being papered over by a
-# longer bound.
-timeout_s = 40
+weight = "heavy"
+# tst_fuzzy_sync stress test with `.runtime = 150` — it beats inotify until a
+# 3M-loop cap OR ~150s of runtime, whichever first (LTP's own per-run timeout is
+# 180s). Docker's fast per-op hits the loop cap in ~4s; carrick pays an HVF
+# vmexit per guest syscall. The per-op fixes (fork-coherent resolve + watch_fds
+# caches; skipping the redundant IN_EXCL_UNLINK write-path stat) took carrick
+# 150s -> ~61s isolated — now LOOP-CAP-bound like Docker, TPASS. The residual is
+# the fundamental HVF vmexit floor (5 syscalls/loop x 3M loops), not a fixable
+# carrick bug, and under gate contention it can drift toward the runtime budget.
+# The suite timeout must exceed the test's own runtime/LTP timeout: 240s reflects
+# the test's DESIGN, not a papered-over slowness.
+timeout_s = 240
 carrick_flags = ["--raw", "--fs", "host"]
 
 [[suite]]
@@ -20168,11 +20172,12 @@ image = "localhost:5050/ltp:arm64"
 cmd = ["/opt/ltp/testcases/bin/setrlimit06"]
 verdict = "ltp"
 tier = "full"
-weight = "light"
-# Same tst_fuzzy_sync race pattern as ltp-inotify09: syscall-bound, far slower
-# than native under carrick. Tight 40s timeout kept DELIBERATELY red until the
-# per-syscall dispatch cost is fixed.
-timeout_s = 40
+weight = "heavy"
+# Same tst_fuzzy_sync stress pattern as ltp-inotify09 (a `.runtime`-bounded race
+# test): the per-op fixes cut carrick's per-loop cost, but the residual is the
+# HVF vmexit floor, so — like inotify09 — the suite timeout must exceed the
+# test's own runtime budget. 240s reflects the test's design.
+timeout_s = 240
 carrick_flags = ["--raw", "--fs", "host"]
 
 [[suite]]
