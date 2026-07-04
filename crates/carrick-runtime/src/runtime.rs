@@ -1001,7 +1001,11 @@ where
                 let retval: i64 = match outcome {
                     crate::trap::ForkOutcome::Parent { child_pid } => {
                         crate::event_ring::rec(crate::event_ring::FORK, child_pid, 0, 0);
-                        crate::guest_cpu::register_child(child_pid as u32);
+                        crate::guest_cpu::register_child_with_parent(
+                            child_pid as u32,
+                            std::process::id(),
+                            dispatcher.subreaper_for_fork_child(),
+                        );
                         // Watch the child's exit (EVFILT_PROC/NOTE_EXIT) so the
                         // signal pump delivers the requested exit signal to this
                         // (parent) tid when it exits — without a host SIGCHLD
