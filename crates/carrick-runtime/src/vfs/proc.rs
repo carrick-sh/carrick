@@ -62,7 +62,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use crate::linux_abi::{LINUX_EACCES, LINUX_ENOENT, LINUX_ENOTDIR, LinuxErrno};
+use crate::linux_abi::{LINUX_EACCES, LINUX_ENOENT, LINUX_ENOTDIR, LINUX_EROFS, LinuxErrno};
 use crate::memory::{
     LINUX_EL0_TRAMPOLINE_BASE, LINUX_EL1_VECTORS_BASE, LINUX_HEAP_BASE, LINUX_HEAP_SIZE,
     LINUX_MMAP_BASE, LINUX_PAGE_TABLES_BASE, LINUX_RLIMIT_STACK_SOFT,
@@ -354,6 +354,9 @@ const SYSCTL_TABLE: &[(&str, Sysctl)] = &[
     // Highest capability number carrick models — libcap/systemd/runc loop
     // 0..=cap_last_cap dropping bounding-set caps.
     ("/proc/sys/kernel/cap_last_cap", Sysctl::Static(b"40\n")),
+    // Present but read-only in Docker's LTP container. LTP io_uring tests use
+    // this save/restore path to skip when they cannot change the kernel knob.
+    ("/proc/sys/kernel/io_uring_disabled", Sysctl::Static(b"0\n")),
     ("/proc/sys/kernel/threads-max", Sysctl::Static(b"127760\n")),
     ("/proc/sys/kernel/ngroups_max", Sysctl::Static(b"65536\n")),
     // carrick has no autogroup scheduler, so the honest value is 0.
@@ -1765,6 +1768,9 @@ impl Vfs for ProcVfs {
         // The user-namespace map files and the rw tunables (oom_score_adj/…)
         // are writable; the dispatcher routes write(2) on their SyntheticFile to
         // the appropriate handler. All other /proc files stay read-only.
+        if flags.write && sysctl_value(path).is_some() {
+            return Err(LINUX_EROFS);
+        }
         if flags.write && !is_userns_map_path(path) && !is_writable_tunable_path(path) {
             return Err(LINUX_EACCES);
         }
@@ -3163,6 +3169,7 @@ mod tests {
         for (path, want) in [
             ("/proc/sys/kernel/ostype", "Linux\n"),
             ("/proc/sys/kernel/cap_last_cap", "40\n"),
+            ("/proc/sys/kernel/io_uring_disabled", "0\n"),
             ("/proc/sys/vm/overcommit_memory", "1\n"),
             ("/proc/sys/vm/max_map_count", "262144\n"),
             ("/proc/sys/net/core/somaxconn", "4096\n"),
@@ -3176,6 +3183,20 @@ mod tests {
             let got = synthetic_file(path, &ctx()).unwrap();
             assert_eq!(String::from_utf8(got).unwrap(), want, "{path}");
         }
+    }
+
+    #[test]
+    fn sysctl_io_uring_disabled_is_readonly_like_docker() {
+        let v = ProcVfs::new();
+        let write_open = v.open(
+            "/proc/sys/kernel/io_uring_disabled",
+            OpenFlags {
+                write: true,
+                ..Default::default()
+            },
+            &OpenContext::default(),
+        );
+        assert_eq!(write_open, Err(crate::linux_abi::LINUX_EROFS));
     }
 
     #[test]
