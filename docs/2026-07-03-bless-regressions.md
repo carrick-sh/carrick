@@ -35,6 +35,17 @@ oracle-cache edits are only used when the suite declaration itself changed.
   when arming the HVF watch or returning from terminal `wait4`. Red-first:
   `clone3args` DIFFed on the malformed cases and pre-fix `ltp-clone302`
   regressed at carrick[6/12] vs oracle[12/12].
+- `ltp-futex*`: `ltp-futex_cmp_requeue01`, `ltp-futex_waitv01`,
+  `ltp-futex_waitv02`, `ltp-futex_waitv03`, `ltp-futex_wake02`, and
+  `ltp-futex_wake04` all MATCH after `4e338587`. Root causes fixed:
+  `futex_waitv` dispatch/validation, process-shared `FUTEX_CMP_REQUEUE`
+  bookkeeping, HVF resource release while forked shared-futex waiters are
+  parked, and `/proc/<tgid>/task/<tid>` state visibility for futex waiters.
+  Red-first: pre-fix `c76448a9` regressed `ltp-futex_cmp_requeue01` at
+  carrick[0/129] vs oracle[7/7], `ltp-futex_waitv01` at carrick[Success] vs
+  oracle[9/9], and `ltp-futex_wake02` at carrick[0/1] vs oracle[11/11].
+  Reduced probes `futexwaiterstates`, `futexforkwakegroups`, and
+  `futexforkrequeue` all MATCH.
 - `ltp-mq*`: `ltp-mq_notify01`, `ltp-mq_notify02`, `ltp-mq_notify03`,
   `ltp-mq_open01`, `ltp-mq_timedreceive01`, `ltp-mq_timedsend01`,
   `ltp-mq_unlink01` all MATCH.
@@ -69,9 +80,6 @@ oracle-cache edits are only used when the suite declaration itself changed.
   count-level MATCH but still has differing assertion mix. Raw failure themes:
   seccomp/securebits/capbset negative cases, child-subreaper reparenting,
   `/proc/self/comm` after `PR_SET_NAME`, and `/proc/self/timerslack_ns`.
-- `ltp-futex_wake04`: earlier focused futex run reported an inversion
-  (`carrick[Success]`, oracle failure). It did not gate that run, but this goal
-  wants listed suites to MATCH, so audit later instead of counting it closed.
 
 ## Top clusters (fix the shared root cause once → clears many)
 
