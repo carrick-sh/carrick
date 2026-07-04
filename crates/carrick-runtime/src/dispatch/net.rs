@@ -320,7 +320,15 @@ fn guest_unix_pathname(memory: &impl GuestMemory, addr: u64, addrlen: u32) -> Op
 
 fn host_stream_socket_read_eof(host_fd: i32) -> bool {
     let mut byte = [0u8; 1];
-    let rc = unsafe { libc::recv(host_fd, byte.as_mut_ptr().cast(), 1, libc::MSG_PEEK) };
+    let rc = unsafe {
+        // BLOCKING-IO-OK: MSG_DONTWAIT is passed
+        libc::recv(
+            host_fd,
+            byte.as_mut_ptr().cast(),
+            1,
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
     rc == 0
 }
 
