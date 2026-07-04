@@ -7,7 +7,9 @@
 //! `/name` is a real host FILE, so a forked guest child (a separate carrick host
 //! process) and its parent resolve the same `/name` to the same inode and see
 //! the same queue — an in-process `HashMap` would NOT be fork-coherent and would
-//! silently diverge.
+//! silently diverge. Open descriptors operate through a carrick-private hidden
+//! hardlink to the queue object, so `mq_unlink` can remove the public name while
+//! existing descriptors keep the object alive until close, as Linux does.
 //!
 //! # File layout (carrick-private, little-endian — NOT a Linux ABI)
 //!
@@ -43,10 +45,11 @@
 //!     like `sysv_semop`'s timed wait).
 //!   - `mq_getsetattr` (report `mq_attr`; set only `O_NONBLOCK`).
 //!   - `mq_notify` SIGEV_SIGNAL/SIGEV_NONE one-shot registration fired on the
-//!     empty→non-empty transition in `mq_timedsend`. SIGEV_THREAD is glibc
-//!     layered on SIGEV_SIGNAL, so the kernel surface here is enough. The
-//!     registration is recorded in the file header (fork-coherent), and cross-
-//!     process delivery uses `libc::kill` with the host signal number.
+//!     empty→non-empty transition in `mq_timedsend`. SIGEV_THREAD is glibc's
+//!     netlink-helper ABI: the wrapper passes a NETLINK_ROUTE fd in
+//!     `sigev_signo`, and the kernel sends a 32-byte notification record to that
+//!     fd. The registration is recorded in the file header (fork-coherent), and
+//!     cross-process signal delivery uses `libc::kill`/xsignals.
 
 use super::*;
 use crate::linux_abi::LinuxErrno;
@@ -101,7 +104,20 @@ const OFF_SIGEV_SIGNO: usize = 28;
 /// (sticky) mqueue filesystem — a non-root, non-owner unlink is EACCES
 /// (mq_unlink01 entry 1, `as_nobody`).
 const OFF_OWNER_UID: usize = 32;
-const HEADER_SIZE: usize = 40;
+/// For `SIGEV_THREAD`, glibc transforms the user-facing sigevent before entering
+/// the kernel: `sigev_signo` is the helper's netlink fd and `sigev_value` points
+/// at glibc's helper control block. Linux copies the first 32 bytes of that
+/// block back to the helper fd, with the final byte patched to the event
+/// code. Keep those bytes in the backing file so delivery remains fork-coherent.
+const OFF_NOTIFY_NETLINK_FD: usize = 36;
+const OFF_NOTIFY_DATA: usize = 40;
+const NOTIFY_DATA_SIZE: usize = 32;
+const HEADER_SIZE: usize = OFF_NOTIFY_DATA + NOTIFY_DATA_SIZE;
+
+/// glibc's mq-notify helper distinguishes "message arrived" from
+/// "registration removed" by the final byte in the 32-byte netlink record.
+const MQ_NOTIFY_EVENT_MSG: u32 = 1;
+const MQ_NOTIFY_EVENT_REMOVED: u32 = 2;
 
 // Per-slot header byte offsets (relative to the slot start).
 const SLOT_USED: usize = 0;
@@ -122,6 +138,73 @@ fn rd_u32(buf: &[u8], off: usize) -> u32 {
 fn wr_u32(buf: &mut [u8], off: usize, v: u32) {
     if let Some(b) = buf.get_mut(off..off + 4) {
         b.copy_from_slice(&v.to_le_bytes());
+    }
+}
+
+fn read_notify_data(buf: &[u8]) -> [u8; NOTIFY_DATA_SIZE] {
+    let mut data = [0u8; NOTIFY_DATA_SIZE];
+    if let Some(stored) = buf.get(OFF_NOTIFY_DATA..OFF_NOTIFY_DATA + NOTIFY_DATA_SIZE) {
+        data.copy_from_slice(stored);
+    }
+    data
+}
+
+fn write_notify_data(buf: &mut [u8], data: &[u8; NOTIFY_DATA_SIZE]) {
+    if let Some(stored) = buf.get_mut(OFF_NOTIFY_DATA..OFF_NOTIFY_DATA + NOTIFY_DATA_SIZE) {
+        stored.copy_from_slice(data);
+    }
+}
+
+fn clear_notify_header(buf: &mut [u8]) {
+    wr_u32(buf, OFF_NOTIFY_PID, 0);
+    wr_u32(buf, OFF_SIGEV_NOTIFY, 0);
+    wr_u32(buf, OFF_SIGEV_SIGNO, 0);
+    wr_u32(buf, OFF_NOTIFY_NETLINK_FD, 0);
+    write_notify_data(buf, &[0u8; NOTIFY_DATA_SIZE]);
+}
+
+#[derive(Debug, Clone, Copy)]
+enum NotifyDelivery {
+    Signal {
+        pid: i32,
+        signo: i32,
+        value: i64,
+    },
+    Thread {
+        pid: i32,
+        netlink_fd: i32,
+        data: [u8; NOTIFY_DATA_SIZE],
+    },
+}
+
+fn notify_delivery_from_header(buf: &[u8], event: u32) -> Option<NotifyDelivery> {
+    let pid = rd_u32(buf, OFF_NOTIFY_PID) as i32;
+    if pid == 0 {
+        return None;
+    }
+    let sigev = rd_u32(buf, OFF_SIGEV_NOTIFY) as i32;
+    match sigev {
+        crate::linux_abi::LINUX_SIGEV_NONE => None,
+        crate::linux_abi::LINUX_SIGEV_SIGNAL => {
+            let signo = rd_u32(buf, OFF_SIGEV_SIGNO) as i32;
+            let value = buf
+                .get(OFF_NOTIFY_DATA..OFF_NOTIFY_DATA + 8)
+                .and_then(|b| b.try_into().ok())
+                .map(i64::from_le_bytes)
+                .unwrap_or(0);
+            (signo > 0).then_some(NotifyDelivery::Signal { pid, signo, value })
+        }
+        crate::linux_abi::LINUX_SIGEV_THREAD => {
+            let netlink_fd = rd_u32(buf, OFF_NOTIFY_NETLINK_FD) as i32;
+            let mut data = read_notify_data(buf);
+            data[NOTIFY_DATA_SIZE - 1] = event as u8;
+            (netlink_fd >= 0).then_some(NotifyDelivery::Thread {
+                pid,
+                netlink_fd,
+                data,
+            })
+        }
+        _ => None,
     }
 }
 
@@ -161,6 +244,40 @@ fn name_to_path(name: &str) -> Result<PathBuf, LinuxErrno> {
         return Err(crate::linux_abi::LINUX_ENAMETOOLONG);
     }
     Ok(PathBuf::from(MQ_DIR).join(rest))
+}
+
+fn object_path_from_stat(st: &libc::stat) -> PathBuf {
+    PathBuf::from(MQ_DIR).join(format!(
+        ".carrick-mqueue-object-{}-{}",
+        st.st_dev, st.st_ino
+    ))
+}
+
+fn hidden_object_path(public_path: &str, fd: i32) -> String {
+    let mut st: libc::stat = unsafe { core::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut st) }
+        .host_syscall_errno()
+        .is_err()
+    {
+        return public_path.to_owned();
+    }
+    let object_path = object_path_from_stat(&st);
+    let object_path_str = object_path.to_string_lossy().into_owned();
+    if object_path.exists() {
+        return object_path_str;
+    }
+    let Ok(public_cstr) = std::ffi::CString::new(public_path.as_bytes()) else {
+        return public_path.to_owned();
+    };
+    let Ok(object_cstr) = std::ffi::CString::new(object_path_str.as_bytes()) else {
+        return public_path.to_owned();
+    };
+    let rc = unsafe { libc::link(public_cstr.as_ptr(), object_cstr.as_ptr()) };
+    if rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EEXIST) {
+        object_path_str
+    } else {
+        public_path.to_owned()
+    }
 }
 
 /// An OFD write lock held on a freshly-opened host fd for the duration of one
@@ -434,12 +551,16 @@ impl SyscallDispatcher {
 
             // Install the mqd as a real fd. status_flags carries the access mode
             // and O_NONBLOCK; the fd-flags carry O_CLOEXEC. The host fd is owned
-            // by the OpenFile so close(2)/dup(2) reclaim it.
+            // by the OpenFile so close(2)/dup(2) reclaim it. The descriptor path
+            // is a hidden hardlink to the object, not the public queue name, so
+            // mq_unlink removes only the name while open mqd_t values continue
+            // to operate on the same queue.
+            let backing_path = hidden_object_path(&path_str, host_fd);
             let status_flags = access | (oflag & LINUX_O_NONBLOCK);
             let description = OpenDescription::Mqueue {
                 base: OpenDescriptionBase::new(status_flags),
                 host_fd: HostFdRef::new(host_fd),
-                path: path_str,
+                path: backing_path,
                 msg_size: msgsize as usize,
                 max_msg: maxmsg as usize,
             };
@@ -533,7 +654,7 @@ impl SyscallDispatcher {
             // when a deliverable signal arrives (mq_timedsend01 entry 14).
             let tid = cx.tid();
             loop {
-                match mq_try_send(&mq, prio as u32, &payload) {
+                match mq_try_send(this, tid, &mq, prio as u32, &payload) {
                     Ok(true) => return Ok(DispatchOutcome::Returned { value: 0 }),
                     Ok(false) => {
                         // Full.
@@ -625,9 +746,9 @@ impl SyscallDispatcher {
 
         /// mq_notify(mqd, sevp). Register (NULL → unregister) a one-shot
         /// notification for the empty→non-empty transition. SIGEV_NONE records
-        /// "no signal"; SIGEV_SIGNAL records (this pid, signo). EBUSY if a
-        /// DIFFERENT pid is already registered. Delivery happens in
-        /// mq_timedsend.
+        /// "no signal"; SIGEV_SIGNAL records (this pid, signo). EBUSY if any
+        /// registration already exists, even from this process. Delivery happens
+        /// in mq_timedsend.
         fn mq_notify(this, cx, mqd: u64, sevp: GuestPtr) {
             let me = std::process::id() as i32;
 
@@ -640,7 +761,12 @@ impl SyscallDispatcher {
                     Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                 };
                 return Ok(match mq_clear_notify(&mq, me) {
-                    Ok(()) => DispatchOutcome::Returned { value: 0 },
+                    Ok(delivery) => {
+                        if let Some(delivery) = delivery {
+                            deliver_notify(this, cx.tid(), delivery);
+                        }
+                        DispatchOutcome::Returned { value: 0 }
+                    }
                     Err(errno) => DispatchOutcome::errno(errno),
                 });
             }
@@ -654,11 +780,11 @@ impl SyscallDispatcher {
                     Ok(s) => s,
                     Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                 };
-            let signo = match sev.sigev_notify {
-                crate::linux_abi::LINUX_SIGEV_NONE => 0,
-                // SIGEV_THREAD is glibc layered on SIGEV_SIGNAL; the kernel
-                // surface is the signal, so treat it like SIGEV_SIGNAL.
-                crate::linux_abi::LINUX_SIGEV_SIGNAL | crate::linux_abi::LINUX_SIGEV_THREAD => {
+            let sigev_notify = sev.sigev_notify;
+            let sigev_value = sev.sigev_value;
+            let (signo, data) = match sigev_notify {
+                crate::linux_abi::LINUX_SIGEV_NONE => (0, [0u8; NOTIFY_DATA_SIZE]),
+                crate::linux_abi::LINUX_SIGEV_SIGNAL => {
                     // Copy out of the #[repr(packed)] sigevent before taking a ref.
                     // SIGEV_SIGNAL requires a valid signal number; an out-of-range
                     // signo is EINVAL (LTP mq_notify02's second bad-sevp case).
@@ -666,7 +792,28 @@ impl SyscallDispatcher {
                     if !(1..=64).contains(&s) {
                         return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                     }
-                    s
+                    let mut data = [0u8; NOTIFY_DATA_SIZE];
+                    data[..8].copy_from_slice(&sigev_value.to_le_bytes());
+                    (s, data)
+                }
+                crate::linux_abi::LINUX_SIGEV_THREAD => {
+                    // For mq_notify, glibc's SIGEV_THREAD wrapper passes the
+                    // helper NETLINK_ROUTE fd in sigev_signo. It is not a signal
+                    // number and may exceed NSIG, so validate that it names one
+                    // of Carrick's synthetic netlink sockets instead. The kernel
+                    // notification payload is the 32-byte helper record pointed
+                    // to by sigev_value, not the transformed sigevent itself.
+                    let fd = sev.sigev_signo;
+                    if fd < 0 || !this.fd_is_netlink(fd) {
+                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                    }
+                    let bytes = match cx.memory.read_bytes(sigev_value, NOTIFY_DATA_SIZE) {
+                        Ok(bytes) => bytes,
+                        Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
+                    };
+                    let mut data = [0u8; NOTIFY_DATA_SIZE];
+                    data.copy_from_slice(&bytes);
+                    (fd, data)
                 }
                 _ => return Ok(DispatchOutcome::errno(LINUX_EINVAL)),
             };
@@ -674,7 +821,7 @@ impl SyscallDispatcher {
                 Ok(v) => v,
                 Err(errno) => return Ok(DispatchOutcome::errno(errno)),
             };
-            Ok(match mq_register_notify(&mq, me, sev.sigev_notify, signo) {
+            Ok(match mq_register_notify(&mq, me, sigev_notify, signo, data) {
                 Ok(()) => DispatchOutcome::Returned { value: 0 },
                 Err(errno) => DispatchOutcome::errno(errno),
             })
@@ -763,6 +910,49 @@ fn read_queue_owner(path: &str) -> Option<u32> {
     Some(rd_u32(&hdr, OFF_OWNER_UID))
 }
 
+fn deliver_notify(
+    this: &SyscallDispatcher,
+    tid: crate::thread::ThreadId,
+    delivery: NotifyDelivery,
+) {
+    match delivery {
+        NotifyDelivery::Signal { pid, signo, value } => {
+            let info = crate::linux_abi::LinuxSiginfo::message_queue(
+                signo,
+                crate::namespace::pid::self_ns_pid() as i32,
+                this.cred_snapshot().ruid,
+                value,
+            );
+            if pid == std::process::id() as i32 {
+                this.record_pending_siginfo(tid, signo, info);
+                this.mark_signal_pending(tid, signo);
+                crate::host_signal::raise_for_self(signo);
+            } else if crate::host_signal::xsig_enqueue(
+                pid,
+                signo,
+                crate::linux_abi::LINUX_SI_MESGQ,
+                crate::namespace::pid::self_ns_pid() as i32,
+                this.cred_snapshot().ruid,
+                value,
+            ) {
+                crate::host_signal::xsig_nudge(pid);
+            } else {
+                let host_signo = crate::host_signal::linux_to_host_signum(signo);
+                unsafe { libc::kill(pid, host_signo) };
+            }
+        }
+        NotifyDelivery::Thread {
+            pid,
+            netlink_fd,
+            data,
+        } => {
+            if pid == std::process::id() as i32 {
+                let _ = this.enqueue_netlink_message(netlink_fd, &data);
+            }
+        }
+    }
+}
+
 /// Does a deliverable signal want to interrupt a blocking mq op? Checks all
 /// three pending stores: the dispatcher's injected set, the HVF cross-process
 /// xsignal ring (where a `kill` from another guest process lands), and
@@ -810,7 +1000,13 @@ fn deadline_expired(deadline: Option<(i64, i64)>) -> bool {
 /// Try to enqueue one message. Returns `Ok(true)` if enqueued, `Ok(false)` if
 /// the queue is full, `Err(errno)` on a host/file error. Fires a one-shot
 /// `mq_notify` registration on the empty→non-empty transition.
-fn mq_try_send(mq: &MqFd, prio: u32, payload: &[u8]) -> Result<bool, LinuxErrno> {
+fn mq_try_send(
+    this: &SyscallDispatcher,
+    tid: crate::thread::ThreadId,
+    mq: &MqFd,
+    prio: u32,
+    payload: &[u8],
+) -> Result<bool, LinuxErrno> {
     let lock = MqLock::acquire(&mq.path)?;
     let size = file_size(mq.max_msg, mq.msg_size);
     let mut buf = lock.read_all(size)?;
@@ -855,18 +1051,10 @@ fn mq_try_send(mq: &MqFd, prio: u32, payload: &[u8]) -> Result<bool, LinuxErrno>
 
     // One-shot notify on the empty→non-empty transition: read the registration,
     // clear it, deliver, and write the whole (cleared) header+slot back.
-    let mut notify: Option<(i32, i32, i32)> = None; // (pid, sigev_notify, signo)
+    let mut notify: Option<NotifyDelivery> = None;
     if was_empty {
-        let pid = rd_u32(&buf, OFF_NOTIFY_PID) as i32;
-        if pid != 0 {
-            let sigev = rd_u32(&buf, OFF_SIGEV_NOTIFY) as i32;
-            let signo = rd_u32(&buf, OFF_SIGEV_SIGNO) as i32;
-            notify = Some((pid, sigev, signo));
-            // Clear the one-shot registration.
-            wr_u32(&mut buf, OFF_NOTIFY_PID, 0);
-            wr_u32(&mut buf, OFF_SIGEV_NOTIFY, 0);
-            wr_u32(&mut buf, OFF_SIGEV_SIGNO, 0);
-        }
+        notify = notify_delivery_from_header(&buf, MQ_NOTIFY_EVENT_MSG);
+        clear_notify_header(&mut buf);
     }
 
     // Persist the header + the written slot. Write the whole buffer back; it is
@@ -875,17 +1063,10 @@ fn mq_try_send(mq: &MqFd, prio: u32, payload: &[u8]) -> Result<bool, LinuxErrno>
     lock.write_at(0, &buf)?;
     drop(lock);
 
-    // Deliver the notification AFTER releasing the lock (kill could block on a
-    // stopped target; never hold the file lock across it).
-    if let Some((pid, sigev, signo)) = notify {
-        if sigev != crate::linux_abi::LINUX_SIGEV_NONE && signo > 0 {
-            if pid == std::process::id() as i32 {
-                crate::host_signal::raise_for_self(signo);
-            } else {
-                let host_signo = crate::host_signal::linux_to_host_signum(signo);
-                unsafe { libc::kill(pid, host_signo) };
-            }
-        }
+    // Deliver the notification AFTER releasing the lock (signal/netlink delivery
+    // may re-enter fd/signal state and must never hold the file lock).
+    if let Some(delivery) = notify {
+        deliver_notify(this, tid, delivery);
     }
     Ok(true)
 }
@@ -950,29 +1131,31 @@ fn mq_try_receive(mq: &MqFd) -> Result<Option<(u32, Vec<u8>)>, LinuxErrno> {
 /// Clear `pid`'s notify registration (mq_notify(NULL)). A no-op if a different
 /// pid (or no one) is registered — Linux's mq_notify(NULL) only removes the
 /// CALLER's registration.
-fn mq_clear_notify(mq: &MqFd, pid: i32) -> Result<(), LinuxErrno> {
+fn mq_clear_notify(mq: &MqFd, pid: i32) -> Result<Option<NotifyDelivery>, LinuxErrno> {
     let lock = MqLock::acquire(&mq.path)?;
     let size = file_size(mq.max_msg, mq.msg_size);
     let mut buf = lock.read_all(size)?;
     if rd_u32(&buf, OFF_MAGIC) != MQ_MAGIC {
         return Err(LINUX_EINVAL);
     }
+    let mut delivery = None;
     if rd_u32(&buf, OFF_NOTIFY_PID) as i32 == pid {
-        wr_u32(&mut buf, OFF_NOTIFY_PID, 0);
-        wr_u32(&mut buf, OFF_SIGEV_NOTIFY, 0);
-        wr_u32(&mut buf, OFF_SIGEV_SIGNO, 0);
+        delivery = notify_delivery_from_header(&buf, MQ_NOTIFY_EVENT_REMOVED);
+        clear_notify_header(&mut buf);
         lock.write_at(0, &buf[..HEADER_SIZE])?;
     }
-    Ok(())
+    Ok(delivery)
 }
 
-/// Register `pid`'s one-shot notify (mq_notify(non-NULL)). EBUSY if a DIFFERENT
-/// pid is already registered (mq_notify(3)).
+/// Register `pid`'s one-shot notify (mq_notify(non-NULL)). EBUSY if a
+/// registration already exists (mq_notify(3)); callers must `mq_notify(NULL)`
+/// or wait for one-shot delivery before registering again.
 fn mq_register_notify(
     mq: &MqFd,
     pid: i32,
     sigev_notify: i32,
-    signo: i32,
+    signo_or_fd: i32,
+    notify_data: [u8; NOTIFY_DATA_SIZE],
 ) -> Result<(), LinuxErrno> {
     let lock = MqLock::acquire(&mq.path)?;
     let size = file_size(mq.max_msg, mq.msg_size);
@@ -981,12 +1164,22 @@ fn mq_register_notify(
         return Err(LINUX_EINVAL);
     }
     let cur_pid = rd_u32(&buf, OFF_NOTIFY_PID) as i32;
-    if cur_pid != 0 && cur_pid != pid {
+    if cur_pid != 0 {
         return Err(crate::linux_abi::LINUX_EBUSY);
     }
     wr_u32(&mut buf, OFF_NOTIFY_PID, pid as u32);
     wr_u32(&mut buf, OFF_SIGEV_NOTIFY, sigev_notify as u32);
-    wr_u32(&mut buf, OFF_SIGEV_SIGNO, signo as u32);
+    wr_u32(&mut buf, OFF_SIGEV_SIGNO, signo_or_fd as u32);
+    wr_u32(
+        &mut buf,
+        OFF_NOTIFY_NETLINK_FD,
+        if sigev_notify == crate::linux_abi::LINUX_SIGEV_THREAD {
+            signo_or_fd as u32
+        } else {
+            0
+        },
+    );
+    write_notify_data(&mut buf, &notify_data);
     lock.write_at(0, &buf[..HEADER_SIZE])?;
     Ok(())
 }
