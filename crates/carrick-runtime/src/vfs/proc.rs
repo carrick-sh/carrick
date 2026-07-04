@@ -448,6 +448,7 @@ const SYSCTL_TABLE: &[(&str, Sysctl)] = &[
     // Default 64-bit Linux pid ceiling. LTP (setpgid02) reads this to bound pid
     // scans; without it tst_test aborts with ENOENT.
     ("/proc/sys/kernel/pid_max", Sysctl::Static(b"4194304\n")),
+    ("/proc/sys/kernel/ns_last_pid", Sysctl::Static(b"0\n")),
     (
         "/proc/sys/kernel/shmall",
         Sysctl::Static(b"18446744073692774399\n"),
@@ -509,6 +510,10 @@ const SYSCTL_TABLE: &[(&str, Sysctl)] = &[
     ("/proc/sys/vm/max_map_count", Sysctl::Static(b"262144\n")),
     // Lowest address a process may mmap — matches carrick's null-guard.
     ("/proc/sys/vm/mmap_min_addr", Sysctl::Static(b"65536\n")),
+    // Present but read-only in Docker's LTP container. shmget02 probes this
+    // after seeing `/sys/kernel/mm/hugepages/` and skips hugepage-specific
+    // assertions when the container cannot tune it.
+    ("/proc/sys/vm/nr_hugepages", Sysctl::Static(b"0\n")),
     ("/proc/sys/vm/swappiness", Sysctl::Static(b"60\n")),
     // fs.* — file-max/nr_open match NOFILE_HARD (the RLIMIT_NOFILE ceiling
     // carrick enforces). file-nr is exactly THREE tab-separated ints.
@@ -574,6 +579,11 @@ fn sysctl_value(path: &str) -> Option<Vec<u8>> {
             Sysctl::Dynamic(f) => f(),
         })
     })
+}
+
+/// True iff `path` is one of the synthetic `/proc/sys/**` leaves carrick serves.
+pub(crate) fn is_sysctl_leaf_path(path: &str) -> bool {
+    SYSCTL_TABLE.iter().any(|(p, _)| *p == path)
 }
 
 /// True iff `path` is a `/proc/sys` directory (the root or any intermediate
@@ -3326,6 +3336,7 @@ mod tests {
             ("/proc/sys/kernel/ostype", "Linux\n"),
             ("/proc/sys/kernel/cap_last_cap", "40\n"),
             ("/proc/sys/kernel/io_uring_disabled", "0\n"),
+            ("/proc/sys/kernel/ns_last_pid", "0\n"),
             ("/proc/sys/vm/overcommit_memory", "1\n"),
             ("/proc/sys/vm/max_map_count", "262144\n"),
             ("/proc/sys/net/core/somaxconn", "4096\n"),

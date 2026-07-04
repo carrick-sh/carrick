@@ -237,6 +237,34 @@ fn net_path_kind_from_interfaces(path: &str, interfaces: &[NetIface]) -> Option<
     }
 }
 
+fn synthetic_dir_entries(path: &str) -> Option<Vec<super::DirEnt>> {
+    let entries: &[(&str, EntryKind)] = match path {
+        "/sys/kernel" => &[
+            ("mm", EntryKind::Directory),
+            ("random", EntryKind::Directory),
+        ],
+        "/sys/kernel/mm" => &[
+            ("hugepages", EntryKind::Directory),
+            ("transparent_hugepage", EntryKind::Directory),
+        ],
+        "/sys/kernel/mm/hugepages" => &[],
+        "/sys/kernel/mm/transparent_hugepage" => {
+            &[("enabled", EntryKind::File), ("defrag", EntryKind::File)]
+        }
+        "/sys/kernel/random" => &[("uuid", EntryKind::File), ("boot_id", EntryKind::File)],
+        _ => return None,
+    };
+    Some(
+        entries
+            .iter()
+            .map(|(name, kind)| super::DirEnt {
+                name: (*name).to_string(),
+                kind: *kind,
+            })
+            .collect(),
+    )
+}
+
 pub struct SysVfs {
     network_model: Option<crate::network::model::LinuxNetworkModel>,
 }
@@ -300,6 +328,17 @@ impl Vfs for SysVfs {
                 mtime_nanos: 0,
             });
         }
+        if synthetic_dir_entries(path).is_some() {
+            return Ok(Metadata {
+                kind: EntryKind::Directory,
+                mode: 0o555,
+                size: 0,
+                uid: 0,
+                gid: 0,
+                mtime_secs: 0,
+                mtime_nanos: 0,
+            });
+        }
         if let Some(kind) = self.net_path_kind(path) {
             let mode = if kind == EntryKind::Directory {
                 0o555
@@ -320,6 +359,9 @@ impl Vfs for SysVfs {
     }
 
     fn readdir(&self, path: &str) -> Result<Vec<super::DirEnt>, VfsError> {
+        if let Some(entries) = synthetic_dir_entries(path) {
+            return Ok(entries);
+        }
         // /sys/class -> ["net"]; /sys/class/net -> interface names;
         // /sys/class/net/<if> -> the per-interface attribute files.
         if path == "/sys/class" {
@@ -475,6 +517,18 @@ mod tests {
         let v = SysVfs::new();
         let md = v.lookup("/sys/devices/system/cpu/online").unwrap();
         assert_eq!(md.kind, EntryKind::File);
+    }
+
+    #[test]
+    fn hugepages_directory_matches_ltp_probe_path() {
+        let v = SysVfs::new();
+        assert_eq!(
+            v.lookup("/sys/kernel/mm/hugepages").unwrap().kind,
+            EntryKind::Directory
+        );
+        let mm_entries = v.readdir("/sys/kernel/mm").unwrap();
+        assert!(mm_entries.iter().any(|entry| entry.name == "hugepages"));
+        assert!(v.readdir("/sys/kernel/mm/hugepages").unwrap().is_empty());
     }
 
     #[test]
