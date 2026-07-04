@@ -45,7 +45,8 @@ use carrick_hal::{HostForkCoordinator, PlatformFutex, ThreadedEngine, VcpuRegist
 
 use crate::compat::CompatReporter;
 use crate::dispatch::{
-    DispatchError, DispatchOutcome, GuestMemory, ProcMapsEntry, SyscallDispatcher, SyscallRequest,
+    DispatchError, DispatchOutcome, GuestMemory, ProcMapSharing, ProcMapsEntry, SyscallDispatcher,
+    SyscallRequest,
 };
 use crate::linux_abi::LinuxErrno;
 use crate::memory::AddressSpace;
@@ -465,6 +466,7 @@ fn proc_maps_from_address_space(image: &AddressSpace) -> Vec<ProcMapsEntry> {
             read: region.perms.read,
             write: region.perms.write,
             execute: region.perms.execute,
+            sharing: ProcMapSharing::Private,
             path: String::new(),
         })
         .collect()
@@ -1208,6 +1210,7 @@ where
                         if engine.is_forked_child() || kernel.dispatcher.is_forked_guest_process() {
                             let out = kernel.dispatcher.stdout();
                             let err = kernel.dispatcher.stderr();
+                            kernel.dispatcher.cleanup_sysv_ipc_on_process_exit();
                             forked_child_die_by_signal(11, &out, &err);
                         }
                         let result = assemble_run_result(&kernel, 128 + 11, traps, false);
@@ -1276,6 +1279,7 @@ where
                         // Destroy a name-bound child VM (bhyve) before _exit — KVM/HVF
                         // is a no-op (fd-lifetime-bound VM). _exit skips every Drop.
                         engine.process_exit_cleanup();
+                        kernel.dispatcher.cleanup_sysv_ipc_on_process_exit();
                         forked_child_exit(
                             code,
                             kernel.dispatcher.stdout(),
@@ -1294,6 +1298,7 @@ where
                         let err = kernel.dispatcher.stderr();
                         let _ = unsafe { libc::write(1, out.as_ptr() as *const _, out.len()) };
                         let _ = unsafe { libc::write(2, err.as_ptr() as *const _, err.len()) };
+                        kernel.dispatcher.cleanup_sysv_ipc_on_process_exit();
                         unsafe { libc::_exit(code) };
                     }
                     let result = assemble_run_result(&kernel, code, traps, false);
@@ -1305,6 +1310,7 @@ where
                         // Destroy a name-bound child VM (bhyve) before _exit — KVM/HVF
                         // is a no-op (fd-lifetime-bound VM). _exit skips every Drop.
                         engine.process_exit_cleanup();
+                        kernel.dispatcher.cleanup_sysv_ipc_on_process_exit();
                         forked_child_die_by_signal(
                             signum,
                             kernel.dispatcher.stdout(),
@@ -1320,6 +1326,7 @@ where
                         let err = kernel.dispatcher.stderr();
                         let _ = unsafe { libc::write(1, out.as_ptr() as *const _, out.len()) };
                         let _ = unsafe { libc::write(2, err.as_ptr() as *const _, err.len()) };
+                        kernel.dispatcher.cleanup_sysv_ipc_on_process_exit();
                         unsafe { libc::_exit(code) };
                     }
                     let result = assemble_run_result(&kernel, code, traps, false);
@@ -1414,6 +1421,7 @@ where
                             {
                                 let out = kernel.dispatcher.stdout();
                                 let err = kernel.dispatcher.stderr();
+                                kernel.dispatcher.cleanup_sysv_ipc_on_process_exit();
                                 forked_child_die_by_signal(11, &out, &err);
                             }
                             let result = assemble_run_result(&kernel, 128 + 11, traps, false);
@@ -1527,6 +1535,7 @@ pub(crate) fn assemble_run_result(
     trap_limit_hit: bool,
 ) -> RunResult {
     crate::probes::guest_exit(exit_code);
+    kernel.dispatcher.cleanup_sysv_ipc_on_process_exit();
     let report = kernel.reporter.snapshot();
     RunResult {
         exit_code,

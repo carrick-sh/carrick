@@ -76,7 +76,23 @@ pub struct ProcMapsEntry {
     pub read: bool,
     pub write: bool,
     pub execute: bool,
+    pub sharing: ProcMapSharing,
     pub path: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProcMapSharing {
+    Private,
+    Shared,
+}
+
+impl ProcMapSharing {
+    fn marker(self) -> char {
+        match self {
+            Self::Private => 'p',
+            Self::Shared => 's',
+        }
+    }
 }
 
 /// The ISA a guest reports about *itself* through arch-dependent synthetic
@@ -504,13 +520,24 @@ pub(crate) fn is_proc_self_mem_path(path: &str) -> bool {
         })
 }
 
+pub(crate) fn is_proc_self_pagemap_path(path: &str) -> bool {
+    path.strip_prefix("/proc/")
+        .and_then(|rest| rest.strip_suffix("/pagemap"))
+        .is_some_and(|mid| {
+            mid == "self"
+                || mid == "thread-self"
+                || (!mid.is_empty() && mid.bytes().all(|b| b.is_ascii_digit()))
+        })
+}
+
 pub(crate) fn synthetic_file(path: &str, ctx: &SyntheticProcContext) -> Option<Vec<u8>> {
     let normalized = normalize_self_pid_path(path);
     let path = normalized.as_ref();
-    // `/proc/<pid>/mem` is a live-memory file, not a precomputed blob: return an
-    // EMPTY blob so it OPENS as a `SyntheticFile`; the `read` handler recognizes
-    // the path and translates the offset as a guest VA into guest memory.
-    if is_proc_self_mem_path(path) {
+    // `/proc/<pid>/mem` and `/proc/<pid>/pagemap` are live files, not
+    // precomputed blobs: return an EMPTY blob so they OPEN as `SyntheticFile`;
+    // the read handler recognizes the path and derives bytes from guest memory
+    // or from the sparse pagemap offset.
+    if is_proc_self_mem_path(path) || is_proc_self_pagemap_path(path) {
         return Some(Vec::new());
     }
     match path {
@@ -1706,14 +1733,14 @@ fn render_proc_maps_from_regions(
         let r = if region.read { 'r' } else { '-' };
         let w = if region.write { 'w' } else { '-' };
         let x = if region.execute { 'x' } else { '-' };
-        // Real Linux /proc/self/maps reports page-aligned VMA bounds. Some
-        // consumers (Apple Rosetta's VM tracker) assert on this. Round to 16 KiB
-        // (carrick's HVF page; also satisfies a 4 KiB check) — start down, end up.
-        const PAGE: u64 = 0x4000;
+        let s = region.sharing.marker();
+        // Real Linux /proc/self/maps reports Linux page-aligned VMA bounds.
+        // LTP scans for an exact 4 KiB page start after MAP_FIXED remaps.
+        const PAGE: u64 = crate::linux_abi::LINUX_PAGE_SIZE;
         let start = start & !(PAGE - 1);
         let end = end.div_ceil(PAGE) * PAGE;
         out.push_str(&format!(
-            "{start:016x}-{end:016x} {r}{w}{x}p 00000000 00:00 0                          {label}\n",
+            "{start:08x}-{end:08x} {r}{w}{x}{s} 00000000 00:00 0                          {label}\n",
         ));
     }
     out
@@ -2958,6 +2985,7 @@ mod tests {
                 read: true,
                 write: true,
                 execute: false,
+                sharing: ProcMapSharing::Private,
                 path: String::new(),
             }]),
             brk_current: LINUX_HEAP_BASE + 0x1234,
@@ -2971,8 +2999,8 @@ mod tests {
         assert!(maps.contains("[heap]"));
         // The heap ends at the page-aligned break (0x1234 → 0x4000), proving the
         // VFS-owned brk_current drives the end rather than the reserved region end.
-        assert!(maps.contains(&format!("{:016x}", LINUX_HEAP_BASE + 0x4000)));
-        assert!(!maps.contains(&format!("{:016x}", LINUX_HEAP_BASE + 0x10000)));
+        assert!(maps.contains(&format!("{:08x}", LINUX_HEAP_BASE + 0x4000)));
+        assert!(!maps.contains(&format!("{:08x}", LINUX_HEAP_BASE + 0x10000)));
     }
 
     fn ctx() -> SyntheticProcContext {
@@ -3670,6 +3698,7 @@ mod tests {
                 read: true,
                 write: true,
                 execute: false,
+                sharing: ProcMapSharing::Private,
                 path: String::new(),
             }]),
             brk_current: LINUX_HEAP_BASE + 0x4000,
