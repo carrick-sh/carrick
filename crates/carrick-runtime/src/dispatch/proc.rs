@@ -123,8 +123,8 @@ syscall_table! {
 // ptrace(2) PEEK/POKE request numbers live in the shared ABI crate (the
 // dispatch ABI-constant gate forbids module-level LINUX_* declarations here).
 use crate::linux_abi::{
-    LINUX_PTRACE_PEEKDATA, LINUX_PTRACE_PEEKTEXT, LINUX_PTRACE_PEEKUSER, LINUX_PTRACE_POKEDATA,
-    LINUX_PTRACE_POKETEXT, LINUX_PTRACE_POKEUSER,
+    LINUX_PTRACE_ATTACH, LINUX_PTRACE_PEEKDATA, LINUX_PTRACE_PEEKTEXT, LINUX_PTRACE_PEEKUSER,
+    LINUX_PTRACE_POKEDATA, LINUX_PTRACE_POKETEXT, LINUX_PTRACE_POKEUSER,
 };
 
 /// Process I/O priority stored by `ioprio_set` and echoed by `ioprio_get`.
@@ -1944,6 +1944,10 @@ impl SyscallDispatcher {
                     crate::host_signal::linux_to_host_signum(linux_signal)
                 }
             };
+            let target_exists = |host: i32| -> bool {
+                (unsafe { libc::kill(host, 0) == 0 })
+                    || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+            };
 
             let result = match request {
                 0 => unsafe {
@@ -1977,14 +1981,18 @@ impl SyscallDispatcher {
                     },
                     None => return Ok(DispatchOutcome::errno(LINUX_ESRCH)),
                 },
+                LINUX_PTRACE_ATTACH => match host_pid(pid) {
+                    Some(host) if host > 0 && target_exists(host) => {
+                        return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EPERM));
+                    }
+                    _ => return Ok(DispatchOutcome::errno(LINUX_ESRCH)),
+                },
                 LINUX_PTRACE_PEEKTEXT
                 | LINUX_PTRACE_PEEKDATA
                 | LINUX_PTRACE_POKETEXT
                 | LINUX_PTRACE_POKEDATA => match host_pid(pid) {
                     Some(host) if host > 0 => {
-                        let exists = unsafe { libc::kill(host, 0) == 0 }
-                            || std::io::Error::last_os_error().raw_os_error()
-                                == Some(libc::EPERM);
+                        let exists = target_exists(host);
                         if !exists {
                             return Ok(DispatchOutcome::errno(LINUX_ESRCH));
                         }
@@ -1997,9 +2005,7 @@ impl SyscallDispatcher {
                 },
                 LINUX_PTRACE_PEEKUSER | LINUX_PTRACE_POKEUSER => match host_pid(pid) {
                     Some(host) if host > 0 => {
-                        let exists = unsafe { libc::kill(host, 0) == 0 }
-                            || std::io::Error::last_os_error().raw_os_error()
-                                == Some(libc::EPERM);
+                        let exists = target_exists(host);
                         if !exists {
                             return Ok(DispatchOutcome::errno(LINUX_ESRCH));
                         }

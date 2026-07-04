@@ -114,6 +114,11 @@ oracle-cache edits are only used when the suite declaration itself changed.
   Red-first: `ptracekillcont` DIFFed on the LTP-shaped `PTRACE_TRACEME` /
   self-`SIGUSR2` sequence because post-case cleanup `waitpid(-1, 0)` returned
   `0` and left stale `ENOTTY`; it now MATCHes Linux with `-1/ECHILD`.
+- `ltp-ptrace02` MATCH after `PTRACE_ATTACH` denial semantics. Root cause
+  fixed: Carrick now recognizes Linux ptrace request 16 and returns `EPERM`
+  for an existing target instead of treating the request as absent `ENOSYS`.
+  Red-first: `ptraceattach` DIFFed on a non-dumpable parent attach attempt and
+  now MATCHes Linux.
 
 ### Still open / next
 
@@ -123,10 +128,9 @@ oracle-cache edits are only used when the suite declaration itself changed.
   timer-slack cases, while Carrick additionally failed the 10ms case in two
   samples by a small oversleep margin. Treat this as timing-jitter evidence,
   not a prctl semantic blocker.
-- Remaining `ltp-ptrace*` gating items after the `ltp-ptrace01` fix:
-  `ltp-ptrace02`, `ltp-ptrace03`, `ltp-ptrace05`, `ltp-ptrace06`, and
-  `ltp-ptrace11`. Focused `ltp-ptrace02` still REGRESSIONed at carrick[0/1] vs
-  oracle[1/1], so continue with a separate red-first reduction.
+- Remaining `ltp-ptrace*` gating items after the `ltp-ptrace01`/`02` fixes:
+  `ltp-ptrace03`, `ltp-ptrace05`, `ltp-ptrace06`, and `ltp-ptrace11`.
+  Continue with separate red-first reductions.
 
 ## Top clusters (fix the shared root cause once → clears many)
 
