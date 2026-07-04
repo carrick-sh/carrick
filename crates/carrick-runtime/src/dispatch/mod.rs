@@ -4018,6 +4018,7 @@ impl SyscallDispatcher {
             sig_shdpnd,
             sysvipc_shm: self.sysvipc_shm_table(),
             sysvipc_sem: self.sysvipc_sem_table(),
+            sysvipc_msg: self.sysvipc_msg_table(),
         }
     }
 }
