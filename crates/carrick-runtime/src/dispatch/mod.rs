@@ -5084,6 +5084,7 @@ fn write_host_pipe(
     host_fd_owner: Option<HostFdRef>,
     nonblocking: bool,
     write_kind: HostWriteKind,
+    pipe_state: Option<(i64, usize)>,
     tid: crate::thread::ThreadId,
     sigpipe_on_epipe: bool,
 ) -> DispatchOutcome {
@@ -5093,6 +5094,7 @@ fn write_host_pipe(
         host_fd_owner,
         nonblocking,
         write_kind,
+        pipe_state,
         tid,
         sigpipe_on_epipe,
     )
@@ -5104,6 +5106,7 @@ fn write_host_pipe_owned(
     host_fd_owner: Option<HostFdRef>,
     nonblocking: bool,
     write_kind: HostWriteKind,
+    pipe_state: Option<(i64, usize)>,
     tid: crate::thread::ThreadId,
     sigpipe_on_epipe: bool,
 ) -> DispatchOutcome {
@@ -5113,9 +5116,15 @@ fn write_host_pipe_owned(
         host_fd_owner,
         nonblocking,
         write_kind,
+        pipe_state,
         tid,
         sigpipe_on_epipe,
     )
+}
+
+fn host_pipe_write_room(capacity: i64, queued: usize) -> Option<usize> {
+    let capacity = usize::try_from(capacity).ok()?;
+    Some(capacity.saturating_sub(queued))
 }
 
 fn write_host_pipe_payload(
@@ -5124,6 +5133,7 @@ fn write_host_pipe_payload(
     host_fd_owner: Option<HostFdRef>,
     nonblocking: bool,
     write_kind: HostWriteKind,
+    pipe_state: Option<(i64, usize)>,
     tid: crate::thread::ThreadId,
     sigpipe_on_epipe: bool,
 ) -> DispatchOutcome {
@@ -5171,13 +5181,22 @@ fn write_host_pipe_payload(
         // construction, the lock is never held across a blocking write.
         let n = {
             let bytes = payload.as_slice();
-            unsafe {
-                libc::write(
-                    host_fd,
-                    bytes[offset..].as_ptr() as *const _,
-                    bytes.len() - offset,
-                )
+            let mut len = bytes.len() - offset;
+            if write_kind == HostWriteKind::PipeLike
+                && let Some((capacity, queued)) = pipe_state
+                && let Some(room) = host_pipe_write_room(capacity, queued.saturating_add(offset))
+            {
+                if room == 0 || (nonblocking && offset == 0 && len <= 4096 && len > room) {
+                    return would_block_outcome(
+                        host_fd,
+                        libc::POLLOUT,
+                        nonblocking,
+                        host_fd_owner.clone(),
+                    );
+                }
+                len = len.min(room);
             }
+            unsafe { libc::write(host_fd, bytes[offset..].as_ptr() as *const _, len) }
         };
         #[cfg(feature = "trace-tty")]
         if payload.as_slice().contains(&0x0a) {
@@ -5817,6 +5836,7 @@ mod overlay_dispatch_tests {
             None,
             false,
             HostWriteKind::PipeLike,
+            None,
             crate::thread::ThreadId::synthetic_for_tests(0x7FFE_0101),
             true,
         );
@@ -5870,6 +5890,7 @@ mod overlay_dispatch_tests {
             None,
             true,
             HostWriteKind::PipeLike,
+            None,
             crate::thread::ThreadId::synthetic_for_tests(0x7FFE_0103),
             false,
         );
@@ -5924,6 +5945,7 @@ mod overlay_dispatch_tests {
             None,
             true,
             HostWriteKind::SocketLike,
+            None,
             crate::thread::ThreadId::synthetic_for_tests(0x7FFE_0104),
             false,
         );

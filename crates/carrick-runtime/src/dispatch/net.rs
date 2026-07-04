@@ -99,6 +99,7 @@ syscall_table! {
     carrick_abi::CARRICK_PRIVATE_X86_EPOLL_CREATE => x86_epoll_create,
     21 => epoll_ctl,
     22 => epoll_pwait,
+    441 => epoll_pwait2,
     // x86_64 poll(2): shares the ppoll handler, which branches on the
     // canonical number to read arg2 as an INT timeout_ms (not a *timespec).
     carrick_abi::CARRICK_PRIVATE_X86_POLL => ppoll,
@@ -317,6 +318,12 @@ fn guest_unix_pathname(memory: &impl GuestMemory, addr: u64, addrlen: u32) -> Op
         })
 }
 
+fn host_stream_socket_read_eof(host_fd: i32) -> bool {
+    let mut byte = [0u8; 1];
+    let rc = unsafe { libc::recv(host_fd, byte.as_mut_ptr().cast(), 1, libc::MSG_PEEK) };
+    rc == 0
+}
+
 impl SyscallDispatcher {
     /// Whether `fd` is a pollable target for `epoll_ctl(ADD)`. The kernel
     /// returns EPERM when adding an fd whose file has no `->poll` op — regular
@@ -336,6 +343,43 @@ impl SyscallDispatcher {
             }
             _ => true,
         }
+    }
+
+    fn fd_supports_epoll_oob(&self, fd: i32) -> bool {
+        let Some(open_file) = self.open_file(fd) else {
+            return false;
+        };
+        matches!(
+            &*open_file.description.read(),
+            OpenDescription::HostSocket { .. }
+        )
+    }
+
+    fn epoll_path_reaches(
+        &self,
+        current_fd: i32,
+        target_fd: i32,
+        depth: usize,
+        seen: &mut std::collections::BTreeSet<i32>,
+    ) -> bool {
+        if current_fd == target_fd || depth >= 5 || !seen.insert(current_fd) {
+            return true;
+        }
+        let Some(open_file) = self.open_file(current_fd) else {
+            return false;
+        };
+        let open = open_file.description.read();
+        let OpenDescription::Epoll { interest, .. } = &*open else {
+            return false;
+        };
+        interest
+            .keys()
+            .any(|child| self.epoll_path_reaches(*child, target_fd, depth + 1, seen))
+    }
+
+    fn epoll_add_would_loop(&self, epfd: i32, fd: i32) -> bool {
+        let mut seen = std::collections::BTreeSet::new();
+        self.epoll_path_reaches(fd, epfd, 0, &mut seen)
     }
 
     fn epoll_effective_interest(
@@ -358,6 +402,9 @@ impl SyscallDispatcher {
         if interest.write && self.host_fd_is_oneway_pipe_read_end(fd) {
             interest.write = false;
             interest.read = true;
+        }
+        if interest.oob && !self.fd_supports_epoll_oob(fd) {
+            interest.oob = false;
         }
         interest
     }
@@ -448,15 +495,35 @@ impl SyscallDispatcher {
                 // A one-way pipe/FIFO read end is never writable under Linux;
                 // FreeBSD's poll(2) wrongly reports POLLOUT on it (see
                 // host_fd_is_oneway_pipe_read_end), so drop EPOLLOUT for it.
-                let suppress_pollout = matches!(
-                    &*open,
+                let suppress_pollout = match &*open {
                     OpenDescription::HostPipe {
-                        is_read_end: true,
-                        bidirectional: false,
-                        pty: None,
+                        base,
+                        host_fd,
+                        is_read_end,
+                        bidirectional,
+                        pty,
+                        pipe_id,
                         ..
+                    } => {
+                        let one_way_read_end = *is_read_end && !*bidirectional && pty.is_none();
+                        let pipe_full = self
+                            .host_pipe_capacity_state(
+                                base,
+                                *pipe_id,
+                                *is_read_end,
+                                *bidirectional,
+                                host_fd.raw(),
+                            )
+                            .and_then(|(capacity, queued)| host_pipe_write_room(capacity, queued))
+                            .is_some_and(|room| room < 4096);
+                        one_way_read_end || pipe_full
                     }
-                );
+                    _ => false,
+                };
+                let stream_socket_fd = match &*open {
+                    OpenDescription::HostSocket { host_fd, .. } => Some(host_fd.raw()),
+                    _ => None,
+                };
                 drop(open);
                 let Some(host_fd) = self.host_fd_for_poll(fd) else {
                     return 0;
@@ -524,6 +591,12 @@ impl SyscallDispatcher {
                 if crate::dispatch::fifo_beacon::read_end_at_eof(host_fd.get()) {
                     ready |= LINUX_EPOLLIN | LINUX_EPOLLHUP;
                 }
+                if requested_events & LINUX_EPOLLRDHUP != 0
+                    && let Some(socket_fd) = stream_socket_fd
+                    && host_stream_socket_read_eof(socket_fd)
+                {
+                    ready |= LINUX_EPOLLIN | LINUX_EPOLLRDHUP;
+                }
                 // Only report events the caller is watching, plus the
                 // always-reported HUP/ERR conditions Linux delivers regardless.
                 ready & (requested_events | LINUX_EPOLLHUP | LINUX_EPOLLERR)
@@ -581,7 +654,7 @@ impl SyscallDispatcher {
         let positive = matches!(outcome, DispatchOutcome::Returned { value } if *value > 0);
         let zero = matches!(outcome, DispatchOutcome::Returned { value } if *value == 0);
         let eagain = matches!(outcome, DispatchOutcome::Errno { errno } if *errno == LINUX_EAGAIN);
-        let read_consumed = positive || zero || eagain;
+        let read_consumed = zero || eagain;
         let write_consumed = positive;
         let a = |i: usize| request.arg(i) as i32;
         let write_eagain_targets: [Option<i32>; 2] = if eagain {
@@ -2265,6 +2338,9 @@ impl SyscallDispatcher {
                     if !this.fd_is_epollable(fd) {
                         return Ok(DispatchOutcome::errno(LINUX_EPERM));
                     }
+                    if this.epoll_add_would_loop(epfd, fd) {
+                        return Ok(DispatchOutcome::errno(carrick_abi::LINUX_ELOOP));
+                    }
                     if interest.contains_key(&fd) {
                         return Ok(DispatchOutcome::errno(LINUX_EEXIST));
                     }
@@ -2714,10 +2790,8 @@ impl SyscallDispatcher {
                                 }
                                 let read_avail_update = if raw & READ_READY_BITS == 0 {
                                     Some(0)
-                                } else if ready_events & READ_READY_BITS != 0 {
-                                    Some(observed_read_avail)
                                 } else {
-                                    None
+                                    Some(observed_read_avail)
                                 };
                                 ready_updates.push((
                                     gfd,
@@ -2823,10 +2897,8 @@ impl SyscallDispatcher {
                 }
                 let read_avail_update = if raw_ready & READ_READY_BITS == 0 {
                     Some(0)
-                } else if ready_events & READ_READY_BITS != 0 {
-                    Some(read_avail)
                 } else {
-                    None
+                    Some(read_avail)
                 };
                 ready_updates.push((
                     *fd,
@@ -2917,6 +2989,8 @@ impl SyscallDispatcher {
                                 continue;
                             }
                             let before = slot.last_ready;
+                            let read_avail_changed = read_avail
+                                .is_some_and(|read_avail| read_avail != slot.last_read_avail);
                             slot.last_ready = raw;
                             if let Some(read_avail) = read_avail {
                                 slot.last_read_avail = read_avail;
@@ -2930,7 +3004,7 @@ impl SyscallDispatcher {
                                 feature = "platform-netbsd"
                             ))]
                             if slot.event.events & LINUX_EPOLLET != 0
-                                && before != raw
+                                && (before != raw || read_avail_changed)
                                 && let Some(host_fd) = this.host_fd_for_poll(fd)
                             {
                                 host_rearms.push(host_fd.get());
@@ -3054,6 +3128,83 @@ impl SyscallDispatcher {
             write_epoll_events(memory, events_address, &ready, guest_abi)
         }
 
+        }
+
+        fn epoll_pwait2(this, cx, epfd: Fd, events: GuestPtr, maxevents: u64, timeout: GuestPtr, sigmask: GuestPtr, sigsetsize: u64) {
+            let epfd = epfd.0;
+            let events_address = events.0;
+            let timeout_addr = timeout.0;
+            let sigmask_ptr = sigmask.0;
+            let guest_abi = cx.guest_abi();
+            let memory = &mut *cx.memory;
+            let max_events_signed = maxevents as i32;
+            if max_events_signed <= 0 {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
+            let max_events = max_events_signed as usize;
+            if sigmask_ptr != 0 {
+                if sigsetsize != crate::linux_abi::LINUX_RT_SIGSET_SIZE {
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                }
+                if memory
+                    .read_bytes(sigmask_ptr, crate::linux_abi::LINUX_RT_SIGSET_SIZE as usize)
+                    .is_err()
+                {
+                    return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                }
+            }
+            let timeout_ms = if timeout_addr == 0 {
+                -1
+            } else {
+                let timespec = match read_kernel_struct::<LinuxTimespec>(memory, timeout_addr) {
+                    Ok(timespec) => timespec,
+                    Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
+                };
+                let sec = timespec.tv_sec;
+                let nsec = timespec.tv_nsec;
+                if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                }
+                let ms = sec.saturating_mul(1000).saturating_add(nsec / 1_000_000);
+                if ms <= 0 {
+                    0
+                } else if ms > i32::MAX as i64 {
+                    i32::MAX
+                } else {
+                    ms as i32
+                }
+            };
+            let Some(open_file) = this.open_file(epfd) else {
+                return Ok(DispatchOutcome::errno(if this.fd_is_valid(epfd) {
+                    LINUX_EINVAL
+                } else {
+                    LINUX_EBADF
+                }));
+            };
+            let (ready, has_interests) = {
+                let mut open = open_file.description.write();
+                let OpenDescription::Epoll {
+                    interest,
+                    pending_ready,
+                    ..
+                } = &mut *open
+                else {
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                };
+                (
+                    drain_pending_epoll_ready(pending_ready, max_events),
+                    !interest.is_empty(),
+                )
+            };
+            if !ready.is_empty() {
+                crate::probes::epoll_result(epfd, ready.len() as i32, 0, timeout_ms, 0);
+                return write_epoll_events(memory, events_address, &ready, guest_abi);
+            }
+            if timeout_ms == 0 || !has_interests {
+                crate::probes::epoll_result(epfd, 0, 0, timeout_ms, 0);
+                return Ok(DispatchOutcome::Returned { value: 0 });
+            }
+            Ok(DispatchOutcome::errno(LINUX_ENOSYS))
         }
 
         fn pselect6(this, cx, nfds: u64, readfds: GuestPtr, writefds: GuestPtr, exceptfds: GuestPtr, timeout: GuestPtr, sigmask: GuestPtr) {
