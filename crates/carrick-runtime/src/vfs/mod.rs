@@ -96,7 +96,7 @@ pub use dev::DevVfs;
 pub use devpts::{DevptsVfs, PtyRole, PtyTable};
 pub use etc_services::EtcServicesVfs;
 pub use mount::VfsMounts;
-pub use proc::{GuestReportedArch, ProcMapsEntry, ProcVfs, SyntheticProcContext};
+pub use proc::{GuestReportedArch, ProcMapSharing, ProcMapsEntry, ProcVfs, SyntheticProcContext};
 pub use resolvconf::ResolvConfVfs;
 pub use rootfs::RootFsVfs;
 pub use sys::SysVfs;

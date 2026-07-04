@@ -3219,6 +3219,15 @@ bitflags! {
         const PRIVATE = LINUX_MAP_PRIVATE;
         const FIXED = LINUX_MAP_FIXED;
         const ANONYMOUS = LINUX_MAP_ANONYMOUS;
+        const GROWSDOWN = LINUX_MAP_GROWSDOWN;
+        const DENYWRITE = LINUX_MAP_DENYWRITE;
+        const EXECUTABLE = LINUX_MAP_EXECUTABLE;
+        const LOCKED = LINUX_MAP_LOCKED;
+        const NORESERVE = LINUX_MAP_NORESERVE;
+        const POPULATE = LINUX_MAP_POPULATE;
+        const NONBLOCK = LINUX_MAP_NONBLOCK;
+        const STACK = LINUX_MAP_STACK;
+        const HUGETLB = LINUX_MAP_HUGETLB;
         const FIXED_NOREPLACE = LINUX_MAP_FIXED_NOREPLACE;
         const DROPPABLE = LINUX_MAP_DROPPABLE;
     }
@@ -3400,7 +3409,16 @@ impl LinuxMmapFlags {
         | Self::PRIVATE.bits()
         | Self::FIXED.bits()
         | Self::ANONYMOUS.bits()
-        | LINUX_MAP_HINT_MASK
+        | Self::GROWSDOWN.bits()
+        | Self::DENYWRITE.bits()
+        | Self::EXECUTABLE.bits()
+        | Self::LOCKED.bits()
+        | Self::NORESERVE.bits()
+        | Self::POPULATE.bits()
+        | Self::NONBLOCK.bits()
+        | Self::STACK.bits()
+        | Self::HUGETLB.bits()
+        | Self::DROPPABLE.bits()
         | LINUX_MAP_FIXED_NOREPLACE;
 }
 

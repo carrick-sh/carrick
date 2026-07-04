@@ -2202,6 +2202,13 @@ impl SyscallDispatcher {
         drop(proc);
         let open_fds = self.open_fd_numbers();
         let mem = self.mem_snapshot();
+        let mut address_space_regions = mem.address_space_regions.clone();
+        if !mem.dynamic_maps.is_empty() {
+            match &mut address_space_regions {
+                Some(regions) => regions.extend(mem.dynamic_maps.clone()),
+                None => address_space_regions = Some(mem.dynamic_maps.clone()),
+            }
+        }
         let creds = self.cred_snapshot();
         let groups = self.current_groups();
         let (sig_ignored, sig_caught, sig_shdpnd) = self.proc_status_signal_masks();
@@ -2216,7 +2223,7 @@ impl SyscallDispatcher {
             open_fds: Some(open_fds.as_slice()),
             network: Some(&self.network.spec),
             auxv: Some(mem.linux_auxv_image.as_slice()),
-            address_space_regions: mem.address_space_regions.as_deref(),
+            address_space_regions: address_space_regions.as_deref(),
             brk_current: mem.brk_current,
             mmap_next: mem.mmap_next,
             ruid: creds.ruid,
@@ -6724,6 +6731,14 @@ impl SyscallDispatcher {
                                 return Ok(DispatchOutcome::errno(carrick_abi::LINUX_EIO));
                             }
                         }
+                    } else if crate::vfs::proc::is_proc_self_pagemap_path(path) {
+                        let present = (1u64 << 63).to_le_bytes();
+                        let mut bytes = vec![0u8; length];
+                        for (i, byte) in bytes.iter_mut().enumerate() {
+                            *byte = present[(*offset + i) % present.len()];
+                        }
+                        *offset += bytes.len();
+                        (bytes.len(), bytes)
                     } else {
                         let remaining: &[u8] = contents.get(*offset..).unwrap_or(&[]);
                         let read_len = remaining.len().min(length);

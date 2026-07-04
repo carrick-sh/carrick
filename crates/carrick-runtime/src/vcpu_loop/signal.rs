@@ -174,13 +174,33 @@ pub(super) fn deliver_fault_signal<E: ThreadedEngine>(
     kernel: &Kernel,
     engine: &mut E,
     this_tid: ThreadId,
-    signum: i32,
-    si_code: i32,
+    mut signum: i32,
+    mut si_code: i32,
     si_addr: u64,
     interrupted_pc: Option<u64>,
     traps: usize,
 ) -> Result<Option<VcpuLoopOutcome>, RuntimeError> {
     let dispatcher = &kernel.dispatcher;
+    const SIGSEGV: i32 = 11;
+    const SIGBUS: i32 = 7;
+    const BUS_ADRERR: i32 = 2;
+    if signum == SIGSEGV
+        && let Some((grow_start, grow_len)) = dispatcher.mmap_growdown_fault_plan(si_addr)
+        && engine
+            .protect_range(
+                grow_start,
+                grow_len,
+                crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_WRITE,
+            )
+            .is_ok()
+    {
+        dispatcher.commit_mmap_growdown(grow_start);
+        return Ok(None);
+    }
+    if signum == SIGSEGV && dispatcher.mmap_fault_is_sigbus(si_addr) {
+        signum = SIGBUS;
+        si_code = BUS_ADRERR;
+    }
     // Capture the forked-child flag up front so the `terminate` closure does not
     // borrow `engine` — it is now also called in the inject-failure arm below,
     // after a &mut engine use, and a closure-held &engine would conflict. (M1b)
@@ -189,6 +209,7 @@ pub(super) fn deliver_fault_signal<E: ThreadedEngine>(
         if is_forked_child || kernel.dispatcher.is_forked_guest_process() {
             let out = dispatcher.stdout();
             let err = dispatcher.stderr();
+            dispatcher.cleanup_sysv_ipc_on_process_exit();
             forked_child_die_by_signal(signum, &out, &err);
         }
         let result = assemble_run_result(kernel, 128 + signum, traps, false);
