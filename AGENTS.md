@@ -183,13 +183,14 @@ If it fails in Docker too, it's not carrick's bug.
   routine gates run carrick-only. Single-run gating is non-deterministic
   (Go-under-HVF races); treat flaky flips as flakiness (retry / `known_gaps`),
   not regressions.
-- **Use `bpftrace` inside the Docker oracle for Linux syscall shape.** The LTP
-  container already has `bpftrace` installed (validated as `bpftrace v0.20.2`);
-  use that in-container copy rather than a host-side tracer. Prefer it over
-  guest `strace` when you only need the Docker/Linux side because it is lower
-  overhead and does not perturb the test as much. Run it in a separate
-  Docker-only phase (never alongside Carrick), with privileges and tracefs
-  mounted inside the container. Validate the tool before trusting a trace:
+- **Use `bpftrace` inside the Docker oracle for Linux syscall shape — strict
+  requirement.** The LTP container already has `bpftrace` installed (validated
+  as `bpftrace v0.20.2`); use that in-container copy rather than a host-side
+  tracer. Do **not** use guest `strace` for Linux-in-Docker syscall evidence;
+  it perturbs test behaviour and is not accepted as Docker oracle syscall
+  evidence. Run `bpftrace` in a separate Docker-only phase (never alongside
+  Carrick), with privileges and tracefs mounted inside the container. Validate
+  the tool before trusting a trace:
   `docker run --rm --privileged --pid=host localhost:5050/ltp:arm64 sh -lc 'mount -t tracefs tracefs /sys/kernel/tracing 2>/dev/null || true; bpftrace -V; bpftrace -e "BEGIN { printf(\"ok\\n\"); exit(); }"'`.
   Then trace the case with the same wrapper, for example:
   `docker run --rm --privileged --pid=host localhost:5050/ltp:arm64 sh -lc 'mount -t tracefs tracefs /sys/kernel/tracing 2>/dev/null || true; bpftrace -e "..." -c /opt/ltp/testcases/bin/<case>'`.
@@ -281,7 +282,8 @@ Use **real debuggers, not `eprintln!`** — and never ship debug spam. Full guid
 
 - **NEVER read Linux kernel or other GPL source when implementing carrick.**
   Clean-room only: derive ABIs from man-pages/specs and the differential Docker
-  oracle (strace/observe behaviour, diff verdicts). This is non-negotiable.
+  oracle (`bpftrace`/observe behaviour, diff verdicts). This is
+  non-negotiable.
   (Reading LTP *test* source — the oracle itself — is a separate, grayer matter.)
 - **Typed domain values are the baseline — bare `u64`/`i32` never crosses a
   semantic boundary.** Three shipped bugs (the `!wait_set` polarity hang, the
