@@ -81,6 +81,35 @@ guest path is used until its real on-disk path is verified beneath
 `root_prefix`.** `fast_open_contained` already does this; the parent-fd pattern
 extends it (verify the parent chain, then a single-component `*at`).
 
+## Stage-2 MEASURED (2026-07-03) — `resolve_following` dominates, not the open
+
+Built a prototype `open_contained` (a real-access-mode `fast_open_contained`)
+and fast-pathed `open_raw_fd`'s pure-open branch, then measured host-open
+amplification on a 200×-open loop of a 5-component path:
+
+| | host_opens / guest_openat |
+|---|---|
+| fast open OFF (baseline) | **39.9×** |
+| fast open ON | **37.9×** |
+
+So the open itself is only **~5%** of the amplification. `open_raw_fd` calls
+`resolve_following(path)` FIRST — a per-component cap-std `symlink_metadata` walk
+(~7 host opens/component) — and THAT is the ~38×. **Revised Stage-2 target:
+make `resolve_following` fast, then `open_contained` for the residual open
+walk.** The fast `resolve_following`: for a symlink-free path (the common case),
+`fast_open_contained(path, follow=true)` + a byte-exact `F_GETPATH ==
+root_prefix+normalize(path)` check proves no symlink redirected → return the
+path in ONE openat (this is exactly `validate_parents_fast`'s trick, applied to
+the FULL path); any mismatch → the existing per-component walk. Both pieces are
+needed together for the win; each on its own is marginal.
+
+**Containment approach VERIFIED escape-safe** (the `open_contained` prototype,
+live): a guest symlink to an absolute host-only path (macOS
+`SystemVersion.plist`) → ENOENT (re-rooted, host file NOT leaked); a `../`-
+stacked symlink → clamped to the guest root; LTP open/openat/symlink/lstat/stat
+all PASS; 487 lib tests green. The F_GETPATH-after guarantee holds for pure
+opens. Reverted the prototype (marginal alone) pending the combined change.
+
 ## Stage-2 security detail (traced from `open_raw_fd`)
 
 `open_raw_fd` already calls `resolve_following(path)` first, so `normalized`
