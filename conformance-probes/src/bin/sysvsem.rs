@@ -2,8 +2,11 @@ use conformance_probes::report;
 
 const IPC_RMID: i32 = 0;
 const IPC_CREAT: i32 = 0o1000;
+const GETPID: i32 = 11;
 const GETVAL: i32 = 12;
 const GETALL: i32 = 13;
+const GETNCNT: i32 = 14;
+const GETZCNT: i32 = 15;
 const SETVAL: i32 = 16;
 const SETALL: i32 = 17;
 const SEM_INFO: i32 = 19;
@@ -147,6 +150,124 @@ unsafe fn semop_zero_wait_child_reports_sleeping() -> bool {
     semctl(semid, 0, IPC_RMID, core::ptr::null_mut());
     let _ = wait_child_success(pid);
     saw_sleeping
+}
+
+unsafe fn semctl_waiter_count(sem_op: i16, setup_increment: bool, cmd: i32) -> (usize, i64) {
+    const WAITER_COUNT: usize = 5;
+
+    let semid = libc::syscall(SYS_SEMGET, libc::IPC_PRIVATE, 5, IPC_CREAT | 0o600) as i32;
+    if semid < 0 {
+        return (0, -1);
+    }
+    if setup_increment {
+        let mut increment = Sembuf {
+            sem_num: 4,
+            sem_op: 1,
+            sem_flg: 0,
+        };
+        if libc::syscall(SYS_SEMOP, semid, &mut increment, 1) != 0 {
+            semctl(semid, 0, IPC_RMID, core::ptr::null_mut());
+            return (0, -1);
+        }
+    }
+
+    let mut pids = [0; WAITER_COUNT];
+    let mut sleepers = 0;
+    for pid_slot in &mut pids {
+        let pid = libc::fork();
+        if pid == 0 {
+            let mut wait = Sembuf {
+                sem_num: 4,
+                sem_op,
+                sem_flg: 0,
+            };
+            let _ = libc::syscall(SYS_SEMOP, semid, &mut wait, 1);
+            libc::_exit(0);
+        }
+        if pid < 0 {
+            semctl(semid, 0, IPC_RMID, core::ptr::null_mut());
+            for child in pids.iter().copied().filter(|child| *child > 0) {
+                libc::kill(child, libc::SIGKILL);
+                let mut status = 0;
+                libc::waitpid(child, &mut status, 0);
+            }
+            return (sleepers, -1);
+        }
+
+        *pid_slot = pid;
+        let mut saw_sleeping = false;
+        for _ in 0..40 {
+            if proc_state(pid) == Some('S') {
+                saw_sleeping = true;
+                break;
+            }
+            let req = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 50_000_000,
+            };
+            libc::nanosleep(&req, core::ptr::null_mut());
+        }
+        if !saw_sleeping {
+            break;
+        }
+        sleepers += 1;
+    }
+
+    let count = semctl(semid, 4, cmd, core::ptr::null_mut());
+    semctl(semid, 0, IPC_RMID, core::ptr::null_mut());
+    for child in pids.into_iter().filter(|child| *child > 0) {
+        let _ = wait_child_success(child);
+    }
+    (sleepers, count)
+}
+
+unsafe fn semctl_getpid_child_visible_as_zombie() -> (i32, bool) {
+    let semid = libc::syscall(SYS_SEMGET, libc::IPC_PRIVATE, 3, IPC_CREAT | 0o600) as i32;
+    if semid < 0 {
+        return (0, false);
+    }
+
+    let pid = libc::fork();
+    if pid == 0 {
+        let mut increment = Sembuf {
+            sem_num: 2,
+            sem_op: 1,
+            sem_flg: 0,
+        };
+        let ok = libc::syscall(SYS_SEMOP, semid, &mut increment, 1) == 0;
+        libc::_exit(if ok { 0 } else { 1 });
+    }
+    if pid < 0 {
+        semctl(semid, 0, IPC_RMID, core::ptr::null_mut());
+        return (0, false);
+    }
+
+    let mut child_state = 0;
+    for _ in 0..40 {
+        if let Some(state) = proc_state(pid) {
+            child_state = state as i32;
+            if state == 'Z' {
+                break;
+            }
+        }
+        if child_state == 'Z' as i32 {
+            break;
+        }
+        let req = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 50_000_000,
+        };
+        libc::nanosleep(&req, core::ptr::null_mut());
+    }
+
+    let last_pid = semctl(semid, 2, GETPID, core::ptr::null_mut());
+    let mut status = 0;
+    let reaped = libc::waitpid(pid, &mut status, 0) == pid;
+    semctl(semid, 0, IPC_RMID, core::ptr::null_mut());
+    (
+        child_state,
+        reaped && libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 && last_pid == pid as i64,
+    )
 }
 
 unsafe extern "C" fn handle_hup(_sig: i32) {}
@@ -376,6 +497,9 @@ fn main() {
         let decrement_rmid_wakes = semop_rmid_wakes_child(0, 0, -1);
         let zero_wait_rmid_wakes = semop_rmid_wakes_child(2, 1, 0);
         let zero_wait_sleeping = semop_zero_wait_child_reports_sleeping();
+        let (getncnt_sleepers, getncnt_count) = semctl_waiter_count(-1, false, GETNCNT);
+        let (getzcnt_sleepers, getzcnt_count) = semctl_waiter_count(0, true, GETZCNT);
+        let (getpid_state, getpid_value) = semctl_getpid_child_visible_as_zombie();
         let timed_rmid = semtimedop_interrupted_by_rmid();
         let timed_signal = semtimedop_interrupted_by_signal();
         let semop_overflow = semop_positive_overflow_erange();
@@ -401,6 +525,13 @@ fn main() {
         report!(semop_decrement_rmid_wakes = decrement_rmid_wakes);
         report!(semop_zero_wait_rmid_wakes = zero_wait_rmid_wakes);
         report!(semop_zero_wait_child_sleeping = zero_wait_sleeping);
+        report!(semctl_getncnt_sleepers = getncnt_sleepers);
+        report!(semctl_getncnt_count = getncnt_count);
+        report!(semctl_getzcnt_sleepers = getzcnt_sleepers);
+        report!(semctl_getzcnt_count = getzcnt_count);
+        report!(semctl_getpid_child_state = getpid_state);
+        report!(semctl_getpid_child_zombie_visible = getpid_state == 'Z' as i32);
+        report!(semctl_getpid_reports_child = getpid_value);
         report!(semtimedop_rmid_eidrm = timed_rmid);
         report!(semtimedop_signal_eintr = timed_signal);
         report!(semop_positive_overflow_erange = semop_overflow);

@@ -23,11 +23,13 @@
 //! ([`crate::namespace::pid`]); the renderers are written against the literal
 //! `/proc/self/*` form, so `normalize_self_pid_path` rewrites a numeric
 //! self-pid (host pid *or* ns-pid) back to `/proc/self/*` before the match.
-//! Enumerating or reading another process's `/proc/<pid>` works only for a
-//! *live* guest process: the path is translated ns-pid → host-pid and gated on
-//! liveness (`proc_pid_dir_host_pid` / `synthetic_task_dir`, which consult
-//! [`crate::host_proc::is_guest_process`] and the thread tables). A `/proc/<pid>`
-//! for a dead or non-guest pid returns `ENOENT`, matching Linux.
+//! Enumerating or reading another process's `/proc/<pid>` works for a live
+//! guest process, plus the Linux zombie interval for a namespace-mapped child
+//! that has exited but has not yet been reaped. The path is translated ns-pid →
+//! host-pid and gated on guest ownership (`proc_pid_dir_host_pid` /
+//! `synthetic_task_dir`, which consult [`crate::host_proc::is_guest_process`],
+//! namespace membership, and the thread tables). A `/proc/<pid>` for a reaped or
+//! non-guest pid returns `ENOENT`, matching Linux.
 //!
 //! ## Live context is threaded in, not captured
 //!
@@ -1232,9 +1234,50 @@ fn ns_pid_to_host(ns_pid: u32) -> Option<u32> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ProcHostPid(u32);
+
+impl ProcHostPid {
+    fn waitid_id(self) -> libc::id_t {
+        self.0 as libc::id_t
+    }
+
+    fn raw_i32(self) -> i32 {
+        self.0 as i32
+    }
+}
+
+fn host_child_exited_unreaped(pid: ProcHostPid) -> bool {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid.waitid_id(),
+            &mut info,
+            libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+        )
+    };
+    if rc != 0 {
+        return false;
+    }
+
+    const CLD_EXITED: i32 = 1;
+    const CLD_KILLED: i32 = 2;
+    const CLD_DUMPED: i32 = 3;
+    carrick_portable::si_pid(&info) == pid.raw_i32()
+        && matches!(info.si_code, CLD_EXITED | CLD_KILLED | CLD_DUMPED)
+}
+
+fn mapped_existing_ns_pid(ns_pid: u32, host_pid: u32) -> bool {
+    crate::namespace::pid::enabled()
+        && crate::namespace::pid::ns_to_host_or_self(ns_pid) == Some(host_pid)
+        && (crate::host_proc::pid_info(host_pid).is_some()
+            || host_child_exited_unreaped(ProcHostPid(host_pid)))
+}
+
 /// The backing HOST pid for a `/proc/<pid>` DIRECTORY path (the pid component
 /// only, no sub-path), or `None` if the path isn't a numeric process directory
-/// or the pid isn't a live process we expose. Used both to gate the directory
+/// or the pid isn't a process we expose. Used both to gate the directory
 /// open and to let `pidfd_send_signal` treat a `/proc/<pid>` directory fd as a
 /// pidfd (Linux allows a `/proc/<pid>` dir fd anywhere a pidfd is expected).
 pub(crate) fn proc_pid_dir_host_pid(path: &str) -> Option<u32> {
@@ -1246,12 +1289,17 @@ pub(crate) fn proc_pid_dir_host_pid(path: &str) -> Option<u32> {
     // `self`/`thread-self` resolve to the calling process (the same mapping
     // parse_proc_pid_path uses for sub-path file reads), so the bare /proc/self
     // directory is openable/stat-able/scandir-able — not just /proc/self/<file>.
-    let host_pid = if comp == "self" || comp == "thread-self" {
-        std::process::id()
+    let (host_pid, ns_pid) = if comp == "self" || comp == "thread-self" {
+        (std::process::id(), None)
     } else {
-        ns_pid_to_host(comp.parse().ok()?)?
+        let ns_pid = comp.parse().ok()?;
+        (ns_pid_to_host(ns_pid)?, Some(ns_pid))
     };
-    synthetic_task_dir(host_pid)?; // gate: a live process (own thread or guest)
+    if synthetic_task_dir(host_pid).is_none()
+        && !ns_pid.is_some_and(|pid| mapped_existing_ns_pid(pid, host_pid))
+    {
+        return None;
+    }
     Some(host_pid)
 }
 
@@ -2410,15 +2458,18 @@ Pid:\t{pid}\nPPid:\t{ppid}\nThreads:\t1\n",
     } else {
         pid
     };
-    if !crate::host_proc::is_guest_process(host_pid) {
+    let zombie = host_child_exited_unreaped(ProcHostPid(host_pid));
+    let info = crate::host_proc::pid_info(host_pid);
+    if info.is_none() && !zombie {
         return None;
     }
-    let info = crate::host_proc::pid_info(host_pid)?;
-    let comm = if info.comm.is_empty() {
-        "carrick".to_owned()
-    } else {
-        info.comm.clone()
-    };
+    if !zombie && !crate::host_proc::is_guest_process(host_pid) && !ns_enabled {
+        return None;
+    }
+    let comm = info
+        .as_ref()
+        .and_then(|info| (!info.comm.is_empty()).then(|| info.comm.clone()))
+        .unwrap_or_else(|| "carrick".to_owned());
     // Prefer the guest's TRUE published run-state over the host vCPU-thread's
     // scheduler state. The host park is `S`/`D` (`do_sys_poll`) for BOTH a guest
     // genuinely blocked in pause()/futex AND a freshly-forked child still in its
@@ -2429,22 +2480,31 @@ Pid:\t{pid}\nPPid:\t{ppid}\nThreads:\t1\n",
     // for any LIVE host state (`R`/`S`/`D`). Only the terminal/job-control states
     // the publisher never reports — zombie (`Z`) and stopped (`T`) — stay with the
     // host kernel (a dead/stopped process has no fresh publish to trust).
-    let state = match info.state {
-        'Z' | 'T' => info.state,
-        _ => crate::run_state::published_stat_char(host_pid).unwrap_or(info.state),
+    let state = if zombie {
+        'Z'
+    } else {
+        let info = info.as_ref()?;
+        match info.state {
+            'Z' | 'T' => info.state,
+            _ => crate::run_state::published_stat_char(host_pid).unwrap_or(info.state),
+        }
     };
     // Display pids are ns-local: the requested ns-pid for self, and the
     // ns-translation of the host ppid/pgid (0 / reparent handled by the
     // translation). When ns is off these are the raw host values.
+    let fallback_ppid = std::process::id();
+    let fallback_pgid = unsafe { libc::getpgrp() as u32 };
+    let host_ppid = info.as_ref().map(|info| info.ppid).unwrap_or(fallback_ppid);
+    let host_pgid = info.as_ref().map(|info| info.pgid).unwrap_or(fallback_pgid);
     let disp_ppid = if ns_enabled {
-        crate::namespace::pid::host_to_ns_or_self(info.ppid)
+        crate::namespace::pid::host_to_ns_or_self(host_ppid)
     } else {
-        info.ppid
+        host_ppid
     };
     let disp_pgid = if ns_enabled {
-        crate::namespace::pid::host_to_ns_pgid(info.pgid)
+        crate::namespace::pid::host_to_ns_pgid(host_pgid)
     } else {
-        info.pgid
+        host_pgid
     };
     match rest {
         // Another guest process: we don't track its thread registry, so report
