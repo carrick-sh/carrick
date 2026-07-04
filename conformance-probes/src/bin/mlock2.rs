@@ -110,6 +110,34 @@ fn mlock2_mincore_counts() -> (Option<usize>, Option<usize>, Option<usize>) {
     (onfault_empty_count, onfault_half_count, populated_count)
 }
 
+fn mmap_locked_vmlck_grew() -> bool {
+    let before = read_vmlck_kb();
+    let mapped = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            PAGE * 2,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_LOCKED,
+            -1,
+            0,
+        )
+    };
+    if mapped == libc::MAP_FAILED {
+        return false;
+    }
+
+    let after = read_vmlck_kb();
+    unsafe {
+        libc::munmap(mapped, PAGE * 2);
+    }
+
+    let expected_kb = (PAGE * 2 / 1024) as u64;
+    matches!(
+        (before, after),
+        (Some(before), Some(after)) if after.saturating_sub(before) == expected_kb
+    )
+}
+
 fn main() {
     let mapped = unsafe {
         libc::mmap(
@@ -169,5 +197,6 @@ fn main() {
         mlock2_mincore_onfault_empty = mincore_onfault_empty == Some(0),
         mlock2_mincore_onfault_half = mincore_onfault_half == Some(4),
         mlock2_mincore_populated = mincore_populated == Some(8),
+        mmap_locked_vmlck_grew = mmap_locked_vmlck_grew(),
     );
 }
