@@ -874,6 +874,15 @@ fn linux_ifreq_inet4(name: &str, addr_be: [u8; 4]) -> [u8; LINUX_IFREQ_SIZE] {
     req
 }
 
+struct RenameAtRequest {
+    olddirfd: u64,
+    oldpath: u64,
+    newdirfd: u64,
+    newpath: u64,
+    flags: u64,
+    target_tid: Option<crate::thread::ThreadId>,
+}
+
 impl SyscallDispatcher {
     fn record_fd_open_path(&self, fd: i32, path: String) {
         #[cfg(test)]
@@ -3175,32 +3184,36 @@ impl SyscallDispatcher {
                         } else {
                             write_host_pipe(
                                 bytes,
-                                host_fd.raw(),
-                                Some(host_fd.clone()),
-                                nonblocking,
-                                *write_kind,
-                                self.host_pipe_capacity_state(
-                                    base,
-                                    *pipe_id,
-                                    *is_read_end,
-                                    *bidirectional,
-                                    host_fd.raw(),
-                                ),
-                                tid,
-                                false,
+                                HostPipeWriteTarget {
+                                    host_fd: host_fd.raw(),
+                                    host_fd_owner: Some(host_fd.clone()),
+                                    nonblocking,
+                                    write_kind: *write_kind,
+                                    pipe_state: self.host_pipe_capacity_state(
+                                        base,
+                                        *pipe_id,
+                                        *is_read_end,
+                                        *bidirectional,
+                                        host_fd.raw(),
+                                    ),
+                                    tid,
+                                    sigpipe_on_epipe: false,
+                                },
                             )
                         };
                     }
                     OpenDescription::HostSocket { host_fd, .. } => {
                         return write_host_pipe(
                             bytes,
-                            host_fd.raw(),
-                            Some(host_fd.clone()),
-                            nonblocking,
-                            HostWriteKind::SocketLike,
-                            None,
-                            tid,
-                            false,
+                            HostPipeWriteTarget {
+                                host_fd: host_fd.raw(),
+                                host_fd_owner: Some(host_fd.clone()),
+                                nonblocking,
+                                write_kind: HostWriteKind::SocketLike,
+                                pipe_state: None,
+                                tid,
+                                sigpipe_on_epipe: false,
+                            },
                         );
                     }
                     OpenDescription::HostFile {
@@ -3217,13 +3230,15 @@ impl SyscallDispatcher {
                         }
                         return write_host_pipe(
                             bytes,
-                            host_fd.raw(),
-                            Some(host_fd.clone()),
-                            nonblocking,
-                            HostWriteKind::RegularFile,
-                            None,
-                            tid,
-                            false,
+                            HostPipeWriteTarget {
+                                host_fd: host_fd.raw(),
+                                host_fd_owner: Some(host_fd.clone()),
+                                nonblocking,
+                                write_kind: HostWriteKind::RegularFile,
+                                pipe_state: None,
+                                tid,
+                                sigpipe_on_epipe: false,
+                            },
                         );
                     }
                     OpenDescription::File {
@@ -3414,16 +3429,19 @@ impl SyscallDispatcher {
 
     fn do_renameat(
         &self,
-        olddirfd: u64,
-        oldpath: u64,
-        newdirfd: u64,
-        newpath: u64,
-        flags: u64,
+        request: RenameAtRequest,
         memory: &impl GuestMemory,
-        target_tid: Option<crate::thread::ThreadId>,
     ) -> Result<DispatchOutcome, DispatchError> {
         const RENAME_NOREPLACE: u64 = 1;
         const RENAME_EXCHANGE: u64 = 2;
+        let RenameAtRequest {
+            olddirfd,
+            oldpath,
+            newdirfd,
+            newpath,
+            flags,
+            target_tid,
+        } = request;
         let old = read_guest_c_string(memory, oldpath)?;
         let new_path = read_guest_c_string(memory, newpath)?;
         if old.is_empty() || new_path.is_empty() {
@@ -8474,19 +8492,21 @@ impl SyscallDispatcher {
                             // SIGPIPE on the writer (write05).
                             let out = write_host_pipe_owned(
                                 bytes,
-                                host_fd.raw(),
-                                Some(host_fd.clone()),
-                                nonblocking,
-                                *write_kind,
-                                this.host_pipe_capacity_state(
-                                    base,
-                                    *pipe_id,
-                                    *is_read_end,
-                                    *bidirectional,
-                                    host_fd.raw(),
-                                ),
-                                cx.tid(),
-                                true,
+                                HostPipeWriteTarget {
+                                    host_fd: host_fd.raw(),
+                                    host_fd_owner: Some(host_fd.clone()),
+                                    nonblocking,
+                                    write_kind: *write_kind,
+                                    pipe_state: this.host_pipe_capacity_state(
+                                        base,
+                                        *pipe_id,
+                                        *is_read_end,
+                                        *bidirectional,
+                                        host_fd.raw(),
+                                    ),
+                                    tid: cx.tid(),
+                                    sigpipe_on_epipe: true,
+                                },
                             );
                             // Signal-driven I/O: a write that added bytes makes the
                             // pipe's read end readable — the FASYNC readiness edge.
@@ -8507,13 +8527,15 @@ impl SyscallDispatcher {
                             // their own ENOTCONN via the host.
                             let out = write_host_pipe_owned(
                                 bytes,
-                                host_fd.raw(),
-                                Some(host_fd.clone()),
-                                nonblocking,
-                                HostWriteKind::SocketLike,
-                                None,
-                                cx.tid(),
-                                false,
+                                HostPipeWriteTarget {
+                                    host_fd: host_fd.raw(),
+                                    host_fd_owner: Some(host_fd.clone()),
+                                    nonblocking,
+                                    write_kind: HostWriteKind::SocketLike,
+                                    pipe_state: None,
+                                    tid: cx.tid(),
+                                    sigpipe_on_epipe: false,
+                                },
                             );
                             // Signal-driven I/O readiness edge on the socket peer.
                             let written = match &out {
@@ -8546,13 +8568,15 @@ impl SyscallDispatcher {
                             // kernel offset and is visible across fork.
                             return Ok(write_host_pipe_owned(
                                 bytes,
-                                host_fd.raw(),
-                                Some(host_fd.clone()),
-                                nonblocking,
-                                HostWriteKind::RegularFile,
-                                None,
-                                cx.tid(),
-                                false,
+                                HostPipeWriteTarget {
+                                    host_fd: host_fd.raw(),
+                                    host_fd_owner: Some(host_fd.clone()),
+                                    nonblocking,
+                                    write_kind: HostWriteKind::RegularFile,
+                                    pipe_state: None,
+                                    tid: cx.tid(),
+                                    sigpipe_on_epipe: false,
+                                },
                             ));
                         }
                         OpenDescription::File {
@@ -8753,13 +8777,15 @@ impl SyscallDispatcher {
                 }
                 let outcome = write_host_pipe_owned(
                     bytes,
-                    target.host_fd,
-                    target.host_fd_owner.clone(),
-                    nonblocking,
-                    target.write_kind,
-                    target.pipe_state,
-                    cx.tid(),
-                    target.sigpipe_on_epipe,
+                    HostPipeWriteTarget {
+                        host_fd: target.host_fd,
+                        host_fd_owner: target.host_fd_owner.clone(),
+                        nonblocking,
+                        write_kind: target.write_kind,
+                        pipe_state: target.pipe_state,
+                        tid: cx.tid(),
+                        sigpipe_on_epipe: target.sigpipe_on_epipe,
+                    },
                 );
                 return if target.sigpipe_on_epipe {
                     Ok(this.raise_sigpipe_on_epipe(cx, outcome))
@@ -8824,32 +8850,36 @@ impl SyscallDispatcher {
                                 }
                                 outcome = write_host_pipe_owned(
                                     bytes,
-                                    host_fd.raw(),
-                                    Some(host_fd.clone()),
-                                    nonblocking,
-                                    *write_kind,
-                                    this.host_pipe_capacity_state(
-                                        base,
-                                        *pipe_id,
-                                        *is_read_end,
-                                        *bidirectional,
-                                        host_fd.raw(),
-                                    ),
-                                    cx.tid(),
-                                    true,
+                                    HostPipeWriteTarget {
+                                        host_fd: host_fd.raw(),
+                                        host_fd_owner: Some(host_fd.clone()),
+                                        nonblocking,
+                                        write_kind: *write_kind,
+                                        pipe_state: this.host_pipe_capacity_state(
+                                            base,
+                                            *pipe_id,
+                                            *is_read_end,
+                                            *bidirectional,
+                                            host_fd.raw(),
+                                        ),
+                                        tid: cx.tid(),
+                                        sigpipe_on_epipe: true,
+                                    },
                                 );
                                 writeback = None;
                             }
                             OpenDescription::HostSocket { host_fd, .. } => {
                                 outcome = write_host_pipe_owned(
                                     bytes,
-                                    host_fd.raw(),
-                                    Some(host_fd.clone()),
-                                    nonblocking,
-                                    HostWriteKind::SocketLike,
-                                    None,
-                                    cx.tid(),
-                                    false,
+                                    HostPipeWriteTarget {
+                                        host_fd: host_fd.raw(),
+                                        host_fd_owner: Some(host_fd.clone()),
+                                        nonblocking,
+                                        write_kind: HostWriteKind::SocketLike,
+                                        pipe_state: None,
+                                        tid: cx.tid(),
+                                        sigpipe_on_epipe: false,
+                                    },
                                 );
                                 writeback = None;
                             }
@@ -8871,13 +8901,15 @@ impl SyscallDispatcher {
                                 }
                                 outcome = write_host_pipe_owned(
                                     bytes,
-                                    host_fd.raw(),
-                                    Some(host_fd.clone()),
-                                    nonblocking,
-                                    HostWriteKind::RegularFile,
-                                    None,
-                                    cx.tid(),
-                                    false,
+                                    HostPipeWriteTarget {
+                                        host_fd: host_fd.raw(),
+                                        host_fd_owner: Some(host_fd.clone()),
+                                        nonblocking,
+                                        write_kind: HostWriteKind::RegularFile,
+                                        pipe_state: None,
+                                        tid: cx.tid(),
+                                        sigpipe_on_epipe: false,
+                                    },
                                 );
                                 writeback = None;
                             }
@@ -9756,13 +9788,15 @@ impl SyscallDispatcher {
         fn renameat(this, cx, olddirfd: u64, oldpath: GuestPtr, newdirfd: u64, newpath: GuestPtr) {
 
             this.do_renameat(
+                RenameAtRequest {
                 olddirfd,
-                oldpath.0,
+                    oldpath: oldpath.0,
                 newdirfd,
-                newpath.0,
-                0,
+                    newpath: newpath.0,
+                    flags: 0,
+                    target_tid: Some(cx.tid()),
+                },
                 &*cx.memory,
-                Some(cx.tid()),
             )
 
         }
@@ -9791,13 +9825,15 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             this.do_renameat(
+                RenameAtRequest {
                 olddirfd,
-                oldpath.0,
+                    oldpath: oldpath.0,
                 newdirfd,
-                newpath.0,
+                    newpath: newpath.0,
                 flags,
+                    target_tid: Some(cx.tid()),
+                },
                 &*cx.memory,
-                Some(cx.tid()),
             )
 
         }
