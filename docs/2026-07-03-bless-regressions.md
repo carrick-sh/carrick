@@ -8,8 +8,8 @@
 Updated 2026-07-04. This section is the working ledger; use it before choosing
 the next cluster so we do not repeat already-verified current-tree work. Evidence
 below is from focused `just conformance full --workers 1 ... --flake-retries 0`
-runs unless noted. No `known_gaps`, baseline, or oracle-cache edits are part of
-this closeout.
+runs unless noted. No `known_gaps` or baseline edits are part of this closeout;
+oracle-cache edits are only used when the suite declaration itself changed.
 
 ### Closed on current tree
 
@@ -27,6 +27,14 @@ this closeout.
 - `ltp-add_key*` / `ltp-keyctl*`: `ltp-add_key01` through `ltp-add_key04` and
   `ltp-keyctl01`, `ltp-keyctl03`, `ltp-keyctl04`, `ltp-keyctl05`,
   `ltp-keyctl06`, `ltp-keyctl07`, `ltp-keyctl08` all MATCH.
+- `ltp-clone301`, `ltp-clone302`, `ltp-clone303` all MATCH after running
+  clone301/302's Docker oracle with seccomp disabled so the tests exercise
+  clone3 instead of Docker's default ENOSYS filter. Root causes fixed:
+  clone3 now rejects malformed size/flag/exit-signal/pidfd combinations before
+  forking, and child-exit signal publication handles already-waitable children
+  when arming the HVF watch or returning from terminal `wait4`. Red-first:
+  `clone3args` DIFFed on the malformed cases and pre-fix `ltp-clone302`
+  regressed at carrick[6/12] vs oracle[12/12].
 - `ltp-mq*`: `ltp-mq_notify01`, `ltp-mq_notify02`, `ltp-mq_notify03`,
   `ltp-mq_open01`, `ltp-mq_timedreceive01`, `ltp-mq_timedsend01`,
   `ltp-mq_unlink01` all MATCH.
