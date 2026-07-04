@@ -70,6 +70,7 @@ syscall_table! {
     231 => munlockall,
     232 => mincore,
     233 => madvise,
+    234 => remap_file_pages,
     425 => io_uring_setup,
     426 => io_uring_enter,
     427 => io_uring_register,
@@ -121,6 +122,11 @@ pub(super) struct MemState {
     /// VMAs Linux would have installed inside those arenas with their actual
     /// permissions and private/shared bit.
     pub dynamic_maps: Vec<ProcMapsEntry>,
+    /// Original bytes for mappings that have used remap_file_pages(2). Carrick's
+    /// low fixed MAP_SHARED path is byte-backed guest memory rather than a live
+    /// nonlinear VM object, so remap_file_pages copies windows from this stable
+    /// image instead of from already-rearranged bytes.
+    pub remap_snapshots: std::collections::HashMap<u64, Vec<u8>>,
     /// Ranges inside mapped files where Linux delivers SIGBUS on access: pages
     /// wholly beyond the backing file's EOF for a MAP_SHARED file mapping.
     pub bus_fault_ranges: Vec<(u64, u64)>,
@@ -153,6 +159,7 @@ impl MemState {
             free_regions: Vec::new(),
             address_space_regions: None,
             dynamic_maps: Vec::new(),
+            remap_snapshots: std::collections::HashMap::new(),
             bus_fault_ranges: Vec::new(),
             growdown_ranges: Vec::new(),
             linux_auxv_image: Vec::new(),
@@ -314,6 +321,7 @@ impl SyscallDispatcher {
         let (read, write, execute) = prot_to_proc_perms(prot);
         let mut mem = self.mem.lock();
         trim_dynamic_maps_for_range(&mut mem.dynamic_maps, start, len);
+        mem.remap_snapshots.remove(&start);
         mem.dynamic_maps.push(ProcMapsEntry {
             start,
             end,
@@ -327,7 +335,18 @@ impl SyscallDispatcher {
     }
 
     fn remove_dynamic_mapping(&self, start: u64, len: u64) {
-        trim_dynamic_maps_for_range(&mut self.mem.lock().dynamic_maps, start, len);
+        let mut mem = self.mem.lock();
+        trim_dynamic_maps_for_range(&mut mem.dynamic_maps, start, len);
+        if start.checked_add(len).is_none() {
+            mem.remap_snapshots.clear();
+            return;
+        }
+        mem.remap_snapshots.retain(|snapshot_start, bytes| {
+            let snapshot_end = snapshot_start
+                .checked_add(bytes.len() as u64)
+                .unwrap_or(u64::MAX);
+            !ranges_overlap(start, len, *snapshot_start, snapshot_end)
+        });
     }
 
     pub(in crate::dispatch) fn record_mmap_bus_fault_range(&self, start: u64, len: u64) {
@@ -1700,6 +1719,71 @@ impl SyscallDispatcher {
                 }
             }
             Ok(DispatchOutcome::Returned { value: 0 })
+        }
+
+        fn remap_file_pages(this, cx, addr: u64, size: u64, prot: u64, pgoff: u64, _flags: u64) {
+            if addr == 0 || size == 0 || prot != 0 {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
+            let Some(end) = addr.checked_add(size) else {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            };
+            match this.note_sysv_remap_file_pages(addr, end) {
+                Ok(true) => return Ok(DispatchOutcome::Returned { value: 0 }),
+                Ok(false) => {}
+                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+            }
+            let shared_map = {
+                this.mem
+                    .lock()
+                    .dynamic_maps
+                    .iter()
+                    .find(|map| map.sharing == ProcMapSharing::Shared && addr >= map.start && end <= map.end)
+                    .cloned()
+            };
+            if let Some(map) = shared_map {
+                let map_len = map.end.saturating_sub(map.start);
+                let snapshot = {
+                    let mut mem = this.mem.lock();
+                    if let Some(snapshot) = mem.remap_snapshots.get(&map.start) {
+                        snapshot.clone()
+                    } else {
+                        let Ok(map_len_usize) = usize::try_from(map_len) else {
+                            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                        };
+                        let Ok(bytes) = cx.memory.read_bytes(map.start, map_len_usize) else {
+                            return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                        };
+                        mem.remap_snapshots.insert(map.start, bytes.clone());
+                        bytes
+                    }
+                };
+                let source_offset = match pgoff
+                    .checked_mul(LINUX_PAGE_SIZE)
+                    .and_then(|off| usize::try_from(off).ok())
+                {
+                    Some(off) => off,
+                    None => return Ok(DispatchOutcome::errno(LINUX_EINVAL)),
+                };
+                let size_usize = match usize::try_from(size) {
+                    Ok(size) => size,
+                    Err(_) => return Ok(DispatchOutcome::errno(LINUX_EINVAL)),
+                };
+                let Some(source_end) = source_offset.checked_add(size_usize) else {
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                };
+                let Some(bytes) = snapshot.get(source_offset..source_end) else {
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                };
+                if cx.memory.write_bytes(addr, bytes).is_err() {
+                    return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                }
+                return Ok(DispatchOutcome::Returned { value: 0 });
+            }
+            // Linux rejects remap_file_pages for addresses that are not in a
+            // MAP_SHARED mapping; carrick does not emulate nonlinear remapping, so
+            // the valid no-op path is limited to ranges that already identify one.
+            Ok(DispatchOutcome::errno(LINUX_EINVAL))
         }
 
         fn sys_membarrier(this, cx, command: u64, flags: u64) {
