@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 const FUTEX_WAIT: libc::c_int = 0;
 const FUTEX_WAKE: libc::c_int = 1;
-const FUTEX_PRIVATE_FLAG: libc::c_int = 128;
+const FUTEX_PRIVATE_FLAG: libc::c_int = 0;
 
 static WORD: AtomicU32 = AtomicU32::new(0);
 static WAITER_TID: AtomicI32 = AtomicI32::new(0);
@@ -34,8 +34,8 @@ unsafe fn futex_wake_private(uaddr: *mut u32, n: u32) -> libc::c_long {
     )
 }
 
-fn stat_state(tid: i32) -> Option<char> {
-    let stat = std::fs::read_to_string(format!("/proc/{tid}/stat")).ok()?;
+fn stat_state(path: &str) -> Option<char> {
+    let stat = std::fs::read_to_string(path).ok()?;
     let rparen = stat.rfind(')')?;
     stat[rparen + 1..].split_whitespace().next()?.chars().next()
 }
@@ -65,11 +65,16 @@ fn main() {
         std::thread::sleep(Duration::from_millis(1));
     };
 
+    let tgid = std::process::id();
+    let direct_path = format!("/proc/{tid}/stat");
+    let task_path = format!("/proc/{tgid}/task/{tid}/stat");
     let state_deadline = Instant::now() + Duration::from_secs(2);
-    let mut state = None;
+    let mut direct_state = None;
+    let mut task_state = None;
     while Instant::now() < state_deadline {
-        state = stat_state(tid);
-        if state == Some('S') {
+        direct_state = stat_state(&direct_path);
+        task_state = stat_state(&task_path);
+        if direct_state == Some('S') && task_state == Some('S') {
             break;
         }
         std::thread::sleep(Duration::from_millis(1));
@@ -80,7 +85,11 @@ fn main() {
     let joined = waiter.join().is_ok();
 
     println!("waiter_tid_known=true");
-    println!("waiter_state={}", state.unwrap_or('?'));
-    println!("waiter_state_is_sleeping={}", state == Some('S'));
+    println!("waiter_direct_state={}", direct_state.unwrap_or('?'));
+    println!("waiter_task_state={}", task_state.unwrap_or('?'));
+    println!(
+        "waiter_state_is_sleeping={}",
+        direct_state == Some('S') && task_state == Some('S')
+    );
     println!("waiter_joined={joined}");
 }
