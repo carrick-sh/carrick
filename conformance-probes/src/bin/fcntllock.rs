@@ -19,6 +19,10 @@
 //!      returns l_type=F_UNLCK (no conflict).
 //!   4. **Unlock releases**: after the parent F_UNLCKs, the child's F_SETLK
 //!      on [0,10) succeeds.
+//!   5. **Closing any same-file fd releases classic locks**: parent locks a
+//!      range, dup(2)s the fd, closes the dup, and a child can then lock that
+//!      same range. This is Linux's process-associated POSIX lock lifetime and
+//!      stands in for LTP fcntl15's dup case.
 //!
 //! Deterministic booleans; the child reports via a pipe; bounded so a broken
 //! lock path prints false, never hangs.
@@ -198,6 +202,48 @@ fn main() {
         report!(
             parent_unlock_ok = unlock_ok,
             child_relock_after_unlock_ok = got2 && b2 == 1,
+        );
+
+        let mut close_lock = mk(F_WRLCK, 200, 10);
+        let parent_close_lock_ok = flock_op(fd, F_SETLK, &mut close_lock) == 0;
+        let dup_fd = libc::dup(fd);
+        let dup_close_ok = dup_fd >= 0 && libc::close(dup_fd) == 0;
+
+        let mut pipefd3 = [0i32; 2];
+        libc::pipe(pipefd3.as_mut_ptr());
+        let pid3 = libc::fork();
+        if pid3 == 0 {
+            libc::close(pipefd3[0]);
+            let cfd = libc::open(path.as_ptr() as *const libc::c_char, libc::O_RDWR);
+            let mut cl = mk(F_WRLCK, 200, 10);
+            let rc = flock_op(cfd, F_SETLK, &mut cl);
+            let ok = (rc == 0) as u8;
+            libc::write(pipefd3[1], &ok as *const u8 as *const libc::c_void, 1);
+            libc::close(pipefd3[1]);
+            libc::_exit(0);
+        }
+        libc::close(pipefd3[1]);
+        let mut b3 = 0u8;
+        let mut got3 = false;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            let n = libc::read(pipefd3[0], &mut b3 as *mut u8 as *mut libc::c_void, 1);
+            if n == 1 {
+                got3 = true;
+                break;
+            }
+            if n <= 0 {
+                break;
+            }
+        }
+        libc::close(pipefd3[0]);
+        let mut st3 = 0i32;
+        libc::waitpid(pid3, &mut st3, 0);
+
+        report!(
+            parent_close_lock_ok = parent_close_lock_ok,
+            dup_close_ok = dup_close_ok,
+            child_relock_after_dup_close_ok = got3 && b3 == 1,
         );
 
         let _ = F_RDLCK;
