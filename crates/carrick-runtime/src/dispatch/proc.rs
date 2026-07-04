@@ -2318,10 +2318,12 @@ impl SyscallDispatcher {
             // A ptraced child can become waitable for a signal-delivery stop
             // even without WUNTRACED. EVFILT_PROC/NOTE_EXIT would sleep past
             // that stop, so let Darwin's wait4 observe a published pending stop.
-            let can_park_on_proc_exit = host_target > 0
+            let has_pending_ptrace_stop = host_target > 0
+                && crate::guest_cpu::child_has_ptrace_stop_pending(host_target as u32);
+            let can_park_on_proc_exit = (host_target > 0 || host_target == -1)
                 && host_options & libc::WNOHANG == 0
                 && !options.intersects(LinuxWaitOptions::WUNTRACED | LinuxWaitOptions::WCONTINUED)
-                && !crate::guest_cpu::child_has_ptrace_stop_pending(host_target as u32);
+                && !has_pending_ptrace_stop;
             let result = if can_park_on_proc_exit {
                 let r = loop {
                     let r = unsafe {
@@ -2438,8 +2440,16 @@ impl SyscallDispatcher {
                     return Ok(DispatchOutcome::errno(errno));
                 }
             };
-            if result == 0 {
+            if result == 0 && host_options & libc::WNOHANG != 0 {
                 return Ok(DispatchOutcome::Returned { value: 0 });
+            }
+            if result == 0 {
+                let tid = Self::ctx_tid(cx);
+                let non_interrupting = this.non_interrupting_signal_mask(tid);
+                return Ok(DispatchOutcome::WaitOnProcExit {
+                    pid: host_target,
+                    sig_mask: carrick_abi::WaitSigMask::Additive(non_interrupting),
+                });
             }
             if host_wait_status_is_stopped_by(host_status, LINUX_SIGKILL) {
                 crate::guest_cpu::clear_child_ptrace_stop_pending(result as u32);
@@ -2493,6 +2503,21 @@ impl SyscallDispatcher {
                 // on KVM/HVF. `result` is the reaped HOST pid.
                 carrick_hal::vm_backend::reap_child_vm(result as u32);
             }
+            let ns_result = crate::namespace::pid::host_to_ns(result as u32);
+            if crate::namespace::pid::enabled() && host_target <= 0 && ns_result.is_none() {
+                if terminal_reap {
+                    crate::namespace::pid::unregister_reaped(result as u32);
+                }
+                if host_options & libc::WNOHANG != 0 {
+                    return Ok(DispatchOutcome::Returned { value: 0 });
+                }
+                let tid = Self::ctx_tid(cx);
+                let non_interrupting = this.non_interrupting_signal_mask(tid);
+                return Ok(DispatchOutcome::WaitOnProcExit {
+                    pid: host_target,
+                    sig_mask: carrick_abi::WaitSigMask::Additive(non_interrupting),
+                });
+            }
             let tv_us = |t: libc::timeval| t.tv_sec as u64 * 1_000_000 + t.tv_usec as u64;
             let child_guest_us = crate::guest_cpu::reap_child_guest_ns(result as u32) / 1000;
             let child_user_us = child_guest_us + tv_us(host_rusage.ru_utime);
@@ -2515,7 +2540,7 @@ impl SyscallDispatcher {
             // PID namespace (§5.3): the guest must see the reaped child's
             // ns-local pid, not its host pid — critical for `wait4(-1)` where
             // the arg was never translated. Identity when namespaces are off.
-            let ns_result = crate::namespace::pid::host_to_ns_or_self(result as u32);
+            let ns_result = ns_result.unwrap_or(result as u32);
             if terminal_reap {
                 crate::namespace::pid::unregister_reaped(result as u32);
             }
