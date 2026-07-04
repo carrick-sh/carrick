@@ -3072,6 +3072,7 @@ pub const LINUX_PR_GET_NAME: u64 = 16;
 /// (docs/namespaces-design.md §4.4); not enforced, but libcap tools query them.
 pub const LINUX_PR_CAPBSET_READ: u64 = 23;
 pub const LINUX_PR_CAPBSET_DROP: u64 = 24;
+pub const LINUX_PR_SET_SECUREBITS: u64 = 28;
 /// `prctl(PR_GET_KEEPCAPS)` / `PR_SET_KEEPCAPS` — preserve capabilities across a
 /// uid transition that would otherwise clear them. Recorded and echoed back.
 pub const LINUX_PR_GET_KEEPCAPS: u64 = 7;
@@ -3103,6 +3104,23 @@ pub const LINUX_PR_GET_CHILD_SUBREAPER: u64 = 37;
 /// `arg2 == 1` and `arg3..arg5 == 0`; `GET` returns the bit as the return value.
 pub const LINUX_PR_SET_NO_NEW_PRIVS: u64 = 38;
 pub const LINUX_PR_GET_NO_NEW_PRIVS: u64 = 39;
+/// Transparent hugepage enable/disable state. Carrick has no THP backing, but
+/// the valid forms are recognized so feature probes can exercise their errno
+/// paths instead of treating the option as unsupported.
+pub const LINUX_PR_SET_THP_DISABLE: u64 = 41;
+pub const LINUX_PR_GET_THP_DISABLE: u64 = 42;
+/// Ambient capability prctl sub-API (`prctl(PR_CAP_AMBIENT, subcmd, cap, ...)`).
+pub const LINUX_PR_CAP_AMBIENT: u64 = 47;
+pub const LINUX_PR_CAP_AMBIENT_IS_SET: u64 = 1;
+pub const LINUX_PR_CAP_AMBIENT_RAISE: u64 = 2;
+pub const LINUX_PR_CAP_AMBIENT_LOWER: u64 = 3;
+pub const LINUX_PR_CAP_AMBIENT_CLEAR_ALL: u64 = 4;
+/// Speculation-control query API. Carrick records no mitigations, but supports
+/// the valid selectors so invalid selector/argument errno checks run.
+pub const LINUX_PR_GET_SPECULATION_CTRL: u64 = 52;
+pub const LINUX_PR_SPEC_STORE_BYPASS: u64 = 0;
+pub const LINUX_PR_SPEC_INDIRECT_BRANCH: u64 = 1;
+pub const LINUX_PR_SPEC_L1D_FLUSH: u64 = 2;
 /// `prctl(PR_GET_MEM_MODEL, …)` / `prctl(PR_SET_MEM_MODEL, …)` — query or set
 /// the CPU memory-ordering model. Apple Rosetta 2 issues
 /// `PR_SET_MEM_MODEL(PR_SET_MEM_MODEL_TSO)` at startup to request hardware

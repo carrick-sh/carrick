@@ -32,6 +32,8 @@ pub const DOCKER_DEFAULT_CAPS: u64 = 0x0000_0000_a804_25fb;
 /// `capabilities(7)`; mirrors `LINUX_CAP_LAST_CAP`). A full set is all bits
 /// `0..=CAP_LAST_CAP`.
 pub const CAP_LAST_CAP: u32 = 40;
+pub const CAP_SETPCAP: u32 = 8;
+pub const CAP_SYS_ADMIN: u32 = 21;
 
 /// A full capability set over the modeled range — what the creator of a fresh
 /// user namespace holds within it (design §4.1, §4.4).
@@ -188,6 +190,44 @@ pub fn capbset_drop(cap: u32) {
         return;
     }
     store().lock().caps.bounding &= !(1u64 << cap);
+}
+
+pub fn has_effective_cap(cap: u32) -> bool {
+    if cap > 63 {
+        return false;
+    }
+    store().lock().caps.effective & (1u64 << cap) != 0
+}
+
+pub fn cap_ambient_is_set(cap: u32) -> bool {
+    if cap > 63 {
+        return false;
+    }
+    store().lock().caps.ambient & (1u64 << cap) != 0
+}
+
+pub fn cap_ambient_lower(cap: u32) {
+    if cap > 63 {
+        return;
+    }
+    store().lock().caps.ambient &= !(1u64 << cap);
+}
+
+pub fn cap_ambient_clear_all() {
+    store().lock().caps.ambient = 0;
+}
+
+pub fn cap_ambient_raise(cap: u32) -> bool {
+    if cap > 63 {
+        return false;
+    }
+    let bit = 1u64 << cap;
+    let mut g = store().lock();
+    if g.caps.permitted & bit == 0 || g.caps.inheritable & bit == 0 {
+        return false;
+    }
+    g.caps.ambient |= bit;
+    true
 }
 
 /// Is the current process privileged for *map-writing* purposes in its current

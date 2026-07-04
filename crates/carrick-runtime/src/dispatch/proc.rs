@@ -636,6 +636,14 @@ impl SyscallDispatcher {
         let Some(prog) = crate::seccomp::SockFilter::parse_program(&prog_bytes) else {
             return DispatchOutcome::errno(LINUX_EINVAL);
         };
+        let no_new_privs = self.proc.lock().no_new_privs;
+        if !no_new_privs
+            && !crate::namespace::process::has_effective_cap(
+                crate::namespace::process::CAP_SYS_ADMIN,
+            )
+        {
+            return DispatchOutcome::errno(LINUX_EACCES);
+        }
         self.seccomp.install(prog);
         self.disable_identity_syscall_shim(memory);
         DispatchOutcome::Returned { value: 0 }
@@ -1015,7 +1023,20 @@ impl SyscallDispatcher {
                     if arg2 > 63 {
                         return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                     }
+                    if !crate::namespace::process::has_effective_cap(
+                        crate::namespace::process::CAP_SETPCAP,
+                    ) {
+                        return Ok(DispatchOutcome::errno(LINUX_EPERM));
+                    }
                     crate::namespace::process::capbset_drop(arg2 as u32);
+                    DispatchOutcome::Returned { value: 0 }
+                }
+                LINUX_PR_SET_SECUREBITS => {
+                    if !crate::namespace::process::has_effective_cap(
+                        crate::namespace::process::CAP_SETPCAP,
+                    ) {
+                        return Ok(DispatchOutcome::errno(LINUX_EPERM));
+                    }
                     DispatchOutcome::Returned { value: 0 }
                 }
                 // PR_SET_NO_NEW_PRIVS: arg2 must be 1, arg3..arg5 must be 0
@@ -1073,6 +1094,77 @@ impl SyscallDispatcher {
                 LINUX_PR_GET_TIMERSLACK => DispatchOutcome::Returned {
                     value: this.proc.lock().timerslack as i64,
                 },
+                LINUX_PR_SET_THP_DISABLE => {
+                    if arg2 > 1 || arg3 != 0 || arg4 != 0 || arg5 != 0 {
+                        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                    }
+                    DispatchOutcome::Returned { value: 0 }
+                }
+                LINUX_PR_GET_THP_DISABLE => {
+                    if arg2 != 0 || arg3 != 0 || arg4 != 0 || arg5 != 0 {
+                        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                    }
+                    DispatchOutcome::Returned { value: 0 }
+                }
+                LINUX_PR_CAP_AMBIENT => match arg2 {
+                    LINUX_PR_CAP_AMBIENT_IS_SET => {
+                        if arg3 > crate::namespace::process::CAP_LAST_CAP as u64
+                            || arg4 != 0
+                            || arg5 != 0
+                        {
+                            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                        }
+                        DispatchOutcome::Returned {
+                            value: i64::from(crate::namespace::process::cap_ambient_is_set(
+                                arg3 as u32,
+                            )),
+                        }
+                    }
+                    LINUX_PR_CAP_AMBIENT_RAISE => {
+                        if arg3 > crate::namespace::process::CAP_LAST_CAP as u64
+                            || arg4 != 0
+                            || arg5 != 0
+                        {
+                            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                        }
+                        if !crate::namespace::process::cap_ambient_raise(arg3 as u32) {
+                            return Ok(DispatchOutcome::errno(LINUX_EPERM));
+                        }
+                        DispatchOutcome::Returned { value: 0 }
+                    }
+                    LINUX_PR_CAP_AMBIENT_LOWER => {
+                        if arg3 > crate::namespace::process::CAP_LAST_CAP as u64
+                            || arg4 != 0
+                            || arg5 != 0
+                        {
+                            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                        }
+                        crate::namespace::process::cap_ambient_lower(arg3 as u32);
+                        DispatchOutcome::Returned { value: 0 }
+                    }
+                    LINUX_PR_CAP_AMBIENT_CLEAR_ALL => {
+                        if arg3 != 0 || arg4 != 0 || arg5 != 0 {
+                            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                        }
+                        crate::namespace::process::cap_ambient_clear_all();
+                        DispatchOutcome::Returned { value: 0 }
+                    }
+                    _ => DispatchOutcome::errno(LINUX_EINVAL),
+                },
+                LINUX_PR_GET_SPECULATION_CTRL => {
+                    if !matches!(
+                        arg2,
+                        LINUX_PR_SPEC_STORE_BYPASS
+                            | LINUX_PR_SPEC_INDIRECT_BRANCH
+                            | LINUX_PR_SPEC_L1D_FLUSH
+                    ) || arg3 != 0
+                        || arg4 != 0
+                        || arg5 != 0
+                    {
+                        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                    }
+                    DispatchOutcome::Returned { value: 0 }
+                }
                 // PR_SET_SECCOMP(SECCOMP_MODE_FILTER, prog) is the legacy entry
                 // point for the same cBPF install as seccomp(2). STRICT mode is
                 // accepted as a no-op record (not differentiated). arg2 is the
