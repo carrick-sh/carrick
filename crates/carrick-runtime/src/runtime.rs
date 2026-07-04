@@ -1158,6 +1158,19 @@ where
                 runtime.complete_syscall(retval)?;
                 last_syscall_retval = Some(retval);
             }
+            DispatchOutcome::SharedFutexWaitv {
+                location,
+                waiter_key,
+                value,
+                timeout,
+                index,
+            } => {
+                let retval =
+                    shared_futex_wait(location.wait_addr(), waiter_key, value, timeout, this_tid);
+                let retval = if retval == 0 { index } else { retval };
+                runtime.complete_syscall(retval)?;
+                last_syscall_retval = Some(retval);
+            }
             DispatchOutcome::SharedFutexWake {
                 location,
                 waiter_key,
@@ -1170,10 +1183,31 @@ where
                 runtime.complete_syscall(retval)?;
                 last_syscall_retval = Some(retval);
             }
+            DispatchOutcome::SharedFutexRequeue {
+                from,
+                from_key,
+                to,
+                to_key,
+                wake,
+                requeue,
+            } => {
+                let (woken, requeued) = crate::ulock::requeue_counted(
+                    from.wait_addr().raw(),
+                    from_key,
+                    to.wait_addr().raw(),
+                    to_key,
+                    wake,
+                    requeue,
+                );
+                let retval = i64::from(woken + requeued);
+                runtime.complete_syscall(retval)?;
+                last_syscall_retval = Some(retval);
+            }
             DispatchOutcome::CloneThread { .. }
             | DispatchOutcome::ThreadExit { .. }
             | DispatchOutcome::SignalThread { .. }
-            | DispatchOutcome::FutexWait { .. } => {
+            | DispatchOutcome::FutexWait { .. }
+            | DispatchOutcome::FutexWaitv { .. } => {
                 // These are emitted only on the multi-threaded
                 // `dispatch_threaded` path (run_vcpu_until_exit). The
                 // single-threaded loops here always pass `thread: None`, so

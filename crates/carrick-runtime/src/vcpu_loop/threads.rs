@@ -22,21 +22,37 @@ where
         wait: crate::thread::FutexWait,
         timeout: Option<Duration>,
     ) -> Result<i64, RuntimeError> {
+        self.complete_futex_wait_with_value(engine, wait, timeout, 0)
+    }
+
+    pub(super) fn complete_futex_waitv(
+        &self,
+        engine: &mut E,
+        wait: crate::thread::FutexWait,
+        timeout: Option<Duration>,
+        index: i64,
+    ) -> Result<i64, RuntimeError> {
+        self.complete_futex_wait_with_value(engine, wait, timeout, index)
+    }
+
+    fn complete_futex_wait_with_value(
+        &self,
+        engine: &mut E,
+        wait: crate::thread::FutexWait,
+        timeout: Option<Duration>,
+        woken_value: i64,
+    ) -> Result<i64, RuntimeError> {
         use crate::thread::FutexWaitOutcome;
 
         let retval: i64 = loop {
             // M:N reclaim-on-block: free this thread's vCPU slot for the duration of
             // the blocking wait so another guest thread can run on it, restoring this
-            // thread's state into a (possibly different) slot on wake. Only when the
-            // backend reclaims (bhyve); a no-op on HVF/KVM (Phase 1 lifetime-bind).
-            // Reclaim (free this vCPU) when the backend reclaims AND either someone
-            // is already waiting OR there is no spare slot — parking with a full pool
-            // would let a future waiter starve (the parked thread is stuck at, e.g.,
-            // a barrier it can only leave once that waiter runs). With spare capacity
-            // and no waiter, PARK (keep the vCPU) — the fast path.
-            let reclaim_now = engine.reclaims()
-                && (carrick_hal::vcpu_sched::global().has_waiters()
-                    || !carrick_hal::vcpu_sched::global().has_spare_capacity());
+            // thread's state into a (possibly different) slot on wake. Reclaim every
+            // genuine futex block on reclaiming backends: tests and real runtimes
+            // commonly spawn a set of waiters and then poll until all are asleep, so
+            // early waiters must not keep scarce HVF slots merely because capacity
+            // was still spare at the instant they parked.
+            let reclaim_now = engine.reclaims();
             let snapshot = if reclaim_now {
                 let st = engine.save_guest_state();
                 let old_slot = carrick_hal::vcpu_sched::current_slot();
@@ -159,7 +175,7 @@ where
                 crate::probes::mn_reclaim(self.this_tid.raw(), slot, slot, 0);
             }
             let outcome = match raw {
-                FutexWaitOutcome::Woken => 0,
+                FutexWaitOutcome::Woken => woken_value,
                 FutexWaitOutcome::TimedOut => crate::linux_abi::LINUX_ETIMEDOUT.guest_retval(),
                 FutexWaitOutcome::Interrupted if crate::fork_quiesce::is_quiescing() => {
                     self.release_and_park_vcpu_for_fork(engine)?;
@@ -180,12 +196,57 @@ where
         value: u32,
         timeout: Option<Duration>,
     ) -> Result<i64, RuntimeError> {
+        self.complete_shared_futex_wait_with_value(engine, location, waiter_key, value, timeout, 0)
+    }
+
+    pub(super) fn complete_shared_futex_waitv(
+        &self,
+        engine: &mut E,
+        location: carrick_guest_mem::SharedFutexLocation,
+        waiter_key: usize,
+        value: u32,
+        timeout: Option<Duration>,
+        index: i64,
+    ) -> Result<i64, RuntimeError> {
+        self.complete_shared_futex_wait_with_value(
+            engine, location, waiter_key, value, timeout, index,
+        )
+    }
+
+    fn complete_shared_futex_wait_with_value(
+        &self,
+        engine: &mut E,
+        location: carrick_guest_mem::SharedFutexLocation,
+        waiter_key: usize,
+        value: u32,
+        timeout: Option<Duration>,
+        woken_value: i64,
+    ) -> Result<i64, RuntimeError> {
         let interrupted = || {
             crate::host_signal::has_pending_for(self.this_tid.raw())
                 || crate::fork_quiesce::is_quiescing()
                 || crate::fork_quiesce::exec_replacing_other_thread(self.this_tid)
         };
         let retval = loop {
+            let single_threaded_process = self.registry.live_count() == 1;
+            let snapshot = if engine.reclaims() {
+                let st = if single_threaded_process {
+                    engine.save_shared_wait_state()
+                } else {
+                    engine.save_guest_state()
+                };
+                let old_slot = carrick_hal::vcpu_sched::current_slot();
+                if let Some(l) = carrick_hal::vcpu_sched::take_current_lease() {
+                    carrick_hal::vcpu_sched::global()
+                        .release(l, carrick_hal::vcpu_sched::Yield::Blocked);
+                }
+                if engine.reclaim_refreshes_kicker() {
+                    self.kicker.unregister(self.this_tid);
+                }
+                Some((st, old_slot))
+            } else {
+                None
+            };
             // Genuine guest block (cross-process MAP_SHARED FUTEX_WAIT).
             crate::run_state::publish(crate::run_state::RunState::Blocked);
             crate::thread::set_current_thread_state(self.this_tid, 'S');
@@ -201,6 +262,69 @@ where
                 self.this_tid.raw(),
                 crate::run_state::RunState::Running,
             );
+            if let Some((st, old_slot)) = snapshot {
+                let mut kicker_dropped = engine.reclaim_refreshes_kicker();
+                let new = loop {
+                    if let Some(l) = carrick_hal::vcpu_sched::global().acquire_timeout(
+                        self.this_tid.raw() as u64,
+                        old_slot,
+                        Duration::from_millis(50),
+                    ) {
+                        break l;
+                    }
+                    if crate::fork_quiesce::is_quiescing() {
+                        if !kicker_dropped {
+                            self.kicker.unregister(self.this_tid);
+                            kicker_dropped = true;
+                        }
+                        fork_barrier().park_if_quiescing();
+                    }
+                };
+                carrick_hal::vcpu_sched::set_current_lease(new);
+                if engine.reclaim_refreshes_kicker() {
+                    let _topo = crate::fork_quiesce::topology_lock()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    if single_threaded_process {
+                        engine
+                            .rebind_shared_wait_state(new.slot, &st)
+                            .map_err(RuntimeError::Trap)?;
+                    } else {
+                        engine
+                            .rebind_to_slot(new.slot, &st)
+                            .map_err(RuntimeError::Trap)?;
+                    }
+                    let handle: Box<dyn carrick_hal::VcpuKickDyn> = Box::new(engine.kick_handle());
+                    self.kicker.register(self.this_tid, handle);
+                } else {
+                    if crate::fork_quiesce::is_quiescing() {
+                        if !kicker_dropped {
+                            self.kicker.unregister(self.this_tid);
+                            kicker_dropped = true;
+                        }
+                        fork_barrier().park_if_quiescing();
+                    }
+                    if kicker_dropped {
+                        self.register_vcpu(engine);
+                    }
+                    if single_threaded_process {
+                        engine
+                            .rebind_shared_wait_state(new.slot, &st)
+                            .map_err(RuntimeError::Trap)?;
+                    } else {
+                        engine
+                            .rebind_to_slot(new.slot, &st)
+                            .map_err(RuntimeError::Trap)?;
+                    }
+                }
+                let prev = old_slot.unwrap_or(new.slot);
+                crate::probes::mn_reclaim(
+                    self.this_tid.raw(),
+                    prev,
+                    new.slot,
+                    if new.slot == prev { 1 } else { 2 },
+                );
+            }
             if retval == crate::linux_abi::LINUX_EINTR.guest_retval()
                 && crate::fork_quiesce::is_quiescing()
             {
@@ -209,6 +333,7 @@ where
             }
             break retval;
         };
+        let retval = if retval == 0 { woken_value } else { retval };
         if location.is_mirror() {
             // A bhyve shared futex waits on a fork-coherent mirror word, while the
             // guest loop rereads its process-private copied sysmem word after the

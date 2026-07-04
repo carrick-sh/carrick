@@ -520,6 +520,12 @@ pub(crate) struct ThreadRuntimeState<E: ThreadedEngine> {
     _engine: std::marker::PhantomData<fn() -> E>,
 }
 
+struct BlockingWaitReclaim {
+    state: Vec<u8>,
+    old_slot: Option<carrick_hal::SlotId>,
+    single_threaded_process: bool,
+}
+
 impl<E: ThreadedEngine + 'static> ThreadRuntimeState<E>
 where
     E::SiblingSpec: 'static,
@@ -575,6 +581,103 @@ where
             a[3],
             a[4]
         );
+    }
+
+    fn park_vcpu_for_blocking_wait(&self, engine: &mut E) -> Option<BlockingWaitReclaim> {
+        if !engine.reclaims() {
+            return None;
+        }
+        let single_threaded_process = self.registry.live_count() == 1;
+        let state = if single_threaded_process {
+            engine.save_shared_wait_state()
+        } else {
+            engine.save_guest_state()
+        };
+        let old_slot = carrick_hal::vcpu_sched::current_slot();
+        if let Some(lease) = carrick_hal::vcpu_sched::take_current_lease() {
+            carrick_hal::vcpu_sched::global()
+                .release(lease, carrick_hal::vcpu_sched::Yield::Blocked);
+        }
+        if engine.reclaim_refreshes_kicker() {
+            self.kicker.unregister(self.this_tid);
+        }
+        Some(BlockingWaitReclaim {
+            state,
+            old_slot,
+            single_threaded_process,
+        })
+    }
+
+    fn resume_vcpu_after_blocking_wait(
+        &self,
+        engine: &mut E,
+        reclaim: Option<BlockingWaitReclaim>,
+    ) -> Result<(), RuntimeError> {
+        let Some(reclaim) = reclaim else {
+            return Ok(());
+        };
+        let mut kicker_dropped = engine.reclaim_refreshes_kicker();
+        let new_lease = loop {
+            if let Some(lease) = carrick_hal::vcpu_sched::global().acquire_timeout(
+                self.this_tid.raw() as u64,
+                reclaim.old_slot,
+                Duration::from_millis(50),
+            ) {
+                break lease;
+            }
+            if crate::fork_quiesce::is_quiescing() {
+                if !kicker_dropped {
+                    self.kicker.unregister(self.this_tid);
+                    kicker_dropped = true;
+                }
+                fork_barrier().park_if_quiescing();
+            }
+        };
+        carrick_hal::vcpu_sched::set_current_lease(new_lease);
+        if engine.reclaim_refreshes_kicker() {
+            let _topo = crate::fork_quiesce::topology_lock()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if reclaim.single_threaded_process {
+                engine
+                    .rebind_shared_wait_state(new_lease.slot, &reclaim.state)
+                    .map_err(RuntimeError::Trap)?;
+            } else {
+                engine
+                    .rebind_to_slot(new_lease.slot, &reclaim.state)
+                    .map_err(RuntimeError::Trap)?;
+            }
+            let handle: Box<dyn carrick_hal::VcpuKickDyn> = Box::new(engine.kick_handle());
+            self.kicker.register(self.this_tid, handle);
+        } else {
+            if crate::fork_quiesce::is_quiescing() {
+                if !kicker_dropped {
+                    self.kicker.unregister(self.this_tid);
+                    kicker_dropped = true;
+                }
+                fork_barrier().park_if_quiescing();
+            }
+            if kicker_dropped {
+                self.register_vcpu(engine);
+            }
+            if reclaim.single_threaded_process {
+                engine
+                    .rebind_shared_wait_state(new_lease.slot, &reclaim.state)
+                    .map_err(RuntimeError::Trap)?;
+            } else {
+                engine
+                    .rebind_to_slot(new_lease.slot, &reclaim.state)
+                    .map_err(RuntimeError::Trap)?;
+            }
+        }
+        let prev = reclaim.old_slot.unwrap_or(new_lease.slot);
+        crate::probes::mn_reclaim(
+            self.this_tid.raw(),
+            prev,
+            new_lease.slot,
+            if new_lease.slot == prev { 1 } else { 2 },
+        );
+        Ok(())
     }
 
     /// Return-side companion to [`Self::trace_syscall`].
@@ -696,7 +799,8 @@ where
                 } => {
                     self.waiter.ensure_full();
                     crate::run_state::publish(crate::run_state::RunState::Blocked);
-                    match self.waiter.wait_with_dispatch_pending(
+                    let reclaim = self.park_vcpu_for_blocking_wait(engine);
+                    let wait_result = self.waiter.wait_with_dispatch_pending(
                         &fds,
                         timeout,
                         sig_mask.block_mask(),
@@ -705,7 +809,9 @@ where
                                 .dispatcher
                                 .has_deliverable_dispatch_pending_for_wait(self.this_tid, sig_mask)
                         },
-                    ) {
+                    );
+                    self.resume_vcpu_after_blocking_wait(engine, reclaim)?;
+                    match wait_result {
                         crate::io_wait::WaitResult::Ready => continue,
                         crate::io_wait::WaitResult::TimedOut => {
                             break Ok(DispatchOutcome::Returned { value: on_timeout });
@@ -732,7 +838,8 @@ where
                 } => {
                     self.waiter.ensure_full();
                     crate::run_state::publish(crate::run_state::RunState::Blocked);
-                    match self.waiter.wait_with_dispatch_pending(
+                    let reclaim = self.park_vcpu_for_blocking_wait(engine);
+                    let wait_result = self.waiter.wait_with_dispatch_pending(
                         &fds,
                         timeout,
                         sig_mask.block_mask(),
@@ -741,7 +848,9 @@ where
                                 .dispatcher
                                 .has_deliverable_dispatch_pending_for_wait(self.this_tid, sig_mask)
                         },
-                    ) {
+                    );
+                    self.resume_vcpu_after_blocking_wait(engine, reclaim)?;
+                    match wait_result {
                         crate::io_wait::WaitResult::Ready => continue,
                         crate::io_wait::WaitResult::TimedOut => {
                             for (addr, len) in &clear_on_timeout {
@@ -786,7 +895,8 @@ where
                         }
                     };
                     crate::run_state::publish(crate::run_state::RunState::Blocked);
-                    match self.waiter.wait_poll_with_dispatch_pending(
+                    let reclaim = self.park_vcpu_for_blocking_wait(engine);
+                    let wait_result = self.waiter.wait_poll_with_dispatch_pending(
                         &fds,
                         timeout,
                         sig_mask.block_mask(),
@@ -795,7 +905,9 @@ where
                                 .dispatcher
                                 .has_deliverable_dispatch_pending_for_wait(self.this_tid, sig_mask)
                         },
-                    ) {
+                    );
+                    self.resume_vcpu_after_blocking_wait(engine, reclaim)?;
+                    match wait_result {
                         crate::io_wait::WaitResult::Ready => continue,
                         crate::io_wait::WaitResult::TimedOut => {
                             break Ok(DispatchOutcome::Returned { value: on_timeout });
@@ -817,7 +929,8 @@ where
                 DispatchOutcome::WaitOnProcExit { pid, sig_mask } => {
                     self.waiter.ensure_full();
                     crate::run_state::publish(crate::run_state::RunState::Blocked);
-                    match self.waiter.wait_proc_exit_with_dispatch_pending(
+                    let reclaim = self.park_vcpu_for_blocking_wait(engine);
+                    let wait_result = self.waiter.wait_proc_exit_with_dispatch_pending(
                         pid,
                         sig_mask.block_mask(),
                         || {
@@ -828,7 +941,9 @@ where
                                 .dispatcher
                                 .has_deliverable_dispatch_pending_for_wait(self.this_tid, sig_mask)
                         },
-                    ) {
+                    );
+                    self.resume_vcpu_after_blocking_wait(engine, reclaim)?;
+                    match wait_result {
                         crate::io_wait::WaitResult::Ready => continue,
                         crate::io_wait::WaitResult::Interrupted
                         | crate::io_wait::WaitResult::TimedOut => {
@@ -914,11 +1029,14 @@ where
                     }
                     self.waiter.ensure_full();
                     crate::run_state::publish(crate::run_state::RunState::Blocked);
-                    match self.waiter.wait(
+                    let reclaim = self.park_vcpu_for_blocking_wait(engine);
+                    let wait_result = self.waiter.wait(
                         &[],
                         Some(deadline - now),
                         carrick_abi::SigBlockMask::NONE,
-                    ) {
+                    );
+                    self.resume_vcpu_after_blocking_wait(engine, reclaim)?;
+                    match wait_result {
                         crate::io_wait::WaitResult::Ready => continue,
                         crate::io_wait::WaitResult::TimedOut => {
                             if Instant::now() >= deadline {
@@ -1344,6 +1462,14 @@ where
                     last_syscall_retval =
                         Some(state.complete_futex_wait(&mut engine, wait, timeout)?);
                 }
+                DispatchOutcome::FutexWaitv {
+                    wait,
+                    timeout,
+                    index,
+                } => {
+                    last_syscall_retval =
+                        Some(state.complete_futex_waitv(&mut engine, wait, timeout, index)?);
+                }
                 DispatchOutcome::SharedFutexWait {
                     location,
                     waiter_key,
@@ -1361,6 +1487,22 @@ where
                         timeout,
                     )?);
                 }
+                DispatchOutcome::SharedFutexWaitv {
+                    location,
+                    waiter_key,
+                    value,
+                    timeout,
+                    index,
+                } => {
+                    last_syscall_retval = Some(state.complete_shared_futex_waitv(
+                        &mut engine,
+                        location,
+                        waiter_key,
+                        value,
+                        timeout,
+                        index,
+                    )?);
+                }
                 DispatchOutcome::SharedFutexWake {
                     location,
                     waiter_key,
@@ -1376,6 +1518,20 @@ where
                         .platform_futex
                         .shared_wake(location, waiter_key, count);
                     last_syscall_retval = Some(state.complete_returned(&mut engine, woke.max(0))?);
+                }
+                DispatchOutcome::SharedFutexRequeue {
+                    from,
+                    from_key,
+                    to,
+                    to_key,
+                    wake,
+                    requeue,
+                } => {
+                    let (woken, requeued) = state
+                        .platform_futex
+                        .shared_requeue(from, from_key, to, to_key, wake, requeue);
+                    last_syscall_retval =
+                        Some(state.complete_returned(&mut engine, i64::from(woken + requeued))?);
                 }
                 DispatchOutcome::CloneThread {
                     stack,

@@ -43,8 +43,29 @@ impl SharedFutexSyscall for HvfShared {
         carrick_host::ulock::waiter_enter(waiter_key);
     }
 
+    fn wait_start_requeued(&self, waiter_key: usize) -> bool {
+        carrick_host::ulock::requeued_waiter_enter(waiter_key)
+    }
+
     fn wait_end(&self, waiter_key: usize) {
         carrick_host::ulock::waiter_exit(waiter_key);
+    }
+
+    fn wait_end_requeued(
+        &self,
+        location: SharedFutexLocation,
+        waiter_key: usize,
+        value: u32,
+    ) -> bool {
+        carrick_host::ulock::requeued_waiter_exit(waiter_key, location.wait_addr().raw(), value)
+    }
+
+    fn try_complete_requeued(&self, waiter_key: usize) -> bool {
+        carrick_host::ulock::requeued_waiter_complete(waiter_key)
+    }
+
+    fn take_requeue(&self, waiter_key: usize) -> Option<(usize, usize, u32)> {
+        carrick_host::ulock::take_requeue(waiter_key)
     }
 
     /// One ≤20 ms `os_sync_wait_on_address` slice + its macOS-errno
@@ -55,9 +76,11 @@ impl SharedFutexSyscall for HvfShared {
     fn wait_one_slice(
         &self,
         location: SharedFutexLocation,
+        waiter_key: usize,
         val: u32,
         slice_ns: i64,
     ) -> SharedWaitStep {
+        let _ = waiter_key;
         let host_addr = location.wait_addr().raw();
         // Re-validate the shared word at the TOP of every slice before re-parking.
         // A macOS os_sync wake can be LOST: `os_sync_wake_by_address` fires before
@@ -86,14 +109,24 @@ impl SharedFutexSyscall for HvfShared {
         if r >= 0 {
             return SharedWaitStep::Woken;
         }
-        // Shared ABI guard + observability (single-sourced with bhyve/NVMM):
-        // ETIMEDOUT/EINTR -> Retry; ANY other host errno -> a SPURIOUS wake, never
-        // leaked raw, and fires the `futex-unexpected-errno` probe.
-        // `os_sync_wait_on_address` can return a Darwin-specific errno (e.g.
-        // EINVAL) with no Linux-futex meaning, and glibc's nptl FATALLY aborts on
-        // anything but 0/EAGAIN/EINTR/ETIMEDOUT — surfacing it raw once killed
-        // cpython multiprocessing workers on a process-shared semaphore. (The
-        // shared probe supersedes the old HVF-only ulock_wait phase=2 trace.)
+        let host_errno = (-r) as i32;
+        if host_errno != libc::ETIMEDOUT && host_errno != libc::EINTR {
+            carrick_observability::probes::futex_unexpected_errno(host_addr as u64, host_errno);
+            let current = unsafe {
+                (*(host_addr as *const std::sync::atomic::AtomicU32))
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            };
+            return if current != val {
+                SharedWaitStep::Woken
+            } else {
+                SharedWaitStep::Retry
+            };
+        }
+        // Shared ABI guard + observability (single-sourced with bhyve/NVMM for
+        // the ordinary ETIMEDOUT/EINTR cases). Host-specific os_sync errnos were
+        // handled above: they retry while the word is unchanged and become a
+        // guest wake only if the condition actually changed, so Darwin-specific
+        // errno values never leak into glibc's futex ABI.
         carrick_thread::platform_futex::classify_observed_wait_slice(
             r,
             host_addr,
@@ -108,6 +141,25 @@ impl SharedFutexSyscall for HvfShared {
     fn wake(&self, location: SharedFutexLocation, waiter_key: usize, n: u32) -> i64 {
         let host_addr = location.wait_addr().raw();
         carrick_host::ulock::wake_counted(host_addr, waiter_key, n)
+    }
+
+    fn requeue(
+        &self,
+        from: SharedFutexLocation,
+        from_key: usize,
+        to: SharedFutexLocation,
+        to_key: usize,
+        wake: u32,
+        requeue: u32,
+    ) -> (u32, u32) {
+        carrick_host::ulock::requeue_counted(
+            from.wait_addr().raw(),
+            from_key,
+            to.wait_addr().raw(),
+            to_key,
+            wake,
+            requeue,
+        )
     }
 }
 

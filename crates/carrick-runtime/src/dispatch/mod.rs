@@ -287,15 +287,18 @@ use crate::linux_abi::{
     LINUX_FICLONE,
     LINUX_FIONBIO,
     LINUX_FIONREAD,
+    LINUX_FUTEX_32,
     LINUX_FUTEX_CMD_MASK,
     LINUX_FUTEX_CMP_REQUEUE,
     LINUX_FUTEX_LOCK_PI,
+    LINUX_FUTEX_PRIVATE_FLAG,
     LINUX_FUTEX_REQUEUE,
     LINUX_FUTEX_TID_MASK,
     LINUX_FUTEX_TRYLOCK_PI,
     LINUX_FUTEX_UNLOCK_PI,
     LINUX_FUTEX_WAIT,
     LINUX_FUTEX_WAIT_BITSET,
+    LINUX_FUTEX_WAITV_MAX,
     LINUX_FUTEX_WAKE,
     LINUX_FUTEX_WAKE_BITSET,
     LINUX_IFA_ADDRESS,
@@ -764,7 +767,7 @@ impl std::ops::Deref for WaitFds {
 const MAX_GUEST_PATH: usize = 4096;
 
 fn threaded_independent_dispatch_supports(number: u64) -> bool {
-    matches!(number, 96 | 98 | 99 | 124 | 178)
+    matches!(number, 96 | 98 | 99 | 124 | 178 | 449)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -1216,6 +1219,11 @@ pub enum DispatchOutcome {
         wait: crate::thread::FutexWait,
         timeout: Option<Duration>,
     },
+    FutexWaitv {
+        wait: crate::thread::FutexWait,
+        timeout: Option<Duration>,
+        index: i64,
+    },
     /// A `FUTEX_WAIT` on a genuine `MAP_SHARED` file mapping — an inter-PROCESS
     /// rendezvous (LTP `tst_checkpoint`). The in-process parking-lot table can't
     /// reach a waker in another carrick process, so the runtime blocks on the
@@ -1228,6 +1236,13 @@ pub enum DispatchOutcome {
         waiter_key: usize,
         value: u32,
         timeout: Option<Duration>,
+    },
+    SharedFutexWaitv {
+        location: carrick_guest_mem::SharedFutexLocation,
+        waiter_key: usize,
+        value: u32,
+        timeout: Option<Duration>,
+        index: i64,
     },
     /// A `FUTEX_WAKE` on a genuine `MAP_SHARED` mapping — the cross-PROCESS wake
     /// counterpart of [`DispatchOutcome::SharedFutexWait`]. The wake must reach a
@@ -1243,6 +1258,14 @@ pub enum DispatchOutcome {
         location: carrick_guest_mem::SharedFutexLocation,
         waiter_key: usize,
         count: u32,
+    },
+    SharedFutexRequeue {
+        from: carrick_guest_mem::SharedFutexLocation,
+        from_key: usize,
+        to: carrick_guest_mem::SharedFutexLocation,
+        to_key: usize,
+        wake: u32,
+        requeue: u32,
     },
     /// A blocking-mode I/O syscall (ppoll/pselect/poll/select with no fd ready,
     /// or — later — recvfrom/accept/read that would block) needs to wait for
@@ -1399,8 +1422,11 @@ impl DispatchOutcome {
             DispatchOutcome::ThreadExit { .. } => (0, None),
             DispatchOutcome::SignalThread { .. } => (0, None),
             DispatchOutcome::FutexWait { .. } => (0, None),
+            DispatchOutcome::FutexWaitv { .. } => (0, None),
             DispatchOutcome::SharedFutexWait { .. } => (0, None),
+            DispatchOutcome::SharedFutexWaitv { .. } => (0, None),
             DispatchOutcome::SharedFutexWake { .. } => (0, None),
+            DispatchOutcome::SharedFutexRequeue { .. } => (0, None),
             DispatchOutcome::WaitOnFds { .. } => (0, None),
             DispatchOutcome::BlockingHostWrite(_) => (0, None),
             DispatchOutcome::WaitOnFdsSelect { .. } => (0, None),
@@ -2591,6 +2617,15 @@ impl SyscallDispatcher {
                     value: i64::from(tid),
                 }
             }
+            449 => dispatch_futex_waitv_args(
+                memory,
+                Some(futex),
+                request.arg(0),
+                request.arg(1),
+                request.arg(2),
+                request.arg(3),
+                request.arg(4),
+            ),
             _ => DispatchOutcome::Errno {
                 errno: LINUX_ENOSYS,
             },
@@ -3259,27 +3294,19 @@ fn dispatch_threaded_futex(
                 };
             }
 
-            // The shared (cross-process __ulock) path has no native requeue.
-            // Requeue is an OPTIMISATION over wake (the futex contract permits
-            // spurious wakeups, so waking a thread that "should" have been
-            // requeued is still correct — the woken guest re-checks its word
-            // and re-waits on uaddr2 itself). So for shared futexes we degrade
-            // to waking nr_wake + nr_requeue waiters: correct, just without the
-            // thundering-herd avoidance. Private/anon futexes — where glibc and
-            // musl condvars and LTP futex_cmp_requeue01 actually live — take the
-            // real parking-lot requeue below.
             if let Some(location) = shared_location {
-                // Degrade the shared requeue to a wake of nr_wake + nr_requeue
-                // waiters (spurious-wakeup-safe; the woken guest re-checks and
-                // re-waits on uaddr2 itself). Route through the same
-                // `PlatformFutex::shared_wake` seam as a plain shared FUTEX_WAKE.
-                let total = (nr_wake as u64)
-                    .saturating_add(nr_requeue as u64)
-                    .min(u32::MAX as u64) as u32;
-                return DispatchOutcome::SharedFutexWake {
-                    location,
-                    waiter_key: uaddr2 as usize,
-                    count: total,
+                let Some(to_location) = memory.shared_futex_location(uaddr2) else {
+                    return DispatchOutcome::Errno {
+                        errno: LINUX_EFAULT,
+                    };
+                };
+                return DispatchOutcome::SharedFutexRequeue {
+                    from: location,
+                    from_key: address as usize,
+                    to: to_location,
+                    to_key: uaddr2 as usize,
+                    wake: nr_wake,
+                    requeue: nr_requeue,
                 };
             }
 
@@ -3293,6 +3320,175 @@ fn dispatch_threaded_futex(
         _ => DispatchOutcome::Errno {
             errno: LINUX_ENOSYS,
         },
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FutexWaitvEntry {
+    address: u64,
+    value: u32,
+    private: bool,
+}
+
+pub(super) fn dispatch_futex_waitv_args(
+    memory: &mut impl GuestMemory,
+    futex: Option<&crate::thread::FutexTable>,
+    waiters: u64,
+    nr_futexes: u64,
+    flags: u64,
+    timeout_address: u64,
+    clockid: u64,
+) -> DispatchOutcome {
+    if flags != 0
+        || nr_futexes == 0
+        || nr_futexes > LINUX_FUTEX_WAITV_MAX
+        || waiters == 0
+        || !matches!(clockid, LINUX_CLOCK_MONOTONIC | LINUX_CLOCK_REALTIME)
+    {
+        return DispatchOutcome::Errno {
+            errno: LINUX_EINVAL,
+        };
+    }
+
+    let timeout = if timeout_address == 0 {
+        None
+    } else {
+        let timespec = match read_timespec(memory, timeout_address) {
+            Ok(timespec) => timespec,
+            Err(errno) => return DispatchOutcome::Errno { errno },
+        };
+        Some(relative_from_absolute_timespec(
+            timespec.tv_sec,
+            timespec.tv_nsec,
+            clockid == LINUX_CLOCK_REALTIME,
+        ))
+    };
+
+    let mut entries = Vec::with_capacity(nr_futexes as usize);
+    for index in 0..nr_futexes {
+        let Some(entry_address) = waiters.checked_add(index.saturating_mul(24)) else {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EFAULT,
+            };
+        };
+        let bytes = match memory.read_bytes(entry_address, 24) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return DispatchOutcome::Errno {
+                    errno: LINUX_EFAULT,
+                };
+            }
+        };
+        let mut value_bytes = [0u8; 8];
+        value_bytes.copy_from_slice(&bytes[0..8]);
+        let mut address_bytes = [0u8; 8];
+        address_bytes.copy_from_slice(&bytes[8..16]);
+        let mut flags_bytes = [0u8; 4];
+        flags_bytes.copy_from_slice(&bytes[16..20]);
+        let mut reserved_bytes = [0u8; 4];
+        reserved_bytes.copy_from_slice(&bytes[20..24]);
+
+        let value = u64::from_ne_bytes(value_bytes);
+        let address = u64::from_ne_bytes(address_bytes);
+        let waiter_flags = u32::from_ne_bytes(flags_bytes) as u64;
+        let reserved = u32::from_ne_bytes(reserved_bytes);
+
+        let size = waiter_flags & LINUX_FUTEX_32;
+        let unknown = waiter_flags & !(LINUX_FUTEX_32 | LINUX_FUTEX_PRIVATE_FLAG);
+        if reserved != 0 || size != LINUX_FUTEX_32 || unknown != 0 {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            };
+        }
+        if address == 0 {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EFAULT,
+            };
+        }
+        if address & 0x3 != 0 {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            };
+        }
+        if value > u64::from(u32::MAX) {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            };
+        }
+        let expected = value as u32;
+        let private = waiter_flags & LINUX_FUTEX_PRIVATE_FLAG != 0;
+        match read_futex_word(memory, address) {
+            Ok(word) if word == expected => {}
+            Ok(_) => {
+                return DispatchOutcome::Errno {
+                    errno: LINUX_EAGAIN,
+                };
+            }
+            Err(errno) => return DispatchOutcome::Errno { errno },
+        }
+        entries.push(FutexWaitvEntry {
+            address,
+            value: expected,
+            private,
+        });
+    }
+
+    if let Some((index, entry)) = entries
+        .len()
+        .checked_sub(1)
+        .and_then(|index| entries.get(index).map(|entry| (index, *entry)))
+    {
+        if !entry.private
+            && let Some(location) = memory.shared_futex_location(entry.address)
+        {
+            return DispatchOutcome::SharedFutexWaitv {
+                location,
+                waiter_key: entry.address as usize,
+                value: entry.value,
+                timeout,
+                index: index as i64,
+            };
+        }
+        if let Some(futex) = futex {
+            let wait = futex.prepare_wait(entry.address);
+            match read_futex_word(memory, entry.address) {
+                Ok(word) if word != entry.value => {
+                    return DispatchOutcome::Returned {
+                        value: index as i64,
+                    };
+                }
+                Ok(_) => {}
+                Err(errno) => return DispatchOutcome::Errno { errno },
+            }
+            return DispatchOutcome::FutexWaitv {
+                wait,
+                timeout,
+                index: index as i64,
+            };
+        }
+    }
+
+    let start = Instant::now();
+    loop {
+        for (index, entry) in entries.iter().enumerate() {
+            match read_futex_word(memory, entry.address) {
+                Ok(word) if word != entry.value => {
+                    return DispatchOutcome::Returned {
+                        value: index as i64,
+                    };
+                }
+                Ok(_) => {}
+                Err(errno) => return DispatchOutcome::Errno { errno },
+            }
+        }
+        if let Some(deadline) = timeout
+            && start.elapsed() >= deadline
+        {
+            return DispatchOutcome::Errno {
+                errno: LINUX_ETIMEDOUT,
+            };
+        }
+        std::thread::sleep(Duration::from_millis(1));
     }
 }
 
@@ -6087,7 +6283,7 @@ mod overlay_dispatch_tests {
             .filter(|syscall| threaded_independent_dispatch_supports(syscall.number))
             .map(|syscall| syscall.number)
             .collect();
-        assert_eq!(supported, vec![96, 98, 99, 124, 178]);
+        assert_eq!(supported, vec![96, 98, 99, 124, 178, 449]);
 
         for syscall in crate::syscall::aarch64_table() {
             if syscall.handler == crate::syscall::SyscallHandler::ThreadLocal {
