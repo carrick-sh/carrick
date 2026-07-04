@@ -267,6 +267,10 @@ fn stop_self_by_signal(signum: i32) {
     }
 }
 
+fn ptrace_self_signal_needs_stop_carrier(signum: i32) -> bool {
+    signum != LINUX_SIGKILL
+}
+
 fn should_route_specific_xsig(target_host_pid: i32, signum: i32) -> bool {
     if target_host_pid <= 0 {
         return false;
@@ -1177,6 +1181,8 @@ impl SyscallDispatcher {
             } else {
                 i64::from(pid.0)
             };
+            let signal_target_names_self = pid == std::process::id() as i64
+                || (!crate::namespace::pid::enabled() && pid == LINUX_BOOTSTRAP_PID as i64);
             // pid-1 protection on the NON-namespaced OCI path (§5.4,
             // pid_namespaces(7)). The guest's init presents itself as bootstrap
             // pid 1; carrick does NOT fork a real NsSupervisor here (unlike the
@@ -1204,32 +1210,29 @@ impl SyscallDispatcher {
             {
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
-            if signal_is_self_target(pid) {
+            if signal_target_names_self {
                 let tid = Self::ctx_tid(cx);
                 if this.proc.lock().ptrace_traceme && signum != 0 {
-                    if signum == LINUX_SIGKILL as u64 {
+                    let signum = signum as i32;
+                    if signum == LINUX_SIGKILL {
                         crate::guest_cpu::record_child_exit(
                             std::process::id(),
                             crate::guest_cpu::total_ns(),
                         );
-                        crate::guest_cpu::mark_self_ptrace_stop_pending();
+                        crate::guest_cpu::mark_self_ptrace_stop_pending(signum);
                         stop_self_by_signal(LINUX_SIGKILL);
                         return Ok(DispatchOutcome::Returned { value: 0 });
                     }
-                    crate::guest_cpu::mark_self_ptrace_stop_pending();
-                    if signum == crate::linux_abi::LINUX_SIGCONT as u64
-                        || is_rt_signal(signum as i32)
-                    {
-                        // Darwin has no host signal numbers for Linux RT
-                        // signals (32..=64), and SIGCONT's host default action
-                        // is "continue" rather than a tracee delivery stop. A
-                        // traced Linux child still becomes waitable as a ptrace
-                        // signal-delivery stop; use a host SIGSTOP as the
-                        // carrier so the parent observes WIFSTOPPED instead of
-                        // the child falling through to normal exit.
+                    crate::guest_cpu::mark_self_ptrace_stop_pending(signum);
+                    if ptrace_self_signal_needs_stop_carrier(signum) {
+                        // Linux reports a ptrace signal-delivery stop before
+                        // applying the signal's normal disposition. Carrick's
+                        // host process may mirror, ignore, or claim the Darwin
+                        // carrier signal, so use host SIGSTOP uniformly and
+                        // report the recorded Linux signum in wait4.
                         stop_self_by_signal(LINUX_SIGSTOP);
                     } else {
-                        let host_signum = crate::host_signal::linux_to_host_signum(signum as i32);
+                        let host_signum = crate::host_signal::linux_to_host_signum(signum);
                         unsafe {
                             libc::raise(host_signum);
                         }
@@ -2042,21 +2045,6 @@ fn rt_sigtimedwait_deliver(
     DispatchOutcome::Returned {
         value: signum as i64,
     }
-}
-
-/// True iff a kill/tkill/tgkill `target` refers to the guest itself.
-/// getpid() exposes the host pid, so glibc uses that as the self-id;
-/// accept it, LINUX_BOOTSTRAP_PID (1), and — for the pid form — 0
-/// (process-group, which is just us in the single-process bootstrap).
-fn signal_is_self_target(target: i64) -> bool {
-    // Self-target for kill(2): the canonical NsPid::names_self (host pid,
-    // bootstrap pid, or the caller's ns-pid). pid 0 is deliberately NOT self —
-    // kill(0, sig) targets the caller's whole PROCESS GROUP (which after a fork
-    // includes child guest processes); it must fall through to
-    // bootstrap_signal_send_as's host group-kill (LTP kill02 "Process 1 did not
-    // receive"). names_self also excludes 0, so that group path is preserved.
-    // (tgkill/tkill route tids as SignalTarget::GuestTid and never 0.)
-    NsPid(target as i32).names_self()
 }
 
 /// True iff `x` names THIS process (or thread) — host pid, bootstrap pid, or,

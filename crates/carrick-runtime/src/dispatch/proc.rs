@@ -2487,8 +2487,13 @@ impl SyscallDispatcher {
                     }
                 }
             }
-            if libc::WIFSTOPPED(host_status) {
-                crate::guest_cpu::clear_child_ptrace_stop_pending(result as u32);
+            let mut host_status_is_guest_status = false;
+            if libc::WIFSTOPPED(host_status)
+                && let Some(linux_signum) =
+                    crate::guest_cpu::take_child_ptrace_stop_signal(result as u32)
+            {
+                host_status = (linux_signum << 8) | 0x7f;
+                host_status_is_guest_status = true;
             }
             // Terminal reap of a child (not a WUNTRACED/WCONTINUED state report):
             // resolve its async exit-signal watch. If the pump already delivered
@@ -2541,7 +2546,11 @@ impl SyscallDispatcher {
                     return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                 }
             }
-            let host_status = translate_child_wait_status(result as u32, host_status);
+            let host_status = if host_status_is_guest_status {
+                host_status
+            } else {
+                translate_child_wait_status(result as u32, host_status)
+            };
             if wstatus_addr.0 != 0 {
                 let bytes = host_status.to_ne_bytes();
                 memory.write_bytes(wstatus_addr.0, &bytes)?;
