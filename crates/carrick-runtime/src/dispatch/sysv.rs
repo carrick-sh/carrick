@@ -26,7 +26,7 @@
 //!     host-forwarded support for the cases conformance currently exercises.
 
 use super::*;
-use crate::linux_abi::LinuxErrno;
+use crate::linux_abi::{LINUX_ENOSPC, LinuxErrno};
 
 syscall_table! {
     /// Per-module syscall routing for the `sysv` subsystem (Task A1).
@@ -198,6 +198,13 @@ const LINUX_SHM_STAT_ANY: u64 = 15;
 const LINUX_SHMMNI: usize = 4096;
 const LINUX_SHM_LOCK: u64 = 11;
 const LINUX_SHM_UNLOCK: u64 = 12;
+const LINUX_SEM_STAT: u64 = 18;
+const LINUX_SEM_INFO: u64 = 19;
+const LINUX_SEM_STAT_ANY: u64 = 20;
+const LINUX_SEMMSL: usize = 32000;
+const LINUX_SEMMNI: usize = 32000;
+const LINUX_SEMOPM: u32 = 500;
+const LINUX_SEMVMX: u32 = 32767;
 
 bitflags::bitflags! {
     #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -327,6 +334,100 @@ impl ShmSegment {
     }
 }
 
+#[derive(Clone, Debug)]
+struct SemSet {
+    key: i32,
+    host_id: HostSemId,
+    scan_index: SemScanIndex,
+    nsems: usize,
+    mode: ShmPermMode,
+    uid: u32,
+    gid: u32,
+    cuid: u32,
+    cgid: u32,
+    ctime: u64,
+    otime: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct GuestSemId(i32);
+
+impl GuestSemId {
+    fn from_syscall_arg(value: i32) -> Result<Self, LinuxErrno> {
+        if value < 0 {
+            Err(LINUX_EINVAL)
+        } else {
+            Ok(GuestSemId(value))
+        }
+    }
+
+    fn as_i64(self) -> i64 {
+        i64::from(self.0)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HostSemId(i32);
+
+impl HostSemId {
+    fn raw(self) -> i32 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SemStatSelector {
+    StatIndex(SemScanIndex),
+    AnyIndex(SemScanIndex),
+}
+
+impl SemStatSelector {
+    fn scan_index(self) -> SemScanIndex {
+        match self {
+            SemStatSelector::StatIndex(index) | SemStatSelector::AnyIndex(index) => index,
+        }
+    }
+
+    fn enforces_read_permission(self) -> bool {
+        matches!(self, SemStatSelector::StatIndex(_))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct SemScanIndex(u32);
+
+impl SemScanIndex {
+    fn from_semctl_arg(value: i32) -> Result<Self, LinuxErrno> {
+        u32::try_from(value)
+            .map(SemScanIndex)
+            .map_err(|_| LINUX_EINVAL)
+    }
+
+    fn as_i64(self) -> i64 {
+        i64::from(self.0)
+    }
+}
+
+impl SemSet {
+    fn can_read(&self, creds: &super::creds::CredState) -> bool {
+        creds.euid == 0
+            || if creds.euid == self.uid {
+                self.mode.owner_readable()
+            } else {
+                self.mode.other_readable()
+            }
+    }
+
+    fn can_write(&self, creds: &super::creds::CredState) -> bool {
+        creds.euid == 0
+            || if creds.euid == self.uid {
+                self.mode.owner_writable()
+            } else {
+                self.mode.other_writable()
+            }
+    }
+}
+
 #[derive(Default, Debug)]
 pub(super) struct SysvShmState {
     /// shmid (= host inode number, truncated to i32) → segment metadata.
@@ -352,6 +453,11 @@ pub(super) struct SysvShmState {
     /// queue the guest forgot to `IPC_RMID`, avoiding stateful ENOSPC across LTP
     /// runs.
     message_queues: HashSet<i32>,
+    /// Host SysV semaphore sets observed through guest `semget`, with guest
+    /// ownership/mode metadata layered over the host primitive.
+    semaphores: HashMap<GuestSemId, SemSet>,
+    sem_keys: HashMap<i32, GuestSemId>,
+    next_sem_scan_index: u32,
 }
 
 impl SysvShmState {
@@ -362,7 +468,17 @@ impl SysvShmState {
             remapped_attachments: HashSet::new(),
             private_counter: AtomicU32::new(1),
             message_queues: HashSet::new(),
+            semaphores: HashMap::new(),
+            sem_keys: HashMap::new(),
+            next_sem_scan_index: 0,
         }
+    }
+
+    fn allocate_sem_id(&mut self) -> Result<(GuestSemId, SemScanIndex), LinuxErrno> {
+        let raw = i32::try_from(self.next_sem_scan_index).map_err(|_| LINUX_ENOSPC)?;
+        let index = SemScanIndex(self.next_sem_scan_index);
+        self.next_sem_scan_index = self.next_sem_scan_index.saturating_add(1);
+        Ok((GuestSemId(raw), index))
     }
 
     /// Ensure `/tmp/carrick-shm/` exists with 0o1777. Best-effort; if the
@@ -697,6 +813,31 @@ impl SyscallDispatcher {
         rows
     }
 
+    pub(crate) fn sysvipc_sem_table(&self) -> String {
+        let state = self.sysv.lock();
+        let mut rows = String::from(
+            "       key      semid perms      nsems   uid   gid  cuid  cgid      otime      ctime\n",
+        );
+        let mut semaphores = state.semaphores.iter().collect::<Vec<_>>();
+        semaphores.sort_by_key(|(semid, _)| semid.0);
+        for (semid, meta) in semaphores {
+            rows.push_str(&format!(
+                "{:10} {:10} {:5o} {:10} {:5} {:5} {:5} {:5} {:10} {:10}\n",
+                meta.key,
+                semid.0,
+                meta.mode.perms(),
+                meta.nsems,
+                meta.uid,
+                meta.gid,
+                meta.cuid,
+                meta.cgid,
+                meta.otime,
+                meta.ctime,
+            ));
+        }
+        rows
+    }
+
     pub(crate) fn note_sysv_remap_file_pages(
         &self,
         addr: u64,
@@ -738,10 +879,15 @@ impl SyscallDispatcher {
         if self.is_forked_guest_process() {
             return;
         }
-        let (message_queues, shm_segments) = {
+        let (message_queues, semaphore_ids, shm_segments) = {
             let mut state = self.sysv.lock();
             (
                 state.message_queues.drain().collect::<Vec<_>>(),
+                state
+                    .semaphores
+                    .drain()
+                    .map(|(_, meta)| meta.host_id)
+                    .collect::<Vec<_>>(),
                 state
                     .segments
                     .drain()
@@ -751,6 +897,9 @@ impl SyscallDispatcher {
         };
         for msqid in message_queues {
             let _ = unsafe { msgctl(msqid, libc::IPC_RMID, core::ptr::null_mut()) };
+        }
+        for semid in semaphore_ids {
+            let _ = unsafe { carrick_portable::semctl0(semid.raw(), 0, libc::IPC_RMID) };
         }
         for segment in shm_segments {
             let _ = std::fs::remove_file(&segment.path);
@@ -1442,23 +1591,90 @@ impl SyscallDispatcher {
         /// Forwarded to the host (macOS has SysV semaphores); IPC_CREAT/IPC_EXCL
         /// share their values with Linux, and carrick guest processes are
         /// separate host processes, so the host kernel gives cross-process
-        /// semaphore coherence for free. The host semid is returned to the
-        /// guest and accepted back verbatim.
+        /// semaphore coherence for free. Carrick returns a Linux-shaped guest
+        /// semid and keeps the host semid private at the libc boundary.
         fn semget(this, cx, key: u64, nsems: u64, semflg: u64) {
-            let _ = (this, cx);
+            let _ = cx;
             // Linux caps nsems at SEMMSL (default 32000): nsems > SEMMSL → EINVAL
             // (LTP semget02). macOS has a much smaller limit and returns ENOSPC
             // for the same over-large request, so validate against the Linux
             // limit before forwarding to the host.
-            const LINUX_SEMMSL: i32 = 32000;
-            if (nsems as i32) > LINUX_SEMMSL {
+            let Ok(nsems_usize) = usize::try_from(nsems) else {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            };
+            if nsems_usize > LINUX_SEMMSL {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
+            let key = key as i32;
+            let create_flags = IpcCreateFlags::from_bits_retain(semflg);
+            let create = create_flags.contains(IpcCreateFlags::CREAT);
+            let exclusive = create_flags.contains(IpcCreateFlags::EXCL);
+            let creds = this.cred_snapshot();
+            {
+                let state = this.sysv.lock();
+                if key != LINUX_IPC_PRIVATE
+                    && let Some(guest_semid) = state.sem_keys.get(&key).copied()
+                    && let Some(existing) = state.semaphores.get(&guest_semid)
+                {
+                    if create && exclusive {
+                        return Ok(DispatchOutcome::errno(LINUX_EEXIST));
+                    }
+                    if nsems_usize > existing.nsems {
+                        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                    }
+                    let wants_read = semflg & 0o400 != 0;
+                    let wants_write = semflg & 0o200 != 0;
+                    if (wants_read && !existing.can_read(&creds))
+                        || (wants_write && !existing.can_write(&creds))
+                    {
+                        return Ok(DispatchOutcome::errno(LINUX_EACCES));
+                    }
+                    return Ok(DispatchOutcome::Returned {
+                        value: guest_semid.as_i64(),
+                    });
+                }
+            }
+            if !create && key != LINUX_IPC_PRIVATE {
+                return Ok(DispatchOutcome::errno(LINUX_ENOENT));
+            }
             let rc = unsafe {
-                carrick_portable::semget(key as i32 as libc::key_t, nsems as i32, semflg as i32)
+                carrick_portable::semget(key as libc::key_t, nsems_usize as i32, semflg as i32)
             };
             match rc.host_syscall_errno() {
-                Ok(id) => Ok(DispatchOutcome::Returned { value: id as i64 }),
+                Ok(host_id) => {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    let mut state = this.sysv.lock();
+                    let Ok((guest_semid, scan_index)) = state.allocate_sem_id() else {
+                        drop(state);
+                        let _ = unsafe { carrick_portable::semctl0(host_id, 0, libc::IPC_RMID) };
+                        return Ok(DispatchOutcome::errno(LINUX_ENOSPC));
+                    };
+                    state.semaphores.insert(
+                        guest_semid,
+                        SemSet {
+                            key,
+                            host_id: HostSemId(host_id),
+                            scan_index,
+                            nsems: nsems_usize,
+                            mode: ShmPermMode::requested(semflg),
+                            uid: creds.euid,
+                            gid: creds.egid,
+                            cuid: creds.euid,
+                            cgid: creds.egid,
+                            ctime: now,
+                            otime: 0,
+                        },
+                    );
+                    if key != LINUX_IPC_PRIVATE {
+                        state.sem_keys.insert(key, guest_semid);
+                    }
+                    Ok(DispatchOutcome::Returned {
+                        value: guest_semid.as_i64(),
+                    })
+                }
                 Err(errno) => Ok(DispatchOutcome::errno(errno)),
             }
         }
@@ -1480,7 +1696,7 @@ impl SyscallDispatcher {
         /// tracked follow-up (it needs the multiprocess LTP semaphore harness to
         /// verify), not an accepted limitation of the primitive.
         fn semop(this, cx, semid: u64, sops: GuestPtr, nsops: u64) {
-            sysv_semop(cx, semid as i32, sops.0, nsops as usize, None)
+            this.sysv_semop(cx, semid as i32, sops.0, nsops as usize, None)
         }
 
         /// semtimedop(semid, sops, nsops, timeout): semop with a relative
@@ -1495,7 +1711,7 @@ impl SyscallDispatcher {
                     Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                 }
             };
-            sysv_semop(cx, semid as i32, sops.0, nsops as usize, to)
+            this.sysv_semop(cx, semid as i32, sops.0, nsops as usize, to)
         }
 
         /// semctl(semid, semnum, cmd, arg). The command constants differ
@@ -1507,7 +1723,7 @@ impl SyscallDispatcher {
             // process is not the guest uid); snapshot them here where `this` is
             // in scope and hand them to the free fn.
             let creds = this.cred_snapshot();
-            sysv_semctl(cx, semid as i32, semnum as i32, cmd, arg, &creds)
+            this.sysv_semctl(cx, semid as i32, semnum as i32, cmd, arg, &creds)
         }
     }
 }
@@ -1533,8 +1749,11 @@ fn sysv_semop<M: GuestMemory>(
     nsops: usize,
     timeout: Option<LinuxTimespec>,
 ) -> Result<DispatchOutcome, DispatchError> {
-    if nsops == 0 || nsops > 1024 {
+    if nsops == 0 {
         return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+    }
+    if nsops > LINUX_SEMOPM as usize {
+        return Ok(DispatchOutcome::errno(LINUX_E2BIG));
     }
     // sembuf is 6 bytes; read the whole array.
     let bytes = match cx.memory.read_bytes(sops_addr, nsops * 6) {
@@ -1626,6 +1845,200 @@ fn linux_semctl_cmd_to_host(cmd: u64) -> Option<i32> {
         LINUX_SETALL => SETALL,
         _ => return None,
     })
+}
+
+impl SyscallDispatcher {
+    fn host_semid_for_guest(&self, semid: i32) -> Result<HostSemId, LinuxErrno> {
+        let guest_semid = GuestSemId::from_syscall_arg(semid)?;
+        let state = self.sysv.lock();
+        state
+            .semaphores
+            .get(&guest_semid)
+            .map(|meta| meta.host_id)
+            .ok_or(LINUX_EINVAL)
+    }
+
+    fn sysv_semop<M: GuestMemory>(
+        &self,
+        cx: &mut SyscallCtx<M>,
+        semid: i32,
+        sops_addr: u64,
+        nsops: usize,
+        timeout: Option<LinuxTimespec>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let host_id = match self.host_semid_for_guest(semid) {
+            Ok(host_id) => host_id,
+            Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+        };
+        sysv_semop(cx, host_id.raw(), sops_addr, nsops, timeout)
+    }
+
+    fn sysv_semctl<M: GuestMemory>(
+        &self,
+        cx: &mut SyscallCtx<M>,
+        semid: i32,
+        semnum: i32,
+        cmd: u64,
+        arg: u64,
+        creds: &super::creds::CredState,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        match cmd {
+            LINUX_IPC_INFO | LINUX_SEM_INFO => {
+                return self.write_sem_info(cx, arg);
+            }
+            LINUX_SEM_STAT | LINUX_SEM_STAT_ANY => {
+                let Ok(index) = SemScanIndex::from_semctl_arg(semid) else {
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                };
+                let selector = if cmd == LINUX_SEM_STAT_ANY {
+                    SemStatSelector::AnyIndex(index)
+                } else {
+                    SemStatSelector::StatIndex(index)
+                };
+                return self.write_sem_stat(cx, selector, arg, creds);
+            }
+            _ => {}
+        }
+
+        let guest_semid = match GuestSemId::from_syscall_arg(semid) {
+            Ok(guest_semid) => guest_semid,
+            Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+        };
+        let host_id = {
+            let state = self.sysv.lock();
+            let Some(meta) = state.semaphores.get(&guest_semid) else {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            };
+            if matches!(cmd, LINUX_IPC_RMID | LINUX_IPC_SET) && !meta.can_write(creds) {
+                return Ok(DispatchOutcome::errno(LINUX_EPERM));
+            }
+            meta.host_id
+        };
+
+        let out = sysv_semctl(cx, host_id.raw(), semnum, cmd, arg, creds)?;
+        if matches!(out, DispatchOutcome::Returned { value: 0 }) {
+            let mut state = self.sysv.lock();
+            match cmd {
+                LINUX_IPC_RMID => {
+                    if let Some(meta) = state.semaphores.remove(&guest_semid)
+                        && meta.key != LINUX_IPC_PRIVATE
+                    {
+                        state.sem_keys.remove(&meta.key);
+                    }
+                }
+                LINUX_IPC_SET => {
+                    if let Some(meta) = state.semaphores.get_mut(&guest_semid)
+                        && arg != 0
+                        && let Ok(bytes) = cx.memory.read_bytes(arg + 20, 4)
+                    {
+                        let mode = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                        meta.mode = ShmPermMode::from_ipc_set(mode, meta.mode);
+                        meta.ctime = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(meta.ctime);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(out)
+    }
+
+    fn write_sem_info<M: GuestMemory>(
+        &self,
+        cx: &mut SyscallCtx<M>,
+        arg: u64,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let state = self.sysv.lock();
+        let used_sets = state.semaphores.len() as u32;
+        let used_sems = state
+            .semaphores
+            .values()
+            .map(|meta| meta.nsems as u32)
+            .sum::<u32>();
+        let max_index = state
+            .semaphores
+            .values()
+            .map(|meta| meta.scan_index)
+            .max()
+            .map_or(0, SemScanIndex::as_i64);
+        drop(state);
+
+        if arg != 0 {
+            // Linux `struct seminfo` is ten 32-bit integers. For SEM_INFO,
+            // semusz carries the used set count and semaem carries used sems.
+            let fields = [
+                LINUX_SEMMNI as u32,
+                LINUX_SEMMNI as u32,
+                1_024_000_000u32,
+                1_024_000_000u32,
+                LINUX_SEMMSL as u32,
+                LINUX_SEMOPM,
+                LINUX_SEMMNI as u32,
+                used_sets,
+                LINUX_SEMVMX,
+                used_sems,
+            ];
+            let mut bytes = Vec::with_capacity(fields.len() * 4);
+            for field in fields {
+                bytes.extend_from_slice(&field.to_le_bytes());
+            }
+            if cx.memory.write_bytes(arg, &bytes).is_err() {
+                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+            }
+        }
+        Ok(DispatchOutcome::Returned { value: max_index })
+    }
+
+    fn write_sem_stat<M: GuestMemory>(
+        &self,
+        cx: &mut SyscallCtx<M>,
+        selector: SemStatSelector,
+        arg: u64,
+        creds: &super::creds::CredState,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let state = self.sysv.lock();
+        let Some((guest_semid, meta)) = state
+            .semaphores
+            .iter()
+            .find(|(_, meta)| meta.scan_index == selector.scan_index())
+        else {
+            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+        };
+        let guest_semid = *guest_semid;
+        let meta = meta.clone();
+        if selector.enforces_read_permission() && !meta.can_read(creds) {
+            return Ok(DispatchOutcome::errno(LINUX_EACCES));
+        }
+        drop(state);
+
+        if arg != 0 {
+            let out = LinuxSemidDs {
+                sem_perm: LinuxIpcPerm {
+                    key: meta.key,
+                    uid: meta.uid,
+                    gid: meta.gid,
+                    cuid: meta.cuid,
+                    cgid: meta.cgid,
+                    mode: meta.mode.perms(),
+                    seq: 0,
+                    ..Default::default()
+                },
+                sem_otime: meta.otime,
+                sem_ctime: meta.ctime,
+                sem_nsems: meta.nsems as u64,
+                __unused3: 0,
+                __unused4: 0,
+            };
+            if cx.memory.write_bytes(arg, out.as_bytes()).is_err() {
+                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+            }
+        }
+        Ok(DispatchOutcome::Returned {
+            value: guest_semid.as_i64(),
+        })
+    }
 }
 
 fn sysv_semctl<M: GuestMemory>(
