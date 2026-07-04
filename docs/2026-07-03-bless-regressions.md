@@ -106,6 +106,14 @@ oracle-cache edits are only used when the suite declaration itself changed.
   synthetic exit status. Red-first: `childsubreaper` DIFFed on inherited
   subreaper state, orphan PPID, wait reaping, exit status, and SIGCHLD before
   matching Linux line-for-line.
+- `ltp-ptrace01` MATCH after PID-namespace any-child wait fixes. Root cause
+  fixed: `wait4(-1)` in a private PID namespace no longer returns guest pid 0
+  after reaping a host child that is not visible in the namespace; namespace-
+  invisible host children are discarded and blocking any-child waits keep
+  waiting until a guest-visible child changes state or `ECHILD` is real.
+  Red-first: `ptracekillcont` DIFFed on the LTP-shaped `PTRACE_TRACEME` /
+  self-`SIGUSR2` sequence because post-case cleanup `waitpid(-1, 0)` returned
+  `0` and left stale `ENOTTY`; it now MATCHes Linux with `-1/ECHILD`.
 
 ### Still open / next
 
@@ -115,6 +123,10 @@ oracle-cache edits are only used when the suite declaration itself changed.
   timer-slack cases, while Carrick additionally failed the 10ms case in two
   samples by a small oversleep margin. Treat this as timing-jitter evidence,
   not a prctl semantic blocker.
+- Remaining `ltp-ptrace*` gating items after the `ltp-ptrace01` fix:
+  `ltp-ptrace02`, `ltp-ptrace03`, `ltp-ptrace05`, `ltp-ptrace06`, and
+  `ltp-ptrace11`. Focused `ltp-ptrace02` still REGRESSIONed at carrick[0/1] vs
+  oracle[1/1], so continue with a separate red-first reduction.
 
 ## Top clusters (fix the shared root cause once → clears many)
 

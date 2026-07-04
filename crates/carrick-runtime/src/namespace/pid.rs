@@ -354,6 +354,17 @@ pub fn host_to_ns_or_self(host_pid: u32) -> u32 {
     }
 }
 
+/// Translate a host pid to the pid the current ns sees. Identity when
+/// namespaces are off. Unlike [`host_to_ns_or_self`], this preserves the
+/// "not a namespace member" distinction for wait/reap paths, where returning
+/// pid 0 would be a bogus successful `waitpid(-1)` result.
+pub fn host_to_ns(host_pid: u32) -> Option<u32> {
+    match region() {
+        Some(r) => r.host_to_ns(host_pid),
+        None => Some(host_pid),
+    }
+}
+
 /// Translate a host pgid/sid to the value the ns should report. If the group/
 /// session leader is a namespace member, report its ns-pid; otherwise keep the
 /// host value (a pgid/sid is always positive, so unlike a parent pid it must
