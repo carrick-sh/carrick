@@ -983,6 +983,8 @@ impl SyscallDispatcher {
                 && map_flags.contains(LinuxMmapFlags::ANONYMOUS)
                 && crate::memory::va_in_shared_aperture(requested.0, length)
             {
+                let locked_range =
+                    this.prepare_mmap_locked_range(map_flags, requested.0, length)?;
                 let overlay_va = {
                     let mut mem = this.mem.lock();
                     // Re-MAP_FIXED over the same VA: free the prior overlay slot.
@@ -1015,6 +1017,7 @@ impl SyscallDispatcher {
                     ProcMapSharing::Private,
                     String::new(),
                 );
+                this.commit_mmap_locked_range(locked_range);
                 return Ok(DispatchOutcome::Returned {
                     value: requested.0 as i64,
                 });
@@ -1144,6 +1147,7 @@ impl SyscallDispatcher {
                 if let Some((addr, reused)) = alloc {
                     let map_len_usize = usize::try_from(map_len)
                         .map_err(|_| DispatchError::LengthTooLarge(map_len))?;
+                    let locked_range = this.prepare_mmap_locked_range(map_flags, addr, length)?;
                     if reused {
                         let _ = memory.zero_backing(addr, map_len_usize);
                     }
@@ -1176,6 +1180,7 @@ impl SyscallDispatcher {
                         ProcMapSharing::Shared,
                         String::new(),
                     );
+                    this.commit_mmap_locked_range(locked_range);
                     return Ok(DispatchOutcome::Returned { value: addr as i64 });
                 }
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
@@ -1210,7 +1215,8 @@ impl SyscallDispatcher {
             let in_arena = range_within(address, length, LINUX_MMAP_BASE, crate::memory::mmap_arena_size());
 
             let prot_none = prot_flags.is_empty();
-                if prot_none && map_flags.contains(LinuxMmapFlags::ANONYMOUS) {
+            if prot_none && map_flags.contains(LinuxMmapFlags::ANONYMOUS) {
+                let locked_range = this.prepare_mmap_locked_range(map_flags, address, length)?;
                 memory.set_no_access(address, length_usize, false);
                 memory.set_no_write(address, length_usize, false);
                 memory.set_no_access(address, length_usize, true);
@@ -1231,6 +1237,7 @@ impl SyscallDispatcher {
                     map_sharing.proc_map_sharing(),
                     String::new(),
                 );
+                this.commit_mmap_locked_range(locked_range);
                 if map_flags.contains(LinuxMmapFlags::GROWSDOWN) {
                     this.record_growdown_mapping(address, length);
                 }
@@ -1242,6 +1249,7 @@ impl SyscallDispatcher {
             if map_flags.contains(LinuxMmapFlags::ANONYMOUS)
                 && !mmap_address_uses_alias(address, length)
             {
+                let locked_range = this.prepare_mmap_locked_range(map_flags, address, length)?;
                 memory.set_no_access(address, length_usize, false);
                 memory.set_no_write(
                     address,
@@ -1260,6 +1268,7 @@ impl SyscallDispatcher {
                     map_sharing.proc_map_sharing(),
                     String::new(),
                 );
+                this.commit_mmap_locked_range(locked_range);
                 if map_flags.contains(LinuxMmapFlags::GROWSDOWN) {
                     this.record_growdown_mapping(address, length);
                 }
@@ -1423,6 +1432,7 @@ impl SyscallDispatcher {
                 });
             }
 
+            let locked_range = this.prepare_mmap_locked_range(map_flags, address, length)?;
             memory.set_no_access(address, length_usize, false);
             // Stamp the file content via the UNCHECKED path: this is carrick
             // loading the mapping, not a guest write. The final prot may be
@@ -1461,6 +1471,7 @@ impl SyscallDispatcher {
                 map_sharing.proc_map_sharing(),
                 String::new(),
             );
+            this.commit_mmap_locked_range(locked_range);
             Ok(DispatchOutcome::Returned {
                 value: address as i64,
             })
@@ -2193,13 +2204,38 @@ impl SyscallDispatcher {
     }
 
     fn add_locked_range(&self, range: crate::vfs::GuestMemoryRange) -> Result<(), LinuxErrno> {
+        self.check_locked_range_limit(range)?;
+        self.commit_mmap_locked_range(Some(range));
+        Ok(())
+    }
+
+    fn prepare_mmap_locked_range(
+        &self,
+        flags: LinuxMmapFlags,
+        address: u64,
+        length: u64,
+    ) -> Result<Option<crate::vfs::GuestMemoryRange>, LinuxErrno> {
+        if !flags.contains(LinuxMmapFlags::LOCKED) {
+            return Ok(None);
+        }
+        let Some(range) = page_rounded_range(GuestPtr(address), length)? else {
+            return Ok(None);
+        };
+        self.check_locked_range_limit(range)?;
+        Ok(Some(range))
+    }
+
+    fn check_locked_range_limit(
+        &self,
+        range: crate::vfs::GuestMemoryRange,
+    ) -> Result<(), LinuxErrno> {
         let creds = self.cred_snapshot();
         let memlock_limit = if creds.euid == 0 {
             None
         } else {
             Some(self.effective_resource_limit(LINUX_RLIMIT_MEMLOCK).rlim_cur)
         };
-        let mut mem = self.mem.lock();
+        let mem = self.mem.lock();
         let mut next = mem.locked_ranges.clone();
         locked_ranges_insert(&mut next, range);
         if let Some(limit) = memlock_limit {
@@ -2210,8 +2246,14 @@ impl SyscallDispatcher {
                 return Err(LINUX_ENOMEM);
             }
         }
-        mem.locked_ranges = next;
         Ok(())
+    }
+
+    fn commit_mmap_locked_range(&self, range: Option<crate::vfs::GuestMemoryRange>) {
+        let Some(range) = range else {
+            return;
+        };
+        locked_ranges_insert(&mut self.mem.lock().locked_ranges, range);
     }
 
     fn remove_locked_range(&self, range: crate::vfs::GuestMemoryRange) {
