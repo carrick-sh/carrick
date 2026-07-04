@@ -328,6 +328,86 @@ fn sysctl_hostname() -> Vec<u8> {
     format!("{}\n", crate::execute::guest_hostname()).into_bytes()
 }
 
+#[derive(Clone, Copy)]
+struct KernelThreadLimit(u64);
+
+impl KernelThreadLimit {
+    const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+const DEFAULT_THREADS_MAX: KernelThreadLimit = KernelThreadLimit::new(63_087);
+
+fn sysctl_threads_max() -> Vec<u8> {
+    let limit = host_threads_max().unwrap_or(DEFAULT_THREADS_MAX);
+    format!("{}\n", limit.raw()).into_bytes()
+}
+
+fn host_threads_max() -> Option<KernelThreadLimit> {
+    host_rlimit_nproc().or_else(host_kernel_threads_max)
+}
+
+fn host_rlimit_nproc() -> Option<KernelThreadLimit> {
+    let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+    // SAFETY: `getrlimit` initializes the passed `rlimit` on success.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NPROC, limit.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: success above initialized `limit`.
+    let limit = unsafe { limit.assume_init() };
+    if limit.rlim_cur == libc::RLIM_INFINITY || limit.rlim_cur == 0 {
+        None
+    } else {
+        Some(KernelThreadLimit::new(limit.rlim_cur))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn host_kernel_threads_max() -> Option<KernelThreadLimit> {
+    let raw = std::fs::read_to_string("/proc/sys/kernel/threads-max").ok()?;
+    raw.trim().parse::<u64>().ok().map(KernelThreadLimit::new)
+}
+
+#[cfg(target_os = "macos")]
+fn host_kernel_threads_max() -> Option<KernelThreadLimit> {
+    host_sysctl_u64("kern.maxprocperuid")
+        .or_else(|| host_sysctl_u64("kern.maxproc"))
+        .map(KernelThreadLimit::new)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn host_kernel_threads_max() -> Option<KernelThreadLimit> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn host_sysctl_u64(name: &str) -> Option<u64> {
+    let cname = std::ffi::CString::new(name).ok()?;
+    let mut value: u64 = 0;
+    let mut len = std::mem::size_of::<u64>();
+    // SAFETY: `sysctlbyname` writes at most `len` bytes into `value`; we pass a
+    // matching size and a valid NUL-terminated sysctl name.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            cname.as_ptr(),
+            &mut value as *mut u64 as *mut libc::c_void,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc == 0 && len == std::mem::size_of::<u64>() {
+        Some(value)
+    } else {
+        None
+    }
+}
+
 fn context_guest_hostname(ctx: &SyntheticProcContext) -> &str {
     if ctx.guest_hostname.is_empty() {
         crate::execute::guest_hostname()
@@ -390,7 +470,12 @@ const SYSCTL_TABLE: &[(&str, Sysctl)] = &[
     // Present but read-only in Docker's LTP container. LTP io_uring tests use
     // this save/restore path to skip when they cannot change the kernel knob.
     ("/proc/sys/kernel/io_uring_disabled", Sysctl::Static(b"0\n")),
-    ("/proc/sys/kernel/threads-max", Sysctl::Static(b"127760\n")),
+    // Host-powered process/thread ceiling. This is intentionally not used to
+    // tune SysV IPC workloads; queue throughput belongs to the SysV service.
+    (
+        "/proc/sys/kernel/threads-max",
+        Sysctl::Dynamic(sysctl_threads_max),
+    ),
     ("/proc/sys/kernel/ngroups_max", Sysctl::Static(b"65536\n")),
     // carrick has no autogroup scheduler, so the honest value is 0.
     (
