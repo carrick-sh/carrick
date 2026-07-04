@@ -185,6 +185,15 @@ pub(super) fn deliver_fault_signal<E: ThreadedEngine>(
     const SIGBUS: i32 = 7;
     const BUS_ADRERR: i32 = 2;
     if signum == SIGSEGV
+        && let Some((page, prot)) = dispatcher.resident_fault_plan(si_addr)
+        && engine
+            .protect_range(page, crate::linux_abi::LINUX_PAGE_SIZE as usize, prot)
+            .is_ok()
+    {
+        dispatcher.commit_resident_fault(page);
+        return Ok(None);
+    }
+    if signum == SIGSEGV
         && let Some((grow_start, grow_len)) = dispatcher.mmap_growdown_fault_plan(si_addr)
         && engine
             .protect_range(

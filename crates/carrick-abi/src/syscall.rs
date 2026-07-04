@@ -445,7 +445,7 @@ const AARCH64_SYSCALLS: &[Syscall] = &[
     syscall(281, "execveat", "process", SupportLevel::Planned),
     syscall(282, "userfaultfd", "mm", SupportLevel::Deferred),
     syscall(283, "membarrier", "process", SupportLevel::BringUp),
-    syscall(284, "mlock2", "mm", SupportLevel::Deferred),
+    syscall(284, "mlock2", "mm", SupportLevel::BringUp),
     syscall(285, "copy_file_range", "fs", SupportLevel::BringUp),
     syscall(286, "preadv2", "fs", SupportLevel::Deferred),
     syscall(287, "pwritev2", "fs", SupportLevel::Deferred),
