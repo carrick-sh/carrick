@@ -798,6 +798,9 @@ impl SyscallDispatcher {
             let child_sp = stack + stack_size;
             return clone_thread_outcome(flags, child_sp, parent_tid_ptr, tls_val, child_tid_ptr);
         }
+        if flags & (LinuxCloneFlags::NEWUSER | LinuxCloneFlags::NEWPID).bits() != 0 {
+            return DispatchOutcome::errno(LINUX_EPERM);
+        }
 
         let pidfd_out = if flags & LinuxCloneFlags::PIDFD.bits() != 0 {
             Some(args.pidfd)
@@ -2311,6 +2314,9 @@ impl SyscallDispatcher {
             let thread_mask = LinuxCloneFlags::THREAD_MASK;
             if (flags & thread_mask) == thread_mask {
                 return Ok(clone_thread_outcome(flags, stack, parent_tid.0, tls, child_tid.0));
+            }
+            if flags & (LinuxCloneFlags::NEWUSER | LinuxCloneFlags::NEWPID).bits() != 0 {
+                return Ok(DispatchOutcome::errno(LINUX_EPERM));
             }
 
             let pidfd_out = if flags & LinuxCloneFlags::PIDFD.bits() != 0 {
