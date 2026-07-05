@@ -8237,19 +8237,18 @@ impl SyscallDispatcher {
         }
 
         fn fanotify_init(this, cx, _flags: u64, _event_f_flags: u64) {
-            // fanotify is genuinely CAP_SYS_ADMIN-gated: unprivileged Linux itself
-            // returns EPERM here. Carrick has no fanotify backend, so EPERM is the
-            // honest CAP-gated answer that MATCHes real Linux with no seccomp
-            // trick. Do NOT unconfine these suites — there is no real success path
-            // to converge on.
-            Ok(DispatchOutcome::errno(LINUX_EPERM))
+            // Carrick has no fanotify backend at all, so ENOSYS (the honest
+            // "unimplemented") is correct — not a fabricated EPERM that would
+            // claim the syscall is implemented-but-denied. Consistent with
+            // keyring/pidfd_getfd: report-only against an unconfined,
+            // CAP_SYS_ADMIN oracle that can run the real syscall.
+            Ok(DispatchOutcome::errno(LINUX_ENOSYS))
         }
 
         fn fanotify_mark(this, cx, _fanotify_fd: Fd, _flags: u64, _mask: u64, _dirfd: Fd, _pathname: GuestPtr) {
-            // See fanotify_init: no fanotify backend; EPERM is the honest
-            // CAP_SYS_ADMIN-gated answer, matching unprivileged Linux with no
-            // seccomp trick. Do NOT unconfine these suites.
-            Ok(DispatchOutcome::errno(LINUX_EPERM))
+            // See fanotify_init: no fanotify backend, so honest ENOSYS, not a
+            // fabricated EPERM denial.
+            Ok(DispatchOutcome::errno(LINUX_ENOSYS))
         }
 
         fn sync(this, cx) {
