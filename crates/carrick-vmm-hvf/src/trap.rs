@@ -714,15 +714,24 @@ fn vcpu_created() {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VmCreateAdmission {
     Initial,
-    ForkRebuild,
+    ForkRebuild { vfork: bool },
     ExecveRebuild,
     SharedWaitResume,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl VmCreateAdmission {
-    fn uses_global_permit(self) -> bool {
-        matches!(self, Self::Initial)
+    const CONSERVATIVE_GLOBAL_VM_CAP: usize = 4;
+
+    fn global_permit_budget_from_mn(self, mn_budget: usize) -> Option<usize> {
+        let mn_budget = mn_budget.max(1);
+        match self {
+            Self::Initial | Self::SharedWaitResume => {
+                Some(mn_budget.min(Self::CONSERVATIVE_GLOBAL_VM_CAP))
+            }
+            Self::ForkRebuild { vfork: false } => Some(mn_budget),
+            Self::ForkRebuild { vfork: true } | Self::ExecveRebuild => None,
+        }
     }
 }
 
@@ -806,12 +815,13 @@ fn open_global_vcpu_slot(slot: usize) -> Option<libc::c_int> {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn acquire_global_vcpu_permit() -> GlobalVcpuPermit {
+fn acquire_global_vcpu_permit(budget: usize) -> GlobalVcpuPermit {
     // `hv_vm_get_max_vcpu_count` is a per-VM ceiling. A fork storm creates many
-    // one-vCPU VMs, and HVF can exhaust host resources well below that per-VM
-    // count. Keep the cross-process gate conservative; the in-process M:N
-    // scheduler uses the physical-core-capped per-VM budget for guest threads.
-    let budget = vcpu_gate::budget().clamp(1, 4);
+    // one-vCPU VMs, and HVF can exhaust host resources well below that per-VM count.
+    // Admission classes choose the budget: plain fork needs the physical-core M:N
+    // budget so forked waiters can reach their blocking syscall, while shared-wait
+    // resume drains already-parked processes through a smaller gate.
+    let budget = budget.max(1);
     ensure_global_vcpu_slot_dir();
     let mut backoff = GlobalVcpuPermitBackoff::default();
     loop {
@@ -936,11 +946,9 @@ fn create_vm_with_admission(
     ),
     TrapError,
 > {
-    let permit = if admission.uses_global_permit() {
-        Some(acquire_global_vcpu_permit())
-    } else {
-        None
-    };
+    let permit = admission
+        .global_permit_budget_from_mn(vcpu_gate::budget())
+        .map(acquire_global_vcpu_permit);
     match virtual_machine_with_private_signals_blocked(config) {
         Ok(vm) => Ok((vm, permit)),
         Err(e) => {
@@ -969,10 +977,19 @@ fn create_vm_with_admission(
 /// queue (producers exit → free slots → queued consumers admitted) therefore
 /// complete instead of deadlocking.
 ///
-/// The shared M:N scheduler applies this budget to guest-thread vCPU slots.
-/// Initial VM creation and fork/execve VM REBUILDs must not also wait on a second
-/// sibling-thread gate: a fork releases its vCPUs before rebuilding, and blocking
-/// a rebuild behind the gate it just emptied would be a self-deadlock.
+/// The shared M:N scheduler caps runnable sibling threads inside one process.
+/// A separate file-lock permit caps one-vCPU HVF VMs across a fork tree: otherwise
+/// every fork child receives a fresh process-local scheduler and a plain LTP fork
+/// storm can create hundreds of live VMs until HVF returns `HV_NO_RESOURCES`.
+/// Plain fork rebuilds use this same physical-core budget so child processes can
+/// reach blocking syscalls. Initial VM creation and shared-wait resumes use a
+/// smaller cross-process gate: they are independent processes competing for host
+/// HVF resources, not threads sharing one M:N scheduler.
+///
+/// Vfork rebuilds deliberately bypass that global permit. The vfork parent waits
+/// inside the fork handler itself until the child execs/exits, so admitting that
+/// parent and child through the same cross-process slots can self-deadlock. Execve
+/// rebuilds also bypass for the same vfork-child progress reason.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod vcpu_gate {
     use std::sync::{Condvar, OnceLock};
@@ -3199,7 +3216,12 @@ impl HvfVmState {
         if is_child {
             reset_global_vcpu_permits_after_fork_child();
         }
-        let (new_vm, permit) = create_vm_with_admission(config, VmCreateAdmission::ForkRebuild)?;
+        let (new_vm, permit) = create_vm_with_admission(
+            config,
+            VmCreateAdmission::ForkRebuild {
+                vfork: self.vfork_share,
+            },
+        )?;
         let new_vcpu = create_vcpu_with_permit(&new_vm, permit)?;
         enable_el0_counter_access(new_vcpu.id());
         self.vcpu_id = new_vcpu.id();
@@ -4501,11 +4523,66 @@ mod vm_create_admission_tests {
     use super::*;
 
     #[test]
-    fn only_initial_vm_creation_uses_global_permit() {
-        assert!(VmCreateAdmission::Initial.uses_global_permit());
-        assert!(!VmCreateAdmission::ForkRebuild.uses_global_permit());
-        assert!(!VmCreateAdmission::ExecveRebuild.uses_global_permit());
-        assert!(!VmCreateAdmission::SharedWaitResume.uses_global_permit());
+    fn resource_growing_vm_creation_uses_global_permit() {
+        assert!(
+            VmCreateAdmission::Initial
+                .global_permit_budget_from_mn(10)
+                .is_some()
+        );
+        assert!(
+            VmCreateAdmission::ForkRebuild { vfork: false }
+                .global_permit_budget_from_mn(10)
+                .is_some(),
+            "plain fork rebuilds create another live one-vCPU VM in the fork tree"
+        );
+        assert!(
+            VmCreateAdmission::ForkRebuild { vfork: true }
+                .global_permit_budget_from_mn(10)
+                .is_none(),
+            "vfork parents wait in the fork handler, so the child rebuild must not \
+             compete with the parent for the same global permit"
+        );
+        assert!(
+            VmCreateAdmission::ExecveRebuild
+                .global_permit_budget_from_mn(10)
+                .is_none()
+        );
+        assert!(
+            VmCreateAdmission::SharedWaitResume
+                .global_permit_budget_from_mn(10)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn global_permit_budget_depends_on_admission_kind() {
+        assert_eq!(
+            VmCreateAdmission::Initial.global_permit_budget_from_mn(10),
+            Some(4)
+        );
+        assert_eq!(
+            VmCreateAdmission::ForkRebuild { vfork: false }.global_permit_budget_from_mn(10),
+            Some(10),
+            "plain fork uses the physical-core M:N budget"
+        );
+        assert_eq!(
+            VmCreateAdmission::ForkRebuild { vfork: true }.global_permit_budget_from_mn(10),
+            None
+        );
+        assert_eq!(
+            VmCreateAdmission::ExecveRebuild.global_permit_budget_from_mn(10),
+            None
+        );
+        assert_eq!(
+            VmCreateAdmission::SharedWaitResume.global_permit_budget_from_mn(10),
+            Some(4),
+            "shared-wait resume drains parked processes through the conservative gate"
+        );
+        assert_eq!(
+            VmCreateAdmission::Initial.global_permit_budget_from_mn(2),
+            Some(2),
+            "small hosts keep their real M:N budget"
+        );
     }
 
     #[test]
