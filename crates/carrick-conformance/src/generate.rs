@@ -124,6 +124,20 @@ const DOCKER_FLAG_PREFIX_OVERRIDES: &[(&str, &[&str])] = &[
             "SYS_RESOURCE",
         ],
     ),
+    // fanotify_init needs CAP_SYS_ADMIN. Grant it (plus unconfine) so the
+    // oracle can attempt the real syscall — carrick has no fanotify backend
+    // and honestly returns ENOSYS, so the divergence is report-only (see
+    // known_gap below), not a fabricated EPERM match against the container's
+    // seccomp policy.
+    (
+        "ltp-fanotify",
+        &[
+            "--security-opt",
+            "seccomp=unconfined",
+            "--cap-add",
+            "SYS_ADMIN",
+        ],
+    ),
 ];
 
 /// Suites a prefix override would otherwise capture but MUST NOT: they need a
@@ -138,17 +152,19 @@ const OVERRIDE_EXCLUSIONS: &[&str] = &["ltp-setrlimit06"];
 
 /// Suites whose single LTP `"summary"` divergence is a TRACKED-unimplemented-
 /// capability marker (maintainer-approved report-only), NOT an edge-case excuse.
-/// keyring and pidfd_getfd have no carrick backend: with the oracle unconfined
-/// the docker side runs the real syscall and SUCCEEDS while carrick returns
-/// ENOSYS, so they legitimately DIFF. Stamping the `"summary"` id known keeps
-/// the gate green while the gap stays visible. Matched by PREFIX. `"summary"` is
-/// the ONLY id the LTP parser emits (see parsers/ltp.rs), so it is the exact
-/// diverging id — verified empirically from a focused oracle run, not invented.
+/// keyring, pidfd_getfd, and fanotify have no carrick backend: with the oracle
+/// unconfined the docker side runs the real syscall and SUCCEEDS while carrick
+/// returns ENOSYS, so they legitimately DIFF. Stamping the `"summary"` id known
+/// keeps the gate green while the gap stays visible. Matched by PREFIX.
+/// `"summary"` is the ONLY id the LTP parser emits (see parsers/ltp.rs), so it
+/// is the exact diverging id — verified empirically from a focused oracle run,
+/// not invented.
 const KNOWN_GAP_PREFIX_OVERRIDES: &[(&str, &[&str])] = &[
     ("ltp-add_key", &["summary"]),
     ("ltp-request_key", &["summary"]),
     ("ltp-keyctl", &["summary"]),
     ("ltp-pidfd_getfd", &["summary"]),
+    ("ltp-fanotify", &["summary"]),
 ];
 
 /// Exact-name known_gaps for suites that a whole-family prefix would over-mark.
@@ -618,10 +634,10 @@ mod tests {
         }
     }
 
-    /// The keyring/pidfd_getfd/setrlimit oracle-fidelity flags (and the
-    /// keyring/pidfd known_gaps) must be present in the COMMITTED manifest so a
-    /// future regen without them is caught. Reads suites.toml off disk (not
-    /// `build()`, which shells to docker).
+    /// The keyring/pidfd_getfd/setrlimit/fanotify oracle-fidelity flags (and
+    /// the keyring/pidfd/fanotify known_gaps) must be present in the COMMITTED
+    /// manifest so a future regen without them is caught. Reads suites.toml off
+    /// disk (not `build()`, which shells to docker).
     #[test]
     fn committed_suites_carry_oracle_fidelity_flags_and_gaps() {
         let text = std::fs::read_to_string(concat!(
@@ -653,6 +669,23 @@ mod tests {
             assert!(
                 s.docker_flags.iter().any(|f| f == "SYS_PTRACE"),
                 "{name} lost cap SYS_PTRACE"
+            );
+            assert!(
+                s.known_gaps.iter().any(|g| g == "summary"),
+                "{name} lost known_gap summary"
+            );
+        }
+        // fanotify: unconfined + CAP_SYS_ADMIN + known_gap "summary" (no
+        // carrick backend — report-only).
+        for name in ["ltp-fanotify02", "ltp-fanotify04", "ltp-fanotify07"] {
+            let s = find(name);
+            assert!(
+                s.docker_flags.iter().any(|f| f == "seccomp=unconfined"),
+                "{name} lost seccomp=unconfined"
+            );
+            assert!(
+                s.docker_flags.iter().any(|f| f == "SYS_ADMIN"),
+                "{name} lost cap SYS_ADMIN"
             );
             assert!(
                 s.known_gaps.iter().any(|g| g == "summary"),
@@ -748,6 +781,14 @@ mod tests {
         // pidfd_open/pidfd_send_signal are genuinely implemented — no override.
         assert_eq!(docker_flag_overrides("ltp-pidfd_open01"), None);
         assert_eq!(known_gap_overrides("ltp-pidfd_send_signal01"), None);
+        // fanotify: unconfined + SYS_ADMIN + known_gap summary.
+        let f = docker_flag_overrides("ltp-fanotify02").unwrap();
+        assert!(f.iter().any(|x| x == "seccomp=unconfined"));
+        assert!(f.iter().any(|x| x == "SYS_ADMIN"));
+        assert_eq!(
+            known_gap_overrides("ltp-fanotify07"),
+            Some(vec!["summary".into()])
+        );
         // setrlimit01-05: unconfined + SYS_RESOURCE. Only 01 (FSIZE-enforcement
         // gap) gets a known_gap; 02/03/04/05 MATCH -> no gap (03 now enforces the
         // nr_open ceiling on NOFILE hard-raises even for root).
