@@ -24,6 +24,7 @@ pub struct RunOutput {
     pub stderr_path: PathBuf,
     pub exit_code: i32,
     pub timed_out: bool,
+    pub elapsed_ms: u64,
     pub run_id: String,
     pub argv: Vec<String>,
 }
@@ -325,9 +326,19 @@ fn run_one(
         stderr_path,
         exit_code,
         timed_out,
+        elapsed_ms: elapsed_ms(start.elapsed()),
         run_id: run_id.to_string(),
         argv,
     })
+}
+
+fn elapsed_ms(duration: Duration) -> u64 {
+    let ms = duration.as_millis();
+    if ms > u64::MAX as u128 {
+        u64::MAX
+    } else {
+        ms as u64
+    }
 }
 
 /// Kill exactly this run — never an unscoped reap.

@@ -44,6 +44,15 @@ pub struct SideSummary {
     pub totals: Totals,
 }
 
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PerfSummary {
+    pub carrick_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oracle_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub carrick_to_oracle_ratio: Option<f64>,
+}
+
 /// One per-suite record — the unit of both `results.jsonl` and `baseline.jsonl`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SuiteReport {
@@ -55,6 +64,8 @@ pub struct SuiteReport {
     pub gating: bool,
     pub carrick: SideSummary,
     pub docker: SideSummary,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub perf: Option<PerfSummary>,
     /// diverging ids that are NOT excused (the regression set, or first-obs NEW set).
     pub new_diffs: Vec<String>,
     /// diverging ids excused by known_gaps or an unchanged baseline pair.
