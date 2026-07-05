@@ -74,6 +74,10 @@ pub struct OracleRecord {
     pub key: String,
     /// The cached, parsed docker oracle result (totals + per-id outcomes).
     pub result: SuiteResult,
+    /// Observed docker wall time from the cache-fill run. This is telemetry, not a
+    /// determinant of oracle correctness, so it deliberately stays out of the key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elapsed_ms: Option<u64>,
 }
 
 /// A committed JSONL cache of docker oracle results, keyed by determinant.
@@ -145,6 +149,16 @@ impl OracleCache {
         Some(result)
     }
 
+    pub fn get_elapsed_ms(
+        &self,
+        suite: &Suite,
+        platform: crate::lane::DockerPlatform,
+    ) -> Option<u64> {
+        self.by_key
+            .get(&oracle_key(suite, platform))
+            .and_then(|record| record.elapsed_ms)
+    }
+
     /// Cache a freshly-run docker result. Refuses a non-comparable (crashed /
     /// empty) oracle so a broken run is retried next time, never frozen. Returns
     /// whether it was stored.
@@ -153,6 +167,7 @@ impl OracleCache {
         suite: &Suite,
         platform: crate::lane::DockerPlatform,
         result: SuiteResult,
+        elapsed_ms: Option<u64>,
     ) -> bool {
         if !is_cacheable(&result) {
             return false;
@@ -164,6 +179,7 @@ impl OracleCache {
                 name: suite.name.clone(),
                 key,
                 result,
+                elapsed_ms,
             },
         );
         self.dirty = true;
@@ -407,6 +423,7 @@ mod tests {
             name: "s".into(),
             key: "k1".into(),
             result: result(&[("t", Outcome::Ok)], SuiteOutcome::Success),
+            elapsed_ms: None,
         })
         .unwrap();
         let text = format!("{valid}\n\n   \n{{\"not\":\"an-oracle-record\"}}\ntotally not json\n");
@@ -433,7 +450,7 @@ mod tests {
         let platform = crate::lane::DockerPlatform::LinuxArm64;
         assert!(cache.get(&s, platform).is_none(), "empty cache must miss");
         assert!(
-            cache.insert(&s, platform, r.clone()),
+            cache.insert(&s, platform, r.clone(), Some(1234)),
             "comparable result must store"
         );
         assert!(cache.dirty());
@@ -445,6 +462,7 @@ mod tests {
         assert_eq!(got.totals.n, 2);
         assert_eq!(got.ids.get("t1").copied(), Some(Outcome::Ok));
         assert_eq!(got.ids.get("t2").copied(), Some(Outcome::Fail));
+        assert_eq!(reloaded.get_elapsed_ms(&s, platform), Some(1234));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -459,6 +477,7 @@ mod tests {
             &s,
             platform,
             result(&[("t", Outcome::Ok)], SuiteOutcome::Success),
+            None,
         );
         cache.save().unwrap();
 
@@ -503,6 +522,7 @@ mod tests {
                     ..Default::default()
                 },
             },
+            perf: None,
             new_diffs: vec![],
             known_diffs: vec![],
             carrick_run_id: String::new(),
@@ -594,8 +614,8 @@ mod tests {
         let mut cache = OracleCache::load(&path);
         // docker hung / crashed -> result None, must NOT be cached.
         let platform = crate::lane::DockerPlatform::LinuxArm64;
-        assert!(!cache.insert(&s, platform, result(&[], SuiteOutcome::None)));
-        assert!(!cache.insert(&s, platform, result(&[], SuiteOutcome::Empty)));
+        assert!(!cache.insert(&s, platform, result(&[], SuiteOutcome::None), Some(1)));
+        assert!(!cache.insert(&s, platform, result(&[], SuiteOutcome::Empty), Some(1)));
         assert!(!cache.dirty(), "nothing stored");
         assert!(cache.get(&s, platform).is_none());
         let _ = std::fs::remove_file(&path);
