@@ -70,6 +70,8 @@ const LTP_SMOKE: &[&str] = &[
     "sched_getaffinity01",
 ];
 
+const LTP_NOFILE_4096: &[&str] = &["dup03", "dup06", "dup205"];
+
 /// LTP binaries that are single manifests but multi-phase tests; the default
 /// 40 s syscall-family budget can kill them after valid progress. Keep these
 /// budgets close to the oracle: a pathological failure must not hold a
@@ -400,11 +402,16 @@ fn build() -> (Vec<Suite>, (usize, usize, usize)) {
         .collect();
     ltp.sort();
     for b in &ltp {
+        let cmd = if LTP_NOFILE_4096.contains(&b.as_str()) {
+            vec![format!("ulimit -n 4096; /opt/ltp/testcases/bin/{b}")]
+        } else {
+            vec![format!("/opt/ltp/testcases/bin/{b}")]
+        };
         let mut suite = mk(
             format!("ltp-{b}"),
             Ecosystem::Ltp,
             LTP_IMG,
-            vec![format!("/opt/ltp/testcases/bin/{b}")],
+            cmd,
             VerdictKind::Ltp,
             smoke(LTP_SMOKE.contains(&b.as_str())),
             Light,
