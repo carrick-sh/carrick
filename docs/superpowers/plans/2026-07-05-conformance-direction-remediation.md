@@ -4,6 +4,11 @@
 
 **Goal:** Correct the four direction drifts found in the 76-commit LTP re-bless campaign (`47a8bb10..HEAD`) — replace deny-to-match-the-container denials with honest capability, revert the capability-capping / test-shaping fakes and fix the latent `wait4(-1)` bug, gate-test then simplify the HVF vcpu-admission machinery, and finish the shared-mmap SysV IPC arena — so carrick's conformance reflects **real Linux behavior, not a constrained oracle**.
 
+**North Star (maintainer, 2026-07-05):** the uber goal is to **complete a `conformance --bless` successfully**. Everything below serves that. Triage every gap by kind:
+- **Unimplemented** (no backend — keyring, `pidfd_getfd`, fanotify) → mark it an honest **DIFF / report-only** (tracked `known_gap` used as a subsystem marker). Acceptable; do not fake a MATCH.
+- **Regressed** (worked before and broke — deny-to-match fakes, capability caps, correctness bugs) → **MUST FIX**, never mark.
+- **Perf/timing outlier** (the new duration-ratio telemetry, `020bd0b0`, flags where carrick is orders of magnitude slower than Linux) → **judgment call**: FIX the slowness that can't sustain real workloads (SysV file-backed path → arena; admission churn); TOLERATE + TRACK the slowness that needs deeper architectural work (record as debt, don't block the bless). `epoll-ltp` ~30x is a live judgment case (Phase 5).
+
 **Architecture:** Five independently-executable phases, sequenced by risk and dependency. Phase 0 (hygiene) and Phases 1–2 (small, high-value dispatch reverts) land first; Phase 3 (HVF admission) gate-tests before any redesign; Phase 4 (SysV arena) is the honest home of the `msgmni` fix. Each phase produces working, independently-testable software and could be pulled out as its own plan.
 
 **Tech Stack:** Rust 2024 workspace; `just` recipes (`just build`, `just test`, `just fmt-check`, `just conformance`, `just lint-domains`, `just ci`); `cargo test -p <crate>`, `cargo clippy`; the differential Docker oracle (`cargo run -p carrick-conformance -- --tier full ...`); `bitflags`, `libc`, `zerocopy`, mmap-backed shared state, the carrick shared-futex abstraction (`carrick_host::ulock`); `carrick trace` (in-process dtrace) and `carrick-lldb` for diagnosis.
@@ -34,6 +39,7 @@
 | 3b-mech | #2 | Replace host-wide 4-VM file-lock permit with a shared-memory atomic counter (keep physical-core cap) | M | — |
 | 3b-spike | #2 | *Design spike:* measure whether reclaim-on-block alone can drop the cross-process permit | L (spike) | after 3b-mech |
 | 4 | #3+#4 | Finish shared-mmap SysV arena (free-list) → run-global queue count → **realistic `msgmni`** (subsumes the `msgmni=8` revert) | L (spike) | — |
+| 5 | North Star | Drive the full `conformance --bless`: triage every remaining gap (fix regressions, DIFF/report-only the unimplemented, judgment-triage perf outliers), then bless | L | goal complete |
 
 **`msgmni` note:** ruling #3 wants `msgmni=8` gone, but the value is coupled to *enforcement* on the still-file-backed hot path and is not even enforced run-globally today (per-process `HashSet`). Raising it standalone makes `msgstress01` TIMEOUT. The honest removal therefore lives in **Phase 4** (Task 4), which builds the run-global counter that makes a realistic `msgmni` affordable. Until Phase 4 lands, `msgmni=8` is an **acknowledged debt**, not a hidden shaping — do not raise it on the file path.
 
@@ -318,6 +324,23 @@ parses the `verdict` per suite, prints a table, and **exits 1 if any row is not 
 - [ ] **Step 3: RED→GREEN.** `sysvmsgcap`'s global-cap key now enforces at the real ceiling; `cargo run -p carrick-conformance -- --tier full --workers 1 --flake-retries 0 --suite ltp-msgstress01` MATCHes (it sizes off `/proc/sys/kernel/msgmni` and no longer TIMEOUTs with a real arena). `just ci`.
 - [ ] **Step 4: Commit.** `fix(runtime): restore linux-realistic msgmni now that arena has capacity`
 - **This is the honest completion of ruling #3's `msgmni=8` revert** — deferred here because a realistic ceiling is only affordable once Tasks 4.1-4.2 make that many queues real. Never raise the enforced ceiling before the arena lands.
+
+---
+
+## Phase 5 — Drive the full `conformance --bless` to green (North Star)
+
+After Phases 0–4 land, run the full gate and drive it to a blessable state. This is where the maintainer's triage rule is applied case-by-case; it is **not** blind bless.
+
+- [ ] **Full gate (two-phase, never concurrent):** `just conformance full` (oracle phase then carrick phase). Capture the JSONL + the duration-ratio telemetry.
+- [ ] **Triage every non-MATCH row by kind:**
+  - **Regressed** (was MATCH, now DIFF/CRASH/TIMEOUT; or a correctness divergence real Linux would not have) → **fix it** (new task/probe, red-first). Never mark. The campaign's masked regressions live here.
+  - **Unimplemented** (no backend — keyring, pidfd_getfd, and any other genuinely-absent subsystem) → **DIFF / report-only** via `known_gaps` as a subsystem marker; record the subsystem as tracked future work.
+  - **Oracle-side** (oracle CRASH/BROKEN/flaky, not carrick) → confirm via a docker-only run; re-bless the honest verdict (legitimate bless mechanics, not an excuse).
+- [ ] **Perf-outlier judgment** (duration-ratio telemetry ≥10×/≥100×): for each outlier decide, with the maintainer where non-obvious:
+  - *Untenable for real workloads* (a real program would be unusable) → **fix** (targeted or architectural — e.g. the SysV arena from Phase 4 removes the file-backed hot path; admission simplification from Phase 3). 
+  - *Acceptable pending deeper architecture* → **tolerate + track** as recorded debt; it does not block the bless, but the ratio stays visible in telemetry. `epoll-ltp` ~30× is the first case to rule on.
+- [ ] **Bless:** once every row is MATCH, an honest tracked DIFF, or a triaged-and-recorded perf outlier — and **zero unfixed regressions** — run the bless. Record the final MATCH/DIFF/report-only counts and the perf-debt ledger in `docs/`.
+- **Gotcha:** the `--bless` safety refuses on gating regressions (it worked before — see the Wave-0 ledger). A refused bless means a regression is unfixed; find and fix it, do not force.
 
 ---
 
