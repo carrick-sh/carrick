@@ -2754,11 +2754,13 @@ impl SyscallDispatcher {
         }
 
         fn pidfd_getfd(this, cx, _pidfd: Fd, _targetfd: u64, _flags: u64) {
-            // Carrick does not yet provide a safe cross-process guest-fd
-            // duplication path. Surface the same conservative denial that the
-            // Docker oracle reports under its container policy instead of
-            // advertising the syscall as absent with ENOSYS.
-            Ok(DispatchOutcome::errno(LINUX_EPERM))
+            // Carrick has no cross-process guest-fd duplication on macOS; a real
+            // implementation needs a host helper to reach into another guest
+            // process's fd table. Report the honest "unimplemented" (ENOSYS)
+            // rather than a fabricated EPERM that would falsely claim the syscall
+            // is implemented-but-denied. pidfd_open/pidfd_send_signal remain
+            // genuinely implemented and are untouched.
+            Ok(DispatchOutcome::errno(LINUX_ENOSYS))
         }
 
         fn pidfd_send_signal(this, cx, fd: Fd, signum: u64, info: GuestPtr, flags: u64) {
