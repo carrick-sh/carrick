@@ -25,6 +25,7 @@ use crate::verdict::{Baseline, SideSummary, SuiteReport, Verdict, classify};
 use clap::Parser;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 
 /// Runtime crates whose change should out-date the signed binary (the soft
@@ -44,6 +45,8 @@ const RUNTIME_CRATES: &[&str] = &[
     "carrick-guest-mem",
     "carrick-cli",
 ];
+
+const DEFAULT_MAX_GATING: usize = 50;
 
 #[derive(Parser, Debug)]
 #[command(about = "Differential conformance harness (carrick vs docker)")]
@@ -136,6 +139,18 @@ struct Args {
     /// retries them instead of false-failing. 0 disables.
     #[arg(long, default_value = "2", env = "CARRICK_CONFORMANCE_FLAKE_RETRIES")]
     flake_retries: usize,
+    /// Abort once MORE than this many gating verdicts are observed. Cached
+    /// oracle verdicts can stop phase 1 early; uncached/refresh runs check after
+    /// classification. Use --force for an exhaustive run.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_MAX_GATING,
+        env = "CARRICK_CONFORMANCE_MAX_GATING"
+    )]
+    max_gating: usize,
+    /// Force an exhaustive run even when the fail-fast threshold is exceeded.
+    #[arg(long)]
+    force: bool,
     #[arg(long, default_value = "target/release/carrick")]
     carrick_bin: PathBuf,
     /// Committed docker-oracle cache (parsed results, one JSONL line per suite).
@@ -365,6 +380,13 @@ fn run() -> anyhow::Result<ExitCode> {
     let workers = worker_count(args.workers);
     let cpython_workers = cpython_worker_count(args.cpython_workers, workers);
     let lanes = SchedulerLanes::new(cpython_workers);
+    let fail_fast = FailFast::new(args.force, args.max_gating);
+    if !fail_fast.force {
+        eprintln!(
+            "fail-fast: abort after more than {} gating verdict(s) (use --force for exhaustive)",
+            fail_fast.max_gating
+        );
+    }
 
     // The oracle is cached for routine runs, so a suite's verdict is fully known
     // the moment its carrick run finishes — no docker needed. Load the cache +
@@ -383,41 +405,81 @@ fn run() -> anyhow::Result<ExitCode> {
             .collect()
     };
     let stream = Mutex::new(std::fs::File::create(&args.jsonl).ok());
+    let streamed_reports = Mutex::new(Vec::new());
+    let fail_fast_stop = AtomicBool::new(false);
+    let phase1_gating = AtomicUsize::new(0);
 
     // ---- Phase 1: ALL carrick (weight-aware; never overlapping docker). ----
     eprintln!("phase 1/3: {n} carrick runs (workers={workers}, cpython-workers={cpython_workers})");
     let all_indices: Vec<usize> = (0..n).collect();
-    let carrick_outs = fan_out_scheduled(&all_indices, &selected, workers, &lanes, |i| {
-        let s = &selected[i];
-        // Zero-pad the index so no run-id is a prefix of another (c01 vs c10);
-        // kill.sh anchors on the proctitle "carrick:<id>:" delimiter too, but a
-        // collision-free id is defense in depth against any unanchored grep.
-        let run_id = format!("conf-{pid}-c{i:02}");
-        let out = engine::run_carrick(s, &carrick_bin, &run_id, &lane);
-        eprintln!("  [carrick] {}", s.name);
-        // Stream this suite's report NOW if its oracle is cached (the common
-        // case). Un-cached suites still need docker (Phase 2) and are emitted
-        // only by the final authoritative write.
-        if let Some(res) = cached.get(i).and_then(|c| c.as_ref()) {
-            let docker = DockerSide {
-                result: res.clone(),
-                run_id: "<cached>".to_string(),
-                argv: engine::docker_dry_run(s, "<cached>", docker_platform),
-            };
-            let cout = out.as_ref().ok();
-            let rep = build_report(s, cout, &docker, &baseline);
-            if let Ok(line) = serde_json::to_string(&rep)
-                && let Ok(mut guard) = stream.lock()
-                && let Some(f) = guard.as_mut()
-            {
-                use std::io::Write as _;
-                let _ = writeln!(f, "{line}");
-                let _ = f.flush();
+    let carrick_outs = fan_out_scheduled_with_stop(
+        &all_indices,
+        &selected,
+        workers,
+        &lanes,
+        || fail_fast_stop.load(Ordering::SeqCst),
+        |i| {
+            let s = &selected[i];
+            // Zero-pad the index so no run-id is a prefix of another (c01 vs c10);
+            // kill.sh anchors on the proctitle "carrick:<id>:" delimiter too, but a
+            // collision-free id is defense in depth against any unanchored grep.
+            let run_id = format!("conf-{pid}-c{i:02}");
+            let out = engine::run_carrick(s, &carrick_bin, &run_id, &lane);
+            eprintln!("  [carrick] {}", s.name);
+            // Stream this suite's report NOW if its oracle is cached (the common
+            // case). Un-cached suites still need docker (Phase 2) and are emitted
+            // only by the final authoritative write.
+            if let Some(res) = cached.get(i).and_then(|c| c.as_ref()) {
+                let docker = DockerSide {
+                    result: res.clone(),
+                    run_id: "<cached>".to_string(),
+                    argv: engine::docker_dry_run(s, "<cached>", docker_platform),
+                };
+                let cout = out.as_ref().ok();
+                let rep = build_report(s, cout, &docker, &baseline);
+                if rep.gating {
+                    let gating = phase1_gating.fetch_add(1, Ordering::SeqCst) + 1;
+                    if fail_fast.should_abort(gating)
+                        && !fail_fast_stop.swap(true, Ordering::SeqCst)
+                    {
+                        eprintln!(
+                            "fail-fast: stopping phase 1 after {gating} gating verdict(s) \
+                         (max {}, use --force for exhaustive)",
+                            fail_fast.max_gating
+                        );
+                    }
+                }
+                if let Ok(line) = serde_json::to_string(&rep)
+                    && let Ok(mut guard) = stream.lock()
+                    && let Some(f) = guard.as_mut()
+                {
+                    use std::io::Write as _;
+                    let _ = writeln!(f, "{line}");
+                    let _ = f.flush();
+                }
+                streamed_reports
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(rep);
             }
-        }
-        out
-    });
+            out
+        },
+    );
     drop(stream);
+    if fail_fast_stop.load(Ordering::SeqCst) {
+        let reports = streamed_reports
+            .into_inner()
+            .unwrap_or_else(|e| e.into_inner());
+        write_reports(&args.jsonl, &reports)?;
+        print_summary(&reports);
+        eprintln!(
+            "\nFAIL-FAST: {} cached-oracle gating verdict(s) exceeded max {} \
+             before all suites were scheduled; use --force for an exhaustive run",
+            phase1_gating.load(Ordering::SeqCst),
+            fail_fast.max_gating
+        );
+        return Ok(ExitCode::from(1));
+    }
 
     // ---- Phase 2: docker — but ONLY for suites whose oracle is not already
     // cached. The docker oracle for a deterministic suite is stable, so it needs
@@ -510,6 +572,16 @@ fn run() -> anyhow::Result<ExitCode> {
     // (no docker re-run), so this never overlaps docker. ----
     let retries = args.flake_retries;
     let gating_before = reports.iter().filter(|r| r.gating).count();
+    if fail_fast.should_abort(gating_before) {
+        write_reports(&args.jsonl, &reports)?;
+        print_summary(&reports);
+        eprintln!(
+            "\nFAIL-FAST: {gating_before} gating verdict(s) exceeded max {}; \
+             use --force for retries/bless/exhaustive classification",
+            fail_fast.max_gating
+        );
+        return Ok(ExitCode::from(1));
+    }
     if retries > 0 && gating_before > 0 {
         eprintln!(
             "phase 3b: retry-on-flake — {gating_before} gating suite(s), up to {retries} retr{} each",
@@ -766,6 +838,22 @@ fn bless(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct FailFast {
+    force: bool,
+    max_gating: usize,
+}
+
+impl FailFast {
+    fn new(force: bool, max_gating: usize) -> Self {
+        Self { force, max_gating }
+    }
+
+    fn should_abort(self, gating: usize) -> bool {
+        !self.force && gating > self.max_gating
+    }
+}
+
 /// Hand-rolled work-stealing pool (std only; mirrors conformance.rs::fan_out_indexed
 /// but returns `Option<T>` to stay clear of the no-panic gate). Lane permits are
 /// acquired before dispatch so blocked heavy suites do not monopolize workers
@@ -775,6 +863,17 @@ fn fan_out_scheduled<T: Send>(
     suites: &[Suite],
     workers: usize,
     lanes: &SchedulerLanes,
+    f: impl Fn(usize) -> T + Sync,
+) -> Vec<Option<T>> {
+    fan_out_scheduled_with_stop(indices, suites, workers, lanes, || false, f)
+}
+
+fn fan_out_scheduled_with_stop<T: Send>(
+    indices: &[usize],
+    suites: &[Suite],
+    workers: usize,
+    lanes: &SchedulerLanes,
+    should_stop: impl Fn() -> bool + Sync,
     f: impl Fn(usize) -> T + Sync,
 ) -> Vec<Option<T>> {
     let slots: Vec<Mutex<Option<T>>> = (0..indices.len()).map(|_| Mutex::new(None)).collect();
@@ -790,7 +889,7 @@ fn fan_out_scheduled<T: Send>(
                     let job = {
                         let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
                         loop {
-                            if state.completed == indices.len() {
+                            if state.completed == indices.len() || should_stop() {
                                 break None;
                             }
 
@@ -1782,6 +1881,50 @@ mod tests {
         assert!(!called, "retries=0 must run nothing");
         assert_eq!(recovered, 0);
         assert_eq!(items, vec![("a", true), ("b", false)]);
+    }
+
+    #[test]
+    fn fail_fast_trips_only_after_limit_unless_forced() {
+        let normal = FailFast::new(false, 2);
+        assert!(!normal.should_abort(0));
+        assert!(!normal.should_abort(2));
+        assert!(normal.should_abort(3));
+
+        let forced = FailFast::new(true, 2);
+        assert!(!forced.should_abort(3));
+        assert!(!forced.should_abort(300));
+    }
+
+    #[test]
+    fn scheduled_fanout_stops_claiming_new_jobs_after_stop() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let suites: Vec<Suite> = (0..12)
+            .map(|i| suite(&format!("suite-{i}"), Ecosystem::Ltp, Weight::Light))
+            .collect();
+        let indices: Vec<usize> = (0..suites.len()).collect();
+        let lanes = SchedulerLanes::new(4);
+        let stop = AtomicBool::new(false);
+        let ran = AtomicUsize::new(0);
+
+        let out = fan_out_scheduled_with_stop(
+            &indices,
+            &suites,
+            1,
+            &lanes,
+            || stop.load(Ordering::SeqCst),
+            |i| {
+                let n = ran.fetch_add(1, Ordering::SeqCst) + 1;
+                if n == 3 {
+                    stop.store(true, Ordering::SeqCst);
+                }
+                i
+            },
+        );
+
+        assert_eq!(ran.load(Ordering::SeqCst), 3);
+        assert_eq!(out.iter().filter(|x| x.is_some()).count(), 3);
+        assert!(out.iter().skip(3).all(Option::is_none));
     }
 
     #[test]
