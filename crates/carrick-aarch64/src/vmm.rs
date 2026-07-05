@@ -139,10 +139,11 @@ pub struct Aarch64VcpuSnapshot {
     /// and the guest can only READ it (EL1 writes it), so a fork/clone/reclaim must
     /// restore it — vDSO cpu-id / rseq read it. KVM does not use it (left 0).
     pub tpidrro_el0: u64,
-    /// TPIDR_EL1 — carrick's per-vCPU scratch. HVF stamps the guest tid here for
-    /// the fast `gettid` path; `hv_vcpu_create` zeroes it, so a rebuild must restore
-    /// it. (On KVM TPIDR_EL1 backs the syscall-frame `saved_x9` stash; the snapshot
-    /// carries it so a reclaim/fork round-trips that too.)
+    /// TPIDR_EL1 — carrick's per-vCPU scratch. HVF's syscall shim uses it only
+    /// transiently to preserve x16 while checking ESR_EL1; the fast `gettid`
+    /// path stores the guest tid in CONTEXTIDR_EL1 instead. (On KVM TPIDR_EL1
+    /// backs the syscall-frame `saved_x9` stash; the snapshot carries it so a
+    /// reclaim/fork round-trips that too.)
     pub tpidr_el1: u64,
     /// ACTLR_EL1 — incl. EnTSO (Rosetta `prctl(PR_SET_MEM_MODEL, TSO)`). Restored
     /// across fork/clone/reclaim so a rebuilt vCPU keeps hardware x86 TSO. KVM has
