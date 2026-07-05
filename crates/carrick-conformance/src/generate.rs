@@ -76,15 +76,123 @@ const LTP_NOFILE_4096: &[&str] = &["dup03", "dup06", "dup205"];
 /// clone3 template: lift the container seccomp default so BOTH engines run the
 /// real syscall (carrick then returns ENOSYS for unimplemented). Hand-edits to
 /// the generated suites.toml do NOT survive regen — this table is their home.
+/// Matched by EXACT suite name.
 const DOCKER_FLAG_OVERRIDES: &[(&str, &[&str])] = &[
     ("ltp-clone301", &["--security-opt", "seccomp=unconfined"]),
     ("ltp-clone302", &["--security-opt", "seccomp=unconfined"]),
 ];
+
+/// Oracle-fidelity docker_flags matched by suite-name PREFIX (family stem), so a
+/// whole LTP family shares one entry (add_key01..05, keyctl01..09, …) without
+/// enumerating every binary. Same intent as [`DOCKER_FLAG_OVERRIDES`]: run the
+/// oracle against the REAL syscall (not the seccomp-blocked container) so the
+/// comparison reflects true Linux capability, not the container's policy.
+/// (`docker_flags` is part of the oracle cache determinant, so a changed entry
+/// forces a live re-run — never a stale confined result.)
+const DOCKER_FLAG_PREFIX_OVERRIDES: &[(&str, &[&str])] = &[
+    // Keyring: real Linux allows UNPRIVILEGED user keyrings; the container's
+    // default seccomp blocks add_key/request_key/keyctl. Unconfine so the
+    // oracle runs the real syscall — carrick then honestly returns ENOSYS and
+    // the suite's known_gap ("summary") keeps that divergence report-only.
+    ("ltp-add_key", &["--security-opt", "seccomp=unconfined"]),
+    ("ltp-request_key", &["--security-opt", "seccomp=unconfined"]),
+    ("ltp-keyctl", &["--security-opt", "seccomp=unconfined"]),
+    // pidfd_getfd additionally needs CAP_SYS_PTRACE to reach into the target
+    // process's fd table.
+    (
+        "ltp-pidfd_getfd",
+        &[
+            "--security-opt",
+            "seccomp=unconfined",
+            "--cap-add",
+            "SYS_PTRACE",
+        ],
+    ),
+    // setrlimit: raising a previously-lowered hard cap needs CAP_SYS_RESOURCE.
+    // Grant it (plus unconfine, template-consistent) so the root oracle matches
+    // the now-privilege-gated root carrick guest. The raise-tests (setrlimit02/
+    // 04/05) then MATCH honestly — that IS the euid-gate fix, verified. The
+    // enforcement-tests (01/03) still DIFF on genuine carrick gaps and carry a
+    // known_gap (see below). setrlimit06 is EXCLUDED entirely (see
+    // OVERRIDE_EXCLUSIONS).
+    (
+        "ltp-setrlimit",
+        &[
+            "--security-opt",
+            "seccomp=unconfined",
+            "--cap-add",
+            "SYS_RESOURCE",
+        ],
+    ),
+];
+
+/// Suites a prefix override would otherwise capture but MUST NOT: they need a
+/// deeper runtime fix, not oracle-fidelity flags, and unconfining them would
+/// only convert a fake match into a gating TIMEOUT/REGRESSION.
+///  - setrlimit06 tests RLIMIT_CPU ENFORCEMENT: the child burns CPU expecting
+///    SIGXCPU (soft limit) then SIGKILL (hard limit). carrick does not enforce
+///    RLIMIT_CPU, so the runaway child is never killed and the test spins until
+///    the LTP framework timeout. The real fix is CPU-limit enforcement (tracked
+///    separately) — NOT a longer budget — so leave 06 exactly as committed.
+const OVERRIDE_EXCLUSIONS: &[&str] = &["ltp-setrlimit06"];
+
+/// Suites whose single LTP `"summary"` divergence is a TRACKED-unimplemented-
+/// capability marker (maintainer-approved report-only), NOT an edge-case excuse.
+/// keyring and pidfd_getfd have no carrick backend: with the oracle unconfined
+/// the docker side runs the real syscall and SUCCEEDS while carrick returns
+/// ENOSYS, so they legitimately DIFF. Stamping the `"summary"` id known keeps
+/// the gate green while the gap stays visible. Matched by PREFIX. `"summary"` is
+/// the ONLY id the LTP parser emits (see parsers/ltp.rs), so it is the exact
+/// diverging id — verified empirically from a focused oracle run, not invented.
+const KNOWN_GAP_PREFIX_OVERRIDES: &[(&str, &[&str])] = &[
+    ("ltp-add_key", &["summary"]),
+    ("ltp-request_key", &["summary"]),
+    ("ltp-keyctl", &["summary"]),
+    ("ltp-pidfd_getfd", &["summary"]),
+];
+
+/// Exact-name known_gaps for suites that a whole-family prefix would over-mark.
+/// The setrlimit family mostly MATCHes with the unconfined+cap oracle (the
+/// euid-gate raise-fix); only these two DIFF on genuine, orthogonal carrick
+/// gaps, so ONLY they are report-only (02/04/05 stay clean MATCHes):
+///  - setrlimit01: RLIMIT_FSIZE is not enforced — a child writes 26 bytes where
+///    real Linux caps the file at the 10-byte limit (setrlimit01.c:184).
+///  - setrlimit03: even a privileged raise of RLIMIT_NOFILE above the system max
+///    (nr_open) must return EPERM; carrick models CAP_SYS_RESOURCE as full
+///    privilege without the nr_open ceiling, so it allows the raise and diverges.
+const KNOWN_GAP_EXACT_OVERRIDES: &[(&str, &[&str])] = &[
+    ("ltp-setrlimit01", &["summary"]),
+    ("ltp-setrlimit03", &["summary"]),
+];
+
 fn docker_flag_overrides(name: &str) -> Option<Vec<String>> {
+    if OVERRIDE_EXCLUSIONS.contains(&name) {
+        return None;
+    }
     DOCKER_FLAG_OVERRIDES
         .iter()
         .find(|(n, _)| *n == name)
+        .or_else(|| {
+            DOCKER_FLAG_PREFIX_OVERRIDES
+                .iter()
+                .find(|(p, _)| name.starts_with(p))
+        })
         .map(|(_, f)| f.iter().map(|s| s.to_string()).collect())
+}
+
+fn known_gap_overrides(name: &str) -> Option<Vec<String>> {
+    if OVERRIDE_EXCLUSIONS.contains(&name) {
+        return None;
+    }
+    KNOWN_GAP_EXACT_OVERRIDES
+        .iter()
+        .find(|(n, _)| *n == name)
+        .or_else(|| {
+            KNOWN_GAP_PREFIX_OVERRIDES
+                .iter()
+                .find(|(p, _)| name.starts_with(p))
+        })
+        .map(|(_, g)| g.iter().map(|s| s.to_string()).collect())
 }
 
 /// LTP binaries that are single manifests but multi-phase tests; the default
@@ -447,6 +555,9 @@ fn build() -> (Vec<Suite>, (usize, usize, usize)) {
         if let Some(f) = docker_flag_overrides(&s.name) {
             s.docker_flags = f;
         }
+        if let Some(g) = known_gap_overrides(&s.name) {
+            s.known_gaps = g;
+        }
     }
 
     (suites, (cpy.len(), go.len(), ltp.len()))
@@ -509,6 +620,86 @@ mod tests {
         }
     }
 
+    /// The keyring/pidfd_getfd/setrlimit oracle-fidelity flags (and the
+    /// keyring/pidfd known_gaps) must be present in the COMMITTED manifest so a
+    /// future regen without them is caught. Reads suites.toml off disk (not
+    /// `build()`, which shells to docker).
+    #[test]
+    fn committed_suites_carry_oracle_fidelity_flags_and_gaps() {
+        let text = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../scripts/conformance/suites.toml"
+        ))
+        .unwrap();
+        let m = Manifest::from_toml(&text).unwrap();
+        let find = |name: &str| m.suite.iter().find(|s| s.name == name).unwrap();
+        // Keyring: unconfined oracle + known_gap "summary" (report-only).
+        for name in ["ltp-add_key02", "ltp-keyctl01", "ltp-request_key01"] {
+            let s = find(name);
+            assert!(
+                s.docker_flags.iter().any(|f| f == "seccomp=unconfined"),
+                "{name} lost seccomp=unconfined"
+            );
+            assert!(
+                s.known_gaps.iter().any(|g| g == "summary"),
+                "{name} lost known_gap summary"
+            );
+        }
+        // pidfd_getfd: unconfined + CAP_SYS_PTRACE + known_gap "summary".
+        for name in ["ltp-pidfd_getfd01", "ltp-pidfd_getfd02"] {
+            let s = find(name);
+            assert!(
+                s.docker_flags.iter().any(|f| f == "seccomp=unconfined"),
+                "{name} lost seccomp=unconfined"
+            );
+            assert!(
+                s.docker_flags.iter().any(|f| f == "SYS_PTRACE"),
+                "{name} lost cap SYS_PTRACE"
+            );
+            assert!(
+                s.known_gaps.iter().any(|g| g == "summary"),
+                "{name} lost known_gap summary"
+            );
+        }
+        // setrlimit01/03: unconfined + CAP_SYS_RESOURCE + known_gap "summary"
+        // (genuine FSIZE-enforcement / NOFILE-system-max gaps — report-only).
+        for name in ["ltp-setrlimit01", "ltp-setrlimit03"] {
+            let s = find(name);
+            assert!(
+                s.docker_flags.iter().any(|f| f == "SYS_RESOURCE"),
+                "{name} lost cap SYS_RESOURCE"
+            );
+            assert!(
+                s.known_gaps.iter().any(|g| g == "summary"),
+                "{name} lost known_gap summary"
+            );
+        }
+        // setrlimit02/04/05: unconfined + CAP_SYS_RESOURCE and DELIBERATELY no
+        // gap — these root-raise tests MATCH the cap-added oracle (euid-gate fix).
+        for name in ["ltp-setrlimit02", "ltp-setrlimit04", "ltp-setrlimit05"] {
+            let s = find(name);
+            assert!(
+                s.docker_flags.iter().any(|f| f == "SYS_RESOURCE"),
+                "{name} lost cap SYS_RESOURCE"
+            );
+            assert!(
+                s.known_gaps.is_empty(),
+                "{name} must not carry a known_gap (should MATCH)"
+            );
+        }
+        // setrlimit06 is EXCLUDED (RLIMIT_CPU enforcement gap, needs a real fix
+        // not a longer budget) — no docker_flags, no known_gap, untouched.
+        let s6 = find("ltp-setrlimit06");
+        assert!(
+            s6.docker_flags.is_empty(),
+            "ltp-setrlimit06 must stay unconfined-free (excluded)"
+        );
+        assert!(
+            s6.known_gaps.is_empty(),
+            "ltp-setrlimit06 must not carry a known_gap (excluded)"
+        );
+    }
+
     #[test]
     fn manual_docker_flag_overrides_survive_regen() {
         assert_eq!(
@@ -520,5 +711,63 @@ mod tests {
             Some(vec!["--security-opt".into(), "seccomp=unconfined".into()])
         );
         assert_eq!(docker_flag_overrides("ltp-clone303"), None);
+    }
+
+    /// Family-prefix / exact overrides cover the right binaries with the right
+    /// caps and known_gaps, and honor the setrlimit06 exclusion.
+    #[test]
+    fn family_prefix_overrides_apply() {
+        // keyring: unconfined, no cap, known_gap summary.
+        for name in [
+            "ltp-add_key01",
+            "ltp-add_key05",
+            "ltp-keyctl09",
+            "ltp-request_key06",
+        ] {
+            let f = docker_flag_overrides(name).unwrap();
+            assert!(f.iter().any(|x| x == "seccomp=unconfined"), "{name}");
+            assert!(!f.iter().any(|x| x == "SYS_PTRACE"), "{name}");
+            assert_eq!(
+                known_gap_overrides(name),
+                Some(vec!["summary".into()]),
+                "{name}"
+            );
+        }
+        // pidfd_getfd: unconfined + SYS_PTRACE + known_gap summary.
+        let f = docker_flag_overrides("ltp-pidfd_getfd01").unwrap();
+        assert!(f.iter().any(|x| x == "SYS_PTRACE"));
+        assert_eq!(
+            known_gap_overrides("ltp-pidfd_getfd02"),
+            Some(vec!["summary".into()])
+        );
+        // pidfd_open/pidfd_send_signal are genuinely implemented — no override.
+        assert_eq!(docker_flag_overrides("ltp-pidfd_open01"), None);
+        assert_eq!(known_gap_overrides("ltp-pidfd_send_signal01"), None);
+        // setrlimit01-05: unconfined + SYS_RESOURCE. Only 01/03 (enforcement
+        // gaps) get a known_gap; 02/04/05 (raise-tests) MATCH -> no gap.
+        for name in [
+            "ltp-setrlimit01",
+            "ltp-setrlimit02",
+            "ltp-setrlimit03",
+            "ltp-setrlimit04",
+            "ltp-setrlimit05",
+        ] {
+            let f = docker_flag_overrides(name).unwrap();
+            assert!(f.iter().any(|x| x == "SYS_RESOURCE"), "{name}");
+        }
+        assert_eq!(
+            known_gap_overrides("ltp-setrlimit01"),
+            Some(vec!["summary".into()])
+        );
+        assert_eq!(
+            known_gap_overrides("ltp-setrlimit03"),
+            Some(vec!["summary".into()])
+        );
+        assert_eq!(known_gap_overrides("ltp-setrlimit02"), None);
+        assert_eq!(known_gap_overrides("ltp-setrlimit04"), None);
+        assert_eq!(known_gap_overrides("ltp-setrlimit05"), None);
+        // setrlimit06: EXCLUDED from both overrides (RLIMIT_CPU enforcement gap).
+        assert_eq!(docker_flag_overrides("ltp-setrlimit06"), None);
+        assert_eq!(known_gap_overrides("ltp-setrlimit06"), None);
     }
 }
