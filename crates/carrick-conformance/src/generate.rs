@@ -71,8 +71,11 @@ const LTP_SMOKE: &[&str] = &[
 ];
 
 /// LTP binaries that are single manifests but multi-phase tests; the default
-/// 40 s syscall-family budget can kill them after valid progress.
+/// 40 s syscall-family budget can kill them after valid progress. Keep these
+/// budgets close to the oracle: a pathological failure must not hold a
+/// fail-fast drain for many minutes.
 const LTP_SLOW: &[&str] = &["epoll-ltp"];
+const LTP_SLOW_TIMEOUT_S: u64 = 120;
 
 /// LTP coverage is DENYLIST-based: every test binary in the image is a suite
 /// unless excluded here. (The original allowlist of syscall-family stems kept
@@ -138,7 +141,11 @@ fn go_timeout_s(pkg: &str) -> u64 {
 }
 
 fn ltp_timeout_s(bin: &str) -> u64 {
-    if LTP_SLOW.contains(&bin) { 900 } else { 40 }
+    if LTP_SLOW.contains(&bin) {
+        LTP_SLOW_TIMEOUT_S
+    } else {
+        40
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -442,7 +449,7 @@ mod tests {
     fn full_load_slow_suites_have_extended_budgets() {
         assert_eq!(cpython_timeout_s("test_tarfile"), 600);
         assert_eq!(go_timeout_s("net/http"), 540);
-        assert_eq!(ltp_timeout_s("epoll-ltp"), 900);
+        assert_eq!(ltp_timeout_s("epoll-ltp"), 120);
     }
 
     #[test]
