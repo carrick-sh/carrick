@@ -18,6 +18,7 @@
 use std::sync::OnceLock;
 
 static LOGICAL_CPUS: OnceLock<usize> = OnceLock::new();
+static PHYSICAL_CPUS: OnceLock<usize> = OnceLock::new();
 static HOST_HOSTNAME: OnceLock<Option<String>> = OnceLock::new();
 
 /// The host's short hostname, sanitized to a valid Linux nodename label
@@ -121,6 +122,16 @@ pub fn logical_cpu_count() -> usize {
     *LOGICAL_CPUS.get_or_init(|| query_logical_cpus().clamp(1, 1024))
 }
 
+/// Number of physical host CPU cores Carrick may treat as hardware execution
+/// capacity for host-side scheduling decisions, clamped to `[1, 1024]`.
+///
+/// This intentionally ignores `CARRICK_EXPOSED_CPUS`: that override controls
+/// guest-visible Linux CPU surfaces, while this value caps host HVF vCPU work to
+/// real host cores.
+pub fn physical_cpu_count() -> usize {
+    *PHYSICAL_CPUS.get_or_init(|| query_physical_cpus().clamp(1, 1024))
+}
+
 #[cfg(target_os = "macos")]
 fn query_logical_cpus() -> usize {
     if let Some(n) = env_exposed_cpus() {
@@ -140,11 +151,36 @@ fn query_logical_cpus() -> usize {
     )
 }
 
+#[cfg(target_os = "macos")]
+fn query_physical_cpus() -> usize {
+    let host_physical = sysctl_u32("hw.physicalcpu")
+        .filter(|n| *n >= 1)
+        .map(|n| n as usize);
+    let performance_physical = sysctl_u32("hw.perflevel0.physicalcpu")
+        .filter(|n| *n >= 1)
+        .map(|n| n as usize);
+    let efficiency_physical = sysctl_u32("hw.perflevel1.physicalcpu")
+        .filter(|n| *n >= 1)
+        .map(|n| n as usize);
+
+    select_physical_cpu_count(
+        host_physical,
+        performance_physical,
+        efficiency_physical,
+        available_parallelism_count(),
+    )
+}
+
 #[cfg(not(target_os = "macos"))]
 fn query_logical_cpus() -> usize {
     if let Some(n) = env_exposed_cpus() {
         return n;
     }
+    available_parallelism_count()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn query_physical_cpus() -> usize {
     available_parallelism_count()
 }
 
@@ -173,6 +209,27 @@ fn select_exposed_cpu_count(
         (Some(perf), None) => perf.max(1),
         (None, Some(host)) => host.max(1),
         (None, None) => fallback.max(1),
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn select_physical_cpu_count(
+    host_physical: Option<usize>,
+    performance_physical: Option<usize>,
+    efficiency_physical: Option<usize>,
+    fallback: usize,
+) -> usize {
+    if let Some(host) = host_physical.filter(|n| *n >= 1) {
+        return host;
+    }
+    let cluster_total = performance_physical
+        .filter(|n| *n >= 1)
+        .unwrap_or(0)
+        .saturating_add(efficiency_physical.filter(|n| *n >= 1).unwrap_or(0));
+    if cluster_total >= 1 {
+        cluster_total
+    } else {
+        fallback.max(1)
     }
 }
 
@@ -219,6 +276,15 @@ mod tests {
     }
 
     #[test]
+    fn physical_cpu_count_is_sane() {
+        let n = physical_cpu_count();
+        assert!(
+            (1..=1024).contains(&n),
+            "physical cpu count {n} out of range"
+        );
+    }
+
+    #[test]
     fn exposed_cpu_selection_prefers_performance_level_when_present() {
         assert_eq!(select_exposed_cpu_count(Some(4), Some(10), 10), 4);
         assert_eq!(select_exposed_cpu_count(Some(12), Some(10), 10), 10);
@@ -229,5 +295,17 @@ mod tests {
         assert_eq!(select_exposed_cpu_count(None, Some(10), 4), 10);
         assert_eq!(select_exposed_cpu_count(None, None, 6), 6);
         assert_eq!(select_exposed_cpu_count(Some(0), Some(0), 0), 1);
+    }
+
+    #[test]
+    fn physical_cpu_selection_prefers_total_physical_then_cluster_sum() {
+        assert_eq!(
+            select_physical_cpu_count(Some(10), Some(4), Some(6), 99),
+            10
+        );
+        assert_eq!(select_physical_cpu_count(None, Some(4), Some(6), 99), 10);
+        assert_eq!(select_physical_cpu_count(None, Some(4), None, 99), 4);
+        assert_eq!(select_physical_cpu_count(None, None, None, 8), 8);
+        assert_eq!(select_physical_cpu_count(Some(0), Some(0), Some(0), 0), 1);
     }
 }
