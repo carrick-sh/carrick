@@ -133,11 +133,10 @@ struct Args {
     #[arg(long, env = "CARRICK_CONFORMANCE_CPYTHON_WORKERS")]
     cpython_workers: Option<usize>,
     /// Retry-on-flake: re-run each gating suite up to N times (carrick only,
-    /// reusing the cached oracle), adopting the first non-gating attempt. Several
-    /// Go suites flip pass/none/timeout between identical-binary runs (internal
-    /// Go-runtime-under-HVF races), and serializing does NOT help — so the gate
-    /// retries them instead of false-failing. 0 disables.
-    #[arg(long, default_value = "2", env = "CARRICK_CONFORMANCE_FLAKE_RETRIES")]
+    /// reusing the cached oracle), adopting the first non-gating attempt. This is
+    /// opt-in for targeted flaky-suite investigations; a broad red gate should be
+    /// triaged, not retried suite-by-suite. 0 disables.
+    #[arg(long, default_value = "0", env = "CARRICK_CONFORMANCE_FLAKE_RETRIES")]
     flake_retries: usize,
     /// Abort once MORE than this many gating verdicts are observed. Cached
     /// oracle verdicts can stop phase 1 early; uncached/refresh runs check after
@@ -1881,6 +1880,15 @@ mod tests {
         assert!(!called, "retries=0 must run nothing");
         assert_eq!(recovered, 0);
         assert_eq!(items, vec![("a", true), ("b", false)]);
+    }
+
+    #[test]
+    fn flake_retries_are_opt_in_by_default() {
+        let default = Args::parse_from(["carrick-conformance"]);
+        assert_eq!(default.flake_retries, 0);
+
+        let explicit = Args::parse_from(["carrick-conformance", "--flake-retries", "2"]);
+        assert_eq!(explicit.flake_retries, 2);
     }
 
     #[test]
