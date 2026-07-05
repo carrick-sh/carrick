@@ -792,6 +792,17 @@ impl SyscallDispatcher {
                 if rlim_cur > rlim_max {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
+                // RLIMIT_NOFILE's hard limit can never exceed the system-wide
+                // nr_open ceiling (/proc/sys/fs/nr_open, which carrick advertises
+                // as 1 Mi fds = NOFILE_HARD). This is an ABSOLUTE cap: real Linux
+                // returns EPERM even to a CAP_SYS_RESOURCE/root process, so the
+                // check runs BEFORE the euid-gate below and is NOFILE-specific
+                // (LTP setrlimit03). Without it, a root guest's raise of NOFILE
+                // above nr_open would wrongly succeed.
+                const NR_OPEN_CEILING: u64 = 1024 * 1024;
+                if resource == LINUX_RLIMIT_NOFILE && rlim_max > NR_OPEN_CEILING {
+                    return Ok(DispatchOutcome::errno(LINUX_EPERM));
+                }
                 // Raising a (previously-lowered) hard limit needs CAP_SYS_RESOURCE,
                 // which carrick models as euid==0 (the default guest identity is
                 // root). A privileged guest may raise it; the store path below

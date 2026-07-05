@@ -153,17 +153,15 @@ const KNOWN_GAP_PREFIX_OVERRIDES: &[(&str, &[&str])] = &[
 
 /// Exact-name known_gaps for suites that a whole-family prefix would over-mark.
 /// The setrlimit family mostly MATCHes with the unconfined+cap oracle (the
-/// euid-gate raise-fix); only these two DIFF on genuine, orthogonal carrick
-/// gaps, so ONLY they are report-only (02/04/05 stay clean MATCHes):
+/// euid-gate raise-fix); only this one DIFFs on a genuine, orthogonal carrick
+/// gap, so ONLY it is report-only (02/03/04/05 stay clean MATCHes):
 ///  - setrlimit01: RLIMIT_FSIZE is not enforced — a child writes 26 bytes where
 ///    real Linux caps the file at the 10-byte limit (setrlimit01.c:184).
-///  - setrlimit03: even a privileged raise of RLIMIT_NOFILE above the system max
-///    (nr_open) must return EPERM; carrick models CAP_SYS_RESOURCE as full
-///    privilege without the nr_open ceiling, so it allows the raise and diverges.
-const KNOWN_GAP_EXACT_OVERRIDES: &[(&str, &[&str])] = &[
-    ("ltp-setrlimit01", &["summary"]),
-    ("ltp-setrlimit03", &["summary"]),
-];
+///
+/// setrlimit03 (a privileged raise of RLIMIT_NOFILE above the system max must
+/// return EPERM even for root) used to be report-only, but carrick now enforces
+/// the nr_open ceiling on NOFILE hard-raises regardless of euid, so it MATCHes.
+const KNOWN_GAP_EXACT_OVERRIDES: &[(&str, &[&str])] = &[("ltp-setrlimit01", &["summary"])];
 
 fn docker_flag_overrides(name: &str) -> Option<Vec<String>> {
     if OVERRIDE_EXCLUSIONS.contains(&name) {
@@ -661,9 +659,9 @@ mod tests {
                 "{name} lost known_gap summary"
             );
         }
-        // setrlimit01/03: unconfined + CAP_SYS_RESOURCE + known_gap "summary"
-        // (genuine FSIZE-enforcement / NOFILE-system-max gaps — report-only).
-        for name in ["ltp-setrlimit01", "ltp-setrlimit03"] {
+        // setrlimit01: unconfined + CAP_SYS_RESOURCE + known_gap "summary"
+        // (genuine FSIZE-enforcement gap — report-only).
+        for name in ["ltp-setrlimit01"] {
             let s = find(name);
             assert!(
                 s.docker_flags.iter().any(|f| f == "SYS_RESOURCE"),
@@ -674,9 +672,16 @@ mod tests {
                 "{name} lost known_gap summary"
             );
         }
-        // setrlimit02/04/05: unconfined + CAP_SYS_RESOURCE and DELIBERATELY no
-        // gap — these root-raise tests MATCH the cap-added oracle (euid-gate fix).
-        for name in ["ltp-setrlimit02", "ltp-setrlimit04", "ltp-setrlimit05"] {
+        // setrlimit02/03/04/05: unconfined + CAP_SYS_RESOURCE and DELIBERATELY no
+        // gap. 02/04/05 are root-raise tests that MATCH via the euid-gate fix; 03
+        // MATCHes now that carrick enforces the nr_open ceiling on NOFILE
+        // hard-raises even for root (dropping its former report-only marker).
+        for name in [
+            "ltp-setrlimit02",
+            "ltp-setrlimit03",
+            "ltp-setrlimit04",
+            "ltp-setrlimit05",
+        ] {
             let s = find(name);
             assert!(
                 s.docker_flags.iter().any(|f| f == "SYS_RESOURCE"),
@@ -743,8 +748,9 @@ mod tests {
         // pidfd_open/pidfd_send_signal are genuinely implemented — no override.
         assert_eq!(docker_flag_overrides("ltp-pidfd_open01"), None);
         assert_eq!(known_gap_overrides("ltp-pidfd_send_signal01"), None);
-        // setrlimit01-05: unconfined + SYS_RESOURCE. Only 01/03 (enforcement
-        // gaps) get a known_gap; 02/04/05 (raise-tests) MATCH -> no gap.
+        // setrlimit01-05: unconfined + SYS_RESOURCE. Only 01 (FSIZE-enforcement
+        // gap) gets a known_gap; 02/03/04/05 MATCH -> no gap (03 now enforces the
+        // nr_open ceiling on NOFILE hard-raises even for root).
         for name in [
             "ltp-setrlimit01",
             "ltp-setrlimit02",
@@ -759,11 +765,8 @@ mod tests {
             known_gap_overrides("ltp-setrlimit01"),
             Some(vec!["summary".into()])
         );
-        assert_eq!(
-            known_gap_overrides("ltp-setrlimit03"),
-            Some(vec!["summary".into()])
-        );
         assert_eq!(known_gap_overrides("ltp-setrlimit02"), None);
+        assert_eq!(known_gap_overrides("ltp-setrlimit03"), None);
         assert_eq!(known_gap_overrides("ltp-setrlimit04"), None);
         assert_eq!(known_gap_overrides("ltp-setrlimit05"), None);
         // setrlimit06: EXCLUDED from both overrides (RLIMIT_CPU enforcement gap).
