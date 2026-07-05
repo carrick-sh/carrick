@@ -21,7 +21,7 @@ where
         engine: &mut E,
         wait: crate::thread::FutexWait,
         timeout: Option<Duration>,
-    ) -> Result<i64, RuntimeError> {
+    ) -> Result<BlockingWaitCompletion, RuntimeError> {
         self.complete_futex_wait_with_value(engine, wait, timeout, 0)
     }
 
@@ -31,7 +31,7 @@ where
         wait: crate::thread::FutexWait,
         timeout: Option<Duration>,
         index: i64,
-    ) -> Result<i64, RuntimeError> {
+    ) -> Result<BlockingWaitCompletion, RuntimeError> {
         self.complete_futex_wait_with_value(engine, wait, timeout, index)
     }
 
@@ -41,7 +41,7 @@ where
         wait: crate::thread::FutexWait,
         timeout: Option<Duration>,
         woken_value: i64,
-    ) -> Result<i64, RuntimeError> {
+    ) -> Result<BlockingWaitCompletion, RuntimeError> {
         use crate::thread::FutexWaitOutcome;
 
         let retval: i64 = loop {
@@ -93,6 +93,9 @@ where
                 self.this_tid.raw(),
                 crate::run_state::RunState::Running,
             );
+            if thread_should_finish_for_exec_replacement(&self.registry, self.this_tid) {
+                return Ok(BlockingWaitCompletion::ExecReplacedThread);
+            }
             if let Some((st, old_slot)) = snapshot {
                 // Prefer the thread's OWN just-released slot (reuse its clean vCPU,
                 // no re-bind) over reclaiming another thread's — esp. an exited one.
@@ -186,6 +189,7 @@ where
             break outcome;
         };
         self.complete_returned(engine, retval)
+            .map(BlockingWaitCompletion::Retval)
     }
 
     pub(super) fn complete_shared_futex_wait(
@@ -195,7 +199,7 @@ where
         waiter_key: usize,
         value: u32,
         timeout: Option<Duration>,
-    ) -> Result<i64, RuntimeError> {
+    ) -> Result<BlockingWaitCompletion, RuntimeError> {
         self.complete_shared_futex_wait_with_value(engine, location, waiter_key, value, timeout, 0)
     }
 
@@ -207,7 +211,7 @@ where
         value: u32,
         timeout: Option<Duration>,
         index: i64,
-    ) -> Result<i64, RuntimeError> {
+    ) -> Result<BlockingWaitCompletion, RuntimeError> {
         self.complete_shared_futex_wait_with_value(
             engine, location, waiter_key, value, timeout, index,
         )
@@ -221,7 +225,7 @@ where
         value: u32,
         timeout: Option<Duration>,
         woken_value: i64,
-    ) -> Result<i64, RuntimeError> {
+    ) -> Result<BlockingWaitCompletion, RuntimeError> {
         let interrupted = || {
             crate::host_signal::has_pending_for(self.this_tid.raw())
                 || crate::fork_quiesce::is_quiescing()
@@ -262,6 +266,9 @@ where
                 self.this_tid.raw(),
                 crate::run_state::RunState::Running,
             );
+            if thread_should_finish_for_exec_replacement(&self.registry, self.this_tid) {
+                return Ok(BlockingWaitCompletion::ExecReplacedThread);
+            }
             if let Some((st, old_slot)) = snapshot {
                 let mut kicker_dropped = engine.reclaim_refreshes_kicker();
                 let new = loop {
@@ -347,6 +354,7 @@ where
             let _ = engine.write_bytes(waiter_key as u64, &current.to_ne_bytes());
         }
         self.complete_returned(engine, retval)
+            .map(BlockingWaitCompletion::Retval)
     }
 
     #[allow(clippy::too_many_arguments)]
