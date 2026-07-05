@@ -132,13 +132,12 @@ oracle-cache edits are only used when the suite declaration itself changed.
 - `ltp-ptrace06` MATCH after the ptrace signal-delivery stop fix above; the
   same current tree reports all 48 invalid peek/poke address assertions as
   matching Linux.
-- `ltp-ptrace11` MATCH after synthetic attach-stop support for pid 1. Root
-  cause fixed: Carrick no longer treats every `PTRACE_ATTACH` to an existing
-  task as `EPERM`; attaching the namespace init records a synthetic waitable
-  `SIGSTOP` attach stop and `PTRACE_DETACH` clears it. Red-first:
-  `ptraceattachinit` DIFFed on attach/wait/detach before matching Linux, while
-  `ptraceattach` still covers the non-dumpable-parent `EPERM` case from
-  `ltp-ptrace02`.
+- `ltp-ptrace11` `PTRACE_ATTACH` to pid 1 returns honest `EPERM` (the errno
+  real Linux gives a non-root attach to init). The earlier synthetic waitable
+  `SIGSTOP` attach stop — and the latent `wait4(-1)` hazard it carried (a
+  genuine wait-any-child could drain the phantom pid-1 stop) — has been
+  reverted; Carrick does not actually stop init. The suite therefore DIFFs
+  honestly on the attach path, with no harness excuse.
 - `ltp-adjtimex01`, `ltp-adjtimex02`, and `ltp-adjtimex03` MATCH after
   exposing the read-only `adjtimex`/`clock_adjtime(CLOCK_REALTIME)` time
   discipline state. Root causes fixed: `modes == 0` now writes a Linux-shaped
