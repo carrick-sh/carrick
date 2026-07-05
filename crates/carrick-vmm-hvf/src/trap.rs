@@ -711,9 +711,48 @@ fn vcpu_created() {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VmCreateAdmission {
+    Initial,
+    ForkRebuild,
+    ExecveRebuild,
+    SharedWaitResume,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl VmCreateAdmission {
+    fn uses_global_permit(self) -> bool {
+        matches!(self, Self::Initial)
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 struct GlobalVcpuPermit {
     slot: usize,
     fd: libc::c_int,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct GlobalVcpuPermitBackoff {
+    next_ms: u64,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Default for GlobalVcpuPermitBackoff {
+    fn default() -> Self {
+        Self { next_ms: 1 }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl GlobalVcpuPermitBackoff {
+    const MAX_MS: u64 = 50;
+
+    fn next_delay(&mut self) -> std::time::Duration {
+        let delay = self.next_ms;
+        self.next_ms = self.next_ms.saturating_mul(2).min(Self::MAX_MS);
+        std::time::Duration::from_millis(delay)
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -738,11 +777,15 @@ fn close_global_vcpu_permit(permit: GlobalVcpuPermit) {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn open_global_vcpu_slot(slot: usize) -> Option<libc::c_int> {
+fn ensure_global_vcpu_slot_dir() {
     let dir = c"/tmp/carrick-hvf-vcpu-slots";
     unsafe {
         let _ = libc::mkdir(dir.as_ptr(), 0o700);
     }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn open_global_vcpu_slot(slot: usize) -> Option<libc::c_int> {
     let Ok(path) = std::ffi::CString::new(format!("/tmp/carrick-hvf-vcpu-slots/slot-{slot}"))
     else {
         return None;
@@ -769,6 +812,8 @@ fn acquire_global_vcpu_permit() -> GlobalVcpuPermit {
     // count. Keep the cross-process gate conservative; the in-process scheduler
     // still uses the full per-VM budget for guest threads.
     let budget = (vcpu_gate::budget().max(1) as usize).min(4);
+    ensure_global_vcpu_slot_dir();
+    let mut backoff = GlobalVcpuPermitBackoff::default();
     loop {
         let mut state = global_vcpu_permits()
             .lock()
@@ -784,7 +829,7 @@ fn acquire_global_vcpu_permit() -> GlobalVcpuPermit {
             return GlobalVcpuPermit { slot, fd };
         }
         drop(state);
-        std::thread::sleep(std::time::Duration::from_millis(1));
+        std::thread::sleep(backoff.next_delay());
     }
 }
 
@@ -844,16 +889,20 @@ fn reset_global_vcpu_permits_after_fork_child() {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn create_vcpu_with_permit(
     vm: &applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>,
-    permit: GlobalVcpuPermit,
+    permit: Option<GlobalVcpuPermit>,
 ) -> Result<applevisor::vcpu::Vcpu, TrapError> {
     match vm.vcpu_create() {
         Ok(vcpu) => {
-            register_global_vcpu_permit(vcpu.id(), permit);
+            if let Some(permit) = permit {
+                register_global_vcpu_permit(vcpu.id(), permit);
+            }
             vcpu_created();
             Ok(vcpu)
         }
         Err(e) => {
-            release_unregistered_global_vcpu_permit(permit);
+            if let Some(permit) = permit {
+                release_unregistered_global_vcpu_permit(permit);
+            }
             Err(hvf_error(e))
         }
     }
@@ -877,20 +926,27 @@ fn create_vcpu(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn create_vm_with_permit(
+fn create_vm_with_admission(
     config: applevisor::vm::VirtualMachineConfig,
+    admission: VmCreateAdmission,
 ) -> Result<
     (
         applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>,
-        GlobalVcpuPermit,
+        Option<GlobalVcpuPermit>,
     ),
     TrapError,
 > {
-    let permit = acquire_global_vcpu_permit();
+    let permit = if admission.uses_global_permit() {
+        Some(acquire_global_vcpu_permit())
+    } else {
+        None
+    };
     match virtual_machine_with_private_signals_blocked(config) {
         Ok(vm) => Ok((vm, permit)),
         Err(e) => {
-            release_unregistered_global_vcpu_permit(permit);
+            if let Some(permit) = permit {
+                release_unregistered_global_vcpu_permit(permit);
+            }
             Err(hvf_error(e))
         }
     }
@@ -1509,7 +1565,7 @@ impl HvfVmState {
         let max_ipa = VirtualMachineConfig::get_max_ipa_size().map_err(hvf_error)?;
         let mut config = VirtualMachineConfig::new();
         config.set_ipa_size(max_ipa).map_err(hvf_error)?;
-        let (vm, permit) = create_vm_with_permit(config)?;
+        let (vm, permit) = create_vm_with_admission(config, VmCreateAdmission::Initial)?;
         let vcpu = create_vcpu_with_permit(&vm, permit)?;
         enable_el0_counter_access(vcpu.id());
 
@@ -2844,7 +2900,8 @@ impl HvfVmState {
         let max_ipa = VirtualMachineConfig::get_max_ipa_size().map_err(hvf_error)?;
         let mut config = VirtualMachineConfig::new();
         config.set_ipa_size(max_ipa).map_err(hvf_error)?;
-        let (new_vm, permit) = create_vm_with_permit(config)?;
+        let (new_vm, permit) =
+            create_vm_with_admission(config, VmCreateAdmission::SharedWaitResume)?;
         let new_vcpu = create_vcpu_with_permit(&new_vm, permit)?;
         enable_el0_counter_access(new_vcpu.id());
         self.vcpu_id = new_vcpu.id();
@@ -3129,7 +3186,7 @@ impl HvfVmState {
         if is_child {
             reset_global_vcpu_permits_after_fork_child();
         }
-        let (new_vm, permit) = create_vm_with_permit(config)?;
+        let (new_vm, permit) = create_vm_with_admission(config, VmCreateAdmission::ForkRebuild)?;
         let new_vcpu = create_vcpu_with_permit(&new_vm, permit)?;
         enable_el0_counter_access(new_vcpu.id());
         self.vcpu_id = new_vcpu.id();
@@ -3460,7 +3517,7 @@ impl HvfVmState {
         let max_ipa = VirtualMachineConfig::get_max_ipa_size().map_err(hvf_error)?;
         let mut config = VirtualMachineConfig::new();
         config.set_ipa_size(max_ipa).map_err(hvf_error)?;
-        let (new_vm, permit) = create_vm_with_permit(config)?;
+        let (new_vm, permit) = create_vm_with_admission(config, VmCreateAdmission::ExecveRebuild)?;
         let new_vcpu = create_vcpu_with_permit(&new_vm, permit)?;
         enable_el0_counter_access(new_vcpu.id());
         self.vcpu_id = new_vcpu.id();
@@ -4424,6 +4481,40 @@ pub(crate) fn hvf_vcpu_budget() -> usize {
 // engine's `build_sibling_spec` applies before `materialize_sibling`. HVF's
 // `from_thread_spec` only stands up the vCPU + mirrors the mapping metadata; the
 // engine restores the seeded snapshot onto it.
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(test)]
+mod vm_create_admission_tests {
+    use super::*;
+
+    #[test]
+    fn only_initial_vm_creation_uses_global_permit() {
+        assert!(VmCreateAdmission::Initial.uses_global_permit());
+        assert!(!VmCreateAdmission::ForkRebuild.uses_global_permit());
+        assert!(!VmCreateAdmission::ExecveRebuild.uses_global_permit());
+        assert!(!VmCreateAdmission::SharedWaitResume.uses_global_permit());
+    }
+
+    #[test]
+    fn global_permit_retries_back_off_to_cap() {
+        let mut backoff = GlobalVcpuPermitBackoff::default();
+        let delays: Vec<_> = (0..8).map(|_| backoff.next_delay()).collect();
+
+        assert_eq!(
+            delays,
+            [
+                std::time::Duration::from_millis(1),
+                std::time::Duration::from_millis(2),
+                std::time::Duration::from_millis(4),
+                std::time::Duration::from_millis(8),
+                std::time::Duration::from_millis(16),
+                std::time::Duration::from_millis(32),
+                std::time::Duration::from_millis(50),
+                std::time::Duration::from_millis(50),
+            ]
+        );
+    }
+}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[cfg(test)]
