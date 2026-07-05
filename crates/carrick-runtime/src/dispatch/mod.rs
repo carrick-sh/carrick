@@ -1282,6 +1282,16 @@ pub enum DispatchOutcome {
         wake: u32,
         requeue: u32,
     },
+    /// Wait until an internal fork-shared word changes, then re-dispatch the
+    /// original syscall. This is for runtime-owned kernel objects such as SysV
+    /// message queues: the wait condition is not the syscall result, it only says
+    /// the object state might have changed. The loop must release dispatcher and
+    /// vCPU resources while parked, then retry the handler under fresh state.
+    WaitOnSharedWord {
+        location: carrick_guest_mem::SharedFutexLocation,
+        waiter_key: usize,
+        value: u32,
+    },
     /// A blocking-mode I/O syscall (ppoll/pselect/poll/select with no fd ready,
     /// or — later — recvfrom/accept/read that would block) needs to wait for
     /// host-fd readiness. Like `FutexWait`, the handler MUST NOT block while
@@ -1442,6 +1452,7 @@ impl DispatchOutcome {
             DispatchOutcome::SharedFutexWaitv { .. } => (0, None),
             DispatchOutcome::SharedFutexWake { .. } => (0, None),
             DispatchOutcome::SharedFutexRequeue { .. } => (0, None),
+            DispatchOutcome::WaitOnSharedWord { .. } => (0, None),
             DispatchOutcome::WaitOnFds { .. } => (0, None),
             DispatchOutcome::BlockingHostWrite(_) => (0, None),
             DispatchOutcome::WaitOnFdsSelect { .. } => (0, None),

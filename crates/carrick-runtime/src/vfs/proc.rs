@@ -468,11 +468,12 @@ const SYSCTL_TABLE: &[(&str, Sysctl)] = &[
         Sysctl::Static(b"18446744073692774399\n"),
     ),
     ("/proc/sys/kernel/shmmni", Sysctl::Static(b"4096\n")),
-    // SysV message-queue tunables. These mirror the Linux defaults Carrick's
-    // owned queue implementation enforces for MSGMAX/MSGMNB/MSGMNI.
+    // SysV message-queue tunables. MSGMAX/MSGMNB mirror Linux defaults; MSGMNI
+    // is Carrick's current owned-service queue-count capacity, not a host
+    // process/thread shaping knob.
     ("/proc/sys/kernel/msgmax", Sysctl::Static(b"8192\n")),
     ("/proc/sys/kernel/msgmnb", Sysctl::Static(b"16384\n")),
-    ("/proc/sys/kernel/msgmni", Sysctl::Static(b"32000\n")),
+    ("/proc/sys/kernel/msgmni", Sysctl::Static(b"8\n")),
     (
         "/proc/sys/kernel/sem",
         Sysctl::Static(b"32000\t1024000000\t500\t32000\n"),
@@ -2694,7 +2695,8 @@ Pid:\t{pid}\nPPid:\t{ppid}\nThreads:\t1\n",
     let host_ppid = info.as_ref().map(|info| info.ppid).unwrap_or(fallback_ppid);
     let host_pgid = info.as_ref().map(|info| info.pgid).unwrap_or(fallback_pgid);
     let disp_ppid = if ns_enabled {
-        crate::namespace::pid::host_to_ns_or_self(host_ppid)
+        crate::namespace::pid::ns_ppid_for_host(host_pid)
+            .unwrap_or_else(|| crate::namespace::pid::host_to_ns_or_self(host_ppid))
     } else {
         host_ppid
     };

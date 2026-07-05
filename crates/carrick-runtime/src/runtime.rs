@@ -1176,6 +1176,15 @@ where
                 runtime.complete_syscall(retval)?;
                 last_syscall_retval = Some(retval);
             }
+            DispatchOutcome::WaitOnSharedWord {
+                location: _,
+                waiter_key: _,
+                value: _,
+            } => {
+                return Err(RuntimeError::Unsupported(
+                    "WaitOnSharedWord escaped single-threaded syscall service".to_string(),
+                ));
+            }
             DispatchOutcome::SharedFutexWake {
                 location,
                 waiter_key,
@@ -1524,6 +1533,18 @@ fn dispatch_single_threaded_syscall<M: GuestMemory>(
                     WaitResult::Errno(errno) => return Ok(DispatchOutcome::Errno { errno }),
                 }
             }
+            DispatchOutcome::WaitOnSharedWord {
+                location,
+                waiter_key,
+                value,
+            } => {
+                let retval =
+                    shared_futex_wait(location.wait_addr(), waiter_key, value, None, waiter.tid());
+                if retval == 0 {
+                    continue;
+                }
+                return Ok(DispatchOutcome::Returned { value: retval });
+            }
             other => return Ok(other),
         }
     }
@@ -1667,7 +1688,11 @@ fn shared_futex_wait(
         let r = crate::ulock::wait(host_addr, value, slice_us);
         crate::probes::ulock_wait(host_addr as u64, value, slice_us, 1, r);
         if r >= 0 {
-            return 0;
+            let current = unsafe { (host_addr as *const u32).read() };
+            if current != value {
+                return 0;
+            }
+            continue;
         }
         let host_errno = (-r) as i32;
         if host_errno == libc::ETIMEDOUT || host_errno == libc::EINTR {

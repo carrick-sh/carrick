@@ -5,6 +5,11 @@
 
 use super::*;
 
+enum SharedWordWaitRaw {
+    Retval(i64),
+    ExecReplacedThread,
+}
+
 impl<E: ThreadedEngine + 'static> ThreadRuntimeState<E>
 where
     E::SiblingSpec: 'static,
@@ -217,15 +222,14 @@ where
         )
     }
 
-    fn complete_shared_futex_wait_with_value(
+    fn wait_on_shared_word_retval(
         &self,
         engine: &mut E,
         location: carrick_guest_mem::SharedFutexLocation,
         waiter_key: usize,
         value: u32,
         timeout: Option<Duration>,
-        woken_value: i64,
-    ) -> Result<BlockingWaitCompletion, RuntimeError> {
+    ) -> Result<SharedWordWaitRaw, RuntimeError> {
         let interrupted = || {
             crate::host_signal::has_pending_for(self.this_tid.raw())
                 || crate::fork_quiesce::is_quiescing()
@@ -251,7 +255,7 @@ where
             } else {
                 None
             };
-            // Genuine guest block (cross-process MAP_SHARED FUTEX_WAIT).
+
             crate::run_state::publish(crate::run_state::RunState::Blocked);
             crate::thread::set_current_thread_state(self.this_tid, 'S');
             crate::run_state::publish_guest_tid(
@@ -267,7 +271,7 @@ where
                 crate::run_state::RunState::Running,
             );
             if thread_should_finish_for_exec_replacement(&self.registry, self.this_tid) {
-                return Ok(BlockingWaitCompletion::ExecReplacedThread);
+                return Ok(SharedWordWaitRaw::ExecReplacedThread);
             }
             if let Some((st, old_slot)) = snapshot {
                 let mut kicker_dropped = engine.reclaim_refreshes_kicker();
@@ -340,19 +344,53 @@ where
             }
             break retval;
         };
-        let retval = if retval == 0 { woken_value } else { retval };
         if location.is_mirror() {
-            // A bhyve shared futex waits on a fork-coherent mirror word, while the
-            // guest loop rereads its process-private copied sysmem word after the
-            // wait returns. Pull the mirror value back so a successful wake that
-            // changed the word in another process is visible to the waiter before
-            // it resumes guest code.
             let current = unsafe {
                 (*(location.wait_addr().raw() as *const std::sync::atomic::AtomicU32))
                     .load(std::sync::atomic::Ordering::SeqCst)
             };
             let _ = engine.write_bytes(waiter_key as u64, &current.to_ne_bytes());
         }
+        Ok(SharedWordWaitRaw::Retval(retval))
+    }
+
+    pub(super) fn wait_on_shared_word(
+        &self,
+        engine: &mut E,
+        location: carrick_guest_mem::SharedFutexLocation,
+        waiter_key: usize,
+        value: u32,
+    ) -> Result<SharedWordWaitCompletion, RuntimeError> {
+        match self.wait_on_shared_word_retval(engine, location, waiter_key, value, None)? {
+            SharedWordWaitRaw::ExecReplacedThread => {
+                Ok(SharedWordWaitCompletion::ExecReplacedThread)
+            }
+            SharedWordWaitRaw::Retval(retval)
+                if retval == crate::linux_abi::LINUX_EINTR.guest_retval() =>
+            {
+                Ok(SharedWordWaitCompletion::Interrupted)
+            }
+            SharedWordWaitRaw::Retval(_) => Ok(SharedWordWaitCompletion::Changed),
+        }
+    }
+
+    fn complete_shared_futex_wait_with_value(
+        &self,
+        engine: &mut E,
+        location: carrick_guest_mem::SharedFutexLocation,
+        waiter_key: usize,
+        value: u32,
+        timeout: Option<Duration>,
+        woken_value: i64,
+    ) -> Result<BlockingWaitCompletion, RuntimeError> {
+        let retval =
+            match self.wait_on_shared_word_retval(engine, location, waiter_key, value, timeout)? {
+                SharedWordWaitRaw::Retval(retval) => retval,
+                SharedWordWaitRaw::ExecReplacedThread => {
+                    return Ok(BlockingWaitCompletion::ExecReplacedThread);
+                }
+            };
+        let retval = if retval == 0 { woken_value } else { retval };
         self.complete_returned(engine, retval)
             .map(BlockingWaitCompletion::Retval)
     }
