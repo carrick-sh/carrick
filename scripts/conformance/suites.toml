@@ -7813,6 +7813,17 @@ timeout_s = 40
 carrick_flags = ["--raw", "--fs", "host"]
 
 [[suite]]
+name = "ltp-chdir02"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/chdir02"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
 name = "ltp-chdir04"
 ecosystem = "ltp"
 image = "localhost:5050/ltp:arm64"
@@ -8209,6 +8220,17 @@ timeout_s = 40
 carrick_flags = ["--raw", "--fs", "host"]
 
 [[suite]]
+name = "ltp-clock_settime04"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/clock_settime04"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
 name = "ltp-clone01"
 ecosystem = "ltp"
 image = "localhost:5050/ltp:arm64"
@@ -8308,6 +8330,28 @@ timeout_s = 40
 carrick_flags = ["--raw", "--fs", "host"]
 
 [[suite]]
+name = "ltp-clone10"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/clone10"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
+name = "ltp-clone11"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/clone11"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
 name = "ltp-clone301"
 ecosystem = "ltp"
 image = "localhost:5050/ltp:arm64"
@@ -8336,6 +8380,17 @@ name = "ltp-clone303"
 ecosystem = "ltp"
 image = "localhost:5050/ltp:arm64"
 cmd = ["/opt/ltp/testcases/bin/clone303"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
+name = "ltp-clone304"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/clone304"]
 verdict = "ltp"
 tier = "full"
 weight = "light"
@@ -8599,7 +8654,7 @@ carrick_flags = ["--raw", "--fs", "host"]
 name = "ltp-dup03"
 ecosystem = "ltp"
 image = "localhost:5050/ltp:arm64"
-cmd = ["/opt/ltp/testcases/bin/dup03"]
+cmd = ["ulimit -n 4096; /opt/ltp/testcases/bin/dup03"]
 verdict = "ltp"
 tier = "full"
 weight = "light"
@@ -8632,7 +8687,7 @@ carrick_flags = ["--raw", "--fs", "host"]
 name = "ltp-dup06"
 ecosystem = "ltp"
 image = "localhost:5050/ltp:arm64"
-cmd = ["/opt/ltp/testcases/bin/dup06"]
+cmd = ["ulimit -n 4096; /opt/ltp/testcases/bin/dup06"]
 verdict = "ltp"
 tier = "full"
 weight = "light"
@@ -8698,7 +8753,7 @@ carrick_flags = ["--raw", "--fs", "host"]
 name = "ltp-dup205"
 ecosystem = "ltp"
 image = "localhost:5050/ltp:arm64"
-cmd = ["/opt/ltp/testcases/bin/dup205"]
+cmd = ["ulimit -n 4096; /opt/ltp/testcases/bin/dup205"]
 verdict = "ltp"
 tier = "full"
 weight = "light"
@@ -8919,6 +8974,17 @@ name = "ltp-epoll_pwait05"
 ecosystem = "ltp"
 image = "localhost:5050/ltp:arm64"
 cmd = ["/opt/ltp/testcases/bin/epoll_pwait05"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
+name = "ltp-epoll_pwait06"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/epoll_pwait06"]
 verdict = "ltp"
 tier = "full"
 weight = "light"
@@ -9663,6 +9729,28 @@ timeout_s = 40
 carrick_flags = ["--raw", "--fs", "host"]
 
 [[suite]]
+name = "ltp-fanotify24"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/fanotify24"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
+name = "ltp-fanotify25"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/fanotify25"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
 name = "ltp-fchdir01"
 ecosystem = "ltp"
 image = "localhost:5050/ltp:arm64"
@@ -9931,6 +10019,17 @@ name = "ltp-fchownat02"
 ecosystem = "ltp"
 image = "localhost:5050/ltp:arm64"
 cmd = ["/opt/ltp/testcases/bin/fchownat02"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
+name = "ltp-fchownat03"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/fchownat03"]
 verdict = "ltp"
 tier = "full"
 weight = "light"
@@ -10752,6 +10851,28 @@ timeout_s = 40
 carrick_flags = ["--raw", "--fs", "host"]
 
 [[suite]]
+name = "ltp-fcntl40"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/fcntl40"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
+name = "ltp-fcntl40_64"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/fcntl40_64"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
 name = "ltp-fdatasync01"
 ecosystem = "ltp"
 image = "localhost:5050/ltp:arm64"
@@ -10811,6 +10932,61 @@ name = "ltp-fgetxattr03"
 ecosystem = "ltp"
 image = "localhost:5050/ltp:arm64"
 cmd = ["/opt/ltp/testcases/bin/fgetxattr03"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
+name = "ltp-file_attr01"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/file_attr01"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
+name = "ltp-file_attr02"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/file_attr02"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
+name = "ltp-file_attr03"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/file_attr03"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
+name = "ltp-file_attr04"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/file_attr04"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
+name = "ltp-file_attr05"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/file_attr05"]
 verdict = "ltp"
 tier = "full"
 weight = "light"
@@ -10921,6 +11097,17 @@ name = "ltp-flock06"
 ecosystem = "ltp"
 image = "localhost:5050/ltp:arm64"
 cmd = ["/opt/ltp/testcases/bin/flock06"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
+name = "ltp-flock07"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/flock07"]
 verdict = "ltp"
 tier = "full"
 weight = "light"
@@ -12673,18 +12860,8 @@ image = "localhost:5050/ltp:arm64"
 cmd = ["/opt/ltp/testcases/bin/inotify09"]
 verdict = "ltp"
 tier = "full"
-weight = "heavy"
-# tst_fuzzy_sync stress test with `.runtime = 150` — it beats inotify until a
-# 3M-loop cap OR ~150s of runtime, whichever first (LTP's own per-run timeout is
-# 180s). Docker's fast per-op hits the loop cap in ~4s; carrick pays an HVF
-# vmexit per guest syscall. The per-op fixes (fork-coherent resolve + watch_fds
-# caches; skipping the redundant IN_EXCL_UNLINK write-path stat) took carrick
-# 150s -> ~61s isolated — now LOOP-CAP-bound like Docker, TPASS. The residual is
-# the fundamental HVF vmexit floor (5 syscalls/loop x 3M loops), not a fixable
-# carrick bug, and under gate contention it can drift toward the runtime budget.
-# The suite timeout must exceed the test's own runtime/LTP timeout: 240s reflects
-# the test's DESIGN, not a papered-over slowness.
-timeout_s = 240
+weight = "light"
+timeout_s = 40
 carrick_flags = ["--raw", "--fs", "host"]
 
 [[suite]]
@@ -12886,6 +13063,17 @@ timeout_s = 40
 carrick_flags = ["--raw", "--fs", "host"]
 
 [[suite]]
+name = "ltp-io_submit04"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/io_submit04"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
 name = "ltp-io_uring01"
 ecosystem = "ltp"
 image = "localhost:5050/ltp:arm64"
@@ -12901,6 +13089,17 @@ name = "ltp-io_uring02"
 ecosystem = "ltp"
 image = "localhost:5050/ltp:arm64"
 cmd = ["/opt/ltp/testcases/bin/io_uring02"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
+name = "ltp-io_uring03"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/io_uring03"]
 verdict = "ltp"
 tier = "full"
 weight = "light"
@@ -13007,6 +13206,17 @@ timeout_s = 40
 carrick_flags = ["--raw", "--fs", "host"]
 
 [[suite]]
+name = "ltp-ioctl10"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/ioctl10"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
 name = "ltp-ioctl_ficlone01"
 ecosystem = "ltp"
 image = "localhost:5050/ltp:arm64"
@@ -13066,6 +13276,28 @@ name = "ltp-ioctl_ficlonerange02"
 ecosystem = "ltp"
 image = "localhost:5050/ltp:arm64"
 cmd = ["/opt/ltp/testcases/bin/ioctl_ficlonerange02"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
+name = "ltp-ioctl_fiemap01"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/ioctl_fiemap01"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
+name = "ltp-ioctl_getlbmd01"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/ioctl_getlbmd01"]
 verdict = "ltp"
 tier = "full"
 weight = "light"
@@ -13220,6 +13452,72 @@ name = "ltp-ioctl_ns07"
 ecosystem = "ltp"
 image = "localhost:5050/ltp:arm64"
 cmd = ["/opt/ltp/testcases/bin/ioctl_ns07"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
+name = "ltp-ioctl_pidfd01"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/ioctl_pidfd01"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
+name = "ltp-ioctl_pidfd02"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/ioctl_pidfd02"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
+name = "ltp-ioctl_pidfd03"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/ioctl_pidfd03"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
+name = "ltp-ioctl_pidfd04"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/ioctl_pidfd04"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
+name = "ltp-ioctl_pidfd05"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/ioctl_pidfd05"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
+name = "ltp-ioctl_pidfd06"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/ioctl_pidfd06"]
 verdict = "ltp"
 tier = "full"
 weight = "light"
@@ -13502,32 +13800,10 @@ timeout_s = 40
 carrick_flags = ["--raw", "--fs", "host"]
 
 [[suite]]
-name = "ltp-kill07"
-ecosystem = "ltp"
-image = "localhost:5050/ltp:arm64"
-cmd = ["/opt/ltp/testcases/bin/kill07"]
-verdict = "ltp"
-tier = "full"
-weight = "light"
-timeout_s = 40
-carrick_flags = ["--raw", "--fs", "host"]
-
-[[suite]]
 name = "ltp-kill08"
 ecosystem = "ltp"
 image = "localhost:5050/ltp:arm64"
 cmd = ["/opt/ltp/testcases/bin/kill08"]
-verdict = "ltp"
-tier = "full"
-weight = "light"
-timeout_s = 40
-carrick_flags = ["--raw", "--fs", "host"]
-
-[[suite]]
-name = "ltp-kill09"
-ecosystem = "ltp"
-image = "localhost:5050/ltp:arm64"
-cmd = ["/opt/ltp/testcases/bin/kill09"]
 verdict = "ltp"
 tier = "full"
 weight = "light"
@@ -13656,6 +13932,39 @@ timeout_s = 40
 carrick_flags = ["--raw", "--fs", "host"]
 
 [[suite]]
+name = "ltp-landlock08"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/landlock08"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
+name = "ltp-landlock09"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/landlock09"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
+name = "ltp-landlock10"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/landlock10"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
 name = "ltp-lchown01"
 ecosystem = "ltp"
 image = "localhost:5050/ltp:arm64"
@@ -13693,28 +14002,6 @@ name = "ltp-lchown02_16"
 ecosystem = "ltp"
 image = "localhost:5050/ltp:arm64"
 cmd = ["/opt/ltp/testcases/bin/lchown02_16"]
-verdict = "ltp"
-tier = "full"
-weight = "light"
-timeout_s = 40
-carrick_flags = ["--raw", "--fs", "host"]
-
-[[suite]]
-name = "ltp-lchown03"
-ecosystem = "ltp"
-image = "localhost:5050/ltp:arm64"
-cmd = ["/opt/ltp/testcases/bin/lchown03"]
-verdict = "ltp"
-tier = "full"
-weight = "light"
-timeout_s = 40
-carrick_flags = ["--raw", "--fs", "host"]
-
-[[suite]]
-name = "ltp-lchown03_16"
-ecosystem = "ltp"
-image = "localhost:5050/ltp:arm64"
-cmd = ["/opt/ltp/testcases/bin/lchown03_16"]
 verdict = "ltp"
 tier = "full"
 weight = "light"
@@ -13832,6 +14119,50 @@ timeout_s = 40
 carrick_flags = ["--raw", "--fs", "host"]
 
 [[suite]]
+name = "ltp-listmount01"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/listmount01"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
+name = "ltp-listmount02"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/listmount02"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
+name = "ltp-listmount03"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/listmount03"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
+name = "ltp-listmount04"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/listmount04"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
 name = "ltp-listxattr01"
 ecosystem = "ltp"
 image = "localhost:5050/ltp:arm64"
@@ -13858,6 +14189,17 @@ name = "ltp-listxattr03"
 ecosystem = "ltp"
 image = "localhost:5050/ltp:arm64"
 cmd = ["/opt/ltp/testcases/bin/listxattr03"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
+name = "ltp-listxattr04"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/listxattr04"]
 verdict = "ltp"
 tier = "full"
 weight = "light"
@@ -13979,6 +14321,72 @@ name = "ltp-lseek11"
 ecosystem = "ltp"
 image = "localhost:5050/ltp:arm64"
 cmd = ["/opt/ltp/testcases/bin/lseek11"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
+name = "ltp-lsm_get_self_attr01"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/lsm_get_self_attr01"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
+name = "ltp-lsm_get_self_attr02"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/lsm_get_self_attr02"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
+name = "ltp-lsm_get_self_attr03"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/lsm_get_self_attr03"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
+name = "ltp-lsm_list_modules01"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/lsm_list_modules01"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
+name = "ltp-lsm_list_modules02"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/lsm_list_modules02"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
+name = "ltp-lsm_set_self_attr01"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/lsm_set_self_attr01"]
 verdict = "ltp"
 tier = "full"
 weight = "light"
@@ -14155,6 +14563,17 @@ name = "ltp-madvise11"
 ecosystem = "ltp"
 image = "localhost:5050/ltp:arm64"
 cmd = ["/opt/ltp/testcases/bin/madvise11"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
+name = "ltp-madvise12"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/madvise12"]
 verdict = "ltp"
 tier = "full"
 weight = "light"
@@ -14668,17 +15087,6 @@ timeout_s = 40
 carrick_flags = ["--raw", "--fs", "host"]
 
 [[suite]]
-name = "ltp-mmap001"
-ecosystem = "ltp"
-image = "localhost:5050/ltp:arm64"
-cmd = ["/opt/ltp/testcases/bin/mmap01"]
-verdict = "ltp"
-tier = "full"
-weight = "light"
-timeout_s = 40
-carrick_flags = ["--raw", "--fs", "host"]
-
-[[suite]]
 name = "ltp-mmap01"
 ecosystem = "ltp"
 image = "localhost:5050/ltp:arm64"
@@ -14888,6 +15296,28 @@ timeout_s = 40
 carrick_flags = ["--raw", "--fs", "host"]
 
 [[suite]]
+name = "ltp-mmap21"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/mmap21"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
+name = "ltp-mmap22"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/mmap22"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
 name = "ltp-modify_ldt01"
 ecosystem = "ltp"
 image = "localhost:5050/ltp:arm64"
@@ -14903,17 +15333,6 @@ name = "ltp-modify_ldt02"
 ecosystem = "ltp"
 image = "localhost:5050/ltp:arm64"
 cmd = ["/opt/ltp/testcases/bin/modify_ldt02"]
-verdict = "ltp"
-tier = "full"
-weight = "light"
-timeout_s = 40
-carrick_flags = ["--raw", "--fs", "host"]
-
-[[suite]]
-name = "ltp-modify_ldt03"
-ecosystem = "ltp"
-image = "localhost:5050/ltp:arm64"
-cmd = ["/opt/ltp/testcases/bin/modify_ldt03"]
 verdict = "ltp"
 tier = "full"
 weight = "light"
@@ -14998,10 +15417,32 @@ timeout_s = 40
 carrick_flags = ["--raw", "--fs", "host"]
 
 [[suite]]
+name = "ltp-mount08"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/mount08"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
 name = "ltp-mount_setattr01"
 ecosystem = "ltp"
 image = "localhost:5050/ltp:arm64"
 cmd = ["/opt/ltp/testcases/bin/mount_setattr01"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
+name = "ltp-mount_setattr02"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/mount_setattr02"]
 verdict = "ltp"
 tier = "full"
 weight = "light"
@@ -15024,6 +15465,17 @@ name = "ltp-move_mount02"
 ecosystem = "ltp"
 image = "localhost:5050/ltp:arm64"
 cmd = ["/opt/ltp/testcases/bin/move_mount02"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
+name = "ltp-move_mount03"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/move_mount03"]
 verdict = "ltp"
 tier = "full"
 weight = "light"
@@ -15343,6 +15795,17 @@ name = "ltp-mremap06"
 ecosystem = "ltp"
 image = "localhost:5050/ltp:arm64"
 cmd = ["/opt/ltp/testcases/bin/mremap06"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
+name = "ltp-mremap07"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/mremap07"]
 verdict = "ltp"
 tier = "full"
 weight = "light"
@@ -15724,10 +16187,10 @@ timeout_s = 40
 carrick_flags = ["--raw", "--fs", "host"]
 
 [[suite]]
-name = "ltp-munmap02"
+name = "ltp-munmap03"
 ecosystem = "ltp"
 image = "localhost:5050/ltp:arm64"
-cmd = ["/opt/ltp/testcases/bin/munmap02"]
+cmd = ["/opt/ltp/testcases/bin/munmap03"]
 verdict = "ltp"
 tier = "full"
 weight = "light"
@@ -15735,10 +16198,10 @@ timeout_s = 40
 carrick_flags = ["--raw", "--fs", "host"]
 
 [[suite]]
-name = "ltp-munmap03"
+name = "ltp-munmap04"
 ecosystem = "ltp"
 image = "localhost:5050/ltp:arm64"
-cmd = ["/opt/ltp/testcases/bin/munmap03"]
+cmd = ["/opt/ltp/testcases/bin/munmap04"]
 verdict = "ltp"
 tier = "full"
 weight = "light"
@@ -15761,6 +16224,17 @@ name = "ltp-name_to_handle_at02"
 ecosystem = "ltp"
 image = "localhost:5050/ltp:arm64"
 cmd = ["/opt/ltp/testcases/bin/name_to_handle_at02"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
+name = "ltp-name_to_handle_at03"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/name_to_handle_at03"]
 verdict = "ltp"
 tier = "full"
 weight = "light"
@@ -16208,17 +16682,6 @@ timeout_s = 40
 carrick_flags = ["--raw", "--fs", "host"]
 
 [[suite]]
-name = "ltp-pause03"
-ecosystem = "ltp"
-image = "localhost:5050/ltp:arm64"
-cmd = ["/opt/ltp/testcases/bin/pause03"]
-verdict = "ltp"
-tier = "full"
-weight = "light"
-timeout_s = 40
-carrick_flags = ["--raw", "--fs", "host"]
-
-[[suite]]
 name = "ltp-perf_event_open01"
 ecosystem = "ltp"
 image = "localhost:5050/ltp:arm64"
@@ -16608,6 +17071,28 @@ name = "ltp-poll02"
 ecosystem = "ltp"
 image = "localhost:5050/ltp:arm64"
 cmd = ["/opt/ltp/testcases/bin/poll02"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
+name = "ltp-poll03"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/poll03"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
+name = "ltp-poll04"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/poll04"]
 verdict = "ltp"
 tier = "full"
 weight = "light"
@@ -18188,6 +18673,17 @@ timeout_s = 40
 carrick_flags = ["--raw", "--fs", "host"]
 
 [[suite]]
+name = "ltp-rt_sigqueueinfo02"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/rt_sigqueueinfo02"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
 name = "ltp-rt_sigsuspend01"
 ecosystem = "ltp"
 image = "localhost:5050/ltp:arm64"
@@ -19138,6 +19634,17 @@ name = "ltp-set_thread_area01"
 ecosystem = "ltp"
 image = "localhost:5050/ltp:arm64"
 cmd = ["/opt/ltp/testcases/bin/set_thread_area01"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
+name = "ltp-set_thread_area02"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/set_thread_area02"]
 verdict = "ltp"
 tier = "full"
 weight = "light"
@@ -20174,12 +20681,8 @@ image = "localhost:5050/ltp:arm64"
 cmd = ["/opt/ltp/testcases/bin/setrlimit06"]
 verdict = "ltp"
 tier = "full"
-weight = "heavy"
-# Same tst_fuzzy_sync stress pattern as ltp-inotify09 (a `.runtime`-bounded race
-# test): the per-op fixes cut carrick's per-loop cost, but the residual is the
-# HVF vmexit floor, so — like inotify09 — the suite timeout must exceed the
-# test's own runtime budget. 240s reflects the test's design.
-timeout_s = 240
+weight = "light"
+timeout_s = 40
 carrick_flags = ["--raw", "--fs", "host"]
 
 [[suite]]
@@ -20531,7 +21034,7 @@ cmd = ["/opt/ltp/testcases/bin/shmctl05"]
 verdict = "ltp"
 tier = "full"
 weight = "light"
-timeout_s = 80
+timeout_s = 40
 carrick_flags = ["--raw", "--fs", "host"]
 
 [[suite]]
@@ -21272,6 +21775,105 @@ timeout_s = 40
 carrick_flags = ["--raw", "--fs", "host"]
 
 [[suite]]
+name = "ltp-statmount01"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/statmount01"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
+name = "ltp-statmount02"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/statmount02"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
+name = "ltp-statmount03"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/statmount03"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
+name = "ltp-statmount04"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/statmount04"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
+name = "ltp-statmount05"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/statmount05"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
+name = "ltp-statmount06"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/statmount06"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
+name = "ltp-statmount07"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/statmount07"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
+name = "ltp-statmount08"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/statmount08"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
+name = "ltp-statmount09"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/statmount09"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
 name = "ltp-statvfs01"
 ecosystem = "ltp"
 image = "localhost:5050/ltp:arm64"
@@ -21496,17 +22098,6 @@ name = "ltp-swapon03"
 ecosystem = "ltp"
 image = "localhost:5050/ltp:arm64"
 cmd = ["/opt/ltp/testcases/bin/swapon03"]
-verdict = "ltp"
-tier = "full"
-weight = "light"
-timeout_s = 40
-carrick_flags = ["--raw", "--fs", "host"]
-
-[[suite]]
-name = "ltp-symlink01"
-ecosystem = "ltp"
-image = "localhost:5050/ltp:arm64"
-cmd = ["/opt/ltp/testcases/bin/symlink01"]
 verdict = "ltp"
 tier = "full"
 weight = "light"
@@ -22317,10 +22908,98 @@ timeout_s = 40
 carrick_flags = ["--raw", "--fs", "host"]
 
 [[suite]]
+name = "ltp-unshare03"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/unshare03"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
+name = "ltp-unshare04"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/unshare04"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
+name = "ltp-unshare05"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/unshare05"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
 name = "ltp-userfaultfd01"
 ecosystem = "ltp"
 image = "localhost:5050/ltp:arm64"
 cmd = ["/opt/ltp/testcases/bin/userfaultfd01"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
+name = "ltp-userfaultfd02"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/userfaultfd02"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
+name = "ltp-userfaultfd03"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/userfaultfd03"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
+name = "ltp-userfaultfd04"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/userfaultfd04"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
+name = "ltp-userfaultfd05"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/userfaultfd05"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "host"]
+
+[[suite]]
+name = "ltp-userfaultfd06"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/userfaultfd06"]
 verdict = "ltp"
 tier = "full"
 weight = "light"
