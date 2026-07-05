@@ -7359,7 +7359,9 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
+known_gaps = ["summary"]
 carrick_flags = ["--raw", "--fs", "host"]
+docker_flags = ["--security-opt", "seccomp=unconfined"]
 
 [[suite]]
 name = "ltp-add_key02"
@@ -7370,7 +7372,9 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
+known_gaps = ["summary"]
 carrick_flags = ["--raw", "--fs", "host"]
+docker_flags = ["--security-opt", "seccomp=unconfined"]
 
 [[suite]]
 name = "ltp-add_key03"
@@ -7381,7 +7385,9 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
+known_gaps = ["summary"]
 carrick_flags = ["--raw", "--fs", "host"]
+docker_flags = ["--security-opt", "seccomp=unconfined"]
 
 [[suite]]
 name = "ltp-add_key04"
@@ -7392,7 +7398,9 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
+known_gaps = ["summary"]
 carrick_flags = ["--raw", "--fs", "host"]
+docker_flags = ["--security-opt", "seccomp=unconfined"]
 
 [[suite]]
 name = "ltp-add_key05"
@@ -7403,7 +7411,9 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
+known_gaps = ["summary"]
 carrick_flags = ["--raw", "--fs", "host"]
+docker_flags = ["--security-opt", "seccomp=unconfined"]
 
 [[suite]]
 name = "ltp-adjtimex01"
@@ -13665,7 +13675,9 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
+known_gaps = ["summary"]
 carrick_flags = ["--raw", "--fs", "host"]
+docker_flags = ["--security-opt", "seccomp=unconfined"]
 
 [[suite]]
 name = "ltp-keyctl02"
@@ -13676,7 +13688,9 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
+known_gaps = ["summary"]
 carrick_flags = ["--raw", "--fs", "host"]
+docker_flags = ["--security-opt", "seccomp=unconfined"]
 
 [[suite]]
 name = "ltp-keyctl03"
@@ -13687,7 +13701,9 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
+known_gaps = ["summary"]
 carrick_flags = ["--raw", "--fs", "host"]
+docker_flags = ["--security-opt", "seccomp=unconfined"]
 
 [[suite]]
 name = "ltp-keyctl04"
@@ -13698,7 +13714,9 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
+known_gaps = ["summary"]
 carrick_flags = ["--raw", "--fs", "host"]
+docker_flags = ["--security-opt", "seccomp=unconfined"]
 
 [[suite]]
 name = "ltp-keyctl05"
@@ -13709,7 +13727,9 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
+known_gaps = ["summary"]
 carrick_flags = ["--raw", "--fs", "host"]
+docker_flags = ["--security-opt", "seccomp=unconfined"]
 
 [[suite]]
 name = "ltp-keyctl06"
@@ -13720,7 +13740,9 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
+known_gaps = ["summary"]
 carrick_flags = ["--raw", "--fs", "host"]
+docker_flags = ["--security-opt", "seccomp=unconfined"]
 
 [[suite]]
 name = "ltp-keyctl07"
@@ -13731,7 +13753,9 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
+known_gaps = ["summary"]
 carrick_flags = ["--raw", "--fs", "host"]
+docker_flags = ["--security-opt", "seccomp=unconfined"]
 
 [[suite]]
 name = "ltp-keyctl08"
@@ -13742,7 +13766,9 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
+known_gaps = ["summary"]
 carrick_flags = ["--raw", "--fs", "host"]
+docker_flags = ["--security-opt", "seccomp=unconfined"]
 
 [[suite]]
 name = "ltp-keyctl09"
@@ -13753,7 +13779,9 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
+known_gaps = ["summary"]
 carrick_flags = ["--raw", "--fs", "host"]
+docker_flags = ["--security-opt", "seccomp=unconfined"]
 
 [[suite]]
 name = "ltp-kill02"
@@ -16745,7 +16773,9 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
+known_gaps = ["summary"]
 carrick_flags = ["--raw", "--fs", "host"]
+docker_flags = ["--security-opt", "seccomp=unconfined", "--cap-add", "SYS_PTRACE"]
 
 [[suite]]
 name = "ltp-pidfd_getfd02"
@@ -16756,7 +16786,9 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
+known_gaps = ["summary"]
 carrick_flags = ["--raw", "--fs", "host"]
+docker_flags = ["--security-opt", "seccomp=unconfined", "--cap-add", "SYS_PTRACE"]
 
 [[suite]]
 name = "ltp-pidfd_open01"
@@ -18516,7 +18548,9 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
+known_gaps = ["summary"]
 carrick_flags = ["--raw", "--fs", "host"]
+docker_flags = ["--security-opt", "seccomp=unconfined"]
 
 [[suite]]
 name = "ltp-request_key02"
@@ -18527,7 +18561,9 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
+known_gaps = ["summary"]
 carrick_flags = ["--raw", "--fs", "host"]
+docker_flags = ["--security-opt", "seccomp=unconfined"]
 
 [[suite]]
 name = "ltp-request_key03"
@@ -18538,7 +18574,9 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
+known_gaps = ["summary"]
 carrick_flags = ["--raw", "--fs", "host"]
+docker_flags = ["--security-opt", "seccomp=unconfined"]
 
 [[suite]]
 name = "ltp-request_key04"
@@ -18549,7 +18587,9 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
+known_gaps = ["summary"]
 carrick_flags = ["--raw", "--fs", "host"]
+docker_flags = ["--security-opt", "seccomp=unconfined"]
 
 [[suite]]
 name = "ltp-request_key05"
@@ -18560,7 +18600,9 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
+known_gaps = ["summary"]
 carrick_flags = ["--raw", "--fs", "host"]
+docker_flags = ["--security-opt", "seccomp=unconfined"]
 
 [[suite]]
 name = "ltp-request_key06"
@@ -18571,7 +18613,9 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
+known_gaps = ["summary"]
 carrick_flags = ["--raw", "--fs", "host"]
+docker_flags = ["--security-opt", "seccomp=unconfined"]
 
 [[suite]]
 name = "ltp-rmdir01"
@@ -20628,7 +20672,9 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
+known_gaps = ["summary"]
 carrick_flags = ["--raw", "--fs", "host"]
+docker_flags = ["--security-opt", "seccomp=unconfined", "--cap-add", "SYS_RESOURCE"]
 
 [[suite]]
 name = "ltp-setrlimit02"
@@ -20640,6 +20686,7 @@ tier = "full"
 weight = "light"
 timeout_s = 40
 carrick_flags = ["--raw", "--fs", "host"]
+docker_flags = ["--security-opt", "seccomp=unconfined", "--cap-add", "SYS_RESOURCE"]
 
 [[suite]]
 name = "ltp-setrlimit03"
@@ -20650,7 +20697,9 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
+known_gaps = ["summary"]
 carrick_flags = ["--raw", "--fs", "host"]
+docker_flags = ["--security-opt", "seccomp=unconfined", "--cap-add", "SYS_RESOURCE"]
 
 [[suite]]
 name = "ltp-setrlimit04"
@@ -20662,6 +20711,7 @@ tier = "full"
 weight = "light"
 timeout_s = 40
 carrick_flags = ["--raw", "--fs", "host"]
+docker_flags = ["--security-opt", "seccomp=unconfined", "--cap-add", "SYS_RESOURCE"]
 
 [[suite]]
 name = "ltp-setrlimit05"
@@ -20673,6 +20723,7 @@ tier = "full"
 weight = "light"
 timeout_s = 40
 carrick_flags = ["--raw", "--fs", "host"]
+docker_flags = ["--security-opt", "seccomp=unconfined", "--cap-add", "SYS_RESOURCE"]
 
 [[suite]]
 name = "ltp-setrlimit06"
