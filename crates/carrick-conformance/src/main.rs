@@ -21,7 +21,7 @@ mod parsers;
 mod verdict;
 
 use crate::manifest::{Ecosystem, Manifest, Suite, Tier, Weight};
-use crate::verdict::{Baseline, SideSummary, SuiteReport, Verdict, classify};
+use crate::verdict::{Baseline, PerfSummary, SideSummary, SuiteReport, Verdict, classify};
 use clap::Parser;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -47,6 +47,8 @@ const RUNTIME_CRATES: &[&str] = &[
 ];
 
 const DEFAULT_MAX_GATING: usize = 50;
+const PERF_WARN_RATIO: f64 = 10.0;
+const PERF_CRITICAL_RATIO: f64 = 100.0;
 
 #[derive(Parser, Debug)]
 #[command(about = "Differential conformance harness (carrick vs docker)")]
@@ -395,14 +397,20 @@ fn run() -> anyhow::Result<ExitCode> {
     // leaves partial results behind. The authoritative file is still rewritten
     // in full at the end (after flake-retries), so this is purely additive.
     let mut cache = oracle::OracleCache::load(&args.oracle_cache);
-    let cached: Vec<Option<parsers::SuiteResult>> = if args.refresh_oracle {
-        vec![None; n]
-    } else {
-        selected
-            .iter()
-            .map(|s| cache.get(s, docker_platform))
-            .collect()
-    };
+    let (cached, cached_elapsed): (Vec<Option<parsers::SuiteResult>>, Vec<Option<u64>>) =
+        if args.refresh_oracle {
+            (vec![None; n], vec![None; n])
+        } else {
+            selected
+                .iter()
+                .map(|s| {
+                    (
+                        cache.get(s, docker_platform),
+                        cache.get_elapsed_ms(s, docker_platform),
+                    )
+                })
+                .unzip()
+        };
     let stream = Mutex::new(std::fs::File::create(&args.jsonl).ok());
     let streamed_reports = Mutex::new(Vec::new());
     let fail_fast_stop = AtomicBool::new(false);
@@ -433,6 +441,7 @@ fn run() -> anyhow::Result<ExitCode> {
                     result: res.clone(),
                     run_id: "<cached>".to_string(),
                     argv: engine::docker_dry_run(s, "<cached>", docker_platform),
+                    elapsed_ms: cached_elapsed[i],
                 };
                 let cout = out.as_ref().ok();
                 let rep = build_report(s, cout, &docker, &baseline);
@@ -514,17 +523,19 @@ fn run() -> anyhow::Result<ExitCode> {
         let side = match out.and_then(|r| r.ok()) {
             Some(o) => {
                 let res = parsers::parse(verdict_kind(s), &o.raw());
-                cache.insert(s, docker_platform, res.clone()); // refuses to cache a non-comparable oracle
+                cache.insert(s, docker_platform, res.clone(), Some(o.elapsed_ms)); // refuses to cache a non-comparable oracle
                 DockerSide {
                     result: res,
                     run_id: o.run_id,
                     argv: o.argv,
+                    elapsed_ms: Some(o.elapsed_ms),
                 }
             }
             None => DockerSide {
                 result: parsers::SuiteResult::empty(),
                 run_id: String::new(),
                 argv: engine::docker_dry_run(s, "spawn-failed", docker_platform),
+                elapsed_ms: None,
             },
         };
         fresh.insert(i, side);
@@ -549,6 +560,7 @@ fn run() -> anyhow::Result<ExitCode> {
                 result: res.clone(),
                 run_id: "<cached>".to_string(),
                 argv: engine::docker_dry_run(s, "<cached>", docker_platform),
+                elapsed_ms: cached_elapsed[i],
             },
             None => fresh.remove(&i).ok_or_else(|| {
                 anyhow::anyhow!("every non-cached suite has a fresh docker side (suite {i})")
@@ -633,6 +645,7 @@ struct DockerSide {
     result: parsers::SuiteResult,
     run_id: String,
     argv: Vec<String>,
+    elapsed_ms: Option<u64>,
 }
 
 fn build_report(
@@ -641,8 +654,14 @@ fn build_report(
     docker: &DockerSide,
     baseline: &Baseline,
 ) -> SuiteReport {
-    let (c_raw, c_timed, c_runid, c_argv) = match cout {
-        Some(o) => (o.raw(), o.timed_out, o.run_id.clone(), o.argv.clone()),
+    let (c_raw, c_timed, c_runid, c_argv, c_elapsed_ms) = match cout {
+        Some(o) => (
+            o.raw(),
+            o.timed_out,
+            o.run_id.clone(),
+            o.argv.clone(),
+            Some(o.elapsed_ms),
+        ),
         None => (
             parsers::Raw {
                 stdout: String::new(),
@@ -653,6 +672,7 @@ fn build_report(
             false,
             String::new(),
             vec![],
+            None,
         ),
     };
 
@@ -674,6 +694,7 @@ fn build_report(
             result: d_res.result,
             totals: d_res.totals.clone(),
         },
+        perf: c_elapsed_ms.map(|elapsed_ms| perf_summary(elapsed_ms, docker.elapsed_ms)),
         new_diffs: cl.new_diffs,
         known_diffs: cl.known_diffs,
         carrick_run_id: c_runid,
@@ -681,6 +702,24 @@ fn build_report(
         carrick_argv: c_argv,
         docker_argv: docker.argv.clone(),
         pairs: cl.pairs,
+    }
+}
+
+fn perf_summary(carrick_ms: u64, oracle_ms: Option<u64>) -> PerfSummary {
+    PerfSummary {
+        carrick_ms,
+        oracle_ms,
+        carrick_to_oracle_ratio: oracle_ms.and_then(|ms| {
+            if ms == 0 {
+                return None;
+            }
+            let ratio = carrick_ms as f64 / ms as f64;
+            if ratio.is_finite() {
+                Some((ratio * 100.0).round() / 100.0)
+            } else {
+                None
+            }
+        }),
     }
 }
 
@@ -717,7 +756,8 @@ fn seed_oracle(
         };
         match oracle::docker_result_from_report(r) {
             Some(res) => {
-                if cache.insert(s, docker_platform, res) {
+                let oracle_ms = r.perf.as_ref().and_then(|p| p.oracle_ms);
+                if cache.insert(s, docker_platform, res, oracle_ms) {
                     seeded += 1;
                 } else {
                     skipped += 1;
@@ -816,7 +856,7 @@ fn bless(
     let _ = selected; // (kept for symmetry / future per-suite bless)
     match target {
         BlessTarget::SharedBaseline => {
-            write_reports(&args.baseline, reports)?;
+            write_baseline_reports(&args.baseline, reports)?;
             let md = matrix::render(reports);
             write_matrix(&md)?;
             eprintln!(
@@ -827,7 +867,7 @@ fn bless(
         BlessTarget::LaneOverlay(key) => {
             // ONLY the lane overlay — the shared baseline + matrix stay untouched.
             let overlay = overlay_path_for_key(&args.baseline, key);
-            write_reports(&overlay, reports)?;
+            write_baseline_reports(&overlay, reports)?;
             eprintln!(
                 "blessed {key} lane overlay: wrote {} (shared baseline + matrix left untouched)",
                 overlay.display()
@@ -1214,12 +1254,73 @@ fn print_summary(reports: &[SuiteReport]) {
         } else {
             String::new()
         };
+        let perf = perf_annotation(r);
         eprintln!(
-            "  {mark} {:14} {:40} carrick[{}] oracle[{}]{infra}",
+            "  {mark} {:14} {:40} carrick[{}] oracle[{}]{infra}{perf}",
             r.verdict.as_str(),
             r.name,
             side(&r.carrick),
             side(&r.docker),
+        );
+    }
+    print_perf_outliers(reports);
+}
+
+fn perf_annotation(r: &SuiteReport) -> String {
+    let Some(perf) = &r.perf else {
+        return String::new();
+    };
+    let Some(ratio) = perf.carrick_to_oracle_ratio else {
+        return String::new();
+    };
+    if ratio < PERF_WARN_RATIO {
+        return String::new();
+    }
+    let class = if ratio >= PERF_CRITICAL_RATIO {
+        "critical"
+    } else {
+        "slow"
+    };
+    match perf.oracle_ms {
+        Some(oracle_ms) => format!(
+            "  [perf:{class} {:.2}x {}ms/{}ms]",
+            ratio, perf.carrick_ms, oracle_ms
+        ),
+        None => format!("  [perf:{class} {:.2}x {}ms/?]", ratio, perf.carrick_ms),
+    }
+}
+
+fn print_perf_outliers(reports: &[SuiteReport]) {
+    let mut outliers: Vec<(&str, &PerfSummary)> = reports
+        .iter()
+        .filter_map(|r| {
+            let perf = r.perf.as_ref()?;
+            let ratio = perf.carrick_to_oracle_ratio?;
+            if ratio >= PERF_WARN_RATIO {
+                Some((r.name.as_str(), perf))
+            } else {
+                None
+            }
+        })
+        .collect();
+    outliers.sort_by(|a, b| {
+        let ar = a.1.carrick_to_oracle_ratio.unwrap_or_default();
+        let br = b.1.carrick_to_oracle_ratio.unwrap_or_default();
+        br.total_cmp(&ar).then_with(|| a.0.cmp(b.0))
+    });
+    if outliers.is_empty() {
+        return;
+    }
+    eprintln!("\n=== performance outliers (carrick/oracle >= {PERF_WARN_RATIO:.0}x) ===");
+    for (name, perf) in outliers.into_iter().take(10) {
+        let ratio = perf.carrick_to_oracle_ratio.unwrap_or_default();
+        let oracle_ms = perf
+            .oracle_ms
+            .map(|ms| ms.to_string())
+            .unwrap_or_else(|| "?".to_string());
+        eprintln!(
+            "  {:40} {:.2}x carrick={}ms oracle={}ms",
+            name, ratio, perf.carrick_ms, oracle_ms
         );
     }
 }
@@ -1295,6 +1396,14 @@ fn write_reports(path: &Path, reports: &[SuiteReport]) -> anyhow::Result<()> {
     }
     std::fs::write(path, s)?; // nosemgrep
     Ok(())
+}
+
+fn write_baseline_reports(path: &Path, reports: &[SuiteReport]) -> anyhow::Result<()> {
+    let mut sanitized = reports.to_vec();
+    for report in &mut sanitized {
+        report.perf = None;
+    }
+    write_reports(path, &sanitized)
 }
 
 fn write_matrix(md: &str) -> anyhow::Result<()> {
@@ -1880,6 +1989,62 @@ mod tests {
         assert!(!called, "retries=0 must run nothing");
         assert_eq!(recovered, 0);
         assert_eq!(items, vec![("a", true), ("b", false)]);
+    }
+
+    #[test]
+    fn perf_summary_rounds_and_omits_zero_oracle_ratios() {
+        let with_oracle = perf_summary(12_345, Some(1_000));
+        assert_eq!(with_oracle.carrick_ms, 12_345);
+        assert_eq!(with_oracle.oracle_ms, Some(1_000));
+        assert_eq!(with_oracle.carrick_to_oracle_ratio, Some(12.35));
+
+        let zero_oracle = perf_summary(12_345, Some(0));
+        assert_eq!(zero_oracle.carrick_to_oracle_ratio, None);
+
+        let cached_without_timing = perf_summary(12_345, None);
+        assert_eq!(cached_without_timing.oracle_ms, None);
+        assert_eq!(cached_without_timing.carrick_to_oracle_ratio, None);
+    }
+
+    #[test]
+    fn baseline_writer_strips_non_deterministic_perf_observations() {
+        let report = SuiteReport {
+            name: "suite".to_string(),
+            ecosystem: "ltp".to_string(),
+            tier: "full".to_string(),
+            verdict: Verdict::Match,
+            gating: false,
+            carrick: SideSummary {
+                result: parsers::SuiteOutcome::Success,
+                totals: parsers::Totals::default(),
+            },
+            docker: SideSummary {
+                result: parsers::SuiteOutcome::Success,
+                totals: parsers::Totals::default(),
+            },
+            perf: Some(perf_summary(10_000, Some(1_000))),
+            new_diffs: Vec::new(),
+            known_diffs: Vec::new(),
+            carrick_run_id: "conf-test-c00".to_string(),
+            docker_run_id: "<cached>".to_string(),
+            carrick_argv: vec!["carrick".to_string()],
+            docker_argv: vec!["docker".to_string()],
+            pairs: Default::default(),
+        };
+        let path = std::env::temp_dir().join(format!(
+            "carrick-conformance-baseline-perf-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        write_baseline_reports(&path, &[report]).expect("write sanitized baseline");
+
+        let text = std::fs::read_to_string(&path).expect("read sanitized baseline");
+        assert!(
+            !text.contains("\"perf\""),
+            "baseline must not carry wall-clock observations: {text}"
+        );
+        std::fs::remove_file(path).expect("remove temp baseline");
     }
 
     #[test]
