@@ -382,6 +382,19 @@ pub(crate) enum VcpuLoopOutcome {
     TrapLimit(Box<RunResult>),
 }
 
+pub(super) enum BlockingWaitCompletion {
+    Retval(i64),
+    ExecReplacedThread,
+}
+
+fn thread_should_finish_for_exec_replacement(registry: &ThreadRegistry, tid: ThreadId) -> bool {
+    // `exec_replacing_other_thread` is transient. A sibling that reclaimed its
+    // vCPU can still be waking from a host wait after the execing thread has
+    // removed it from the registry and cleared the flag; the registry removal is
+    // the durable signal that it must not recreate a vCPU in the replaced VM.
+    crate::fork_quiesce::exec_replacing_other_thread(tid) || !registry.is_live(tid)
+}
+
 // ===================================================================
 // Cross-platform syscall-dispatch backstops + image proc-state stamps.
 // (Moved from runtime.rs; the macOS single-threaded loop now calls these
@@ -680,6 +693,14 @@ where
         Ok(())
     }
 
+    fn exec_replaced_thread_exit(&self) -> Option<DispatchOutcome> {
+        if thread_should_finish_for_exec_replacement(&self.registry, self.this_tid) {
+            Some(DispatchOutcome::ThreadExit { code: 0 })
+        } else {
+            None
+        }
+    }
+
     /// Return-side companion to [`Self::trace_syscall`].
     fn trace_syscall_return(&self, traps: usize, ret: Option<i64>) {
         if !self.trace {
@@ -767,6 +788,9 @@ where
                                 ) {
                                     crate::io_wait::WaitResult::Ready => continue,
                                     crate::io_wait::WaitResult::Interrupted => {
+                                        if let Some(outcome) = self.exec_replaced_thread_exit() {
+                                            return Ok(outcome);
+                                        }
                                         if crate::fork_quiesce::is_quiescing() {
                                             self.release_and_park_vcpu_for_fork(engine)?;
                                             continue;
@@ -810,6 +834,9 @@ where
                                 .has_deliverable_dispatch_pending_for_wait(self.this_tid, sig_mask)
                         },
                     );
+                    if let Some(outcome) = self.exec_replaced_thread_exit() {
+                        return Ok(outcome);
+                    }
                     self.resume_vcpu_after_blocking_wait(engine, reclaim)?;
                     match wait_result {
                         crate::io_wait::WaitResult::Ready => continue,
@@ -849,6 +876,9 @@ where
                                 .has_deliverable_dispatch_pending_for_wait(self.this_tid, sig_mask)
                         },
                     );
+                    if let Some(outcome) = self.exec_replaced_thread_exit() {
+                        return Ok(outcome);
+                    }
                     self.resume_vcpu_after_blocking_wait(engine, reclaim)?;
                     match wait_result {
                         crate::io_wait::WaitResult::Ready => continue,
@@ -906,6 +936,9 @@ where
                                 .has_deliverable_dispatch_pending_for_wait(self.this_tid, sig_mask)
                         },
                     );
+                    if let Some(outcome) = self.exec_replaced_thread_exit() {
+                        return Ok(outcome);
+                    }
                     self.resume_vcpu_after_blocking_wait(engine, reclaim)?;
                     match wait_result {
                         crate::io_wait::WaitResult::Ready => continue,
@@ -942,6 +975,9 @@ where
                                 .has_deliverable_dispatch_pending_for_wait(self.this_tid, sig_mask)
                         },
                     );
+                    if let Some(outcome) = self.exec_replaced_thread_exit() {
+                        return Ok(outcome);
+                    }
                     self.resume_vcpu_after_blocking_wait(engine, reclaim)?;
                     match wait_result {
                         crate::io_wait::WaitResult::Ready => continue,
@@ -986,6 +1022,9 @@ where
                             continue;
                         }
                         crate::io_wait::WaitResult::Interrupted => {
+                            if let Some(outcome) = self.exec_replaced_thread_exit() {
+                                break Ok(outcome);
+                            }
                             if crate::fork_quiesce::is_quiescing() {
                                 self.release_and_park_vcpu_for_fork(engine)?;
                             }
@@ -1035,6 +1074,9 @@ where
                         Some(deadline - now),
                         carrick_abi::SigBlockMask::NONE,
                     );
+                    if let Some(outcome) = self.exec_replaced_thread_exit() {
+                        return Ok(outcome);
+                    }
                     self.resume_vcpu_after_blocking_wait(engine, reclaim)?;
                     match wait_result {
                         crate::io_wait::WaitResult::Ready => continue,
@@ -1459,17 +1501,27 @@ where
                 DispatchOutcome::FutexWait { wait, timeout } => {
                     // Block with the dispatcher lock RELEASED so a sibling FUTEX_WAKE
                     // can run.
-                    last_syscall_retval =
-                        Some(state.complete_futex_wait(&mut engine, wait, timeout)?);
+                    match state.complete_futex_wait(&mut engine, wait, timeout)? {
+                        BlockingWaitCompletion::Retval(retval) => {
+                            last_syscall_retval = Some(retval);
+                        }
+                        BlockingWaitCompletion::ExecReplacedThread => {
+                            return Ok(state.handle_thread_exit(&kernel, &mut engine, 0, traps));
+                        }
+                    }
                 }
                 DispatchOutcome::FutexWaitv {
                     wait,
                     timeout,
                     index,
-                } => {
-                    last_syscall_retval =
-                        Some(state.complete_futex_waitv(&mut engine, wait, timeout, index)?);
-                }
+                } => match state.complete_futex_waitv(&mut engine, wait, timeout, index)? {
+                    BlockingWaitCompletion::Retval(retval) => {
+                        last_syscall_retval = Some(retval);
+                    }
+                    BlockingWaitCompletion::ExecReplacedThread => {
+                        return Ok(state.handle_thread_exit(&kernel, &mut engine, 0, traps));
+                    }
+                },
                 DispatchOutcome::SharedFutexWait {
                     location,
                     waiter_key,
@@ -1479,13 +1531,20 @@ where
                     // Cross-process futex (MAP_SHARED): block on the host __ulock
                     // keyed by the shared physical page, with the dispatcher lock
                     // released. Interruptible by a signal deliverable to this thread.
-                    last_syscall_retval = Some(state.complete_shared_futex_wait(
+                    match state.complete_shared_futex_wait(
                         &mut engine,
                         location,
                         waiter_key,
                         value,
                         timeout,
-                    )?);
+                    )? {
+                        BlockingWaitCompletion::Retval(retval) => {
+                            last_syscall_retval = Some(retval);
+                        }
+                        BlockingWaitCompletion::ExecReplacedThread => {
+                            return Ok(state.handle_thread_exit(&kernel, &mut engine, 0, traps));
+                        }
+                    }
                 }
                 DispatchOutcome::SharedFutexWaitv {
                     location,
@@ -1494,14 +1553,21 @@ where
                     timeout,
                     index,
                 } => {
-                    last_syscall_retval = Some(state.complete_shared_futex_waitv(
+                    match state.complete_shared_futex_waitv(
                         &mut engine,
                         location,
                         waiter_key,
                         value,
                         timeout,
                         index,
-                    )?);
+                    )? {
+                        BlockingWaitCompletion::Retval(retval) => {
+                            last_syscall_retval = Some(retval);
+                        }
+                        BlockingWaitCompletion::ExecReplacedThread => {
+                            return Ok(state.handle_thread_exit(&kernel, &mut engine, 0, traps));
+                        }
+                    }
                 }
                 DispatchOutcome::SharedFutexWake {
                     location,
@@ -1796,6 +1862,21 @@ mod tests {
     use super::signal::lower_el0_fault;
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn exec_replacement_treats_removed_sibling_as_done_after_flag_clears() {
+        let owner = ThreadId::synthetic_for_tests(1000);
+        let registry = ThreadRegistry::new(owner);
+        let sibling = registry.register_child(0);
+
+        let removed = registry.remove_all_except(owner);
+        assert!(removed.contains(&sibling));
+        crate::fork_quiesce::end_exec_replacement();
+
+        assert!(thread_should_finish_for_exec_replacement(
+            &registry, sibling
+        ));
+    }
 
     #[test]
     fn trap_watchdog_keeps_running_below_count_prefilter() {
