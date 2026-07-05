@@ -458,10 +458,10 @@ pub(crate) fn stamp_identity_page<M: GuestMemory>(memory: &mut M, dispatcher: &S
     }
 }
 
-/// Stamp the running guest thread's guest-visible tid into the vCPU's TPIDR_EL1,
-/// which the EL1 shim returns for `gettid` without a VM exit (no-op unless the
-/// shim is enabled). Must run whenever the vCPU is (re)created — boot, clone,
-/// fork, exec — since TPIDR_EL1 resets.
+/// Stamp the running guest thread's guest-visible tid into the vCPU sysreg that
+/// the EL1 shim returns for `gettid` without a VM exit (no-op unless the shim is
+/// enabled). Must run whenever the vCPU is (re)created — boot, clone, fork,
+/// exec — since vCPU sysregs reset.
 pub(crate) fn stamp_guest_tid<E: ThreadedEngine>(
     engine: &E,
     this_tid: ThreadId,

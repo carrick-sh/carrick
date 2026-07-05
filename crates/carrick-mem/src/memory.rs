@@ -215,10 +215,10 @@ pub const IDENTITY_SYSCALLS: &[(u16, u64)] = &[
     (177, IDENTITY_OFF_EGID), // getegid
 ];
 /// Linux aarch64 `gettid` (178). Unlike the per-process identity reads it is
-/// per-thread, so the EL1 fast path reads it from `TPIDR_EL1` — which carrick
+/// per-thread, so the EL1 fast path reads it from `CONTEXTIDR_EL1` — which carrick
 /// sets per vCPU to that thread's guest-visible tid — instead of the shared
-/// identity page. (`TPIDR_EL1` is otherwise unused by carrick; the guest uses
-/// `TPIDR_EL0` for TLS.)
+/// identity page. (`CONTEXTIDR_EL1` is otherwise unused by carrick; the guest
+/// uses `TPIDR_EL0` for TLS.)
 pub const GETTID_NR: u16 = 178;
 // The identity page must stay inside the kernel hole's first 2 MiB block so it
 // inherits the kernel-only (AP=00) block mapping from `stage1_identity_page_tables`.
@@ -273,9 +273,23 @@ const AARCH64_MOV_X8_RT_SIGRETURN_OPCODE: u32 = 0xd280_1168;
 const AARCH64_SVC0_OPCODE: u32 = 0xd400_0001;
 // AArch64 `nop` opcode, used as trampoline page padding.
 const AARCH64_NOP_OPCODE: u32 = 0xd503_201f;
-// AArch64 `mrs x0, TPIDR_EL1` (TPIDR_EL1 = S3_0_C13_C0_4). The shim's gettid
-// handler reads the per-vCPU thread id carrick stamps into TPIDR_EL1.
-const AARCH64_MRS_X0_TPIDR_EL1_OPCODE: u32 = 0xd538_d080;
+// AArch64 `mrs x0, CONTEXTIDR_EL1` (CONTEXTIDR_EL1 = S3_0_C13_C0_1). The
+// shim's gettid handler reads the per-vCPU thread id carrick stamps into
+// CONTEXTIDR_EL1.
+const AARCH64_MRS_X0_CONTEXTIDR_EL1_OPCODE: u32 = 0xd538_d020;
+// AArch64 `msr TPIDR_EL1, x16` / `mrs x16, TPIDR_EL1`. The syscall shim uses
+// TPIDR_EL1 as an EL1-private scratch slot to preserve x16 while it checks
+// ESR_EL1. The gettid fast path uses CONTEXTIDR_EL1 so these roles do not
+// collide.
+const AARCH64_MSR_TPIDR_EL1_X16_OPCODE: u32 = 0xd518_d090;
+const AARCH64_MRS_TPIDR_EL1_X16_OPCODE: u32 = 0xd538_d090;
+// AArch64 `mrs x16, ESR_EL1`, `lsr x16, x16, #26`, and `cmp x16, #0x15`
+// (`EC=0x15` is an EL0 SVC). The vector slot catches every lower-EL sync
+// exception, so the identity fast path must prove the exception is a syscall
+// before dispatching on stale x8.
+const AARCH64_MRS_ESR_EL1_X16_OPCODE: u32 = 0xd538_5210;
+const AARCH64_LSR_X16_X16_26_OPCODE: u32 = 0xd35a_fe10;
+const AARCH64_CMP_X16_SVC64_OPCODE: u32 = 0xf100_561f;
 // AArch64 `tlbi vmalle1is` — invalidate all stage-1 TLB entries for the
 // current EL in the inner-shareable domain. Required after the host flips
 // SCTLR_EL1.M from 0 to 1 via `set_sys_reg` because the guest never
@@ -2106,6 +2120,10 @@ fn enc_beq(pc: u64, target: u64) -> u32 {
     let imm19 = (((target as i64 - pc as i64) >> 2) as u32) & 0x7FFFF;
     0x5400_0000 | (imm19 << 5)
 }
+fn enc_bne(pc: u64, target: u64) -> u32 {
+    let imm19 = (((target as i64 - pc as i64) >> 2) as u32) & 0x7FFFF;
+    0x5400_0001 | (imm19 << 5)
+}
 fn enc_cbz_xn(reg: u32, pc: u64, target: u64) -> u32 {
     let imm19 = (((target as i64 - pc as i64) >> 2) as u32) & 0x7FFFF;
     0xB400_0000 | (imm19 << 5) | (reg & 0x1F)
@@ -2143,19 +2161,26 @@ fn enc_ldr_w0_x0(off: u64) -> u32 {
 /// [`IDENTITY_SYSCALLS`] directly at EL1 (loading the answer from the identity
 /// page into `x0` and `eret`-ing — zero VM exits), falling through to the
 /// legacy `hvc #2; eret` for everything else. If the runtime clears the
-/// `IDENTITY_OFF_SHIM_ENABLED` flag, the whole shim falls through as well; this
-/// is required once seccomp is active because filters must see identity syscalls
-/// before they execute. Every other slot is unchanged.
+/// `IDENTITY_OFF_SHIM_ENABLED` flag, matched identity syscalls fall through as
+/// well; this is required once seccomp is active because filters must see
+/// identity syscalls before they execute. Every other slot is unchanged.
 ///
-/// The dispatcher clobbers only NZCV (the `cmp`s) and — on the intercepted
-/// paths — `x0` (the syscall return register). The pre-dispatch enabled guard
-/// uses `x16`, which Linux's syscall ABI does not preserve for callers; the
-/// fallthrough path still leaves `x0..x5,x8` untouched so the host sees an
-/// unperturbed syscall frame. `eret` restores EL0's PSTATE from SPSR_EL1, so
-/// the flag clobber is invisible. The per-syscall handlers live in the page's
-/// `nop` tail (past the 2 KiB vector table), branch-reachable from the slot, and
-/// build the (kernel-hole, AP=00) identity-page address in `x0` only AFTER the
-/// eligibility decision.
+/// The dispatcher first checks `ESR_EL1.EC`: the lower-EL sync vector catches
+/// faults and sysreg traps as well as SVCs, and x8 can still hold a prior
+/// syscall number when a following instruction faults. Non-SVC exceptions must
+/// fall through to the host HVC decoder, not be answered as stale identity
+/// syscalls. That guard preserves x16 via an EL1-only scratch sysreg before
+/// either the fast path or fallthrough. After that, the dispatcher clobbers only
+/// NZCV (the `cmp`s) and — on the intercepted paths — `x0` (the syscall return
+/// register). The fallthrough path for non-identity syscalls leaves all GPRs
+/// untouched so the host sees an unperturbed syscall frame. The enabled guard
+/// lives inside each matched handler and uses only `x0`; if the guard is
+/// disabled, that matched no-arg identity syscall traps normally with `x0`
+/// already clobbered, but no syscall argument semantics are lost. `eret`
+/// restores EL0's PSTATE from SPSR_EL1, so the flag clobber is invisible. The
+/// per-syscall handlers live in the page's `nop` tail (past the 2 KiB vector
+/// table), branch-reachable from the slot, and build the (kernel-hole, AP=00)
+/// identity-page address only after the syscall number matches.
 pub fn el1_vectors_bytes_shim() -> Vec<u8> {
     // Start from the legacy page (all slots = eret, 0x400 = hvc #2; eret, tail
     // = nop) and overwrite the sync slot + the handler tail.
@@ -2166,7 +2191,7 @@ pub fn el1_vectors_bytes_shim() -> Vec<u8> {
 
     // Handlers go in the nop tail right after the 16-slot (2 KiB) vector table.
     const HANDLER_BASE: usize = 16 * AARCH64_VECTOR_SLOT_SIZE; // 0x800
-    const HANDLER_LEN: usize = 5 * 4; // movz, movk, movk, ldr, eret
+    const PAGE_HANDLER_LEN: usize = 10 * 4;
     let base = LINUX_IDENTITY_PAGE_BASE;
     let (lo, mid, hi) = (
         (base & 0xFFFF) as u16,
@@ -2181,19 +2206,21 @@ pub fn el1_vectors_bytes_shim() -> Vec<u8> {
 
     let dispatch = AARCH64_VECTOR_LOWER_EL_SYNC_OFFSET;
     let mut cursor = dispatch;
-    const GUARD_REG: u32 = 16;
-    put(&mut bytes, cursor, enc_movz_xn(GUARD_REG, lo, 0));
-    put(&mut bytes, cursor + 4, enc_movk_xn(GUARD_REG, mid, 1));
-    put(&mut bytes, cursor + 8, enc_movk_xn(GUARD_REG, hi, 2));
+    const ESR_GUARD_LEN: usize = 6 * 4;
+    let fallthrough = dispatch + ESR_GUARD_LEN + (IDENTITY_SYSCALLS.len() + 1) * 8;
+    put(&mut bytes, cursor, AARCH64_MSR_TPIDR_EL1_X16_OPCODE);
+    put(&mut bytes, cursor + 4, AARCH64_MRS_ESR_EL1_X16_OPCODE);
+    put(&mut bytes, cursor + 8, AARCH64_LSR_X16_X16_26_OPCODE);
+    put(&mut bytes, cursor + 12, AARCH64_CMP_X16_SVC64_OPCODE);
+    put(&mut bytes, cursor + 16, AARCH64_MRS_TPIDR_EL1_X16_OPCODE);
     put(
         &mut bytes,
-        cursor + 12,
-        enc_ldr_wt_xn(GUARD_REG, GUARD_REG, IDENTITY_OFF_SHIM_ENABLED),
+        cursor + 20,
+        enc_bne((cursor + 20) as u64, fallthrough as u64),
     );
-    let guard_cbz = cursor + 16;
-    cursor += 20;
+    cursor += ESR_GUARD_LEN;
     for (i, &(nr, off)) in IDENTITY_SYSCALLS.iter().enumerate() {
-        let handler = HANDLER_BASE + i * HANDLER_LEN;
+        let handler = HANDLER_BASE + i * PAGE_HANDLER_LEN;
         // dispatcher: cmp x8,#nr ; b.eq handler
         put(&mut bytes, cursor, enc_cmp_x8_imm(nr));
         put(
@@ -2202,17 +2229,30 @@ pub fn el1_vectors_bytes_shim() -> Vec<u8> {
             enc_beq((cursor + 4) as u64, handler as u64),
         );
         cursor += 8;
-        // handler: build the page base in x0, load the field, eret.
+        // handler: if enabled, build the page base in x0, load the field, eret.
         put(&mut bytes, handler, enc_movz_x0(lo, 0));
         put(&mut bytes, handler + 4, enc_movk_x0(mid, 1));
         put(&mut bytes, handler + 8, enc_movk_x0(hi, 2));
-        put(&mut bytes, handler + 12, enc_ldr_w0_x0(off));
-        put(&mut bytes, handler + 16, AARCH64_ERET_OPCODE);
+        put(
+            &mut bytes,
+            handler + 12,
+            enc_ldr_w0_x0(IDENTITY_OFF_SHIM_ENABLED),
+        );
+        put(
+            &mut bytes,
+            handler + 16,
+            enc_cbz_x0((handler + 16) as u64, fallthrough as u64),
+        );
+        put(&mut bytes, handler + 20, enc_movz_x0(lo, 0));
+        put(&mut bytes, handler + 24, enc_movk_x0(mid, 1));
+        put(&mut bytes, handler + 28, enc_movk_x0(hi, 2));
+        put(&mut bytes, handler + 32, enc_ldr_w0_x0(off));
+        put(&mut bytes, handler + 36, AARCH64_ERET_OPCODE);
     }
-    // gettid (178): per-thread, so read the vCPU's TPIDR_EL1 (the runtime stamps
-    // it with this thread's guest-visible tid) instead of the shared page. Its
-    // handler sits right after the page handlers.
-    let gettid_handler = HANDLER_BASE + IDENTITY_SYSCALLS.len() * HANDLER_LEN;
+    // gettid (178): per-thread, so read the vCPU's CONTEXTIDR_EL1 (the runtime
+    // stamps it with this thread's guest-visible tid) instead of the shared page.
+    // Its handler sits right after the page handlers.
+    let gettid_handler = HANDLER_BASE + IDENTITY_SYSCALLS.len() * PAGE_HANDLER_LEN;
     put(&mut bytes, cursor, enc_cmp_x8_imm(GETTID_NR));
     put(
         &mut bytes,
@@ -2221,22 +2261,35 @@ pub fn el1_vectors_bytes_shim() -> Vec<u8> {
     );
     cursor += 8;
     // The fallthrough trap lands here once the gettid cmp/b.eq is placed.
-    let fallthrough = cursor;
-    // gettid handler: read TPIDR_EL1; if it is 0 (unstamped — a tid is never 0)
-    // trap normally instead of returning a wrong 0; otherwise eret with the tid.
-    put(&mut bytes, gettid_handler, AARCH64_MRS_X0_TPIDR_EL1_OPCODE);
+    debug_assert_eq!(fallthrough, cursor);
+    // gettid handler: read CONTEXTIDR_EL1; if it is 0 (unstamped — a tid is
+    // never 0) trap normally instead of returning a wrong 0; otherwise eret with
+    // the tid.
+    put(&mut bytes, gettid_handler, enc_movz_x0(lo, 0));
+    put(&mut bytes, gettid_handler + 4, enc_movk_x0(mid, 1));
+    put(&mut bytes, gettid_handler + 8, enc_movk_x0(hi, 2));
     put(
         &mut bytes,
-        gettid_handler + 4,
-        enc_cbz_x0((gettid_handler + 4) as u64, fallthrough as u64),
+        gettid_handler + 12,
+        enc_ldr_w0_x0(IDENTITY_OFF_SHIM_ENABLED),
     );
-    put(&mut bytes, gettid_handler + 8, AARCH64_ERET_OPCODE);
+    put(
+        &mut bytes,
+        gettid_handler + 16,
+        enc_cbz_x0((gettid_handler + 16) as u64, fallthrough as u64),
+    );
+    put(
+        &mut bytes,
+        gettid_handler + 20,
+        AARCH64_MRS_X0_CONTEXTIDR_EL1_OPCODE,
+    );
+    put(
+        &mut bytes,
+        gettid_handler + 24,
+        enc_cbz_x0((gettid_handler + 24) as u64, fallthrough as u64),
+    );
+    put(&mut bytes, gettid_handler + 28, AARCH64_ERET_OPCODE);
     // Fallthrough: not intercepted -> forward to the host like the legacy slot.
-    put(
-        &mut bytes,
-        guard_cbz,
-        enc_cbz_xn(GUARD_REG, guard_cbz as u64, fallthrough as u64),
-    );
     put(&mut bytes, fallthrough, AARCH64_HVC_SYSCALL_OPCODE);
     put(&mut bytes, fallthrough + 4, AARCH64_ERET_OPCODE);
     debug_assert!(
@@ -3077,16 +3130,18 @@ mod el1_shim_tests {
         let signed = (imm19 << 45) >> 45; // sign-extend 19 bits
         Some((pc as i64 + (signed << 2)) as usize)
     }
+    /// `b.ne <target>` at byte offset `pc` → Some(absolute target byte offset).
+    fn decode_bne(op: u32, pc: usize) -> Option<usize> {
+        if op & 0xFF00_001F != 0x5400_0001 {
+            return None;
+        }
+        let imm19 = ((op >> 5) & 0x7FFFF) as i64;
+        let signed = (imm19 << 45) >> 45;
+        Some((pc as i64 + (signed << 2)) as usize)
+    }
     /// `ldr w0, [x0, #off]` → Some(off).
     fn decode_ldr_w0_x0(op: u32) -> Option<u64> {
         if op & !(0xFFF << 10) == 0xB940_0000 {
-            Some((((op >> 10) & 0xFFF) as u64) * 4)
-        } else {
-            None
-        }
-    }
-    fn decode_ldr_w16_x16(op: u32) -> Option<u64> {
-        if op & !(0xFFF << 10) == (0xB940_0000 | (16 << 5) | 16) {
             Some((((op >> 10) & 0xFFF) as u64) * 4)
         } else {
             None
@@ -3100,25 +3155,9 @@ mod el1_shim_tests {
             None
         }
     }
-    /// `movz x16, #imm16, lsl #(hw*16)` → Some((imm16, hw)).
-    fn decode_movz_x16(op: u32) -> Option<(u64, u32)> {
-        if op & 0xFF80_001F == (0xD280_0000 | 16) {
-            Some((((op >> 5) & 0xFFFF) as u64, (op >> 21) & 0x3))
-        } else {
-            None
-        }
-    }
     /// `movk x0, #imm16, lsl #(hw*16)` → Some((imm16, hw)).
     fn decode_movk_x0(op: u32) -> Option<(u64, u32)> {
         if op & 0xFF80_001F == 0xF280_0000 {
-            Some((((op >> 5) & 0xFFFF) as u64, (op >> 21) & 0x3))
-        } else {
-            None
-        }
-    }
-    /// `movk x16, #imm16, lsl #(hw*16)` → Some((imm16, hw)).
-    fn decode_movk_x16(op: u32) -> Option<(u64, u32)> {
-        if op & 0xFF80_001F == (0xF280_0000 | 16) {
             Some((((op >> 5) & 0xFFFF) as u64, (op >> 21) & 0x3))
         } else {
             None
@@ -3133,20 +3172,11 @@ mod el1_shim_tests {
         let signed = (imm19 << 45) >> 45;
         Some((pc as i64 + (signed << 2)) as usize)
     }
-    /// `cbz x16, <target>` at byte offset `pc` → Some(absolute target offset).
-    fn decode_cbz_x16(op: u32, pc: usize) -> Option<usize> {
-        if op & 0xFF00_001F != (0xB400_0000 | 16) {
-            return None;
-        }
-        let imm19 = ((op >> 5) & 0x7FFFF) as i64;
-        let signed = (imm19 << 45) >> 45;
-        Some((pc as i64 + (signed << 2)) as usize)
-    }
 
     const ERET: u32 = 0xD69F_03E0;
     const HVC2: u32 = 0xD400_0042;
     const HVC3: u32 = 0xD400_0062; // hvc #3 — fail-loud unexpected-EL1 trap
-    const MRS_TPIDR_EL1_X0: u32 = 0xD538_D080; // mrs x0, TPIDR_EL1
+    const MRS_CONTEXTIDR_EL1_X0: u32 = 0xD538_D020; // mrs x0, CONTEXTIDR_EL1
 
     /// The shim dispatcher must service EXACTLY the per-process identity syscalls
     /// (each via a page-read handler) plus `gettid` (via a per-vCPU TPIDR_EL1
@@ -3157,29 +3187,39 @@ mod el1_shim_tests {
         let mut pc = AARCH64_VECTOR_LOWER_EL_SYNC_OFFSET;
         let mut page_seen: Vec<(u16, u64)> = Vec::new();
         let mut sysreg_seen: Vec<u16> = Vec::new();
-        let (lo, hw0) = decode_movz_x16(rd_u32(&bytes, pc)).expect("guard movz x16");
-        let (mid, hw1) = decode_movk_x16(rd_u32(&bytes, pc + 4)).expect("guard movk #16");
-        let (hi, hw2) = decode_movk_x16(rd_u32(&bytes, pc + 8)).expect("guard movk #32");
-        assert_eq!((hw0, hw1, hw2), (0, 1, 2), "guard base built lo/mid/hi");
         assert_eq!(
-            lo | (mid << 16) | (hi << 32),
-            LINUX_IDENTITY_PAGE_BASE,
-            "guard must address the identity page"
+            rd_u32(&bytes, pc),
+            AARCH64_MSR_TPIDR_EL1_X16_OPCODE,
+            "ESR guard must save x16 before using it"
         );
         assert_eq!(
-            decode_ldr_w16_x16(rd_u32(&bytes, pc + 12)).expect("guard ldr w16"),
-            IDENTITY_OFF_SHIM_ENABLED
+            rd_u32(&bytes, pc + 4),
+            AARCH64_MRS_ESR_EL1_X16_OPCODE,
+            "ESR guard must inspect the real lower-EL exception class"
         );
-        let guard_cbz_pc = pc + 16;
-        let guard_fallthrough =
-            decode_cbz_x16(rd_u32(&bytes, guard_cbz_pc), guard_cbz_pc).expect("guard cbz x16");
-        pc += 20;
+        assert_eq!(
+            rd_u32(&bytes, pc + 8),
+            AARCH64_LSR_X16_X16_26_OPCODE,
+            "ESR guard must isolate ESR_EL1.EC"
+        );
+        assert_eq!(
+            rd_u32(&bytes, pc + 12),
+            AARCH64_CMP_X16_SVC64_OPCODE,
+            "ESR guard must require EC=SVC64"
+        );
+        assert_eq!(
+            rd_u32(&bytes, pc + 16),
+            AARCH64_MRS_TPIDR_EL1_X16_OPCODE,
+            "ESR guard must restore x16 before branching"
+        );
+        let esr_fallthrough = decode_bne(rd_u32(&bytes, pc + 20), pc + 20).expect("ESR guard b.ne");
+        pc += 24;
         loop {
             let op = rd_u32(&bytes, pc);
             if op == HVC2 {
                 assert_eq!(
-                    pc, guard_fallthrough,
-                    "disabled shim guard must branch to the host-trap fallthrough"
+                    pc, esr_fallthrough,
+                    "non-SVC lower-EL exceptions must fall through to the HVC decoder"
                 );
                 assert_eq!(
                     rd_u32(&bytes, pc + 4),
@@ -3192,13 +3232,42 @@ mod el1_shim_tests {
                 .unwrap_or_else(|| panic!("expected `cmp x8,#n` at {pc:#x}, got {op:#010x}"));
             let target = decode_beq(rd_u32(&bytes, pc + 4), pc + 4)
                 .unwrap_or_else(|| panic!("expected `b.eq` at {:#x}", pc + 4));
-            let h0 = rd_u32(&bytes, target);
-            if h0 == MRS_TPIDR_EL1_X0 {
-                // gettid: `mrs x0, TPIDR_EL1 ; cbz x0, <fallthrough> ; eret`.
-                // The cbz traps normally if TPIDR_EL1 is unstamped (0) — a tid is
-                // never 0 — so a missed per-vCPU stamp degrades to a correct trap,
-                // not a wrong gettid==0.
-                let guard = decode_cbz_x0(rd_u32(&bytes, target + 4), target + 4)
+            // Each handler starts with the enabled guard, using x0 only after
+            // the syscall number has matched. This keeps the non-intercepted
+            // path from perturbing any guest register.
+            let (lo, hw0) = decode_movz_x0(rd_u32(&bytes, target)).expect("handler movz x0");
+            let (mid, hw1) = decode_movk_x0(rd_u32(&bytes, target + 4)).expect("handler movk #16");
+            let (hi, hw2) = decode_movk_x0(rd_u32(&bytes, target + 8)).expect("handler movk #32");
+            assert_eq!((hw0, hw1, hw2), (0, 1, 2), "guard base built lo/mid/hi");
+            assert_eq!(
+                lo | (mid << 16) | (hi << 32),
+                LINUX_IDENTITY_PAGE_BASE,
+                "guard must address the identity page"
+            );
+            assert_eq!(
+                decode_ldr_w0_x0(rd_u32(&bytes, target + 12)).expect("guard ldr w0"),
+                IDENTITY_OFF_SHIM_ENABLED
+            );
+            let disabled_fallthrough = decode_cbz_x0(rd_u32(&bytes, target + 16), target + 16)
+                .expect("disabled guard must branch with `cbz x0`");
+            assert_eq!(
+                rd_u32(&bytes, disabled_fallthrough),
+                HVC2,
+                "disabled handler guard must branch to the host-trap fallthrough"
+            );
+
+            if nr == GETTID_NR {
+                // gettid: after the enabled guard, read CONTEXTIDR_EL1, then trap
+                // normally if it is 0 (unstamped — a tid is never 0).
+                assert_eq!(
+                    rd_u32(&bytes, target + 20),
+                    MRS_CONTEXTIDR_EL1_X0,
+                    "gettid must read CONTEXTIDR_EL1 after the enabled guard"
+                );
+                // The cbz traps normally if CONTEXTIDR_EL1 is unstamped (0) — a
+                // tid is never 0 — so a missed per-vCPU stamp degrades to a
+                // correct trap, not a wrong gettid==0.
+                let guard = decode_cbz_x0(rd_u32(&bytes, target + 24), target + 24)
                     .expect("gettid handler must guard with `cbz x0, <fallthrough>`");
                 assert_eq!(
                     rd_u32(&bytes, guard),
@@ -3206,27 +3275,29 @@ mod el1_shim_tests {
                     "gettid cbz must branch to the host-trap fallthrough"
                 );
                 assert_eq!(
-                    rd_u32(&bytes, target + 8),
+                    rd_u32(&bytes, target + 28),
                     ERET,
                     "gettid handler must eret after the guard"
                 );
                 sysreg_seen.push(nr);
             } else {
-                // page read: movz/movk/movk build the page base in x0, then ldr.
-                let (lo, hw0) = decode_movz_x0(h0).expect("handler movz x0");
+                // page read: after the enabled guard, movz/movk/movk rebuild
+                // the page base in x0, then ldr the syscall's identity field.
+                let (lo, hw0) =
+                    decode_movz_x0(rd_u32(&bytes, target + 20)).expect("handler movz x0");
                 let (mid, hw1) =
-                    decode_movk_x0(rd_u32(&bytes, target + 4)).expect("handler movk #16");
+                    decode_movk_x0(rd_u32(&bytes, target + 24)).expect("handler movk #16");
                 let (hi, hw2) =
-                    decode_movk_x0(rd_u32(&bytes, target + 8)).expect("handler movk #32");
+                    decode_movk_x0(rd_u32(&bytes, target + 28)).expect("handler movk #32");
                 assert_eq!((hw0, hw1, hw2), (0, 1, 2), "page base built lo/mid/hi");
                 assert_eq!(
                     lo | (mid << 16) | (hi << 32),
                     LINUX_IDENTITY_PAGE_BASE,
                     "handler must address the identity page"
                 );
-                let off = decode_ldr_w0_x0(rd_u32(&bytes, target + 12)).expect("ldr w0,[x0,#off]");
+                let off = decode_ldr_w0_x0(rd_u32(&bytes, target + 32)).expect("ldr w0,[x0,#off]");
                 assert_eq!(
-                    rd_u32(&bytes, target + 16),
+                    rd_u32(&bytes, target + 36),
                     ERET,
                     "handler must end with eret"
                 );
@@ -3244,7 +3315,7 @@ mod el1_shim_tests {
         assert_eq!(
             sysreg_seen,
             vec![GETTID_NR],
-            "gettid must be serviced via a TPIDR_EL1 read"
+            "gettid must be serviced via a CONTEXTIDR_EL1 read"
         );
     }
 
@@ -3396,8 +3467,9 @@ mod el1_shim_tests {
             .find(|r| r.start == LINUX_EL1_VECTORS_BASE)
             .expect("EL1 vector region must be present");
         assert!(
-            decode_movz_x16(rd_u32(region.bytes(), AARCH64_VECTOR_LOWER_EL_SYNC_OFFSET)).is_some(),
-            "sync slot must start with the x16 identity-page enabled guard"
+            rd_u32(region.bytes(), AARCH64_VECTOR_LOWER_EL_SYNC_OFFSET)
+                == AARCH64_MSR_TPIDR_EL1_X16_OPCODE,
+            "sync slot must start with the register-preserving ESR guard"
         );
     }
 

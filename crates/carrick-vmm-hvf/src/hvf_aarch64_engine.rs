@@ -226,13 +226,13 @@ impl Aarch64Vcpu for HvfAarch64Vcpu {
 
     fn stamp_guest_thread_id(&self, tid: u64) -> Result<(), TrapError> {
         use applevisor::prelude::SysReg;
-        // HVF's `hvc #2` vehicle leaves TPIDR_EL1 free (KVM uses it for the live-x9
-        // stash — see `get_saved_x9`), so carrick stamps the guest tid there for the
-        // EL1-vector `gettid` fast path (serviced at EL1, no host trap). Written via
-        // the applevisor `SysReg` directly: the neutral `carrick_hal::SysReg` has no
-        // TPIDR_EL1 variant (it is an HVF-private fast-path scratch).
+        // HVF's `gettid` fast path reads CONTEXTIDR_EL1 (serviced at EL1, no
+        // host trap), leaving TPIDR_EL1 free as the syscall-shim scratch that
+        // preserves x16 while checking ESR_EL1. Written via the applevisor
+        // `SysReg` directly: the neutral `carrick_hal::SysReg` has no
+        // CONTEXTIDR_EL1 variant (it is an HVF-private fast-path detail).
         self.0
-            .set_sys_reg(SysReg::TPIDR_EL1, tid)
+            .set_sys_reg(SysReg::CONTEXTIDR_EL1, tid)
             .map_err(|e| TrapError::Hypervisor(e.to_string()))
     }
 
