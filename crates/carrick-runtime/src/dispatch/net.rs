@@ -27,7 +27,7 @@
 //!   - **Buffer sizing and option semantics**: macOS gives an AF_UNIX stream
 //!     socket only an 8 KiB buffer where Linux gives 212992, which strands a
 //!     guest writer that fills its socket buffer expecting a non-blocking-style
-//!     completion (`widen_unix_stream_buffers`); SEQPACKET has no macOS AF_UNIX
+//!     completion (`widen_stream_socket_buffers`); SEQPACKET has no macOS AF_UNIX
 //!     backing and is framed on top of a STREAM socket
 //!     (`host_socktype_backing`).
 //!
@@ -1337,11 +1337,9 @@ impl SyscallDispatcher {
         // blocking mode in Linux-visible status_flags and waits outside the
         // dispatcher lock when a blocking operation would block.
         set_host_nonblocking(host_fd);
-        // Give AF_UNIX stream sockets the Linux-sized buffer (macOS defaults to
-        // 8 KiB vs Linux's 212992) so a guest write expecting to complete up to the
-        // socket buffer without a draining reader doesn't block forever (Go
-        // splice/sendfile "Limited" copy hang). No-op for AF_INET / DGRAM.
-        widen_unix_stream_buffers(host_fd, family, base_type);
+        // Give stream sockets a Linux-sized host backing buffer so guest
+        // non-blocking copy/splice loops do not churn on macOS' small defaults.
+        widen_stream_socket_buffers(host_fd, family, base_type);
         let status_flags = LINUX_O_RDWR | if nonblock { LINUX_O_NONBLOCK } else { 0 };
         let fd_flags = if cloexec { LINUX_FD_CLOEXEC } else { 0 };
         let open_file = OpenFile::new(
@@ -1952,7 +1950,7 @@ impl SyscallDispatcher {
         // Keep the host socket non-blocking; Linux-visible blocking intent is
         // carried by status_flags and serviced by WaitOnFds.
         set_host_nonblocking(new_host);
-        widen_unix_stream_buffers(new_host, family, type_);
+        widen_stream_socket_buffers(new_host, family, type_);
         let status_flags = LINUX_O_RDWR | if nonblock { LINUX_O_NONBLOCK } else { 0 };
         let fd_flags = if cloexec { LINUX_FD_CLOEXEC } else { 0 };
         let open_file = OpenFile::new(

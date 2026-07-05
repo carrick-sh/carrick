@@ -181,7 +181,7 @@ mod stat;
 mod state;
 mod xattr;
 use state::*;
-pub(super) use state::{FsState, IoState};
+pub(super) use state::{FsState, IoState, SplicePushback};
 
 fn get_last_error() -> i32 {
     carrick_portable::errno()
@@ -2526,7 +2526,8 @@ impl SyscallDispatcher {
                 host_fd,
                 is_read_end: true,
                 ..
-            } => host_pipe_readable_bytes(host_fd.raw()).map(Some),
+            } => host_pipe_readable_bytes(host_fd.raw())
+                .map(|bytes| Some(bytes + self.staged_splice_pipe_bytes(fd))),
             OpenDescription::HostPipe {
                 pipe_id,
                 bidirectional,
@@ -2558,6 +2559,46 @@ impl SyscallDispatcher {
         }
     }
 
+    fn host_pipe_read_end_for_pipe_id(&self, pipe_id: u64) -> Option<(i32, HostFd)> {
+        let table = self.io.open_files.read();
+        for (fd, other) in table.iter() {
+            let other_open = other.description.read();
+            if let OpenDescription::HostPipe {
+                host_fd,
+                is_read_end: true,
+                pipe_id: other_pipe_id,
+                ..
+            } = &*other_open
+                && *other_pipe_id == pipe_id
+            {
+                return Some((*fd, host_fd.view()));
+            }
+        }
+        None
+    }
+
+    fn host_pipe_splice_staging_target(&self, fd: i32) -> Option<(i32, usize)> {
+        let (pipe_id, capacity) = {
+            let open_file = self.open_file(fd)?;
+            let open = open_file.description.read();
+            match &*open {
+                OpenDescription::HostPipe {
+                    base,
+                    is_read_end: false,
+                    pipe_id,
+                    pty: None,
+                    bidirectional: false,
+                    ..
+                } if *pipe_id != 0 => (*pipe_id, base.pipe_capacity()),
+                _ => return None,
+            }
+        };
+        let (read_fd, _) = self.host_pipe_read_end_for_pipe_id(pipe_id)?;
+        let capacity = usize::try_from(capacity).ok()?;
+        let queued = self.host_pipe_read_end_buffered_bytes(pipe_id);
+        Some((read_fd, capacity.saturating_sub(queued)))
+    }
+
     pub(in crate::dispatch) fn host_pipe_capacity_state(
         &self,
         base: &OpenDescriptionBase,
@@ -2576,7 +2617,7 @@ impl SyscallDispatcher {
 
     fn host_pipe_read_end_buffered_bytes(&self, pipe_id: u64) -> usize {
         let table = self.io.open_files.read();
-        for other in table.values() {
+        for (fd, other) in table.iter() {
             let Some(other_open) = other.description.try_read() else {
                 continue;
             };
@@ -2588,10 +2629,19 @@ impl SyscallDispatcher {
             } = &*other_open
                 && *other_pipe_id == pipe_id
             {
-                return host_pipe_readable_bytes(host_fd.raw()).ok().unwrap_or(0);
+                return host_pipe_readable_bytes(host_fd.raw()).ok().unwrap_or(0)
+                    + self.staged_splice_pipe_bytes(*fd);
             }
         }
         0
+    }
+
+    fn staged_splice_pipe_bytes(&self, guest_fd: i32) -> usize {
+        self.io
+            .splice_pushback
+            .lock()
+            .get(&guest_fd)
+            .map_or(0, SplicePushback::len)
     }
 
     /// Reconcile the fork-coherent FASYNC registry with `fd`'s current
@@ -3088,19 +3138,17 @@ impl SyscallDispatcher {
         host_fd: HostFd,
         count: usize,
     ) -> Result<Vec<u8>, DispatchError> {
-        let mut buf = Vec::new();
+        let mut buf;
         {
             let mut staged = self.io.splice_pushback.lock();
-            let mut empty = false;
-            if let Some(queue) = staged.get_mut(&guest_fd) {
-                while buf.len() < count {
-                    let Some(byte) = queue.pop_front() else {
-                        break;
-                    };
-                    buf.push(byte);
+            let empty;
+            (buf, empty) = match staged.get_mut(&guest_fd) {
+                Some(queue) => {
+                    let buf = queue.take_vec(count);
+                    (buf, queue.is_empty())
                 }
-                empty = queue.is_empty();
-            }
+                None => (Vec::new(), false),
+            };
             if empty {
                 staged.remove(&guest_fd);
             }
@@ -3126,15 +3174,22 @@ impl SyscallDispatcher {
         Ok(buf)
     }
 
+    fn stage_splice_pipe_bytes_owned(&self, guest_fd: i32, bytes: Vec<u8>) {
+        if bytes.is_empty() {
+            return;
+        }
+        let mut staged = self.io.splice_pushback.lock();
+        let queue = staged.entry(guest_fd).or_default();
+        queue.push_back_owned(bytes);
+    }
+
     fn restore_splice_pipe_bytes(&self, guest_fd: i32, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
         }
         let mut staged = self.io.splice_pushback.lock();
         let queue = staged.entry(guest_fd).or_default();
-        for byte in bytes.iter().rev() {
-            queue.push_front(*byte);
-        }
+        queue.push_front(bytes);
     }
 
     fn write_output_fd(
@@ -7744,9 +7799,9 @@ impl SyscallDispatcher {
             let memory = &mut *cx.memory;
             // `from_bits` rejects exactly the historical `& !SUPPORTED` set:
             // the type's full set IS the supported set.
-            if LinuxSpliceFlags::from_bits(flags).is_none() {
+            let Some(splice_flags) = LinuxSpliceFlags::from_bits(flags) else {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-            }
+            };
             // A closed/negative fd_in is EBADF before any routing — the
             // file→pipe fallthrough otherwise read an empty byte stream from
             // the dead fd and "spliced" 0 bytes (LTP splice03 badfd case).
@@ -7824,6 +7879,35 @@ impl SyscallDispatcher {
                 }
                 if let Some(errno) = this.splice_output_errno(out_fd.0) {
                     return Ok(DispatchOutcome::errno(errno));
+                }
+                if off_out_address == 0
+                    && splice_flags.contains(LinuxSpliceFlags::NONBLOCK)
+                    && let Some((pipe_read_fd, room)) =
+                        this.host_pipe_splice_staging_target(out_fd.0)
+                {
+                    if room == 0 {
+                        return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
+                    }
+                    let want = count.min(room).min(1 << 20);
+                    let mut buf = vec![0u8; want];
+                    let n = unsafe {
+                        libc::recv(
+                            host_fd.get(),
+                            buf.as_mut_ptr() as *mut _,
+                            want,
+                            libc::MSG_DONTWAIT,
+                        )
+                    };
+                    let n = n.host_syscall_errno()?;
+                    if n == 0 {
+                        return Ok(DispatchOutcome::Returned { value: 0 });
+                    }
+                    buf.truncate(n as usize);
+                    let consumed = buf.len();
+                    this.stage_splice_pipe_bytes_owned(pipe_read_fd, buf);
+                    return Ok(DispatchOutcome::Returned {
+                        value: consumed as i64,
+                    });
                 }
                 // PEEK first, then consume EXACTLY what the destination accepts.
                 // The destination is typically Go's O_NONBLOCK splice pipe (64 KiB
@@ -10541,6 +10625,84 @@ mod tests {
             sigpoll_fd(dispatcher.take_pending_siginfo(tid, signum).unwrap()),
             parent_fd
         );
+    }
+
+    #[test]
+    fn staged_splice_pipe_bytes_preserve_fifo_order() {
+        let mut host_fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(host_fds.as_mut_ptr()) }, 0);
+
+        let dispatcher = SyscallDispatcher::new();
+        let read_open = OpenFile::new(
+            Arc::new(RwLock::new(OpenDescription::HostPipe {
+                host_fd: HostFdRef::new(host_fds[0]),
+                is_read_end: true,
+                pipe_id: 42,
+                base: OpenDescriptionBase::new(0),
+                pty: None,
+                bidirectional: false,
+                write_kind: HostWriteKind::PipeLike,
+            })),
+            0,
+        );
+        let write_open = OpenFile::new(
+            Arc::new(RwLock::new(OpenDescription::HostPipe {
+                host_fd: HostFdRef::new(host_fds[1]),
+                is_read_end: false,
+                pipe_id: 42,
+                base: OpenDescriptionBase::new(0),
+                pty: None,
+                bidirectional: false,
+                write_kind: HostWriteKind::PipeLike,
+            })),
+            0,
+        );
+        let (read_fd, _write_fd) = dispatcher
+            .install_fd_pair_at_or_above(3, read_open, write_open)
+            .expect("install host pipe pair");
+        let host_read = dispatcher
+            .host_pipe_read_fd(read_fd)
+            .expect("host pipe read fd");
+
+        dispatcher.stage_splice_pipe_bytes_owned(read_fd, b"abc".to_vec());
+        dispatcher.stage_splice_pipe_bytes_owned(read_fd, b"def".to_vec());
+
+        let bytes = dispatcher
+            .take_splice_pipe_bytes(read_fd, host_read, 6)
+            .expect("take staged bytes");
+        assert_eq!(bytes, b"abcdef");
+    }
+
+    #[test]
+    fn splice_pushback_keeps_large_stages_chunked() {
+        let mut pushback = fs::SplicePushback::default();
+        let bytes = vec![0x5a; 1024 * 1024];
+
+        pushback.push_front(&bytes);
+
+        assert_eq!(pushback.len(), bytes.len());
+        assert_eq!(pushback.chunk_count_for_tests(), 1);
+
+        let mut drained = Vec::new();
+        pushback.take_into(4096, &mut drained);
+
+        assert_eq!(drained, &bytes[..4096]);
+        assert_eq!(pushback.len(), bytes.len() - 4096);
+        assert_eq!(pushback.chunk_count_for_tests(), 1);
+    }
+
+    #[test]
+    fn splice_pushback_moves_owned_full_chunks_without_copy() {
+        let mut pushback = fs::SplicePushback::default();
+        let bytes = vec![0x33; 1024 * 1024];
+        let ptr = bytes.as_ptr();
+
+        pushback.push_back_owned(bytes);
+        let drained = pushback.take_vec(1024 * 1024);
+
+        assert_eq!(drained.as_ptr(), ptr);
+        assert_eq!(drained.len(), 1024 * 1024);
+        assert!(pushback.is_empty());
     }
 
     #[test]
