@@ -8237,12 +8237,18 @@ impl SyscallDispatcher {
         }
 
         fn fanotify_init(this, cx, _flags: u64, _event_f_flags: u64) {
-            let _ = (this, cx);
+            // fanotify is genuinely CAP_SYS_ADMIN-gated: unprivileged Linux itself
+            // returns EPERM here. Carrick has no fanotify backend, so EPERM is the
+            // honest CAP-gated answer that MATCHes real Linux with no seccomp
+            // trick. Do NOT unconfine these suites — there is no real success path
+            // to converge on.
             Ok(DispatchOutcome::errno(LINUX_EPERM))
         }
 
         fn fanotify_mark(this, cx, _fanotify_fd: Fd, _flags: u64, _mask: u64, _dirfd: Fd, _pathname: GuestPtr) {
-            let _ = (this, cx);
+            // See fanotify_init: no fanotify backend; EPERM is the honest
+            // CAP_SYS_ADMIN-gated answer, matching unprivileged Linux with no
+            // seccomp trick. Do NOT unconfine these suites.
             Ok(DispatchOutcome::errno(LINUX_EPERM))
         }
 
