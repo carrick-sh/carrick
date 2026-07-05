@@ -809,9 +809,9 @@ fn open_global_vcpu_slot(slot: usize) -> Option<libc::c_int> {
 fn acquire_global_vcpu_permit() -> GlobalVcpuPermit {
     // `hv_vm_get_max_vcpu_count` is a per-VM ceiling. A fork storm creates many
     // one-vCPU VMs, and HVF can exhaust host resources well below that per-VM
-    // count. Keep the cross-process gate conservative; the in-process scheduler
-    // still uses the full per-VM budget for guest threads.
-    let budget = (vcpu_gate::budget().max(1) as usize).min(4);
+    // count. Keep the cross-process gate conservative; the in-process M:N
+    // scheduler uses the physical-core-capped per-VM budget for guest threads.
+    let budget = vcpu_gate::budget().clamp(1, 4);
     ensure_global_vcpu_slot_dir();
     let mut backoff = GlobalVcpuPermitBackoff::default();
     loop {
@@ -952,29 +952,27 @@ fn create_vm_with_admission(
     }
 }
 
-/// vCPU admission gate for sibling guest threads.
+/// vCPU budget for sibling guest threads.
 ///
 /// Hypervisor.framework caps the number of vCPUs that may exist CONCURRENTLY in
-/// a VM (`hv_vm_get_max_vcpu_count`, 64 on this class of host). carrick gives
-/// every guest thread its own vCPU for its whole lifetime, so a guest that runs
-/// more concurrent threads than the cap (CPython's `test_queue.test_many_threads`
-/// spawns 50 producers + 50 consumers = 100) makes `hv_vcpu_create` return
-/// HV_NO_RESOURCES (0xfae94005). Before this gate the clone() syscall had ALREADY
-/// reported the new tid as success to the guest, so the thread that failed to get
-/// a vCPU silently never ran — and any join on it deadlocked (→ 150s TIMEOUT).
+/// a VM (`hv_vm_get_max_vcpu_count`, 64 on this class of host). Carrick also
+/// should not ask the bounded M:N scheduler to run more HVF vCPU handles than
+/// there are physical host cores: extra runnable guest threads should queue in
+/// the scheduler, not oversubscribe HVF and turn conformance into host-kernel
+/// contention.
 ///
 /// Linux has no such cap: those 100 threads just run. To preserve that observable
-/// behavior we DON'T fail clone; instead the sibling host-thread BLOCKS here until
-/// a vCPU slot frees (another guest thread exits and destroys its vCPU). The guest
-/// thread is created eagerly (clone succeeds, matching Linux); it simply may not
-/// get scheduled onto a real vCPU until the live count drops below budget. Threads
-/// that decouple through a queue (producers exit → free slots → queued consumers
-/// admitted) therefore complete instead of deadlocking.
+/// behavior we DON'T fail clone; instead the bounded scheduler parks excess
+/// guest threads until a vCPU slot frees. The guest thread is created eagerly
+/// (clone succeeds, matching Linux); it simply may not get scheduled onto a real
+/// vCPU until the live count drops below budget. Threads that decouple through a
+/// queue (producers exit → free slots → queued consumers admitted) therefore
+/// complete instead of deadlocking.
 ///
-/// Only SIBLING-thread creation goes through the gate. The initial boot vCPU and
-/// fork/execve REBUILDs must never block: a fork releases its vCPUs (count drops)
-/// before rebuilding, and blocking a rebuild behind the gate it just emptied would
-/// be a self-deadlock — those paths call `vcpu_create` directly.
+/// The shared M:N scheduler applies this budget to guest-thread vCPU slots.
+/// Initial VM creation and fork/execve VM REBUILDs must not also wait on a second
+/// sibling-thread gate: a fork releases its vCPUs before rebuilding, and blocking
+/// a rebuild behind the gate it just emptied would be a self-deadlock.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod vcpu_gate {
     use std::sync::{Condvar, OnceLock};
@@ -984,25 +982,40 @@ mod vcpu_gate {
     /// recreates one) and the forker has headroom, even while the gate is full.
     const RESERVE: i64 = 4;
 
-    static BUDGET: OnceLock<i64> = OnceLock::new();
+    static BUDGET: OnceLock<usize> = OnceLock::new();
     static GATE_CV: Condvar = Condvar::new();
 
-    /// HVF concurrent-vCPU budget for SIBLING threads (cap − reserve). Queried
-    /// once; if the query fails we fall back to a conservative 60. The
-    /// `Aarch64Vmm::vcpu_budget()` the bounded scheduler installs.
+    /// HVF concurrent-vCPU budget for SIBLING threads, capped by both the
+    /// usable HVF ceiling (cap − reserve) and physical host cores. Queried once.
+    /// This is the `Aarch64Vmm::vcpu_budget()` the bounded scheduler installs.
     ///
     /// NOTE: the old blocking `acquire()` admission gate is RETIRED — the bounded
     /// carrick-hal scheduler (installed for `vcpu_budget()`) does admission in the
     /// shared spawn path, and HVF's `wait_for_vcpu_slot` is now a no-op. `notify`
     /// is still poked on every vCPU destroy in case a future waiter parks on the
     /// condvar.
-    pub(crate) fn budget() -> i64 {
+    pub(crate) fn budget() -> usize {
         *BUDGET.get_or_init(|| {
-            let mut max: u32 = 0;
-            let rc = unsafe { applevisor_sys::hv_vm_get_max_vcpu_count(&mut max) };
-            let cap = if rc == 0 && max > 0 { max as i64 } else { 64 };
-            (cap - RESERVE).max(1)
+            budget_from_limits(
+                hvf_cap_budget(),
+                carrick_host::host_facts::physical_cpu_count(),
+            )
         })
+    }
+
+    fn hvf_cap_budget() -> usize {
+        let mut max: u32 = 0;
+        let rc = unsafe { applevisor_sys::hv_vm_get_max_vcpu_count(&mut max) };
+        let cap = if rc == 0 && max > 0 {
+            i64::from(max)
+        } else {
+            64
+        };
+        (cap - RESERVE).max(1) as usize
+    }
+
+    pub(crate) fn budget_from_limits(hvf_budget: usize, physical_cores: usize) -> usize {
+        hvf_budget.max(1).min(physical_cores.max(1))
     }
 
     /// A vCPU was destroyed; wake any thread parked on the gate condvar.
@@ -4465,15 +4478,15 @@ fn hvf_mem_perms(perms: carrick_hal::MemPerms) -> applevisor::memory::MemPerms {
     }
 }
 
-/// The HVF concurrent-vCPU budget (cap − fork-rebuild reserve) for the bounded
-/// M:N scheduler the engine installs via `GuestVmBackend::vcpu_budget`. Same value
-/// the retired `vcpu_gate` enforced; reclaim recycles vCPUs so >cap guest threads
-/// run instead of hanging. macOS/HVF-only: `vcpu_gate` (and the whole HVF backend)
-/// is cfg'd out off the HVF lane, and the only caller (the new module's
+/// The HVF concurrent-vCPU budget for the bounded M:N scheduler the engine
+/// installs via `GuestVmBackend::vcpu_budget`: physical host cores, capped by
+/// HVF's usable per-VM vCPU ceiling. Reclaim recycles vCPUs so >budget guest
+/// threads run instead of hanging. macOS/HVF-only: `vcpu_gate` (and the whole HVF
+/// backend) is cfg'd out off the HVF lane, and the only caller (the new module's
 /// `GuestVmBackend::vcpu_budget`) is macOS-only too.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn hvf_vcpu_budget() -> usize {
-    vcpu_gate::budget().max(1) as usize
+    vcpu_gate::budget().max(1)
 }
 
 // NOTE: the thread-sibling register seeding (`seed_child_snapshot`) now lives
@@ -4513,6 +4526,14 @@ mod vm_create_admission_tests {
                 std::time::Duration::from_millis(50),
             ]
         );
+    }
+
+    #[test]
+    fn mn_budget_uses_physical_cores_but_never_exceeds_hvf_cap() {
+        assert_eq!(vcpu_gate::budget_from_limits(60, 10), 10);
+        assert_eq!(vcpu_gate::budget_from_limits(6, 10), 6);
+        assert_eq!(vcpu_gate::budget_from_limits(60, 0), 1);
+        assert_eq!(vcpu_gate::budget_from_limits(0, 10), 1);
     }
 }
 
