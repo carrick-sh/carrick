@@ -792,7 +792,13 @@ impl SyscallDispatcher {
                 if rlim_cur > rlim_max {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
-                if rlim_max > old.rlim_max {
+                // Raising a (previously-lowered) hard limit needs CAP_SYS_RESOURCE,
+                // which carrick models as euid==0 (the default guest identity is
+                // root). A privileged guest may raise it; the store path below
+                // then persists the new hard cap. An unprivileged guest still gets
+                // EPERM (matches real Linux). Reverts commit 13873aa3's
+                // unconditional denial.
+                if rlim_max > old.rlim_max && this.cred_snapshot().euid != 0 {
                     return Ok(DispatchOutcome::errno(LINUX_EPERM));
                 }
                 if resource == LINUX_RLIMIT_NOFILE {
