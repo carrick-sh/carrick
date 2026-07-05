@@ -72,6 +72,21 @@ const LTP_SMOKE: &[&str] = &[
 
 const LTP_NOFILE_4096: &[&str] = &["dup03", "dup06", "dup205"];
 
+/// Oracle-fidelity docker_flags that must survive `--generate-suites`.
+/// clone3 template: lift the container seccomp default so BOTH engines run the
+/// real syscall (carrick then returns ENOSYS for unimplemented). Hand-edits to
+/// the generated suites.toml do NOT survive regen — this table is their home.
+const DOCKER_FLAG_OVERRIDES: &[(&str, &[&str])] = &[
+    ("ltp-clone301", &["--security-opt", "seccomp=unconfined"]),
+    ("ltp-clone302", &["--security-opt", "seccomp=unconfined"]),
+];
+fn docker_flag_overrides(name: &str) -> Option<Vec<String>> {
+    DOCKER_FLAG_OVERRIDES
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, f)| f.iter().map(|s| s.to_string()).collect())
+}
+
 /// LTP binaries that are single manifests but multi-phase tests; the default
 /// 40 s syscall-family budget can kill them after valid progress. Keep these
 /// budgets close to the oracle: a pathological failure must not hold a
@@ -428,6 +443,12 @@ fn build() -> (Vec<Suite>, (usize, usize, usize)) {
         suites.push(suite);
     }
 
+    for s in &mut suites {
+        if let Some(f) = docker_flag_overrides(&s.name) {
+            s.docker_flags = f;
+        }
+    }
+
     (suites, (cpy.len(), go.len(), ltp.len()))
 }
 
@@ -464,5 +485,40 @@ mod tests {
         assert_eq!(cpython_timeout_s("test_json"), 300);
         assert_eq!(go_timeout_s("net/url"), 180);
         assert_eq!(ltp_timeout_s("gettid01"), 40);
+    }
+
+    /// Guards against a repeat of the regen that silently dropped the
+    /// `docker_flags = ["--security-opt", "seccomp=unconfined"]` lines from
+    /// ltp-clone301/302: reads the COMMITTED manifest straight off disk (not
+    /// `build()` — that shells to docker) and asserts the oracle-fidelity
+    /// flag is still there.
+    #[test]
+    fn committed_suites_preserve_manual_docker_flags() {
+        let text = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../scripts/conformance/suites.toml"
+        ))
+        .unwrap();
+        let m = Manifest::from_toml(&text).unwrap();
+        for name in ["ltp-clone301", "ltp-clone302"] {
+            let s = m.suite.iter().find(|s| s.name == name).unwrap();
+            assert!(
+                s.docker_flags.iter().any(|f| f == "seccomp=unconfined"),
+                "{name} lost seccomp=unconfined"
+            );
+        }
+    }
+
+    #[test]
+    fn manual_docker_flag_overrides_survive_regen() {
+        assert_eq!(
+            docker_flag_overrides("ltp-clone301"),
+            Some(vec!["--security-opt".into(), "seccomp=unconfined".into()])
+        );
+        assert_eq!(
+            docker_flag_overrides("ltp-clone302"),
+            Some(vec!["--security-opt".into(), "seccomp=unconfined".into()])
+        );
+        assert_eq!(docker_flag_overrides("ltp-clone303"), None);
     }
 }
