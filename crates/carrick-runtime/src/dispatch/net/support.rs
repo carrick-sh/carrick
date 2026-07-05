@@ -480,24 +480,24 @@ pub(super) fn host_socktype_backing(family: i32, base_type: i32) -> i32 {
     linux_to_host_socktype(base_type)
 }
 
-/// Widen a host AF_UNIX stream/seqpacket socket's send (and recv) buffer beyond
-/// macOS' tiny default. Linux-visible `getsockopt(SO_SNDBUF/SO_RCVBUF)` reports
-/// the guest-intended/default Linux value from `OpenDescriptionBase`, so this is
+/// Widen a host stream socket's send (and recv) buffer beyond macOS' small
+/// defaults. Linux-visible `getsockopt(SO_SNDBUF/SO_RCVBUF)` reports the
+/// guest-intended/default Linux value from `OpenDescriptionBase`, so this is
 /// host-only backing capacity. A guest that writes up to its socket buffer
 /// expecting the write to complete WITHOUT a draining reader then blocks forever
 /// on a POLLOUT that never comes — e.g. Go's splice/sendfile "Limited" copy, where
 /// a writer goroutine pushes a large payload while the reader consumes in large
 /// netpoll waits. SO_SNDBUF is the load-bearing option (it governs the writer);
-/// SO_RCVBUF is set for symmetry. Best-effort: errors are ignored. No-op for
-/// AF_INET (macOS already gives it a large buffer) and for DGRAM (datagram
-/// boundary semantics differ — never widen).
-pub(super) fn widen_unix_stream_buffers(host_fd: i32, family: i32, base_type: i32) {
-    if family != LINUX_AF_UNIX
-        || (base_type != LINUX_SOCK_STREAM && base_type != LINUX_SOCK_SEQPACKET)
-    {
+/// SO_RCVBUF is set for symmetry. Best-effort: errors are ignored. DGRAM is
+/// intentionally left alone because datagram boundary semantics differ.
+pub(super) fn widen_stream_socket_buffers(host_fd: i32, family: i32, base_type: i32) {
+    if !matches!(base_type, LINUX_SOCK_STREAM | LINUX_SOCK_SEQPACKET) {
         return;
     }
-    const HOST_UNIX_STREAM_BUF: libc::c_int = 4 * 1024 * 1024;
+    if base_type == LINUX_SOCK_SEQPACKET && family != LINUX_AF_UNIX {
+        return;
+    }
+    const HOST_STREAM_BUF: libc::c_int = 4 * 1024 * 1024;
     for opt in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
         // SAFETY: host_fd is a live socket fd; the optval is a valid &c_int.
         unsafe {
@@ -505,7 +505,7 @@ pub(super) fn widen_unix_stream_buffers(host_fd: i32, family: i32, base_type: i3
                 host_fd,
                 libc::SOL_SOCKET,
                 opt,
-                &HOST_UNIX_STREAM_BUF as *const libc::c_int as *const libc::c_void,
+                &HOST_STREAM_BUF as *const libc::c_int as *const libc::c_void,
                 std::mem::size_of::<libc::c_int>() as libc::socklen_t,
             );
         }
@@ -3070,6 +3070,33 @@ mod tests {
         );
         // A non-IO wake (EVFILT_USER) carries no readiness → no bits.
         assert_eq!(pollevent_to_epoll(&ev(Readiness::empty(), false, None)), 0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn stream_buffer_widening_covers_inet_stream_sockets() {
+        let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+        assert!(fd >= 0);
+        widen_stream_socket_buffers(fd, LINUX_AF_INET, LINUX_SOCK_STREAM);
+
+        let mut size: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                &mut size as *mut libc::c_int as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        unsafe { libc::close(fd) };
+
+        assert_eq!(rc, 0);
+        assert!(
+            size >= 1024 * 1024,
+            "host stream send buffer stayed too small: {size}"
+        );
     }
 
     #[cfg(target_os = "macos")]

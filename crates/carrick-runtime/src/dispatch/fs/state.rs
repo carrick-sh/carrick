@@ -50,6 +50,98 @@ impl LegacyAioContextId {
     }
 }
 
+#[derive(Debug, Default)]
+pub(in crate::dispatch) struct SplicePushback {
+    chunks: VecDeque<SplicePushbackChunk>,
+    len: usize,
+}
+
+#[derive(Debug)]
+struct SplicePushbackChunk {
+    bytes: Vec<u8>,
+    offset: usize,
+}
+
+impl SplicePushback {
+    pub(in crate::dispatch) fn len(&self) -> usize {
+        self.len
+    }
+
+    pub(in crate::dispatch) fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub(in crate::dispatch) fn push_back_owned(&mut self, bytes: Vec<u8>) {
+        self.push_owned(bytes, PushbackEnd::Back);
+    }
+
+    pub(in crate::dispatch) fn push_front(&mut self, bytes: &[u8]) {
+        self.push_owned(bytes.to_vec(), PushbackEnd::Front);
+    }
+
+    pub(in crate::dispatch) fn take_vec(&mut self, count: usize) -> Vec<u8> {
+        let Some(chunk) = self.chunks.front() else {
+            return Vec::new();
+        };
+        let available = chunk.bytes.len().saturating_sub(chunk.offset);
+        if chunk.offset == 0 && available == count {
+            if let Some(chunk) = self.chunks.pop_front() {
+                self.len -= count;
+                return chunk.bytes;
+            }
+        }
+
+        let mut out = Vec::with_capacity(count.min(self.len));
+        self.take_into(count, &mut out);
+        out
+    }
+
+    pub(in crate::dispatch) fn take_into(&mut self, count: usize, out: &mut Vec<u8>) {
+        let mut remaining = count;
+        while remaining > 0 {
+            let Some(chunk) = self.chunks.front_mut() else {
+                break;
+            };
+            let available = chunk.bytes.len().saturating_sub(chunk.offset);
+            if available == 0 {
+                self.chunks.pop_front();
+                continue;
+            }
+            let take = remaining.min(available);
+            out.extend_from_slice(&chunk.bytes[chunk.offset..chunk.offset + take]);
+            chunk.offset += take;
+            self.len -= take;
+            remaining -= take;
+            if chunk.offset == chunk.bytes.len() {
+                self.chunks.pop_front();
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(in crate::dispatch) fn chunk_count_for_tests(&self) -> usize {
+        self.chunks.len()
+    }
+
+    fn push_owned(&mut self, bytes: Vec<u8>, end: PushbackEnd) {
+        if bytes.is_empty() {
+            return;
+        }
+        let len = bytes.len();
+        let chunk = SplicePushbackChunk { bytes, offset: 0 };
+        self.len += len;
+        match end {
+            PushbackEnd::Front => self.chunks.push_front(chunk),
+            PushbackEnd::Back => self.chunks.push_back(chunk),
+        }
+    }
+}
+
+enum PushbackEnd {
+    Front,
+    Back,
+}
+
 /// Owned filesystem-subsystem state. Split out of `SyscallDispatcher` so
 /// the fs handlers borrow only the VFS state they touch instead of the
 /// whole dispatcher. Field semantics are unchanged from the former loose
@@ -135,7 +227,7 @@ pub(in crate::dispatch) struct IoState {
     /// destination yet. Linux does not consume pipe bytes when splice returns
     /// EAGAIN on the output side; host pipes have no peek API, so Carrick stages
     /// the bytes here and retries them before reading more from the host pipe.
-    pub splice_pushback: Mutex<HashMap<i32, VecDeque<u8>>>,
+    pub splice_pushback: Mutex<HashMap<i32, SplicePushback>>,
     /// Live io_uring instances keyed by ring fd (WS-H4-B1). Side table rather
     /// than an `OpenDescription` variant so io_uring needs no new arm across the
     /// ~24 fd match sites; `mmap`/`io_uring_enter` look the ring up here.
