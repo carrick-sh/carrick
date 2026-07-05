@@ -387,6 +387,12 @@ pub(super) enum BlockingWaitCompletion {
     ExecReplacedThread,
 }
 
+pub(super) enum SharedWordWaitCompletion {
+    Changed,
+    Interrupted,
+    ExecReplacedThread,
+}
+
 fn thread_should_finish_for_exec_replacement(registry: &ThreadRegistry, tid: ThreadId) -> bool {
     // `exec_replacing_other_thread` is transient. A sibling that reclaimed its
     // vCPU can still be waking from a host wait after the execing thread has
@@ -1102,6 +1108,28 @@ where
                         }
                     }
                 }
+                DispatchOutcome::WaitOnSharedWord {
+                    location,
+                    waiter_key,
+                    value,
+                } => match self.wait_on_shared_word(engine, location, waiter_key, value)? {
+                    SharedWordWaitCompletion::Changed => continue,
+                    SharedWordWaitCompletion::Interrupted => {
+                        if let Some(outcome) = self.exec_replaced_thread_exit() {
+                            break Ok(outcome);
+                        }
+                        if crate::fork_quiesce::is_quiescing() {
+                            self.release_and_park_vcpu_for_fork(engine)?;
+                            continue;
+                        }
+                        break Ok(DispatchOutcome::Errno {
+                            errno: crate::linux_abi::LINUX_EINTR,
+                        });
+                    }
+                    SharedWordWaitCompletion::ExecReplacedThread => {
+                        break Ok(DispatchOutcome::ThreadExit { code: 0 });
+                    }
+                },
                 other => break Ok(other),
             }
         }
@@ -1598,6 +1626,15 @@ where
                         .shared_requeue(from, from_key, to, to_key, wake, requeue);
                     last_syscall_retval =
                         Some(state.complete_returned(&mut engine, i64::from(woken + requeued))?);
+                }
+                DispatchOutcome::WaitOnSharedWord {
+                    location: _,
+                    waiter_key: _,
+                    value: _,
+                } => {
+                    return Err(RuntimeError::Unsupported(
+                        "WaitOnSharedWord escaped threaded syscall service".to_string(),
+                    ));
                 }
                 DispatchOutcome::CloneThread {
                     stack,

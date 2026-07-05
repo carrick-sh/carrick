@@ -170,7 +170,7 @@ const LINUX_SEMMSL: usize = 32000;
 const LINUX_SEMMNI: usize = 32000;
 const LINUX_SEMOPM: u32 = 500;
 const LINUX_SEMVMX: u32 = 32767;
-const LINUX_MSGMNI: usize = 32000;
+const LINUX_MSGMNI: usize = 8;
 const LINUX_MSGMNB: u64 = 16384;
 const LINUX_MSGMAX: usize = 8192;
 const LINUX_MSG_STAT: u64 = 11;
@@ -183,7 +183,6 @@ const MSG_QUEUE_HEADER_SIZE: usize = 128;
 const MSG_RECORD_HEADER_SIZE: usize = 16;
 const MSG_QUEUE_COMPACT_HEAD_THRESHOLD: usize = 64 * 1024;
 const MSG_QUEUE_WAIT_WORD_BYTES: usize = std::mem::size_of::<std::sync::atomic::AtomicU32>();
-const MSG_QUEUE_WAIT_SLICE_US: u32 = 20_000;
 
 const MSG_OFF_MAGIC: usize = 0;
 const MSG_OFF_VERSION: usize = 4;
@@ -1589,6 +1588,7 @@ impl MsgQueueWaitWordCache {
 thread_local! {
     static MSG_QUEUE_WAIT_WORD_CACHE: RefCell<MsgQueueWaitWordCache> =
         RefCell::new(MsgQueueWaitWordCache::new());
+    static MSG_QUEUE_BLOCKED_IDS: RefCell<HashSet<i32>> = RefCell::new(HashSet::new());
 }
 
 fn with_cached_msg_queue_wait_word<R>(
@@ -1605,37 +1605,46 @@ fn remove_cached_msg_queue_wait_word(queue_path: &Path) {
     MSG_QUEUE_WAIT_WORD_CACHE.with(|cache| cache.borrow_mut().remove(queue_path));
 }
 
+fn remember_msg_queue_block(id: MsgQueueId) {
+    MSG_QUEUE_BLOCKED_IDS.with(|ids| {
+        ids.borrow_mut().insert(id.raw());
+    });
+}
+
+fn clear_msg_queue_block(id: MsgQueueId) {
+    MSG_QUEUE_BLOCKED_IDS.with(|ids| {
+        ids.borrow_mut().remove(&id.raw());
+    });
+}
+
+fn take_msg_queue_block(id: MsgQueueId) -> bool {
+    MSG_QUEUE_BLOCKED_IDS.with(|ids| ids.borrow_mut().remove(&id.raw()))
+}
+
 struct MsgQueueWaitToken {
-    word: MsgQueueWaitWord,
+    location: carrick_guest_mem::SharedFutexLocation,
+    waiter_key: usize,
     observed: u32,
 }
 
 impl MsgQueueWaitToken {
     fn for_queue(id: MsgQueueId) -> Result<Self, LinuxErrno> {
         let path = lookup_msg_queue_path(id)?;
-        let word = MsgQueueWaitWord::open(&path)?;
-        let observed = word.load();
-        Ok(Self { word, observed })
+        remember_msg_queue_block(id);
+        with_cached_msg_queue_wait_word(&path, |word| Self {
+            location: carrick_guest_mem::SharedFutexLocation::Direct {
+                word: carrick_guest_mem::HostVa(word.addr()),
+            },
+            waiter_key: id.raw() as usize,
+            observed: word.load(),
+        })
     }
 
-    fn wait_until_changed(&self, interrupted: impl Fn() -> bool) -> Result<(), LinuxErrno> {
-        loop {
-            if interrupted() {
-                return Err(LINUX_EINTR);
-            }
-            if self.word.load() != self.observed {
-                return Ok(());
-            }
-            let rc =
-                carrick_host::ulock::wait(self.word.addr(), self.observed, MSG_QUEUE_WAIT_SLICE_US);
-            if rc >= 0 {
-                continue;
-            }
-            let errno = (-rc) as i32;
-            if errno == libc::ETIMEDOUT || errno == libc::EINTR {
-                continue;
-            }
-            return Ok(());
+    fn wait_outcome(&self) -> DispatchOutcome {
+        DispatchOutcome::WaitOnSharedWord {
+            location: self.location,
+            waiter_key: self.waiter_key,
+            value: self.observed,
         }
     }
 }
@@ -2434,7 +2443,10 @@ impl SyscallDispatcher {
             let mut saw_would_block = false;
             loop {
                 match SysvIpcService::msgsnd(msqid, &creds, msg_type, &payload) {
-                    Ok(true) => return Ok(DispatchOutcome::Returned { value: 0 }),
+                    Ok(true) => {
+                        clear_msg_queue_block(msqid);
+                        return Ok(DispatchOutcome::Returned { value: 0 });
+                    }
                     Ok(false) => {
                         saw_would_block = true;
                         if flags.contains(MsgOpFlags::NOWAIT) {
@@ -2445,13 +2457,15 @@ impl SyscallDispatcher {
                         }
                         if let Ok(token) = MsgQueueWaitToken::for_queue(msqid) {
                             match SysvIpcService::msgsnd(msqid, &creds, msg_type, &payload) {
-                                Ok(true) => return Ok(DispatchOutcome::Returned { value: 0 }),
+                                Ok(true) => {
+                                    clear_msg_queue_block(msqid);
+                                    return Ok(DispatchOutcome::Returned { value: 0 });
+                                }
                                 Ok(false) => {
-                                    if let Err(errno) =
-                                        token.wait_until_changed(|| sysv_msg_wait_interrupted(this, tid))
-                                    {
-                                        return Ok(DispatchOutcome::errno(errno));
+                                    if sysv_msg_wait_interrupted(this, tid) {
+                                        return Ok(DispatchOutcome::errno(LINUX_EINTR));
                                     }
+                                    return Ok(token.wait_outcome());
                                 }
                                 Err(errno) if errno == LINUX_EINVAL && saw_would_block => {
                                     return Ok(DispatchOutcome::errno(
@@ -2464,7 +2478,10 @@ impl SyscallDispatcher {
                             std::thread::yield_now();
                         }
                     }
-                    Err(errno) if errno == LINUX_EINVAL && saw_would_block => {
+                    Err(errno)
+                        if errno == LINUX_EINVAL
+                            && (saw_would_block || take_msg_queue_block(msqid)) =>
+                    {
                         return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIDRM));
                     }
                     Err(errno) => return Ok(DispatchOutcome::errno(errno)),
@@ -2503,6 +2520,7 @@ impl SyscallDispatcher {
             loop {
                 match SysvIpcService::msgrcv(cx, msqid, &creds, msgp.0, sz, msgtyp, flags) {
                     Ok(Some(received)) => {
+                        clear_msg_queue_block(msqid);
                         return Ok(DispatchOutcome::Returned { value: received as i64 });
                     }
                     Ok(None) => {
@@ -2517,16 +2535,16 @@ impl SyscallDispatcher {
                             match SysvIpcService::msgrcv(cx, msqid, &creds, msgp.0, sz, msgtyp, flags)
                             {
                                 Ok(Some(received)) => {
+                                    clear_msg_queue_block(msqid);
                                     return Ok(DispatchOutcome::Returned {
                                         value: received as i64,
                                     });
                                 }
                                 Ok(None) => {
-                                    if let Err(errno) =
-                                        token.wait_until_changed(|| sysv_msg_wait_interrupted(this, tid))
-                                    {
-                                        return Ok(DispatchOutcome::errno(errno));
+                                    if sysv_msg_wait_interrupted(this, tid) {
+                                        return Ok(DispatchOutcome::errno(LINUX_EINTR));
                                     }
+                                    return Ok(token.wait_outcome());
                                 }
                                 Err(errno) if errno == LINUX_EINVAL && saw_would_block => {
                                     return Ok(DispatchOutcome::errno(
@@ -2539,7 +2557,10 @@ impl SyscallDispatcher {
                             std::thread::yield_now();
                         }
                     }
-                    Err(errno) if errno == LINUX_EINVAL && saw_would_block => {
+                    Err(errno)
+                        if errno == LINUX_EINVAL
+                            && (saw_would_block || take_msg_queue_block(msqid)) =>
+                    {
                         return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIDRM));
                     }
                     Err(errno) => return Ok(DispatchOutcome::errno(errno)),

@@ -473,6 +473,7 @@ pub fn self_ns_ppid() -> u32 {
         // SAFETY: getppid is always safe.
         return unsafe { libc::getppid() } as u32;
     }
+    let self_host = std::process::id();
     if self_ns_pid() == NS_INIT_PID {
         return 0;
     }
@@ -483,8 +484,11 @@ pub fn self_ns_ppid() -> u32 {
     }
     // Explicit orphan flag (set by the NsSupervisor the instant it sees the
     // parent die) — fast, race-free reparent-to-init.
-    if is_orphaned(std::process::id()) {
+    if is_orphaned(self_host) {
         return NS_INIT_PID;
+    }
+    if let Some(parent) = ns_ppid_for_host(self_host) {
+        return parent;
     }
     let host_ppid = unsafe { libc::getppid() } as u32;
     match region().and_then(|r| r.host_to_ns(host_ppid)) {
@@ -500,6 +504,15 @@ pub fn self_ns_ppid() -> u32 {
         // reparenting correct even before the supervisor's orphan flag lands.
         None => NS_INIT_PID,
     }
+}
+
+/// Namespace-visible parent pid for a registered host pid, derived from the
+/// fork-time parent recorded in the shared namespace table. This is more stable
+/// than `libc::getppid()` for Carrick guest children because the host process
+/// topology also contains runtime/supervisor processes that are not guest
+/// parents.
+pub fn ns_ppid_for_host(host_pid: u32) -> Option<u32> {
+    region()?.ns_ppid_for_host(host_pid)
 }
 
 /// Publish that the ns-init has installed (or cleared) a handler for `signum`.
@@ -785,6 +798,28 @@ impl NsSharedRegion {
             .map(|i| self.members[i].flags.load(Ordering::Acquire))
     }
 
+    /// The host pid recorded as this member's namespace parent at fork time.
+    pub fn parent_host_pid_of(&self, host_pid: u32) -> Option<u32> {
+        self.slot_of(host_pid)
+            .map(|i| self.members[i].parent_host_pid.load(Ordering::Acquire))
+    }
+
+    /// Translate a member's recorded parent to the pid its namespace sees.
+    pub fn ns_ppid_for_host(&self, host_pid: u32) -> Option<u32> {
+        let ns_pid = self.host_to_ns(host_pid)?;
+        if ns_pid == NS_INIT_PID {
+            return Some(0);
+        }
+        if self.flags_of(host_pid) == Some(MEMBER_ORPHANED) {
+            return Some(NS_INIT_PID);
+        }
+        let parent = self.parent_host_pid_of(host_pid)?;
+        if parent == 0 {
+            return Some(0);
+        }
+        Some(self.host_to_ns(parent).unwrap_or(NS_INIT_PID))
+    }
+
     /// Mark every live member whose ns-parent is `dead_host_pid` as orphaned
     /// (design §3.6 step 3). Called by the NsSupervisor on a parent's death.
     pub fn mark_children_orphaned(&self, dead_host_pid: u32) {
@@ -952,10 +987,15 @@ mod tests {
         assert_eq!(region.ns_to_host(1), Some(100));
         assert_eq!(region.ns_to_host(2), Some(200));
         assert_eq!(region.ns_to_host(42), None);
+        assert_eq!(region.parent_host_pid_of(200), Some(100));
+        assert_eq!(region.ns_ppid_for_host(100), Some(0));
+        assert_eq!(region.ns_ppid_for_host(200), Some(1));
+        assert_eq!(region.ns_ppid_for_host(999), None);
 
         // orphan the child by killing its parent (100)
         region.mark_children_orphaned(100);
         assert_eq!(region.flags_of(200), Some(MEMBER_ORPHANED));
+        assert_eq!(region.ns_ppid_for_host(200), Some(1));
 
         // mark the child dead
         region.mark_dead(200, 0);
