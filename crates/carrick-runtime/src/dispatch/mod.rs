@@ -5436,7 +5436,44 @@ fn write_host_pipe_payload(
                 && let Some((capacity, queued)) = pipe_state
                 && let Some(room) = host_pipe_write_room(capacity, queued.saturating_add(offset))
             {
-                if room == 0 || (nonblocking && offset == 0 && len <= 4096 && len > room) {
+                if room == 0 {
+                    // A blocking pipe write that already made partial progress
+                    // (offset > 0) must RESUME from `offset` — re-dispatching the
+                    // guest write(2) from 0 (what would_block_outcome does) would
+                    // re-send the delivered prefix and duplicate every byte past
+                    // the first pipe-full (corrupting any >64 KiB stream, e.g.
+                    // dpkg's data.tar). Hand the staged bytes to the runtime the
+                    // same way the EAGAIN branch does.
+                    if block_until_complete && offset > 0 {
+                        if crate::host_signal::has_unblocked_pending_for(
+                            tid.raw(),
+                            carrick_abi::SigBlockMask::NONE,
+                        ) {
+                            return DispatchOutcome::Returned {
+                                value: offset as i64,
+                            };
+                        }
+                        return match BlockingHostWrite::from_vec(
+                            host_fd,
+                            payload.into_owned(),
+                            offset,
+                            tid,
+                            sigpipe_on_epipe,
+                        ) {
+                            Ok(write) => DispatchOutcome::BlockingHostWrite(write),
+                            Err(_) => DispatchOutcome::Returned {
+                                value: offset as i64,
+                            },
+                        };
+                    }
+                    return would_block_outcome(
+                        host_fd,
+                        libc::POLLOUT,
+                        nonblocking,
+                        host_fd_owner.clone(),
+                    );
+                }
+                if nonblocking && offset == 0 && len <= 4096 && len > room {
                     return would_block_outcome(
                         host_fd,
                         libc::POLLOUT,
