@@ -2186,6 +2186,7 @@ impl SyscallDispatcher {
         for (fd, open_file) in removed {
             self.io.splice_pushback.lock().remove(&fd);
             self.close_open_file_and_free_pty(&open_file);
+            self.note_fd_closed(fd);
             // Linux auto-removes a closed fd from every epoll interest set.
             self.detach_fd_from_epolls(fd);
         }

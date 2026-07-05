@@ -3947,6 +3947,8 @@ impl SyscallDispatcher {
                 for open_file in removed.into_iter().flatten() {
                     this.close_open_file_and_free_pty(&open_file);
                 }
+                this.note_fd_closed(read_fd);
+                this.note_fd_closed(write_fd);
                 return Ok(DispatchOutcome::errno(LINUX_EFAULT));
             }
             Ok(DispatchOutcome::Returned { value: 0 })

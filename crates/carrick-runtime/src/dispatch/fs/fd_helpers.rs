@@ -78,10 +78,12 @@ impl SyscallDispatcher {
     ) -> Result<i32, OpenFile> {
         let limit = self.nofile_limit();
         let mut table = self.io.open_files.write();
+        let mut next_fd = self.io.next_fd.lock();
         // Lock order: open_files → closed_stdio (the close path never holds both).
         let fd = {
             let closed = self.io.closed_stdio.lock();
-            match Self::first_free_fd(&table, min_fd, None, &closed, limit) {
+            let start = if min_fd <= *next_fd { *next_fd } else { min_fd };
+            match Self::first_free_fd(&table, start, None, &closed, limit) {
                 Some(fd) => fd,
                 None => return Err(open_file),
             }
@@ -89,8 +91,11 @@ impl SyscallDispatcher {
         retain_open_file(&open_file.description);
         table.insert(fd, open_file);
         self.clear_closed_stdio(fd);
-        let mut next_fd = self.io.next_fd.lock();
-        *next_fd = (*next_fd).max(fd.saturating_add(1));
+        if fd == *next_fd {
+            let closed = self.io.closed_stdio.lock();
+            *next_fd = Self::first_free_fd(&table, fd.saturating_add(1), None, &closed, limit)
+                .unwrap_or(limit);
+        }
         Ok(fd)
     }
 
@@ -102,9 +107,11 @@ impl SyscallDispatcher {
     ) -> Result<(i32, i32), (OpenFile, OpenFile)> {
         let limit = self.nofile_limit();
         let mut table = self.io.open_files.write();
+        let mut next_fd = self.io.next_fd.lock();
         let (first_fd, second_fd) = {
             let closed = self.io.closed_stdio.lock();
-            let Some(first_fd) = Self::first_free_fd(&table, min_fd, None, &closed, limit) else {
+            let start = if min_fd <= *next_fd { *next_fd } else { min_fd };
+            let Some(first_fd) = Self::first_free_fd(&table, start, None, &closed, limit) else {
                 return Err((first, second));
             };
             let Some(second_fd) = Self::first_free_fd(
@@ -124,9 +131,23 @@ impl SyscallDispatcher {
         table.insert(second_fd, second);
         self.clear_closed_stdio(first_fd);
         self.clear_closed_stdio(second_fd);
-        let mut next_fd = self.io.next_fd.lock();
-        *next_fd = (*next_fd).max(second_fd.saturating_add(1));
+        if first_fd == *next_fd {
+            let closed = self.io.closed_stdio.lock();
+            *next_fd =
+                Self::first_free_fd(&table, second_fd.saturating_add(1), None, &closed, limit)
+                    .unwrap_or(limit);
+        }
         Ok((first_fd, second_fd))
+    }
+
+    pub(in crate::dispatch) fn note_fd_closed(&self, fd: i32) {
+        if fd < 0 {
+            return;
+        }
+        let mut next_fd = self.io.next_fd.lock();
+        if fd < *next_fd {
+            *next_fd = fd;
+        }
     }
 
     pub(in crate::dispatch) fn install_fd(
