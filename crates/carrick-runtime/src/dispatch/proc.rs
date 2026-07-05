@@ -2068,15 +2068,24 @@ impl SyscallDispatcher {
         }
 
         fn add_key(this, cx) {
-            Ok(DispatchOutcome::errno(LINUX_EPERM))
+            // Real Linux supports UNPRIVILEGED user keyrings (add_key/request_key/
+            // keyctl work without CAP_*), so an EPERM would falsely claim
+            // "implemented but denied". Carrick has no kernel keyring backend at
+            // all, so ENOSYS (the honest "unimplemented" that glibc treats as a
+            // fallback trigger) is correct. Reverts commit 980bf69a's intent.
+            Ok(DispatchOutcome::errno(LINUX_ENOSYS))
         }
 
         fn request_key(this, cx) {
-            Ok(DispatchOutcome::errno(LINUX_EPERM))
+            // See add_key: no kernel keyring backend, so honest ENOSYS, not a
+            // fabricated EPERM denial (real Linux allows this unprivileged).
+            Ok(DispatchOutcome::errno(LINUX_ENOSYS))
         }
 
         fn keyctl(this, cx) {
-            Ok(DispatchOutcome::errno(LINUX_EPERM))
+            // See add_key: no kernel keyring backend, so honest ENOSYS, not a
+            // fabricated EPERM denial (real Linux allows this unprivileged).
+            Ok(DispatchOutcome::errno(LINUX_ENOSYS))
         }
 
         fn setpgid(this, cx, pid: Pid, pgid: Pid) {
