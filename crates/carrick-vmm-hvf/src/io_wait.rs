@@ -157,11 +157,16 @@ fn child_status_ready(pid: i32) -> bool {
     if pid > 0 && crate::guest_cpu::child_has_ptrace_stop_pending(pid as u32) {
         return true;
     }
+    let (idtype, id) = if pid > 0 {
+        (libc::P_PID, pid as libc::id_t)
+    } else {
+        (libc::P_ALL, 0 as libc::id_t)
+    };
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
     let rc = unsafe {
         libc::waitid(
-            libc::P_PID,
-            pid as libc::id_t,
+            idtype,
+            id,
             &mut info,
             libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
         )
@@ -524,12 +529,14 @@ impl ThreadWaiter {
         self.wait_poll(fds, timeout, block_mask)
     }
 
-    /// Block until process `pid` exits, a signal becomes pending, or a fork
-    /// quiesce begins. Used by a blocking `waitid(P_PID)`: the child's exit is
-    /// observed via the per-thread kqueue's `EVFILT_PROC`/`NOTE_EXIT` (macOS's
-    /// native process-lifecycle tracking) so the thread parks in `kevent()` —
+    /// Block until process `pid` exits, any child exits for `pid <= 0`, a signal
+    /// becomes pending, or a fork quiesce begins. Concrete children use the
+    /// per-thread kqueue's `EVFILT_PROC`/`NOTE_EXIT` (macOS's native
+    /// process-lifecycle tracking) so the thread parks in `kevent()` —
     /// interruptible by the self-pipe poke — instead of an uninterruptible
-    /// `libc::waitid`. The runtime re-dispatches the waitid on `Ready` to reap.
+    /// `libc::waitid`. Any-child waits use the bounded `P_ALL` fallback because
+    /// kqueue cannot watch a sentinel pid. The runtime re-dispatches the waitid
+    /// on `Ready` to reap.
     #[cfg(target_os = "macos")]
     pub fn wait_proc_exit(&self, pid: i32, block_mask: carrick_abi::SigBlockMask) -> WaitResult {
         if self.should_interrupt(block_mask) {
@@ -542,7 +549,8 @@ impl ThreadWaiter {
             return WaitResult::Ready;
         }
         // Fast path: park in kevent() on the per-thread kqueue's EVFILT_PROC.
-        if !self.has_dead_wake_pipe()
+        if pid > 0
+            && !self.has_dead_wake_pipe()
             && let Some(kq) = self.kq.as_ref()
         {
             match self.wait_proc_exit_kqueue(kq, pid, block_mask) {
@@ -1272,6 +1280,38 @@ mod tests {
             !ready,
             "a stopped child is not exit-ready for a WEXITED-only waiter"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn child_status_ready_observes_any_exited_child() {
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed");
+        if child == 0 {
+            unsafe {
+                libc::_exit(7);
+            }
+        }
+
+        let mut ready = false;
+        for _ in 0..100 {
+            if super::child_status_ready(-1) {
+                ready = true;
+                break;
+            }
+            unsafe {
+                libc::usleep(10_000);
+            }
+        }
+
+        unsafe {
+            let mut status = 0;
+            assert_eq!(libc::waitpid(child, &mut status, 0), child);
+            assert!(libc::WIFEXITED(status));
+            assert_eq!(libc::WEXITSTATUS(status), 7);
+        }
+
+        assert!(ready, "wait4(-1) must observe an exited child via P_ALL");
     }
 
     /// The finite-timeout arm of `wait_kqueue` must cap each kevent slice at the
