@@ -617,6 +617,7 @@ impl SyscallDispatcher {
                     Some(open_file) => {
                         self.close_open_file_and_free_pty(&open_file);
                         self.io.io_uring_instances.write().remove(&sqe.fd);
+                        self.note_fd_closed(sqe.fd);
                         0
                     }
                     None => cqe_err(LINUX_EBADF),

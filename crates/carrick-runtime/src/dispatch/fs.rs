@@ -4753,6 +4753,8 @@ impl SyscallDispatcher {
                 for open_file in removed.into_iter().flatten() {
                     this.close_open_file_and_free_pty(&open_file);
                 }
+                this.note_fd_closed(read_fd);
+                this.note_fd_closed(write_fd);
                 return Ok(DispatchOutcome::errno(LINUX_EFAULT));
             }
 
@@ -6450,6 +6452,7 @@ impl SyscallDispatcher {
                     // used by close_range and close_cloexec_fds so every close path
                     // stays in sync.
                     this.close_open_file_and_free_pty(&open_file);
+                    this.note_fd_closed(fd.0);
                     DispatchOutcome::Returned { value: 0 }
                 } else if is_stdio_fd(fd.0) {
                     // Guest closing its own stdio at exit: there's nothing for
@@ -6457,6 +6460,7 @@ impl SyscallDispatcher {
                     // sibling processes keep working), but reporting EBADF
                     // here makes glibc print "write error: Bad file descriptor"
                     // after the program's real output. Return success.
+                    this.note_fd_closed(fd.0);
                     DispatchOutcome::Returned { value: 0 }
                 } else {
                     DispatchOutcome::errno(LINUX_EBADF)
@@ -6508,6 +6512,7 @@ impl SyscallDispatcher {
                         // also drop their /dev/pts/N entry. open_files and pty_table
                         // are independent locks (no nesting), so deadlock-free.
                         this.close_open_file_and_free_pty(&open_file);
+                        this.note_fd_closed(fd);
                     }
                 }
             }
@@ -10537,6 +10542,62 @@ mod tests {
             })),
             fd_flags: 0,
         }
+    }
+
+    #[test]
+    fn fd_allocator_cursor_reuses_closed_hole_then_advances() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let reporter = CompatReporter::default();
+        let mut memory = LinearMemory::new(0x4000, vec![0; 0x1000]);
+        let base_fd = dispatcher
+            .install_fd_at_or_above(3, test_directory_open_file("/base"))
+            .unwrap();
+        assert_eq!(base_fd, 3);
+
+        for expected in 4..36 {
+            assert_eq!(
+                dispatcher
+                    .dispatch(
+                        SyscallRequest::new(23, SyscallArgs::from([base_fd as u64, 0, 0, 0, 0, 0])),
+                        &mut memory,
+                        &reporter,
+                    )
+                    .unwrap(),
+                DispatchOutcome::Returned { value: expected }
+            );
+        }
+
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    SyscallRequest::new(57, SyscallArgs::from([10, 0, 0, 0, 0, 0])),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    SyscallRequest::new(23, SyscallArgs::from([base_fd as u64, 0, 0, 0, 0, 0])),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+            DispatchOutcome::Returned { value: 10 }
+        );
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    SyscallRequest::new(23, SyscallArgs::from([base_fd as u64, 0, 0, 0, 0, 0])),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+            DispatchOutcome::Returned { value: 36 }
+        );
+        assert!(reporter.finish().unhandled_syscalls.is_empty());
     }
 
     fn sigpoll_fd(info: carrick_abi::LinuxSiginfo) -> i32 {
