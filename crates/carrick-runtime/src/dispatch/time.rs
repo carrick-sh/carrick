@@ -122,7 +122,12 @@ impl SyscallDispatcher {
 
         fn timerfd_settime(this, cx, fd: Fd, flags: u64, new_value: u64, old_value: u64) {
             let memory = &mut *cx.memory;
-            if flags & !LINUX_TIMER_ABSTIME != 0 {
+            // TFD_TIMER_ABSTIME and TFD_TIMER_CANCEL_ON_SET are the two valid
+            // flags (timerfd_settime02). CANCEL_ON_SET only matters for a
+            // CLOCK_REALTIME discontinuity, which carrick's virtual clock never
+            // produces, so it is accepted and ignored — but rejecting it as
+            // EINVAL is wrong.
+            if flags & !(LINUX_TIMER_ABSTIME | crate::linux_abi::LINUX_TFD_TIMER_CANCEL_ON_SET) != 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             let spec = read_itimerspec(memory, new_value)?;
