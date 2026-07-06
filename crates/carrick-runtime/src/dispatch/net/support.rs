@@ -480,6 +480,73 @@ pub(super) fn host_socktype_backing(family: i32, base_type: i32) -> i32 {
     linux_to_host_socktype(base_type)
 }
 
+/// Linux-canonical `(family, base_type, protocol)` validation applied BEFORE the
+/// tuple reaches the host `socket()`/`socketpair()`. Returns `Some(errno)` for
+/// the combinations Linux rejects with a well-defined errno that macOS reports
+/// differently (invalid type → `EPROTONOSUPPORT`; a protocol/type mismatch or a
+/// raw socket → `EPROTOTYPE`/`EPERM`), and `None` to let the host handle the
+/// tuple (a genuinely unsupported domain still surfaces `EAFNOSUPPORT`; a valid
+/// INET pair still surfaces `EOPNOTSUPP` from `socketpair`). `base_type` must
+/// already have the `SOCK_NONBLOCK`/`SOCK_CLOEXEC` bits stripped.
+/// (LTP socket01, socketpair01.)
+pub(super) fn canonical_socket_errno(
+    family: i32,
+    base_type: i32,
+    protocol: i32,
+) -> Option<LinuxErrno> {
+    // SOCK_RDM is a valid Linux socket type (4) but has no named ABI constant.
+    const LINUX_SOCK_RDM: i32 = 4;
+    // IPPROTO numbers with no named ABI constant. IPPROTO_TCP == LINUX_SOL_TCP
+    // (6) and IPPROTO_UDP == LINUX_SOL_UDP (17); ICMP/ICMPv6 are the datagram
+    // "ping socket" protocols Linux permits on SOCK_DGRAM.
+    const IPPROTO_ICMP: i32 = 1;
+    const IPPROTO_ICMPV6: i32 = 58;
+
+    // An unknown socket type is EINVAL on Linux (macOS returns EPROTONOSUPPORT).
+    if !matches!(
+        base_type,
+        LINUX_SOCK_STREAM
+            | LINUX_SOCK_DGRAM
+            | LINUX_SOCK_RAW
+            | LINUX_SOCK_RDM
+            | LINUX_SOCK_SEQPACKET
+    ) {
+        return Some(LINUX_EINVAL);
+    }
+
+    // Protocol validation only applies to the INET families; AF_UNIX (and any
+    // other family) proceeds to the host, which validates the pair itself.
+    if family == LINUX_AF_INET || family == LINUX_AF_INET6 {
+        match base_type {
+            // Stream sockets accept only the default (0) or TCP protocol; UDP,
+            // ICMP, etc. on a stream socket are EPROTONOSUPPORT (macOS: the less
+            // specific EPROTOTYPE).
+            LINUX_SOCK_STREAM => {
+                if protocol != 0 && protocol != LINUX_SOL_TCP {
+                    return Some(crate::linux_abi::LINUX_EPROTONOSUPPORT);
+                }
+            }
+            // Datagram sockets accept the default (0), UDP, UDP-Lite, or the
+            // ICMP/ICMPv6 ping-socket protocols; a TCP protocol on a datagram
+            // socket is EPROTONOSUPPORT.
+            LINUX_SOCK_DGRAM => {
+                if !matches!(
+                    protocol,
+                    0 | LINUX_SOL_UDP | LINUX_IPPROTO_UDPLITE | IPPROTO_ICMP | IPPROTO_ICMPV6
+                ) {
+                    return Some(crate::linux_abi::LINUX_EPROTONOSUPPORT);
+                }
+            }
+            // Raw sockets need CAP_NET_RAW; carrick cannot back an unprivileged
+            // raw socket on macOS and the Linux/container oracle answers
+            // EPROTONOSUPPORT (macOS: EPERM).
+            LINUX_SOCK_RAW => return Some(crate::linux_abi::LINUX_EPROTONOSUPPORT),
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Widen a host stream socket's send (and recv) buffer beyond macOS' small
 /// defaults. Linux-visible `getsockopt(SO_SNDBUF/SO_RCVBUF)` reports the
 /// guest-intended/default Linux value from `OpenDescriptionBase`, so this is

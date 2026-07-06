@@ -1313,6 +1313,11 @@ impl SyscallDispatcher {
         let nonblock = socket_flags.contains(LinuxSocketTypeFlags::NONBLOCK);
         let cloexec = socket_flags.contains(LinuxSocketTypeFlags::CLOEXEC);
         let base_type = type_ & !LinuxSocketTypeFlags::SUPPORTED_MASK;
+        // Reject Linux-invalid (family,type,protocol) tuples with the canonical
+        // errno before macOS gets a chance to report a divergent one. (socket01)
+        if let Some(errno) = canonical_socket_errno(family, base_type, protocol) {
+            return DispatchOutcome::errno(errno);
+        }
         let host_family = linux_to_host_af(family);
         let host_type = host_socktype_backing(family, base_type);
         // macOS has no UDPLITE protocol, so back IPPROTO_UDPLITE with a plain UDP
@@ -3909,6 +3914,13 @@ impl SyscallDispatcher {
             let nonblock = socket_flags.contains(LinuxSocketTypeFlags::NONBLOCK);
             let cloexec = socket_flags.contains(LinuxSocketTypeFlags::CLOEXEC);
             let base_type = type_ & !LinuxSocketTypeFlags::SUPPORTED_MASK;
+            // Reject Linux-invalid (family,type,protocol) tuples with the
+            // canonical errno before macOS gets a chance to report a divergent
+            // one; a valid INET pair still falls through to socketpair(), which
+            // answers EOPNOTSUPP. (socketpair01)
+            if let Some(errno) = canonical_socket_errno(family, base_type, protocol) {
+                return Ok(DispatchOutcome::errno(errno));
+            }
             let host_family = linux_to_host_af(family);
             let host_type = host_socktype_backing(family, base_type);
 
