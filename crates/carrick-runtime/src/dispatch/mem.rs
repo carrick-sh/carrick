@@ -148,6 +148,15 @@ pub(super) struct MemState {
     /// MAP_GROWSDOWN VMAs that may expand downward on a stack fault:
     /// `(low_bound, current_start, end)`.
     pub growdown_ranges: Vec<(u64, u64, u64)>,
+    /// VA ranges of MAP_SHARED mappings backed by a memfd sealed F_SEAL_WRITE
+    /// (or F_SEAL_FUTURE_WRITE): `mprotect(PROT_WRITE)` on them must fail EPERM,
+    /// since the sealed backing can never gain a shared writable view
+    /// (memfd_create01 check_mfd_non_writeable's mmap+mprotect case).
+    write_sealed_shared_maps: Vec<crate::vfs::GuestMemoryRange>,
+    /// Active MAP_SHARED, PROT_WRITE mappings of a (sealable) memfd, paired with
+    /// the backing open-file description. While one is live, `F_ADD_SEALS`
+    /// F_SEAL_WRITE on that memfd must fail EBUSY (memfd_create01 test_share_mmap).
+    writable_memfd_maps: Vec<(crate::vfs::GuestMemoryRange, OpenDescriptionRef)>,
     /// The exact serialized ELF auxiliary vector written to the guest stack at
     /// exec, captured from the `AddressSpace` via
     /// [`SyscallDispatcher::set_auxv_image`]. Mirrored to `/proc/self/auxv`.
@@ -181,6 +190,8 @@ impl MemState {
             resident_tracked_ranges: Vec::new(),
             resident_fault_ranges: Vec::new(),
             growdown_ranges: Vec::new(),
+            write_sealed_shared_maps: Vec::new(),
+            writable_memfd_maps: Vec::new(),
             linux_auxv_image: Vec::new(),
         }
     }
@@ -555,6 +566,64 @@ impl SyscallDispatcher {
             .dynamic_maps
             .iter()
             .any(|map| ranges_overlap(start, len, map.start, map.end))
+    }
+
+    fn record_write_sealed_shared_map(&self, start: u64, len: u64) {
+        if let Some(range) =
+            crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(start.saturating_add(len)))
+        {
+            self.mem.lock().write_sealed_shared_maps.push(range);
+        }
+    }
+
+    fn range_is_write_sealed_shared(&self, start: u64, len: u64) -> bool {
+        self.mem
+            .lock()
+            .write_sealed_shared_maps
+            .iter()
+            .any(|r| ranges_overlap(start, len, r.start().raw(), r.end().raw()))
+    }
+
+    fn remove_write_sealed_shared_map(&self, start: u64, len: u64) {
+        if let Some(range) =
+            crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(start.saturating_add(len)))
+        {
+            locked_ranges_remove(&mut self.mem.lock().write_sealed_shared_maps, range);
+        }
+    }
+
+    fn record_writable_memfd_map(&self, start: u64, len: u64, description: OpenDescriptionRef) {
+        if let Some(range) =
+            crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(start.saturating_add(len)))
+        {
+            self.mem
+                .lock()
+                .writable_memfd_maps
+                .push((range, description));
+        }
+    }
+
+    fn remove_writable_memfd_map(&self, start: u64, len: u64) {
+        let Some(end) = start.checked_add(len) else {
+            return;
+        };
+        self.mem
+            .lock()
+            .writable_memfd_maps
+            .retain(|(range, _)| !(range.start().raw() < end && start < range.end().raw()));
+    }
+
+    /// True iff a live MAP_SHARED, PROT_WRITE mapping backed by `description`
+    /// exists — used to reject `F_ADD_SEALS` F_SEAL_WRITE with EBUSY.
+    pub(in crate::dispatch) fn memfd_has_writable_shared_map(
+        &self,
+        description: &OpenDescriptionRef,
+    ) -> bool {
+        self.mem
+            .lock()
+            .writable_memfd_maps
+            .iter()
+            .any(|(_, desc)| std::sync::Arc::ptr_eq(desc, description))
     }
 
     fn record_dynamic_mapping(
@@ -1034,6 +1103,23 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::errno(LINUX_EACCES));
             }
 
+            // A memfd sealed F_SEAL_WRITE (or F_SEAL_FUTURE_WRITE) cannot back a
+            // shared, writable mapping — Linux returns EPERM (memfd_create01
+            // check_mmap_fail). A private (MAP_PRIVATE) writable mapping is fine:
+            // its stores never reach the sealed backing.
+            if !map_flags.contains(LinuxMmapFlags::ANONYMOUS)
+                && map_sharing == MmapSharing::Shared
+                && prot_flags.contains(LinuxProtFlags::WRITE)
+                && let Some(open_file) = this.open_file(fd.0)
+                && let Some(seals) = open_file.description.read().seals()
+                && seals
+                    & (crate::linux_abi::LINUX_F_SEAL_WRITE
+                        | crate::linux_abi::LINUX_F_SEAL_FUTURE_WRITE)
+                    != 0
+            {
+                return Ok(DispatchOutcome::errno(LINUX_EPERM));
+            }
+
             if fixed_noreplace && this.dynamic_mapping_overlaps(requested.0, length) {
                 return Ok(DispatchOutcome::errno(linux_errno::EEXIST));
             }
@@ -1357,6 +1443,14 @@ impl SyscallDispatcher {
             }
 
             let mut bus_fault_offset = None;
+            // A MAP_SHARED mapping of a memfd sealed F_SEAL_WRITE is created
+            // read-only here (a writable one already returned EPERM above); record
+            // it so a later mprotect(PROT_WRITE) is rejected.
+            let mut mmap_write_sealed_shared = false;
+            // A live MAP_SHARED, PROT_WRITE mapping of an (unsealed) memfd — its
+            // backing description is recorded so F_ADD_SEALS F_SEAL_WRITE can
+            // EBUSY while it is mapped.
+            let mut writable_memfd_desc: Option<OpenDescriptionRef> = None;
             let bytes = if map_flags.contains(LinuxMmapFlags::ANONYMOUS) {
                 Vec::new()
             } else {
@@ -1368,7 +1462,7 @@ impl SyscallDispatcher {
                 let offset_usize =
                     usize::try_from(offset).map_err(|_| DispatchError::LengthTooLarge(offset))?;
                 match &*open {
-                    OpenDescription::File { contents, .. } => {
+                    OpenDescription::File { contents, base, .. } => {
                         if map_sharing == MmapSharing::Shared
                             && let Some(bus_offset) = shared_file_bus_offset(
                                 contents.len() as u64,
@@ -1377,6 +1471,21 @@ impl SyscallDispatcher {
                             )
                         {
                             bus_fault_offset = Some(bus_offset);
+                        }
+                        if map_sharing == MmapSharing::Shared
+                            && matches!(base.seals(), Some(s) if s
+                                & (crate::linux_abi::LINUX_F_SEAL_WRITE
+                                    | crate::linux_abi::LINUX_F_SEAL_FUTURE_WRITE)
+                                != 0)
+                        {
+                            mmap_write_sealed_shared = true;
+                        }
+                        if map_sharing == MmapSharing::Shared
+                            && prot_flags.contains(LinuxProtFlags::WRITE)
+                            && base.seals().is_some()
+                        {
+                            writable_memfd_desc =
+                                Some(std::sync::Arc::clone(&open_file.description));
                         }
                         let available = contents.read_at(offset_usize, length_usize);
                         bytes[..available.len()].copy_from_slice(&available);
@@ -1440,6 +1549,13 @@ impl SyscallDispatcher {
                 }
                 bytes
             };
+
+            if mmap_write_sealed_shared {
+                this.record_write_sealed_shared_map(address, length);
+            }
+            if let Some(description) = writable_memfd_desc {
+                this.record_writable_memfd_map(address, length, description);
+            }
 
             // Guest-chosen mmap addresses outside Carrick's low identity arenas
             // use alias backing. VAs >= 1 TiB need this because HVF's IPA is
@@ -1578,6 +1694,8 @@ impl SyscallDispatcher {
             }
             if let Some(len) = align_up_u64(length, LINUX_PAGE_SIZE) {
                 this.remove_dynamic_mapping(address.0, len);
+                this.remove_write_sealed_shared_map(address.0, len);
+                this.remove_writable_memfd_map(address.0, len);
                 trim_ranges_for_range(&mut this.mem.lock().bus_fault_ranges, address.0, len);
                 if let Some(remove) = crate::vfs::GuestMemoryRange::new(
                     GuestVa(address.0),
@@ -2065,6 +2183,11 @@ impl SyscallDispatcher {
             if cx.memory.read_bytes_raw(address.0, 1).is_err() {
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
             }
+            // A shared mapping of a F_SEAL_WRITE memfd cannot be upgraded to
+            // writable (memfd_create01 check_mfd_non_writeable).
+            if prot & LINUX_PROT_WRITE != 0 && this.range_is_write_sealed_shared(address.0, length) {
+                return Ok(DispatchOutcome::errno(LINUX_EPERM));
+            }
             if let Ok(len) = usize::try_from(length) {
                 let prot_none = LinuxProtFlags::from_bits_truncate(prot).is_empty();
                 cx.memory.set_no_access(address.0, len, prot_none);
@@ -2438,7 +2561,12 @@ impl SyscallDispatcher {
     }
 
     pub(crate) fn mem_after_fork_child(&self) {
-        self.mem.lock().locked_ranges.clear();
+        let mut mem = self.mem.lock();
+        mem.locked_ranges.clear();
+        // The child does not inherit the parent's writable-memfd-map bookkeeping
+        // (the descriptions it references may be closed in the child); a stale
+        // entry would spuriously EBUSY a child's F_ADD_SEALS.
+        mem.writable_memfd_maps.clear();
     }
 }
 

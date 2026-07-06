@@ -253,8 +253,10 @@ use crate::linux_abi::{
     LINUX_ESPIPE,
     LINUX_ESRCH,
     LINUX_ETIMEDOUT,
+    LINUX_F_ADD_SEALS,
     LINUX_F_DUPFD,
     LINUX_F_DUPFD_CLOEXEC,
+    LINUX_F_GET_SEALS,
     LINUX_F_GETFD,
     LINUX_F_GETFL,
     LINUX_F_GETLEASE,
@@ -271,6 +273,12 @@ use crate::linux_abi::{
     LINUX_F_OWNER_PID,
     LINUX_F_OWNER_TID,
     LINUX_F_RDLCK,
+    LINUX_F_SEAL_ALL,
+    LINUX_F_SEAL_FUTURE_WRITE,
+    LINUX_F_SEAL_GROW,
+    LINUX_F_SEAL_SEAL,
+    LINUX_F_SEAL_SHRINK,
+    LINUX_F_SEAL_WRITE,
     LINUX_F_SETFD,
     LINUX_F_SETFL,
     LINUX_F_SETLEASE,
@@ -283,6 +291,7 @@ use crate::linux_abi::{
     LINUX_F_UNLCK,
     LINUX_F_WRLCK,
     LINUX_FALLOC_FL_KEEP_SIZE,
+    LINUX_FALLOC_FL_PUNCH_HOLE,
     LINUX_FALLOC_FL_SUPPORTED,
     LINUX_FD_CLOEXEC,
     LINUX_FICLONE,
@@ -2809,6 +2818,47 @@ fn write_into_file_contents(
     }
     contents.write_at(*offset, bytes)?;
     *offset = end;
+    Ok(())
+}
+
+/// Seal enforcement for a content-modifying write to a memfd (`seals` is the
+/// description's seal set; `None` = not sealable). F_SEAL_WRITE /
+/// F_SEAL_FUTURE_WRITE → EPERM on any write; F_SEAL_GROW → EPERM when the write
+/// extends past `cur_len`. (memfd_create01)
+fn memfd_seal_write_check(
+    seals: Option<u32>,
+    offset: usize,
+    write_len: usize,
+    cur_len: usize,
+) -> Result<(), LinuxErrno> {
+    let Some(seals) = seals else {
+        return Ok(());
+    };
+    if seals & (LINUX_F_SEAL_WRITE | LINUX_F_SEAL_FUTURE_WRITE) != 0 {
+        return Err(LINUX_EPERM);
+    }
+    if seals & LINUX_F_SEAL_GROW != 0 && offset.saturating_add(write_len) > cur_len {
+        return Err(LINUX_EPERM);
+    }
+    Ok(())
+}
+
+/// Seal enforcement for a size change (ftruncate / fallocate grow / hole punch).
+/// Shrinking with F_SEAL_SHRINK or growing with F_SEAL_GROW → EPERM.
+fn memfd_seal_resize_check(
+    seals: Option<u32>,
+    new_len: usize,
+    cur_len: usize,
+) -> Result<(), LinuxErrno> {
+    let Some(seals) = seals else {
+        return Ok(());
+    };
+    if seals & LINUX_F_SEAL_SHRINK != 0 && new_len < cur_len {
+        return Err(LINUX_EPERM);
+    }
+    if seals & LINUX_F_SEAL_GROW != 0 && new_len > cur_len {
+        return Err(LINUX_EPERM);
+    }
     Ok(())
 }
 
