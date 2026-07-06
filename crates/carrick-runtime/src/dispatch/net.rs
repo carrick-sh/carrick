@@ -3785,6 +3785,16 @@ impl SyscallDispatcher {
                 carrick_abi::WaitSigMask::NONE
             };
 
+            // Linux rejects an nfds greater than the guest's soft RLIMIT_NOFILE
+            // with EINVAL BEFORE touching the fds array (poll/ppoll: do_sys_poll
+            // caps at rlimit(RLIMIT_NOFILE)). Without this, a huge nfds (LTP
+            // ppoll01 INVALID_NFDS passes nfds=0xFFFFFFFF) walks the pollfd loop
+            // off the end of the array and faults into EFAULT instead — and would
+            // also try to reserve a multi-GB Vec below.
+            if nfds > this.nofile_limit() as usize {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
+
             // Read all the pollfds up front so we can route them. Fast path:
             // every fd in the set maps to a host fd (stdio bare, HostPipe, or
             // HostSocket) → call libc::poll once with the requested timeout
@@ -3852,6 +3862,16 @@ impl SyscallDispatcher {
                 for (i, p) in sys_pollfds.iter().enumerate() {
                     let mut pollfd = fds[i];
                     pollfd.revents = p.revents;
+                    // macOS poll() on a regular file returns POLLPRI whenever the
+                    // caller requested it (the BSD vnode "always ready" default);
+                    // Linux only ever sets POLLPRI on a genuine out-of-band
+                    // condition, which only a socket can carry. Strip the spurious
+                    // bit for any fd that cannot hold OOB data so a regular-file
+                    // poll matches Linux (LTP ppoll01 NORMAL: POLLIN|POLLPRI|POLLOUT
+                    // requested on a regular file must return POLLIN|POLLOUT).
+                    if pollfd.revents & libc::POLLPRI != 0 && !this.fd_supports_epoll_oob(pollfd.fd) {
+                        pollfd.revents &= !libc::POLLPRI;
+                    }
                     if pollfd.revents != 0 {
                         ready += 1;
                     }
