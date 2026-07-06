@@ -1277,6 +1277,17 @@ pub(super) fn host_to_linux_msg_flags(flags: i32) -> i32 {
     out
 }
 
+/// Whether `level` is a socket option level carrick recognizes (the set
+/// [`linux_to_host_sockopt`] switches on). getsockopt distinguishes an
+/// unrecognized level (EOPNOTSUPP) from an unrecognized optname at a known
+/// level (ENOPROTOOPT). (LTP getsockopt01.)
+pub(super) fn is_known_sockopt_level(level: i32) -> bool {
+    matches!(
+        level,
+        LINUX_SOL_SOCKET | LINUX_SOL_IP | LINUX_SOL_IPV6 | LINUX_SOL_TCP | LINUX_SOL_UDP
+    )
+}
+
 pub(super) fn linux_to_host_sockopt(level: i32, optname: i32) -> Option<(i32, i32)> {
     match level {
         LINUX_SOL_SOCKET => {
