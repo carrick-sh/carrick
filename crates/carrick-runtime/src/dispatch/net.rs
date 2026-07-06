@@ -5604,6 +5604,21 @@ impl SyscallDispatcher {
             self.host_socket_lookup(fd)?
         };
         let msg = read_linux_msghdr(memory, msg_addr)?;
+        // Linux validates the msghdr during copy-in before touching the flags: a
+        // negative msg_namelen is EINVAL (recvmsg01 "invalid socket length",
+        // which passes flags=-1 so its MSG_ERRQUEUE bit must NOT short-circuit
+        // ahead of this check).
+        if !is_netlink && (msg.namelen as i32) < 0 {
+            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+        }
+        // MSG_ERRQUEUE reads the socket's error queue. carrick keeps no error
+        // queue, so it's always empty -> EAGAIN (recvmsg01), matching Linux when
+        // no error is queued. Checked after msghdr validation so an invalid
+        // msg_namelen still surfaces EINVAL. (from_bits_retain: recvmsg IGNORES
+        // other unknown flag bits.) Mirrors the recvfrom MSG_ERRQUEUE path.
+        if !is_netlink && LinuxMsgFlags::from_bits_retain(flags).contains(LinuxMsgFlags::ERRQUEUE) {
+            return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
+        }
         // Linux caps the iovec array at UIO_MAXIOV (1024); a larger msg_iovlen is
         // EMSGSIZE, not the EINVAL that read_iovecs' length guard would raise
         // (recvmsg01 "invalid iovec count").
