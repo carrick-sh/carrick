@@ -66,3 +66,8 @@ pub mod vcpu_kick;
 // is parameterized over. `crate::trap::HvfTrapEngine` aliases the specialization.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub mod hvf_aarch64_engine;
+// Root death-reclaim supervisor for the flag-gated atomic vCPU permit: one
+// EVFILT_PROC kqueue that frees a dead owner's generation-stamped slots. Started
+// from `HvfHostBackend::pre_loop_setup` via `trap::start_vcpu_permit_reaper`.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub mod vcpu_permit_reaper;
