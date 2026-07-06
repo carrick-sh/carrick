@@ -7179,7 +7179,7 @@ impl SyscallDispatcher {
 
         }
 
-        fn preadv(this, cx, fd: Fd, iov: GuestPtr, vlen: u64, pos_l: u64, pos_h: u64, _rwf: u64) {
+        fn preadv(this, cx, fd: Fd, iov: GuestPtr, vlen: u64, pos_l: u64, pos_h: u64, rwf: u64) {
 
             let fd: Fd = fd;
             let iov = iov.0;
@@ -7195,6 +7195,19 @@ impl SyscallDispatcher {
             // here, so preadv2(off, RWF_HIPRI) reads like preadv.
             let is_preadv2 = cx.number() == 286;
             let read_at_current = is_preadv2 && (pos_l as i64) == -1;
+            // preadv2's RWF_* flags: any bit outside RWF_SUPPORTED is rejected by
+            // Linux's kiocb_set_rw_flags() with EOPNOTSUPP (preadv202 passes
+            // flag=-1 and expects EOPNOTSUPP, NOT EINVAL). RWF_NOWAIT on our
+            // buffered host backing likewise cannot be honored → EOPNOTSUPP. The
+            // known-but-advisory bits (HIPRI/DSYNC/SYNC/APPEND) are accepted.
+            if is_preadv2
+                && rwf
+                    & !(crate::linux_abi::LINUX_RWF_SUPPORTED
+                        & !crate::linux_abi::LINUX_RWF_NOWAIT)
+                    != 0
+            {
+                return Ok(DispatchOutcome::errno(LINUX_EOPNOTSUPP));
+            }
             let memory = &mut *cx.memory;
             let iovecs = read_iovecs(memory, iov, iovcnt)?;
             let Some(open_file) = this.open_file(fd.0) else {
@@ -7337,6 +7350,11 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
             let open = open_file.description.read();
+            // An O_APPEND fd forces EVERY write to EOF, ignoring the supplied
+            // offset (pwrite04). macOS pwrite() on an O_APPEND fd returns EINVAL,
+            // so seek-to-end then write() instead (matching the plain write()
+            // append path).
+            let is_append = open.status_flags() & LINUX_O_APPEND != 0;
             // Real host file: positional write via libc::pwrite (visible
             // across fork; kernel offset untouched).
             if let OpenDescription::HostFile {
@@ -7347,12 +7365,28 @@ impl SyscallDispatcher {
                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
                 }
                 let n = unsafe {
-                    libc::pwrite(
-                        host_fd.raw(),
-                        bytes.as_ptr() as *const _,
-                        length,
-                        offset as libc::off_t,
-                    )
+                    if is_append {
+                        // O_APPEND writes at EOF regardless of the offset, but
+                        // pwrite MUST leave the file offset untouched (pwrite04
+                        // checks lseek(SEEK_CUR) is unchanged). Save the offset,
+                        // seek to EOF, write, then restore. (The write goes
+                        // through write(), not pwrite(), which macOS rejects with
+                        // EINVAL on an O_APPEND fd.)
+                        let saved = libc::lseek(host_fd.raw(), 0, libc::SEEK_CUR);
+                        libc::lseek(host_fd.raw(), 0, libc::SEEK_END);
+                        let w = libc::write(host_fd.raw(), bytes.as_ptr() as *const _, length);
+                        if saved >= 0 {
+                            libc::lseek(host_fd.raw(), saved, libc::SEEK_SET);
+                        }
+                        w
+                    } else {
+                        libc::pwrite(
+                            host_fd.raw(),
+                            bytes.as_ptr() as *const _,
+                            length,
+                            offset as libc::off_t,
+                        )
+                    }
                 };
                 let n = n.host_syscall_errno()?;
                 return Ok(DispatchOutcome::Returned { value: n as i64 });
@@ -7378,7 +7412,7 @@ impl SyscallDispatcher {
 
         }
 
-        fn pwritev(this, cx, fd: Fd, iov: GuestPtr, vlen: u64, pos_l: u64, pos_h: u64, _rwf: u64) {
+        fn pwritev(this, cx, fd: Fd, iov: GuestPtr, vlen: u64, pos_l: u64, pos_h: u64, rwf: u64) {
 
             let fd: Fd = fd;
             let iov = iov.0;
@@ -7391,6 +7425,19 @@ impl SyscallDispatcher {
             // host-file backing; RWF_HIPRI writes like pwritev.
             let is_pwritev2 = cx.number() == 287;
             let write_at_current = is_pwritev2 && offset == -1;
+            // pwritev2's RWF_* flags: any bit outside RWF_SUPPORTED is rejected by
+            // Linux's kiocb_set_rw_flags() with EOPNOTSUPP (pwritev202 passes
+            // flag=-1 and expects EOPNOTSUPP, NOT EINVAL). RWF_NOWAIT on our
+            // buffered host backing likewise cannot be honored → EOPNOTSUPP. The
+            // known-but-advisory bits (HIPRI/DSYNC/SYNC/APPEND) are accepted.
+            if is_pwritev2
+                && rwf
+                    & !(crate::linux_abi::LINUX_RWF_SUPPORTED
+                        & !crate::linux_abi::LINUX_RWF_NOWAIT)
+                    != 0
+            {
+                return Ok(DispatchOutcome::errno(LINUX_EOPNOTSUPP));
+            }
             let memory = &*cx.memory;
             let iovecs = read_iovecs(memory, iov, iovcnt)?;
             if offset < 0 && !write_at_current {
@@ -7407,6 +7454,12 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
             let open = open_file.description.read();
+            // An O_APPEND fd writes at EOF regardless of the offset, but pwritev
+            // (like pwrite) MUST leave the file offset untouched. Save the
+            // offset, seek to EOF, then write via writev()/write() (macOS rejects
+            // pwritev() on an O_APPEND fd with EINVAL), and restore the offset
+            // afterward.
+            let is_append = open.status_flags() & LINUX_O_APPEND != 0;
             // Real host file: positional writev via libc::pwrite per iovec.
             if let OpenDescription::HostFile {
                 host_fd, writable, ..
@@ -7416,6 +7469,19 @@ impl SyscallDispatcher {
                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
                 }
                 let hfd = host_fd.raw();
+                let saved_offset =
+                    is_append.then(|| unsafe { libc::lseek(hfd, 0, libc::SEEK_CUR) });
+                if is_append {
+                    unsafe { libc::lseek(hfd, 0, libc::SEEK_END) };
+                }
+                let restore_offset = |saved: Option<i64>| {
+                    if let Some(s) = saved
+                        && s >= 0
+                    {
+                        unsafe { libc::lseek(hfd, s, libc::SEEK_SET) };
+                    }
+                };
+                let at_current = write_at_current || is_append;
                 if let PwritevPayloads::Borrowed(borrowed_iovecs) = &payloads {
                     if borrowed_iovecs.is_empty() {
                         return Ok(DispatchOutcome::Returned { value: 0 });
@@ -7423,7 +7489,7 @@ impl SyscallDispatcher {
                     let iovcnt =
                         i32::try_from(borrowed_iovecs.len()).map_err(|_| LINUX_EINVAL)?;
                     let n = unsafe {
-                        if write_at_current {
+                        if at_current {
                             libc::writev(hfd, borrowed_iovecs.as_ptr(), iovcnt)
                         } else {
                             libc::pwritev(
@@ -7434,6 +7500,7 @@ impl SyscallDispatcher {
                             )
                         }
                     };
+                    restore_offset(saved_offset);
                     let n = n.host_syscall_errno()?;
                     return Ok(DispatchOutcome::Returned { value: n as i64 });
                 }
@@ -7452,7 +7519,7 @@ impl SyscallDispatcher {
                     // a regular host file, never a pipe/socket/tty — so this write
                     // cannot block the vCPU waiting on a peer.
                     let n = unsafe {
-                        if write_at_current {
+                        if at_current {
                             libc::write(hfd, buf.as_ptr() as *const _, len)
                         } else {
                             libc::pwrite(hfd, buf.as_ptr() as *const _, len, cur as libc::off_t)
@@ -7465,6 +7532,7 @@ impl SyscallDispatcher {
                         break;
                     }
                 }
+                restore_offset(saved_offset);
                 return Ok(DispatchOutcome::Returned { value: total });
             }
             let errno = match &*open {
@@ -9131,6 +9199,13 @@ impl SyscallDispatcher {
             }
 
             let path = read_guest_c_string(&*cx.memory, pathname)?;
+            // readlinkat has no AT_EMPTY_PATH flag, so an empty pathname does not
+            // name the dirfd itself — modern Linux returns ENOENT for
+            // readlink("") (readlink03), NOT the EINVAL our path lookup would
+            // otherwise raise.
+            if path.is_empty() {
+                return Ok(DispatchOutcome::errno(LINUX_ENOENT));
+            }
             let path = this.resolve_at_path(dirfd, &path)?;
 
             let target = if let Some(kind) = proc_self_magic_link(&path) {
