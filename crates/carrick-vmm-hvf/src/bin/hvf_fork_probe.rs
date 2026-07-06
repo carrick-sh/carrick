@@ -220,6 +220,11 @@ mod imp {
                 let workers = parse_u64_arg(&args, 1, 8);
                 parallel_recreate(workers);
             }
+            "concurrent-ceiling" => {
+                let max = parse_u64_arg(&args, 1, 100);
+                let hold_secs = parse_u64_arg(&args, 2, 60);
+                concurrent_ceiling(max, hold_secs);
+            }
             _ => usage(),
         }
     }
@@ -240,6 +245,7 @@ mod imp {
         println!("  hvf_fork_probe signal-flood [run_us] [block_internal=0|1]");
         println!("  hvf_fork_probe fork-churn [iters] [child_hold_us]");
         println!("  hvf_fork_probe parallel-recreate [workers]");
+        println!("  hvf_fork_probe concurrent-ceiling [max] [hold_secs]");
     }
 
     fn install_probe_signal_handlers() {
@@ -778,6 +784,119 @@ mod imp {
         if failed != 0 {
             std::process::exit(1);
         }
+    }
+
+    /// Measure how many concurrent single-vCPU HVF VMs the host sustains across
+    /// SEPARATE processes (carrick's one-VM-per-process model). The parent holds NO
+    /// VM; it forks children one at a time, each does `hv_vm_create` + `hv_vcpu_create`
+    /// and HOLDS the VM alive (parked), reporting its result over a pipe. We ramp
+    /// until a create fails and print the concurrent count + the exact HV error.
+    /// The guest RAM is tiny (nothing mapped here), so this isolates the VM/vCPU
+    /// HANDLE limit from any memory limit. Each child self-destructs after
+    /// `hold_secs` so an orphaned run cannot strand VMs.
+    fn concurrent_ceiling(max: u64, hold_secs: u64) {
+        println!("case=concurrent-ceiling max={max} hold_secs={hold_secs}");
+        let mut held_pids: Vec<libc::pid_t> = Vec::new();
+        let mut live = 0u64;
+        let mut failure: Option<hv_return_t> = None;
+        let mut first_create_us: Option<u128> = None;
+        let mut last_create_us: u128 = 0;
+
+        for i in 0..max {
+            let mut fds = [0i32; 2];
+            if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+                println!("i={i} pipe=errno({})", errno());
+                break;
+            }
+            let (rd, wr) = (fds[0], fds[1]);
+
+            let pid = unsafe { libc::fork() };
+            if pid < 0 {
+                println!("i={i} fork=errno({})", errno());
+                unsafe {
+                    libc::close(rd);
+                    libc::close(wr);
+                }
+                failure = Some(HV_ERROR);
+                break;
+            }
+            if pid == 0 {
+                // Child: create a VM+vCPU and hold it, reporting rc + create_us.
+                unsafe { libc::close(rd) };
+                let (rc, create_us): (hv_return_t, u64) = match Vm::create() {
+                    Ok((_vm, elapsed)) => (HV_SUCCESS, elapsed.as_micros() as u64),
+                    Err(rc) => (rc, 0),
+                };
+                let mut report = [0u8; 12];
+                report[0..4].copy_from_slice(&(rc as u32).to_le_bytes());
+                report[4..12].copy_from_slice(&create_us.to_le_bytes());
+                unsafe {
+                    let _ = libc::write(wr, report.as_ptr().cast::<c_void>(), report.len());
+                    libc::close(wr);
+                };
+                if rc != HV_SUCCESS {
+                    unsafe { libc::_exit(2) };
+                }
+                // Success: hold the VM alive (parked) until killed or self-destruct.
+                if hold_secs > 0 {
+                    unsafe { libc::alarm(hold_secs as libc::c_uint) };
+                }
+                loop {
+                    unsafe { libc::pause() };
+                }
+            }
+
+            // Parent: read the child's report.
+            unsafe { libc::close(wr) };
+            let mut buf = [0u8; 12];
+            let n = unsafe { libc::read(rd, buf.as_mut_ptr().cast::<c_void>(), buf.len()) };
+            unsafe { libc::close(rd) };
+            if n != 12 {
+                println!("i={i} child_no_report n={n} (treat as failure)");
+                let mut st = 0;
+                unsafe { libc::waitpid(pid, &mut st, 0) };
+                failure = Some(HV_ERROR);
+                break;
+            }
+            let rc = u32::from_le_bytes(buf[0..4].try_into().unwrap()) as hv_return_t;
+            let create_us = u64::from_le_bytes(buf[4..12].try_into().unwrap()) as u128;
+            if rc == HV_SUCCESS {
+                live += 1;
+                last_create_us = create_us;
+                if first_create_us.is_none() {
+                    first_create_us = Some(create_us);
+                }
+                held_pids.push(pid);
+                if live % 8 == 0 || live <= 4 {
+                    println!("live={live} last_create_us={create_us}");
+                }
+            } else {
+                println!("i={i} create={} live_at_failure={live}", rc_label(rc));
+                failure = Some(rc);
+                let mut st = 0;
+                unsafe { libc::waitpid(pid, &mut st, 0) };
+                break;
+            }
+        }
+
+        println!(
+            "=== CEILING max_concurrent_vms={live} failure={} first_create_us={} last_create_us={} ===",
+            failure
+                .map(rc_label)
+                .unwrap_or_else(|| "none(reached max, no hard limit hit)".to_owned()),
+            first_create_us.unwrap_or(0),
+            last_create_us,
+        );
+
+        // Teardown: kill every held child so no VM is left alive.
+        for &pid in &held_pids {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        for &pid in &held_pids {
+            let mut st = 0;
+            unsafe { libc::waitpid(pid, &mut st, 0) };
+        }
+        println!("torn_down={} children", held_pids.len());
     }
 
     fn sleep_micros(micros: u64) {
