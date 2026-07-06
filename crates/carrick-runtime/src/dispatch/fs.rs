@@ -10067,9 +10067,22 @@ impl SyscallDispatcher {
             const MFD_ALLOW_SEALING: u64 = 0x0002;
             const MFD_HUGETLB: u64 = 0x0004;
             const MFD_KNOWN: u64 = MFD_CLOEXEC | MFD_ALLOW_SEALING | MFD_HUGETLB;
+            // The huge-page size selector lives in bits [26..31]
+            // (MFD_HUGE_MASK << MFD_HUGE_SHIFT); MFD_HUGE_2MB/1GB/… encode a
+            // log2 page size there. Linux only permits those bits alongside
+            // MFD_HUGETLB (mm/memfd.c): with MFD_HUGETLB set the size selector
+            // is accepted, otherwise any extra bit is EINVAL.
+            const MFD_HUGE_SHIFT: u64 = 26;
+            const MFD_HUGE_MASK: u64 = 0x3f;
+            const MFD_HUGE_BITS: u64 = MFD_HUGE_MASK << MFD_HUGE_SHIFT;
+            let allowed = if flags & MFD_HUGETLB != 0 {
+                MFD_KNOWN | MFD_HUGE_BITS
+            } else {
+                MFD_KNOWN
+            };
             // Linux validates the flags BEFORE the name (LTP memfd_create02
             // passes a valid name with bad flags and still expects EINVAL).
-            if flags & !MFD_KNOWN != 0 {
+            if flags & !allowed != 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             // The name is bounded by MFD_NAME_MAX_LEN (256 − len("memfd:") − 1 =
