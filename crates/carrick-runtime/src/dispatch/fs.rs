@@ -1777,7 +1777,12 @@ impl SyscallDispatcher {
                 }
             }
             Ok(crate::vfs::rootfs::OpenDispatchResult::Directory { metadata, entries }) => {
-                if writable_request {
+                // A directory can never be the target of a write-intent open
+                // (O_WRONLY/O_RDWR) nor of an O_CREAT open — Linux returns
+                // EISDIR in both cases (a directory is never "created" by
+                // open(), and its dentry rejects write access). O_RDONLY
+                // without O_CREAT still yields a readable directory fd.
+                if writable_request || want_create {
                     return Ok(DispatchOutcome::errno(LINUX_EISDIR));
                 }
                 OpenDescription::Directory {
