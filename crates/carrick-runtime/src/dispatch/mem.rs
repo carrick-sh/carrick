@@ -60,6 +60,7 @@ syscall_table! {
     214 => brk,
     215 => munmap,
     216 => mremap,
+    213 => readahead,
     222 => mmap,
     223 => fadvise64,
     226 => mprotect,
@@ -810,6 +811,36 @@ impl SyscallDispatcher {
 
 impl SyscallDispatcher {
     define_syscall! {
+        fn readahead(this, cx, fd: Fd, _offset: u64, _count: u64) {
+            // readahead(2) warms the page cache. carrick has no guest page
+            // cache to populate, so the operation itself is a no-op returning
+            // 0 — but it must reproduce the kernel's fd validation, which LTP
+            // readahead01 asserts. Order matches ksys_readahead: FMODE_READ is
+            // checked FIRST (EBADF), THEN the mapping type (EINVAL).
+            let Some(open_file) = this.open_file(fd.0) else {
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            };
+            let desc = open_file.description.read();
+            // An O_PATH descriptor (or an O_WRONLY fd) is not open for reading.
+            if desc.status_flags() & crate::linux_abi::LINUX_O_PATH != 0
+                || desc.status_flags() & LINUX_O_ACCMODE == LINUX_O_WRONLY
+            {
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            }
+            // readahead only applies to objects with a readahead-capable
+            // address space — regular files (and block devices). Pipes, FIFOs,
+            // sockets, char devices, directories, and the anonymous fd types
+            // (eventfd/timerfd/epoll/…) all lack one and are EINVAL.
+            let applicable = matches!(
+                &*desc,
+                OpenDescription::File { .. } | OpenDescription::HostFile { .. }
+            );
+            if !applicable {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
+            Ok(DispatchOutcome::Returned { value: 0 })
+        }
+
         fn fadvise64(this, cx, fd: Fd, _offset: u64, _len: u64, advice: u64) {
             if !this.fd_is_valid(fd.0) && !is_stdio_fd(fd.0) {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
