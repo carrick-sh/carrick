@@ -1068,12 +1068,23 @@ impl PermitRegion {
 
     /// DERIVED occupancy: the count of non-free slots across the whole fork tree.
     /// There is deliberately no separate `live` counter to drift from this.
+    ///
+    /// These per-slot loads are `SeqCst`, not `Acquire`, to forbid a
+    /// store-buffering (SB) over-admit: two acquirers racing on DIFFERENT
+    /// slots i != j each publish their own claim with a store, then read the
+    /// other's slot to check the budget. With only `AcqRel`/`Acquire` (no
+    /// total store order) each can observe the other's slot as still-free —
+    /// both claims land, both pass the budget check, and occupancy transiently
+    /// exceeds `budget`. `SeqCst` here plus `SeqCst` on the claim CAS's success
+    /// case (below) puts both operations in one global total order, so at
+    /// least one racer's occupancy scan is guaranteed to see the other's
+    /// already-published claim and back out.
     fn occupied(&self) -> usize {
         use std::sync::atomic::Ordering;
         self.table()
             .slots
             .iter()
-            .filter(|s| atomic_permit_slot::state_of(s.load(Ordering::Acquire)) != SlotState::Free)
+            .filter(|s| atomic_permit_slot::state_of(s.load(Ordering::SeqCst)) != SlotState::Free)
             .count()
     }
 
@@ -1081,6 +1092,15 @@ impl PermitRegion {
     /// is reclaimable), THEN counts occupancy: if the claim pushed occupancy over
     /// `budget`, it CASes that exact `(slot, gen)` back to free and returns `None`
     /// so the caller backs off. Returns `None` (no leak) on a full table too.
+    ///
+    /// The claim CAS's success ordering is `SeqCst` (paired with the `SeqCst`
+    /// loads in `occupied()`) specifically to forbid the store-buffering
+    /// over-admit race: with plain `AcqRel`/`Acquire`, two threads claiming
+    /// slots i != j can each fail to observe the other's just-published claim
+    /// when scanning for occupancy, so both slip past the `budget` check.
+    /// `SeqCst` on both sides puts every claim-store and occupancy-load into
+    /// one total order, so at least one of the two racers is guaranteed to
+    /// see the other's slot occupied and back out.
     fn acquire(&self, budget: usize, pid: u32) -> Option<PermitToken> {
         use std::sync::atomic::Ordering;
         let budget = budget.max(1);
@@ -1095,7 +1115,7 @@ impl PermitRegion {
             let claimed =
                 atomic_permit_slot::pack(atomic_permit_slot::STATE_ACQUIRING, pid, generation);
             if slot
-                .compare_exchange(cur, claimed, Ordering::AcqRel, Ordering::Acquire)
+                .compare_exchange(cur, claimed, Ordering::SeqCst, Ordering::Acquire)
                 .is_err()
             {
                 // Lost this slot to a concurrent acquirer; try the next free one.
@@ -5178,6 +5198,62 @@ mod vm_create_admission_tests {
                 assert_eq!(r.occupied(), 1);
             }
         }
+    }
+
+    /// Regression smoke test for the store-buffering over-admit race: with
+    /// `AcqRel`/`Acquire` (no total store order), two threads claiming
+    /// DIFFERENT slots could each fail to see the other's just-published claim
+    /// when checking `occupied()` against `budget`, so both would keep their
+    /// claim and the number of SIMULTANEOUSLY-held permits could exceed
+    /// `budget` (e.g. 5 outstanding vs a cap of 4). `SeqCst` on the claim CAS
+    /// and the `occupied()` loads forbids that outcome.
+    ///
+    /// NOTE: a memory-ordering bug is not guaranteed to reproduce
+    /// deterministically (it depends on the host's actual store-buffering
+    /// behavior and scheduling), so this test's value is as a regression
+    /// tripwire, not a proof the ordering is correct.
+    #[test]
+    fn concurrent_acquire_never_over_admits_past_budget() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let region = Arc::new(PermitRegion::new_anon_for_test());
+        let budget = 4usize;
+        let held = Arc::new(AtomicUsize::new(0));
+        let max_held = Arc::new(AtomicUsize::new(0));
+        let iterations = 5_000;
+
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let region = Arc::clone(&region);
+                let held = Arc::clone(&held);
+                let max_held = Arc::clone(&max_held);
+                std::thread::spawn(move || {
+                    let pid = std::process::id();
+                    for _ in 0..iterations {
+                        if let Some(token) = region.acquire(budget, pid) {
+                            let now = held.fetch_add(1, Ordering::SeqCst) + 1;
+                            max_held.fetch_max(now, Ordering::SeqCst);
+                            // Widen the race window before releasing.
+                            std::thread::yield_now();
+                            held.fetch_sub(1, Ordering::SeqCst);
+                            region.release_unregistered(token);
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let observed = max_held.load(Ordering::SeqCst);
+        assert!(
+            observed <= budget,
+            "observed {observed} concurrently-held permits with budget {budget} \
+             — over-admission past the budget cap (store-buffering regression)"
+        );
     }
 }
 
