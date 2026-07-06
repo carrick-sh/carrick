@@ -896,22 +896,504 @@ fn reset_global_vcpu_permits_after_fork_child() {
     }
 }
 
+// ===========================================================================
+// Atomic vCPU admission permit (Option 3, Task 1) — flag-gated alternative to
+// the flock permit above, behind `CARRICK_HVF_ATOMIC_PERMIT=1`.
+//
+// The flock permit above gets its cross-process death-reclaim for free from the
+// kernel (a slot lock releases when the holder's last fd closes on exit). A bare
+// shared counter does NOT — that was the 3b leak (`cur=4 live_len=0`). So here
+// OWNERSHIP is the source of truth: every admitted count IS a generation-stamped
+// slot in a fork-shared table, published owner-first, so a crash between acquire
+// and vcpu_create leaves a reclaimable owner record (reaped by Tasks 2/3). There
+// is NO separate live counter; `occupied()` is DERIVED from non-free slots.
+// ===========================================================================
+
+/// Packed-slot bit layout for one `AtomicU64` entry in the shared table:
+///
+/// ```text
+///   bits 63..62  state       (2 bits: 0=free, 1=acquiring, 2=registered)
+///   bits 61..32  generation  (30 bits, from the shared monotonic counter)
+///   bits 31..0   owner_pid    (32 bits)
+/// ```
+///
+/// A `MAP_ANON` zero-filled word is therefore `state=free, gen=0, pid=0` — a
+/// valid empty slot — and no live slot is ever all-zero (state is never free).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod atomic_permit_slot {
+    pub(super) const MAX_SLOTS: usize = 64;
+
+    pub(super) const STATE_SHIFT: u32 = 62;
+    pub(super) const STATE_MASK: u64 = 0b11 << STATE_SHIFT;
+    pub(super) const GEN_SHIFT: u32 = 32;
+    pub(super) const GEN_BITS: u32 = 30;
+    pub(super) const GEN_MASK: u64 = ((1u64 << GEN_BITS) - 1) << GEN_SHIFT;
+    pub(super) const GEN_VALUE_MASK: u32 = (1u32 << GEN_BITS) - 1;
+    pub(super) const PID_MASK: u64 = 0xFFFF_FFFF;
+
+    pub(super) const STATE_FREE: u64 = 0;
+    pub(super) const STATE_ACQUIRING: u64 = 1;
+    pub(super) const STATE_REGISTERED: u64 = 2;
+
+    /// A fully-free slot word (all zero).
+    pub(super) const FREE_WORD: u64 = 0;
+
+    pub(super) const MAGIC: u32 = 0x4352_5031; // "CRP1"
+    pub(super) const VERSION: u32 = 1;
+
+    pub(super) fn pack(state: u64, pid: u32, generation: u32) -> u64 {
+        (state << STATE_SHIFT)
+            | ((u64::from(generation) & ((1u64 << GEN_BITS) - 1)) << GEN_SHIFT)
+            | u64::from(pid)
+    }
+
+    pub(super) fn state_of(word: u64) -> super::SlotState {
+        match (word & STATE_MASK) >> STATE_SHIFT {
+            STATE_FREE => super::SlotState::Free,
+            STATE_ACQUIRING => super::SlotState::Acquiring,
+            STATE_REGISTERED => super::SlotState::Registered,
+            _ => super::SlotState::Free, // unused 0b11 encoding
+        }
+    }
+
+    pub(super) fn pid_of(word: u64) -> u32 {
+        (word & PID_MASK) as u32
+    }
+
+    pub(super) fn gen_of(word: u64) -> u32 {
+        ((word & GEN_MASK) >> GEN_SHIFT) as u32
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlotState {
+    Free,
+    Acquiring,
+    Registered,
+}
+
+/// A held atomic permit: proof that exactly one generation-stamped slot is owned
+/// by `owner_pid`. `Copy` so events/tokens can be compared without consuming.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Clone, Copy)]
+struct PermitToken {
+    slot: u16,
+    generation: u32,
+    owner_pid: u32,
+}
+
+/// The fork-shared slot table itself, laid out in the `MAP_ANON | MAP_SHARED`
+/// page. `#[repr(C)]` so parent and child agree on the layout; every field is an
+/// atomic so all cross-process access is well-defined. `next_generation` hands
+/// out a monotonic (30-bit-wrapping) generation per acquire so a freed-then-
+/// reused slot never collides with a stale token/event.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[repr(C)]
+struct SharedPermitTable {
+    magic: std::sync::atomic::AtomicU32,
+    version: std::sync::atomic::AtomicU32,
+    next_generation: std::sync::atomic::AtomicU32,
+    // `#[repr(C)]` inserts 4 bytes of padding here to 8-align `slots`.
+    slots: [std::sync::atomic::AtomicU64; atomic_permit_slot::MAX_SLOTS],
+}
+
+/// Process-local handle onto the fork-shared [`SharedPermitTable`].
+///
+/// `table` is the shared page's address — identical in parent and child because
+/// the region is `MAP_SHARED` and created before any guest fork. `local` is a
+/// PROCESS-PRIVATE `vcpu_id -> PermitToken` map (fork copies it, and the child
+/// clears it via [`PermitRegion::reset_local_after_fork_child`]) — it is the
+/// authority for token-guarded release: only a `vcpu_id` that registered a token
+/// can free the shared slot it named.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct PermitRegion {
+    table: usize,
+    local: std::sync::Mutex<HashMap<u64, PermitToken>>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl PermitRegion {
+    /// mmap a fresh zero-filled shared table and publish its header. Used for
+    /// both the process singleton and (in tests) an injectable private region.
+    fn map_shared_table() -> usize {
+        use std::sync::atomic::Ordering;
+        let size = std::mem::size_of::<SharedPermitTable>();
+        // SAFETY: MAP_ANON pages are zero-filled, so the region is a valid
+        // `SharedPermitTable` with every slot `FREE_WORD`. MAP_SHARED + created
+        // before any guest fork makes the mapping (and its address) inherited by
+        // every fork child, so all processes share one slot table.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANON | libc::MAP_SHARED,
+                -1,
+                0,
+            )
+        };
+        assert!(
+            ptr != libc::MAP_FAILED,
+            "mmap(MAP_ANON|MAP_SHARED) for the vCPU permit table failed"
+        );
+        // SAFETY: `ptr` is a live, page-aligned, zero-filled mapping of exactly
+        // `size_of::<SharedPermitTable>()` bytes, kept for the process lifetime.
+        let table = unsafe { &*(ptr as *const SharedPermitTable) };
+        // Generations start at 1 so 0 is reserved for "no owner".
+        table.next_generation.store(1, Ordering::Relaxed);
+        table
+            .version
+            .store(atomic_permit_slot::VERSION, Ordering::Relaxed);
+        // Publish the magic last (Release) so a reader that sees it also sees the
+        // initialized header.
+        table
+            .magic
+            .store(atomic_permit_slot::MAGIC, Ordering::Release);
+        ptr as usize
+    }
+
+    fn new_shared_global() -> PermitRegion {
+        PermitRegion {
+            table: Self::map_shared_table(),
+            local: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn table(&self) -> &SharedPermitTable {
+        // SAFETY: `self.table` is the address returned by `map_shared_table`,
+        // a live mapping for the process lifetime; the child shares the same VA.
+        unsafe { &*(self.table as *const SharedPermitTable) }
+    }
+
+    /// DERIVED occupancy: the count of non-free slots across the whole fork tree.
+    /// There is deliberately no separate `live` counter to drift from this.
+    fn occupied(&self) -> usize {
+        use std::sync::atomic::Ordering;
+        self.table()
+            .slots
+            .iter()
+            .filter(|s| atomic_permit_slot::state_of(s.load(Ordering::Acquire)) != SlotState::Free)
+            .count()
+    }
+
+    /// Single acquire attempt. Publishes an OWNED slot FIRST (a crash after this
+    /// is reclaimable), THEN counts occupancy: if the claim pushed occupancy over
+    /// `budget`, it CASes that exact `(slot, gen)` back to free and returns `None`
+    /// so the caller backs off. Returns `None` (no leak) on a full table too.
+    fn acquire(&self, budget: usize, pid: u32) -> Option<PermitToken> {
+        use std::sync::atomic::Ordering;
+        let budget = budget.max(1);
+        let table = self.table();
+        for (idx, slot) in table.slots.iter().enumerate() {
+            let cur = slot.load(Ordering::Acquire);
+            if atomic_permit_slot::state_of(cur) != SlotState::Free {
+                continue;
+            }
+            let generation = table.next_generation.fetch_add(1, Ordering::AcqRel)
+                & atomic_permit_slot::GEN_VALUE_MASK;
+            let claimed =
+                atomic_permit_slot::pack(atomic_permit_slot::STATE_ACQUIRING, pid, generation);
+            if slot
+                .compare_exchange(cur, claimed, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                // Lost this slot to a concurrent acquirer; try the next free one.
+                continue;
+            }
+            // An owned slot now exists; count occupancy (which includes it).
+            if self.occupied() > budget {
+                // Over budget: undo THIS exact claim and let the caller back off.
+                let _ = slot.compare_exchange(
+                    claimed,
+                    atomic_permit_slot::FREE_WORD,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+                return None;
+            }
+            return Some(PermitToken {
+                slot: idx as u16,
+                generation,
+                owner_pid: pid,
+            });
+        }
+        None
+    }
+
+    /// Transition `acquiring -> registered` for the same `(pid, gen)` and record
+    /// `vcpu_id -> token` locally. The local entry is the release authority; the
+    /// shared transition is best-effort (an acquiring slot already counts as
+    /// occupied, so a lost race here cannot drop the count).
+    fn register(&self, vcpu_id: u64, token: PermitToken) {
+        use std::sync::atomic::Ordering;
+        let slot = &self.table().slots[token.slot as usize];
+        let acquiring = atomic_permit_slot::pack(
+            atomic_permit_slot::STATE_ACQUIRING,
+            token.owner_pid,
+            token.generation,
+        );
+        let registered = atomic_permit_slot::pack(
+            atomic_permit_slot::STATE_REGISTERED,
+            token.owner_pid,
+            token.generation,
+        );
+        let _ = slot.compare_exchange(acquiring, registered, Ordering::AcqRel, Ordering::Acquire);
+        self.local
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(vcpu_id, token);
+    }
+
+    /// Token-guarded release: only frees the shared slot if THIS `vcpu_id` holds
+    /// a locally-recorded token. An unregistered sibling teardown is a no-op on
+    /// the shared table (mirrors the flock `live`-set guard).
+    fn release_token(&self, vcpu_id: u64) {
+        let token = self
+            .local
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&vcpu_id);
+        if let Some(token) = token {
+            self.free_exact(token);
+        }
+    }
+
+    /// Free a slot iff it still holds this exact `(owner_pid, generation)` — the
+    /// generation guard: a stale token or a late death event for a reused slot
+    /// (now owned by a newer generation) will not match and cannot free it.
+    fn free_exact(&self, token: PermitToken) -> bool {
+        use std::sync::atomic::Ordering;
+        let slot = &self.table().slots[token.slot as usize];
+        loop {
+            let cur = slot.load(Ordering::Acquire);
+            if atomic_permit_slot::state_of(cur) == SlotState::Free
+                || atomic_permit_slot::pid_of(cur) != token.owner_pid
+                || atomic_permit_slot::gen_of(cur)
+                    != (token.generation & atomic_permit_slot::GEN_VALUE_MASK)
+            {
+                return false;
+            }
+            match slot.compare_exchange_weak(
+                cur,
+                atomic_permit_slot::FREE_WORD,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(_) => continue,
+            }
+        }
+    }
+
+    /// Release a token that was acquired but never registered against a `vcpu_id`
+    /// (VM- or vcpu-create failed after acquire). Frees the exact acquiring slot.
+    fn release_unregistered(&self, token: PermitToken) {
+        self.free_exact(token);
+    }
+
+    /// Reclaim (free) every non-free slot owned by `pid` — optionally restricted
+    /// to a single `generation`. Used by the death-reclaim supervisor and the
+    /// cooperative fork-child exit path (Tasks 2/3). Returns the number freed.
+    #[allow(dead_code)] // consumed by the Task 2/3 reaper + cooperative exit.
+    fn reclaim_owner(&self, pid: u32, generation: Option<u32>) -> usize {
+        use std::sync::atomic::Ordering;
+        let mut freed = 0;
+        for slot in self.table().slots.iter() {
+            loop {
+                let cur = slot.load(Ordering::Acquire);
+                if atomic_permit_slot::state_of(cur) == SlotState::Free
+                    || atomic_permit_slot::pid_of(cur) != pid
+                {
+                    break;
+                }
+                if let Some(g) = generation {
+                    if atomic_permit_slot::gen_of(cur) != (g & atomic_permit_slot::GEN_VALUE_MASK) {
+                        break;
+                    }
+                }
+                if slot
+                    .compare_exchange_weak(
+                        cur,
+                        atomic_permit_slot::FREE_WORD,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    freed += 1;
+                    break;
+                }
+                // CAS lost to a concurrent mutator; re-check this slot.
+            }
+        }
+        freed
+    }
+
+    /// Fork-child reset: drop the inherited local token map WITHOUT touching any
+    /// shared slot. The inherited tokens name the PARENT's live vCPUs; the shared
+    /// (MAP_SHARED) slots still belong to the parent and must not be freed here.
+    fn reset_local_after_fork_child(&self) {
+        self.local.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+
+    /// Diagnostic slot-state read (used by tests and the Task 2 supervisor).
+    #[allow(dead_code)]
+    fn slot_state(&self, slot: u16) -> SlotState {
+        use std::sync::atomic::Ordering;
+        atomic_permit_slot::state_of(self.table().slots[slot as usize].load(Ordering::Acquire))
+    }
+
+    #[cfg(test)]
+    fn new_anon_for_test() -> PermitRegion {
+        Self::new_shared_global()
+    }
+
+    #[cfg(test)]
+    fn local_token(&self, vcpu_id: u64) -> Option<PermitToken> {
+        self.local
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&vcpu_id)
+            .copied()
+    }
+
+    #[cfg(test)]
+    fn force_owner_for_test(&self, slot: u16, pid: u32, generation: u32) {
+        use std::sync::atomic::Ordering;
+        let s = &self.table().slots[slot as usize];
+        let cur = s.load(Ordering::Acquire);
+        let state = (cur & atomic_permit_slot::STATE_MASK) >> atomic_permit_slot::STATE_SHIFT;
+        s.store(
+            atomic_permit_slot::pack(state, pid, generation),
+            Ordering::Release,
+        );
+    }
+
+    #[cfg(test)]
+    fn try_free_exact_for_test(&self, token: PermitToken) -> bool {
+        self.free_exact(token)
+    }
+
+    #[cfg(test)]
+    fn table_addr_for_test(&self) -> usize {
+        self.table
+    }
+}
+
+/// The process-global permit region. Initialized lazily on first use, but the
+/// FIRST use is the `Initial` admission acquire during initial-VM creation, which
+/// runs before the guest can execute any `fork` — so the region always exists,
+/// `MAP_SHARED`, before any guest fork inherits it.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn permit_region() -> &'static PermitRegion {
+    static REGION: std::sync::OnceLock<PermitRegion> = std::sync::OnceLock::new();
+    REGION.get_or_init(PermitRegion::new_shared_global)
+}
+
+/// `true` when `CARRICK_HVF_ATOMIC_PERMIT=1`; cached once. Unset/other → the
+/// default flock permit path (byte-for-byte unchanged).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn atomic_permit_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static FLAG: AtomicU8 = AtomicU8::new(0);
+    match FLAG.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var("CARRICK_HVF_ATOMIC_PERMIT").ok().as_deref() == Some("1");
+            FLAG.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Blocking acquire against the atomic slot table: retry the single-attempt
+/// [`PermitRegion::acquire`] with the same exponential backoff as the flock path
+/// until a slot is admitted. Analogue of [`acquire_global_vcpu_permit`].
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn acquire_atomic_vcpu_permit(budget: usize) -> PermitToken {
+    let region = permit_region();
+    let pid = std::process::id();
+    let mut backoff = GlobalVcpuPermitBackoff::default();
+    loop {
+        if let Some(token) = region.acquire(budget, pid) {
+            return token;
+        }
+        std::thread::sleep(backoff.next_delay());
+    }
+}
+
+/// A held admission permit, either flock (default) or atomic (flag-gated). It
+/// flows from `create_vm_with_admission` through `create_vcpu_with_permit` where
+/// it is registered against the created `vcpu_id` (or released on failure).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+enum HeldPermit {
+    Flock(GlobalVcpuPermit),
+    Atomic(PermitToken),
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn acquire_admission_permit(budget: usize) -> HeldPermit {
+    if atomic_permit_enabled() {
+        HeldPermit::Atomic(acquire_atomic_vcpu_permit(budget))
+    } else {
+        HeldPermit::Flock(acquire_global_vcpu_permit(budget))
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn register_admission_permit(vcpu_id: u64, permit: HeldPermit) {
+    match permit {
+        HeldPermit::Flock(permit) => register_global_vcpu_permit(vcpu_id, permit),
+        HeldPermit::Atomic(token) => permit_region().register(vcpu_id, token),
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn release_unregistered_admission_permit(permit: HeldPermit) {
+    match permit {
+        HeldPermit::Flock(permit) => release_unregistered_global_vcpu_permit(permit),
+        HeldPermit::Atomic(token) => permit_region().release_unregistered(token),
+    }
+}
+
+/// Dispatch a normal `vcpu_destroyed` release to whichever permit path is active.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn release_admission_permit_for_vcpu(vcpu_id: u64) {
+    if atomic_permit_enabled() {
+        permit_region().release_token(vcpu_id);
+    } else {
+        release_global_vcpu_permit(vcpu_id);
+    }
+}
+
+/// Dispatch the fork-child reset to whichever permit path is active.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn reset_admission_permits_after_fork_child() {
+    if atomic_permit_enabled() {
+        permit_region().reset_local_after_fork_child();
+    } else {
+        reset_global_vcpu_permits_after_fork_child();
+    }
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn create_vcpu_with_permit(
     vm: &applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>,
-    permit: Option<GlobalVcpuPermit>,
+    permit: Option<HeldPermit>,
 ) -> Result<applevisor::vcpu::Vcpu, TrapError> {
     match vm.vcpu_create() {
         Ok(vcpu) => {
             if let Some(permit) = permit {
-                register_global_vcpu_permit(vcpu.id(), permit);
+                register_admission_permit(vcpu.id(), permit);
             }
             vcpu_created();
             Ok(vcpu)
         }
         Err(e) => {
             if let Some(permit) = permit {
-                release_unregistered_global_vcpu_permit(permit);
+                release_unregistered_admission_permit(permit);
             }
             Err(hvf_error(e))
         }
@@ -942,18 +1424,18 @@ fn create_vm_with_admission(
 ) -> Result<
     (
         applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>,
-        Option<GlobalVcpuPermit>,
+        Option<HeldPermit>,
     ),
     TrapError,
 > {
     let permit = admission
         .global_permit_budget_from_mn(vcpu_gate::budget())
-        .map(acquire_global_vcpu_permit);
+        .map(acquire_admission_permit);
     match virtual_machine_with_private_signals_blocked(config) {
         Ok(vm) => Ok((vm, permit)),
         Err(e) => {
             if let Some(permit) = permit {
-                release_unregistered_global_vcpu_permit(permit);
+                release_unregistered_admission_permit(permit);
             }
             Err(hvf_error(e))
         }
@@ -1068,7 +1550,7 @@ fn enable_el0_counter_access(vcpu_id: applevisor_sys::hv_vcpu_t) {
 }
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn vcpu_destroyed(vcpu_id: u64) {
-    release_global_vcpu_permit(vcpu_id);
+    release_admission_permit_for_vcpu(vcpu_id);
     VCPU_LIVE.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     // A slot freed: wake a sibling thread blocked in the admission gate.
     vcpu_gate::notify();
@@ -3214,7 +3696,7 @@ impl HvfVmState {
         let mut config = VirtualMachineConfig::new();
         config.set_ipa_size(max_ipa).map_err(hvf_error)?;
         if is_child {
-            reset_global_vcpu_permits_after_fork_child();
+            reset_admission_permits_after_fork_child();
         }
         let (new_vm, permit) = create_vm_with_admission(
             config,
@@ -4611,6 +5093,91 @@ mod vm_create_admission_tests {
         assert_eq!(vcpu_gate::budget_from_limits(6, 10), 6);
         assert_eq!(vcpu_gate::budget_from_limits(60, 0), 1);
         assert_eq!(vcpu_gate::budget_from_limits(0, 10), 1);
+    }
+
+    // ---- Atomic permit slot-table state machine (Option 3, Task 1) ----------
+    //
+    // These prove the load-bearing invariant the 3b bare-counter attempt lost:
+    // ownership is the source of truth, so a crash between acquire and
+    // vcpu_create is reclaimable and no sibling teardown or stale event can
+    // free a live owner's slot.
+
+    #[test]
+    fn acquire_cannot_leave_an_unowned_count() {
+        let r = PermitRegion::new_anon_for_test();
+        let t = r.acquire(4, std::process::id()).unwrap(); // slot published owned BEFORE any count-only state
+        assert_eq!(r.occupied(), 1);
+        assert_eq!(r.slot_state(t.slot), SlotState::Acquiring); // owner+gen visible even pre-register
+        // a crash here is reclaimable: reap by owner finds the acquiring slot
+        r.force_owner_for_test(t.slot, 999_999_999, t.generation);
+        assert_eq!(r.reclaim_owner(999_999_999, None), 1);
+        assert_eq!(r.occupied(), 0);
+    }
+
+    #[test]
+    fn vcpu_destroyed_of_unregistered_vcpu_does_not_release_a_permit() {
+        let r = PermitRegion::new_anon_for_test();
+        let t = r.acquire(4, std::process::id()).unwrap();
+        r.register(100, t); // vcpu 100 holds the permit
+        r.release_token(999); // an UNPERMITTED sibling vcpu teardown
+        assert_eq!(r.occupied(), 1); // must NOT free vcpu 100's permit
+        r.release_token(100);
+        assert_eq!(r.occupied(), 0);
+    }
+
+    #[test]
+    fn release_is_generation_checked() {
+        let r = PermitRegion::new_anon_for_test();
+        let t = r.acquire(4, std::process::id()).unwrap();
+        r.register(1, t);
+        let stale = PermitToken {
+            generation: t.generation.wrapping_sub(1),
+            ..t
+        };
+        assert!(!r.try_free_exact_for_test(stale)); // a stale token/event cannot free a newer owner
+        assert_eq!(r.occupied(), 1);
+    }
+
+    #[test]
+    fn fork_child_reset_clears_local_only() {
+        let r = PermitRegion::new_anon_for_test();
+        let t = r.acquire(4, std::process::id()).unwrap();
+        r.register(1, t);
+        r.reset_local_after_fork_child(); // child clears local map
+        assert!(r.local_token(1).is_none());
+        assert_eq!(r.occupied(), 1); // parent's shared slot untouched
+    }
+
+    #[test]
+    fn region_address_is_inherited_across_fork() {
+        // The MAP_ANON|MAP_SHARED region must live at the same address in a fork
+        // child AND expose the same physical slot table, so a child's acquire is
+        // visible to the parent. This is the property flock got from the kernel.
+        let r = PermitRegion::new_anon_for_test();
+        let parent_addr = r.table_addr_for_test();
+        assert_eq!(r.occupied(), 0);
+        // SAFETY: the child does only async-signal-safe atomic work on the shared
+        // region (no allocation, no locks) before `_exit`, so the multithreaded
+        // test harness fork is safe here.
+        match unsafe { libc::fork() } {
+            -1 => panic!("fork failed"),
+            0 => {
+                let addr_ok = r.table_addr_for_test() == parent_addr;
+                let acquired = r.acquire(4, std::process::id()).is_some();
+                unsafe { libc::_exit(if addr_ok && acquired { 0 } else { 1 }) };
+            }
+            pid => {
+                let mut status: libc::c_int = 0;
+                let rc = unsafe { libc::waitpid(pid, &mut status, 0) };
+                assert_eq!(rc, pid);
+                assert!(
+                    libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+                    "child saw a different region address or could not acquire"
+                );
+                // The child's acquire on the SHARED table is visible in the parent.
+                assert_eq!(r.occupied(), 1);
+            }
+        }
     }
 }
 
