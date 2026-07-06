@@ -193,6 +193,26 @@ impl SyscallDispatcher {
         }
     }
 
+    /// DAC write-permission check on an EXISTING file, for the path mutators
+    /// that need it (truncate; the linkat new-path parent). Returns
+    /// `Some(EACCES)` when the caller lacks write on `path`. Root (euid 0)
+    /// bypasses — CAP_DAC_OVERRIDE, and the hot path. Returns `None` when the
+    /// backend can't supply real owner/mode (e.g. `--fs memory`), leaving the
+    /// op to the backend. Ancestor search permission is already enforced by
+    /// `resolve_at_path`/`check_search_access`, so this gates only the leaf.
+    pub(super) fn may_write(&self, path: &str) -> Option<LinuxErrno> {
+        let creds = self.cred_snapshot();
+        if creds.euid == 0 {
+            return None;
+        }
+        let real = self.fs.rootfs_vfs.overlay.real_stat(path, true)?;
+        let is_dir = matches!(real.kind, RootFsEntryKind::Directory);
+        crate::dispatch::dac_check(
+            creds.euid, creds.egid, real.uid, real.gid, real.mode, is_dir, LINUX_W_OK,
+        )
+        .err()
+    }
+
     /// Verify the caller has search (X) permission on every ancestor directory
     /// of `path`. Returns `Some(EACCES)` on the first non-searchable parent.
     fn dac_ancestors_searchable(&self, path: &str, uid: u32, gid: u32) -> Option<LinuxErrno> {
