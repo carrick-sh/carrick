@@ -2640,6 +2640,13 @@ impl SyscallDispatcher {
         /// the guest issues execveat, not execve, so without this it was ENOSYS).
         fn execveat(this, cx, dirfd: u64, pathname_addr: GuestPtr, argv_addr: GuestPtr, envp_addr: GuestPtr, flags: u64) {
             let memory = &*cx.memory;
+            // execveat(2) accepts only AT_EMPTY_PATH and AT_SYMLINK_NOFOLLOW; any
+            // other flag bit is EINVAL — validated BEFORE touching the fd/path so a
+            // malformed call never executes the target (execveat02 passes flags=-1).
+            const EXECVEAT_VALID_FLAGS: u64 = LINUX_AT_EMPTY_PATH | LINUX_AT_SYMLINK_NOFOLLOW;
+            if flags & !EXECVEAT_VALID_FLAGS != 0 {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
             let path_str = read_guest_c_string(memory, pathname_addr.0)?;
             let path = if flags & LINUX_AT_EMPTY_PATH != 0 && path_str.is_empty() {
                 // fexecve: dirfd IS the executable's open fd. Recover the guest
@@ -2654,7 +2661,18 @@ impl SyscallDispatcher {
                     None => return Ok(DispatchOutcome::errno(LINUX_EBADF)),
                 }
             } else {
-                this.resolve_at_path(dirfd, &path_str)?
+                let resolved = this.resolve_at_path(dirfd, &path_str)?;
+                // AT_SYMLINK_NOFOLLOW: if the FINAL component is a symlink, the
+                // kernel refuses to follow it and fails with ELOOP (execveat02).
+                if flags & LINUX_AT_SYMLINK_NOFOLLOW != 0
+                    && this
+                        .layered_lstat(&resolved)
+                        .map(|m| m.kind == RootFsEntryKind::Symlink)
+                        .unwrap_or(false)
+                {
+                    return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ELOOP));
+                }
+                resolved
             };
             let argv = read_guest_string_array_bytes(memory, argv_addr.0)?;
             let env = read_guest_string_array_bytes(memory, envp_addr.0)?;
