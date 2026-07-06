@@ -1820,6 +1820,52 @@ impl SyscallDispatcher {
         }
     }
 
+    /// Count of currently-queued pending signals for this process — carrick's
+    /// per-process analogue of the Linux per-user `sigpending` count that
+    /// `RLIMIT_SIGPENDING` bounds. Standard signals (1..=31) coalesce, so each
+    /// pending standard signum is one slot; real-time signals queue per POSIX,
+    /// so each queued instance counts (`rt_pending_counts`). Linux's limit is
+    /// per-user across the user's processes; carrick approximates it per-process
+    /// (one user per guest here), which is exact for the single-process case.
+    fn pending_signal_count(&self) -> u64 {
+        // Standard signals occupy the low 31 bits of a sigset; RT signal bits
+        // (32..=64) are excluded here and counted from the RT queue-depth maps
+        // to avoid double-counting the mirror bit.
+        const STANDARD_MASK: u64 = (1u64 << 31) - 1;
+        let s = self.signal.lock();
+        let mut total: u64 = 0;
+        for set in s.pendings.values() {
+            total += u64::from((set.raw() & STANDARD_MASK).count_ones());
+        }
+        total += u64::from((s.process_pending.raw() & STANDARD_MASK).count_ones());
+        total += s
+            .rt_pending_counts
+            .values()
+            .map(|&c| u64::from(c))
+            .sum::<u64>();
+        total += s
+            .process_rt_pending_counts
+            .values()
+            .map(|&c| u64::from(c))
+            .sum::<u64>();
+        total
+    }
+
+    /// True when queuing one more signal would exceed this process's effective
+    /// `RLIMIT_SIGPENDING` soft limit (an INFINITY limit — carrick's default —
+    /// never does). Linux allows a queue alloc iff `count + 1 <= limit`; the
+    /// send fails with `EAGAIN` otherwise (LTP tgkill02: a blocked SIGRTMIN with
+    /// `RLIMIT_SIGPENDING = {0, 0}`).
+    fn sigpending_limit_exceeded(&self) -> bool {
+        let limit = self
+            .effective_resource_limit(crate::linux_abi::LINUX_RLIMIT_SIGPENDING)
+            .rlim_cur;
+        if limit == LINUX_RLIM_INFINITY {
+            return false;
+        }
+        self.pending_signal_count() >= limit
+    }
+
     /// Shared tgkill/tkill routing for the multi-threaded path. Returns
     /// `Some(outcome)` when `tid` names a live thread of this process:
     /// `raise_self` if it's the caller, a queued success if the sibling has the
@@ -1859,6 +1905,14 @@ impl SyscallDispatcher {
         }
         if t.registry.is_live(target) {
             let signum_i32 = signum as i32;
+            // RLIMIT_SIGPENDING: a real-time signal allocates a queue entry when
+            // generated, so a send at the pending-signal limit fails with EAGAIN
+            // BEFORE anything is recorded (LTP tgkill02: a sibling with SIGRTMIN
+            // blocked and RLIMIT_SIGPENDING={0,0}). Standard signals coalesce and
+            // are not bounded per-entry, so they are unaffected.
+            if is_rt_signal(signum_i32) && self.sigpending_limit_exceeded() {
+                return Some((DispatchOutcome::errno(LINUX_EAGAIN), target));
+            }
             if record_synthetic {
                 self.record_tkill_siginfo(target, signum_i32);
             }

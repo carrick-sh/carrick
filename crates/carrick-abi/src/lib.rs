@@ -2913,6 +2913,7 @@ pub const LINUX_RLIMIT_NPROC: u64 = 6;
 pub const LINUX_RLIMIT_NOFILE: u64 = 7;
 pub const LINUX_RLIMIT_MEMLOCK: u64 = 8;
 pub const LINUX_RLIMIT_AS: u64 = 9;
+pub const LINUX_RLIMIT_SIGPENDING: u64 = 11;
 pub const LINUX_RLIM_NLIMITS: u64 = 16;
 pub const LINUX_RUSAGE_SELF: i32 = 0;
 pub const LINUX_RUSAGE_CHILDREN: i32 = -1;
