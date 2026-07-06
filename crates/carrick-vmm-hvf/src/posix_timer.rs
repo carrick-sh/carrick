@@ -6,6 +6,7 @@
 
 pub use carrick_timer_core::posix::{
     PosixTimerSlot, PosixTimerSpec, clear, clock_id, create, delete, exists, getoverrun, remaining,
+    seed_overrun,
 };
 
 use carrick_timer_core::TimerSpecNs;

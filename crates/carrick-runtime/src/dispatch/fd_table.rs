@@ -295,6 +295,13 @@ pub(super) struct OpenDescriptionBase {
     /// after a datagram is sent. Store that errno here and copy it into
     /// `pending_socket_error` after each successful connected send.
     socket_error_after_send: Option<i32>,
+    /// File-sealing state (memfd_create(2)/fcntl F_ADD_SEALS/F_GET_SEALS). `None`
+    /// means this description does not support sealing (F_GET_SEALS/F_ADD_SEALS →
+    /// EINVAL); `Some(bits)` is the current seal set of a sealable memfd (empty
+    /// when created with MFD_ALLOW_SEALING, F_SEAL_SEAL preset otherwise). Lives
+    /// on the open-file description so a dup'd fd shares it, matching the kernel's
+    /// per-inode seal set for the common dup path.
+    seals: Option<u32>,
 }
 
 impl OpenDescriptionBase {
@@ -317,7 +324,16 @@ impl OpenDescriptionBase {
             async_sig: 0,
             pipe_capacity: crate::linux_abi::LINUX_PIPE_BUF_SIZE,
             pipe_capacity_shared: None,
+            seals: None,
         }
+    }
+
+    pub(super) fn seals(&self) -> Option<u32> {
+        self.seals
+    }
+
+    pub(super) fn set_seals(&mut self, seals: Option<u32>) {
+        self.seals = seals;
     }
 
     /// Route pipe capacity through a cell shared with the pipe's other end.
@@ -1247,6 +1263,14 @@ impl OpenDescription {
 
     pub(super) fn set_lease(&mut self, lease: i32) {
         self.base_mut().set_lease(lease);
+    }
+
+    pub(super) fn seals(&self) -> Option<u32> {
+        self.base().seals()
+    }
+
+    pub(super) fn set_seals(&mut self, seals: Option<u32>) {
+        self.base_mut().set_seals(seals);
     }
 
     pub(super) fn owner(&self) -> (i32, i32) {

@@ -60,6 +60,7 @@ syscall_table! {
     214 => brk,
     215 => munmap,
     216 => mremap,
+    213 => readahead,
     222 => mmap,
     223 => fadvise64,
     226 => mprotect,
@@ -147,6 +148,15 @@ pub(super) struct MemState {
     /// MAP_GROWSDOWN VMAs that may expand downward on a stack fault:
     /// `(low_bound, current_start, end)`.
     pub growdown_ranges: Vec<(u64, u64, u64)>,
+    /// VA ranges of MAP_SHARED mappings backed by a memfd sealed F_SEAL_WRITE
+    /// (or F_SEAL_FUTURE_WRITE): `mprotect(PROT_WRITE)` on them must fail EPERM,
+    /// since the sealed backing can never gain a shared writable view
+    /// (memfd_create01 check_mfd_non_writeable's mmap+mprotect case).
+    write_sealed_shared_maps: Vec<crate::vfs::GuestMemoryRange>,
+    /// Active MAP_SHARED, PROT_WRITE mappings of a (sealable) memfd, paired with
+    /// the backing open-file description. While one is live, `F_ADD_SEALS`
+    /// F_SEAL_WRITE on that memfd must fail EBUSY (memfd_create01 test_share_mmap).
+    writable_memfd_maps: Vec<(crate::vfs::GuestMemoryRange, OpenDescriptionRef)>,
     /// The exact serialized ELF auxiliary vector written to the guest stack at
     /// exec, captured from the `AddressSpace` via
     /// [`SyscallDispatcher::set_auxv_image`]. Mirrored to `/proc/self/auxv`.
@@ -180,6 +190,8 @@ impl MemState {
             resident_tracked_ranges: Vec::new(),
             resident_fault_ranges: Vec::new(),
             growdown_ranges: Vec::new(),
+            write_sealed_shared_maps: Vec::new(),
+            writable_memfd_maps: Vec::new(),
             linux_auxv_image: Vec::new(),
         }
     }
@@ -320,50 +332,10 @@ fn locked_ranges_total(ranges: &[crate::vfs::GuestMemoryRange]) -> u64 {
     ranges.iter().map(|range| range.len()).sum()
 }
 
-fn ranges_cover(
-    ranges: &[crate::vfs::GuestMemoryRange],
-    requested: crate::vfs::GuestMemoryRange,
-) -> bool {
-    let mut cursor = requested.start().raw();
-    for range in ranges {
-        if range.end().raw() <= cursor {
-            continue;
-        }
-        if range.start().raw() > cursor {
-            return false;
-        }
-        cursor = cursor.max(range.end().raw());
-        if cursor >= requested.end().raw() {
-            return true;
-        }
-    }
-    false
-}
-
 fn ranges_contain_page(ranges: &[crate::vfs::GuestMemoryRange], page: u64) -> bool {
     ranges
         .iter()
         .any(|range| page >= range.start().raw() && page < range.end().raw())
-}
-
-fn exact_residency(
-    tracked: &[crate::vfs::GuestMemoryRange],
-    resident: &[crate::vfs::GuestMemoryRange],
-    address: u64,
-    pages: u64,
-) -> Option<Vec<u8>> {
-    let length = pages.checked_mul(LINUX_PAGE_SIZE)?;
-    let requested =
-        crate::vfs::GuestMemoryRange::new(GuestVa(address), GuestVa(address.checked_add(length)?))?;
-    if !ranges_cover(tracked, requested) {
-        return None;
-    }
-    let mut out = Vec::with_capacity(usize::try_from(pages).ok()?);
-    for index in 0..pages {
-        let page = address.checked_add(index.checked_mul(LINUX_PAGE_SIZE)?)?;
-        out.push(u8::from(ranges_contain_page(resident, page)));
-    }
-    Some(out)
 }
 
 fn remove_fault_range(ranges: &mut Vec<ResidentFaultRange>, remove: crate::vfs::GuestMemoryRange) {
@@ -411,57 +383,6 @@ fn fault_range_intersections(
             })
         })
         .collect()
-}
-
-fn host_page_size() -> u64 {
-    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    if page <= 0 {
-        LINUX_PAGE_SIZE
-    } else {
-        page as u64
-    }
-}
-
-fn align_down_runtime(value: u64, alignment: u64) -> u64 {
-    value - value % alignment
-}
-
-fn align_up_runtime(value: u64, alignment: u64) -> Option<u64> {
-    let rem = value % alignment;
-    if rem == 0 {
-        Some(value)
-    } else {
-        value.checked_add(alignment - rem)
-    }
-}
-
-fn mincore_residency(memory: &impl GuestMemory, address: u64, length: u64) -> Option<Vec<u8>> {
-    let len = usize::try_from(length).ok()?;
-    let ptr = memory.host_ptr_for_read(address, len)?;
-    let guest_pages = length.div_ceil(LINUX_PAGE_SIZE);
-    let mut guest_resident = vec![0u8; usize::try_from(guest_pages).ok()?];
-    let host_page = host_page_size();
-    let ptr_addr = ptr.addr() as u64;
-    let host_start = align_down_runtime(ptr_addr, host_page);
-    let host_prefix = ptr_addr.checked_sub(host_start)?;
-    let host_scan = align_up_runtime(host_prefix.checked_add(length)?, host_page)?;
-    let host_pages = host_scan.div_ceil(host_page);
-    let mut host_resident = vec![0u8; usize::try_from(host_pages).ok()?];
-    let host_len = usize::try_from(host_scan).ok()?;
-    #[cfg(target_os = "linux")]
-    let vec_ptr = host_resident.as_mut_ptr() as *mut libc::c_uchar;
-    #[cfg(not(target_os = "linux"))]
-    let vec_ptr = host_resident.as_mut_ptr() as *mut libc::c_char;
-    let rc = unsafe { libc::mincore(host_start as *mut libc::c_void, host_len, vec_ptr) };
-    if rc != 0 {
-        return None;
-    }
-    for (guest_index, resident) in guest_resident.iter_mut().enumerate() {
-        let guest_offset = (guest_index as u64).checked_mul(LINUX_PAGE_SIZE)?;
-        let host_index = usize::try_from((host_prefix + guest_offset) / host_page).ok()?;
-        *resident = host_resident.get(host_index).copied().unwrap_or(0) & 1;
-    }
-    Some(guest_resident)
 }
 
 fn mincore_page_is_mapped(memory: &impl GuestMemory, page: u64) -> bool {
@@ -562,13 +483,147 @@ fn host_fd_file_len(fd: i32) -> Option<u64> {
         None
     }
 }
+/// VMA-metadata answer for a `madvise` range, computed without touching guest
+/// memory. `fully_mapped` is false when any page in the range falls in an
+/// unmapped hole (→ ENOMEM). `writable`/`shared` describe the covering VMAs and
+/// `locked` reports whether the range intersects an mlocked span.
+struct MadviseRangeMeta {
+    fully_mapped: bool,
+    writable: bool,
+    shared: bool,
+    locked: bool,
+}
+
 impl SyscallDispatcher {
+    /// Derive `madvise` range validity + properties from carrick's mapping
+    /// metadata (`dynamic_maps` plus the boot address-space regions), never by
+    /// probing a page. Coverage unions both sources so an advise on an
+    /// untracked initial region (heap/stack/ELF) is not mis-reported as a hole;
+    /// a post-`munmap` hole in a file/anon VMA (removed from `dynamic_maps`)
+    /// stays uncovered → ENOMEM.
+    fn madvise_range_meta(&self, start: u64, end: u64) -> MadviseRangeMeta {
+        let mem = self.mem.lock();
+        // (start, end, writable, shared) for every VMA overlapping [start, end).
+        let mut intervals: Vec<(u64, u64, bool, bool)> = Vec::new();
+        let mut push = |map: &ProcMapsEntry| {
+            if map.start < end && map.end > start {
+                intervals.push((
+                    map.start,
+                    map.end,
+                    map.write,
+                    map.sharing == ProcMapSharing::Shared,
+                ));
+            }
+        };
+        for map in &mem.dynamic_maps {
+            push(map);
+        }
+        if let Some(regions) = &mem.address_space_regions {
+            for map in regions {
+                push(map);
+            }
+        }
+        intervals.sort_by_key(|&(s, ..)| s);
+        // Walk the sorted intervals to confirm contiguous coverage of the range
+        // and fold the covering VMAs' writable/shared bits.
+        let mut covered_to = start;
+        let mut writable = true;
+        let mut shared = false;
+        for (s, e, w, sh) in intervals {
+            if s > covered_to {
+                break; // gap before this interval → unmapped hole
+            }
+            if e > covered_to {
+                // This interval extends coverage; its bits apply to the range.
+                if !w {
+                    writable = false;
+                }
+                if sh {
+                    shared = true;
+                }
+                covered_to = e;
+            }
+            if covered_to >= end {
+                break;
+            }
+        }
+        let fully_mapped = covered_to >= end;
+        let locked = mem.locked_ranges.iter().any(|r| {
+            let (rs, re) = (r.start().raw(), r.end().raw());
+            rs < end && re > start
+        });
+        MadviseRangeMeta {
+            fully_mapped,
+            writable: fully_mapped && writable,
+            shared,
+            locked,
+        }
+    }
+
     fn dynamic_mapping_overlaps(&self, start: u64, len: u64) -> bool {
         self.mem
             .lock()
             .dynamic_maps
             .iter()
             .any(|map| ranges_overlap(start, len, map.start, map.end))
+    }
+
+    fn record_write_sealed_shared_map(&self, start: u64, len: u64) {
+        if let Some(range) =
+            crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(start.saturating_add(len)))
+        {
+            self.mem.lock().write_sealed_shared_maps.push(range);
+        }
+    }
+
+    fn range_is_write_sealed_shared(&self, start: u64, len: u64) -> bool {
+        self.mem
+            .lock()
+            .write_sealed_shared_maps
+            .iter()
+            .any(|r| ranges_overlap(start, len, r.start().raw(), r.end().raw()))
+    }
+
+    fn remove_write_sealed_shared_map(&self, start: u64, len: u64) {
+        if let Some(range) =
+            crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(start.saturating_add(len)))
+        {
+            locked_ranges_remove(&mut self.mem.lock().write_sealed_shared_maps, range);
+        }
+    }
+
+    fn record_writable_memfd_map(&self, start: u64, len: u64, description: OpenDescriptionRef) {
+        if let Some(range) =
+            crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(start.saturating_add(len)))
+        {
+            self.mem
+                .lock()
+                .writable_memfd_maps
+                .push((range, description));
+        }
+    }
+
+    fn remove_writable_memfd_map(&self, start: u64, len: u64) {
+        let Some(end) = start.checked_add(len) else {
+            return;
+        };
+        self.mem
+            .lock()
+            .writable_memfd_maps
+            .retain(|(range, _)| !(range.start().raw() < end && start < range.end().raw()));
+    }
+
+    /// True iff a live MAP_SHARED, PROT_WRITE mapping backed by `description`
+    /// exists — used to reject `F_ADD_SEALS` F_SEAL_WRITE with EBUSY.
+    pub(in crate::dispatch) fn memfd_has_writable_shared_map(
+        &self,
+        description: &OpenDescriptionRef,
+    ) -> bool {
+        self.mem
+            .lock()
+            .writable_memfd_maps
+            .iter()
+            .any(|(_, desc)| std::sync::Arc::ptr_eq(desc, description))
     }
 
     fn record_dynamic_mapping(
@@ -801,15 +856,97 @@ impl SyscallDispatcher {
     }
 
     fn membarrier(&self, command: u64, flags: u64) -> DispatchOutcome {
-        if command == LINUX_MEMBARRIER_CMD_QUERY && flags == 0 {
-            return DispatchOutcome::Returned { value: 0 };
+        // membarrier(2) command bits (also the CMD_QUERY reply mask). carrick
+        // has a globally-coherent guest address space, so every barrier is a
+        // no-op that succeeds once its precondition (registration, for the
+        // expedited-private variants) is met.
+        const CMD_GLOBAL: u64 = 1 << 0;
+        const CMD_GLOBAL_EXPEDITED: u64 = 1 << 1;
+        const CMD_REGISTER_GLOBAL_EXPEDITED: u64 = 1 << 2;
+        const CMD_PRIVATE_EXPEDITED: u64 = 1 << 3;
+        const CMD_REGISTER_PRIVATE_EXPEDITED: u64 = 1 << 4;
+        const CMD_PRIVATE_EXPEDITED_SYNC_CORE: u64 = 1 << 5;
+        const CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE: u64 = 1 << 6;
+        const SUPPORTED: u64 = CMD_GLOBAL
+            | CMD_GLOBAL_EXPEDITED
+            | CMD_REGISTER_GLOBAL_EXPEDITED
+            | CMD_PRIVATE_EXPEDITED
+            | CMD_REGISTER_PRIVATE_EXPEDITED
+            | CMD_PRIVATE_EXPEDITED_SYNC_CORE
+            | CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE;
+
+        // No advertised command takes a flag (only the un-advertised RSEQ CPU
+        // variant does), so any non-zero flags arg is EINVAL — checked before
+        // the command, matching the kernel (and QUERY|flags=1 → EINVAL).
+        if flags != 0 {
+            return DispatchOutcome::errno(LINUX_EINVAL);
         }
-        DispatchOutcome::errno(LINUX_EINVAL)
+        if command == LINUX_MEMBARRIER_CMD_QUERY {
+            return DispatchOutcome::Returned {
+                value: SUPPORTED as i64,
+            };
+        }
+        match command {
+            // A global (or global-expedited) barrier needs no registration.
+            CMD_GLOBAL | CMD_GLOBAL_EXPEDITED | CMD_REGISTER_GLOBAL_EXPEDITED => {
+                DispatchOutcome::Returned { value: 0 }
+            }
+            // Registering an expedited-private intent records the readiness bit
+            // so a subsequent expedited-private barrier succeeds.
+            CMD_REGISTER_PRIVATE_EXPEDITED => {
+                self.proc.lock().membarrier_ready |= CMD_PRIVATE_EXPEDITED;
+                DispatchOutcome::Returned { value: 0 }
+            }
+            CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE => {
+                self.proc.lock().membarrier_ready |= CMD_PRIVATE_EXPEDITED_SYNC_CORE;
+                DispatchOutcome::Returned { value: 0 }
+            }
+            // An expedited-private barrier requires prior registration; an
+            // unregistered call is EPERM (Linux >= 4.16).
+            CMD_PRIVATE_EXPEDITED | CMD_PRIVATE_EXPEDITED_SYNC_CORE => {
+                if self.proc.lock().membarrier_ready & command != 0 {
+                    DispatchOutcome::Returned { value: 0 }
+                } else {
+                    DispatchOutcome::errno(LINUX_EPERM)
+                }
+            }
+            _ => DispatchOutcome::errno(LINUX_EINVAL),
+        }
     }
 }
 
 impl SyscallDispatcher {
     define_syscall! {
+        fn readahead(this, cx, fd: Fd, _offset: u64, _count: u64) {
+            // readahead(2) warms the page cache. carrick has no guest page
+            // cache to populate, so the operation itself is a no-op returning
+            // 0 — but it must reproduce the kernel's fd validation, which LTP
+            // readahead01 asserts. Order matches ksys_readahead: FMODE_READ is
+            // checked FIRST (EBADF), THEN the mapping type (EINVAL).
+            let Some(open_file) = this.open_file(fd.0) else {
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            };
+            let desc = open_file.description.read();
+            // An O_PATH descriptor (or an O_WRONLY fd) is not open for reading.
+            if desc.status_flags() & crate::linux_abi::LINUX_O_PATH != 0
+                || desc.status_flags() & LINUX_O_ACCMODE == LINUX_O_WRONLY
+            {
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            }
+            // readahead only applies to objects with a readahead-capable
+            // address space — regular files (and block devices). Pipes, FIFOs,
+            // sockets, char devices, directories, and the anonymous fd types
+            // (eventfd/timerfd/epoll/…) all lack one and are EINVAL.
+            let applicable = matches!(
+                &*desc,
+                OpenDescription::File { .. } | OpenDescription::HostFile { .. }
+            );
+            if !applicable {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
+            Ok(DispatchOutcome::Returned { value: 0 })
+        }
+
         fn fadvise64(this, cx, fd: Fd, _offset: u64, _len: u64, advice: u64) {
             if !this.fd_is_valid(fd.0) && !is_stdio_fd(fd.0) {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
@@ -964,6 +1101,23 @@ impl SyscallDispatcher {
                 && open_file.description.read().status_flags() & LINUX_O_ACCMODE == LINUX_O_WRONLY
             {
                 return Ok(DispatchOutcome::errno(LINUX_EACCES));
+            }
+
+            // A memfd sealed F_SEAL_WRITE (or F_SEAL_FUTURE_WRITE) cannot back a
+            // shared, writable mapping — Linux returns EPERM (memfd_create01
+            // check_mmap_fail). A private (MAP_PRIVATE) writable mapping is fine:
+            // its stores never reach the sealed backing.
+            if !map_flags.contains(LinuxMmapFlags::ANONYMOUS)
+                && map_sharing == MmapSharing::Shared
+                && prot_flags.contains(LinuxProtFlags::WRITE)
+                && let Some(open_file) = this.open_file(fd.0)
+                && let Some(seals) = open_file.description.read().seals()
+                && seals
+                    & (crate::linux_abi::LINUX_F_SEAL_WRITE
+                        | crate::linux_abi::LINUX_F_SEAL_FUTURE_WRITE)
+                    != 0
+            {
+                return Ok(DispatchOutcome::errno(LINUX_EPERM));
             }
 
             if fixed_noreplace && this.dynamic_mapping_overlaps(requested.0, length) {
@@ -1289,6 +1443,14 @@ impl SyscallDispatcher {
             }
 
             let mut bus_fault_offset = None;
+            // A MAP_SHARED mapping of a memfd sealed F_SEAL_WRITE is created
+            // read-only here (a writable one already returned EPERM above); record
+            // it so a later mprotect(PROT_WRITE) is rejected.
+            let mut mmap_write_sealed_shared = false;
+            // A live MAP_SHARED, PROT_WRITE mapping of an (unsealed) memfd — its
+            // backing description is recorded so F_ADD_SEALS F_SEAL_WRITE can
+            // EBUSY while it is mapped.
+            let mut writable_memfd_desc: Option<OpenDescriptionRef> = None;
             let bytes = if map_flags.contains(LinuxMmapFlags::ANONYMOUS) {
                 Vec::new()
             } else {
@@ -1300,7 +1462,7 @@ impl SyscallDispatcher {
                 let offset_usize =
                     usize::try_from(offset).map_err(|_| DispatchError::LengthTooLarge(offset))?;
                 match &*open {
-                    OpenDescription::File { contents, .. } => {
+                    OpenDescription::File { contents, base, .. } => {
                         if map_sharing == MmapSharing::Shared
                             && let Some(bus_offset) = shared_file_bus_offset(
                                 contents.len() as u64,
@@ -1309,6 +1471,21 @@ impl SyscallDispatcher {
                             )
                         {
                             bus_fault_offset = Some(bus_offset);
+                        }
+                        if map_sharing == MmapSharing::Shared
+                            && matches!(base.seals(), Some(s) if s
+                                & (crate::linux_abi::LINUX_F_SEAL_WRITE
+                                    | crate::linux_abi::LINUX_F_SEAL_FUTURE_WRITE)
+                                != 0)
+                        {
+                            mmap_write_sealed_shared = true;
+                        }
+                        if map_sharing == MmapSharing::Shared
+                            && prot_flags.contains(LinuxProtFlags::WRITE)
+                            && base.seals().is_some()
+                        {
+                            writable_memfd_desc =
+                                Some(std::sync::Arc::clone(&open_file.description));
                         }
                         let available = contents.read_at(offset_usize, length_usize);
                         bytes[..available.len()].copy_from_slice(&available);
@@ -1372,6 +1549,13 @@ impl SyscallDispatcher {
                 }
                 bytes
             };
+
+            if mmap_write_sealed_shared {
+                this.record_write_sealed_shared_map(address, length);
+            }
+            if let Some(description) = writable_memfd_desc {
+                this.record_writable_memfd_map(address, length, description);
+            }
 
             // Guest-chosen mmap addresses outside Carrick's low identity arenas
             // use alias backing. VAs >= 1 TiB need this because HVF's IPA is
@@ -1482,6 +1666,15 @@ impl SyscallDispatcher {
                 map_sharing.proc_map_sharing(),
                 String::new(),
             );
+            // A file-backed mapping's content is loaded eagerly (above), and
+            // MAP_POPULATE prefaults anonymous pages — so mincore must report
+            // those pages resident even before the guest touches them (LTP
+            // mincore04 mlocks in a child, then the parent queries mincore).
+            if !map_flags.contains(LinuxMmapFlags::ANONYMOUS)
+                || map_flags.contains(LinuxMmapFlags::POPULATE)
+            {
+                this.mark_range_resident(address, length);
+            }
             this.commit_mmap_locked_range(locked_range);
             Ok(DispatchOutcome::Returned {
                 value: address as i64,
@@ -1501,6 +1694,8 @@ impl SyscallDispatcher {
             }
             if let Some(len) = align_up_u64(length, LINUX_PAGE_SIZE) {
                 this.remove_dynamic_mapping(address.0, len);
+                this.remove_write_sealed_shared_map(address.0, len);
+                this.remove_writable_memfd_map(address.0, len);
                 trim_ranges_for_range(&mut this.mem.lock().bus_fault_ranges, address.0, len);
                 if let Some(remove) = crate::vfs::GuestMemoryRange::new(
                     GuestVa(address.0),
@@ -1733,8 +1928,7 @@ impl SyscallDispatcher {
             }
             let pages = length.div_ceil(LINUX_PAGE_SIZE);
             let bytes = this
-                .exact_mincore_residency(address.0, pages)
-                .or_else(|| mincore_residency(memory, address.0, pages * LINUX_PAGE_SIZE))
+                .mincore_residency_vector(address.0, pages)
                 .unwrap_or_else(|| vec![1u8; pages as usize]);
             memory.write_bytes(vec.0, &bytes)?;
             Ok(DispatchOutcome::Returned { value: 0 })
@@ -1989,6 +2183,11 @@ impl SyscallDispatcher {
             if cx.memory.read_bytes_raw(address.0, 1).is_err() {
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
             }
+            // A shared mapping of a F_SEAL_WRITE memfd cannot be upgraded to
+            // writable (memfd_create01 check_mfd_non_writeable).
+            if prot & LINUX_PROT_WRITE != 0 && this.range_is_write_sealed_shared(address.0, length) {
+                return Ok(DispatchOutcome::errno(LINUX_EPERM));
+            }
             if let Ok(len) = usize::try_from(length) {
                 let prot_none = LinuxProtFlags::from_bits_truncate(prot).is_empty();
                 cx.memory.set_no_access(address.0, len, prot_none);
@@ -2026,8 +2225,6 @@ impl SyscallDispatcher {
         }
 
         fn madvise(this, cx, address: GuestPtr, length: u64, advice: u64) {
-            let memory = &mut *cx.memory;
-
             if !address.0.is_multiple_of(LINUX_PAGE_SIZE) || !linux_madvise_advice_is_supported(advice) {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
@@ -2038,23 +2235,56 @@ impl SyscallDispatcher {
             let Ok(length) = usize::try_from(length) else {
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
             };
-            let Some(last_address) = address.0.checked_add(length as u64 - 1) else {
+            // Validity is derived from carrick's VMA metadata, NEVER by touching
+            // a page: a physical probe SIGBUSes the runtime on a read-only /
+            // past-EOF file page (madvise02 MADV_DONTNEED on a locked read-only
+            // MAP_SHARED file) and false-ENOMEMs a mapped-but-PROT_NONE range
+            // (madvise05 MADV_WILLNEED on an mprotect(PROT_NONE) anon region).
+            // An unmapped hole anywhere in [address, address+length) → ENOMEM,
+            // matching madvise_walk_vmas.
+            let Some(raw_end) = address.0.checked_add(length as u64) else {
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
             };
-            if memory.read_bytes(address.0, 1).is_err() || memory.read_bytes(last_address, 1).is_err() {
+            let Some(end) = align_up_u64(raw_end, LINUX_PAGE_SIZE) else {
+                return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+            };
+            let meta = this.madvise_range_meta(address.0, end);
+            if !meta.fully_mapped {
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
             }
-            if advice == LINUX_MADV_DONTNEED {
-                // MADV_DONTNEED zeroes the PHYSICAL backing — this is a
-                // carrick-internal scrub, not a guest store, so it must bypass
-                // the guest-visible write-protection gate. The permission-checked
-                // write_bytes path is range-gated on x86 (engine.rs range_no_write)
-                // and faults on a PROT_READ / no-access region, leaving stale
-                // bytes; zero_backing writes the host backing directly (same call
-                // the MAP_FIXED/munmap-reuse scrub uses above).
-                if memory.zero_backing(address.0, length).is_err() {
-                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+            match advice {
+                LINUX_MADV_DONTNEED => {
+                    // Linux can_madv_lru_vma rejects VM_LOCKED (also VM_HUGETLB /
+                    // VM_PFNMAP, which carrick does not model) with EINVAL before
+                    // dropping any page — derived from the locked-range table.
+                    if meta.locked {
+                        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                    }
+                    // Drop the pages by zeroing the writable PRIVATE/anonymous
+                    // backing — only such mappings get zero-fill-on-next-access.
+                    // A read-only mapping must NOT be written (would SIGBUS the
+                    // runtime); a MAP_SHARED mapping must NOT be written either —
+                    // for a shared FILE mapping zero_backing writes straight
+                    // through to the file and CORRUPTS it, and Linux
+                    // MADV_DONTNEED on a shared mapping does not zero (the next
+                    // access re-faults the original content from the file). In
+                    // all those cases treat DONTNEED as a success no-op, matching
+                    // Linux dropping clean cache pages. zero_backing writes the
+                    // host backing directly (same call the MAP_FIXED/munmap-reuse
+                    // scrub uses), bypassing the guest write-protection gate.
+                    if meta.writable
+                        && !meta.shared
+                        && cx.memory.zero_backing(address.0, length).is_err()
+                    {
+                        return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                    }
                 }
+                // MADV_FREE only applies to private anonymous mappings; a shared
+                // mapping (file- or anon-backed) → EINVAL.
+                LINUX_MADV_FREE if meta.shared => {
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                }
+                _ => {}
             }
             Ok(DispatchOutcome::Returned { value: 0 })
         }
@@ -2163,14 +2393,46 @@ impl SyscallDispatcher {
             .push(ResidentFaultRange { range, prot });
     }
 
-    fn exact_mincore_residency(&self, address: u64, pages: u64) -> Option<Vec<u8>> {
+    /// Residency vector for `mincore`, derived from carrick's mapping metadata
+    /// rather than host `mincore` (which is useless on macOS — it reports
+    /// unmapped/untouched pages as resident). A page inside a post-exec VMA
+    /// (`dynamic_maps`) is resident only when carrick has populated it: a file
+    /// load / MAP_POPULATE marks `resident_ranges`, a fault commits it, and
+    /// `mlock` records both `resident_ranges` and `locked_ranges`. A fresh,
+    /// untouched anonymous mapping is therefore NOT resident (LTP mincore03),
+    /// while a file-backed or mlocked mapping is (mincore02/04). Pages outside
+    /// every post-exec VMA belong to loader-populated initial regions (ELF
+    /// text/data, heap, stack, trampolines) and stay resident, matching the
+    /// prior conservative default.
+    fn mincore_residency_vector(&self, address: u64, pages: u64) -> Option<Vec<u8>> {
         let mem = self.mem.lock();
-        exact_residency(
-            &mem.resident_tracked_ranges,
-            &mem.resident_ranges,
-            address,
-            pages,
-        )
+        let mut out = Vec::with_capacity(usize::try_from(pages).ok()?);
+        for index in 0..pages {
+            let page = address.checked_add(index.checked_mul(LINUX_PAGE_SIZE)?)?;
+            let in_dynamic = mem
+                .dynamic_maps
+                .iter()
+                .any(|m| page >= m.start && page < m.end);
+            let resident = if in_dynamic {
+                ranges_contain_page(&mem.resident_ranges, page)
+                    || ranges_contain_page(&mem.locked_ranges, page)
+            } else {
+                true
+            };
+            out.push(u8::from(resident));
+        }
+        Some(out)
+    }
+
+    /// Record a range as populated (resident) — used when carrick eagerly loads
+    /// a file-backed or MAP_POPULATE mapping's content, so a later `mincore`
+    /// reports those pages resident.
+    fn mark_range_resident(&self, start: u64, len: u64) {
+        if let Some(range) =
+            crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(start.saturating_add(len)))
+        {
+            locked_ranges_insert(&mut self.mem.lock().resident_ranges, range);
+        }
     }
 
     pub(crate) fn resident_fault_plan(&self, address: u64) -> Option<(u64, u64)> {
@@ -2307,7 +2569,12 @@ impl SyscallDispatcher {
     }
 
     pub(crate) fn mem_after_fork_child(&self) {
-        self.mem.lock().locked_ranges.clear();
+        let mut mem = self.mem.lock();
+        mem.locked_ranges.clear();
+        // The child does not inherit the parent's writable-memfd-map bookkeeping
+        // (the descriptions it references may be closed in the child); a stale
+        // entry would spuriously EBUSY a child's F_ADD_SEALS.
+        mem.writable_memfd_maps.clear();
     }
 }
 

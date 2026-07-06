@@ -17,17 +17,20 @@ use super::devpts::{PtyTable, open_master};
 use super::{DirEnt, EntryKind, Metadata, OpenContext, OpenFlags, Vfs, VfsError, VfsHandle};
 
 /// macOS character devices that have the same name and semantics as
-/// their Linux counterparts. `/dev/full` is mapped to `/dev/null`
+/// their Linux counterparts. `/dev/full` is mapped to `/dev/zero`
 /// because macOS lacks a "always-ENOSPC-on-write" device — the
-/// closest available approximation discards writes, which is fine
-/// for the apt/dpkg paths that probe `/dev/full` to detect the
-/// device's existence.
+/// closest available approximation reads as an endless stream of zero
+/// bytes (exactly like Linux `/dev/full` on read; splice08 splices
+/// zeros out of it) and discards writes. macOS `/dev/zero` accepts and
+/// discards writes just like the prior `/dev/null` mapping, so the
+/// apt/dpkg existence probes are unaffected. Neither host device raises
+/// ENOSPC, so the write side is a best-effort approximation either way.
 const PASSTHROUGHS: &[(&str, &str)] = &[
     ("/dev/null", "/dev/null"),
     ("/dev/zero", "/dev/zero"),
     ("/dev/random", "/dev/random"),
     ("/dev/urandom", "/dev/urandom"),
-    ("/dev/full", "/dev/null"),
+    ("/dev/full", "/dev/zero"),
 ];
 // NOTE: `/dev/tty` is handled specially (not a host passthrough): it must
 // resolve to the GUEST's controlling terminal — the `carrick run -t` pty
@@ -396,8 +399,8 @@ mod tests {
     }
 
     #[test]
-    fn open_full_aliases_to_null() {
-        // /dev/full is mapped to /dev/null on macOS; open should
+    fn open_full_aliases_to_zero() {
+        // /dev/full is mapped to /dev/zero on macOS; open should
         // succeed regardless.
         let v = make_dev();
         let h = v
