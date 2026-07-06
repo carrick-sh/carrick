@@ -640,6 +640,13 @@ impl SyscallDispatcher {
         // child starts unregistered (LTP membarrier01 forks precisely to get a
         // fresh, unregistered process for each subtest).
         proc.membarrier_ready = 0;
+        // Interval timers (setitimer/alarm) are NOT inherited across fork
+        // (POSIX): the child starts with every ITIMER_* disarmed. The neutral
+        // itimer-core delivery state is cleared separately in the host-signal
+        // fork reinit; this clears the dispatcher's own record so a child
+        // getitimer reports 0 rather than the parent's inherited remaining time
+        // (LTP alarm07).
+        proc.itimers = [None, None, None];
     }
 
     pub(crate) fn subreaper_for_fork_child(&self) -> u32 {
