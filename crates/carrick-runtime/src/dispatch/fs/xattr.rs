@@ -67,6 +67,25 @@ impl SyscallDispatcher {
         // setxattr(path/fd, name, value, size, flags)
         let resolved = self.xattr_target_path(memory, target)?;
         let name = read_guest_c_string(memory, name_ptr.0)?;
+        // Linux restricts the `user.*` namespace to regular files and
+        // directories: setxattr(user.*) on a FIFO, char/block device, or socket
+        // is EPERM (setxattr02). The path variant follows symlinks, so a symlink
+        // resolves to its target's type (case 02 -> the regular file -> EEXIST,
+        // not EPERM). Device markers carry their S_IFCHR/S_IFBLK type bits in the
+        // stored mode; a plain regular file reports `File` with no device bits.
+        // Skipped when the backend can't report a type (e.g. `--fs memory`).
+        if name.starts_with("user.")
+            && let Some(real) = self.fs.rootfs_vfs.overlay.real_stat(&resolved, true)
+        {
+            let type_bits = real.mode & LINUX_S_IFMT;
+            let regular_or_dir = matches!(real.kind, RootFsEntryKind::Directory)
+                || (matches!(real.kind, RootFsEntryKind::File)
+                    && type_bits != LINUX_S_IFCHR
+                    && type_bits != LINUX_S_IFBLK);
+            if !regular_or_dir {
+                return Ok(DispatchOutcome::errno(LINUX_EPERM));
+            }
+        }
         let size = size as usize;
         let flags = flags as i32;
         let value = memory

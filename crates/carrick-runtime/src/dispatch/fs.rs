@@ -531,8 +531,8 @@ fn path_is_under_or_equal(path: &str, root: &str) -> bool {
 }
 
 /// Host passthrough for tee(2). On Linux the guest pipes are real host kernel
-/// pipes, so the host tee(2) gives exact zero-consume semantics; on other hosts
-/// (macOS) there is no tee(2), so it stays ENOSYS as before.
+/// pipes, so the host tee(2) gives exact zero-consume semantics; on hosts
+/// without tee(2) (macOS/BSD) `SyscallDispatcher::userspace_tee` emulates it.
 #[cfg(target_os = "linux")]
 fn tee_host_passthrough(
     in_fd: HostFd,
@@ -553,16 +553,6 @@ fn tee_host_passthrough(
     Ok(DispatchOutcome::Returned {
         value: n.host_syscall_errno()? as i64,
     })
-}
-
-#[cfg(not(target_os = "linux"))]
-fn tee_host_passthrough(
-    _in_fd: HostFd,
-    _out_fd: HostFd,
-    _count: usize,
-    _flags: LinuxSpliceFlags,
-) -> Result<DispatchOutcome, DispatchError> {
-    Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ENOSYS))
 }
 
 /// Same-file identity used for F_SETLEASE conflict accounting (see
@@ -1099,8 +1089,13 @@ impl SyscallDispatcher {
         path: &str,
         flags: u64,
     ) -> Result<StatRecord, LinuxErrno> {
-        if path.is_empty() && flags & LINUX_AT_EMPTY_PATH != 0 {
-            return self.fd_stat_record(dirfd as i32);
+        if path.is_empty() {
+            // AT_EMPTY_PATH stats the dirfd/fd itself; without it an empty
+            // pathname is ENOENT — NOT a stat of the cwd (lstat02/stat02 case 2).
+            if flags & LINUX_AT_EMPTY_PATH != 0 {
+                return self.fd_stat_record(dirfd as i32);
+            }
+            return Err(LINUX_ENOENT);
         }
 
         // A trailing "/" or "/." forces directory semantics on the FINAL
@@ -1195,6 +1190,13 @@ impl SyscallDispatcher {
         memory: &mut impl GuestMemory,
     ) -> Result<DispatchOutcome, DispatchError> {
         let path = read_guest_c_string(memory, pathname.0)?;
+        // An empty pathname is ENOENT (statfs has no AT_EMPTY_PATH form). glibc
+        // pathconf(path, _PC_LINK_MAX) validates the path via statfs, so
+        // statfs("") must fail rather than succeed and yield LINK_MAX
+        // (pathconf02 empty-string case).
+        if path.is_empty() {
+            return Ok(DispatchOutcome::errno(LINUX_ENOENT));
+        }
         let path = self.resolve_at_path(LINUX_AT_FDCWD, &path)?;
         // statfs(2) follows symlinks; a symlink CYCLE is ELOOP. resolve_at_path
         // doesn't cap symlink depth, so canonicalize here to surface a cycle as
@@ -1247,6 +1249,12 @@ impl SyscallDispatcher {
         };
         if kind == RootFsEntryKind::Directory {
             return Ok(DispatchOutcome::errno(LINUX_EISDIR));
+        }
+        // DAC: truncating a file writes it, so a caller without write permission
+        // is EACCES (truncate03 sets euid to nobody and truncates a 0444 file).
+        // Root bypasses; `--fs memory` (no real owner/mode) falls through.
+        if let Some(errno) = self.may_write(&resolved) {
+            return Ok(DispatchOutcome::errno(errno));
         }
         // Disk-backed: open the real file and ftruncate it. The whole rootfs
         // is materialised on the cap-std scratch under --fs host, so this
@@ -1412,6 +1420,47 @@ impl SyscallDispatcher {
         // main-binary fd this way. Serve it by duplicating N (works for host-fd
         // backed files, which carry no guest path to re-resolve).
         if let Some(n) = proc_self_fd_number(&path) {
+            // O_TRUNC on the reopened magic symlink truncates the underlying
+            // (shared) in-memory inode — memfd_create01 reopens /proc/self/fd/N
+            // with O_TRUNC and expects size 0. Applied before the dup and gated
+            // by F_SEAL_SHRINK/GROW (a sealed truncate → EPERM, and the open
+            // fails).
+            if flags & LINUX_O_TRUNC != 0
+                && let Some(open_file) = self.open_file(n)
+            {
+                let mut truncated_path: Option<String> = None;
+                {
+                    let mut open = open_file.description.write();
+                    if let OpenDescription::File {
+                        base,
+                        path,
+                        contents,
+                        metadata,
+                        writable,
+                        ..
+                    } = &mut *open
+                        && *writable
+                        && contents.len() != 0
+                    {
+                        if let Err(errno) = memfd_seal_resize_check(base.seals(), 0, contents.len())
+                        {
+                            return Ok(DispatchOutcome::errno(errno));
+                        }
+                        contents.truncate(0);
+                        metadata.size = 0;
+                        truncated_path = Some(path.clone());
+                    }
+                }
+                // Sync the empty contents to the overlay backing so a later
+                // fstat (which resolves the memfd's `/memfd:` path) reports 0.
+                if let Some(path) = truncated_path {
+                    let _ = self
+                        .fs
+                        .rootfs_vfs
+                        .overlay
+                        .set_file_contents(&path, Vec::new());
+                }
+            }
             return Ok(self.duplicate_fd(n, 0, flags & LINUX_O_CLOEXEC));
         }
 
@@ -1513,6 +1562,30 @@ impl SyscallDispatcher {
                 if open_flags.contains(LinuxOpenFlags::DIRECTORY) {
                     return Ok(DispatchOutcome::errno(LINUX_ENOTDIR));
                 }
+                // O_PATH | O_NOFOLLOW on a symlink is the ONE way open(2) yields a
+                // descriptor to the LINK ITSELF (not its target): the fd is opened
+                // only for path operations, so readlinkat(fd,"")/fstatat(fd,"",
+                // AT_EMPTY_PATH) operate on the link (readlinkat01 case 6). Model
+                // it as an O_PATH File carrying the symlink's own lstat metadata;
+                // every I/O op already rejects an O_PATH fd with EBADF.
+                if open_flags.contains(LinuxOpenFlags::PATH) {
+                    let open_file = OpenFile {
+                        description: Arc::new(RwLock::new(OpenDescription::File {
+                            base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
+                            path: path.clone(),
+                            metadata: md,
+                            contents: FileContents::dense(Vec::new()),
+                            offset: 0,
+                            writable: false,
+                        })),
+                        fd_flags: linux_fd_flags_from_open_flags(flags),
+                    };
+                    let Ok(fd) = self.install_fd_at_or_above(0, open_file) else {
+                        return Ok(DispatchOutcome::errno(linux_errno::EMFILE));
+                    };
+                    self.record_fd_open_path(fd, path.clone());
+                    return Ok(DispatchOutcome::Returned { value: fd as i64 });
+                }
                 return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ELOOP));
             }
         }
@@ -1589,6 +1662,21 @@ impl SyscallDispatcher {
         // on the parent dir. Root bypasses (handled in dac_check).
         if let Some(errno) = self.dac_open_check(&path, access, want_create) {
             return Ok(DispatchOutcome::errno(errno));
+        }
+
+        // O_NOATIME may only be requested by the file's owner (or a holder of
+        // CAP_FOWNER, modeled here as euid==0). Linux's do_dentry_open rejects a
+        // non-owner with EPERM (fs/open.c -> inode_owner_or_capable). Only
+        // enforce when the backing file exists and reports a real owner; a
+        // not-yet-existent O_CREAT target has no owner to compare against.
+        if open_flags.contains(LinuxOpenFlags::NOATIME) {
+            let creds = self.cred_snapshot();
+            if creds.euid != 0
+                && let Some(real) = self.fs.rootfs_vfs.overlay.real_stat(&path, true)
+                && real.uid != creds.euid
+            {
+                return Ok(DispatchOutcome::errno(LINUX_EPERM));
+            }
         }
 
         // FIFO (named pipe): open the REAL host FIFO in NON-BLOCKING mode and
@@ -1762,7 +1850,12 @@ impl SyscallDispatcher {
                 }
             }
             Ok(crate::vfs::rootfs::OpenDispatchResult::Directory { metadata, entries }) => {
-                if writable_request {
+                // A directory can never be the target of a write-intent open
+                // (O_WRONLY/O_RDWR) nor of an O_CREAT open — Linux returns
+                // EISDIR in both cases (a directory is never "created" by
+                // open(), and its dentry rejects write access). O_RDONLY
+                // without O_CREAT still yields a readable directory fd.
+                if writable_request || want_create {
                     return Ok(DispatchOutcome::errno(LINUX_EISDIR));
                 }
                 OpenDescription::Directory {
@@ -1906,8 +1999,10 @@ impl SyscallDispatcher {
             // name = basename) — the kernel reports a child's open to the dir
             // watch with the child's name (inotify02 watches the dir and asserts
             // IN_OPEN with name=test_file1). A create also "opens" the new file.
-            self.inotify_self(&record_path, carrick_abi::LINUX_IN_OPEN);
+            // Parent (child) event precedes the self event, matching Linux
+            // fsnotify ordering (inotify10).
             self.inotify_child(&record_path, carrick_abi::LINUX_IN_OPEN, opened_is_dir);
+            self.inotify_self(&record_path, carrick_abi::LINUX_IN_OPEN);
         }
         if inotify_created {
             self.dnotify_child(&record_path, LinuxDnotifyMask::CREATE);
@@ -2575,6 +2670,194 @@ impl SyscallDispatcher {
             }
         }
         None
+    }
+
+    /// The host fd backing the WRITE end of the pipe object identified by
+    /// `pipe_id`, if one is currently open. Symmetric to
+    /// [`Self::host_pipe_read_end_for_pipe_id`]; the userspace `tee` uses it to
+    /// restore the source pipe after peeking its buffered bytes on hosts that
+    /// lack `tee(2)`.
+    fn host_pipe_write_end_for_pipe_id(&self, pipe_id: u64) -> Option<HostFd> {
+        if pipe_id == 0 {
+            return None;
+        }
+        let table = self.io.open_files.read();
+        for (_fd, other) in table.iter() {
+            let other_open = other.description.read();
+            if let OpenDescription::HostPipe {
+                host_fd,
+                is_read_end: false,
+                pipe_id: other_pipe_id,
+                ..
+            } = &*other_open
+                && *other_pipe_id == pipe_id
+            {
+                return Some(host_fd.view());
+            }
+        }
+        None
+    }
+
+    /// True iff `fd` refers to a genuine pipe end — an anonymous pipe, a FIFO,
+    /// or a pty — as opposed to a char device (e.g. `/dev/zero`, which carrick
+    /// also models as a `HostPipe`), a socket, or a regular file. splice(2)
+    /// requires at least one of its two fds to be a genuine pipe; a char-device
+    /// `HostPipe` must NOT satisfy that requirement (splice07).
+    fn is_genuine_pipe(&self, fd: i32) -> bool {
+        let Some(open_file) = self.open_file(fd) else {
+            return false;
+        };
+        match &*open_file.description.read() {
+            OpenDescription::PipeReader { .. } | OpenDescription::PipeWriter { .. } => true,
+            OpenDescription::HostPipe {
+                write_kind, pty, ..
+            } => pty.is_some() || *write_kind == HostWriteKind::PipeLike,
+            _ => false,
+        }
+    }
+
+    /// True iff `fd` is a splice/tee SOURCE that is not open for reading, so
+    /// splice(2) must reject it with EBADF: an `O_PATH` descriptor, a
+    /// write-only regular file, or the write end of a one-way pipe (splice03's
+    /// write-only case, splice07's `O_PATH`/pipe-write-end sources).
+    fn splice_source_not_readable(&self, fd: i32) -> bool {
+        if self.fd_is_o_path(fd) {
+            return true;
+        }
+        let Some(open_file) = self.open_file(fd) else {
+            return false;
+        };
+        let open = open_file.description.read();
+        match &*open {
+            OpenDescription::File { .. }
+            | OpenDescription::SyntheticFile { .. }
+            | OpenDescription::HostFile { .. } => {
+                open.status_flags() & LINUX_O_ACCMODE == LINUX_O_WRONLY
+            }
+            OpenDescription::PipeWriter { .. } => true,
+            OpenDescription::HostPipe {
+                is_read_end,
+                pty,
+                bidirectional,
+                ..
+            } => pty.is_none() && !*bidirectional && !*is_read_end,
+            _ => false,
+        }
+    }
+
+    /// tee(2): duplicate up to `count` bytes from the source pipe's read end to
+    /// the destination pipe's write end WITHOUT consuming the source. On a Linux
+    /// host the real `tee(2)` is exact; elsewhere (macOS/BSD lack `tee(2)`) fall
+    /// back to a userspace peek-and-copy.
+    fn host_tee(
+        &self,
+        in_read: HostFd,
+        in_pipe_id: u64,
+        out_write: HostFd,
+        count: usize,
+        flags: LinuxSpliceFlags,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        #[cfg(target_os = "linux")]
+        {
+            let _ = in_pipe_id;
+            tee_host_passthrough(in_read, out_write, count, flags)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.userspace_tee(in_read, in_pipe_id, out_write, count, flags)
+        }
+    }
+
+    /// Userspace `tee(2)` for hosts without the syscall: drain the source pipe's
+    /// currently-buffered bytes, write them back through the source's write end
+    /// to restore it (FIFO order is preserved because the pipe is momentarily
+    /// emptied first), then copy up to `count` of them into the destination
+    /// pipe. The restore runs before the copy so a short/failed destination
+    /// write still leaves the non-consumed source intact.
+    #[cfg(not(target_os = "linux"))]
+    fn userspace_tee(
+        &self,
+        in_read: HostFd,
+        in_pipe_id: u64,
+        out_write: HostFd,
+        count: usize,
+        flags: LinuxSpliceFlags,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let nonblock = flags.contains(LinuxSpliceFlags::NONBLOCK);
+        let avail = host_pipe_readable_bytes(in_read.get()).unwrap_or(0);
+        if avail == 0 {
+            // Nothing buffered: a non-blocking tee is EAGAIN; a blocking tee
+            // would wait for the writer, which this path does not park for under
+            // the dispatcher lock, so report 0 (empty/writer-closed) instead.
+            return Ok(if nonblock {
+                DispatchOutcome::errno(LINUX_EAGAIN)
+            } else {
+                DispatchOutcome::Returned { value: 0 }
+            });
+        }
+        // Drain the whole buffer so the writeback restores it in FIFO order.
+        let mut buf = vec![0u8; avail];
+        let n = unsafe {
+            libc::read(
+                in_read.get(),
+                buf.as_mut_ptr().cast::<libc::c_void>(),
+                avail,
+            )
+        };
+        let n = n.host_syscall_errno()?;
+        if n <= 0 {
+            return Ok(if nonblock {
+                DispatchOutcome::errno(LINUX_EAGAIN)
+            } else {
+                DispatchOutcome::Returned { value: 0 }
+            });
+        }
+        buf.truncate(n as usize);
+        // Restore the source: write the drained bytes back via its write end. The
+        // pipe was just emptied, so a non-blocking write of `n <= capacity`
+        // completes in full and preserves order. If no write end is open (the
+        // source's writer was closed) the source is consumed — a best-effort
+        // fallback; tee01 keeps the source write end open.
+        if let Some(write_fd) = self.host_pipe_write_end_for_pipe_id(in_pipe_id) {
+            let mut off = 0usize;
+            while off < buf.len() {
+                let w = unsafe {
+                    libc::write(
+                        write_fd.get(),
+                        buf[off..].as_ptr().cast::<libc::c_void>(),
+                        buf.len() - off,
+                    )
+                };
+                match w.host_syscall_errno() {
+                    Ok(c) if c > 0 => off += c as usize,
+                    _ => break,
+                }
+            }
+        }
+        // Copy up to `count` bytes into the destination pipe.
+        let copy_len = count.min(buf.len());
+        let mut written = 0usize;
+        while written < copy_len {
+            let w = unsafe {
+                libc::write(
+                    out_write.get(),
+                    buf[written..copy_len].as_ptr().cast::<libc::c_void>(),
+                    copy_len - written,
+                )
+            };
+            match w.host_syscall_errno() {
+                Ok(c) if c > 0 => written += c as usize,
+                // A full destination with nothing copied yet is EAGAIN under
+                // SPLICE_F_NONBLOCK; otherwise report whatever landed.
+                Err(e) if e == LINUX_EAGAIN && written == 0 && nonblock => {
+                    return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
+                }
+                _ => break,
+            }
+        }
+        Ok(DispatchOutcome::Returned {
+            value: written as i64,
+        })
     }
 
     fn host_pipe_splice_staging_target(&self, fd: i32) -> Option<(i32, usize)> {
@@ -3912,7 +4195,24 @@ impl SyscallDispatcher {
                 return Ok(hit);
             }
         }
-        let resolved = self.resolve_at_path_inner(dirfd, path)?;
+        let resolved = match self.resolve_at_path_inner(dirfd, path) {
+            Ok(resolved) => resolved,
+            Err(errno) => {
+                // Linux checks search (x) permission on EACH directory as it
+                // descends, so a no-search-permission prefix reports EACCES
+                // BEFORE a deeper ENOTDIR/ENOENT is discovered. carrick resolves
+                // the whole path as host-root first (finding the deeper error),
+                // so re-run the guest DAC search check on the input's directory
+                // prefix and let an EACCES there take precedence (pathconf02:
+                // abs_path = <mode-0 tmpdir>/testfile/testfile_1). No-op for root.
+                if (errno == LINUX_ENOTDIR || errno == LINUX_ENOENT)
+                    && let Some(abs) = self.absolute_input_path(dirfd, path)
+                {
+                    self.check_search_access(&abs)?;
+                }
+                return Err(errno);
+            }
+        };
         self.check_search_access(&resolved)?;
         if let Some(key) = cache_key {
             self.fs
@@ -3920,6 +4220,25 @@ impl SyscallDispatcher {
                 .put(key, resolved.clone(), gen_at_entry);
         }
         Ok(resolved)
+    }
+
+    /// The lexical absolute form of a guest input path (anchor + path, ".."
+    /// collapsed), WITHOUT existence/symlink resolution — used to run the DAC
+    /// search-permission walk on a path whose full resolution already failed.
+    /// `None` when the dirfd anchor can't be determined (not a directory fd).
+    fn absolute_input_path(&self, dirfd: u64, path: &str) -> Option<String> {
+        let dirfd = (dirfd as i32) as i64 as u64;
+        let anchor = if Path::new(path).is_absolute() {
+            "/".to_string()
+        } else if dirfd == LINUX_AT_FDCWD {
+            self.io.cwd.read().clone()
+        } else {
+            match &*self.open_file(dirfd as i32)?.description.read() {
+                OpenDescription::Directory { path: dir, .. } => dir.clone(),
+                _ => return None,
+            }
+        };
+        Some(join_rootfs_path(&anchor, path))
     }
 
     /// Linux DAC search-permission check: resolving a path requires search
@@ -4444,6 +4763,45 @@ impl SyscallDispatcher {
         outcome
     }
 
+    /// The RLIMIT_FSIZE soft cap the guest set via setrlimit/prlimit64, or
+    /// `None` when unset / RLIM_INFINITY. A write whose bytes would land past
+    /// this offset is EFBIG + SIGXFSZ on Linux (llseek01). Stored in the
+    /// per-process override table (RLIMIT_FSIZE == resource 1).
+    fn fsize_soft_limit(&self) -> Option<u64> {
+        let ov = self
+            .proc
+            .lock()
+            .rlimit_overrides
+            .get(LINUX_RLIMIT_FSIZE as usize)
+            .copied()
+            .flatten()?;
+        (ov.rlim_cur != LINUX_RLIM_INFINITY).then_some(ov.rlim_cur)
+    }
+
+    /// Enforce RLIMIT_FSIZE for a regular-file write starting at `offset` that
+    /// would carry `len` bytes. Returns `Some(EFBIG)` (after queuing SIGXFSZ)
+    /// when the write STARTS at or beyond the soft cap — the case Linux errors
+    /// outright (a straddling write is truncated to the cap, not an error, and
+    /// is left to the backend). `None` means the write may proceed.
+    fn fsize_write_guard<M: GuestMemory>(
+        &self,
+        cx: &SyscallCtx<M>,
+        offset: u64,
+        len: usize,
+    ) -> Option<LinuxErrno> {
+        if len == 0 {
+            return None;
+        }
+        let limit = self.fsize_soft_limit()?;
+        if offset >= limit {
+            if !self.signal_is_ignored(LINUX_SIGXFSZ) {
+                self.mark_signal_pending(Self::ctx_tid(cx), LINUX_SIGXFSZ);
+            }
+            return Some(LINUX_EFBIG);
+        }
+        None
+    }
+
     /// Linux DAC: may the calling guest create/remove an entry in directory
     /// `dir_path`? It needs WRITE + EXECUTE (search) on the directory for its
     /// permission class (owner/group/other), evaluated against the
@@ -4535,10 +4893,41 @@ impl SyscallDispatcher {
             let address = address.0;
             let size =
                 usize::try_from(size).map_err(|_| DispatchError::LengthTooLarge(size))?;
+            // carrick stores the GLOBAL cwd and does NOT re-root path
+            // resolution, so getcwd(2) reports that global path verbatim in
+            // almost every case — including a cwd set by a post-chroot chdir
+            // (`chroot("/x"); chdir("/etc"); getcwd()` → "/etc", matching
+            // Linux). The ONE exception is the CVE-2018-1000001 shape realpath01
+            // exercises: the guest chroots into a SUBDIRECTORY of its cwd
+            // without chdir'ing in, leaving the cwd ABOVE the new root. Such a
+            // cwd is unreachable from the root, so getcwd returns ENOENT. A
+            // chroot("/") is a no-op and never triggers this.
+            let cwd = this.io.cwd.read().clone();
+            let cwd = match this.io.chroot_root.read().as_deref() {
+                Some(root) if root != "/" => {
+                    if cwd == root {
+                        // The guest chdir'd into the new root itself.
+                        "/".to_owned()
+                    } else if let Some(rel) = cwd.strip_prefix(&format!("{root}/")) {
+                        // cwd lies inside the root subtree.
+                        format!("/{rel}")
+                    } else if cwd == "/" || root.starts_with(&format!("{cwd}/")) {
+                        // cwd is a strict ANCESTOR of the new root: it is above
+                        // the root and unreachable (realpath01 / CVE-2018-1000001).
+                        return Ok(DispatchOutcome::errno(LINUX_ENOENT));
+                    } else {
+                        // Neither inside nor above the root: report the global
+                        // cwd verbatim (carrick does not re-root).
+                        cwd
+                    }
+                }
+                // No chroot, or the chroot("/") no-op.
+                _ => cwd,
+            };
             // The cwd is stored in the VFS layer's reversible escape form;
             // decode to the opaque path BYTES so getcwd is byte-exact for a
             // cwd that contains undecodable (non-UTF-8) components.
-            let mut bytes = crate::pathcodec::decode_to_bytes(&this.io.cwd.read());
+            let mut bytes = crate::pathcodec::decode_to_bytes(&cwd);
             bytes.push(0);
             if bytes.len() > size {
                 return Ok(DispatchOutcome::errno(LINUX_ERANGE));
@@ -4613,12 +5002,14 @@ impl SyscallDispatcher {
             if this.cred_snapshot().euid != 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EPERM));
             }
-            // The request is valid and we accept it. Per-process root
+            // The request is valid and we accept it. Full per-process root
             // enforcement inside resolve_at_path (so the guest's "/" maps under
             // the new root) is a tracked follow-up — chroot02 only needs the call
             // to succeed; chroot04 (EACCES from a no-search-permission component)
-            // and realpath01 (which relies on the root actually changing) await
-            // that enforcement plus the DAC search-permission check.
+            // awaits that plus the DAC search-permission check. We DO record the
+            // new root so getcwd can report a cwd left outside it as ENOENT
+            // (realpath01 / CVE-2018-1000001).
+            *this.io.chroot_root.write() = Some(display_rootfs_path(&metadata.path));
             Ok(DispatchOutcome::Returned { value: 0 })
 
         }
@@ -4632,7 +5023,33 @@ impl SyscallDispatcher {
             let open = open_file.description.read();
             Ok(match &*open {
                 OpenDescription::Directory { metadata, .. } => {
-                    *this.io.cwd.write() = display_rootfs_path(&metadata.path);
+                    let dir_path = display_rootfs_path(&metadata.path);
+                    // fchdir(2) requires search (execute) permission on the
+                    // directory the fd refers to. The fd may have been opened
+                    // O_RDONLY (needing only read) and the directory later
+                    // chmod'd to drop its search bit — so re-stat to observe the
+                    // CURRENT mode/owner rather than the value captured at open
+                    // time. A non-root euid lacking X on the directory gets
+                    // EACCES (fchdir03); root (euid 0) bypasses via
+                    // CAP_DAC_OVERRIDE.
+                    let creds = this.cred_snapshot();
+                    if creds.euid != 0
+                        && let Some(real) =
+                            this.fs.rootfs_vfs.overlay.real_stat(&dir_path, true)
+                        && crate::dispatch::dac_check(
+                            creds.euid,
+                            creds.egid,
+                            real.uid,
+                            real.gid,
+                            real.mode,
+                            true,
+                            LINUX_X_OK,
+                        )
+                        .is_err()
+                    {
+                        return Ok(DispatchOutcome::errno(LINUX_EACCES));
+                    }
+                    *this.io.cwd.write() = dir_path;
                     DispatchOutcome::Returned { value: 0 }
                 }
                 OpenDescription::File { .. }
@@ -5196,6 +5613,54 @@ impl SyscallDispatcher {
                     };
                     let lease = open_file.description.read().lease();
                     DispatchOutcome::Returned { value: lease as i64 }
+                }
+                // File sealing (memfd_create01). The seal set lives on the
+                // open-file description (shared across dup). F_GET_SEALS returns
+                // the current set; a non-sealable fd → EINVAL.
+                LINUX_F_GET_SEALS => {
+                    let Some(open_file) = this.open_file(fd.0) else {
+                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                    };
+                    match open_file.description.read().seals() {
+                        Some(seals) => DispatchOutcome::Returned {
+                            value: i64::from(seals),
+                        },
+                        None => DispatchOutcome::errno(LINUX_EINVAL),
+                    }
+                }
+                LINUX_F_ADD_SEALS => {
+                    let Some(open_file) = this.open_file(fd.0) else {
+                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                    };
+                    let new_seals = arg as u32;
+                    // Unknown seal bits → EINVAL (before the sealable check, as
+                    // Linux validates the arg first).
+                    if u64::from(new_seals) != arg || new_seals & !LINUX_F_SEAL_ALL != 0 {
+                        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                    }
+                    let mut open = open_file.description.write();
+                    let Some(current) = open.seals() else {
+                        // Not a sealable fd (regular file, socket, …).
+                        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                    };
+                    // F_ADD_SEALS needs the fd open for writing.
+                    if open.status_flags() & LINUX_O_ACCMODE == LINUX_O_RDONLY {
+                        return Ok(DispatchOutcome::errno(LINUX_EPERM));
+                    }
+                    // Already fully sealed → no further seals may be added.
+                    if current & LINUX_F_SEAL_SEAL != 0 {
+                        return Ok(DispatchOutcome::errno(LINUX_EPERM));
+                    }
+                    // F_SEAL_WRITE cannot be set while a shared, writable mapping
+                    // of the memfd is live (Linux → EBUSY; memfd_create01
+                    // test_share_mmap).
+                    if new_seals & LINUX_F_SEAL_WRITE != 0
+                        && this.memfd_has_writable_shared_map(&open_file.description)
+                    {
+                        return Ok(DispatchOutcome::errno(LINUX_EBUSY));
+                    }
+                    open.set_seals(Some(current | new_seals));
+                    DispatchOutcome::Returned { value: 0 }
                 }
                 // Async-I/O owner + signal (F_SETOWN/F_GETOWN, F_SETOWN_EX/
                 // F_GETOWN_EX, F_SETSIG/F_GETSIG). The owner (SIGIO/SIGURG target)
@@ -5863,6 +6328,21 @@ impl SyscallDispatcher {
                                 let len = pipe.lock().buffer.len();
                                 i32::try_from(len).unwrap_or(i32::MAX)
                             }
+                            // FIONREAD on a pipe WRITE end reports the bytes
+                            // currently buffered in the pipe (Linux). macOS
+                            // FIONREAD on a write fd returns 0, so consult the
+                            // paired read end's queued byte count instead — pipe12
+                            // reads FIONREAD on fds[1] after filling the pipe.
+                            OpenDescription::HostPipe {
+                                is_read_end: false,
+                                pipe_id,
+                                pty: None,
+                                bidirectional: false,
+                                ..
+                            } if *pipe_id != 0 => {
+                                i32::try_from(this.host_pipe_read_end_buffered_bytes(*pipe_id))
+                                    .unwrap_or(i32::MAX)
+                            }
                             OpenDescription::HostPipe { host_fd, .. }
                             | OpenDescription::HostSocket { host_fd, .. } => {
                                 let mut n: libc::c_int = 0;
@@ -6190,6 +6670,8 @@ impl SyscallDispatcher {
                 let mut open = open_file.description.write();
                 match &mut *open {
                     OpenDescription::File {
+                        base,
+                        path,
                         contents,
                         metadata,
                         writable,
@@ -6197,6 +6679,15 @@ impl SyscallDispatcher {
                     } if grow => {
                         if !*writable {
                             return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                        }
+                        // memfd seals: an allocating (non-KEEP_SIZE) fallocate is
+                        // blocked only by F_SEAL_GROW when it extends the file —
+                        // F_SEAL_WRITE does NOT block a pure grow (memfd_create01
+                        // seals WRITE then grows via fallocate successfully).
+                        if matches!(base.seals(), Some(s) if s & LINUX_F_SEAL_GROW != 0)
+                            && new_size as usize > contents.len()
+                        {
+                            return Ok(DispatchOutcome::errno(LINUX_EPERM));
                         }
                         // In-memory model (--fs memory): grow the cached bytes.
                         if new_size > crate::vfs::MAX_IN_MEMORY_FILE_SIZE {
@@ -6206,12 +6697,23 @@ impl SyscallDispatcher {
                             contents.resize(new_size as usize);
                             metadata.size = contents.len();
                         }
-                        writeback = None;
+                        // Sync the grown contents to the overlay backing so a
+                        // later fstat (which resolves the memfd's path) agrees
+                        // (memfd_create01 CHECK_MFD_GROWABLE fstats the new size).
+                        writeback = Some((path.clone(), contents.to_vec()));
                         outcome = DispatchOutcome::Returned { value: 0 };
                     }
-                    OpenDescription::File { writable, .. } => {
+                    OpenDescription::File { base, writable, .. } => {
                         if !*writable {
                             return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                        }
+                        // A hole punch modifies content, so F_SEAL_WRITE blocks it
+                        // (memfd_create01 check_mfd_non_writeable). A plain
+                        // KEEP_SIZE preallocate changes nothing and is unaffected.
+                        if mode & LINUX_FALLOC_FL_PUNCH_HOLE != 0
+                            && let Err(errno) = memfd_seal_write_check(base.seals(), 0, 0, 0)
+                        {
+                            return Ok(DispatchOutcome::errno(errno));
                         }
                         // KEEP_SIZE: don't change apparent size.
                         writeback = None;
@@ -6287,6 +6789,7 @@ impl SyscallDispatcher {
                 let mut open = open_file.description.write();
                 match &mut *open {
                     OpenDescription::File {
+                        base,
                         path,
                         contents,
                         offset,
@@ -6304,6 +6807,13 @@ impl SyscallDispatcher {
                             return Ok(DispatchOutcome::errno(LINUX_EFBIG));
                         }
                         let new_len = length as usize;
+                        // memfd resize seals: F_SEAL_SHRINK blocks shrink,
+                        // F_SEAL_GROW blocks grow (memfd_create01).
+                        if let Err(errno) =
+                            memfd_seal_resize_check(base.seals(), new_len, contents.len())
+                        {
+                            return Ok(DispatchOutcome::errno(errno));
+                        }
                         if new_len > contents.len() {
                             contents.resize(new_len);
                         } else {
@@ -6870,6 +7380,15 @@ impl SyscallDispatcher {
                     // An empty queue is EAGAIN (inotify fds are overwhelmingly
                     // used non-blocking + epoll; a true blocking wait on the
                     // backing kqueue fd is a tracked follow-up).
+                    //
+                    // NOTE: a blocking-mode read cannot be reliably satisfied on
+                    // macOS for a CROSS-PROCESS transient-event flood (inotify11:
+                    // a forked child create+unlinks 9999 files). kqueue only
+                    // reports "the directory vnode changed", and carrick's
+                    // dir-snapshot diff misses any file both created AND deleted
+                    // between two coalesced scans — so parking on the kqueue would
+                    // hang rather than deliver the IN_DELETE names. That needs a
+                    // cross-process inotify event mirror, out of scope here.
                     return Ok(match state.read_records(length) {
                         Ok(bytes) if bytes.is_empty() => DispatchOutcome::errno(LINUX_EAGAIN),
                         Ok(bytes) => {
@@ -7391,6 +7910,57 @@ impl SyscallDispatcher {
                 let n = n.host_syscall_errno()?;
                 return Ok(DispatchOutcome::Returned { value: n as i64 });
             }
+            // In-memory File (memfd / O_TMPFILE fallback): positional write into
+            // the cached contents, honoring memfd write/grow seals. Previously an
+            // unconditional EBADF (memfd_create01 CHECK_MFD_*_BY_WRITE pwrites).
+            let is_inmem_file = matches!(&*open, OpenDescription::File { .. });
+            drop(open);
+            if is_inmem_file {
+                let mut open = open_file.description.write();
+                if let OpenDescription::File {
+                    base,
+                    path,
+                    contents,
+                    writable,
+                    metadata,
+                    ..
+                } = &mut *open
+                {
+                    if !*writable {
+                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                    }
+                    let write_at = if is_append {
+                        contents.len()
+                    } else {
+                        offset as usize
+                    };
+                    if let Err(errno) = memfd_seal_write_check(
+                        base.seals(),
+                        write_at,
+                        bytes.len(),
+                        contents.len(),
+                    ) {
+                        return Ok(DispatchOutcome::errno(errno));
+                    }
+                    let mut off = write_at;
+                    if let Err(errno) = write_into_file_contents(contents, &mut off, &bytes) {
+                        return Ok(DispatchOutcome::errno(errno));
+                    }
+                    metadata.size = contents.len();
+                    let writeback = (path.clone(), contents.to_vec());
+                    drop(open);
+                    let _ = this
+                        .fs
+                        .rootfs_vfs
+                        .overlay
+                        .set_file_contents(&writeback.0, writeback.1);
+                    return Ok(DispatchOutcome::Returned {
+                        value: bytes.len() as i64,
+                    });
+                }
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            }
+            let open = open_file.description.read();
             let errno = match &*open {
                 OpenDescription::File { .. } | OpenDescription::SyntheticFile { .. } => LINUX_EBADF,
                 OpenDescription::HostFile { .. } => LINUX_EINVAL,
@@ -7856,7 +8426,7 @@ impl SyscallDispatcher {
             if count == 0 {
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
-            tee_host_passthrough(in_fd, out_fd, count, splice_flags)
+            this.host_tee(in_fd, in_pipe, out_fd, count, splice_flags)
 
         }
 
@@ -7880,6 +8450,21 @@ impl SyscallDispatcher {
             // the dead fd and "spliced" 0 bytes (LTP splice03 badfd case).
             if in_fd.0 < 0 || (in_fd.0 > 2 && this.open_file(in_fd.0).is_none()) {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            }
+            // splice(2) reads from fd_in, so a source not open for reading — an
+            // O_PATH descriptor, a write-only file, or the write end of a pipe —
+            // is EBADF, decided ahead of the pipe-vs-pipe routing (splice03's
+            // write-only fd_in, splice07's O_PATH / pipe-write-end sources).
+            if this.splice_source_not_readable(in_fd.0) {
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            }
+            // splice(2) requires at least ONE end to be a genuine pipe; a
+            // char-device HostPipe (e.g. /dev/zero) does NOT count. When neither
+            // fd is a genuine pipe the call is EINVAL, resolved BEFORE any read so
+            // a char-device or socket source is never drained (splice07
+            // /dev/zero->file & socket->file/socket, splice03 file->file).
+            if !this.is_genuine_pipe(in_fd.0) && !this.is_genuine_pipe(out_fd.0) {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             if count == 0 {
                 return Ok(DispatchOutcome::Returned { value: 0 });
@@ -7971,7 +8556,20 @@ impl SyscallDispatcher {
                             libc::MSG_DONTWAIT,
                         )
                     };
-                    let n = n.host_syscall_errno()?;
+                    let n = match n.host_syscall_errno() {
+                        Ok(v) => v,
+                        // A socket that STRUCTURALLY cannot serve as a splice
+                        // source — unconnected (ENOTCONN) or a family without a
+                        // splice_read op (EOPNOTSUPP) — is EINVAL, matching
+                        // Linux's structural check (splice07). Every OTHER recv
+                        // error is a genuine transport/nonblocking condition —
+                        // EAGAIN (netpoller), ECONNRESET, EPIPE, … — which Linux
+                        // propagates verbatim, so surface the real errno.
+                        Err(e) if e == LINUX_ENOTCONN || e == LINUX_EOPNOTSUPP => {
+                            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                        }
+                        Err(e) => return Ok(DispatchOutcome::errno(e)),
+                    };
                     if n == 0 {
                         return Ok(DispatchOutcome::Returned { value: 0 });
                     }
@@ -8005,7 +8603,20 @@ impl SyscallDispatcher {
                         libc::MSG_PEEK | libc::MSG_DONTWAIT,
                     )
                 };
-                let n = n.host_syscall_errno()?;
+                let n = match n.host_syscall_errno() {
+                    Ok(v) => v,
+                    // A socket that STRUCTURALLY cannot serve as a splice source —
+                    // unconnected (ENOTCONN) or a family without a splice_read op
+                    // (EOPNOTSUPP) — is EINVAL, matching Linux's structural check
+                    // (splice07 socket-source cases). Every OTHER recv error is a
+                    // genuine transport/nonblocking condition — EAGAIN (Go
+                    // netpoller), ECONNRESET, EPIPE, … — which Linux propagates
+                    // verbatim, so surface the real errno.
+                    Err(e) if e == LINUX_ENOTCONN || e == LINUX_EOPNOTSUPP => {
+                        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                    }
+                    Err(e) => return Ok(DispatchOutcome::errno(e)),
+                };
                 if n == 0 {
                     // EOF: the writer closed; splice reports 0 (Go stops the loop).
                     return Ok(DispatchOutcome::Returned { value: 0 });
@@ -8730,6 +9341,19 @@ impl SyscallDispatcher {
                             if base.status_flags() & LINUX_O_APPEND != 0 {
                                 unsafe { libc::lseek(host_fd.raw(), 0, libc::SEEK_END) };
                             }
+                            // RLIMIT_FSIZE: a write starting past the guest's
+                            // soft file-size cap is EFBIG + SIGXFSZ (llseek01).
+                            // The offset lives in the host kernel; read it back
+                            // (post-append reposition) only when a cap is set.
+                            if this.fsize_soft_limit().is_some() {
+                                let pos = unsafe { libc::lseek(host_fd.raw(), 0, libc::SEEK_CUR) };
+                                if pos >= 0
+                                    && let Some(errno) =
+                                        this.fsize_write_guard(cx, pos as u64, bytes.len())
+                                {
+                                    return Ok(DispatchOutcome::errno(errno));
+                                }
+                            }
                             // libc::write to the real fd: advances the
                             // kernel offset and is visible across fork.
                             return Ok(write_host_pipe_owned(
@@ -8746,6 +9370,7 @@ impl SyscallDispatcher {
                             ));
                         }
                         OpenDescription::File {
+                            base,
                             path,
                             contents,
                             offset,
@@ -8755,6 +9380,23 @@ impl SyscallDispatcher {
                         } => {
                             if !*writable {
                                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                            }
+                            // memfd write seals: F_SEAL_WRITE → EPERM; F_SEAL_GROW
+                            // → EPERM when the write would extend the file.
+                            if let Err(errno) = memfd_seal_write_check(
+                                base.seals(),
+                                *offset,
+                                bytes.len(),
+                                contents.len(),
+                            ) {
+                                return Ok(DispatchOutcome::errno(errno));
+                            }
+                            // RLIMIT_FSIZE: a write starting past the guest's
+                            // soft file-size cap is EFBIG + SIGXFSZ (llseek01).
+                            if let Some(errno) =
+                                this.fsize_write_guard(cx, *offset as u64, bytes.len())
+                            {
+                                return Ok(DispatchOutcome::errno(errno));
                             }
                             let write_offset = *offset;
                             if let Err(errno) = write_into_file_contents(contents, offset, &bytes) {
@@ -9080,6 +9722,7 @@ impl SyscallDispatcher {
                                 writeback = None;
                             }
                             OpenDescription::File {
+                                base,
                                 path,
                                 contents,
                                 offset,
@@ -9089,6 +9732,14 @@ impl SyscallDispatcher {
                             } => {
                                 if !*writable {
                                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                                }
+                                if let Err(errno) = memfd_seal_write_check(
+                                    base.seals(),
+                                    *offset,
+                                    bytes.len(),
+                                    contents.len(),
+                                ) {
+                                    return Ok(DispatchOutcome::errno(errno));
                                 }
                                 let write_offset = *offset;
                                 if let Err(errno) = write_into_file_contents(contents, offset, &bytes) {
@@ -9199,14 +9850,24 @@ impl SyscallDispatcher {
             }
 
             let path = read_guest_c_string(&*cx.memory, pathname)?;
-            // readlinkat has no AT_EMPTY_PATH flag, so an empty pathname does not
-            // name the dirfd itself — modern Linux returns ENOENT for
-            // readlink("") (readlink03), NOT the EINVAL our path lookup would
-            // otherwise raise.
-            if path.is_empty() {
-                return Ok(DispatchOutcome::errno(LINUX_ENOENT));
-            }
-            let path = this.resolve_at_path(dirfd, &path)?;
+            // An empty pathname with an O_PATH|O_NOFOLLOW dirfd naming a SYMLINK
+            // reads that link — readlinkat implicitly treats "" as AT_EMPTY_PATH
+            // for such an fd (readlinkat(2) since 2.6.39; readlinkat01 case 6).
+            // Rewrite to the fd's recorded symlink path so the readlink below runs.
+            let path = if path.is_empty() {
+                let dfd = (dirfd as i32) as i64 as u64 as i32;
+                match this.lookup_recorded_fd_open_path(dfd).filter(|p| {
+                    this.fd_is_o_path(dfd)
+                        && matches!(this.layered_lstat(p), Ok(md) if md.kind == RootFsEntryKind::Symlink)
+                }) {
+                    Some(p) => p,
+                    // A plain empty readlink (AT_FDCWD / non-symlink fd) is ENOENT
+                    // on modern Linux (readlink03), not the EINVAL a lookup raises.
+                    None => return Ok(DispatchOutcome::errno(LINUX_ENOENT)),
+                }
+            } else {
+                this.resolve_at_path(dirfd, &path)?
+            };
 
             let target = if let Some(kind) = proc_self_magic_link(&path) {
                 match kind {
@@ -9799,6 +10460,30 @@ impl SyscallDispatcher {
             {
                 return Ok(DispatchOutcome::errno(LINUX_EEXIST));
             }
+            // The new-path's parent directory must exist, be a directory, and be
+            // writable by the caller — creating a hard link writes an entry into
+            // it (link04: a missing parent component -> ENOENT, a non-directory
+            // component -> ENOTDIR, an unwritable parent under a dropped euid ->
+            // EACCES). VFS-mount targets own their own checks below.
+            if this.fs.vfs_mounts.resolve(&resolved_new).is_none() {
+                let new_parent = std::path::Path::new(&resolved_new)
+                    .parent()
+                    .map(|p| {
+                        let s = p.to_string_lossy().into_owned();
+                        if s.is_empty() { "/".to_string() } else { s }
+                    })
+                    .unwrap_or_else(|| "/".to_string());
+                match this.layered_metadata(&new_parent) {
+                    Err(_) => return Ok(DispatchOutcome::errno(LINUX_ENOENT)),
+                    Ok(md) if md.kind != RootFsEntryKind::Directory => {
+                        return Ok(DispatchOutcome::errno(LINUX_ENOTDIR));
+                    }
+                    Ok(_) => {}
+                }
+                if let Some(errno) = this.may_write(&new_parent) {
+                    return Ok(DispatchOutcome::errno(errno));
+                }
+            }
             // Linux gives the unnamed inode a name in place (same inode); carrick
             // has no shared-inode primitive for the overlay, so it materializes a
             // fresh entry from the fd's live bytes + creation mode. The O_TMPFILE
@@ -10021,9 +10706,22 @@ impl SyscallDispatcher {
             const MFD_ALLOW_SEALING: u64 = 0x0002;
             const MFD_HUGETLB: u64 = 0x0004;
             const MFD_KNOWN: u64 = MFD_CLOEXEC | MFD_ALLOW_SEALING | MFD_HUGETLB;
+            // The huge-page size selector lives in bits [26..31]
+            // (MFD_HUGE_MASK << MFD_HUGE_SHIFT); MFD_HUGE_2MB/1GB/… encode a
+            // log2 page size there. Linux only permits those bits alongside
+            // MFD_HUGETLB (mm/memfd.c): with MFD_HUGETLB set the size selector
+            // is accepted, otherwise any extra bit is EINVAL.
+            const MFD_HUGE_SHIFT: u64 = 26;
+            const MFD_HUGE_MASK: u64 = 0x3f;
+            const MFD_HUGE_BITS: u64 = MFD_HUGE_MASK << MFD_HUGE_SHIFT;
+            let allowed = if flags & MFD_HUGETLB != 0 {
+                MFD_KNOWN | MFD_HUGE_BITS
+            } else {
+                MFD_KNOWN
+            };
             // Linux validates the flags BEFORE the name (LTP memfd_create02
             // passes a valid name with bad flags and still expects EINVAL).
-            if flags & !MFD_KNOWN != 0 {
+            if flags & !allowed != 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             // The name is bounded by MFD_NAME_MAX_LEN (256 − len("memfd:") − 1 =
@@ -10053,6 +10751,19 @@ impl SyscallDispatcher {
             }
             let name = String::from_utf8_lossy(&name_bytes).into_owned();
             let path = format!("/memfd:{name}");
+            // Every memfd supports the sealing API. With MFD_ALLOW_SEALING the
+            // initial seal set is empty; without it F_SEAL_SEAL is preset so no
+            // seals can ever be added (F_ADD_SEALS → EPERM) while F_GET_SEALS
+            // still succeeds. (memfd_create01)
+            let initial_seals = if flags & MFD_ALLOW_SEALING != 0 {
+                0
+            } else {
+                LINUX_F_SEAL_SEAL
+            };
+            // A memfd is opened O_RDWR (memfd_create(2)); F_ADD_SEALS requires
+            // the description carry write access (FMODE_WRITE).
+            let mut base = OpenDescriptionBase::new(LINUX_O_RDWR);
+            base.set_seals(Some(initial_seals));
             let description = OpenDescription::File {
                 metadata: RootFsMetadata {
                     path: Path::new(&path).to_path_buf(),
@@ -10063,7 +10774,7 @@ impl SyscallDispatcher {
                 path,
                 contents: FileContents::dense(Vec::new()),
                 offset: 0,
-                base: OpenDescriptionBase::new(0),
+                base,
                 writable: true,
             };
             let fd_flags = if flags & MFD_CLOEXEC != 0 {
@@ -10265,6 +10976,27 @@ impl SyscallDispatcher {
                     crate::probes::fs_op("utimensat:resolve_err", &path, errno.get());
                     return Ok(DispatchOutcome::errno(errno));
                 }
+            };
+            // Without AT_SYMLINK_NOFOLLOW, utime()/utimensat FOLLOWS a trailing
+            // symlink to its target and updates THAT file's times: a dangling
+            // target is ENOENT and a symlink cycle is ELOOP (utime07). Only when
+            // the final component is genuinely a symlink — plain paths and
+            // synthetic /proc entries are left untouched for the checks below,
+            // and resolve_at_path already leaves the final component unfollowed.
+            let path = if flags & LINUX_AT_SYMLINK_NOFOLLOW == 0
+                && matches!(
+                    this.layered_lstat(&path),
+                    Ok(md) if md.kind == RootFsEntryKind::Symlink
+                ) {
+                match this.canonicalize_following(&path) {
+                    Ok(resolved) => resolved,
+                    Err(errno) => {
+                        crate::probes::fs_op("utimensat:follow_err", &path, errno.get());
+                        return Ok(DispatchOutcome::errno(errno));
+                    }
+                }
+            } else {
+                path
             };
             // The path must exist in the layered view, else NotFound (or a
             // no-op success for synthetic /proc paths whose times we can't

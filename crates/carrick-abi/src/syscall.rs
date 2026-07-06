@@ -112,7 +112,7 @@ pub const fn handler_for_aarch64(number: u64) -> SyscallHandler {
         85..=87 | 101..=103 | 112..=115 | 153 | 165 | 169..=171 | 179 | 261 | 266 => {
             SyscallHandler::Time
         }
-        214..=216 | 222 | 223 | 226..=233 | 283 | 284 | 425 | 426 => SyscallHandler::Memory,
+        213..=216 | 222 | 223 | 226..=233 | 283 | 284 | 425 | 426 => SyscallHandler::Memory,
         90 | 91 | 140 | 141 | 143..=152 | 158 | 159 | 166 | 174..=177 => {
             SyscallHandler::Credentials
         }
@@ -390,7 +390,7 @@ const AARCH64_SYSCALLS: &[Syscall] = &[
     syscall(210, "shutdown", "net", SupportLevel::BringUp),
     syscall(211, "sendmsg", "net", SupportLevel::BringUp),
     syscall(212, "recvmsg", "net", SupportLevel::BringUp),
-    syscall(213, "readahead", "fs", SupportLevel::Deferred),
+    syscall(213, "readahead", "fs", SupportLevel::BringUp),
     syscall(214, "brk", "mm", SupportLevel::BringUp),
     syscall(215, "munmap", "mm", SupportLevel::BringUp),
     syscall(216, "mremap", "mm", SupportLevel::BringUp),
@@ -431,8 +431,8 @@ const AARCH64_SYSCALLS: &[Syscall] = &[
     syscall(267, "syncfs", "fs", SupportLevel::BringUp),
     syscall(268, "setns", "process", SupportLevel::Deferred),
     syscall(269, "sendmmsg", "net", SupportLevel::BringUp),
-    syscall(270, "process_vm_readv", "process", SupportLevel::Deferred),
-    syscall(271, "process_vm_writev", "process", SupportLevel::Deferred),
+    syscall(270, "process_vm_readv", "process", SupportLevel::BringUp),
+    syscall(271, "process_vm_writev", "process", SupportLevel::BringUp),
     syscall(272, "kcmp", "process", SupportLevel::Deferred),
     syscall(273, "finit_module", "process", SupportLevel::Deferred),
     syscall(274, "sched_setattr", "sched", SupportLevel::Deferred),

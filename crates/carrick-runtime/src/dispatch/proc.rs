@@ -109,6 +109,8 @@ syscall_table! {
     449 => futex_waitv,
     281 => execveat,
     260 => wait4,
+    270 => process_vm_readv,
+    271 => process_vm_writev,
     277 => sys_seccomp,
     275 => sched_getattr,
     278 => getrandom,
@@ -270,32 +272,70 @@ fn sched_pid_is_live_guest_thread<M: GuestMemory>(cx: &SyscallCtx<'_, M>, pid: u
     })
 }
 
-/// True when `pid` names a live process accessible to the guest: either
-/// the calling process / its alias, a live Carrick guest thread tid, or a peer
-/// host pid the kernel confirms via `kill(pid, 0)`. Used by sched_get* queries
-/// so they can answer for any task in the system the way Linux does (with our
-/// uniform SCHED_OTHER + prio 0 model, the actual answer is the same for every
-/// valid pid; only the "does it exist?" check varies).
-fn sched_pid_exists<M: GuestMemory>(cx: &SyscallCtx<'_, M>, pid: u64) -> bool {
+/// Classification of a sched_*/priority `pid` argument relative to the caller,
+/// resolved against carrick's guest process model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SchedTarget {
+    /// 0, the caller's own pid/alias, or one of its live sibling thread tids —
+    /// operate on the calling process.
+    SelfProc,
+    /// Another live carrick guest process (EPERM for an unprivileged caller
+    /// changing its scheduling attributes).
+    OtherGuest,
+    /// No such guest task — ESRCH.
+    NotFound,
+}
+
+/// Resolve a guest-supplied sched/affinity `pid` against carrick's guest process
+/// model — the single resolver shared by every sched_* handler. Self (0, our own
+/// pid/alias, our own thread, a live sibling thread) is `SelfProc`; any other
+/// LIVE carrick guest process is `OtherGuest`; anything else is `NotFound`
+/// (ESRCH).
+///
+/// The guest names processes by ns-pid (what `getpid()` reports). We translate
+/// the ns-pid to its host pid and consult the guest process table
+/// (`is_guest_process`) rather than `kill(pid, 0)` an arbitrary host pid: a raw
+/// ns-pid probed against the host would spuriously match an unrelated host
+/// process/kthread sharing the numeric value (over-inclusive), and a valid
+/// sibling's ns-pid would never be recognised as a peer guest (under-inclusive).
+/// An ns-pid naming no member — or a host pid that is not one of carrick's own
+/// guest descendants — is `NotFound`. Identity when namespaces are off.
+fn resolve_sched_target<M: GuestMemory>(cx: &SyscallCtx<'_, M>, pid: u64) -> SchedTarget {
     if sched_pid_is_self(cx, pid) || sched_pid_is_live_guest_thread(cx, pid) {
-        return true;
+        return SchedTarget::SelfProc;
     }
     if pid == 0 || pid > i32::MAX as u64 {
-        return false;
+        return SchedTarget::NotFound;
     }
-    // The guest names processes by ns-pid (what getpid() reports), so a
-    // sched_*(getpid(), …) issued by a forked child targets the PARENT's ns-pid,
-    // not a host pid. Translate ns -> host before probing liveness, else we'd
-    // libc::kill an unrelated HOST pid that happens to share the numeric value
-    // (LTP sched_getparam01/sched_rr_get_interval01). An ns-pid that maps to no
-    // member doesn't exist (ESRCH); identity when namespaces are off.
-    let Some(host_pid) = crate::namespace::pid::ns_to_host_or_self(pid as u32) else {
-        return false;
-    };
-    unsafe {
-        libc::kill(host_pid as i32, 0) == 0
-            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    match crate::namespace::pid::ns_to_host_or_self(pid as u32) {
+        Some(host) if crate::host_proc::is_guest_process(host) => SchedTarget::OtherGuest,
+        _ => SchedTarget::NotFound,
     }
+}
+
+/// True when `pid` names a live process accessible to the guest (self or another
+/// live carrick guest). Used by the sched_get*/policy queries, which answer the
+/// same for every valid pid under our uniform SCHED_OTHER + prio 0 model; only
+/// the "does it exist?" check varies. Backed by [`resolve_sched_target`].
+fn sched_pid_exists<M: GuestMemory>(cx: &SyscallCtx<'_, M>, pid: u64) -> bool {
+    resolve_sched_target(cx, pid) != SchedTarget::NotFound
+}
+
+/// `check_same_owner` for a cross-process `sched_setparam`/`sched_setaffinity`
+/// (an already-resolved `SchedTarget::OtherGuest`). Root always may; a non-root
+/// caller may change another guest process's scheduling attributes only when its
+/// euid matches the target's published euid — the same ownership rule carrick's
+/// `kill`/`setpriority` use, NOT a root-only proxy (a SAME-OWNER non-root set
+/// must succeed: LTP sched_setparam05 / sched_setaffinity01). Returns true when
+/// the set is PERMITTED. `pid` is the guest-supplied ns-pid of the target.
+fn sched_cross_owner_ok(pid: u64, caller_euid: u32) -> bool {
+    if caller_euid == 0 {
+        return true;
+    }
+    let target_euid = crate::namespace::pid::ns_to_host_or_self(pid as u32)
+        .and_then(|host| crate::cred_ipc::read_target(host as i32))
+        .unwrap_or(0);
+    caller_euid == target_euid
 }
 
 /// True when `policy` is one of the kernel's known scheduling policies.
@@ -454,6 +494,14 @@ pub(super) struct ProcState {
     /// dispositions; Carrick needs this bit so the signal path can avoid routing
     /// those through the ordinary pending-signal queue.
     pub ptrace_traceme: bool,
+    /// `membarrier(2)` per-process registration state: a bitmask of the
+    /// expedited command bits this process has registered for (via the
+    /// matching `MEMBARRIER_CMD_REGISTER_*`). An expedited private barrier
+    /// requires prior registration — an unregistered call is EPERM. Reset to 0
+    /// in a forked child (the address-space copy carries the parent's value,
+    /// but Linux does not inherit the membarrier registration across fork, so
+    /// the fork path clears it). See `SyscallDispatcher::membarrier`.
+    pub membarrier_ready: u64,
 }
 
 /// Default affinity mask for `ncpu` logical CPUs: the low `ncpu` bits set
@@ -481,16 +529,6 @@ pub(super) fn affinity_to_bytes(mask: &[u64], out_len: usize) -> Vec<u8> {
         buf[off..off + n].copy_from_slice(&wb[..n]);
     }
     buf
-}
-
-/// Classification of a sched_*affinity `pid` argument relative to the caller.
-enum AffinityTarget {
-    /// 0 or the caller's own pid.
-    SelfProc,
-    /// Another process/thread in the guest tree.
-    OtherGuest,
-    /// No such guest task — ESRCH.
-    NotFound,
 }
 
 /// Build a `LinuxRusage` carrying just CPU time (user/system microseconds);
@@ -568,6 +606,7 @@ impl ProcState {
             affinity: default_affinity(crate::host_facts::logical_cpu_count()),
             tso_enabled: false,
             ptrace_traceme: false,
+            membarrier_ready: 0,
         }
     }
 
@@ -616,6 +655,17 @@ impl SyscallDispatcher {
         proc.child_subreaper = 0;
         proc.child_subreaper_owner = 0;
         proc.timerslack_default = proc.timerslack;
+        // Linux does not inherit membarrier(2) registration across fork; the
+        // child starts unregistered (LTP membarrier01 forks precisely to get a
+        // fresh, unregistered process for each subtest).
+        proc.membarrier_ready = 0;
+        // Interval timers (setitimer/alarm) are NOT inherited across fork
+        // (POSIX): the child starts with every ITIMER_* disarmed. The neutral
+        // itimer-core delivery state is cleared separately in the host-signal
+        // fork reinit; this clears the dispatcher's own record so a child
+        // getitimer reports 0 rather than the parent's inherited remaining time
+        // (LTP alarm07).
+        proc.itimers = [None, None, None];
     }
 
     pub(crate) fn subreaper_for_fork_child(&self) -> u32 {
@@ -693,32 +743,6 @@ impl SyscallDispatcher {
         self.seccomp.install_strict();
         self.disable_identity_syscall_shim(memory);
         DispatchOutcome::Returned { value: 0 }
-    }
-
-    /// Resolve an affinity pid argument. 0 or our own pid is `SelfProc`; a live
-    /// sibling guest thread is also `SelfProc` (carrick keeps a single
-    /// per-process affinity mask, so a sibling's affinity IS the process
-    /// affinity — and `sched_getaffinity`/`setaffinity` accept a thread tid,
-    /// like sched_getscheduler/getparam already do); any other thread/process
-    /// in the guest tree is `OtherGuest`; anything else is `NotFound` (ESRCH).
-    fn resolve_affinity_target<M: GuestMemory>(
-        &self,
-        cx: &SyscallCtx<M>,
-        pid: u64,
-    ) -> AffinityTarget {
-        if pid == 0
-            || pid == std::process::id() as u64
-            || cx.thread.as_ref().is_some_and(|t| {
-                t.registry
-                    .is_live(crate::thread::ThreadId::from_guest_supplied_tid(pid as i32))
-            })
-        {
-            AffinityTarget::SelfProc
-        } else if crate::host_proc::is_guest_process(pid as u32) {
-            AffinityTarget::OtherGuest
-        } else {
-            AffinityTarget::NotFound
-        }
     }
 
     /// Allocate a pidfd for `host_pid`. Shared by `pidfd_open` and the
@@ -1442,7 +1466,7 @@ impl SyscallDispatcher {
 
             // Resolve the target BEFORE borrowing cx.memory (resolve reads
             // cx.thread; the mutable memory borrow below would otherwise alias).
-            if matches!(this.resolve_affinity_target(cx, pid), AffinityTarget::NotFound) {
+            if resolve_sched_target(cx, pid) == SchedTarget::NotFound {
                 return Ok(DispatchOutcome::errno(LINUX_ESRCH));
             }
             let memory = &mut *cx.memory;
@@ -1464,11 +1488,13 @@ impl SyscallDispatcher {
 
             let read_len = size.min(128);
             let bytes = memory.read_bytes(address.0, read_len)?;
-            let target = this.resolve_affinity_target(cx, pid);
-            if matches!(target, AffinityTarget::NotFound) {
+            let target = resolve_sched_target(cx, pid);
+            if target == SchedTarget::NotFound {
                 return Ok(DispatchOutcome::errno(LINUX_ESRCH));
             }
-            if matches!(target, AffinityTarget::OtherGuest) && this.creds.lock().euid != 0 {
+            if target == SchedTarget::OtherGuest
+                && !sched_cross_owner_ok(pid, this.cred_snapshot().euid)
+            {
                 return Ok(DispatchOutcome::errno(LINUX_EPERM));
             }
             let ncpu = crate::host_facts::logical_cpu_count();
@@ -1482,7 +1508,7 @@ impl SyscallDispatcher {
             if effective.iter().all(|w| *w == 0) {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            if matches!(target, AffinityTarget::SelfProc) {
+            if target == SchedTarget::SelfProc {
                 this.proc.lock().affinity = effective;
             }
             Ok(DispatchOutcome::Returned { value: 0 })
@@ -1606,17 +1632,28 @@ impl SyscallDispatcher {
 
         /// `sched_setparam(pid, &param)`: change just the priority. For our
         /// SCHED_OTHER-only model the only valid priority is 0; anything else
-        /// is EINVAL (matches Linux for SCHED_NORMAL/OTHER/BATCH/IDLE).
+        /// is EINVAL (matches Linux for SCHED_NORMAL/OTHER/BATCH/IDLE). Changing
+        /// ANOTHER process's params requires `check_same_owner` (or root): a
+        /// DIFFERENT-owner non-root caller is refused with EPERM (LTP
+        /// sched_setparam05: a `nobody` child calling `sched_setparam(getppid(),
+        /// …)` on its root parent), but a SAME-owner non-root cross-process set
+        /// succeeds — hence the ownership check, not a root-only proxy.
         fn sched_setparam(this, cx, pid: u64, address: GuestPtr) {
             if (pid as i32) < 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            if !sched_pid_exists(cx, pid) {
+            let target = resolve_sched_target(cx, pid);
+            if target == SchedTarget::NotFound {
                 return Ok(DispatchOutcome::errno(LINUX_ESRCH));
             }
             let prio = sched_read_param_priority(cx, address)?;
             if prio != 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
+            if target == SchedTarget::OtherGuest
+                && !sched_cross_owner_ok(pid, this.cred_snapshot().euid)
+            {
+                return Ok(DispatchOutcome::errno(LINUX_EPERM));
             }
             Ok(DispatchOutcome::Returned { value: 0 })
         }
@@ -2300,7 +2337,16 @@ impl SyscallDispatcher {
                     // its ns-local pid (§5.3). Identity when namespaces are off.
                     let ns_si_pid =
                         crate::namespace::pid::host_to_ns_or_self(carrick_portable::si_pid(&info) as u32) as i32;
-                    build_sigchld_siginfo(ns_si_pid, carrick_portable::si_uid(&info), info.si_code, carrick_portable::si_status(&info))
+                    // macOS reports CLD_KILLED for a signal death (the host never
+                    // dumps core); Linux reports CLD_DUMPED when the child died by
+                    // a core-dumping signal with core dumps enabled. Synthesize it
+                    // (mirrors the wait4 wstatus 0x80 bit) so waitid(WEXITED)
+                    // matches — waitid10: a SIGFPE child → CLD_DUMPED.
+                    let si_code = this.core_dumped_si_code(
+                        info.si_code,
+                        carrick_portable::si_status(&info),
+                    );
+                    build_sigchld_siginfo(ns_si_pid, carrick_portable::si_uid(&info), si_code, carrick_portable::si_status(&info))
                 };
                 let memory = &mut *cx.memory;
                 memory.write_bytes(infop_addr.0, &bytes)?;
@@ -2628,6 +2674,13 @@ impl SyscallDispatcher {
         /// the guest issues execveat, not execve, so without this it was ENOSYS).
         fn execveat(this, cx, dirfd: u64, pathname_addr: GuestPtr, argv_addr: GuestPtr, envp_addr: GuestPtr, flags: u64) {
             let memory = &*cx.memory;
+            // execveat(2) accepts only AT_EMPTY_PATH and AT_SYMLINK_NOFOLLOW; any
+            // other flag bit is EINVAL — validated BEFORE touching the fd/path so a
+            // malformed call never executes the target (execveat02 passes flags=-1).
+            const EXECVEAT_VALID_FLAGS: u64 = LINUX_AT_EMPTY_PATH | LINUX_AT_SYMLINK_NOFOLLOW;
+            if flags & !EXECVEAT_VALID_FLAGS != 0 {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
             let path_str = read_guest_c_string(memory, pathname_addr.0)?;
             let path = if flags & LINUX_AT_EMPTY_PATH != 0 && path_str.is_empty() {
                 // fexecve: dirfd IS the executable's open fd. Recover the guest
@@ -2642,7 +2695,18 @@ impl SyscallDispatcher {
                     None => return Ok(DispatchOutcome::errno(LINUX_EBADF)),
                 }
             } else {
-                this.resolve_at_path(dirfd, &path_str)?
+                let resolved = this.resolve_at_path(dirfd, &path_str)?;
+                // AT_SYMLINK_NOFOLLOW: if the FINAL component is a symlink, the
+                // kernel refuses to follow it and fails with ELOOP (execveat02).
+                if flags & LINUX_AT_SYMLINK_NOFOLLOW != 0
+                    && this
+                        .layered_lstat(&resolved)
+                        .map(|m| m.kind == RootFsEntryKind::Symlink)
+                        .unwrap_or(false)
+                {
+                    return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ELOOP));
+                }
+                resolved
             };
             let argv = read_guest_string_array_bytes(memory, argv_addr.0)?;
             let env = read_guest_string_array_bytes(memory, envp_addr.0)?;
@@ -2848,6 +2912,171 @@ impl SyscallDispatcher {
         fn sys_rseq(this, cx) {
             Ok(this.rseq())
         }
+
+        fn process_vm_readv(
+            this, cx,
+            pid: Pid,
+            local_iov: GuestPtr, liovcnt: u64,
+            remote_iov: GuestPtr, riovcnt: u64,
+            flags: u64,
+        ) {
+            this.process_vm_rw(cx, pid, local_iov, liovcnt, remote_iov, riovcnt, flags, true)
+        }
+
+        fn process_vm_writev(
+            this, cx,
+            pid: Pid,
+            local_iov: GuestPtr, liovcnt: u64,
+            remote_iov: GuestPtr, riovcnt: u64,
+            flags: u64,
+        ) {
+            this.process_vm_rw(cx, pid, local_iov, liovcnt, remote_iov, riovcnt, flags, false)
+        }
+    }
+}
+
+/// Copy the flattened byte stream from `src` iovecs into `dst` iovecs WITHIN a
+/// single guest address space — the `process_vm_readv`/`process_vm_writev` case
+/// where the caller IS the target (`pid == getpid()`). Walks both iovec lists
+/// with independent cursors, transferring `min(remaining_src, remaining_dst)`
+/// per step and stopping when either side is exhausted (Linux transfers the
+/// shorter of the two flattened lengths). The gated `read_bytes`/`write_bytes`
+/// enforce PROT_NONE / out-of-bounds, so a bad `iov_base` faults here. Returns
+/// the byte count copied, or `EFAULT` when the FIRST access faults (once any
+/// byte has moved Linux returns the partial count, not an error).
+fn process_vm_copy_self<M: GuestMemory>(
+    memory: &mut M,
+    src: &[LinuxIovec],
+    dst: &[LinuxIovec],
+) -> Result<i64, LinuxErrno> {
+    // Bound a single read/write allocation; a large transfer streams in chunks.
+    const CHUNK: u64 = 1 << 20;
+    let mut copied: u64 = 0;
+    let (mut si, mut so, mut di, mut dofs) = (0usize, 0u64, 0usize, 0u64);
+    let fault = |copied: u64| -> Result<i64, LinuxErrno> {
+        if copied == 0 {
+            Err(LINUX_EFAULT)
+        } else {
+            Ok(copied as i64)
+        }
+    };
+    loop {
+        while si < src.len() && so >= src[si].iov_len {
+            si += 1;
+            so = 0;
+        }
+        while di < dst.len() && dofs >= dst[di].iov_len {
+            di += 1;
+            dofs = 0;
+        }
+        if si >= src.len() || di >= dst.len() {
+            break;
+        }
+        let want = (src[si].iov_len - so)
+            .min(dst[di].iov_len - dofs)
+            .min(CHUNK);
+        let want_usize = want as usize;
+        if want_usize == 0 {
+            break;
+        }
+        let src_addr = src[si].iov_base.wrapping_add(so);
+        let dst_addr = dst[di].iov_base.wrapping_add(dofs);
+        let bytes = match memory.read_bytes(src_addr, want_usize) {
+            Ok(bytes) => bytes,
+            Err(_) => return fault(copied),
+        };
+        if memory.write_bytes(dst_addr, &bytes).is_err() {
+            return fault(copied);
+        }
+        copied += want;
+        so += want;
+        dofs += want;
+    }
+    Ok(copied as i64)
+}
+
+impl SyscallDispatcher {
+    /// Shared body of `process_vm_readv` (270, `is_read=true`) and
+    /// `process_vm_writev` (271, `is_read=false`): transfer between the caller's
+    /// `local_iov` and the target process's `remote_iov`. readv copies
+    /// remote→local, writev copies local→remote.
+    ///
+    /// Validation mirrors the kernel's `process_vm_rw`: `flags != 0` → EINVAL
+    /// (only 0 is defined); both iovec arrays are imported up front so an
+    /// `iov_len` overflow → EINVAL and a bad array pointer → EFAULT before any
+    /// copy; the target `pid` is resolved against carrick's guest process model
+    /// (no such task → ESRCH); an unprivileged caller that does not own the
+    /// target → EPERM (ptrace_may_access).
+    ///
+    /// When the target is the CALLER (`pid == getpid()`, the LTP process_vm01
+    /// success cases and every setup sanity probe) the transfer runs entirely
+    /// within this guest's address space. A privileged cross-guest transfer
+    /// (LTP process_vm_readv02/03, process_vm_writev02) would require reading a
+    /// PEER HVF VM's private RAM — carrick has no cross-VM VA translation, so the
+    /// peer address space is reported inaccessible (EFAULT).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn process_vm_rw<M: GuestMemory>(
+        &self,
+        cx: &mut SyscallCtx<M>,
+        pid: Pid,
+        local_iov: GuestPtr,
+        liovcnt: u64,
+        remote_iov: GuestPtr,
+        riovcnt: u64,
+        flags: u64,
+        is_read: bool,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        // Only flags == 0 is defined; anything else is EINVAL (process_vm01
+        // test_flags exercises -INT_MAX/-1/1/INT_MAX).
+        if flags != 0 {
+            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+        }
+        let liovcnt = usize::try_from(liovcnt).map_err(|_| LINUX_EINVAL)?;
+        let riovcnt = usize::try_from(riovcnt).map_err(|_| LINUX_EINVAL)?;
+        // Import + validate both vectors: iov_len overflow → EINVAL, bad array
+        // pointer → EFAULT (read_iovecs). Read-only borrow ends with the vecs.
+        let local = read_iovecs(&*cx.memory, local_iov.0, liovcnt)?;
+        let remote = read_iovecs(&*cx.memory, remote_iov.0, riovcnt)?;
+
+        // process_vm_readv/writev do a plain task lookup: pid 0 names NO task
+        // (unlike sched_*, where 0 means "the calling process"). Linux returns
+        // ESRCH and transfers nothing. resolve_sched_target inherits the sched_*
+        // 0-is-self rule, so screen pid 0 out here before consulting it.
+        if pid.raw() == 0 {
+            return Ok(DispatchOutcome::errno(LINUX_ESRCH));
+        }
+
+        match resolve_sched_target(cx, pid.raw() as u64) {
+            SchedTarget::NotFound => Ok(DispatchOutcome::errno(LINUX_ESRCH)),
+            SchedTarget::SelfProc => {
+                let (src, dst) = if is_read {
+                    (&remote, &local)
+                } else {
+                    (&local, &remote)
+                };
+                match process_vm_copy_self(&mut *cx.memory, src, dst) {
+                    Ok(value) => Ok(DispatchOutcome::Returned { value }),
+                    Err(errno) => Ok(DispatchOutcome::errno(errno)),
+                }
+            }
+            SchedTarget::OtherGuest => {
+                // ptrace_may_access(PTRACE_MODE_ATTACH_REALCREDS): a non-root
+                // caller that does not own the target is denied (process_vm01
+                // test_invalid_perm drops to `nobody` then reads root's pid).
+                // carrick models CAP_SYS_PTRACE as euid 0.
+                let caller_euid = self.cred_snapshot().euid;
+                let target_euid = crate::namespace::pid::ns_to_host_or_self(pid.raw() as u32)
+                    .and_then(|host| crate::cred_ipc::read_target(host as i32))
+                    .unwrap_or(0);
+                if caller_euid != 0 && caller_euid != target_euid {
+                    return Ok(DispatchOutcome::errno(LINUX_EPERM));
+                }
+                // The peer runs in a separate host process with its own HVF VM;
+                // carrick cannot translate/read a peer guest's private VA space,
+                // so its address range is inaccessible.
+                Ok(DispatchOutcome::errno(LINUX_EFAULT))
+            }
+        }
     }
 }
 
@@ -3039,6 +3268,44 @@ fn clear_unrequested_waitid_state(info: &mut libc::siginfo_t, options: LinuxWait
     }
     *info = unsafe { std::mem::zeroed() };
     false
+}
+
+impl SyscallDispatcher {
+    /// Promote a `waitid` `CLD_KILLED` to `CLD_DUMPED` when the child died by a
+    /// core-dumping signal AND core dumps are enabled (RLIMIT_CORE soft > 0).
+    /// macOS's `waitid` never sets CLD_DUMPED (the host doesn't dump core), but
+    /// Linux does — the same "died in a core-dumping way" contract the wait4
+    /// wstatus 0x80 bit encodes. `host_si_status` is the host signal number.
+    fn core_dumped_si_code(&self, si_code: i32, host_si_status: i32) -> i32 {
+        const CLD_KILLED: i32 = 2;
+        const CLD_DUMPED: i32 = 3;
+        if si_code != CLD_KILLED {
+            return si_code;
+        }
+        let linux_sig = crate::host_signal::host_to_linux_signum(host_si_status);
+        if core_dump_bit_for(linux_sig) != 0 && self.rlimit_core_enabled() {
+            CLD_DUMPED
+        } else {
+            si_code
+        }
+    }
+
+    /// True iff RLIMIT_CORE's soft limit is nonzero (core dumps are produced).
+    /// The carrick default is RLIM_INFINITY; a `setrlimit(RLIMIT_CORE, 0)` in the
+    /// override table disables it.
+    fn rlimit_core_enabled(&self) -> bool {
+        match self
+            .proc
+            .lock()
+            .rlimit_overrides
+            .get(crate::linux_abi::LINUX_RLIMIT_CORE as usize)
+            .copied()
+            .flatten()
+        {
+            Some(limit) => limit.rlim_cur != 0,
+            None => true,
+        }
+    }
 }
 
 fn waitid_state_requested(si_code: i32, options: LinuxWaitOptions) -> bool {
@@ -3296,5 +3563,90 @@ mod wait_status_tests {
         let status = translate_child_wait_status(host_pid, exited(5));
         assert!(libc::WIFEXITED(status), "status {status:#x}");
         assert_eq!(libc::WEXITSTATUS(status), 5);
+    }
+}
+
+#[cfg(test)]
+mod process_vm_copy_tests {
+    use super::*;
+
+    const BASE: u64 = 0x10000;
+    const SRC: u64 = 0x10000;
+    const DST: u64 = 0x10800;
+
+    /// A LinearMemory seeded so `[SRC, SRC+256)` holds the ramp `i % 256` and the
+    /// destination window is zero.
+    fn seeded_memory() -> LinearMemory {
+        let mut memory = LinearMemory::new(BASE, vec![0u8; 0x1000]);
+        let ramp: Vec<u8> = (0..256u32).map(|i| i as u8).collect();
+        memory.write_bytes(SRC, &ramp).unwrap();
+        memory
+    }
+
+    /// Scatter: one 100-byte source spread across three uneven destination
+    /// iovecs. Every byte lands contiguously and the count is the transferred
+    /// total (readv02/03 use exactly this many-to-few / few-to-many shape).
+    #[test]
+    fn scatter_one_source_into_three_dests() {
+        let mut memory = seeded_memory();
+        let src = [LinuxIovec::new(SRC, 100)];
+        let dst = [
+            LinuxIovec::new(DST, 30),
+            LinuxIovec::new(DST + 0x40, 30),
+            LinuxIovec::new(DST + 0x80, 40),
+        ];
+        let n = process_vm_copy_self(&mut memory, &src, &dst).unwrap();
+        assert_eq!(n, 100);
+        assert_eq!(
+            memory.read_bytes(DST, 30).unwrap(),
+            (0..30u8).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            memory.read_bytes(DST + 0x40, 30).unwrap(),
+            (30..60u8).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            memory.read_bytes(DST + 0x80, 40).unwrap(),
+            (60..100u8).collect::<Vec<_>>()
+        );
+    }
+
+    /// The transfer stops at the shorter flattened length: 100 source bytes into
+    /// a 50-byte destination copies 50 (Linux `min(local, remote)`).
+    #[test]
+    fn copies_only_the_shorter_length() {
+        let mut memory = seeded_memory();
+        let src = [LinuxIovec::new(SRC, 100)];
+        let dst = [LinuxIovec::new(DST, 50)];
+        let n = process_vm_copy_self(&mut memory, &src, &dst).unwrap();
+        assert_eq!(n, 50);
+        assert_eq!(
+            memory.read_bytes(DST, 50).unwrap(),
+            (0..50u8).collect::<Vec<_>>()
+        );
+    }
+
+    /// A source address outside the backing faults before any byte moves — the
+    /// process_vm01 `iov_base = -1` / PROT_NONE cases must be EFAULT, not a
+    /// zero-length success.
+    #[test]
+    fn first_access_fault_is_efault() {
+        let mut memory = seeded_memory();
+        let src = [LinuxIovec::new(0x9_0000, 10)];
+        let dst = [LinuxIovec::new(DST, 10)];
+        assert_eq!(
+            process_vm_copy_self(&mut memory, &src, &dst),
+            Err(LINUX_EFAULT)
+        );
+    }
+
+    /// Zero total on either side is a valid 0-byte transfer (the setup sanity
+    /// probe `process_vm_readv(getpid(), NULL, 0, NULL, 0, 0)`), never EFAULT.
+    #[test]
+    fn empty_vectors_transfer_zero_bytes() {
+        let mut memory = seeded_memory();
+        assert_eq!(process_vm_copy_self(&mut memory, &[], &[]).unwrap(), 0);
+        let src = [LinuxIovec::new(SRC, 100)];
+        assert_eq!(process_vm_copy_self(&mut memory, &src, &[]).unwrap(), 0);
     }
 }

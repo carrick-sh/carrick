@@ -17,7 +17,7 @@ pub(crate) fn load_execve_image(
     argv: Vec<Vec<u8>>,
     env: Vec<Vec<u8>>,
 ) -> Result<AddressSpace, LinuxErrno> {
-    use crate::linux_abi::LINUX_ENOENT;
+    use crate::linux_abi::{LINUX_ENOENT, LINUX_ENOEXEC};
     let argv = if argv.is_empty() {
         vec![path.as_bytes().to_vec()]
     } else {
@@ -27,9 +27,16 @@ pub(crate) fn load_execve_image(
     // Absolutize a RELATIVE execve target against the guest cwd before any
     // layer lookup (Linux resolves `execve("b/foo")` against the caller's cwd;
     // carrick's layers key on absolute guest paths). See `resolve_exec_path`.
-    // Then resolve any `#!` shebang script to its interpreter (shared with the
-    // initial entrypoint load via `resolve_shebang`).
-    let (path, argv) = resolve_shebang(dispatcher, dispatcher.resolve_exec_path(path), argv)?;
+    // Validate the target the way the kernel does BEFORE reading the image:
+    // resolution errnos (ENOENT/ENOTDIR/ELOOP/ENAMETOOLONG/EACCES) plus execute
+    // permission on the final file. Done on the ABSOLUTIZED path before shebang
+    // resolution so a non-executable `#!` script is EACCES, not a followed
+    // interpreter (execve03/execve02). Then resolve any `#!` shebang script to
+    // its interpreter (shared with the initial entrypoint load via
+    // `resolve_shebang`).
+    let abs_path = dispatcher.resolve_exec_path(path);
+    dispatcher.check_exec_target(&abs_path)?;
+    let (path, argv) = resolve_shebang(dispatcher, abs_path, argv)?;
 
     // Read the main binary AND resolve its interpreter OVERLAY-FIRST via
     // `read_exec_file`, so execve works for guest-created/overlay binaries
@@ -67,10 +74,13 @@ pub(crate) fn load_execve_image(
         }
         Some(Err(errno)) => return Err(errno),
     };
+    // A file that resolved and is executable but isn't a valid ELF (and isn't a
+    // `#!` script / Rosetta x86 target handled above) is ENOEXEC — "Exec format
+    // error" — not ENOENT (execve03).
     let raw = AddressSpace::load_elf_bytes_with_reader(&raw_bytes, &|p| {
         dispatcher.read_exec_file(p).or_else(|| host_read(p))
     })
-    .map_err(|_| LINUX_ENOENT)?;
+    .map_err(|_| LINUX_ENOEXEC)?;
     // Mirror the boot builder: the syscall shim installs the identity-fast-path
     // EL1 vectors + the kernel-hole identity page (see finish_and_run_image).
     let vectors_and_id = |a: AddressSpace| -> Result<AddressSpace, AddressSpaceError> {
