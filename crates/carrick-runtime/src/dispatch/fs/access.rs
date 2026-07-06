@@ -213,6 +213,59 @@ impl SyscallDispatcher {
         .err()
     }
 
+    /// Validate an `execve(2)`/`execveat(2)` target the way the kernel does
+    /// BEFORE it reads the image: resolve the path (surfacing ENOENT / ENOTDIR /
+    /// ELOOP / ENAMETOOLONG and the no-search-permission EACCES) and require
+    /// execute permission on the final file. Called before shebang resolution so
+    /// that a non-executable `#!` script is EACCES rather than a followed
+    /// interpreter (matching Linux). The ELF/shebang FORMAT check (ENOEXEC) is
+    /// left to image-load time. (execve03 / execveat02 / execve02.)
+    pub(crate) fn check_exec_target(&self, path: &str) -> Result<(), LinuxErrno> {
+        // Existence via the SAME layered reader the loader uses, so a symlinked
+        // executable (busybox/coreutils) is followed identically here. A bare
+        // RunElf boot may additionally read the literal host path.
+        let host_fallback = self.exec_host_fs_fallback();
+        let exists = self.read_exec_file(path).is_some()
+            || (host_fallback
+                && std::fs::metadata(path)
+                    .map(|m| m.is_file())
+                    .unwrap_or(false));
+        if exists {
+            return self.exec_access_errno(path).map_or(Ok(()), Err);
+        }
+        // Missing/unreadable: resolve_at_path distinguishes ENOTDIR (a
+        // non-directory path component), ELOOP (a symlink cycle) and
+        // ENAMETOOLONG (an over-long path/component). A path that resolves but
+        // whose leaf is simply absent is ENOENT.
+        match self.resolve_at_path(LINUX_AT_FDCWD, path) {
+            Ok(_) => Err(LINUX_ENOENT),
+            Err(errno) => Err(errno),
+        }
+    }
+
+    /// Execute-permission (`X_OK`) DAC check on an EXISTING exec target. Uses the
+    /// backend's real owner+mode (`--fs host`); falls back to the layered
+    /// metadata mode + tracked owner (`--fs memory`). Even root fails a regular
+    /// file that carries NO execute bit — `dac_check` encodes the one case where
+    /// `CAP_DAC_OVERRIDE` does not apply (`mode & 0o111 == 0 -> EACCES`).
+    fn exec_access_errno(&self, path: &str) -> Option<LinuxErrno> {
+        let creds = self.cred_snapshot();
+        if let Some(real) = self.fs.rootfs_vfs.overlay.real_stat(path, true) {
+            let is_dir = matches!(real.kind, RootFsEntryKind::Directory);
+            return crate::dispatch::dac_check(
+                creds.euid, creds.egid, real.uid, real.gid, real.mode, is_dir, LINUX_X_OK,
+            )
+            .err();
+        }
+        let md = self.layered_metadata(path).ok()?;
+        let is_dir = md.kind == RootFsEntryKind::Directory;
+        let (uid, gid) = self.fs.rootfs_vfs.overlay.get_owner(path).unwrap_or((0, 0));
+        crate::dispatch::dac_check(
+            creds.euid, creds.egid, uid, gid, md.mode, is_dir, LINUX_X_OK,
+        )
+        .err()
+    }
+
     /// Verify the caller has search (X) permission on every ancestor directory
     /// of `path`. Returns `Some(EACCES)` on the first non-searchable parent.
     fn dac_ancestors_searchable(&self, path: &str, uid: u32, gid: u32) -> Option<LinuxErrno> {
