@@ -298,18 +298,18 @@ impl GuestVmBackend for HvfAarch64Vmm {
         // `is_forked_child() || is_forked_guest_process()`, so it NEVER runs on
         // the parent), BEFORE `_exit` skips Rust drops.
         //
-        // ATOMIC PERMIT PATH (CARRICK_HVF_ATOMIC_PERMIT=1): cooperatively free the
-        // permit slots THIS process registered so occupancy returns to baseline
-        // immediately, rather than waiting for the root EVFILT_PROC reaper's
-        // backstop — the fast path that shrinks the fork/exec churn window.
-        // Idempotent with `vcpu_destroyed` and the supervisor (generation-guarded)
-        // and it drains only THIS process's local token map, so it cannot free the
-        // parent's shared slots.
+        // ATOMIC PERMIT PATH (the default): cooperatively free the permit slots
+        // THIS process registered so occupancy returns to baseline immediately,
+        // rather than waiting for the root EVFILT_PROC reaper's backstop — the
+        // fast path that shrinks the fork/exec churn window. Idempotent with
+        // `vcpu_destroyed` and the supervisor (generation-guarded) and it drains
+        // only THIS process's local token map, so it cannot free the parent's
+        // shared slots.
         //
-        // DEFAULT FLOCK PATH: a no-op — the flock permit is fd-lifetime-bound, and
-        // HVF's VM is swapped/leaked-until-exit (ManuallyDrop discipline), so there
-        // is nothing to release on a forked-child `_exit`. Matches the historical
-        // no-op byte-for-byte.
+        // FLOCK FALLBACK PATH (CARRICK_HVF_ATOMIC_PERMIT=0): a no-op — the flock
+        // permit is fd-lifetime-bound, and HVF's VM is swapped/leaked-until-exit
+        // (ManuallyDrop discipline), so there is nothing to release on a
+        // forked-child `_exit`. Matches the historical no-op byte-for-byte.
         let _ = crate::trap::cooperative_release_atomic_permit();
     }
 
