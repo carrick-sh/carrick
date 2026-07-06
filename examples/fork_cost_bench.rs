@@ -1,9 +1,17 @@
 //! Isolate macOS fork() cost as a function of the process's mapped footprint.
-//! carrick's per-fork+exec overhead (~10.8ms) is dominated by the fork-pre ->
-//! fork-post window; HVF VM lifecycle is <0.2ms, so the suspect is libc::fork()
-//! of a process carrying the guest address space. This bench times fork()
-//! (child _exits immediately, parent waitpid) with 0, then N large touched
-//! mappings, to see how fork cost scales with resident mapped memory.
+//! This bench times fork() alone (child _exits immediately, parent waitpid) with
+//! 0, then N large touched mappings, to see how fork cost scales with resident
+//! mapped memory. It measures ONE primitive (host libc::fork of a process
+//! carrying a large address space); it is NOT the end-to-end guest process-spawn
+//! cost.
+//!
+//! NOTE: the historical "~10.8ms per fork+exec" claim once carried here is
+//! SUPERSEDED and disproven — current measurements show host fork() ~0.5ms flat,
+//! full HVF VM lifecycle 0.061ms, cold vcpu entry 0.022ms. The authoritative,
+//! reproducible end-to-end fork/exec process-spawn number now lives in the
+//! differential perf gate: conformance-probes/src/bin/perf_fork_exec.rs
+//! (workload "fork_exec", metric fork_exec_p50_us), run via `just bench`. Keep
+//! this example only as a fork-primitive isolator, not a source of conclusions.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 #[cfg(unix)]
