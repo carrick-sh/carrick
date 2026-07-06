@@ -6187,6 +6187,21 @@ impl SyscallDispatcher {
                                 let len = pipe.lock().buffer.len();
                                 i32::try_from(len).unwrap_or(i32::MAX)
                             }
+                            // FIONREAD on a pipe WRITE end reports the bytes
+                            // currently buffered in the pipe (Linux). macOS
+                            // FIONREAD on a write fd returns 0, so consult the
+                            // paired read end's queued byte count instead — pipe12
+                            // reads FIONREAD on fds[1] after filling the pipe.
+                            OpenDescription::HostPipe {
+                                is_read_end: false,
+                                pipe_id,
+                                pty: None,
+                                bidirectional: false,
+                                ..
+                            } if *pipe_id != 0 => {
+                                i32::try_from(this.host_pipe_read_end_buffered_bytes(*pipe_id))
+                                    .unwrap_or(i32::MAX)
+                            }
                             OpenDescription::HostPipe { host_fd, .. }
                             | OpenDescription::HostSocket { host_fd, .. } => {
                                 let mut n: libc::c_int = 0;
