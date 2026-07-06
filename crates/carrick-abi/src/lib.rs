@@ -2909,6 +2909,7 @@ pub const LINUX_RLIM_INFINITY: u64 = u64::MAX;
 // are named; a resource >= RLIM_NLIMITS is EINVAL.
 pub const LINUX_RLIMIT_FSIZE: u64 = 1;
 pub const LINUX_RLIMIT_DATA: u64 = 2;
+pub const LINUX_RLIMIT_CORE: u64 = 4;
 pub const LINUX_RLIMIT_STACK: u64 = 3;
 pub const LINUX_RLIMIT_NPROC: u64 = 6;
 pub const LINUX_RLIMIT_NOFILE: u64 = 7;
