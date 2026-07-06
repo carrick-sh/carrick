@@ -1373,6 +1373,16 @@ impl SyscallDispatcher {
             if !is_valid_signum(signum) {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
+            // tgid-membership: `tid` must belong to thread group `tgid`. A guest
+            // process is one host process whose threads all share tgid == the
+            // process pid, and that is the only thread group tgkill can reach.
+            // So `tgid` must name THIS process — a (tgid, tid) pair where tid is
+            // a live thread but is NOT in tgid's group is ESRCH, even though a
+            // plain tkill(tid) would have succeeded (LTP tgkill03 "Defunct
+            // tgid": tgkill(defunct_tid, child_tid) with child_tid live).
+            if !names_self_pid(tgid) {
+                return Ok(DispatchOutcome::errno(LINUX_ESRCH));
+            }
             if let Some((routed, _target)) = this.route_thread_signal(cx, tid, signum, true) {
                 return Ok(routed);
             }
