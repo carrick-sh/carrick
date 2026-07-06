@@ -1555,6 +1555,30 @@ impl SyscallDispatcher {
                 if open_flags.contains(LinuxOpenFlags::DIRECTORY) {
                     return Ok(DispatchOutcome::errno(LINUX_ENOTDIR));
                 }
+                // O_PATH | O_NOFOLLOW on a symlink is the ONE way open(2) yields a
+                // descriptor to the LINK ITSELF (not its target): the fd is opened
+                // only for path operations, so readlinkat(fd,"")/fstatat(fd,"",
+                // AT_EMPTY_PATH) operate on the link (readlinkat01 case 6). Model
+                // it as an O_PATH File carrying the symlink's own lstat metadata;
+                // every I/O op already rejects an O_PATH fd with EBADF.
+                if open_flags.contains(LinuxOpenFlags::PATH) {
+                    let open_file = OpenFile {
+                        description: Arc::new(RwLock::new(OpenDescription::File {
+                            base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
+                            path: path.clone(),
+                            metadata: md,
+                            contents: FileContents::dense(Vec::new()),
+                            offset: 0,
+                            writable: false,
+                        })),
+                        fd_flags: linux_fd_flags_from_open_flags(flags),
+                    };
+                    let Ok(fd) = self.install_fd_at_or_above(0, open_file) else {
+                        return Ok(DispatchOutcome::errno(linux_errno::EMFILE));
+                    };
+                    self.record_fd_open_path(fd, path.clone());
+                    return Ok(DispatchOutcome::Returned { value: fd as i64 });
+                }
                 return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ELOOP));
             }
         }
@@ -9758,14 +9782,24 @@ impl SyscallDispatcher {
             }
 
             let path = read_guest_c_string(&*cx.memory, pathname)?;
-            // readlinkat has no AT_EMPTY_PATH flag, so an empty pathname does not
-            // name the dirfd itself — modern Linux returns ENOENT for
-            // readlink("") (readlink03), NOT the EINVAL our path lookup would
-            // otherwise raise.
-            if path.is_empty() {
-                return Ok(DispatchOutcome::errno(LINUX_ENOENT));
-            }
-            let path = this.resolve_at_path(dirfd, &path)?;
+            // An empty pathname with an O_PATH|O_NOFOLLOW dirfd naming a SYMLINK
+            // reads that link — readlinkat implicitly treats "" as AT_EMPTY_PATH
+            // for such an fd (readlinkat(2) since 2.6.39; readlinkat01 case 6).
+            // Rewrite to the fd's recorded symlink path so the readlink below runs.
+            let path = if path.is_empty() {
+                let dfd = (dirfd as i32) as i64 as u64 as i32;
+                match this.lookup_recorded_fd_open_path(dfd).filter(|p| {
+                    this.fd_is_o_path(dfd)
+                        && matches!(this.layered_lstat(p), Ok(md) if md.kind == RootFsEntryKind::Symlink)
+                }) {
+                    Some(p) => p,
+                    // A plain empty readlink (AT_FDCWD / non-symlink fd) is ENOENT
+                    // on modern Linux (readlink03), not the EINVAL a lookup raises.
+                    None => return Ok(DispatchOutcome::errno(LINUX_ENOENT)),
+                }
+            } else {
+                this.resolve_at_path(dirfd, &path)?
+            };
 
             let target = if let Some(kind) = proc_self_magic_link(&path) {
                 match kind {
