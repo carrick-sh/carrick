@@ -5144,11 +5144,19 @@ impl SyscallDispatcher {
             Ok(if let Err(errno) = rc.host_syscall_errno() {
                 // At a protocol level (IPPROTO_*), macOS answers EINVAL for an
                 // optname it doesn't recognize where Linux answers ENOPROTOOPT.
-                // SOL_SOCKET is excluded so its optlen-validation EINVAL (the
-                // "invalid optlen" case) stays EINVAL. Other errnos (incl. the
-                // ENOPROTOOPT for options macOS simply lacks, eg IP_MTU_DISCOVER)
-                // pass through unchanged. (setsockopt01 "invalid option name (UDP)")
-                let errno = if errno == LINUX_EINVAL && level != LINUX_SOL_SOCKET {
+                // Scope the remap to UNRECOGNIZED optnames: a RECOGNIZED option
+                // that carrick maps (IP_TTL, TCP_MAXSEG, …) reports EINVAL for a
+                // genuine bad argument (short optlen / out-of-range value), which
+                // Linux ALSO reports as EINVAL, so that must pass through
+                // unchanged. SOL_SOCKET is likewise excluded so its
+                // optlen-validation EINVAL (the "invalid optlen" case) stays
+                // EINVAL. Other errnos (incl. the ENOPROTOOPT for options macOS
+                // simply lacks, eg IP_MTU_DISCOVER) pass through unchanged.
+                // (setsockopt01 "invalid option name (UDP)")
+                let errno = if errno == LINUX_EINVAL
+                    && level != LINUX_SOL_SOCKET
+                    && !is_known_sockopt_optname(level, optname)
+                {
                     LINUX_ENOPROTOOPT
                 } else {
                     errno
@@ -5403,10 +5411,16 @@ impl SyscallDispatcher {
             };
             if let Err(errno) = rc.host_syscall_errno() {
                 // At a protocol level (IPPROTO_*), macOS answers EINVAL for an
-                // option it can't read where Linux answers EOPNOTSUPP; SOL_SOCKET
-                // is excluded so a genuine value/optlen EINVAL stays EINVAL.
-                // (getsockopt01 "not supported option name (UDP)")
-                let errno = if errno == LINUX_EINVAL && level != LINUX_SOL_SOCKET {
+                // option it can't read where Linux answers EOPNOTSUPP. Scope the
+                // remap to UNRECOGNIZED optnames: a RECOGNIZED option that carrick
+                // maps reports EINVAL for a genuine value/optlen error, which
+                // Linux ALSO reports as EINVAL, so it must pass through unchanged.
+                // SOL_SOCKET is likewise excluded so its value/optlen EINVAL stays
+                // EINVAL. (getsockopt01 "not supported option name (UDP)")
+                let errno = if errno == LINUX_EINVAL
+                    && level != LINUX_SOL_SOCKET
+                    && !is_known_sockopt_optname(level, optname)
+                {
                     LINUX_EOPNOTSUPP
                 } else {
                     errno
