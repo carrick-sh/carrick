@@ -2260,14 +2260,22 @@ impl SyscallDispatcher {
                     if meta.locked {
                         return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                     }
-                    // Drop the pages by zeroing the writable anonymous backing.
-                    // A read-only or shared-file mapping must NOT be written —
-                    // that would SIGBUS the runtime or corrupt the file — so treat
-                    // it as a success no-op, matching Linux dropping clean cache
-                    // pages. zero_backing writes the host backing directly (same
-                    // call the MAP_FIXED/munmap-reuse scrub uses), bypassing the
-                    // guest write-protection gate.
-                    if meta.writable && cx.memory.zero_backing(address.0, length).is_err() {
+                    // Drop the pages by zeroing the writable PRIVATE/anonymous
+                    // backing — only such mappings get zero-fill-on-next-access.
+                    // A read-only mapping must NOT be written (would SIGBUS the
+                    // runtime); a MAP_SHARED mapping must NOT be written either —
+                    // for a shared FILE mapping zero_backing writes straight
+                    // through to the file and CORRUPTS it, and Linux
+                    // MADV_DONTNEED on a shared mapping does not zero (the next
+                    // access re-faults the original content from the file). In
+                    // all those cases treat DONTNEED as a success no-op, matching
+                    // Linux dropping clean cache pages. zero_backing writes the
+                    // host backing directly (same call the MAP_FIXED/munmap-reuse
+                    // scrub uses), bypassing the guest write-protection gate.
+                    if meta.writable
+                        && !meta.shared
+                        && cx.memory.zero_backing(address.0, length).is_err()
+                    {
                         return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                     }
                 }
