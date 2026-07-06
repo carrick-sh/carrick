@@ -321,6 +321,23 @@ fn sched_pid_exists<M: GuestMemory>(cx: &SyscallCtx<'_, M>, pid: u64) -> bool {
     resolve_sched_target(cx, pid) != SchedTarget::NotFound
 }
 
+/// `check_same_owner` for a cross-process `sched_setparam`/`sched_setaffinity`
+/// (an already-resolved `SchedTarget::OtherGuest`). Root always may; a non-root
+/// caller may change another guest process's scheduling attributes only when its
+/// euid matches the target's published euid — the same ownership rule carrick's
+/// `kill`/`setpriority` use, NOT a root-only proxy (a SAME-OWNER non-root set
+/// must succeed: LTP sched_setparam05 / sched_setaffinity01). Returns true when
+/// the set is PERMITTED. `pid` is the guest-supplied ns-pid of the target.
+fn sched_cross_owner_ok(pid: u64, caller_euid: u32) -> bool {
+    if caller_euid == 0 {
+        return true;
+    }
+    let target_euid = crate::namespace::pid::ns_to_host_or_self(pid as u32)
+        .and_then(|host| crate::cred_ipc::read_target(host as i32))
+        .unwrap_or(0);
+    caller_euid == target_euid
+}
+
 /// True when `policy` is one of the kernel's known scheduling policies.
 fn sched_policy_is_known(policy: i32) -> bool {
     matches!(
@@ -1475,7 +1492,9 @@ impl SyscallDispatcher {
             if target == SchedTarget::NotFound {
                 return Ok(DispatchOutcome::errno(LINUX_ESRCH));
             }
-            if target == SchedTarget::OtherGuest && this.creds.lock().euid != 0 {
+            if target == SchedTarget::OtherGuest
+                && !sched_cross_owner_ok(pid, this.cred_snapshot().euid)
+            {
                 return Ok(DispatchOutcome::errno(LINUX_EPERM));
             }
             let ncpu = crate::host_facts::logical_cpu_count();
@@ -1613,10 +1632,12 @@ impl SyscallDispatcher {
 
         /// `sched_setparam(pid, &param)`: change just the priority. For our
         /// SCHED_OTHER-only model the only valid priority is 0; anything else
-        /// is EINVAL (matches Linux for SCHED_NORMAL/OTHER/BATCH/IDLE). An
-        /// unprivileged caller targeting ANOTHER guest process lacks CAP_SYS_NICE
-        /// and is refused with EPERM (LTP sched_setparam05: a `nobody` child
-        /// calling `sched_setparam(getppid(), …)` on its root parent).
+        /// is EINVAL (matches Linux for SCHED_NORMAL/OTHER/BATCH/IDLE). Changing
+        /// ANOTHER process's params requires `check_same_owner` (or root): a
+        /// DIFFERENT-owner non-root caller is refused with EPERM (LTP
+        /// sched_setparam05: a `nobody` child calling `sched_setparam(getppid(),
+        /// …)` on its root parent), but a SAME-owner non-root cross-process set
+        /// succeeds — hence the ownership check, not a root-only proxy.
         fn sched_setparam(this, cx, pid: u64, address: GuestPtr) {
             if (pid as i32) < 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
@@ -1629,7 +1650,9 @@ impl SyscallDispatcher {
             if prio != 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            if target == SchedTarget::OtherGuest && this.creds.lock().euid != 0 {
+            if target == SchedTarget::OtherGuest
+                && !sched_cross_owner_ok(pid, this.cred_snapshot().euid)
+            {
                 return Ok(DispatchOutcome::errno(LINUX_EPERM));
             }
             Ok(DispatchOutcome::Returned { value: 0 })
@@ -3014,6 +3037,14 @@ impl SyscallDispatcher {
         // pointer → EFAULT (read_iovecs). Read-only borrow ends with the vecs.
         let local = read_iovecs(&*cx.memory, local_iov.0, liovcnt)?;
         let remote = read_iovecs(&*cx.memory, remote_iov.0, riovcnt)?;
+
+        // process_vm_readv/writev do a plain task lookup: pid 0 names NO task
+        // (unlike sched_*, where 0 means "the calling process"). Linux returns
+        // ESRCH and transfers nothing. resolve_sched_target inherits the sched_*
+        // 0-is-self rule, so screen pid 0 out here before consulting it.
+        if pid.raw() == 0 {
+            return Ok(DispatchOutcome::errno(LINUX_ESRCH));
+        }
 
         match resolve_sched_target(cx, pid.raw() as u64) {
             SchedTarget::NotFound => Ok(DispatchOutcome::errno(LINUX_ESRCH)),
