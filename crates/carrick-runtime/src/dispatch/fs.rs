@@ -1423,6 +1423,47 @@ impl SyscallDispatcher {
         // main-binary fd this way. Serve it by duplicating N (works for host-fd
         // backed files, which carry no guest path to re-resolve).
         if let Some(n) = proc_self_fd_number(&path) {
+            // O_TRUNC on the reopened magic symlink truncates the underlying
+            // (shared) in-memory inode — memfd_create01 reopens /proc/self/fd/N
+            // with O_TRUNC and expects size 0. Applied before the dup and gated
+            // by F_SEAL_SHRINK/GROW (a sealed truncate → EPERM, and the open
+            // fails).
+            if flags & LINUX_O_TRUNC != 0
+                && let Some(open_file) = self.open_file(n)
+            {
+                let mut truncated_path: Option<String> = None;
+                {
+                    let mut open = open_file.description.write();
+                    if let OpenDescription::File {
+                        base,
+                        path,
+                        contents,
+                        metadata,
+                        writable,
+                        ..
+                    } = &mut *open
+                        && *writable
+                        && contents.len() != 0
+                    {
+                        if let Err(errno) = memfd_seal_resize_check(base.seals(), 0, contents.len())
+                        {
+                            return Ok(DispatchOutcome::errno(errno));
+                        }
+                        contents.truncate(0);
+                        metadata.size = 0;
+                        truncated_path = Some(path.clone());
+                    }
+                }
+                // Sync the empty contents to the overlay backing so a later
+                // fstat (which resolves the memfd's `/memfd:` path) reports 0.
+                if let Some(path) = truncated_path {
+                    let _ = self
+                        .fs
+                        .rootfs_vfs
+                        .overlay
+                        .set_file_contents(&path, Vec::new());
+                }
+            }
             return Ok(self.duplicate_fd(n, 0, flags & LINUX_O_CLOEXEC));
         }
 
@@ -5254,6 +5295,54 @@ impl SyscallDispatcher {
                     let lease = open_file.description.read().lease();
                     DispatchOutcome::Returned { value: lease as i64 }
                 }
+                // File sealing (memfd_create01). The seal set lives on the
+                // open-file description (shared across dup). F_GET_SEALS returns
+                // the current set; a non-sealable fd → EINVAL.
+                LINUX_F_GET_SEALS => {
+                    let Some(open_file) = this.open_file(fd.0) else {
+                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                    };
+                    match open_file.description.read().seals() {
+                        Some(seals) => DispatchOutcome::Returned {
+                            value: i64::from(seals),
+                        },
+                        None => DispatchOutcome::errno(LINUX_EINVAL),
+                    }
+                }
+                LINUX_F_ADD_SEALS => {
+                    let Some(open_file) = this.open_file(fd.0) else {
+                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                    };
+                    let new_seals = arg as u32;
+                    // Unknown seal bits → EINVAL (before the sealable check, as
+                    // Linux validates the arg first).
+                    if u64::from(new_seals) != arg || new_seals & !LINUX_F_SEAL_ALL != 0 {
+                        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                    }
+                    let mut open = open_file.description.write();
+                    let Some(current) = open.seals() else {
+                        // Not a sealable fd (regular file, socket, …).
+                        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                    };
+                    // F_ADD_SEALS needs the fd open for writing.
+                    if open.status_flags() & LINUX_O_ACCMODE == LINUX_O_RDONLY {
+                        return Ok(DispatchOutcome::errno(LINUX_EPERM));
+                    }
+                    // Already fully sealed → no further seals may be added.
+                    if current & LINUX_F_SEAL_SEAL != 0 {
+                        return Ok(DispatchOutcome::errno(LINUX_EPERM));
+                    }
+                    // F_SEAL_WRITE cannot be set while a shared, writable mapping
+                    // of the memfd is live (Linux → EBUSY; memfd_create01
+                    // test_share_mmap).
+                    if new_seals & LINUX_F_SEAL_WRITE != 0
+                        && this.memfd_has_writable_shared_map(&open_file.description)
+                    {
+                        return Ok(DispatchOutcome::errno(LINUX_EBUSY));
+                    }
+                    open.set_seals(Some(current | new_seals));
+                    DispatchOutcome::Returned { value: 0 }
+                }
                 // Async-I/O owner + signal (F_SETOWN/F_GETOWN, F_SETOWN_EX/
                 // F_GETOWN_EX, F_SETSIG/F_GETSIG). The owner (SIGIO/SIGURG target)
                 // and signal are recorded on the open-file description (shared
@@ -6247,6 +6336,8 @@ impl SyscallDispatcher {
                 let mut open = open_file.description.write();
                 match &mut *open {
                     OpenDescription::File {
+                        base,
+                        path,
                         contents,
                         metadata,
                         writable,
@@ -6254,6 +6345,15 @@ impl SyscallDispatcher {
                     } if grow => {
                         if !*writable {
                             return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                        }
+                        // memfd seals: an allocating (non-KEEP_SIZE) fallocate is
+                        // blocked only by F_SEAL_GROW when it extends the file —
+                        // F_SEAL_WRITE does NOT block a pure grow (memfd_create01
+                        // seals WRITE then grows via fallocate successfully).
+                        if matches!(base.seals(), Some(s) if s & LINUX_F_SEAL_GROW != 0)
+                            && new_size as usize > contents.len()
+                        {
+                            return Ok(DispatchOutcome::errno(LINUX_EPERM));
                         }
                         // In-memory model (--fs memory): grow the cached bytes.
                         if new_size > crate::vfs::MAX_IN_MEMORY_FILE_SIZE {
@@ -6263,12 +6363,23 @@ impl SyscallDispatcher {
                             contents.resize(new_size as usize);
                             metadata.size = contents.len();
                         }
-                        writeback = None;
+                        // Sync the grown contents to the overlay backing so a
+                        // later fstat (which resolves the memfd's path) agrees
+                        // (memfd_create01 CHECK_MFD_GROWABLE fstats the new size).
+                        writeback = Some((path.clone(), contents.to_vec()));
                         outcome = DispatchOutcome::Returned { value: 0 };
                     }
-                    OpenDescription::File { writable, .. } => {
+                    OpenDescription::File { base, writable, .. } => {
                         if !*writable {
                             return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                        }
+                        // A hole punch modifies content, so F_SEAL_WRITE blocks it
+                        // (memfd_create01 check_mfd_non_writeable). A plain
+                        // KEEP_SIZE preallocate changes nothing and is unaffected.
+                        if mode & LINUX_FALLOC_FL_PUNCH_HOLE != 0
+                            && let Err(errno) = memfd_seal_write_check(base.seals(), 0, 0, 0)
+                        {
+                            return Ok(DispatchOutcome::errno(errno));
                         }
                         // KEEP_SIZE: don't change apparent size.
                         writeback = None;
@@ -6344,6 +6455,7 @@ impl SyscallDispatcher {
                 let mut open = open_file.description.write();
                 match &mut *open {
                     OpenDescription::File {
+                        base,
                         path,
                         contents,
                         offset,
@@ -6361,6 +6473,13 @@ impl SyscallDispatcher {
                             return Ok(DispatchOutcome::errno(LINUX_EFBIG));
                         }
                         let new_len = length as usize;
+                        // memfd resize seals: F_SEAL_SHRINK blocks shrink,
+                        // F_SEAL_GROW blocks grow (memfd_create01).
+                        if let Err(errno) =
+                            memfd_seal_resize_check(base.seals(), new_len, contents.len())
+                        {
+                            return Ok(DispatchOutcome::errno(errno));
+                        }
                         if new_len > contents.len() {
                             contents.resize(new_len);
                         } else {
@@ -7448,6 +7567,57 @@ impl SyscallDispatcher {
                 let n = n.host_syscall_errno()?;
                 return Ok(DispatchOutcome::Returned { value: n as i64 });
             }
+            // In-memory File (memfd / O_TMPFILE fallback): positional write into
+            // the cached contents, honoring memfd write/grow seals. Previously an
+            // unconditional EBADF (memfd_create01 CHECK_MFD_*_BY_WRITE pwrites).
+            let is_inmem_file = matches!(&*open, OpenDescription::File { .. });
+            drop(open);
+            if is_inmem_file {
+                let mut open = open_file.description.write();
+                if let OpenDescription::File {
+                    base,
+                    path,
+                    contents,
+                    writable,
+                    metadata,
+                    ..
+                } = &mut *open
+                {
+                    if !*writable {
+                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                    }
+                    let write_at = if is_append {
+                        contents.len()
+                    } else {
+                        offset as usize
+                    };
+                    if let Err(errno) = memfd_seal_write_check(
+                        base.seals(),
+                        write_at,
+                        bytes.len(),
+                        contents.len(),
+                    ) {
+                        return Ok(DispatchOutcome::errno(errno));
+                    }
+                    let mut off = write_at;
+                    if let Err(errno) = write_into_file_contents(contents, &mut off, &bytes) {
+                        return Ok(DispatchOutcome::errno(errno));
+                    }
+                    metadata.size = contents.len();
+                    let writeback = (path.clone(), contents.to_vec());
+                    drop(open);
+                    let _ = this
+                        .fs
+                        .rootfs_vfs
+                        .overlay
+                        .set_file_contents(&writeback.0, writeback.1);
+                    return Ok(DispatchOutcome::Returned {
+                        value: bytes.len() as i64,
+                    });
+                }
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            }
+            let open = open_file.description.read();
             let errno = match &*open {
                 OpenDescription::File { .. } | OpenDescription::SyntheticFile { .. } => LINUX_EBADF,
                 OpenDescription::HostFile { .. } => LINUX_EINVAL,
@@ -8803,6 +8973,7 @@ impl SyscallDispatcher {
                             ));
                         }
                         OpenDescription::File {
+                            base,
                             path,
                             contents,
                             offset,
@@ -8812,6 +8983,16 @@ impl SyscallDispatcher {
                         } => {
                             if !*writable {
                                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                            }
+                            // memfd write seals: F_SEAL_WRITE → EPERM; F_SEAL_GROW
+                            // → EPERM when the write would extend the file.
+                            if let Err(errno) = memfd_seal_write_check(
+                                base.seals(),
+                                *offset,
+                                bytes.len(),
+                                contents.len(),
+                            ) {
+                                return Ok(DispatchOutcome::errno(errno));
                             }
                             let write_offset = *offset;
                             if let Err(errno) = write_into_file_contents(contents, offset, &bytes) {
@@ -9137,6 +9318,7 @@ impl SyscallDispatcher {
                                 writeback = None;
                             }
                             OpenDescription::File {
+                                base,
                                 path,
                                 contents,
                                 offset,
@@ -9146,6 +9328,14 @@ impl SyscallDispatcher {
                             } => {
                                 if !*writable {
                                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                                }
+                                if let Err(errno) = memfd_seal_write_check(
+                                    base.seals(),
+                                    *offset,
+                                    bytes.len(),
+                                    contents.len(),
+                                ) {
+                                    return Ok(DispatchOutcome::errno(errno));
                                 }
                                 let write_offset = *offset;
                                 if let Err(errno) = write_into_file_contents(contents, offset, &bytes) {
@@ -10147,6 +10337,19 @@ impl SyscallDispatcher {
             }
             let name = String::from_utf8_lossy(&name_bytes).into_owned();
             let path = format!("/memfd:{name}");
+            // Every memfd supports the sealing API. With MFD_ALLOW_SEALING the
+            // initial seal set is empty; without it F_SEAL_SEAL is preset so no
+            // seals can ever be added (F_ADD_SEALS → EPERM) while F_GET_SEALS
+            // still succeeds. (memfd_create01)
+            let initial_seals = if flags & MFD_ALLOW_SEALING != 0 {
+                0
+            } else {
+                LINUX_F_SEAL_SEAL
+            };
+            // A memfd is opened O_RDWR (memfd_create(2)); F_ADD_SEALS requires
+            // the description carry write access (FMODE_WRITE).
+            let mut base = OpenDescriptionBase::new(LINUX_O_RDWR);
+            base.set_seals(Some(initial_seals));
             let description = OpenDescription::File {
                 metadata: RootFsMetadata {
                     path: Path::new(&path).to_path_buf(),
@@ -10157,7 +10360,7 @@ impl SyscallDispatcher {
                 path,
                 contents: FileContents::dense(Vec::new()),
                 offset: 0,
-                base: OpenDescriptionBase::new(0),
+                base,
                 writable: true,
             };
             let fd_flags = if flags & MFD_CLOEXEC != 0 {
