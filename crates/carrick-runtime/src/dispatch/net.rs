@@ -2073,6 +2073,11 @@ impl SyscallDispatcher {
             };
             let outcome = match self.sendmsg_inner(fd, entry, flags, &*memory) {
                 Ok(o) => o,
+                // Surface the REAL errno the single-message path carries (a bad
+                // fd is EBADF, not the blanket EFAULT — sendmmsg02). The
+                // `match outcome` below keeps the multi-message semantics: a
+                // failure after >=1 success still returns the count.
+                Err(DispatchError::Errno(errno)) => DispatchOutcome::Errno { errno },
                 Err(_) => {
                     return DispatchOutcome::errno(LINUX_EFAULT);
                 }
@@ -2169,6 +2174,11 @@ impl SyscallDispatcher {
             };
             let outcome = match self.recvmsg_inner(fd, entry, entry_flags, &mut *memory) {
                 Ok(o) => o,
+                // Surface the REAL errno the single-message path carries (a bad
+                // fd is EBADF, not the blanket EFAULT — recvmmsg01). The
+                // `match outcome` below keeps the multi-message semantics: a
+                // failure after >=1 success still returns the count.
+                Err(DispatchError::Errno(errno)) => DispatchOutcome::Errno { errno },
                 Err(_) => {
                     return DispatchOutcome::errno(LINUX_EFAULT);
                 }
