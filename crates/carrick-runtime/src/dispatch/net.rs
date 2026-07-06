@@ -2269,6 +2269,589 @@ mod recvmmsg_tests {
 }
 
 impl SyscallDispatcher {
+    /// Shared wait core for `epoll_pwait`/`epoll_pwait2`. Both callers do
+    /// their own arg + timeout decode and epfd validation, then hand the
+    /// resolved `open_file` (plus the decoded `timeout_ms`/`sig_mask`/
+    /// `max_events`) here so the two syscalls share ONE readiness path:
+    /// drain any queued ready events, run the multiplexer drain + readiness
+    /// recompute, then park (`WaitOnFds`/`WaitOnPollFds`) honouring the
+    /// timeout and (blocking) sigmask. Factored out of `epoll_pwait` verbatim
+    /// so its behaviour is preserved byte-for-byte (LTP epoll_wait01/02,
+    /// epoll_pwait01/02/03).
+    #[allow(clippy::too_many_arguments)]
+    // Moved verbatim out of the `define_syscall!`-generated `epoll_pwait`, which
+    // applies this same lenience to every handler body; preserved so the wait
+    // core stays byte-for-byte identical (one pre-existing unused destructure).
+    #[allow(unused_variables)]
+    fn epoll_pwait_wait_core<M: GuestMemory>(
+        &self,
+        memory: &mut M,
+        open_file: OpenFile,
+        epfd: i32,
+        events_address: u64,
+        guest_abi: LinuxGuestAbi,
+        max_events: usize,
+        timeout_ms: i32,
+        sig_mask: carrick_abi::WaitSigMask,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let this = self;
+        // Snapshot any already-queued ready events first. `ready` is
+        // reassigned on the multiplexer path below (it collects the
+        // drained-and-tagged events), so the `mut` is load-bearing.
+        let mut ready = {
+            let mut open = open_file.description.write();
+            let OpenDescription::Epoll { pending_ready, .. } = &mut *open else {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            };
+            drain_pending_epoll_ready(pending_ready, max_events)
+        };
+        if !ready.is_empty() {
+            crate::probes::epoll_result(epfd, ready.len() as i32, 0, timeout_ms, 0);
+            return write_epoll_events(memory, events_address, &ready, guest_abi);
+        }
+
+        // Multiplexer-backed readiness (kqueue on macOS, epoll on Linux). The
+        // multiplexer is the authoritative readiness source for host-backed fds
+        // (sockets/pipes/ptys/eventfds) — crucially, it monitors fds registered
+        // by OTHER threads while this thread is blocked, fixing the
+        // interest-snapshot race that lost a netpoller wakeup. If a drained host
+        // event names a guest fd that is not in this snapshot, fall back to the
+        // live map before dropping it; that covers the narrow concurrent ADD
+        // race without putting a live lock lookup on every returned event.
+        {
+            let (interests, kq, kq_fd) = {
+                let open = open_file.description.read();
+                let OpenDescription::Epoll {
+                    interest, kqueue, ..
+                } = &*open
+                else {
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                };
+                (
+                    interest
+                        .iter()
+                        .map(|(fd, interest)| (*fd, interest.clone()))
+                        .collect::<Vec<_>>(),
+                    Arc::clone(kqueue),
+                    kqueue.poll_fd(),
+                )
+            };
+            let has_interests = !interests.is_empty();
+
+            // guest_fd -> (accumulated epoll events, epoll_data); read+write filters
+            // for the same fd merge into one returned event.
+            let mut acc: HashMap<i32, (u32, u64)> = HashMap::new();
+            let mut ready_updates: Vec<(i32, u32, u32, Option<u64>, bool)> = Vec::new();
+            let mut host_ready_sampled = std::collections::HashSet::<i32>::new();
+            const READ_READY_BITS: u32 =
+                LINUX_EPOLLIN | LINUX_EPOLLRDHUP | LINUX_EPOLLHUP | LINUX_EPOLLERR;
+
+            // (1) Drain the instance kqueue (non-blocking) for host-backed fds.
+            // `kq_drained_all_filtered` tracks the corner case where the kqueue
+            // had readiness events but the user's interest mask filters them
+            // all out (e.g. `epoll_ctl(ADD, fd, events=0)` plus data on the
+            // pipe — the read filter still fires because Linux must surface
+            // EPOLLHUP/EPOLLERR, but no event bit matches). Without this flag
+            // we'd return `WaitOnPollFds` and the runtime would re-poll the
+            // already-readable kq_fd, re-dispatch, and tight-loop until the
+            // harness deadline. Detect it once here and switch to an empty
+            // `WaitOnFds` (signal-pipe-and-timeout-only) below.
+            let mut kq_drained_all_filtered = false;
+            {
+                // Non-blocking drain of the multiplexer for host-backed fds.
+                let mut poll_events: Vec<carrick_hal::event::PollEvent> = Vec::new();
+                if kq
+                    .with_mux(|mux| mux.wait(&mut poll_events, Some(Duration::ZERO)))
+                    .is_ok()
+                {
+                    let acc_before = acc.len();
+                    // Each drained event's udata is a GENERATIONAL handle
+                    // `(guest_fd, reg_gen)` (the multiplexer IDENT stays the host
+                    // fd). Guest AND host fd numbers recycle rapidly under churn, so
+                    // routing by a bare fd is an ABA hazard; the gen lets us confirm
+                    // the edge belongs to the CURRENT registration of guest_fd and
+                    // drop a stale edge for a recycled fd (see below). For each valid
+                    // edge we RE-POLL the live owner(s) rather than trust the drained
+                    // bits, which stays correct even when the host fd was recycled
+                    // mid-drain. bits==0 is an EVFILT_USER(0) in-memory wake or a
+                    // filter with no translatable bits — in-memory readiness is
+                    // recomputed in step (2), so it is skipped (and must NOT count
+                    // toward `kq_drained_all_filtered`: it auto-resets, so polling
+                    // kq_fd won't spin, whereas the all-filtered path parks on the
+                    // signal pipe — the Node worker-teardown hang).
+                    let mut filtered_ready_events = 0usize;
+                    if !poll_events.is_empty() {
+                        // Build the per-wait routing tables from the LIVE interest map
+                        // (NOT the pre-drain snapshot): an fd ADDed by another thread
+                        // AFTER the snapshot whose edge is already in THIS batch must
+                        // still be routable — its single EV_CLEAR/EPOLLET edge is
+                        // consumed and will not re-fire. `gfd_info` resolves a guest
+                        // fd to its (host_fd, mask, data, reg_gen); `host_to_gfds` is
+                        // the reverse index for dup fan-out (one host fd may back
+                        // several guest fds — Linux wakes each pollDesc). Built once
+                        // here, then the epoll lock is dropped before the per-fd
+                        // re-poll so a concurrent epoll_ctl isn't blocked on syscalls.
+                        // gfd_info: guest fd -> (host_fd, requested events,
+                        // epoll_data, reg_gen, last_ready, last_read_avail,
+                        // write_backpressured). host_to_gfds: host fd
+                        // -> guest fds sharing it (dup fan-out). Types inferred
+                        // from the inserts.
+                        let (gfd_info, host_to_gfds) = {
+                            let open = open_file.description.read();
+                            // Per-guest-fd epoll interest snapshot: (host_fd,
+                            // events, epoll data, reg_gen, last_ready,
+                            // last_read_avail, write_backpressured).
+                            type GfdInterest = (i32, u32, u64, u32, u32, u64, bool);
+                            let mut info: HashMap<i32, GfdInterest> = HashMap::new();
+                            let mut rev: HashMap<i32, Vec<i32>> = HashMap::new();
+                            if let OpenDescription::Epoll { interest, .. } = &*open {
+                                for (gfd, slot) in interest.iter() {
+                                    if let Some(hfd) = this.host_fd_for_poll(*gfd) {
+                                        info.insert(
+                                            *gfd,
+                                            (
+                                                hfd.get(),
+                                                slot.event.events,
+                                                slot.event.data,
+                                                slot.reg_gen,
+                                                slot.last_ready,
+                                                slot.last_read_avail,
+                                                slot.write_backpressured,
+                                            ),
+                                        );
+                                        rev.entry(hfd.get()).or_default().push(*gfd);
+                                    }
+                                }
+                            }
+                            (info, rev)
+                        };
+                        // Resolve each drained event through its generational handle.
+                        // The udata is (guest_fd, gen); trust it only if the live
+                        // interest for guest_fd carries the SAME gen — otherwise the
+                        // fd was recycled (ABA) and this is a stale edge for a gone
+                        // registration: drop it (the current owner, if any, gets its
+                        // own edge) and probe so the race stays observable. A valid
+                        // hit fans out to every guest fd currently sharing that host
+                        // fd (dups). bits==0 is an EVFILT_USER(0) wake / untranslatable
+                        // filter — in-memory readiness is recomputed in step (2).
+                        let mut deliver: HashMap<i32, (u32, u64)> = HashMap::new();
+                        for ev in &poll_events {
+                            let edge_bits = pollevent_to_epoll(ev);
+                            if edge_bits == 0 {
+                                continue;
+                            }
+                            let edge_readiness_count = if ev.readiness_count > 0 {
+                                ev.readiness_count as u64
+                            } else {
+                                0
+                            };
+                            let (guest_fd, generation) = unpack_epoll_udata(ev.token);
+                            match gfd_info.get(&guest_fd) {
+                                Some(&(hfd, _, _, reg_gen, _, _, _)) if reg_gen == generation => {
+                                    if let Some(siblings) = host_to_gfds.get(&hfd) {
+                                        for sibling in siblings {
+                                            let entry = deliver.entry(*sibling).or_insert((0, 0));
+                                            entry.0 |= edge_bits;
+                                            entry.1 = entry.1.max(edge_readiness_count);
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    crate::probes::epoll_stale_edge(ev.token, guest_fd, generation);
+                                }
+                            }
+                        }
+                        // Deliver each owner's CURRENT readiness. RE-POLLING (rather
+                        // than trusting the drained bits) keeps delivery correct even
+                        // when the host fd was recycled between the edge and now — the
+                        // live poll(2) state is always the truth. illumos devpoll
+                        // model: the edge only FLAGS the fd; we re-poll just the
+                        // flagged owners (polling ALL registered fds was O(nfds) and
+                        // too slow).
+                        for (gfd, (edge_bits, edge_readiness_count)) in deliver {
+                            if let Some(&(
+                                _,
+                                requested,
+                                data,
+                                reg_gen,
+                                last_ready,
+                                last_read_avail,
+                                write_backpressured,
+                            )) = gfd_info.get(&gfd)
+                            {
+                                host_ready_sampled.insert(gfd);
+                                let raw = this.epoll_ready_events(gfd, requested);
+                                let read_avail = if raw & READ_READY_BITS != 0 {
+                                    this.host_read_avail_for_poll(gfd)
+                                } else {
+                                    0
+                                };
+                                let observed_read_avail = if edge_readiness_count > 0 {
+                                    edge_readiness_count
+                                } else {
+                                    read_avail
+                                };
+                                let clear_write_backpressure =
+                                    write_backpressured && raw & LINUX_EPOLLOUT != 0;
+                                let read_growth = if requested & LINUX_EPOLLET != 0
+                                    && raw & READ_READY_BITS != 0
+                                    && observed_read_avail > last_read_avail
+                                {
+                                    raw & READ_READY_BITS
+                                } else {
+                                    0
+                                };
+                                let mut ready_events = if requested & LINUX_EPOLLET != 0 {
+                                    (raw & !last_ready) | read_growth
+                                } else {
+                                    raw
+                                };
+                                if clear_write_backpressure {
+                                    ready_events |= raw & LINUX_EPOLLOUT;
+                                }
+                                let read_avail_update = if raw & READ_READY_BITS == 0 {
+                                    Some(0)
+                                } else {
+                                    Some(observed_read_avail)
+                                };
+                                ready_updates.push((
+                                    gfd,
+                                    reg_gen,
+                                    raw,
+                                    read_avail_update,
+                                    clear_write_backpressure,
+                                ));
+                                crate::probes::epoll_interest(
+                                    epfd,
+                                    gfd,
+                                    requested,
+                                    raw,
+                                    last_ready,
+                                    ready_events,
+                                );
+                                if ready_events != 0 {
+                                    acc.entry(gfd).or_insert((0, data)).0 |= ready_events;
+                                } else if requested & LINUX_EPOLLET != 0
+                                    && raw != 0
+                                    && raw & last_ready != 0
+                                {
+                                    #[cfg(any(
+                                        feature = "platform-macos",
+                                        feature = "platform-freebsd",
+                                        feature = "platform-netbsd"
+                                    ))]
+                                    {
+                                        // BSD host-fd registrations are kept
+                                        // level-triggered and the guest ET
+                                        // contract is enforced by last_ready.
+                                        // A level event that is fully masked by
+                                        // the software latch would make the
+                                        // instance kqueue fd immediately
+                                        // readable again, so park on the
+                                        // signal/backstop path instead.
+                                        filtered_ready_events += 1;
+                                    }
+                                    #[cfg(not(any(
+                                        feature = "platform-macos",
+                                        feature = "platform-freebsd",
+                                        feature = "platform-netbsd"
+                                    )))]
+                                    {
+                                        // Native epoll ET on Linux has no
+                                        // persistent level event to spin on
+                                        // here; a later edge will re-wake the
+                                        // instance.
+                                    }
+                                } else if raw != 0 {
+                                    filtered_ready_events += 1;
+                                }
+                            }
+                        }
+                    }
+                    // A REAL, CURRENT host-fd readiness event fired but the interest
+                    // masks let none through (the events=0-with-data case): polling
+                    // kq_fd would see the same level readiness and spin, so park on
+                    // the signal pipe instead. Stale (recycled-fd) edges are excluded
+                    // from `translatable_events`: their host edge was consumed, so
+                    // kq_fd won't spin and the kqueue-poll path stays reachable by the
+                    // current owner's own later edge. A pure EVFILT_USER drain is
+                    // likewise excluded — it auto-resets.
+                    kq_drained_all_filtered = filtered_ready_events > 0 && acc.len() == acc_before;
+                }
+            }
+
+            // (2) Host-backed fds: the multiplexer edge says which owners are
+            // worth re-polling, but the live host level is still the authority.
+            // Re-sample any host-backed interest that was not already sampled
+            // from a drained mux event so a missed/stale edge cannot park an
+            // epoll waiter while the host fd is already readable/writable.
+            for (fd, interest) in &interests {
+                if host_ready_sampled.contains(fd) || this.host_fd_for_poll(*fd).is_none() {
+                    continue;
+                }
+                host_ready_sampled.insert(*fd);
+                let requested = interest.event.events;
+                let raw_ready = this.epoll_ready_events(*fd, requested);
+                let read_avail = if raw_ready & READ_READY_BITS != 0 {
+                    this.host_read_avail_for_poll(*fd)
+                } else {
+                    0
+                };
+                let clear_write_backpressure =
+                    interest.write_backpressured && raw_ready & LINUX_EPOLLOUT != 0;
+                let read_growth = if requested & LINUX_EPOLLET != 0
+                    && raw_ready & READ_READY_BITS != 0
+                    && read_avail > interest.last_read_avail
+                {
+                    raw_ready & READ_READY_BITS
+                } else {
+                    0
+                };
+                let mut ready_events = if requested & LINUX_EPOLLET != 0 {
+                    (raw_ready & !interest.last_ready) | read_growth
+                } else {
+                    raw_ready
+                };
+                if clear_write_backpressure {
+                    ready_events |= raw_ready & LINUX_EPOLLOUT;
+                }
+                let read_avail_update = if raw_ready & READ_READY_BITS == 0 {
+                    Some(0)
+                } else {
+                    Some(read_avail)
+                };
+                ready_updates.push((
+                    *fd,
+                    interest.reg_gen,
+                    raw_ready,
+                    read_avail_update,
+                    clear_write_backpressure,
+                ));
+                crate::probes::epoll_interest(
+                    epfd,
+                    *fd,
+                    requested,
+                    raw_ready,
+                    interest.last_ready,
+                    ready_events,
+                );
+                if ready_events != 0 {
+                    let entry = acc.entry(*fd).or_insert((0, interest.event.data));
+                    entry.0 |= ready_events;
+                }
+            }
+
+            // (3) In-memory fds (no host fd): recompute readiness.
+            for (fd, interest) in &interests {
+                if host_ready_sampled.contains(fd) {
+                    continue;
+                }
+                // Host-fd fds are handled by the kqueue drain above — EXCEPT a
+                // named-FIFO read-end whose writer has closed: macOS kqueue won't
+                // report that (dispatch::fifo_beacon decides it via a kernel
+                // beacon pipe), so recompute it here so the notify_inmem_epoll
+                // wake on writer-close surfaces EOF instead of blocking forever.
+                if let Some(hfd) = this.host_fd_for_poll(*fd)
+                    && !crate::dispatch::fifo_beacon::read_end_at_eof(hfd.get())
+                {
+                    continue;
+                }
+                let requested = interest.event.events;
+                let raw_ready = this.epoll_ready_events(*fd, requested);
+                let ready_events = if requested & LINUX_EPOLLET != 0 {
+                    raw_ready & !interest.last_ready
+                } else {
+                    raw_ready
+                };
+                ready_updates.push((*fd, interest.reg_gen, raw_ready, Some(0), false));
+                crate::probes::epoll_interest(
+                    epfd,
+                    *fd,
+                    requested,
+                    raw_ready,
+                    interest.last_ready,
+                    ready_events,
+                );
+                if ready_events != 0 {
+                    let entry = acc.entry(*fd).or_insert((0, interest.event.data));
+                    entry.0 |= ready_events;
+                }
+            }
+
+            // EPOLLONESHOT: every interest that just fired must be disarmed
+            // until EPOLL_CTL_MOD re-arms it (Linux semantics — the fd never
+            // appears in a subsequent epoll_wait without an explicit MOD).
+            // Collect the fds-to-disarm before consuming `acc`.
+            let oneshot_fds: Vec<i32> = acc
+                .iter()
+                .filter(|(fd, _)| {
+                    interests.iter().any(|(ifd, slot)| {
+                        ifd == *fd && slot.event.events & LINUX_EPOLLONESHOT != 0
+                    })
+                })
+                .map(|(fd, _)| *fd)
+                .collect();
+
+            if !ready_updates.is_empty() || !oneshot_fds.is_empty() {
+                let mut open = open_file.description.write();
+                if let OpenDescription::Epoll {
+                    interest, kqueue, ..
+                } = &mut *open
+                {
+                    #[cfg(any(
+                        feature = "platform-macos",
+                        feature = "platform-freebsd",
+                        feature = "platform-netbsd"
+                    ))]
+                    let mut host_rearms: Vec<i32> = Vec::new();
+                    for (fd, reg_gen, raw, read_avail, clear_write_backpressure) in ready_updates {
+                        if let Some(slot) = interest.get_mut(&fd) {
+                            if slot.reg_gen != reg_gen {
+                                continue;
+                            }
+                            let before = slot.last_ready;
+                            let read_avail_changed = read_avail
+                                .is_some_and(|read_avail| read_avail != slot.last_read_avail);
+                            slot.last_ready = raw;
+                            if let Some(read_avail) = read_avail {
+                                slot.last_read_avail = read_avail;
+                            }
+                            if clear_write_backpressure {
+                                slot.write_backpressured = false;
+                            }
+                            #[cfg(any(
+                                feature = "platform-macos",
+                                feature = "platform-freebsd",
+                                feature = "platform-netbsd"
+                            ))]
+                            if slot.event.events & LINUX_EPOLLET != 0
+                                && (before != raw || read_avail_changed)
+                                && let Some(host_fd) = this.host_fd_for_poll(fd)
+                            {
+                                host_rearms.push(host_fd.get());
+                            }
+                        }
+                    }
+                    #[cfg(any(
+                        feature = "platform-macos",
+                        feature = "platform-freebsd",
+                        feature = "platform-netbsd"
+                    ))]
+                    {
+                        host_rearms.sort_unstable();
+                        host_rearms.dedup();
+                        for host_fd in host_rearms {
+                            this.rebind_epoll_host_registration(kqueue, interest, HostFd(host_fd));
+                        }
+                    }
+                    for fd in &oneshot_fds {
+                        if let Some(slot) = interest.get_mut(fd) {
+                            // Clear the events mask so subsequent waits never
+                            // surface this fd until EPOLL_CTL_MOD re-arms it.
+                            slot.event.events = 0;
+                        }
+                    }
+                }
+            }
+            // Also remove the host kqueue filter for each disarmed fd so the
+            // level-triggered EVFILT_READ doesn't keep firing and tight-loop
+            // the next epoll_wait (the same shape as the events=0 fix above,
+            // applied to the freshly-disarmed ONESHOT slot).
+            for fd in &oneshot_fds {
+                if let Some(host_fd) = this.host_fd_for_poll(*fd) {
+                    kq.with_mux(|mux| {
+                        let _ = mux.deregister(host_fd.get());
+                    });
+                }
+            }
+
+            // Tag each ready event with its ORIGINATING guest fd (acc is keyed by
+            // guest fd) so an overflow queued into pending_ready can be purged by
+            // fd on EPOLL_CTL_DEL/MOD even when epoll_data != fd. Split the tail
+            // (still fd-tagged) into pending_ready, THEN strip fds for the
+            // guest-visible `ready`. (audit M3; probe epollstaledel)
+            let mut ready_tagged: Vec<(i32, LinuxEpollEvent)> = acc
+                .into_iter()
+                .map(|(fd, (events, data))| {
+                    (
+                        fd,
+                        LinuxEpollEvent {
+                            events,
+                            _pad: 0,
+                            data,
+                        },
+                    )
+                })
+                .collect();
+            if ready_tagged.len() > max_events {
+                let overflow: Vec<(i32, LinuxEpollEvent)> = ready_tagged.split_off(max_events);
+                let mut open = open_file.description.write();
+                if let OpenDescription::Epoll { pending_ready, .. } = &mut *open {
+                    pending_ready.extend(overflow);
+                }
+            }
+            ready = ready_tagged.into_iter().map(|(_fd, event)| event).collect();
+
+            crate::event_ring::rec(
+                crate::event_ring::EPWAIT,
+                kq_fd,
+                ready.len() as i32,
+                timeout_ms,
+            );
+            if ready.is_empty() && timeout_ms != 0 {
+                let timeout = if timeout_ms < 0 {
+                    None
+                } else {
+                    Some(Duration::from_millis(timeout_ms as u64))
+                };
+                if kq_drained_all_filtered {
+                    // The instance kqueue is readable, but every drained event
+                    // was masked by the guest interest or by the software ET
+                    // latch. Polling kq_fd for POLLIN would wake immediately
+                    // and spin; polling the same valid fd with an empty event
+                    // mask uses the WaitOnPollFds backstop as an interruptible
+                    // retry sleep while preserving the guest deadline.
+                    crate::probes::epoll_result(epfd, 0, 1, timeout_ms, 2);
+                    return Ok(DispatchOutcome::WaitOnPollFds {
+                        fds: WaitFds::raw_one(kq_fd, 0),
+                        timeout,
+                        on_timeout: 0,
+                        sig_mask,
+                    });
+                }
+                if !has_interests {
+                    // epoll_pwait with an empty interest set must still honour
+                    // timeout + signal interruption, not return 0 immediately.
+                    // There is no instance-fd readiness to wait for.
+                    crate::probes::epoll_result(epfd, 0, 1, timeout_ms, 2);
+                    return Ok(DispatchOutcome::WaitOnFds {
+                        fds: WaitFds::empty(),
+                        timeout,
+                        on_timeout: 0,
+                        sig_mask,
+                    });
+                }
+                crate::probes::epoll_result(epfd, 0, 1, timeout_ms, 1);
+                crate::probes::epoll_wait_fd(epfd, -1, kq_fd, libc::POLLIN as i32, timeout_ms);
+                // Poll the instance kqueue fd for readability. This avoids nesting
+                // the epoll kqueue inside the per-thread kqueue, and unlike calling
+                // kevent() here it does not consume pending epoll events before the
+                // re-dispatched epoll_pwait can copy them out.
+                return Ok(DispatchOutcome::WaitOnPollFds {
+                    fds: WaitFds::raw_one(kq_fd, libc::POLLIN),
+                    timeout,
+                    on_timeout: 0,
+                    sig_mask,
+                });
+            }
+
+            crate::probes::epoll_result(epfd, ready.len() as i32, 0, timeout_ms, 0);
+            write_epoll_events(memory, events_address, &ready, guest_abi)
+        }
+    }
+}
+
+impl SyscallDispatcher {
     define_syscall! {
 
         fn eventfd2(this, cx, initial_value: u64, flags: u64) {
@@ -2632,564 +3215,16 @@ impl SyscallDispatcher {
                     LINUX_EBADF
                 }));
             };
-            // Snapshot any already-queued ready events first. `ready` is
-            // reassigned on the multiplexer path below (it collects the
-            // drained-and-tagged events), so the `mut` is load-bearing.
-            let mut ready = {
-                let mut open = open_file.description.write();
-                let OpenDescription::Epoll { pending_ready, .. } = &mut *open else {
-                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-                };
-                drain_pending_epoll_ready(pending_ready, max_events)
-            };
-            if !ready.is_empty() {
-                crate::probes::epoll_result(epfd, ready.len() as i32, 0, timeout_ms, 0);
-                return write_epoll_events(memory, events_address, &ready, guest_abi);
-            }
-
-            // Multiplexer-backed readiness (kqueue on macOS, epoll on Linux). The
-            // multiplexer is the authoritative readiness source for host-backed fds
-            // (sockets/pipes/ptys/eventfds) — crucially, it monitors fds registered
-            // by OTHER threads while this thread is blocked, fixing the
-            // interest-snapshot race that lost a netpoller wakeup. If a drained host
-            // event names a guest fd that is not in this snapshot, fall back to the
-            // live map before dropping it; that covers the narrow concurrent ADD
-            // race without putting a live lock lookup on every returned event.
-            {
-            let (interests, kq, kq_fd) = {
-                let open = open_file.description.read();
-                let OpenDescription::Epoll {
-                    interest, kqueue, ..
-                } = &*open
-                else {
-                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-                };
-                (
-                    interest
-                        .iter()
-                        .map(|(fd, interest)| (*fd, interest.clone()))
-                        .collect::<Vec<_>>(),
-                    Arc::clone(kqueue),
-                    kqueue.poll_fd(),
-                )
-            };
-            let has_interests = !interests.is_empty();
-
-            // guest_fd -> (accumulated epoll events, epoll_data); read+write filters
-            // for the same fd merge into one returned event.
-            let mut acc: HashMap<i32, (u32, u64)> = HashMap::new();
-            let mut ready_updates: Vec<(i32, u32, u32, Option<u64>, bool)> = Vec::new();
-            let mut host_ready_sampled = std::collections::HashSet::<i32>::new();
-            const READ_READY_BITS: u32 =
-                LINUX_EPOLLIN | LINUX_EPOLLRDHUP | LINUX_EPOLLHUP | LINUX_EPOLLERR;
-
-            // (1) Drain the instance kqueue (non-blocking) for host-backed fds.
-            // `kq_drained_all_filtered` tracks the corner case where the kqueue
-            // had readiness events but the user's interest mask filters them
-            // all out (e.g. `epoll_ctl(ADD, fd, events=0)` plus data on the
-            // pipe — the read filter still fires because Linux must surface
-            // EPOLLHUP/EPOLLERR, but no event bit matches). Without this flag
-            // we'd return `WaitOnPollFds` and the runtime would re-poll the
-            // already-readable kq_fd, re-dispatch, and tight-loop until the
-            // harness deadline. Detect it once here and switch to an empty
-            // `WaitOnFds` (signal-pipe-and-timeout-only) below.
-            let mut kq_drained_all_filtered = false;
-            {
-                // Non-blocking drain of the multiplexer for host-backed fds.
-                let mut poll_events: Vec<carrick_hal::event::PollEvent> = Vec::new();
-                if kq
-                    .with_mux(|mux| mux.wait(&mut poll_events, Some(Duration::ZERO)))
-                    .is_ok()
-                {
-                    let acc_before = acc.len();
-                    // Each drained event's udata is a GENERATIONAL handle
-                    // `(guest_fd, reg_gen)` (the multiplexer IDENT stays the host
-                    // fd). Guest AND host fd numbers recycle rapidly under churn, so
-                    // routing by a bare fd is an ABA hazard; the gen lets us confirm
-                    // the edge belongs to the CURRENT registration of guest_fd and
-                    // drop a stale edge for a recycled fd (see below). For each valid
-                    // edge we RE-POLL the live owner(s) rather than trust the drained
-                    // bits, which stays correct even when the host fd was recycled
-                    // mid-drain. bits==0 is an EVFILT_USER(0) in-memory wake or a
-                    // filter with no translatable bits — in-memory readiness is
-                    // recomputed in step (2), so it is skipped (and must NOT count
-                    // toward `kq_drained_all_filtered`: it auto-resets, so polling
-                    // kq_fd won't spin, whereas the all-filtered path parks on the
-                    // signal pipe — the Node worker-teardown hang).
-                    let mut filtered_ready_events = 0usize;
-                    if !poll_events.is_empty() {
-                        // Build the per-wait routing tables from the LIVE interest map
-                        // (NOT the pre-drain snapshot): an fd ADDed by another thread
-                        // AFTER the snapshot whose edge is already in THIS batch must
-                        // still be routable — its single EV_CLEAR/EPOLLET edge is
-                        // consumed and will not re-fire. `gfd_info` resolves a guest
-                        // fd to its (host_fd, mask, data, reg_gen); `host_to_gfds` is
-                        // the reverse index for dup fan-out (one host fd may back
-                        // several guest fds — Linux wakes each pollDesc). Built once
-                        // here, then the epoll lock is dropped before the per-fd
-                        // re-poll so a concurrent epoll_ctl isn't blocked on syscalls.
-                        // gfd_info: guest fd -> (host_fd, requested events,
-                        // epoll_data, reg_gen, last_ready, last_read_avail,
-                        // write_backpressured). host_to_gfds: host fd
-                        // -> guest fds sharing it (dup fan-out). Types inferred
-                        // from the inserts.
-                        let (gfd_info, host_to_gfds) = {
-                            let open = open_file.description.read();
-                            // Per-guest-fd epoll interest snapshot: (host_fd,
-                            // events, epoll data, reg_gen, last_ready,
-                            // last_read_avail, write_backpressured).
-                            type GfdInterest = (i32, u32, u64, u32, u32, u64, bool);
-                            let mut info: HashMap<i32, GfdInterest> = HashMap::new();
-                            let mut rev: HashMap<i32, Vec<i32>> = HashMap::new();
-                            if let OpenDescription::Epoll { interest, .. } = &*open {
-                                for (gfd, slot) in interest.iter() {
-                                    if let Some(hfd) = this.host_fd_for_poll(*gfd) {
-                                        info.insert(
-                                            *gfd,
-                                            (
-                                                hfd.get(),
-                                                slot.event.events,
-                                                slot.event.data,
-                                                slot.reg_gen,
-                                                slot.last_ready,
-                                                slot.last_read_avail,
-                                                slot.write_backpressured,
-                                            ),
-                                        );
-                                        rev.entry(hfd.get()).or_default().push(*gfd);
-                                    }
-                                }
-                            }
-                            (info, rev)
-                        };
-                        // Resolve each drained event through its generational handle.
-                        // The udata is (guest_fd, gen); trust it only if the live
-                        // interest for guest_fd carries the SAME gen — otherwise the
-                        // fd was recycled (ABA) and this is a stale edge for a gone
-                        // registration: drop it (the current owner, if any, gets its
-                        // own edge) and probe so the race stays observable. A valid
-                        // hit fans out to every guest fd currently sharing that host
-                        // fd (dups). bits==0 is an EVFILT_USER(0) wake / untranslatable
-                        // filter — in-memory readiness is recomputed in step (2).
-                        let mut deliver: HashMap<i32, (u32, u64)> = HashMap::new();
-                        for ev in &poll_events {
-                            let edge_bits = pollevent_to_epoll(ev);
-                            if edge_bits == 0 {
-                                continue;
-                            }
-                            let edge_readiness_count = if ev.readiness_count > 0 {
-                                ev.readiness_count as u64
-                            } else {
-                                0
-                            };
-                            let (guest_fd, generation) = unpack_epoll_udata(ev.token);
-                            match gfd_info.get(&guest_fd) {
-                                Some(&(hfd, _, _, reg_gen, _, _, _)) if reg_gen == generation => {
-                                    if let Some(siblings) = host_to_gfds.get(&hfd) {
-                                        for sibling in siblings {
-                                            let entry = deliver.entry(*sibling).or_insert((0, 0));
-                                            entry.0 |= edge_bits;
-                                            entry.1 = entry.1.max(edge_readiness_count);
-                                        }
-                                    }
-                                }
-                                _ => {
-                                    crate::probes::epoll_stale_edge(
-                                        ev.token,
-                                        guest_fd,
-                                        generation,
-                                    );
-                                }
-                            }
-                        }
-                        // Deliver each owner's CURRENT readiness. RE-POLLING (rather
-                        // than trusting the drained bits) keeps delivery correct even
-                        // when the host fd was recycled between the edge and now — the
-                        // live poll(2) state is always the truth. illumos devpoll
-                        // model: the edge only FLAGS the fd; we re-poll just the
-                        // flagged owners (polling ALL registered fds was O(nfds) and
-                        // too slow).
-                        for (gfd, (edge_bits, edge_readiness_count)) in deliver {
-                            if let Some(&(
-                                _,
-                                requested,
-                                data,
-                                reg_gen,
-                                last_ready,
-                                last_read_avail,
-                                write_backpressured,
-                            )) =
-                                gfd_info.get(&gfd)
-                            {
-                                host_ready_sampled.insert(gfd);
-                                let raw = this.epoll_ready_events(gfd, requested);
-                                let read_avail = if raw & READ_READY_BITS != 0 {
-                                    this.host_read_avail_for_poll(gfd)
-                                } else {
-                                    0
-                                };
-                                let observed_read_avail = if edge_readiness_count > 0 {
-                                    edge_readiness_count
-                                } else {
-                                    read_avail
-                                };
-                                let clear_write_backpressure =
-                                    write_backpressured && raw & LINUX_EPOLLOUT != 0;
-                                let read_growth = if requested & LINUX_EPOLLET != 0
-                                    && raw & READ_READY_BITS != 0
-                                    && observed_read_avail > last_read_avail
-                                {
-                                    raw & READ_READY_BITS
-                                } else {
-                                    0
-                                };
-                                let mut ready_events = if requested & LINUX_EPOLLET != 0 {
-                                    (raw & !last_ready) | read_growth
-                                } else {
-                                    raw
-                                };
-                                if clear_write_backpressure {
-                                    ready_events |= raw & LINUX_EPOLLOUT;
-                                }
-                                let read_avail_update = if raw & READ_READY_BITS == 0 {
-                                    Some(0)
-                                } else {
-                                    Some(observed_read_avail)
-                                };
-                                ready_updates.push((
-                                    gfd,
-                                    reg_gen,
-                                    raw,
-                                    read_avail_update,
-                                    clear_write_backpressure,
-                                ));
-                                crate::probes::epoll_interest(
-                                    epfd,
-                                    gfd,
-                                    requested,
-                                    raw,
-                                    last_ready,
-                                    ready_events,
-                                );
-                                if ready_events != 0 {
-                                    acc.entry(gfd).or_insert((0, data)).0 |= ready_events;
-                                } else if requested & LINUX_EPOLLET != 0
-                                    && raw != 0
-                                    && raw & last_ready != 0
-                                {
-                                    #[cfg(any(
-                                        feature = "platform-macos",
-                                        feature = "platform-freebsd",
-                                        feature = "platform-netbsd"
-                                    ))]
-                                    {
-                                        // BSD host-fd registrations are kept
-                                        // level-triggered and the guest ET
-                                        // contract is enforced by last_ready.
-                                        // A level event that is fully masked by
-                                        // the software latch would make the
-                                        // instance kqueue fd immediately
-                                        // readable again, so park on the
-                                        // signal/backstop path instead.
-                                        filtered_ready_events += 1;
-                                    }
-                                    #[cfg(not(any(
-                                        feature = "platform-macos",
-                                        feature = "platform-freebsd",
-                                        feature = "platform-netbsd"
-                                    )))]
-                                    {
-                                        // Native epoll ET on Linux has no
-                                        // persistent level event to spin on
-                                        // here; a later edge will re-wake the
-                                        // instance.
-                                    }
-                                } else if raw != 0 {
-                                    filtered_ready_events += 1;
-                                }
-                            }
-                        }
-                    }
-                    // A REAL, CURRENT host-fd readiness event fired but the interest
-                    // masks let none through (the events=0-with-data case): polling
-                    // kq_fd would see the same level readiness and spin, so park on
-                    // the signal pipe instead. Stale (recycled-fd) edges are excluded
-                    // from `translatable_events`: their host edge was consumed, so
-                    // kq_fd won't spin and the kqueue-poll path stays reachable by the
-                    // current owner's own later edge. A pure EVFILT_USER drain is
-                    // likewise excluded — it auto-resets.
-                    kq_drained_all_filtered =
-                        filtered_ready_events > 0 && acc.len() == acc_before;
-                }
-            }
-
-            // (2) Host-backed fds: the multiplexer edge says which owners are
-            // worth re-polling, but the live host level is still the authority.
-            // Re-sample any host-backed interest that was not already sampled
-            // from a drained mux event so a missed/stale edge cannot park an
-            // epoll waiter while the host fd is already readable/writable.
-            for (fd, interest) in &interests {
-                if host_ready_sampled.contains(fd) || this.host_fd_for_poll(*fd).is_none() {
-                    continue;
-                }
-                host_ready_sampled.insert(*fd);
-                let requested = interest.event.events;
-                let raw_ready = this.epoll_ready_events(*fd, requested);
-                let read_avail = if raw_ready & READ_READY_BITS != 0 {
-                    this.host_read_avail_for_poll(*fd)
-                } else {
-                    0
-                };
-                let clear_write_backpressure =
-                    interest.write_backpressured && raw_ready & LINUX_EPOLLOUT != 0;
-                let read_growth = if requested & LINUX_EPOLLET != 0
-                    && raw_ready & READ_READY_BITS != 0
-                    && read_avail > interest.last_read_avail
-                {
-                    raw_ready & READ_READY_BITS
-                } else {
-                    0
-                };
-                let mut ready_events = if requested & LINUX_EPOLLET != 0 {
-                    (raw_ready & !interest.last_ready) | read_growth
-                } else {
-                    raw_ready
-                };
-                if clear_write_backpressure {
-                    ready_events |= raw_ready & LINUX_EPOLLOUT;
-                }
-                let read_avail_update = if raw_ready & READ_READY_BITS == 0 {
-                    Some(0)
-                } else {
-                    Some(read_avail)
-                };
-                ready_updates.push((
-                    *fd,
-                    interest.reg_gen,
-                    raw_ready,
-                    read_avail_update,
-                    clear_write_backpressure,
-                ));
-                crate::probes::epoll_interest(
-                    epfd,
-                    *fd,
-                    requested,
-                    raw_ready,
-                    interest.last_ready,
-                    ready_events,
-                );
-                if ready_events != 0 {
-                    let entry = acc.entry(*fd).or_insert((0, interest.event.data));
-                    entry.0 |= ready_events;
-                }
-            }
-
-            // (3) In-memory fds (no host fd): recompute readiness.
-            for (fd, interest) in &interests {
-                if host_ready_sampled.contains(fd) {
-                    continue;
-                }
-                // Host-fd fds are handled by the kqueue drain above — EXCEPT a
-                // named-FIFO read-end whose writer has closed: macOS kqueue won't
-                // report that (dispatch::fifo_beacon decides it via a kernel
-                // beacon pipe), so recompute it here so the notify_inmem_epoll
-                // wake on writer-close surfaces EOF instead of blocking forever.
-                if let Some(hfd) = this.host_fd_for_poll(*fd)
-                    && !crate::dispatch::fifo_beacon::read_end_at_eof(hfd.get()) {
-                        continue;
-                    }
-                let requested = interest.event.events;
-                let raw_ready = this.epoll_ready_events(*fd, requested);
-                let ready_events = if requested & LINUX_EPOLLET != 0 {
-                    raw_ready & !interest.last_ready
-                } else {
-                    raw_ready
-                };
-                ready_updates.push((*fd, interest.reg_gen, raw_ready, Some(0), false));
-                crate::probes::epoll_interest(
-                    epfd,
-                    *fd,
-                    requested,
-                    raw_ready,
-                    interest.last_ready,
-                    ready_events,
-                );
-                if ready_events != 0 {
-                    let entry = acc.entry(*fd).or_insert((0, interest.event.data));
-                    entry.0 |= ready_events;
-                }
-            }
-
-            // EPOLLONESHOT: every interest that just fired must be disarmed
-            // until EPOLL_CTL_MOD re-arms it (Linux semantics — the fd never
-            // appears in a subsequent epoll_wait without an explicit MOD).
-            // Collect the fds-to-disarm before consuming `acc`.
-            let oneshot_fds: Vec<i32> = acc
-                .iter()
-                .filter(|(fd, _)| {
-                    interests
-                        .iter()
-                        .any(|(ifd, slot)| ifd == *fd && slot.event.events & LINUX_EPOLLONESHOT != 0)
-                })
-                .map(|(fd, _)| *fd)
-                .collect();
-
-            if !ready_updates.is_empty() || !oneshot_fds.is_empty() {
-                let mut open = open_file.description.write();
-                if let OpenDescription::Epoll {
-                    interest, kqueue, ..
-                } = &mut *open
-                {
-                    #[cfg(any(
-                        feature = "platform-macos",
-                        feature = "platform-freebsd",
-                        feature = "platform-netbsd"
-                    ))]
-                    let mut host_rearms: Vec<i32> = Vec::new();
-                    for (fd, reg_gen, raw, read_avail, clear_write_backpressure) in ready_updates {
-                        if let Some(slot) = interest.get_mut(&fd) {
-                            if slot.reg_gen != reg_gen {
-                                continue;
-                            }
-                            let before = slot.last_ready;
-                            let read_avail_changed = read_avail
-                                .is_some_and(|read_avail| read_avail != slot.last_read_avail);
-                            slot.last_ready = raw;
-                            if let Some(read_avail) = read_avail {
-                                slot.last_read_avail = read_avail;
-                            }
-                            if clear_write_backpressure {
-                                slot.write_backpressured = false;
-                            }
-                            #[cfg(any(
-                                feature = "platform-macos",
-                                feature = "platform-freebsd",
-                                feature = "platform-netbsd"
-                            ))]
-                            if slot.event.events & LINUX_EPOLLET != 0
-                                && (before != raw || read_avail_changed)
-                                && let Some(host_fd) = this.host_fd_for_poll(fd)
-                            {
-                                host_rearms.push(host_fd.get());
-                            }
-                        }
-                    }
-                    #[cfg(any(
-                        feature = "platform-macos",
-                        feature = "platform-freebsd",
-                        feature = "platform-netbsd"
-                    ))]
-                    {
-                        host_rearms.sort_unstable();
-                        host_rearms.dedup();
-                        for host_fd in host_rearms {
-                            this.rebind_epoll_host_registration(kqueue, interest, HostFd(host_fd));
-                        }
-                    }
-                    for fd in &oneshot_fds {
-                        if let Some(slot) = interest.get_mut(fd) {
-                            // Clear the events mask so subsequent waits never
-                            // surface this fd until EPOLL_CTL_MOD re-arms it.
-                            slot.event.events = 0;
-                        }
-                    }
-                }
-            }
-            // Also remove the host kqueue filter for each disarmed fd so the
-            // level-triggered EVFILT_READ doesn't keep firing and tight-loop
-            // the next epoll_wait (the same shape as the events=0 fix above,
-            // applied to the freshly-disarmed ONESHOT slot).
-            for fd in &oneshot_fds {
-                if let Some(host_fd) = this.host_fd_for_poll(*fd) {
-                    kq.with_mux(|mux| {
-                        let _ = mux.deregister(host_fd.get());
-                    });
-                }
-            }
-
-            // Tag each ready event with its ORIGINATING guest fd (acc is keyed by
-            // guest fd) so an overflow queued into pending_ready can be purged by
-            // fd on EPOLL_CTL_DEL/MOD even when epoll_data != fd. Split the tail
-            // (still fd-tagged) into pending_ready, THEN strip fds for the
-            // guest-visible `ready`. (audit M3; probe epollstaledel)
-            let mut ready_tagged: Vec<(i32, LinuxEpollEvent)> = acc
-                .into_iter()
-                .map(|(fd, (events, data))| {
-                    (
-                        fd,
-                        LinuxEpollEvent {
-                            events,
-                            _pad: 0,
-                            data,
-                        },
-                    )
-                })
-                .collect();
-            if ready_tagged.len() > max_events {
-                let overflow: Vec<(i32, LinuxEpollEvent)> = ready_tagged.split_off(max_events);
-                let mut open = open_file.description.write();
-                if let OpenDescription::Epoll { pending_ready, .. } = &mut *open {
-                    pending_ready.extend(overflow);
-                }
-            }
-            ready = ready_tagged.into_iter().map(|(_fd, event)| event).collect();
-
-            crate::event_ring::rec(
-                crate::event_ring::EPWAIT,
-                kq_fd,
-                ready.len() as i32,
+            this.epoll_pwait_wait_core(
+                memory,
+                open_file,
+                epfd,
+                events_address,
+                guest_abi,
+                max_events,
                 timeout_ms,
-            );
-            if ready.is_empty() && timeout_ms != 0 {
-                let timeout = if timeout_ms < 0 {
-                    None
-                } else {
-                    Some(Duration::from_millis(timeout_ms as u64))
-                };
-                if kq_drained_all_filtered {
-                    // The instance kqueue is readable, but every drained event
-                    // was masked by the guest interest or by the software ET
-                    // latch. Polling kq_fd for POLLIN would wake immediately
-                    // and spin; polling the same valid fd with an empty event
-                    // mask uses the WaitOnPollFds backstop as an interruptible
-                    // retry sleep while preserving the guest deadline.
-                    crate::probes::epoll_result(epfd, 0, 1, timeout_ms, 2);
-                    return Ok(DispatchOutcome::WaitOnPollFds {
-                        fds: WaitFds::raw_one(kq_fd, 0),
-                        timeout,
-                        on_timeout: 0,
-                        sig_mask,
-                    });
-                }
-                if !has_interests {
-                    // epoll_pwait with an empty interest set must still honour
-                    // timeout + signal interruption, not return 0 immediately.
-                    // There is no instance-fd readiness to wait for.
-                    crate::probes::epoll_result(epfd, 0, 1, timeout_ms, 2);
-                    return Ok(DispatchOutcome::WaitOnFds {
-                        fds: WaitFds::empty(),
-                        timeout,
-                        on_timeout: 0,
-                        sig_mask,
-                    });
-                }
-                crate::probes::epoll_result(epfd, 0, 1, timeout_ms, 1);
-                crate::probes::epoll_wait_fd(epfd, -1, kq_fd, libc::POLLIN as i32, timeout_ms);
-                // Poll the instance kqueue fd for readability. This avoids nesting
-                // the epoll kqueue inside the per-thread kqueue, and unlike calling
-                // kevent() here it does not consume pending epoll events before the
-                // re-dispatched epoll_pwait can copy them out.
-                return Ok(DispatchOutcome::WaitOnPollFds {
-                    fds: WaitFds::raw_one(kq_fd, libc::POLLIN),
-                    timeout,
-                    on_timeout: 0,
-                    sig_mask,
-                });
-            }
-
-            crate::probes::epoll_result(epfd, ready.len() as i32, 0, timeout_ms, 0);
-            write_epoll_events(memory, events_address, &ready, guest_abi)
-        }
+                sig_mask,
+            )
 
         }
 
@@ -3205,17 +3240,36 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             let max_events = max_events_signed as usize;
-            if sigmask_ptr != 0 {
+            // epoll_pwait2 carries the SAME sigmask (arg4) + sigsetsize (arg5)
+            // contract as epoll_pwait: a non-NULL mask must have the right size
+            // and a readable pointer (else EINVAL/EFAULT), and it REPLACES the
+            // thread mask for the wait so a blocked signal doesn't interrupt it.
+            // Capture it as a typed SigSet exactly like epoll_pwait so both feed
+            // the shared wait core identically (LTP epoll_pwait01).
+            let block_signals: carrick_abi::SigSet = if sigmask_ptr != 0 {
                 if sigsetsize != crate::linux_abi::LINUX_RT_SIGSET_SIZE {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
-                if memory
-                    .read_bytes(sigmask_ptr, crate::linux_abi::LINUX_RT_SIGSET_SIZE as usize)
-                    .is_err()
-                {
-                    return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                match memory.read_bytes(sigmask_ptr, crate::linux_abi::LINUX_RT_SIGSET_SIZE as usize) {
+                    Ok(bytes) => {
+                        let mut le = [0u8; 8];
+                        le.copy_from_slice(&bytes[..8]);
+                        carrick_abi::SigSet::from_raw(u64::from_le_bytes(le))
+                    }
+                    Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
                 }
-            }
+            } else {
+                carrick_abi::SigSet::EMPTY
+            };
+            let sig_mask = if sigmask_ptr != 0 {
+                carrick_abi::WaitSigMask::Replace(block_signals)
+            } else {
+                carrick_abi::WaitSigMask::NONE
+            };
+            // epoll_pwait2's timeout is a *timespec (nsec), unlike epoll_pwait's
+            // millisecond int; decode it to the timeout_ms the shared wait core
+            // consumes. NULL = block forever (-1). Invalid timespec -> EINVAL,
+            // bad pointer -> EFAULT (LTP epoll_pwait04).
             let timeout_ms = if timeout_addr == 0 {
                 -1
             } else {
@@ -3244,30 +3298,19 @@ impl SyscallDispatcher {
                     LINUX_EBADF
                 }));
             };
-            let (ready, has_interests) = {
-                let mut open = open_file.description.write();
-                let OpenDescription::Epoll {
-                    interest,
-                    pending_ready,
-                    ..
-                } = &mut *open
-                else {
-                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-                };
-                (
-                    drain_pending_epoll_ready(pending_ready, max_events),
-                    !interest.is_empty(),
-                )
-            };
-            if !ready.is_empty() {
-                crate::probes::epoll_result(epfd, ready.len() as i32, 0, timeout_ms, 0);
-                return write_epoll_events(memory, events_address, &ready, guest_abi);
-            }
-            if timeout_ms == 0 || !has_interests {
-                crate::probes::epoll_result(epfd, 0, 0, timeout_ms, 0);
-                return Ok(DispatchOutcome::Returned { value: 0 });
-            }
-            Ok(DispatchOutcome::errno(LINUX_ENOSYS))
+            // Delegate to the SHARED epoll_pwait wait core. epoll_pwait2 formerly
+            // returned ENOSYS whenever a real wait/readiness sample was required,
+            // diverging from epoll_pwait (LTP epoll_pwait01/02/03).
+            this.epoll_pwait_wait_core(
+                memory,
+                open_file,
+                epfd,
+                events_address,
+                guest_abi,
+                max_events,
+                timeout_ms,
+                sig_mask,
+            )
         }
 
         fn pselect6(this, cx, nfds: u64, readfds: GuestPtr, writefds: GuestPtr, exceptfds: GuestPtr, timeout: GuestPtr, sigmask: GuestPtr) {
