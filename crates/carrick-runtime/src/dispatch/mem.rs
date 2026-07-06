@@ -802,10 +802,62 @@ impl SyscallDispatcher {
     }
 
     fn membarrier(&self, command: u64, flags: u64) -> DispatchOutcome {
-        if command == LINUX_MEMBARRIER_CMD_QUERY && flags == 0 {
-            return DispatchOutcome::Returned { value: 0 };
+        // membarrier(2) command bits (also the CMD_QUERY reply mask). carrick
+        // has a globally-coherent guest address space, so every barrier is a
+        // no-op that succeeds once its precondition (registration, for the
+        // expedited-private variants) is met.
+        const CMD_GLOBAL: u64 = 1 << 0;
+        const CMD_GLOBAL_EXPEDITED: u64 = 1 << 1;
+        const CMD_REGISTER_GLOBAL_EXPEDITED: u64 = 1 << 2;
+        const CMD_PRIVATE_EXPEDITED: u64 = 1 << 3;
+        const CMD_REGISTER_PRIVATE_EXPEDITED: u64 = 1 << 4;
+        const CMD_PRIVATE_EXPEDITED_SYNC_CORE: u64 = 1 << 5;
+        const CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE: u64 = 1 << 6;
+        const SUPPORTED: u64 = CMD_GLOBAL
+            | CMD_GLOBAL_EXPEDITED
+            | CMD_REGISTER_GLOBAL_EXPEDITED
+            | CMD_PRIVATE_EXPEDITED
+            | CMD_REGISTER_PRIVATE_EXPEDITED
+            | CMD_PRIVATE_EXPEDITED_SYNC_CORE
+            | CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE;
+
+        // No advertised command takes a flag (only the un-advertised RSEQ CPU
+        // variant does), so any non-zero flags arg is EINVAL — checked before
+        // the command, matching the kernel (and QUERY|flags=1 → EINVAL).
+        if flags != 0 {
+            return DispatchOutcome::errno(LINUX_EINVAL);
         }
-        DispatchOutcome::errno(LINUX_EINVAL)
+        if command == LINUX_MEMBARRIER_CMD_QUERY {
+            return DispatchOutcome::Returned {
+                value: SUPPORTED as i64,
+            };
+        }
+        match command {
+            // A global (or global-expedited) barrier needs no registration.
+            CMD_GLOBAL | CMD_GLOBAL_EXPEDITED | CMD_REGISTER_GLOBAL_EXPEDITED => {
+                DispatchOutcome::Returned { value: 0 }
+            }
+            // Registering an expedited-private intent records the readiness bit
+            // so a subsequent expedited-private barrier succeeds.
+            CMD_REGISTER_PRIVATE_EXPEDITED => {
+                self.proc.lock().membarrier_ready |= CMD_PRIVATE_EXPEDITED;
+                DispatchOutcome::Returned { value: 0 }
+            }
+            CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE => {
+                self.proc.lock().membarrier_ready |= CMD_PRIVATE_EXPEDITED_SYNC_CORE;
+                DispatchOutcome::Returned { value: 0 }
+            }
+            // An expedited-private barrier requires prior registration; an
+            // unregistered call is EPERM (Linux >= 4.16).
+            CMD_PRIVATE_EXPEDITED | CMD_PRIVATE_EXPEDITED_SYNC_CORE => {
+                if self.proc.lock().membarrier_ready & command != 0 {
+                    DispatchOutcome::Returned { value: 0 }
+                } else {
+                    DispatchOutcome::errno(LINUX_EPERM)
+                }
+            }
+            _ => DispatchOutcome::errno(LINUX_EINVAL),
+        }
     }
 }
 
