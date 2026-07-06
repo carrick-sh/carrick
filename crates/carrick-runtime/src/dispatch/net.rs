@@ -5110,6 +5110,14 @@ impl SyscallDispatcher {
                     return Ok(DispatchOutcome::errno(LINUX_ENOPROTOOPT));
                 }
             };
+            // A non-zero optlen with a NULL optval is EFAULT on Linux (the kernel
+            // copies optlen bytes in from the pointer); macOS would instead see a
+            // NULL/short buffer and answer EINVAL. (setsockopt01 "invalid option
+            // buffer") A zero optlen keeps the existing empty-buffer behavior so
+            // the "invalid optlen" case still surfaces the host's EINVAL.
+            if optlen != 0 && optval_addr == 0 {
+                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+            }
             let bytes = if optval_addr == 0 || optlen == 0 {
                 Vec::new()
             } else {
@@ -5134,9 +5142,17 @@ impl SyscallDispatcher {
                 )
             };
             Ok(if let Err(errno) = rc.host_syscall_errno() {
-                // Linux apps frequently set options that aren't supported on
-                // macOS (eg IP_MTU_DISCOVER); swallow ENOPROTOOPT silently
-                // when the equivalent option simply doesn't exist on macOS.
+                // At a protocol level (IPPROTO_*), macOS answers EINVAL for an
+                // optname it doesn't recognize where Linux answers ENOPROTOOPT.
+                // SOL_SOCKET is excluded so its optlen-validation EINVAL (the
+                // "invalid optlen" case) stays EINVAL. Other errnos (incl. the
+                // ENOPROTOOPT for options macOS simply lacks, eg IP_MTU_DISCOVER)
+                // pass through unchanged. (setsockopt01 "invalid option name (UDP)")
+                let errno = if errno == LINUX_EINVAL && level != LINUX_SOL_SOCKET {
+                    LINUX_ENOPROTOOPT
+                } else {
+                    errno
+                };
                 DispatchOutcome::errno(errno)
             } else {
                 DispatchOutcome::Returned { value: 0 }
@@ -5345,7 +5361,15 @@ impl SyscallDispatcher {
             let (host_level, host_opt) = match linux_to_host_sockopt(level, optname) {
                 Some(t) => t,
                 None => {
-                    return Ok(DispatchOutcome::errno(LINUX_ENOPROTOOPT));
+                    // An unrecognized LEVEL is EOPNOTSUPP; an unrecognized optname
+                    // at a known level stays ENOPROTOOPT. (getsockopt01 "invalid
+                    // level" vs "invalid option name (IP/TCP)")
+                    let errno = if is_known_sockopt_level(level) {
+                        LINUX_ENOPROTOOPT
+                    } else {
+                        LINUX_EOPNOTSUPP
+                    };
+                    return Ok(DispatchOutcome::errno(errno));
                 }
             };
             // Read the guest's reported optlen so we don't overflow.
@@ -5361,6 +5385,11 @@ impl SyscallDispatcher {
                 optlen_bytes[2],
                 optlen_bytes[3],
             ]);
+            // A negative optlen (as a signed int) is EINVAL on Linux. (getsockopt01
+            // "invalid optlen") macOS would clamp the u32 and read successfully.
+            if (optlen as i32) < 0 {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
             let cap = optlen.min(256) as usize;
             let mut buf = vec![0u8; cap];
             let rc = unsafe {
@@ -5373,9 +5402,24 @@ impl SyscallDispatcher {
                 )
             };
             if let Err(errno) = rc.host_syscall_errno() {
+                // At a protocol level (IPPROTO_*), macOS answers EINVAL for an
+                // option it can't read where Linux answers EOPNOTSUPP; SOL_SOCKET
+                // is excluded so a genuine value/optlen EINVAL stays EINVAL.
+                // (getsockopt01 "not supported option name (UDP)")
+                let errno = if errno == LINUX_EINVAL && level != LINUX_SOL_SOCKET {
+                    LINUX_EOPNOTSUPP
+                } else {
+                    errno
+                };
                 return Ok(DispatchOutcome::errno(errno));
             }
             let used = (optlen as usize).min(buf.len());
+            // A NULL optval with a value to return is EFAULT on Linux (the kernel
+            // copies `used` bytes out); macOS silently succeeds. (getsockopt01
+            // "invalid option buffer")
+            if used > 0 && optval_addr == 0 {
+                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+            }
             if optval_addr != 0 && used > 0 && memory.write_bytes(optval_addr, &buf[..used]).is_err() {
                 return Ok(DispatchOutcome::errno(LINUX_EFAULT));
             }
