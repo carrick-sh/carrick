@@ -2106,6 +2106,18 @@ impl SyscallDispatcher {
                 }
             }
 
+            // mmap_min_addr floor (default 64 KiB): a process may not place a
+            // mapping in the first 64 KiB of the address space. do_shmat sets
+            // MAP_FIXED for a non-NULL shmaddr, so a too-low address — even
+            // after SHM_RND rounds it down to a page boundary — is rejected
+            // outright rather than relocated. shmat03 attaches at a low address
+            // and asserts nothing maps within the first 64 KiB.
+            const MMAP_MIN_ADDR: u64 = 0x10000;
+            if addr != 0 && (addr & !(LINUX_PAGE_SIZE - 1)) < MMAP_MIN_ADDR {
+                unsafe { libc::close(host_fd) };
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
+
             // Reserve a guest alias-VA window and return MapHostAlias so the
             // runtime hv_vm_maps the host file into the guest's address
             // space — same path mmap(MAP_SHARED, fd) uses for file mappings.
