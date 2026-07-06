@@ -4652,7 +4652,33 @@ impl SyscallDispatcher {
             let open = open_file.description.read();
             Ok(match &*open {
                 OpenDescription::Directory { metadata, .. } => {
-                    *this.io.cwd.write() = display_rootfs_path(&metadata.path);
+                    let dir_path = display_rootfs_path(&metadata.path);
+                    // fchdir(2) requires search (execute) permission on the
+                    // directory the fd refers to. The fd may have been opened
+                    // O_RDONLY (needing only read) and the directory later
+                    // chmod'd to drop its search bit — so re-stat to observe the
+                    // CURRENT mode/owner rather than the value captured at open
+                    // time. A non-root euid lacking X on the directory gets
+                    // EACCES (fchdir03); root (euid 0) bypasses via
+                    // CAP_DAC_OVERRIDE.
+                    let creds = this.cred_snapshot();
+                    if creds.euid != 0
+                        && let Some(real) =
+                            this.fs.rootfs_vfs.overlay.real_stat(&dir_path, true)
+                        && crate::dispatch::dac_check(
+                            creds.euid,
+                            creds.egid,
+                            real.uid,
+                            real.gid,
+                            real.mode,
+                            true,
+                            LINUX_X_OK,
+                        )
+                        .is_err()
+                    {
+                        return Ok(DispatchOutcome::errno(LINUX_EACCES));
+                    }
+                    *this.io.cwd.write() = dir_path;
                     DispatchOutcome::Returned { value: 0 }
                 }
                 OpenDescription::File { .. }
