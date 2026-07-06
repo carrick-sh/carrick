@@ -459,6 +459,11 @@ const SYSCTL_TABLE: &[(&str, Sysctl)] = &[
     // scans; without it tst_test aborts with ENOENT.
     ("/proc/sys/kernel/pid_max", Sysctl::Static(b"4194304\n")),
     ("/proc/sys/kernel/ns_last_pid", Sysctl::Static(b"0\n")),
+    // Linux default core dump filename pattern (matches the Docker oracle). Read
+    // by tools deciding whether a core-dumping signal produces a dump — a leading
+    // '|' means a pipe handler (dumps regardless of RLIMIT_CORE); "core" does not
+    // (waitid10 setup reads this).
+    ("/proc/sys/kernel/core_pattern", Sysctl::Static(b"core\n")),
     (
         "/proc/sys/kernel/shmall",
         Sysctl::Static(b"18446744073692774399\n"),
