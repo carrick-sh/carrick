@@ -1253,6 +1253,12 @@ impl SyscallDispatcher {
         if kind == RootFsEntryKind::Directory {
             return Ok(DispatchOutcome::errno(LINUX_EISDIR));
         }
+        // DAC: truncating a file writes it, so a caller without write permission
+        // is EACCES (truncate03 sets euid to nobody and truncates a 0444 file).
+        // Root bypasses; `--fs memory` (no real owner/mode) falls through.
+        if let Some(errno) = self.may_write(&resolved) {
+            return Ok(DispatchOutcome::errno(errno));
+        }
         // Disk-backed: open the real file and ftruncate it. The whole rootfs
         // is materialised on the cap-std scratch under --fs host, so this
         // works for both rootfs and guest-created files. MemoryBackend has no
