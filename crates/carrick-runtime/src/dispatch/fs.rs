@@ -9856,6 +9856,30 @@ impl SyscallDispatcher {
             {
                 return Ok(DispatchOutcome::errno(LINUX_EEXIST));
             }
+            // The new-path's parent directory must exist, be a directory, and be
+            // writable by the caller — creating a hard link writes an entry into
+            // it (link04: a missing parent component -> ENOENT, a non-directory
+            // component -> ENOTDIR, an unwritable parent under a dropped euid ->
+            // EACCES). VFS-mount targets own their own checks below.
+            if this.fs.vfs_mounts.resolve(&resolved_new).is_none() {
+                let new_parent = std::path::Path::new(&resolved_new)
+                    .parent()
+                    .map(|p| {
+                        let s = p.to_string_lossy().into_owned();
+                        if s.is_empty() { "/".to_string() } else { s }
+                    })
+                    .unwrap_or_else(|| "/".to_string());
+                match this.layered_metadata(&new_parent) {
+                    Err(_) => return Ok(DispatchOutcome::errno(LINUX_ENOENT)),
+                    Ok(md) if md.kind != RootFsEntryKind::Directory => {
+                        return Ok(DispatchOutcome::errno(LINUX_ENOTDIR));
+                    }
+                    Ok(_) => {}
+                }
+                if let Some(errno) = this.may_write(&new_parent) {
+                    return Ok(DispatchOutcome::errno(errno));
+                }
+            }
             // Linux gives the unnamed inode a name in place (same inode); carrick
             // has no shared-inode primitive for the overlay, so it materializes a
             // fresh entry from the fd's live bytes + creation mode. The O_TMPFILE
