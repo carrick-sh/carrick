@@ -4893,27 +4893,36 @@ impl SyscallDispatcher {
             let address = address.0;
             let size =
                 usize::try_from(size).map_err(|_| DispatchError::LengthTooLarge(size))?;
-            // getcwd(2) under a chroot reports the cwd RELATIVE to the process's
-            // chroot root; a cwd that lies OUTSIDE that root subtree is
-            // unreachable and returns ENOENT. glibc's realpath(".") relies on
-            // this to fail when the caller chroots into a subdirectory without
-            // first chdir'ing into it, leaving the cwd above the new root
-            // (realpath01, the CVE-2018-1000001 regression). With no chroot the
-            // cwd is reported verbatim.
+            // carrick stores the GLOBAL cwd and does NOT re-root path
+            // resolution, so getcwd(2) reports that global path verbatim in
+            // almost every case — including a cwd set by a post-chroot chdir
+            // (`chroot("/x"); chdir("/etc"); getcwd()` → "/etc", matching
+            // Linux). The ONE exception is the CVE-2018-1000001 shape realpath01
+            // exercises: the guest chroots into a SUBDIRECTORY of its cwd
+            // without chdir'ing in, leaving the cwd ABOVE the new root. Such a
+            // cwd is unreachable from the root, so getcwd returns ENOENT. A
+            // chroot("/") is a no-op and never triggers this.
             let cwd = this.io.cwd.read().clone();
-            let cwd = match &*this.io.chroot_root.read() {
-                Some(root) => {
-                    // cwd == "/" means the guest chdir'd to the (global) root
-                    // after chroot: it is at the chroot root, so getcwd is "/".
-                    if cwd == "/" || cwd == *root {
+            let cwd = match this.io.chroot_root.read().as_deref() {
+                Some(root) if root != "/" => {
+                    if cwd == root {
+                        // The guest chdir'd into the new root itself.
                         "/".to_owned()
                     } else if let Some(rel) = cwd.strip_prefix(&format!("{root}/")) {
+                        // cwd lies inside the root subtree.
                         format!("/{rel}")
-                    } else {
+                    } else if cwd == "/" || root.starts_with(&format!("{cwd}/")) {
+                        // cwd is a strict ANCESTOR of the new root: it is above
+                        // the root and unreachable (realpath01 / CVE-2018-1000001).
                         return Ok(DispatchOutcome::errno(LINUX_ENOENT));
+                    } else {
+                        // Neither inside nor above the root: report the global
+                        // cwd verbatim (carrick does not re-root).
+                        cwd
                     }
                 }
-                None => cwd,
+                // No chroot, or the chroot("/") no-op.
+                _ => cwd,
             };
             // The cwd is stored in the VFS layer's reversible escape form;
             // decode to the opaque path BYTES so getcwd is byte-exact for a
@@ -8549,14 +8558,17 @@ impl SyscallDispatcher {
                     };
                     let n = match n.host_syscall_errno() {
                         Ok(v) => v,
-                        // A socket that cannot serve as a splice source (an
-                        // unconnected socket → ENOTCONN, a non-spliceable family,
-                        // …) is EINVAL, not the raw host errno (splice07). EAGAIN
-                        // keeps its meaning for the non-blocking netpoller path.
-                        Err(e) if e == LINUX_EAGAIN => {
-                            return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
+                        // A socket that STRUCTURALLY cannot serve as a splice
+                        // source — unconnected (ENOTCONN) or a family without a
+                        // splice_read op (EOPNOTSUPP) — is EINVAL, matching
+                        // Linux's structural check (splice07). Every OTHER recv
+                        // error is a genuine transport/nonblocking condition —
+                        // EAGAIN (netpoller), ECONNRESET, EPIPE, … — which Linux
+                        // propagates verbatim, so surface the real errno.
+                        Err(e) if e == LINUX_ENOTCONN || e == LINUX_EOPNOTSUPP => {
+                            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                         }
-                        Err(_) => return Ok(DispatchOutcome::errno(LINUX_EINVAL)),
+                        Err(e) => return Ok(DispatchOutcome::errno(e)),
                     };
                     if n == 0 {
                         return Ok(DispatchOutcome::Returned { value: 0 });
@@ -8593,15 +8605,17 @@ impl SyscallDispatcher {
                 };
                 let n = match n.host_syscall_errno() {
                     Ok(v) => v,
-                    // A socket that cannot serve as a splice source (an
-                    // unconnected socket → ENOTCONN, a non-spliceable family, …)
-                    // is EINVAL, not the raw host errno (splice07 socket-source
-                    // cases). EAGAIN keeps its meaning for the non-blocking Go
-                    // netpoller path.
-                    Err(e) if e == LINUX_EAGAIN => {
-                        return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
+                    // A socket that STRUCTURALLY cannot serve as a splice source —
+                    // unconnected (ENOTCONN) or a family without a splice_read op
+                    // (EOPNOTSUPP) — is EINVAL, matching Linux's structural check
+                    // (splice07 socket-source cases). Every OTHER recv error is a
+                    // genuine transport/nonblocking condition — EAGAIN (Go
+                    // netpoller), ECONNRESET, EPIPE, … — which Linux propagates
+                    // verbatim, so surface the real errno.
+                    Err(e) if e == LINUX_ENOTCONN || e == LINUX_EOPNOTSUPP => {
+                        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                     }
-                    Err(_) => return Ok(DispatchOutcome::errno(LINUX_EINVAL)),
+                    Err(e) => return Ok(DispatchOutcome::errno(e)),
                 };
                 if n == 0 {
                     // EOF: the writer closed; splice reports 0 (Go stops the loop).
