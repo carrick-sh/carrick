@@ -97,11 +97,23 @@ mod imp {
         if !argv0.contains(": ") {
             return None;
         }
-        let name = argv0.rsplit(": ").next()?.trim();
-        if name.is_empty() || name == "carrick" {
+        let label = argv0.rsplit(": ").next()?.trim();
+        if label.is_empty() || label == "carrick" {
             return None;
         }
-        Some(name.chars().take(15).collect())
+        // Linux `comm` is a SINGLE token with no spaces — the basename of
+        // argv[0], truncated to TASK_COMM_LEN-1 (15). The proctitle LABEL may be
+        // the full command line ("/bin/sh -c cat …", set for `ps` readability),
+        // so reduce it to the comm: first whitespace-delimited token, then its
+        // path basename. A comm containing spaces breaks a `/proc/<pid>/stat`
+        // reader that scans the `(comm)` field with `%s` (LTP getpgid01 parsing
+        // /proc/1/stat, whose init label is the full shell command line).
+        let argv0_token = label.split_whitespace().next().unwrap_or(label);
+        let base = argv0_token.rsplit('/').next().unwrap_or(argv0_token);
+        if base.is_empty() {
+            return None;
+        }
+        Some(base.chars().take(15).collect())
     }
 
     /// Read `pid`'s `argv[0]` (the proctitle) via `KERN_PROCARGS2` and pull the
@@ -439,6 +451,21 @@ mod imp {
             assert_eq!(
                 parse_proctitle_name("carrick: bash").as_deref(),
                 Some("bash")
+            );
+        }
+
+        #[test]
+        fn reduces_a_full_command_line_label_to_a_single_token_comm() {
+            // The init/root proctitle carries the whole command line for `ps`
+            // readability; `comm` must be the basename of argv[0] alone (no
+            // spaces, no path) — else a `/proc/<pid>/stat` `(comm)` scan breaks.
+            assert_eq!(
+                parse_proctitle_name("carrick:run-1: /bin/sh -c cat /proc/1/stat").as_deref(),
+                Some("sh")
+            );
+            assert_eq!(
+                parse_proctitle_name("carrick:run-1: /opt/ltp/testcases/bin/getpgid01").as_deref(),
+                Some("getpgid01")
             );
         }
 
