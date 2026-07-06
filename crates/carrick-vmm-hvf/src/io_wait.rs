@@ -549,15 +549,30 @@ impl ThreadWaiter {
             return WaitResult::Ready;
         }
         // Fast path: park in kevent() on the per-thread kqueue's EVFILT_PROC.
+        //
+        // NOTE: this deliberately does NOT gate on `has_dead_wake_pipe()`. The
+        // kqueue's EVFILT_PROC/NOTE_EXIT child-exit notification is independent of
+        // the signal wake pipes — it needs no pipe at all. A dead wake pipe only
+        // means we can't get a *prompt* pipe-poked wake for a pending *signal*; the
+        // proc-exit wake still fires promptly via the kqueue. Gating the whole
+        // proc-exit path on wake-pipe health was the fork-storm regression: a
+        // forked child closes the process self-pipe's write end (its read end goes
+        // to permanent EOF), one drain marks `wake_pipe_dead`, and every
+        // subsequent waitpid then fell back to the 50ms `waitid(WNOHANG)` poll for
+        // the rest of the process's life (~56ms/reap). With the kqueue alive, we
+        // keep parking in EVFILT_PROC and reap on the child's exit edge; signal
+        // responsiveness degrades only to the same 50ms `should_interrupt` slices
+        // the poll fallback already used (see `wait_proc_exit_kqueue`).
         if pid > 0
-            && !self.has_dead_wake_pipe()
             && let Some(kq) = self.kq.as_ref()
         {
             match self.wait_proc_exit_kqueue(kq, pid, block_mask) {
                 ProcExitWait::Done(result) => return result,
-                // The kqueue fd was closed out from under us; abandon it and poll
-                // the child directly so the guest's wait4 still completes instead
-                // of busy-spinning on EBADF forever (the apt fork-storm hang).
+                // The kqueue fd itself is invalid (EBADF: closed out from under us
+                // by the fork-storm internal-fd churn) — retrying it can only EBADF
+                // forever, so poll the child directly to avoid a busy-spin (the apt
+                // fork-storm hang). A merely-dead *wake pipe* does NOT reach here:
+                // `wait_proc_exit_kqueue` keeps using EVFILT_PROC in that case.
                 ProcExitWait::KqueueDead => {}
             }
         }
@@ -594,7 +609,6 @@ impl ThreadWaiter {
         let mut changes = vec![Kevent::proc_exit(pid)];
         let cap = (1 + self.signal_pipe_count()).max(1);
         let mut events_out: Vec<Kevent> = vec![Kevent::empty(); cap];
-        let mut wake_pipe_dead = false;
         let result = loop {
             // Bound the wait even when a signal pipe exists. A freshly forked
             // child can race signal-pump/self-pipe reinitialisation; the kqueue
@@ -644,17 +658,23 @@ impl ThreadWaiter {
             if proc_woke {
                 break WaitResult::Ready;
             }
-            if process_pipe_woke
-                && self.drain_process_wake_pipe(kq) == crate::host_signal::DrainResult::Dead
-            {
-                wake_pipe_dead = true;
-                break WaitResult::Interrupted;
+            // Drain a wake-pipe poke. A `Dead` result (the pipe's write end was
+            // closed — e.g. a forked child closed the process self-pipe, leaving
+            // this read end at permanent EOF) must NOT abandon the kqueue: the
+            // drain wrapper already deleted the dead pipe's EVFILT_READ (so its EOF
+            // edge can't re-fire and busy-spin) and marked the wake pipe dead. The
+            // EVFILT_PROC/NOTE_EXIT watch is independent of the wake pipes and
+            // keeps delivering the child-exit wake, so re-park on it. A genuine
+            // pending signal is still caught by the `should_interrupt` slice below
+            // (the same 50ms recheck the poll fallback uses). Previously a single
+            // dead-pipe drain here returned `KqueueDead`, dropping every subsequent
+            // waitpid onto the 50ms `waitid(WNOHANG)` poll (the ~56ms/reap
+            // fork-storm regression).
+            if process_pipe_woke {
+                let _ = self.drain_process_wake_pipe(kq);
             }
-            if thread_pipe_woke
-                && self.drain_thread_wake_pipe(kq) == crate::host_signal::DrainResult::Dead
-            {
-                wake_pipe_dead = true;
-                break WaitResult::Interrupted;
+            if thread_pipe_woke {
+                let _ = self.drain_thread_wake_pipe(kq);
             }
             // Backstop poll (mirrors `wait_proc_exit_fallback`). `EVFILT_PROC`/
             // `NOTE_EXIT` is the fast wake, but it is lost if the child exits in
@@ -678,11 +698,10 @@ impl ThreadWaiter {
             tv_nsec: 0,
         };
         let _ = kq.wait(&[Kevent::proc_exit_delete(pid)], &mut [], Some(&zero));
-        if wake_pipe_dead {
-            ProcExitWait::KqueueDead
-        } else {
-            ProcExitWait::Done(result)
-        }
+        // A dead wake pipe no longer forces the poll fallback (see the drain
+        // handling above) — only a genuine kqueue-fd error (handled inline via the
+        // early `return ProcExitWait::KqueueDead`) does.
+        ProcExitWait::Done(result)
     }
 
     /// Bounded fallback for `wait_proc_exit` when the per-thread kqueue is
