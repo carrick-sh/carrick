@@ -454,6 +454,14 @@ pub(super) struct ProcState {
     /// dispositions; Carrick needs this bit so the signal path can avoid routing
     /// those through the ordinary pending-signal queue.
     pub ptrace_traceme: bool,
+    /// `membarrier(2)` per-process registration state: a bitmask of the
+    /// expedited command bits this process has registered for (via the
+    /// matching `MEMBARRIER_CMD_REGISTER_*`). An expedited private barrier
+    /// requires prior registration — an unregistered call is EPERM. Reset to 0
+    /// in a forked child (the address-space copy carries the parent's value,
+    /// but Linux does not inherit the membarrier registration across fork, so
+    /// the fork path clears it). See `SyscallDispatcher::membarrier`.
+    pub membarrier_ready: u64,
 }
 
 /// Default affinity mask for `ncpu` logical CPUs: the low `ncpu` bits set
@@ -568,6 +576,7 @@ impl ProcState {
             affinity: default_affinity(crate::host_facts::logical_cpu_count()),
             tso_enabled: false,
             ptrace_traceme: false,
+            membarrier_ready: 0,
         }
     }
 
@@ -616,6 +625,10 @@ impl SyscallDispatcher {
         proc.child_subreaper = 0;
         proc.child_subreaper_owner = 0;
         proc.timerslack_default = proc.timerslack;
+        // Linux does not inherit membarrier(2) registration across fork; the
+        // child starts unregistered (LTP membarrier01 forks precisely to get a
+        // fresh, unregistered process for each subtest).
+        proc.membarrier_ready = 0;
     }
 
     pub(crate) fn subreaper_for_fork_child(&self) -> u32 {
