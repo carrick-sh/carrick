@@ -45,6 +45,8 @@
 //! Methods are `impl` blocks on [`SyscallDispatcher`]; see [`super`] for the
 //! dispatcher struct and the normalized dispatch table.
 use carrick_timer_core::TimerSpecNs;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use super::*;
 
@@ -853,13 +855,91 @@ impl SyscallDispatcher {
                     // override table so a subsequent get reads back what was set.
                     if let Some(slot) = this.proc.lock().rlimit_overrides.get_mut(resource as usize)
                     {
-                        *slot = Some(LinuxRlimit::new(rlim_cur, rlim_max));
+                        let limit = LinuxRlimit::new(rlim_cur, rlim_max);
+                        *slot = Some(limit);
+                        if resource == LINUX_RLIMIT_CPU {
+                            arm_rlimit_cpu(limit);
+                        }
                     }
                 }
             }
             Ok(DispatchOutcome::Returned { value: 0 })
         }
     }
+}
+
+static RLIMIT_CPU_GENERATION: AtomicU64 = AtomicU64::new(0);
+const RLIMIT_CPU_RECHECK_NS: u64 = 1_000_000;
+const RLIMIT_CPU_REPEAT_NS: u64 = 1_000_000_000;
+
+fn arm_rlimit_cpu(limit: LinuxRlimit) {
+    let generation = RLIMIT_CPU_GENERATION
+        .fetch_add(1, Ordering::SeqCst)
+        .wrapping_add(1);
+    let (soft, hard) = (limit.rlim_cur, limit.rlim_max);
+    if soft == LINUX_RLIM_INFINITY && hard == LINUX_RLIM_INFINITY {
+        return;
+    }
+    let _ = std::thread::Builder::new()
+        .name("carrick-rlimit-cpu".to_owned())
+        .spawn(move || enforce_rlimit_cpu(generation, soft, hard));
+}
+
+fn enforce_rlimit_cpu(generation: u64, soft_secs: u64, hard_secs: u64) {
+    let soft_ns = rlimit_cpu_secs_to_ns(soft_secs);
+    let hard_ns = rlimit_cpu_secs_to_ns(hard_secs);
+    let mut next_sigxcpu_ns = soft_ns;
+    loop {
+        if RLIMIT_CPU_GENERATION.load(Ordering::SeqCst) != generation {
+            return;
+        }
+        let now = crate::guest_cpu::total_ns_including_active();
+        if let Some(hard) = hard_ns
+            && now >= hard
+        {
+            publish_rlimit_cpu_signal(crate::linux_abi::LINUX_SIGKILL);
+            return;
+        }
+        if let Some(soft) = next_sigxcpu_ns
+            && now >= soft
+        {
+            publish_rlimit_cpu_signal(crate::linux_abi::LINUX_SIGXCPU);
+            next_sigxcpu_ns = now.checked_add(RLIMIT_CPU_REPEAT_NS);
+        }
+        let next = [next_sigxcpu_ns, hard_ns]
+            .into_iter()
+            .flatten()
+            .filter(|deadline| *deadline > now)
+            .min();
+        let delay_ns = next
+            .map(|deadline| deadline.saturating_sub(now))
+            .unwrap_or(RLIMIT_CPU_REPEAT_NS)
+            .min(RLIMIT_CPU_RECHECK_NS)
+            .max(1);
+        std::thread::sleep(Duration::from_nanos(delay_ns));
+    }
+}
+
+fn rlimit_cpu_secs_to_ns(secs: u64) -> Option<u64> {
+    if secs == LINUX_RLIM_INFINITY {
+        None
+    } else {
+        Some(secs.saturating_mul(1_000_000_000))
+    }
+}
+
+#[cfg(feature = "platform-macos")]
+fn publish_rlimit_cpu_signal(signum: i32) {
+    crate::host_signal::publish_process_signal(signum);
+}
+
+#[cfg(any(
+    feature = "platform-linux",
+    feature = "platform-freebsd",
+    feature = "platform-netbsd"
+))]
+fn publish_rlimit_cpu_signal(signum: i32) {
+    crate::timer_delivery::deliver(signum);
 }
 
 /// The resource limit carrick reports for `getrlimit`/`prlimit64`, honoring any
