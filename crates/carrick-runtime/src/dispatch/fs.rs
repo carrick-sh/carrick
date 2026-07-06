@@ -1999,8 +1999,10 @@ impl SyscallDispatcher {
             // name = basename) — the kernel reports a child's open to the dir
             // watch with the child's name (inotify02 watches the dir and asserts
             // IN_OPEN with name=test_file1). A create also "opens" the new file.
-            self.inotify_self(&record_path, carrick_abi::LINUX_IN_OPEN);
+            // Parent (child) event precedes the self event, matching Linux
+            // fsnotify ordering (inotify10).
             self.inotify_child(&record_path, carrick_abi::LINUX_IN_OPEN, opened_is_dir);
+            self.inotify_self(&record_path, carrick_abi::LINUX_IN_OPEN);
         }
         if inotify_created {
             self.dnotify_child(&record_path, LinuxDnotifyMask::CREATE);
@@ -7369,6 +7371,15 @@ impl SyscallDispatcher {
                     // An empty queue is EAGAIN (inotify fds are overwhelmingly
                     // used non-blocking + epoll; a true blocking wait on the
                     // backing kqueue fd is a tracked follow-up).
+                    //
+                    // NOTE: a blocking-mode read cannot be reliably satisfied on
+                    // macOS for a CROSS-PROCESS transient-event flood (inotify11:
+                    // a forked child create+unlinks 9999 files). kqueue only
+                    // reports "the directory vnode changed", and carrick's
+                    // dir-snapshot diff misses any file both created AND deleted
+                    // between two coalesced scans — so parking on the kqueue would
+                    // hang rather than deliver the IN_DELETE names. That needs a
+                    // cross-process inotify event mirror, out of scope here.
                     return Ok(match state.read_records(length) {
                         Ok(bytes) if bytes.is_empty() => DispatchOutcome::errno(LINUX_EAGAIN),
                         Ok(bytes) => {
