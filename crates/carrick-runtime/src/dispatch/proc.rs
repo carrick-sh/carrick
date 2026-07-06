@@ -2161,9 +2161,27 @@ impl SyscallDispatcher {
                         None => return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ECHILD)),
                     }
                 }
-                // P_PGID stays host-level in Phase 2 (process groups are not yet
-                // ns-translated — §6.6).
-                LINUX_P_PGID => (libc::P_PGID, id as libc::id_t),
+                // P_PGID names a process group (§6.6). `id == 0` is "the
+                // caller's own group" — already host-level, pass through. A
+                // non-zero `id` is the guest's ns-pgid; translate it to the
+                // host pgid via the same helper `setpgid`/`F_OWNER_PGRP`/
+                // `TIOCSPGRP` use, so the host waitid matches the real host
+                // group instead of ECHILD-ing on an untranslated ns value. An
+                // ns-pgid that names no group is ECHILD (no such child).
+                LINUX_P_PGID => {
+                    if id == 0 {
+                        (libc::P_PGID, 0)
+                    } else {
+                        match crate::namespace::pid::ns_to_host_pgid(id as u32) {
+                            Some(h) => (libc::P_PGID, h as libc::id_t),
+                            None => {
+                                return Ok(DispatchOutcome::errno(
+                                    crate::linux_abi::LINUX_ECHILD,
+                                ));
+                            }
+                        }
+                    }
+                }
                 LINUX_P_PIDFD => match this.pidfd_host_pid(id as i32) {
                     Some(host_pid) => (libc::P_PID, host_pid as libc::id_t),
                     None => return Ok(DispatchOutcome::errno(LINUX_EBADF)),
@@ -2316,6 +2334,21 @@ impl SyscallDispatcher {
             let host_target: i32 = if crate::namespace::pid::enabled() && pid.0 > 0 {
                 match crate::namespace::pid::ns_to_host_or_self(pid.0 as u32) {
                     Some(h) => h as i32,
+                    None => return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ECHILD)),
+                }
+            } else if crate::namespace::pid::enabled() && pid.0 < -1 && pid.0 != i32::MIN {
+                // A process-group wait names ns-pgid `-pid`; translate it to
+                // the host pgid via the same helper `setpgid`/`F_OWNER_PGRP`/
+                // `TIOCSPGRP` use, so the host wait4 matches the real host
+                // group instead of finding none and ECHILD-ing. An ns-pgid
+                // that names no group is ECHILD (Linux: no such child,
+                // matching the `pid > 0` non-member case above). `i32::MIN` is
+                // excluded: its magnitude can never be a real ns-pgid (LTP
+                // waitpid04's "invalid process group" case expects ESRCH, via
+                // the untranslated host_target < -1 EINVAL remap below — not
+                // this branch's ECHILD).
+                match crate::namespace::pid::ns_to_host_pgid(pid.0.unsigned_abs()) {
+                    Some(h) => -(h as i32),
                     None => return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ECHILD)),
                 }
             } else {
