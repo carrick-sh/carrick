@@ -1,139 +1,141 @@
 # Option 3 — Crash-safe atomic vCPU admission permit (design spike) Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans. Steps use checkbox (`- [ ]`) syntax.
+> **REQUIRED READING:** `docs/superpowers/plans/2026-07-05-option3-atomic-vcpu-permit-companion-review.md` — the adversarial companion review whose design this plan now implements. Read it before Task 1; it has the full rationale and the exact `trap.rs` line anchors.
 
-**Goal:** Replace carrick's cross-process HVF vCPU-admission file-lock permit with a fork-shared shared-memory atomic counter that has **cheaper acquire** (a userspace CAS vs `open`+`flock`+backoff) while preserving the file-lock's load-bearing **crash/death-reclaim**, via a supervisor that reclaims leaked slots on process death (periodic PID-liveness reaper, then optionally prompt `EVFILT_PROC/NOTE_EXIT`) plus an explicit exec-path release.
+**Goal:** Replace carrick's cross-process HVF vCPU-admission `flock` permit with a fork-shared, **generation-stamped slot table** whose acquire is a cheap userspace CAS (vs `open`+`flock`+backoff) while **recreating flock's kernel-backed death-reclaim** — because a shared count that can exist without a reclaimable owner is exactly what timed out the node suites in the 3b attempt (`cur=4 budget=4 live_len=0`, node ~447×, flock matched in ~7-8 s).
 
-**Architecture:** This is a **design SPIKE gated behind `CARRICK_HVF_ATOMIC_PERMIT=1`** — the `flock` permit stays the default and the fallback until the atomic path proves it survives the fork-storm/many-thread gate. It builds directly on the already-written atomic-counter patch (`.superpowers/sdd/task-3b-mech-atomic.patch`), which failed *only* because it lost death-reclaim (fork-child exit/exec teardown skipped the decrement → orphaned counts pinned the pool → node worker_threads 447× timeout). The fix is a race-proof reaper in the root process (`host_proc::set_root_guest_pid` marks it) that scans the shared region's slot→owner-PID table and reclaims any dead owner (`kill(pid,0)==ESRCH`), backing the whole thing on the same `min(hvf_cap, physical_cores)` cap math (unchanged, per the maintainer's kept physical-core cap).
+**Architecture (amended per the companion review):** Ownership is the source of truth, not a bolt-on. Every admitted count IS a generation-stamped slot (`state | owner_pid | generation` in one packed `AtomicU64`), reclaimable idempotently by (a) a token-guarded local release on `vcpu_destroyed`, (b) a cooperative `process_exit_cleanup` release before a fork-child `_exit` skips Rust drops, and (c) a **mandatory** root `EVFILT_PROC/NOTE_EXIT` supervisor for hard death (SIGKILL/segfault/missed cleanup), with the generation guard defeating PID reuse. Flag-gated behind `CARRICK_HVF_ATOMIC_PERMIT=1`; `flock` stays the default and fallback. The cap math is untouched, and the cap-raise experiment is a SEPARATE follow-up (never committed with the atomic permit).
 
-**Tech Stack:** Rust 2024; macOS+aarch64 HVF backend (`crates/carrick-vmm-hvf`); `mmap(MAP_ANON|MAP_SHARED)`, `AtomicU64`/`AtomicUsize`, `libc::kill(pid,0)` liveness, `crate::darwin_kqueue::Kqueue` (`EVFILT_PROC`/`NOTE_EXIT`); `crate::host_proc` (root pid / guest-pid tracking); the Phase-3a gate `scripts/conformance/vcpu-admission-gate.sh`.
-
-**Research basis:** `docs/2026-07-05-admission-reclaim-research.md` (macOS has no robust futex/mutex/OFD lock; `EVFILT_PROC/NOTE_EXIT` is the native death-watch; leases/reapers are the race-proof backstop; Firecracker runs cap-free but never faces our fork-storm pre-block window — hence Option 4 stays gated).
+**Tech Stack:** Rust 2024; macOS+aarch64 HVF (`crates/carrick-vmm-hvf`); `mmap(MAP_ANON|MAP_SHARED)`, packed `AtomicU64` slots; `crate::darwin_kqueue` (`Kevent::proc_exit` = one-shot `EVFILT_PROC|NOTE_EXIT|NOTE_EXITSTATUS`, kqueue.rs:195-214); `waitid(WNOWAIT|WNOHANG)` non-consuming readiness (pattern at `host_signal.rs:197-205`/`io_wait.rs:659-667`); `HvfHostBackend::pre_loop_setup` (`runtime.rs:1610-1613`); `engine.process_exit_cleanup` (`hvf_aarch64_engine.rs:295`, currently no-op; called `vcpu_loop/mod.rs:1469/1500/1884`).
 
 ## Global Constraints
-- **KEEP the cap math** unchanged: `vcpu_gate::budget_from_limits = min(hvf_cap, physical_cores)` (`trap.rs:1034`) and `global_permit_budget_from_mn` per-class budgets (`trap.rs:726`; Initial/SharedWaitResume=`min(mn,4)`, ForkRebuild{vfork:false}=`mn`, vfork/execve=`None`). This task changes the *mechanism*, not the budget.
-- **Gated + fallback:** all new behavior behind `CARRICK_HVF_ATOMIC_PERMIT=1`; unset → the current `flock` permit, byte-for-byte. The atomic path must never become the default in this plan.
-- **The atomic region must be created before any fork** (so children inherit it via `MAP_SHARED`) and keyed per-run by `CARRICK_RUN_ID` if `shm_open` is used (prefer anon+MAP_SHARED — inherited across fork, no name/cleanup).
-- **Crash-safety is the acceptance bar:** a permit holder that dies by exit/SIGKILL/SEGFAULT **or** replaces its image via `execve` must not permanently consume a slot.
-- macOS+aarch64 only (`#[cfg(all(target_os = "macos", target_arch = "aarch64"))]`), matching the existing permit code.
-- Never run carrick and the Docker oracle concurrently. Never `git commit --no-verify`. Typed domain values at boundaries.
-- **Validation is mandatory and specific:** every phase that changes admission re-runs `scripts/conformance/vcpu-admission-gate.sh` (4 fragile workloads must stay MATCH) AND the fork-storm suites (`ltp-msgstress01`, `ltp-futex_cmp_requeue01` at `--workers 8`) with `CARRICK_HVF_ATOMIC_PERMIT=1`, watching for HV_NO_RESOURCES/HV_BUSY/timeout AND host-UI (WindowServer/Finder) instability. If the atomic path regresses the gate, STOP — flock is the shipped fallback.
-
----
+- **KEEP the cap math** unchanged: `budget_from_limits = min(hvf_cap, physical_cores)` (`trap.rs:1034`) and the per-class budgets `global_permit_budget_from_mn` (`trap.rs:726`). This spike changes the MECHANISM only.
+- **The cap-raise is OUT of this plan.** It is a separate follow-up; do NOT commit any `CONSERVATIVE_GLOBAL_VM_CAP` change with the atomic permit (a failed fork-storm gate must be unambiguously the permit, not the cap or their interaction).
+- **Gated + fallback:** all new behavior behind `CARRICK_HVF_ATOMIC_PERMIT=1`; unset → the current `flock` path, byte-for-byte.
+- **Preserve the three flock invariants (companion review §"Current invariants"):** (1) only budgeted admission classes acquire — `ExecveRebuild`/vfork ungated; (2) a permit releases only if the destroyed `vcpu_id` HELD one (not every `vcpu_destroyed`); (3) fork-child clears inherited LOCAL tracking without releasing the parent's shared slots.
+- **No ownerless count. Ever.** The slot (with owner + generation) must be published before/atomically-with the count it represents; the reaper reclaims by owner record, never by a bare counter.
+- **Generation guard** on every reclaim so a late event for a dead owner cannot free a new slot held by a reused PID.
+- The region is `MAP_ANON|MAP_SHARED`, created **before any guest fork** (in the initial admission path / HVF engine init — NOT lazily on first acquire; a child's first acquire would map a private region). It survives fork (inherited) but the carrick host process must not `execve` (it doesn't — guest exec is emulated via `ExecveRebuild`, no host exec).
+- macOS+aarch64 only. Never run carrick+docker concurrently. Never `git commit --no-verify`. Typed domain values at boundaries.
 
 ## File Structure
-- Modify `crates/carrick-vmm-hvf/src/trap.rs` — the whole permit subsystem (`GlobalVcpuPermit*`, `acquire/register/release_*`, `reset_*_after_fork_child`, `create_vm_with_admission`, `create_vcpu_with_permit`). Add the atomic region + slot→owner-PID table + the `CARRICK_HVF_ATOMIC_PERMIT` dispatch that chooses flock vs atomic.
-- Create `crates/carrick-vmm-hvf/src/vcpu_permit_reaper.rs` — the supervisor: the periodic PID-liveness reaper and (Phase D) the `EVFILT_PROC` prompt-reclaim, plus its start/stop lifecycle. One file, one responsibility (death-reclaim of the shared permit region).
-- Modify `crates/carrick-runtime/src/threaded_loop.rs` (~:142, where `host_proc::set_root_guest_pid` runs) — start the reaper in the root process when the atomic path is enabled.
-- Reference only (read, don't change the cap math): `crates/carrick-host/src/host_facts.rs` (`physical_cpu_count`), `crates/carrick-vmm-hvf/src/darwin_kqueue.rs` (`Kqueue`), `crates/carrick-runtime/src/host_proc.rs` (root pid / `is_guest_process` / `pid_info`).
+- Modify `crates/carrick-vmm-hvf/src/trap.rs` — the permit subsystem: the packed-slot `PermitRegion`, `acquire`/`register`/token-guarded `release`, `reset_*_after_fork_child`, `create_vm_with_admission`, `create_vcpu_with_permit`, `vcpu_destroyed`, and the `atomic_permit_enabled()` dispatch (flock vs atomic).
+- Create `crates/carrick-vmm-hvf/src/vcpu_permit_reaper.rs` — the root supervisor: the `EVFILT_PROC` watcher + periodic backstop + `start_vcpu_permit_reaper()`.
+- Modify `crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs:295` — the `process_exit_cleanup` override (atomic-only cooperative release).
+- Modify `crates/carrick-vmm-hvf/src/runtime.rs` (`HvfHostBackend::pre_loop_setup` ~:1610) — start the reaper in the root when atomic permits are enabled.
+- Reference (do not change the cap math): `host_facts.rs` (`physical_cpu_count`), `darwin_kqueue.rs` (`Kevent::proc_exit`), `host_signal.rs`/`io_wait.rs` (the `waitid(WNOWAIT)` pattern).
 
 ---
 
-## Task 1 — Shared-memory atomic permit region + owner-PID table (behind the flag)
+## Task 1 — Tokenized generation-stamped slot table (source of truth)
 
-**Files:** Modify `crates/carrick-vmm-hvf/src/trap.rs` (`GlobalVcpuPermit*` region ~:735-897, `create_vm_with_admission` ~:939, `create_vcpu_with_permit` ~:900, `vcpu_destroyed` ~:1070). Test: `trap.rs` `vm_create_admission_tests` (~:4522).
+**Files:** Modify `crates/carrick-vmm-hvf/src/trap.rs`. Test: `vm_create_admission_tests` (~:4522).
 
-**Interfaces:**
-- Produces: `fn atomic_permit_enabled() -> bool` (reads `CARRICK_HVF_ATOMIC_PERMIT`); a `PermitRegion` mapped once pre-fork holding `live: AtomicUsize` + a fixed-size `slots: [AtomicU32; MAX_SLOTS]` table of owner PIDs (0 = free); `fn try_acquire_atomic(budget) -> bool` (CAS-increment `live` while `< budget`, then claim a free slot with the caller's `getpid()`); `fn release_atomic(pid)` (clear one slot owned by `pid`, `fetch_sub(1)`); `fn reclaim_dead_slots() -> usize` (used by Task 2). MAX_SLOTS = the HVF cap ceiling (~64).
+**Interfaces (Produces):** `struct PermitRegion` over a fork-shared mmap: `magic/version` header, `next_generation: AtomicU32`, `slots: [AtomicU64; MAX_SLOTS]` each packed `state(free|acquiring|registered) | owner_pid:u32 | generation`. `fn atomic_permit_enabled() -> bool`. `fn acquire(budget, pid) -> Option<PermitToken>` (CAS a free slot → `acquiring(pid, gen)`; count occupied (`acquiring|registered`) slots; if > budget, CAS that exact `(slot,gen)` back to free + return None to trigger backoff; else return the token). `struct PermitToken { slot: u16, generation: u32, owner_pid: u32 }`. `fn register(vcpu_id, token)` (CAS slot `acquiring→registered` for the same `(pid,gen)`; insert `vcpu_id→token` into a process-local `HashMap`). `fn release_token(vcpu_id)` (remove local map entry; if present CAS that exact `(slot,gen)`→free; else no-op on the shared table). `fn reclaim_owner(pid, generation?) -> usize` (used by Tasks 2/3: CAS matching `(pid[,gen])` registered/acquiring slots → free). `fn occupied() -> usize` (derived count = non-free slots; there is no separate `live` counter). MAX_SLOTS = HVF vcpu ceiling (~64).
 
-**Start from the existing patch:** `.superpowers/sdd/task-3b-mech-atomic.patch` already converts `GlobalVcpuPermit` to a zero-sized marker + a fork-shared count with `try_acquire`/`release`/`release_unregistered` + a `HashSet<u64>` of live vcpu-ids and unit tests (7/7 passed). Apply it as the base, THEN extend it with the **slot→owner-PID table** (the patch had only a bare count — the reaper needs per-PID ownership to know how much to reclaim).
-
-- [ ] **Step 1: Apply the base atomic patch** and confirm its unit tests compile: `git apply .superpowers/sdd/task-3b-mech-atomic.patch` then `cargo test -p carrick-vmm-hvf vm_create_admission_tests --lib`. If it no longer applies cleanly (trap.rs shifted since it was saved), port the change by hand — the shape is: `GlobalVcpuPermit` → unit struct; a `fn global_vcpu_count() -> &'static AtomicUsize` backed by `mmap(MAP_ANON|MAP_SHARED)` created in a `OnceLock` before any guest fork; `try_acquire` CAS-increments while `< budget`; `release`/`release_unregistered` `fetch_sub`.
-- [ ] **Step 2: RED — write the owner-table test** in `vm_create_admission_tests`:
+- [ ] **Step 1: Port only the useful parts of the 3b patch** (`.superpowers/sdd/task-3b-mech-atomic.patch`): the `MAP_ANON|MAP_SHARED` region setup, the injectable-for-test constructor, and the cap-math preservation. **Do NOT apply it mechanically** — it uses a bare `AtomicUsize` count (the leak). Build the packed-slot `PermitRegion` instead.
+- [ ] **Step 2: RED — the state-machine unit tests** (in `vm_create_admission_tests`, over a private test region):
 ```rust
-#[test]
-fn atomic_permit_records_and_reclaims_owner_pids() {
-    let region = PermitRegion::new_anon_for_test(); // test ctor over a private mmap
-    let me = std::process::id();
-    assert!(region.try_acquire(4, me));            // slot claimed for `me`
-    assert_eq!(region.live(), 1);
-    assert_eq!(region.owner_slot_count(me), 1);
-    // a slot owned by a definitely-dead pid must be reclaimable:
-    region.force_claim_for_test(999_999_999, /*count*/ 2); // simulate leaked slots
-    assert_eq!(region.live(), 3);
-    let reclaimed = region.reclaim_dead_slots();    // 999999999 is not alive
-    assert_eq!(reclaimed, 2);
-    assert_eq!(region.live(), 1);                   // only `me`'s slot remains
+#[test] fn acquire_cannot_leave_an_unowned_count() {
+    let r = PermitRegion::new_anon_for_test();
+    let t = r.acquire(4, std::process::id()).unwrap();   // slot published owned BEFORE any count-only state
+    assert_eq!(r.occupied(), 1);
+    assert_eq!(r.slot_state(t.slot), SlotState::Acquiring); // owner+gen visible even pre-register
+    // a crash here is reclaimable: reap by owner finds the acquiring slot
+    r.force_owner_for_test(t.slot, 999_999_999, t.generation);
+    assert_eq!(r.reclaim_owner(999_999_999, None), 1);
+    assert_eq!(r.occupied(), 0);
+}
+#[test] fn vcpu_destroyed_of_unregistered_vcpu_does_not_release_a_permit() {
+    let r = PermitRegion::new_anon_for_test();
+    let t = r.acquire(4, std::process::id()).unwrap();
+    r.register(100, t);                        // vcpu 100 holds the permit
+    r.release_token(999);                      // an UNPERMITTED sibling vcpu teardown
+    assert_eq!(r.occupied(), 1);               // must NOT free vcpu 100's permit
+    r.release_token(100);
+    assert_eq!(r.occupied(), 0);
+}
+#[test] fn release_is_generation_checked() {
+    let r = PermitRegion::new_anon_for_test();
+    let t = r.acquire(4, std::process::id()).unwrap();
+    r.register(1, t);
+    let stale = PermitToken { generation: t.generation.wrapping_sub(1), ..t };
+    assert!(!r.try_free_exact_for_test(stale)); // a stale token/event cannot free a newer owner
+    assert_eq!(r.occupied(), 1);
+}
+#[test] fn fork_child_reset_clears_local_only() {
+    let r = PermitRegion::new_anon_for_test();
+    let t = r.acquire(4, std::process::id()).unwrap(); r.register(1, t);
+    r.reset_local_after_fork_child();          // child clears local map
+    assert!(r.local_token(1).is_none());
+    assert_eq!(r.occupied(), 1);               // parent's shared slot untouched
 }
 ```
-Run `cargo test -p carrick-vmm-hvf atomic_permit_records_and_reclaims_owner_pids --lib` → fails (no owner table / `reclaim_dead_slots` yet).
-- [ ] **Step 3: Implement the owner table.** Add `slots: [AtomicU32; MAX_SLOTS]` to the mmap'd `PermitRegion` (owner PID per slot, 0 = free). `try_acquire(budget, pid)`: CAS-increment `live` while `< budget`; on success, CAS-claim the first `slots[i]==0` to `pid` (if none free — shouldn't happen since `live<=budget<=MAX_SLOTS` — undo the increment and return false). `release(pid)`: find one `slots[i]==pid`, CAS it to 0, `live.fetch_sub(1)`. `reclaim_dead_slots()`: for each `slots[i]==pid` where `pid!=0 && libc::kill(pid as i32, 0) < 0 && errno==ESRCH`, CAS it to 0 and `live.fetch_sub(1)`; return the count. Use `Ordering::AcqRel` for the CAS, `Acquire`/`Release` for loads/stores. Route acquire/register/release through `atomic_permit_enabled()`: true → the atomic path; false → the existing flock path (keep it intact).
-- [ ] **Step 4: GREEN** — the new test passes; `cargo test -p carrick-vmm-hvf vm_create_admission_tests --lib` (all, incl. the ported patch tests) green; `cargo clippy -p carrick-vmm-hvf --all-targets -- -D warnings`; `just fmt-check`; `just build`.
-- [ ] **Step 5: Commit** — `feat(hvf): fork-shared atomic vcpu permit with owner-pid table (flag-gated)`. (Trailers per Global Constraints.)
-
-**Gotcha:** the region MUST be created before the first guest fork. Put the `OnceLock` init at engine/VM bring-up (before `run_oci` forks a guest), not lazily on first acquire (a fork child's first acquire would map a *private* region). Verify by asserting the same region address is inherited across a `libc::fork()` in a test.
+Run `cargo test -p carrick-vmm-hvf vm_create_admission_tests --lib` → fails (types/fns don't exist).
+- [ ] **Step 3: Implement** the packed-slot region + acquire/register/release_token/reclaim_owner/reset per the Interfaces and the companion review §"Recommended replacement design". Use one packed `AtomicU64` per slot (avoids torn multi-field state). `next_generation.fetch_add(1)` per acquire. Wire `create_vm_with_admission`/`create_vcpu_with_permit`/`vcpu_destroyed`/`reset_*_after_fork_child` to the atomic path when `atomic_permit_enabled()`, keeping the flock path intact for the default.
+- [ ] **Step 4: GREEN + offline gates** (all tests; `cargo clippy -p carrick-vmm-hvf --all-targets -- -D warnings`; `just fmt-check`; `just build`). Verify with a `libc::fork()` test that the region address is inherited across fork.
+- [ ] **Step 5: Commit** — `feat(hvf): tokenized generation-stamped atomic vcpu permit slots (flag-gated)`.
 
 ---
 
-## Task 2 — The race-proof reaper (the death-reclaim that fixes the 3b leak)
+## Task 2 — Mandatory EVFILT_PROC supervisor + periodic backstop
 
-**Files:** Create `crates/carrick-vmm-hvf/src/vcpu_permit_reaper.rs`. Modify `crates/carrick-runtime/src/threaded_loop.rs` (~:142) to start it in the root. Test: unit test in the new file.
+**Files:** Create `crates/carrick-vmm-hvf/src/vcpu_permit_reaper.rs`. Modify `crates/carrick-vmm-hvf/src/runtime.rs` (`pre_loop_setup` ~:1610). Test: unit test in the new file + a proc-event integration check.
 
-**Interfaces:**
-- Consumes: `PermitRegion::reclaim_dead_slots()` (Task 1).
-- Produces: `fn start_reaper()` (spawns a daemon thread that, every `REAP_INTERVAL_MS`, calls `reclaim_dead_slots()`; idempotent via a `OnceLock`/`AtomicBool`), `const REAP_INTERVAL_MS: u64`.
+**Interfaces (Consumes Task 1):** `PermitRegion::reclaim_owner(pid, gen)`, the slot table's owner set. **Produces:** `fn start_vcpu_permit_reaper()` (idempotent; spawns the root supervisor thread) + a `crate::trap::start_vcpu_permit_reaper` re-export.
 
-The root process (`host_proc::set_root_guest_pid(std::process::id())`, threaded_loop.rs:142) is the natural supervisor — it outlives the fork tree and can see all guest PIDs. Fork children do NOT start a reaper (only the root does); the shared region + `kill(pid,0)` liveness make the root's single reaper authoritative for the whole tree.
+The root process (`host_proc::set_root_guest_pid`) is the supervisor. `EVFILT_PROC` is MANDATORY (not conditional) — `kill(pid,0)` is not a crash-reclaim equivalent (zombies + PID reuse).
 
-- [ ] **Step 1: RED — reaper reclaims a dead owner within one interval.** Test: build a private `PermitRegion`, `force_claim_for_test(dead_pid, 1)`, spawn the reaper loop against it, sleep `2*REAP_INTERVAL_MS`, assert `live()==0`. Run `cargo test -p carrick-vmm-hvf reaper_reclaims_dead_owner` → fails (no reaper).
-- [ ] **Step 2: Implement `start_reaper`** — a named daemon `std::thread` that loops `{ region.reclaim_dead_slots(); sleep(REAP_INTERVAL_MS) }`, guarded by an `AtomicBool` so it starts once. Start it only when `atomic_permit_enabled()`. `REAP_INTERVAL_MS`: start at **20** (a value the fork-storm gate will tune — see the spike note).
-- [ ] **Step 3: Wire it into the root** at threaded_loop.rs:~142, right after `set_root_guest_pid`, `if crate::hvf::atomic_permit_enabled() { crate::hvf::start_vcpu_permit_reaper(); }` (expose a thin re-export from carrick-vmm-hvf). Only the root reaches this path.
-- [ ] **Step 4: GREEN + offline gates** (test passes; clippy/fmt/build).
-- [ ] **Step 5: Commit** — `feat(hvf): periodic reaper reclaims dead-owner vcpu permits`.
-
-**SPIKE — this is the load-bearing uncertainty (measure, don't guess):** the reaper interval trades reclaim latency against scan cost. Too slow and a rapid death-churn workload (node worker_threads) pins the pool between reaps → the exact 447× timeout the flock version avoided (flock reclaims *instantly* on close). **After Step 4, run the fork-storm validation** (`CARRICK_HVF_ATOMIC_PERMIT=1 scripts/conformance/vcpu-admission-gate.sh` + `--workers 8` msgstress01/futex_cmp_requeue01). If node still times out at 20ms, that is the signal that a periodic reaper alone is insufficient and Task 4 (prompt `EVFILT_PROC` reclaim) is REQUIRED, not optional. Record the measured churn-vs-interval result in the report.
+- [ ] **Step 1: RED** — a supervisor unit test: register a `Kevent::proc_exit` on a short-lived child that `_exit`s; assert the reaper reclaims that `(pid,gen)`'s slots on the delivered `NOTE_EXIT`; AND a register-after-exit test: a child that exits BEFORE registration is still reclaimed via the post-register `waitid(WNOWAIT|WNOHANG)` / `ESRCH` path. Run `cargo test -p carrick-vmm-hvf permit_reaper` → fails.
+- [ ] **Step 2: Implement the supervisor** in `vcpu_permit_reaper.rs`: own one `Kqueue`; poll the slot table for new `(owner_pid, generation)`; register `Kevent::proc_exit(pid)` (kqueue.rs:195-214, already one-shot `EVFILT_PROC|NOTE_EXIT|NOTE_EXITSTATUS`); **immediately after a successful register, do a non-consuming `waitid(WNOWAIT|WNOHANG)`** (host_signal.rs pattern) so an exit-before-register is not stranded; on `EV_ERROR`/`ESRCH` reclaim that generation-stamped slot at once; on `NOTE_EXIT` reclaim slots matching the watched `(pid,generation)`. Keep a **periodic backstop scan** (a low-frequency sweep, e.g. every 250 ms) ONLY for missed registrations / kqueue setup failure — the primary detector is the proc event, NOT `kill(pid,0)`.
+- [ ] **Step 3: Start it in the root** at `HvfHostBackend::pre_loop_setup` (runtime.rs:~1610): `if crate::trap::atomic_permit_enabled() { crate::trap::start_vcpu_permit_reaper(); }`. (Do NOT edit the generic loop body / `threaded_loop.rs` — the generic loop must not grow HVF knowledge. Region init stays in the admission path per Task 1, since the initial VM is created before the loop.)
+- [ ] **Step 4: GREEN + offline gates.**
+- [ ] **Step 5: Commit** — `feat(hvf): EVFILT_PROC death-reclaim supervisor for atomic permits`.
 
 ---
 
-## Task 3 — Explicit permit release on execve (the exec-teardown leak)
+## Task 3 — Cooperative release before fork-child `_exit`
 
-**Files:** Modify `crates/carrick-vmm-hvf/src/trap.rs` — the `ExecveRebuild` path (`create_vm_with_admission(..., VmCreateAdmission::ExecveRebuild)` ~:3555) and where the old VM is torn down before it.
+**Files:** Modify `crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs:295` (the `process_exit_cleanup` no-op override).
 
-`NOTE_EXIT` does not fire on `execve` (the PID survives — Linux reclaims via `mm_release→exit_robust_list`, macOS has no equivalent). So the exec rebuild MUST release the old VM's permit explicitly. This is the second half of the 3b leak ("fork-child exit/**exec** teardown never ran the destructor").
+The runtime already calls `engine.process_exit_cleanup()` on normal fork-child exit and signal death (`vcpu_loop/mod.rs:1469/1500/1884`), before `_exit` skips Rust drops. HVF overrides it as a no-op because the flock path was fd-lifetime-bound. For the atomic path this is the fast path that shrinks the churn window (leaving the supervisor for HARD death only).
 
-- [ ] **Step 1: RED — an exec across a held permit must not leak.** A hostless-ish test is hard here; instead use the fork-storm-adjacent differential: with `CARRICK_HVF_ATOMIC_PERMIT=1`, run a guest that repeatedly `fork()`+`execve()`s in a tight loop (a small conformance probe `conformance-probes/src/bin/execpermitchurn.rs`: fork N children that each immediately `execve(/bin/true)`; parent reaps; repeat) and assert the shared `live` count returns to baseline after each round (expose it via a debug probe or `carrick trace` of `VCPU_LIVE`). Pre-fix (exec release missing) the count climbs and admission eventually stalls.
-- [ ] **Step 2: Read the exec rebuild** (trap.rs ~:3540-3560) — find where the old VM/vCPU is destroyed on exec. Confirm whether `vcpu_destroyed` (→ `release`) runs on that path for the atomic case; the 3b finding says it does NOT. Add an explicit `release_atomic(getpid())` (or route the old-VM teardown through `vcpu_destroyed`) BEFORE the `ExecveRebuild` acquire, so the exec releases exactly the permit it held.
-- [ ] **Step 3: GREEN** — the churn probe's `live` returns to baseline; offline gates.
-- [ ] **Step 4: Commit** — `fix(hvf): release atomic vcpu permit on execve rebuild`.
-
-**Gotcha:** `ExecveRebuild`'s own budget is `None` (ungated) — so exec re-acquires nothing; it only needs to RELEASE the pre-exec permit. Don't double-release (guard: release only if the pre-exec VM actually held a permit under the atomic path).
+- [ ] **Step 1: RED** — the exec/fork churn probe `conformance-probes/src/bin/execpermitchurn.rs`: fork N children that each `_exit` immediately; parent reaps; loop. With `CARRICK_HVF_ATOMIC_PERMIT=1`, assert the region's `occupied()` returns to baseline after each round (expose via a debug hook or `carrick trace` of the slot table). Pre-fix (no cooperative release, reaper-only) the count sits high between reaps.
+- [ ] **Step 2: Implement** an atomic-only `process_exit_cleanup` that releases all slots owned by the current PID (or at least this engine's registered token), **idempotent** with `vcpu_destroyed` and the supervisor via the generation check. It must NOT run on the parent after a fork reset.
+- [ ] **Step 3: GREEN** — the churn probe's `occupied()` returns to baseline promptly (not dependent on the backstop interval); offline gates.
+- [ ] **Step 4: Commit** — `feat(hvf): cooperative atomic-permit release on fork-child exit`.
 
 ---
 
-## Task 4 — (Conditional) Prompt EVFILT_PROC/NOTE_EXIT reclaim
+## Task 4 — Exec: PROVE no leak / no double-release (proof task, code only if it fails)
 
-**Do this ONLY if Task 2's spike showed the periodic reaper's latency causes a gate regression.** If the 20ms reaper passes the fork-storm gate, SKIP this task and record that the reaper alone suffices.
+**Files:** Modify `crates/carrick-vmm-hvf/src/trap.rs` ONLY if the proof fails.
 
-**Files:** Modify `crates/carrick-vmm-hvf/src/vcpu_permit_reaper.rs`. Reference `crates/carrick-vmm-hvf/src/darwin_kqueue.rs` (`Kqueue`).
+The exec-leak premise in the prior draft was stale: the current code destroys the inherited vCPU and calls `vcpu_destroyed` BEFORE the ungated `ExecveRebuild` (trap.rs:3544-3556), and `ExecveRebuild` has no budget so it acquires nothing. So after Task 1's tokenization, exec should already release correctly via `vcpu_destroyed(vcpu_id)`.
 
-- [ ] **Step 1:** In the root reaper, own a `Kqueue`. When a new owner PID appears in the region (the reaper notices a slot it hasn't watched), register `EV_ADD|EVFILT_PROC` with `fflags=NOTE_EXIT` for that PID. On `kevent` delivery of `NOTE_EXIT`, immediately `reclaim` that PID's slots (prompt, ~0 latency).
-- [ ] **Step 2: Handle the register-after-dead race** (finding 5's acknowledged Firecracker race): `kevent(EV_ADD, EVFILT_PROC)` on an already-exited PID returns `ESRCH` — on `ESRCH`, reclaim that PID's slots immediately. The periodic `reclaim_dead_slots()` from Task 2 stays as the belt-and-suspenders backstop for any PID that died in the registration gap.
-- [ ] **Step 3:** Re-run the fork-storm gate with prompt reclaim; confirm the churn timeout is gone. Offline gates.
-- [ ] **Step 4: Commit** — `feat(hvf): prompt EVFILT_PROC death-reclaim for atomic vcpu permits`.
-
-**Gotcha:** kqueue registration is not free at fork-storm scale (one `EV_ADD` per new owner PID). Reuse the existing `darwin_kqueue::Kqueue` abstraction and a single kq in the root; do NOT create a kq per PID. The reaper already knows the owner set from the region table, so it registers incrementally.
+- [ ] **Step 1: PROVE it** — with `CARRICK_HVF_ATOMIC_PERMIT=1`, run the churn probe in `execve` mode (children `execve(/bin/true)` instead of `_exit`) and assert `occupied()` returns to baseline. Read the exec teardown path (trap.rs:3544-3556) and confirm the destroyed pre-exec `vcpu_id` is in the local token map so `release_token` runs.
+- [ ] **Step 2:** If the proof passes, add ONLY a regression test asserting exec does not leak. **Do NOT add an explicit `release_token`/`release_atomic` on the exec path** unless the proof shows the tokenized path bypasses `vcpu_destroyed` — an extra release would double-free.
+- [ ] **Step 3: Commit** — `test(hvf): prove execve rebuild releases atomic permit via vcpu_destroyed` (or, only if a real bypass was found, `fix(hvf): release atomic permit on execve rebuild`).
 
 ---
 
-## Task 5 — End-to-end validation + the raise-the-cap experiment
+## Task 5 — Integration validation (phases separate; NO cap change here)
 
-**Files:** Modify `scripts/conformance/vcpu-admission-gate.sh` (accept an env passthrough so it can run with `CARRICK_HVF_ATOMIC_PERMIT=1`). Reference the fork-storm suites.
+**Files:** Modify `scripts/conformance/vcpu-admission-gate.sh` (env passthrough for `CARRICK_HVF_ATOMIC_PERMIT`).
 
-- [ ] **Step 1: Full gate under the atomic path** — `CARRICK_HVF_ATOMIC_PERMIT=1 bash scripts/conformance/vcpu-admission-gate.sh`: all 4 fragile workloads (cpython-queue, node-v8-smoke, node-app-smoke, go-os_exec) MATCH, none TIMEOUT (this is the exact gate that caught the 3b leak). Watch for host-UI instability.
-- [ ] **Step 2: Fork-storm stress** — `CARRICK_HVF_ATOMIC_PERMIT=1 cargo run -q -p carrick-conformance -- --tier full --workers 8 --flake-retries 0 --suite ltp-msgstress01 --suite ltp-futex_cmp_requeue01 --jsonl /tmp/opt3-storm.jsonl` × 3 runs: zero CRASH/TIMEOUT/HV_NO_RESOURCES/HV_BUSY.
-- [ ] **Step 3: The payoff experiment (why we did this)** — with the cheaper atomic acquire proven safe, raise `CONSERVATIVE_GLOBAL_VM_CAP` from 4 toward physical cores (10) AND re-check `ltp-waitpid13` (the suite that needs ~11 concurrent processes and timed out under the cold-start cap of 4): `CARRICK_HVF_ATOMIC_PERMIT=1 cargo run ... --suite ltp-waitpid13`. Record whether the higher cap closes it AND the fork-storm gate still passes (the two must both hold). This is the concrete win that motivated Option 3.
-- [ ] **Step 4: Commit** — `test(hvf): validate atomic vcpu permit under fork-storm + raised cap`.
-
-**Decision gate:** if Steps 1-2 pass, the atomic permit is a viable default and the maintainer can flip `CARRICK_HVF_ATOMIC_PERMIT` on (a follow-up). If Step 3 shows the raised cap safely closes waitpid13-class workloads without HV/host instability, that answers the "more concurrent processes" question. If any step regresses, the flag stays off and flock ships — **the spike still delivered the measurement.**
+- [ ] **Step 1: Atomic gate** — `CARRICK_HVF_ATOMIC_PERMIT=1 bash scripts/conformance/vcpu-admission-gate.sh`: cpython-queue/node-v8-smoke/node-app-smoke/go-os_exec all MATCH, none TIMEOUT (the exact gate that caught 3b). Watch for host-UI instability.
+- [ ] **Step 2: Fork-storm** — `CARRICK_HVF_ATOMIC_PERMIT=1 cargo run -q -p carrick-conformance -- --tier full --workers 8 --flake-retries 0 --suite ltp-msgstress01 --suite ltp-futex_cmp_requeue01 --jsonl /tmp/opt3-storm.jsonl` × 3: zero CRASH/TIMEOUT/HV_NO_RESOURCES/HV_BUSY.
+- [ ] **Step 3: Commit** — `test(hvf): validate atomic vcpu permit under gate + fork-storm`.
+- **Decision gate:** if Steps 1-2 pass across 3 runs, the atomic permit is a viable default (a follow-up flips the flag). If any step regresses, the flag stays off and flock ships — **the spike still delivered the measurement.** Do NOT touch `CONSERVATIVE_GLOBAL_VM_CAP` in this plan.
 
 ---
 
-## Notes toward Option 4 (out of scope here, recorded for the follow-up)
-Option 4 (drop the cap entirely, reclaim-only) is unlocked ONLY after this spike, and needs its own measurement: with the atomic path + prompt reclaim, gate `create_vm_with_admission` behind `CARRICK_HVF_NO_XPROC_PERMIT=1` (budget → `None` for all classes) and stress the fork-storm pre-block window (`--workers 8` msgstress01/futex fanout × 3). PASS = zero HV_NO_RESOURCES across the burst where every child is runnable before any blocks. Firecracker runs cap-free but never faces this window (its VMs are externally orchestrated), so this measurement — not precedent — is what clears Option 4.
-
----
+## Follow-ups (separate plans, gated on this spike)
+- **Cap-raise experiment** (the "more concurrent processes" payoff): with the atomic permit proven, a SEPARATE temporary/env-gated patch raises `CONSERVATIVE_GLOBAL_VM_CAP` 4→physical cores and re-checks `ltp-waitpid13` + the fork-storm gate. Never committed together with the atomic permit (ambiguity).
+- **Option 4** (cap-free, reclaim-only): only after this spike + prompt reclaim, gate `create_vm_with_admission` behind `CARRICK_HVF_NO_XPROC_PERMIT=1` and stress the fork-storm pre-block window. Firecracker runs cap-free but never faces that window, so this measurement — not precedent — clears Option 4.
 
 ## Self-Review
-- **Spec coverage:** cheaper acquire (Task 1 atomic CAS) ✓; preserve death-reclaim (Task 2 reaper + Task 4 prompt EVFILT_PROC) ✓; exec-teardown leak (Task 3) ✓; keep cap math (Global Constraints + Task 5 raises only the *conservative* cap, deliberately) ✓; gated+fallback (flag throughout) ✓; validation on the exact gate that caught 3b (Task 5) ✓; Option-4 path recorded ✓.
-- **Placeholder scan:** the two genuine unknowns (reaper interval; whether prompt reclaim is needed) are marked as SPIKE/measure steps with concrete pass criteria, not hand-waves — appropriate for a spike. Task 4 is explicitly conditional on Task 2's measurement.
-- **Type consistency:** `PermitRegion`, `try_acquire(budget,pid)`, `release(pid)`, `reclaim_dead_slots()`, `atomic_permit_enabled()`, `start_reaper()` are used consistently across tasks.
+- **Companion-review coverage:** ownerless-count leak → Task 1 slot-is-source-of-truth ✓; token-guarded release → Task 1 `release_token` by vcpu_id + the unregistered-doesn't-release test ✓; `kill(pid,0)` weak → Task 2 mandatory `EVFILT_PROC` + `waitid(WNOWAIT)` + generation guard ✓; cooperative `_exit` → Task 3 ✓; wrong integration point → Task 2 uses `pre_loop_setup`, not `threaded_loop`/`crate::hvf` ✓; stale exec premise → Task 4 downgraded to proof ✓; cap-raise conflation → moved to Follow-ups, Global Constraint forbids committing it here ✓.
+- **Placeholders:** the genuine unknowns (backstop interval; whether cooperative-exit alone suffices vs relies on the supervisor) are measured in Task 3/5, not hand-waved. Task 4 is explicitly proof-first.
+- **Type consistency:** `PermitRegion`, `PermitToken{slot,generation,owner_pid}`, `acquire`, `register`, `release_token`, `reclaim_owner`, `occupied`, `atomic_permit_enabled`, `start_vcpu_permit_reaper` used consistently across tasks.
