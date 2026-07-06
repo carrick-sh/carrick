@@ -473,9 +473,12 @@ impl SyscallDispatcher {
                 }
             }
             let timer_id = crate::posix_timer::create(clock_id as i32, signum);
-            // Linux uses an opaque pointer-sized `timer_t`; we hand back the
-            // small integer id widened to 64 bits.
-            let id_bytes = (timer_id as i64 as u64).to_le_bytes();
+            // The raw timer_create(2) ABI writes a kernel `timer_t`, which is a
+            // 4-byte `int` (`__kernel_timer_t`) — NOT glibc's 8-byte opaque
+            // timer_t (glibc synthesises that pointer from this int). Writing 8
+            // bytes overruns a guest `kernel_timer_t` (int) buffer and trips its
+            // stack canary (LTP timer_delete01: "stack smashing detected").
+            let id_bytes = (timer_id).to_le_bytes();
             if memory.write_bytes(id_out.0, &id_bytes).is_err() {
                 let _ = crate::posix_timer::delete(timer_id);
                 return Ok(DispatchOutcome::errno(LINUX_EFAULT));
@@ -554,6 +557,12 @@ impl SyscallDispatcher {
                 Some(d) => d.arm_posix(id, spec_ns),
                 None => crate::posix_timer::arm(id, spec_ns),
             };
+            // Seed the missed-interval overrun for a past absolute deadline (the
+            // arm above reset the counter to 0); `fetch_max` keeps it above any
+            // increment the firing thread has already recorded.
+            if seed_overrun > 0 {
+                crate::posix_timer::seed_overrun(id, seed_overrun);
+            }
             if old_ptr.0 != 0 {
                 let prev = old.unwrap_or(crate::posix_timer::PosixTimerSpec {
                     signum: 0,
