@@ -1099,8 +1099,13 @@ impl SyscallDispatcher {
         path: &str,
         flags: u64,
     ) -> Result<StatRecord, LinuxErrno> {
-        if path.is_empty() && flags & LINUX_AT_EMPTY_PATH != 0 {
-            return self.fd_stat_record(dirfd as i32);
+        if path.is_empty() {
+            // AT_EMPTY_PATH stats the dirfd/fd itself; without it an empty
+            // pathname is ENOENT — NOT a stat of the cwd (lstat02/stat02 case 2).
+            if flags & LINUX_AT_EMPTY_PATH != 0 {
+                return self.fd_stat_record(dirfd as i32);
+            }
+            return Err(LINUX_ENOENT);
         }
 
         // A trailing "/" or "/." forces directory semantics on the FINAL
