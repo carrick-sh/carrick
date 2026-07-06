@@ -270,32 +270,53 @@ fn sched_pid_is_live_guest_thread<M: GuestMemory>(cx: &SyscallCtx<'_, M>, pid: u
     })
 }
 
-/// True when `pid` names a live process accessible to the guest: either
-/// the calling process / its alias, a live Carrick guest thread tid, or a peer
-/// host pid the kernel confirms via `kill(pid, 0)`. Used by sched_get* queries
-/// so they can answer for any task in the system the way Linux does (with our
-/// uniform SCHED_OTHER + prio 0 model, the actual answer is the same for every
-/// valid pid; only the "does it exist?" check varies).
-fn sched_pid_exists<M: GuestMemory>(cx: &SyscallCtx<'_, M>, pid: u64) -> bool {
+/// Classification of a sched_*/priority `pid` argument relative to the caller,
+/// resolved against carrick's guest process model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SchedTarget {
+    /// 0, the caller's own pid/alias, or one of its live sibling thread tids —
+    /// operate on the calling process.
+    SelfProc,
+    /// Another live carrick guest process (EPERM for an unprivileged caller
+    /// changing its scheduling attributes).
+    OtherGuest,
+    /// No such guest task — ESRCH.
+    NotFound,
+}
+
+/// Resolve a guest-supplied sched/affinity `pid` against carrick's guest process
+/// model — the single resolver shared by every sched_* handler. Self (0, our own
+/// pid/alias, our own thread, a live sibling thread) is `SelfProc`; any other
+/// LIVE carrick guest process is `OtherGuest`; anything else is `NotFound`
+/// (ESRCH).
+///
+/// The guest names processes by ns-pid (what `getpid()` reports). We translate
+/// the ns-pid to its host pid and consult the guest process table
+/// (`is_guest_process`) rather than `kill(pid, 0)` an arbitrary host pid: a raw
+/// ns-pid probed against the host would spuriously match an unrelated host
+/// process/kthread sharing the numeric value (over-inclusive), and a valid
+/// sibling's ns-pid would never be recognised as a peer guest (under-inclusive).
+/// An ns-pid naming no member — or a host pid that is not one of carrick's own
+/// guest descendants — is `NotFound`. Identity when namespaces are off.
+fn resolve_sched_target<M: GuestMemory>(cx: &SyscallCtx<'_, M>, pid: u64) -> SchedTarget {
     if sched_pid_is_self(cx, pid) || sched_pid_is_live_guest_thread(cx, pid) {
-        return true;
+        return SchedTarget::SelfProc;
     }
     if pid == 0 || pid > i32::MAX as u64 {
-        return false;
+        return SchedTarget::NotFound;
     }
-    // The guest names processes by ns-pid (what getpid() reports), so a
-    // sched_*(getpid(), …) issued by a forked child targets the PARENT's ns-pid,
-    // not a host pid. Translate ns -> host before probing liveness, else we'd
-    // libc::kill an unrelated HOST pid that happens to share the numeric value
-    // (LTP sched_getparam01/sched_rr_get_interval01). An ns-pid that maps to no
-    // member doesn't exist (ESRCH); identity when namespaces are off.
-    let Some(host_pid) = crate::namespace::pid::ns_to_host_or_self(pid as u32) else {
-        return false;
-    };
-    unsafe {
-        libc::kill(host_pid as i32, 0) == 0
-            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    match crate::namespace::pid::ns_to_host_or_self(pid as u32) {
+        Some(host) if crate::host_proc::is_guest_process(host) => SchedTarget::OtherGuest,
+        _ => SchedTarget::NotFound,
     }
+}
+
+/// True when `pid` names a live process accessible to the guest (self or another
+/// live carrick guest). Used by the sched_get*/policy queries, which answer the
+/// same for every valid pid under our uniform SCHED_OTHER + prio 0 model; only
+/// the "does it exist?" check varies. Backed by [`resolve_sched_target`].
+fn sched_pid_exists<M: GuestMemory>(cx: &SyscallCtx<'_, M>, pid: u64) -> bool {
+    resolve_sched_target(cx, pid) != SchedTarget::NotFound
 }
 
 /// True when `policy` is one of the kernel's known scheduling policies.
@@ -489,16 +510,6 @@ pub(super) fn affinity_to_bytes(mask: &[u64], out_len: usize) -> Vec<u8> {
         buf[off..off + n].copy_from_slice(&wb[..n]);
     }
     buf
-}
-
-/// Classification of a sched_*affinity `pid` argument relative to the caller.
-enum AffinityTarget {
-    /// 0 or the caller's own pid.
-    SelfProc,
-    /// Another process/thread in the guest tree.
-    OtherGuest,
-    /// No such guest task — ESRCH.
-    NotFound,
 }
 
 /// Build a `LinuxRusage` carrying just CPU time (user/system microseconds);
@@ -706,32 +717,6 @@ impl SyscallDispatcher {
         self.seccomp.install_strict();
         self.disable_identity_syscall_shim(memory);
         DispatchOutcome::Returned { value: 0 }
-    }
-
-    /// Resolve an affinity pid argument. 0 or our own pid is `SelfProc`; a live
-    /// sibling guest thread is also `SelfProc` (carrick keeps a single
-    /// per-process affinity mask, so a sibling's affinity IS the process
-    /// affinity — and `sched_getaffinity`/`setaffinity` accept a thread tid,
-    /// like sched_getscheduler/getparam already do); any other thread/process
-    /// in the guest tree is `OtherGuest`; anything else is `NotFound` (ESRCH).
-    fn resolve_affinity_target<M: GuestMemory>(
-        &self,
-        cx: &SyscallCtx<M>,
-        pid: u64,
-    ) -> AffinityTarget {
-        if pid == 0
-            || pid == std::process::id() as u64
-            || cx.thread.as_ref().is_some_and(|t| {
-                t.registry
-                    .is_live(crate::thread::ThreadId::from_guest_supplied_tid(pid as i32))
-            })
-        {
-            AffinityTarget::SelfProc
-        } else if crate::host_proc::is_guest_process(pid as u32) {
-            AffinityTarget::OtherGuest
-        } else {
-            AffinityTarget::NotFound
-        }
     }
 
     /// Allocate a pidfd for `host_pid`. Shared by `pidfd_open` and the
@@ -1455,7 +1440,7 @@ impl SyscallDispatcher {
 
             // Resolve the target BEFORE borrowing cx.memory (resolve reads
             // cx.thread; the mutable memory borrow below would otherwise alias).
-            if matches!(this.resolve_affinity_target(cx, pid), AffinityTarget::NotFound) {
+            if resolve_sched_target(cx, pid) == SchedTarget::NotFound {
                 return Ok(DispatchOutcome::errno(LINUX_ESRCH));
             }
             let memory = &mut *cx.memory;
@@ -1477,11 +1462,11 @@ impl SyscallDispatcher {
 
             let read_len = size.min(128);
             let bytes = memory.read_bytes(address.0, read_len)?;
-            let target = this.resolve_affinity_target(cx, pid);
-            if matches!(target, AffinityTarget::NotFound) {
+            let target = resolve_sched_target(cx, pid);
+            if target == SchedTarget::NotFound {
                 return Ok(DispatchOutcome::errno(LINUX_ESRCH));
             }
-            if matches!(target, AffinityTarget::OtherGuest) && this.creds.lock().euid != 0 {
+            if target == SchedTarget::OtherGuest && this.creds.lock().euid != 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EPERM));
             }
             let ncpu = crate::host_facts::logical_cpu_count();
@@ -1495,7 +1480,7 @@ impl SyscallDispatcher {
             if effective.iter().all(|w| *w == 0) {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            if matches!(target, AffinityTarget::SelfProc) {
+            if target == SchedTarget::SelfProc {
                 this.proc.lock().affinity = effective;
             }
             Ok(DispatchOutcome::Returned { value: 0 })
@@ -1619,17 +1604,24 @@ impl SyscallDispatcher {
 
         /// `sched_setparam(pid, &param)`: change just the priority. For our
         /// SCHED_OTHER-only model the only valid priority is 0; anything else
-        /// is EINVAL (matches Linux for SCHED_NORMAL/OTHER/BATCH/IDLE).
+        /// is EINVAL (matches Linux for SCHED_NORMAL/OTHER/BATCH/IDLE). An
+        /// unprivileged caller targeting ANOTHER guest process lacks CAP_SYS_NICE
+        /// and is refused with EPERM (LTP sched_setparam05: a `nobody` child
+        /// calling `sched_setparam(getppid(), …)` on its root parent).
         fn sched_setparam(this, cx, pid: u64, address: GuestPtr) {
             if (pid as i32) < 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            if !sched_pid_exists(cx, pid) {
+            let target = resolve_sched_target(cx, pid);
+            if target == SchedTarget::NotFound {
                 return Ok(DispatchOutcome::errno(LINUX_ESRCH));
             }
             let prio = sched_read_param_priority(cx, address)?;
             if prio != 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
+            if target == SchedTarget::OtherGuest && this.creds.lock().euid != 0 {
+                return Ok(DispatchOutcome::errno(LINUX_EPERM));
             }
             Ok(DispatchOutcome::Returned { value: 0 })
         }
