@@ -1288,6 +1288,90 @@ pub(super) fn is_known_sockopt_level(level: i32) -> bool {
     )
 }
 
+/// Whether `(level, optname)` names a socket option carrick EXPLICITLY
+/// recognizes and maps to a specific host option — as opposed to an optname it
+/// merely passes through to the host by number (the `other => other` arms of
+/// [`linux_to_host_sockopt`] at SOL_IP/SOL_IPV6/SOL_UDP) or one it does not map
+/// at all.
+///
+/// Callers use this to SCOPE the EINVAL → ENOPROTOOPT/EOPNOTSUPP remap on the
+/// set/getsockopt error path. macOS answers EINVAL for an optname it does not
+/// recognize where Linux answers ENOPROTOOPT/EOPNOTSUPP, so an EINVAL from an
+/// UNRECOGNIZED optname is remapped — but a RECOGNIZED optname's EINVAL is a
+/// genuine bad-argument error (short optlen / out-of-range value) that Linux
+/// also reports as EINVAL, so it must pass through UNCHANGED. The recognized
+/// set mirrors the explicit match arms of [`linux_to_host_sockopt`] and is
+/// host-agnostic (the macOS and non-macOS arms enumerate the same LINUX_*
+/// optnames). SOL_UDP recognizes no optname explicitly (every UDP optname is a
+/// by-number pass-through), so a host EINVAL there is always the
+/// unsupported-optname case and this returns `false`.
+pub(super) fn is_known_sockopt_optname(level: i32, optname: i32) -> bool {
+    use crate::linux_abi as a;
+    match level {
+        LINUX_SOL_SOCKET => matches!(
+            optname,
+            a::LINUX_SO_DEBUG
+                | a::LINUX_SO_REUSEADDR
+                | a::LINUX_SO_TYPE
+                | a::LINUX_SO_ERROR
+                | a::LINUX_SO_DONTROUTE
+                | a::LINUX_SO_BROADCAST
+                | a::LINUX_SO_SNDBUF
+                | a::LINUX_SO_RCVBUF
+                | a::LINUX_SO_KEEPALIVE
+                | a::LINUX_SO_OOBINLINE
+                | a::LINUX_SO_LINGER
+                | a::LINUX_SO_REUSEPORT
+                | a::LINUX_SO_RCVTIMEO
+                | a::LINUX_SO_SNDTIMEO
+                | a::LINUX_SO_ACCEPTCONN
+        ),
+        LINUX_SOL_IP => matches!(
+            optname,
+            a::LINUX_IP_OPTIONS
+                | a::LINUX_IP_HDRINCL
+                | a::LINUX_IP_TOS
+                | a::LINUX_IP_TTL
+                | a::LINUX_IP_MULTICAST_IF
+                | a::LINUX_IP_MULTICAST_TTL
+                | a::LINUX_IP_MULTICAST_LOOP
+                | a::LINUX_IP_ADD_MEMBERSHIP
+                | a::LINUX_IP_DROP_MEMBERSHIP
+                | a::LINUX_IP_RECVTTL
+                | a::LINUX_IP_PKTINFO
+                | a::LINUX_IP_RECVTOS
+        ),
+        LINUX_SOL_IPV6 => matches!(
+            optname,
+            a::LINUX_IPV6_UNICAST_HOPS
+                | a::LINUX_IPV6_MULTICAST_IF
+                | a::LINUX_IPV6_MULTICAST_HOPS
+                | a::LINUX_IPV6_MULTICAST_LOOP
+                | a::LINUX_IPV6_JOIN_GROUP
+                | a::LINUX_IPV6_LEAVE_GROUP
+                | a::LINUX_IPV6_V6ONLY
+                | a::LINUX_IPV6_RECVTCLASS
+                | a::LINUX_IPV6_TCLASS
+                | a::LINUX_IPV6_RECVHOPLIMIT
+                | a::LINUX_IPV6_PKTINFO
+                | a::LINUX_IPV6_HOPLIMIT
+                | a::LINUX_IPV6_RECVPKTINFO
+        ),
+        LINUX_SOL_TCP => matches!(
+            optname,
+            a::LINUX_TCP_NODELAY
+                | a::LINUX_TCP_MAXSEG
+                | a::LINUX_TCP_CORK
+                | a::LINUX_TCP_KEEPIDLE
+                | a::LINUX_TCP_KEEPINTVL
+                | a::LINUX_TCP_KEEPCNT
+        ),
+        // SOL_UDP passes every optname through by number (no explicit arm), and
+        // an unrecognized LEVEL maps nothing: neither recognizes `optname`.
+        _ => false,
+    }
+}
+
 pub(super) fn linux_to_host_sockopt(level: i32, optname: i32) -> Option<(i32, i32)> {
     match level {
         LINUX_SOL_SOCKET => {
@@ -3198,5 +3282,35 @@ mod tests {
             flags >= 0 && flags & libc::O_NONBLOCK != 0,
             "host fd must be nonblocking for dispatcher wait invariants",
         );
+    }
+
+    #[test]
+    fn sockopt_optname_recognition_scopes_einval_remap() {
+        use crate::linux_abi as a;
+        // RECOGNIZED optnames carrick maps explicitly: a host EINVAL here is a
+        // genuine bad-arg error and stays EINVAL (predicate true => remap
+        // suppressed). Covers one from each explicitly-mapped level.
+        assert!(is_known_sockopt_optname(LINUX_SOL_IP, a::LINUX_IP_TTL));
+        assert!(is_known_sockopt_optname(LINUX_SOL_IP, a::LINUX_IP_TOS));
+        assert!(is_known_sockopt_optname(LINUX_SOL_TCP, a::LINUX_TCP_MAXSEG));
+        assert!(is_known_sockopt_optname(
+            LINUX_SOL_TCP,
+            a::LINUX_TCP_KEEPIDLE
+        ));
+        assert!(is_known_sockopt_optname(
+            LINUX_SOL_IPV6,
+            a::LINUX_IPV6_TCLASS
+        ));
+
+        // UNRECOGNIZED optnames (the getsockopt01/setsockopt01 "invalid option
+        // name" cases): predicate false => the EINVAL→ENOPROTOOPT/EOPNOTSUPP
+        // remap still fires. A made-up optname at IP/IPV6 and EVERY UDP optname
+        // (all by-number pass-throughs) are unrecognized.
+        assert!(!is_known_sockopt_optname(LINUX_SOL_IP, 0x7fff));
+        assert!(!is_known_sockopt_optname(LINUX_SOL_IPV6, 0x7fff));
+        assert!(!is_known_sockopt_optname(LINUX_SOL_UDP, a::LINUX_IP_TTL));
+        assert!(!is_known_sockopt_optname(LINUX_SOL_UDP, 0x7fff));
+        // An unrecognized LEVEL recognizes no optname either.
+        assert!(!is_known_sockopt_optname(0x4242, a::LINUX_IP_TTL));
     }
 }
