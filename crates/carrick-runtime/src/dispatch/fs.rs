@@ -10792,6 +10792,27 @@ impl SyscallDispatcher {
                     return Ok(DispatchOutcome::errno(errno));
                 }
             };
+            // Without AT_SYMLINK_NOFOLLOW, utime()/utimensat FOLLOWS a trailing
+            // symlink to its target and updates THAT file's times: a dangling
+            // target is ENOENT and a symlink cycle is ELOOP (utime07). Only when
+            // the final component is genuinely a symlink — plain paths and
+            // synthetic /proc entries are left untouched for the checks below,
+            // and resolve_at_path already leaves the final component unfollowed.
+            let path = if flags & LINUX_AT_SYMLINK_NOFOLLOW == 0
+                && matches!(
+                    this.layered_lstat(&path),
+                    Ok(md) if md.kind == RootFsEntryKind::Symlink
+                ) {
+                match this.canonicalize_following(&path) {
+                    Ok(resolved) => resolved,
+                    Err(errno) => {
+                        crate::probes::fs_op("utimensat:follow_err", &path, errno.get());
+                        return Ok(DispatchOutcome::errno(errno));
+                    }
+                }
+            } else {
+                path
+            };
             // The path must exist in the layered view, else NotFound (or a
             // no-op success for synthetic /proc paths whose times we can't
             // back).
