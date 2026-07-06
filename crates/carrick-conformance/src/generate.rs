@@ -694,7 +694,8 @@ mod tests {
         }
         // setrlimit01: unconfined + CAP_SYS_RESOURCE + known_gap "summary"
         // (genuine FSIZE-enforcement gap — report-only).
-        for name in ["ltp-setrlimit01"] {
+        {
+            let name = "ltp-setrlimit01";
             let s = find(name);
             assert!(
                 s.docker_flags.iter().any(|f| f == "SYS_RESOURCE"),
