@@ -533,6 +533,15 @@ const SYSCTL_TABLE: &[(&str, Sysctl)] = &[
     ("/proc/sys/fs/nr_open", Sysctl::Static(b"1048576\n")),
     ("/proc/sys/fs/aio-max-nr", Sysctl::Static(b"65536\n")),
     ("/proc/sys/fs/pipe-max-size", Sysctl::Static(b"1048576\n")),
+    // Per-user pipe-buffer accounting ceilings (in pages). carrick does not
+    // enforce a per-user pipe-pages cap, but pipe15 SCANFs the soft limit to
+    // size a pipe-creation loop, so it must be present and a positive integer;
+    // the Linux default is 16384 pages (soft) with no hard cap (0).
+    (
+        "/proc/sys/fs/pipe-user-pages-soft",
+        Sysctl::Static(b"16384\n"),
+    ),
+    ("/proc/sys/fs/pipe-user-pages-hard", Sysctl::Static(b"0\n")),
     ("/proc/sys/fs/overflowuid", Sysctl::Static(b"65534\n")),
     ("/proc/sys/fs/overflowgid", Sysctl::Static(b"65534\n")),
     // fs/inotify/* — file-watchers (chokidar/webpack/vite/fsnotify) read these.
