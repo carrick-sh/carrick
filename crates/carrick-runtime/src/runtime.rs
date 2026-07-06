@@ -1612,7 +1612,9 @@ impl crate::threaded_loop::HostBackend for HvfHostBackend {
         // The root process is the atomic-permit supervisor: one EVFILT_PROC
         // kqueue that frees the generation-stamped slots of any owner that dies
         // hard (SIGKILL/segfault/missed cooperative cleanup), recreating flock's
-        // kernel-backed reclaim. Flag-gated; the default flock path is untouched.
+        // kernel-backed reclaim. Runs by default (the atomic permit is the
+        // default admission path); skipped only when the flock fallback is
+        // selected via CARRICK_HVF_ATOMIC_PERMIT=0.
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         if crate::trap::atomic_permit_enabled() {
             crate::trap::start_vcpu_permit_reaper();

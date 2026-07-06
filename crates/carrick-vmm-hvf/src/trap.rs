@@ -897,8 +897,9 @@ fn reset_global_vcpu_permits_after_fork_child() {
 }
 
 // ===========================================================================
-// Atomic vCPU admission permit (Option 3, Task 1) — flag-gated alternative to
-// the flock permit above, behind `CARRICK_HVF_ATOMIC_PERMIT=1`.
+// Atomic vCPU admission permit (Option 3, Task 1) — the DEFAULT admission path.
+// The flock permit above remains as a fallback, selectable with
+// `CARRICK_HVF_ATOMIC_PERMIT=0` (`false`/`no` also accepted).
 //
 // The flock permit above gets its cross-process death-reclaim for free from the
 // kernel (a slot lock releases when the holder's last fd closes on exit). A bare
@@ -1373,8 +1374,13 @@ fn permit_region() -> &'static PermitRegion {
     REGION.get_or_init(PermitRegion::new_shared_global)
 }
 
-/// `true` when `CARRICK_HVF_ATOMIC_PERMIT=1`; cached once. Unset/other → the
-/// default flock permit path (byte-for-byte unchanged).
+/// Whether the atomic slot-table admission permit is active; cached once.
+///
+/// The atomic permit is the DEFAULT: it is enabled UNLESS
+/// `CARRICK_HVF_ATOMIC_PERMIT` is explicitly set to a falsey value
+/// (`0`/`false`/`no`, case-insensitive), which selects the legacy flock
+/// permit path (byte-for-byte unchanged) as a fallback. Unset → atomic on.
+/// `=1` (or any other value) → atomic on.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub fn atomic_permit_enabled() -> bool {
     use std::sync::atomic::{AtomicU8, Ordering};
@@ -1383,10 +1389,24 @@ pub fn atomic_permit_enabled() -> bool {
         1 => true,
         2 => false,
         _ => {
-            let on = std::env::var("CARRICK_HVF_ATOMIC_PERMIT").ok().as_deref() == Some("1");
+            let on = atomic_permit_enabled_from_env(
+                std::env::var("CARRICK_HVF_ATOMIC_PERMIT").ok().as_deref(),
+            );
             FLAG.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
         }
+    }
+}
+
+/// Pure env → enabled mapping for [`atomic_permit_enabled`], factored out so it
+/// can be unit-tested without touching the process-global `FLAG` cache or the
+/// (unsafe, in edition 2024) `set_var`. Atomic is the default: enabled unless
+/// the value is an explicit falsey token (`0`/`false`/`no`, case-insensitive).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn atomic_permit_enabled_from_env(val: Option<&str>) -> bool {
+    match val {
+        Some(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no"),
+        None => true,
     }
 }
 
@@ -5323,12 +5343,38 @@ mod vm_create_admission_tests {
     }
 
     #[test]
+    fn atomic_permit_enabled_from_env_defaults_to_atomic() {
+        // The flip: atomic admission is the DEFAULT admission path.
+        // Unset → enabled.
+        assert!(atomic_permit_enabled_from_env(None));
+        // `=1` → enabled (the historical explicit-on still works).
+        assert!(atomic_permit_enabled_from_env(Some("1")));
+        // Explicit falsey tokens → disabled = the flock fallback.
+        assert!(!atomic_permit_enabled_from_env(Some("0")));
+        assert!(!atomic_permit_enabled_from_env(Some("false")));
+        assert!(!atomic_permit_enabled_from_env(Some("no")));
+        // Case-insensitive, tolerant of surrounding whitespace.
+        assert!(!atomic_permit_enabled_from_env(Some("FALSE")));
+        assert!(!atomic_permit_enabled_from_env(Some(" 0 ")));
+        // Any other value falls through to the default (enabled).
+        assert!(atomic_permit_enabled_from_env(Some("yes")));
+        assert!(atomic_permit_enabled_from_env(Some("")));
+    }
+
+    #[test]
     fn cooperative_release_atomic_permit_is_noop_on_flock_path() {
-        // With CARRICK_HVF_ATOMIC_PERMIT unset (the default flock path), the
-        // engine hook must be a byte-for-byte no-op: it must not touch the global
-        // region and must free nothing.
-        assert!(!atomic_permit_enabled());
-        assert_eq!(cooperative_release_atomic_permit(), 0);
+        // `CARRICK_HVF_ATOMIC_PERMIT=0` selects the legacy flock fallback...
+        assert!(!atomic_permit_enabled_from_env(Some("0")));
+        // ...on which `cooperative_release_atomic_permit` early-returns 0 without
+        // touching the region (the permit is fd-lifetime-bound). Mirror that
+        // "frees nothing" result against a fresh region: with no owned local
+        // slots the cooperative release frees zero and leaves the table empty.
+        // (Testing the parse gate here rather than the process-global
+        // `atomic_permit_enabled()` cache, which is now DEFAULT-on and cannot be
+        // toggled per-test without the edition-2024-unsafe `set_var`.)
+        let r = PermitRegion::new_anon_for_test();
+        assert_eq!(r.cooperative_release_local(), 0);
+        assert_eq!(r.occupied(), 0);
     }
 
     // ---- Task 4: execve rebuild releases the pre-exec token, no double-free -
@@ -5344,10 +5390,10 @@ mod vm_create_admission_tests {
     // budgets), so `vcpu_destroyed`'s `release_token(vcpu_id)` finds it in the
     // local map and frees exactly that slot — no leak, and nothing left for an
     // extra explicit release to double-free. These tests drive that exact
-    // sequence against a private `PermitRegion` (the other tests in this
-    // module rely on the process-global `atomic_permit_enabled()` gate
-    // staying OFF, so we don't route through the real dispatch functions) to
-    // PROVE the premise instead of merely asserting it.
+    // sequence against a private `PermitRegion` (they never call
+    // `atomic_permit_enabled()` or the real dispatch functions, so they are
+    // insulated from the process-global gate — now DEFAULT-on) to PROVE the
+    // premise instead of merely asserting it.
 
     #[test]
     fn execve_rebuild_releases_pre_exec_permit_and_acquires_nothing_new() {
