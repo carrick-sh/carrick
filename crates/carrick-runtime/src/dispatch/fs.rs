@@ -4694,6 +4694,45 @@ impl SyscallDispatcher {
         outcome
     }
 
+    /// The RLIMIT_FSIZE soft cap the guest set via setrlimit/prlimit64, or
+    /// `None` when unset / RLIM_INFINITY. A write whose bytes would land past
+    /// this offset is EFBIG + SIGXFSZ on Linux (llseek01). Stored in the
+    /// per-process override table (RLIMIT_FSIZE == resource 1).
+    fn fsize_soft_limit(&self) -> Option<u64> {
+        let ov = self
+            .proc
+            .lock()
+            .rlimit_overrides
+            .get(LINUX_RLIMIT_FSIZE as usize)
+            .copied()
+            .flatten()?;
+        (ov.rlim_cur != LINUX_RLIM_INFINITY).then_some(ov.rlim_cur)
+    }
+
+    /// Enforce RLIMIT_FSIZE for a regular-file write starting at `offset` that
+    /// would carry `len` bytes. Returns `Some(EFBIG)` (after queuing SIGXFSZ)
+    /// when the write STARTS at or beyond the soft cap — the case Linux errors
+    /// outright (a straddling write is truncated to the cap, not an error, and
+    /// is left to the backend). `None` means the write may proceed.
+    fn fsize_write_guard<M: GuestMemory>(
+        &self,
+        cx: &SyscallCtx<M>,
+        offset: u64,
+        len: usize,
+    ) -> Option<LinuxErrno> {
+        if len == 0 {
+            return None;
+        }
+        let limit = self.fsize_soft_limit()?;
+        if offset >= limit {
+            if !self.signal_is_ignored(LINUX_SIGXFSZ) {
+                self.mark_signal_pending(Self::ctx_tid(cx), LINUX_SIGXFSZ);
+            }
+            return Some(LINUX_EFBIG);
+        }
+        None
+    }
+
     /// Linux DAC: may the calling guest create/remove an entry in directory
     /// `dir_path`? It needs WRITE + EXECUTE (search) on the directory for its
     /// permission class (owner/group/other), evaluated against the
@@ -4785,10 +4824,32 @@ impl SyscallDispatcher {
             let address = address.0;
             let size =
                 usize::try_from(size).map_err(|_| DispatchError::LengthTooLarge(size))?;
+            // getcwd(2) under a chroot reports the cwd RELATIVE to the process's
+            // chroot root; a cwd that lies OUTSIDE that root subtree is
+            // unreachable and returns ENOENT. glibc's realpath(".") relies on
+            // this to fail when the caller chroots into a subdirectory without
+            // first chdir'ing into it, leaving the cwd above the new root
+            // (realpath01, the CVE-2018-1000001 regression). With no chroot the
+            // cwd is reported verbatim.
+            let cwd = this.io.cwd.read().clone();
+            let cwd = match &*this.io.chroot_root.read() {
+                Some(root) => {
+                    // cwd == "/" means the guest chdir'd to the (global) root
+                    // after chroot: it is at the chroot root, so getcwd is "/".
+                    if cwd == "/" || cwd == *root {
+                        "/".to_owned()
+                    } else if let Some(rel) = cwd.strip_prefix(&format!("{root}/")) {
+                        format!("/{rel}")
+                    } else {
+                        return Ok(DispatchOutcome::errno(LINUX_ENOENT));
+                    }
+                }
+                None => cwd,
+            };
             // The cwd is stored in the VFS layer's reversible escape form;
             // decode to the opaque path BYTES so getcwd is byte-exact for a
             // cwd that contains undecodable (non-UTF-8) components.
-            let mut bytes = crate::pathcodec::decode_to_bytes(&this.io.cwd.read());
+            let mut bytes = crate::pathcodec::decode_to_bytes(&cwd);
             bytes.push(0);
             if bytes.len() > size {
                 return Ok(DispatchOutcome::errno(LINUX_ERANGE));
@@ -4863,12 +4924,14 @@ impl SyscallDispatcher {
             if this.cred_snapshot().euid != 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EPERM));
             }
-            // The request is valid and we accept it. Per-process root
+            // The request is valid and we accept it. Full per-process root
             // enforcement inside resolve_at_path (so the guest's "/" maps under
             // the new root) is a tracked follow-up — chroot02 only needs the call
             // to succeed; chroot04 (EACCES from a no-search-permission component)
-            // and realpath01 (which relies on the root actually changing) await
-            // that enforcement plus the DAC search-permission check.
+            // awaits that plus the DAC search-permission check. We DO record the
+            // new root so getcwd can report a cwd left outside it as ENOENT
+            // (realpath01 / CVE-2018-1000001).
+            *this.io.chroot_root.write() = Some(display_rootfs_path(&metadata.path));
             Ok(DispatchOutcome::Returned { value: 0 })
 
         }
@@ -9186,6 +9249,19 @@ impl SyscallDispatcher {
                             if base.status_flags() & LINUX_O_APPEND != 0 {
                                 unsafe { libc::lseek(host_fd.raw(), 0, libc::SEEK_END) };
                             }
+                            // RLIMIT_FSIZE: a write starting past the guest's
+                            // soft file-size cap is EFBIG + SIGXFSZ (llseek01).
+                            // The offset lives in the host kernel; read it back
+                            // (post-append reposition) only when a cap is set.
+                            if this.fsize_soft_limit().is_some() {
+                                let pos = unsafe { libc::lseek(host_fd.raw(), 0, libc::SEEK_CUR) };
+                                if pos >= 0
+                                    && let Some(errno) =
+                                        this.fsize_write_guard(cx, pos as u64, bytes.len())
+                                {
+                                    return Ok(DispatchOutcome::errno(errno));
+                                }
+                            }
                             // libc::write to the real fd: advances the
                             // kernel offset and is visible across fork.
                             return Ok(write_host_pipe_owned(
@@ -9221,6 +9297,13 @@ impl SyscallDispatcher {
                                 bytes.len(),
                                 contents.len(),
                             ) {
+                                return Ok(DispatchOutcome::errno(errno));
+                            }
+                            // RLIMIT_FSIZE: a write starting past the guest's
+                            // soft file-size cap is EFBIG + SIGXFSZ (llseek01).
+                            if let Some(errno) =
+                                this.fsize_write_guard(cx, *offset as u64, bytes.len())
+                            {
                                 return Ok(DispatchOutcome::errno(errno));
                             }
                             let write_offset = *offset;

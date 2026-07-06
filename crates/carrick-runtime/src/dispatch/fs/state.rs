@@ -204,6 +204,13 @@ pub(in crate::dispatch) struct IoState {
     pub open_files: RwLock<HashMap<i32, OpenFile>>,
     pub next_fd: Mutex<i32>,
     pub cwd: RwLock<String>,
+    /// The process's chroot root as a GLOBAL (un-rerooted) guest path, set by a
+    /// successful `chroot(2)`; `None` means the default root `/`. carrick does
+    /// not yet re-root path resolution (a tracked follow-up), but getcwd
+    /// consults this so a cwd that lies OUTSIDE the new root reports ENOENT —
+    /// the CVE-2018-1000001 semantics realpath01 exercises. Fork-inherited via
+    /// the copied address space.
+    pub chroot_root: RwLock<Option<String>>,
     /// FD_CLOEXEC state for bare stdio fds (0/1/2) that have no
     /// `OpenDescription` in `open_files`. Linux lets `fcntl(F_SETFD,
     /// FD_CLOEXEC)` on stdio and a subsequent `F_GETFD` reflects the bit;
@@ -271,6 +278,7 @@ impl IoState {
             open_files: RwLock::new(HashMap::new()),
             next_fd: Mutex::new(3),
             cwd: RwLock::new("/".to_owned()),
+            chroot_root: RwLock::new(None),
             stdio_cloexec: Mutex::new([false; 3]),
             closed_stdio: Mutex::new([false; 3]),
             fd_open_paths: RwLock::new(HashMap::new()),
