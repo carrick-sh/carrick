@@ -109,6 +109,8 @@ syscall_table! {
     449 => futex_waitv,
     281 => execveat,
     260 => wait4,
+    270 => process_vm_readv,
+    271 => process_vm_writev,
     277 => sys_seccomp,
     275 => sched_getattr,
     278 => getrandom,
@@ -2887,6 +2889,163 @@ impl SyscallDispatcher {
         fn sys_rseq(this, cx) {
             Ok(this.rseq())
         }
+
+        fn process_vm_readv(
+            this, cx,
+            pid: Pid,
+            local_iov: GuestPtr, liovcnt: u64,
+            remote_iov: GuestPtr, riovcnt: u64,
+            flags: u64,
+        ) {
+            this.process_vm_rw(cx, pid, local_iov, liovcnt, remote_iov, riovcnt, flags, true)
+        }
+
+        fn process_vm_writev(
+            this, cx,
+            pid: Pid,
+            local_iov: GuestPtr, liovcnt: u64,
+            remote_iov: GuestPtr, riovcnt: u64,
+            flags: u64,
+        ) {
+            this.process_vm_rw(cx, pid, local_iov, liovcnt, remote_iov, riovcnt, flags, false)
+        }
+    }
+}
+
+/// Copy the flattened byte stream from `src` iovecs into `dst` iovecs WITHIN a
+/// single guest address space — the `process_vm_readv`/`process_vm_writev` case
+/// where the caller IS the target (`pid == getpid()`). Walks both iovec lists
+/// with independent cursors, transferring `min(remaining_src, remaining_dst)`
+/// per step and stopping when either side is exhausted (Linux transfers the
+/// shorter of the two flattened lengths). The gated `read_bytes`/`write_bytes`
+/// enforce PROT_NONE / out-of-bounds, so a bad `iov_base` faults here. Returns
+/// the byte count copied, or `EFAULT` when the FIRST access faults (once any
+/// byte has moved Linux returns the partial count, not an error).
+fn process_vm_copy_self<M: GuestMemory>(
+    memory: &mut M,
+    src: &[LinuxIovec],
+    dst: &[LinuxIovec],
+) -> Result<i64, LinuxErrno> {
+    // Bound a single read/write allocation; a large transfer streams in chunks.
+    const CHUNK: u64 = 1 << 20;
+    let mut copied: u64 = 0;
+    let (mut si, mut so, mut di, mut dofs) = (0usize, 0u64, 0usize, 0u64);
+    let fault = |copied: u64| -> Result<i64, LinuxErrno> {
+        if copied == 0 {
+            Err(LINUX_EFAULT)
+        } else {
+            Ok(copied as i64)
+        }
+    };
+    loop {
+        while si < src.len() && so >= src[si].iov_len {
+            si += 1;
+            so = 0;
+        }
+        while di < dst.len() && dofs >= dst[di].iov_len {
+            di += 1;
+            dofs = 0;
+        }
+        if si >= src.len() || di >= dst.len() {
+            break;
+        }
+        let want = (src[si].iov_len - so)
+            .min(dst[di].iov_len - dofs)
+            .min(CHUNK);
+        let want_usize = want as usize;
+        if want_usize == 0 {
+            break;
+        }
+        let src_addr = src[si].iov_base.wrapping_add(so);
+        let dst_addr = dst[di].iov_base.wrapping_add(dofs);
+        let bytes = match memory.read_bytes(src_addr, want_usize) {
+            Ok(bytes) => bytes,
+            Err(_) => return fault(copied),
+        };
+        if memory.write_bytes(dst_addr, &bytes).is_err() {
+            return fault(copied);
+        }
+        copied += want;
+        so += want;
+        dofs += want;
+    }
+    Ok(copied as i64)
+}
+
+impl SyscallDispatcher {
+    /// Shared body of `process_vm_readv` (270, `is_read=true`) and
+    /// `process_vm_writev` (271, `is_read=false`): transfer between the caller's
+    /// `local_iov` and the target process's `remote_iov`. readv copies
+    /// remote→local, writev copies local→remote.
+    ///
+    /// Validation mirrors the kernel's `process_vm_rw`: `flags != 0` → EINVAL
+    /// (only 0 is defined); both iovec arrays are imported up front so an
+    /// `iov_len` overflow → EINVAL and a bad array pointer → EFAULT before any
+    /// copy; the target `pid` is resolved against carrick's guest process model
+    /// (no such task → ESRCH); an unprivileged caller that does not own the
+    /// target → EPERM (ptrace_may_access).
+    ///
+    /// When the target is the CALLER (`pid == getpid()`, the LTP process_vm01
+    /// success cases and every setup sanity probe) the transfer runs entirely
+    /// within this guest's address space. A privileged cross-guest transfer
+    /// (LTP process_vm_readv02/03, process_vm_writev02) would require reading a
+    /// PEER HVF VM's private RAM — carrick has no cross-VM VA translation, so the
+    /// peer address space is reported inaccessible (EFAULT).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn process_vm_rw<M: GuestMemory>(
+        &self,
+        cx: &mut SyscallCtx<M>,
+        pid: Pid,
+        local_iov: GuestPtr,
+        liovcnt: u64,
+        remote_iov: GuestPtr,
+        riovcnt: u64,
+        flags: u64,
+        is_read: bool,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        // Only flags == 0 is defined; anything else is EINVAL (process_vm01
+        // test_flags exercises -INT_MAX/-1/1/INT_MAX).
+        if flags != 0 {
+            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+        }
+        let liovcnt = usize::try_from(liovcnt).map_err(|_| LINUX_EINVAL)?;
+        let riovcnt = usize::try_from(riovcnt).map_err(|_| LINUX_EINVAL)?;
+        // Import + validate both vectors: iov_len overflow → EINVAL, bad array
+        // pointer → EFAULT (read_iovecs). Read-only borrow ends with the vecs.
+        let local = read_iovecs(&*cx.memory, local_iov.0, liovcnt)?;
+        let remote = read_iovecs(&*cx.memory, remote_iov.0, riovcnt)?;
+
+        match resolve_sched_target(cx, pid.raw() as u64) {
+            SchedTarget::NotFound => Ok(DispatchOutcome::errno(LINUX_ESRCH)),
+            SchedTarget::SelfProc => {
+                let (src, dst) = if is_read {
+                    (&remote, &local)
+                } else {
+                    (&local, &remote)
+                };
+                match process_vm_copy_self(&mut *cx.memory, src, dst) {
+                    Ok(value) => Ok(DispatchOutcome::Returned { value }),
+                    Err(errno) => Ok(DispatchOutcome::errno(errno)),
+                }
+            }
+            SchedTarget::OtherGuest => {
+                // ptrace_may_access(PTRACE_MODE_ATTACH_REALCREDS): a non-root
+                // caller that does not own the target is denied (process_vm01
+                // test_invalid_perm drops to `nobody` then reads root's pid).
+                // carrick models CAP_SYS_PTRACE as euid 0.
+                let caller_euid = self.cred_snapshot().euid;
+                let target_euid = crate::namespace::pid::ns_to_host_or_self(pid.raw() as u32)
+                    .and_then(|host| crate::cred_ipc::read_target(host as i32))
+                    .unwrap_or(0);
+                if caller_euid != 0 && caller_euid != target_euid {
+                    return Ok(DispatchOutcome::errno(LINUX_EPERM));
+                }
+                // The peer runs in a separate host process with its own HVF VM;
+                // carrick cannot translate/read a peer guest's private VA space,
+                // so its address range is inaccessible.
+                Ok(DispatchOutcome::errno(LINUX_EFAULT))
+            }
+        }
     }
 }
 
@@ -3373,5 +3532,90 @@ mod wait_status_tests {
         let status = translate_child_wait_status(host_pid, exited(5));
         assert!(libc::WIFEXITED(status), "status {status:#x}");
         assert_eq!(libc::WEXITSTATUS(status), 5);
+    }
+}
+
+#[cfg(test)]
+mod process_vm_copy_tests {
+    use super::*;
+
+    const BASE: u64 = 0x10000;
+    const SRC: u64 = 0x10000;
+    const DST: u64 = 0x10800;
+
+    /// A LinearMemory seeded so `[SRC, SRC+256)` holds the ramp `i % 256` and the
+    /// destination window is zero.
+    fn seeded_memory() -> LinearMemory {
+        let mut memory = LinearMemory::new(BASE, vec![0u8; 0x1000]);
+        let ramp: Vec<u8> = (0..256u32).map(|i| i as u8).collect();
+        memory.write_bytes(SRC, &ramp).unwrap();
+        memory
+    }
+
+    /// Scatter: one 100-byte source spread across three uneven destination
+    /// iovecs. Every byte lands contiguously and the count is the transferred
+    /// total (readv02/03 use exactly this many-to-few / few-to-many shape).
+    #[test]
+    fn scatter_one_source_into_three_dests() {
+        let mut memory = seeded_memory();
+        let src = [LinuxIovec::new(SRC, 100)];
+        let dst = [
+            LinuxIovec::new(DST, 30),
+            LinuxIovec::new(DST + 0x40, 30),
+            LinuxIovec::new(DST + 0x80, 40),
+        ];
+        let n = process_vm_copy_self(&mut memory, &src, &dst).unwrap();
+        assert_eq!(n, 100);
+        assert_eq!(
+            memory.read_bytes(DST, 30).unwrap(),
+            (0..30u8).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            memory.read_bytes(DST + 0x40, 30).unwrap(),
+            (30..60u8).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            memory.read_bytes(DST + 0x80, 40).unwrap(),
+            (60..100u8).collect::<Vec<_>>()
+        );
+    }
+
+    /// The transfer stops at the shorter flattened length: 100 source bytes into
+    /// a 50-byte destination copies 50 (Linux `min(local, remote)`).
+    #[test]
+    fn copies_only_the_shorter_length() {
+        let mut memory = seeded_memory();
+        let src = [LinuxIovec::new(SRC, 100)];
+        let dst = [LinuxIovec::new(DST, 50)];
+        let n = process_vm_copy_self(&mut memory, &src, &dst).unwrap();
+        assert_eq!(n, 50);
+        assert_eq!(
+            memory.read_bytes(DST, 50).unwrap(),
+            (0..50u8).collect::<Vec<_>>()
+        );
+    }
+
+    /// A source address outside the backing faults before any byte moves — the
+    /// process_vm01 `iov_base = -1` / PROT_NONE cases must be EFAULT, not a
+    /// zero-length success.
+    #[test]
+    fn first_access_fault_is_efault() {
+        let mut memory = seeded_memory();
+        let src = [LinuxIovec::new(0x9_0000, 10)];
+        let dst = [LinuxIovec::new(DST, 10)];
+        assert_eq!(
+            process_vm_copy_self(&mut memory, &src, &dst),
+            Err(LINUX_EFAULT)
+        );
+    }
+
+    /// Zero total on either side is a valid 0-byte transfer (the setup sanity
+    /// probe `process_vm_readv(getpid(), NULL, 0, NULL, 0, 0)`), never EFAULT.
+    #[test]
+    fn empty_vectors_transfer_zero_bytes() {
+        let mut memory = seeded_memory();
+        assert_eq!(process_vm_copy_self(&mut memory, &[], &[]).unwrap(), 0);
+        let src = [LinuxIovec::new(SRC, 100)];
+        assert_eq!(process_vm_copy_self(&mut memory, &src, &[]).unwrap(), 0);
     }
 }
