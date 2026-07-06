@@ -46,17 +46,21 @@ log() { printf '[vcpu-admission-gate] %s\n' "$*" >&2; }
 
 # Permit mechanism under test. carrick reads CARRICK_HVF_ATOMIC_PERMIT
 # process-globally (crates/carrick-vmm-hvf/src/trap.rs::atomic_permit_enabled):
-# =1 selects the fork-shared atomic slot-table permit, unset/other selects the
-# default host-wide flock permit. std::process::Command does NOT env_clear, so
-# the carrick child inherits this script's environment; we export it explicitly
-# so the atomic path is selected unambiguously and the intent is documented.
-# Unset leaves the default flock path byte-for-byte (nothing exported/added).
+# the fork-shared atomic slot-table permit is the DEFAULT — it is used unless
+# the value is an explicit falsey token (0/false/no, case-insensitive), which
+# selects the legacy host-wide flock permit fallback. std::process::Command does
+# NOT env_clear, so the carrick child inherits this script's environment; when
+# the var is set we export it explicitly so the intent is documented. Unset
+# leaves the default atomic path (nothing exported/added).
 ATOMIC_PERMIT="${CARRICK_HVF_ATOMIC_PERMIT:-}"
 if [ -n "$ATOMIC_PERMIT" ]; then
     export CARRICK_HVF_ATOMIC_PERMIT="$ATOMIC_PERMIT"
-    log "permit mechanism: ATOMIC (CARRICK_HVF_ATOMIC_PERMIT=$ATOMIC_PERMIT)"
+    case "$(printf '%s' "$ATOMIC_PERMIT" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')" in
+        0|false|no) log "permit mechanism: flock fallback (CARRICK_HVF_ATOMIC_PERMIT=$ATOMIC_PERMIT)" ;;
+        *)          log "permit mechanism: ATOMIC (CARRICK_HVF_ATOMIC_PERMIT=$ATOMIC_PERMIT)" ;;
+    esac
 else
-    log "permit mechanism: flock (default; set CARRICK_HVF_ATOMIC_PERMIT=1 for the atomic slot-table path)"
+    log "permit mechanism: ATOMIC (default; set CARRICK_HVF_ATOMIC_PERMIT=0 for the legacy flock permit)"
 fi
 
 log "building signed carrick binary (unsigned -> HV_DENIED on every run)"
