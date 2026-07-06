@@ -473,9 +473,12 @@ impl SyscallDispatcher {
                 }
             }
             let timer_id = crate::posix_timer::create(clock_id as i32, signum);
-            // Linux uses an opaque pointer-sized `timer_t`; we hand back the
-            // small integer id widened to 64 bits.
-            let id_bytes = (timer_id as i64 as u64).to_le_bytes();
+            // The raw timer_create(2) ABI writes a kernel `timer_t`, which is a
+            // 4-byte `int` (`__kernel_timer_t`) — NOT glibc's 8-byte opaque
+            // timer_t (glibc synthesises that pointer from this int). Writing 8
+            // bytes overruns a guest `kernel_timer_t` (int) buffer and trips its
+            // stack canary (LTP timer_delete01: "stack smashing detected").
+            let id_bytes = (timer_id).to_le_bytes();
             if memory.write_bytes(id_out.0, &id_bytes).is_err() {
                 let _ = crate::posix_timer::delete(timer_id);
                 return Ok(DispatchOutcome::errno(LINUX_EFAULT));
@@ -510,6 +513,14 @@ impl SyscallDispatcher {
             // shape (None disarms; a TIMER_ABSTIME deadline becomes a relative
             // interval floored at 1ns), so it can't share the plain
             // Duration-pair saturation.
+            // For a TIMER_ABSTIME arm whose deadline is already in the PAST and
+            // that is periodic, the first delivered expiry carries the count of
+            // intervals missed since that deadline. Linux caps that count at
+            // INT_MAX rather than wrapping negative (CVE-2018-12896). Carrick's
+            // firing model floors a past deadline to a 1ns "fire now", losing the
+            // missed count, so we compute it here and seed the overrun counter
+            // after arming (LTP timer_settime03).
+            let mut seed_overrun: u32 = 0;
             let value_ns = match value_dur {
                 None => 0, // all-zero it_value disarms (Linux semantics)
                 Some(deadline) => {
@@ -518,6 +529,11 @@ impl SyscallDispatcher {
                         let now =
                             linux_clock_duration(crate::posix_timer::clock_id(id) as u64)
                                 .unwrap_or(Duration::ZERO);
+                        if interval_ns > 0 && deadline < now {
+                            let past_ns = duration_to_nanos(now - deadline);
+                            seed_overrun = u32::try_from(past_ns / u128::from(interval_ns))
+                                .unwrap_or(u32::MAX);
+                        }
                         // A now/past deadline must still arm-and-fire; arm() uses
                         // value_ns==0 as the DISARM sentinel, so floor at 1ns.
                         let rel = deadline.saturating_sub(now);
@@ -541,6 +557,12 @@ impl SyscallDispatcher {
                 Some(d) => d.arm_posix(id, spec_ns),
                 None => crate::posix_timer::arm(id, spec_ns),
             };
+            // Seed the missed-interval overrun for a past absolute deadline (the
+            // arm above reset the counter to 0); `fetch_max` keeps it above any
+            // increment the firing thread has already recorded.
+            if seed_overrun > 0 {
+                crate::posix_timer::seed_overrun(id, seed_overrun);
+            }
             if old_ptr.0 != 0 {
                 let prev = old.unwrap_or(crate::posix_timer::PosixTimerSpec {
                     signum: 0,

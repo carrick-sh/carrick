@@ -2584,6 +2584,21 @@ pub const LINUX_F_SETPIPE_SZ: u64 = 1031;
 pub const LINUX_F_GETPIPE_SZ: u64 = 1032;
 pub const LINUX_F_ADD_SEALS: u64 = 1033;
 pub const LINUX_F_GET_SEALS: u64 = 1034;
+/// File seals (memfd_create(2)/fcntl F_ADD_SEALS). Each is a bit in the seal
+/// set carried by a sealable in-memory (memfd) inode.
+pub const LINUX_F_SEAL_SEAL: u32 = 0x0001;
+pub const LINUX_F_SEAL_SHRINK: u32 = 0x0002;
+pub const LINUX_F_SEAL_GROW: u32 = 0x0004;
+pub const LINUX_F_SEAL_WRITE: u32 = 0x0008;
+pub const LINUX_F_SEAL_FUTURE_WRITE: u32 = 0x0010;
+pub const LINUX_F_SEAL_EXEC: u32 = 0x0020;
+/// The set of valid seal bits accepted by F_ADD_SEALS (anything else → EINVAL).
+pub const LINUX_F_SEAL_ALL: u32 = LINUX_F_SEAL_SEAL
+    | LINUX_F_SEAL_SHRINK
+    | LINUX_F_SEAL_GROW
+    | LINUX_F_SEAL_WRITE
+    | LINUX_F_SEAL_FUTURE_WRITE
+    | LINUX_F_SEAL_EXEC;
 pub const LINUX_FD_CLOEXEC: u64 = 1;
 /// A CANONICAL syscall number — the asm-generic/aarch64 numbering every guest
 /// ISA is normalized to before dispatch (plus the `CARRICK_PRIVATE_*` range).
@@ -2892,12 +2907,15 @@ pub const LINUX_RLIM_INFINITY: u64 = u64::MAX;
 // getrlimit/setrlimit/prlimit64 resource numbers (asm-generic resource.h;
 // shared by aarch64 and x86_64). Only the resources carrick treats specially
 // are named; a resource >= RLIM_NLIMITS is EINVAL.
+pub const LINUX_RLIMIT_FSIZE: u64 = 1;
 pub const LINUX_RLIMIT_DATA: u64 = 2;
+pub const LINUX_RLIMIT_CORE: u64 = 4;
 pub const LINUX_RLIMIT_STACK: u64 = 3;
 pub const LINUX_RLIMIT_NPROC: u64 = 6;
 pub const LINUX_RLIMIT_NOFILE: u64 = 7;
 pub const LINUX_RLIMIT_MEMLOCK: u64 = 8;
 pub const LINUX_RLIMIT_AS: u64 = 9;
+pub const LINUX_RLIMIT_SIGPENDING: u64 = 11;
 pub const LINUX_RLIM_NLIMITS: u64 = 16;
 pub const LINUX_RUSAGE_SELF: i32 = 0;
 pub const LINUX_RUSAGE_CHILDREN: i32 = -1;

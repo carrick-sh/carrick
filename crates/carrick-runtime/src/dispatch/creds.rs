@@ -87,6 +87,47 @@ fn is_self_priority_target(who: i32) -> bool {
     who == 0 || NsPid(who).names_self()
 }
 
+/// A `setpriority(PRIO_PROCESS, who)` target relative to the caller.
+enum PrioTarget {
+    /// The calling process itself (who 0, the caller's own ns-pid/host pid, or a
+    /// live sibling thread).
+    Caller,
+    /// Another live carrick guest process, carrying its published effective uid
+    /// (root/0 when the peer hasn't published — the conservative reading for the
+    /// container init, which is root and never drops privilege).
+    Other { euid: u32 },
+    /// No such process — ESRCH.
+    NotFound,
+}
+
+/// Resolve a concrete `setpriority(PRIO_PROCESS, who)` pid against carrick's
+/// guest process model. Deliberately does NOT treat the bootstrap pid (1) as
+/// self (unlike [`is_self_priority_target`]): a non-init caller naming init
+/// (pid 1) must resolve to that OTHER, root-owned process so the ownership check
+/// can reject it with EPERM (LTP setpriority02). The peer's effective uid is
+/// read from the fork-coherent cred publication that `kill(2)` already uses.
+fn resolve_prio_process_target<M: GuestMemory>(cx: &SyscallCtx<'_, M>, who: i32) -> PrioTarget {
+    let host = std::process::id();
+    let is_self = who == 0
+        || who as u32 == host
+        || (crate::namespace::pid::enabled()
+            && (who as u32 == crate::namespace::pid::self_ns_pid()
+                || crate::namespace::pid::ns_to_host_or_self(who as u32) == Some(host)))
+        || cx.thread.as_ref().is_some_and(|t| {
+            t.registry
+                .is_live(crate::thread::ThreadId::from_guest_supplied_tid(who))
+        });
+    if is_self {
+        return PrioTarget::Caller;
+    }
+    match crate::namespace::pid::ns_to_host_or_self(who as u32) {
+        Some(h) if crate::host_proc::is_guest_process(h) => PrioTarget::Other {
+            euid: crate::cred_ipc::read_target(h as i32).unwrap_or(0),
+        },
+        _ => PrioTarget::NotFound,
+    }
+}
+
 /// Owned credentials-subsystem state. Split out of `SyscallDispatcher`.
 ///
 /// Tracked (real, effective, saved) uid and gid plus the umask. Carrick
@@ -500,6 +541,7 @@ impl SyscallDispatcher {
         fn setpriority(this, cx, which: u64, who: Pid, prio: u64) {
             use std::sync::atomic::Ordering;
             let prio = prio as i32;
+            // An unknown `which` class is EINVAL (setpriority02 case 0).
             if which > LINUX_PRIO_USER {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
@@ -508,32 +550,51 @@ impl SyscallDispatcher {
             if who.0 < 0 {
                 return Ok(DispatchOutcome::errno(LINUX_ESRCH));
             }
-            // PRIO_PROCESS names a process OR a thread (Linux nice is per-thread);
-            // a live sibling guest thread tid is a valid self-process target.
-            let sibling = cx
-                .thread
-                .as_ref()
-                .is_some_and(|t| {
-                    t.registry
-                        .is_live(crate::thread::ThreadId::from_guest_supplied_tid(who.0))
-                });
-            if which == LINUX_PRIO_PROCESS && !is_self_priority_target(who.0) && !sibling {
-                return Ok(DispatchOutcome::errno(LINUX_ESRCH));
-            }
+            let euid = this.cred_snapshot().euid;
             // Linux CLAMPS the nice value to [-20,19] (it does NOT reject an
             // out-of-range value with EINVAL): glibc's nice() passes
             // current+increment straight through and relies on this clamp
             // (LTP nice02 does nice(50) → clamps to 19).
             let clamped = prio.clamp(-20, 19);
-            // For the calling process, enforce the unprivileged nice-lowering
-            // rule (raising priority needs CAP_SYS_NICE): a non-root euid can't
-            // set a nice BELOW the current one. setpriority(2) reports EACCES
-            // for that case; EPERM is for a target-ownership mismatch.
+
+            // PRIO_PROCESS names a concrete process (or thread — Linux nice is
+            // per-thread). Resolve its identity/ownership against the guest
+            // process model.
             if which == LINUX_PRIO_PROCESS {
-                let current = NICE_VALUE.load(Ordering::Relaxed);
-                if clamped < current && this.cred_snapshot().euid != 0 {
-                    return Ok(DispatchOutcome::errno(LINUX_EACCES));
+                match resolve_prio_process_target(cx, who.0) {
+                    // The caller itself → fall through to the self nice rule.
+                    PrioTarget::Caller => {}
+                    // Ownership (setpriority(2) EPERM): a non-root caller may only
+                    // affect a process whose euid matches its own (setpriority02
+                    // case 6 — `nobody` targeting init/root).
+                    PrioTarget::Other { euid: target_euid }
+                        if euid != 0 && euid != target_euid =>
+                    {
+                        return Ok(DispatchOutcome::errno(LINUX_EPERM));
+                    }
+                    // Another guest process the caller MAY affect (privileged or
+                    // same owner), or no such process. carrick tracks nice only
+                    // for the CALLING process, so it cannot service a cross-
+                    // process set: report ESRCH rather than a bogus success that
+                    // the paired getpriority() readback (which also cannot see a
+                    // peer's nice) would contradict — LTP setpriority01 then fails
+                    // every sub-case uniformly, matching the container oracle.
+                    PrioTarget::Other { .. } | PrioTarget::NotFound => {
+                        return Ok(DispatchOutcome::errno(LINUX_ESRCH));
+                    }
                 }
+            }
+
+            // Nice-lowering rule for the CALLER — PRIO_PROCESS on self, or
+            // PRIO_PGRP/PRIO_USER with who==0 (the caller's own group/user):
+            // raising priority (a nice BELOW the current value) needs
+            // CAP_SYS_NICE, so an unprivileged caller gets EACCES (setpriority02
+            // cases 4 and 5). EPERM (above) is target-ownership; EACCES is the
+            // privilege to raise one's own priority.
+            if clamped < NICE_VALUE.load(Ordering::Relaxed) && euid != 0 {
+                return Ok(DispatchOutcome::errno(LINUX_EACCES));
+            }
+            if which == LINUX_PRIO_PROCESS {
                 NICE_VALUE.store(clamped, Ordering::Relaxed);
             }
             Ok(DispatchOutcome::Returned { value: 0 })

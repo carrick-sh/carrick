@@ -459,6 +459,11 @@ const SYSCTL_TABLE: &[(&str, Sysctl)] = &[
     // scans; without it tst_test aborts with ENOENT.
     ("/proc/sys/kernel/pid_max", Sysctl::Static(b"4194304\n")),
     ("/proc/sys/kernel/ns_last_pid", Sysctl::Static(b"0\n")),
+    // Linux default core dump filename pattern (matches the Docker oracle). Read
+    // by tools deciding whether a core-dumping signal produces a dump — a leading
+    // '|' means a pipe handler (dumps regardless of RLIMIT_CORE); "core" does not
+    // (waitid10 setup reads this).
+    ("/proc/sys/kernel/core_pattern", Sysctl::Static(b"core\n")),
     (
         "/proc/sys/kernel/shmall",
         Sysctl::Static(b"18446744073692774399\n"),
@@ -533,6 +538,15 @@ const SYSCTL_TABLE: &[(&str, Sysctl)] = &[
     ("/proc/sys/fs/nr_open", Sysctl::Static(b"1048576\n")),
     ("/proc/sys/fs/aio-max-nr", Sysctl::Static(b"65536\n")),
     ("/proc/sys/fs/pipe-max-size", Sysctl::Static(b"1048576\n")),
+    // Per-user pipe-buffer accounting ceilings (in pages). carrick does not
+    // enforce a per-user pipe-pages cap, but pipe15 SCANFs the soft limit to
+    // size a pipe-creation loop, so it must be present and a positive integer;
+    // the Linux default is 16384 pages (soft) with no hard cap (0).
+    (
+        "/proc/sys/fs/pipe-user-pages-soft",
+        Sysctl::Static(b"16384\n"),
+    ),
+    ("/proc/sys/fs/pipe-user-pages-hard", Sysctl::Static(b"0\n")),
     ("/proc/sys/fs/overflowuid", Sysctl::Static(b"65534\n")),
     ("/proc/sys/fs/overflowgid", Sysctl::Static(b"65534\n")),
     // fs/inotify/* — file-watchers (chokidar/webpack/vite/fsnotify) read these.
