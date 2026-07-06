@@ -1257,6 +1257,31 @@ impl PermitRegion {
         self.local.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 
+    /// Cooperative release of THIS process's atomic permits (Task 3). Called from
+    /// the HVF engine's `process_exit_cleanup` on the exiting fork-child's own
+    /// thread, BEFORE `_exit` skips Rust drops — the fast path that shrinks the
+    /// churn window instead of waiting for the root reaper backstop.
+    ///
+    /// Precise + idempotent: it DRAINS the process-local token map and frees each
+    /// named slot with the generation-guarded [`Self::free_exact`], so
+    /// - a slot a normal `vcpu_destroyed` already freed is gone from the map (no
+    ///   entry → nothing to free);
+    /// - a slot the supervisor already reclaimed (now `Free`, or reused under an
+    ///   advanced generation) fails the guard in `free_exact` → no double-free;
+    /// - a second call finds an empty map → frees nothing.
+    ///
+    /// It can only free slots THIS process registered: after a fork the child
+    /// cleared the inherited map via [`Self::reset_local_after_fork_child`] and
+    /// re-acquired its own, so the map never names the PARENT's slots. Returns the
+    /// number of slots actually freed (for tests/diagnostics).
+    fn cooperative_release_local(&self) -> usize {
+        let tokens: Vec<PermitToken> = {
+            let mut map = self.local.lock().unwrap_or_else(|e| e.into_inner());
+            map.drain().map(|(_, token)| token).collect()
+        };
+        tokens.iter().filter(|t| self.free_exact(**t)).count()
+    }
+
     /// Diagnostic slot-state read (used by tests and the Task 2 supervisor).
     #[allow(dead_code)]
     fn slot_state(&self, slot: u16) -> SlotState {
@@ -1433,6 +1458,21 @@ fn reset_admission_permits_after_fork_child() {
     } else {
         reset_global_vcpu_permits_after_fork_child();
     }
+}
+
+/// Cooperative fast-path release of THIS process's atomic permit slots, invoked
+/// from the HVF engine's `process_exit_cleanup` (Task 3) before a fork-child (or
+/// signal-death) `_exit` skips Rust drops. No-op unless the atomic permit path is
+/// active — on the default flock path the permit is fd-lifetime-bound, so the
+/// engine hook stays the historical no-op. Idempotent with the token-guarded
+/// `vcpu_destroyed` release and the root reaper's `reclaim_owner` (both are
+/// generation-guarded). Returns the number of slots freed (for tests).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub fn cooperative_release_atomic_permit() -> usize {
+    if !atomic_permit_enabled() {
+        return 0;
+    }
+    permit_region().cooperative_release_local()
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -5203,6 +5243,92 @@ mod vm_create_admission_tests {
         r.reset_local_after_fork_child(); // child clears local map
         assert!(r.local_token(1).is_none());
         assert_eq!(r.occupied(), 1); // parent's shared slot untouched
+    }
+
+    // ---- Task 3: cooperative release before a fork-child `_exit` ------------
+    //
+    // `process_exit_cleanup` runs on the exiting child's own thread BEFORE
+    // `_exit` skips Rust drops. It drains THIS process's local token map,
+    // freeing each named slot with the generation-guarded `free_exact`, so it
+    // is idempotent with `vcpu_destroyed` (which may have released already) and
+    // the supervisor's later `reclaim_owner`, and it never frees the parent's
+    // slots (its local map, after the fork reset, names only this process).
+
+    #[test]
+    fn cooperative_release_frees_owned_slots_and_is_idempotent() {
+        let r = PermitRegion::new_anon_for_test();
+        let pid = std::process::id();
+        let t1 = r.acquire(4, pid).unwrap();
+        r.register(1, t1);
+        let t2 = r.acquire(4, pid).unwrap();
+        r.register(2, t2);
+        assert_eq!(r.occupied(), 2);
+
+        // The fork-child `_exit` fast path frees both registered slots at once.
+        assert_eq!(r.cooperative_release_local(), 2);
+        assert_eq!(r.occupied(), 0);
+        assert!(r.local_token(1).is_none());
+        assert!(r.local_token(2).is_none());
+
+        // Idempotent: a second call (or a late supervisor reclaim) frees nothing.
+        assert_eq!(r.cooperative_release_local(), 0);
+        assert_eq!(r.occupied(), 0);
+    }
+
+    #[test]
+    fn cooperative_release_is_idempotent_with_vcpu_destroyed() {
+        let r = PermitRegion::new_anon_for_test();
+        let pid = std::process::id();
+        let t1 = r.acquire(4, pid).unwrap();
+        r.register(10, t1);
+        let t2 = r.acquire(4, pid).unwrap();
+        r.register(20, t2);
+        // A normal `vcpu_destroyed` already released one token (removed it from
+        // the local map AND freed its slot) before the process exits.
+        r.release_token(10);
+        assert_eq!(r.occupied(), 1);
+        // Cooperative exit frees only the STILL-owned remaining slot; no double-free.
+        assert_eq!(r.cooperative_release_local(), 1);
+        assert_eq!(r.occupied(), 0);
+    }
+
+    #[test]
+    fn cooperative_release_no_ops_after_supervisor_reclaim() {
+        let r = PermitRegion::new_anon_for_test();
+        let pid = std::process::id();
+        let t = r.acquire(4, pid).unwrap();
+        r.register(1, t);
+        // The supervisor won the race and already reclaimed the slot by (pid, gen).
+        assert_eq!(r.reclaim_owner(pid, Some(t.generation)), 1);
+        assert_eq!(r.occupied(), 0);
+        // The local map still names the (now-free) slot, but the generation guard
+        // in `free_exact` makes the cooperative release a no-op — no double-free.
+        assert_eq!(r.cooperative_release_local(), 0);
+        assert_eq!(r.occupied(), 0);
+    }
+
+    #[test]
+    fn cooperative_release_after_fork_reset_spares_parent_slots() {
+        let r = PermitRegion::new_anon_for_test();
+        let pid = std::process::id();
+        let t = r.acquire(4, pid).unwrap();
+        r.register(1, t);
+        // Simulate the fork child: the inherited local map is cleared before the
+        // child re-acquires its own permits. The parent's shared slot stays owned.
+        r.reset_local_after_fork_child();
+        // The child's cooperative `_exit` must NOT free the parent's shared slot:
+        // its (now-empty) local map names none of the parent's tokens.
+        assert_eq!(r.cooperative_release_local(), 0);
+        assert_eq!(r.occupied(), 1);
+    }
+
+    #[test]
+    fn cooperative_release_atomic_permit_is_noop_on_flock_path() {
+        // With CARRICK_HVF_ATOMIC_PERMIT unset (the default flock path), the
+        // engine hook must be a byte-for-byte no-op: it must not touch the global
+        // region and must free nothing.
+        assert!(!atomic_permit_enabled());
+        assert_eq!(cooperative_release_atomic_permit(), 0);
     }
 
     #[test]
