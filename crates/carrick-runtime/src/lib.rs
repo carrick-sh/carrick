@@ -2512,7 +2512,7 @@ pub mod posix_timer {
 
     pub use carrick_timer_core::posix::{
         PosixTimerSlot, PosixTimerSpec, clear, clock_id, create, delete, exists, getoverrun,
-        remaining,
+        remaining, seed_overrun,
     };
 
     /// (Re-)arm timer `id`. Returns the PREVIOUS spec (for `timer_settime`'s
