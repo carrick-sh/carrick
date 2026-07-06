@@ -166,10 +166,34 @@ pub fn generation_matches(slot: &PosixTimerSlot, generation: u64) -> bool {
     slot.generation.load(Ordering::SeqCst) == generation
 }
 
+/// Linux `DELAYTIMER_MAX`: the overrun counter saturates here rather than
+/// wrapping into the negative `int` range (the kernel fix for CVE-2018-12896,
+/// exercised by LTP timer_settime03).
+pub const OVERRUN_MAX: u32 = i32::MAX as u32;
+
 /// Bump a slot's overrun counter (a periodic expiry the backend's firing thread
-/// observed).
+/// observed). Saturates at `OVERRUN_MAX` (INT_MAX) — Linux caps the overrun
+/// count and never lets it overflow into the negative range.
 pub fn record_overrun(slot: &PosixTimerSlot) {
-    slot.overruns.fetch_add(1, Ordering::SeqCst);
+    let _ = slot
+        .overruns
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+            (n < OVERRUN_MAX).then_some(n + 1)
+        });
+}
+
+/// Seed a timer's overrun counter to at least `count` (saturated at INT_MAX).
+/// Used when a periodic timer is armed with an absolute deadline already in the
+/// past: the first delivered expiry carries the number of intervals missed
+/// since that deadline (which for a tiny interval vastly exceeds INT_MAX and so
+/// caps). `fetch_max` so a concurrent firing-thread increment can't lower it.
+pub fn seed_overrun(id: i32, count: u32) {
+    let capped = count.min(OVERRUN_MAX);
+    let mut guard = registry();
+    let map = ensure_registry(&mut guard);
+    if let Some(slot) = map.get(&id) {
+        slot.overruns.fetch_max(capped, Ordering::SeqCst);
+    }
 }
 
 /// Linux CPU-time clocks whose POSIX timers must fire off AGGREGATE GUEST CPU
@@ -297,7 +321,8 @@ pub fn delete(id: i32) -> bool {
 pub fn getoverrun(id: i32) -> Option<u32> {
     let mut guard = registry();
     let map = ensure_registry(&mut guard);
-    map.get(&id).map(|s| s.overruns.load(Ordering::SeqCst))
+    map.get(&id)
+        .map(|s| s.overruns.load(Ordering::SeqCst).min(OVERRUN_MAX))
 }
 
 /// `true` if `id` is currently in the registry.
