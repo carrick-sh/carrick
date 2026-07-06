@@ -2986,6 +2986,21 @@ pub const LINUX_POLLNVAL: i16 = 0x0020;
 pub const LINUX_TFD_NONBLOCK: u64 = LINUX_O_NONBLOCK;
 pub const LINUX_TFD_CLOEXEC: u64 = LINUX_O_CLOEXEC;
 pub const LINUX_TIMER_ABSTIME: u64 = 0x1;
+/// `TFD_TIMER_CANCEL_ON_SET` (timerfd_settime): cancel a CLOCK_REALTIME timer if
+/// the realtime clock is discontinuously reset. carrick's virtual clock never
+/// triggers such a discontinuity, so this is accepted and ignored — but it IS a
+/// valid flag and must not be rejected as EINVAL.
+pub const LINUX_TFD_TIMER_CANCEL_ON_SET: u64 = 0x2;
+// preadv2/pwritev2 per-call RWF_* flags. Linux's kiocb_set_rw_flags() rejects
+// any bit outside RWF_SUPPORTED with EOPNOTSUPP (NOT EINVAL — preadv202/
+// pwritev202 pass flag=-1 and expect EOPNOTSUPP).
+pub const LINUX_RWF_HIPRI: u64 = 0x1;
+pub const LINUX_RWF_DSYNC: u64 = 0x2;
+pub const LINUX_RWF_SYNC: u64 = 0x4;
+pub const LINUX_RWF_NOWAIT: u64 = 0x8;
+pub const LINUX_RWF_APPEND: u64 = 0x10;
+pub const LINUX_RWF_SUPPORTED: u64 =
+    LINUX_RWF_HIPRI | LINUX_RWF_DSYNC | LINUX_RWF_SYNC | LINUX_RWF_NOWAIT | LINUX_RWF_APPEND;
 pub const LINUX_SPLICE_F_MOVE: u64 = 0x1;
 pub const LINUX_SPLICE_F_NONBLOCK: u64 = 0x2;
 pub const LINUX_SPLICE_F_MORE: u64 = 0x4;
