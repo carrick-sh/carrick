@@ -321,50 +321,10 @@ fn locked_ranges_total(ranges: &[crate::vfs::GuestMemoryRange]) -> u64 {
     ranges.iter().map(|range| range.len()).sum()
 }
 
-fn ranges_cover(
-    ranges: &[crate::vfs::GuestMemoryRange],
-    requested: crate::vfs::GuestMemoryRange,
-) -> bool {
-    let mut cursor = requested.start().raw();
-    for range in ranges {
-        if range.end().raw() <= cursor {
-            continue;
-        }
-        if range.start().raw() > cursor {
-            return false;
-        }
-        cursor = cursor.max(range.end().raw());
-        if cursor >= requested.end().raw() {
-            return true;
-        }
-    }
-    false
-}
-
 fn ranges_contain_page(ranges: &[crate::vfs::GuestMemoryRange], page: u64) -> bool {
     ranges
         .iter()
         .any(|range| page >= range.start().raw() && page < range.end().raw())
-}
-
-fn exact_residency(
-    tracked: &[crate::vfs::GuestMemoryRange],
-    resident: &[crate::vfs::GuestMemoryRange],
-    address: u64,
-    pages: u64,
-) -> Option<Vec<u8>> {
-    let length = pages.checked_mul(LINUX_PAGE_SIZE)?;
-    let requested =
-        crate::vfs::GuestMemoryRange::new(GuestVa(address), GuestVa(address.checked_add(length)?))?;
-    if !ranges_cover(tracked, requested) {
-        return None;
-    }
-    let mut out = Vec::with_capacity(usize::try_from(pages).ok()?);
-    for index in 0..pages {
-        let page = address.checked_add(index.checked_mul(LINUX_PAGE_SIZE)?)?;
-        out.push(u8::from(ranges_contain_page(resident, page)));
-    }
-    Some(out)
 }
 
 fn remove_fault_range(ranges: &mut Vec<ResidentFaultRange>, remove: crate::vfs::GuestMemoryRange) {
@@ -412,57 +372,6 @@ fn fault_range_intersections(
             })
         })
         .collect()
-}
-
-fn host_page_size() -> u64 {
-    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    if page <= 0 {
-        LINUX_PAGE_SIZE
-    } else {
-        page as u64
-    }
-}
-
-fn align_down_runtime(value: u64, alignment: u64) -> u64 {
-    value - value % alignment
-}
-
-fn align_up_runtime(value: u64, alignment: u64) -> Option<u64> {
-    let rem = value % alignment;
-    if rem == 0 {
-        Some(value)
-    } else {
-        value.checked_add(alignment - rem)
-    }
-}
-
-fn mincore_residency(memory: &impl GuestMemory, address: u64, length: u64) -> Option<Vec<u8>> {
-    let len = usize::try_from(length).ok()?;
-    let ptr = memory.host_ptr_for_read(address, len)?;
-    let guest_pages = length.div_ceil(LINUX_PAGE_SIZE);
-    let mut guest_resident = vec![0u8; usize::try_from(guest_pages).ok()?];
-    let host_page = host_page_size();
-    let ptr_addr = ptr.addr() as u64;
-    let host_start = align_down_runtime(ptr_addr, host_page);
-    let host_prefix = ptr_addr.checked_sub(host_start)?;
-    let host_scan = align_up_runtime(host_prefix.checked_add(length)?, host_page)?;
-    let host_pages = host_scan.div_ceil(host_page);
-    let mut host_resident = vec![0u8; usize::try_from(host_pages).ok()?];
-    let host_len = usize::try_from(host_scan).ok()?;
-    #[cfg(target_os = "linux")]
-    let vec_ptr = host_resident.as_mut_ptr() as *mut libc::c_uchar;
-    #[cfg(not(target_os = "linux"))]
-    let vec_ptr = host_resident.as_mut_ptr() as *mut libc::c_char;
-    let rc = unsafe { libc::mincore(host_start as *mut libc::c_void, host_len, vec_ptr) };
-    if rc != 0 {
-        return None;
-    }
-    for (guest_index, resident) in guest_resident.iter_mut().enumerate() {
-        let guest_offset = (guest_index as u64).checked_mul(LINUX_PAGE_SIZE)?;
-        let host_index = usize::try_from((host_prefix + guest_offset) / host_page).ok()?;
-        *resident = host_resident.get(host_index).copied().unwrap_or(0) & 1;
-    }
-    Some(guest_resident)
 }
 
 fn mincore_page_is_mapped(memory: &impl GuestMemory, page: u64) -> bool {
@@ -1641,6 +1550,15 @@ impl SyscallDispatcher {
                 map_sharing.proc_map_sharing(),
                 String::new(),
             );
+            // A file-backed mapping's content is loaded eagerly (above), and
+            // MAP_POPULATE prefaults anonymous pages — so mincore must report
+            // those pages resident even before the guest touches them (LTP
+            // mincore04 mlocks in a child, then the parent queries mincore).
+            if !map_flags.contains(LinuxMmapFlags::ANONYMOUS)
+                || map_flags.contains(LinuxMmapFlags::POPULATE)
+            {
+                this.mark_range_resident(address, length);
+            }
             this.commit_mmap_locked_range(locked_range);
             Ok(DispatchOutcome::Returned {
                 value: address as i64,
@@ -1892,8 +1810,7 @@ impl SyscallDispatcher {
             }
             let pages = length.div_ceil(LINUX_PAGE_SIZE);
             let bytes = this
-                .exact_mincore_residency(address.0, pages)
-                .or_else(|| mincore_residency(memory, address.0, pages * LINUX_PAGE_SIZE))
+                .mincore_residency_vector(address.0, pages)
                 .unwrap_or_else(|| vec![1u8; pages as usize]);
             memory.write_bytes(vec.0, &bytes)?;
             Ok(DispatchOutcome::Returned { value: 0 })
@@ -2345,14 +2262,46 @@ impl SyscallDispatcher {
             .push(ResidentFaultRange { range, prot });
     }
 
-    fn exact_mincore_residency(&self, address: u64, pages: u64) -> Option<Vec<u8>> {
+    /// Residency vector for `mincore`, derived from carrick's mapping metadata
+    /// rather than host `mincore` (which is useless on macOS — it reports
+    /// unmapped/untouched pages as resident). A page inside a post-exec VMA
+    /// (`dynamic_maps`) is resident only when carrick has populated it: a file
+    /// load / MAP_POPULATE marks `resident_ranges`, a fault commits it, and
+    /// `mlock` records both `resident_ranges` and `locked_ranges`. A fresh,
+    /// untouched anonymous mapping is therefore NOT resident (LTP mincore03),
+    /// while a file-backed or mlocked mapping is (mincore02/04). Pages outside
+    /// every post-exec VMA belong to loader-populated initial regions (ELF
+    /// text/data, heap, stack, trampolines) and stay resident, matching the
+    /// prior conservative default.
+    fn mincore_residency_vector(&self, address: u64, pages: u64) -> Option<Vec<u8>> {
         let mem = self.mem.lock();
-        exact_residency(
-            &mem.resident_tracked_ranges,
-            &mem.resident_ranges,
-            address,
-            pages,
-        )
+        let mut out = Vec::with_capacity(usize::try_from(pages).ok()?);
+        for index in 0..pages {
+            let page = address.checked_add(index.checked_mul(LINUX_PAGE_SIZE)?)?;
+            let in_dynamic = mem
+                .dynamic_maps
+                .iter()
+                .any(|m| page >= m.start && page < m.end);
+            let resident = if in_dynamic {
+                ranges_contain_page(&mem.resident_ranges, page)
+                    || ranges_contain_page(&mem.locked_ranges, page)
+            } else {
+                true
+            };
+            out.push(u8::from(resident));
+        }
+        Some(out)
+    }
+
+    /// Record a range as populated (resident) — used when carrick eagerly loads
+    /// a file-backed or MAP_POPULATE mapping's content, so a later `mincore`
+    /// reports those pages resident.
+    fn mark_range_resident(&self, start: u64, len: u64) {
+        if let Some(range) =
+            crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(start.saturating_add(len)))
+        {
+            locked_ranges_insert(&mut self.mem.lock().resident_ranges, range);
+        }
     }
 
     pub(crate) fn resident_fault_plan(&self, address: u64) -> Option<(u64, u64)> {
