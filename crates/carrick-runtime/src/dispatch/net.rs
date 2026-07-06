@@ -3400,7 +3400,9 @@ impl SyscallDispatcher {
                             ms as i32
                         }
                     }
-                    _ => 0,
+                    // Faulting *timeval pointer -> EFAULT (see the *timespec arm
+                    // below); select03 "Faulty timeout" for the x86 select(2) path.
+                    Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
                 }
             } else {
                 match read_kernel_struct::<LinuxTimespec>(memory, timeout_addr) {
@@ -3423,11 +3425,16 @@ impl SyscallDispatcher {
                             ms as i32
                         }
                     }
-                    // A bad timeout pointer: leave the existing behavior (a guest
-                    // read of an unmapped VA already injects a fault upstream);
-                    // only the value-validation above is new. (faulty-pointer
-                    // EFAULT vs guest-SIGSEGV is select03's domain — left as-is.)
-                    _ => 0,
+                    // A bad timeout pointer: the raw pselect6/select syscall reads
+                    // the timeout in-kernel, so a faulting pointer is EFAULT (the
+                    // Linux copy_from_user failure). tst_get_bad_addr hands a
+                    // PROT_NONE page whose read the shared memory gate rejects
+                    // WITHOUT injecting a guest fault, so surface EFAULT here rather
+                    // than clamping to a 0 timeout (which let select() return a
+                    // spurious ready count) — LTP select03 "Faulty timeout". (The
+                    // glibc select() variant instead touches the page in userspace
+                    // and dies with SIGSEGV, which the test also accepts.)
+                    Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
                 }
             };
 
