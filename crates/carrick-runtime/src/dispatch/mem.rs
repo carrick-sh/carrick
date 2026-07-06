@@ -563,7 +563,83 @@ fn host_fd_file_len(fd: i32) -> Option<u64> {
         None
     }
 }
+/// VMA-metadata answer for a `madvise` range, computed without touching guest
+/// memory. `fully_mapped` is false when any page in the range falls in an
+/// unmapped hole (→ ENOMEM). `writable`/`shared` describe the covering VMAs and
+/// `locked` reports whether the range intersects an mlocked span.
+struct MadviseRangeMeta {
+    fully_mapped: bool,
+    writable: bool,
+    shared: bool,
+    locked: bool,
+}
+
 impl SyscallDispatcher {
+    /// Derive `madvise` range validity + properties from carrick's mapping
+    /// metadata (`dynamic_maps` plus the boot address-space regions), never by
+    /// probing a page. Coverage unions both sources so an advise on an
+    /// untracked initial region (heap/stack/ELF) is not mis-reported as a hole;
+    /// a post-`munmap` hole in a file/anon VMA (removed from `dynamic_maps`)
+    /// stays uncovered → ENOMEM.
+    fn madvise_range_meta(&self, start: u64, end: u64) -> MadviseRangeMeta {
+        let mem = self.mem.lock();
+        // (start, end, writable, shared) for every VMA overlapping [start, end).
+        let mut intervals: Vec<(u64, u64, bool, bool)> = Vec::new();
+        let mut push = |map: &ProcMapsEntry| {
+            if map.start < end && map.end > start {
+                intervals.push((
+                    map.start,
+                    map.end,
+                    map.write,
+                    map.sharing == ProcMapSharing::Shared,
+                ));
+            }
+        };
+        for map in &mem.dynamic_maps {
+            push(map);
+        }
+        if let Some(regions) = &mem.address_space_regions {
+            for map in regions {
+                push(map);
+            }
+        }
+        intervals.sort_by_key(|&(s, ..)| s);
+        // Walk the sorted intervals to confirm contiguous coverage of the range
+        // and fold the covering VMAs' writable/shared bits.
+        let mut covered_to = start;
+        let mut writable = true;
+        let mut shared = false;
+        for (s, e, w, sh) in intervals {
+            if s > covered_to {
+                break; // gap before this interval → unmapped hole
+            }
+            if e > covered_to {
+                // This interval extends coverage; its bits apply to the range.
+                if !w {
+                    writable = false;
+                }
+                if sh {
+                    shared = true;
+                }
+                covered_to = e;
+            }
+            if covered_to >= end {
+                break;
+            }
+        }
+        let fully_mapped = covered_to >= end;
+        let locked = mem.locked_ranges.iter().any(|r| {
+            let (rs, re) = (r.start().raw(), r.end().raw());
+            rs < end && re > start
+        });
+        MadviseRangeMeta {
+            fully_mapped,
+            writable: fully_mapped && writable,
+            shared,
+            locked,
+        }
+    }
+
     fn dynamic_mapping_overlaps(&self, start: u64, len: u64) -> bool {
         self.mem
             .lock()
@@ -2109,8 +2185,6 @@ impl SyscallDispatcher {
         }
 
         fn madvise(this, cx, address: GuestPtr, length: u64, advice: u64) {
-            let memory = &mut *cx.memory;
-
             if !address.0.is_multiple_of(LINUX_PAGE_SIZE) || !linux_madvise_advice_is_supported(advice) {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
@@ -2121,23 +2195,48 @@ impl SyscallDispatcher {
             let Ok(length) = usize::try_from(length) else {
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
             };
-            let Some(last_address) = address.0.checked_add(length as u64 - 1) else {
+            // Validity is derived from carrick's VMA metadata, NEVER by touching
+            // a page: a physical probe SIGBUSes the runtime on a read-only /
+            // past-EOF file page (madvise02 MADV_DONTNEED on a locked read-only
+            // MAP_SHARED file) and false-ENOMEMs a mapped-but-PROT_NONE range
+            // (madvise05 MADV_WILLNEED on an mprotect(PROT_NONE) anon region).
+            // An unmapped hole anywhere in [address, address+length) → ENOMEM,
+            // matching madvise_walk_vmas.
+            let Some(raw_end) = address.0.checked_add(length as u64) else {
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
             };
-            if memory.read_bytes(address.0, 1).is_err() || memory.read_bytes(last_address, 1).is_err() {
+            let Some(end) = align_up_u64(raw_end, LINUX_PAGE_SIZE) else {
+                return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+            };
+            let meta = this.madvise_range_meta(address.0, end);
+            if !meta.fully_mapped {
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
             }
-            if advice == LINUX_MADV_DONTNEED {
-                // MADV_DONTNEED zeroes the PHYSICAL backing — this is a
-                // carrick-internal scrub, not a guest store, so it must bypass
-                // the guest-visible write-protection gate. The permission-checked
-                // write_bytes path is range-gated on x86 (engine.rs range_no_write)
-                // and faults on a PROT_READ / no-access region, leaving stale
-                // bytes; zero_backing writes the host backing directly (same call
-                // the MAP_FIXED/munmap-reuse scrub uses above).
-                if memory.zero_backing(address.0, length).is_err() {
-                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+            match advice {
+                LINUX_MADV_DONTNEED => {
+                    // Linux can_madv_lru_vma rejects VM_LOCKED (also VM_HUGETLB /
+                    // VM_PFNMAP, which carrick does not model) with EINVAL before
+                    // dropping any page — derived from the locked-range table.
+                    if meta.locked {
+                        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                    }
+                    // Drop the pages by zeroing the writable anonymous backing.
+                    // A read-only or shared-file mapping must NOT be written —
+                    // that would SIGBUS the runtime or corrupt the file — so treat
+                    // it as a success no-op, matching Linux dropping clean cache
+                    // pages. zero_backing writes the host backing directly (same
+                    // call the MAP_FIXED/munmap-reuse scrub uses), bypassing the
+                    // guest write-protection gate.
+                    if meta.writable && cx.memory.zero_backing(address.0, length).is_err() {
+                        return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                    }
                 }
+                // MADV_FREE only applies to private anonymous mappings; a shared
+                // mapping (file- or anon-backed) → EINVAL.
+                LINUX_MADV_FREE if meta.shared => {
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                }
+                _ => {}
             }
             Ok(DispatchOutcome::Returned { value: 0 })
         }
