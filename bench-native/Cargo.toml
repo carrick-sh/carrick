@@ -13,6 +13,13 @@ version = "0.0.0"
 edition = "2021"
 publish = false
 
+# Most probes here are pure std, but the process-spawn probe (perf_fork_exec)
+# needs POSIX fork/execve/waitpid, which std does not expose. libc's fork/execve/
+# waitpid/_exit are portable POSIX and present on aarch64-apple-darwin, so the
+# native (macOS-ceiling) build of that probe compiles and runs unchanged.
+[dependencies]
+libc = "0.2"
+
 [[bin]]
 name = "perf_net_tcp_rr"
 path = "../conformance-probes/src/bin/perf_net_tcp_rr.rs"
@@ -24,6 +31,10 @@ path = "../conformance-probes/src/bin/perf_net_tcp_stream.rs"
 [[bin]]
 name = "perf_disk_meta"
 path = "../conformance-probes/src/bin/perf_disk_meta.rs"
+
+[[bin]]
+name = "perf_fork_exec"
+path = "../conformance-probes/src/bin/perf_fork_exec.rs"
 
 [[bin]]
 name = "perf_disk_vol"

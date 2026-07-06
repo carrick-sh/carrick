@@ -196,6 +196,23 @@ pub const CASES: &[PerfCase] = &[
         carrick_fs_mode: "host",
         cross_boundary: false,
     },
+    // Latency (lower better): end-to-end process spawn — fork→execve(self)→exit
+    // →reap per rep. carrick must fork the guest-carrying process, stand up a
+    // fresh guest for the exec'd image, and reap it, vs docker's in-kernel
+    // clone+execve+wait. The first trustworthy fork/exec number (supersedes the
+    // stale ~10.8ms examples/fork_*_bench.rs headers).
+    PerfCase {
+        probe: "perf_fork_exec",
+        artifact: PerfArtifact::StaticMusl,
+        dimension: "process",
+        workload: "fork_exec",
+        metric_key: "fork_exec_p50_us",
+        unit: "us",
+        higher_is_better: false,
+        mount_scratch: false,
+        carrick_fs_mode: "host",
+        cross_boundary: false,
+    },
     // Latency (lower better): loopback request/response round-trip.
     PerfCase {
         probe: "perf_net_tcp_rr",
@@ -437,6 +454,23 @@ mod tests {
             assert_eq!(case.carrick_fs_mode, "host");
             assert!(!case.cross_boundary);
         }
+    }
+
+    #[test]
+    fn registry_contains_process_perf_surface() {
+        let case = CASES
+            .iter()
+            .find(|case| case.workload == "fork_exec")
+            .expect("missing process perf workload fork_exec");
+        assert_eq!(case.dimension, "process");
+        assert_eq!(case.probe, "perf_fork_exec");
+        assert_eq!(case.metric_key, "fork_exec_p50_us");
+        assert_eq!(case.unit, "us");
+        assert_eq!(case.artifact, PerfArtifact::StaticMusl);
+        assert!(!case.higher_is_better);
+        assert!(!case.mount_scratch);
+        assert_eq!(case.carrick_fs_mode, "host");
+        assert!(!case.cross_boundary);
     }
 
     #[test]
