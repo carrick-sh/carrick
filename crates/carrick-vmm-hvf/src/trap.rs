@@ -1301,6 +1301,43 @@ impl PermitRegion {
     }
 }
 
+/// Bridge the fork-shared slot table to the root death-reclaim supervisor
+/// ([`crate::vcpu_permit_reaper`]). The reaper only ever needs the occupied
+/// owners and a generation-guarded reclaim, so it works in `(pid, generation)`
+/// tuples and never names the private slot types.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl crate::vcpu_permit_reaper::PermitReclaimSource for PermitRegion {
+    fn owner_slots(&self) -> Vec<(u32, u32)> {
+        use std::sync::atomic::Ordering;
+        let mut owners = Vec::new();
+        for slot in self.table().slots.iter() {
+            let word = slot.load(Ordering::SeqCst);
+            if atomic_permit_slot::state_of(word) != SlotState::Free {
+                owners.push((
+                    atomic_permit_slot::pid_of(word),
+                    atomic_permit_slot::gen_of(word),
+                ));
+            }
+        }
+        owners
+    }
+
+    fn reclaim(&self, pid: u32, generation: u32) -> usize {
+        // `Some(generation)` is the generation guard: a late death event for a
+        // dead owner cannot free a NEW slot held by a reused pid.
+        self.reclaim_owner(pid, Some(generation))
+    }
+}
+
+/// Start the root's atomic-permit death-reclaim supervisor (Task 2). The thin
+/// re-export wired from `HvfHostBackend::pre_loop_setup`; idempotent, and it
+/// binds the supervisor to the process-global permit region so the daemon frees
+/// the slots of any owner that dies without a cooperative release.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub fn start_vcpu_permit_reaper() {
+    crate::vcpu_permit_reaper::spawn_reaper(permit_region());
+}
+
 /// The process-global permit region. Initialized lazily on first use, but the
 /// FIRST use is the `Initial` admission acquire during initial-VM creation, which
 /// runs before the guest can execute any `fork` — so the region always exists,
@@ -1314,7 +1351,7 @@ fn permit_region() -> &'static PermitRegion {
 /// `true` when `CARRICK_HVF_ATOMIC_PERMIT=1`; cached once. Unset/other → the
 /// default flock permit path (byte-for-byte unchanged).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn atomic_permit_enabled() -> bool {
+pub fn atomic_permit_enabled() -> bool {
     use std::sync::atomic::{AtomicU8, Ordering};
     static FLAG: AtomicU8 = AtomicU8::new(0);
     match FLAG.load(Ordering::Relaxed) {

@@ -1609,6 +1609,14 @@ impl crate::threaded_loop::HostBackend for HvfHostBackend {
 
     fn pre_loop_setup(&self) -> Box<dyn std::any::Any> {
         crate::host_signal::install_default_handlers();
+        // The root process is the atomic-permit supervisor: one EVFILT_PROC
+        // kqueue that frees the generation-stamped slots of any owner that dies
+        // hard (SIGKILL/segfault/missed cooperative cleanup), recreating flock's
+        // kernel-backed reclaim. Flag-gated; the default flock path is untouched.
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if crate::trap::atomic_permit_enabled() {
+            crate::trap::start_vcpu_permit_reaper();
+        }
         Box::new(crate::host_tty::TermiosRestoreGuard::new())
     }
 
