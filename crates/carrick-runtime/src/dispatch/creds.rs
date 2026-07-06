@@ -464,6 +464,22 @@ impl SyscallDispatcher {
             if (eff & !prm) != 0 || (prm & !caps.permitted) != 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EPERM));
             }
+            // Validate the new INHERITABLE (pI) set, the third invariant Linux
+            // enforces for every caller (capset02/capset03). A caller may only
+            // raise pI bits it is entitled to:
+            //   * WITH CAP_SETPCAP: any bit in (bounding | old_inheritable).
+            //   * WITHOUT it: only bits in (old_permitted | old_inheritable).
+            // A new pI bit outside that set is EPERM. (`caps` is still the OLD
+            // set here — it is mutated below.)
+            let setpcap_bit = 1u64 << crate::namespace::process::CAP_SETPCAP;
+            let allowed_inh = if caps.effective & setpcap_bit != 0 {
+                caps.bounding | caps.inheritable
+            } else {
+                caps.permitted | caps.inheritable
+            };
+            if (inh & !allowed_inh) != 0 {
+                return Ok(DispatchOutcome::errno(LINUX_EPERM));
+            }
             caps.effective = eff;
             caps.permitted = prm;
             caps.inheritable = inh;
@@ -742,6 +758,14 @@ impl SyscallDispatcher {
         }
 
         fn sys_setgroups(this, cx, size: u64, list: GuestPtr) {
+            // setgroups requires CAP_SETGID (Linux checks may_setgroups() first).
+            // We model that capability as "running as root": a non-root euid is
+            // EPERM (setgroups03). This precedes the size/EFAULT checks, matching
+            // the kernel's ordering (the EPERM case runs as `nobody`, the EINVAL
+            // and EFAULT cases as root).
+            if this.cred_snapshot().euid != 0 {
+                return Ok(DispatchOutcome::errno(LINUX_EPERM));
+            }
             // Linux caps the supplementary set at NGROUPS_MAX (65536).
             const NGROUPS_MAX: u64 = 65536;
             if size > NGROUPS_MAX {
