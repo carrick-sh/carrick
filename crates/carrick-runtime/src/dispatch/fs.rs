@@ -1591,6 +1591,21 @@ impl SyscallDispatcher {
             return Ok(DispatchOutcome::errno(errno));
         }
 
+        // O_NOATIME may only be requested by the file's owner (or a holder of
+        // CAP_FOWNER, modeled here as euid==0). Linux's do_dentry_open rejects a
+        // non-owner with EPERM (fs/open.c -> inode_owner_or_capable). Only
+        // enforce when the backing file exists and reports a real owner; a
+        // not-yet-existent O_CREAT target has no owner to compare against.
+        if open_flags.contains(LinuxOpenFlags::NOATIME) {
+            let creds = self.cred_snapshot();
+            if creds.euid != 0
+                && let Some(real) = self.fs.rootfs_vfs.overlay.real_stat(&path, true)
+                && real.uid != creds.euid
+            {
+                return Ok(DispatchOutcome::errno(LINUX_EPERM));
+            }
+        }
+
         // FIFO (named pipe): open the REAL host FIFO in NON-BLOCKING mode and
         // model it as a HostPipe. A blocking host open of a writer-less
         // O_RDONLY FIFO would wedge the single dispatcher thread; opening
