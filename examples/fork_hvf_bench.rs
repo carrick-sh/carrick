@@ -1,5 +1,15 @@
 //! Measure HVF vCPU FIRST-ENTRY (cold) latency vs subsequent (warm) hv_vcpu_run.
-//! Hypothesis: a freshly-forked carrick process pays ~4ms cold vcpu entry.
+//! This isolates ONE primitive: the cost of the first hv_vcpu_run after vCPU
+//! create.
+//!
+//! NOTE: the old "~4ms cold vcpu entry" hypothesis once stated here is
+//! SUPERSEDED — current micro-measurements show cold vcpu entry ~0.022ms and the
+//! full HVF VM lifecycle ~0.061ms, so vcpu entry is NOT the dominant fork/exec
+//! cost. The authoritative, reproducible end-to-end fork/exec process-spawn
+//! number now lives in the differential perf gate:
+//! conformance-probes/src/bin/perf_fork_exec.rs (workload "fork_exec", metric
+//! fork_exec_p50_us), run via `just bench`. Keep this example only as a
+//! vcpu-entry-primitive isolator, not a source of conclusions.
 #![allow(clippy::unwrap_used)]
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod sys {
