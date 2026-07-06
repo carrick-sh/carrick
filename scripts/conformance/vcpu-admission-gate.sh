@@ -44,6 +44,21 @@ SUITES=(cpython-queue node-v8-smoke node-app-smoke go-os_exec)
 
 log() { printf '[vcpu-admission-gate] %s\n' "$*" >&2; }
 
+# Permit mechanism under test. carrick reads CARRICK_HVF_ATOMIC_PERMIT
+# process-globally (crates/carrick-vmm-hvf/src/trap.rs::atomic_permit_enabled):
+# =1 selects the fork-shared atomic slot-table permit, unset/other selects the
+# default host-wide flock permit. std::process::Command does NOT env_clear, so
+# the carrick child inherits this script's environment; we export it explicitly
+# so the atomic path is selected unambiguously and the intent is documented.
+# Unset leaves the default flock path byte-for-byte (nothing exported/added).
+ATOMIC_PERMIT="${CARRICK_HVF_ATOMIC_PERMIT:-}"
+if [ -n "$ATOMIC_PERMIT" ]; then
+    export CARRICK_HVF_ATOMIC_PERMIT="$ATOMIC_PERMIT"
+    log "permit mechanism: ATOMIC (CARRICK_HVF_ATOMIC_PERMIT=$ATOMIC_PERMIT)"
+else
+    log "permit mechanism: flock (default; set CARRICK_HVF_ATOMIC_PERMIT=1 for the atomic slot-table path)"
+fi
+
 log "building signed carrick binary (unsigned -> HV_DENIED on every run)"
 just build >&2
 
