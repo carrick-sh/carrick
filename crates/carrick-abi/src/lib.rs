@@ -2907,6 +2907,7 @@ pub const LINUX_RLIM_INFINITY: u64 = u64::MAX;
 // getrlimit/setrlimit/prlimit64 resource numbers (asm-generic resource.h;
 // shared by aarch64 and x86_64). Only the resources carrick treats specially
 // are named; a resource >= RLIM_NLIMITS is EINVAL.
+pub const LINUX_RLIMIT_FSIZE: u64 = 1;
 pub const LINUX_RLIMIT_DATA: u64 = 2;
 pub const LINUX_RLIMIT_STACK: u64 = 3;
 pub const LINUX_RLIMIT_NPROC: u64 = 6;
