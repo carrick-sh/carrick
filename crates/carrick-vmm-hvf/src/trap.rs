@@ -721,28 +721,31 @@ enum VmCreateAdmission {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl VmCreateAdmission {
-    /// Ceiling on concurrently-CREATING HVF VMs across a fork tree. This bounds
-    /// VM/vCPU *creation* only (the pre-block window of a fork storm), NOT guest
-    /// *execution* — execution is already bounded by the per-process M:N
+    /// Soft pre-throttle on concurrently-CREATING HVF VMs across a fork tree.
+    /// This bounds VM/vCPU *creation* only (the pre-block window of a fork storm),
+    /// NOT guest *execution* — execution is already bounded by the per-process M:N
     /// scheduler gate and the Darwin kernel time-slicing cores across processes.
-    /// The permit's source budget is now `hvf_cap_budget()` (the real HVF vCPU
-    /// handle ceiling), decoupled from physical core count; this cap keeps a
-    /// fork storm from creating up to that whole ceiling of live VMs at once,
-    /// which would destabilize the host UI. Chosen at 12: the minimal step above
-    /// the old plain-fork-rebuild ceiling (physical-core count, 10 on the dev
-    /// Mac) that still admits the ~11 concurrent VMs `ltp-waitpid13` needs.
-    /// Measured: 16 admits waitpid13 too, but its +6 over the old fork-rebuild
-    /// ceiling regressed `ltp-msgstress01` from MATCH to TIMEOUT when two heavy
-    /// fork-storm suites shared the host at `--workers 8` (pure contention — no
-    /// HV_NO_RESOURCES and msgstress01 still MATCHes in isolation); 12 keeps the
-    /// increase to +2 to stay close to that proven-stable ceiling.
-    const CONSERVATIVE_GLOBAL_VM_CAP: usize = 12;
+    ///
+    /// Measured via `hvf_fork_probe concurrent-ceiling`: the host sustains ~126
+    /// concurrent single-vCPU HVF VMs across separate processes before
+    /// `hv_vm_create`/`hv_vcpu_create` returns `HV_NO_RESOURCES`. So the real
+    /// system-wide vCPU budget is ~126 — NOT `hv_vm_get_max_vcpu_count()` (64),
+    /// which is the per-VM max vCPU count, not a system total. The old cap (12,
+    /// clamped from `hvf_cap_budget()` = 64 − reserve) was ~10× too low: it was
+    /// sourced from the wrong number and starved suites that need dozens of
+    /// simultaneously-alive processes (e.g. `ltp-fcntl36` needs ~36).
+    ///
+    /// The true hard limit is discovered at runtime by `HV_NO_RESOURCES` and
+    /// handled with park+retry backpressure (`create_with_no_resources_backpressure`);
+    /// 120 is a soft pre-throttle margin a little under the measured ~126 to leave
+    /// headroom for other system VM consumers. It is NOT
+    /// `hv_vm_get_max_vcpu_count` (that's the per-VM max).
+    const GLOBAL_VCPU_CEILING: usize = 120;
 
-    fn global_permit_budget_from_mn(self, mn_budget: usize) -> Option<usize> {
-        let mn_budget = mn_budget.max(1);
+    fn global_permit_budget(self) -> Option<usize> {
         match self {
             Self::Initial | Self::SharedWaitResume | Self::ForkRebuild { vfork: false } => {
-                Some(mn_budget.min(Self::CONSERVATIVE_GLOBAL_VM_CAP))
+                Some(Self::GLOBAL_VCPU_CEILING)
             }
             Self::ForkRebuild { vfork: true } | Self::ExecveRebuild => None,
         }
@@ -936,7 +939,12 @@ fn reset_global_vcpu_permits_after_fork_child() {
 /// valid empty slot — and no live slot is ever all-zero (state is never free).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod atomic_permit_slot {
-    pub(super) const MAX_SLOTS: usize = 64;
+    // Sized to cover `GLOBAL_VCPU_CEILING` (120) with headroom so the DEFAULT
+    // atomic admission path honors the full measured system-wide vCPU budget;
+    // at 64 the soft pre-throttle would silently clamp to 64 concurrent creators
+    // (well below the real ~126 ceiling). Auto-sizes the shared table's mmap
+    // (`size_of::<SharedPermitTable>()`) and every slot scan.
+    pub(super) const MAX_SLOTS: usize = 128;
 
     pub(super) const STATE_SHIFT: u32 = 62;
     pub(super) const STATE_MASK: u64 = 0b11 << STATE_SHIFT;
@@ -1509,12 +1517,109 @@ pub fn cooperative_release_atomic_permit() -> usize {
     permit_region().cooperative_release_local()
 }
 
+/// True when park+retry admission tracing is requested (`CARRICK_HVF_ADMISSION_TRACE`).
+/// Cached once; park+retry is rare, so this stays off the hot path.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn admission_trace_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CARRICK_HVF_ADMISSION_TRACE").is_some())
+}
+
+/// A fresh VM config (max-IPA-sized), rebuilt per creation attempt so
+/// `HV_NO_RESOURCES` park+retry can re-run `hv_vm_create` (config is consumed on
+/// each `with_config`, so a retry needs a new one).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn fresh_vm_config() -> applevisor::error::Result<applevisor::vm::VirtualMachineConfig> {
+    use applevisor::prelude::*;
+    let max_ipa = VirtualMachineConfig::get_max_ipa_size()?;
+    let mut config = VirtualMachineConfig::new();
+    config.set_ipa_size(max_ipa)?;
+    Ok(config)
+}
+
+/// Run a VM/vCPU creation, absorbing the TRUE hard limit (`HV_NO_RESOURCES`,
+/// reachable if other system VMs consumed budget or a multithreaded guest pushed
+/// total vCPUs past the measured ~126 even under the 120 soft budget) by PARKING
+/// on the vcpu gate and RETRYING, rather than propagating a fatal error.
+///
+/// A sibling vCPU's `vcpu_destroyed` calls `vcpu_gate::notify()`, which wakes an
+/// in-process waiter fast; the bounded per-park timeout also drives cross-process
+/// recovery (a slot freed by a DIFFERENT process's teardown is picked up on the
+/// next retry, since that process's notify can't reach this process's condvar).
+/// Bounded by a total-wait deadline so a genuinely-full system propagates the
+/// error instead of hanging forever. Any non-`NoResources` error is propagated
+/// immediately. Gated logging makes the park+retry observable.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn create_with_no_resources_backpressure<T>(
+    what: &str,
+    attempt: impl FnMut() -> applevisor::error::Result<T>,
+) -> Result<T, TrapError> {
+    /// One park between retries; also the cross-process retry cadence.
+    const PARK: std::time::Duration = std::time::Duration::from_millis(25);
+    /// Total time to keep parking+retrying before declaring the host genuinely full.
+    const MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+    create_with_no_resources_backpressure_bounded(what, PARK, MAX_WAIT, attempt)
+}
+
+/// The bounded park+retry loop, split out with explicit `park`/`max_wait` so it
+/// is unit-testable in milliseconds instead of the production 10s ceiling. See
+/// [`create_with_no_resources_backpressure`] for the semantics.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn create_with_no_resources_backpressure_bounded<T>(
+    what: &str,
+    park: std::time::Duration,
+    max_wait: std::time::Duration,
+    mut attempt: impl FnMut() -> applevisor::error::Result<T>,
+) -> Result<T, TrapError> {
+    use applevisor::error::HypervisorError;
+
+    let start = std::time::Instant::now();
+    let mut parks: u32 = 0;
+    loop {
+        match attempt() {
+            Ok(v) => {
+                if parks > 0 && admission_trace_enabled() {
+                    eprintln!(
+                        "[hvf-admission pid={}] {what} recovered from HV_NO_RESOURCES after {parks} park(s) / {:?}",
+                        unsafe { libc::getpid() },
+                        start.elapsed(),
+                    );
+                }
+                return Ok(v);
+            }
+            Err(e) if e == HypervisorError::NoResources && start.elapsed() < max_wait => {
+                parks += 1;
+                if admission_trace_enabled() {
+                    eprintln!(
+                        "[hvf-admission pid={}] {what} HV_NO_RESOURCES; park+retry #{parks} (waited {:?})",
+                        unsafe { libc::getpid() },
+                        start.elapsed(),
+                    );
+                }
+                vcpu_gate::park_for_slot(park);
+            }
+            Err(e) => {
+                if e == HypervisorError::NoResources && admission_trace_enabled() {
+                    eprintln!(
+                        "[hvf-admission pid={}] {what} HV_NO_RESOURCES persisted {:?} after {parks} park(s); host full, propagating",
+                        unsafe { libc::getpid() },
+                        start.elapsed(),
+                    );
+                }
+                return Err(hvf_error(e));
+            }
+        }
+    }
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn create_vcpu_with_permit(
     vm: &applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>,
     permit: Option<HeldPermit>,
 ) -> Result<applevisor::vcpu::Vcpu, TrapError> {
-    match vm.vcpu_create() {
+    // The permit (this process's admitted soft-budget slot) is held across all
+    // retries; only the terminal outcome registers or releases it.
+    match create_with_no_resources_backpressure("hv_vcpu_create", || vm.vcpu_create()) {
         Ok(vcpu) => {
             if let Some(permit) = permit {
                 register_admission_permit(vcpu.id(), permit);
@@ -1526,7 +1631,7 @@ fn create_vcpu_with_permit(
             if let Some(permit) = permit {
                 release_unregistered_admission_permit(permit);
             }
-            Err(hvf_error(e))
+            Err(e)
         }
     }
 }
@@ -1550,7 +1655,6 @@ fn create_vcpu(
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn create_vm_with_admission(
-    config: applevisor::vm::VirtualMachineConfig,
     admission: VmCreateAdmission,
 ) -> Result<
     (
@@ -1559,16 +1663,23 @@ fn create_vm_with_admission(
     ),
     TrapError,
 > {
+    // Soft pre-throttle: acquire an admitted slot (bounded by GLOBAL_VCPU_CEILING)
+    // BEFORE creating; held across HV_NO_RESOURCES retries below.
     let permit = admission
-        .global_permit_budget_from_mn(vcpu_gate::hvf_cap_budget())
+        .global_permit_budget()
         .map(acquire_admission_permit);
-    match virtual_machine_with_private_signals_blocked(config) {
+    // Config is rebuilt per attempt inside the closure because `with_config`
+    // consumes it, so an HV_NO_RESOURCES retry needs a fresh one.
+    match create_with_no_resources_backpressure("hv_vm_create", || {
+        let config = fresh_vm_config()?;
+        virtual_machine_with_private_signals_blocked(config)
+    }) {
         Ok(vm) => Ok((vm, permit)),
         Err(e) => {
             if let Some(permit) = permit {
                 release_unregistered_admission_permit(permit);
             }
-            Err(hvf_error(e))
+            Err(e)
         }
     }
 }
@@ -1591,14 +1702,18 @@ fn create_vm_with_admission(
 /// complete instead of deadlocking.
 ///
 /// The shared M:N scheduler caps runnable sibling threads inside one process.
-/// A separate file-lock permit caps one-vCPU HVF VMs across a fork tree: otherwise
+/// A separate admission permit caps one-vCPU HVF VMs across a fork tree: otherwise
 /// every fork child receives a fresh process-local scheduler and a plain LTP fork
 /// storm can create hundreds of live VMs until HVF returns `HV_NO_RESOURCES`.
-/// That global creation permit is sized from the real HVF vCPU handle ceiling
-/// (`hvf_cap_budget()`), NOT physical core count, then clamped to
-/// `CONSERVATIVE_GLOBAL_VM_CAP` (12). Its ONLY job is bounding concurrent VM/vCPU
-/// CREATION in a fork storm's pre-block window; guest EXECUTION is already bounded
-/// by the per-process M:N scheduler and the Darwin kernel time-slicing host cores.
+/// That global creation permit is sized from the measured system-wide vCPU
+/// ceiling (`GLOBAL_VCPU_CEILING`, 120 — a soft margin under the ~126 the host
+/// sustains), NOT `hvf_cap_budget()`/`hv_vm_get_max_vcpu_count` (which is the
+/// PER-VM max, 64, and was the wrong number the old cap of 12 was clamped from).
+/// Its ONLY job is bounding concurrent VM/vCPU CREATION in a fork storm's
+/// pre-block window; guest EXECUTION is already bounded by the per-process M:N
+/// scheduler and the Darwin kernel time-slicing host cores. The TRUE hard limit
+/// is discovered at runtime by `HV_NO_RESOURCES` and absorbed with park+retry
+/// (`create_with_no_resources_backpressure` / `park_for_slot`).
 /// Initial VM creation, plain fork rebuilds, and shared-wait resumes all pass
 /// through this same creation gate.
 ///
@@ -1608,7 +1723,7 @@ fn create_vm_with_admission(
 /// rebuilds also bypass for the same vfork-child progress reason.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod vcpu_gate {
-    use std::sync::{Condvar, OnceLock};
+    use std::sync::{Condvar, Mutex, OnceLock};
 
     /// Slots we keep in reserve below the raw HVF cap so a multithreaded fork can
     /// always rebuild its quiesced siblings' vCPUs (each sibling releases then
@@ -1654,6 +1769,19 @@ mod vcpu_gate {
     /// A vCPU was destroyed; wake any thread parked on the gate condvar.
     pub fn notify() {
         GATE_CV.notify_all();
+    }
+
+    /// Park until a vCPU slot may have freed (a `notify()` from a sibling's
+    /// `vcpu_destroyed`) or `timeout` elapses — whichever first. Used by the
+    /// `HV_NO_RESOURCES` backpressure retry so a creation that hit the true hard
+    /// limit waits for capacity instead of failing. The timeout is the backstop
+    /// for the cross-process case: a slot freed by a DIFFERENT process's teardown
+    /// can't reach this process's condvar, so the bounded wait drives the retry.
+    /// A missed notify is harmless — the timeout retries anyway.
+    pub(crate) fn park_for_slot(timeout: std::time::Duration) {
+        static GATE_MUTEX: Mutex<()> = Mutex::new(());
+        let guard = GATE_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = GATE_CV.wait_timeout(guard, timeout);
     }
 }
 
@@ -2208,10 +2336,7 @@ impl HvfVmState {
     ) -> Result<(HvfVmState, applevisor::vcpu::Vcpu), TrapError> {
         use applevisor::prelude::*;
 
-        let max_ipa = VirtualMachineConfig::get_max_ipa_size().map_err(hvf_error)?;
-        let mut config = VirtualMachineConfig::new();
-        config.set_ipa_size(max_ipa).map_err(hvf_error)?;
-        let (vm, permit) = create_vm_with_admission(config, VmCreateAdmission::Initial)?;
+        let (vm, permit) = create_vm_with_admission(VmCreateAdmission::Initial)?;
         let vcpu = create_vcpu_with_permit(&vm, permit)?;
         enable_el0_counter_access(vcpu.id());
 
@@ -3538,16 +3663,10 @@ impl HvfVmState {
         &mut self,
         vcpu: &mut applevisor::vcpu::Vcpu,
     ) -> Result<(), TrapError> {
-        use applevisor::prelude::*;
-
         let snap = self.reclaim_snapshot.take().ok_or_else(|| {
             TrapError::Hypervisor("shared_wait_resume: no parked snapshot".into())
         })?;
-        let max_ipa = VirtualMachineConfig::get_max_ipa_size().map_err(hvf_error)?;
-        let mut config = VirtualMachineConfig::new();
-        config.set_ipa_size(max_ipa).map_err(hvf_error)?;
-        let (new_vm, permit) =
-            create_vm_with_admission(config, VmCreateAdmission::SharedWaitResume)?;
+        let (new_vm, permit) = create_vm_with_admission(VmCreateAdmission::SharedWaitResume)?;
         let new_vcpu = create_vcpu_with_permit(&new_vm, permit)?;
         enable_el0_counter_access(new_vcpu.id());
         self.vcpu_id = new_vcpu.id();
@@ -3814,8 +3933,6 @@ impl HvfVmState {
         snap: &VcpuSnapshot,
         is_child: bool,
     ) -> Result<(), TrapError> {
-        use applevisor::prelude::*;
-
         // Take the descriptors stashed in `fork_prepare_and_teardown`. The parent
         // re-maps its own buffers (`mapping_descs`); the child re-maps the private
         // snapshots / shared originals (`child_descs`). The unused set drops here.
@@ -3826,18 +3943,12 @@ impl HvfVmState {
         // torn down (parent did it pre-fork; child inherited the now-empty state
         // via fork). Each side independently re-registers the inherited host
         // buffers via raw `hv_vm_map`.
-        let max_ipa = VirtualMachineConfig::get_max_ipa_size().map_err(hvf_error)?;
-        let mut config = VirtualMachineConfig::new();
-        config.set_ipa_size(max_ipa).map_err(hvf_error)?;
         if is_child {
             reset_admission_permits_after_fork_child();
         }
-        let (new_vm, permit) = create_vm_with_admission(
-            config,
-            VmCreateAdmission::ForkRebuild {
-                vfork: self.vfork_share,
-            },
-        )?;
+        let (new_vm, permit) = create_vm_with_admission(VmCreateAdmission::ForkRebuild {
+            vfork: self.vfork_share,
+        })?;
         let new_vcpu = create_vcpu_with_permit(&new_vm, permit)?;
         enable_el0_counter_access(new_vcpu.id());
         self.vcpu_id = new_vcpu.id();
@@ -4165,10 +4276,7 @@ impl HvfVmState {
         let _ = unsafe { applevisor_sys::hv_vm_destroy() };
 
         // Create a fresh VM + vCPU.
-        let max_ipa = VirtualMachineConfig::get_max_ipa_size().map_err(hvf_error)?;
-        let mut config = VirtualMachineConfig::new();
-        config.set_ipa_size(max_ipa).map_err(hvf_error)?;
-        let (new_vm, permit) = create_vm_with_admission(config, VmCreateAdmission::ExecveRebuild)?;
+        let (new_vm, permit) = create_vm_with_admission(VmCreateAdmission::ExecveRebuild)?;
         let new_vcpu = create_vcpu_with_permit(&new_vm, permit)?;
         enable_el0_counter_access(new_vcpu.id());
         self.vcpu_id = new_vcpu.id();
@@ -5140,80 +5248,144 @@ mod vm_create_admission_tests {
 
     #[test]
     fn resource_growing_vm_creation_uses_global_permit() {
-        assert!(
-            VmCreateAdmission::Initial
-                .global_permit_budget_from_mn(10)
-                .is_some()
-        );
+        assert!(VmCreateAdmission::Initial.global_permit_budget().is_some());
         assert!(
             VmCreateAdmission::ForkRebuild { vfork: false }
-                .global_permit_budget_from_mn(10)
+                .global_permit_budget()
                 .is_some(),
             "plain fork rebuilds create another live one-vCPU VM in the fork tree"
         );
         assert!(
             VmCreateAdmission::ForkRebuild { vfork: true }
-                .global_permit_budget_from_mn(10)
+                .global_permit_budget()
                 .is_none(),
             "vfork parents wait in the fork handler, so the child rebuild must not \
              compete with the parent for the same global permit"
         );
         assert!(
             VmCreateAdmission::ExecveRebuild
-                .global_permit_budget_from_mn(10)
+                .global_permit_budget()
                 .is_none()
         );
         assert!(
             VmCreateAdmission::SharedWaitResume
-                .global_permit_budget_from_mn(10)
+                .global_permit_budget()
                 .is_some()
         );
     }
 
     #[test]
     fn global_permit_budget_depends_on_admission_kind() {
-        // Below the conservative cap the source budget passes through unchanged
-        // for every gated class (source is now hvf_cap_budget, not phys cores).
+        // Every gated class is now bounded by the measured system-wide vCPU
+        // ceiling (GLOBAL_VCPU_CEILING), NOT the per-VM hv_vm_get_max_vcpu_count
+        // the old cap of 12 was clamped from. The true hard limit is discovered
+        // at runtime via HV_NO_RESOURCES park+retry, not this soft pre-throttle.
+        let ceiling = Some(VmCreateAdmission::GLOBAL_VCPU_CEILING);
+        assert_eq!(VmCreateAdmission::Initial.global_permit_budget(), ceiling);
         assert_eq!(
-            VmCreateAdmission::Initial.global_permit_budget_from_mn(10),
-            Some(10)
+            VmCreateAdmission::ForkRebuild { vfork: false }.global_permit_budget(),
+            ceiling,
+            "plain fork rebuilds are gated by the same creation ceiling"
         );
         assert_eq!(
-            VmCreateAdmission::ForkRebuild { vfork: false }.global_permit_budget_from_mn(10),
-            Some(10),
-            "plain fork rebuilds are gated by the same creation cap"
+            VmCreateAdmission::SharedWaitResume.global_permit_budget(),
+            ceiling,
+            "shared-wait resume drains parked processes through the creation ceiling"
         );
+        // vfork parents wait in the fork handler and execve rebuilds must make
+        // progress, so both bypass the global creation permit entirely.
         assert_eq!(
-            VmCreateAdmission::ForkRebuild { vfork: true }.global_permit_budget_from_mn(10),
+            VmCreateAdmission::ForkRebuild { vfork: true }.global_permit_budget(),
             None
         );
         assert_eq!(
-            VmCreateAdmission::ExecveRebuild.global_permit_budget_from_mn(10),
+            VmCreateAdmission::ExecveRebuild.global_permit_budget(),
             None
         );
-        assert_eq!(
-            VmCreateAdmission::SharedWaitResume.global_permit_budget_from_mn(10),
-            Some(10),
-            "shared-wait resume drains parked processes through the creation cap"
+        // The ceiling is the measured margin under the ~126 real host limit, well
+        // above the old cap of 12 that starved dozens-of-processes suites.
+        assert_eq!(VmCreateAdmission::GLOBAL_VCPU_CEILING, 120);
+    }
+
+    // ---- Part B: HV_NO_RESOURCES park+retry backpressure ----
+    // The live fork-storm never reaches the ~126 hard ceiling under the 120 soft
+    // budget, so these drive the bounded retry loop directly (millisecond timings)
+    // to prove: transient HV_NO_RESOURCES recovers, a genuinely-full host bounds
+    // out and propagates, and a non-NoResources error is never parked on.
+    use applevisor::error::HypervisorError;
+    use std::cell::Cell;
+    use std::time::Duration;
+
+    #[test]
+    fn no_resources_backpressure_recovers_after_transient() {
+        // NoResources for the first two attempts, then success — the loop must
+        // park+retry through them and return Ok, not propagate.
+        let calls = Cell::new(0u32);
+        let out: Result<u64, TrapError> = create_with_no_resources_backpressure_bounded(
+            "test",
+            Duration::from_millis(1),
+            Duration::from_secs(5),
+            || {
+                let n = calls.get();
+                calls.set(n + 1);
+                if n < 2 {
+                    Err(HypervisorError::NoResources)
+                } else {
+                    Ok(42)
+                }
+            },
         );
-        // A large source budget (real hvf_cap ~60) is clamped to the cap of 12
-        // for every gated class, so a fork storm creates at most 12 live VMs.
-        assert_eq!(
-            VmCreateAdmission::Initial.global_permit_budget_from_mn(60),
-            Some(12)
+        assert_eq!(out.ok(), Some(42), "transient NoResources must recover");
+        assert_eq!(calls.get(), 3, "expected two retries then success");
+    }
+
+    #[test]
+    fn no_resources_backpressure_bounds_out_when_host_is_full() {
+        // Always NoResources: the loop must give up after ~max_wait and propagate
+        // the error (never hang forever). A tiny max_wait keeps the test fast.
+        let calls = Cell::new(0u32);
+        let start = std::time::Instant::now();
+        let out: Result<u64, TrapError> = create_with_no_resources_backpressure_bounded(
+            "test",
+            Duration::from_millis(1),
+            Duration::from_millis(20),
+            || {
+                calls.set(calls.get() + 1);
+                Err(HypervisorError::NoResources)
+            },
         );
-        assert_eq!(
-            VmCreateAdmission::ForkRebuild { vfork: false }.global_permit_budget_from_mn(60),
-            Some(12)
+        assert!(
+            out.is_err(),
+            "a genuinely-full host must propagate the error"
         );
-        assert_eq!(
-            VmCreateAdmission::SharedWaitResume.global_permit_budget_from_mn(60),
-            Some(12)
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "bounded wait must not hang"
         );
+        assert!(
+            calls.get() >= 2,
+            "expected at least one park+retry before giving up"
+        );
+    }
+
+    #[test]
+    fn no_resources_backpressure_never_parks_on_other_errors() {
+        // A non-NoResources error is propagated immediately, with no retry.
+        let calls = Cell::new(0u32);
+        let out: Result<u64, TrapError> = create_with_no_resources_backpressure_bounded(
+            "test",
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            || {
+                calls.set(calls.get() + 1);
+                Err(HypervisorError::Busy)
+            },
+        );
+        assert!(out.is_err());
         assert_eq!(
-            VmCreateAdmission::Initial.global_permit_budget_from_mn(2),
-            Some(2),
-            "a source budget below the cap passes through unchanged"
+            calls.get(),
+            1,
+            "a non-NoResources error must not be retried"
         );
     }
 
@@ -5438,7 +5610,7 @@ mod vm_create_admission_tests {
         // the vCPU it just created.
         let pre_exec_vcpu_id = 42u64;
         let budget = VmCreateAdmission::Initial
-            .global_permit_budget_from_mn(4)
+            .global_permit_budget()
             .expect("Initial admission is budgeted");
         let t = r.acquire(budget, pid).unwrap();
         r.register(pre_exec_vcpu_id, t);
@@ -5459,7 +5631,7 @@ mod vm_create_admission_tests {
         // None), so create_vcpu_with_permit registers no token for the
         // replacement vCPU — even if HVF hands back the same numeric id.
         assert_eq!(
-            VmCreateAdmission::ExecveRebuild.global_permit_budget_from_mn(4),
+            VmCreateAdmission::ExecveRebuild.global_permit_budget(),
             None
         );
         let post_exec_vcpu_id = pre_exec_vcpu_id;
