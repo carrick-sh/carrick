@@ -312,12 +312,16 @@ impl SyscallDispatcher {
             return;
         }
         let is_dir = self.inotify_path_kind(path).unwrap_or(false);
-        self.fs
-            .inotify_registry
-            .notify_self(path, carrick_abi::LINUX_IN_ATTRIB, is_dir);
+        // Linux delivers the PARENT-directory (child, name=basename) event
+        // BEFORE the object's own (self, name="") event: inotify10 test #0
+        // watches a dir and a subdir/file inside it in ONE group and asserts the
+        // parent watch's named event precedes the self watch's nameless one.
         self.fs
             .inotify_registry
             .notify_child(path, carrick_abi::LINUX_IN_ATTRIB, is_dir);
+        self.fs
+            .inotify_registry
+            .notify_self(path, carrick_abi::LINUX_IN_ATTRIB, is_dir);
     }
 
     /// Emit an inotify event for a read/write/close on `fd`, iff `fd` is a
@@ -362,10 +366,12 @@ impl SyscallDispatcher {
         // is the difference between a ~38µs and a ~few-µs write on a watched file.
         let child_unlinked =
             self.fs.inotify_registry.parent_watch_exists_for(&path) && !self.path_exists(&path);
-        self.fs.inotify_registry.notify_self(&path, mask, is_dir);
+        // Parent-directory (child) event precedes the object's own (self) event,
+        // matching Linux fsnotify ordering (inotify10).
         self.fs
             .inotify_registry
             .notify_child_excl(&path, mask, is_dir, child_unlinked);
+        self.fs.inotify_registry.notify_self(&path, mask, is_dir);
     }
 
     /// Emit `IN_CLOSE_WRITE` (fd was writable) or `IN_CLOSE_NOWRITE` (read-only)
