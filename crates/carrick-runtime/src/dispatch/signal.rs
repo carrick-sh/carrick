@@ -1971,7 +1971,15 @@ impl SyscallDispatcher {
         if let Some((routed, target_tid)) =
             self.route_thread_signal(ctx, route_target, signum, false)
         {
-            if let Some(info) = user_info {
+            // Only record the queued payload when the route actually queued the
+            // signal. If the route failed with an errno (e.g. RLIMIT_SIGPENDING
+            // EAGAIN, which returns BEFORE any pending bit is set), Linux queued
+            // nothing — recording here would leave a stale RT payload that a
+            // LATER legitimate rt_sigqueueinfo(same sig) would pop and deliver
+            // with the wrong si_value.
+            if !matches!(routed, DispatchOutcome::Errno { .. })
+                && let Some(info) = user_info
+            {
                 self.record_pending_siginfo(target_tid, s, info);
             }
             return routed;
