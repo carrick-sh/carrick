@@ -2312,7 +2312,16 @@ impl SyscallDispatcher {
                     // its ns-local pid (§5.3). Identity when namespaces are off.
                     let ns_si_pid =
                         crate::namespace::pid::host_to_ns_or_self(carrick_portable::si_pid(&info) as u32) as i32;
-                    build_sigchld_siginfo(ns_si_pid, carrick_portable::si_uid(&info), info.si_code, carrick_portable::si_status(&info))
+                    // macOS reports CLD_KILLED for a signal death (the host never
+                    // dumps core); Linux reports CLD_DUMPED when the child died by
+                    // a core-dumping signal with core dumps enabled. Synthesize it
+                    // (mirrors the wait4 wstatus 0x80 bit) so waitid(WEXITED)
+                    // matches — waitid10: a SIGFPE child → CLD_DUMPED.
+                    let si_code = this.core_dumped_si_code(
+                        info.si_code,
+                        carrick_portable::si_status(&info),
+                    );
+                    build_sigchld_siginfo(ns_si_pid, carrick_portable::si_uid(&info), si_code, carrick_portable::si_status(&info))
                 };
                 let memory = &mut *cx.memory;
                 memory.write_bytes(infop_addr.0, &bytes)?;
@@ -3069,6 +3078,44 @@ fn clear_unrequested_waitid_state(info: &mut libc::siginfo_t, options: LinuxWait
     }
     *info = unsafe { std::mem::zeroed() };
     false
+}
+
+impl SyscallDispatcher {
+    /// Promote a `waitid` `CLD_KILLED` to `CLD_DUMPED` when the child died by a
+    /// core-dumping signal AND core dumps are enabled (RLIMIT_CORE soft > 0).
+    /// macOS's `waitid` never sets CLD_DUMPED (the host doesn't dump core), but
+    /// Linux does — the same "died in a core-dumping way" contract the wait4
+    /// wstatus 0x80 bit encodes. `host_si_status` is the host signal number.
+    fn core_dumped_si_code(&self, si_code: i32, host_si_status: i32) -> i32 {
+        const CLD_KILLED: i32 = 2;
+        const CLD_DUMPED: i32 = 3;
+        if si_code != CLD_KILLED {
+            return si_code;
+        }
+        let linux_sig = crate::host_signal::host_to_linux_signum(host_si_status);
+        if core_dump_bit_for(linux_sig) != 0 && self.rlimit_core_enabled() {
+            CLD_DUMPED
+        } else {
+            si_code
+        }
+    }
+
+    /// True iff RLIMIT_CORE's soft limit is nonzero (core dumps are produced).
+    /// The carrick default is RLIM_INFINITY; a `setrlimit(RLIMIT_CORE, 0)` in the
+    /// override table disables it.
+    fn rlimit_core_enabled(&self) -> bool {
+        match self
+            .proc
+            .lock()
+            .rlimit_overrides
+            .get(crate::linux_abi::LINUX_RLIMIT_CORE as usize)
+            .copied()
+            .flatten()
+        {
+            Some(limit) => limit.rlim_cur != 0,
+            None => true,
+        }
+    }
 }
 
 fn waitid_state_requested(si_code: i32, options: LinuxWaitOptions) -> bool {
