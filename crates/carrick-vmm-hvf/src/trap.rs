@@ -721,15 +721,29 @@ enum VmCreateAdmission {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl VmCreateAdmission {
-    const CONSERVATIVE_GLOBAL_VM_CAP: usize = 4;
+    /// Ceiling on concurrently-CREATING HVF VMs across a fork tree. This bounds
+    /// VM/vCPU *creation* only (the pre-block window of a fork storm), NOT guest
+    /// *execution* — execution is already bounded by the per-process M:N
+    /// scheduler gate and the Darwin kernel time-slicing cores across processes.
+    /// The permit's source budget is now `hvf_cap_budget()` (the real HVF vCPU
+    /// handle ceiling), decoupled from physical core count; this cap keeps a
+    /// fork storm from creating up to that whole ceiling of live VMs at once,
+    /// which would destabilize the host UI. Chosen at 12: the minimal step above
+    /// the old plain-fork-rebuild ceiling (physical-core count, 10 on the dev
+    /// Mac) that still admits the ~11 concurrent VMs `ltp-waitpid13` needs.
+    /// Measured: 16 admits waitpid13 too, but its +6 over the old fork-rebuild
+    /// ceiling regressed `ltp-msgstress01` from MATCH to TIMEOUT when two heavy
+    /// fork-storm suites shared the host at `--workers 8` (pure contention — no
+    /// HV_NO_RESOURCES and msgstress01 still MATCHes in isolation); 12 keeps the
+    /// increase to +2 to stay close to that proven-stable ceiling.
+    const CONSERVATIVE_GLOBAL_VM_CAP: usize = 12;
 
     fn global_permit_budget_from_mn(self, mn_budget: usize) -> Option<usize> {
         let mn_budget = mn_budget.max(1);
         match self {
-            Self::Initial | Self::SharedWaitResume => {
+            Self::Initial | Self::SharedWaitResume | Self::ForkRebuild { vfork: false } => {
                 Some(mn_budget.min(Self::CONSERVATIVE_GLOBAL_VM_CAP))
             }
-            Self::ForkRebuild { vfork: false } => Some(mn_budget),
             Self::ForkRebuild { vfork: true } | Self::ExecveRebuild => None,
         }
     }
@@ -1546,7 +1560,7 @@ fn create_vm_with_admission(
     TrapError,
 > {
     let permit = admission
-        .global_permit_budget_from_mn(vcpu_gate::budget())
+        .global_permit_budget_from_mn(vcpu_gate::hvf_cap_budget())
         .map(acquire_admission_permit);
     match virtual_machine_with_private_signals_blocked(config) {
         Ok(vm) => Ok((vm, permit)),
@@ -1580,10 +1594,13 @@ fn create_vm_with_admission(
 /// A separate file-lock permit caps one-vCPU HVF VMs across a fork tree: otherwise
 /// every fork child receives a fresh process-local scheduler and a plain LTP fork
 /// storm can create hundreds of live VMs until HVF returns `HV_NO_RESOURCES`.
-/// Plain fork rebuilds use this same physical-core budget so child processes can
-/// reach blocking syscalls. Initial VM creation and shared-wait resumes use a
-/// smaller cross-process gate: they are independent processes competing for host
-/// HVF resources, not threads sharing one M:N scheduler.
+/// That global creation permit is sized from the real HVF vCPU handle ceiling
+/// (`hvf_cap_budget()`), NOT physical core count, then clamped to
+/// `CONSERVATIVE_GLOBAL_VM_CAP` (12). Its ONLY job is bounding concurrent VM/vCPU
+/// CREATION in a fork storm's pre-block window; guest EXECUTION is already bounded
+/// by the per-process M:N scheduler and the Darwin kernel time-slicing host cores.
+/// Initial VM creation, plain fork rebuilds, and shared-wait resumes all pass
+/// through this same creation gate.
 ///
 /// Vfork rebuilds deliberately bypass that global permit. The vfork parent waits
 /// inside the fork handler itself until the child execs/exits, so admitting that
@@ -1619,7 +1636,7 @@ mod vcpu_gate {
         })
     }
 
-    fn hvf_cap_budget() -> usize {
+    pub(crate) fn hvf_cap_budget() -> usize {
         let mut max: u32 = 0;
         let rc = unsafe { applevisor_sys::hv_vm_get_max_vcpu_count(&mut max) };
         let cap = if rc == 0 && max > 0 {
@@ -5155,14 +5172,16 @@ mod vm_create_admission_tests {
 
     #[test]
     fn global_permit_budget_depends_on_admission_kind() {
+        // Below the conservative cap the source budget passes through unchanged
+        // for every gated class (source is now hvf_cap_budget, not phys cores).
         assert_eq!(
             VmCreateAdmission::Initial.global_permit_budget_from_mn(10),
-            Some(4)
+            Some(10)
         );
         assert_eq!(
             VmCreateAdmission::ForkRebuild { vfork: false }.global_permit_budget_from_mn(10),
             Some(10),
-            "plain fork uses the physical-core M:N budget"
+            "plain fork rebuilds are gated by the same creation cap"
         );
         assert_eq!(
             VmCreateAdmission::ForkRebuild { vfork: true }.global_permit_budget_from_mn(10),
@@ -5174,13 +5193,27 @@ mod vm_create_admission_tests {
         );
         assert_eq!(
             VmCreateAdmission::SharedWaitResume.global_permit_budget_from_mn(10),
-            Some(4),
-            "shared-wait resume drains parked processes through the conservative gate"
+            Some(10),
+            "shared-wait resume drains parked processes through the creation cap"
+        );
+        // A large source budget (real hvf_cap ~60) is clamped to the cap of 12
+        // for every gated class, so a fork storm creates at most 12 live VMs.
+        assert_eq!(
+            VmCreateAdmission::Initial.global_permit_budget_from_mn(60),
+            Some(12)
+        );
+        assert_eq!(
+            VmCreateAdmission::ForkRebuild { vfork: false }.global_permit_budget_from_mn(60),
+            Some(12)
+        );
+        assert_eq!(
+            VmCreateAdmission::SharedWaitResume.global_permit_budget_from_mn(60),
+            Some(12)
         );
         assert_eq!(
             VmCreateAdmission::Initial.global_permit_budget_from_mn(2),
             Some(2),
-            "small hosts keep their real M:N budget"
+            "a source budget below the cap passes through unchanged"
         );
     }
 
