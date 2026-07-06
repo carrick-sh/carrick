@@ -1190,6 +1190,13 @@ impl SyscallDispatcher {
         memory: &mut impl GuestMemory,
     ) -> Result<DispatchOutcome, DispatchError> {
         let path = read_guest_c_string(memory, pathname.0)?;
+        // An empty pathname is ENOENT (statfs has no AT_EMPTY_PATH form). glibc
+        // pathconf(path, _PC_LINK_MAX) validates the path via statfs, so
+        // statfs("") must fail rather than succeed and yield LINK_MAX
+        // (pathconf02 empty-string case).
+        if path.is_empty() {
+            return Ok(DispatchOutcome::errno(LINUX_ENOENT));
+        }
         let path = self.resolve_at_path(LINUX_AT_FDCWD, &path)?;
         // statfs(2) follows symlinks; a symlink CYCLE is ELOOP. resolve_at_path
         // doesn't cap symlink depth, so canonicalize here to surface a cycle as
@@ -4186,7 +4193,24 @@ impl SyscallDispatcher {
                 return Ok(hit);
             }
         }
-        let resolved = self.resolve_at_path_inner(dirfd, path)?;
+        let resolved = match self.resolve_at_path_inner(dirfd, path) {
+            Ok(resolved) => resolved,
+            Err(errno) => {
+                // Linux checks search (x) permission on EACH directory as it
+                // descends, so a no-search-permission prefix reports EACCES
+                // BEFORE a deeper ENOTDIR/ENOENT is discovered. carrick resolves
+                // the whole path as host-root first (finding the deeper error),
+                // so re-run the guest DAC search check on the input's directory
+                // prefix and let an EACCES there take precedence (pathconf02:
+                // abs_path = <mode-0 tmpdir>/testfile/testfile_1). No-op for root.
+                if (errno == LINUX_ENOTDIR || errno == LINUX_ENOENT)
+                    && let Some(abs) = self.absolute_input_path(dirfd, path)
+                {
+                    self.check_search_access(&abs)?;
+                }
+                return Err(errno);
+            }
+        };
         self.check_search_access(&resolved)?;
         if let Some(key) = cache_key {
             self.fs
@@ -4194,6 +4218,25 @@ impl SyscallDispatcher {
                 .put(key, resolved.clone(), gen_at_entry);
         }
         Ok(resolved)
+    }
+
+    /// The lexical absolute form of a guest input path (anchor + path, ".."
+    /// collapsed), WITHOUT existence/symlink resolution — used to run the DAC
+    /// search-permission walk on a path whose full resolution already failed.
+    /// `None` when the dirfd anchor can't be determined (not a directory fd).
+    fn absolute_input_path(&self, dirfd: u64, path: &str) -> Option<String> {
+        let dirfd = (dirfd as i32) as i64 as u64;
+        let anchor = if Path::new(path).is_absolute() {
+            "/".to_string()
+        } else if dirfd == LINUX_AT_FDCWD {
+            self.io.cwd.read().clone()
+        } else {
+            match &*self.open_file(dirfd as i32)?.description.read() {
+                OpenDescription::Directory { path: dir, .. } => dir.clone(),
+                _ => return None,
+            }
+        };
+        Some(join_rootfs_path(&anchor, path))
     }
 
     /// Linux DAC search-permission check: resolving a path requires search
