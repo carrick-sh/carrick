@@ -867,7 +867,7 @@ mod imp {
                     first_create_us = Some(create_us);
                 }
                 held_pids.push(pid);
-                if live % 8 == 0 || live <= 4 {
+                if live.is_multiple_of(8) || live <= 4 {
                     println!("live={live} last_create_us={create_us}");
                 }
             } else {
