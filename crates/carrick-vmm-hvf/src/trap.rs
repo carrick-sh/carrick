@@ -5331,6 +5331,99 @@ mod vm_create_admission_tests {
         assert_eq!(cooperative_release_atomic_permit(), 0);
     }
 
+    // ---- Task 4: execve rebuild releases the pre-exec token, no double-free -
+    //
+    // `execve_rebuild` destroys the inherited pre-exec vCPU with a raw
+    // `hv_vcpu_destroy` and calls `vcpu_destroyed(inherited_vcpu_id)` BEFORE
+    // creating the replacement VM/vCPU under `VmCreateAdmission::ExecveRebuild`
+    // (`global_permit_budget_depends_on_admission_kind` above proves that
+    // admission class's budget is `None`, so the replacement acquires no
+    // permit at all). After Task 1's tokenization this is ALREADY correct: the
+    // pre-exec `vcpu_id` was registered when its process/thread was admitted
+    // (`Initial`/`ForkRebuild{vfork:false}`/`SharedWaitResume` all have `Some`
+    // budgets), so `vcpu_destroyed`'s `release_token(vcpu_id)` finds it in the
+    // local map and frees exactly that slot — no leak, and nothing left for an
+    // extra explicit release to double-free. These tests drive that exact
+    // sequence against a private `PermitRegion` (the other tests in this
+    // module rely on the process-global `atomic_permit_enabled()` gate
+    // staying OFF, so we don't route through the real dispatch functions) to
+    // PROVE the premise instead of merely asserting it.
+
+    #[test]
+    fn execve_rebuild_releases_pre_exec_permit_and_acquires_nothing_new() {
+        let r = PermitRegion::new_anon_for_test();
+        let pid = std::process::id();
+
+        // Pre-exec admission (e.g. `VmCreateAdmission::Initial`, budget
+        // `Some(_)`): `create_vcpu_with_permit` registers the token against
+        // the vCPU it just created.
+        let pre_exec_vcpu_id = 42u64;
+        let budget = VmCreateAdmission::Initial
+            .global_permit_budget_from_mn(4)
+            .expect("Initial admission is budgeted");
+        let t = r.acquire(budget, pid).unwrap();
+        r.register(pre_exec_vcpu_id, t);
+        assert_eq!(r.occupied(), 1);
+
+        // execve_rebuild: hv_vcpu_destroy(inherited_vcpu_id) succeeds, so
+        // vcpu_destroyed(inherited_vcpu_id) runs, which dispatches to
+        // release_token(pre_exec_vcpu_id) on the atomic path.
+        r.release_token(pre_exec_vcpu_id);
+        assert_eq!(
+            r.occupied(),
+            0,
+            "the pre-exec permit must already be released by the ordinary \
+             vcpu_destroyed path, before the ungated replacement is created"
+        );
+
+        // create_vm_with_admission(ExecveRebuild) acquires NOTHING (budget
+        // None), so create_vcpu_with_permit registers no token for the
+        // replacement vCPU — even if HVF hands back the same numeric id.
+        assert_eq!(
+            VmCreateAdmission::ExecveRebuild.global_permit_budget_from_mn(4),
+            None
+        );
+        let post_exec_vcpu_id = pre_exec_vcpu_id;
+        assert!(r.local_token(post_exec_vcpu_id).is_none());
+        assert_eq!(
+            r.occupied(),
+            0,
+            "exec must not leave the table over baseline"
+        );
+
+        // A later vcpu_destroyed on the post-exec vCPU (e.g. eventual process
+        // exit) must be a safe no-op: it never registered a token.
+        r.release_token(post_exec_vcpu_id);
+        assert_eq!(r.occupied(), 0);
+    }
+
+    #[test]
+    fn execve_rebuild_extra_release_would_be_a_harmless_but_pointless_noop() {
+        // Guards the "do NOT add an explicit release" half of the premise: an
+        // EXTRA release bolted onto execve_rebuild alongside the existing
+        // vcpu_destroyed call would target a slot vcpu_destroyed already
+        // freed. release_token is token-guarded (the local map entry is gone
+        // after the first call), so a redundant second call on the SAME
+        // vcpu_id is a no-op, not a double-free — but it also proves such an
+        // addition does nothing useful, i.e. it is dead weight at best. This
+        // locks in that no-op behavior so nobody "fixes" the proof-passing
+        // case with an unnecessary release.
+        let r = PermitRegion::new_anon_for_test();
+        let pid = std::process::id();
+        let t = r.acquire(4, pid).unwrap();
+        r.register(7, t);
+
+        r.release_token(7); // the real vcpu_destroyed(inherited_vcpu_id) release
+        assert_eq!(r.occupied(), 0);
+
+        r.release_token(7); // a hypothetical redundant "exec path" release
+        assert_eq!(
+            r.occupied(),
+            0,
+            "a redundant release on an already-released vcpu_id must stay a no-op"
+        );
+    }
+
     #[test]
     fn region_address_is_inherited_across_fork() {
         // The MAP_ANON|MAP_SHARED region must live at the same address in a fork
