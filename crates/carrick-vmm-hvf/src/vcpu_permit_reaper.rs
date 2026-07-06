@@ -10,9 +10,19 @@
 //! This module recreates that property WITHOUT reintroducing an ownerless count.
 //! The root process (the supervisor) owns ONE `Kqueue` and watches every observed
 //! owner pid with a native `EVFILT_PROC | NOTE_EXIT` knote. On a watched owner's
-//! death it reclaims that owner's *generation-stamped* slots — the generation
-//! guard means a late event for a dead owner can never free a NEW slot held by a
-//! reused pid.
+//! death it reclaims that owner's *generation-stamped* slots. The generation
+//! guard alone is NOT sufficient, though: `kqueue` reports a `NOTE_EXIT` for a
+//! *pid*, not for a process *instance*, so it cannot distinguish "the owner we
+//! armed the watch for died" from "that pid was reused by a brand-new live
+//! process before we drained the edge". If owner `(pid, gen=5)` dies, its
+//! `NOTE_EXIT` is queued, and the host reuses `pid` for a fresh owner
+//! `(pid, gen=42)` before we drain the queue, `watched[pid]` legitimately holds
+//! `{5, 42}` — both generations are genuinely occupied slots, so the generation
+//! guard on `reclaim` cannot save `gen=42`. A raw `reclaim_pid(pid)` off that
+//! `NOTE_EXIT` would free BOTH, ripping the slot out from under the live
+//! reused-pid process. `wait_for_events` therefore re-checks liveness before
+//! trusting a delivered `NOTE_EXIT`; see [`Reaper::handle_note_exit`] for the
+//! gate and its bounded-leak tradeoff.
 //!
 //! `EVFILT_PROC` is the PRIMARY detector (not `kill(pid, 0)`, which cannot tell a
 //! live process from a zombie or a reused pid). Three races are closed explicitly:
@@ -108,6 +118,13 @@ struct Reaper<'a> {
     /// watch for. One `EVFILT_PROC` knote per pid (not per generation); a process
     /// with several vCPUs owns several slots (one generation each) but exits once.
     watched: HashMap<u32, HashSet<u32>>,
+    /// The "is `pid` truly dead" predicate the `NOTE_EXIT` reuse gate
+    /// (`handle_note_exit`) consults. `None` (the production default) means the
+    /// real `pid_confirmed_dead(pid) || pid_is_gone(pid)` — the same OR the
+    /// backstop uses. Tests override this because forcing the real OS to reuse
+    /// a specific pid deterministically is impractical; production code never
+    /// sets it.
+    liveness_override: Option<Box<dyn Fn(i32) -> bool + Send + Sync + 'a>>,
 }
 
 impl<'a> Reaper<'a> {
@@ -116,6 +133,36 @@ impl<'a> Reaper<'a> {
             kq: Kqueue::new_internal(),
             source,
             watched: HashMap::new(),
+            liveness_override: None,
+        }
+    }
+
+    /// Test-only constructor: same as `new`, but with the `NOTE_EXIT` reuse-gate
+    /// liveness check replaced by `is_dead`, so a pid-reuse race can be driven
+    /// deterministically without forking real processes into a real reused pid.
+    /// `kq` is deliberately `None` (not a real `Kqueue`): the test pids used
+    /// with this constructor are synthetic and do not name real processes, so a
+    /// real `EV_ADD` would itself spuriously fail (`ESRCH`) and reclaim through
+    /// `arm_watch`'s OWN death path, defeating the liveness-gate test.
+    #[cfg(test)]
+    fn new_with_liveness(
+        source: &'a dyn PermitReclaimSource,
+        is_dead: impl Fn(i32) -> bool + Send + Sync + 'a,
+    ) -> Self {
+        Self {
+            kq: None,
+            source,
+            watched: HashMap::new(),
+            liveness_override: Some(Box::new(is_dead)),
+        }
+    }
+
+    /// The `NOTE_EXIT` reuse-gate liveness check: real predicate unless a test
+    /// has injected an override (see `liveness_override`).
+    fn pid_confirmed_gone_for_reuse_gate(&self, pid: i32) -> bool {
+        match &self.liveness_override {
+            Some(is_dead) => is_dead(pid),
+            None => pid_confirmed_dead(pid) || pid_is_gone(pid),
         }
     }
 
@@ -166,8 +213,18 @@ impl<'a> Reaper<'a> {
     /// Reclaim every recorded generation-stamped slot owned by `pid`, then drop
     /// the (possibly still-armed) one-shot watch. Idempotent: a second call (a
     /// stale `NOTE_EXIT` after we already reclaimed, or a backstop double-fire)
-    /// finds nothing recorded and is a no-op, and `reclaim` itself is generation-
-    /// guarded so it can never free a reused pid's newer slot.
+    /// finds nothing recorded and is a no-op.
+    ///
+    /// CAUTION: this frees every generation recorded for `pid`, trusting that
+    /// the caller has already confirmed `pid` is actually gone (not merely that
+    /// *an* instance of it died). The generation guard on `reclaim` only bounds
+    /// *which* slots can be freed to what is recorded under `pid` — it does NOT
+    /// protect against a reused-live pid, because a reused pid's new generation
+    /// is itself a genuinely-recorded, genuinely-occupied slot. Callers: `backstop`
+    /// and `arm_watch`'s own post-register check call this only after proving
+    /// death directly (`pid_confirmed_dead` / `pid_is_gone` / register-`ESRCH`);
+    /// `wait_for_events` must NOT call this straight off a raw `NOTE_EXIT` — see
+    /// `handle_note_exit`.
     fn reclaim_pid(&mut self, pid: u32) {
         let Some(generations) = self.watched.remove(&pid) else {
             return;
@@ -181,11 +238,41 @@ impl<'a> Reaper<'a> {
     }
 
     /// Block up to `timeout` for one or more `EVFILT_PROC` events (the primary
-    /// death edge) and reclaim each exited owner. With no kqueue, just sleep the
-    /// interval and let the backstop do the work.
+    /// death edge) and handle each delivered `NOTE_EXIT`. With no kqueue, just
+    /// sleep the interval and let the backstop do the work.
     fn wait_for_events(&mut self, timeout: &libc::timespec) {
         for pid in self.poll_kqueue(timeout) {
+            self.handle_note_exit(pid);
+        }
+    }
+
+    /// Gate a delivered `NOTE_EXIT(pid)` with a liveness re-check before trusting
+    /// it enough to reclaim.
+    ///
+    /// `kqueue` names only the pid, never the process INSTANCE. If the original
+    /// watched owner already died and the host reused its pid before we drained
+    /// this edge, `watched[pid]` can legitimately hold a mix of the dead
+    /// original's stale generation(s) and a brand-new LIVE owner's generation —
+    /// both genuinely-occupied slots, so `reclaim`'s generation guard cannot tell
+    /// them apart. Freeing indiscriminately (the pre-fix behavior) would rip a
+    /// slot out from under the live reused-pid process.
+    ///
+    /// The confirmed-dead check (`pid_confirmed_dead(pid) || pid_is_gone(pid)`,
+    /// the same OR the backstop uses) is what makes this safe against BOTH
+    /// hazards at once: a same-instance zombie not yet reaped by the guest's own
+    /// `wait4` still reports `pid_confirmed_dead`, so the common case (no reuse)
+    /// reclaims immediately, exactly as before this gate existed; only a
+    /// genuinely reused, running pid reports neither, and THAT is what must not
+    /// be reclaimed. If the pid is still alive, this edge names a dead PREVIOUS
+    /// instance whose generation we can no longer single out — skip the reclaim
+    /// entirely (that dead generation's slot leaks, bounded until the reused pid
+    /// itself finally exits and is confirmed gone) and re-arm a fresh one-shot
+    /// watch so the CURRENT instance's eventual real exit is still caught.
+    fn handle_note_exit(&mut self, pid: u32) {
+        if self.pid_confirmed_gone_for_reuse_gate(pid as i32) {
             self.reclaim_pid(pid);
+        } else {
+            self.arm_watch(pid);
         }
     }
 
@@ -256,15 +343,21 @@ pub(crate) fn spawn_reaper(source: &'static dyn PermitReclaimSource) {
     if STARTED.swap(true, Ordering::SeqCst) {
         return;
     }
-    let _ = std::thread::Builder::new()
+    if let Err(err) = std::thread::Builder::new()
         .name("carrick-vcpu-permit-reaper".into())
-        .spawn(move || Reaper::new(source).run());
+        .spawn(move || Reaper::new(source).run())
+    {
+        // This supervisor is load-bearing: without it, a dead owner's slots are
+        // never reclaimed and admission eventually starves. A silently dropped
+        // spawn failure would make that degrade invisibly, so surface it.
+        eprintln!("carrick: vcpu-permit-reaper: failed to spawn supervisor thread: {err}");
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     /// In-test slot table: a plain `(pid, generation)` list standing in for the
@@ -388,6 +481,64 @@ mod tests {
         assert!(
             slots.is_empty(),
             "an exit-before-register child was stranded (readiness check failed)"
+        );
+    }
+
+    /// The pid-reuse conflation race this module's fix closes: `watched[pid]`
+    /// can legitimately hold TWO generations for the SAME pid — a dead original
+    /// owner (gen 5) and a brand-new LIVE owner that reused the pid before the
+    /// original's `NOTE_EXIT` drained (gen 42). Delivering that stale
+    /// `NOTE_EXIT` must NOT free the live generation's slot; it may only be
+    /// reclaimed once the pid is actually confirmed gone.
+    ///
+    /// Forcing the real OS to reuse one specific pid deterministically isn't
+    /// practical in a unit test, so this drives `handle_note_exit` directly
+    /// (simulating the delivered kqueue edge) with an injected liveness
+    /// predicate standing in for `pid_confirmed_dead || pid_is_gone`.
+    #[test]
+    fn note_exit_on_reused_pid_does_not_free_live_generation() {
+        let slots = TestSlots::new();
+        let pid = 100u32;
+        let stale_generation = 5u32; // the dead original owner
+        let live_generation = 42u32; // the live owner that reused `pid`
+        slots.insert(pid, stale_generation);
+        slots.insert(pid, live_generation);
+
+        let alive = Arc::new(AtomicBool::new(true));
+        let is_dead = {
+            let alive = Arc::clone(&alive);
+            move |_pid: i32| !alive.load(Ordering::SeqCst)
+        };
+        let mut reaper = Reaper::new_with_liveness(&slots, is_dead);
+        // Seed `watched` directly (bypassing register_new_owners/EVFILT_PROC,
+        // which are not under test here): both generations are recorded under
+        // the one pid, exactly as the real race leaves them.
+        reaper
+            .watched
+            .insert(pid, HashSet::from([stale_generation, live_generation]));
+
+        // Pre-fix behavior: a delivered NOTE_EXIT for `pid` frees every recorded
+        // generation, including the live one. With the liveness gate, the pid
+        // is still alive (reused) so nothing may be freed yet.
+        reaper.handle_note_exit(pid);
+        let remaining = slots.owner_slots();
+        assert_eq!(
+            remaining.len(),
+            2,
+            "a live reused pid's slots must survive a stale NOTE_EXIT, got {remaining:?}"
+        );
+        assert!(
+            remaining.contains(&(pid, live_generation)),
+            "the live generation's slot was wrongly freed: {remaining:?}"
+        );
+
+        // The reused pid itself now genuinely exits: only now may the (still
+        // only ever the current, live) generation be reclaimed.
+        alive.store(false, Ordering::SeqCst);
+        reaper.handle_note_exit(pid);
+        assert!(
+            slots.owner_slots().is_empty(),
+            "pid confirmed gone but its slots were not reclaimed"
         );
     }
 }
