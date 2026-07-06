@@ -4046,9 +4046,13 @@ impl FsBackend for HostFsBackend {
         // Open a real kernel fd for the materialised file (same approach as
         // `set_times`/`allocate`) and drive macOS `fsetxattr(2)` on it. The
         // attribute name is stored verbatim ("user.foo"), so a later
-        // list/get round-trips the exact Linux name.
+        // list/get round-trips the exact Linux name. A DIRECTORY can't be
+        // opened O_RDWR (EISDIR), so fall back to a read-only handle — xattr is
+        // metadata and macOS `fsetxattr` accepts an O_RDONLY dir fd (setxattr02
+        // case 01: `user.*` on a directory must succeed, not fail ENODATA).
         let host_fd = self
             .open_raw_fd(path, true, false, false)
+            .or_else(|| self.open_raw_fd(path, false, false, false))
             .ok_or(crate::linux_abi::LINUX_ENODATA)?;
         let cname = match std::ffi::CString::new(name) {
             Ok(c) => c,
@@ -4182,8 +4186,12 @@ impl FsBackend for HostFsBackend {
         if !is_guest_xattr_namespace(name) || is_internal_carrick_xattr(name) {
             return Err(crate::linux_abi::LINUX_ENODATA);
         }
+        // A directory can't be opened O_RDWR; fall back to a read-only handle so
+        // its xattrs can be removed too (setxattr02 removes the `user.*` key it
+        // set on a directory between iterations).
         let host_fd = self
             .open_raw_fd(path, true, false, false)
+            .or_else(|| self.open_raw_fd(path, false, false, false))
             .ok_or(crate::linux_abi::LINUX_ENODATA)?;
         let cname = match std::ffi::CString::new(name) {
             Ok(c) => c,
