@@ -531,8 +531,8 @@ fn path_is_under_or_equal(path: &str, root: &str) -> bool {
 }
 
 /// Host passthrough for tee(2). On Linux the guest pipes are real host kernel
-/// pipes, so the host tee(2) gives exact zero-consume semantics; on other hosts
-/// (macOS) there is no tee(2), so it stays ENOSYS as before.
+/// pipes, so the host tee(2) gives exact zero-consume semantics; on hosts
+/// without tee(2) (macOS/BSD) `SyscallDispatcher::userspace_tee` emulates it.
 #[cfg(target_os = "linux")]
 fn tee_host_passthrough(
     in_fd: HostFd,
@@ -553,16 +553,6 @@ fn tee_host_passthrough(
     Ok(DispatchOutcome::Returned {
         value: n.host_syscall_errno()? as i64,
     })
-}
-
-#[cfg(not(target_os = "linux"))]
-fn tee_host_passthrough(
-    _in_fd: HostFd,
-    _out_fd: HostFd,
-    _count: usize,
-    _flags: LinuxSpliceFlags,
-) -> Result<DispatchOutcome, DispatchError> {
-    Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ENOSYS))
 }
 
 /// Same-file identity used for F_SETLEASE conflict accounting (see
@@ -2647,6 +2637,194 @@ impl SyscallDispatcher {
             }
         }
         None
+    }
+
+    /// The host fd backing the WRITE end of the pipe object identified by
+    /// `pipe_id`, if one is currently open. Symmetric to
+    /// [`Self::host_pipe_read_end_for_pipe_id`]; the userspace `tee` uses it to
+    /// restore the source pipe after peeking its buffered bytes on hosts that
+    /// lack `tee(2)`.
+    fn host_pipe_write_end_for_pipe_id(&self, pipe_id: u64) -> Option<HostFd> {
+        if pipe_id == 0 {
+            return None;
+        }
+        let table = self.io.open_files.read();
+        for (_fd, other) in table.iter() {
+            let other_open = other.description.read();
+            if let OpenDescription::HostPipe {
+                host_fd,
+                is_read_end: false,
+                pipe_id: other_pipe_id,
+                ..
+            } = &*other_open
+                && *other_pipe_id == pipe_id
+            {
+                return Some(host_fd.view());
+            }
+        }
+        None
+    }
+
+    /// True iff `fd` refers to a genuine pipe end — an anonymous pipe, a FIFO,
+    /// or a pty — as opposed to a char device (e.g. `/dev/zero`, which carrick
+    /// also models as a `HostPipe`), a socket, or a regular file. splice(2)
+    /// requires at least one of its two fds to be a genuine pipe; a char-device
+    /// `HostPipe` must NOT satisfy that requirement (splice07).
+    fn is_genuine_pipe(&self, fd: i32) -> bool {
+        let Some(open_file) = self.open_file(fd) else {
+            return false;
+        };
+        match &*open_file.description.read() {
+            OpenDescription::PipeReader { .. } | OpenDescription::PipeWriter { .. } => true,
+            OpenDescription::HostPipe {
+                write_kind, pty, ..
+            } => pty.is_some() || *write_kind == HostWriteKind::PipeLike,
+            _ => false,
+        }
+    }
+
+    /// True iff `fd` is a splice/tee SOURCE that is not open for reading, so
+    /// splice(2) must reject it with EBADF: an `O_PATH` descriptor, a
+    /// write-only regular file, or the write end of a one-way pipe (splice03's
+    /// write-only case, splice07's `O_PATH`/pipe-write-end sources).
+    fn splice_source_not_readable(&self, fd: i32) -> bool {
+        if self.fd_is_o_path(fd) {
+            return true;
+        }
+        let Some(open_file) = self.open_file(fd) else {
+            return false;
+        };
+        let open = open_file.description.read();
+        match &*open {
+            OpenDescription::File { .. }
+            | OpenDescription::SyntheticFile { .. }
+            | OpenDescription::HostFile { .. } => {
+                open.status_flags() & LINUX_O_ACCMODE == LINUX_O_WRONLY
+            }
+            OpenDescription::PipeWriter { .. } => true,
+            OpenDescription::HostPipe {
+                is_read_end,
+                pty,
+                bidirectional,
+                ..
+            } => pty.is_none() && !*bidirectional && !*is_read_end,
+            _ => false,
+        }
+    }
+
+    /// tee(2): duplicate up to `count` bytes from the source pipe's read end to
+    /// the destination pipe's write end WITHOUT consuming the source. On a Linux
+    /// host the real `tee(2)` is exact; elsewhere (macOS/BSD lack `tee(2)`) fall
+    /// back to a userspace peek-and-copy.
+    fn host_tee(
+        &self,
+        in_read: HostFd,
+        in_pipe_id: u64,
+        out_write: HostFd,
+        count: usize,
+        flags: LinuxSpliceFlags,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        #[cfg(target_os = "linux")]
+        {
+            let _ = in_pipe_id;
+            tee_host_passthrough(in_read, out_write, count, flags)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.userspace_tee(in_read, in_pipe_id, out_write, count, flags)
+        }
+    }
+
+    /// Userspace `tee(2)` for hosts without the syscall: drain the source pipe's
+    /// currently-buffered bytes, write them back through the source's write end
+    /// to restore it (FIFO order is preserved because the pipe is momentarily
+    /// emptied first), then copy up to `count` of them into the destination
+    /// pipe. The restore runs before the copy so a short/failed destination
+    /// write still leaves the non-consumed source intact.
+    #[cfg(not(target_os = "linux"))]
+    fn userspace_tee(
+        &self,
+        in_read: HostFd,
+        in_pipe_id: u64,
+        out_write: HostFd,
+        count: usize,
+        flags: LinuxSpliceFlags,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let nonblock = flags.contains(LinuxSpliceFlags::NONBLOCK);
+        let avail = host_pipe_readable_bytes(in_read.get()).unwrap_or(0);
+        if avail == 0 {
+            // Nothing buffered: a non-blocking tee is EAGAIN; a blocking tee
+            // would wait for the writer, which this path does not park for under
+            // the dispatcher lock, so report 0 (empty/writer-closed) instead.
+            return Ok(if nonblock {
+                DispatchOutcome::errno(LINUX_EAGAIN)
+            } else {
+                DispatchOutcome::Returned { value: 0 }
+            });
+        }
+        // Drain the whole buffer so the writeback restores it in FIFO order.
+        let mut buf = vec![0u8; avail];
+        let n = unsafe {
+            libc::read(
+                in_read.get(),
+                buf.as_mut_ptr().cast::<libc::c_void>(),
+                avail,
+            )
+        };
+        let n = n.host_syscall_errno()?;
+        if n <= 0 {
+            return Ok(if nonblock {
+                DispatchOutcome::errno(LINUX_EAGAIN)
+            } else {
+                DispatchOutcome::Returned { value: 0 }
+            });
+        }
+        buf.truncate(n as usize);
+        // Restore the source: write the drained bytes back via its write end. The
+        // pipe was just emptied, so a non-blocking write of `n <= capacity`
+        // completes in full and preserves order. If no write end is open (the
+        // source's writer was closed) the source is consumed — a best-effort
+        // fallback; tee01 keeps the source write end open.
+        if let Some(write_fd) = self.host_pipe_write_end_for_pipe_id(in_pipe_id) {
+            let mut off = 0usize;
+            while off < buf.len() {
+                let w = unsafe {
+                    libc::write(
+                        write_fd.get(),
+                        buf[off..].as_ptr().cast::<libc::c_void>(),
+                        buf.len() - off,
+                    )
+                };
+                match w.host_syscall_errno() {
+                    Ok(c) if c > 0 => off += c as usize,
+                    _ => break,
+                }
+            }
+        }
+        // Copy up to `count` bytes into the destination pipe.
+        let copy_len = count.min(buf.len());
+        let mut written = 0usize;
+        while written < copy_len {
+            let w = unsafe {
+                libc::write(
+                    out_write.get(),
+                    buf[written..copy_len].as_ptr().cast::<libc::c_void>(),
+                    copy_len - written,
+                )
+            };
+            match w.host_syscall_errno() {
+                Ok(c) if c > 0 => written += c as usize,
+                // A full destination with nothing copied yet is EAGAIN under
+                // SPLICE_F_NONBLOCK; otherwise report whatever landed.
+                Err(e) if e == LINUX_EAGAIN && written == 0 && nonblock => {
+                    return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
+                }
+                _ => break,
+            }
+        }
+        Ok(DispatchOutcome::Returned {
+            value: written as i64,
+        })
     }
 
     fn host_pipe_splice_staging_target(&self, fd: i32) -> Option<(i32, usize)> {
@@ -8083,7 +8261,7 @@ impl SyscallDispatcher {
             if count == 0 {
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
-            tee_host_passthrough(in_fd, out_fd, count, splice_flags)
+            this.host_tee(in_fd, in_pipe, out_fd, count, splice_flags)
 
         }
 
@@ -8107,6 +8285,21 @@ impl SyscallDispatcher {
             // the dead fd and "spliced" 0 bytes (LTP splice03 badfd case).
             if in_fd.0 < 0 || (in_fd.0 > 2 && this.open_file(in_fd.0).is_none()) {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            }
+            // splice(2) reads from fd_in, so a source not open for reading — an
+            // O_PATH descriptor, a write-only file, or the write end of a pipe —
+            // is EBADF, decided ahead of the pipe-vs-pipe routing (splice03's
+            // write-only fd_in, splice07's O_PATH / pipe-write-end sources).
+            if this.splice_source_not_readable(in_fd.0) {
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            }
+            // splice(2) requires at least ONE end to be a genuine pipe; a
+            // char-device HostPipe (e.g. /dev/zero) does NOT count. When neither
+            // fd is a genuine pipe the call is EINVAL, resolved BEFORE any read so
+            // a char-device or socket source is never drained (splice07
+            // /dev/zero->file & socket->file/socket, splice03 file->file).
+            if !this.is_genuine_pipe(in_fd.0) && !this.is_genuine_pipe(out_fd.0) {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             if count == 0 {
                 return Ok(DispatchOutcome::Returned { value: 0 });
@@ -8198,7 +8391,17 @@ impl SyscallDispatcher {
                             libc::MSG_DONTWAIT,
                         )
                     };
-                    let n = n.host_syscall_errno()?;
+                    let n = match n.host_syscall_errno() {
+                        Ok(v) => v,
+                        // A socket that cannot serve as a splice source (an
+                        // unconnected socket → ENOTCONN, a non-spliceable family,
+                        // …) is EINVAL, not the raw host errno (splice07). EAGAIN
+                        // keeps its meaning for the non-blocking netpoller path.
+                        Err(e) if e == LINUX_EAGAIN => {
+                            return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
+                        }
+                        Err(_) => return Ok(DispatchOutcome::errno(LINUX_EINVAL)),
+                    };
                     if n == 0 {
                         return Ok(DispatchOutcome::Returned { value: 0 });
                     }
@@ -8232,7 +8435,18 @@ impl SyscallDispatcher {
                         libc::MSG_PEEK | libc::MSG_DONTWAIT,
                     )
                 };
-                let n = n.host_syscall_errno()?;
+                let n = match n.host_syscall_errno() {
+                    Ok(v) => v,
+                    // A socket that cannot serve as a splice source (an
+                    // unconnected socket → ENOTCONN, a non-spliceable family, …)
+                    // is EINVAL, not the raw host errno (splice07 socket-source
+                    // cases). EAGAIN keeps its meaning for the non-blocking Go
+                    // netpoller path.
+                    Err(e) if e == LINUX_EAGAIN => {
+                        return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
+                    }
+                    Err(_) => return Ok(DispatchOutcome::errno(LINUX_EINVAL)),
+                };
                 if n == 0 {
                     // EOF: the writer closed; splice reports 0 (Go stops the loop).
                     return Ok(DispatchOutcome::Returned { value: 0 });
