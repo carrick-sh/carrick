@@ -657,6 +657,13 @@ pub fn reinit_after_fork() {
     // so the child doesn't accidentally reuse the parent's timer IDs without
     // a backing thread.
     crate::posix_timer::clear();
+    // Interval timers (setitimer/alarm) are NOT inherited across fork on Linux
+    // (POSIX: a fork child starts with all timers cleared). The neutral
+    // itimer-core slot state is copied by libc::fork; without this clear the
+    // child's re-spawned signal pump reconcile loop (vcpu_kick.rs) re-registers
+    // the inherited armed EVFILT_TIMER and the child wrongly receives the
+    // parent's SIGALRM (LTP alarm07). Mirrors the KVM reinit_after_fork.
+    crate::itimer::clear();
     // The child is single-threaded (fork copies only the calling thread); any
     // sibling-directed pending entries inherited from the parent are stale.
     clear_thread_pending();
