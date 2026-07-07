@@ -303,6 +303,7 @@ mod tests {
 
     #[test]
     fn direct_shared_futex_location_does_not_expose_waiter_counter() {
+        let _guard = crate::thread::current_futex_table_test_guard();
         let futex = FutexTableFutex::new(Arc::new(FutexTable::default()), RecordingShared);
         let location = SharedFutexLocation::Direct {
             word: HostVa(0x1000),
@@ -351,6 +352,7 @@ mod tests {
 
     #[test]
     fn shared_wait_publishes_after_waiter_enrollment() {
+        let _guard = crate::thread::current_futex_table_test_guard();
         let state = Arc::new(AtomicUsize::new(0));
         let futex = FutexTableFutex::new(
             Arc::new(FutexTable::default()),
