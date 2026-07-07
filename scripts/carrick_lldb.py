@@ -342,6 +342,7 @@ _EVENTRING_KINDS = {
     11: ("ACCEPTER", lambda a, b, c: f"listener_hfd={a} accepted_hfd={b} errno={c}"),
     12: ("EPWFD", lambda a, b, c: f"fd={a} events={b:#x} timeout={c}"),
     13: ("EPMASK", lambda a, b, c: f"origin={a} raw={b:#x} last={c:#x}"),
+    14: ("EPMASKFD", lambda a, b, c: f"origin={a} gfd={b} hfd={c}"),
 }
 
 
