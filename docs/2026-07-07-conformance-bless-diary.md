@@ -1149,3 +1149,70 @@ clean conformance bless. The next bless-oriented milestone is to remove or
 honestly classify the futex requeue regression, then drive the pathological
 timing list down far enough that the new baseline does not bless order-of-
 magnitude slowdowns as if they were healthy.
+
+## 2026-07-07 08:19 - marked futex requeue report-only and reran full bless
+
+Change:
+
+- Added `ltp-futex_cmp_requeue01` to the generated exact `known_gaps` list as
+  `summary`, with the mechanism gap documented in
+  `crates/carrick-conformance/src/generate.rs`.
+- Regenerated `scripts/conformance/suites.toml`.
+- Committed the classification and diary checkpoint as
+  `5c686605 test(conformance): mark futex requeue as known gap`.
+
+Verification:
+
+- `cargo test -p carrick-conformance committed_suites_carry_oracle_fidelity_flags_and_gaps`
+  passed.
+- `cargo test -p carrick-conformance known_gap` passed.
+- `just build` rebuilt and re-signed the runtime.
+- Focused signed row
+  `target/conformance/futex-requeue-known-gap-signed-080437.jsonl` matched:
+  Carrick `7/7`, Docker `7/7`.
+- `just fmt-check` passed.
+
+Fresh bless attempt:
+
+`target/conformance/bless-after-futex-known-gap-080517.jsonl` stopped at the
+fail-fast threshold with:
+
+- 1181 written rows.
+- 51 gating regressions.
+- 10 `NEW` rows.
+- 42 report-only `DIFF` rows.
+- 10 rows at or above the 10x oracle-time threshold.
+
+Key rows:
+
+- `ltp-futex_cmp_requeue01` matched this time: Carrick `7/7`, Docker `7/7`,
+  `9.9x`. The known-gap marker remains useful because the earlier full bless
+  proved the high-fanout case is load-sensitive and not correctly modeled.
+- `ltp-fcntl36` and `ltp-fcntl36_64` still matched at `1.10x` and `1.06x`.
+- New semantic regressions surfaced before fail-fast: `ltp-futex_wait05`,
+  `ltp-msgsnd06`, and `ltp-process_vm01`, in addition to the older xattr,
+  kcmp, memory-locking, socket/sendfile, setns, and identity/namespace rows.
+
+Pathological timing remains:
+
+- `ltp-rt_sigqueueinfo02` `67.28x`, non-gating `NEW`.
+- `ltp-epoll-ltp` `36.15x`, semantic match.
+- `ltp-creat05` `23.95x`, semantic match.
+- `ltp-flock07` `19.52x`, non-gating `NEW`.
+- `ltp-link05` `11.41x`, semantic match.
+- `ltp-ptrace05` `11.36x`, semantic match.
+- `ltp-fcntl14` `11.00x`, semantic match.
+- `ltp-openat03` `10.86x`, semantic match.
+- `ltp-fork09` `10.50x`, semantic match.
+- `ltp-fcntl14_64` `10.45x`, semantic match.
+
+Outcome:
+
+The bless is still not close enough to accept. The futex requeue row is now
+honestly classified for the known missing mechanism and is no longer the active
+stopper, but the run still reaches 51 gating regressions before completing the
+full suite. The next high-leverage work should prioritize a small cluster that
+removes multiple gates without blessing false passes: xattr/listxattr policy,
+setns/sendfile/socket skips, or the newly surfaced `futex_wait05` regression.
+Separately, the epoll/creat/flock timing outliers need first-principles
+investigation before any final bless.
