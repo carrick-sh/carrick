@@ -1673,3 +1673,65 @@ Verification:
   passed with MATCH `317/317`, confirming the fork row is same-binary
   load-sensitive in this measurement campaign rather than a stable process
   section regression.
+
+## 2026-07-07 19:xx - arena/B6 landing review: four findings fixed
+
+An adversarial review of the arena migration series (ccc84c00..f6e4a97c)
+confirmed the landing's strengths (honest ledger, real TDD, sound E1
+refutation) and found four defects, all now fixed red-first:
+
+1. `wait4(-1)` park watched only the FIRST direct child (af3292c3).
+   B6 substituted `direct_children_for_wait(..).next()` for the `-1` park
+   pid, routing wait-any into the single-pid `wait_proc_exit_kqueue`, whose
+   50ms backstop re-polls only the watched pid — a sibling's exit never woke
+   the parent (Linux returns the exited sibling immediately; a long-lived
+   first child made it a hang). This matches the waitpid08/waitpid10/
+   multiprocessing_fork churn shape in the B7 full runs. `wait_any_park_pid`
+   now keeps `-1` (the per-child-watch any path) whenever a direct child
+   exists, parks on a concrete adopted pid only with no direct children, and
+   returns ECHILD only with neither.
+2. `PENDING_CHILD_RECORD` clobber window (6950cb63). The parent published
+   the pre-fork child record via the process-global stash AFTER `end_fork()`
+   released fork serialization — a second thread's prepare could overwrite
+   the stash and get OUR child pid stamped into ITS record (crossed
+   ns-pids). Parents now publish by the `ProcessRecordRef` their own prepare
+   returned; the stash-based parent publish is deleted; the stash remains
+   only the fork child's channel (its memory snapshot is taken inside the
+   serialized window).
+3. Run-state records duplicated + leaked (85026e08). The B3 migration
+   claimed a SEPARATE arena record for run-state publication even when the
+   process's metadata record existed — one orphan per distinct child pid
+   (unreleasable; a 4096-record section aborts mid-storm) and
+   order-dependent same-pid lookups. `claim_record` now adopts the existing
+   published process record (one record per process, released by the normal
+   terminal reap); the fork child publishes its host pid BEFORE seeding
+   Booting so adoption sees it.
+4. Member-record reuse kept stale wait state (c71e45f4). `fill_member`
+   left `exit_ready`/`guest_ns`/`subreaper_pid`/`ptrace_stop_signal`/
+   `FLAG_ADOPTED` from a recycled pid's previous occupant — a stale
+   adopted+exit_ready pair made a new live member spuriously reapable.
+
+Plan-debt also cleared: the skipped B6 fork-storm test now exists
+(f085211e: 200 real fork children + concurrent scanner assert no
+published-incomplete record, records reused not leaked), and B6 step 4's
+skipped deletion landed (b98ddd90: register_child/register_child_with_parent/
+register_clone_parent_child/await_self_registration removed — no production
+callers since pre-fork registration; parity tests rewritten to the new
+complete-at-publish invariant).
+
+Verification: carrick-kernel 17 lib + 2 prefork integration tests,
+carrick-host 38, carrick-runtime 532, carrick-vmm-hvf 81 (3x; one isolated
+cross-test wait4(-1) parallel-race flake observed once, solo-green),
+signed build, focused rows all MATCH — ltp-waitpid06/08/10, ltp-getpid01
+(100/100), ltp-ptrace06 (48/48, 3x), ltp-clone08, ltp-kill10,
+ltp-mq_timedreceive01 (30/30), cpython-multiprocessing_fork (317/317);
+go-os remains the known non-gating DIFF. Evidence:
+target/conformance/findings-fix-rows{,-rerun2,-rerun3}.jsonl and
+target/conformance/findings-fix-churn-rows.jsonl.
+
+Remaining (tracked, not fixed here): never-waited children still leak one
+process record each (release happens only on terminal reap) and section
+exhaustion still aborts rather than degrading to a Linux-shaped fork EAGAIN;
+plus the supervisor watch-rearm gap for a recycled pid reusing a released
+slot index. Handed off as a follow-up task (supervisor sweep + EAGAIN
+degrade), per the spec's death-sweep design.
