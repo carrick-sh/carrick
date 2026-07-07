@@ -1127,6 +1127,19 @@ pub enum DispatchOutcome {
     /// then waits on that fd.
     Fork {
         pidfd_out: Option<u64>,
+        /// `CLONE_PARENT`: the child is guest-parented to the caller's parent,
+        /// even though Carrick must still create it as a host child of the
+        /// caller. Runtime fork code records that guest parent in fork-coherent
+        /// shared state.
+        clone_parent: bool,
+        /// `CLONE_PARENT_SETTID`: write the child's guest-visible pid/tid to
+        /// this `pid_t *` before returning to the caller. Linux makes the store
+        /// visible in the child as well for CLONE_VM; Carrick's process fork is
+        /// CoW, so runtime fork code mirrors the write into both branches.
+        parent_tid_addr: Option<u64>,
+        /// `CLONE_CHILD_SETTID`: write the child's guest-visible pid/tid to
+        /// this child-memory `pid_t *` before the child returns from clone.
+        child_tid_addr: Option<u64>,
         /// Guest-requested exit signal (low byte of clone flags / clone3
         /// `exit_signal`). Delivered to the parent on child exit instead of a
         /// hardcoded SIGCHLD. `0` means "no exit signal" (e.g. `clone(0)`).
@@ -1215,11 +1228,12 @@ pub enum DispatchOutcome {
     /// Thread-creating `clone(2)`/`clone3(2)` (CLONE_VM|CLONE_THREAD|...).
     /// The runtime spawns a new host thread + vCPU sharing this process's VM.
     CloneThread {
-        stack: u64, // child SP (clone arg)
-        tls: u64,   // CLONE_SETTLS value -> TPIDR_EL0 (0 = none)
+        stack: u64,       // child SP (clone arg)
+        tls: Option<u64>, // CLONE_SETTLS value -> TPIDR_EL0
         flags: u64,
-        parent_tid_addr: u64, // CLONE_PARENT_SETTID target (0 = none)
-        child_tid_addr: u64,  // CLONE_CHILD_SETTID/CLEARTID target (0 = none)
+        parent_tid_addr: u64,      // CLONE_PARENT_SETTID target (0 = none)
+        child_tid_addr: u64,       // CLONE_CHILD_SETTID target (0 = none)
+        clear_child_tid_addr: u64, // CLONE_CHILD_CLEARTID target (0 = none)
     },
     /// A single thread exited via `exit(2)` (NOT exit_group): the runtime
     /// performs the CLONE_CHILD_CLEARTID futex wake and ends just this host
@@ -6110,6 +6124,8 @@ mod overlay_dispatch_tests {
     const SYS_READ: u64 = 63;
     const SYS_WRITE: u64 = 64;
     const SYS_NEWFSTATAT: u64 = 79;
+    const SYS_CLONE: u64 = 220;
+    const SYS_CLONE3: u64 = 435;
     const SYS_MKDIRAT: u64 = 34;
     const SYS_UNLINKAT: u64 = 35;
     const SYS_RENAMEAT: u64 = 38;
@@ -7704,6 +7720,99 @@ mod overlay_dispatch_tests {
             ),
             Err(LINUX_EFAULT)
         );
+    }
+
+    #[test]
+    fn clone_thread_requires_thread_bit_not_pthread_superset() {
+        let mut h = Harness::new();
+        let flags = LinuxCloneFlags::VM.bits()
+            | LinuxCloneFlags::SIGHAND.bits()
+            | LinuxCloneFlags::THREAD.bits()
+            | LinuxCloneFlags::CHILD_CLEARTID.bits()
+            | u64::from(crate::linux_abi::LINUX_SIGCHLD as u32);
+        let child_tid = h.reserve(4);
+
+        let outcome = h.call(SYS_CLONE, [flags, MEM_BASE + 0x800, 0, 0, child_tid, 0]);
+
+        assert!(matches!(
+            outcome,
+            DispatchOutcome::CloneThread {
+                child_tid_addr,
+                clear_child_tid_addr,
+                tls: None,
+                parent_tid_addr: 0,
+                ..
+            } if child_tid_addr == 0 && clear_child_tid_addr == child_tid
+        ));
+    }
+
+    #[test]
+    fn clone_preserves_parent_and_tid_pointer_semantics_for_fork_path() {
+        let mut h = Harness::new();
+        let parent_tid = h.reserve(4);
+        let child_tid = h.reserve(4);
+        let flags = LinuxCloneFlags::PARENT.bits()
+            | LinuxCloneFlags::PARENT_SETTID.bits()
+            | LinuxCloneFlags::CHILD_SETTID.bits()
+            | u64::from(crate::linux_abi::LINUX_SIGCHLD as u32);
+
+        let outcome = h.call(SYS_CLONE, [flags, 0, parent_tid, 0, child_tid, 0]);
+
+        assert!(matches!(
+            outcome,
+            DispatchOutcome::Fork {
+                clone_parent: true,
+                parent_tid_addr: Some(p),
+                child_tid_addr: Some(c),
+                ..
+            } if p == parent_tid && c == child_tid
+        ));
+    }
+
+    #[test]
+    fn clone3_preserves_parent_and_tid_pointer_semantics_for_fork_path() {
+        let mut h = Harness::new();
+        let args_addr = h.reserve(<LinuxCloneArgs as KernelAbi>::ABI_SIZE);
+        let parent_tid = h.reserve(4);
+        let child_tid = h.reserve(4);
+        let args = LinuxCloneArgs {
+            flags: LinuxCloneFlags::PARENT.bits()
+                | LinuxCloneFlags::PARENT_SETTID.bits()
+                | LinuxCloneFlags::CHILD_SETTID.bits(),
+            pidfd: 0,
+            child_tid,
+            parent_tid,
+            exit_signal: u64::from(crate::linux_abi::LINUX_SIGCHLD as u32),
+            stack: 0,
+            stack_size: 0,
+            tls: 0,
+            set_tid: 0,
+            set_tid_size: 0,
+            cgroup: 0,
+        };
+        h.memory.write_bytes(args_addr, args.abi_bytes()).unwrap();
+
+        let outcome = h.call(
+            SYS_CLONE3,
+            [
+                args_addr,
+                <LinuxCloneArgs as KernelAbi>::ABI_SIZE as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+        );
+
+        assert!(matches!(
+            outcome,
+            DispatchOutcome::Fork {
+                clone_parent: true,
+                parent_tid_addr: Some(p),
+                child_tid_addr: Some(c),
+                ..
+            } if p == parent_tid && c == child_tid
+        ));
     }
 
     const AT_FDCWD: u64 = (-100i64) as u64;

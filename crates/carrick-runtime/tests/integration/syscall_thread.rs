@@ -7,10 +7,11 @@ use support::*;
 fn clone_thread_variant_exists() {
     let o = DispatchOutcome::CloneThread {
         stack: 0x7000,
-        tls: 0x9000,
+        tls: Some(0x9000),
         flags: 0x3d0f00,
         parent_tid_addr: 0,
         child_tid_addr: 0,
+        clear_child_tid_addr: 0,
     };
     assert!(matches!(o, DispatchOutcome::CloneThread { .. }));
 }
@@ -43,10 +44,11 @@ fn clone_with_pthread_flags_emits_clone_thread() {
         outcome,
         DispatchOutcome::CloneThread {
             stack: 0x7000,
-            tls: 0x9000,
+            tls: Some(0x9000),
             flags,
             parent_tid_addr: 0x100,
-            child_tid_addr: 0x200,
+            child_tid_addr: 0,
+            clear_child_tid_addr: 0x200,
         }
     );
 }
@@ -70,6 +72,9 @@ fn clone_fork_flags_still_fork() {
         outcome,
         DispatchOutcome::Fork {
             pidfd_out: None,
+            clone_parent: false,
+            parent_tid_addr: None,
+            child_tid_addr: Some(0),
             exit_signal: 0x11,
             // NULL stack → the child keeps the parent's SP.
             child_stack: 0,

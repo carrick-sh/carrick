@@ -3292,6 +3292,7 @@ pub const LINUX_CLONE_SIGHAND: u64 = 0x0000_0800;
 /// `_exit`s. Go `os/exec` / glibc `posix_spawn` use `CLONE_VM|CLONE_VFORK[|CLONE_PIDFD]`.
 /// Deliberately NOT part of `THREAD_MASK`.
 pub const LINUX_CLONE_VFORK: u64 = 0x0000_4000;
+pub const LINUX_CLONE_PARENT: u64 = 0x0000_8000;
 pub const LINUX_CLONE_THREAD: u64 = 0x0001_0000;
 pub const LINUX_CLONE_SETTLS: u64 = 0x0008_0000;
 pub const LINUX_CLONE_PARENT_SETTID: u64 = 0x0010_0000;
@@ -3410,6 +3411,7 @@ bitflags! {
         /// execve/_exit. Not in `THREAD_MASK` (a vfork child is a process, not a
         /// thread). See [`LINUX_CLONE_VFORK`].
         const VFORK = LINUX_CLONE_VFORK;
+        const PARENT = LINUX_CLONE_PARENT;
         const THREAD = LINUX_CLONE_THREAD;
         const SETTLS = LINUX_CLONE_SETTLS;
         const PARENT_SETTID = LINUX_CLONE_PARENT_SETTID;

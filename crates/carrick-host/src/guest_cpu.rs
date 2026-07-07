@@ -254,12 +254,27 @@ pub fn register_child(pid: u32) {
 
 /// Register a live child with enough ancestry to model child-subreaper adoption.
 pub fn register_child_with_parent(pid: u32, parent_pid: u32, subreaper_pid: u32) {
+    register_child_slot(pid, parent_pid, subreaper_pid, false);
+}
+
+/// Register a child whose guest-visible parent is not its host parent.
+///
+/// `CLONE_PARENT` makes the new child a sibling of the caller in Linux's process
+/// tree. Carrick still has to create it with host `fork(2)`, so the host parent
+/// is the caller; mark the slot adopted immediately so guest `getppid()` and
+/// parent-side `wait4()` consult this table instead of the host tree.
+pub fn register_clone_parent_child(pid: u32, parent_pid: u32, subreaper_pid: u32) {
+    register_child_slot(pid, parent_pid, subreaper_pid, parent_pid != 0);
+}
+
+fn register_child_slot(pid: u32, parent_pid: u32, subreaper_pid: u32, adopted: bool) {
     let Some(slots) = child_slots() else { return };
     for slot in slots {
         if slot.pid.load(Ordering::Acquire) == pid as u64 {
             slot.parent_pid.store(parent_pid as u64, Ordering::Release);
             slot.subreaper_pid
                 .store(subreaper_pid as u64, Ordering::Release);
+            slot.adopted.store(u64::from(adopted), Ordering::Release);
             slot.ptrace_stop_signal.store(0, Ordering::Release);
             return;
         }
@@ -273,7 +288,7 @@ pub fn register_child_with_parent(pid: u32, parent_pid: u32, subreaper_pid: u32)
             slot.parent_pid.store(parent_pid as u64, Ordering::Release);
             slot.subreaper_pid
                 .store(subreaper_pid as u64, Ordering::Release);
-            slot.adopted.store(0, Ordering::Release);
+            slot.adopted.store(u64::from(adopted), Ordering::Release);
             slot.guest_ns.store(0, Ordering::Relaxed);
             slot.exit_status.store(0, Ordering::Relaxed);
             slot.exit_ready.store(0, Ordering::Release);
@@ -570,5 +585,25 @@ mod tests {
         assert!(!child_has_ptrace_stop_pending(pid));
         assert_eq!(reap_child_guest_ns(pid), 1234);
         assert!(!child_has_ptrace_stop_pending(pid));
+    }
+
+    #[test]
+    fn clone_parent_registration_is_adopted_immediately() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        init_child_table();
+        let child = 525_252;
+        let parent = 424_242;
+
+        let _ = reap_child_guest_ns(child);
+        register_clone_parent_child(child, parent, 0);
+
+        assert_eq!(adopted_parent_for(child), Some(parent));
+        assert_eq!(pending_adopted_child(parent, child as i32), Some(child));
+
+        record_child_exit_status(child, 9876, 0x2a00, true);
+        assert_eq!(
+            reap_adopted_child(parent, child as i32),
+            Some((child, 0x2a00, 9876))
+        );
     }
 }

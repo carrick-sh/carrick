@@ -985,6 +985,9 @@ where
             }
             DispatchOutcome::Fork {
                 pidfd_out,
+                clone_parent,
+                parent_tid_addr,
+                child_tid_addr,
                 exit_signal,
                 child_stack: _,
                 vfork,
@@ -1001,11 +1004,24 @@ where
                 let retval: i64 = match outcome {
                     crate::trap::ForkOutcome::Parent { child_pid } => {
                         crate::event_ring::rec(crate::event_ring::FORK, child_pid, 0, 0);
-                        crate::guest_cpu::register_child_with_parent(
-                            child_pid as u32,
-                            std::process::id(),
-                            dispatcher.subreaper_for_fork_child(),
-                        );
+                        let child_parent = if clone_parent {
+                            dispatcher.clone_parent_host_pid()
+                        } else {
+                            std::process::id()
+                        };
+                        if clone_parent {
+                            crate::guest_cpu::register_clone_parent_child(
+                                child_pid as u32,
+                                child_parent,
+                                dispatcher.subreaper_for_fork_child(),
+                            );
+                        } else {
+                            crate::guest_cpu::register_child_with_parent(
+                                child_pid as u32,
+                                std::process::id(),
+                                dispatcher.subreaper_for_fork_child(),
+                            );
+                        }
                         // Watch the child's exit (EVFILT_PROC/NOTE_EXIT) so the
                         // signal pump delivers the requested exit signal to this
                         // (parent) tid when it exits — without a host SIGCHLD
@@ -1024,10 +1040,15 @@ where
                         // the mapping (we are its ns-parent), then return the
                         // ns-pid — not the host pid — as the fork retval (§5.3).
                         // Identity when namespaces are off.
-                        i64::from(crate::namespace::pid::register_child(
+                        let retval = i64::from(crate::namespace::pid::register_child(
                             child_pid as u32,
-                            std::process::id(),
-                        ))
+                            child_parent,
+                        ));
+                        if let Some(addr) = parent_tid_addr {
+                            let tid = (retval as i32).to_le_bytes();
+                            let _ = runtime.write_bytes(addr, &tid);
+                        }
+                        retval
                     }
                     crate::trap::ForkOutcome::Child => {
                         dispatcher.clear_output_buffers();
@@ -1051,6 +1072,14 @@ where
                         // Re-stamp the identity page: the child's pid changed
                         // (ns-pid now registered), so a fast-path getpid is right.
                         stamp_identity_page(runtime, &dispatcher);
+                        if let Some(addr) = parent_tid_addr {
+                            let tid = (crate::namespace::pid::self_ns_pid() as i32).to_le_bytes();
+                            let _ = runtime.write_bytes(addr, &tid);
+                        }
+                        if let Some(addr) = child_tid_addr {
+                            let tid = (crate::namespace::pid::self_ns_pid() as i32).to_le_bytes();
+                            let _ = runtime.write_bytes(addr, &tid);
+                        }
                         dispatcher.proc_after_fork_child();
                         dispatcher.mem_after_fork_child();
                         dispatcher.sysv_after_fork_child();
