@@ -877,6 +877,17 @@ fn fill_member(record: &ProcessRecord, ns_pid: u32, parent_host_pid: u32) {
         .store(parent_host_pid, Ordering::Relaxed);
     record.exec_generation.store(0, Ordering::Relaxed);
     record.exit_status.store(0, Ordering::Relaxed);
+    // A reused record (recycled host pid) may carry the PREVIOUS process's
+    // wait state; a stale adopted+exit_ready pair would make the new live
+    // member spuriously reapable, and stale ptrace/subreaper links would
+    // corrupt wait routing. Clear every wait-visible field.
+    record.exit_ready.store(0, Ordering::Relaxed);
+    record.guest_ns.store(0, Ordering::Relaxed);
+    record.subreaper_pid.store(0, Ordering::Relaxed);
+    record.ptrace_stop_signal.store(0, Ordering::Relaxed);
+    record
+        .flags
+        .fetch_and(!carrick_kernel::process::FLAG_ADOPTED, Ordering::AcqRel);
     record.flags.fetch_or(MEMBER_ALIVE, Ordering::AcqRel);
     record.flags.fetch_and(!MEMBER_ORPHANED, Ordering::AcqRel);
     record.flags.fetch_and(!MEMBER_DEAD, Ordering::AcqRel);
@@ -927,6 +938,44 @@ mod tests {
     // the signed build. They are gated to run serially via a fresh region per
     // test would be ideal, but the region is a process-global; so each test
     // uses the global region after init and asserts on its own pids.
+
+    #[test]
+    fn fill_member_resets_stale_wait_state_on_reuse() {
+        // A recycled host pid can reuse a record that still carries the OLD
+        // process's wait state; a stale adopted+exit_ready pair would make the
+        // new live member spuriously reapable. fill_member must clear every
+        // wait-visible field, not just lifecycle flags.
+        let region = test_region();
+        let section = region.section;
+        let pid = 0x51F1_0001u32;
+        let generation = ProcessGeneration::new(41);
+        let r = match section.claim(Some(HostPid::new(pid)), generation, |record| {
+            record.subreaper_pid.store(999, Ordering::Relaxed);
+            record.ptrace_stop_signal.store(19, Ordering::Relaxed);
+            record.exit_ready.store(1, Ordering::Relaxed);
+            record.guest_ns.store(123_456, Ordering::Relaxed);
+            record
+                .flags
+                .store(carrick_kernel::process::FLAG_ADOPTED, Ordering::Relaxed);
+        }) {
+            Ok(r) => r,
+            Err(err) => unreachable!("claim: {err:?}"),
+        };
+        let record = &section.records[r.index];
+
+        fill_member(record, 42, 1);
+
+        assert_eq!(record.exit_ready.load(Ordering::Acquire), 0);
+        assert_eq!(record.guest_ns.load(Ordering::Acquire), 0);
+        assert_eq!(record.subreaper_pid.load(Ordering::Acquire), 0);
+        assert_eq!(record.ptrace_stop_signal.load(Ordering::Acquire), 0);
+        assert_eq!(
+            record.flags.load(Ordering::Acquire) & carrick_kernel::process::FLAG_ADOPTED,
+            0,
+            "stale ADOPTED flag must not survive member reuse"
+        );
+        section.release(r);
+    }
 
     fn test_region() -> NsSharedRegion {
         let arena = Box::leak(Box::new(KernelArena::create().unwrap()));
