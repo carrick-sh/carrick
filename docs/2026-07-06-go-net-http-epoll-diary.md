@@ -971,6 +971,7 @@ Tests:
 
 Outcome:
 
+- Marked `ltp-acct01` and `ltp-bind06` with `known_gaps = ["summary"]`.
 - Added resolver support for `io.chroot_root` on absolute paths, including the
   resolve-cache key so pre- and post-chroot absolute lookups cannot alias.
 - Added a final-directory search-permission check for `chroot` before the
