@@ -261,7 +261,10 @@ impl X86Vmm for KvmVmm {
     fn shared_futex_location(&self, gpa: Gpa, len: usize) -> Option<SharedFutexLocation> {
         self.ram
             .shared_futex_host_addr(gpa.raw(), len)
-            .map(|word| SharedFutexLocation::Direct { word: HostVa(word) })
+            .map(|word| SharedFutexLocation::Direct {
+                word: HostVa(word),
+                waiter_key: word,
+            })
     }
 
     fn protect_range(&mut self, address: u64, len: usize, prot: u64) -> Result<(), MemoryError> {

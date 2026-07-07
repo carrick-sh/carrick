@@ -231,6 +231,7 @@ impl<S: SharedFutexSyscall> PlatformFutex for FutexTableFutex<S> {
             };
             location = SharedFutexLocation::Direct {
                 word: HostVa(next_host),
+                waiter_key: next_key,
             };
             waiter_key = next_key;
             value = next_value;
@@ -302,6 +303,7 @@ mod tests {
         let futex = FutexTableFutex::new(Arc::new(FutexTable::default()), RecordingShared);
         let location = SharedFutexLocation::Direct {
             word: HostVa(0x1000),
+            waiter_key: 0x1000,
         };
 
         assert_eq!(futex.shared_wait(location, 0x2000, 7, None, &|| false), 0);

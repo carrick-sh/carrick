@@ -176,29 +176,46 @@ impl HostVa {
 /// explicit waiter-counter address, if the host futex primitive needs one.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
 pub enum SharedFutexLocation {
-    Direct { word: HostVa },
-    Mirror { word: HostVa, waiter_count: HostVa },
+    Direct {
+        word: HostVa,
+        waiter_key: usize,
+    },
+    Mirror {
+        word: HostVa,
+        waiter_count: HostVa,
+        waiter_key: usize,
+    },
 }
 
 impl SharedFutexLocation {
     #[inline]
     pub const fn wait_addr(self) -> HostVa {
         match self {
-            SharedFutexLocation::Direct { word }
+            SharedFutexLocation::Direct { word, .. }
             | SharedFutexLocation::Mirror {
                 word,
                 waiter_count: _,
+                waiter_key: _,
             } => word,
+        }
+    }
+
+    #[inline]
+    pub const fn waiter_key(self) -> usize {
+        match self {
+            SharedFutexLocation::Direct { waiter_key, .. }
+            | SharedFutexLocation::Mirror { waiter_key, .. } => waiter_key,
         }
     }
 
     #[inline]
     pub const fn waiter_count_addr(self) -> Option<HostVa> {
         match self {
-            SharedFutexLocation::Direct { word: _ } => None,
+            SharedFutexLocation::Direct { .. } => None,
             SharedFutexLocation::Mirror {
                 word: _,
                 waiter_count,
+                waiter_key: _,
             } => Some(waiter_count),
         }
     }

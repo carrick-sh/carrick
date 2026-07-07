@@ -629,9 +629,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
     fn shared_futex_location(&self, guest_addr: u64) -> Option<SharedFutexLocation> {
         // The backend seam below is typed GuestVa -> HostVa. Aarch64 backends
         // expose only direct shared-aperture words; bhyve-style mirrors are x86.
-        self.vm
-            .shared_futex_host_addr(GuestVa(guest_addr))
-            .map(|word| SharedFutexLocation::Direct { word })
+        self.vm.shared_futex_location(GuestVa(guest_addr))
     }
 
     /// Make a guest `mprotect`/`mmap`'s protection GUEST-visible by editing the

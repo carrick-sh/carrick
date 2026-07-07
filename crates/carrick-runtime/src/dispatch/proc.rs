@@ -1838,7 +1838,7 @@ impl SyscallDispatcher {
                         // uniformly. The loop completes with the count woken.
                         return Ok(DispatchOutcome::SharedFutexWake {
                             location,
-                            waiter_key: address.0 as usize,
+                            waiter_key: location.waiter_key(),
                             count: value,
                         });
                     }
@@ -1889,7 +1889,7 @@ impl SyscallDispatcher {
                     if let Some(location) = shared_location {
                         return Ok(DispatchOutcome::SharedFutexWait {
                             location,
-                            waiter_key: address.0 as usize,
+                            waiter_key: location.waiter_key(),
                             value,
                             timeout,
                         });
@@ -1929,9 +1929,9 @@ impl SyscallDispatcher {
                         };
                         return Ok(DispatchOutcome::SharedFutexRequeue {
                             from: location,
-                            from_key: address.0 as usize,
+                            from_key: location.waiter_key(),
                             to: to_location,
-                            to_key: uaddr2 as usize,
+                            to_key: to_location.waiter_key(),
                             wake: nr_wake,
                             requeue: nr_requeue,
                         });

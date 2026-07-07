@@ -3283,7 +3283,7 @@ fn dispatch_threaded_futex(
                 // completes the syscall with the count woken.
                 return DispatchOutcome::SharedFutexWake {
                     location,
-                    waiter_key: address as usize,
+                    waiter_key: location.waiter_key(),
                     count: value,
                 };
             }
@@ -3364,7 +3364,7 @@ fn dispatch_threaded_futex(
                 // generation snapshot is needed here.
                 return DispatchOutcome::SharedFutexWait {
                     location,
-                    waiter_key: address as usize,
+                    waiter_key: location.waiter_key(),
                     value,
                     timeout,
                 };
@@ -3427,9 +3427,9 @@ fn dispatch_threaded_futex(
                 };
                 return DispatchOutcome::SharedFutexRequeue {
                     from: location,
-                    from_key: address as usize,
+                    from_key: location.waiter_key(),
                     to: to_location,
-                    to_key: uaddr2 as usize,
+                    to_key: to_location.waiter_key(),
                     wake: nr_wake,
                     requeue: nr_requeue,
                 };
@@ -3568,7 +3568,7 @@ pub(super) fn dispatch_futex_waitv_args(
         {
             return DispatchOutcome::SharedFutexWaitv {
                 location,
-                waiter_key: entry.address as usize,
+                waiter_key: location.waiter_key(),
                 value: entry.value,
                 timeout,
                 index: index as i64,
@@ -8015,6 +8015,7 @@ mod overlay_dispatch_tests {
             ) -> Option<carrick_guest_mem::SharedFutexLocation> {
                 Some(carrick_guest_mem::SharedFutexLocation::Direct {
                     word: HostVa(&self.word as *const u32 as usize),
+                    waiter_key: &self.word as *const u32 as usize,
                 })
             }
         }
@@ -8191,12 +8192,14 @@ mod overlay_dispatch_tests {
             ) -> Option<carrick_guest_mem::SharedFutexLocation> {
                 Some(carrick_guest_mem::SharedFutexLocation::Direct {
                     word: HostVa(&self.word as *const u32 as usize),
+                    waiter_key: &self.word as *const u32 as usize,
                 })
             }
         }
         let mut memory = SharedWord { word: 0 };
         let location = carrick_guest_mem::SharedFutexLocation::Direct {
             word: HostVa(&memory.word as *const u32 as usize),
+            waiter_key: &memory.word as *const u32 as usize,
         };
         let reporter = CompatReporter::default();
         let futex = crate::thread::FutexTable::new();
