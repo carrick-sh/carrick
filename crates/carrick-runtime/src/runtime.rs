@@ -1047,28 +1047,32 @@ where
                 // behaves as a plain fork — safe (same as before), just not the
                 // faithful CLONE_VM|CLONE_VFORK.
                 let _ = vfork;
-                let outcome = runtime.fork()?;
+                let child_parent = if clone_parent {
+                    dispatcher.clone_parent_host_pid()
+                } else {
+                    std::process::id()
+                };
+                let child_subreaper = dispatcher.subreaper_for_fork_child();
+                let child_ns_pid = crate::namespace::pid::allocate_child_ns_pid_pre_fork();
+                crate::guest_cpu::prepare_child_record_pre_fork(
+                    child_parent,
+                    child_subreaper,
+                    child_ns_pid.unwrap_or(0),
+                    clone_parent && child_parent != 0,
+                    0,
+                );
+                let outcome = match runtime.fork() {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        crate::guest_cpu::abort_prepared_child_record();
+                        return Err(RuntimeError::Trap(error));
+                    }
+                };
                 let retval: i64 = match outcome {
                     crate::trap::ForkOutcome::Parent { child_pid } => {
                         crate::event_ring::rec(crate::event_ring::FORK, child_pid, 0, 0);
-                        let child_parent = if clone_parent {
-                            dispatcher.clone_parent_host_pid()
-                        } else {
-                            std::process::id()
-                        };
-                        if clone_parent {
-                            crate::guest_cpu::register_clone_parent_child(
-                                child_pid as u32,
-                                child_parent,
-                                dispatcher.subreaper_for_fork_child(),
-                            );
-                        } else {
-                            crate::guest_cpu::register_child_with_parent(
-                                child_pid as u32,
-                                std::process::id(),
-                                dispatcher.subreaper_for_fork_child(),
-                            );
-                        }
+                        crate::guest_cpu::publish_prepared_child_record_parent(child_pid as u32);
+                        crate::namespace::pid::notify_child_registered();
                         // Watch the child's exit (EVFILT_PROC/NOTE_EXIT) so the
                         // signal pump delivers the requested exit signal to this
                         // (parent) tid when it exits — without a host SIGCHLD
@@ -1083,14 +1087,10 @@ where
                             let fd = dispatcher.install_child_pidfd(child_pid).unwrap_or(-1);
                             let _ = runtime.write_bytes(addr, &fd.to_le_bytes());
                         }
-                        // PID namespace: allocate the child's ns-pid and record
-                        // the mapping (we are its ns-parent), then return the
-                        // ns-pid — not the host pid — as the fork retval (§5.3).
-                        // Identity when namespaces are off.
-                        let retval = i64::from(crate::namespace::pid::register_child(
-                            child_pid as u32,
-                            child_parent,
-                        ));
+                        // PID namespace: the child's ns-pid was allocated and
+                        // stored in its prepared record before fork. Identity
+                        // when namespaces are off.
+                        let retval = i64::from(child_ns_pid.unwrap_or(child_pid as u32));
                         if let Some(addr) = parent_tid_addr {
                             let tid = (retval as i32).to_le_bytes();
                             let _ = runtime.write_bytes(addr, &tid);
@@ -1112,10 +1112,7 @@ where
                         // Threads don't survive fork: re-arm the child's deadlock
                         // watchdog (shares the tree-global progress counter).
                         crate::deadlock_watchdog::arm();
-                        // PID namespace: block until the parent has registered
-                        // our ns-pid, so our first getpid()/getppid() see the
-                        // mapping (§5.3). No-op when namespaces are off.
-                        crate::namespace::pid::await_self_registration();
+                        crate::guest_cpu::complete_child_record_post_fork_child();
                         // Re-stamp the identity page: the child's pid changed
                         // (ns-pid now registered), so a fast-path getpid is right.
                         stamp_identity_page(runtime, &dispatcher);
