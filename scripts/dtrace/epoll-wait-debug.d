@@ -2,7 +2,10 @@
  * Focused epoll/kqueue wait tracing for Carrick.
  *
  * This intentionally avoids the full syscall stream and prints only epoll
- * wait decisions plus masked-ready interest samples. Use through:
+ * wait decisions plus masked-ready interest samples. It self-exits after 20s
+ * because `carrick trace -s` intentionally lets custom scripts outlive the
+ * directly-spawned child; an unbounded script can otherwise leave a root trace
+ * parent behind after the guest is killed. Use through:
  *
  *   carrick trace -s scripts/dtrace/epoll-wait-debug.d -- ...
  */
@@ -50,6 +53,11 @@ tick-1s
     printa("  events=%#x timeout=%-8d %@d\n", @wait_fds);
     printf("--- masked interest samples ---\n");
     printa("  requested=%#x raw=%#x last=%#x %@d\n", @masked);
+}
+
+tick-20s
+{
+    exit(0);
 }
 
 dtrace:::END
