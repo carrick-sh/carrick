@@ -21,7 +21,7 @@
 //! guard on `reclaim` cannot save `gen=42`. A raw `reclaim_pid(pid)` off that
 //! `NOTE_EXIT` would free BOTH, ripping the slot out from under the live
 //! reused-pid process. `wait_for_events` therefore re-checks liveness before
-//! trusting a delivered `NOTE_EXIT`; see [`Reaper::handle_note_exit`] for the
+//! trusting a delivered `NOTE_EXIT`; see `Reaper::handle_note_exit` for the
 //! gate and its bounded-leak tradeoff.
 //!
 //! `EVFILT_PROC` is the PRIMARY detector (not `kill(pid, 0)`, which cannot tell a
