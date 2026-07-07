@@ -67,7 +67,13 @@ carrick trace [--script <file.d>] [--trace-out <file>] [--flowindent] -- <run-ar
    the script, `tick-1s { secs++ } tick-1s /secs >= N/ { exit(0); }`. A guest
    that hangs will otherwise stream forever.
 
-4. **Kill stale carrick processes before each run — SCOPED to YOUR run-id:**
+4. **If tracing perturbs the hang away, switch to `carrick debug lldb-run`.**
+   That runner owns a normal `carrick run`, waits for a deadline, then dumps the
+   always-on event ring, all host backtraces, and modified-memory cores through
+   lldb before scoped cleanup. It is the right next move for timing-sensitive
+   epoll/futex/fork stalls where DTrace changes the schedule.
+
+5. **Kill stale carrick processes before each run — SCOPED to YOUR run-id:**
    set `export CARRICK_RUN_ID=<unique>` (e.g. `trace-$$`) so carrick stamps it
    into each guest's `carrick:<run-id>` title, then reap only yours with
    `scripts/sudo/kill.sh "$CARRICK_RUN_ID"` (or `pkill -9 -f "carrick:$CARRICK_RUN_ID"`).
@@ -78,18 +84,18 @@ carrick trace [--script <file.d>] [--trace-out <file>] [--flowindent] -- <run-ar
    sledgehammer, never for per-run cleanup.) Leftover hung guests from a prior
    run get caught by `progenyof` and pollute counts/events — reap yours first.
 
-5. **Reduce to a fast Rust fixture before tracing anything big.** Tracing apt or
+6. **Reduce to a fast Rust fixture before tracing anything big.** Tracing apt or
    a shell is millions of events. The `fixtures/linux-aarch64-hello` crate holds
    tiny raw-syscall ELF repros (build with `scripts/build-linux-fixtures.sh`,
    run via `carrick run-elf`). A ~15-syscall fixture that reproduces the bug
    turns each hypothesis into a <10s loop. Add a new fixture mirroring the
    failing pattern when one doesn't exist.
 
-6. **Build + re-sign before tracing, or you get HV_DENIED (0xfae94007).**
+7. **Build + re-sign before tracing, or you get HV_DENIED (0xfae94007).**
    `cargo build --release` then
    `codesign --force --sign - --entitlements scripts/entitlements.plist target/release/carrick`.
 
-7. **A D-script compile error silently kills the trace — and looks like the
+8. **A D-script compile error silently kills the trace — and looks like the
    guest dying.** libdtrace fails `dtrace_program_strcompile` BEFORE the child
    spawns, `carrick trace` exits, and a driver pty sees an immediate EIO with no
    obvious cause. If a trace produces an empty `--trace-out` file or an instant
@@ -109,7 +115,7 @@ carrick trace [--script <file.d>] [--trace-out <file>] [--flowindent] -- <run-ar
    `exit(0)` fire (size the driver's run > the tick budget) or print per-event
    and count with `grep | sort | uniq -c`.
 
-8. **Interactive (`-t`) / driven traces: use `--trace-out` + drive over a pty.**
+9. **Interactive (`-t`) / driven traces: use `--trace-out` + drive over a pty.**
    To trace a scenario that needs input (Ctrl-C, Ctrl-Z, typed commands), run
    `carrick trace --trace-out /tmp/ev.out -- run -t … /bin/bash` with its
    stdin/stdout wired to a pty you drive from a small Python harness
