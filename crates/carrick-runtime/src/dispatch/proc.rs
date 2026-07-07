@@ -3131,17 +3131,12 @@ fn fill_deterministic_bootstrap_random(bytes: &mut [u8]) {
     }
 }
 
-/// KVM lane only: absorb a tracee stop on a carrick-INTERNAL signal (the
-/// SIGRTMIN vCPU kick / SIGRTMIN+1 xsignal nudge — see
-/// `io_wait::is_internal_kick_signal`). Such a stop is an implementation
-/// artifact the guest knows nothing about: `PTRACE_CONT` re-injects the signal
-/// (its handler still runs in the tracee) and the caller re-waits instead of
-/// surfacing a bogus `WIFSTOPPED`/`WSTOPSIG=SIGRTMIN` to the guest. The parked
-/// `wait_proc_exit` path absorbs the same stops; this covers the blocking
-/// host-wait4 observation points (the WNOHANG pre-flight and the blocking
-/// loop). Returns `true` when absorbed. On HVF this can't happen (vCPU kicks
-/// are `hv_vcpus_exit`, not signals), hence the compile-time no-op.
-#[cfg(target_os = "linux")]
+/// Absorb a tracee stop on a carrick-internal host carrier signal. Such a stop
+/// is an implementation artifact the guest knows nothing about: `PTRACE_CONT`
+/// re-injects the carrier so its handler still runs in the tracee, and the
+/// caller re-waits instead of surfacing a bogus `WIFSTOPPED` to the guest. The
+/// parked `wait_proc_exit` path absorbs the same stops; this covers the blocking
+/// host-wait4 observation points.
 fn absorb_internal_tracee_stop(pid: i32, host_status: i32) -> bool {
     if pid <= 0 || !libc::WIFSTOPPED(host_status) {
         return false;
@@ -3158,11 +3153,6 @@ fn absorb_internal_tracee_stop(pid: i32, host_status: i32) -> bool {
         carrick_portable::ptrace(carrick_portable::PT_CONTINUE, pid, 1, sig);
     }
     true
-}
-
-#[cfg(not(target_os = "linux"))]
-fn absorb_internal_tracee_stop(_pid: i32, _host_status: i32) -> bool {
-    false
 }
 
 /// Translate a host `waitpid` status so a signal-death's termsig uses Linux

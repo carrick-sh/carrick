@@ -1984,19 +1984,29 @@ pub mod io_wait {
         InternalSignal(i32),
     }
 
-    /// Signals carrick reserves for its own cross-thread/cross-process plumbing
-    /// on the Linux lane: the vCPU kick (`carrick-vmm-kvm`'s
-    /// `kvm_kicker::kick_signal()` = `SIGRTMIN`) and the xsignal-ring nudge
-    /// (`kvm_xsig::xsig_nudge_signal()` = `SIGRTMIN+1`). Guest signals never
-    /// travel as these host numbers (guest RT signals ride the xsig ring; the
-    /// shared kill path raises a host `SIGSTOP` carrier for RT/SIGCONT), so a
-    /// traced child stopped on one of these is ALWAYS an implementation
-    /// artifact, never guest-visible state. Mirrored by an equality test in
-    /// `carrick-vmm-kvm` (`kvm_disposition`'s claimed-signal tests).
+    /// Signals carrick reserves for its own cross-thread/cross-process plumbing.
+    /// A traced child can stop on these host carriers before the carrier handler
+    /// runs. Surface none of them to the guest tracer; re-inject and keep waiting
+    /// so the handler can publish the real guest-visible state.
     pub fn is_internal_kick_signal(signum: i32) -> bool {
-        use crate::host_signal::ActiveGlue;
-        use carrick_signal_core::HostSignalGlue;
-        signum == ActiveGlue::kick_signal() || signum == ActiveGlue::nudge_signum()
+        #[cfg(feature = "platform-macos")]
+        {
+            if crate::host_signal::is_xsig_nudge(signum) {
+                return true;
+            }
+        }
+        #[cfg(any(
+            feature = "platform-linux",
+            feature = "platform-freebsd",
+            feature = "platform-netbsd"
+        ))]
+        {
+            use crate::host_signal::ActiveGlue;
+            use carrick_signal_core::HostSignalGlue;
+            return signum == ActiveGlue::kick_signal() || signum == ActiveGlue::nudge_signum();
+        }
+        #[allow(unreachable_code)]
+        false
     }
 
     /// Peek (`WNOWAIT`) whether child `pid` sits in a ptrace signal-delivery
@@ -2058,6 +2068,9 @@ pub mod io_wait {
         // the WIFSTOPPED status. Mirrors the HVF waiter's identical pre-check
         // (carrick-vmm-hvf io_wait::child_status_ready).
         if pid > 0 && crate::guest_cpu::child_has_ptrace_stop_pending(pid as u32) {
+            return true;
+        }
+        if pid <= 0 && crate::guest_cpu::direct_child_ptrace_stop_pending(std::process::id()) {
             return true;
         }
         let (idtype, id) = if pid > 0 {

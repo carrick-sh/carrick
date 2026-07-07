@@ -152,9 +152,57 @@ enum ProcExitWait {
     KqueueDead,
 }
 
+/// Whether a traced child stopped on a Carrick-owned host carrier signal rather
+/// than a guest-visible signal. The runtime re-injects these and keeps waiting.
+pub fn is_internal_kick_signal(signum: i32) -> bool {
+    crate::host_signal::is_xsig_nudge(signum)
+}
+
+#[cfg(target_os = "macos")]
+fn child_ptrace_trap_stop_ready(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WSTOPPED | libc::WNOWAIT | libc::WNOHANG,
+        )
+    };
+    if rc != 0 {
+        return false;
+    }
+    info.si_pid != 0
+        && (info.si_code == libc::CLD_TRAPPED
+            // Darwin reports the initial PT_TRACE_ME SIGTRAP stop as
+            // CLD_STOPPED/SIGTRAP, but `wait4(..., 0)` still consumes it as a
+            // ptrace wait state. Wake the vCPU so the dispatcher can reap it.
+            || (info.si_code == libc::CLD_STOPPED && info.si_status == libc::SIGTRAP))
+}
+
+#[cfg(target_os = "macos")]
+fn any_direct_child_ptrace_trap_stop_ready() -> bool {
+    crate::guest_cpu::direct_children_for_wait(std::process::id())
+        .into_iter()
+        .filter_map(|child| i32::try_from(child).ok())
+        .any(child_ptrace_trap_stop_ready)
+}
+
 #[cfg(target_os = "macos")]
 fn child_status_ready(pid: i32) -> bool {
-    if pid > 0 && crate::guest_cpu::child_has_ptrace_stop_pending(pid as u32) {
+    if pid > 0
+        && (crate::guest_cpu::child_has_ptrace_stop_pending(pid as u32)
+            || child_ptrace_trap_stop_ready(pid))
+    {
+        return true;
+    }
+    if pid == -1
+        && (crate::guest_cpu::direct_child_ptrace_stop_pending(std::process::id())
+            || any_direct_child_ptrace_trap_stop_ready())
+    {
         return true;
     }
     let (idtype, id) = if pid > 0 {
@@ -1400,6 +1448,93 @@ mod tests {
             !ready,
             "a stopped child is not exit-ready for a WEXITED-only waiter"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    fn spawn_ptrace_trap_child_for_wait_test() -> i32 {
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed");
+        if child == 0 {
+            unsafe {
+                let rc = libc::ptrace(libc::PT_TRACE_ME, 0, std::ptr::null_mut(), 0);
+                if rc != 0 {
+                    libc::_exit(101);
+                }
+                libc::raise(libc::SIGTRAP);
+                libc::pause();
+                libc::_exit(0);
+            }
+        }
+
+        crate::guest_cpu::init_child_table();
+        crate::guest_cpu::register_child_with_parent(child as u32, std::process::id(), 0);
+        unsafe {
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            for _ in 0..100 {
+                assert_eq!(
+                    libc::waitid(
+                        libc::P_PID,
+                        child as libc::id_t,
+                        &mut info,
+                        libc::WSTOPPED | libc::WNOWAIT | libc::WNOHANG,
+                    ),
+                    0
+                );
+                if info.si_pid == child {
+                    break;
+                }
+                libc::usleep(10_000);
+            }
+            assert_eq!(info.si_pid, child, "child did not report ptrace stop");
+        }
+        child
+    }
+
+    #[cfg(target_os = "macos")]
+    fn kill_ptrace_child_for_wait_test(child: i32) {
+        unsafe {
+            libc::ptrace(libc::PT_KILL, child, std::ptr::null_mut(), 0);
+            let mut status = 0;
+            libc::waitpid(child, &mut status, 0);
+        }
+        let _ = crate::guest_cpu::reap_child_guest_ns(child as u32);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn child_status_ready_observes_ptrace_trap_stop() {
+        let child = spawn_ptrace_trap_child_for_wait_test();
+        let specific_ready = super::child_status_ready(child);
+        let mut status = 0;
+        let specific_result =
+            unsafe { libc::wait4(child, &mut status, libc::WNOHANG, std::ptr::null_mut()) };
+        kill_ptrace_child_for_wait_test(child);
+
+        assert!(
+            specific_ready,
+            "specific wait must observe ptrace trap stop"
+        );
+        assert_eq!(
+            specific_result, child,
+            "readiness must leave the ptrace stop consumable"
+        );
+        assert!(libc::WIFSTOPPED(status));
+        assert_eq!(libc::WSTOPSIG(status), libc::SIGTRAP);
+
+        let child = spawn_ptrace_trap_child_for_wait_test();
+        let any_ready = super::child_status_ready(-1);
+        let mut status = 0;
+        let any_result =
+            unsafe { libc::wait4(-1, &mut status, libc::WNOHANG, std::ptr::null_mut()) };
+        kill_ptrace_child_for_wait_test(child);
+
+        assert!(any_ready, "wait4(-1) must observe direct child ptrace stop");
+        assert_eq!(
+            any_result, child,
+            "any-child readiness must leave the ptrace stop consumable"
+        );
+        assert!(libc::WIFSTOPPED(status));
+        assert_eq!(libc::WSTOPSIG(status), libc::SIGTRAP);
     }
 
     #[cfg(target_os = "macos")]
