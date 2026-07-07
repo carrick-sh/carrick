@@ -402,14 +402,14 @@ fn kill_scoped(pid: i32, run_id: &str, engine: Engine, cleanup: Option<&CarrickC
             let cleanup = Command::new("sudo")
                 .args(["-n", "scripts/sudo/kill.sh", run_id])
                 .output();
-            if let Ok(output) = cleanup {
-                if !output.status.success() {
-                    eprintln!(
-                        "warning: scoped carrick cleanup failed for {run_id}: {}{}",
-                        String::from_utf8_lossy(&output.stdout),
-                        String::from_utf8_lossy(&output.stderr)
-                    );
-                }
+            if let Ok(output) = cleanup
+                && !output.status.success()
+            {
+                eprintln!(
+                    "warning: scoped carrick cleanup failed for {run_id}: {}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
             }
         }
         (Engine::Docker, _) => {
