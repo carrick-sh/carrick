@@ -1636,3 +1636,40 @@ Treat B7 as measurement-blocked, not done. Before checking off B7, either make
 the full gate stable enough to produce two consecutive identical gating sets or
 replace the completion rule with an explicit, committed measurement policy that
 accounts for known timeout-sensitive rows.
+
+## 2026-07-07 15:43 - B7 measurement-policy follow-up
+
+The first follow-up separated one real harness-budget problem from the
+remaining full-run churn.
+
+Changes:
+
+- `ltp-futex_cmp_requeue01` stays a documented `summary` known gap, but its
+  generated timeout is now 90 seconds. The row has an internal LTP timeout and
+  must reach the LTP `Summary:` line for the known-gap classifier to report it
+  as non-gating. The old 40 second harness cap could kill Carrick first and
+  convert the known summary mismatch into a gating harness TIMEOUT.
+- The xattr/listxattr known-gap rows are now encoded in the generator, not just
+  the generated manifest, so `--generate-suites` preserves the committed xattr
+  policy instead of silently deleting those markers.
+- The arena-process-section plan now states the B7 replacement measurement
+  policy explicitly: stable new gating rows are regressions; same-binary rows
+  that recover in focused reruns may be handled with `--flake-retries 1` for the
+  broad full-run comparison, with artifact paths recorded here. A row that
+  remains gating after retry is still a regression.
+
+Verification:
+
+- `cargo test -p carrick-conformance generate::tests` passed; 7 generator tests.
+- `cargo run -p carrick-conformance -- --generate-suites` regenerated
+  `scripts/conformance/suites.toml`; the manifest diff is only
+  `ltp-futex_cmp_requeue01` timeout `40 -> 90`.
+- `target/release/carrick-conformance --suite ltp-futex_cmp_requeue01 --force --jsonl target/conformance/futex-cmp-requeue-timeout-budget.jsonl`
+  passed with `ltp-futex_cmp_requeue01` MATCH `7/7`.
+- `target/release/carrick-conformance --suite cpython-multiprocessing_fork --suite cpython-multiprocessing_spawn --suite go-os --suite ltp-futex_cmp_requeue01 --suite ltp-mq_notify01 --suite ltp-mq_timedreceive01 --suite ltp-sched_setaffinity01 --suite ltp-waitpid08 --suite ltp-waitpid10 --force --jsonl target/conformance/after-process-section-union-new-rerun2.jsonl`
+  still exited 1, but narrowed the remaining gate to
+  `cpython-multiprocessing_fork`.
+- `target/release/carrick-conformance --suite cpython-multiprocessing_fork --force --jsonl target/conformance/cpython-multiprocessing-fork-focused-rerun2.jsonl`
+  passed with MATCH `317/317`, confirming the fork row is same-binary
+  load-sensitive in this measurement campaign rather than a stable process
+  section regression.
