@@ -257,3 +257,127 @@ impl EventMultiplexer for KqueueMultiplexer {
         self.kq.raw_fd()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn read_lowat_suppresses_socket_until_threshold_growth() {
+        let (reader, mut writer) = UnixStream::pair().expect("socketpair");
+        reader.set_nonblocking(true).expect("reader nonblocking");
+        writer.set_nonblocking(true).expect("writer nonblocking");
+
+        let mut mux = KqueueMultiplexer::new().expect("kqueue");
+        mux.register_io(
+            reader.as_raw_fd(),
+            0xabc,
+            Interest {
+                read: true,
+                write: false,
+                oob: false,
+                read_lowat: Some(113),
+            },
+            TriggerMode::Edge,
+        )
+        .expect("register lowat read");
+
+        writer.write_all(&[0xaa; 112]).expect("write below lowat");
+        let mut events = Vec::new();
+        assert_eq!(
+            mux.wait(&mut events, Some(Duration::ZERO))
+                .expect("wait below lowat"),
+            0
+        );
+
+        writer.write_all(&[0xbb; 1]).expect("write to lowat");
+        let n = mux
+            .wait(&mut events, Some(Duration::ZERO))
+            .expect("wait at lowat");
+        assert_eq!(n, 1);
+        assert_eq!(events[0].token, 0xabc);
+        assert!(events[0].readiness.read);
+        assert!(events[0].readiness_count >= 113);
+    }
+
+    #[test]
+    fn read_lowat_rearm_after_edge_suppresses_until_growth() {
+        let (reader, mut writer) = UnixStream::pair().expect("socketpair");
+        reader.set_nonblocking(true).expect("reader nonblocking");
+        writer.set_nonblocking(true).expect("writer nonblocking");
+
+        let mut mux = KqueueMultiplexer::new().expect("kqueue");
+        mux.register_io(reader.as_raw_fd(), 0xabc, Interest::READ, TriggerMode::Edge)
+            .expect("register initial read");
+
+        writer.write_all(&[0xaa; 112]).expect("write initial bytes");
+        let mut events = Vec::new();
+        let n = mux
+            .wait(&mut events, Some(Duration::ZERO))
+            .expect("initial wait");
+        assert_eq!(n, 1);
+        assert_eq!(events[0].token, 0xabc);
+        assert!(events[0].readiness.read);
+
+        mux.register_io(
+            reader.as_raw_fd(),
+            0xdef,
+            Interest {
+                read: true,
+                write: false,
+                oob: false,
+                read_lowat: Some(113),
+            },
+            TriggerMode::Edge,
+        )
+        .expect("rearm lowat read");
+
+        assert_eq!(
+            mux.wait(&mut events, Some(Duration::ZERO))
+                .expect("wait after lowat rearm"),
+            0
+        );
+
+        writer.write_all(&[0xbb; 1]).expect("write to lowat");
+        let n = mux
+            .wait(&mut events, Some(Duration::ZERO))
+            .expect("wait after growth");
+        assert_eq!(n, 1);
+        assert_eq!(events[0].token, 0xdef);
+        assert!(events[0].readiness.read);
+        assert!(events[0].readiness_count >= 113);
+    }
+
+    #[test]
+    fn read_lowat_one_still_reports_socket_eof() {
+        let (reader, writer) = UnixStream::pair().expect("socketpair");
+        reader.set_nonblocking(true).expect("reader nonblocking");
+        drop(writer);
+
+        let mut mux = KqueueMultiplexer::new().expect("kqueue");
+        mux.register_io(
+            reader.as_raw_fd(),
+            0xabc,
+            Interest {
+                read: true,
+                write: false,
+                oob: false,
+                read_lowat: Some(1),
+            },
+            TriggerMode::Edge,
+        )
+        .expect("register lowat read");
+
+        let mut events = Vec::new();
+        let n = mux
+            .wait(&mut events, Some(Duration::ZERO))
+            .expect("wait for eof");
+        assert_eq!(n, 1);
+        assert_eq!(events[0].token, 0xabc);
+        assert!(events[0].readiness.read);
+        assert!(events[0].eof);
+    }
+}
