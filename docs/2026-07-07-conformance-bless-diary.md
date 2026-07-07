@@ -211,3 +211,46 @@ Verified:
   `target/release/carrick-conformance --suite ltp-getpid01 --jsonl target/conformance/getpid01-anykq.jsonl`
   reported `MATCH carrick[100/100] oracle[100/100]`, with Carrick 2,965ms vs
   cached oracle 404ms (7.34x), below the conformance 10x outlier threshold.
+
+Follow-up after full bless:
+The next full `--bless` run still reported `ltp-getpid01` as the top timing
+outlier under worker load:
+`target/conformance/logs/conformance-bless-20260707-025522.log` failed fast
+after 55 cached-oracle gating verdicts, with `ltp-getpid01` still a semantic
+match but 16,115ms vs 404ms (39.89x). A focused exact re-run immediately after
+the full run took 4,729ms, and the harness run
+`target/conformance/getpid01-postfull.jsonl` reported 4,889ms vs 404ms
+(12.10x). The wait-any kqueue fix therefore removed the original 50ms
+poll/reap cliff, but did not make the fork-heavy case robust under load.
+
+Second lldb capture:
+`target/conformance/logs/lldb-runs/getpid01-lldb2-030336.lldb.txt` caught the
+active LTP worker in `HvfVmState::fork_rebuild` while creating a fresh HVF VM
+for the fork child. The parent was waiting on the concrete child with
+`wait_proc_exit_kqueue`, and the shell was on the new `wait_proc_exit_any_kqueue`
+path, so the remaining hot state is no longer the wait-any fallback.
+
+Host-HVF comparison:
+Checked-in `hvf_fork_probe` isolates raw Hypervisor.framework create/destroy
+from Carrick's guest rebuild work. After codesigning the probe binary, the
+host-only recreate loop showed VM+vCPU creation usually in tens of microseconds,
+and the fork churn probe showed child `hv_vm_create` around 300-700us:
+`target/conformance/logs/hvf-probes/recreate-loop-20260707-030531.log` and
+`target/conformance/logs/hvf-probes/fork-churn-20260707-030531.log`. That makes
+plain `hv_vm_create` too small to explain the 4-5s focused LTP cost by itself.
+
+Raw fork oracle:
+The untracked local `perf_fork` probe timed a steady-state loop of
+`fork()+_exit(0)+waitpid()` with no child work. Carrick:
+`target/conformance/logs/perf-probes/perf_fork-carrick-20260707-030639.log`
+reported `fork_p50_us=40988.625`, `fork_p95_us=42627.084`, and
+`fork_min_us=38328.250` over 300 iterations. Docker:
+`target/conformance/logs/perf-probes/perf_fork-docker-20260707-030639.log`
+reported `fork_p50_us=47.666`, `fork_p95_us=578.083`, and
+`fork_min_us=32.875`. This is the current first-principles explanation for
+`getpid01`: the test is a 100-fork loop, so Carrick's steady-state fork
+primitive alone accounts for roughly four seconds, while Docker's is effectively
+sub-millisecond at this scale. The next question is architectural: whether the
+HVF fork model can avoid rebuilding a full VM for simple child-exit forks, or
+whether the conformance harness should classify this as an acknowledged
+performance gap rather than a transient wait bug.
