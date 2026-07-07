@@ -2693,7 +2693,7 @@ impl SyscallDispatcher {
                         // too slow).
                         for (gfd, (edge_bits, edge_readiness_count)) in deliver {
                             if let Some(&(
-                                _,
+                                hfd,
                                 requested,
                                 data,
                                 reg_gen,
@@ -2753,7 +2753,16 @@ impl SyscallDispatcher {
                                     ready_events,
                                 );
                                 if ready_events == 0 && raw != 0 {
-                                    crate::probes::epoll_masked(1, gfd, requested, raw, last_ready);
+                                    crate::probes::epoll_masked(
+                                        1,
+                                        gfd,
+                                        hfd,
+                                        requested,
+                                        raw,
+                                        last_ready,
+                                        observed_read_avail,
+                                        last_read_avail,
+                                    );
                                 }
                                 if ready_events != 0 {
                                     acc.entry(gfd).or_insert((0, data)).0 |= ready_events;
@@ -2831,7 +2840,19 @@ impl SyscallDispatcher {
                     ready_events,
                 );
                 if ready_events == 0 && raw_ready != 0 {
-                    crate::probes::epoll_masked(2, *fd, requested, raw_ready, interest.last_ready);
+                    let host_fd = this
+                        .host_fd_for_poll(*fd)
+                        .map_or(-1, |host_fd| host_fd.get());
+                    crate::probes::epoll_masked(
+                        2,
+                        *fd,
+                        host_fd,
+                        requested,
+                        raw_ready,
+                        interest.last_ready,
+                        read_avail,
+                        interest.last_read_avail,
+                    );
                 }
                 if ready_events != 0 {
                     let entry = acc.entry(*fd).or_insert((0, interest.event.data));
@@ -2871,7 +2892,16 @@ impl SyscallDispatcher {
                     ready_events,
                 );
                 if ready_events == 0 && raw_ready != 0 {
-                    crate::probes::epoll_masked(3, *fd, requested, raw_ready, interest.last_ready);
+                    crate::probes::epoll_masked(
+                        3,
+                        *fd,
+                        -1,
+                        requested,
+                        raw_ready,
+                        interest.last_ready,
+                        0,
+                        interest.last_read_avail,
+                    );
                 }
                 if ready_events != 0 {
                     let entry = acc.entry(*fd).or_insert((0, interest.event.data));
