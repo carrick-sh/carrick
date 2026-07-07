@@ -17,7 +17,10 @@ impl SyscallDispatcher {
         target: XattrTarget,
     ) -> Result<String, LinuxErrno> {
         match target {
-            XattrTarget::Path(path_ptr) => {
+            XattrTarget::Path {
+                path: path_ptr,
+                follow,
+            } => {
                 let path = read_guest_c_string(memory, path_ptr.0)?;
                 if path.is_empty() {
                     return Err(LINUX_ENOENT);
@@ -28,7 +31,12 @@ impl SyscallDispatcher {
                 // (oracle: debian:stable arm64 set/get/list/remove on a missing
                 // path all -> errno 2). Without this the request falls through to
                 // the backend, which reports ENOTSUP (in-memory) / ENODATA (host).
-                if self.layered_metadata(&resolved).is_err() {
+                let exists = if follow {
+                    self.layered_metadata(&resolved)
+                } else {
+                    self.layered_lstat(&resolved)
+                };
+                if exists.is_err() {
                     return Err(LINUX_ENOENT);
                 }
                 Ok(resolved)
@@ -65,6 +73,7 @@ impl SyscallDispatcher {
         flags: u64,
     ) -> Result<DispatchOutcome, DispatchError> {
         // setxattr(path/fd, name, value, size, flags)
+        let follow = target.follow();
         let resolved = self.xattr_target_path(memory, target)?;
         let name = read_guest_c_string(memory, name_ptr.0)?;
         // Linux restricts the `user.*` namespace to regular files and
@@ -94,7 +103,7 @@ impl SyscallDispatcher {
         self.fs
             .rootfs_vfs
             .overlay
-            .set_xattr(&resolved, &name, &value, flags)?;
+            .set_xattr(&resolved, &name, &value, flags, follow)?;
         Ok(DispatchOutcome::Returned { value: 0 })
     }
 
@@ -107,11 +116,16 @@ impl SyscallDispatcher {
         size: u64,
     ) -> Result<DispatchOutcome, DispatchError> {
         // getxattr(path/fd, name, value, size)
+        let follow = target.follow();
         let resolved = self.xattr_target_path(memory, target)?;
         let name = read_guest_c_string(memory, name_ptr.0)?;
         let buf_addr = value_ptr.0;
         let size = size as usize;
-        let value = self.fs.rootfs_vfs.overlay.get_xattr(&resolved, &name)?;
+        let value = self
+            .fs
+            .rootfs_vfs
+            .overlay
+            .get_xattr(&resolved, &name, follow)?;
         // size == 0 is the "tell me how big" probe: return the length without
         // copying anything.
         if size == 0 {
@@ -138,10 +152,11 @@ impl SyscallDispatcher {
         size: u64,
     ) -> Result<DispatchOutcome, DispatchError> {
         // listxattr(path/fd, list, size)
+        let follow = target.follow();
         let resolved = self.xattr_target_path(memory, target)?;
         let buf_addr = list_ptr.0;
         let size = size as usize;
-        let names = self.fs.rootfs_vfs.overlay.list_xattr(&resolved)?;
+        let names = self.fs.rootfs_vfs.overlay.list_xattr(&resolved, follow)?;
         // Assemble the NUL-separated, NUL-terminated name list Linux returns.
         let mut list = Vec::new();
         for n in &names {
@@ -171,12 +186,25 @@ impl SyscallDispatcher {
         name_ptr: GuestPtr,
     ) -> Result<DispatchOutcome, DispatchError> {
         // removexattr(path/fd, name)
+        let follow = target.follow();
         let resolved = self.xattr_target_path(memory, target)?;
         // Path existence (missing -> ENOENT, distinct from ENODATA for an
         // absent attribute on a file that DOES exist; removexattr02 checks
         // both) is now enforced centrally in xattr_target_path.
         let name = read_guest_c_string(memory, name_ptr.0)?;
-        self.fs.rootfs_vfs.overlay.remove_xattr(&resolved, &name)?;
+        self.fs
+            .rootfs_vfs
+            .overlay
+            .remove_xattr(&resolved, &name, follow)?;
         Ok(DispatchOutcome::Returned { value: 0 })
+    }
+}
+
+impl XattrTarget {
+    fn follow(self) -> bool {
+        match self {
+            Self::Path { follow, .. } => follow,
+            Self::Fd(_) => true,
+        }
     }
 }
