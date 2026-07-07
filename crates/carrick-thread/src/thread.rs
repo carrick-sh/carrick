@@ -103,6 +103,7 @@ struct ThreadEntry {
 }
 
 pub struct ThreadRegistry {
+    main_tid: ThreadId,
     next_tid: AtomicI32,
     inner: ParkingMutex<HashMap<ThreadId, ThreadEntry>>,
 }
@@ -196,9 +197,14 @@ impl ThreadRegistry {
             },
         );
         Self {
+            main_tid,
             next_tid: AtomicI32::new(main_tid.raw() + 1),
             inner: ParkingMutex::new(map),
         }
+    }
+
+    pub fn main_tid(&self) -> ThreadId {
+        self.main_tid
     }
 
     pub fn register_child(&self, clear_child_tid: u64) -> ThreadId {

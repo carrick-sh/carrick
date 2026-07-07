@@ -2815,6 +2815,8 @@ impl SyscallDispatcher {
         // Drain the whole buffer so the writeback restores it in FIFO order.
         let mut buf = vec![0u8; avail];
         let n = unsafe {
+            // BLOCKING-IO-OK: HostPipe fds are adopted O_NONBLOCK and `avail`
+            // was measured immediately before the read.
             libc::read(
                 in_read.get(),
                 buf.as_mut_ptr().cast::<libc::c_void>(),
@@ -2839,6 +2841,8 @@ impl SyscallDispatcher {
             let mut off = 0usize;
             while off < buf.len() {
                 let w = unsafe {
+                    // BLOCKING-IO-OK: the source pipe was just drained, so this
+                    // bounded restore writes back into known room.
                     libc::write(
                         write_fd.get(),
                         buf[off..].as_ptr().cast::<libc::c_void>(),
@@ -2856,6 +2860,8 @@ impl SyscallDispatcher {
         let mut written = 0usize;
         while written < copy_len {
             let w = unsafe {
+                // BLOCKING-IO-OK: HostPipe fds are adopted O_NONBLOCK; a full
+                // destination returns EAGAIN and is handled below.
                 libc::write(
                     out_write.get(),
                     buf[written..copy_len].as_ptr().cast::<libc::c_void>(),
@@ -7964,6 +7970,8 @@ impl SyscallDispatcher {
                         // EINVAL on an O_APPEND fd.)
                         let saved = libc::lseek(host_fd.raw(), 0, libc::SEEK_CUR);
                         libc::lseek(host_fd.raw(), 0, libc::SEEK_END);
+                        // BLOCKING-IO-OK: HostFile fds are adopted O_NONBLOCK;
+                        // regular-file writes do not park on pipe/socket wait.
                         let w = libc::write(host_fd.raw(), bytes.as_ptr() as *const _, length);
                         if saved >= 0 {
                             libc::lseek(host_fd.raw(), saved, libc::SEEK_SET);
@@ -8620,6 +8628,7 @@ impl SyscallDispatcher {
                     let want = count.min(room).min(1 << 20);
                     let mut buf = vec![0u8; want];
                     let n = unsafe {
+                        // BLOCKING-IO-OK: MSG_DONTWAIT is passed on this recv.
                         libc::recv(
                             host_fd.get(),
                             buf.as_mut_ptr() as *mut _,
