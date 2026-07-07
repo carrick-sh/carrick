@@ -720,6 +720,7 @@ fn run_address_space_with_hvf_and_dispatcher(
     max_traps: usize,
 ) -> Result<RunResult, RuntimeError> {
     let _ = crate::ulock::preinit_waiter_table();
+    ensure_kernel_arena_path_env()?;
     // Kernel arena MUST exist before the supervisor split and any guest fork so
     // every descendant inherits one shared mapping.
     let _ = carrick_kernel::arena::KernelArena::init_global();
@@ -770,6 +771,48 @@ fn run_address_space_with_hvf_and_dispatcher(
         }
         Err(e) => Err(e),
     }
+}
+
+fn ensure_kernel_arena_path_env() -> Result<(), RuntimeError> {
+    if std::env::var_os(carrick_kernel::arena::ARENA_PATH_ENV).is_some() {
+        return Ok(());
+    }
+
+    let dir = std::env::temp_dir()
+        .join("carrick-kernel")
+        .join(kernel_arena_run_scope());
+    std::fs::create_dir_all(&dir).map_err(|err| {
+        RuntimeError::AddressSpace(AddressSpaceError::Io(std::io::Error::new(
+            err.kind(),
+            format!(
+                "failed to create kernel arena directory {}: {err}",
+                dir.display()
+            ),
+        )))
+    })?;
+    let path = dir.join("arena");
+    // SAFETY: this runs during runtime preinit, before Carrick starts guest
+    // threads. Fork descendants and late exec attachers inherit the path.
+    unsafe {
+        std::env::set_var(carrick_kernel::arena::ARENA_PATH_ENV, &path);
+    }
+    Ok(())
+}
+
+fn kernel_arena_run_scope() -> String {
+    let raw = std::env::var("CARRICK_RUN_ID").unwrap_or_else(|_| {
+        std::env::var("CARRICK_CONTAINER_ID")
+            .unwrap_or_else(|_| format!("pid-{}", std::process::id()))
+    });
+    raw.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 /// Finish a freshly-loaded image (its initial stack already set, if any) and

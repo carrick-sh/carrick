@@ -4,6 +4,7 @@
 //! cross-process access is atomics plus robust locks for multi-record sections.
 
 use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -11,6 +12,7 @@ use crate::domains::{HostPid, ProcessGeneration};
 
 pub const ARENA_MAGIC: u32 = 0x434b_4131;
 pub const ARENA_VERSION: u32 = 1;
+pub const ARENA_PATH_ENV: &str = "CARRICK_KERNEL_ARENA";
 
 /// Permit-section constants. These must stay byte-identical to the landed
 /// `SharedPermitTable` in `carrick-vmm-hvf/src/trap.rs`: magic "CRP1",
@@ -98,12 +100,115 @@ impl KernelArena {
     /// Create the region as an unlinked temp file, ftruncate it to the fixed
     /// layout size, and publish the header magic last.
     pub fn create() -> std::io::Result<KernelArena> {
-        let size = std::mem::size_of::<ArenaLayout>();
         let serial = ARENA_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
             "carrick-kernel-arena-{}-{serial}",
             std::process::id()
         ));
+        Self::create_with_path(&path, true)
+    }
+
+    /// Create the arena at a stable path so later `carrick exec` processes can
+    /// attach to the same run-scoped region. The file is left linked on
+    /// success and created with `O_EXCL` so callers never attach stale state by
+    /// accident.
+    pub fn create_at(path: &Path) -> std::io::Result<KernelArena> {
+        Self::create_with_path(path, false)
+    }
+
+    /// Attach to an existing arena and fail closed on layout mismatch.
+    pub fn attach(path: &Path) -> std::io::Result<KernelArena> {
+        let size = std::mem::size_of::<ArenaLayout>();
+        let cpath = std::ffi::CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| std::io::Error::other("arena path contains NUL"))?;
+
+        let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDWR) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
+            let err = std::io::Error::last_os_error();
+            unsafe {
+                libc::close(fd);
+            }
+            return Err(err);
+        }
+        let stat = unsafe { stat.assume_init() };
+        if stat.st_size < size as libc::off_t {
+            unsafe {
+                libc::close(fd);
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "kernel arena file is too small",
+            ));
+        }
+
+        let base = match Self::map_file(fd, size) {
+            Ok(base) => base,
+            Err(err) => {
+                unsafe {
+                    libc::close(fd);
+                }
+                return Err(err);
+            }
+        };
+        let arena = KernelArena { base, _fd: fd };
+        let layout = arena.layout();
+        let magic = layout.header.magic.load(Ordering::Acquire);
+        let version = layout.header.version.load(Ordering::Acquire);
+        if magic != ARENA_MAGIC || version != ARENA_VERSION {
+            unsafe {
+                libc::munmap(base as *mut libc::c_void, size);
+                libc::close(fd);
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "kernel arena magic/version mismatch",
+            ));
+        }
+        Ok(arena)
+    }
+
+    /// Process-wide singleton. Must be initialized before the first guest fork;
+    /// repeated calls return the same inherited mapping.
+    #[allow(clippy::panic)]
+    pub fn init_global() -> &'static KernelArena {
+        static GLOBAL: OnceLock<KernelArena> = OnceLock::new();
+        GLOBAL.get_or_init(|| match KernelArena::create_or_attach_from_env() {
+            Ok(arena) => arena,
+            Err(err) => {
+                panic!("carrick-kernel arena creation failed: {err}");
+            }
+        })
+    }
+
+    pub fn global() -> &'static KernelArena {
+        Self::init_global()
+    }
+
+    pub fn layout(&self) -> &ArenaLayout {
+        unsafe { &*(self.base as *const ArenaLayout) }
+    }
+
+    fn create_or_attach_from_env() -> std::io::Result<KernelArena> {
+        match std::env::var_os(ARENA_PATH_ENV) {
+            Some(path) => {
+                let path = Path::new(&path);
+                if path.exists() {
+                    Self::attach(path)
+                } else {
+                    Self::create_at(path)
+                }
+            }
+            None => Self::create(),
+        }
+    }
+
+    fn create_with_path(path: &Path, unlink_on_success: bool) -> std::io::Result<KernelArena> {
+        let size = std::mem::size_of::<ArenaLayout>();
         let cpath = std::ffi::CString::new(path.as_os_str().as_bytes())
             .map_err(|_| std::io::Error::other("arena path contains NUL"))?;
 
@@ -118,8 +223,7 @@ impl KernelArena {
             return Err(std::io::Error::last_os_error());
         }
 
-        let rc = unsafe { libc::ftruncate(fd, size as libc::off_t) };
-        if rc != 0 {
+        if unsafe { libc::ftruncate(fd, size as libc::off_t) } != 0 {
             let err = std::io::Error::last_os_error();
             unsafe {
                 libc::close(fd);
@@ -128,6 +232,28 @@ impl KernelArena {
             return Err(err);
         }
 
+        let base = match Self::map_file(fd, size) {
+            Ok(base) => base,
+            Err(err) => {
+                unsafe {
+                    libc::close(fd);
+                    libc::unlink(cpath.as_ptr());
+                }
+                return Err(err);
+            }
+        };
+        if unlink_on_success {
+            unsafe {
+                libc::unlink(cpath.as_ptr());
+            }
+        }
+
+        let arena = KernelArena { base, _fd: fd };
+        arena.publish_fresh_header();
+        Ok(arena)
+    }
+
+    fn map_file(fd: libc::c_int, size: usize) -> std::io::Result<usize> {
         let ptr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -138,20 +264,14 @@ impl KernelArena {
                 0,
             )
         };
-        unsafe { libc::unlink(cpath.as_ptr()) };
         if ptr == libc::MAP_FAILED {
-            let err = std::io::Error::last_os_error();
-            unsafe {
-                libc::close(fd);
-            }
-            return Err(err);
+            return Err(std::io::Error::last_os_error());
         }
+        Ok(ptr as usize)
+    }
 
-        let arena = KernelArena {
-            base: ptr as usize,
-            _fd: fd,
-        };
-        let layout = arena.layout();
+    fn publish_fresh_header(&self) {
+        let layout = self.layout();
         layout.header.next_generation.store(1, Ordering::Relaxed);
         layout
             .header
@@ -164,28 +284,6 @@ impl KernelArena {
             .store(PERMIT_VERSION, Ordering::Relaxed);
         layout.permits.magic.store(PERMIT_MAGIC, Ordering::Release);
         layout.header.magic.store(ARENA_MAGIC, Ordering::Release);
-        Ok(arena)
-    }
-
-    /// Process-wide singleton. Must be initialized before the first guest fork;
-    /// repeated calls return the same inherited mapping.
-    #[allow(clippy::panic)]
-    pub fn init_global() -> &'static KernelArena {
-        static GLOBAL: OnceLock<KernelArena> = OnceLock::new();
-        GLOBAL.get_or_init(|| match KernelArena::create() {
-            Ok(arena) => arena,
-            Err(err) => {
-                panic!("carrick-kernel arena creation failed: {err}");
-            }
-        })
-    }
-
-    pub fn global() -> &'static KernelArena {
-        Self::init_global()
-    }
-
-    pub fn layout(&self) -> &ArenaLayout {
-        unsafe { &*(self.base as *const ArenaLayout) }
     }
 
     /// Shared monotonic generation: 30-bit wrap, never 0.
@@ -294,5 +392,37 @@ mod tests {
             }
             other => panic!("expected loud exhaustion, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn attach_joins_an_existing_arena() {
+        let dir = std::env::temp_dir().join(format!("cka-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("arena");
+        let a = KernelArena::create_at(&path).unwrap();
+        a.layout()
+            .header
+            .run_token
+            .store(77, std::sync::atomic::Ordering::Release);
+        let b = KernelArena::attach(&path).unwrap();
+        assert_eq!(
+            b.layout()
+                .header
+                .run_token
+                .load(std::sync::atomic::Ordering::Acquire),
+            77
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn attach_rejects_wrong_magic() {
+        let dir = std::env::temp_dir().join(format!("cka-badmagic-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("arena");
+        std::fs::write(&path, vec![0u8; std::mem::size_of::<ArenaLayout>()]).unwrap();
+        let e = KernelArena::attach(&path).err().unwrap();
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
