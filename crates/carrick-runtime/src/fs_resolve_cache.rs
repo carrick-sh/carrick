@@ -22,8 +22,9 @@
 //! unlink/mknod/create) do.
 
 use std::collections::HashMap;
-use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use parking_lot::RwLock;
 
 /// The one `MAP_SHARED` generation word, shared with every host-forked
 /// descendant so a mutation in any process invalidates every process's cache.
@@ -107,7 +108,7 @@ impl ResolveCache {
     /// live [`current_generation`], read at the get, so a mutation between an
     /// entry's birth and this lookup invalidates it).
     pub fn get(&self, key: &str, current: u64) -> Option<String> {
-        let guard = self.map.read().ok()?;
+        let guard = self.map.read();
         match guard.get(key) {
             Some((abs, stamped)) if *stamped == current => Some(abs.clone()),
             _ => None,
@@ -123,15 +124,14 @@ impl ResolveCache {
     /// saw at entry.)
     pub fn put(&self, key: String, abs: String, gen_at_lookup: u64) {
         let stamped = gen_at_lookup;
-        if let Ok(mut guard) = self.map.write() {
-            if guard.len() >= MAX_ENTRIES && !guard.contains_key(&key) {
-                // Cheapest bound: drop everything rather than track LRU. The hot
-                // loops re-warm instantly; only a pathologically path-diverse
-                // workload ever trips this.
-                guard.clear();
-            }
-            guard.insert(key, (abs, stamped));
+        let mut guard = self.map.write();
+        if guard.len() >= MAX_ENTRIES && !guard.contains_key(&key) {
+            // Cheapest bound: drop everything rather than track LRU. The hot
+            // loops re-warm instantly; only a pathologically path-diverse
+            // workload ever trips this.
+            guard.clear();
         }
+        guard.insert(key, (abs, stamped));
     }
 }
 
