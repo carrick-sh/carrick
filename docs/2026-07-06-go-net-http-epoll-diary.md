@@ -641,3 +641,67 @@ Outcome:
   repeated origin-2 samples over guest fds `7`, `9`, `10`, `12`, `13`, `14`,
   `15`, and `16`, with host fds in the `146..162` range. The repeated masks
   remain `raw=0x4 last=0x4` and `raw=0x5 last=0x5`.
+
+### Rejected experiment: disarm all terminal ET read filters
+
+Hypothesis:
+
+- Since kqueue still reports EOF even with a read low-water mark, terminal ET
+  read filters may need the same disarm treatment as terminal ET write filters.
+
+Experiment:
+
+- Tried suppressing the host read filter whenever an ET registration had read
+  interest and `last_ready` already contained a terminal bit
+  (`EPOLLHUP`/`EPOLLERR`/`EPOLLRDHUP`).
+
+Outcome:
+
+- Rejected and reverted. Focused `TestOmitHTTP2Vet` failed twice:
+  `target/conformance/logs/go-net-http-vet-termread-235643.guest.log` failed in
+  `real 19.63`, and
+  `target/conformance/logs/go-net-http-vet-termread2-235713.guest.log` failed in
+  `real 8.24`.
+- Interpretation: terminal read suppression cannot be registration-wide. The
+  Go toolchain still needs some terminal/read state to be visible or rearmed in
+  cases unrelated to the h1 loop.
+
+### Diagnostics: drained edge source event ring
+
+Implementation:
+
+- Added `EPEDGE` to the always-on event ring and `scripts/carrick_lldb.py`. It
+  records the guest fd, translated kqueue edge bits, and the drained readiness
+  count at the kqueue-drain point.
+
+Verification:
+
+```sh
+cargo fmt --check
+cargo check -p carrick-cli
+just build -p carrick-cli
+target/release/carrick debug lldb-run --deadline-seconds 160 ...
+CARRICK_RUN_ID=go-net-http-vet-diagonly2-235952 timeout 60s \
+  target/release/carrick run --raw --fs host \
+  -w /usr/local/go/src/net/http \
+  localhost:5005/carrick-go-conformance:1.24 \
+  /conformance/net_http.test -test.v -test.run '^TestOmitHTTP2Vet$' -test.short
+```
+
+Outcome:
+
+- `target/conformance/logs/lldb-go-net-http-edge/go-net-http-lldb-edge-235017.lldb.txt`
+  shows the repeated wake source is guest fd 6, repeatedly draining
+  `edge=0x2009` (`EPOLLIN|EPOLLERR|EPOLLRDHUP`) with count 24.
+- In the same loop, Carrick recomputes readiness as `raw=0x11`
+  (`EPOLLIN|EPOLLHUP`) and masks it because `last=0x11`.
+- A first focused diagnostic-only vet run
+  `target/conformance/logs/go-net-http-vet-diagonly-235825.guest.log` failed
+  with a Go compiler `SIGTRAP`, but an immediate repeat
+  `target/conformance/logs/go-net-http-vet-diagonly2-235952.guest.log` passed in
+  `real 31.90`. Treat the SIGTRAP as a flake until a deterministic reproducer
+  proves otherwise.
+- Interpretation: the likely bad loop is not "read filters are always armed
+  after terminal state"; it is narrower. A masked terminal edge is drained from
+  kqueue, then the same host filter is rearmed even though that exact terminal
+  edge produced no guest-visible delta.
