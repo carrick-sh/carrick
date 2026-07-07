@@ -18,7 +18,7 @@ mod imp {
         hv_vcpu_create, hv_vcpu_destroy, hv_vcpu_exit_t, hv_vcpu_get_exec_time, hv_vcpu_run,
         hv_vcpu_set_reg, hv_vcpu_t, hv_vcpus_exit, hv_vm_config_create,
         hv_vm_config_get_max_ipa_size, hv_vm_config_set_ipa_size, hv_vm_create, hv_vm_destroy,
-        hv_vm_map, os_release,
+        hv_vm_map, hv_vm_unmap, os_release,
     };
 
     const HV_SUCCESS: hv_return_t = 0;
@@ -168,6 +168,7 @@ mod imp {
     impl Drop for SpinMem {
         fn drop(&mut self) {
             unsafe {
+                let _ = hv_vm_unmap(SPIN_GUEST_ADDR, self.size);
                 libc::munmap(self.ptr, self.size);
             }
         }
@@ -220,6 +221,10 @@ mod imp {
                 let workers = parse_u64_arg(&args, 1, 8);
                 parallel_recreate(workers);
             }
+            "parent-keeps-vm" => {
+                let iters = parse_u64_arg(&args, 1, 50);
+                std::process::exit(parent_keeps_vm(iters));
+            }
             "concurrent-ceiling" => {
                 let max = parse_u64_arg(&args, 1, 100);
                 let hold_secs = parse_u64_arg(&args, 2, 60);
@@ -245,6 +250,7 @@ mod imp {
         println!("  hvf_fork_probe signal-flood [run_us] [block_internal=0|1]");
         println!("  hvf_fork_probe fork-churn [iters] [child_hold_us]");
         println!("  hvf_fork_probe parallel-recreate [workers]");
+        println!("  hvf_fork_probe parent-keeps-vm [iters]");
         println!("  hvf_fork_probe concurrent-ceiling [max] [hold_secs]");
     }
 
@@ -783,6 +789,116 @@ mod imp {
         }
         if failed != 0 {
             std::process::exit(1);
+        }
+    }
+
+    /// E1 probe: fork while the parent VM is live. The child tries to clear
+    /// its inherited HVF state and create/run a new VM; the parent then proves
+    /// its original vCPU still runs.
+    fn parent_keeps_vm(iters: u64) -> i32 {
+        println!("case=parent-keeps-vm iters={iters}");
+        let mut failures = 0u64;
+        for iter in 0..iters {
+            let (vm, create_elapsed) = match Vm::create() {
+                Ok(vm) => vm,
+                Err(rc) => {
+                    println!("iter={iter} stage=parent-create rc={}", rc_label(rc));
+                    return 1;
+                }
+            };
+
+            let pre = vm.run_spin_for(200);
+            let pre_ok = spin_run_ok(&pre);
+            let pre_exit = spin_exit_reason(&pre);
+
+            let child = unsafe { libc::fork() };
+            if child < 0 {
+                println!("iter={iter} stage=fork errno={}", errno());
+                let _ = vm.destroy();
+                return 1;
+            }
+            if child == 0 {
+                let rc_direct = unsafe { hv_vm_create(ptr::null_mut()) };
+                let rc_destroy = unsafe { hv_vm_destroy() };
+                let created = Vm::create();
+                let (rc_create, rc_run, run_exit) = match created {
+                    Ok((child_vm, _)) => {
+                        let run = child_vm.run_spin_for(200);
+                        let rc_run = if spin_run_ok(&run) {
+                            HV_SUCCESS
+                        } else {
+                            HV_ERROR
+                        };
+                        let run_exit = spin_exit_reason(&run);
+                        let _ = child_vm.destroy();
+                        (HV_SUCCESS, rc_run, run_exit)
+                    }
+                    Err(rc) => (rc, HV_ERROR, "create-failed".to_owned()),
+                };
+                println!(
+                    "iter={iter} stage=child rc_direct={} rc_destroy={} rc_create={} rc_run={} run_exit={run_exit}",
+                    rc_label(rc_direct),
+                    rc_label(rc_destroy),
+                    rc_label(rc_create),
+                    rc_label(rc_run),
+                );
+                let code = if rc_create != HV_SUCCESS {
+                    2
+                } else if rc_run != HV_SUCCESS {
+                    3
+                } else {
+                    0
+                };
+                std::process::exit(code);
+            }
+
+            let mut status = 0;
+            let wait_rc = unsafe { libc::waitpid(child, &mut status, 0) };
+            let child_code = if wait_rc == child && libc::WIFEXITED(status) {
+                libc::WEXITSTATUS(status)
+            } else {
+                -1
+            };
+
+            let post = vm.run_spin_for(200);
+            let post_ok = spin_run_ok(&post);
+            let post_exit = spin_exit_reason(&post);
+            let exit_match = pre_exit == post_exit;
+            let (vcpu_rc, vm_rc, destroy_elapsed) = vm.destroy();
+            let ok = pre_ok
+                && post_ok
+                && exit_match
+                && child_code == 0
+                && vcpu_rc == HV_SUCCESS
+                && vm_rc == HV_SUCCESS;
+            if !ok {
+                failures += 1;
+            }
+            println!(
+                "iter={iter} stage=verdict pre_ok={pre_ok} pre_exit={pre_exit} post_ok={post_ok} post_exit={post_exit} exit_match={exit_match} child_code={child_code} parent_destroy=({},{}) create_us={} destroy_us={} ok={ok}",
+                rc_label(vcpu_rc),
+                rc_label(vm_rc),
+                create_elapsed.as_micros(),
+                destroy_elapsed.as_micros(),
+            );
+        }
+        println!("parent-keeps-vm failures={failures}");
+        i32::from(failures != 0)
+    }
+
+    fn spin_run_ok(run: &Result<SpinRun, hv_return_t>) -> bool {
+        match run {
+            Ok(run) => {
+                run.run_rc == HV_SUCCESS && run.kick_rc == HV_SUCCESS && run.exec_rc == HV_SUCCESS
+            }
+            Err(_) => false,
+        }
+    }
+
+    fn spin_exit_reason(run: &Result<SpinRun, hv_return_t>) -> String {
+        match run {
+            Ok(run) => run.exit_reason.clone(),
+            Err(rc) => rc_label(*rc),
         }
     }
 
