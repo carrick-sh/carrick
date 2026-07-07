@@ -1642,6 +1642,7 @@ where
                     flags: _,
                     parent_tid_addr,
                     child_tid_addr,
+                    clear_child_tid_addr,
                 } => {
                     let tid = state.spawn_clone_thread(
                         &kernel,
@@ -1650,6 +1651,7 @@ where
                         tls,
                         parent_tid_addr,
                         child_tid_addr,
+                        clear_child_tid_addr,
                     )?;
                     state.complete_returned(&mut engine, i64::from(tid.raw()))?;
                 }
@@ -1701,6 +1703,9 @@ where
                 }
                 DispatchOutcome::Fork {
                     pidfd_out,
+                    clone_parent,
+                    parent_tid_addr,
+                    child_tid_addr,
                     exit_signal,
                     child_stack,
                     vfork,
@@ -1709,6 +1714,9 @@ where
                         &kernel,
                         &mut engine,
                         pidfd_out,
+                        clone_parent,
+                        parent_tid_addr,
+                        child_tid_addr,
                         exit_signal,
                         child_stack,
                         vfork,

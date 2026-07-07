@@ -90,6 +90,9 @@ where
         kernel: &Kernel,
         engine: &mut E,
         pidfd_out: Option<u64>,
+        clone_parent: bool,
+        parent_tid_addr: Option<u64>,
+        child_tid_addr: Option<u64>,
         exit_signal: u32,
         child_stack: u64,
         vfork: Option<u64>,
@@ -378,11 +381,24 @@ where
                     );
                 }
                 crate::event_ring::rec(crate::event_ring::FORK, child_pid, 0, 0);
-                crate::guest_cpu::register_child_with_parent(
-                    child_pid as u32,
-                    std::process::id(),
-                    kernel.dispatcher.subreaper_for_fork_child(),
-                );
+                let child_parent = if clone_parent {
+                    kernel.dispatcher.clone_parent_host_pid()
+                } else {
+                    std::process::id()
+                };
+                if clone_parent {
+                    crate::guest_cpu::register_clone_parent_child(
+                        child_pid as u32,
+                        child_parent,
+                        kernel.dispatcher.subreaper_for_fork_child(),
+                    );
+                } else {
+                    crate::guest_cpu::register_child_with_parent(
+                        child_pid as u32,
+                        std::process::id(),
+                        kernel.dispatcher.subreaper_for_fork_child(),
+                    );
+                }
                 // Seed the child's published run-state as Booting NOW, from the
                 // parent, before this fork returns — so a parent that polls
                 // /proc/<child>/stat immediately (pauseinterrupt2) sees `R`, not
@@ -402,8 +418,12 @@ where
                 // and return the ns-pid as the fork retval. Identity when off.
                 let retval = i64::from(crate::namespace::pid::register_child(
                     child_pid as u32,
-                    std::process::id(),
+                    child_parent,
                 ));
+                if let Some(addr) = parent_tid_addr {
+                    let tid = (retval as i32).to_le_bytes();
+                    let _ = engine.write_bytes(addr, &tid);
+                }
                 // vfork: SUSPEND this (parent) vCPU thread until the child execve's
                 // (it writes one byte) or exits (the OS closes the child's write
                 // end → our read() returns EOF). We still hold `_topology`, so no
@@ -563,6 +583,14 @@ where
                 // Re-stamp identity + tid: the child's pid changed and the vCPU was
                 // rebuilt.
                 stamp_identity_page(engine, &kernel.dispatcher);
+                if let Some(addr) = parent_tid_addr {
+                    let tid = (crate::namespace::pid::self_ns_pid() as i32).to_le_bytes();
+                    let _ = engine.write_bytes(addr, &tid);
+                }
+                if let Some(addr) = child_tid_addr {
+                    let tid = (crate::namespace::pid::self_ns_pid() as i32).to_le_bytes();
+                    let _ = engine.write_bytes(addr, &tid);
+                }
                 stamp_guest_tid(engine, self.this_tid, &self.registry);
                 kernel.dispatcher.proc_after_fork_child();
                 kernel.dispatcher.sysv_after_fork_child();

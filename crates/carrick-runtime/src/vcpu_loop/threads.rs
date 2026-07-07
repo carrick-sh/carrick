@@ -401,16 +401,12 @@ where
         kernel: &Kernel,
         engine: &mut E,
         stack: u64,
-        tls: u64,
+        tls: Option<u64>,
         parent_tid_addr: u64,
         child_tid_addr: u64,
+        clear_child_tid_addr: u64,
     ) -> Result<ThreadId, RuntimeError> {
-        let clear_addr = if child_tid_addr != 0 {
-            child_tid_addr
-        } else {
-            0
-        };
-        let tid = self.registry.register_child(clear_addr);
+        let tid = self.registry.register_child(clear_child_tid_addr);
         kernel
             .dispatcher
             .inherit_thread_signal_mask(self.this_tid, tid);
@@ -425,7 +421,7 @@ where
         let spec = engine.build_sibling_spec(carrick_hal::GuestEntryRegs {
             return_value: 0,
             stack: Some(stack),
-            tls: Some(tls),
+            tls,
         })?;
         let child_kernel = Arc::clone(kernel);
         let child_registry = Arc::clone(&self.registry);

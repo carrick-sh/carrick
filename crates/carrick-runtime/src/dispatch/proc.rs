@@ -209,9 +209,9 @@ fn clone_thread_outcome(
     DispatchOutcome::CloneThread {
         stack: child_sp,
         tls: if flags & LinuxCloneFlags::SETTLS.bits() != 0 {
-            tls_val
+            Some(tls_val)
         } else {
-            0
+            None
         },
         flags,
         parent_tid_addr: if flags & LinuxCloneFlags::PARENT_SETTID.bits() != 0 {
@@ -219,15 +219,21 @@ fn clone_thread_outcome(
         } else {
             0
         },
-        child_tid_addr: if flags
-            & (LinuxCloneFlags::CHILD_SETTID | LinuxCloneFlags::CHILD_CLEARTID).bits()
-            != 0
-        {
+        child_tid_addr: if flags & LinuxCloneFlags::CHILD_SETTID.bits() != 0 {
+            child_tid_ptr
+        } else {
+            0
+        },
+        clear_child_tid_addr: if flags & LinuxCloneFlags::CHILD_CLEARTID.bits() != 0 {
             child_tid_ptr
         } else {
             0
         },
     }
+}
+
+fn is_thread_clone(flags: u64) -> bool {
+    flags & LinuxCloneFlags::THREAD.bits() != 0
 }
 
 /// policies expose MAX_USER_RT_PRIO-1 / 1; time-sharing policies expose 0/0;
@@ -680,6 +686,21 @@ impl SyscallDispatcher {
         }
     }
 
+    pub(crate) fn clone_parent_host_pid(&self) -> u32 {
+        if crate::namespace::pid::enabled() {
+            let ns_parent = crate::namespace::pid::self_ns_ppid();
+            return crate::namespace::pid::ns_to_host_or_self(ns_parent).unwrap_or(0);
+        }
+        let bootstrap_host_pid = self.proc.lock().bootstrap_host_pid;
+        if std::process::id() == bootstrap_host_pid {
+            0
+        } else if let Some(parent) = crate::guest_cpu::adopted_parent_for_self() {
+            parent
+        } else {
+            unsafe { libc::getppid() as u32 }
+        }
+    }
+
     /// Parse a `struct sock_fprog *` at `fprog_ptr` and install its cBPF program
     /// as a seccomp filter. Shared by `seccomp(SECCOMP_SET_MODE_FILTER)` and the
     /// legacy `prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, prog)` entry point.
@@ -902,8 +923,7 @@ impl SyscallDispatcher {
         if args.exit_signal != 0 && !crate::dispatch::signal::is_valid_signum(args.exit_signal) {
             return DispatchOutcome::errno(LINUX_EINVAL);
         }
-        let thread_mask = LinuxCloneFlags::THREAD_MASK;
-        if (flags & thread_mask) == thread_mask {
+        if is_thread_clone(flags) {
             if args_size < 64 {
                 return DispatchOutcome::errno(LINUX_ENOSYS);
             }
@@ -945,6 +965,17 @@ impl SyscallDispatcher {
             .then_some(args.stack.wrapping_add(args.stack_size));
         DispatchOutcome::Fork {
             pidfd_out,
+            clone_parent: flags & LinuxCloneFlags::PARENT.bits() != 0,
+            parent_tid_addr: if flags & LinuxCloneFlags::PARENT_SETTID.bits() != 0 {
+                Some(args.parent_tid)
+            } else {
+                None
+            },
+            child_tid_addr: if flags & LinuxCloneFlags::CHILD_SETTID.bits() != 0 {
+                Some(args.child_tid)
+            } else {
+                None
+            },
             exit_signal,
             child_stack: args.stack.wrapping_add(args.stack_size),
             vfork,
@@ -2730,8 +2761,7 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
 
-            let thread_mask = LinuxCloneFlags::THREAD_MASK;
-            if (flags & thread_mask) == thread_mask {
+            if is_thread_clone(flags) {
                 return Ok(clone_thread_outcome(flags, stack, parent_tid.0, tls, child_tid.0));
             }
             if flags & (LinuxCloneFlags::NEWUSER | LinuxCloneFlags::NEWPID).bits() != 0 {
@@ -2760,6 +2790,17 @@ impl SyscallDispatcher {
             Ok(DispatchOutcome::Fork {
                 child_stack: stack,
                 pidfd_out,
+                clone_parent: flags & LinuxCloneFlags::PARENT.bits() != 0,
+                parent_tid_addr: if flags & LinuxCloneFlags::PARENT_SETTID.bits() != 0 {
+                    Some(parent_tid.0)
+                } else {
+                    None
+                },
+                child_tid_addr: if flags & LinuxCloneFlags::CHILD_SETTID.bits() != 0 {
+                    Some(child_tid.0)
+                } else {
+                    None
+                },
                 exit_signal,
                 vfork,
             })
