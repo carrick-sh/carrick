@@ -21,7 +21,14 @@
 //!   / file context. This gives a one-shot, lldb-free inspection of the guest
 //!   address-space layout.
 
-use anyhow::Context;
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use anyhow::{Context, bail};
 use carrick_runtime::runtime::DebugStateSnapshot;
 
 use crate::args::DebugCommand;
@@ -60,8 +67,366 @@ pub(crate) fn run_debug(command: DebugCommand) -> anyhow::Result<()> {
                 .with_context(|| format!("failed to parse {}", path.display()))?;
             println!("{}", serde_json::to_string_pretty(&state)?);
         }
+        DebugCommand::LldbRun {
+            deadline_seconds,
+            out_dir,
+            run_id,
+            lldb_plugin,
+            no_core,
+            command,
+        } => {
+            let status = run_lldb_deadline(
+                command,
+                deadline_seconds,
+                out_dir,
+                run_id,
+                lldb_plugin,
+                no_core,
+            )?;
+            std::process::exit(status);
+        }
     }
     Ok(())
+}
+
+fn run_lldb_deadline(
+    mut run_args: Vec<String>,
+    deadline_seconds: u64,
+    out_dir: PathBuf,
+    run_id_arg: Option<String>,
+    lldb_plugin_arg: Option<PathBuf>,
+    no_core: bool,
+) -> anyhow::Result<i32> {
+    if run_args.is_empty() {
+        bail!("debug lldb-run needs `-- <carrick run args>`");
+    }
+    if run_args.first().map(String::as_str) == Some("run") {
+        bail!("debug lldb-run expects args for `carrick run`; omit the `run` word");
+    }
+
+    let name_arg = find_run_name(&run_args)?;
+    let needs_injected_name = name_arg.is_none();
+    let run_id = match (run_id_arg, name_arg) {
+        (Some(explicit), Some(name)) if explicit != name => {
+            bail!("--run-id `{explicit}` does not match forwarded --name `{name}`");
+        }
+        (Some(explicit), _) => explicit,
+        (None, Some(name)) => name,
+        (None, None) => generated_run_id(),
+    };
+    if needs_injected_name {
+        run_args.splice(0..0, [String::from("--name"), run_id.clone()]);
+    }
+
+    fs::create_dir_all(&out_dir)
+        .with_context(|| format!("failed to create {}", out_dir.display()))?;
+    let guest_log = out_dir.join(format!("{run_id}.guest.log"));
+    let lldb_log = out_dir.join(format!("{run_id}.lldb.txt"));
+    let ps_log = out_dir.join(format!("{run_id}.ps.txt"));
+    let manifest = out_dir.join(format!("{run_id}.manifest.txt"));
+    let exe = std::env::current_exe().context("failed to resolve current carrick binary path")?;
+    let lldb_plugin = lldb_plugin_arg.unwrap_or_else(default_lldb_plugin_path);
+
+    write_manifest(
+        &manifest,
+        &run_id,
+        deadline_seconds,
+        &exe,
+        &lldb_plugin,
+        &run_args,
+    )?;
+
+    let guest = File::create(&guest_log)
+        .with_context(|| format!("failed to create {}", guest_log.display()))?;
+    let guest_stderr = guest
+        .try_clone()
+        .with_context(|| format!("failed to clone {}", guest_log.display()))?;
+    let mut child = Command::new(&exe)
+        .arg("run")
+        .args(&run_args)
+        .env("CARRICK_RUN_ID", &run_id)
+        .stdout(Stdio::from(guest))
+        .stderr(Stdio::from(guest_stderr))
+        .spawn()
+        .with_context(|| format!("failed to spawn {} run", exe.display()))?;
+
+    eprintln!(
+        "carrick debug lldb-run: run_id={run_id} deadline={deadline_seconds}s guest_log={} lldb_log={}",
+        guest_log.display(),
+        lldb_log.display()
+    );
+
+    let deadline = Duration::from_secs(deadline_seconds);
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .context("failed to poll carrick run child")?
+        {
+            return Ok(exit_code(status));
+        }
+        if started.elapsed() >= deadline {
+            let why = format!("deadline-{deadline_seconds}s");
+            let pids = dump_lldb(&LldbDumpContext {
+                run_id: &run_id,
+                why: &why,
+                exe: &exe,
+                lldb_plugin: &lldb_plugin,
+                out_dir: &out_dir,
+                lldb_log: &lldb_log,
+                ps_log: &ps_log,
+                no_core,
+            })?;
+            terminate_scoped_run(&run_id, &pids, &mut child)?;
+            return Ok(124);
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+}
+
+fn find_run_name(args: &[String]) -> anyhow::Result<Option<String>> {
+    let mut iter = args.iter().peekable();
+    while let Some(arg) = iter.next() {
+        if let Some(value) = arg.strip_prefix("--name=") {
+            if value.is_empty() {
+                bail!("forwarded --name must not be empty");
+            }
+            return Ok(Some(value.to_owned()));
+        }
+        if arg == "--name" {
+            let value = iter
+                .next()
+                .context("forwarded --name is missing its value")?;
+            if value.is_empty() {
+                bail!("forwarded --name must not be empty");
+            }
+            return Ok(Some(value.to_owned()));
+        }
+    }
+    Ok(None)
+}
+
+fn generated_run_id() -> String {
+    let epoch = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_secs(),
+        Err(_) => 0,
+    };
+    format!("lldb-run-{}-{epoch}", std::process::id())
+}
+
+fn write_manifest(
+    path: &Path,
+    run_id: &str,
+    deadline_seconds: u64,
+    exe: &Path,
+    lldb_plugin: &Path,
+    run_args: &[String],
+) -> anyhow::Result<()> {
+    let mut file =
+        File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
+    writeln!(file, "run_id={run_id}")?;
+    writeln!(file, "deadline_seconds={deadline_seconds}")?;
+    writeln!(file, "exe={}", exe.display())?;
+    writeln!(file, "lldb_plugin={}", lldb_plugin.display())?;
+    writeln!(file, "run_args={}", run_args.join(" "))?;
+    Ok(())
+}
+
+#[derive(Clone, Debug)]
+struct MatchedProcess {
+    pid: libc::pid_t,
+    ppid: libc::pid_t,
+    command: String,
+}
+
+struct LldbDumpContext<'a> {
+    run_id: &'a str,
+    why: &'a str,
+    exe: &'a Path,
+    lldb_plugin: &'a Path,
+    out_dir: &'a Path,
+    lldb_log: &'a Path,
+    ps_log: &'a Path,
+    no_core: bool,
+}
+
+fn dump_lldb(ctx: &LldbDumpContext<'_>) -> anyhow::Result<Vec<MatchedProcess>> {
+    let pids = collect_scoped_processes(ctx.run_id)?;
+    write_ps_log(ctx.ps_log, &pids)?;
+
+    let mut log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(ctx.lldb_log)
+        .with_context(|| format!("failed to open {}", ctx.lldb_log.display()))?;
+    writeln!(log, "RUN_ID={} WHY={}", ctx.run_id, ctx.why)?;
+    writeln!(log, "PS_MATCHES:")?;
+    for process in &pids {
+        writeln!(log, "{} {} {}", process.pid, process.ppid, process.command)?;
+    }
+
+    for process in &pids {
+        if process.pid == std::process::id() as libc::pid_t {
+            continue;
+        }
+        writeln!(
+            log,
+            "===== lldb attach pid={} ppid={} =====",
+            process.pid, process.ppid
+        )?;
+        log.flush()?;
+        let core_path = ctx
+            .out_dir
+            .join(format!("{}.{}.core", ctx.run_id, process.pid));
+        let mut lldb = Command::new("lldb");
+        lldb.arg("--batch")
+            .arg("-o")
+            .arg(format!(
+                "command script import {}",
+                lldb_quoted_path(ctx.lldb_plugin)
+            ))
+            .arg("-o")
+            .arg(format!("attach {}", process.pid))
+            .arg("-o")
+            .arg("carrick eventring")
+            .arg("-o")
+            .arg("thread backtrace all");
+        if !ctx.no_core {
+            lldb.arg("-o").arg(format!(
+                "process save-core {}",
+                lldb_quoted_path(&core_path)
+            ));
+        }
+        lldb.arg("-o").arg("detach").arg(ctx.exe);
+
+        let stdout = log
+            .try_clone()
+            .with_context(|| format!("failed to clone {}", ctx.lldb_log.display()))?;
+        let stderr = log
+            .try_clone()
+            .with_context(|| format!("failed to clone {}", ctx.lldb_log.display()))?;
+        let status = lldb
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr))
+            .status()
+            .context("failed to run lldb")?;
+        writeln!(
+            log,
+            "===== lldb status pid={} status={} =====",
+            process.pid, status
+        )?;
+    }
+    Ok(pids)
+}
+
+fn collect_scoped_processes(run_id: &str) -> anyhow::Result<Vec<MatchedProcess>> {
+    let output = Command::new("ps")
+        .args(["-A", "-o", "pid=,ppid=,command="])
+        .output()
+        .context("failed to run ps")?;
+    if !output.status.success() {
+        bail!("ps failed with status {}", output.status);
+    }
+    let needle = format!("carrick:{run_id}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut processes = Vec::new();
+    for line in stdout.lines() {
+        if !line.contains(&needle) {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let Some(pid_raw) = parts.next() else {
+            continue;
+        };
+        let Some(ppid_raw) = parts.next() else {
+            continue;
+        };
+        let command = parts.collect::<Vec<_>>().join(" ");
+        let pid = pid_raw
+            .parse::<libc::pid_t>()
+            .with_context(|| format!("failed to parse pid from `{line}`"))?;
+        let ppid = ppid_raw
+            .parse::<libc::pid_t>()
+            .with_context(|| format!("failed to parse ppid from `{line}`"))?;
+        processes.push(MatchedProcess { pid, ppid, command });
+    }
+    Ok(processes)
+}
+
+fn write_ps_log(path: &Path, pids: &[MatchedProcess]) -> anyhow::Result<()> {
+    let mut file =
+        File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
+    for process in pids {
+        writeln!(file, "{} {} {}", process.pid, process.ppid, process.command)?;
+    }
+    Ok(())
+}
+
+fn terminate_scoped_run(
+    run_id: &str,
+    pids: &[MatchedProcess],
+    child: &mut Child,
+) -> anyhow::Result<()> {
+    let kill_script = Path::new("scripts").join("sudo").join("kill.sh");
+    if kill_script.exists() {
+        let _ = Command::new(&kill_script).arg(run_id).status();
+    }
+
+    for process in pids {
+        // SAFETY: signal delivery is scoped to pids whose proctitle matched this
+        // run id. Errors are best-effort here because the process may have exited.
+        unsafe {
+            libc::kill(process.pid, libc::SIGTERM);
+        }
+    }
+    if wait_for_child(child, Duration::from_secs(2))?.is_none() {
+        for process in pids {
+            // SAFETY: same scoped pid set as above; SIGKILL is the final cleanup
+            // after the graceful deadline expires.
+            unsafe {
+                libc::kill(process.pid, libc::SIGKILL);
+            }
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    Ok(())
+}
+
+fn wait_for_child(child: &mut Child, timeout: Duration) -> anyhow::Result<Option<i32>> {
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().context("failed to poll child")? {
+            return Ok(Some(exit_code(status)));
+        }
+        if started.elapsed() >= timeout {
+            return Ok(None);
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn exit_code(status: std::process::ExitStatus) -> i32 {
+    status.code().unwrap_or(1)
+}
+
+fn default_lldb_plugin_path() -> PathBuf {
+    let relative = Path::new("scripts").join("carrick_lldb.py");
+    if relative.exists() {
+        return relative;
+    }
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    for ancestor in manifest.ancestors() {
+        let candidate = ancestor.join("scripts").join("carrick_lldb.py");
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+    manifest.join("scripts").join("carrick_lldb.py")
+}
+
+fn lldb_quoted_path(path: &Path) -> String {
+    format!("\"{}\"", path.display())
 }
 
 /// Decode an `ESR_EL1` value into a human-readable struct. Mirrors the

@@ -768,6 +768,30 @@ pub(crate) enum DebugCommand {
     /// Read the JSON dumped by `run --debug-state-path` and print it as a
     /// human-readable summary. Useful for one-shot inspection without lldb.
     InspectState { path: PathBuf },
+    /// Run `carrick run` with a deadline and dump lldb diagnostics before
+    /// killing the scoped container when the deadline expires.
+    LldbRun {
+        /// Seconds to let the guest run before attaching lldb and saving cores.
+        #[arg(long = "deadline-seconds", default_value_t = 30)]
+        deadline_seconds: u64,
+        /// Directory for the guest log, lldb transcript, ps snapshot, and cores.
+        #[arg(long = "out-dir", default_value = "target/conformance/logs/lldb-runs")]
+        out_dir: PathBuf,
+        /// Stable container/run id. Defaults to `--name` when present, otherwise
+        /// a generated id is injected as `run --name`.
+        #[arg(long = "run-id")]
+        run_id: Option<String>,
+        /// Path to `scripts/carrick_lldb.py`. Defaults to the repo script when
+        /// running from a checkout.
+        #[arg(long = "lldb-plugin")]
+        lldb_plugin: Option<PathBuf>,
+        /// Skip `process save-core`; still records event rings and backtraces.
+        #[arg(long = "no-core")]
+        no_core: bool,
+        /// Arguments for `carrick run` after `--`, excluding the `run` word.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        command: Vec<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
