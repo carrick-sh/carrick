@@ -1047,3 +1047,105 @@ Remaining:
   it did not reproduce in the selected non-DTrace load run, so the next futex
   step should use a broader non-DTrace harness shape or lldb-run capture rather
   than another DTrace-heavy run.
+
+## 2026-07-07 07:58 - rejected single-threaded run-state publication as the futex fix
+
+Hypothesis:
+
+The threaded-loop futex enrollment fix only covered guest tasks managed by the
+threaded HVF loop. Single-threaded runtime paths still published `Running` and
+`Blocked` less explicitly, so high fanout fork waiters might still become
+visible to `/proc/<pid>/stat` before the shared futex waiter was enrolled.
+
+Tests:
+
+- A focused signed run of `ltp-futex_cmp_requeue01` matched:
+  `target/conformance/futex-requeue-single-runstate-073632.jsonl` reported
+  Carrick `7/7` vs Docker `7/7`.
+- A selected Carrick-only load run also matched all targeted semantic rows:
+  `target/conformance/selected-load-single-runstate-073646.jsonl` had
+  `ltp-futex_cmp_requeue01`, `ltp-futex_wake03`, `ltp-fcntl36`, and
+  `ltp-fcntl36_64` all matching. It still showed pathological but non-gating
+  timing in `ltp-epoll-ltp` (`36.34x`), `ltp-flock07` (`19.17x`), `ltp-creat05`
+  (`14.44x`), and `ltp-openat03` (`10.24x`).
+- A full signed `--bless` run contradicted the focused results:
+  `target/conformance/bless-after-single-runstate-073758.jsonl` stopped with
+  `ltp-futex_cmp_requeue01` as a gating regression. Carrick reported `6/54`
+  while Docker reported `7/7`; the row took `12403ms` vs `1214ms` (`10.22x`).
+
+Outcome:
+
+The single-threaded publication change did not solve the full-harness failure
+and was backed out. The record-lock fix remained good in the same full run:
+`ltp-fcntl36` matched `7/7` at `1.14x`, and `ltp-fcntl36_64` matched `7/7` at
+`1.11x`.
+
+## 2026-07-07 08:05 - full-bless futex failure is deeper than the current probe
+
+Observation:
+
+The raw failing row `target/conformance/raw/conf-84200-c398.err` showed tests
+0 through 4 passing. Test 5, the `1000` waiter case with `100` wakes and `900`
+requeues, printed `futex_cmp_requeue() returned 1000` and then stranded 47
+children that timed out. Test 6 returned `800` for `300` wakes and `500`
+requeues, but still left a child timed out and ended with 47 abnormal waiter
+exits. The bug is therefore not just the immediate `FUTEX_CMP_REQUEUE` return
+value; Carrick can account for wake/requeue credits while some forked children
+remain unable to complete normally.
+
+Tests:
+
+- `scripts/run-probe.sh futexforkrequeue` matched Docker before the host wake
+  experiment. That proves the existing probe is weaker than the full LTP
+  repeated-round/source-state shape.
+- A tighter Carrick-only stress run with `ltp-futex_cmp_requeue01`,
+  `ltp-futex_cmp_requeue02`, `ltp-futex_wake03`, and `ltp-msgstress01` also
+  matched, so the failure is not reproduced by a small adjacent-suite set.
+- A one-at-a-time host wake/dequeue experiment in `carrick-host` was rejected.
+  It made `futexforkrequeue` diverge from Docker with
+  `wake_original_count_expected=false`.
+- `carrick trace` evidence in
+  `target/conformance/logs/trace-futexfork-075636.trace` explains that rejection:
+  the source side count drained when waiters observed the source futex value
+  change, even for waiters that had not been logically dequeued from the source
+  futex. That breaks the probe's source-wake invariant.
+
+Outcome:
+
+The current design is still an approximation of process-shared
+`FUTEX_CMP_REQUEUE` on top of Darwin primitives, not a true atomic kernel
+requeue. The next decision should be explicit: either mark
+`ltp-futex_cmp_requeue01` as a known missing mechanism for this bless, or design
+a fork-coherent requeue authority that can make source dequeue, destination
+enrollment, wake accounting, and child completion agree without sleeps or
+polling backstops.
+
+## 2026-07-07 08:12 - current bless distance
+
+Evidence:
+
+`target/conformance/bless-after-single-runstate-073758.jsonl` contains 1231
+completed rows before the fail-fast run stopped. It reports:
+
+- 51 gating regressions.
+- 10 `NEW` rows.
+- 13 rows at or above the 10x oracle-time threshold.
+
+The highest-signal unresolved items are:
+
+- `ltp-futex_cmp_requeue01`: gating regression, Carrick `6/54`, Docker `7/7`,
+  `10.22x`.
+- `ltp-rt_sigqueueinfo02`: non-gating `NEW`, Carrick `1/3` plus one broken
+  setup, Docker `3/3`, `68.29x`.
+- `ltp-epoll-ltp`: semantic match but `36.41x`, which is not acceptable as a
+  healthy bless signal.
+- `ltp-creat05`: semantic match but `25.44x`.
+- `ltp-flock07`: non-gating `NEW`, Carrick `1/2`, Docker `2/2`, `19.26x`.
+
+Outcome:
+
+We are past several concrete runtime regressions, but not close enough for a
+clean conformance bless. The next bless-oriented milestone is to remove or
+honestly classify the futex requeue regression, then drive the pathological
+timing list down far enough that the new baseline does not bless order-of-
+magnitude slowdowns as if they were healthy.
