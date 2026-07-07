@@ -688,3 +688,55 @@ Outcome:
 fails only under full HVF co-scheduling jitter. It now joins the exclusive
 scheduler lane. This is deliberately narrow: nearby select/pselect rows are not
 changed unless they show the same full-load-only failure mode.
+
+## 2026-07-07 05:45 - SysV semaphore host-key collisions isolated
+
+Hypothesis:
+
+The next full bless attempt, `target/conformance/bless-current-052947.{log,jsonl}`,
+made it past the exclusive scheduling rows and then failed fast on SysV
+semaphore suites. The raw failures were `EEXIST` in `semop01`, `semop02`, and
+`semop03`, and `ENOSPC` in `semget05`. Carrick already scopes SysV shm/msg
+state by `CARRICK_RUN_ID`, but semaphore sets were still passed to Darwin
+`semget(2)` with the raw guest key, so independent LTP suites using the same
+guest IPC key collided in Darwin's host-global semaphore namespace.
+
+Tests:
+
+- Runtime unit test:
+  `cargo test -p carrick-runtime scoped_host_sem_key_separates_run_scopes`
+  passed.
+- Signed rebuild:
+  `just build` rebuilt and re-signed `target/release/carrick`.
+- First focused harness run:
+  `target/conformance/sem-scope-054226.{log,jsonl}` cleared `semop02` and
+  `semop03`, but still showed `semop01` as `2/3` and `semget05` as `0/1`.
+  This run exported one outer `CARRICK_RUN_ID`, so all four per-suite Carrick
+  children shared one SysV run scope despite their distinct `--name` values.
+- `carrick trace` run:
+  `target/conformance/logs/semop01-trace-054445.trace` and guest log showed
+  standalone `semop01` passes all four assertions; cleanup issues `IPC_RMID`
+  successfully and the next variant recreates the set.
+- Corrected focused harness run without an outer `CARRICK_RUN_ID`:
+  `target/conformance/sem-scope-noouter-054457.{log,jsonl}` matched
+  `ltp-semop01`, `ltp-semop02`, and `ltp-semop03`. Only `ltp-semget05`
+  remained a regression.
+
+Outcome:
+
+The runtime fix is valid for per-suite semaphore namespace isolation: Carrick now
+hashes the run scope into the host `key_t` before calling Darwin `semget(2)`,
+while preserving the guest-visible key in Carrick metadata and leaving
+`IPC_PRIVATE` as host-private zero. The invalid first focused run also exposed a
+debugging rule: do not wrap `carrick-conformance` itself in a single
+`CARRICK_RUN_ID` when the behavior under test depends on per-suite `--name`
+scoping.
+
+`ltp-semget05` is a separate capacity-advertising gap. The LTP source fills the
+advertised fourth `/proc/sys/kernel/sem` value using `PSEMS == 10` semaphores per
+set and expects the next allocation to fail with `ENOSPC`. Carrick advertises
+Linux's large semaphore tunables but still backs semaphore sets with Darwin's
+finite host SysV pool, so it can exhaust host semaphore capacity before the
+advertised Linux set count. That is missing functionality for a Carrick-owned
+large SysV semaphore service or honest tunable virtualization, not the key-scope
+collision fixed here.
