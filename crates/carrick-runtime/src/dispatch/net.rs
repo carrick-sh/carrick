@@ -394,12 +394,27 @@ impl SyscallDispatcher {
         &self,
         fd: i32,
         events: u32,
-        _last_ready: u32,
-        _write_backpressured: bool,
+        last_ready: u32,
+        write_backpressured: bool,
     ) -> carrick_hal::event::Interest {
         // Wire→typed seam: the guest event word is a raw u32; epoll ACCEPTS
         // unknown bits, so retain them rather than reject.
         let mut interest = epoll_interest_for(LinuxEpollEvents::from_bits_retain(events));
+        // On BSD hosts the underlying kqueue registration is level-triggered
+        // and guest EPOLLET is enforced by the software `last_ready` latch. Once
+        // EPOLLOUT has been delivered, keeping EVFILT_WRITE armed makes the
+        // instance kqueue permanently readable for an event the guest is not
+        // allowed to see again. Drop the write filter until either guest I/O
+        // consumes the edge or a write returns EAGAIN and explicitly asks to
+        // watch for writability again. Keep read armed: read-side ET uses
+        // FIONREAD growth to detect a new edge while data remains buffered.
+        if events & LINUX_EPOLLET != 0
+            && interest.write
+            && last_ready & LINUX_EPOLLOUT != 0
+            && !write_backpressured
+        {
+            interest.write = false;
+        }
         // A one-way pipe/FIFO read end is never writable under Linux, so it must
         // never carry a write filter. FreeBSD's kqueue arms `EVFILT_WRITE` on a
         // pipe read end and fires it immediately (the read end is reported
@@ -2412,6 +2427,44 @@ mod recvmmsg_tests {
             !matches!(out, DispatchOutcome::Errno { errno } if errno == LINUX_EINVAL),
             "NULL timeout must not be rejected as malformed, got {out:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod epoll_interest_tests {
+    use super::*;
+
+    #[cfg(any(
+        feature = "platform-macos",
+        feature = "platform-freebsd",
+        feature = "platform-netbsd"
+    ))]
+    #[test]
+    fn et_write_latch_temporarily_disarms_host_write_filter() {
+        let dispatcher = SyscallDispatcher::new();
+        let events = LINUX_EPOLLET | LINUX_EPOLLIN | LINUX_EPOLLOUT;
+
+        let fresh = dispatcher.epoll_effective_interest(12345, events, 0, false);
+        assert!(fresh.read);
+        assert!(fresh.write);
+
+        let latched = dispatcher.epoll_effective_interest(12345, events, LINUX_EPOLLOUT, false);
+        assert!(latched.read);
+        assert!(!latched.write);
+
+        let backpressured =
+            dispatcher.epoll_effective_interest(12345, events, LINUX_EPOLLOUT, true);
+        assert!(backpressured.read);
+        assert!(backpressured.write);
+
+        let level = dispatcher.epoll_effective_interest(
+            12345,
+            LINUX_EPOLLIN | LINUX_EPOLLOUT,
+            LINUX_EPOLLOUT,
+            false,
+        );
+        assert!(level.read);
+        assert!(level.write);
     }
 }
 
