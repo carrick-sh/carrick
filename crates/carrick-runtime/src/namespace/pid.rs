@@ -568,6 +568,21 @@ pub fn await_self_registration() {
     }
 }
 
+/// Allocate the ns-pid before `fork(2)` so the child's process record can be
+/// fully populated before either process resumes. Identity mode has no active
+/// namespace table, so the caller falls back to the host pid after fork.
+pub fn allocate_child_ns_pid_pre_fork() -> Option<u32> {
+    region().map(|r| r.alloc_ns_pid())
+}
+
+/// Notify the namespace supervisor after a pre-registered child record has had
+/// its host pid published by the fork parent.
+pub fn notify_child_registered() {
+    if enabled() {
+        notify_registration();
+    }
+}
+
 /// Register a freshly-forked child in the active ns: allocate its ns-pid and
 /// record the host↔ns mapping + its ns-parent. Returns the child's ns-pid (to
 /// be handed back to the guest as the `fork`/`clone` return value). When

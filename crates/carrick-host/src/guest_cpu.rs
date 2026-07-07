@@ -26,7 +26,7 @@ use std::time::Instant;
 use carrick_kernel::arena::{ArenaError, KernelArena};
 use carrick_kernel::domains::{HostPid, ProcessGeneration};
 use carrick_kernel::process::{
-    FLAG_ADOPTED, ProcessRecord, ProcessRecordRef, ProcessSection, REGISTERING,
+    FLAG_ADOPTED, FLAG_ALIVE, ProcessRecord, ProcessRecordRef, ProcessSection, REGISTERING,
 };
 
 /// Per-vCPU accumulated guest execution nanoseconds, one atomic slot per vCPU
@@ -191,6 +191,10 @@ static CHILD_USER_US: AtomicU64 = AtomicU64::new(0);
 static CHILD_SYS_US: AtomicU64 = AtomicU64::new(0);
 
 const RUN_STATE_KIND_TID: u64 = 1 << 40;
+const REF_NONE: u64 = u64::MAX;
+const REF_INDEX_MASK: u64 = 0xffff_ffff;
+
+static PENDING_CHILD_RECORD: AtomicU64 = AtomicU64::new(REF_NONE);
 
 /// Ensure the arena exists before any `fork`, so every descendant inherits the
 /// same process section. Idempotent.
@@ -204,6 +208,25 @@ fn process_section() -> &'static ProcessSection {
 
 fn process_records() -> &'static [ProcessRecord] {
     &process_section().records
+}
+
+fn pack_ref(r: ProcessRecordRef) -> u64 {
+    (u64::from(r.generation.raw()) << 32) | (r.index as u64)
+}
+
+fn unpack_ref(raw: u64) -> Option<ProcessRecordRef> {
+    if raw == REF_NONE {
+        return None;
+    }
+    let index = (raw & REF_INDEX_MASK) as usize;
+    let generation = (raw >> 32) as u32;
+    if generation == 0 {
+        return None;
+    }
+    Some(ProcessRecordRef {
+        index,
+        generation: ProcessGeneration::new(generation),
+    })
 }
 
 fn record_pid(record: &ProcessRecord) -> u32 {
@@ -263,6 +286,63 @@ fn claim_child_record(pid: u32, fill: impl FnOnce(&ProcessRecord)) -> ProcessRec
 fn abort_on_arena_error(err: ArenaError) -> ! {
     eprintln!("carrick: child metadata arena publication failed: {err:?}");
     std::process::abort();
+}
+
+/// Claim and fill a child process record before `fork(2)` publishes the child's
+/// host pid. The pending ref is inherited by the fork child; both parent and
+/// child publish the same host pid after fork, which is intentionally idempotent.
+pub fn prepare_child_record_pre_fork(
+    parent_pid: u32,
+    subreaper_pid: u32,
+    ns_pid: u32,
+    adopted: bool,
+    ptrace_stop_signal: u64,
+) -> ProcessRecordRef {
+    init_child_table();
+    let generation = KernelArena::global().allocate_generation();
+    let r = match process_section().claim(None, generation, |record| {
+        record.parent_host_pid.store(parent_pid, Ordering::Release);
+        record.subreaper_pid.store(subreaper_pid, Ordering::Release);
+        record.ns_pid.store(ns_pid, Ordering::Release);
+        record
+            .ptrace_stop_signal
+            .store(ptrace_stop_signal, Ordering::Release);
+        record.flags.fetch_or(FLAG_ALIVE, Ordering::AcqRel);
+        set_adopted(record, adopted);
+    }) {
+        Ok(r) => r,
+        Err(err) => abort_on_arena_error(err),
+    };
+    PENDING_CHILD_RECORD.store(pack_ref(r), Ordering::Release);
+    r
+}
+
+pub fn publish_prepared_child_record_parent(child_pid: u32) {
+    let Some(r) = unpack_ref(PENDING_CHILD_RECORD.swap(REF_NONE, Ordering::AcqRel)) else {
+        return;
+    };
+    process_section().publish_host_pid(r, HostPid::new(child_pid));
+}
+
+pub fn complete_child_record_post_fork_child() {
+    let Some(r) = unpack_ref(PENDING_CHILD_RECORD.swap(REF_NONE, Ordering::AcqRel)) else {
+        return;
+    };
+    process_section().publish_host_pid(r, HostPid::new(std::process::id()));
+    if let Some(record) = record_for_ref(r) {
+        let recorded_parent = record_parent_pid(record);
+        let host_parent = unsafe { libc::getppid() };
+        if recorded_parent != 0 && recorded_parent != host_parent as u32 {
+            set_adopted(record, true);
+        }
+    }
+}
+
+pub fn abort_prepared_child_record() {
+    let Some(r) = unpack_ref(PENDING_CHILD_RECORD.swap(REF_NONE, Ordering::AcqRel)) else {
+        return;
+    };
+    process_section().release(r);
 }
 
 fn adopted_flag(record: &ProcessRecord) -> bool {
@@ -346,6 +426,10 @@ fn record_ptrace_stop_signal(record: &ProcessRecord) -> u64 {
 
 fn record_guest_ns(record: &ProcessRecord) -> u64 {
     record.guest_ns.load(Ordering::Acquire)
+}
+
+fn record_ns_pid(record: &ProcessRecord) -> u32 {
+    record.ns_pid.load(Ordering::Acquire)
 }
 
 fn record_exit_status(record: &ProcessRecord) -> i32 {
@@ -455,6 +539,7 @@ pub fn record_child_exit(pid: u32, guest_ns: u64) {
 /// the subreaper can consume even though the host kernel cannot wait it.
 pub fn record_child_exit_status(pid: u32, guest_ns: u64, status: i32, status_ready: bool) {
     if let Some(record) = child_record(pid) {
+        let status_ready = status_ready || adopted_flag(record);
         record.guest_ns.store(guest_ns, Ordering::Release);
         record.ptrace_stop_signal.store(0, Ordering::Release);
         if status_ready {
@@ -494,7 +579,13 @@ pub fn reap_adopted_child(waiter_pid: u32, target_pid: i32) -> Option<(u32, i32,
         }
         let status = record_exit_status(record);
         let ns = record_guest_ns(record);
-        release_record(record);
+        if record_ns_pid(record) == 0 {
+            release_record(record);
+        } else {
+            record.guest_ns.store(0, Ordering::Release);
+            record.ptrace_stop_signal.store(0, Ordering::Release);
+            store_exit_ready(record, false);
+        }
         return Some((pid, status, ns));
     }
     None
@@ -543,12 +634,19 @@ pub fn direct_children_for_wait(waiter_pid: u32) -> Vec<u32> {
     children
 }
 
-/// Drain a reaped child's published guest CPU nanoseconds (0 if none), freeing
-/// the slot. Called from the parent's `wait4` after a successful reap.
+/// Drain a child's published guest CPU nanoseconds (0 if none).
+///
+/// Namespace-member records also carry pid translation state, so they stay
+/// published until the terminal namespace reap releases them. Non-namespace
+/// child metadata remains owned by this table and is freed here.
 pub fn reap_child_guest_ns(pid: u32) -> u64 {
     if let Some(record) = child_record(pid) {
         let ns = record_guest_ns(record);
-        release_child_pid(pid);
+        record.guest_ns.store(0, Ordering::Release);
+        record.ptrace_stop_signal.store(0, Ordering::Release);
+        if record_ns_pid(record) == 0 {
+            release_child_pid(pid);
+        }
         return ns;
     }
     0
@@ -650,6 +748,56 @@ mod tests {
     }
 
     #[test]
+    fn adopted_record_exit_is_waitable_even_when_caller_did_not_preclassify_it() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        init_child_table();
+        let child = 525_262;
+        let parent = 424_252;
+
+        let _ = reap_child_guest_ns(child);
+        register_clone_parent_child(child, parent, 0);
+
+        record_child_exit_status(child, 6789, 0x2b00, false);
+        assert_eq!(
+            reap_adopted_child(parent, child as i32),
+            Some((child, 0x2b00, 6789))
+        );
+    }
+
+    #[test]
+    fn adopted_reap_keeps_namespace_member_record_for_pid_translation() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        init_child_table();
+        let child = 525_272;
+        let parent = 424_262;
+        let ns_pid = 45_104;
+
+        let _ = reap_child_guest_ns(child);
+        let generation = KernelArena::global().allocate_generation();
+        let r = process_section()
+            .claim(Some(HostPid::new(child)), generation, |record| {
+                record.parent_host_pid.store(parent, Ordering::Release);
+                record.ns_pid.store(ns_pid, Ordering::Release);
+                record.guest_ns.store(2345, Ordering::Release);
+                set_adopted(record, true);
+                store_exit_status(record, 0x2c00);
+                store_exit_ready(record, true);
+            })
+            .expect("claim adopted namespace child record");
+
+        assert_eq!(
+            reap_adopted_child(parent, child as i32),
+            Some((child, 0x2c00, 2345))
+        );
+        let record = child_record(child).expect("namespace record remains for translation");
+        assert_eq!(record_ns_pid(record), ns_pid);
+        assert_eq!(record_guest_ns(record), 0);
+        assert!(!record_exit_ready(record));
+
+        release_child_record(r);
+    }
+
+    #[test]
     fn direct_children_for_wait_excludes_adopted_children() {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         init_child_table();
@@ -731,6 +879,106 @@ mod tests {
         assert_eq!(parent_pid_for_test(child_pid), Some(parent_pid));
 
         let _ = reap_child_guest_ns(child_pid);
+    }
+
+    #[test]
+    fn prefork_record_is_complete_when_child_publishes_host_pid() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        init_child_table();
+        let parent_pid = std::process::id();
+        let ns_pid = 45_002;
+        let stop_signal = libc::SIGTRAP;
+
+        prepare_child_record_pre_fork(parent_pid, 0, ns_pid, false, stop_signal as u64);
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed");
+        if child == 0 {
+            complete_child_record_post_fork_child();
+            let me = std::process::id();
+            let ok = child_record(me).is_some_and(|record| {
+                record_parent_pid(record) == parent_pid
+                    && record.ns_pid.load(Ordering::Acquire) == ns_pid
+                    && record.ptrace_stop_signal.load(Ordering::Acquire) == stop_signal as u64
+            });
+            unsafe { libc::_exit(if ok { 0 } else { 71 }) };
+        }
+
+        publish_prepared_child_record_parent(child as u32);
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(child, &mut status, 0) };
+        assert_eq!(waited, child);
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+
+        let record = child_record(child as u32).expect("child record remains published");
+        assert_eq!(record_parent_pid(record), parent_pid);
+        assert_eq!(record.ns_pid.load(Ordering::Acquire), ns_pid);
+        assert_eq!(
+            record.ptrace_stop_signal.load(Ordering::Acquire),
+            stop_signal as u64
+        );
+        let Some(r) = find_child_record(child as u32) else {
+            panic!("child record should remain published");
+        };
+        release_child_record(r);
+    }
+
+    #[test]
+    fn prefork_child_marks_adopted_when_recorded_parent_differs_from_host_parent() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        init_child_table();
+        let recorded_parent = std::process::id().saturating_add(10_000);
+
+        prepare_child_record_pre_fork(recorded_parent, 0, 45_052, false, 0);
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed");
+        if child == 0 {
+            complete_child_record_post_fork_child();
+            let ok = adopted_parent_for_self() == Some(recorded_parent);
+            unsafe { libc::_exit(if ok { 0 } else { 72 }) };
+        }
+
+        publish_prepared_child_record_parent(child as u32);
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(child, &mut status, 0) };
+        assert_eq!(waited, child);
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+
+        let Some(r) = find_child_record(child as u32) else {
+            panic!("child record should remain published");
+        };
+        release_child_record(r);
+    }
+
+    #[test]
+    fn guest_cpu_drain_keeps_namespace_member_record_published() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        init_child_table();
+        let parent = 45_101;
+        let child = 45_102;
+        let ns_pid = 45_103;
+
+        let _ = reap_child_guest_ns(child);
+        let generation = KernelArena::global().allocate_generation();
+        let r = process_section()
+            .claim(Some(HostPid::new(child)), generation, |record| {
+                record.parent_host_pid.store(parent, Ordering::Release);
+                record.ns_pid.store(ns_pid, Ordering::Release);
+                record.guest_ns.store(12_345, Ordering::Release);
+                record
+                    .ptrace_stop_signal
+                    .store(libc::SIGSTOP as u64, Ordering::Release);
+            })
+            .expect("claim namespace child record");
+
+        assert_eq!(reap_child_guest_ns(child), 12_345);
+        let record = child_record(child).expect("namespace record remains published");
+        assert_eq!(record_ns_pid(record), ns_pid);
+        assert_eq!(record_guest_ns(record), 0);
+        assert_eq!(record_ptrace_stop_signal(record), 0);
+
+        release_child_record(r);
     }
 
     #[test]
