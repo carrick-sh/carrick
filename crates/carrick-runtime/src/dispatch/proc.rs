@@ -2461,16 +2461,11 @@ impl SyscallDispatcher {
                     return Some(host_target);
                 }
                 if host_target == -1 {
-                    return crate::guest_cpu::direct_children_for_wait(std::process::id())
-                        .into_iter()
-                        .next()
-                        .or_else(|| {
-                            crate::guest_cpu::pending_adopted_child(
-                                std::process::id(),
-                                host_target,
-                            )
-                        })
-                        .map(|pid| pid as i32);
+                    // -1 stays -1 while any direct child exists: the io_wait
+                    // any-child kqueue path watches EVERY direct child, so a
+                    // single-pid substitution would sleep through a sibling's
+                    // exit. None (no children at all) becomes ECHILD below.
+                    return crate::guest_cpu::wait_any_park_pid(std::process::id());
                 }
                 None
             };
