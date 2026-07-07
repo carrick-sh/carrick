@@ -1481,7 +1481,7 @@ fn epoll_waits_on_host_backed_edge_interests_when_no_event_is_ready() {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn epoll_latched_host_edge_parks_on_signal_wait_instead_of_kqueue_fd() {
+fn epoll_latched_host_edge_parks_on_kqueue_edge_not_timeout_backstop() {
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x800]);
     let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
@@ -1575,11 +1575,11 @@ fn epoll_latched_host_edge_parks_on_signal_wait_instead_of_kqueue_fd() {
         sig_mask,
     } = outcome
     else {
-        panic!("expected latch-masked level event to park on retry wait, got {outcome:?}");
+        panic!("expected latch-masked edge to park on kqueue edge, got {outcome:?}");
     };
     assert_eq!(fds.len(), 1);
     assert!(fds[0].fd() >= 0);
-    assert_eq!(fds[0].events(), 0);
+    assert_eq!(fds[0].events() & libc::POLLIN, libc::POLLIN);
     assert_eq!(timeout, Some(std::time::Duration::from_millis(25)));
     assert_eq!(on_timeout, 0);
     assert_eq!(sig_mask.raw_block_bits(), 0);
