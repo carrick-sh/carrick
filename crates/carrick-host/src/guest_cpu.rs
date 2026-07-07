@@ -362,36 +362,6 @@ fn set_adopted(record: &ProcessRecord, adopted: bool) {
     }
 }
 
-/// Register a live child so descendants can publish metadata before exit.
-pub fn register_child(pid: u32) {
-    register_child_with_parent(pid, 0, 0);
-}
-
-/// Register a live child with enough ancestry to model child-subreaper adoption.
-pub fn register_child_with_parent(pid: u32, parent_pid: u32, subreaper_pid: u32) {
-    register_child_slot(pid, parent_pid, subreaper_pid, false);
-}
-
-/// Register a child whose guest-visible parent is not its host parent.
-///
-/// `CLONE_PARENT` makes the new child a sibling of the caller in Linux's process
-/// tree. Carrick still has to create it with host `fork(2)`, so the host parent
-/// is the caller; mark the slot adopted immediately so guest `getppid()` and
-/// parent-side `wait4()` consult this table instead of the host tree.
-pub fn register_clone_parent_child(pid: u32, parent_pid: u32, subreaper_pid: u32) {
-    register_child_slot(pid, parent_pid, subreaper_pid, parent_pid != 0);
-}
-
-fn register_child_slot(pid: u32, parent_pid: u32, subreaper_pid: u32, adopted: bool) {
-    claim_child_record(pid, |record| {
-        if parent_pid != 0 || subreaper_pid != 0 || adopted {
-            record.parent_host_pid.store(parent_pid, Ordering::Release);
-            record.subreaper_pid.store(subreaper_pid, Ordering::Release);
-            set_adopted(record, adopted);
-        }
-    });
-}
-
 fn release_child_record(r: ProcessRecordRef) {
     process_section().release(r);
 }
@@ -697,6 +667,15 @@ mod tests {
 
     static TEST_LOCK: Mutex<()> = Mutex::new(());
 
+    /// Register a (test) child through the production pre-fork path: claim +
+    /// fill by the parent, then publish the child pid by ref. The legacy
+    /// post-fork registration fns are deleted; every registration goes this
+    /// way now.
+    fn register_for_test(child: u32, parent: u32, subreaper: u32, adopted: bool) {
+        let r = prepare_child_record_pre_fork(parent, subreaper, 0, adopted, 0);
+        publish_prepared_child_record_parent_ref(r, child);
+    }
+
     #[test]
     fn add_then_sum_accumulates() {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
@@ -731,7 +710,7 @@ mod tests {
         let pid = 424_242;
 
         let _ = reap_child_guest_ns(pid);
-        register_child(pid);
+        register_for_test(pid, 0, 0, false);
         assert!(!child_has_ptrace_stop_pending(pid));
 
         mark_ptrace_stop_pending_for_test(pid, 16);
@@ -758,7 +737,7 @@ mod tests {
         let parent = 424_242;
 
         let _ = reap_child_guest_ns(child);
-        register_clone_parent_child(child, parent, 0);
+        register_for_test(child, parent, 0, true);
 
         assert_eq!(adopted_parent_for(child), Some(parent));
         assert_eq!(pending_adopted_child(parent, child as i32), Some(child));
@@ -778,7 +757,7 @@ mod tests {
         let parent = 424_252;
 
         let _ = reap_child_guest_ns(child);
-        register_clone_parent_child(child, parent, 0);
+        register_for_test(child, parent, 0, true);
 
         record_child_exit_status(child, 6789, 0x2b00, false);
         assert_eq!(
@@ -830,8 +809,8 @@ mod tests {
 
         let _ = reap_child_guest_ns(direct);
         let _ = reap_child_guest_ns(adopted);
-        register_child_with_parent(direct, parent, 0);
-        register_clone_parent_child(adopted, parent, 0);
+        register_for_test(direct, parent, 0, false);
+        register_for_test(adopted, parent, 0, true);
 
         let children = direct_children_for_wait(parent);
         assert!(children.contains(&direct));
@@ -852,8 +831,8 @@ mod tests {
 
         let _ = reap_child_guest_ns(direct);
         let _ = reap_child_guest_ns(adopted);
-        register_child_with_parent(direct, parent, 0);
-        register_clone_parent_child(adopted, parent, 0);
+        register_for_test(direct, parent, 0, false);
+        register_for_test(adopted, parent, 0, true);
 
         mark_ptrace_stop_pending_for_test(adopted, 5);
         assert!(!direct_child_ptrace_stop_pending(parent));
@@ -867,41 +846,23 @@ mod tests {
     }
 
     #[test]
-    fn late_parent_registration_preserves_ptrace_stop_marker() {
+    fn ptrace_stop_marker_persists_on_prefork_record() {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         init_child_table();
         let parent = 717_181;
         let child = 717_182;
 
+        // New invariant: the record is COMPLETE at publish (pre-fork fill), so
+        // a ptrace-stop marker lands on an already-complete record and is
+        // visible through the direct-child wait scan.
         let _ = reap_child_guest_ns(child);
-        register_child(child);
+        register_for_test(child, parent, 0, false);
         mark_ptrace_stop_pending_for_test(child, 19);
-
-        register_child_with_parent(child, parent, 0);
 
         assert!(direct_child_ptrace_stop_pending(parent));
         assert_eq!(take_child_ptrace_stop_signal(child), Some(19));
 
         let _ = reap_child_guest_ns(child);
-    }
-
-    #[test]
-    fn late_parent_registration_preserves_ptrace_stop_and_ancestry() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
-        init_child_table();
-        let child_pid = 44_001;
-        let parent_pid = 44_000;
-
-        let _ = reap_child_guest_ns(child_pid);
-        register_self_for_test(child_pid);
-        mark_ptrace_stop_pending_for_test(child_pid, libc::SIGSTOP);
-
-        register_child_with_parent(child_pid, parent_pid, 0);
-
-        assert_eq!(ptrace_stop_signal_for_test(child_pid), Some(libc::SIGSTOP));
-        assert_eq!(parent_pid_for_test(child_pid), Some(parent_pid));
-
-        let _ = reap_child_guest_ns(child_pid);
     }
 
     #[test]
@@ -1073,28 +1034,6 @@ mod tests {
         assert_eq!(record_ptrace_stop_signal(record), 0);
 
         release_child_record(r);
-    }
-
-    #[test]
-    fn child_self_registration_preserves_parent_ancestry() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
-        init_child_table();
-        let parent = 717_191;
-        let child = 717_192;
-
-        let _ = reap_child_guest_ns(child);
-        register_child_with_parent(child, parent, 0);
-        assert_eq!(direct_children_for_wait(parent), vec![child]);
-
-        register_child(child);
-
-        assert_eq!(direct_children_for_wait(parent), vec![child]);
-
-        let _ = reap_child_guest_ns(child);
-    }
-
-    fn register_self_for_test(pid: u32) {
-        register_child(pid);
     }
 
     fn mark_ptrace_stop_pending_for_test(pid: u32, signum: i32) {
