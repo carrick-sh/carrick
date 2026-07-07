@@ -62,6 +62,27 @@ pub struct EpollMaskedProbe {
     pub last_read_avail: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct UlockRequeueProbe {
+    pub phase: u32,
+    pub from_key: u64,
+    pub to_key: u64,
+    pub wake_req: u32,
+    pub requeue_req: u32,
+    pub wake_ret: u32,
+    pub requeue_ret: u32,
+    pub from_count: u32,
+    pub from_requeue_wake: u32,
+    pub from_requeue_count: u32,
+    pub from_logical_requeued: u32,
+    pub from_logical_wake: u32,
+    pub to_count: u32,
+    pub to_requeue_wake: u32,
+    pub to_requeue_count: u32,
+    pub to_logical_requeued: u32,
+    pub to_logical_wake: u32,
+}
+
 #[cfg(any(
     target_os = "macos",
     all(
@@ -214,6 +235,9 @@ mod real {
         /// Fires for each iteration of the dispatcher's FUTEX_WAKE loop:
         /// `pid`, `host_addr`, `iter`, `rc` (0 on wake-one success, <0 on ENOENT).
         fn ulock__wake(_: u32, _: u64, _: i32, _: i64) {}
+        /// Raw-pointer payload for shared-futex requeue side-table accounting.
+        /// See `UlockRequeueProbe`; phase 0=before host requeue, 1=after.
+        fn ulock__requeue(_: u64) {}
         /// A cross-process futex wait slice returned a host errno OUTSIDE the
         /// Linux FUTEX_WAIT set (not ETIMEDOUT/EINTR), which the shared ABI guard
         /// folds to a spurious wake instead of leaking it (glibc nptl would abort
@@ -449,6 +473,82 @@ mod real {
 
     pub fn ulock_wake(host_addr: u64, iter: i32, rc: i64) {
         carrick_usdt::ulock__wake!(|| (std::process::id(), host_addr, iter, rc));
+    }
+
+    #[derive(Clone, Copy)]
+    #[repr(C)]
+    struct UlockRequeueWireProbe {
+        pid: u64,
+        phase: u64,
+        from_key: u64,
+        to_key: u64,
+        wake_req: u64,
+        requeue_req: u64,
+        wake_ret: u64,
+        requeue_ret: u64,
+        from_count: u64,
+        from_requeue_wake: u64,
+        from_requeue_count: u64,
+        from_logical_requeued: u64,
+        from_logical_wake: u64,
+        to_count: u64,
+        to_requeue_wake: u64,
+        to_requeue_count: u64,
+        to_logical_requeued: u64,
+        to_logical_wake: u64,
+    }
+
+    thread_local! {
+        static ULOCK_REQUEUE_PROBE: std::cell::Cell<UlockRequeueWireProbe> =
+            const { std::cell::Cell::new(UlockRequeueWireProbe {
+                pid: 0,
+                phase: 0,
+                from_key: 0,
+                to_key: 0,
+                wake_req: 0,
+                requeue_req: 0,
+                wake_ret: 0,
+                requeue_ret: 0,
+                from_count: 0,
+                from_requeue_wake: 0,
+                from_requeue_count: 0,
+                from_logical_requeued: 0,
+                from_logical_wake: 0,
+                to_count: 0,
+                to_requeue_wake: 0,
+                to_requeue_count: 0,
+                to_logical_requeued: 0,
+                to_logical_wake: 0,
+            }) };
+    }
+
+    #[inline(never)]
+    pub fn ulock_requeue(sample: super::UlockRequeueProbe) {
+        let payload = UlockRequeueWireProbe {
+            pid: std::process::id() as u64,
+            phase: sample.phase as u64,
+            from_key: sample.from_key,
+            to_key: sample.to_key,
+            wake_req: sample.wake_req as u64,
+            requeue_req: sample.requeue_req as u64,
+            wake_ret: sample.wake_ret as u64,
+            requeue_ret: sample.requeue_ret as u64,
+            from_count: sample.from_count as u64,
+            from_requeue_wake: sample.from_requeue_wake as u64,
+            from_requeue_count: sample.from_requeue_count as u64,
+            from_logical_requeued: sample.from_logical_requeued as u64,
+            from_logical_wake: sample.from_logical_wake as u64,
+            to_count: sample.to_count as u64,
+            to_requeue_wake: sample.to_requeue_wake as u64,
+            to_requeue_count: sample.to_requeue_count as u64,
+            to_logical_requeued: sample.to_logical_requeued as u64,
+            to_logical_wake: sample.to_logical_wake as u64,
+        };
+        ULOCK_REQUEUE_PROBE.with(|slot| {
+            slot.set(payload);
+            let ptr = slot.as_ptr() as u64;
+            carrick_usdt::ulock__requeue!(|| ptr);
+        });
     }
 
     pub fn futex_unexpected_errno(host_addr: u64, errno: i32) {
@@ -1160,6 +1260,7 @@ mod stub {
     stub!(futex_route(addr: u64, op: i32, shared: i32, host_addr: u64));
     stub!(ulock_wait(host_addr: u64, value: u32, timeout_us: u32, phase: i32, rc: i64));
     stub!(ulock_wake(host_addr: u64, iter: i32, rc: i64));
+    stub!(ulock_requeue(sample: super::UlockRequeueProbe));
     stub!(futex_unexpected_errno(host_addr: u64, errno: i32));
     stub!(guest_exit(code: i32));
     stub!(mn_admit(tid: i32, slot: u32, budget: u32));

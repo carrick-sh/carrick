@@ -904,3 +904,37 @@ large wait sets under full HVF load. Options to evaluate before editing again:
   consumed by physically woken source waiters;
 - run the smallest deterministic child-fanout reducer that reproduces the
   100/1000-waiter load case outside the full LTP harness.
+
+## 2026-07-07 06:44 - shared-futex requeue tracepoint added
+
+Change:
+
+Added `ulock-requeue` USDT instrumentation and
+`scripts/dtrace/futex-requeue-debug.d`. The probe snapshots the fork-shared
+ulock waiter side table before and after a shared `FUTEX_REQUEUE` /
+`FUTEX_CMP_REQUEUE`: source/destination keys, requested wake/requeue counts,
+returned wake/requeue counts, source waiter counts, source wake/requeue credits,
+and destination logical counts.
+
+Verification:
+
+- `cargo check -p carrick-observability -p carrick-host -p carrick-vmm-hvf -p carrick-runtime`
+  passed.
+- `just build` rebuilt and re-signed `target/release/carrick`.
+- Bounded trace command:
+  `target/release/carrick trace --script scripts/dtrace/futex-requeue-debug.d --trace-out target/conformance/logs/futex-requeue-trace-064426.trace -- run --name futex-requeue-trace-064426 --max-traps 18446744073709551615 --raw --fs host localhost:5050/ltp:arm64 /bin/sh -c /opt/ltp/testcases/bin/futex_cmp_requeue01`
+  completed with `futex_cmp_requeue01` passing `7/7`.
+
+Trace outcome:
+
+The new probe fires for all seven `CMP_REQUEUE` cases. In the focused passing
+run, phase 0 saw the expected enrolled waiter counts (`10`, `100`, `1000`).
+Phase 1 showed the emulation behavior directly: for the 100-waiter 50/50 case,
+the source side table already read `count=95 wake=45 requeue=50` while the
+destination logical count was `50`; for the 1000-waiter 100/900 case, source
+read `count=988 wake=88 requeue=900` while destination logical count was `900`.
+
+This confirms the current design is not an atomic move. It relies on physically
+woken source waiters to consume source credits, while the destination wake path
+uses logical destination counts. The next fix should be evaluated with this
+trace under a failing/full-load scenario, not by another blind credit tweak.

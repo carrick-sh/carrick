@@ -1235,6 +1235,7 @@ where
                 wake,
                 requeue,
             } => {
+                trace_shared_futex_requeue(0, from_key, to_key, wake, requeue, 0, 0);
                 let (woken, requeued) = crate::ulock::requeue_counted(
                     from.wait_addr().raw(),
                     from_key,
@@ -1243,6 +1244,7 @@ where
                     wake,
                     requeue,
                 );
+                trace_shared_futex_requeue(1, from_key, to_key, wake, requeue, woken, requeued);
                 let retval = i64::from(woken + requeued);
                 runtime.complete_syscall(retval)?;
                 last_syscall_retval = Some(retval);
@@ -1775,6 +1777,38 @@ fn shared_futex_wake(host_addr: usize, waiter_key: usize, count: u32) -> i64 {
     let woke = crate::ulock::wake_counted(host_addr, waiter_key, count);
     crate::probes::ulock_wake(host_addr as u64, 0, woke);
     woke.max(0)
+}
+
+fn trace_shared_futex_requeue(
+    phase: u32,
+    from_key: usize,
+    to_key: usize,
+    wake_req: u32,
+    requeue_req: u32,
+    wake_ret: u32,
+    requeue_ret: u32,
+) {
+    let from = crate::ulock::waiter_debug_counts(from_key);
+    let to = crate::ulock::waiter_debug_counts(to_key);
+    crate::probes::ulock_requeue(crate::probes::UlockRequeueProbe {
+        phase,
+        from_key: from_key as u64,
+        to_key: to_key as u64,
+        wake_req,
+        requeue_req,
+        wake_ret,
+        requeue_ret,
+        from_count: from.count,
+        from_requeue_wake: from.requeue_wake,
+        from_requeue_count: from.requeue_count,
+        from_logical_requeued: from.logical_requeued,
+        from_logical_wake: from.logical_wake,
+        to_count: to.count,
+        to_requeue_wake: to.requeue_wake,
+        to_requeue_count: to.requeue_count,
+        to_logical_requeued: to.logical_requeued,
+        to_logical_wake: to.logical_wake,
+    });
 }
 
 /// Absolute host path to Apple's Rosetta 2 Linux ELF interpreter. This is an
