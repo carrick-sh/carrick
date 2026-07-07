@@ -392,10 +392,16 @@ pub fn spawn_signal_pump(
                     break;
                 }
                 let pending_threads = crate::host_signal::pending_thread_tids();
-                if crate::host_signal::has_process_pending() {
+                if crate::host_signal::has_process_pending()
+                    || crate::host_signal::xsig_has_unblocked_for_self(
+                        carrick_abi::SigBlockMask::NONE,
+                    )
+                {
                     // A process-directed signal can be delivered by any guest
-                    // thread, so every in-guest vCPU and futex waiter must
-                    // re-check pending at its next safe point.
+                    // thread. Xsignals sit in the fork-shared ring until a vCPU
+                    // reaches dispatch context and drains them, so the pump must
+                    // also kick on the ring peek, not just on already-drained
+                    // pending bits.
                     kicker.kick_all();
                     futex.notify_signal_pending();
                 }

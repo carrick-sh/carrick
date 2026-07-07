@@ -271,11 +271,12 @@ fn register_child_slot(pid: u32, parent_pid: u32, subreaper_pid: u32, adopted: b
     let Some(slots) = child_slots() else { return };
     for slot in slots {
         if slot.pid.load(Ordering::Acquire) == pid as u64 {
-            slot.parent_pid.store(parent_pid as u64, Ordering::Release);
-            slot.subreaper_pid
-                .store(subreaper_pid as u64, Ordering::Release);
-            slot.adopted.store(u64::from(adopted), Ordering::Release);
-            slot.ptrace_stop_signal.store(0, Ordering::Release);
+            if parent_pid != 0 || subreaper_pid != 0 || adopted {
+                slot.parent_pid.store(parent_pid as u64, Ordering::Release);
+                slot.subreaper_pid
+                    .store(subreaper_pid as u64, Ordering::Release);
+                slot.adopted.store(u64::from(adopted), Ordering::Release);
+            }
             return;
         }
     }
@@ -381,6 +382,29 @@ pub fn child_has_ptrace_stop_pending(pid: u32) -> bool {
     for slot in slots {
         if slot.pid.load(Ordering::Acquire) == pid as u64 {
             return slot.ptrace_stop_signal.load(Ordering::Acquire) != 0;
+        }
+    }
+    false
+}
+
+/// Whether any direct, non-adopted child of `waiter_pid` has an unreported
+/// ptrace signal-delivery stop.
+pub fn direct_child_ptrace_stop_pending(waiter_pid: u32) -> bool {
+    let Some(slots) = child_slots() else {
+        return false;
+    };
+    for slot in slots {
+        if slot.pid.load(Ordering::Acquire) == 0 {
+            continue;
+        }
+        if slot.adopted.load(Ordering::Acquire) != 0 {
+            continue;
+        }
+        if slot.parent_pid.load(Ordering::Acquire) != u64::from(waiter_pid) {
+            continue;
+        }
+        if slot.ptrace_stop_signal.load(Ordering::Acquire) != 0 {
+            return true;
         }
     }
     false
@@ -656,5 +680,78 @@ mod tests {
         let _ = reap_child_guest_ns(direct);
         record_child_exit_status(adopted, 0, 0, true);
         let _ = reap_adopted_child(parent, adopted as i32);
+    }
+
+    #[test]
+    fn direct_child_ptrace_stop_pending_excludes_adopted_children() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        init_child_table();
+        let parent = 717_171;
+        let direct = 717_172;
+        let adopted = 717_173;
+
+        let _ = reap_child_guest_ns(direct);
+        let _ = reap_child_guest_ns(adopted);
+        register_child_with_parent(direct, parent, 0);
+        register_clone_parent_child(adopted, parent, 0);
+
+        for slot in child_slots().unwrap() {
+            if slot.pid.load(Ordering::Acquire) == adopted as u64 {
+                slot.ptrace_stop_signal.store(5, Ordering::Release);
+            }
+        }
+        assert!(!direct_child_ptrace_stop_pending(parent));
+
+        for slot in child_slots().unwrap() {
+            if slot.pid.load(Ordering::Acquire) == direct as u64 {
+                slot.ptrace_stop_signal.store(5, Ordering::Release);
+            }
+        }
+        assert!(direct_child_ptrace_stop_pending(parent));
+
+        let _ = reap_child_guest_ns(direct);
+        record_child_exit_status(adopted, 0, 0, true);
+        let _ = reap_adopted_child(parent, adopted as i32);
+    }
+
+    #[test]
+    fn late_parent_registration_preserves_ptrace_stop_marker() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        init_child_table();
+        let parent = 717_181;
+        let child = 717_182;
+
+        let _ = reap_child_guest_ns(child);
+        register_child(child);
+        for slot in child_slots().unwrap() {
+            if slot.pid.load(Ordering::Acquire) == child as u64 {
+                slot.ptrace_stop_signal.store(19, Ordering::Release);
+            }
+        }
+
+        register_child_with_parent(child, parent, 0);
+
+        assert!(direct_child_ptrace_stop_pending(parent));
+        assert_eq!(take_child_ptrace_stop_signal(child), Some(19));
+
+        let _ = reap_child_guest_ns(child);
+    }
+
+    #[test]
+    fn child_self_registration_preserves_parent_ancestry() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        init_child_table();
+        let parent = 717_191;
+        let child = 717_192;
+
+        let _ = reap_child_guest_ns(child);
+        register_child_with_parent(child, parent, 0);
+        assert_eq!(direct_children_for_wait(parent), vec![child]);
+
+        register_child(child);
+
+        assert_eq!(direct_children_for_wait(parent), vec![child]);
+
+        let _ = reap_child_guest_ns(child);
     }
 }

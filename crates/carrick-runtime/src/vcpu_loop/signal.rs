@@ -353,6 +353,11 @@ where
         dispatcher.mark_signal_pending(tid, pending);
         return Ok(Some(PendingSignalAction::ignored()));
     }
+    if dispatcher.is_ptrace_traceme() {
+        crate::guest_cpu::mark_self_ptrace_stop_pending(pending);
+        crate::exec_helpers::stop_by_signal(crate::linux_abi::LINUX_SIGSTOP);
+        return Ok(Some(PendingSignalAction::ignored()));
+    }
     crate::exec_helpers::stop_for_debug_signal(pending);
     let action = dispatcher
         .take_pending_signal_action(tid, pending)
