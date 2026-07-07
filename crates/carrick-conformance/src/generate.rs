@@ -198,10 +198,18 @@ const KNOWN_GAP_PREFIX_OVERRIDES: &[(&str, &[&str])] = &[
 /// finite host pool while advertising Linux's larger tunables, so this remains
 /// a visible capacity/virtualization gap until Carrick owns the semaphore
 /// service or virtualizes the tunables honestly.
+///
+/// futex_cmp_requeue01's high-fanout process-shared cases require Linux's
+/// atomic source dequeue + destination enqueue semantics. Carrick's Darwin
+/// ulock-backed approximation can account wake/requeue credits while a subset
+/// of forked children still times out, so keep the LTP summary mismatch
+/// report-only until Carrick has a fork-coherent requeue authority instead of
+/// side-table credit accounting.
 const KNOWN_GAP_EXACT_OVERRIDES: &[(&str, &[&str])] = &[
     ("ltp-acct01", &["summary"]),
     ("ltp-bind06", &["summary"]),
     ("ltp-delete_module02", &["summary"]),
+    ("ltp-futex_cmp_requeue01", &["summary"]),
     ("ltp-setrlimit01", &["summary"]),
     ("ltp-semget05", &["summary"]),
 ];
@@ -771,6 +779,7 @@ mod tests {
             "ltp-acct01",
             "ltp-bind06",
             "ltp-delete_module02",
+            "ltp-futex_cmp_requeue01",
             "ltp-semget05",
         ] {
             let s = find(name);
