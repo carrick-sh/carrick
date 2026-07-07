@@ -789,3 +789,38 @@ This fixed the checkpoint timeout and removed the timing outlier. The row is
 still a semantic regression: the final assertion expects Linux `EACCES` after
 the child has execed, while Carrick currently delegates to Darwin `setpgid(2)`
 and returns `EPERM`.
+
+## 2026-07-07 06:18 - setpgid03 EACCES-after-exec semantics fixed
+
+Hypothesis:
+
+The remaining `ltp-setpgid03` failure was a Linux process-lifecycle rule not
+represented by Darwin `setpgid(2)`: a parent may not change the process group of
+one of its children after that child has successfully executed a new program.
+Linux reports this as `EACCES`. Carrick translated the namespace pid to the host
+pid, delegated to Darwin, and surfaced Darwin's `EPERM` instead.
+
+Change:
+
+The PID namespace member table now tracks whether a process has crossed a
+successful `execve(2)` point of no return. Both runtime exec loops mark the
+current member after `execve_into` succeeds. The `setpgid` handler keeps the
+existing namespace argument validation order, then returns Linux `EACCES` when
+the target is a direct child of the caller and that child has execed.
+
+Tests:
+
+- Namespace table unit coverage:
+  `cargo test -p carrick-runtime namespace::pid::tests --lib`
+- Existing setpgid namespace rule:
+  `cargo test -p carrick-runtime setpgid_tests --lib`
+- Signed rebuild:
+  `just build`
+- Focused originating LTP row:
+  `target/release/carrick-conformance --tier full --suite ltp-setpgid03 --jsonl target/conformance/setpgid03-eacces-061810.jsonl`
+
+Outcome:
+
+`ltp-setpgid03` now matches the Docker oracle: Carrick `3/3`, Docker `3/3`,
+with Carrick at 940ms vs the cached oracle's 812ms (`1.16x`). The original
+ten-second timeout and the follow-on errno mismatch are both closed.
