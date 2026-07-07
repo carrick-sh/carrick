@@ -9248,7 +9248,7 @@ impl SyscallDispatcher {
                     let mut open = open_file.description.write();
                     match &mut *open {
                         OpenDescription::EventFd { state, .. } => {
-                            return Ok(write_eventfd(&bytes, state));
+                            return Ok(write_eventfd(this, &bytes, state));
                         }
                         OpenDescription::PipeWriter { pipe, .. } => {
                             return Ok(write_pipe(&bytes, pipe));

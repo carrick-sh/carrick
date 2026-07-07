@@ -539,7 +539,7 @@ where
                 crate::event_ring::reinit_after_fork();
                 crate::host_signal::reinit_after_fork();
                 crate::dispatch::reset_fifo_beacons_after_fork_child();
-                crate::dispatch::reset_epoll_wake_registry_after_fork_child();
+                kernel.dispatcher.epoll_after_fork_child();
                 // Publish THIS child (new host pid) as Booting in the SHARED
                 // run-state table, before any post-fork boot work that parks the
                 // vCPU in the host's internal boot ppoll — so a parent reading

@@ -687,8 +687,8 @@ mod abi_args;
 mod creds;
 mod epoll_shim;
 pub(crate) use epoll_shim::{
-    after_fork_child as reset_epoll_wake_registry_after_fork_child, notify_inmem_epoll,
-    register_epoll_kqueue, unregister_epoll_kqueue,
+    EpollWakeRegistry, after_fork_child as reset_epoll_wake_registry_after_fork_child,
+    new_epoll_wake_registry, notify_inmem_epoll, register_epoll_kqueue, unregister_epoll_kqueue,
 };
 pub(crate) use fifo_beacon::after_fork_child as reset_fifo_beacons_after_fork_child;
 mod fd_table;
@@ -1692,22 +1692,27 @@ pub(crate) struct EpollKqueue {
     /// `poll_fd` on macOS (EVFILT_USER rides the kqueue fd). Stable for life;
     /// read lock-free by the registry and `Drop`.
     wake_fd: i32,
+    wake_registry: EpollWakeRegistry,
 }
 
 impl EpollKqueue {
     /// Take ownership of a freshly-built multiplexer (its user-wake channel
     /// `register_user(0)` already armed) and record it in the in-memory wake
     /// registry so `notify_inmem_epoll`/`wake_parked` can reach this instance.
-    pub(crate) fn new(mux: Box<dyn carrick_hal::event::EventMultiplexer>) -> Self {
+    pub(crate) fn new(
+        mux: Box<dyn carrick_hal::event::EventMultiplexer>,
+        wake_registry: EpollWakeRegistry,
+    ) -> Self {
         let poll_fd = mux.poll_fd();
         // On Linux the user-wake is a separate eventfd; on macOS it rides the
         // kqueue fd, so fall back to poll_fd. The registry pulses this fd.
         let wake_fd = mux.user_wake_fd(0).unwrap_or(poll_fd);
-        register_epoll_kqueue(wake_fd);
+        register_epoll_kqueue(&wake_registry, wake_fd);
         Self {
             mux: std::sync::Mutex::new(mux),
             poll_fd,
             wake_fd,
+            wake_registry,
         }
     }
 
@@ -1760,7 +1765,7 @@ impl std::fmt::Debug for EpollKqueue {
 
 impl Drop for EpollKqueue {
     fn drop(&mut self) {
-        unregister_epoll_kqueue(self.wake_fd);
+        unregister_epoll_kqueue(&self.wake_registry, self.wake_fd);
     }
 }
 
@@ -1772,7 +1777,7 @@ mod epoll_kqueue_tests {
     fn wake_parked_makes_poll_fd_readable() {
         let mut mux = crate::event_mux::make_event_multiplexer().expect("event multiplexer");
         mux.register_user(0).expect("register user wake");
-        let epoll = EpollKqueue::new(mux);
+        let epoll = EpollKqueue::new(mux, new_epoll_wake_registry());
 
         epoll.wake_parked();
 
@@ -1934,6 +1939,14 @@ impl SyscallDispatcher {
         }
         dispatcher.network = network;
         dispatcher
+    }
+
+    pub(crate) fn notify_inmem_epoll(&self) {
+        notify_inmem_epoll(&self.io.epoll_wake_registry);
+    }
+
+    pub(crate) fn epoll_after_fork_child(&self) {
+        reset_epoll_wake_registry_after_fork_child(&self.io.epoll_wake_registry);
     }
 
     pub fn set_guest_hostname(&self, hostname: impl Into<String>) {
@@ -2286,7 +2299,7 @@ impl SyscallDispatcher {
         if let Some(host_fd) = fifo_host_fd
             && crate::dispatch::fifo_beacon::register_close(host_fd)
         {
-            crate::dispatch::notify_inmem_epoll();
+            self.notify_inmem_epoll();
         }
     }
 
@@ -4410,7 +4423,7 @@ fn read_eventfd(
     }
 }
 
-fn write_eventfd(bytes: &[u8], state: &EventFdState) -> DispatchOutcome {
+fn write_eventfd(this: &SyscallDispatcher, bytes: &[u8], state: &EventFdState) -> DispatchOutcome {
     if bytes.len() != core::mem::size_of::<LinuxEventfdValue>() {
         return DispatchOutcome::Errno {
             errno: LINUX_EINVAL,
@@ -4460,7 +4473,7 @@ fn write_eventfd(bytes: &[u8], state: &EventFdState) -> DispatchOutcome {
             // registered the eventfd before its host fd was available: also
             // poke the in-memory wake broadcast. Redundant with the host-backed
             // pipe above; harmless.
-            notify_inmem_epoll();
+            this.notify_inmem_epoll();
         }
         return DispatchOutcome::Returned {
             value: core::mem::size_of::<LinuxEventfdValue>() as i64,
