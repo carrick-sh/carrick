@@ -12,4 +12,5 @@ path = "src/lib.rs"
 workspace = true
 
 [dependencies]
+carrick-kernel = { path = "../carrick-kernel" }
 libc.workspace = true
