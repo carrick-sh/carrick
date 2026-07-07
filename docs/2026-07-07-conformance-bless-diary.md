@@ -576,3 +576,48 @@ timeout / 40s harness deadline. The suite command now uses `-n 200` for both
 Docker oracle without turning this row into an implicit fork-stress benchmark.
 The fork-stress problem remains tracked by the raw fork perf probes and the
 `ltp-epoll-ltp`/`getpid01` outliers.
+
+## 2026-07-07 05:12 - openat03/inotify09 full-run timeouts isolated
+
+Hypothesis:
+
+The post-`fcntl14` full bless run still failed fast with 52 cached-oracle gating
+rows. The remaining timeouts were `ltp-openat03` and `ltp-inotify09`. Both had
+prior focused MATCH evidence, so the working theory was load amplification
+inside the harness rather than a deterministic syscall semantic failure.
+
+Tests:
+
+- Full bless attempt:
+  `target/conformance/bless-current-050055.{log,jsonl}` failed fast at 52
+  gating rows. Its perf outlier table showed `ltp-openat03` at `40381ms/1444ms`
+  and `ltp-inotify09` timed out at `40390ms/10344ms`.
+- Focused `ltp-openat03` repeats:
+  `target/conformance/openat03-repeat-{1,2,3}-*.jsonl` all matched, with
+  Carrick times `14884ms`, `14249ms`, and `14257ms` against the cached
+  `1444ms` Docker oracle.
+- Focused `ltp-inotify09` repeats:
+  `target/conformance/inotify09-repeat-{1,2}-*.jsonl` both matched, with
+  Carrick times `33606ms` and `33785ms` against the cached `10344ms` Docker
+  oracle.
+- LTP `openat03` source shows this is not a fork test: it creates 100 nested
+  directories, opens anonymous `O_TMPFILE` files, writes/reads 4 KiB blocks,
+  links them through `/proc/self/fd/<n>`, stats permissions, and cleans up.
+- After adding the exclusive scheduling rule, the targeted harness run
+  `target/conformance/exclusive-ltp-051107.{log,jsonl}` matched both suites.
+- Full bless attempt `target/conformance/bless-current-051216.{log,jsonl}`
+  confirmed both formerly timed-out rows now match in the normal full-run
+  schedule: `ltp-inotify09` was `34109ms/10344ms`, and `ltp-openat03` was
+  `14483ms/1444ms`. The run still failed fast, but now with 51 regression rows
+  and no timeout rows.
+
+Outcome:
+
+These rows are load-sensitive harness timeouts over real slow tests, not
+deterministic semantic regressions. The harness now schedules
+`ltp-openat03` and `ltp-inotify09` in the existing exclusive lane, alongside
+`go-net_http`, so a full Carrick phase does not co-schedule them with other
+guests. This intentionally does not raise their deadlines and does not bless
+away the performance problem: `openat03` remains an order-of-magnitude syscall
+/ filesystem overhead outlier, and `inotify09` remains close to the 40s
+deadline even when isolated.
