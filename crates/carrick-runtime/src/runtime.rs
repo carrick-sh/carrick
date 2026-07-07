@@ -1054,7 +1054,7 @@ where
                 };
                 let child_subreaper = dispatcher.subreaper_for_fork_child();
                 let child_ns_pid = crate::namespace::pid::allocate_child_ns_pid_pre_fork();
-                crate::guest_cpu::prepare_child_record_pre_fork(
+                let prepared_child_record = crate::guest_cpu::prepare_child_record_pre_fork(
                     child_parent,
                     child_subreaper,
                     child_ns_pid.unwrap_or(0),
@@ -1071,7 +1071,13 @@ where
                 let retval: i64 = match outcome {
                     crate::trap::ForkOutcome::Parent { child_pid } => {
                         crate::event_ring::rec(crate::event_ring::FORK, child_pid, 0, 0);
-                        crate::guest_cpu::publish_prepared_child_record_parent(child_pid as u32);
+                        // By REF (see quiesce.rs): the single-threaded loop has
+                        // no sibling forkers today, but the stash contract is
+                        // "child channel only" everywhere.
+                        crate::guest_cpu::publish_prepared_child_record_parent_ref(
+                            prepared_child_record,
+                            child_pid as u32,
+                        );
                         crate::namespace::pid::notify_child_registered();
                         // Watch the child's exit (EVFILT_PROC/NOTE_EXIT) so the
                         // signal pump delivers the requested exit signal to this
