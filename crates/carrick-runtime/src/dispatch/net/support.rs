@@ -137,20 +137,17 @@ pub(super) fn epoll_trigger_mode(events: LinuxEpollEvents) -> carrick_hal::event
 
 /// Trigger mode used for host-fd registrations that back a guest epoll set.
 ///
-/// BSD kqueue `EV_CLEAR` can spend the only host edge while the guest-side
-/// `EPOLLET` latch still suppresses delivery. Keep the host registration
-/// level-triggered there and enforce the guest edge contract in software with
-/// `EpollInterest::last_ready`. Linux's backend is native epoll, so it keeps
-/// the real `EPOLLET` registration.
+/// Keep host registrations aligned with the guest trigger mode. On BSD kqueue,
+/// `EV_CLEAR` spends a host edge exactly once; Carrick re-arms registrations
+/// after guest I/O/backpressure transitions instead of polling a permanently
+/// readable kqueue fd for latch-masked `EPOLLET` readiness.
 #[cfg(any(
     feature = "platform-macos",
     feature = "platform-freebsd",
     feature = "platform-netbsd"
 ))]
-pub(super) fn epoll_host_trigger_mode(
-    _events: LinuxEpollEvents,
-) -> carrick_hal::event::TriggerMode {
-    carrick_hal::event::TriggerMode::Level
+pub(super) fn epoll_host_trigger_mode(events: LinuxEpollEvents) -> carrick_hal::event::TriggerMode {
+    epoll_trigger_mode(events)
 }
 
 #[cfg(not(any(
