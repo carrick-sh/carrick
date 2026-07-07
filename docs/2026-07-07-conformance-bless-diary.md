@@ -255,6 +255,44 @@ HVF fork model can avoid rebuilding a full VM for simple child-exit forks, or
 whether the conformance harness should classify this as an acknowledged
 performance gap rather than a transient wait bug.
 
+## go-net_http concurrency/epoll blocker
+
+Hypothesis:
+The full-run `go-net_http` blocker is structural, not a missing timeout or a
+case that should be blessed as slow. Under concurrent Go net/http activity,
+Carrick waits on the BSD source kqueue fd even when its Linux-facing ET latch
+has masked every event as already delivered. Linux's epoll fd is readable only
+for kernel-ready-list entries, so native Linux does not wake on these
+non-deliverable source events.
+
+Tests:
+- Deadline capture before the diagnostic runner fix:
+  `target/conformance/logs/lldb-runs/go-net-http-struct-092753.lldb.txt`.
+  lldb attached only the namespace parent; the parent ring was empty.
+- Diagnostic runner fix: retry a failed lldb attach to a stopped scoped process
+  by `SIGCONT`ing that process and letting lldb stop it itself.
+- Verification for the runner fix:
+  `cargo fmt --check`, `cargo check -p carrick-cli`,
+  `just build -p carrick-cli`.
+- Focused lldb-run after the runner fix:
+  `target/conformance/logs/lldb-runs/go-net-http-struct-retry-093437.lldb.txt`.
+
+Outcome:
+The patched runner captured the guest. By the 120s deadline the guest event
+ring had recorded `18,948,305` events. The visible tail repeats
+`EPWFD fd=16411 events=0x1 timeout=-1`, `EPEDGE` for guest fds 6/7, masked
+`raw==last` samples for guest fds 6/7/8/9, and `EPWAIT kq=16411 ready=0`.
+One guest thread was inside `epoll_pwait_wait_core`/`epoll_ready_events`; most
+other guest threads were futex parked.
+
+Current options:
+The detailed option set is in
+`docs/2026-07-06-go-net-http-epoll-diary.md`. The preferred direction is to
+make epoll an explicit typed state machine whose guest-visible readiness is the
+Linux-deliverable queue, not raw source-kqueue readability. Also add a
+pathological-loop detector so this class fails with a clear diagnostic instead
+of consuming the harness deadline.
+
 ## short finite wait timer regressions
 
 Hypothesis:
