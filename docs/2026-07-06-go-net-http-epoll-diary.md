@@ -406,3 +406,98 @@ Interpretation:
 - The debugger capture path is now a Carrick command and should be the default
   for deadline-based hang investigation. Continue root-cause from the captured
   child event ring/backtraces instead of adding timing backstops.
+
+### Hypothesis: the non-perturbing ring needs the actual wait handoff and masked bits
+
+Test:
+
+- Added always-on event-ring events:
+  - `EPWFD fd=<host fd> events=<poll mask> timeout=<ms>` for epoll wait
+    handoffs.
+  - `EPMASK origin=<path> raw=<bits> last=<bits>` for readiness masked by the
+    guest ET latch.
+- Rebuilt/signed and reran `carrick debug lldb-run` around focused h1 until a
+  deadline fired.
+
+Outcome:
+
+- Captured `target/conformance/logs/lldb-run-h1-epwfd/h1-epwfd-catch-2-221901.lldb.txt`.
+- The ring alternated:
+  - `EPWAIT kq=16408 ready=0 timeout=119989`
+  - `EPWFD fd=16408 events=0x1 timeout=119989`
+- Captured `target/conformance/logs/lldb-run-h1-mask/h1-mask-catch-1-222058.lldb.txt`.
+- The masked samples were repeated already-latched ET readiness:
+  - `EPMASK origin=2 raw=0x4 last=0x4`
+  - `EPMASK origin=2 raw=0x5 last=0x5`
+- Interpretation: the non-perturbed failure is not a long sleep. Carrick
+  samples only latched ET state, returns a `POLLIN` wait on the epoll kqueue
+  fd, and immediately wakes again.
+
+### Hypothesis: ET host registration must spend kqueue edges and re-arm explicitly
+
+Implementation experiment:
+
+- Added `Interest::read_lowat`.
+- Added `Kevent::read_lowat(fd, flags, lowat)` backed by `NOTE_LOWAT`.
+- For BSD edge-triggered registrations, added `EV_DISPATCH` so a returned
+  kqueue event disables its filter until Carrick re-arms it.
+- Made drained host edges and masked ET samples rebind through
+  `epoll_effective_interest`, so:
+  - latched `EPOLLOUT` removes the host write filter;
+  - latched unread `EPOLLIN` on host sockets/pipes re-arms read at
+    `last_read_avail + 1`;
+  - duplicated guest fds sharing one host fd use the lowest needed low-water
+    threshold, while any unlatched reader clears the low-water hint;
+  - edge rebinds delete the old kqueue filter before adding the new one so stale
+    pending readiness does not survive a threshold/mask change.
+
+Focused tests:
+
+```sh
+cargo check -p carrick-cli
+cargo test -p carrick-runtime --test integration epoll -- --nocapture
+just build -p carrick-cli
+```
+
+Outcome:
+
+- `cargo check -p carrick-cli` passed.
+- The default-parallel epoll integration slice passed with 30 tests, including:
+  - `epoll_wakes_accepted_socket_after_peer_write`
+  - `threaded_epoll_wait_wakes_when_peer_thread_writes_to_accepted_socket`
+  - `epoll_et_read_growth_does_not_rearm_latched_read_level`
+- Five focused h1 samples passed:
+  - first cold-ish run `real 4.12`
+  - warm runs `real 1.72`, `1.75`, `1.75`, `1.76`
+- Docker oracle warm samples were `real 0.23`, `0.19`, `0.18`.
+- Interpretation: the focused h1 timeout flake improved, but warm Carrick h1 is
+  still roughly an order of magnitude slower than the Docker oracle.
+
+### Broader go-net_http still has a masked-kqueue blocker
+
+Test:
+
+```sh
+CARRICK_RUN_ID=go-net-http-lowat2-* \
+  timeout 180s target/release/carrick-conformance \
+  --tier full --suite go-net_http --workers 1 --force \
+  --jsonl target/conformance/go-net-http-lowat2-*.jsonl
+```
+
+Outcome:
+
+- Timed out at 180s before writing any JSONL rows.
+- Direct raw-suite `lldb-run` captures also timed out:
+  - `target/conformance/logs/lldb-go-net-http-suite/go-net-http-suite-maskrearm-223748.lldb.txt`
+  - `target/conformance/logs/lldb-go-net-http-suite/go-net-http-suite-deleteadd-224122.lldb.txt`
+- The raw-suite guest log advanced into broader package execution and then
+  timed out around `TestTransportConcurrency/h1` or later concurrent tests.
+- The ring still showed repeated:
+  - `EPMASK origin=2 raw=0x5 last=0x5`
+  - `EPMASK origin=2 raw=0x4 last=0x4`
+  - `EPWAIT ... ready=0`
+  - `EPWFD ... events=0x1`
+- Interpretation: the current low-water/EV_DISPATCH/delete-add work is not the
+  full architectural fix. It is a useful focused h1 improvement and diagnostic
+  checkpoint, but the full `go-net_http` suite still has a masked kqueue
+  readiness path that keeps the epoll instance fd poll-readable.

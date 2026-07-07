@@ -16,6 +16,9 @@ pub struct Interest {
     pub write: bool,
     /// Out-of-band / priority data (`EPOLLPRI` ↔ `EVFILT_EXCEPT`/`NOTE_OOB`).
     pub oob: bool,
+    /// Optional read low-water mark for backends that can arm "wake when at
+    /// least N bytes are readable" (`NOTE_LOWAT` on kqueue).
+    pub read_lowat: Option<u64>,
 }
 
 impl Interest {
@@ -28,16 +31,19 @@ impl Interest {
         read: true,
         write: false,
         oob: false,
+        read_lowat: None,
     };
     pub const WRITE: Self = Self {
         read: false,
         write: true,
         oob: false,
+        read_lowat: None,
     };
     pub const OOB: Self = Self {
         read: false,
         write: false,
         oob: true,
+        read_lowat: None,
     };
 }
 
