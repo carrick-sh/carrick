@@ -1134,9 +1134,12 @@ impl Drop for SchedulerPermit<'_> {
 }
 
 fn suite_requires_exclusive_lane(suite: &Suite) -> bool {
-    // The root net/http Go package is reliable when run alone but can make
-    // little progress when co-scheduled with CPython-heavy suites under HVF.
-    matches!(suite.name.as_str(), "go-net_http")
+    // These suites are reliable when run alone but can make little progress
+    // when co-scheduled under HVF. Keep this as scheduling isolation, not a
+    // timeout escape hatch: the underlying performance outliers still show up
+    // in the per-suite timing ratios.
+    const EXCLUSIVE_SUITES: &[&str] = &["go-net_http", "ltp-inotify09", "ltp-openat03"];
+    EXCLUSIVE_SUITES.contains(&suite.name.as_str())
 }
 
 /// Whether `suite` is applicable on the lane identified by `overlay_key` — the
@@ -2205,6 +2208,8 @@ mod tests {
         let lanes = SchedulerLanes::new(2);
         let suites = vec![
             suite("go-net_http", Ecosystem::Go, Weight::Heavy),
+            suite("ltp-openat03", Ecosystem::Ltp, Weight::Light),
+            suite("ltp-inotify09", Ecosystem::Ltp, Weight::Light),
             suite("cpython-tarfile", Ecosystem::Cpython, Weight::Heavy),
             suite("ltp-gettid01", Ecosystem::Ltp, Weight::Light),
         ];
@@ -2214,7 +2219,7 @@ mod tests {
         let overlapped = AtomicBool::new(false);
         let indices: Vec<usize> = (0..suites.len()).collect();
         let _ = fan_out_scheduled(&indices, &suites, 3, &lanes, |i| {
-            let is_exclusive = suites[i].name == "go-net_http";
+            let is_exclusive = suite_requires_exclusive_lane(&suites[i]);
             let now = active.fetch_add(1, Ordering::SeqCst) + 1;
             if is_exclusive {
                 exclusive_active.store(true, Ordering::SeqCst);
@@ -2234,7 +2239,7 @@ mod tests {
 
         assert!(
             !overlapped.load(Ordering::SeqCst),
-            "go-net_http must not overlap with other suites"
+            "load-sensitive suites must not overlap with other suites"
         );
     }
 
