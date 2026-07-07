@@ -15,9 +15,9 @@ use carrick_runtime::dispatch::WaitFds;
 #[cfg(target_os = "macos")]
 use carrick_runtime::io_wait::{ThreadWaiter, WaitResult};
 use carrick_runtime::linux_abi::{
-    LINUX_AF_INET, LINUX_EINTR, LINUX_EPOLLOUT, LINUX_SIOCGIFINDEX, LINUX_SIOCGIFNAME,
-    LINUX_SOCK_CLOEXEC, LINUX_SOCK_NONBLOCK, LINUX_SOCK_STREAM, LINUX_SOL_TCP, LinuxGuestAbi,
-    LinuxX8664EpollEvent,
+    LINUX_AF_INET, LINUX_EINTR, LINUX_EMFILE, LINUX_EPOLLOUT, LINUX_SIOCGIFINDEX,
+    LINUX_SIOCGIFNAME, LINUX_SOCK_CLOEXEC, LINUX_SOCK_NONBLOCK, LINUX_SOCK_STREAM, LINUX_SOL_TCP,
+    LinuxGuestAbi, LinuxX8664EpollEvent,
 };
 #[cfg(target_os = "macos")]
 use carrick_runtime::thread::{FutexTable, ThreadRegistry};
@@ -492,6 +492,56 @@ fn pipe2_duplicate_writer_keeps_pipe_open_until_all_writers_close() {
         DispatchOutcome::Returned { value: 0 }
     );
     assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
+fn pipe2_fd_fill_fails_fast_with_emfile() {
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x200]);
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+    let mut fds = Vec::new();
+
+    for _ in 0..2048 {
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    SyscallRequest::new(59, SyscallArgs::from([0x4000, 0, 0, 0, 0, 0])),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        let pair = read_fd_pair(&memory, 0x4000);
+        fds.push(pair.read_fd as u64);
+        fds.push(pair.write_fd as u64);
+    }
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(59, SyscallArgs::from([0x4000, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno {
+            errno: LINUX_EMFILE
+        }
+    );
+
+    for fd in fds {
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    SyscallRequest::new(57, SyscallArgs::from([fd, 0, 0, 0, 0, 0])),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+            DispatchOutcome::Returned { value: 0 }
+        );
+    }
 }
 
 #[test]
