@@ -8291,7 +8291,7 @@ mod overlay_dispatch_tests {
             outcome,
             DispatchOutcome::SharedFutexWake {
                 location,
-                waiter_key: 0x10800,
+                waiter_key: location.waiter_key(),
                 count: 3,
             },
             "a shared FUTEX_WAKE must defer to the PlatformFutex::shared_wake seam"
