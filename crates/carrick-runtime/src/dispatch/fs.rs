@@ -4169,7 +4169,10 @@ impl SyscallDispatcher {
         // so it is not keyed here.
         let is_atfdcwd = (dirfd as i32) as i64 as u64 == LINUX_AT_FDCWD;
         let cache_key: Option<String> = if std::path::Path::new(path).is_absolute() {
-            Some(path.to_owned())
+            match self.io.chroot_root.read().as_deref() {
+                Some(root) if root != "/" => Some(format!("{root}\u{0}{path}")),
+                _ => Some(path.to_owned()),
+            }
         } else if is_atfdcwd {
             Some(format!("{}\u{0}{}", self.io.cwd.read(), path))
         } else {
@@ -4228,13 +4231,16 @@ impl SyscallDispatcher {
     /// `None` when the dirfd anchor can't be determined (not a directory fd).
     fn absolute_input_path(&self, dirfd: u64, path: &str) -> Option<String> {
         let dirfd = (dirfd as i32) as i64 as u64;
-        let anchor = if Path::new(path).is_absolute() {
-            "/".to_string()
+        let (anchor, path) = if Path::new(path).is_absolute() {
+            match self.io.chroot_root.read().as_deref() {
+                Some(root) if root != "/" => (root.to_owned(), path.trim_start_matches('/')),
+                _ => ("/".to_string(), path),
+            }
         } else if dirfd == LINUX_AT_FDCWD {
-            self.io.cwd.read().clone()
+            (self.io.cwd.read().clone(), path)
         } else {
             match &*self.open_file(dirfd as i32)?.description.read() {
-                OpenDescription::Directory { path: dir, .. } => dir.clone(),
+                OpenDescription::Directory { path: dir, .. } => (dir.clone(), path),
                 _ => return None,
             }
         };
@@ -4294,6 +4300,29 @@ impl SyscallDispatcher {
         Ok(())
     }
 
+    fn check_directory_search_access(&self, abs: &str) -> Result<(), LinuxErrno> {
+        let creds = self.cred_snapshot();
+        if creds.euid == 0 {
+            return Ok(());
+        }
+        let md = self.layered_metadata(abs)?;
+        if md.kind != RootFsEntryKind::Directory {
+            return Ok(());
+        }
+        let (uid, gid) = self.fs.rootfs_vfs.overlay.get_owner(abs).unwrap_or((0, 0));
+        let x_bit = if creds.fsuid == uid {
+            0o100
+        } else if creds.fsgid == gid {
+            0o010
+        } else {
+            0o001
+        };
+        if md.mode & x_bit == 0 {
+            return Err(LINUX_EACCES);
+        }
+        Ok(())
+    }
+
     fn resolve_at_path_inner(&self, dirfd: u64, path: &str) -> Result<String, LinuxErrno> {
         // dirfd is an `int` in the kernel ABI: only the low 32 bits are
         // meaningful, and AT_FDCWD (-100) may arrive zero-extended (0xFFFFFF9C)
@@ -4320,10 +4349,13 @@ impl SyscallDispatcher {
         // The anchor directory a relative path resolves against (already a real,
         // symlink-free path): "/" for an absolute path, the cwd for AT_FDCWD, else
         // the dirfd's directory.
-        let anchor = if Path::new(path).is_absolute() {
-            "/".to_string()
+        let (anchor, path) = if Path::new(path).is_absolute() {
+            match self.io.chroot_root.read().as_deref() {
+                Some(root) if root != "/" => (root.to_owned(), path.trim_start_matches('/')),
+                _ => ("/".to_string(), path),
+            }
         } else if dirfd == LINUX_AT_FDCWD {
-            self.io.cwd.read().clone()
+            (self.io.cwd.read().clone(), path)
         } else {
             match self.open_file(dirfd as i32).as_ref() {
                 Some(open_file) => match &*open_file.description.read() {
@@ -4337,7 +4369,7 @@ impl SyscallDispatcher {
                         if self.layered_metadata(dir).is_err() {
                             return Err(LINUX_ENOENT);
                         }
-                        dir.clone()
+                        (dir.clone(), path)
                     }
                     _ => return Err(LINUX_ENOTDIR),
                 },
@@ -4996,6 +5028,10 @@ impl SyscallDispatcher {
             if metadata.kind != RootFsEntryKind::Directory {
                 return Ok(DispatchOutcome::errno(LINUX_ENOTDIR));
             }
+            let new_root = display_rootfs_path(&metadata.path);
+            if let Err(errno) = this.check_directory_search_access(&new_root) {
+                return Ok(DispatchOutcome::errno(errno));
+            }
             // chroot(2) requires CAP_SYS_CHROOT. carrick models the capability
             // set as "effective uid 0"; a guest that has dropped to a non-root
             // euid no longer holds it (chroot01 expects EPERM).
@@ -5009,7 +5045,7 @@ impl SyscallDispatcher {
             // awaits that plus the DAC search-permission check. We DO record the
             // new root so getcwd can report a cwd left outside it as ENOENT
             // (realpath01 / CVE-2018-1000001).
-            *this.io.chroot_root.write() = Some(display_rootfs_path(&metadata.path));
+            *this.io.chroot_root.write() = Some(new_root);
             Ok(DispatchOutcome::Returned { value: 0 })
 
         }
@@ -11366,6 +11402,59 @@ mod tests {
             })),
             fd_flags: 0,
         }
+    }
+
+    #[test]
+    fn chroot_rebases_absolute_resolution() {
+        let backend = crate::fs_backend::MemoryBackend::new();
+        backend.make_dir("/jail").unwrap();
+        backend
+            .set_file_contents("/jail/chroot02_testfile", b"payload".to_vec())
+            .unwrap();
+
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.set_fs_backend(Box::new(backend));
+        *dispatcher.io.chroot_root.write() = Some("/jail".to_owned());
+
+        assert_eq!(
+            dispatcher
+                .resolve_at_path(LINUX_AT_FDCWD, "/chroot02_testfile")
+                .unwrap(),
+            "/jail/chroot02_testfile"
+        );
+        assert!(
+            dispatcher
+                .layered_metadata("/jail/chroot02_testfile")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn chroot_no_search_permission_precedes_capability_error() {
+        let scratch = tempfile::tempdir().unwrap();
+        let dir = cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority())
+            .unwrap();
+        let backend = crate::fs_backend::HostFsBackend::from_existing_dir(dir);
+        backend.make_dir("/jail").unwrap();
+        backend.set_mode("/jail", 0o600).unwrap();
+
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.set_fs_backend(Box::new(backend));
+        dispatcher.creds.lock().seed_identity(1000, 1000);
+        let reporter = CompatReporter::default();
+        let mut memory = LinearMemory::new(0x4000, vec![0; 0x1000]);
+        memory.write_bytes(0x4000, b"/jail\0").unwrap();
+
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    SyscallRequest::new(51, SyscallArgs::from([0x4000, 0, 0, 0, 0, 0])),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+            DispatchOutcome::errno(LINUX_EACCES)
+        );
     }
 
     #[test]
