@@ -152,15 +152,52 @@ impl SharedFutexSyscall for HvfShared {
         wake: u32,
         requeue: u32,
     ) -> (u32, u32) {
-        carrick_host::ulock::requeue_counted(
+        trace_requeue(0, from_key, to_key, wake, requeue, 0, 0);
+        let result = carrick_host::ulock::requeue_counted(
             from.wait_addr().raw(),
             from_key,
             to.wait_addr().raw(),
             to_key,
             wake,
             requeue,
-        )
+        );
+        trace_requeue(1, from_key, to_key, wake, requeue, result.0, result.1);
+        result
     }
+}
+
+fn trace_requeue(
+    phase: u32,
+    from_key: usize,
+    to_key: usize,
+    wake_req: u32,
+    requeue_req: u32,
+    wake_ret: u32,
+    requeue_ret: u32,
+) {
+    let from = carrick_host::ulock::waiter_debug_counts(from_key);
+    let to = carrick_host::ulock::waiter_debug_counts(to_key);
+    carrick_observability::probes::ulock_requeue(
+        carrick_observability::probes::UlockRequeueProbe {
+            phase,
+            from_key: from_key as u64,
+            to_key: to_key as u64,
+            wake_req,
+            requeue_req,
+            wake_ret,
+            requeue_ret,
+            from_count: from.count,
+            from_requeue_wake: from.requeue_wake,
+            from_requeue_count: from.requeue_count,
+            from_logical_requeued: from.logical_requeued,
+            from_logical_wake: from.logical_wake,
+            to_count: to.count,
+            to_requeue_wake: to.requeue_wake,
+            to_requeue_count: to.requeue_count,
+            to_logical_requeued: to.logical_requeued,
+            to_logical_wake: to.logical_wake,
+        },
+    );
 }
 
 /// HVF's `PlatformFutex`: the shared `FutexTableFutex` over the `HvfShared`
