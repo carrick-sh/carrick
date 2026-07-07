@@ -444,6 +444,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "carrick-kernel"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "carrick-mem"
 version = "0.1.0"
 dependencies = [
