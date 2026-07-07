@@ -891,6 +891,123 @@ Interpretation:
   threshold to keep treating this as performance debt during the bless campaign,
   not as a completed performance story.
 
+## 2026-07-07
+
+### Diagnostic fix: make lldb-run catch the guest, not only the parent
+
+Hypothesis:
+
+- The focused `go-net_http` deadline runner was not setting us up for success
+  when lldb failed to attach to the stopped guest child and then only dumped the
+  namespace parent. The parent ring is empty, so the failure mode loses the
+  only evidence that matters.
+
+Change:
+
+- `carrick debug lldb-run` now retries a failed attach to an already-stopped
+  scoped process by sending `SIGCONT` to that process and immediately letting
+  lldb attach and stop it itself. The existing leaf-first attach order remains.
+
+Tests:
+
+```sh
+cargo fmt --check
+cargo check -p carrick-cli
+just build -p carrick-cli
+
+target/release/carrick debug lldb-run --no-core \
+  --deadline-seconds 120 \
+  --out-dir target/conformance/logs/lldb-runs \
+  --run-id go-net-http-struct-retry-093437 -- \
+  --max-traps 18446744073709551615 --raw --fs host \
+  -w /usr/local/go/src/net/http \
+  localhost:5005/carrick-go-conformance:1.24 \
+  /conformance/net_http.test -test.v -test.run Test -test.short
+```
+
+Outcome:
+
+- The patched runner captured the guest process event ring and host stacks:
+  `target/conformance/logs/lldb-runs/go-net-http-struct-retry-093437.lldb.txt`.
+- The guest ring had `total=18948305` by the 120s deadline. The visible tail is
+  a repeated cycle:
+  - `EPWFD fd=16411 events=0x1 timeout=-1`
+  - `EPEDGE gfd=6 edge=0x2001 count=94`
+  - `EPEDGE gfd=7 edge=0x2001 count=94`
+  - `EPMASK origin=1 raw=0x11 last=0x11` for guest fds 6/7
+  - `EPMASK origin=2 raw=0x4 last=0x4` for guest fd 9
+  - `EPMASK origin=2 raw=0x5 last=0x5` for guest fd 8
+  - `EPWAIT kq=16411 ready=0 timeout=-1`
+- One guest thread was actively in `epoll_pwait_wait_core` /
+  `epoll_ready_events`, while the other guest threads were mostly futex parked.
+
+Interpretation:
+
+- This is not merely a slow Go test. Carrick is spinning on an epoll instance
+  whose BSD source kqueue remains readable, while the Linux-facing ET latch
+  correctly masks every sampled event as already delivered.
+- Linux has no comparable problem here because epoll's wait target is its
+  kernel-maintained ready list: if no Linux-deliverable item exists, the epoll
+  fd is not readable. Carrick currently waits on the source kqueue fd and only
+  applies the Linux ET software latch after waking, so BSD source readiness can
+  leak through as a hot loop.
+
+### Structural options for the epoll/kqueue mismatch
+
+Grounding:
+
+- FreeBSD's Linux compatibility layer maps epoll onto kqueue directly
+  (`sys/compat/linux/linux_event.c`): `EPOLLET` uses `EV_CLEAR`, and
+  `epoll_wait` drains with `kevent`.
+- Apple's public XNU kqueue implementation/documentation treats `EV_CLEAR` as a
+  filter-state reset after retrieval; it does not provide Linux's separate
+  epoll ready-list/latch semantics.
+- Carrick adds its own Linux ET latch (`last_ready`, `last_read_avail`,
+  `write_backpressured`) on top of kqueue, so the design must ensure the fd we
+  wait on reflects that Linux-deliverable state, not raw kqueue readability.
+
+Options:
+
+1. Narrow kqueue rearm state machine.
+   Suppress or reshape host re-registration only for the exact masked states
+   proven by the ring (`edge_drained && raw == last_ready`, especially terminal
+   read edges and latched write-only readiness). This is the smallest code
+   change, but prior broad variants regressed `TestOmitHTTP2Vet`, so it needs a
+   deterministic probe before landing.
+
+2. Make `OpenDescription::Epoll` a typed state machine/struct.
+   Replace the loose tuple state with an `EpollInstance` struct owning the
+   source mux, interest table, pending deliverable ready list, per-fd latch
+   metadata, and wake bookkeeping. The important invariant would be explicit:
+   the guest-visible epoll fd is readable only when the deliverable queue is
+   non-empty, or when a mutation requires a rescan. This is the cleanest
+   direction, but needs a careful wake design so future host kqueue edges still
+   wake a blocked guest without reintroducing raw source-readiness as the
+   public wait condition.
+
+3. Add a per-instance epoll pump.
+   A helper thread (or shared pump) blocks on the source kqueue, converts host
+   edges into Carrick's Linux-ready queue, and wakes waiters through a separate
+   Carrick-controlled event. This most closely separates "source readiness" from
+   "Linux deliverable readiness" and should tolerate concurrent Go-style
+   netpolling. Cost/risk: extra host threads, lifecycle/fork handling, and
+   careful teardown.
+
+4. Add a fail-fast pathological-loop detector.
+   Count repeated `EPWAIT ready=0` cycles with the same masked `(epfd, gfd,
+   raw, last_ready)` and return a clear diagnostic failure or trigger the debug
+   dump path instead of burning minutes. This is not the correctness fix, but it
+   answers the graceful-failure question and prevents the conformance harness
+   from treating a structural loop as a long timeout.
+
+Current preference:
+
+- Option 2 is the right architectural target. Option 4 should be added as a
+  guardrail. Option 1 is only acceptable if a small probe proves it does not
+  hide the same source-kqueue/ready-list mismatch. Option 3 is the fallback if
+  Option 2 cannot make a blocked wait observe future host events without
+  exposing raw kqueue readability again.
+
 ### Full bless attempt: first fail-fast blocker is accept02
 
 Hypotheses:
