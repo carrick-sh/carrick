@@ -563,6 +563,17 @@ impl ThreadWaiter {
         // keep parking in EVFILT_PROC and reap on the child's exit edge; signal
         // responsiveness degrades only to the same 50ms `should_interrupt` slices
         // the poll fallback already used (see `wait_proc_exit_kqueue`).
+        if pid == -1
+            && let Some(kq) = self.kq.as_ref()
+        {
+            match self.wait_proc_exit_any_kqueue(kq, block_mask) {
+                ProcExitWait::Done(result) => return result,
+                // No direct children were registered for kqueue watching, or the
+                // kqueue fd itself is unusable. Preserve the existing correctness
+                // fallback rather than guessing.
+                ProcExitWait::KqueueDead => {}
+            }
+        }
         if pid > 0
             && let Some(kq) = self.kq.as_ref()
         {
@@ -701,6 +712,96 @@ impl ThreadWaiter {
         // A dead wake pipe no longer forces the poll fallback (see the drain
         // handling above) — only a genuine kqueue-fd error (handled inline via the
         // early `return ProcExitWait::KqueueDead`) does.
+        ProcExitWait::Done(result)
+    }
+
+    /// Park in `kevent()` until any direct child of this host process exits.
+    ///
+    /// Darwin has no `EVFILT_PROC` sentinel for "any child", but Carrick already
+    /// maintains a fork-shared child table. Snapshot that table and arm one
+    /// `NOTE_EXIT` watch per direct child, then re-dispatch `wait4(-1)` when any
+    /// watch fires. This avoids the old 50 ms `waitid(P_ALL, WNOHANG)` polling
+    /// fallback in serial fork/wait-any loops such as LTP `getpid01`.
+    #[cfg(target_os = "macos")]
+    fn wait_proc_exit_any_kqueue(
+        &self,
+        kq: &Kqueue,
+        block_mask: carrick_abi::SigBlockMask,
+    ) -> ProcExitWait {
+        let mut watched = std::collections::HashSet::<i32>::new();
+        let mut changes = Vec::<Kevent>::new();
+        let cap = (crate::guest_cpu::direct_children_for_wait(std::process::id()).len()
+            + self.signal_pipe_count())
+        .max(1);
+        let mut events_out: Vec<Kevent> = vec![Kevent::empty(); cap];
+        let result = loop {
+            if child_status_ready(-1) {
+                break WaitResult::Ready;
+            }
+            for child in crate::guest_cpu::direct_children_for_wait(std::process::id()) {
+                let Ok(child) = i32::try_from(child) else {
+                    continue;
+                };
+                if watched.insert(child) {
+                    changes.push(Kevent::proc_exit(child));
+                }
+            }
+            if watched.is_empty() && changes.is_empty() {
+                return ProcExitWait::KqueueDead;
+            }
+            let ts = Some(libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 50_000_000,
+            });
+            let n = match kq.wait(&changes, &mut events_out, ts.as_ref()) {
+                Ok(n) => n,
+                Err(e) => {
+                    if self.should_interrupt(block_mask) {
+                        break WaitResult::Interrupted;
+                    }
+                    if e == libc::EINTR {
+                        changes.clear();
+                        continue;
+                    }
+                    return ProcExitWait::KqueueDead;
+                }
+            };
+            changes.clear();
+            let mut proc_woke = false;
+            let mut process_pipe_woke = false;
+            let mut thread_pipe_woke = false;
+            for e in &events_out[..n] {
+                if e.is_read_for_fd(self.process_pipe_read) {
+                    process_pipe_woke = true;
+                } else if self
+                    .thread_wake
+                    .as_ref()
+                    .is_some_and(|thread_wake| e.is_read_for_fd(thread_wake.read_fd()))
+                {
+                    thread_pipe_woke = true;
+                } else if e.proc_exit_ident().is_some() {
+                    proc_woke = true;
+                }
+            }
+            if proc_woke || child_status_ready(-1) {
+                break WaitResult::Ready;
+            }
+            if process_pipe_woke {
+                let _ = self.drain_process_wake_pipe(kq);
+            }
+            if thread_pipe_woke {
+                let _ = self.drain_thread_wake_pipe(kq);
+            }
+            if self.should_interrupt(block_mask) {
+                break WaitResult::Interrupted;
+            }
+        };
+        let zero = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        let deletes: Vec<Kevent> = watched.into_iter().map(Kevent::proc_exit_delete).collect();
+        let _ = kq.wait(&deletes, &mut [], Some(&zero));
         ProcExitWait::Done(result)
     }
 

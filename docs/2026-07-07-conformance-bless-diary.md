@@ -163,3 +163,51 @@ Verified:
   `target/release/carrick-conformance --suite ltp-kill12 --jsonl target/conformance/kill12-sleepfix.jsonl`
   reported `MATCH carrick[1/1] oracle[1/1]`, with Carrick 496ms vs oracle
   404ms (1.23x).
+
+## getpid01 wait-any performance outlier
+
+Hypothesis:
+The full bless reported `ltp-getpid01` as a semantic `MATCH` but with a 36.18x
+timing outlier: Carrick 14,617ms vs cached Docker oracle 404ms. Reading the LTP
+source reframed this as a fork/wait-any benchmark, not a raw `getpid` hot loop:
+the test forks 100 children serially, and each child calls `getpid()`.
+
+Tests:
+- Focused exact Carrick argv before the fix:
+  `target/conformance/logs/getpid01-focus-024803-1.carrick.log`,
+  `target/conformance/logs/getpid01-focus-024811-2.carrick.log`, and
+  `target/conformance/logs/getpid01-focus-024820-3.carrick.log`, elapsed
+  8,271ms, 8,269ms, and 8,308ms.
+- Fresh Docker timings:
+  `target/conformance/logs/docker-getpid01-focus-024836-1.docker.log`,
+  `target/conformance/logs/docker-getpid01-focus-024837-2.docker.log`, and
+  `target/conformance/logs/docker-getpid01-focus-024837-3.docker.log`, elapsed
+  503ms, 273ms, and 256ms.
+- lldb deadline capture:
+  `target/conformance/logs/lldb-runs/getpid01-lldb-025050.lldb.txt`.
+
+Outcome:
+The lldb runner froze the live process tree mid-test. The active LTP worker was
+blocked in `ThreadWaiter::wait_proc_exit_fallback(pid=-1)`, not in guest
+`getpid()`. Carrick already used kqueue `EVFILT_PROC` for concrete
+`wait4(pid)`, but `wait4(-1)` fell back to a 50ms `waitid(P_ALL, WNOHANG)` poll
+because Darwin has no single "any child" kqueue sentinel. In a serial fork loop
+that made every child reap pay a sleep/re-poll penalty.
+
+Fix under test:
+Use Carrick's fork-shared child table as the missing structure for the probe:
+snapshot this process's direct, non-adopted children, arm one `EVFILT_PROC`
+watch per child on the per-thread kqueue, and re-dispatch `wait4(-1)` when any
+child exit fires. Adopted children stay on the existing adopted-child table path,
+and the old polling fallback remains for no-child/unusable-kqueue cases.
+
+Verified:
+- Focused exact Carrick argv after the fix:
+  `target/conformance/logs/getpid01-anykq-025352-1.carrick.log`,
+  `target/conformance/logs/getpid01-anykq-025355-2.carrick.log`, and
+  `target/conformance/logs/getpid01-anykq-025358-3.carrick.log`, elapsed
+  2,836ms, 2,674ms, and 2,699ms.
+- Harness run:
+  `target/release/carrick-conformance --suite ltp-getpid01 --jsonl target/conformance/getpid01-anykq.jsonl`
+  reported `MATCH carrick[100/100] oracle[100/100]`, with Carrick 2,965ms vs
+  cached oracle 404ms (7.34x), below the conformance 10x outlier threshold.
