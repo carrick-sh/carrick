@@ -90,6 +90,74 @@ const EPOLL_REBIND_REASON_IO_REARM: u32 = 1;
 const EPOLL_REBIND_REASON_CLOSE_DETACH: u32 = 2;
 const EPOLL_REBIND_REASON_WAIT_SAMPLE: u32 = 3;
 const EPOLL_REBIND_REASON_CTL_DEL: u32 = 4;
+const MCAST_JOIN_GROUP: i32 = 42;
+const MCAST_BLOCK_SOURCE: i32 = 43;
+const MCAST_UNBLOCK_SOURCE: i32 = 44;
+const MCAST_LEAVE_GROUP: i32 = 45;
+const MCAST_JOIN_SOURCE_GROUP: i32 = 46;
+const MCAST_LEAVE_SOURCE_GROUP: i32 = 47;
+
+fn is_mcast_sockopt(level: i32, optname: i32) -> bool {
+    (level == crate::linux_abi::LINUX_SOL_IP || level == crate::linux_abi::LINUX_SOL_IPV6)
+        && (MCAST_JOIN_GROUP..=MCAST_LEAVE_SOURCE_GROUP).contains(&optname)
+}
+
+fn mcast_source_specific(optname: i32) -> Option<bool> {
+    match optname {
+        MCAST_JOIN_GROUP | MCAST_LEAVE_GROUP | MCAST_BLOCK_SOURCE | MCAST_UNBLOCK_SOURCE => {
+            Some(false)
+        }
+        MCAST_JOIN_SOURCE_GROUP | MCAST_LEAVE_SOURCE_GROUP => Some(true),
+        _ => None,
+    }
+}
+
+fn mcast_setsockopt_outcome(
+    memberships: &mut Vec<SocketMulticastMembership>,
+    level: i32,
+    optname: i32,
+    optval: Vec<u8>,
+) -> DispatchOutcome {
+    let Some(source_specific) = mcast_source_specific(optname) else {
+        return DispatchOutcome::errno(LINUX_ENOPROTOOPT);
+    };
+    if optval.is_empty() {
+        return DispatchOutcome::errno(LINUX_EINVAL);
+    }
+    let membership = SocketMulticastMembership {
+        level,
+        source_specific,
+        optval,
+    };
+    match optname {
+        MCAST_JOIN_GROUP | MCAST_JOIN_SOURCE_GROUP => {
+            if !memberships.contains(&membership) {
+                memberships.push(membership);
+            }
+            DispatchOutcome::Returned { value: 0 }
+        }
+        MCAST_LEAVE_GROUP | MCAST_LEAVE_SOURCE_GROUP => {
+            if let Some(pos) = memberships.iter().position(|entry| entry == &membership) {
+                memberships.remove(pos);
+                DispatchOutcome::Returned { value: 0 }
+            } else {
+                DispatchOutcome::errno(crate::linux_abi::LINUX_EADDRNOTAVAIL)
+            }
+        }
+        MCAST_BLOCK_SOURCE | MCAST_UNBLOCK_SOURCE => {
+            if memberships.iter().any(|entry| {
+                entry.level == membership.level
+                    && !entry.source_specific
+                    && entry.optval == membership.optval
+            }) {
+                DispatchOutcome::Returned { value: 0 }
+            } else {
+                DispatchOutcome::errno(crate::linux_abi::LINUX_EADDRNOTAVAIL)
+            }
+        }
+        _ => DispatchOutcome::errno(LINUX_ENOPROTOOPT),
+    }
+}
 
 syscall_table! {
     /// Per-module syscall routing for the `net` subsystem (Task A1).
@@ -1538,6 +1606,7 @@ impl SyscallDispatcher {
                 family,
                 type_: base_type,
                 base: OpenDescriptionBase::new(status_flags),
+                mcast_memberships: Vec::new(),
                 synthetic_recv: std::collections::VecDeque::new(),
             })),
             fd_flags,
@@ -1606,6 +1675,7 @@ impl SyscallDispatcher {
                 family: libc::AF_UNIX,
                 type_: so_type,
                 base: OpenDescriptionBase::new(LINUX_O_RDWR),
+                mcast_memberships: Vec::new(),
                 synthetic_recv: std::collections::VecDeque::new(),
             }
         } else if kind == libc::S_IFIFO {
@@ -2174,6 +2244,7 @@ impl SyscallDispatcher {
                 family,
                 type_,
                 base: OpenDescriptionBase::new(status_flags),
+                mcast_memberships: Vec::new(),
                 synthetic_recv: std::collections::VecDeque::new(),
             })),
             fd_flags,
@@ -2481,6 +2552,68 @@ mod recvmmsg_tests {
             !matches!(out, DispatchOutcome::Errno { errno } if errno == LINUX_EINVAL),
             "NULL timeout must not be rejected as malformed, got {out:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod mcast_membership_tests {
+    use super::*;
+
+    fn errno(outcome: DispatchOutcome) -> Option<LinuxErrno> {
+        match outcome {
+            DispatchOutcome::Errno { errno } => Some(errno),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn mcast_leave_without_join_is_eaddrnotavail() {
+        let mut memberships = Vec::new();
+        let outcome = mcast_setsockopt_outcome(
+            &mut memberships,
+            crate::linux_abi::LINUX_SOL_IP,
+            MCAST_LEAVE_GROUP,
+            vec![1, 2, 3, 4],
+        );
+
+        assert_eq!(errno(outcome), Some(crate::linux_abi::LINUX_EADDRNOTAVAIL));
+        assert!(memberships.is_empty());
+    }
+
+    #[test]
+    fn mcast_membership_is_per_socket_state() {
+        let mut listener_memberships = Vec::new();
+        let join = mcast_setsockopt_outcome(
+            &mut listener_memberships,
+            crate::linux_abi::LINUX_SOL_IP,
+            MCAST_JOIN_GROUP,
+            vec![1, 2, 3, 4],
+        );
+        assert!(matches!(join, DispatchOutcome::Returned { value: 0 }));
+
+        let mut accepted_memberships = Vec::new();
+        let accepted_leave = mcast_setsockopt_outcome(
+            &mut accepted_memberships,
+            crate::linux_abi::LINUX_SOL_IP,
+            MCAST_LEAVE_GROUP,
+            vec![1, 2, 3, 4],
+        );
+        assert_eq!(
+            errno(accepted_leave),
+            Some(crate::linux_abi::LINUX_EADDRNOTAVAIL)
+        );
+
+        let listener_leave = mcast_setsockopt_outcome(
+            &mut listener_memberships,
+            crate::linux_abi::LINUX_SOL_IP,
+            MCAST_LEAVE_GROUP,
+            vec![1, 2, 3, 4],
+        );
+        assert!(matches!(
+            listener_leave,
+            DispatchOutcome::Returned { value: 0 }
+        ));
+        assert!(listener_memberships.is_empty());
     }
 }
 
@@ -4388,6 +4521,7 @@ impl SyscallDispatcher {
                     family,
                     type_: base_type,
                     base: OpenDescriptionBase::new(status_flags),
+                    mcast_memberships: Vec::new(),
                     synthetic_recv: std::collections::VecDeque::new(),
                 })),
                 fd_flags,
@@ -4398,6 +4532,7 @@ impl SyscallDispatcher {
                     family,
                     type_: base_type,
                     base: OpenDescriptionBase::new(status_flags),
+                    mcast_memberships: Vec::new(),
                     synthetic_recv: std::collections::VecDeque::new(),
                 })),
                 fd_flags,
@@ -5540,16 +5675,39 @@ impl SyscallDispatcher {
                 }
                 // Protocol-independent multicast source-filter API
                 // (MCAST_JOIN_GROUP=42 .. MCAST_LEAVE_SOURCE_GROUP=47, RFC 3678).
-                // The LTP networking framework sets MCAST_JOIN_GROUP during setup;
-                // real Linux returns 0 (verified against the arm64 Docker oracle on
-                // both TCP and UDP). macOS has no MCAST_* optnames, so
-                // accept-and-ignore (no-op success) instead of the ENOPROTOOPT that
-                // TBROK'd accept02/connect02 et al.
-                let mcast_family = (level == a::LINUX_SOL_IP
-                    || level == a::LINUX_SOL_IPV6)
-                    && (42..=47).contains(&optname);
-                if mcast_family {
-                    return Ok(DispatchOutcome::Returned { value: 0 });
+                // Darwin has no MCAST_* optnames, so Carrick models the
+                // Linux-visible membership state instead of passing through. This
+                // lets joins succeed for setup while preserving Linux's per-socket
+                // rule: accepted sockets do not inherit listener memberships.
+                if is_mcast_sockopt(level, optname) {
+                    if optlen != 0 && optval_addr == 0 {
+                        return Ok(DispatchOutcome::errno(a::LINUX_EFAULT));
+                    }
+                    let bytes = if optval_addr == 0 || optlen == 0 {
+                        Vec::new()
+                    } else {
+                        match memory.read_bytes(optval_addr, optlen as usize) {
+                            Ok(b) => b,
+                            Err(_) => return Ok(DispatchOutcome::errno(a::LINUX_EFAULT)),
+                        }
+                    };
+                    let Some(open_file) = this.open_file(fd) else {
+                        return Ok(DispatchOutcome::errno(a::LINUX_EBADF));
+                    };
+                    let mut open = open_file.description.write();
+                    let OpenDescription::HostSocket {
+                        mcast_memberships,
+                        ..
+                    } = &mut *open
+                    else {
+                        return Ok(DispatchOutcome::errno(a::LINUX_ENOTSOCK));
+                    };
+                    return Ok(mcast_setsockopt_outcome(
+                        mcast_memberships,
+                        level,
+                        optname,
+                        bytes,
+                    ));
                 }
             }
             let (host_level, host_opt) = match linux_to_host_sockopt(level, optname) {
