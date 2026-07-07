@@ -86,6 +86,11 @@ use super::*;
 use crate::network::{BindTarget, ConnectTarget, GuestSocketAddr, HostSocketAddr};
 use carrick_spec::PortProtocol;
 
+const EPOLL_REBIND_REASON_IO_REARM: u32 = 1;
+const EPOLL_REBIND_REASON_CLOSE_DETACH: u32 = 2;
+const EPOLL_REBIND_REASON_WAIT_SAMPLE: u32 = 3;
+const EPOLL_REBIND_REASON_CTL_DEL: u32 = 4;
+
 syscall_table! {
     /// Per-module syscall routing for the `net` subsystem (Task A1).
     ///
@@ -441,6 +446,7 @@ impl SyscallDispatcher {
         kqueue: &Arc<EpollKqueue>,
         interest: &HashMap<i32, EpollInterest>,
         host_fd: HostFd,
+        reason: u32,
     ) {
         let mut survivor: Option<(i32, u32)> = None;
         let mut union_events = 0u32;
@@ -461,6 +467,18 @@ impl SyscallDispatcher {
             union_interest.write |= effective.write;
             union_interest.oob |= effective.oob;
         }
+        let (survivor_fd, survivor_gen) = survivor.unwrap_or((-1, 0));
+        let effective_bits = u32::from(union_interest.read)
+            | (u32::from(union_interest.write) << 1)
+            | (u32::from(union_interest.oob) << 2);
+        crate::probes::epoll_rebind(
+            reason,
+            host_fd.get(),
+            survivor_fd,
+            survivor_gen,
+            union_events,
+            effective_bits,
+        );
 
         kqueue.with_mux(|mux| match survivor {
             Some((sfd, sgen)) => {
@@ -865,6 +883,7 @@ impl SyscallDispatcher {
                                     kqueue,
                                     interest,
                                     HostFd(host_fd),
+                                    EPOLL_REBIND_REASON_IO_REARM,
                                 );
                             }
                         }
@@ -1026,7 +1045,12 @@ impl SyscallDispatcher {
                         feature = "platform-freebsd",
                         feature = "platform-netbsd"
                     ))]
-                    self.rebind_epoll_host_registration(kqueue, interest, host_fd);
+                    self.rebind_epoll_host_registration(
+                        kqueue,
+                        interest,
+                        host_fd,
+                        EPOLL_REBIND_REASON_CLOSE_DETACH,
+                    );
                     #[cfg(not(any(
                         feature = "platform-macos",
                         feature = "platform-freebsd",
@@ -2918,7 +2942,12 @@ impl SyscallDispatcher {
                         host_rearms.sort_unstable();
                         host_rearms.dedup();
                         for host_fd in host_rearms {
-                            this.rebind_epoll_host_registration(kqueue, interest, HostFd(host_fd));
+                            this.rebind_epoll_host_registration(
+                                kqueue,
+                                interest,
+                                HostFd(host_fd),
+                                EPOLL_REBIND_REASON_WAIT_SAMPLE,
+                            );
                         }
                     }
                     for fd in &oneshot_fds {
@@ -3292,7 +3321,12 @@ impl SyscallDispatcher {
                             feature = "platform-freebsd",
                             feature = "platform-netbsd"
                         ))]
-                        this.rebind_epoll_host_registration(kqueue, interest, host_fd);
+                        this.rebind_epoll_host_registration(
+                            kqueue,
+                            interest,
+                            host_fd,
+                            EPOLL_REBIND_REASON_CTL_DEL,
+                        );
                         #[cfg(not(any(
                             feature = "platform-macos",
                             feature = "platform-freebsd",

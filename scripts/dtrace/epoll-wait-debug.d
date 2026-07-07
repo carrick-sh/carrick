@@ -53,6 +53,31 @@ carrick*:::epoll-masked
         pid, (int)this->m[1], (uint32_t)this->m[2], (uint32_t)this->m[3], (uint32_t)this->m[4], (int)this->m[0]);
 }
 
+carrick*:::epoll-rebind
+/(pid == $target || progenyof($target))/
+{
+    this->r = (uint64_t *)copyin(arg0, 48);
+    @rebind[(int)this->r[0], (uint32_t)this->r[4], (uint32_t)this->r[5]] = count();
+    printf("[%d epoll-rebind] reason=%d host_fd=%d survivor=%d gen=%d union=%#x effective=%#x\n",
+        pid, (int)this->r[0], (int)this->r[1], (int)this->r[2], (int)this->r[3], (uint32_t)this->r[4], (uint32_t)this->r[5]);
+}
+
+carrick*:::io-wait-begin
+/(pid == $target || progenyof($target))/
+{
+    @io_wait_begin[(int)arg1, (int)arg3, (int)arg4] = count();
+    printf("[%d io-wait-begin] tid=%d fds=%d timeout=%d fd0=%d events0=%#x fd1=%d\n",
+        pid, (int)arg0, (int)arg1, (int)arg2, (int)arg3, (int)arg4, (int)arg5);
+}
+
+carrick*:::io-wait-end
+/(pid == $target || progenyof($target))/
+{
+    @io_wait_end[(int)arg1, (int)arg2, (int)arg3] = count();
+    printf("[%d io-wait-end] tid=%d result=%d fds=%d fd0=%d fd1=%d fd2=%d\n",
+        pid, (int)arg0, (int)arg1, (int)arg2, (int)arg3, (int)arg4, (int)arg5);
+}
+
 tick-1s
 {
     printf("\n========= epoll tick %Y =========\n", walltimestamp);
@@ -64,6 +89,12 @@ tick-1s
     printa("  requested=%#x raw=%#x last=%#x %@d\n", @masked);
     printf("--- masked origins ---\n");
     printa("  origin=%-2d requested=%#x raw=%#x last=%#x %@d\n", @masked_origin);
+    printf("--- rebinds ---\n");
+    printa("  reason=%-2d union=%#x effective=%#x %@d\n", @rebind);
+    printf("--- io wait begin ---\n");
+    printa("  fds=%-3d fd0=%-8d events0=%#x %@d\n", @io_wait_begin);
+    printf("--- io wait end ---\n");
+    printa("  result=%-3d fds=%-3d fd0=%-8d %@d\n", @io_wait_end);
 }
 
 tick-20s
@@ -82,4 +113,10 @@ dtrace:::END
     printa("  requested=%#x raw=%#x last=%#x %@d\n", @masked);
     printf("--- masked origins ---\n");
     printa("  origin=%-2d requested=%#x raw=%#x last=%#x %@d\n", @masked_origin);
+    printf("--- rebinds ---\n");
+    printa("  reason=%-2d union=%#x effective=%#x %@d\n", @rebind);
+    printf("--- io wait begin ---\n");
+    printa("  fds=%-3d fd0=%-8d events0=%#x %@d\n", @io_wait_begin);
+    printf("--- io wait end ---\n");
+    printa("  result=%-3d fds=%-3d fd0=%-8d %@d\n", @io_wait_end);
 }
