@@ -34,12 +34,12 @@ fi
 
 if [ "$run_id" = "--all" ]; then
     # Global sledgehammer (manual recovery only): every renamed guest + trace fronts.
-    scan() { ps -axo pid,args | awk '!/awk/ && ($0 ~ /carrick:/ || $0 ~ /release\/carrick trace/) {print $1}'; }
+    scan() { ps -axo pid=,command= | awk '!/awk/ && ($0 ~ /carrick:/ || $0 ~ /release\/carrick trace/) {print $1}'; }
     desc="ALL carrick guests"
 else
     # Scoped: LITERAL, anchored match of the delimited token "carrick:<id>:".
     needle="carrick:$run_id:"
-    scan() { ps -axo pid,args | awk -v n="$needle" '!/awk/ && index($0, n) {print $1}'; }
+    scan() { ps -axo pid=,command= | awk -v n="$needle" '!/awk/ && index($0, n) {print $1}'; }
     desc="run-id $run_id"
 fi
 
