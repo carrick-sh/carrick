@@ -115,6 +115,7 @@ pub(super) fn epoll_interest_for(events: LinuxEpollEvents) -> carrick_hal::event
         read,
         write,
         oob: events.contains(LinuxEpollEvents::PRI),
+        read_lowat: None,
     }
 }
 
@@ -3194,6 +3195,7 @@ mod tests {
                 read: true,
                 write: false,
                 oob: false,
+                read_lowat: None,
             }
         );
         assert_eq!(
@@ -3202,6 +3204,7 @@ mod tests {
                 read: true,
                 write: false,
                 oob: false,
+                read_lowat: None,
             }
         );
         assert_eq!(
@@ -3210,6 +3213,7 @@ mod tests {
                 read: false,
                 write: true,
                 oob: false,
+                read_lowat: None,
             }
         );
         assert_eq!(
@@ -3218,6 +3222,7 @@ mod tests {
                 read: true,
                 write: true,
                 oob: false,
+                read_lowat: None,
             }
         );
         assert_eq!(
@@ -3226,6 +3231,7 @@ mod tests {
                 read: true,
                 write: false,
                 oob: true,
+                read_lowat: None,
             }
         );
     }

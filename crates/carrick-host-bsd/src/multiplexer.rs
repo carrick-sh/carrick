@@ -50,16 +50,26 @@ impl EventMultiplexer for KqueueMultiplexer {
     ) -> Result<(), OsError> {
         let mut base = libc::EV_ADD | libc::EV_ENABLE;
         if mode == TriggerMode::Edge {
-            base |= libc::EV_CLEAR;
+            base |= libc::EV_CLEAR | libc::EV_DISPATCH;
         }
 
         let mut changes = Vec::with_capacity(3);
         if interest.read {
-            changes.push(Kevent::read(fd, base).with_udata_u64(token));
+            if mode == TriggerMode::Edge {
+                let _ = self.kq.apply(&[Kevent::read(fd, libc::EV_DELETE)]);
+            }
+            let read = match interest.read_lowat {
+                Some(lowat) => Kevent::read_lowat(fd, base, lowat),
+                None => Kevent::read(fd, base),
+            };
+            changes.push(read.with_udata_u64(token));
         } else {
             let _ = self.kq.apply(&[Kevent::read(fd, libc::EV_DELETE)]);
         }
         if interest.write {
+            if mode == TriggerMode::Edge {
+                let _ = self.kq.apply(&[Kevent::write(fd, libc::EV_DELETE)]);
+            }
             changes.push(Kevent::write(fd, base).with_udata_u64(token));
         } else {
             let _ = self.kq.apply(&[Kevent::write(fd, libc::EV_DELETE)]);
@@ -68,6 +78,10 @@ impl EventMultiplexer for KqueueMultiplexer {
             #[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
             {
                 return Err(OsError::from_raw(libc::EOPNOTSUPP));
+            }
+            #[cfg(not(any(target_os = "freebsd", target_os = "netbsd")))]
+            if mode == TriggerMode::Edge {
+                let _ = self.kq.apply(&[Kevent::oob(fd, libc::EV_DELETE)]);
             }
             #[cfg(not(any(target_os = "freebsd", target_os = "netbsd")))]
             changes.push(Kevent::oob(fd, base).with_udata_u64(token));
