@@ -516,9 +516,12 @@ mod real {
     struct EpollMaskedProbe {
         origin: u64,
         fd: u64,
+        host_fd: u64,
         requested: u64,
         raw_ready: u64,
         last_ready: u64,
+        read_avail: u64,
+        last_read_avail: u64,
     }
 
     thread_local! {
@@ -526,20 +529,35 @@ mod real {
             const { std::cell::Cell::new(EpollMaskedProbe {
                 origin: 0,
                 fd: 0,
+                host_fd: 0,
                 requested: 0,
                 raw_ready: 0,
                 last_ready: 0,
+                read_avail: 0,
+                last_read_avail: 0,
             }) };
     }
 
     #[inline(never)]
-    pub fn epoll_masked(origin: i32, fd: i32, requested: u32, raw_ready: u32, last_ready: u32) {
+    pub fn epoll_masked(
+        origin: i32,
+        fd: i32,
+        host_fd: i32,
+        requested: u32,
+        raw_ready: u32,
+        last_ready: u32,
+        read_avail: u64,
+        last_read_avail: u64,
+    ) {
         let payload = EpollMaskedProbe {
             origin: origin as u64,
             fd: fd as i64 as u64,
+            host_fd: host_fd as i64 as u64,
             requested: requested as u64,
             raw_ready: raw_ready as u64,
             last_ready: last_ready as u64,
+            read_avail,
+            last_read_avail,
         };
         EPOLL_MASKED_PROBE.with(|slot| {
             slot.set(payload);
@@ -1149,7 +1167,7 @@ mod stub {
     stub!(host_pipe_io(host_fd: i32, dir: i32, n: i64));
     stub!(epoll_ctl(epfd: i32, op: u64, fd: i32, events: u32, data: u64, errno: i32));
     stub!(epoll_interest(epfd: i32, fd: i32, requested: u32, raw_ready: u32, last_ready: u32, ready: u32));
-    stub!(epoll_masked(origin: i32, fd: i32, requested: u32, raw_ready: u32, last_ready: u32));
+    stub!(epoll_masked(origin: i32, fd: i32, host_fd: i32, requested: u32, raw_ready: u32, last_ready: u32, read_avail: u64, last_read_avail: u64));
     stub!(epoll_rebind(reason: u32, host_fd: i32, survivor_fd: i32, survivor_gen: u32, union_events: u32, effective: u32));
     stub!(epoll_wait_fd(epfd: i32, fd: i32, host_fd: i32, poll_events: i32, timeout_ms: i32));
     stub!(epoll_result(epfd: i32, ready_count: i32, wait_count: i32, timeout_ms: i32, kind: i32));

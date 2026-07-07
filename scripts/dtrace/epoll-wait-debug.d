@@ -47,10 +47,11 @@ carrick*:::epoll-interest
 carrick*:::epoll-masked
 /(pid == $target || progenyof($target))/
 {
-    this->m = (uint64_t *)copyin(arg0, 40);
-    @masked_origin[(int)this->m[0], (uint32_t)this->m[2], (uint32_t)this->m[3], (uint32_t)this->m[4]] = count();
-    printf("[%d epoll-masked-origin] fd=%d requested=%#x raw=%#x last=%#x origin=%d\n",
-        pid, (int)this->m[1], (uint32_t)this->m[2], (uint32_t)this->m[3], (uint32_t)this->m[4], (int)this->m[0]);
+    this->m = (uint64_t *)copyin(arg0, 64);
+    @masked_origin[(int)this->m[0], (uint32_t)this->m[3], (uint32_t)this->m[4], (uint32_t)this->m[5]] = count();
+    @masked_avail[(int)this->m[0], (uint32_t)this->m[4], (uint64_t)this->m[6], (uint64_t)this->m[7]] = count();
+    printf("[%d epoll-masked-origin] fd=%d host_fd=%d requested=%#x raw=%#x last=%#x read_avail=%d last_read_avail=%d origin=%d\n",
+        pid, (int)this->m[1], (int)this->m[2], (uint32_t)this->m[3], (uint32_t)this->m[4], (uint32_t)this->m[5], (int)this->m[6], (int)this->m[7], (int)this->m[0]);
 }
 
 carrick*:::epoll-rebind
@@ -89,6 +90,8 @@ tick-1s
     printa("  requested=%#x raw=%#x last=%#x %@d\n", @masked);
     printf("--- masked origins ---\n");
     printa("  origin=%-2d requested=%#x raw=%#x last=%#x %@d\n", @masked_origin);
+    printf("--- masked read availability ---\n");
+    printa("  origin=%-2d raw=%#x read_avail=%-6d last_read_avail=%-6d %@d\n", @masked_avail);
     printf("--- rebinds ---\n");
     printa("  reason=%-2d union=%#x effective=%#x %@d\n", @rebind);
     printf("--- io wait begin ---\n");
@@ -113,6 +116,8 @@ dtrace:::END
     printa("  requested=%#x raw=%#x last=%#x %@d\n", @masked);
     printf("--- masked origins ---\n");
     printa("  origin=%-2d requested=%#x raw=%#x last=%#x %@d\n", @masked_origin);
+    printf("--- masked read availability ---\n");
+    printa("  origin=%-2d raw=%#x read_avail=%-6d last_read_avail=%-6d %@d\n", @masked_avail);
     printf("--- rebinds ---\n");
     printa("  reason=%-2d union=%#x effective=%#x %@d\n", @rebind);
     printf("--- io wait begin ---\n");
