@@ -1216,3 +1216,46 @@ removes multiple gates without blessing false passes: xattr/listxattr policy,
 setns/sendfile/socket skips, or the newly surfaced `futex_wait05` regression.
 Separately, the epoll/creat/flock timing outliers need first-principles
 investigation before any final bless.
+
+## 2026-07-07 08:22 - epoll-ltp timing reconfirmed as fork-storm cost
+
+Hypothesis:
+
+The fresh full bless still showed `ltp-epoll-ltp` as a semantic match but a
+pathological timing outlier (`36.15x`). The name again points at epoll/kqueue,
+but the earlier 04:40 investigation said the row was dominated by LTP's
+protected fork-per-case harness. Re-check this against the current signed tree
+before touching the kqueue epoll backend.
+
+Tests:
+
+- Focused baseline
+  `target/conformance/epoll-ltp-baseline-081316.jsonl` matched
+  Carrick `33/33` vs Docker `33/33`, but took `52051ms` vs `1426ms`
+  (`36.50x`).
+- The raw guest log `target/conformance/raw/conf-99594-c00.out` shows the work:
+  33 `epoll_create` cases, then the old `epoll01` `epoll_ctl` matrix with
+  `13824` successful cases. There are no `epoll_wait` assertions in this test.
+- LTP source inspection confirmed every `epoll_ctl` case is wrapped in
+  `PROTECT_REGION_START`, so the child process executes exactly one
+  `epoll_ctl` attempt and exits.
+- `carrick trace` with `scripts/dtrace/epoll-ctl-cost.d`:
+  `target/conformance/logs/epoll-ctl-cost-081725.trace`.
+  Before the 70s trace deadline it observed:
+  - Guest syscall `21` (`epoll_ctl`): `7832` entries.
+  - Guest syscall `220` (`clone`): `7836` entries.
+  - `fork-post`: `15670` parent/child events.
+  - Host `kevent`: `89319` calls.
+  - Host `fcntl`: `360205` calls, plus `172524` host `close` calls.
+- `scripts/dtrace/fork-phases.d` on the same workload:
+  `target/conformance/logs/epoll-ltp-fork-phases-081912.trace`.
+  Parent rebuild averaged `3099us`; child rebuild averaged `3478us`.
+
+Outcome:
+
+This is still not an epoll readiness or `EV_CLEAR`/`EV_DISPATCH` bug.
+`epoll-ltp` is an old fork-protected parameter matrix where Carrick pays its
+~3ms HVF fork lifecycle thousands of times. The fix belongs in the fork/VM
+rebuild architecture, not in epoll wait/rearm. Until that deeper fork work is
+done, this row should stay visible as pathological timing debt rather than be
+papered over with sleeps or kqueue backstops.
