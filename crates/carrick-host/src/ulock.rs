@@ -22,8 +22,18 @@
 //! word), or `-errno` (`-ETIMEDOUT`, `-EINTR`, …). `wake` returns `>= 0` on
 //! success or `-errno` (e.g. `-ENOENT` when there was no waiter).
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WaiterDebugCounts {
+    pub count: u32,
+    pub requeue_wake: u32,
+    pub requeue_count: u32,
+    pub logical_requeued: u32,
+    pub logical_wake: u32,
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod imp {
+    use super::WaiterDebugCounts;
     use std::ffi::c_void;
     use std::sync::OnceLock;
     use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -148,6 +158,19 @@ mod imp {
         waiter_slot(host_addr)
             .map(|slot| slot.count.load(Ordering::Acquire))
             .unwrap_or(0)
+    }
+
+    pub fn waiter_debug_counts(waiter_key: usize) -> WaiterDebugCounts {
+        let Some(slot) = waiter_slot(waiter_key) else {
+            return WaiterDebugCounts::default();
+        };
+        WaiterDebugCounts {
+            count: slot.count.load(Ordering::Acquire),
+            requeue_wake: slot.requeue_wake.load(Ordering::Acquire),
+            requeue_count: slot.requeue_count.load(Ordering::Acquire),
+            logical_requeued: slot.logical_requeued.load(Ordering::Acquire),
+            logical_wake: slot.logical_wake.load(Ordering::Acquire),
+        }
     }
 
     fn consume_one(counter: &AtomicU32) -> bool {
@@ -427,6 +450,8 @@ mod imp {
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 mod imp {
+    use super::WaiterDebugCounts;
+
     pub fn wait(_host_addr: usize, _value: u32, _timeout_us: u32) -> i64 {
         -(libc::ENOSYS as i64)
     }
@@ -435,6 +460,9 @@ mod imp {
     }
     pub fn wake_counted(_host_addr: usize, _waiter_key: usize, _n: u32) -> i64 {
         -(libc::ENOSYS as i64)
+    }
+    pub fn waiter_debug_counts(_waiter_key: usize) -> WaiterDebugCounts {
+        WaiterDebugCounts::default()
     }
     pub fn requeue_counted(
         _from_host_addr: usize,
@@ -467,7 +495,8 @@ mod imp {
 
 pub use imp::{
     preinit_waiter_table, requeue_counted, requeued_waiter_complete, requeued_waiter_enter,
-    requeued_waiter_exit, take_requeue, wait, waiter_enter, waiter_exit, wake, wake_counted,
+    requeued_waiter_exit, take_requeue, wait, waiter_debug_counts, waiter_enter, waiter_exit, wake,
+    wake_counted,
 };
 
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
