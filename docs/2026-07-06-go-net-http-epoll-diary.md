@@ -705,3 +705,34 @@ Outcome:
   after terminal state"; it is narrower. A masked terminal edge is drained from
   kqueue, then the same host filter is rearmed even though that exact terminal
   edge produced no guest-visible delta.
+
+### Rejected experiment: suppress rearm only for masked terminal edges
+
+Hypothesis:
+
+- If the bad loop is caused by one drained terminal edge being immediately
+  rearmed after producing no guest-visible delta, the update path can suppress
+  only that host rearm and leave ordinary terminal/read registration behavior
+  unchanged.
+
+Experiment:
+
+- Converted the wait-loop update tuple to a local struct and added a
+  `suppress_host_rearm` decision only for `edge_drained && masked_ready` events
+  whose drained edge carried `EPOLLRDHUP`, `EPOLLHUP`, or `EPOLLERR`.
+
+Outcome:
+
+- Rejected and reverted. It fixed the focused h1 reproducer:
+  `target/conformance/logs/go-net-http-h1-maskterm-000424.guest.log` passed in
+  `real 1.66`.
+- It regressed focused `TestOmitHTTP2Vet` in 2 of 3 samples:
+  `target/conformance/logs/go-net-http-vet-maskterm-000406.guest.log`,
+  `target/conformance/logs/go-net-http-vet-maskterm1-000432.guest.log`, and
+  `target/conformance/logs/go-net-http-vet-maskterm2-000449.guest.log` failed;
+  `target/conformance/logs/go-net-http-vet-maskterm3-000458.guest.log` passed in
+  `real 32.02`.
+- Interpretation: the rearm is still serving another Go toolchain path. The
+  h1 loop needs either a more fd/state-specific condition or a different
+  architecture for terminal kqueue edges rather than suppressing the host
+  rearm in the generic ET update path.
