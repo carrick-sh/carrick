@@ -199,6 +199,12 @@ const KNOWN_GAP_PREFIX_OVERRIDES: &[(&str, &[&str])] = &[
 /// a visible capacity/virtualization gap until Carrick owns the semaphore
 /// service or virtualizes the tunables honestly.
 ///
+/// The xattr/listxattr rows below are oracle-broken on the current Docker/LTP
+/// image because Linux container security policy blocks setup of the
+/// `security.*` xattrs these tests need. Carrick's host-backed xattr behavior is
+/// tracked separately; keep the affected rows report-only instead of gating on
+/// container setup failures.
+///
 /// futex_cmp_requeue01's high-fanout process-shared cases require Linux's
 /// atomic source dequeue + destination enqueue semantics. Carrick's Darwin
 /// ulock-backed approximation can account wake/requeue credits while a subset
@@ -209,7 +215,20 @@ const KNOWN_GAP_EXACT_OVERRIDES: &[(&str, &[&str])] = &[
     ("ltp-acct01", &["summary"]),
     ("ltp-bind06", &["summary"]),
     ("ltp-delete_module02", &["summary"]),
+    ("ltp-fgetxattr02", &["summary"]),
+    ("ltp-flistxattr01", &["summary"]),
+    ("ltp-flistxattr02", &["summary"]),
+    ("ltp-flistxattr03", &["summary"]),
+    ("ltp-fsetxattr02", &["summary"]),
     ("ltp-futex_cmp_requeue01", &["summary"]),
+    ("ltp-lgetxattr01", &["summary"]),
+    ("ltp-lgetxattr02", &["summary"]),
+    ("ltp-listxattr01", &["summary"]),
+    ("ltp-listxattr02", &["summary"]),
+    ("ltp-listxattr03", &["summary"]),
+    ("ltp-llistxattr01", &["summary"]),
+    ("ltp-llistxattr02", &["summary"]),
+    ("ltp-llistxattr03", &["summary"]),
     ("ltp-setrlimit01", &["summary"]),
     ("ltp-semget05", &["summary"]),
 ];
@@ -315,6 +334,13 @@ fn go_timeout_s(pkg: &str) -> u64 {
 }
 
 fn ltp_timeout_s(bin: &str) -> u64 {
+    if bin == "futex_cmp_requeue01" {
+        // This known-gap suite has its own LTP timeout and must reach the
+        // Summary line for the `summary` known_gap to classify it as
+        // report-only. The default 40s outer cap can kill carrick first and
+        // turn that documented summary mismatch into a gating harness TIMEOUT.
+        return 90;
+    }
     if bin == "timerfd_settime02" {
         // tst_fuzzy_sync race test: ~150s under carrick (HVF vmexit/syscall
         // overhead is ~30x the native raw-syscall loop this test spins), vs a
@@ -652,6 +678,7 @@ mod tests {
         assert_eq!(cpython_timeout_s("test_tarfile"), 600);
         assert_eq!(go_timeout_s("net/http"), 540);
         assert_eq!(ltp_timeout_s("epoll-ltp"), 120);
+        assert_eq!(ltp_timeout_s("futex_cmp_requeue01"), 90);
         assert_eq!(ltp_timeout_s("timerfd_settime02"), 300);
     }
 
@@ -788,6 +815,30 @@ mod tests {
                 "{name} lost known_gap summary"
             );
         }
+        // xattr/listxattr rows: current Docker/LTP setup trips over
+        // container-blocked security xattrs; keep these report-only until the
+        // oracle environment can exercise the intended Linux semantics.
+        for name in [
+            "ltp-fgetxattr02",
+            "ltp-flistxattr01",
+            "ltp-flistxattr02",
+            "ltp-flistxattr03",
+            "ltp-fsetxattr02",
+            "ltp-lgetxattr01",
+            "ltp-lgetxattr02",
+            "ltp-listxattr01",
+            "ltp-listxattr02",
+            "ltp-listxattr03",
+            "ltp-llistxattr01",
+            "ltp-llistxattr02",
+            "ltp-llistxattr03",
+        ] {
+            let s = find(name);
+            assert!(
+                s.known_gaps.iter().any(|g| g == "summary"),
+                "{name} lost known_gap summary"
+            );
+        }
         // setrlimit02/03/04/05: unconfined + CAP_SYS_RESOURCE and DELIBERATELY no
         // gap. 02/04/05 are root-raise tests that MATCH via the euid-gate fix; 03
         // MATCHes now that carrick enforces the nr_open ceiling on NOFILE
@@ -891,6 +942,10 @@ mod tests {
         );
         assert_eq!(
             known_gap_overrides("ltp-semget05"),
+            Some(vec!["summary".into()])
+        );
+        assert_eq!(
+            known_gap_overrides("ltp-llistxattr01"),
             Some(vec!["summary".into()])
         );
         assert_eq!(known_gap_overrides("ltp-setrlimit02"), None);
