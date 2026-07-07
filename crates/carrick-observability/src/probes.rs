@@ -264,6 +264,9 @@ mod real {
         /// Per-interest epoll_pwait readiness decision. `requested`, `raw_ready`,
         /// `last_ready`, and `ready` are Linux epoll event bitmasks.
         fn epoll__interest(_: i32, _: i32, _: u32, _: u32, _: u32, _: u32) {}
+        /// Masked epoll readiness sample. Arg0 is the ADDRESS of an
+        /// `EpollMaskedProbe` payload.
+        fn epoll__masked(_: u64) {}
         /// Host-backed fd that epoll_pwait hands to the runtime's kqueue waiter.
         /// `poll_events` is the libc POLL* mask used to build EVFILT registrations.
         fn epoll__wait__fd(_: i32, _: i32, _: i32, _: i32, _: i32) {}
@@ -501,6 +504,45 @@ mod real {
         ready: u32,
     ) {
         carrick_usdt::epoll__interest!(|| (epfd, fd, requested, raw_ready, last_ready, ready));
+    }
+
+    /// Raw-pointer payload for `epoll-masked`. Keep field order in sync with
+    /// `scripts/dtrace/epoll-wait-debug.d`.
+    #[derive(Clone, Copy)]
+    #[repr(C)]
+    struct EpollMaskedProbe {
+        origin: u64,
+        fd: u64,
+        requested: u64,
+        raw_ready: u64,
+        last_ready: u64,
+    }
+
+    thread_local! {
+        static EPOLL_MASKED_PROBE: std::cell::Cell<EpollMaskedProbe> =
+            const { std::cell::Cell::new(EpollMaskedProbe {
+                origin: 0,
+                fd: 0,
+                requested: 0,
+                raw_ready: 0,
+                last_ready: 0,
+            }) };
+    }
+
+    #[inline(never)]
+    pub fn epoll_masked(origin: i32, fd: i32, requested: u32, raw_ready: u32, last_ready: u32) {
+        let payload = EpollMaskedProbe {
+            origin: origin as u64,
+            fd: fd as i64 as u64,
+            requested: requested as u64,
+            raw_ready: raw_ready as u64,
+            last_ready: last_ready as u64,
+        };
+        EPOLL_MASKED_PROBE.with(|slot| {
+            slot.set(payload);
+            let ptr = slot.as_ptr() as u64;
+            carrick_usdt::epoll__masked!(|| ptr);
+        });
     }
 
     pub fn epoll_wait_fd(epfd: i32, fd: i32, host_fd: i32, poll_events: i32, timeout_ms: i32) {
@@ -1055,6 +1097,7 @@ mod stub {
     stub!(host_pipe_io(host_fd: i32, dir: i32, n: i64));
     stub!(epoll_ctl(epfd: i32, op: u64, fd: i32, events: u32, data: u64, errno: i32));
     stub!(epoll_interest(epfd: i32, fd: i32, requested: u32, raw_ready: u32, last_ready: u32, ready: u32));
+    stub!(epoll_masked(origin: i32, fd: i32, requested: u32, raw_ready: u32, last_ready: u32));
     stub!(epoll_wait_fd(epfd: i32, fd: i32, host_fd: i32, poll_events: i32, timeout_ms: i32));
     stub!(epoll_result(epfd: i32, ready_count: i32, wait_count: i32, timeout_ms: i32, kind: i32));
     stub!(epoll_stale_edge(udata: u64, guest_fd: i32, generation: u32));
