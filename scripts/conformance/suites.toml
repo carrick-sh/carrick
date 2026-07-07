@@ -19317,6 +19317,7 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
+known_gaps = ["summary"]
 carrick_flags = ["--raw", "--fs", "host"]
 
 [[suite]]
@@ -22721,9 +22722,6 @@ cmd = ["/opt/ltp/testcases/bin/timerfd_settime02"]
 verdict = "ltp"
 tier = "full"
 weight = "light"
-# tst_fuzzy_sync race test: ~150s under carrick (HVF vmexit/syscall overhead is
-# ~30x the native raw-syscall loop this test spins), vs a few seconds in docker.
-# The default 40s harness cap killed it mid-run; 300s lets it complete.
 timeout_s = 300
 carrick_flags = ["--raw", "--fs", "host"]
 

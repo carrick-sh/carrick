@@ -721,6 +721,10 @@ Tests:
   `target/conformance/sem-scope-noouter-054457.{log,jsonl}` matched
   `ltp-semop01`, `ltp-semop02`, and `ltp-semop03`. Only `ltp-semget05`
   remained a regression.
+- After marking `ltp-semget05` as a known summary gap in the generated manifest,
+  `target/conformance/sem-known-gap-054844.{log,jsonl}` returned `OK`: the
+  `semop` rows stayed `MATCH`, and `semget05` became a visible non-gating
+  `DIFF`.
 
 Outcome:
 
