@@ -400,14 +400,13 @@ impl SyscallDispatcher {
         // Wire→typed seam: the guest event word is a raw u32; epoll ACCEPTS
         // unknown bits, so retain them rather than reject.
         let mut interest = epoll_interest_for(LinuxEpollEvents::from_bits_retain(events));
-        // On BSD hosts the underlying kqueue registration is level-triggered
-        // and guest EPOLLET is enforced by the software `last_ready` latch. Once
-        // EPOLLOUT has been delivered, keeping EVFILT_WRITE armed makes the
-        // instance kqueue permanently readable for an event the guest is not
-        // allowed to see again. Drop the write filter until either guest I/O
-        // consumes the edge or a write returns EAGAIN and explicitly asks to
-        // watch for writability again. Keep read armed: read-side ET uses
-        // FIONREAD growth to detect a new edge while data remains buffered.
+        // Guest EPOLLET is enforced by the software `last_ready` latch. Once
+        // EPOLLOUT has been delivered, keeping write interest armed can wake an
+        // epoll waiter for an event the guest is not allowed to see again. Drop
+        // the write filter until either guest I/O consumes the edge or a write
+        // returns EAGAIN and explicitly asks to watch for writability again.
+        // Keep read armed: read-side ET uses FIONREAD growth to detect a new
+        // edge while data remains buffered.
         if events & LINUX_EPOLLET != 0
             && interest.write
             && last_ready & LINUX_EPOLLOUT != 0
@@ -2734,38 +2733,7 @@ impl SyscallDispatcher {
                                 }
                                 if ready_events != 0 {
                                     acc.entry(gfd).or_insert((0, data)).0 |= ready_events;
-                                } else if requested & LINUX_EPOLLET != 0
-                                    && raw != 0
-                                    && raw & last_ready != 0
-                                {
-                                    #[cfg(any(
-                                        feature = "platform-macos",
-                                        feature = "platform-freebsd",
-                                        feature = "platform-netbsd"
-                                    ))]
-                                    {
-                                        // BSD host-fd registrations are kept
-                                        // level-triggered and the guest ET
-                                        // contract is enforced by last_ready.
-                                        // A level event that is fully masked by
-                                        // the software latch would make the
-                                        // instance kqueue fd immediately
-                                        // readable again, so park on the
-                                        // signal/backstop path instead.
-                                        filtered_ready_events += 1;
-                                    }
-                                    #[cfg(not(any(
-                                        feature = "platform-macos",
-                                        feature = "platform-freebsd",
-                                        feature = "platform-netbsd"
-                                    )))]
-                                    {
-                                        // Native epoll ET on Linux has no
-                                        // persistent level event to spin on
-                                        // here; a later edge will re-wake the
-                                        // instance.
-                                    }
-                                } else if raw != 0 {
+                                } else if raw != 0 && requested & LINUX_EPOLLET == 0 {
                                     filtered_ready_events += 1;
                                 }
                             }
@@ -3015,11 +2983,11 @@ impl SyscallDispatcher {
                 };
                 if kq_drained_all_filtered {
                     // The instance kqueue is readable, but every drained event
-                    // was masked by the guest interest or by the software ET
-                    // latch. Polling kq_fd for POLLIN would wake immediately
-                    // and spin; polling the same valid fd with an empty event
-                    // mask uses the WaitOnPollFds backstop as an interruptible
-                    // retry sleep while preserving the guest deadline.
+                    // was masked by the guest interest. Polling kq_fd for
+                    // POLLIN would wake immediately and spin; polling the same
+                    // valid fd with an empty event mask uses the WaitOnPollFds
+                    // backstop as an interruptible retry sleep while preserving
+                    // the guest deadline.
                     crate::probes::epoll_result(epfd, 0, 1, timeout_ms, 2);
                     return Ok(DispatchOutcome::WaitOnPollFds {
                         fds: WaitFds::raw_one(kq_fd, 0),
