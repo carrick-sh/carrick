@@ -13,7 +13,8 @@
 
 pub use carrick_runtime::compat::{CompatReporter, SyscallArgs};
 pub use carrick_runtime::dispatch::{
-    DispatchOutcome, GuestMemory, LinearMemory, SyscallDispatcher, SyscallRequest,
+    DispatchOutcome, GuestMemory, LinearMemory, ProcMapSharing, ProcMapsEntry, SyscallDispatcher,
+    SyscallRequest,
 };
 pub use carrick_runtime::elf::SegmentPerms;
 pub use carrick_runtime::linux_abi::{
@@ -427,4 +428,22 @@ pub fn rwx_perms() -> SegmentPerms {
         write: true,
         execute: true,
     }
+}
+
+pub fn publish_address_space_regions(dispatcher: &SyscallDispatcher, memory: &AddressSpace) {
+    dispatcher.set_address_space_regions(
+        memory
+            .regions()
+            .iter()
+            .map(|region| ProcMapsEntry {
+                start: region.start,
+                end: region.end,
+                read: region.perms.read,
+                write: region.perms.write,
+                execute: region.perms.execute,
+                sharing: ProcMapSharing::Private,
+                path: String::new(),
+            })
+            .collect(),
+    );
 }

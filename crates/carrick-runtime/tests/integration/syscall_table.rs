@@ -204,6 +204,7 @@ fn names_linux_aarch64_bringup_syscalls() {
         (260, "wait4"),
         (261, "prlimit64"),
         (266, "clock_adjtime"),
+        (270, "process_vm_readv"),
         (278, "getrandom"),
         (283, "membarrier"),
         (291, "statx"),

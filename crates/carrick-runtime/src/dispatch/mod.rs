@@ -5646,6 +5646,8 @@ fn write_host_pipe_payload(
                 }
                 len = len.min(room);
             }
+            // BLOCKING-IO-OK: host_fd was adopted O_NONBLOCK; EAGAIN routes to
+            // the lockless wait path below.
             unsafe { libc::write(host_fd, bytes[offset..].as_ptr() as *const _, len) }
         };
         #[cfg(feature = "trace-tty")]
