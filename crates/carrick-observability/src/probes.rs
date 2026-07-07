@@ -50,6 +50,18 @@ pub use real::*;
 )))]
 pub use stub::*;
 
+#[derive(Clone, Copy, Debug)]
+pub struct EpollMaskedProbe {
+    pub origin: i32,
+    pub fd: i32,
+    pub host_fd: i32,
+    pub requested: u32,
+    pub raw_ready: u32,
+    pub last_ready: u32,
+    pub read_avail: u64,
+    pub last_read_avail: u64,
+}
+
 #[cfg(any(
     target_os = "macos",
     all(
@@ -513,7 +525,7 @@ mod real {
     /// `scripts/dtrace/epoll-wait-debug.d`.
     #[derive(Clone, Copy)]
     #[repr(C)]
-    struct EpollMaskedProbe {
+    struct EpollMaskedWireProbe {
         origin: u64,
         fd: u64,
         host_fd: u64,
@@ -525,8 +537,8 @@ mod real {
     }
 
     thread_local! {
-        static EPOLL_MASKED_PROBE: std::cell::Cell<EpollMaskedProbe> =
-            const { std::cell::Cell::new(EpollMaskedProbe {
+        static EPOLL_MASKED_PROBE: std::cell::Cell<EpollMaskedWireProbe> =
+            const { std::cell::Cell::new(EpollMaskedWireProbe {
                 origin: 0,
                 fd: 0,
                 host_fd: 0,
@@ -539,25 +551,16 @@ mod real {
     }
 
     #[inline(never)]
-    pub fn epoll_masked(
-        origin: i32,
-        fd: i32,
-        host_fd: i32,
-        requested: u32,
-        raw_ready: u32,
-        last_ready: u32,
-        read_avail: u64,
-        last_read_avail: u64,
-    ) {
-        let payload = EpollMaskedProbe {
-            origin: origin as u64,
-            fd: fd as i64 as u64,
-            host_fd: host_fd as i64 as u64,
-            requested: requested as u64,
-            raw_ready: raw_ready as u64,
-            last_ready: last_ready as u64,
-            read_avail,
-            last_read_avail,
+    pub fn epoll_masked(sample: super::EpollMaskedProbe) {
+        let payload = EpollMaskedWireProbe {
+            origin: sample.origin as u64,
+            fd: sample.fd as i64 as u64,
+            host_fd: sample.host_fd as i64 as u64,
+            requested: sample.requested as u64,
+            raw_ready: sample.raw_ready as u64,
+            last_ready: sample.last_ready as u64,
+            read_avail: sample.read_avail,
+            last_read_avail: sample.last_read_avail,
         };
         EPOLL_MASKED_PROBE.with(|slot| {
             slot.set(payload);
@@ -1167,7 +1170,7 @@ mod stub {
     stub!(host_pipe_io(host_fd: i32, dir: i32, n: i64));
     stub!(epoll_ctl(epfd: i32, op: u64, fd: i32, events: u32, data: u64, errno: i32));
     stub!(epoll_interest(epfd: i32, fd: i32, requested: u32, raw_ready: u32, last_ready: u32, ready: u32));
-    stub!(epoll_masked(origin: i32, fd: i32, host_fd: i32, requested: u32, raw_ready: u32, last_ready: u32, read_avail: u64, last_read_avail: u64));
+    stub!(epoll_masked(sample: super::EpollMaskedProbe));
     stub!(epoll_rebind(reason: u32, host_fd: i32, survivor_fd: i32, survivor_gen: u32, union_events: u32, effective: u32));
     stub!(epoll_wait_fd(epfd: i32, fd: i32, host_fd: i32, poll_events: i32, timeout_ms: i32));
     stub!(epoll_result(epfd: i32, ready_count: i32, wait_count: i32, timeout_ms: i32, kind: i32));

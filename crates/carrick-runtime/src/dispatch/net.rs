@@ -2752,16 +2752,16 @@ impl SyscallDispatcher {
                                     ready_events,
                                 );
                                 if ready_events == 0 && raw != 0 {
-                                    crate::probes::epoll_masked(
-                                        1,
-                                        gfd,
-                                        hfd,
+                                    crate::probes::epoll_masked(crate::probes::EpollMaskedProbe {
+                                        origin: 1,
+                                        fd: gfd,
+                                        host_fd: hfd,
                                         requested,
-                                        raw,
+                                        raw_ready: raw,
                                         last_ready,
-                                        observed_read_avail,
+                                        read_avail: observed_read_avail,
                                         last_read_avail,
-                                    );
+                                    });
                                 }
                                 if ready_events != 0 {
                                     acc.entry(gfd).or_insert((0, data)).0 |= ready_events;
@@ -2842,16 +2842,16 @@ impl SyscallDispatcher {
                     let host_fd = this
                         .host_fd_for_poll(*fd)
                         .map_or(-1, |host_fd| host_fd.get());
-                    crate::probes::epoll_masked(
-                        2,
-                        *fd,
+                    crate::probes::epoll_masked(crate::probes::EpollMaskedProbe {
+                        origin: 2,
+                        fd: *fd,
                         host_fd,
                         requested,
                         raw_ready,
-                        interest.last_ready,
+                        last_ready: interest.last_ready,
                         read_avail,
-                        interest.last_read_avail,
-                    );
+                        last_read_avail: interest.last_read_avail,
+                    });
                 }
                 if ready_events != 0 {
                     let entry = acc.entry(*fd).or_insert((0, interest.event.data));
@@ -2891,16 +2891,16 @@ impl SyscallDispatcher {
                     ready_events,
                 );
                 if ready_events == 0 && raw_ready != 0 {
-                    crate::probes::epoll_masked(
-                        3,
-                        *fd,
-                        -1,
+                    crate::probes::epoll_masked(crate::probes::EpollMaskedProbe {
+                        origin: 3,
+                        fd: *fd,
+                        host_fd: -1,
                         requested,
                         raw_ready,
-                        interest.last_ready,
-                        0,
-                        interest.last_read_avail,
-                    );
+                        last_ready: interest.last_ready,
+                        read_avail: 0,
+                        last_read_avail: interest.last_read_avail,
+                    });
                 }
                 if ready_events != 0 {
                     let entry = acc.entry(*fd).or_insert((0, interest.event.data));
