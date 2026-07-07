@@ -2883,7 +2883,8 @@ impl SyscallDispatcher {
             // guest_fd -> (accumulated epoll events, epoll_data); read+write filters
             // for the same fd merge into one returned event.
             let mut acc: HashMap<i32, (u32, u64)> = HashMap::new();
-            let mut ready_updates: Vec<(i32, u32, u32, Option<u64>, bool, bool, bool)> = Vec::new();
+            type ReadyUpdate = (i32, u32, u32, Option<u64>, bool, bool, bool);
+            let mut ready_updates: Vec<ReadyUpdate> = Vec::new();
             let mut host_ready_sampled = std::collections::HashSet::<i32>::new();
             const READ_READY_BITS: u32 =
                 LINUX_EPOLLIN | LINUX_EPOLLRDHUP | LINUX_EPOLLHUP | LINUX_EPOLLERR;
