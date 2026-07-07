@@ -803,3 +803,90 @@ Outcome:
   next diagnostic should dump from the runtime's guest-fault/termination handler
   or teach the debug runner to trigger lldb on the observed failing exit path,
   not only on a wall-clock deadline.
+
+### Diagnostics: stop-on-signal lldb runner for vet
+
+Hypothesis:
+
+- The vet `SIGTRAP` failure needed to be caught before the failing compiler
+  process exited. A wall-clock deadline runner was too late because the failing
+  process had already died.
+
+Experiment:
+
+- Extended `carrick debug lldb-run` with `--stop-on-signal 5`. The runner sets a
+  diagnostic env var for the scoped child. Runtime signal-delivery paths raise
+  `SIGSTOP` just before delivering the selected Linux signal, and the runner
+  detects stopped scoped processes, dumps lldb/event-ring/cores, resumes them,
+  and then performs scoped cleanup.
+- Ran focused vet with run id
+  `go-net-http-vet-stoptrap2-002455`.
+
+Outcome:
+
+- The runner stopped and dumped the failing compiler child before Go printed its
+  crash. The stopped child was
+  `/usr/local/go/pkg/tool/linux_arm64/compile ... -p sort ...`.
+- lldb showed thread #1 stopped at host
+  `libdispatch.dylib::_dispatch_sema4_create_slow.cold.5` on `brk #0x1`,
+  reached from Rust's Darwin thread parker while waiting in
+  `std::sync::RwLock` during
+  `carrick_runtime::fs_resolve_cache::ResolveCache::put`.
+- The event ring for the compiler child had only startup/open activity and no
+  epoll loop, so this was not the previous h1 epoll terminal-edge loop.
+- Interpretation: the apparent guest `SIGTRAP` was masking a host-side Darwin
+  trap in Carrick's runtime, hit under concurrent Go compiler `openat` path
+  resolution.
+
+### Fix: classify Darwin BRK as host fault and remove std RwLock from resolve cache
+
+Hypotheses:
+
+- H1: Carrick's HVF host routed handler was converting Darwin host `SIGTRAP`
+  into a guest signal because the classifier only treated `si_code > 0` as a
+  synchronous host fault.
+- H2: The underlying host trap came from the resolve cache's use of
+  `std::sync::RwLock`, whose Darwin wait path uses libdispatch semaphores. The
+  rest of the runtime filesystem hot path already uses `parking_lot::RwLock`.
+
+Tests:
+
+- A throwaway host probe installed `SA_SIGINFO` for `SIGTRAP` and executed
+  `brk #1`; macOS reported `sig=5 si_code=0 si_pid=0`.
+- After teaching the HVF classifier about that no-sender Darwin `brk` shape,
+  focused vet no longer produced a guest Go crash dump, but still failed with
+  host `signal: trace/breakpoint trap`, confirming the host trap was real.
+- Swapped `fs_resolve_cache::ResolveCache` from `std::sync::RwLock` to
+  `parking_lot::RwLock`.
+
+Outcome:
+
+- Focused checks passed:
+  `cargo fmt --check`;
+  `cargo test -p carrick-runtime fs_resolve_cache`;
+  `cargo test -p carrick-vmm-hvf darwin_brk_trap_is_classified_as_host_fault`;
+  `cargo test -p carrick-runtime exec_helpers::tests::debug_stop_signal_selector_accepts_comma_list`;
+  `cargo check -p carrick-cli`;
+  `just build -p carrick-cli`.
+- Focused Carrick vet now passes twice:
+  `target/conformance/logs/go-net-http-vet-lockfix1-003616.guest.log`
+  (`real 32.79`) and
+  `target/conformance/logs/go-net-http-vet-lockfix2-003720.guest.log`
+  (`real 32.23`).
+- Focused Carrick h1 still passes:
+  `target/conformance/logs/go-net-http-h1-lockfix1-003713.guest.log`
+  (`real 1.77`).
+- Fresh Docker oracle timings, run after Carrick runs completed:
+  `target/conformance/logs/docker-go-net-http-vet-lockfix-003803.log`
+  passed vet in `real 4.11`;
+  `target/conformance/logs/docker-go-net-http-h1-lockfix-003807.log`
+  passed h1 in `real 0.19`.
+
+Interpretation:
+
+- Correctness blocker: fixed. The vet crash was a real Carrick host-runtime
+  trap exposed through guest signal delivery.
+- Performance is still not clean: vet is roughly 8x Docker wall-clock and h1 is
+  roughly 9x Docker wall-clock. That is close enough to the "order of magnitude"
+  threshold to keep treating this as performance debt during the bless campaign,
+  not as a completed performance story.

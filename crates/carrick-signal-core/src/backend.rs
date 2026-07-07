@@ -97,13 +97,13 @@ pub trait HostSignalGlue: 'static {
         Self::is_claimed(linux_signum)
     }
 
-    /// Whether a host signal carrying `si_code` for guest `linux_signum` is a
-    /// SYNCHRONOUS self-fault — a real CPU fault at the faulting PC, i.e. carrick's
-    /// OWN bug, which must crash visibly — rather than an async cross-process
-    /// `kill` (route to the guest). Default `false`: KVM/bhyve/NVMM guest faults
-    /// are vmexits, never host signals. HVF overrides: a fault signum with
-    /// `si_code > 0`. Consulted by `shared_routed_handler`. Pure (signal-safe).
-    fn is_synchronous_self_fault(_linux_signum: i32, _si_code: i32) -> bool {
+    /// Whether a host signal carrying `si_code`/`si_pid` for guest `linux_signum`
+    /// is a SYNCHRONOUS self-fault — a real CPU fault at the faulting PC, i.e.
+    /// carrick's OWN bug, which must crash visibly — rather than an async
+    /// cross-process `kill` (route to the guest). Default `false`: KVM/bhyve/NVMM
+    /// guest faults are vmexits, never host signals. HVF overrides for its host
+    /// fault carriers. Consulted by `shared_routed_handler`. Pure (signal-safe).
+    fn is_synchronous_self_fault(_linux_signum: i32, _si_code: i32, _si_pid: i32) -> bool {
         false
     }
 }
