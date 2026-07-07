@@ -335,10 +335,11 @@ fn shared_dispatcher_services_thread_lifecycle_syscalls() {
         cloned,
         DispatchOutcome::CloneThread {
             stack: 0x20000,
-            tls: 0x30000,
+            tls: Some(0x30000),
             flags,
             parent_tid_addr: 0x10800,
-            child_tid_addr: 0x10808
+            child_tid_addr: 0x10808,
+            clear_child_tid_addr: 0x10808
         }
     );
 
