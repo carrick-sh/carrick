@@ -267,6 +267,9 @@ mod real {
         /// Masked epoll readiness sample. Arg0 is the ADDRESS of an
         /// `EpollMaskedProbe` payload.
         fn epoll__masked(_: u64) {}
+        /// Epoll host-registration rebind decision. Arg0 is the ADDRESS of an
+        /// `EpollRebindProbe` payload.
+        fn epoll__rebind(_: u64) {}
         /// Host-backed fd that epoll_pwait hands to the runtime's kqueue waiter.
         /// `poll_events` is the libc POLL* mask used to build EVFILT registrations.
         fn epoll__wait__fd(_: i32, _: i32, _: i32, _: i32, _: i32) {}
@@ -542,6 +545,55 @@ mod real {
             slot.set(payload);
             let ptr = slot.as_ptr() as u64;
             carrick_usdt::epoll__masked!(|| ptr);
+        });
+    }
+
+    /// Raw-pointer payload for `epoll-rebind`. Keep field order in sync with
+    /// `scripts/dtrace/epoll-wait-debug.d`.
+    #[derive(Clone, Copy)]
+    #[repr(C)]
+    struct EpollRebindProbe {
+        reason: u64,
+        host_fd: u64,
+        survivor_fd: u64,
+        survivor_gen: u64,
+        union_events: u64,
+        effective: u64,
+    }
+
+    thread_local! {
+        static EPOLL_REBIND_PROBE: std::cell::Cell<EpollRebindProbe> =
+            const { std::cell::Cell::new(EpollRebindProbe {
+                reason: 0,
+                host_fd: 0,
+                survivor_fd: 0,
+                survivor_gen: 0,
+                union_events: 0,
+                effective: 0,
+            }) };
+    }
+
+    #[inline(never)]
+    pub fn epoll_rebind(
+        reason: u32,
+        host_fd: i32,
+        survivor_fd: i32,
+        survivor_gen: u32,
+        union_events: u32,
+        effective: u32,
+    ) {
+        let payload = EpollRebindProbe {
+            reason: reason as u64,
+            host_fd: host_fd as i64 as u64,
+            survivor_fd: survivor_fd as i64 as u64,
+            survivor_gen: survivor_gen as u64,
+            union_events: union_events as u64,
+            effective: effective as u64,
+        };
+        EPOLL_REBIND_PROBE.with(|slot| {
+            slot.set(payload);
+            let ptr = slot.as_ptr() as u64;
+            carrick_usdt::epoll__rebind!(|| ptr);
         });
     }
 
@@ -1098,6 +1150,7 @@ mod stub {
     stub!(epoll_ctl(epfd: i32, op: u64, fd: i32, events: u32, data: u64, errno: i32));
     stub!(epoll_interest(epfd: i32, fd: i32, requested: u32, raw_ready: u32, last_ready: u32, ready: u32));
     stub!(epoll_masked(origin: i32, fd: i32, requested: u32, raw_ready: u32, last_ready: u32));
+    stub!(epoll_rebind(reason: u32, host_fd: i32, survivor_fd: i32, survivor_gen: u32, union_events: u32, effective: u32));
     stub!(epoll_wait_fd(epfd: i32, fd: i32, host_fd: i32, poll_events: i32, timeout_ms: i32));
     stub!(epoll_result(epfd: i32, ready_count: i32, wait_count: i32, timeout_ms: i32, kind: i32));
     stub!(epoll_stale_edge(udata: u64, guest_fd: i32, generation: u32));
