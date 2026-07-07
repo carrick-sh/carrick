@@ -112,7 +112,7 @@
 //! [`AddressSpace`]: crate::memory::AddressSpace
 
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use carrick_guest_mem::{Gpa, GuestVa, HostVa};
 
@@ -1543,8 +1543,32 @@ fn dispatch_single_threaded_syscall<M: GuestMemory>(
                 if now >= deadline {
                     return Ok(DispatchOutcome::Returned { value: 0 });
                 }
+                let waiter_tid = waiter.tid();
+                let sleep_interrupt_pending = || {
+                    dispatcher.drain_xsignals_for_tid(waiter_tid);
+                    dispatcher.has_deliverable_dispatch_pending_for_wait(
+                        waiter_tid,
+                        carrick_abi::WaitSigMask::Additive(carrick_abi::SigSet::EMPTY),
+                    )
+                };
+                if sleep_interrupt_pending() {
+                    return Ok(crate::dispatch::complete_interrupted_sleep(
+                        memory,
+                        remaining,
+                        deadline.saturating_duration_since(Instant::now()),
+                    ));
+                }
                 waiter.ensure_full();
-                match waiter.wait(&[], Some(deadline - now), carrick_abi::SigBlockMask::NONE) {
+                // Xsignals live in a fork-shared ring, not an fd. Bound the
+                // sleep wait at the same internal slice as `io_wait` so each
+                // slice services dispatcher-owned pending state.
+                let wait_for = (deadline - now).min(Duration::from_millis(50));
+                match waiter.wait_with_dispatch_pending(
+                    &[],
+                    Some(wait_for),
+                    carrick_abi::SigBlockMask::NONE,
+                    sleep_interrupt_pending,
+                ) {
                     WaitResult::Ready => continue,
                     WaitResult::TimedOut => {
                         if Instant::now() >= deadline {

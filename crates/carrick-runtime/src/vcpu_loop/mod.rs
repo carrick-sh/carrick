@@ -1072,13 +1072,32 @@ where
                     if now >= deadline {
                         break Ok(DispatchOutcome::Returned { value: 0 });
                     }
+                    let sleep_interrupt_pending = || {
+                        kernel.dispatcher.drain_xsignals_for_tid(self.this_tid);
+                        kernel.dispatcher.has_deliverable_dispatch_pending_for_wait(
+                            self.this_tid,
+                            carrick_abi::WaitSigMask::Additive(carrick_abi::SigSet::EMPTY),
+                        )
+                    };
+                    if sleep_interrupt_pending() {
+                        break Ok(crate::dispatch::complete_interrupted_sleep(
+                            engine,
+                            remaining,
+                            deadline.saturating_duration_since(Instant::now()),
+                        ));
+                    }
                     self.waiter.ensure_full();
                     crate::run_state::publish(crate::run_state::RunState::Blocked);
                     let reclaim = self.park_vcpu_for_blocking_wait(engine);
-                    let wait_result = self.waiter.wait(
+                    // Xsignals live in a fork-shared ring, not an fd. Bound the
+                    // sleep wait at the same internal slice as `io_wait` so each
+                    // slice services dispatcher-owned pending state.
+                    let wait_for = (deadline - now).min(Duration::from_millis(50));
+                    let wait_result = self.waiter.wait_with_dispatch_pending(
                         &[],
-                        Some(deadline - now),
+                        Some(wait_for),
                         carrick_abi::SigBlockMask::NONE,
+                        sleep_interrupt_pending,
                     );
                     if let Some(outcome) = self.exec_replaced_thread_exit() {
                         return Ok(outcome);
