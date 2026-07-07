@@ -1117,11 +1117,16 @@ git commit -m "feat(kernel): loud-exhaustion claim API on the permit section"
 - [ ] **Step 1: Full local gate for touched crates**
 
 Run: `just ci` (memory: CI runs fmt→clippy→build→test sequentially and a red clippy masks later stages — `just ci` locally is the honest equivalent), then `just conformance smoke`.
-Expected: green, exit 0.
+Expected: `just ci` green. The smoke tier should have no new arena-related
+regressions; if the current baseline still has a pre-existing smoke-row drift,
+record the exact row, counts, and prior evidence instead of treating it as an
+arena failure.
 
 - [ ] **Step 2: Record in the spec's migration checklist**
 
 Append to `docs/2026-07-07-conformance-bless-diary.md` (or the current diary) a short dated entry: arena foundation landed (steps 1–2 of the kernel-authority migration), permit table relocated, no admission behavior change, gates run and green. Reference commits.
+If the smoke tier remains red only because of an unrelated pre-existing row,
+record that deviation and the evidence path.
 
 - [ ] **Step 3: Commit**
 

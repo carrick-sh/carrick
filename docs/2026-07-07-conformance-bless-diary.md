@@ -1501,3 +1501,66 @@ targets are:
 - fork-storm cost: continue treating `ltp-epoll-ltp`, waitid, splice/vmsplice,
   and process-heavy timing outliers as architecture debt rather than acceptable
   baseline noise.
+
+## 2026-07-07 11:20 - kernel arena foundation landing
+
+Foundation scope:
+
+- `carrick-kernel` now owns the initial typed domains, spin/yield wait backend,
+  robust bucket lock, kill-9 lock recovery test, versioned file-backed arena,
+  permit section, and loud permit-exhaustion claim API.
+- The HVF vCPU admission table is relocated into the arena permit section.
+  Admission semantics are intentionally unchanged in this phase; the existing
+  reaper remains responsible for clearing stale owner entries.
+- This lands steps 1-2 of the kernel-authority migration. Process ownership and
+  fork-time process records are deliberately left for the arena process-section
+  plan.
+
+Commits:
+
+- `620d253b` `feat(kernel): carrick-kernel crate scaffold + typed domains`
+- `93a64240` `feat(kernel): WaitWake trait + SpinYield test backend`
+- `b844e5ec` `feat(kernel): robust bucket lock with owner generations and force_break`
+- `47c2b987` `test(kernel): kill-9 holder recoverable via force_break`
+- `55f32805` `feat(kernel): file-backed kernel arena with versioned header and permit section`
+- `e4ec62ca` `test(runtime): expect shared futex waiter key from location`
+- `ccc84c00` `refactor(hvf): relocate vcpu permit table into kernel arena`
+- `1effe17b` `feat(kernel): loud-exhaustion claim API on permit section`
+- `c15d8a87` `fix(ci): satisfy current clippy gate`
+- `d19f4e30` `fix(abi): define linux SOCK_RDM in abi table`
+- `20e58088` `docs(hvf): avoid private rustdoc link in permit reaper`
+- `29a3018b` `test(thread): serialize current futex table users`
+- `f01d2700` `fix(runtime): align integration gate with current syscall semantics`
+
+Gate evidence:
+
+- Final logged `just ci` pass:
+  `target/goal-logs/just-ci-a8-final.log`.
+- Signed `just conformance smoke` was run after the foundation work and saved
+  as `target/conformance/a8-smoke-20260707.jsonl`.
+
+Smoke outcome:
+
+- 23 smoke rows ran.
+- 22 rows matched the cached Docker oracle.
+- 1 row remains gating red: `cpython-subprocess`, Carrick `278/278` vs Docker
+  `280/280`, with missing `test_no_leaking` cases.
+
+Classification:
+
+This smoke red is not attributed to the arena foundation. The same
+`cpython-subprocess` `278/280` drift was reproduced immediately after A6 in
+`target/conformance/cpython-subprocess-a6-rerun.jsonl`, and older artifacts
+(`target/conformance/bless-2026-07-06.jsonl` and
+`target/conformance/full-after-xattr-084615.jsonl`) already show the same
+skipped-case shape. A8's durable gate is therefore: `just ci` green, signed
+smoke rerun completed, and no new smoke regression beyond that pre-existing
+row.
+
+Transient note:
+
+An earlier `just ci` attempt saw
+`vfs::rootfs::tests::open_for_dispatch_host_file_uses_raw_fd_without_loading_contents`
+fail once under the full workspace run. The focused rerun and full
+`cargo test -p carrick-runtime --lib -- --nocapture` both passed, and the final
+logged `just ci` passed.
