@@ -748,6 +748,82 @@ pub unsafe fn flistxattr(fd: i32, list: *mut libc::c_char, size: usize) -> isize
     }
 }
 
+/// Path-based `llistxattr` (no-follow), portable `(path, list, size)`.
+///
+/// # Safety
+/// `path` is a valid C string; `list` is writable for `size` bytes (or null
+/// with size 0).
+#[inline]
+pub unsafe fn llistxattr(path: *const libc::c_char, list: *mut libc::c_char, size: usize) -> isize {
+    #[cfg(target_os = "macos")]
+    {
+        unsafe { libc::listxattr(path, list, size, libc::XATTR_NOFOLLOW) }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        unsafe { libc::llistxattr(path, list, size) }
+    }
+    #[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
+    {
+        let mut out: Vec<u8> = Vec::new();
+        for (ns, ns_enum) in [
+            (
+                libc::EXTATTR_NAMESPACE_USER as libc::c_int,
+                BsdExtattrNamespace::User,
+            ),
+            (
+                libc::EXTATTR_NAMESPACE_SYSTEM as libc::c_int,
+                BsdExtattrNamespace::System,
+            ),
+        ] {
+            let need = unsafe { libc::extattr_list_link(path, ns, std::ptr::null_mut(), 0) };
+            if need <= 0 {
+                continue;
+            }
+            let mut raw = vec![0u8; need as usize];
+            let got =
+                unsafe { libc::extattr_list_link(path, ns, raw.as_mut_ptr().cast(), raw.len()) };
+            if got <= 0 {
+                continue;
+            }
+            let raw = &raw[..got as usize];
+            let mut i = 0usize;
+            while i < raw.len() {
+                let nlen = raw[i] as usize;
+                i += 1;
+                if i + nlen > raw.len() {
+                    break;
+                }
+                let stored = &raw[i..i + nlen];
+                i += nlen;
+                if let Some(name) = bsd_xattr_to_linux(ns_enum, stored) {
+                    out.extend_from_slice(&name);
+                    out.push(0);
+                }
+            }
+        }
+        if size == 0 {
+            return out.len() as isize;
+        }
+        if out.len() > size {
+            set_errno(libc::ERANGE);
+            return -1;
+        }
+        unsafe { std::ptr::copy_nonoverlapping(out.as_ptr(), list.cast::<u8>(), out.len()) };
+        out.len() as isize
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "netbsd"
+    )))]
+    {
+        let _ = (path, list, size);
+        -libc::ENOSYS as isize
+    }
+}
+
 /// `fremovexattr` with the portable `(fd, name)` shape.
 ///
 /// # Safety
@@ -776,6 +852,38 @@ pub unsafe fn fremovexattr(fd: i32, name: *const libc::c_char) -> libc::c_int {
     )))]
     {
         let _ = (fd, name);
+        -libc::ENOSYS
+    }
+}
+
+/// Path-based `lremovexattr` (no-follow), portable `(path, name)`.
+///
+/// # Safety
+/// `path` and `name` are valid C strings.
+#[inline]
+pub unsafe fn lremovexattr(path: *const libc::c_char, name: *const libc::c_char) -> libc::c_int {
+    #[cfg(target_os = "macos")]
+    {
+        unsafe { libc::removexattr(path, name, libc::XATTR_NOFOLLOW) }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        unsafe { libc::lremovexattr(path, name) }
+    }
+    #[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
+    {
+        let (ns, attr) = bsd_extattr_ns(unsafe { std::ffi::CStr::from_ptr(name) });
+        let rc = unsafe { libc::extattr_delete_link(path, ns, attr.as_ptr()) };
+        if rc >= 0 { 0 } else { -1 }
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "netbsd"
+    )))]
+    {
+        let _ = (path, name);
         -libc::ENOSYS
     }
 }

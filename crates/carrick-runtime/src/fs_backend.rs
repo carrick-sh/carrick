@@ -437,26 +437,27 @@ pub trait FsBackend: Send + Sync {
         _name: &str,
         _value: &[u8],
         _flags: i32,
+        _follow: bool,
     ) -> Result<(), LinuxErrno> {
         Err(crate::linux_abi::LINUX_ENOTSUP)
     }
 
     /// Read the extended attribute `name` on `path`. Returns the raw value
     /// bytes. `Err(LINUX_ENODATA)` if absent. Default: unsupported.
-    fn get_xattr(&self, _path: &str, _name: &str) -> Result<Vec<u8>, LinuxErrno> {
+    fn get_xattr(&self, _path: &str, _name: &str, _follow: bool) -> Result<Vec<u8>, LinuxErrno> {
         Err(crate::linux_abi::LINUX_ENOTSUP)
     }
 
     /// List the `user.*` extended attribute names on `path` (names only, no
     /// trailing NUL — the caller assembles the NUL-separated list). Default:
     /// unsupported.
-    fn list_xattr(&self, _path: &str) -> Result<Vec<String>, LinuxErrno> {
+    fn list_xattr(&self, _path: &str, _follow: bool) -> Result<Vec<String>, LinuxErrno> {
         Err(crate::linux_abi::LINUX_ENOTSUP)
     }
 
     /// Remove the `user.*` extended attribute `name` from `path`.
     /// `Err(LINUX_ENODATA)` if the attribute is absent. Default: unsupported.
-    fn remove_xattr(&self, _path: &str, _name: &str) -> Result<(), LinuxErrno> {
+    fn remove_xattr(&self, _path: &str, _name: &str, _follow: bool) -> Result<(), LinuxErrno> {
         Err(crate::linux_abi::LINUX_ENOTSUP)
     }
 
@@ -4089,6 +4090,7 @@ impl FsBackend for HostFsBackend {
         name: &str,
         value: &[u8],
         flags: i32,
+        follow: bool,
     ) -> Result<(), LinuxErrno> {
         // Accept the Linux VFS xattr namespaces (user./trusted./security./
         // system.); the guest is root so trusted.* is allowed, matching the
@@ -4108,16 +4110,9 @@ impl FsBackend for HostFsBackend {
         // opened O_RDWR (EISDIR), so fall back to a read-only handle — xattr is
         // metadata and macOS `fsetxattr` accepts an O_RDONLY dir fd (setxattr02
         // case 01: `user.*` on a directory must succeed, not fail ENODATA).
-        let host_fd = self
-            .open_raw_fd(path, true, false, false)
-            .or_else(|| self.open_raw_fd(path, false, false, false))
-            .ok_or(crate::linux_abi::LINUX_ENODATA)?;
         let cname = match std::ffi::CString::new(name) {
             Ok(c) => c,
-            Err(_) => {
-                unsafe { libc::close(host_fd) };
-                return Err(crate::linux_abi::LINUX_EINVAL);
-            }
+            Err(_) => return Err(crate::linux_abi::LINUX_EINVAL),
         };
         // Translate Linux XATTR_CREATE/XATTR_REPLACE to the macOS options
         // (same semantics, different numeric values).
@@ -4128,6 +4123,28 @@ impl FsBackend for HostFsBackend {
         if flags & crate::linux_abi::LINUX_XATTR_REPLACE != 0 {
             opts |= carrick_portable::XATTR_REPLACE;
         }
+        if !follow {
+            use std::os::unix::ffi::OsStrExt;
+            let normalized = normalize(path).ok_or(crate::linux_abi::LINUX_EINVAL)?;
+            let rel = Self::rel_path(&normalized).ok_or(crate::linux_abi::LINUX_ENODATA)?;
+            let abs = sandbox_abs_path(&self.dir, rel).ok_or(crate::linux_abi::LINUX_ENODATA)?;
+            let cpath = std::ffi::CString::new(abs.as_os_str().as_bytes())
+                .map_err(|_| crate::linux_abi::LINUX_EINVAL)?;
+            let rc = unsafe {
+                carrick_portable::lsetxattr(
+                    cpath.as_ptr(),
+                    cname.as_ptr(),
+                    value.as_ptr() as *const libc::c_void,
+                    value.len() as libc::size_t,
+                    opts,
+                )
+            };
+            return rc.host_syscall_errno().map(|_| ());
+        }
+        let host_fd = self
+            .open_raw_fd(path, true, false, false)
+            .or_else(|| self.open_raw_fd(path, false, false, false))
+            .ok_or(crate::linux_abi::LINUX_ENODATA)?;
         let rc = unsafe {
             carrick_portable::fsetxattr(
                 host_fd,
@@ -4142,20 +4159,42 @@ impl FsBackend for HostFsBackend {
         err
     }
 
-    fn get_xattr(&self, path: &str, name: &str) -> Result<Vec<u8>, LinuxErrno> {
+    fn get_xattr(&self, path: &str, name: &str, follow: bool) -> Result<Vec<u8>, LinuxErrno> {
         if !is_guest_xattr_namespace(name) || is_internal_carrick_xattr(name) {
             return Err(crate::linux_abi::LINUX_ENODATA);
+        }
+        let cname = match std::ffi::CString::new(name) {
+            Ok(c) => c,
+            Err(_) => return Err(crate::linux_abi::LINUX_EINVAL),
+        };
+        if !follow {
+            use std::os::unix::ffi::OsStrExt;
+            let normalized = normalize(path).ok_or(crate::linux_abi::LINUX_EINVAL)?;
+            let rel = Self::rel_path(&normalized).ok_or(crate::linux_abi::LINUX_ENODATA)?;
+            let abs = sandbox_abs_path(&self.dir, rel).ok_or(crate::linux_abi::LINUX_ENODATA)?;
+            let cpath = std::ffi::CString::new(abs.as_os_str().as_bytes())
+                .map_err(|_| crate::linux_abi::LINUX_EINVAL)?;
+            let needed = unsafe {
+                carrick_portable::lgetxattr(cpath.as_ptr(), cname.as_ptr(), std::ptr::null_mut(), 0)
+            };
+            let needed = needed.host_syscall_errno()?;
+            let mut buf = vec![0u8; needed as usize];
+            let n = unsafe {
+                carrick_portable::lgetxattr(
+                    cpath.as_ptr(),
+                    cname.as_ptr(),
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    buf.len() as libc::size_t,
+                )
+            };
+            return n.host_syscall_errno().map(|n| {
+                buf.truncate(n as usize);
+                buf
+            });
         }
         let host_fd = self
             .open_raw_fd(path, false, false, false)
             .ok_or(crate::linux_abi::LINUX_ENODATA)?;
-        let cname = match std::ffi::CString::new(name) {
-            Ok(c) => c,
-            Err(_) => {
-                unsafe { libc::close(host_fd) };
-                return Err(crate::linux_abi::LINUX_EINVAL);
-            }
-        };
         // First call with size 0 to learn the value length.
         let needed = unsafe {
             carrick_portable::fgetxattr(host_fd, cname.as_ptr(), std::ptr::null_mut(), 0)
@@ -4184,26 +4223,18 @@ impl FsBackend for HostFsBackend {
         result
     }
 
-    fn list_xattr(&self, path: &str) -> Result<Vec<String>, LinuxErrno> {
-        fn list_xattr_fd(host_fd: std::os::fd::RawFd) -> Result<Vec<String>, LinuxErrno> {
-            // macOS may surface its own attribute names (e.g. resource forks);
-            // we read the full NUL-separated list then filter to `user.*` so the
-            // result is exactly the Linux-conformant namespace the guest set.
-            let needed = unsafe { carrick_portable::flistxattr(host_fd, std::ptr::null_mut(), 0) };
+    fn list_xattr(&self, path: &str, follow: bool) -> Result<Vec<String>, LinuxErrno> {
+        fn collect_names(
+            needed: isize,
+            mut read: impl FnMut(&mut [u8]) -> isize,
+        ) -> Result<Vec<String>, LinuxErrno> {
             let needed = match needed.host_syscall_errno() {
                 Ok(needed) => needed,
                 Err(crate::linux_abi::LINUX_ENODATA) => return Ok(Vec::new()),
                 Err(err) => return Err(err),
             };
             let mut buf = vec![0u8; needed as usize];
-            let n = unsafe {
-                carrick_portable::flistxattr(
-                    host_fd,
-                    buf.as_mut_ptr() as *mut libc::c_char,
-                    buf.len() as libc::size_t,
-                )
-            };
-            let n = match n.host_syscall_errno() {
+            let n = match read(&mut buf).host_syscall_errno() {
                 Ok(n) => n,
                 Err(crate::linux_abi::LINUX_ENODATA) => return Ok(Vec::new()),
                 Err(err) => return Err(err),
@@ -4219,6 +4250,37 @@ impl FsBackend for HostFsBackend {
             Ok(names)
         }
 
+        fn list_xattr_fd(host_fd: std::os::fd::RawFd) -> Result<Vec<String>, LinuxErrno> {
+            // macOS may surface its own attribute names (e.g. resource forks);
+            // we read the full NUL-separated list then filter to `user.*` so the
+            // result is exactly the Linux-conformant namespace the guest set.
+            let needed = unsafe { carrick_portable::flistxattr(host_fd, std::ptr::null_mut(), 0) };
+            collect_names(needed, |buf| unsafe {
+                carrick_portable::flistxattr(
+                    host_fd,
+                    buf.as_mut_ptr() as *mut libc::c_char,
+                    buf.len() as libc::size_t,
+                )
+            })
+        }
+
+        if !follow {
+            use std::os::unix::ffi::OsStrExt;
+            let normalized = normalize(path).ok_or(crate::linux_abi::LINUX_EINVAL)?;
+            let rel = Self::rel_path(&normalized).ok_or(crate::linux_abi::LINUX_ENODATA)?;
+            let abs = sandbox_abs_path(&self.dir, rel).ok_or(crate::linux_abi::LINUX_ENODATA)?;
+            let cpath = std::ffi::CString::new(abs.as_os_str().as_bytes())
+                .map_err(|_| crate::linux_abi::LINUX_EINVAL)?;
+            let needed =
+                unsafe { carrick_portable::llistxattr(cpath.as_ptr(), std::ptr::null_mut(), 0) };
+            return collect_names(needed, |buf| unsafe {
+                carrick_portable::llistxattr(
+                    cpath.as_ptr(),
+                    buf.as_mut_ptr() as *mut libc::c_char,
+                    buf.len() as libc::size_t,
+                )
+            });
+        }
         let normalized = self
             .resolve_following(path)
             .ok_or(crate::linux_abi::LINUX_ENODATA)?;
@@ -4238,7 +4300,7 @@ impl FsBackend for HostFsBackend {
             .ok_or(crate::linux_abi::LINUX_ENODATA)?
     }
 
-    fn remove_xattr(&self, path: &str, name: &str) -> Result<(), LinuxErrno> {
+    fn remove_xattr(&self, path: &str, name: &str, follow: bool) -> Result<(), LinuxErrno> {
         // Mirror get_xattr: a non-`user.*` or carrick-internal name has no
         // guest-visible attribute to remove → ENODATA.
         if !is_guest_xattr_namespace(name) || is_internal_carrick_xattr(name) {
@@ -4247,17 +4309,24 @@ impl FsBackend for HostFsBackend {
         // A directory can't be opened O_RDWR; fall back to a read-only handle so
         // its xattrs can be removed too (setxattr02 removes the `user.*` key it
         // set on a directory between iterations).
+        let cname = match std::ffi::CString::new(name) {
+            Ok(c) => c,
+            Err(_) => return Err(crate::linux_abi::LINUX_EINVAL),
+        };
+        if !follow {
+            use std::os::unix::ffi::OsStrExt;
+            let normalized = normalize(path).ok_or(crate::linux_abi::LINUX_EINVAL)?;
+            let rel = Self::rel_path(&normalized).ok_or(crate::linux_abi::LINUX_ENODATA)?;
+            let abs = sandbox_abs_path(&self.dir, rel).ok_or(crate::linux_abi::LINUX_ENODATA)?;
+            let cpath = std::ffi::CString::new(abs.as_os_str().as_bytes())
+                .map_err(|_| crate::linux_abi::LINUX_EINVAL)?;
+            let rc = unsafe { carrick_portable::lremovexattr(cpath.as_ptr(), cname.as_ptr()) };
+            return rc.host_syscall_errno().map(|_| ());
+        }
         let host_fd = self
             .open_raw_fd(path, true, false, false)
             .or_else(|| self.open_raw_fd(path, false, false, false))
             .ok_or(crate::linux_abi::LINUX_ENODATA)?;
-        let cname = match std::ffi::CString::new(name) {
-            Ok(c) => c,
-            Err(_) => {
-                unsafe { libc::close(host_fd) };
-                return Err(crate::linux_abi::LINUX_EINVAL);
-            }
-        };
         // macOS fremovexattr; ENOATTR (absent attribute) maps to Linux ENODATA
         // via host_syscall_errno.
         let rc = unsafe { carrick_portable::fremovexattr(host_fd, cname.as_ptr()) };
@@ -5127,9 +5196,9 @@ mod tests {
     #[test]
     fn host_guest_xattr_api_hides_all_internal_carrick_names() {
         let (b, _scratch) = host_backend();
-        assert_eq!(b.list_xattr("/").unwrap(), Vec::<String>::new());
+        assert_eq!(b.list_xattr("/", true).unwrap(), Vec::<String>::new());
         b.set_file_contents("/plain", b"x".to_vec()).unwrap();
-        assert_eq!(b.list_xattr("/plain").unwrap(), Vec::<String>::new());
+        assert_eq!(b.list_xattr("/plain", true).unwrap(), Vec::<String>::new());
 
         b.set_file_contents("/f", b"x".to_vec()).unwrap();
         b.set_mode("/f", 0o600).unwrap();
@@ -5142,20 +5211,50 @@ mod tests {
             "user.carrick.future",
         ] {
             assert_eq!(
-                b.get_xattr("/f", name),
+                b.get_xattr("/f", name, true),
                 Err(crate::linux_abi::LINUX_ENODATA),
                 "{name} must not be guest-readable",
             );
             assert_eq!(
-                b.set_xattr("/f", name, b"guest", 0),
+                b.set_xattr("/f", name, b"guest", 0, true),
                 Err(crate::linux_abi::LINUX_ENOTSUP),
                 "{name} must not be guest-writable",
             );
         }
 
-        b.set_xattr("/f", "user.visible", b"ok", 0).unwrap();
-        let names = b.list_xattr("/f").unwrap();
+        b.set_xattr("/f", "user.visible", b"ok", 0, true).unwrap();
+        let names = b.list_xattr("/f", true).unwrap();
         assert_eq!(names, vec!["user.visible".to_string()]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn host_lpath_xattrs_do_not_follow_final_symlink() {
+        let (b, _scratch) = host_backend();
+        b.set_file_contents("/target", b"x".to_vec()).unwrap();
+        b.symlink("target", "/link").unwrap();
+
+        b.set_xattr("/target", "security.target", b"target", 0, false)
+            .unwrap();
+        b.set_xattr("/link", "security.link", b"link", 0, false)
+            .unwrap();
+
+        assert_eq!(
+            b.get_xattr("/link", "security.link", false).unwrap(),
+            b"link"
+        );
+        assert_eq!(
+            b.get_xattr("/link", "security.target", false),
+            Err(crate::linux_abi::LINUX_ENODATA)
+        );
+        assert_eq!(
+            b.list_xattr("/link", false).unwrap(),
+            vec!["security.link".to_string()]
+        );
+        assert_eq!(
+            b.list_xattr("/link", true).unwrap(),
+            vec!["security.target".to_string()]
+        );
     }
 
     /// Cap-std enforces sandboxing at the syscall layer: trying to

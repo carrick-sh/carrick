@@ -135,13 +135,17 @@ syscall_table! {
     436 => close_range,
     437 => openat2,
     439 => faccessat2,
-    5 | 6 => sys_setxattr_path,
+    5 => sys_setxattr_path,
+    6 => sys_lsetxattr_path,
     7 => sys_setxattr_fd,
-    8 | 9 => sys_getxattr_path,
+    8 => sys_getxattr_path,
+    9 => sys_lgetxattr_path,
     10 => sys_getxattr_fd,
-    11 | 12 => sys_listxattr_path,
+    11 => sys_listxattr_path,
+    12 => sys_llistxattr_path,
     13 => sys_listxattr_fd,
-    14 | 15 => sys_removexattr_path,
+    14 => sys_removexattr_path,
+    15 => sys_lremovexattr_path,
     16 => sys_removexattr_fd,
     43 => sys_statfs,
     44 => sys_fstatfs,
@@ -9021,9 +9025,15 @@ impl SyscallDispatcher {
 
         }
 
-        fn sys_setxattr_path(this, cx, path: GuestPtr, name: GuestPtr, value: GuestPtr, size: u64, flags: u64, follow: u64) {
+        fn sys_setxattr_path(this, cx, path: GuestPtr, name: GuestPtr, value: GuestPtr, size: u64, flags: u64) {
 
-            this.setxattr(cx.memory, XattrTarget::Path(path), name, value, size, flags)
+            this.setxattr(cx.memory, XattrTarget::Path { path, follow: true }, name, value, size, flags)
+
+        }
+
+        fn sys_lsetxattr_path(this, cx, path: GuestPtr, name: GuestPtr, value: GuestPtr, size: u64, flags: u64) {
+
+            this.setxattr(cx.memory, XattrTarget::Path { path, follow: false }, name, value, size, flags)
 
         }
 
@@ -9038,9 +9048,15 @@ impl SyscallDispatcher {
 
         }
 
-        fn sys_getxattr_path(this, cx, path: GuestPtr, name: GuestPtr, value: GuestPtr, size: u64, follow: u64) {
+        fn sys_getxattr_path(this, cx, path: GuestPtr, name: GuestPtr, value: GuestPtr, size: u64) {
 
-            this.getxattr(cx.memory, XattrTarget::Path(path), name, value, size)
+            this.getxattr(cx.memory, XattrTarget::Path { path, follow: true }, name, value, size)
+
+        }
+
+        fn sys_lgetxattr_path(this, cx, path: GuestPtr, name: GuestPtr, value: GuestPtr, size: u64) {
+
+            this.getxattr(cx.memory, XattrTarget::Path { path, follow: false }, name, value, size)
 
         }
 
@@ -9053,9 +9069,15 @@ impl SyscallDispatcher {
 
         }
 
-        fn sys_listxattr_path(this, cx, path: GuestPtr, list: GuestPtr, size: u64, follow: u64) {
+        fn sys_listxattr_path(this, cx, path: GuestPtr, list: GuestPtr, size: u64) {
 
-            this.listxattr(cx.memory, XattrTarget::Path(path), list, size)
+            this.listxattr(cx.memory, XattrTarget::Path { path, follow: true }, list, size)
+
+        }
+
+        fn sys_llistxattr_path(this, cx, path: GuestPtr, list: GuestPtr, size: u64) {
+
+            this.listxattr(cx.memory, XattrTarget::Path { path, follow: false }, list, size)
 
         }
 
@@ -9068,10 +9090,15 @@ impl SyscallDispatcher {
 
         }
 
-        fn sys_removexattr_path(this, cx, path: GuestPtr, name: GuestPtr, follow: u64) {
+        fn sys_removexattr_path(this, cx, path: GuestPtr, name: GuestPtr) {
 
-            let _ = follow;
-            this.removexattr(cx.memory, XattrTarget::Path(path), name)
+            this.removexattr(cx.memory, XattrTarget::Path { path, follow: true }, name)
+
+        }
+
+        fn sys_lremovexattr_path(this, cx, path: GuestPtr, name: GuestPtr) {
+
+            this.removexattr(cx.memory, XattrTarget::Path { path, follow: false }, name)
 
         }
 
