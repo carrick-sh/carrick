@@ -695,6 +695,26 @@ fn sysv_run_scope() -> String {
         .collect()
 }
 
+fn scoped_host_sem_key(key: i32) -> libc::key_t {
+    if key == LINUX_IPC_PRIVATE {
+        return LINUX_IPC_PRIVATE as libc::key_t;
+    }
+    scoped_host_sem_key_for_scope(&sysv_run_scope(), key)
+}
+
+fn scoped_host_sem_key_for_scope(scope: &str, key: i32) -> libc::key_t {
+    // Darwin SysV semaphore keys live in one host-global pool. Linux containers
+    // get an IPC namespace, so mix Carrick's run scope into the host key while
+    // preserving the guest-visible key in Carrick metadata.
+    let mut hash = 0x811c_9dc5u32;
+    for byte in scope.as_bytes().iter().copied().chain(key.to_le_bytes()) {
+        hash ^= u32::from(byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    let raw = (hash & 0x7fff_ffff) as i32;
+    if raw == LINUX_IPC_PRIVATE { 1 } else { raw }
+}
+
 fn shm_nattch_path(path: &std::path::Path) -> PathBuf {
     let mut out = path.as_os_str().to_os_string();
     out.push(".nattch");
@@ -2639,9 +2659,9 @@ impl SyscallDispatcher {
             if !create && key != LINUX_IPC_PRIVATE {
                 return Ok(DispatchOutcome::errno(LINUX_ENOENT));
             }
-            let rc = unsafe {
-                carrick_portable::semget(key as libc::key_t, nsems_usize as i32, semflg as i32)
-            };
+            let host_key = scoped_host_sem_key(key);
+            let rc =
+                unsafe { carrick_portable::semget(host_key, nsems_usize as i32, semflg as i32) };
             match rc.host_syscall_errno() {
                 Ok(host_id) => {
                     let now = std::time::SystemTime::now()
@@ -3787,6 +3807,28 @@ fn host_sem_nsems(semid: i32) -> Result<usize, LinuxErrno> {
 mod ipc_set_tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn scoped_host_sem_key_separates_run_scopes() {
+        let key = 0x1234_5678u32 as i32;
+        let first = scoped_host_sem_key_for_scope("conf-a", key);
+        let first_again = scoped_host_sem_key_for_scope("conf-a", key);
+        let second = scoped_host_sem_key_for_scope("conf-b", key);
+        let other_key = scoped_host_sem_key_for_scope("conf-a", key.wrapping_add(1));
+
+        assert_eq!(first, first_again, "mapping must be stable within a run");
+        assert_ne!(first, second, "same guest key must not collide across runs");
+        assert_ne!(
+            first, other_key,
+            "different guest keys must remain distinct"
+        );
+        assert_ne!(first, LINUX_IPC_PRIVATE as libc::key_t);
+        assert_eq!(
+            scoped_host_sem_key(LINUX_IPC_PRIVATE),
+            LINUX_IPC_PRIVATE as libc::key_t,
+            "IPC_PRIVATE must stay host-private"
+        );
+    }
 
     /// `shmctl(IPC_SET)` must APPLY the requested permission bits to carrick's
     /// owned shm-segment bookkeeping — it was a silent no-op on every lane, so
