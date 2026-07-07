@@ -290,3 +290,69 @@ Outcome:
 - The same fix cleared the adjacent full-bless regressions:
   `target/release/carrick-conformance --suite ltp-poll02 --suite ltp-pselect01 --suite ltp-pselect01_64 --suite ltp-prctl09 --jsonl target/conformance/timedwait-reclaim-poll-select.jsonl`
   matched all four suites at 7/7 vs 7/7.
+
+## ptrace06 timeout
+
+Hypothesis:
+The `ltp-ptrace06` regression was a real wait/ptrace bug, not a slow test to
+bless. Docker completes the matrix in about 412ms with 48/48 TPASS lines, while
+Carrick timed out at about 30.5s before printing any TPASS. The LTP source first
+forks a `PTRACE_TRACEME` child, the child uses `raise(SIGSTOP)`, and the parent
+uses a plain blocking `wait()`; Linux reports this as a ptrace stop even without
+`WUNTRACED`.
+
+Tests:
+- Docker oracle:
+  `docker run --rm --platform linux/arm64 localhost:5050/ltp:arm64 /bin/sh -c /opt/ltp/testcases/bin/ptrace06`
+  printed 48 TPASS lines.
+- `carrick trace`:
+  `target/conformance/logs/ptrace06-trace-current-040615.dtrace.txt` showed the
+  LTP worker parked in wait-any after its tracee called `ptrace(TRACEME)`.
+- `carrick debug lldb-run`:
+  `target/conformance/logs/lldb-runs/ptrace06-post-race-041227.lldb.txt`
+  caught the worker in `wait_proc_exit_any_kqueue` with a stopped tracee child.
+- New focused probe:
+  `conformance-probes/src/bin/ptracestop.rs` reproduces the exact setup with a
+  bounded blocking wait and `raise(SIGSTOP)`.
+
+Outcome:
+The first reducer using `kill(getpid(), SIGSTOP)` passed, which disproved the
+generic "SIGSTOP stop is invisible" theory. Changing the reducer to
+`raise(SIGSTOP)` made it red on Carrick: the blocking wait timed out and was
+interrupted by the probe alarm. The first runtime fix taught all self-directed
+ptraced signal paths, including tkill/tgkill self-raise, to publish a Linux
+ptrace-stop marker before applying the host stop carrier. That fixed the
+reducer but not LTP.
+
+The remaining root cause was in the fork-shared child metadata. The child can
+self-register and publish the ptrace-stop marker before, or after, the parent
+registers fork ancestry. Existing-slot registration was not stable: parent-side
+registration could clear a published marker, and child self-registration could
+erase `parent_pid`. Wait-any then stopped considering the tracee a direct child,
+so the 50ms kqueue retry loop still missed it. The fix preserves live
+`ptrace_stop_signal` and parent ancestry across metadata-free self-registration
+and late parent registration.
+
+Verified:
+- `cargo fmt --check`
+- `cargo test -p carrick-host guest_cpu::tests --lib`
+- `cargo test -p carrick-runtime timed_wait_reclaim --lib`
+- `cargo test -p carrick-vmm-hvf child_status_ready_observes_ptrace_trap_stop --lib`
+- `just build -p carrick-cli`
+- Focused probes:
+  - `ptracestop` under Carrick OCI and `run-elf` now reports
+    `blocking_wait_reaped_stop=true` and `blocking_wait_alarm_fired=false`.
+  - the cross-process diagnostic `ptracesignal` passes in focused OCI and
+    `run-elf` runs, but it is not being committed as a durable gate because the
+    full loaded `just conformance-probes` run observed a `SIGPIPE` stop in that
+    diagnostic probe.
+- Focused LTP harness:
+  `target/release/carrick-conformance --suite ltp-ptrace06 --jsonl target/conformance/ptrace06-ancestry-fix.jsonl`
+  reported `MATCH carrick[48/48] oracle[48/48]`.
+
+Probe-gate note:
+`just conformance-probes` is not green on this tree. It hit the existing bridge
+UDP timeout and existing arm64 musl gaps such as `childsubreaper`,
+`epollforkeventfd`, `execthreads`, `keydeny`, `mlock2`, `ptyforkreopen`,
+`rlimitroundtrip`, `sotimeo`, and `syscallregpreserve`. The new stable
+`ptracestop` probe passed in that run.
