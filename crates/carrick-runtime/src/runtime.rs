@@ -934,6 +934,7 @@ where
         match outcome {
             DispatchOutcome::WaitOnFds { .. }
             | DispatchOutcome::BlockingHostWrite(_)
+            | DispatchOutcome::BlockingRecordLock(_)
             | DispatchOutcome::WaitOnFdsSelect { .. }
             | DispatchOutcome::WaitOnPollFds { .. }
             | DispatchOutcome::WaitOnProcExit { .. }
@@ -1383,6 +1384,9 @@ fn dispatch_single_threaded_syscall<M: GuestMemory>(
                         }
                     }
                 }
+            }
+            DispatchOutcome::BlockingRecordLock(lock) => {
+                return Ok(crate::dispatch::drive_blocking_record_lock(&lock));
             }
             DispatchOutcome::WaitOnFds {
                 fds,

@@ -992,3 +992,58 @@ Outcome:
 The `futex_cmp_requeue01` semantic regression is fixed in the focused and
 load-stressed reproducers. It remains slower than the Docker oracle, but it is
 now below the 10x pathological threshold in the focused harness row.
+
+## 2026-07-07 07:20 - moved blocking record locks out of dispatch
+
+Hypothesis:
+
+`fcntl36` and `fcntl36_64` timed out at the first subtest,
+`OFD read lock vs OFD write lock`. The handler forwarded
+`F_SETLKW`/`F_OFD_SETLKW` directly to the host `fcntl` while still inside
+Carrick syscall dispatch. A blocking host record-lock wait can then sleep while
+holding dispatcher state that sibling guest threads need in order to run and
+release the conflicting lock.
+
+Tests:
+
+- Selected Carrick-only stress run
+  `target/conformance/futex-requeue-selected-load-071431.jsonl` reproduced the
+  blocker with zero Docker runs. `ltp-fcntl36` and `ltp-fcntl36_64` both broke
+  after about 40s at `0/1` while the cached oracle was `7/7`.
+- The same run showed `ltp-futex_cmp_requeue01` matching `7/7`, so the explicit
+  selected stress set did not reproduce the full-bless futex contradiction.
+
+Change:
+
+- Added a `BlockingRecordLock` dispatch outcome for `F_SETLKW` and
+  `F_OFD_SETLKW`.
+- The dispatcher still parses/translates the Linux `struct flock`, validates the
+  command, and keeps synchronous `F_SETLK`/`F_OFD_SETLK` and `GETLK` behavior.
+- The runtime loop now executes the potentially blocking host `fcntl` after the
+  dispatcher has released its state, matching the existing `BlockingHostWrite`
+  handoff pattern.
+
+Verification:
+
+- `cargo check -p carrick-runtime -p carrick-vmm-hvf` passed.
+- `just build` rebuilt and re-signed `target/release/carrick`.
+- Focused rows
+  `target/conformance/fcntl36-blocking-record-lock-072019.jsonl` matched:
+  `ltp-fcntl36` Carrick `7/7`, Docker `7/7`, `8194ms/7709ms` (`1.06x`);
+  `ltp-fcntl36_64` Carrick `7/7`, Docker `7/7`, `8194ms/7731ms` (`1.06x`).
+- Selected stress run
+  `target/conformance/selected-load-after-record-lock-072037.jsonl` completed
+  with no regressions and zero Docker runs. `fcntl36`, `fcntl36_64`,
+  `futex_cmp_requeue01`, and `futex_wake03` all matched.
+
+Remaining:
+
+- Pathological performance remains in the selected set:
+  `ltp-epoll-ltp` `38.74x`, `ltp-flock07` `19.11x`, and `ltp-creat05`
+  `14.63x`.
+- `ltp-flock07` is still a non-gating `NEW` row in this selected run
+  (`1/2` vs `2/2`) and needs separate root-cause work before a clean bless.
+- The earlier full-bless futex failure remains a full-harness contradiction:
+  it did not reproduce in the selected non-DTrace load run, so the next futex
+  step should use a broader non-DTrace harness shape or lldb-run capture rather
+  than another DTrace-heavy run.

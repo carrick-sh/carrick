@@ -841,6 +841,13 @@ where
                         }
                     }
                 }
+                DispatchOutcome::BlockingRecordLock(lock) => {
+                    crate::run_state::publish(crate::run_state::RunState::Blocked);
+                    let reclaim = self.park_vcpu_for_blocking_wait(engine);
+                    let outcome = crate::dispatch::drive_blocking_record_lock(&lock);
+                    self.resume_vcpu_after_blocking_wait(engine, reclaim)?;
+                    break Ok(outcome);
+                }
                 DispatchOutcome::WaitOnFds {
                     fds,
                     timeout,
@@ -1491,6 +1498,7 @@ where
             match outcome {
                 DispatchOutcome::WaitOnFds { .. }
                 | DispatchOutcome::BlockingHostWrite(_)
+                | DispatchOutcome::BlockingRecordLock(_)
                 | DispatchOutcome::WaitOnFdsSelect { .. }
                 | DispatchOutcome::WaitOnPollFds { .. }
                 | DispatchOutcome::WaitOnProcExit { .. }
