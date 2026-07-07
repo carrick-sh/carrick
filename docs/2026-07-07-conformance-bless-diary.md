@@ -499,3 +499,43 @@ cycles around negative `epoll_ctl` cases. The right next performance target is
 the fork path (`fork_prepare_and_teardown`, permit reaper/signal pump/namespace
 supervisor cost, and child registration/wait bookkeeping), not another epoll
 backstop or rearm change.
+
+## 2026-07-07 04:44 - raw fork cost refreshed after epoll-ltp triage
+
+Hypothesis:
+
+The earlier raw `perf_fork` result (`fork_p50_us=40988.625`) explained
+fork-heavy LTP timing, but it was captured before the latest pipe/oracle and
+epoll-ltp diagnostic commits and may have included load or stale-binary effects.
+Before optimizing the fork path, refresh the primitive measurement and split the
+cost across Carrick's fork phases.
+
+Tests:
+
+- Untraced Carrick raw fork probe:
+  `target/conformance/logs/perf-probes/perf-fork-carrick-044358.log`
+  reported `fork_p50_us=3540.833`, `fork_p95_us=4059.834`, and
+  `fork_min_us=3014.333` over 300 iterations.
+- Docker oracle, same static probe binary:
+  `target/conformance/logs/perf-probes/perf-fork-docker-044405.log`
+  reported `fork_p50_us=48.625`, `fork_p95_us=124.417`, and
+  `fork_min_us=33.583` over 300 iterations.
+- `carrick trace` with `scripts/dtrace/fork-phases.d`:
+  `target/conformance/logs/perf-probes/trace-perf-fork-044330.fork-phases.trace`
+  reported parent rebuild average `2104us` and child rebuild average `2380us`;
+  the traced guest itself reported `fork_p50_us=4277.458`.
+- Scale probe:
+  `target/conformance/logs/perf-probes/perf-fork-scale-*-044433.*.log`
+  reported Carrick p50 `3344.583us` at baseline, `3417.125us` with four parked
+  threads, and `4053.292us` with 128 MiB touched resident memory. Docker p50 was
+  `63.542us`, `70.500us`, and `75.375us` for the same cases.
+
+Outcome:
+
+The current raw fork problem is still pathological but materially different
+from the stale 41 ms premise: Carrick is now roughly 50-75x slower than Docker
+for fork+immediate-exit+wait, with a fixed ~3.3-3.5 ms HVF fork lifecycle floor.
+The scale data is nearly flat for parked threads and only modestly worse for
+128 MiB resident memory, so the next architectural target is the mandatory HVF
+VM/vCPU teardown and rebuild model itself (plus mapping replay), not sibling
+quiesce, kqueue, or an eager memory-copy cliff.
