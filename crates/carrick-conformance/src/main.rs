@@ -1143,6 +1143,7 @@ fn suite_requires_exclusive_lane(suite: &Suite) -> bool {
         "ltp-execve05",
         "ltp-inotify09",
         "ltp-openat03",
+        "ltp-select02",
     ];
     EXCLUSIVE_SUITES.contains(&suite.name.as_str())
 }
@@ -2216,6 +2217,7 @@ mod tests {
             suite("ltp-execve05", Ecosystem::Ltp, Weight::Light),
             suite("ltp-openat03", Ecosystem::Ltp, Weight::Light),
             suite("ltp-inotify09", Ecosystem::Ltp, Weight::Light),
+            suite("ltp-select02", Ecosystem::Ltp, Weight::Light),
             suite("cpython-tarfile", Ecosystem::Cpython, Weight::Heavy),
             suite("ltp-gettid01", Ecosystem::Ltp, Weight::Light),
         ];
