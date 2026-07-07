@@ -2139,6 +2139,9 @@ impl SyscallDispatcher {
                 Ok(args) => args,
                 Err(errno) => return Ok(DispatchOutcome::errno(errno)),
             };
+            if pid.0 > 0 && crate::namespace::pid::is_execed_child_of_current(pid.0 as u32) {
+                return Ok(DispatchOutcome::errno(LINUX_EACCES));
+            }
             if let Err(errno) = (unsafe { libc::setpgid(hpid, hpgid) }).host_syscall_errno() {
                 return Ok(DispatchOutcome::errno(errno));
             }
