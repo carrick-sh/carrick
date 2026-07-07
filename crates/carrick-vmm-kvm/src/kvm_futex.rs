@@ -266,7 +266,14 @@ mod tests {
         let futex = Arc::new(make_kvm_futex(Arc::new(FutexTable::new())));
         let f2 = Arc::clone(&futex);
         let waiter = thread::spawn(move || {
-            f2.shared_wait(location, word, 0, Some(Duration::from_secs(5)), &|| false)
+            f2.shared_wait(
+                location,
+                word,
+                0,
+                Some(Duration::from_secs(5)),
+                &|| false,
+                &|| {},
+            )
         });
         thread::sleep(Duration::from_millis(50));
         atom.store(1, Ordering::SeqCst);
@@ -293,6 +300,7 @@ mod tests {
             0,
             Some(Duration::from_secs(5)),
             &never_interrupted(),
+            &|| {},
         );
         let elapsed = start.elapsed();
         assert_eq!(r, 0, "value-mismatch shared_wait must return 0 (no block)");
@@ -317,6 +325,7 @@ mod tests {
             7,
             Some(Duration::from_millis(120)),
             &never_interrupted(),
+            &|| {},
         );
         assert_eq!(
             r,
@@ -334,7 +343,14 @@ mod tests {
         atom.store(0, Ordering::SeqCst);
 
         let futex = make_kvm_futex(Arc::new(FutexTable::new()));
-        let r = futex.shared_wait(location, word, 0, Some(Duration::from_secs(5)), &|| true);
+        let r = futex.shared_wait(
+            location,
+            word,
+            0,
+            Some(Duration::from_secs(5)),
+            &|| true,
+            &|| {},
+        );
         assert_eq!(
             r,
             LINUX_EINTR.guest_retval(),

@@ -96,9 +96,10 @@ impl RunState {
 // claims ANY free slot (and caches its index for O(1) republish), and a reader
 // scans for its id — so a slot may sit anywhere (no home-index invariant), which
 // keeps full-table dead-slot reclamation correct (an evicted slot is readable
-// wherever it lands). 510 slots comfortably exceeds the live guest-process count
-// of any conformance workload; once full, a process whose slot can't be claimed
-// degrades to the host-state fallback (never a wrong state).
+// wherever it lands). The table must cover high-fanout conformance cases such
+// as `futex_cmp_requeue01`'s 1000 children; once full, a process whose slot
+// can't be claimed degrades to the host-state fallback, which can report a
+// booting child as sleeping too early.
 //
 // Worker guest tids are `host_pid + k` (registry-allocated), so they share the
 // low-32 numbering space with host pids: a worker tid can numerically equal a
@@ -106,7 +107,7 @@ impl RunState {
 // worker entry and a process entry with the same low-32 value occupy separate
 // slots (never clobber), and `published` prefers the process entry so a live
 // process's /proc state is never shadowed by an aliasing worker tid.
-const SLOTS: usize = 510;
+const SLOTS: usize = 4096;
 
 const PID_MASK: u64 = 0xffff_ffff;
 const STATE_SHIFT: u64 = 32;
@@ -428,6 +429,30 @@ mod tests {
         }
         // An unpublished pid reads None (host-state fallback).
         assert_eq!(published(999_001), None);
+    }
+
+    #[test]
+    fn table_covers_ltp_futex_cmp_requeue_fanout() {
+        // `futex_cmp_requeue01` waits for 1000 children to show `S` before it
+        // changes the futex word. If the run-state table fills first, later
+        // children fall back to host scheduler state and can appear asleep before
+        // their shared futex waiter is actually enrolled.
+        let first = 0x2000_0000_u32;
+        let count = 1200_u32;
+        for id in first..first + count {
+            wipe_id(id);
+            publish_for(id, RunState::Blocked);
+        }
+        for id in first..first + count {
+            assert_eq!(
+                published(id),
+                Some(RunState::Blocked),
+                "missing high-fanout run-state slot for pid {id}"
+            );
+        }
+        for id in first..first + count {
+            wipe_id(id);
+        }
     }
 
     /// Zero every slot (either kind) holding this low-32 id, so a test leaves the

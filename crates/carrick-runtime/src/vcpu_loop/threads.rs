@@ -256,15 +256,22 @@ where
                 None
             };
 
-            crate::run_state::publish(crate::run_state::RunState::Blocked);
-            crate::thread::set_current_thread_state(self.this_tid, 'S');
-            crate::run_state::publish_guest_tid(
-                self.this_tid.raw(),
-                crate::run_state::RunState::Blocked,
+            let publish_wait_enrolled = || {
+                crate::run_state::publish(crate::run_state::RunState::Blocked);
+                crate::thread::set_current_thread_state(self.this_tid, 'S');
+                crate::run_state::publish_guest_tid(
+                    self.this_tid.raw(),
+                    crate::run_state::RunState::Blocked,
+                );
+            };
+            let retval = self.platform_futex.shared_wait(
+                location,
+                waiter_key,
+                value,
+                timeout,
+                &interrupted,
+                &publish_wait_enrolled,
             );
-            let retval =
-                self.platform_futex
-                    .shared_wait(location, waiter_key, value, timeout, &interrupted);
             crate::thread::set_current_thread_state(self.this_tid, 'R');
             crate::run_state::publish_guest_tid(
                 self.this_tid.raw(),

@@ -165,6 +165,7 @@ mod tests {
             _value: u32,
             _timeout: Option<Duration>,
             _interrupted: &dyn Fn() -> bool,
+            _wait_enrolled: &dyn Fn(),
         ) -> i64 {
             0
         }
