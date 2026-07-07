@@ -583,8 +583,11 @@ where
                 // /proc/<child>/stat sees `R` during boot (as real Linux does),
                 // not the `S` of that boot park. Republished `Running` when the
                 // child's vCPU first resumes guest code (run_vcpu_until_exit top).
-                crate::run_state::reinit_booting_after_fork();
+                // Publish the child's host pid on its pre-fork record FIRST:
+                // the run-state publish right after adopts that record (one
+                // record per process), which only works once host_pid is set.
                 crate::guest_cpu::complete_child_record_post_fork_child();
+                crate::run_state::reinit_booting_after_fork();
                 // M:N scheduler: the child inherited the parent's pool but has only
                 // THIS thread, now the child's main (remapped to the child VM's vCPU
                 // 0). Drop the inherited (parent-slot) lease, reset to a fresh pool,
