@@ -248,7 +248,10 @@ mod tests {
     }
 
     fn shared_location(word: usize) -> SharedFutexLocation {
-        SharedFutexLocation::Direct { word: HostVa(word) }
+        SharedFutexLocation::Direct {
+            word: HostVa(word),
+            waiter_key: word,
+        }
     }
 
     /// SHARED path: thread A `shared_wait` blocks on host `SYS_futex`; thread B
