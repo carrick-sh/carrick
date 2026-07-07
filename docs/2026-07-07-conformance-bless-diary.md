@@ -239,6 +239,30 @@ and the fork churn probe showed child `hv_vm_create` around 300-700us:
 `target/conformance/logs/hvf-probes/fork-churn-20260707-030531.log`. That makes
 plain `hv_vm_create` too small to explain the 4-5s focused LTP cost by itself.
 
+E1 parent-keeps-VM probe:
+`feat(hvf): parent-keeps-vm fork probe (E1)` added
+`hvf_fork_probe parent-keeps-vm`, which forks while the parent VM stays live,
+has the child attempt `hv_vm_create`, `hv_vm_destroy`, then a fresh
+`Vm::create()`, and finally checks whether the original parent vCPU still runs.
+The probe also fixed its own spin helper to `hv_vm_unmap` before reusing a VM,
+so the parent before/after check is not polluted by a stale test mapping.
+
+Evidence: after signing `target/release/hvf_fork_probe` with
+`scripts/entitlements.plist`, `target/release/hvf_fork_probe parent-keeps-vm 50`
+logged `target/conformance/logs/hvf-probes/parent-keeps-vm-20260707-103502.log`.
+All 50 iterations produced the same child-side answer:
+`rc_direct=HV_BUSY`, `rc_destroy=HV_NO_DEVICE`, `rc_create=HV_BUSY`, with
+`child_code=2`. All 50 parent verdict lines had `pre_ok=true`, `post_ok=true`,
+`exit_match=true`, and `parent_destroy=(HV_SUCCESS,HV_SUCCESS)`.
+
+Verdict: **E1 REFUTED.** A child cannot clear inherited HVF state and create its
+own VM while the parent keeps its VM live. The parent's VM is not perturbed by
+the child's failed destroy/create attempt, but the child remains blocked at
+`hv_vm_create`. The threaded variant and the flag-gated engine change are
+therefore skipped. Next fork-floor work should move to E2: lazy stage-2 replay
+to shrink the rebuild cost that remains unavoidable under HVF's one-live-VM
+fork semantics.
+
 Raw fork oracle:
 The untracked local `perf_fork` probe timed a steady-state loop of
 `fork()+_exit(0)+waitpid()` with no child work. Carrick:
