@@ -997,3 +997,48 @@ Interpretation:
 - `chroot02`/`chroot04` were real correctness bugs and are now fixed.
 - Focused chroot timing is not pathological; the large performance outliers
   remain the process/pipe/epoll-heavy cases from the full-run summary.
+
+### connect02: IPV6_ADDRFORM and TCP AF_UNSPEC disconnect
+
+Hypotheses:
+
+- H1: `ltp-connect02` is a real missing socket semantic. Focused Carrick failed
+  at `setsockopt(IPV6_ADDRFORM)` with `ENOPROTOOPT`; Docker passed.
+- H2: Accepting `IPV6_ADDRFORM` is not sufficient. The LTP test converts an
+  accepted IPv6 TCP socket to IPv4, calls `connect(AF_UNSPEC)` to disconnect it,
+  then reuses the same fd with `bind`/`listen`.
+
+Tests:
+
+- Read the LTP patch/source context for `connect02` to confirm the syscall
+  sequence. The test loops over: connect IPv4 client, accept on IPv6 listener,
+  `setsockopt(SOL_IPV6, IPV6_ADDRFORM, AF_INET)`, `connect(AF_UNSPEC)`, then
+  `bind`/`listen`/accept on the same fd.
+- First implementation only relabeled Carrick's guest-visible family from
+  `AF_INET6` to `AF_INET`. Focused Carrick then advanced to the next failure:
+  `connect(AF_UNSPEC)` returned `EISCONN`.
+- Added modeled stream-socket disconnect: for `connect(AF_UNSPEC)` on a stream
+  socket, Carrick swaps the open description's host backing fd for a fresh
+  nonblocking socket with the stored guest family/type. This preserves the guest
+  fd/open-description identity while giving later `bind`/`listen` an unconnected
+  host socket.
+
+Outcome:
+
+- Focused checks passed:
+  `cargo fmt --check`;
+  `cargo test -p carrick-runtime ipv6_addrform_relabels_guest_family`;
+  `cargo check -p carrick-cli`;
+  `just build -p carrick-cli`.
+- Focused Carrick `ltp-connect02` now passes:
+  `target/conformance/logs/ltp-connect02-addrform-reset-011611.carrick.log`
+  (`1.21 real`).
+- Separate Docker oracle run also passes:
+  `target/conformance/logs/ltp-connect02-addrform-reset-011611.docker.log`
+  (`0.269 total`).
+
+Interpretation:
+
+- `connect02` was a real socket-state bug, not a baseline/classification issue.
+- Focused timing is slower but not pathological; the large outliers remain the
+  full-run process/pipe/epoll cases.
