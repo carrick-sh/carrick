@@ -21,6 +21,7 @@
 //!   / file context. This gives a one-shot, lldb-free inspection of the guest
 //!   address-space layout.
 
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -292,7 +293,7 @@ struct LldbDumpContext<'a> {
 }
 
 fn dump_lldb(ctx: &LldbDumpContext<'_>) -> anyhow::Result<Vec<MatchedProcess>> {
-    let pids = collect_scoped_processes(ctx.run_id)?;
+    let pids = stop_scoped_processes(ctx.run_id)?;
     write_ps_log(ctx.ps_log, &pids)?;
 
     let mut log = OpenOptions::new()
@@ -302,7 +303,19 @@ fn dump_lldb(ctx: &LldbDumpContext<'_>) -> anyhow::Result<Vec<MatchedProcess>> {
         .with_context(|| format!("failed to open {}", ctx.lldb_log.display()))?;
     writeln!(log, "RUN_ID={} WHY={}", ctx.run_id, ctx.why)?;
     writeln!(log, "PS_MATCHES:")?;
-    for process in &pids {
+    let mut attach_order = pids.clone();
+    let parent_pids = pids
+        .iter()
+        .map(|process| process.ppid)
+        .collect::<HashSet<_>>();
+    attach_order.sort_by(|a, b| {
+        parent_pids
+            .contains(&a.pid)
+            .cmp(&parent_pids.contains(&b.pid))
+            .then_with(|| b.pid.cmp(&a.pid))
+    });
+
+    for process in &attach_order {
         writeln!(
             log,
             "{} {} {} {}",
@@ -310,7 +323,7 @@ fn dump_lldb(ctx: &LldbDumpContext<'_>) -> anyhow::Result<Vec<MatchedProcess>> {
         )?;
     }
 
-    for process in &pids {
+    for process in &attach_order {
         if process.pid == std::process::id() as libc::pid_t {
             continue;
         }
@@ -362,6 +375,26 @@ fn dump_lldb(ctx: &LldbDumpContext<'_>) -> anyhow::Result<Vec<MatchedProcess>> {
         )?;
     }
     Ok(pids)
+}
+
+fn stop_scoped_processes(run_id: &str) -> anyhow::Result<Vec<MatchedProcess>> {
+    let self_pid = std::process::id() as libc::pid_t;
+    for _ in 0..3 {
+        let pids = collect_scoped_processes(run_id)?;
+        for process in &pids {
+            if process.pid == self_pid || process.is_stopped() {
+                continue;
+            }
+            // SAFETY: the pid set is selected by the scoped carrick run-id in
+            // the process title. ESRCH is benign because hot fork/exit paths can
+            // race the diagnostic freeze loop.
+            unsafe {
+                libc::kill(process.pid, libc::SIGSTOP);
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    collect_scoped_processes(run_id)
 }
 
 fn collect_scoped_processes(run_id: &str) -> anyhow::Result<Vec<MatchedProcess>> {
