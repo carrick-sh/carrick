@@ -261,6 +261,10 @@ pub(in crate::dispatch) struct IoState {
     /// (closed / recycled as a non-epoll) is removed when the re-arm next
     /// visits it.
     pub epoll_fds: RwLock<std::collections::BTreeSet<i32>>,
+    /// User-wake fds for epoll instances owned by this dispatcher. In-memory
+    /// readiness changes broadcast only within this registry, not to unrelated
+    /// dispatcher instances sharing the same host test process.
+    pub epoll_wake_registry: crate::dispatch::EpollWakeRegistry,
 }
 
 /// Default soft RLIMIT_NOFILE. Docker's LTP oracle starts processes with the
@@ -288,6 +292,7 @@ impl IoState {
             next_legacy_aio_context: AtomicU64::new(1),
             nofile_soft: AtomicU64::new(DEFAULT_NOFILE_SOFT),
             epoll_fds: RwLock::new(std::collections::BTreeSet::new()),
+            epoll_wake_registry: crate::dispatch::new_epoll_wake_registry(),
         }
     }
 }

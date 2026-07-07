@@ -1929,7 +1929,7 @@ impl SyscallDispatcher {
         };
         recv_queue.extend(bytes);
         drop(open);
-        notify_inmem_epoll();
+        self.notify_inmem_epoll();
         Ok(())
     }
 
@@ -2568,7 +2568,6 @@ impl SyscallDispatcher {
             let mut host_ready_sampled = std::collections::HashSet::<i32>::new();
             const READ_READY_BITS: u32 =
                 LINUX_EPOLLIN | LINUX_EPOLLRDHUP | LINUX_EPOLLHUP | LINUX_EPOLLERR;
-
             // (1) Drain the instance kqueue (non-blocking) for host-backed fds.
             // `kq_drained_all_filtered` tracks the corner case where the kqueue
             // had readiness events but the user's interest mask filters them
@@ -3126,7 +3125,7 @@ impl SyscallDispatcher {
                     Err(_) => return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EMFILE)),
                 };
                 let _ = mux.register_user(0);
-                crate::dispatch::EpollKqueue::new(mux)
+                crate::dispatch::EpollKqueue::new(mux, this.io.epoll_wake_registry.clone())
             };
             let description = OpenDescription::Epoll {
                 interest: HashMap::new(),
@@ -3152,7 +3151,7 @@ impl SyscallDispatcher {
                     Err(_) => return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EMFILE)),
                 };
                 let _ = mux.register_user(0);
-                crate::dispatch::EpollKqueue::new(mux)
+                crate::dispatch::EpollKqueue::new(mux, this.io.epoll_wake_registry.clone())
             };
             let description = OpenDescription::Epoll {
                 interest: HashMap::new(),
