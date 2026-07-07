@@ -343,6 +343,7 @@ pub(crate) fn forked_child_die_by_signal(
     let stderr_buf = stderr_buf.as_ref();
     let _ = unsafe { libc::write(1, stdout_buf.as_ptr() as *const _, stdout_buf.len()) };
     let _ = unsafe { libc::write(2, stderr_buf.as_ptr() as *const _, stderr_buf.len()) };
+    stop_for_debug_signal(signum);
     let host_signum = crate::host_signal::linux_to_host_signum(signum);
     #[cfg(not(target_os = "linux"))]
     if host_signum == 0 {
@@ -367,6 +368,24 @@ pub(crate) fn forked_child_die_by_signal(
         let _ = std::fs::write(sigdeath_marker_path(std::process::id()), [signum as u8]);
         libc::_exit(128 + signum)
     }
+}
+
+pub(crate) fn stop_for_debug_signal(signum: i32) {
+    let Ok(raw) = std::env::var("CARRICK_DEBUG_STOP_ON_SIGNAL") else {
+        return;
+    };
+    if !debug_stop_matches_signal(&raw, signum) {
+        return;
+    }
+    unsafe {
+        libc::raise(libc::SIGSTOP);
+    }
+}
+
+fn debug_stop_matches_signal(raw: &str, signum: i32) -> bool {
+    raw.split(',')
+        .filter_map(|value| value.trim().parse::<i32>().ok())
+        .any(|wanted| wanted == signum)
 }
 
 /// Stop THIS process by `signum` (job control / ptrace stop): reset the
@@ -403,6 +422,14 @@ mod tests {
     use super::*;
 
     const EM_X86_64: u16 = 62;
+
+    #[test]
+    fn debug_stop_signal_selector_accepts_comma_list() {
+        assert!(debug_stop_matches_signal("5", 5));
+        assert!(debug_stop_matches_signal(" 4, 5, 11 ", 5));
+        assert!(!debug_stop_matches_signal("4,11", 5));
+        assert!(!debug_stop_matches_signal("not-a-signal", 5));
+    }
 
     fn synthetic_elf(machine: u16) -> Vec<u8> {
         const ET_EXEC: u16 = 2;

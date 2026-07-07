@@ -231,6 +231,7 @@ pub(super) fn deliver_fault_signal<E: ThreadedEngine>(
         );
     }
     crate::probes::signal_deliver(this_tid.raw(), signum);
+    crate::exec_helpers::stop_for_debug_signal(signum);
 
     // A synchronous fault with the signal blocked, or no handler installed,
     // forces the default action (terminate) on Linux.
@@ -352,6 +353,7 @@ where
         dispatcher.mark_signal_pending(tid, pending);
         return Ok(Some(PendingSignalAction::ignored()));
     }
+    crate::exec_helpers::stop_for_debug_signal(pending);
     let action = dispatcher
         .take_pending_signal_action(tid, pending)
         .or_else(|| dispatcher.registered_signal_handler(pending));

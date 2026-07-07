@@ -73,6 +73,7 @@ pub(crate) fn run_debug(command: DebugCommand) -> anyhow::Result<()> {
             run_id,
             lldb_plugin,
             no_core,
+            stop_on_signal,
             command,
         } => {
             let status = run_lldb_deadline(
@@ -82,6 +83,7 @@ pub(crate) fn run_debug(command: DebugCommand) -> anyhow::Result<()> {
                 run_id,
                 lldb_plugin,
                 no_core,
+                stop_on_signal,
             )?;
             std::process::exit(status);
         }
@@ -96,6 +98,7 @@ fn run_lldb_deadline(
     run_id_arg: Option<String>,
     lldb_plugin_arg: Option<PathBuf>,
     no_core: bool,
+    stop_on_signal: Option<i32>,
 ) -> anyhow::Result<i32> {
     if run_args.is_empty() {
         bail!("debug lldb-run needs `-- <carrick run args>`");
@@ -131,6 +134,7 @@ fn run_lldb_deadline(
         &manifest,
         &run_id,
         deadline_seconds,
+        stop_on_signal,
         &exe,
         &lldb_plugin,
         &run_args,
@@ -141,12 +145,17 @@ fn run_lldb_deadline(
     let guest_stderr = guest
         .try_clone()
         .with_context(|| format!("failed to clone {}", guest_log.display()))?;
-    let mut child = Command::new(&exe)
+    let mut command = Command::new(&exe);
+    command
         .arg("run")
         .args(&run_args)
         .env("CARRICK_RUN_ID", &run_id)
         .stdout(Stdio::from(guest))
-        .stderr(Stdio::from(guest_stderr))
+        .stderr(Stdio::from(guest_stderr));
+    if let Some(signum) = stop_on_signal {
+        command.env("CARRICK_DEBUG_STOP_ON_SIGNAL", signum.to_string());
+    }
+    let mut child = command
         .spawn()
         .with_context(|| format!("failed to spawn {} run", exe.display()))?;
 
@@ -164,6 +173,25 @@ fn run_lldb_deadline(
             .context("failed to poll carrick run child")?
         {
             return Ok(exit_code(status));
+        }
+        if let Some(signum) = stop_on_signal {
+            let pids = collect_scoped_processes(&run_id)?;
+            if pids.iter().any(MatchedProcess::is_stopped) {
+                write_ps_log(&ps_log, &pids)?;
+                let why = format!("stopped-before-signal-{signum}");
+                let dumped = dump_lldb(&LldbDumpContext {
+                    run_id: &run_id,
+                    why: &why,
+                    exe: &exe,
+                    lldb_plugin: &lldb_plugin,
+                    out_dir: &out_dir,
+                    lldb_log: &lldb_log,
+                    ps_log: &ps_log,
+                    no_core,
+                })?;
+                terminate_scoped_run(&run_id, &dumped, &mut child)?;
+                return Ok(124);
+            }
         }
         if started.elapsed() >= deadline {
             let why = format!("deadline-{deadline_seconds}s");
@@ -218,6 +246,7 @@ fn write_manifest(
     path: &Path,
     run_id: &str,
     deadline_seconds: u64,
+    stop_on_signal: Option<i32>,
     exe: &Path,
     lldb_plugin: &Path,
     run_args: &[String],
@@ -226,6 +255,11 @@ fn write_manifest(
         File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
     writeln!(file, "run_id={run_id}")?;
     writeln!(file, "deadline_seconds={deadline_seconds}")?;
+    writeln!(
+        file,
+        "stop_on_signal={}",
+        stop_on_signal.map_or_else(|| String::from("<none>"), |s| s.to_string())
+    )?;
     writeln!(file, "exe={}", exe.display())?;
     writeln!(file, "lldb_plugin={}", lldb_plugin.display())?;
     writeln!(file, "run_args={}", run_args.join(" "))?;
@@ -236,7 +270,14 @@ fn write_manifest(
 struct MatchedProcess {
     pid: libc::pid_t,
     ppid: libc::pid_t,
+    stat: String,
     command: String,
+}
+
+impl MatchedProcess {
+    fn is_stopped(&self) -> bool {
+        self.stat.contains('T')
+    }
 }
 
 struct LldbDumpContext<'a> {
@@ -262,7 +303,11 @@ fn dump_lldb(ctx: &LldbDumpContext<'_>) -> anyhow::Result<Vec<MatchedProcess>> {
     writeln!(log, "RUN_ID={} WHY={}", ctx.run_id, ctx.why)?;
     writeln!(log, "PS_MATCHES:")?;
     for process in &pids {
-        writeln!(log, "{} {} {}", process.pid, process.ppid, process.command)?;
+        writeln!(
+            log,
+            "{} {} {} {}",
+            process.pid, process.ppid, process.stat, process.command
+        )?;
     }
 
     for process in &pids {
@@ -271,8 +316,8 @@ fn dump_lldb(ctx: &LldbDumpContext<'_>) -> anyhow::Result<Vec<MatchedProcess>> {
         }
         writeln!(
             log,
-            "===== lldb attach pid={} ppid={} =====",
-            process.pid, process.ppid
+            "===== lldb attach pid={} ppid={} stat={} =====",
+            process.pid, process.ppid, process.stat
         )?;
         log.flush()?;
         let core_path = ctx
@@ -321,7 +366,7 @@ fn dump_lldb(ctx: &LldbDumpContext<'_>) -> anyhow::Result<Vec<MatchedProcess>> {
 
 fn collect_scoped_processes(run_id: &str) -> anyhow::Result<Vec<MatchedProcess>> {
     let output = Command::new("ps")
-        .args(["-A", "-o", "pid=,ppid=,command="])
+        .args(["-A", "-o", "pid=,ppid=,stat=,command="])
         .output()
         .context("failed to run ps")?;
     if !output.status.success() {
@@ -341,6 +386,9 @@ fn collect_scoped_processes(run_id: &str) -> anyhow::Result<Vec<MatchedProcess>>
         let Some(ppid_raw) = parts.next() else {
             continue;
         };
+        let Some(stat) = parts.next() else {
+            continue;
+        };
         let command = parts.collect::<Vec<_>>().join(" ");
         let pid = pid_raw
             .parse::<libc::pid_t>()
@@ -348,7 +396,12 @@ fn collect_scoped_processes(run_id: &str) -> anyhow::Result<Vec<MatchedProcess>>
         let ppid = ppid_raw
             .parse::<libc::pid_t>()
             .with_context(|| format!("failed to parse ppid from `{line}`"))?;
-        processes.push(MatchedProcess { pid, ppid, command });
+        processes.push(MatchedProcess {
+            pid,
+            ppid,
+            stat: stat.to_owned(),
+            command,
+        });
     }
     Ok(processes)
 }
@@ -357,7 +410,11 @@ fn write_ps_log(path: &Path, pids: &[MatchedProcess]) -> anyhow::Result<()> {
     let mut file =
         File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
     for process in pids {
-        writeln!(file, "{} {} {}", process.pid, process.ppid, process.command)?;
+        writeln!(
+            file,
+            "{} {} {} {}",
+            process.pid, process.ppid, process.stat, process.command
+        )?;
     }
     Ok(())
 }
@@ -373,6 +430,11 @@ fn terminate_scoped_run(
     }
 
     for process in pids {
+        // SAFETY: same scoped pid set as below; resume stopped diagnostic
+        // targets so SIGTERM can run normal cleanup before the SIGKILL fallback.
+        unsafe {
+            libc::kill(process.pid, libc::SIGCONT);
+        }
         // SAFETY: signal delivery is scoped to pids whose proctitle matched this
         // run id. Errors are best-effort here because the process may have exited.
         unsafe {
