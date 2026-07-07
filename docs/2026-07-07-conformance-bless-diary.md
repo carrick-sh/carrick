@@ -64,3 +64,57 @@ Verified:
 - Harness run:
   `target/release/carrick-conformance --suite ltp-clone08 --jsonl target/conformance/clone08-fix.jsonl`
   reported `MATCH carrick[5/5] oracle[5/5]`.
+
+## munmap04 performance outlier
+
+Hypothesis:
+The full bless reported `ltp-munmap04` as `MATCH` but with a 77.42x timing
+outlier: Carrick 31,121ms vs cached Docker oracle 402ms. This is not acceptable
+as a blessed state even though the verdict matches. The first suspicion was
+that the shell-wrapped LTP process left a child alive or waited on the wrong
+process.
+
+Tests:
+- Direct binary run without `/bin/sh -c`:
+  `target/conformance/logs/munmap04-focus-020704.carrick.log`
+- Exact harness argv with `/bin/sh -c`:
+  `target/conformance/logs/munmap04-exact-020811.carrick.log`
+- Docker oracle refresh:
+  `target/conformance/logs/munmap04-docker-020916.docker.log`
+- DTrace profile:
+  `target/conformance/logs/munmap04-profile-020857.trace`
+- lldb deadline captures:
+  `target/conformance/logs/lldb-runs/munmap04-lldborder-021849.lldb.txt`
+
+Outcome:
+The direct no-shell run returned in 415ms, but the exact harness argv took
+30,332ms. Docker's exact argv returned in 505ms with the same LTP `SIGSEGV`
+TBROK verdict. The DTrace profile showed the active child was not blocked: it
+made about 39k guest `mmap` syscalls in six seconds. A first VMA metadata patch
+removed full-vector sort/linear overlap work from `dynamic_maps`, but the exact
+run still took 30,843ms.
+
+The original lldb runner attached parents first and missed the hot leaf process.
+After freezing the scoped process set and attaching leaf-first, lldb caught the
+worker in `carrick_guest_mem::protections::RangeSet::set` from the PROT_NONE
+`mmap` path. That range set was also doing full sort/merge scans on every
+mapping, plus full scans for no-op clears.
+
+Fix under test:
+Keep the existing `Vec`-backed metadata representation, but update sorted ranges
+locally with `partition_point`:
+- `dynamic_maps` now does binary overlap checks and ordered insertions without
+  resorting the whole vector for non-overlapping fixed mappings.
+- `MemoryProtections::RangeSet` now merges or removes only the affected local
+  slice instead of sorting/merging every stored range on each `set_no_access`.
+- `carrick debug lldb-run` now freezes the scoped process set and attaches
+  leaf-first so fork-heavy diagnostics capture the active guest process.
+
+Verified:
+- Raw exact Carrick argv after the range-set fix:
+  `target/conformance/logs/munmap04-rangeset-022035.carrick.log`, rc 2,
+  elapsed 1,151ms. This is about 2.28x vs the 505ms fresh Docker run, down from
+  the 30s timeout class and below the 10x outlier threshold.
+- Harness run:
+  `target/release/carrick-conformance --suite ltp-munmap04 --jsonl target/conformance/munmap04-harness-fixed-022052.jsonl`
+  reported `MATCH carrick[0/1] oracle[0/1]` with no performance outlier.

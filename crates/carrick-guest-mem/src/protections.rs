@@ -73,39 +73,40 @@ impl RangeSet {
         }
         let mut ranges = self.ranges.write();
         if present {
-            ranges.push((address, end));
-            ranges.sort_by_key(|&(start, _)| start);
-            let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
-            for (start, end) in std::mem::take(&mut *ranges) {
-                if let Some((_, last_end)) = merged.last_mut()
-                    && start <= *last_end
-                {
-                    *last_end = (*last_end).max(end);
-                    continue;
+            let mut start = address;
+            let mut merged_end = end;
+            let idx = ranges.partition_point(|&(_, range_end)| range_end < start);
+            let mut remove_end = idx;
+            while let Some(&(range_start, range_end)) = ranges.get(remove_end) {
+                if range_start > merged_end {
+                    break;
                 }
-                merged.push((start, end));
+                start = start.min(range_start);
+                merged_end = merged_end.max(range_end);
+                remove_end += 1;
             }
-            *ranges = merged;
+            ranges.splice(idx..remove_end, [(start, merged_end)]);
             return;
         }
-        let mut next = Vec::with_capacity(ranges.len());
-        for (s, e) in std::mem::take(&mut *ranges) {
-            if address <= s && end >= e {
-                continue;
-            }
-            if end <= s || address >= e {
-                next.push((s, e));
-                continue;
+
+        let idx = ranges.partition_point(|&(_, range_end)| range_end <= address);
+        let mut remove_end = idx;
+        let mut replacement = Vec::new();
+        while let Some(&(s, e)) = ranges.get(remove_end) {
+            if s >= end {
+                break;
             }
             if s < address {
-                next.push((s, address));
+                replacement.push((s, address));
             }
             if end < e {
-                next.push((end, e));
+                replacement.push((end, e));
             }
+            remove_end += 1;
         }
-        next.sort_by_key(|&(start, _)| start);
-        *ranges = next;
+        if idx != remove_end {
+            ranges.splice(idx..remove_end, replacement);
+        }
     }
 }
 
