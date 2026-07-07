@@ -336,38 +336,22 @@ fn dump_lldb(ctx: &LldbDumpContext<'_>) -> anyhow::Result<Vec<MatchedProcess>> {
         let core_path = ctx
             .out_dir
             .join(format!("{}.{}.core", ctx.run_id, process.pid));
-        let mut lldb = Command::new("lldb");
-        lldb.arg("--batch")
-            .arg("-o")
-            .arg(format!(
-                "command script import {}",
-                lldb_quoted_path(ctx.lldb_plugin)
-            ))
-            .arg("-o")
-            .arg(format!("attach {}", process.pid))
-            .arg("-o")
-            .arg("carrick eventring")
-            .arg("-o")
-            .arg("thread backtrace all");
-        if !ctx.no_core {
-            lldb.arg("-o").arg(format!(
-                "process save-core {}",
-                lldb_quoted_path(&core_path)
-            ));
+        let mut status = run_lldb_attach(ctx, &mut log, process.pid, &core_path)?;
+        if !status.success() && process.is_stopped() {
+            writeln!(
+                log,
+                "===== lldb retry pid={} after SIGCONT from stopped attach failure =====",
+                process.pid
+            )?;
+            log.flush()?;
+            // SAFETY: this is still the scoped process selected by run id.
+            // lldb will attach to the now-running task and stop it itself.
+            unsafe {
+                libc::kill(process.pid, libc::SIGCONT);
+            }
+            thread::sleep(Duration::from_millis(50));
+            status = run_lldb_attach(ctx, &mut log, process.pid, &core_path)?;
         }
-        lldb.arg("-o").arg("detach").arg(ctx.exe);
-
-        let stdout = log
-            .try_clone()
-            .with_context(|| format!("failed to clone {}", ctx.lldb_log.display()))?;
-        let stderr = log
-            .try_clone()
-            .with_context(|| format!("failed to clone {}", ctx.lldb_log.display()))?;
-        let status = lldb
-            .stdout(Stdio::from(stdout))
-            .stderr(Stdio::from(stderr))
-            .status()
-            .context("failed to run lldb")?;
         writeln!(
             log,
             "===== lldb status pid={} status={} =====",
@@ -375,6 +359,43 @@ fn dump_lldb(ctx: &LldbDumpContext<'_>) -> anyhow::Result<Vec<MatchedProcess>> {
         )?;
     }
     Ok(pids)
+}
+
+fn run_lldb_attach(
+    ctx: &LldbDumpContext<'_>,
+    log: &mut File,
+    pid: libc::pid_t,
+    core_path: &Path,
+) -> anyhow::Result<std::process::ExitStatus> {
+    let mut lldb = Command::new("lldb");
+    lldb.arg("--batch")
+        .arg("-o")
+        .arg(format!(
+            "command script import {}",
+            lldb_quoted_path(ctx.lldb_plugin)
+        ))
+        .arg("-o")
+        .arg(format!("attach {pid}"))
+        .arg("-o")
+        .arg("carrick eventring")
+        .arg("-o")
+        .arg("thread backtrace all");
+    if !ctx.no_core {
+        lldb.arg("-o")
+            .arg(format!("process save-core {}", lldb_quoted_path(core_path)));
+    }
+    lldb.arg("-o").arg("detach").arg(ctx.exe);
+
+    let stdout = log
+        .try_clone()
+        .with_context(|| format!("failed to clone {}", ctx.lldb_log.display()))?;
+    let stderr = log
+        .try_clone()
+        .with_context(|| format!("failed to clone {}", ctx.lldb_log.display()))?;
+    lldb.stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        .status()
+        .context("failed to run lldb")
 }
 
 fn stop_scoped_processes(run_id: &str) -> anyhow::Result<Vec<MatchedProcess>> {
