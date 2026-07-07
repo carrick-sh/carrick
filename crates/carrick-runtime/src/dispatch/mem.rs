@@ -396,6 +396,14 @@ fn ranges_overlap(a_start: u64, a_len: u64, b_start: u64, b_end: u64) -> bool {
     a_start < b_end && b_start < a_end
 }
 
+fn dynamic_mapping_overlaps_sorted(maps: &[ProcMapsEntry], start: u64, len: u64) -> bool {
+    let Some(end) = start.checked_add(len) else {
+        return true;
+    };
+    let idx = maps.partition_point(|map| map.end <= start);
+    maps.get(idx).is_some_and(|map| map.start < end)
+}
+
 fn trim_dynamic_maps_for_range(maps: &mut Vec<ProcMapsEntry>, start: u64, len: u64) {
     let Some(end) = start.checked_add(len) else {
         maps.clear();
@@ -418,7 +426,6 @@ fn trim_dynamic_maps_for_range(maps: &mut Vec<ProcMapsEntry>, start: u64, len: u
             next.push(right);
         }
     }
-    next.sort_by_key(|map| map.start);
     *maps = next;
 }
 
@@ -561,11 +568,7 @@ impl SyscallDispatcher {
     }
 
     fn dynamic_mapping_overlaps(&self, start: u64, len: u64) -> bool {
-        self.mem
-            .lock()
-            .dynamic_maps
-            .iter()
-            .any(|map| ranges_overlap(start, len, map.start, map.end))
+        dynamic_mapping_overlaps_sorted(&self.mem.lock().dynamic_maps, start, len)
     }
 
     fn record_write_sealed_shared_map(&self, start: u64, len: u64) {
@@ -639,9 +642,8 @@ impl SyscallDispatcher {
         };
         let (read, write, execute) = prot_to_proc_perms(prot);
         let mut mem = self.mem.lock();
-        trim_dynamic_maps_for_range(&mut mem.dynamic_maps, start, len);
         mem.remap_snapshots.remove(&start);
-        mem.dynamic_maps.push(ProcMapsEntry {
+        let entry = ProcMapsEntry {
             start,
             end,
             read,
@@ -649,8 +651,17 @@ impl SyscallDispatcher {
             execute,
             sharing,
             path,
-        });
-        mem.dynamic_maps.sort_by_key(|map| map.start);
+        };
+
+        if !dynamic_mapping_overlaps_sorted(&mem.dynamic_maps, start, len) {
+            let idx = mem.dynamic_maps.partition_point(|map| map.start < start);
+            mem.dynamic_maps.insert(idx, entry);
+            return;
+        }
+
+        trim_dynamic_maps_for_range(&mut mem.dynamic_maps, start, len);
+        let idx = mem.dynamic_maps.partition_point(|map| map.start < start);
+        mem.dynamic_maps.insert(idx, entry);
     }
 
     fn remove_dynamic_mapping(&self, start: u64, len: u64) {
@@ -2744,6 +2755,66 @@ mod tests {
         free_regions_insert(&mut r, 0x3000, 0x1000); // [0x3000,0x4000)
         free_regions_insert(&mut r, 0x2000, 0x1000); // bridges → one [0x1000,0x4000)
         assert_eq!(r, vec![(0x1000, 0x3000)]);
+    }
+
+    #[test]
+    fn dynamic_mapping_overlap_uses_sorted_boundaries() {
+        let maps = vec![
+            ProcMapsEntry {
+                start: 0x1000,
+                end: 0x2000,
+                read: true,
+                write: false,
+                execute: false,
+                sharing: ProcMapSharing::Private,
+                path: String::new(),
+            },
+            ProcMapsEntry {
+                start: 0x4000,
+                end: 0x5000,
+                read: true,
+                write: false,
+                execute: false,
+                sharing: ProcMapSharing::Private,
+                path: String::new(),
+            },
+        ];
+
+        assert!(!dynamic_mapping_overlaps_sorted(&maps, 0x2000, 0x2000));
+        assert!(dynamic_mapping_overlaps_sorted(&maps, 0x1fff, 1));
+        assert!(dynamic_mapping_overlaps_sorted(&maps, 0x3000, 0x1001));
+    }
+
+    #[test]
+    fn trim_dynamic_maps_preserves_sorted_order_without_full_resort() {
+        let mut maps = vec![
+            ProcMapsEntry {
+                start: 0x1000,
+                end: 0x5000,
+                read: true,
+                write: true,
+                execute: false,
+                sharing: ProcMapSharing::Private,
+                path: String::new(),
+            },
+            ProcMapsEntry {
+                start: 0x8000,
+                end: 0x9000,
+                read: true,
+                write: false,
+                execute: false,
+                sharing: ProcMapSharing::Private,
+                path: String::new(),
+            },
+        ];
+
+        trim_dynamic_maps_for_range(&mut maps, 0x2000, 0x2000);
+
+        let ranges: Vec<(u64, u64)> = maps.iter().map(|map| (map.start, map.end)).collect();
+        assert_eq!(
+            ranges,
+            vec![(0x1000, 0x2000), (0x4000, 0x5000), (0x8000, 0x9000)]
+        );
     }
 
     // mincore (syscall 232) failure-arm guards: a guest-controlled `length` must
