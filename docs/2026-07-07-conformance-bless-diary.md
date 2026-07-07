@@ -744,3 +744,48 @@ finite host SysV pool, so it can exhaust host semaphore capacity before the
 advertised Linux set count. That is missing functionality for a Carrick-owned
 large SysV semaphore service or honest tunable virtualization, not the key-scope
 collision fixed here.
+
+## 2026-07-07 06:12 - setpgid03 checkpoint timeout reduced
+
+Hypothesis:
+
+The `ltp-setpgid03` timeout was not caused by `setpgid(2)` itself. The test's
+second child execs an LTP helper and then uses the shared `tst_checkpoint`
+futex word to wake its parent. The trace showed the execed child repeatedly
+issuing `FUTEX_WAKE` on the checkpoint word, but Carrick reported zero waiters
+until LTP's ten-second checkpoint deadline expired.
+
+Root cause:
+
+Carrick's host-side shared-futex wait and wake paths used the guest virtual
+address as the waiter-table key. After exec, the child remaps the same
+`/dev/shm` checkpoint file at a different guest virtual address, so the parent
+and child addressed the same Linux futex word through different Carrick waiter
+keys. The Darwin shared futex primitive could still point at the right host
+word, but the Linux-visible wake count was computed from the wrong waiter bucket.
+
+Tests:
+
+- Existing shared checkpoint reducer:
+  `scripts/run-probe.sh ltpcheckpoint` reported `MATCH`.
+- New exec-remap reducer:
+  `scripts/run-probe.sh ltpcheckpointexec` was red before the fix:
+  Carrick failed both `exec_child_woke_parent_wait` and `exec_child_exit_ok`
+  while Docker passed them.
+- Post-fix reducer:
+  `scripts/run-probe.sh ltpcheckpointexec` reported `MATCH`.
+- Focused originating LTP row:
+  `target/conformance/setpgid03-fix-061159.{log,jsonl}` no longer timed out.
+  Carrick completed in 467ms vs the cached Docker oracle's 812ms.
+
+Outcome:
+
+`SharedFutexLocation` now carries an explicit waiter key, and HVF file-backed
+shared aliases derive that key from stable host file identity plus file offset
+instead of from the guest virtual address. The KVM, bhyve, SysV, and test
+backends keep their existing host-word identity as the waiter key.
+
+This fixed the checkpoint timeout and removed the timing outlier. The row is
+still a semantic regression: the final assertion expects Linux `EACCES` after
+the child has execed, while Carrick currently delegates to Darwin `setpgid(2)`
+and returns `EPERM`.

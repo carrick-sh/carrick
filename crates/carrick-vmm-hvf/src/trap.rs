@@ -457,6 +457,34 @@ struct AliasBacking {
     /// cross-process futex word — an anon arena alias resolved via the same index
     /// must NOT be treated as one.
     guest_shared: bool,
+    shared_key_base: u64,
+    shared_key_offset: u64,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn mix_futex_key(mut x: u64) -> u64 {
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^ (x >> 31)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn shared_file_key_base(fd: libc::c_int) -> u64 {
+    let mut st: libc::stat = unsafe { core::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut st) } != 0 {
+        return 0;
+    }
+    let key = mix_futex_key((st.st_dev as u64) ^ (st.st_ino as u64).rotate_left(32));
+    if key == 0 { 1 } else { key }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn shared_futex_waiter_key(base: u64, file_offset: u64) -> usize {
+    let key = mix_futex_key(base ^ file_offset.rotate_left(17));
+    let key = if key == 0 { 1 } else { key };
+    key as usize
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -660,6 +688,8 @@ struct SiblingForkMapping {
     perms: u64,
     guest_shared: bool,
     guest_writable: bool,
+    shared_key_base: u64,
+    shared_key_offset: u64,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -695,6 +725,8 @@ fn publish_sibling_fork_mappings(regions: &[HvfMappedRegion]) {
             perms: u64::from(m.perms),
             guest_shared: m.guest_shared,
             guest_writable: m.guest_writable,
+            shared_key_base: m.shared_key_base,
+            shared_key_offset: m.shared_key_offset,
         });
     }
 }
@@ -2137,6 +2169,8 @@ pub(crate) struct HvfMappedRegion {
     /// a PROT_READ MAP_SHARED file alias) or corrupting a carrick-owned
     /// `write:false` region. (audit M1; probe `rosharedbus`)
     guest_writable: bool,
+    shared_key_base: u64,
+    shared_key_offset: u64,
 }
 
 /// A copyable projection of the scalar fields of an [`HvfMappedRegion`] that the
@@ -2158,6 +2192,8 @@ struct MappingView {
     host_addr: *mut u8,
     guest_writable: bool,
     guest_shared: bool,
+    shared_key_base: u64,
+    shared_key_offset: u64,
 }
 
 /// Snapshot of vCPU register state captured before fork(2). The child restores
@@ -2210,6 +2246,8 @@ struct ThreadMappingDesc {
     perms: applevisor::memory::MemPerms,
     guest_shared: bool,
     guest_writable: bool,
+    shared_key_base: u64,
+    shared_key_offset: u64,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -2227,6 +2265,8 @@ impl ThreadMappingDesc {
             perms: region.perms,
             guest_shared: region.guest_shared,
             guest_writable: region.guest_writable,
+            shared_key_base: region.shared_key_base,
+            shared_key_offset: region.shared_key_offset,
         }
     }
 
@@ -2242,6 +2282,8 @@ impl ThreadMappingDesc {
             host_mapping: None,
             guest_shared: self.guest_shared,
             guest_writable: self.guest_writable,
+            shared_key_base: self.shared_key_base,
+            shared_key_offset: self.shared_key_offset,
         }
     }
 }
@@ -2256,6 +2298,8 @@ struct ForkMappingDesc {
     perms: applevisor::memory::MemPerms,
     guest_shared: bool,
     guest_writable: bool,
+    shared_key_base: u64,
+    shared_key_offset: u64,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -2834,6 +2878,13 @@ impl HvfVmState {
             Some((_, _, prot)) => prot & libc::PROT_WRITE != 0,
             None => true,
         };
+        let (shared_key_base, shared_key_offset) = match file {
+            Some((fd, offset, _)) => (
+                shared_file_key_base(fd),
+                u64::try_from(offset).unwrap_or_default(),
+            ),
+            None => (0, 0),
+        };
         let host_mapping = match file {
             // Live MAP_SHARED file: back the guest region with the file's page
             // cache directly, so writes are coherent with other openers and
@@ -2896,6 +2947,8 @@ impl HvfVmState {
             perms: u64::from(perms),
             guest_writable: alias_guest_writable,
             guest_shared,
+            shared_key_base,
+            shared_key_offset,
         });
         self.mappings.push(HvfMappedRegion {
             start: va,
@@ -2908,6 +2961,8 @@ impl HvfVmState {
             host_mapping: Some(host_mapping),
             guest_shared,
             guest_writable: alias_guest_writable,
+            shared_key_base,
+            shared_key_offset,
         });
         Ok((ipa, alias_guest_writable))
     }
@@ -3053,14 +3108,13 @@ impl HvfVmState {
     /// (the boot-mapped shared aperture; shared across carrick processes via
     /// the inherited MAP_SHARED backing). Used to back a cross-process futex
     /// with the public `os_sync_wait_on_address` API (see `crate::ulock`).
-    pub(crate) fn shared_futex_host_addr(&self, address: u64) -> Option<usize> {
+    pub(crate) fn shared_futex_location(
+        &self,
+        address: u64,
+    ) -> Option<carrick_guest_mem::SharedFutexLocation> {
         // Fast path: the region is in THIS thread's mapping list.
         if let Some(mapping) = self.mapping_for_range(address, 4) {
-            if !mapping.guest_shared {
-                return None; // present but private/anon — not a cross-process futex
-            }
-            let offset = (address - mapping.start) as usize;
-            return Some(unsafe { mapping.host_addr.add(offset) } as usize);
+            return mapping.shared_futex_location(address);
         }
         // Slow path: a fork rebuild replayed only the forking thread's mappings,
         // so a MAP_SHARED-file alias mapped by another thread is absent from THIS
@@ -3077,8 +3131,7 @@ impl HvfVmState {
                 .wrapping_sub(crate::memory::LINUX_HIGH_VA_THRESHOLD)
                 .wrapping_add(crate::memory::LINUX_ALIAS_IPA_BASE);
             if let Some(b) = lookup_shared_alias(ipa) {
-                let offset = (ipa - b.ipa) as usize;
-                return Some(b.host_addr + offset);
+                return MappingView::from_alias(&b).shared_futex_location(address);
             }
         }
         None
@@ -3700,6 +3753,8 @@ impl HvfVmState {
                     perms: u64::from(mapping.perms),
                     guest_writable: mapping.guest_writable,
                     guest_shared: mapping.guest_shared,
+                    shared_key_base: mapping.shared_key_base,
+                    shared_key_offset: mapping.shared_key_offset,
                 });
             }
         }
@@ -3840,6 +3895,8 @@ impl HvfVmState {
                 perms: m.perms,
                 guest_shared: m.guest_shared,
                 guest_writable: m.guest_writable,
+                shared_key_base: m.shared_key_base,
+                shared_key_offset: m.shared_key_offset,
             })
             .collect();
 
@@ -3890,6 +3947,8 @@ impl HvfVmState {
                 perms: desc.perms,
                 guest_shared: desc.guest_shared,
                 guest_writable: desc.guest_writable,
+                shared_key_base: desc.shared_key_base,
+                shared_key_offset: desc.shared_key_offset,
             });
         }
 
@@ -4052,6 +4111,8 @@ impl HvfVmState {
                     perms: perms_raw,
                     guest_writable: desc.guest_writable,
                     guest_shared: desc.guest_shared,
+                    shared_key_base: desc.shared_key_base,
+                    shared_key_offset: desc.shared_key_offset,
                 });
             }
             self.mappings.push(HvfMappedRegion {
@@ -4069,6 +4130,8 @@ impl HvfVmState {
                 memory: None,
                 host_mapping: desc.host.into_owned(),
                 guest_shared: desc.guest_shared,
+                shared_key_base: desc.shared_key_base,
+                shared_key_offset: desc.shared_key_offset,
             });
         }
 
@@ -4136,6 +4199,8 @@ impl HvfVmState {
                     memory: None,
                     host_mapping: None,
                     guest_shared: sm.guest_shared,
+                    shared_key_base: sm.shared_key_base,
+                    shared_key_offset: sm.shared_key_offset,
                 });
             }
         }
@@ -4897,6 +4962,8 @@ impl HvfMappedRegion {
             host_addr: self.host_addr,
             guest_writable: self.guest_writable,
             guest_shared: self.guest_shared,
+            shared_key_base: self.shared_key_base,
+            shared_key_offset: self.shared_key_offset,
         }
     }
 }
@@ -4918,7 +4985,27 @@ impl MappingView {
             // fallback is still recognized as a cross-process futex word by
             // shared_futex_host_addr (an anon arena alias must NOT be).
             guest_shared: b.guest_shared,
+            shared_key_base: b.shared_key_base,
+            shared_key_offset: b.shared_key_offset,
         }
+    }
+
+    fn shared_futex_location(
+        &self,
+        address: u64,
+    ) -> Option<carrick_guest_mem::SharedFutexLocation> {
+        if !self.guest_shared {
+            return None;
+        }
+        let offset = (address - self.start) as usize;
+        let word = carrick_guest_mem::HostVa(unsafe { self.host_addr.add(offset) } as usize);
+        let waiter_key = if self.shared_key_base == 0 {
+            word.raw()
+        } else {
+            let file_offset = self.shared_key_offset.saturating_add(offset as u64);
+            shared_futex_waiter_key(self.shared_key_base, file_offset)
+        };
+        Some(carrick_guest_mem::SharedFutexLocation::Direct { word, waiter_key })
     }
 }
 
@@ -5150,6 +5237,8 @@ fn map_region_raw(mapping: &GuestMapping) -> Result<HvfMappedRegion, TrapError> 
         // Boot regions carry their true guest write-intent (image=RX, page
         // tables=RO -> not writable; heap/stack/data=RW -> writable).
         guest_writable: mapping.perms.write,
+        shared_key_base: 0,
+        shared_key_offset: 0,
     })
 }
 
@@ -5927,6 +6016,8 @@ mod thread_sibling_tests {
             perms: applevisor::memory::MemPerms::ReadWrite,
             guest_shared: true,
             guest_writable: true,
+            shared_key_base: 0,
+            shared_key_offset: 0,
         };
 
         let copied = desc.into_unowned_region();
@@ -5953,6 +6044,8 @@ mod thread_sibling_tests {
             host_mapping: None,
             guest_shared: false,
             guest_writable: true,
+            shared_key_base: 0,
+            shared_key_offset: 0,
         }
     }
 

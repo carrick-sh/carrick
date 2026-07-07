@@ -1255,6 +1255,7 @@ fn shared_futex_mirror_slot(key: u64) -> Option<SharedFutexLocation> {
             return Some(SharedFutexLocation::Mirror {
                 word: HostVa(&slot.value as *const _ as usize),
                 waiter_count: HostVa(&slot.waiters as *const _ as usize),
+                waiter_key: &slot.value as *const _ as usize,
             });
         }
         if cur == 0 {
@@ -1263,6 +1264,7 @@ fn shared_futex_mirror_slot(key: u64) -> Option<SharedFutexLocation> {
                     return Some(SharedFutexLocation::Mirror {
                         word: HostVa(&slot.value as *const _ as usize),
                         waiter_count: HostVa(&slot.waiters as *const _ as usize),
+                        waiter_key: &slot.value as *const _ as usize,
                     });
                 }
                 // Lost the race to a peer claiming the SAME key — still ours to use.
@@ -1270,6 +1272,7 @@ fn shared_futex_mirror_slot(key: u64) -> Option<SharedFutexLocation> {
                     return Some(SharedFutexLocation::Mirror {
                         word: HostVa(&slot.value as *const _ as usize),
                         waiter_count: HostVa(&slot.waiters as *const _ as usize),
+                        waiter_key: &slot.value as *const _ as usize,
                     });
                 }
                 // Claimed by a different key — keep probing.

@@ -28,7 +28,7 @@ use carrick_aarch64::{
 };
 use carrick_guest_mem::protections::MemoryProtections;
 use carrick_guest_mem::zero_range_chunked;
-use carrick_guest_mem::{GuestVa, HostVa, MemoryError};
+use carrick_guest_mem::{GuestVa, HostVa, MemoryError, SharedFutexLocation};
 use carrick_hal::{
     GuestEntryRegs, GuestVmBackend, HvVcpu, HvVm, MemPerms, OsError, Reg, SysReg, TrapError,
     VcpuExit, VcpuRegistry,
@@ -360,10 +360,13 @@ impl Aarch64Vmm for KvmAarch64Vmm {
         })
     }
 
-    fn shared_futex_host_addr(&self, guest_addr: GuestVa) -> Option<HostVa> {
+    fn shared_futex_location(&self, guest_addr: GuestVa) -> Option<SharedFutexLocation> {
         self.ram
             .shared_futex_host_addr(guest_addr.raw(), 4)
-            .map(HostVa)
+            .map(|word| SharedFutexLocation::Direct {
+                word: HostVa(word),
+                waiter_key: word,
+            })
     }
 
     fn add_alias(

@@ -19,7 +19,7 @@
 use std::sync::Arc;
 
 use carrick_guest_mem::protections::MemoryProtections;
-use carrick_guest_mem::{Aarch64SyscallFrame, GuestVa, HostVa, MemoryError};
+use carrick_guest_mem::{Aarch64SyscallFrame, GuestVa, MemoryError, SharedFutexLocation};
 use carrick_hal::{
     GuestEntryRegs, GuestVmBackend, MemPerms, Reg, SlotId, SysReg, TrapError, VcpuKick,
     VcpuRegistry,
@@ -341,12 +341,10 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
     /// never resurface after a later `mprotect` makes it readable.
     fn zero_backing(&mut self, address: u64, len: usize) -> Result<(), MemoryError>;
 
-    /// Host VA of a guest futex word IFF it lives in the `MAP_SHARED` aperture —
-    /// lets the dispatcher route a guest cross-process (`MAP_SHARED`) futex through
-    /// the shared host-`SYS_futex` path on the same physical page (inherited across
-    /// `fork(2)`). `None` for a private/COW word (those stay in-process via the
-    /// parking-lot `FutexTable`).
-    fn shared_futex_host_addr(&self, _guest_addr: GuestVa) -> Option<HostVa> {
+    /// Host wait address plus Linux-visible waiter-count key for a guest futex
+    /// word IFF it lives in a `MAP_SHARED` region. `None` for private/COW words,
+    /// which stay in-process via the parking-lot `FutexTable`.
+    fn shared_futex_location(&self, _guest_addr: GuestVa) -> Option<SharedFutexLocation> {
         None
     }
 

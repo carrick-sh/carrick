@@ -1654,6 +1654,7 @@ impl MsgQueueWaitToken {
         with_cached_msg_queue_wait_word(&path, |word| Self {
             location: carrick_guest_mem::SharedFutexLocation::Direct {
                 word: carrick_guest_mem::HostVa(word.addr()),
+                waiter_key: id.raw() as usize,
             },
             waiter_key: id.raw() as usize,
             observed: word.load(),
