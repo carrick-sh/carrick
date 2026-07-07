@@ -582,9 +582,9 @@ fn io_error_to_linux_errno(error: std::io::Error) -> LinuxErrno {
 fn open_host_watch_fd(path: &Path) -> Result<i32, LinuxErrno> {
     let cpath = cstring_from_osstr(path.as_os_str()).ok_or(crate::linux_abi::LINUX_EINVAL)?;
     #[cfg(target_os = "macos")]
-    let host_flags = libc::O_EVTONLY;
+    let host_flags = libc::O_EVTONLY | libc::O_NONBLOCK | libc::O_CLOEXEC;
     #[cfg(not(target_os = "macos"))]
-    let host_flags = libc::O_RDONLY;
+    let host_flags = libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC;
     // SAFETY: `cpath` is NUL-terminated and points at a real host path.
     let fd = unsafe { libc::open(cpath.as_ptr(), host_flags) };
     if fd < 0 {
@@ -594,6 +594,17 @@ fn open_host_watch_fd(path: &Path) -> Result<i32, LinuxErrno> {
         return Err(crate::host_to_linux_errno(raw));
     }
     Ok(fd)
+}
+
+fn dup_host_watch_fd(fd: i32) -> Result<i32, LinuxErrno> {
+    let dup = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+    if dup < 0 {
+        let raw = std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EMFILE);
+        return Err(crate::host_to_linux_errno(raw));
+    }
+    Ok(dup)
 }
 
 fn child_name(prefix: &Path, candidate: &Path) -> Option<String> {
@@ -1322,17 +1333,20 @@ pub struct HostFsBackend {
     /// `umount2(MNT_DETACH)`s it before the `TempDir` removes the scratch.
     /// Linux-only; always `None` on macOS (clonefile is already O(1)).
     overlay_mount: Option<std::path::PathBuf>,
-    /// Fork-coherent cache of `watch_fds`' path RESOLUTION — the (kind, resolved
-    /// host-relative path) that `lookup_kind` + `resolve_following` compute via
-    /// cap-std `symlink_metadata` (an openat-per-component walk). LTP
-    /// `tst_fuzzy_sync` tests re-run `inotify_add_watch` on the SAME path ~158k
-    /// times; caching this elides the walk, while `open_host_watch_fd` still
-    /// opens the kqueue fd fresh. Each entry is stamped with the shared fs
-    /// generation ([`crate::fs_resolve_cache`]) and served only while it still
-    /// matches, so a structural mutation in ANY process invalidates it. No fds
-    /// are cached, so — unlike `stat_cache` — it needs no per-pid drop. Value is
-    /// (stamped fs generation, resolved host-relative path).
-    watch_res_cache: parking_lot::Mutex<std::collections::HashMap<String, (u64, PathBuf)>>,
+    /// Fork-coherent cache for `watch_fds`: resolved host-relative path plus,
+    /// for non-directories, one source fd for the watched vnode. LTP
+    /// `tst_fuzzy_sync` tests re-run `inotify_add_watch`/`inotify_rm_watch` on
+    /// the SAME path hundreds of thousands of times; caching the resolved path
+    /// elides the cap-std walk, and duping the source fd elides the hot host
+    /// `open(2)`. Each entry is stamped with the shared fs generation
+    /// ([`crate::fs_resolve_cache`]) and served only while it still matches, so a
+    /// structural mutation in ANY carrick process invalidates it. Because fds are
+    /// cached, a host fork adopts this cache by clearing inherited parent entries
+    /// before first use in the child.
+    watch_res_cache: parking_lot::Mutex<std::collections::HashMap<String, WatchResCacheEntry>>,
+    /// The pid that owns current `watch_res_cache` fd entries; see the cache
+    /// comment above.
+    watch_cache_pid: std::sync::atomic::AtomicU32,
 }
 
 /// A cached `RealStat` plus the snapshot needed to revalidate it cheaply. The
@@ -1357,6 +1371,12 @@ struct StatCacheEntry {
 #[allow(dead_code)]
 struct StatCacheEntry {
     real: RealStat,
+}
+
+struct WatchResCacheEntry {
+    generation: u64,
+    normalized: PathBuf,
+    source_fd: Option<std::sync::Arc<std::os::fd::OwnedFd>>,
 }
 
 /// F_GETPATH of a cap-std dir fd → its absolute host path (macOS), used as the
@@ -1523,6 +1543,7 @@ impl HostFsBackend {
             use_stat_cache: stat_cache_enabled(),
             overlay_mount: None,
             watch_res_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            watch_cache_pid: std::sync::atomic::AtomicU32::new(0),
         })
     }
 
@@ -1563,6 +1584,7 @@ impl HostFsBackend {
             use_stat_cache: stat_cache_enabled(),
             overlay_mount: None,
             watch_res_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            watch_cache_pid: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -3622,7 +3644,9 @@ impl FsBackend for HostFsBackend {
     }
 
     fn watch_fds(&self, path: &str) -> Result<Vec<crate::vfs::WatchFd>, LinuxErrno> {
+        use std::os::fd::FromRawFd;
         use std::os::unix::ffi::OsStrExt;
+        use std::sync::atomic::Ordering::Relaxed;
 
         let scratch = self
             ._scratch
@@ -3639,15 +3663,20 @@ impl FsBackend for HostFsBackend {
         let gen_at_entry = crate::fs_resolve_cache::current_generation();
         let cached = {
             let now = crate::fs_resolve_cache::current_generation();
-            self.watch_res_cache
-                .lock()
-                .get(path)
-                .filter(|(g, _)| *g == now)
-                .map(|(_, n)| n.clone())
+            let me = unsafe { libc::getpid() } as u32;
+            let mut guard = self.watch_res_cache.lock();
+            if self.watch_cache_pid.load(Relaxed) != me {
+                guard.clear();
+                self.watch_cache_pid.store(me, Relaxed);
+            }
+            guard.get(path).and_then(|entry| {
+                (entry.generation == now)
+                    .then(|| (entry.normalized.clone(), entry.source_fd.clone()))
+            })
         };
-        let normalized = match cached {
+        let (normalized, cached_source_fd) = match cached {
             // A cached hit is never a tombstone — we don't store those.
-            Some(n) => n,
+            Some(entry) => entry,
             None => {
                 let kind = self
                     .lookup_kind(path)
@@ -3660,25 +3689,54 @@ impl FsBackend for HostFsBackend {
                 let normalized = self
                     .resolve_following(path)
                     .ok_or(crate::linux_abi::LINUX_EINVAL)?;
-                {
-                    let mut guard = self.watch_res_cache.lock();
-                    // Bound it: distinct watched paths are normally few, but a
-                    // path-diverse guest must not grow this without limit.
-                    if guard.len() >= 8192 && !guard.contains_key(path) {
-                        guard.clear();
-                    }
-                    guard.insert(path.to_owned(), (gen_at_entry, normalized.clone()));
-                }
-                normalized
+                (normalized, None)
             }
         };
         let host_path = scratch.path().join(&normalized);
-        let root_fd = open_host_watch_fd(&host_path)?;
+        let root_fd = match cached_source_fd {
+            Some(ref source_fd) => {
+                dup_host_watch_fd(std::os::fd::AsRawFd::as_raw_fd(&**source_fd))?
+            }
+            None => open_host_watch_fd(&host_path)?,
+        };
         let metadata = std::fs::symlink_metadata(&host_path).map_err(io_error_to_linux_errno)?;
         if !metadata.is_dir() {
+            if cached_source_fd.is_none() {
+                let source_fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(root_fd) };
+                let watch_fd = dup_host_watch_fd(std::os::fd::AsRawFd::as_raw_fd(&source_fd))?;
+                let mut guard = self.watch_res_cache.lock();
+                // Bound it: distinct watched paths are normally few, but a
+                // path-diverse guest must not grow this without limit.
+                if guard.len() >= 8192 && !guard.contains_key(path) {
+                    guard.clear();
+                }
+                guard.insert(
+                    path.to_owned(),
+                    WatchResCacheEntry {
+                        generation: gen_at_entry,
+                        normalized,
+                        source_fd: Some(std::sync::Arc::new(source_fd)),
+                    },
+                );
+                return Ok(vec![crate::vfs::WatchFd::unnamed(watch_fd)]);
+            }
             return Ok(vec![crate::vfs::WatchFd::unnamed(root_fd)]);
         }
 
+        if cached_source_fd.is_none() {
+            let mut guard = self.watch_res_cache.lock();
+            if guard.len() >= 8192 && !guard.contains_key(path) {
+                guard.clear();
+            }
+            guard.insert(
+                path.to_owned(),
+                WatchResCacheEntry {
+                    generation: gen_at_entry,
+                    normalized: normalized.clone(),
+                    source_fd: None,
+                },
+            );
+        }
         let mut fds = vec![crate::vfs::WatchFd::scanning_directory(
             root_fd,
             host_path.clone(),
@@ -4819,6 +4877,50 @@ mod tests {
         let dir = cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority())
             .unwrap();
         (HostFsBackend::from_existing_dir(dir), scratch)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn open_host_watch_fd_does_not_block_on_writerless_fifo() {
+        let scratch = tempfile::TempDir::new().unwrap();
+        let path = scratch.path().join("stress_fname");
+        let cpath = cstring_from_osstr(path.as_os_str()).unwrap();
+        assert_eq!(
+            unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) },
+            0,
+            "mkfifo failed: {:?}",
+            std::io::Error::last_os_error()
+        );
+
+        let fd = open_host_watch_fd(&path).unwrap();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        unsafe { libc::close(fd) };
+
+        assert_ne!(flags, -1);
+        assert_ne!(flags & libc::O_NONBLOCK, 0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn host_watch_fds_caches_source_fd_for_stable_fifo() {
+        let scratch_root = tempfile::TempDir::new().unwrap();
+        let b = HostFsBackend::new_in(scratch_root.path()).unwrap();
+        b.create_fifo("/stress_fname", 0o600).unwrap();
+
+        let first = b.watch_fds("/stress_fname").unwrap();
+        let second = b.watch_fds("/stress_fname").unwrap();
+
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        for fd in [first[0].host_fd, second[0].host_fd] {
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            unsafe { libc::close(fd) };
+            assert_ne!(flags, -1);
+            assert_ne!(flags & libc::O_NONBLOCK, 0);
+        }
+        let guard = b.watch_res_cache.lock();
+        let entry = guard.get("/stress_fname").expect("cached watch source");
+        assert!(entry.source_fd.is_some());
     }
 
     /// Deep-path (> PATH_MAX) operations: a guest that mkdir/chdir's its way
