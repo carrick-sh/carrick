@@ -1475,6 +1475,16 @@ fn epoll_waits_on_host_backed_edge_interests_when_no_event_is_ready() {
     assert_eq!(timeout, Some(std::time::Duration::from_millis(25)));
     assert_eq!(on_timeout, 0);
     assert_eq!(sig_mask.raw_block_bits(), 0);
+    let mut host_pollfd = libc::pollfd {
+        fd: fds[0].fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let host_ready = unsafe { libc::poll(&mut host_pollfd, 1, 0) };
+    assert_eq!(
+        host_ready, 0,
+        "latch-masked ET readiness must not leave the epoll kqueue fd readable"
+    );
 
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
@@ -1583,6 +1593,150 @@ fn epoll_latched_host_edge_parks_on_kqueue_edge_not_timeout_backstop() {
     assert_eq!(timeout, Some(std::time::Duration::from_millis(25)));
     assert_eq!(on_timeout, 0);
     assert_eq!(sig_mask.raw_block_bits(), 0);
+
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn epoll_et_read_growth_does_not_rearm_latched_read_level() {
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x800]);
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    59,
+                    SyscallArgs::from([0x4000, LINUX_O_NONBLOCK, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let pair = read_fd_pair(&memory, 0x4000);
+    let read_fd = pair.read_fd as u64;
+    let write_fd = pair.write_fd as u64;
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(20, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 5 }
+    );
+    let wanted = LinuxEpollEvent {
+        events: LINUX_EPOLLIN | LINUX_EPOLLET,
+        _pad: 0,
+        data: read_fd,
+    };
+    memory.write_bytes(0x4040, wanted.as_bytes()).unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    21,
+                    SyscallArgs::from([5, LINUX_EPOLL_CTL_ADD, read_fd, 0x4040, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+
+    memory.write_bytes(0x4060, b"x").unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(64, SyscallArgs::from([write_fd, 0x4060, 1, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 1 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(22, SyscallArgs::from([5, 0x4100, 4, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 1 }
+    );
+    let first = read_epoll_event(&memory, 0x4100);
+    let first_data = first.data;
+    let first_events = first.events;
+    assert_eq!(first_data, read_fd);
+    assert_eq!(first_events & LINUX_EPOLLIN, LINUX_EPOLLIN);
+
+    memory.write_bytes(0x4060, b"y").unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(64, SyscallArgs::from([write_fd, 0x4060, 1, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 1 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(22, SyscallArgs::from([5, 0x4100, 4, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 1 }
+    );
+    let growth = read_epoll_event(&memory, 0x4100);
+    let growth_data = growth.data;
+    let growth_events = growth.events;
+    assert_eq!(growth_data, read_fd);
+    assert_eq!(growth_events & LINUX_EPOLLIN, LINUX_EPOLLIN);
+
+    let outcome = dispatcher
+        .dispatch(
+            SyscallRequest::new(22, SyscallArgs::from([5, 0x4100, 4, 25, 0, 0])),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+    let DispatchOutcome::WaitOnPollFds {
+        fds,
+        timeout,
+        on_timeout,
+        sig_mask,
+    } = outcome
+    else {
+        panic!("expected latched growth edge to park on future kqueue edge, got {outcome:?}");
+    };
+    assert_eq!(fds.len(), 1);
+    assert_eq!(fds[0].events() & libc::POLLIN, libc::POLLIN);
+    assert_eq!(timeout, Some(std::time::Duration::from_millis(25)));
+    assert_eq!(on_timeout, 0);
+    assert_eq!(sig_mask.raw_block_bits(), 0);
+
+    let mut host_pollfd = libc::pollfd {
+        fd: fds[0].fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let host_ready = unsafe { libc::poll(&mut host_pollfd, 1, 0) };
+    assert_eq!(
+        host_ready, 0,
+        "read-growth ET delivery must not rearm kqueue for already-latched bytes"
+    );
 
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
