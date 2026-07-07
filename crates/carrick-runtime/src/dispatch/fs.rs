@@ -5128,12 +5128,18 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
 
+            if crate::dispatch::fs::state::HOST_PIPE_FD_PRESSURE
+                .is_exhausted_by(this.io.open_files.read().len())
+            {
+                return Ok(DispatchOutcome::errno(linux_errno::EMFILE));
+            }
+
             // Allocate a real host pipe so the two ends share state via the
             // kernel and survive `libc::fork(2)` natively. macOS's `pipe(2)`
             // returns two fds: [0] read end, [1] write end.
             let mut host_fds = [0i32; 2];
-            if let Err(errno) = (unsafe { libc::pipe(host_fds.as_mut_ptr()) }).host_syscall_errno() {
-                return Ok(DispatchOutcome::errno(errno));
+            if (unsafe { libc::pipe(host_fds.as_mut_ptr()) }) != 0 {
+                return Ok(DispatchOutcome::errno(linux_errno::EMFILE));
             }
 
             let host_read = host_fds[0];

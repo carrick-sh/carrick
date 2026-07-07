@@ -25,6 +25,14 @@ impl PathOpenFdPressure {
 pub(in crate::dispatch) const PATH_OPEN_FD_PRESSURE: PathOpenFdPressure =
     PathOpenFdPressure::new(4 * 1024);
 
+/// Host-backed anonymous pipes consume real macOS pipe/file-descriptor
+/// resources. Carrick still advertises Docker's 1M Linux `RLIMIT_NOFILE`, but
+/// until pipe storage is synthetic or pooled we must fail fd-fill tests
+/// deterministically instead of spending the LTP timeout opening tens of
+/// thousands of host pipes and surfacing Darwin-specific errno shapes.
+pub(in crate::dispatch) const HOST_PIPE_FD_PRESSURE: PathOpenFdPressure =
+    PathOpenFdPressure::new(4 * 1024);
+
 #[derive(Debug, Clone)]
 pub(in crate::dispatch) struct DnotifyRegistration {
     pub(in crate::dispatch) fd: i32,
