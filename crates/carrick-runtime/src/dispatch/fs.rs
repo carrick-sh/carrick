@@ -6956,6 +6956,12 @@ impl SyscallDispatcher {
             let removed = this.io.open_files.write().remove(&fd.0);
             Ok(
                 if let Some(open_file) = removed {
+                    crate::event_ring::rec(
+                        crate::event_ring::FDCLOSE,
+                        fd.0,
+                        fd_helpers::event_ring_host_fd(&open_file),
+                        0,
+                    );
                     // Centralised close: frees the host fd and, for pty masters,
                     // removes the /dev/pts/N entry from the PtyTable so it becomes
                     // ENOENT — mirroring Linux devpts semantics. The same helper is
@@ -7018,6 +7024,12 @@ impl SyscallDispatcher {
                     this.io.splice_pushback.lock().remove(&fd);
                     this.detach_fd_from_epolls(fd);
                     if let Some(open_file) = this.io.open_files.write().remove(&fd) {
+                        crate::event_ring::rec(
+                            crate::event_ring::FDCLOSE,
+                            fd,
+                            fd_helpers::event_ring_host_fd(&open_file),
+                            0,
+                        );
                         // Centralised close so pty masters freed via close_range
                         // also drop their /dev/pts/N entry. open_files and pty_table
                         // are independent locks (no nesting), so deadlock-free.

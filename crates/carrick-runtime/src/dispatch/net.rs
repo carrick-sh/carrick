@@ -2055,12 +2055,27 @@ impl SyscallDispatcher {
                     accepted_source
                         .as_ref()
                         .map(|host_source| host_to_linux_sockaddr(host_source, family, false))
+                })
+                .or_else(|| {
+                    (family == libc::AF_UNIX).then(|| (LINUX_AF_UNIX as u16).to_ne_bytes().to_vec())
                 });
             let Some(linux_bytes) = linux_bytes else {
+                crate::event_ring::rec(
+                    crate::event_ring::ACCEPTERR,
+                    host_fd,
+                    new_host,
+                    LINUX_EFAULT.get(),
+                );
                 unsafe { libc::close(new_host) };
                 return DispatchOutcome::errno(LINUX_EFAULT);
             };
             if write_linux_sockaddr(memory, addr_addr, addrlen_addr, &linux_bytes).is_err() {
+                crate::event_ring::rec(
+                    crate::event_ring::ACCEPTERR,
+                    host_fd,
+                    new_host,
+                    LINUX_EFAULT.get(),
+                );
                 unsafe { libc::close(new_host) };
                 return DispatchOutcome::errno(LINUX_EFAULT);
             }
@@ -2072,8 +2087,15 @@ impl SyscallDispatcher {
         // carried by status_flags and serviced by WaitOnFds.
         set_host_nonblocking(new_host);
         if let Err(errno) = widen_stream_socket_buffers(new_host, family, type_) {
-            unsafe { libc::close(new_host) };
-            return DispatchOutcome::errno(errno);
+            crate::event_ring::rec(crate::event_ring::ACCEPTERR, host_fd, new_host, errno.get());
+            if family != LINUX_AF_UNIX {
+                unsafe { libc::close(new_host) };
+                return DispatchOutcome::errno(errno);
+            }
+            // Linux accept(2) does not fail because optional host-side buffer
+            // tuning failed. AF_UNIX accepted sockets can reject the larger Darwin
+            // buffer target intermittently; keep the connection and let normal
+            // nonblocking backpressure handle any smaller host buffer.
         }
         let status_flags = LINUX_O_RDWR | if nonblock { LINUX_O_NONBLOCK } else { 0 };
         let fd_flags = if cloexec { LINUX_FD_CLOEXEC } else { 0 };
@@ -2090,6 +2112,12 @@ impl SyscallDispatcher {
         let linux_fd = match self.install_fd_at_or_above(3, open_file) {
             Ok(fd) => fd,
             Err(_) => {
+                crate::event_ring::rec(
+                    crate::event_ring::ACCEPTERR,
+                    host_fd,
+                    new_host,
+                    linux_errno::EMFILE.get(),
+                );
                 return DispatchOutcome::errno(linux_errno::EMFILE);
             }
         };

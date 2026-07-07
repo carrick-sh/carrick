@@ -337,6 +337,9 @@ _EVENTRING_KINDS = {
     6: ("EPWAIT", lambda a, b, c: f"kq={a} ready={b} timeout={c}"),
     7: ("FORK", lambda a, b, c: f"child_pid={a}"),
     8: ("EXEC", lambda a, b, c: f"path_present={a}"),
+    9: ("FDOPEN", lambda a, b, c: f"gfd={a} hfd={b} minfd={c}"),
+    10: ("FDCLOSE", lambda a, b, c: f"gfd={a} hfd={b}"),
+    11: ("ACCEPTER", lambda a, b, c: f"listener_hfd={a} accepted_hfd={b} errno={c}"),
 }
 
 
