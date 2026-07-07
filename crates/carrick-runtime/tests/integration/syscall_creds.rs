@@ -388,7 +388,7 @@ fn rseq_reports_clean_bootstrap_fallback() {
 }
 
 #[test]
-fn membarrier_query_reports_no_bootstrap_commands() {
+fn membarrier_query_reports_supported_commands() {
     let mut memory = LinearMemory::new(0x4000, Vec::new());
     let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
@@ -404,7 +404,7 @@ fn membarrier_query_reports_no_bootstrap_commands() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Returned { value: 0 }
+        DispatchOutcome::Returned { value: 127 }
     );
     assert_eq!(
         dispatcher
@@ -439,9 +439,7 @@ fn membarrier_query_reports_no_bootstrap_commands() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno {
-            errno: LinuxErrno::new(22)
-        }
+        DispatchOutcome::Returned { value: 0 }
     );
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }

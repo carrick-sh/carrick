@@ -664,6 +664,7 @@ fn madvise_accepts_common_advice_for_mapped_ranges() {
     .unwrap();
     let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
+    publish_address_space_regions(&dispatcher, &memory);
 
     assert_eq!(
         dispatcher

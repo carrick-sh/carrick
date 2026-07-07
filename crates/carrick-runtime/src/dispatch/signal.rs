@@ -1388,7 +1388,7 @@ impl SyscallDispatcher {
             // a live thread but is NOT in tgid's group is ESRCH, even though a
             // plain tkill(tid) would have succeeded (LTP tgkill03 "Defunct
             // tgid": tgkill(defunct_tid, child_tid) with child_tid live).
-            if !names_self_pid(tgid) {
+            if !names_current_thread_group(cx, tgid) {
                 return Ok(DispatchOutcome::errno(LINUX_ESRCH));
             }
             if let Some((routed, _target)) = this.route_thread_signal(cx, tid, signum, true) {
@@ -1399,7 +1399,7 @@ impl SyscallDispatcher {
             // self-target here is the caller's ns-pid — not just host-pid/
             // bootstrap. (Sibling threads were already handled by
             // route_thread_signal above.)
-            let valid_self = names_self_pid(tgid) && names_self_pid(tid);
+            let valid_self = names_current_thread_group(cx, tgid) && names_self_pid(tid);
             if !valid_self {
                 return Ok(DispatchOutcome::errno(LINUX_ESRCH));
             }
@@ -2136,6 +2136,13 @@ fn names_self_pid(x: i64) -> bool {
     // The canonical self-check lives on NsPid; this i64 wrapper stays for the
     // signal handlers that hold a raw pid_t (tgkill/tkill).
     NsPid(x as i32).names_self()
+}
+
+fn names_current_thread_group<M: GuestMemory>(ctx: &SyscallCtx<'_, M>, x: i64) -> bool {
+    names_self_pid(x)
+        || ctx.thread.as_ref().is_some_and(|t| {
+            t.registry.main_tid() == crate::thread::ThreadId::from_guest_supplied_tid(x as i32)
+        })
 }
 
 /// The target of a host-routed (cross-process) signal send — the typed
