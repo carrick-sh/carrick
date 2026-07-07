@@ -399,11 +399,18 @@ fn kill_scoped(pid: i32, run_id: &str, engine: Engine, cleanup: Option<&CarrickC
             // Belt for a guest that escaped its group (setpgid/setsid): the
             // SCOPED kill.sh, which matches only `carrick:<run-id>` and refuses
             // a global reap. Best-effort (needs the sudoers entry).
-            let _ = Command::new("sudo")
+            let cleanup = Command::new("sudo")
                 .args(["-n", "scripts/sudo/kill.sh", run_id])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
+                .output();
+            if let Ok(output) = cleanup {
+                if !output.status.success() {
+                    eprintln!(
+                        "warning: scoped carrick cleanup failed for {run_id}: {}{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+            }
         }
         (Engine::Docker, _) => {
             let container = run_id.to_string();
