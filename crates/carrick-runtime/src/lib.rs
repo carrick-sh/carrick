@@ -864,6 +864,9 @@ pub mod runtime {
                         }
                     }
                 },
+                DispatchOutcome::BlockingRecordLock(lock) => {
+                    return Ok(crate::dispatch::drive_blocking_record_lock(&lock));
+                }
                 DispatchOutcome::WaitOnSignals {
                     wait_set,
                     block_mask,
