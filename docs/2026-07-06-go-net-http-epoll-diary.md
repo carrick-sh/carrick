@@ -1072,3 +1072,42 @@ Interpretation:
 - This records the current diff as a missing/deferred module facility plus
   container-oracle limitation, rather than spending this pass implementing Linux
   module loading/unloading on macOS.
+
+### creat05: bound fd-fill oracle to supported path-open pressure
+
+Hypotheses:
+
+- H1: `ltp-creat05` is not a creat errno bug. It is a mismatch between the
+  guest-visible fd table limit and Carrick's host-backed path-open pressure
+  guard.
+- H2: A symmetric `RLIMIT_NOFILE` bound lets the test exercise its intended
+  assertion without asking Carrick to keep one million host-backed path fds live.
+
+Tests:
+
+- Focused Carrick without a bound:
+  `target/conformance/logs/ltp-creat05-focus-012523.carrick.log`.
+  Carrick reports `getdtablesize() = 1048576`, then TBROKs when an open in the
+  setup loop reaches `creat05_4096` and gets `EMFILE`.
+- Focused Docker without a bound:
+  `target/conformance/logs/ltp-creat05-focus-012523.docker.log`.
+  Docker opens 1,048,573 additional fds and then passes the final
+  `creat() failed with EMFILE` assertion.
+- Focused Carrick and Docker with `ulimit -n 4096` before the test:
+  `target/conformance/logs/ltp-creat05-ulimit-012642.carrick.log` and
+  `target/conformance/logs/ltp-creat05-ulimit-012642.docker.log`.
+  Both report `getdtablesize() = 4096`, open 4093 additional fds, and pass the
+  final `EMFILE` assertion.
+
+Outcome:
+
+- Changed the `ltp-creat05` manifest command to
+  `ulimit -n 4096; /opt/ltp/testcases/bin/creat05`, matching the existing
+  symmetric bounding used by fd-fill dup suites.
+
+Interpretation:
+
+- The conformance suite now asks both engines the same bounded question. This is
+  not a general solution for guest programs that genuinely need one million
+  simultaneously open path-backed files; supporting that honestly would require
+  lazy/reopenable host-file backing instead of one live Darwin fd per guest fd.
