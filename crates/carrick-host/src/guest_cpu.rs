@@ -485,6 +485,35 @@ pub fn pending_adopted_child(waiter_pid: u32, target_pid: i32) -> Option<u32> {
     None
 }
 
+/// Snapshot direct, non-adopted children of `waiter_pid` that can be watched
+/// with host `EVFILT_PROC`/`NOTE_EXIT`.
+///
+/// Adopted children are deliberately excluded: their guest parent is no longer
+/// the host parent, so the host kernel cannot deliver their exit to this waiter.
+/// Those stay on the adopted-child table path.
+pub fn direct_children_for_wait(waiter_pid: u32) -> Vec<u32> {
+    let Some(slots) = child_slots() else {
+        return Vec::new();
+    };
+    let mut children = Vec::new();
+    for slot in slots {
+        let pid = slot.pid.load(Ordering::Acquire);
+        if pid == 0 {
+            continue;
+        }
+        if slot.adopted.load(Ordering::Acquire) != 0 {
+            continue;
+        }
+        if slot.parent_pid.load(Ordering::Acquire) != u64::from(waiter_pid) {
+            continue;
+        }
+        if let Ok(pid) = u32::try_from(pid) {
+            children.push(pid);
+        }
+    }
+    children
+}
+
 /// Drain a reaped child's published guest CPU nanoseconds (0 if none), freeing
 /// the slot. Called from the parent's `wait4` after a successful reap.
 pub fn reap_child_guest_ns(pid: u32) -> u64 {
@@ -605,5 +634,27 @@ mod tests {
             reap_adopted_child(parent, child as i32),
             Some((child, 0x2a00, 9876))
         );
+    }
+
+    #[test]
+    fn direct_children_for_wait_excludes_adopted_children() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        init_child_table();
+        let parent = 616_161;
+        let direct = 616_162;
+        let adopted = 616_163;
+
+        let _ = reap_child_guest_ns(direct);
+        let _ = reap_child_guest_ns(adopted);
+        register_child_with_parent(direct, parent, 0);
+        register_clone_parent_child(adopted, parent, 0);
+
+        let children = direct_children_for_wait(parent);
+        assert!(children.contains(&direct));
+        assert!(!children.contains(&adopted));
+
+        let _ = reap_child_guest_ns(direct);
+        record_child_exit_status(adopted, 0, 0, true);
+        let _ = reap_adopted_child(parent, adopted as i32);
     }
 }
