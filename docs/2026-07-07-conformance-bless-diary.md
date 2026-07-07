@@ -824,3 +824,83 @@ Outcome:
 `ltp-setpgid03` now matches the Docker oracle: Carrick `3/3`, Docker `3/3`,
 with Carrick at 940ms vs the cached oracle's 812ms (`1.16x`). The original
 ten-second timeout and the follow-on errno mismatch are both closed.
+
+## 2026-07-07 06:24 - full bless after setpgid03
+
+Command:
+
+```sh
+target/release/carrick-conformance --tier full --bless \
+  --jsonl target/conformance/bless-after-setpgid-061849.jsonl
+```
+
+Outcome:
+
+- The run stopped at fail-fast with 51 cached-oracle gating verdicts.
+- `ltp-setpgid03` no longer appeared in the gating or slow tables.
+- `ltp-futex_cmp_requeue01` became the highest-leverage next row because it was
+  both gating and over the 10x full-run timing threshold: Carrick `6/7`, Docker
+  `7/7`, `12341ms/1214ms` (`10.17x`).
+
+Focused futex evidence:
+
+- Initial focused run `target/conformance/futex-cmp-requeue01-focus-062523.jsonl`
+  reproduced the semantic failure: Carrick `6/7`, Docker `7/7`.
+- Raw log `target/conformance/raw/conf-85605-c00.err` showed the failing case:
+  100 waiters, 50 wakes, 50 requeues; Carrick returned 99 and the test observed
+  49 requeued waiters.
+- Three immediate focused repeats
+  `futex-cmp-requeue01-repeat{1,2,3}-*.jsonl` all matched at about 6x.
+
+Hypothesis:
+
+This is a load-sensitive shared-futex requeue race, not a deterministic missing
+operation. The suspicious layer is the HVF/macOS shared futex side table:
+Darwin has no atomic futex requeue, so Carrick wakes source waiters physically
+and lets each waiter consume either a wake credit or a requeue credit. Under
+load, at least one child can miss the first physical wake/credit handoff.
+
+## 2026-07-07 06:32 - rejected shared-futex logical-credit patch
+
+Hypothesis:
+
+Credit destination requeues logically at syscall time and let source waiters
+notice a pending requeue decision between 20ms wait slices. This should make a
+missed `os_sync` source wake converge to the same destination-futex visibility
+Linux provides atomically.
+
+Tests:
+
+- Added a generic unit check for consuming a pending requeue decision before
+  another host wait slice.
+- `cargo test -p carrick-thread pending_requeue_decision_completes_before_next_wait_slice --lib`
+  passed.
+- `cargo check -p carrick-host -p carrick-thread -p carrick-vmm-hvf -p carrick-runtime`
+  passed.
+- `just build` rebuilt and re-signed `target/release/carrick`.
+- Five focused repeats `futex-cmp-requeue01-credit{1..5}-*.jsonl` all matched,
+  still around 6x the cached oracle.
+- Full bless attempt:
+  `target/conformance/bless-after-futex-credit-063234.jsonl`.
+
+Outcome:
+
+The patch was rejected and reverted. Under full load it made the large cases
+worse: `ltp-futex_cmp_requeue01` reported Carrick `5/39` vs Docker `7/7`.
+The raw log `target/conformance/raw/conf-22334-c398.err` showed the 100-waiter
+case passing, but the 1000-waiter cases lost many children to `ETIMEDOUT`.
+
+Conclusion:
+
+The durable fix needs a stronger requeue architecture than "logical destination
+credits plus a source-slice poll." The next attempt should preserve the proven
+focused behavior while making the source-to-destination handoff robust for
+large wait sets under full HVF load. Options to evaluate before editing again:
+
+- instrument the side table with `carrick trace`/USDT counters for entered,
+  physically woken, wake-credit, requeue-credit, destination logical count, and
+  timed-out waiters;
+- model requeued waiters as first-class side-table records rather than credits
+  consumed by physically woken source waiters;
+- run the smallest deterministic child-fanout reducer that reproduces the
+  100/1000-waiter load case outside the full LTP harness.
