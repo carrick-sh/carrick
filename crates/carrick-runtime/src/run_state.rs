@@ -287,6 +287,31 @@ fn claim_record(section: &ProcessSection, id: u32, want: u64, want_tid: bool) ->
         return r;
     }
 
+    // One record per PROCESS: a fork child's metadata record (host pid
+    // published by pre-fork registration, run_state still empty) is THIS
+    // process's record — write the run-state word into it instead of claiming
+    // a duplicate. A duplicate has no owner to release it (storm leak) and
+    // makes pid lookups order-dependent (first-match flip). TID entries stay
+    // their own records: a worker tid is not a process.
+    if !want_tid {
+        for (index, record) in section.records.iter().enumerate() {
+            if record.host_pid.load(Ordering::Acquire) != id {
+                continue;
+            }
+            let generation = record.generation.load(Ordering::Acquire);
+            if generation == 0 {
+                continue;
+            }
+            if record.run_state.load(Ordering::Acquire) == 0 {
+                record.run_state.store(want, Ordering::Release);
+                return ProcessRecordRef {
+                    index,
+                    generation: ProcessGeneration::new(generation),
+                };
+            }
+        }
+    }
+
     let generation = KernelArena::global().allocate_generation();
     match section.claim(Some(HostPid::new(id)), generation, |record| {
         record.run_state.store(want, Ordering::Relaxed);
@@ -369,6 +394,40 @@ pub fn published_stat_char(pid: u32) -> Option<char> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn publish_adopts_the_existing_process_record() {
+        // A fork child's metadata record (host pid published, run_state empty)
+        // already exists when the run-state publish happens. The publish must
+        // write INTO that record — one record per process — not claim a
+        // duplicate whose lifetime nothing manages (the storm-leak /
+        // first-match-flip hazard).
+        let pid = 0x51F0_0001u32;
+        let section = processes();
+        let generation = KernelArena::global().allocate_generation();
+        let meta = match section.claim(Some(HostPid::new(pid)), generation, |record| {
+            record
+                .parent_host_pid
+                .store(1, std::sync::atomic::Ordering::Relaxed);
+        }) {
+            Ok(r) => r,
+            Err(err) => unreachable!("claim metadata record: {err:?}"),
+        };
+
+        publish_for(pid, RunState::Booting);
+        assert_eq!(published(pid), Some(RunState::Booting));
+        let live = section
+            .records
+            .iter()
+            .filter(|record| {
+                record.host_pid.load(Ordering::Acquire) == pid
+                    && record.generation.load(Ordering::Acquire) != 0
+            })
+            .count();
+        assert_eq!(live, 1, "run-state publish must adopt, not duplicate");
+
+        section.release(meta);
+    }
 
     #[test]
     fn encode_decode_roundtrips() {
