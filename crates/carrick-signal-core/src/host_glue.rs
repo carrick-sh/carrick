@@ -53,15 +53,14 @@ extern "C" fn shared_routed_handler<G: HostSignalGlue>(
 ) {
     let linux_signum = G::host_to_linux(host_signum);
     if !info.is_null() {
-        // si_code > 0 ⇒ hardware/kernel-generated (a real fault at the faulting
-        // PC), i.e. carrick's OWN bug: restore the default disposition and return
-        // so the process crashes visibly with the true signal. si_code <= 0 ⇒
-        // SI_USER/SI_QUEUE/SI_TKILL, sent by another process ⇒ route to the guest.
-        // `is_synchronous_self_fault` is `false` for every backend whose guest
-        // faults are vmexits (KVM/bhyve/NVMM), so this is a no-op there; HVF
-        // overrides it for the fault set it routes.
+        // Hardware/kernel-generated host faults are carrick's OWN bug: restore
+        // the default disposition and return so the process crashes visibly with
+        // the true signal. Async sender signals route to the guest. Darwin's
+        // AArch64 `brk` trap reports `(si_code=0, si_pid=0)`, so the backend
+        // classifier receives both fields rather than relying on `si_code > 0`.
         let si_code = unsafe { (*info).si_code };
-        if G::is_synchronous_self_fault(linux_signum, si_code) {
+        let si_pid = unsafe { (*info).si_pid() };
+        if G::is_synchronous_self_fault(linux_signum, si_code, si_pid) {
             // SAFETY: zeroed sigaction with SIG_DFL is the documented default
             // disposition form; signal-safe.
             unsafe {
@@ -72,10 +71,8 @@ extern "C" fn shared_routed_handler<G: HostSignalGlue>(
             }
             return;
         }
-        // SAFETY: the kernel hands a valid siginfo_t to an SA_SIGINFO handler;
-        // `si_pid()` reads the POSIX union member. `record_sender` is one atomic
-        // store — async-signal-safe.
-        crate::record_sender(linux_signum, unsafe { (*info).si_pid() });
+        // `record_sender` is one atomic store — async-signal-safe.
+        crate::record_sender(linux_signum, si_pid);
     }
     if let Some(bit) = crate::pending_bit(linux_signum) {
         crate::proc_pending_fetch_or(bit);

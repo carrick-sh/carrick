@@ -986,11 +986,14 @@ impl carrick_signal_core::HostSignalGlue for HvfGlue {
 
     /// A real synchronous CPU fault (carrick's OWN bug, must crash visibly): the
     /// Linux fault set SIGILL(4)/SIGTRAP(5)/SIGBUS(7)/SIGFPE(8)/SIGSEGV(11) with a
-    /// kernel-generated `si_code > 0`. (NOT SIGABRT(6) — it was not in the
-    /// historical `handle_routed` host set.) An async cross-process `kill` carries
-    /// `si_code <= 0` and is routed to the guest.
-    fn is_synchronous_self_fault(linux_signum: i32, si_code: i32) -> bool {
-        matches!(linux_signum, 4 | 5 | 7 | 8 | 11) && si_code > 0
+    /// kernel-generated code. Darwin reports AArch64 `brk` as SIGTRAP with
+    /// `(si_code=0, si_pid=0)`, so include that no-sender shape too. (NOT
+    /// SIGABRT(6) — it was not in the historical `handle_routed` host set.) An
+    /// async cross-process `kill` carries sender identity and is routed to the
+    /// guest.
+    fn is_synchronous_self_fault(linux_signum: i32, si_code: i32, si_pid: i32) -> bool {
+        matches!(linux_signum, 4 | 5 | 7 | 8 | 11)
+            && (si_code > 0 || (linux_signum == 5 && si_code == 0 && si_pid == 0))
     }
 }
 
@@ -1430,6 +1433,22 @@ mod tests {
             assert!(!signal_is_blocked(libc::SIGTRAP));
         }
         assert_eq!(signal_is_blocked(libc::SIGUSR1), before);
+    }
+
+    #[test]
+    fn darwin_brk_trap_is_classified_as_host_fault() {
+        use carrick_signal_core::HostSignalGlue;
+
+        assert!(
+            HvfGlue::is_synchronous_self_fault(5, 0, 0),
+            "Darwin AArch64 brk reports SIGTRAP as si_code=0, si_pid=0"
+        );
+        assert!(
+            !HvfGlue::is_synchronous_self_fault(5, 0, 44_001),
+            "a sender pid still routes as an async guest signal"
+        );
+        assert!(HvfGlue::is_synchronous_self_fault(11, 1, 0));
+        assert!(!HvfGlue::is_synchronous_self_fault(6, 0, 0));
     }
 
     #[test]
