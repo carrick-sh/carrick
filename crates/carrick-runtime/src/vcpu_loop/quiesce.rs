@@ -16,6 +16,16 @@ pub(crate) fn pt_barrier() -> &'static crate::fork_quiesce::PtQuiesce {
     crate::fork_quiesce::pt_barrier()
 }
 
+pub(super) struct ForkRequest {
+    pub(super) pidfd_out: Option<u64>,
+    pub(super) clone_parent: bool,
+    pub(super) parent_tid_addr: Option<u64>,
+    pub(super) child_tid_addr: Option<u64>,
+    pub(super) exit_signal: u32,
+    pub(super) child_stack: u64,
+    pub(super) vfork: Option<u64>,
+}
+
 impl<E: ThreadedEngine + 'static> ThreadRuntimeState<E>
 where
     E::SiblingSpec: 'static,
@@ -89,14 +99,17 @@ where
         &mut self,
         kernel: &Kernel,
         engine: &mut E,
-        pidfd_out: Option<u64>,
-        clone_parent: bool,
-        parent_tid_addr: Option<u64>,
-        child_tid_addr: Option<u64>,
-        exit_signal: u32,
-        child_stack: u64,
-        vfork: Option<u64>,
+        request: ForkRequest,
     ) -> Result<Option<i64>, RuntimeError> {
+        let ForkRequest {
+            pidfd_out,
+            clone_parent,
+            parent_tid_addr,
+            child_tid_addr,
+            exit_signal,
+            child_stack,
+            vfork,
+        } = request;
         // vfork (CLONE_VM|CLONE_VFORK): the child SHARES the parent's guest RAM
         // (engine.fork_vfork() below) and the parent vCPU is SUSPENDED here until
         // the child execve's or exits (Parent arm below). An ordinary fork keeps

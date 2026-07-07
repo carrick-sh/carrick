@@ -1762,13 +1762,15 @@ where
                     if let Some(retval) = state.handle_fork(
                         &kernel,
                         &mut engine,
-                        pidfd_out,
-                        clone_parent,
-                        parent_tid_addr,
-                        child_tid_addr,
-                        exit_signal,
-                        child_stack,
-                        vfork,
+                        quiesce::ForkRequest {
+                            pidfd_out,
+                            clone_parent,
+                            parent_tid_addr,
+                            child_tid_addr,
+                            exit_signal,
+                            child_stack,
+                            vfork,
+                        },
                     )? {
                         last_syscall_retval = Some(state.complete_returned(&mut engine, retval)?);
                     }
