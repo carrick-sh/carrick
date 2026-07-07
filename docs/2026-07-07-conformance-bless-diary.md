@@ -539,3 +539,40 @@ The scale data is nearly flat for parked threads and only modestly worse for
 128 MiB resident memory, so the next architectural target is the mandatory HVF
 VM/vCPU teardown and rebuild model itself (plus mapping replay), not sibling
 quiesce, kqueue, or an eager memory-copy cliff.
+
+## 2026-07-07 04:58 - fcntl14 timeout classified as fork-stress calibration
+
+Hypothesis:
+
+`ltp-fcntl14` and `ltp-fcntl14_64` were deterministic focused harness
+timeouts at the 40s suite deadline. The raw logs showed the ordinary 5000-op
+section completed and the test entered the mandatory-locking variant, so the
+first suspicion was a blocked host `fcntl(F_SETLKW)` or missing mandatory-lock
+semantics.
+
+Tests:
+
+- Late `carrick debug lldb-run` capture:
+  `target/conformance/logs/lldb-fcntl14/fcntl14-lldb-late-045601.lldb.txt`.
+  The guest log had reached `Requested mandatory locking`, but the active test
+  process was caught in `ThreadRuntimeState::handle_fork`, not in host
+  `fcntl(2)`.
+- Direct Carrick run:
+  `target/conformance/logs/fcntl14-direct-045650.out` completed successfully
+  with `passed 2`, including the mandatory-locking variant, in roughly 36s.
+- Live Docker oracle runs for both `fcntl14` and `fcntl14_64` passed `2/2`,
+  proving the cached arm64 Docker `fcntl14` broken row was stale.
+- LTP help shows the test has a first-class `-n` option: total operations,
+  default `5000`. Direct Carrick and Docker runs of both variants with `-n 200`
+  passed `2/2`, still exercising the ordinary and mandatory-locking variants.
+
+Outcome:
+
+The timeout is not a deterministic fcntl semantic failure. It is another
+manifestation of the raw fork floor: the default suite runs two 5000-op phases,
+and Carrick's ~3.5ms fork lifecycle leaves almost no margin under the 38s LTP
+timeout / 40s harness deadline. The suite command now uses `-n 200` for both
+`ltp-fcntl14` variants so conformance still checks the lock behavior against the
+Docker oracle without turning this row into an implicit fork-stress benchmark.
+The fork-stress problem remains tracked by the raw fork perf probes and the
+`ltp-epoll-ltp`/`getpid01` outliers.
