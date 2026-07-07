@@ -356,7 +356,15 @@ git commit -m "feat(runtime): pre-fork child registration eliminates the post-fo
 
 ### Task 7: Gate + diary
 
-- [ ] **Step 1:** `just ci`, then a full cached-oracle measurement: `target/release/carrick-conformance --tier full --force --jsonl target/conformance/after-process-section.jsonl`. Compare gating set against `target/conformance/full-after-xattr-084615.jsonl` — the gating set must be equal or smaller; any NEW gating row is a regression to fix before commit.
+- [ ] **Step 1:** `just ci`, then a full cached-oracle measurement: `target/release/carrick-conformance --tier full --force --jsonl target/conformance/after-process-section.jsonl`. Compare gating set against `target/conformance/full-after-xattr-084615.jsonl` — the gating set must be equal or smaller; any stable NEW gating row is a regression to fix before commit.
+  - B7 measurement policy, added after the first two process-section full runs
+    exposed same-binary full-gate churn: an apparent NEW row may be excluded
+    from the B7 regression set only when a focused rerun of that exact suite on
+    the same binary recovers to non-gating and the diary records the artifact
+    path. For rows that need a broad rerun, use the harness' existing
+    `--flake-retries 1` mechanism and compare the post-retry gating set; rows
+    that remain gating after retry are still regressions. Do not add a
+    known-gap marker just to pass B7.
 - [ ] **Step 2:** Diary entry (current conformance diary): tables consolidated, capacities unified at 4096, pre-fork registration landed, race-class deletions listed, measurement results.
 - [ ] **Step 3:** Commit docs.
 
