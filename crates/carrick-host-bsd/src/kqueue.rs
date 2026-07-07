@@ -184,6 +184,19 @@ impl Kevent {
         Self::new(fd as usize, libc::EVFILT_READ, flags, 0)
     }
 
+    pub fn read_lowat(fd: RawFd, flags: KeventFlags, lowat: u64) -> Self {
+        let mut ev = Self::new(fd as usize, libc::EVFILT_READ, flags, libc::NOTE_LOWAT);
+        #[cfg(any(target_os = "macos", target_os = "dragonfly"))]
+        {
+            ev.0.data = lowat.min(isize::MAX as u64) as isize;
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "dragonfly")))]
+        {
+            ev.0.data = lowat.min(i64::MAX as u64) as i64;
+        }
+        ev
+    }
+
     pub fn write(fd: RawFd, flags: KeventFlags) -> Self {
         Self::new(fd as usize, libc::EVFILT_WRITE, flags, 0)
     }

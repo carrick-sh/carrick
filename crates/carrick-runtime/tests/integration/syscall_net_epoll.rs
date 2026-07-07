@@ -1914,6 +1914,53 @@ fn epoll_wakes_accepted_socket_after_peer_write() {
     }
     assert!(saw_accepted_out);
 
+    let outcome = dispatcher
+        .dispatch(
+            SyscallRequest::new(22, SyscallArgs::from([4, 0x5100, 8, 25, 0, 0])),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+    match outcome {
+        DispatchOutcome::WaitOnPollFds {
+            fds,
+            timeout,
+            on_timeout,
+            sig_mask,
+        } => {
+            assert_eq!(fds.len(), 1);
+            assert_eq!(timeout, Some(std::time::Duration::from_millis(25)));
+            assert_eq!(on_timeout, 0);
+            assert_eq!(sig_mask.raw_block_bits(), 0);
+            if fds[0].events() & libc::POLLIN != 0 {
+                let mut host_pollfd = libc::pollfd {
+                    fd: fds[0].fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let host_ready = unsafe { libc::poll(&mut host_pollfd, 1, 0) };
+                assert_eq!(
+                    host_ready, 0,
+                    "latched accepted-socket EPOLLOUT must not leave the epoll kqueue fd readable"
+                );
+            }
+        }
+        DispatchOutcome::WaitOnFds {
+            fds,
+            timeout,
+            on_timeout,
+            sig_mask,
+        } => {
+            assert!(fds.is_empty());
+            assert_eq!(timeout, Some(std::time::Duration::from_millis(25)));
+            assert_eq!(on_timeout, 0);
+            assert_eq!(sig_mask.raw_block_bits(), 0);
+        }
+        other => panic!(
+            "expected timed epoll wait handoff after latched accepted EPOLLOUT, got {other:?}"
+        ),
+    }
+
     set_tcp_keepidle(&mut dispatcher, &mut memory, &reporter, 5, 0x5400);
     set_tcp_keepidle(&mut dispatcher, &mut memory, &reporter, accepted_fd, 0x5410);
 
@@ -1952,6 +1999,53 @@ fn epoll_wakes_accepted_socket_after_peer_write() {
         }
     }
     assert!(saw_accepted_in);
+
+    let outcome = dispatcher
+        .dispatch(
+            SyscallRequest::new(22, SyscallArgs::from([4, 0x5100, 8, 25, 0, 0])),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+    match outcome {
+        DispatchOutcome::WaitOnPollFds {
+            fds,
+            timeout,
+            on_timeout,
+            sig_mask,
+        } => {
+            assert_eq!(fds.len(), 1);
+            assert_eq!(timeout, Some(std::time::Duration::from_millis(25)));
+            assert_eq!(on_timeout, 0);
+            assert_eq!(sig_mask.raw_block_bits(), 0);
+            if fds[0].events() & libc::POLLIN != 0 {
+                let mut host_pollfd = libc::pollfd {
+                    fd: fds[0].fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let host_ready = unsafe { libc::poll(&mut host_pollfd, 1, 0) };
+                assert_eq!(
+                    host_ready, 0,
+                    "latched accepted-socket ET readiness must not leave the epoll kqueue fd readable"
+                );
+            }
+        }
+        DispatchOutcome::WaitOnFds {
+            fds,
+            timeout,
+            on_timeout,
+            sig_mask,
+        } => {
+            assert!(fds.is_empty());
+            assert_eq!(timeout, Some(std::time::Duration::from_millis(25)));
+            assert_eq!(on_timeout, 0);
+            assert_eq!(sig_mask.raw_block_bits(), 0);
+        }
+        other => {
+            panic!("expected timed epoll wait handoff after latched accepted socket, got {other:?}")
+        }
+    }
 
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }

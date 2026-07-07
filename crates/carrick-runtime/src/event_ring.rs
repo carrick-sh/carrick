@@ -60,6 +60,8 @@ pub const EXEC: u8 = 8;
 pub const FDOPEN: u8 = 9;
 pub const FDCLOSE: u8 = 10;
 pub const ACCEPTERR: u8 = 11;
+pub const EPWFD: u8 = 12;
+pub const EPMASK: u8 = 13;
 
 #[cfg(feature = "event-ring-dump")]
 fn dir() -> Option<&'static str> {
@@ -150,6 +152,8 @@ fn decode(kind: u8, a: i32, b: i32, c: i32) -> String {
         FDOPEN => format!("FDOPEN   gfd={a} hfd={b} minfd={c}"),
         FDCLOSE => format!("FDCLOSE  gfd={a} hfd={b}"),
         ACCEPTERR => format!("ACCEPTER listener_hfd={a} accepted_hfd={b} errno={c}"),
+        EPWFD => format!("EPWFD    fd={a} events={b:#x} timeout={c}"),
+        EPMASK => format!("EPMASK   origin={a} raw={b:#x} last={c:#x}"),
         _ => String::new(),
     }
 }

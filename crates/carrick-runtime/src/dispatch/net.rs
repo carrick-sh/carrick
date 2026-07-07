@@ -368,6 +368,16 @@ impl SyscallDispatcher {
         )
     }
 
+    fn fd_supports_read_lowat(&self, fd: i32) -> bool {
+        let Some(open_file) = self.open_file(fd) else {
+            return false;
+        };
+        matches!(
+            &*open_file.description.read(),
+            OpenDescription::HostPipe { .. } | OpenDescription::HostSocket { .. }
+        )
+    }
+
     fn epoll_path_reaches(
         &self,
         current_fd: i32,
@@ -400,6 +410,7 @@ impl SyscallDispatcher {
         fd: i32,
         events: u32,
         last_ready: u32,
+        last_read_avail: u64,
         write_backpressured: bool,
     ) -> carrick_hal::event::Interest {
         // Wire→typed seam: the guest event word is a raw u32; epoll ACCEPTS
@@ -418,6 +429,14 @@ impl SyscallDispatcher {
             && !write_backpressured
         {
             interest.write = false;
+        }
+        if events & LINUX_EPOLLET != 0
+            && interest.read
+            && last_ready & LINUX_EPOLLIN != 0
+            && last_read_avail > 0
+            && self.fd_supports_read_lowat(fd)
+        {
+            interest.read_lowat = Some(last_read_avail.saturating_add(1));
         }
         // A one-way pipe/FIFO read end is never writable under Linux, so it must
         // never carry a write filter. FreeBSD's kqueue arms `EVFILT_WRITE` on a
@@ -451,6 +470,7 @@ impl SyscallDispatcher {
         let mut survivor: Option<(i32, u32)> = None;
         let mut union_events = 0u32;
         let mut union_interest = carrick_hal::event::Interest::default();
+        let mut read_lowat: Option<Option<u64>> = None;
         for (&other, slot) in interest.iter() {
             if self.host_fd_for_poll(other) != Some(host_fd) {
                 continue;
@@ -461,12 +481,22 @@ impl SyscallDispatcher {
                 other,
                 slot.event.events,
                 slot.last_ready,
+                slot.last_read_avail,
                 slot.write_backpressured,
             );
             union_interest.read |= effective.read;
             union_interest.write |= effective.write;
             union_interest.oob |= effective.oob;
+            if effective.read {
+                read_lowat = match (read_lowat, effective.read_lowat) {
+                    (None, lowat) => Some(lowat),
+                    (Some(Some(current)), Some(next)) => Some(Some(current.min(next))),
+                    (Some(_), None) => Some(None),
+                    (current, Some(_)) => current,
+                };
+            }
         }
+        union_interest.read_lowat = read_lowat.flatten();
         let (survivor_fd, survivor_gen) = survivor.unwrap_or((-1, 0));
         let effective_bits = u32::from(union_interest.read)
             | (u32::from(union_interest.write) << 1)
@@ -2467,16 +2497,16 @@ mod epoll_interest_tests {
         let dispatcher = SyscallDispatcher::new();
         let events = LINUX_EPOLLET | LINUX_EPOLLIN | LINUX_EPOLLOUT;
 
-        let fresh = dispatcher.epoll_effective_interest(12345, events, 0, false);
+        let fresh = dispatcher.epoll_effective_interest(12345, events, 0, 0, false);
         assert!(fresh.read);
         assert!(fresh.write);
 
-        let latched = dispatcher.epoll_effective_interest(12345, events, LINUX_EPOLLOUT, false);
+        let latched = dispatcher.epoll_effective_interest(12345, events, LINUX_EPOLLOUT, 0, false);
         assert!(latched.read);
         assert!(!latched.write);
 
         let backpressured =
-            dispatcher.epoll_effective_interest(12345, events, LINUX_EPOLLOUT, true);
+            dispatcher.epoll_effective_interest(12345, events, LINUX_EPOLLOUT, 0, true);
         assert!(backpressured.read);
         assert!(backpressured.write);
 
@@ -2484,6 +2514,7 @@ mod epoll_interest_tests {
             12345,
             LINUX_EPOLLIN | LINUX_EPOLLOUT,
             LINUX_EPOLLOUT,
+            0,
             false,
         );
         assert!(level.read);
@@ -2564,7 +2595,7 @@ impl SyscallDispatcher {
             // guest_fd -> (accumulated epoll events, epoll_data); read+write filters
             // for the same fd merge into one returned event.
             let mut acc: HashMap<i32, (u32, u64)> = HashMap::new();
-            let mut ready_updates: Vec<(i32, u32, u32, Option<u64>, bool)> = Vec::new();
+            let mut ready_updates: Vec<(i32, u32, u32, Option<u64>, bool, bool, bool)> = Vec::new();
             let mut host_ready_sampled = std::collections::HashSet::<i32>::new();
             const READ_READY_BITS: u32 =
                 LINUX_EPOLLIN | LINUX_EPOLLRDHUP | LINUX_EPOLLHUP | LINUX_EPOLLERR;
@@ -2736,12 +2767,15 @@ impl SyscallDispatcher {
                                 } else {
                                     Some(observed_read_avail)
                                 };
+                                let masked_ready = ready_events == 0 && raw != 0;
                                 ready_updates.push((
                                     gfd,
                                     reg_gen,
                                     raw,
                                     read_avail_update,
                                     clear_write_backpressure,
+                                    true,
+                                    masked_ready,
                                 ));
                                 crate::probes::epoll_interest(
                                     epfd,
@@ -2751,7 +2785,13 @@ impl SyscallDispatcher {
                                     last_ready,
                                     ready_events,
                                 );
-                                if ready_events == 0 && raw != 0 {
+                                if masked_ready {
+                                    crate::event_ring::rec(
+                                        crate::event_ring::EPMASK,
+                                        1,
+                                        raw as i32,
+                                        last_ready as i32,
+                                    );
                                     crate::probes::epoll_masked(crate::probes::EpollMaskedProbe {
                                         origin: 1,
                                         fd: gfd,
@@ -2823,12 +2863,15 @@ impl SyscallDispatcher {
                 } else {
                     Some(read_avail)
                 };
+                let masked_ready = ready_events == 0 && raw_ready != 0;
                 ready_updates.push((
                     *fd,
                     interest.reg_gen,
                     raw_ready,
                     read_avail_update,
                     clear_write_backpressure,
+                    false,
+                    masked_ready,
                 ));
                 crate::probes::epoll_interest(
                     epfd,
@@ -2838,7 +2881,13 @@ impl SyscallDispatcher {
                     interest.last_ready,
                     ready_events,
                 );
-                if ready_events == 0 && raw_ready != 0 {
+                if masked_ready {
+                    crate::event_ring::rec(
+                        crate::event_ring::EPMASK,
+                        2,
+                        raw_ready as i32,
+                        interest.last_ready as i32,
+                    );
                     let host_fd = this
                         .host_fd_for_poll(*fd)
                         .map_or(-1, |host_fd| host_fd.get());
@@ -2881,7 +2930,15 @@ impl SyscallDispatcher {
                 } else {
                     raw_ready
                 };
-                ready_updates.push((*fd, interest.reg_gen, raw_ready, Some(0), false));
+                ready_updates.push((
+                    *fd,
+                    interest.reg_gen,
+                    raw_ready,
+                    Some(0),
+                    false,
+                    false,
+                    false,
+                ));
                 crate::probes::epoll_interest(
                     epfd,
                     *fd,
@@ -2891,6 +2948,12 @@ impl SyscallDispatcher {
                     ready_events,
                 );
                 if ready_events == 0 && raw_ready != 0 {
+                    crate::event_ring::rec(
+                        crate::event_ring::EPMASK,
+                        3,
+                        raw_ready as i32,
+                        interest.last_ready as i32,
+                    );
                     crate::probes::epoll_masked(crate::probes::EpollMaskedProbe {
                         origin: 3,
                         fd: *fd,
@@ -2934,7 +2997,16 @@ impl SyscallDispatcher {
                         feature = "platform-netbsd"
                     ))]
                     let mut host_rearms: Vec<i32> = Vec::new();
-                    for (fd, reg_gen, raw, read_avail, clear_write_backpressure) in ready_updates {
+                    for (
+                        fd,
+                        reg_gen,
+                        raw,
+                        read_avail,
+                        clear_write_backpressure,
+                        edge_drained,
+                        masked_ready,
+                    ) in ready_updates
+                    {
                         if let Some(slot) = interest.get_mut(&fd) {
                             if slot.reg_gen != reg_gen {
                                 continue;
@@ -2955,7 +3027,10 @@ impl SyscallDispatcher {
                                 feature = "platform-netbsd"
                             ))]
                             if slot.event.events & LINUX_EPOLLET != 0
-                                && (before != raw || read_avail_changed)
+                                && (edge_drained
+                                    || masked_ready
+                                    || before != raw
+                                    || read_avail_changed)
                                 && let Some(host_fd) = this.host_fd_for_poll(fd)
                             {
                                 host_rearms.push(host_fd.get());
@@ -3047,6 +3122,7 @@ impl SyscallDispatcher {
                     // backstop as an interruptible retry sleep while preserving
                     // the guest deadline.
                     crate::probes::epoll_result(epfd, 0, 1, timeout_ms, 2);
+                    crate::event_ring::rec(crate::event_ring::EPWFD, kq_fd, 0, timeout_ms);
                     return Ok(DispatchOutcome::WaitOnPollFds {
                         fds: WaitFds::raw_one(kq_fd, 0),
                         timeout,
@@ -3059,6 +3135,7 @@ impl SyscallDispatcher {
                     // timeout + signal interruption, not return 0 immediately.
                     // There is no instance-fd readiness to wait for.
                     crate::probes::epoll_result(epfd, 0, 1, timeout_ms, 2);
+                    crate::event_ring::rec(crate::event_ring::EPWFD, -1, 0, timeout_ms);
                     return Ok(DispatchOutcome::WaitOnFds {
                         fds: WaitFds::empty(),
                         timeout,
@@ -3068,6 +3145,12 @@ impl SyscallDispatcher {
                 }
                 crate::probes::epoll_result(epfd, 0, 1, timeout_ms, 1);
                 crate::probes::epoll_wait_fd(epfd, -1, kq_fd, libc::POLLIN as i32, timeout_ms);
+                crate::event_ring::rec(
+                    crate::event_ring::EPWFD,
+                    kq_fd,
+                    libc::POLLIN as i32,
+                    timeout_ms,
+                );
                 // Poll the instance kqueue fd for readability. This avoids nesting
                 // the epoll kqueue inside the per-thread kqueue, and unlike calling
                 // kevent() here it does not consume pending epoll events before the
@@ -3237,7 +3320,7 @@ impl SyscallDispatcher {
                     let reg_gen = next_epoll_reg_gen();
                     if let Some(host_fd) = host_fd {
                         let ev_events = event.events;
-                        let effective = this.epoll_effective_interest(fd, ev_events, 0, false);
+                        let effective = this.epoll_effective_interest(fd, ev_events, 0, 0, false);
                         let register = kqueue.with_mux(|mux| {
                             mux.register_io(
                                 host_fd.get(),
@@ -3290,7 +3373,8 @@ impl SyscallDispatcher {
                     // handle is unchanged — see EPOLL_CTL_ADD).
                     let reg_gen = slot.reg_gen;
                     if let Some(host_fd) = host_fd {
-                        let effective = this.epoll_effective_interest(fd, event.events, 0, false);
+                        let effective =
+                            this.epoll_effective_interest(fd, event.events, 0, 0, false);
                         let register = kqueue.with_mux(|mux| {
                             mux.register_io(
                                 host_fd.get(),

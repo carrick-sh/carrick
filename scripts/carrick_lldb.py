@@ -340,6 +340,8 @@ _EVENTRING_KINDS = {
     9: ("FDOPEN", lambda a, b, c: f"gfd={a} hfd={b} minfd={c}"),
     10: ("FDCLOSE", lambda a, b, c: f"gfd={a} hfd={b}"),
     11: ("ACCEPTER", lambda a, b, c: f"listener_hfd={a} accepted_hfd={b} errno={c}"),
+    12: ("EPWFD", lambda a, b, c: f"fd={a} events={b:#x} timeout={c}"),
+    13: ("EPMASK", lambda a, b, c: f"origin={a} raw={b:#x} last={c:#x}"),
 }
 
 
