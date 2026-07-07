@@ -76,4 +76,13 @@ for pass in 1 2 3; do
     sleep 1
 done
 
-echo "remaining carrick procs ($desc) = $(scan | grep -c .)"
+remaining=$(scan)
+remaining_count=$(printf '%s\n' "$remaining" | grep -c .)
+echo "remaining carrick procs ($desc) = $remaining_count"
+if [ "$remaining_count" -ne 0 ]; then
+    echo "kill.sh: failed to reap these scoped carrick processes:" >&2
+    for p in $remaining; do
+        ps -p "$p" -o user=,pid=,ppid=,stat=,command= >&2
+    done
+    exit 1
+fi
