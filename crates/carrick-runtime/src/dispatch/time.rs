@@ -914,8 +914,7 @@ fn enforce_rlimit_cpu(generation: u64, soft_secs: u64, hard_secs: u64) {
         let delay_ns = next
             .map(|deadline| deadline.saturating_sub(now))
             .unwrap_or(RLIMIT_CPU_REPEAT_NS)
-            .min(RLIMIT_CPU_RECHECK_NS)
-            .max(1);
+            .clamp(1, RLIMIT_CPU_RECHECK_NS);
         std::thread::sleep(Duration::from_nanos(delay_ns));
     }
 }
