@@ -5,6 +5,7 @@
 //! bucket locks; the run supervisor only sweeps after hard death.
 //! Spec: docs/superpowers/specs/2026-07-06-carrick-kernel-authority-design.md.
 
+pub mod arena;
 pub mod domains;
 pub mod lock;
 pub mod wait;
