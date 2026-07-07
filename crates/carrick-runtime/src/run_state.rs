@@ -22,12 +22,10 @@
 //!
 //! # The fix: publish the guest's true run-state
 //!
-//! Each vCPU publishes its guest's run-state into a `MAP_SHARED` table mmap'd
-//! before the first guest fork and inherited by every host descendant — the same
-//! durable, fork-coherent pattern as [`crate::deadlock_watchdog`] and
-//! [`crate::guest_cpu`]'s reaped-child table (an in-process `HashMap` would NOT
-//! survive `fork(2)` and would silently diverge). The table is keyed by host pid,
-//! so ANY guest process can read ANY other guest's published state.
+//! Each vCPU publishes its guest's run-state into the carrick-kernel arena's
+//! process section, which is mmap'd before the first guest fork and inherited by
+//! every host descendant. The process section is keyed by host pid, so ANY guest
+//! process can read ANY other guest's published state.
 //!
 //!   * [`RunState::Booting`] — process start until the vCPU first resumes guest
 //!     code (post-fork runtime boot). Renders `R`.
@@ -42,8 +40,11 @@
 //! Zombie/stopped/uninterruptible classification stays with the host kernel —
 //! this only disambiguates `R` vs `S` for a live guest.
 
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use carrick_kernel::arena::{ArenaError, KernelArena};
+use carrick_kernel::domains::{HostPid, ProcessGeneration};
+use carrick_kernel::process::{ProcessRecord, ProcessRecordRef, ProcessSection};
 
 /// Published guest run-state of a process. The encoded value lives in the high
 /// 8 bits of a shared `u64` slot whose low bits hold the owning host pid.
@@ -87,19 +88,16 @@ impl RunState {
     }
 }
 
-// Linear-scan slot table in a shared mapping. Each slot is a single u64:
+// Linear-scan arena records. Each record's `run_state` is a single u64:
 //   bits  0..32  id — host pid (process entry) or guest tid (worker entry)
 //   bits 32..40  encoded RunState (0 = unset)
 //   bit  40      KIND_TID — set for a worker-thread entry, clear for a process
 // A single atomic u64 store publishes id+state together, so a reader never sees
 // an id paired with another owner's state (no torn cross-field read). A process
-// claims ANY free slot (and caches its index for O(1) republish), and a reader
-// scans for its id — so a slot may sit anywhere (no home-index invariant), which
-// keeps full-table dead-slot reclamation correct (an evicted slot is readable
-// wherever it lands). The table must cover high-fanout conformance cases such
-// as `futex_cmp_requeue01`'s 1000 children; once full, a process whose slot
-// can't be claimed degrades to the host-state fallback, which can report a
-// booting child as sleeping too early.
+// claims ANY free record (and caches its ref for O(1) republish), and a reader
+// scans for its id. The arena's fixed capacity is deliberately fail-closed:
+// exhausting process records aborts instead of silently falling back to
+// process-local state.
 //
 // Worker guest tids are `host_pid + k` (registry-allocated), so they share the
 // low-32 numbering space with host pids: a worker tid can numerically equal a
@@ -107,18 +105,12 @@ impl RunState {
 // worker entry and a process entry with the same low-32 value occupy separate
 // slots (never clobber), and `published` prefers the process entry so a live
 // process's /proc state is never shadowed by an aliasing worker tid.
-const SLOTS: usize = 4096;
-
 const PID_MASK: u64 = 0xffff_ffff;
 const STATE_SHIFT: u64 = 32;
 const STATE_MASK: u64 = 0xff;
 /// Distinguishes a worker-thread (guest tid) entry from a process (host pid)
 /// entry so the two never collide in the low-32 id space. Part of the slot KEY.
 const KIND_TID: u64 = 1 << 40;
-/// The bits that identify a slot's OWNER: the low-32 id plus the kind tag. Two
-/// publishers with the same key share a slot; different keys never clobber.
-const KEY_MASK: u64 = PID_MASK | KIND_TID;
-
 fn pack(pid: u32, state: RunState) -> u64 {
     (pid as u64) | (state.encode() << STATE_SHIFT)
 }
@@ -138,51 +130,44 @@ fn unpack(raw: u64) -> Option<(u32, RunState)> {
     Some((pid, st))
 }
 
-/// The shared slot table, in a `MAP_SHARED` anonymous mapping established before
-/// the first guest fork and inherited (the SAME physical pages) by every host
-/// descendant. Falls back to a process-private box if `mmap` fails — the guest
-/// then publishes/reads only its own state, which is harmless (the reader's
-/// host-state fallback covers a sibling that isn't visible).
-fn table() -> &'static [AtomicU64] {
-    static CELL: OnceLock<usize> = OnceLock::new();
-    let base = *CELL.get_or_init(|| {
-        let bytes = SLOTS * std::mem::size_of::<AtomicU64>();
-        // SAFETY: a fresh anonymous shared mapping owned for the process lifetime.
-        let p = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                bytes,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_ANON | libc::MAP_SHARED,
-                -1,
-                0,
-            )
-        };
-        if p == libc::MAP_FAILED {
-            // Process-private fallback: a leaked zeroed Box of the same shape.
-            let v: Vec<AtomicU64> = (0..SLOTS).map(|_| AtomicU64::new(0)).collect();
-            return Box::into_raw(v.into_boxed_slice()) as *mut AtomicU64 as usize;
-        }
-        // mmap(MAP_ANON) zero-fills, so every slot starts empty (pid 0).
-        p as usize
-    });
-    // SAFETY: `base` points at SLOTS contiguous AtomicU64 valid for the whole
-    // process; MAP_SHARED makes them the SAME words in every host descendant.
-    unsafe { std::slice::from_raw_parts(base as *const AtomicU64, SLOTS) }
+fn processes() -> &'static ProcessSection {
+    &KernelArena::init_global().layout().processes
 }
 
-/// Ensure the shared table exists before the first guest fork (so every
-/// descendant inherits the SAME mapping). Idempotent. Called once at loop start.
+/// Ensure the arena exists before the first guest fork (so every descendant
+/// inherits the SAME mapping). Idempotent. Called once at loop start.
 pub fn init_table() {
-    let _ = table();
+    let _ = KernelArena::init_global();
 }
 
-/// THIS process's own slot index, cached after the first claim so the hot-path
+const REF_NONE: u64 = u64::MAX;
+const REF_INDEX_MASK: u64 = 0xffff_ffff;
+
+fn pack_ref(r: ProcessRecordRef) -> u64 {
+    (u64::from(r.generation.raw()) << 32) | (r.index as u64)
+}
+
+fn unpack_ref(raw: u64) -> Option<ProcessRecordRef> {
+    if raw == REF_NONE {
+        return None;
+    }
+    let index = (raw & REF_INDEX_MASK) as usize;
+    let generation = (raw >> 32) as u32;
+    if generation == 0 {
+        return None;
+    }
+    Some(ProcessRecordRef {
+        index,
+        generation: ProcessGeneration::new(generation),
+    })
+}
+
+/// THIS process's own record ref, cached after the first claim so the hot-path
 /// republish (every loop iteration) is one bounds check + one atomic store, not
 /// a full-table scan. Process-local (NOT shared): each host process owns a
-/// distinct slot, and a forked child re-claims a fresh one. `usize::MAX` = not
+/// distinct record, and a forked child re-claims a fresh one. `REF_NONE` = not
 /// yet claimed. Reset to unclaimed on fork (`reinit_booting_after_fork`).
-static MY_SLOT: AtomicUsize = AtomicUsize::new(usize::MAX);
+static MY_SLOT: AtomicU64 = AtomicU64::new(REF_NONE);
 
 /// Publish `state` for THIS process. Claims a slot on first publish, caches its
 /// index in `MY_SLOT`, then updates it in place — so the hot-path republish (every
@@ -193,21 +178,17 @@ pub fn publish(state: RunState) {
     if pid == 0 {
         return;
     }
-    let tbl = table();
+    let section = processes();
     let want = pack(pid, state);
     // Fast path: our slot is cached and still ours (a forked child clears the
     // cache, so a stale parent index can't be reused by the child).
     let cached = MY_SLOT.load(Ordering::Relaxed);
-    if cached != usize::MAX
-        && cached < SLOTS
-        && (tbl[cached].load(Ordering::Relaxed) & PID_MASK) as u32 == pid
-    {
-        tbl[cached].store(want, Ordering::Release);
+    if let Some(record) = cached_record(section, cached, pid, false) {
+        record.run_state.store(want, Ordering::Release);
         return;
     }
-    if let Some(slot) = claim_slot(tbl, want) {
-        MY_SLOT.store(slot, Ordering::Relaxed);
-    }
+    let r = claim_record(section, pid, want, false);
+    MY_SLOT.store(pack_ref(r), Ordering::Relaxed);
 }
 
 /// Publish `state` for an ARBITRARY pid (used to seed a child's `Booting` from
@@ -218,9 +199,9 @@ fn publish_for(pid: u32, state: RunState) {
     if pid == 0 {
         return;
     }
-    let tbl = table();
+    let section = processes();
     let want = pack(pid, state);
-    let _ = claim_slot(tbl, want);
+    let _ = claim_record(section, pid, want, false);
 }
 
 /// Publish a guest-visible WORKER thread id into the shared state table. Worker
@@ -234,8 +215,8 @@ pub fn publish_guest_tid(tid: i32, state: RunState) {
         if tid == 0 || tid == std::process::id() {
             return;
         }
-        let tbl = table();
-        let _ = claim_slot(tbl, pack_tid(tid, state));
+        let section = processes();
+        let _ = claim_record(section, tid, pack_tid(tid, state), true);
     }
 }
 
@@ -250,75 +231,74 @@ pub fn clear_guest_tid(tid: i32) {
     if tid == 0 {
         return;
     }
-    let key = pack_tid(tid, RunState::Booting) & KEY_MASK;
-    let tbl = table();
-    for slot in tbl.iter() {
-        let raw = slot.load(Ordering::Acquire);
-        if raw & PID_MASK != 0 && raw & KEY_MASK == key {
-            slot.store(0, Ordering::Release);
-            return;
-        }
+    let section = processes();
+    if let Some(r) = find_record(section, tid, true) {
+        section.release(r);
     }
 }
 
-/// Find or claim this pid's slot, writing `want`. Returns the slot index, or
-/// `None` if the table is full of LIVE processes (the process then degrades to
-/// the host-state fallback — never a wrong state). Once per process (cached
-/// after), so the dead-slot eviction scan here is off the hot path. Linear scan:
-/// the slot may land anywhere, so the reader scans too — which is what makes
-/// full-table dead-slot reclamation correct (an evicted slot is readable wherever
-/// it lands, with no home-index invariant to violate).
-fn claim_slot(tbl: &[AtomicU64], want: u64) -> Option<usize> {
-    // The owner KEY is the low-32 id PLUS the kind tag, so a worker-tid entry and
-    // a process-pid entry with the same low-32 value never share a slot.
-    let key = want & KEY_MASK;
-    // First pass: reuse our own slot if present, else claim a free one.
-    for (idx, slot) in tbl.iter().enumerate() {
-        let cur = slot.load(Ordering::Relaxed);
-        if cur & KEY_MASK == key {
-            slot.store(want, Ordering::Release); // already ours — update
-            return Some(idx);
-        }
-        if cur & PID_MASK == 0
-            && slot
-                .compare_exchange(cur, want, Ordering::AcqRel, Ordering::Relaxed)
-                .is_ok()
-        {
-            return Some(idx);
-        }
+fn cached_record(
+    section: &ProcessSection,
+    packed_ref: u64,
+    id: u32,
+    want_tid: bool,
+) -> Option<&ProcessRecord> {
+    let r = unpack_ref(packed_ref)?;
+    let record = section.records.get(r.index)?;
+    if record.generation.load(Ordering::Acquire) != r.generation.raw() {
+        return None;
     }
-    // Full: reclaim a slot whose owner is no longer a live process. Only in the
-    // rare full-table case (a guest that has forked >510 processes), at most once
-    // per process, so the per-slot `kill(pid, 0)` liveness probe is off the hot
-    // path.
-    for (idx, slot) in tbl.iter().enumerate() {
-        let cur = slot.load(Ordering::Relaxed);
-        let cur_pid = (cur & PID_MASK) as u32;
-        if cur_pid != 0
-            && cur & KEY_MASK != key
-            && !pid_is_live(cur_pid)
-            && slot
-                .compare_exchange(cur, want, Ordering::AcqRel, Ordering::Relaxed)
-                .is_ok()
-        {
-            return Some(idx);
+    if record.host_pid.load(Ordering::Acquire) != id {
+        return None;
+    }
+    let raw = record.run_state.load(Ordering::Acquire);
+    if (raw & PID_MASK) as u32 == id && ((raw & KIND_TID) != 0) == want_tid {
+        Some(record)
+    } else {
+        None
+    }
+}
+
+fn find_record(section: &ProcessSection, id: u32, want_tid: bool) -> Option<ProcessRecordRef> {
+    for (index, record) in section.records.iter().enumerate() {
+        if record.host_pid.load(Ordering::Acquire) != id {
+            continue;
+        }
+        let generation = record.generation.load(Ordering::Acquire);
+        if generation == 0 {
+            continue;
+        }
+        let raw = record.run_state.load(Ordering::Acquire);
+        if (raw & PID_MASK) as u32 == id && ((raw & KIND_TID) != 0) == want_tid {
+            return Some(ProcessRecordRef {
+                index,
+                generation: ProcessGeneration::new(generation),
+            });
         }
     }
     None
 }
 
-/// Whether `pid` is still a live process (any state, including zombie). Used
-/// only to reclaim a dead process's slot when the table is full.
-fn pid_is_live(pid: u32) -> bool {
-    // SAFETY: kill(pid, 0) sends no signal; it only checks existence/permission.
-    // EPERM (process exists, owned by another user) still means "live"; only
-    // ESRCH means gone. All carrick guests are same-user, so EPERM is unexpected
-    // but treated conservatively as live (never wrongly evict a live process).
-    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    if rc == 0 {
-        return true;
+fn claim_record(section: &ProcessSection, id: u32, want: u64, want_tid: bool) -> ProcessRecordRef {
+    if let Some(r) = find_record(section, id, want_tid) {
+        section.records[r.index]
+            .run_state
+            .store(want, Ordering::Release);
+        return r;
     }
-    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+
+    let generation = KernelArena::global().allocate_generation();
+    match section.claim(Some(HostPid::new(id)), generation, |record| {
+        record.run_state.store(want, Ordering::Relaxed);
+    }) {
+        Ok(r) => r,
+        Err(err) => abort_on_arena_error(err),
+    }
+}
+
+fn abort_on_arena_error(err: ArenaError) -> ! {
+    eprintln!("carrick: run-state arena publication failed: {err:?}");
+    std::process::abort();
 }
 
 /// Reset THIS (freshly-forked child) process's published state to `Booting`.
@@ -328,7 +308,7 @@ fn pid_is_live(pid: u32) -> bool {
 /// and the table is shared, so the parent still reads its own state. Call in the
 /// fork-CHILD setup, before any boot work that could park the vCPU.
 pub fn reinit_booting_after_fork() {
-    MY_SLOT.store(usize::MAX, Ordering::Relaxed);
+    MY_SLOT.store(REF_NONE, Ordering::Relaxed);
     publish_for(std::process::id(), RunState::Booting);
 }
 
@@ -356,10 +336,17 @@ pub fn published(pid: u32) -> Option<RunState> {
     if pid == 0 {
         return None;
     }
-    let tbl = table();
+    let section = processes();
     let mut tid_hit = None;
-    for slot in tbl.iter() {
-        let raw = slot.load(Ordering::Acquire);
+    for record in section.records.iter() {
+        if record.host_pid.load(Ordering::Acquire) != pid {
+            continue;
+        }
+        let generation = record.generation.load(Ordering::Acquire);
+        if generation == 0 {
+            continue;
+        }
+        let raw = record.run_state.load(Ordering::Acquire);
         if let Some((p, st)) = unpack(raw)
             && p == pid
         {
@@ -458,9 +445,16 @@ mod tests {
     /// Zero every slot (either kind) holding this low-32 id, so a test leaves the
     /// process-shared table clean for the others.
     fn wipe_id(id: u32) {
-        for slot in table().iter() {
-            if (slot.load(Ordering::Relaxed) & PID_MASK) as u32 == id {
-                slot.store(0, Ordering::Release);
+        let section = processes();
+        for (index, record) in section.records.iter().enumerate() {
+            if record.host_pid.load(Ordering::Relaxed) == id {
+                let generation = record.generation.load(Ordering::Relaxed);
+                if generation != 0 {
+                    section.release(ProcessRecordRef {
+                        index,
+                        generation: ProcessGeneration::new(generation),
+                    });
+                }
             }
         }
     }
