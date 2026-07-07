@@ -343,6 +343,7 @@ _EVENTRING_KINDS = {
     12: ("EPWFD", lambda a, b, c: f"fd={a} events={b:#x} timeout={c}"),
     13: ("EPMASK", lambda a, b, c: f"origin={a} raw={b:#x} last={c:#x}"),
     14: ("EPMASKFD", lambda a, b, c: f"origin={a} gfd={b} hfd={c}"),
+    15: ("EPEDGE", lambda a, b, c: f"gfd={a} edge={b:#x} count={c}"),
 }
 
 
