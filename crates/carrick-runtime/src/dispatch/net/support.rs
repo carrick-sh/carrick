@@ -547,36 +547,83 @@ pub(super) fn canonical_socket_errno(
     None
 }
 
+const HOST_STREAM_BUF_TARGET: libc::c_int = 16 * 1024 * 1024;
+const HOST_STREAM_BUF_REQUIRED: libc::c_int = 8 * 1024 * 1024;
+
+fn host_socket_buffer_size(host_fd: i32, opt: libc::c_int) -> Result<libc::c_int, LinuxErrno> {
+    let mut size: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: host_fd is a live socket fd; size/len point to writable storage.
+    let rc = unsafe {
+        libc::getsockopt(
+            host_fd,
+            libc::SOL_SOCKET,
+            opt,
+            &mut size as *mut libc::c_int as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    rc.host_syscall_errno().map(|_| size)
+}
+
+fn set_host_socket_buffer_size(
+    host_fd: i32,
+    opt: libc::c_int,
+    size: libc::c_int,
+) -> Result<(), LinuxErrno> {
+    // SAFETY: host_fd is a live socket fd; the optval is a valid &c_int.
+    let rc = unsafe {
+        libc::setsockopt(
+            host_fd,
+            libc::SOL_SOCKET,
+            opt,
+            &size as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    rc.host_syscall_errno()
+        .map(|_| ())
+        .map_err(|_| crate::linux_abi::LINUX_ENOBUFS)
+}
+
 /// Widen a host stream socket's send (and recv) buffer beyond macOS' small
 /// defaults. Linux-visible `getsockopt(SO_SNDBUF/SO_RCVBUF)` reports the
 /// guest-intended/default Linux value from `OpenDescriptionBase`, so this is
 /// host-only backing capacity. A guest that writes up to its socket buffer
-/// expecting the write to complete WITHOUT a draining reader then blocks forever
-/// on a POLLOUT that never comes — e.g. Go's splice/sendfile "Limited" copy, where
-/// a writer goroutine pushes a large payload while the reader consumes in large
-/// netpoll waits. SO_SNDBUF is the load-bearing option (it governs the writer);
-/// SO_RCVBUF is set for symmetry. Best-effort: errors are ignored. DGRAM is
-/// intentionally left alone because datagram boundary semantics differ.
-pub(super) fn widen_stream_socket_buffers(host_fd: i32, family: i32, base_type: i32) {
+/// expecting the write to complete WITHOUT a draining reader can otherwise park
+/// behind a POLLOUT edge that never gives it enough progress — e.g. Go's
+/// infinite-response tests, where a writer goroutine pushes a large payload
+/// while the reader consumes in large netpoll waits. SO_SNDBUF is the
+/// load-bearing option (it governs the writer); SO_RCVBUF is checked for
+/// symmetry. DGRAM is intentionally left alone because datagram boundary
+/// semantics differ.
+///
+/// The host may reject or silently clamp a large `setsockopt(SO_*BUF)` request,
+/// so this function retries at the required floor and then verifies the actual
+/// kernel value. Falling below the required floor is a setup failure (`ENOBUFS`)
+/// rather than a latent guest timeout.
+pub(super) fn widen_stream_socket_buffers(
+    host_fd: i32,
+    family: i32,
+    base_type: i32,
+) -> Result<(), LinuxErrno> {
     if !matches!(base_type, LINUX_SOCK_STREAM | LINUX_SOCK_SEQPACKET) {
-        return;
+        return Ok(());
     }
     if base_type == LINUX_SOCK_SEQPACKET && family != LINUX_AF_UNIX {
-        return;
+        return Ok(());
     }
-    const HOST_STREAM_BUF: libc::c_int = 4 * 1024 * 1024;
     for opt in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
-        // SAFETY: host_fd is a live socket fd; the optval is a valid &c_int.
-        unsafe {
-            libc::setsockopt(
-                host_fd,
-                libc::SOL_SOCKET,
-                opt,
-                &HOST_STREAM_BUF as *const libc::c_int as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
+        if set_host_socket_buffer_size(host_fd, opt, HOST_STREAM_BUF_TARGET).is_err() {
+            set_host_socket_buffer_size(host_fd, opt, HOST_STREAM_BUF_REQUIRED)?;
+        }
+        let actual =
+            host_socket_buffer_size(host_fd, opt).map_err(|_| crate::linux_abi::LINUX_ENOBUFS)?;
+        if actual < HOST_STREAM_BUF_REQUIRED {
+            return Err(crate::linux_abi::LINUX_ENOBUFS);
         }
     }
+    Ok(())
 }
 
 pub(super) fn linux_to_host_socktype(t: i32) -> i32 {
@@ -3239,26 +3286,55 @@ mod tests {
     fn stream_buffer_widening_covers_inet_stream_sockets() {
         let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
         assert!(fd >= 0);
-        widen_stream_socket_buffers(fd, LINUX_AF_INET, LINUX_SOCK_STREAM);
-
-        let mut size: libc::c_int = 0;
-        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-        let rc = unsafe {
-            libc::getsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_SNDBUF,
-                &mut size as *mut libc::c_int as *mut libc::c_void,
-                &mut len,
-            )
-        };
+        let result = widen_stream_socket_buffers(fd, LINUX_AF_INET, LINUX_SOCK_STREAM);
+        let sndbuf = host_socket_buffer_size(fd, libc::SO_SNDBUF);
+        let rcvbuf = host_socket_buffer_size(fd, libc::SO_RCVBUF);
         unsafe { libc::close(fd) };
 
+        result.expect("stream buffer widening should meet required floor");
+        assert!(sndbuf.unwrap() >= HOST_STREAM_BUF_REQUIRED);
+        assert!(rcvbuf.unwrap() >= HOST_STREAM_BUF_REQUIRED);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn stream_buffer_widening_covers_accepted_inet_stream_sockets() {
+        use std::os::fd::AsRawFd;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let client = std::net::TcpStream::connect(addr).expect("connect client");
+        let (server, _) = listener.accept().expect("accept server");
+
+        let result =
+            widen_stream_socket_buffers(server.as_raw_fd(), LINUX_AF_INET, LINUX_SOCK_STREAM);
+        let sndbuf = host_socket_buffer_size(server.as_raw_fd(), libc::SO_SNDBUF);
+        let rcvbuf = host_socket_buffer_size(server.as_raw_fd(), libc::SO_RCVBUF);
+
+        result.expect("accepted stream buffer widening should meet required floor");
+        assert!(sndbuf.unwrap() >= HOST_STREAM_BUF_REQUIRED);
+        assert!(rcvbuf.unwrap() >= HOST_STREAM_BUF_REQUIRED);
+        drop(client);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn stream_buffer_widening_covers_unix_stream_sockets() {
+        let mut fds = [-1; 2];
+        let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
         assert_eq!(rc, 0);
-        assert!(
-            size >= 1024 * 1024,
-            "host stream send buffer stayed too small: {size}"
-        );
+
+        let result = widen_stream_socket_buffers(fds[0], LINUX_AF_UNIX, LINUX_SOCK_STREAM);
+        let sndbuf = host_socket_buffer_size(fds[0], libc::SO_SNDBUF);
+        let rcvbuf = host_socket_buffer_size(fds[0], libc::SO_RCVBUF);
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+
+        result.expect("unix stream buffer widening should meet required floor");
+        assert!(sndbuf.unwrap() >= HOST_STREAM_BUF_REQUIRED);
+        assert!(rcvbuf.unwrap() >= HOST_STREAM_BUF_REQUIRED);
     }
 
     #[cfg(target_os = "macos")]
