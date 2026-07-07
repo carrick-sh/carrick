@@ -417,15 +417,16 @@ impl SyscallDispatcher {
         // unknown bits, so retain them rather than reject.
         let mut interest = epoll_interest_for(LinuxEpollEvents::from_bits_retain(events));
         // Guest EPOLLET is enforced by the software `last_ready` latch. Once
-        // EPOLLOUT has been delivered, keeping write interest armed can wake an
-        // epoll waiter for an event the guest is not allowed to see again. Drop
-        // the write filter until either guest I/O consumes the edge or a write
-        // returns EAGAIN and explicitly asks to watch for writability again.
-        // Keep read armed: read-side ET uses FIONREAD growth to detect a new
-        // edge while data remains buffered.
+        // EPOLLOUT or a terminal HUP/ERR edge has been delivered, keeping write
+        // interest armed can wake an epoll waiter for host writability that the
+        // Linux-facing sampler will keep masking. Drop the write filter until
+        // either guest I/O consumes the edge or a write returns EAGAIN and
+        // explicitly asks to watch for writability again. Keep read armed:
+        // read-side ET uses FIONREAD growth to detect a new edge while data
+        // remains buffered.
         if events & LINUX_EPOLLET != 0
             && interest.write
-            && last_ready & LINUX_EPOLLOUT != 0
+            && last_ready & (LINUX_EPOLLOUT | LINUX_EPOLLHUP | LINUX_EPOLLERR) != 0
             && !write_backpressured
         {
             interest.write = false;
@@ -2520,6 +2521,42 @@ mod epoll_interest_tests {
         assert!(level.read);
         assert!(level.write);
     }
+
+    #[cfg(any(
+        feature = "platform-macos",
+        feature = "platform-freebsd",
+        feature = "platform-netbsd"
+    ))]
+    #[test]
+    fn et_terminal_latch_disarms_host_write_filter() {
+        let dispatcher = SyscallDispatcher::new();
+        let events = LINUX_EPOLLET | LINUX_EPOLLIN | LINUX_EPOLLOUT;
+
+        let hup_latched = dispatcher.epoll_effective_interest(
+            12345,
+            events,
+            LINUX_EPOLLIN | LINUX_EPOLLHUP,
+            0,
+            false,
+        );
+        assert!(hup_latched.read);
+        assert!(!hup_latched.write);
+
+        let err_latched =
+            dispatcher.epoll_effective_interest(12345, events, LINUX_EPOLLERR, 0, false);
+        assert!(err_latched.read);
+        assert!(!err_latched.write);
+
+        let backpressured = dispatcher.epoll_effective_interest(
+            12345,
+            events,
+            LINUX_EPOLLIN | LINUX_EPOLLHUP,
+            0,
+            true,
+        );
+        assert!(backpressured.read);
+        assert!(backpressured.write);
+    }
 }
 
 impl SyscallDispatcher {
@@ -3826,6 +3863,9 @@ impl SyscallDispatcher {
             let all_host: Option<Vec<i32>> = host_map.iter().copied().collect();
 
             if owners.is_empty() {
+                if timeout_ms == 0 && sigmask_addr == 0 {
+                    return Ok(DispatchOutcome::Returned { value: 0 });
+                }
                 // No fds in any set. The original raw `libc::nanosleep` here
                 // never observed guest pending signals (the pump publishes via
                 // the dispatcher-thread-invisible PENDING atomic, not a host
