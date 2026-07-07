@@ -788,6 +788,11 @@ pub(crate) enum DebugCommand {
         /// Skip `process save-core`; still records event rings and backtraces.
         #[arg(long = "no-core")]
         no_core: bool,
+        /// Ask forked guest processes to SIGSTOP just before dying by this Linux
+        /// signal, then dump lldb diagnostics when the stopped scoped process is
+        /// observed. Diagnostic-only; normal runs are unaffected.
+        #[arg(long = "stop-on-signal")]
+        stop_on_signal: Option<i32>,
         /// Arguments for `carrick run` after `--`, excluding the `run` word.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         command: Vec<String>,
