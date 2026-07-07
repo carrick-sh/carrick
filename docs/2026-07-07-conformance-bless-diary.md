@@ -656,3 +656,35 @@ from a match into a TBROK. `ltp-execve05` now uses the same exclusive scheduler
 lane as the other load-sensitive rows. The raw exec/checkpoint scalability
 problem remains real; the scheduler change prevents a load artifact from being
 misclassified as a semantic conformance diff.
+
+## 2026-07-07 05:32 - select02 full-load pselect6 jitter isolated
+
+Hypothesis:
+
+After isolating `execve05`, the full bless attempt
+`target/conformance/bless-current-052037.{log,jsonl}` progressed further and
+failed fast with `ltp-select02` as the new late gating row: Carrick `12/14`,
+Docker `14/14`. The raw log showed the failures were not readiness semantics:
+the libc `select()` section passed, unsupported arch-specific select variants
+were TCONF, and the failures were in the `SYS_pselect6` timer test where the
+100ms and 1s sleeps exceeded LTP's jitter threshold under full load.
+
+Tests:
+
+- Full-run raw log:
+  `target/conformance/raw/conf-65542-c1075.err` showed two `TFAIL: select()
+  slept for too long` assertions in the `SYS_pselect6` section.
+- Focused `ltp-select02` repeats:
+  `target/conformance/select02-repeat-{1,2}-*.jsonl` both matched, with Carrick
+  times `19249ms` and `19270ms` against the cached `20535ms` Docker oracle.
+- After adding `ltp-select02` to the exclusive scheduling rule, the targeted
+  run `target/conformance/exclusive-ltp3-052813.{log,jsonl}` matched
+  `ltp-execve05`, `ltp-inotify09`, `ltp-openat03`, and `ltp-select02`
+  together.
+
+Outcome:
+
+`ltp-select02` is a timing-threshold test that is correct when focused and
+fails only under full HVF co-scheduling jitter. It now joins the exclusive
+scheduler lane. This is deliberately narrow: nearby select/pselect rows are not
+changed unless they show the same full-load-only failure mode.
