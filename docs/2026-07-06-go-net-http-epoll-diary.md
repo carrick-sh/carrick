@@ -501,3 +501,74 @@ Outcome:
   full architectural fix. It is a useful focused h1 improvement and diagnostic
   checkpoint, but the full `go-net_http` suite still has a masked kqueue
   readiness path that keeps the epoll instance fd poll-readable.
+
+### Hypothesis: terminal ET readiness must also disarm host write filters
+
+Grounding:
+
+- A current-state `carrick debug lldb-run` capture hit the same broad-suite
+  masked-kqueue pattern at `TestTransportConcurrency/h1`:
+  `target/conformance/logs/lldb-go-net-http-current/go-net-http-current-lldb-225110.lldb.txt`.
+- A focused `carrick trace` run showed the dominant repeated set included
+  fds with `raw=0x11 last=0x11 read_avail=8388608`, while
+  `epoll-rebind` kept `effective=0x3` (read + write) for those host fds.
+- Interpretation: after a terminal `EPOLLHUP`/`EPOLLERR` edge is already
+  latched for an ET registration, a host write filter can keep waking the
+  kqueue even though the Linux-facing sampler will not deliver a new event.
+
+Implementation:
+
+- `epoll_effective_interest` now drops BSD host write interest for ET
+  registrations when `last_ready` includes `EPOLLOUT`, `EPOLLHUP`, or
+  `EPOLLERR`, unless a guest write hit backpressure and explicitly needs a
+  writability wake.
+- Added a unit test for terminal latch write-filter suppression.
+
+Verification:
+
+```sh
+cargo test -p carrick-runtime epoll_interest_tests -- --nocapture
+cargo test -p carrick-runtime --test integration epoll -- --nocapture
+cargo fmt --check
+cargo check -p carrick-cli
+just build -p carrick-cli
+```
+
+Outcome:
+
+- The focused gates passed.
+- Five focused h1 samples before later experiments passed with warm timings
+  still around `real 1.76-1.86`; Docker oracle for the same focused case was
+  around `real 0.18-0.23`, so the focused performance gap remains.
+- A broad 60s `lldb-run` progressed past `TestTransportConcurrency/h1` and
+  into later SOCKS/round-trip tests instead of stopping in the old
+  `EPWAIT ready=0` / `EPWFD POLLIN` loop.
+- A broad raw run still timed out at 240s while making progress; the Docker
+  oracle completed the same raw command in `real 4.43`.
+- Interpretation: this is real liveness progress and removes one pathological
+  masked-kqueue source, but `go-net_http` remains unblessable because the broad
+  suite is still more than an order of magnitude slower than Docker.
+
+### Rejected experiment: short nanosleep as yield
+
+Grounding:
+
+- Post-terminal-fix `carrick trace --script scripts/dtrace/epoll-wait-debug.d`
+  reduced kqueue-fd waits from roughly 208k/20s to about 1.1k/20s, but showed
+  tens of thousands of empty-fd waits.
+- `carrick trace --script scripts/dtrace/trace-profile.d` on focused h1 showed
+  `nanosleep` dominating the syscall count.
+
+Experiment:
+
+- Tried routing sub-100us `WaitOnSleep` outcomes through `thread::yield_now`
+  instead of the signal-aware empty-fd waiter.
+
+Outcome:
+
+- Rejected and reverted. One of five focused h1 samples timed out at 45s, and
+  warm passing samples remained around `real 1.77-1.79`.
+- Interpretation: short-sleep yielding is not a valid fix. The remaining
+  performance work needs better evidence about why Go emits so many short
+  sleeps and whether Carrick is forcing those sleeps through a path Linux avoids,
+  not an approximation that changes scheduling semantics.

@@ -2796,6 +2796,29 @@ fn pselect6_reports_eventfd_pipe_and_write_readiness() {
 }
 
 #[test]
+fn pselect6_empty_zero_timeout_returns_without_wait_handoff() {
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x1000]);
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    memory
+        .write_bytes(0x4100, LinuxTimespec::new(0, 0).as_bytes())
+        .unwrap();
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(72, SyscallArgs::from([0, 0, 0, 0, 0x4100, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
 fn pselect6_invalid_fd_returns_ebadf() {
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x400]);
     let reporter = CompatReporter::default();
