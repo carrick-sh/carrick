@@ -993,9 +993,6 @@ mod atomic_permit_slot {
     /// A fully-free slot word (all zero).
     pub(super) const FREE_WORD: u64 = 0;
 
-    pub(super) const MAGIC: u32 = 0x4352_5031; // "CRP1"
-    pub(super) const VERSION: u32 = 1;
-
     pub(super) fn pack(state: u64, pid: u32, generation: u32) -> u64 {
         (state << STATE_SHIFT)
             | ((u64::from(generation) & ((1u64 << GEN_BITS) - 1)) << GEN_SHIFT)
@@ -1069,9 +1066,11 @@ struct PermitRegion {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl PermitRegion {
-    /// mmap a fresh zero-filled shared table and publish its header. Used for
-    /// both the process singleton and (in tests) an injectable private region.
-    fn map_shared_table() -> usize {
+    /// mmap a fresh zero-filled shared table and publish its header. Used only
+    /// for injectable test regions; the process-global table lives in the
+    /// carrick-kernel arena.
+    #[cfg(test)]
+    fn map_private_table_for_tests() -> usize {
         use std::sync::atomic::Ordering;
         let size = std::mem::size_of::<SharedPermitTable>();
         // SAFETY: MAP_ANON pages are zero-filled, so the region is a valid
@@ -1099,25 +1098,27 @@ impl PermitRegion {
         table.next_generation.store(1, Ordering::Relaxed);
         table
             .version
-            .store(atomic_permit_slot::VERSION, Ordering::Relaxed);
+            .store(carrick_kernel::arena::PERMIT_VERSION, Ordering::Relaxed);
         // Publish the magic last (Release) so a reader that sees it also sees the
         // initialized header.
         table
             .magic
-            .store(atomic_permit_slot::MAGIC, Ordering::Release);
+            .store(carrick_kernel::arena::PERMIT_MAGIC, Ordering::Release);
         ptr as usize
     }
 
     fn new_shared_global() -> PermitRegion {
+        let arena = carrick_kernel::arena::KernelArena::global();
         PermitRegion {
-            table: Self::map_shared_table(),
+            table: &arena.layout().permits as *const _ as usize,
             local: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
     fn table(&self) -> &SharedPermitTable {
-        // SAFETY: `self.table` is the address returned by `map_shared_table`,
-        // a live mapping for the process lifetime; the child shares the same VA.
+        // SAFETY: `self.table` is either the arena permit section or a test-only
+        // private mapping. Both are live mappings for the process lifetime; fork
+        // children inherit the same VA.
         unsafe { &*(self.table as *const SharedPermitTable) }
     }
 
@@ -1346,7 +1347,10 @@ impl PermitRegion {
 
     #[cfg(test)]
     fn new_anon_for_test() -> PermitRegion {
-        Self::new_shared_global()
+        PermitRegion {
+            table: Self::map_private_table_for_tests(),
+            local: std::sync::Mutex::new(HashMap::new()),
+        }
     }
 
     #[cfg(test)]
@@ -5394,6 +5398,22 @@ mod vm_create_admission_tests {
         // The ceiling is the measured margin under the ~126 real host limit, well
         // above the old cap of 12 that starved dozens-of-processes suites.
         assert_eq!(VmCreateAdmission::GLOBAL_VCPU_CEILING, 120);
+    }
+
+    #[test]
+    fn permit_table_is_the_arena_permit_section() {
+        assert_eq!(
+            std::mem::size_of::<SharedPermitTable>(),
+            std::mem::size_of::<carrick_kernel::arena::PermitSection>()
+        );
+        assert_eq!(
+            std::mem::offset_of!(SharedPermitTable, slots),
+            std::mem::offset_of!(carrick_kernel::arena::PermitSection, slots)
+        );
+
+        let arena = carrick_kernel::arena::KernelArena::global();
+        let section = &arena.layout().permits as *const _ as usize;
+        assert_eq!(permit_region().table_addr_for_test(), section);
     }
 
     // ---- Part B: HV_NO_RESOURCES park+retry backpressure ----

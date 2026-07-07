@@ -73,6 +73,7 @@ carrick-host-linux = { path = "../carrick-host-linux", optional = true }
 carrick-vmm-bhyve = { path = "../carrick-vmm-bhyve", optional = true }
 carrick-vmm-nvmm = { path = "../carrick-vmm-nvmm", optional = true }
 carrick-host = { path = "../carrick-host" }
+carrick-kernel = { path = "../carrick-kernel" }
 carrick-mem = { path = "../carrick-mem" }
 carrick-observability = { path = "../carrick-observability" }
 carrick-signal-core = { path = "../carrick-signal-core" }

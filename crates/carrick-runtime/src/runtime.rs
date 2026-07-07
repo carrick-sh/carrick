@@ -720,6 +720,9 @@ fn run_address_space_with_hvf_and_dispatcher(
     max_traps: usize,
 ) -> Result<RunResult, RuntimeError> {
     let _ = crate::ulock::preinit_waiter_table();
+    // Kernel arena MUST exist before the supervisor split and any guest fork so
+    // every descendant inherits one shared mapping.
+    let _ = carrick_kernel::arena::KernelArena::init_global();
     // PID-namespace placement (container runs only): fork the NsSupervisor
     // BEFORE creating the HVF VM. macOS HVF state is not fork-safe — a VM live
     // in the parent at fork(2) makes the child's hv_vm_create return HV_BUSY
