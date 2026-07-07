@@ -660,11 +660,31 @@ impl SyscallDispatcher {
             LINUX_EPOLLIN | LINUX_EPOLLRDHUP | LINUX_EPOLLPRI | LINUX_EPOLLHUP | LINUX_EPOLLERR;
         const WRITE_CLEAR: u32 = LINUX_EPOLLOUT | LINUX_EPOLLHUP | LINUX_EPOLLERR;
         let positive = matches!(outcome, DispatchOutcome::Returned { value } if *value > 0);
+        let positive_value = match outcome {
+            DispatchOutcome::Returned { value } if *value > 0 => Some(*value as u64),
+            _ => None,
+        };
         let zero = matches!(outcome, DispatchOutcome::Returned { value } if *value == 0);
         let eagain = matches!(outcome, DispatchOutcome::Errno { errno } if *errno == LINUX_EAGAIN);
-        let read_consumed = zero || eagain;
+        let read_consumed = positive || zero || eagain;
         let write_consumed = positive;
         let a = |i: usize| request.arg(i) as i32;
+        let read_progress_bytes = if positive {
+            match request.number.raw() {
+                // read / readv / pread64 / preadv / preadv2, recvfrom /
+                // recvmsg / recvmmsg: positive return is bytes consumed.
+                63 | 65 | 67 | 69 | 286 | 207 | 212 | 243 => positive_value,
+                // sendfile/splice/copy_file_range/tee: positive return is bytes
+                // consumed from the read-side fd.
+                71 | 76 | 285 | 77 => positive_value,
+                // accept/accept4 consume listener readiness but return a new fd,
+                // not a byte count; clear the read latch outright.
+                202 | 242 => None,
+                _ => None,
+            }
+        } else {
+            None
+        };
         let write_eagain_targets: [Option<i32>; 2] = if eagain {
             match request.number.raw() {
                 64 | 66 | 68 | 70 | 287 | 206 | 211 | 269 => [Some(a(0)), None],
@@ -722,11 +742,43 @@ impl SyscallDispatcher {
                         ))]
                         let mut host_rearms: Vec<i32> = Vec::new();
                         for (fd, clear) in targets.iter().flatten() {
-                            if let Some(slot) = interest.get_mut(fd) {
+                            let target_host_fd = self.host_fd_for_poll(*fd);
+                            let target_description = self
+                                .open_file(*fd)
+                                .map(|file| Arc::clone(&file.description));
+                            let matching_fds = interest
+                                .keys()
+                                .copied()
+                                .filter(|candidate| {
+                                    *candidate == *fd
+                                        || target_host_fd.is_some()
+                                            && self.host_fd_for_poll(*candidate) == target_host_fd
+                                        || target_description.as_ref().is_some_and(|target| {
+                                            self.open_file(*candidate).is_some_and(|candidate| {
+                                                Arc::ptr_eq(&candidate.description, target)
+                                            })
+                                        })
+                                })
+                                .collect::<Vec<_>>();
+                            for matching_fd in matching_fds {
+                                let Some(slot) = interest.get_mut(&matching_fd) else {
+                                    continue;
+                                };
                                 let before = slot.last_ready;
-                                slot.last_ready &= !clear;
                                 if clear & READ_CLEAR != 0 {
-                                    slot.last_read_avail = 0;
+                                    if let Some(bytes) = read_progress_bytes {
+                                        slot.last_read_avail =
+                                            slot.last_read_avail.saturating_sub(bytes);
+                                        if slot.last_read_avail == 0 {
+                                            slot.last_ready &= !READ_CLEAR;
+                                        }
+                                    } else {
+                                        slot.last_ready &= !READ_CLEAR;
+                                        slot.last_read_avail = 0;
+                                    }
+                                }
+                                if clear & !READ_CLEAR != 0 {
+                                    slot.last_ready &= !(clear & !READ_CLEAR);
                                 }
                                 if clear & WRITE_CLEAR != 0 {
                                     slot.write_backpressured = false;
@@ -738,17 +790,40 @@ impl SyscallDispatcher {
                                         feature = "platform-freebsd",
                                         feature = "platform-netbsd"
                                     ))]
-                                    if let Some(host_fd) = self.host_fd_for_poll(*fd) {
+                                    if let Some(host_fd) = self.host_fd_for_poll(matching_fd) {
                                         host_rearms.push(host_fd.get());
                                     }
                                 }
                             }
                         }
                         for fd in write_eagain_targets.iter().flatten() {
-                            if let Some(slot) = interest.get_mut(fd)
-                                && slot.event.events & LINUX_EPOLLET != 0
-                                && slot.event.events & LINUX_EPOLLOUT != 0
-                            {
+                            let target_host_fd = self.host_fd_for_poll(*fd);
+                            let target_description = self
+                                .open_file(*fd)
+                                .map(|file| Arc::clone(&file.description));
+                            let matching_fds = interest
+                                .keys()
+                                .copied()
+                                .filter(|candidate| {
+                                    *candidate == *fd
+                                        || target_host_fd.is_some()
+                                            && self.host_fd_for_poll(*candidate) == target_host_fd
+                                        || target_description.as_ref().is_some_and(|target| {
+                                            self.open_file(*candidate).is_some_and(|candidate| {
+                                                Arc::ptr_eq(&candidate.description, target)
+                                            })
+                                        })
+                                })
+                                .collect::<Vec<_>>();
+                            for matching_fd in matching_fds {
+                                let Some(slot) = interest.get_mut(&matching_fd) else {
+                                    continue;
+                                };
+                                if slot.event.events & LINUX_EPOLLET == 0
+                                    || slot.event.events & LINUX_EPOLLOUT == 0
+                                {
+                                    continue;
+                                }
                                 if !slot.write_backpressured {
                                     snapshot_changed = true;
                                     slot.write_backpressured = true;
@@ -758,7 +833,7 @@ impl SyscallDispatcher {
                                     feature = "platform-freebsd",
                                     feature = "platform-netbsd"
                                 ))]
-                                if let Some(host_fd) = self.host_fd_for_poll(*fd) {
+                                if let Some(host_fd) = self.host_fd_for_poll(matching_fd) {
                                     host_rearms.push(host_fd.get());
                                 }
                             }
@@ -1344,7 +1419,10 @@ impl SyscallDispatcher {
         set_host_nonblocking(host_fd);
         // Give stream sockets a Linux-sized host backing buffer so guest
         // non-blocking copy/splice loops do not churn on macOS' small defaults.
-        widen_stream_socket_buffers(host_fd, family, base_type);
+        if let Err(errno) = widen_stream_socket_buffers(host_fd, family, base_type) {
+            unsafe { libc::close(host_fd) };
+            return DispatchOutcome::errno(errno);
+        }
         let status_flags = LINUX_O_RDWR | if nonblock { LINUX_O_NONBLOCK } else { 0 };
         let fd_flags = if cloexec { LINUX_FD_CLOEXEC } else { 0 };
         let open_file = OpenFile::new(
@@ -1955,7 +2033,10 @@ impl SyscallDispatcher {
         // Keep the host socket non-blocking; Linux-visible blocking intent is
         // carried by status_flags and serviced by WaitOnFds.
         set_host_nonblocking(new_host);
-        widen_stream_socket_buffers(new_host, family, type_);
+        if let Err(errno) = widen_stream_socket_buffers(new_host, family, type_) {
+            unsafe { libc::close(new_host) };
+            return DispatchOutcome::errno(errno);
+        }
         let status_flags = LINUX_O_RDWR | if nonblock { LINUX_O_NONBLOCK } else { 0 };
         let fd_flags = if cloexec { LINUX_FD_CLOEXEC } else { 0 };
         let open_file = OpenFile::new(
