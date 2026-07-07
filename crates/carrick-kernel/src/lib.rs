@@ -6,3 +6,4 @@
 //! Spec: docs/superpowers/specs/2026-07-06-carrick-kernel-authority-design.md.
 
 pub mod domains;
+pub mod wait;
