@@ -148,6 +148,11 @@ The verdict is a tool, not the truth. Each of these has burned us:
 - **`TIMEOUT` = a hang** (the worst class). Often a blocking syscall that never
   wakes (EINTR/signal/futex/poll), or a `/proc` poll waiting for a state that
   never appears. Treat as a real DIFF and root-cause.
+- For a reproducible or intermittent timeout, use `carrick debug lldb-run`
+  (see the `carrick-lldb` skill) around the smallest focused `carrick run`
+  command. It writes the guest log, `ps` snapshot, lldb event ring, all host
+  backtraces, and modified-memory cores on the deadline, then performs scoped
+  cleanup. Do this before raising timeouts or adding sleeps/backstops.
 - **Single-run verdicts on flaky tests mislead.** If a test is timing-sensitive
   (e.g. a clone-thread racing a 40s deadline), run it 3× before believing either
   a MATCH or a DIFF.
