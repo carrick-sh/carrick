@@ -1729,18 +1729,15 @@ impl EpollKqueue {
     }
 
     /// Wake any waiter parked on this instance's `poll_fd` so it re-checks
-    /// readiness. On Linux it fires the multiplexer's user-wake
-    /// (`trigger_user(0)`), which makes the epoll `poll_fd` readable and pops the
-    /// park; the parked thread re-samples and re-parks armed. (The shared epoll
-    /// set already auto-wakes on an ADD-of-ready-fd, so this covers the readiness
-    /// changes that don't ride a freshly-registered fd: ET re-arm and the
-    /// in-memory broadcast.) Best-effort — a saturated user-wake is already a
-    /// pending wake.
-    ///
-    /// On macOS this is a no-op: the shared kqueue reaches parked waiters
-    /// natively and the in-memory broadcast drives `trigger_user(0)` directly via
-    /// `notify_inmem_epoll`, so the historical macOS behavior is preserved.
+    /// readiness. This fires the multiplexer's user-wake (`trigger_user(0)`),
+    /// which makes the epoll `poll_fd` readable and pops the park; the parked
+    /// thread re-samples and re-parks armed. The shared epoll set already
+    /// auto-wakes on an ADD-of-ready-fd, so this covers readiness changes that
+    /// don't ride a freshly-registered fd: ET re-arm, write-backpressure latch
+    /// changes, and in-memory readiness broadcasts. Best-effort — a saturated
+    /// user-wake is already a pending wake.
     #[cfg(any(
+        feature = "platform-macos",
         feature = "platform-linux",
         feature = "platform-freebsd",
         feature = "platform-netbsd"
@@ -1750,10 +1747,6 @@ impl EpollKqueue {
             let _ = mux.trigger_user(0);
         });
     }
-
-    /// macOS: the shared kqueue reaches parked waiters natively; no-op.
-    #[cfg(feature = "platform-macos")]
-    pub(crate) fn wake_parked(&self) {}
 }
 
 impl std::fmt::Debug for EpollKqueue {
@@ -1768,6 +1761,29 @@ impl std::fmt::Debug for EpollKqueue {
 impl Drop for EpollKqueue {
     fn drop(&mut self) {
         unregister_epoll_kqueue(self.wake_fd);
+    }
+}
+
+#[cfg(test)]
+mod epoll_kqueue_tests {
+    use super::*;
+
+    #[test]
+    fn wake_parked_makes_poll_fd_readable() {
+        let mut mux = crate::event_mux::make_event_multiplexer().expect("event multiplexer");
+        mux.register_user(0).expect("register user wake");
+        let epoll = EpollKqueue::new(mux);
+
+        epoll.wake_parked();
+
+        let mut pfd = libc::pollfd {
+            fd: epoll.poll_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let rc = unsafe { libc::poll(&mut pfd as *mut _, 1, 0) };
+        assert_eq!(rc, 1, "epoll user wake must make poll_fd readable");
+        assert_ne!(pfd.revents & libc::POLLIN, 0);
     }
 }
 
@@ -6722,6 +6738,123 @@ mod overlay_dispatch_tests {
         let data = u64::from_le_bytes(out[8..16].try_into().unwrap());
         assert_ne!(events & LINUX_EPOLLIN, 0);
         assert_eq!(data, reader as u64);
+    }
+
+    #[test]
+    fn epoll_et_read_via_dup_rearms_registered_sibling() {
+        let mut h = Harness::new();
+        let epfd = returned(h.call(20, [0, 0, 0, 0, 0, 0])) as u64;
+
+        let pair_addr = h.reserve(8);
+        assert_eq!(
+            returned(h.call(
+                199,
+                [
+                    LINUX_AF_UNIX as u64,
+                    LINUX_SOCK_STREAM as u64 | LINUX_O_NONBLOCK,
+                    0,
+                    pair_addr,
+                    0,
+                    0,
+                ],
+            )),
+            0
+        );
+        let pair = h.memory.read_bytes(pair_addr, 8).unwrap();
+        let reader = i32::from_le_bytes(pair[0..4].try_into().unwrap());
+        let writer = i32::from_le_bytes(pair[4..8].try_into().unwrap());
+        let registered_reader = returned(h.call(23, [reader as u64, 0, 0, 0, 0, 0])) as i32;
+        assert_eq!(
+            h.dispatcher.host_fd_for_poll(reader),
+            h.dispatcher.host_fd_for_poll(registered_reader),
+            "dup siblings should share the same host fd"
+        );
+
+        let ev_addr = h.reserve(16);
+        let mut ev = [0u8; 16];
+        ev[0..4].copy_from_slice(&(LINUX_EPOLLIN | LINUX_EPOLLET).to_le_bytes());
+        ev[8..16].copy_from_slice(&(registered_reader as u64).to_le_bytes());
+        h.memory.write_bytes(ev_addr, &ev).unwrap();
+        assert_eq!(
+            returned(h.call(
+                21,
+                [
+                    epfd,
+                    LINUX_EPOLL_CTL_ADD,
+                    registered_reader as u64,
+                    ev_addr,
+                    0,
+                    0,
+                ],
+            )),
+            0
+        );
+
+        let out_addr = h.reserve(16);
+        let first_addr = h.put_bytes(b"a");
+        assert_eq!(
+            returned(h.call(64, [writer as u64, first_addr, 1, 0, 0, 0])),
+            1
+        );
+        assert_eq!(returned(h.call(22, [epfd, out_addr, 1, 0, 0, 0])), 1);
+
+        let read_addr = h.reserve(1);
+        let read_args = SyscallArgs::from([reader as u64, read_addr, 1, 0, 0, 0]);
+        let read_request = SyscallRequest::new(63, read_args);
+        let read_outcome = h
+            .dispatcher
+            .dispatch(read_request, &mut h.memory, &h.reporter)
+            .expect("read dispatch");
+        assert_eq!(returned(read_outcome.clone()), 1);
+        assert!(
+            h.dispatcher.io.epoll_fds.read().contains(&(epfd as i32)),
+            "epoll fd should be tracked for rearm"
+        );
+        h.dispatcher
+            .epoll_rearm_after_io(&read_request, &read_outcome);
+        {
+            let epoll_open = h.dispatcher.open_file(epfd as i32).expect("epoll fd");
+            let open = epoll_open.description.read();
+            let OpenDescription::Epoll { interest, .. } = &*open else {
+                panic!("epfd should be an epoll description");
+            };
+            let slot = interest
+                .get(&registered_reader)
+                .expect("registered dup interest");
+            assert_eq!(
+                slot.last_ready & LINUX_EPOLLIN,
+                0,
+                "read through a dup sibling must clear the registered fd latch"
+            );
+        }
+
+        let second_addr = h.put_bytes(b"b");
+        assert_eq!(
+            returned(h.call(64, [writer as u64, second_addr, 1, 0, 0, 0])),
+            1
+        );
+        let host_fd = h
+            .dispatcher
+            .host_fd_for_poll(registered_reader)
+            .expect("registered reader host fd");
+        let mut pfd = libc::pollfd {
+            fd: host_fd.get(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let poll_rc = unsafe { libc::poll(&mut pfd, 1, 0) };
+        assert_eq!(poll_rc, 1, "second write should make host fd readable");
+        assert_ne!(pfd.revents & libc::POLLIN, 0);
+        let n = returned(h.call(22, [epfd, out_addr, 1, 0, 0, 0]));
+        assert_eq!(
+            n, 1,
+            "consuming readiness through a dup sibling must re-arm ET interest"
+        );
+        let out = h.memory.read_bytes(out_addr, 16).unwrap();
+        let events = u32::from_le_bytes(out[0..4].try_into().unwrap());
+        let data = u64::from_le_bytes(out[8..16].try_into().unwrap());
+        assert_ne!(events & LINUX_EPOLLIN, 0);
+        assert_eq!(data, registered_reader as u64);
     }
 
     #[test]
