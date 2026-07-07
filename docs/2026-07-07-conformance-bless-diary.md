@@ -1259,3 +1259,94 @@ This is still not an epoll readiness or `EV_CLEAR`/`EV_DISPATCH` bug.
 rebuild architecture, not in epoll wait/rearm. Until that deeper fork work is
 done, this row should stay visible as pathological timing debt rather than be
 papered over with sleeps or kqueue backstops.
+
+## 2026-07-07 08:28 - futex_wait05 concurrency hypothesis checked against Docker
+
+Hypothesis:
+
+The fresh full bless surfaced `ltp-futex_wait05` as a gating regression even
+though focused futex work had been stable. A plausible first-principles concern
+was that Carrick cannot run the same timing-sensitive LTP cases concurrently
+while Linux can, which would point at a structural scheduler or blocking-wait
+problem rather than at the individual futex syscall.
+
+Tests:
+
+- Focused solo harness run:
+  `target/conformance/futex-wait05-solo-082351.jsonl` matched Carrick `7/7`
+  vs Docker `7/7`.
+- Mixed Carrick harness load with `ltp-epoll-ltp`, `ltp-fork09`,
+  `ltp-fork_procs`, `ltp-futex_wait05`, and adjacent futex waits/wakes:
+  `target/conformance/futex-wait05-load-082414.jsonl` matched all selected
+  rows. `ltp-futex_wait05` was Carrick `7/7` at `0.99x`; `ltp-epoll-ltp`
+  remained pathological at `35.35x`.
+- Docker-only stress launched seven `futex_wait05` containers plus one
+  `epoll-ltp` container concurrently under
+  `target/conformance/concurrency-docker-082729`.
+- Carrick-only direct stress launched seven Carrick `futex_wait05` guests plus
+  one Carrick `epoll-ltp` guest concurrently under
+  `target/conformance/concurrency-carrick-082758`.
+
+Outcome:
+
+The broad premise did not hold for this exact stress shape. Docker/Linux also
+failed each concurrent `futex_wait05-*` copy with `TFAIL: futex_wait() slept
+for too long` in the timer buckets, while the Carrick-only direct stress passed
+all `futex_wait05` copies. This does not prove the full-bless Carrick outlier is
+healthy, but it falsifies "Linux has no problem executing this timing assertion
+concurrently" for the stress we tried. Do not add sleeps or retune timeouts from
+this evidence. The next useful futex step is a cleaner reproduction of the
+full-harness `futex_wait05` failure, ideally caught with `carrick debug
+lldb-run` if it wedges, before making runtime scheduler changes.
+
+## 2026-07-07 08:47 - lpath xattr semantics and oracle-broken xattr rows
+
+Hypothesis:
+
+The full bless xattr cluster mixed two issues. Some rows were Carrick pass vs
+Docker TBROK because the arm64 Docker container cannot set required privileged
+xattr namespaces. Separately, `ltp-llistxattr01` exposed a real Carrick bug:
+the `l*` xattr syscalls followed the final symlink because path xattr dispatch
+collapsed follow and no-follow variants.
+
+Tests:
+
+- Live Docker oracle for `fgetxattr02` broke during setup with
+  `open(mntpoint/fgetxattr02blk,0,0000) failed: EPERM (1)`.
+- Live Docker oracle for `llistxattr01` broke during setup with
+  `lsetxattr(testfile, security.ltptest1, ..., 4, 1) failed: EPERM (1)`.
+- Focused pre-fix Carrick subset
+  `target/conformance/xattr-focus-082918.jsonl` showed `llistxattr01` failing
+  in Carrick while the other sampled xattr rows were Carrick pass vs Docker
+  broken.
+- LTP source inspection for `llistxattr01` showed the invariant: set one
+  security xattr on the target and a different one on the symlink, then
+  `llistxattr(symlink)` must list only the symlink's own attr:
+  <https://raw.githubusercontent.com/linux-test-project/ltp/master/testcases/kernel/syscalls/llistxattr/llistxattr01.c>.
+
+Outcome:
+
+Fixed the runtime path distinction instead of papering over the row:
+
+- `XattrTarget::Path` now carries `follow: bool`.
+- Syscall dispatch splits `setxattr/lsetxattr`, `getxattr/lgetxattr`,
+  `listxattr/llistxattr`, and `removexattr/lremovexattr` instead of sharing a
+  bogus extra `follow` argument.
+- Host-backed xattr operations call no-follow path primitives for `l*` xattr
+  syscalls.
+- A macOS host-backend unit test covers target-vs-symlink xattr separation.
+
+Verification:
+
+- `cargo fmt --check` passed before the signed rebuild.
+- `cargo check -p carrick-runtime` passed.
+- `cargo test -p carrick-runtime host_lpath_xattrs_do_not_follow_final_symlink`
+  passed.
+- `just build` rebuilt and re-signed the runtime.
+- Focused signed `llistxattr01` after the split:
+  `target/conformance/llistxattr-after-split-084246.jsonl` reported Carrick
+  `1/1` vs cached Docker `0/1`.
+- The 13-row xattr subset
+  `target/conformance/xattr-known-gaps-*.jsonl` exits cleanly with no gating
+  regressions. Every row is now a non-gating `DIFF` because Carrick runs the
+  assertions while the arm64 Docker oracle is setup-broken for this container.
