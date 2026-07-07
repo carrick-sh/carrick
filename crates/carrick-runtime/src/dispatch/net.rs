@@ -1793,6 +1793,46 @@ impl SyscallDispatcher {
         }
     }
 
+    fn reset_host_stream_socket_for_disconnect(&self, fd: i32) -> Result<(), LinuxErrno> {
+        let Some(open_file) = self.open_file(fd) else {
+            return Err(LINUX_EBADF);
+        };
+        let mut open = open_file.description.write();
+        let OpenDescription::HostSocket {
+            host_fd,
+            family,
+            type_,
+            base,
+            synthetic_recv,
+            ..
+        } = &mut *open
+        else {
+            return Err(LINUX_ENOTSOCK);
+        };
+        if *type_ != LINUX_SOCK_STREAM {
+            return Err(LINUX_EINVAL);
+        }
+        let new_host = unsafe {
+            libc::socket(
+                linux_to_host_af(*family),
+                host_socktype_backing(*family, *type_),
+                0,
+            )
+        }
+        .host_syscall_errno()?;
+        set_host_nonblocking(new_host);
+        if let Err(errno) = widen_stream_socket_buffers(new_host, *family, *type_) {
+            unsafe { libc::close(new_host) };
+            return Err(errno);
+        }
+        *host_fd = HostFdRef::new(new_host);
+        synthetic_recv.clear();
+        base.set_connect_in_progress(false);
+        base.clear_socket_error_after_send();
+        let _ = base.take_pending_socket_error();
+        Ok(())
+    }
+
     fn queue_socket_error_after_send(&self, fd: i32) {
         if let Some(open_file) = self.open_file(fd)
             && let OpenDescription::HostSocket { base, .. } = &mut *open_file.description.write()
@@ -2614,6 +2654,84 @@ mod mcast_membership_tests {
             DispatchOutcome::Returned { value: 0 }
         ));
         assert!(listener_memberships.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod ipv6_addrform_tests {
+    use super::*;
+    use crate::dispatch::LinearMemory;
+
+    #[test]
+    fn ipv6_addrform_relabels_guest_family() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let reporter = CompatReporter::default();
+        let mut memory = LinearMemory::new(0x4000, vec![0; 0x1000]);
+
+        let fd = match dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    198,
+                    SyscallArgs::from([
+                        LINUX_AF_INET6 as u64,
+                        LINUX_SOCK_STREAM as u64,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap()
+        {
+            DispatchOutcome::Returned { value } => value as i32,
+            other => panic!("socket(AF_INET6) failed: {other:?}"),
+        };
+
+        memory
+            .write_bytes(0x4000, &LINUX_AF_INET.to_ne_bytes())
+            .unwrap();
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    SyscallRequest::new(
+                        208,
+                        SyscallArgs::from([
+                            fd as u64,
+                            LINUX_SOL_IPV6 as u64,
+                            crate::linux_abi::LINUX_IPV6_ADDRFORM as u64,
+                            0x4000,
+                            4,
+                            0,
+                        ]),
+                    ),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+            DispatchOutcome::Returned { value: 0 }
+        );
+
+        let (old_host, family) = dispatcher.host_socket_lookup(fd).unwrap();
+        assert_eq!(family, LINUX_AF_INET);
+
+        memory.write_bytes(0x4010, &0u16.to_ne_bytes()).unwrap();
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    SyscallRequest::new(203, SyscallArgs::from([fd as u64, 0x4010, 16, 0, 0, 0]),),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        assert_ne!(
+            dispatcher.host_socket_lookup(fd).unwrap().0.get(),
+            old_host.get()
+        );
     }
 }
 
@@ -4946,6 +5064,12 @@ impl SyscallDispatcher {
                     .ok()
                     .map(|b| u16::from_ne_bytes([b[0], b[1]]) as i32 == LINUX_AF_UNSPEC)
                     .unwrap_or(false);
+            if is_unspec_disconnect && this.socket_guest_type(fd) == Some(LINUX_SOCK_STREAM) {
+                match this.reset_host_stream_socket_for_disconnect(fd) {
+                    Ok(()) => return Ok(DispatchOutcome::Returned { value: 0 }),
+                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                }
+            }
             if family == libc::AF_UNIX
                 && let Some(gp) = guest_unix_pathname(memory, addr_addr, addrlen)
             {
@@ -5519,7 +5643,7 @@ impl SyscallDispatcher {
                     }
                 }
             }
-            let (host_fd, _family) = this.host_socket_lookup(fd)?;
+            let (host_fd, family) = this.host_socket_lookup(fd)?;
             // Record the GUEST-intended SO_REUSEADDR / SO_REUSEPORT / SO_RCVBUF / SO_SNDBUF so
             // getsockopt reports what the guest set rather than carrick's
             // host-side widening (SO_REUSEADDR→SO_REUSEPORT for UDP; AF_UNIX
@@ -5573,6 +5697,37 @@ impl SyscallDispatcher {
             // isn't emulated — macOS can't — but the option calls must succeed).
             if level == 136 {
                 let _ = (optname, optval_addr, optlen);
+                return Ok(DispatchOutcome::Returned { value: 0 });
+            }
+            // IPV6_ADDRFORM converts a connected IPv6 socket carrying an IPv4
+            // mapped peer into an IPv4 socket. Darwin has no equivalent option,
+            // but Carrick stores the guest-visible family separately from the
+            // host fd, so model the Linux-visible state transition here.
+            if level == LINUX_SOL_IPV6 && optname == crate::linux_abi::LINUX_IPV6_ADDRFORM {
+                if optlen != 0 && optval_addr == 0 {
+                    return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                }
+                if optlen < 4 {
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                }
+                let Ok(bytes) = memory.read_bytes(optval_addr, 4) else {
+                    return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                };
+                let requested = i32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                if requested != LINUX_AF_INET {
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                }
+                if family != LINUX_AF_INET6 {
+                    return Ok(DispatchOutcome::errno(LINUX_ENOPROTOOPT));
+                }
+                let Some(open_file) = this.open_file(fd) else {
+                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                };
+                let mut open = open_file.description.write();
+                let OpenDescription::HostSocket { family, .. } = &mut *open else {
+                    return Ok(DispatchOutcome::errno(LINUX_ENOTSOCK));
+                };
+                *family = LINUX_AF_INET;
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
             // SO_RCVTIMEO/SO_SNDTIMEO: the host fd is ALWAYS O_NONBLOCK (the
