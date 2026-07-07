@@ -318,6 +318,7 @@ pub trait PlatformFutex: Send + Sync {
         val: u32,
         timeout: Option<Duration>,
         interrupted: &dyn Fn() -> bool,
+        wait_enrolled: &dyn Fn(),
     ) -> i64;
     fn shared_wake(&self, location: SharedFutexLocation, waiter_key: usize, n: u32) -> i64;
     fn shared_requeue(

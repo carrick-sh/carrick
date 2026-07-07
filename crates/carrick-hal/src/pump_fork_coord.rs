@@ -226,6 +226,7 @@ mod tests {
             _v: u32,
             _to: Option<Duration>,
             _i: &dyn Fn() -> bool,
+            _wait_enrolled: &dyn Fn(),
         ) -> i64 {
             0
         }
