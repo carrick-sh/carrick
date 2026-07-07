@@ -2829,6 +2829,12 @@ impl SyscallDispatcher {
                                         raw as i32,
                                         last_ready as i32,
                                     );
+                                    crate::event_ring::rec(
+                                        crate::event_ring::EPMASKFD,
+                                        1,
+                                        gfd,
+                                        hfd,
+                                    );
                                     crate::probes::epoll_masked(crate::probes::EpollMaskedProbe {
                                         origin: 1,
                                         fd: gfd,
@@ -2928,6 +2934,7 @@ impl SyscallDispatcher {
                     let host_fd = this
                         .host_fd_for_poll(*fd)
                         .map_or(-1, |host_fd| host_fd.get());
+                    crate::event_ring::rec(crate::event_ring::EPMASKFD, 2, *fd, host_fd);
                     crate::probes::epoll_masked(crate::probes::EpollMaskedProbe {
                         origin: 2,
                         fd: *fd,
@@ -2991,6 +2998,7 @@ impl SyscallDispatcher {
                         raw_ready as i32,
                         interest.last_ready as i32,
                     );
+                    crate::event_ring::rec(crate::event_ring::EPMASKFD, 3, *fd, -1);
                     crate::probes::epoll_masked(crate::probes::EpollMaskedProbe {
                         origin: 3,
                         fd: *fd,

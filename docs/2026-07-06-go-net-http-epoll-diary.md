@@ -572,3 +572,72 @@ Outcome:
   performance work needs better evidence about why Go emits so many short
   sleeps and whether Carrick is forcing those sleeps through a path Linux avoids,
   not an approximation that changes scheduling semantics.
+
+### Rejected experiment: explicit `NOTE_LOWAT=1` for fresh ET reads
+
+Grounding:
+
+- Post-commit raw suite:
+  `target/conformance/logs/go-net-http-raw-231737.guest.log`.
+  It timed out at 180s at `TestTransportConcurrency/h1`.
+- Deadline handler:
+  `target/conformance/logs/lldb-go-net-http-postcommit/go-net-http-lldb-232051.lldb.txt`.
+  The ring showed the old masked loop, now with `raw=0x5/0x4` equal to
+  `last=0x5/0x4`.
+- Structured `epoll-masked` tail trace:
+  `target/conformance/logs/go-net-http-masktail-232444.dtrace`.
+  The loop was origin 2 over ET sockets requesting `0x80002005`; one fd had
+  `raw=0x5 read_avail=112 last_read_avail=112`, the rest had `raw=0x4`.
+- Host changelist trace:
+  `target/conformance/logs/go-net-http-kevent-233018.dtrace`.
+  Carrick did install `NOTE_LOWAT` for latched read-byte-count sockets, while
+  sockets whose only latched bit was `EPOLLOUT` were rearmed with plain read
+  filters.
+- Host primitive tests added in `carrick-host-bsd` prove kqueue can suppress
+  read readiness until low-water growth, can rearm that threshold after an edge,
+  and still reports EOF with `NOTE_LOWAT=1`.
+
+Experiment:
+
+- Tried setting `read_lowat=Some(1)` for ET read registrations before a read
+  edge has latched, while preserving `last_read_avail + 1` after a read edge.
+
+Outcome:
+
+- Rejected and reverted. The broad suite got past `TestTransportConcurrency/h1`
+  but focused `TestOmitHTTP2Vet` regressed:
+  `target/conformance/logs/go-net-http-vet-234031.guest.log` failed with
+  `SIGTRAP` in a child Go compiler process.
+- Attribution run with the pre-experiment committed binary:
+  `target/conformance/logs/go-net-http-vet-prelowat-234125.guest.log` passed
+  `TestOmitHTTP2Vet` in `real 32.30`.
+- Interpretation: explicit low-water on fresh ET read filters changes runtime
+  scheduling/visibility enough to expose or cause a Go toolchain failure. It is
+  not acceptable as the fix even though it moves the broad suite past h1.
+
+### Diagnostics: fd-bearing masked-readiness event ring
+
+Implementation:
+
+- Added `EPMASKFD` to the always-on event ring and `scripts/carrick_lldb.py`.
+  It records `origin`, guest fd, and host fd next to the existing `EPMASK`
+  `origin/raw/last` record.
+
+Verification:
+
+```sh
+cargo fmt --check
+cargo check -p carrick-cli
+cargo test -p carrick-host-bsd read_lowat -- --nocapture
+just build -p carrick-cli
+target/release/carrick debug lldb-run --deadline-seconds 160 ...
+```
+
+Outcome:
+
+- The new lldb handler capture
+  `target/conformance/logs/lldb-go-net-http-fdmask/go-net-http-lldb-fdmask-234440.lldb.txt`
+  shows the masked loop without DTrace perturbation:
+  repeated origin-2 samples over guest fds `7`, `9`, `10`, `12`, `13`, `14`,
+  `15`, and `16`, with host fds in the `146..162` range. The repeated masks
+  remain `raw=0x4 last=0x4` and `raw=0x5 last=0x5`.
