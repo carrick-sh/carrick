@@ -118,3 +118,48 @@ Verified:
 - Harness run:
   `target/release/carrick-conformance --suite ltp-munmap04 --jsonl target/conformance/munmap04-harness-fixed-022052.jsonl`
   reported `MATCH carrick[0/1] oracle[0/1]` with no performance outlier.
+
+## kill12 sleep/signal performance outlier
+
+Hypothesis:
+The full bless reported `ltp-kill12` as a clean `MATCH`, but with a 32.63x
+timing outlier: Carrick 13,181ms vs cached Docker oracle 404ms. The LTP test
+loops over signals 1..13 and uses `sleep(1)` while waiting for a child
+`SIGCHLD` readiness/exit notification. A one-second-per-signal total means the
+signal eventually arrives, but it is not interrupting the guest sleep promptly.
+
+Tests:
+- Focused exact Carrick argv:
+  `target/conformance/logs/kill12-focus-022859.carrick.log`, elapsed 12.44s.
+- Bounded DTrace script:
+  `scripts/dtrace/sleep-signal-wakeup.d`.
+- DTrace run:
+  `target/conformance/logs/kill12-wakeup-023042.trace`.
+- Focused re-run before the fix:
+  `target/conformance/logs/kill12-refocus-023429.carrick.log`, elapsed 12.57s.
+
+Outcome:
+The trace showed parent child-exit `SIGCHLD` wakes often returned
+`io-wait-end result=2` (`Interrupted`), but the child's guest-sent `SIGCHLD`
+path could sit behind `clock_nanosleep` and only deliver after a timeout. The
+common shape is an xsignal-ring entry that exists outside the host pending
+bitmasks until the dispatcher drains it. Sleep waits were only checking the
+host-signal waiter's predicate while parked; unlike poll/proc-exit waits, they
+did not explicitly service dispatcher-owned pending state before and during
+the wait.
+
+Fix under test:
+For `WaitOnSleep` in both the threaded and single-vCPU loops, drain xsignals
+for the current tid and check dispatcher pending state before parking. Then
+wait in the same 50ms internal slice granularity used by `io_wait`, so each
+slice has a dispatcher-pending recheck instead of letting a guest sleep absorb
+the full one-second deadline.
+
+Verified:
+- Focused exact Carrick argv after the fix:
+  `target/conformance/logs/kill12-sleepfix-023709.carrick.log`, rc 0,
+  elapsed 0.64s.
+- Harness run:
+  `target/release/carrick-conformance --suite ltp-kill12 --jsonl target/conformance/kill12-sleepfix.jsonl`
+  reported `MATCH carrick[1/1] oracle[1/1]`, with Carrick 496ms vs oracle
+  404ms (1.23x).
