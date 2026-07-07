@@ -2729,6 +2729,9 @@ impl SyscallDispatcher {
                                     last_ready,
                                     ready_events,
                                 );
+                                if ready_events == 0 && raw != 0 {
+                                    crate::probes::epoll_masked(1, gfd, requested, raw, last_ready);
+                                }
                                 if ready_events != 0 {
                                     acc.entry(gfd).or_insert((0, data)).0 |= ready_events;
                                 } else if requested & LINUX_EPOLLET != 0
@@ -2835,6 +2838,9 @@ impl SyscallDispatcher {
                     interest.last_ready,
                     ready_events,
                 );
+                if ready_events == 0 && raw_ready != 0 {
+                    crate::probes::epoll_masked(2, *fd, requested, raw_ready, interest.last_ready);
+                }
                 if ready_events != 0 {
                     let entry = acc.entry(*fd).or_insert((0, interest.event.data));
                     entry.0 |= ready_events;
@@ -2872,6 +2878,9 @@ impl SyscallDispatcher {
                     interest.last_ready,
                     ready_events,
                 );
+                if ready_events == 0 && raw_ready != 0 {
+                    crate::probes::epoll_masked(3, *fd, requested, raw_ready, interest.last_ready);
+                }
                 if ready_events != 0 {
                     let entry = acc.entry(*fd).or_insert((0, interest.event.data));
                     entry.0 |= ready_events;

@@ -44,6 +44,15 @@ carrick*:::epoll-interest
         pid, (int)arg0, (int)arg1, (uint32_t)arg2, (uint32_t)arg3, (uint32_t)arg4);
 }
 
+carrick*:::epoll-masked
+/(pid == $target || progenyof($target))/
+{
+    this->m = (uint64_t *)copyin(arg0, 40);
+    @masked_origin[(int)this->m[0], (uint32_t)this->m[2], (uint32_t)this->m[3], (uint32_t)this->m[4]] = count();
+    printf("[%d epoll-masked-origin] fd=%d requested=%#x raw=%#x last=%#x origin=%d\n",
+        pid, (int)this->m[1], (uint32_t)this->m[2], (uint32_t)this->m[3], (uint32_t)this->m[4], (int)this->m[0]);
+}
+
 tick-1s
 {
     printf("\n========= epoll tick %Y =========\n", walltimestamp);
@@ -53,6 +62,8 @@ tick-1s
     printa("  events=%#x timeout=%-8d %@d\n", @wait_fds);
     printf("--- masked interest samples ---\n");
     printa("  requested=%#x raw=%#x last=%#x %@d\n", @masked);
+    printf("--- masked origins ---\n");
+    printa("  origin=%-2d requested=%#x raw=%#x last=%#x %@d\n", @masked_origin);
 }
 
 tick-20s
@@ -69,4 +80,6 @@ dtrace:::END
     printa("  events=%#x timeout=%-8d %@d\n", @wait_fds);
     printf("--- masked interest samples ---\n");
     printa("  requested=%#x raw=%#x last=%#x %@d\n", @masked);
+    printf("--- masked origins ---\n");
+    printa("  origin=%-2d requested=%#x raw=%#x last=%#x %@d\n", @masked_origin);
 }
