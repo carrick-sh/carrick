@@ -403,6 +403,7 @@ dependencies = [
 name = "carrick-host"
 version = "0.1.0"
 dependencies = [
+ "carrick-kernel",
  "libc",
 ]
 
