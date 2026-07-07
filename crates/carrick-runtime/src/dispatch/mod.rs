@@ -7041,6 +7041,90 @@ mod overlay_dispatch_tests {
         }
     }
 
+    #[test]
+    fn epoll_close_rebinds_shared_host_fd_survivor() {
+        use std::time::Duration;
+
+        let mut h = Harness::new();
+        let epfd = returned(h.call(20, [0, 0, 0, 0, 0, 0])) as u64;
+
+        let pair_addr = h.reserve(8);
+        assert_eq!(
+            returned(h.call(
+                199,
+                [
+                    LINUX_AF_UNIX as u64,
+                    LINUX_SOCK_STREAM as u64 | LINUX_O_NONBLOCK,
+                    0,
+                    pair_addr,
+                    0,
+                    0,
+                ],
+            )),
+            0
+        );
+        let pair = h.memory.read_bytes(pair_addr, 8).unwrap();
+        let survivor = i32::from_le_bytes(pair[0..4].try_into().unwrap());
+        let peer = i32::from_le_bytes(pair[4..8].try_into().unwrap());
+        let closing_dup = returned(h.call(23, [survivor as u64, 0, 0, 0, 0, 0])) as i32;
+
+        let ev_addr = h.reserve(16);
+        let mut ev = [0u8; 16];
+        ev[0..4].copy_from_slice(&(LINUX_EPOLLIN | LINUX_EPOLLET).to_le_bytes());
+        ev[8..16].copy_from_slice(&(survivor as u64).to_le_bytes());
+        h.memory.write_bytes(ev_addr, &ev).unwrap();
+        assert_eq!(
+            returned(h.call(
+                21,
+                [epfd, LINUX_EPOLL_CTL_ADD, survivor as u64, ev_addr, 0, 0],
+            )),
+            0
+        );
+
+        ev[8..16].copy_from_slice(&(closing_dup as u64).to_le_bytes());
+        h.memory.write_bytes(ev_addr, &ev).unwrap();
+        assert_eq!(
+            returned(h.call(
+                21,
+                [epfd, LINUX_EPOLL_CTL_ADD, closing_dup as u64, ev_addr, 0, 0,],
+            )),
+            0
+        );
+
+        assert_eq!(returned(h.call(57, [closing_dup as u64, 0, 0, 0, 0, 0])), 0);
+
+        let byte_addr = h.put_bytes(b"x");
+        assert_eq!(
+            returned(h.call(64, [peer as u64, byte_addr, 1, 0, 0, 0])),
+            1
+        );
+
+        let delivered_guest_fd = {
+            let epoll_open = h.dispatcher.open_file(epfd as i32).expect("epoll fd");
+            let open = epoll_open.description.read();
+            let OpenDescription::Epoll { kqueue, .. } = &*open else {
+                panic!("epfd should be an epoll description");
+            };
+            let mut events = Vec::new();
+            let n = kqueue
+                .with_mux(|mux| mux.wait(&mut events, Some(Duration::from_millis(100))))
+                .expect("kqueue wait");
+            assert!(n > 0, "peer write should wake the epoll instance");
+            let io_tokens = events
+                .iter()
+                .filter(|event| event.readiness.read || event.readiness.write || event.eof)
+                .map(|event| (event.token & 0xffff_ffff) as u32 as i32)
+                .collect::<Vec<_>>();
+            assert_eq!(io_tokens.len(), 1, "expected one routed IO readiness event");
+            io_tokens[0]
+        };
+
+        assert_eq!(
+            delivered_guest_fd, survivor,
+            "close of a dup must rebind the shared host-fd registration to a surviving guest fd"
+        );
+    }
+
     /// GROUNDED REGRESSION GATE (Rust, in-tree, cross-platform: macOS kqueue +
     /// Linux epoll-emulation) for the epoll EPOLLET edge-loss hang. It drives the
     /// REAL `epoll_pwait`/`epoll_ctl`/`pipe2` handlers through the threaded

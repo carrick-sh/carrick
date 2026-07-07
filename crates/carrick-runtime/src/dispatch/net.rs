@@ -987,6 +987,7 @@ impl SyscallDispatcher {
     /// `EPOLL_CTL_DEL`-covered survivor-rebind case. MUST be called with NO
     /// `open_files` lock held — it takes a read lock to snapshot the instances.
     pub(in crate::dispatch) fn detach_fd_from_epolls(&self, fd: i32) {
+        let detached_host_fd = self.host_fd_for_poll(fd);
         let descriptions: Vec<OpenDescriptionRef> = self
             .io
             .open_files
@@ -1005,6 +1006,43 @@ impl SyscallDispatcher {
                 && interest.remove(&fd).is_some()
             {
                 clear_pending_epoll_ready(pending_ready, fd);
+                if let Some(host_fd) = detached_host_fd {
+                    #[cfg(any(
+                        feature = "platform-macos",
+                        feature = "platform-freebsd",
+                        feature = "platform-netbsd"
+                    ))]
+                    self.rebind_epoll_host_registration(kqueue, interest, host_fd);
+                    #[cfg(not(any(
+                        feature = "platform-macos",
+                        feature = "platform-freebsd",
+                        feature = "platform-netbsd"
+                    )))]
+                    {
+                        let mut survivor: Option<(i32, u32)> = None;
+                        let mut union_events: u32 = 0;
+                        for (&other, slot) in interest.iter() {
+                            if self.host_fd_for_poll(other) == Some(host_fd) {
+                                survivor.get_or_insert((other, slot.reg_gen));
+                                union_events |= slot.event.events;
+                            }
+                        }
+                        kqueue.with_mux(|mux| match survivor {
+                            Some((sfd, sgen)) => {
+                                let union_events = LinuxEpollEvents::from_bits_retain(union_events);
+                                let _ = mux.register_io(
+                                    host_fd.get(),
+                                    pack_epoll_udata(sfd, sgen),
+                                    epoll_interest_for(union_events),
+                                    epoll_host_trigger_mode(union_events),
+                                );
+                            }
+                            None => {
+                                let _ = mux.deregister(host_fd.get());
+                            }
+                        });
+                    }
+                }
                 // A parked waiter still ppolls the closed fd's host fd (a
                 // closed entry never wakes poll); pop it so it rebuilds.
                 kqueue.wake_parked();
