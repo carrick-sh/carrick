@@ -543,31 +543,6 @@ pub fn is_orphaned(host_pid: u32) -> bool {
         .unwrap_or(false)
 }
 
-/// Called by a freshly-forked CHILD before it runs any guest code: wait until
-/// the parent has registered this process in the shared table (the parent
-/// allocates the ns-pid in its fork branch — §5.3). This closes the race where
-/// the child's first `getpid()`/`getppid()` would otherwise see no mapping
-/// (translating to 0) before the parent's `register_child` lands. The parent
-/// registers within microseconds; the bounded spin (with `sched_yield`) caps
-/// the wait so a never-registering parent can't hang the child. No-op when
-/// namespaces are off.
-pub fn await_self_registration() {
-    let Some(r) = region() else { return };
-    let self_host = std::process::id();
-    // ~50ms worst case (5000 * ~10us yield) — orders of magnitude beyond the
-    // real parent-register latency, but bounded so a crashed parent can't wedge.
-    for _ in 0..5000 {
-        if r.host_to_ns(self_host).is_some() {
-            return;
-        }
-        // SAFETY: sched_yield is always safe; hands the CPU to the parent so it
-        // can complete register_child.
-        unsafe {
-            libc::sched_yield();
-        }
-    }
-}
-
 /// Allocate the ns-pid before `fork(2)` so the child's process record can be
 /// fully populated before either process resumes. Identity mode has no active
 /// namespace table, so the caller falls back to the host pid after fork.
