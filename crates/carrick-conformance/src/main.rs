@@ -1138,7 +1138,12 @@ fn suite_requires_exclusive_lane(suite: &Suite) -> bool {
     // when co-scheduled under HVF. Keep this as scheduling isolation, not a
     // timeout escape hatch: the underlying performance outliers still show up
     // in the per-suite timing ratios.
-    const EXCLUSIVE_SUITES: &[&str] = &["go-net_http", "ltp-inotify09", "ltp-openat03"];
+    const EXCLUSIVE_SUITES: &[&str] = &[
+        "go-net_http",
+        "ltp-execve05",
+        "ltp-inotify09",
+        "ltp-openat03",
+    ];
     EXCLUSIVE_SUITES.contains(&suite.name.as_str())
 }
 
@@ -2208,6 +2213,7 @@ mod tests {
         let lanes = SchedulerLanes::new(2);
         let suites = vec![
             suite("go-net_http", Ecosystem::Go, Weight::Heavy),
+            suite("ltp-execve05", Ecosystem::Ltp, Weight::Light),
             suite("ltp-openat03", Ecosystem::Ltp, Weight::Light),
             suite("ltp-inotify09", Ecosystem::Ltp, Weight::Light),
             suite("cpython-tarfile", Ecosystem::Cpython, Weight::Heavy),

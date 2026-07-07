@@ -621,3 +621,38 @@ guests. This intentionally does not raise their deadlines and does not bless
 away the performance problem: `openat03` remains an order-of-magnitude syscall
 / filesystem overhead outlier, and `inotify09` remains close to the 40s
 deadline even when isolated.
+
+## 2026-07-07 05:22 - execve05 checkpoint TBROK classified as load-sensitive
+
+Hypothesis:
+
+The current full bless attempt moved `ltp-openat03` and `ltp-inotify09` out of
+the timeout set, but `ltp-execve05` became the top gating slow regression:
+`13856ms/604ms`, with Carrick reporting `passed 8, broken 1`. The raw log showed
+all eight `execve_child` processes printed their canary `TPASS`, then the parent
+TBROKed in `tst_checkpoint_wake(0, 8, 10000)`.
+
+Tests:
+
+- Focused `ltp-execve05` repeats:
+  `target/conformance/execve05-repeat-{1,2,3}-*.jsonl` all matched, with
+  Carrick times `466ms`, `464ms`, and `454ms` against the cached `604ms` Docker
+  oracle.
+- After adding `ltp-execve05` to the exclusive scheduling rule, the targeted
+  run `target/conformance/exclusive-ltp2-051915.{log,jsonl}` matched
+  `ltp-execve05`, `ltp-inotify09`, and `ltp-openat03` together.
+- Live Docker oracle run matched the cache: all eight children passed and no
+  checkpoint broke.
+- LTP `execve05` source is a simultaneous checkpoint fan-out: fork 8 children,
+  each waits on checkpoint 0, then the parent wakes all 8 and each child
+  `execve`s `execve_child`.
+
+Outcome:
+
+This is not an `execve(2)` semantic failure in focused execution. Under full
+HVF load, the parent can spend more than the LTP 10s checkpoint-wake window
+getting all eight children through the checkpoint/exec path, so the row flips
+from a match into a TBROK. `ltp-execve05` now uses the same exclusive scheduler
+lane as the other load-sensitive rows. The raw exec/checkpoint scalability
+problem remains real; the scheduler change prevents a load artifact from being
+misclassified as a semantic conformance diff.
