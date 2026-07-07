@@ -614,6 +614,24 @@ pub fn pending_adopted_child(waiter_pid: u32, target_pid: i32) -> Option<u32> {
     None
 }
 
+/// Park target for a blocking `wait4(-1)`.
+///
+/// Returns `-1` whenever ANY direct child exists — the io_wait `-1` branch
+/// (`wait_proc_exit_any_kqueue`) arms one `NOTE_EXIT` watch PER direct child.
+/// Never substitutes a single child pid for `-1`: the single-pid slice loop
+/// re-polls `child_status_ready` for ONLY the watched pid, so parking on the
+/// first-listed child misses a sibling's exit (Linux returns the sibling
+/// immediately; a first-child park blocks until the watched child dies).
+/// With no direct children, an adopted child that is not yet exit-ready is a
+/// concrete watchable pid (`EVFILT_PROC` watches non-children). With neither,
+/// `None`: the caller reports `ECHILD` instead of parking forever.
+pub fn wait_any_park_pid(waiter_pid: u32) -> Option<i32> {
+    if !direct_children_for_wait(waiter_pid).is_empty() {
+        return Some(-1);
+    }
+    pending_adopted_child(waiter_pid, -1).map(|pid| pid as i32)
+}
+
 /// Snapshot direct, non-adopted children of `waiter_pid` that can be watched
 /// with host `EVFILT_PROC`/`NOTE_EXIT`.
 ///
@@ -879,6 +897,47 @@ mod tests {
         assert_eq!(parent_pid_for_test(child_pid), Some(parent_pid));
 
         let _ = reap_child_guest_ns(child_pid);
+    }
+
+    #[test]
+    fn wait_any_park_target_is_any_child_never_the_first() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        init_child_table();
+        let waiter = 818_181;
+        let first = 818_182;
+        let second = 818_183;
+
+        // Two direct children registered through the pre-fork path. A blocking
+        // wait4(-1) park must go to the any-child kqueue path (-1): parking on
+        // the FIRST child's pid misses the second child's exit (the single-pid
+        // slice loop re-polls only the watched pid).
+        prepare_child_record_pre_fork(waiter, 0, 0, false, 0);
+        publish_prepared_child_record_parent(first);
+        prepare_child_record_pre_fork(waiter, 0, 0, false, 0);
+        publish_prepared_child_record_parent(second);
+
+        assert_eq!(wait_any_park_pid(waiter), Some(-1));
+
+        let r1 = find_child_record(first).unwrap_or_else(|| panic!("first record"));
+        release_child_record(r1);
+        // With only one direct child left the park target is STILL -1: the
+        // any-child path handles a single watch fine, and pid-order guessing
+        // is exactly the bug this guards against.
+        assert_eq!(wait_any_park_pid(waiter), Some(-1));
+        let r2 = find_child_record(second).unwrap_or_else(|| panic!("second record"));
+        release_child_record(r2);
+
+        // No direct children, one adopted child not yet exit-ready: park on the
+        // adopted child's concrete host pid (EVFILT_PROC watches non-children).
+        let adopted = 818_184;
+        prepare_child_record_pre_fork(waiter, 0, 0, true, 0);
+        publish_prepared_child_record_parent(adopted);
+        assert_eq!(wait_any_park_pid(waiter), Some(adopted as i32));
+        let r3 = find_child_record(adopted).unwrap_or_else(|| panic!("adopted record"));
+        release_child_record(r3);
+
+        // No children at all: no park target (the caller reports ECHILD).
+        assert_eq!(wait_any_park_pid(waiter), None);
     }
 
     #[test]
