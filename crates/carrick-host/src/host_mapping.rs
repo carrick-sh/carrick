@@ -279,6 +279,10 @@ mod tests {
         let _serialize = MMAP_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Other host tests can lazily initialize the shared kernel arena, which
+        // opens one fd. Do it before the fd-count baseline so this leak test
+        // measures only map_shared_file cycles.
+        crate::guest_cpu::init_child_table();
         // A real backing file (mmap of an anonymous/closed fd is not portable);
         // 16 KiB so it is a single HVF granule.
         let len = 16 * 1024usize;
