@@ -45,6 +45,7 @@ where
                     self.terminate_siblings_for_exec(kernel, engine)?;
                 }
                 engine.execve_into(&img)?;
+                crate::namespace::pid::mark_self_execed();
                 // execve_into rebuilt a fresh vCPU: re-stamp the identity page
                 // (zeroed) and TPIDR_EL1 (reset) for the same thread/tid.
                 stamp_identity_page(engine, &kernel.dispatcher);

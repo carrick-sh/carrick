@@ -53,6 +53,7 @@ pub struct MemberSlot {
     pub host_pid: AtomicU32,
     pub ns_pid: AtomicU32,
     pub parent_host_pid: AtomicU32,
+    pub execed: AtomicU8,
     pub flags: AtomicU8,
     pub exit_status: AtomicI32,
 }
@@ -63,6 +64,7 @@ impl MemberSlot {
             host_pid: AtomicU32::new(0),
             ns_pid: AtomicU32::new(0),
             parent_host_pid: AtomicU32::new(0),
+            execed: AtomicU8::new(0),
             flags: AtomicU8::new(MEMBER_ALIVE),
             exit_status: AtomicI32::new(0),
         }
@@ -304,6 +306,7 @@ pub fn set_init(init_host_pid: u32) {
     let init_slot = &region.members[0];
     init_slot.ns_pid.store(NS_INIT_PID, Ordering::Relaxed);
     init_slot.parent_host_pid.store(0, Ordering::Relaxed);
+    init_slot.execed.store(0, Ordering::Relaxed);
     init_slot.flags.store(MEMBER_ALIVE, Ordering::Relaxed);
     // Publish host_pid last so a concurrent reader never sees a half-filled slot
     // (Release pairs with the Acquire scan in `host_to_ns`).
@@ -694,6 +697,25 @@ pub fn unregister_reaped(host_pid: u32) {
     }
 }
 
+/// Mark the current member as having successfully crossed an `execve(2)` point
+/// of no return. Linux uses this to reject a parent changing the process group
+/// of its child after the child has executed a new program.
+pub fn mark_self_execed() {
+    let Some(r) = region() else { return };
+    r.mark_execed(std::process::id());
+}
+
+/// Whether `target_ns_pid` names a direct child of the current process that has
+/// successfully execed. Identity mode has no namespace table, so this predicate
+/// is only authoritative for namespace-enabled container runs.
+pub fn is_execed_child_of_current(target_ns_pid: u32) -> bool {
+    let Some(r) = region() else { return false };
+    let Some(target_host_pid) = r.ns_to_host(target_ns_pid) else {
+        return false;
+    };
+    r.is_execed_child_of(target_host_pid, std::process::id())
+}
+
 /// `carrick exec`: attach the running container's file-backed region and join it
 /// as a new member — a fresh ns-pid, parented OUTSIDE the namespace (the
 /// `carrick exec` CLI, so the exec'd guest's ns-ppid is 0, matching docker exec).
@@ -734,6 +756,7 @@ impl NsSharedRegion {
                 slot.ns_pid.store(ns_pid, Ordering::Relaxed);
                 slot.parent_host_pid
                     .store(parent_host_pid, Ordering::Relaxed);
+                slot.execed.store(0, Ordering::Relaxed);
                 slot.exit_status.store(0, Ordering::Relaxed);
                 slot.flags.store(MEMBER_ALIVE, Ordering::Relaxed);
                 // Publish host_pid last so a concurrent reader never sees a
@@ -804,6 +827,29 @@ impl NsSharedRegion {
             .map(|i| self.members[i].parent_host_pid.load(Ordering::Acquire))
     }
 
+    /// Whether the member has successfully executed a new image since fork.
+    pub fn execed_of(&self, host_pid: u32) -> Option<bool> {
+        self.slot_of(host_pid)
+            .map(|i| self.members[i].execed.load(Ordering::Acquire) != 0)
+    }
+
+    /// Mark a registered member as having crossed an exec point of no return.
+    pub fn mark_execed(&self, host_pid: u32) {
+        if let Some(i) = self.slot_of(host_pid) {
+            self.members[i].execed.store(1, Ordering::Release);
+        }
+    }
+
+    /// Whether `host_pid` is a direct child of `parent_host_pid` and has
+    /// successfully executed a new image.
+    pub fn is_execed_child_of(&self, host_pid: u32, parent_host_pid: u32) -> bool {
+        let Some(i) = self.slot_of(host_pid) else {
+            return false;
+        };
+        self.members[i].parent_host_pid.load(Ordering::Acquire) == parent_host_pid
+            && self.members[i].execed.load(Ordering::Acquire) != 0
+    }
+
     /// Translate a member's recorded parent to the pid its namespace sees.
     pub fn ns_ppid_for_host(&self, host_pid: u32) -> Option<u32> {
         let ns_pid = self.host_to_ns(host_pid)?;
@@ -865,6 +911,7 @@ impl NsSharedRegion {
             {
                 slot.ns_pid.store(0, Ordering::Relaxed);
                 slot.parent_host_pid.store(0, Ordering::Relaxed);
+                slot.execed.store(0, Ordering::Relaxed);
                 slot.exit_status.store(0, Ordering::Relaxed);
                 slot.flags.store(MEMBER_ALIVE, Ordering::Relaxed);
                 slot.host_pid.store(0, Ordering::Release);
@@ -991,6 +1038,12 @@ mod tests {
         assert_eq!(region.ns_ppid_for_host(100), Some(0));
         assert_eq!(region.ns_ppid_for_host(200), Some(1));
         assert_eq!(region.ns_ppid_for_host(999), None);
+        assert_eq!(region.execed_of(200), Some(false));
+        assert!(!region.is_execed_child_of(200, 100));
+        region.mark_execed(200);
+        assert_eq!(region.execed_of(200), Some(true));
+        assert!(region.is_execed_child_of(200, 100));
+        assert!(!region.is_execed_child_of(200, 999));
 
         // orphan the child by killing its parent (100)
         region.mark_children_orphaned(100);
@@ -1065,6 +1118,8 @@ mod tests {
         let first_ns = region.alloc_ns_pid();
         assert_eq!(first_ns, 2);
         assert_eq!(region.register(200, first_ns, 100), Some(0));
+        region.mark_execed(200);
+        assert_eq!(region.execed_of(200), Some(true));
         region.mark_dead(200, 0);
         assert_eq!(region.ns_to_host(first_ns), Some(200));
 
@@ -1076,6 +1131,7 @@ mod tests {
         assert_eq!(second_ns, 3);
         assert_eq!(region.register(201, second_ns, 100), Some(0));
         assert_eq!(region.ns_to_host(second_ns), Some(201));
+        assert_eq!(region.execed_of(201), Some(false));
         assert_eq!(region.ns_to_host(first_ns), None);
 
         unsafe {

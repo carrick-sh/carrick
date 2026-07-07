@@ -1121,6 +1121,7 @@ where
                         apply_image_proc_state(&dispatcher, &new_image);
                         dispatcher.close_cloexec_fds();
                         runtime.execve_into(&new_image)?;
+                        crate::namespace::pid::mark_self_execed();
                         // execve_into rebuilt a fresh (zeroed) identity page.
                         stamp_identity_page(runtime, &dispatcher);
                         stop_after_traced_exec(&dispatcher);
