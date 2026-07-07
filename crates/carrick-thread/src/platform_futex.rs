@@ -183,6 +183,7 @@ impl<S: SharedFutexSyscall> PlatformFutex for FutexTableFutex<S> {
         value: u32,
         timeout: Option<Duration>,
         interrupted: &dyn Fn() -> bool,
+        wait_enrolled: &dyn Fn(),
     ) -> i64 {
         let mut location = location;
         let mut waiter_key = waiter_key;
@@ -196,6 +197,7 @@ impl<S: SharedFutexSyscall> PlatformFutex for FutexTableFutex<S> {
                 self.shared.wait_start(waiter_key);
                 false
             };
+            wait_enrolled();
             if already_woken {
                 return 0;
             }
@@ -275,6 +277,7 @@ impl<S: SharedFutexSyscall> PlatformFutex for FutexTableFutex<S> {
 mod tests {
     use super::*;
     use carrick_hal::HostVa;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct RecordingShared;
 
@@ -306,7 +309,70 @@ mod tests {
             waiter_key: 0x1000,
         };
 
-        assert_eq!(futex.shared_wait(location, 0x2000, 7, None, &|| false), 0);
+        assert_eq!(
+            futex.shared_wait(location, 0x2000, 7, None, &|| false, &|| {}),
+            0
+        );
         assert_eq!(futex.shared_wake(location, 0x2000, 3), 3);
+    }
+
+    struct OrderedShared {
+        state: Arc<AtomicUsize>,
+    }
+
+    impl SharedFutexSyscall for OrderedShared {
+        fn wait_start(&self, _waiter_key: usize) {
+            assert_eq!(
+                self.state.swap(1, Ordering::SeqCst),
+                0,
+                "wait_start must run first"
+            );
+        }
+
+        fn wait_one_slice(
+            &self,
+            _location: SharedFutexLocation,
+            _waiter_key: usize,
+            _val: u32,
+            _slice_ns: i64,
+        ) -> SharedWaitStep {
+            assert_eq!(
+                self.state.load(Ordering::SeqCst),
+                2,
+                "wait_enrolled callback must run before the first wait slice"
+            );
+            SharedWaitStep::Woken
+        }
+
+        fn wake(&self, _location: SharedFutexLocation, _waiter_key: usize, _n: u32) -> i64 {
+            0
+        }
+    }
+
+    #[test]
+    fn shared_wait_publishes_after_waiter_enrollment() {
+        let state = Arc::new(AtomicUsize::new(0));
+        let futex = FutexTableFutex::new(
+            Arc::new(FutexTable::default()),
+            OrderedShared {
+                state: Arc::clone(&state),
+            },
+        );
+        let location = SharedFutexLocation::Direct {
+            word: HostVa(0x1000),
+            waiter_key: 0x1000,
+        };
+        let mark_enrolled = || {
+            assert_eq!(
+                state.swap(2, Ordering::SeqCst),
+                1,
+                "wait_enrolled must run after wait_start"
+            );
+        };
+
+        assert_eq!(
+            futex.shared_wait(location, 0x2000, 7, None, &|| false, &mark_enrolled),
+            0
+        );
     }
 }

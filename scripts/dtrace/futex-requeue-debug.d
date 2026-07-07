@@ -51,7 +51,7 @@ carrick*:::ulock-requeue
 }
 
 tick-1s { secs++; }
-tick-1s /secs >= 20/ { exit(0); }
+tick-1s /secs >= 60/ { exit(0); }
 
 END
 {

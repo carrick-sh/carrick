@@ -938,3 +938,57 @@ This confirms the current design is not an atomic move. It relies on physically
 woken source waiters to consume source credits, while the destination wake path
 uses logical destination counts. The next fix should be evaluated with this
 trace under a failing/full-load scenario, not by another blind credit tweak.
+
+## 2026-07-07 06:59 - fixed false-S readiness before shared futex enrollment
+
+Hypothesis:
+
+`futex_cmp_requeue01` waits for every child to report `/proc/<pid>/stat` state
+`S`, then increments the futex word before `FUTEX_CMP_REQUEUE`. Carrick
+published `RunState::Blocked` before the shared-futex waiter was visible in the
+fork-shared ulock side table. Under load, the parent could observe `S` for a
+child that had not actually entered `FUTEX_WAIT`, then change the futex word and
+run the requeue pass too early.
+
+Tests:
+
+- A Carrick-only load reproducer with `fcntl36`, `fcntl36_64`, `epoll-ltp`, and
+  `flock07` in the background reproduced the failure without Docker overlap.
+- Moving the blocked-state publish behind shared-futex waiter enrollment removed
+  the `ETIMEDOUT` children, but test 5 still returned `997` instead of `1000`.
+- That intermediate result exposed the second root cause: the run-state table
+  had only 510 slots, while `futex_cmp_requeue01` creates 1000 children. Once
+  full, later children fell back to host scheduler state, recreating the
+  false-`S` readiness path for a minority of waiters.
+
+Change:
+
+- Added a `PlatformFutex::shared_wait` enrollment callback and invoke it only
+  after `SharedFutexSyscall::wait_start` has made the waiter visible.
+- Moved threaded-loop `/proc` `Blocked` publication into that callback.
+- Increased the fork-shared run-state table to 4096 slots.
+- Extended `scripts/dtrace/futex-requeue-debug.d` to 60 seconds so the trace
+  does not terminate high-fanout runs before the 1000-waiter phases.
+
+Verification:
+
+- `cargo test -p carrick-thread shared_wait_publishes_after_waiter_enrollment --lib`
+  passed.
+- `cargo test -p carrick-runtime table_covers_ltp_futex_cmp_requeue_fanout --lib`
+  passed.
+- `cargo check -p carrick-hal -p carrick-thread -p carrick-vmm-hvf -p carrick-runtime -p carrick-vmm-kvm`
+  passed.
+- `just build` rebuilt and re-signed `target/release/carrick`.
+- Focused row
+  `target/conformance/futex-requeue-statefix2-focus-065906.jsonl` matched:
+  Carrick `7/7`, Docker `7/7`, `7450ms/1214ms` (`6.14x`).
+- The same Carrick-only load reproducer that had failed at `997/1000` passed:
+  `target/conformance/logs/futex-requeue-statefix2-load-065923.guest.log`
+  reported `passed 7`, `failed 0`, including test 5 returning `1000` and
+  observing `futex1: 900`.
+
+Outcome:
+
+The `futex_cmp_requeue01` semantic regression is fixed in the focused and
+load-stressed reproducers. It remains slower than the Docker oracle, but it is
+now below the 10x pathological threshold in the focused harness row.
