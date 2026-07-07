@@ -7,7 +7,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use crate::domains::ProcessGeneration;
+use crate::domains::{HostPid, ProcessGeneration};
 
 pub const ARENA_MAGIC: u32 = 0x434b_4131;
 pub const ARENA_VERSION: u32 = 1;
@@ -51,6 +51,36 @@ pub enum ArenaError {
         section: &'static str,
         capacity: usize,
     },
+}
+
+impl PermitSection {
+    const STATE_ACQUIRING: u64 = 1 << 62;
+
+    fn pack(pid: HostPid, generation: ProcessGeneration) -> u64 {
+        Self::STATE_ACQUIRING
+            | ((u64::from(generation.raw()) & ((1u64 << 30) - 1)) << 32)
+            | u64::from(pid.raw())
+    }
+
+    pub fn try_claim_slot(
+        &self,
+        pid: HostPid,
+        generation: ProcessGeneration,
+    ) -> Result<usize, ArenaError> {
+        let packed = Self::pack(pid, generation);
+        for (i, slot) in self.slots.iter().enumerate() {
+            if slot
+                .compare_exchange(0, packed, Ordering::SeqCst, Ordering::Relaxed)
+                .is_ok()
+            {
+                return Ok(i);
+            }
+        }
+        Err(ArenaError::Exhausted {
+            section: "permits",
+            capacity: PERMIT_MAX_SLOTS,
+        })
+    }
 }
 
 pub struct KernelArena {
@@ -239,6 +269,30 @@ mod tests {
                 "child write not visible"
             );
             std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn permit_section_exhaustion_is_loud() {
+        let arena = KernelArena::create().unwrap();
+        let l = arena.layout();
+        for i in 0..PERMIT_MAX_SLOTS {
+            let claimed = l.permits.try_claim_slot(
+                crate::domains::HostPid::new(100 + i as u32),
+                arena.allocate_generation(),
+            );
+            assert!(claimed.is_ok(), "slot {i} should claim");
+        }
+        let full = l.permits.try_claim_slot(
+            crate::domains::HostPid::new(9999),
+            arena.allocate_generation(),
+        );
+        match full {
+            Err(ArenaError::Exhausted { section, capacity }) => {
+                assert_eq!(section, "permits");
+                assert_eq!(capacity, PERMIT_MAX_SLOTS);
+            }
+            other => panic!("expected loud exhaustion, got {other:?}"),
         }
     }
 }
