@@ -940,3 +940,60 @@ Interpretation:
   sockets (`EADDRNOTAVAIL`) rather than a no-op success.
 - Focused timing is acceptable here: Carrick is close to Docker for this case,
   so the larger performance outliers in the bless log remain separate targets.
+
+### Second bless attempt: classify acct/bind, fix chroot root semantics
+
+Hypotheses:
+
+- H1: After fixing `accept02`, the early `acct01` and `bind06` regressions are
+  classification/environment diffs, not Carrick runtime crashes.
+- H2: `chroot04`/`chroot02` are real filesystem semantics bugs. Carrick records
+  the new root for `getcwd`, but absolute path resolution still uses global `/`,
+  and `chroot` does not check search permission on the final new-root directory
+  before returning the capability error.
+
+Tests:
+
+- Reran full `scripts/conformance/run-full.sh --bless`; it did not bless, but
+  `ltp-accept02` now matched. The log
+  `target/conformance/logs/conformance-bless-20260707-005118.log` fail-fasted
+  at 52 cached-oracle gating verdicts.
+- Focused `acct01`: Carrick skipped because `/proc/config.gz` reports
+  `CONFIG_BSD_PROCESS_ACCT` absent; Docker broke because the container could not
+  acquire a block device. This is classification/baseline debt.
+- Focused `bind06`: Carrick skipped because `AF_PACKET`/protocol 17 is not
+  supported; Docker broke on unprivileged namespace setup. This is also
+  classification/baseline debt.
+- Focused `chroot04`: Carrick returned `EPERM` for a no-search-permission
+  directory where Docker/Linux returned `EACCES`.
+- Focused `chroot02`: Carrick succeeded at `chroot(tmpdir)` but `stat` of an
+  absolute path inside the new root missed the file; Docker/Linux found it.
+
+Outcome:
+
+- Added resolver support for `io.chroot_root` on absolute paths, including the
+  resolve-cache key so pre- and post-chroot absolute lookups cannot alias.
+- Added a final-directory search-permission check for `chroot` before the
+  capability check, preserving Linux's lookup-error precedence over `EPERM`.
+- Focused checks passed:
+  `cargo fmt --check`;
+  `cargo test -p carrick-runtime chroot_`;
+  `cargo check -p carrick-cli`;
+  `just build -p carrick-cli`.
+- Focused Carrick/Docker matches:
+  `target/conformance/logs/ltp-chroot04-chrootfix-010138.carrick.log`
+  passed in `0.62 real`, Docker
+  `target/conformance/logs/ltp-chroot04-chrootfix-010138.docker.log`
+  passed in `0.262 total`;
+  `target/conformance/logs/ltp-chroot02-chrootfix-010139.carrick.log`
+  passed in `0.34 real`, Docker
+  `target/conformance/logs/ltp-chroot02-chrootfix-010139.docker.log`
+  passed in `0.191 total`.
+
+Interpretation:
+
+- `acct01` and `bind06` should be marked/classified rather than treated as
+  root-cause runtime bugs in this pass.
+- `chroot02`/`chroot04` were real correctness bugs and are now fixed.
+- Focused chroot timing is not pathological; the large performance outliers
+  remain the process/pipe/epoll-heavy cases from the full-run summary.
