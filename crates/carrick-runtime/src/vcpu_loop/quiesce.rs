@@ -330,6 +330,21 @@ where
         // existing, NOT on vfork.is_some() — if pipe() failed the parent CANNOT be
         // suspended, and sharing RAM with a running parent silently corrupts guest
         // memory. So a pipe() failure degrades to a plain CoW fork.
+        let child_parent = if clone_parent {
+            kernel.dispatcher.clone_parent_host_pid()
+        } else {
+            std::process::id()
+        };
+        let child_subreaper = kernel.dispatcher.subreaper_for_fork_child();
+        let child_ns_pid = crate::namespace::pid::allocate_child_ns_pid_pre_fork();
+        crate::guest_cpu::prepare_child_record_pre_fork(
+            child_parent,
+            child_subreaper,
+            child_ns_pid.unwrap_or(0),
+            clone_parent && child_parent != 0,
+            0,
+        );
+
         let fork_result = if vfork_pipe.is_some() {
             engine.fork_vfork()
         } else {
@@ -351,6 +366,7 @@ where
                 if quiesced {
                     fork_barrier().end_quiesce();
                 }
+                crate::guest_cpu::abort_prepared_child_record();
                 fork_barrier().end_fork();
                 kernel.fork.restart_after_fork_error(
                     prepared_fork,
@@ -394,24 +410,8 @@ where
                     );
                 }
                 crate::event_ring::rec(crate::event_ring::FORK, child_pid, 0, 0);
-                let child_parent = if clone_parent {
-                    kernel.dispatcher.clone_parent_host_pid()
-                } else {
-                    std::process::id()
-                };
-                if clone_parent {
-                    crate::guest_cpu::register_clone_parent_child(
-                        child_pid as u32,
-                        child_parent,
-                        kernel.dispatcher.subreaper_for_fork_child(),
-                    );
-                } else {
-                    crate::guest_cpu::register_child_with_parent(
-                        child_pid as u32,
-                        std::process::id(),
-                        kernel.dispatcher.subreaper_for_fork_child(),
-                    );
-                }
+                crate::guest_cpu::publish_prepared_child_record_parent(child_pid as u32);
+                crate::namespace::pid::notify_child_registered();
                 // Seed the child's published run-state as Booting NOW, from the
                 // parent, before this fork returns — so a parent that polls
                 // /proc/<child>/stat immediately (pauseinterrupt2) sees `R`, not
@@ -427,12 +427,9 @@ where
                         .unwrap_or(-1);
                     let _ = engine.write_bytes(addr, &fd.to_le_bytes());
                 }
-                // PID namespace: allocate the child's ns-pid + record the mapping,
-                // and return the ns-pid as the fork retval. Identity when off.
-                let retval = i64::from(crate::namespace::pid::register_child(
-                    child_pid as u32,
-                    child_parent,
-                ));
+                // PID namespace: the child's ns-pid was allocated and stored in
+                // its prepared record before fork. Identity when namespaces are off.
+                let retval = i64::from(child_ns_pid.unwrap_or(child_pid as u32));
                 if let Some(addr) = parent_tid_addr {
                     let tid = (retval as i32).to_le_bytes();
                     let _ = engine.write_bytes(addr, &tid);
@@ -580,6 +577,7 @@ where
                 // not the `S` of that boot park. Republished `Running` when the
                 // child's vCPU first resumes guest code (run_vcpu_until_exit top).
                 crate::run_state::reinit_booting_after_fork();
+                crate::guest_cpu::complete_child_record_post_fork_child();
                 // M:N scheduler: the child inherited the parent's pool but has only
                 // THIS thread, now the child's main (remapped to the child VM's vCPU
                 // 0). Drop the inherited (parent-slot) lease, reset to a fresh pool,
@@ -590,9 +588,6 @@ where
                 carrick_hal::vcpu_sched::set_current_lease(
                     carrick_hal::vcpu_sched::global().acquire(self.this_tid.raw() as u64),
                 );
-                // PID namespace: block until the parent registered our ns-pid
-                // before any guest code runs. No-op when ns off.
-                crate::namespace::pid::await_self_registration();
                 // Re-stamp identity + tid: the child's pid changed and the vCPU was
                 // rebuilt.
                 stamp_identity_page(engine, &kernel.dispatcher);

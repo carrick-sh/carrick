@@ -672,6 +672,7 @@ impl SyscallDispatcher {
         // getitimer reports 0 rather than the parent's inherited remaining time
         // (LTP alarm07).
         proc.itimers = [None, None, None];
+        proc.ptrace_traceme = false;
     }
 
     pub(crate) fn subreaper_for_fork_child(&self) -> u32 {
@@ -2455,6 +2456,24 @@ impl SyscallDispatcher {
                 && host_options & libc::WNOHANG == 0
                 && !options.intersects(LinuxWaitOptions::WUNTRACED | LinuxWaitOptions::WCONTINUED)
                 && !has_pending_ptrace_stop;
+            let wait_proc_exit_pid = || -> Option<i32> {
+                if host_target > 0 {
+                    return Some(host_target);
+                }
+                if host_target == -1 {
+                    return crate::guest_cpu::direct_children_for_wait(std::process::id())
+                        .into_iter()
+                        .next()
+                        .or_else(|| {
+                            crate::guest_cpu::pending_adopted_child(
+                                std::process::id(),
+                                host_target,
+                            )
+                        })
+                        .map(|pid| pid as i32);
+                }
+                None
+            };
             let result = if can_park_on_proc_exit {
                 let r = loop {
                     let r = unsafe {
@@ -2487,8 +2506,11 @@ impl SyscallDispatcher {
                         // (then SA_RESTART restarts wait4).
                         let tid = Self::ctx_tid(cx);
                         let non_interrupting = this.non_interrupting_signal_mask(tid);
+                        let Some(wait_pid) = wait_proc_exit_pid() else {
+                            return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ECHILD));
+                        };
                         return Ok(DispatchOutcome::WaitOnProcExit {
-                            pid: host_target,
+                            pid: wait_pid,
                             sig_mask: carrick_abi::WaitSigMask::Additive(non_interrupting),
                         });
                     }
@@ -2543,6 +2565,9 @@ impl SyscallDispatcher {
                         } else {
                             pid
                         };
+                        if crate::namespace::pid::enabled() {
+                            crate::namespace::pid::unregister_reaped(pid);
+                        }
                         return Ok(DispatchOutcome::Returned {
                             value: i64::from(value),
                         });
@@ -2577,8 +2602,11 @@ impl SyscallDispatcher {
             if result == 0 {
                 let tid = Self::ctx_tid(cx);
                 let non_interrupting = this.non_interrupting_signal_mask(tid);
+                let Some(wait_pid) = wait_proc_exit_pid() else {
+                    return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ECHILD));
+                };
                 return Ok(DispatchOutcome::WaitOnProcExit {
-                    pid: host_target,
+                    pid: wait_pid,
                     sig_mask: carrick_abi::WaitSigMask::Additive(non_interrupting),
                 });
             }
