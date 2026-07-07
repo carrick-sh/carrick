@@ -55,6 +55,14 @@ use crate::thread::{FutexTable, ThreadId, ThreadRegistry};
 use crate::trap::{SyscallTrap, TrapError};
 
 const SIGNAL_WAIT_SLICE: Duration = Duration::from_millis(50);
+const SHORT_TIMED_WAIT_RECLAIM_CUTOFF: Duration = Duration::from_millis(250);
+
+fn should_reclaim_vcpu_for_timed_wait(timeout: Option<Duration>) -> bool {
+    match timeout {
+        None => true,
+        Some(timeout) => timeout > SHORT_TIMED_WAIT_RECLAIM_CUTOFF,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // NON-engine helpers the generic loop calls.
@@ -627,6 +635,18 @@ where
         })
     }
 
+    fn park_vcpu_for_timed_wait(
+        &self,
+        engine: &mut E,
+        timeout: Option<Duration>,
+    ) -> Option<BlockingWaitReclaim> {
+        if should_reclaim_vcpu_for_timed_wait(timeout) {
+            self.park_vcpu_for_blocking_wait(engine)
+        } else {
+            None
+        }
+    }
+
     fn resume_vcpu_after_blocking_wait(
         &self,
         engine: &mut E,
@@ -829,7 +849,7 @@ where
                 } => {
                     self.waiter.ensure_full();
                     crate::run_state::publish(crate::run_state::RunState::Blocked);
-                    let reclaim = self.park_vcpu_for_blocking_wait(engine);
+                    let reclaim = self.park_vcpu_for_timed_wait(engine, timeout);
                     let wait_result = self.waiter.wait_with_dispatch_pending(
                         &fds,
                         timeout,
@@ -871,7 +891,7 @@ where
                 } => {
                     self.waiter.ensure_full();
                     crate::run_state::publish(crate::run_state::RunState::Blocked);
-                    let reclaim = self.park_vcpu_for_blocking_wait(engine);
+                    let reclaim = self.park_vcpu_for_timed_wait(engine, timeout);
                     let wait_result = self.waiter.wait_with_dispatch_pending(
                         &fds,
                         timeout,
@@ -931,7 +951,7 @@ where
                         }
                     };
                     crate::run_state::publish(crate::run_state::RunState::Blocked);
-                    let reclaim = self.park_vcpu_for_blocking_wait(engine);
+                    let reclaim = self.park_vcpu_for_timed_wait(engine, timeout);
                     let wait_result = self.waiter.wait_poll_with_dispatch_pending(
                         &fds,
                         timeout,
@@ -1088,11 +1108,13 @@ where
                     }
                     self.waiter.ensure_full();
                     crate::run_state::publish(crate::run_state::RunState::Blocked);
-                    let reclaim = self.park_vcpu_for_blocking_wait(engine);
                     // Xsignals live in a fork-shared ring, not an fd. Bound the
                     // sleep wait at the same internal slice as `io_wait` so each
                     // slice services dispatcher-owned pending state.
-                    let wait_for = (deadline - now).min(Duration::from_millis(50));
+                    let remaining_until_deadline = deadline - now;
+                    let reclaim =
+                        self.park_vcpu_for_timed_wait(engine, Some(remaining_until_deadline));
+                    let wait_for = remaining_until_deadline.min(Duration::from_millis(50));
                     let wait_result = self.waiter.wait_with_dispatch_pending(
                         &[],
                         Some(wait_for),
@@ -1999,6 +2021,24 @@ mod tests {
             ),
             TrapWatchdog::Trip
         );
+    }
+
+    #[test]
+    fn timed_wait_reclaim_keeps_vcpu_for_short_finite_timeouts() {
+        assert!(!should_reclaim_vcpu_for_timed_wait(Some(
+            SHORT_TIMED_WAIT_RECLAIM_CUTOFF
+        )));
+        assert!(!should_reclaim_vcpu_for_timed_wait(Some(
+            SHORT_TIMED_WAIT_RECLAIM_CUTOFF - Duration::from_millis(1)
+        )));
+    }
+
+    #[test]
+    fn timed_wait_reclaim_releases_vcpu_for_long_or_indefinite_waits() {
+        assert!(should_reclaim_vcpu_for_timed_wait(None));
+        assert!(should_reclaim_vcpu_for_timed_wait(Some(
+            SHORT_TIMED_WAIT_RECLAIM_CUTOFF + Duration::from_millis(1)
+        )));
     }
 
     #[test]
