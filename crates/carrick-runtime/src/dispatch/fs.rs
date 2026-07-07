@@ -424,12 +424,25 @@ fn forward_record_lock<M: GuestMemory>(
         _ => return DispatchOutcome::errno(LINUX_EINVAL),
     };
 
+    if matches!(linux_cmd, LINUX_F_SETLKW | LINUX_F_OFD_SETLKW) {
+        return match BlockingRecordLock::new(
+            host_fd,
+            host_cmd,
+            l_start,
+            l_len,
+            l_type_host,
+            l_whence,
+        ) {
+            Ok(lock) => DispatchOutcome::BlockingRecordLock(lock),
+            Err(errno) => DispatchOutcome::errno(errno),
+        };
+    }
+
     let mut fl: libc::flock = unsafe { core::mem::zeroed() };
     fl.l_start = l_start as libc::off_t;
     fl.l_len = l_len as libc::off_t;
     fl.l_type = l_type_host;
     fl.l_whence = l_whence;
-
     let rc = unsafe { libc::fcntl(host_fd, host_cmd, &mut fl as *mut libc::flock) };
     if let Err(errno) = rc.host_syscall_errno() {
         return DispatchOutcome::errno(errno);

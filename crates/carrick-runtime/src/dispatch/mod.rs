@@ -1039,6 +1039,50 @@ impl std::fmt::Debug for BlockingHostWrite {
     }
 }
 
+#[derive(Clone, PartialEq, Eq, Serialize)]
+pub struct BlockingRecordLock {
+    #[serde(skip_serializing)]
+    host_fd: std::sync::Arc<PinnedHostFd>,
+    host_cmd: i32,
+    l_start: i64,
+    l_len: i64,
+    l_type: i16,
+    l_whence: i16,
+}
+
+impl BlockingRecordLock {
+    pub(crate) fn new(
+        host_fd: i32,
+        host_cmd: i32,
+        l_start: i64,
+        l_len: i64,
+        l_type: i16,
+        l_whence: i16,
+    ) -> Result<Self, LinuxErrno> {
+        Ok(Self {
+            host_fd: std::sync::Arc::new(PinnedHostFd::new(host_fd)?),
+            host_cmd,
+            l_start,
+            l_len,
+            l_type,
+            l_whence,
+        })
+    }
+}
+
+impl std::fmt::Debug for BlockingRecordLock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BlockingRecordLock")
+            .field("host_fd", &self.host_fd.fd)
+            .field("host_cmd", &self.host_cmd)
+            .field("l_start", &self.l_start)
+            .field("l_len", &self.l_len)
+            .field("l_type", &self.l_type)
+            .field("l_whence", &self.l_whence)
+            .finish()
+    }
+}
+
 pub(crate) enum BlockingHostWriteStep {
     Done(DispatchOutcome),
     Wait,
@@ -1099,6 +1143,23 @@ pub(crate) fn drive_blocking_host_write(write: &mut BlockingHostWrite) -> Blocki
                 value: write.offset as i64,
             });
         }
+    }
+}
+
+pub(crate) fn drive_blocking_record_lock(lock: &BlockingRecordLock) -> DispatchOutcome {
+    let mut fl: libc::flock = unsafe { core::mem::zeroed() };
+    fl.l_start = lock.l_start as libc::off_t;
+    fl.l_len = lock.l_len as libc::off_t;
+    fl.l_type = lock.l_type;
+    fl.l_whence = lock.l_whence;
+
+    // BLOCKING-IO-OK: this is the blocking half of F_SETLKW/F_OFD_SETLKW after
+    // the dispatcher has returned its state locks to the run loop. Sibling guest
+    // threads can keep running and release the conflicting record lock.
+    let rc = unsafe { libc::fcntl(lock.host_fd.fd, lock.host_cmd, &mut fl as *mut libc::flock) };
+    match rc.host_syscall_errno() {
+        Ok(_) => DispatchOutcome::Returned { value: 0 },
+        Err(errno) => DispatchOutcome::Errno { errno },
     }
 }
 
@@ -1358,6 +1419,11 @@ pub enum DispatchOutcome {
     /// The runtime owns this staged continuation, waits for POLLOUT with the
     /// dispatcher lock released, and completes with the Linux-visible result.
     BlockingHostWrite(BlockingHostWrite),
+    /// A blocking record-lock `fcntl(F_SETLKW/F_OFD_SETLKW)`. The dispatcher
+    /// parsed and validated the guest `struct flock`, but the host call may
+    /// sleep until a sibling thread releases a conflicting lock. Execute it in
+    /// the run loop after dispatcher state locks have been released.
+    BlockingRecordLock(BlockingRecordLock),
     /// Like [`DispatchOutcome::WaitOnFds`] but for `select`/`pselect6`, whose fd-set bitmaps are
     /// BOTH input and output (unlike `poll`'s separate `events`/`revents`).
     /// The handler therefore leaves the guest fd-sets UNMODIFIED across the
@@ -1481,6 +1547,7 @@ impl DispatchOutcome {
             DispatchOutcome::WaitOnSharedWord { .. } => (0, None),
             DispatchOutcome::WaitOnFds { .. } => (0, None),
             DispatchOutcome::BlockingHostWrite(_) => (0, None),
+            DispatchOutcome::BlockingRecordLock(_) => (0, None),
             DispatchOutcome::WaitOnFdsSelect { .. } => (0, None),
             DispatchOutcome::WaitOnPollFds { .. } => (0, None),
             DispatchOutcome::WaitOnProcExit { .. } => (0, None),
