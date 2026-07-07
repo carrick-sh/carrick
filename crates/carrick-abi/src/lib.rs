@@ -3281,6 +3281,7 @@ pub const LINUX_AF_PACKET: i32 = 17;
 pub const LINUX_SOCK_STREAM: i32 = 1;
 pub const LINUX_SOCK_DGRAM: i32 = 2;
 pub const LINUX_SOCK_RAW: i32 = 3;
+pub const LINUX_SOCK_RDM: i32 = 4;
 pub const LINUX_SOCK_SEQPACKET: i32 = 5;
 
 pub const LINUX_CLONE_VM: u64 = 0x0000_0100;
@@ -3615,6 +3616,7 @@ pub const LINUX_SOCKET_TYPE_SUPPORTED_MASK: u64 = LinuxSocketTypeFlags::SUPPORTE
     | LINUX_SOCK_STREAM as u64
     | LINUX_SOCK_DGRAM as u64
     | LINUX_SOCK_RAW as u64
+    | LINUX_SOCK_RDM as u64
     | LINUX_SOCK_SEQPACKET as u64;
 
 pub const LINUX_MSG_OOB: i32 = 0x0001;
@@ -4000,10 +4002,11 @@ const _: () = {
 
 // Socket types must be pairwise distinct.
 const _: () = {
-    const TYPES: [i32; 4] = [
+    const TYPES: [i32; 5] = [
         LINUX_SOCK_STREAM,
         LINUX_SOCK_DGRAM,
         LINUX_SOCK_RAW,
+        LINUX_SOCK_RDM,
         LINUX_SOCK_SEQPACKET,
     ];
     let mut i = 0;

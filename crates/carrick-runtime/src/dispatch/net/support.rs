@@ -80,6 +80,7 @@ use crate::linux_abi::{
     LINUX_RTA_DST, LINUX_RTA_GATEWAY, LINUX_RTA_OIF, LINUX_RTM_GETNEIGH, LINUX_RTM_GETROUTE,
     LINUX_RTM_NEWROUTE, LINUX_RTN_UNICAST, LINUX_RTPROT_KERNEL, LinuxRtMsg,
 };
+use carrick_abi::LINUX_SOCK_RDM;
 
 pub(super) fn read_epoll_event(
     memory: &impl GuestMemory,
@@ -492,8 +493,6 @@ pub(super) fn canonical_socket_errno(
     base_type: i32,
     protocol: i32,
 ) -> Option<LinuxErrno> {
-    // SOCK_RDM is a valid Linux socket type (4) but has no named ABI constant.
-    const LINUX_SOCK_RDM: i32 = 4;
     // IPPROTO numbers with no named ABI constant. IPPROTO_TCP == LINUX_SOL_TCP
     // (6) and IPPROTO_UDP == LINUX_SOL_UDP (17); ICMP/ICMPv6 are the datagram
     // "ping socket" protocols Linux permits on SOCK_DGRAM.
