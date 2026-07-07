@@ -14,7 +14,10 @@
 #     regex metacharacters could misfire; index() of the ":"-anchored token cures
 #     both.
 # carrick stamps the run id into the title from $CARRICK_RUN_ID, inherited across
-# guest forks. ALWAYS pass a run id.
+# guest forks. `carrick trace` keeps root/sudo wrapper processes whose argv still
+# contains that same run id but whose proctitle is not rewritten; scoped cleanup
+# must reap those wrappers too or a cancelled trace can survive with no guest
+# children left. ALWAYS pass a run id.
 #
 #   kill.sh <run-id>   scoped reap (the ONLY per-run cleanup form)
 #   kill.sh --all      explicit GLOBAL sledgehammer (every renamed guest +
@@ -37,9 +40,31 @@ if [ "$run_id" = "--all" ]; then
     scan() { ps -axo pid=,command= | awk '!/awk/ && ($0 ~ /carrick:/ || $0 ~ /release\/carrick trace/) {print $1}'; }
     desc="ALL carrick guests"
 else
-    # Scoped: LITERAL, anchored match of the delimited token "carrick:<id>:".
+    # Scoped: LITERAL, anchored match of the delimited token "carrick:<id>:",
+    # plus trace front-ends that carry the same run id in argv.
     needle="carrick:$run_id:"
-    scan() { ps -axo pid=,command= | awk -v n="$needle" '!/awk/ && index($0, n) {print $1}'; }
+    scan() {
+        ps -axo pid=,command= | awk \
+            -v n="$needle" \
+            -v env="CARRICK_RUN_ID=$run_id" \
+            -v name="--name $run_id" \
+            -v var="run_id=$run_id" '
+            function delimited(s, token, idx, nxt) {
+                idx = index(s, token)
+                if (!idx) return 0
+                nxt = substr(s, idx + length(token), 1)
+                return nxt == "" || nxt == " " || nxt == "\t" || nxt == "\\" || nxt == "\"" || nxt == "'\''"
+            }
+            !/awk/ && !/scripts\/sudo\/kill.sh/ {
+                if (index($0, n)) {
+                    print $1
+                } else if (index($0, "carrick trace") &&
+                    (delimited($0, env) || delimited($0, name) || delimited($0, var))) {
+                    print $1
+                }
+            }
+        '
+    }
     desc="run-id $run_id"
 fi
 
