@@ -114,6 +114,15 @@ pub struct ThreadRegistry {
 /// its registry and re-set in a forked child (which builds a fresh one).
 static CURRENT_REGISTRY: ParkingMutex<Option<Arc<ThreadRegistry>>> = ParkingMutex::new(None);
 static CURRENT_FUTEX_TABLE: ParkingMutex<Option<Weak<FutexTable>>> = ParkingMutex::new(None);
+#[cfg(test)]
+static CURRENT_FUTEX_TABLE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn current_futex_table_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    CURRENT_FUTEX_TABLE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// Publish `registry` as this process's current registry. Called by the run
 /// loop at startup and after fork (the child has its own registry).
@@ -1157,6 +1166,7 @@ mod tests {
     fn current_futex_signal_notification_interrupts_waiter() {
         use std::sync::atomic::{AtomicBool, Ordering};
 
+        let _guard = current_futex_table_test_guard();
         let table = Arc::new(FutexTable::new());
         set_current_futex_table(&table);
         let addr = 0xfeed_beef_u64;
