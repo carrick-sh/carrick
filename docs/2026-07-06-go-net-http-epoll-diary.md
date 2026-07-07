@@ -736,3 +736,70 @@ Outcome:
   h1 loop needs either a more fd/state-specific condition or a different
   architecture for terminal kqueue edges rather than suppressing the host
   rearm in the generic ET update path.
+
+### Rejected experiment: merge drained terminal edge bits into ET readiness
+
+Hypothesis:
+
+- The drained kqueue edge reported `EPOLLIN|EPOLLERR|EPOLLRDHUP`, while
+  Carrick's live recompute reported only `EPOLLIN|EPOLLHUP`. Preserving the
+  drained edge's Linux-reportable terminal bits might let Go observe the
+  half-close/error edge instead of spinning on a masked `IN|HUP` latch.
+
+Experiment:
+
+- Tried OR-ing drained edge bits into the recomputed readiness mask, limited to
+  bits Linux could report for that registration (`requested|EPOLLHUP|EPOLLERR`).
+
+Outcome:
+
+- Rejected and reverted. It fixed the focused h1 reproducer:
+  `target/conformance/logs/go-net-http-h1-edgebits-001104.guest.log` passed in
+  `real 1.74`.
+- Focused `TestOmitHTTP2Vet` under the experiment passed once, then failed
+  twice:
+  `target/conformance/logs/go-net-http-vet-edgebits1-000942.guest.log` passed in
+  `real 32.92`;
+  `target/conformance/logs/go-net-http-vet-edgebits2-001015.guest.log` failed
+  in `real 30.37`; and
+  `target/conformance/logs/go-net-http-vet-edgebits3-001046.guest.log` failed
+  in `real 17.96`.
+- A rebuilt committed baseline then failed the same focused vet case 3/3:
+  `target/conformance/logs/go-net-http-vet-baseline1-001213.guest.log`,
+  `target/conformance/logs/go-net-http-vet-baseline2-001231.guest.log`, and
+  `target/conformance/logs/go-net-http-vet-baseline3-001248.guest.log`.
+- Docker oracle for the exact vet case passed in `real 5.49`.
+- Interpretation: vet is a current independent correctness/performance blocker,
+  not a reliable guard for h1 attribution. The edge-bit merge still lacks a
+  clean acceptance signal and should stay reverted until vet's SIGTRAP path is
+  understood.
+
+### Diagnostics: SIGTRAP/vet signal trace
+
+Grounding:
+
+- Go's conformance harness documents that some Go debug-call paths intentionally
+  use in-guest `SIGTRAP`/`BRK`, so the vet failures may be a guest signal
+  delivery/resume issue rather than epoll.
+
+Trace:
+
+- Added temporary trace script
+  `target/conformance/logs/sigtrap-vet.d` for `vcpu-fault`,
+  `vcpu-fault-regs`, `signal-publish`, `signal-deliver`, `signal-inject`, and
+  `signal-restore`.
+- Ran:
+  `target/conformance/logs/go-net-http-vet-sigtrace-001436.dtrace` with guest
+  log `target/conformance/logs/go-net-http-vet-sigtrace-001436.guest.log`.
+
+Outcome:
+
+- Under trace, focused `TestOmitHTTP2Vet` passed in `real 36.06`, but the outer
+  `timeout 90s` returned `124` because the trace wrapper did not shut down
+  cleanly before the timeout.
+- The trace tail showed heavy signal 23 publish/deliver traffic and no fault
+  lines in the sampled tail.
+- Interpretation: the trace perturbs the failure and is not yet enough. The
+  next diagnostic should dump from the runtime's guest-fault/termination handler
+  or teach the debug runner to trigger lldb on the observed failing exit path,
+  not only on a wall-clock deadline.
