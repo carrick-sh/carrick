@@ -159,7 +159,7 @@ fn arm_member_watches(mux: &mut dyn EventMultiplexer, watched: &mut [u32]) {
     let Some(region) = pid::region() else { return };
     for (i, slot) in region.members().iter().enumerate() {
         let host = slot.host_pid.load(Ordering::Acquire);
-        if host == 0 || host == HOST_PID_REGISTERING {
+        if host == 0 || host == HOST_PID_REGISTERING || slot.ns_pid.load(Ordering::Acquire) == 0 {
             watched[i] = 0;
             continue;
         }
@@ -197,10 +197,14 @@ fn teardown(init_host_pid: i32) {
     if let Some(region) = pid::region() {
         for slot in region.members() {
             let host = slot.host_pid.load(Ordering::Acquire);
-            if host == 0 || host == HOST_PID_REGISTERING || host as i32 == init_host_pid {
+            if host == 0
+                || host == HOST_PID_REGISTERING
+                || slot.ns_pid.load(Ordering::Acquire) == 0
+                || host as i32 == init_host_pid
+            {
                 continue;
             }
-            if slot.flags.load(Ordering::Acquire) != MEMBER_DEAD {
+            if slot.flags.load(Ordering::Acquire) & MEMBER_DEAD == 0 {
                 // SAFETY: kill with SIGKILL; ESRCH if already gone.
                 unsafe {
                     libc::kill(host as i32, libc::SIGKILL);
