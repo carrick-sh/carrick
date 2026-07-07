@@ -890,3 +890,53 @@ Interpretation:
   roughly 9x Docker wall-clock. That is close enough to the "order of magnitude"
   threshold to keep treating this as performance debt during the bless campaign,
   not as a completed performance story.
+
+### Full bless attempt: first fail-fast blocker is accept02
+
+Hypotheses:
+
+- H1: The first fail-fast diff, `ltp-accept02`, is not a timing problem. The
+  Docker oracle reports success while Carrick reports `TFAIL: Multicast group
+  was copied!`, so the likely gap is Linux-visible multicast socket state.
+- H2: Direct multicast membership forwarding is not the issue. Carrick already
+  rejects `IP_ADD_MEMBERSHIP`/`IPV6_JOIN_GROUP` as unsupported with `ENODEV`;
+  `accept02` uses the protocol-independent `MCAST_*` path Carrick accepted as a
+  no-op because Darwin has no matching optnames.
+
+Tests:
+
+- Ran full unfiltered `scripts/conformance/run-full.sh --bless`; it did not
+  bless. The log
+  `target/conformance/logs/conformance-bless-20260707-003946.log` fail-fasted
+  after 51 gating verdicts with `ltp-accept02` as the first listed blocker.
+- Ran focused Carrick and Docker reproducer for `accept02`. Carrick failed with
+  `TFAIL: Multicast group was copied!`; Docker passed with
+  `TPASS: Multicast group was not copied: EADDRNOTAVAIL (99)`.
+- Added Linux-visible per-socket bookkeeping for protocol-independent
+  `MCAST_JOIN_GROUP`/`MCAST_LEAVE_GROUP` and source-specific variants. Accepted
+  sockets start with an empty membership set, matching Linux's rule that
+  listener multicast memberships are not copied across `accept`.
+
+Outcome:
+
+- Helper checks passed:
+  `cargo fmt --check`;
+  `cargo test -p carrick-runtime mcast_membership_tests`;
+  `cargo check -p carrick-cli`;
+  `just build -p carrick-cli`.
+- Focused Carrick `ltp-accept02` now passes:
+  `target/conformance/logs/ltp-accept02-mcaststate-005017.carrick.log`.
+- Timed focused Carrick run:
+  `target/conformance/logs/ltp-accept02-mcaststate-time-005034.carrick.log`
+  passed in `0.32 real`.
+- Fresh Docker oracle run:
+  `target/conformance/logs/ltp-accept02-mcaststate-docker-005023.docker.log`
+  passed in `0.279 total`.
+
+Interpretation:
+
+- `accept02` was a modeled-state bug, not a slow-case symptom and not a host
+  kqueue/epoll issue. The fix is a graceful Linux-visible failure on accepted
+  sockets (`EADDRNOTAVAIL`) rather than a no-op success.
+- Focused timing is acceptable here: Carrick is close to Docker for this case,
+  so the larger performance outliers in the bless log remain separate targets.

@@ -304,6 +304,13 @@ pub(super) struct OpenDescriptionBase {
     seals: Option<u32>,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(super) struct SocketMulticastMembership {
+    pub(super) level: i32,
+    pub(super) source_specific: bool,
+    pub(super) optval: Vec<u8>,
+}
+
 impl OpenDescriptionBase {
     pub(super) fn new(status_flags: u64) -> Self {
         Self {
@@ -852,6 +859,10 @@ pub(super) enum OpenDescription {
         host_fd: HostFdRef,
         family: i32,
         type_: i32,
+        /// Linux-visible MCAST_* memberships. Darwin has no protocol-independent
+        /// MCAST_* optnames, so these are bookkeeping only; accepted sockets start
+        /// empty because Linux does not copy listener memberships across accept.
+        mcast_memberships: Vec<SocketMulticastMembership>,
         synthetic_recv: VecDeque<(Vec<u8>, Vec<u8>)>,
     },
     /// A regular file backed by a REAL macOS file descriptor into the
