@@ -356,3 +356,103 @@ UDP timeout and existing arm64 musl gaps such as `childsubreaper`,
 `epollforkeventfd`, `execthreads`, `keydeny`, `mlock2`, `ptyforkreopen`,
 `rlimitroundtrip`, `sotimeo`, and `syscallregpreserve`. The new stable
 `ptracestop` probe passed in that run.
+
+## 2026-07-07 04:xx - Full bless after ptrace06
+
+Command:
+
+```sh
+target/release/carrick-conformance --tier full --bless \
+  --jsonl target/conformance/bless-after-ptrace.jsonl
+```
+
+Outcome:
+
+- The run stopped in Carrick phase 1/3 at the harness fail-fast limit:
+  51 cached-oracle gating verdicts exceeded the default maximum of 50.
+- No bless artifacts were left staged or modified.
+- The ptrace06 fix held under the larger run:
+  `ltp-ptrace06` reported `MATCH carrick[48/48] oracle[48/48]` with
+  `716ms/412ms` (`1.74x`).
+
+Important regressions/timing signals:
+
+- `ltp-ptrace11` is a nearby ptrace regression but not a timing outlier:
+  `broken/ok`, `717ms/606ms`.
+- `ltp-pipe07` is both a gating regression and a pathological timing case:
+  `broken/fail`, `31353ms/1027ms` (`30.53x`).
+- Related pipe/wait timing signals cluster around the same 30s Carrick runtime:
+  `ltp-pipe06` (`19.34x`, both broken), `ltp-pipe11` (`24.73x`, match),
+  and `ltp-epoll-ltp` (`23.41x`, match).
+- Largest observed ratio was `ltp-rt_sigqueueinfo02` at `66.30x`, but that is
+  also a new signal-semantics diff (`broken/ok`), so it is not the first pipe
+  wait/backpressure reducer.
+
+Hypothesis:
+
+The immediate next target should be `ltp-pipe07`, not a blanket baseline bless.
+It is narrow enough to reproduce alone, it is a gating regression, and its
+runtime matches the broader pipe/epoll/fcntl slow-wait cluster. If the focused
+run keeps the 30s shape, trace pipe/fd syscalls first; if tracing perturbs the
+failure, run the same command through `carrick debug lldb-run` so event-ring and
+thread dumps are captured by the deadline handler instead of relying on an
+external sleep/retry loop.
+
+## 2026-07-07 04:37 - pipe07 graceful-failure reducer
+
+Hypothesis:
+
+`ltp-pipe07` is not a pipe readiness/kqueue problem. It is an fd-fill/resource
+contract problem: Carrick advertised Linux's 1M `RLIMIT_NOFILE`, then backed
+each anonymous pipe with real macOS pipe fds until the host refused more pipe
+resources. The old behavior returned a Darwin-shaped failure (`EBADF`) after
+122864 pipe fds and then timed out during LTP cleanup.
+
+Tests:
+
+- Focused pre-fix harness:
+  `target/release/carrick-conformance --suite ltp-pipe07 --jsonl target/conformance/pipe07-focused-1.jsonl`
+  reproduced the 30s failure: `carrick[0/3] oracle[0/2]`,
+  `30472ms/1027ms`, with raw Carrick output:
+  - `TFAIL: errno (9) != EMFILE (24)`
+  - `TFAIL: exp_num_pipes (1048572) != num_pipe_fds (122864)`
+  - `TBROK: Test killed! (timeout?)`
+- Live Docker oracle, run alone after Carrick stopped, contradicted the stale
+  cache and passed:
+  - `TPASS: errno == EMFILE (24)`
+  - `TPASS: exp_num_pipes == num_pipe_fds (1048572)`
+- Added a focused integration gate,
+  `pipe2_fd_fill_fails_fast_with_emfile`, that opens 2048 host-backed pipes
+  through the real `pipe2` dispatcher path, asserts the next `pipe2` returns
+  Linux `EMFILE`, then closes every fd it opened.
+
+Change:
+
+Added `HOST_PIPE_FD_PRESSURE` at 4096 guest fd-table entries, mirroring the
+existing path-open pressure cap. `pipe2` now returns Linux `EMFILE` before
+allocating more host pipes past that threshold, and any raw host `pipe(2)`
+failure is normalized to `EMFILE` because the guest pointer is Carrick-owned and
+a failure there means host pipe/fd resources are exhausted for this emulation
+path.
+
+Outcome:
+
+- `cargo fmt --check` passed.
+- `cargo test -p carrick-runtime --test integration pipe2_fd_fill_fails_fast_with_emfile`
+  passed.
+- `just build -p carrick-cli` passed and re-signed `target/release/carrick`.
+- Refreshed focused harness:
+  `target/release/carrick-conformance --suite ltp-pipe07 --refresh-oracle --jsonl target/conformance/pipe07-fast-emfile.jsonl`
+  now finishes quickly: `carrick[1/2] oracle[2/2]`,
+  `1112ms/822ms` (`1.35x`), with no timeout/TBROK. Carrick now passes the
+  `EMFILE` assertion and fails only the real missing-capacity assertion:
+  `exp_num_pipes (1048572) != num_pipe_fds (4096)`.
+
+Conclusion:
+
+This is a good logical checkpoint to commit as graceful failure and stale-oracle
+repair, not a complete `pipe07` conformance fix. Passing `pipe07` requires a
+larger architectural answer for million-scale anonymous pipes: synthetic/pooled
+pipe storage, or a coherent lower guest-visible `RLIMIT_NOFILE` and `/proc`
+surface. The former is closer to Linux semantics; the latter would deliberately
+diverge from the Docker oracle.
