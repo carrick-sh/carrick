@@ -32,7 +32,7 @@ const N: usize = 8192;
 
 // Each event is two u64 cells (lo, hi). A reader may observe a torn write
 // (lo updated, hi stale) under concurrency; that's acceptable for a diagnostic
-// (rare, and a decoded `kind` outside 1..=8 is dropped).
+// (rare, and a decoded `kind` outside the known event set is dropped).
 struct Slot {
     lo: AtomicU64,
     hi: AtomicU64,
@@ -57,6 +57,9 @@ pub const EPADD: u8 = 5;
 pub const EPWAIT: u8 = 6;
 pub const FORK: u8 = 7;
 pub const EXEC: u8 = 8;
+pub const FDOPEN: u8 = 9;
+pub const FDCLOSE: u8 = 10;
+pub const ACCEPTERR: u8 = 11;
 
 #[cfg(feature = "event-ring-dump")]
 fn dir() -> Option<&'static str> {
@@ -144,6 +147,9 @@ fn decode(kind: u8, a: i32, b: i32, c: i32) -> String {
         EPWAIT => format!("EPWAIT   kq={a} ready={b} timeout={c}"),
         FORK => format!("FORK     child_pid={a}"),
         EXEC => format!("EXEC     path_present={a}"),
+        FDOPEN => format!("FDOPEN   gfd={a} hfd={b} minfd={c}"),
+        FDCLOSE => format!("FDCLOSE  gfd={a} hfd={b}"),
+        ACCEPTERR => format!("ACCEPTER listener_hfd={a} accepted_hfd={b} errno={c}"),
         _ => String::new(),
     }
 }
