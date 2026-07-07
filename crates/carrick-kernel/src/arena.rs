@@ -9,9 +9,10 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::domains::{HostPid, ProcessGeneration};
+use crate::process::ProcessSection;
 
 pub const ARENA_MAGIC: u32 = 0x434b_4131;
-pub const ARENA_VERSION: u32 = 1;
+pub const ARENA_VERSION: u32 = 2;
 pub const ARENA_PATH_ENV: &str = "CARRICK_KERNEL_ARENA";
 
 /// Permit-section constants. These must stay byte-identical to the landed
@@ -43,6 +44,7 @@ pub struct PermitSection {
 pub struct ArenaLayout {
     pub header: ArenaHeader,
     pub permits: PermitSection,
+    pub processes: ProcessSection,
 }
 
 #[derive(Debug)]
@@ -282,6 +284,7 @@ impl KernelArena {
             .permits
             .version
             .store(PERMIT_VERSION, Ordering::Relaxed);
+        layout.processes.next_ns_pid.store(2, Ordering::Relaxed);
         layout.permits.magic.store(PERMIT_MAGIC, Ordering::Release);
         layout.header.magic.store(ARENA_MAGIC, Ordering::Release);
     }
@@ -328,6 +331,12 @@ mod tests {
                 .next_generation
                 .load(std::sync::atomic::Ordering::Relaxed),
             1
+        );
+        assert_eq!(
+            l.processes
+                .next_ns_pid
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
         );
     }
 
