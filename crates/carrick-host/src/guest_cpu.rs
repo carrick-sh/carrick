@@ -317,10 +317,15 @@ pub fn prepare_child_record_pre_fork(
     r
 }
 
-pub fn publish_prepared_child_record_parent(child_pid: u32) {
-    let Some(r) = unpack_ref(PENDING_CHILD_RECORD.swap(REF_NONE, Ordering::AcqRel)) else {
-        return;
-    };
+/// Parent-side publish by the ref `prepare_child_record_pre_fork` returned.
+///
+/// The parent publishes AFTER `end_fork` releases fork serialization, so the
+/// process-global stash may already hold a DIFFERENT thread's prepared record
+/// (back-to-back forks from two threads). Publishing by ref stamps the record
+/// this fork prepared; the stash stays the fork CHILD's channel (its memory
+/// snapshot at `fork(2)` is taken inside the serialized window, so the
+/// inherited stash is always this fork's ref).
+pub fn publish_prepared_child_record_parent_ref(r: ProcessRecordRef, child_pid: u32) {
     process_section().publish_host_pid(r, HostPid::new(child_pid));
 }
 
@@ -911,10 +916,10 @@ mod tests {
         // wait4(-1) park must go to the any-child kqueue path (-1): parking on
         // the FIRST child's pid misses the second child's exit (the single-pid
         // slice loop re-polls only the watched pid).
-        prepare_child_record_pre_fork(waiter, 0, 0, false, 0);
-        publish_prepared_child_record_parent(first);
-        prepare_child_record_pre_fork(waiter, 0, 0, false, 0);
-        publish_prepared_child_record_parent(second);
+        let prep1 = prepare_child_record_pre_fork(waiter, 0, 0, false, 0);
+        publish_prepared_child_record_parent_ref(prep1, first);
+        let prep2 = prepare_child_record_pre_fork(waiter, 0, 0, false, 0);
+        publish_prepared_child_record_parent_ref(prep2, second);
 
         assert_eq!(wait_any_park_pid(waiter), Some(-1));
 
@@ -930,14 +935,43 @@ mod tests {
         // No direct children, one adopted child not yet exit-ready: park on the
         // adopted child's concrete host pid (EVFILT_PROC watches non-children).
         let adopted = 818_184;
-        prepare_child_record_pre_fork(waiter, 0, 0, true, 0);
-        publish_prepared_child_record_parent(adopted);
+        let prep3 = prepare_child_record_pre_fork(waiter, 0, 0, true, 0);
+        publish_prepared_child_record_parent_ref(prep3, adopted);
         assert_eq!(wait_any_park_pid(waiter), Some(adopted as i32));
         let r3 = find_child_record(adopted).unwrap_or_else(|| panic!("adopted record"));
         release_child_record(r3);
 
         // No children at all: no park target (the caller reports ECHILD).
         assert_eq!(wait_any_park_pid(waiter), None);
+    }
+
+    #[test]
+    fn parent_publish_by_ref_survives_a_second_prepare() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        init_child_table();
+        let parent_a = 828_181;
+        let parent_b = 828_182;
+        let child_a = 828_183;
+        let child_b = 828_184;
+
+        // Fork serialization releases (end_fork) before the parent publishes,
+        // so another thread's prepare can overwrite the process-global stash
+        // in that window. The parent must therefore publish the record IT
+        // prepared, by ref — not whatever the stash currently holds.
+        let r1 = prepare_child_record_pre_fork(parent_a, 0, 111, false, 0);
+        let r2 = prepare_child_record_pre_fork(parent_b, 0, 222, false, 0);
+        publish_prepared_child_record_parent_ref(r1, child_a);
+        publish_prepared_child_record_parent_ref(r2, child_b);
+
+        let rec_a = child_record(child_a).unwrap_or_else(|| panic!("child_a record"));
+        assert_eq!(record_parent_pid(rec_a), parent_a);
+        assert_eq!(rec_a.ns_pid.load(Ordering::Acquire), 111);
+        let rec_b = child_record(child_b).unwrap_or_else(|| panic!("child_b record"));
+        assert_eq!(record_parent_pid(rec_b), parent_b);
+        assert_eq!(rec_b.ns_pid.load(Ordering::Acquire), 222);
+
+        release_child_record(r1);
+        release_child_record(r2);
     }
 
     #[test]
@@ -948,7 +982,8 @@ mod tests {
         let ns_pid = 45_002;
         let stop_signal = libc::SIGTRAP;
 
-        prepare_child_record_pre_fork(parent_pid, 0, ns_pid, false, stop_signal as u64);
+        let prepared =
+            prepare_child_record_pre_fork(parent_pid, 0, ns_pid, false, stop_signal as u64);
         let child = unsafe { libc::fork() };
         assert!(child >= 0, "fork failed");
         if child == 0 {
@@ -962,7 +997,7 @@ mod tests {
             unsafe { libc::_exit(if ok { 0 } else { 71 }) };
         }
 
-        publish_prepared_child_record_parent(child as u32);
+        publish_prepared_child_record_parent_ref(prepared, child as u32);
         let mut status = 0;
         let waited = unsafe { libc::waitpid(child, &mut status, 0) };
         assert_eq!(waited, child);
@@ -988,7 +1023,7 @@ mod tests {
         init_child_table();
         let recorded_parent = std::process::id().saturating_add(10_000);
 
-        prepare_child_record_pre_fork(recorded_parent, 0, 45_052, false, 0);
+        let prepared = prepare_child_record_pre_fork(recorded_parent, 0, 45_052, false, 0);
         let child = unsafe { libc::fork() };
         assert!(child >= 0, "fork failed");
         if child == 0 {
@@ -997,7 +1032,7 @@ mod tests {
             unsafe { libc::_exit(if ok { 0 } else { 72 }) };
         }
 
-        publish_prepared_child_record_parent(child as u32);
+        publish_prepared_child_record_parent_ref(prepared, child as u32);
         let mut status = 0;
         let waited = unsafe { libc::waitpid(child, &mut status, 0) };
         assert_eq!(waited, child);
