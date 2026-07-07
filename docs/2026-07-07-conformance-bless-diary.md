@@ -254,3 +254,39 @@ sub-millisecond at this scale. The next question is architectural: whether the
 HVF fork model can avoid rebuilding a full VM for simple child-exit forks, or
 whether the conformance harness should classify this as an acknowledged
 performance gap rather than a transient wait bug.
+
+## short finite wait timer regressions
+
+Hypothesis:
+The latest full bless left several timer-threshold regressions that all had the
+same shape: Carrick slept about 2.5-3.5ms past the requested finite timeout.
+`ltp-epoll_wait02` failed as 4/7 or 5/7 against a 7/7 Docker oracle, and a
+focused rerun before the fix showed the 10ms, 25ms, and 100ms cases failing
+with "slept too long":
+`target/conformance/epoll_wait02-focus-030948.jsonl` and
+`target/conformance/raw/conf-93040-c00.err`. The dispatcher handed empty
+`epoll_wait` to `WaitOnFds`, and the vCPU loop reclaimed/rebound the HVF vCPU
+before every fd/poll timeout and every sleep wait, so short finite waits were
+paying timer latency plus vCPU lifecycle overhead.
+
+Test:
+Added a pure policy helper in `crates/carrick-runtime/src/vcpu_loop/mod.rs`:
+short finite timed waits keep the current vCPU lease, while indefinite waits and
+finite waits above 250ms still release the lease. The sleep path applies that
+policy to the full remaining deadline, not the internal 50ms xsignal slice, so a
+long sleep still releases the vCPU for most of its duration and only keeps it
+for the final short tail.
+
+Outcome:
+- `cargo fmt --check`
+- `cargo test -p carrick-runtime timed_wait_reclaim --lib`
+- `just build -p carrick-cli`
+- `target/release/carrick-conformance --suite ltp-epoll_wait02 --suite ltp-epoll_pwait03 --suite ltp-kill12 --suite ltp-nanosleep01 --jsonl target/conformance/timedwait-reclaim-focused.jsonl`
+  matched all four suites:
+  - `ltp-epoll_wait02`: 7/7 vs 7/7, 1.11x
+  - `ltp-epoll_pwait03`: 14/14 vs 14/14, 1.03x
+  - `ltp-kill12`: 1/1 vs 1/1, 5.86x
+  - `ltp-nanosleep01`: 7/7 vs 7/7, 1.02x
+- The same fix cleared the adjacent full-bless regressions:
+  `target/release/carrick-conformance --suite ltp-poll02 --suite ltp-pselect01 --suite ltp-pselect01_64 --suite ltp-prctl09 --jsonl target/conformance/timedwait-reclaim-poll-select.jsonl`
+  matched all four suites at 7/7 vs 7/7.
