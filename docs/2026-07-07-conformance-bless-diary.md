@@ -1350,3 +1350,92 @@ Verification:
   `target/conformance/xattr-known-gaps-*.jsonl` exits cleanly with no gating
   regressions. Every row is now a non-gating `DIFF` because Carrick runs the
   assertions while the arm64 Docker oracle is setup-broken for this container.
+
+## 2026-07-07 09:25 - post-xattr full cached-oracle measurement
+
+Evidence:
+
+`target/conformance/full-after-xattr-084615.jsonl` was a full-tier
+cached-oracle measurement after the lpath xattr fix and xattr known-gap
+classification. It used `--force` so it completed the whole declared set rather
+than stopping at the first 50 gates.
+
+Summary:
+
+- 2,127 total rows.
+- 1,989 `MATCH`.
+- 68 report-only `DIFF`.
+- 56 `REGRESSION`.
+- 11 `NEW`.
+- 2 `TIMEOUT`.
+- 1 `CARRICK_CRASH`.
+- 59 gating verdicts total: 51 LTP, 6 CPython, 2 Go.
+
+Important resolved or reframed rows:
+
+- The xattr cluster no longer gates. The affected rows are report-only `DIFF`
+  because Carrick executes the assertions and the arm64 Docker oracle is
+  setup-broken.
+- `ltp-futex_wait05` matched in the full harness: Carrick success vs Docker
+  success, `1.06x` (`10696ms/10089ms`). This supports the earlier conclusion
+  that the previous single full-run outlier needs a cleaner reproducer before
+  changing futex architecture.
+- `ltp-futex_cmp_requeue01` is now report-only: Carrick failure vs Docker
+  success, `9.51x` (`11544ms/1214ms`). The known-gap classification is still
+  correct: this is a missing fork-coherent futex requeue mechanism, not a row to
+  bless as healthy.
+- `ltp-epoll-ltp` remains a non-gating but unacceptable timing row: `37.87x`
+  (`54002ms/1426ms`), still consistent with fork-storm cost rather than epoll
+  readiness semantics.
+
+Top timing debt:
+
+- `node-libuv`: `489.99x` (`196487ms/401ms`), semantic match.
+- `cpython-pathlib`: `76.23x` (`62355ms/818ms`), report-only `DIFF`.
+- `ltp-rt_sigqueueinfo02`: `66.49x` (`13631ms/205ms`), non-gating `NEW`.
+- `node-app-smoke`: `43.98x` (`17678ms/402ms`), semantic match.
+- `cpython-glob`: `43.03x` (`26289ms/611ms`), semantic match.
+- `ltp-splice02`, `ltp-waitid08`, `ltp-waitid07`, `ltp-vmsplice01`,
+  `ltp-vmsplice04`, and `ltp-splice05`: gating and about `38x`.
+
+Live-captured blockers:
+
+- `go-net_http` is a gating `CARRICK_CRASH` row. During the run, scoped pids
+  `7739` and `7756` remained alive under `conf-17046-c1628` for more than
+  twenty minutes. The lldb capture lives at
+  `target/conformance/logs/lldb-runs/go-net-http-full-hang-090510/`.
+  The supervisor parent was blocked in `namespace::supervisor::run` waiting on
+  kqueue for init exit. The guest process event ring showed repeated
+  `EPWAIT`/`EPWFD` cycles on epoll fd `16408` with a long timeout and masks for
+  guest fds 8 and 10. Backtraces showed many guest threads parked in
+  `FutexTable::wait_prepared_with_token`, plus one thread in
+  `ThreadWaiter::wait_poll_with_dispatch_pending`.
+- `cpython-tarfile` is a gating regression with Carrick `Empty` vs Docker
+  `609/609`. The lldb capture lives at
+  `target/conformance/logs/lldb-runs/cpython-tarfile-full-hang-092311/`.
+  The active guest was servicing `newfstatat` on a deeply nested tar extraction
+  path and was in `HostFsBackend::name_matches_on_disk` via cap-std
+  `read_dir`. This points at path resolution/directory-scan cost or a
+  pathological tarfile extraction path, not at a generic process scheduler hang.
+
+Cleanup:
+
+After the harness exited, scoped cleanup killed only the remaining
+`conf-17046-c1628` and `conf-17046-c2034` guests. No broad Carrick kill was
+used.
+
+Outcome:
+
+We are not close to a conformance bless yet. The xattr cluster is cleaned up,
+but the full measurement still has 59 gates and serious timing debt. The next
+architectural work should not be sleeps or timeout bumps. The best current
+targets are:
+
+- `go-net_http`: reduce the epoll/futex wait pattern using the lldb evidence,
+  likely by building a focused Go/net or probe-level reproduction around the
+  fd 8/10 readiness/wait state.
+- `cpython-tarfile` / `cpython-pathlib` / `cpython-glob`: investigate host
+  path resolution and directory-scan amplification under deeply nested paths.
+- fork-storm cost: continue treating `ltp-epoll-ltp`, waitid, splice/vmsplice,
+  and process-heavy timing outliers as architecture debt rather than acceptable
+  baseline noise.
