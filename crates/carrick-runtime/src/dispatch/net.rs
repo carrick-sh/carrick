@@ -2736,6 +2736,12 @@ impl SyscallDispatcher {
                                 0
                             };
                             let (guest_fd, generation) = unpack_epoll_udata(ev.token);
+                            crate::event_ring::rec(
+                                crate::event_ring::EPEDGE,
+                                guest_fd,
+                                edge_bits as i32,
+                                edge_readiness_count.min(i32::MAX as u64) as i32,
+                            );
                             match gfd_info.get(&guest_fd) {
                                 Some(&(hfd, _, _, reg_gen, _, _, _)) if reg_gen == generation => {
                                     if let Some(siblings) = host_to_gfds.get(&hfd) {

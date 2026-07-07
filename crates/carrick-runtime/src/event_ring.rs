@@ -63,6 +63,7 @@ pub const ACCEPTERR: u8 = 11;
 pub const EPWFD: u8 = 12;
 pub const EPMASK: u8 = 13;
 pub const EPMASKFD: u8 = 14;
+pub const EPEDGE: u8 = 15;
 
 #[cfg(feature = "event-ring-dump")]
 fn dir() -> Option<&'static str> {
@@ -156,6 +157,7 @@ fn decode(kind: u8, a: i32, b: i32, c: i32) -> String {
         EPWFD => format!("EPWFD    fd={a} events={b:#x} timeout={c}"),
         EPMASK => format!("EPMASK   origin={a} raw={b:#x} last={c:#x}"),
         EPMASKFD => format!("EPMASKFD origin={a} gfd={b} hfd={c}"),
+        EPEDGE => format!("EPEDGE   gfd={a} edge={b:#x} count={c}"),
         _ => String::new(),
     }
 }
