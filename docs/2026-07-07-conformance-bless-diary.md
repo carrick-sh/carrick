@@ -456,3 +456,46 @@ larger architectural answer for million-scale anonymous pipes: synthetic/pooled
 pipe storage, or a coherent lower guest-visible `RLIMIT_NOFILE` and `/proc`
 surface. The former is closer to Linux semantics; the latter would deliberately
 diverge from the Docker oracle.
+
+## 2026-07-07 04:40 - epoll-ltp timing root-cause pass
+
+Hypothesis:
+
+The full bless reported `ltp-epoll-ltp` as a functional match but a performance
+outlier (`80684ms/3447ms`, `23.41x`). Because the suite name points at epoll, it
+was tempting to assume a kqueue-backed epoll wait/rearm problem. That needed
+evidence before touching epoll behavior.
+
+Tests:
+
+- Focused refreshed harness:
+  `target/release/carrick-conformance --suite ltp-epoll-ltp --refresh-oracle --jsonl target/conformance/epoll-ltp-focused-1.jsonl`
+  reported `MATCH carrick[33/33] oracle[33/33]` but still pathological timing:
+  `51033ms/1426ms` (`35.79x`). The Docker cache row was refreshed from
+  `3447ms` to `1426ms`.
+- Bounded 6s profile trace:
+  `target/release/carrick trace --script scripts/dtrace/trace-profile.d --trace-out target/conformance/epoll-ltp-profile.trace -- run --name trace-epoll-profile ... /opt/ltp/testcases/bin/epoll-ltp`.
+  The guest output was already through the 33 `epoll_create` cases and into
+  `Testing epoll_ctl`. Syscall mix in the first 6s:
+  - `epoll_ctl`: 1391 calls, all returning `EBADF`.
+  - `clone`: 1395 calls.
+  - `exit_group`: 1392 calls.
+  - `wait4`: 2793 calls.
+  - No `epoll_pwait`/`EPWAIT` signal in this window.
+- Deadline lldb runner:
+  `target/release/carrick debug lldb-run --deadline-seconds 8 --out-dir target/conformance/logs/lldb-epoll-ltp --run-id epoll-ltp-lldb-044003 -- ... /opt/ltp/testcases/bin/epoll-ltp`.
+  It dumped four scoped processes and then `scripts/sudo/kill.sh` cleaned up only
+  that run id. The active test process had an event ring with 2192 events,
+  essentially all `FORK`, and thread #1 was caught in
+  `HvfVmState::fork_prepare_and_teardown -> Aarch64EngineCore::fork ->
+  ThreadRuntimeState::handle_fork`. The supervisor/parent processes were waiting
+  in kqueue for process/supervisor events, not spinning in epoll wait.
+
+Outcome:
+
+`epoll-ltp` is not currently evidence for a kqueue readiness or EV_CLEAR/ET
+bug. Its 35x ratio is fork-heavy LTP test structure: thousands of fork/exit/wait
+cycles around negative `epoll_ctl` cases. The right next performance target is
+the fork path (`fork_prepare_and_teardown`, permit reaper/signal pump/namespace
+supervisor cost, and child registration/wait bookkeeping), not another epoll
+backstop or rearm change.
