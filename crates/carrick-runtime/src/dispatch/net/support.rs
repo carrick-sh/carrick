@@ -1388,7 +1388,8 @@ pub(super) fn is_known_sockopt_optname(level: i32, optname: i32) -> bool {
         ),
         LINUX_SOL_IPV6 => matches!(
             optname,
-            a::LINUX_IPV6_UNICAST_HOPS
+            a::LINUX_IPV6_ADDRFORM
+                | a::LINUX_IPV6_UNICAST_HOPS
                 | a::LINUX_IPV6_MULTICAST_IF
                 | a::LINUX_IPV6_MULTICAST_HOPS
                 | a::LINUX_IPV6_MULTICAST_LOOP
