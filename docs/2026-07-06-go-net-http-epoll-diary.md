@@ -1042,3 +1042,33 @@ Interpretation:
 - `connect02` was a real socket-state bug, not a baseline/classification issue.
 - Focused timing is slower but not pathological; the large outliers remain the
   full-run process/pipe/epoll cases.
+
+### delete_module02: module-infrastructure gap marker
+
+Hypothesis:
+
+- H1: `ltp-delete_module02` is not a useful Carrick implementation target during
+  this bless pass. `delete_module` is deferred module infrastructure, and the
+  Docker container does not provide a clean privileged module oracle either.
+
+Tests:
+
+- Focused Carrick:
+  `target/conformance/logs/ltp-delete-module02-classify-012426.carrick.log`.
+  The test reports `TCONF: syscall(106) __NR_delete_module not supported on your
+  arch`, with summary `skipped 1`.
+- Focused Docker oracle, run separately:
+  `target/conformance/logs/ltp-delete-module02-classify-012426.docker.log`.
+  Docker runs the assertions but four privileged/module cases fail with `EPERM`;
+  only the non-superuser `EPERM` case passes.
+
+Outcome:
+
+- Added `known_gaps = ["summary"]` to `ltp-delete_module02` in
+  `scripts/conformance/suites.toml`.
+
+Interpretation:
+
+- This records the current diff as a missing/deferred module facility plus
+  container-oracle limitation, rather than spending this pass implementing Linux
+  module loading/unloading on macOS.
