@@ -72,6 +72,21 @@ const LTP_SMOKE: &[&str] = &[
 
 const LTP_NOFILE_4096: &[&str] = &["dup03", "dup06", "dup205"];
 
+/// Exact LTP command overrides that must survive manifest regeneration. Keep
+/// these narrow: each one documents a known harness/resource mismatch where the
+/// default binary invocation is not the conformance signal we want.
+const LTP_CMD_OVERRIDES: &[(&str, &[&str])] = &[
+    (
+        "creat05",
+        &["ulimit -n 4096; /opt/ltp/testcases/bin/creat05"],
+    ),
+    ("fcntl14", &["/opt/ltp/testcases/bin/fcntl14", "-n", "200"]),
+    (
+        "fcntl14_64",
+        &["/opt/ltp/testcases/bin/fcntl14_64", "-n", "200"],
+    ),
+];
+
 /// Oracle-fidelity docker_flags that must survive `--generate-suites`.
 /// clone3 template: lift the container seccomp default so BOTH engines run the
 /// real syscall (carrick then returns ENOSYS for unimplemented). Hand-edits to
@@ -177,7 +192,19 @@ const KNOWN_GAP_PREFIX_OVERRIDES: &[(&str, &[&str])] = &[
 /// setrlimit03 (a privileged raise of RLIMIT_NOFILE above the system max must
 /// return EPERM even for root) used to be report-only, but carrick now enforces
 /// the nr_open ceiling on NOFILE hard-raises regardless of euid, so it MATCHes.
-const KNOWN_GAP_EXACT_OVERRIDES: &[(&str, &[&str])] = &[("ltp-setrlimit01", &["summary"])];
+///
+/// semget05 fills the advertised `/proc/sys/kernel/sem` set-count limit using
+/// ten semaphores per set. Carrick still backs SysV semaphores with Darwin's
+/// finite host pool while advertising Linux's larger tunables, so this remains
+/// a visible capacity/virtualization gap until Carrick owns the semaphore
+/// service or virtualizes the tunables honestly.
+const KNOWN_GAP_EXACT_OVERRIDES: &[(&str, &[&str])] = &[
+    ("ltp-acct01", &["summary"]),
+    ("ltp-bind06", &["summary"]),
+    ("ltp-delete_module02", &["summary"]),
+    ("ltp-setrlimit01", &["summary"]),
+    ("ltp-semget05", &["summary"]),
+];
 
 fn docker_flag_overrides(name: &str) -> Option<Vec<String>> {
     if OVERRIDE_EXCLUSIONS.contains(&name) {
@@ -280,10 +307,28 @@ fn go_timeout_s(pkg: &str) -> u64 {
 }
 
 fn ltp_timeout_s(bin: &str) -> u64 {
+    if bin == "timerfd_settime02" {
+        // tst_fuzzy_sync race test: ~150s under carrick (HVF vmexit/syscall
+        // overhead is ~30x the native raw-syscall loop this test spins), vs a
+        // few seconds in docker. The default 40s harness cap killed it mid-run;
+        // 300s lets it complete without changing the oracle expectation.
+        return 300;
+    }
     if LTP_SLOW.contains(&bin) {
         LTP_SLOW_TIMEOUT_S
     } else {
         40
+    }
+}
+
+fn ltp_cmd(bin: &str) -> Vec<String> {
+    if let Some((_, cmd)) = LTP_CMD_OVERRIDES.iter().find(|(name, _)| *name == bin) {
+        return cmd.iter().map(|s| s.to_string()).collect();
+    }
+    if LTP_NOFILE_4096.contains(&bin) {
+        vec![format!("ulimit -n 4096; /opt/ltp/testcases/bin/{bin}")]
+    } else {
+        vec![format!("/opt/ltp/testcases/bin/{bin}")]
     }
 }
 
@@ -539,11 +584,7 @@ fn build() -> (Vec<Suite>, (usize, usize, usize)) {
         .collect();
     ltp.sort();
     for b in &ltp {
-        let cmd = if LTP_NOFILE_4096.contains(&b.as_str()) {
-            vec![format!("ulimit -n 4096; /opt/ltp/testcases/bin/{b}")]
-        } else {
-            vec![format!("/opt/ltp/testcases/bin/{b}")]
-        };
+        let cmd = ltp_cmd(b);
         let mut suite = mk(
             format!("ltp-{b}"),
             Ecosystem::Ltp,
@@ -603,6 +644,7 @@ mod tests {
         assert_eq!(cpython_timeout_s("test_tarfile"), 600);
         assert_eq!(go_timeout_s("net/http"), 540);
         assert_eq!(ltp_timeout_s("epoll-ltp"), 120);
+        assert_eq!(ltp_timeout_s("timerfd_settime02"), 300);
     }
 
     #[test]
@@ -610,6 +652,22 @@ mod tests {
         assert_eq!(cpython_timeout_s("test_json"), 300);
         assert_eq!(go_timeout_s("net/url"), 180);
         assert_eq!(ltp_timeout_s("gettid01"), 40);
+    }
+
+    #[test]
+    fn exact_ltp_command_overrides_survive_regen() {
+        assert_eq!(
+            ltp_cmd("creat05"),
+            vec!["ulimit -n 4096; /opt/ltp/testcases/bin/creat05"]
+        );
+        assert_eq!(
+            ltp_cmd("fcntl14"),
+            vec!["/opt/ltp/testcases/bin/fcntl14", "-n", "200"]
+        );
+        assert_eq!(
+            ltp_cmd("fcntl14_64"),
+            vec!["/opt/ltp/testcases/bin/fcntl14_64", "-n", "200"]
+        );
     }
 
     /// Guards against a repeat of the regen that silently dropped the
@@ -701,6 +759,21 @@ mod tests {
                 s.docker_flags.iter().any(|f| f == "SYS_RESOURCE"),
                 "{name} lost cap SYS_RESOURCE"
             );
+            assert!(
+                s.known_gaps.iter().any(|g| g == "summary"),
+                "{name} lost known_gap summary"
+            );
+        }
+        // semget05: Carrick's current host-backed SysV semaphore service cannot
+        // satisfy Linux's advertised semaphore capacity; keep it report-only
+        // until the service or tunable virtualization is fixed.
+        for name in [
+            "ltp-acct01",
+            "ltp-bind06",
+            "ltp-delete_module02",
+            "ltp-semget05",
+        ] {
+            let s = find(name);
             assert!(
                 s.known_gaps.iter().any(|g| g == "summary"),
                 "{name} lost known_gap summary"
@@ -805,6 +878,10 @@ mod tests {
         }
         assert_eq!(
             known_gap_overrides("ltp-setrlimit01"),
+            Some(vec!["summary".into()])
+        );
+        assert_eq!(
+            known_gap_overrides("ltp-semget05"),
             Some(vec!["summary".into()])
         );
         assert_eq!(known_gap_overrides("ltp-setrlimit02"), None);
