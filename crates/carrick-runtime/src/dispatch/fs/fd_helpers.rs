@@ -5,6 +5,20 @@
 use super::*;
 use crate::linux_abi::LinuxErrno;
 
+pub(super) fn event_ring_host_fd(open_file: &OpenFile) -> i32 {
+    match &*open_file.description.read() {
+        OpenDescription::HostPipe { host_fd, .. }
+        | OpenDescription::HostFile { host_fd, .. }
+        | OpenDescription::HostSocket { host_fd, .. } => host_fd.raw(),
+        OpenDescription::EventFd { state, .. } => {
+            state.read_fd.as_ref().map_or(-1, |host_fd| host_fd.raw())
+        }
+        OpenDescription::Pidfd { kqueue, .. } => kqueue.poll_fd(),
+        OpenDescription::Inotify { state, .. } => state.poll_fd(),
+        _ => -1,
+    }
+}
+
 impl SyscallDispatcher {
     fn first_free_fd(
         table: &HashMap<i32, OpenFile>,
@@ -88,8 +102,10 @@ impl SyscallDispatcher {
                 None => return Err(open_file),
             }
         };
+        let host_fd = event_ring_host_fd(&open_file);
         retain_open_file(&open_file.description);
         table.insert(fd, open_file);
+        crate::event_ring::rec(crate::event_ring::FDOPEN, fd, host_fd, min_fd);
         self.clear_closed_stdio(fd);
         if fd == *next_fd {
             let closed = self.io.closed_stdio.lock();
@@ -125,10 +141,14 @@ impl SyscallDispatcher {
             };
             (first_fd, second_fd)
         };
+        let first_host_fd = event_ring_host_fd(&first);
+        let second_host_fd = event_ring_host_fd(&second);
         retain_open_file(&first.description);
         retain_open_file(&second.description);
         table.insert(first_fd, first);
         table.insert(second_fd, second);
+        crate::event_ring::rec(crate::event_ring::FDOPEN, first_fd, first_host_fd, min_fd);
+        crate::event_ring::rec(crate::event_ring::FDOPEN, second_fd, second_host_fd, min_fd);
         self.clear_closed_stdio(first_fd);
         self.clear_closed_stdio(second_fd);
         if first_fd == *next_fd {

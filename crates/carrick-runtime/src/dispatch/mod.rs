@@ -7125,6 +7125,84 @@ mod overlay_dispatch_tests {
         );
     }
 
+    #[test]
+    fn unix_accept_unnamed_peer_writes_family_only_sockaddr() {
+        let mut h = Harness::new();
+        let listener = returned(h.call(
+            198,
+            [
+                LINUX_AF_UNIX as u64,
+                LINUX_SOCK_STREAM as u64 | LINUX_O_NONBLOCK,
+                0,
+                0,
+                0,
+                0,
+            ],
+        )) as i32;
+        let client = returned(h.call(
+            198,
+            [
+                LINUX_AF_UNIX as u64,
+                LINUX_SOCK_STREAM as u64 | LINUX_O_NONBLOCK,
+                0,
+                0,
+                0,
+                0,
+            ],
+        )) as i32;
+
+        let path = format!("/var/carrick-accept-{}", std::process::id());
+        let mut sockaddr = vec![0u8; 2 + path.len() + 1];
+        sockaddr[0..2].copy_from_slice(&(LINUX_AF_UNIX as u16).to_ne_bytes());
+        sockaddr[2..2 + path.len()].copy_from_slice(path.as_bytes());
+        let sockaddr_addr = h.put_bytes(&sockaddr);
+        assert_eq!(
+            returned(h.call(
+                200,
+                [
+                    listener as u64,
+                    sockaddr_addr,
+                    sockaddr.len() as u64,
+                    0,
+                    0,
+                    0
+                ],
+            )),
+            0
+        );
+        assert_eq!(returned(h.call(201, [listener as u64, 1, 0, 0, 0, 0])), 0);
+        assert_eq!(
+            returned(h.call(
+                203,
+                [client as u64, sockaddr_addr, sockaddr.len() as u64, 0, 0, 0],
+            )),
+            0
+        );
+
+        let peer_addr = h.reserve(128);
+        let peer_len_addr = h.reserve(4);
+        h.memory
+            .write_bytes(peer_len_addr, &128u32.to_ne_bytes())
+            .unwrap();
+        let accepted = returned(h.call(202, [listener as u64, peer_addr, peer_len_addr, 0, 0, 0]));
+        assert!(
+            accepted >= 0,
+            "accept must return a guest fd, got {accepted}"
+        );
+
+        let peer_len = h.memory.read_bytes(peer_len_addr, 4).unwrap();
+        assert_eq!(
+            u32::from_ne_bytes(peer_len.try_into().unwrap()),
+            2,
+            "Linux reports only sa_family for an unnamed AF_UNIX peer"
+        );
+        let peer = h.memory.read_bytes(peer_addr, 2).unwrap();
+        assert_eq!(
+            u16::from_ne_bytes(peer.try_into().unwrap()),
+            LINUX_AF_UNIX as u16
+        );
+    }
+
     /// GROUNDED REGRESSION GATE (Rust, in-tree, cross-platform: macOS kqueue +
     /// Linux epoll-emulation) for the epoll EPOLLET edge-loss hang. It drives the
     /// REAL `epoll_pwait`/`epoll_ctl`/`pipe2` handlers through the threaded
