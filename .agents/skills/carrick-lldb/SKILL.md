@@ -62,7 +62,45 @@ Subcommands: `eventring`, `where`, `mappings`, `gva <addr>`, `decode-esr <hex>`,
 process/core; the rest are guest-mapping helpers that want a debug-state JSON
 (`carrick run --debug-state-path <p>` then `carrick load-state <p>`).
 
-## Workflow A — live (attach to a hung process)
+## Workflow A — deadline runner (preferred for hangs)
+
+Use Carrick's built-in lldb runner when you can reproduce the hang with a normal
+`carrick run` invocation. It owns the child, gives it a scoped run id, redirects
+guest output to a file, waits for a deadline, then attaches lldb to each
+matching `carrick:<run-id>` process and writes the event ring, all host
+backtraces, and modified-memory cores before cleanup:
+
+```sh
+target/release/carrick debug lldb-run \
+  --deadline-seconds 35 \
+  --out-dir target/conformance/logs/lldb-runs \
+  --run-id <run-id> -- \
+  --max-traps 18446744073709551615 --raw --fs host \
+  <image> <guest-command> ...
+```
+
+Everything after `--` is the argument list for `carrick run` **without** the
+`run` word. If the forwarded args do not include `--name`, the runner injects
+`--name <run-id>` and also sets `CARRICK_RUN_ID=<run-id>`, so `ps`, `kill.sh`,
+lldb transcripts, guest logs, and cores all use the same scoped identity. Use
+`--no-core` only for a fast plumbing smoke; real hang triage should keep cores.
+
+Artifacts:
+
+- `<run-id>.manifest.txt` — exact binary, plugin path, deadline, and forwarded
+  run args.
+- `<run-id>.guest.log` — guest stdout/stderr.
+- `<run-id>.ps.txt` — matched host processes.
+- `<run-id>.lldb.txt` — `carrick eventring`, `thread backtrace all`, and lldb
+  status for each matched process.
+- `<run-id>.<pid>.core` — modified-memory core for each matched Carrick process
+  unless `--no-core` was passed.
+
+This is the right first move when a test sometimes passes quickly and sometimes
+wedges: the runner catches it in the act without adding sleeps or hand-written
+process matching to the investigation loop.
+
+## Workflow B — live manual attach
 
 A `carrick run` is **two host processes**: an orchestrator parent and the guest.
 **Attach to the GUEST** — the one whose ring is non-empty. Find pids by the
@@ -84,7 +122,7 @@ A wedged thread's `bt` plus the ring usually pins it immediately (e.g. a worker
 parked in `SignalPump::stop_inner -> thread::join -> __ulock_wait` with a ring
 ending at `LISTEN` and no `FORK`).
 
-## Workflow B — core file (durable, share-able, no live process)
+## Workflow C — core file (durable, share-able, no live process)
 
 Use a **`modified-memory`** core: it captures dirty pages (which include the
 written-to event ring + Rust statics) but NOT the multi-GB clean guest-memory

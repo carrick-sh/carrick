@@ -301,3 +301,108 @@ Outcome:
 - Interpretation: dispatcher-local wake registry is stable enough to commit as
   a separate fix. Low-water remains a rejected/parked experiment until it can
   explain and pass the accepted-socket parallel case.
+
+### Focused h1 after dispatcher-local wake registry
+
+Test:
+
+```sh
+just build -p carrick-cli
+target/release/carrick run --name go-net-http-h1-registry-* \
+  --max-traps 18446744073709551615 --raw --fs host \
+  -w /usr/local/go/src/net/http \
+  localhost:5005/carrick-go-conformance:1.24 \
+  /conformance/net_http.test -test.v \
+  -test.run '^TestTransportConcurrency/h1$' \
+  -test.short -test.timeout=120s
+```
+
+Outcome:
+
+- Timed out at 35s (`RUN_RC=124`), after printing the test start but before
+  PASS.
+- Interpretation: dispatcher-local registry as committed regresses the focused
+  h1 workload. Do not treat `8a819e30` as good until the missing wake path is
+  identified or the commit is reverted.
+
+### Hypothesis: lldb capture must be part of the runner, not an ad-hoc shell loop
+
+Grounding:
+
+- A bad zsh deadline handler found matching `carrick:<run-id>` pids but tried to
+  attach to the whitespace-joined pid list as one lldb target. That produced no
+  useful capture.
+- A POSIX shell handler that wrote a `ps` snapshot and attached one pid at a
+  time captured the h1 failure:
+  `target/conformance/logs/lldb-handler-runs/h1-posix-3-215106.lldb.txt`.
+- The capture showed:
+  - supervisor parent in `carrick_runtime::namespace::supervisor::run`, blocked
+    in `kevent`, with an empty event ring;
+  - guest/init child with event-ring history and vCPU threads parked in
+    futex/poll paths;
+  - cores for both matched Carrick processes.
+
+Implementation:
+
+- Added `carrick debug lldb-run -- <run args>`.
+- The runner re-execs the signed Carrick binary as `run`, injects `--name
+  <run-id>` when the forwarded args do not already name the container, sets
+  `CARRICK_RUN_ID`, redirects guest output to `<run-id>.guest.log`, and monitors
+  the child.
+- On deadline it records a manifest, `ps` snapshot, lldb transcript, `carrick
+  eventring`, `thread backtrace all`, and modified-memory cores unless
+  `--no-core` is set. Cleanup is scoped to the run id.
+- Checked the Rust LLDB crate surface with `cargo search lldb`: `lldb` and
+  `lldb-sys` exist, but the first runner deliberately stays on `lldb --batch`
+  because that preserves the operator transcript and the existing Python plugin
+  contract. Revisit a binding only if the command boundary becomes the limiting
+  factor.
+
+Validation:
+
+```sh
+cargo fmt --check
+cargo check -p carrick-cli
+cargo clippy -p carrick-cli -- -D warnings
+just build -p carrick-cli
+
+target/release/carrick debug lldb-run \
+  --deadline-seconds 1 \
+  --out-dir target/conformance/logs/lldb-run-smoke \
+  --run-id h1-injected-name-smoke-* \
+  --no-core -- \
+  --max-traps 18446744073709551615 --raw --fs host \
+  -w /usr/local/go/src/net/http \
+  localhost:5005/carrick-go-conformance:1.24 \
+  /conformance/net_http.test -test.v \
+  -test.run '^TestTransportConcurrency/h1$' \
+  -test.short -test.timeout=120s
+```
+
+Outcome:
+
+- Clippy initially rejected the earlier scalar `epoll_masked` probe call shape.
+  The probe now takes a semantic `EpollMaskedProbe` struct while preserving the
+  existing pointer-to-wire-payload USDT ABI for `epoll-wait-debug.d`.
+- Clippy also rejected the runner's first `dump_lldb` helper for the same
+  scalar-list reason; the lldb dump configuration is now a context struct.
+- The first final smoke exposed a macOS `ps` parser bug: right-aligned pid
+  fields confused the split logic. The parser now reads the first two
+  whitespace fields as `pid`/`ppid` and joins the remaining command snapshot.
+- The forced-deadline smoke exited `124`, wrote a manifest whose `run_args`
+  included injected `--name h1-final-smoke-*`, attached lldb to the parent and
+  child scoped processes, dumped the event rings and host backtraces, then
+  reaped only the matching run id.
+- A real 35s h1 run timed out and produced:
+  - `target/conformance/logs/lldb-run-h1/h1-integral-runner-215807.lldb.txt`
+  - `target/conformance/logs/lldb-run-h1/h1-integral-runner-215807.84408.core`
+  - `target/conformance/logs/lldb-run-h1/h1-integral-runner-215807.84473.core`
+  - `target/conformance/logs/lldb-run-h1/h1-integral-runner-215807.guest.log`
+- The reproduced failure shape matches the hand handler: parent in supervisor
+  `kevent`, child stuck after entering `TestTransportConcurrency/h1`.
+
+Interpretation:
+
+- The debugger capture path is now a Carrick command and should be the default
+  for deadline-based hang investigation. Continue root-cause from the captured
+  child event ring/backtraces instead of adding timing backstops.
