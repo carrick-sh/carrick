@@ -1564,3 +1564,75 @@ An earlier `just ci` attempt saw
 fail once under the full workspace run. The focused rerun and full
 `cargo test -p carrick-runtime --lib -- --nocapture` both passed, and the final
 logged `just ci` passed.
+
+## 2026-07-07 - arena process-section B7 measurement
+
+Process-section landing scope:
+
+- `carrick-kernel` now includes a generation-stamped process section in the
+  shared arena.
+- Runtime run-state publication, the host child table, PID namespace members,
+  and pre-fork child registration all use arena process records.
+- The pre-fork registration change removes the post-fork record creation window:
+  the parent allocates and populates the child record before `fork(2)`, the
+  parent publishes the real child host pid after `fork`, and the child completes
+  its own inherited record.
+
+Green gates before B7 measurement:
+
+- `just ci` passed after B6.
+- `cargo test -p carrick-kernel --lib` passed after the B7 measurements
+  (17 tests).
+- B6 focused rows passed before the B6 commit:
+  `ltp-ptrace06`, `ltp-clone08`, `ltp-kill10`, and `ltp-waitpid06` all matched
+  the cached Docker oracle in
+  `target/conformance/prefork-reg.jsonl`; `ptrace06` also matched in two extra
+  reruns.
+
+Full forced measurements:
+
+- Baseline artifact:
+  `target/conformance/full-after-xattr-084615.jsonl` has 59 gating rows.
+- First process-section artifact:
+  `target/conformance/after-process-section.jsonl` has 58 gating rows.
+  Compared with baseline, it added `cpython-multiprocessing_fork`,
+  `ltp-futex_cmp_requeue01`, and `ltp-waitpid08`, while dropping
+  `cpython-asyncio`, `cpython-tarfile`, `ltp-nice05`, and `ltp-semctl01`.
+- Second process-section artifact:
+  `target/conformance/after-process-section-rerun.jsonl` has 64 gating rows.
+  Compared with baseline, it added `cpython-multiprocessing_fork`,
+  `cpython-multiprocessing_spawn`, `go-os`, `ltp-futex_cmp_requeue01`,
+  `ltp-mq_notify01`, `ltp-mq_timedreceive01`,
+  `ltp-sched_setaffinity01`, and `ltp-waitpid10`, while dropping
+  `cpython-multiprocessing_forkserver`, `cpython-tarfile`, and
+  `ltp-semctl01`.
+
+Focused follow-up on apparent new rows:
+
+- `target/conformance/after-process-section-new-gating-rerun.jsonl` reran the
+  first full run's new rows and all three matched:
+  `ltp-futex_cmp_requeue01`, `ltp-waitpid08`, and
+  `cpython-multiprocessing_fork`.
+- `target/conformance/after-process-section-second-new-gating-rerun.jsonl`
+  reran the second full run's new rows. It reduced the set to three reds:
+  `ltp-futex_cmp_requeue01` TIMEOUT, `ltp-mq_timedreceive01` REGRESSION, and
+  `go-os` TIMEOUT.
+- `target/conformance/after-process-section-sensitive-rerun2.jsonl` sampled
+  those three again and reported no gating regressions:
+  `ltp-futex_cmp_requeue01` MATCH, `ltp-mq_timedreceive01` MATCH, and `go-os`
+  DIFF but non-gating.
+
+Classification:
+
+B7 did not meet the goal-complete measurement criterion. The implementation is
+landed and focused reruns do not show a stable new process-section regression,
+but two consecutive full `--force` runs did not produce identical gating sets.
+The full gate is currently too sensitive to timeout/load churn to bless this as
+a stable non-increasing conformance measurement.
+
+Next action:
+
+Treat B7 as measurement-blocked, not done. Before checking off B7, either make
+the full gate stable enough to produce two consecutive identical gating sets or
+replace the completion rule with an explicit, committed measurement policy that
+accounts for known timeout-sensitive rows.
