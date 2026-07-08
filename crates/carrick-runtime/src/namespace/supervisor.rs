@@ -148,7 +148,32 @@ pub fn run(init_host_pid: i32, reg_pipe_read: i32) -> SupervisorExit {
         // On any wake (pipe, member death, or timeout) re-arm watches for any
         // members that appeared since the last scan.
         arm_member_watches(mux.as_mut(), &mut watched);
+        // Leak backstop: release records whose owner is FULLY gone (reaped —
+        // no process, no zombie) and whose exit no live waiter can consume.
+        // Fork children nobody ever wait4s (SIGCHLD ignored, parent exited
+        // without a subreaper) otherwise hold their records until the section
+        // exhausts and fork(2) starts failing EAGAIN.
+        if let Some(region) = pid::region() {
+            let _ = region.sweep_dead_owner_records(&host_pid_fully_gone);
+        }
     }
+}
+
+/// `kill(pid, 0) == ESRCH`: the pid is fully gone — no live process AND no
+/// zombie (a zombie still answers success, which is what keeps a reapable
+/// child's record alive until its parent's terminal wait). Same last-resort
+/// liveness discipline as the vCPU-permit reaper's backstop; the EVFILT_PROC
+/// member-death events are the wake-up, this is the proof.
+fn host_pid_fully_gone(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 {
+        return false;
+    }
+    // SAFETY: kill with signal 0 probes existence only; no signal is sent.
+    let rc = unsafe { libc::kill(pid, 0) };
+    rc != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
 }
 
 /// Arm an exit watch for every registered member we haven't watched yet. If a
@@ -348,5 +373,52 @@ mod tests {
     #[test]
     fn handle_member_death_is_safe_without_region() {
         handle_member_death(999_999, 42);
+    }
+
+    /// The sweep's liveness proof must NOT treat a zombie as gone: a dead-but-
+    /// unreaped child still has a live parent whose `wait4` consumes it, so its
+    /// record must survive until the terminal reap. Only a fully-reaped pid is
+    /// "fully gone".
+    #[test]
+    fn fully_gone_distinguishes_zombie_from_reaped() {
+        // SAFETY: fork in a test; the child only calls `_exit`.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed");
+        if child == 0 {
+            unsafe { libc::_exit(0) };
+        }
+        // Wait (non-consuming) until the child is a confirmed zombie.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            // SAFETY: WNOWAIT peek on our direct child.
+            let rc = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    child as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+                )
+            };
+            if rc == 0 && info.si_pid == child {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child did not become a zombie"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            !super::host_pid_fully_gone(child as u32),
+            "a zombie still answers kill(pid, 0); it is not fully gone"
+        );
+        let mut status = 0;
+        // SAFETY: terminal reap of our direct child.
+        unsafe { libc::waitpid(child, &mut status, 0) };
+        assert!(
+            super::host_pid_fully_gone(child as u32),
+            "a reaped pid is fully gone"
+        );
     }
 }
