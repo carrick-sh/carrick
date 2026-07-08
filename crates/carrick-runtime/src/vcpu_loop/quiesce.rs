@@ -320,6 +320,7 @@ where
         }
 
         let phase_start = std::time::Instant::now();
+        let subphase_start = std::time::Instant::now();
         // Publish the arena high-water so the child snapshot's mincore scan is
         // bounded to the guest's used prefix, not all 32 GiB. The HVF child
         // snapshot reads the process-global (trap::set_guest_arena_high_water); a
@@ -328,10 +329,18 @@ where
         let arena_high_water = kernel.dispatcher.mmap_arena_high_water();
         crate::trap::set_guest_arena_high_water(arena_high_water);
         engine.set_vfork_arena_high_water(arena_high_water);
+        crate::probes::fork_lifecycle(
+            0,
+            50,
+            elapsed_us(subphase_start),
+            arena_high_water.min(i64::MAX as u64) as i64,
+            0,
+        );
         // vfork: an inherited pipe to SUSPEND the parent until the child
         // execve/_exit. Created BEFORE the fork so BOTH processes inherit BOTH
         // ends; these are host fds (NOT in the guest fd table). On a pipe() failure
         // degrade to a non-suspending shared fork (vfork_pipe = None).
+        let subphase_start = std::time::Instant::now();
         let vfork_pipe: Option<(i32, i32)> = if vfork.is_some() {
             let mut fds = [0i32; 2];
             if unsafe { libc::pipe(fds.as_mut_ptr()) } == 0 {
@@ -346,7 +355,16 @@ where
         } else {
             None
         };
+        crate::probes::fork_lifecycle(
+            0,
+            51,
+            elapsed_us(subphase_start),
+            i64::from(pidfd_out.is_some()),
+            i64::from(vfork_pipe.is_some()),
+        );
+        let subphase_start = std::time::Instant::now();
         let prepared_fork = kernel.fork.prepare_host_fork();
+        crate::probes::fork_lifecycle(0, 52, elapsed_us(subphase_start), 0, 0);
         // Hold the quiesce barrier's internal mutex ACROSS the fork: a sibling
         // parking for this quiesce leaves the kicker count BEFORE it parks
         // (`release_and_park_vcpu_for_fork` unregisters first), so the quiesce
@@ -357,12 +375,15 @@ where
         // permanently in `end_quiesce` → `Mutex::lock_contended`). Owning the
         // mutex here excludes that window by mutual exclusion; it is dropped on
         // BOTH sides immediately after the fork, before any barrier call.
+        let subphase_start = std::time::Instant::now();
         let paused_guard = fork_barrier().lock_paused_across_fork();
+        crate::probes::fork_lifecycle(0, 53, elapsed_us(subphase_start), 0, 0);
         // vfork shares the parent's guest RAM (CLONE_VM); an ordinary fork takes a
         // private CoW snapshot. CRITICAL: gate the SHARE on the suspend pipe
         // existing, NOT on vfork.is_some() — if pipe() failed the parent CANNOT be
         // suspended, and sharing RAM with a running parent silently corrupts guest
         // memory. So a pipe() failure degrades to a plain CoW fork.
+        let subphase_start = std::time::Instant::now();
         let child_parent = if clone_parent {
             kernel.dispatcher.clone_parent_host_pid()
         } else {
@@ -370,11 +391,19 @@ where
         };
         let child_subreaper = kernel.dispatcher.subreaper_for_fork_child();
         let child_ns_pid = crate::namespace::pid::allocate_child_ns_pid_pre_fork();
+        crate::probes::fork_lifecycle(
+            0,
+            54,
+            elapsed_us(subphase_start),
+            child_ns_pid.map(i64::from).unwrap_or(-1),
+            i64::from(child_parent),
+        );
         // Section exhaustion (a guest that forks children nobody ever reaps —
         // SIGCHLD ignored, or the parent exited without a subreaper) is
         // Linux-shaped EAGAIN from fork(2), not a guest abort (spec "Failure
         // model"). Unwind exactly like the engine-fork error arm below, but
         // complete the syscall instead of surfacing a runtime error.
+        let subphase_start = std::time::Instant::now();
         let prepared_child_record = match crate::guest_cpu::prepare_child_record_pre_fork(
             child_parent,
             child_subreaper,
@@ -382,8 +411,24 @@ where
             clone_parent && child_parent != 0,
             0,
         ) {
-            Ok(r) => r,
+            Ok(r) => {
+                crate::probes::fork_lifecycle(
+                    0,
+                    55,
+                    elapsed_us(subphase_start),
+                    child_ns_pid.map(i64::from).unwrap_or(-1),
+                    0,
+                );
+                r
+            }
             Err(_exhausted) => {
+                crate::probes::fork_lifecycle(
+                    0,
+                    55,
+                    elapsed_us(subphase_start),
+                    child_ns_pid.map(i64::from).unwrap_or(-1),
+                    -1,
+                );
                 drop(paused_guard);
                 if let Some((r, w)) = vfork_pipe {
                     unsafe {

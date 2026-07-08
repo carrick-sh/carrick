@@ -186,6 +186,11 @@ mod real {
         /// just-finished phase duration. `a` and `b` are phase-specific counts or
         /// return codes.
         fn fork__lifecycle(_: i32, _: i32, _: u64, _: i64, _: i64) {}
+        /// Fork address-space footprint sample. `phase` is sample-local; current
+        /// E2.2 diagnostics use 0=immediately-before-host-fork. The remaining
+        /// fields are host VM region count, guest mmap-arena high-water, current
+        /// resident bytes, and current virtual bytes.
+        fn fork__footprint(_: i32, _: u64, _: u64, _: u64, _: u64) {}
         /// Per-run lifecycle marker, one probe fired at each phase boundary so a
         /// DTrace consumer can time each phase as a delta. `phase`:
         /// 0=run-entry, 1=image-ready, 2=vm-created, 3=guest-loaded (ready to run),
@@ -771,6 +776,24 @@ mod real {
         carrick_usdt::fork__lifecycle!(|| (role, phase, elapsed_us, a, b));
     }
 
+    pub fn fork_footprint(
+        phase: i32,
+        vm_region_count: u64,
+        arena_high_water: u64,
+        resident_bytes: u64,
+        virtual_bytes: u64,
+    ) {
+        carrick_usdt::fork__footprint!(|| {
+            (
+                phase,
+                vm_region_count,
+                arena_high_water,
+                resident_bytes,
+                virtual_bytes,
+            )
+        });
+    }
+
     pub fn fork_post(pid: i32, pc: u64, elr: u64) {
         carrick_usdt::fork__post!(|| (pid, pc, elr));
     }
@@ -1303,6 +1326,7 @@ mod stub {
     stub!(fork_quiesce(phase: i32, a: i64, b: i64, tid: i32));
     stub!(fork_rebuild(role: i32, phase: i32, desc_count: u64, map_count: u64, elapsed_us: u64));
     stub!(fork_lifecycle(role: i32, phase: i32, elapsed_us: u64, a: i64, b: i64));
+    stub!(fork_footprint(phase: i32, vm_region_count: u64, arena_high_water: u64, resident_bytes: u64, virtual_bytes: u64));
     stub!(fork_post(pid: i32, pc: u64, elr: u64));
     stub!(signal_inject(signum: i32, saved_pc: u64, new_sp: u64, handler: u64));
     stub!(signal_restore(saved_pc: u64, sp: u64, magic: u64));
