@@ -5786,6 +5786,7 @@ mod vm_create_admission_tests {
 
     #[test]
     fn region_address_is_inherited_across_fork() {
+        let _fork_serial = crate::fork_test_lock();
         // The MAP_ANON|MAP_SHARED region must live at the same address in a fork
         // child AND expose the same physical slot table, so a child's acquire is
         // visible to the parent. This is the property flock got from the kernel.

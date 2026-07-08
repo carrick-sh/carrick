@@ -420,6 +420,7 @@ mod tests {
     /// child exits and the supervisor drains the delivered `NOTE_EXIT`.
     #[test]
     fn note_exit_reclaims_owner_slot() {
+        let _fork_serial = crate::fork_test_lock();
         let slots = TestSlots::new();
         // Child stays alive ~150 ms so we register the watch BEFORE it exits,
         // exercising the NOTE_EXIT delivery path (not the register-after-exit one).
@@ -455,6 +456,7 @@ mod tests {
     /// never left stranded.
     #[test]
     fn register_after_exit_reclaims_via_readiness_check() {
+        let _fork_serial = crate::fork_test_lock();
         let slots = TestSlots::new();
         let pid = fork_short_lived_child(0); // exits immediately
 

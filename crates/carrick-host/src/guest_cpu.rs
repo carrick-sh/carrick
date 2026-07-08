@@ -1104,16 +1104,4 @@ mod tests {
                 .store(signum.max(0) as u64, Ordering::Release);
         }
     }
-
-    fn ptrace_stop_signal_for_test(pid: u32) -> Option<i32> {
-        let record = child_record(pid)?;
-        let signum = record.ptrace_stop_signal.load(Ordering::Acquire);
-        i32::try_from(signum).ok().filter(|s| *s != 0)
-    }
-
-    fn parent_pid_for_test(pid: u32) -> Option<u32> {
-        child_record(pid)
-            .map(record_parent_pid)
-            .filter(|parent| *parent != 0)
-    }
 }

@@ -1240,6 +1240,7 @@ mod tests {
 
     #[test]
     fn waitable_child_exit_check_publishes_without_reaping() {
+        let _fork_serial = crate::fork_test_lock();
         let _g = TEST_LOCK.lock();
         reset_after_supervisor_fork();
         PUMP_KQUEUE.store(-1, Ordering::SeqCst);

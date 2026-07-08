@@ -1405,6 +1405,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn child_status_ready_ignores_stopped_child() {
+        let _fork_serial = crate::fork_test_lock();
         let child = unsafe { libc::fork() };
         assert!(child >= 0, "fork failed");
         if child == 0 {
@@ -1506,6 +1507,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn child_status_ready_observes_ptrace_trap_stop() {
+        let _fork_serial = crate::fork_test_lock();
         let child = spawn_ptrace_trap_child_for_wait_test();
         let specific_ready = super::child_status_ready(child);
         let mut status = 0;
@@ -1543,6 +1545,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn child_status_ready_observes_any_exited_child() {
+        let _fork_serial = crate::fork_test_lock();
         let child = unsafe { libc::fork() };
         assert!(child >= 0, "fork failed");
         if child == 0 {
