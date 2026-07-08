@@ -110,13 +110,43 @@ fn kick_ids(_ids: &[u64]) {}
 pub struct SignalPump {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     running: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Set true by the pump thread (via an exit guard) when its loop ends, so
-    /// `stop_inner` can wait on the EXIT — not merely send one wake — and so it
-    /// can give up and detach rather than `join()` forever.
+    /// Raised by the pump thread (via an exit guard) when its loop ends, so
+    /// `stop_inner` can WAIT on the EXIT — not merely send one wake and poll —
+    /// and so it can give up and detach rather than `join()` forever.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    exited: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    exited: std::sync::Arc<ExitSignal>,
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     handle: Option<std::thread::JoinHandle<()>>,
+}
+
+/// Exit signal the pump thread raises when its loop ends: `flag` for lock-free
+/// checks, `mu`/`cv` so `stop_inner` can WAIT for the exit event instead of
+/// sleep-polling (the old 1 ms poll put a full sleep quantum — ~1.3 ms — into
+/// EVERY fork's `prepare_host_fork()`, measured as fork-lifecycle phase 52).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct ExitSignal {
+    flag: std::sync::atomic::AtomicBool,
+    mu: std::sync::Mutex<()>,
+    cv: std::sync::Condvar,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl ExitSignal {
+    fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            flag: std::sync::atomic::AtomicBool::new(false),
+            mu: std::sync::Mutex::new(()),
+            cv: std::sync::Condvar::new(),
+        })
+    }
+    fn raise(&self) {
+        self.flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _g = self.mu.lock().unwrap_or_else(|e| e.into_inner());
+        self.cv.notify_all();
+    }
+    fn raised(&self) -> bool {
+        self.flag.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 impl SignalPump {
@@ -147,7 +177,7 @@ impl SignalPump {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
             crate::host_signal::wake_signal_pump_all();
-            if self.exited.load(Ordering::SeqCst) {
+            if self.exited.raised() {
                 let _ = handle.join();
                 return;
             }
@@ -155,7 +185,15 @@ impl SignalPump {
                 drop(handle); // detach (does NOT join) — never hang the fork
                 return;
             }
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            // Event wait: the pump's ExitGuard raises the signal the moment its
+            // loop ends, so the common case returns in microseconds. The 10 ms
+            // timeout is only the re-wake cadence for the lost-wake race (pump
+            // still setting up its kqueue when the first wake fired).
+            let g = self.exited.mu.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = self
+                .exited
+                .cv
+                .wait_timeout(g, std::time::Duration::from_millis(10));
         }
     }
 
@@ -183,7 +221,7 @@ pub fn spawn_signal_pump(
     futex: std::sync::Arc<dyn carrick_hal::PlatformFutex>,
 ) -> SignalPump {
     let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-    let exited = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let exited = ExitSignal::new();
     let thread_running = std::sync::Arc::clone(&running);
     let thread_exited = std::sync::Arc::clone(&exited);
     let handle = std::thread::Builder::new()
@@ -192,10 +230,10 @@ pub fn spawn_signal_pump(
             // Mark the pump EXITED on every return path (incl. the early
             // kqueue/pipe-setup bail-outs below), so `stop_inner` waits on the
             // real exit and never joins a thread that already left.
-            struct ExitGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
+            struct ExitGuard(std::sync::Arc<ExitSignal>);
             impl Drop for ExitGuard {
                 fn drop(&mut self) {
-                    self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+                    self.0.raise();
                 }
             }
             let _exit_guard = ExitGuard(thread_exited);
