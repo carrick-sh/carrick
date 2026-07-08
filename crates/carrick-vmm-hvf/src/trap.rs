@@ -3754,9 +3754,28 @@ impl HvfVmState {
     /// Resume a process parked by [`Self::shared_wait_park`]: create a fresh VM
     /// and vCPU, re-map this process's existing host backings, then restore the
     /// saved guest registers.
+    ///
+    /// `replay_alias_union` (the MT whole-VM lease first-waker rebuild): also
+    /// re-map every live process-global [`alias_registry`] entry this thread's
+    /// per-thread `mappings` lacks. Threads share ONE VM but `mappings` is
+    /// per-thread, so a high-VA alias a STILL-PARKED sibling mapped would
+    /// otherwise be missing from the rebuilt stage-2 (the same shape the fork
+    /// rebuild repairs with its quiesced-sibling union). Safe because every
+    /// parked sibling holds its `OwnedHostMapping`s alive while parked, and no
+    /// guest thread of this process runs during the rebuild (the caller holds
+    /// the topology lock; claim-false wakers rebind behind it) — so no
+    /// interleaving `munmap` can invalidate an entry mid-replay. Entries are
+    /// NOT pushed into `self.mappings` (ownership stays with the mapping
+    /// thread; a later rebuild re-reads the registry, which reflects any
+    /// munmap since). Single-threaded resumes pass `false` — their own
+    /// `mappings` list is complete by construction, and a forked child must
+    /// NOT re-establish inherited parent/sibling aliases the fork rebuild
+    /// deliberately dropped. The bounded lazy on-fault re-map in `run_to_exit`
+    /// remains the backstop either way.
     pub(crate) fn shared_wait_resume(
         &mut self,
         vcpu: &mut applevisor::vcpu::Vcpu,
+        replay_alias_union: bool,
     ) -> Result<(), TrapError> {
         let snap = self.reclaim_snapshot.take().ok_or_else(|| {
             TrapError::Hypervisor("shared_wait_resume: no parked snapshot".into())
@@ -3798,6 +3817,35 @@ impl HvfVmState {
                     shared_key_base: mapping.shared_key_base,
                     shared_key_offset: mapping.shared_key_offset,
                 });
+            }
+        }
+
+        if replay_alias_union {
+            let mapped_ipas: std::collections::HashSet<u64> =
+                self.mappings.iter().map(|m| m.ipa).collect();
+            // Copy the entries out so the registry mutex isn't held across the
+            // hv_vm_map syscalls (`AliasBacking` is `Copy`).
+            let union: Vec<AliasBacking> = alias_registry().lock().clone();
+            for b in union {
+                if mapped_ipas.contains(&b.ipa) || !alias_backing_is_live(b.host_addr) {
+                    continue;
+                }
+                let r = unsafe {
+                    applevisor_sys::hv_vm_map(
+                        b.host_addr as *mut std::ffi::c_void,
+                        b.ipa,
+                        b.size,
+                        b.perms,
+                    )
+                };
+                if r != 0 {
+                    return Err(TrapError::ChildMapFailed {
+                        host_addr: b.host_addr as u64,
+                        guest_start: b.ipa,
+                        size: b.size,
+                        code: r as u32,
+                    });
+                }
             }
         }
 

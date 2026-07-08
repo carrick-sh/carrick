@@ -236,25 +236,11 @@ where
                 || crate::fork_quiesce::exec_replacing_other_thread(self.this_tid)
         };
         let retval = loop {
-            let single_threaded_process = self.registry.live_count() == 1;
-            let snapshot = if engine.reclaims() {
-                let st = if single_threaded_process {
-                    engine.save_shared_wait_state()
-                } else {
-                    engine.save_guest_state()
-                };
-                let old_slot = carrick_hal::vcpu_sched::current_slot();
-                if let Some(l) = carrick_hal::vcpu_sched::take_current_lease() {
-                    carrick_hal::vcpu_sched::global()
-                        .release(l, carrick_hal::vcpu_sched::Yield::Blocked);
-                }
-                if engine.reclaim_refreshes_kicker() {
-                    self.kicker.unregister(self.this_tid);
-                }
-                Some((st, old_slot))
-            } else {
-                None
-            };
+            // Shared park/resume pair (mod.rs): reclaim this thread's vCPU —
+            // and, when this is the process's last unparked thread (or a
+            // single-threaded process), the whole VM — for the duration of
+            // the shared-word wait.
+            let reclaim = self.park_vcpu_for_blocking_wait(engine);
 
             let publish_wait_enrolled = || {
                 crate::run_state::publish(crate::run_state::RunState::Blocked);
@@ -280,69 +266,7 @@ where
             if thread_should_finish_for_exec_replacement(&self.registry, self.this_tid) {
                 return Ok(SharedWordWaitRaw::ExecReplacedThread);
             }
-            if let Some((st, old_slot)) = snapshot {
-                let mut kicker_dropped = engine.reclaim_refreshes_kicker();
-                let new = loop {
-                    if let Some(l) = carrick_hal::vcpu_sched::global().acquire_timeout(
-                        self.this_tid.raw() as u64,
-                        old_slot,
-                        Duration::from_millis(50),
-                    ) {
-                        break l;
-                    }
-                    if crate::fork_quiesce::is_quiescing() {
-                        if !kicker_dropped {
-                            self.kicker.unregister(self.this_tid);
-                            kicker_dropped = true;
-                        }
-                        fork_barrier().park_if_quiescing();
-                    }
-                };
-                carrick_hal::vcpu_sched::set_current_lease(new);
-                if engine.reclaim_refreshes_kicker() {
-                    let _topo = crate::fork_quiesce::topology_lock()
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    if single_threaded_process {
-                        engine
-                            .rebind_shared_wait_state(new.slot, &st)
-                            .map_err(RuntimeError::Trap)?;
-                    } else {
-                        engine
-                            .rebind_to_slot(new.slot, &st)
-                            .map_err(RuntimeError::Trap)?;
-                    }
-                    let handle: Box<dyn carrick_hal::VcpuKickDyn> = Box::new(engine.kick_handle());
-                    self.kicker.register(self.this_tid, handle);
-                } else {
-                    if crate::fork_quiesce::is_quiescing() {
-                        if !kicker_dropped {
-                            self.kicker.unregister(self.this_tid);
-                            kicker_dropped = true;
-                        }
-                        fork_barrier().park_if_quiescing();
-                    }
-                    if kicker_dropped {
-                        self.register_vcpu(engine);
-                    }
-                    if single_threaded_process {
-                        engine
-                            .rebind_shared_wait_state(new.slot, &st)
-                            .map_err(RuntimeError::Trap)?;
-                    } else {
-                        engine
-                            .rebind_to_slot(new.slot, &st)
-                            .map_err(RuntimeError::Trap)?;
-                    }
-                }
-                let prev = old_slot.unwrap_or(new.slot);
-                crate::probes::mn_reclaim(
-                    self.this_tid.raw(),
-                    prev,
-                    new.slot,
-                    if new.slot == prev { 1 } else { 2 },
-                );
-            }
+            self.resume_vcpu_after_blocking_wait(engine, reclaim)?;
             if retval == crate::linux_abi::LINUX_EINTR.guest_retval()
                 && crate::fork_quiesce::is_quiescing()
             {
