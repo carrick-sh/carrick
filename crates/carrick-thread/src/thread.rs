@@ -1010,9 +1010,49 @@ mod tests {
     }
 
     #[test]
+    fn park_vcpu_three_threads_requires_all_others_parked() {
+        // With 3 live threads, "every OTHER thread parked" (all()) and "some
+        // OTHER thread parked" (any()) diverge: after parking exactly one of
+        // t3's two siblings, any()=true but all()=false — park_vcpu(t3) must
+        // report false in exactly that state.
+        let reg = ThreadRegistry::new(ThreadId::synthetic_for_tests(2020));
+        let t1 = reg.main_tid();
+        let t2 = reg.register_child(0);
+        let t3 = reg.register_child(0);
+        assert!(!reg.park_vcpu(t2), "t1 and t3 still unparked");
+        assert!(
+            !reg.park_vcpu(t3),
+            "t1 still unparked: one parked sibling (any) must not count as all"
+        );
+        assert!(reg.park_vcpu(t1), "t1 is the last unparked of the three");
+    }
+
+    #[test]
     fn park_vcpu_unknown_tid_returns_false() {
         let reg = ThreadRegistry::new(ThreadId::synthetic_for_tests(2010));
+        let t1 = reg.main_tid();
+        let t2 = reg.register_child(0);
         assert!(!reg.park_vcpu(ThreadId::synthetic_for_tests(9999)));
+        // Even when EVERY real thread is parked (a state where the
+        // "all others parked" scan is true), an unknown tid must hit the
+        // early return and still report false — not a coincidental false.
+        assert!(!reg.park_vcpu(t1));
+        assert!(reg.park_vcpu(t2));
+        assert!(!reg.park_vcpu(ThreadId::synthetic_for_tests(9999)));
+    }
+
+    #[test]
+    fn set_vm_released_false_clears_pending_claim() {
+        let reg = ThreadRegistry::new(ThreadId::synthetic_for_tests(2030));
+        let t1 = reg.main_tid();
+        reg.set_vm_released(true);
+        assert!(reg.vm_released());
+        reg.set_vm_released(false);
+        assert!(!reg.vm_released());
+        assert!(
+            !reg.unpark_vcpu(t1),
+            "a cleared flag must leave nothing to claim"
+        );
     }
 
     #[test]
