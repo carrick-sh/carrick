@@ -56,6 +56,25 @@ pub struct ResourceUsage {
 mod imp {
     use super::{GuestProcInfo, ResourceUsage};
 
+    const VM_REGION_BASIC_INFO_64: i32 = 9;
+    const VM_REGION_BASIC_INFO_COUNT_64: u32 = 9;
+
+    unsafe extern "C" {
+        fn mach_vm_region(
+            target_task: libc::vm_map_t,
+            address: *mut libc::mach_vm_address_t,
+            size: *mut libc::mach_vm_size_t,
+            flavor: i32,
+            info: *mut i32,
+            info_count: *mut u32,
+            object_name: *mut libc::mach_port_t,
+        ) -> libc::kern_return_t;
+        fn mach_port_deallocate(
+            task: libc::mach_port_t,
+            name: libc::mach_port_t,
+        ) -> libc::kern_return_t;
+    }
+
     /// Map a macOS process status (`pbi_status`) to the Linux stat state char.
     /// The tests only distinguish "sleeping in a syscall" (`S`) from "running"
     /// (`R`); a guest blocked in pause()/futex parks carrick's run loop in a
@@ -414,6 +433,51 @@ mod imp {
             usage.user_us = usage.user_us.saturating_add(guest_us);
         }
         Some(usage)
+    }
+
+    /// Count this process's Mach VM regions by walking the task map. This is a
+    /// diagnostics-only fork-footprint signal: it tells us whether host `fork(2)`
+    /// cost is scaling with address-space shape, not just resident bytes.
+    #[allow(deprecated)] // libc::mach_task_self_ is the stable self-task port here.
+    pub fn self_vm_region_count() -> Option<u64> {
+        let task = unsafe { libc::mach_task_self_ };
+        let mut address: libc::mach_vm_address_t = 0;
+        let mut regions = 0u64;
+
+        loop {
+            let mut size: libc::mach_vm_size_t = 0;
+            let mut info = [0i32; 16];
+            let mut count = VM_REGION_BASIC_INFO_COUNT_64;
+            let mut object_name: libc::mach_port_t = 0;
+            // SAFETY: queries this process's VM map and writes fixed-size result
+            // buffers matching VM_REGION_BASIC_INFO_64.
+            let kr = unsafe {
+                mach_vm_region(
+                    task,
+                    &mut address,
+                    &mut size,
+                    VM_REGION_BASIC_INFO_64,
+                    info.as_mut_ptr(),
+                    &mut count,
+                    &mut object_name,
+                )
+            };
+            if object_name != 0 {
+                let _ = unsafe { mach_port_deallocate(task, object_name) };
+            }
+            if kr != libc::KERN_SUCCESS {
+                return (regions > 0).then_some(regions);
+            }
+            if size == 0 {
+                return None;
+            }
+            regions = regions.checked_add(1)?;
+            let next = address.checked_add(size)?;
+            if next <= address {
+                return None;
+            }
+            address = next;
+        }
     }
 
     /// (user_us, system_us) CPU time for the current thread, from
@@ -961,6 +1025,10 @@ mod imp {
         }
     }
 
+    pub fn self_vm_region_count() -> Option<u64> {
+        None
+    }
+
     /// (user_us, system_us) CPU time for the CURRENT thread, from the host
     /// kernel's own per-thread accounting: `getrusage(RUSAGE_THREAD)`. KVM
     /// guest execution is charged to the vCPU thread as guest time, which
@@ -1015,7 +1083,7 @@ mod imp {
 
 pub use imp::{
     current_thread_port, is_guest_process, pid_info, self_resource_usage, self_thread_cpu_us,
-    thread_run_state_char,
+    self_vm_region_count, thread_run_state_char,
 };
 
 /// Mach port type alias for the registry (real on macOS, u32 elsewhere).
