@@ -191,6 +191,9 @@ mod real {
         /// fields are host VM region count, guest mmap-arena high-water, current
         /// resident bytes, and current virtual bytes.
         fn fork__footprint(_: i32, _: u64, _: u64, _: u64, _: u64) {}
+        /// Fork footprint attribution by HVF guest mapping class. Args are:
+        /// class id, region count, scanned bytes, resident bytes, and flags.
+        fn fork__footprint__class(_: i32, _: u64, _: u64, _: u64, _: u64) {}
         /// Per-run lifecycle marker, one probe fired at each phase boundary so a
         /// DTrace consumer can time each phase as a delta. `phase`:
         /// 0=run-entry, 1=image-ready, 2=vm-created, 3=guest-loaded (ready to run),
@@ -794,6 +797,31 @@ mod real {
         });
     }
 
+    pub fn fork_footprint_class(
+        class_id: i32,
+        region_count: u64,
+        scan_bytes: u64,
+        resident_bytes: u64,
+        flags: u64,
+    ) {
+        carrick_usdt::fork__footprint__class!(|| {
+            (class_id, region_count, scan_bytes, resident_bytes, flags)
+        });
+    }
+
+    pub fn with_fork_footprint_class_probe<F>(emit: F)
+    where
+        F: FnOnce(),
+    {
+        let mut emit = Some(emit);
+        carrick_usdt::fork__footprint__class!(|| {
+            if let Some(emit) = emit.take() {
+                emit();
+            }
+            (0, 0, 0, 0, 0)
+        });
+    }
+
     pub fn fork_post(pid: i32, pc: u64, elr: u64) {
         carrick_usdt::fork__post!(|| (pid, pc, elr));
     }
@@ -1327,6 +1355,7 @@ mod stub {
     stub!(fork_rebuild(role: i32, phase: i32, desc_count: u64, map_count: u64, elapsed_us: u64));
     stub!(fork_lifecycle(role: i32, phase: i32, elapsed_us: u64, a: i64, b: i64));
     stub!(fork_footprint(phase: i32, vm_region_count: u64, arena_high_water: u64, resident_bytes: u64, virtual_bytes: u64));
+    stub!(fork_footprint_class(class_id: i32, region_count: u64, scan_bytes: u64, resident_bytes: u64, flags: u64));
     stub!(fork_post(pid: i32, pc: u64, elr: u64));
     stub!(signal_inject(signum: i32, saved_pc: u64, new_sp: u64, handler: u64));
     stub!(signal_restore(saved_pc: u64, sp: u64, magic: u64));
@@ -1355,6 +1384,12 @@ mod stub {
     stub!(signal_publish(target_tid: i32, signum: i32, kind: i32));
     stub!(signal_deliver(tid: i32, pending: i32));
     stub!(fire(event: &crate::compat::CompatEvent));
+
+    pub fn with_fork_footprint_class_probe<F>(_emit: F)
+    where
+        F: FnOnce(),
+    {
+    }
 
     /// Per-run lifecycle phase markers (mirrors `real::phase`).
     pub mod phase {

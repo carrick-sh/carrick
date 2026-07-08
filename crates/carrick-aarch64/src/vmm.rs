@@ -439,6 +439,12 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         Ok(())
     }
 
+    /// Emit backend-specific pre-host-fork footprint attribution. The shared
+    /// engine calls this immediately after the process-wide `fork__footprint`
+    /// sample and immediately before `libc::fork`. Backends without per-mapping
+    /// attribution keep the no-op default.
+    fn emit_fork_footprint_attribution(&self, _arena_high_water: u64) {}
+
     /// Child-side rebuild after `libc::fork()`: KVM rebuilds a fresh `KvmVm` over
     /// the COW host mmaps; HVF rebuilds a fresh `applevisor` VM and re-`hv_vm_map`s
     /// each region. This hook owns the whole child-side register re-seat (restore

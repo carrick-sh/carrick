@@ -64,6 +64,19 @@ carrick*:::fork-footprint
     @footprint_count[(int)arg0] = count();
 }
 
+carrick*:::fork-footprint-class
+/(pid == $target || progenyof($target)) && arg0 != 0/
+{
+    printf("[%d] fork-footprint-class class=%d regions=%d scan_bytes=%d resident_bytes=%d flags=%d\n",
+        pid, (int)arg0, (uint64_t)arg1, (uint64_t)arg2, (uint64_t)arg3,
+        (uint64_t)arg4);
+    @footprint_class_regions[(int)arg0] = avg((uint64_t)arg1);
+    @footprint_class_scan_bytes[(int)arg0] = avg((uint64_t)arg2);
+    @footprint_class_resident_bytes[(int)arg0] = avg((uint64_t)arg3);
+    @footprint_class_flags[(int)arg0] = avg((uint64_t)arg4);
+    @footprint_class_count[(int)arg0] = count();
+}
+
 carrick*:::fork-post
 /(pid == $target || progenyof($target)) && fork_start[pid]/
 {
@@ -138,6 +151,11 @@ dtrace:::END
     printa("footprint resident_bytes phase=%d %@d\n", @footprint_resident_bytes);
     printa("footprint virtual_bytes phase=%d %@d\n", @footprint_virtual_bytes);
     printa("footprint count phase=%d %@d\n", @footprint_count);
+    printa("footprint class regions class=%d %@d\n", @footprint_class_regions);
+    printa("footprint class scan_bytes class=%d %@d\n", @footprint_class_scan_bytes);
+    printa("footprint class resident_bytes class=%d %@d\n", @footprint_class_resident_bytes);
+    printa("footprint class flags class=%d %@d\n", @footprint_class_flags);
+    printa("footprint class count class=%d %@d\n", @footprint_class_count);
     printa("child post-to-exit avg us %@d\n", @child_post_to_exit_us);
     printa("parent post-to-exit avg us %@d\n", @parent_post_to_exit_us);
 }
