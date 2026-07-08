@@ -353,15 +353,18 @@ where
     dispatcher.drain_xsignals_for_tid(tid);
 
     let pending = crate::host_signal::take_pending_for(tid.raw());
-    let pending = if pending == 0 {
+    // Provenance of the taken signal (see take_pending_in_from): a host-slot
+    // delivery is thread-directed; only a shared-set take may consume the
+    // PROCESS-directed siginfo queue below.
+    let (pending, from_shared) = if pending == 0 {
         // Nothing newly arrived in the host slot. Deliver the next signal that was
         // raised while blocked and has since been unblocked.
-        match dispatcher.take_deliverable_pending(tid) {
-            Some(s) => s,
+        match dispatcher.take_deliverable_pending_from(tid) {
+            Some((s, from_thread)) => (s, !from_thread),
             None => return Ok(None),
         }
     } else {
-        pending
+        (pending, false)
     };
     crate::probes::signal_deliver(tid.raw(), pending);
     // A blocked signal must not be delivered — hold it pending until the guest
@@ -413,41 +416,46 @@ where
             // If rt_sigqueueinfo queued a caller-supplied siginfo for this (tid,
             // signum), pop it now and hand it to inject_signal. Failing that,
             // synthesise an SI_USER siginfo with the sender's ns-pid.
-            let queued_siginfo = dispatcher
-                .take_pending_siginfo(tid, pending)
-                .or_else(|| {
-                    crate::host_signal::take_child_exit_siginfo(tid.raw(), pending).map(|info| {
-                        const CLD_EXITED: i32 = 1;
-                        let ns_pid =
-                            crate::namespace::pid::host_to_ns_or_self(info.host_pid as u32) as i32;
-                        let linux_status = if info.si_code == CLD_EXITED {
-                            info.host_status
-                        } else {
-                            crate::host_signal::host_to_linux_signum(info.host_status)
-                        };
-                        crate::linux_abi::LinuxSiginfo::child_exit(
-                            pending,
-                            ns_pid,
-                            info.host_uid,
-                            info.si_code,
-                            linux_status,
-                        )
-                    })
+            // Provenance-gated: a shared-set take reads the PROCESS-directed
+            // queue; a host-slot/per-thread take reads the per-tid queue only.
+            let queued_siginfo = if from_shared {
+                dispatcher.take_process_pending_siginfo(pending)
+            } else {
+                dispatcher.take_pending_siginfo(tid, pending)
+            }
+            .or_else(|| {
+                crate::host_signal::take_child_exit_siginfo(tid.raw(), pending).map(|info| {
+                    const CLD_EXITED: i32 = 1;
+                    let ns_pid =
+                        crate::namespace::pid::host_to_ns_or_self(info.host_pid as u32) as i32;
+                    let linux_status = if info.si_code == CLD_EXITED {
+                        info.host_status
+                    } else {
+                        crate::host_signal::host_to_linux_signum(info.host_status)
+                    };
+                    crate::linux_abi::LinuxSiginfo::child_exit(
+                        pending,
+                        ns_pid,
+                        info.host_uid,
+                        info.si_code,
+                        linux_status,
+                    )
                 })
-                .or_else(|| {
-                    let sender_host = crate::host_signal::last_sender_for(pending);
-                    (sender_host > 0).then(|| {
-                        let ns_pid =
-                            crate::namespace::pid::host_to_ns_or_self(sender_host as u32) as i32;
-                        let uid = crate::cred_ipc::read_target(sender_host).unwrap_or(0);
-                        crate::linux_abi::LinuxSiginfo::kill(
-                            pending,
-                            crate::linux_abi::LINUX_SI_USER,
-                            ns_pid,
-                            uid,
-                        )
-                    })
-                });
+            })
+            .or_else(|| {
+                let sender_host = crate::host_signal::last_sender_for(pending);
+                (sender_host > 0).then(|| {
+                    let ns_pid =
+                        crate::namespace::pid::host_to_ns_or_self(sender_host as u32) as i32;
+                    let uid = crate::cred_ipc::read_target(sender_host).unwrap_or(0);
+                    crate::linux_abi::LinuxSiginfo::kill(
+                        pending,
+                        crate::linux_abi::LINUX_SI_USER,
+                        ns_pid,
+                        uid,
+                    )
+                })
+            });
             match trap.inject_signal(
                 pending,
                 action.sa_handler,
