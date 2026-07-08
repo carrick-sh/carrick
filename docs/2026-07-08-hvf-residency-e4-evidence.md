@@ -99,8 +99,8 @@ carrick already releases the whole VM for them.
      releasing a vCPU alone does not free a slot; the existing single-threaded
      path already destroys the VM, which is why it works).
    - **Reacquire budget: tens of µs of HVF create + ~200-670 µs stage-2 replay**
-     (questions 2+3), bounded at 14 descriptors independent of guest VA
-     fragmentation.
+     (questions 2+3), bounded at 14 descriptors for anonymous-private guest VA
+     fragmentation (see question 3's MAP_SHARED caveat).
    - **Churn bound: flat / non-degrading over 200 cycles** (question 2) — a
      lease can release and reacquire repeatedly without accumulating cost.
    - **Acceptance test: `PROC_LADDER_N=160 procladder` MATCH** stays green as the
@@ -263,7 +263,8 @@ lease work is now scoped by measured reality, not the memo's prediction:
    (`shared_wait_park`) to multi-threaded blocked processes, which today keep the
    VM alive via `reclaim_park` and so remain capacity-bound at 127. Eviction unit
    is the whole VM (per-VM ceiling); reacquire budget is tens of µs create +
-   ~200-670 µs replay bounded at 14 descriptors; churn is flat/non-degrading.
+   ~200-670 µs replay bounded at 14 descriptors for anonymous-private shapes;
+   churn is flat/non-degrading.
    - **Red-first gate:** a `procladder-mt` variant whose children spawn a second
      thread and *then* block — this must currently fail (>127 multithreaded
      blocked processes hit `HV_NO_RESOURCES`) and pass after the lease extension.
