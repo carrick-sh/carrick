@@ -100,9 +100,31 @@ struct ThreadEntry {
     /// query a host kernel thread state through Mach. Defaults to running; the
     /// runtime marks it sleeping around genuine blocking waits.
     proc_state: char,
-    /// True while this thread's vCPU is parked (quiesced) as part of an
-    /// all-threads-parked barrier — see [`ThreadRegistry::park_vcpu`].
-    vcpu_parked: bool,
+    /// `Some(class)` while this thread's vCPU is parked (destroyed for the
+    /// duration of a blocking wait) — see [`ThreadRegistry::park_vcpu_classified`].
+    /// `None` = not parked.
+    vcpu_parked: Option<VcpuParkClass>,
+}
+
+/// How a parked thread's WAKE PATH behaves if the process VM is released
+/// from under it — the classification the MT whole-VM lease's release
+/// re-check consults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VcpuParkClass {
+    /// The wait is armed on one or more REAL fds (kqueue readiness — the
+    /// WaitOnFds/WaitOnPollFds/WaitOnFdsSelect arms with a non-empty fd
+    /// set, plus conservative members like the blocking record-lock and
+    /// host-waitpid waits). The fd-wait wake path has an un-root-caused
+    /// wake gap when the VM is released from under it (the CPython
+    /// forkserver wedge — task-6-regression-attribution.md cluster B,
+    /// cores cr-attr-fs.*), so a parked fd-backed thread VETOES the
+    /// whole-VM release.
+    FdBacked,
+    /// The wake is signal/timer/futex-driven (the slicing WaitOnSignals /
+    /// WaitOnSleep arms, shared-futex waits, and fd-arm parks with an
+    /// EMPTY fd set — e.g. a `ppoll(NULL)` pure-signal/timeout wait):
+    /// proven to wake and rebuild correctly with the VM released.
+    ReleaseSafe,
 }
 
 /// Everything the registry's ONE mutex guards: the thread table plus the
@@ -112,15 +134,18 @@ struct ThreadEntry {
 /// rebuild flag are each one atomic critical section, not two locks that
 /// could race against each other.
 ///
-/// The vCPU-parking contract is FIVE methods: `park_vcpu` (mark + the
-/// last-unparked verdict; on the MT path the caller marks only AFTER its
-/// vCPU is actually destroyed, so the mark is truthful), `unpark_vcpu`
-/// (clear + atomically claim the rebuild), `set_vm_released` /
-/// `vm_released` (the flag itself), and — the addendum —
-/// `all_other_vcpus_parked`, the last-parker's re-check taken under the
-/// process topology lock, atomically with the VM teardown, so a sibling's
-/// wake between the `park_vcpu` verdict and the teardown downgrades the
-/// whole-VM release instead of racing it.
+/// The vCPU-parking contract is SIX methods: `park_vcpu_classified` (mark
+/// with a [`VcpuParkClass`] + the last-unparked verdict; on the MT path the
+/// caller marks only AFTER its vCPU is actually destroyed, so the mark is
+/// truthful — `park_vcpu` is the class-conservative `FdBacked` shorthand),
+/// `unpark_vcpu` (clear + atomically claim the rebuild), `set_vm_released`
+/// / `vm_released` (the flag itself), and the release re-checks taken by
+/// the last parker under the process topology lock, atomically with the VM
+/// teardown — `all_other_vcpus_parked` (every other live thread parked) and
+/// `all_other_parked_release_safe` (…AND every one of them wake-safe under
+/// a released VM), so a sibling's wake between the verdict and the teardown
+/// downgrades the whole-VM release instead of racing it, and a parked
+/// fd-backed waiter vetoes it outright.
 struct RegistryInner {
     map: HashMap<ThreadId, ThreadEntry>,
     /// Set by the thread that parks last (see `park_vcpu`) once it has torn
@@ -221,7 +246,7 @@ impl ThreadRegistry {
                 mach_port: 0,
                 name: None,
                 proc_state: 'R',
-                vcpu_parked: false,
+                vcpu_parked: None,
             },
         );
         Self {
@@ -247,7 +272,7 @@ impl ThreadRegistry {
                 mach_port: 0,
                 name: None,
                 proc_state: 'R',
-                vcpu_parked: false,
+                vcpu_parked: None,
             },
         );
         tid
@@ -384,28 +409,37 @@ impl ThreadRegistry {
         }
     }
 
-    /// Mark `tid`'s vCPU as parked (quiesced). Returns true iff `tid` was not
-    /// already parked AND every OTHER live thread is already parked — i.e.
-    /// the caller is the last thread to park, the one responsible for
-    /// whatever barrier action follows (e.g. tearing down the VM). Returns
-    /// false for an unknown `tid`, and false if `tid` was already parked
-    /// (parking is idempotent — it does not re-report "last" on a repeat
-    /// call).
+    /// Mark `tid`'s vCPU as parked (quiesced) with the conservative
+    /// [`VcpuParkClass::FdBacked`] class (vetoes whole-VM release). See
+    /// [`Self::park_vcpu_classified`] for the semantics; callers that KNOW
+    /// their wake path is release-safe pass the class explicitly.
     pub fn park_vcpu(&self, tid: ThreadId) -> bool {
+        self.park_vcpu_classified(tid, VcpuParkClass::FdBacked)
+    }
+
+    /// Mark `tid`'s vCPU as parked (quiesced), recording how its wake path
+    /// behaves under a released VM. Returns true iff `tid` was not already
+    /// parked AND every OTHER live thread is already parked — i.e. the
+    /// caller is the last thread to park, the one responsible for whatever
+    /// barrier action follows (e.g. tearing down the VM). Returns false for
+    /// an unknown `tid`, and false if `tid` was already parked (parking is
+    /// idempotent — it does not re-report "last" on a repeat call; a repeat
+    /// call still updates the recorded class).
+    pub fn park_vcpu_classified(&self, tid: ThreadId, class: VcpuParkClass) -> bool {
         let mut inner = self.inner.lock();
         let already_parked = match inner.map.get(&tid) {
-            Some(e) => e.vcpu_parked,
+            Some(e) => e.vcpu_parked.is_some(),
             None => return false,
         };
         if let Some(e) = inner.map.get_mut(&tid) {
-            e.vcpu_parked = true;
+            e.vcpu_parked = Some(class);
         }
         !already_parked
             && inner
                 .map
                 .iter()
                 .filter(|(t, _)| **t != tid)
-                .all(|(_, e)| e.vcpu_parked)
+                .all(|(_, e)| e.vcpu_parked.is_some())
     }
 
     /// Clear `tid`'s parked mark. Returns true iff the process-wide
@@ -417,19 +451,20 @@ impl ThreadRegistry {
     pub fn unpark_vcpu(&self, tid: ThreadId) -> bool {
         let mut inner = self.inner.lock();
         if let Some(e) = inner.map.get_mut(&tid) {
-            e.vcpu_parked = false;
+            e.vcpu_parked = None;
         }
         let claimed = inner.vm_released;
         inner.vm_released = false;
         claimed
     }
 
-    /// True iff every live thread OTHER than `tid` is currently vcpu-parked.
+    /// True iff every live thread OTHER than `tid` is currently vcpu-parked
+    /// (any class).
     ///
-    /// The whole-VM release path re-checks this under the process topology
-    /// lock, atomically with the VM teardown: a sibling whose wake claimed
-    /// the rebuild (`unpark_vcpu`, taken under the same topology lock) after
-    /// the `park_vcpu` last-unparked verdict — but before the teardown —
+    /// The whole-VM release path re-checks under the process topology lock,
+    /// atomically with the VM teardown: a sibling whose wake claimed the
+    /// rebuild (`unpark_vcpu`, taken under the same topology lock) after the
+    /// `park_vcpu` last-unparked verdict — but before the teardown —
     /// DOWNGRADES the release to a vCPU-only park instead of racing the
     /// teardown against the sibling's vCPU re-create.
     pub fn all_other_vcpus_parked(&self, tid: ThreadId) -> bool {
@@ -438,7 +473,22 @@ impl ThreadRegistry {
             .map
             .iter()
             .filter(|(t, _)| **t != tid)
-            .all(|(_, e)| e.vcpu_parked)
+            .all(|(_, e)| e.vcpu_parked.is_some())
+    }
+
+    /// [`Self::all_other_vcpus_parked`] AND every one of those parks is
+    /// [`VcpuParkClass::ReleaseSafe`] — the MT whole-VM release's actual
+    /// under-lock re-check: a parked FD-BACKED waiter (whose wake path under
+    /// a released VM has an un-root-caused gap — the CPython forkserver
+    /// wedge, task-6-regression-attribution.md cluster B) VETOES the
+    /// release.
+    pub fn all_other_parked_release_safe(&self, tid: ThreadId) -> bool {
+        let inner = self.inner.lock();
+        inner
+            .map
+            .iter()
+            .filter(|(t, _)| **t != tid)
+            .all(|(_, e)| e.vcpu_parked == Some(VcpuParkClass::ReleaseSafe))
     }
 
     /// Record that the last-parked thread destroyed the VM (or, with
@@ -1086,6 +1136,38 @@ mod tests {
         // teardown must flip the re-check to false — the downgrade trigger.
         assert!(!reg.unpark_vcpu(t2));
         assert!(!reg.all_other_vcpus_parked(t1), "t2 woke: downgrade");
+    }
+
+    #[test]
+    fn fd_backed_park_vetoes_release_safe_recheck() {
+        let reg = ThreadRegistry::new(ThreadId::synthetic_for_tests(2050));
+        let t1 = reg.main_tid();
+        let t2 = reg.register_child(0);
+        let t3 = reg.register_child(0);
+        // Both siblings parked release-safe: the whole-VM release re-check
+        // passes on both queries.
+        assert!(!reg.park_vcpu_classified(t2, VcpuParkClass::ReleaseSafe));
+        assert!(!reg.park_vcpu_classified(t3, VcpuParkClass::ReleaseSafe));
+        assert!(reg.all_other_vcpus_parked(t1));
+        assert!(reg.all_other_parked_release_safe(t1));
+        // Re-park t2 fd-backed (a poll on a real fd): still "all parked",
+        // but the release-safe re-check must VETO — an fd-backed waiter
+        // never has the VM released from under it (attribution cluster B).
+        reg.unpark_vcpu(t2);
+        assert!(!reg.park_vcpu_classified(t2, VcpuParkClass::FdBacked));
+        assert!(reg.all_other_vcpus_parked(t1), "still all parked");
+        assert!(
+            !reg.all_other_parked_release_safe(t1),
+            "fd-backed park vetoes the whole-VM release"
+        );
+        // The class-conservative shorthand parks as FdBacked too.
+        reg.unpark_vcpu(t3);
+        assert!(!reg.park_vcpu(t3));
+        assert!(!reg.all_other_parked_release_safe(t1));
+        // An unparked sibling fails BOTH re-checks.
+        reg.unpark_vcpu(t2);
+        assert!(!reg.all_other_vcpus_parked(t1));
+        assert!(!reg.all_other_parked_release_safe(t1));
     }
 
     #[test]

@@ -237,10 +237,12 @@ where
         };
         let retval = loop {
             // Shared park/resume pair (mod.rs): reclaim this thread's vCPU —
-            // and, when this is the process's last unparked thread (or a
-            // single-threaded process), the whole VM — for the duration of
-            // the shared-word wait.
-            let reclaim = self.park_vcpu_for_blocking_wait(engine);
+            // and, for a single-threaded process, the whole VM — for the
+            // duration of the shared-word wait. ReleaseSafe: the wake is the
+            // cross-process futex mirror / __ulock predicate, the ORIGINAL
+            // (E4) VM-released wait shape, proven vCPU-less.
+            let reclaim =
+                self.park_vcpu_for_blocking_wait(engine, crate::thread::VcpuParkClass::ReleaseSafe);
 
             let publish_wait_enrolled = || {
                 crate::run_state::publish(crate::run_state::RunState::Blocked);
