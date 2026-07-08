@@ -1636,8 +1636,11 @@ pub mod host_signal {
     }
     /// Drain every xsignal-ring entry targeting THIS process, clearing the dirty
     /// flag. Called in dispatch context; the consumer rebuilds siginfo (preserving
-    /// `si_value` for RT signals) and marks each signal pending.
-    pub fn xsig_drain_for_self() -> Vec<(i32, i32, i32, u32, i64)> {
+    /// `si_value` for RT signals) and marks each signal pending. The trailing
+    /// `target_ns_tid` is 0 for a process-directed send (kill/rt_sigqueueinfo/
+    /// pidfd) or the guest ns tid of a thread-directed one (tkill/tgkill/
+    /// rt_tgsigqueueinfo).
+    pub fn xsig_drain_for_self() -> Vec<(i32, i32, i32, u32, i64, i32)> {
         carrick_signal_core::xsig::xsig_drain_for_self()
     }
     /// Self-directed `kill(getpid(), sig)` for an UNBLOCKED signal: publish it
@@ -1684,6 +1687,8 @@ pub mod host_signal {
     /// Enqueue a cross-process guest signal into the shared `MAP_SHARED` xsignal
     /// ring (inherited across `fork`, so every carrick process shares ONE ring).
     /// Delegates to the neutral ring core; false = no ring or ring full.
+    /// `target_ns_tid` is 0 for a process-directed send, or the target's guest
+    /// ns tid for a thread-directed one (tkill/tgkill/rt_tgsigqueueinfo).
     pub fn xsig_enqueue(
         target_host: i32,
         sig: i32,
@@ -1691,6 +1696,7 @@ pub mod host_signal {
         sender_ns: i32,
         sender_uid: u32,
         value: i64,
+        target_ns_tid: i32,
     ) -> bool {
         carrick_signal_core::xsig::xsig_enqueue(
             target_host,
@@ -1699,6 +1705,7 @@ pub mod host_signal {
             sender_ns,
             sender_uid,
             value,
+            target_ns_tid,
         )
     }
     /// Nudge `target_host` (a sibling carrick process) to drain its xsignal ring
