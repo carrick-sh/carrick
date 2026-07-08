@@ -414,6 +414,23 @@ impl ThreadRegistry {
         claimed
     }
 
+    /// True iff every live thread OTHER than `tid` is currently vcpu-parked.
+    ///
+    /// The whole-VM release path re-checks this under the process topology
+    /// lock, atomically with the VM teardown: a sibling whose wake claimed
+    /// the rebuild (`unpark_vcpu`, taken under the same topology lock) after
+    /// the `park_vcpu` last-unparked verdict — but before the teardown —
+    /// DOWNGRADES the release to a vCPU-only park instead of racing the
+    /// teardown against the sibling's vCPU re-create.
+    pub fn all_other_vcpus_parked(&self, tid: ThreadId) -> bool {
+        let inner = self.inner.lock();
+        inner
+            .map
+            .iter()
+            .filter(|(t, _)| **t != tid)
+            .all(|(_, e)| e.vcpu_parked)
+    }
+
     /// Record that the last-parked thread destroyed the VM (or, with
     /// `released = false`, that a rebuild has been handled).
     pub fn set_vm_released(&self, released: bool) {
@@ -1039,6 +1056,26 @@ mod tests {
         assert!(!reg.park_vcpu(t1));
         assert!(reg.park_vcpu(t2));
         assert!(!reg.park_vcpu(ThreadId::synthetic_for_tests(9999)));
+    }
+
+    #[test]
+    fn all_other_vcpus_parked_tracks_unparks() {
+        let reg = ThreadRegistry::new(ThreadId::synthetic_for_tests(2040));
+        let t1 = reg.main_tid();
+        let t2 = reg.register_child(0);
+        let t3 = reg.register_child(0);
+        assert!(!reg.all_other_vcpus_parked(t1), "t2/t3 unparked");
+        assert!(!reg.park_vcpu(t2));
+        assert!(!reg.all_other_vcpus_parked(t1), "t3 still unparked");
+        assert!(!reg.park_vcpu(t3));
+        assert!(
+            reg.all_other_vcpus_parked(t1),
+            "both siblings parked: the re-check under the topology lock passes"
+        );
+        // A sibling's wake (unpark) between the park_vcpu verdict and the
+        // teardown must flip the re-check to false — the downgrade trigger.
+        assert!(!reg.unpark_vcpu(t2));
+        assert!(!reg.all_other_vcpus_parked(t1), "t2 woke: downgrade");
     }
 
     #[test]
