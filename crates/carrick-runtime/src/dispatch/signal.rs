@@ -171,6 +171,14 @@ pub(super) struct SignalState {
     /// (POSIX queuing); standard signals overwrite the head. Each delivery
     /// pops the front entry.
     pub pending_siginfos: HashMap<(crate::thread::ThreadId, i32), VecDeque<LinuxSiginfo>>,
+    /// PROCESS-directed analogue of `pending_siginfos`, keyed by `signum`:
+    /// caller-supplied siginfo for a signal held in the SHARED pending set
+    /// (`process_pending`). The cross-process xsignal-ring drain records here —
+    /// a ring entry is always process-directed (the ring carries no target
+    /// tid) — so WHICHEVER thread consumes the shared-set signal receives the
+    /// sender's identity/payload. `take_pending_siginfo` falls back to this
+    /// queue when the consuming thread's per-tid queue is empty.
+    pub process_pending_siginfos: HashMap<i32, VecDeque<LinuxSiginfo>>,
     /// Handler action snapshots for unblocked thread-directed signals. The
     /// backend pending slot stores only a signum; without this, delayed delivery
     /// can observe a later `sigaction(SIG_IGN)` and drop a signal that was
@@ -191,6 +199,7 @@ impl SignalState {
             handler_frames: HashMap::new(),
             restore_masks: HashMap::new(),
             pending_siginfos: HashMap::new(),
+            process_pending_siginfos: HashMap::new(),
             pending_actions: HashMap::new(),
         }
     }
@@ -515,6 +524,7 @@ impl SyscallDispatcher {
         // host process), so it never affects the parent's shared set.
         s.process_pending = SigSet::EMPTY;
         s.process_rt_pending_counts.clear();
+        s.process_pending_siginfos.clear();
     }
 
     /// Initialize a new `CLONE_THREAD` task's per-thread signal state. Linux
@@ -741,10 +751,21 @@ impl SyscallDispatcher {
         signum: i32,
     ) -> Option<LinuxSiginfo> {
         let mut signal = self.signal.lock();
-        let queue = signal.pending_siginfos.get_mut(&(tid, signum))?;
+        if let Some(queue) = signal.pending_siginfos.get_mut(&(tid, signum)) {
+            let front = queue.pop_front();
+            if queue.is_empty() {
+                signal.pending_siginfos.remove(&(tid, signum));
+            }
+            return front;
+        }
+        // Fall back to the PROCESS-directed queue: a shared-set signal (e.g. a
+        // cross-process kill drained from the xsignal ring) is consumed by
+        // whichever thread dequeues it, and that thread's per-tid queue has no
+        // entry for it.
+        let queue = signal.process_pending_siginfos.get_mut(&signum)?;
         let front = queue.pop_front();
         if queue.is_empty() {
-            signal.pending_siginfos.remove(&(tid, signum));
+            signal.process_pending_siginfos.remove(&signum);
         }
         front
     }
@@ -802,7 +823,7 @@ impl SyscallDispatcher {
     /// dispatcher pending state for `tid`, preserving siginfo payloads. Normal
     /// async delivery and synchronous waits (`rt_sigtimedwait`/sigwait) both use
     /// this so an xsignal can be consumed by either path.
-    pub(crate) fn drain_xsignals_for_tid(&self, tid: crate::thread::ThreadId) {
+    pub(crate) fn drain_xsignals_for_tid(&self, _tid: crate::thread::ThreadId) {
         // Ring-authoritative gate (`SigBlockMask::NONE` => "any entry targets
         // this process"),
         // NOT the losable process-local `XSIG_DIRTY` hint: a dropped host nudge
@@ -823,8 +844,25 @@ impl SyscallDispatcher {
             } else {
                 LinuxSiginfo::kill(signum, code, sender_ns, sender_uid)
             };
-            self.record_pending_siginfo(tid, signum, info);
-            self.mark_signal_pending(tid, signum);
+            // A ring entry is ALWAYS process-directed (kill/rt_sigqueueinfo to a
+            // PID — the slot carries no target tid), so publish it to the SHARED
+            // pending set, NOT to the tid that happened to run this drain.
+            // Pinning it to the drainer stranded the signal forever when the
+            // drain race was won by a thread that blocks `signum` (the
+            // procladder_mt pause()-sibling): `take_pending_in(main, set)` only
+            // consults `pendings[main] ∪ process_pending`, so the sigwait-ing
+            // main thread never saw it — the whole-process silent stall. Same
+            // bug class as the process_pending doc's CPython
+            // test_sigwait_thread precedent, one layer down.
+            {
+                let mut signal = self.signal.lock();
+                let entry = signal.process_pending_siginfos.entry(signum).or_default();
+                if !is_rt_signal(signum) {
+                    entry.clear();
+                }
+                entry.push_back(info);
+            }
+            self.mark_process_signal_pending(signum);
         }
     }
 
