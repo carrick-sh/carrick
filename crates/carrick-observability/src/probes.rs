@@ -172,6 +172,13 @@ mod real {
         /// HV_BUSY root cause), 3=vcpu_create result in a sibling rebuild / spawn
         /// (a=rc, b=site: 0=rebuild 1=spawn). `tid` is the acting thread.
         fn fork__quiesce(_: i32, _: i64, _: i64, _: i32) {}
+        /// Fork rebuild detail. `role`: 0=parent, 1=child. `phase`: 0=begin,
+        /// 1=local-map-end, 2=sibling-map-end, 3=restore-end. `desc_count` is the
+        /// local descriptor set for phases 0/1/3 and the sibling candidate set for
+        /// phase 2. `map_count` is the number of `hv_vm_map` calls completed in
+        /// that phase. `elapsed_us` is measured from the phase start, except phase
+        /// 3 which is total rebuild elapsed.
+        fn fork__rebuild(_: i32, _: i32, _: u64, _: u64, _: u64) {}
         /// Per-run lifecycle marker, one probe fired at each phase boundary so a
         /// DTrace consumer can time each phase as a delta. `phase`:
         /// 0=run-entry, 1=image-ready, 2=vm-created, 3=guest-loaded (ready to run),
@@ -749,6 +756,10 @@ mod real {
         carrick_usdt::fork__quiesce!(|| (phase, a, b, tid));
     }
 
+    pub fn fork_rebuild(role: i32, phase: i32, desc_count: u64, map_count: u64, elapsed_us: u64) {
+        carrick_usdt::fork__rebuild!(|| (role, phase, desc_count, map_count, elapsed_us));
+    }
+
     pub fn fork_post(pid: i32, pc: u64, elr: u64) {
         carrick_usdt::fork__post!(|| (pid, pc, elr));
     }
@@ -1279,6 +1290,7 @@ mod stub {
     stub!(io_wait_begin(tid: i32, fd_count: i32, timeout_ms: i64, fd0: i32, events0: i32, fd1: i32));
     stub!(io_wait_end(tid: i32, result: i32, fd_count: i32, fd0: i32, fd1: i32, fd2: i32));
     stub!(fork_quiesce(phase: i32, a: i64, b: i64, tid: i32));
+    stub!(fork_rebuild(role: i32, phase: i32, desc_count: u64, map_count: u64, elapsed_us: u64));
     stub!(fork_post(pid: i32, pc: u64, elr: u64));
     stub!(signal_inject(signum: i32, saved_pc: u64, new_sp: u64, handler: u64));
     stub!(signal_restore(saved_pc: u64, sp: u64, magic: u64));
