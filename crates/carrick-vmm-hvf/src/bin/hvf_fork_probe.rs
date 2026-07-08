@@ -962,14 +962,19 @@ mod imp {
         Ok(start.elapsed())
     }
 
-    /// Measure how many concurrent single-vCPU HVF VMs the host sustains across
-    /// SEPARATE processes (carrick's one-VM-per-process model). The parent holds NO
-    /// VM; it forks children one at a time, each does `hv_vm_create` + `hv_vcpu_create`
+    /// Measure how many concurrent HVF VMs the host sustains across SEPARATE
+    /// processes (carrick's one-VM-per-process model). The parent holds NO VM; it
+    /// forks children one at a time, each does `hv_vm_create` + `hv_vcpu_create`
     /// and HOLDS the VM alive (parked), reporting its result over a pipe. We ramp
     /// until a create fails and print the concurrent count + the exact HV error.
-    /// The guest RAM is tiny (nothing mapped here), so this isolates the VM/vCPU
-    /// HANDLE limit from any memory limit. Each child self-destructs after
-    /// `hold_secs` so an orphaned run cannot strand VMs.
+    /// Each VM gets `vcpus_per_vm` vCPUs (extras on their own parked threads,
+    /// since HVF binds a vCPU to its creating thread) and `map_mib` MiB of
+    /// resident anonymous guest memory (0 = nothing mapped). With the defaults
+    /// (`vcpus_per_vm=1`, `map_mib=0`) this reduces to the original single-vCPU,
+    /// no-memory shape, isolating the VM/vCPU HANDLE limit from any memory or
+    /// total-vCPU limit; non-default knobs sweep the ceiling against those axes
+    /// independently. Each child self-destructs after `hold_secs` so an orphaned
+    /// run cannot strand VMs.
     fn concurrent_ceiling(max: u64, hold_secs: u64, vcpus_per_vm: u64, map_mib: u64) {
         println!(
             "case=concurrent-ceiling max={max} hold_secs={hold_secs} vcpus_per_vm={vcpus_per_vm} map_mib={map_mib}"
