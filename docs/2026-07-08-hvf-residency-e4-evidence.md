@@ -36,9 +36,7 @@ carrick already releases the whole VM for them.
    (`vcpus_per_vm` 1/2/4) and `map_mib` scales 0 → 16 → 64. The ceiling never
    moves. It is a per-VM slot budget, not a system-wide vCPU budget and not
    memory-coupled. This **refutes the `trap.rs:761-775` comment** that calls it a
-   "~126 system-wide vCPU budget": it is neither ~126 (that earlier reading was
-   taken with stray guests live) nor per-vCPU nor system-wide-in-vCPUs — it is
-   127 VM slots on this host/OS. Multi-vCPU (multithreaded) processes do **not**
+   "~126 system-wide vCPU budget": The earlier '~126' reading is superseded by five exact-127 quiet-host runs; why it read lower before is undetermined — plausibly a 128-slot machine-wide table with one slot consumed elsewhere, or the earlier measurement running with other live VM consumers (stray guests) on the host. The per-VM verdict is unaffected either way: it is per-VM at 127 on this host/OS, not per-vCPU nor system-wide-in-vCPUs. Multi-vCPU (multithreaded) processes do **not**
    consume extra ceiling budget; mapped memory is free with respect to the
    ceiling up to at least 64 MiB/VM (~8 GiB aggregate across 127 VMs).
 
@@ -204,7 +202,7 @@ E4's measurements refute two stale source comments — flag as follow-ups:
 - `crates/carrick-vmm-hvf/src/trap.rs:761-775` calls the ceiling a "~126
   system-wide vCPU budget". It is a per-VM slot budget of 127 on this host/OS;
   both the "~126" and "system-wide vCPU" framings are wrong.
-- `crates/carrick-vmm-hvf/src/trap.rs:3672` and `trap.rs:3705` mark
+- `crates/carrick-vmm-hvf/src/trap.rs:3665` and `trap.rs:3702` mark
   `reclaim_park`/`reclaim_resume` as "NOT YET WIRED"; they **are** wired via
   `crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs:536` and `:558`.
 
@@ -248,6 +246,6 @@ lease work is now scoped by measured reality, not the memo's prediction:
      MiB; `perf_fork_exec` p50 8464 µs / 10957 µs) must not regress under any
      lease-path change.
 2. **Comment fixes** (no behavior change): `trap.rs:761-775` "~126 system-wide
-   vCPU budget" and `trap.rs:3672`/`:3705` "NOT YET WIRED" per the section above.
+   vCPU budget" and `trap.rs:3665`/`:3702` "NOT YET WIRED" per the section above.
 3. **Cross-host re-measurement.** Re-run Task 2's ceiling matrix after any macOS
    update; the 127 figure is host/OS-specific and undocumented by Apple.
