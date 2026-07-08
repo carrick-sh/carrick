@@ -1047,6 +1047,20 @@ where
                 // behaves as a plain fork — safe (same as before), just not the
                 // faithful CLONE_VM|CLONE_VFORK.
                 let _ = vfork;
+                // Pre-fork admission gate (see quiesce.rs handle_fork):
+                // persistent host VM exhaustion degrades to Linux-shaped
+                // fork(2) = EAGAIN with the parent VM untouched, instead of a
+                // post-fork rebuild fatal.
+                if let Err(error) = runtime.fork_admission_check() {
+                    tracing::warn!(
+                        %error,
+                        "fork admission gate: host VM capacity exhausted; fork(2) = EAGAIN"
+                    );
+                    let value = crate::linux_abi::LINUX_EAGAIN.guest_retval();
+                    runtime.complete_syscall(value)?;
+                    last_syscall_retval = Some(value);
+                    break 'fork_arm;
+                }
                 let child_parent = if clone_parent {
                     dispatcher.clone_parent_host_pid()
                 } else {
@@ -2089,6 +2103,11 @@ impl<M: GuestMemory, T: SyscallTrap> SyscallTrap for SplitView<'_, M, T> {
     }
     fn fork(&mut self) -> Result<crate::trap::ForkOutcome, TrapError> {
         self.trap.fork()
+    }
+    fn fork_admission_check(&self) -> Result<(), TrapError> {
+        // Forward explicitly: the trait DEFAULT (Ok) would otherwise shadow the
+        // wrapped engine's pre-fork exhaustion gate.
+        self.trap.fork_admission_check()
     }
     fn execve_into(&mut self, new_image: &AddressSpace) -> Result<(), TrapError> {
         self.trap.execve_into(new_image)
