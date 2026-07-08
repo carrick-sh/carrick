@@ -298,7 +298,7 @@ where
                 0,
                 3,
                 elapsed_us(phase_start),
-                crate::trap::VCPU_LIVE.load(SeqCst) as i64,
+                crate::trap::VCPU_LIVE.load(SeqCst),
                 self.kicker.count() as i64,
             );
         }
