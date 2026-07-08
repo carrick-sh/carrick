@@ -71,3 +71,16 @@ pub mod hvf_aarch64_engine;
 // from `HvfHostBackend::pre_loop_setup` via `trap::start_vcpu_permit_reaper`.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub mod vcpu_permit_reaper;
+
+/// Serializes tests that fork REAL child processes. The test binary is one
+/// process, so any-child wait paths under test (`wait4(-1)`,
+/// `waitid(P_ALL)`, `child_status_ready(-1)`) see EVERY test's children:
+/// a concurrent forking test's child gets stolen - or outright reaped - by
+/// a sibling's any-child wait, failing both tests (the recurring `just ci`
+/// carrick-vmm-hvf flake). Every test that forks holds this for its whole
+/// fork-to-wait-to-reap lifetime.
+#[cfg(test)]
+pub(crate) fn fork_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
