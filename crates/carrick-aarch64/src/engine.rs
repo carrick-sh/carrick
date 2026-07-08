@@ -919,10 +919,16 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
     }
 
     fn fork(&mut self) -> Result<ForkOutcome, TrapError> {
+        let elapsed_us = |start: std::time::Instant| -> u64 {
+            let micros = start.elapsed().as_micros();
+            micros.min(u128::from(u64::MAX)) as u64
+        };
         // 1. Snapshot the parent vCPU register file BEFORE forking, so both sides
         //    resume inside the same trapped syscall site. (Taken while the vCPU is
         //    suspended at the syscall trap — atomic, race-free.)
+        let phase_start = std::time::Instant::now();
         let snap = self.vcpu.snapshot()?;
+        carrick_observability::probes::fork_lifecycle(2, 0, elapsed_us(phase_start), 0, 0);
         // The guest's real x9 to carry onto the child (the child resumes straight at
         // the eret and never runs `complete_syscall`). KVM's snapshot captured the
         // CLOBBERED x9 (the sentinel store), so it returns `Some(real_x9)` to repair.
@@ -933,10 +939,12 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
 
         // For EagerCopy backends (HVF), freeze RAM pre-fork so the child can rebuild
         // from a coherent image; Cow backends (KVM) lean on Linux COW.
+        let phase_start = std::time::Instant::now();
         match self.vm.fork_ram_strategy() {
             ForkRamStrategy::EagerCopy => self.vm.freeze_ram_for_fork()?,
             ForkRamStrategy::Cow => {}
         }
+        carrick_observability::probes::fork_lifecycle(2, 1, elapsed_us(phase_start), 0, 0);
 
         // Clone the parent's page-table manager VALUE now (under the lock), to seed
         // the child's OWN fresh Arc below. Cloning (vs resetting to None) mirrors
@@ -948,11 +956,13 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
         // overlay. Cloning lets the child translate immediately. At fork the child's
         // COW table backing == the parent's synced manager bytes, so the clone is
         // exactly what a lazy rebuild from the child's backing would produce.
+        let phase_start = std::time::Instant::now();
         let cloned_pt = self
             .page_tables
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
+        carrick_observability::probes::fork_lifecycle(2, 2, elapsed_us(phase_start), 0, 0);
 
         // 2. Real host fork.
         //
@@ -960,31 +970,52 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
         // calling thread is the only active one here, so no other thread holds the
         // malloc lock (or any other process-global lock) at fork time, and the child
         // inherits a consistent allocator state.
+        let phase_start = std::time::Instant::now();
         let pid = unsafe { libc::fork() };
+        let fork_elapsed = elapsed_us(phase_start);
         if pid < 0 {
             return Err(TrapError::ForkFailed(
                 std::io::Error::last_os_error().to_string(),
             ));
         }
         if pid > 0 {
+            carrick_observability::probes::fork_lifecycle(
+                2,
+                3,
+                fork_elapsed,
+                i64::from(pid as i32),
+                0,
+            );
             // PARENT: KVM's live VM is untouched (`rebuild_parent_after_fork` is a
             // no-op). HVF tore its VM down pre-fork (in `freeze_ram_for_fork`), so
             // it MUST rebuild here too — a fresh VM, re-`hv_vm_map` of its own (and
             // the quiesced siblings') buffers, and a register restore from the
             // pre-fork snapshot. Return the child pid so the runtime writes it into
             // the guest's x0.
+            let phase_start = std::time::Instant::now();
             self.vm
                 .rebuild_parent_after_fork(&mut self.vcpu, &snap, saved_x9)?;
+            carrick_observability::probes::fork_lifecycle(
+                2,
+                4,
+                elapsed_us(phase_start),
+                i64::from(pid as i32),
+                0,
+            );
             return Ok(ForkOutcome::Parent {
                 child_pid: pid as i32,
             });
         }
+        carrick_observability::probes::fork_lifecycle(3, 3, fork_elapsed, 0, 0);
 
         // 3. CHILD: rebuild the VM (per backend) + re-seat the register file (the
         //    backend owns the x0=0 / x9 / sentinel-PC-advance / vDSO re-calibration,
         //    since the PC-advance distance and post-MMIO replay are per-trap-vehicle).
+        let phase_start = std::time::Instant::now();
         self.vm
             .rebuild_child_after_fork(&mut self.vcpu, &snap, saved_x9)?;
+        carrick_observability::probes::fork_lifecycle(3, 5, elapsed_us(phase_start), 0, 0);
+        let phase_start = std::time::Instant::now();
         self.is_forked_child = true;
         // The child resumes mid-clone; clear stale parent syscall/fault state so a
         // signal arriving before the child's first svc cannot read parent values.
@@ -997,6 +1028,7 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
         // never reach back into the parent's manager). Seeded with the clone taken
         // above (the child's COW table backing == the parent's synced bytes).
         self.page_tables = Arc::new(Mutex::new(cloned_pt));
+        carrick_observability::probes::fork_lifecycle(3, 6, elapsed_us(phase_start), 0, 0);
         Ok(ForkOutcome::Child)
     }
 
