@@ -1038,7 +1038,7 @@ where
                 exit_signal,
                 child_stack: _,
                 vfork,
-            } => {
+            } => 'fork_arm: {
                 // The single-threaded loop (run-elf) keeps the ordinary CoW fork
                 // even for a vfork clone: it has no sibling threads, and Go / the
                 // conformance gate exercise the THREADED loop
@@ -1054,13 +1054,26 @@ where
                 };
                 let child_subreaper = dispatcher.subreaper_for_fork_child();
                 let child_ns_pid = crate::namespace::pid::allocate_child_ns_pid_pre_fork();
-                let prepared_child_record = crate::guest_cpu::prepare_child_record_pre_fork(
+                // Section exhaustion (a guest that forks children nobody ever
+                // reaps) is Linux-shaped EAGAIN from fork(2), not a guest
+                // abort (spec "Failure model").
+                let prepared_child_record = match crate::guest_cpu::prepare_child_record_pre_fork(
                     child_parent,
                     child_subreaper,
                     child_ns_pid.unwrap_or(0),
                     clone_parent && child_parent != 0,
                     0,
-                );
+                ) {
+                    Ok(r) => r,
+                    Err(_exhausted) => {
+                        let value = crate::linux_abi::LINUX_EAGAIN.guest_retval();
+                        runtime.complete_syscall(value)?;
+                        last_syscall_retval = Some(value);
+                        // Fall through to the loop's pending-signal delivery
+                        // exactly like any other completed syscall.
+                        break 'fork_arm;
+                    }
+                };
                 let outcome = match runtime.fork() {
                     Ok(outcome) => outcome,
                     Err(error) => {

@@ -1468,7 +1468,8 @@ mod tests {
 
         crate::guest_cpu::init_child_table();
         let prepared =
-            crate::guest_cpu::prepare_child_record_pre_fork(std::process::id(), 0, 0, false, 0);
+            crate::guest_cpu::prepare_child_record_pre_fork(std::process::id(), 0, 0, false, 0)
+                .expect("prepare child record");
         crate::guest_cpu::publish_prepared_child_record_parent_ref(prepared, child as u32);
         unsafe {
             let mut info: libc::siginfo_t = std::mem::zeroed();
