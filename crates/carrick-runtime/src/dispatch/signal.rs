@@ -825,11 +825,14 @@ impl SyscallDispatcher {
         self.record_pending_siginfo(tid, signum, info);
     }
 
-    /// Drain cross-process explicit signals queued for this host process into
-    /// the dispatcher's PROCESS-directed pending state (a ring entry carries
-    /// no target tid), preserving siginfo payloads. Normal async delivery and
-    /// synchronous waits (`rt_sigtimedwait`/sigwait) both use this so an
-    /// xsignal can be consumed by either path — any thread may run the drain.
+    /// Drain cross-process explicit signals queued for this host process,
+    /// publishing each to the dispatcher's PROCESS-directed pending state
+    /// (`target_ns_tid == 0` — kill/rt_sigqueueinfo/pidfd, no target tid) or a
+    /// named THREAD's per-tid state (`target_ns_tid != 0` — tkill/tgkill/
+    /// rt_tgsigqueueinfo), preserving siginfo payloads either way. Normal
+    /// async delivery and synchronous waits (`rt_sigtimedwait`/sigwait) both
+    /// use this so an xsignal can be consumed by either path — any thread may
+    /// run the drain.
     pub(crate) fn drain_xsignals_process_directed(&self) {
         // Ring-authoritative gate (`SigBlockMask::NONE` => "any entry targets
         // this process"),
@@ -840,36 +843,71 @@ impl SyscallDispatcher {
         if !carrick_signal_core::xsig::xsig_has_unblocked_for_self(SigBlockMask::NONE) {
             return;
         }
-        for (signum, code, sender_ns, sender_uid, value) in
+        for (signum, code, sender_ns, sender_uid, value, target_ns_tid) in
             crate::host_signal::xsig_drain_for_self()
         {
-            // The ring carries the send's REAL si_code: a plain kill(2) of an
-            // RT signal is SI_USER (kill-shaped siginfo), only rt_sigqueueinfo
-            // deliveries are SI_QUEUE with a sigval payload.
+            // The ring carries the send's REAL si_code: a plain kill(2)/tkill of
+            // an RT signal is SI_USER/SI_TKILL (kill-shaped siginfo), only
+            // rt_sigqueueinfo/rt_tgsigqueueinfo deliveries are SI_QUEUE with a
+            // sigval payload.
             let info = if code == crate::linux_abi::LINUX_SI_QUEUE {
                 LinuxSiginfo::rt_queue(signum, sender_ns, sender_uid, value)
             } else {
                 LinuxSiginfo::kill(signum, code, sender_ns, sender_uid)
             };
-            // A ring entry is ALWAYS process-directed (kill/rt_sigqueueinfo to a
-            // PID — the slot carries no target tid), so publish it to the SHARED
-            // pending set, NOT to the tid that happened to run this drain.
-            // Pinning it to the drainer stranded the signal forever when the
-            // drain race was won by a thread that blocks `signum` (the
-            // procladder_mt pause()-sibling): `take_pending_in_from(main, set)` only
-            // consults `pendings[main] ∪ process_pending`, so the sigwait-ing
-            // main thread never saw it — the whole-process silent stall. Same
-            // bug class as the process_pending doc's CPython
-            // test_sigwait_thread precedent, one layer down.
-            {
-                let mut signal = self.signal.lock();
-                let entry = signal.process_pending_siginfos.entry(signum).or_default();
-                if !is_rt_signal(signum) {
-                    entry.clear();
+            if target_ns_tid == 0 {
+                // Process-directed (no target tid on the slot): publish it to
+                // the SHARED pending set, NOT to the tid that happened to run
+                // this drain. Pinning it to the drainer stranded the signal
+                // forever when the drain race was won by a thread that blocks
+                // `signum` (the procladder_mt pause()-sibling):
+                // `take_pending_in_from(main, set)` only consults
+                // `pendings[main] ∪ process_pending`, so the sigwait-ing main
+                // thread never saw it — the whole-process silent stall. Same
+                // bug class as the process_pending doc's CPython
+                // test_sigwait_thread precedent, one layer down.
+                {
+                    let mut signal = self.signal.lock();
+                    let entry = signal.process_pending_siginfos.entry(signum).or_default();
+                    if !is_rt_signal(signum) {
+                        entry.clear();
+                    }
+                    entry.push_back(info);
                 }
-                entry.push_back(info);
+                self.mark_process_signal_pending(signum);
+                continue;
             }
-            self.mark_process_signal_pending(signum);
+            // Thread-directed: resolve the guest ns tid to a live local thread
+            // the same way `route_thread_signal` resolves its `tgkill`/`tkill`
+            // target, then mirror its in-process delivery half (per-tid
+            // siginfo store + per-tid pending mark + host-slot waiter kick)
+            // instead of the shared-set publish above.
+            let Some(target) = resolve_xsig_thread_target(target_ns_tid) else {
+                // No live thread bears this tid: Linux discards a
+                // thread-directed pending signal at thread exit (it is NOT
+                // redirected to a sibling or the whole thread group), so the
+                // ring entry is simply dropped.
+                continue;
+            };
+            self.record_pending_siginfo(target, signum, info);
+            if self.signal_blocked(target, signum) {
+                // Held pending until the target unblocks it or a sigwait
+                // dequeues it — exactly `route_thread_signal`'s blocked
+                // branch, no host-slot publish (nothing to wake yet).
+                self.mark_signal_pending(target, signum);
+            } else {
+                if let Some(action) = self.registered_signal_handler(signum) {
+                    self.record_pending_signal_action(target, signum, action);
+                }
+                // The host-level per-tid slot `deliver_pending_signal` checks
+                // first for `target`'s own vCPU loop iteration — the same
+                // publish `complete_signal_thread` performs for a live,
+                // in-process `SignalThread` route. The nudge that triggered
+                // this drain already broadcast a wake to every parked thread
+                // of this process (see the xsig ring's nudge-handler doc), so
+                // no separate kick is needed here.
+                crate::host_signal::publish_pending_for(target.raw(), signum);
+            }
         }
     }
 
@@ -1882,8 +1920,10 @@ impl SyscallDispatcher {
             // rt_sigqueueinfo routes on the tgid itself (LTP rt_sigqueueinfo01
             // permits a non-leader tid here because find_vpid + thread_group
             // still resolve to the same process), so route_target == ns_target.
+            // It targets the whole thread GROUP, never a specific thread —
+            // `tid_directed = false` keeps a cross-process send process-directed.
             let tgid = i64::from(tgid.0);
-            Ok(this.sigqueueinfo_common(cx, tgid, tgid, sig.0 as u64, info_ptr))
+            Ok(this.sigqueueinfo_common(cx, tgid, tgid, sig.0 as u64, info_ptr, false))
         }
 
         /// rt_tgsigqueueinfo(tgid, tid, sig, uinfo): queue `sig` with the
@@ -1897,12 +1937,16 @@ impl SyscallDispatcher {
         fn rt_tgsigqueueinfo(this, cx, tgid: Pid, tid: Pid, sig: Signal, info_ptr: GuestPtr) {
             // Same delivery machinery as rt_sigqueueinfo, but routing keys on the
             // explicit `tid` while the self/cross-process decision uses `tgid`.
+            // `tid_directed = true`: unlike rt_sigqueueinfo this names ONE
+            // thread, so a cross-process send must carry that tid through the
+            // xsig ring instead of landing process-directed.
             Ok(this.sigqueueinfo_common(
                 cx,
                 i64::from(tid.0),
                 i64::from(tgid.0),
                 sig.0 as u64,
                 info_ptr,
+                true,
             ))
         }
 
@@ -2034,7 +2078,11 @@ impl SyscallDispatcher {
     /// translate `ns_target` through the PID namespace and either forward
     /// cross-process or mark-pending against the caller. `route_target` is the
     /// tgid for `rt_sigqueueinfo` and the explicit tid for `rt_tgsigqueueinfo`;
-    /// `ns_target` is the tgid in both.
+    /// `ns_target` is the tgid in both. `tid_directed` distinguishes the two at
+    /// the CROSS-PROCESS ring send: `rt_tgsigqueueinfo` names one specific
+    /// thread (`route_target` carries that tid through the ring), while
+    /// `rt_sigqueueinfo` targets the whole thread group (ring entry stays
+    /// process-directed, `target_ns_tid = 0`).
     fn sigqueueinfo_common<M: GuestMemory>(
         &self,
         ctx: &SyscallCtx<M>,
@@ -2042,6 +2090,7 @@ impl SyscallDispatcher {
         ns_target: i64,
         signum: u64,
         info_ptr: GuestPtr,
+        tid_directed: bool,
     ) -> DispatchOutcome {
         if !is_valid_signum(signum) {
             return DispatchOutcome::errno(LINUX_EINVAL);
@@ -2109,6 +2158,11 @@ impl SyscallDispatcher {
                 let code = user_info
                     .map(|i| i.si_code)
                     .unwrap_or(crate::linux_abi::LINUX_SI_QUEUE);
+                // rt_tgsigqueueinfo names a specific thread; carry it through
+                // the ring as the guest-supplied tid (untranslated — same
+                // convention `SignalTarget::GuestTid` uses). rt_sigqueueinfo
+                // targets the thread group, so this stays 0.
+                let target_ns_tid = if tid_directed { route_target as i32 } else { 0 };
                 if crate::host_signal::xsig_enqueue(
                     target_host,
                     s,
@@ -2116,6 +2170,7 @@ impl SyscallDispatcher {
                     sender_ns,
                     sender_uid,
                     value,
+                    target_ns_tid,
                 ) {
                     crate::host_signal::xsig_nudge(target_host);
                     return DispatchOutcome::Returned { value: 0 };
@@ -2210,6 +2265,31 @@ fn rt_sigtimedwait_deliver(
     }
     DispatchOutcome::Returned {
         value: signum as i64,
+    }
+}
+
+/// Resolve a THREAD-DIRECTED xsig ring entry's guest ns tid to a live local
+/// `ThreadId`, mirroring `route_thread_signal`'s membership check
+/// (`ctx.thread.registry.is_live`) for a caller with no `SyscallCtx` — the
+/// ring drain runs outside any single syscall's dispatch, so it cannot borrow
+/// a per-call thread registry the way `route_thread_signal` does.
+///
+/// The main thread's registry key deterministically equals this process's
+/// host pid (`ThreadId::main_from_host_pid`), so when the CURRENT process has
+/// no MT thread registry installed at all (the single-threaded run loop never
+/// calls `set_current_registry` — there is no CLONE_THREAD table to consult)
+/// a `target_ns_tid` naming the main thread still resolves: this is the common
+/// "tid == pid" cross-process case (`bootstrap_signal_send_as`'s `GuestTid`
+/// comment), and it must keep working for a single-threaded target exactly as
+/// it did before this ring carried a tid at all. When a registry IS installed
+/// (an MT process), its `is_live` is authoritative for every tid, including
+/// the main one — deferred to entirely rather than short-circuited, so a
+/// thread-group leader that has since exited is not misreported live.
+fn resolve_xsig_thread_target(target_ns_tid: i32) -> Option<crate::thread::ThreadId> {
+    let requested = crate::thread::ThreadId::from_guest_supplied_tid(target_ns_tid);
+    match crate::thread::current_registry_liveness(requested) {
+        Some(live) => live.then_some(requested),
+        None => (requested == crate::thread::ThreadId::main_from_host_pid()).then_some(requested),
     }
 }
 
@@ -2314,6 +2394,15 @@ pub(crate) fn bootstrap_signal_send_as(
     if !is_valid_signum(signum) {
         return DispatchOutcome::errno(LINUX_EINVAL);
     }
+    // A `GuestTid` target names one specific thread (tkill's cross-process
+    // fallthrough); every other variant is process/group-directed. Captured
+    // BEFORE `host_kill_encoding` collapses the typed target to its raw kill(2)
+    // i64 (which cannot distinguish a tid from a pid), so the xsig ring send
+    // below can still carry it.
+    let target_ns_tid = match target {
+        SignalTarget::GuestTid(t) => t.0,
+        _ => 0,
+    };
     // The raw kill(2) value this target denotes: every sign/sentinel test
     // below and the final host kill read this single escape.
     let target = target.host_kill_encoding();
@@ -2397,6 +2486,11 @@ pub(crate) fn bootstrap_signal_send_as(
     if route_xsig {
         let sender_ns = crate::namespace::pid::self_ns_pid() as i32;
         let sender_uid = caller_euid.unwrap_or_else(|| unsafe { libc::getuid() });
+        // Routing still addresses the ring by host pid (`target`), so
+        // cross-process thread-directed delivery only reaches a tid the
+        // target process's registry actually has live — in practice this
+        // works where it worked before (tid == pid main threads), and now
+        // lands thread-directed in the target instead of process-directed.
         if crate::host_signal::xsig_enqueue(
             target as i32,
             signum as i32,
@@ -2404,6 +2498,7 @@ pub(crate) fn bootstrap_signal_send_as(
             sender_ns,
             sender_uid,
             0,
+            target_ns_tid,
         ) {
             crate::host_signal::xsig_nudge(target as i32);
             return DispatchOutcome::Returned { value: 0 };
@@ -2605,8 +2700,22 @@ mod tests {
     /// pinned it to the drainer (`mark_signal_pending(drainer)`), and the
     /// `take_pending_in(main, …)` below returned None forever: the whole-
     /// process wedge.
+    ///
+    /// This test and the three `ring_drain_*`/`per_tid_delivery_*` tests below
+    /// that touch the REAL global xsig ring all target THIS process
+    /// (`std::process::id()`, the test binary's own pid — there is no other
+    /// "cross-process" target available in-process) with overlapping signums,
+    /// so they race each other if cargo runs them on parallel test threads.
+    /// Serialised on one lock, mirroring the same-shaped `TEST_LOCK` already
+    /// used by `carrick-signal-core`'s and `carrick-vmm-hvf`'s own xsig ring
+    /// tests for the identical reason.
+    static XSIG_RING_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn ring_drain_publishes_process_directed_signal_visible_to_non_drainer() {
+        let _g = XSIG_RING_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let d = SyscallDispatcher::new();
         let main = crate::thread::ThreadId::synthetic_for_tests(6001);
         let sibling = crate::thread::ThreadId::synthetic_for_tests(6002);
@@ -2624,6 +2733,7 @@ mod tests {
                 crate::linux_abi::LINUX_SI_USER,
                 4242,
                 1000,
+                0,
                 0,
             ),
             "ring slot available"
@@ -2714,6 +2824,185 @@ mod tests {
             (d.take_process_pending_siginfo(chld).unwrap().si_addr & 0xffff_ffff) as i32,
             7777
         );
+    }
+
+    /// Set up a live registry (main + one sibling) and publish it as the
+    /// process's CURRENT thread registry, so `drain_xsignals_process_directed`'s
+    /// `target_ns_tid` resolution (which consults
+    /// `crate::thread::current_registry_liveness`, the same per-process handle
+    /// `route_thread_signal` reaches via `ctx.thread.registry`) can resolve
+    /// `main`/`sibling` as live. Registered under the SAME test-shape tids the
+    /// pinning tests above use (`ThreadRegistry::new` takes `main` as the
+    /// registry's main tid; `register_child` then allocates monotonically from
+    /// `main + 1`, landing exactly on `sibling`). Callers serialise on
+    /// `XSIG_RING_TEST_LOCK`: `CURRENT_REGISTRY` is ALSO a process-global
+    /// singleton, alongside the xsig ring itself.
+    fn install_test_registry(main: crate::thread::ThreadId, sibling: crate::thread::ThreadId) {
+        let registry = std::sync::Arc::new(crate::thread::ThreadRegistry::new(main));
+        let allocated = registry.register_child(0);
+        assert_eq!(
+            allocated, sibling,
+            "test tids must line up with the registry's next-tid allocation"
+        );
+        crate::thread::set_current_registry(registry);
+    }
+
+    /// Pins the target_ns_tid resolution + publish half of Task 3: a
+    /// THREAD-DIRECTED cross-process xsig entry (tkill/tgkill/
+    /// rt_tgsigqueueinfo across processes) must land ONLY in the named
+    /// thread's per-tid state — never pinned to the drainer, and never in the
+    /// SHARED process-directed set (that would let ANY sibling consume a send
+    /// Linux delivers to one specific thread).
+    #[test]
+    fn ring_drain_routes_thread_directed_to_target_tid_only() {
+        let _g = XSIG_RING_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let d = SyscallDispatcher::new();
+        let main = crate::thread::ThreadId::synthetic_for_tests(6101);
+        let sibling = crate::thread::ThreadId::synthetic_for_tests(6102);
+        let usr1 = crate::linux_abi::LINUX_SIGUSR1;
+        // Probe shape: BOTH threads block SIGUSR1 (mirrors
+        // ring_drain_publishes_process_directed_signal_visible_to_non_drainer),
+        // so nothing here is deliverable by the fast "unblocked" path — the
+        // resolution must come from the target_ns_tid itself, not a blocked-mask
+        // side effect.
+        d.restore_signal_mask(main, SigSet::EMPTY.with(usr1));
+        d.restore_signal_mask(sibling, SigSet::EMPTY.with(usr1));
+        install_test_registry(main, sibling);
+
+        carrick_signal_core::xsig::xsig_init();
+        assert!(
+            carrick_signal_core::xsig::xsig_enqueue(
+                std::process::id() as i32,
+                usr1,
+                crate::linux_abi::LINUX_SI_TKILL,
+                4242,
+                1000,
+                0,
+                main.raw(),
+            ),
+            "ring slot available"
+        );
+        // The SIBLING wins the drain race (the same interleaving the
+        // process-directed pinning test guards against).
+        d.drain_xsignals_process_directed();
+
+        // NOT pinned to the drainer.
+        assert!(
+            d.take_pending_siginfo(sibling, usr1).is_none(),
+            "thread-directed drain must not pin the payload to the drainer tid"
+        );
+        // NOT process-directed: the shared set must stay untouched.
+        assert!(
+            d.take_process_pending_siginfo(usr1).is_none(),
+            "thread-directed drain must not land in the shared process-pending set"
+        );
+        // Visible to MAIN per-thread, carrying the sender identity + SI_TKILL.
+        let set = SigSet::EMPTY.with(usr1);
+        let (signum, from_thread) = d
+            .take_pending_in_from(main, set)
+            .expect("thread-directed signal must be visible to its named target");
+        assert_eq!(signum, usr1);
+        assert!(from_thread, "consumed from the per-thread set, not shared");
+        let info = d
+            .take_pending_siginfo(main, usr1)
+            .expect("siginfo payload follows the per-thread store");
+        assert_eq!(
+            (info.si_addr & 0xffff_ffff) as i32,
+            4242,
+            "sender ns-pid survives the drain"
+        );
+        assert_eq!({ info.si_code }, crate::linux_abi::LINUX_SI_TKILL);
+        // Exactly-once: nothing left for a second take.
+        assert_eq!(d.take_pending_in(main, set), None);
+    }
+
+    /// `target_ns_tid == 0` must keep TODAY's process-directed contract
+    /// byte-for-byte — the exact assertions
+    /// `ring_drain_publishes_process_directed_signal_visible_to_non_drainer`
+    /// makes, just re-run here to pin that the new tid-carrying arity didn't
+    /// change the zero case.
+    #[test]
+    fn ring_drain_target_tid_zero_stays_process_directed() {
+        let _g = XSIG_RING_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let d = SyscallDispatcher::new();
+        let main = crate::thread::ThreadId::synthetic_for_tests(6201);
+        let sibling = crate::thread::ThreadId::synthetic_for_tests(6202);
+        let usr1 = crate::linux_abi::LINUX_SIGUSR1;
+        d.restore_signal_mask(main, SigSet::EMPTY.with(usr1));
+        d.restore_signal_mask(sibling, SigSet::EMPTY.with(usr1));
+
+        carrick_signal_core::xsig::xsig_init();
+        assert!(
+            carrick_signal_core::xsig::xsig_enqueue(
+                std::process::id() as i32,
+                usr1,
+                crate::linux_abi::LINUX_SI_USER,
+                4242,
+                1000,
+                0,
+                0,
+            ),
+            "ring slot available"
+        );
+        d.drain_xsignals_process_directed();
+
+        assert!(
+            d.take_pending_siginfo(sibling, usr1).is_none(),
+            "drain must not pin the payload to the drainer tid"
+        );
+        let set = SigSet::EMPTY.with(usr1);
+        let (signum, from_thread) = d
+            .take_pending_in_from(main, set)
+            .expect("process-directed signal must be visible to the non-drainer's sigwait");
+        assert_eq!(signum, usr1);
+        assert!(!from_thread, "consumed from the SHARED set");
+        let info = d
+            .take_process_pending_siginfo(usr1)
+            .expect("siginfo payload follows the shared set");
+        assert_eq!(
+            (info.si_addr & 0xffff_ffff) as i32,
+            4242,
+            "sender ns-pid survives the drain"
+        );
+        assert_eq!(d.take_pending_in(main, set), None);
+    }
+
+    /// A thread-directed ring entry whose `target_ns_tid` matches NO live
+    /// thread (the target already exited) must be DISCARDED entirely, matching
+    /// Linux's own semantics: a thread-directed pending signal for an exited
+    /// thread is dropped, not redirected to a sibling or the shared set.
+    #[test]
+    fn ring_drain_discards_thread_directed_for_exited_tid() {
+        let _g = XSIG_RING_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let d = SyscallDispatcher::new();
+        let main = crate::thread::ThreadId::synthetic_for_tests(6301);
+        let sibling = crate::thread::ThreadId::synthetic_for_tests(6302);
+        let exited = crate::thread::ThreadId::synthetic_for_tests(6399);
+        let usr1 = crate::linux_abi::LINUX_SIGUSR1;
+        install_test_registry(main, sibling);
+
+        carrick_signal_core::xsig::xsig_init();
+        assert!(carrick_signal_core::xsig::xsig_enqueue(
+            std::process::id() as i32,
+            usr1,
+            crate::linux_abi::LINUX_SI_TKILL,
+            4242,
+            1000,
+            0,
+            exited.raw(),
+        ));
+        d.drain_xsignals_process_directed();
+
+        let set = SigSet::EMPTY.with(usr1);
+        assert!(d.take_pending_in(main, set).is_none());
+        assert!(d.take_pending_in(sibling, set).is_none());
+        assert!(d.take_process_pending_siginfo(usr1).is_none());
     }
 
     #[test]
@@ -3004,8 +3293,14 @@ mod tests {
             }),
         };
 
-        let routed =
-            d.sigqueueinfo_common(&cx, guest_main_tid, guest_main_tid, 34, GuestPtr(0x400));
+        let routed = d.sigqueueinfo_common(
+            &cx,
+            guest_main_tid,
+            guest_main_tid,
+            34,
+            GuestPtr(0x400),
+            false,
+        );
         assert!(matches!(
             routed,
             crate::dispatch::DispatchOutcome::SignalThread { tid, signum }

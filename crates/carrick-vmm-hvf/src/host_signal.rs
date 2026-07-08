@@ -1471,7 +1471,15 @@ mod tests {
         let signum = crate::linux_abi::LINUX_SIGUSR1;
         let blocked =
             carrick_abi::SigBlockMask::blocking_all_of(carrick_abi::SigSet::EMPTY.with(signum));
-        assert!(xsig_enqueue(std::process::id() as i32, signum, 0, 42, 0, 0));
+        assert!(xsig_enqueue(
+            std::process::id() as i32,
+            signum,
+            0,
+            42,
+            0,
+            0,
+            0
+        ));
         mark_xsig_dirty();
 
         assert!(has_pending_for(900_050));

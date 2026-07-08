@@ -2919,6 +2919,9 @@ impl SyscallDispatcher {
                     crate::namespace::pid::self_ns_pid() as i32,
                     this.cred_snapshot().euid,
                     value,
+                    // A pidfd names exactly one PROCESS (never a specific
+                    // thread), so this send is always process-directed.
+                    0,
                 ) {
                     crate::host_signal::xsig_nudge(host_pid);
                     return Ok(DispatchOutcome::Returned { value: 0 });

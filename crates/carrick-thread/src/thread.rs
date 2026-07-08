@@ -244,6 +244,17 @@ pub fn set_current_thread_state(tid: ThreadId, state: char) {
     }
 }
 
+/// Is `tid` live in the CURRENT process's thread registry? `None` when no
+/// registry has been installed at all (the single-threaded run loop never
+/// calls [`set_current_registry`] — there is no MT thread table to consult).
+/// Lets a caller with no `SyscallCtx` (an async drain, not a single syscall's
+/// dispatch) resolve a guest-supplied tid the same way
+/// `ThreadRegistry::is_live` does for the in-context `tgkill`/`tkill` route,
+/// without threading a registry reference through every call site.
+pub fn current_registry_liveness(tid: ThreadId) -> Option<bool> {
+    CURRENT_REGISTRY.lock().as_ref().map(|r| r.is_live(tid))
+}
+
 impl ThreadRegistry {
     pub fn new(main_tid: ThreadId) -> Self {
         let mut map = HashMap::new();
