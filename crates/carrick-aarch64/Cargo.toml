@@ -28,5 +28,6 @@ carrick-abi = { path = "../carrick-abi" }
 # getrusage(RUSAGE_SELF)/times/`/proc` see the guest's CPU time. Done ONCE in
 # this shared run loop — like carrick-x86.
 carrick-host = { path = "../carrick-host" }
+carrick-observability = { path = "../carrick-observability" }
 bitflags.workspace = true
 libc.workspace = true

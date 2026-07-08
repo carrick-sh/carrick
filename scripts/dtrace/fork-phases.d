@@ -41,6 +41,16 @@ carrick*:::fork-rebuild
     @rebuild_descs[(int)arg0, (int)arg1] = avg((uint64_t)arg2);
 }
 
+carrick*:::fork-lifecycle
+/(pid == $target || progenyof($target))/
+{
+    printf("[%d] fork-lifecycle role=%d phase=%d elapsed_us=%d a=%d b=%d\n",
+        pid, (int)arg0, (int)arg1, (uint64_t)arg2, (int64_t)arg3,
+        (int64_t)arg4);
+    @lifecycle_us[(int)arg0, (int)arg1] = avg((uint64_t)arg2);
+    @lifecycle_count[(int)arg0, (int)arg1] = count();
+}
+
 carrick*:::fork-post
 /(pid == $target || progenyof($target)) && fork_start[pid]/
 {
@@ -49,6 +59,7 @@ carrick*:::fork-post
     @parent_rebuild_avg_us = avg(this->elapsed_us);
     printf("[%d] fork-post role=parent child=%d elapsed_us=%d\n",
         pid, (int)arg0, this->elapsed_us);
+    parent_post_start[pid] = timestamp;
     fork_start[pid] = 0;
 }
 
@@ -60,12 +71,31 @@ carrick*:::fork-post
     @child_rebuild_avg_us = avg(this->elapsed_us);
     printf("[%d] fork-post role=child elapsed_since_pre_us=%d\n",
         pid, this->elapsed_us);
+    child_post_start[pid] = timestamp;
 }
 
 carrick*:::guest-exit
 /(pid == $target || progenyof($target))/
 {
     printf("[%d] guest-exit code=%d signal=%d\n", pid, (int)arg0, (int)arg1);
+}
+
+carrick*:::guest-exit
+/(pid == $target || progenyof($target)) && child_post_start[pid]/
+{
+    this->elapsed_us = (timestamp - child_post_start[pid]) / 1000;
+    @child_post_to_exit_us = avg(this->elapsed_us);
+    printf("[%d] child-post-to-exit elapsed_us=%d\n", pid, this->elapsed_us);
+    child_post_start[pid] = 0;
+}
+
+carrick*:::guest-exit
+/(pid == $target || progenyof($target)) && parent_post_start[pid]/
+{
+    this->elapsed_us = (timestamp - parent_post_start[pid]) / 1000;
+    @parent_post_to_exit_us = avg(this->elapsed_us);
+    printf("[%d] parent-post-to-exit elapsed_us=%d\n", pid, this->elapsed_us);
+    parent_post_start[pid] = 0;
 }
 
 tick-1s
@@ -88,4 +118,8 @@ dtrace:::END
     printa("rebuild us role=%d phase=%d %@d\n", @rebuild_us);
     printa("rebuild maps role=%d phase=%d %@d\n", @rebuild_maps);
     printa("rebuild descs role=%d phase=%d %@d\n", @rebuild_descs);
+    printa("lifecycle us role=%d phase=%d %@d\n", @lifecycle_us);
+    printa("lifecycle count role=%d phase=%d %@d\n", @lifecycle_count);
+    printa("child post-to-exit avg us %@d\n", @child_post_to_exit_us);
+    printa("parent post-to-exit avg us %@d\n", @parent_post_to_exit_us);
 }

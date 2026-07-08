@@ -179,6 +179,13 @@ mod real {
         /// that phase. `elapsed_us` is measured from the phase start, except phase
         /// 3 which is total rebuild elapsed.
         fn fork__rebuild(_: i32, _: i32, _: u64, _: u64, _: u64) {}
+        /// Fork lifecycle phase timing. `role`: 0=runtime-parent/common,
+        /// 1=runtime-child, 2=aarch64-parent/common, 3=aarch64-child,
+        /// 4=hvf-parent/common, 5=hvf-child. `phase` is domain-local and
+        /// documented in the E2.1 evidence artifact; `elapsed_us` is the
+        /// just-finished phase duration. `a` and `b` are phase-specific counts or
+        /// return codes.
+        fn fork__lifecycle(_: i32, _: i32, _: u64, _: i64, _: i64) {}
         /// Per-run lifecycle marker, one probe fired at each phase boundary so a
         /// DTrace consumer can time each phase as a delta. `phase`:
         /// 0=run-entry, 1=image-ready, 2=vm-created, 3=guest-loaded (ready to run),
@@ -760,6 +767,10 @@ mod real {
         carrick_usdt::fork__rebuild!(|| (role, phase, desc_count, map_count, elapsed_us));
     }
 
+    pub fn fork_lifecycle(role: i32, phase: i32, elapsed_us: u64, a: i64, b: i64) {
+        carrick_usdt::fork__lifecycle!(|| (role, phase, elapsed_us, a, b));
+    }
+
     pub fn fork_post(pid: i32, pc: u64, elr: u64) {
         carrick_usdt::fork__post!(|| (pid, pc, elr));
     }
@@ -1291,6 +1302,7 @@ mod stub {
     stub!(io_wait_end(tid: i32, result: i32, fd_count: i32, fd0: i32, fd1: i32, fd2: i32));
     stub!(fork_quiesce(phase: i32, a: i64, b: i64, tid: i32));
     stub!(fork_rebuild(role: i32, phase: i32, desc_count: u64, map_count: u64, elapsed_us: u64));
+    stub!(fork_lifecycle(role: i32, phase: i32, elapsed_us: u64, a: i64, b: i64));
     stub!(fork_post(pid: i32, pc: u64, elr: u64));
     stub!(signal_inject(signum: i32, saved_pc: u64, new_sp: u64, handler: u64));
     stub!(signal_restore(saved_pc: u64, sp: u64, magic: u64));
