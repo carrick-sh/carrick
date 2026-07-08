@@ -1814,6 +1814,11 @@ fn create_vm_with_admission(
 /// slot is generation-stamped with the PARENT's pid (the death-reaper would
 /// free the child's slot when the parent exits), and the flock path's
 /// in-process pending bookkeeping does not survive into the child.
+///
+/// KNOWN BLIND SPOT: permits UNDER-REPORT resident VMs — a vCPU-only park
+/// releases its permit while keeping its VM, so a parked fleet can pin the
+/// hard ~127-VM ceiling while this gate passes trivially (fix = resident-VM
+/// accounting; docs/2026-07-09-mt-residency-lease-evidence.md, Next Track 1a).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub fn probe_fork_vm_admission() -> Result<(), TrapError> {
     let Some(budget) = (VmCreateAdmission::ForkRebuild { vfork: false }).global_permit_budget()
@@ -3929,6 +3934,16 @@ impl HvfVmState {
         let registered_ipas: std::collections::HashSet<u64> =
             alias_registry().lock().iter().map(|e| e.ipa).collect();
         for mapping in &self.mappings {
+            // Skip a sibling-munmap'd stale high-VA entry ENTIRELY (absence
+            // from the registry = gone on purpose, mirroring the union loop
+            // below): hv_vm_map'ing it would map a freed host VA
+            // (ChildMapFailed → wake fatal) or squat a dead IPA a later mmap
+            // collides with.
+            let live_high_va_alias =
+                crate::memory::is_high_va(mapping.start) && registered_ipas.contains(&mapping.ipa);
+            if crate::memory::is_high_va(mapping.start) && !live_high_va_alias {
+                continue;
+            }
             let r = unsafe {
                 applevisor_sys::hv_vm_map(
                     mapping.host_addr.cast(),
@@ -3945,7 +3960,7 @@ impl HvfVmState {
                     code: r as u32,
                 });
             }
-            if crate::memory::is_high_va(mapping.start) && registered_ipas.contains(&mapping.ipa) {
+            if live_high_va_alias {
                 register_shared_alias(AliasBacking {
                     start: mapping.start,
                     ipa: mapping.ipa,

@@ -1628,7 +1628,7 @@ fn dispatch_single_threaded_syscall<M: GuestMemory>(
                 }
                 let waiter_tid = waiter.tid();
                 let sleep_interrupt_pending = || {
-                    dispatcher.drain_xsignals_for_tid(waiter_tid);
+                    dispatcher.drain_xsignals_process_directed();
                     dispatcher.has_deliverable_dispatch_pending_for_wait(
                         waiter_tid,
                         carrick_abi::WaitSigMask::Additive(carrick_abi::SigSet::EMPTY),
