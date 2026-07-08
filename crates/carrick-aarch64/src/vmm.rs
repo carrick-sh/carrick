@@ -552,6 +552,21 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         self.rebind_to_slot(slot, snapshot, vcpu)
     }
 
+    /// [`Self::rebind_shared_wait_state`] for a MULTI-THREADED parked process
+    /// (the whole-VM residency lease): the first waker rebuilds the process VM
+    /// for every still-parked sibling, so the mapping replay must carry the
+    /// UNION of every thread's dynamic mappings. HVF overrides this; the
+    /// default (KVM: no whole-VM teardown on park) is the single-threaded
+    /// restore.
+    fn rebind_shared_wait_state_mt(
+        &mut self,
+        slot: SlotId,
+        snapshot: &Aarch64VcpuSnapshot,
+        vcpu: &mut Self::Vcpu,
+    ) -> Result<(), TrapError> {
+        self.rebind_shared_wait_state(slot, snapshot, vcpu)
+    }
+
     /// Build the `Send` payload a `clone(CLONE_THREAD)` sibling needs to add its
     /// own vCPU on the SAME VM (shared VM handle + window descriptors + a
     /// live-vcpu ticket). KVM `build_sibling_spec` (ignores `vcpu`); HVF publishes

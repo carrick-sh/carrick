@@ -64,6 +64,29 @@ fn should_reclaim_vcpu_for_timed_wait(timeout: Option<Duration>) -> bool {
     }
 }
 
+/// MT whole-VM residency lease (E4 Track 3): when the LAST unparked thread of
+/// a multi-threaded process parks for a reclaim-eligible wait, release the
+/// whole VM like single-threaded parks already do (`save_shared_wait_state`),
+/// so >127 blocked MT processes don't exhaust the per-VM slot budget.
+/// `CARRICK_MT_VM_LEASE=0` reverts to vCPU-only MT parks for bisection.
+///
+/// Lock ordering (process-wide rule): `fork_quiesce::topology_lock` →
+/// registry lock is PERMITTED — the wake path claims the rebuild
+/// (`unpark_vcpu`) under the topology lock, and the MT release path re-checks
+/// the registry under a topology TRY-lock. Registry → topology is FORBIDDEN
+/// (no registry lock is ever held while acquiring the topology lock; the
+/// registry's own methods are self-contained critical sections). The park
+/// path never runs under an already-held `topology_lock` (its callers are the
+/// blocking-wait arms of the dispatch loop, which hold neither lock).
+fn mt_vm_lease_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("CARRICK_MT_VM_LEASE")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
+}
+
 // ---------------------------------------------------------------------------
 // NON-engine helpers the generic loop calls.
 //
@@ -615,8 +638,19 @@ where
             return None;
         }
         let single_threaded_process = self.registry.live_count() == 1;
+        let last_unparked = self.registry.park_vcpu(self.this_tid);
         let state = if single_threaded_process {
-            engine.save_shared_wait_state()
+            // Single-threaded: this thread IS the whole process — no sibling
+            // can race the teardown, so release unconditionally (the
+            // historical pre-lease path, kept byte-identical). The registry
+            // bookkeeping above is harmless here (one thread, no contention)
+            // and keeps one code path; the flag is claimed back by this same
+            // thread's own `unpark_vcpu` on wake.
+            let st = engine.save_shared_wait_state();
+            self.registry.set_vm_released(true);
+            st
+        } else if mt_vm_lease_enabled() && last_unparked {
+            self.park_mt_releasing_vm(engine)
         } else {
             engine.save_guest_state()
         };
@@ -633,6 +667,39 @@ where
             old_slot,
             single_threaded_process,
         })
+    }
+
+    /// MT whole-VM release: the last unparked thread of a multi-threaded
+    /// process tears down the process VM so a fleet of fully-blocked MT
+    /// processes holds zero HVF VM slots. Returns the saved state (whole-VM
+    /// release, or a vCPU-only downgrade).
+    ///
+    /// The teardown + `set_vm_released` run under the topology lock so they
+    /// are ATOMIC against a waking sibling's claim + rebind (which hold the
+    /// same lock in `resume_vcpu_after_blocking_wait`): without it, a sibling
+    /// waking between our `park_vcpu` last-unparked verdict and the teardown
+    /// could claim FALSE (flag not yet set) and re-create its vCPU in the VM
+    /// we are destroying. TRY-lock, not lock: a fork quiesce holds the
+    /// topology lock while draining kicker-registered threads, and this
+    /// thread is still registered here — blocking would deadlock the drain.
+    /// A held lock (fork in flight, or a sibling mid-claim) simply downgrades
+    /// to the vCPU-only park; so does a sibling that already unparked (the
+    /// re-check below).
+    fn park_mt_releasing_vm(&self, engine: &mut E) -> Vec<u8> {
+        let _topo = match crate::fork_quiesce::topology_lock().try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return engine.save_guest_state(),
+        };
+        if !self.registry.all_other_vcpus_parked(self.this_tid) {
+            // A sibling woke (its unpark cleared its mark) after our
+            // last-unparked verdict: it is about to re-create its vCPU, so
+            // the VM must stay.
+            return engine.save_guest_state();
+        }
+        let st = engine.save_shared_wait_state();
+        self.registry.set_vm_released(true);
+        st
     }
 
     fn park_vcpu_for_timed_wait(
@@ -677,10 +744,28 @@ where
             let _topo = crate::fork_quiesce::topology_lock()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            if reclaim.single_threaded_process {
-                engine
-                    .rebind_shared_wait_state(new_lease.slot, &reclaim.state)
-                    .map_err(RuntimeError::Trap)?;
+            // Claim the whole-VM rebuild INSIDE the topology lock — the same
+            // lock the park-side teardown and every rebind hold — so a
+            // claim-FALSE result proves the claimer's rebuild (or the
+            // teardown's downgrade) already completed: a claim-false waker
+            // can never reach `rebind_to_slot` against a dead VM. Exactly one
+            // of any set of simultaneous wakers claims true (registry mutex).
+            let rebuild_vm =
+                self.registry.unpark_vcpu(self.this_tid) || reclaim.single_threaded_process;
+            if rebuild_vm {
+                if reclaim.single_threaded_process {
+                    engine
+                        .rebind_shared_wait_state(new_lease.slot, &reclaim.state)
+                        .map_err(RuntimeError::Trap)?;
+                } else {
+                    // MT first waker: rebuild the process VM on behalf of the
+                    // still-parked siblings — the mapping replay must carry
+                    // the UNION of every thread's dynamic mappings, not just
+                    // this thread's per-thread list.
+                    engine
+                        .rebind_shared_wait_state_mt(new_lease.slot, &reclaim.state)
+                        .map_err(RuntimeError::Trap)?;
+                }
             } else {
                 engine
                     .rebind_to_slot(new_lease.slot, &reclaim.state)
@@ -699,10 +784,26 @@ where
             if kicker_dropped {
                 self.register_vcpu(engine);
             }
-            if reclaim.single_threaded_process {
-                engine
-                    .rebind_shared_wait_state(new_lease.slot, &reclaim.state)
-                    .map_err(RuntimeError::Trap)?;
+            // Non-refresh (pool-swap: KVM x86 / bhyve) branch: no backend in
+            // this branch tears down per-process VM state on a shared-wait
+            // park (`save_shared_wait_state` defaults to the vCPU pool-swap),
+            // so there is no dead-VM window and the claim needs no topology
+            // lock. Taking it here would deadlock a concurrent fork quiesce:
+            // this thread stays kicker-REGISTERED on pool-swap backends, so
+            // the forker (holding the topology lock) would wait on our park
+            // while we wait on its lock.
+            let rebuild_vm =
+                self.registry.unpark_vcpu(self.this_tid) || reclaim.single_threaded_process;
+            if rebuild_vm {
+                if reclaim.single_threaded_process {
+                    engine
+                        .rebind_shared_wait_state(new_lease.slot, &reclaim.state)
+                        .map_err(RuntimeError::Trap)?;
+                } else {
+                    engine
+                        .rebind_shared_wait_state_mt(new_lease.slot, &reclaim.state)
+                        .map_err(RuntimeError::Trap)?;
+                }
             } else {
                 engine
                     .rebind_to_slot(new_lease.slot, &reclaim.state)

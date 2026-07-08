@@ -559,6 +559,23 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + GuestMemory + Send {
     ) -> Result<(), TrapError> {
         self.rebind_to_slot(slot, state)
     }
+    /// Restore state saved by [`Self::save_shared_wait_state`] when the parked
+    /// process was MULTI-THREADED (the whole-VM residency lease): the FIRST
+    /// waker rebuilds the per-process VM state on behalf of every still-parked
+    /// sibling, so a backend whose shared-wait park tears the whole VM down
+    /// must replay the UNION of every thread's dynamic mappings — not just
+    /// this (waking) thread's per-thread list (HVF overrides this via its
+    /// process-global alias registry). Defaults to the single-threaded
+    /// restore: pool-swap backends (KVM x86, bhyve) never tear down
+    /// per-process VM state on a shared-wait park, so there is nothing extra
+    /// to rebuild.
+    fn rebind_shared_wait_state_mt(
+        &mut self,
+        slot: crate::SlotId,
+        state: &[u8],
+    ) -> Result<(), TrapError> {
+        self.rebind_shared_wait_state(slot, state)
+    }
     fn build_sibling_spec(&self, entry: GuestEntryRegs) -> Result<Self::SiblingSpec, TrapError>;
     fn materialize_sibling(spec: Self::SiblingSpec) -> Result<Self, TrapError>
     where

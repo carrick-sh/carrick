@@ -564,7 +564,23 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         _snapshot: &Aarch64VcpuSnapshot,
         vcpu: &mut Self::Vcpu,
     ) -> Result<(), TrapError> {
-        self.state.shared_wait_resume(&mut vcpu.0)
+        self.state
+            .shared_wait_resume(&mut vcpu.0, /*replay_alias_union=*/ false)
+    }
+
+    fn rebind_shared_wait_state_mt(
+        &mut self,
+        _slot: SlotId,
+        _snapshot: &Aarch64VcpuSnapshot,
+        vcpu: &mut Self::Vcpu,
+    ) -> Result<(), TrapError> {
+        // MT whole-VM lease first-waker rebuild: `self.mappings` is PER-THREAD,
+        // so replay the process-global alias registry's union on top of it —
+        // a high-VA alias a still-parked sibling mapped would otherwise be
+        // missing from the rebuilt VM's stage-2 (same shape as the fork
+        // rebuild's sibling-union replay).
+        self.state
+            .shared_wait_resume(&mut vcpu.0, /*replay_alias_union=*/ true)
     }
 
     fn build_sibling_builder(
