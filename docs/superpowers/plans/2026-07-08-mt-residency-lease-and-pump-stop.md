@@ -722,6 +722,8 @@ Expected: identical booleans. Also re-run `procladder` (single-threaded twin) at
 
 Re-run the gate once with `CARRICK_MT_VM_LEASE=0` in the carrick env. Expected: NOT green-by-lease — with Task 5 Step 4c landed, the run should complete with `ladder_forked_all=false` and NO engine fatals and NO silent stall (graceful EAGAIN degradation at the ceiling). This one run proves both the kill switch and the exhaustion-degradation fix. (Task 2 recorded the two pre-fix red shapes: pause-shaped fatal `procladder_mt-160-red-rework-*.log`, sigwait-shaped silent stall `procladder_mt-160-red-sigwait-*.log` — neither shape may reappear.)
 
+> **AMENDMENT (recorded result diverged):** the kill-switch run produced the trap-fatal family, not the expected EAGAIN degradation — parked children release PERMITS while pinning VMs, so the pre-fork gate under-reports hard-slot residency (see docs/2026-07-09-mt-residency-lease-evidence.md, Next Track 1a — resident-VM accounting follow-up).
+
 - [ ] **Step 3: Perf regression gates**
 
 ```bash
