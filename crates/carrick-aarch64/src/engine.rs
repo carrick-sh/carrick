@@ -1306,6 +1306,10 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             .rebind_shared_wait_state_mt(slot, &snap, &mut self.vcpu)
     }
 
+    fn release_vm_after_reclaim_park(&mut self) -> Result<bool, TrapError> {
+        self.vm.release_vm_after_reclaim_park()
+    }
+
     fn build_sibling_spec(&self, entry: GuestEntryRegs) -> Result<Self::SiblingSpec, TrapError> {
         // Snapshot the parent vCPU (taken while it is suspended at the trapped
         // `clone` syscall — atomic, race-free), then seed it for the new thread
