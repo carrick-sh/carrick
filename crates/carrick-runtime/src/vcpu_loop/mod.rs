@@ -637,7 +637,11 @@ where
         );
     }
 
-    fn park_vcpu_for_blocking_wait(&self, engine: &mut E) -> Option<BlockingWaitReclaim> {
+    fn park_vcpu_for_blocking_wait(
+        &self,
+        engine: &mut E,
+        park_class: crate::thread::VcpuParkClass,
+    ) -> Option<BlockingWaitReclaim> {
         if !engine.reclaims() {
             return None;
         }
@@ -646,10 +650,13 @@ where
             // Single-threaded: this thread IS the whole process — no sibling
             // can race the teardown, so release unconditionally via the
             // combined vCPU+VM park (the historical pre-lease path, kept
-            // byte-identical). The registry bookkeeping is harmless here (one
+            // byte-identical; the class is recorded but nothing consults it
+            // for ST). The registry bookkeeping is harmless here (one
             // thread, no contention) and keeps one claim protocol; the flag
             // is claimed back by this same thread's own `unpark_vcpu` on wake.
-            let _ = self.registry.park_vcpu(self.this_tid);
+            let _ = self
+                .registry
+                .park_vcpu_classified(self.this_tid, park_class);
             let st = engine.save_shared_wait_state();
             self.registry.set_vm_released(true);
             st
@@ -658,16 +665,22 @@ where
             // (reclaim_park shape — snapshot stashed, compatible with the
             // shared-wait resume), and only THEN set the registry "parked"
             // mark — so `vcpu_parked` truthfully means "vCPU actually
-            // destroyed". The whole-VM release is deliberately NOT taken
-            // here: an eager last-unparked release on this common park path
-            // made every hot MT blocking wait pay a full VM release+rebuild
-            // (wait_pipe_pingpong p50 41.9µs → 354µs, +867% — see
+            // destroyed". The mark carries the wait's wake-path CLASS: a
+            // parked FD-BACKED wait vetoes any sibling's whole-VM release
+            // (the fd-wait wake path under a released VM has an
+            // un-root-caused gap — attribution cluster B). The whole-VM
+            // release is deliberately NOT taken here: an eager last-unparked
+            // release on this common park path made every hot MT blocking
+            // wait pay a full VM release+rebuild (wait_pipe_pingpong p50
+            // 41.9µs → 354µs, +867% — see
             // .superpowers/sdd/task-6-regression-attribution.md, cluster A1)
             // and wedged the CPython forkserver suite (cluster B). The
             // release is DEFERRED to the slicing wait arms' second parked
-            // slice — see `try_upgrade_vm_release_on_slice_tick`.
+            // full slice — see `try_upgrade_vm_release_on_slice_tick`.
             let st = engine.save_guest_state();
-            let _ = self.registry.park_vcpu(self.this_tid);
+            let _ = self
+                .registry
+                .park_vcpu_classified(self.this_tid, park_class);
             st
         };
         let old_slot = carrick_hal::vcpu_sched::current_slot();
@@ -688,30 +701,43 @@ where
     /// Deferred MT whole-VM release — the SLICE-TICK UPGRADE. Called only
     /// from the SLICING wait arms (WaitOnSignals, WaitOnSleep — the arms
     /// that re-dispatch on ≥1 s parked service slices), on a tick where this
-    /// thread has ALREADY completed at least one full parked slice (≈1 s
-    /// parked; the caller counts). At that point this thread's own vCPU is
-    /// already destroyed by the slice's vCPU-only park, so an idle
+    /// thread has ALREADY completed at least one full parked slice AND the
+    /// CURRENT tick is itself a full ≥1 s slice (both counted/checked by the
+    /// caller — a finite wait's final <1 s window uses short slices and must
+    /// not churn releases at slice rate). At that point this thread's own
+    /// vCPU is already destroyed by the slice's vCPU-only park, so an idle
     /// fully-parked MT process converges to holding zero HVF VMs within ~1 s
     /// — while hot blocking paths (pipe/futex pingpongs, which park and wake
     /// in microseconds) never reach a second slice and never pay the
     /// release+rebuild round trip (the +867% wait_pipe regression the eager
     /// design caused — task-6-regression-attribution.md, cluster A1).
+    /// Post-release ticks stretch progressively (2s→4s→8s, caller-managed)
+    /// so a long-idle process converges to ~1 rebuild per 8 s. The better
+    /// endpoint — SKIP the resume/re-park round trip entirely on an idle
+    /// TimedOut tick — is deliberately NOT attempted here (deadline/EINTR
+    /// bookkeeping risk); it is the named follow-up.
     ///
-    /// KNOWN LIMITATION (deliberate): a process whose blocked threads are
-    /// ALL in non-slicing fd waits (`WaitOnFds`/`WaitOnPollFds`/... — e.g.
-    /// the forkserver-descended manager in the attribution report's cluster
-    /// B cores, cr-attr-fs.38232) never releases its VM. The attribution
-    /// cores show the fd-wait wake path has an unresolved wake gap when the
-    /// process's VM is released from under it, so fd-wait releases stay OFF
-    /// until that is root-caused (see
-    /// .superpowers/sdd/task-6-regression-attribution.md, cluster B).
-    fn try_upgrade_vm_release_on_slice_tick(&self, engine: &mut E) {
+    /// Returns true iff the process VM is released when this returns (this
+    /// call released it, or it was already released) — the caller uses it to
+    /// drive the post-release slice-stretch progression.
+    ///
+    /// INVARIANT (enforced, not just documented): a parked FD-BACKED wait
+    /// anywhere in the process VETOES the release
+    /// (`all_other_parked_release_safe`) — fd-backed waits never have the VM
+    /// released from under them until the fd-wait wake gap is root-caused
+    /// (the CPython forkserver wedge: attribution report cluster B, retained
+    /// cores cr-attr-fs.38232 et al. — an fd-wait manager parked and made no
+    /// progress). Consequently a process whose blocked threads are ALL in
+    /// fd-backed waits never releases its VM; a mixed process releases only
+    /// while every parked sibling is wake-safe (signal/timer/futex-driven,
+    /// or an empty-fd-set poll like `ppoll(NULL)`).
+    fn try_upgrade_vm_release_on_slice_tick(&self, engine: &mut E) -> bool {
         if !mt_vm_lease_enabled() || self.registry.live_count() == 1 {
             // ST processes already released eagerly at park
             // (save_shared_wait_state); the upgrade is MT-only.
-            return;
+            return false;
         }
-        self.try_release_vm_mt(engine);
+        self.try_release_vm_mt(engine)
     }
 
     /// MT whole-VM release machinery (used only by the slice-tick upgrade
@@ -724,13 +750,16 @@ where
     /// (which hold the same lock in `resume_vcpu_after_blocking_wait`):
     /// without it, a sibling waking between the all-parked re-check and the
     /// teardown could claim FALSE (flag not yet set) and re-create its vCPU
-    /// in the VM we are destroying. TRY-lock, not lock: a fork quiesce holds
-    /// the topology lock while draining kicker-registered threads, and this
-    /// thread is still registered here — blocking would deadlock the drain.
-    /// A held lock (fork in flight, or a sibling mid-claim) simply skips the
-    /// release (the park stays vCPU-only); so does an unparked sibling (the
-    /// re-check) or an already-set flag (VM already dead; re-destroying
-    /// would just warn).
+    /// in the VM we are destroying. TRY-lock, not lock: on a NON-refresh
+    /// (pool-swap) backend this thread is still kicker-registered while
+    /// parked, so blocking on a forker-held topology lock would deadlock the
+    /// quiesce drain; on HVF (kicker already unregistered by the park) the
+    /// try-lock still holds — a contended lock means a fork/exec is
+    /// rebuilding the VM topology anyway, so releasing now would be wasted
+    /// work at best. A held lock simply skips the release (the park stays
+    /// vCPU-only); so does an unparked sibling (the re-check), a parked
+    /// FD-BACKED sibling (the release-safe veto), or an already-set flag
+    /// (VM already dead — reported as released).
     ///
     /// `vm_released` is set ONLY when the engine reports a successful
     /// whole-VM release (`Ok(true)`). On `Err` — e.g. HV_BUSY from a vCPU in
@@ -738,27 +767,34 @@ where
     /// the VM is still alive and setting the flag would poison an innocent
     /// sibling's wake with a rebuild against a live VM; instead the park
     /// stays vCPU-only, with a gated diagnostic.
-    fn try_release_vm_mt(&self, engine: &mut E) {
+    ///
+    /// Returns true iff the VM stands released on return.
+    fn try_release_vm_mt(&self, engine: &mut E) -> bool {
         let _topo = match crate::fork_quiesce::topology_lock().try_lock() {
             Ok(guard) => guard,
             Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => return,
+            Err(std::sync::TryLockError::WouldBlock) => return false,
         };
         if self.registry.vm_released() {
             // A slicing sibling already released this tick cycle and no
             // waker has claimed yet: the VM is already gone.
-            return;
+            return true;
         }
-        if !self.registry.all_other_vcpus_parked(self.this_tid) {
-            // A sibling woke (its unpark cleared its mark): it is about to
-            // re-create its vCPU, so the VM must stay.
-            return;
+        if !self.registry.all_other_parked_release_safe(self.this_tid) {
+            // A sibling woke (its unpark cleared its mark) — it is about to
+            // re-create its vCPU — or a parked sibling is in an FD-BACKED
+            // wait, whose wake path must never see the VM released from
+            // under it (attribution cluster B). The VM stays.
+            return false;
         }
         match engine.release_vm_after_reclaim_park() {
-            Ok(true) => self.registry.set_vm_released(true),
+            Ok(true) => {
+                self.registry.set_vm_released(true);
+                true
+            }
             // Backend has no whole-VM state to release (pool-swap): nothing
             // to flag; the wake side's rebind_to_slot is already correct.
-            Ok(false) => {}
+            Ok(false) => false,
             Err(error) => {
                 tracing::warn!(
                     tid = self.this_tid.raw(),
@@ -766,6 +802,7 @@ where
                     "MT whole-VM release failed; keeping the park vCPU-only \
                      (vm_released NOT set)"
                 );
+                false
             }
         }
     }
@@ -774,9 +811,10 @@ where
         &self,
         engine: &mut E,
         timeout: Option<Duration>,
+        park_class: crate::thread::VcpuParkClass,
     ) -> Option<BlockingWaitReclaim> {
         if should_reclaim_vcpu_for_timed_wait(timeout) {
-            self.park_vcpu_for_blocking_wait(engine)
+            self.park_vcpu_for_blocking_wait(engine, park_class)
         } else {
             None
         }
@@ -818,8 +856,12 @@ where
             // teardown's downgrade) already completed: a claim-false waker
             // can never reach `rebind_to_slot` against a dead VM. Exactly one
             // of any set of simultaneous wakers claims true (registry mutex).
-            let rebuild_vm =
-                self.registry.unpark_vcpu(self.this_tid) || reclaim.single_threaded_process;
+            // `unpark_vcpu` is ALWAYS called (the mark must clear); the MT
+            // claim is honored only with the lease enabled, so
+            // CARRICK_MT_VM_LEASE=0 is a true zero (no MT release can have
+            // set the flag with the lease off, so ignoring a claim is safe).
+            let claimed = self.registry.unpark_vcpu(self.this_tid);
+            let rebuild_vm = reclaim.single_threaded_process || (mt_vm_lease_enabled() && claimed);
             if rebuild_vm {
                 if reclaim.single_threaded_process {
                     engine
@@ -859,9 +901,10 @@ where
             // lock. Taking it here would deadlock a concurrent fork quiesce:
             // this thread stays kicker-REGISTERED on pool-swap backends, so
             // the forker (holding the topology lock) would wait on our park
-            // while we wait on its lock.
-            let rebuild_vm =
-                self.registry.unpark_vcpu(self.this_tid) || reclaim.single_threaded_process;
+            // while we wait on its lock. Same lease gating as the refresh
+            // branch: unpark always, honor an MT claim only with the lease on.
+            let claimed = self.registry.unpark_vcpu(self.this_tid);
+            let rebuild_vm = reclaim.single_threaded_process || (mt_vm_lease_enabled() && claimed);
             if rebuild_vm {
                 if reclaim.single_threaded_process {
                     engine
@@ -935,10 +978,18 @@ where
         // Completed FULL (≥1 s) parked service slices in this syscall's
         // slicing wait arms (WaitOnSignals / WaitOnSleep). Drives the
         // deferred MT whole-VM upgrade: the FIRST parked slice is always
-        // vCPU-only; from the second tick on (≈1 s parked, provably idle)
-        // the arm attempts `try_upgrade_vm_release_on_slice_tick`. Resets
-        // naturally with each new syscall dispatch.
+        // vCPU-only; from the second FULL tick on (≈1 s parked, provably
+        // idle) the arm attempts `try_upgrade_vm_release_on_slice_tick`.
+        // Resets naturally with each new syscall dispatch (deliberately NOT
+        // on a Ready wake — see the WaitOnSignals arm's comment).
         let mut parked_full_slices: u32 = 0;
+        // Parked-slice stretch target for the slicing arms: 1 s until a
+        // whole-VM release succeeds, then 2s→4s→8s (reset to 1 s on any
+        // real wake) so a long-idle released process converges to ~1
+        // rebuild per 8 s. The better endpoint — skip the resume/re-park
+        // round trip entirely on an idle TimedOut tick — is deliberately
+        // not attempted (deadline/EINTR bookkeeping risk); named follow-up.
+        let mut parked_slice_stretch: Duration = Duration::from_secs(1);
         // Monotonic deadline for a WaitOnSleep, established on first dispatch and
         // preserved across quiesce-park re-dispatch so the sleep isn't restarted.
         let mut sleep_deadline: Option<Instant> = None;
@@ -1019,7 +1070,12 @@ where
                 }
                 DispatchOutcome::BlockingRecordLock(lock) => {
                     crate::run_state::publish(crate::run_state::RunState::Blocked);
-                    let reclaim = self.park_vcpu_for_blocking_wait(engine);
+                    // FdBacked (conservative): the record-lock wake is a host
+                    // blocking fcntl, unproven under a released VM.
+                    let reclaim = self.park_vcpu_for_blocking_wait(
+                        engine,
+                        crate::thread::VcpuParkClass::FdBacked,
+                    );
                     let outcome = crate::dispatch::drive_blocking_record_lock(&lock);
                     self.resume_vcpu_after_blocking_wait(engine, reclaim)?;
                     break Ok(outcome);
@@ -1032,7 +1088,16 @@ where
                 } => {
                     self.waiter.ensure_full();
                     crate::run_state::publish(crate::run_state::RunState::Blocked);
-                    let reclaim = self.park_vcpu_for_timed_wait(engine, timeout);
+                    // A NON-EMPTY fd set is fd-backed (kqueue readiness wake —
+                    // vetoes whole-VM release; attribution cluster B); an
+                    // EMPTY set (pure signal/timeout wait, e.g. ppoll(NULL))
+                    // wakes like a signal wait and is release-safe.
+                    let park_class = if fds.is_empty() {
+                        crate::thread::VcpuParkClass::ReleaseSafe
+                    } else {
+                        crate::thread::VcpuParkClass::FdBacked
+                    };
+                    let reclaim = self.park_vcpu_for_timed_wait(engine, timeout, park_class);
                     let wait_result = self.waiter.wait_with_dispatch_pending(
                         &fds,
                         timeout,
@@ -1074,7 +1139,13 @@ where
                 } => {
                     self.waiter.ensure_full();
                     crate::run_state::publish(crate::run_state::RunState::Blocked);
-                    let reclaim = self.park_vcpu_for_timed_wait(engine, timeout);
+                    // fd-class rule: see the WaitOnFds arm.
+                    let park_class = if fds.is_empty() {
+                        crate::thread::VcpuParkClass::ReleaseSafe
+                    } else {
+                        crate::thread::VcpuParkClass::FdBacked
+                    };
+                    let reclaim = self.park_vcpu_for_timed_wait(engine, timeout, park_class);
                     let wait_result = self.waiter.wait_with_dispatch_pending(
                         &fds,
                         timeout,
@@ -1134,7 +1205,15 @@ where
                         }
                     };
                     crate::run_state::publish(crate::run_state::RunState::Blocked);
-                    let reclaim = self.park_vcpu_for_timed_wait(engine, timeout);
+                    // fd-class rule: see the WaitOnFds arm. An empty poll set
+                    // (ppoll(NULL) — pure signal/timeout wait, e.g.
+                    // procladder_mt's pause() sibling) is release-safe.
+                    let park_class = if fds.is_empty() {
+                        crate::thread::VcpuParkClass::ReleaseSafe
+                    } else {
+                        crate::thread::VcpuParkClass::FdBacked
+                    };
+                    let reclaim = self.park_vcpu_for_timed_wait(engine, timeout, park_class);
                     let wait_result = self.waiter.wait_poll_with_dispatch_pending(
                         &fds,
                         timeout,
@@ -1171,7 +1250,13 @@ where
                 DispatchOutcome::WaitOnProcExit { pid, sig_mask } => {
                     self.waiter.ensure_full();
                     crate::run_state::publish(crate::run_state::RunState::Blocked);
-                    let reclaim = self.park_vcpu_for_blocking_wait(engine);
+                    // FdBacked (conservative): the wake is kqueue
+                    // EVFILT_PROC readiness — same kqueue-wake family as the
+                    // un-root-caused fd gap (attribution cluster B).
+                    let reclaim = self.park_vcpu_for_blocking_wait(
+                        engine,
+                        crate::thread::VcpuParkClass::FdBacked,
+                    );
                     let wait_result = self.waiter.wait_proc_exit_with_dispatch_pending(
                         pid,
                         sig_mask.block_mask(),
@@ -1237,33 +1322,66 @@ where
                     // TimedOut arm's `signal_wait_expired` bookkeeping is
                     // unchanged).
                     let guest_remaining = signal_wait_remaining(signal_wait_deadline, timeout);
-                    let reclaim = self.park_vcpu_for_timed_wait(engine, guest_remaining);
-                    // Deferred MT whole-VM upgrade: only from the SECOND
-                    // parked full slice on (≈1 s provably idle) — the first
-                    // tick is always vCPU-only, so hot signal waits never pay
-                    // the release+rebuild round trip.
-                    if reclaim.is_some() && parked_full_slices >= 1 {
-                        self.try_upgrade_vm_release_on_slice_tick(engine);
-                    }
+                    // Signal-driven wake (the per-thread waiter pipe) —
+                    // release-safe: proven to wake and rebuild with the VM
+                    // released (procladder_mt's sigwait children).
+                    let reclaim = self.park_vcpu_for_timed_wait(
+                        engine,
+                        guest_remaining,
+                        crate::thread::VcpuParkClass::ReleaseSafe,
+                    );
+                    // While parked, stretch the service slice: 1 s by
+                    // default; after a successful whole-VM release the
+                    // progression below widens it 2s→4s→8s so a long-idle
+                    // process converges to ~1 rebuild per 8 s instead of one
+                    // per second. Only when the guest wait is indefinite or
+                    // has >1 s left, capped at the remainder — a finite
+                    // wait's final <1 s window keeps 50 ms slices (and, via
+                    // the full-slice gate below, never attempts an upgrade
+                    // at that rate).
                     let slice = match (reclaim.is_some(), guest_remaining) {
-                        (true, None) => slice.max(Duration::from_secs(1)),
+                        (true, None) => slice.max(parked_slice_stretch),
                         (true, Some(remaining)) if remaining > Duration::from_secs(1) => {
-                            slice.max(Duration::from_secs(1)).min(remaining)
+                            slice.max(parked_slice_stretch).min(remaining)
                         }
                         _ => slice,
                     };
                     let was_parked_full_slice =
                         reclaim.is_some() && slice >= Duration::from_secs(1);
+                    // Deferred MT whole-VM upgrade: only from the SECOND
+                    // parked full slice on (≈1 s provably idle), and only
+                    // when the CURRENT tick is itself a full ≥1 s slice —
+                    // the first tick and any short-slice tick stay
+                    // vCPU-only, so hot signal waits and finite-wait tail
+                    // windows never pay the release+rebuild round trip.
+                    let released = was_parked_full_slice
+                        && parked_full_slices >= 1
+                        && self.try_upgrade_vm_release_on_slice_tick(engine);
                     let wait_result = self.waiter.wait(&[], Some(slice), block_mask);
                     if let Some(outcome) = self.exec_replaced_thread_exit() {
                         return Ok(outcome);
                     }
                     self.resume_vcpu_after_blocking_wait(engine, reclaim)?;
                     match wait_result {
-                        crate::io_wait::WaitResult::Ready => continue,
+                        crate::io_wait::WaitResult::Ready => {
+                            // Real wake: reset the post-release stretch
+                            // progression. `parked_full_slices` deliberately
+                            // does NOT reset — the thread already proved ≥1 s
+                            // idle once within this syscall, and the upgrade
+                            // stays gated on the CURRENT tick being a full
+                            // slice, so a hot wait (which never completes
+                            // full slices) is unaffected either way.
+                            parked_slice_stretch = Duration::from_secs(1);
+                            continue;
+                        }
                         crate::io_wait::WaitResult::TimedOut => {
                             if was_parked_full_slice {
                                 parked_full_slices = parked_full_slices.saturating_add(1);
+                                if released {
+                                    // Post-release progression: 2s→4s→8s.
+                                    parked_slice_stretch = (parked_slice_stretch * 2)
+                                        .clamp(Duration::from_secs(2), Duration::from_secs(8));
+                                }
                             }
                             if signal_wait_expired(signal_wait_deadline) {
                                 break Ok(DispatchOutcome::Errno {
@@ -1273,6 +1391,7 @@ where
                             continue;
                         }
                         crate::io_wait::WaitResult::Interrupted => {
+                            parked_slice_stretch = Duration::from_secs(1);
                             if let Some(outcome) = self.exec_replaced_thread_exit() {
                                 break Ok(outcome);
                             }
@@ -1337,28 +1456,34 @@ where
                     // sleep wait at the same internal slice as `io_wait` so each
                     // slice services dispatcher-owned pending state.
                     let remaining_until_deadline = deadline - now;
-                    let reclaim =
-                        self.park_vcpu_for_timed_wait(engine, Some(remaining_until_deadline));
-                    // Deferred MT whole-VM upgrade: second+ parked full slice
-                    // only (see the WaitOnSignals arm).
-                    if reclaim.is_some() && parked_full_slices >= 1 {
-                        self.try_upgrade_vm_release_on_slice_tick(engine);
-                    }
-                    // While PARKED, stretch the 50 ms service slice to 1 s
-                    // (same capped rule as the WaitOnSignals arm): interrupts
-                    // arrive via the waiter kick in microseconds, and a
-                    // fully-parked MT process in a long nanosleep would
-                    // otherwise churn ~20 VM park/resume cycles per second.
-                    // Only when >1 s remains, capped at the remainder, so the
-                    // deadline check below is unaffected.
+                    // Timer-driven wake — release-safe.
+                    let reclaim = self.park_vcpu_for_timed_wait(
+                        engine,
+                        Some(remaining_until_deadline),
+                        crate::thread::VcpuParkClass::ReleaseSafe,
+                    );
+                    // While PARKED, stretch the 50 ms service slice (same
+                    // capped rule + post-release 2s→4s→8s progression as the
+                    // WaitOnSignals arm): interrupts arrive via the waiter
+                    // kick in microseconds, and a fully-parked MT process in
+                    // a long nanosleep would otherwise churn ~20 VM
+                    // park/resume cycles per second. Only when >1 s remains,
+                    // capped at the remainder, so the deadline check below
+                    // is unaffected.
                     let wait_for =
                         if reclaim.is_some() && remaining_until_deadline > Duration::from_secs(1) {
-                            remaining_until_deadline.min(Duration::from_secs(1))
+                            remaining_until_deadline.min(parked_slice_stretch)
                         } else {
                             remaining_until_deadline.min(Duration::from_millis(50))
                         };
                     let was_parked_full_slice =
                         reclaim.is_some() && wait_for >= Duration::from_secs(1);
+                    // Deferred MT whole-VM upgrade: second+ parked full slice
+                    // only, and only when the CURRENT tick is a full slice
+                    // (see the WaitOnSignals arm).
+                    let released = was_parked_full_slice
+                        && parked_full_slices >= 1
+                        && self.try_upgrade_vm_release_on_slice_tick(engine);
                     let wait_result = self.waiter.wait_with_dispatch_pending(
                         &[],
                         Some(wait_for),
@@ -1370,10 +1495,17 @@ where
                     }
                     self.resume_vcpu_after_blocking_wait(engine, reclaim)?;
                     match wait_result {
-                        crate::io_wait::WaitResult::Ready => continue,
+                        crate::io_wait::WaitResult::Ready => {
+                            parked_slice_stretch = Duration::from_secs(1);
+                            continue;
+                        }
                         crate::io_wait::WaitResult::TimedOut => {
                             if was_parked_full_slice {
                                 parked_full_slices = parked_full_slices.saturating_add(1);
+                                if released {
+                                    parked_slice_stretch = (parked_slice_stretch * 2)
+                                        .clamp(Duration::from_secs(2), Duration::from_secs(8));
+                                }
                             }
                             if Instant::now() >= deadline {
                                 break Ok(DispatchOutcome::Returned { value: 0 });
@@ -1381,6 +1513,7 @@ where
                             continue;
                         }
                         crate::io_wait::WaitResult::Interrupted => {
+                            parked_slice_stretch = Duration::from_secs(1);
                             if crate::fork_quiesce::is_quiescing() {
                                 self.release_and_park_vcpu_for_fork(engine)?;
                                 continue;
