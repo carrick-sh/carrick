@@ -758,20 +758,27 @@ impl VmCreateAdmission {
     /// NOT guest *execution* — execution is already bounded by the per-process M:N
     /// scheduler gate and the Darwin kernel time-slicing cores across processes.
     ///
-    /// Measured via `hvf_fork_probe concurrent-ceiling`: the host sustains ~126
-    /// concurrent single-vCPU HVF VMs across separate processes before
-    /// `hv_vm_create`/`hv_vcpu_create` returns `HV_NO_RESOURCES`. So the real
-    /// system-wide vCPU budget is ~126 — NOT `hv_vm_get_max_vcpu_count()` (64),
-    /// which is the per-VM max vCPU count, not a system total. The old cap (12,
-    /// clamped from `hvf_cap_budget()` = 64 − reserve) was ~10× too low: it was
-    /// sourced from the wrong number and starved suites that need dozens of
-    /// simultaneously-alive processes (e.g. `ltp-fcntl36` needs ~36).
+    /// Measured via `hvf_fork_probe concurrent-ceiling` (E4,
+    /// `docs/2026-07-08-hvf-residency-e4-evidence.md`): the ceiling is a **per-VM
+    /// slot budget**, not a system-wide vCPU budget. Exactly **127** VMs
+    /// materialize across separate processes before `hv_vm_create`/
+    /// `hv_vcpu_create` returns `HV_NO_RESOURCES`, and that 127 held flat in five
+    /// quiet-host configurations while `total_vcpus` scaled 127 → 254 → 508
+    /// (`vcpus_per_vm` 1/2/4) and mapped memory scaled 0 → 16 → 64 MiB — i.e. 508
+    /// concurrent vCPUs ran fine at 127 VMs, so a materialized vCPU is not what
+    /// the ceiling counts. It is also NOT `hv_vm_get_max_vcpu_count()` (64), which
+    /// is the per-VM max vCPU count, not a system total. The old cap (12, clamped
+    /// from `hvf_cap_budget()` = 64 − reserve) was ~10× too low: it was sourced
+    /// from the wrong number and starved suites that need dozens of
+    /// simultaneously-alive processes (e.g. `ltp-fcntl36` needs ~36). An earlier
+    /// "~126" reading is superseded by the five exact-127 runs; why it read one
+    /// lower is undetermined (plausibly a 128-slot machine-wide table with one
+    /// slot consumed elsewhere, or stray live VMs on that host).
     ///
     /// The true hard limit is discovered at runtime by `HV_NO_RESOURCES` and
     /// handled with park+retry backpressure (`create_with_no_resources_backpressure`);
-    /// 120 is a soft pre-throttle margin a little under the measured ~126 to leave
-    /// headroom for other system VM consumers. It is NOT
-    /// `hv_vm_get_max_vcpu_count` (that's the per-VM max).
+    /// 120 is a soft pre-throttle margin a little under the measured 127 to leave
+    /// headroom for other system VM consumers.
     const GLOBAL_VCPU_CEILING: usize = 120;
 
     fn global_permit_budget(self) -> Option<usize> {
@@ -3760,14 +3767,12 @@ impl HvfVmState {
     /// `rebuilt_vm_cell`: the snapshot is stashed in `self.reclaim_snapshot`, and
     /// recreate uses the existing `self._vm`.)
     ///
-    /// NOT YET WIRED: the shared engine's `ThreadedEngine::save_guest_state` /
-    /// `rebind_to_slot` route through the `&self` / `&mut self.vm` `Aarch64Vmm`
-    /// reclaim hooks, which CANNOT reach the engine's separately-owned vCPU — so
-    /// they surface an error for HVF (see the `save_guest_state` impl in
-    /// `hvf_aarch64_engine.rs`). The DESTROY-IN-PLACE reclaim these methods
-    /// implement needs `&mut vcpu`, so they wait on a future engine override that
-    /// passes the vCPU through. Kept here as the ready reclaim surface.
-    #[allow(dead_code)]
+    /// WIRED via the HVF engine override `ThreadedEngine::save_guest_state`
+    /// (`hvf_aarch64_engine.rs:536`), which passes the engine's separately-owned
+    /// `&mut vcpu` through to this destroy-in-place reclaim; the wake side is
+    /// `rebind_to_slot` (`hvf_aarch64_engine.rs:557`) → [`reclaim_resume`].
+    /// This is the multi-threaded blocked-wait park (vCPU-only; the VM stays
+    /// alive) that `park_vcpu_for_blocking_wait` routes to.
     pub(crate) fn reclaim_park(
         &mut self,
         vcpu: &mut applevisor::vcpu::Vcpu,
@@ -3797,10 +3802,10 @@ impl HvfVmState {
     /// `vcpu` via `std::mem::replace` + `forget` of the old (already-destroyed)
     /// handle (no applevisor Drop).
     ///
-    /// NOT YET WIRED — see [`reclaim_park`](Self::reclaim_park): the engine's
-    /// reclaim hooks can't reach the vCPU, so this destroy/recreate-in-place
-    /// reclaim waits on a future engine override.
-    #[allow(dead_code)]
+    /// WIRED — see [`reclaim_park`](Self::reclaim_park): reached via the HVF
+    /// engine override `ThreadedEngine::rebind_to_slot`
+    /// (`hvf_aarch64_engine.rs:557`), which passes the `&mut vcpu` this
+    /// destroy/recreate-in-place reclaim needs.
     pub(crate) fn reclaim_resume(
         &mut self,
         vcpu: &mut applevisor::vcpu::Vcpu,

@@ -432,3 +432,32 @@ follow-up), churn is flat and non-degrading over 200 cycles. Acceptance = a
 today and passing after the lease extension, with `PROC_LADDER_N=160 procladder`
 staying green as the regression guard and no `perf_fork`/`perf_fork_exec`
 regression.
+
+## Addendum 2026-07-09: Track 3 implemented (slice-tick lease + fd-backed veto)
+
+The narrowed Track 3 multi-threaded lease is now **implemented and default-on**
+(evidence: `docs/2026-07-09-mt-residency-lease-evidence.md`). The shipping design
+is a **slice-tick deferred whole-VM release** (not the eager last-unparked
+release, which measurement refuted as the hot-path design — it caused
+`wait_pipe_pingpong` +867% and a forkserver wedge), damped so a fully-parked idle
+process converges to ~1 rebuild / 8 s, and gated by a **fd-backed park veto**
+(`VcpuParkClass`): any parked thread in a non-empty-fd-set wait vetoes the release,
+so fd-waiters are never stranded. Kill switch `CARRICK_MT_VM_LEASE`.
+
+Acceptance is green: `procladder_mt`@160 (4.3 s, both booleans), `procladder`@160
+regression guard green, `perf_fork` p50 2.11 ms (pump-stop fix `eadee537` took it
+from ~3.4 ms), `perf_wait_pipe_pingpong` 41.75 µs (hot path untouched), futex flat
+31.3 µs, CPython forkserver green (397 tests), LTP six-pack 6/6, `go-os_exec`
+86/86. The `MAP_SHARED`-file reacquire budget is **de-provisionalized** — the
+`FORK_SHARED_MAPS` sweep measured `desc_count = 14 + 1` per shared mapping with
+desc-linear replay (270 descs → 351/731 µs), sane. A latent cross-process
+`sigwait` stranding bug the lease timing flushed out was fixed on the way
+(`e22b689f`/`5f1a5bea`).
+
+Narrowed follow-ups (do NOT re-expand scope): (a) **resident-VM accounting** for
+the admission gate — permits under-report hard-slot residency (two manifestations:
+kill-switch fatal shape; the veto's `procladder_mixed`@160 capacity cost); (b)
+**cluster-B root cause** via an epoll/AF_UNIX manager probe = the named condition
+for lifting the fd-backed veto; (c) `skip-resume-on-idle-TimedOut` zero-churn
+endpoint; (d) xsig ring `target_tid` for thread-directed cross-process sends; (e)
+the pre-existing epoll-ET p50 debt window (`0572d32f..9baacd44`).
