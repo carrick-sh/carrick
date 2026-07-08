@@ -96,6 +96,54 @@ fn fragmented_mappings(count: usize) -> usize {
     made
 }
 
+fn shared_maps_arg_or_env() -> usize {
+    std::env::args()
+        .nth(3)
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or_else(|| env_usize("FORK_SHARED_MAPS"))
+}
+
+/// `count` disjoint MAP_SHARED mappings of ONE temp file (distinct 64 KiB
+/// offsets), each touched. Unlike the anonymous-private arena (one host
+/// backing), guest MAP_SHARED file mappings materialize host-side alias
+/// mappings — E4 §3 flagged their per-mapping stage-2 descriptor growth as
+/// the unmeasured half of the lease reacquire budget.
+fn shared_file_mappings(count: usize) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    const CHUNK: usize = 64 * 1024;
+    let path = std::ffi::CString::new("/tmp/clonebasic-shared-maps").unwrap();
+    let mut made = 0usize;
+    unsafe {
+        let fd = libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CREAT, 0o600);
+        if fd < 0 {
+            return 0;
+        }
+        if libc::ftruncate(fd, (count * CHUNK) as i64) != 0 {
+            libc::close(fd);
+            return 0;
+        }
+        for i in 0..count {
+            let p = libc::mmap(
+                std::ptr::null_mut(),
+                CHUNK,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd,
+                (i * CHUNK) as i64,
+            );
+            if p == libc::MAP_FAILED {
+                break;
+            }
+            *p.cast::<u8>() = 1;
+            made += 1;
+        }
+        libc::close(fd);
+    }
+    made
+}
+
 fn resident_memory(mem_mb: usize) -> Vec<u8> {
     let bytes = mem_mb.saturating_mul(1024 * 1024);
     let mut mem = vec![0u8; bytes];
@@ -126,6 +174,7 @@ fn main() {
     let mem_mb = mem_mb_arg_or_env();
     let mem = resident_memory(mem_mb);
     let maps_made = fragmented_mappings(maps_arg_or_env());
+    let shared_made = shared_file_mappings(shared_maps_arg_or_env());
     unsafe {
         // (1) Basic clone(SIGCHLD) — fork equivalent.
         let r = raw_clone(LINUX_SIGCHLD);
@@ -158,4 +207,5 @@ fn main() {
         hint::black_box(mem[0]);
     }
     hint::black_box(maps_made);
+    hint::black_box(shared_made);
 }
