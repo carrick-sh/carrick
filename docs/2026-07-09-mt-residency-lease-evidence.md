@@ -385,6 +385,30 @@ once at HEAD; 7 predicate evaluations, zero skips).
 
 Single-commit jump: 32.2 → 56.2 µs at the culprit; flat on both sides.
 
+Per-step medians for the remaining bisect evaluations, so the "flat on both
+sides" claim is checkable from this record alone (all bad-side steps sit in
+the same ~53–57 µs band; nothing borderline against the 42 µs threshold):
+
+| bisect step | verdict | p50 median |
+| --- | --- | --- |
+| `3843d754` fix(runtime): publish shared futex sleep after enrollment | bad | 53.79 µs |
+| `e2339d51` docs(runtime): record vet sigtrap attribution | bad | 56.58 µs |
+| `74af49ac` diagnostics(runtime): trace masked epoll readiness origin | bad | 54.46 µs |
+| `8511eccd` fix(runtime): rebind epoll survivors on close | bad | (verdict only, see below) |
+| `84a82799` fix(runtime): enforce guest cpu rlimit | good | (verdict only, see below) |
+
+**Measurement conditions** (load sensitivity is first-class, so the context
+is part of the record): all runs on a quiet host — no other carrick guests,
+no parallel builds, no active docker workloads — but two idle
+docker-registry containers (permanent host fixtures) were up throughout.
+Endpoint medians (31.58 / 54.71 µs) reproduce the campaign reference band
+(33.2 / 50.9 µs), so this is classified as measurement-context, not
+contamination. Caveat: the `git bisect run` was restarted mid-flight (tool
+timeout) and the restart truncated the stderr log, losing the raw median
+lines for the `8511eccd` and `84a82799` steps; the verdicts are authoritative
+in `git bisect log`, and the decisive `37dd7c20`/`d1276b47` pair was
+re-measured directly afterwards (56.21 / 32.21 µs above).
+
 **Mechanism hypothesis** (from the culprit diff, `dispatch/net.rs`
 `epoll_rearm_after_io` + `dispatch/mod.rs` `wake_parked`): the dup-sibling
 correctness fix put the whole ET bookkeeping pass on every successful read.
