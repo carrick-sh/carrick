@@ -344,7 +344,7 @@ pub(crate) use quiesce::{fork_barrier, pt_barrier};
 use signal::{deliver_fault_signal, lower_el0_fault};
 pub(crate) use signal::{
     deliver_pending_signal, partial_write_interrupt_outcome, raise_sigpipe_for_blocking_write,
-    signal_progress_count, signal_wait_expired, signal_wait_slice,
+    signal_progress_count, signal_wait_expired, signal_wait_remaining, signal_wait_slice,
 };
 // Test-only re-exports: the `tests` module below names these (via `use super::*`)
 // but no non-test in-crate caller does, so gate them to avoid an unused-import
@@ -1145,7 +1145,37 @@ where
                     };
                     self.waiter.ensure_full();
                     crate::run_state::publish(crate::run_state::RunState::Blocked);
-                    match self.waiter.wait(&[], Some(slice), block_mask) {
+                    // Park for reclaim-eligible waits, judged by the GUEST's
+                    // overall timeout (None = indefinite sigwait), not the
+                    // 50 ms service slice — otherwise signal-wait threads hold
+                    // vCPU + permit + (via never becoming "parked") the whole
+                    // VM forever: the sigwait-shaped procladder_mt red's
+                    // silent fork-storm stall. While parked, stretch the slice
+                    // to 1 s: real wakes arrive via the per-thread waiter kick
+                    // (`publish_pending_for` → `wake_thread_waiter`) in
+                    // microseconds; the slice is only the lost-kick safety
+                    // net, and 20 park/resume VM-rebuild cycles per second per
+                    // blocked thread would be pointless churn. A stretched
+                    // slice may overshoot a FINITE guest deadline by up to
+                    // 1 s, so only stretch when the guest wait is indefinite
+                    // or has more than 1 s left, capped at the remainder (the
+                    // TimedOut arm's `signal_wait_expired` bookkeeping is
+                    // unchanged).
+                    let guest_remaining = signal_wait_remaining(signal_wait_deadline, timeout);
+                    let reclaim = self.park_vcpu_for_timed_wait(engine, guest_remaining);
+                    let slice = match (reclaim.is_some(), guest_remaining) {
+                        (true, None) => slice.max(Duration::from_secs(1)),
+                        (true, Some(remaining)) if remaining > Duration::from_secs(1) => {
+                            slice.max(Duration::from_secs(1)).min(remaining)
+                        }
+                        _ => slice,
+                    };
+                    let wait_result = self.waiter.wait(&[], Some(slice), block_mask);
+                    if let Some(outcome) = self.exec_replaced_thread_exit() {
+                        return Ok(outcome);
+                    }
+                    self.resume_vcpu_after_blocking_wait(engine, reclaim)?;
+                    match wait_result {
                         crate::io_wait::WaitResult::Ready => continue,
                         crate::io_wait::WaitResult::TimedOut => {
                             if signal_wait_expired(signal_wait_deadline) {
