@@ -17,6 +17,7 @@ use std::ffi::CString;
 use std::ptr;
 use std::thread;
 use std::time::Instant;
+use std::{env, hint};
 
 const ITERS: usize = 200;
 const WARMUP: usize = 20;
@@ -27,6 +28,24 @@ fn nproc() -> usize {
     thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(0)
+}
+
+fn env_usize(key: &str) -> usize {
+    env::var(key)
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(0)
+}
+
+fn resident_memory(mem_mb: usize) -> Vec<u8> {
+    let bytes = mem_mb.saturating_mul(1024 * 1024);
+    let mut mem = vec![0u8; bytes];
+    let mut i = 0usize;
+    while i < mem.len() {
+        mem[i] = 1;
+        i = i.saturating_add(4096);
+    }
+    mem
 }
 
 /// Reap `pid`, retrying through EINTR; abort the probe on any anomaly so a broken
@@ -60,6 +79,8 @@ fn main() {
     if std::env::args().any(|a| a == CHILD_MARKER) {
         unsafe { libc::_exit(0) };
     }
+    let mem_mb = env_usize("FORK_MEM_MB");
+    let mem = resident_memory(mem_mb);
 
     // Resolve our own binary once (the exec target). Under the gate this is
     // /tmp/p; native it is bench-native's release binary. Both are absolute, so
@@ -113,5 +134,9 @@ fn main() {
     println!("fork_exec_p95_us={:.3}", pct(0.95));
     println!("fork_exec_min_us={:.3}", samples_ns[0] as f64 / 1000.0);
     println!("iters={}", samples_ns.len());
+    println!("mem_mb={mem_mb}");
     println!("nproc={}", nproc());
+    if !mem.is_empty() {
+        hint::black_box(mem[0]);
+    }
 }

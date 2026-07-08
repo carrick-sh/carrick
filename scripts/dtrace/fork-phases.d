@@ -51,6 +51,19 @@ carrick*:::fork-lifecycle
     @lifecycle_count[(int)arg0, (int)arg1] = count();
 }
 
+carrick*:::fork-footprint
+/(pid == $target || progenyof($target))/
+{
+    printf("[%d] fork-footprint phase=%d regions=%d arena_high_water=%d resident_bytes=%d virtual_bytes=%d\n",
+        pid, (int)arg0, (uint64_t)arg1, (uint64_t)arg2, (uint64_t)arg3,
+        (uint64_t)arg4);
+    @footprint_regions[(int)arg0] = avg((uint64_t)arg1);
+    @footprint_arena_high_water[(int)arg0] = avg((uint64_t)arg2);
+    @footprint_resident_bytes[(int)arg0] = avg((uint64_t)arg3);
+    @footprint_virtual_bytes[(int)arg0] = avg((uint64_t)arg4);
+    @footprint_count[(int)arg0] = count();
+}
+
 carrick*:::fork-post
 /(pid == $target || progenyof($target)) && fork_start[pid]/
 {
@@ -120,6 +133,11 @@ dtrace:::END
     printa("rebuild descs role=%d phase=%d %@d\n", @rebuild_descs);
     printa("lifecycle us role=%d phase=%d %@d\n", @lifecycle_us);
     printa("lifecycle count role=%d phase=%d %@d\n", @lifecycle_count);
+    printa("footprint regions phase=%d %@d\n", @footprint_regions);
+    printa("footprint arena_high_water phase=%d %@d\n", @footprint_arena_high_water);
+    printa("footprint resident_bytes phase=%d %@d\n", @footprint_resident_bytes);
+    printa("footprint virtual_bytes phase=%d %@d\n", @footprint_virtual_bytes);
+    printa("footprint count phase=%d %@d\n", @footprint_count);
     printa("child post-to-exit avg us %@d\n", @child_post_to_exit_us);
     printa("parent post-to-exit avg us %@d\n", @parent_post_to_exit_us);
 }

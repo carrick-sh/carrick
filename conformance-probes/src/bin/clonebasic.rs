@@ -31,9 +31,35 @@
 //! Deterministic output: booleans only, one line per assertion.
 
 use conformance_probes::{errno, report};
+use std::{env, hint};
 
 const CLONE_THREAD: u64 = 0x0001_0000;
 const LINUX_SIGCHLD: u64 = 17;
+
+fn env_usize(key: &str) -> usize {
+    env::var(key)
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(0)
+}
+
+fn mem_mb_arg_or_env() -> usize {
+    std::env::args()
+        .nth(1)
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or_else(|| env_usize("FORK_MEM_MB"))
+}
+
+fn resident_memory(mem_mb: usize) -> Vec<u8> {
+    let bytes = mem_mb.saturating_mul(1024 * 1024);
+    let mut mem = vec![0u8; bytes];
+    let mut i = 0usize;
+    while i < mem.len() {
+        mem[i] = 1;
+        i = i.saturating_add(4096);
+    }
+    mem
+}
 
 /// Raw clone via the aarch64 syscall — the kernel ABI, not glibc's fork
 /// wrapper. `clone(flags, child_stack=NULL, ...)`: NULL stack means the child
@@ -51,6 +77,8 @@ fn reap(pid: i32) -> bool {
 }
 
 fn main() {
+    let mem_mb = mem_mb_arg_or_env();
+    let mem = resident_memory(mem_mb);
     unsafe {
         // (1) Basic clone(SIGCHLD) — fork equivalent.
         let r = raw_clone(LINUX_SIGCHLD);
@@ -78,5 +106,8 @@ fn main() {
             clone_thread_alone_rc_neg_one = r == -1,
             clone_thread_alone_errno_einval = er == libc::EINVAL,
         );
+    }
+    if !mem.is_empty() {
+        hint::black_box(mem[0]);
     }
 }

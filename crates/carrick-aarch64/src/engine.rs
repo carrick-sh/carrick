@@ -101,6 +101,10 @@ pub struct Aarch64EngineCore<V: Aarch64Vmm> {
     /// restores on wake. The same host thread saves/restores, so a plain `Option`
     /// field.
     reclaim_snapshot: Option<Aarch64VcpuSnapshot>,
+
+    /// Runtime-published mmap-arena high-water used only for fork footprint
+    /// diagnostics. The runtime refreshes it immediately before every fork.
+    fork_arena_high_water: u64,
 }
 
 impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
@@ -123,6 +127,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             page_tables: Arc::new(Mutex::new(None)),
             protections: Arc::new(MemoryProtections::default()),
             reclaim_snapshot: None,
+            fork_arena_high_water: u64::MAX,
         }
     }
 
@@ -221,6 +226,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             page_tables,
             protections,
             reclaim_snapshot: None,
+            fork_arena_high_water: u64::MAX,
         }
     }
 
@@ -726,6 +732,20 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
     }
 }
 
+fn emit_fork_footprint(phase: i32, arena_high_water: u64) {
+    let vm_region_count = carrick_host::host_proc::self_vm_region_count().unwrap_or(0);
+    let usage = carrick_host::host_proc::self_resource_usage();
+    let resident_bytes = usage.map(|u| u.resident_bytes).unwrap_or(0);
+    let virtual_bytes = usage.map(|u| u.virtual_bytes).unwrap_or(0);
+    carrick_observability::probes::fork_footprint(
+        phase,
+        vm_region_count,
+        arena_high_water,
+        resident_bytes,
+        virtual_bytes,
+    );
+}
+
 // ─── RegAccess ───────────────────────────────────────────────────────────────
 
 impl<V: Aarch64Vmm> carrick_hal::RegAccess for Aarch64EngineCore<V> {
@@ -970,6 +990,7 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
         // calling thread is the only active one here, so no other thread holds the
         // malloc lock (or any other process-global lock) at fork time, and the child
         // inherits a consistent allocator state.
+        emit_fork_footprint(0, self.fork_arena_high_water);
         let phase_start = std::time::Instant::now();
         let pid = unsafe { libc::fork() };
         let fork_elapsed = elapsed_us(phase_start);
@@ -1223,6 +1244,10 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
 
     fn vcpu_budget() -> usize {
         V::vcpu_budget()
+    }
+
+    fn set_vfork_arena_high_water(&mut self, high_water: u64) {
+        self.fork_arena_high_water = high_water;
     }
 
     fn reclaims(&self) -> bool {
