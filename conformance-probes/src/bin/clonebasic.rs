@@ -50,6 +50,52 @@ fn mem_mb_arg_or_env() -> usize {
         .unwrap_or_else(|| env_usize("FORK_MEM_MB"))
 }
 
+fn maps_arg_or_env() -> usize {
+    std::env::args()
+        .nth(2)
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or_else(|| env_usize("FORK_MAPS"))
+}
+
+/// Fragment the guest VA space before the fork: `count` disjoint 64 KiB
+/// anonymous mappings, each followed by a 64 KiB munmap hole so neighbors
+/// can never coalesce, with every other region dropped to PROT_READ so the
+/// host also sees protection boundaries. Touches one byte per 4 KiB page so
+/// the kept pages are resident. Returns how many regions were made.
+fn fragmented_mappings(count: usize) -> usize {
+    const KEEP: usize = 64 * 1024;
+    const SPAN: usize = 128 * 1024;
+    let mut made = 0usize;
+    for i in 0..count {
+        let p = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                SPAN,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if p == libc::MAP_FAILED {
+            break;
+        }
+        let mut off = 0usize;
+        while off < KEEP {
+            unsafe { *p.cast::<u8>().add(off) = 1 };
+            off += 4096;
+        }
+        unsafe {
+            libc::munmap(p.cast::<u8>().add(KEEP).cast(), SPAN - KEEP);
+            if i % 2 == 1 {
+                libc::mprotect(p, KEEP, libc::PROT_READ);
+            }
+        }
+        made += 1;
+    }
+    made
+}
+
 fn resident_memory(mem_mb: usize) -> Vec<u8> {
     let bytes = mem_mb.saturating_mul(1024 * 1024);
     let mut mem = vec![0u8; bytes];
@@ -79,6 +125,7 @@ fn reap(pid: i32) -> bool {
 fn main() {
     let mem_mb = mem_mb_arg_or_env();
     let mem = resident_memory(mem_mb);
+    let maps_made = fragmented_mappings(maps_arg_or_env());
     unsafe {
         // (1) Basic clone(SIGCHLD) — fork equivalent.
         let r = raw_clone(LINUX_SIGCHLD);
@@ -110,4 +157,5 @@ fn main() {
     if !mem.is_empty() {
         hint::black_box(mem[0]);
     }
+    hint::black_box(maps_made);
 }
