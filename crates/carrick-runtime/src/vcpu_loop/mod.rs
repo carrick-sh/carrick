@@ -714,8 +714,13 @@ where
     /// Post-release ticks stretch progressively (2s→4s→8s, caller-managed)
     /// so a long-idle process converges to ~1 rebuild per 8 s. The better
     /// endpoint — SKIP the resume/re-park round trip entirely on an idle
-    /// TimedOut tick — is deliberately NOT attempted here (deadline/EINTR
-    /// bookkeeping risk); it is the named follow-up.
+    /// TimedOut tick — is now IMPLEMENTED: both slicing arms wrap the wait in
+    /// an inner re-wait loop, so a fully-idle parked process re-arms without
+    /// resuming/re-parking (deadline + EINTR bookkeeping stays inside the
+    /// loop; a finite deadline expiry, a real wake, or a non-parked short
+    /// wait still breaks out to the single resume). A long-idle MT process
+    /// therefore holds zero HVF VMs and issues ~1 rebuild for the whole idle
+    /// span (the boot + final wake), not one per stretched tick.
     ///
     /// Returns true iff the process VM is released when this returns (this
     /// call released it, or it was already released) — the caller uses it to
@@ -987,8 +992,10 @@ where
         // whole-VM release succeeds, then 2s→4s→8s (reset to 1 s on any
         // real wake) so a long-idle released process converges to ~1
         // rebuild per 8 s. The better endpoint — skip the resume/re-park
-        // round trip entirely on an idle TimedOut tick — is deliberately
-        // not attempted (deadline/EINTR bookkeeping risk); named follow-up.
+        // round trip entirely on an idle TimedOut tick — is now implemented:
+        // each slicing arm's inner re-wait loop re-arms an idle parked tick
+        // without resuming, so a long-idle process pays ~1 rebuild for the
+        // whole idle span instead of one per stretched tick.
         let mut parked_slice_stretch: Duration = Duration::from_secs(1);
         // Monotonic deadline for a WaitOnSleep, established on first dispatch and
         // preserved across quiesce-park re-dispatch so the sleep isn't restarted.
@@ -1330,6 +1337,15 @@ where
                         guest_remaining,
                         crate::thread::VcpuParkClass::ReleaseSafe,
                     );
+                    // Inner re-wait loop: an idle parked TimedOut tick re-arms
+                    // the wait WITHOUT the resume/re-park round trip (the
+                    // "skip-resume-on-idle-TimedOut" endpoint named by the
+                    // 2026-07-09 evidence doc). Every tick still: re-checks
+                    // the finite guest deadline, advances the full-slice
+                    // count, and may attempt the deferred whole-VM upgrade.
+                    // Any non-TimedOut result (or a deadline expiry, or a
+                    // non-parked wait) breaks out to the single resume below.
+                    //
                     // While parked, stretch the service slice: 1 s by
                     // default; after a successful whole-VM release the
                     // progression below widens it 2s→4s→8s so a long-idle
@@ -1339,28 +1355,53 @@ where
                     // wait's final <1 s window keeps 50 ms slices (and, via
                     // the full-slice gate below, never attempts an upgrade
                     // at that rate).
-                    let slice = match (reclaim.is_some(), guest_remaining) {
-                        (true, None) => slice.max(parked_slice_stretch),
-                        (true, Some(remaining)) if remaining > Duration::from_secs(1) => {
-                            slice.max(parked_slice_stretch).min(remaining)
+                    let wait_result = loop {
+                        let guest_remaining = signal_wait_remaining(signal_wait_deadline, timeout);
+                        let slice_eff = match (reclaim.is_some(), guest_remaining) {
+                            (true, None) => slice.max(parked_slice_stretch),
+                            (true, Some(remaining)) if remaining > Duration::from_secs(1) => {
+                                slice.max(parked_slice_stretch).min(remaining)
+                            }
+                            _ => slice,
+                        };
+                        let was_parked_full_slice =
+                            reclaim.is_some() && slice_eff >= Duration::from_secs(1);
+                        // Deferred MT whole-VM upgrade: only from the SECOND
+                        // parked full slice on (≈1 s provably idle), and only
+                        // when the CURRENT tick is itself a full ≥1 s slice —
+                        // the first tick and any short-slice tick stay
+                        // vCPU-only, so hot signal waits and finite-wait tail
+                        // windows never pay the release+rebuild round trip.
+                        let released = was_parked_full_slice
+                            && parked_full_slices >= 1
+                            && self.try_upgrade_vm_release_on_slice_tick(engine);
+                        let result = self.waiter.wait(&[], Some(slice_eff), block_mask);
+                        if let Some(outcome) = self.exec_replaced_thread_exit() {
+                            return Ok(outcome);
                         }
-                        _ => slice,
+                        match result {
+                            crate::io_wait::WaitResult::TimedOut => {
+                                if was_parked_full_slice {
+                                    parked_full_slices = parked_full_slices.saturating_add(1);
+                                    if released {
+                                        // Post-release progression: 2s→4s→8s.
+                                        parked_slice_stretch = (parked_slice_stretch * 2)
+                                            .clamp(Duration::from_secs(2), Duration::from_secs(8));
+                                    }
+                                }
+                                if signal_wait_expired(signal_wait_deadline) {
+                                    break result; // finite deadline: resume, then EAGAIN below
+                                }
+                                if reclaim.is_none() {
+                                    break result; // vCPU live (short-wait class): keep the old re-dispatch cadence
+                                }
+                                // Idle parked tick: skip the resume/re-park
+                                // round trip entirely and re-arm the wait.
+                                continue;
+                            }
+                            other => break other,
+                        }
                     };
-                    let was_parked_full_slice =
-                        reclaim.is_some() && slice >= Duration::from_secs(1);
-                    // Deferred MT whole-VM upgrade: only from the SECOND
-                    // parked full slice on (≈1 s provably idle), and only
-                    // when the CURRENT tick is itself a full ≥1 s slice —
-                    // the first tick and any short-slice tick stay
-                    // vCPU-only, so hot signal waits and finite-wait tail
-                    // windows never pay the release+rebuild round trip.
-                    let released = was_parked_full_slice
-                        && parked_full_slices >= 1
-                        && self.try_upgrade_vm_release_on_slice_tick(engine);
-                    let wait_result = self.waiter.wait(&[], Some(slice), block_mask);
-                    if let Some(outcome) = self.exec_replaced_thread_exit() {
-                        return Ok(outcome);
-                    }
                     self.resume_vcpu_after_blocking_wait(engine, reclaim)?;
                     match wait_result {
                         crate::io_wait::WaitResult::Ready => {
@@ -1375,14 +1416,6 @@ where
                             continue;
                         }
                         crate::io_wait::WaitResult::TimedOut => {
-                            if was_parked_full_slice {
-                                parked_full_slices = parked_full_slices.saturating_add(1);
-                                if released {
-                                    // Post-release progression: 2s→4s→8s.
-                                    parked_slice_stretch = (parked_slice_stretch * 2)
-                                        .clamp(Duration::from_secs(2), Duration::from_secs(8));
-                                }
-                            }
                             if signal_wait_expired(signal_wait_deadline) {
                                 break Ok(DispatchOutcome::Errno {
                                     errno: crate::linux_abi::LINUX_EAGAIN,
@@ -1462,6 +1495,14 @@ where
                         Some(remaining_until_deadline),
                         crate::thread::VcpuParkClass::ReleaseSafe,
                     );
+                    // Inner re-wait loop (see the WaitOnSignals arm): an idle
+                    // parked TimedOut tick re-arms the wait WITHOUT the
+                    // resume/re-park round trip. Every tick re-checks the
+                    // sleep deadline, advances the full-slice count, and may
+                    // attempt the deferred whole-VM upgrade. Any non-TimedOut
+                    // result (or the deadline elapsing, or a non-parked wait)
+                    // breaks out to the single resume below.
+                    //
                     // While PARKED, stretch the 50 ms service slice (same
                     // capped rule + post-release 2s→4s→8s progression as the
                     // WaitOnSignals arm): interrupts arrive via the waiter
@@ -1470,29 +1511,58 @@ where
                     // park/resume cycles per second. Only when >1 s remains,
                     // capped at the remainder, so the deadline check below
                     // is unaffected.
-                    let wait_for =
-                        if reclaim.is_some() && remaining_until_deadline > Duration::from_secs(1) {
+                    let wait_result = loop {
+                        let now = Instant::now();
+                        if now >= deadline {
+                            break crate::io_wait::WaitResult::TimedOut;
+                        }
+                        let remaining_until_deadline = deadline - now;
+                        let wait_for = if reclaim.is_some()
+                            && remaining_until_deadline > Duration::from_secs(1)
+                        {
                             remaining_until_deadline.min(parked_slice_stretch)
                         } else {
                             remaining_until_deadline.min(Duration::from_millis(50))
                         };
-                    let was_parked_full_slice =
-                        reclaim.is_some() && wait_for >= Duration::from_secs(1);
-                    // Deferred MT whole-VM upgrade: second+ parked full slice
-                    // only, and only when the CURRENT tick is a full slice
-                    // (see the WaitOnSignals arm).
-                    let released = was_parked_full_slice
-                        && parked_full_slices >= 1
-                        && self.try_upgrade_vm_release_on_slice_tick(engine);
-                    let wait_result = self.waiter.wait_with_dispatch_pending(
-                        &[],
-                        Some(wait_for),
-                        carrick_abi::SigBlockMask::NONE,
-                        sleep_interrupt_pending,
-                    );
-                    if let Some(outcome) = self.exec_replaced_thread_exit() {
-                        return Ok(outcome);
-                    }
+                        let was_parked_full_slice =
+                            reclaim.is_some() && wait_for >= Duration::from_secs(1);
+                        // Deferred MT whole-VM upgrade: second+ parked full slice
+                        // only, and only when the CURRENT tick is a full slice
+                        // (see the WaitOnSignals arm).
+                        let released = was_parked_full_slice
+                            && parked_full_slices >= 1
+                            && self.try_upgrade_vm_release_on_slice_tick(engine);
+                        let result = self.waiter.wait_with_dispatch_pending(
+                            &[],
+                            Some(wait_for),
+                            carrick_abi::SigBlockMask::NONE,
+                            sleep_interrupt_pending,
+                        );
+                        if let Some(outcome) = self.exec_replaced_thread_exit() {
+                            return Ok(outcome);
+                        }
+                        match result {
+                            crate::io_wait::WaitResult::TimedOut => {
+                                if was_parked_full_slice {
+                                    parked_full_slices = parked_full_slices.saturating_add(1);
+                                    if released {
+                                        parked_slice_stretch = (parked_slice_stretch * 2)
+                                            .clamp(Duration::from_secs(2), Duration::from_secs(8));
+                                    }
+                                }
+                                if Instant::now() >= deadline {
+                                    break result; // deadline elapsed: resume, then Returned{0} below
+                                }
+                                if reclaim.is_none() {
+                                    break result; // vCPU live (short-wait class): keep the old 50 ms cadence
+                                }
+                                // Idle parked tick: skip the resume/re-park
+                                // round trip entirely and re-arm the wait.
+                                continue;
+                            }
+                            other => break other,
+                        }
+                    };
                     self.resume_vcpu_after_blocking_wait(engine, reclaim)?;
                     match wait_result {
                         crate::io_wait::WaitResult::Ready => {
@@ -1500,13 +1570,6 @@ where
                             continue;
                         }
                         crate::io_wait::WaitResult::TimedOut => {
-                            if was_parked_full_slice {
-                                parked_full_slices = parked_full_slices.saturating_add(1);
-                                if released {
-                                    parked_slice_stretch = (parked_slice_stretch * 2)
-                                        .clamp(Duration::from_secs(2), Duration::from_secs(8));
-                                }
-                            }
                             if Instant::now() >= deadline {
                                 break Ok(DispatchOutcome::Returned { value: 0 });
                             }
