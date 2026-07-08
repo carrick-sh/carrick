@@ -360,7 +360,7 @@ mod tests {
             l.header
                 .run_token
                 .store(0x5eed, std::sync::atomic::Ordering::Release);
-            std::process::exit(0);
+            unsafe { libc::_exit(0) };
         }
         let mut status = 0;
         unsafe { libc::waitpid(child, &mut status, 0) };
