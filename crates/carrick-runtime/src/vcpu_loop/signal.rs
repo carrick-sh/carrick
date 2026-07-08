@@ -26,6 +26,24 @@ pub(crate) fn signal_wait_expired(deadline: Option<Instant>) -> bool {
     deadline.is_some_and(|target| Instant::now() >= target)
 }
 
+/// The GUEST's remaining overall signal-wait budget: `None` for an indefinite
+/// `sigwait`/`rt_sigtimedwait(NULL)`, else the time left until the deadline
+/// `signal_wait_slice` established (call this AFTER it, in the same loop
+/// iteration, so a finite wait's deadline exists). This is what the vCPU park
+/// decision must be judged by — the 50 ms service slice is carrick-internal
+/// and would otherwise make every signal wait look "short" and never park.
+pub(crate) fn signal_wait_remaining(
+    deadline: Option<Instant>,
+    timeout: Option<Duration>,
+) -> Option<Duration> {
+    match timeout {
+        None => None,
+        Some(timeout) => Some(deadline.map_or(timeout, |target| {
+            target.saturating_duration_since(Instant::now())
+        })),
+    }
+}
+
 pub(crate) fn raise_sigpipe_for_blocking_write(
     dispatcher: &SyscallDispatcher,
     write: &crate::dispatch::BlockingHostWrite,
