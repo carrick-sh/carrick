@@ -39,7 +39,7 @@
 //!     stacks. Both were real (the field docstrings cite the cases).
 //!   - `process_pending` / `process_rt_pending_counts` are the SHARED
 //!     thread-group pending set for a process-directed signal that no thread
-//!     can take immediately (every thread blocks it). `take_pending_in`
+//!     can take immediately (every thread blocks it). `take_pending_in_from`
 //!     considers it alongside the per-thread set so ANY thread that next
 //!     unblocks — or that calls `rt_sigtimedwait`/`sigwait` — can consume it.
 //!   - `rt_pending_counts` gives real-time signals (SIGRTMIN..=SIGRTMAX) POSIX
@@ -122,7 +122,7 @@ pub(super) struct SignalState {
     /// Queue depth for pending REAL-TIME signals, keyed by `(tid, signum)`.
     /// RT signals must deliver once per send (POSIX queuing), unlike standard
     /// signals which coalesce — so N `rt_sigqueueinfo`/`kill` of an RT signal
-    /// while blocked must yield N deliveries on unblock. `take_pending_in`
+    /// while blocked must yield N deliveries on unblock. `take_pending_in_from`
     /// decrements this and only clears the pending bit when it hits 0.
     pub rt_pending_counts: HashMap<(crate::thread::ThreadId, i32), u32>,
     /// SHARED (process-level) pending set (bit `signum-1`) for PROCESS-directed
@@ -132,7 +132,7 @@ pub(super) struct SignalState {
     /// unblocks it (`rt_sigprocmask` -> `take_deliverable_pending`) OR dequeues
     /// it synchronously (`rt_sigtimedwait`/sigwait). Pinning it to the SENDER's
     /// per-thread set instead stranded a SIBLING's `sigwait` forever (CPython
-    /// test_sigwait_thread). `take_pending_in` considers this alongside the
+    /// test_sigwait_thread). `take_pending_in_from` considers this alongside the
     /// per-thread set so any thread can consume it.
     pub process_pending: SigSet,
     /// Queue depth for SHARED pending REAL-TIME signals, keyed by `signum`
@@ -855,7 +855,7 @@ impl SyscallDispatcher {
             // pending set, NOT to the tid that happened to run this drain.
             // Pinning it to the drainer stranded the signal forever when the
             // drain race was won by a thread that blocks `signum` (the
-            // procladder_mt pause()-sibling): `take_pending_in(main, set)` only
+            // procladder_mt pause()-sibling): `take_pending_in_from(main, set)` only
             // consults `pendings[main] ∪ process_pending`, so the sigwait-ing
             // main thread never saw it — the whole-process silent stall. Same
             // bug class as the process_pending doc's CPython
@@ -971,7 +971,7 @@ impl SyscallDispatcher {
     /// pending signal OUTSIDE the wait set (pending in the dispatcher's sets,
     /// the host slot, or the cross-process xsignal ring). The run loop then
     /// returns EINTR and its delivery tail runs the handler — re-dispatching
-    /// instead would `take_pending_in(wait_set)`, find nothing, and RE-PARK,
+    /// instead would `take_pending_in_from(wait_set)`, find nothing, and RE-PARK,
     /// wedging `rt_sigtimedwait(set=∅)` forever (the kvm-lane LTP
     /// sigtimedwait01/sigwaitinfo01 TIMEOUT cluster). A wait-set signal (or a
     /// consumed/spurious wake) returns false: re-dispatch dequeues it and
@@ -997,25 +997,26 @@ impl SyscallDispatcher {
             )
     }
 
-    /// Lowest-numbered pending signal for `tid` that intersects `set`, cleared
-    /// from that thread's pending set OR the shared process pending set. Used by
-    /// `rt_sigtimedwait`/sigwait and `take_deliverable_pending`. The union lets
-    /// any thread consume a process-directed signal held in the shared set
-    /// (`process_pending`), matching Linux's thread-group shared pending.
+    /// Provenance-less convenience over [`Self::take_pending_in_from`] for the
+    /// dispatcher tests, which assert on which signum is taken, not its store.
+    #[cfg(test)]
     fn take_pending_in(&self, tid: crate::thread::ThreadId, set: SigSet) -> Option<i32> {
         self.take_pending_in_from(tid, set)
             .map(|(signum, _)| signum)
     }
 
-    /// [`Self::take_pending_in`] with PROVENANCE: the `bool` is true when the
-    /// signal came from the thread's own pending set, false when it was a
-    /// process-directed signal consumed from the shared set. The caller must
-    /// fetch the matching queued siginfo from the SAME store
-    /// (`take_pending_siginfo` vs `take_process_pending_siginfo`): pairing a
-    /// per-thread take with the shared queue (or vice versa) lets two
-    /// same-signum instances swap payloads (e.g. a host-slot delivery stealing
-    /// an adopted-child SIGCHLD's si_pid or an SI_QUEUE si_value while the
-    /// shared pending bit stays set).
+    /// Lowest-numbered pending signal for `tid` that intersects `set`, cleared
+    /// from that thread's pending set OR the shared process pending set, with
+    /// PROVENANCE: the `bool` is true when the signal came from the thread's
+    /// own pending set, false when it was a process-directed signal consumed
+    /// from the shared set (`process_pending` — the union matches Linux's
+    /// thread-group shared pending). Used by `rt_sigtimedwait`/sigwait and
+    /// `take_deliverable_pending`. The caller must fetch the matching queued
+    /// siginfo from the SAME store (`take_pending_siginfo` vs
+    /// `take_process_pending_siginfo`): pairing a per-thread take with the
+    /// shared queue (or vice versa) lets two same-signum instances swap
+    /// payloads (e.g. a host-slot delivery stealing an adopted-child SIGCHLD's
+    /// si_pid or an SI_QUEUE si_value while the shared pending bit stays set).
     fn take_pending_in_from(
         &self,
         tid: crate::thread::ThreadId,
