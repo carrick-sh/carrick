@@ -823,6 +823,73 @@ impl NsSharedRegion {
         true
     }
 
+    /// Release records whose owner host pid is FULLY gone (no live process and
+    /// no zombie — `is_gone` is the supervisor's `kill(pid, 0) == ESRCH`
+    /// re-check, the same liveness discipline as the vCPU-permit reaper's
+    /// backstop) and whose exit no live guest waiter can still consume.
+    ///
+    /// This is the NsSupervisor's leak backstop for fork children that are
+    /// never waited on (SIGCHLD set to SIG_IGN, or the parent exited without a
+    /// subreaper reap): their terminal reap never runs `unregister_reaped`, so
+    /// only the supervisor can return those records to the section before it
+    /// exhausts. Records that still carry a consumable exit — a published
+    /// adopted exit status (`exit_ready`), or a harvested §3.4 status on a
+    /// dead ns member — are kept while their waiter (the recorded parent, or
+    /// the ns-init for an orphan) is alive.
+    ///
+    /// A zombie still answers `kill(pid, 0)` with success, so a dead-but-
+    /// unreaped child whose live parent can still `wait4` it is naturally
+    /// kept until that terminal reap (or the parent's own death) happens.
+    /// Returns the number of records released.
+    pub fn sweep_dead_owner_records(&self, is_gone: &dyn Fn(u32) -> bool) -> usize {
+        let init = self.init_host_pid();
+        let mut released = 0;
+        for (index, record) in self.section.records.iter().enumerate() {
+            let host_pid = record.host_pid.load(Ordering::Acquire);
+            if host_pid == 0 || host_pid == HOST_PID_REGISTERING || host_pid == init {
+                continue;
+            }
+            // Run-state TID entries carry thread ids, not process pids; the
+            // liveness predicate is meaningless for them and they are owned
+            // by the run-state table.
+            if record.run_state.load(Ordering::Acquire) & RUN_STATE_KIND_TID != 0 {
+                continue;
+            }
+            let generation = record.generation.load(Ordering::Acquire);
+            if generation == 0 {
+                continue;
+            }
+            if !is_gone(host_pid) || self.awaiting_guest_reap(record, is_gone) {
+                continue;
+            }
+            // Generation-checked release: a concurrent reuse of this slot
+            // (new generation) makes the release a no-op.
+            self.section.release(ProcessRecordRef {
+                index,
+                generation: ProcessGeneration::new(generation),
+            });
+            released += 1;
+        }
+        released
+    }
+
+    /// Whether a gone owner's record still carries an exit some LIVE guest
+    /// process can consume through `wait4` (see `sweep_dead_owner_records`).
+    fn awaiting_guest_reap(&self, record: &ProcessRecord, is_gone: &dyn Fn(u32) -> bool) -> bool {
+        let flags = record.flags.load(Ordering::Acquire);
+        let consumable = record.exit_ready.load(Ordering::Acquire) != 0
+            || (record.ns_pid.load(Ordering::Acquire) != 0 && flags & MEMBER_DEAD != 0);
+        if !consumable {
+            return false;
+        }
+        let waiter = if flags & MEMBER_ORPHANED != 0 {
+            self.init_host_pid()
+        } else {
+            record.parent_host_pid.load(Ordering::Acquire)
+        };
+        waiter != 0 && !is_gone(waiter)
+    }
+
     fn member_records(&self) -> impl Iterator<Item = &ProcessRecord> {
         self.section.records.iter().filter(|record| {
             let host_pid = record.host_pid.load(Ordering::Acquire);
@@ -1046,6 +1113,104 @@ mod tests {
         slot.host_pid.store(200, Ordering::Release);
         assert_eq!(region.host_to_ns(200), Some(2));
         assert_eq!(region.ns_to_host(2), Some(200));
+    }
+
+    #[test]
+    fn sweep_releases_records_of_gone_owners_with_no_live_waiter() {
+        // The leak this closes: a fork child that is never waited on (parent
+        // exited without a subreaper reap) keeps its record forever; 4096 of
+        // them exhaust the section. Once the owner host pid is FULLY gone (no
+        // process, no zombie — the launchd reap already happened) and no live
+        // guest waiter can still consume its exit, the supervisor sweep must
+        // release the record.
+        let region = test_region();
+        region.section.init_host_pid.store(100, Ordering::Relaxed);
+        assert_eq!(region.register(100, NS_INIT_PID, 0), Some(0));
+
+        // A namespace member whose parent (300) is itself gone.
+        assert!(region.register(300, region.alloc_ns_pid(), 100).is_some());
+        assert!(region.register(301, region.alloc_ns_pid(), 300).is_some());
+        // A plain child-table record (no ns membership).
+        let generation = ProcessGeneration::new(77);
+        region
+            .section
+            .claim(Some(HostPid::new(400)), generation, |record| {
+                record.parent_host_pid.store(300, Ordering::Relaxed);
+                record.flags.store(MEMBER_ALIVE, Ordering::Relaxed);
+            })
+            .expect("claim child-table record");
+
+        let gone = |pid: u32| pid == 300 || pid == 301 || pid == 400;
+        let released = region.sweep_dead_owner_records(&gone);
+
+        assert_eq!(released, 3, "all three gone-owner records are released");
+        assert_eq!(region.host_to_ns(300), None);
+        assert_eq!(region.host_to_ns(301), None);
+        assert!(region.section.find(HostPid::new(400)).is_none());
+        // The live init is untouched.
+        assert_eq!(region.host_to_ns(100), Some(NS_INIT_PID));
+    }
+
+    #[test]
+    fn sweep_keeps_records_awaiting_a_live_guest_reap() {
+        let region = test_region();
+        region.section.init_host_pid.store(100, Ordering::Relaxed);
+        assert_eq!(region.register(100, NS_INIT_PID, 0), Some(0));
+
+        // An adopted child published its exit status for a LIVE subreaper
+        // (parent 100): the record is the subreaper's only way to wait4 it
+        // after launchd took the host zombie — it must survive the sweep.
+        assert!(region.register(500, region.alloc_ns_pid(), 100).is_some());
+        let i = region.slot_of(500).expect("member slot");
+        region.section.records[i]
+            .exit_ready
+            .store(1, Ordering::Release);
+
+        // An orphaned, dead ns member with a harvested exit status (§3.4):
+        // the live ns-init may still reap it.
+        assert!(region.register(501, region.alloc_ns_pid(), 999).is_some());
+        region.mark_children_orphaned(999);
+        region.mark_dead(501, 7);
+
+        let gone = |pid: u32| pid == 500 || pid == 501 || pid == 999;
+        let released = region.sweep_dead_owner_records(&gone);
+
+        assert_eq!(released, 0, "records awaiting a live guest reap are kept");
+        assert_eq!(region.host_to_ns(500), Some(2));
+        assert_eq!(region.host_to_ns(501), Some(3));
+
+        // Once the waiters are gone too, both records are releasable.
+        let all_gone = |pid: u32| pid != 0;
+        let released = region.sweep_dead_owner_records(&all_gone);
+        assert_eq!(released, 2, "gone waiters make the records releasable");
+    }
+
+    #[test]
+    fn sweep_skips_live_owners_and_tid_entries() {
+        let region = test_region();
+        region.section.init_host_pid.store(100, Ordering::Relaxed);
+        assert_eq!(region.register(100, NS_INIT_PID, 0), Some(0));
+        assert!(region.register(600, region.alloc_ns_pid(), 100).is_some());
+
+        // A run-state TID entry can carry a thread id in host_pid; the
+        // liveness predicate is meaningless for it and it is owned by the
+        // run-state table, not the process sweep.
+        let generation = ProcessGeneration::new(88);
+        region
+            .section
+            .claim(Some(HostPid::new(601)), generation, |record| {
+                record
+                    .run_state
+                    .store(RUN_STATE_KIND_TID, Ordering::Relaxed);
+            })
+            .expect("claim tid record");
+
+        let gone = |pid: u32| pid == 601;
+        let released = region.sweep_dead_owner_records(&gone);
+
+        assert_eq!(released, 0, "live owners and TID entries are untouched");
+        assert_eq!(region.host_to_ns(600), Some(2));
+        assert!(region.section.find(HostPid::new(601)).is_some());
     }
 
     #[test]
