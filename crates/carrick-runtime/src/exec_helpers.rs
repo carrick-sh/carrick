@@ -259,6 +259,7 @@ pub(crate) fn forked_child_exit(
             pid as i32,
             0,
             0,
+            0,
         );
         crate::host_signal::xsig_nudge(parent as i32);
     }
@@ -334,6 +335,7 @@ pub(crate) fn forked_child_die_by_signal(
             crate::linux_abi::LINUX_SIGCHLD,
             0,
             pid as i32,
+            0,
             0,
             0,
         );

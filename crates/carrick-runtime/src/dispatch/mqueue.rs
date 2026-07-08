@@ -934,6 +934,7 @@ fn deliver_notify(
                 crate::namespace::pid::self_ns_pid() as i32,
                 this.cred_snapshot().ruid,
                 value,
+                0,
             ) {
                 crate::host_signal::xsig_nudge(pid);
             } else {
