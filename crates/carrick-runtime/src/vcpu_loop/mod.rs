@@ -91,6 +91,20 @@ fn mt_vm_lease_enabled() -> bool {
     })
 }
 
+/// TEST-ONLY: `CARRICK_MT_VM_LEASE_FDBACKED=1` swaps `try_release_vm_mt`'s
+/// re-check from the shipped class-aware `all_other_parked_release_safe`
+/// (fd-backed parks veto the release) to the class-blind `all_other_parked`
+/// — the reproducible form of the veto-neutered mutation that surfaced
+/// cluster B (b01e18e2). Default OFF (false); truthy only on the literal
+/// value `"1"`, mirroring `mt_vm_lease_enabled` above. This does not ship —
+/// it exists so the `procladder_epollmgr` probe can drive the same
+/// release-under-fd-waiters shape the cluster-B cores showed, without
+/// deleting the shipping veto.
+fn mt_vm_lease_fdbacked_release_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CARRICK_MT_VM_LEASE_FDBACKED").is_some_and(|v| v == "1"))
+}
+
 // ---------------------------------------------------------------------------
 // NON-engine helpers the generic loop calls.
 //
@@ -785,11 +799,21 @@ where
             // waker has claimed yet: the VM is already gone.
             return true;
         }
-        if !self.registry.all_other_parked_release_safe(self.this_tid) {
+        let release_safe = if mt_vm_lease_fdbacked_release_enabled() {
+            // TEST-ONLY (CARRICK_MT_VM_LEASE_FDBACKED=1): treat fd-backed
+            // parks as release-safe — the reproducible form of the
+            // procladder_mixed mutation check (b01e18e2). The veto stays the
+            // shipping default until cluster B is root-caused (the recorded
+            // reviewer condition).
+            self.registry.all_other_parked(self.this_tid)
+        } else {
+            self.registry.all_other_parked_release_safe(self.this_tid)
+        };
+        if !release_safe {
             // A sibling woke (its unpark cleared its mark) — it is about to
-            // re-create its vCPU — or a parked sibling is in an FD-BACKED
-            // wait, whose wake path must never see the VM released from
-            // under it (attribution cluster B). The VM stays.
+            // re-create its vCPU — or (default veto) a parked sibling is in
+            // an FD-BACKED wait, whose wake path must never see the VM
+            // released from under it (attribution cluster B). The VM stays.
             return false;
         }
         match engine.release_vm_after_reclaim_park() {

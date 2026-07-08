@@ -146,12 +146,13 @@ pub enum VcpuParkClass {
 /// so a sibling's wake between a park verdict and the teardown downgrades
 /// the release instead of racing it.
 ///
-/// Test-pinned quantifier surface (no production caller, kept because the
-/// unit tests pin the quantifier semantics the re-check builds on): the
-/// last-unparked verdict `park_vcpu_classified` RETURNS — production call
-/// sites discard it (`let _ =`); the slice-tick upgrader decides via the
-/// re-check, not the verdict — and the class-blind `all_other_vcpus_parked`
-/// query.
+/// Test-pinned quantifier surface: the last-unparked verdict
+/// `park_vcpu_classified` RETURNS — production call sites discard it
+/// (`let _ =`); the slice-tick upgrader decides via the re-check, not the
+/// verdict. The class-blind `all_other_parked` query has no production
+/// caller by DEFAULT, but `try_release_vm_mt` swaps to it under
+/// `CARRICK_MT_VM_LEASE_FDBACKED=1` (test-only knob reproducing the
+/// veto-neutered release for the cluster-B investigation).
 struct RegistryInner {
     map: HashMap<ThreadId, ThreadEntry>,
     /// Set by whichever thread RELEASES the VM — a single-threaded park
@@ -482,12 +483,14 @@ impl ThreadRegistry {
     }
 
     /// True iff every live thread OTHER than `tid` is currently vcpu-parked
-    /// (any class). Test-pinned quantifier surface: the shipped release
-    /// re-check is the class-aware [`Self::all_other_parked_release_safe`]
-    /// (this class-blind variant has no production caller); kept because
-    /// the unit tests pin the all-others-parked quantifier semantics both
+    /// (any class). The shipped release re-check is the class-aware
+    /// [`Self::all_other_parked_release_safe`]; this class-blind query has
+    /// one production caller — `try_release_vm_mt`'s re-check swaps to it
+    /// under `CARRICK_MT_VM_LEASE_FDBACKED=1` (test-only knob reproducing
+    /// the veto-neutered release for the cluster-B investigation) — plus the
+    /// unit tests that pin the all-others-parked quantifier semantics both
     /// queries share.
-    pub fn all_other_vcpus_parked(&self, tid: ThreadId) -> bool {
+    pub fn all_other_parked(&self, tid: ThreadId) -> bool {
         let inner = self.inner.lock();
         inner
             .map
@@ -496,7 +499,13 @@ impl ThreadRegistry {
             .all(|(_, e)| e.vcpu_parked.is_some())
     }
 
-    /// [`Self::all_other_vcpus_parked`] AND every one of those parks is
+    /// Thin alias for [`Self::all_other_parked`] — kept so existing tests
+    /// naming the original symbol keep compiling.
+    pub fn all_other_vcpus_parked(&self, tid: ThreadId) -> bool {
+        self.all_other_parked(tid)
+    }
+
+    /// [`Self::all_other_parked`] AND every one of those parks is
     /// [`VcpuParkClass::ReleaseSafe`] — the MT whole-VM release's actual
     /// under-lock re-check: a parked FD-BACKED waiter (whose wake path under
     /// a released VM has an un-root-caused gap — the CPython forkserver
@@ -1158,6 +1167,30 @@ mod tests {
         // teardown must flip the re-check to false — the downgrade trigger.
         assert!(!reg.unpark_vcpu(t2));
         assert!(!reg.all_other_vcpus_parked(t1), "t2 woke: downgrade");
+    }
+
+    #[test]
+    fn all_other_parked_ignores_park_class() {
+        let reg = ThreadRegistry::new(ThreadId::synthetic_for_tests(2045));
+        let t1 = reg.main_tid();
+        let t2 = reg.register_child(0);
+        let t3 = reg.register_child(0);
+        // t2 parked fd-backed, t3 parked release-safe; t1 (main) never
+        // parked, matching the existing fd_backed_park_vetoes_ test's
+        // "last-unparked" bookkeeping (park_vcpu_classified reports false
+        // for both since t1 stays unparked throughout).
+        assert!(!reg.park_vcpu_classified(t2, VcpuParkClass::FdBacked));
+        assert!(!reg.park_vcpu_classified(t3, VcpuParkClass::ReleaseSafe));
+        // Class-blind query: both others are parked (any class) -> true.
+        assert!(
+            reg.all_other_parked(t1),
+            "both siblings parked, regardless of class"
+        );
+        // Class-aware re-check still vetoes on the fd-backed park.
+        assert!(
+            !reg.all_other_parked_release_safe(t1),
+            "fd-backed park vetoes the class-aware recheck"
+        );
     }
 
     #[test]
