@@ -3996,6 +3996,12 @@ impl HvfVmState {
         snap: &VcpuSnapshot,
         is_child: bool,
     ) -> Result<(), TrapError> {
+        let role = if is_child { 1 } else { 0 };
+        let rebuild_start = std::time::Instant::now();
+        let elapsed_us = |start: std::time::Instant| -> u64 {
+            let micros = start.elapsed().as_micros();
+            micros.min(u128::from(u64::MAX)) as u64
+        };
         // Take the descriptors stashed in `fork_prepare_and_teardown`. The parent
         // re-maps its own buffers (`mapping_descs`); the child re-maps the private
         // snapshots / shared originals (`child_descs`). The unused set drops here.
@@ -4078,6 +4084,10 @@ impl HvfVmState {
         // buffers; the CHILD maps the pre-fork private snapshots for PRIVATE
         // regions and the shared originals for guest-MAP_SHARED ones.
         let descs = if is_child { child_descs } else { mapping_descs };
+        let desc_count = descs.len() as u64;
+        crate::probes::fork_rebuild(role, 0, desc_count, 0, 0);
+        let local_map_start = std::time::Instant::now();
+        let mut local_maps = 0u64;
         for desc in descs {
             let host_addr = desc.host.ptr();
             let perms_raw: u64 = u64::from(desc.perms);
@@ -4097,6 +4107,7 @@ impl HvfVmState {
                     code: r as u32,
                 });
             }
+            local_maps = local_maps.saturating_add(1);
             // Re-register every high-VA alias into the process-shared index with
             // THIS rebuild's host_addr. Critical for the CHILD: the index is
             // COW-inherited from the parent pointing at the PARENT's backings, but
@@ -4138,6 +4149,7 @@ impl HvfVmState {
                 shared_key_offset: desc.shared_key_offset,
             });
         }
+        crate::probes::fork_rebuild(role, 1, desc_count, local_maps, elapsed_us(local_map_start));
 
         // PARENT post-vfork: restore VM_INHERIT_COPY on the regions we shared for
         // this vfork (set VM_INHERIT_SHARE in fork_prepare_and_teardown), so a LATER
@@ -4168,10 +4180,13 @@ impl HvfVmState {
         // here (memory/host_mapping = None) so the parent never frees a buffer the
         // sibling owns. The CHILD is single-threaded post-fork (uses child_descs),
         // so it must NOT inherit sibling aliases — hence parent only.
+        let mut sibling_maps = 0u64;
         if !is_child {
             let mut mapped_ipas: std::collections::HashSet<u64> =
                 self.mappings.iter().map(|m| m.ipa).collect();
             let siblings = sibling_fork_mappings().lock().clone();
+            let sibling_count = siblings.len() as u64;
+            let sibling_map_start = std::time::Instant::now();
             for sm in siblings {
                 if !mapped_ipas.insert(sm.ipa) {
                     continue;
@@ -4192,6 +4207,7 @@ impl HvfVmState {
                         code: r as u32,
                     });
                 }
+                sibling_maps = sibling_maps.saturating_add(1);
                 self.mappings.push(HvfMappedRegion {
                     start: sm.start,
                     ipa: sm.ipa,
@@ -4207,6 +4223,13 @@ impl HvfVmState {
                     shared_key_offset: sm.shared_key_offset,
                 });
             }
+            crate::probes::fork_rebuild(
+                role,
+                2,
+                sibling_count,
+                sibling_maps,
+                elapsed_us(sibling_map_start),
+            );
         }
 
         // Restore vCPU register state from the engine's pre-fork snapshot. Both
@@ -4215,6 +4238,7 @@ impl HvfVmState {
         // parent, 0 for child).
         HvfInner::restore_vcpu_into(vcpu, snap)?;
         self.last_exit_class = snap.last_exit_class;
+        crate::probes::fork_rebuild(role, 3, desc_count, local_maps, elapsed_us(rebuild_start));
         let post_pid = if is_child {
             0
         } else {
