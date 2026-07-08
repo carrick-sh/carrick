@@ -552,6 +552,15 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         self.rebind_to_slot(slot, snapshot, vcpu)
     }
 
+    /// MT whole-VM lease — VM-only release by the LAST parker, whose own vCPU
+    /// was already destroyed by [`Self::save_guest_state`] (snapshot stashed;
+    /// compatible with the shared-wait resume). `Ok(true)` iff whole-VM state
+    /// was released. Default `Ok(false)`: the backend has no whole-VM state
+    /// to release (KVM), and the caller keeps the park vCPU-only.
+    fn release_vm_after_reclaim_park(&mut self) -> Result<bool, TrapError> {
+        Ok(false)
+    }
+
     /// [`Self::rebind_shared_wait_state`] for a MULTI-THREADED parked process
     /// (the whole-VM residency lease): the first waker rebuilds the process VM
     /// for every still-parked sibling, so the mapping replay must carry the

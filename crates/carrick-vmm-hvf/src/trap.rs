@@ -3849,6 +3849,33 @@ impl HvfVmState {
         Ok(())
     }
 
+    /// MT whole-VM lease — VM-only release by the LAST parker of a
+    /// multi-threaded process. Its own vCPU was ALREADY destroyed by
+    /// [`Self::reclaim_park`] (the snapshot is stashed in `reclaim_snapshot`,
+    /// the same field [`Self::shared_wait_resume`] restores from), and every
+    /// sibling's registry "parked" mark is set only AFTER its own
+    /// `reclaim_park` destroy — so when the runtime's re-check passes, zero
+    /// vCPUs are live and the bare `hv_vm_destroy` succeeds. Any nonzero rc
+    /// (e.g. HV_BUSY from a vCPU in a teardown window the registry no longer
+    /// tracks, like a thread mid-exit) is a clean error: the VM was NOT
+    /// destroyed, and the caller must NOT set the vm-released flag — the park
+    /// stays vCPU-only and the wake side stays `reclaim_resume`.
+    pub(crate) fn release_vm_after_reclaim_park(&mut self) -> Result<(), TrapError> {
+        if self.reclaim_snapshot.is_none() {
+            return Err(TrapError::Hypervisor(
+                "release_vm_after_reclaim_park: no parked snapshot (reclaim_park did not run)"
+                    .into(),
+            ));
+        }
+        let vm_rc = unsafe { applevisor_sys::hv_vm_destroy() };
+        if vm_rc != 0 {
+            return Err(TrapError::Hypervisor(format!(
+                "release_vm_after_reclaim_park: hv_vm_destroy rc={vm_rc:#x}"
+            )));
+        }
+        Ok(())
+    }
+
     /// Resume a process parked by [`Self::shared_wait_park`]: create a fresh VM
     /// and vCPU, re-map this process's existing host backings, then restore the
     /// saved guest registers.
@@ -3886,6 +3913,16 @@ impl HvfVmState {
         std::mem::forget(std::mem::replace(vcpu, new_vcpu));
         replace_destroyed_vm(self, new_vm);
 
+        // Snapshot the registry's CURRENT membership before the replay: an
+        // alias another thread `munmap`'d while we were parked was removed
+        // from the registry (`unregister_alias`) but may still sit in this
+        // thread's per-thread `mappings` list — re-REGISTERING it below would
+        // resurrect a dead index entry that a later syscall/fault could
+        // resolve to a freed backing. Registration is creation-complete
+        // (every `add_alias` registers; removal happens only on munmap /
+        // execve-clear), so absence here means "gone on purpose".
+        let registered_ipas: std::collections::HashSet<u64> =
+            alias_registry().lock().iter().map(|e| e.ipa).collect();
         for mapping in &self.mappings {
             let r = unsafe {
                 applevisor_sys::hv_vm_map(
@@ -3903,7 +3940,7 @@ impl HvfVmState {
                     code: r as u32,
                 });
             }
-            if crate::memory::is_high_va(mapping.start) {
+            if crate::memory::is_high_va(mapping.start) && registered_ipas.contains(&mapping.ipa) {
                 register_shared_alias(AliasBacking {
                     start: mapping.start,
                     ipa: mapping.ipa,

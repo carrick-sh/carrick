@@ -111,6 +111,16 @@ struct ThreadEntry {
 /// `park_vcpu`'s last-unparked check and `unpark_vcpu`'s claim of the
 /// rebuild flag are each one atomic critical section, not two locks that
 /// could race against each other.
+///
+/// The vCPU-parking contract is FIVE methods: `park_vcpu` (mark + the
+/// last-unparked verdict; on the MT path the caller marks only AFTER its
+/// vCPU is actually destroyed, so the mark is truthful), `unpark_vcpu`
+/// (clear + atomically claim the rebuild), `set_vm_released` /
+/// `vm_released` (the flag itself), and — the addendum —
+/// `all_other_vcpus_parked`, the last-parker's re-check taken under the
+/// process topology lock, atomically with the VM teardown, so a sibling's
+/// wake between the `park_vcpu` verdict and the teardown downgrades the
+/// whole-VM release instead of racing it.
 struct RegistryInner {
     map: HashMap<ThreadId, ThreadEntry>,
     /// Set by the thread that parks last (see `park_vcpu`) once it has torn
