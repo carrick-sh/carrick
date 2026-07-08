@@ -1,23 +1,31 @@
 //! Mixed-wait variant of `procladder_mt`: N simultaneously-alive children,
 //! each TWO-threaded with DIFFERENT wait classes — a std::thread sibling
 //! looping a LONG `nanosleep(3s)` (a slicing, RELEASE-SAFE park) plus the
-//! main thread blocked in a pipe `read()` (an FD-BACKED park). This is the
-//! standing red-first gate for the MT whole-VM residency lease's fd-backed
-//! VETO: a parked fd-backed waiter must never have the process VM released
-//! from under it (the fd-wait wake path has an un-root-caused wake gap when
-//! the VM is released — the CPython forkserver wedge,
-//! task-6-regression-attribution.md cluster B, cores cr-attr-fs.*).
+//! main thread blocked in a pipe `read()` (an FD-BACKED park).
+//!
+//! WHAT THIS PROBE IS (per the mutation-check finding): an attempt-vs-veto
+//! MECHANISM gate — every iteration provably drives a whole-VM release
+//! ATTEMPT from the sleeper into the fd-backed reader's veto — and the
+//! standing wake-correctness proof for whenever fd-backed releases get
+//! enabled (the named condition: root-causing the cluster-B wake gap,
+//! task-6-regression-attribution.md, cores cr-attr-fs.*). It is NOT a
+//! veto-REMOVAL detector: neutering the veto keeps it green (measured:
+//! 8/8 children released their VMs and every pipe-read fd-waiter still
+//! woke via kqueue, claimed, and union-rebuilt correctly) — the cluster-B
+//! wedge needs a richer shape (epoll/AF_UNIX manager) than a plain pipe
+//! read.
 //!
 //! The sleeper MUST out-sleep the lease's full-slice threshold or the probe
 //! is VACUOUS (re-review finding: an earlier 300 ms-loop draft never drove
-//! the upgrade at all — deleting the veto kept it green). The slice-tick
-//! upgrade fires only from the SECOND completed full ≥1 s parked slice, and
-//! a parked slice is stretched to ≥1 s only while MORE than 1 s of guest
-//! wait remains — a short sleep loop parks on 50 ms service slices forever
-//! and never attempts the upgrade. With a 3 s sleep the sleeper completes a
-//! full slice at ~1 s and ATTEMPTS the upgrade from its next full tick
-//! (inside the parent's pre-write window), so the fd-backed main thread's
-//! veto is genuinely load-bearing on every iteration.
+//! the upgrade at all — deleting the veto kept it green for the wrong
+//! reason). The slice-tick upgrade fires only from the SECOND completed
+//! full ≥1 s parked slice, and a parked slice is stretched to ≥1 s only
+//! while MORE than 1 s of guest wait remains — a short sleep loop parks on
+//! 50 ms service slices forever and never attempts the upgrade. With a 3 s
+//! sleep the sleeper completes a full slice at ~1 s and ATTEMPTS the
+//! upgrade from its next full tick (inside the parent's pre-write window),
+//! so the fd-backed main thread's veto is genuinely load-bearing on every
+//! iteration.
 //!
 //! The parent waits past that would-be release (>2.5 s) before writing one
 //! byte to every child's pipe; a child whose fd-waiter was stranded by a
@@ -26,8 +34,7 @@
 //! unbounded), not as a false boolean — acceptable, documented here. The
 //! parent ignores SIGPIPE so a child that died early (closed read end)
 //! degrades to clean false booleans instead of a crash-red on the wake
-//! write. If/when fd-backed releases are enabled (wake gap root-caused),
-//! this probe is the proof fd-waiters wake correctly.
+//! write.
 //!
 //! Invariants encoded:
 //!   * ladder_forked_all — all N forks succeeded
@@ -60,12 +67,14 @@ fn child_body(read_fd: libc::c_int) -> ! {
         // main thread's fd-backed read() park below must VETO. (A short
         // sleep never drives the upgrade and makes the probe vacuous — see
         // the module doc.)
-        std::thread::spawn(|| loop {
-            let ts = libc::timespec {
-                tv_sec: 3,
-                tv_nsec: 0,
-            };
-            libc::nanosleep(&ts, std::ptr::null_mut());
+        std::thread::spawn(|| {
+            loop {
+                let ts = libc::timespec {
+                    tv_sec: 3,
+                    tv_nsec: 0,
+                };
+                libc::nanosleep(&ts, std::ptr::null_mut());
+            }
         });
         // Fd-backed main thread: block in read() until the parent's wake
         // byte arrives. EINTR is retried; EOF or an error is a failure exit.
