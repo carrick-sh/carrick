@@ -751,17 +751,23 @@ impl SyscallDispatcher {
         signum: i32,
     ) -> Option<LinuxSiginfo> {
         let mut signal = self.signal.lock();
-        if let Some(queue) = signal.pending_siginfos.get_mut(&(tid, signum)) {
-            let front = queue.pop_front();
-            if queue.is_empty() {
-                signal.pending_siginfos.remove(&(tid, signum));
-            }
-            return front;
+        let queue = signal.pending_siginfos.get_mut(&(tid, signum))?;
+        let front = queue.pop_front();
+        if queue.is_empty() {
+            signal.pending_siginfos.remove(&(tid, signum));
         }
-        // Fall back to the PROCESS-directed queue: a shared-set signal (e.g. a
-        // cross-process kill drained from the xsignal ring) is consumed by
-        // whichever thread dequeues it, and that thread's per-tid queue has no
-        // entry for it.
+        front
+    }
+
+    /// Pop the next queued `siginfo_t` for a PROCESS-directed `signum` consumed
+    /// from the SHARED pending set (e.g. a cross-process kill drained from the
+    /// xsignal ring). Provenance-gated companion of [`Self::take_pending_siginfo`]:
+    /// call this ONLY when the take reported a shared-set origin
+    /// (`take_pending_in_from` → `from_thread == false`), so a same-signum
+    /// per-thread/host-slot delivery can never steal a queued process-directed
+    /// payload while the shared bit is still set.
+    pub(crate) fn take_process_pending_siginfo(&self, signum: i32) -> Option<LinuxSiginfo> {
+        let mut signal = self.signal.lock();
         let queue = signal.process_pending_siginfos.get_mut(&signum)?;
         let front = queue.pop_front();
         if queue.is_empty() {
@@ -880,8 +886,18 @@ impl SyscallDispatcher {
     /// before the next is injected, matching the kernel's deliver-all-pending-
     /// before-returning-to-userspace behaviour. None when none remain.
     pub fn take_deliverable_pending(&self, tid: crate::thread::ThreadId) -> Option<i32> {
+        self.take_deliverable_pending_from(tid).map(|(s, _)| s)
+    }
+
+    /// [`Self::take_deliverable_pending`] with provenance (`from_thread`), so
+    /// the delivery path can fetch the queued siginfo from the matching store
+    /// (see [`Self::take_pending_in_from`]).
+    pub(crate) fn take_deliverable_pending_from(
+        &self,
+        tid: crate::thread::ThreadId,
+    ) -> Option<(i32, bool)> {
         let mask = self.signal.lock().mask_for(tid);
-        self.take_pending_in(tid, mask.complement())
+        self.take_pending_in_from(tid, mask.complement())
     }
 
     /// True iff dispatcher-owned signal state has a pending signal deliverable
@@ -987,6 +1003,24 @@ impl SyscallDispatcher {
     /// any thread consume a process-directed signal held in the shared set
     /// (`process_pending`), matching Linux's thread-group shared pending.
     fn take_pending_in(&self, tid: crate::thread::ThreadId, set: SigSet) -> Option<i32> {
+        self.take_pending_in_from(tid, set)
+            .map(|(signum, _)| signum)
+    }
+
+    /// [`Self::take_pending_in`] with PROVENANCE: the `bool` is true when the
+    /// signal came from the thread's own pending set, false when it was a
+    /// process-directed signal consumed from the shared set. The caller must
+    /// fetch the matching queued siginfo from the SAME store
+    /// (`take_pending_siginfo` vs `take_process_pending_siginfo`): pairing a
+    /// per-thread take with the shared queue (or vice versa) lets two
+    /// same-signum instances swap payloads (e.g. a host-slot delivery stealing
+    /// an adopted-child SIGCHLD's si_pid or an SI_QUEUE si_value while the
+    /// shared pending bit stays set).
+    fn take_pending_in_from(
+        &self,
+        tid: crate::thread::ThreadId,
+        set: SigSet,
+    ) -> Option<(i32, bool)> {
         let mut signal = self.signal.lock();
         let per_thread = signal.pendings.get(&tid).copied().unwrap_or(SigSet::EMPTY);
         let shared = signal.process_pending;
@@ -1008,7 +1042,7 @@ impl SyscallDispatcher {
                     .saturating_sub(1);
                 if remaining > 0 {
                     signal.rt_pending_counts.insert(key, remaining);
-                    return Some(signum); // more queued — leave the bit set
+                    return Some((signum, from_thread)); // more queued — leave the bit set
                 }
                 signal.rt_pending_counts.remove(&key);
                 signal.pendings.insert(tid, per_thread.without(signum));
@@ -1021,19 +1055,19 @@ impl SyscallDispatcher {
                     .saturating_sub(1);
                 if remaining > 0 {
                     signal.process_rt_pending_counts.insert(signum, remaining);
-                    return Some(signum); // more queued — leave the bit set
+                    return Some((signum, from_thread)); // more queued — leave the bit set
                 }
                 signal.process_rt_pending_counts.remove(&signum);
                 signal.process_pending = signal.process_pending.without(signum);
             }
-            return Some(signum);
+            return Some((signum, from_thread));
         }
         if from_thread {
             signal.pendings.insert(tid, per_thread.without(signum));
         } else {
             signal.process_pending = signal.process_pending.without(signum);
         }
-        Some(signum)
+        Some((signum, from_thread))
     }
 
     /// `read(2)` on a signalfd: drain pending signals matching the fd's `mask`
@@ -1059,7 +1093,7 @@ impl SyscallDispatcher {
         let max = length / SIGINFO_LEN;
         let mut out: Vec<u8> = Vec::new();
         for _ in 0..max {
-            let Some(signum) = self.take_pending_in(tid, mask) else {
+            let Some((signum, from_thread)) = self.take_pending_in_from(tid, mask) else {
                 break;
             };
             let mut rec = [0u8; SIGINFO_LEN];
@@ -1067,8 +1101,14 @@ impl SyscallDispatcher {
             rec[0..4].copy_from_slice(&(signum as u32).to_le_bytes());
             // Carry a queued rt_sigqueueinfo payload's code/pid/uid if present.
             // LinuxSiginfo packs si_pid (low 32) and si_uid (high 32) into
-            // si_addr (see LinuxSiginfo::kill).
-            if let Some(info) = self.take_pending_siginfo(tid, signum) {
+            // si_addr (see LinuxSiginfo::kill). Provenance-gated (see
+            // take_pending_in_from).
+            let queued = if from_thread {
+                self.take_pending_siginfo(tid, signum)
+            } else {
+                self.take_process_pending_siginfo(signum)
+            };
+            if let Some(info) = queued {
                 rec[8..12].copy_from_slice(&info.si_code.to_le_bytes()); // ssi_code @8
                 let pid = (info.si_addr & 0xffff_ffff) as u32;
                 let uid = (info.si_addr >> 32) as u32;
@@ -1792,10 +1832,16 @@ impl SyscallDispatcher {
 
             this.drain_xsignals_for_tid(tid);
             let memory = &mut *cx.memory;
-            if let Some(signum) = this.take_pending_in(tid, wait_set) {
+            if let Some((signum, from_thread)) = this.take_pending_in_from(tid, wait_set) {
                 // Carry any queued rt_sigqueueinfo payload (si_code/pid/uid/value)
                 // into the caller's siginfo, not just si_signo. (audit M9)
-                let queued = this.take_pending_siginfo(tid, signum);
+                // Provenance-gated: a per-thread take must not steal a queued
+                // PROCESS-directed payload (and vice versa).
+                let queued = if from_thread {
+                    this.take_pending_siginfo(tid, signum)
+                } else {
+                    this.take_process_pending_siginfo(signum)
+                };
                 return Ok(rt_sigtimedwait_deliver(memory, info_ptr, signum, queued));
             }
             let signum = crate::host_signal::take_pending_in_for(tid.raw(), wait_set);
@@ -2546,6 +2592,125 @@ mod tests {
         // guards the `ppollunblock` regression.
         assert!(
             d.has_deliverable_dispatch_pending_for_wait(tid, WaitSigMask::Replace(SigSet::EMPTY))
+        );
+    }
+
+    /// Pins the procladder_mt silent-stall root cause: a PROCESS-directed
+    /// signal drained from the cross-process xsignal ring by a thread that is
+    /// NOT the eventual consumer (the pause()-sibling winning the drain race)
+    /// must land in the SHARED pending set — visible to a sibling thread's
+    /// sigwait — and carry the sender's identity with it. Pre-fix, the drain
+    /// pinned it to the drainer (`mark_signal_pending(drainer)`), and the
+    /// `take_pending_in(main, …)` below returned None forever: the whole-
+    /// process wedge.
+    #[test]
+    fn ring_drain_publishes_process_directed_signal_visible_to_non_drainer() {
+        let d = SyscallDispatcher::new();
+        let main = crate::thread::ThreadId::synthetic_for_tests(6001);
+        let sibling = crate::thread::ThreadId::synthetic_for_tests(6002);
+        let usr1 = crate::linux_abi::LINUX_SIGUSR1;
+        // Probe shape: BOTH threads block SIGUSR1 (main consumes via sigwait,
+        // the sibling can never take delivery).
+        d.restore_signal_mask(main, SigSet::EMPTY.with(usr1));
+        d.restore_signal_mask(sibling, SigSet::EMPTY.with(usr1));
+
+        carrick_signal_core::xsig::xsig_init();
+        assert!(
+            carrick_signal_core::xsig::xsig_enqueue(
+                std::process::id() as i32,
+                usr1,
+                crate::linux_abi::LINUX_SI_USER,
+                4242,
+                1000,
+                0,
+            ),
+            "ring slot available"
+        );
+        // The SIBLING wins the drain race (the hang's interleaving).
+        d.drain_xsignals_for_tid(sibling);
+
+        // Nothing may be pinned to the drainer…
+        assert!(
+            d.take_pending_siginfo(sibling, usr1).is_none(),
+            "drain must not pin the payload to the drainer tid"
+        );
+        // …the MAIN thread's sigwait take must find it in the shared set…
+        let set = SigSet::EMPTY.with(usr1);
+        let (signum, from_thread) = d
+            .take_pending_in_from(main, set)
+            .expect("process-directed signal must be visible to the non-drainer's sigwait");
+        assert_eq!(signum, usr1);
+        assert!(!from_thread, "consumed from the SHARED set");
+        // …with the sender's identity travelling alongside.
+        let info = d
+            .take_process_pending_siginfo(usr1)
+            .expect("siginfo payload follows the shared set");
+        assert_eq!(
+            (info.si_addr & 0xffff_ffff) as i32,
+            4242,
+            "sender ns-pid survives the drain"
+        );
+        // Exactly-once: nothing left for a second take.
+        assert_eq!(d.take_pending_in(main, set), None);
+    }
+
+    /// Provenance gate: a per-tid (host-slot-style) delivery of the SAME
+    /// signum must not steal a queued PROCESS-directed payload while the
+    /// shared pending bit is still set — and each take pairs with the siginfo
+    /// from its own store.
+    #[test]
+    fn per_tid_delivery_does_not_steal_process_directed_payload() {
+        let d = SyscallDispatcher::new();
+        let main = crate::thread::ThreadId::synthetic_for_tests(6003);
+        let chld = crate::linux_abi::LINUX_SIGCHLD;
+        let set = SigSet::EMPTY.with(chld);
+
+        // Shared-set instance with payload (the ring-drain shape).
+        d.signal
+            .lock()
+            .process_pending_siginfos
+            .entry(chld)
+            .or_default()
+            .push_back(LinuxSiginfo::kill(
+                chld,
+                crate::linux_abi::LINUX_SI_USER,
+                7777,
+                0,
+            ));
+        d.mark_process_signal_pending(chld);
+
+        // Host-slot-style per-tid fetch (per-tid queue EMPTY): must NOT
+        // consume the shared queue (an ungated fallback returned 7777 here,
+        // swapping payloads between two same-signum instances).
+        assert!(
+            d.take_pending_siginfo(main, chld).is_none(),
+            "per-tid siginfo fetch must not consume the process-directed queue"
+        );
+
+        // With a per-tid instance ALSO queued: the per-thread take pairs with
+        // the per-tid payload…
+        d.mark_signal_pending(main, chld);
+        d.record_pending_siginfo(
+            main,
+            chld,
+            LinuxSiginfo::kill(chld, crate::linux_abi::LINUX_SI_USER, 1111, 0),
+        );
+        let (s1, from_thread1) = d.take_pending_in_from(main, set).unwrap();
+        assert_eq!(
+            (s1, from_thread1),
+            (chld, true),
+            "per-thread instance first"
+        );
+        assert_eq!(
+            (d.take_pending_siginfo(main, chld).unwrap().si_addr & 0xffff_ffff) as i32,
+            1111
+        );
+        // …and the shared instance + payload remain intact for the shared take.
+        let (s2, from_thread2) = d.take_pending_in_from(main, set).unwrap();
+        assert_eq!((s2, from_thread2), (chld, false));
+        assert_eq!(
+            (d.take_process_pending_siginfo(chld).unwrap().si_addr & 0xffff_ffff) as i32,
+            7777
         );
     }
 
