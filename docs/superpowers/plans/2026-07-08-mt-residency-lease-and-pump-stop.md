@@ -620,6 +620,58 @@ if rebuild_vm {
 
 `wait_on_shared_word_retval` (`threads.rs:239-256`) inlines the same park logic (branching on `live_count() == 1`) and its resume twin later in the same function stores `Some((st, old_slot))`. Replace the inline park block with a call to `self.park_vcpu_for_blocking_wait(engine)` and the resume with `self.resume_vcpu_after_blocking_wait(engine, reclaim)?`, converting the local tuple to the `BlockingWaitReclaim` the mod.rs methods use (both files are `impl` blocks of the same loop struct — verify and, if the tuple carries anything `BlockingWaitReclaim` lacks, extend `BlockingWaitReclaim` rather than keeping two shapes). This makes the shared-futex wait path (the E4-era `shared_wait_park` trigger) and every other blocking wait go through ONE park/resume pair.
 
+- [ ] **Step 4b: Close the signal-wait park gap (discovered by Task 2's sigwait red)**
+
+`DispatchOutcome::WaitOnSignals` (`mod.rs:1032-1088`) never calls any `park_vcpu_*` — a thread blocked in `sigwait`/`rt_sigtimedwait` keeps its vCPU, its global permit, AND (via never becoming "parked") blocks the whole-VM release for its process, forever. Task 2 measured the consequence: 160 sigwait-blocked children silently stall the fork storm in the unbounded permit wait (0 bytes of output, no admission-trace lines — the permit backoff loop has none). Mirror the `WaitOnSleep` arm's shape (`mod.rs:1122-1134`):
+
+```rust
+DispatchOutcome::WaitOnSignals {
+    wait_set,
+    block_mask,
+    timeout,
+} => {
+    let slice = match signal_wait_slice(&mut signal_wait_deadline, timeout) {
+        Some(slice) => slice,
+        None => {
+            break Ok(DispatchOutcome::Errno {
+                errno: crate::linux_abi::LINUX_EAGAIN,
+            });
+        }
+    };
+    self.waiter.ensure_full();
+    crate::run_state::publish(crate::run_state::RunState::Blocked);
+    // Park for reclaim-eligible waits, judged by the GUEST's overall
+    // timeout (None = indefinite sigwait), not the 50 ms service slice —
+    // otherwise signal-wait threads hold vCPU+permit+VM forever (the
+    // sigwait-shaped procladder_mt red). While parked, stretch the slice:
+    // real wakes arrive via the waiter kick in microseconds; the slice is
+    // only the lost-kick safety net, and 20 park/resume cycles per second
+    // per blocked thread would be pointless VM churn.
+    let guest_remaining = signal_wait_remaining(signal_wait_deadline, timeout);
+    let reclaim = self.park_vcpu_for_timed_wait(engine, guest_remaining);
+    let slice = if reclaim.is_some() {
+        slice.max(Duration::from_secs(1))
+    } else {
+        slice
+    };
+    let wait_result = self.waiter.wait(&[], Some(slice), block_mask);
+    if let Some(outcome) = self.exec_replaced_thread_exit() {
+        return Ok(outcome);
+    }
+    self.resume_vcpu_after_blocking_wait(engine, reclaim)?;
+    match wait_result {
+        // ... existing match arms unchanged ...
+```
+
+where `signal_wait_remaining` is a small helper next to `signal_wait_slice` returning the guest's remaining total timeout (`None` for an indefinite wait; `Some(deadline - now)` otherwise — reuse `signal_wait_deadline`'s existing bookkeeping; read `signal_wait_slice` first and match its conventions). Keep the existing `TimedOut`/`Interrupted`/`Ready` arms exactly (the deadline-expiry check still uses the ORIGINAL slice bookkeeping — verify `signal_wait_expired` semantics survive the stretched slice: a stretched slice may overshoot a finite guest deadline by up to 1 s, so only stretch when `guest_remaining` is `None` OR > 1 s, and cap the stretched slice at `guest_remaining`).
+
+- [ ] **Step 4c: Fork-path resource exhaustion degrades to guest EAGAIN, loudly**
+
+Two robustness fixes the Task 2 reds exposed (precedent: fork-time process-record exhaustion → guest `EAGAIN`, commit 9bed118d):
+
+1. `acquire_global_vcpu_permit` (`crates/carrick-vmm-hvf/src/trap.rs:867`): the backoff loop is silent and unbounded. Add gated admission-trace lines (same `admission_trace_enabled()` style as the `HV_NO_RESOURCES` path) on first park and every ~100 parks, and a bound: after 60 s of waiting, return an error that the fork/vCPU-create caller propagates as a typed resource-exhaustion error rather than looping forever.
+2. The fork-rebuild `HV_NO_RESOURCES` fatal (Task 2's pause-shaped red killed 19 engines with "trap engine failed"): trace how `create_with_no_resources_backpressure`'s post-10s error propagates through the fork-rebuild path, and convert BOTH exhaustion errors above into guest `fork(2) = EAGAIN` instead of a fatal engine abort. Follow the 9bed118d plumbing (`git show 9bed118d` shows the process-record precedent end-to-end). A red-first probe is NOT required here (the Task 2 red logs are the red); the green evidence is procladder_mt at an over-ceiling N with the kill switch ON (lease disabled): expected `ladder_forked_all=false` + clean completion instead of engine fatals/stalls.
+
 - [ ] **Step 5: Build + unit tests + focused probes**
 
 ```bash
@@ -668,7 +720,7 @@ Expected: identical booleans. Also re-run `procladder` (single-threaded twin) at
 
 - [ ] **Step 2: Kill-switch sanity**
 
-Re-run the gate once with `CARRICK_MT_VM_LEASE=0` in the carrick env: expected = the Task 2 red shape returns (proves the switch works and the green is attributable to the feature).
+Re-run the gate once with `CARRICK_MT_VM_LEASE=0` in the carrick env. Expected: NOT green-by-lease — with Task 5 Step 4c landed, the run should complete with `ladder_forked_all=false` and NO engine fatals and NO silent stall (graceful EAGAIN degradation at the ceiling). This one run proves both the kill switch and the exhaustion-degradation fix. (Task 2 recorded the two pre-fix red shapes: pause-shaped fatal `procladder_mt-160-red-rework-*.log`, sigwait-shaped silent stall `procladder_mt-160-red-sigwait-*.log` — neither shape may reappear.)
 
 - [ ] **Step 3: Perf regression gates**
 
