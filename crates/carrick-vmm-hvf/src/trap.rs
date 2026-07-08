@@ -863,8 +863,50 @@ fn open_global_vcpu_slot(slot: usize) -> Option<libc::c_int> {
     }
 }
 
+/// Total time an admission-permit acquire may park before declaring the host
+/// exhausted and returning [`TrapError::HostResourceExhausted`] — the bound
+/// that turns the historical SILENT UNBOUNDED permit stall (the sigwait-shaped
+/// procladder_mt red: 160 blocked children, zero output, zero trace lines)
+/// into a loud, typed error the fork path degrades to guest `EAGAIN`.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn acquire_global_vcpu_permit(budget: usize) -> GlobalVcpuPermit {
+const ADMISSION_PERMIT_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Emit a gated admission-trace line on the FIRST park and every ~100th.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const ADMISSION_PERMIT_TRACE_EVERY: u32 = 100;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn trace_permit_park(what: &str, budget: usize, parks: u32, waited: std::time::Duration) {
+    if admission_trace_enabled()
+        && (parks == 1 || parks.is_multiple_of(ADMISSION_PERMIT_TRACE_EVERY))
+    {
+        eprintln!(
+            "[hvf-admission pid={}] {what} budget {budget} full; park #{parks} (waited {waited:?})",
+            unsafe { libc::getpid() },
+        );
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn permit_exhausted(
+    what: &str,
+    budget: usize,
+    parks: u32,
+    waited: std::time::Duration,
+) -> TrapError {
+    if admission_trace_enabled() {
+        eprintln!(
+            "[hvf-admission pid={}] {what} budget {budget} still full after {waited:?} / {parks} park(s); host exhausted, propagating",
+            unsafe { libc::getpid() },
+        );
+    }
+    TrapError::HostResourceExhausted {
+        what: format!("{what}: budget {budget} still full after {waited:?} / {parks} park(s)"),
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn acquire_global_vcpu_permit(budget: usize) -> Result<GlobalVcpuPermit, TrapError> {
     // `hv_vm_get_max_vcpu_count` is a per-VM ceiling. A fork storm creates many
     // one-vCPU VMs, and HVF can exhaust host resources well below that per-VM count.
     // Admission classes choose the budget: plain fork needs the physical-core M:N
@@ -873,6 +915,8 @@ fn acquire_global_vcpu_permit(budget: usize) -> GlobalVcpuPermit {
     let budget = budget.max(1);
     ensure_global_vcpu_slot_dir();
     let mut backoff = GlobalVcpuPermitBackoff::default();
+    let start = std::time::Instant::now();
+    let mut parks: u32 = 0;
     loop {
         let mut state = global_vcpu_permits()
             .lock()
@@ -885,9 +929,19 @@ fn acquire_global_vcpu_permit(budget: usize) -> GlobalVcpuPermit {
                 continue;
             };
             state.pending.push(slot);
-            return GlobalVcpuPermit { slot, fd };
+            return Ok(GlobalVcpuPermit { slot, fd });
         }
         drop(state);
+        if start.elapsed() >= ADMISSION_PERMIT_MAX_WAIT {
+            return Err(permit_exhausted(
+                "vcpu permit (flock)",
+                budget,
+                parks,
+                start.elapsed(),
+            ));
+        }
+        parks += 1;
+        trace_permit_park("vcpu permit (flock)", budget, parks, start.elapsed());
         std::thread::sleep(backoff.next_delay());
     }
 }
@@ -1470,16 +1524,29 @@ fn atomic_permit_enabled_from_env(val: Option<&str>) -> bool {
 
 /// Blocking acquire against the atomic slot table: retry the single-attempt
 /// [`PermitRegion::acquire`] with the same exponential backoff as the flock path
-/// until a slot is admitted. Analogue of [`acquire_global_vcpu_permit`].
+/// until a slot is admitted, bounded at [`ADMISSION_PERMIT_MAX_WAIT`] like the
+/// flock analogue [`acquire_global_vcpu_permit`].
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn acquire_atomic_vcpu_permit(budget: usize) -> PermitToken {
+fn acquire_atomic_vcpu_permit(budget: usize) -> Result<PermitToken, TrapError> {
     let region = permit_region();
     let pid = std::process::id();
     let mut backoff = GlobalVcpuPermitBackoff::default();
+    let start = std::time::Instant::now();
+    let mut parks: u32 = 0;
     loop {
         if let Some(token) = region.acquire(budget, pid) {
-            return token;
+            return Ok(token);
         }
+        if start.elapsed() >= ADMISSION_PERMIT_MAX_WAIT {
+            return Err(permit_exhausted(
+                "vcpu permit (atomic)",
+                budget,
+                parks,
+                start.elapsed(),
+            ));
+        }
+        parks += 1;
+        trace_permit_park("vcpu permit (atomic)", budget, parks, start.elapsed());
         std::thread::sleep(backoff.next_delay());
     }
 }
@@ -1494,11 +1561,11 @@ enum HeldPermit {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn acquire_admission_permit(budget: usize) -> HeldPermit {
+fn acquire_admission_permit(budget: usize) -> Result<HeldPermit, TrapError> {
     if atomic_permit_enabled() {
-        HeldPermit::Atomic(acquire_atomic_vcpu_permit(budget))
+        Ok(HeldPermit::Atomic(acquire_atomic_vcpu_permit(budget)?))
     } else {
-        HeldPermit::Flock(acquire_global_vcpu_permit(budget))
+        Ok(HeldPermit::Flock(acquire_global_vcpu_permit(budget)?))
     }
 }
 
@@ -1700,10 +1767,13 @@ fn create_vm_with_admission(
     TrapError,
 > {
     // Soft pre-throttle: acquire an admitted slot (bounded by GLOBAL_VCPU_CEILING)
-    // BEFORE creating; held across HV_NO_RESOURCES retries below.
-    let permit = admission
-        .global_permit_budget()
-        .map(acquire_admission_permit);
+    // BEFORE creating; held across HV_NO_RESOURCES retries below. The acquire is
+    // bounded (ADMISSION_PERMIT_MAX_WAIT) — persistent exhaustion propagates as
+    // a typed error instead of parking here forever.
+    let permit = match admission.global_permit_budget() {
+        Some(budget) => Some(acquire_admission_permit(budget)?),
+        None => None,
+    };
     // Config is rebuilt per attempt inside the closure because `with_config`
     // consumes it, so an HV_NO_RESOURCES retry needs a fresh one.
     match create_with_no_resources_backpressure("hv_vm_create", || {
@@ -1718,6 +1788,34 @@ fn create_vm_with_admission(
             Err(e)
         }
     }
+}
+
+/// Pre-fork admission gate (the `SyscallTrap::fork_admission_check` backend):
+/// bounded-acquire ONE plain-fork admission permit and release it immediately.
+/// The permit budget models exactly what the fork is about to consume — the
+/// CHILD's post-fork `create_vm_with_admission(ForkRebuild)` — so a probe that
+/// cannot get a slot within [`ADMISSION_PERMIT_MAX_WAIT`] proves the child's
+/// rebuild would stall/fail too, and the fork degrades to guest `EAGAIN`
+/// BEFORE any teardown (the parent VM is untouched; no child exists yet).
+///
+/// Probe-and-release rather than reserve-and-inherit: the released slot can in
+/// principle be raced away before the child re-acquires it, but that window
+/// falls back to the existing post-fork `HV_NO_RESOURCES` park+retry — the
+/// persistent-exhaustion case (a parked fleet pinning every slot, the
+/// procladder_mt pause-shaped red's fatal) is what this converts to `EAGAIN`.
+/// Inheriting the permit across `libc::fork` is not sound today: the atomic
+/// slot is generation-stamped with the PARENT's pid (the death-reaper would
+/// free the child's slot when the parent exits), and the flock path's
+/// in-process pending bookkeeping does not survive into the child.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub fn probe_fork_vm_admission() -> Result<(), TrapError> {
+    let Some(budget) = (VmCreateAdmission::ForkRebuild { vfork: false }).global_permit_budget()
+    else {
+        return Ok(());
+    };
+    let permit = acquire_admission_permit(budget)?;
+    release_unregistered_admission_permit(permit);
+    Ok(())
 }
 
 /// vCPU budget for sibling guest threads.

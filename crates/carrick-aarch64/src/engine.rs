@@ -938,6 +938,10 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
         self.is_forked_child
     }
 
+    fn fork_admission_check(&self) -> Result<(), TrapError> {
+        self.vm.fork_admission_check()
+    }
+
     fn fork(&mut self) -> Result<ForkOutcome, TrapError> {
         let elapsed_us = |start: std::time::Instant| -> u64 {
             let micros = start.elapsed().as_micros();

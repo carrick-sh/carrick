@@ -130,6 +130,26 @@ where
             std::thread::yield_now();
         }
         crate::probes::fork_lifecycle(0, 0, elapsed_us(phase_start), 0, 0);
+        // Pre-fork admission gate (fork-path exhaustion degradation): prove the
+        // host can admit the CHILD's VM before quiescing or tearing anything
+        // down. Persistent exhaustion (a parked fleet pinning HVF's ~127-VM
+        // ceiling) becomes Linux-shaped `fork(2) = EAGAIN` with the parent VM
+        // untouched, instead of the post-fork HV_NO_RESOURCES fatal ("trap
+        // engine failed") that killed engines in the procladder_mt red. Only
+        // `end_fork` needs unwinding here — the topology lock, quiesce, and
+        // child record all come later. vfork is exempt: its child rebuild
+        // bypasses the admission permit (the suspended parent and its child
+        // sharing the gate can self-deadlock).
+        if vfork.is_none()
+            && let Err(error) = engine.fork_admission_check()
+        {
+            tracing::warn!(
+                %error,
+                "fork admission gate: host VM capacity exhausted; fork(2) = EAGAIN"
+            );
+            fork_barrier().end_fork();
+            return Ok(Some(crate::linux_abi::LINUX_EAGAIN.guest_retval()));
+        }
         // Serialize VM topology against sibling vCPU creation for the whole fork.
         let phase_start = std::time::Instant::now();
         let _topology = crate::fork_quiesce::topology_lock()

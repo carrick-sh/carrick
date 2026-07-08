@@ -36,12 +36,11 @@ pub(crate) fn signal_wait_remaining(
     deadline: Option<Instant>,
     timeout: Option<Duration>,
 ) -> Option<Duration> {
-    match timeout {
-        None => None,
-        Some(timeout) => Some(deadline.map_or(timeout, |target| {
+    timeout.map(|timeout| {
+        deadline.map_or(timeout, |target| {
             target.saturating_duration_since(Instant::now())
-        })),
-    }
+        })
+    })
 }
 
 pub(crate) fn raise_sigpipe_for_blocking_write(

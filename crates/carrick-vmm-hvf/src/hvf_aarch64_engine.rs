@@ -449,6 +449,15 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         self.state.add_vcpu().map(HvfAarch64Vcpu::new)
     }
 
+    fn fork_admission_check(&self) -> Result<(), TrapError> {
+        // Pre-fork exhaustion gate: prove the host can admit the CHILD's
+        // post-fork VM rebuild (bounded probe-and-release of one plain-fork
+        // permit) BEFORE the parent tears its VM down / libc::fork's, so a
+        // parked-fleet exhaustion becomes guest fork(2)=EAGAIN instead of a
+        // post-fork HV_NO_RESOURCES fatal ("trap engine failed").
+        crate::trap::probe_fork_vm_admission()
+    }
+
     fn freeze_ram_for_fork(&mut self) -> Result<(), TrapError> {
         // Pre-fork (parent, single process): snapshot every PRIVATE region into a
         // child-private copy (guest RAM is MAP_SHARED, so fork doesn't isolate it),
