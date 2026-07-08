@@ -36,7 +36,13 @@ carrick already releases the whole VM for them.
    (`vcpus_per_vm` 1/2/4) and `map_mib` scales 0 → 16 → 64. The ceiling never
    moves. It is a per-VM slot budget, not a system-wide vCPU budget and not
    memory-coupled. This **refutes the `trap.rs:761-775` comment** that calls it a
-   "~126 system-wide vCPU budget": The earlier '~126' reading is superseded by five exact-127 quiet-host runs; why it read lower before is undetermined — plausibly a 128-slot machine-wide table with one slot consumed elsewhere, or the earlier measurement running with other live VM consumers (stray guests) on the host. The per-VM verdict is unaffected either way: it is per-VM at 127 on this host/OS, not per-vCPU nor system-wide-in-vCPUs. Multi-vCPU (multithreaded) processes do **not**
+   "~126 system-wide vCPU budget": the earlier "~126" reading is superseded by
+   five exact-127 quiet-host runs; why it read lower before is undetermined —
+   plausibly a 128-slot machine-wide table with one slot consumed elsewhere,
+   or the earlier measurement running with other live VM consumers (stray
+   guests) on the host. The per-VM verdict is unaffected either way: it is
+   per-VM at 127 on this host/OS, not per-vCPU nor system-wide-in-vCPUs.
+   Multi-vCPU (multithreaded) processes do **not**
    consume extra ceiling budget; mapped memory is free with respect to the
    ceiling up to at least 64 MiB/VM (~8 GiB aggregate across 127 VMs).
 
@@ -48,24 +54,38 @@ carrick already releases the whole VM for them.
    lease reacquire pays tens of microseconds for the HVF create/destroy itself.
 
 3. **Does guest VA fragmentation multiply stage-2 descriptors / replay cost? —
-   NO, REPLAY-BOUNDED.** `desc_count` is flat at **14** across `FORK_MAPS`
-   0/256/1024 (up to ~2048 distinct guest region/protection boundaries), both
-   parent and child, at every phase. Local replay stayed in the ~200-670 µs
-   band (parent 209/210/324 µs; child 599/611/671 µs), the small child drift
-   tracking host `fork(2)` cost rising, not descriptor growth. carrick's host
-   stage-2 descriptor set is a function of *its own* coarse region layout
-   (code, rw-arena, guard, stacks, page tables), not of how the guest carves up
-   its mmap arena. A lease reacquire needs no eviction bias against
+   NO, REPLAY-BOUNDED for anonymous-private fragmentation.** `desc_count` is
+   flat at **14** across `FORK_MAPS` 0/256/1024 (up to ~2048 distinct guest
+   region/protection boundaries), both parent and child, at every phase. Local
+   replay stayed in the ~200-670 µs band (parent 209/210/324 µs; child
+   599/611/671 µs), the small child drift tracking host `fork(2)` cost rising,
+   not descriptor growth. carrick's host stage-2 descriptor set is a function
+   of *its own* coarse region layout (code, rw-arena, guard, stacks, page
+   tables), not of how the guest carves up its anonymous-private mmap arena. A
+   lease reacquire needs no eviction bias against anonymous-private
    fragmented/mapping-heavy processes.
+
+   This flat-14 result is proven only for anonymous-private guest VA
+   fragmentation, which lives entirely inside carrick's arena and never adds
+   host stage-2 descriptors. Guest `MAP_SHARED` FILE mappings are different:
+   they DO grow the per-process mapping list (pushes at
+   `crates/carrick-vmm-hvf/src/trap.rs:2995`, `:4233`, `:4319`, `:4524` — the
+   dynamic MAP_SHARED-file alias registry at `trap.rs:415`), and shared-wait
+   resume replays every entry in that list. A `MAP_SHARED`-file variant of the
+   `FORK_MAPS` sweep is required follow-up before the lease plan fixes its
+   reacquire budget; until then the reacquire budget below is **provisional**
+   for shared-file-mapping-heavy processes.
 
 4. **What happens when a workload exceeds the soft budget with blocked
    (non-exiting) children? — NO STALL. PREDICTION REFUTED.** At
    `PROC_LADDER_N=160` — 160 children all simultaneously alive (proven by
    `ladder_forked_all=true`) and blocked in `pause(2)`, i.e. 33 over the 127
    hard ceiling and 40 over the 120 soft budget — the probe **passes under
-   carrick in under 2 seconds, rc=0**, matches the Docker oracle byte-for-byte,
-   and emits **no** `HV_NO_RESOURCES` and **no** admission-trace lines. There is
-   no plateau, no timeout, no permit-wait stall. The reason (verified in source,
+   carrick in under 2 seconds, rc=0**, matching the Docker oracle byte-for-byte;
+   that is the pass evidence. With `CARRICK_HVF_ADMISSION_TRACE=1` set, the run
+   also emitted **no** `HV_NO_RESOURCES` and **no** admission-trace lines,
+   supporting but not load-bearing for the verdict. There is no plateau, no
+   timeout, no permit-wait stall. The reason (verified in source,
    see below): a single-threaded process that blocks releases its **entire VM**.
    So the anticipated "fork #121 stalls in the unbounded permit wait" scenario
    **does not exist for single-threaded blocked processes**. `procladder@160` is
@@ -91,7 +111,7 @@ carrick already releases the whole VM for them.
 ## Instrumentation Added
 
 - **Concurrent-ceiling matrix knobs** (commit `dbacff30`): the
-  `hvf_fork_probe concurrent-ceiling <max> <soft> <vcpus_per_vm> <map_mib>`
+  `hvf_fork_probe concurrent-ceiling <max> <hold_secs> <vcpus_per_vm> <map_mib>`
   probe gained the `vcpus_per_vm` and `map_mib` arguments so the ceiling can be
   swept against total-vCPU and mapped-memory pressure independently. Emits a
   single `=== CEILING ... ===` summary line plus `torn_down=<n>` on teardown.
@@ -125,8 +145,12 @@ children between runs; the only error lines were the expected ceiling hits.
 
 Reading: ceiling is per-VM (127 flat while total_vcpus 127→254→508). Memory does
 not consume the ceiling but raises per-VM create latency ~3-4x at 16 MiB and
-~10-15x at 64 MiB. All logs under
-`target/conformance/logs/hvf-residency-e4/`.
+~10-15x at 64 MiB. Caveat: the probe's `create_us` window includes the `mmap`
+call plus a one-store-per-16-KiB resident-touch loop over the mapped region
+(thousands of zero-fill page faults at 64 MiB), so first-touch fault cost
+dominates the m16/m64 numbers; this overstates what a lease reacquire would
+pay, since reacquired memory is already host-resident and would not re-fault.
+All logs under `target/conformance/logs/hvf-residency-e4/`.
 
 ### Sequential churn (Task 3)
 
@@ -220,8 +244,11 @@ E4's measurements refute two stale source comments — flag as follow-ups:
 - `scripts/run-probe.sh clonebasic` — Result: `MATCH clonebasic`, rc 0.
 - `scripts/run-probe.sh procladder` — Result: `MATCH procladder`, rc 0 (N=8 gate).
 - Over-ceiling (Task 5):
-  `base64 -i "$PROBE" | CARRICK_RUN_ID=$RUN_ID timeout 90 target/release/carrick run ubuntu:24.04 --raw --fs host /bin/sh -c 'base64 -d > /tmp/p && chmod +x /tmp/p && PROC_LADDER_N=160 /tmp/p'`
-  — Result: `ladder_forked_all=true`, `ladder_reaped_all=true`, rc 0, <2 s, no HV_NO_RESOURCES lines; Docker oracle byte-identical.
+  `base64 -i "$PROBE" | CARRICK_RUN_ID=$RUN_ID CARRICK_HVF_ADMISSION_TRACE=1 timeout 90 target/release/carrick run ubuntu:24.04 --raw --fs host /bin/sh -c 'base64 -d > /tmp/p && chmod +x /tmp/p && PROC_LADDER_N=160 /tmp/p'`
+  — Result: `ladder_forked_all=true`, `ladder_reaped_all=true`, rc 0 in under 2 s,
+  matching the Docker oracle byte-for-byte — that is the pass evidence. With
+  `CARRICK_HVF_ADMISSION_TRACE=1` set, the log also showed no `HV_NO_RESOURCES`
+  lines and no admission-trace lines, supporting but not load-bearing detail.
 
 No carrick guest/probe and Docker oracle command were run concurrently in any
 task; `scripts/run-probe.sh` sequences its carrick and Docker phases.

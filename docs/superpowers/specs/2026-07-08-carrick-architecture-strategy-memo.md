@@ -403,8 +403,11 @@ Measured reality:
 - The ceiling is **per-VM (exactly 127 on this host/OS)**, not memory-coupled and
   not a system-wide vCPU budget: 127 VMs materialize whether `total_vcpus` is 127,
   254, or 508 and whether each VM maps 0, 16, or 64 MiB. The earlier "~126
-  system-wide vCPU budget" reading (and the `trap.rs:761-775` comment) was
-  measured with stray guests live and is refuted.
+  system-wide vCPU budget" reading (and the `trap.rs:761-775` comment) is
+  superseded by five exact-127 quiet-host runs; why it read lower before is
+  undetermined — plausibly a 128-slot machine-wide table with one slot
+  consumed elsewhere, or the earlier measurement running with other live VM
+  consumers on the host. The per-VM verdict is unaffected either way.
 - **carrick already releases the whole VM for single-threaded blocked
   processes.** `park_vcpu_for_blocking_wait` → `save_shared_wait_state()` →
   HVF `shared_wait_park` destroys the vCPU *and* the VM while parked and rebuilds
@@ -421,8 +424,11 @@ processes take the other branch (`save_guest_state()` → HVF `reclaim_park`, a
 vCPU-only destroy that keeps the VM alive), so more than 127 simultaneously-blocked
 multi-threaded processes remain capacity-bound. The lease design parameters are
 already measured: eviction unit is the whole VM (per-VM ceiling), reacquire budget
-is tens of µs create + ~200-670 µs replay bounded at 14 descriptors, churn is flat
-and non-degrading over 200 cycles. Acceptance = a `procladder-mt` variant (children
-spawn a second thread, then block) failing red today and passing after the lease
-extension, with `PROC_LADDER_N=160 procladder` staying green as the regression
-guard and no `perf_fork`/`perf_fork_exec` regression.
+is tens of µs create + ~200-670 µs replay bounded at 14 descriptors for
+anonymous-private guest VA fragmentation (unconfirmed for `MAP_SHARED`-file
+mappings, which grow the per-process mapping list separately — see E4 §3
+follow-up), churn is flat and non-degrading over 200 cycles. Acceptance = a
+`procladder-mt` variant (children spawn a second thread, then block) failing red
+today and passing after the lease extension, with `PROC_LADDER_N=160 procladder`
+staying green as the regression guard and no `perf_fork`/`perf_fork_exec`
+regression.
