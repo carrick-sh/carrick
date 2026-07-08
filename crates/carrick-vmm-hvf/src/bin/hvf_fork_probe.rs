@@ -228,7 +228,9 @@ mod imp {
             "concurrent-ceiling" => {
                 let max = parse_u64_arg(&args, 1, 100);
                 let hold_secs = parse_u64_arg(&args, 2, 60);
-                concurrent_ceiling(max, hold_secs);
+                let vcpus_per_vm = parse_u64_arg(&args, 3, 1).max(1);
+                let map_mib = parse_u64_arg(&args, 4, 0);
+                concurrent_ceiling(max, hold_secs, vcpus_per_vm, map_mib);
             }
             _ => usage(),
         }
@@ -251,7 +253,7 @@ mod imp {
         println!("  hvf_fork_probe fork-churn [iters] [child_hold_us]");
         println!("  hvf_fork_probe parallel-recreate [workers]");
         println!("  hvf_fork_probe parent-keeps-vm [iters]");
-        println!("  hvf_fork_probe concurrent-ceiling [max] [hold_secs]");
+        println!("  hvf_fork_probe concurrent-ceiling [max] [hold_secs] [vcpus_per_vm] [map_mib]");
     }
 
     fn install_probe_signal_handlers() {
@@ -902,6 +904,64 @@ mod imp {
         }
     }
 
+    /// Create this child's VM + first vCPU, then the requested extras:
+    /// `map_mib` MiB of resident anonymous memory mapped into the guest, and
+    /// `vcpus_per_vm - 1` additional vCPUs, each on its own parked thread
+    /// (HVF binds a vCPU to its creating thread).
+    fn create_vm_with_extras(vcpus_per_vm: u64, map_mib: u64) -> Result<Duration, hv_return_t> {
+        const EXTRA_GUEST_ADDR: u64 = 0x2000_0000;
+        let start = Instant::now();
+        let (_vm, _first) = Vm::create()?;
+        if map_mib > 0 {
+            let bytes = (map_mib as usize) * 1024 * 1024;
+            let host = unsafe {
+                libc::mmap(
+                    ptr::null_mut(),
+                    bytes,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_ANON | libc::MAP_PRIVATE,
+                    -1,
+                    0,
+                )
+            };
+            if host == libc::MAP_FAILED {
+                return Err(HV_ERROR);
+            }
+            let mut off = 0usize;
+            while off < bytes {
+                unsafe { *host.cast::<u8>().add(off) = 1 };
+                off += 16384;
+            }
+            let perms: hv_memory_flags_t = HV_MEMORY_READ | HV_MEMORY_WRITE;
+            let rc = unsafe { hv_vm_map(host.cast_const(), EXTRA_GUEST_ADDR, bytes, perms) };
+            if rc != HV_SUCCESS {
+                return Err(rc);
+            }
+        }
+        let (tx, rx) = std::sync::mpsc::channel::<hv_return_t>();
+        for _ in 1..vcpus_per_vm {
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let mut vcpu = 0;
+                let mut exit: *const hv_vcpu_exit_t = ptr::null();
+                let rc = unsafe { hv_vcpu_create(&mut vcpu, &mut exit, ptr::null_mut()) };
+                let _ = tx.send(rc);
+                loop {
+                    std::thread::park();
+                }
+            });
+        }
+        drop(tx);
+        for _ in 1..vcpus_per_vm {
+            match rx.recv() {
+                Ok(rc) if rc == HV_SUCCESS => {}
+                Ok(rc) => return Err(rc),
+                Err(_) => return Err(HV_ERROR),
+            }
+        }
+        Ok(start.elapsed())
+    }
+
     /// Measure how many concurrent single-vCPU HVF VMs the host sustains across
     /// SEPARATE processes (carrick's one-VM-per-process model). The parent holds NO
     /// VM; it forks children one at a time, each does `hv_vm_create` + `hv_vcpu_create`
@@ -910,8 +970,10 @@ mod imp {
     /// The guest RAM is tiny (nothing mapped here), so this isolates the VM/vCPU
     /// HANDLE limit from any memory limit. Each child self-destructs after
     /// `hold_secs` so an orphaned run cannot strand VMs.
-    fn concurrent_ceiling(max: u64, hold_secs: u64) {
-        println!("case=concurrent-ceiling max={max} hold_secs={hold_secs}");
+    fn concurrent_ceiling(max: u64, hold_secs: u64, vcpus_per_vm: u64, map_mib: u64) {
+        println!(
+            "case=concurrent-ceiling max={max} hold_secs={hold_secs} vcpus_per_vm={vcpus_per_vm} map_mib={map_mib}"
+        );
         let mut held_pids: Vec<libc::pid_t> = Vec::new();
         let mut live = 0u64;
         let mut failure: Option<hv_return_t> = None;
@@ -939,10 +1001,11 @@ mod imp {
             if pid == 0 {
                 // Child: create a VM+vCPU and hold it, reporting rc + create_us.
                 unsafe { libc::close(rd) };
-                let (rc, create_us): (hv_return_t, u64) = match Vm::create() {
-                    Ok((_vm, elapsed)) => (HV_SUCCESS, elapsed.as_micros() as u64),
-                    Err(rc) => (rc, 0),
-                };
+                let (rc, create_us): (hv_return_t, u64) =
+                    match create_vm_with_extras(vcpus_per_vm, map_mib) {
+                        Ok(elapsed) => (HV_SUCCESS, elapsed.as_micros() as u64),
+                        Err(rc) => (rc, 0),
+                    };
                 let mut report = [0u8; 12];
                 report[0..4].copy_from_slice(&(rc as u32).to_le_bytes());
                 report[4..12].copy_from_slice(&create_us.to_le_bytes());
@@ -996,7 +1059,8 @@ mod imp {
         }
 
         println!(
-            "=== CEILING max_concurrent_vms={live} failure={} first_create_us={} last_create_us={} ===",
+            "=== CEILING max_concurrent_vms={live} vcpus_per_vm={vcpus_per_vm} map_mib={map_mib} total_vcpus={} failure={} first_create_us={} last_create_us={} ===",
+            live * vcpus_per_vm,
             failure
                 .map(rc_label)
                 .unwrap_or_else(|| "none(reached max, no hard limit hit)".to_owned()),
