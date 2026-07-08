@@ -223,6 +223,13 @@ pub fn init(init_host_pid: u32) -> bool {
     true
 }
 
+/// Crate-internal view over an explicit process section. The supervisor's unit
+/// tests build a region over a private arena with this; production code goes
+/// through the [`region`] global.
+pub(crate) fn region_over(section: &'static ProcessSection) -> NsSharedRegion {
+    NsSharedRegion { section }
+}
+
 /// Borrow the shared region, or `None` if namespaces are not enabled for this
 /// run (identity behavior — `getpid` returns the host pid).
 pub fn region() -> Option<NsSharedRegion> {

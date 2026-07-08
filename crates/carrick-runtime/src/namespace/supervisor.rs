@@ -83,11 +83,13 @@ pub fn run(init_host_pid: i32, reg_pipe_read: i32) -> SupervisorExit {
     );
     let _ = mux.watch_process_exit(init_host_pid, INIT_TOKEN);
 
-    // Track which host pid each slot is armed for. Slots are reused after a
+    // Track which member each slot is armed for. Slots are reused after a
     // terminal wait reaps a child, so a plain per-slot boolean would skip the
     // replacement member and miss its exit.
-    let mut watched = vec![0u32; pid::MEMBER_SLOTS];
-    arm_member_watches(mux.as_mut(), &mut watched);
+    let mut watched = vec![WatchStamp::default(); pid::MEMBER_SLOTS];
+    if let Some(region) = pid::region() {
+        arm_member_watches(mux.as_mut(), &mut watched, &region);
+    }
 
     let mut events: Vec<PollEvent> = Vec::new();
     // 1s periodic rescan as a fallback when a registration-pipe write was lost
@@ -147,7 +149,9 @@ pub fn run(init_host_pid: i32, reg_pipe_read: i32) -> SupervisorExit {
         }
         // On any wake (pipe, member death, or timeout) re-arm watches for any
         // members that appeared since the last scan.
-        arm_member_watches(mux.as_mut(), &mut watched);
+        if let Some(region) = pid::region() {
+            arm_member_watches(mux.as_mut(), &mut watched, &region);
+        }
         // Leak backstop: release records whose owner is FULLY gone (reaped —
         // no process, no zombie) and whose exit no live waiter can consume.
         // Fork children nobody ever wait4s (SIGCHLD ignored, parent exited
@@ -176,25 +180,43 @@ fn host_pid_fully_gone(pid: u32) -> bool {
     rc != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
 }
 
+/// A slot's armed-watch identity: the (host pid, record generation) pair. The
+/// generation is what distinguishes a recycled identical host pid re-claiming
+/// a reused slot (a brand-new process that still needs a watch) from the
+/// already-watched occupant — pid alone cannot tell them apart.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct WatchStamp {
+    host_pid: u32,
+    generation: u32,
+}
+
 /// Arm an exit watch for every registered member we haven't watched yet. If a
 /// member already exited, the multiplexer either fires immediately or errors
 /// (the pid is gone) — both are handled by the loop (the immediate event marks
 /// it dead; a missed one is caught by the periodic rescan).
-fn arm_member_watches(mux: &mut dyn EventMultiplexer, watched: &mut [u32]) {
-    let Some(region) = pid::region() else { return };
+fn arm_member_watches(
+    mux: &mut dyn EventMultiplexer,
+    watched: &mut [WatchStamp],
+    region: &pid::NsSharedRegion,
+) {
     for (i, slot) in region.members().iter().enumerate() {
         let host = slot.host_pid.load(Ordering::Acquire);
         if host == 0 || host == HOST_PID_REGISTERING || slot.ns_pid.load(Ordering::Acquire) == 0 {
-            watched[i] = 0;
+            watched[i] = WatchStamp::default();
             continue;
         }
-        if watched[i] == host {
+        let stamp = WatchStamp {
+            host_pid: host,
+            generation: slot.generation.load(Ordering::Acquire),
+        };
+        if watched[i] == stamp {
             continue;
         }
         // Arm the watch; ignore an error (already gone — the rescan / immediate
-        // fire covers it).
+        // fire covers it). Re-arming an already-watched pid is harmless
+        // (kqueue EV_ADD replaces the knote).
         let _ = mux.watch_process_exit(host as i32, member_token(host as i32));
-        watched[i] = host;
+        watched[i] = stamp;
     }
 }
 
@@ -301,9 +323,102 @@ pub fn status_to_exit_code(status: i32) -> i32 {
 
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
-    use super::{handle_member_death, member_token, status_to_exit_code};
-    use carrick_hal::event::PollEvent;
+    use super::{arm_member_watches, handle_member_death, member_token, status_to_exit_code};
+    use crate::namespace::pid;
+    use carrick_hal::error::OsError;
+    use carrick_hal::event::{EventMultiplexer, Interest, PollEvent, TriggerMode, VnodeEvents};
+    use carrick_kernel::arena::KernelArena;
+    use std::os::fd::RawFd;
     use std::time::Duration;
+
+    /// Records `watch_process_exit` calls; every other multiplexer op is a
+    /// no-op. Lets the arm/dedup logic be driven without a real kqueue.
+    #[derive(Default)]
+    struct RecordingMux {
+        armed: Vec<i32>,
+    }
+
+    impl EventMultiplexer for RecordingMux {
+        fn register_io(
+            &mut self,
+            _fd: RawFd,
+            _token: u64,
+            _interest: Interest,
+            _mode: TriggerMode,
+        ) -> Result<(), OsError> {
+            Ok(())
+        }
+        fn register_vnode(
+            &mut self,
+            _fd: RawFd,
+            _token: u64,
+            _mask: VnodeEvents,
+        ) -> Result<(), OsError> {
+            Ok(())
+        }
+        fn watch_process_exit(&mut self, pid: i32, _token: u64) -> Result<(), OsError> {
+            self.armed.push(pid);
+            Ok(())
+        }
+        fn register_user(&mut self, _ident: u64) -> Result<(), OsError> {
+            Ok(())
+        }
+        fn trigger_user(&self, _ident: u64) -> Result<(), OsError> {
+            Ok(())
+        }
+        fn register_timer(
+            &mut self,
+            _token: u64,
+            _interval: Duration,
+            _oneshot: bool,
+        ) -> Result<(), OsError> {
+            Ok(())
+        }
+        fn deregister(&mut self, _fd: RawFd) -> Result<(), OsError> {
+            Ok(())
+        }
+        fn wait(
+            &mut self,
+            _out: &mut Vec<PollEvent>,
+            _timeout: Option<Duration>,
+        ) -> Result<usize, OsError> {
+            Ok(0)
+        }
+        fn poll_fd(&self) -> RawFd {
+            -1
+        }
+    }
+
+    /// A terminal reap frees a member slot; the OS can then recycle the SAME
+    /// host pid for a brand-new member that re-claims the SAME slot index. A
+    /// pid-only dedup sees `watched[i] == pid` and never re-arms, so the new
+    /// process's exit is silently missed (no orphan flagging, no harvested
+    /// status). The dedup must compare the record GENERATION, not just the pid.
+    #[test]
+    fn recycled_pid_on_reused_slot_rearms_the_watch() {
+        let arena = Box::leak(Box::new(KernelArena::create().expect("create arena")));
+        let region = pid::region_over(&arena.layout().processes);
+        let host_pid = 424_270u32;
+
+        assert!(region.register(host_pid, 2, 1).is_some());
+        let mut watched = vec![super::WatchStamp::default(); pid::MEMBER_SLOTS];
+        let mut mux = RecordingMux::default();
+        arm_member_watches(&mut mux, &mut watched, &region);
+        let first_arms = mux.armed.iter().filter(|p| **p == host_pid as i32).count();
+        assert_eq!(first_arms, 1, "first occupant armed once");
+
+        // Terminal reap releases the slot; the recycled identical pid
+        // re-claims the same (first free) index as a NEW process instance.
+        assert!(region.unregister_reaped(host_pid));
+        assert!(region.register(host_pid, 3, 1).is_some());
+
+        arm_member_watches(&mut mux, &mut watched, &region);
+        let total_arms = mux.armed.iter().filter(|p| **p == host_pid as i32).count();
+        assert_eq!(
+            total_arms, 2,
+            "a recycled identical pid on a reused slot must re-arm the exit watch"
+        );
+    }
 
     /// A namespace member (a process the supervisor CANNOT waitpid — it's
     /// reparented to launchd) exits 42. The supervisor recovers the status from
