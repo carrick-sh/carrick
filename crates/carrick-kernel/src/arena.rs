@@ -12,7 +12,7 @@ use crate::domains::{HostPid, ProcessGeneration};
 use crate::process::ProcessSection;
 
 pub const ARENA_MAGIC: u32 = 0x434b_4131;
-pub const ARENA_VERSION: u32 = 2;
+pub const ARENA_VERSION: u32 = 3;
 pub const ARENA_PATH_ENV: &str = "CARRICK_KERNEL_ARENA";
 
 /// Permit-section constants. These must stay byte-identical to the landed
@@ -45,6 +45,14 @@ pub struct ArenaLayout {
     pub header: ArenaHeader,
     pub permits: PermitSection,
     pub processes: ProcessSection,
+    /// Resident-VM slot table: one generation-stamped slot per LIVE HVF VM
+    /// (claimed on `hv_vm_create`, freed on `hv_vm_destroy`, death-reclaimed
+    /// by the vcpu-permit reaper). Same byte layout and slot protocol as
+    /// `permits`; consumed by `carrick-vmm-hvf/src/trap.rs::vm_residency_region`.
+    /// Exists because vCPU-admission permits UNDER-REPORT residency: a
+    /// vCPU-only park frees its permit while keeping its VM
+    /// (docs/2026-07-09-mt-residency-lease-evidence.md, Next Track 1).
+    pub vm_slots: PermitSection,
 }
 
 #[derive(Debug)]
@@ -285,6 +293,12 @@ impl KernelArena {
             .version
             .store(PERMIT_VERSION, Ordering::Relaxed);
         layout.processes.next_ns_pid.store(2, Ordering::Relaxed);
+        layout.vm_slots.next_generation.store(1, Ordering::Relaxed);
+        layout
+            .vm_slots
+            .version
+            .store(PERMIT_VERSION, Ordering::Relaxed);
+        layout.vm_slots.magic.store(PERMIT_MAGIC, Ordering::Release);
         layout.permits.magic.store(PERMIT_MAGIC, Ordering::Release);
         layout.header.magic.store(ARENA_MAGIC, Ordering::Release);
     }
@@ -433,5 +447,31 @@ mod tests {
         let e = KernelArena::attach(&path).err().unwrap();
         assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn vm_slots_section_is_published_and_independent() {
+        let arena = KernelArena::create().unwrap();
+        let l = arena.layout();
+        assert_eq!(
+            l.vm_slots.magic.load(std::sync::atomic::Ordering::Acquire),
+            PERMIT_MAGIC
+        );
+        assert_eq!(
+            l.vm_slots
+                .next_generation
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        // Claiming in vm_slots must not consume permit slots (independent tables).
+        let claimed = l.vm_slots.try_claim_slot(
+            crate::domains::HostPid::new(42),
+            arena.allocate_generation(),
+        );
+        assert!(claimed.is_ok());
+        assert_eq!(
+            l.permits.slots[claimed.unwrap()].load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
     }
 }
