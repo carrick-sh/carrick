@@ -592,6 +592,15 @@ impl Aarch64Vmm for HvfAarch64Vmm {
             .shared_wait_resume(&mut vcpu.0, /*replay_alias_union=*/ true)
     }
 
+    fn release_vm_after_reclaim_park(&mut self) -> Result<bool, TrapError> {
+        // MT last-parker VM-only release: this thread's own vCPU is already
+        // gone (reclaim_park, snapshot stashed), and the runtime re-checked
+        // that every sibling's post-destroy "parked" mark is set — so only
+        // the VM remains. Ok(true) = the wake side must rebuild
+        // (shared_wait_resume works from the reclaim_park snapshot).
+        self.state.release_vm_after_reclaim_park().map(|()| true)
+    }
+
     fn build_sibling_builder(
         &self,
         _vcpu: &Self::Vcpu,

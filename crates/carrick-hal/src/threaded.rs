@@ -559,6 +559,21 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + GuestMemory + Send {
     ) -> Result<(), TrapError> {
         self.rebind_to_slot(slot, state)
     }
+    /// MT whole-VM residency lease — VM-only release, called by the LAST
+    /// parker of a multi-threaded process AFTER its own vCPU was already
+    /// destroyed by [`Self::save_guest_state`] (so the runtime registry's
+    /// "parked" mark truthfully means "vCPU destroyed" for every marked
+    /// thread, and this call finds zero live vCPUs). Returns `Ok(true)` iff
+    /// the backend released whole-VM state that a claim-true waker must
+    /// rebuild via [`Self::rebind_shared_wait_state_mt`]; `Ok(false)` (the
+    /// default) means the backend has no whole-VM state to release
+    /// (pool-swap backends). On `Err` or `Ok(false)` the caller MUST NOT set
+    /// the registry's vm-released flag — the park stays a vCPU-only park (a
+    /// failed teardown must never poison an innocent sibling's wake with a
+    /// rebuild against a live VM).
+    fn release_vm_after_reclaim_park(&mut self) -> Result<bool, TrapError> {
+        Ok(false)
+    }
     /// Restore state saved by [`Self::save_shared_wait_state`] when the parked
     /// process was MULTI-THREADED (the whole-VM residency lease): the FIRST
     /// waker rebuilds the per-process VM state on behalf of every still-parked
