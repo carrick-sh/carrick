@@ -366,3 +366,47 @@ pointer:
    commits dense with epoll-ET/kqueue work — `348ae189` "park epoll et on kqueue
    edges" et al.). `perf_epoll_pipe_loop` p50 33.2 → 50.9 µs happened there, not
    in this campaign; separate bisect if the +17 µs matters.
+
+## epoll-ET p50 debt window: bisect result
+
+Bisected the `perf_epoll_pipe_loop` p50 regression (follow-up item 5 above)
+across `0572d32f..9baacd44` with `scripts/perf/bisect-epoll-p50.sh`
+(median of 3 one-shot runs, threshold 42 µs, quiet host, probe binary built
+once at HEAD; 7 predicate evaluations, zero skips).
+
+**Culprit: `37dd7c20` "fix(runtime): rearm epoll et across dup reads".**
+
+| commit | p50 median |
+| --- | --- |
+| `0572d32f` (window good endpoint) | 31.58 µs |
+| `d1276b47` (culprit~1) | 32.21 µs |
+| `37dd7c20` (culprit) | 56.21 µs |
+| `9baacd44` (window bad endpoint) | 54.71 µs |
+
+Single-commit jump: 32.2 → 56.2 µs at the culprit; flat on both sides.
+
+**Mechanism hypothesis** (from the culprit diff, `dispatch/net.rs`
+`epoll_rearm_after_io` + `dispatch/mod.rs` `wake_parked`): the dup-sibling
+correctness fix put the whole ET bookkeeping pass on every successful read.
+
+1. `read_consumed = positive || zero || eagain` — before the culprit, a
+   positive read took no rearm path at all (only 0/EAGAIN did). Now every
+   1-byte pipe read in the loop enters the epoll interest pass under the
+   epoll description write lock.
+2. The pass became O(interest set) per read with heavy per-candidate work:
+   for each target fd it clones the open-description `Arc`, then scans
+   *every* key in the interest map calling `host_fd_for_poll` (fd-table
+   lookup) and `open_file` + `Arc::ptr_eq` per candidate, collecting into a
+   fresh `Vec` — even when there are no dup registrations.
+3. macOS `wake_parked()` stopped being a no-op: each rearm now fires the
+   shared-kqueue user wake (`trigger_user(0)`), an extra host kevent per
+   read plus a spurious wake/re-park round trip for any parked waiter.
+
+**Decision: defer — named follow-up, not a one-liner.** The commit is a
+load-bearing correctness fix (Go netpoller dup-read rearm,
+TestServerNoWriteTimeout); reverting any leg regresses that. The perf fix is
+a fast path, not a tweak: skip the sibling scan when the interest map has a
+single entry (or the target fd is its only self-match), hoist the
+per-candidate fd-table lookups, and fire `wake_parked` only when a latch
+actually changed. Follow-up name: **epoll-rearm-fastpath** (target: recover
+p50 ≤ ~35 µs with the dup-sibling regression tests still green).
