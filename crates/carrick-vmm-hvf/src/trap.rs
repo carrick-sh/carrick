@@ -4229,7 +4229,7 @@ impl HvfVmState {
             4,
             elapsed_us(phase_start),
             vm_destroy_rc as i64,
-            VCPU_LIVE.load(std::sync::atomic::Ordering::SeqCst) as i64,
+            VCPU_LIVE.load(std::sync::atomic::Ordering::SeqCst),
         );
 
         let phase_start = std::time::Instant::now();
