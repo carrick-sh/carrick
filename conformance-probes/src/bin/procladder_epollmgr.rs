@@ -76,8 +76,11 @@ fn sockaddr_un_for(path: &str) -> Option<(libc::sockaddr_un, libc::socklen_t)> {
     Some((addr, len))
 }
 
-/// `socket` + `bind` + `listen(8)` an AF_UNIX SOCK_STREAM listener at `path`
-/// (the 38232 manager's accept-loop listener). Returns the raw fd, or -1.
+/// `unlink` + `socket` + `bind` + `listen(8)` an AF_UNIX SOCK_STREAM
+/// listener at `path` (the 38232 manager's accept-loop listener). The
+/// unlink clears a stale socket file left behind by an interrupted prior
+/// run — without it the bind fails EADDRINUSE, the child `_exit(3)`s, and
+/// the probe reads as a spurious DIFF. Returns the raw fd, or -1.
 fn make_listener(path: &str) -> i32 {
     unsafe {
         let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
@@ -88,6 +91,7 @@ fn make_listener(path: &str) -> i32 {
             libc::close(fd);
             return -1;
         };
+        libc::unlink(addr.sun_path.as_ptr());
         if libc::bind(fd, (&raw const addr).cast(), len) != 0 {
             libc::close(fd);
             return -1;
