@@ -781,6 +781,10 @@ impl VmCreateAdmission {
     /// headroom for other system VM consumers.
     const GLOBAL_VCPU_CEILING: usize = 120;
 
+    /// Resident-VM budget for the fork gate: same soft margin under the
+    /// measured ~126-concurrent-VM HVF ceiling as the vCPU-permit budget.
+    const GLOBAL_VM_CEILING: usize = 120;
+
     fn global_permit_budget(self) -> Option<usize> {
         match self {
             Self::Initial | Self::SharedWaitResume | Self::ForkRebuild { vfork: false } => {
@@ -1902,10 +1906,15 @@ fn create_vm_with_admission(
 /// free the child's slot when the parent exits), and the flock path's
 /// in-process pending bookkeeping does not survive into the child.
 ///
-/// KNOWN BLIND SPOT: permits UNDER-REPORT resident VMs — a vCPU-only park
-/// releases its permit while keeping its VM, so a parked fleet can pin the
-/// hard ~127-VM ceiling while this gate passes trivially (fix = resident-VM
-/// accounting; docs/2026-07-09-mt-residency-lease-evidence.md, Next Track 1a).
+/// CLOSED BLIND SPOT: permits alone UNDER-REPORT resident VMs — a vCPU-only
+/// park releases its permit while keeping its VM, so a parked fleet could pin
+/// the hard ~127-VM ceiling while the permit-only gate passed trivially (the
+/// lease-off @160 fatal and the fd-veto capacity cost; evidence doc
+/// docs/2026-07-09-mt-residency-lease-evidence.md, Next Track 1a). This gate
+/// now ALSO probes the resident-VM slot table (`vm_residency_region()`,
+/// Task 1) with a bounded [`probe_vm_slot_budget`] call: a pinned fleet with
+/// free permits but no free VM slot now bounds out and degrades to guest
+/// `EAGAIN` instead of reaching the post-fork `hv_vm_create` fatal.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub fn probe_fork_vm_admission() -> Result<(), TrapError> {
     let Some(budget) = (VmCreateAdmission::ForkRebuild { vfork: false }).global_permit_budget()
@@ -1914,7 +1923,59 @@ pub fn probe_fork_vm_admission() -> Result<(), TrapError> {
     };
     let permit = acquire_admission_permit(budget)?;
     release_unregistered_admission_permit(permit);
+    // Resident-VM budget: permits alone UNDER-REPORT residency (a vCPU-only
+    // park frees its permit while keeping its VM — the lease-off @160 fatal
+    // and the fd-veto capacity cost, evidence doc Next Track 1). Probe the
+    // hard-slot table too. Flock fallback has no residency table; it keeps
+    // the historical permit-only gate.
+    if atomic_permit_enabled() {
+        probe_vm_slot_budget(
+            vm_residency_region(),
+            VmCreateAdmission::GLOBAL_VM_CEILING,
+            FORK_VM_PROBE_MAX_WAIT,
+        )?;
+    }
     Ok(())
+}
+
+/// Fork-gate bound for the resident-VM probe. Deliberately the SAME 10 s as
+/// the post-fork `hv_vm_create` HV_NO_RESOURCES backpressure MAX_WAIT: the
+/// pre-fork gate never waits longer than the post-fork path it replaces, so
+/// a pinned fleet (lease off, or fd-veto-retained VMs) degrades to guest
+/// EAGAIN in ~10 s instead of a rc=125 trap fatal. Lease-driven releases
+/// land at the 2–8 s slice ticks, well inside the bound.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const FORK_VM_PROBE_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Bounded acquire-and-release of ONE slot in `region`: proves a hard slot
+/// exists for the fork child's `hv_vm_create` under `budget`.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn probe_vm_slot_budget(
+    region: &PermitRegion,
+    budget: usize,
+    max_wait: std::time::Duration,
+) -> Result<(), TrapError> {
+    let pid = std::process::id();
+    let mut backoff = GlobalVcpuPermitBackoff::default();
+    let start = std::time::Instant::now();
+    let mut parks: u32 = 0;
+    loop {
+        if let Some(token) = region.acquire(budget, pid) {
+            region.release_unregistered(token);
+            return Ok(());
+        }
+        if start.elapsed() >= max_wait {
+            return Err(permit_exhausted(
+                "resident-vm slot",
+                budget,
+                parks,
+                start.elapsed(),
+            ));
+        }
+        parks += 1;
+        trace_permit_park("resident-vm slot", budget, parks, start.elapsed());
+        std::thread::sleep(backoff.next_delay());
+    }
 }
 
 /// vCPU budget for sibling guest threads.
@@ -6487,6 +6548,29 @@ mod vm_create_admission_tests {
             "observed {observed} concurrently-held permits with budget {budget} \
              — over-admission past the budget cap (store-buffering regression)"
         );
+    }
+
+    #[test]
+    fn fork_vm_probe_bounds_out_when_residency_is_pinned_and_admits_after_release() {
+        let region = PermitRegion::new_anon_for_test();
+        let budget = 4;
+        let mut tokens = Vec::new();
+        for i in 0..budget {
+            let t = region
+                .acquire(budget, 1000 + i as u32)
+                .expect("under budget");
+            region.register(i as u64, t);
+            tokens.push(t);
+        }
+        // Pinned at budget: the probe must bound out quickly (test-scale wait).
+        let err = probe_vm_slot_budget(&region, budget, std::time::Duration::from_millis(50));
+        assert!(matches!(err, Err(TrapError::HostResourceExhausted { .. })));
+        // One release frees a hard slot: the probe admits again.
+        region.release_token(0);
+        assert!(
+            probe_vm_slot_budget(&region, budget, std::time::Duration::from_millis(50)).is_ok()
+        );
+        drop(tokens);
     }
 }
 
