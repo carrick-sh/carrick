@@ -567,6 +567,14 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         self.rebind_shared_wait_state(slot, snapshot, vcpu)
     }
 
+    /// Pre-fork admission gate (see `SyscallTrap::fork_admission_check`):
+    /// verify the host can admit the CHILD VM this fork will create, before
+    /// any teardown, so persistent exhaustion degrades to guest `EAGAIN`.
+    /// Default: no gate (KVM has no hard VM-creation ceiling).
+    fn fork_admission_check(&self) -> Result<(), TrapError> {
+        Ok(())
+    }
+
     /// Build the `Send` payload a `clone(CLONE_THREAD)` sibling needs to add its
     /// own vCPU on the SAME VM (shared VM handle + window descriptors + a
     /// live-vcpu ticket). KVM `build_sibling_spec` (ignores `vcpu`); HVF publishes

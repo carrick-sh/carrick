@@ -84,6 +84,18 @@ pub trait SyscallTrap {
     /// vCPU context pointing at the same guest memory; the runtime then writes
     /// the appropriate retval into the guest's x0 via `complete_syscall`.
     fn fork(&mut self) -> Result<ForkOutcome, TrapError>;
+    /// Pre-fork admission gate: verify the host has VM/vCPU capacity for the
+    /// CHILD this fork is about to create, BEFORE any VM teardown or
+    /// `libc::fork`, so persistent exhaustion (HVF's ~127-VM hard ceiling)
+    /// surfaces here — with the parent VM still intact — as
+    /// [`TrapError::HostResourceExhausted`], which the runtime's fork arms
+    /// degrade to a guest `fork(2) = EAGAIN`. A post-fork rebuild failure
+    /// cannot be degraded (the child already exists and the parent VM is
+    /// gone), so this gate is the only sound EAGAIN point. Default: no gate
+    /// (backends without a hard creation ceiling).
+    fn fork_admission_check(&self) -> Result<(), TrapError> {
+        Ok(())
+    }
     /// `execve(2)` — tear down the current guest address space and
     /// re-initialise this engine with `new_image`. Does NOT advance past a
     /// syscall (execve has no successful return); the next `next_syscall`
@@ -209,6 +221,14 @@ pub enum TrapError {
     },
     #[error("fork(2) failed: {0}")]
     ForkFailed(String),
+    /// The host ran out of VM/vCPU capacity and stayed exhausted past the
+    /// bounded admission wait (HVF's ~127-VM hard ceiling / the ~120-permit
+    /// soft budget). Fork-shaped callers degrade this to a guest
+    /// `fork(2) = EAGAIN` (via the pre-fork [`SyscallTrap::fork_admission_check`]
+    /// gate) instead of a fatal engine abort; other creation paths surface it
+    /// as a bounded, loud error instead of parking forever.
+    #[error("host VM/vCPU capacity exhausted: {what}")]
+    HostResourceExhausted { what: String },
     #[error(
         "guest-memory map(host=0x{host_addr:x}, guest=0x{guest_start:x}, size={size}) failed in child: 0x{code:x}"
     )]
