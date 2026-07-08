@@ -291,16 +291,42 @@ fn abort_on_arena_error(err: ArenaError) -> ! {
 /// Claim and fill a child process record before `fork(2)` publishes the child's
 /// host pid. The pending ref is inherited by the fork child; both parent and
 /// child publish the same host pid after fork, which is intentionally idempotent.
+///
+/// Exhaustion is an `Err`, NOT an abort: a guest that forks children nobody
+/// reaps (SIGCHLD ignored, parent exited without a subreaper) can legitimately
+/// fill the section, and `fork(2)` must then fail with Linux `EAGAIN` (spec
+/// "Failure model") while the rest of the guest keeps running. On `Err`,
+/// nothing was claimed and the pending-child stash is untouched.
 pub fn prepare_child_record_pre_fork(
     parent_pid: u32,
     subreaper_pid: u32,
     ns_pid: u32,
     adopted: bool,
     ptrace_stop_signal: u64,
-) -> ProcessRecordRef {
+) -> Result<ProcessRecordRef, ArenaError> {
     init_child_table();
-    let generation = KernelArena::global().allocate_generation();
-    let r = match process_section().claim(None, generation, |record| {
+    let r = prepare_child_record_in(
+        KernelArena::global(),
+        parent_pid,
+        subreaper_pid,
+        ns_pid,
+        adopted,
+        ptrace_stop_signal,
+    )?;
+    PENDING_CHILD_RECORD.store(pack_ref(r), Ordering::Release);
+    Ok(r)
+}
+
+fn prepare_child_record_in(
+    arena: &KernelArena,
+    parent_pid: u32,
+    subreaper_pid: u32,
+    ns_pid: u32,
+    adopted: bool,
+    ptrace_stop_signal: u64,
+) -> Result<ProcessRecordRef, ArenaError> {
+    let generation = arena.allocate_generation();
+    arena.layout().processes.claim(None, generation, |record| {
         record.parent_host_pid.store(parent_pid, Ordering::Release);
         record.subreaper_pid.store(subreaper_pid, Ordering::Release);
         record.ns_pid.store(ns_pid, Ordering::Release);
@@ -309,12 +335,7 @@ pub fn prepare_child_record_pre_fork(
             .store(ptrace_stop_signal, Ordering::Release);
         record.flags.fetch_or(FLAG_ALIVE, Ordering::AcqRel);
         set_adopted(record, adopted);
-    }) {
-        Ok(r) => r,
-        Err(err) => abort_on_arena_error(err),
-    };
-    PENDING_CHILD_RECORD.store(pack_ref(r), Ordering::Release);
-    r
+    })
 }
 
 /// Parent-side publish by the ref `prepare_child_record_pre_fork` returned.
@@ -672,7 +693,8 @@ mod tests {
     /// post-fork registration fns are deleted; every registration goes this
     /// way now.
     fn register_for_test(child: u32, parent: u32, subreaper: u32, adopted: bool) {
-        let r = prepare_child_record_pre_fork(parent, subreaper, 0, adopted, 0);
+        let r = prepare_child_record_pre_fork(parent, subreaper, 0, adopted, 0)
+            .expect("prepare child record");
         publish_prepared_child_record_parent_ref(r, child);
     }
 
@@ -877,9 +899,11 @@ mod tests {
         // wait4(-1) park must go to the any-child kqueue path (-1): parking on
         // the FIRST child's pid misses the second child's exit (the single-pid
         // slice loop re-polls only the watched pid).
-        let prep1 = prepare_child_record_pre_fork(waiter, 0, 0, false, 0);
+        let prep1 =
+            prepare_child_record_pre_fork(waiter, 0, 0, false, 0).expect("prepare child record");
         publish_prepared_child_record_parent_ref(prep1, first);
-        let prep2 = prepare_child_record_pre_fork(waiter, 0, 0, false, 0);
+        let prep2 =
+            prepare_child_record_pre_fork(waiter, 0, 0, false, 0).expect("prepare child record");
         publish_prepared_child_record_parent_ref(prep2, second);
 
         assert_eq!(wait_any_park_pid(waiter), Some(-1));
@@ -896,7 +920,8 @@ mod tests {
         // No direct children, one adopted child not yet exit-ready: park on the
         // adopted child's concrete host pid (EVFILT_PROC watches non-children).
         let adopted = 818_184;
-        let prep3 = prepare_child_record_pre_fork(waiter, 0, 0, true, 0);
+        let prep3 =
+            prepare_child_record_pre_fork(waiter, 0, 0, true, 0).expect("prepare child record");
         publish_prepared_child_record_parent_ref(prep3, adopted);
         assert_eq!(wait_any_park_pid(waiter), Some(adopted as i32));
         let r3 = find_child_record(adopted).unwrap_or_else(|| panic!("adopted record"));
@@ -919,8 +944,10 @@ mod tests {
         // so another thread's prepare can overwrite the process-global stash
         // in that window. The parent must therefore publish the record IT
         // prepared, by ref — not whatever the stash currently holds.
-        let r1 = prepare_child_record_pre_fork(parent_a, 0, 111, false, 0);
-        let r2 = prepare_child_record_pre_fork(parent_b, 0, 222, false, 0);
+        let r1 = prepare_child_record_pre_fork(parent_a, 0, 111, false, 0)
+            .expect("prepare child record");
+        let r2 = prepare_child_record_pre_fork(parent_b, 0, 222, false, 0)
+            .expect("prepare child record");
         publish_prepared_child_record_parent_ref(r1, child_a);
         publish_prepared_child_record_parent_ref(r2, child_b);
 
@@ -936,6 +963,38 @@ mod tests {
     }
 
     #[test]
+    fn fork_time_claim_exhaustion_is_an_error_not_an_abort() {
+        // A guest that forks children nobody ever reaps (SIGCHLD set to
+        // SIG_IGN, or the parent exits with no subreaper) eventually fills the
+        // process section. The pre-fork claim must surface that as an error
+        // the fork dispatch can turn into Linux EAGAIN (spec "Failure model":
+        // section exhaustion fails the specific operation with a Linux errno)
+        // — never an abort of the whole guest.
+        let arena = KernelArena::create().expect("create private arena");
+        let section = &arena.layout().processes;
+        for i in 0..carrick_kernel::process::PROCESS_RECORDS {
+            section
+                .claim(
+                    Some(HostPid::new(0x0600_0000 + i as u32)),
+                    arena.allocate_generation(),
+                    |_| {},
+                )
+                .expect("fill section");
+        }
+        let claimed = prepare_child_record_in(&arena, 4242, 0, 77, false, 0);
+        assert!(
+            matches!(
+                claimed,
+                Err(ArenaError::Exhausted {
+                    section: "processes",
+                    ..
+                })
+            ),
+            "expected recoverable exhaustion, got {claimed:?}"
+        );
+    }
+
+    #[test]
     fn prefork_record_is_complete_when_child_publishes_host_pid() {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         init_child_table();
@@ -944,7 +1003,8 @@ mod tests {
         let stop_signal = libc::SIGTRAP;
 
         let prepared =
-            prepare_child_record_pre_fork(parent_pid, 0, ns_pid, false, stop_signal as u64);
+            prepare_child_record_pre_fork(parent_pid, 0, ns_pid, false, stop_signal as u64)
+                .expect("prepare child record");
         let child = unsafe { libc::fork() };
         assert!(child >= 0, "fork failed");
         if child == 0 {
@@ -984,7 +1044,8 @@ mod tests {
         init_child_table();
         let recorded_parent = std::process::id().saturating_add(10_000);
 
-        let prepared = prepare_child_record_pre_fork(recorded_parent, 0, 45_052, false, 0);
+        let prepared = prepare_child_record_pre_fork(recorded_parent, 0, 45_052, false, 0)
+            .expect("prepare child record");
         let child = unsafe { libc::fork() };
         assert!(child >= 0, "fork failed");
         if child == 0 {
