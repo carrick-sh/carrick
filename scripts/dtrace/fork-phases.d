@@ -30,6 +30,17 @@ carrick*:::fork-quiesce
         pid, (int)arg0, (int)arg1, (int)arg2, (int)arg3);
 }
 
+carrick*:::fork-rebuild
+/(pid == $target || progenyof($target))/
+{
+    printf("[%d] fork-rebuild role=%d phase=%d desc=%d maps=%d elapsed_us=%d\n",
+        pid, (int)arg0, (int)arg1, (uint64_t)arg2, (uint64_t)arg3,
+        (uint64_t)arg4);
+    @rebuild_us[(int)arg0, (int)arg1] = avg((uint64_t)arg4);
+    @rebuild_maps[(int)arg0, (int)arg1] = avg((uint64_t)arg3);
+    @rebuild_descs[(int)arg0, (int)arg1] = avg((uint64_t)arg2);
+}
+
 carrick*:::fork-post
 /(pid == $target || progenyof($target)) && fork_start[pid]/
 {
@@ -74,4 +85,7 @@ dtrace:::END
     printa("child rebuild avg us %@d\n", @child_rebuild_avg_us);
     printa("parent rebuild us %@d\n", @parent_rebuild_us);
     printa("child rebuild us %@d\n", @child_rebuild_us);
+    printa("rebuild us role=%d phase=%d %@d\n", @rebuild_us);
+    printa("rebuild maps role=%d phase=%d %@d\n", @rebuild_maps);
+    printa("rebuild descs role=%d phase=%d %@d\n", @rebuild_descs);
 }
