@@ -337,13 +337,39 @@ where
         };
         let child_subreaper = kernel.dispatcher.subreaper_for_fork_child();
         let child_ns_pid = crate::namespace::pid::allocate_child_ns_pid_pre_fork();
-        let prepared_child_record = crate::guest_cpu::prepare_child_record_pre_fork(
+        // Section exhaustion (a guest that forks children nobody ever reaps —
+        // SIGCHLD ignored, or the parent exited without a subreaper) is
+        // Linux-shaped EAGAIN from fork(2), not a guest abort (spec "Failure
+        // model"). Unwind exactly like the engine-fork error arm below, but
+        // complete the syscall instead of surfacing a runtime error.
+        let prepared_child_record = match crate::guest_cpu::prepare_child_record_pre_fork(
             child_parent,
             child_subreaper,
             child_ns_pid.unwrap_or(0),
             clone_parent && child_parent != 0,
             0,
-        );
+        ) {
+            Ok(r) => r,
+            Err(_exhausted) => {
+                drop(paused_guard);
+                if let Some((r, w)) = vfork_pipe {
+                    unsafe {
+                        libc::close(r);
+                        libc::close(w);
+                    }
+                }
+                if quiesced {
+                    fork_barrier().end_quiesce();
+                }
+                fork_barrier().end_fork();
+                kernel.fork.restart_after_fork_error(
+                    prepared_fork,
+                    &self.kicker,
+                    &self.platform_futex,
+                );
+                return Ok(Some(crate::linux_abi::LINUX_EAGAIN.guest_retval()));
+            }
+        };
 
         let fork_result = if vfork_pipe.is_some() {
             engine.fork_vfork()
