@@ -297,6 +297,7 @@ dependencies = [
  "carrick-hal",
  "carrick-host",
  "carrick-mem",
+ "carrick-observability",
  "libc",
 ]
 

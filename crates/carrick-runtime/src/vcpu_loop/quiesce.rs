@@ -101,6 +101,10 @@ where
         engine: &mut E,
         request: ForkRequest,
     ) -> Result<Option<i64>, RuntimeError> {
+        let elapsed_us = |start: std::time::Instant| -> u64 {
+            let micros = start.elapsed().as_micros();
+            micros.min(u128::from(u64::MAX)) as u64
+        };
         let ForkRequest {
             pidfd_out,
             clone_parent,
@@ -118,16 +122,20 @@ where
         // already holds the token, BLOCK rather than surfacing EAGAIN. Park at the
         // in-flight fork's barrier so it can count this thread as quiesced and
         // complete, then retry the token.
+        let phase_start = std::time::Instant::now();
         while !fork_barrier().try_begin_fork() {
             if fork_barrier().is_quiescing() {
                 self.release_and_park_vcpu_for_fork(engine)?;
             }
             std::thread::yield_now();
         }
+        crate::probes::fork_lifecycle(0, 0, elapsed_us(phase_start), 0, 0);
         // Serialize VM topology against sibling vCPU creation for the whole fork.
+        let phase_start = std::time::Instant::now();
         let _topology = crate::fork_quiesce::topology_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        crate::probes::fork_lifecycle(0, 1, elapsed_us(phase_start), 0, 0);
         // Clear any VM published by a previous fork so siblings that release their
         // vCPUs this round see only THIS fork's republished VM. Also reset the
         // sibling-mapping registry so this round collects a clean set (siblings
@@ -145,6 +153,7 @@ where
             self.this_tid.raw(),
         );
         let mut quiesced = false;
+        let phase_start = std::time::Instant::now();
         if others > 0 {
             let barrier = fork_barrier();
             barrier.set_quiescing();
@@ -222,6 +231,13 @@ where
             }
             quiesced = true;
         }
+        crate::probes::fork_lifecycle(
+            0,
+            2,
+            elapsed_us(phase_start),
+            others as i64,
+            self.kicker.count() as i64,
+        );
 
         // INVARIANT before tearing down the VM: no OTHER guest vCPU is live
         // besides this forker's (VCPU_LIVE == 1). Give the kicked siblings a
@@ -239,6 +255,7 @@ where
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
             use std::sync::atomic::Ordering::SeqCst;
+            let phase_start = std::time::Instant::now();
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             while crate::trap::VCPU_LIVE.load(SeqCst) > 1 {
                 if std::time::Instant::now() >= deadline {
@@ -257,6 +274,13 @@ where
                 kernel.signal_arrival.wake_all_waiters();
                 std::thread::sleep(std::time::Duration::from_micros(200));
             }
+            crate::probes::fork_lifecycle(
+                0,
+                3,
+                elapsed_us(phase_start),
+                crate::trap::VCPU_LIVE.load(SeqCst) as i64,
+                self.kicker.count() as i64,
+            );
         }
 
         // Drain in-flight EXIT CLEANUPS before forking. An exiting thread drops
@@ -273,6 +297,7 @@ where
         // the 5s bound exists only against pathology, and on expiry we proceed
         // (the status-quo risk) rather than kill a healthy guest.
         {
+            let phase_start = std::time::Instant::now();
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             while crate::fork_quiesce::exit_cleanups_in_flight() > 0 {
                 if std::time::Instant::now() >= deadline {
@@ -285,8 +310,16 @@ where
                 }
                 std::thread::yield_now();
             }
+            crate::probes::fork_lifecycle(
+                0,
+                4,
+                elapsed_us(phase_start),
+                crate::fork_quiesce::exit_cleanups_in_flight() as i64,
+                0,
+            );
         }
 
+        let phase_start = std::time::Instant::now();
         // Publish the arena high-water so the child snapshot's mincore scan is
         // bounded to the guest's used prefix, not all 32 GiB. The HVF child
         // snapshot reads the process-global (trap::set_guest_arena_high_water); a
@@ -370,12 +403,21 @@ where
                 return Ok(Some(crate::linux_abi::LINUX_EAGAIN.guest_retval()));
             }
         };
+        crate::probes::fork_lifecycle(
+            0,
+            5,
+            elapsed_us(phase_start),
+            child_ns_pid.map(i64::from).unwrap_or(-1),
+            i64::from(vfork_pipe.is_some()),
+        );
 
+        let phase_start = std::time::Instant::now();
         let fork_result = if vfork_pipe.is_some() {
             engine.fork_vfork()
         } else {
             engine.fork()
         };
+        let engine_fork_elapsed = elapsed_us(phase_start);
         // Release the barrier mutex FIRST THING on both sides (and on the error
         // path): every arm below calls `end_quiesce` / `park_if_quiescing`,
         // which retake it (self-deadlock if still held).
@@ -402,9 +444,18 @@ where
                 return Err(RuntimeError::Trap(error));
             }
         };
+        match &fork_outcome {
+            crate::trap::ForkOutcome::Parent { child_pid } => {
+                crate::probes::fork_lifecycle(0, 6, engine_fork_elapsed, i64::from(*child_pid), 0);
+            }
+            crate::trap::ForkOutcome::Child => {
+                crate::probes::fork_lifecycle(1, 6, engine_fork_elapsed, 0, 0);
+            }
+        }
 
         let retval = match fork_outcome {
             crate::trap::ForkOutcome::Parent { child_pid } => {
+                let runtime_repair_start = std::time::Instant::now();
                 // Publish the rebuilt VM so quiesced siblings recreate their vCPUs
                 // in it, THEN resume them.
                 if quiesced {
@@ -472,6 +523,7 @@ where
                 // end → our read() returns EOF). We still hold `_topology`, so no
                 // concurrent fork can quiesce us. Retry on EINTR.
                 if let Some((vf_read, _vf_write)) = vfork_pipe {
+                    let vfork_wait_start = std::time::Instant::now();
                     unsafe { libc::close(_vf_write) }; // parent only reads
                     // Bounded suspend: the child should execve/_exit within ms, but
                     // a pathological guest must NOT wedge the parent forever — we
@@ -525,10 +577,25 @@ where
                     // overwrote the shared EL1 shim identity page; restore the
                     // parent's getpid/get*id fast-path values before resuming it.
                     stamp_identity_page(engine, &kernel.dispatcher);
+                    crate::probes::fork_lifecycle(
+                        0,
+                        9,
+                        elapsed_us(vfork_wait_start),
+                        i64::from(child_pid),
+                        0,
+                    );
                 }
+                crate::probes::fork_lifecycle(
+                    0,
+                    7,
+                    elapsed_us(runtime_repair_start),
+                    i64::from(child_pid),
+                    0,
+                );
                 retval
             }
             crate::trap::ForkOutcome::Child => {
+                let runtime_repair_start = std::time::Instant::now();
                 kernel.dispatcher.clear_output_buffers();
                 // A forked child must NOT inherit its PARENT's vfork suspend-pipe
                 // write end (copied across libc::fork). Drop the inherited copy so
@@ -648,6 +715,7 @@ where
                     &self.kicker,
                     &self.platform_futex,
                 );
+                crate::probes::fork_lifecycle(1, 8, elapsed_us(runtime_repair_start), 0, 0);
                 0
             }
         };

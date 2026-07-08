@@ -3856,6 +3856,10 @@ impl HvfVmState {
     /// shared engine does that) and does NOT snapshot the vCPU registers (the
     /// engine snapshots separately and passes them into `fork_rebuild`).
     pub(crate) fn fork_prepare_and_teardown(&mut self) -> Result<(), TrapError> {
+        let elapsed_us = |start: std::time::Instant| -> u64 {
+            let micros = start.elapsed().as_micros();
+            micros.min(u128::from(u64::MAX)) as u64
+        };
         // Probe parity with the old monolithic fork: the engine snapshots the
         // vCPU (PC/ELR/CPSR) just before this; report the pre-fork marker. The
         // vCPU registers are no longer read here (the engine owns the snapshot),
@@ -3878,6 +3882,7 @@ impl HvfVmState {
         // the WHOLE region (offset 0, full len) — a sub-range would clip the map
         // entry and shadow on the first fork. The parent restores VM_INHERIT_COPY
         // after the fork (fork_rebuild) so later PLAIN forks stay cheap COW.
+        let phase_start = std::time::Instant::now();
         if self.vfork_share {
             for m in &self.mappings {
                 let is_pt = m.start == crate::memory::LINUX_PAGE_TABLES_BASE;
@@ -3886,7 +3891,15 @@ impl HvfVmState {
                 }
             }
         }
+        crate::probes::fork_lifecycle(
+            4,
+            0,
+            elapsed_us(phase_start),
+            self.mappings.len() as i64,
+            i64::from(self.vfork_share),
+        );
 
+        let phase_start = std::time::Instant::now();
         let mapping_descs: Vec<ForkMappingDesc> = self
             .mappings
             .iter()
@@ -3903,9 +3916,11 @@ impl HvfVmState {
                 shared_key_offset: m.shared_key_offset,
             })
             .collect();
+        crate::probes::fork_lifecycle(4, 1, elapsed_us(phase_start), mapping_descs.len() as i64, 0);
 
         let share_vm = self.vfork_share;
         let mut child_descs: Vec<ForkMappingDesc> = Vec::with_capacity(mapping_descs.len());
+        let phase_start = std::time::Instant::now();
         for desc in &mapping_descs {
             // vfork (CLONE_VM): the child shares the parent's address space until it
             // execs/exits, while the parent vCPU stays SUSPENDED. carrick forks a
@@ -3955,6 +3970,7 @@ impl HvfVmState {
                 shared_key_offset: desc.shared_key_offset,
             });
         }
+        crate::probes::fork_lifecycle(4, 2, elapsed_us(phase_start), child_descs.len() as i64, 0);
 
         // Tear down the parent's HVF context BEFORE the engine forks. macOS's
         // HVF kernel state is not fork-safe: if a VM exists in the parent at
@@ -3964,10 +3980,19 @@ impl HvfVmState {
         // `freeze_ram_for_fork` hook does NOT pass the vCPU, so we destroy by the
         // tracked `vcpu_id` (the stale `HvfAarch64Vcpu` wrapper is replaced in
         // `fork_rebuild`, which DOES hold `&mut vcpu`).
+        let phase_start = std::time::Instant::now();
         let vcpu_destroy_rc = unsafe { applevisor_sys::hv_vcpu_destroy(self.vcpu_id) };
         if vcpu_destroy_rc == 0 {
             vcpu_destroyed(self.vcpu_id);
         }
+        crate::probes::fork_lifecycle(
+            4,
+            3,
+            elapsed_us(phase_start),
+            vcpu_destroy_rc as i64,
+            self.vcpu_id as i64,
+        );
+        let phase_start = std::time::Instant::now();
         let vm_destroy_rc = unsafe { applevisor_sys::hv_vm_destroy() };
         // phase 2: a nonzero rc means a vCPU was still live at teardown — the
         // HV_BUSY root cause (the rebuilt VM is then corrupt and sibling
@@ -3978,9 +4003,24 @@ impl HvfVmState {
             VCPU_LIVE.load(std::sync::atomic::Ordering::SeqCst),
             unsafe { libc::getpid() },
         );
+        crate::probes::fork_lifecycle(
+            4,
+            4,
+            elapsed_us(phase_start),
+            vm_destroy_rc as i64,
+            VCPU_LIVE.load(std::sync::atomic::Ordering::SeqCst) as i64,
+        );
 
+        let phase_start = std::time::Instant::now();
         self.fork_mapping_descs = mapping_descs;
         self.fork_child_descs = child_descs;
+        crate::probes::fork_lifecycle(
+            4,
+            5,
+            elapsed_us(phase_start),
+            self.fork_mapping_descs.len() as i64,
+            self.fork_child_descs.len() as i64,
+        );
         Ok(())
     }
 
@@ -4013,12 +4053,25 @@ impl HvfVmState {
         // via fork). Each side independently re-registers the inherited host
         // buffers via raw `hv_vm_map`.
         if is_child {
+            let phase_start = std::time::Instant::now();
             reset_admission_permits_after_fork_child();
+            crate::probes::fork_lifecycle(role + 4, 10, elapsed_us(phase_start), 0, 0);
         }
+        let phase_start = std::time::Instant::now();
         let (new_vm, permit) = create_vm_with_admission(VmCreateAdmission::ForkRebuild {
             vfork: self.vfork_share,
         })?;
+        crate::probes::fork_lifecycle(role + 4, 11, elapsed_us(phase_start), 0, 0);
+        let phase_start = std::time::Instant::now();
         let new_vcpu = create_vcpu_with_permit(&new_vm, permit)?;
+        crate::probes::fork_lifecycle(
+            role + 4,
+            12,
+            elapsed_us(phase_start),
+            new_vcpu.id() as i64,
+            0,
+        );
+        let phase_start = std::time::Instant::now();
         enable_el0_counter_access(new_vcpu.id());
         self.vcpu_id = new_vcpu.id();
         self.vcpu_handle = new_vcpu.get_handle();
@@ -4028,12 +4081,20 @@ impl HvfVmState {
         // child process; the parent kept its pre-fork host process identity.
         std::mem::forget(std::mem::replace(vcpu, new_vcpu));
         replace_destroyed_vm(self, new_vm);
+        crate::probes::fork_lifecycle(
+            role + 4,
+            13,
+            elapsed_us(phase_start),
+            self.vcpu_id as i64,
+            0,
+        );
 
         // In the parent, keep the exact shared protection table siblings already
         // use; otherwise post-fork mmap/mprotect changes split across two Arcs and
         // one thread can see a valid Go heap futex as PROT_NONE. The child is
         // single-threaded after fork, so it gets a private copy of the parent's
         // ranges at the fork point.
+        let phase_start = std::time::Instant::now();
         self.protections = if is_child {
             std::sync::Arc::new(MemoryProtections::from_snapshot(
                 self.protections.snapshot_all(),
@@ -4079,6 +4140,7 @@ impl HvfVmState {
         self.forked_no_exec = is_child;
         self.last_syscall_nr = None;
         self.last_syscall_orig_x0 = 0;
+        crate::probes::fork_lifecycle(role + 4, 14, elapsed_us(phase_start), 0, 0);
 
         // Re-map each region using raw hv_vm_map. The PARENT re-maps its original
         // buffers; the CHILD maps the pre-fork private snapshots for PRIVATE
@@ -4157,12 +4219,20 @@ impl HvfVmState {
         // silently sharing its address space. The vfork child execs/exits, so it
         // keeps the inherited SHARE attribute harmlessly (a no-op once it detaches).
         if !is_child && self.vfork_share {
+            let phase_start = std::time::Instant::now();
             for m in &self.mappings {
                 let is_pt = m.start == crate::memory::LINUX_PAGE_TABLES_BASE;
                 if m.guest_writable && !m.guest_shared && !is_pt {
                     set_region_fork_inheritance(m.host_addr, m.size, VM_INHERIT_COPY);
                 }
             }
+            crate::probes::fork_lifecycle(
+                role + 4,
+                15,
+                elapsed_us(phase_start),
+                self.mappings.len() as i64,
+                0,
+            );
         }
 
         // PARENT only: re-map the UNION of all quiesced siblings' regions that
@@ -4236,8 +4306,10 @@ impl HvfVmState {
         // parent and child resume inside the same `clone` syscall site; the
         // dispatcher then writes the appropriate retval into X0 (child pid for
         // parent, 0 for child).
+        let phase_start = std::time::Instant::now();
         HvfInner::restore_vcpu_into(vcpu, snap)?;
         self.last_exit_class = snap.last_exit_class;
+        crate::probes::fork_lifecycle(role + 4, 16, elapsed_us(phase_start), 0, 0);
         crate::probes::fork_rebuild(role, 3, desc_count, local_maps, elapsed_us(rebuild_start));
         let post_pid = if is_child {
             0
@@ -4251,7 +4323,9 @@ impl HvfVmState {
             // `carrick*` provider matches this child too — otherwise forked guest
             // processes (apt's http method, dpkg-deb's tar subprocess) are
             // invisible to `carrick trace`.
+            let phase_start = std::time::Instant::now();
             let _ = crate::probes::register_dtrace_probes();
+            crate::probes::fork_lifecycle(role + 4, 17, elapsed_us(phase_start), 0, 0);
             // P2 getrandom fork-safety: re-stamp the vvar RNG generation with the
             // child's new PID. `self` is now the child's rebuilt engine — its vvar
             // mapping points at the child's freshly re-mapped snapshot buffer, and
@@ -4259,7 +4333,9 @@ impl HvfVmState {
             // visible to the child's guest reads. The child's distinct generation
             // forces the userspace getrandom blob to reseed instead of reusing the
             // parent's keystream (gated by conformance-probes/getrandomvdsofork).
+            let phase_start = std::time::Instant::now();
             self.stamp_rng_generation();
+            crate::probes::fork_lifecycle(role + 4, 18, elapsed_us(phase_start), 0, 0);
         }
         Ok(())
     }
