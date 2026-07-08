@@ -350,7 +350,7 @@ where
 {
     // Drain the cross-process explicit-signal ring into pending state, so the
     // normal delivery below runs each with the sender's identity.
-    dispatcher.drain_xsignals_for_tid(tid);
+    dispatcher.drain_xsignals_process_directed();
 
     let pending = crate::host_signal::take_pending_for(tid.raw());
     // Provenance of the taken signal (see take_pending_in_from): a host-slot

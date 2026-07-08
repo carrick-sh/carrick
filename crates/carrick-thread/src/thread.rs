@@ -130,27 +130,35 @@ pub enum VcpuParkClass {
 /// Everything the registry's ONE mutex guards: the thread table plus the
 /// process-wide "the VM was torn down while every thread was parked and
 /// needs a rebuild" flag. Kept as a single struct behind a single lock so
-/// `park_vcpu`'s last-unparked check and `unpark_vcpu`'s claim of the
-/// rebuild flag are each one atomic critical section, not two locks that
+/// each parking method is one atomic critical section, not two locks that
 /// could race against each other.
 ///
-/// The vCPU-parking contract is SIX methods: `park_vcpu_classified` (mark
-/// with a [`VcpuParkClass`] + the last-unparked verdict; on the MT path the
-/// caller marks only AFTER its vCPU is actually destroyed, so the mark is
-/// truthful — `park_vcpu` is the class-conservative `FdBacked` shorthand),
-/// `unpark_vcpu` (clear + atomically claim the rebuild), `set_vm_released`
-/// / `vm_released` (the flag itself), and the release re-checks taken by
-/// the last parker under the process topology lock, atomically with the VM
-/// teardown — `all_other_vcpus_parked` (every other live thread parked) and
-/// `all_other_parked_release_safe` (…AND every one of them wake-safe under
-/// a released VM), so a sibling's wake between the verdict and the teardown
-/// downgrades the whole-VM release instead of racing it, and a parked
-/// fd-backed waiter vetoes it outright.
+/// The vCPU-parking contract, as SHIPPED (the deferred slice-tick lease —
+/// releases happen from a slicing arm's second full parked slice, never
+/// from the park path itself): `park_vcpu_classified` marks a thread parked
+/// with a [`VcpuParkClass`] (on the MT path the runtime marks only AFTER
+/// its vCPU is actually destroyed, so the mark is truthful; `park_vcpu` is
+/// the class-conservative `FdBacked` shorthand); `unpark_vcpu` clears the
+/// mark and atomically claims the rebuild; `set_vm_released`/`vm_released`
+/// are the flag itself; and `all_other_parked_release_safe` is the
+/// upgrader's under-topology-lock re-check (every other live thread parked
+/// AND wake-safe under a released VM — a parked fd-backed waiter vetoes),
+/// so a sibling's wake between a park verdict and the teardown downgrades
+/// the release instead of racing it.
+///
+/// Test-pinned quantifier surface (no production caller, kept because the
+/// unit tests pin the quantifier semantics the re-check builds on): the
+/// last-unparked verdict `park_vcpu_classified` RETURNS — production call
+/// sites discard it (`let _ =`); the slice-tick upgrader decides via the
+/// re-check, not the verdict — and the class-blind `all_other_vcpus_parked`
+/// query.
 struct RegistryInner {
     map: HashMap<ThreadId, ThreadEntry>,
-    /// Set by the thread that parks last (see `park_vcpu`) once it has torn
-    /// down the VM; cleared by whichever `unpark_vcpu` caller claims it
-    /// first, so exactly one waker performs the rebuild.
+    /// Set by whichever thread RELEASES the VM — a single-threaded park
+    /// (the park path's unconditional release) or an MT slicing thread's
+    /// slice-tick upgrade (`try_release_vm_mt`, only after the engine
+    /// reports the teardown succeeded); cleared by whichever `unpark_vcpu`
+    /// caller claims it first, so exactly one waker performs the rebuild.
     vm_released: bool,
 }
 
@@ -418,13 +426,17 @@ impl ThreadRegistry {
     }
 
     /// Mark `tid`'s vCPU as parked (quiesced), recording how its wake path
-    /// behaves under a released VM. Returns true iff `tid` was not already
-    /// parked AND every OTHER live thread is already parked — i.e. the
-    /// caller is the last thread to park, the one responsible for whatever
-    /// barrier action follows (e.g. tearing down the VM). Returns false for
-    /// an unknown `tid`, and false if `tid` was already parked (parking is
-    /// idempotent — it does not re-report "last" on a repeat call; a repeat
-    /// call still updates the recorded class).
+    /// behaves under a released VM. The mark is what the shipped slice-tick
+    /// lease consumes (via [`Self::all_other_parked_release_safe`]); the
+    /// RETURNED last-unparked verdict — true iff `tid` was not already
+    /// parked AND every OTHER live thread is already parked — is
+    /// test-pinned quantifier surface: production call sites discard it
+    /// (the deferred design releases from a slicing arm's re-check, never
+    /// from the park itself), but the unit tests pin the quantifier the
+    /// re-check builds on. Returns false for an unknown `tid`, and false if
+    /// `tid` was already parked (parking is idempotent — it does not
+    /// re-report "last" on a repeat call; a repeat call still updates the
+    /// recorded class).
     pub fn park_vcpu_classified(&self, tid: ThreadId, class: VcpuParkClass) -> bool {
         let mut inner = self.inner.lock();
         let already_parked = match inner.map.get(&tid) {
@@ -459,14 +471,11 @@ impl ThreadRegistry {
     }
 
     /// True iff every live thread OTHER than `tid` is currently vcpu-parked
-    /// (any class).
-    ///
-    /// The whole-VM release path re-checks under the process topology lock,
-    /// atomically with the VM teardown: a sibling whose wake claimed the
-    /// rebuild (`unpark_vcpu`, taken under the same topology lock) after the
-    /// `park_vcpu` last-unparked verdict — but before the teardown —
-    /// DOWNGRADES the release to a vCPU-only park instead of racing the
-    /// teardown against the sibling's vCPU re-create.
+    /// (any class). Test-pinned quantifier surface: the shipped release
+    /// re-check is the class-aware [`Self::all_other_parked_release_safe`]
+    /// (this class-blind variant has no production caller); kept because
+    /// the unit tests pin the all-others-parked quantifier semantics both
+    /// queries share.
     pub fn all_other_vcpus_parked(&self, tid: ThreadId) -> bool {
         let inner = self.inner.lock();
         inner
@@ -491,8 +500,10 @@ impl ThreadRegistry {
             .all(|(_, e)| e.vcpu_parked == Some(VcpuParkClass::ReleaseSafe))
     }
 
-    /// Record that the last-parked thread destroyed the VM (or, with
-    /// `released = false`, that a rebuild has been handled).
+    /// Record that the VM was destroyed while every thread was parked — set
+    /// by an ST park's unconditional release or an MT slicing thread's
+    /// slice-tick upgrade (or, with `released = false`, that a rebuild has
+    /// been handled).
     pub fn set_vm_released(&self, released: bool) {
         self.inner.lock().vm_released = released;
     }
