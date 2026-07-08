@@ -1437,7 +1437,7 @@ where
                         break Ok(DispatchOutcome::Returned { value: 0 });
                     }
                     let sleep_interrupt_pending = || {
-                        kernel.dispatcher.drain_xsignals_for_tid(self.this_tid);
+                        kernel.dispatcher.drain_xsignals_process_directed();
                         kernel.dispatcher.has_deliverable_dispatch_pending_for_wait(
                             self.this_tid,
                             carrick_abi::WaitSigMask::Additive(carrick_abi::SigSet::EMPTY),

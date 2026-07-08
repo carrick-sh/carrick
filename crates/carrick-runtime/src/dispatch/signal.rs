@@ -826,10 +826,11 @@ impl SyscallDispatcher {
     }
 
     /// Drain cross-process explicit signals queued for this host process into
-    /// dispatcher pending state for `tid`, preserving siginfo payloads. Normal
-    /// async delivery and synchronous waits (`rt_sigtimedwait`/sigwait) both use
-    /// this so an xsignal can be consumed by either path.
-    pub(crate) fn drain_xsignals_for_tid(&self, _tid: crate::thread::ThreadId) {
+    /// the dispatcher's PROCESS-directed pending state (a ring entry carries
+    /// no target tid), preserving siginfo payloads. Normal async delivery and
+    /// synchronous waits (`rt_sigtimedwait`/sigwait) both use this so an
+    /// xsignal can be consumed by either path — any thread may run the drain.
+    pub(crate) fn drain_xsignals_process_directed(&self) {
         // Ring-authoritative gate (`SigBlockMask::NONE` => "any entry targets
         // this process"),
         // NOT the losable process-local `XSIG_DIRTY` hint: a dropped host nudge
@@ -1831,7 +1832,7 @@ impl SyscallDispatcher {
                 timeout = Some(Duration::new(tv_sec as u64, tv_nsec as u32));
             }
 
-            this.drain_xsignals_for_tid(tid);
+            this.drain_xsignals_process_directed();
             let memory = &mut *cx.memory;
             if let Some((signum, from_thread)) = this.take_pending_in_from(tid, wait_set) {
                 // Carry any queued rt_sigqueueinfo payload (si_code/pid/uid/value)
@@ -2628,7 +2629,7 @@ mod tests {
             "ring slot available"
         );
         // The SIBLING wins the drain race (the hang's interleaving).
-        d.drain_xsignals_for_tid(sibling);
+        d.drain_xsignals_process_directed();
 
         // Nothing may be pinned to the drainer…
         assert!(
