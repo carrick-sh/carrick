@@ -100,12 +100,29 @@ struct ThreadEntry {
     /// query a host kernel thread state through Mach. Defaults to running; the
     /// runtime marks it sleeping around genuine blocking waits.
     proc_state: char,
+    /// True while this thread's vCPU is parked (quiesced) as part of an
+    /// all-threads-parked barrier — see [`ThreadRegistry::park_vcpu`].
+    vcpu_parked: bool,
+}
+
+/// Everything the registry's ONE mutex guards: the thread table plus the
+/// process-wide "the VM was torn down while every thread was parked and
+/// needs a rebuild" flag. Kept as a single struct behind a single lock so
+/// `park_vcpu`'s last-unparked check and `unpark_vcpu`'s claim of the
+/// rebuild flag are each one atomic critical section, not two locks that
+/// could race against each other.
+struct RegistryInner {
+    map: HashMap<ThreadId, ThreadEntry>,
+    /// Set by the thread that parks last (see `park_vcpu`) once it has torn
+    /// down the VM; cleared by whichever `unpark_vcpu` caller claims it
+    /// first, so exactly one waker performs the rebuild.
+    vm_released: bool,
 }
 
 pub struct ThreadRegistry {
     main_tid: ThreadId,
     next_tid: AtomicI32,
-    inner: ParkingMutex<HashMap<ThreadId, ThreadEntry>>,
+    inner: ParkingMutex<RegistryInner>,
 }
 
 /// Process-global handle to THIS process's live thread registry, so the
@@ -194,12 +211,16 @@ impl ThreadRegistry {
                 mach_port: 0,
                 name: None,
                 proc_state: 'R',
+                vcpu_parked: false,
             },
         );
         Self {
             main_tid,
             next_tid: AtomicI32::new(main_tid.raw() + 1),
-            inner: ParkingMutex::new(map),
+            inner: ParkingMutex::new(RegistryInner {
+                map,
+                vm_released: false,
+            }),
         }
     }
 
@@ -209,24 +230,25 @@ impl ThreadRegistry {
 
     pub fn register_child(&self, clear_child_tid: u64) -> ThreadId {
         let tid = ThreadId::from_registry_allocation(self.next_tid.fetch_add(1, Ordering::Relaxed));
-        self.inner.lock().insert(
+        self.inner.lock().map.insert(
             tid,
             ThreadEntry {
                 clear_child_tid,
                 mach_port: 0,
                 name: None,
                 proc_state: 'R',
+                vcpu_parked: false,
             },
         );
         tid
     }
 
     pub fn clear_child_tid(&self, tid: ThreadId) -> Option<u64> {
-        self.inner.lock().get(&tid).map(|e| e.clear_child_tid)
+        self.inner.lock().map.get(&tid).map(|e| e.clear_child_tid)
     }
 
     pub fn set_clear_child_tid(&self, tid: ThreadId, addr: u64) {
-        if let Some(e) = self.inner.lock().get_mut(&tid) {
+        if let Some(e) = self.inner.lock().map.get_mut(&tid) {
             e.clear_child_tid = addr;
         }
     }
@@ -243,25 +265,26 @@ impl ThreadRegistry {
             && self
                 .inner
                 .lock()
+                .map
                 .values()
                 .any(|e| e.clear_child_tid == addr)
     }
 
     /// Returns true if this was the last live thread (process should exit).
     pub fn exit(&self, tid: ThreadId) -> bool {
-        let mut map = self.inner.lock();
-        map.remove(&tid);
-        map.is_empty()
+        let mut inner = self.inner.lock();
+        inner.map.remove(&tid);
+        inner.map.is_empty()
     }
 
     pub fn live_count(&self) -> usize {
-        self.inner.lock().len()
+        self.inner.lock().map.len()
     }
 
     /// Is `tid` a live thread of this process? Used to route a guest
     /// `tgkill`/`tkill` to a sibling vs. reporting ESRCH.
     pub fn is_live(&self, tid: ThreadId) -> bool {
-        self.inner.lock().contains_key(&tid)
+        self.inner.lock().map.contains_key(&tid)
     }
 
     /// Remove every live thread entry except `keep_tid`.
@@ -272,10 +295,15 @@ impl ThreadRegistry {
     /// had a guest tid but had not yet built its vCPU can notice that its stale
     /// pre-exec thread spec is no longer live and exit without creating one.
     pub fn remove_all_except(&self, keep_tid: ThreadId) -> Vec<ThreadId> {
-        let mut map = self.inner.lock();
-        let removed: Vec<ThreadId> = map.keys().copied().filter(|tid| *tid != keep_tid).collect();
+        let mut inner = self.inner.lock();
+        let removed: Vec<ThreadId> = inner
+            .map
+            .keys()
+            .copied()
+            .filter(|tid| *tid != keep_tid)
+            .collect();
         for tid in &removed {
-            map.remove(tid);
+            inner.map.remove(tid);
         }
         removed
     }
@@ -285,7 +313,7 @@ impl ThreadRegistry {
     /// route a process-directed signal (`kill(getpid(), sig)`) to a thread that
     /// doesn't block `sig`.
     pub fn live_tids(&self) -> Vec<ThreadId> {
-        self.inner.lock().keys().copied().collect()
+        self.inner.lock().map.keys().copied().collect()
     }
 
     /// Set `tid`'s name (prctl PR_SET_NAME / pthread_setname_np). `name` is the
@@ -294,7 +322,7 @@ impl ThreadRegistry {
         let mut buf = [0u8; 16];
         let n = name.iter().take_while(|&&b| b != 0).count().min(15);
         buf[..n].copy_from_slice(&name[..n]);
-        if let Some(e) = self.inner.lock().get_mut(&tid) {
+        if let Some(e) = self.inner.lock().map.get_mut(&tid) {
             e.name = Some(buf);
         }
     }
@@ -302,7 +330,7 @@ impl ThreadRegistry {
     /// `tid`'s name, if it has named itself; `None` falls back to the exe
     /// basename at the /proc/comm layer.
     pub fn thread_name(&self, tid: ThreadId) -> Option<[u8; 16]> {
-        self.inner.lock().get(&tid).and_then(|e| e.name)
+        self.inner.lock().map.get(&tid).and_then(|e| e.name)
     }
 
     /// Record the mach port of the host thread backing `tid`. Called ONCE by
@@ -310,7 +338,7 @@ impl ThreadRegistry {
     /// is the only per-thread state we keep for `/proc` — the run/sleep state
     /// is read live from the kernel, not tracked here.
     pub fn record_thread_port(&self, tid: ThreadId, port: ThreadPort) {
-        if let Some(e) = self.inner.lock().get_mut(&tid) {
+        if let Some(e) = self.inner.lock().map.get_mut(&tid) {
             e.mach_port = port;
         }
     }
@@ -323,6 +351,7 @@ impl ThreadRegistry {
     pub fn thread_ports(&self) -> Vec<(ThreadId, ThreadPort)> {
         self.inner
             .lock()
+            .map
             .iter()
             .map(|(&tid, e)| (tid, e.mach_port))
             .collect()
@@ -332,6 +361,7 @@ impl ThreadRegistry {
     pub fn thread_state_chars(&self) -> Vec<(ThreadId, char)> {
         self.inner
             .lock()
+            .map
             .iter()
             .map(|(&tid, e)| (tid, e.proc_state))
             .collect()
@@ -339,9 +369,60 @@ impl ThreadRegistry {
 
     /// Set a live thread's guest-visible `/proc` state.
     pub fn set_thread_state(&self, tid: ThreadId, state: char) {
-        if let Some(e) = self.inner.lock().get_mut(&tid) {
+        if let Some(e) = self.inner.lock().map.get_mut(&tid) {
             e.proc_state = state;
         }
+    }
+
+    /// Mark `tid`'s vCPU as parked (quiesced). Returns true iff `tid` was not
+    /// already parked AND every OTHER live thread is already parked — i.e.
+    /// the caller is the last thread to park, the one responsible for
+    /// whatever barrier action follows (e.g. tearing down the VM). Returns
+    /// false for an unknown `tid`, and false if `tid` was already parked
+    /// (parking is idempotent — it does not re-report "last" on a repeat
+    /// call).
+    pub fn park_vcpu(&self, tid: ThreadId) -> bool {
+        let mut inner = self.inner.lock();
+        let already_parked = match inner.map.get(&tid) {
+            Some(e) => e.vcpu_parked,
+            None => return false,
+        };
+        if let Some(e) = inner.map.get_mut(&tid) {
+            e.vcpu_parked = true;
+        }
+        !already_parked
+            && inner
+                .map
+                .iter()
+                .filter(|(t, _)| **t != tid)
+                .all(|(_, e)| e.vcpu_parked)
+    }
+
+    /// Clear `tid`'s parked mark. Returns true iff the process-wide
+    /// `vm_released` flag was set, atomically claiming it: the flag flips
+    /// back to false as part of the same locked section, so only the FIRST
+    /// caller to observe it set gets `true`; every subsequent caller (even
+    /// if `vm_released` was set again in between by another park/unpark
+    /// cycle they didn't observe) gets `false` until it is set anew.
+    pub fn unpark_vcpu(&self, tid: ThreadId) -> bool {
+        let mut inner = self.inner.lock();
+        if let Some(e) = inner.map.get_mut(&tid) {
+            e.vcpu_parked = false;
+        }
+        let claimed = inner.vm_released;
+        inner.vm_released = false;
+        claimed
+    }
+
+    /// Record that the last-parked thread destroyed the VM (or, with
+    /// `released = false`, that a rebuild has been handled).
+    pub fn set_vm_released(&self, released: bool) {
+        self.inner.lock().vm_released = released;
+    }
+
+    /// Read-only peek at the process-wide VM-released flag (diagnostics/tests).
+    pub fn vm_released(&self) -> bool {
+        self.inner.lock().vm_released
     }
 }
 
@@ -913,6 +994,48 @@ mod tests {
         let t = reg.register_child(0);
         assert!(!reg.exit(t)); // not last
         assert!(reg.exit(ThreadId::synthetic_for_tests(1000))); // last live thread -> true
+    }
+
+    #[test]
+    fn park_vcpu_reports_last_unparked() {
+        let reg = ThreadRegistry::new(ThreadId::synthetic_for_tests(2000));
+        let t1 = reg.main_tid();
+        let t2 = reg.register_child(0);
+        assert!(!reg.park_vcpu(t1), "t2 still unparked");
+        assert!(reg.park_vcpu(t2), "t2 is the last unparked thread");
+        assert!(
+            !reg.park_vcpu(t2),
+            "re-parking an already-parked tid is not 'last' again"
+        );
+    }
+
+    #[test]
+    fn park_vcpu_unknown_tid_returns_false() {
+        let reg = ThreadRegistry::new(ThreadId::synthetic_for_tests(2010));
+        assert!(!reg.park_vcpu(ThreadId::synthetic_for_tests(9999)));
+    }
+
+    #[test]
+    fn unpark_claims_vm_rebuild_exactly_once() {
+        let reg = ThreadRegistry::new(ThreadId::synthetic_for_tests(2001));
+        let t1 = reg.main_tid();
+        let t2 = reg.register_child(0);
+        assert!(!reg.park_vcpu(t1));
+        assert!(reg.park_vcpu(t2));
+        reg.set_vm_released(true);
+        assert!(reg.unpark_vcpu(t2), "first waker claims the rebuild");
+        assert!(!reg.unpark_vcpu(t1), "second waker must not rebuild again");
+        assert!(!reg.vm_released());
+    }
+
+    #[test]
+    fn exit_of_parked_thread_updates_last_unparked() {
+        let reg = ThreadRegistry::new(ThreadId::synthetic_for_tests(2002));
+        let t1 = reg.main_tid();
+        let t2 = reg.register_child(0);
+        assert!(!reg.park_vcpu(t2));
+        let _ = reg.exit(t2); // parked thread dies; t1 is now the only live thread
+        assert!(reg.park_vcpu(t1), "t1 is last unparked after t2 exited");
     }
 
     #[test]
