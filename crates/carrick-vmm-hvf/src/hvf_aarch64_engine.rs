@@ -458,6 +458,10 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         self.state.fork_prepare_and_teardown()
     }
 
+    fn emit_fork_footprint_attribution(&self, arena_high_water: u64) {
+        self.state.emit_fork_footprint_attribution(arena_high_water);
+    }
+
     fn set_vfork_share(&mut self, share_vm: bool) {
         self.state.set_vfork_share(share_vm);
     }

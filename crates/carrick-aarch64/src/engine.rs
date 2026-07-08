@@ -991,6 +991,8 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
         // malloc lock (or any other process-global lock) at fork time, and the child
         // inherits a consistent allocator state.
         emit_fork_footprint(0, self.fork_arena_high_water);
+        self.vm
+            .emit_fork_footprint_attribution(self.fork_arena_high_water);
         let phase_start = std::time::Instant::now();
         let pid = unsafe { libc::fork() };
         let fork_elapsed = elapsed_us(phase_start);

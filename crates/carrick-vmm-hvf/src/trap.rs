@@ -2740,6 +2740,44 @@ impl HvfVmState {
         self.vfork_share = share_vm;
     }
 
+    /// Emit pre-host-fork resident footprint by guest mapping class. The expensive
+    /// `mincore` walk runs only when DTrace enables `fork-footprint-class`; normal
+    /// fork performance gates do not pay the scan.
+    pub(crate) fn emit_fork_footprint_attribution(&self, arena_high_water: u64) {
+        carrick_observability::probes::with_fork_footprint_class_probe(|| {
+            let mut classes = [ForkFootprintClassSample::default(); 10];
+            for m in &self.mappings {
+                let class_id = fork_footprint_class_id(m.start, m.guest_shared, m.guest_writable);
+                let Ok(index) = usize::try_from(class_id) else {
+                    continue;
+                };
+                let Some(sample) = classes.get_mut(index) else {
+                    continue;
+                };
+                let scan_len = fork_footprint_scan_len(m, class_id, arena_high_water);
+                sample.region_count = sample.region_count.saturating_add(1);
+                sample.scan_bytes = sample.scan_bytes.saturating_add(scan_len as u64);
+                sample.resident_bytes = sample
+                    .resident_bytes
+                    .saturating_add(resident_bytes_for_host_range(m.host_addr, scan_len));
+                sample.flags |= fork_footprint_flags(m);
+            }
+
+            for (class_id, sample) in classes.iter().enumerate() {
+                if sample.region_count == 0 {
+                    continue;
+                }
+                carrick_observability::probes::fork_footprint_class(
+                    class_id as i32,
+                    sample.region_count,
+                    sample.scan_bytes,
+                    sample.resident_bytes,
+                    sample.flags,
+                );
+            }
+        });
+    }
+
     /// Create a fresh vCPU bound to this VM (the boot/clone/fork/reclaim
     /// vcpu_create; admission is the bounded scheduler's job, NOT this path).
     pub(crate) fn add_vcpu(&mut self) -> Result<applevisor::vcpu::Vcpu, TrapError> {
@@ -5166,6 +5204,132 @@ const VM_INHERIT_SHARE: libc::c_int = 0;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const VM_INHERIT_COPY: libc::c_int = 1;
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const FORK_FOOTPRINT_CLASS_PRIVATE_MMAP_ARENA: i32 = 1;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const FORK_FOOTPRINT_CLASS_PRIVATE_HEAP: i32 = 2;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const FORK_FOOTPRINT_CLASS_PRIVATE_OVERLAY: i32 = 3;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const FORK_FOOTPRINT_CLASS_PRIVATE_HIGH_ALIAS: i32 = 4;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const FORK_FOOTPRINT_CLASS_PRIVATE_WRITABLE_OTHER: i32 = 5;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const FORK_FOOTPRINT_CLASS_PRIVATE_RO_OR_INTERNAL: i32 = 6;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const FORK_FOOTPRINT_CLASS_SHARED_APERTURE: i32 = 7;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const FORK_FOOTPRINT_CLASS_SHARED_OTHER: i32 = 8;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const FORK_FOOTPRINT_CLASS_PRIVATE_PAGE_TABLES: i32 = 9;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const FORK_FOOTPRINT_FLAG_CHILD_OBSERVES: u64 = 1 << 0;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const FORK_FOOTPRINT_FLAG_PARENT_SHARED: u64 = 1 << 1;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const FORK_FOOTPRINT_FLAG_COW_COPY: u64 = 1 << 2;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const FORK_FOOTPRINT_FLAG_GUEST_WRITABLE: u64 = 1 << 3;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const FORK_FOOTPRINT_FLAG_CHILD_SNAPSHOT: u64 = 1 << 4;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Default)]
+struct ForkFootprintClassSample {
+    region_count: u64,
+    scan_bytes: u64,
+    resident_bytes: u64,
+    flags: u64,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn fork_footprint_class_id(start: u64, guest_shared: bool, guest_writable: bool) -> i32 {
+    if guest_shared {
+        if start == crate::memory::LINUX_SHARED_FILE_BASE {
+            return FORK_FOOTPRINT_CLASS_SHARED_APERTURE;
+        }
+        return FORK_FOOTPRINT_CLASS_SHARED_OTHER;
+    }
+    if start == crate::memory::LINUX_MMAP_BASE {
+        return FORK_FOOTPRINT_CLASS_PRIVATE_MMAP_ARENA;
+    }
+    if start == crate::memory::LINUX_HEAP_BASE {
+        return FORK_FOOTPRINT_CLASS_PRIVATE_HEAP;
+    }
+    if start == crate::memory::LINUX_PRIVATE_OVERLAY_BASE {
+        return FORK_FOOTPRINT_CLASS_PRIVATE_OVERLAY;
+    }
+    if start == crate::memory::LINUX_PAGE_TABLES_BASE {
+        return FORK_FOOTPRINT_CLASS_PRIVATE_PAGE_TABLES;
+    }
+    if crate::memory::is_high_va(start) {
+        return FORK_FOOTPRINT_CLASS_PRIVATE_HIGH_ALIAS;
+    }
+    if guest_writable {
+        FORK_FOOTPRINT_CLASS_PRIVATE_WRITABLE_OTHER
+    } else {
+        FORK_FOOTPRINT_CLASS_PRIVATE_RO_OR_INTERNAL
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn fork_footprint_flags(m: &HvfMappedRegion) -> u64 {
+    let mut flags = FORK_FOOTPRINT_FLAG_CHILD_OBSERVES;
+    if m.guest_shared {
+        flags |= FORK_FOOTPRINT_FLAG_PARENT_SHARED;
+    } else if m.start == crate::memory::LINUX_PAGE_TABLES_BASE {
+        flags |= FORK_FOOTPRINT_FLAG_CHILD_SNAPSHOT;
+    } else {
+        flags |= FORK_FOOTPRINT_FLAG_COW_COPY;
+    }
+    if m.guest_writable {
+        flags |= FORK_FOOTPRINT_FLAG_GUEST_WRITABLE;
+    }
+    flags
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn fork_footprint_scan_len(m: &HvfMappedRegion, class_id: i32, arena_high_water: u64) -> usize {
+    if class_id == FORK_FOOTPRINT_CLASS_PRIVATE_MMAP_ARENA {
+        arena_high_water
+            .saturating_sub(crate::memory::LINUX_MMAP_BASE)
+            .try_into()
+            .unwrap_or(m.size)
+            .min(m.size)
+    } else {
+        m.size
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn resident_bytes_for_host_range(host_addr: *mut u8, len: usize) -> u64 {
+    if host_addr.is_null() || len == 0 {
+        return 0;
+    }
+    let page = {
+        let p = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if p <= 0 { 16 * 1024 } else { p as usize }
+    };
+    let pages = len.div_ceil(page);
+    let mut resident = vec![0u8; pages];
+    let rc = unsafe {
+        libc::mincore(
+            host_addr.cast::<libc::c_void>(),
+            len,
+            resident.as_mut_ptr().cast::<libc::c_char>(),
+        )
+    };
+    if rc != 0 {
+        return 0;
+    }
+    resident
+        .iter()
+        .filter(|flag| **flag & 1 != 0)
+        .count()
+        .saturating_mul(page) as u64
+}
+
 /// Set a guest region's per-process `fork(2)` inheritance via macOS `minherit(2)`.
 ///
 /// `VM_INHERIT_SHARE` makes the WHOLE region's pages SHARED across a later
@@ -6586,6 +6750,38 @@ mod tag_strip_tests {
         assert_eq!(
             strip_pointer_tag(0x0000_0001_2345_6000),
             0x0000_0001_2345_6000
+        );
+    }
+
+    #[test]
+    fn fork_footprint_classifies_guest_mapping_roles() {
+        assert_eq!(
+            super::fork_footprint_class_id(crate::memory::LINUX_MMAP_BASE, false, true),
+            super::FORK_FOOTPRINT_CLASS_PRIVATE_MMAP_ARENA
+        );
+        assert_eq!(
+            super::fork_footprint_class_id(crate::memory::LINUX_HEAP_BASE, false, true),
+            super::FORK_FOOTPRINT_CLASS_PRIVATE_HEAP
+        );
+        assert_eq!(
+            super::fork_footprint_class_id(crate::memory::LINUX_PRIVATE_OVERLAY_BASE, false, true),
+            super::FORK_FOOTPRINT_CLASS_PRIVATE_OVERLAY
+        );
+        assert_eq!(
+            super::fork_footprint_class_id(crate::memory::LINUX_SHARED_FILE_BASE, true, true),
+            super::FORK_FOOTPRINT_CLASS_SHARED_APERTURE
+        );
+        assert_eq!(
+            super::fork_footprint_class_id(crate::memory::LINUX_HIGH_VA_THRESHOLD, false, true),
+            super::FORK_FOOTPRINT_CLASS_PRIVATE_HIGH_ALIAS
+        );
+        assert_eq!(
+            super::fork_footprint_class_id(0x4000, false, false),
+            super::FORK_FOOTPRINT_CLASS_PRIVATE_RO_OR_INTERNAL
+        );
+        assert_eq!(
+            super::fork_footprint_class_id(crate::memory::LINUX_PAGE_TABLES_BASE, false, true),
+            super::FORK_FOOTPRINT_CLASS_PRIVATE_PAGE_TABLES
         );
     }
 }
