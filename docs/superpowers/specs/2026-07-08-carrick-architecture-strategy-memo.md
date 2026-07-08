@@ -390,3 +390,39 @@ Those two results determine the next quarter of architecture work. If E1 is
 positive, spend the next performance push eliminating parent rebuild and then
 lazy-replaying child mappings. If E1 is negative, preserve the process model,
 finish arena coherence, and make lazy replay the fork-floor track.
+
+## Addendum 2026-07-08: residency ceiling narrows and re-scopes Track 3
+
+E4 (`docs/2026-07-08-hvf-residency-e4-evidence.md`) measured the HVF residency
+ceiling and **refuted this memo's prediction** that blocked guest processes hold
+their VM/vCPU residency and that a workload past the soft budget stalls in the
+unbounded permit wait. That is false for single-threaded blocked processes.
+
+Measured reality:
+
+- The ceiling is **per-VM (exactly 127 on this host/OS)**, not memory-coupled and
+  not a system-wide vCPU budget: 127 VMs materialize whether `total_vcpus` is 127,
+  254, or 508 and whether each VM maps 0, 16, or 64 MiB. The earlier "~126
+  system-wide vCPU budget" reading (and the `trap.rs:761-775` comment) was
+  measured with stray guests live and is refuted.
+- **carrick already releases the whole VM for single-threaded blocked
+  processes.** `park_vcpu_for_blocking_wait` → `save_shared_wait_state()` →
+  HVF `shared_wait_park` destroys the vCPU *and* the VM while parked and rebuilds
+  on wake (bounded at 14 stage-2 descriptors, ~200-670 µs replay, tens of µs
+  create). `procladder` at `PROC_LADDER_N=160` — 160 simultaneously-alive blocked
+  children, 33 over the hard ceiling — passes under carrick in under 2 s, rc=0,
+  matching Docker, with no `HV_NO_RESOURCES` and no stall. The ceiling therefore
+  binds on processes that *hold a VM*, not on all *alive* processes.
+
+Priority change: Track 3's `WakeFromBlockingSyscall` lease class still moves ahead
+of Track 4 (shared waiters and IPC objects) — E4 gives it the evidence — but its
+**scope narrows to the multi-threaded blocked case only**. Multi-threaded blocked
+processes take the other branch (`save_guest_state()` → HVF `reclaim_park`, a
+vCPU-only destroy that keeps the VM alive), so more than 127 simultaneously-blocked
+multi-threaded processes remain capacity-bound. The lease design parameters are
+already measured: eviction unit is the whole VM (per-VM ceiling), reacquire budget
+is tens of µs create + ~200-670 µs replay bounded at 14 descriptors, churn is flat
+and non-degrading over 200 cycles. Acceptance = a `procladder-mt` variant (children
+spawn a second thread, then block) failing red today and passing after the lease
+extension, with `PROC_LADDER_N=160 procladder` staying green as the regression
+guard and no `perf_fork`/`perf_fork_exec` regression.
