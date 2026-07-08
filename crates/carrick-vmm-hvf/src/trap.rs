@@ -1176,6 +1176,19 @@ impl PermitRegion {
         }
     }
 
+    /// Same as [`Self::new_shared_global`] but over the arena's resident-VM
+    /// slot section. One slot per live HVF VM, claimed/freed at the actual
+    /// `hv_vm_create`/`hv_vm_destroy` transitions; occupancy is DERIVED from
+    /// the slots (no separate counter to drift), and the death reaper
+    /// reclaims a dead owner's slot exactly like a permit slot.
+    fn new_shared_global_vm() -> PermitRegion {
+        let arena = carrick_kernel::arena::KernelArena::global();
+        PermitRegion {
+            table: &arena.layout().vm_slots as *const _ as usize,
+            local: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
     fn table(&self) -> &SharedPermitTable {
         // SAFETY: `self.table` is either the arena permit section or a test-only
         // private mapping. Both are live mappings for the process lifetime; fork
@@ -1478,9 +1491,29 @@ impl crate::vcpu_permit_reaper::PermitReclaimSource for PermitRegion {
 /// re-export wired from `HvfHostBackend::pre_loop_setup`; idempotent, and it
 /// binds the supervisor to the process-global permit region so the daemon frees
 /// the slots of any owner that dies without a cooperative release.
+/// Both slot tables feed ONE reaper: pid death must reclaim the dead owner's
+/// vCPU-permit slots AND its resident-VM slot.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct DualReclaimSource(&'static PermitRegion, &'static PermitRegion);
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl crate::vcpu_permit_reaper::PermitReclaimSource for DualReclaimSource {
+    fn owner_slots(&self) -> Vec<(u32, u32)> {
+        let mut owners = self.0.owner_slots();
+        owners.extend(self.1.owner_slots());
+        owners
+    }
+    fn reclaim(&self, pid: u32, generation: u32) -> usize {
+        self.0.reclaim(pid, generation) + self.1.reclaim(pid, generation)
+    }
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub fn start_vcpu_permit_reaper() {
-    crate::vcpu_permit_reaper::spawn_reaper(permit_region());
+    static DUAL: std::sync::OnceLock<DualReclaimSource> = std::sync::OnceLock::new();
+    crate::vcpu_permit_reaper::spawn_reaper(
+        DUAL.get_or_init(|| DualReclaimSource(permit_region(), vm_residency_region())),
+    );
 }
 
 /// The process-global permit region. Initialized lazily on first use, but the
@@ -1491,6 +1524,56 @@ pub fn start_vcpu_permit_reaper() {
 fn permit_region() -> &'static PermitRegion {
     static REGION: std::sync::OnceLock<PermitRegion> = std::sync::OnceLock::new();
     REGION.get_or_init(PermitRegion::new_shared_global)
+}
+
+/// The process-global resident-VM region. Same fork-inheritance property as
+/// `permit_region`: first touched during initial-VM creation, before any
+/// guest fork.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn vm_residency_region() -> &'static PermitRegion {
+    static REGION: std::sync::OnceLock<PermitRegion> = std::sync::OnceLock::new();
+    REGION.get_or_init(PermitRegion::new_shared_global_vm)
+}
+
+/// The process-local registration key for THE resident VM (one VM per
+/// process). `u64::MAX` cannot collide with an HVF vcpu_id in the shared
+/// local map.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const VM_RESIDENCY_LOCAL_KEY: u64 = u64::MAX;
+
+/// Record "this process now holds a live HVF VM". Called from the single
+/// create funnel (`create_vm_with_admission` Ok arm). Recording is
+/// UNCONDITIONAL (budget = MAX_SLOTS): the VM already exists; the budget is
+/// enforced only by the fork-admission PROBE. A full table (impossible in
+/// practice: 128 slots > the ~127-VM hard ceiling) logs and under-counts by
+/// one rather than failing the create.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn record_vm_resident() {
+    if !atomic_permit_enabled() {
+        return; // flock fallback: no residency table; the gate skips the VM probe too
+    }
+    let region = vm_residency_region();
+    // A stale prior registration (should not happen: one VM per process,
+    // destroy paths release first) would leak a slot until death-reclaim;
+    // release defensively so the table can never double-count one process.
+    region.release_token(VM_RESIDENCY_LOCAL_KEY);
+    match region.acquire(atomic_permit_slot::MAX_SLOTS, std::process::id()) {
+        Some(token) => region.register(VM_RESIDENCY_LOCAL_KEY, token),
+        None => eprintln!(
+            "[hvf-admission pid={}] resident-VM table full; VM unrecorded (fork gate will under-count by one)",
+            unsafe { libc::getpid() }
+        ),
+    }
+}
+
+/// Record "this process's HVF VM is gone". Called after each SUCCESSFUL
+/// `hv_vm_destroy`. Idempotent (token-guarded).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn record_vm_released() {
+    if !atomic_permit_enabled() {
+        return;
+    }
+    vm_residency_region().release_token(VM_RESIDENCY_LOCAL_KEY);
 }
 
 /// Whether the atomic slot-table admission permit is active; cached once.
@@ -1607,6 +1690,7 @@ fn release_admission_permit_for_vcpu(vcpu_id: u64) {
 fn reset_admission_permits_after_fork_child() {
     if atomic_permit_enabled() {
         permit_region().reset_local_after_fork_child();
+        vm_residency_region().reset_local_after_fork_child();
     } else {
         reset_global_vcpu_permits_after_fork_child();
     }
@@ -1624,7 +1708,7 @@ pub fn cooperative_release_atomic_permit() -> usize {
     if !atomic_permit_enabled() {
         return 0;
     }
-    permit_region().cooperative_release_local()
+    permit_region().cooperative_release_local() + vm_residency_region().cooperative_release_local()
 }
 
 /// True when park+retry admission tracing is requested (`CARRICK_HVF_ADMISSION_TRACE`).
@@ -1787,7 +1871,10 @@ fn create_vm_with_admission(
         let config = fresh_vm_config()?;
         virtual_machine_with_private_signals_blocked(config)
     }) {
-        Ok(vm) => Ok((vm, permit)),
+        Ok(vm) => {
+            record_vm_resident();
+            Ok((vm, permit))
+        }
         Err(e) => {
             if let Some(permit) = permit {
                 release_unregistered_admission_permit(permit);
@@ -3856,6 +3943,7 @@ impl HvfVmState {
                 "shared_wait_park: hv_vm_destroy rc={vm_rc:#x}"
             )));
         }
+        record_vm_released();
         Ok(())
     }
 
@@ -3883,6 +3971,7 @@ impl HvfVmState {
                 "release_vm_after_reclaim_park: hv_vm_destroy rc={vm_rc:#x}"
             )));
         }
+        record_vm_released();
         Ok(())
     }
 
@@ -4235,6 +4324,9 @@ impl HvfVmState {
         );
         let phase_start = std::time::Instant::now();
         let vm_destroy_rc = unsafe { applevisor_sys::hv_vm_destroy() };
+        if vm_destroy_rc == 0 {
+            record_vm_released();
+        }
         // phase 2: a nonzero rc means a vCPU was still live at teardown — the
         // HV_BUSY root cause (the rebuilt VM is then corrupt and sibling
         // vcpu_create fails). Traceable via `carrick trace` fork__quiesce.
@@ -4683,7 +4775,10 @@ impl HvfVmState {
         if vcpu_destroy_rc == 0 {
             vcpu_destroyed(inherited_vcpu_id);
         }
-        let _ = unsafe { applevisor_sys::hv_vm_destroy() };
+        let vm_destroy_rc = unsafe { applevisor_sys::hv_vm_destroy() };
+        if vm_destroy_rc == 0 {
+            record_vm_released();
+        }
 
         // Create a fresh VM + vCPU.
         let (new_vm, permit) = create_vm_with_admission(VmCreateAdmission::ExecveRebuild)?;
@@ -5881,6 +5976,60 @@ mod vm_create_admission_tests {
         let arena = carrick_kernel::arena::KernelArena::global();
         let section = &arena.layout().permits as *const _ as usize;
         assert_eq!(permit_region().table_addr_for_test(), section);
+    }
+
+    #[test]
+    fn vm_residency_region_is_the_arena_vm_slots_section() {
+        let arena = carrick_kernel::arena::KernelArena::global();
+        assert_eq!(
+            vm_residency_region().table_addr_for_test(),
+            &arena.layout().vm_slots as *const _ as usize,
+        );
+        // Independent of the permit table.
+        assert_ne!(
+            vm_residency_region().table_addr_for_test(),
+            permit_region().table_addr_for_test(),
+        );
+    }
+
+    #[test]
+    fn vm_residency_record_release_roundtrip_on_test_region() {
+        let region = PermitRegion::new_anon_for_test();
+        let pid = std::process::id();
+        let token = region
+            .acquire(atomic_permit_slot::MAX_SLOTS, pid)
+            .expect("record acquires unconditionally under MAX_SLOTS");
+        region.register(VM_RESIDENCY_LOCAL_KEY, token);
+        assert_eq!(region.occupied(), 1);
+        region.release_token(VM_RESIDENCY_LOCAL_KEY);
+        assert_eq!(region.occupied(), 0);
+        // Idempotent: a second release is a no-op.
+        region.release_token(VM_RESIDENCY_LOCAL_KEY);
+        assert_eq!(region.occupied(), 0);
+    }
+
+    #[test]
+    fn dual_reclaim_source_merges_and_reclaims_both_tables() {
+        use crate::vcpu_permit_reaper::PermitReclaimSource;
+        let a = Box::leak(Box::new(PermitRegion::new_anon_for_test()));
+        let b = Box::leak(Box::new(PermitRegion::new_anon_for_test()));
+        // `force_owner_for_test` overwrites only the pid on an ALREADY-acquired
+        // slot (preserving its real Acquiring state and generation) — so a real
+        // slot must be acquired first for the slot to count as occupied.
+        let token_a = a
+            .acquire(atomic_permit_slot::MAX_SLOTS, std::process::id())
+            .unwrap();
+        let token_b = b
+            .acquire(atomic_permit_slot::MAX_SLOTS, std::process::id())
+            .unwrap();
+        a.force_owner_for_test(token_a.slot, 4242, token_a.generation);
+        b.force_owner_for_test(token_b.slot, 4242, token_b.generation);
+        let (gen_a, gen_b) = (token_a.generation, token_b.generation);
+        let dual = DualReclaimSource(a, b);
+        let owners = dual.owner_slots();
+        assert!(owners.contains(&(4242, gen_a)));
+        assert!(owners.contains(&(4242, gen_b)));
+        assert_eq!(dual.reclaim(4242, gen_a) + dual.reclaim(4242, gen_b), 2);
     }
 
     // ---- Part B: HV_NO_RESOURCES park+retry backpressure ----
