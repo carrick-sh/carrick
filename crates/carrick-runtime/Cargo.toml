@@ -109,7 +109,10 @@ carrick-spec = { path = "../carrick-spec" }
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
 applevisor.workspace = true
 applevisor-sys.workspace = true
+bad64.workspace = true
 
+[build-dependencies]
+cc = "1"
 
 [dev-dependencies]
 carrick-test-support = { path = "../carrick-test-support" }

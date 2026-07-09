@@ -157,13 +157,12 @@ impl Runtime {
             rosetta_license_notice();
         }
         let execution_plan = crate::page_profile::resolve_execution_plan(spec)?;
-        if execution_plan.backend == crate::page_profile::ExecutionBackend::NativeDarwin {
-            return crate::native_darwin::run(spec, &execution_plan);
+        if execution_plan.backend != crate::page_profile::ExecutionBackend::NativeDarwin {
+            debug_assert_eq!(
+                execution_plan.page_geometry.linux_page_size,
+                crate::page_profile::DEFAULT_LINUX_PAGE_SIZE
+            );
         }
-        debug_assert_eq!(
-            execution_plan.page_geometry.linux_page_size,
-            crate::page_profile::DEFAULT_LINUX_PAGE_SIZE
-        );
         // Container launch (`carrick run <image>`) places the root guest in a
         // fresh PID namespace so its init sees getpid()==1, ns-local child
         // pids, and an ns-filtered /proc — the headline docker-run behavior
@@ -335,14 +334,28 @@ impl Runtime {
                     .debug_state_path
                     .as_ref()
                     .map(|p| PathBuf::from(p.as_std_path()));
-                let run_result = run_elf_from_dispatcher_debug(
-                    &spec.executable,
-                    dispatcher,
-                    spec.argv.clone(),
-                    env,
-                    spec.max_traps,
-                    debug_path.as_ref(),
-                );
+                let run_result = if execution_plan.backend
+                    == crate::page_profile::ExecutionBackend::NativeDarwin
+                {
+                    crate::native_darwin::run_elf_from_dispatcher_debug(
+                        &spec.executable,
+                        dispatcher,
+                        spec.argv.clone(),
+                        env,
+                        spec.max_traps,
+                        debug_path.as_ref(),
+                        &execution_plan,
+                    )
+                } else {
+                    run_elf_from_dispatcher_debug(
+                        &spec.executable,
+                        dispatcher,
+                        spec.argv.clone(),
+                        env,
+                        spec.max_traps,
+                        debug_path.as_ref(),
+                    )
+                };
                 match run_result {
                     Ok(r) => r,
                     Err(e) if is_entrypoint_not_found(&e) => {
@@ -432,15 +445,29 @@ impl Runtime {
                     .debug_state_path
                     .as_ref()
                     .map(|p| PathBuf::from(p.as_std_path()));
-                let run_result = run_rootfs_elf_with_hvf_args_and_dispatcher_debug(
-                    &spec.executable,
-                    &rootfs,
-                    dispatcher,
-                    spec.argv.clone(),
-                    env,
-                    spec.max_traps,
-                    debug_path.as_ref(),
-                );
+                let run_result = if execution_plan.backend
+                    == crate::page_profile::ExecutionBackend::NativeDarwin
+                {
+                    crate::native_darwin::run_elf_from_dispatcher_debug(
+                        &spec.executable,
+                        dispatcher,
+                        spec.argv.clone(),
+                        env,
+                        spec.max_traps,
+                        debug_path.as_ref(),
+                        &execution_plan,
+                    )
+                } else {
+                    run_rootfs_elf_with_hvf_args_and_dispatcher_debug(
+                        &spec.executable,
+                        &rootfs,
+                        dispatcher,
+                        spec.argv.clone(),
+                        env,
+                        spec.max_traps,
+                        debug_path.as_ref(),
+                    )
+                };
                 match run_result {
                     Ok(r) => r,
                     Err(e) if is_entrypoint_not_found(&e) => {
@@ -775,20 +802,13 @@ mod exit_code_tests {
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
-    fn explicit_native_linux4k_reaches_darwin_native_backend_boundary() {
-        let err = Runtime::execute(&native_run_spec(NativePageProfileRequest::Linux4k))
-            .expect_err("native backend is selected but not runnable yet");
+    fn explicit_native_linux4k_uses_container_entrypoint_resolution() {
+        let result = Runtime::execute(&native_run_spec(NativePageProfileRequest::Linux4k))
+            .expect("native container setup should classify a missing entrypoint");
 
-        assert!(matches!(
-            err,
-            RuntimeError::Unsupported(message)
-                if message.contains("native Darwin backend selected")
-                    && message.contains("platform=Aarch64")
-                    && message.contains("profile=Linux4kOn16k")
-                    && message.contains("host_page_size=16384")
-                    && message.contains("linux_page_size=4096")
-                    && message.contains("launch unsupported")
-        ));
+        assert_eq!(result.exit_code, 127);
+        assert!(result.stdout.is_empty());
+        assert!(result.stderr.is_empty());
     }
 
     #[test]

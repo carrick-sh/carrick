@@ -1,7 +1,7 @@
 use crate::runtime::RuntimeError;
 use carrick_spec::{
     BackendCapabilities, ExecBackendRequest, HostExecution, HostOs, NativePageGeometry,
-    NativePageProfile, NativePageProfileRequest, RunSpec,
+    NativePageProfile, NativePageProfileRequest, Platform, RunSpec,
 };
 
 pub(crate) const DEFAULT_LINUX_PAGE_SIZE: u64 = carrick_abi::LINUX_PAGE_SIZE;
@@ -202,23 +202,60 @@ pub(crate) struct ExecutionPlan {
 }
 
 pub(crate) fn resolve_execution_plan(spec: &RunSpec) -> Result<ExecutionPlan, RuntimeError> {
-    resolve_execution_plan_for_host(spec, BackendCapabilities::current(), host_page_size())
+    resolve_execution_plan_for_request_for_host(
+        spec.platform,
+        spec.exec_backend,
+        spec.native_page_profile,
+        BackendCapabilities::current(),
+        host_page_size(),
+    )
 }
 
+pub(crate) fn resolve_execution_plan_for_request(
+    platform: Platform,
+    exec_backend: ExecBackendRequest,
+    native_page_profile: NativePageProfileRequest,
+) -> Result<ExecutionPlan, RuntimeError> {
+    resolve_execution_plan_for_request_for_host(
+        platform,
+        exec_backend,
+        native_page_profile,
+        BackendCapabilities::current(),
+        host_page_size(),
+    )
+}
+
+#[cfg(test)]
 fn resolve_execution_plan_for_host(
     spec: &RunSpec,
     host_caps: BackendCapabilities,
     host_page_size: u64,
 ) -> Result<ExecutionPlan, RuntimeError> {
-    if spec.exec_backend != ExecBackendRequest::Native
-        && spec.native_page_profile != NativePageProfileRequest::Auto
+    resolve_execution_plan_for_request_for_host(
+        spec.platform,
+        spec.exec_backend,
+        spec.native_page_profile,
+        host_caps,
+        host_page_size,
+    )
+}
+
+fn resolve_execution_plan_for_request_for_host(
+    platform: Platform,
+    exec_backend: ExecBackendRequest,
+    native_page_profile: NativePageProfileRequest,
+    host_caps: BackendCapabilities,
+    host_page_size: u64,
+) -> Result<ExecutionPlan, RuntimeError> {
+    if exec_backend != ExecBackendRequest::Native
+        && native_page_profile != NativePageProfileRequest::Auto
     {
         return Err(RuntimeError::Unsupported(
             "native page profile requires --exec-backend=native".to_string(),
         ));
     }
 
-    match spec.exec_backend {
+    match exec_backend {
         ExecBackendRequest::Auto | ExecBackendRequest::Hvf => Ok(ExecutionPlan {
             backend: ExecutionBackend::Hvf,
             page_geometry: PageGeometry {
@@ -235,13 +272,13 @@ fn resolve_execution_plan_for_host(
                     host_caps.host_os
                 )));
             }
-            if host_caps.host_execution(spec.platform) != HostExecution::Native {
+            if host_caps.host_execution(platform) != HostExecution::Native {
                 return Err(RuntimeError::Unsupported(format!(
                     "native execution backend does not support cross-ISA guest platform {:?} on {:?} host",
-                    spec.platform, host_caps.host_isa
+                    platform, host_caps.host_isa
                 )));
             }
-            native_plan(spec.native_page_profile, host_page_size)
+            native_plan(native_page_profile, host_page_size)
         }
     }
 }
