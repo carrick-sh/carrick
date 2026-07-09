@@ -82,6 +82,7 @@ syscall_table! {
 /// Owned memory-subsystem state. Split out of `SyscallDispatcher`.
 #[derive(Clone)]
 pub(super) struct MemState {
+    pub layout: MemoryLayout,
     /// Current program break (`brk`/`sbrk`).
     pub brk_current: u64,
     /// Bump cursor for the anonymous mmap arena.
@@ -169,12 +170,36 @@ pub(super) struct MemState {
     // `crate::memory::alloc_alias_ipa`.
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct MemoryLayout {
+    pub heap_base: u64,
+    pub heap_size: u64,
+    pub mmap_base: u64,
+    pub mmap_size: u64,
+}
+
+impl MemoryLayout {
+    pub(crate) fn hvf_default() -> Self {
+        Self {
+            heap_base: LINUX_HEAP_BASE,
+            heap_size: LINUX_HEAP_SIZE,
+            mmap_base: LINUX_MMAP_BASE,
+            mmap_size: crate::memory::mmap_arena_size(),
+        }
+    }
+}
+
 impl MemState {
     pub(super) fn new() -> Self {
+        Self::new_with_layout(MemoryLayout::hvf_default())
+    }
+
+    pub(super) fn new_with_layout(layout: MemoryLayout) -> Self {
         Self {
-            brk_current: LINUX_HEAP_BASE,
-            mmap_next: LINUX_MMAP_BASE,
-            mmap_dirty_high: LINUX_MMAP_BASE,
+            layout,
+            brk_current: layout.heap_base,
+            mmap_next: layout.mmap_base,
+            mmap_dirty_high: layout.mmap_base,
             shared: crate::shared_aperture::SharedAperture::new(),
             overlay: crate::shared_aperture::SharedAperture::with_window(
                 crate::memory::LINUX_PRIVATE_OVERLAY_BASE,
@@ -197,9 +222,10 @@ impl MemState {
     }
 
     fn reset_for_execve(&mut self) {
+        let layout = self.layout;
         let address_space_regions = self.address_space_regions.take();
         let linux_auxv_image = std::mem::take(&mut self.linux_auxv_image);
-        *self = Self::new();
+        *self = Self::new_with_layout(layout);
         self.address_space_regions = address_space_regions;
         self.linux_auxv_image = linux_auxv_image;
     }
@@ -785,6 +811,7 @@ impl SyscallDispatcher {
         flags: u64,
     ) -> Option<(u64, bool)> {
         let page_size = self.linux_page_size();
+        let layout = self.mem.lock().layout;
         if flags & LINUX_MAP_FIXED != 0 {
             if requested == 0 || !requested.is_multiple_of(page_size) {
                 return None;
@@ -794,13 +821,8 @@ impl SyscallDispatcher {
 
         if requested != 0 {
             let aligned_hint = requested.is_multiple_of(page_size);
-            let arena_hint = aligned_hint
-                && range_within(
-                    requested,
-                    length,
-                    LINUX_MMAP_BASE,
-                    crate::memory::mmap_arena_size(),
-                );
+            let arena_hint =
+                aligned_hint && range_within(requested, length, layout.mmap_base, layout.mmap_size);
             if arena_hint {
                 let mut mem = self.mem.lock();
                 let end = requested.checked_add(length)?;
@@ -815,7 +837,8 @@ impl SyscallDispatcher {
                     return Some((requested, stale));
                 }
             }
-            let canonical_alias_hint = aligned_hint && mmap_address_uses_alias(requested, length);
+            let canonical_alias_hint =
+                aligned_hint && mmap_address_uses_alias(requested, length, layout);
             if canonical_alias_hint {
                 return Some((requested, false));
             }
@@ -832,12 +855,7 @@ impl SyscallDispatcher {
             return Some((s, true));
         }
         let address = align_up_u64(mem.mmap_next, page_size)?;
-        if !range_within(
-            address,
-            length,
-            LINUX_MMAP_BASE,
-            crate::memory::mmap_arena_size(),
-        ) {
+        if !range_within(address, length, layout.mmap_base, layout.mmap_size) {
             return None;
         }
         let end = address.checked_add(length)?;
@@ -1013,7 +1031,7 @@ impl SyscallDispatcher {
                     value: mem.brk_current as i64,
                 });
             }
-            if range_within(requested, 0, LINUX_HEAP_BASE, LINUX_HEAP_SIZE) {
+            if range_within(requested, 0, mem.layout.heap_base, mem.layout.heap_size) {
                 mem.brk_current = requested;
             }
             Ok(DispatchOutcome::Returned {
@@ -1390,7 +1408,10 @@ impl SyscallDispatcher {
 
             let fixed_anonymous = map_flags.contains(LinuxMmapFlags::ANONYMOUS)
                 && map_flags.contains(LinuxMmapFlags::FIXED);
-            if (reused || fixed_anonymous) && !mmap_address_uses_alias(address, length) {
+            let layout = this.mem.lock().layout;
+            if (reused || fixed_anonymous)
+                && !mmap_address_uses_alias(address, length, layout)
+            {
                 // Scrub the reused region's PHYSICAL backing. MUST bypass the
                 // guest-visible permission: a region just reclaimed from munmap
                 // is stage-1-invalidated (no-access) and a PROT_NONE mmap is not
@@ -1407,7 +1428,7 @@ impl SyscallDispatcher {
             // page reclaimed from a prior munmap (which invalidated it) must be
             // valid+RW again, and a PROT_NONE mmap must actually fault. No-op
             // (no TLBI) when the page is already at the target protection.
-            let in_arena = range_within(address, length, LINUX_MMAP_BASE, crate::memory::mmap_arena_size());
+            let in_arena = range_within(address, length, layout.mmap_base, layout.mmap_size);
 
             let prot_none = prot_flags.is_empty();
             if prot_none && map_flags.contains(LinuxMmapFlags::ANONYMOUS) {
@@ -1442,7 +1463,7 @@ impl SyscallDispatcher {
             }
 
             if map_flags.contains(LinuxMmapFlags::ANONYMOUS)
-                && !mmap_address_uses_alias(address, length)
+                && !mmap_address_uses_alias(address, length, layout)
             {
                 let locked_range = this.prepare_mmap_locked_range(map_flags, address, length)?;
                 memory.set_no_access(address, length_usize, false);
@@ -1595,7 +1616,7 @@ impl SyscallDispatcher {
             // aperture use the same machinery so Linux-style advisory hints
             // (notably Go's 0xc000000000 arena probe) are preserved instead of
             // being relocated into the low mmap arena.
-            if mmap_address_uses_alias(address, length) {
+            if mmap_address_uses_alias(address, length, layout) {
                 // Reject a genuinely non-canonical hint (bits 55:48 of the
                 // ORIGINAL address neither all-0 nor all-1). With TCR_EL1.TBI on,
                 // canonicality is decided by bits 55:48, not 63:48. A canonical
@@ -1778,7 +1799,8 @@ impl SyscallDispatcher {
             // Misaligned addresses (e.g. RLIM_INFINITY, which LTP munmap03 passes
             // to assert EINVAL) are already rejected by the alignment gate above;
             // addresses >= 2^48 stay EINVAL via the range check below.
-            if mmap_address_uses_alias(address.0, length) {
+            let layout = this.mem.lock().layout;
+            if mmap_address_uses_alias(address.0, length, layout) {
                 if let Some(len) = align_up_u64(length, page_size)
                     && let Ok(len_usize) = usize::try_from(len)
                 {
@@ -1791,7 +1813,7 @@ impl SyscallDispatcher {
                 }
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
-            if !range_within(address.0, length, LINUX_MMAP_BASE, crate::memory::mmap_arena_size()) {
+            if !range_within(address.0, length, layout.mmap_base, layout.mmap_size) {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             if let Some(len) = align_up_u64(length, page_size) {
@@ -1987,7 +2009,8 @@ impl SyscallDispatcher {
             let Some(new_size) = align_up_u64(new_size_req, page_size) else {
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
             };
-            if !range_within(old_address.0, old_size, LINUX_MMAP_BASE, crate::memory::mmap_arena_size()) {
+            let layout = this.mem.lock().layout;
+            if !range_within(old_address.0, old_size, layout.mmap_base, layout.mmap_size) {
                 // The mapping is not in the mmap arena: it's a MAP_SHARED file
                 // alias (high VA) or a MAP_SHARED anonymous shared-aperture
                 // region. CPython's mmap.resize() shrinks both of these
@@ -2064,7 +2087,7 @@ impl SyscallDispatcher {
                 let Some(new_end) = old_address.0.checked_add(new_size) else {
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 };
-                if range_within(old_address.0, new_size, LINUX_MMAP_BASE, crate::memory::mmap_arena_size()) {
+                if range_within(old_address.0, new_size, layout.mmap_base, layout.mmap_size) {
                     {
                         let mut mem = this.mem.lock();
                         mem.mmap_next = new_end;
@@ -2250,11 +2273,12 @@ impl SyscallDispatcher {
                 // historical host-side-only behaviour instead of failing.
                 // The shared/overlay apertures and high-VA aliases keep
                 // host-side checks only (unchanged).
-                if range_within(address.0, length, LINUX_MMAP_BASE, crate::memory::mmap_arena_size()) {
+                let layout = this.mem.lock().layout;
+                if range_within(address.0, length, layout.mmap_base, layout.mmap_size) {
                     if cx.memory.protect_range(address.0, len, prot).is_err() {
                         return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                     }
-                } else if mprotect_range_in_identity_image(address.0, length) {
+                } else if mprotect_range_in_identity_image(address.0, length, layout) {
                     let _ = cx.memory.protect_range(address.0, len, prot);
                 }
                 this.update_dynamic_mapping_prot(
@@ -2670,14 +2694,13 @@ fn range_within(address: u64, length: u64, base: u64, size: u64) -> bool {
 /// RELRO; a handler unprotecting a faulted page) has to reach the real leaves —
 /// host-side-only tracking would leave the guest's own stores enforcing the OLD
 /// protection.
-fn mprotect_range_in_identity_image(address: u64, length: u64) -> bool {
+fn mprotect_range_in_identity_image(address: u64, length: u64, layout: MemoryLayout) -> bool {
     use crate::memory::{
-        LINUX_HEAP_BASE as HEAP, LINUX_INTERPRETER_BASE as INTERP,
-        LINUX_KERNEL_REGION_BASE as KERNEL, LINUX_NULL_GUARD_END as GUARD_END,
-        LINUX_SHARED_FILE_BASE as SHARED,
+        LINUX_INTERPRETER_BASE as INTERP, LINUX_KERNEL_REGION_BASE as KERNEL,
+        LINUX_NULL_GUARD_END as GUARD_END, LINUX_SHARED_FILE_BASE as SHARED,
     };
     range_within(address, length, GUARD_END, KERNEL - GUARD_END)
-        || range_within(address, length, HEAP, crate::memory::LINUX_HEAP_SIZE)
+        || range_within(address, length, layout.heap_base, layout.heap_size)
         || range_within(address, length, INTERP, SHARED - INTERP)
         || range_within(
             address,
@@ -2687,11 +2710,14 @@ fn mprotect_range_in_identity_image(address: u64, length: u64) -> bool {
         )
 }
 
-fn mmap_address_uses_alias(address: u64, length: u64) -> bool {
+fn mmap_address_uses_alias(address: u64, length: u64, layout: MemoryLayout) -> bool {
     let Some(end) = address.checked_add(length) else {
         return false;
     };
     if end > (1u64 << 48) {
+        return false;
+    }
+    if range_within(address, length, layout.mmap_base, layout.mmap_size) {
         return false;
     }
     if crate::memory::is_high_va(address) {
@@ -2716,6 +2742,28 @@ mod tests {
         write_bytes_total: Cell<usize>,
         zero_backing_calls: Cell<usize>,
         protect_calls: Cell<usize>,
+    }
+
+    #[test]
+    fn backend_mmap_arena_is_not_classified_as_an_alias() {
+        let native_layout = MemoryLayout {
+            heap_base: 0x8_0000_0000,
+            heap_size: 128 * 1024 * 1024,
+            mmap_base: 0xa0_0000_0000,
+            mmap_size: 32 * 1024 * 1024 * 1024,
+        };
+        let address = native_layout.mmap_base;
+
+        assert!(!mmap_address_uses_alias(
+            address,
+            LINUX_PAGE_SIZE,
+            native_layout,
+        ));
+        assert!(mmap_address_uses_alias(
+            address,
+            LINUX_PAGE_SIZE,
+            MemoryLayout::hvf_default(),
+        ));
     }
 
     impl CountingMmapMemory {
