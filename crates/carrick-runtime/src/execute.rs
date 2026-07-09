@@ -156,6 +156,16 @@ impl Runtime {
         if spec.platform == Platform::Amd64 {
             rosetta_license_notice();
         }
+        let execution_plan = crate::page_profile::resolve_execution_plan(spec)?;
+        if execution_plan.backend == crate::page_profile::ExecutionBackend::NativeDarwin {
+            return Err(RuntimeError::Unsupported(
+                "native Darwin execution backend is gated off; page-profile selection is wired for the native backend only".to_string(),
+            ));
+        }
+        debug_assert_eq!(
+            execution_plan.page_geometry.linux_page_size,
+            crate::page_profile::DEFAULT_LINUX_PAGE_SIZE
+        );
         // Container launch (`carrick run <image>`) places the root guest in a
         // fresh PID namespace so its init sees getpid()==1, ns-local child
         // pids, and an ns-filtered /proc — the headline docker-run behavior

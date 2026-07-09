@@ -147,6 +147,7 @@ pub(crate) fn build_run_image(
         dispatcher,
         vdso_enabled,
         at_base,
+        crate::page_profile::DEFAULT_LINUX_PAGE_SIZE,
         EM_AARCH64,
     )
 }
@@ -162,6 +163,7 @@ pub(crate) fn build_run_image_for(
     dispatcher: &SyscallDispatcher,
     vdso_enabled: bool,
     at_base: Option<u64>,
+    linux_page_size: u64,
     machine: u16,
 ) -> Result<crate::memory::AddressSpace, crate::memory::AddressSpaceError> {
     let mut image = crate::memory::AddressSpace::load_elf_bytes_with_reader_for(
@@ -173,7 +175,11 @@ pub(crate) fn build_run_image_for(
     if let Some(base) = at_base {
         image = image.with_auxv_base(base);
     }
-    image.with_linux_initial_stack(argv, env.iter().map(|s| s.as_bytes()))
+    image.with_linux_initial_stack_page_size(
+        argv,
+        env.iter().map(|s| s.as_bytes()),
+        linux_page_size,
+    )
 }
 
 #[cfg(any(
@@ -192,6 +198,7 @@ pub(crate) fn build_run_image_for_execfn(
     dispatcher: &SyscallDispatcher,
     vdso_enabled: bool,
     at_base: Option<u64>,
+    linux_page_size: u64,
     machine: u16,
 ) -> Result<crate::memory::AddressSpace, crate::memory::AddressSpaceError> {
     let mut image = crate::memory::AddressSpace::load_elf_bytes_with_reader_for(
@@ -203,7 +210,12 @@ pub(crate) fn build_run_image_for_execfn(
     if let Some(base) = at_base {
         image = image.with_auxv_base(base);
     }
-    image.with_linux_initial_stack_execfn(argv, env.iter().map(|s| s.as_bytes()), execfn)
+    image.with_linux_initial_stack_execfn_page_size(
+        argv,
+        env.iter().map(|s| s.as_bytes()),
+        execfn,
+        linux_page_size,
+    )
 }
 
 /// Parse a `#!` shebang line into (interpreter, optional single arg),
@@ -472,6 +484,7 @@ mod tests {
             &dispatcher,
             false,
             None,
+            crate::page_profile::DEFAULT_LINUX_PAGE_SIZE,
             EM_X86_64,
         )
         .expect("x86_64 ELF accepted when requested");

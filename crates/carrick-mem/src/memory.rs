@@ -902,6 +902,52 @@ impl AddressSpace {
         self
     }
 
+    pub fn with_linux_initial_stack_page_size<A, E>(
+        mut self,
+        argv: A,
+        env: E,
+        linux_page_size: u64,
+    ) -> Result<Self, AddressSpaceError>
+    where
+        A: IntoIterator,
+        A::Item: AsRef<[u8]>,
+        E: IntoIterator,
+        E::Item: AsRef<[u8]>,
+    {
+        self.set_linux_auxv_page_size(linux_page_size);
+        self.with_linux_initial_stack(argv, env)
+    }
+
+    pub fn with_linux_initial_stack_execfn_page_size<A, E>(
+        mut self,
+        argv: A,
+        env: E,
+        execfn: &[u8],
+        linux_page_size: u64,
+    ) -> Result<Self, AddressSpaceError>
+    where
+        A: IntoIterator,
+        A::Item: AsRef<[u8]>,
+        E: IntoIterator,
+        E::Item: AsRef<[u8]>,
+    {
+        self.set_linux_auxv_page_size(linux_page_size);
+        self.with_linux_initial_stack_execfn(argv, env, execfn)
+    }
+
+    fn set_linux_auxv_page_size(&mut self, linux_page_size: u64) {
+        for entry in &mut self.linux_auxv {
+            if entry.a_type == LINUX_AT_PAGESZ {
+                *entry = LinuxAuxvEntry::new(LINUX_AT_PAGESZ, linux_page_size);
+                self.linux_auxv_image.clear();
+                return;
+            }
+        }
+        self.linux_auxv
+            .push(LinuxAuxvEntry::new(LINUX_AT_PAGESZ, linux_page_size));
+        self.linux_auxv_image.clear();
+    }
+
     pub fn entry(&self) -> u64 {
         self.entry
     }
