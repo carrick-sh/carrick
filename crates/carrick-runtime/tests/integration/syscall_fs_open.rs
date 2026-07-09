@@ -587,8 +587,11 @@ fn tty_ioctls_handle_pgrp_sid_and_controlling_terminal_calls() {
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x200]);
     let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
+    let stdin_is_tty = carrick_runtime::host_tty::host_isatty(0);
+    let stderr_is_tty = carrick_runtime::host_tty::host_isatty(2);
 
-    // TIOCGPGRP on stdio fd 0 → writes pgid=1.
+    // TIOCGPGRP on stdio fd 0 either writes the bootstrap pgid for headless
+    // stdio or the real foreground pgrp for PTY-backed test runs.
     assert_eq!(
         dispatcher
             .dispatch(
@@ -599,9 +602,16 @@ fn tty_ioctls_handle_pgrp_sid_and_controlling_terminal_calls() {
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
     );
-    assert_eq!(read_i32_le(&memory, 0x4000), 1);
+    let expected_pgrp = if stdin_is_tty {
+        let host_pgrp = carrick_runtime::host_tty::host_tty_tcgetpgrp(0)
+            .expect("stdio tty should have a foreground process group");
+        carrick_runtime::namespace::pid::host_to_ns_pgid(host_pgrp as u32) as i32
+    } else {
+        carrick_runtime::linux_abi::LINUX_BOOTSTRAP_PGID
+    };
+    assert_eq!(read_i32_le(&memory, 0x4000), expected_pgrp);
 
-    // TIOCGSID on stdio fd 2 → writes sid=1.
+    // TIOCGSID on stdio fd 2 follows the same split.
     assert_eq!(
         dispatcher
             .dispatch(
@@ -612,7 +622,13 @@ fn tty_ioctls_handle_pgrp_sid_and_controlling_terminal_calls() {
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
     );
-    assert_eq!(read_i32_le(&memory, 0x4010), 1);
+    let expected_sid = if stderr_is_tty {
+        carrick_runtime::host_tty::host_tty_tcgetsid(2)
+            .expect("stdio tty should have a controlling session")
+    } else {
+        carrick_runtime::linux_abi::LINUX_BOOTSTRAP_SID
+    };
+    assert_eq!(read_i32_le(&memory, 0x4010), expected_sid);
 
     // TIOCGPGRP on unknown fd 99 → EBADF.
     assert_eq!(
@@ -631,8 +647,10 @@ fn tty_ioctls_handle_pgrp_sid_and_controlling_terminal_calls() {
         }
     );
 
-    // TIOCSPGRP on stdio with pgid=1 → 0; with pgid=99 → EPERM.
-    memory.write_bytes(0x4030, &1_i32.to_le_bytes()).unwrap();
+    // TIOCSPGRP on stdio succeeds for the currently reported foreground group.
+    memory
+        .write_bytes(0x4030, &expected_pgrp.to_le_bytes())
+        .unwrap();
     assert_eq!(
         dispatcher
             .dispatch(
@@ -643,19 +661,24 @@ fn tty_ioctls_handle_pgrp_sid_and_controlling_terminal_calls() {
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
     );
-    memory.write_bytes(0x4040, &99_i32.to_le_bytes()).unwrap();
-    assert_eq!(
-        dispatcher
-            .dispatch(
-                SyscallRequest::new(29, SyscallArgs::from([0, LINUX_TIOCSPGRP, 0x4040, 0, 0, 0])),
-                &mut memory,
-                &reporter,
-            )
-            .unwrap(),
-        DispatchOutcome::Errno {
-            errno: LinuxErrno::new(1)
-        }
-    );
+    if !stdin_is_tty {
+        memory.write_bytes(0x4040, &99_i32.to_le_bytes()).unwrap();
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    SyscallRequest::new(
+                        29,
+                        SyscallArgs::from([0, LINUX_TIOCSPGRP, 0x4040, 0, 0, 0])
+                    ),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+            DispatchOutcome::Errno {
+                errno: LinuxErrno::new(1)
+            }
+        );
+    }
 
     // TIOCSCTTY / TIOCNOTTY on stdio → 0.
     assert_eq!(

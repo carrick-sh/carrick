@@ -450,3 +450,43 @@ prove:
 - a simple mixed 4K guard-page case is caught and handled without silently
   widening permissions;
 - unsupported mixed cases fail with clear diagnostics.
+
+## Implementation boundary as of 2026-07-09
+
+The first implementation slice has landed the policy vocabulary, page geometry
+threading, native execution-plan selection, and an explicit Darwin-native
+backend boundary. The boundary is deliberately a launch gate, not a runnable
+native engine:
+
+- `--exec-backend=native` is accepted only for same-ISA guests on macOS.
+- Cross-ISA native requests are rejected before launch.
+- `--native-page-profile=linux4k` selects `Linux4kOn16k` directly; it is not
+  routed to HVF.
+- The Darwin-native backend receives the selected profile and returns a typed
+  unsupported diagnostic naming `platform`, `profile`, `host_page_size`, and
+  `linux_page_size`.
+- The existing macOS default remains HVF unless native is explicitly requested.
+
+The current 4K-on-16K policy boundary is intentionally conservative:
+
+| Mapping shape | Current decision |
+|---|---|
+| Uniform 16K host page | Supported as direct host fast path |
+| Private/composable data subpages | Supported as `Composed16k` |
+| Mixed shared-file backing | Unsupported until alias/writeback coherence exists |
+| Data-only mixed permissions | Supported as `MixedGuarded` policy state |
+| Mixed executable permissions | Unsupported until instruction instrumentation exists |
+| Unsupported geometry | Unsupported with explicit geometry diagnostic |
+
+`MixedGuarded` is a policy state, not a claim that arbitrary native load/store
+instruction emulation is complete. The backend must reject any mapping that
+needs executable sub-16K enforcement until an implementation can prove that
+instruction fetch and data access semantics are preserved.
+
+The PTY-sensitive integration gate has also been hardened. The stdio ioctl test
+now asserts the bootstrap fallback when run headless and the host tty passthrough
+when run under a PTY, while the separate real-pty helper tests continue to prove
+that Carrick does not return synthetic bootstrap pgrp/sid values for real ttys.
+
+Authoritative evidence for this boundary lives in
+[`docs/2026-07-09-no-vmm-native-feasibility-evidence.md`](../../2026-07-09-no-vmm-native-feasibility-evidence.md).

@@ -158,9 +158,7 @@ impl Runtime {
         }
         let execution_plan = crate::page_profile::resolve_execution_plan(spec)?;
         if execution_plan.backend == crate::page_profile::ExecutionBackend::NativeDarwin {
-            return Err(RuntimeError::Unsupported(
-                "native Darwin execution backend is gated off; page-profile selection is wired for the native backend only".to_string(),
-            ));
+            return crate::native_darwin::run(spec, &execution_plan);
         }
         debug_assert_eq!(
             execution_plan.page_geometry.linux_page_size,
@@ -708,12 +706,16 @@ fn setup_interactive_stdio(
 
 #[cfg(test)]
 mod exit_code_tests {
-    use super::{is_entrypoint_not_executable, is_entrypoint_not_found};
+    use super::{Runtime, is_entrypoint_not_executable, is_entrypoint_not_found};
     use crate::elf::ElfInspectError;
     use crate::fs_backend::{FsBackend, MemoryBackend};
     use crate::memory::AddressSpaceError;
     use crate::runtime::RuntimeError;
-    use carrick_spec::NetworkNamespaceSpec;
+    use camino::Utf8PathBuf;
+    use carrick_spec::{
+        ExecBackendRequest, FsBackendKind, NativePageProfileRequest, NetworkNamespaceSpec, PidMode,
+        Platform, RunSpec,
+    };
     use std::io::{Error as IoError, ErrorKind};
 
     fn rt_io(kind: ErrorKind) -> RuntimeError {
@@ -721,6 +723,32 @@ mod exit_code_tests {
     }
     fn rt_not_elf() -> RuntimeError {
         RuntimeError::AddressSpace(AddressSpaceError::Elf(ElfInspectError::NotElf))
+    }
+
+    fn native_run_spec(page_profile: NativePageProfileRequest) -> RunSpec {
+        RunSpec {
+            executable: "/bin/sh".to_string(),
+            argv: vec!["/bin/sh".to_string()],
+            envp: Vec::new(),
+            cwd: Some(Utf8PathBuf::from("/")),
+            rootfs_layers: Vec::new(),
+            fs_backend: FsBackendKind::Host,
+            mounts: Vec::new(),
+            tty: false,
+            raw: true,
+            interactive: false,
+            max_traps: 100,
+            debug_state_path: None,
+            platform: Platform::Aarch64,
+            exec_backend: ExecBackendRequest::Native,
+            native_page_profile: page_profile,
+            pid: PidMode::Host,
+            hostname: None,
+            network: NetworkNamespaceSpec::default(),
+            extra_hosts: Vec::new(),
+            uid: 0,
+            gid: 0,
+        }
     }
 
     #[test]
@@ -743,6 +771,24 @@ mod exit_code_tests {
             ErrorKind::PermissionDenied
         )));
         assert!(!is_entrypoint_not_executable(&rt_io(ErrorKind::NotFound)));
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn explicit_native_linux4k_reaches_darwin_native_backend_boundary() {
+        let err = Runtime::execute(&native_run_spec(NativePageProfileRequest::Linux4k))
+            .expect_err("native backend is selected but not runnable yet");
+
+        assert!(matches!(
+            err,
+            RuntimeError::Unsupported(message)
+                if message.contains("native Darwin backend selected")
+                    && message.contains("platform=Aarch64")
+                    && message.contains("profile=Linux4kOn16k")
+                    && message.contains("host_page_size=16384")
+                    && message.contains("linux_page_size=4096")
+                    && message.contains("launch unsupported")
+        ));
     }
 
     #[test]
