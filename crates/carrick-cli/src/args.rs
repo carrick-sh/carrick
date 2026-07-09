@@ -37,7 +37,7 @@ use std::path::PathBuf;
 #[cfg(feature = "platform-macos")]
 use carrick_runtime::compat::CompatReportFormat;
 use carrick_runtime::runtime::DEFAULT_MAX_TRAPS;
-use carrick_spec::{FsBackendKind, PidMode};
+use carrick_spec::{ExecBackendRequest, FsBackendKind, NativePageProfileRequest, PidMode};
 use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
@@ -290,6 +290,12 @@ pub(crate) enum Commands {
         /// in-memory backend (`memory`) is opt-in (`--features fs-memory`).
         #[arg(long, value_enum)]
         fs: Option<FsBackendKind>,
+        /// Execution backend policy. `native` is experimental and trusted-code-only.
+        #[arg(long = "exec-backend", value_enum, default_value_t = ExecBackendRequest::Auto, env = "CARRICK_EXEC_BACKEND")]
+        exec_backend: ExecBackendRequest,
+        /// Page profile for the native execution backend.
+        #[arg(long = "native-page-profile", value_enum, default_value_t = NativePageProfileRequest::Auto, env = "CARRICK_NATIVE_PAGE_PROFILE")]
+        native_page_profile: NativePageProfileRequest,
         /// PID namespace mode (like `docker run --pid`). `private` (default)
         /// runs the container in its own PID namespace (init is pid 1); `host`
         /// shares the host PID namespace (no remap).
@@ -388,6 +394,12 @@ pub(crate) enum Commands {
         /// in-memory backend (`memory`) is opt-in (`--features fs-memory`).
         #[arg(long, value_enum)]
         fs: Option<FsBackendKind>,
+        /// Execution backend policy. `native` is experimental and trusted-code-only.
+        #[arg(long = "exec-backend", value_enum, default_value_t = ExecBackendRequest::Auto, env = "CARRICK_EXEC_BACKEND")]
+        exec_backend: ExecBackendRequest,
+        /// Page profile for the native execution backend.
+        #[arg(long = "native-page-profile", value_enum, default_value_t = NativePageProfileRequest::Auto, env = "CARRICK_NATIVE_PAGE_PROFILE")]
+        native_page_profile: NativePageProfileRequest,
         #[arg(long, value_enum, default_value_t = PidMode::Private)]
         pid: PidMode,
         /// Docker `--pull` policy: `always` re-checks the registry and re-pulls a
