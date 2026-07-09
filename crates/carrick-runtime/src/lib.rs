@@ -134,6 +134,7 @@ pub(crate) mod inotify;
 pub mod interactive_supervisor;
 pub mod layer_cache;
 pub mod namespace;
+pub(crate) mod native_darwin;
 pub mod network;
 pub mod page_profile;
 // `linux_abi` was lifted into the leaf crate `carrick-abi` (build-graph split,
