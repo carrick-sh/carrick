@@ -45,7 +45,7 @@ fn run_fault_child(mark_guest: bool) -> Result<i32, String> {
 fn child_fault(mark_guest: bool) -> ! {
     unsafe {
         let mut action: libc::sigaction = std::mem::zeroed();
-        action.sa_sigaction = fault_handler as usize;
+        action.sa_sigaction = fault_handler as *const () as usize;
         action.sa_flags = libc::SA_SIGINFO;
         libc::sigemptyset(&mut action.sa_mask);
         if libc::sigaction(libc::SIGSEGV, &action, std::ptr::null_mut()) != 0 {

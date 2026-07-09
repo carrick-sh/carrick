@@ -57,6 +57,26 @@ Focused formatting:
 cargo fmt --manifest-path bench-native/Cargo.toml
 ```
 
+## Follow-up fix (warning cleanup)
+
+Narrow warning cleanup applied in `fault.rs`:
+
+- changed `action.sa_sigaction = fault_handler as usize;`
+  to `action.sa_sigaction = fault_handler as *const () as usize;`
+- kept behavior and scope unchanged (Task 6 only).
+
+Re-check command after fix:
+
+```bash
+cargo run --manifest-path bench-native/Cargo.toml --bin native_exec_probe -- fault-discriminator
+```
+
+Observed output (no warnings):
+
+```text
+probe=fault-discriminator status=pass guest_fault_exit=90 host_fault_exit=91
+```
+
 ## Concerns
 
 - No functional concerns recorded for this task.
