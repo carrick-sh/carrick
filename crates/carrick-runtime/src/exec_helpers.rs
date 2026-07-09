@@ -145,11 +145,21 @@ pub(crate) fn build_run_image(
         argv,
         env,
         dispatcher,
-        vdso_enabled,
-        at_base,
-        crate::page_profile::DEFAULT_LINUX_PAGE_SIZE,
-        EM_AARCH64,
+        RunImageBuildOptions {
+            vdso_enabled,
+            at_base,
+            linux_page_size: crate::page_profile::DEFAULT_LINUX_PAGE_SIZE,
+            machine: EM_AARCH64,
+        },
     )
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RunImageBuildOptions {
+    pub(crate) vdso_enabled: bool,
+    pub(crate) at_base: Option<u64>,
+    pub(crate) linux_page_size: u64,
+    pub(crate) machine: u16,
 }
 
 #[cfg_attr(
@@ -161,24 +171,21 @@ pub(crate) fn build_run_image_for(
     argv: Vec<Vec<u8>>,
     env: &[String],
     dispatcher: &SyscallDispatcher,
-    vdso_enabled: bool,
-    at_base: Option<u64>,
-    linux_page_size: u64,
-    machine: u16,
+    options: RunImageBuildOptions,
 ) -> Result<crate::memory::AddressSpace, crate::memory::AddressSpaceError> {
     let mut image = crate::memory::AddressSpace::load_elf_bytes_with_reader_for(
         bytes,
         &|p| dispatcher.read_exec_file(p),
-        machine,
+        options.machine,
     )?
-    .with_vdso_auxv(vdso_enabled);
-    if let Some(base) = at_base {
+    .with_vdso_auxv(options.vdso_enabled);
+    if let Some(base) = options.at_base {
         image = image.with_auxv_base(base);
     }
     image.with_linux_initial_stack_page_size(
         argv,
         env.iter().map(|s| s.as_bytes()),
-        linux_page_size,
+        options.linux_page_size,
     )
 }
 
@@ -187,34 +194,28 @@ pub(crate) fn build_run_image_for(
     feature = "platform-freebsd",
     feature = "platform-netbsd"
 ))]
-// One cohesive set of ELF-image inputs (the `execfn`-carrying variant of
-// `build_run_image_for`); the extra `execfn` arg just edges past the 7-arg limit.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_run_image_for_execfn(
     bytes: &[u8],
     argv: Vec<Vec<u8>>,
     env: &[String],
     execfn: &[u8],
     dispatcher: &SyscallDispatcher,
-    vdso_enabled: bool,
-    at_base: Option<u64>,
-    linux_page_size: u64,
-    machine: u16,
+    options: RunImageBuildOptions,
 ) -> Result<crate::memory::AddressSpace, crate::memory::AddressSpaceError> {
     let mut image = crate::memory::AddressSpace::load_elf_bytes_with_reader_for(
         bytes,
         &|p| dispatcher.read_exec_file(p),
-        machine,
+        options.machine,
     )?
-    .with_vdso_auxv(vdso_enabled);
-    if let Some(base) = at_base {
+    .with_vdso_auxv(options.vdso_enabled);
+    if let Some(base) = options.at_base {
         image = image.with_auxv_base(base);
     }
     image.with_linux_initial_stack_execfn_page_size(
         argv,
         env.iter().map(|s| s.as_bytes()),
         execfn,
-        linux_page_size,
+        options.linux_page_size,
     )
 }
 
@@ -482,10 +483,12 @@ mod tests {
             vec![b"/bin/true".to_vec()],
             &[],
             &dispatcher,
-            false,
-            None,
-            crate::page_profile::DEFAULT_LINUX_PAGE_SIZE,
-            EM_X86_64,
+            RunImageBuildOptions {
+                vdso_enabled: false,
+                at_base: None,
+                linux_page_size: crate::page_profile::DEFAULT_LINUX_PAGE_SIZE,
+                machine: EM_X86_64,
+            },
         )
         .expect("x86_64 ELF accepted when requested");
 
