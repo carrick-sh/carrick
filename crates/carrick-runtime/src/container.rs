@@ -79,6 +79,12 @@ pub struct ContainerState {
 pub struct RunConfig {
     /// Raw `--platform` string (`None` = host default).
     pub platform: Option<String>,
+    /// Execution backend request preserved across start/restart/exec.
+    #[serde(default)]
+    pub exec_backend: carrick_spec::ExecBackendRequest,
+    /// Native page profile request preserved across start/restart/exec.
+    #[serde(default)]
+    pub native_page_profile: carrick_spec::NativePageProfileRequest,
     /// Container env overrides (`-e`/`--env-file`), re-applied over the image env.
     pub env: Vec<String>,
     /// `-w/--workdir`.
@@ -195,6 +201,8 @@ impl Default for RunConfig {
     fn default() -> Self {
         Self {
             platform: None,
+            exec_backend: carrick_spec::ExecBackendRequest::Auto,
+            native_page_profile: carrick_spec::NativePageProfileRequest::Auto,
             env: Vec::new(),
             workdir: None,
             user: None,
