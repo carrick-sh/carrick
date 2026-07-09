@@ -1417,10 +1417,12 @@ pub mod runtime {
             &spec.envp,
             resolved.as_bytes(),
             &dispatcher,
-            vdso_enabled,
-            None,
-            crate::page_profile::DEFAULT_LINUX_PAGE_SIZE,
-            E::Arch::elf_machine(),
+            crate::exec_helpers::RunImageBuildOptions {
+                vdso_enabled,
+                at_base: None,
+                linux_page_size: crate::page_profile::DEFAULT_LINUX_PAGE_SIZE,
+                machine: E::Arch::elf_machine(),
+            },
         )?;
         // Materialise the vvar+vDSO regions when this ISA provides real bytes.
         // The initial stack must be built with the same decision, otherwise
