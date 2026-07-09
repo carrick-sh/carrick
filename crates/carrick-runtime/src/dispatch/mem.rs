@@ -240,19 +240,30 @@ fn free_regions_insert(regions: &mut Vec<(u64, u64)>, addr: u64, len: u64) {
     *regions = out;
 }
 
+fn page_floor(value: u64, page_size: u64) -> u64 {
+    value & !(page_size - 1)
+}
+
+fn page_ceil(value: u64, page_size: u64) -> Option<u64> {
+    value
+        .checked_add(page_size - 1)
+        .map(|end| page_floor(end, page_size))
+}
+
 fn page_rounded_range(
     address: GuestPtr,
     length: u64,
+    page_size: u64,
 ) -> Result<Option<crate::vfs::GuestMemoryRange>, LinuxErrno> {
     if length == 0 {
         return Ok(None);
     }
-    let start = GuestVa(address.0 & !(LINUX_PAGE_SIZE - 1));
+    let start = GuestVa(page_floor(address.0, page_size));
     let end = address
         .0
         .checked_add(length)
-        .and_then(|end| end.checked_add(LINUX_PAGE_SIZE - 1))
-        .map(|end| GuestVa(end & !(LINUX_PAGE_SIZE - 1)))
+        .and_then(|end| page_ceil(end, page_size))
+        .map(GuestVa)
         .ok_or(LINUX_ENOMEM)?;
     crate::vfs::GuestMemoryRange::new(start, end)
         .map(Some)
@@ -267,6 +278,7 @@ fn validate_mlock_range(
     memory: &mut impl GuestMemory,
     range: crate::vfs::GuestMemoryRange,
     populate: bool,
+    page_size: u64,
 ) -> Result<(), LinuxErrno> {
     let len = range_len_usize(range)?;
     if !populate && memory.host_ptr_for_read(range.start().raw(), len).is_some() {
@@ -277,7 +289,7 @@ fn validate_mlock_range(
         if memory.read_bytes(page, 1).is_err() {
             return Err(LINUX_ENOMEM);
         }
-        page = page.checked_add(LINUX_PAGE_SIZE).ok_or(LINUX_ENOMEM)?;
+        page = page.checked_add(page_size).ok_or(LINUX_ENOMEM)?;
     }
     Ok(())
 }
@@ -476,9 +488,9 @@ fn trim_ranges_for_range(ranges: &mut Vec<(u64, u64)>, start: u64, len: u64) {
     *ranges = next;
 }
 
-fn shared_file_bus_offset(file_len: u64, offset: u64, length: u64) -> Option<u64> {
+fn shared_file_bus_offset(file_len: u64, offset: u64, length: u64, page_size: u64) -> Option<u64> {
     let bytes_available = file_len.saturating_sub(offset).min(length);
-    let bus_start = align_up_u64(bytes_available, LINUX_PAGE_SIZE)?;
+    let bus_start = align_up_u64(bytes_available, page_size)?;
     (bus_start < length).then_some(bus_start)
 }
 
@@ -702,13 +714,14 @@ impl SyscallDispatcher {
         let Some(end) = start.checked_add(len) else {
             return;
         };
-        let stack_span = 256 * LINUX_PAGE_SIZE;
+        let page_size = self.linux_page_size();
+        let stack_span = 256 * page_size;
         let low = end.saturating_sub(stack_span);
         self.mem.lock().growdown_ranges.push((low, start, end));
     }
 
     pub(crate) fn mmap_growdown_fault_plan(&self, addr: u64) -> Option<(u64, usize)> {
-        let page = addr & !(LINUX_PAGE_SIZE - 1);
+        let page = page_floor(addr, self.linux_page_size());
         let mem = self.mem.lock();
         for &(low, current, _end) in &mem.growdown_ranges {
             if page >= low && page < current {
@@ -771,15 +784,16 @@ impl SyscallDispatcher {
         _prot: u64,
         flags: u64,
     ) -> Option<(u64, bool)> {
+        let page_size = self.linux_page_size();
         if flags & LINUX_MAP_FIXED != 0 {
-            if requested == 0 || !requested.is_multiple_of(LINUX_PAGE_SIZE) {
+            if requested == 0 || !requested.is_multiple_of(page_size) {
                 return None;
             }
             return Some((requested, false));
         }
 
         if requested != 0 {
-            let aligned_hint = requested.is_multiple_of(LINUX_PAGE_SIZE);
+            let aligned_hint = requested.is_multiple_of(page_size);
             let arena_hint = aligned_hint
                 && range_within(
                     requested,
@@ -817,7 +831,7 @@ impl SyscallDispatcher {
             }
             return Some((s, true));
         }
-        let address = align_up_u64(mem.mmap_next, LINUX_PAGE_SIZE)?;
+        let address = align_up_u64(mem.mmap_next, page_size)?;
         if !range_within(
             address,
             length,
@@ -1010,6 +1024,7 @@ impl SyscallDispatcher {
         fn mmap(this, cx, requested: GuestPtr, length: u64, prot: u64, flags: u64, fd: Fd, offset: u64) {
             let mut flags = flags;
             let memory = &mut *cx.memory;
+            let page_size = this.linux_page_size();
 
             // Apple Rosetta tags pointers in bits 63:48 (a 16-bit value space)
             // and maps its translated ELF into the x86-64 high half. Strip the
@@ -1081,15 +1096,17 @@ impl SyscallDispatcher {
                 || prot_flags.bits() & !LinuxProtFlags::SUPPORTED_MASK != 0
                 || map_flags.bits() & !LinuxMmapFlags::SUPPORTED_MASK != 0
                 || map_sharing.is_none()
-                || (!map_flags.contains(LinuxMmapFlags::ANONYMOUS) && !offset.is_multiple_of(LINUX_PAGE_SIZE))
-                || (map_flags.contains(LinuxMmapFlags::FIXED) && !requested.0.is_multiple_of(LINUX_PAGE_SIZE))
+                || (!map_flags.contains(LinuxMmapFlags::ANONYMOUS)
+                    && !offset.is_multiple_of(page_size))
+                || (map_flags.contains(LinuxMmapFlags::FIXED)
+                    && !requested.0.is_multiple_of(page_size))
             {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             let Some(map_sharing) = map_sharing else {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             };
-            let length = match align_up_u64(length, LINUX_PAGE_SIZE) {
+            let length = match align_up_u64(length, page_size) {
                 Some(length) => length,
                 None => {
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
@@ -1224,7 +1241,9 @@ impl SyscallDispatcher {
                     match &*open {
                         OpenDescription::HostFile { host_fd, .. } => {
                             if host_fd_file_len(host_fd.raw())
-                                .and_then(|len| shared_file_bus_offset(len, offset, length))
+                                .and_then(|len| {
+                                    shared_file_bus_offset(len, offset, length, page_size)
+                                })
                                 .is_some()
                             {
                                 None
@@ -1479,6 +1498,7 @@ impl SyscallDispatcher {
                                 contents.len() as u64,
                                 offset,
                                 length,
+                                page_size,
                             )
                         {
                             bus_fault_offset = Some(bus_offset);
@@ -1507,6 +1527,7 @@ impl SyscallDispatcher {
                                 contents.len() as u64,
                                 offset,
                                 length,
+                                page_size,
                             )
                         {
                             bus_fault_offset = Some(bus_offset);
@@ -1521,7 +1542,7 @@ impl SyscallDispatcher {
                         if map_sharing == MmapSharing::Shared
                             && let Some(file_len) = host_fd_file_len(host_fd.raw())
                             && let Some(bus_offset) =
-                                shared_file_bus_offset(file_len, offset, length)
+                                shared_file_bus_offset(file_len, offset, length, page_size)
                         {
                             bus_fault_offset = Some(bus_offset);
                         }
@@ -1693,17 +1714,18 @@ impl SyscallDispatcher {
         }
 
         fn munmap(this, cx, address: GuestPtr, length: u64) {
+            let page_size = this.linux_page_size();
             // Linux munmap EINVAL edges (__vm_munmap): the address must be
             // page-aligned and the length non-zero. LTP munmap03 munmaps the
             // address of a BSS global (8-aligned, not page-aligned) and that
             // address + 8, expecting EINVAL — carrick lacked the alignment gate.
-            if !address.0.is_multiple_of(LINUX_PAGE_SIZE) {
+            if !address.0.is_multiple_of(page_size) {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             if length == 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            if let Some(len) = align_up_u64(length, LINUX_PAGE_SIZE) {
+            if let Some(len) = align_up_u64(length, page_size) {
                 this.remove_dynamic_mapping(address.0, len);
                 this.remove_write_sealed_shared_map(address.0, len);
                 this.remove_writable_memfd_map(address.0, len);
@@ -1735,7 +1757,7 @@ impl SyscallDispatcher {
                 // SharedFile backings write dirty bytes back and close the dup;
                 // SharedAnon frees are pure bookkeeping. The aperture stays
                 // stage-2 mapped — no hv_vm_unmap.
-                if let Some(len) = align_up_u64(length, LINUX_PAGE_SIZE)
+                if let Some(len) = align_up_u64(length, page_size)
                     && let Ok(len_usize) = usize::try_from(len)
                 {
                     cx.memory.set_no_access(address.0, len_usize, true);
@@ -1757,7 +1779,7 @@ impl SyscallDispatcher {
             // to assert EINVAL) are already rejected by the alignment gate above;
             // addresses >= 2^48 stay EINVAL via the range check below.
             if mmap_address_uses_alias(address.0, length) {
-                if let Some(len) = align_up_u64(length, LINUX_PAGE_SIZE)
+                if let Some(len) = align_up_u64(length, page_size)
                     && let Ok(len_usize) = usize::try_from(len)
                 {
                     // Alias teardown: invalidate AND reclaim the now-empty per-
@@ -1772,7 +1794,7 @@ impl SyscallDispatcher {
             if !range_within(address.0, length, LINUX_MMAP_BASE, crate::memory::mmap_arena_size()) {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            if let Some(len) = align_up_u64(length, LINUX_PAGE_SIZE) {
+            if let Some(len) = align_up_u64(length, page_size) {
                 let mut mem = this.mem.lock();
                 // Invalidate the freed range in stage-1 (use-after-munmap faults
                 // in-guest) BEFORE returning it to the allocator, holding `mem`
@@ -1814,7 +1836,7 @@ impl SyscallDispatcher {
             // before anything else). CPython's mmap.flush(offset, size) calls
             // msync(data + offset, size, ...), so flush(1, n) must EINVAL —
             // test_mmap.test_flush_return_value asserts it on Linux.
-            if !address.0.is_multiple_of(LINUX_PAGE_SIZE) {
+            if !address.0.is_multiple_of(this.linux_page_size()) {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             if length == 0 {
@@ -1840,20 +1862,22 @@ impl SyscallDispatcher {
         }
 
         fn mlock(this, cx, address: GuestPtr, length: u64) {
-            let Some(range) = page_rounded_range(address, length)? else {
+            let page_size = this.linux_page_size();
+            let Some(range) = page_rounded_range(address, length, page_size)? else {
                 return Ok(DispatchOutcome::Returned { value: 0 });
             };
-            validate_mlock_range(&mut *cx.memory, range, true)?;
+            validate_mlock_range(&mut *cx.memory, range, true, page_size)?;
             this.populate_resident_range(&mut *cx.memory, range)?;
             this.add_locked_range(range)?;
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
         fn munlock(this, cx, address: GuestPtr, length: u64) {
-            let Some(range) = page_rounded_range(address, length)? else {
+            let page_size = this.linux_page_size();
+            let Some(range) = page_rounded_range(address, length, page_size)? else {
                 return Ok(DispatchOutcome::Returned { value: 0 });
             };
-            validate_mlock_range(&mut *cx.memory, range, false)?;
+            validate_mlock_range(&mut *cx.memory, range, false, page_size)?;
             this.remove_locked_range(range);
             Ok(DispatchOutcome::Returned { value: 0 })
         }
@@ -1885,13 +1909,15 @@ impl SyscallDispatcher {
             let Some(flags) = LinuxMlock2Flags::from_bits(flags) else {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             };
-            let Some(range) = page_rounded_range(address, length)? else {
+            let page_size = this.linux_page_size();
+            let Some(range) = page_rounded_range(address, length, page_size)? else {
                 return Ok(DispatchOutcome::Returned { value: 0 });
             };
             validate_mlock_range(
                 &mut *cx.memory,
                 range,
                 !flags.contains(LinuxMlock2Flags::ONFAULT),
+                page_size,
             )?;
             if !flags.contains(LinuxMlock2Flags::ONFAULT) {
                 this.populate_resident_range(&mut *cx.memory, range)?;
@@ -1902,9 +1928,10 @@ impl SyscallDispatcher {
 
         fn mincore(this, cx, address: GuestPtr, length: u64, vec: GuestPtr) {
             let memory = &mut *cx.memory;
+            let page_size = this.linux_page_size();
             // Linux requires a page-aligned start address, else EINVAL (this is
             // what Go's TestMincoreErrorSign checks — the errno must be -EINVAL).
-            if !address.0.is_multiple_of(LINUX_PAGE_SIZE) {
+            if !address.0.is_multiple_of(page_size) {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             if length == 0 {
@@ -1921,7 +1948,7 @@ impl SyscallDispatcher {
             // catchable panic). Then walk each page start so mapped first+last
             // pages with a hole in the middle still report ENOMEM.
             let last_page = match address.0.checked_add(length - 1) {
-                Some(end) => end & !(LINUX_PAGE_SIZE - 1),
+                Some(end) => page_floor(end, page_size),
                 None => return Ok(DispatchOutcome::errno(LINUX_ENOMEM)),
             };
             if !mincore_page_is_mapped(memory, last_page) {
@@ -1932,14 +1959,14 @@ impl SyscallDispatcher {
                 if !mincore_page_is_mapped(memory, page) {
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 }
-                page = match page.checked_add(LINUX_PAGE_SIZE) {
+                page = match page.checked_add(page_size) {
                     Some(next) => next,
                     None => return Ok(DispatchOutcome::errno(LINUX_ENOMEM)),
                 };
             }
-            let pages = length.div_ceil(LINUX_PAGE_SIZE);
+            let pages = length.div_ceil(page_size);
             let bytes = this
-                .mincore_residency_vector(address.0, pages)
+                .mincore_residency_vector(address.0, pages, page_size)
                 .unwrap_or_else(|| vec![1u8; pages as usize]);
             memory.write_bytes(vec.0, &bytes)?;
             Ok(DispatchOutcome::Returned { value: 0 })
@@ -1947,6 +1974,7 @@ impl SyscallDispatcher {
 
         fn mremap(this, cx, old_address: GuestPtr, old_size: u64, new_size_req: u64, flags: u64, _new_address: GuestPtr) {
             let memory = &mut *cx.memory;
+            let page_size = this.linux_page_size();
             if new_size_req == 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
@@ -1969,7 +1997,7 @@ impl SyscallDispatcher {
                 // here — invalidating a high-VA alias tail needs trap-engine
                 // coordination; no caller reads it. A grow would mean relocating
                 // a file/shared backing, which we don't do → EINVAL as before.)
-                let Some(new_size) = align_up_u64(new_size_req, LINUX_PAGE_SIZE) else {
+                let Some(new_size) = align_up_u64(new_size_req, page_size) else {
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 };
                 if memory.read_bytes(old_address.0, 1).is_err() {
@@ -1982,7 +2010,7 @@ impl SyscallDispatcher {
                 }
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            let Some(new_size) = align_up_u64(new_size_req, LINUX_PAGE_SIZE) else {
+            let Some(new_size) = align_up_u64(new_size_req, page_size) else {
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
             };
             if new_size <= old_size {
@@ -1996,7 +2024,7 @@ impl SyscallDispatcher {
                 let tail_end = old_address
                     .0
                     .checked_add(old_size)
-                    .map(|e| e & !(LINUX_PAGE_SIZE - 1));
+                    .map(|e| page_floor(e, page_size));
                 if let Some(tail_end) = tail_end
                     && tail_end > tail_start
                 {
@@ -2136,7 +2164,7 @@ impl SyscallDispatcher {
             let dst_overlaps_src = new_addr < old_address.0.wrapping_add(old_size)
                 && old_address.0 < new_addr.wrapping_add(new_size);
             if flags & LINUX_MREMAP_DONTUNMAP == 0 && !dst_overlaps_src
-                && let Some(old_size_a) = align_up_u64(old_size, LINUX_PAGE_SIZE)
+                && let Some(old_size_a) = align_up_u64(old_size, page_size)
                     && let Ok(old_len) = usize::try_from(old_size_a)
                     && old_len > 0
                 {
@@ -2166,13 +2194,14 @@ impl SyscallDispatcher {
         }
 
         fn mprotect(this, cx, address: GuestPtr, length: u64, prot: u64) {
+            let page_size = this.linux_page_size();
             if prot & !LinuxProtFlags::SUPPORTED_MASK != 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             if length == 0 {
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
-            if !address.0.is_multiple_of(LINUX_PAGE_SIZE) {
+            if !address.0.is_multiple_of(page_size) {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             // Linux mprotect returns ENOMEM when the range covers unmapped VA
@@ -2236,7 +2265,8 @@ impl SyscallDispatcher {
         }
 
         fn madvise(this, cx, address: GuestPtr, length: u64, advice: u64) {
-            if !address.0.is_multiple_of(LINUX_PAGE_SIZE) || !linux_madvise_advice_is_supported(advice) {
+            let page_size = this.linux_page_size();
+            if !address.0.is_multiple_of(page_size) || !linux_madvise_advice_is_supported(advice) {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             if length == 0 {
@@ -2256,7 +2286,7 @@ impl SyscallDispatcher {
             let Some(raw_end) = address.0.checked_add(length as u64) else {
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
             };
-            let Some(end) = align_up_u64(raw_end, LINUX_PAGE_SIZE) else {
+            let Some(end) = align_up_u64(raw_end, page_size) else {
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
             };
             let meta = this.madvise_range_meta(address.0, end);
@@ -2338,7 +2368,7 @@ impl SyscallDispatcher {
                     }
                 };
                 let source_offset = match pgoff
-                    .checked_mul(LINUX_PAGE_SIZE)
+                    .checked_mul(this.linux_page_size())
                     .and_then(|off| usize::try_from(off).ok())
                 {
                     Some(off) => off,
@@ -2415,11 +2445,16 @@ impl SyscallDispatcher {
     /// every post-exec VMA belong to loader-populated initial regions (ELF
     /// text/data, heap, stack, trampolines) and stay resident, matching the
     /// prior conservative default.
-    fn mincore_residency_vector(&self, address: u64, pages: u64) -> Option<Vec<u8>> {
+    fn mincore_residency_vector(
+        &self,
+        address: u64,
+        pages: u64,
+        page_size: u64,
+    ) -> Option<Vec<u8>> {
         let mem = self.mem.lock();
         let mut out = Vec::with_capacity(usize::try_from(pages).ok()?);
         for index in 0..pages {
-            let page = address.checked_add(index.checked_mul(LINUX_PAGE_SIZE)?)?;
+            let page = address.checked_add(index.checked_mul(page_size)?)?;
             let in_dynamic = mem
                 .dynamic_maps
                 .iter()
@@ -2447,7 +2482,7 @@ impl SyscallDispatcher {
     }
 
     pub(crate) fn resident_fault_plan(&self, address: u64) -> Option<(u64, u64)> {
-        let page = address & !(LINUX_PAGE_SIZE - 1);
+        let page = page_floor(address, self.linux_page_size());
         let mem = self.mem.lock();
         mem.resident_fault_ranges
             .iter()
@@ -2456,9 +2491,10 @@ impl SyscallDispatcher {
     }
 
     pub(crate) fn commit_resident_fault(&self, page: u64) {
-        let Some(range) =
-            crate::vfs::GuestMemoryRange::new(GuestVa(page), GuestVa(page + LINUX_PAGE_SIZE))
-        else {
+        let Some(end) = page.checked_add(self.linux_page_size()) else {
+            return;
+        };
+        let Some(range) = crate::vfs::GuestMemoryRange::new(GuestVa(page), GuestVa(end)) else {
             return;
         };
         let mut mem = self.mem.lock();
@@ -2502,7 +2538,8 @@ impl SyscallDispatcher {
         if !flags.contains(LinuxMmapFlags::LOCKED) {
             return Ok(None);
         }
-        let Some(range) = page_rounded_range(GuestPtr(address), length)? else {
+        let Some(range) = page_rounded_range(GuestPtr(address), length, self.linux_page_size())?
+        else {
             return Ok(None);
         };
         self.check_locked_range_limit(range)?;

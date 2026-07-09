@@ -1707,6 +1707,9 @@ pub struct SyscallDispatcher {
     /// Active network namespace provider lease for this run. Host mode uses a
     /// no-op provider; bridge mode carries the socket namespace provider.
     network: std::sync::Arc<crate::network::RuntimeNetwork>,
+    /// Linux/host page geometry selected for this run. Default dispatch stays
+    /// 4 KiB Linux pages; native-only lanes can override before first syscall.
+    page_geometry: crate::page_profile::PageGeometry,
     /// The supplementary group set installed by `setgroups(2)`, or `None` if the
     /// guest never called it (then `getgroups` falls back to the /etc/group-
     /// derived membership for `id(1)` compatibility). `setgroups` replaces this
@@ -1992,6 +1995,11 @@ impl SyscallDispatcher {
             seccomp: crate::seccomp::SeccompState::default(),
             sysv: Mutex::new(sysv::SysvShmState::new()),
             network: std::sync::Arc::new(crate::network::RuntimeNetwork::host_default()),
+            page_geometry: crate::page_profile::PageGeometry {
+                host_page_size: crate::page_profile::DEFAULT_LINUX_PAGE_SIZE,
+                linux_page_size: crate::page_profile::DEFAULT_LINUX_PAGE_SIZE,
+                native_profile: None,
+            },
             setgroups_override: Mutex::new(None),
             signal_pump_requested: std::sync::atomic::AtomicBool::new(false),
             // Default: bare run-elf boot — allow the host-fs execve fallback.
@@ -2020,6 +2028,24 @@ impl SyscallDispatcher {
         }
         dispatcher.network = network;
         dispatcher
+    }
+
+    pub fn with_page_geometry(page_geometry: crate::page_profile::PageGeometry) -> Self {
+        let mut dispatcher = Self::new();
+        dispatcher.page_geometry = page_geometry;
+        dispatcher
+    }
+
+    pub(crate) fn set_page_geometry(&mut self, page_geometry: crate::page_profile::PageGeometry) {
+        self.page_geometry = page_geometry;
+    }
+
+    pub fn page_geometry(&self) -> crate::page_profile::PageGeometry {
+        self.page_geometry
+    }
+
+    pub(crate) fn linux_page_size(&self) -> u64 {
+        self.page_geometry.linux_page_size
     }
 
     pub(crate) fn notify_inmem_epoll(&self) {
