@@ -35,7 +35,25 @@ pub fn run_from_env() -> Result<(), String> {
 }
 
 fn run_all() -> Result<(), String> {
-    Err("all probe is implemented after the individual probes exist".to_string())
+    let reports = [
+        page_size()?,
+        fixed_map_child()?,
+        execmem()?,
+        brk_trap()?,
+        branch_gateway()?,
+        fault_discriminator()?,
+    ];
+
+    let failed = reports.iter().any(|report| report.status() == Status::Fail);
+    for report in reports {
+        report.print();
+    }
+
+    if failed {
+        Err("native execution feasibility probe failed".to_string())
+    } else {
+        Ok(())
+    }
 }
 
 fn print_one(report: ProbeReport) -> Result<(), String> {
