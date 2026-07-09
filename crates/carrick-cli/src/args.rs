@@ -125,6 +125,12 @@ pub(crate) enum Commands {
         /// idiom as `trace --forward-env`.
         #[arg(long = "forward-env", value_name = "KEY=VAL")]
         forward_env: Vec<String>,
+        /// Execution backend policy. `native` is experimental and trusted-code-only.
+        #[arg(long = "exec-backend", value_enum, default_value_t = ExecBackendRequest::Auto, env = "CARRICK_EXEC_BACKEND")]
+        exec_backend: ExecBackendRequest,
+        /// Page profile for the native execution backend.
+        #[arg(long = "native-page-profile", value_enum, default_value_t = NativePageProfileRequest::Auto, env = "CARRICK_NATIVE_PAGE_PROFILE")]
+        native_page_profile: NativePageProfileRequest,
         #[arg(last = true)]
         args: Vec<String>,
     },
