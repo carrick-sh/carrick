@@ -1892,7 +1892,7 @@ fn create_vm_with_admission(
 /// bounded-acquire ONE plain-fork admission permit and release it immediately.
 /// The permit budget models exactly what the fork is about to consume — the
 /// CHILD's post-fork `create_vm_with_admission(ForkRebuild)` — so a probe that
-/// cannot get a slot within [`ADMISSION_PERMIT_MAX_WAIT`] proves the child's
+/// cannot get a slot within `ADMISSION_PERMIT_MAX_WAIT` proves the child's
 /// rebuild would stall/fail too, and the fork degrades to guest `EAGAIN`
 /// BEFORE any teardown (the parent VM is untouched; no child exists yet).
 ///
@@ -1912,7 +1912,7 @@ fn create_vm_with_admission(
 /// lease-off @160 fatal and the fd-veto capacity cost; evidence doc
 /// docs/2026-07-09-mt-residency-lease-evidence.md, Next Track 1a). This gate
 /// now ALSO probes the resident-VM slot table (`vm_residency_region()`,
-/// Task 1) with a bounded [`probe_vm_slot_budget`] call: a pinned fleet with
+/// Task 1) with a bounded `probe_vm_slot_budget` call: a pinned fleet with
 /// free permits but no free VM slot now bounds out and degrades to guest
 /// `EAGAIN` instead of reaching the post-fork `hv_vm_create` fatal.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
