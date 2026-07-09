@@ -48,6 +48,10 @@ path = "../conformance-probes/src/bin/perf_net_xserver.rs"
 name = "perf_net_xclient"
 path = "../conformance-probes/src/bin/perf_net_xclient.rs"
 
+[[bin]]
+name = "native_exec_probe"
+path = "src/bin/native_exec_probe.rs"
+
 [profile.release]
 opt-level = "z"
 strip = true
