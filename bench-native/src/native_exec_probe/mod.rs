@@ -1,8 +1,10 @@
 #![allow(dead_code)]
 
+mod execmem;
 mod mapping;
 mod report;
 
+use execmem::execmem;
 use mapping::{fixed_map_child, page_size};
 use report::{ProbeReport, Status};
 
@@ -19,7 +21,7 @@ pub fn run_from_env() -> Result<(), String> {
     match command.as_str() {
         "page-size" => print_one(page_size()?),
         "fixed-map" => print_one(fixed_map_child()?),
-        "execmem" => Err("execmem probe is implemented in Task 3".to_string()),
+        "execmem" => print_one(execmem()?),
         "brk-trap" => Err("brk-trap probe is implemented in Task 4".to_string()),
         "branch-gateway" => Err("branch-gateway probe is implemented in Task 5".to_string()),
         "fault-discriminator" => {
