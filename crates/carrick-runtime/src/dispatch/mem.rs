@@ -1981,6 +1981,12 @@ impl SyscallDispatcher {
             if flags & !(LINUX_MREMAP_MAYMOVE | LINUX_MREMAP_FIXED | LINUX_MREMAP_DONTUNMAP) != 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
+            let Some(old_size) = align_up_u64(old_size, page_size) else {
+                return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+            };
+            let Some(new_size) = align_up_u64(new_size_req, page_size) else {
+                return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+            };
             if !range_within(old_address.0, old_size, LINUX_MMAP_BASE, crate::memory::mmap_arena_size()) {
                 // The mapping is not in the mmap arena: it's a MAP_SHARED file
                 // alias (high VA) or a MAP_SHARED anonymous shared-aperture
@@ -1997,9 +2003,6 @@ impl SyscallDispatcher {
                 // here — invalidating a high-VA alias tail needs trap-engine
                 // coordination; no caller reads it. A grow would mean relocating
                 // a file/shared backing, which we don't do → EINVAL as before.)
-                let Some(new_size) = align_up_u64(new_size_req, page_size) else {
-                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
-                };
                 if memory.read_bytes(old_address.0, 1).is_err() {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
@@ -2010,9 +2013,6 @@ impl SyscallDispatcher {
                 }
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            let Some(new_size) = align_up_u64(new_size_req, page_size) else {
-                return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
-            };
             if new_size <= old_size {
                 // Linux mremap shrink unmaps the freed tail [old+new_size,
                 // old+old_size); carrick used to leave it mapped (a leak, and
@@ -2164,8 +2164,7 @@ impl SyscallDispatcher {
             let dst_overlaps_src = new_addr < old_address.0.wrapping_add(old_size)
                 && old_address.0 < new_addr.wrapping_add(new_size);
             if flags & LINUX_MREMAP_DONTUNMAP == 0 && !dst_overlaps_src
-                && let Some(old_size_a) = align_up_u64(old_size, page_size)
-                    && let Ok(old_len) = usize::try_from(old_size_a)
+                && let Ok(old_len) = usize::try_from(old_size)
                     && old_len > 0
                 {
                     let mut mem = this.mem.lock();
@@ -2174,7 +2173,7 @@ impl SyscallDispatcher {
                     // mmap clears it in its seed.
                     memory.set_no_access(old_address.0, old_len, true);
                     let _ = memory.unmap_range(old_address.0, old_len);
-                    if old_address.0.checked_add(old_size_a) == Some(mem.mmap_next) {
+                    if old_address.0.checked_add(old_size) == Some(mem.mmap_next) {
                         mem.mmap_next = old_address.0;
                         while let Some(pos) = mem
                             .free_regions
@@ -2185,7 +2184,7 @@ impl SyscallDispatcher {
                             mem.mmap_next = s;
                         }
                     } else {
-                        free_regions_insert(&mut mem.free_regions, old_address.0, old_size_a);
+                        free_regions_insert(&mut mem.free_regions, old_address.0, old_size);
                     }
                 }
             Ok(DispatchOutcome::Returned {
@@ -2223,6 +2222,9 @@ impl SyscallDispatcher {
             if cx.memory.read_bytes_raw(address.0, 1).is_err() {
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
             }
+            let Some(length) = align_up_u64(length, page_size) else {
+                return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+            };
             // A shared mapping of a F_SEAL_WRITE memfd cannot be upgraded to
             // writable (memfd_create01 check_mfd_non_writeable).
             if prot & LINUX_PROT_WRITE != 0 && this.range_is_write_sealed_shared(address.0, length) {

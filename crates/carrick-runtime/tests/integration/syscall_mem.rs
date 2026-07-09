@@ -8,6 +8,41 @@ mod support;
 
 use support::*;
 
+use carrick_guest_mem::protections::MemoryProtections;
+use carrick_runtime::dispatch::MemoryError;
+
+struct ProtectedAddressSpace {
+    inner: AddressSpace,
+    protections: MemoryProtections,
+}
+
+impl ProtectedAddressSpace {
+    fn new(inner: AddressSpace) -> Self {
+        Self {
+            inner,
+            protections: MemoryProtections::default(),
+        }
+    }
+}
+
+impl GuestMemory for ProtectedAddressSpace {
+    fn protections(&self) -> Option<&MemoryProtections> {
+        Some(&self.protections)
+    }
+
+    fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+        self.inner.read_bytes_raw(address, length)
+    }
+
+    fn write_bytes_raw(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+        self.inner.write_bytes_raw(address, bytes)
+    }
+
+    fn set_no_access(&mut self, address: u64, len: usize, no_access: bool) {
+        self.protections.set_no_access(address, len, no_access);
+    }
+}
+
 #[test]
 fn linear_memory_bounds_reads() {
     let mut memory = LinearMemory::new(0x1000, b"abcdef".to_vec());
@@ -354,6 +389,138 @@ fn dispatcher_mmap_uses_configured_16k_linux_page_size() {
             value: (LINUX_MMAP_BASE + 16_384) as i64
         }
     );
+}
+
+#[test]
+fn mprotect_rounds_length_to_configured_16k_linux_page_size() {
+    let mut memory = ProtectedAddressSpace::new(
+        AddressSpace::from_segments(
+            0,
+            [(LINUX_MMAP_BASE, rwx_perms(), Vec::new(), LINUX_MMAP_SIZE)],
+        )
+        .unwrap(),
+    );
+    let reporter = CompatReporter::default();
+    let mut dispatcher =
+        SyscallDispatcher::with_page_geometry(carrick_runtime::page_profile::PageGeometry {
+            host_page_size: 16_384,
+            linux_page_size: 16_384,
+            native_profile: Some(carrick_spec::NativePageProfile::Native16k),
+        });
+    let map_private_anonymous = 0x02 | 0x20;
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    222,
+                    SyscallArgs::from([0, 1, 3, map_private_anonymous, (-1_i64) as u64, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned {
+            value: LINUX_MMAP_BASE as i64
+        }
+    );
+    memory
+        .write_bytes(LINUX_MMAP_BASE + 4096, b"x")
+        .expect("mapped 16K page should be writable before mprotect");
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(226, SyscallArgs::from([LINUX_MMAP_BASE, 1, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    64,
+                    SyscallArgs::from([1, LINUX_MMAP_BASE + 4096, 1, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(14)
+        }
+    );
+}
+
+#[test]
+fn mremap_rounds_old_size_to_configured_16k_linux_page_size_when_moving() {
+    const MREMAP_MAYMOVE: u64 = 0x01;
+    let mut memory = AddressSpace::from_segments(
+        0,
+        [(LINUX_MMAP_BASE, rwx_perms(), Vec::new(), LINUX_MMAP_SIZE)],
+    )
+    .unwrap();
+    let reporter = CompatReporter::default();
+    let mut dispatcher =
+        SyscallDispatcher::with_page_geometry(carrick_runtime::page_profile::PageGeometry {
+            host_page_size: 16_384,
+            linux_page_size: 16_384,
+            native_profile: Some(carrick_spec::NativePageProfile::Native16k),
+        });
+    let map_private_anonymous = 0x02 | 0x20;
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    222,
+                    SyscallArgs::from([0, 1, 3, map_private_anonymous, (-1_i64) as u64, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned {
+            value: LINUX_MMAP_BASE as i64
+        }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    222,
+                    SyscallArgs::from([0, 1, 3, map_private_anonymous, (-1_i64) as u64, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned {
+            value: (LINUX_MMAP_BASE + 16_384) as i64
+        }
+    );
+    memory
+        .write_bytes(LINUX_MMAP_BASE + 4096, b"x")
+        .expect("mapped 16K page should be writable before mremap");
+
+    let outcome = dispatcher
+        .dispatch(
+            SyscallRequest::new(
+                216,
+                SyscallArgs::from([LINUX_MMAP_BASE, 1, 32_768, MREMAP_MAYMOVE, 0, 0]),
+            ),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+    let DispatchOutcome::Returned { value } = outcome else {
+        panic!("mremap failed: {outcome:?}");
+    };
+    assert_eq!(value as u64, LINUX_MMAP_BASE + 32_768);
+    assert_eq!(memory.read_bytes(value as u64 + 4096, 1).unwrap(), b"x");
 }
 
 #[test]
