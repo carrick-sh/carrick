@@ -30,6 +30,99 @@ impl PageGeometry {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostPageState {
+    Uniform16k,
+    Composed16k,
+    MixedGuarded(MixedPageReason),
+    Unsupported(MixedPageReason),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MixedPageReason {
+    Permissions,
+    Backing,
+    ExecutableMixedPage,
+    UnsupportedGeometry,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageBacking {
+    Anonymous,
+    PrivateFile,
+    SharedFile,
+    Unmapped,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PagePerms {
+    pub read: bool,
+    pub write: bool,
+    pub exec: bool,
+}
+
+impl PagePerms {
+    pub const fn none() -> Self {
+        Self {
+            read: false,
+            write: false,
+            exec: false,
+        }
+    }
+
+    pub const fn read_write() -> Self {
+        Self {
+            read: true,
+            write: true,
+            exec: false,
+        }
+    }
+
+    pub const fn read_exec() -> Self {
+        Self {
+            read: true,
+            write: false,
+            exec: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubpageState {
+    pub backing: PageBacking,
+    pub perms: PagePerms,
+}
+
+impl SubpageState {
+    pub const fn new(backing: PageBacking, perms: PagePerms) -> Self {
+        Self { backing, perms }
+    }
+}
+
+pub fn classify_host_page_state<const N: usize>(
+    geometry: PageGeometry,
+    subpages: [SubpageState; N],
+) -> HostPageState {
+    if geometry.host_page_size == geometry.linux_page_size {
+        return HostPageState::Uniform16k;
+    }
+    if geometry.host_page_size != 16_384 || geometry.linux_page_size != 4096 || N != 4 {
+        return HostPageState::Unsupported(MixedPageReason::UnsupportedGeometry);
+    }
+
+    let first = subpages[0];
+    if subpages.iter().all(|state| *state == first) {
+        return HostPageState::Uniform16k;
+    }
+    if subpages.iter().any(|state| state.perms.exec) {
+        return HostPageState::Unsupported(MixedPageReason::ExecutableMixedPage);
+    }
+    if subpages.iter().any(|state| state.backing != first.backing) {
+        return HostPageState::Composed16k;
+    }
+    HostPageState::MixedGuarded(MixedPageReason::Permissions)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ExecutionPlan {
     pub backend: ExecutionBackend,
@@ -277,5 +370,65 @@ mod tests {
             let err = result.expect_err("unsupported off the Darwin 16K native lane");
             assert!(matches!(err, RuntimeError::Unsupported(_)));
         }
+    }
+
+    #[test]
+    fn classifies_uniform_16k_page_as_fast_path() {
+        let state = classify_host_page_state(
+            PageGeometry {
+                host_page_size: 16_384,
+                linux_page_size: 4096,
+                native_profile: Some(NativePageProfile::Linux4kOn16k),
+            },
+            [
+                SubpageState::new(PageBacking::Anonymous, PagePerms::read_write()),
+                SubpageState::new(PageBacking::Anonymous, PagePerms::read_write()),
+                SubpageState::new(PageBacking::Anonymous, PagePerms::read_write()),
+                SubpageState::new(PageBacking::Anonymous, PagePerms::read_write()),
+            ],
+        );
+        assert_eq!(state, HostPageState::Uniform16k);
+    }
+
+    #[test]
+    fn classifies_non_executable_mixed_permissions_as_guarded() {
+        let state = classify_host_page_state(
+            PageGeometry {
+                host_page_size: 16_384,
+                linux_page_size: 4096,
+                native_profile: Some(NativePageProfile::Linux4kOn16k),
+            },
+            [
+                SubpageState::new(PageBacking::Anonymous, PagePerms::read_write()),
+                SubpageState::new(PageBacking::Anonymous, PagePerms::none()),
+                SubpageState::new(PageBacking::Anonymous, PagePerms::read_write()),
+                SubpageState::new(PageBacking::Anonymous, PagePerms::read_write()),
+            ],
+        );
+        assert_eq!(
+            state,
+            HostPageState::MixedGuarded(MixedPageReason::Permissions)
+        );
+    }
+
+    #[test]
+    fn rejects_executable_mixed_page_without_instruction_instrumentation() {
+        let state = classify_host_page_state(
+            PageGeometry {
+                host_page_size: 16_384,
+                linux_page_size: 4096,
+                native_profile: Some(NativePageProfile::Linux4kOn16k),
+            },
+            [
+                SubpageState::new(PageBacking::Anonymous, PagePerms::read_exec()),
+                SubpageState::new(PageBacking::Anonymous, PagePerms::none()),
+                SubpageState::new(PageBacking::Anonymous, PagePerms::read_exec()),
+                SubpageState::new(PageBacking::Anonymous, PagePerms::read_exec()),
+            ],
+        );
+        assert_eq!(
+            state,
+            HostPageState::Unsupported(MixedPageReason::ExecutableMixedPage)
+        );
     }
 }

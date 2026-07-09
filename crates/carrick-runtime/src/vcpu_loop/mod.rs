@@ -279,13 +279,11 @@ mod macos_helper_stubs {
         let image = {
             use carrick_hal::GuestArch as _;
             type KvmArch = <carrick_vmm_kvm::KvmTrapEngine as carrick_hal::ThreadedEngine>::Arch;
-            match raw.with_vdso_bytes(KvmArch::vdso_bytes()).and_then(|a| {
-                a.with_linux_initial_stack_page_size(
-                    argv,
-                    env,
-                    crate::page_profile::DEFAULT_LINUX_PAGE_SIZE,
-                )
-            }) {
+            let linux_page_size = dispatcher.linux_page_size();
+            match raw
+                .with_vdso_bytes(KvmArch::vdso_bytes())
+                .and_then(|a| a.with_linux_initial_stack_page_size(argv, env, linux_page_size))
+            {
                 Ok(image) => image,
                 Err(err) => {
                     trace_execve(&path, format_args!("image-build path={path} err={err:?}"));
@@ -296,15 +294,11 @@ mod macos_helper_stubs {
         #[cfg(target_arch = "x86_64")]
         let image = {
             use carrick_hal::GuestArch as _;
+            let linux_page_size = dispatcher.linux_page_size();
             match raw
                 .with_vdso_bytes(carrick_hal::x8664_arch::X8664GuestArch::vdso_bytes())
-                .and_then(|a| {
-                    a.with_linux_initial_stack_page_size(
-                        argv,
-                        env,
-                        crate::page_profile::DEFAULT_LINUX_PAGE_SIZE,
-                    )
-                }) {
+                .and_then(|a| a.with_linux_initial_stack_page_size(argv, env, linux_page_size))
+            {
                 Ok(image) => image,
                 Err(err) => {
                     trace_execve(&path, format_args!("image-build path={path} err={err:?}"));
@@ -318,11 +312,7 @@ mod macos_helper_stubs {
         ))]
         let image = raw
             .with_vdso_auxv(false)
-            .with_linux_initial_stack_page_size(
-                argv,
-                env,
-                crate::page_profile::DEFAULT_LINUX_PAGE_SIZE,
-            )
+            .with_linux_initial_stack_page_size(argv, env, dispatcher.linux_page_size())
             .map_err(|_| LINUX_ENOENT)?;
         // execve point of no return: reset CAUGHT handlers to SIG_DFL (the kernel
         // does this; SIG_IGN/mask/pending are preserved).
