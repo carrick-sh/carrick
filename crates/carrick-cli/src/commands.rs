@@ -81,7 +81,9 @@ use carrick_runtime::runtime::DEFAULT_MAX_TRAPS;
 // `syscalls`-table subcommands are macOS-only for now (Linux uses `carrick run
 // <oci>` / `carrick-kvm run-elf`; per-number `syscalls <n>` works on both).
 #[cfg(feature = "platform-macos")]
-use carrick_runtime::runtime::run_static_elf_with_hvf_args_and_dispatcher_debug;
+use carrick_runtime::runtime::{
+    RunStaticElfBackendOptions, run_static_elf_with_backend_args_and_dispatcher_debug,
+};
 #[cfg(feature = "platform-macos")]
 use carrick_runtime::syscall::aarch64_table;
 use carrick_runtime::syscall::lookup_aarch64;
@@ -195,6 +197,8 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             volume,
             workdir,
             forward_env,
+            exec_backend,
+            native_page_profile,
             args,
         } => {
             // Apply forwarded env BEFORE anything reads it (host_facts caches the
@@ -284,13 +288,17 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     elf_env.push(format!("{key}={val}"));
                 }
             }
-            let result = run_static_elf_with_hvf_args_and_dispatcher_debug(
+            let result = run_static_elf_with_backend_args_and_dispatcher_debug(
                 &path,
                 dispatcher,
                 argv,
                 elf_env,
-                max_traps,
-                debug_state_path.as_ref(),
+                RunStaticElfBackendOptions {
+                    max_traps,
+                    debug_state_path: debug_state_path.as_ref(),
+                    exec_backend,
+                    native_page_profile,
+                },
             )
             .with_context(|| format!("failed to run static ELF {}", path.display()))?;
             if raw {

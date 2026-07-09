@@ -366,6 +366,54 @@ where
     finish_and_run_image(image, dispatcher, max_traps, debug_state_path)
 }
 
+pub struct RunStaticElfBackendOptions<'a> {
+    pub max_traps: usize,
+    pub debug_state_path: Option<&'a PathBuf>,
+    pub exec_backend: carrick_spec::ExecBackendRequest,
+    pub native_page_profile: carrick_spec::NativePageProfileRequest,
+}
+
+pub fn run_static_elf_with_backend_args_and_dispatcher_debug<A, E>(
+    path: impl AsRef<Path>,
+    dispatcher: SyscallDispatcher,
+    argv: A,
+    env: E,
+    options: RunStaticElfBackendOptions<'_>,
+) -> Result<RunResult, RuntimeError>
+where
+    A: IntoIterator<Item = String>,
+    E: IntoIterator<Item = String>,
+{
+    let plan = crate::page_profile::resolve_execution_plan_for_request(
+        carrick_spec::Platform::host_native(),
+        options.exec_backend,
+        options.native_page_profile,
+    )?;
+    match plan.backend {
+        crate::page_profile::ExecutionBackend::Hvf => {
+            run_static_elf_with_hvf_args_and_dispatcher_debug(
+                path,
+                dispatcher,
+                argv,
+                env,
+                options.max_traps,
+                options.debug_state_path,
+            )
+        }
+        crate::page_profile::ExecutionBackend::NativeDarwin => {
+            crate::native_darwin::run_static_elf(
+                path.as_ref(),
+                dispatcher,
+                argv,
+                env,
+                options.max_traps,
+                options.debug_state_path,
+                &plan,
+            )
+        }
+    }
+}
+
 fn canonical_host_executable_path(path: &Path) -> String {
     path.canonicalize()
         .unwrap_or_else(|_| path.to_path_buf())
