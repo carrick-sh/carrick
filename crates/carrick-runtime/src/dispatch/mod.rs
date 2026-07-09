@@ -698,6 +698,7 @@ mod ioring;
 mod fs;
 #[macro_use]
 mod mem;
+pub(crate) use mem::MemoryLayout;
 #[macro_use]
 mod net;
 #[macro_use]
@@ -2038,6 +2039,10 @@ impl SyscallDispatcher {
 
     pub(crate) fn set_page_geometry(&mut self, page_geometry: crate::page_profile::PageGeometry) {
         self.page_geometry = page_geometry;
+    }
+
+    pub(crate) fn set_memory_layout(&self, layout: MemoryLayout) {
+        *self.mem.lock() = mem::MemState::new_with_layout(layout);
     }
 
     pub fn page_geometry(&self) -> crate::page_profile::PageGeometry {

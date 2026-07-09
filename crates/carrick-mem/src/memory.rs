@@ -87,7 +87,7 @@ use std::path::Path;
 // Imported from the leaf crate (not `crate::dispatch`) — this is the edge that
 // previously closed the `memory ↔ dispatch` cycle (docs/archive/build-decomposition-design.md §3.A-A2).
 use crate::elf::{
-    ElfInspectError, LoadPlan, LoadSegment, SegmentPerms, plan_elf_load_bytes,
+    ElfInspectError, ElfType, LoadPlan, LoadSegment, SegmentPerms, plan_elf_load_bytes,
     plan_elf_load_bytes_for, plan_elf_load_for,
 };
 use crate::linux_abi::{
@@ -628,6 +628,12 @@ pub struct AddressSpace {
     ro_spans: Vec<crate::elf::RoSpan>,
 }
 
+#[derive(Clone, Copy)]
+enum LoadRegionShape {
+    HvfMerged,
+    PageAligned { page_size: u64 },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MemoryRegion {
     pub start: u64,
@@ -743,6 +749,43 @@ impl AddressSpace {
         Self::load_elf_bytes_with_reader_for(file, read_interp, EM_AARCH64)
     }
 
+    /// Like [`AddressSpace::load_elf_bytes_with_reader`] but places an ET_DYN
+    /// main executable at `pie_base` instead of the default guest PIE base.
+    pub fn load_elf_bytes_with_reader_at_pie_base(
+        file: &[u8],
+        read_interp: &dyn Fn(&str) -> Option<Vec<u8>>,
+        pie_base: u64,
+    ) -> Result<Self, AddressSpaceError> {
+        use goblin::elf::header::EM_AARCH64;
+        Self::load_elf_bytes_with_reader_for_at_pie_base(file, read_interp, EM_AARCH64, pie_base)
+    }
+
+    /// Like [`AddressSpace::load_elf_bytes_with_reader_at_pie_base`] but omits
+    /// Carrick's pre-mapped runtime windows (heap, mmap arena, signal
+    /// trampoline, and apertures).
+    pub fn load_elf_bytes_with_reader_at_pie_base_without_runtime_regions(
+        file: &[u8],
+        read_interp: &dyn Fn(&str) -> Option<Vec<u8>>,
+        pie_base: u64,
+        mapping_page_size: u64,
+    ) -> Result<Self, AddressSpaceError> {
+        use goblin::elf::header::EM_AARCH64;
+        let mut plan = plan_elf_load_bytes_for(file, EM_AARCH64)?;
+        if plan.e_type == ElfType::Dyn {
+            plan = plan.with_load_bias(pie_base);
+        }
+        Self::load_elf_segments_with_interpreter_and_runtime_regions(
+            file,
+            plan,
+            EM_AARCH64,
+            read_interp,
+            false,
+            LoadRegionShape::PageAligned {
+                page_size: mapping_page_size,
+            },
+        )
+    }
+
     /// Like [`AddressSpace::load_elf_bytes_with_reader`] but accepts only the given `machine`
     /// type (`EM_X86_64 = 62`, `EM_AARCH64 = 183` per elf(5)/psABI §4.1) — the
     /// execve image builder on the x86_64 lanes (KVM-x86 / bhyve) passes
@@ -755,8 +798,35 @@ impl AddressSpace {
         read_interp: &dyn Fn(&str) -> Option<Vec<u8>>,
         machine: u16,
     ) -> Result<Self, AddressSpaceError> {
-        let plan = plan_elf_load_bytes_for(file, machine)?;
-        Self::load_elf_segments_with_interpreter(file, plan, machine, read_interp)
+        Self::load_elf_bytes_with_reader_for_at_pie_base(
+            file,
+            read_interp,
+            machine,
+            crate::elf::LINUX_PIE_DEFAULT_BASE,
+        )
+    }
+
+    /// Like [`AddressSpace::load_elf_bytes_with_reader_for`] but places an
+    /// ET_DYN main executable at `pie_base`. ET_EXEC addresses are left
+    /// untouched.
+    pub fn load_elf_bytes_with_reader_for_at_pie_base(
+        file: &[u8],
+        read_interp: &dyn Fn(&str) -> Option<Vec<u8>>,
+        machine: u16,
+        pie_base: u64,
+    ) -> Result<Self, AddressSpaceError> {
+        let mut plan = plan_elf_load_bytes_for(file, machine)?;
+        if plan.e_type == ElfType::Dyn {
+            plan = plan.with_load_bias(pie_base);
+        }
+        Self::load_elf_segments_with_interpreter_and_runtime_regions(
+            file,
+            plan,
+            machine,
+            read_interp,
+            true,
+            LoadRegionShape::HvfMerged,
+        )
     }
 
     fn load_elf_segments(file: &[u8], plan: LoadPlan) -> Result<Self, AddressSpaceError> {
@@ -777,7 +847,25 @@ impl AddressSpace {
         machine: u16,
         read_interp: &dyn Fn(&str) -> Option<Vec<u8>>,
     ) -> Result<Self, AddressSpaceError> {
-        let mut regions = regions_from_load_plan(file, &plan)?;
+        Self::load_elf_segments_with_interpreter_and_runtime_regions(
+            file,
+            plan,
+            machine,
+            read_interp,
+            true,
+            LoadRegionShape::HvfMerged,
+        )
+    }
+
+    fn load_elf_segments_with_interpreter_and_runtime_regions(
+        file: &[u8],
+        plan: LoadPlan,
+        machine: u16,
+        read_interp: &dyn Fn(&str) -> Option<Vec<u8>>,
+        include_runtime_regions: bool,
+        shape: LoadRegionShape,
+    ) -> Result<Self, AddressSpaceError> {
+        let mut regions = regions_from_load_plan_with_shape(file, &plan, shape)?;
         let mut entry = plan.entry;
         let mut interpreter_base = None;
         let mut ro_spans = crate::elf::ro_page_spans(&plan);
@@ -788,11 +876,17 @@ impl AddressSpace {
             let interpreter_plan = plan_elf_load_bytes_for(&interpreter, machine)?
                 .with_load_bias(LINUX_INTERPRETER_BASE);
             ro_spans.extend(crate::elf::ro_page_spans(&interpreter_plan));
-            regions.extend(regions_from_load_plan(&interpreter, &interpreter_plan)?);
+            regions.extend(regions_from_load_plan_with_shape(
+                &interpreter,
+                &interpreter_plan,
+                shape,
+            )?);
             entry = interpreter_plan.entry;
             interpreter_base = Some(LINUX_INTERPRETER_BASE);
         }
-        regions.extend(linux_runtime_regions()?);
+        if include_runtime_regions {
+            regions.extend(linux_runtime_regions()?);
+        }
 
         let linux_auxv = linux_auxv_from_load_plan(&plan, interpreter_base);
         let mut image = Self::from_regions(entry, regions)?;
@@ -1716,6 +1810,101 @@ fn regions_from_load_plan(
     }
 
     Ok(regions)
+}
+
+fn regions_from_load_plan_with_shape(
+    file: &[u8],
+    plan: &LoadPlan,
+    shape: LoadRegionShape,
+) -> Result<Vec<MemoryRegion>, AddressSpaceError> {
+    match shape {
+        LoadRegionShape::HvfMerged => regions_from_load_plan(file, plan),
+        LoadRegionShape::PageAligned { page_size } => {
+            regions_from_load_plan_page_aligned(file, plan, page_size)
+        }
+    }
+}
+
+fn regions_from_load_plan_page_aligned(
+    file: &[u8],
+    plan: &LoadPlan,
+    page_size: u64,
+) -> Result<Vec<MemoryRegion>, AddressSpaceError> {
+    if page_size == 0 {
+        return Err(AddressSpaceError::RegionTooLarge(0));
+    }
+    let mut regions = Vec::with_capacity(plan.segments.len());
+    for segment in &plan.segments {
+        regions.push(region_from_load_segment_page_aligned(
+            file, segment, page_size,
+        )?);
+    }
+    Ok(regions)
+}
+
+fn region_from_load_segment_page_aligned(
+    file: &[u8],
+    segment: &LoadSegment,
+    page_size: u64,
+) -> Result<MemoryRegion, AddressSpaceError> {
+    if segment.file_size > segment.memory_size {
+        return Err(AddressSpaceError::FileLargerThanMemory {
+            virtual_address: segment.virtual_address,
+            file_size: segment.file_size,
+            memory_size: segment.memory_size,
+        });
+    }
+
+    let segment_end = segment
+        .virtual_address
+        .checked_add(segment.memory_size)
+        .ok_or(AddressSpaceError::RegionOverflow {
+            start: segment.virtual_address,
+            size: segment.memory_size,
+        })?;
+    let start = align_down_u64(segment.virtual_address, page_size);
+    let end = align_up_u64(segment_end, page_size).ok_or(AddressSpaceError::RegionOverflow {
+        start: segment.virtual_address,
+        size: segment.memory_size,
+    })?;
+    let total_size_u64 = end
+        .checked_sub(start)
+        .ok_or(AddressSpaceError::RegionOverflow { start, size: 0 })?;
+    let total_size = usize::try_from(total_size_u64)
+        .map_err(|_| AddressSpaceError::RegionTooLarge(total_size_u64))?;
+    let mut bytes = vec![0_u8; total_size];
+
+    let file_offset =
+        usize::try_from(segment.file_offset).map_err(|_| AddressSpaceError::SegmentBeyondFile {
+            virtual_address: segment.virtual_address,
+        })?;
+    let file_size =
+        usize::try_from(segment.file_size).map_err(|_| AddressSpaceError::SegmentBeyondFile {
+            virtual_address: segment.virtual_address,
+        })?;
+    let file_end =
+        file_offset
+            .checked_add(file_size)
+            .ok_or(AddressSpaceError::SegmentBeyondFile {
+                virtual_address: segment.virtual_address,
+            })?;
+    if file_end > file.len() {
+        return Err(AddressSpaceError::SegmentBeyondFile {
+            virtual_address: segment.virtual_address,
+        });
+    }
+    let offset_in_region = usize::try_from(segment.virtual_address.wrapping_sub(start))
+        .map_err(|_| AddressSpaceError::RegionTooLarge(total_size_u64))?;
+    bytes[offset_in_region..offset_in_region + file_size]
+        .copy_from_slice(&file[file_offset..file_end]);
+
+    Ok(MemoryRegion {
+        start,
+        end,
+        perms: segment.perms,
+        shared: false,
+        bytes,
+    })
 }
 
 fn region_from_load_segments(
@@ -2847,6 +3036,109 @@ mod loader_tests {
         .expect("x86_64 interpreter should load with x86_64 machine");
 
         assert_eq!(image.entry(), LINUX_INTERPRETER_BASE + 0x120);
+    }
+
+    #[test]
+    fn load_elf_bytes_with_reader_at_pie_base_rebases_dyn_main() {
+        let pie_base = 0x20_0000_0000;
+        let main = synthetic_elf(ET_DYN_TYPE, 183, 0x120, 0, None);
+
+        let image =
+            AddressSpace::load_elf_bytes_with_reader_at_pie_base(&main, &|_| None, pie_base)
+                .expect("ET_DYN main should load at requested PIE base");
+
+        assert_eq!(image.entry(), pie_base + 0x120);
+        assert!(
+            image
+                .regions()
+                .iter()
+                .any(|region| region.start == pie_base),
+            "rebased ET_DYN load segment should start at requested PIE base"
+        );
+    }
+
+    #[test]
+    fn load_elf_bytes_without_runtime_regions_omits_hvf_boot_windows() {
+        let pie_base = 0x4_0000_0000;
+        let main = synthetic_elf(ET_DYN_TYPE, 183, 0x120, 0, None);
+
+        let image = AddressSpace::load_elf_bytes_with_reader_at_pie_base_without_runtime_regions(
+            &main,
+            &|_| None,
+            pie_base,
+            0x4000,
+        )
+        .expect("native ET_DYN main should load without HVF runtime windows");
+
+        assert!(
+            image.regions().iter().all(|region| {
+                region.start != LINUX_HEAP_BASE
+                    && region.start != LINUX_MMAP_BASE
+                    && region.start != LINUX_SIGRETURN_TRAMPOLINE_BASE
+            }),
+            "native loader should omit pre-mapped HVF runtime regions"
+        );
+    }
+
+    #[test]
+    fn page_aligned_load_regions_preserve_segment_permissions() {
+        let mut file = vec![0_u8; 0x3000];
+        file[0x1000..0x1004].copy_from_slice(&[1, 2, 3, 4]);
+        file[0x2000..0x2004].copy_from_slice(&[5, 6, 7, 8]);
+        let plan = LoadPlan {
+            entry: 0x4_0000_1234,
+            interpreter: None,
+            program_header_address: None,
+            program_header_entry_size: 56,
+            program_header_count: 2,
+            load_bias: 0,
+            e_type: ElfType::Dyn,
+            segments: vec![
+                LoadSegment {
+                    file_offset: 0x1000,
+                    virtual_address: 0x4_0000_1234,
+                    file_size: 4,
+                    memory_size: 0x10,
+                    alignment: 0x4000,
+                    perms: SegmentPerms {
+                        read: true,
+                        write: false,
+                        execute: true,
+                    },
+                },
+                LoadSegment {
+                    file_offset: 0x2000,
+                    virtual_address: 0x4_0001_9234,
+                    file_size: 4,
+                    memory_size: 0x10,
+                    alignment: 0x4000,
+                    perms: SegmentPerms {
+                        read: true,
+                        write: true,
+                        execute: false,
+                    },
+                },
+            ],
+        };
+
+        let regions = regions_from_load_plan_page_aligned(&file, &plan, 0x4000)
+            .expect("page-aligned native regions");
+
+        assert_eq!(regions.len(), 2);
+        assert_eq!(
+            (regions[0].start, regions[0].end),
+            (0x4_0000_0000, 0x4_0000_4000)
+        );
+        assert!(regions[0].perms.execute);
+        assert!(!regions[0].perms.write);
+        assert_eq!(&regions[0].bytes()[0x1234..0x1238], &[1, 2, 3, 4]);
+        assert_eq!(
+            (regions[1].start, regions[1].end),
+            (0x4_0001_8000, 0x4_0001_c000)
+        );
+        assert!(regions[1].perms.write);
+        assert!(!regions[1].perms.execute);
+        assert_eq!(&regions[1].bytes()[0x1234..0x1238], &[5, 6, 7, 8]);
     }
 
     #[test]
