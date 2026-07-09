@@ -1,11 +1,13 @@
 #![allow(dead_code)]
 
 mod execmem;
+mod fault;
 mod mapping;
 mod report;
 mod trap;
 
 use execmem::execmem;
+use fault::fault_discriminator;
 use mapping::{fixed_map_child, page_size};
 use report::{ProbeReport, Status};
 use trap::{branch_gateway, brk_trap};
@@ -26,9 +28,7 @@ pub fn run_from_env() -> Result<(), String> {
         "execmem" => print_one(execmem()?),
         "brk-trap" => print_one(brk_trap()?),
         "branch-gateway" => print_one(branch_gateway()?),
-        "fault-discriminator" => {
-            Err("fault-discriminator probe is implemented in Task 6".to_string())
-        }
+        "fault-discriminator" => print_one(fault_discriminator()?),
         "all" => run_all(),
         _ => Err(usage()),
     }
