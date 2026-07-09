@@ -46,6 +46,18 @@ pub enum MixedPageReason {
     UnsupportedGeometry,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MappingPolicyDecision {
+    Supported {
+        state: HostPageState,
+        diagnostic: String,
+    },
+    Unsupported {
+        reason: MixedPageReason,
+        diagnostic: String,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PageBacking {
     Anonymous,
@@ -121,6 +133,65 @@ pub fn classify_host_page_state<const N: usize>(
         return HostPageState::Composed16k;
     }
     HostPageState::MixedGuarded(MixedPageReason::Permissions)
+}
+
+pub fn decide_linux4k_on_16k_mapping<const N: usize>(
+    geometry: PageGeometry,
+    subpages: [SubpageState; N],
+) -> MappingPolicyDecision {
+    let state = classify_host_page_state(geometry, subpages);
+    match state {
+        HostPageState::Uniform16k => MappingPolicyDecision::Supported {
+            state,
+            diagnostic: "linux4k-on-16k mapping supported: uniform 16K host page".to_string(),
+        },
+        HostPageState::Composed16k => {
+            if subpages
+                .iter()
+                .any(|state| state.backing == PageBacking::SharedFile)
+            {
+                MappingPolicyDecision::Unsupported {
+                    reason: MixedPageReason::Backing,
+                    diagnostic: "native linux4k mapping unsupported: mixed shared-file backing requires alias/writeback coherence".to_string(),
+                }
+            } else {
+                MappingPolicyDecision::Supported {
+                    state,
+                    diagnostic: "linux4k-on-16k mapping supported: composed private data page"
+                        .to_string(),
+                }
+            }
+        }
+        HostPageState::MixedGuarded(MixedPageReason::Permissions) => {
+            MappingPolicyDecision::Supported {
+                state,
+                diagnostic: "linux4k-on-16k mapping supported: guarded data page for mixed permissions".to_string(),
+            }
+        }
+        HostPageState::MixedGuarded(reason) => MappingPolicyDecision::Unsupported {
+            reason,
+            diagnostic: format!("native linux4k mapping unsupported: mixed page reason {reason:?}"),
+        },
+        HostPageState::Unsupported(MixedPageReason::ExecutableMixedPage) => {
+            MappingPolicyDecision::Unsupported {
+                reason: MixedPageReason::ExecutableMixedPage,
+                diagnostic: "native linux4k mapping unsupported: executable mixed page requires instruction instrumentation".to_string(),
+            }
+        }
+        HostPageState::Unsupported(MixedPageReason::UnsupportedGeometry) => {
+            MappingPolicyDecision::Unsupported {
+                reason: MixedPageReason::UnsupportedGeometry,
+                diagnostic: format!(
+                    "native linux4k mapping unsupported: requires 16K host pages and 4K Linux pages, got host_page_size={} linux_page_size={} subpages={N}",
+                    geometry.host_page_size, geometry.linux_page_size
+                ),
+            }
+        }
+        HostPageState::Unsupported(reason) => MappingPolicyDecision::Unsupported {
+            reason,
+            diagnostic: format!("native linux4k mapping unsupported: mixed page reason {reason:?}"),
+        },
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -429,6 +500,132 @@ mod tests {
         assert_eq!(
             state,
             HostPageState::Unsupported(MixedPageReason::ExecutableMixedPage)
+        );
+    }
+
+    #[test]
+    fn linux4k_policy_allows_composed_private_data_pages() {
+        let decision = decide_linux4k_on_16k_mapping(
+            PageGeometry {
+                host_page_size: 16_384,
+                linux_page_size: 4096,
+                native_profile: Some(NativePageProfile::Linux4kOn16k),
+            },
+            [
+                SubpageState::new(PageBacking::Anonymous, PagePerms::read_write()),
+                SubpageState::new(PageBacking::PrivateFile, PagePerms::read_write()),
+                SubpageState::new(PageBacking::Anonymous, PagePerms::read_write()),
+                SubpageState::new(PageBacking::PrivateFile, PagePerms::read_write()),
+            ],
+        );
+
+        assert_eq!(
+            decision,
+            MappingPolicyDecision::Supported {
+                state: HostPageState::Composed16k,
+                diagnostic: "linux4k-on-16k mapping supported: composed private data page"
+                    .to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn linux4k_policy_rejects_composed_shared_file_pages_with_diagnostic() {
+        let decision = decide_linux4k_on_16k_mapping(
+            PageGeometry {
+                host_page_size: 16_384,
+                linux_page_size: 4096,
+                native_profile: Some(NativePageProfile::Linux4kOn16k),
+            },
+            [
+                SubpageState::new(PageBacking::Anonymous, PagePerms::read_write()),
+                SubpageState::new(PageBacking::SharedFile, PagePerms::read_write()),
+                SubpageState::new(PageBacking::Anonymous, PagePerms::read_write()),
+                SubpageState::new(PageBacking::SharedFile, PagePerms::read_write()),
+            ],
+        );
+
+        assert_eq!(
+            decision,
+            MappingPolicyDecision::Unsupported {
+                reason: MixedPageReason::Backing,
+                diagnostic: "native linux4k mapping unsupported: mixed shared-file backing requires alias/writeback coherence".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn linux4k_policy_allows_guarded_data_permissions() {
+        let decision = decide_linux4k_on_16k_mapping(
+            PageGeometry {
+                host_page_size: 16_384,
+                linux_page_size: 4096,
+                native_profile: Some(NativePageProfile::Linux4kOn16k),
+            },
+            [
+                SubpageState::new(PageBacking::Anonymous, PagePerms::read_write()),
+                SubpageState::new(PageBacking::Anonymous, PagePerms::none()),
+                SubpageState::new(PageBacking::Anonymous, PagePerms::read_write()),
+                SubpageState::new(PageBacking::Anonymous, PagePerms::read_write()),
+            ],
+        );
+
+        assert_eq!(
+            decision,
+            MappingPolicyDecision::Supported {
+                state: HostPageState::MixedGuarded(MixedPageReason::Permissions),
+                diagnostic:
+                    "linux4k-on-16k mapping supported: guarded data page for mixed permissions"
+                        .to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn linux4k_policy_rejects_mixed_executable_pages_with_diagnostic() {
+        let decision = decide_linux4k_on_16k_mapping(
+            PageGeometry {
+                host_page_size: 16_384,
+                linux_page_size: 4096,
+                native_profile: Some(NativePageProfile::Linux4kOn16k),
+            },
+            [
+                SubpageState::new(PageBacking::Anonymous, PagePerms::read_exec()),
+                SubpageState::new(PageBacking::Anonymous, PagePerms::none()),
+                SubpageState::new(PageBacking::Anonymous, PagePerms::read_exec()),
+                SubpageState::new(PageBacking::Anonymous, PagePerms::read_exec()),
+            ],
+        );
+
+        assert_eq!(
+            decision,
+            MappingPolicyDecision::Unsupported {
+                reason: MixedPageReason::ExecutableMixedPage,
+                diagnostic: "native linux4k mapping unsupported: executable mixed page requires instruction instrumentation".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn linux4k_policy_rejects_unsupported_geometry_with_diagnostic() {
+        let decision = decide_linux4k_on_16k_mapping(
+            PageGeometry {
+                host_page_size: 8192,
+                linux_page_size: 4096,
+                native_profile: Some(NativePageProfile::Linux4kOn16k),
+            },
+            [
+                SubpageState::new(PageBacking::Anonymous, PagePerms::read_write()),
+                SubpageState::new(PageBacking::Anonymous, PagePerms::read_write()),
+            ],
+        );
+
+        assert_eq!(
+            decision,
+            MappingPolicyDecision::Unsupported {
+                reason: MixedPageReason::UnsupportedGeometry,
+                diagnostic: "native linux4k mapping unsupported: requires 16K host pages and 4K Linux pages, got host_page_size=8192 linux_page_size=4096 subpages=2".to_string(),
+            }
         );
     }
 }
