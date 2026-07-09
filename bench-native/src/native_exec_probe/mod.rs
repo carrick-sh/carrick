@@ -6,7 +6,7 @@ mod trap;
 
 use execmem::execmem;
 use fault::fault_discriminator;
-use mapping::{fixed_map_child, page_size};
+use mapping::{fixed_map_child, page_size, subpage_protect};
 use report::{ProbeReport, Status};
 use trap::{branch_gateway, brk_trap};
 
@@ -23,6 +23,7 @@ pub fn run_from_env() -> Result<(), String> {
     match command.as_str() {
         "page-size" => print_one(page_size()?),
         "fixed-map" => print_one(fixed_map_child()?),
+        "subpage-protect" => print_one(subpage_protect()?),
         "execmem" => print_one(execmem()?),
         "brk-trap" => print_one(brk_trap()?),
         "branch-gateway" => print_one(branch_gateway()?),
@@ -36,6 +37,7 @@ fn run_all() -> Result<(), String> {
     let reports = [
         page_size()?,
         fixed_map_child()?,
+        subpage_protect()?,
         execmem()?,
         brk_trap()?,
         branch_gateway()?,
@@ -65,7 +67,7 @@ fn print_one(report: ProbeReport) -> Result<(), String> {
 }
 
 fn usage() -> String {
-    "usage: native_exec_probe page-size|fixed-map|execmem|brk-trap|branch-gateway|fault-discriminator|all".to_string()
+    "usage: native_exec_probe page-size|fixed-map|subpage-protect|execmem|brk-trap|branch-gateway|fault-discriminator|all".to_string()
 }
 
 fn errno() -> i32 {
