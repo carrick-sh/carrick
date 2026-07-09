@@ -309,6 +309,54 @@ fn mmap_without_hint_uses_next_page_granular_address() {
 }
 
 #[test]
+fn dispatcher_mmap_uses_configured_16k_linux_page_size() {
+    let mut memory = AddressSpace::from_segments(
+        0,
+        [(LINUX_MMAP_BASE, rwx_perms(), Vec::new(), LINUX_MMAP_SIZE)],
+    )
+    .unwrap();
+    let reporter = CompatReporter::default();
+    let mut dispatcher =
+        SyscallDispatcher::with_page_geometry(carrick_runtime::page_profile::PageGeometry {
+            host_page_size: 16_384,
+            linux_page_size: 16_384,
+            native_profile: Some(carrick_spec::NativePageProfile::Native16k),
+        });
+    let map_private_anonymous = 0x02 | 0x20;
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    222,
+                    SyscallArgs::from([0, 1, 0, map_private_anonymous, (-1_i64) as u64, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned {
+            value: LINUX_MMAP_BASE as i64
+        }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    222,
+                    SyscallArgs::from([0, 1, 0, map_private_anonymous, (-1_i64) as u64, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned {
+            value: (LINUX_MMAP_BASE + 16_384) as i64
+        }
+    );
+}
+
+#[test]
 fn mmap_non_fixed_hint_does_not_overlap_existing_bump_allocation() {
     let mut memory = AddressSpace::from_segments(
         0,

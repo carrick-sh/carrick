@@ -269,6 +269,7 @@ impl Runtime {
                 }
 
                 let mut dispatcher = SyscallDispatcher::with_network(runtime_network.clone());
+                dispatcher.set_page_geometry(execution_plan.page_geometry);
                 let guest_hostname = effective_guest_hostname(spec);
                 dispatcher.set_guest_hostname(guest_hostname.as_ref());
                 // Sandboxed container fs (extracted OCI layers on a cap-std
@@ -376,6 +377,7 @@ impl Runtime {
                     rootfs.clone(),
                     spec.executable.clone(),
                 );
+                dispatcher.set_page_geometry(execution_plan.page_geometry);
                 let guest_hostname = effective_guest_hostname(spec);
                 dispatcher.set_guest_hostname(guest_hostname.as_ref());
                 if let Some(cwd) = &spec.cwd {
