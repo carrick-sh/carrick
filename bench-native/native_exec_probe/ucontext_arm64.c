@@ -3,6 +3,7 @@
 #endif
 
 #include <stdint.h>
+#include <libkern/OSCacheControl.h>
 #include <string.h>
 #include <ucontext.h>
 
@@ -41,4 +42,8 @@ int carrick_snapshot_ucontext(void *uap, struct carrick_uc_snapshot *out) {
     (void)out;
     return -3;
 #endif
+}
+
+void carrick_probe_clear_icache(void *start, size_t len) {
+    sys_icache_invalidate(start, len);
 }
