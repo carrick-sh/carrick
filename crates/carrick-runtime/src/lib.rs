@@ -135,6 +135,7 @@ pub mod interactive_supervisor;
 pub mod layer_cache;
 pub mod namespace;
 pub mod network;
+pub mod page_profile;
 // `linux_abi` was lifted into the leaf crate `carrick-abi` (build-graph split,
 // docs/archive/build-decomposition-design.md §3.A-A1). Re-exported under the original
 // path so every `crate::linux_abi::…` / `carrick_runtime::linux_abi::…` site is
@@ -1418,6 +1419,7 @@ pub mod runtime {
             &dispatcher,
             vdso_enabled,
             None,
+            crate::page_profile::DEFAULT_LINUX_PAGE_SIZE,
             E::Arch::elf_machine(),
         )?;
         // Materialise the vvar+vDSO regions when this ISA provides real bytes.

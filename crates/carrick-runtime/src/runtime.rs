@@ -358,7 +358,11 @@ where
             .or_else(|| std::fs::read(p).ok())
     })?
     .with_vdso_auxv(vdso_enabled_for_debug())
-    .with_linux_initial_stack(argv, env)?;
+    .with_linux_initial_stack_page_size(
+        argv,
+        env,
+        crate::page_profile::DEFAULT_LINUX_PAGE_SIZE,
+    )?;
     finish_and_run_image(image, dispatcher, max_traps, debug_state_path)
 }
 
@@ -400,7 +404,11 @@ where
     }
     let image = AddressSpace::load_elf_bytes(bytes)?
         .with_vdso_auxv(vdso_enabled_for_debug())
-        .with_linux_initial_stack(argv, env)?;
+        .with_linux_initial_stack_page_size(
+            argv,
+            env,
+            crate::page_profile::DEFAULT_LINUX_PAGE_SIZE,
+        )?;
     finish_and_run_image(image, dispatcher, max_traps, None)
 }
 
@@ -474,7 +482,11 @@ where
     if needs_at_base {
         image = image.with_auxv_base(ROSETTA_AT_BASE_PLACEHOLDER);
     }
-    let image = image.with_linux_initial_stack(argv, env)?;
+    let image = image.with_linux_initial_stack_page_size(
+        argv,
+        env,
+        crate::page_profile::DEFAULT_LINUX_PAGE_SIZE,
+    )?;
     finish_and_run_image(image, dispatcher, max_traps, debug_state_path)
 }
 

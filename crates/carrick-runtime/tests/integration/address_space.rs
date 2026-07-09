@@ -139,6 +139,24 @@ fn loaded_elf_initial_stack_includes_linux_auxv() {
 }
 
 #[test]
+fn loaded_elf_initial_stack_can_report_16k_pages() {
+    build_fixture();
+    let artifact = "fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-hello";
+    let image = AddressSpace::load_elf(artifact)
+        .unwrap()
+        .with_linux_initial_stack_page_size(
+            [artifact.to_owned()],
+            std::iter::empty::<String>(),
+            16_384,
+        )
+        .unwrap();
+    let sp = image.initial_stack_pointer().unwrap();
+    let auxv = read_auxv(&image, sp + 32);
+
+    assert!(auxv.contains(&(LINUX_AT_PAGESZ, 16_384)));
+}
+
+#[test]
 fn load_elf_from_rootfs_maps_pt_interp_at_base_and_sets_at_base() {
     let app = dynamic_aarch64_elf("/lib/ld-linux-aarch64.so.1");
     let interpreter = interpreter_aarch64_elf();
