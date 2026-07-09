@@ -1361,6 +1361,29 @@ where
                         guest_remaining,
                         crate::thread::VcpuParkClass::ReleaseSafe,
                     );
+                    // Lost-kick safety net for skip-resume signal waits. A
+                    // sibling can drain the xsig ring and publish a
+                    // process-directed signal into dispatcher state while its
+                    // own mask prevents delivery; a ring-only or host-slot-only
+                    // peek then sees nothing and the sigwait thread can strand.
+                    // Draining here and checking dispatcher-owned pending state
+                    // lets a wait-set signal re-dispatch into
+                    // `rt_sigtimedwait`, while an out-of-set caught signal
+                    // still exits as EINTR. Blocked/ignored non-set signals do
+                    // not return true, so the inner loop does not spin.
+                    let signals_interrupt_pending = || {
+                        kernel.dispatcher.drain_xsignals_process_directed();
+                        kernel.dispatcher.has_deliverable_dispatch_pending_for_wait(
+                            self.this_tid,
+                            carrick_abi::WaitSigMask::Replace(carrick_abi::SigSet::from_raw(
+                                block_mask.raw(),
+                            )),
+                        ) || kernel.dispatcher.signal_wait_should_eintr(
+                            self.this_tid,
+                            wait_set,
+                            block_mask,
+                        )
+                    };
                     // Inner re-wait loop: an idle parked TimedOut tick re-arms
                     // the wait WITHOUT the resume/re-park round trip (the
                     // "skip-resume-on-idle-TimedOut" endpoint named by the
@@ -1399,7 +1422,12 @@ where
                         let released = was_parked_full_slice
                             && parked_full_slices >= 1
                             && self.try_upgrade_vm_release_on_slice_tick(engine);
-                        let result = self.waiter.wait(&[], Some(slice_eff), block_mask);
+                        let result = self.waiter.wait_with_dispatch_pending(
+                            &[],
+                            Some(slice_eff),
+                            block_mask,
+                            signals_interrupt_pending,
+                        );
                         if let Some(outcome) = self.exec_replaced_thread_exit() {
                             return Ok(outcome);
                         }
@@ -1420,7 +1448,9 @@ where
                                     break result; // vCPU live (short-wait class): keep the old re-dispatch cadence
                                 }
                                 // Idle parked tick: skip the resume/re-park
-                                // round trip entirely and re-arm the wait.
+                                // round trip entirely and re-arm the wait
+                                // (`signals_interrupt_pending` above is the
+                                // lost-kick safety net for this skip).
                                 continue;
                             }
                             other => break other,
