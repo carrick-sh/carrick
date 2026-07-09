@@ -3,10 +3,12 @@
 mod execmem;
 mod mapping;
 mod report;
+mod trap;
 
 use execmem::execmem;
 use mapping::{fixed_map_child, page_size};
 use report::{ProbeReport, Status};
+use trap::brk_trap;
 
 pub fn run_from_env() -> Result<(), String> {
     let mut args = std::env::args().skip(1);
@@ -22,7 +24,7 @@ pub fn run_from_env() -> Result<(), String> {
         "page-size" => print_one(page_size()?),
         "fixed-map" => print_one(fixed_map_child()?),
         "execmem" => print_one(execmem()?),
-        "brk-trap" => Err("brk-trap probe is implemented in Task 4".to_string()),
+        "brk-trap" => print_one(brk_trap()?),
         "branch-gateway" => Err("branch-gateway probe is implemented in Task 5".to_string()),
         "fault-discriminator" => {
             Err("fault-discriminator probe is implemented in Task 6".to_string())
