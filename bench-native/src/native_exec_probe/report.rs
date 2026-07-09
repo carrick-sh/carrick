@@ -1,10 +1,9 @@
-#![allow(dead_code)]
+use std::io::Write as _;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Status {
     Pass,
     Fail,
-    Skip,
 }
 
 impl Status {
@@ -12,7 +11,6 @@ impl Status {
         match self {
             Self::Pass => "pass",
             Self::Fail => "fail",
-            Self::Skip => "skip",
         }
     }
 }
@@ -44,6 +42,7 @@ impl ProbeReport {
             print!(" {key}={}", shell_escape(value));
         }
         println!();
+        let _ = std::io::stdout().flush();
     }
 
     pub fn status(&self) -> Status {
