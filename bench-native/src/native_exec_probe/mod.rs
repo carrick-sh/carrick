@@ -1,7 +1,9 @@
 #![allow(dead_code)]
 
+mod mapping;
 mod report;
 
+use mapping::{fixed_map_child, page_size};
 use report::{ProbeReport, Status};
 
 pub fn run_from_env() -> Result<(), String> {
@@ -15,8 +17,8 @@ pub fn run_from_env() -> Result<(), String> {
     }
 
     match command.as_str() {
-        "page-size" => Err("page-size probe is implemented in Task 2".to_string()),
-        "fixed-map" => Err("fixed-map probe is implemented in Task 2".to_string()),
+        "page-size" => print_one(page_size()?),
+        "fixed-map" => print_one(fixed_map_child()?),
         "execmem" => Err("execmem probe is implemented in Task 3".to_string()),
         "brk-trap" => Err("brk-trap probe is implemented in Task 4".to_string()),
         "branch-gateway" => Err("branch-gateway probe is implemented in Task 5".to_string()),
