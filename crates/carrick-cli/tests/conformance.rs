@@ -2439,6 +2439,149 @@ fn run_carrick_probe_with_backend_env(
     normalize(&combined)
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn ensure_native_smoke_probe() -> PathBuf {
+    let probe = probes_dir("aarch64-unknown-linux-musl").join("native_smoke");
+
+    std::fs::create_dir_all(probe.parent().expect("native smoke target directory"))
+        .expect("create native smoke target directory");
+    let status = Command::new("clang")
+        .current_dir(repo_path("."))
+        .args([
+            "--target=aarch64-linux-musl",
+            "-fuse-ld=lld",
+            "-nostdlib",
+            "-static-pie",
+            "-o",
+        ])
+        .arg(&probe)
+        .args(["conformance-probes/native_smoke.S"])
+        .status()
+        .expect("build native_smoke probe");
+    if !status.success() {
+        let fallback_status = Command::new("clang")
+            .current_dir(repo_path("."))
+            .args([
+                "--target=aarch64-linux-musl",
+                "-fuse-ld=/opt/homebrew/bin/ld.lld",
+                "-nostdlib",
+                "-static-pie",
+                "-o",
+            ])
+            .arg(&probe)
+            .args(["conformance-probes/native_smoke.S"])
+            .status()
+            .expect("build native_smoke probe with explicit ld.lld");
+        assert!(
+            fallback_status.success(),
+            "failed to build native_smoke probe"
+        );
+    }
+    assert!(probe.exists(), "native_smoke probe missing after build");
+    assert_eq!(
+        elf_file_type(&probe),
+        Some(3),
+        "native_smoke must be an ET_DYN static PIE probe for high native mapping"
+    );
+    probe
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn ensure_native_static_pie_probe(name: &str) -> PathBuf {
+    let target_dir = repo_path("conformance-probes/target/native-pie");
+    let status = Command::new("cargo")
+        .current_dir(repo_path("conformance-probes"))
+        .env("CARGO_TARGET_DIR", &target_dir)
+        .env("RUSTFLAGS", "-C relocation-model=pie -C link-arg=-pie")
+        .args([
+            "build",
+            "--release",
+            "--target",
+            "aarch64-unknown-linux-musl",
+            "--bin",
+            name,
+        ])
+        .status()
+        .expect("build native static PIE probe");
+    assert!(
+        status.success(),
+        "failed to build native static PIE probe {name}"
+    );
+    let probe = target_dir
+        .join("aarch64-unknown-linux-musl")
+        .join("release")
+        .join(name);
+    assert!(probe.exists(), "native static PIE probe missing: {name}");
+    assert_eq!(
+        elf_file_type(&probe),
+        Some(3),
+        "native static PIE probe {name} must be ET_DYN for high native mapping"
+    );
+    probe
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn elf_file_type(path: &PathBuf) -> Option<u16> {
+    let bytes = std::fs::read(path).ok()?;
+    let raw = bytes.get(16..18)?;
+    Some(u16::from_le_bytes([raw[0], raw[1]]))
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn run_native_run_elf(bin: &PathBuf, probe: &PathBuf, native_page_profile: &'static str) -> String {
+    use std::os::unix::process::CommandExt;
+
+    let run_id = case_run_id();
+    let child = Command::new(bin)
+        .args([
+            "run-elf",
+            "--raw",
+            "--exec-backend",
+            "native",
+            "--native-page-profile",
+            native_page_profile,
+        ])
+        .arg(probe)
+        .env("CARRICK_RUN_ID", &run_id)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .expect("spawn native run-elf probe");
+    let pid = child.id() as i32;
+    let done = Arc::new(AtomicBool::new(false));
+    let watcher = {
+        let done = Arc::clone(&done);
+        let run_id = run_id.clone();
+        std::thread::spawn(move || {
+            let start = Instant::now();
+            while !done.load(Ordering::Relaxed) {
+                if start.elapsed() > CASE_DEADLINE {
+                    unsafe { libc::kill(-pid, libc::SIGKILL) };
+                    scoped_kill_guests(&run_id);
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            false
+        })
+    };
+    let out = child.wait_with_output().expect("wait native run-elf probe");
+    done.store(true, Ordering::Relaxed);
+    let timed_out = watcher.join().unwrap_or(false);
+    if timed_out {
+        return format!("<TIMEOUT after {}s>", CASE_DEADLINE.as_secs());
+    }
+
+    let mut combined = String::new();
+    combined.push_str("status=");
+    combined.push_str(&out.status.to_string());
+    combined.push('\n');
+    combined.push_str(&String::from_utf8_lossy(&out.stdout));
+    combined.push_str(&String::from_utf8_lossy(&out.stderr));
+    normalize(&combined)
+}
+
 /// Run the probe-injection snippet under real Linux via `docker run -i`,
 /// feeding `stdin_bytes` to the container's STDIN. Uses std::process rather
 /// than bollard because bollard stdin-attach is awkward; the shell-case path
@@ -3067,43 +3210,166 @@ fn conformance_probes() {
 
 #[test]
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn native_conformance_probe_launch_reaches_backend_boundary() {
+fn native_conformance_container_executes_libc_probe() {
     let _serial = CONFORMANCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     let Some(bin) = carrick_bin() else {
         eprintln!(
-            "SKIP native_conformance_probe_launch_reaches_backend_boundary: target/release/carrick not built"
+            "SKIP native_conformance_container_executes_libc_probe: target/release/carrick not built"
         );
         return;
     };
     ensure_signed(&bin);
 
-    let probe = probes_dir("aarch64-unknown-linux-musl").join("abortdeath");
-    if !probe.exists() {
-        eprintln!(
-            "SKIP native_conformance_probe_launch_reaches_backend_boundary: probe not built ({})",
-            probe.display()
-        );
-        return;
-    }
+    let probe = ensure_native_static_pie_probe("devnullseek");
 
     use base64::Engine as _;
     let engine = base64::engine::general_purpose::STANDARD;
     let encoded = engine
-        .encode(std::fs::read(&probe).expect("read native smoke probe"))
+        .encode(std::fs::read(&probe).expect("read native libc probe"))
         .into_bytes();
-    let out =
-        run_carrick_probe_with_backend(&bin, ARM64, &encoded, CASE_DEADLINE, "native", "linux4k");
+    for profile in ["native16k", "linux4k"] {
+        let out =
+            run_carrick_probe_with_backend(&bin, ARM64, &encoded, CASE_DEADLINE, "native", profile);
+        assert!(
+            out.contains("devnull_lseek_cur0=true")
+                && out.contains("devnull_lseek_set=true")
+                && !out.contains("unsupported in this backend")
+                && !out.contains("no HVF fallback was attempted"),
+            "native container libc probe failed for profile {profile}:\n{out}"
+        );
+    }
+}
 
-    assert!(
-        out.contains("native Darwin backend selected")
-            && out.contains("platform=Aarch64")
-            && out.contains("profile=Linux4kOn16k")
-            && out.contains("host_page_size=16384")
-            && out.contains("linux_page_size=4096")
-            && out.contains("no HVF fallback was attempted"),
-        "native probe launch did not reach explicit backend boundary:\n{out}"
-    );
+#[test]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn native_conformance_run_elf_executes_smoke_probe() {
+    let _serial = CONFORMANCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let Some(bin) = carrick_bin() else {
+        eprintln!(
+            "SKIP native_conformance_run_elf_executes_smoke_probe: target/release/carrick not built"
+        );
+        return;
+    };
+    ensure_signed(&bin);
+    let probe = ensure_native_smoke_probe();
+
+    for profile in ["native16k", "linux4k"] {
+        let out = run_native_run_elf(&bin, &probe, profile);
+        assert!(
+            out.contains("status=exit status: 0")
+                && out.contains("native-smoke: ok")
+                && !out.contains("no HVF fallback was attempted"),
+            "native run-elf smoke probe failed for profile {profile}:\n{out}"
+        );
+    }
+}
+
+#[test]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn native_conformance_run_elf_executes_libc_probe() {
+    let _serial = CONFORMANCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let Some(bin) = carrick_bin() else {
+        eprintln!(
+            "SKIP native_conformance_run_elf_executes_libc_probe: target/release/carrick not built"
+        );
+        return;
+    };
+    ensure_signed(&bin);
+    let probe = ensure_native_static_pie_probe("devnullseek");
+
+    for profile in ["native16k", "linux4k"] {
+        let out = run_native_run_elf(&bin, &probe, profile);
+        assert!(
+            out.contains("status=exit status: 0")
+                && out.contains("devnull_lseek_cur0=true")
+                && out.contains("devnull_lseek_set=true")
+                && !out.contains("no HVF fallback was attempted"),
+            "native run-elf libc probe failed for profile {profile}:\n{out}"
+        );
+    }
+}
+
+#[test]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn native_conformance_run_elf_preserves_ip0_across_syscalls() {
+    let _serial = CONFORMANCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let Some(bin) = carrick_bin() else {
+        eprintln!(
+            "SKIP native_conformance_run_elf_preserves_ip0_across_syscalls: target/release/carrick not built"
+        );
+        return;
+    };
+    ensure_signed(&bin);
+    let probe = ensure_native_static_pie_probe("bigallocfree");
+
+    for profile in ["native16k", "linux4k"] {
+        for attempt in 1..=5 {
+            let out = run_native_run_elf(&bin, &probe, profile);
+            assert!(
+                out.contains("status=exit status: 0")
+                    && out.contains("bigalloc=loop-done")
+                    && out.contains("bigalloc=OK"),
+                "native run-elf bigallocfree failed for profile {profile} attempt {attempt}:\n{out}"
+            );
+        }
+    }
+}
+
+#[test]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn native_conformance_run_elf_supports_plain_fork_probe() {
+    let _serial = CONFORMANCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let Some(bin) = carrick_bin() else {
+        eprintln!(
+            "SKIP native_conformance_run_elf_supports_plain_fork_probe: target/release/carrick not built"
+        );
+        return;
+    };
+    ensure_signed(&bin);
+    let probe = ensure_native_static_pie_probe("mapfixed");
+
+    for profile in ["native16k", "linux4k"] {
+        let out = run_native_run_elf(&bin, &probe, profile);
+        assert!(
+            out.contains("status=exit status: 0")
+                && out.contains("setup_ok=true")
+                && out.contains("child_map_fixed_ok=true")
+                && out.contains("parent_value_preserved=true")
+                && out.contains("parent_clobbered_by_child=false"),
+            "native run-elf mapfixed fork probe failed for profile {profile}:\n{out}"
+        );
+    }
+}
+
+#[test]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn native_conformance_run_elf_supports_clone_child_stack() {
+    let _serial = CONFORMANCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let Some(bin) = carrick_bin() else {
+        eprintln!(
+            "SKIP native_conformance_run_elf_supports_clone_child_stack: target/release/carrick not built"
+        );
+        return;
+    };
+    ensure_signed(&bin);
+    let probe = ensure_native_static_pie_probe("clonestack");
+
+    for profile in ["native16k", "linux4k"] {
+        let out = run_native_run_elf(&bin, &probe, profile);
+        assert!(
+            out.contains("status=exit status: 0")
+                && out.contains("clone_ok=true")
+                && out.contains("wait_ok=true")
+                && out.contains("child_exit_42=true"),
+            "native run-elf clonestack probe failed for profile {profile}:\n{out}"
+        );
+    }
 }
 
 /// Bless the probe-oracle cache: capture each DETERMINISTIC probe's Docker
