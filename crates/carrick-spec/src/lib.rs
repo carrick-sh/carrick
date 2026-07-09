@@ -232,6 +232,42 @@ pub enum FsBackendKind {
     Host,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
+pub enum ExecBackendRequest {
+    #[default]
+    Auto,
+    Hvf,
+    Native,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
+pub enum NativePageProfileRequest {
+    #[default]
+    Auto,
+    #[cfg_attr(feature = "clap", value(name = "native16k"))]
+    Native16k,
+    #[cfg_attr(feature = "clap", value(name = "linux4k"))]
+    Linux4k,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativePageProfile {
+    Native16k,
+    Linux4kOn16k,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativePageGeometry {
+    pub host_page_size: u64,
+    pub linux_page_size: u64,
+    pub profile: NativePageProfile,
+}
+
 /// `carrick run --pid <mode>` — which PID namespace the container runs in,
 /// mirroring `docker run --pid`. `Private` (the default) places the container
 /// in a fresh PID namespace (its init is pid 1, ns-local child pids, ns-filtered
@@ -696,6 +732,14 @@ pub struct RunSpec {
     /// [`Platform::host_native`]).
     #[serde(default)]
     pub platform: Platform,
+    /// Execution backend requested by CLI/API policy. `Auto` preserves the
+    /// platform default; explicit `Native` is experimental and trusted-code-only.
+    #[serde(default)]
+    pub exec_backend: ExecBackendRequest,
+    /// Native-only page profile request. Ignored by explicitly non-native
+    /// backends; explicit native profiles are validated by the runtime plan.
+    #[serde(default)]
+    pub native_page_profile: NativePageProfileRequest,
     /// PID namespace mode (`docker run --pid`). `Private` (default) gives the
     /// container its own pid ns (init == pid 1); `Host` shares the host pid ns.
     #[serde(default)]
@@ -797,6 +841,46 @@ mod tests {
 
         let deserialized: ImageReference = serde_json::from_str(&serialized).expect("deserialize");
         assert_eq!(deserialized, reference);
+    }
+
+    #[test]
+    fn run_spec_defaults_execution_backend_and_native_page_profile() {
+        let json = r#"{
+            "executable": "/bin/sh",
+            "argv": ["/bin/sh"],
+            "envp": [],
+            "cwd": "/",
+            "rootfs_layers": [],
+            "fs_backend": "Host",
+            "mounts": [],
+            "tty": false,
+            "raw": true,
+            "interactive": false,
+            "max_traps": 100,
+            "debug_state_path": null
+        }"#;
+
+        let spec: RunSpec = serde_json::from_str(json).expect("legacy spec should deserialize");
+        assert_eq!(spec.exec_backend, ExecBackendRequest::Auto);
+        assert_eq!(spec.native_page_profile, NativePageProfileRequest::Auto);
+    }
+
+    #[test]
+    fn page_profile_vocabulary_round_trips() {
+        let geometry = NativePageGeometry {
+            host_page_size: 16_384,
+            linux_page_size: 4096,
+            profile: NativePageProfile::Linux4kOn16k,
+        };
+
+        let encoded = serde_json::to_string(&geometry).expect("serialize geometry");
+        assert_eq!(
+            encoded,
+            r#"{"host_page_size":16384,"linux_page_size":4096,"profile":"linux4k_on16k"}"#
+        );
+        let decoded: NativePageGeometry =
+            serde_json::from_str(&encoded).expect("deserialize geometry");
+        assert_eq!(decoded, geometry);
     }
 
     #[test]
