@@ -8,7 +8,7 @@ mod trap;
 use execmem::execmem;
 use mapping::{fixed_map_child, page_size};
 use report::{ProbeReport, Status};
-use trap::brk_trap;
+use trap::{branch_gateway, brk_trap};
 
 pub fn run_from_env() -> Result<(), String> {
     let mut args = std::env::args().skip(1);
@@ -25,7 +25,7 @@ pub fn run_from_env() -> Result<(), String> {
         "fixed-map" => print_one(fixed_map_child()?),
         "execmem" => print_one(execmem()?),
         "brk-trap" => print_one(brk_trap()?),
-        "branch-gateway" => Err("branch-gateway probe is implemented in Task 5".to_string()),
+        "branch-gateway" => print_one(branch_gateway()?),
         "fault-discriminator" => {
             Err("fault-discriminator probe is implemented in Task 6".to_string())
         }

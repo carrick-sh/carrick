@@ -1,6 +1,13 @@
 use super::errno;
 use super::report::{ProbeReport, Status};
 
+const MOV_W0_77_RET: [u8; 8] = [
+    0xa0, 0x09, 0x80, 0x52, // mov w0, #77
+    0xc0, 0x03, 0x5f, 0xd6, // ret
+];
+
+type GatewayFn = extern "C" fn() -> u32;
+
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct UcontextSnapshot {
@@ -12,6 +19,7 @@ struct UcontextSnapshot {
 unsafe extern "C" {
     fn carrick_snapshot_ucontext(uap: *mut libc::c_void, out: *mut UcontextSnapshot)
         -> libc::c_int;
+    fn carrick_probe_clear_icache(start: *mut libc::c_void, len: usize);
 }
 
 pub fn brk_trap() -> Result<ProbeReport, String> {
@@ -73,4 +81,85 @@ extern "C" fn brk_handler(_sig: libc::c_int, _info: *mut libc::siginfo_t, uap: *
     unsafe {
         libc::_exit(if ok { 0 } else { 82 });
     }
+}
+
+pub fn branch_gateway() -> Result<ProbeReport, String> {
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page_size <= 0 {
+        return Ok(ProbeReport::new("branch-gateway", Status::Fail).field("page_size", page_size));
+    }
+
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            page_size as usize,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANON,
+            -1,
+            0,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        return Ok(ProbeReport::new("branch-gateway", Status::Fail).field("mmap_errno", errno()));
+    }
+
+    let base = ptr as usize;
+    let guest_pc = base;
+    let gateway_pc = base + 64;
+    let Some(branch) = encode_b(guest_pc, gateway_pc) else {
+        unsafe {
+            libc::munmap(ptr, page_size as usize);
+        }
+        return Ok(ProbeReport::new("branch-gateway", Status::Fail).field("reason", "branch_range"));
+    };
+
+    unsafe {
+        std::ptr::write_unaligned(ptr.cast::<u32>(), branch);
+        std::ptr::copy_nonoverlapping(
+            MOV_W0_77_RET.as_ptr(),
+            ptr.cast::<u8>().add(64),
+            MOV_W0_77_RET.len(),
+        );
+        carrick_probe_clear_icache(ptr, 72);
+    }
+
+    let protect =
+        unsafe { libc::mprotect(ptr, page_size as usize, libc::PROT_READ | libc::PROT_EXEC) };
+    if protect != 0 {
+        let err = errno();
+        unsafe {
+            libc::munmap(ptr, page_size as usize);
+        }
+        return Ok(ProbeReport::new("branch-gateway", Status::Fail).field("mprotect_errno", err));
+    }
+
+    let func: GatewayFn = unsafe { std::mem::transmute(ptr) };
+    let value = func();
+
+    unsafe {
+        libc::munmap(ptr, page_size as usize);
+    }
+
+    let status = if value == 77 {
+        Status::Pass
+    } else {
+        Status::Fail
+    };
+    Ok(ProbeReport::new("branch-gateway", status)
+        .field("return", value)
+        .field("branch_word", format!("0x{branch:08x}")))
+}
+
+fn encode_b(from: usize, to: usize) -> Option<u32> {
+    let byte_delta = (to as isize).checked_sub(from as isize)?;
+    if byte_delta % 4 != 0 {
+        return None;
+    }
+
+    let instruction_delta = byte_delta / 4;
+    if !(-(1 << 25)..(1 << 25)).contains(&instruction_delta) {
+        return None;
+    }
+
+    Some(0x1400_0000 | ((instruction_delta as u32) & 0x03ff_ffff))
 }
