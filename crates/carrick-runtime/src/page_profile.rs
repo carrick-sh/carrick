@@ -1,6 +1,7 @@
 use crate::runtime::RuntimeError;
 use carrick_spec::{
-    ExecBackendRequest, NativePageGeometry, NativePageProfile, NativePageProfileRequest, RunSpec,
+    BackendCapabilities, ExecBackendRequest, HostExecution, NativePageGeometry, NativePageProfile,
+    NativePageProfileRequest, RunSpec,
 };
 
 pub(crate) const DEFAULT_LINUX_PAGE_SIZE: u64 = carrick_abi::LINUX_PAGE_SIZE;
@@ -17,6 +18,16 @@ pub struct PageGeometry {
     pub host_page_size: u64,
     pub linux_page_size: u64,
     pub native_profile: Option<NativePageProfile>,
+}
+
+impl PageGeometry {
+    pub fn native_geometry(self) -> Option<NativePageGeometry> {
+        Some(NativePageGeometry {
+            host_page_size: self.host_page_size,
+            linux_page_size: self.linux_page_size,
+            profile: self.native_profile?,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,7 +56,17 @@ pub(crate) fn resolve_execution_plan(spec: &RunSpec) -> Result<ExecutionPlan, Ru
             },
             diagnostics: Vec::new(),
         }),
-        ExecBackendRequest::Native => native_plan(spec.native_page_profile),
+        ExecBackendRequest::Native => {
+            let host_isa = BackendCapabilities::current().host_isa;
+            if BackendCapabilities::current().host_execution(spec.platform) != HostExecution::Native
+            {
+                return Err(RuntimeError::Unsupported(format!(
+                    "native execution backend does not support cross-ISA guest platform {:?} on {:?} host",
+                    spec.platform, host_isa
+                )));
+            }
+            native_plan(spec.native_page_profile)
+        }
     }
 }
 
@@ -104,25 +125,16 @@ fn host_page_size() -> u64 {
     }
 }
 
-impl From<PageGeometry> for NativePageGeometry {
-    fn from(value: PageGeometry) -> Self {
-        let profile = value
-            .native_profile
-            .unwrap_or(NativePageProfile::Linux4kOn16k);
-        Self {
-            host_page_size: value.host_page_size,
-            linux_page_size: value.linux_page_size,
-            profile,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use camino::Utf8PathBuf;
 
-    fn spec(exec_backend: ExecBackendRequest, page: NativePageProfileRequest) -> RunSpec {
+    fn spec_with_platform(
+        platform: carrick_spec::Platform,
+        exec_backend: ExecBackendRequest,
+        page: NativePageProfileRequest,
+    ) -> RunSpec {
         RunSpec {
             executable: "/bin/sh".to_string(),
             argv: vec!["/bin/sh".to_string()],
@@ -136,7 +148,7 @@ mod tests {
             interactive: false,
             max_traps: 100,
             debug_state_path: None,
-            platform: carrick_spec::Platform::Aarch64,
+            platform,
             exec_backend,
             native_page_profile: page,
             pid: carrick_spec::PidMode::Private,
@@ -146,6 +158,10 @@ mod tests {
             uid: 0,
             gid: 0,
         }
+    }
+
+    fn spec(exec_backend: ExecBackendRequest, page: NativePageProfileRequest) -> RunSpec {
+        spec_with_platform(carrick_spec::Platform::Aarch64, exec_backend, page)
     }
 
     #[test]
@@ -161,6 +177,7 @@ mod tests {
             carrick_abi::LINUX_PAGE_SIZE
         );
         assert_eq!(plan.page_geometry.native_profile, None);
+        assert_eq!(plan.page_geometry.native_geometry(), None);
     }
 
     #[test]
@@ -173,6 +190,44 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("native page profile requires --exec-backend=native")
+        );
+    }
+
+    #[test]
+    fn native_backend_rejects_cross_isa_guest_platform() {
+        let err = resolve_execution_plan(&spec_with_platform(
+            carrick_spec::Platform::Amd64,
+            ExecBackendRequest::Native,
+            NativePageProfileRequest::Auto,
+        ))
+        .expect_err("native backend must reject cross-ISA guest requests");
+
+        assert!(matches!(
+            err,
+            RuntimeError::Unsupported(message)
+                if message.contains("cross-ISA")
+                    && message.contains("Amd64")
+                    && message.contains("Aarch64")
+        ));
+    }
+
+    #[test]
+    fn native_linux4k_plan_reports_4k_linux_on_16k_host() {
+        let plan = resolve_execution_plan(&spec(
+            ExecBackendRequest::Native,
+            NativePageProfileRequest::Linux4k,
+        ))
+        .expect("linux4k native plan");
+
+        assert_eq!(plan.backend, ExecutionBackend::NativeDarwin);
+        assert_eq!(plan.page_geometry.host_page_size, 16_384);
+        assert_eq!(
+            plan.page_geometry.native_geometry(),
+            Some(NativePageGeometry {
+                host_page_size: 16_384,
+                linux_page_size: carrick_abi::LINUX_PAGE_SIZE,
+                profile: NativePageProfile::Linux4kOn16k,
+            })
         );
     }
 }
