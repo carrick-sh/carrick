@@ -2337,10 +2337,38 @@ fn run_carrick_probe_with_deadline(
     stdin_bytes: &[u8],
     deadline: Duration,
 ) -> String {
+    run_carrick_probe_with_backend_env(bin, lane, stdin_bytes, deadline, None)
+}
+
+fn run_carrick_probe_with_backend(
+    bin: &PathBuf,
+    lane: Lane,
+    stdin_bytes: &[u8],
+    deadline: Duration,
+    exec_backend: &'static str,
+    native_page_profile: &'static str,
+) -> String {
+    run_carrick_probe_with_backend_env(
+        bin,
+        lane,
+        stdin_bytes,
+        deadline,
+        Some((exec_backend, native_page_profile)),
+    )
+}
+
+fn run_carrick_probe_with_backend_env(
+    bin: &PathBuf,
+    lane: Lane,
+    stdin_bytes: &[u8],
+    deadline: Duration,
+    backend_env: Option<(&'static str, &'static str)>,
+) -> String {
     use std::io::Write;
     use std::os::unix::process::CommandExt;
     let run_id = case_run_id();
-    let mut child = Command::new(bin)
+    let mut command = Command::new(bin);
+    command
         .args([
             "run",
             "--platform",
@@ -2365,9 +2393,13 @@ fn run_carrick_probe_with_deadline(
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .process_group(0)
-        .spawn()
-        .expect("spawn carrick probe");
+        .process_group(0);
+    if let Some((exec_backend, native_page_profile)) = backend_env {
+        command
+            .env("CARRICK_EXEC_BACKEND", exec_backend)
+            .env("CARRICK_NATIVE_PAGE_PROFILE", native_page_profile);
+    }
+    let mut child = command.spawn().expect("spawn carrick probe");
     let pid = child.id() as i32;
     // Hand the base64 to the child on its own thread so a full stdout pipe
     // can't deadlock the write.
@@ -3031,6 +3063,47 @@ fn conformance_probes() {
         "known-gap probes now PASS — remove from KNOWN_PROBE_GAPS / KNOWN_LANE_GAPS: {fixed_gaps:?}"
     );
     assert!(failures.is_empty(), "probe conformance gaps: {failures:?}");
+}
+
+#[test]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn native_conformance_probe_launch_reaches_backend_boundary() {
+    let _serial = CONFORMANCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let Some(bin) = carrick_bin() else {
+        eprintln!(
+            "SKIP native_conformance_probe_launch_reaches_backend_boundary: target/release/carrick not built"
+        );
+        return;
+    };
+    ensure_signed(&bin);
+
+    let probe = probes_dir("aarch64-unknown-linux-musl").join("abortdeath");
+    if !probe.exists() {
+        eprintln!(
+            "SKIP native_conformance_probe_launch_reaches_backend_boundary: probe not built ({})",
+            probe.display()
+        );
+        return;
+    }
+
+    use base64::Engine as _;
+    let engine = base64::engine::general_purpose::STANDARD;
+    let encoded = engine
+        .encode(std::fs::read(&probe).expect("read native smoke probe"))
+        .into_bytes();
+    let out =
+        run_carrick_probe_with_backend(&bin, ARM64, &encoded, CASE_DEADLINE, "native", "linux4k");
+
+    assert!(
+        out.contains("native Darwin backend selected")
+            && out.contains("platform=Aarch64")
+            && out.contains("profile=Linux4kOn16k")
+            && out.contains("host_page_size=16384")
+            && out.contains("linux_page_size=4096")
+            && out.contains("no HVF fallback was attempted"),
+        "native probe launch did not reach explicit backend boundary:\n{out}"
+    );
 }
 
 /// Bless the probe-oracle cache: capture each DETERMINISTIC probe's Docker
