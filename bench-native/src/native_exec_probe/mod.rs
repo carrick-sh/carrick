@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 mod execmem;
 mod fault;
 mod mapping;
