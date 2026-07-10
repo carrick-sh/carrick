@@ -104,7 +104,7 @@
 //!   / [`DispatchOutcome::WaitOnPollFds`] (poll/select/epoll-style fd readiness,
 //!   serviced by the per-thread kqueue or `poll(2)`), [`DispatchOutcome::WaitOnProcExit`]
 //!   (a blocking `waitid` parks on `EVFILT_PROC`/`NOTE_EXIT`),
-//!   [`DispatchOutcome::WaitOnSignals`] (`rt_sigtimedwait`), and
+//!   [`DispatchOutcome::WaitOnSignals`] (`rt_sigtimedwait` / `rt_sigsuspend`), and
 //!   [`DispatchOutcome::WaitOnSleep`] (`nanosleep` via the per-thread waiter, so
 //!   the sleep is interruptible AND can park for a fork-quiesce — a sibling stuck
 //!   in a synchronous host nanosleep would deadlock a multithreaded fork).
@@ -1480,8 +1480,11 @@ pub enum DispatchOutcome {
         pid: i32,
         sig_mask: carrick_abi::WaitSigMask,
     },
-    /// `rt_sigtimedwait` found no matching signal already pending and must wait
-    /// until one of `wait_set` arrives, or until `timeout` elapses. The runtime
+    /// A synchronous signal wait found no matching signal already pending and
+    /// must wait until one of `wait_set` arrives, or until `timeout` elapses.
+    /// `rt_sigtimedwait` uses its caller-supplied timeout; `rt_sigsuspend` uses
+    /// `None` after installing its temporary mask and saved-mask restoration.
+    /// The runtime
     /// parks without holding dispatcher locks, wakes for matching signals
     /// (re-dispatching the same syscall so the dispatcher can dequeue the
     /// signal and write `siginfo_t` through the original guest pointer) — OR
