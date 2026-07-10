@@ -21,15 +21,15 @@ fn read_proc_state(pid: i32) -> Option<char> {
     after_comm.chars().next()
 }
 
-fn wait_until_sleeping(pid: i32) -> bool {
+fn wait_until_sleeping(pid: i32) -> Option<char> {
     let deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < deadline {
-        if matches!(read_proc_state(pid), Some('S' | 'D')) {
-            return true;
+        if let Some(state @ ('S' | 'D')) = read_proc_state(pid) {
+            return Some(state);
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    false
+    None
 }
 
 unsafe fn wait_child_bounded(pid: i32, timeout: Duration) -> (bool, i32) {
@@ -75,7 +75,8 @@ fn main() {
         }
 
         let fork_ok = pid > 0;
-        let child_sleeping = fork_ok && wait_until_sleeping(pid);
+        let child_state = fork_ok.then(|| wait_until_sleeping(pid)).flatten();
+        let child_sleeping = child_state.is_some();
         let send_sigint_ok = child_sleeping && libc::kill(pid, libc::SIGINT) == 0;
         let (child_reaped, status) = if fork_ok {
             wait_child_bounded(pid, Duration::from_secs(5))
@@ -83,6 +84,9 @@ fn main() {
             (false, 0)
         };
 
+        if std::env::args().any(|arg| arg == "--report-state") {
+            report!(child_state = child_state.unwrap_or('?'));
+        }
         report!(
             parent_handler_ok = parent_handler_ok,
             fork_ok = fork_ok,

@@ -1547,6 +1547,49 @@ impl Drop for NativeThreadRuntime {
     }
 }
 
+struct NativeWaitState {
+    tid: crate::thread::ThreadId,
+    registry: Arc<crate::thread::ThreadRegistry>,
+    enrolled: std::cell::Cell<bool>,
+    process_leader: bool,
+}
+
+impl NativeWaitState {
+    fn new(thread_runtime: &NativeThreadRuntime) -> Self {
+        let tid = thread_runtime.tid();
+        Self {
+            tid,
+            registry: Arc::clone(&thread_runtime.registry),
+            enrolled: std::cell::Cell::new(false),
+            process_leader: tid == crate::thread::ThreadId::main_from_host_pid(),
+        }
+    }
+
+    fn enroll(&self) {
+        if self.enrolled.replace(true) {
+            return;
+        }
+        if self.process_leader {
+            crate::run_state::publish(crate::run_state::RunState::Blocked);
+        }
+        self.registry.set_thread_state(self.tid, 'S');
+        crate::run_state::publish_guest_tid(self.tid.raw(), crate::run_state::RunState::Blocked);
+    }
+}
+
+impl Drop for NativeWaitState {
+    fn drop(&mut self) {
+        if !self.enrolled.get() {
+            return;
+        }
+        self.registry.set_thread_state(self.tid, 'R');
+        crate::run_state::publish_guest_tid(self.tid.raw(), crate::run_state::RunState::Running);
+        if self.process_leader {
+            crate::run_state::publish(crate::run_state::RunState::Running);
+        }
+    }
+}
+
 impl<'a> NativeSignalTrap<'a> {
     fn new(
         memory: &'a mut NativeMappedMemory,
@@ -2017,18 +2060,20 @@ fn wait_native_futex(
     timeout: Option<Duration>,
     woken_value: i64,
 ) -> i64 {
-    match thread_runtime.futex.wait_prepared_for_thread(
-        wait,
-        timeout,
-        thread_runtime.tid(),
-        &|| {
-            native_wait_should_interrupt(
-                dispatcher,
-                thread_runtime.tid(),
-                carrick_abi::WaitSigMask::NONE,
-            )
-        },
-    ) {
+    let wait_state = NativeWaitState::new(thread_runtime);
+    wait_state.enroll();
+    let outcome =
+        thread_runtime
+            .futex
+            .wait_prepared_for_thread(wait, timeout, thread_runtime.tid(), &|| {
+                native_wait_should_interrupt(
+                    dispatcher,
+                    thread_runtime.tid(),
+                    carrick_abi::WaitSigMask::NONE,
+                )
+            });
+    drop(wait_state);
+    match outcome {
         crate::thread::FutexWaitOutcome::Woken => woken_value,
         crate::thread::FutexWaitOutcome::TimedOut => {
             crate::linux_abi::LINUX_ETIMEDOUT.guest_retval()
@@ -2055,7 +2100,8 @@ fn wait_native_shared_futex(
             carrick_abi::WaitSigMask::NONE,
         )
     };
-    let wait_enrolled = || {};
+    let wait_state = NativeWaitState::new(thread_runtime);
+    let wait_enrolled = || wait_state.enroll();
     let retval = thread_runtime.platform_futex.shared_wait(
         location,
         waiter_key,
@@ -2064,6 +2110,7 @@ fn wait_native_shared_futex(
         &interrupted,
         &wait_enrolled,
     );
+    drop(wait_state);
     if retval == 0 { woken_value } else { retval }
 }
 
@@ -2083,11 +2130,16 @@ fn wait_native_signals(
         if let Some(result) = native_signal_wait_pending(dispatcher, tid, wait_set, block_mask) {
             return result;
         }
-        match thread_runtime
-            .waiter
-            .wait_with_dispatch_pending(&[], Some(slice), block_mask, || {
-                native_signal_wait_pending(dispatcher, tid, wait_set, block_mask).is_some()
-            }) {
+        let wait_state = NativeWaitState::new(thread_runtime);
+        wait_state.enroll();
+        let result =
+            thread_runtime
+                .waiter
+                .wait_with_dispatch_pending(&[], Some(slice), block_mask, || {
+                    native_signal_wait_pending(dispatcher, tid, wait_set, block_mask).is_some()
+                });
+        drop(wait_state);
+        match result {
             crate::io_wait::WaitResult::Ready | crate::io_wait::WaitResult::Interrupted => {
                 if let Some(result) =
                     native_signal_wait_pending(dispatcher, tid, wait_set, block_mask)
@@ -2139,11 +2191,15 @@ fn wait_native_fds(
 ) -> Result<NativeWaitResult, crate::linux_abi::LinuxErrno> {
     let tid = thread_runtime.tid();
     let block_mask = native_wait_block_mask(dispatcher, tid, sig_mask);
-    match thread_runtime
+    let wait_state = NativeWaitState::new(thread_runtime);
+    wait_state.enroll();
+    let result = thread_runtime
         .waiter
         .wait_with_dispatch_pending(fds, timeout, block_mask, || {
             native_wait_should_interrupt(dispatcher, tid, sig_mask)
-        }) {
+        });
+    drop(wait_state);
+    match result {
         crate::io_wait::WaitResult::Ready => Ok(NativeWaitResult::Ready),
         crate::io_wait::WaitResult::TimedOut => Ok(NativeWaitResult::TimedOut),
         crate::io_wait::WaitResult::Interrupted => Err(crate::linux_abi::LINUX_EINTR),
@@ -2159,11 +2215,16 @@ fn wait_native_proc_exit(
 ) -> Result<NativeWaitResult, crate::linux_abi::LinuxErrno> {
     let tid = thread_runtime.tid();
     let block_mask = native_wait_block_mask(dispatcher, tid, sig_mask);
-    match thread_runtime
-        .waiter
-        .wait_proc_exit_with_dispatch_pending(pid, block_mask, || {
-            native_wait_should_interrupt(dispatcher, tid, sig_mask)
-        }) {
+    let wait_state = NativeWaitState::new(thread_runtime);
+    wait_state.enroll();
+    let result =
+        thread_runtime
+            .waiter
+            .wait_proc_exit_with_dispatch_pending(pid, block_mask, || {
+                native_wait_should_interrupt(dispatcher, tid, sig_mask)
+            });
+    drop(wait_state);
+    match result {
         crate::io_wait::WaitResult::Ready => Ok(NativeWaitResult::Ready),
         crate::io_wait::WaitResult::TimedOut => Ok(NativeWaitResult::TimedOut),
         crate::io_wait::WaitResult::Interrupted => Err(crate::linux_abi::LINUX_EINTR),
@@ -2178,11 +2239,15 @@ fn wait_native_proc_state(
 ) -> Result<NativeWaitResult, crate::linux_abi::LinuxErrno> {
     let tid = thread_runtime.tid();
     let block_mask = native_wait_block_mask(dispatcher, tid, sig_mask);
-    match thread_runtime
+    let wait_state = NativeWaitState::new(thread_runtime);
+    wait_state.enroll();
+    let result = thread_runtime
         .waiter
         .wait_proc_state_with_dispatch_pending(block_mask, || {
             native_wait_should_interrupt(dispatcher, tid, sig_mask)
-        }) {
+        });
+    drop(wait_state);
+    match result {
         crate::io_wait::WaitResult::Ready => Ok(NativeWaitResult::Ready),
         crate::io_wait::WaitResult::TimedOut => Ok(NativeWaitResult::TimedOut),
         crate::io_wait::WaitResult::Interrupted => Err(crate::linux_abi::LINUX_EINTR),
@@ -2206,12 +2271,16 @@ fn wait_native_sleep_until(
         if now >= deadline {
             return Ok(());
         }
-        match thread_runtime.waiter.wait_with_dispatch_pending(
+        let wait_state = NativeWaitState::new(thread_runtime);
+        wait_state.enroll();
+        let result = thread_runtime.waiter.wait_with_dispatch_pending(
             &[],
             Some(deadline - now),
             block_mask,
             || native_wait_should_interrupt(dispatcher, tid, sig_mask),
-        ) {
+        );
+        drop(wait_state);
+        match result {
             crate::io_wait::WaitResult::Ready => {}
             crate::io_wait::WaitResult::TimedOut => return Ok(()),
             crate::io_wait::WaitResult::Interrupted => {
@@ -5597,6 +5666,26 @@ mod tests {
         let child = runtime.sibling(child_tid);
         assert_eq!(child.waiter.tid(), child_tid);
         runtime.registry.exit(child_tid);
+    }
+
+    #[test]
+    fn native_wait_state_tracks_blocked_and_running_thread() {
+        let runtime = NativeThreadRuntime::new_current();
+        let state_for = || {
+            runtime
+                .registry
+                .thread_state_chars()
+                .into_iter()
+                .find_map(|(tid, state)| (tid == runtime.tid()).then_some(state))
+        };
+        assert_eq!(state_for(), Some('R'));
+
+        let wait_state = NativeWaitState::new(&runtime);
+        wait_state.enroll();
+        assert_eq!(state_for(), Some('S'));
+        drop(wait_state);
+
+        assert_eq!(state_for(), Some('R'));
     }
 
     #[test]
