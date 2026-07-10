@@ -24,7 +24,7 @@ use carrick_kernel::arena::{ARENA_PATH_ENV, KernelArena};
 use carrick_kernel::domains::{HostPid, ProcessGeneration};
 use carrick_kernel::process::{
     FLAG_ALIVE, FLAG_DEAD, FLAG_ORPHANED, PROCESS_RECORDS, ProcessRecord, ProcessRecordRef,
-    ProcessSection, REGISTERING,
+    ProcessSection, REGISTERING, VirtualPtraceState,
 };
 
 use super::NsId;
@@ -934,6 +934,10 @@ fn fill_member(record: &ProcessRecord, ns_pid: u32, parent_host_pid: u32) {
     record.guest_ns.store(0, Ordering::Relaxed);
     record.subreaper_pid.store(0, Ordering::Relaxed);
     record.ptrace_stop_signal.store(0, Ordering::Relaxed);
+    record.ptrace_tracer_pid.store(0, Ordering::Relaxed);
+    record
+        .ptrace_state
+        .store(VirtualPtraceState::Untraced.raw(), Ordering::Relaxed);
     record
         .flags
         .fetch_and(!carrick_kernel::process::FLAG_ADOPTED, Ordering::AcqRel);
@@ -1001,6 +1005,10 @@ mod tests {
         let r = match section.claim(Some(HostPid::new(pid)), generation, |record| {
             record.subreaper_pid.store(999, Ordering::Relaxed);
             record.ptrace_stop_signal.store(19, Ordering::Relaxed);
+            record.ptrace_tracer_pid.store(998, Ordering::Relaxed);
+            record
+                .ptrace_state
+                .store(VirtualPtraceState::StopReported.raw(), Ordering::Relaxed);
             record.exit_ready.store(1, Ordering::Relaxed);
             record.guest_ns.store(123_456, Ordering::Relaxed);
             record
@@ -1018,6 +1026,11 @@ mod tests {
         assert_eq!(record.guest_ns.load(Ordering::Acquire), 0);
         assert_eq!(record.subreaper_pid.load(Ordering::Acquire), 0);
         assert_eq!(record.ptrace_stop_signal.load(Ordering::Acquire), 0);
+        assert_eq!(record.ptrace_tracer_pid.load(Ordering::Acquire), 0);
+        assert_eq!(
+            record.ptrace_state.load(Ordering::Acquire),
+            VirtualPtraceState::Untraced.raw()
+        );
         assert_eq!(
             record.flags.load(Ordering::Acquire) & carrick_kernel::process::FLAG_ADOPTED,
             0,
