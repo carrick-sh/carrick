@@ -67,6 +67,8 @@ const NATIVE_WAIT_BACKSTOP: Duration = Duration::from_millis(50);
 const VM_INHERIT_SHARE: libc::c_int = 0;
 const VM_INHERIT_COPY: libc::c_int = 1;
 
+type SharedNativeMemory = Arc<parking_lot::Mutex<NativeMappedMemory>>;
+
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct NativeUcontextSnapshot {
@@ -513,7 +515,7 @@ fn run_image_in_child(
 
 fn run_image_in_current_process(
     image: AddressSpace,
-    mut dispatcher: SyscallDispatcher,
+    dispatcher: SyscallDispatcher,
     max_traps: usize,
     relative_relocations: &[NativeRelativeRelocation],
     plan: &ExecutionPlan,
@@ -522,13 +524,16 @@ fn run_image_in_current_process(
         RuntimeError::Unsupported("native Darwin image has no initial stack".to_string())
     })?;
     let entry = image.entry();
-    let mut memory = NativeMappedMemory::map(
+    let memory = Arc::new(parking_lot::Mutex::new(NativeMappedMemory::map(
         &image,
         native_memory_layout(),
         plan.page_geometry.host_page_size,
         plan.page_geometry.linux_page_size,
-    )?;
-    apply_native_relative_relocations(&mut memory, relative_relocations)?;
+    )?));
+    {
+        let mut memory = memory.lock();
+        apply_native_relative_relocations(&mut memory, relative_relocations)?;
+    }
     let _ = crate::ulock::preinit_waiter_table();
     carrick_signal_core::xsig::xsig_init();
     carrick_signal_core::fasync::fasync_init();
@@ -564,16 +569,25 @@ fn run_image_in_current_process(
             } else {
                 snapshot.far
             };
-            if let Some((page, prot)) = dispatcher.resident_fault_plan(fault_address)
-                && memory
-                    .protect_range(page, memory.linux_page_size as usize, prot)
-                    .is_ok()
+            let resident_fault_plan = dispatcher.resident_fault_plan(fault_address);
+            let resident_fault_resolved = if let Some((page, prot)) = resident_fault_plan {
+                let mut memory = memory.lock();
+                let linux_page_size = memory.linux_page_size as usize;
+                memory.protect_range(page, linux_page_size, prot).is_ok()
+            } else {
+                false
+            };
+            if let Some((page, _)) = resident_fault_plan
+                && resident_fault_resolved
             {
                 dispatcher.commit_resident_fault(page);
                 resume_guest_snapshot(&snapshot)?;
                 continue;
             }
-            emulate_linux4k_guarded_fault(&mut memory, &mut snapshot)?;
+            {
+                let mut memory = memory.lock();
+                emulate_linux4k_guarded_fault(&mut memory, &mut snapshot)?;
+            }
             resume_guest_snapshot(&snapshot)?;
             continue;
         }
@@ -587,7 +601,11 @@ fn run_image_in_current_process(
                 snapshot.esr
             )));
         }
-        match decode_native_trap(&memory, snapshot.pc)? {
+        let native_trap = {
+            let memory = memory.lock();
+            decode_native_trap(&memory, snapshot.pc)?
+        };
+        match native_trap {
             NativeTrap::ReadTpidr { rt, resume_pc } => {
                 if trace_syscalls {
                     child_write_stderr(
@@ -636,7 +654,10 @@ fn run_image_in_current_process(
             }
             NativeTrap::DcZva { rt, resume_pc } => {
                 let address = snapshot_register(&snapshot, rt);
-                native_dc_zva(&mut memory, address)?;
+                {
+                    let mut memory = memory.lock();
+                    native_dc_zva(&mut memory, address)?;
+                }
                 resume_guest_at(resume_pc)?;
             }
             NativeTrap::Syscall { resume_pc } => {
@@ -672,9 +693,9 @@ fn run_image_in_current_process(
                 }
 
                 let outcome = dispatch_native_syscall(
-                    &mut dispatcher,
+                    &dispatcher,
                     request,
-                    &mut memory,
+                    &memory,
                     &thread_runtime,
                     &reporter,
                     trace_syscalls,
@@ -683,7 +704,7 @@ fn run_image_in_current_process(
                     DispatchOutcome::Returned { value } => {
                         if let Some(code) = resume_guest_after_syscall(
                             &dispatcher,
-                            &mut memory,
+                            &memory,
                             snapshot,
                             resume_pc,
                             value,
@@ -695,7 +716,7 @@ fn run_image_in_current_process(
                     DispatchOutcome::Errno { errno } => {
                         if let Some(code) = resume_guest_after_syscall(
                             &dispatcher,
-                            &mut memory,
+                            &memory,
                             snapshot,
                             resume_pc,
                             errno.guest_retval(),
@@ -705,7 +726,7 @@ fn run_image_in_current_process(
                         }
                     }
                     DispatchOutcome::SigReturn => {
-                        resume_guest_from_sigreturn(&dispatcher, &mut memory, snapshot)?;
+                        resume_guest_from_sigreturn(&dispatcher, &memory, snapshot)?;
                     }
                     DispatchOutcome::SignalDeath { signum } => return Ok(128 + signum),
                     DispatchOutcome::Fork {
@@ -728,7 +749,7 @@ fn run_image_in_current_process(
                         };
                         handle_native_fork(
                             &dispatcher,
-                            &mut memory,
+                            &memory,
                             &mut thread_runtime,
                             &mut vfork_completion,
                             request,
@@ -760,7 +781,9 @@ fn run_image_in_current_process(
                                 );
                                 crate::vcpu_loop::apply_image_proc_state(&dispatcher, &image);
                                 dispatcher.close_cloexec_fds();
-                                memory.replace_image(&image, &relative_relocations, plan)?;
+                                memory
+                                    .lock()
+                                    .replace_image(&image, &relative_relocations, plan)?;
                                 crate::namespace::pid::mark_self_execed();
                                 let cmdline = proc_argv.join(" ");
                                 crate::dispatch::set_host_process_name(cmdline.as_bytes());
@@ -777,7 +800,7 @@ fn run_image_in_current_process(
                             Err(errno) => {
                                 if let Some(code) = resume_guest_after_syscall(
                                     &dispatcher,
-                                    &mut memory,
+                                    &memory,
                                     snapshot,
                                     resume_pc,
                                     errno.guest_retval(),
@@ -796,7 +819,9 @@ fn run_image_in_current_process(
                         file,
                         prot_none,
                     } => {
-                        memory.map_host_alias(va.raw(), len, &payload, file, prot_none)?;
+                        memory
+                            .lock()
+                            .map_host_alias(va.raw(), len, &payload, file, prot_none)?;
                         resume_guest(va.raw(), resume_pc)?;
                     }
                     DispatchOutcome::Exit { code } => return Ok(code),
@@ -813,48 +838,56 @@ fn run_image_in_current_process(
 
 fn resume_guest_after_syscall(
     dispatcher: &SyscallDispatcher,
-    memory: &mut NativeMappedMemory,
+    memory: &SharedNativeMemory,
     snapshot: NativeUcontextSnapshot,
     resume_pc: u64,
     return_value: i64,
     syscall_nr: u64,
 ) -> Result<Option<i32>, RuntimeError> {
     let tid = crate::thread::ThreadId::main_from_host_pid();
-    let mut trap = NativeSignalTrap::new(memory, snapshot, Some(syscall_nr));
-    trap.complete_syscall(return_value)?;
-    trap.set_pc(resume_pc);
-    let action = crate::vcpu_loop::deliver_pending_signal(
-        &mut trap,
-        dispatcher,
-        Some(return_value),
-        tid,
-        None,
-    )?;
-    if let Some(action) = action {
-        if let Some(signum) = action.term_signal {
-            return Ok(Some(128 + signum));
+    let pc = {
+        let mut memory = memory.lock();
+        let mut trap = NativeSignalTrap::new(&mut memory, snapshot, Some(syscall_nr));
+        trap.complete_syscall(return_value)?;
+        trap.set_pc(resume_pc);
+        let action = crate::vcpu_loop::deliver_pending_signal(
+            &mut trap,
+            dispatcher,
+            Some(return_value),
+            tid,
+            None,
+        )?;
+        if let Some(action) = action {
+            if let Some(signum) = action.term_signal {
+                return Ok(Some(128 + signum));
+            }
+            if let Some(signum) = action.stop_signal {
+                return Ok(Some(128 + signum));
+            }
         }
-        if let Some(signum) = action.stop_signal {
-            return Ok(Some(128 + signum));
-        }
-    }
-    let pc = trap.pc();
-    trap.commit();
+        let pc = trap.pc();
+        trap.commit();
+        pc
+    };
     resume_guest_at(pc)?;
     Ok(None)
 }
 
 fn resume_guest_from_sigreturn(
     dispatcher: &SyscallDispatcher,
-    memory: &mut NativeMappedMemory,
+    memory: &SharedNativeMemory,
     snapshot: NativeUcontextSnapshot,
 ) -> Result<(), RuntimeError> {
     let tid = crate::thread::ThreadId::main_from_host_pid();
-    let mut trap = NativeSignalTrap::new(memory, snapshot, None);
-    let restored_sigmask = trap.restore_from_sigframe()?;
-    dispatcher.restore_signal_mask(tid, carrick_abi::SigSet::from_raw(restored_sigmask));
-    let pc = trap.pc();
-    trap.commit();
+    let pc = {
+        let mut memory = memory.lock();
+        let mut trap = NativeSignalTrap::new(&mut memory, snapshot, None);
+        let restored_sigmask = trap.restore_from_sigframe()?;
+        dispatcher.restore_signal_mask(tid, carrick_abi::SigSet::from_raw(restored_sigmask));
+        let pc = trap.pc();
+        trap.commit();
+        pc
+    };
     resume_guest_at(pc)
 }
 
@@ -1105,23 +1138,26 @@ impl SyscallTrap for NativeSignalTrap<'_> {
 }
 
 fn dispatch_native_syscall(
-    dispatcher: &mut SyscallDispatcher,
+    dispatcher: &SyscallDispatcher,
     request: SyscallRequest,
-    memory: &mut NativeMappedMemory,
+    memory: &SharedNativeMemory,
     thread_runtime: &NativeThreadRuntime,
     reporter: &CompatReporter,
     trace_syscalls: bool,
 ) -> Result<DispatchOutcome, RuntimeError> {
     let mut signal_wait_deadline = None;
     loop {
-        let outcome = dispatcher.dispatch_threaded(
-            request,
-            memory,
-            reporter,
-            thread_runtime.tid(),
-            &thread_runtime.registry,
-            &thread_runtime.futex,
-        )?;
+        let outcome = {
+            let mut memory = memory.lock();
+            dispatcher.dispatch_threaded(
+                request,
+                &mut *memory,
+                reporter,
+                thread_runtime.tid(),
+                &thread_runtime.registry,
+                &thread_runtime.futex,
+            )?
+        };
         if trace_syscalls {
             child_write_stderr(
                 format!("native trace pid={} outcome={outcome:?}\n", unsafe {
@@ -1157,6 +1193,7 @@ fn dispatch_native_syscall(
             } => match wait_native_fds(dispatcher, &fds, timeout, sig_mask) {
                 Ok(NativeWaitResult::Ready) => continue,
                 Ok(NativeWaitResult::TimedOut) => {
+                    let mut memory = memory.lock();
                     for (addr, len) in &clear_on_timeout {
                         let _ = memory.zero_guest_range(*addr, *len);
                     }
@@ -1309,8 +1346,9 @@ fn dispatch_native_syscall(
                 match wait_native_sleep_until(dispatcher, deadline) {
                     Ok(()) => return Ok(DispatchOutcome::Returned { value: 0 }),
                     Err(crate::linux_abi::LINUX_EINTR) => {
+                        let mut memory = memory.lock();
                         return Ok(crate::dispatch::complete_interrupted_sleep(
-                            memory,
+                            &mut *memory,
                             remaining,
                             deadline.saturating_duration_since(Instant::now()),
                         ));
@@ -1589,7 +1627,7 @@ fn native_child_status_ready(pid: i32) -> bool {
 
 fn handle_native_fork(
     dispatcher: &SyscallDispatcher,
-    memory: &mut NativeMappedMemory,
+    memory: &SharedNativeMemory,
     thread_runtime: &mut NativeThreadRuntime,
     vfork_completion: &mut Option<NativeVforkCompletion>,
     request: NativeForkRequest,
@@ -1601,7 +1639,7 @@ fn handle_native_fork(
         ));
     }
     let vfork_pipe = if request.vfork.is_some() {
-        memory.set_fork_inheritance(true);
+        memory.lock().set_fork_inheritance(true);
         Some(pipe_pair()?)
     } else {
         None
@@ -1621,7 +1659,7 @@ fn handle_native_fork(
             if let Some((read_fd, write_fd)) = vfork_pipe {
                 close_fd(read_fd);
                 close_fd(write_fd);
-                memory.set_fork_inheritance(false);
+                memory.lock().set_fork_inheritance(false);
             }
             return resume_guest(
                 crate::linux_abi::LINUX_EAGAIN.guest_retval() as u64,
@@ -1635,7 +1673,7 @@ fn handle_native_fork(
         if let Some((read_fd, write_fd)) = vfork_pipe {
             close_fd(read_fd);
             close_fd(write_fd);
-            memory.set_fork_inheritance(false);
+            memory.lock().set_fork_inheritance(false);
         }
         return resume_guest(
             crate::linux_abi::LINUX_EAGAIN.guest_retval() as u64,
@@ -1657,10 +1695,10 @@ fn handle_native_fork(
         crate::run_state::reinit_booting_after_fork();
         let self_tid = (crate::namespace::pid::self_ns_pid() as i32).to_le_bytes();
         if let Some(addr) = request.parent_tid_addr {
-            let _ = memory.write_bytes(addr, &self_tid);
+            let _ = memory.lock().write_bytes(addr, &self_tid);
         }
         if let Some(addr) = request.child_tid_addr {
-            let _ = memory.write_bytes(addr, &self_tid);
+            let _ = memory.lock().write_bytes(addr, &self_tid);
         }
         if request.child_stack != 0 {
             unsafe {
@@ -1674,19 +1712,19 @@ fn handle_native_fork(
         close_fd(write_fd);
         wait_native_vfork_completion(read_fd)?;
         close_fd(read_fd);
-        memory.set_fork_inheritance(false);
+        memory.lock().set_fork_inheritance(false);
     }
     crate::guest_cpu::publish_prepared_child_record_parent_ref(prepared_child_record, child as u32);
     crate::namespace::pid::notify_child_registered();
     crate::run_state::publish_child_booting(child as u32);
     if let Some(addr) = request.pidfd_out {
         let fd = dispatcher.install_child_pidfd(child).unwrap_or(-1);
-        let _ = memory.write_bytes(addr, &fd.to_le_bytes());
+        let _ = memory.lock().write_bytes(addr, &fd.to_le_bytes());
     }
     let guest_child_pid = child_ns_pid.unwrap_or(child as u32) as i32;
     if let Some(addr) = request.parent_tid_addr {
         let tid = guest_child_pid.to_le_bytes();
-        let _ = memory.write_bytes(addr, &tid);
+        let _ = memory.lock().write_bytes(addr, &tid);
     }
     native_register_child_exit_watch(dispatcher, child, request.exit_signal);
     resume_guest(guest_child_pid as u64, resume_pc)
