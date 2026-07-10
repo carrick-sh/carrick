@@ -918,6 +918,17 @@ pub mod runtime {
                         WaitResult::Errno(errno) => return Ok(DispatchOutcome::Errno { errno }),
                     }
                 }
+                DispatchOutcome::WaitOnProcState { sig_mask, .. } => {
+                    match waiter
+                        .wait_proc_state_with_dispatch_pending(sig_mask.block_mask(), || false)
+                    {
+                        WaitResult::Ready | WaitResult::TimedOut => continue,
+                        WaitResult::Interrupted => {
+                            return Ok(DispatchOutcome::Errno { errno: EINTR });
+                        }
+                        WaitResult::Errno(errno) => return Ok(DispatchOutcome::Errno { errno }),
+                    }
+                }
                 // Terminal (Returned/Errno/Exit/...) and not-yet-serviced
                 // (futex/fork/clone-thread/...) outcomes.
                 terminal => return Ok(terminal),

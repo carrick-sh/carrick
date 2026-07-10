@@ -1044,6 +1044,7 @@ where
             | DispatchOutcome::WaitOnFdsSelect { .. }
             | DispatchOutcome::WaitOnPollFds { .. }
             | DispatchOutcome::WaitOnProcExit { .. }
+            | DispatchOutcome::WaitOnProcState { .. }
             | DispatchOutcome::WaitOnSignals { .. }
             | DispatchOutcome::WaitOnSleep { .. } => {
                 let value = crate::linux_abi::LINUX_EINTR.guest_retval();
@@ -1626,6 +1627,21 @@ fn dispatch_single_threaded_syscall<M: GuestMemory>(
                     }
                     // wait_proc_exit never builds PinnedWaitFds, so this is
                     // unreachable in practice; present for exhaustiveness.
+                    WaitResult::Errno(errno) => {
+                        return Ok(DispatchOutcome::Errno { errno });
+                    }
+                }
+            }
+            DispatchOutcome::WaitOnProcState { sig_mask, .. } => {
+                waiter.ensure_full();
+                match waiter.wait_proc_state_with_dispatch_pending(sig_mask.block_mask(), || false)
+                {
+                    WaitResult::Ready | WaitResult::TimedOut => continue,
+                    WaitResult::Interrupted => {
+                        return Ok(DispatchOutcome::Errno {
+                            errno: crate::linux_abi::LINUX_EINTR,
+                        });
+                    }
                     WaitResult::Errno(errno) => {
                         return Ok(DispatchOutcome::Errno { errno });
                     }

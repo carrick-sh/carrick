@@ -1480,6 +1480,15 @@ pub enum DispatchOutcome {
         pid: i32,
         sig_mask: carrick_abi::WaitSigMask,
     },
+    /// A Darwin-native wait for a non-terminal child state (`WSTOPPED` or
+    /// `WCONTINUED`). `EVFILT_PROC` only reports exit, so the runtime parks on
+    /// the signal wake path with a bounded retry and re-dispatches the original
+    /// wait syscall. `pid` keeps the concrete host target for diagnostics and a
+    /// future selector-aware kqueue implementation.
+    WaitOnProcState {
+        pid: i32,
+        sig_mask: carrick_abi::WaitSigMask,
+    },
     /// A synchronous signal wait found no matching signal already pending and
     /// must wait until one of `wait_set` arrives, or until `timeout` elapses.
     /// `rt_sigtimedwait` uses its caller-supplied timeout; `rt_sigsuspend` uses
@@ -1555,6 +1564,7 @@ impl DispatchOutcome {
             DispatchOutcome::WaitOnFdsSelect { .. } => (0, None),
             DispatchOutcome::WaitOnPollFds { .. } => (0, None),
             DispatchOutcome::WaitOnProcExit { .. } => (0, None),
+            DispatchOutcome::WaitOnProcState { .. } => (0, None),
             DispatchOutcome::WaitOnSignals { .. } => (0, None),
             DispatchOutcome::WaitOnSleep { .. } => (0, None),
         }
