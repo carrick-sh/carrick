@@ -774,11 +774,70 @@ fn run_native_thread_loop(
                 resume_guest_snapshot(&snapshot)?;
                 continue;
             }
-            {
+
+            let guarded = memory.lock().linux4k_address_is_guarded(fault_address);
+            if guarded {
                 let mut memory = memory.lock();
                 emulate_linux4k_guarded_fault(&mut memory, &mut snapshot)?;
+                drop(memory);
+                resume_guest_snapshot(&snapshot)?;
+                continue;
             }
-            resume_guest_snapshot(&snapshot)?;
+
+            let Some((mut signum, mut si_code, si_addr)) =
+                crate::vcpu_loop::lower_el0_fault(snapshot.esr, snapshot.pc, fault_address)
+            else {
+                native_die_by_signal(&dispatcher, crate::linux_abi::LINUX_SIGSEGV);
+            };
+            si_code = {
+                let memory = memory.lock();
+                crate::vcpu_loop::upgrade_prot_none_si_code(&*memory, signum, si_code, si_addr)
+            };
+            if signum == crate::linux_abi::LINUX_SIGSEGV
+                && let Some((grow_start, grow_len)) = dispatcher.mmap_growdown_fault_plan(si_addr)
+            {
+                let grew = memory
+                    .lock()
+                    .protect_range(
+                        grow_start,
+                        grow_len,
+                        crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_WRITE,
+                    )
+                    .is_ok();
+                if grew {
+                    dispatcher.commit_mmap_growdown(grow_start);
+                    resume_guest_snapshot(&snapshot)?;
+                    continue;
+                }
+            }
+            if signum == crate::linux_abi::LINUX_SIGSEGV && dispatcher.mmap_fault_is_sigbus(si_addr)
+            {
+                signum = crate::linux_abi::LINUX_SIGBUS;
+                si_code = 2; // BUS_ADRERR
+            }
+            let interrupted_pc = snapshot.pc;
+            let pc = {
+                let mut memory = memory.lock();
+                let mut trap = NativeSignalTrap::new(&mut memory, snapshot, None);
+                match crate::vcpu_loop::inject_fault_signal(
+                    &mut trap,
+                    &dispatcher,
+                    thread_runtime.tid(),
+                    signum,
+                    si_code,
+                    si_addr,
+                    Some(interrupted_pc),
+                )? {
+                    crate::vcpu_loop::FaultSignalDisposition::Injected => {}
+                    crate::vcpu_loop::FaultSignalDisposition::Terminate(signum) => {
+                        native_die_by_signal(&dispatcher, signum);
+                    }
+                }
+                let pc = trap.pc();
+                trap.commit();
+                pc
+            };
+            resume_guest_at(pc)?;
             continue;
         }
         if snapshot.signal != libc::SIGTRAP {

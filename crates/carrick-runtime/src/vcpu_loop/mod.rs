@@ -359,12 +359,13 @@ mod threads;
 // (`crate::runtime`, this module's own code) keep naming them as
 // `crate::vcpu_loop::X` / bare `X`.
 pub(crate) use quiesce::{fork_barrier, pt_barrier};
-// `lower_el0_fault` / `deliver_fault_signal`: only callers are in this module's
-// run-loop body. `pub(super)` in signal.rs limits them to vcpu_loop scope.
-use signal::{deliver_fault_signal, lower_el0_fault};
+// The threaded loop owns its backend-specific fault resolution. Native Darwin
+// reuses the architecture lowering and Linux signal-frame half below.
+use signal::deliver_fault_signal;
 pub(crate) use signal::{
-    deliver_pending_signal, partial_write_interrupt_outcome, raise_sigpipe_for_blocking_write,
-    signal_progress_count, signal_wait_expired, signal_wait_remaining, signal_wait_slice,
+    FaultSignalDisposition, deliver_pending_signal, inject_fault_signal, lower_el0_fault,
+    partial_write_interrupt_outcome, raise_sigpipe_for_blocking_write, signal_progress_count,
+    signal_wait_expired, signal_wait_remaining, signal_wait_slice, upgrade_prot_none_si_code,
 };
 // Test-only re-exports: the `tests` module below names these (via `use super::*`)
 // but no non-test in-crate caller does, so gate them to avoid an unused-import
