@@ -442,6 +442,15 @@ static void carrick_native_fatal_signal_handler(int sig, siginfo_t *info, void *
     _exit(128 + sig);
 }
 
+static int carrick_native_sanitize_transport_mask(sigset_t *mask) {
+    return sigdelset(mask, SIGTRAP) != 0 ||
+           sigdelset(mask, SIGSEGV) != 0 ||
+           sigdelset(mask, SIGBUS) != 0 ||
+           sigdelset(mask, SIGILL) != 0
+               ? -1
+               : 0;
+}
+
 static void carrick_native_trap_handler(int sig, siginfo_t *info, void *uap) {
     if ((sig != SIGTRAP && sig != SIGSEGV && sig != SIGBUS) ||
         !carrick_native_env_ready || uap == 0) {
@@ -464,12 +473,24 @@ static void carrick_native_trap_handler(int sig, siginfo_t *info, void *uap) {
     carrick_native_uc.uc_mcontext = &carrick_native_uc.__mcontext_data;
     carrick_native_pending_uc = uc;
     carrick_native_env_ready = 0;
+    // Rust dispatch runs before this signal handler returns, so restore the
+    // pre-trap host mask now while keeping Carrick's trap transport unblocked.
+    if (carrick_native_sanitize_transport_mask(&uc->uc_sigmask) != 0) {
+        _exit(128 + sig);
+    }
+    int mask_rc = pthread_sigmask(SIG_SETMASK, &uc->uc_sigmask, 0);
+    if (mask_rc != 0) {
+        _exit(128 + sig);
+    }
     if (sigsetjmp(carrick_native_return_env, 1) == 0) {
         siglongjmp(carrick_native_env, 1);
     }
 
     ucontext_t *pending = carrick_native_pending_uc;
     if (pending == 0 || pending->uc_mcontext == 0) {
+        _exit(128 + sig);
+    }
+    if (carrick_native_sanitize_transport_mask(&pending->uc_sigmask) != 0) {
         _exit(128 + sig);
     }
     carrick_native_copy_mcontext(
@@ -481,8 +502,28 @@ static void carrick_native_trap_handler(int sig, siginfo_t *info, void *uap) {
     }
 }
 
+int carrick_native_unblock_transport_signals(void) {
+    sigset_t transport;
+    if (sigemptyset(&transport) != 0 ||
+        sigaddset(&transport, SIGTRAP) != 0 ||
+        sigaddset(&transport, SIGSEGV) != 0 ||
+        sigaddset(&transport, SIGBUS) != 0 ||
+        sigaddset(&transport, SIGILL) != 0) {
+        return -1;
+    }
+    int rc = pthread_sigmask(SIG_UNBLOCK, &transport, 0);
+    if (rc != 0) {
+        errno = rc;
+        return -1;
+    }
+    return 0;
+}
+
 int carrick_native_install_trap_handler(void) {
     if (carrick_native_init_custom_x18() != 0) {
+        return -1;
+    }
+    if (carrick_native_unblock_transport_signals() != 0) {
         return -1;
     }
     carrick_native_host_tpidr_el0 = carrick_native_read_tpidr_el0();
