@@ -218,6 +218,36 @@ git commit -m "feat(native): execute Linux clone threads as pthreads" ...
 - Test: `conformance-probes/src/bin/xthreadsig.rs`
 - Test: `conformance-probes/src/bin/sigwaitthread.rs`
 
+**Grounding:**
+
+- HVF needed three distinct helpers, not one: `ThreadWaiter` plus targeted
+  self-pipes for threads parked in host waits (`90bc48e6`, `490b805e`),
+  `hv_vcpus_exit` for threads executing guest code (`393ceccc`), and a futex
+  notification for threads parked in `FUTEX_WAIT` (`21cce7cb`). Its signal
+  restore path also needed the C ABI shim added in `54cd04bd` to preserve SIMD
+  state correctly. Native Darwin must preserve those same ownership boundaries
+  while replacing only the in-guest kick primitive.
+- Apple documents `pthread_kill` as delivery to one specified pthread and
+  `SA_SIGINFO` as exposing that thread's `ucontext_t`; returning from the handler
+  resumes the saved context unless the handler arranges another context. The
+  handler must remain async-signal-safe and use an alternate signal stack.
+- Go's Darwin runtime is the closest production precedent. It uses a targeted
+  host signal for non-cooperative preemption, edits the interrupted arm64 PC/LR
+  to enter a trampoline, coalesces repeated requests behind one pending bit, and
+  acknowledges them with a generation. It also suppresses preemption signals
+  across `exec` after real Darwin failures and avoids sending duplicate pending
+  signals after a Darwin livelock report.
+
+Primary references:
+
+- https://developer.apple.com/documentation/hypervisor/exits
+- https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/pthread_kill.2.html
+- https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/sigaction.2.html
+- https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/sigaltstack.2.html
+- https://go.dev/src/runtime/signal_unix.go
+- https://go.dev/src/runtime/signal_arm64.go
+- https://github.com/golang/go/issues/41702
+
 **Interfaces:**
 - Reuses: `crate::io_wait::ThreadWaiter` and the existing process/per-thread
   wake pipes for fd, sleep, signal, and process-exit waits.
@@ -263,12 +293,28 @@ state, advances the generation, wakes the target waiter/futex, then
 `pthread_kill`s only the target. The handler may touch only TLS, lock-free
 atomics, the supplied ucontext, and the existing trap jump state.
 
+Coalesce host carriers: atomically change one per-thread `kick_pending` bit from
+clear to set and call `pthread_kill` only on that transition. The handler clears
+and acknowledges that request before returning to Rust. A later request advances
+the generation and may send one new carrier; a burst must never produce an
+unbounded host-signal stream. `SIGPIPE` deliberately differs from Go's `SIGURG`:
+Carrick already reserves host SIGPIPE from guest routing and synthesizes guest
+SIGPIPE, while guest Go programs actively use Linux SIGURG for async preemption.
+Add a host broken-pipe regression proving an ordinary EPIPE with no pending kick
+remains a no-op at the native handler.
+
 Block the carrier during host dispatch. Initial and detached entry must use a
 bootstrap signal-return path so publishing `kickable`, rechecking the
 generation, restoring the guest signal mask, and entering the guest have no
 lost-kick window. Child creation does not return the guest TID until pthread,
 waiter, C kick state, and lifecycle-registry publication are complete. Exit
 removes that one lifecycle entry before the pthread can terminate.
+
+Fork/exec transition code must disable new kicks, drain or invalidate the current
+generation, and only then replace handler or image state. No native carrier may
+survive into the new image. This is a correctness gate, not cleanup: Darwin has
+delivered a thread-directed preemption signal into a newly exec'd image in a
+real production runtime.
 
 - [ ] **Step 5: Deliver and resume**
 
