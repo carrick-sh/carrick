@@ -219,38 +219,76 @@ git commit -m "feat(native): execute Linux clone threads as pthreads" ...
 - Test: `conformance-probes/src/bin/sigwaitthread.rs`
 
 **Interfaces:**
-- Produces: a process-local `ThreadId -> pthread_t` native kick registry.
-- Produces: a targeted host trap that captures an arbitrary guest PC without
-  decoding it as a patched `brk` site.
+- Reuses: `crate::io_wait::ThreadWaiter` and the existing process/per-thread
+  wake pipes for fd, sleep, signal, and process-exit waits.
+- Reuses: `PlatformFutex::notify_signal_pending_for` for a targeted private
+  futex wake; do not also notify the underlying `FutexTable` directly.
+- Produces: `NativeKickHandle`, the native implementation of the shared
+  `VcpuKick` contract, plus lifecycle-atomic `ThreadId -> NativeKickHandle`
+  registration.
+- Produces: an explicit C native-event kind and per-thread kick generation;
+  ordinary patched `brk` traps and asynchronous kicks never share an
+  `si_code`-based classifier.
 
-- [ ] **Step 1: Verify red signal reducers**
+- [x] **Step 1: Verify red signal reducers**
 
 Run `xthreadsig` and `sigwaitthread` on both profiles. Expected: thread creation
 may succeed after Task 3, but delivery or wake still diverges.
 
-- [ ] **Step 2: Add targeted native kicks**
+- [x] **Step 2: Make the single-thread signal round trip green first**
 
-Register each host `pthread_t`. For `SignalThread`, validate registry liveness,
-publish the pending Linux signal, and `pthread_kill` only the target with the
-native kick signal. Teach the C handler and Rust loop to classify that signal as
-an interrupt trap whose resume PC is the captured PC.
+Remove the exploratory `SIGTRAP + si_code == 0` kick classifier. Add focused
+bridge tests for GPR, PSTATE, FPSIMD, SP, PC, and signal-mask restoration, then
+make `signals`, `siginfo`, `sigunblockpending`, and `sigreenter` pass on both
+profiles before introducing any cross-thread carrier. This proves the Darwin
+ucontext/sigreturn boundary independently of wake routing.
 
-- [ ] **Step 3: Deliver and resume**
+- [ ] **Step 3: Reuse the existing blocked-wait helper layer**
 
-At interrupt return, call `deliver_pending_signal` with the current guest TID,
-commit the resulting sigframe/registers, and resume. Notify private/platform
-futex waiters so blocked target threads observe pending signals without waiting
-for the 50 ms backstop.
+Give every `NativeThreadRuntime` a `ThreadWaiter`. Route fd and select waits
+through `wait_with_dispatch_pending`, process waits through
+`wait_proc_exit_with_dispatch_pending`, and pure signal/sleep waits through the
+same empty-fd path. Keep bounded slices only as a defensive backstop. A
+thread-directed publish wakes the existing per-thread pipe and calls only
+`PlatformFutex::notify_signal_pending_for`.
 
-- [ ] **Step 4: Verify green signal/thread clusters**
+- [ ] **Step 4: Add a transition-safe native kick handle**
+
+Use host `SIGPIPE` as the native-only carrier: Carrick already keeps host
+SIGPIPE out of guest routing and synthesizes Linux SIGPIPE on the syscall path.
+The C handler must preserve the current host-ignore behavior by returning
+immediately when no native kick generation is pending. Store a pointer to a
+lock-free per-thread generation/cookie in C TLS; the sender publishes pending
+state, advances the generation, wakes the target waiter/futex, then
+`pthread_kill`s only the target. The handler may touch only TLS, lock-free
+atomics, the supplied ucontext, and the existing trap jump state.
+
+Block the carrier during host dispatch. Initial and detached entry must use a
+bootstrap signal-return path so publishing `kickable`, rechecking the
+generation, restoring the guest signal mask, and entering the guest have no
+lost-kick window. Child creation does not return the guest TID until pthread,
+waiter, C kick state, and lifecycle-registry publication are complete. Exit
+removes that one lifecycle entry before the pthread can terminate.
+
+- [ ] **Step 5: Deliver and resume**
+
+At an explicit asynchronous-kick event, call `deliver_pending_signal` with the
+captured guest PC and current guest TID, commit the resulting sigframe/registers,
+and resume through the Darwin signal context. A carrier that arrives after a
+natural syscall/fault already consumed the generation is a harmless no-op.
+
+- [ ] **Step 6: Verify green signal/thread clusters**
 
 Run `xthreadsig`, `sigwaitthread`, `sigsuspendxthread`, `mtsigrelease`, and
-`preemptsigstorm` three times per profile. Expected: MATCH without global host
-signals or cross-thread context corruption.
+`preemptsigstorm` three times per profile. Add one long fd-wait reducer and one
+long nanosleep reducer so prompt targeted wakes cannot pass through the 50 ms
+backstop. Expected: MATCH without global guest-signal delivery, lost kicks, or
+cross-thread context corruption.
 
-- [ ] **Step 5: Commit signal routing**
+- [ ] **Step 7: Commit signal routing in logical slices**
 
 ```sh
+git commit -m "fix(native): restore Darwin signal contexts" ...
 git add crates/carrick-runtime/csrc/native_darwin.c crates/carrick-runtime/src/native_darwin.rs
 git commit -m "fix(native): route Linux signals to guest pthreads" ...
 ```
