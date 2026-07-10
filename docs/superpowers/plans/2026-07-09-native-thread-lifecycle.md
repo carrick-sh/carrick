@@ -115,27 +115,27 @@ git commit -m "fix(native): isolate trap state per host thread" ...
 - Changes: `dispatch_native_syscall` accepts `&SharedNativeMemory` and locks only
   around `dispatch_threaded` or an explicit memory mutation.
 
-- [ ] **Step 1: Capture the deadlock-sensitive red probes**
+- [x] **Step 1: Capture the deadlock-sensitive red probes**
 
-Run signed `native16k` `futexpingpong` and `epolloutxthread` through the bound
+Run signed `native16k` `futexextra` and `epolloutxthread` through the bound
 probe transport and retain their current `CloneThread` failures. These probes
 require one thread to block while another acquires guest memory and wakes it.
 
-- [ ] **Step 2: Introduce shared memory ownership**
+- [x] **Step 2: Introduce shared memory ownership**
 
 Wrap `NativeMappedMemory` in `Arc<parking_lot::Mutex<_>>` after image mapping.
 Change trap decode, guarded-fault emulation, `dc zva`, syscall dispatch, signal
 frame operations, fork, exec replacement, host aliases, and protection changes
 to take short scoped locks.
 
-- [ ] **Step 3: Keep waits outside the memory lock**
+- [x] **Step 3: Keep waits outside the memory lock**
 
 In `dispatch_native_syscall`, obtain the `DispatchOutcome` in one scoped lock,
 drop the guard, then execute `wait_native_fds`, `wait_native_signals`, futex
 waits, process waits, and sleeps. Reacquire only for timeout buffer clearing or
 remaining-time writes.
 
-- [ ] **Step 4: Verify single-thread regressions**
+- [x] **Step 4: Verify single-thread regressions**
 
 Run:
 
@@ -146,7 +146,7 @@ cargo test -p carrick-cli --test conformance native_conformance_ -- --test-threa
 
 Expected: all existing native reducers pass unchanged.
 
-- [ ] **Step 5: Commit the shared-memory boundary**
+- [x] **Step 5: Commit the shared-memory boundary**
 
 ```sh
 git add crates/carrick-runtime/src/native_darwin.rs
