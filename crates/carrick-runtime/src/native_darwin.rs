@@ -161,6 +161,7 @@ unsafe extern "C" {
     fn carrick_native_set_sp(sp: u64);
     fn carrick_native_set_register(index: u32, value: u64);
     fn carrick_native_set_vector(index: u32, value: *const u8);
+    fn carrick_native_set_processor_state(pstate: u64, fpsr: u32, fpcr: u32);
     fn carrick_native_clear_icache(start: *mut libc::c_void, len: usize);
     fn carrick_native_reset_resume_pads();
     fn carrick_native_register_resume_page(
@@ -1313,6 +1314,7 @@ impl<'a> NativeSignalTrap<'a> {
         unsafe {
             carrick_native_set_sp(self.regs.sp);
             carrick_native_set_pc(self.regs.pc);
+            carrick_native_set_processor_state(self.regs.pstate, self.regs.fpsr, self.regs.fpcr);
         }
     }
 }
@@ -1470,7 +1472,7 @@ impl SyscallTrap for NativeSignalTrap<'_> {
             pstate_source: self.regs.pstate & !0xf,
             orig_x0: self.orig_x0,
             fault_esr: 0,
-            fpsimd_enabled: false,
+            fpsimd_enabled: true,
             sigreturn_trampoline_base: NATIVE_DARWIN_SIGRETURN_TRAMPOLINE_BASE,
         };
         carrick_hal::sigframe::build_sigframe(self, params)?;
@@ -1482,7 +1484,7 @@ impl SyscallTrap for NativeSignalTrap<'_> {
     }
 
     fn restore_from_sigframe(&mut self) -> Result<u64, TrapError> {
-        let restored = carrick_hal::sigframe::restore_sigframe(self, false)?;
+        let restored = carrick_hal::sigframe::restore_sigframe(self, true)?;
         self.regs.pc = restored.saved_pc;
         Ok(restored.sigmask)
     }
@@ -4988,6 +4990,103 @@ mod tests {
         let main_after = snapshot_ucontext().expect("snapshot main native context");
         assert_eq!(child_context.x[0], 0x2222);
         assert_eq!(main_after.x[0], 0x1111);
+    }
+
+    #[test]
+    fn native_signal_commit_restores_processor_state() {
+        let initial = NativeUcontextSnapshot::default();
+        assert_eq!(unsafe { carrick_native_seed_ucontext(&initial) }, 0);
+
+        let mut restored = NativeUcontextSnapshot {
+            sp: 0x7000,
+            pc: 0x4000,
+            pstate: 0xa000_0000,
+            fpsr: 0x0800_0000,
+            fpcr: 0x0040_0000,
+            ..NativeUcontextSnapshot::default()
+        };
+        restored.x[0] = 0x1111;
+        restored.v[0] = 0x2222_u128.to_le_bytes();
+        let mut memory = NativeMappedMemory {
+            regions: Vec::new(),
+            resume_pad_arenas: Vec::new(),
+            protections: MemoryProtections::default(),
+            native_page_protections: BTreeMap::new(),
+            linux4k_page_protections: BTreeMap::new(),
+            exclusive_reservation: None,
+            host_page_size: 16 * 1024,
+            linux_page_size: 16 * 1024,
+        };
+        NativeSignalTrap::new(&mut memory, restored, None).commit();
+
+        let committed = snapshot_ucontext().expect("snapshot committed native context");
+        assert_eq!(committed.x[0], restored.x[0]);
+        assert_eq!(committed.sp, restored.sp);
+        assert_eq!(committed.pc, restored.pc);
+        assert_eq!(committed.pstate, restored.pstate);
+        assert_eq!(committed.v[0], restored.v[0]);
+        assert_eq!(committed.fpsr, restored.fpsr);
+        assert_eq!(committed.fpcr, restored.fpcr);
+    }
+
+    #[test]
+    fn native_signal_frame_restores_fpsimd_state() {
+        let mut stack = vec![0_u8; 16 * 1024];
+        let stack_start = stack.as_mut_ptr() as u64;
+        let stack_end = stack_start + stack.len() as u64;
+        let mut memory = NativeMappedMemory {
+            regions: vec![NativeMappedRegion {
+                start: stack_start,
+                end: stack_end,
+                host_protects: false,
+                shared_futex: false,
+                guest_writable: true,
+                default_prot: crate::linux_abi::LINUX_PROT_READ
+                    | crate::linux_abi::LINUX_PROT_WRITE,
+            }],
+            resume_pad_arenas: Vec::new(),
+            protections: MemoryProtections::default(),
+            native_page_protections: BTreeMap::new(),
+            linux4k_page_protections: BTreeMap::new(),
+            exclusive_reservation: None,
+            host_page_size: 16 * 1024,
+            linux_page_size: 16 * 1024,
+        };
+        let mut interrupted = NativeUcontextSnapshot {
+            sp: stack_end,
+            pc: 0x4000,
+            pstate: 0x6000_0000,
+            fpsr: 0x0800_0000,
+            fpcr: 0x0040_0000,
+            ..NativeUcontextSnapshot::default()
+        };
+        for (index, value) in interrupted.v.iter_mut().enumerate() {
+            *value = (0x1000_u128 + index as u128).to_le_bytes();
+        }
+
+        let mut trap = NativeSignalTrap::new(&mut memory, interrupted, None);
+        trap.inject_signal(
+            crate::linux_abi::LINUX_SIGUSR1,
+            0x5000,
+            0,
+            None,
+            Some(interrupted.pc),
+            None,
+            0,
+            None,
+            None,
+            false,
+        )
+        .expect("inject native signal frame");
+        trap.regs.v.fill(0xff_u128.to_le_bytes());
+        trap.regs.fpsr = 0;
+        trap.regs.fpcr = 0;
+
+        trap.restore_from_sigframe()
+            .expect("restore native signal frame");
+        assert_eq!(trap.regs.v, interrupted.v);
+        assert_eq!(trap.regs.fpsr, interrupted.fpsr);
+        assert_eq!(trap.regs.fpcr, interrupted.fpcr);
     }
 
     #[test]
