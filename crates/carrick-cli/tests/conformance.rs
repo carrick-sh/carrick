@@ -2623,10 +2623,21 @@ fn elf_file_type(path: &PathBuf) -> Option<u16> {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn run_native_run_elf(bin: &PathBuf, probe: &PathBuf, native_page_profile: &'static str) -> String {
+    run_native_run_elf_with_args(bin, probe, native_page_profile, &[])
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn run_native_run_elf_with_args(
+    bin: &PathBuf,
+    probe: &PathBuf,
+    native_page_profile: &'static str,
+    guest_args: &[&str],
+) -> String {
     use std::os::unix::process::CommandExt;
 
     let run_id = case_run_id();
-    let child = Command::new(bin)
+    let mut command = Command::new(bin);
+    command
         .args([
             "run-elf",
             "--raw",
@@ -2635,7 +2646,11 @@ fn run_native_run_elf(bin: &PathBuf, probe: &PathBuf, native_page_profile: &'sta
             "--native-page-profile",
             native_page_profile,
         ])
-        .arg(probe)
+        .arg(probe);
+    if !guest_args.is_empty() {
+        command.arg("--").args(guest_args);
+    }
+    let child = command
         .env("CARRICK_RUN_ID", &run_id)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -3565,6 +3580,49 @@ fn native_conformance_run_elf_rounds_sysv_shm_to_page_profile() {
             "native run-elf SysV shared-memory probe failed for profile {profile}:\n{out}"
         );
     }
+}
+
+#[test]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn native16k_conformance_waits_publish_sleeping_state() {
+    let _serial = CONFORMANCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let Some(bin) = carrick_bin() else {
+        eprintln!(
+            "SKIP native16k_conformance_waits_publish_sleeping_state: target/release/carrick not built"
+        );
+        return;
+    };
+    ensure_signed(&bin);
+
+    let procstat = run_native_run_elf(
+        &bin,
+        &ensure_native_static_pie_probe("procstatstate"),
+        "native16k",
+    );
+    assert!(
+        procstat.contains("status=exit status: 0")
+            && procstat.contains("child_state=S")
+            && procstat.contains("child_state_is_sleeping=true")
+            && procstat.contains("child_reaped=true"),
+        "native16k shared-futex wait did not publish sleeping state:\n{procstat}"
+    );
+
+    let pause = run_native_run_elf_with_args(
+        &bin,
+        &ensure_native_static_pie_probe("pauseinterrupt2"),
+        "native16k",
+        &["--report-state"],
+    );
+    assert!(
+        pause.contains("status=exit status: 0")
+            && pause.contains("child_state=S")
+            && pause.contains("child_sleeping=true")
+            && pause.contains("send_sigint_ok=true")
+            && pause.contains("child_exit_zero=true")
+            && pause.contains("child_not_signaled=true"),
+        "native16k signal wait did not publish sleeping state:\n{pause}"
+    );
 }
 
 #[test]
