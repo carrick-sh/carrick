@@ -2459,6 +2459,147 @@ fn emulate_linux4k_guarded_vector_access(
     Ok(())
 }
 
+fn exclusive_access_width(op: bad64::Op, transfer_reg: bad64::Reg) -> Option<usize> {
+    match op {
+        bad64::Op::LDAXRB | bad64::Op::LDXRB | bad64::Op::STLXRB | bad64::Op::STXRB => Some(1),
+        bad64::Op::LDAXRH | bad64::Op::LDXRH | bad64::Op::STLXRH | bad64::Op::STXRH => Some(2),
+        bad64::Op::LDAXR | bad64::Op::LDXR | bad64::Op::STLXR | bad64::Op::STXR => {
+            bad64_transfer_width(transfer_reg)
+        }
+        _ => None,
+    }
+}
+
+fn emulate_linux4k_guarded_exclusive_access(
+    memory: &mut NativeMappedMemory,
+    snapshot: &mut NativeUcontextSnapshot,
+    instruction: &bad64::Instruction,
+    fault_address: u64,
+) -> Result<(), RuntimeError> {
+    let load = matches!(
+        instruction.op(),
+        bad64::Op::LDAXR
+            | bad64::Op::LDAXRB
+            | bad64::Op::LDAXRH
+            | bad64::Op::LDXR
+            | bad64::Op::LDXRB
+            | bad64::Op::LDXRH
+    );
+    let acquire = matches!(
+        instruction.op(),
+        bad64::Op::LDAXR | bad64::Op::LDAXRB | bad64::Op::LDAXRH
+    );
+    let release = matches!(
+        instruction.op(),
+        bad64::Op::STLXR | bad64::Op::STLXRB | bad64::Op::STLXRH
+    );
+
+    let (status_reg, transfer_reg, memory_operand) = if load {
+        let [
+            bad64::Operand::Reg {
+                reg: transfer_reg,
+                arrspec: None,
+            },
+            memory_operand,
+        ] = instruction.operands()
+        else {
+            return Err(RuntimeError::Unsupported(format!(
+                "native linux4k exclusive load does not support operands for {instruction}"
+            )));
+        };
+        (None, *transfer_reg, *memory_operand)
+    } else {
+        let [
+            bad64::Operand::Reg {
+                reg: status_reg,
+                arrspec: None,
+            },
+            bad64::Operand::Reg {
+                reg: transfer_reg,
+                arrspec: None,
+            },
+            memory_operand,
+        ] = instruction.operands()
+        else {
+            return Err(RuntimeError::Unsupported(format!(
+                "native linux4k exclusive store does not support operands for {instruction}"
+            )));
+        };
+        (Some(*status_reg), *transfer_reg, *memory_operand)
+    };
+    let width = exclusive_access_width(instruction.op(), transfer_reg).ok_or_else(|| {
+        RuntimeError::Unsupported(format!(
+            "native linux4k exclusive access does not support width for {instruction}"
+        ))
+    })?;
+    let (address, writeback) =
+        decode_native_scalar_address(snapshot, memory_operand).ok_or_else(|| {
+            RuntimeError::Unsupported(format!(
+                "native linux4k exclusive access does not support addressing for {instruction}"
+            ))
+        })?;
+    if writeback.is_some() {
+        return Err(RuntimeError::Unsupported(format!(
+            "native linux4k exclusive access rejects writeback for {instruction}"
+        )));
+    }
+    let access_end = address.checked_add(width as u64).ok_or_else(|| {
+        RuntimeError::Unsupported("native linux4k exclusive access overflow".to_string())
+    })?;
+    if fault_address < address || fault_address >= access_end {
+        return Err(RuntimeError::Unsupported(format!(
+            "native linux4k guarded fault address 0x{fault_address:x} is outside {instruction} access 0x{address:x}..0x{access_end:x}"
+        )));
+    }
+    if !memory.linux4k_range_allows(address, width, !load) {
+        return Err(RuntimeError::Unsupported(format!(
+            "native linux4k guarded {instruction} violates guest permissions at 0x{address:x}"
+        )));
+    }
+
+    if load {
+        let value = memory
+            .exclusive_load(address, width, acquire)
+            .map_err(|error| {
+                RuntimeError::Unsupported(format!(
+                    "native linux4k exclusive load failed at 0x{address:x}: {error}"
+                ))
+            })?;
+        if !native_snapshot_write_reg(snapshot, transfer_reg, value) {
+            return Err(RuntimeError::Unsupported(format!(
+                "native linux4k exclusive load could not write {transfer_reg}"
+            )));
+        }
+    } else {
+        let value = native_snapshot_read_reg(snapshot, transfer_reg).ok_or_else(|| {
+            RuntimeError::Unsupported(format!(
+                "native linux4k exclusive store could not read {transfer_reg}"
+            ))
+        })?;
+        let stored = memory
+            .exclusive_store(address, width, value, release)
+            .map_err(|error| {
+                RuntimeError::Unsupported(format!(
+                    "native linux4k exclusive store failed at 0x{address:x}: {error}"
+                ))
+            })?;
+        let status_reg = status_reg.ok_or_else(|| {
+            RuntimeError::Unsupported(format!(
+                "native linux4k exclusive store lacks status register for {instruction}"
+            ))
+        })?;
+        if !native_snapshot_write_reg(snapshot, status_reg, u64::from(!stored)) {
+            return Err(RuntimeError::Unsupported(format!(
+                "native linux4k exclusive store could not write {status_reg}"
+            )));
+        }
+    }
+    snapshot.pc = snapshot.pc.checked_add(4).ok_or_else(|| {
+        RuntimeError::Unsupported("native linux4k exclusive PC overflow".to_string())
+    })?;
+    Ok(())
+}
+
 fn emulate_linux4k_guarded_fault(
     memory: &mut NativeMappedMemory,
     snapshot: &mut NativeUcontextSnapshot,
@@ -2490,6 +2631,28 @@ fn emulate_linux4k_guarded_fault(
                 snapshot.esr
             )
             .as_bytes(),
+        );
+    }
+    if matches!(
+        instruction.op(),
+        bad64::Op::LDAXR
+            | bad64::Op::LDAXRB
+            | bad64::Op::LDAXRH
+            | bad64::Op::LDXR
+            | bad64::Op::LDXRB
+            | bad64::Op::LDXRH
+            | bad64::Op::STLXR
+            | bad64::Op::STLXRB
+            | bad64::Op::STLXRH
+            | bad64::Op::STXR
+            | bad64::Op::STXRB
+            | bad64::Op::STXRH
+    ) {
+        return emulate_linux4k_guarded_exclusive_access(
+            memory,
+            snapshot,
+            &instruction,
+            fault_address,
         );
     }
     if matches!(instruction.op(), bad64::Op::LD1 | bad64::Op::ST1) {
@@ -2691,8 +2854,16 @@ struct NativeMappedMemory {
     protections: MemoryProtections,
     native_page_protections: BTreeMap<u64, u64>,
     linux4k_page_protections: BTreeMap<u64, [u64; 4]>,
+    exclusive_reservation: Option<NativeExclusiveReservation>,
     host_page_size: u64,
     linux_page_size: u64,
+}
+
+#[derive(Clone, Copy)]
+struct NativeExclusiveReservation {
+    address: u64,
+    width: usize,
+    observed: u64,
 }
 
 struct NativeMappedRegion {
@@ -2818,6 +2989,7 @@ impl NativeMappedMemory {
             protections: MemoryProtections::default(),
             native_page_protections: BTreeMap::new(),
             linux4k_page_protections: BTreeMap::new(),
+            exclusive_reservation: None,
             host_page_size,
             linux_page_size,
         })
@@ -3023,6 +3195,128 @@ impl NativeMappedMemory {
             cursor = next.min(end);
         }
         true
+    }
+
+    fn invalidate_exclusive_range(&mut self, address: u64, len: usize) {
+        let Some(reservation) = self.exclusive_reservation else {
+            return;
+        };
+        let Some(end) = address.checked_add(len as u64) else {
+            self.exclusive_reservation = None;
+            return;
+        };
+        let Some(reservation_end) = reservation.address.checked_add(reservation.width as u64)
+        else {
+            self.exclusive_reservation = None;
+            return;
+        };
+        if address < reservation_end && reservation.address < end {
+            self.exclusive_reservation = None;
+        }
+    }
+
+    fn exclusive_load(
+        &mut self,
+        address: u64,
+        width: usize,
+        acquire: bool,
+    ) -> Result<u64, MemoryError> {
+        if !address.is_multiple_of(width as u64) || !self.region_contains(address, width) {
+            return Err(MemoryError::OutOfBounds {
+                address,
+                length: width,
+            });
+        }
+        let changed = self.prepare_temporary_host_access(address, width, false)?;
+        let ptr = usize::try_from(address).map_err(|_| MemoryError::OutOfBounds {
+            address,
+            length: width,
+        })? as *mut u8;
+        let ordering = if acquire {
+            std::sync::atomic::Ordering::Acquire
+        } else {
+            std::sync::atomic::Ordering::Relaxed
+        };
+        let observed = unsafe {
+            match width {
+                1 => u64::from((&*ptr.cast::<std::sync::atomic::AtomicU8>()).load(ordering)),
+                2 => u64::from((&*ptr.cast::<std::sync::atomic::AtomicU16>()).load(ordering)),
+                4 => u64::from((&*ptr.cast::<std::sync::atomic::AtomicU32>()).load(ordering)),
+                8 => (&*ptr.cast::<std::sync::atomic::AtomicU64>()).load(ordering),
+                _ => return Err(MemoryError::Unsupported),
+            }
+        };
+        self.restore_temporary_host_access(&changed, address, width)?;
+        self.exclusive_reservation = Some(NativeExclusiveReservation {
+            address,
+            width,
+            observed,
+        });
+        Ok(observed)
+    }
+
+    fn exclusive_store(
+        &mut self,
+        address: u64,
+        width: usize,
+        value: u64,
+        release: bool,
+    ) -> Result<bool, MemoryError> {
+        let Some(reservation) = self.exclusive_reservation.take() else {
+            return Ok(false);
+        };
+        if reservation.address != address || reservation.width != width {
+            return Ok(false);
+        }
+        let changed = self.prepare_temporary_host_access(address, width, true)?;
+        let ptr = usize::try_from(address).map_err(|_| MemoryError::OutOfBounds {
+            address,
+            length: width,
+        })? as *mut u8;
+        let success = if release {
+            std::sync::atomic::Ordering::Release
+        } else {
+            std::sync::atomic::Ordering::Relaxed
+        };
+        let stored = unsafe {
+            match width {
+                1 => (&*ptr.cast::<std::sync::atomic::AtomicU8>())
+                    .compare_exchange(
+                        reservation.observed as u8,
+                        value as u8,
+                        success,
+                        std::sync::atomic::Ordering::Relaxed,
+                    )
+                    .is_ok(),
+                2 => (&*ptr.cast::<std::sync::atomic::AtomicU16>())
+                    .compare_exchange(
+                        reservation.observed as u16,
+                        value as u16,
+                        success,
+                        std::sync::atomic::Ordering::Relaxed,
+                    )
+                    .is_ok(),
+                4 => (&*ptr.cast::<std::sync::atomic::AtomicU32>())
+                    .compare_exchange(
+                        reservation.observed as u32,
+                        value as u32,
+                        success,
+                        std::sync::atomic::Ordering::Relaxed,
+                    )
+                    .is_ok(),
+                8 => (&*ptr.cast::<std::sync::atomic::AtomicU64>())
+                    .compare_exchange(
+                        reservation.observed,
+                        value,
+                        success,
+                        std::sync::atomic::Ordering::Relaxed,
+                    )
+                    .is_ok(),
+                _ => return Err(MemoryError::Unsupported),
+            }
+        };
+        self.restore_temporary_host_access(&changed, address, width)?;
+        Ok(stored)
     }
 
     fn linux4k_address_is_guarded(&self, address: u64) -> bool {
@@ -3529,6 +3823,7 @@ impl GuestMemory for NativeMappedMemory {
         if !self.region_contains(address, length) {
             return Err(MemoryError::OutOfBounds { address, length });
         }
+        self.invalidate_exclusive_range(address, length);
         let ptr = usize::try_from(address)
             .map_err(|_| MemoryError::OutOfBounds { address, length })?
             as *mut u8;
@@ -4592,6 +4887,116 @@ mod tests {
                     }
                     Ok(())
                 });
+            unsafe { libc::_exit(i32::from(emulated.is_err())) };
+        }
+
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFEXITED(status), "child status was 0x{status:x}");
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+    }
+
+    #[test]
+    fn native_linux4k_guard_emulates_exclusive_compare_exchange() {
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            let host_page_size = 16 * 1024_u64;
+            let linux_page_size = 4 * 1024_u64;
+            let layout = MemoryLayout {
+                heap_base: NATIVE_DARWIN_HEAP_BASE,
+                heap_size: host_page_size,
+                mmap_base: NATIVE_DARWIN_MMAP_BASE,
+                mmap_size: 2 * host_page_size,
+            };
+            let image = AddressSpace::from_regions(0, Vec::new())
+                .expect("empty native test image should be valid");
+            let emulated = NativeMappedMemory::map(&image, layout, host_page_size, linux_page_size)
+                .and_then(|mut memory| {
+                    let pc = layout.mmap_base;
+                    let address = layout.mmap_base + host_page_size + linux_page_size;
+                    memory
+                        .write_bytes_unchecked(pc, &0x885f_fc40_u32.to_le_bytes())
+                        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+                    memory
+                        .protect_range(
+                            pc,
+                            host_page_size as usize,
+                            crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_EXEC,
+                        )
+                        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+                    memory
+                        .protect_range(
+                            address,
+                            linux_page_size as usize,
+                            crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_WRITE,
+                        )
+                        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+                    memory
+                        .write_bytes_unchecked(address, &7_u32.to_le_bytes())
+                        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+
+                    let mut snapshot = NativeUcontextSnapshot {
+                        pc,
+                        signal: libc::SIGBUS,
+                        fault_address: address,
+                        ..NativeUcontextSnapshot::default()
+                    };
+                    snapshot.x[2] = address;
+                    emulate_linux4k_guarded_fault(&mut memory, &mut snapshot)?;
+                    if snapshot.x[0] != 7 || snapshot.pc != pc + 4 {
+                        return Err(RuntimeError::Unsupported(format!(
+                            "emulated ldaxr produced x0={} pc=0x{:x}",
+                            snapshot.x[0], snapshot.pc
+                        )));
+                    }
+
+                    memory
+                        .write_bytes_unchecked(pc, &0x8803_fc44_u32.to_le_bytes())
+                        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+                    snapshot.pc = pc;
+                    snapshot.x[4] = 9;
+                    emulate_linux4k_guarded_fault(&mut memory, &mut snapshot)?;
+                    let stored = memory
+                        .read_bytes_raw(address, std::mem::size_of::<u32>())
+                        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+                    if snapshot.x[3] != 0 || stored != 9_u32.to_le_bytes() || snapshot.pc != pc + 4
+                    {
+                        return Err(RuntimeError::Unsupported(format!(
+                            "emulated stlxr produced status={} bytes={stored:02x?} pc=0x{:x}",
+                            snapshot.x[3], snapshot.pc
+                        )));
+                    }
+
+                    memory
+                        .write_bytes_unchecked(pc, &0x885f_fc40_u32.to_le_bytes())
+                        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+                    snapshot.pc = pc;
+                    emulate_linux4k_guarded_fault(&mut memory, &mut snapshot)?;
+                    memory
+                        .write_bytes_unchecked(address, &11_u32.to_le_bytes())
+                        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+                    memory
+                        .write_bytes_unchecked(pc, &0x8803_fc44_u32.to_le_bytes())
+                        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+                    snapshot.pc = pc;
+                    snapshot.x[4] = 13;
+                    emulate_linux4k_guarded_fault(&mut memory, &mut snapshot)?;
+                    let stored = memory
+                        .read_bytes_raw(address, std::mem::size_of::<u32>())
+                        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+                    if snapshot.x[3] != 1 || stored != 11_u32.to_le_bytes() || snapshot.pc != pc + 4
+                    {
+                        return Err(RuntimeError::Unsupported(format!(
+                            "invalidated stlxr produced status={} bytes={stored:02x?} pc=0x{:x}",
+                            snapshot.x[3], snapshot.pc
+                        )));
+                    }
+                    Ok(())
+                });
+            if let Err(error) = &emulated {
+                child_write_stderr(format!("exclusive emulation test: {error}\n").as_bytes());
+            }
             unsafe { libc::_exit(i32::from(emulated.is_err())) };
         }
 
