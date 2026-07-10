@@ -3267,6 +3267,104 @@ fn emulate_linux4k_guarded_atomic_add(
     Ok(())
 }
 
+fn ordered_atomic_access_width(op: bad64::Op, transfer_reg: bad64::Reg) -> Option<usize> {
+    match op {
+        bad64::Op::LDARB | bad64::Op::LDAPRB | bad64::Op::STLRB | bad64::Op::STLLRB => Some(1),
+        bad64::Op::LDARH | bad64::Op::LDAPRH | bad64::Op::STLRH | bad64::Op::STLLRH => Some(2),
+        bad64::Op::LDAR | bad64::Op::LDAPR | bad64::Op::STLR | bad64::Op::STLLR => {
+            bad64_transfer_width(transfer_reg)
+        }
+        _ => None,
+    }
+}
+
+fn emulate_linux4k_guarded_ordered_atomic_access(
+    memory: &mut NativeMappedMemory,
+    snapshot: &mut NativeUcontextSnapshot,
+    instruction: &bad64::Instruction,
+    fault_address: u64,
+) -> Result<(), RuntimeError> {
+    let [
+        bad64::Operand::Reg {
+            reg: transfer_reg,
+            arrspec: None,
+        },
+        memory_operand,
+    ] = instruction.operands()
+    else {
+        return Err(RuntimeError::Unsupported(format!(
+            "native linux4k ordered atomic access does not support operands for {instruction}"
+        )));
+    };
+    let load = matches!(
+        instruction.op(),
+        bad64::Op::LDAR
+            | bad64::Op::LDARB
+            | bad64::Op::LDARH
+            | bad64::Op::LDAPR
+            | bad64::Op::LDAPRB
+            | bad64::Op::LDAPRH
+    );
+    let width = ordered_atomic_access_width(instruction.op(), *transfer_reg).ok_or_else(|| {
+        RuntimeError::Unsupported(format!(
+            "native linux4k ordered atomic access does not support width for {instruction}"
+        ))
+    })?;
+    let (address, writeback) =
+        decode_native_scalar_address(snapshot, *memory_operand).ok_or_else(|| {
+            RuntimeError::Unsupported(format!(
+                "native linux4k ordered atomic access does not support addressing for {instruction}"
+            ))
+        })?;
+    if writeback.is_some() {
+        return Err(RuntimeError::Unsupported(format!(
+            "native linux4k ordered atomic access rejects writeback for {instruction}"
+        )));
+    }
+    let access_end = address.checked_add(width as u64).ok_or_else(|| {
+        RuntimeError::Unsupported("native linux4k ordered atomic access overflow".to_string())
+    })?;
+    if fault_address < address || fault_address >= access_end {
+        return Err(RuntimeError::Unsupported(format!(
+            "native linux4k guarded fault address 0x{fault_address:x} is outside {instruction} access 0x{address:x}..0x{access_end:x}"
+        )));
+    }
+    if !memory.linux4k_range_allows(address, width, !load) {
+        return Err(RuntimeError::Unsupported(format!(
+            "native linux4k guarded {instruction} violates guest permissions at 0x{address:x}"
+        )));
+    }
+    if load {
+        let value = memory.atomic_load(address, width).map_err(|error| {
+            RuntimeError::Unsupported(format!(
+                "native linux4k ordered atomic load failed at 0x{address:x}: {error}"
+            ))
+        })?;
+        if !native_snapshot_write_reg(snapshot, *transfer_reg, value) {
+            return Err(RuntimeError::Unsupported(format!(
+                "native linux4k ordered atomic load could not write {transfer_reg}"
+            )));
+        }
+    } else {
+        let value = native_snapshot_read_reg(snapshot, *transfer_reg).ok_or_else(|| {
+            RuntimeError::Unsupported(format!(
+                "native linux4k ordered atomic store could not read {transfer_reg}"
+            ))
+        })?;
+        memory
+            .atomic_store(address, width, value)
+            .map_err(|error| {
+                RuntimeError::Unsupported(format!(
+                    "native linux4k ordered atomic store failed at 0x{address:x}: {error}"
+                ))
+            })?;
+    }
+    snapshot.pc = snapshot.pc.checked_add(4).ok_or_else(|| {
+        RuntimeError::Unsupported("native linux4k ordered atomic PC overflow".to_string())
+    })?;
+    Ok(())
+}
+
 fn exclusive_access_width(op: bad64::Op, transfer_reg: bad64::Reg) -> Option<usize> {
     match op {
         bad64::Op::LDAXRB | bad64::Op::LDXRB | bad64::Op::STLXRB | bad64::Op::STXRB => Some(1),
@@ -3464,6 +3562,28 @@ fn emulate_linux4k_guarded_fault(
             | bad64::Op::LDADDLH
     ) {
         return emulate_linux4k_guarded_atomic_add(memory, snapshot, &instruction, fault_address);
+    }
+    if matches!(
+        instruction.op(),
+        bad64::Op::LDAR
+            | bad64::Op::LDARB
+            | bad64::Op::LDARH
+            | bad64::Op::LDAPR
+            | bad64::Op::LDAPRB
+            | bad64::Op::LDAPRH
+            | bad64::Op::STLR
+            | bad64::Op::STLRB
+            | bad64::Op::STLRH
+            | bad64::Op::STLLR
+            | bad64::Op::STLLRB
+            | bad64::Op::STLLRH
+    ) {
+        return emulate_linux4k_guarded_ordered_atomic_access(
+            memory,
+            snapshot,
+            &instruction,
+            fault_address,
+        );
     }
     if matches!(
         instruction.op(),
@@ -4054,6 +4174,74 @@ impl NativeMappedMemory {
         if address < reservation_end && reservation.address < end {
             self.exclusive_reservation = None;
         }
+    }
+
+    fn atomic_load(&self, address: u64, width: usize) -> Result<u64, MemoryError> {
+        if !matches!(width, 1 | 2 | 4 | 8)
+            || !address.is_multiple_of(width as u64)
+            || !self.region_contains(address, width)
+        {
+            return Err(MemoryError::OutOfBounds {
+                address,
+                length: width,
+            });
+        }
+        let ptr = usize::try_from(address).map_err(|_| MemoryError::OutOfBounds {
+            address,
+            length: width,
+        })? as *mut u8;
+        let changed = self.prepare_temporary_host_access(address, width, false)?;
+        let observed = unsafe {
+            match width {
+                1 => u64::from(
+                    (&*ptr.cast::<std::sync::atomic::AtomicU8>())
+                        .load(std::sync::atomic::Ordering::Acquire),
+                ),
+                2 => u64::from(
+                    (&*ptr.cast::<std::sync::atomic::AtomicU16>())
+                        .load(std::sync::atomic::Ordering::Acquire),
+                ),
+                4 => u64::from(
+                    (&*ptr.cast::<std::sync::atomic::AtomicU32>())
+                        .load(std::sync::atomic::Ordering::Acquire),
+                ),
+                _ => (&*ptr.cast::<std::sync::atomic::AtomicU64>())
+                    .load(std::sync::atomic::Ordering::Acquire),
+            }
+        };
+        self.restore_temporary_host_access(&changed, address, width)?;
+        Ok(observed)
+    }
+
+    fn atomic_store(&mut self, address: u64, width: usize, value: u64) -> Result<(), MemoryError> {
+        if !matches!(width, 1 | 2 | 4 | 8)
+            || !address.is_multiple_of(width as u64)
+            || !self.region_contains(address, width)
+        {
+            return Err(MemoryError::OutOfBounds {
+                address,
+                length: width,
+            });
+        }
+        let ptr = usize::try_from(address).map_err(|_| MemoryError::OutOfBounds {
+            address,
+            length: width,
+        })? as *mut u8;
+        self.invalidate_exclusive_range(address, width);
+        let changed = self.prepare_temporary_host_access(address, width, true)?;
+        unsafe {
+            match width {
+                1 => (&*ptr.cast::<std::sync::atomic::AtomicU8>())
+                    .store(value as u8, std::sync::atomic::Ordering::Release),
+                2 => (&*ptr.cast::<std::sync::atomic::AtomicU16>())
+                    .store(value as u16, std::sync::atomic::Ordering::Release),
+                4 => (&*ptr.cast::<std::sync::atomic::AtomicU32>())
+                    .store(value as u32, std::sync::atomic::Ordering::Release),
+                _ => (&*ptr.cast::<std::sync::atomic::AtomicU64>())
+                    .store(value, std::sync::atomic::Ordering::Release),
+            }
+        }
+        self.restore_temporary_host_access(&changed, address, width)
     }
 
     fn atomic_fetch_add(
@@ -6237,6 +6425,23 @@ mod tests {
                     {
                         return Err(RuntimeError::Unsupported(format!(
                             "emulated ldadd produced old={} bytes={stored:02x?} pc=0x{:x}",
+                            snapshot.x[0], snapshot.pc
+                        )));
+                    }
+
+                    memory
+                        .write_bytes_unchecked(pc, &0x88df_fc20_u32.to_le_bytes())
+                        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+                    memory
+                        .write_bytes_unchecked(address, &17_u32.to_le_bytes())
+                        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+                    snapshot.pc = pc;
+                    snapshot.x[0] = 0;
+                    snapshot.fault_address = address;
+                    emulate_linux4k_guarded_fault(&mut memory, &mut snapshot)?;
+                    if snapshot.x[0] != 17 || snapshot.pc != pc + 4 {
+                        return Err(RuntimeError::Unsupported(format!(
+                            "emulated ldar produced value={} pc=0x{:x}",
                             snapshot.x[0], snapshot.pc
                         )));
                     }
