@@ -16,6 +16,23 @@ fn process_wait_test_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+#[cfg(target_os = "macos")]
+struct ForkedChild(i32);
+
+#[cfg(target_os = "macos")]
+impl Drop for ForkedChild {
+    fn drop(&mut self) {
+        unsafe {
+            let mut status = 0;
+            if libc::waitpid(self.0, &mut status, libc::WNOHANG) == 0 {
+                libc::kill(self.0, libc::SIGKILL);
+                libc::waitpid(self.0, &mut status, 0);
+            }
+        }
+        carrick_runtime::guest_cpu::reap_child_guest_ns(self.0 as u32);
+    }
+}
+
 #[test]
 fn exit_syscall_requests_process_exit() {
     let mut memory = LinearMemory::new(0x4000, Vec::new());
@@ -558,6 +575,596 @@ fn waitid_wexited_ignores_stopped_child() {
             )),
         }
     );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn native_waitid_translates_and_controls_virtual_ptrace_stop() {
+    let _guard = process_wait_test_lock();
+    const LINUX_P_PID: u64 = 1;
+    const LINUX_WNOHANG: u64 = 1;
+    const LINUX_WSTOPPED: u64 = 2;
+    const LINUX_WEXITED: u64 = 4;
+    const LINUX_WCONTINUED: u64 = 8;
+    const LINUX_WNOWAIT: u64 = 0x0100_0000;
+    const LINUX_SIGUSR2: i32 = 12;
+    const LINUX_CLD_TRAPPED: i32 = 4;
+    const INFO_ADDR: u64 = 0x4000;
+
+    carrick_runtime::guest_cpu::init_child_table();
+    let tracer_pid = std::process::id();
+    let prepared =
+        carrick_runtime::guest_cpu::prepare_child_record_pre_fork(tracer_pid, 0, 0, false, 0)
+            .expect("prepare virtual-ptrace child record");
+    let child = unsafe { libc::fork() };
+    assert!(child >= 0, "fork failed");
+    if child == 0 {
+        carrick_runtime::guest_cpu::complete_child_record_post_fork_child();
+        let ready = carrick_runtime::guest_cpu::register_self_virtual_ptrace(tracer_pid)
+            && carrick_runtime::guest_cpu::request_self_virtual_ptrace_stop(LINUX_SIGUSR2);
+        if !ready {
+            unsafe { libc::_exit(70) };
+        }
+        unsafe {
+            libc::raise(libc::SIGSTOP);
+            libc::_exit(0);
+        }
+    }
+    let child_guard = ForkedChild(child);
+    carrick_runtime::guest_cpu::publish_prepared_child_record_parent_ref(prepared, child as u32);
+
+    let geometry = carrick_runtime::page_profile::PageGeometry {
+        host_page_size: 16 * 1024,
+        linux_page_size: 16 * 1024,
+        native_profile: Some(carrick_spec::NativePageProfile::Native16k),
+    };
+    let mut memory = LinearMemory::new(INFO_ADDR, vec![0; 0x100]);
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::with_page_geometry(geometry);
+
+    let mut host_stop_ready = false;
+    for _ in 0..100 {
+        let mut host_info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    child as libc::id_t,
+                    &mut host_info,
+                    libc::WSTOPPED | libc::WNOWAIT | libc::WNOHANG,
+                )
+            },
+            0,
+        );
+        if host_info.si_pid == child {
+            host_stop_ready = true;
+            break;
+        }
+        unsafe { libc::usleep(10_000) };
+    }
+    assert!(host_stop_ready, "host carrier stop did not become waitable");
+    memory.write_bytes(INFO_ADDR, &[0xff; 28]).unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    95,
+                    SyscallArgs::from([
+                        LINUX_P_PID,
+                        child as u64,
+                        INFO_ADDR,
+                        LINUX_WEXITED | LINUX_WNOHANG,
+                        0,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 },
+    );
+    assert_eq!(memory.read_bytes(INFO_ADDR, 28).unwrap(), vec![0; 28]);
+
+    let mut observed = false;
+    for _ in 0..100 {
+        let outcome = dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    95,
+                    SyscallArgs::from([
+                        LINUX_P_PID,
+                        child as u64,
+                        INFO_ADDR,
+                        LINUX_WSTOPPED | LINUX_WNOHANG | LINUX_WNOWAIT,
+                        0,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap();
+        assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
+        let bytes = memory.read_bytes(INFO_ADDR, 28).unwrap();
+        let si_pid = i32::from_ne_bytes(bytes[16..20].try_into().unwrap());
+        if si_pid == child {
+            let si_code = i32::from_ne_bytes(bytes[8..12].try_into().unwrap());
+            let si_status = i32::from_ne_bytes(bytes[24..28].try_into().unwrap());
+            assert_eq!(si_code, LINUX_CLD_TRAPPED);
+            assert_eq!(si_status, LINUX_SIGUSR2);
+            observed = true;
+            break;
+        }
+        unsafe { libc::usleep(10_000) };
+    }
+    assert!(observed, "virtual ptrace stop was not reported");
+
+    memory.write_bytes(INFO_ADDR, &[0; 28]).unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    95,
+                    SyscallArgs::from([
+                        LINUX_P_PID,
+                        child as u64,
+                        INFO_ADDR,
+                        LINUX_WSTOPPED | LINUX_WNOHANG,
+                        0,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 },
+    );
+    let consumed = memory.read_bytes(INFO_ADDR, 28).unwrap();
+    assert_eq!(
+        i32::from_ne_bytes(consumed[8..12].try_into().unwrap()),
+        LINUX_CLD_TRAPPED,
+    );
+    assert_eq!(
+        i32::from_ne_bytes(consumed[16..20].try_into().unwrap()),
+        child,
+    );
+    assert_eq!(
+        i32::from_ne_bytes(consumed[24..28].try_into().unwrap()),
+        LINUX_SIGUSR2,
+    );
+
+    memory.write_bytes(INFO_ADDR, &[0xff; 28]).unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    95,
+                    SyscallArgs::from([
+                        LINUX_P_PID,
+                        child as u64,
+                        INFO_ADDR,
+                        LINUX_WSTOPPED | LINUX_WNOHANG,
+                        0,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 },
+    );
+    assert_eq!(memory.read_bytes(INFO_ADDR, 28).unwrap(), vec![0; 28]);
+
+    let continued_waitid = dispatcher
+        .dispatch(
+            SyscallRequest::new(
+                95,
+                SyscallArgs::from([LINUX_P_PID, child as u64, 0, LINUX_WCONTINUED, 0, 0]),
+            ),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+    assert!(matches!(
+        continued_waitid,
+        DispatchOutcome::WaitOnProcState { pid, .. } if pid == child
+    ));
+    let continued_wait4 = dispatcher
+        .dispatch(
+            SyscallRequest::new(
+                260,
+                SyscallArgs::from([child as u64, 0, LINUX_WCONTINUED, 0, 0, 0]),
+            ),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+    assert!(matches!(
+        continued_wait4,
+        DispatchOutcome::WaitOnProcState { pid, .. } if pid == child
+    ));
+
+    let prepared_sibling =
+        carrick_runtime::guest_cpu::prepare_child_record_pre_fork(tracer_pid, 0, 0, false, 0)
+            .expect("prepare sibling child record");
+    let sibling = unsafe { libc::fork() };
+    assert!(sibling >= 0, "sibling fork failed");
+    if sibling == 0 {
+        carrick_runtime::guest_cpu::complete_child_record_post_fork_child();
+        unsafe { libc::_exit(23) };
+    }
+    let sibling_guard = ForkedChild(sibling);
+    carrick_runtime::guest_cpu::publish_prepared_child_record_parent_ref(
+        prepared_sibling,
+        sibling as u32,
+    );
+    let mut sibling_ready = false;
+    for _ in 0..100 {
+        let mut sibling_info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    sibling as libc::id_t,
+                    &mut sibling_info,
+                    libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+                )
+            },
+            0,
+        );
+        if sibling_info.si_pid == sibling {
+            sibling_ready = true;
+            break;
+        }
+        unsafe { libc::usleep(10_000) };
+    }
+    assert!(sibling_ready, "sibling did not become waitable");
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    260,
+                    SyscallArgs::from([u64::MAX, 0, LINUX_WNOHANG, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned {
+            value: sibling as i64,
+        },
+    );
+    std::mem::forget(sibling_guard);
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(117, SyscallArgs::from([7, child as u64, 0, 0, 0, 0]),),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 },
+    );
+
+    std::mem::forget(child_guard);
+    let mut status = 0;
+    assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+    assert!(libc::WIFEXITED(status));
+    assert_eq!(libc::WEXITSTATUS(status), 0);
+    carrick_runtime::guest_cpu::reap_child_guest_ns(child as u32);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn native_ptrace_wait_without_wuntraced_uses_state_readiness() {
+    let _guard = process_wait_test_lock();
+    carrick_runtime::guest_cpu::init_child_table();
+    let tracer_pid = std::process::id();
+    let prepared =
+        carrick_runtime::guest_cpu::prepare_child_record_pre_fork(tracer_pid, 0, 0, false, 0)
+            .expect("prepare virtual-ptrace child record");
+    let child = unsafe { libc::fork() };
+    assert!(child >= 0, "fork failed");
+    if child == 0 {
+        carrick_runtime::guest_cpu::complete_child_record_post_fork_child();
+        let ready = carrick_runtime::guest_cpu::register_self_virtual_ptrace(tracer_pid)
+            && carrick_runtime::guest_cpu::request_self_virtual_ptrace_stop(12);
+        if !ready {
+            unsafe { libc::_exit(70) };
+        }
+        loop {
+            unsafe { libc::pause() };
+        }
+    }
+    carrick_runtime::guest_cpu::publish_prepared_child_record_parent_ref(prepared, child as u32);
+    let _child_guard = ForkedChild(child);
+
+    let mut requested = false;
+    for _ in 0..100 {
+        if carrick_runtime::guest_cpu::child_virtual_ptrace_stop_requested(child as u32) {
+            requested = true;
+            break;
+        }
+        unsafe { libc::usleep(10_000) };
+    }
+    assert!(requested, "virtual ptrace stop was not requested");
+
+    let geometry = carrick_runtime::page_profile::PageGeometry {
+        host_page_size: 16 * 1024,
+        linux_page_size: 16 * 1024,
+        native_profile: Some(carrick_spec::NativePageProfile::Native16k),
+    };
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x100]);
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::with_page_geometry(geometry);
+    let outcome = dispatcher
+        .dispatch(
+            SyscallRequest::new(260, SyscallArgs::from([child as u64, 0, 0, 0, 0, 0])),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+
+    assert!(matches!(
+        outcome,
+        DispatchOutcome::WaitOnProcState { pid, .. } if pid == child
+    ));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn native_broad_waitid_skips_unrequested_stop_for_exited_sibling() {
+    let _guard = process_wait_test_lock();
+    const LINUX_P_ALL: u64 = 0;
+    const LINUX_P_PGID: u64 = 2;
+    const LINUX_WNOHANG: u64 = 1;
+    const LINUX_WEXITED: u64 = 4;
+    const LINUX_WNOWAIT: u64 = 0x0100_0000;
+    const INFO_ADDR: u64 = 0x4000;
+
+    carrick_runtime::guest_cpu::init_child_table();
+    let parent = std::process::id();
+    let stopped_record =
+        carrick_runtime::guest_cpu::prepare_child_record_pre_fork(parent, 0, 0, false, 0)
+            .expect("prepare stopped child record");
+    let stopped = unsafe { libc::fork() };
+    assert!(stopped >= 0, "fork failed");
+    if stopped == 0 {
+        carrick_runtime::guest_cpu::complete_child_record_post_fork_child();
+        loop {
+            unsafe { libc::pause() };
+        }
+    }
+    carrick_runtime::guest_cpu::publish_prepared_child_record_parent_ref(
+        stopped_record,
+        stopped as u32,
+    );
+    let _stopped_guard = ForkedChild(stopped);
+    unsafe {
+        assert_eq!(libc::kill(stopped, libc::SIGSTOP), 0);
+    }
+    let mut stopped_info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    for _ in 0..100 {
+        assert_eq!(
+            unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    stopped as libc::id_t,
+                    &mut stopped_info,
+                    libc::WSTOPPED | libc::WNOWAIT | libc::WNOHANG,
+                )
+            },
+            0,
+        );
+        if stopped_info.si_pid == stopped {
+            break;
+        }
+        unsafe { libc::usleep(10_000) };
+    }
+    assert_eq!(stopped_info.si_pid, stopped, "child did not stop");
+
+    let exited_record =
+        carrick_runtime::guest_cpu::prepare_child_record_pre_fork(parent, 0, 0, false, 0)
+            .expect("prepare exited child record");
+    let exited = unsafe { libc::fork() };
+    assert!(exited >= 0, "fork failed");
+    if exited == 0 {
+        carrick_runtime::guest_cpu::complete_child_record_post_fork_child();
+        unsafe { libc::_exit(23) };
+    }
+    carrick_runtime::guest_cpu::publish_prepared_child_record_parent_ref(
+        exited_record,
+        exited as u32,
+    );
+    let _exited_guard = ForkedChild(exited);
+    let mut exited_info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    for _ in 0..100 {
+        assert_eq!(
+            unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    exited as libc::id_t,
+                    &mut exited_info,
+                    libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+                )
+            },
+            0,
+        );
+        if exited_info.si_pid == exited {
+            break;
+        }
+        unsafe { libc::usleep(10_000) };
+    }
+    assert_eq!(exited_info.si_pid, exited, "sibling did not exit");
+
+    let geometry = carrick_runtime::page_profile::PageGeometry {
+        host_page_size: 16 * 1024,
+        linux_page_size: 16 * 1024,
+        native_profile: Some(carrick_spec::NativePageProfile::Native16k),
+    };
+    let mut memory = LinearMemory::new(INFO_ADDR, vec![0; 0x100]);
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::with_page_geometry(geometry);
+    for idtype in [LINUX_P_ALL, LINUX_P_PGID].into_iter().cycle().take(16) {
+        memory.write_bytes(INFO_ADDR, &[0; 28]).unwrap();
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    SyscallRequest::new(
+                        95,
+                        SyscallArgs::from([
+                            idtype,
+                            0,
+                            INFO_ADDR,
+                            LINUX_WEXITED | LINUX_WNOHANG | LINUX_WNOWAIT,
+                            0,
+                            0,
+                        ]),
+                    ),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+            DispatchOutcome::Returned { value: 0 },
+        );
+        let bytes = memory.read_bytes(INFO_ADDR, 28).unwrap();
+        assert_eq!(
+            i32::from_ne_bytes(bytes[16..20].try_into().unwrap()),
+            exited,
+            "broad waitid must not starve behind the stopped child",
+        );
+        assert_eq!(i32::from_ne_bytes(bytes[24..28].try_into().unwrap()), 23,);
+    }
+
+    let mut still_stopped: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    assert_eq!(
+        unsafe {
+            libc::waitid(
+                libc::P_PID,
+                stopped as libc::id_t,
+                &mut still_stopped,
+                libc::WSTOPPED | libc::WNOWAIT | libc::WNOHANG,
+            )
+        },
+        0,
+    );
+    assert_eq!(
+        still_stopped.si_pid, stopped,
+        "skipped stop must remain waitable"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn native_process_group_waits_park_without_blocking_in_host_wait() {
+    let _guard = process_wait_test_lock();
+    carrick_runtime::guest_cpu::init_child_table();
+    let prepared = carrick_runtime::guest_cpu::prepare_child_record_pre_fork(
+        std::process::id(),
+        0,
+        0,
+        false,
+        0,
+    )
+    .expect("prepare native wait child record");
+    let child = unsafe { libc::fork() };
+    assert!(child >= 0, "fork failed");
+    if child == 0 {
+        carrick_runtime::guest_cpu::complete_child_record_post_fork_child();
+        unsafe {
+            libc::usleep(200_000);
+            libc::_exit(0);
+        }
+    }
+    carrick_runtime::guest_cpu::publish_prepared_child_record_parent_ref(prepared, child as u32);
+    let _child_guard = ForkedChild(child);
+
+    let geometry = carrick_runtime::page_profile::PageGeometry {
+        host_page_size: 16 * 1024,
+        linux_page_size: 16 * 1024,
+        native_profile: Some(carrick_spec::NativePageProfile::Native16k),
+    };
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x100]);
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::with_page_geometry(geometry);
+
+    let outcome = dispatcher
+        .dispatch(
+            SyscallRequest::new(260, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+
+    assert!(matches!(
+        outcome,
+        DispatchOutcome::WaitOnProcExit { pid: -1, .. }
+    ));
+
+    let waitid_outcome = dispatcher
+        .dispatch(
+            SyscallRequest::new(95, SyscallArgs::from([2, 0, 0, 4, 0, 0])),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+    assert!(
+        matches!(
+            waitid_outcome,
+            DispatchOutcome::WaitOnProcExit { pid: -1, .. }
+        ),
+        "unexpected waitid outcome: {waitid_outcome:?}"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn native_untraced_wait_uses_child_state_readiness() {
+    let _guard = process_wait_test_lock();
+    carrick_runtime::guest_cpu::init_child_table();
+    let prepared = carrick_runtime::guest_cpu::prepare_child_record_pre_fork(
+        std::process::id(),
+        0,
+        0,
+        false,
+        0,
+    )
+    .expect("prepare native state-wait child record");
+    let child = unsafe { libc::fork() };
+    assert!(child >= 0, "fork failed");
+    if child == 0 {
+        carrick_runtime::guest_cpu::complete_child_record_post_fork_child();
+        loop {
+            unsafe { libc::pause() };
+        }
+    }
+    carrick_runtime::guest_cpu::publish_prepared_child_record_parent_ref(prepared, child as u32);
+    let _child_guard = ForkedChild(child);
+
+    let geometry = carrick_runtime::page_profile::PageGeometry {
+        host_page_size: 16 * 1024,
+        linux_page_size: 16 * 1024,
+        native_profile: Some(carrick_spec::NativePageProfile::Native16k),
+    };
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x100]);
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::with_page_geometry(geometry);
+    let outcome = dispatcher
+        .dispatch(
+            SyscallRequest::new(260, SyscallArgs::from([child as u64, 0, 2, 0, 0, 0])),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+
+    assert!(matches!(
+        outcome,
+        DispatchOutcome::WaitOnProcState { pid, .. } if pid == child
+    ));
 }
 
 #[test]

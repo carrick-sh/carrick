@@ -1324,6 +1324,42 @@ where
                         }
                     }
                 }
+                DispatchOutcome::WaitOnProcState { sig_mask, .. } => {
+                    self.waiter.ensure_full();
+                    crate::run_state::publish(crate::run_state::RunState::Blocked);
+                    let reclaim = self.park_vcpu_for_blocking_wait(
+                        engine,
+                        crate::thread::VcpuParkClass::FdBacked,
+                    );
+                    let wait_result = self.waiter.wait_proc_state_with_dispatch_pending(
+                        sig_mask.block_mask(),
+                        || {
+                            kernel
+                                .dispatcher
+                                .has_deliverable_dispatch_pending_for_wait(self.this_tid, sig_mask)
+                        },
+                    );
+                    if let Some(outcome) = self.exec_replaced_thread_exit() {
+                        return Ok(outcome);
+                    }
+                    self.resume_vcpu_after_blocking_wait(engine, reclaim)?;
+                    match wait_result {
+                        crate::io_wait::WaitResult::Ready
+                        | crate::io_wait::WaitResult::TimedOut => continue,
+                        crate::io_wait::WaitResult::Interrupted => {
+                            if crate::fork_quiesce::is_quiescing() {
+                                self.release_and_park_vcpu_for_fork(engine)?;
+                                continue;
+                            }
+                            break Ok(DispatchOutcome::Errno {
+                                errno: crate::linux_abi::LINUX_EINTR,
+                            });
+                        }
+                        crate::io_wait::WaitResult::Errno(errno) => {
+                            break Ok(DispatchOutcome::Errno { errno });
+                        }
+                    }
+                }
                 DispatchOutcome::WaitOnSignals {
                     wait_set,
                     block_mask,
@@ -1995,6 +2031,7 @@ where
                 | DispatchOutcome::WaitOnFdsSelect { .. }
                 | DispatchOutcome::WaitOnPollFds { .. }
                 | DispatchOutcome::WaitOnProcExit { .. }
+                | DispatchOutcome::WaitOnProcState { .. }
                 | DispatchOutcome::WaitOnSignals { .. }
                 | DispatchOutcome::WaitOnSleep { .. } => {
                     last_syscall_retval =
