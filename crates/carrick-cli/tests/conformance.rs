@@ -3294,6 +3294,32 @@ fn native_conformance_run_elf_executes_libc_probe() {
 
 #[test]
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn native_conformance_preserves_x18_across_guarded_load() {
+    let _serial = CONFORMANCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let Some(bin) = carrick_bin() else {
+        eprintln!(
+            "SKIP native_conformance_preserves_x18_across_guarded_load: target/release/carrick not built"
+        );
+        return;
+    };
+    ensure_signed(&bin);
+    let probe = ensure_native_static_pie_probe("nativex18");
+
+    for profile in ["native16k", "linux4k"] {
+        let out = run_native_run_elf(&bin, &probe, profile);
+        assert!(
+            out.contains("status=exit status: 0")
+                && out.contains("setup_ok=true")
+                && out.contains("guarded_load_ok=true")
+                && out.contains("x18_preserved=true"),
+            "native x18 preservation failed for profile {profile}:\n{out}"
+        );
+    }
+}
+
+#[test]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn native_conformance_run_elf_preserves_ip0_across_syscalls() {
     let _serial = CONFORMANCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
