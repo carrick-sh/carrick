@@ -225,6 +225,33 @@ Native Darwin needs a new `GuestMemory` implementation over real host mappings.
 Unlike HVF, there is no guest physical memory hidden behind a VM. Guest virtual
 addresses are host virtual addresses.
 
+#### Darwin low-address boundary
+
+On arm64, XNU requires every 64-bit Mach-O process to carry a 4 GiB
+`__PAGEZERO`; the loader rejects a smaller segment with `LOAD_BADMACHO`. This is
+also a hard minimum mapping offset: deallocating part of `__PAGEZERO` does not
+make a later low fixed mapping available. For PIE outputs, current `ld64` also
+ignores `-image_base`, so linker placement cannot move Carrick itself out of the
+way while retaining a valid arm64 process image.
+
+The direct backend must therefore distinguish two independent compatibility
+dimensions:
+
+- PIE/`ET_DYN` Linux images may be loaded with a bias above `0x1_0000_0000` and
+  execute directly;
+- fixed Linux `ET_EXEC` images with a required segment below 4 GiB cannot be
+  directly mapped and must fail with a typed diagnostic;
+- supporting those low fixed images requires address translation or code
+  rewriting. Changing the native page profile does not solve that address-space
+  collision.
+
+References:
+
+- XNU arm64 Mach-O page-zero validation:
+  https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/mach_loader.c#L3700-L3760
+- Xcode 13 linker note for PIE image bases:
+  https://developer.apple.com/documentation/xcode-release-notes/xcode-13-release-notes
+
 The engine should reuse:
 
 - Carrick's ELF loader and initial stack construction;
@@ -660,4 +687,3 @@ bundle that proves or refutes the native gateway, ABI context switch, page-size
 policy, and signal discriminator. If those pass, build `carrick-exec-darwin`
 behind an opt-in backend flag and drive the existing dispatcher through
 `SyscallTrap`.
-

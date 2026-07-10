@@ -43,6 +43,9 @@ metadata.
   and notes that Rosetta matches the Intel environment, including 4K pages for
   translated processes. That does not give a public 4K-page mode for native
   arm64 processes.
+- XNU contains `_POSIX_SPAWN_FORCE_4K_PAGES`, but the declaration is available
+  only to private debug/development builds. It is not a public production macOS
+  process mode on which Carrick can depend.
 - `mprotect` changes protections for whole pages containing the requested
   range. On Darwin, the page granularity is the host kernel's page granularity.
 
@@ -58,6 +61,10 @@ References:
   https://man7.org/linux/man-pages/man3/sysconf.3.html
 - Apple `mprotect(2)` man page:
   https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/mprotect.2.html
+- XNU private spawn flags:
+  https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/spawn.h#L45-L75
+- XNU 4K map creation path:
+  https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/mach_loader.c#L720-L765
 
 ## Goals
 
