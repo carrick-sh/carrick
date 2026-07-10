@@ -6,7 +6,12 @@
 use conformance_probes::{errno, report};
 use std::ffi::c_void;
 
-const PAGE: usize = 4096;
+fn linux_page_size() -> Option<usize> {
+    let raw = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    usize::try_from(raw)
+        .ok()
+        .filter(|page| page.is_power_of_two() && *page <= usize::MAX / 3)
+}
 
 fn mincore_errno(addr: *mut c_void, len: usize, vec: *mut u8) -> i32 {
     unsafe {
@@ -16,10 +21,14 @@ fn mincore_errno(addr: *mut c_void, len: usize, vec: *mut u8) -> i32 {
 }
 
 fn main() {
+    let Some(page_size) = linux_page_size() else {
+        report!(invalid_vec_errno = -1, hole_errno = -1);
+        return;
+    };
     let p = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
-            PAGE,
+            page_size,
             libc::PROT_READ | libc::PROT_WRITE,
             libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
             -1,
@@ -29,18 +38,18 @@ fn main() {
     let invalid_vec_errno = if p == libc::MAP_FAILED {
         -1
     } else {
-        mincore_errno(p, PAGE, std::ptr::null_mut())
+        mincore_errno(p, page_size, std::ptr::null_mut())
     };
     if p != libc::MAP_FAILED {
         unsafe {
-            libc::munmap(p, PAGE);
+            libc::munmap(p, page_size);
         }
     }
 
     let q = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
-            PAGE * 3,
+            page_size * 3,
             libc::PROT_READ | libc::PROT_WRITE,
             libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
             -1,
@@ -51,13 +60,13 @@ fn main() {
         -1
     } else {
         unsafe {
-            libc::munmap((q as *mut u8).add(PAGE) as *mut c_void, PAGE);
+            libc::munmap((q as *mut u8).add(page_size) as *mut c_void, page_size);
         }
         let mut vec = [0u8; 3];
-        let err = mincore_errno(q, PAGE * 3, vec.as_mut_ptr());
+        let err = mincore_errno(q, page_size * 3, vec.as_mut_ptr());
         unsafe {
-            libc::munmap(q, PAGE);
-            libc::munmap((q as *mut u8).add(PAGE * 2) as *mut c_void, PAGE);
+            libc::munmap(q, page_size);
+            libc::munmap((q as *mut u8).add(page_size * 2) as *mut c_void, page_size);
         }
         err
     };

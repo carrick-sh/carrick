@@ -4042,7 +4042,7 @@ impl NativeMappedMemory {
                 crate::memory::LINUX_SHARED_FILE_SIZE,
                 "native shared aperture end",
             )?,
-            host_protects: false,
+            host_protects: true,
             shared_futex: true,
             guest_writable: true,
             default_prot: crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_WRITE,
