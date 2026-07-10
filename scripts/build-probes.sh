@@ -35,6 +35,60 @@ set -e
 cd "$(dirname "$0")/.."
 
 HOST_ARCH="$(uname -m)"
+MODE="${1:-default}"
+
+if [ "$MODE" = "--native-pie" ]; then
+  if [ "$HOST_ARCH" != "arm64" ] && [ "$HOST_ARCH" != "aarch64" ]; then
+    echo "--native-pie requires an arm64 host" >&2
+    exit 2
+  fi
+
+  docker run --rm --platform linux/arm64 \
+    -v "$PWD/conformance-probes:/p" -w /p \
+    rust:alpine sh -ec '
+      rustup target add aarch64-unknown-linux-musl >/dev/null 2>&1 || true
+      rm -rf target/native-pie/release
+      rm -rf target/native-pie/aarch64-unknown-linux-musl/release
+      sysroot="$(rustc --print sysroot)"
+      CARGO_TARGET_DIR=target/native-pie \
+        CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=cc \
+        RUSTFLAGS="-C link-self-contained=no -C relocation-model=pic -C link-arg=-static-pie -C link-arg=-L${sysroot}/lib/rustlib/aarch64-unknown-linux-musl/lib/self-contained" \
+        cargo build --release --target aarch64-unknown-linux-musl
+
+      probe=target/native-pie/aarch64-unknown-linux-musl/release/devnullseek
+      readelf -h "$probe" | awk '\''$1 == "Type:" { found = 1; if ($2 != "DYN") exit 1 } END { if (!found) exit 1 }'\''
+      "$probe" >/dev/null
+    '
+
+  docker run --rm --platform linux/arm64 \
+    -v "$PWD/conformance-probes:/p" -w /p \
+    rust:bookworm sh -ec '
+      rustup target add aarch64-unknown-linux-gnu >/dev/null 2>&1 || true
+      # Host build artifacts are libc-specific even though target artifacts
+      # live in separate triple directories.
+      rm -rf target/native-pie/release
+      rm -rf target/native-pie/aarch64-unknown-linux-gnu/release
+      CARGO_TARGET_DIR=target/native-pie \
+        RUSTFLAGS="-C relocation-model=pie -C link-arg=-pie" \
+        cargo build --release --target aarch64-unknown-linux-gnu
+
+      probe=target/native-pie/aarch64-unknown-linux-gnu/release/devnullseek
+      readelf -h "$probe" | awk '\''$1 == "Type:" { found = 1; if ($2 != "DYN") exit 1 } END { if (!found) exit 1 }'\''
+      "$probe" >/dev/null
+    '
+
+  for triple in aarch64-unknown-linux-musl aarch64-unknown-linux-gnu; do
+    dir="conformance-probes/target/native-pie/$triple/release"
+    count=$(find "$dir" -maxdepth 1 -type f ! -name '*.*' 2>/dev/null | wc -l | tr -d ' ')
+    echo "native PIE probes built: $dir ($count binaries)"
+  done
+  exit 0
+fi
+
+if [ "$MODE" != "default" ]; then
+  echo "usage: $0 [--native-pie]" >&2
+  exit 2
+fi
 
 build_native() {
   # build_native <target-triple> <linker-env-or-empty>

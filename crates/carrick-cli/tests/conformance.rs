@@ -18,7 +18,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1545,6 +1545,12 @@ fn lane_runnable_here(lane: &Lane) -> bool {
     }
 }
 
+/// A requested same-ISA native campaign must not spill into the macOS Rosetta
+/// lane. Other backends retain the ordinary host-runnable matrix.
+fn lane_allowed_for_backend(lane: &Lane, exec_backend: Option<&str>) -> bool {
+    exec_backend != Some("native") || lane.platform == "linux/arm64"
+}
+
 /// Whether a probe set's DIFFs should fail the gate ON THIS HOST. A probe set is
 /// only the system-under-test where carrick ITSELF executes the guest ISA — i.e.
 /// the host arch matches the guest arch. The macOS amd64 lane runs through
@@ -2274,6 +2280,16 @@ fn probes_dir(target: &str) -> PathBuf {
     repo_path(&format!("conformance-probes/target/{target}/release"))
 }
 
+fn probe_campaign_dir(target: &str, exec_backend: Option<&str>) -> PathBuf {
+    if exec_backend == Some("native") && target.starts_with("aarch64-") {
+        repo_path(&format!(
+            "conformance-probes/target/native-pie/{target}/release"
+        ))
+    } else {
+        probes_dir(target)
+    }
+}
+
 fn probe_source_names() -> BTreeSet<String> {
     let src_dir = repo_path("conformance-probes/src/bin");
     let Ok(entries) = std::fs::read_dir(src_dir) else {
@@ -2298,9 +2314,13 @@ fn probe_source_names() -> BTreeSet<String> {
 /// source list keeps stale artifacts out of the line-exact gate.
 fn probe_binaries(target: &str) -> Vec<PathBuf> {
     let dir = probes_dir(target);
+    probe_binaries_in(&dir)
+}
+
+fn probe_binaries_in(dir: &Path) -> Vec<PathBuf> {
     let source_names = probe_source_names();
     let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(&dir) else {
+    let Ok(entries) = std::fs::read_dir(dir) else {
         return out;
     };
     for entry in entries.flatten() {
@@ -2516,6 +2536,39 @@ fn ensure_native_static_pie_probe(name: &str) -> PathBuf {
         elf_file_type(&probe),
         Some(3),
         "native static PIE probe {name} must be ET_DYN for high native mapping"
+    );
+    probe
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn ensure_native_et_exec_probe(name: &str) -> PathBuf {
+    let target_dir = repo_path("conformance-probes/target/native-et-exec");
+    let status = Command::new("cargo")
+        .current_dir(repo_path("conformance-probes"))
+        .env("CARGO_TARGET_DIR", &target_dir)
+        .args([
+            "build",
+            "--release",
+            "--target",
+            "aarch64-unknown-linux-musl",
+            "--bin",
+            name,
+        ])
+        .status()
+        .expect("build native ET_EXEC probe");
+    assert!(
+        status.success(),
+        "failed to build native ET_EXEC probe {name}"
+    );
+    let probe = target_dir
+        .join("aarch64-unknown-linux-musl")
+        .join("release")
+        .join(name);
+    assert!(probe.exists(), "native ET_EXEC probe missing: {name}");
+    assert_eq!(
+        elf_file_type(&probe),
+        Some(2),
+        "native fixed-address probe {name} must be ET_EXEC"
     );
     probe
 }
@@ -2960,7 +3013,16 @@ fn conformance_probes() {
     let mut unblessed: Vec<String> = Vec::new();
 
     let mut nongating_diffs: Vec<String> = Vec::new();
+    let requested_exec_backend = std::env::var("CARRICK_EXEC_BACKEND").ok();
     for lane in LANES {
+        if !lane_allowed_for_backend(lane, requested_exec_backend.as_deref()) {
+            eprintln!(
+                "SKIP conformance_probes[{}]: exec backend {} only supports same-ISA arm64 guests",
+                lane.label,
+                requested_exec_backend.as_deref().unwrap_or("default")
+            );
+            continue;
+        }
         if !lane_runnable_here(lane) {
             eprintln!(
                 "SKIP conformance_probes[{}]: host ({}) cannot run {} guests \
@@ -2982,7 +3044,7 @@ fn conformance_probes() {
             // per-probe `probe_gates` allowlist below (so a curated x86 subset can
             // gate while the rest of the bring-up lane stays report-only).
             let set_gates = set_gates_here(lane, set);
-            let dir = probes_dir(set.target);
+            let dir = probe_campaign_dir(set.target, requested_exec_backend.as_deref());
             if !dir.exists() {
                 eprintln!(
                     "SKIP conformance_probes[{}:{}]: probes not built ({})",
@@ -2993,7 +3055,7 @@ fn conformance_probes() {
                 continue;
             }
 
-            let probes: Vec<PathBuf> = probe_binaries(set.target)
+            let probes: Vec<PathBuf> = probe_binaries_in(&dir)
                 .into_iter()
                 .filter(|p| {
                     p.file_name()
@@ -3294,6 +3356,31 @@ fn native_conformance_run_elf_executes_libc_probe() {
 
 #[test]
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn native_conformance_rejects_fixed_et_exec_below_hard_pagezero() {
+    let _serial = CONFORMANCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let Some(bin) = carrick_bin() else {
+        eprintln!(
+            "SKIP native_conformance_rejects_fixed_et_exec_below_hard_pagezero: target/release/carrick not built"
+        );
+        return;
+    };
+    ensure_signed(&bin);
+    let probe = ensure_native_et_exec_probe("devnullseek");
+
+    for profile in ["native16k", "linux4k"] {
+        let out = run_native_run_elf(&bin, &probe, profile);
+        assert!(
+            out.contains("status=exit status: 125")
+                && out.contains("hard 4 GiB __PAGEZERO")
+                && out.contains("PIE/ET_DYN"),
+            "native fixed ET_EXEC rejection was not typed for profile {profile}:\n{out}"
+        );
+    }
+}
+
+#[test]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn native_conformance_preserves_x18_across_guarded_load() {
     let _serial = CONFORMANCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -3503,6 +3590,26 @@ fn probe_gates_decision_allowlist_logic() {
         true,
         X86_GATING_PROBES.contains(&"icmp")
     ));
+}
+
+#[test]
+fn native_probe_campaign_selects_only_same_isa_lane() {
+    assert!(lane_allowed_for_backend(&ARM64, Some("native")));
+    assert!(!lane_allowed_for_backend(&AMD64, Some("native")));
+    assert!(lane_allowed_for_backend(&ARM64, Some("hvf")));
+    assert!(lane_allowed_for_backend(&AMD64, None));
+}
+
+#[test]
+fn native_probe_campaign_uses_pie_artifacts() {
+    assert!(
+        probe_campaign_dir("aarch64-unknown-linux-musl", Some("native"))
+            .ends_with("conformance-probes/target/native-pie/aarch64-unknown-linux-musl/release")
+    );
+    assert!(
+        probe_campaign_dir("aarch64-unknown-linux-musl", None)
+            .ends_with("conformance-probes/target/aarch64-unknown-linux-musl/release")
+    );
 }
 
 #[test]

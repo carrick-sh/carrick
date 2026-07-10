@@ -61,6 +61,7 @@ const NATIVE_DARWIN_HEAP_SIZE: u64 = 128 * 1024 * 1024;
 // native direct-mapped arena above Carrick's shared/private aperture windows.
 const NATIVE_DARWIN_MMAP_BASE: u64 = 0xa0_0000_0000;
 const NATIVE_DARWIN_MMAP_SIZE: u64 = 32 * 1024 * 1024 * 1024;
+const NATIVE_DARWIN_HARD_PAGEZERO_END: u64 = 0x1_0000_0000;
 const NATIVE_DARWIN_RESUME_BUCKET_SIZE: u64 = 128 * 1024 * 1024;
 const NATIVE_WAIT_BACKSTOP: Duration = Duration::from_millis(50);
 const VM_INHERIT_SHARE: libc::c_int = 0;
@@ -3073,6 +3074,16 @@ impl NativeMappedMemory {
         host_page_size: u64,
         linux_page_size: u64,
     ) -> Result<Self, RuntimeError> {
+        if let Some(region) = image
+            .regions()
+            .iter()
+            .find(|region| region.start < NATIVE_DARWIN_HARD_PAGEZERO_END)
+        {
+            return Err(RuntimeError::Unsupported(format!(
+                "native Darwin cannot directly map guest region 0x{:x}..0x{:x} below 0x{NATIVE_DARWIN_HARD_PAGEZERO_END:x}: arm64 Mach-O enforces a hard 4 GiB __PAGEZERO; use a PIE/ET_DYN image or an address-virtualizing backend",
+                region.start, region.end
+            )));
+        }
         unsafe { carrick_native_reset_resume_pads() };
         let mut regions = Vec::new();
         for region in image.regions() {
@@ -4521,6 +4532,46 @@ mod tests {
             file[interpreter_offset..].copy_from_slice(interpreter);
         }
         file
+    }
+
+    #[test]
+    #[allow(deprecated)] // libc exposes mach_task_self_ as the stable self-task port.
+    fn native_pagezero_min_offset_rejects_reallocation() {
+        const GUEST_ADDRESS: usize = 0x20_0000;
+        const HOST_PAGE_SIZE: usize = 16 * 1024;
+
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            let deallocate = unsafe {
+                libc::vm_deallocate(
+                    libc::mach_task_self_,
+                    GUEST_ADDRESS as libc::vm_address_t,
+                    HOST_PAGE_SIZE as libc::vm_size_t,
+                )
+            };
+            if deallocate != 0 {
+                unsafe { libc::_exit(1) };
+            }
+            let mapped = unsafe {
+                libc::mmap(
+                    GUEST_ADDRESS as *mut libc::c_void,
+                    HOST_PAGE_SIZE,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_ANON | libc::MAP_PRIVATE | libc::MAP_FIXED,
+                    -1,
+                    0,
+                )
+            };
+            unsafe {
+                libc::_exit(i32::from(mapped as usize == GUEST_ADDRESS) * 2);
+            }
+        }
+
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFEXITED(status), "child status was 0x{status:x}");
+        assert_eq!(libc::WEXITSTATUS(status), 0);
     }
 
     #[test]

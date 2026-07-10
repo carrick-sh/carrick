@@ -105,3 +105,53 @@ enforcement mechanism, such as guarded mixed pages with enough AArch64
 load/store emulation or explicit code instrumentation. Until that exists, the
 native backend must continue rejecting those mappings instead of widening them
 to 16K host permissions.
+
+## Address-layout and conformance campaign evidence
+
+Date: 2026-07-09
+
+Current XNU source makes a second compatibility boundary explicit: an arm64
+64-bit Mach-O must reserve a hard 4 GiB `__PAGEZERO`. A forked host test also
+confirmed that deallocating a low subrange does not permit a later fixed mapping
+there. The native backend now rejects a Linux `ET_EXEC` image whose required
+region is below `0x1_0000_0000` and directs the caller to a PIE/`ET_DYN` image or
+an address-virtualizing backend.
+
+The native conformance campaign now builds Linux-valid AArch64 PIE artifacts.
+For musl, Rust's self-contained non-PIE startup selection is disabled and the
+system compiler driver selects musl `rcrt1.o` with `-static-pie`; Rust's bundled
+static library directory remains on the link path. The builder verifies
+`ET_DYN` and executes a smoke probe inside Linux before accepting the campaign.
+This distinction matters: forcing `-pie` onto the ordinary static CRT produced
+an ELF that Carrick's eager relocator could run but real Linux correctly
+crashed.
+
+Focused byte-identical proof:
+
+```text
+Linux arm64: devnullseek static PIE -> exit 0
+native16k:   devnullseek static PIE -> exit 0, output matches Linux
+linux4k:     devnullseek static PIE -> exit 0, output matches Linux
+```
+
+Full `native16k` probe baseline with the corrected artifacts:
+
+```text
+musl gating:      280/373 MATCH, 93 semantic gaps
+glibc report-only: 271/374 MATCH, 103 semantic gaps
+amd64:             skipped because native is same-ISA only
+```
+
+The campaign now runs every gating probe instead of failing at image mapping.
+The remaining failures are runtime semantics, led by the native backend's
+missing `CloneThread` outcome, signal/process lifecycle, ptrace, and vDSO gaps;
+they are not page-zero or linker failures.
+
+References:
+
+- XNU arm64 Mach-O page-zero validation:
+  https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/mach_loader.c#L3700-L3760
+- Rust relocation-model and static PIE selection:
+  https://doc.rust-lang.org/rustc/codegen-options/index.html#relocation-model
+- Rust target option for static position-independent executables:
+  https://doc.rust-lang.org/stable/nightly-rustc/rustc_target/spec/struct.TargetOptions.html#structfield.static_position_independent_executables
