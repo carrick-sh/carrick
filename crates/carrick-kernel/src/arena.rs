@@ -12,7 +12,7 @@ use crate::domains::{HostPid, ProcessGeneration};
 use crate::process::ProcessSection;
 
 pub const ARENA_MAGIC: u32 = 0x434b_4131;
-pub const ARENA_VERSION: u32 = 3;
+pub const ARENA_VERSION: u32 = 4;
 pub const ARENA_PATH_ENV: &str = "CARRICK_KERNEL_ARENA";
 
 /// Permit-section constants. These must stay byte-identical to the landed
