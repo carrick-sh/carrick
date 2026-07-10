@@ -64,7 +64,6 @@ const NATIVE_DARWIN_MMAP_SIZE: u64 = 32 * 1024 * 1024 * 1024;
 const NATIVE_DARWIN_HARD_PAGEZERO_END: u64 = 0x1_0000_0000;
 const NATIVE_DARWIN_RESUME_BUCKET_SIZE: u64 = 128 * 1024 * 1024;
 const NATIVE_DARWIN_MAX_GUEST_THREADS: usize = 1024;
-const NATIVE_WAIT_BACKSTOP: Duration = Duration::from_millis(50);
 const VM_INHERIT_SHARE: libc::c_int = 0;
 const VM_INHERIT_COPY: libc::c_int = 1;
 
@@ -1062,6 +1061,7 @@ struct NativeThreadRuntime {
     registry: Arc<crate::thread::ThreadRegistry>,
     futex: Arc<crate::thread::FutexTable>,
     platform_futex: Arc<dyn carrick_hal::PlatformFutex>,
+    waiter: crate::io_wait::ThreadWaiter,
     threads: Arc<parking_lot::Mutex<Vec<std::thread::JoinHandle<()>>>>,
     resume_pad_slot: usize,
     resume_pad_slots: Arc<parking_lot::Mutex<Vec<usize>>>,
@@ -1081,6 +1081,7 @@ impl NativeThreadRuntime {
             registry,
             futex,
             platform_futex,
+            waiter: crate::io_wait::ThreadWaiter::new(tid),
             threads: Arc::new(parking_lot::Mutex::new(Vec::new())),
             resume_pad_slot: 0,
             resume_pad_slots: Arc::new(parking_lot::Mutex::new(
@@ -1108,6 +1109,7 @@ impl NativeThreadRuntime {
             registry: Arc::clone(&self.registry),
             futex: Arc::clone(&self.futex),
             platform_futex: Arc::clone(&self.platform_futex),
+            waiter: crate::io_wait::ThreadWaiter::new(tid),
             threads: Arc::clone(&self.threads),
             resume_pad_slot,
             resume_pad_slots: Arc::clone(&self.resume_pad_slots),
@@ -1533,7 +1535,7 @@ fn dispatch_native_syscall(
                 timeout,
                 on_timeout,
                 sig_mask,
-            } => match wait_native_fds(dispatcher, thread_runtime.tid(), &fds, timeout, sig_mask) {
+            } => match wait_native_fds(dispatcher, thread_runtime, &fds, timeout, sig_mask) {
                 Ok(NativeWaitResult::Ready) => continue,
                 Ok(NativeWaitResult::TimedOut) => {
                     return Ok(DispatchOutcome::Returned { value: on_timeout });
@@ -1545,7 +1547,7 @@ fn dispatch_native_syscall(
                 timeout,
                 sig_mask,
                 clear_on_timeout,
-            } => match wait_native_fds(dispatcher, thread_runtime.tid(), &fds, timeout, sig_mask) {
+            } => match wait_native_fds(dispatcher, thread_runtime, &fds, timeout, sig_mask) {
                 Ok(NativeWaitResult::Ready) => continue,
                 Ok(NativeWaitResult::TimedOut) => {
                     let mut memory = memory.lock();
@@ -1562,7 +1564,7 @@ fn dispatch_native_syscall(
                 timeout,
             } => match wait_native_signals(
                 dispatcher,
-                thread_runtime.tid(),
+                thread_runtime,
                 wait_set,
                 block_mask,
                 timeout,
@@ -1666,7 +1668,7 @@ fn dispatch_native_syscall(
                     crate::dispatch::BlockingHostWriteStep::Wait => {
                         match wait_native_fds(
                             dispatcher,
-                            thread_runtime.tid(),
+                            thread_runtime,
                             &[crate::io_wait::WaitFd::raw(write.host_fd(), libc::POLLOUT)],
                             None,
                             carrick_abi::WaitSigMask::NONE,
@@ -1690,7 +1692,7 @@ fn dispatch_native_syscall(
                 }
             },
             DispatchOutcome::WaitOnProcExit { pid, sig_mask } => {
-                match wait_native_proc_exit(dispatcher, thread_runtime.tid(), pid, sig_mask) {
+                match wait_native_proc_exit(dispatcher, thread_runtime, pid, sig_mask) {
                     Ok(NativeWaitResult::Ready) | Ok(NativeWaitResult::TimedOut) => continue,
                     Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
                 }
@@ -1700,7 +1702,7 @@ fn dispatch_native_syscall(
                 remaining,
             } => {
                 let deadline = Instant::now() + duration;
-                match wait_native_sleep_until(dispatcher, thread_runtime.tid(), deadline) {
+                match wait_native_sleep_until(dispatcher, thread_runtime, deadline) {
                     Ok(()) => return Ok(DispatchOutcome::Returned { value: 0 }),
                     Err(crate::linux_abi::LINUX_EINTR) => {
                         let mut memory = memory.lock();
@@ -1777,12 +1779,13 @@ fn wait_native_shared_futex(
 
 fn wait_native_signals(
     dispatcher: &SyscallDispatcher,
-    tid: crate::thread::ThreadId,
+    thread_runtime: &NativeThreadRuntime,
     wait_set: carrick_abi::SigSet,
     block_mask: carrick_abi::SigBlockMask,
     timeout: Option<Duration>,
     deadline: &mut Option<Instant>,
 ) -> NativeSignalWaitResult {
+    let tid = thread_runtime.tid();
     loop {
         let Some(slice) = crate::vcpu_loop::signal_wait_slice(deadline, timeout) else {
             return NativeSignalWaitResult::TimedOut;
@@ -1790,9 +1793,23 @@ fn wait_native_signals(
         if let Some(result) = native_signal_wait_pending(dispatcher, tid, wait_set, block_mask) {
             return result;
         }
-        thread::sleep(slice);
-        if crate::vcpu_loop::signal_wait_expired(*deadline) {
-            return NativeSignalWaitResult::TimedOut;
+        match thread_runtime
+            .waiter
+            .wait_with_dispatch_pending(&[], Some(slice), block_mask, || {
+                native_signal_wait_pending(dispatcher, tid, wait_set, block_mask).is_some()
+            }) {
+            crate::io_wait::WaitResult::Ready | crate::io_wait::WaitResult::Interrupted => {
+                if let Some(result) =
+                    native_signal_wait_pending(dispatcher, tid, wait_set, block_mask)
+                {
+                    return result;
+                }
+            }
+            crate::io_wait::WaitResult::TimedOut | crate::io_wait::WaitResult::Errno(_) => {
+                if crate::vcpu_loop::signal_wait_expired(*deadline) {
+                    return NativeSignalWaitResult::TimedOut;
+                }
+            }
         }
     }
 }
@@ -1825,110 +1842,75 @@ fn native_signal_wait_pending(
 
 fn wait_native_fds(
     dispatcher: &SyscallDispatcher,
-    tid: crate::thread::ThreadId,
+    thread_runtime: &NativeThreadRuntime,
     fds: &[crate::io_wait::WaitFd],
     timeout: Option<Duration>,
     sig_mask: carrick_abi::WaitSigMask,
 ) -> Result<NativeWaitResult, crate::linux_abi::LinuxErrno> {
-    let mut pollfds: Vec<libc::pollfd> = fds
-        .iter()
-        .map(|fd| libc::pollfd {
-            fd: fd.fd(),
-            events: fd.events(),
-            revents: 0,
-        })
-        .collect();
-    let nfds = libc::nfds_t::try_from(pollfds.len()).map_err(|_| crate::linux_abi::LINUX_EINVAL)?;
-    let deadline = timeout.and_then(|duration| Instant::now().checked_add(duration));
-    loop {
-        if native_wait_should_interrupt(dispatcher, tid, sig_mask) {
-            return Err(crate::linux_abi::LINUX_EINTR);
-        }
-        let timeout_ms = poll_slice_timeout_ms(deadline);
-        let rc = unsafe { libc::poll(pollfds.as_mut_ptr(), nfds, timeout_ms) };
-        match rc.host_syscall_errno() {
-            Ok(0) => {
-                if deadline.is_some_and(|instant| Instant::now() >= instant) {
-                    return Ok(NativeWaitResult::TimedOut);
-                }
-                if native_wait_should_interrupt(dispatcher, tid, sig_mask) {
-                    return Err(crate::linux_abi::LINUX_EINTR);
-                }
-            }
-            Ok(_) => return Ok(NativeWaitResult::Ready),
-            Err(errno) if errno == crate::linux_abi::LINUX_EINTR => {
-                if native_wait_should_interrupt(dispatcher, tid, sig_mask) {
-                    return Err(crate::linux_abi::LINUX_EINTR);
-                }
-                if deadline.is_some_and(|instant| Instant::now() >= instant) {
-                    return Ok(NativeWaitResult::TimedOut);
-                }
-            }
-            Err(errno) => return Err(errno),
-        }
-    }
-}
-
-fn poll_slice_timeout_ms(deadline: Option<Instant>) -> libc::c_int {
-    let now = Instant::now();
-    let slice = match deadline {
-        Some(deadline) if now >= deadline => return 0,
-        Some(deadline) => deadline.duration_since(now).min(NATIVE_WAIT_BACKSTOP),
-        None => NATIVE_WAIT_BACKSTOP,
-    };
-    let millis = slice.as_millis();
-    if millis > libc::c_int::MAX as u128 {
-        libc::c_int::MAX
-    } else {
-        millis as libc::c_int
+    let tid = thread_runtime.tid();
+    let block_mask = native_wait_block_mask(dispatcher, tid, sig_mask);
+    match thread_runtime
+        .waiter
+        .wait_with_dispatch_pending(fds, timeout, block_mask, || {
+            native_wait_should_interrupt(dispatcher, tid, sig_mask)
+        }) {
+        crate::io_wait::WaitResult::Ready => Ok(NativeWaitResult::Ready),
+        crate::io_wait::WaitResult::TimedOut => Ok(NativeWaitResult::TimedOut),
+        crate::io_wait::WaitResult::Interrupted => Err(crate::linux_abi::LINUX_EINTR),
+        crate::io_wait::WaitResult::Errno(errno) => Err(errno),
     }
 }
 
 fn wait_native_proc_exit(
     dispatcher: &SyscallDispatcher,
-    tid: crate::thread::ThreadId,
+    thread_runtime: &NativeThreadRuntime,
     pid: i32,
     sig_mask: carrick_abi::WaitSigMask,
 ) -> Result<NativeWaitResult, crate::linux_abi::LinuxErrno> {
-    while !native_child_status_ready(pid) {
-        if native_wait_should_interrupt(dispatcher, tid, sig_mask) {
-            return Err(crate::linux_abi::LINUX_EINTR);
-        }
-        std::thread::sleep(Duration::from_millis(10));
-        if native_wait_should_interrupt(dispatcher, tid, sig_mask) {
-            return Err(crate::linux_abi::LINUX_EINTR);
-        }
+    let tid = thread_runtime.tid();
+    let block_mask = native_wait_block_mask(dispatcher, tid, sig_mask);
+    match thread_runtime
+        .waiter
+        .wait_proc_exit_with_dispatch_pending(pid, block_mask, || {
+            native_wait_should_interrupt(dispatcher, tid, sig_mask)
+        }) {
+        crate::io_wait::WaitResult::Ready => Ok(NativeWaitResult::Ready),
+        crate::io_wait::WaitResult::TimedOut => Ok(NativeWaitResult::TimedOut),
+        crate::io_wait::WaitResult::Interrupted => Err(crate::linux_abi::LINUX_EINTR),
+        crate::io_wait::WaitResult::Errno(errno) => Err(errno),
     }
-    Ok(NativeWaitResult::Ready)
 }
 
 fn wait_native_sleep_until(
     dispatcher: &SyscallDispatcher,
-    tid: crate::thread::ThreadId,
+    thread_runtime: &NativeThreadRuntime,
     deadline: Instant,
 ) -> Result<(), crate::linux_abi::LinuxErrno> {
+    let tid = thread_runtime.tid();
+    let sig_mask = carrick_abi::WaitSigMask::NONE;
+    let block_mask = native_wait_block_mask(dispatcher, tid, sig_mask);
     loop {
-        if native_wait_should_interrupt(dispatcher, tid, carrick_abi::WaitSigMask::NONE) {
+        if native_wait_should_interrupt(dispatcher, tid, sig_mask) {
             return Err(crate::linux_abi::LINUX_EINTR);
         }
         let now = Instant::now();
         if now >= deadline {
             return Ok(());
         }
-        let remaining = (deadline - now).min(NATIVE_WAIT_BACKSTOP);
-        let request = libc::timespec {
-            tv_sec: remaining.as_secs().try_into().unwrap_or(libc::time_t::MAX),
-            tv_nsec: remaining.subsec_nanos().into(),
-        };
-        let rc = unsafe { libc::nanosleep(&request, std::ptr::null_mut()) };
-        match rc.host_syscall_errno() {
-            Ok(_) => {}
-            Err(errno) if errno == crate::linux_abi::LINUX_EINTR => {
-                if native_wait_should_interrupt(dispatcher, tid, carrick_abi::WaitSigMask::NONE) {
+        match thread_runtime.waiter.wait_with_dispatch_pending(
+            &[],
+            Some(deadline - now),
+            block_mask,
+            || native_wait_should_interrupt(dispatcher, tid, sig_mask),
+        ) {
+            crate::io_wait::WaitResult::Ready => {}
+            crate::io_wait::WaitResult::TimedOut => return Ok(()),
+            crate::io_wait::WaitResult::Interrupted => {
+                if native_wait_should_interrupt(dispatcher, tid, sig_mask) {
                     return Err(crate::linux_abi::LINUX_EINTR);
                 }
             }
-            Err(errno) => return Err(errno),
+            crate::io_wait::WaitResult::Errno(errno) => return Err(errno),
         }
     }
 }
@@ -5114,6 +5096,17 @@ mod tests {
             native_clone_child_context(parent, 0x4020, 0, None, 0x7777);
         assert_eq!(inherited_stack.sp, 0x7000);
         assert_eq!(inherited_tls, 0x7777);
+    }
+
+    #[test]
+    fn native_thread_runtime_waiter_tracks_guest_tid() {
+        let runtime = NativeThreadRuntime::new_current();
+        assert_eq!(runtime.waiter.tid(), runtime.tid());
+
+        let child_tid = runtime.registry.register_child(0);
+        let child = runtime.sibling(child_tid, 1);
+        assert_eq!(child.waiter.tid(), child_tid);
+        runtime.registry.exit(child_tid);
     }
 
     #[test]

@@ -273,7 +273,7 @@ make `signals`, `siginfo`, `sigunblockpending`, and `sigreenter` pass on both
 profiles before introducing any cross-thread carrier. This proves the Darwin
 ucontext/sigreturn boundary independently of wake routing.
 
-- [ ] **Step 3: Reuse the existing blocked-wait helper layer**
+- [x] **Step 3: Reuse the existing blocked-wait helper layer**
 
 Give every `NativeThreadRuntime` a `ThreadWaiter`. Route fd and select waits
 through `wait_with_dispatch_pending`, process waits through
@@ -281,6 +281,13 @@ through `wait_with_dispatch_pending`, process waits through
 same empty-fd path. Keep bounded slices only as a defensive backstop. A
 thread-directed publish wakes the existing per-thread pipe and calls only
 `PlatformFutex::notify_signal_pending_for`.
+
+Verified with signed `signals`, `threadspawn`, `threadrecycle`, and
+`sigwaitthread` reducers. All four match Docker on `native16k`; the first three
+also match on `linux4k`. The `linux4k` `sigwaitthread` run now reaches a guarded
+`ldadd` instruction and exits through the typed unsupported-instruction path,
+which isolates that remaining failure to 4K-on-16K LSE emulation rather than the
+wait/wakeup helper.
 
 - [ ] **Step 4: Add a transition-safe native kick handle**
 
