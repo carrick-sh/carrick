@@ -23,11 +23,105 @@ pub enum VirtualPtraceState {
     ResumeRequested = 4,
     KillRequested = 5,
     DetachRequested = 6,
+    StopPreparing = 7,
 }
 
 impl VirtualPtraceState {
     pub const fn raw(self) -> u32 {
         self as u32
+    }
+
+    pub const fn decode_shared(raw: u32) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Untraced),
+            1 => Some(Self::Running),
+            2 => Some(Self::StopRequested),
+            3 => Some(Self::StopReported),
+            4 => Some(Self::ResumeRequested),
+            5 => Some(Self::KillRequested),
+            6 => Some(Self::DetachRequested),
+            7 => Some(Self::StopPreparing),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VirtualPtraceControl {
+    tracer_pid: u32,
+    generation: ProcessGeneration,
+    state: VirtualPtraceState,
+}
+
+impl VirtualPtraceControl {
+    const STATE_BITS: u32 = 3;
+    const STATE_MASK: u32 = (1 << Self::STATE_BITS) - 1;
+    const MAX_TRACER_PID: u32 = u32::MAX >> Self::STATE_BITS;
+
+    pub const fn untraced() -> Self {
+        Self {
+            tracer_pid: 0,
+            generation: ProcessGeneration::NONE,
+            state: VirtualPtraceState::Untraced,
+        }
+    }
+
+    pub const fn traced(
+        tracer_pid: u32,
+        generation: ProcessGeneration,
+        state: VirtualPtraceState,
+    ) -> Option<Self> {
+        if tracer_pid == 0
+            || tracer_pid > Self::MAX_TRACER_PID
+            || generation.raw() == ProcessGeneration::NONE.raw()
+            || matches!(state, VirtualPtraceState::Untraced)
+        {
+            return None;
+        }
+        Some(Self {
+            tracer_pid,
+            generation,
+            state,
+        })
+    }
+
+    pub const fn decode_shared(raw: u64) -> Option<Self> {
+        let encoded_control = raw as u32;
+        let tracer_pid = encoded_control >> Self::STATE_BITS;
+        let generation = ProcessGeneration::new((raw >> 32) as u32);
+        let state = match VirtualPtraceState::decode_shared(encoded_control & Self::STATE_MASK) {
+            Some(state) => state,
+            None => return None,
+        };
+        if matches!(state, VirtualPtraceState::Untraced) {
+            if tracer_pid != 0 || generation.raw() != ProcessGeneration::NONE.raw() {
+                return None;
+            }
+        } else if tracer_pid == 0 || generation.raw() == ProcessGeneration::NONE.raw() {
+            return None;
+        }
+        Some(Self {
+            tracer_pid,
+            generation,
+            state,
+        })
+    }
+
+    pub const fn raw(self) -> u64 {
+        (self.generation.raw() as u64) << 32
+            | ((self.tracer_pid << Self::STATE_BITS) | self.state.raw()) as u64
+    }
+
+    pub const fn tracer_pid(self) -> u32 {
+        self.tracer_pid
+    }
+
+    pub const fn generation(self) -> ProcessGeneration {
+        self.generation
+    }
+
+    pub const fn state(self) -> VirtualPtraceState {
+        self.state
     }
 }
 
@@ -56,10 +150,8 @@ pub struct ProcessRecord {
     pub run_state: AtomicU64,
     pub ptrace_stop_signal: AtomicU64,
     pub exit_status: AtomicU64,
+    pub ptrace_control: AtomicU64,
     pub exit_ready: AtomicU32,
-    pub ptrace_tracer_pid: AtomicU32,
-    pub ptrace_state: AtomicU32,
-    pub ptrace_record_generation: AtomicU32,
     pub guest_ns: AtomicU64,
 }
 
@@ -164,11 +256,9 @@ impl ProcessRecord {
         self.run_state.store(0, Ordering::Relaxed);
         self.ptrace_stop_signal.store(0, Ordering::Relaxed);
         self.exit_status.store(0, Ordering::Relaxed);
+        self.ptrace_control
+            .store(VirtualPtraceControl::untraced().raw(), Ordering::Relaxed);
         self.exit_ready.store(0, Ordering::Relaxed);
-        self.ptrace_tracer_pid.store(0, Ordering::Relaxed);
-        self.ptrace_state
-            .store(VirtualPtraceState::Untraced.raw(), Ordering::Relaxed);
-        self.ptrace_record_generation.store(0, Ordering::Relaxed);
         self.guest_ns.store(0, Ordering::Relaxed);
     }
 }
@@ -179,6 +269,44 @@ mod tests {
     use super::*;
     use crate::arena::KernelArena;
     use crate::domains::HostPid;
+
+    #[test]
+    fn virtual_ptrace_control_round_trips_owner_and_state() {
+        let generation = ProcessGeneration::new(7);
+        let control =
+            VirtualPtraceControl::traced(42, generation, VirtualPtraceState::StopReported)
+                .expect("valid traced state");
+        assert_eq!(
+            VirtualPtraceControl::decode_shared(control.raw()),
+            Some(control)
+        );
+        assert_eq!(control.tracer_pid(), 42);
+        assert_eq!(control.generation(), generation);
+        assert_eq!(control.state(), VirtualPtraceState::StopReported);
+        assert_eq!(
+            VirtualPtraceControl::decode_shared(VirtualPtraceControl::untraced().raw()),
+            Some(VirtualPtraceControl::untraced())
+        );
+        assert_eq!(
+            VirtualPtraceControl::decode_shared(42 << VirtualPtraceControl::STATE_BITS),
+            None,
+            "an untraced state cannot retain an owner"
+        );
+        assert_eq!(
+            VirtualPtraceControl::decode_shared(
+                (generation.raw() as u64) << 32 | VirtualPtraceState::Running.raw() as u64,
+            ),
+            None,
+            "a traced state requires an owner"
+        );
+        assert_eq!(
+            VirtualPtraceControl::decode_shared(
+                (42 << VirtualPtraceControl::STATE_BITS | VirtualPtraceState::Running.raw()) as u64,
+            ),
+            None,
+            "a traced state requires a record generation"
+        );
+    }
 
     #[test]
     fn claim_fill_publish_find_release_round_trip() {
