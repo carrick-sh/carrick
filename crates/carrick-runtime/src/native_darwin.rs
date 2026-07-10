@@ -4064,9 +4064,20 @@ impl NativeMappedMemory {
             guest_writable: true,
             default_prot: crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_WRITE,
         });
+        let protections = MemoryProtections::default();
+        for span in image.ro_spans() {
+            let _span_end = checked_add_u64(span.start, span.len, "read-only ELF span end")?;
+            let len = usize::try_from(span.len).map_err(|_| {
+                RuntimeError::Unsupported(format!(
+                    "native Darwin read-only ELF span too large: 0x{:x}+0x{:x}",
+                    span.start, span.len
+                ))
+            })?;
+            protections.set_no_write(span.start, len, true);
+        }
         Ok(Self {
             regions,
-            protections: MemoryProtections::default(),
+            protections,
             native_page_protections: BTreeMap::new(),
             linux4k_page_protections: BTreeMap::new(),
             exclusive_reservation: None,
