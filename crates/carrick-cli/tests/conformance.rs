@@ -2447,7 +2447,9 @@ fn run_carrick_bound_probe(bin: &PathBuf, lane: Lane, probe: &Path, deadline: Du
         .arg(lane.image)
         .arg("/tmp/carrick-probe")
         .env("CARRICK_ACCEPT_ROSETTA_TERMS", "0");
-    run_carrick_probe_process(command, None, deadline)
+    // Docker consumes the injected payload before exec, leaving the probe an
+    // EOF pipe on stdin. Preserve that fd shape for direct native probes.
+    run_carrick_probe_process(command, Some(&[]), deadline)
 }
 
 fn run_carrick_probe_process(
