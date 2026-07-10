@@ -146,6 +146,8 @@ enum NativeSignalWaitResult {
 
 unsafe extern "C" {
     fn carrick_native_install_trap_handler() -> libc::c_int;
+    #[cfg(test)]
+    fn carrick_native_seed_ucontext(snapshot: *const NativeUcontextSnapshot) -> libc::c_int;
     fn carrick_native_enter(entry: u64, sp: u64) -> libc::c_int;
     fn carrick_native_resume() -> libc::c_int;
     fn carrick_native_resume_detached_context() -> libc::c_int;
@@ -4532,6 +4534,26 @@ mod tests {
             file[interpreter_offset..].copy_from_slice(interpreter);
         }
         file
+    }
+
+    #[test]
+    fn native_bridge_context_is_thread_local() {
+        let mut main_context = NativeUcontextSnapshot::default();
+        main_context.x[0] = 0x1111;
+        assert_eq!(unsafe { carrick_native_seed_ucontext(&main_context) }, 0);
+
+        let child_context = std::thread::spawn(|| {
+            let mut context = NativeUcontextSnapshot::default();
+            context.x[0] = 0x2222;
+            assert_eq!(unsafe { carrick_native_seed_ucontext(&context) }, 0);
+            snapshot_ucontext().expect("snapshot child native context")
+        })
+        .join()
+        .expect("join native context child");
+
+        let main_after = snapshot_ucontext().expect("snapshot main native context");
+        assert_eq!(child_context.x[0], 0x2222);
+        assert_eq!(main_after.x[0], 0x1111);
     }
 
     #[test]

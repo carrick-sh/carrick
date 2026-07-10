@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <libkern/OSCacheControl.h>
 #include <mach-o/dyld.h>
+#include <pthread.h>
 #include <setjmp.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -34,16 +35,17 @@ struct carrick_native_ucontext_snapshot {
 };
 
 #if defined(__aarch64__)
-static sigjmp_buf carrick_native_env;
-static sigjmp_buf carrick_native_return_env;
-static volatile sig_atomic_t carrick_native_env_ready;
-static ucontext_t carrick_native_uc;
-static ucontext_t *carrick_native_pending_uc;
-static unsigned char carrick_native_signal_stack[64 * 1024] __attribute__((aligned(16)));
-static uint64_t carrick_native_host_tpidr_el0;
-static int32_t carrick_native_last_signal;
-static int32_t carrick_native_last_signal_code;
-static uint64_t carrick_native_last_fault_address;
+static _Thread_local sigjmp_buf carrick_native_env;
+static _Thread_local sigjmp_buf carrick_native_return_env;
+static _Thread_local volatile sig_atomic_t carrick_native_env_ready;
+static _Thread_local ucontext_t carrick_native_uc;
+static _Thread_local ucontext_t *carrick_native_pending_uc;
+static _Thread_local unsigned char carrick_native_signal_stack[64 * 1024]
+    __attribute__((aligned(16)));
+static _Thread_local uint64_t carrick_native_host_tpidr_el0;
+static _Thread_local int32_t carrick_native_last_signal;
+static _Thread_local int32_t carrick_native_last_signal_code;
+static _Thread_local uint64_t carrick_native_last_fault_address;
 
 typedef void (*carrick_native_update_tpidr_fn)(uint64_t, uint64_t);
 _Static_assert(sizeof(carrick_native_update_tpidr_fn) == sizeof(uint64_t),
@@ -51,6 +53,8 @@ _Static_assert(sizeof(carrick_native_update_tpidr_fn) == sizeof(uint64_t),
 
 static carrick_native_update_tpidr_fn carrick_native_update_tpidr;
 static uint64_t carrick_native_update_tpidr_address;
+static pthread_once_t carrick_native_update_tpidr_once = PTHREAD_ONCE_INIT;
+static int carrick_native_update_tpidr_errno;
 
 #define CARRICK_NATIVE_CUSTOM_X18_BIT UINT64_C(0x0001000000000000)
 #define CARRICK_NATIVE_TPIDR_BASE_MASK UINT64_C(0xfffffffffff00000)
@@ -71,12 +75,12 @@ struct carrick_native_resume_entry {
     void *pad;
 };
 
-static struct carrick_native_resume_page
+static _Thread_local struct carrick_native_resume_page
     carrick_native_resume_pages[CARRICK_NATIVE_MAX_RESUME_PAGES];
-static struct carrick_native_resume_entry
+static _Thread_local struct carrick_native_resume_entry
     carrick_native_resume_cache[CARRICK_NATIVE_RESUME_CACHE_SIZE];
-static size_t carrick_native_resume_page_count;
-static size_t carrick_native_page_size;
+static _Thread_local size_t carrick_native_resume_page_count;
+static _Thread_local size_t carrick_native_page_size;
 
 static struct __darwin_mcontext64 *carrick_native_mcontext(void) {
     return carrick_native_uc.uc_mcontext;
@@ -108,26 +112,39 @@ static void carrick_native_write_tpidr_el0(uint64_t value) {
 
 // The public setter aborts on a same-state call. Signal entry can race that
 // strict check, so use its exported idempotent TPIDR update hook directly.
-static int carrick_native_init_custom_x18(void) {
-    if (carrick_native_update_tpidr != 0) {
-        return 0;
-    }
+static void carrick_native_init_custom_x18_once(void) {
     void *set_symbol = dlsym(RTLD_DEFAULT, "os_set_custom_x18_abi_enabled");
     void *get_symbol = dlsym(RTLD_DEFAULT, "os_custom_x18_abi_enabled");
     void *update_symbol = dlsym(RTLD_DEFAULT, "update_tpidr");
     if (set_symbol == 0 || get_symbol == 0 || update_symbol == 0) {
-        errno = ENOTSUP;
-        return -1;
+        carrick_native_update_tpidr_errno = ENOTSUP;
+        return;
     }
     memcpy(&carrick_native_update_tpidr, update_symbol,
            sizeof(carrick_native_update_tpidr));
     if (carrick_native_update_tpidr == 0) {
-        errno = ENOTSUP;
-        return -1;
+        carrick_native_update_tpidr_errno = ENOTSUP;
+        return;
     }
     memcpy(&carrick_native_update_tpidr_address,
            &carrick_native_update_tpidr,
            sizeof(carrick_native_update_tpidr_address));
+}
+
+static int carrick_native_init_custom_x18(void) {
+    int rc = pthread_once(&carrick_native_update_tpidr_once,
+                          carrick_native_init_custom_x18_once);
+    if (rc != 0) {
+        errno = rc;
+        return -1;
+    }
+    if (carrick_native_update_tpidr_errno != 0 ||
+        carrick_native_update_tpidr == 0) {
+        errno = carrick_native_update_tpidr_errno != 0
+                    ? carrick_native_update_tpidr_errno
+                    : ENOTSUP;
+        return -1;
+    }
     return 0;
 }
 
@@ -510,6 +527,39 @@ int carrick_native_install_trap_handler(void) {
     return 0;
 }
 
+int carrick_native_seed_ucontext(
+    const struct carrick_native_ucontext_snapshot *snapshot) {
+    if (snapshot == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    memset(&carrick_native_uc, 0, sizeof(carrick_native_uc));
+    carrick_native_uc.uc_mcontext = &carrick_native_uc.__mcontext_data;
+    struct __darwin_mcontext64 *mc = carrick_native_mcontext();
+    if (mc == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    for (int i = 0; i < 29; i++) {
+        mc->__ss.__x[i] = snapshot->x[i];
+    }
+    mc->__ss.__fp = snapshot->x[29];
+    mc->__ss.__lr = snapshot->x[30];
+    mc->__ss.__sp = snapshot->sp;
+    mc->__ss.__pc = snapshot->pc;
+    mc->__ss.__cpsr = (uint32_t)snapshot->pstate;
+    memcpy(mc->__ns.__v, snapshot->v, sizeof(snapshot->v));
+    mc->__ns.__fpsr = snapshot->fpsr;
+    mc->__ns.__fpcr = snapshot->fpcr;
+    carrick_native_last_signal = snapshot->signal;
+    carrick_native_last_signal_code = snapshot->signal_code;
+    carrick_native_last_fault_address = snapshot->fault_address;
+    carrick_native_pending_uc = 0;
+    carrick_native_env_ready = 0;
+    return 0;
+}
+
 __attribute__((noreturn)) static void carrick_native_branch(uint64_t entry, uint64_t sp) {
     __asm__ volatile(
         "mov sp, %1\n"
@@ -706,6 +756,11 @@ void carrick_native_clear_icache(void *start, size_t len) {
 }
 #else
 int carrick_native_install_trap_handler(void) { return -1; }
+int carrick_native_seed_ucontext(
+    const struct carrick_native_ucontext_snapshot *snapshot) {
+    (void)snapshot;
+    return -1;
+}
 int carrick_native_enter(uint64_t entry, uint64_t sp) {
     (void)entry;
     (void)sp;
