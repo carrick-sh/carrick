@@ -588,7 +588,7 @@ fn run_image_in_child(
     let exit_code = if libc::WIFEXITED(status) {
         libc::WEXITSTATUS(status)
     } else if libc::WIFSIGNALED(status) {
-        128 + libc::WTERMSIG(status)
+        128 + crate::host_signal::host_to_linux_signum(libc::WTERMSIG(status))
     } else {
         125
     };
@@ -744,11 +744,7 @@ fn run_native_thread_loop(
 
         let mut snapshot = snapshot_ucontext()?;
         if snapshot.event_kind == NATIVE_EVENT_KICK {
-            if let Some(code) =
-                resume_guest_after_kick(&dispatcher, &memory, snapshot, thread_runtime.tid())?
-            {
-                return Ok(NativeThreadLoopOutcome::ProcessExit(code));
-            }
+            resume_guest_after_kick(&dispatcher, &memory, snapshot, thread_runtime.tid())?;
             continue;
         }
         if snapshot.event_kind != NATIVE_EVENT_TRAP {
@@ -900,7 +896,7 @@ fn run_native_thread_loop(
                 )?;
                 match outcome {
                     DispatchOutcome::Returned { value } => {
-                        if let Some(code) = resume_guest_after_syscall(
+                        resume_guest_after_syscall(
                             &dispatcher,
                             &memory,
                             snapshot,
@@ -908,12 +904,10 @@ fn run_native_thread_loop(
                             value,
                             request.number.raw(),
                             thread_runtime.tid(),
-                        )? {
-                            return Ok(NativeThreadLoopOutcome::ProcessExit(code));
-                        }
+                        )?;
                     }
                     DispatchOutcome::Errno { errno } => {
-                        if let Some(code) = resume_guest_after_syscall(
+                        resume_guest_after_syscall(
                             &dispatcher,
                             &memory,
                             snapshot,
@@ -921,9 +915,7 @@ fn run_native_thread_loop(
                             errno.guest_retval(),
                             request.number.raw(),
                             thread_runtime.tid(),
-                        )? {
-                            return Ok(NativeThreadLoopOutcome::ProcessExit(code));
-                        }
+                        )?;
                     }
                     DispatchOutcome::SigReturn => {
                         resume_guest_from_sigreturn(
@@ -934,7 +926,7 @@ fn run_native_thread_loop(
                         )?;
                     }
                     DispatchOutcome::SignalDeath { signum } => {
-                        return Ok(NativeThreadLoopOutcome::ProcessExit(128 + signum));
+                        native_die_by_signal(&dispatcher, signum);
                     }
                     DispatchOutcome::CloneThread {
                         stack,
@@ -961,7 +953,7 @@ fn run_native_thread_loop(
                                 clear_child_tid_addr,
                             },
                         )?;
-                        if let Some(code) = resume_guest_after_syscall(
+                        resume_guest_after_syscall(
                             &dispatcher,
                             &memory,
                             snapshot,
@@ -969,9 +961,7 @@ fn run_native_thread_loop(
                             i64::from(tid.raw()),
                             request.number.raw(),
                             thread_runtime.tid(),
-                        )? {
-                            return Ok(NativeThreadLoopOutcome::ProcessExit(code));
-                        }
+                        )?;
                     }
                     DispatchOutcome::ThreadExit { code } => {
                         if thread_runtime.finish_thread(&dispatcher, &memory) {
@@ -984,7 +974,7 @@ fn run_native_thread_loop(
                         signum,
                     } => {
                         let value = thread_runtime.signal_thread(target, signum);
-                        if let Some(code) = resume_guest_after_syscall(
+                        resume_guest_after_syscall(
                             &dispatcher,
                             &memory,
                             snapshot,
@@ -992,9 +982,7 @@ fn run_native_thread_loop(
                             value,
                             request.number.raw(),
                             thread_runtime.tid(),
-                        )? {
-                            return Ok(NativeThreadLoopOutcome::ProcessExit(code));
-                        }
+                        )?;
                     }
                     DispatchOutcome::Fork {
                         pidfd_out,
@@ -1069,7 +1057,7 @@ fn run_native_thread_loop(
                                 resume_guest_at(entry)?;
                             }
                             Err(errno) => {
-                                if let Some(code) = resume_guest_after_syscall(
+                                resume_guest_after_syscall(
                                     &dispatcher,
                                     &memory,
                                     snapshot,
@@ -1077,9 +1065,7 @@ fn run_native_thread_loop(
                                     errno.guest_retval(),
                                     request.number.raw(),
                                     thread_runtime.tid(),
-                                )? {
-                                    return Ok(NativeThreadLoopOutcome::ProcessExit(code));
-                                }
+                                )?;
                             }
                         }
                     }
@@ -1118,7 +1104,7 @@ fn resume_guest_after_syscall(
     return_value: i64,
     syscall_nr: u64,
     tid: crate::thread::ThreadId,
-) -> Result<Option<i32>, RuntimeError> {
+) -> Result<(), RuntimeError> {
     let pc = {
         let mut memory = memory.lock();
         let mut trap = NativeSignalTrap::new(&mut memory, snapshot, Some(syscall_nr));
@@ -1132,11 +1118,11 @@ fn resume_guest_after_syscall(
             None,
         )?;
         if let Some(action) = action {
-            if let Some(signum) = action.term_signal {
-                return Ok(Some(128 + signum));
-            }
             if let Some(signum) = action.stop_signal {
-                return Ok(Some(128 + signum));
+                crate::exec_helpers::stop_by_signal(signum);
+            }
+            if let Some(signum) = action.term_signal {
+                native_die_by_signal(dispatcher, signum);
             }
         }
         let pc = trap.pc();
@@ -1144,7 +1130,7 @@ fn resume_guest_after_syscall(
         pc
     };
     resume_guest_at(pc)?;
-    Ok(None)
+    Ok(())
 }
 
 fn resume_guest_after_kick(
@@ -1152,7 +1138,7 @@ fn resume_guest_after_kick(
     memory: &SharedNativeMemory,
     snapshot: NativeUcontextSnapshot,
     tid: crate::thread::ThreadId,
-) -> Result<Option<i32>, RuntimeError> {
+) -> Result<(), RuntimeError> {
     let pc = {
         let mut memory = memory.lock();
         let mut trap = NativeSignalTrap::new(&mut memory, snapshot, None);
@@ -1164,11 +1150,11 @@ fn resume_guest_after_kick(
             Some(snapshot.pc),
         )?;
         if let Some(action) = action {
-            if let Some(signum) = action.term_signal {
-                return Ok(Some(128 + signum));
-            }
             if let Some(signum) = action.stop_signal {
-                return Ok(Some(128 + signum));
+                crate::exec_helpers::stop_by_signal(signum);
+            }
+            if let Some(signum) = action.term_signal {
+                native_die_by_signal(dispatcher, signum);
             }
         }
         let pc = trap.pc();
@@ -1176,7 +1162,16 @@ fn resume_guest_after_kick(
         pc
     };
     resume_guest_at(pc)?;
-    Ok(None)
+    Ok(())
+}
+
+fn native_die_by_signal(dispatcher: &SyscallDispatcher, signum: i32) -> ! {
+    dispatcher.cleanup_sysv_ipc_on_process_exit();
+    crate::exec_helpers::forked_child_die_by_signal(
+        signum,
+        dispatcher.stdout(),
+        dispatcher.stderr(),
+    )
 }
 
 fn resume_guest_from_sigreturn(
