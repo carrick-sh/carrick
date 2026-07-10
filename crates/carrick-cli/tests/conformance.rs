@@ -1744,7 +1744,7 @@ fn probe_src_hash(name: &str) -> String {
 fn cached_probe_oracle(lane_label: &str, libc: &str, name: &str) -> Option<String> {
     let raw = std::fs::read_to_string(probe_oracle_dir(lane_label, libc).join(name)).ok()?;
     let (hash_line, body) = raw.split_once('\n')?;
-    (hash_line == probe_src_hash(name)).then(|| body.to_string())
+    (hash_line == probe_src_hash(name)).then(|| normalize(body))
 }
 
 /// Persist a freshly-captured Docker-oracle output for a probe (the bless step).
@@ -3617,6 +3617,13 @@ fn probe_oracle_entry_roundtrip() {
     assert_eq!(body, output);
     // A probe with no source file gets the stable sentinel hash.
     assert_eq!(probe_src_hash("__definitely_not_a_real_probe__"), "nosrc");
+}
+
+#[test]
+fn cached_probe_oracle_output_is_normalized() {
+    let cached = cached_probe_oracle("arm64", "musl", "syscallregpreserve")
+        .expect("shipped syscallregpreserve oracle matches its source");
+    assert_eq!(cached, normalize(&cached));
 }
 
 #[test]
