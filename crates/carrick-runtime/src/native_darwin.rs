@@ -2271,6 +2271,7 @@ fn handle_native_fork(
     } else {
         None
     };
+    let parent_tid = thread_runtime.tid();
     let child_parent = std::process::id();
     let child_subreaper = dispatcher.subreaper_for_fork_child();
     let child_ns_pid = crate::namespace::pid::allocate_child_ns_pid_pre_fork();
@@ -2316,6 +2317,7 @@ fn handle_native_fork(
         native_after_fork_child(dispatcher);
         native_trace_fork_phase("child-dispatcher-reset");
         thread_runtime.reset_after_fork_child();
+        dispatcher.migrate_thread_signal_state(parent_tid, thread_runtime.tid());
         thread_runtime.prepare_kick_target()?;
         native_trace_fork_phase("child-thread-runtime-reset");
         crate::guest_cpu::reset();
