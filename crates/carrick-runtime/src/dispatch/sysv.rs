@@ -2111,6 +2111,7 @@ impl SyscallDispatcher {
         fn shmat(this, cx, shmid: u64, addr: u64, flag: u64) {
             let shmid = shmid as i32;
             let attach_flags = ShmAttachFlags::from_bits_retain(flag);
+            let linux_page_size = this.linux_page_size();
             let (host_fd, size) = {
                 let mut state = this.sysv.lock();
                 match shmat_open_fd(&mut state, shmid) {
@@ -2134,7 +2135,7 @@ impl SyscallDispatcher {
             // outright rather than relocated. shmat03 attaches at a low address
             // and asserts nothing maps within the first 64 KiB.
             const MMAP_MIN_ADDR: u64 = 0x10000;
-            if addr != 0 && (addr & !(LINUX_PAGE_SIZE - 1)) < MMAP_MIN_ADDR {
+            if addr != 0 && (addr & !(linux_page_size - 1)) < MMAP_MIN_ADDR {
                 unsafe { libc::close(host_fd) };
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
@@ -2173,14 +2174,14 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
             };
             if addr != 0
-                && !addr.is_multiple_of(LINUX_PAGE_SIZE)
+                && !addr.is_multiple_of(linux_page_size)
                 && !attach_flags.contains(ShmAttachFlags::RND)
             {
                 unsafe { libc::close(host_fd) };
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             let va = if addr != 0 {
-                addr & !(LINUX_PAGE_SIZE - 1)
+                addr & !(linux_page_size - 1)
             } else {
                 crate::memory::LINUX_HIGH_VA_THRESHOLD
                     + (ipa - crate::memory::LINUX_ALIAS_IPA_BASE)
