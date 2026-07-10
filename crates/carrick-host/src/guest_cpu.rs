@@ -27,6 +27,7 @@ use carrick_kernel::arena::{ArenaError, KernelArena};
 use carrick_kernel::domains::{HostPid, ProcessGeneration};
 use carrick_kernel::process::{
     FLAG_ADOPTED, FLAG_ALIVE, ProcessRecord, ProcessRecordRef, ProcessSection, REGISTERING,
+    VirtualPtraceState,
 };
 
 /// Per-vCPU accumulated guest execution nanoseconds, one atomic slot per vCPU
@@ -420,6 +421,25 @@ fn record_ptrace_stop_signal(record: &ProcessRecord) -> u64 {
     record.ptrace_stop_signal.load(Ordering::Acquire)
 }
 
+fn record_ptrace_tracer_pid(record: &ProcessRecord) -> u32 {
+    record.ptrace_tracer_pid.load(Ordering::Acquire)
+}
+
+fn record_virtual_ptrace_state(record: &ProcessRecord) -> u32 {
+    record.ptrace_state.load(Ordering::Acquire)
+}
+
+fn transition_virtual_ptrace_state(
+    record: &ProcessRecord,
+    from: VirtualPtraceState,
+    to: VirtualPtraceState,
+) -> bool {
+    record
+        .ptrace_state
+        .compare_exchange(from.raw(), to.raw(), Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+}
+
 fn record_guest_ns(record: &ProcessRecord) -> u64 {
     record.guest_ns.load(Ordering::Acquire)
 }
@@ -491,6 +511,189 @@ pub fn mark_self_ptrace_stop_pending(signum: i32) {
     });
 }
 
+/// Register the current process as a Darwin-native virtual ptrace tracee.
+/// The tracer must be the parent recorded before `fork(2)` published this slot.
+pub fn register_self_virtual_ptrace(tracer_pid: u32) -> bool {
+    if tracer_pid == 0 {
+        return false;
+    }
+    let Some(record) = child_record(std::process::id()) else {
+        return false;
+    };
+    if record_parent_pid(record) != tracer_pid
+        || record_virtual_ptrace_state(record) != VirtualPtraceState::Untraced.raw()
+    {
+        return false;
+    }
+    if record
+        .ptrace_tracer_pid
+        .compare_exchange(0, tracer_pid, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return false;
+    }
+    if transition_virtual_ptrace_state(
+        record,
+        VirtualPtraceState::Untraced,
+        VirtualPtraceState::Running,
+    ) {
+        return true;
+    }
+    let _ = record.ptrace_tracer_pid.compare_exchange(
+        tracer_pid,
+        0,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    );
+    false
+}
+
+/// Whether the current process still has an active virtual ptrace owner.
+pub fn self_is_virtual_ptrace_tracee() -> bool {
+    child_record(std::process::id()).is_some_and(|record| {
+        record_ptrace_tracer_pid(record) != 0
+            && record_virtual_ptrace_state(record) != VirtualPtraceState::Untraced.raw()
+    })
+}
+
+/// Publish a Linux signal-delivery stop before the tracee raises host SIGSTOP.
+pub fn request_self_virtual_ptrace_stop(signum: i32) -> bool {
+    let Ok(signum) = u64::try_from(signum) else {
+        return false;
+    };
+    if signum == 0 {
+        return false;
+    }
+    let Some(record) = child_record(std::process::id()) else {
+        return false;
+    };
+    if record_ptrace_tracer_pid(record) == 0 {
+        return false;
+    }
+    record.ptrace_stop_signal.store(signum, Ordering::Release);
+    if transition_virtual_ptrace_state(
+        record,
+        VirtualPtraceState::Running,
+        VirtualPtraceState::StopRequested,
+    ) {
+        return true;
+    }
+    let _ =
+        record
+            .ptrace_stop_signal
+            .compare_exchange(signum, 0, Ordering::AcqRel, Ordering::Acquire);
+    false
+}
+
+/// Whether `pid` has requested a virtual ptrace stop for `tracer_pid`.
+pub fn child_virtual_ptrace_stop_requested(pid: u32, tracer_pid: u32) -> bool {
+    child_record(pid).is_some_and(|record| {
+        record_ptrace_tracer_pid(record) == tracer_pid
+            && record_virtual_ptrace_state(record) == VirtualPtraceState::StopRequested.raw()
+    })
+}
+
+/// Convert one confirmed host SIGSTOP into exactly one Linux ptrace stop.
+pub fn report_child_virtual_ptrace_stop(pid: u32, tracer_pid: u32) -> Option<i32> {
+    let record = child_record(pid)?;
+    if record_ptrace_tracer_pid(record) != tracer_pid
+        || !transition_virtual_ptrace_state(
+            record,
+            VirtualPtraceState::StopRequested,
+            VirtualPtraceState::StopReported,
+        )
+    {
+        return None;
+    }
+    i32::try_from(record_ptrace_stop_signal(record))
+        .ok()
+        .filter(|signum| *signum != 0)
+}
+
+fn rollback_virtual_ptrace_resume(record: &ProcessRecord, signum: u64) {
+    record.ptrace_stop_signal.store(signum, Ordering::Release);
+    record
+        .ptrace_state
+        .store(VirtualPtraceState::StopReported.raw(), Ordering::Release);
+}
+
+/// Resume a reported virtual ptrace stop using host SIGCONT.
+pub fn resume_child_virtual_ptrace(pid: u32, tracer_pid: u32) -> bool {
+    let Some(record) = child_record(pid) else {
+        return false;
+    };
+    if record_ptrace_tracer_pid(record) != tracer_pid
+        || !transition_virtual_ptrace_state(
+            record,
+            VirtualPtraceState::StopReported,
+            VirtualPtraceState::Running,
+        )
+    {
+        return false;
+    }
+    let signum = record.ptrace_stop_signal.swap(0, Ordering::AcqRel);
+    if unsafe { libc::kill(pid as i32, libc::SIGCONT) } == 0 {
+        return true;
+    }
+    rollback_virtual_ptrace_resume(record, signum);
+    false
+}
+
+/// Kill a reported virtual ptrace tracee using host SIGKILL.
+pub fn kill_child_virtual_ptrace(pid: u32, tracer_pid: u32) -> bool {
+    let Some(record) = child_record(pid) else {
+        return false;
+    };
+    if record_ptrace_tracer_pid(record) != tracer_pid
+        || !transition_virtual_ptrace_state(
+            record,
+            VirtualPtraceState::StopReported,
+            VirtualPtraceState::Running,
+        )
+    {
+        return false;
+    }
+    let signum = record.ptrace_stop_signal.swap(0, Ordering::AcqRel);
+    if unsafe { libc::kill(pid as i32, libc::SIGKILL) } == 0 {
+        return true;
+    }
+    rollback_virtual_ptrace_resume(record, signum);
+    false
+}
+
+/// Detach a reported virtual ptrace tracee and resume it with host SIGCONT.
+pub fn detach_child_virtual_ptrace(pid: u32, tracer_pid: u32) -> bool {
+    let Some(record) = child_record(pid) else {
+        return false;
+    };
+    if record_ptrace_tracer_pid(record) != tracer_pid
+        || !transition_virtual_ptrace_state(
+            record,
+            VirtualPtraceState::StopReported,
+            VirtualPtraceState::Untraced,
+        )
+    {
+        return false;
+    }
+    let signum = record.ptrace_stop_signal.swap(0, Ordering::AcqRel);
+    if record
+        .ptrace_tracer_pid
+        .compare_exchange(tracer_pid, 0, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        rollback_virtual_ptrace_resume(record, signum);
+        return false;
+    }
+    if unsafe { libc::kill(pid as i32, libc::SIGCONT) } == 0 {
+        return true;
+    }
+    record
+        .ptrace_tracer_pid
+        .store(tracer_pid, Ordering::Release);
+    rollback_virtual_ptrace_resume(record, signum);
+    false
+}
+
 /// Clear and return the pending ptrace signal-stop marker once wait4 reports it.
 pub fn take_child_ptrace_stop_signal(pid: u32) -> Option<i32> {
     let record = child_record(pid)?;
@@ -538,6 +741,10 @@ pub fn record_child_exit_status(pid: u32, guest_ns: u64, status: i32, status_rea
         let status_ready = status_ready || adopted_flag(record);
         record.guest_ns.store(guest_ns, Ordering::Release);
         record.ptrace_stop_signal.store(0, Ordering::Release);
+        record.ptrace_tracer_pid.store(0, Ordering::Release);
+        record
+            .ptrace_state
+            .store(VirtualPtraceState::Untraced.raw(), Ordering::Release);
         if status_ready {
             store_exit_status(record, status);
             store_exit_ready(record, true);
@@ -548,6 +755,10 @@ pub fn record_child_exit_status(pid: u32, guest_ns: u64, status: i32, status_rea
     claim_child_record(pid, |record| {
         record.guest_ns.store(guest_ns, Ordering::Release);
         record.ptrace_stop_signal.store(0, Ordering::Release);
+        record.ptrace_tracer_pid.store(0, Ordering::Release);
+        record
+            .ptrace_state
+            .store(VirtualPtraceState::Untraced.raw(), Ordering::Release);
         if status_ready {
             store_exit_status(record, status);
             store_exit_ready(record, true);
@@ -658,6 +869,10 @@ pub fn reap_child_guest_ns(pid: u32) -> u64 {
         let ns = record_guest_ns(record);
         record.guest_ns.store(0, Ordering::Release);
         record.ptrace_stop_signal.store(0, Ordering::Release);
+        record.ptrace_tracer_pid.store(0, Ordering::Release);
+        record
+            .ptrace_state
+            .store(VirtualPtraceState::Untraced.raw(), Ordering::Release);
         if record_ns_pid(record) == 0 {
             release_child_pid(pid);
         }
@@ -749,6 +964,54 @@ mod tests {
         assert!(!child_has_ptrace_stop_pending(pid));
         assert_eq!(reap_child_guest_ns(pid), 1234);
         assert!(!child_has_ptrace_stop_pending(pid));
+    }
+
+    #[test]
+    fn virtual_ptrace_stop_is_reported_once_then_resumed() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        init_child_table();
+        let tracer_pid = std::process::id();
+        let prepared =
+            prepare_child_record_pre_fork(tracer_pid, 0, 0, false, 0).expect("prepare child");
+
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed");
+        if child == 0 {
+            complete_child_record_post_fork_child();
+            if !register_self_virtual_ptrace(tracer_pid)
+                || !request_self_virtual_ptrace_stop(libc::SIGUSR2)
+            {
+                unsafe { libc::_exit(70) };
+            }
+            unsafe {
+                libc::raise(libc::SIGSTOP);
+                libc::_exit(42);
+            }
+        }
+
+        publish_prepared_child_record_parent_ref(prepared, child as u32);
+        let mut stop_status = 0;
+        let stopped = unsafe { libc::waitpid(child, &mut stop_status, libc::WUNTRACED) };
+        assert_eq!(stopped, child);
+        assert!(libc::WIFSTOPPED(stop_status));
+        assert_eq!(libc::WSTOPSIG(stop_status), libc::SIGSTOP);
+        assert_eq!(
+            report_child_virtual_ptrace_stop(child as u32, tracer_pid),
+            Some(libc::SIGUSR2)
+        );
+        assert_eq!(
+            report_child_virtual_ptrace_stop(child as u32, tracer_pid),
+            None,
+            "one host stop must produce exactly one guest report"
+        );
+        assert!(resume_child_virtual_ptrace(child as u32, tracer_pid));
+
+        let mut exit_status = 0;
+        let reaped = unsafe { libc::waitpid(child, &mut exit_status, 0) };
+        assert_eq!(reaped, child);
+        assert!(libc::WIFEXITED(exit_status));
+        assert_eq!(libc::WEXITSTATUS(exit_status), 42);
+        let _ = reap_child_guest_ns(child as u32);
     }
 
     #[test]

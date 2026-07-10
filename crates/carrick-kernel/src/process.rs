@@ -13,6 +13,21 @@ pub const FLAG_ORPHANED: u32 = 1 << 1;
 pub const FLAG_DEAD: u32 = 1 << 2;
 pub const FLAG_ADOPTED: u32 = 1 << 3;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum VirtualPtraceState {
+    Untraced = 0,
+    Running = 1,
+    StopRequested = 2,
+    StopReported = 3,
+}
+
+impl VirtualPtraceState {
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
+}
+
 #[repr(C)]
 pub struct ProcessSection {
     pub next_ns_pid: AtomicU32,
@@ -39,6 +54,8 @@ pub struct ProcessRecord {
     pub ptrace_stop_signal: AtomicU64,
     pub exit_status: AtomicU64,
     pub exit_ready: AtomicU32,
+    pub ptrace_tracer_pid: AtomicU32,
+    pub ptrace_state: AtomicU32,
     _pad: AtomicU32,
     pub guest_ns: AtomicU64,
 }
@@ -145,6 +162,9 @@ impl ProcessRecord {
         self.ptrace_stop_signal.store(0, Ordering::Relaxed);
         self.exit_status.store(0, Ordering::Relaxed);
         self.exit_ready.store(0, Ordering::Relaxed);
+        self.ptrace_tracer_pid.store(0, Ordering::Relaxed);
+        self.ptrace_state
+            .store(VirtualPtraceState::Untraced.raw(), Ordering::Relaxed);
         self.guest_ns.store(0, Ordering::Relaxed);
     }
 }
