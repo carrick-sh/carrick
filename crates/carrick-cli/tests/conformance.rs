@@ -3652,6 +3652,50 @@ fn native_conformance_rejects_readonly_syscall_output() {
 
 #[test]
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn native_conformance_memory_probes_use_selected_page_size() {
+    let _serial = CONFORMANCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let Some(bin) = carrick_bin() else {
+        eprintln!(
+            "SKIP native_conformance_memory_probes_use_selected_page_size: target/release/carrick not built"
+        );
+        return;
+    };
+    ensure_signed(&bin);
+
+    let mincore = ensure_native_static_pie_probe("mincoreedge");
+    let mlock = ensure_native_static_pie_probe("mlock2");
+    for profile in ["native16k", "linux4k"] {
+        let mincore_output = run_native_run_elf(&bin, &mincore, profile);
+        assert!(
+            mincore_output.contains("status=exit status: 0")
+                && mincore_output.contains("invalid_vec_errno=14")
+                && mincore_output.contains("hole_errno=12"),
+            "{profile} mincoreedge did not use the selected Linux page size:\n{mincore_output}"
+        );
+
+        let mlock_output = run_native_run_elf(&bin, &mlock, profile);
+        assert!(
+            mlock_output.contains("status=exit status: 0")
+                && mlock_output.contains("mlock2_onfault_ok=true")
+                && mlock_output.contains("mlock2_vmlck_grew=true")
+                && mlock_output.contains("mlock2_repeat_not_double=true")
+                && mlock_output.contains("mlock2_invalid_flag_einval=true")
+                && mlock_output.contains("mlock2_unmapped_enomem=true")
+                && mlock_output.contains("mlock2_mincore_onfault_empty_pages=0")
+                && mlock_output.contains("mlock2_mincore_onfault_half_pages=4")
+                && mlock_output.contains("mlock2_mincore_populated_pages=8")
+                && mlock_output.contains("mlock2_mincore_onfault_empty=true")
+                && mlock_output.contains("mlock2_mincore_onfault_half=true")
+                && mlock_output.contains("mlock2_mincore_populated=true")
+                && mlock_output.contains("mmap_locked_vmlck_grew=true"),
+            "{profile} mlock2 did not use the selected Linux page size:\n{mlock_output}"
+        );
+    }
+}
+
+#[test]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn native_conformance_run_elf_supports_clone_child_stack() {
     let _serial = CONFORMANCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 

@@ -1196,6 +1196,9 @@ impl SyscallDispatcher {
             {
                 let locked_range =
                     this.prepare_mmap_locked_range(map_flags, requested.0, length)?;
+                if let Some(range) = locked_range {
+                    this.populate_resident_range(memory, range)?;
+                }
                 let overlay_va = {
                     let mut mem = this.mem.lock();
                     // Re-MAP_FIXED over the same VA: free the prior overlay slot.
@@ -1221,6 +1224,7 @@ impl SyscallDispatcher {
                     this.mem.lock().overlay.free(overlay_va);
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 }
+                this.commit_eager_locked_range(locked_range);
                 this.record_dynamic_mapping(
                     requested.0,
                     length,
@@ -1228,7 +1232,6 @@ impl SyscallDispatcher {
                     ProcMapSharing::Private,
                     String::new(),
                 );
-                this.commit_mmap_locked_range(locked_range);
                 return Ok(DispatchOutcome::Returned {
                     value: requested.0 as i64,
                 });
@@ -1274,6 +1277,14 @@ impl SyscallDispatcher {
                     }
                 };
                 if let Some(dup_fd) = dup_fd {
+                    let locked_len = match this.prepare_fresh_mmap_locked_length(map_flags, length)
+                    {
+                        Ok(length) => length,
+                        Err(errno) => {
+                            unsafe { libc::close(dup_fd) };
+                            return Ok(DispatchOutcome::errno(errno));
+                        }
+                    };
                     // Reserve a FRESH alias IPA (2 MiB-block-aligned so no two
                     // file mappings share a stage-1 block). The allocator is
                     // PROCESS-TREE-GLOBAL and monotonic — never reused — because
@@ -1291,6 +1302,18 @@ impl SyscallDispatcher {
                     };
                     let va = crate::memory::LINUX_HIGH_VA_THRESHOLD
                         + (ipa - crate::memory::LINUX_ALIAS_IPA_BASE);
+                    let locked_range = match locked_len {
+                        Some(length) => match va.checked_add(length).and_then(|end| {
+                            crate::vfs::GuestMemoryRange::new(GuestVa(va), GuestVa(end))
+                        }) {
+                            Some(range) => Some(range),
+                            None => {
+                                unsafe { libc::close(dup_fd) };
+                                return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                            }
+                        },
+                        None => None,
+                    };
                     // Host mmap prot MUST match the guest's request (and thus the
                     // fd's access mode) for READ/WRITE: MAP_SHARED|PROT_WRITE of a
                     // read-only fd is EACCES. Translate the guest PROT_* bits to
@@ -1322,6 +1345,8 @@ impl SyscallDispatcher {
                     if let Ok(l) = usize::try_from(length) {
                         memory.set_no_access(va, l, prot_none);
                     }
+                    this.mark_range_resident(va, length);
+                    this.commit_eager_locked_range(locked_range);
                     this.record_dynamic_mapping(
                         va,
                         length,
@@ -1386,6 +1411,18 @@ impl SyscallDispatcher {
                         let _ = memory.protect_range(addr, map_len_usize, 0);
                         this.track_resident_fault_range(addr, length, prot_flags);
                     }
+                    if let Err(errno) = this.commit_mmap_locked_range(memory, locked_range) {
+                        memory.set_no_access(addr, map_len_usize, false);
+                        memory.set_no_write(addr, map_len_usize, false);
+                        let _ = memory.protect_range(
+                            addr,
+                            map_len_usize,
+                            crate::linux_abi::LINUX_PROT_READ
+                                | crate::linux_abi::LINUX_PROT_WRITE,
+                        );
+                        this.rollback_shared_anon_mapping(addr, length);
+                        return Ok(DispatchOutcome::errno(errno));
+                    }
                     this.record_dynamic_mapping(
                         addr,
                         length,
@@ -1393,7 +1430,6 @@ impl SyscallDispatcher {
                         ProcMapSharing::Shared,
                         String::new(),
                     );
-                    this.commit_mmap_locked_range(locked_range);
                     return Ok(DispatchOutcome::Returned { value: addr as i64 });
                 }
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
@@ -1446,6 +1482,7 @@ impl SyscallDispatcher {
                 if memory.protect_range(address, length_usize, 0).is_err() && in_arena {
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 }
+                this.commit_mmap_locked_range(memory, locked_range)?;
                 this.record_dynamic_mapping(
                     address,
                     length,
@@ -1453,7 +1490,6 @@ impl SyscallDispatcher {
                     map_sharing.proc_map_sharing(),
                     String::new(),
                 );
-                this.commit_mmap_locked_range(locked_range);
                 if map_flags.contains(LinuxMmapFlags::GROWSDOWN) {
                     this.record_growdown_mapping(address, length);
                 }
@@ -1477,6 +1513,7 @@ impl SyscallDispatcher {
                 if memory.protect_range(address, length_usize, prot).is_err() && in_arena {
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 }
+                this.commit_mmap_locked_range(memory, locked_range)?;
                 this.record_dynamic_mapping(
                     address,
                     length,
@@ -1484,7 +1521,6 @@ impl SyscallDispatcher {
                     map_sharing.proc_map_sharing(),
                     String::new(),
                 );
-                this.commit_mmap_locked_range(locked_range);
                 if map_flags.contains(LinuxMmapFlags::GROWSDOWN) {
                     this.record_growdown_mapping(address, length);
                 }
@@ -1629,6 +1665,7 @@ impl SyscallDispatcher {
                     }
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 }
+                let locked_range = this.prepare_mmap_locked_range(map_flags, address, length)?;
                 // Reserve a FRESH alias IPA (2 MiB-block-aligned). Process-tree-
                 // global + monotonic, NEVER reused — the shared `hv_vm`'s stage-2
                 // TLB can't be flushed on arm64, so a reused IPA reads a stale
@@ -1654,6 +1691,12 @@ impl SyscallDispatcher {
                     length_usize,
                     !prot_none && !prot_flags.contains(LinuxProtFlags::WRITE),
                 );
+                if !map_flags.contains(LinuxMmapFlags::ANONYMOUS)
+                    || map_flags.contains(LinuxMmapFlags::POPULATE)
+                {
+                    this.mark_range_resident(address, length);
+                }
+                this.commit_eager_locked_range(locked_range);
                 this.record_dynamic_mapping(
                     address,
                     length,
@@ -1708,17 +1751,10 @@ impl SyscallDispatcher {
                 && let Some(bus_len) = length.checked_sub(bus_offset)
                 && let Ok(bus_len_usize) = usize::try_from(bus_len)
             {
-                cx.memory.set_no_access(bus_start, bus_len_usize, true);
-                let _ = cx.memory.protect_range(bus_start, bus_len_usize, 0);
+                memory.set_no_access(bus_start, bus_len_usize, true);
+                let _ = memory.protect_range(bus_start, bus_len_usize, 0);
                 this.record_mmap_bus_fault_range(bus_start, bus_len);
             }
-            this.record_dynamic_mapping(
-                address,
-                length,
-                prot_flags,
-                map_sharing.proc_map_sharing(),
-                String::new(),
-            );
             // A file-backed mapping's content is loaded eagerly (above), and
             // MAP_POPULATE prefaults anonymous pages — so mincore must report
             // those pages resident even before the guest touches them (LTP
@@ -1728,7 +1764,14 @@ impl SyscallDispatcher {
             {
                 this.mark_range_resident(address, length);
             }
-            this.commit_mmap_locked_range(locked_range);
+            this.commit_mmap_locked_range(memory, locked_range)?;
+            this.record_dynamic_mapping(
+                address,
+                length,
+                prot_flags,
+                map_sharing.proc_map_sharing(),
+                String::new(),
+            );
             Ok(DispatchOutcome::Returned {
                 value: address as i64,
             })
@@ -1917,7 +1960,10 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             if flags.contains(LinuxMlockallFlags::CURRENT) {
-                this.lock_current_mappings()?;
+                this.lock_current_mappings(
+                    &mut *cx.memory,
+                    flags.contains(LinuxMlockallFlags::ONFAULT),
+                )?;
             }
             Ok(DispatchOutcome::Returned { value: 0 })
         }
@@ -2465,12 +2511,14 @@ impl SyscallDispatcher {
     /// unmapped/untouched pages as resident). A page inside a post-exec VMA
     /// (`dynamic_maps`) is resident only when carrick has populated it: a file
     /// load / MAP_POPULATE marks `resident_ranges`, a fault commits it, and
-    /// `mlock` records both `resident_ranges` and `locked_ranges`. A fresh,
-    /// untouched anonymous mapping is therefore NOT resident (LTP mincore03),
-    /// while a file-backed or mlocked mapping is (mincore02/04). Pages outside
-    /// every post-exec VMA belong to loader-populated initial regions (ELF
-    /// text/data, heap, stack, trampolines) and stay resident, matching the
-    /// prior conservative default.
+    /// `mlock` without `MLOCK_ONFAULT` populates before recording the lock. A
+    /// lock created with `MLOCK_ONFAULT` remains only in `locked_ranges` until
+    /// each page faults, so lock accounting alone must not imply residency. A
+    /// fresh, untouched anonymous mapping is therefore NOT resident (LTP
+    /// mincore03), while a file-backed or populated mlocked mapping is
+    /// (mincore02/04). Pages outside every post-exec VMA belong to loader-
+    /// populated initial regions (ELF text/data, heap, stack, trampolines) and
+    /// stay resident, matching the prior conservative default.
     fn mincore_residency_vector(
         &self,
         address: u64,
@@ -2487,7 +2535,6 @@ impl SyscallDispatcher {
                 .any(|m| page >= m.start && page < m.end);
             let resident = if in_dynamic {
                 ranges_contain_page(&mem.resident_ranges, page)
-                    || ranges_contain_page(&mem.locked_ranges, page)
             } else {
                 true
             };
@@ -2551,7 +2598,7 @@ impl SyscallDispatcher {
 
     fn add_locked_range(&self, range: crate::vfs::GuestMemoryRange) -> Result<(), LinuxErrno> {
         self.check_locked_range_limit(range)?;
-        self.commit_mmap_locked_range(Some(range));
+        locked_ranges_insert(&mut self.mem.lock().locked_ranges, range);
         Ok(())
     }
 
@@ -2570,6 +2617,30 @@ impl SyscallDispatcher {
         };
         self.check_locked_range_limit(range)?;
         Ok(Some(range))
+    }
+
+    fn prepare_fresh_mmap_locked_length(
+        &self,
+        flags: LinuxMmapFlags,
+        length: u64,
+    ) -> Result<Option<u64>, LinuxErrno> {
+        if !flags.contains(LinuxMmapFlags::LOCKED) {
+            return Ok(None);
+        }
+        let length = align_up_u64(length, self.linux_page_size()).ok_or(LINUX_ENOMEM)?;
+        let creds = self.cred_snapshot();
+        if creds.euid == 0 {
+            return Ok(Some(length));
+        }
+        let limit = self.effective_resource_limit(LINUX_RLIMIT_MEMLOCK).rlim_cur;
+        if limit == 0 {
+            return Err(LINUX_EPERM);
+        }
+        let locked = locked_ranges_total(&self.mem.lock().locked_ranges);
+        if locked.checked_add(length).is_none_or(|total| total > limit) {
+            return Err(LINUX_ENOMEM);
+        }
+        Ok(Some(length))
     }
 
     fn check_locked_range_limit(
@@ -2596,18 +2667,52 @@ impl SyscallDispatcher {
         Ok(())
     }
 
-    fn commit_mmap_locked_range(&self, range: Option<crate::vfs::GuestMemoryRange>) {
+    fn commit_mmap_locked_range(
+        &self,
+        memory: &mut impl GuestMemory,
+        range: Option<crate::vfs::GuestMemoryRange>,
+    ) -> Result<(), LinuxErrno> {
+        let Some(range) = range else {
+            return Ok(());
+        };
+        self.populate_resident_range(memory, range)?;
+        locked_ranges_insert(&mut self.mem.lock().locked_ranges, range);
+        Ok(())
+    }
+
+    fn commit_eager_locked_range(&self, range: Option<crate::vfs::GuestMemoryRange>) {
         let Some(range) = range else {
             return;
         };
-        locked_ranges_insert(&mut self.mem.lock().locked_ranges, range);
+        let mut mem = self.mem.lock();
+        locked_ranges_insert(&mut mem.resident_ranges, range);
+        locked_ranges_insert(&mut mem.locked_ranges, range);
+    }
+
+    fn rollback_shared_anon_mapping(&self, address: u64, length: u64) {
+        let Some(end) = address.checked_add(length) else {
+            return;
+        };
+        let Some(range) = crate::vfs::GuestMemoryRange::new(GuestVa(address), GuestVa(end)) else {
+            return;
+        };
+        let mut mem = self.mem.lock();
+        mem.shared.free(address);
+        locked_ranges_remove(&mut mem.locked_ranges, range);
+        locked_ranges_remove(&mut mem.resident_ranges, range);
+        locked_ranges_remove(&mut mem.resident_tracked_ranges, range);
+        remove_fault_range(&mut mem.resident_fault_ranges, range);
     }
 
     fn remove_locked_range(&self, range: crate::vfs::GuestMemoryRange) {
         locked_ranges_remove(&mut self.mem.lock().locked_ranges, range);
     }
 
-    fn lock_current_mappings(&self) -> Result<(), LinuxErrno> {
+    fn lock_current_mappings(
+        &self,
+        memory: &mut impl GuestMemory,
+        onfault: bool,
+    ) -> Result<(), LinuxErrno> {
         let mem = self.mem.lock();
         let mut ranges = mem.locked_ranges.clone();
         if let Some(regions) = &mem.address_space_regions {
@@ -2636,6 +2741,11 @@ impl SyscallDispatcher {
             }
             if locked_ranges_total(&ranges) > limit {
                 return Err(LINUX_ENOMEM);
+            }
+        }
+        if !onfault {
+            for range in &ranges {
+                self.populate_resident_range(memory, *range)?;
             }
         }
         self.mem.lock().locked_ranges = ranges;
@@ -2901,6 +3011,96 @@ mod tests {
         assert_eq!(
             ranges,
             vec![(0x1000, 0x2000), (0x4000, 0x5000), (0x8000, 0x9000)]
+        );
+    }
+
+    #[test]
+    fn mincore_onfault_lock_is_not_resident_until_page_is_touched() {
+        let dispatcher = SyscallDispatcher::new();
+        let base = LINUX_MMAP_BASE;
+        let length = 2 * LINUX_PAGE_SIZE;
+        dispatcher.record_dynamic_mapping(
+            base,
+            length,
+            LinuxProtFlags::READ | LinuxProtFlags::WRITE,
+            ProcMapSharing::Shared,
+            String::new(),
+        );
+        let range =
+            crate::vfs::GuestMemoryRange::new(GuestVa(base), GuestVa(base.saturating_add(length)))
+                .expect("valid locked range");
+        locked_ranges_insert(&mut dispatcher.mem.lock().locked_ranges, range);
+
+        assert_eq!(
+            dispatcher.mincore_residency_vector(base, 2, LINUX_PAGE_SIZE),
+            Some(vec![0, 0]),
+            "MLOCK_ONFAULT accounting alone must not make pages resident"
+        );
+
+        dispatcher.mark_range_resident(base, LINUX_PAGE_SIZE);
+        assert_eq!(
+            dispatcher.mincore_residency_vector(base, 2, LINUX_PAGE_SIZE),
+            Some(vec![1, 0]),
+            "only the populated page becomes resident"
+        );
+    }
+
+    #[test]
+    fn eager_lock_paths_populate_mincore_residency() {
+        let base = LINUX_MMAP_BASE;
+        let length = 2 * LINUX_PAGE_SIZE;
+        let range =
+            crate::vfs::GuestMemoryRange::new(GuestVa(base), GuestVa(base.saturating_add(length)))
+                .expect("valid locked range");
+        let mut memory = LinearMemory::new(base, vec![0; length as usize]);
+
+        let map_locked = SyscallDispatcher::new();
+        map_locked.record_dynamic_mapping(
+            base,
+            length,
+            LinuxProtFlags::READ | LinuxProtFlags::WRITE,
+            ProcMapSharing::Private,
+            String::new(),
+        );
+        map_locked
+            .commit_mmap_locked_range(&mut memory, Some(range))
+            .expect("populate MAP_LOCKED range");
+        assert_eq!(
+            map_locked.mincore_residency_vector(base, 2, LINUX_PAGE_SIZE),
+            Some(vec![1, 1]),
+            "MAP_LOCKED must populate the mapping"
+        );
+
+        let mlockall = SyscallDispatcher::new();
+        mlockall.record_dynamic_mapping(
+            base,
+            length,
+            LinuxProtFlags::READ | LinuxProtFlags::WRITE,
+            ProcMapSharing::Private,
+            String::new(),
+        );
+        mlockall
+            .lock_current_mappings(&mut memory, false)
+            .expect("populate MCL_CURRENT mappings");
+        assert_eq!(
+            mlockall.mincore_residency_vector(base, 2, LINUX_PAGE_SIZE),
+            Some(vec![1, 1]),
+            "MCL_CURRENT without MCL_ONFAULT must populate current mappings"
+        );
+
+        let alias_locked = SyscallDispatcher::new();
+        alias_locked.commit_eager_locked_range(Some(range));
+        alias_locked.record_dynamic_mapping(
+            base,
+            length,
+            LinuxProtFlags::READ,
+            ProcMapSharing::Shared,
+            String::new(),
+        );
+        assert_eq!(
+            alias_locked.mincore_residency_vector(base, 2, LINUX_PAGE_SIZE),
+            Some(vec![1, 1]),
+            "deferred host aliases must publish eager MAP_LOCKED residency"
         );
     }
 
