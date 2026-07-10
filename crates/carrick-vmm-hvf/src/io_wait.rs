@@ -462,7 +462,7 @@ impl ThreadWaiter {
             if !self.has_dead_wake_pipe()
                 && let Some(kq) = self.kq.as_ref()
             {
-                result = self.wait_kqueue(kq, wait_fds, timeout, block_mask);
+                result = self.wait_kqueue(kq, wait_fds, timeout, block_mask, false);
                 crate::probes::io_wait_end(
                     self.tid.raw(),
                     wait_result_code(result),
@@ -500,6 +500,43 @@ impl ThreadWaiter {
             return WaitResult::Interrupted;
         }
         self.wait(fds, timeout, block_mask)
+    }
+
+    /// Wait for a child stop/continue notification that cannot use
+    /// `EVFILT_PROC`/`NOTE_EXIT`. A signal-pipe edge prompts immediate
+    /// re-dispatch; the 50 ms timeout is a lost-edge backstop.
+    pub fn wait_proc_state_with_dispatch_pending<F>(
+        &self,
+        block_mask: carrick_abi::SigBlockMask,
+        should_interrupt: F,
+    ) -> WaitResult
+    where
+        F: Fn() -> bool,
+    {
+        if should_interrupt() {
+            return WaitResult::Interrupted;
+        }
+        let timeout = Some(Duration::from_millis(50));
+        let result;
+        #[cfg(target_os = "macos")]
+        {
+            if !self.has_dead_wake_pipe()
+                && let Some(kq) = self.kq.as_ref()
+            {
+                result = self.wait_kqueue(kq, &[], timeout, block_mask, true);
+                return if result == WaitResult::Ready && should_interrupt() {
+                    WaitResult::Interrupted
+                } else {
+                    result
+                };
+            }
+        }
+        result = self.fallback_poll(&[], timeout, block_mask);
+        if result == WaitResult::Ready && should_interrupt() {
+            WaitResult::Interrupted
+        } else {
+            result
+        }
     }
 
     /// Block using `poll(2)` instead of the per-thread kqueue. This is used for
@@ -911,6 +948,7 @@ impl ThreadWaiter {
         fds: &[(i32, i16)],
         timeout: Option<Duration>,
         block_mask: carrick_abi::SigBlockMask,
+        wake_on_signal_pipe: bool,
     ) -> WaitResult {
         let deadline = timeout.map(|d| Instant::now() + d);
         let mut changes: Vec<Kevent> = Vec::with_capacity(fds.len() * 2);
@@ -992,15 +1030,21 @@ impl ThreadWaiter {
             if fd_ready {
                 break WaitResult::Ready;
             }
-            if process_pipe_woke
-                && self.drain_process_wake_pipe(kq) == crate::host_signal::DrainResult::Dead
-            {
+            let process_pipe_dead = process_pipe_woke
+                && self.drain_process_wake_pipe(kq) == crate::host_signal::DrainResult::Dead;
+            let thread_pipe_dead = thread_pipe_woke
+                && self.drain_thread_wake_pipe(kq) == crate::host_signal::DrainResult::Dead;
+            if wake_on_signal_pipe && (process_pipe_woke || thread_pipe_woke) {
+                if self.should_interrupt(block_mask) {
+                    break WaitResult::Interrupted;
+                }
+                break WaitResult::Ready;
+            }
+            if process_pipe_dead {
                 self.clear_fd_registrations(kq, fds);
                 return self.fallback_poll(fds, remaining_timeout(deadline), block_mask);
             }
-            if thread_pipe_woke
-                && self.drain_thread_wake_pipe(kq) == crate::host_signal::DrainResult::Dead
-            {
+            if thread_pipe_dead {
                 self.clear_fd_registrations(kq, fds);
                 return self.fallback_poll(fds, remaining_timeout(deadline), block_mask);
             }
@@ -1402,6 +1446,20 @@ mod tests {
         assert_eq!(unsafe { libc::close(fds[1]) }, 0);
     }
 
+    #[test]
+    fn proc_state_wait_redispatches_after_bounded_backstop() {
+        let _g = crate::host_signal::PUMP_STATE_TEST_LOCK.lock();
+        crate::host_signal::reset_after_supervisor_fork();
+        let waiter = super::ThreadWaiter::new(carrick_hal::ThreadId::synthetic_for_tests(7));
+        let started = std::time::Instant::now();
+
+        let result =
+            waiter.wait_proc_state_with_dispatch_pending(carrick_abi::SigBlockMask::NONE, || false);
+
+        assert_eq!(result, super::WaitResult::TimedOut);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn child_status_ready_ignores_stopped_child() {
@@ -1449,6 +1507,50 @@ mod tests {
             !ready,
             "a stopped child is not exit-ready for a WEXITED-only waiter"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn child_status_ready_observes_requested_virtual_ptrace_stop() {
+        let _fork_serial = crate::fork_test_lock();
+        crate::guest_cpu::init_child_table();
+        let tracer_pid = std::process::id();
+        let prepared = crate::guest_cpu::prepare_child_record_pre_fork(tracer_pid, 0, 0, false, 0)
+            .expect("prepare virtual-ptrace child record");
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed");
+        if child == 0 {
+            crate::guest_cpu::complete_child_record_post_fork_child();
+            let ready = crate::guest_cpu::register_self_virtual_ptrace(tracer_pid)
+                && crate::guest_cpu::request_self_virtual_ptrace_stop(12);
+            if !ready {
+                unsafe { libc::_exit(70) };
+            }
+            loop {
+                unsafe { libc::pause() };
+            }
+        }
+        crate::guest_cpu::publish_prepared_child_record_parent_ref(prepared, child as u32);
+
+        let mut requested = false;
+        for _ in 0..100 {
+            if crate::guest_cpu::child_virtual_ptrace_stop_requested(child as u32) {
+                requested = true;
+                break;
+            }
+            unsafe { libc::usleep(10_000) };
+        }
+        assert!(requested, "virtual ptrace stop was not requested");
+        let ready = super::child_status_ready(child);
+
+        unsafe {
+            libc::kill(child, libc::SIGKILL);
+            let mut status = 0;
+            libc::waitpid(child, &mut status, 0);
+        }
+        let _ = crate::guest_cpu::reap_child_guest_ns(child as u32);
+
+        assert!(ready, "a requested virtual ptrace stop must wake wait4");
     }
 
     #[cfg(target_os = "macos")]

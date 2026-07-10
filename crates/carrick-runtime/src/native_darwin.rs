@@ -1959,6 +1959,12 @@ fn dispatch_native_syscall(
                     Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
                 }
             }
+            DispatchOutcome::WaitOnProcState { sig_mask, .. } => {
+                match wait_native_proc_state(dispatcher, thread_runtime, sig_mask) {
+                    Ok(NativeWaitResult::Ready) | Ok(NativeWaitResult::TimedOut) => continue,
+                    Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+                }
+            }
             DispatchOutcome::WaitOnSleep {
                 duration,
                 remaining,
@@ -2134,6 +2140,25 @@ fn wait_native_proc_exit(
     match thread_runtime
         .waiter
         .wait_proc_exit_with_dispatch_pending(pid, block_mask, || {
+            native_wait_should_interrupt(dispatcher, tid, sig_mask)
+        }) {
+        crate::io_wait::WaitResult::Ready => Ok(NativeWaitResult::Ready),
+        crate::io_wait::WaitResult::TimedOut => Ok(NativeWaitResult::TimedOut),
+        crate::io_wait::WaitResult::Interrupted => Err(crate::linux_abi::LINUX_EINTR),
+        crate::io_wait::WaitResult::Errno(errno) => Err(errno),
+    }
+}
+
+fn wait_native_proc_state(
+    dispatcher: &SyscallDispatcher,
+    thread_runtime: &NativeThreadRuntime,
+    sig_mask: carrick_abi::WaitSigMask,
+) -> Result<NativeWaitResult, crate::linux_abi::LinuxErrno> {
+    let tid = thread_runtime.tid();
+    let block_mask = native_wait_block_mask(dispatcher, tid, sig_mask);
+    match thread_runtime
+        .waiter
+        .wait_proc_state_with_dispatch_pending(block_mask, || {
             native_wait_should_interrupt(dispatcher, tid, sig_mask)
         }) {
         crate::io_wait::WaitResult::Ready => Ok(NativeWaitResult::Ready),
