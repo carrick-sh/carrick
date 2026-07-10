@@ -660,62 +660,97 @@ pub fn self_is_virtual_ptrace_tracee() -> bool {
         && control.generation() == r.generation
 }
 
-/// Publish a Linux signal-delivery stop before the tracee raises host SIGSTOP.
-pub fn request_self_virtual_ptrace_stop(signum: i32) -> bool {
+/// Outcome of publishing a native virtual-ptrace signal-delivery stop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VirtualPtraceStopRequest {
+    Requested,
+    Busy,
+    Detached,
+    InvalidSignal,
+}
+
+/// Publish a Linux signal-delivery stop before the tracee raises host SIGSTOP,
+/// preserving the distinction between a detached tracee and another producer
+/// that already owns the stop transition.
+pub fn request_self_virtual_ptrace_stop_result(signum: i32) -> VirtualPtraceStopRequest {
     let Ok(signum) = u32::try_from(signum) else {
-        return false;
+        return VirtualPtraceStopRequest::InvalidSignal;
     };
     if signum == 0 {
-        return false;
+        return VirtualPtraceStopRequest::InvalidSignal;
     }
-    let pid = std::process::id();
-    let Some(r) = find_child_record(pid) else {
-        return false;
-    };
-    let Some(record) = record_for_ref(r) else {
-        return false;
-    };
-    let Some(control) = record_virtual_ptrace_control(record) else {
-        return false;
-    };
-    let tracer_pid = control.tracer_pid();
-    let Some((r, record, control)) = virtual_ptrace_record(pid, tracer_pid) else {
-        return false;
-    };
-    if control.state() != VirtualPtraceState::Running {
-        return false;
+    loop {
+        let pid = std::process::id();
+        let Some(r) = find_child_record(pid) else {
+            return VirtualPtraceStopRequest::Detached;
+        };
+        let Some(record) = record_for_ref(r) else {
+            return VirtualPtraceStopRequest::Detached;
+        };
+        let Some(control) = record_virtual_ptrace_control(record) else {
+            return VirtualPtraceStopRequest::Detached;
+        };
+        let tracer_pid = control.tracer_pid();
+        let Some((r, record, control)) = virtual_ptrace_record(pid, tracer_pid) else {
+            return VirtualPtraceStopRequest::Detached;
+        };
+        match control.state() {
+            VirtualPtraceState::Running => {}
+            VirtualPtraceState::Untraced | VirtualPtraceState::DetachRequested => {
+                return VirtualPtraceStopRequest::Detached;
+            }
+            VirtualPtraceState::StopPreparing
+            | VirtualPtraceState::StopRequested
+            | VirtualPtraceState::StopReported
+            | VirtualPtraceState::ResumeRequested
+            | VirtualPtraceState::KillRequested => {
+                return VirtualPtraceStopRequest::Busy;
+            }
+        }
+        let Some(preparing) = VirtualPtraceControl::traced(
+            tracer_pid,
+            r.generation,
+            VirtualPtraceState::StopPreparing,
+        ) else {
+            return VirtualPtraceStopRequest::Detached;
+        };
+        let Some(requested) = VirtualPtraceControl::traced(
+            tracer_pid,
+            r.generation,
+            VirtualPtraceState::StopRequested,
+        ) else {
+            return VirtualPtraceStopRequest::Detached;
+        };
+        if !transition_virtual_ptrace_control(record, control, preparing) {
+            continue;
+        }
+        let previous_word = record_ptrace_stop_word(record);
+        let previous_sequence = ptrace_stop_word_sequence(previous_word);
+        let wrapped = previous_sequence.wrapping_add(1);
+        let sequence = if wrapped == 0 { 1 } else { wrapped };
+        let published_word = ptrace_stop_word(sequence, signum);
+        record
+            .ptrace_stop_signal
+            .store(published_word, Ordering::Release);
+        if transition_virtual_ptrace_control(record, preparing, requested) {
+            return VirtualPtraceStopRequest::Requested;
+        }
+        let _ = record.ptrace_stop_signal.compare_exchange(
+            published_word,
+            previous_word,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        if record_virtual_ptrace_control(record) == Some(preparing) {
+            let _ = transition_virtual_ptrace_control(record, preparing, control);
+        }
     }
-    let Some(preparing) =
-        VirtualPtraceControl::traced(tracer_pid, r.generation, VirtualPtraceState::StopPreparing)
-    else {
-        return false;
-    };
-    let Some(requested) =
-        VirtualPtraceControl::traced(tracer_pid, r.generation, VirtualPtraceState::StopRequested)
-    else {
-        return false;
-    };
-    if !transition_virtual_ptrace_control(record, control, preparing) {
-        return false;
-    }
-    let previous_word = record_ptrace_stop_word(record);
-    let previous_sequence = ptrace_stop_word_sequence(previous_word);
-    let wrapped = previous_sequence.wrapping_add(1);
-    let sequence = if wrapped == 0 { 1 } else { wrapped };
-    let published_word = ptrace_stop_word(sequence, signum);
-    record
-        .ptrace_stop_signal
-        .store(published_word, Ordering::Release);
-    if transition_virtual_ptrace_control(record, preparing, requested) {
-        return true;
-    }
-    let _ = record.ptrace_stop_signal.compare_exchange(
-        published_word,
-        previous_word,
-        Ordering::AcqRel,
-        Ordering::Acquire,
-    );
-    false
+}
+
+/// Compatibility predicate for callers that only need to know whether this
+/// invocation published a new stop.
+pub fn request_self_virtual_ptrace_stop(signum: i32) -> bool {
+    request_self_virtual_ptrace_stop_result(signum) == VirtualPtraceStopRequest::Requested
 }
 
 /// Whether `pid` has requested a virtual ptrace stop for `tracer_pid`.
@@ -1307,6 +1342,66 @@ mod tests {
         assert_ne!(first, second);
         assert!(!resume_child_virtual_ptrace(first));
         assert!(resume_child_virtual_ptrace(second));
+
+        let mut exit_status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut exit_status, 0) }, child);
+        assert!(libc::WIFEXITED(exit_status));
+        assert_eq!(libc::WEXITSTATUS(exit_status), 44);
+        let _ = reap_child_guest_ns(child as u32);
+    }
+
+    #[test]
+    fn virtual_ptrace_stop_request_distinguishes_busy_and_detached() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        init_child_table();
+        let tracer_pid = std::process::id();
+        let prepared =
+            prepare_child_record_pre_fork(tracer_pid, 0, 0, false, 0).expect("prepare child");
+
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed");
+        if child == 0 {
+            complete_child_record_post_fork_child();
+            if !register_self_virtual_ptrace(tracer_pid)
+                || request_self_virtual_ptrace_stop_result(libc::SIGUSR1)
+                    != VirtualPtraceStopRequest::Requested
+                || request_self_virtual_ptrace_stop_result(libc::SIGUSR2)
+                    != VirtualPtraceStopRequest::Busy
+            {
+                unsafe { libc::_exit(70) };
+            }
+            unsafe { libc::raise(libc::SIGSTOP) };
+            if request_self_virtual_ptrace_stop_result(libc::SIGUSR2)
+                != VirtualPtraceStopRequest::Requested
+            {
+                unsafe { libc::_exit(71) };
+            }
+            unsafe { libc::raise(libc::SIGSTOP) };
+            if request_self_virtual_ptrace_stop_result(libc::SIGHUP)
+                != VirtualPtraceStopRequest::Detached
+            {
+                unsafe { libc::_exit(72) };
+            }
+            unsafe { libc::_exit(44) };
+        }
+
+        publish_prepared_child_record_parent_ref(prepared, child as u32);
+        let mut stop_status = 0;
+        assert_eq!(
+            unsafe { libc::waitpid(child, &mut stop_status, libc::WUNTRACED) },
+            child
+        );
+        let first = report_child_virtual_ptrace_stop(child as u32).expect("first stop");
+        assert_eq!(first.linux_signum(), libc::SIGUSR1);
+        assert!(resume_child_virtual_ptrace(first));
+
+        assert_eq!(
+            unsafe { libc::waitpid(child, &mut stop_status, libc::WUNTRACED) },
+            child
+        );
+        let second = report_child_virtual_ptrace_stop(child as u32).expect("second stop");
+        assert_eq!(second.linux_signum(), libc::SIGUSR2);
+        assert!(detach_child_virtual_ptrace(second));
 
         let mut exit_status = 0;
         assert_eq!(unsafe { libc::waitpid(child, &mut exit_status, 0) }, child);

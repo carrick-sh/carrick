@@ -857,6 +857,11 @@ impl SyscallDispatcher {
         self.proc.lock().ptrace_traceme
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_ptrace_traceme_for_test(&self) {
+        self.proc.lock().ptrace_traceme = true;
+    }
+
     pub(crate) fn proc_after_fork_child(&self) {
         let mut proc = self.proc.lock();
         if proc.child_subreaper != 0 {
