@@ -20,6 +20,9 @@ pub enum VirtualPtraceState {
     Running = 1,
     StopRequested = 2,
     StopReported = 3,
+    ResumeRequested = 4,
+    KillRequested = 5,
+    DetachRequested = 6,
 }
 
 impl VirtualPtraceState {
@@ -56,7 +59,7 @@ pub struct ProcessRecord {
     pub exit_ready: AtomicU32,
     pub ptrace_tracer_pid: AtomicU32,
     pub ptrace_state: AtomicU32,
-    _pad: AtomicU32,
+    pub ptrace_record_generation: AtomicU32,
     pub guest_ns: AtomicU64,
 }
 
@@ -165,6 +168,7 @@ impl ProcessRecord {
         self.ptrace_tracer_pid.store(0, Ordering::Relaxed);
         self.ptrace_state
             .store(VirtualPtraceState::Untraced.raw(), Ordering::Relaxed);
+        self.ptrace_record_generation.store(0, Ordering::Relaxed);
         self.guest_ns.store(0, Ordering::Relaxed);
     }
 }
