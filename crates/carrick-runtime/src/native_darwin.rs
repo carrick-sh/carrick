@@ -7,10 +7,11 @@
 //! details and the native run loop. Unsupported dispatcher outcomes fail
 //! explicitly rather than falling back to HVF.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::io::Read;
 use std::os::fd::{FromRawFd, RawFd};
 use std::path::{Path, PathBuf};
+use std::ptr::NonNull;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -27,7 +28,9 @@ use crate::page_profile::{
 };
 use crate::runtime::{RunResult, RuntimeError, maybe_dump_debug_state};
 use carrick_guest_mem::protections::MemoryProtections;
-use carrick_hal::{ForkOutcome, RawSyscall, Reg, RegAccess, SysReg, SyscallTrap, TrapError};
+use carrick_hal::{
+    ForkOutcome, RawSyscall, Reg, RegAccess, SysReg, SyscallTrap, TrapError, VcpuRegistry,
+};
 use goblin::elf::Elf;
 use goblin::elf::header::ET_DYN;
 use goblin::elf::reloc::{R_AARCH64_NONE, R_AARCH64_RELATIVE};
@@ -62,8 +65,8 @@ const NATIVE_DARWIN_HEAP_SIZE: u64 = 128 * 1024 * 1024;
 const NATIVE_DARWIN_MMAP_BASE: u64 = 0xa0_0000_0000;
 const NATIVE_DARWIN_MMAP_SIZE: u64 = 32 * 1024 * 1024 * 1024;
 const NATIVE_DARWIN_HARD_PAGEZERO_END: u64 = 0x1_0000_0000;
-const NATIVE_DARWIN_RESUME_BUCKET_SIZE: u64 = 128 * 1024 * 1024;
-const NATIVE_DARWIN_MAX_GUEST_THREADS: usize = 1024;
+const NATIVE_EVENT_TRAP: i32 = 1;
+const NATIVE_EVENT_KICK: i32 = 2;
 const VM_INHERIT_SHARE: libc::c_int = 0;
 const VM_INHERIT_COPY: libc::c_int = 1;
 
@@ -79,6 +82,7 @@ struct NativeUcontextSnapshot {
     v: [[u8; 16]; 32],
     fpsr: u32,
     fpcr: u32,
+    event_kind: i32,
     signal: libc::c_int,
     signal_code: libc::c_int,
     fault_address: u64,
@@ -146,6 +150,86 @@ enum NativeSignalWaitResult {
     TimedOut,
 }
 
+struct NativeKickState {
+    raw: NonNull<libc::c_void>,
+}
+
+// The pointed-to object is a C11 lock-free atomic state block. Its lifetime is
+// owned by this wrapper and every mutation goes through the C helper API.
+unsafe impl Send for NativeKickState {}
+unsafe impl Sync for NativeKickState {}
+
+impl NativeKickState {
+    fn new() -> Result<Self, RuntimeError> {
+        let raw = unsafe { carrick_native_kick_state_create() };
+        let raw = NonNull::new(raw).ok_or_else(|| last_io_error("create native kick state"))?;
+        Ok(Self { raw })
+    }
+
+    fn request(&self) -> bool {
+        unsafe { carrick_native_kick_state_request(self.raw.as_ptr()) == 1 }
+    }
+
+    fn acknowledge(&self) {
+        unsafe { carrick_native_kick_state_acknowledge(self.raw.as_ptr()) };
+    }
+
+    fn bind_current(&self) -> Result<(), RuntimeError> {
+        if unsafe { carrick_native_kick_state_bind_current(self.raw.as_ptr()) } == 0 {
+            Ok(())
+        } else {
+            Err(last_io_error("bind native kick state"))
+        }
+    }
+
+    fn unbind_current(&self) {
+        unsafe { carrick_native_kick_state_unbind_current(self.raw.as_ptr()) };
+    }
+
+    #[cfg(test)]
+    fn requested_generation(&self) -> u64 {
+        unsafe { carrick_native_kick_state_requested(self.raw.as_ptr()) }
+    }
+
+    #[cfg(test)]
+    fn acknowledged_generation(&self) -> u64 {
+        unsafe { carrick_native_kick_state_acknowledged(self.raw.as_ptr()) }
+    }
+}
+
+impl Drop for NativeKickState {
+    fn drop(&mut self) {
+        unsafe { carrick_native_kick_state_destroy(self.raw.as_ptr()) };
+    }
+}
+
+#[derive(Clone)]
+struct NativeKickHandle {
+    pthread: usize,
+    state: Arc<NativeKickState>,
+}
+
+impl NativeKickHandle {
+    fn for_current_thread(state: Arc<NativeKickState>) -> Self {
+        Self {
+            pthread: unsafe { libc::pthread_self() } as usize,
+            state,
+        }
+    }
+}
+
+impl carrick_hal::VcpuKick for NativeKickHandle {
+    fn kick(&self) {
+        if !self.state.request() {
+            return;
+        }
+        let rc = unsafe { libc::pthread_kill(self.pthread as libc::pthread_t, libc::SIGPIPE) };
+        if rc != 0 {
+            self.state.acknowledge();
+        }
+    }
+}
+
 unsafe extern "C" {
     fn carrick_native_install_trap_handler() -> libc::c_int;
     #[cfg(test)]
@@ -161,13 +245,17 @@ unsafe extern "C" {
     fn carrick_native_set_register(index: u32, value: u64);
     fn carrick_native_set_vector(index: u32, value: *const u8);
     fn carrick_native_set_processor_state(pstate: u64, fpsr: u32, fpcr: u32);
+    fn carrick_native_kick_state_create() -> *mut libc::c_void;
+    fn carrick_native_kick_state_destroy(state: *mut libc::c_void);
+    fn carrick_native_kick_state_request(state: *mut libc::c_void) -> libc::c_int;
+    fn carrick_native_kick_state_acknowledge(state: *mut libc::c_void);
+    fn carrick_native_kick_state_bind_current(state: *mut libc::c_void) -> libc::c_int;
+    fn carrick_native_kick_state_unbind_current(state: *mut libc::c_void);
+    #[cfg(test)]
+    fn carrick_native_kick_state_requested(state: *mut libc::c_void) -> u64;
+    #[cfg(test)]
+    fn carrick_native_kick_state_acknowledged(state: *mut libc::c_void) -> u64;
     fn carrick_native_clear_icache(start: *mut libc::c_void, len: usize);
-    fn carrick_native_reset_resume_pads();
-    fn carrick_native_register_resume_page(
-        bucket: u64,
-        base: *mut libc::c_void,
-        page_size: usize,
-    ) -> libc::c_int;
 }
 
 const fn brk_instruction(imm: u16) -> u32 {
@@ -539,10 +627,12 @@ fn run_image_in_current_process(
     let _ = crate::ulock::preinit_waiter_table();
     carrick_signal_core::xsig::xsig_init();
     carrick_signal_core::fasync::fasync_init();
+    crate::host_signal::install_default_handlers();
     let dispatcher = Arc::new(dispatcher);
     let reporter = Arc::new(CompatReporter::default());
     let plan = Arc::new(plan.clone());
     let mut thread_runtime = NativeThreadRuntime::new_current();
+    thread_runtime.prepare_kick_target()?;
     match run_native_thread_loop(
         dispatcher,
         memory,
@@ -628,11 +718,6 @@ fn run_native_thread_loop(
     };
     let mut vfork_completion: Option<NativeVforkCompletion> = None;
 
-    let install = unsafe { carrick_native_install_trap_handler() };
-    if install != 0 {
-        return Err(last_io_error("install native Darwin trap handler"));
-    }
-
     let mut traps = 0usize;
     let entered = match start {
         NativeThreadStart::Initial { entry, initial_sp } => unsafe {
@@ -658,6 +743,20 @@ fn run_native_thread_loop(
         }
 
         let mut snapshot = snapshot_ucontext()?;
+        if snapshot.event_kind == NATIVE_EVENT_KICK {
+            if let Some(code) =
+                resume_guest_after_kick(&dispatcher, &memory, snapshot, thread_runtime.tid())?
+            {
+                return Ok(NativeThreadLoopOutcome::ProcessExit(code));
+            }
+            continue;
+        }
+        if snapshot.event_kind != NATIVE_EVENT_TRAP {
+            return Err(RuntimeError::Unsupported(format!(
+                "native Darwin reported unknown event kind {} signal={} pc=0x{:x}",
+                snapshot.event_kind, snapshot.signal, snapshot.pc
+            )));
+        }
         if snapshot.signal == libc::SIGSEGV || snapshot.signal == libc::SIGBUS {
             let fault_address = if snapshot.fault_address != 0 {
                 snapshot.fault_address
@@ -880,6 +979,23 @@ fn run_native_thread_loop(
                         }
                         return Ok(NativeThreadLoopOutcome::ThreadDone);
                     }
+                    DispatchOutcome::SignalThread {
+                        tid: target,
+                        signum,
+                    } => {
+                        let value = thread_runtime.signal_thread(target, signum);
+                        if let Some(code) = resume_guest_after_syscall(
+                            &dispatcher,
+                            &memory,
+                            snapshot,
+                            resume_pc,
+                            value,
+                            request.number.raw(),
+                            thread_runtime.tid(),
+                        )? {
+                            return Ok(NativeThreadLoopOutcome::ProcessExit(code));
+                        }
+                    }
                     DispatchOutcome::Fork {
                         pidfd_out,
                         clone_parent,
@@ -1031,6 +1147,38 @@ fn resume_guest_after_syscall(
     Ok(None)
 }
 
+fn resume_guest_after_kick(
+    dispatcher: &SyscallDispatcher,
+    memory: &SharedNativeMemory,
+    snapshot: NativeUcontextSnapshot,
+    tid: crate::thread::ThreadId,
+) -> Result<Option<i32>, RuntimeError> {
+    let pc = {
+        let mut memory = memory.lock();
+        let mut trap = NativeSignalTrap::new(&mut memory, snapshot, None);
+        let action = crate::vcpu_loop::deliver_pending_signal(
+            &mut trap,
+            dispatcher,
+            None,
+            tid,
+            Some(snapshot.pc),
+        )?;
+        if let Some(action) = action {
+            if let Some(signum) = action.term_signal {
+                return Ok(Some(128 + signum));
+            }
+            if let Some(signum) = action.stop_signal {
+                return Ok(Some(128 + signum));
+            }
+        }
+        let pc = trap.pc();
+        trap.commit();
+        pc
+    };
+    resume_guest_at(pc)?;
+    Ok(None)
+}
+
 fn resume_guest_from_sigreturn(
     dispatcher: &SyscallDispatcher,
     memory: &SharedNativeMemory,
@@ -1062,9 +1210,9 @@ struct NativeThreadRuntime {
     futex: Arc<crate::thread::FutexTable>,
     platform_futex: Arc<dyn carrick_hal::PlatformFutex>,
     waiter: crate::io_wait::ThreadWaiter,
+    kicker: Arc<carrick_hal::GenericVcpuRegistry>,
+    kick_state: Option<Arc<NativeKickState>>,
     threads: Arc<parking_lot::Mutex<Vec<std::thread::JoinHandle<()>>>>,
-    resume_pad_slot: usize,
-    resume_pad_slots: Arc<parking_lot::Mutex<Vec<usize>>>,
     finished: bool,
 }
 
@@ -1076,17 +1224,16 @@ impl NativeThreadRuntime {
         let futex = Arc::new(crate::thread::FutexTable::new());
         let platform_futex = Arc::new(crate::threaded_impl::hvf_futex(Arc::clone(&futex)))
             as Arc<dyn carrick_hal::PlatformFutex>;
+        let kicker = Arc::new(carrick_hal::GenericVcpuRegistry::new());
         let runtime = Self {
             tid,
             registry,
             futex,
             platform_futex,
             waiter: crate::io_wait::ThreadWaiter::new(tid),
+            kicker,
+            kick_state: None,
             threads: Arc::new(parking_lot::Mutex::new(Vec::new())),
-            resume_pad_slot: 0,
-            resume_pad_slots: Arc::new(parking_lot::Mutex::new(
-                (1..NATIVE_DARWIN_MAX_GUEST_THREADS).rev().collect(),
-            )),
             finished: false,
         };
         runtime
@@ -1103,18 +1250,52 @@ impl NativeThreadRuntime {
         self.tid
     }
 
-    fn sibling(&self, tid: crate::thread::ThreadId, resume_pad_slot: usize) -> Self {
+    fn sibling(&self, tid: crate::thread::ThreadId) -> Self {
         Self {
             tid,
             registry: Arc::clone(&self.registry),
             futex: Arc::clone(&self.futex),
             platform_futex: Arc::clone(&self.platform_futex),
             waiter: crate::io_wait::ThreadWaiter::new(tid),
+            kicker: Arc::clone(&self.kicker),
+            kick_state: None,
             threads: Arc::clone(&self.threads),
-            resume_pad_slot,
-            resume_pad_slots: Arc::clone(&self.resume_pad_slots),
             finished: false,
         }
+    }
+
+    fn prepare_kick_target(&mut self) -> Result<(), RuntimeError> {
+        if self.kick_state.is_some() {
+            return Ok(());
+        }
+        if unsafe { carrick_native_install_trap_handler() } != 0 {
+            return Err(last_io_error("install native Darwin trap handler"));
+        }
+        let state = Arc::new(NativeKickState::new()?);
+        state.bind_current()?;
+        self.kicker.register(
+            self.tid,
+            Box::new(NativeKickHandle::for_current_thread(Arc::clone(&state))),
+        );
+        self.kick_state = Some(state);
+        Ok(())
+    }
+
+    fn release_kick_target(&mut self) {
+        self.kicker.unregister(self.tid);
+        if let Some(state) = self.kick_state.take() {
+            state.unbind_current();
+        }
+    }
+
+    fn signal_thread(&self, target: crate::thread::ThreadId, signum: i32) -> i64 {
+        if !self.registry.is_live(target) {
+            return crate::linux_abi::LINUX_ESRCH.guest_retval();
+        }
+        crate::host_signal::publish_pending_for(target.raw(), signum);
+        self.platform_futex.notify_signal_pending_for(target);
+        self.kicker.kick(target);
+        0
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1127,11 +1308,6 @@ impl NativeThreadRuntime {
         max_traps: usize,
         request: NativeCloneThreadRequest,
     ) -> Result<crate::thread::ThreadId, RuntimeError> {
-        let resume_pad_slot = self.resume_pad_slots.lock().pop().ok_or_else(|| {
-            RuntimeError::Unsupported(format!(
-                "native Darwin supports at most {NATIVE_DARWIN_MAX_GUEST_THREADS} concurrent guest threads"
-            ))
-        })?;
         let tid = self.registry.register_child(request.clear_child_tid_addr);
         dispatcher.inherit_thread_signal_mask(self.tid, tid);
         let tid_bytes = tid.raw().to_le_bytes();
@@ -1156,10 +1332,12 @@ impl NativeThreadRuntime {
         let child_memory = Arc::clone(memory);
         let child_reporter = Arc::clone(reporter);
         let child_plan = Arc::clone(plan);
-        let mut child_runtime = self.sibling(tid, resume_pad_slot);
+        let mut child_runtime = self.sibling(tid);
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         let spawn_result = std::thread::Builder::new()
             .name(format!("native-guest-tid-{tid}"))
             .spawn(move || {
+                let mut ready = Some(ready_tx);
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     child_runtime
                         .registry
@@ -1168,9 +1346,17 @@ impl NativeThreadRuntime {
                         tid.raw(),
                         crate::run_state::RunState::Running,
                     );
-                    child_memory
-                        .lock()
-                        .register_resume_pad_slot(child_runtime.resume_pad_slot)?;
+                    child_runtime.prepare_kick_target()?;
+                    let sender = ready.take().ok_or_else(|| {
+                        RuntimeError::Unsupported(
+                            "native Darwin clone readiness was already published".to_string(),
+                        )
+                    })?;
+                    sender.send(Ok(())).map_err(|_| {
+                        RuntimeError::Unsupported(
+                            "native Darwin clone parent dropped readiness channel".to_string(),
+                        )
+                    })?;
                     run_native_thread_loop(
                         Arc::clone(&child_dispatcher),
                         Arc::clone(&child_memory),
@@ -1188,10 +1374,13 @@ impl NativeThreadRuntime {
                     Ok(Ok(NativeThreadLoopOutcome::ProcessExit(code))) => unsafe {
                         libc::_exit(code);
                     },
-                    Ok(Ok(NativeThreadLoopOutcome::ThreadDone)) => {
-                        child_runtime.release_resume_pad_slot();
-                    }
+                    Ok(Ok(NativeThreadLoopOutcome::ThreadDone)) => {}
                     Ok(Err(err)) => {
+                        if let Some(sender) = ready.take() {
+                            let _ = sender.send(Err(err.to_string()));
+                            child_runtime.finish_thread(&child_dispatcher, &child_memory);
+                            return;
+                        }
                         child_write_stderr(
                             format!("native Darwin guest thread {tid} error: {err}\n").as_bytes(),
                         );
@@ -1199,6 +1388,13 @@ impl NativeThreadRuntime {
                         unsafe { libc::_exit(125) };
                     }
                     Err(_) => {
+                        if let Some(sender) = ready.take() {
+                            let _ = sender
+                                .send(Err("native Darwin guest thread panicked during startup"
+                                    .to_string()));
+                            child_runtime.finish_thread(&child_dispatcher, &child_memory);
+                            return;
+                        }
                         child_write_stderr(
                             format!("native Darwin guest thread {tid} panicked\n").as_bytes(),
                         );
@@ -1214,12 +1410,24 @@ impl NativeThreadRuntime {
                 self.registry.exit(tid);
                 crate::host_signal::forget_thread(tid.raw());
                 dispatcher.forget_thread_signal_state(tid);
-                self.resume_pad_slots.lock().push(resume_pad_slot);
                 return Err(RuntimeError::Trap(TrapError::Hypervisor(format!(
                     "spawn native Darwin guest thread failed: {err}"
                 ))));
             }
         };
+        match ready_rx.recv() {
+            Ok(Ok(())) => {}
+            Ok(Err(message)) => {
+                let _ = handle.join();
+                return Err(RuntimeError::Unsupported(message));
+            }
+            Err(_) => {
+                let _ = handle.join();
+                return Err(RuntimeError::Unsupported(
+                    "native Darwin guest thread exited before kick readiness".to_string(),
+                ));
+            }
+        }
         self.threads.lock().push(handle);
         Ok(tid)
     }
@@ -1234,6 +1442,7 @@ impl NativeThreadRuntime {
         }
         let _cleanup_gate = crate::fork_quiesce::begin_exit_cleanup();
         self.finished = true;
+        self.release_kick_target();
         if let Some(address) = self.registry.clear_child_tid(self.tid)
             && address != 0
         {
@@ -1248,13 +1457,6 @@ impl NativeThreadRuntime {
         crate::host_signal::forget_thread(self.tid.raw());
         dispatcher.forget_thread_signal_state(self.tid);
         last
-    }
-
-    fn release_resume_pad_slot(&mut self) {
-        if self.resume_pad_slot != 0 {
-            self.resume_pad_slots.lock().push(self.resume_pad_slot);
-            self.resume_pad_slot = 0;
-        }
     }
 
     fn require_single_threaded(&self, operation: &str) -> Result<(), RuntimeError> {
@@ -1281,6 +1483,12 @@ impl NativeThreadRuntime {
                 }
             }
         }
+    }
+}
+
+impl Drop for NativeThreadRuntime {
+    fn drop(&mut self) {
+        self.release_kick_target();
     }
 }
 
@@ -2028,6 +2236,7 @@ fn handle_native_fork(
         native_after_fork_child(dispatcher);
         native_trace_fork_phase("child-dispatcher-reset");
         thread_runtime.reset_after_fork_child();
+        thread_runtime.prepare_kick_target()?;
         native_trace_fork_phase("child-thread-runtime-reset");
         crate::guest_cpu::reset();
         crate::guest_cpu::complete_child_record_post_fork_child();
@@ -3271,7 +3480,6 @@ fn decode_trap_instruction(word: u32, pc: u64) -> Result<Option<NativeTrap>, Run
 
 struct NativeMappedMemory {
     regions: Vec<NativeMappedRegion>,
-    resume_pad_arenas: Vec<NativeResumePadArena>,
     protections: MemoryProtections,
     native_page_protections: BTreeMap<u64, u64>,
     linux4k_page_protections: BTreeMap<u64, [u64; 4]>,
@@ -3296,176 +3504,6 @@ struct NativeMappedRegion {
     default_prot: u64,
 }
 
-#[derive(Clone, Copy)]
-struct NativeResumePadArena {
-    bucket: u64,
-    start: u64,
-    end: u64,
-}
-
-impl NativeResumePadArena {
-    fn page_for_slot(self, slot: usize, host_page_size: u64) -> Option<u64> {
-        let slot = u64::try_from(slot).ok()?;
-        let offset = slot.checked_mul(host_page_size)?;
-        let page = self.start.checked_add(offset)?;
-        (page.checked_add(host_page_size)? <= self.end).then_some(page)
-    }
-}
-
-fn map_native_resume_pad_pages(
-    image: &AddressSpace,
-    host_page_size: u64,
-) -> Result<Vec<NativeResumePadArena>, RuntimeError> {
-    if host_page_size == 0 || !host_page_size.is_power_of_two() {
-        return Err(RuntimeError::Unsupported(format!(
-            "native Darwin resume-pad page size is invalid: {host_page_size}"
-        )));
-    }
-
-    let sigreturn_range = (
-        NATIVE_DARWIN_SIGRETURN_TRAMPOLINE_BASE,
-        NATIVE_DARWIN_SIGRETURN_TRAMPOLINE_BASE
-            + carrick_mem::memory::LINUX_SIGRETURN_TRAMPOLINE_SIZE,
-    );
-    let mut occupied: Vec<(u64, u64)> = image
-        .regions()
-        .iter()
-        .map(|region| (region.start, region.end))
-        .collect();
-    occupied.push(sigreturn_range);
-
-    let mut buckets = BTreeSet::new();
-    for (start, end) in image
-        .regions()
-        .iter()
-        .filter(|region| region.perms.execute)
-        .map(|region| (region.start, region.end))
-        .chain(std::iter::once(sigreturn_range))
-    {
-        if start >= end {
-            continue;
-        }
-        let mut bucket = start & !(NATIVE_DARWIN_RESUME_BUCKET_SIZE - 1);
-        let last_bucket = (end - 1) & !(NATIVE_DARWIN_RESUME_BUCKET_SIZE - 1);
-        loop {
-            buckets.insert(bucket);
-            if bucket == last_bucket {
-                break;
-            }
-            bucket = bucket
-                .checked_add(NATIVE_DARWIN_RESUME_BUCKET_SIZE)
-                .ok_or_else(|| {
-                    RuntimeError::Unsupported(
-                        "native Darwin resume-pad bucket overflow".to_string(),
-                    )
-                })?;
-        }
-    }
-
-    let arena_size = host_page_size
-        .checked_mul(NATIVE_DARWIN_MAX_GUEST_THREADS as u64)
-        .ok_or_else(|| {
-            RuntimeError::Unsupported("native Darwin resume-pad arena overflow".to_string())
-        })?;
-    if arena_size >= NATIVE_DARWIN_RESUME_BUCKET_SIZE {
-        return Err(RuntimeError::Unsupported(
-            "native Darwin resume-pad arena does not fit its branch bucket".to_string(),
-        ));
-    }
-
-    let mut arenas = Vec::with_capacity(buckets.len() + 1);
-    for bucket in buckets {
-        let bucket_end = bucket
-            .checked_add(NATIVE_DARWIN_RESUME_BUCKET_SIZE)
-            .ok_or_else(|| {
-                RuntimeError::Unsupported("native Darwin resume-pad range overflow".to_string())
-            })?;
-        let mut candidate = bucket_end.checked_sub(arena_size).ok_or_else(|| {
-            RuntimeError::Unsupported("native Darwin resume-pad address underflow".to_string())
-        })?;
-        let selected = loop {
-            let candidate_end = candidate + arena_size;
-            let overlaps = occupied
-                .iter()
-                .any(|(start, end)| candidate < *end && *start < candidate_end);
-            if !overlaps {
-                break candidate;
-            }
-            if candidate < bucket + host_page_size {
-                return Err(RuntimeError::Unsupported(format!(
-                    "native Darwin executable bucket 0x{bucket:x} has no resume-pad arena"
-                )));
-            }
-            candidate -= host_page_size;
-        };
-
-        map_anonymous_region(selected, arena_size, false)?;
-        arenas.push(NativeResumePadArena {
-            bucket,
-            start: selected,
-            end: selected + arena_size,
-        });
-        occupied.push((selected, selected + arena_size));
-    }
-
-    let pre_mmap = NATIVE_DARWIN_MMAP_BASE
-        .checked_sub(arena_size)
-        .ok_or_else(|| {
-            RuntimeError::Unsupported("native Darwin pre-mmap pad underflow".to_string())
-        })?;
-    let pre_mmap_end = pre_mmap + arena_size;
-    if occupied
-        .iter()
-        .any(|(start, end)| pre_mmap < *end && *start < pre_mmap_end)
-    {
-        return Err(RuntimeError::Unsupported(format!(
-            "native Darwin pre-mmap resume pad overlaps 0x{pre_mmap:x}..0x{pre_mmap_end:x}"
-        )));
-    }
-    map_anonymous_region(pre_mmap, arena_size, false)?;
-    arenas.push(NativeResumePadArena {
-        bucket: pre_mmap & !(NATIVE_DARWIN_RESUME_BUCKET_SIZE - 1),
-        start: pre_mmap,
-        end: pre_mmap_end,
-    });
-    Ok(arenas)
-}
-
-fn register_native_resume_pad_slot(
-    arenas: &[NativeResumePadArena],
-    host_page_size: u64,
-    slot: usize,
-) -> Result<(), RuntimeError> {
-    let page_size = usize::try_from(host_page_size).map_err(|_| {
-        RuntimeError::Unsupported("native Darwin resume-pad page is too large".to_string())
-    })?;
-    unsafe { carrick_native_reset_resume_pads() };
-    for arena in arenas {
-        let page = arena.page_for_slot(slot, host_page_size).ok_or_else(|| {
-            RuntimeError::Unsupported(format!(
-                "native Darwin resume-pad slot {slot} is outside arena 0x{:x}..0x{:x}",
-                arena.start, arena.end
-            ))
-        })?;
-        let address = usize::try_from(page).map_err(|_| {
-            RuntimeError::Unsupported(format!(
-                "native Darwin resume-pad address is too large: 0x{page:x}"
-            ))
-        })?;
-        let rc = unsafe {
-            carrick_native_register_resume_page(
-                arena.bucket,
-                address as *mut libc::c_void,
-                page_size,
-            )
-        };
-        if rc != 0 {
-            return Err(last_io_error("register native Darwin resume-pad slot"));
-        }
-    }
-    Ok(())
-}
-
 fn native_region_linux_prot(read: bool, write: bool, exec: bool) -> u64 {
     let mut prot = 0;
     if read {
@@ -3481,10 +3519,6 @@ fn native_region_linux_prot(read: bool, write: bool, exec: bool) -> u64 {
 }
 
 impl NativeMappedMemory {
-    fn register_resume_pad_slot(&self, slot: usize) -> Result<(), RuntimeError> {
-        register_native_resume_pad_slot(&self.resume_pad_arenas, self.host_page_size, slot)
-    }
-
     fn map(
         image: &AddressSpace,
         layout: MemoryLayout,
@@ -3501,7 +3535,6 @@ impl NativeMappedMemory {
                 region.start, region.end
             )));
         }
-        unsafe { carrick_native_reset_resume_pads() };
         let mut regions = Vec::new();
         for region in image.regions() {
             map_region(region)?;
@@ -3518,8 +3551,6 @@ impl NativeMappedMemory {
                 ),
             });
         }
-        let resume_pad_arenas = map_native_resume_pad_pages(image, host_page_size)?;
-        register_native_resume_pad_slot(&resume_pad_arenas, host_page_size, 0)?;
         map_bytes_region(
             NATIVE_DARWIN_SIGRETURN_TRAMPOLINE_BASE,
             carrick_mem::memory::LINUX_SIGRETURN_TRAMPOLINE_SIZE,
@@ -3594,7 +3625,6 @@ impl NativeMappedMemory {
         });
         Ok(Self {
             regions,
-            resume_pad_arenas,
             protections: MemoryProtections::default(),
             native_page_protections: BTreeMap::new(),
             linux4k_page_protections: BTreeMap::new(),
@@ -3673,26 +3703,6 @@ impl NativeMappedMemory {
                 )));
             }
         }
-        for arena in &self.resume_pad_arenas {
-            let address = usize::try_from(arena.start).map_err(|_| {
-                RuntimeError::Unsupported(format!(
-                    "native Darwin resume-pad address too large: 0x{:x}",
-                    arena.start
-                ))
-            })? as *mut libc::c_void;
-            let len = usize::try_from(arena.end - arena.start).map_err(|_| {
-                RuntimeError::Unsupported(
-                    "native Darwin resume-pad length is too large".to_string(),
-                )
-            })?;
-            if unsafe { libc::munmap(address, len) } != 0 {
-                return Err(last_io_error(&format!(
-                    "munmap native Darwin resume-pad arena 0x{:x}..0x{:x}",
-                    arena.start, arena.end
-                )));
-            }
-        }
-
         let mut replacement = Self::map(
             image,
             native_memory_layout(),
@@ -4991,7 +5001,6 @@ mod tests {
         restored.v[0] = 0x2222_u128.to_le_bytes();
         let mut memory = NativeMappedMemory {
             regions: Vec::new(),
-            resume_pad_arenas: Vec::new(),
             protections: MemoryProtections::default(),
             native_page_protections: BTreeMap::new(),
             linux4k_page_protections: BTreeMap::new(),
@@ -5026,7 +5035,6 @@ mod tests {
                 default_prot: crate::linux_abi::LINUX_PROT_READ
                     | crate::linux_abi::LINUX_PROT_WRITE,
             }],
-            resume_pad_arenas: Vec::new(),
             protections: MemoryProtections::default(),
             native_page_protections: BTreeMap::new(),
             linux4k_page_protections: BTreeMap::new(),
@@ -5104,9 +5112,69 @@ mod tests {
         assert_eq!(runtime.waiter.tid(), runtime.tid());
 
         let child_tid = runtime.registry.register_child(0);
-        let child = runtime.sibling(child_tid, 1);
+        let child = runtime.sibling(child_tid);
         assert_eq!(child.waiter.tid(), child_tid);
         runtime.registry.exit(child_tid);
+    }
+
+    #[test]
+    fn native_kick_state_coalesces_until_acknowledged() {
+        let state = NativeKickState::new().expect("create native kick state");
+
+        assert!(state.request());
+        assert!(!state.request());
+        assert_eq!(state.requested_generation(), 2);
+        assert_eq!(state.acknowledged_generation(), 0);
+
+        state.acknowledge();
+        assert_eq!(state.acknowledged_generation(), 2);
+        assert!(state.request());
+        assert_eq!(state.requested_generation(), 3);
+    }
+
+    #[test]
+    fn native_kick_handler_ignores_ordinary_broken_pipe() {
+        std::thread::spawn(|| {
+            let state = NativeKickState::new().expect("create native kick state");
+            assert_eq!(unsafe { carrick_native_install_trap_handler() }, 0);
+            state.bind_current().expect("bind native kick state");
+
+            let mut kick: libc::sigset_t = unsafe { std::mem::zeroed() };
+            unsafe {
+                libc::sigemptyset(&mut kick);
+                libc::sigaddset(&mut kick, libc::SIGPIPE);
+            }
+            assert_eq!(
+                unsafe { libc::pthread_sigmask(libc::SIG_UNBLOCK, &kick, std::ptr::null_mut()) },
+                0
+            );
+
+            let mut sockets = [-1; 2];
+            assert_eq!(
+                unsafe {
+                    libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sockets.as_mut_ptr())
+                },
+                0
+            );
+            assert_eq!(unsafe { libc::shutdown(sockets[1], libc::SHUT_RD) }, 0);
+            close_fd(sockets[1]);
+            let byte = [1_u8];
+            assert_eq!(
+                unsafe { libc::write(sockets[0], byte.as_ptr().cast(), byte.len()) },
+                -1
+            );
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EPIPE)
+            );
+            assert_eq!(state.requested_generation(), 0);
+            assert_eq!(state.acknowledged_generation(), 0);
+
+            state.unbind_current();
+            close_fd(sockets[0]);
+        })
+        .join()
+        .expect("join native broken-pipe test thread");
     }
 
     #[test]
