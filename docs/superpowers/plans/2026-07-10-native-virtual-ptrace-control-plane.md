@@ -125,6 +125,8 @@
 ### Task 3: Signal and Exec Stop Integration
 
 **Files:**
+- Modify: `crates/carrick-host/src/guest_cpu.rs`
+- Modify: `crates/carrick-runtime/src/dispatch/proc.rs`
 - Modify: `crates/carrick-runtime/src/dispatch/signal.rs`
 - Modify: `crates/carrick-runtime/src/vcpu_loop/signal.rs`
 - Modify: `crates/carrick-runtime/src/exec_helpers.rs`
@@ -135,11 +137,11 @@
 - Produces: one shared `stop_for_ptrace_signal(dispatcher, signum)` decision used by direct self-signals and queued signal delivery.
 - Produces: native traced exec requests Linux `SIGTRAP`, stops on host `SIGSTOP`, and enters the new image only after `PTRACE_CONT`.
 
-- [ ] **Step 1: Add failing helper tests**
+- [x] **Step 1: Add failing helper tests**
 
   Test that native ptrace signal stops choose host `SIGSTOP`, non-native ptrace retains its existing carrier behavior, `SIGKILL` remains terminal, and a detached native tracee falls back to ordinary signal delivery.
 
-- [ ] **Step 2: Verify the helper tests are red**
+- [x] **Step 2: Verify the helper tests are red**
 
   Run:
 
@@ -147,17 +149,22 @@
   cargo test -p carrick-runtime ptrace_signal_stop --lib --no-default-features --features platform-macos
   ```
 
-- [ ] **Step 3: Route all three signal paths through the helper**
+- [x] **Step 3: Route all three signal paths through the helper**
 
   Replace the duplicated `ptrace_traceme` checks in direct process signals, direct thread signals, and queued pending-signal delivery. Native virtual stops publish shared state and raise host `SIGSTOP`; detached tracees no longer stop. Keep the existing non-native marker path unchanged.
 
-- [ ] **Step 4: Add native traced-exec stop**
+- [x] **Step 4: Add native traced-exec stop**
 
   After image replacement, CLOEXEC closure, vfork completion, and register reset, request the virtual Linux `SIGTRAP` stop before `resume_guest_at(entry)`. The host carrier remains `SIGSTOP`; the guest wait status is `SIGTRAP`.
 
-- [ ] **Step 5: Verify unit tests, signed probes, and commit**
+- [x] **Step 5: Verify unit tests, signed probes, and commit**
 
-  Run `just build`, then compare these byte-identical static-PIE probes with Docker: `ptracestop`, `ptracetraceme`, `ptracesignalstop`, `ptracesigdeath`, `ptracesequence`, `ptracekillcont`, `ptraceinvaliderrno`, and `traceexecstop`. Commit the four integration files with subject `fix(native): virtualize ptrace signal stops`.
+  Run `just build`, then compare these byte-identical static-PIE probes with Docker: `ptracestop`, `ptracetraceme`, `ptracesignalstop`, `ptracesigdeath`, `ptracesequence`, `ptracekillcont`, `ptraceinvaliderrno`, and `traceexecstop`. Commit the reviewed integration files with subject `fix(native): virtualize ptrace signal stops`.
+
+  Review expanded the shared-state API to distinguish concurrent `Busy` stop
+  ownership from detach and added real queued-delivery coverage. All eight
+  bound native-PIE probes matched Docker byte-for-byte on `native16k`. Commit:
+  `7e3f80f7 fix(native): virtualize ptrace signal stops`.
 
 ### Task 4: Differential Gate and Compatibility Message
 
