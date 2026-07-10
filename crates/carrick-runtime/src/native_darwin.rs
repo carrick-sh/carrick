@@ -1113,6 +1113,7 @@ fn run_native_thread_loop(
                                     set_guest_register(index, 0);
                                 }
                                 unsafe { carrick_native_set_sp(initial_sp) };
+                                crate::exec_helpers::stop_after_traced_exec(&dispatcher);
                                 resume_guest_at(entry)?;
                             }
                             Err(errno) => {

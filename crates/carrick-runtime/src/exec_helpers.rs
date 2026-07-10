@@ -424,10 +424,95 @@ pub(crate) fn stop_by_signal(signum: i32) {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PtraceSignalRoute {
+    DeliverNormally,
+    LegacyStop,
+    VirtualStop,
+    Terminate,
+}
+
+fn ptrace_signal_route(
+    traceme: bool,
+    native: bool,
+    virtual_owner: bool,
+    signum: i32,
+) -> PtraceSignalRoute {
+    if !traceme || (native && !virtual_owner) {
+        return PtraceSignalRoute::DeliverNormally;
+    }
+    if signum == crate::linux_abi::LINUX_SIGKILL {
+        return PtraceSignalRoute::Terminate;
+    }
+    if native {
+        PtraceSignalRoute::VirtualStop
+    } else {
+        PtraceSignalRoute::LegacyStop
+    }
+}
+
+fn await_virtual_ptrace_stop_request<F>(mut request: F) -> bool
+where
+    F: FnMut() -> crate::guest_cpu::VirtualPtraceStopRequest,
+{
+    loop {
+        match request() {
+            crate::guest_cpu::VirtualPtraceStopRequest::Requested => return true,
+            crate::guest_cpu::VirtualPtraceStopRequest::Busy => std::thread::yield_now(),
+            crate::guest_cpu::VirtualPtraceStopRequest::Detached
+            | crate::guest_cpu::VirtualPtraceStopRequest::InvalidSignal => return false,
+        }
+    }
+}
+
+/// Stop the current tracee before delivering a Linux signal.
+///
+/// Native execution publishes the Linux signal through the fork-coherent
+/// virtual ptrace record and uses host SIGSTOP only as an invisible carrier.
+/// Other backends retain the legacy marker path. `false` means the tracee is
+/// not currently owned (including after native detach), so normal delivery
+/// must continue.
+pub(crate) fn stop_for_ptrace_signal(dispatcher: &SyscallDispatcher, signum: i32) -> bool {
+    let native = dispatcher.page_geometry().native_profile.is_some();
+    let virtual_owner = native && crate::guest_cpu::self_is_virtual_ptrace_tracee();
+    match ptrace_signal_route(
+        dispatcher.is_ptrace_traceme(),
+        native,
+        virtual_owner,
+        signum,
+    ) {
+        PtraceSignalRoute::DeliverNormally => false,
+        PtraceSignalRoute::LegacyStop => {
+            crate::guest_cpu::mark_self_ptrace_stop_pending(signum);
+            stop_by_signal(crate::linux_abi::LINUX_SIGSTOP);
+            true
+        }
+        PtraceSignalRoute::VirtualStop => {
+            if !await_virtual_ptrace_stop_request(|| {
+                crate::guest_cpu::request_self_virtual_ptrace_stop_result(signum)
+            }) {
+                return false;
+            }
+            stop_by_signal(crate::linux_abi::LINUX_SIGSTOP);
+            true
+        }
+        PtraceSignalRoute::Terminate => {
+            crate::guest_cpu::record_child_exit(std::process::id(), crate::guest_cpu::total_ns());
+            if !native {
+                crate::guest_cpu::mark_self_ptrace_stop_pending(signum);
+            }
+            stop_by_signal(crate::linux_abi::LINUX_SIGKILL);
+            true
+        }
+    }
+}
+
 /// After a `PTRACE_TRACEME`d exec, stop with SIGTRAP so a tracer sees the
 /// exec stop.
 pub(crate) fn stop_after_traced_exec(dispatcher: &SyscallDispatcher) {
-    if dispatcher.is_ptrace_traceme() {
+    if dispatcher.page_geometry().native_profile.is_some() {
+        let _ = stop_for_ptrace_signal(dispatcher, crate::linux_abi::LINUX_SIGTRAP);
+    } else if dispatcher.is_ptrace_traceme() {
         stop_by_signal(crate::linux_abi::LINUX_SIGTRAP);
     }
 }
@@ -444,6 +529,60 @@ mod tests {
         assert!(debug_stop_matches_signal(" 4, 5, 11 ", 5));
         assert!(!debug_stop_matches_signal("4,11", 5));
         assert!(!debug_stop_matches_signal("not-a-signal", 5));
+    }
+
+    #[test]
+    fn ptrace_signal_stop_route_preserves_host_and_virtualizes_native_stops() {
+        assert_eq!(
+            ptrace_signal_route(true, false, false, 12),
+            PtraceSignalRoute::LegacyStop
+        );
+        assert_eq!(
+            ptrace_signal_route(true, true, true, 12),
+            PtraceSignalRoute::VirtualStop
+        );
+    }
+
+    #[test]
+    fn ptrace_signal_stop_route_delivers_normally_after_native_detach() {
+        assert_eq!(
+            ptrace_signal_route(true, true, false, 12),
+            PtraceSignalRoute::DeliverNormally
+        );
+        assert_eq!(
+            ptrace_signal_route(false, true, false, 12),
+            PtraceSignalRoute::DeliverNormally
+        );
+    }
+
+    #[test]
+    fn ptrace_signal_stop_route_keeps_sigkill_terminal() {
+        assert_eq!(
+            ptrace_signal_route(true, false, false, crate::linux_abi::LINUX_SIGKILL),
+            PtraceSignalRoute::Terminate
+        );
+        assert_eq!(
+            ptrace_signal_route(true, true, true, crate::linux_abi::LINUX_SIGKILL),
+            PtraceSignalRoute::Terminate
+        );
+    }
+
+    #[test]
+    fn ptrace_signal_stop_retries_busy_owner_without_losing_signal() {
+        let mut requests = [
+            crate::guest_cpu::VirtualPtraceStopRequest::Busy,
+            crate::guest_cpu::VirtualPtraceStopRequest::Busy,
+            crate::guest_cpu::VirtualPtraceStopRequest::Requested,
+        ]
+        .into_iter();
+        assert!(await_virtual_ptrace_stop_request(|| requests
+            .next()
+            .unwrap_or(
+                crate::guest_cpu::VirtualPtraceStopRequest::Detached
+            )));
+        assert!(!await_virtual_ptrace_stop_request(|| {
+            crate::guest_cpu::VirtualPtraceStopRequest::Detached
+        }));
     }
 
     fn synthetic_elf(machine: u16) -> Vec<u8> {
