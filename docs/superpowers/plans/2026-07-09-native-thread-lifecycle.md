@@ -169,19 +169,19 @@ git commit -m "refactor(native): share mapped memory across guest threads" ...
 - Produces: a native loop start mode for initial ELF entry versus a seeded
   detached sibling context.
 
-- [ ] **Step 1: Verify the exact red reducer**
+- [x] **Step 1: Verify the exact red reducer**
 
 Run `threadspawn` under `native16k` with the bound static PIE artifact.
 Expected: exit 125 with `does not yet support dispatcher outcome CloneThread`.
 
-- [ ] **Step 2: Construct the Linux child context**
+- [x] **Step 2: Construct the Linux child context**
 
 On `DispatchOutcome::CloneThread`, allocate a registry TID, inherit the parent
 signal mask, write `parent_tid_addr` and `child_tid_addr`, copy the trapped
 snapshot, set child `x0=0`, set PC to the post-syscall resume PC, apply a nonzero
 child stack, and carry `tls.unwrap_or(parent_guest_tpidr)`.
 
-- [ ] **Step 3: Spawn and enter the sibling loop**
+- [x] **Step 3: Spawn and enter the sibling loop**
 
 Start a named Rust host thread, record its Mach thread port, install its native
 trap/altstack state, seed the copied context, and enter through
@@ -189,7 +189,7 @@ trap/altstack state, seed the copied context, and enter through
 per-thread `NativeThreadRuntime` sharing registry, futex, platform futex,
 dispatcher, reporter, and memory.
 
-- [ ] **Step 4: Implement thread exit semantics**
+- [x] **Step 4: Implement thread exit semantics**
 
 Handle `DispatchOutcome::ThreadExit` by zeroing a nonzero clear-child-tid word,
 waking one private futex waiter, removing the TID, clearing run-state and host
@@ -197,13 +197,13 @@ signal state, and returning from only that host thread. Handle process-wide
 `Exit`/`SignalDeath` from a sibling with `_exit`, because the native run already
 lives in a dedicated forked macOS child.
 
-- [ ] **Step 5: Verify green reducers**
+- [x] **Step 5: Verify green reducers**
 
 Run `threadspawn` and `threadrecycle` on `native16k` and `linux4k`, then run each
 three times. Expected: line-exact MATCH with Docker and no residual guest
 processes.
 
-- [ ] **Step 6: Commit basic native pthread lifecycle**
+- [x] **Step 6: Commit basic native pthread lifecycle**
 
 ```sh
 git add crates/carrick-runtime/src/native_darwin.rs
