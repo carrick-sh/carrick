@@ -13,9 +13,10 @@
 #include <setjmp.h>
 #include <signal.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
 #include <ucontext.h>
 #include <unistd.h>
 
@@ -27,12 +28,117 @@ struct carrick_native_ucontext_snapshot {
     uint8_t v[32][16];
     uint32_t fpsr;
     uint32_t fpcr;
+    int32_t event_kind;
     int32_t signal;
     int32_t signal_code;
     uint64_t fault_address;
     uint64_t esr;
     uint64_t far;
 };
+
+struct carrick_native_kick_state {
+    _Atomic uint64_t requested;
+    _Atomic uint64_t acknowledged;
+    _Atomic bool pending;
+};
+
+static _Thread_local struct carrick_native_kick_state
+    *carrick_native_bound_kick_state;
+
+static bool carrick_native_kick_state_take(
+    struct carrick_native_kick_state *state) {
+    if (state == 0 || !atomic_exchange_explicit(
+                          &state->pending,
+                          false,
+                          memory_order_seq_cst)) {
+        return false;
+    }
+    uint64_t requested = atomic_load_explicit(
+        &state->requested,
+        memory_order_seq_cst);
+    atomic_store_explicit(
+        &state->acknowledged,
+        requested,
+        memory_order_seq_cst);
+    return true;
+}
+
+void *carrick_native_kick_state_create(void) {
+    struct carrick_native_kick_state *state = calloc(1, sizeof(*state));
+    if (state == 0) {
+        return 0;
+    }
+
+    atomic_init(&state->requested, 0);
+    atomic_init(&state->acknowledged, 0);
+    atomic_init(&state->pending, false);
+    if (!atomic_is_lock_free(&state->requested) ||
+        !atomic_is_lock_free(&state->acknowledged) ||
+        !atomic_is_lock_free(&state->pending)) {
+        free(state);
+        errno = ENOTSUP;
+        return 0;
+    }
+    return state;
+}
+
+void carrick_native_kick_state_destroy(void *opaque) {
+    free(opaque);
+}
+
+int carrick_native_kick_state_request(void *opaque) {
+    struct carrick_native_kick_state *state = opaque;
+    if (state == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    atomic_fetch_add_explicit(&state->requested, 1, memory_order_seq_cst);
+    bool was_pending = atomic_exchange_explicit(
+        &state->pending,
+        true,
+        memory_order_seq_cst);
+    return was_pending ? 0 : 1;
+}
+
+void carrick_native_kick_state_acknowledge(void *opaque) {
+    struct carrick_native_kick_state *state = opaque;
+    (void)carrick_native_kick_state_take(state);
+}
+
+int carrick_native_kick_state_bind_current(void *opaque) {
+    struct carrick_native_kick_state *state = opaque;
+    if (state == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    carrick_native_bound_kick_state = state;
+    return 0;
+}
+
+void carrick_native_kick_state_unbind_current(void *opaque) {
+    if (carrick_native_bound_kick_state == opaque) {
+        carrick_native_bound_kick_state = 0;
+    }
+}
+
+uint64_t carrick_native_kick_state_requested(void *opaque) {
+    struct carrick_native_kick_state *state = opaque;
+    return state == 0
+               ? 0
+               : atomic_load_explicit(
+                     &state->requested,
+                     memory_order_seq_cst);
+}
+
+uint64_t carrick_native_kick_state_acknowledged(void *opaque) {
+    struct carrick_native_kick_state *state = opaque;
+    return state == 0
+               ? 0
+               : atomic_load_explicit(
+                     &state->acknowledged,
+                     memory_order_seq_cst);
+}
 
 #if defined(__aarch64__)
 static _Thread_local sigjmp_buf carrick_native_env;
@@ -43,6 +149,8 @@ static _Thread_local ucontext_t *carrick_native_pending_uc;
 static _Thread_local unsigned char carrick_native_signal_stack[64 * 1024]
     __attribute__((aligned(16)));
 static _Thread_local uint64_t carrick_native_host_tpidr_el0;
+static _Thread_local volatile sig_atomic_t carrick_native_bootstrap_pending;
+static _Thread_local int32_t carrick_native_last_event_kind;
 static _Thread_local int32_t carrick_native_last_signal;
 static _Thread_local int32_t carrick_native_last_signal_code;
 static _Thread_local uint64_t carrick_native_last_fault_address;
@@ -58,29 +166,8 @@ static int carrick_native_update_tpidr_errno;
 
 #define CARRICK_NATIVE_CUSTOM_X18_BIT UINT64_C(0x0001000000000000)
 #define CARRICK_NATIVE_TPIDR_BASE_MASK UINT64_C(0xfffffffffff00000)
-
-#define CARRICK_NATIVE_RESUME_BUCKET_SIZE (UINT64_C(1) << 27)
-#define CARRICK_NATIVE_MAX_RESUME_PAGES 256
-#define CARRICK_NATIVE_RESUME_CACHE_SIZE 16384
-#define CARRICK_NATIVE_RESUME_PAD_SIZE 40
-
-struct carrick_native_resume_page {
-    uint64_t bucket;
-    uint8_t *base;
-    size_t used;
-};
-
-struct carrick_native_resume_entry {
-    uint64_t target;
-    void *pad;
-};
-
-static _Thread_local struct carrick_native_resume_page
-    carrick_native_resume_pages[CARRICK_NATIVE_MAX_RESUME_PAGES];
-static _Thread_local struct carrick_native_resume_entry
-    carrick_native_resume_cache[CARRICK_NATIVE_RESUME_CACHE_SIZE];
-static _Thread_local size_t carrick_native_resume_page_count;
-static _Thread_local size_t carrick_native_page_size;
+#define CARRICK_NATIVE_EVENT_TRAP 1
+#define CARRICK_NATIVE_EVENT_KICK 2
 
 static struct __darwin_mcontext64 *carrick_native_mcontext(void) {
     return carrick_native_uc.uc_mcontext;
@@ -100,11 +187,6 @@ static uint64_t carrick_native_read_tpidr_el0(void) {
     __asm__ volatile("mrs %0, TPIDR_EL0" : "=r"(value));
     return value;
 }
-
-__attribute__((noreturn)) static void carrick_native_branch_mcontext(
-    void *state,
-    void *neon,
-    void *pad);
 
 static void carrick_native_write_tpidr_el0(uint64_t value) {
     __asm__ volatile("msr TPIDR_EL0, %0" : : "r"(value) : "memory");
@@ -207,206 +289,6 @@ static void carrick_native_write_hex(uint64_t value) {
     (void)write(STDERR_FILENO, buf, sizeof(buf));
 }
 
-static uint32_t carrick_native_ldr_x_unsigned(
-    uint32_t destination,
-    uint32_t base,
-    uint32_t byte_offset) {
-    return UINT32_C(0xf9400000) | ((byte_offset / 8) << 10) | (base << 5) |
-           destination;
-}
-
-static size_t carrick_native_resume_hash(uint64_t target) {
-    uint64_t mixed = (target >> 2) ^ (target >> 19) ^ (target >> 37);
-    return (size_t)mixed & (CARRICK_NATIVE_RESUME_CACHE_SIZE - 1);
-}
-
-static struct carrick_native_resume_entry *
-carrick_native_find_resume_entry(uint64_t target, bool *found) {
-    size_t index = carrick_native_resume_hash(target);
-    for (size_t probe = 0; probe < CARRICK_NATIVE_RESUME_CACHE_SIZE; probe++) {
-        struct carrick_native_resume_entry *entry =
-            &carrick_native_resume_cache[(index + probe) &
-                                         (CARRICK_NATIVE_RESUME_CACHE_SIZE - 1)];
-        if (entry->target == target) {
-            *found = true;
-            return entry;
-        }
-        if (entry->target == 0) {
-            *found = false;
-            return entry;
-        }
-    }
-    errno = ENOSPC;
-    return 0;
-}
-
-static struct carrick_native_resume_page *
-carrick_native_find_resume_page(uint64_t target) {
-    for (size_t i = 0; i < carrick_native_resume_page_count; i++) {
-        struct carrick_native_resume_page *page = &carrick_native_resume_pages[i];
-        if (page->used + CARRICK_NATIVE_RESUME_PAD_SIZE > carrick_native_page_size) {
-            continue;
-        }
-        uint64_t branch_address =
-            (uint64_t)(uintptr_t)(page->base + page->used + 28);
-        int64_t branch_delta = (int64_t)target - (int64_t)branch_address;
-        if ((branch_delta & 3) == 0 && branch_delta >= -INT64_C(134217728) &&
-            branch_delta <= INT64_C(134217724)) {
-            return page;
-        }
-    }
-    return 0;
-}
-
-void carrick_native_reset_resume_pads(void) {
-    memset(carrick_native_resume_pages, 0, sizeof(carrick_native_resume_pages));
-    memset(carrick_native_resume_cache, 0, sizeof(carrick_native_resume_cache));
-    carrick_native_resume_page_count = 0;
-    carrick_native_page_size = 0;
-}
-
-int carrick_native_register_resume_page(
-    uint64_t bucket,
-    void *base,
-    size_t page_size) {
-    if (base == 0 || page_size == 0 || (page_size & (page_size - 1)) != 0 ||
-        ((uint64_t)(uintptr_t)base & (page_size - 1)) != 0 ||
-        ((uint64_t)(uintptr_t)base & ~(CARRICK_NATIVE_RESUME_BUCKET_SIZE - 1)) != bucket ||
-        carrick_native_resume_page_count >= CARRICK_NATIVE_MAX_RESUME_PAGES) {
-        errno = EINVAL;
-        return -1;
-    }
-    if (carrick_native_page_size != 0 && carrick_native_page_size != page_size) {
-        errno = EINVAL;
-        return -1;
-    }
-    carrick_native_page_size = page_size;
-    struct carrick_native_resume_page *page =
-        &carrick_native_resume_pages[carrick_native_resume_page_count++];
-    page->bucket = bucket;
-    page->base = (uint8_t *)base;
-    page->used = 0;
-    return 0;
-}
-
-static struct carrick_native_resume_page *
-carrick_native_allocate_resume_page(uint64_t bucket) {
-    if (carrick_native_resume_page_count >= CARRICK_NATIVE_MAX_RESUME_PAGES) {
-        errno = ENOSPC;
-        return 0;
-    }
-    if (carrick_native_page_size == 0) {
-        long page_size = sysconf(_SC_PAGESIZE);
-        if (page_size <= 0) {
-            errno = EINVAL;
-            return 0;
-        }
-        carrick_native_page_size = (size_t)page_size;
-    }
-
-    uint64_t bucket_end = bucket + CARRICK_NATIVE_RESUME_BUCKET_SIZE;
-    uint64_t center = bucket + CARRICK_NATIVE_RESUME_BUCKET_SIZE / 2;
-    center &= ~((uint64_t)carrick_native_page_size - 1);
-    size_t slots = CARRICK_NATIVE_RESUME_BUCKET_SIZE / carrick_native_page_size;
-    for (size_t step = 0; step < slots; step++) {
-        int64_t distance = (int64_t)((step + 1) / 2);
-        int64_t direction = (step & 1) == 0 ? -1 : 1;
-        uint64_t candidate = center;
-        if (step != 0) {
-            int64_t delta = direction * distance * (int64_t)carrick_native_page_size;
-            candidate = (uint64_t)((int64_t)center + delta);
-        }
-        if (candidate < bucket || candidate + carrick_native_page_size > bucket_end) {
-            continue;
-        }
-        void *mapped = mmap(
-            (void *)(uintptr_t)candidate,
-            carrick_native_page_size,
-            PROT_READ | PROT_WRITE,
-            MAP_ANON | MAP_PRIVATE | MAP_NORESERVE,
-            -1,
-            0);
-        if (mapped == MAP_FAILED) {
-            continue;
-        }
-        uint64_t mapped_address = (uint64_t)(uintptr_t)mapped;
-        if (mapped_address < bucket ||
-            mapped_address + carrick_native_page_size > bucket_end) {
-            (void)munmap(mapped, carrick_native_page_size);
-            continue;
-        }
-        struct carrick_native_resume_page *page =
-            &carrick_native_resume_pages[carrick_native_resume_page_count++];
-        page->bucket = bucket;
-        page->base = (uint8_t *)mapped;
-        page->used = 0;
-        return page;
-    }
-    errno = ENOMEM;
-    return 0;
-}
-
-static void *carrick_native_prepare_resume_pad(uint64_t target) {
-    if (target == 0 || (target & 3) != 0) {
-        errno = EINVAL;
-        return 0;
-    }
-    bool found = false;
-    struct carrick_native_resume_entry *cache_entry =
-        carrick_native_find_resume_entry(target, &found);
-    if (cache_entry == 0 || found) {
-        return cache_entry == 0 ? 0 : cache_entry->pad;
-    }
-
-    uint64_t bucket = target & ~(CARRICK_NATIVE_RESUME_BUCKET_SIZE - 1);
-    struct carrick_native_resume_page *page = carrick_native_find_resume_page(target);
-    bool new_page = page == 0;
-    if (new_page) {
-        page = carrick_native_allocate_resume_page(bucket);
-        if (page == 0) {
-            return 0;
-        }
-    } else if (mprotect(page->base, carrick_native_page_size,
-                        PROT_READ | PROT_WRITE) != 0) {
-        return 0;
-    }
-
-    uint8_t *pad = page->base + page->used;
-    uint32_t *instructions = (uint32_t *)pad;
-    uint64_t branch_address = (uint64_t)(uintptr_t)(pad + 28);
-    int64_t branch_delta = (int64_t)target - (int64_t)branch_address;
-    if ((branch_delta & 3) != 0 || branch_delta < -INT64_C(134217728) ||
-        branch_delta > INT64_C(134217724)) {
-        errno = ERANGE;
-        if (!new_page) {
-            (void)mprotect(page->base, carrick_native_page_size,
-                           PROT_READ | PROT_EXEC);
-        }
-        return 0;
-    }
-
-    instructions[0] = UINT32_C(0x58000111); /* ldr x17, pad+32 */
-    instructions[1] = carrick_native_ldr_x_unsigned(16, 17, 128);
-    instructions[2] = carrick_native_ldr_x_unsigned(18, 17, 144);
-    instructions[3] = carrick_native_ldr_x_unsigned(9, 17, 248);
-    instructions[4] = UINT32_C(0x9100013f); /* mov sp, x9 */
-    instructions[5] = carrick_native_ldr_x_unsigned(9, 17, 72);
-    instructions[6] = carrick_native_ldr_x_unsigned(17, 17, 136);
-    instructions[7] = UINT32_C(0x14000000) |
-                      ((uint32_t)(branch_delta >> 2) & UINT32_C(0x03ffffff));
-    void *state = &carrick_native_uc.__mcontext_data.__ss;
-    memcpy(pad + 32, &state, sizeof(state));
-    sys_icache_invalidate(pad, CARRICK_NATIVE_RESUME_PAD_SIZE);
-    if (mprotect(page->base, carrick_native_page_size, PROT_READ | PROT_EXEC) != 0) {
-        return 0;
-    }
-
-    page->used += CARRICK_NATIVE_RESUME_PAD_SIZE;
-    cache_entry->target = target;
-    cache_entry->pad = pad;
-    return pad;
-}
-
 static void carrick_native_fatal_signal_handler(int sig, siginfo_t *info, void *uap) {
     carrick_native_enter_host_x18_abi();
     carrick_native_write_literal("native Darwin fatal signal ");
@@ -442,18 +324,54 @@ static void carrick_native_fatal_signal_handler(int sig, siginfo_t *info, void *
     _exit(128 + sig);
 }
 
-static int carrick_native_sanitize_transport_mask(sigset_t *mask) {
+static int carrick_native_prepare_guest_mask(sigset_t *mask) {
     return sigdelset(mask, SIGTRAP) != 0 ||
            sigdelset(mask, SIGSEGV) != 0 ||
            sigdelset(mask, SIGBUS) != 0 ||
-           sigdelset(mask, SIGILL) != 0
+           sigdelset(mask, SIGILL) != 0 ||
+           sigdelset(mask, SIGPIPE) != 0
+               ? -1
+               : 0;
+}
+
+static int carrick_native_prepare_host_mask(sigset_t *mask) {
+    return sigdelset(mask, SIGTRAP) != 0 ||
+           sigdelset(mask, SIGSEGV) != 0 ||
+           sigdelset(mask, SIGBUS) != 0 ||
+           sigdelset(mask, SIGILL) != 0 ||
+           sigaddset(mask, SIGPIPE) != 0
                ? -1
                : 0;
 }
 
 static void carrick_native_trap_handler(int sig, siginfo_t *info, void *uap) {
-    if ((sig != SIGTRAP && sig != SIGSEGV && sig != SIGBUS) ||
-        !carrick_native_env_ready || uap == 0) {
+    if (sig == SIGTRAP && carrick_native_bootstrap_pending && uap != 0) {
+        ucontext_t *uc = (ucontext_t *)uap;
+        struct __darwin_mcontext64 *seeded = carrick_native_mcontext();
+        if (uc->uc_mcontext == 0 || seeded == 0) {
+            _exit(128 + sig);
+        }
+        carrick_native_bootstrap_pending = 0;
+        carrick_native_copy_mcontext(uc->uc_mcontext, seeded);
+        carrick_native_pending_uc = 0;
+        if (carrick_native_prepare_guest_mask(&uc->uc_sigmask) != 0 ||
+            carrick_native_enter_guest_x18_abi() != 0) {
+            _exit(128 + sig);
+        }
+        return;
+    }
+
+    int32_t event_kind = CARRICK_NATIVE_EVENT_TRAP;
+    if (sig == SIGPIPE) {
+        if (!carrick_native_kick_state_take(carrick_native_bound_kick_state)) {
+            return;
+        }
+        if (!carrick_native_env_ready || uap == 0) {
+            return;
+        }
+        event_kind = CARRICK_NATIVE_EVENT_KICK;
+    } else if ((sig != SIGTRAP && sig != SIGSEGV && sig != SIGBUS) ||
+               !carrick_native_env_ready || uap == 0) {
         carrick_native_fatal_signal_handler(sig, info, uap);
     }
 
@@ -467,6 +385,7 @@ static void carrick_native_trap_handler(int sig, siginfo_t *info, void *uap) {
         uc->uc_mcontext);
     carrick_native_enter_host_x18_abi();
     carrick_native_write_tpidr_el0(carrick_native_host_tpidr_el0);
+    carrick_native_last_event_kind = event_kind;
     carrick_native_last_signal = sig;
     carrick_native_last_signal_code = info != 0 ? info->si_code : 0;
     carrick_native_last_fault_address = info != 0 ? (uintptr_t)info->si_addr : 0;
@@ -475,7 +394,7 @@ static void carrick_native_trap_handler(int sig, siginfo_t *info, void *uap) {
     carrick_native_env_ready = 0;
     // Rust dispatch runs before this signal handler returns, so restore the
     // pre-trap host mask now while keeping Carrick's trap transport unblocked.
-    if (carrick_native_sanitize_transport_mask(&uc->uc_sigmask) != 0) {
+    if (carrick_native_prepare_host_mask(&uc->uc_sigmask) != 0) {
         _exit(128 + sig);
     }
     int mask_rc = pthread_sigmask(SIG_SETMASK, &uc->uc_sigmask, 0);
@@ -490,7 +409,7 @@ static void carrick_native_trap_handler(int sig, siginfo_t *info, void *uap) {
     if (pending == 0 || pending->uc_mcontext == 0) {
         _exit(128 + sig);
     }
-    if (carrick_native_sanitize_transport_mask(&pending->uc_sigmask) != 0) {
+    if (carrick_native_prepare_guest_mask(&pending->uc_sigmask) != 0) {
         _exit(128 + sig);
     }
     carrick_native_copy_mcontext(
@@ -519,11 +438,27 @@ int carrick_native_unblock_transport_signals(void) {
     return 0;
 }
 
+static int carrick_native_block_kick_signal(void) {
+    sigset_t kick;
+    if (sigemptyset(&kick) != 0 || sigaddset(&kick, SIGPIPE) != 0) {
+        return -1;
+    }
+    int rc = pthread_sigmask(SIG_BLOCK, &kick, 0);
+    if (rc != 0) {
+        errno = rc;
+        return -1;
+    }
+    return 0;
+}
+
 int carrick_native_install_trap_handler(void) {
     if (carrick_native_init_custom_x18() != 0) {
         return -1;
     }
     if (carrick_native_unblock_transport_signals() != 0) {
+        return -1;
+    }
+    if (carrick_native_block_kick_signal() != 0) {
         return -1;
     }
     carrick_native_host_tpidr_el0 = carrick_native_read_tpidr_el0();
@@ -561,6 +496,9 @@ int carrick_native_install_trap_handler(void) {
     if (sigaction(SIGBUS, &action, 0) != 0) {
         return -1;
     }
+    if (sigaction(SIGPIPE, &action, 0) != 0) {
+        return -1;
+    }
     action.sa_sigaction = carrick_native_fatal_signal_handler;
     if (sigaction(SIGILL, &action, 0) != 0) {
         return -1;
@@ -596,94 +534,45 @@ int carrick_native_seed_ucontext(
     carrick_native_last_signal = snapshot->signal;
     carrick_native_last_signal_code = snapshot->signal_code;
     carrick_native_last_fault_address = snapshot->fault_address;
+    carrick_native_last_event_kind = 0;
     carrick_native_pending_uc = 0;
+    carrick_native_bootstrap_pending = 0;
     carrick_native_env_ready = 0;
     return 0;
 }
 
-__attribute__((noreturn)) static void carrick_native_branch(uint64_t entry, uint64_t sp) {
-    __asm__ volatile(
-        "mov sp, %1\n"
-        "br %0\n"
-        :
-        : "r"(entry), "r"(sp)
-        : "memory");
-    __builtin_unreachable();
-}
-
-__attribute__((naked, noreturn)) static void carrick_native_branch_mcontext(
-    void *state,
-    void *neon,
-    void *pad) {
-    __asm__ volatile(
-        "mov x16, x0\n"
-        "mov x17, x1\n"
-        "mov x18, x2\n"
-        "ldp q0,  q1,  [x17, #0]\n"
-        "ldp q2,  q3,  [x17, #32]\n"
-        "ldp q4,  q5,  [x17, #64]\n"
-        "ldp q6,  q7,  [x17, #96]\n"
-        "ldp q8,  q9,  [x17, #128]\n"
-        "ldp q10, q11, [x17, #160]\n"
-        "ldp q12, q13, [x17, #192]\n"
-        "ldp q14, q15, [x17, #224]\n"
-        "ldp q16, q17, [x17, #256]\n"
-        "ldp q18, q19, [x17, #288]\n"
-        "ldp q20, q21, [x17, #320]\n"
-        "ldp q22, q23, [x17, #352]\n"
-        "ldp q24, q25, [x17, #384]\n"
-        "ldp q26, q27, [x17, #416]\n"
-        "ldp q28, q29, [x17, #448]\n"
-        "ldp q30, q31, [x17, #480]\n"
-        "ldr w9, [x17, #512]\n"
-        "msr FPSR, x9\n"
-        "ldr w9, [x17, #516]\n"
-        "msr FPCR, x9\n"
-        "ldr w9, [x16, #264]\n"
-        "msr NZCV, x9\n"
-        "mov x17, x18\n"
-        "ldr x0,  [x16, #0]\n"
-        "ldr x1,  [x16, #8]\n"
-        "ldr x2,  [x16, #16]\n"
-        "ldr x3,  [x16, #24]\n"
-        "ldr x4,  [x16, #32]\n"
-        "ldr x5,  [x16, #40]\n"
-        "ldr x6,  [x16, #48]\n"
-        "ldr x7,  [x16, #56]\n"
-        "ldr x8,  [x16, #64]\n"
-        "ldr x10, [x16, #80]\n"
-        "ldr x11, [x16, #88]\n"
-        "ldr x12, [x16, #96]\n"
-        "ldr x13, [x16, #104]\n"
-        "ldr x14, [x16, #112]\n"
-        "ldr x15, [x16, #120]\n"
-        "ldr x19, [x16, #152]\n"
-        "ldr x20, [x16, #160]\n"
-        "ldr x21, [x16, #168]\n"
-        "ldr x22, [x16, #176]\n"
-        "ldr x23, [x16, #184]\n"
-        "ldr x24, [x16, #192]\n"
-        "ldr x25, [x16, #200]\n"
-        "ldr x26, [x16, #208]\n"
-        "ldr x27, [x16, #216]\n"
-        "ldr x28, [x16, #224]\n"
-        "ldr x29, [x16, #232]\n"
-        "ldr x30, [x16, #240]\n"
-        "br x17\n");
-}
-
-int carrick_native_enter(uint64_t entry, uint64_t sp) {
+static int carrick_native_bootstrap_seeded_context(void) {
+    if (carrick_native_mcontext() == 0) {
+        errno = EINVAL;
+        return -1;
+    }
     if (sigsetjmp(carrick_native_env, 1) == 0) {
         carrick_native_env_ready = 1;
-        carrick_native_host_tpidr_el0 = carrick_native_read_tpidr_el0();
-        if (carrick_native_enter_guest_x18_abi() != 0) {
+        carrick_native_pending_uc = 0;
+        carrick_native_bootstrap_pending = 1;
+        if (raise(SIGTRAP) != 0) {
+            carrick_native_bootstrap_pending = 0;
             carrick_native_env_ready = 0;
             return -1;
         }
-        carrick_native_branch(entry, sp);
+        carrick_native_bootstrap_pending = 0;
+        carrick_native_env_ready = 0;
+        errno = EFAULT;
+        return -1;
     }
     carrick_native_env_ready = 0;
     return 1;
+}
+
+int carrick_native_enter(uint64_t entry, uint64_t sp) {
+    struct carrick_native_ucontext_snapshot initial;
+    memset(&initial, 0, sizeof(initial));
+    initial.pc = entry;
+    initial.sp = sp;
+    if (carrick_native_seed_ucontext(&initial) != 0) {
+        return -1;
+    }
+    return carrick_native_bootstrap_seeded_context();
 }
 
 int carrick_native_resume(void) {
@@ -701,25 +590,7 @@ int carrick_native_resume(void) {
 }
 
 int carrick_native_resume_detached_context(void) {
-    struct __darwin_mcontext64 *mc = carrick_native_mcontext();
-    if (mc == 0) {
-        return -1;
-    }
-    void *pad = carrick_native_prepare_resume_pad(mc->__ss.__pc);
-    if (pad == 0) {
-        return -1;
-    }
-    if (sigsetjmp(carrick_native_env, 1) == 0) {
-        carrick_native_env_ready = 1;
-        carrick_native_pending_uc = 0;
-        if (carrick_native_enter_guest_x18_abi() != 0) {
-            carrick_native_env_ready = 0;
-            return -1;
-        }
-        carrick_native_branch_mcontext(&mc->__ss, &mc->__ns, pad);
-    }
-    carrick_native_env_ready = 0;
-    return 1;
+    return carrick_native_bootstrap_seeded_context();
 }
 
 int carrick_native_snapshot_ucontext(struct carrick_native_ucontext_snapshot *out) {
@@ -742,6 +613,7 @@ int carrick_native_snapshot_ucontext(struct carrick_native_ucontext_snapshot *ou
     memcpy(out->v, mc->__ns.__v, sizeof(out->v));
     out->fpsr = mc->__ns.__fpsr;
     out->fpcr = mc->__ns.__fpcr;
+    out->event_kind = carrick_native_last_event_kind;
     out->signal = carrick_native_last_signal;
     out->signal_code = carrick_native_last_signal_code;
     out->fault_address = carrick_native_last_fault_address;
