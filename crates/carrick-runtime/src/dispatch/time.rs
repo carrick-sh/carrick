@@ -832,13 +832,18 @@ impl SyscallDispatcher {
                 if resource == LINUX_RLIMIT_NOFILE && rlim_max > NR_OPEN_CEILING {
                     return Ok(DispatchOutcome::errno(LINUX_EPERM));
                 }
-                // Raising a (previously-lowered) hard limit needs CAP_SYS_RESOURCE,
-                // which carrick models as euid==0 (the default guest identity is
-                // root). A privileged guest may raise it; the store path below
-                // then persists the new hard cap. An unprivileged guest still gets
-                // EPERM (matches real Linux). Reverts commit 13873aa3's
-                // unconditional denial.
-                if rlim_max > old.rlim_max && this.cred_snapshot().euid != 0 {
+                // Raising a (previously-lowered) hard limit needs
+                // CAP_SYS_RESOURCE in the initial user namespace. Container
+                // root does not receive that capability in Docker's default
+                // bounded set, and a fresh user namespace's local full set is
+                // insufficient.
+                if rlim_max > old.rlim_max
+                    && !(crate::namespace::process::current_user_ns()
+                        == crate::namespace::INITIAL_USER_NS
+                        && crate::namespace::process::has_effective_cap(
+                            crate::namespace::process::CAP_SYS_RESOURCE,
+                        ))
+                {
                     return Ok(DispatchOutcome::errno(LINUX_EPERM));
                 }
                 if resource == LINUX_RLIMIT_NOFILE {
