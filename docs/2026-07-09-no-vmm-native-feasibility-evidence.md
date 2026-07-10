@@ -134,18 +134,29 @@ native16k:   devnullseek static PIE -> exit 0, output matches Linux
 linux4k:     devnullseek static PIE -> exit 0, output matches Linux
 ```
 
-Full `native16k` probe baseline with the corrected artifacts:
+Static musl probes are bind-mounted into the requested OCI image and executed
+as the container command. They do not pass through the image's glibc `/bin/sh`,
+`base64`, or `chmod`; that bootstrap path corrupted dynamic-loader state under
+`linux4k` before many static probes started. The bind transport preserves the
+image rootfs while keeping the probe itself as the first guest ELF. Docker still
+runs the byte-identical artifact as the independent Linux oracle.
+
+Full matched-transport probe baselines:
 
 ```text
-musl gating:      280/373 MATCH, 93 semantic gaps
-glibc report-only: 271/374 MATCH, 103 semantic gaps
-amd64:             skipped because native is same-ISA only
+native16k musl gating:       277/373 MATCH, 96 semantic gaps
+native16k glibc report-only: 273/374 MATCH, 101 semantic gaps
+linux4k musl gating:         266/373 MATCH, 107 semantic gaps
+linux4k glibc report-only:     0/374 MATCH, 374 loader/runtime gaps
+amd64:                         skipped because native is same-ISA only
 ```
 
 The campaign now runs every gating probe instead of failing at image mapping.
-The remaining failures are runtime semantics, led by the native backend's
-missing `CloneThread` outcome, signal/process lifecycle, ptrace, and vDSO gaps;
-they are not page-zero or linker failures.
+Of the 96 `native16k` failures, 45 terminate at the native backend's missing
+`CloneThread` outcome. Fourteen failures are currently `linux4k`-only and three
+are `native16k`-only. The remaining shared gaps are signal/process lifecycle,
+ptrace, vDSO, and other runtime semantics; they are not page-zero or linker
+failures.
 
 References:
 

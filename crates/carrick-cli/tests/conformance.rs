@@ -2266,14 +2266,30 @@ fn conformance_default_run_contract() {
 // ProbeSet — aarch64-linux-{musl,gnu} for the ARM64 lane, x86_64-linux-{musl,
 // gnu} for the AMD64 lane — so the SAME portable probe sources gate both the
 // macOS/aarch64 reference path and the x86_64 fleet (Linux/KVM, FreeBSD/bhyve).
-// Each probe prints deterministic, one-line-per-observation output. We ship the
-// binary into the guest by base64-encoding it and feeding the encoded bytes to
-// `base64 -d` on the child's STDIN (it's ~600KB — too big for argv).
+// Each probe prints deterministic, one-line-per-observation output. The default
+// transport base64-encodes the binary and feeds it to `base64 -d` on the child's
+// STDIN (it is too large for argv). Native musl campaigns bind the static probe
+// as the container command so an unrelated dynamic image utility cannot fail
+// before the probe starts.
 // ---------------------------------------------------------------------------
 
 /// `base64 -d > /tmp/p && chmod +x /tmp/p && /tmp/p` — the binary arrives on
 /// stdin, so the same snippet works under carrick and Docker.
 const PROBE_SNIPPET: &str = "base64 -d > /tmp/p && chmod +x /tmp/p && /tmp/p";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProbeTransport {
+    ContainerInjection,
+    DirectElf,
+}
+
+fn probe_transport(exec_backend: Option<&str>, libc: &str) -> ProbeTransport {
+    if exec_backend == Some("native") && libc == "musl" {
+        ProbeTransport::DirectElf
+    } else {
+        ProbeTransport::ContainerInjection
+    }
+}
 
 /// Directory holding the compiled probe executables for a target triple, if built.
 fn probes_dir(target: &str) -> PathBuf {
@@ -2384,9 +2400,6 @@ fn run_carrick_probe_with_backend_env(
     deadline: Duration,
     backend_env: Option<(&'static str, &'static str)>,
 ) -> String {
-    use std::io::Write;
-    use std::os::unix::process::CommandExt;
-    let run_id = case_run_id();
     let mut command = Command::new(bin);
     command
         .args([
@@ -2401,7 +2414,6 @@ fn run_carrick_probe_with_backend_env(
             "-c",
             PROBE_SNIPPET,
         ])
-        .env("CARRICK_RUN_ID", &run_id)
         .env(
             "CARRICK_ACCEPT_ROSETTA_TERMS",
             if lane.platform == "linux/amd64" {
@@ -2409,21 +2421,59 @@ fn run_carrick_probe_with_backend_env(
             } else {
                 "0"
             },
-        )
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .process_group(0);
+        );
     if let Some((exec_backend, native_page_profile)) = backend_env {
         command
             .env("CARRICK_EXEC_BACKEND", exec_backend)
             .env("CARRICK_NATIVE_PAGE_PROFILE", native_page_profile);
     }
+    run_carrick_probe_process(command, Some(stdin_bytes), deadline)
+}
+
+fn run_carrick_bound_probe(bin: &PathBuf, lane: Lane, probe: &Path, deadline: Duration) -> String {
+    let volume = format!("{}:/tmp/carrick-probe:ro", probe.display());
+    let mut command = Command::new(bin);
+    command
+        .args([
+            "run",
+            "--platform",
+            lane.platform,
+            "--raw",
+            "--fs",
+            "host",
+            "--volume",
+        ])
+        .arg(volume)
+        .arg(lane.image)
+        .arg("/tmp/carrick-probe")
+        .env("CARRICK_ACCEPT_ROSETTA_TERMS", "0");
+    run_carrick_probe_process(command, None, deadline)
+}
+
+fn run_carrick_probe_process(
+    mut command: Command,
+    stdin_bytes: Option<&[u8]>,
+    deadline: Duration,
+) -> String {
+    use std::io::Write;
+    use std::os::unix::process::CommandExt;
+
+    let run_id = case_run_id();
+    command
+        .env("CARRICK_RUN_ID", &run_id)
+        .stdin(if stdin_bytes.is_some() {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        })
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .process_group(0);
     let mut child = command.spawn().expect("spawn carrick probe");
     let pid = child.id() as i32;
-    // Hand the base64 to the child on its own thread so a full stdout pipe
-    // can't deadlock the write.
-    {
+    if let Some(stdin_bytes) = stdin_bytes {
+        // Hand the base64 to the child on its own thread so a full stdout pipe
+        // can't deadlock the write.
         let mut stdin = child.stdin.take().expect("carrick stdin");
         let bytes = stdin_bytes.to_vec();
         std::thread::spawn(move || {
@@ -2508,29 +2558,18 @@ fn ensure_native_smoke_probe() -> PathBuf {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn ensure_native_static_pie_probe(name: &str) -> PathBuf {
-    let target_dir = repo_path("conformance-probes/target/native-pie");
-    let status = Command::new("cargo")
-        .current_dir(repo_path("conformance-probes"))
-        .env("CARGO_TARGET_DIR", &target_dir)
-        .env("RUSTFLAGS", "-C relocation-model=pie -C link-arg=-pie")
-        .args([
-            "build",
-            "--release",
-            "--target",
-            "aarch64-unknown-linux-musl",
-            "--bin",
-            name,
-        ])
-        .status()
-        .expect("build native static PIE probe");
-    assert!(
-        status.success(),
-        "failed to build native static PIE probe {name}"
-    );
-    let probe = target_dir
-        .join("aarch64-unknown-linux-musl")
-        .join("release")
-        .join(name);
+    let probe = probe_campaign_dir("aarch64-unknown-linux-musl", Some("native")).join(name);
+    if !probe.exists() {
+        let status = Command::new(repo_path("scripts/build-probes.sh"))
+            .current_dir(repo_root())
+            .arg("--native-pie")
+            .status()
+            .expect("build native PIE probe campaign");
+        assert!(
+            status.success(),
+            "failed to build native PIE probe campaign for {name}"
+        );
+    }
     assert!(probe.exists(), "native static PIE probe missing: {name}");
     assert_eq!(
         elf_file_type(&probe),
@@ -2798,9 +2837,14 @@ enum ProbeOutcome {
 }
 
 /// Run one probe under carrick + Docker and classify the result. Self-contained
-/// (its own per-case run id via `run_carrick_probe`), so it is safe to call from
-/// multiple worker threads concurrently.
-fn run_one_probe(bin: &PathBuf, lane: Lane, probe: &std::path::Path) -> (String, ProbeOutcome) {
+/// (its own per-case run id via the selected transport), so it is safe to call
+/// from multiple worker threads concurrently.
+fn run_one_probe(
+    bin: &PathBuf,
+    lane: Lane,
+    probe: &std::path::Path,
+    transport: ProbeTransport,
+) -> (String, ProbeOutcome) {
     use base64::Engine as _;
     let engine = base64::engine::general_purpose::STANDARD;
     let name = probe
@@ -2821,7 +2865,12 @@ fn run_one_probe(bin: &PathBuf, lane: Lane, probe: &std::path::Path) -> (String,
     } else {
         CASE_DEADLINE
     };
-    let carrick_out = run_carrick_probe_with_deadline(bin, lane, &encoded, deadline);
+    let carrick_out = match transport {
+        ProbeTransport::ContainerInjection => {
+            run_carrick_probe_with_deadline(bin, lane, &encoded, deadline)
+        }
+        ProbeTransport::DirectElf => run_carrick_bound_probe(bin, lane, probe, deadline),
+    };
     let docker_out = run_docker_probe(lane, &encoded);
     classify_probe(name, lane.label, &carrick_out, docker_out)
 }
@@ -3086,6 +3135,7 @@ fn conformance_probes() {
             // to a serial tail to keep them off the contended path.
             let (quarantine, parallel): (Vec<PathBuf>, Vec<PathBuf>) =
                 probes.into_iter().partition(|p| is_timing_sensitive(p));
+            let transport = probe_transport(requested_exec_backend.as_deref(), set.libc);
 
             let n_workers = std::thread::available_parallelism()
                 .map(|n| n.get().saturating_sub(2).clamp(1, 8))
@@ -3116,11 +3166,12 @@ fn conformance_probes() {
 
             // Phase 1 — carrick only.
             let carrick_outs: Vec<Option<String>> = fan_out_indexed(jobs.len(), n_workers, |i| {
-                jobs[i]
-                    .1
-                    .as_ref()
-                    .ok()
-                    .map(|enc| run_carrick_probe(&bin, *lane, enc))
+                jobs[i].1.as_ref().ok().map(|enc| match transport {
+                    ProbeTransport::ContainerInjection => run_carrick_probe(&bin, *lane, enc),
+                    ProbeTransport::DirectElf => {
+                        run_carrick_bound_probe(&bin, *lane, &parallel[i], CASE_DEADLINE)
+                    }
+                })
             });
             // Phase 2 — oracle, strictly after phase 1 (carrick and Docker never
             // overlap). Prefer the committed cache (no Docker); else live Docker on a
@@ -3177,7 +3228,7 @@ fn conformance_probes() {
             // can't be gated and are loudly skipped.
             for probe in &quarantine {
                 if docker_available {
-                    results.push(run_one_probe(&bin, *lane, probe));
+                    results.push(run_one_probe(&bin, *lane, probe, transport));
                 } else {
                     let name = probe
                         .file_name()
@@ -3609,6 +3660,22 @@ fn native_probe_campaign_uses_pie_artifacts() {
     assert!(
         probe_campaign_dir("aarch64-unknown-linux-musl", None)
             .ends_with("conformance-probes/target/aarch64-unknown-linux-musl/release")
+    );
+}
+
+#[test]
+fn native_musl_probe_campaign_uses_direct_elf_transport() {
+    assert_eq!(
+        probe_transport(Some("native"), "musl"),
+        ProbeTransport::DirectElf
+    );
+    assert_eq!(
+        probe_transport(Some("native"), "gnu"),
+        ProbeTransport::ContainerInjection
+    );
+    assert_eq!(
+        probe_transport(Some("hvf"), "musl"),
+        ProbeTransport::ContainerInjection
     );
 }
 
