@@ -549,6 +549,20 @@ fn run_image_in_current_process(
 
         let mut snapshot = snapshot_ucontext()?;
         if snapshot.signal == libc::SIGSEGV || snapshot.signal == libc::SIGBUS {
+            let fault_address = if snapshot.fault_address != 0 {
+                snapshot.fault_address
+            } else {
+                snapshot.far
+            };
+            if let Some((page, prot)) = dispatcher.resident_fault_plan(fault_address)
+                && memory
+                    .protect_range(page, memory.linux_page_size as usize, prot)
+                    .is_ok()
+            {
+                dispatcher.commit_resident_fault(page);
+                resume_guest_snapshot(&snapshot)?;
+                continue;
+            }
             emulate_linux4k_guarded_fault(&mut memory, &mut snapshot)?;
             resume_guest_snapshot(&snapshot)?;
             continue;
