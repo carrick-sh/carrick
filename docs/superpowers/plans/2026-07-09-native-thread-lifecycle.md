@@ -51,7 +51,7 @@ campaigns, Docker arm64 oracle.
 - Produces: independent trap, return, ucontext, signal-stack, host-TPIDR, and
   resume-pad state for every host thread.
 
-- [ ] **Step 1: Add a failing thread-isolation unit test**
+- [x] **Step 1: Add a failing thread-isolation unit test**
 
 Add `native_bridge_context_is_thread_local` under `native_darwin::tests`. Seed
 `x0=0x1111` on the test thread, seed and snapshot `x0=0x2222` on a spawned host
@@ -62,7 +62,7 @@ assert_eq!(main_after.x[0], 0x1111);
 assert_eq!(child_snapshot.x[0], 0x2222);
 ```
 
-- [ ] **Step 2: Run the test and verify red**
+- [x] **Step 2: Run the test and verify red**
 
 Run:
 
@@ -73,7 +73,7 @@ cargo test -p carrick-runtime native_bridge_context_is_thread_local --lib -- --n
 Expected: link or assertion failure because the bridge has one process-global
 ucontext and no seed API.
 
-- [ ] **Step 3: Isolate bridge state**
+- [x] **Step 3: Isolate bridge state**
 
 In `native_darwin.c`, make these values `_Thread_local`: both `sigjmp_buf`
 objects, `env_ready`, saved/pending ucontext, alternate signal stack,
@@ -85,7 +85,7 @@ Implement `carrick_native_seed_ucontext` by zeroing the thread-local
 `ucontext_t`, installing its internal mcontext pointer, and copying every GPR,
 SP, PC, PSTATE, vector register, FPSR, and FPCR from the wire snapshot.
 
-- [ ] **Step 4: Verify green and bridge regressions**
+- [x] **Step 4: Verify green and bridge regressions**
 
 Run:
 
@@ -97,7 +97,7 @@ cargo test -p carrick-runtime native_ --lib
 Expected: the isolation test passes and the existing native bridge unit tests
 remain green.
 
-- [ ] **Step 5: Commit the bridge boundary**
+- [x] **Step 5: Commit the bridge boundary**
 
 ```sh
 git add crates/carrick-runtime/csrc/native_darwin.c crates/carrick-runtime/src/native_darwin.rs
