@@ -136,8 +136,8 @@ pub(crate) fn el0_debug_signal(esr: u64) -> Option<(i32, i32)> {
 /// same one the syscall-path EFAULT gate consults) is the tracked PROT_NONE
 /// state, so consult it at delivery time. Anything not tracked there (a
 /// genuinely unmapped VA) keeps MAPERR.
-pub(super) fn upgrade_prot_none_si_code<E: ThreadedEngine>(
-    engine: &E,
+pub(crate) fn upgrade_prot_none_si_code<M: GuestMemory>(
+    memory: &M,
     signum: i32,
     si_code: i32,
     fault_addr: u64,
@@ -147,7 +147,7 @@ pub(super) fn upgrade_prot_none_si_code<E: ThreadedEngine>(
     const SEGV_ACCERR: i32 = 2;
     if signum == SIGSEGV
         && si_code == SEGV_MAPERR
-        && engine
+        && memory
             .protections()
             .is_some_and(|p| p.range_no_access(fault_addr, 1))
     {
@@ -168,11 +168,70 @@ pub(super) fn upgrade_prot_none_si_code<E: ThreadedEngine>(
 /// then `el0_fault_signal` (instruction/data abort → SIGSEGV/SIGBUS, carrying
 /// `FAR_EL1` as `si_addr`). Mapping only `el0_fault_signal` would regress
 /// BRK/single-step SIGTRAP delivery (ptrace, Go TestDebugCall).
-pub(super) fn lower_el0_fault(esr: u64, elr: u64, far: u64) -> Option<(i32, i32, u64)> {
+pub(crate) fn lower_el0_fault(esr: u64, elr: u64, far: u64) -> Option<(i32, i32, u64)> {
     if let Some((signum, si_code)) = el0_debug_signal(esr) {
         Some((signum, si_code, elr))
     } else {
         el0_fault_signal(esr).map(|(signum, si_code)| (signum, si_code, far))
+    }
+}
+
+pub(crate) enum FaultSignalDisposition {
+    Injected,
+    Terminate(i32),
+}
+
+/// Apply Linux's synchronous-fault signal rules to any syscall trap adapter.
+/// Backend-specific code resolves paging first, then calls this helper with the
+/// final signal triple and decides how to terminate its host process.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn inject_fault_signal<T: SyscallTrap>(
+    trap: &mut T,
+    dispatcher: &SyscallDispatcher,
+    this_tid: ThreadId,
+    signum: i32,
+    si_code: i32,
+    si_addr: u64,
+    interrupted_pc: Option<u64>,
+) -> Result<FaultSignalDisposition, RuntimeError> {
+    crate::probes::signal_deliver(this_tid.raw(), signum);
+    crate::exec_helpers::stop_for_debug_signal(signum);
+
+    let action = dispatcher.registered_signal_handler(signum);
+    if dispatcher.signal_blocked(this_tid, signum) || action.is_none() {
+        return Ok(FaultSignalDisposition::Terminate(signum));
+    }
+    // INVARIANT: the `action.is_none()` arm above returned, so this is `Some`.
+    #[allow(clippy::unwrap_used)]
+    let action = action.unwrap();
+    let restorer = if action.sa_flags & crate::linux_abi::LINUX_SA_RESTORER != 0 {
+        action.sa_restorer
+    } else {
+        0
+    };
+    let altstack = if action.sa_flags & crate::linux_abi::LINUX_SA_ONSTACK != 0 {
+        dispatcher.signal_altstack(this_tid)
+    } else {
+        None
+    };
+    let saved_sigmask = dispatcher
+        .enter_signal_handler(this_tid, signum, action)
+        .raw();
+    match trap.inject_signal(
+        signum,
+        action.sa_handler,
+        restorer,
+        None,
+        interrupted_pc,
+        altstack,
+        saved_sigmask,
+        Some((si_code, si_addr)),
+        None,
+        false,
+    ) {
+        Ok(()) => Ok(FaultSignalDisposition::Injected),
+        Err(TrapError::SignalDeliveryFault) => Ok(FaultSignalDisposition::Terminate(11)),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -247,51 +306,17 @@ pub(super) fn deliver_fault_signal<E: ThreadedEngine>(
             "[FAULTDBG tid={this_tid:?}] signum={signum} si_code={si_code} si_addr={si_addr:#x} interrupted_pc={interrupted_pc:?}"
         );
     }
-    crate::probes::signal_deliver(this_tid.raw(), signum);
-    crate::exec_helpers::stop_for_debug_signal(signum);
-
-    // A synchronous fault with the signal blocked, or no handler installed,
-    // forces the default action (terminate) on Linux.
-    let action = dispatcher.registered_signal_handler(signum);
-    if dispatcher.signal_blocked(this_tid, signum) || action.is_none() {
-        return terminate(signum);
-    }
-    // INVARIANT: the `action.is_none()` arm above returned, so this is `Some`.
-    #[allow(clippy::unwrap_used)]
-    let action = action.unwrap();
-    let restorer = if action.sa_flags & crate::linux_abi::LINUX_SA_RESTORER != 0 {
-        action.sa_restorer
-    } else {
-        0
-    };
-    let altstack = if action.sa_flags & crate::linux_abi::LINUX_SA_ONSTACK != 0 {
-        dispatcher.signal_altstack(this_tid)
-    } else {
-        None
-    };
-    // The sigframe stores the saved mask in wire form; escape the typed set at
-    // the frame-build boundary.
-    let saved_sigmask = dispatcher
-        .enter_signal_handler(this_tid, signum, action)
-        .raw();
-    let injected = engine.inject_signal(
+    match inject_fault_signal(
+        engine,
+        dispatcher,
+        this_tid,
         signum,
-        action.sa_handler,
-        restorer,
-        None,
+        si_code,
+        si_addr,
         interrupted_pc,
-        altstack,
-        saved_sigmask,
-        Some((si_code, si_addr)),
-        None,  // a synchronous fault never carries a queued (rt_sigqueueinfo) siginfo
-        false, // a synchronous fault re-runs the faulting instruction, never a syscall restart
-    );
-    match injected {
-        Ok(()) => Ok(None),
-        // Linux force_sigsegv: the handler frame couldn't be written to the
-        // user stack -> the thread-group dies by SIGSEGV (exit 139).
-        Err(TrapError::SignalDeliveryFault) => terminate(11), // SIGSEGV
-        Err(e) => Err(e.into()),
+    )? {
+        FaultSignalDisposition::Injected => Ok(None),
+        FaultSignalDisposition::Terminate(signum) => terminate(signum),
     }
 }
 
