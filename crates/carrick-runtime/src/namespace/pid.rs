@@ -24,8 +24,10 @@ use carrick_kernel::arena::{ARENA_PATH_ENV, KernelArena};
 use carrick_kernel::domains::{HostPid, ProcessGeneration};
 use carrick_kernel::process::{
     FLAG_ALIVE, FLAG_DEAD, FLAG_ORPHANED, PROCESS_RECORDS, ProcessRecord, ProcessRecordRef,
-    ProcessSection, REGISTERING, VirtualPtraceState,
+    ProcessSection, REGISTERING,
 };
+#[cfg(test)]
+use carrick_kernel::process::{VirtualPtraceControl, VirtualPtraceState};
 
 use super::NsId;
 
@@ -926,19 +928,14 @@ fn fill_member(record: &ProcessRecord, ns_pid: u32, parent_host_pid: u32) {
         .store(parent_host_pid, Ordering::Relaxed);
     record.exec_generation.store(0, Ordering::Relaxed);
     record.exit_status.store(0, Ordering::Relaxed);
-    // A reused record (recycled host pid) may carry the PREVIOUS process's
-    // wait state; a stale adopted+exit_ready pair would make the new live
-    // member spuriously reapable, and stale ptrace/subreaper links would
-    // corrupt wait routing. Clear every wait-visible field.
+    // Namespace registration may attach to the process record prepared before
+    // fork. Preserve its generation-scoped ptrace control and stop sequence;
+    // resetting either would invalidate a live stop or let an old token regain
+    // authority. Claiming a genuinely new process record resets those fields.
+    // The remaining wait state is namespace-owned and must start clean.
     record.exit_ready.store(0, Ordering::Relaxed);
     record.guest_ns.store(0, Ordering::Relaxed);
     record.subreaper_pid.store(0, Ordering::Relaxed);
-    record.ptrace_stop_signal.store(0, Ordering::Relaxed);
-    record.ptrace_tracer_pid.store(0, Ordering::Relaxed);
-    record
-        .ptrace_state
-        .store(VirtualPtraceState::Untraced.raw(), Ordering::Relaxed);
-    record.ptrace_record_generation.store(0, Ordering::Relaxed);
     record
         .flags
         .fetch_and(!carrick_kernel::process::FLAG_ADOPTED, Ordering::AcqRel);
@@ -994,25 +991,25 @@ mod tests {
     // uses the global region after init and asserts on its own pids.
 
     #[test]
-    fn fill_member_resets_stale_wait_state_on_reuse() {
-        // A recycled host pid can reuse a record that still carries the OLD
-        // process's wait state; a stale adopted+exit_ready pair would make the
-        // new live member spuriously reapable. fill_member must clear every
-        // wait-visible field, not just lifecycle flags.
+    fn fill_member_preserves_generation_scoped_ptrace_state() {
+        // Attaching namespace identity to a pre-fork process record must clear
+        // namespace wait bookkeeping without invalidating a ptrace stop that
+        // already belongs to this exact record generation.
         let region = test_region();
         let section = region.section;
         let pid = 0x51F1_0001u32;
         let generation = ProcessGeneration::new(41);
         let r = match section.claim(Some(HostPid::new(pid)), generation, |record| {
             record.subreaper_pid.store(999, Ordering::Relaxed);
-            record.ptrace_stop_signal.store(19, Ordering::Relaxed);
-            record.ptrace_tracer_pid.store(998, Ordering::Relaxed);
             record
-                .ptrace_state
-                .store(VirtualPtraceState::StopReported.raw(), Ordering::Relaxed);
-            record
-                .ptrace_record_generation
-                .store(997, Ordering::Relaxed);
+                .ptrace_stop_signal
+                .store((996u64 << 32) | 19, Ordering::Relaxed);
+            record.ptrace_control.store(
+                VirtualPtraceControl::traced(998, generation, VirtualPtraceState::StopReported)
+                    .expect("valid traced control")
+                    .raw(),
+                Ordering::Relaxed,
+            );
             record.exit_ready.store(1, Ordering::Relaxed);
             record.guest_ns.store(123_456, Ordering::Relaxed);
             record
@@ -1024,18 +1021,22 @@ mod tests {
         };
         let record = &section.records[r.index];
 
-        fill_member(record, 42, 1);
+        fill_member(record, 42, 998);
 
         assert_eq!(record.exit_ready.load(Ordering::Acquire), 0);
         assert_eq!(record.guest_ns.load(Ordering::Acquire), 0);
         assert_eq!(record.subreaper_pid.load(Ordering::Acquire), 0);
-        assert_eq!(record.ptrace_stop_signal.load(Ordering::Acquire), 0);
-        assert_eq!(record.ptrace_tracer_pid.load(Ordering::Acquire), 0);
+        assert_eq!(record.parent_host_pid.load(Ordering::Acquire), 998);
         assert_eq!(
-            record.ptrace_state.load(Ordering::Acquire),
-            VirtualPtraceState::Untraced.raw()
+            record.ptrace_stop_signal.load(Ordering::Acquire),
+            (996u64 << 32) | 19
         );
-        assert_eq!(record.ptrace_record_generation.load(Ordering::Acquire), 0);
+        assert_eq!(
+            record.ptrace_control.load(Ordering::Acquire),
+            VirtualPtraceControl::traced(998, generation, VirtualPtraceState::StopReported)
+                .expect("valid traced control")
+                .raw()
+        );
         assert_eq!(
             record.flags.load(Ordering::Acquire) & carrick_kernel::process::FLAG_ADOPTED,
             0,

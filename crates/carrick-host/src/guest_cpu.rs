@@ -27,7 +27,7 @@ use carrick_kernel::arena::{ArenaError, KernelArena};
 use carrick_kernel::domains::{HostPid, ProcessGeneration};
 use carrick_kernel::process::{
     FLAG_ADOPTED, FLAG_ALIVE, ProcessRecord, ProcessRecordRef, ProcessSection, REGISTERING,
-    VirtualPtraceState,
+    VirtualPtraceControl, VirtualPtraceState,
 };
 
 /// Per-vCPU accumulated guest execution nanoseconds, one atomic slot per vCPU
@@ -417,31 +417,61 @@ fn record_exit_ready(record: &ProcessRecord) -> bool {
     record.exit_ready.load(Ordering::Acquire) != 0
 }
 
-fn record_ptrace_stop_signal(record: &ProcessRecord) -> u64 {
+const PTRACE_STOP_SIGNAL_MASK: u64 = u32::MAX as u64;
+
+fn ptrace_stop_word(sequence: u32, signum: u32) -> u64 {
+    (u64::from(sequence) << 32) | u64::from(signum)
+}
+
+fn ptrace_stop_word_sequence(word: u64) -> u32 {
+    (word >> 32) as u32
+}
+
+fn ptrace_stop_word_signal(word: u64) -> u64 {
+    word & PTRACE_STOP_SIGNAL_MASK
+}
+
+fn record_ptrace_stop_word(record: &ProcessRecord) -> u64 {
     record.ptrace_stop_signal.load(Ordering::Acquire)
 }
 
-fn record_ptrace_tracer_pid(record: &ProcessRecord) -> u32 {
-    record.ptrace_tracer_pid.load(Ordering::Acquire)
+#[cfg(test)]
+fn record_ptrace_stop_signal(record: &ProcessRecord) -> u64 {
+    ptrace_stop_word_signal(record_ptrace_stop_word(record))
 }
 
-fn record_virtual_ptrace_state(record: &ProcessRecord) -> u32 {
-    record.ptrace_state.load(Ordering::Acquire)
+fn record_virtual_ptrace_control(record: &ProcessRecord) -> Option<VirtualPtraceControl> {
+    VirtualPtraceControl::decode_shared(record.ptrace_control.load(Ordering::Acquire))
 }
 
-fn record_ptrace_generation(record: &ProcessRecord) -> u32 {
-    record.ptrace_record_generation.load(Ordering::Acquire)
-}
-
-fn transition_virtual_ptrace_state(
+fn transition_virtual_ptrace_control(
     record: &ProcessRecord,
-    from: VirtualPtraceState,
-    to: VirtualPtraceState,
+    from: VirtualPtraceControl,
+    to: VirtualPtraceControl,
 ) -> bool {
     record
-        .ptrace_state
+        .ptrace_control
         .compare_exchange(from.raw(), to.raw(), Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
+}
+
+fn clear_virtual_ptrace(record: &ProcessRecord) {
+    record
+        .ptrace_control
+        .store(VirtualPtraceControl::untraced().raw(), Ordering::Release);
+    let mut current = record_ptrace_stop_word(record);
+    loop {
+        let cleared = current & !PTRACE_STOP_SIGNAL_MASK;
+        match record.ptrace_stop_signal.compare_exchange_weak(
+            current,
+            cleared,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return,
+            Err(actual) => current = actual,
+        }
+    }
 }
 
 fn record_guest_ns(record: &ProcessRecord) -> u64 {
@@ -528,68 +558,76 @@ pub fn register_self_virtual_ptrace(tracer_pid: u32) -> bool {
     let Some(record) = record_for_ref(r) else {
         return false;
     };
+    let untraced = VirtualPtraceControl::untraced();
+    let Some(running) =
+        VirtualPtraceControl::traced(tracer_pid, r.generation, VirtualPtraceState::Running)
+    else {
+        return false;
+    };
     if record_parent_pid(record) != tracer_pid
-        || record_virtual_ptrace_state(record) != VirtualPtraceState::Untraced.raw()
+        || record_virtual_ptrace_control(record) != Some(untraced)
     {
         return false;
     }
-    if record
-        .ptrace_tracer_pid
-        .compare_exchange(0, tracer_pid, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        return false;
-    }
-    record
-        .ptrace_record_generation
-        .store(r.generation.raw(), Ordering::Release);
-    if transition_virtual_ptrace_state(
-        record,
-        VirtualPtraceState::Untraced,
-        VirtualPtraceState::Running,
-    ) {
-        return true;
-    }
-    let _ = record.ptrace_tracer_pid.compare_exchange(
-        tracer_pid,
-        0,
-        Ordering::AcqRel,
-        Ordering::Acquire,
-    );
-    let _ = record.ptrace_record_generation.compare_exchange(
-        r.generation.raw(),
-        0,
-        Ordering::AcqRel,
-        Ordering::Acquire,
-    );
-    false
+    transition_virtual_ptrace_control(record, untraced, running)
 }
 
 fn virtual_ptrace_record(
     pid: u32,
     tracer_pid: u32,
-) -> Option<(ProcessRecordRef, &'static ProcessRecord)> {
+) -> Option<(
+    ProcessRecordRef,
+    &'static ProcessRecord,
+    VirtualPtraceControl,
+)> {
     let r = find_child_record(pid)?;
     let record = record_for_ref(r)?;
+    let control = record_virtual_ptrace_control(record)?;
     (record_pid(record) == pid
         && record_parent_pid(record) == tracer_pid
-        && record_ptrace_tracer_pid(record) == tracer_pid
-        && record_ptrace_generation(record) == r.generation.raw())
-    .then_some((r, record))
+        && control.tracer_pid() == tracer_pid
+        && control.generation() == r.generation)
+        .then_some((r, record, control))
 }
 
-fn virtual_ptrace_record_in_state(
-    r: ProcessRecordRef,
-    pid: u32,
+/// Capability for one exact, reported Linux ptrace stop.
+///
+/// The record generation and stop sequence keep a stale tracer operation from
+/// controlling a later process or a later stop that reused the same numeric PID.
+/// The tracer runtime must also retain this token as an exclusive wait lease
+/// until control finishes: Darwin signals by numeric PID and exposes no
+/// signal-capable process descriptor, so a competing terminal `wait4` must not
+/// reap the stopped child between the final record check and `kill(2)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VirtualPtraceStop {
+    record: ProcessRecordRef,
+    tracee_pid: u32,
     tracer_pid: u32,
+    sequence: u32,
+    linux_signum: i32,
+}
+
+impl VirtualPtraceStop {
+    pub const fn linux_signum(self) -> i32 {
+        self.linux_signum
+    }
+}
+
+fn virtual_ptrace_record_for_stop(
+    stop: VirtualPtraceStop,
     state: VirtualPtraceState,
 ) -> Option<&'static ProcessRecord> {
-    let record = record_for_ref(r)?;
-    (record_pid(record) == pid
-        && record_parent_pid(record) == tracer_pid
-        && record_ptrace_tracer_pid(record) == tracer_pid
-        && record_ptrace_generation(record) == r.generation.raw()
-        && record_virtual_ptrace_state(record) == state.raw())
+    if std::process::id() != stop.tracer_pid {
+        return None;
+    }
+    let record = record_for_ref(stop.record)?;
+    let expected = VirtualPtraceControl::traced(stop.tracer_pid, stop.record.generation, state)?;
+    let stop_word = record_ptrace_stop_word(record);
+    (record_pid(record) == stop.tracee_pid
+        && record_parent_pid(record) == stop.tracer_pid
+        && ptrace_stop_word_sequence(stop_word) == stop.sequence
+        && ptrace_stop_word_signal(stop_word) == stop.linux_signum as u64
+        && record_virtual_ptrace_control(record) == Some(expected))
     .then_some(record)
 }
 
@@ -602,16 +640,22 @@ pub fn self_is_virtual_ptrace_tracee() -> bool {
     let Some(record) = record_for_ref(r) else {
         return false;
     };
-    let tracer_pid = record_ptrace_tracer_pid(record);
+    let Some(control) = record_virtual_ptrace_control(record) else {
+        return false;
+    };
+    let tracer_pid = control.tracer_pid();
     tracer_pid != 0
+        && !matches!(
+            control.state(),
+            VirtualPtraceState::Untraced | VirtualPtraceState::DetachRequested
+        )
         && record_parent_pid(record) == tracer_pid
-        && record_ptrace_generation(record) == r.generation.raw()
-        && record_virtual_ptrace_state(record) != VirtualPtraceState::Untraced.raw()
+        && control.generation() == r.generation
 }
 
 /// Publish a Linux signal-delivery stop before the tracee raises host SIGSTOP.
 pub fn request_self_virtual_ptrace_stop(signum: i32) -> bool {
-    let Ok(signum) = u64::try_from(signum) else {
+    let Ok(signum) = u32::try_from(signum) else {
         return false;
     };
     if signum == 0 {
@@ -624,203 +668,233 @@ pub fn request_self_virtual_ptrace_stop(signum: i32) -> bool {
     let Some(record) = record_for_ref(r) else {
         return false;
     };
-    let tracer_pid = record_ptrace_tracer_pid(record);
-    let Some((_, record)) = virtual_ptrace_record(pid, tracer_pid) else {
+    let Some(control) = record_virtual_ptrace_control(record) else {
         return false;
     };
-    record.ptrace_stop_signal.store(signum, Ordering::Release);
-    if transition_virtual_ptrace_state(
-        record,
-        VirtualPtraceState::Running,
-        VirtualPtraceState::StopRequested,
-    ) {
-        return true;
-    }
-    let _ =
-        record
-            .ptrace_stop_signal
-            .compare_exchange(signum, 0, Ordering::AcqRel, Ordering::Acquire);
-    false
-}
-
-/// Whether `pid` has requested a virtual ptrace stop for `tracer_pid`.
-pub fn child_virtual_ptrace_stop_requested(pid: u32, tracer_pid: u32) -> bool {
-    virtual_ptrace_record(pid, tracer_pid).is_some_and(|(_, record)| {
-        record_virtual_ptrace_state(record) == VirtualPtraceState::StopRequested.raw()
-    })
-}
-
-/// Convert one confirmed host SIGSTOP into exactly one Linux ptrace stop.
-pub fn report_child_virtual_ptrace_stop(pid: u32, tracer_pid: u32) -> Option<i32> {
-    let (_, record) = virtual_ptrace_record(pid, tracer_pid)?;
-    if !transition_virtual_ptrace_state(
-        record,
-        VirtualPtraceState::StopRequested,
-        VirtualPtraceState::StopReported,
-    ) {
-        return None;
-    }
-    i32::try_from(record_ptrace_stop_signal(record))
-        .ok()
-        .filter(|signum| *signum != 0)
-}
-
-fn begin_virtual_ptrace_control(
-    pid: u32,
-    tracer_pid: u32,
-    state: VirtualPtraceState,
-) -> Option<(ProcessRecordRef, u64)> {
-    let (r, record) = virtual_ptrace_record(pid, tracer_pid)?;
-    if !transition_virtual_ptrace_state(record, VirtualPtraceState::StopReported, state) {
-        return None;
-    }
-    Some((r, record.ptrace_stop_signal.swap(0, Ordering::AcqRel)))
-}
-
-fn rollback_virtual_ptrace_control(
-    r: ProcessRecordRef,
-    pid: u32,
-    tracer_pid: u32,
-    state: VirtualPtraceState,
-    signum: u64,
-) -> bool {
-    let Some(record) = virtual_ptrace_record_in_state(r, pid, tracer_pid, state) else {
+    let tracer_pid = control.tracer_pid();
+    let Some((r, record, control)) = virtual_ptrace_record(pid, tracer_pid) else {
         return false;
     };
-    if record
+    if control.state() != VirtualPtraceState::Running {
+        return false;
+    }
+    let Some(preparing) =
+        VirtualPtraceControl::traced(tracer_pid, r.generation, VirtualPtraceState::StopPreparing)
+    else {
+        return false;
+    };
+    let Some(requested) =
+        VirtualPtraceControl::traced(tracer_pid, r.generation, VirtualPtraceState::StopRequested)
+    else {
+        return false;
+    };
+    if !transition_virtual_ptrace_control(record, control, preparing) {
+        return false;
+    }
+    let previous_word = record_ptrace_stop_word(record);
+    let previous_sequence = ptrace_stop_word_sequence(previous_word);
+    let wrapped = previous_sequence.wrapping_add(1);
+    let sequence = if wrapped == 0 { 1 } else { wrapped };
+    let published_word = ptrace_stop_word(sequence, signum);
+    record
         .ptrace_stop_signal
-        .compare_exchange(0, signum, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        return false;
-    }
-    if transition_virtual_ptrace_state(record, state, VirtualPtraceState::StopReported) {
+        .store(published_word, Ordering::Release);
+    if transition_virtual_ptrace_control(record, preparing, requested) {
         return true;
     }
-    let _ =
-        record
-            .ptrace_stop_signal
-            .compare_exchange(signum, 0, Ordering::AcqRel, Ordering::Acquire);
-    false
-}
-
-/// Resume a reported virtual ptrace stop using host SIGCONT.
-pub fn resume_child_virtual_ptrace(pid: u32, tracer_pid: u32) -> bool {
-    let Some((r, signum)) =
-        begin_virtual_ptrace_control(pid, tracer_pid, VirtualPtraceState::ResumeRequested)
-    else {
-        return false;
-    };
-    let Some(record) =
-        virtual_ptrace_record_in_state(r, pid, tracer_pid, VirtualPtraceState::ResumeRequested)
-    else {
-        return false;
-    };
-    if !transition_virtual_ptrace_state(
-        record,
-        VirtualPtraceState::ResumeRequested,
-        VirtualPtraceState::Running,
-    ) {
-        return false;
-    }
-    if unsafe { libc::kill(pid as i32, libc::SIGCONT) } == 0 {
-        return true;
-    }
-    let _ =
-        rollback_virtual_ptrace_control(r, pid, tracer_pid, VirtualPtraceState::Running, signum);
-    false
-}
-
-/// Kill a reported virtual ptrace tracee using host SIGKILL.
-pub fn kill_child_virtual_ptrace(pid: u32, tracer_pid: u32) -> bool {
-    let Some((r, signum)) =
-        begin_virtual_ptrace_control(pid, tracer_pid, VirtualPtraceState::KillRequested)
-    else {
-        return false;
-    };
-    if virtual_ptrace_record_in_state(r, pid, tracer_pid, VirtualPtraceState::KillRequested)
-        .is_none()
-    {
-        return false;
-    }
-    if unsafe { libc::kill(pid as i32, libc::SIGKILL) } == 0 {
-        return true;
-    }
-    let _ = rollback_virtual_ptrace_control(
-        r,
-        pid,
-        tracer_pid,
-        VirtualPtraceState::KillRequested,
-        signum,
+    let _ = record.ptrace_stop_signal.compare_exchange(
+        published_word,
+        previous_word,
+        Ordering::AcqRel,
+        Ordering::Acquire,
     );
     false
 }
 
-/// Detach a reported virtual ptrace tracee and resume it with host SIGCONT.
-pub fn detach_child_virtual_ptrace(pid: u32, tracer_pid: u32) -> bool {
-    let Some((r, signum)) =
-        begin_virtual_ptrace_control(pid, tracer_pid, VirtualPtraceState::DetachRequested)
+/// Whether `pid` has requested a virtual ptrace stop for `tracer_pid`.
+pub fn child_virtual_ptrace_stop_requested(pid: u32) -> bool {
+    let tracer_pid = std::process::id();
+    virtual_ptrace_record(pid, tracer_pid)
+        .is_some_and(|(_, _, control)| control.state() == VirtualPtraceState::StopRequested)
+}
+
+/// Convert one confirmed host SIGSTOP into exactly one Linux ptrace stop.
+pub fn report_child_virtual_ptrace_stop(pid: u32) -> Option<VirtualPtraceStop> {
+    let tracer_pid = std::process::id();
+    let (r, record, requested) = virtual_ptrace_record(pid, tracer_pid)?;
+    if requested.state() != VirtualPtraceState::StopRequested {
+        return None;
+    }
+    let stop_word = record_ptrace_stop_word(record);
+    let linux_signum = i32::try_from(ptrace_stop_word_signal(stop_word))
+        .ok()
+        .filter(|signum| *signum != 0)?;
+    let sequence = ptrace_stop_word_sequence(stop_word);
+    if sequence == 0 {
+        return None;
+    }
+    let reported =
+        VirtualPtraceControl::traced(tracer_pid, r.generation, VirtualPtraceState::StopReported)?;
+    if !transition_virtual_ptrace_control(record, requested, reported) {
+        return None;
+    }
+    Some(VirtualPtraceStop {
+        record: r,
+        tracee_pid: pid,
+        tracer_pid,
+        sequence,
+        linux_signum,
+    })
+}
+
+fn begin_virtual_ptrace_control(stop: VirtualPtraceStop, state: VirtualPtraceState) -> Option<()> {
+    let record = virtual_ptrace_record_for_stop(stop, VirtualPtraceState::StopReported)?;
+    let reported = VirtualPtraceControl::traced(
+        stop.tracer_pid,
+        stop.record.generation,
+        VirtualPtraceState::StopReported,
+    )?;
+    let requested = VirtualPtraceControl::traced(stop.tracer_pid, stop.record.generation, state)?;
+    if !transition_virtual_ptrace_control(record, reported, requested) {
+        return None;
+    }
+    Some(())
+}
+
+fn rollback_virtual_ptrace_control(stop: VirtualPtraceStop, state: VirtualPtraceState) -> bool {
+    let Some(record) = virtual_ptrace_record_for_stop(stop, state) else {
+        return false;
+    };
+    let Some(from) = VirtualPtraceControl::traced(stop.tracer_pid, stop.record.generation, state)
     else {
         return false;
     };
-    let Some(record) =
-        virtual_ptrace_record_in_state(r, pid, tracer_pid, VirtualPtraceState::DetachRequested)
-    else {
+    let Some(reported) = VirtualPtraceControl::traced(
+        stop.tracer_pid,
+        stop.record.generation,
+        VirtualPtraceState::StopReported,
+    ) else {
         return false;
     };
-    if record
-        .ptrace_tracer_pid
-        .compare_exchange(tracer_pid, 0, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        let _ = rollback_virtual_ptrace_control(
-            r,
-            pid,
-            tracer_pid,
-            VirtualPtraceState::DetachRequested,
-            signum,
-        );
+    transition_virtual_ptrace_control(record, from, reported)
+}
+
+/// Resume a reported virtual ptrace stop using host SIGCONT.
+pub fn resume_child_virtual_ptrace(stop: VirtualPtraceStop) -> bool {
+    if begin_virtual_ptrace_control(stop, VirtualPtraceState::ResumeRequested).is_none() {
         return false;
     }
-    if !transition_virtual_ptrace_state(
-        record,
-        VirtualPtraceState::DetachRequested,
-        VirtualPtraceState::Untraced,
-    ) {
+    let Some(record) = virtual_ptrace_record_for_stop(stop, VirtualPtraceState::ResumeRequested)
+    else {
+        let _ = rollback_virtual_ptrace_control(stop, VirtualPtraceState::ResumeRequested);
+        return false;
+    };
+    let Some(resume_requested) = VirtualPtraceControl::traced(
+        stop.tracer_pid,
+        stop.record.generation,
+        VirtualPtraceState::ResumeRequested,
+    ) else {
+        let _ = rollback_virtual_ptrace_control(stop, VirtualPtraceState::ResumeRequested);
+        return false;
+    };
+    let Some(running) = VirtualPtraceControl::traced(
+        stop.tracer_pid,
+        stop.record.generation,
+        VirtualPtraceState::Running,
+    ) else {
+        let _ = rollback_virtual_ptrace_control(stop, VirtualPtraceState::ResumeRequested);
+        return false;
+    };
+    if !transition_virtual_ptrace_control(record, resume_requested, running) {
+        let _ = rollback_virtual_ptrace_control(stop, VirtualPtraceState::ResumeRequested);
         return false;
     }
-    if unsafe { libc::kill(pid as i32, libc::SIGCONT) } == 0 {
-        let _ = record.ptrace_record_generation.compare_exchange(
-            r.generation.raw(),
-            0,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
+    if virtual_ptrace_record_for_stop(stop, VirtualPtraceState::Running).is_none() {
+        let _ = rollback_virtual_ptrace_control(stop, VirtualPtraceState::Running);
+        return false;
+    }
+    if unsafe { libc::kill(stop.tracee_pid as i32, libc::SIGCONT) } == 0 {
         return true;
     }
-    let Some(record) = record_for_ref(r) else {
-        return false;
-    };
-    if record_pid(record) != pid
-        || record_ptrace_generation(record) != r.generation.raw()
-        || record_virtual_ptrace_state(record) != VirtualPtraceState::Untraced.raw()
-        || record
-            .ptrace_tracer_pid
-            .compare_exchange(0, tracer_pid, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-    {
+    let _ = rollback_virtual_ptrace_control(stop, VirtualPtraceState::Running);
+    false
+}
+
+/// Kill a reported virtual ptrace tracee using host SIGKILL.
+pub fn kill_child_virtual_ptrace(stop: VirtualPtraceStop) -> bool {
+    if begin_virtual_ptrace_control(stop, VirtualPtraceState::KillRequested).is_none() {
         return false;
     }
-    let _ =
-        rollback_virtual_ptrace_control(r, pid, tracer_pid, VirtualPtraceState::Untraced, signum);
+    if virtual_ptrace_record_for_stop(stop, VirtualPtraceState::KillRequested).is_none() {
+        let _ = rollback_virtual_ptrace_control(stop, VirtualPtraceState::KillRequested);
+        return false;
+    }
+    if unsafe { libc::kill(stop.tracee_pid as i32, libc::SIGKILL) } == 0 {
+        return true;
+    }
+    let _ = rollback_virtual_ptrace_control(stop, VirtualPtraceState::KillRequested);
     false
+}
+
+/// Detach a reported virtual ptrace tracee and resume it with host SIGCONT.
+pub fn detach_child_virtual_ptrace(stop: VirtualPtraceStop) -> bool {
+    if begin_virtual_ptrace_control(stop, VirtualPtraceState::DetachRequested).is_none() {
+        return false;
+    }
+    if virtual_ptrace_record_for_stop(stop, VirtualPtraceState::DetachRequested).is_none() {
+        let _ = rollback_virtual_ptrace_control(stop, VirtualPtraceState::DetachRequested);
+        return false;
+    }
+    if unsafe { libc::kill(stop.tracee_pid as i32, libc::SIGCONT) } != 0 {
+        let _ = rollback_virtual_ptrace_control(stop, VirtualPtraceState::DetachRequested);
+        return false;
+    }
+    let Some(record) = virtual_ptrace_record_for_stop(stop, VirtualPtraceState::DetachRequested)
+    else {
+        // The carrier was delivered and terminal cleanup won the race.
+        return true;
+    };
+    let Some(detach_requested) = VirtualPtraceControl::traced(
+        stop.tracer_pid,
+        stop.record.generation,
+        VirtualPtraceState::DetachRequested,
+    ) else {
+        return false;
+    };
+    if !transition_virtual_ptrace_control(
+        record,
+        detach_requested,
+        VirtualPtraceControl::untraced(),
+    ) {
+        return record_virtual_ptrace_control(record) == Some(VirtualPtraceControl::untraced());
+    }
+    true
 }
 
 /// Clear and return the pending ptrace signal-stop marker once wait4 reports it.
 pub fn take_child_ptrace_stop_signal(pid: u32) -> Option<i32> {
     let record = child_record(pid)?;
-    let signum = record.ptrace_stop_signal.swap(0, Ordering::AcqRel);
-    i32::try_from(signum).ok().filter(|s| *s != 0)
+    let mut current = record_ptrace_stop_word(record);
+    loop {
+        if ptrace_stop_word_sequence(current) != 0 {
+            // Virtual stops are immutable capabilities consumed through
+            // `report_child_virtual_ptrace_stop`, never through this legacy
+            // host-ptrace marker API.
+            return None;
+        }
+        let signum = i32::try_from(ptrace_stop_word_signal(current))
+            .ok()
+            .filter(|signum| *signum != 0)?;
+        match record.ptrace_stop_signal.compare_exchange_weak(
+            current,
+            0,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return Some(signum),
+            Err(actual) => current = actual,
+        }
+    }
 }
 
 /// Clear the pending ptrace signal-stop marker once wait4 reports it.
@@ -830,7 +904,19 @@ pub fn clear_child_ptrace_stop_pending(pid: u32) {
 
 /// Whether `pid` has an unreported ptrace signal-delivery stop.
 pub fn child_has_ptrace_stop_pending(pid: u32) -> bool {
-    child_record(pid).is_some_and(|record| record_ptrace_stop_signal(record) != 0)
+    child_record(pid).is_some_and(record_has_ptrace_stop_pending)
+}
+
+fn record_has_ptrace_stop_pending(record: &ProcessRecord) -> bool {
+    let stop_word = record_ptrace_stop_word(record);
+    if ptrace_stop_word_signal(stop_word) == 0 {
+        return false;
+    }
+    if ptrace_stop_word_sequence(stop_word) == 0 {
+        return true;
+    }
+    record_virtual_ptrace_control(record)
+        .is_some_and(|control| control.state() == VirtualPtraceState::StopRequested)
 }
 
 /// Whether any direct, non-adopted child of `waiter_pid` has an unreported
@@ -843,7 +929,7 @@ pub fn direct_child_ptrace_stop_pending(waiter_pid: u32) -> bool {
         if record_parent_pid(record) != waiter_pid {
             continue;
         }
-        if record_ptrace_stop_signal(record) != 0 {
+        if record_has_ptrace_stop_pending(record) {
             return true;
         }
     }
@@ -862,12 +948,7 @@ pub fn record_child_exit_status(pid: u32, guest_ns: u64, status: i32, status_rea
     if let Some(record) = child_record(pid) {
         let status_ready = status_ready || adopted_flag(record);
         record.guest_ns.store(guest_ns, Ordering::Release);
-        record.ptrace_stop_signal.store(0, Ordering::Release);
-        record.ptrace_tracer_pid.store(0, Ordering::Release);
-        record
-            .ptrace_state
-            .store(VirtualPtraceState::Untraced.raw(), Ordering::Release);
-        record.ptrace_record_generation.store(0, Ordering::Release);
+        clear_virtual_ptrace(record);
         if status_ready {
             store_exit_status(record, status);
             store_exit_ready(record, true);
@@ -877,12 +958,7 @@ pub fn record_child_exit_status(pid: u32, guest_ns: u64, status: i32, status_rea
 
     claim_child_record(pid, |record| {
         record.guest_ns.store(guest_ns, Ordering::Release);
-        record.ptrace_stop_signal.store(0, Ordering::Release);
-        record.ptrace_tracer_pid.store(0, Ordering::Release);
-        record
-            .ptrace_state
-            .store(VirtualPtraceState::Untraced.raw(), Ordering::Release);
-        record.ptrace_record_generation.store(0, Ordering::Release);
+        clear_virtual_ptrace(record);
         if status_ready {
             store_exit_status(record, status);
             store_exit_ready(record, true);
@@ -914,7 +990,7 @@ pub fn reap_adopted_child(waiter_pid: u32, target_pid: i32) -> Option<(u32, i32,
             release_record(record);
         } else {
             record.guest_ns.store(0, Ordering::Release);
-            record.ptrace_stop_signal.store(0, Ordering::Release);
+            clear_virtual_ptrace(record);
             store_exit_ready(record, false);
         }
         return Some((pid, status, ns));
@@ -992,12 +1068,7 @@ pub fn reap_child_guest_ns(pid: u32) -> u64 {
     if let Some(record) = child_record(pid) {
         let ns = record_guest_ns(record);
         record.guest_ns.store(0, Ordering::Release);
-        record.ptrace_stop_signal.store(0, Ordering::Release);
-        record.ptrace_tracer_pid.store(0, Ordering::Release);
-        record
-            .ptrace_state
-            .store(VirtualPtraceState::Untraced.raw(), Ordering::Release);
-        record.ptrace_record_generation.store(0, Ordering::Release);
+        clear_virtual_ptrace(record);
         if record_ns_pid(record) == 0 {
             release_child_pid(pid);
         }
@@ -1096,12 +1167,20 @@ mod tests {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         init_child_table();
         let tracer_pid = std::process::id();
+        let mut resumed_pipe = [-1; 2];
+        let mut release_pipe = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(resumed_pipe.as_mut_ptr()) }, 0);
+        assert_eq!(unsafe { libc::pipe(release_pipe.as_mut_ptr()) }, 0);
         let prepared =
             prepare_child_record_pre_fork(tracer_pid, 0, 0, false, 0).expect("prepare child");
 
         let child = unsafe { libc::fork() };
         assert!(child >= 0, "fork failed");
         if child == 0 {
+            unsafe {
+                libc::close(resumed_pipe[0]);
+                libc::close(release_pipe[1]);
+            }
             complete_child_record_post_fork_child();
             if !register_self_virtual_ptrace(tracer_pid)
                 || !request_self_virtual_ptrace_stop(libc::SIGUSR2)
@@ -1110,37 +1189,120 @@ mod tests {
             }
             unsafe {
                 libc::raise(libc::SIGSTOP);
+                let byte = [1u8];
+                libc::write(resumed_pipe[1], byte.as_ptr().cast(), byte.len());
+                let mut release = [0u8];
+                libc::read(release_pipe[0], release.as_mut_ptr().cast(), release.len());
                 libc::_exit(42);
             }
         }
 
+        unsafe {
+            libc::close(resumed_pipe[1]);
+            libc::close(release_pipe[0]);
+        }
         publish_prepared_child_record_parent_ref(prepared, child as u32);
         let mut stop_status = 0;
         let stopped = unsafe { libc::waitpid(child, &mut stop_status, libc::WUNTRACED) };
         assert_eq!(stopped, child);
         assert!(libc::WIFSTOPPED(stop_status));
         assert_eq!(libc::WSTOPSIG(stop_status), libc::SIGSTOP);
-        assert!(!resume_child_virtual_ptrace(
-            child as u32,
-            tracer_pid.saturating_add(1)
-        ));
-        assert!(!resume_child_virtual_ptrace(child as u32, tracer_pid));
+        let reported =
+            report_child_virtual_ptrace_stop(child as u32).expect("reported virtual stop");
+        assert_eq!(reported.linux_signum(), libc::SIGUSR2);
         assert_eq!(
-            report_child_virtual_ptrace_stop(child as u32, tracer_pid),
-            Some(libc::SIGUSR2)
-        );
-        assert_eq!(
-            report_child_virtual_ptrace_stop(child as u32, tracer_pid),
+            report_child_virtual_ptrace_stop(child as u32),
             None,
             "one host stop must produce exactly one guest report"
         );
-        assert!(resume_child_virtual_ptrace(child as u32, tracer_pid));
+        let forged = VirtualPtraceStop {
+            tracer_pid: tracer_pid.saturating_add(1),
+            ..reported
+        };
+        assert!(!resume_child_virtual_ptrace(forged));
+        assert!(resume_child_virtual_ptrace(reported));
+
+        let mut resumed = [0u8];
+        assert_eq!(
+            unsafe { libc::read(resumed_pipe[0], resumed.as_mut_ptr().cast(), resumed.len(),) },
+            1
+        );
+        let stop_identity_preserved = find_child_record(child as u32)
+            .and_then(record_for_ref)
+            .is_some_and(|record| record_ptrace_stop_signal(record) == libc::SIGUSR2 as u64);
+        let release = [1u8];
+        assert_eq!(
+            unsafe { libc::write(release_pipe[1], release.as_ptr().cast(), release.len()) },
+            1
+        );
+        unsafe {
+            libc::close(resumed_pipe[0]);
+            libc::close(release_pipe[1]);
+        }
 
         let mut exit_status = 0;
         let reaped = unsafe { libc::waitpid(child, &mut exit_status, 0) };
         assert_eq!(reaped, child);
         assert!(libc::WIFEXITED(exit_status));
         assert_eq!(libc::WEXITSTATUS(exit_status), 42);
+        let _ = reap_child_guest_ns(child as u32);
+        assert!(
+            stop_identity_preserved,
+            "continue must not mutate the generation-scoped stop identity"
+        );
+    }
+
+    #[test]
+    fn virtual_ptrace_stop_token_expires_after_resume() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        init_child_table();
+        let tracer_pid = std::process::id();
+        let prepared =
+            prepare_child_record_pre_fork(tracer_pid, 0, 0, false, 0).expect("prepare child");
+
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed");
+        if child == 0 {
+            complete_child_record_post_fork_child();
+            if !register_self_virtual_ptrace(tracer_pid)
+                || !request_self_virtual_ptrace_stop(libc::SIGUSR1)
+            {
+                unsafe { libc::_exit(70) };
+            }
+            unsafe { libc::raise(libc::SIGSTOP) };
+            if !request_self_virtual_ptrace_stop(libc::SIGUSR2) {
+                unsafe { libc::_exit(71) };
+            }
+            unsafe {
+                libc::raise(libc::SIGSTOP);
+                libc::_exit(44);
+            }
+        }
+
+        publish_prepared_child_record_parent_ref(prepared, child as u32);
+        let mut stop_status = 0;
+        assert_eq!(
+            unsafe { libc::waitpid(child, &mut stop_status, libc::WUNTRACED) },
+            child
+        );
+        let first = report_child_virtual_ptrace_stop(child as u32).expect("first stop");
+        assert_eq!(first.linux_signum(), libc::SIGUSR1);
+        assert!(resume_child_virtual_ptrace(first));
+
+        assert_eq!(
+            unsafe { libc::waitpid(child, &mut stop_status, libc::WUNTRACED) },
+            child
+        );
+        let second = report_child_virtual_ptrace_stop(child as u32).expect("second stop");
+        assert_eq!(second.linux_signum(), libc::SIGUSR2);
+        assert_ne!(first, second);
+        assert!(!resume_child_virtual_ptrace(first));
+        assert!(resume_child_virtual_ptrace(second));
+
+        let mut exit_status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut exit_status, 0) }, child);
+        assert!(libc::WIFEXITED(exit_status));
+        assert_eq!(libc::WEXITSTATUS(exit_status), 44);
         let _ = reap_child_guest_ns(child as u32);
     }
 
@@ -1173,11 +1335,10 @@ mod tests {
             unsafe { libc::waitpid(child, &mut stop_status, libc::WUNTRACED) },
             child
         );
-        assert_eq!(
-            report_child_virtual_ptrace_stop(child as u32, tracer_pid),
-            Some(libc::SIGUSR1)
-        );
-        assert!(kill_child_virtual_ptrace(child as u32, tracer_pid));
+        let reported =
+            report_child_virtual_ptrace_stop(child as u32).expect("reported virtual stop");
+        assert_eq!(reported.linux_signum(), libc::SIGUSR1);
+        assert!(kill_child_virtual_ptrace(reported));
 
         let mut exit_status = 0;
         assert_eq!(unsafe { libc::waitpid(child, &mut exit_status, 0) }, child);
@@ -1216,11 +1377,10 @@ mod tests {
             unsafe { libc::waitpid(child, &mut stop_status, libc::WUNTRACED) },
             child
         );
-        assert_eq!(
-            report_child_virtual_ptrace_stop(child as u32, tracer_pid),
-            Some(libc::SIGHUP)
-        );
-        assert!(detach_child_virtual_ptrace(child as u32, tracer_pid));
+        let reported =
+            report_child_virtual_ptrace_stop(child as u32).expect("reported virtual stop");
+        assert_eq!(reported.linux_signum(), libc::SIGHUP);
+        assert!(detach_child_virtual_ptrace(reported));
 
         let mut exit_status = 0;
         assert_eq!(unsafe { libc::waitpid(child, &mut exit_status, 0) }, child);
@@ -1240,50 +1400,117 @@ mod tests {
         register_for_test(child, tracer, 0, false);
         let old_ref = find_child_record(child).expect("registered tracee");
         let old_record = record_for_ref(old_ref).expect("tracee record");
+        let running =
+            VirtualPtraceControl::traced(tracer, old_ref.generation, VirtualPtraceState::Running)
+                .expect("valid traced control");
         old_record
-            .ptrace_tracer_pid
-            .store(tracer, Ordering::Release);
+            .ptrace_control
+            .store(running.raw(), Ordering::Release);
         old_record
-            .ptrace_record_generation
-            .store(old_ref.generation.raw(), Ordering::Release);
-        old_record
-            .ptrace_state
-            .store(VirtualPtraceState::Running.raw(), Ordering::Release);
+            .ptrace_stop_signal
+            .store(ptrace_stop_word(7, libc::SIGUSR2 as u32), Ordering::Release);
+        let old_stop = VirtualPtraceStop {
+            record: old_ref,
+            tracee_pid: child,
+            tracer_pid: tracer,
+            sequence: 7,
+            linux_signum: libc::SIGUSR2,
+        };
 
         record_child_exit(child, 0);
         assert!(!rollback_virtual_ptrace_control(
-            old_ref,
-            child,
-            tracer,
+            old_stop,
             VirtualPtraceState::Running,
-            libc::SIGUSR2 as u64,
         ));
-        assert_eq!(record_ptrace_tracer_pid(old_record), 0);
         assert_eq!(
-            record_virtual_ptrace_state(old_record),
-            VirtualPtraceState::Untraced.raw()
+            record_virtual_ptrace_control(old_record),
+            Some(VirtualPtraceControl::untraced())
         );
         assert_eq!(record_ptrace_stop_signal(old_record), 0);
+        assert_eq!(
+            ptrace_stop_word_sequence(record_ptrace_stop_word(old_record)),
+            7
+        );
 
         release_child_record(old_ref);
         register_for_test(child, tracer, 0, false);
         let new_ref = find_child_record(child).expect("reused tracee pid");
         assert_ne!(new_ref.generation, old_ref.generation);
         assert!(!rollback_virtual_ptrace_control(
-            old_ref,
-            child,
-            tracer,
+            old_stop,
             VirtualPtraceState::Running,
-            libc::SIGUSR2 as u64,
         ));
         let new_record = record_for_ref(new_ref).expect("new tracee record");
-        assert_eq!(record_ptrace_tracer_pid(new_record), 0);
         assert_eq!(
-            record_virtual_ptrace_state(new_record),
-            VirtualPtraceState::Untraced.raw()
+            record_virtual_ptrace_control(new_record),
+            Some(VirtualPtraceControl::untraced())
         );
         assert_eq!(record_ptrace_stop_signal(new_record), 0);
         release_child_record(new_ref);
+    }
+
+    #[test]
+    fn virtual_ptrace_token_cannot_control_reused_pid() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        init_child_table();
+        let tracer = std::process::id();
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed");
+        if child == 0 {
+            loop {
+                unsafe { libc::pause() };
+            }
+        }
+        let child_pid = child as u32;
+
+        register_for_test(child_pid, tracer, 0, false);
+        let old_ref = find_child_record(child_pid).expect("old tracee record");
+        let old_record = record_for_ref(old_ref).expect("old tracee");
+        old_record
+            .ptrace_stop_signal
+            .store(ptrace_stop_word(9, libc::SIGUSR1 as u32), Ordering::Release);
+        old_record.ptrace_control.store(
+            VirtualPtraceControl::traced(
+                tracer,
+                old_ref.generation,
+                VirtualPtraceState::StopRequested,
+            )
+            .expect("valid requested control")
+            .raw(),
+            Ordering::Release,
+        );
+        let stale_stop =
+            report_child_virtual_ptrace_stop(child_pid).expect("reported stop for old record");
+
+        release_child_record(old_ref);
+        register_for_test(child_pid, tracer, 0, false);
+        let new_ref = find_child_record(child_pid).expect("reused tracee record");
+        assert_ne!(new_ref.generation, old_ref.generation);
+        let new_record = record_for_ref(new_ref).expect("new tracee");
+        let new_control = VirtualPtraceControl::traced(
+            tracer,
+            new_ref.generation,
+            VirtualPtraceState::StopReported,
+        )
+        .expect("valid reported control");
+        new_record
+            .ptrace_stop_signal
+            .store(ptrace_stop_word(9, libc::SIGUSR1 as u32), Ordering::Release);
+        new_record
+            .ptrace_control
+            .store(new_control.raw(), Ordering::Release);
+
+        let rejected = !kill_child_virtual_ptrace(stale_stop);
+        let preserved = record_virtual_ptrace_control(new_record) == Some(new_control)
+            && record_ptrace_stop_word(new_record) == ptrace_stop_word(9, libc::SIGUSR1 as u32);
+
+        let _ = unsafe { libc::kill(child, libc::SIGKILL) };
+        let mut status = 0;
+        let _ = unsafe { libc::waitpid(child, &mut status, 0) };
+        release_child_record(new_ref);
+
+        assert!(rejected, "a stale stop token must be rejected");
+        assert!(preserved, "a stale token must not mutate the reused record");
     }
 
     #[test]
