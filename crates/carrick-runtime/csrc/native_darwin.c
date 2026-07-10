@@ -792,6 +792,18 @@ void carrick_native_set_vector(uint32_t index, const uint8_t value[16]) {
     }
 }
 
+void carrick_native_set_processor_state(
+    uint64_t pstate,
+    uint32_t fpsr,
+    uint32_t fpcr) {
+    struct __darwin_mcontext64 *mc = carrick_native_mcontext();
+    if (mc != 0) {
+        mc->__ss.__cpsr = (uint32_t)pstate;
+        mc->__ns.__fpsr = fpsr;
+        mc->__ns.__fpcr = fpcr;
+    }
+}
+
 void carrick_native_clear_icache(void *start, size_t len) {
     sys_icache_invalidate(start, len);
 }
@@ -823,6 +835,14 @@ void carrick_native_set_register(uint32_t index, uint64_t value) {
 void carrick_native_set_vector(uint32_t index, const uint8_t value[16]) {
     (void)index;
     (void)value;
+}
+void carrick_native_set_processor_state(
+    uint64_t pstate,
+    uint32_t fpsr,
+    uint32_t fpcr) {
+    (void)pstate;
+    (void)fpsr;
+    (void)fpcr;
 }
 void carrick_native_clear_icache(void *start, size_t len) {
     (void)start;
