@@ -3514,6 +3514,33 @@ fn native_conformance_run_elf_supports_plain_fork_probe() {
 
 #[test]
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn native_conformance_run_elf_supports_sysv_message_wakes() {
+    let _serial = CONFORMANCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let Some(bin) = carrick_bin() else {
+        eprintln!(
+            "SKIP native_conformance_run_elf_supports_sysv_message_wakes: target/release/carrick not built"
+        );
+        return;
+    };
+    ensure_signed(&bin);
+    let probe = ensure_native_static_pie_probe("sysvmsgwake");
+
+    for profile in ["native16k", "linux4k"] {
+        let out = run_native_run_elf(&bin, &probe, profile);
+        assert!(
+            out.contains("status=exit status: 0")
+                && out.contains("nowait_empty_enomsg=true")
+                && out.contains("nowait_full_eagain=true")
+                && out.contains("fork_reader_wakes_sender=true")
+                && out.contains("rmid_wakes_receiver=true"),
+            "native run-elf SysV message wake probe failed for profile {profile}:\n{out}"
+        );
+    }
+}
+
+#[test]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn native_conformance_run_elf_supports_clone_child_stack() {
     let _serial = CONFORMANCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 

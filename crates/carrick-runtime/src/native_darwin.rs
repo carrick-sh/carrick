@@ -1896,6 +1896,27 @@ fn dispatch_native_syscall(
                     ),
                 });
             }
+            DispatchOutcome::WaitOnSharedWord {
+                location,
+                waiter_key,
+                value,
+            } => {
+                let retval = wait_native_shared_futex(
+                    dispatcher,
+                    thread_runtime,
+                    location,
+                    waiter_key,
+                    value,
+                    None,
+                    0,
+                );
+                if retval == crate::linux_abi::LINUX_EINTR.guest_retval() {
+                    return Ok(DispatchOutcome::Errno {
+                        errno: crate::linux_abi::LINUX_EINTR,
+                    });
+                }
+                continue;
+            }
             DispatchOutcome::SharedFutexWake {
                 location,
                 waiter_key,
