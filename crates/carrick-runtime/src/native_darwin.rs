@@ -7,7 +7,7 @@
 //! details and the native run loop. Unsupported dispatcher outcomes fail
 //! explicitly rather than falling back to HVF.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::os::fd::{FromRawFd, RawFd};
 use std::path::{Path, PathBuf};
@@ -61,6 +61,7 @@ const NATIVE_DARWIN_HEAP_SIZE: u64 = 128 * 1024 * 1024;
 // native direct-mapped arena above Carrick's shared/private aperture windows.
 const NATIVE_DARWIN_MMAP_BASE: u64 = 0xa0_0000_0000;
 const NATIVE_DARWIN_MMAP_SIZE: u64 = 32 * 1024 * 1024 * 1024;
+const NATIVE_DARWIN_RESUME_BUCKET_SIZE: u64 = 128 * 1024 * 1024;
 const NATIVE_WAIT_BACKSTOP: Duration = Duration::from_millis(50);
 const VM_INHERIT_SHARE: libc::c_int = 0;
 const VM_INHERIT_COPY: libc::c_int = 1;
@@ -154,6 +155,12 @@ unsafe extern "C" {
     fn carrick_native_set_register(index: u32, value: u64);
     fn carrick_native_set_vector(index: u32, value: *const u8);
     fn carrick_native_clear_icache(start: *mut libc::c_void, len: usize);
+    fn carrick_native_reset_resume_pads();
+    fn carrick_native_register_resume_page(
+        bucket: u64,
+        base: *mut libc::c_void,
+        page_size: usize,
+    ) -> libc::c_int;
 }
 
 const fn brk_instruction(imm: u16) -> u32 {
@@ -582,9 +589,9 @@ fn run_image_in_current_process(
                 if trace_syscalls {
                     child_write_stderr(
                         format!(
-                            "native trace pid={} trap={traps} pc=0x{:x} read_tpidr rt={} value=0x{:x}\n",
+                            "native trace pid={} trap={traps} pc=0x{:x} read_tpidr rt={} value=0x{:x} lr=0x{:x}\n",
                             unsafe { libc::getpid() },
-                            snapshot.pc, rt, guest_tpidr_el0
+                            snapshot.pc, rt, guest_tpidr_el0, snapshot.x[30]
                         )
                         .as_bytes(),
                     );
@@ -1826,6 +1833,10 @@ fn resume_guest_detached(value: u64, pc: u64) -> Result<(), RuntimeError> {
     let rc = unsafe { carrick_native_resume_detached_context() };
     if rc == 1 {
         Ok(())
+    } else if rc < 0 {
+        Err(last_io_error(&format!(
+            "detached-resume native Darwin guest at 0x{pc:x}"
+        )))
     } else {
         Err(RuntimeError::Unsupported(format!(
             "native Darwin failed to detached-resume guest: {rc}"
@@ -1878,6 +1889,10 @@ fn resume_guest_at(pc: u64) -> Result<(), RuntimeError> {
     let rc = unsafe { carrick_native_resume() };
     if rc == 1 {
         Ok(())
+    } else if rc < 0 {
+        Err(last_io_error(&format!(
+            "resume native Darwin guest at 0x{pc:x}"
+        )))
     } else {
         Err(RuntimeError::Unsupported(format!(
             "native Darwin failed to resume guest: {rc}"
@@ -2625,8 +2640,15 @@ fn emulate_linux4k_guarded_fault(
     };
     if !memory.linux4k_address_is_guarded(fault_address) {
         return Err(RuntimeError::Unsupported(format!(
-            "native Darwin signal {} at 0x{fault_address:x} was not a guarded linux4k page (pc=0x{:x} esr=0x{:x})",
-            snapshot.signal, snapshot.pc, snapshot.esr
+            "native Darwin signal {} at 0x{fault_address:x} was not a guarded linux4k page (pc=0x{:x} sp=0x{:x} lr=0x{:x} x16=0x{:x} x17=0x{:x} x18=0x{:x} esr=0x{:x})",
+            snapshot.signal,
+            snapshot.pc,
+            snapshot.sp,
+            snapshot.x[30],
+            snapshot.x[16],
+            snapshot.x[17],
+            snapshot.x[18],
+            snapshot.esr
         )));
     }
     let word = memory.read_u32(snapshot.pc)?;
@@ -2865,6 +2887,7 @@ fn decode_trap_instruction(word: u32, pc: u64) -> Result<Option<NativeTrap>, Run
 
 struct NativeMappedMemory {
     regions: Vec<NativeMappedRegion>,
+    resume_pad_pages: Vec<u64>,
     protections: MemoryProtections,
     native_page_protections: BTreeMap<u64, u64>,
     linux4k_page_protections: BTreeMap<u64, [u64; 4]>,
@@ -2889,6 +2912,146 @@ struct NativeMappedRegion {
     default_prot: u64,
 }
 
+fn map_native_resume_pad_pages(
+    image: &AddressSpace,
+    host_page_size: u64,
+) -> Result<Vec<u64>, RuntimeError> {
+    if host_page_size == 0 || !host_page_size.is_power_of_two() {
+        return Err(RuntimeError::Unsupported(format!(
+            "native Darwin resume-pad page size is invalid: {host_page_size}"
+        )));
+    }
+
+    let sigreturn_range = (
+        NATIVE_DARWIN_SIGRETURN_TRAMPOLINE_BASE,
+        NATIVE_DARWIN_SIGRETURN_TRAMPOLINE_BASE
+            + carrick_mem::memory::LINUX_SIGRETURN_TRAMPOLINE_SIZE,
+    );
+    let mut occupied: Vec<(u64, u64)> = image
+        .regions()
+        .iter()
+        .map(|region| (region.start, region.end))
+        .collect();
+    occupied.push(sigreturn_range);
+
+    let mut buckets = BTreeSet::new();
+    for (start, end) in image
+        .regions()
+        .iter()
+        .filter(|region| region.perms.execute)
+        .map(|region| (region.start, region.end))
+        .chain(std::iter::once(sigreturn_range))
+    {
+        if start >= end {
+            continue;
+        }
+        let mut bucket = start & !(NATIVE_DARWIN_RESUME_BUCKET_SIZE - 1);
+        let last_bucket = (end - 1) & !(NATIVE_DARWIN_RESUME_BUCKET_SIZE - 1);
+        loop {
+            buckets.insert(bucket);
+            if bucket == last_bucket {
+                break;
+            }
+            bucket = bucket
+                .checked_add(NATIVE_DARWIN_RESUME_BUCKET_SIZE)
+                .ok_or_else(|| {
+                    RuntimeError::Unsupported(
+                        "native Darwin resume-pad bucket overflow".to_string(),
+                    )
+                })?;
+        }
+    }
+
+    let mut pages = Vec::with_capacity(buckets.len());
+    for bucket in buckets {
+        let bucket_end = bucket
+            .checked_add(NATIVE_DARWIN_RESUME_BUCKET_SIZE)
+            .ok_or_else(|| {
+                RuntimeError::Unsupported("native Darwin resume-pad range overflow".to_string())
+            })?;
+        let mut candidate = bucket_end.checked_sub(host_page_size).ok_or_else(|| {
+            RuntimeError::Unsupported("native Darwin resume-pad address underflow".to_string())
+        })?;
+        let selected = loop {
+            let candidate_end = candidate + host_page_size;
+            let overlaps = occupied
+                .iter()
+                .any(|(start, end)| candidate < *end && *start < candidate_end);
+            if !overlaps {
+                break candidate;
+            }
+            if candidate < bucket + host_page_size {
+                return Err(RuntimeError::Unsupported(format!(
+                    "native Darwin executable bucket 0x{bucket:x} has no resume-pad page"
+                )));
+            }
+            candidate -= host_page_size;
+        };
+
+        map_anonymous_region(selected, host_page_size, false)?;
+        let page_size = usize::try_from(host_page_size).map_err(|_| {
+            RuntimeError::Unsupported("native Darwin resume-pad page is too large".to_string())
+        })?;
+        let selected_usize = usize::try_from(selected).map_err(|_| {
+            RuntimeError::Unsupported("native Darwin resume-pad address is too large".to_string())
+        })?;
+        let rc = unsafe {
+            carrick_native_register_resume_page(
+                bucket,
+                selected_usize as *mut libc::c_void,
+                page_size,
+            )
+        };
+        if rc != 0 {
+            unsafe {
+                libc::munmap(selected_usize as *mut libc::c_void, page_size);
+            }
+            return Err(last_io_error("register native Darwin resume-pad page"));
+        }
+        pages.push(selected);
+        occupied.push((selected, selected + host_page_size));
+    }
+
+    let pre_mmap = NATIVE_DARWIN_MMAP_BASE
+        .checked_sub(host_page_size)
+        .ok_or_else(|| {
+            RuntimeError::Unsupported("native Darwin pre-mmap pad underflow".to_string())
+        })?;
+    let pre_mmap_end = pre_mmap + host_page_size;
+    if occupied
+        .iter()
+        .any(|(start, end)| pre_mmap < *end && *start < pre_mmap_end)
+    {
+        return Err(RuntimeError::Unsupported(format!(
+            "native Darwin pre-mmap resume pad overlaps 0x{pre_mmap:x}..0x{pre_mmap_end:x}"
+        )));
+    }
+    map_anonymous_region(pre_mmap, host_page_size, false)?;
+    let page_size = usize::try_from(host_page_size).map_err(|_| {
+        RuntimeError::Unsupported("native Darwin resume-pad page is too large".to_string())
+    })?;
+    let pre_mmap_usize = usize::try_from(pre_mmap).map_err(|_| {
+        RuntimeError::Unsupported("native Darwin pre-mmap pad address is too large".to_string())
+    })?;
+    let rc = unsafe {
+        carrick_native_register_resume_page(
+            pre_mmap & !(NATIVE_DARWIN_RESUME_BUCKET_SIZE - 1),
+            pre_mmap_usize as *mut libc::c_void,
+            page_size,
+        )
+    };
+    if rc != 0 {
+        unsafe {
+            libc::munmap(pre_mmap_usize as *mut libc::c_void, page_size);
+        }
+        return Err(last_io_error(
+            "register native Darwin pre-mmap resume-pad page",
+        ));
+    }
+    pages.push(pre_mmap);
+    Ok(pages)
+}
+
 fn native_region_linux_prot(read: bool, write: bool, exec: bool) -> u64 {
     let mut prot = 0;
     if read {
@@ -2910,6 +3073,7 @@ impl NativeMappedMemory {
         host_page_size: u64,
         linux_page_size: u64,
     ) -> Result<Self, RuntimeError> {
+        unsafe { carrick_native_reset_resume_pads() };
         let mut regions = Vec::new();
         for region in image.regions() {
             map_region(region)?;
@@ -2926,6 +3090,7 @@ impl NativeMappedMemory {
                 ),
             });
         }
+        let resume_pad_pages = map_native_resume_pad_pages(image, host_page_size)?;
         map_bytes_region(
             NATIVE_DARWIN_SIGRETURN_TRAMPOLINE_BASE,
             carrick_mem::memory::LINUX_SIGRETURN_TRAMPOLINE_SIZE,
@@ -3000,6 +3165,7 @@ impl NativeMappedMemory {
         });
         Ok(Self {
             regions,
+            resume_pad_pages,
             protections: MemoryProtections::default(),
             native_page_protections: BTreeMap::new(),
             linux4k_page_protections: BTreeMap::new(),
@@ -3075,6 +3241,23 @@ impl NativeMappedMemory {
             if len != 0 && unsafe { libc::munmap(address, len) } != 0 {
                 return Err(last_io_error(&format!(
                     "munmap native Darwin execve range 0x{start:x}..0x{end:x}"
+                )));
+            }
+        }
+        for page in &self.resume_pad_pages {
+            let address = usize::try_from(*page).map_err(|_| {
+                RuntimeError::Unsupported(format!(
+                    "native Darwin resume-pad address too large: 0x{page:x}"
+                ))
+            })? as *mut libc::c_void;
+            let len = usize::try_from(self.host_page_size).map_err(|_| {
+                RuntimeError::Unsupported(
+                    "native Darwin resume-pad length is too large".to_string(),
+                )
+            })?;
+            if unsafe { libc::munmap(address, len) } != 0 {
+                return Err(last_io_error(&format!(
+                    "munmap native Darwin resume-pad page 0x{page:x}"
                 )));
             }
         }
