@@ -23,6 +23,7 @@
 ### Task 1: Fork-Coherent Virtual Ptrace State
 
 **Files:**
+- Modify: `crates/carrick-kernel/src/arena.rs`
 - Modify: `crates/carrick-kernel/src/process.rs`
 - Modify: `crates/carrick-host/src/guest_cpu.rs`
 - Modify: `crates/carrick-runtime/src/namespace/pid.rs`
@@ -32,11 +33,11 @@
 - Produces: `register_self_virtual_ptrace(tracer_pid)`, `request_self_virtual_ptrace_stop(signum)`, `report_child_virtual_ptrace_stop(pid, tracer_pid)`, `resume_child_virtual_ptrace(pid, tracer_pid)`, `kill_child_virtual_ptrace(pid, tracer_pid)`, and `detach_child_virtual_ptrace(pid, tracer_pid)`.
 - Preserves: legacy `mark_self_ptrace_stop_pending` and `take_child_ptrace_stop_signal` for non-native backends.
 
-- [ ] **Step 1: Add a failing real-fork lifecycle test**
+- [x] **Step 1: Add a failing real-fork lifecycle test**
 
   Add `virtual_ptrace_stop_is_reported_once_then_resumed` under the existing serialized `guest_cpu` tests. The child registers its parent, publishes Linux `SIGUSR2`, raises host `SIGSTOP`, and exits 42 after resume. The parent must confirm host `SIGSTOP`, report guest `SIGUSR2` exactly once, resume, and reap exit 42.
 
-- [ ] **Step 2: Verify the test is red**
+- [x] **Step 2: Verify the test is red**
 
   Run:
 
@@ -46,7 +47,7 @@
 
   Expected: compile failure because the virtual ptrace state API does not exist.
 
-- [ ] **Step 3: Implement the minimal atomic state machine**
+- [x] **Step 3: Implement the minimal atomic state machine**
 
   Reuse the explicit `ProcessRecord` padding for `ptrace_tracer_pid`, add an atomic state field, and reset tracer, state, and stop signal on claim, reuse, exit, and reap. Only allow these transitions:
 
@@ -58,7 +59,7 @@
 
   `report_child_virtual_ptrace_stop` must CAS `StopRequested` to `StopReported`; a second report returns `None`. Resume/kill/detach must reject a wrong tracer or a state other than `StopReported`.
 
-- [ ] **Step 4: Verify host and kernel tests**
+- [x] **Step 4: Verify host and kernel tests**
 
   Run:
 
@@ -69,25 +70,35 @@
 
   Expected: all selected tests pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
-  Commit only the two shared-state files with subject `feat(host): add virtual ptrace stop state` and a body naming the real-fork test.
+  The initial state landed as `4bcb560d feat(host): add virtual ptrace stop
+  state`; independent race review then produced `0dfabfc5`, `edb4ea82`, and
+  `e33b2c78` for generation-safe control tokens, exclusive wait leases, and
+  reported-stop visibility.
 
 ### Task 2: Native Ptrace Requests and Wait Reporting
 
 **Files:**
+- Modify: `crates/carrick-runtime/src/dispatch/mod.rs`
 - Modify: `crates/carrick-runtime/src/dispatch/proc.rs`
+- Modify: `crates/carrick-runtime/src/lib.rs`
+- Modify: `crates/carrick-runtime/src/native_darwin.rs`
+- Modify: `crates/carrick-runtime/src/runtime.rs`
+- Modify: `crates/carrick-runtime/src/vcpu_loop/mod.rs`
+- Modify: `crates/carrick-runtime/tests/syscall_process.rs`
+- Modify: `crates/carrick-vmm-hvf/src/io_wait.rs`
 
 **Interfaces:**
 - Consumes: Task 1 virtual ptrace helpers.
 - Produces: native-only request routing for `TRACEME`, `CONT`, `KILL`, and `DETACH`.
 - Produces: native wait translation that adds host `WUNTRACED` internally and returns `(linux_signum << 8) | 0x7f` only after a confirmed carrier stop.
 
-- [ ] **Step 1: Add failing request-routing and wait-state unit tests**
+- [x] **Step 1: Add failing request-routing and wait-state unit tests**
 
   Test that native transport does not select `PT_TRACE_ME`, rejects continue before `StopReported`, and preserves the existing host transport selection when no native profile is present. Extract pure selection/status helpers only where needed to make this behavior testable.
 
-- [ ] **Step 2: Verify the tests are red**
+- [x] **Step 2: Verify the tests are red**
 
   Run the exact new test names with:
 
@@ -95,17 +106,21 @@
   cargo test -p carrick-runtime native_virtual_ptrace --lib --no-default-features --features platform-macos
   ```
 
-- [ ] **Step 3: Implement native request routing**
+- [x] **Step 3: Implement native request routing**
 
   `PTRACE_TRACEME` records `getppid()` and returns success without a Darwin ptrace call. `PTRACE_CONT` accepts data 0 in this slice, atomically transitions to running, then sends host `SIGCONT`. `PTRACE_KILL` sends host `SIGKILL`; `PTRACE_DETACH` clears ownership and resumes. Relation or state failures return Linux `ESRCH`; unsupported signal injection returns an explicit Linux error.
 
-- [ ] **Step 4: Implement wait reporting**
+- [x] **Step 4: Implement wait reporting**
 
   For an exact or any-child native virtual stop, internally include `WUNTRACED`. After host `wait4` returns `WIFSTOPPED` with host `SIGSTOP`, atomically report the child stop and replace only the status value with the recorded Linux signal. Never consume the Linux marker on an unrelated host stop.
 
-- [ ] **Step 5: Verify runtime tests and commit**
+- [x] **Step 5: Verify runtime tests and commit**
 
-  Run the focused runtime tests, then commit only `dispatch/proc.rs` with subject `feat(runtime): route native ptrace through shared state`.
+  Review expanded this step across every runtime loop because nonterminal child
+  states cannot use the exit-only kqueue waiter. The committed slice adds a
+  bounded `WaitOnProcState` redispatch path, non-consuming `waitid` selection,
+  and real-fork race coverage while preserving Host/HVF accounting. Commit:
+  `8f8fd1a3 feat(runtime): route native ptrace through shared state`.
 
 ### Task 3: Signal and Exec Stop Integration
 
