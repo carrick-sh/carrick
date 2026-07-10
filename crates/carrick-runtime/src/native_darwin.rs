@@ -3135,6 +3135,138 @@ fn emulate_linux4k_guarded_vector_access(
     Ok(())
 }
 
+fn atomic_add_access_width(op: bad64::Op, result_reg: bad64::Reg) -> Option<usize> {
+    match op {
+        bad64::Op::LDADDB | bad64::Op::LDADDAB | bad64::Op::LDADDALB | bad64::Op::LDADDLB => {
+            Some(1)
+        }
+        bad64::Op::LDADDH | bad64::Op::LDADDAH | bad64::Op::LDADDALH | bad64::Op::LDADDLH => {
+            Some(2)
+        }
+        bad64::Op::LDADD | bad64::Op::LDADDA | bad64::Op::LDADDAL | bad64::Op::LDADDL => {
+            bad64_transfer_width(result_reg)
+        }
+        _ => None,
+    }
+}
+
+fn atomic_add_ordering(
+    op: bad64::Op,
+    result_reg: bad64::Reg,
+) -> Option<std::sync::atomic::Ordering> {
+    let acquire = matches!(
+        op,
+        bad64::Op::LDADDA
+            | bad64::Op::LDADDAB
+            | bad64::Op::LDADDAH
+            | bad64::Op::LDADDAL
+            | bad64::Op::LDADDALB
+            | bad64::Op::LDADDALH
+    ) && !matches!(result_reg, bad64::Reg::WZR | bad64::Reg::XZR);
+    let release = matches!(
+        op,
+        bad64::Op::LDADDL
+            | bad64::Op::LDADDLB
+            | bad64::Op::LDADDLH
+            | bad64::Op::LDADDAL
+            | bad64::Op::LDADDALB
+            | bad64::Op::LDADDALH
+    );
+    atomic_add_access_width(op, result_reg)?;
+    Some(match (acquire, release) {
+        (false, false) => std::sync::atomic::Ordering::Relaxed,
+        (true, false) => std::sync::atomic::Ordering::Acquire,
+        (false, true) => std::sync::atomic::Ordering::Release,
+        (true, true) => std::sync::atomic::Ordering::AcqRel,
+    })
+}
+
+fn emulate_linux4k_guarded_atomic_add(
+    memory: &mut NativeMappedMemory,
+    snapshot: &mut NativeUcontextSnapshot,
+    instruction: &bad64::Instruction,
+    fault_address: u64,
+) -> Result<(), RuntimeError> {
+    let [
+        bad64::Operand::Reg {
+            reg: addend_reg,
+            arrspec: None,
+        },
+        bad64::Operand::Reg {
+            reg: result_reg,
+            arrspec: None,
+        },
+        memory_operand,
+    ] = instruction.operands()
+    else {
+        return Err(RuntimeError::Unsupported(format!(
+            "native linux4k atomic add does not support operands for {instruction}"
+        )));
+    };
+    let width = atomic_add_access_width(instruction.op(), *result_reg).ok_or_else(|| {
+        RuntimeError::Unsupported(format!(
+            "native linux4k atomic add does not support width for {instruction}"
+        ))
+    })?;
+    if bad64_transfer_width(*addend_reg).is_none() || bad64_transfer_width(*result_reg).is_none() {
+        return Err(RuntimeError::Unsupported(format!(
+            "native linux4k atomic add requires GPR operands for {instruction}"
+        )));
+    }
+    let ordering = atomic_add_ordering(instruction.op(), *result_reg).ok_or_else(|| {
+        RuntimeError::Unsupported(format!(
+            "native linux4k atomic add does not support ordering for {instruction}"
+        ))
+    })?;
+    let (address, writeback) =
+        decode_native_scalar_address(snapshot, *memory_operand).ok_or_else(|| {
+            RuntimeError::Unsupported(format!(
+                "native linux4k atomic add does not support addressing for {instruction}"
+            ))
+        })?;
+    if writeback.is_some() {
+        return Err(RuntimeError::Unsupported(format!(
+            "native linux4k atomic add rejects writeback for {instruction}"
+        )));
+    }
+    let access_end = address.checked_add(width as u64).ok_or_else(|| {
+        RuntimeError::Unsupported("native linux4k atomic add access overflow".to_string())
+    })?;
+    if fault_address < address || fault_address >= access_end {
+        return Err(RuntimeError::Unsupported(format!(
+            "native linux4k guarded fault address 0x{fault_address:x} is outside {instruction} access 0x{address:x}..0x{access_end:x}"
+        )));
+    }
+    if !memory.linux4k_range_allows(address, width, false)
+        || !memory.linux4k_range_allows(address, width, true)
+    {
+        return Err(RuntimeError::Unsupported(format!(
+            "native linux4k guarded {instruction} violates guest permissions at 0x{address:x}"
+        )));
+    }
+    let addend = native_snapshot_read_reg(snapshot, *addend_reg).ok_or_else(|| {
+        RuntimeError::Unsupported(format!(
+            "native linux4k atomic add could not read {addend_reg}"
+        ))
+    })?;
+    let old = memory
+        .atomic_fetch_add(address, width, addend, ordering)
+        .map_err(|error| {
+            RuntimeError::Unsupported(format!(
+                "native linux4k atomic add failed at 0x{address:x}: {error}"
+            ))
+        })?;
+    if !native_snapshot_write_reg(snapshot, *result_reg, old) {
+        return Err(RuntimeError::Unsupported(format!(
+            "native linux4k atomic add could not write {result_reg}"
+        )));
+    }
+    snapshot.pc = snapshot.pc.checked_add(4).ok_or_else(|| {
+        RuntimeError::Unsupported("native linux4k atomic add PC overflow".to_string())
+    })?;
+    Ok(())
+}
+
 fn exclusive_access_width(op: bad64::Op, transfer_reg: bad64::Reg) -> Option<usize> {
     match op {
         bad64::Op::LDAXRB | bad64::Op::LDXRB | bad64::Op::STLXRB | bad64::Op::STXRB => Some(1),
@@ -3315,6 +3447,23 @@ fn emulate_linux4k_guarded_fault(
             )
             .as_bytes(),
         );
+    }
+    if matches!(
+        instruction.op(),
+        bad64::Op::LDADD
+            | bad64::Op::LDADDA
+            | bad64::Op::LDADDAB
+            | bad64::Op::LDADDAH
+            | bad64::Op::LDADDAL
+            | bad64::Op::LDADDALB
+            | bad64::Op::LDADDALH
+            | bad64::Op::LDADDB
+            | bad64::Op::LDADDH
+            | bad64::Op::LDADDL
+            | bad64::Op::LDADDLB
+            | bad64::Op::LDADDLH
+    ) {
+        return emulate_linux4k_guarded_atomic_add(memory, snapshot, &instruction, fault_address);
     }
     if matches!(
         instruction.op(),
@@ -3905,6 +4054,48 @@ impl NativeMappedMemory {
         if address < reservation_end && reservation.address < end {
             self.exclusive_reservation = None;
         }
+    }
+
+    fn atomic_fetch_add(
+        &mut self,
+        address: u64,
+        width: usize,
+        value: u64,
+        ordering: std::sync::atomic::Ordering,
+    ) -> Result<u64, MemoryError> {
+        if !matches!(width, 1 | 2 | 4 | 8)
+            || !address.is_multiple_of(width as u64)
+            || !self.region_contains(address, width)
+        {
+            return Err(MemoryError::OutOfBounds {
+                address,
+                length: width,
+            });
+        }
+        let ptr = usize::try_from(address).map_err(|_| MemoryError::OutOfBounds {
+            address,
+            length: width,
+        })? as *mut u8;
+        self.invalidate_exclusive_range(address, width);
+        let changed = self.prepare_temporary_host_access(address, width, true)?;
+        let observed = unsafe {
+            match width {
+                1 => u64::from(
+                    (&*ptr.cast::<std::sync::atomic::AtomicU8>()).fetch_add(value as u8, ordering),
+                ),
+                2 => u64::from(
+                    (&*ptr.cast::<std::sync::atomic::AtomicU16>())
+                        .fetch_add(value as u16, ordering),
+                ),
+                4 => u64::from(
+                    (&*ptr.cast::<std::sync::atomic::AtomicU32>())
+                        .fetch_add(value as u32, ordering),
+                ),
+                _ => (&*ptr.cast::<std::sync::atomic::AtomicU64>()).fetch_add(value, ordering),
+            }
+        };
+        self.restore_temporary_host_access(&changed, address, width)?;
+        Ok(observed)
     }
 
     fn exclusive_load(
@@ -5980,6 +6171,79 @@ mod tests {
                 });
             if let Err(error) = &emulated {
                 child_write_stderr(format!("exclusive emulation test: {error}\n").as_bytes());
+            }
+            unsafe { libc::_exit(i32::from(emulated.is_err())) };
+        }
+
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFEXITED(status), "child status was 0x{status:x}");
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+    }
+
+    #[test]
+    fn native_linux4k_guard_emulates_atomic_fetch_add() {
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            let host_page_size = 16 * 1024_u64;
+            let linux_page_size = 4 * 1024_u64;
+            let layout = MemoryLayout {
+                heap_base: NATIVE_DARWIN_HEAP_BASE,
+                heap_size: host_page_size,
+                mmap_base: NATIVE_DARWIN_MMAP_BASE,
+                mmap_size: 2 * host_page_size,
+            };
+            let image = AddressSpace::from_regions(0, Vec::new())
+                .expect("empty native test image should be valid");
+            let emulated = NativeMappedMemory::map(&image, layout, host_page_size, linux_page_size)
+                .and_then(|mut memory| {
+                    let pc = layout.mmap_base;
+                    let address = layout.mmap_base + host_page_size + linux_page_size;
+                    memory
+                        .write_bytes_unchecked(pc, &0xf820_0020_u32.to_le_bytes())
+                        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+                    memory
+                        .protect_range(
+                            pc,
+                            host_page_size as usize,
+                            crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_EXEC,
+                        )
+                        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+                    memory
+                        .protect_range(
+                            address,
+                            linux_page_size as usize,
+                            crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_WRITE,
+                        )
+                        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+                    memory
+                        .write_bytes_unchecked(address, &7_u64.to_le_bytes())
+                        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+
+                    let mut snapshot = NativeUcontextSnapshot {
+                        pc,
+                        signal: libc::SIGBUS,
+                        fault_address: address,
+                        ..NativeUcontextSnapshot::default()
+                    };
+                    snapshot.x[0] = 5;
+                    snapshot.x[1] = address;
+                    emulate_linux4k_guarded_fault(&mut memory, &mut snapshot)?;
+                    let stored = memory
+                        .read_bytes_raw(address, std::mem::size_of::<u64>())
+                        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+                    if snapshot.x[0] != 7 || stored != 12_u64.to_le_bytes() || snapshot.pc != pc + 4
+                    {
+                        return Err(RuntimeError::Unsupported(format!(
+                            "emulated ldadd produced old={} bytes={stored:02x?} pc=0x{:x}",
+                            snapshot.x[0], snapshot.pc
+                        )));
+                    }
+                    Ok(())
+                });
+            if let Err(error) = &emulated {
+                child_write_stderr(format!("atomic add emulation test: {error}\n").as_bytes());
             }
             unsafe { libc::_exit(i32::from(emulated.is_err())) };
         }
