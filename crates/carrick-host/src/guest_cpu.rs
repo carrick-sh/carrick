@@ -613,6 +613,13 @@ impl VirtualPtraceStop {
     }
 }
 
+/// Whether this exact stop remains reported and controllable by the current
+/// tracer. A failed carrier syscall may roll control back to this state; callers
+/// must retain the token rather than dropping its exclusive wait lease.
+pub fn virtual_ptrace_stop_is_reported(stop: VirtualPtraceStop) -> bool {
+    virtual_ptrace_record_for_stop(stop, VirtualPtraceState::StopReported).is_some()
+}
+
 fn virtual_ptrace_record_for_stop(
     stop: VirtualPtraceStop,
     state: VirtualPtraceState,
@@ -1210,6 +1217,7 @@ mod tests {
         let reported =
             report_child_virtual_ptrace_stop(child as u32).expect("reported virtual stop");
         assert_eq!(reported.linux_signum(), libc::SIGUSR2);
+        assert!(virtual_ptrace_stop_is_reported(reported));
         assert_eq!(
             report_child_virtual_ptrace_stop(child as u32),
             None,
@@ -1221,6 +1229,7 @@ mod tests {
         };
         assert!(!resume_child_virtual_ptrace(forged));
         assert!(resume_child_virtual_ptrace(reported));
+        assert!(!virtual_ptrace_stop_is_reported(reported));
 
         let mut resumed = [0u8];
         assert_eq!(
