@@ -34,6 +34,7 @@ pub const DOCKER_DEFAULT_CAPS: u64 = 0x0000_0000_a804_25fb;
 pub const CAP_LAST_CAP: u32 = 40;
 pub const CAP_SETPCAP: u32 = 8;
 pub const CAP_SYS_ADMIN: u32 = 21;
+pub const CAP_SYS_RESOURCE: u32 = 24;
 
 /// A full capability set over the modeled range — what the creator of a fresh
 /// user namespace holds within it (design §4.1, §4.4).
@@ -305,6 +306,13 @@ mod tests {
         let c = CapabilitySet::docker_default();
         assert!(c.effective & (1 << 6) != 0, "CAP_SETGID");
         assert!(c.effective & (1 << 7) != 0, "CAP_SETUID");
+    }
+
+    #[test]
+    fn docker_default_excludes_sys_resource() {
+        let bit = 1u64 << CAP_SYS_RESOURCE;
+        assert_eq!(CapabilitySet::docker_default().effective & bit, 0);
+        assert_ne!(CapabilitySet::full().effective & bit, 0);
     }
 
     #[test]
