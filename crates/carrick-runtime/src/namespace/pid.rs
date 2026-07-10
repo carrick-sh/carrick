@@ -938,6 +938,7 @@ fn fill_member(record: &ProcessRecord, ns_pid: u32, parent_host_pid: u32) {
     record
         .ptrace_state
         .store(VirtualPtraceState::Untraced.raw(), Ordering::Relaxed);
+    record.ptrace_record_generation.store(0, Ordering::Relaxed);
     record
         .flags
         .fetch_and(!carrick_kernel::process::FLAG_ADOPTED, Ordering::AcqRel);
@@ -1009,6 +1010,9 @@ mod tests {
             record
                 .ptrace_state
                 .store(VirtualPtraceState::StopReported.raw(), Ordering::Relaxed);
+            record
+                .ptrace_record_generation
+                .store(997, Ordering::Relaxed);
             record.exit_ready.store(1, Ordering::Relaxed);
             record.guest_ns.store(123_456, Ordering::Relaxed);
             record
@@ -1031,6 +1035,7 @@ mod tests {
             record.ptrace_state.load(Ordering::Acquire),
             VirtualPtraceState::Untraced.raw()
         );
+        assert_eq!(record.ptrace_record_generation.load(Ordering::Acquire), 0);
         assert_eq!(
             record.flags.load(Ordering::Acquire) & carrick_kernel::process::FLAG_ADOPTED,
             0,
