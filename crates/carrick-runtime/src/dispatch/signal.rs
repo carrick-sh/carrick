@@ -276,32 +276,6 @@ fn stop_self_by_signal(signum: i32) {
     }
 }
 
-fn ptrace_self_signal_needs_stop_carrier(signum: i32) -> bool {
-    signum != LINUX_SIGKILL
-}
-
-fn stop_ptraced_self_by_signal(signum: i32) {
-    if signum == LINUX_SIGKILL {
-        crate::guest_cpu::record_child_exit(std::process::id(), crate::guest_cpu::total_ns());
-        crate::guest_cpu::mark_self_ptrace_stop_pending(signum);
-        stop_self_by_signal(LINUX_SIGKILL);
-        return;
-    }
-    crate::guest_cpu::mark_self_ptrace_stop_pending(signum);
-    if ptrace_self_signal_needs_stop_carrier(signum) {
-        // Linux reports a ptrace signal-delivery stop before applying the
-        // signal's normal disposition. Carrick's host process may mirror,
-        // ignore, or claim the Darwin carrier signal, so use host SIGSTOP
-        // uniformly and report the recorded Linux signum in wait4.
-        stop_self_by_signal(LINUX_SIGSTOP);
-    } else {
-        let host_signum = crate::host_signal::linux_to_host_signum(signum);
-        unsafe {
-            libc::raise(host_signum);
-        }
-    }
-}
-
 fn should_route_specific_xsig(target_host_pid: i32, signum: i32) -> bool {
     if target_host_pid <= 0 {
         return false;
@@ -1209,8 +1183,7 @@ impl SyscallDispatcher {
             return DispatchOutcome::Returned { value: 0 };
         }
         let s = signum as i32;
-        if self.proc.lock().ptrace_traceme {
-            stop_ptraced_self_by_signal(s);
+        if crate::exec_helpers::stop_for_ptrace_signal(self, s) {
             return DispatchOutcome::Returned { value: 0 };
         }
         if s == LINUX_SIGSTOP {
@@ -1238,8 +1211,7 @@ impl SyscallDispatcher {
             return DispatchOutcome::Returned { value: 0 };
         }
         let s = signum as i32;
-        if self.proc.lock().ptrace_traceme {
-            stop_ptraced_self_by_signal(s);
+        if crate::exec_helpers::stop_for_ptrace_signal(self, s) {
             return DispatchOutcome::Returned { value: 0 };
         }
         if s == LINUX_SIGSTOP {
@@ -1379,9 +1351,9 @@ impl SyscallDispatcher {
             }
             if signal_target_names_self {
                 let tid = Self::ctx_tid(cx);
-                if this.proc.lock().ptrace_traceme && signum != 0 {
-                    let signum = signum as i32;
-                    stop_ptraced_self_by_signal(signum);
+                if signum != 0
+                    && crate::exec_helpers::stop_for_ptrace_signal(this, signum as i32)
+                {
                     return Ok(DispatchOutcome::Returned { value: 0 });
                 }
                 // Linux populates si_pid/si_uid with the sender's identity for a

@@ -398,9 +398,7 @@ where
         dispatcher.mark_signal_pending(tid, pending);
         return Ok(Some(PendingSignalAction::ignored()));
     }
-    if dispatcher.is_ptrace_traceme() {
-        crate::guest_cpu::mark_self_ptrace_stop_pending(pending);
-        crate::exec_helpers::stop_by_signal(crate::linux_abi::LINUX_SIGSTOP);
+    if crate::exec_helpers::stop_for_ptrace_signal(dispatcher, pending) {
         return Ok(Some(PendingSignalAction::ignored()));
     }
     crate::exec_helpers::stop_for_debug_signal(pending);
@@ -518,4 +516,143 @@ pub(crate) fn is_default_ignore_signal(signum: i32) -> bool {
             | crate::linux_abi::LINUX_SIGURG
             | crate::linux_abi::LINUX_SIGWINCH
     )
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    static PTRACE_SIGNAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct NoopTrap;
+
+    impl crate::trap::SyscallTrap for NoopTrap {
+        fn next_syscall(&mut self) -> Result<Option<crate::trap::RawSyscall>, TrapError> {
+            Err(TrapError::UnsupportedPlatform)
+        }
+
+        fn current_pc(&self) -> Result<u64, TrapError> {
+            Err(TrapError::UnsupportedPlatform)
+        }
+
+        fn complete_syscall(&mut self, _return_value: i64) -> Result<(), TrapError> {
+            Err(TrapError::UnsupportedPlatform)
+        }
+
+        fn fork(&mut self) -> Result<crate::trap::ForkOutcome, TrapError> {
+            Err(TrapError::UnsupportedPlatform)
+        }
+
+        fn execve_into(
+            &mut self,
+            _new_image: &crate::memory::AddressSpace,
+        ) -> Result<(), TrapError> {
+            Err(TrapError::UnsupportedPlatform)
+        }
+
+        fn inject_signal(
+            &mut self,
+            _signum: i32,
+            _handler: u64,
+            _sa_restorer: u64,
+            _pending_syscall_retval: Option<i64>,
+            _interrupted_pc: Option<u64>,
+            _altstack: Option<(u64, u64)>,
+            _saved_sigmask: u64,
+            _fault_siginfo: Option<(i32, u64)>,
+            _queued_siginfo: Option<crate::linux_abi::LinuxSiginfo>,
+            _restart_syscall: bool,
+        ) -> Result<(), TrapError> {
+            Err(TrapError::UnsupportedPlatform)
+        }
+
+        fn restore_from_sigframe(&mut self) -> Result<u64, TrapError> {
+            Err(TrapError::UnsupportedPlatform)
+        }
+    }
+
+    fn native_geometry() -> crate::page_profile::PageGeometry {
+        crate::page_profile::PageGeometry {
+            host_page_size: 16 * 1024,
+            linux_page_size: 16 * 1024,
+            native_profile: Some(carrick_spec::NativePageProfile::Native16k),
+        }
+    }
+
+    #[test]
+    fn ptrace_signal_stop_queued_native_signal_reports_and_resumes() {
+        let _guard = PTRACE_SIGNAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::guest_cpu::init_child_table();
+        let tracer_pid = std::process::id();
+        let prepared = crate::guest_cpu::prepare_child_record_pre_fork(tracer_pid, 0, 0, false, 0)
+            .expect("prepare native queued-signal child");
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed");
+        if child == 0 {
+            crate::guest_cpu::complete_child_record_post_fork_child();
+            let dispatcher = SyscallDispatcher::with_page_geometry(native_geometry());
+            dispatcher.set_ptrace_traceme_for_test();
+            if !crate::guest_cpu::register_self_virtual_ptrace(tracer_pid) {
+                unsafe { libc::_exit(70) };
+            }
+            let tid = ThreadId::main_from_host_pid();
+            dispatcher.mark_signal_pending(tid, crate::linux_abi::LINUX_SIGUSR2);
+            let mut trap = NoopTrap;
+            if deliver_pending_signal(&mut trap, &dispatcher, None, tid, None).is_err() {
+                unsafe { libc::_exit(71) };
+            }
+            unsafe { libc::_exit(42) };
+        }
+
+        crate::guest_cpu::publish_prepared_child_record_parent_ref(prepared, child as u32);
+        let mut stop_status = 0;
+        assert_eq!(
+            unsafe { libc::waitpid(child, &mut stop_status, libc::WUNTRACED) },
+            child
+        );
+        assert!(libc::WIFSTOPPED(stop_status));
+        assert_eq!(libc::WSTOPSIG(stop_status), libc::SIGSTOP);
+        let stop = crate::guest_cpu::report_child_virtual_ptrace_stop(child as u32)
+            .expect("queued virtual stop");
+        assert_eq!(stop.linux_signum(), crate::linux_abi::LINUX_SIGUSR2);
+        assert!(crate::guest_cpu::resume_child_virtual_ptrace(stop));
+
+        let mut exit_status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut exit_status, 0) }, child);
+        assert!(libc::WIFEXITED(exit_status));
+        assert_eq!(libc::WEXITSTATUS(exit_status), 42);
+        let _ = crate::guest_cpu::reap_child_guest_ns(child as u32);
+    }
+
+    #[test]
+    fn ptrace_signal_stop_queued_host_sigkill_remains_terminal() {
+        let _guard = PTRACE_SIGNAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::guest_cpu::init_child_table();
+        let parent = std::process::id();
+        let prepared = crate::guest_cpu::prepare_child_record_pre_fork(parent, 0, 0, false, 0)
+            .expect("prepare host queued-sigkill child");
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed");
+        if child == 0 {
+            crate::guest_cpu::complete_child_record_post_fork_child();
+            let dispatcher = SyscallDispatcher::new();
+            dispatcher.set_ptrace_traceme_for_test();
+            let tid = ThreadId::main_from_host_pid();
+            dispatcher.mark_signal_pending(tid, crate::linux_abi::LINUX_SIGKILL);
+            let mut trap = NoopTrap;
+            let _ = deliver_pending_signal(&mut trap, &dispatcher, None, tid, None);
+            unsafe { libc::_exit(70) };
+        }
+
+        crate::guest_cpu::publish_prepared_child_record_parent_ref(prepared, child as u32);
+        let mut exit_status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut exit_status, 0) }, child);
+        assert!(libc::WIFSIGNALED(exit_status));
+        assert_eq!(libc::WTERMSIG(exit_status), libc::SIGKILL);
+        let _ = crate::guest_cpu::reap_child_guest_ns(child as u32);
+    }
 }
