@@ -486,6 +486,7 @@ impl SyscallDispatcher {
         s.pending_actions.retain(|(t, _), _| *t != tid);
         s.altstack.remove(&tid);
         s.handler_frames.remove(&tid);
+        s.restore_masks.remove(&tid);
     }
 
     /// Re-key a thread's per-thread signal state from `old` to `new` across
@@ -689,6 +690,24 @@ impl SyscallDispatcher {
     pub fn arm_restore_mask(&self, tid: crate::thread::ThreadId, mask: SigSet) {
         let mut signal = self.signal.lock();
         signal.restore_masks.insert(tid, sanitize_signal_mask(mask));
+    }
+
+    fn begin_sigsuspend(&self, tid: crate::thread::ThreadId, suspend_mask: SigSet) -> SigSet {
+        let mut signal = self.signal.lock();
+        let original = signal
+            .restore_masks
+            .get(&tid)
+            .copied()
+            .unwrap_or_else(|| signal.mask_for(tid));
+        signal.restore_masks.entry(tid).or_insert(original);
+        signal.masks.insert(tid, sanitize_signal_mask(suspend_mask));
+        original
+    }
+
+    fn cancel_sigsuspend(&self, tid: crate::thread::ThreadId, original: SigSet) {
+        let mut signal = self.signal.lock();
+        signal.restore_masks.remove(&tid);
+        signal.masks.insert(tid, sanitize_signal_mask(original));
     }
 
     /// True if a signal deliverable under `suspend_mask` (per-thread pending or
@@ -1605,60 +1624,32 @@ impl SyscallDispatcher {
             let suspend_mask = sanitize_signal_mask(SigSet::from_raw(u64::from_le_bytes(
                 mask_bytes.try_into().unwrap_or([0; 8]),
             )));
-            // sigsuspend semantics (Linux kernel: signal.c rt_sigsuspend):
-            //   1. save the current mask;
-            //   2. install `suspend_mask`;
-            //   3. block until a signal deliverable under `suspend_mask`;
-            //   4. arm restore_sigmask so the next handler delivery restores the
-            //      saved mask AFTER the handler runs (NOT immediately on
-            //      syscall return);
-            //   5. return -EINTR.
-            // The runtime's delivery cycle then injects the handler under
-            // `suspend_mask` (so a previously-pending signal is now deliverable),
-            // and `rt_sigreturn` pops the saved mask back via the sigframe.
-            // The 5 s wait bound is a safety belt — a missed wake edge yields
-            // a spurious EINTR, which the canonical `while (!flag) sigsuspend`
-            // idiom transparently re-enters.
-            let original = this.signal_mask_for(tid);
-            this.restore_signal_mask(tid, suspend_mask);
-            let deadline = Instant::now() + Duration::from_secs(5);
-            loop {
+            // Install the temporary mask and retain the original across the
+            // run loop's wait/re-dispatch cycle. Blocking here would retain the
+            // caller's guest-memory borrow and starve the sibling that must
+            // dispatch tgkill/tkill to wake us.
+            let original = this.begin_sigsuspend(tid, suspend_mask);
+            let dispatcher_pending = {
                 let signal = this.signal.lock();
-                // A queued per-thread signal OR a shared process-directed signal
-                // now deliverable under suspend_mask wakes sigsuspend.
-                let pending = signal
+                signal
                     .pendings
                     .get(&tid)
                     .copied()
                     .unwrap_or(SigSet::EMPTY)
-                    .union(signal.process_pending);
-                drop(signal);
-                if !pending.difference(suspend_mask).is_empty() {
-                    break; // a queued signal is now deliverable
-                }
-                // A sibling tgkill/tkill of an unblocked signal lands in the
-                // per-tid host slot (THREAD_PENDING) via complete_signal_thread
-                // -> publish_pending_for; the global take_pending() below never
-                // sees it and the vCPU kick is a no-op while we spin here. Detect
-                // it WITHOUT consuming, so the post-EINTR delivery cycle injects
-                // the handler under suspend_mask. (audit M3; probe sigsuspendxthread)
-                if crate::host_signal::has_unblocked_pending_for(
-                    tid.raw(),
-                    SigBlockMask::blocking_all_of(suspend_mask),
-                ) {
-                    break;
-                }
-                let host_pending = crate::host_signal::take_pending();
-                if host_pending != 0 {
-                    // Re-raise so the runtime's delivery cycle injects the
-                    // handler after this syscall returns EINTR.
-                    crate::host_signal::raise_for_self(host_pending);
-                    break;
-                }
-                if Instant::now() >= deadline {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(1));
+                    .union(signal.process_pending)
+                    .difference(suspend_mask)
+            };
+            let block_mask = SigBlockMask::blocking_all_of(suspend_mask);
+            let host_pending = crate::host_signal::has_unblocked_pending_for(
+                tid.raw(),
+                block_mask,
+            );
+            if dispatcher_pending.is_empty() && !host_pending {
+                return Ok(DispatchOutcome::WaitOnSignals {
+                    wait_set: suspend_mask.complement(),
+                    block_mask,
+                    timeout: None,
+                });
             }
             // Keep the temporary mask + arm the post-handler restore ONLY when a
             // caught handler is actually going to run: it runs under
@@ -1669,14 +1660,12 @@ impl SyscallDispatcher {
             // stranded running under `suspend_mask`. A cross-thread host-pending
             // wake re-raised above, so a handler will run there too. (audit M1)
             if this.sigsuspend_caught_handler_deliverable(tid, suspend_mask)
-                || crate::host_signal::has_unblocked_pending_for(
-                    tid.raw(),
-                    SigBlockMask::blocking_all_of(suspend_mask),
-                )
+                || host_pending
             {
-                this.arm_restore_mask(tid, original);
+                // `begin_sigsuspend` already armed `original`; handler entry
+                // consumes it into the Linux sigframe.
             } else {
-                this.restore_signal_mask(tid, original);
+                this.cancel_sigsuspend(tid, original);
             }
             Ok(DispatchOutcome::errno(LINUX_EINTR))
         }
@@ -3441,5 +3430,52 @@ mod tests {
         // The same signal BLOCKED by suspend_mask is not deliverable → restore.
         let block_10 = SigSet::EMPTY.with(10);
         assert!(!d.sigsuspend_caught_handler_deliverable(tid, block_10));
+    }
+
+    #[test]
+    fn rt_sigsuspend_releases_dispatch_before_waiting() {
+        const MASK_PTR: u64 = 0x1000;
+        let d = SyscallDispatcher::new();
+        let tid = crate::thread::ThreadId::synthetic_for_tests(1000);
+        let registry = crate::thread::ThreadRegistry::new(tid);
+        let futex = crate::thread::FutexTable::new();
+        let reporter = crate::compat::CompatReporter::default();
+        let mut memory = crate::dispatch::LinearMemory::new(MASK_PTR, vec![0; 64]);
+        memory
+            .write_bytes(MASK_PTR, &SigSet::EMPTY.raw().to_le_bytes())
+            .expect("write suspend mask");
+        let original = SigSet::EMPTY.with(crate::linux_abi::LINUX_SIGUSR1);
+        d.restore_signal_mask(tid, original);
+
+        let started = Instant::now();
+        let outcome = d
+            .dispatch_threaded(
+                SyscallRequest::new(
+                    133,
+                    SyscallArgs::from([MASK_PTR, LINUX_RT_SIGSET_SIZE, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+                tid,
+                &registry,
+                &futex,
+            )
+            .expect("dispatch rt_sigsuspend");
+
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "rt_sigsuspend must park outside dispatch"
+        );
+        assert!(matches!(
+            outcome,
+            DispatchOutcome::WaitOnSignals {
+                wait_set,
+                block_mask,
+                timeout: None,
+            } if wait_set == SigSet::EMPTY.complement()
+                && block_mask == SigBlockMask::blocking_all_of(SigSet::EMPTY)
+        ));
+        assert_eq!(d.signal_mask_for(tid), SigSet::EMPTY);
+        assert_eq!(d.signal.lock().restore_masks.get(&tid), Some(&original));
     }
 }
