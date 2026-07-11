@@ -10,7 +10,7 @@
 //! Known x86_64 gap (2026-06-18): `nonexec_mmap_faults` is FALSE on carrick — a
 //! fresh non-exec mmap page executes — while `mprotect_drop_exec_faults` is TRUE,
 //! i.e. carrick sets the PTE NX bit on the mprotect path but NOT from the initial
-//! mmap prot. Linux: all four true.
+//! mmap prot. Linux: all five reported invariants are true.
 
 use conformance_probes::report;
 
@@ -84,15 +84,16 @@ unsafe fn child_exec(prot: i32, mprotect_to: Option<i32>) -> i32 {
 fn sig_segv(st: i32) -> bool {
     libc::WIFSIGNALED(st) && libc::WTERMSIG(st) == libc::SIGSEGV
 }
-/// The FETCH was permitted (page is executable) iff the child did NOT take a
-/// SIGSEGV. A clean `ret` exits 0; a stale-i-cache fetch might SIGILL — both
-/// mean "fetch allowed", distinct from the NX SIGSEGV.
+/// The fetch path is usable only when the deposited `ret` executes and the
+/// child exits cleanly. Setup failures are not evidence that execution was
+/// permitted.
 fn fetch_allowed(st: i32) -> bool {
-    !sig_segv(st)
+    libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 0
 }
 
 fn main() {
     unsafe {
+        let report_status = std::env::args().any(|arg| arg == "status");
         // Case 1: mmap PROT_READ|WRITE (no EXEC) → jump must fault SIGSEGV (NX).
         let rw = child_exec(libc::PROT_READ | libc::PROT_WRITE, None);
         // Case 2: mmap PROT_READ|WRITE|EXEC → jump executes, child exits 0.
@@ -119,5 +120,12 @@ fn main() {
             mprotect_add_exec_fetch_allowed = fetch_allowed(add_exec),
             mprotect_exec_only_fetch_allowed = fetch_allowed(exec_only),
         );
+        if report_status {
+            println!("nonexec_mmap_status={rw}");
+            println!("exec_mmap_status={rwx}");
+            println!("mprotect_drop_exec_status={drop_exec}");
+            println!("mprotect_add_exec_status={add_exec}");
+            println!("mprotect_exec_only_status={exec_only}");
+        }
     }
 }
