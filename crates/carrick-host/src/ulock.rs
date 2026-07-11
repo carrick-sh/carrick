@@ -295,7 +295,7 @@ mod imp {
     /// `woken` is the guest-visible outcome of the wait this exit closes
     /// (`true` for FUTEX_WAIT returning 0 — physical wake or value re-check;
     /// `false` for ETIMEDOUT/EINTR): it selects whether a no-credit unit
-    /// stays claimable (see [`settle_waiter_exit`]).
+    /// stays claimable (see `settle_waiter_exit`).
     pub fn waiter_exit(host_addr: usize, woken: bool) {
         if let Some(slot) = waiter_slot(host_addr) {
             settle_waiter_exit(slot, woken);
