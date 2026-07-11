@@ -172,4 +172,11 @@ pub(super) enum DsrError {
     Decode { pc: u64, word: u32, detail: String },
     #[error("DSR decoded malformed {op:?} 0x{word:08x} at guest PC 0x{pc:x}")]
     Malformed { pc: u64, word: u32, op: bad64::Op },
+    #[error("DSR cache policy error: {0}")]
+    CachePolicy(String),
+    #[error("DSR host operation {operation} failed: {error}")]
+    Host {
+        operation: &'static str,
+        error: std::io::Error,
+    },
 }
