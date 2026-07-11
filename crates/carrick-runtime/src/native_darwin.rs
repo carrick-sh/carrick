@@ -1039,6 +1039,9 @@ enum NativeForkTokenFlow {
     /// An execve by ANOTHER thread is replacing the thread group; the caller
     /// must retire this thread instead of proceeding.
     RetireForExec,
+    /// The token backstop deadline expired (an unknown holder). Fork callers
+    /// degrade to Linux-shaped EAGAIN.
+    TimedOut,
 }
 
 /// How a fork request left `handle_native_fork`.
@@ -1904,13 +1907,24 @@ impl NativeThreadRuntime {
     /// ANOTHER thread abandons its syscall and retires (Linux: execve kills
     /// every sibling; a concurrent fork/exec in a doomed thread never
     /// completes).
+    ///
+    /// SLEEPS between attempts (a `yield_now` loop burned 100% of a core for
+    /// the whole time another thread held the token — worst case a vfork
+    /// parent-suspend, which the guest's vfork child paces) and is BOUNDED:
+    /// every legitimate holder is itself bounded (quiesce drain 10 s abort,
+    /// vfork suspend 60 s, exec teardown drain 5 s), so the deadline is a
+    /// backstop against an unknown holder, not a pacing bound.
     fn acquire_fork_token(&self) -> NativeForkTokenFlow {
+        let deadline = Instant::now() + Duration::from_secs(120);
         while !crate::fork_quiesce::barrier().try_begin_fork() {
             if crate::fork_quiesce::exec_replacing_other_thread(self.tid) {
                 return NativeForkTokenFlow::RetireForExec;
             }
             self.park_for_fork_quiesce();
-            std::thread::yield_now();
+            if Instant::now() >= deadline {
+                return NativeForkTokenFlow::TimedOut;
+            }
+            std::thread::sleep(Duration::from_micros(200));
         }
         NativeForkTokenFlow::Acquired
     }
@@ -3214,8 +3228,22 @@ fn handle_native_fork(
     // fork's barrier so its drain counts this thread; a loser that observes
     // an execve replacement retires instead (its whole thread group is being
     // destroyed — the fork never happens, matching Linux).
-    if thread_runtime.acquire_fork_token() == NativeForkTokenFlow::RetireForExec {
-        return Ok(NativeForkFlow::RetireForExec);
+    match thread_runtime.acquire_fork_token() {
+        NativeForkTokenFlow::Acquired => {}
+        NativeForkTokenFlow::RetireForExec => return Ok(NativeForkFlow::RetireForExec),
+        NativeForkTokenFlow::TimedOut => {
+            tracing::error!(
+                pid = std::process::id(),
+                tid = thread_runtime.tid().raw(),
+                "native fork could not acquire the fork token within its backstop \
+                 deadline; degrading to EAGAIN"
+            );
+            resume_guest(
+                crate::linux_abi::LINUX_EAGAIN.guest_retval() as u64,
+                resume_pc,
+            )?;
+            return Ok(NativeForkFlow::Resumed);
+        }
     }
     let barrier = crate::fork_quiesce::barrier();
     // Multithreaded fork: stop the world first. Siblings park at their
@@ -3263,6 +3291,15 @@ fn handle_native_fork(
         // stranded thread — mirroring the HVF drain's failure discipline.
         let drain_deadline = Instant::now() + Duration::from_secs(10);
         loop {
+            // An execve replacement raised mid-quiesce WINS (Linux: exec
+            // kills the forking sibling; the fork never completes). Abort:
+            // release the parked siblings so they reach their boundaries and
+            // retire, then retire this thread too.
+            if crate::fork_quiesce::exec_replacing_other_thread(thread_runtime.tid()) {
+                barrier.end_quiesce();
+                barrier.end_fork();
+                return Ok(NativeForkFlow::RetireForExec);
+            }
             if thread_runtime.kicker.count() <= 1 {
                 break;
             }
@@ -3397,10 +3434,14 @@ fn handle_native_fork(
         // (and the parked-thread count, which belongs to PARENT threads that
         // do not exist here) would otherwise park this child's run loop at
         // its first boundary check or satisfy a future MT fork's drain with
-        // phantom parkers — the HVF child arm's exact sequence.
+        // phantom parkers — the HVF child arm's exact sequence. The exec-
+        // replacement owner is likewise a PARENT thread that does not exist
+        // here; an inherited nonzero owner would spuriously retire this
+        // child's threads at their first boundary.
         barrier.end_quiesce();
         barrier.end_fork();
         barrier.reset_paused_for_child();
+        crate::fork_quiesce::end_exec_replacement();
         if let Some((read_fd, write_fd)) = vfork_pipe {
             close_fd(read_fd);
             *vfork_completion = Some(NativeVforkCompletion { fd: write_fd });
@@ -3445,22 +3486,42 @@ fn handle_native_fork(
     }
     // Release the parked siblings now — the fork is done; the vfork suspend
     // below must run with siblings LIVE (HVF suspends after end_quiesce too).
-    // The fork TOKEN is held across the vfork suspend so a sibling's fork
-    // cannot start a new quiesce while this thread is unparkable in read().
+    // The fork TOKEN is held across the vfork suspend because the vm-inherit
+    // SHARE flags set for the vfork window are process-global: a sibling's
+    // CoW fork landing inside it would wrongly SHARE guest-writable memory
+    // with its child. The suspend is bounded (60 s) and exec-interruptible,
+    // so the token hold is too.
     if quiesced {
         barrier.end_quiesce();
     }
     let vfork_wait = if let Some((read_fd, write_fd)) = vfork_pipe {
         close_fd(write_fd);
-        let wait = wait_native_vfork_completion(read_fd);
+        let wait = wait_native_vfork_completion(read_fd, thread_runtime.tid());
         close_fd(read_fd);
         memory.lock().set_fork_inheritance(false);
         wait
     } else {
-        Ok(())
+        Ok(NativeVforkWait::Completed)
     };
     barrier.end_fork();
-    vfork_wait?;
+    match vfork_wait? {
+        NativeVforkWait::Completed => {}
+        NativeVforkWait::ExecRetire => {
+            // Linux kills a vfork-suspended thread during a sibling's execve;
+            // the vfork child lives on as a child of the (exec'd) process.
+            // Publish its record so the new image can reap it, then retire.
+            // No guest-memory writes (pidfd/parent_tid target the dying
+            // image) and no exit-signal watch (execve resets the SIGCHLD
+            // disposition to default).
+            crate::guest_cpu::publish_prepared_child_record_parent_ref(
+                prepared_child_record,
+                child as u32,
+            );
+            crate::namespace::pid::notify_child_registered();
+            crate::run_state::publish_child_booting(child as u32);
+            return Ok(NativeForkFlow::RetireForExec);
+        }
+    }
     crate::guest_cpu::publish_prepared_child_record_parent_ref(prepared_child_record, child as u32);
     crate::namespace::pid::notify_child_registered();
     crate::run_state::publish_child_booting(child as u32);
@@ -3498,32 +3559,56 @@ fn native_terminate_siblings_for_exec(
     if thread_runtime.registry.live_count() <= 1 {
         return Ok(NativeExecTeardownFlow::Proceed);
     }
-    // The fork token is the fork↔exec mutual exclusion: an in-flight fork
-    // quiesce completes (this thread parks for it inside the token loop)
-    // before the teardown starts, and no fork can start mid-teardown. A lost
-    // race against ANOTHER thread's execve retires this thread instead.
-    if thread_runtime.acquire_fork_token() == NativeForkTokenFlow::RetireForExec {
+    let tid = thread_runtime.tid();
+    // Exec WINS: CAS-claim the replacement flag BEFORE serializing on the
+    // fork token, then kick — so a token holder that cannot make progress on
+    // its own observes the flag and yields it: a vfork-suspended leader
+    // retires (Linux kills a vfork-waiting thread during execve; pre-fix the
+    // execing thread hot-spun on the token for the whole guest-paced
+    // suspend), and a forker mid-quiesce aborts its drain. A lost CAS means
+    // another thread's execve already owns the group — retire.
+    if !crate::fork_quiesce::try_begin_exec_replacement(tid) {
         return Ok(NativeExecTeardownFlow::RetireForExec);
     }
+    thread_runtime.kicker.kick_all_except(tid);
+    thread_runtime.platform_futex.notify_signal_pending();
     let barrier = crate::fork_quiesce::barrier();
+    // Token acquisition is a bounded BACKSTOP only: every legitimate holder
+    // now observes the exec flag and releases within its own bounded window
+    // (quiesce drain abort 10 s, vfork suspend 60 s).
+    let token_deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        if barrier.try_begin_fork() {
+            break;
+        }
+        thread_runtime.park_for_fork_quiesce();
+        if Instant::now() >= token_deadline {
+            crate::fork_quiesce::end_exec_replacement();
+            return Err(RuntimeError::Trap(TrapError::Hypervisor(
+                "native execve could not serialize against an in-flight fork/vfork \
+                 within 120s; the thread group is partially torn down"
+                    .to_string(),
+            )));
+        }
+        thread_runtime.kicker.kick_all_except(tid);
+        thread_runtime.platform_futex.notify_signal_pending();
+        std::thread::sleep(Duration::from_micros(200));
+    }
     // W^X boundary (311fae9e), kept narrow and explicit — see the fork-side
     // twin; unreachable while the creation-side rejections hold.
     if memory.lock().has_native16k_write_exec_pages() {
+        crate::fork_quiesce::end_exec_replacement();
         barrier.end_fork();
         return Err(RuntimeError::Unsupported(
             "native Darwin multithreaded execve with write-exec pages is not supported".to_string(),
         ));
     }
-    crate::fork_quiesce::begin_exec_replacement(thread_runtime.tid());
-    thread_runtime.kicker.kick_all_except(thread_runtime.tid());
-    thread_runtime.platform_futex.notify_signal_pending();
     // Drain until every sibling has RETIRED. Both counts matter: the registry
     // entry drops in `finish_thread` (a thread transiently unregistered from
     // the kicker — e.g. re-registering after a fork park — is still live and
     // must not be missed), and the kicker entry drops with it. Bounded 5 s
-    // (mirrors HVF): a sibling that cannot retire — e.g. a vfork parent
-    // suspended in the completion read — surfaces the typed error instead of
-    // wedging the exec.
+    // (mirrors HVF); on expiry the typed error states the honest consequence:
+    // some siblings already retired, so the group is partially torn down.
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         if thread_runtime.registry.live_count() <= 1 && thread_runtime.kicker.count() <= 1 {
@@ -3533,12 +3618,13 @@ fn native_terminate_siblings_for_exec(
             crate::fork_quiesce::end_exec_replacement();
             barrier.end_fork();
             return Err(RuntimeError::Trap(TrapError::Hypervisor(format!(
-                "native execve thread-group teardown timed out: live={} kicker={}",
+                "native execve thread-group teardown timed out: live={} kicker={}; \
+                 the thread group is partially torn down",
                 thread_runtime.registry.live_count(),
                 thread_runtime.kicker.count()
             ))));
         }
-        thread_runtime.kicker.kick_all_except(thread_runtime.tid());
+        thread_runtime.kicker.kick_all_except(tid);
         thread_runtime.platform_futex.notify_signal_pending();
         std::thread::sleep(Duration::from_micros(200));
     }
@@ -3587,17 +3673,62 @@ fn native_trace_fork_phase(phase: &str) {
     }
 }
 
-fn wait_native_vfork_completion(fd: RawFd) -> Result<(), RuntimeError> {
-    let mut byte = [0_u8; 1];
+/// How the vfork parent-suspend ended.
+enum NativeVforkWait {
+    /// The child execve'd (a byte) or exited (EOF) — or the bounded suspend
+    /// expired and the parent resumes DEGRADED (HVF's 60 s parity).
+    Completed,
+    /// A sibling thread's execve replaced the thread group mid-suspend.
+    /// Linux KILLS a vfork-waiting thread during execve (its wait is
+    /// killable); the caller must retire this thread. The vfork child lives
+    /// on, paced by its own execve/_exit.
+    ExecRetire,
+}
+
+fn wait_native_vfork_completion(
+    fd: RawFd,
+    tid: crate::thread::ThreadId,
+) -> Result<NativeVforkWait, RuntimeError> {
+    // Bounded suspend (HVF VFORK_SUSPEND_TIMEOUT parity): the child should
+    // execve/_exit within ms, but a pathological guest must not wedge this
+    // thread — and everything serialized behind the fork token — forever.
+    // poll (not a bare read loop) so a kick's EINTR re-checks the exec flag:
+    // pre-fix the raw EINTR-retrying read held the fork token for the whole
+    // guest-paced suspend while a sibling's execve HOT-SPUN on the token.
+    const VFORK_SUSPEND_TIMEOUT: Duration = Duration::from_secs(60);
+    let deadline = Instant::now() + VFORK_SUSPEND_TIMEOUT;
     loop {
-        let rc = unsafe { libc::read(fd, byte.as_mut_ptr().cast(), byte.len()) };
-        if rc >= 0 {
-            return Ok(());
+        if crate::fork_quiesce::exec_replacing_other_thread(tid) {
+            return Ok(NativeVforkWait::ExecRetire);
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            tracing::error!(
+                "native vfork parent-suspend timed out (60s) waiting for child \
+                 execve/_exit; resuming parent degraded"
+            );
+            return Ok(NativeVforkWait::Completed);
+        }
+        let remaining_ms = (deadline - now).as_millis().min(i32::MAX as u128) as i32;
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let rc = unsafe { libc::poll(&mut pfd, 1, remaining_ms) };
+        if rc > 0 {
+            // Readable: a byte (child execve'd) or EOF (child exited).
+            let mut byte = [0_u8; 1];
+            let _ = unsafe { libc::read(fd, byte.as_mut_ptr().cast(), byte.len()) };
+            return Ok(NativeVforkWait::Completed);
+        }
+        if rc == 0 {
+            continue; // deadline re-checked at loop top
         }
         let err = std::io::Error::last_os_error();
         if err.raw_os_error() != Some(libc::EINTR) {
             return Err(RuntimeError::FsBackend(anyhow::anyhow!(
-                "native Darwin vfork completion read failed: {err}"
+                "native Darwin vfork completion poll failed: {err}"
             )));
         }
     }
