@@ -1386,10 +1386,33 @@ impl AddressSpace {
     /// image (per-ISA bytes come from `GuestArch::vdso_bytes` above the seam)
     /// plus the zero-filled vvar page. `with_vdso` and the debug variants
     /// above delegate here with the aarch64 builders.
-    pub fn with_vdso_bytes(self, mut vdso_bytes: Vec<u8>) -> Result<Self, AddressSpaceError> {
+    pub fn with_vdso_bytes(self, vdso_bytes: Vec<u8>) -> Result<Self, AddressSpaceError> {
+        self.with_vdso_bytes_at(
+            vdso_bytes,
+            crate::vdso::LINUX_VVAR_BASE,
+            crate::vdso::LINUX_VDSO_BASE,
+        )
+    }
+
+    /// Like [`AddressSpace::with_vdso_bytes`] but places the vvar/vdso pages at
+    /// caller-chosen guest VAs and repoints any `AT_SYSINFO_EHDR` auxv entry at
+    /// `vdso_base`. The VMM backends keep the canonical fixed VAs; the Darwin
+    /// native backend must relocate both pages because the canonical bases sit
+    /// inside a Darwin-reserved host VA hole (mmap/mach_vm_allocate refuse
+    /// [63 GiB, 448 GiB) with EACCES/KERN_NO_SPACE in a Darwin process, and
+    /// native guest VAs ARE host VAs). The vDSO code hardcodes the canonical
+    /// vvar base in a `movz`; the native backend rewrites that immediate on its
+    /// injected page at map time. Must run before the initial-stack build so
+    /// the serialized auxv carries the relocated `AT_SYSINFO_EHDR`.
+    pub fn with_vdso_bytes_at(
+        self,
+        mut vdso_bytes: Vec<u8>,
+        vvar_base: u64,
+        vdso_base: u64,
+    ) -> Result<Self, AddressSpaceError> {
         let vvar = MemoryRegion {
-            start: crate::vdso::LINUX_VVAR_BASE,
-            end: crate::vdso::LINUX_VVAR_BASE + crate::vdso::LINUX_VVAR_SIZE,
+            start: vvar_base,
+            end: vvar_base + crate::vdso::LINUX_VVAR_SIZE,
             perms: SegmentPerms {
                 read: true,
                 write: false,
@@ -1400,8 +1423,8 @@ impl AddressSpace {
         };
         vdso_bytes.resize(crate::vdso::LINUX_VDSO_SIZE as usize, 0);
         let vdso = MemoryRegion {
-            start: crate::vdso::LINUX_VDSO_BASE,
-            end: crate::vdso::LINUX_VDSO_BASE + crate::vdso::LINUX_VDSO_SIZE,
+            start: vdso_base,
+            end: vdso_base + crate::vdso::LINUX_VDSO_SIZE,
             perms: SegmentPerms {
                 read: true,
                 write: false,
@@ -1415,13 +1438,18 @@ impl AddressSpace {
             entry,
             regions,
             initial_stack_pointer,
-            linux_auxv,
+            mut linux_auxv,
             linux_auxv_image,
             el0_trampoline_entry,
             el1_vectors_base,
             stage1_page_tables_base,
             ro_spans,
         } = self;
+        for aux in &mut linux_auxv {
+            if aux.a_type == crate::linux_abi::LINUX_AT_SYSINFO_EHDR {
+                aux.a_val = vdso_base;
+            }
+        }
         let mut image =
             Self::from_regions(entry, regions.into_iter().chain([vvar, vdso]).collect())?;
         image.initial_stack_pointer = initial_stack_pointer;
@@ -2986,6 +3014,47 @@ mod loader_tests {
                 .iter()
                 .any(|entry| entry.a_type == crate::linux_abi::LINUX_AT_SYSINFO_EHDR),
             "AT_SYSINFO_EHDR should be absent when vDSO is disabled"
+        );
+    }
+
+    /// `with_vdso_bytes_at` places the vvar/vdso regions at caller-chosen bases
+    /// and repoints `AT_SYSINFO_EHDR` there — the Darwin-native backend depends
+    /// on this because the canonical bases sit in a Darwin-reserved VA hole.
+    #[test]
+    fn with_vdso_bytes_at_relocates_regions_and_auxv() {
+        let vvar_base = crate::vdso::LINUX_VVAR_BASE + (0x80 << 32);
+        let vdso_base = crate::vdso::LINUX_VDSO_BASE + (0x80 << 32);
+        let mut image = AddressSpace::from_regions(0, Vec::new()).unwrap();
+        image.linux_auxv = vec![LinuxAuxvEntry::new(
+            crate::linux_abi::LINUX_AT_SYSINFO_EHDR,
+            crate::vdso::LINUX_VDSO_BASE,
+        )];
+        let image = image
+            .with_vdso_bytes_at(crate::vdso::vdso_image_bytes(), vvar_base, vdso_base)
+            .expect("relocated vDSO should attach");
+
+        let vvar = image
+            .regions()
+            .iter()
+            .find(|region| region.start == vvar_base)
+            .expect("relocated vvar region");
+        assert_eq!(vvar.end, vvar_base + crate::vdso::LINUX_VVAR_SIZE);
+        assert!(vvar.perms.read && !vvar.perms.write && !vvar.perms.execute);
+        let vdso = image
+            .regions()
+            .iter()
+            .find(|region| region.start == vdso_base)
+            .expect("relocated vdso region");
+        assert!(vdso.perms.execute);
+        assert_eq!(&vdso.bytes()[0..4], &[0x7f, b'E', b'L', b'F']);
+        assert_eq!(
+            image
+                .linux_auxv
+                .iter()
+                .find(|aux| aux.a_type == crate::linux_abi::LINUX_AT_SYSINFO_EHDR)
+                .map(|aux| aux.a_val),
+            Some(vdso_base),
+            "AT_SYSINFO_EHDR must point at the relocated vdso base"
         );
     }
 
