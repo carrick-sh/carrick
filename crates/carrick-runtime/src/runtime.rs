@@ -2150,6 +2150,22 @@ impl<M: GuestMemory, T: SyscallTrap> GuestMemory for SplitView<'_, M, T> {
     fn set_no_access(&mut self, address: u64, len: usize, no_access: bool) {
         self.mem.set_no_access(address, len, no_access);
     }
+    fn set_no_write(&mut self, address: u64, len: usize, no_write: bool) {
+        self.mem.set_no_write(address, len, no_write);
+    }
+    fn set_unmapped(&mut self, address: u64, len: usize, unmapped: bool) {
+        self.mem.set_unmapped(address, len, unmapped);
+    }
+    fn set_mapping_protection(
+        &mut self,
+        address: u64,
+        len: usize,
+        no_access: bool,
+        no_write: bool,
+    ) {
+        self.mem
+            .set_mapping_protection(address, len, no_access, no_write);
+    }
     fn protect_range(&mut self, address: u64, len: usize, prot: u64) -> Result<(), MemoryError> {
         self.mem.protect_range(address, len, prot)
     }

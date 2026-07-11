@@ -570,7 +570,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
             && self
                 .vm
                 .protections()
-                .is_some_and(|p| p.range_no_write(address, bytes.len()))
+                .is_some_and(|p| p.range_write_denied(address, bytes.len()))
         {
             return Err(MemoryError::OutOfBounds {
                 address,
@@ -593,9 +593,10 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
 
     fn guest_range_is_writable(&self, address: u64, length: usize) -> bool {
         self.vm.guest_range_is_writable(address, length)
-            && self.vm.protections().is_none_or(|p| {
-                !p.range_no_access(address, length) && !p.range_no_write(address, length)
-            })
+            && self
+                .vm
+                .protections()
+                .is_none_or(|p| !p.range_write_denied(address, length))
     }
 
     fn host_ptr_for_read(&self, address: u64, len: usize) -> Option<*const u8> {
@@ -618,6 +619,24 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
     fn set_no_write(&mut self, address: u64, len: usize, no_write: bool) {
         if let Some(protections) = self.vm.protections() {
             protections.set_no_write(address, len, no_write);
+        }
+    }
+
+    fn set_unmapped(&mut self, address: u64, len: usize, unmapped: bool) {
+        if let Some(protections) = self.vm.protections() {
+            protections.set_unmapped(address, len, unmapped);
+        }
+    }
+
+    fn set_mapping_protection(
+        &mut self,
+        address: u64,
+        len: usize,
+        no_access: bool,
+        no_write: bool,
+    ) {
+        if let Some(protections) = self.vm.protections() {
+            protections.set_mapping_protection(address, len, no_access, no_write);
         }
     }
 
@@ -669,7 +688,9 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         // stage-1 invalidate (no-op for the common low-VA arena; HVF's
         // `alias_registry` for a high-VA alias routed here). KVM no-op.
         self.vm.on_unmap(address, len);
-        self.pt_edit_and_flush(|mgr| mgr.invalidate(address, len))
+        self.pt_edit_and_flush(|mgr| mgr.invalidate(address, len))?;
+        self.set_unmapped(address, len, true);
+        Ok(())
     }
 
     /// `munmap` of a high-VA alias: invalidate AND reclaim the now-empty alias
@@ -679,7 +700,9 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         // The alias backing is freed here; drop the process-shared index entry first
         // so a cross-thread fallback never resolves a now-munmap'd `host_addr` (HVF).
         self.vm.on_unmap(address, len);
-        self.pt_edit_and_flush(|mgr| mgr.unmap_aliased(address, len))
+        self.pt_edit_and_flush(|mgr| mgr.unmap_aliased(address, len))?;
+        self.set_unmapped(address, len, true);
+        Ok(())
     }
 
     /// Repoint guest VA `[va, va+len)` to a slot in the boot-mapped PRIVATE overlay
