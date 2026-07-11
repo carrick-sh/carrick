@@ -2613,14 +2613,30 @@ fn native_signal_wait_pending(
     ) {
         return Some(NativeSignalWaitResult::Ready);
     }
+    // ORDER MATTERS: classify the EINTR case BEFORE the generic deliverable-
+    // dispatch-pending Ready check. `should_eintr` matches a deliverable
+    // pending signal OUTSIDE the wait set (caught, unblocked): the syscall
+    // must return EINTR so the boundary delivers its handler. The Ready check
+    // below ALSO matches that signal (its Replace(block_mask) complement
+    // includes every unblocked caught signal) but Ready means RE-DISPATCH —
+    // `rt_sigtimedwait` would find nothing in the wait set, re-park, observe
+    // the still-pending signal, and spin Ready→re-dispatch→Ready until the
+    // guest timeout returned EAGAIN with the handler deferred to that
+    // boundary (probes sigtimedwaitintr/shmnestedfork once pid namespaces
+    // routed cross-process kills through the xsig ring into dispatcher
+    // pending state). After this check, Ready below is left meaning exactly
+    // "wait-set signal pending in dispatcher-owned state" (host-slot wait-set
+    // pendings returned Ready above) — the HVF WaitOnSignals arm makes the
+    // same distinction by consulting `signal_wait_should_eintr` on its
+    // Interrupted wake before re-dispatching.
+    if dispatcher.signal_wait_should_eintr(tid, wait_set, block_mask) {
+        return Some(NativeSignalWaitResult::Interrupted);
+    }
     if dispatcher.has_deliverable_dispatch_pending_for_wait(
         tid,
         carrick_abi::WaitSigMask::Replace(carrick_abi::SigSet::from_raw(block_mask.raw())),
     ) {
         return Some(NativeSignalWaitResult::Ready);
-    }
-    if dispatcher.signal_wait_should_eintr(tid, wait_set, block_mask) {
-        return Some(NativeSignalWaitResult::Interrupted);
     }
     None
 }
@@ -6700,6 +6716,61 @@ mod tests {
         assert_eq!(trap.regs.v, interrupted.v);
         assert_eq!(trap.regs.fpsr, interrupted.fpsr);
         assert_eq!(trap.regs.fpcr, interrupted.fpcr);
+    }
+
+    /// A deliverable pending signal OUTSIDE the wait set must classify a
+    /// signal-park wake as `Interrupted` (the syscall returns EINTR and the
+    /// delivery tail runs the handler) — NOT `Ready`. `Ready` re-dispatches
+    /// `rt_sigtimedwait`, which finds nothing in the wait set and re-parks;
+    /// with the pending signal never consumed, the park spins
+    /// Ready→re-dispatch→Ready until the guest's own timeout and returns
+    /// EAGAIN, deferring the handler to that boundary. Probes
+    /// `sigtimedwaitintr` (`eintr_on_caught_nonset=false`) and `shmnestedfork`
+    /// (`test_proc_eintr=false`) hit exactly this once 784c05c9 enabled pid
+    /// namespaces for native container runs: a cross-process kill now drains
+    /// from the xsig ring into DISPATCHER pending state, which the old
+    /// Ready-first order claimed before the EINTR classifier ran (a host-slot
+    /// pending — the pre-pid-ns path — only ever reached the EINTR check).
+    /// Mirrors the HVF WaitOnSignals arm, whose Interrupted wake consults
+    /// `signal_wait_should_eintr` before any re-dispatch.
+    #[test]
+    fn native_signal_wait_classifies_nonset_caught_signal_as_interrupted() {
+        let dispatcher = SyscallDispatcher::new();
+        let tid = crate::thread::ThreadId::synthetic_for_tests(0x4e53); // "NS"
+        let usr1 = crate::linux_abi::LINUX_SIGUSR1;
+        dispatcher.mark_signal_pending(tid, usr1);
+        let wait_set = carrick_abi::SigSet::EMPTY;
+        let block_mask = carrick_abi::SigBlockMask::for_signal_wait(
+            wait_set,
+            dispatcher.signal_mask_for(tid),
+            dispatcher.wait_ignored_disposition_mask(),
+        );
+        assert_eq!(
+            native_signal_wait_pending(&dispatcher, tid, wait_set, block_mask),
+            Some(NativeSignalWaitResult::Interrupted),
+        );
+    }
+
+    /// Companion invariant: a pending signal INSIDE the wait set (in
+    /// dispatcher-owned state — e.g. drained from the xsig ring) still
+    /// classifies as `Ready`, so the re-dispatch dequeues and returns it as
+    /// the signum. Guards the reorder that fixed the test above.
+    #[test]
+    fn native_signal_wait_classifies_wait_set_dispatch_pending_as_ready() {
+        let dispatcher = SyscallDispatcher::new();
+        let tid = crate::thread::ThreadId::synthetic_for_tests(0x4e54);
+        let usr1 = crate::linux_abi::LINUX_SIGUSR1;
+        dispatcher.mark_signal_pending(tid, usr1);
+        let wait_set = carrick_abi::SigSet::EMPTY.with(usr1);
+        let block_mask = carrick_abi::SigBlockMask::for_signal_wait(
+            wait_set,
+            dispatcher.signal_mask_for(tid),
+            dispatcher.wait_ignored_disposition_mask(),
+        );
+        assert_eq!(
+            native_signal_wait_pending(&dispatcher, tid, wait_set, block_mask),
+            Some(NativeSignalWaitResult::Ready),
+        );
     }
 
     /// Linux delivers EVERY deliverable pending signal before returning to the
