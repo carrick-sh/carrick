@@ -25,14 +25,16 @@
 //!     EINTR; with a NULL sigmask the same alarm interrupts → -1/EINTR.
 //!     (epoll_pwait01/02)
 //!
-//! Every wait is bounded to <= 100 ms so a broken delivery path turns a
-//! `true` into a `false` instead of hanging the harness.
+//! Ordinary waits are bounded to <= 100 ms; the opt-in concurrent-MOD reducer
+//! uses a 2 s bound. A broken delivery path therefore reports `false` instead
+//! of hanging the harness.
 
 use conformance_probes::{
     arm_alarm_ms, block_signal, disarm_alarm, errno, install_handler, pipe2, report, unblock_signal,
 };
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{Duration, Instant};
 
 static ALRM_HITS: AtomicU32 = AtomicU32::new(0);
 
@@ -109,6 +111,41 @@ fn case_add_zero_events_then_mod() {
             epoll_zero_events_no_fire = wait_pre == 0,
             epoll_ctl_mod_rc_zero = mod_rc == 0,
             epoll_after_mod_fires = wait_post == 1,
+        );
+        libc::close(rd);
+        libc::close(wr);
+        libc::close(epfd);
+    }
+}
+
+fn case_zero_events_concurrent_mod_wakes() {
+    unsafe {
+        let epfd = libc::epoll_create1(libc::EPOLL_CLOEXEC);
+        let (rd, wr) = pipe2();
+        let mut zero = ev(0, rd);
+        let add_rc = libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, rd, &mut zero);
+        let write_rc = libc::write(wr, b"x".as_ptr().cast(), 1);
+
+        let modifier = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            let mut readable = ev(libc::EPOLLIN as u32, rd);
+            libc::epoll_ctl(epfd, libc::EPOLL_CTL_MOD, rd, &mut readable)
+        });
+
+        let mut out = [libc::epoll_event { events: 0, u64: 0 }; 1];
+        let started = Instant::now();
+        let wait_rc = libc::epoll_wait(epfd, out.as_mut_ptr(), 1, 2_000);
+        let elapsed = started.elapsed();
+        let mod_rc = modifier.join().unwrap_or(-1);
+
+        report!(
+            epoll_zero_concurrent_setup_ok = epfd >= 0 && add_rc == 0 && write_rc == 1,
+            epoll_zero_concurrent_mod_ok = mod_rc == 0,
+            epoll_zero_concurrent_wait_woke = wait_rc == 1,
+            epoll_zero_concurrent_event_in =
+                wait_rc == 1 && out[0].events & libc::EPOLLIN as u32 != 0,
+            epoll_zero_concurrent_woke_before_timeout =
+                wait_rc == 1 && elapsed < Duration::from_millis(1_500),
         );
         libc::close(rd);
         libc::close(wr);
@@ -243,6 +280,15 @@ fn case_pwait_null_sigmask_alarm_eintrs() {
 }
 
 fn main() {
+    if let Some(case) = std::env::args().nth(1) {
+        if case == "zero-concurrent-mod" {
+            case_zero_events_concurrent_mod_wakes();
+        } else {
+            report!(epoll_case_known = false);
+        }
+        return;
+    }
+
     case_create_and_exclusive_add();
     case_double_add_eexist();
     case_add_zero_events_then_mod();

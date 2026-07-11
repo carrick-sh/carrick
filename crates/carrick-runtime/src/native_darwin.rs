@@ -1807,6 +1807,7 @@ fn dispatch_native_syscall(
     trace_syscalls: bool,
 ) -> Result<DispatchOutcome, RuntimeError> {
     let mut signal_wait_deadline = None;
+    let mut fd_wait_deadline = None;
     loop {
         let outcome = {
             let mut memory = memory.lock();
@@ -1835,35 +1836,66 @@ fn dispatch_native_syscall(
                 timeout,
                 on_timeout,
                 sig_mask,
+            } => {
+                let Some(timeout) =
+                    remaining_native_wait_timeout(timeout, &mut fd_wait_deadline, Instant::now())
+                else {
+                    return Ok(DispatchOutcome::Returned { value: on_timeout });
+                };
+                match wait_native_fds(dispatcher, thread_runtime, &fds, timeout, sig_mask) {
+                    Ok(NativeWaitResult::Ready) => continue,
+                    Ok(NativeWaitResult::TimedOut) => {
+                        return Ok(DispatchOutcome::Returned { value: on_timeout });
+                    }
+                    Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+                }
             }
-            | DispatchOutcome::WaitOnPollFds {
+            DispatchOutcome::WaitOnPollFds {
                 fds,
                 timeout,
                 on_timeout,
                 sig_mask,
-            } => match wait_native_fds(dispatcher, thread_runtime, &fds, timeout, sig_mask) {
-                Ok(NativeWaitResult::Ready) => continue,
-                Ok(NativeWaitResult::TimedOut) => {
+            } => {
+                let Some(timeout) =
+                    remaining_native_wait_timeout(timeout, &mut fd_wait_deadline, Instant::now())
+                else {
                     return Ok(DispatchOutcome::Returned { value: on_timeout });
+                };
+                match wait_native_poll_fds(dispatcher, thread_runtime, &fds, timeout, sig_mask) {
+                    Ok(NativeWaitResult::Ready) => continue,
+                    Ok(NativeWaitResult::TimedOut) => {
+                        return Ok(DispatchOutcome::Returned { value: on_timeout });
+                    }
+                    Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
                 }
-                Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
-            },
+            }
             DispatchOutcome::WaitOnFdsSelect {
                 fds,
                 timeout,
                 sig_mask,
                 clear_on_timeout,
-            } => match wait_native_fds(dispatcher, thread_runtime, &fds, timeout, sig_mask) {
-                Ok(NativeWaitResult::Ready) => continue,
-                Ok(NativeWaitResult::TimedOut) => {
+            } => {
+                let Some(timeout) =
+                    remaining_native_wait_timeout(timeout, &mut fd_wait_deadline, Instant::now())
+                else {
                     let mut memory = memory.lock();
                     for (addr, len) in &clear_on_timeout {
                         let _ = memory.zero_guest_range(*addr, *len);
                     }
                     return Ok(DispatchOutcome::Returned { value: 0 });
+                };
+                match wait_native_fds(dispatcher, thread_runtime, &fds, timeout, sig_mask) {
+                    Ok(NativeWaitResult::Ready) => continue,
+                    Ok(NativeWaitResult::TimedOut) => {
+                        let mut memory = memory.lock();
+                        for (addr, len) in &clear_on_timeout {
+                            let _ = memory.zero_guest_range(*addr, *len);
+                        }
+                        return Ok(DispatchOutcome::Returned { value: 0 });
+                    }
+                    Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
                 }
-                Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
-            },
+            }
             DispatchOutcome::WaitOnSignals {
                 wait_set,
                 block_mask,
@@ -2053,6 +2085,26 @@ fn dispatch_native_syscall(
     }
 }
 
+/// Preserve one guest deadline across internal readiness re-dispatches, even
+/// when an fd lifecycle change switches between poll-backed and empty-fd waits.
+/// The outer `Option` is `None` only when the deadline has expired.
+fn remaining_native_wait_timeout(
+    timeout: Option<Duration>,
+    deadline: &mut Option<Instant>,
+    now: Instant,
+) -> Option<Option<Duration>> {
+    match timeout {
+        Some(duration) => {
+            let deadline = *deadline.get_or_insert(now + duration);
+            (now < deadline).then_some(Some(deadline.saturating_duration_since(now)))
+        }
+        None => {
+            *deadline = None;
+            Some(None)
+        }
+    }
+}
+
 fn wait_native_futex(
     dispatcher: &SyscallDispatcher,
     thread_runtime: &NativeThreadRuntime,
@@ -2198,6 +2250,32 @@ fn wait_native_fds(
         .wait_with_dispatch_pending(fds, timeout, block_mask, || {
             native_wait_should_interrupt(dispatcher, tid, sig_mask)
         });
+    drop(wait_state);
+    match result {
+        crate::io_wait::WaitResult::Ready => Ok(NativeWaitResult::Ready),
+        crate::io_wait::WaitResult::TimedOut => Ok(NativeWaitResult::TimedOut),
+        crate::io_wait::WaitResult::Interrupted => Err(crate::linux_abi::LINUX_EINTR),
+        crate::io_wait::WaitResult::Errno(errno) => Err(errno),
+    }
+}
+
+fn wait_native_poll_fds(
+    dispatcher: &SyscallDispatcher,
+    thread_runtime: &NativeThreadRuntime,
+    fds: &[crate::io_wait::WaitFd],
+    timeout: Option<Duration>,
+    sig_mask: carrick_abi::WaitSigMask,
+) -> Result<NativeWaitResult, crate::linux_abi::LinuxErrno> {
+    let tid = thread_runtime.tid();
+    let block_mask = native_wait_block_mask(dispatcher, tid, sig_mask);
+    let wait_state = NativeWaitState::new(thread_runtime);
+    wait_state.enroll();
+    let result =
+        thread_runtime
+            .waiter
+            .wait_poll_with_dispatch_pending(fds, timeout, block_mask, || {
+                native_wait_should_interrupt(dispatcher, tid, sig_mask)
+            });
     drop(wait_state);
     match result {
         crate::io_wait::WaitResult::Ready => Ok(NativeWaitResult::Ready),
@@ -5507,6 +5585,31 @@ fn last_io_error(context: &str) -> RuntimeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_fd_wait_deadline_survives_wait_variant_changes() {
+        let now = Instant::now();
+        let existing = now + Duration::from_secs(10);
+        let mut deadline = Some(existing);
+        let remaining =
+            remaining_native_wait_timeout(Some(Duration::from_secs(30)), &mut deadline, now)
+                .flatten()
+                .expect("existing deadline remains live");
+        assert_eq!(deadline, Some(existing));
+        assert_eq!(remaining, Duration::from_secs(10));
+
+        deadline = Some(now - Duration::from_millis(1));
+        assert_eq!(
+            remaining_native_wait_timeout(Some(Duration::from_secs(10)), &mut deadline, now),
+            None
+        );
+
+        assert_eq!(
+            remaining_native_wait_timeout(None, &mut deadline, now),
+            Some(None)
+        );
+        assert_eq!(deadline, None);
+    }
 
     fn synthetic_dynamic_elf(interpreter: Option<&[u8]>) -> Vec<u8> {
         const ELF_HEADER_SIZE: usize = 64;

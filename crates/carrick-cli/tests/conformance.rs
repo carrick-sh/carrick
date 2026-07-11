@@ -2561,7 +2561,22 @@ fn ensure_native_smoke_probe() -> PathBuf {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn ensure_native_static_pie_probe(name: &str) -> PathBuf {
     let probe = probe_campaign_dir("aarch64-unknown-linux-musl", Some("native")).join(name);
-    if !probe.exists() {
+    let probe_mtime = probe.metadata().and_then(|m| m.modified()).ok();
+    let inputs = [
+        repo_path(&format!("conformance-probes/src/bin/{name}.rs")),
+        repo_path("conformance-probes/src/lib.rs"),
+        repo_path("conformance-probes/Cargo.toml"),
+        repo_path("conformance-probes/Cargo.lock"),
+    ];
+    let is_fresh = probe_mtime.is_some_and(|probe_mtime| {
+        inputs.iter().all(|input| {
+            input
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .is_ok_and(|input_mtime| input_mtime <= probe_mtime)
+        })
+    });
+    if !is_fresh {
         let status = Command::new(repo_path("scripts/build-probes.sh"))
             .current_dir(repo_root())
             .arg("--native-pie")
@@ -3692,6 +3707,32 @@ fn native_conformance_memory_probes_use_selected_page_size() {
             "{profile} mlock2 did not use the selected Linux page size:\n{mlock_output}"
         );
     }
+}
+
+#[test]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn native16k_epoll_zero_interest_mod_wakes_waiter() {
+    let _serial = CONFORMANCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let Some(bin) = carrick_bin() else {
+        eprintln!(
+            "SKIP native16k_epoll_zero_interest_mod_wakes_waiter: target/release/carrick not built"
+        );
+        return;
+    };
+    ensure_signed(&bin);
+    let probe = ensure_native_static_pie_probe("epollexclusive");
+    let output = run_native_run_elf_with_args(&bin, &probe, "native16k", &["zero-concurrent-mod"]);
+
+    assert!(
+        output.contains("status=exit status: 0")
+            && output.contains("epoll_zero_concurrent_setup_ok=true")
+            && output.contains("epoll_zero_concurrent_mod_ok=true")
+            && output.contains("epoll_zero_concurrent_wait_woke=true")
+            && output.contains("epoll_zero_concurrent_event_in=true")
+            && output.contains("epoll_zero_concurrent_woke_before_timeout=true"),
+        "native16k zero-interest epoll wait did not wake after concurrent MOD:\n{output}"
+    );
 }
 
 #[test]
