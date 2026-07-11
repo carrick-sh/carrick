@@ -1435,17 +1435,6 @@ fn epoll_timed_wait_blocks_after_edge_event_was_already_reported() {
             assert_eq!(on_timeout, 0);
             assert_eq!(sig_mask.raw_block_bits(), 0);
         }
-        DispatchOutcome::WaitOnFds {
-            fds,
-            timeout,
-            on_timeout,
-            sig_mask,
-        } => {
-            assert!(fds.is_empty());
-            assert_eq!(timeout, Some(std::time::Duration::from_millis(25)));
-            assert_eq!(on_timeout, 0);
-            assert_eq!(sig_mask.raw_block_bits(), 0);
-        }
         other => panic!("expected timed epoll wait handoff, got {other:?}"),
     }
 
