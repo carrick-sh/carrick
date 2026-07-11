@@ -9,18 +9,36 @@
 //!
 //! Deterministic only: NEVER print addresses or varying sizes. Print booleans,
 //! read-back contents, rc, or errno. Each fallible call yields `=ERR:<errno>`
-//! on failure. Patterns assume a 4096-byte page (both carrick and ubuntu-arm64).
+//! on failure. Patterns are built in RUNTIME-page units (sysconf), not a
+//! hardcoded 4096, so every assertion holds by construction on 4K Docker
+//! arm64 AND on a 16 KiB-page kernel (carrick native16k, real 16K Linux).
 
 use std::ffi::CString;
 
-const PAGE: usize = 4096;
+/// The RUNTIME page size, cached. A hardcoded 4096 made section A2
+/// geometry-dependent: on a 16 KiB-page kernel the kernel rounds mremap sizes
+/// to page granularity, so grow-4096-to-8192 within one 16K page is a no-op
+/// success, not the ENOMEM the 4K layout produces. Building every pattern in
+/// runtime-page units keeps each assertion's meaning identical on both
+/// geometries. Falls back to 4096 only if sysconf fails — `pagesize_sane`
+/// has already reported that divergence by then.
+fn page() -> usize {
+    static PAGE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *PAGE.get_or_init(|| {
+        let ps = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if ps > 0 { ps as usize } else { 4096 }
+    })
+}
 
 fn main() {
-    // Sanity: confirm the runtime page size is 4096 (we never print the raw
-    // value, only whether the pattern assumption holds).
+    // Sanity: the page size must be a power of two and agree with the
+    // AT_PAGESZ auxv entry (we never print the raw value, only whether the
+    // geometry is self-consistent — the line is identical on 4K and 16K).
     {
         let ps = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-        println!("pagesize_is_4096={}", ps == 4096);
+        let auxv = unsafe { libc::getauxval(libc::AT_PAGESZ) };
+        let sane = ps > 0 && (ps as u64).is_power_of_two() && ps as u64 == auxv;
+        println!("pagesize_sane={sane}");
     }
 
     section_a_mremap_grow();
@@ -39,7 +57,7 @@ fn main() {
 // Then growing page 0 WITH MREMAP_MAYMOVE succeeds, preserving its byte.
 // ---------------------------------------------------------------------------
 fn section_a2_mremap_nomaymove() {
-    let base = mmap_anon(PAGE * 3);
+    let base = mmap_anon(page() * 3);
     if base.is_null() {
         println!("a2_mmap_base=ERR:{}", errno());
         return;
@@ -47,7 +65,7 @@ fn section_a2_mremap_nomaymove() {
     fill_page(base, 0, 0xC1);
 
     // Grow page 0 (1 page) to 2 pages WITHOUT MAYMOVE → blocked by page 1 → ENOMEM.
-    let r = unsafe { libc::mremap(base, PAGE, PAGE * 2, 0) };
+    let r = unsafe { libc::mremap(base, page(), page() * 2, 0) };
     println!(
         "a2_grow_nomaymove_enomem={}",
         r == libc::MAP_FAILED && errno() == libc::ENOMEM
@@ -55,23 +73,23 @@ fn section_a2_mremap_nomaymove() {
 
     // Grow page 0 WITH MAYMOVE → succeeds and preserves the original byte. The
     // kernel may relocate, so use the returned pointer for the read-back.
-    let np = unsafe { libc::mremap(base, PAGE, PAGE * 2, libc::MREMAP_MAYMOVE) };
+    let np = unsafe { libc::mremap(base, page(), page() * 2, libc::MREMAP_MAYMOVE) };
     if np == libc::MAP_FAILED {
         println!("a2_grow_maymove=ERR:{}", errno());
         // base+page1,page2 still mapped; release them.
         unsafe {
-            libc::munmap((base as *mut u8).add(PAGE) as *mut _, PAGE * 2);
+            libc::munmap((base as *mut u8).add(page()) as *mut _, page() * 2);
         }
     } else {
-        println!("a2_grow_maymove_success={}", true);
+        println!("a2_grow_maymove_success=true");
         println!(
             "a2_grow_maymove_preserved={}",
             page_first_last_eq(np, 0, 0xC1)
         );
         unsafe {
-            libc::munmap(np, PAGE * 2);
+            libc::munmap(np, page() * 2);
             // page1 & page2 of the original region are untouched by the move.
-            libc::munmap((base as *mut u8).add(PAGE) as *mut _, PAGE * 2);
+            libc::munmap((base as *mut u8).add(page()) as *mut _, page() * 2);
         }
     }
 }
@@ -81,7 +99,7 @@ fn section_a2_mremap_nomaymove() {
 // ---------------------------------------------------------------------------
 fn section_a_mremap_grow() {
     // mmap anonymous RW, 2 pages. Fill page i entirely with byte (0xA0 + i).
-    let p = mmap_anon(PAGE * 2);
+    let p = mmap_anon(page() * 2);
     if p.is_null() {
         println!("a_mmap_2page=ERR:{}", errno());
         return;
@@ -90,7 +108,7 @@ fn section_a_mremap_grow() {
     fill_page(p, 1, 0xA1);
 
     // mremap to 8 pages (MREMAP_MAYMOVE).
-    let np = unsafe { libc::mremap(p, PAGE * 2, PAGE * 8, libc::MREMAP_MAYMOVE) };
+    let np = unsafe { libc::mremap(p, page() * 2, page() * 8, libc::MREMAP_MAYMOVE) };
     if np == libc::MAP_FAILED {
         println!("a_mremap_grow_2to8=ERR:{}", errno());
         return;
@@ -111,11 +129,11 @@ fn section_a_mremap_grow() {
     }
     println!("a_newpages_readback_ok={}", newpages_ok);
 
-    unsafe { libc::munmap(np, PAGE * 8) };
+    unsafe { libc::munmap(np, page() * 8) };
 
     // Successive grows 2->4->8->16, re-verifying the original 2 pages each time.
     {
-        let mut cur = mmap_anon(PAGE * 2);
+        let mut cur = mmap_anon(page() * 2);
         if cur.is_null() {
             println!("a_repeated_grow=ERR:{}", errno());
         } else {
@@ -127,8 +145,8 @@ fn section_a_mremap_grow() {
                 let r = unsafe {
                     libc::mremap(
                         cur,
-                        PAGE * old_pages,
-                        PAGE * new_pages,
+                        page() * old_pages,
+                        page() * new_pages,
                         libc::MREMAP_MAYMOVE,
                     )
                 };
@@ -146,14 +164,15 @@ fn section_a_mremap_grow() {
             println!("a_mremap_repeated_grow_preserved={}", all_ok);
 
             // mremap SHRINK 16 -> 2 pages.
-            let r = unsafe { libc::mremap(cur, PAGE * old_pages, PAGE * 2, libc::MREMAP_MAYMOVE) };
+            let r =
+                unsafe { libc::mremap(cur, page() * old_pages, page() * 2, libc::MREMAP_MAYMOVE) };
             if r == libc::MAP_FAILED {
                 println!("a_shrink_16to2=ERR:{}", errno());
             } else {
-                println!("a_shrink_16to2_rc_success={}", true);
+                println!("a_shrink_16to2_rc_success=true");
                 let intact = page_first_last_eq(r, 0, 0xA0) && page_first_last_eq(r, 1, 0xA1);
                 println!("a_shrink_remaining_pages_intact={}", intact);
-                unsafe { libc::munmap(r, PAGE * 2) };
+                unsafe { libc::munmap(r, page() * 2) };
             }
         }
     }
@@ -175,7 +194,7 @@ fn section_b_shared_coherence() {
         println!("b_open=ERR:{}", errno());
         return;
     }
-    if unsafe { libc::ftruncate(fd, (PAGE * 2) as libc::off_t) } != 0 {
+    if unsafe { libc::ftruncate(fd, (page() * 2) as libc::off_t) } != 0 {
         println!("b_ftruncate=ERR:{}", errno());
         unsafe { libc::close(fd) };
         return;
@@ -184,7 +203,7 @@ fn section_b_shared_coherence() {
     let map1 = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
-            PAGE * 2,
+            page() * 2,
             libc::PROT_READ | libc::PROT_WRITE,
             libc::MAP_SHARED,
             fd,
@@ -196,7 +215,7 @@ fn section_b_shared_coherence() {
         unsafe { libc::close(fd) };
         return;
     }
-    println!("b_mmap_shared_ok={}", true);
+    println!("b_mmap_shared_ok=true");
 
     // 1) Write a known 16-byte marker at offset 0 THROUGH the mapping, msync,
     //    then pread() the fd at offset 0 and compare.
@@ -204,27 +223,27 @@ fn section_b_shared_coherence() {
     unsafe {
         std::ptr::copy_nonoverlapping(marker_a.as_ptr(), map1 as *mut u8, marker_a.len());
     }
-    let _ = unsafe { libc::msync(map1, PAGE * 2, libc::MS_SYNC) };
+    let _ = unsafe { libc::msync(map1, page() * 2, libc::MS_SYNC) };
     let mut rb = [0u8; 16];
     let n = unsafe { libc::pread(fd, rb.as_mut_ptr() as *mut _, rb.len(), 0) };
     let read_eq = n == marker_a.len() as isize && rb == marker_a;
     println!("b_mmap_shared_write_visible_via_read={}", read_eq);
 
-    // 2) pwrite a different 16-byte marker at offset 4096 to the fd, then read
-    //    it THROUGH the mapping.
+    // 2) pwrite a different 16-byte marker at offset PAGE (start of page 1)
+    //    to the fd, then read it THROUGH the mapping.
     let marker_b: [u8; 16] = *b"MARKER_B__abcdef";
     let wn = unsafe {
         libc::pwrite(
             fd,
             marker_b.as_ptr() as *const _,
             marker_b.len(),
-            PAGE as libc::off_t,
+            page() as libc::off_t,
         )
     };
     let mut via_map = [0u8; 16];
     unsafe {
         std::ptr::copy_nonoverlapping(
-            (map1 as *const u8).add(PAGE),
+            (map1 as *const u8).add(page()),
             via_map.as_mut_ptr(),
             via_map.len(),
         );
@@ -240,7 +259,7 @@ fn section_b_shared_coherence() {
         let map2 = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
-                PAGE * 2,
+                page() * 2,
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_SHARED,
                 fd2,
@@ -256,13 +275,13 @@ fn section_b_shared_coherence() {
             }
             // No msync required for shared-mapping coherence between two
             // mappings of the same file on Linux, but issue one to be safe.
-            let _ = unsafe { libc::msync(map1, PAGE * 2, libc::MS_SYNC) };
+            let _ = unsafe { libc::msync(map1, page() * 2, libc::MS_SYNC) };
             let mut via2 = [0u8; 16];
             unsafe {
                 std::ptr::copy_nonoverlapping(map2 as *const u8, via2.as_mut_ptr(), via2.len());
             }
             println!("b_two_shared_maps_coherent={}", via2 == marker_c);
-            unsafe { libc::munmap(map2, PAGE * 2) };
+            unsafe { libc::munmap(map2, page() * 2) };
         }
         unsafe { libc::close(fd2) };
     }
@@ -288,7 +307,7 @@ fn section_b_shared_coherence() {
     );
 
     unsafe {
-        libc::munmap(map1, PAGE * 2);
+        libc::munmap(map1, page() * 2);
     }
 
     let mut rb_after_unmap = [0u8; 16];
@@ -329,7 +348,7 @@ fn section_c_edges() {
         } else {
             // Should not happen on Linux; report so the diff catches it.
             println!("c_mmap_len0=UNEXPECTED_OK");
-            unsafe { libc::munmap(p, PAGE) };
+            unsafe { libc::munmap(p, page()) };
         }
     }
 
@@ -340,7 +359,7 @@ fn section_c_edges() {
         let p = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
-                PAGE,
+                page(),
                 libc::PROT_NONE,
                 libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
                 -1,
@@ -350,20 +369,20 @@ fn section_c_edges() {
         if p == libc::MAP_FAILED {
             println!("c_mmap_protnone=ERR:{}", errno());
         } else {
-            let rc = unsafe { libc::mprotect(p, PAGE, libc::PROT_READ | libc::PROT_WRITE) };
+            let rc = unsafe { libc::mprotect(p, page(), libc::PROT_READ | libc::PROT_WRITE) };
             if rc != 0 {
                 println!("c_mprotect_rw=ERR:{}", errno());
             } else {
-                println!("c_mprotect_rw_rc_success={}", true);
+                println!("c_mprotect_rw_rc_success=true");
                 let b = p as *mut u8;
                 unsafe {
                     *b = 0x7e;
-                    *b.add(PAGE - 1) = 0x7f;
+                    *b.add(page() - 1) = 0x7f;
                 }
-                let ok = unsafe { *b == 0x7e && *b.add(PAGE - 1) == 0x7f };
+                let ok = unsafe { *b == 0x7e && *b.add(page() - 1) == 0x7f };
                 println!("c_protnone_then_rw_readback_ok={}", ok);
             }
-            unsafe { libc::munmap(p, PAGE) };
+            unsafe { libc::munmap(p, page()) };
         }
     }
 }
@@ -393,16 +412,16 @@ fn mmap_anon(len: usize) -> *mut libc::c_void {
 
 /// Fill page `idx` of mapping `base` entirely with `byte`.
 fn fill_page(base: *mut libc::c_void, idx: usize, byte: u8) {
-    let p = unsafe { (base as *mut u8).add(idx * PAGE) };
+    let p = unsafe { (base as *mut u8).add(idx * page()) };
     unsafe {
-        std::ptr::write_bytes(p, byte, PAGE);
+        std::ptr::write_bytes(p, byte, page());
     }
 }
 
 /// True iff the first AND last byte of page `idx` equal `byte`.
 fn page_first_last_eq(base: *mut libc::c_void, idx: usize, byte: u8) -> bool {
-    let p = unsafe { (base as *const u8).add(idx * PAGE) };
-    unsafe { *p == byte && *p.add(PAGE - 1) == byte }
+    let p = unsafe { (base as *const u8).add(idx * page()) };
+    unsafe { *p == byte && *p.add(page() - 1) == byte }
 }
 
 /// Open helper returning the raw fd (or -1 on error).
