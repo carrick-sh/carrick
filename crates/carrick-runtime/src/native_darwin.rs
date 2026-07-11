@@ -254,6 +254,99 @@ impl carrick_hal::VcpuKick for NativeKickHandle {
     }
 }
 
+/// The CURRENT native run loop's vCPU kick registry. Process-global so timer
+/// fallback threads — whose `NativeTimerDelivery` handle is registered once in
+/// the `timer_delivery` OnceLock and inherited across fork — always kick the
+/// LIVE registry: `NativeThreadRuntime::new_current` installs it at boot and
+/// again in a fork child (`reset_after_fork_child`).
+static NATIVE_PROCESS_KICKER: parking_lot::Mutex<Option<Arc<carrick_hal::GenericVcpuRegistry>>> =
+    parking_lot::Mutex::new(None);
+
+fn kick_all_native_guest_threads() {
+    let kicker = NATIVE_PROCESS_KICKER.lock().clone();
+    if let Some(kicker) = kicker {
+        use carrick_hal::VcpuRegistry as _;
+        kicker.kick_all();
+    }
+}
+
+/// Deliver a process-directed timer signal to a native guest: publish into the
+/// shared pending mask, then kick every native guest thread so the run loop's
+/// kick path (`resume_guest_after_kick` → `deliver_pending_signal`) injects it.
+/// The HVF fallback publishes only — its pump kqueue re-kicks busy vCPUs — but
+/// native has no pump, and a spinning guest that never traps (vDSO clock reads
+/// satisfy its spin loop in userspace) would otherwise never observe the
+/// signal.
+fn deliver_native_process_signal(signum: i32) {
+    crate::host_signal::publish_process_signal(signum);
+    kick_all_native_guest_threads();
+}
+
+/// Native `TimerDelivery`: there is no signal-pump kqueue, so every interval
+/// timer runs the SHARED timer-core timing loop on a fallback thread —
+/// wall-clock sleeps for `ITIMER_REAL`, guest-CPU polling against the native
+/// Darwin CPU provider for `ITIMER_VIRTUAL`/`ITIMER_PROF` — whose fire action
+/// is publish + kick-all. POSIX per-process timers mirror the KVM/bhyve/NVMM
+/// fallback shape with the same native fire action. Stateless: the kicker is
+/// resolved at fire time from `NATIVE_PROCESS_KICKER`.
+struct NativeTimerDelivery;
+
+impl carrick_hal::TimerDelivery for NativeTimerDelivery {
+    fn arm_itimer(
+        &self,
+        which: usize,
+        spec: carrick_hal::TimerSpecNs,
+        _needs_periodic: bool,
+        signum: i32,
+    ) -> bool {
+        // The dispatch arm wrote the neutral slot (itimer::arm) immediately
+        // before this call; its generation retires this thread on re-arm/disarm.
+        let generation = crate::itimer::generation(which);
+        let _ = thread::Builder::new()
+            .name(format!("carrick-native-itimer-{which}"))
+            .spawn(move || {
+                crate::itimer::run_fallback(which, generation, spec, || {
+                    crate::probes::itimer_fire(signum, 1);
+                    deliver_native_process_signal(signum);
+                });
+            });
+        true
+    }
+
+    fn disarm_itimer(&self, which: usize) {
+        crate::itimer::disarm(which);
+    }
+
+    fn arm_posix(
+        &self,
+        id: i32,
+        spec: carrick_hal::TimerSpecNs,
+    ) -> Option<carrick_hal::PosixTimerSpec> {
+        let armed = carrick_timer_core::posix::arm(id, spec)?;
+        if spec.value > 0 {
+            let signum = armed.signum;
+            let generation = armed.generation;
+            let slot = armed.slot.clone();
+            let _ = thread::Builder::new()
+                .name(format!("carrick-native-ptimer-{id}"))
+                .spawn(move || {
+                    carrick_timer_core::posix::run_fallback(slot, generation, spec, move || {
+                        deliver_native_process_signal(signum);
+                    });
+                });
+        }
+        Some(armed.old)
+    }
+
+    fn disarm_posix(&self, id: i32) {
+        let _ = carrick_timer_core::posix::arm(id, carrick_hal::TimerSpecNs::DISARM);
+    }
+
+    fn current_arm(&self, which: usize) -> Option<carrick_hal::TimerArm> {
+        crate::itimer::current_arm(which)
+    }
+}
+
 unsafe extern "C" {
     fn carrick_native_install_trap_handler() -> libc::c_int;
     #[cfg(test)]
@@ -706,6 +799,11 @@ fn run_image_in_current_process(
     let plan = Arc::new(plan.clone());
     let mut thread_runtime = NativeThreadRuntime::new_current();
     thread_runtime.prepare_kick_target()?;
+    // Timer-signal delivery (setitimer/timer_settime): publish + kick-all via
+    // the native kick registry. Must be registered before the guest's first
+    // setitimer; the OnceLock handle is inherited by forked children and
+    // resolves the CURRENT process's kicker at fire time.
+    crate::timer_delivery::register_delivery(Arc::new(NativeTimerDelivery));
     match run_native_thread_loop(
         dispatcher,
         memory,
@@ -1431,6 +1529,10 @@ impl NativeThreadRuntime {
         let platform_futex = Arc::new(crate::threaded_impl::hvf_futex(Arc::clone(&futex)))
             as Arc<dyn carrick_hal::PlatformFutex>;
         let kicker = Arc::new(carrick_hal::GenericVcpuRegistry::new());
+        // Publish the fresh registry as THE process kicker (boot and fork-child
+        // reset both come through here) so timer fallback threads kick the
+        // live guest threads, never a stale pre-fork registry.
+        *NATIVE_PROCESS_KICKER.lock() = Some(Arc::clone(&kicker));
         let runtime = Self {
             tid,
             registry,
