@@ -2892,12 +2892,10 @@ impl SyscallDispatcher {
             // `kq_drained_all_filtered` tracks the corner case where the kqueue
             // had readiness events but the user's interest mask filters them
             // all out (e.g. `epoll_ctl(ADD, fd, events=0)` plus data on the
-            // pipe — the read filter still fires because Linux must surface
-            // EPOLLHUP/EPOLLERR, but no event bit matches). Without this flag
-            // we'd return `WaitOnPollFds` and the runtime would re-poll the
-            // already-readable kq_fd, re-dispatch, and tight-loop until the
-            // harness deadline. Detect it once here and switch to an empty
-            // `WaitOnFds` (signal-pipe-and-timeout-only) below.
+            // pipe). The poll-backed wait below uses an empty event mask and a
+            // short retry slice: it avoids re-polling kq_fd as immediately
+            // readable while still re-dispatching for a concurrent MOD/HUP and
+            // preserving the guest deadline.
             let mut kq_drained_all_filtered = false;
             {
                 // Non-blocking drain of the multiplexer for host-backed fds.
@@ -3057,12 +3055,15 @@ impl SyscallDispatcher {
                                 if clear_write_backpressure {
                                     ready_events |= raw & LINUX_EPOLLOUT;
                                 }
+                                let edge_filtered_by_interest =
+                                    edge_bits & (requested | LINUX_EPOLLHUP | LINUX_EPOLLERR) == 0;
                                 let read_avail_update = if raw & READ_READY_BITS == 0 {
                                     Some(0)
                                 } else {
                                     Some(observed_read_avail)
                                 };
-                                let masked_ready = ready_events == 0 && raw != 0;
+                                let masked_ready =
+                                    ready_events == 0 && (raw != 0 || edge_filtered_by_interest);
                                 ready_updates.push((
                                     gfd,
                                     reg_gen,
@@ -3106,7 +3107,9 @@ impl SyscallDispatcher {
                                 }
                                 if ready_events != 0 {
                                     acc.entry(gfd).or_insert((0, data)).0 |= ready_events;
-                                } else if raw != 0 && requested & LINUX_EPOLLET == 0 {
+                                } else if requested & LINUX_EPOLLET == 0
+                                    && (raw != 0 || edge_filtered_by_interest)
+                                {
                                     filtered_ready_events += 1;
                                 }
                             }
@@ -3419,11 +3422,10 @@ impl SyscallDispatcher {
                 };
                 if kq_drained_all_filtered {
                     // The instance kqueue is readable, but every drained event
-                    // was masked by the guest interest. Polling kq_fd for
-                    // POLLIN would wake immediately and spin; polling the same
-                    // valid fd with an empty event mask uses the WaitOnPollFds
-                    // backstop as an interruptible retry sleep while preserving
-                    // the guest deadline.
+                    // was masked by the guest interest. Poll kq_fd with an
+                    // empty event mask: the poll-backed wait uses a short
+                    // backstop to re-dispatch without spinning, while still
+                    // observing a concurrent epoll_ctl MOD or a later HUP/ERR.
                     crate::probes::epoll_result(epfd, 0, 1, timeout_ms, 2);
                     crate::event_ring::rec(crate::event_ring::EPWFD, kq_fd, 0, timeout_ms);
                     return Ok(DispatchOutcome::WaitOnPollFds {
