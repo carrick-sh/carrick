@@ -229,27 +229,45 @@ mod imp {
         }
     }
 
-    /// An exiting waiter settles ONE accounting unit: the credit its waker
-    /// pre-paid (`note_logical_dequeues`) when present, else its own `count`
-    /// entry. A no-credit exit that was nonetheless WOKEN left the queue on
-    /// its own (the ≤20 ms slice loop's value re-check, or an os_sync
-    /// at-entry value mismatch) — on Linux that waiter would STAY QUEUED
-    /// until a FUTEX_WAKE dequeued (and counted) it, so its unit moves to
-    /// the claimable `self_woken` pool for the next wake's count instead of
-    /// vanishing (probe futexforkrequeue under load: the guest stores
-    /// word0=1, a waiter self-wakes on the re-check before the guest's
-    /// FUTEX_WAKE lands, and the wake reported 199 of Linux's exact 200). A
-    /// timeout/EINTR exit left the queue on Linux too, so its unit is
-    /// dropped. A racing waiter that self-settled before its waker's
-    /// transfer landed leaves `count` transiently low plus one stale credit,
-    /// which the NEXT exit consumes — bounded and self-repairing, unlike the
-    /// unbounded reschedule-latency lag of pure self-accounting.
+    /// An exiting waiter settles ONE accounting unit, with the LOOKUP ORDER
+    /// keyed by how the wait ended:
+    ///
+    /// * `woken` — prefer the credit its waker pre-paid
+    ///   (`note_logical_dequeues`); a no-credit woken exit left the queue on
+    ///   its own (the ≤20 ms slice loop's value re-check, or an os_sync
+    ///   at-entry value mismatch) — on Linux that waiter would STAY QUEUED
+    ///   until a FUTEX_WAKE dequeued (and counted) it, so its unit moves to
+    ///   the claimable `self_woken` pool instead of vanishing (probe
+    ///   futexforkrequeue under load: the guest stores word0=1, a waiter
+    ///   self-wakes on the re-check before the guest's FUTEX_WAKE lands, and
+    ///   the wake reported 199 of Linux's exact 200).
+    /// * timeout/EINTR — settle its OWN `count` entry FIRST and only fall
+    ///   back to a credit when a waker over-claimed it (physically woken but
+    ///   EINTR-classified, or a wake(all) over-claim). Credit-first here let
+    ///   an EINTR'd waiter ABSORB a woken peer's credit: the peer then
+    ///   consumed the last count unit and minted a PHANTOM `self_woken` unit
+    ///   representing nobody, which the next wake claimed ahead of a real
+    ///   parked waiter — a lost wake, unrecoverable when the waker legally
+    ///   wakes without changing the word. Regression:
+    ///   `eintr_exit_does_not_absorb_woken_peer_credit`. The count-first
+    ///   fallback's own worst case (consuming a parked peer's count unit
+    ///   while our credit lingers) is a bounded TRANSIENT: the peer's exit
+    ///   consumes the leftover credit, and no persistent phantom exists.
+    ///
+    /// A racing waiter that self-settled before its waker's transfer landed
+    /// leaves `count` transiently low plus one stale credit, which the NEXT
+    /// exit consumes — bounded and self-repairing, unlike the unbounded
+    /// reschedule-latency lag of pure self-accounting.
     fn settle_waiter_exit(slot: &WaiterSlot, woken: bool) {
-        if consume_one(&slot.wake_credits) {
-            return;
-        }
-        if consume_one(&slot.count) && woken {
-            slot.self_woken.fetch_add(1, Ordering::AcqRel);
+        if woken {
+            if consume_one(&slot.wake_credits) {
+                return;
+            }
+            if consume_one(&slot.count) {
+                slot.self_woken.fetch_add(1, Ordering::AcqRel);
+            }
+        } else if !consume_one(&slot.count) {
+            let _ = consume_one(&slot.wake_credits);
         }
     }
 
@@ -716,6 +734,40 @@ mod tests {
             wake_counted(addr, addr, u32::MAX),
             0,
             "a timed-out waiter must not be counted by a later wake"
+        );
+    }
+
+    /// A timeout/EINTR exit must NOT absorb a woken peer's credit. With two
+    /// waiters and one wake claimed (count 2→1, credits 1), an EINTR'd waiter
+    /// exiting FIRST used to settle credit-first: it consumed the woken
+    /// peer's credit, the peer then found no credit, consumed the last count
+    /// unit, and — being woken — minted a PHANTOM self_woken unit
+    /// representing nobody. The next wake claimed the phantom ahead of any
+    /// real parked waiter (a lost wake: recovery only via the ≤20 ms value
+    /// re-check, and never if the waker legally wakes without changing the
+    /// word). A `woken=false` exit settles its OWN count entry first and only
+    /// falls back to a credit when a waker over-claimed it.
+    #[test]
+    fn eintr_exit_does_not_absorb_woken_peer_credit() {
+        use super::{waiter_enter, waiter_exit, wake_counted};
+        static WORD4: AtomicU32 = AtomicU32::new(0);
+        let addr = &WORD4 as *const AtomicU32 as usize;
+
+        // Two registered waiters; the waker logically claims one
+        // (count 2→1, credits 1). No kernel parks needed: the claim is
+        // logical and the os_sync hints are best-effort.
+        waiter_enter(addr);
+        waiter_enter(addr);
+        assert_eq!(wake_counted(addr, addr, 1), 1);
+        // The EINTR'd (unclaimed) waiter exits FIRST...
+        waiter_exit(addr, false);
+        // ...then the genuinely woken (claimed) waiter exits.
+        waiter_exit(addr, true);
+        // Queue is empty and fully settled: no phantom may remain claimable.
+        assert_eq!(
+            wake_counted(addr, addr, u32::MAX),
+            0,
+            "EINTR exit absorbed the woken peer's credit and minted a phantom self_woken unit"
         );
     }
 }
