@@ -363,6 +363,11 @@ mod imp {
     /// which kept `times(2)` under its 10 ms tick — probe `accounting`
     /// `times_cpu_pos=false` under the native backend, where the host value is
     /// the only CPU source). On Intel the timebase is 1/1 and this is identity.
+    // libc flags mach_timebase_info deprecated only to steer new code to the
+    // `mach2` crate; it is the canonical timebase API and this file already
+    // uses libc's mach bindings directly (see `mach_task_self_` above), so we
+    // stay consistent rather than add a dependency for one call.
+    #[allow(deprecated)]
     fn mach_ticks_to_ns(ticks: u64) -> u64 {
         static TIMEBASE: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
         let (numer, denom) = *TIMEBASE.get_or_init(|| {
