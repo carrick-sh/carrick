@@ -561,7 +561,9 @@ mod tests {
 
     #[test]
     fn exec_replacement_claim_is_exclusive_until_ended() {
-        // Serialize with any test touching the process-global exec owner.
+        // No lock needed: this is the only test in this binary that touches
+        // the process-global exec owner (the fork-quiesce stress tests use
+        // their own LOCAL barriers, never the static exec owner).
         let a = carrick_hal::ThreadId::synthetic_for_tests(701);
         let b = carrick_hal::ThreadId::synthetic_for_tests(702);
         assert!(try_begin_exec_replacement(a), "first claim wins");

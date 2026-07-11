@@ -91,6 +91,32 @@ const NATIVE_EVENT_KICK: i32 = 2;
 /// CLI, which does no such accounting. Survives execve (same host process).
 static NATIVE_FORKED_GUEST_CHILD: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// Set by the exec teardown at its success point (BEFORE it lowers the
+/// transient exec-replacement owner), never cleared for the life of the
+/// image: "a spawned thread's execve replaced (or is replacing) this
+/// process's image". A NORMALLY-exited leader consults it after its
+/// `join_spawned_threads` returns: the teardown's own join-take can empty
+/// the shared handle vec (detaching the winner's handle) while the exited
+/// leader is mid-take, and without this flag the leader fell into the
+/// unconditional "thread group ended without a process exit" diagnostic and
+/// exited the process under the running exec'd image (the lost-exec variant
+/// via a normally-exited leader). Cleared in a fork CHILD (its image was not
+/// exec-replaced; a stale flag would turn the child's diagnostic into a
+/// silent park).
+static NATIVE_IMAGE_REPLACED_BY_EXEC: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Must an EXITED leader park forever instead of surfacing the
+/// no-process-exit diagnostic? True while a sibling's execve owns the
+/// replacement (transient owner flag) or once one has committed (durable
+/// flag) — in both cases the exec'd thread owns the process and terminates
+/// it via `_exit`; the leader erroring out would kill the image.
+fn native_exited_leader_must_park(tid: crate::thread::ThreadId) -> bool {
+    NATIVE_IMAGE_REPLACED_BY_EXEC.load(std::sync::atomic::Ordering::Acquire)
+        || crate::fork_quiesce::exec_replacing_other_thread(tid)
+}
+
 const VM_INHERIT_SHARE: libc::c_int = 0;
 const VM_INHERIT_COPY: libc::c_int = 1;
 
@@ -952,6 +978,18 @@ fn run_image_in_current_process(
         NativeThreadLoopOutcome::ProcessExit(code) => Ok(code),
         NativeThreadLoopOutcome::ThreadDone => {
             thread_runtime.join_spawned_threads()?;
+            // A sibling spawned AFTER this leader exited may have execve'd,
+            // and its teardown's join-take can empty the shared handle vec
+            // out from under this join. The exec'd thread owns the process
+            // (it terminates via `_exit`); erroring out here exited the
+            // process under the running image — the lost-exec variant via a
+            // NORMALLY-exited leader. Regression:
+            // exited_leader_parks_when_image_replaced_by_exec.
+            if native_exited_leader_must_park(thread_runtime.tid()) {
+                loop {
+                    std::thread::park();
+                }
+            }
             Err(RuntimeError::Unsupported(
                 "native Darwin thread group ended without a process exit".to_string(),
             ))
@@ -3442,6 +3480,10 @@ fn handle_native_fork(
         barrier.end_fork();
         barrier.reset_paused_for_child();
         crate::fork_quiesce::end_exec_replacement();
+        // The durable image-replaced marker belongs to the PARENT's image
+        // history; inherited true it would turn this child's
+        // no-process-exit diagnostic into a silent park.
+        NATIVE_IMAGE_REPLACED_BY_EXEC.store(false, std::sync::atomic::Ordering::Release);
         if let Some((read_fd, write_fd)) = vfork_pipe {
             close_fd(read_fd);
             *vfork_completion = Some(NativeVforkCompletion { fd: write_fd });
@@ -3657,6 +3699,13 @@ fn native_terminate_siblings_for_exec(
             let _ = handle.join();
         }
     }
+    // Durable-BEFORE-transient ordering: a normally-exited leader whose
+    // join-take raced this teardown's take may check
+    // `native_exited_leader_must_park` at any point after our take — while
+    // the transient owner flag is still up it covers the check; once we
+    // lower it below, the durable flag (stored FIRST) has already taken
+    // over. No gap.
+    NATIVE_IMAGE_REPLACED_BY_EXEC.store(true, std::sync::atomic::Ordering::Release);
     crate::fork_quiesce::end_exec_replacement();
     barrier.end_fork();
     Ok(NativeExecTeardownFlow::Proceed)
@@ -7867,6 +7916,38 @@ mod tests {
         release.store(true, Ordering::SeqCst);
         handle.join().expect("join quiesce sibling");
         runtime.registry.exit(sib_tid);
+    }
+
+    /// A NORMALLY-exited leader must PARK (never surface the no-process-exit
+    /// diagnostic, which exits the process) when a sibling's execve owns or
+    /// has committed the image replacement — in either the transient window
+    /// (owner flag up) or after the teardown committed (durable flag set,
+    /// stored BEFORE the owner flag drops, so there is no gap between them).
+    #[test]
+    fn exited_leader_parks_when_image_replaced_by_exec() {
+        use std::sync::atomic::Ordering;
+
+        let _stw = STW_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let leader = crate::thread::ThreadId::synthetic_for_tests(0x717);
+        let winner = crate::thread::ThreadId::synthetic_for_tests(0x718);
+        NATIVE_IMAGE_REPLACED_BY_EXEC.store(false, Ordering::Release);
+
+        // Neither flag: the diagnostic error path stays reachable.
+        assert!(!native_exited_leader_must_park(leader));
+
+        // Transient window: a sibling owns the replacement.
+        crate::fork_quiesce::begin_exec_replacement(winner);
+        assert!(native_exited_leader_must_park(leader));
+
+        // Committed: durable set first, then the owner flag drops — the
+        // leader must still park after end_exec_replacement.
+        NATIVE_IMAGE_REPLACED_BY_EXEC.store(true, Ordering::Release);
+        crate::fork_quiesce::end_exec_replacement();
+        assert!(native_exited_leader_must_park(leader));
+
+        // Fork-child reset restores the diagnostic.
+        NATIVE_IMAGE_REPLACED_BY_EXEC.store(false, Ordering::Release);
+        assert!(!native_exited_leader_must_park(leader));
     }
 
     /// The exec-teardown nudge seam: a sibling blocked in a native private
