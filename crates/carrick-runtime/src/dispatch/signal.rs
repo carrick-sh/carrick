@@ -446,7 +446,42 @@ impl SyscallDispatcher {
             if is_rt_signal(signum) {
                 *s.rt_pending_counts.entry((tid, signum)).or_insert(0) += 1;
             }
+            self.refresh_signal_pending_hints(&s);
         }
+    }
+
+    /// Refresh the dispatcher's lock-free pending hints from the locked state
+    /// (see the field docs on [`super::SyscallDispatcher`]). MUST be called
+    /// with the `signal` lock held (the `&SignalState` argument proves it)
+    /// after EVERY mutation of `pendings` / `process_pending`, so a clear hint
+    /// always proves emptiness and the delivery cycle's lock-free fast path
+    /// can never hide a pending signal.
+    pub(super) fn refresh_signal_pending_hints(&self, s: &SignalState) {
+        let mut tids = 0u64;
+        for (tid, set) in &s.pendings {
+            if !set.is_empty() {
+                tids |= 1u64 << ((tid.raw() as u32) & 63);
+            }
+        }
+        self.signal_tid_pending_hint
+            .store(tids, std::sync::atomic::Ordering::SeqCst);
+        self.signal_process_pending_hint
+            .store(s.process_pending.raw(), std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Lock-free "may anything be pending for `tid` (or the shared process
+    /// set)?" peek over the hints. `false` PROVES emptiness (the hints are
+    /// exact mirrors maintained under the signal lock); `true` may be a
+    /// `tid % 64` collision and merely means "take the lock and look".
+    fn signal_dispatch_pending_possible(&self, tid: crate::thread::ThreadId) -> bool {
+        self.signal_tid_pending_hint
+            .load(std::sync::atomic::Ordering::SeqCst)
+            & (1u64 << ((tid.raw() as u32) & 63))
+            != 0
+            || self
+                .signal_process_pending_hint
+                .load(std::sync::atomic::Ordering::SeqCst)
+                != 0
     }
 
     /// Drop a thread's per-thread signal state (mask/pending/alt stack) when it
@@ -461,6 +496,7 @@ impl SyscallDispatcher {
         s.altstack.remove(&tid);
         s.handler_frames.remove(&tid);
         s.restore_masks.remove(&tid);
+        self.refresh_signal_pending_hints(&s);
     }
 
     /// Re-key a thread's per-thread signal state from `old` to `new` across
@@ -500,6 +536,7 @@ impl SyscallDispatcher {
         s.process_pending = SigSet::EMPTY;
         s.process_rt_pending_counts.clear();
         s.process_pending_siginfos.clear();
+        self.refresh_signal_pending_hints(&s);
     }
 
     /// Retire EVERY per-thread signal entry except `keep`'s, in a fork CHILD
@@ -523,6 +560,7 @@ impl SyscallDispatcher {
         s.altstack.retain(|t, _| *t == keep);
         s.handler_frames.retain(|t, _| *t == keep);
         s.restore_masks.retain(|t, _| *t == keep);
+        self.refresh_signal_pending_hints(&s);
     }
 
     /// Initialize a new `CLONE_THREAD` task's per-thread signal state. Linux
@@ -550,6 +588,7 @@ impl SyscallDispatcher {
         s.altstack.remove(&child);
         s.handler_frames.remove(&child);
         s.restore_masks.remove(&child);
+        self.refresh_signal_pending_hints(&s);
     }
 
     /// Reset signal dispositions across `execve(2)`, matching the kernel: every
@@ -951,8 +990,17 @@ impl SyscallDispatcher {
         &self,
         tid: crate::thread::ThreadId,
     ) -> Option<(i32, bool)> {
-        let mask = self.signal.lock().mask_for(tid);
-        self.take_pending_in_from(tid, mask.complement())
+        // Lock-free empty fast path: this runs on EVERY syscall return / kick
+        // / sigreturn delivery cycle; the hints prove emptiness without the
+        // signal lock (see `refresh_signal_pending_hints`).
+        if !self.signal_dispatch_pending_possible(tid) {
+            return None;
+        }
+        // ONE lock acquisition for mask + take (previously two: a mask read
+        // then a separate locked take).
+        let mut signal = self.signal.lock();
+        let set = signal.mask_for(tid).complement();
+        self.take_pending_in_locked(&mut signal, tid, set)
     }
 
     /// True iff dispatcher-owned signal state has a pending signal deliverable
@@ -977,6 +1025,11 @@ impl SyscallDispatcher {
         sig_mask: carrick_abi::WaitSigMask,
     ) -> bool {
         use carrick_abi::WaitSigMask;
+        // Lock-free empty fast path: an empty pending union intersects to
+        // empty under ANY mask policy (see `refresh_signal_pending_hints`).
+        if !self.signal_dispatch_pending_possible(tid) {
+            return false;
+        }
         let always_deliverable = SigSet::EMPTY.with(LINUX_SIGKILL).with(LINUX_SIGSTOP);
         let signal = self.signal.lock();
         let effective_block_mask = match sig_mask {
@@ -1078,6 +1131,19 @@ impl SyscallDispatcher {
         set: SigSet,
     ) -> Option<(i32, bool)> {
         let mut signal = self.signal.lock();
+        self.take_pending_in_locked(&mut signal, tid, set)
+    }
+
+    /// [`Self::take_pending_in_from`]'s body under an already-held `signal`
+    /// lock, so `take_deliverable_pending_from` can read the mask and take in
+    /// ONE acquisition. Every mutating exit refreshes the lock-free pending
+    /// hints (the bit may stay set — RT queue depth — or clear).
+    fn take_pending_in_locked(
+        &self,
+        signal: &mut SignalState,
+        tid: crate::thread::ThreadId,
+        set: SigSet,
+    ) -> Option<(i32, bool)> {
         let per_thread = signal.pendings.get(&tid).copied().unwrap_or(SigSet::EMPTY);
         let shared = signal.process_pending;
         let candidates = per_thread.union(shared).intersect(set);
@@ -1116,6 +1182,7 @@ impl SyscallDispatcher {
                 signal.process_rt_pending_counts.remove(&signum);
                 signal.process_pending = signal.process_pending.without(signum);
             }
+            self.refresh_signal_pending_hints(signal);
             return Some((signum, from_thread));
         }
         if from_thread {
@@ -1123,6 +1190,7 @@ impl SyscallDispatcher {
         } else {
             signal.process_pending = signal.process_pending.without(signum);
         }
+        self.refresh_signal_pending_hints(signal);
         Some((signum, from_thread))
     }
 
@@ -1191,6 +1259,7 @@ impl SyscallDispatcher {
         if sigmask_bit(signum).is_some() {
             let mut s = self.signal.lock();
             s.process_pending = s.process_pending.with(signum);
+            self.refresh_signal_pending_hints(&s);
             if is_rt_signal(signum) {
                 *s.process_rt_pending_counts.entry(signum).or_insert(0) += 1;
             }
@@ -2641,6 +2710,61 @@ mod tests {
             SigSet::from_raw(1 << 14),
             "process-level pending untouched (fork-clear is migrate's job)"
         );
+    }
+
+    /// The lock-free pending hints must never hide a pending signal from the
+    /// delivery cycle's `take_deliverable_pending_from` fast path — across
+    /// per-tid marks, shared process marks, RT queue depth (the dnotify
+    /// two-instance chain shape), drains, unblocks, and sibling retirement.
+    #[test]
+    fn pending_hints_never_hide_deliverable_signals() {
+        let d = SyscallDispatcher::new();
+        let tid = crate::thread::ThreadId::synthetic_for_tests(9001);
+        let sibling = crate::thread::ThreadId::synthetic_for_tests(9002);
+
+        // Empty state: the fast path proves emptiness.
+        assert_eq!(d.take_deliverable_pending_from(tid), None);
+
+        // Per-tid mark → deliverable through the fast path; drained → empty.
+        d.mark_signal_pending(tid, 10);
+        assert_eq!(d.take_deliverable_pending_from(tid), Some((10, true)));
+        assert_eq!(d.take_deliverable_pending_from(tid), None);
+
+        // RT double-queue (dnotify chain shape): two instances, two takes.
+        d.mark_signal_pending(tid, 34);
+        d.mark_signal_pending(tid, 34);
+        assert_eq!(d.take_deliverable_pending_from(tid), Some((34, true)));
+        assert_eq!(
+            d.take_deliverable_pending_from(tid),
+            Some((34, true)),
+            "second queued RT instance must chain (hint must stay set)"
+        );
+        assert_eq!(d.take_deliverable_pending_from(tid), None);
+
+        // Shared process-directed mark: ANY tid may take it.
+        d.mark_process_signal_pending(15);
+        assert_eq!(d.take_deliverable_pending_from(sibling), Some((15, false)));
+        assert_eq!(d.take_deliverable_pending_from(sibling), None);
+
+        // A blocked-then-unblocked signal: pending while blocked (no take),
+        // deliverable after the mask restore — no new mark bumps the hint, so
+        // a stale-clear hint would strand it forever.
+        d.restore_signal_mask(tid, SigSet::EMPTY.with(12));
+        d.mark_signal_pending(tid, 12);
+        assert_eq!(
+            d.take_deliverable_pending_from(tid),
+            None,
+            "blocked signal must stay pending"
+        );
+        d.restore_signal_mask(tid, SigSet::EMPTY);
+        assert_eq!(d.take_deliverable_pending_from(tid), Some((12, true)));
+
+        // Sibling retirement refreshes hints without dropping the keeper's.
+        d.mark_signal_pending(tid, 10);
+        d.mark_signal_pending(sibling, 10);
+        d.retire_sibling_thread_signal_state(tid);
+        assert_eq!(d.take_deliverable_pending_from(tid), Some((10, true)));
+        assert_eq!(d.take_deliverable_pending_from(sibling), None);
     }
 
     #[test]

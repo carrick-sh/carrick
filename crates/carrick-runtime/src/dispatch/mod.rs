@@ -1706,6 +1706,20 @@ pub struct SyscallDispatcher {
     /// signal syscalls and runtime delivery can run through shared threaded
     /// dispatch without the legacy dispatcher lock.
     signal: Mutex<signal::SignalState>,
+    /// Lock-free MAY-HAVE-PENDING hints mirroring `signal`'s pending stores,
+    /// so the per-dispatch delivery cycle (every syscall return / kick /
+    /// sigreturn) can prove "nothing pending" without taking the signal lock.
+    /// `signal_tid_pending_hint` carries bit `tid % 64` for every tid with a
+    /// nonzero `pendings` set (collisions only cost a locked fallback);
+    /// `signal_process_pending_hint` mirrors `process_pending.raw()`. Both are
+    /// EXACT MIRRORS: every mutation of the underlying stores happens with the
+    /// `signal` lock held and refreshes them before release
+    /// (`signal::SyscallDispatcher::refresh_signal_pending_hints`). A reader
+    /// racing a marker mid-critical-section linearizes before the mark; the
+    /// marker's kick/unblock boundary runs a fresh delivery cycle that sees
+    /// the refreshed hint.
+    signal_tid_pending_hint: std::sync::atomic::AtomicU64,
+    signal_process_pending_hint: std::sync::atomic::AtomicU64,
     /// Owned filesystem subsystem state (unified VFS mount table plus
     /// the `/` rootfs + writable overlay). See [`fs::FsState`]. Handlers
     /// that touch only fs state borrow `self.fs` narrowly.
@@ -2014,6 +2028,8 @@ impl SyscallDispatcher {
             proc: Mutex::new(proc::ProcState::new()),
             creds: Mutex::new(creds::CredState::new()),
             signal: Mutex::new(signal::SignalState::new()),
+            signal_tid_pending_hint: std::sync::atomic::AtomicU64::new(0),
+            signal_process_pending_hint: std::sync::atomic::AtomicU64::new(0),
             fs: fs::FsState::new(),
             seccomp: crate::seccomp::SeccompState::default(),
             // Unconfined until a frontend applies a policy: bare run-elf boots
