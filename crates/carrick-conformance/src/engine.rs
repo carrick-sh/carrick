@@ -121,9 +121,14 @@ pub(crate) fn carrick_argv(suite: &Suite, carrick_bin: &str, run_id: &str) -> Ve
     // UNCONFINED (`--security-opt seccomp=unconfined` in docker_flags — the
     // keyring/pidfd_getfd/fanotify/clone3 families compare real-syscall
     // capability, not container policy) must run the carrick side unconfined
-    // too. Forward exactly that flag pair so the two engines always run under
-    // the same container policy shape.
-    if suite.docker_flags.iter().any(|f| f == "seccomp=unconfined") {
+    // too. Match both docker spellings (two-token `--security-opt X` and
+    // one-token `--security-opt=X`) so a manifest reformat can't silently drop
+    // the symmetry.
+    let docker_unconfined = suite
+        .docker_flags
+        .iter()
+        .any(|f| f == "seccomp=unconfined" || f == "--security-opt=seccomp=unconfined");
+    if docker_unconfined {
         a.push("--security-opt".to_string());
         a.push("seccomp=unconfined".to_string());
     }
@@ -491,6 +496,17 @@ mod tests {
         assert!(
             has_unconfined(&argv),
             "carrick side must mirror the oracle's seccomp=unconfined: {argv:?}"
+        );
+
+        // The one-token docker spelling must be recognized too — a manifest
+        // reformat to `--security-opt=seccomp=unconfined` must not silently
+        // drop the symmetry.
+        let mut suite = Suite::for_test("localhost:5050/ltp:arm64", &["add_key01"]);
+        suite.docker_flags = vec!["--security-opt=seccomp=unconfined".to_string()];
+        let argv = carrick_argv(&suite, "target/release/carrick", "conf-1");
+        assert!(
+            has_unconfined(&argv),
+            "one-token --security-opt= spelling must forward too: {argv:?}"
         );
     }
 
