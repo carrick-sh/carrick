@@ -1706,6 +1706,12 @@ fn run_native_dsr_thread_loop(
     thread_runtime: &mut NativeThreadRuntime,
     start: NativeThreadStart,
 ) -> Result<NativeThreadLoopOutcome, RuntimeError> {
+    let mut guest_tpidr_el0 = match &start {
+        NativeThreadStart::Initial { .. } => 0,
+        NativeThreadStart::Detached {
+            guest_tpidr_el0, ..
+        } => *guest_tpidr_el0,
+    };
     let mut snapshot = match start {
         NativeThreadStart::Initial { entry, initial_sp } => NativeUcontextSnapshot {
             sp: initial_sp,
@@ -1716,6 +1722,7 @@ fn run_native_dsr_thread_loop(
     };
     let mut translator = dsr::ThreadTranslator::new(64 * 1024 * 1024)
         .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+    let trace_syscalls = std::env::var_os("CARRICK_NATIVE_TRACE_SYSCALLS").is_some();
     let mut traps = 0_usize;
 
     loop {
@@ -1732,6 +1739,102 @@ fn run_native_dsr_thread_loop(
         let resume = match exit {
             dsr::ThreadExit::Syscall { resume } => resume,
             dsr::ThreadExit::Continue => continue,
+            dsr::ThreadExit::Sensitive(exit) => {
+                let register = exit.register.ok_or_else(|| {
+                    RuntimeError::Unsupported(format!(
+                        "native DSR sensitive {:?} exit has no register",
+                        exit.kind
+                    ))
+                })?;
+                match exit.kind {
+                    dsr::types::SensitiveKind::ReadTpidr => {
+                        if !native_snapshot_write_reg(&mut snapshot, register, guest_tpidr_el0) {
+                            return Err(RuntimeError::Unsupported(format!(
+                                "native DSR could not write TPIDR result to {register}"
+                            )));
+                        }
+                    }
+                    dsr::types::SensitiveKind::WriteTpidr => {
+                        guest_tpidr_el0 = native_snapshot_read_reg(&snapshot, register)
+                            .ok_or_else(|| {
+                                RuntimeError::Unsupported(format!(
+                                    "native DSR could not read TPIDR source {register}"
+                                ))
+                            })?;
+                    }
+                    dsr::types::SensitiveKind::ReadCtr => {
+                        if !native_snapshot_write_reg(&mut snapshot, register, NATIVE_CTR_EL0) {
+                            return Err(RuntimeError::Unsupported(format!(
+                                "native DSR could not write CTR_EL0 result to {register}"
+                            )));
+                        }
+                    }
+                    dsr::types::SensitiveKind::ReadDczid => {
+                        if !native_snapshot_write_reg(&mut snapshot, register, NATIVE_DCZID_EL0) {
+                            return Err(RuntimeError::Unsupported(format!(
+                                "native DSR could not write DCZID_EL0 result to {register}"
+                            )));
+                        }
+                    }
+                    dsr::types::SensitiveKind::DcZva => {
+                        let address =
+                            native_snapshot_read_reg(&snapshot, register).ok_or_else(|| {
+                                RuntimeError::Unsupported(format!(
+                                    "native DSR could not read dc zva source {register}"
+                                ))
+                            })?;
+                        native_dc_zva(&mut memory.lock(), address)?;
+                    }
+                    dsr::types::SensitiveKind::DcCvau | dsr::types::SensitiveKind::IcIvau => {}
+                }
+                snapshot.pc = exit.resume.raw();
+                continue;
+            }
+            dsr::ThreadExit::Fault {
+                signal,
+                code,
+                address,
+            } => {
+                if trace_syscalls {
+                    child_write_stderr(
+                        format!(
+                            "native trace dsr fault signal={signal} code={code} guest_pc=0x{:x} address=0x{:x} esr=0x{:x} far=0x{:x}\n",
+                            snapshot.pc,
+                            address.raw(),
+                            snapshot.esr,
+                            snapshot.far,
+                        )
+                        .as_bytes(),
+                    );
+                }
+                if !matches!(signal, libc::SIGSEGV | libc::SIGBUS | libc::SIGTRAP) {
+                    return Err(RuntimeError::Unsupported(format!(
+                        "native DSR trapped unexpected host signal {signal} at guest PC 0x{:x}",
+                        snapshot.pc
+                    )));
+                }
+                snapshot = lower_dsr_fault(
+                    &dispatcher,
+                    &memory,
+                    snapshot,
+                    thread_runtime.tid(),
+                    code,
+                    address.raw(),
+                )?;
+                continue;
+            }
+            dsr::ThreadExit::Kick => {
+                let interrupted_pc = snapshot.pc;
+                snapshot = deliver_dsr_pending_signal(
+                    &dispatcher,
+                    &memory,
+                    snapshot,
+                    thread_runtime.tid(),
+                    None,
+                    Some(interrupted_pc),
+                )?;
+                continue;
+            }
             dsr::ThreadExit::Unsupported(detail) => {
                 return Err(RuntimeError::Unsupported(format!(
                     "native DSR produced unsupported exit {detail}"
@@ -1757,16 +1860,43 @@ fn run_native_dsr_thread_loop(
             &memory,
             thread_runtime,
             &reporter,
-            false,
+            trace_syscalls,
         )?;
+        if matches!(outcome, DispatchOutcome::Returned { value: 0 })
+            && carrick_abi::syscall::lookup_aarch64(request.number.raw())
+                .is_some_and(|syscall| syscall.name == "rt_sigaction")
+            && unsafe { carrick_native_install_trap_handler() } != 0
+        {
+            return Err(last_io_error(
+                "restore native DSR transport after rt_sigaction",
+            ));
+        }
         match outcome {
             DispatchOutcome::Returned { value } => {
-                snapshot.x[0] = value as u64;
-                snapshot.pc = resume.raw();
+                snapshot = complete_dsr_syscall(
+                    &dispatcher,
+                    &memory,
+                    snapshot,
+                    thread_runtime.tid(),
+                    request.number.raw(),
+                    value,
+                    resume,
+                )?;
             }
             DispatchOutcome::Errno { errno } => {
-                snapshot.x[0] = errno.guest_retval() as u64;
-                snapshot.pc = resume.raw();
+                snapshot = complete_dsr_syscall(
+                    &dispatcher,
+                    &memory,
+                    snapshot,
+                    thread_runtime.tid(),
+                    request.number.raw(),
+                    errno.guest_retval(),
+                    resume,
+                )?;
+            }
+            DispatchOutcome::SigReturn => {
+                snapshot =
+                    complete_dsr_sigreturn(&dispatcher, &memory, snapshot, thread_runtime.tid())?;
             }
             DispatchOutcome::Exit { code } => {
                 if NATIVE_FORKED_GUEST_CHILD.load(std::sync::atomic::Ordering::Acquire) {
@@ -1790,6 +1920,158 @@ fn run_native_dsr_thread_loop(
                     "native DSR Task 5 does not yet support dispatcher outcome {other:?}"
                 )));
             }
+        }
+    }
+}
+
+fn deliver_dsr_pending_signal(
+    dispatcher: &SyscallDispatcher,
+    memory: &SharedNativeMemory,
+    snapshot: NativeUcontextSnapshot,
+    tid: crate::thread::ThreadId,
+    return_value: Option<i64>,
+    interrupted_pc: Option<u64>,
+) -> Result<NativeUcontextSnapshot, RuntimeError> {
+    let mut memory = memory.lock();
+    let mut trap = NativeSignalTrap::new(&mut memory, snapshot, None);
+    let action = crate::vcpu_loop::deliver_pending_signal(
+        &mut trap,
+        dispatcher,
+        return_value,
+        tid,
+        interrupted_pc,
+    )?;
+    if let Some(action) = action {
+        if let Some(signum) = action.stop_signal {
+            crate::exec_helpers::stop_by_signal(signum);
+        }
+        if let Some(signum) = action.term_signal {
+            native_die_by_signal(dispatcher, signum);
+        }
+    }
+    Ok(trap.into_snapshot())
+}
+
+fn complete_dsr_syscall(
+    dispatcher: &SyscallDispatcher,
+    memory: &SharedNativeMemory,
+    snapshot: NativeUcontextSnapshot,
+    tid: crate::thread::ThreadId,
+    syscall_nr: u64,
+    return_value: i64,
+    resume: carrick_guest_mem::GuestVa,
+) -> Result<NativeUcontextSnapshot, RuntimeError> {
+    let mut memory = memory.lock();
+    let mut trap = NativeSignalTrap::new(&mut memory, snapshot, Some(syscall_nr));
+    trap.complete_syscall(return_value)?;
+    trap.set_pc(resume.raw());
+    let action = crate::vcpu_loop::deliver_pending_signal(
+        &mut trap,
+        dispatcher,
+        Some(return_value),
+        tid,
+        None,
+    )?;
+    if let Some(action) = action {
+        if let Some(signum) = action.stop_signal {
+            crate::exec_helpers::stop_by_signal(signum);
+        }
+        if let Some(signum) = action.term_signal {
+            native_die_by_signal(dispatcher, signum);
+        }
+    }
+    Ok(trap.into_snapshot())
+}
+
+fn complete_dsr_sigreturn(
+    dispatcher: &SyscallDispatcher,
+    memory: &SharedNativeMemory,
+    snapshot: NativeUcontextSnapshot,
+    tid: crate::thread::ThreadId,
+) -> Result<NativeUcontextSnapshot, RuntimeError> {
+    let mut memory = memory.lock();
+    let mut trap = NativeSignalTrap::new(&mut memory, snapshot, None);
+    let action = sigreturn_restore_and_deliver(dispatcher, &mut trap, tid)?;
+    if let Some(action) = action {
+        if let Some(signum) = action.stop_signal {
+            crate::exec_helpers::stop_by_signal(signum);
+        }
+        if let Some(signum) = action.term_signal {
+            native_die_by_signal(dispatcher, signum);
+        }
+    }
+    Ok(trap.into_snapshot())
+}
+
+fn lower_dsr_fault(
+    dispatcher: &SyscallDispatcher,
+    memory: &SharedNativeMemory,
+    snapshot: NativeUcontextSnapshot,
+    tid: crate::thread::ThreadId,
+    host_code: i32,
+    fault_address: u64,
+) -> Result<NativeUcontextSnapshot, RuntimeError> {
+    let _ = host_code;
+    if let Some((page, prot)) = dispatcher.resident_fault_plan(fault_address) {
+        let mut memory = memory.lock();
+        let linux_page_size = memory.linux_page_size as usize;
+        if memory.protect_range(page, linux_page_size, prot).is_ok() {
+            drop(memory);
+            dispatcher.commit_resident_fault(page);
+            return Ok(snapshot);
+        }
+    }
+    if memory
+        .lock()
+        .resolve_native16k_write_exec_fault(fault_address, snapshot.pc, snapshot.esr)?
+    {
+        return Ok(snapshot);
+    }
+    let Some((mut signum, mut si_code, si_addr)) =
+        crate::vcpu_loop::lower_el0_fault(snapshot.esr, snapshot.pc, fault_address)
+    else {
+        native_die_by_signal(dispatcher, crate::linux_abi::LINUX_SIGSEGV);
+    };
+    si_code = {
+        let memory = memory.lock();
+        crate::vcpu_loop::upgrade_protection_si_code(&*memory, signum, si_code, si_addr)
+    };
+    if signum == crate::linux_abi::LINUX_SIGSEGV
+        && let Some((grow_start, grow_len)) = dispatcher.mmap_growdown_fault_plan(si_addr)
+    {
+        let grew = memory
+            .lock()
+            .protect_range(
+                grow_start,
+                grow_len,
+                crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_WRITE,
+            )
+            .is_ok();
+        if grew {
+            dispatcher.commit_mmap_growdown(grow_start);
+            return Ok(snapshot);
+        }
+    }
+    if signum == crate::linux_abi::LINUX_SIGSEGV && dispatcher.mmap_fault_is_sigbus(si_addr) {
+        signum = crate::linux_abi::LINUX_SIGBUS;
+        si_code = 2;
+    }
+    let interrupted_pc = snapshot.pc;
+    let mut memory = memory.lock();
+    let mut trap = NativeSignalTrap::new(&mut memory, snapshot, None);
+    let disposition = crate::vcpu_loop::inject_fault_signal(
+        &mut trap,
+        dispatcher,
+        tid,
+        signum,
+        si_code,
+        si_addr,
+        Some(interrupted_pc),
+    )?;
+    match disposition {
+        crate::vcpu_loop::FaultSignalDisposition::Injected => Ok(trap.into_snapshot()),
+        crate::vcpu_loop::FaultSignalDisposition::Terminate(signum) => {
+            native_die_by_signal(dispatcher, signum)
         }
     }
 }
@@ -2363,6 +2645,10 @@ impl<'a> NativeSignalTrap<'a> {
 
     fn set_pc(&mut self, pc: u64) {
         self.regs.pc = pc;
+    }
+
+    fn into_snapshot(self) -> NativeUcontextSnapshot {
+        self.regs
     }
 
     fn commit(&self) {
@@ -7730,6 +8016,114 @@ mod tests {
                 "unexpected error output: {stderr}"
             );
         }
+    }
+
+    #[test]
+    fn dsr_sensitive_flow_runtime_reuses_native_system_register_semantics() {
+        let words = [
+            0xd53b_d040, // mrs x0, tpidr_el0
+            0xd51b_d040, // msr tpidr_el0, x0
+            0xd53b_0021, // mrs x1, ctr_el0
+            0xd53b_00e2, // mrs x2, dczid_el0
+            0xd50b_7b20, // dc cvau, x0 (native backend no-op)
+            0xd50b_7520, // ic ivau, x0 (native backend no-op)
+            0xd280_0000, // mov x0, #0
+            0xd280_0ba8, // mov x8, #93 (exit)
+            SVC_0,
+        ];
+        let mut file = tempfile::NamedTempFile::new().expect("create DSR sensitive ELF");
+        std::io::Write::write_all(&mut file, &dsr_test_elf(&words))
+            .expect("write DSR sensitive ELF");
+        let plan = ExecutionPlan {
+            backend: crate::page_profile::ExecutionBackend::NativeDarwin,
+            page_geometry: crate::page_profile::PageGeometry {
+                host_page_size: 16 * 1024,
+                linux_page_size: 16 * 1024,
+                native_profile: Some(carrick_spec::NativePageProfile::Native16k),
+            },
+            native_code_mode: carrick_spec::NativeCodeModeRequest::Dsr,
+            diagnostics: Vec::new(),
+        };
+        let result = run_static_elf(
+            file.path(),
+            SyscallDispatcher::new(),
+            ["dsr-sensitive".to_string()],
+            std::iter::empty::<String>(),
+            32,
+            None,
+            &plan,
+        )
+        .expect("run DSR sensitive ELF");
+        assert_eq!(result.exit_code, 0, "stderr={:?}", result.stderr);
+    }
+
+    #[test]
+    fn dsr_signal_fault_runtime_lowers_cache_pc_to_guest_sigsegv() {
+        let words = [
+            0xd280_0020, // mov x0, #1
+            0xf940_0001, // ldr x1, [x0]
+        ];
+        let mut file = tempfile::NamedTempFile::new().expect("create DSR fault ELF");
+        std::io::Write::write_all(&mut file, &dsr_test_elf(&words)).expect("write DSR fault ELF");
+        let plan = ExecutionPlan {
+            backend: crate::page_profile::ExecutionBackend::NativeDarwin,
+            page_geometry: crate::page_profile::PageGeometry {
+                host_page_size: 16 * 1024,
+                linux_page_size: 16 * 1024,
+                native_profile: Some(carrick_spec::NativePageProfile::Native16k),
+            },
+            native_code_mode: carrick_spec::NativeCodeModeRequest::Dsr,
+            diagnostics: Vec::new(),
+        };
+        let result = run_static_elf(
+            file.path(),
+            SyscallDispatcher::new(),
+            ["dsr-fault".to_string()],
+            std::iter::empty::<String>(),
+            16,
+            None,
+            &plan,
+        )
+        .expect("collect DSR fault result");
+        assert_eq!(
+            result.exit_code,
+            128 + crate::linux_abi::LINUX_SIGSEGV,
+            "stderr={:?}",
+            result.stderr
+        );
+    }
+
+    #[test]
+    fn dsr_signal_fault_runtime_lowers_guest_brk_to_sigtrap() {
+        let words = [0xd420_0020]; // brk #1
+        let mut file = tempfile::NamedTempFile::new().expect("create DSR brk ELF");
+        std::io::Write::write_all(&mut file, &dsr_test_elf(&words)).expect("write DSR brk ELF");
+        let plan = ExecutionPlan {
+            backend: crate::page_profile::ExecutionBackend::NativeDarwin,
+            page_geometry: crate::page_profile::PageGeometry {
+                host_page_size: 16 * 1024,
+                linux_page_size: 16 * 1024,
+                native_profile: Some(carrick_spec::NativePageProfile::Native16k),
+            },
+            native_code_mode: carrick_spec::NativeCodeModeRequest::Dsr,
+            diagnostics: Vec::new(),
+        };
+        let result = run_static_elf(
+            file.path(),
+            SyscallDispatcher::new(),
+            ["dsr-brk".to_string()],
+            std::iter::empty::<String>(),
+            16,
+            None,
+            &plan,
+        )
+        .expect("collect DSR brk result");
+        assert_eq!(
+            result.exit_code,
+            128 + crate::linux_abi::LINUX_SIGTRAP,
+            "stderr={:?}",
+            result.stderr
+        );
     }
 
     #[test]

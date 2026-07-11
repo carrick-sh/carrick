@@ -106,7 +106,7 @@ pub(super) struct PcRelativeInst {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum SensitiveKind {
+pub(in crate::native_darwin) enum SensitiveKind {
     ReadTpidr,
     WriteTpidr,
     ReadCtr,
@@ -117,16 +117,17 @@ pub(super) enum SensitiveKind {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct SensitiveExit {
-    pub(super) kind: SensitiveKind,
-    pub(super) register: Option<bad64::Reg>,
-    pub(super) resume: GuestVa,
+pub(in crate::native_darwin) struct SensitiveExit {
+    pub(in crate::native_darwin) kind: SensitiveKind,
+    pub(in crate::native_darwin) register: Option<bad64::Reg>,
+    pub(in crate::native_darwin) resume: GuestVa,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum InstAction {
     Copy(u32),
     VirtualizedX18 { word: u32, op: bad64::Op },
+    VirtualizedX28 { word: u32, op: bad64::Op },
     PcRelative(PcRelativeInst),
     Direct(DirectExit),
     Indirect(IndirectExit),
@@ -149,14 +150,22 @@ pub(super) enum NativeDsrExit {
         target: GuestVa,
         link: Option<GuestVa>,
     },
+    Sensitive {
+        guest_pc: GuestVa,
+        resume: GuestVa,
+    },
     Fault {
         guest_pc: GuestVa,
         signal: i32,
         code: i32,
         address: GuestVa,
+        rewrite_scratch: u64,
+        rewrite_context_scratch: u64,
     },
     Kick {
         resume: GuestVa,
+        rewrite_scratch: u64,
+        rewrite_context_scratch: u64,
     },
     StaleGeneration {
         guest_pc: GuestVa,

@@ -1,7 +1,68 @@
 #![allow(dead_code)] // Additional typed exits consume the same context in later tasks.
 
 use super::super::NativeUcontextSnapshot;
-use super::types::{CacheVa, DsrError, NativeDsrExit};
+use super::types::{CacheVa, CodeGeneration, DsrError, NativeDsrExit};
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+pub(super) const INDIRECT_CACHE_ENTRIES: usize = 1024;
+pub(super) const INDIRECT_CACHE_MASK: u64 = (INDIRECT_CACHE_ENTRIES - 1) as u64;
+pub(super) const INDIRECT_CACHE_ENTRY_SHIFT: u32 = 5;
+pub(super) const CTX_INDIRECT_CACHE: u32 = 1136;
+pub(super) const CTX_GENERATION: u32 = 1144;
+
+#[repr(C, align(32))]
+struct IndirectTargetCacheEntry {
+    guest: AtomicU64,
+    generation: AtomicU64,
+    cache: AtomicU64,
+    pad: u64,
+}
+
+pub(super) struct IndirectTargetCache {
+    entries: Box<[IndirectTargetCacheEntry; INDIRECT_CACHE_ENTRIES]>,
+}
+
+impl IndirectTargetCache {
+    pub(super) fn new() -> Self {
+        Self {
+            entries: Box::new(std::array::from_fn(|_| IndirectTargetCacheEntry {
+                guest: AtomicU64::new(0),
+                generation: AtomicU64::new(0),
+                cache: AtomicU64::new(0),
+                pad: 0,
+            })),
+        }
+    }
+
+    fn index(guest: carrick_guest_mem::GuestVa) -> usize {
+        ((guest.raw() >> 2) & INDIRECT_CACHE_MASK) as usize
+    }
+
+    pub(super) fn publish(
+        &self,
+        guest: carrick_guest_mem::GuestVa,
+        generation: CodeGeneration,
+        cache: CacheVa,
+    ) {
+        let entry = &self.entries[Self::index(guest)];
+        entry
+            .cache
+            .store(cache.host().raw() as u64, Ordering::Relaxed);
+        entry.generation.store(generation.get(), Ordering::Relaxed);
+        entry.guest.store(guest.raw(), Ordering::Release);
+    }
+
+    fn as_ptr(&self) -> *const IndirectTargetCacheEntry {
+        self.entries.as_ptr()
+    }
+}
+
+impl Default for IndirectTargetCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[repr(C, align(16))]
 struct DsrContext {
@@ -18,11 +79,21 @@ struct DsrContext {
     exit_link: u64,
     exit_has_link: u32,
     exit_link_pad: u32,
+    rewrite_scratch: u64,
+    rewrite_context_scratch: u64,
+    indirect_cache: *const IndirectTargetCacheEntry,
+    generation: u64,
 }
 
 impl DsrContext {
-    fn new(snapshot: NativeUcontextSnapshot, entry: CacheVa, exit: NativeDsrExit) -> Self {
-        let (exit_target, exit_source, exit_status, exit_link, exit_has_link) = match exit {
+    fn new(
+        snapshot: NativeUcontextSnapshot,
+        entry: CacheVa,
+        exit: NativeDsrExit,
+        indirect_cache: *const IndirectTargetCacheEntry,
+        generation: CodeGeneration,
+    ) -> Self {
+        let (exit_target, exit_source, _exit_status, exit_link, exit_has_link) = match exit {
             NativeDsrExit::Syscall { resume } => (resume.raw(), 0, 1, 0, 0),
             NativeDsrExit::ResolveDirect { source, target } => {
                 (target.raw(), source.raw(), 2, 0, 0)
@@ -38,6 +109,14 @@ impl DsrContext {
                 link.map_or(0, carrick_guest_mem::GuestVa::raw),
                 u32::from(link.is_some()),
             ),
+            NativeDsrExit::Sensitive { guest_pc, resume } => {
+                (resume.raw(), guest_pc.raw(), 6, 0, 0)
+            }
+            NativeDsrExit::Unsupported { guest_pc, .. } => {
+                (guest_pc.raw(), guest_pc.raw(), 7, 0, 0)
+            }
+            NativeDsrExit::Fault { guest_pc, .. } => (guest_pc.raw(), guest_pc.raw(), 4, 0, 0),
+            NativeDsrExit::Kick { resume, .. } => (resume.raw(), 0, 5, 0, 0),
             _ => (0, 0, 0, 0, 0),
         };
         Self {
@@ -49,11 +128,17 @@ impl DsrContext {
             entry: entry.host().raw() as u64,
             exit_target,
             exit_source,
-            exit_status,
+            // Zero means no gateway or signal exit has been captured yet.
+            // Emitted exits always publish their status before branching.
+            exit_status: 0,
             exit_pad: 0,
             exit_link,
             exit_has_link,
             exit_link_pad: 0,
+            rewrite_scratch: 0,
+            rewrite_context_scratch: 0,
+            indirect_cache,
+            generation: generation.get(),
         }
     }
 }
@@ -69,13 +154,24 @@ const _: () = assert!(std::mem::offset_of!(DsrContext, exit_source) == 1088);
 const _: () = assert!(std::mem::offset_of!(DsrContext, exit_status) == 1096);
 const _: () = assert!(std::mem::offset_of!(DsrContext, exit_link) == 1104);
 const _: () = assert!(std::mem::offset_of!(DsrContext, exit_has_link) == 1112);
-const _: () = assert!(std::mem::size_of::<DsrContext>() == 1120);
+const _: () = assert!(std::mem::offset_of!(DsrContext, rewrite_scratch) == 1120);
+const _: () = assert!(std::mem::offset_of!(DsrContext, rewrite_context_scratch) == 1128);
+const _: () = assert!(std::mem::offset_of!(DsrContext, indirect_cache) == 1136);
+const _: () = assert!(std::mem::offset_of!(DsrContext, generation) == 1144);
+const _: () = assert!(std::mem::size_of::<DsrContext>() == 1152);
+const _: () = assert!(std::mem::size_of::<IndirectTargetCacheEntry>() == 32);
+const _: () = assert!(std::mem::offset_of!(IndirectTargetCacheEntry, guest) == 0);
+const _: () = assert!(std::mem::offset_of!(IndirectTargetCacheEntry, generation) == 8);
+const _: () = assert!(std::mem::offset_of!(IndirectTargetCacheEntry, cache) == 16);
 
 unsafe extern "C" {
     fn carrick_dsr_enter_raw(context: *mut DsrContext) -> libc::c_int;
     fn carrick_dsr_exit_syscall();
     fn carrick_dsr_exit_direct();
     fn carrick_dsr_exit_indirect();
+    fn carrick_dsr_exit_sensitive();
+    fn carrick_dsr_exit_unsupported();
+    fn carrick_dsr_exit_signal();
 }
 
 pub(super) fn syscall_exit_address() -> u64 {
@@ -90,24 +186,71 @@ pub(super) fn indirect_exit_address() -> u64 {
     carrick_dsr_exit_indirect as *const () as usize as u64
 }
 
+pub(super) fn sensitive_exit_address() -> u64 {
+    carrick_dsr_exit_sensitive as *const () as usize as u64
+}
+
+pub(super) fn unsupported_exit_address() -> u64 {
+    carrick_dsr_exit_unsupported as *const () as usize as u64
+}
+
+pub(super) fn signal_exit_address() -> u64 {
+    carrick_dsr_exit_signal as *const () as usize as u64
+}
+
 pub(super) fn enter_translated(
     entry: CacheVa,
     snapshot: &mut NativeUcontextSnapshot,
     exit: &mut NativeDsrExit,
+) -> Result<(), DsrError> {
+    enter_translated_raw(
+        entry,
+        snapshot,
+        exit,
+        std::ptr::null(),
+        CodeGeneration::INITIAL,
+    )
+}
+
+pub(super) fn enter_translated_with_cache(
+    entry: CacheVa,
+    snapshot: &mut NativeUcontextSnapshot,
+    exit: &mut NativeDsrExit,
+    indirect_cache: &IndirectTargetCache,
+) -> Result<(), DsrError> {
+    enter_translated_raw(
+        entry,
+        snapshot,
+        exit,
+        indirect_cache.as_ptr(),
+        CodeGeneration::INITIAL,
+    )
+}
+
+fn enter_translated_raw(
+    entry: CacheVa,
+    snapshot: &mut NativeUcontextSnapshot,
+    exit: &mut NativeDsrExit,
+    indirect_cache: *const IndirectTargetCacheEntry,
+    generation: CodeGeneration,
 ) -> Result<(), DsrError> {
     if !matches!(
         *exit,
         NativeDsrExit::Syscall { .. }
             | NativeDsrExit::ResolveDirect { .. }
             | NativeDsrExit::ResolveIndirect { .. }
+            | NativeDsrExit::Sensitive { .. }
+            | NativeDsrExit::Unsupported { .. }
+            | NativeDsrExit::Fault { .. }
+            | NativeDsrExit::Kick { .. }
     ) {
         return Err(DsrError::Gateway(
             "DSR gateway only accepts syscall or control-flow exits".to_string(),
         ));
     }
-    let mut context = DsrContext::new(*snapshot, entry, *exit);
+    let mut context = DsrContext::new(*snapshot, entry, *exit, indirect_cache, generation);
     let rc = unsafe { carrick_dsr_enter_raw(&mut context) };
-    if rc != 1 && rc != 2 && rc != 3 {
+    if !matches!(rc, 1..=7) {
         return Err(DsrError::Gateway(format!(
             "translated entry returned invalid gateway status {rc}"
         )));
@@ -126,6 +269,28 @@ pub(super) fn enter_translated(
             target: carrick_guest_mem::GuestVa(context.exit_target),
             link: (context.exit_has_link != 0)
                 .then_some(carrick_guest_mem::GuestVa(context.exit_link)),
+        },
+        4 => NativeDsrExit::Fault {
+            guest_pc: carrick_guest_mem::GuestVa(context.exit_target),
+            signal: context.snapshot.signal,
+            code: context.snapshot.signal_code,
+            address: carrick_guest_mem::GuestVa(context.snapshot.fault_address),
+            rewrite_scratch: context.rewrite_scratch,
+            rewrite_context_scratch: context.rewrite_context_scratch,
+        },
+        5 => NativeDsrExit::Kick {
+            resume: carrick_guest_mem::GuestVa(context.exit_target),
+            rewrite_scratch: context.rewrite_scratch,
+            rewrite_context_scratch: context.rewrite_context_scratch,
+        },
+        6 => NativeDsrExit::Sensitive {
+            guest_pc: carrick_guest_mem::GuestVa(context.exit_source),
+            resume: carrick_guest_mem::GuestVa(context.exit_target),
+        },
+        7 => NativeDsrExit::Unsupported {
+            guest_pc: carrick_guest_mem::GuestVa(context.exit_source),
+            word: 0,
+            op: bad64::Op::UDF,
         },
         _ => {
             return Err(DsrError::Gateway(format!(

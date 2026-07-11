@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use carrick_guest_mem::GuestVa;
-use dynasmrt::{DynasmApi, VecAssembler, aarch64::Aarch64Relocation};
+use dynasmrt::{DynasmApi, DynasmLabelApi, VecAssembler, aarch64::Aarch64Relocation};
 
 use super::block::{BlockPlan, PlannedExit};
 use super::cache::{PublishedCode, TranslationCache};
@@ -64,6 +64,33 @@ pub(super) struct EmittedBlock {
     code: PublishedCode,
     map: InstructionMap,
     direct_links: Vec<DirectLink>,
+    recovery: Vec<RecoveryEntry>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RecoveryAction {
+    RestoreScratch {
+        register: u32,
+    },
+    CommitVirtualizedAndRestoreScratch {
+        register: u32,
+        virtual_register: u32,
+    },
+    RestoreScratchAndContext {
+        register: u32,
+        context_register: u32,
+    },
+    CommitVirtualizedAndRestoreScratchAndContext {
+        register: u32,
+        context_register: u32,
+        virtual_register: u32,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct RecoveryEntry {
+    pub(super) cache: CacheOffset,
+    pub(super) action: RecoveryAction,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,6 +114,10 @@ impl EmittedBlock {
 
     pub(super) fn direct_links(&self) -> &[DirectLink] {
         &self.direct_links
+    }
+
+    pub(super) fn recovery(&self) -> &[RecoveryEntry] {
+        &self.recovery
     }
 }
 
@@ -120,6 +151,12 @@ fn exit_word(plan: &BlockPlan) -> Result<u32, DsrError> {
             guest,
             word,
             "virtualized x18 instruction",
+        )),
+        PlannedExit::VirtualizedX28 { guest, word, .. } => Err(unsupported_action(
+            plan,
+            guest,
+            word,
+            "virtualized x28 instruction",
         )),
         PlannedExit::Direct { guest, word, .. } => {
             Err(unsupported_action(plan, guest, word, "direct exit"))
@@ -181,9 +218,25 @@ fn emit_word(
 
 fn gpr_index(register: bad64::Reg) -> Option<u32> {
     let raw = register as u32;
-    let first = bad64::Reg::X0 as u32;
-    let last = bad64::Reg::X30 as u32;
-    (first..=last).contains(&raw).then_some(raw - first)
+    let first_x = bad64::Reg::X0 as u32;
+    let last_x = bad64::Reg::X30 as u32;
+    let first_w = bad64::Reg::W0 as u32;
+    let last_w = bad64::Reg::W30 as u32;
+    if (first_x..=last_x).contains(&raw) {
+        Some(raw - first_x)
+    } else if (first_w..=last_w).contains(&raw) {
+        Some(raw - first_w)
+    } else {
+        None
+    }
+}
+
+const fn virtual_snapshot_offset(register: u32) -> Option<u32> {
+    match register {
+        18 => Some(144),
+        28 => Some(224),
+        _ => None,
+    }
 }
 
 fn emit_pc_relative_address(
@@ -192,6 +245,7 @@ fn emit_pc_relative_address(
     plan: &BlockPlan,
     guest: GuestVa,
     relative: super::types::PcRelativeInst,
+    recovery: &mut Vec<RecoveryEntry>,
 ) -> Result<(), DsrError> {
     let destination = relative.destination.ok_or_else(|| {
         unsupported_action(
@@ -209,36 +263,123 @@ fn emit_pc_relative_address(
             "PC-relative non-GPR destination",
         )
     })?;
-    if register == 18 {
-        map_next(assembler, entries, guest)?;
-        dynasmrt::dynasm!(assembler
-            ; .arch aarch64
-            ; str x17, [x18, #136]
-        );
-        emit_mov_u64(assembler, entries, guest, 17, relative.target.raw())?;
-        map_next(assembler, entries, guest)?;
-        dynasmrt::dynasm!(assembler
-            ; .arch aarch64
-            ; str x17, [x18, #144]
-            ; ldr x17, [x18, #136]
-        );
-    } else {
-        emit_mov_u64(assembler, entries, guest, register, relative.target.raw())?;
+    let scratch = if register == 17 { 16 } else { 17 };
+    emit_word(
+        assembler,
+        entries,
+        guest,
+        0xf900_0000 | ((1120 / 8) << 10) | (28 << 5) | scratch,
+    )?;
+    for halfword in 0..4_u32 {
+        recovery.push(RecoveryEntry {
+            cache: current_offset(assembler)?,
+            action: RecoveryAction::RestoreScratch { register: scratch },
+        });
+        let immediate = ((relative.target.raw() >> (halfword * 16)) & 0xffff) as u32;
+        let base = if halfword == 0 {
+            0xd280_0000
+        } else {
+            0xf280_0000
+        };
+        emit_word(
+            assembler,
+            entries,
+            guest,
+            base | (halfword << 21) | (immediate << 5) | scratch,
+        )?;
     }
+    recovery.push(RecoveryEntry {
+        cache: current_offset(assembler)?,
+        action: RecoveryAction::RestoreScratch { register: scratch },
+    });
+    if let Some(offset) = virtual_snapshot_offset(register) {
+        emit_word(
+            assembler,
+            entries,
+            guest,
+            0xf900_0000 | ((offset / 8) << 10) | (28 << 5) | scratch,
+        )?;
+    } else {
+        emit_word(
+            assembler,
+            entries,
+            guest,
+            0xaa00_03e0 | (scratch << 16) | register,
+        )?;
+    }
+    recovery.push(RecoveryEntry {
+        cache: current_offset(assembler)?,
+        action: RecoveryAction::RestoreScratch { register: scratch },
+    });
+    emit_word(
+        assembler,
+        entries,
+        guest,
+        0xf940_0000 | ((1120 / 8) << 10) | (28 << 5) | scratch,
+    )?;
     Ok(())
 }
 
-fn emit_literal_with_x17_scratch(
+#[allow(
+    clippy::too_many_arguments,
+    reason = "emission and recovery metadata must advance together"
+)]
+fn emit_recovering_scratch_sequence(
     assembler: &mut VecAssembler<Aarch64Relocation>,
     entries: &mut Vec<PcMapEntry>,
     guest: GuestVa,
     target: GuestVa,
     memory_word: u32,
+    scratch: u32,
+    commit_virtual: Option<(u32, u32)>,
+    recovery: &mut Vec<RecoveryEntry>,
 ) -> Result<(), DsrError> {
-    emit_word(assembler, entries, guest, 0xf900_4651)?; // str x17, [x18, #136]
-    emit_mov_u64(assembler, entries, guest, 17, target.raw())?;
+    let save = 0xf900_0000 | ((1120 / 8) << 10) | (28 << 5) | scratch;
+    let restore = 0xf940_0000 | ((1120 / 8) << 10) | (28 << 5) | scratch;
+    emit_word(assembler, entries, guest, save)?;
+    for halfword in 0..4_u32 {
+        recovery.push(RecoveryEntry {
+            cache: current_offset(assembler)?,
+            action: RecoveryAction::RestoreScratch { register: scratch },
+        });
+        let immediate = ((target.raw() >> (halfword * 16)) & 0xffff) as u32;
+        let base = if halfword == 0 {
+            0xd280_0000
+        } else {
+            0xf280_0000
+        };
+        emit_word(
+            assembler,
+            entries,
+            guest,
+            base | (halfword << 21) | (immediate << 5) | scratch,
+        )?;
+    }
+    recovery.push(RecoveryEntry {
+        cache: current_offset(assembler)?,
+        action: RecoveryAction::RestoreScratch { register: scratch },
+    });
     emit_word(assembler, entries, guest, memory_word)?;
-    emit_word(assembler, entries, guest, 0xf940_4651)?; // ldr x17, [x18, #136]
+    if let Some((virtual_register, snapshot_offset)) = commit_virtual {
+        recovery.push(RecoveryEntry {
+            cache: current_offset(assembler)?,
+            action: RecoveryAction::CommitVirtualizedAndRestoreScratch {
+                register: scratch,
+                virtual_register,
+            },
+        });
+        emit_word(
+            assembler,
+            entries,
+            guest,
+            0xf900_0000 | ((snapshot_offset / 8) << 10) | (28 << 5) | scratch,
+        )?;
+    }
+    recovery.push(RecoveryEntry {
+        cache: current_offset(assembler)?,
+        action: RecoveryAction::RestoreScratch { register: scratch },
+    });
+    emit_word(assembler, entries, guest, restore)?;
     Ok(())
 }
 
@@ -248,13 +389,24 @@ fn emit_pc_relative_literal(
     plan: &BlockPlan,
     guest: GuestVa,
     relative: super::types::PcRelativeInst,
+    recovery: &mut Vec<RecoveryEntry>,
 ) -> Result<(), DsrError> {
     let opc = relative.word >> 30;
     let vector = (relative.word >> 26) & 1 != 0;
     let destination = relative.word & 0x1f;
+    let scratch = if !vector && destination == 17 { 16 } else { 17 };
     if relative.kind == super::types::PcRelativeKind::LiteralPrefetch {
-        let word = 0xf980_0000 | (17 << 5) | destination;
-        return emit_literal_with_x17_scratch(assembler, entries, guest, relative.target, word);
+        let word = 0xf980_0000 | (scratch << 5) | destination;
+        return emit_recovering_scratch_sequence(
+            assembler,
+            entries,
+            guest,
+            relative.target,
+            word,
+            scratch,
+            None,
+            recovery,
+        );
     }
 
     if vector {
@@ -271,8 +423,17 @@ fn emit_pc_relative_literal(
                 ));
             }
         };
-        let word = base | (17 << 5) | destination;
-        return emit_literal_with_x17_scratch(assembler, entries, guest, relative.target, word);
+        let word = base | (scratch << 5) | destination;
+        return emit_recovering_scratch_sequence(
+            assembler,
+            entries,
+            guest,
+            relative.target,
+            word,
+            scratch,
+            None,
+            recovery,
+        );
     }
 
     let base = match opc {
@@ -289,36 +450,22 @@ fn emit_pc_relative_literal(
         }
     };
 
-    if destination == 18 {
-        emit_word(assembler, entries, guest, 0xf900_4651)?;
-        emit_mov_u64(assembler, entries, guest, 17, relative.target.raw())?;
-        emit_word(assembler, entries, guest, base | (17 << 5) | 17)?;
-        emit_word(assembler, entries, guest, 0xf900_4a51)?; // str x17, [x18, #144]
-        emit_word(assembler, entries, guest, 0xf940_4651)?;
-    } else if destination == 31 {
-        emit_literal_with_x17_scratch(
-            assembler,
-            entries,
-            guest,
-            relative.target,
-            base | (17 << 5) | destination,
-        )?;
+    let virtual_destination = virtual_snapshot_offset(destination);
+    let load_destination = if virtual_destination.is_some() {
+        scratch
     } else {
-        emit_mov_u64(
-            assembler,
-            entries,
-            guest,
-            destination,
-            relative.target.raw(),
-        )?;
-        emit_word(
-            assembler,
-            entries,
-            guest,
-            base | (destination << 5) | destination,
-        )?;
-    }
-    Ok(())
+        destination
+    };
+    emit_recovering_scratch_sequence(
+        assembler,
+        entries,
+        guest,
+        relative.target,
+        base | (scratch << 5) | load_destination,
+        scratch,
+        virtual_destination.map(|offset| (destination, offset)),
+        recovery,
+    )
 }
 
 fn emit_gateway_exit(
@@ -334,21 +481,21 @@ fn emit_gateway_exit(
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
-        ; str x17, [x18, #1080]
+        ; str x17, [x28, #1080]
     );
     if let Some(source) = source {
         emit_mov_u64(assembler, entries, guest, 17, source.raw())?;
         map_next(assembler, entries, guest)?;
         dynasmrt::dynasm!(assembler
             ; .arch aarch64
-            ; str x17, [x18, #1088]
+            ; str x17, [x28, #1088]
         );
     }
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
         ; mov w17, status
-        ; str w17, [x18, #1096]
+        ; str w17, [x28, #1096]
     );
     emit_mov_u64(assembler, entries, guest, 17, gateway)?;
     map_next(assembler, entries, guest)?;
@@ -372,7 +519,10 @@ fn relocated_direct_word(word: u32, exit: super::types::DirectExit) -> Result<u3
             )));
         }
     };
-    if matches!(exit.register, Some(bad64::Reg::X18 | bad64::Reg::W18)) {
+    if matches!(
+        exit.register,
+        Some(bad64::Reg::X18 | bad64::Reg::W18 | bad64::Reg::X28 | bad64::Reg::W28)
+    ) {
         relocated = (relocated & !0x1f) | 17;
     }
     Ok(relocated)
@@ -387,12 +537,13 @@ fn emit_indirect_exit(
 ) -> Result<(), DsrError> {
     let register = gpr_index(exit.register)
         .ok_or_else(|| unsupported_action(plan, guest, 0, "indirect exit with non-GPR target"))?;
-    if register == 18 {
-        map_next(assembler, entries, guest)?;
-        dynasmrt::dynasm!(assembler
-            ; .arch aarch64
-            ; ldr x17, [x18, #144]
-        );
+    if let Some(offset) = virtual_snapshot_offset(register) {
+        emit_word(
+            assembler,
+            entries,
+            guest,
+            0xf940_0000 | ((offset / 8) << 10) | (28 << 5) | 17,
+        )?;
     } else if register != 17 {
         emit_word(
             assembler,
@@ -401,42 +552,171 @@ fn emit_indirect_exit(
             0xaa00_03f1 | (register << 16), // mov x17, xN
         )?;
     }
-    map_next(assembler, entries, guest)?;
-    dynasmrt::dynasm!(assembler
-        ; .arch aarch64
-        ; str x17, [x18, #1080]
-    );
     let link = (exit.kind == super::types::IndirectKind::Call).then_some(exit.resume);
     if let Some(link) = link {
         emit_mov_u64(assembler, entries, guest, 30, link.raw())?;
     }
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; str x17, [x28, #1080]
+    );
+    // A per-thread direct-mapped cache keeps repeated indirect calls and
+    // returns inside translated code. Guest x17 was saved by the block exit;
+    // preserve x15/x16 while they serve as lookup scratch, and restore all
+    // guest-visible scratch state on both hit and miss paths.
+    let miss = assembler.new_dynamic_label();
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; str x15, [x28, #120]
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; str x16, [x28, #128]
+    );
+    emit_word(assembler, entries, guest, 0xd53b_4210)?; // mrs x16, nzcv
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; str x16, [x28, #264]
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; ldr x15, [x28, super::gateway::CTX_INDIRECT_CACHE]
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; cbz x15, =>miss
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; ubfx x16, x17, #2, #10
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; add x15, x15, x16, LSL #super::gateway::INDIRECT_CACHE_ENTRY_SHIFT
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; ldar x16, [x15]
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; cmp x16, x17
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; b.ne =>miss
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; ldr x16, [x15, #8]
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; ldr x17, [x28, super::gateway::CTX_GENERATION]
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; cmp x16, x17
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; b.ne =>miss
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; ldr x17, [x15, #16]
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; cbz x17, =>miss
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; ldr x16, [x28, #264]
+    );
+    emit_word(assembler, entries, guest, 0xd51b_4210)?; // msr nzcv, x16
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; ldr x15, [x28, #120]
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; ldr x16, [x28, #128]
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; br x17
+        ; =>miss
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; ldr x17, [x28, #1080]
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; ldr x16, [x28, #264]
+    );
+    emit_word(assembler, entries, guest, 0xd51b_4210)?; // msr nzcv, x16
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; ldr x15, [x28, #120]
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; ldr x16, [x28, #128]
+    );
     emit_mov_u64(assembler, entries, guest, 17, guest.raw())?;
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
-        ; str x17, [x18, #1088]
+        ; str x17, [x28, #1088]
     );
     if let Some(link) = link {
         emit_mov_u64(assembler, entries, guest, 17, link.raw())?;
         map_next(assembler, entries, guest)?;
         dynasmrt::dynasm!(assembler
             ; .arch aarch64
-            ; str x17, [x18, #1104]
+            ; str x17, [x28, #1104]
             ; mov w17, #1
-            ; str w17, [x18, #1112]
+            ; str w17, [x28, #1112]
         );
     } else {
         map_next(assembler, entries, guest)?;
         dynasmrt::dynasm!(assembler
             ; .arch aarch64
-            ; str wzr, [x18, #1112]
+            ; str wzr, [x28, #1112]
         );
     }
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
         ; mov w17, #3
-        ; str w17, [x18, #1096]
+        ; str w17, [x28, #1096]
     );
     emit_mov_u64(
         assembler,
@@ -453,6 +733,135 @@ fn emit_indirect_exit(
     Ok(())
 }
 
+fn rewritten_virtual_word(
+    word: u32,
+    guest: GuestVa,
+    virtual_register: u32,
+) -> Option<(u32, u32, u32)> {
+    let original = bad64::decode(word, guest.raw()).ok()?;
+    let fields = [0_u32, 5, 10, 16];
+    for scratch in (9_u32..=17).rev() {
+        if super::decode::decoded_operands_mention_gpr(word, guest, scratch) {
+            continue;
+        }
+        let replaceable = fields
+            .into_iter()
+            .filter(|shift| ((word >> shift) & 0x1f) == virtual_register)
+            .collect::<Vec<_>>();
+        for mask in 1_u32..(1_u32 << replaceable.len()) {
+            let mut candidate_word = word;
+            for (index, shift) in replaceable.iter().copied().enumerate() {
+                if mask & (1 << index) != 0 {
+                    candidate_word = (candidate_word & !(0x1f << shift)) | (scratch << shift);
+                }
+            }
+            let Ok(candidate) = bad64::decode(candidate_word, guest.raw()) else {
+                continue;
+            };
+            if candidate.op() != original.op() {
+                continue;
+            }
+            if super::decode::decoded_operands_mention_gpr(candidate_word, guest, virtual_register)
+            {
+                continue;
+            }
+            let virtual_x = format!("x{virtual_register}");
+            let virtual_w = format!("w{virtual_register}");
+            let normalized = candidate
+                .to_string()
+                .replace(&format!("x{scratch}"), &virtual_x)
+                .replace(&format!("w{scratch}"), &virtual_w);
+            if normalized == original.to_string() {
+                let context_scratch = (9_u32..=17).rev().find(|candidate| {
+                    *candidate != scratch
+                        && !super::decode::decoded_operands_mention_gpr(word, guest, *candidate)
+                })?;
+                return Some((scratch, context_scratch, candidate_word));
+            }
+        }
+    }
+    None
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "virtual-register emission carries its explicit recovery contract"
+)]
+fn emit_virtualized_register(
+    assembler: &mut VecAssembler<Aarch64Relocation>,
+    entries: &mut Vec<PcMapEntry>,
+    plan: &BlockPlan,
+    guest: GuestVa,
+    word: u32,
+    virtual_register: u32,
+    snapshot_offset: u32,
+    recovery: &mut Vec<RecoveryEntry>,
+) -> Result<(), DsrError> {
+    let (scratch, context_scratch, rewritten) =
+        rewritten_virtual_word(word, guest, virtual_register).ok_or_else(|| {
+            unsupported_action(
+                plan,
+                guest,
+                word,
+                "unrewritable virtualized register instruction",
+            )
+        })?;
+    let save = 0xf900_0000 | ((1120 / 8) << 10) | (28 << 5) | scratch;
+    let save_context = 0xf900_0000 | ((1128 / 8) << 10) | (28 << 5) | context_scratch;
+    let mirror_context = 0xaa1c_03e0 | context_scratch;
+    let load_virtual =
+        0xf940_0000 | ((snapshot_offset / 8) << 10) | (context_scratch << 5) | scratch;
+    let store_virtual =
+        0xf900_0000 | ((snapshot_offset / 8) << 10) | (context_scratch << 5) | scratch;
+    let restore = 0xf940_0000 | ((1120 / 8) << 10) | (context_scratch << 5) | scratch;
+    let restore_context = 0xf940_0000 | ((1128 / 8) << 10) | (28 << 5) | context_scratch;
+    emit_word(assembler, entries, guest, save)?;
+    emit_word(assembler, entries, guest, save_context)?;
+    emit_word(assembler, entries, guest, mirror_context)?;
+    recovery.push(RecoveryEntry {
+        cache: current_offset(assembler)?,
+        action: RecoveryAction::RestoreScratchAndContext {
+            register: scratch,
+            context_register: context_scratch,
+        },
+    });
+    emit_word(assembler, entries, guest, load_virtual)?;
+    recovery.push(RecoveryEntry {
+        cache: current_offset(assembler)?,
+        action: RecoveryAction::RestoreScratchAndContext {
+            register: scratch,
+            context_register: context_scratch,
+        },
+    });
+    emit_word(assembler, entries, guest, rewritten)?;
+    recovery.push(RecoveryEntry {
+        cache: current_offset(assembler)?,
+        action: RecoveryAction::CommitVirtualizedAndRestoreScratchAndContext {
+            register: scratch,
+            context_register: context_scratch,
+            virtual_register,
+        },
+    });
+    emit_word(assembler, entries, guest, store_virtual)?;
+    recovery.push(RecoveryEntry {
+        cache: current_offset(assembler)?,
+        action: RecoveryAction::RestoreScratchAndContext {
+            register: scratch,
+            context_register: context_scratch,
+        },
+    });
+    emit_word(assembler, entries, guest, restore)?;
+    recovery.push(RecoveryEntry {
+        cache: current_offset(assembler)?,
+        action: RecoveryAction::RestoreScratchAndContext {
+            register: scratch,
+            context_register: context_scratch,
+        },
+    });
+    emit_word(assembler, entries, guest, restore_context)?;
+    Ok(())
+}
+
 pub(super) fn emit_block(
     cache: &mut TranslationCache,
     plan: &BlockPlan,
@@ -460,21 +869,40 @@ pub(super) fn emit_block(
     let mut assembler = VecAssembler::<Aarch64Relocation>::new(0);
     let mut entries = Vec::with_capacity(plan.instructions.len() + 8);
     let mut direct_links = Vec::new();
+    let mut recovery = Vec::new();
     map_next(&assembler, &mut entries, plan.start)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
-        ; ldr x17, [x18, #136]
+        ; ldr x17, [x28, #136]
     );
     for instruction in &plan.instructions {
         let word = match instruction.action {
             InstAction::Copy(word) => word,
             InstAction::VirtualizedX18 { word, .. } => {
-                return Err(unsupported_action(
+                emit_virtualized_register(
+                    &mut assembler,
+                    &mut entries,
                     plan,
                     instruction.guest,
                     word,
-                    "virtualized x18 instruction",
-                ));
+                    18,
+                    144,
+                    &mut recovery,
+                )?;
+                continue;
+            }
+            InstAction::VirtualizedX28 { word, .. } => {
+                emit_virtualized_register(
+                    &mut assembler,
+                    &mut entries,
+                    plan,
+                    instruction.guest,
+                    word,
+                    28,
+                    224,
+                    &mut recovery,
+                )?;
+                continue;
             }
             InstAction::PcRelative(relative)
                 if matches!(
@@ -488,6 +916,7 @@ pub(super) fn emit_block(
                     plan,
                     instruction.guest,
                     relative,
+                    &mut recovery,
                 )?;
                 continue;
             }
@@ -498,6 +927,7 @@ pub(super) fn emit_block(
                     plan,
                     instruction.guest,
                     relative,
+                    &mut recovery,
                 )?;
                 continue;
             }
@@ -535,7 +965,7 @@ pub(super) fn emit_block(
         map_next(&assembler, &mut entries, exit_guest)?;
         dynasmrt::dynasm!(assembler
             ; .arch aarch64
-            ; str x17, [x18, #136]
+            ; str x17, [x28, #136]
         );
         emit_gateway_exit(
             &mut assembler,
@@ -550,7 +980,7 @@ pub(super) fn emit_block(
         map_next(&assembler, &mut entries, exit_guest)?;
         dynasmrt::dynasm!(assembler
             ; .arch aarch64
-            ; str x17, [x18, #136]
+            ; str x17, [x28, #136]
         );
         if exit.kind == super::types::DirectKind::Call {
             emit_mov_u64(
@@ -581,12 +1011,15 @@ pub(super) fn emit_block(
                 super::gateway::direct_exit_address(),
             )?;
         } else {
-            if matches!(exit.register, Some(bad64::Reg::X18 | bad64::Reg::W18)) {
-                map_next(&assembler, &mut entries, exit_guest)?;
-                dynasmrt::dynasm!(assembler
-                    ; .arch aarch64
-                    ; ldr x17, [x18, #144]
-                );
+            if let Some(register) = exit.register.and_then(gpr_index)
+                && let Some(offset) = virtual_snapshot_offset(register)
+            {
+                emit_word(
+                    &mut assembler,
+                    &mut entries,
+                    exit_guest,
+                    0xf940_0000 | ((offset / 8) << 10) | (28 << 5) | 17,
+                )?;
             }
             emit_word(
                 &mut assembler,
@@ -629,9 +1062,57 @@ pub(super) fn emit_block(
         map_next(&assembler, &mut entries, exit_guest)?;
         dynasmrt::dynasm!(assembler
             ; .arch aarch64
-            ; str x17, [x18, #136]
+            ; str x17, [x28, #136]
         );
         emit_indirect_exit(&mut assembler, &mut entries, plan, exit_guest, exit)?;
+    } else if let PlannedExit::Sensitive { exit, .. } = plan.exit {
+        map_next(&assembler, &mut entries, exit_guest)?;
+        dynasmrt::dynasm!(assembler
+            ; .arch aarch64
+            ; str x17, [x28, #136]
+        );
+        emit_gateway_exit(
+            &mut assembler,
+            &mut entries,
+            exit_guest,
+            exit.resume,
+            Some(exit_guest),
+            6,
+            super::gateway::sensitive_exit_address(),
+        )?;
+    } else if let PlannedExit::Continue { target, .. } = plan.exit {
+        map_next(&assembler, &mut entries, exit_guest)?;
+        dynasmrt::dynasm!(assembler
+            ; .arch aarch64
+            ; str x17, [x28, #136]
+        );
+        let slot = current_offset(&assembler)?;
+        direct_links.push(DirectLink { slot, target });
+        emit_word(&mut assembler, &mut entries, exit_guest, 0x1400_0001)?;
+        emit_gateway_exit(
+            &mut assembler,
+            &mut entries,
+            exit_guest,
+            target,
+            Some(exit_guest),
+            2,
+            super::gateway::direct_exit_address(),
+        )?;
+    } else if let PlannedExit::Unsupported { .. } = plan.exit {
+        map_next(&assembler, &mut entries, exit_guest)?;
+        dynasmrt::dynasm!(assembler
+            ; .arch aarch64
+            ; str x17, [x28, #136]
+        );
+        emit_gateway_exit(
+            &mut assembler,
+            &mut entries,
+            exit_guest,
+            exit_guest,
+            Some(exit_guest),
+            7,
+            super::gateway::unsupported_exit_address(),
+        )?;
     } else {
         map_next(&assembler, &mut entries, exit_guest)?;
         assembler.push_u32(exit_word(plan)?);
@@ -657,6 +1138,7 @@ pub(super) fn emit_block(
         code,
         map,
         direct_links,
+        recovery,
     })
 }
 
@@ -787,7 +1269,7 @@ mod tests {
     }
 
     #[test]
-    fn dsr_emit_continue_exit_is_typed_and_decodable() {
+    fn dsr_emit_continue_exit_is_a_lazy_direct_link() {
         let mut plan = copy_plan();
         plan.instructions.truncate(1);
         plan.end = GuestVa(0x4004);
@@ -797,9 +1279,8 @@ mod tests {
         };
         let mut cache = TranslationCache::new(16 * 1024).expect("allocate translation cache");
         let emitted = emit_block(&mut cache, &plan).expect("emit bounded block");
-        let exit =
-            unsafe { std::ptr::read_unaligned((emitted.entry().host().raw() + 8) as *const u32) };
-        assert_eq!(exit, BRK_DSR_CONTINUE);
+        assert_eq!(emitted.direct_links().len(), 1);
+        assert_eq!(emitted.direct_links()[0].target, GuestVa(0x4004));
         assert_eq!(
             emitted.map().guest_for_cache(CacheOffset::published(8)),
             Some(GuestVa(0x4004))

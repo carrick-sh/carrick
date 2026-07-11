@@ -12,6 +12,7 @@
 #include <pthread.h>
 #include <setjmp.h>
 #include <signal.h>
+#include <stddef.h>
 #include <stdbool.h>
 #include <stdatomic.h>
 #include <stdint.h>
@@ -35,6 +36,25 @@ struct carrick_native_ucontext_snapshot {
     uint64_t esr;
     uint64_t far;
 };
+
+struct carrick_native_dsr_signal_context {
+    struct carrick_native_ucontext_snapshot snapshot;
+    uint64_t host_sp;
+    uint8_t gateway_private[232];
+    uint64_t entry;
+    uint64_t exit_target;
+    uint64_t exit_source;
+    uint32_t exit_status;
+};
+
+_Static_assert(offsetof(struct carrick_native_dsr_signal_context, host_sp) == 832,
+               "DSR signal host SP offset");
+_Static_assert(offsetof(struct carrick_native_dsr_signal_context, exit_target) == 1080,
+               "DSR signal target offset");
+_Static_assert(offsetof(struct carrick_native_dsr_signal_context, exit_source) == 1088,
+               "DSR signal source offset");
+_Static_assert(offsetof(struct carrick_native_dsr_signal_context, exit_status) == 1096,
+               "DSR signal status offset");
 
 struct carrick_native_kick_state {
     _Atomic uint64_t requested;
@@ -154,6 +174,10 @@ static _Thread_local int32_t carrick_native_last_event_kind;
 static _Thread_local int32_t carrick_native_last_signal;
 static _Thread_local int32_t carrick_native_last_signal_code;
 static _Thread_local uint64_t carrick_native_last_fault_address;
+static _Thread_local struct carrick_native_dsr_signal_context
+    *carrick_native_active_dsr_context;
+
+extern void carrick_dsr_exit_signal(void);
 
 typedef void (*carrick_native_update_tpidr_fn)(uint64_t, uint64_t);
 _Static_assert(sizeof(carrick_native_update_tpidr_fn) == sizeof(uint64_t),
@@ -254,12 +278,35 @@ static int carrick_native_enter_guest_x18_abi(void) {
     return 0;
 }
 
-int carrick_native_dsr_enter_guest_abi(void) {
+int carrick_native_dsr_enter_guest_abi(void *context) {
+    carrick_native_active_dsr_context = context;
     return carrick_native_enter_guest_x18_abi();
 }
 
 void carrick_native_dsr_enter_host_abi(void) {
+    carrick_native_active_dsr_context = 0;
     carrick_native_enter_host_x18_abi();
+}
+
+static void carrick_native_snapshot_mcontext(
+    struct carrick_native_ucontext_snapshot *out,
+    const struct __darwin_mcontext64 *mc,
+    bool preserve_virtual_registers) {
+    for (int i = 0; i < 29; i++) {
+        if (!preserve_virtual_registers || (i != 18 && i != 28)) {
+            out->x[i] = mc->__ss.__x[i];
+        }
+    }
+    out->x[29] = mc->__ss.__fp;
+    out->x[30] = mc->__ss.__lr;
+    out->sp = mc->__ss.__sp;
+    out->pc = mc->__ss.__pc;
+    out->pstate = mc->__ss.__cpsr;
+    memcpy(out->v, mc->__ns.__v, sizeof(out->v));
+    out->fpsr = mc->__ns.__fpsr;
+    out->fpcr = mc->__ns.__fpcr;
+    out->esr = mc->__es.__esr;
+    out->far = mc->__es.__far;
 }
 
 static void carrick_native_write_literal(const char *s) {
@@ -371,21 +418,59 @@ static void carrick_native_trap_handler(int sig, siginfo_t *info, void *uap) {
 
     int32_t event_kind = CARRICK_NATIVE_EVENT_TRAP;
     if (sig == SIGPIPE) {
-        if (!carrick_native_kick_state_take(carrick_native_bound_kick_state)) {
+        bool requested = carrick_native_kick_state_take(
+            carrick_native_bound_kick_state);
+        // A coalesced or stale SIGPIPE can arrive after another path consumed
+        // the pending bit. Returning directly to DSR code is unsafe because
+        // Darwin's signal return does not reliably preserve custom x18. Route
+        // every SIGPIPE observed while DSR is active through a typed kick exit;
+        // Rust will simply find no pending guest signal and resume cleanly.
+        if (!requested && carrick_native_active_dsr_context == 0) {
             return;
         }
-        if (!carrick_native_env_ready || uap == 0) {
+        if ((!carrick_native_env_ready && carrick_native_active_dsr_context == 0) || uap == 0) {
             return;
         }
         event_kind = CARRICK_NATIVE_EVENT_KICK;
     } else if ((sig != SIGTRAP && sig != SIGSEGV && sig != SIGBUS) ||
-               !carrick_native_env_ready || uap == 0) {
+               (!carrick_native_env_ready && carrick_native_active_dsr_context == 0) || uap == 0) {
         carrick_native_fatal_signal_handler(sig, info, uap);
     }
 
     ucontext_t *uc = (ucontext_t *)uap;
     if (uc->uc_mcontext == 0) {
         _exit(128 + sig);
+    }
+
+    if (carrick_native_active_dsr_context != 0) {
+        struct carrick_native_dsr_signal_context *context =
+            carrick_native_active_dsr_context;
+        // Preserve the first interrupted cache PC and register snapshot. If
+        // the recovery gateway itself faults, overwriting them would turn the
+        // useful guest fault into an unmappable gateway address.
+        if (context->exit_status != 4 && context->exit_status != 5) {
+            carrick_native_snapshot_mcontext(
+                &context->snapshot,
+                uc->uc_mcontext,
+                true);
+            context->snapshot.event_kind = event_kind;
+            context->snapshot.signal = sig;
+            context->snapshot.signal_code = info != 0 ? info->si_code : 0;
+            context->snapshot.fault_address =
+                info != 0 ? (uintptr_t)info->si_addr : 0;
+            context->exit_target = uc->uc_mcontext->__ss.__pc;
+            context->exit_source = uc->uc_mcontext->__ss.__pc;
+            context->exit_status = event_kind == CARRICK_NATIVE_EVENT_KICK ? 5 : 4;
+        }
+        // The gateway exit runs with physical x28 as its context pointer. A
+        // fault can arrive precisely because translated execution corrupted
+        // that invariant, so do not rely on the interrupted x28 while
+        // redirecting to the common exit stub.
+        uintptr_t recovery_sp = context->host_sp - 16;
+        *(uintptr_t *)recovery_sp = (uintptr_t)context;
+        uc->uc_mcontext->__ss.__sp = recovery_sp;
+        uc->uc_mcontext->__ss.__pc = (uintptr_t)carrick_dsr_exit_signal;
+        return;
     }
 
     carrick_native_copy_mcontext(
