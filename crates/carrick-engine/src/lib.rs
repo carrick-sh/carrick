@@ -84,6 +84,7 @@ pub use carrick_runtime::runtime::RunResult;
 pub use carrick_spec::{
     BridgeId, FsBackendKind, ImageConfig, Mount, NetworkAttachmentSpec, NetworkMode,
     NetworkNamespaceId, NetworkNamespaceSpec, PidMode, Platform, PortMapping, RunSpec,
+    SeccompPolicy,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,6 +144,48 @@ pub struct CliRunRequest {
     /// `--stop-timeout` in seconds (graceful-stop window before SIGKILL), or
     /// `None` for the default. Persisted in the container's `RunConfig`.
     pub stop_timeout: Option<u64>,
+    /// Raw `--security-opt` values (docker syntax). Resolved by
+    /// [`resolve_seccomp_policy`] over the `carrick run` default
+    /// ([`SeccompPolicy::ContainerDefault`], docker's own default); persisted
+    /// in the container's `RunConfig` so start/restart/exec keep the policy.
+    pub security_opts: Vec<String>,
+}
+
+/// Resolve docker-syntax `--security-opt` values (last-wins) onto a
+/// [`SeccompPolicy`], starting from `default` — `ContainerDefault` for the
+/// docker-compatible `carrick run`/`create` frontends, `Unconfined` for the
+/// bare-ELF `run-elf` dev driver (whose opt-IN is `seccomp=default`).
+///
+/// Supported values: `seccomp=unconfined` (docker's opt-out) and
+/// `seccomp=default`/`seccomp=builtin` (the modeled builtin profile). Anything
+/// else — custom profile JSON paths, apparmor/label options — is an ERROR:
+/// silently ignoring a security option the user asked for would misrepresent
+/// the sandbox they believe they configured.
+pub fn resolve_seccomp_policy(
+    default: SeccompPolicy,
+    security_opts: &[String],
+) -> Result<SeccompPolicy, String> {
+    let mut policy = default;
+    for opt in security_opts {
+        match opt.strip_prefix("seccomp=") {
+            Some("unconfined") => policy = SeccompPolicy::Unconfined,
+            Some("default") | Some("builtin") => policy = SeccompPolicy::ContainerDefault,
+            Some(other) => {
+                return Err(format!(
+                    "unsupported --security-opt seccomp value {other:?}: carrick models \
+                     the builtin default profile (`seccomp=default`) and `seccomp=unconfined`; \
+                     custom profile files are not supported"
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "unsupported --security-opt {opt:?}: only `seccomp=unconfined` and \
+                     `seccomp=default`/`seccomp=builtin` are supported"
+                ));
+            }
+        }
+    }
+    Ok(policy)
 }
 
 /// Parse the request's `--platform` into the canonical [`Platform`], falling
@@ -391,6 +434,11 @@ pub fn resolve_run_spec(req: CliRunRequest, image: ResolvedImage) -> Result<RunS
             .map_err(|_| format!("invalid IPv4 address {ipv4:?}"))?;
     }
 
+    // 6. Launch-time syscall policy: docker's default profile model unless
+    //    `--security-opt seccomp=unconfined` opts out.
+    let seccomp_policy =
+        resolve_seccomp_policy(SeccompPolicy::ContainerDefault, &req.security_opts)?;
+
     Ok(RunSpec {
         executable,
         argv,
@@ -413,6 +461,7 @@ pub fn resolve_run_spec(req: CliRunRequest, image: ResolvedImage) -> Result<RunS
         extra_hosts: req.extra_hosts,
         uid,
         gid,
+        seccomp_policy,
     })
 }
 
@@ -539,6 +588,7 @@ mod tests {
             published_ports: Vec::new(),
             stop_signal: None,
             stop_timeout: None,
+            security_opts: Vec::new(),
         }
     }
 
@@ -735,6 +785,7 @@ mod tests {
             published_ports: Vec::new(),
             stop_signal: None,
             stop_timeout: None,
+            security_opts: Vec::new(),
         };
         let spec = resolve_run_spec(req, image).unwrap();
         assert_eq!(spec.executable, "/bin/sh");
@@ -785,6 +836,7 @@ mod tests {
             published_ports: Vec::new(),
             stop_signal: None,
             stop_timeout: None,
+            security_opts: Vec::new(),
         };
         let spec = resolve_run_spec(req, image).unwrap();
         assert_eq!(spec.argv, vec!["/bin/sh", "/bin/ls"]);
@@ -834,6 +886,7 @@ mod tests {
             published_ports: Vec::new(),
             stop_signal: None,
             stop_timeout: None,
+            security_opts: Vec::new(),
         };
         let spec = resolve_run_spec(req, image).unwrap();
         assert_eq!(spec.argv, vec!["/bin/bash", "-c", "echo hi"]);
@@ -883,6 +936,7 @@ mod tests {
             published_ports: Vec::new(),
             stop_signal: None,
             stop_timeout: None,
+            security_opts: Vec::new(),
         };
         let spec = resolve_run_spec(req, image).unwrap();
 
@@ -941,6 +995,7 @@ mod tests {
             published_ports: Vec::new(),
             stop_signal: None,
             stop_timeout: None,
+            security_opts: Vec::new(),
         };
         let spec = resolve_run_spec(req, image).unwrap();
         assert_eq!(spec.cwd.unwrap().as_str(), "/user/app");
@@ -988,6 +1043,7 @@ mod tests {
                 published_ports: Vec::new(),
                 stop_signal: None,
                 stop_timeout: None,
+                security_opts: Vec::new(),
             };
             resolve_run_spec(req, image)
                 .unwrap()
@@ -1004,6 +1060,63 @@ mod tests {
         assert_eq!(mk(None, Some("os")), "/os");
         // absolute --workdir still wins verbatim
         assert_eq!(mk(Some("/image/app"), Some("/user/app")), "/user/app");
+    }
+
+    #[test]
+    fn run_spec_seccomp_policy_defaults_to_container_default() {
+        // `carrick run` with no --security-opt models docker's default
+        // launch-time seccomp profile.
+        let image = make_test_image(None, None, vec![], None);
+        let spec = resolve_run_spec(base_req(None), image).unwrap();
+        assert_eq!(spec.seccomp_policy, SeccompPolicy::ContainerDefault);
+    }
+
+    #[test]
+    fn security_opt_seccomp_unconfined_opts_out() {
+        let image = make_test_image(None, None, vec![], None);
+        let mut req = base_req(None);
+        req.security_opts = vec!["seccomp=unconfined".to_string()];
+        let spec = resolve_run_spec(req, image).unwrap();
+        assert_eq!(spec.seccomp_policy, SeccompPolicy::Unconfined);
+    }
+
+    #[test]
+    fn resolve_seccomp_policy_is_last_wins_and_rejects_unknown_options() {
+        // last-wins like docker
+        assert_eq!(
+            resolve_seccomp_policy(
+                SeccompPolicy::ContainerDefault,
+                &[
+                    "seccomp=unconfined".to_string(),
+                    "seccomp=default".to_string()
+                ],
+            ),
+            Ok(SeccompPolicy::ContainerDefault)
+        );
+        // run-elf shape: explicit opt-IN over an Unconfined default
+        assert_eq!(
+            resolve_seccomp_policy(SeccompPolicy::Unconfined, &["seccomp=builtin".to_string()]),
+            Ok(SeccompPolicy::ContainerDefault)
+        );
+        assert_eq!(
+            resolve_seccomp_policy(SeccompPolicy::Unconfined, &[]),
+            Ok(SeccompPolicy::Unconfined)
+        );
+        // Refuse (never silently ignore) security options carrick can't honor.
+        assert!(
+            resolve_seccomp_policy(
+                SeccompPolicy::ContainerDefault,
+                &["seccomp=/etc/profile.json".to_string()],
+            )
+            .is_err()
+        );
+        assert!(
+            resolve_seccomp_policy(
+                SeccompPolicy::ContainerDefault,
+                &["apparmor=unconfined".to_string()],
+            )
+            .is_err()
+        );
     }
 
     #[test]

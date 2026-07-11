@@ -294,6 +294,30 @@ pub enum NetworkMode {
     None,
 }
 
+/// Launch-time container syscall policy — carrick's model of
+/// `docker run --security-opt seccomp=...`.
+///
+/// Docker installs its default seccomp profile at container launch, BEFORE the
+/// entrypoint runs; syscalls the profile lists fail with a configured errno
+/// (EPERM) without ever reaching a kernel handler. carrick models that as a
+/// launch-time deny table consulted at the dispatch-entry seam (see
+/// `carrick_runtime::container_policy`) — never by editing individual syscall
+/// handlers to fabricate policy-shaped errnos (recorded maintainer ruling,
+/// 2026-07-10). `ContainerDefault` is the serde default so a persisted
+/// container spec is docker-shaped; bare-ELF drivers (`run-elf`,
+/// `carrick-kvm run-elf`) explicitly choose `Unconfined`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SeccompPolicy {
+    /// Model of Docker's default seccomp profile (a launch-time syscall-deny
+    /// table applied before dispatch, inherited by the whole process tree).
+    #[default]
+    ContainerDefault,
+    /// No launch-time syscall policy (`--security-opt seccomp=unconfined`):
+    /// every syscall reaches its handler; absent backends stay honest ENOSYS.
+    Unconfined,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct NetworkNamespaceId(String);
 
@@ -763,6 +787,12 @@ pub struct RunSpec {
     /// with no group, docker uses gid 0.
     #[serde(default)]
     pub gid: u32,
+    /// Launch-time container syscall policy (`--security-opt seccomp=...`).
+    /// Serde-defaults to [`SeccompPolicy::ContainerDefault`]: a container spec
+    /// is docker-shaped, and docker applies its default profile unless the user
+    /// asks for `unconfined`.
+    #[serde(default)]
+    pub seccomp_policy: SeccompPolicy,
 }
 
 #[cfg(test)]
@@ -790,6 +820,9 @@ mod tests {
         assert_eq!(spec.network.mode, NetworkMode::Host);
         assert!(spec.network.namespace_id.is_none());
         assert!(spec.network.published_ports.is_empty());
+        // A container spec without the field is docker-shaped: the launch-time
+        // default seccomp model applies.
+        assert_eq!(spec.seccomp_policy, SeccompPolicy::ContainerDefault);
     }
 
     #[test]

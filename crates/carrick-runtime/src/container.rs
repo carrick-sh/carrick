@@ -170,6 +170,11 @@ pub struct RunConfig {
     /// Grace seconds before `SIGKILL` (`--stop-timeout`). `None` falls back to
     /// `stop -t`, else 10.
     pub stop_timeout: Option<u64>,
+    /// Raw `--security-opt` values (docker syntax), preserved so start/restart
+    /// and `exec` run under the same launch-time syscall policy the container
+    /// was created with (empty = docker's default profile model).
+    #[serde(default)]
+    pub security_opts: Vec<String>,
 }
 
 fn default_max_traps() -> usize {
@@ -232,6 +237,7 @@ impl Default for RunConfig {
             max_traps: default_max_traps(),
             stop_signal: None,
             stop_timeout: None,
+            security_opts: Vec::new(),
         }
     }
 }

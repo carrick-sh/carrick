@@ -131,6 +131,12 @@ pub(crate) enum Commands {
         /// Page profile for the native execution backend.
         #[arg(long = "native-page-profile", value_enum, default_value_t = NativePageProfileRequest::Auto, env = "CARRICK_NATIVE_PAGE_PROFILE")]
         native_page_profile: NativePageProfileRequest,
+        /// Launch-time syscall policy. `run-elf` drives a bare host ELF and
+        /// defaults to UNCONFINED (no policy); pass `seccomp=default` to opt
+        /// into the container policy model `carrick run` applies by default
+        /// (the shape the conformance Docker oracle runs under).
+        #[arg(long = "security-opt", value_name = "OPTION")]
+        security_opt: Vec<String>,
         #[arg(last = true)]
         args: Vec<String>,
     },
@@ -381,6 +387,12 @@ pub(crate) enum Commands {
         /// Publish a container's port(s) to the host (no-op under host networking)
         #[arg(short = 'p', long = "publish", value_name = "hostPort:containerPort")]
         publish: Vec<String>,
+        /// Docker-compatible security options. Supported: `seccomp=unconfined`
+        /// (disable the launch-time default syscall policy — carrick's model of
+        /// Docker's builtin seccomp profile) and `seccomp=default`/
+        /// `seccomp=builtin`. Custom profile files are not supported.
+        #[arg(long = "security-opt", value_name = "OPTION")]
+        security_opt: Vec<String>,
         /// `KEY=VAL` env vars to set in this process before the guest starts.
         /// Carries `CARRICK_*` tunables across `sudo`'s env_reset without needing
         /// SETENV in sudoers (CLI args survive sudo where env vars don't). Same
@@ -473,6 +485,9 @@ pub(crate) enum Commands {
         /// Seconds to wait before SIGKILL when stopping. Defaults to 10.
         #[arg(long = "stop-timeout", value_name = "SECONDS")]
         stop_timeout: Option<u64>,
+        /// Docker-compatible security options (see `run --security-opt`).
+        #[arg(long = "security-opt", value_name = "OPTION")]
+        security_opt: Vec<String>,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
