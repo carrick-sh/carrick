@@ -4466,6 +4466,8 @@ impl SyscallDispatcher {
             locked_memory: mem.locked_ranges,
             brk_current: mem.brk_current,
             mmap_next: mem.mmap_next,
+            heap_base: mem.layout.heap_base,
+            native_guest_va: self.page_geometry().native_geometry().is_some(),
             ruid: creds.ruid,
             euid: creds.euid,
             suid: creds.suid,
