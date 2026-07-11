@@ -5,7 +5,9 @@ use super::block::{BlockPlan, PlannedExit, PlannedInst};
 use super::cache::TranslationCache;
 use super::emit::emit_block;
 use super::gateway::enter_translated;
-use super::types::{CodeGeneration, DsrError, InstAction, NativeDsrExit};
+use super::types::{
+    CodeGeneration, DsrError, InstAction, NativeDsrExit, PcRelativeInst, PcRelativeKind,
+};
 
 fn legacy_brk_round_trip(
     entry: super::types::CacheVa,
@@ -128,6 +130,182 @@ fn dsr_gateway_preserves_full_state_around_enumerated_change() {
     assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
     assert!(libc::WIFEXITED(status), "child status was 0x{status:x}");
     assert_eq!(libc::WEXITSTATUS(status), 0);
+}
+
+#[test]
+fn dsr_pc_relative_adr_materializes_guest_target() {
+    let mut stack = vec![0_u8; 16 * 1024];
+    let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    let target = GuestVa(0x1234_5678_9abc_def0);
+    let plan = BlockPlan {
+        start: GuestVa(0x4000),
+        end: GuestVa(0x4008),
+        generation: CodeGeneration::INITIAL,
+        instructions: vec![PlannedInst {
+            guest: GuestVa(0x4000),
+            action: InstAction::PcRelative(PcRelativeInst {
+                kind: PcRelativeKind::Adr,
+                target,
+                destination: Some(bad64::Reg::X0),
+                word: 0x1000_0000,
+            }),
+        }],
+        exit: PlannedExit::Syscall {
+            guest: GuestVa(0x4004),
+            resume: GuestVa(0x4008),
+        },
+    };
+    let mut cache = TranslationCache::new(16 * 1024).expect("allocate PC-relative cache");
+    let emitted = emit_block(&mut cache, &plan).expect("emit ADR relocation");
+    let mut exit = NativeDsrExit::Syscall {
+        resume: GuestVa(0x4008),
+    };
+    enter_translated(emitted.entry(), &mut snapshot, &mut exit).expect("execute ADR relocation");
+    assert_eq!(snapshot.x[0], target.raw());
+}
+
+#[test]
+fn dsr_pc_relative_literal_load_reads_guest_address() {
+    let mut stack = vec![0_u8; 16 * 1024];
+    let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    let value = 0x8877_6655_4433_2211_u64;
+    let target = GuestVa((&value as *const u64) as u64);
+    let plan = BlockPlan {
+        start: GuestVa(0x5000),
+        end: GuestVa(0x5008),
+        generation: CodeGeneration::INITIAL,
+        instructions: vec![PlannedInst {
+            guest: GuestVa(0x5000),
+            action: InstAction::PcRelative(PcRelativeInst {
+                kind: PcRelativeKind::LiteralLoad,
+                target,
+                destination: Some(bad64::Reg::X0),
+                word: 0x5800_0000,
+            }),
+        }],
+        exit: PlannedExit::Syscall {
+            guest: GuestVa(0x5004),
+            resume: GuestVa(0x5008),
+        },
+    };
+    let mut cache = TranslationCache::new(16 * 1024).expect("allocate literal-load cache");
+    let emitted = emit_block(&mut cache, &plan).expect("emit literal-load relocation");
+    let mut exit = NativeDsrExit::Syscall {
+        resume: GuestVa(0x5008),
+    };
+    enter_translated(emitted.entry(), &mut snapshot, &mut exit)
+        .expect("execute literal-load relocation");
+    assert_eq!(snapshot.x[0], value);
+}
+
+#[test]
+fn dsr_pc_relative_literals_cover_integer_simd_prefetch_and_virtual_x18() {
+    let mut stack = vec![0_u8; 16 * 1024];
+    let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    let expected_x17 = snapshot.x[17];
+    let word_value = 0xfedc_ba98_u32;
+    let signed_value = -123_456_i32;
+    let x18_value = 0x8877_6655_4433_2211_u64;
+    let ignored_value = 0xdead_beef_cafe_babe_u64;
+    let s_value = 0x1122_3344_u32;
+    let d_value = 0x0123_4567_89ab_cdef_u64;
+    let q_value = 0xfedc_ba98_7654_3210_0123_4567_89ab_cdef_u128;
+    let cases = [
+        (0x1800_0000, (&word_value as *const u32) as u64), // ldr w0, literal
+        (0x9800_0001, (&signed_value as *const i32) as u64), // ldrsw x1, literal
+        (0x5800_0012, (&x18_value as *const u64) as u64),  // ldr x18, literal
+        (0x5800_001f, (&ignored_value as *const u64) as u64), // ldr xzr, literal
+        (0x1800_001f, (&word_value as *const u32) as u64), // ldr wzr, literal
+        (0x1c00_0002, (&s_value as *const u32) as u64),    // ldr s2, literal
+        (0x5c00_0003, (&d_value as *const u64) as u64),    // ldr d3, literal
+        (0x9c00_0004, (&q_value as *const u128) as u64),   // ldr q4, literal
+        (0xd800_0000, (&ignored_value as *const u64) as u64), // prfm literal
+    ];
+    let instructions = cases
+        .into_iter()
+        .enumerate()
+        .map(|(index, (word, target))| PlannedInst {
+            guest: GuestVa(0x6000 + index as u64 * 4),
+            action: super::decode::classify(word, GuestVa(0x6000 + index as u64 * 4))
+                .and_then(|action| match action {
+                    InstAction::PcRelative(mut relative) => {
+                        relative.target = GuestVa(target);
+                        Ok(InstAction::PcRelative(relative))
+                    }
+                    _ => Err(DsrError::BlockPolicy(format!(
+                        "literal test word 0x{word:08x} did not classify as PC-relative"
+                    ))),
+                })
+                .expect("classify literal test instruction"),
+        })
+        .collect::<Vec<_>>();
+    let exit_pc = GuestVa(0x6000 + instructions.len() as u64 * 4);
+    let plan = BlockPlan {
+        start: GuestVa(0x6000),
+        end: GuestVa(exit_pc.raw() + 4),
+        generation: CodeGeneration::INITIAL,
+        instructions,
+        exit: PlannedExit::Syscall {
+            guest: exit_pc,
+            resume: GuestVa(exit_pc.raw() + 4),
+        },
+    };
+    let mut cache = TranslationCache::new(16 * 1024).expect("allocate literal matrix cache");
+    let emitted = emit_block(&mut cache, &plan).expect("emit literal relocation matrix");
+    for offset in (0..emitted.len()).step_by(4) {
+        let address = emitted.entry().host().raw() + offset;
+        let word = unsafe { std::ptr::read_unaligned(address as *const u32) };
+        bad64::decode(word, address as u64).expect("decode emitted literal lowering");
+    }
+    let mut exit = NativeDsrExit::Syscall {
+        resume: GuestVa(exit_pc.raw() + 4),
+    };
+    enter_translated(emitted.entry(), &mut snapshot, &mut exit)
+        .expect("execute literal relocation matrix");
+
+    assert_eq!(snapshot.x[0], u64::from(word_value));
+    assert_eq!(snapshot.x[1], signed_value as i64 as u64);
+    assert_eq!(snapshot.x[17], expected_x17);
+    assert_eq!(snapshot.x[18], x18_value);
+    assert_eq!(&snapshot.v[2][..4], &s_value.to_le_bytes());
+    assert_eq!(snapshot.v[2][4..], [0; 12]);
+    assert_eq!(&snapshot.v[3][..8], &d_value.to_le_bytes());
+    assert_eq!(snapshot.v[3][8..], [0; 8]);
+    assert_eq!(snapshot.v[4], q_value.to_le_bytes());
+}
+
+#[test]
+fn dsr_pc_relative_adrp_writes_virtual_guest_x18_without_clobbering_x17() {
+    let mut stack = vec![0_u8; 16 * 1024];
+    let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    let expected_x17 = snapshot.x[17];
+    let target = GuestVa(0xffff_1234_5678_9000);
+    let plan = BlockPlan {
+        start: GuestVa(0x7000),
+        end: GuestVa(0x7008),
+        generation: CodeGeneration::INITIAL,
+        instructions: vec![PlannedInst {
+            guest: GuestVa(0x7000),
+            action: InstAction::PcRelative(PcRelativeInst {
+                kind: PcRelativeKind::Adrp,
+                target,
+                destination: Some(bad64::Reg::X18),
+                word: 0x9000_0012,
+            }),
+        }],
+        exit: PlannedExit::Syscall {
+            guest: GuestVa(0x7004),
+            resume: GuestVa(0x7008),
+        },
+    };
+    let mut cache = TranslationCache::new(16 * 1024).expect("allocate ADRP cache");
+    let emitted = emit_block(&mut cache, &plan).expect("emit ADRP relocation");
+    let mut exit = NativeDsrExit::Syscall {
+        resume: GuestVa(0x7008),
+    };
+    enter_translated(emitted.entry(), &mut snapshot, &mut exit).expect("execute ADRP relocation");
+    assert_eq!(snapshot.x[17], expected_x17);
+    assert_eq!(snapshot.x[18], target.raw());
 }
 
 #[test]

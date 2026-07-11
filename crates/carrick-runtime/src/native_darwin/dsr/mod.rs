@@ -222,6 +222,21 @@ mod tests {
                     if inst.kind == PcRelativeKind::Adr && inst.target == expected
             ));
         }
+
+        #[test]
+        fn adrp_targets_follow_signed_page_imm21(page_offset in -0x10_0000_i32..=0x0f_ffff_i32) {
+            let pc = GuestVa(0x1_0000_0abc);
+            let immediate = (page_offset as u32) & 0x001f_ffff;
+            let immlo = immediate & 0x3;
+            let immhi = immediate >> 2;
+            let word = 0x9000_0000 | (immlo << 29) | (immhi << 5);
+            let expected = GuestVa((pc.raw() & !0xfff).wrapping_add_signed(i64::from(page_offset) * 4096));
+            prop_assert!(matches!(
+                classify(word, pc),
+                Ok(InstAction::PcRelative(inst))
+                    if inst.kind == PcRelativeKind::Adrp && inst.target == expected
+            ));
+        }
     }
 
     #[test]

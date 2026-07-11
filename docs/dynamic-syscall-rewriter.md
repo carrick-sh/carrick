@@ -652,9 +652,13 @@ plan.
 - [ ] **Step 1: Write generated relocation tests across distance classes**
 
   For each instruction, generate guest and cache addresses that are near, far,
-  positive, negative, page-aligned, and page-crossing. Assert the translated
-  destination register or loaded value equals direct execution. Include xzr/wzr
-  and 32-bit destination behavior where architecturally legal.
+  positive, negative, page-aligned, and page-crossing. For `adr`/`adrp`, derive
+  the architectural target independently from the encoded immediate and compare
+  it with the translated destination; direct execution at the cache address is
+  not a valid oracle because it has a different PC. For literal operations,
+  compare the translated loaded value and preserved state with ordinary host
+  memory values. Include xzr/wzr and 32-bit destination behavior where
+  architecturally legal.
 
 - [ ] **Step 2: Verify red**
 
@@ -666,15 +670,16 @@ plan.
 
   Expected: tests fail with the typed unsupported action from Task 4.
 
-- [ ] **Step 3: Emit relocations with `dynasmrt`**
+- [ ] **Step 3: Emit relocations with audited AArch64 encodings**
 
-  Prefer a single equivalent instruction when the translated displacement fits.
-  Otherwise materialize the guest architectural address in a scratch-free
-  sequence that targets only the original destination register. Literal loads
-  load from the original guest data address, not a copied constant, so guest
-  writes remain visible. If an instruction cannot be expanded without a scratch
-  register or semantic loss, end the block and route through a correct slow exit
-  before adding an optimized form.
+  Materialize `adr`/`adrp` targets directly in the architectural destination.
+  Materialize integer literal addresses in their destination before loading.
+  SIMD loads, prefetches, zero-register destinations, and virtual guest x18 use
+  physical x17 only after saving its current guest value in `DsrContext`, and
+  restore it before the next guest instruction. Literal loads read the original
+  guest data address, not a copied constant, so guest writes remain visible.
+  Decode every fixed encoding in tests and route any unreviewed PC-relative form
+  through a typed unsupported exit.
 
 - [ ] **Step 4: Verify and commit**
 
@@ -682,11 +687,12 @@ plan.
 
   ```bash
   cargo test -p carrick-runtime dsr_pc_relative --lib
-  cargo test -p carrick-runtime dsr_oracle --lib
+  cargo test -p carrick-runtime native_darwin::dsr::oracle --lib
   ```
 
-  Expected: all generated cases match direct execution and decode-back checks
-  confirm targets.
+  Expected: generated immediate targets match independently derived AArch64
+  semantics; literal values and preserved state match host memory; and every
+  emitted instruction decodes at its published cache address.
 
   Commit: `feat(native): relocate DSR PC-relative instructions`
 

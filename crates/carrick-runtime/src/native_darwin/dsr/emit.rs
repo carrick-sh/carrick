@@ -157,6 +157,159 @@ fn emit_mov_u64(
     Ok(())
 }
 
+fn emit_word(
+    assembler: &mut VecAssembler<Aarch64Relocation>,
+    entries: &mut Vec<PcMapEntry>,
+    guest: GuestVa,
+    word: u32,
+) -> Result<(), DsrError> {
+    map_next(assembler, entries, guest)?;
+    assembler.push_u32(word);
+    Ok(())
+}
+
+fn gpr_index(register: bad64::Reg) -> Option<u32> {
+    let raw = register as u32;
+    let first = bad64::Reg::X0 as u32;
+    let last = bad64::Reg::X30 as u32;
+    (first..=last).contains(&raw).then_some(raw - first)
+}
+
+fn emit_pc_relative_address(
+    assembler: &mut VecAssembler<Aarch64Relocation>,
+    entries: &mut Vec<PcMapEntry>,
+    plan: &BlockPlan,
+    guest: GuestVa,
+    relative: super::types::PcRelativeInst,
+) -> Result<(), DsrError> {
+    let destination = relative.destination.ok_or_else(|| {
+        unsupported_action(
+            plan,
+            guest,
+            relative.word,
+            "PC-relative instruction without destination",
+        )
+    })?;
+    let register = gpr_index(destination).ok_or_else(|| {
+        unsupported_action(
+            plan,
+            guest,
+            relative.word,
+            "PC-relative non-GPR destination",
+        )
+    })?;
+    if register == 18 {
+        map_next(assembler, entries, guest)?;
+        dynasmrt::dynasm!(assembler
+            ; .arch aarch64
+            ; str x17, [x18, #136]
+        );
+        emit_mov_u64(assembler, entries, guest, 17, relative.target.raw())?;
+        map_next(assembler, entries, guest)?;
+        dynasmrt::dynasm!(assembler
+            ; .arch aarch64
+            ; str x17, [x18, #144]
+            ; ldr x17, [x18, #136]
+        );
+    } else {
+        emit_mov_u64(assembler, entries, guest, register, relative.target.raw())?;
+    }
+    Ok(())
+}
+
+fn emit_literal_with_x17_scratch(
+    assembler: &mut VecAssembler<Aarch64Relocation>,
+    entries: &mut Vec<PcMapEntry>,
+    guest: GuestVa,
+    target: GuestVa,
+    memory_word: u32,
+) -> Result<(), DsrError> {
+    emit_word(assembler, entries, guest, 0xf900_4651)?; // str x17, [x18, #136]
+    emit_mov_u64(assembler, entries, guest, 17, target.raw())?;
+    emit_word(assembler, entries, guest, memory_word)?;
+    emit_word(assembler, entries, guest, 0xf940_4651)?; // ldr x17, [x18, #136]
+    Ok(())
+}
+
+fn emit_pc_relative_literal(
+    assembler: &mut VecAssembler<Aarch64Relocation>,
+    entries: &mut Vec<PcMapEntry>,
+    plan: &BlockPlan,
+    guest: GuestVa,
+    relative: super::types::PcRelativeInst,
+) -> Result<(), DsrError> {
+    let opc = relative.word >> 30;
+    let vector = (relative.word >> 26) & 1 != 0;
+    let destination = relative.word & 0x1f;
+    if relative.kind == super::types::PcRelativeKind::LiteralPrefetch {
+        let word = 0xf980_0000 | (17 << 5) | destination;
+        return emit_literal_with_x17_scratch(assembler, entries, guest, relative.target, word);
+    }
+
+    if vector {
+        let base = match opc {
+            0 => 0xbd40_0000, // ldr St, [Xn]
+            1 => 0xfd40_0000, // ldr Dt, [Xn]
+            2 => 0x3dc0_0000, // ldr Qt, [Xn]
+            _ => {
+                return Err(unsupported_action(
+                    plan,
+                    guest,
+                    relative.word,
+                    "reserved SIMD literal load",
+                ));
+            }
+        };
+        let word = base | (17 << 5) | destination;
+        return emit_literal_with_x17_scratch(assembler, entries, guest, relative.target, word);
+    }
+
+    let base = match opc {
+        0 => 0xb940_0000, // ldr Wt, [Xn]
+        1 => 0xf940_0000, // ldr Xt, [Xn]
+        2 => 0xb980_0000, // ldrsw Xt, [Xn]
+        _ => {
+            return Err(unsupported_action(
+                plan,
+                guest,
+                relative.word,
+                "reserved integer literal load",
+            ));
+        }
+    };
+
+    if destination == 18 {
+        emit_word(assembler, entries, guest, 0xf900_4651)?;
+        emit_mov_u64(assembler, entries, guest, 17, relative.target.raw())?;
+        emit_word(assembler, entries, guest, base | (17 << 5) | 17)?;
+        emit_word(assembler, entries, guest, 0xf900_4a51)?; // str x17, [x18, #144]
+        emit_word(assembler, entries, guest, 0xf940_4651)?;
+    } else if destination == 31 {
+        emit_literal_with_x17_scratch(
+            assembler,
+            entries,
+            guest,
+            relative.target,
+            base | (17 << 5) | destination,
+        )?;
+    } else {
+        emit_mov_u64(
+            assembler,
+            entries,
+            guest,
+            destination,
+            relative.target.raw(),
+        )?;
+        emit_word(
+            assembler,
+            entries,
+            guest,
+            base | (destination << 5) | destination,
+        )?;
+    }
+    Ok(())
+}
+
 pub(super) fn emit_block(
     cache: &mut TranslationCache,
     plan: &BlockPlan,
@@ -179,13 +332,30 @@ pub(super) fn emit_block(
                     "virtualized x18 instruction",
                 ));
             }
-            InstAction::PcRelative(relative) => {
-                return Err(unsupported_action(
+            InstAction::PcRelative(relative)
+                if matches!(
+                    relative.kind,
+                    super::types::PcRelativeKind::Adr | super::types::PcRelativeKind::Adrp
+                ) =>
+            {
+                emit_pc_relative_address(
+                    &mut assembler,
+                    &mut entries,
                     plan,
                     instruction.guest,
-                    relative.word,
-                    "PC-relative instruction",
-                ));
+                    relative,
+                )?;
+                continue;
+            }
+            InstAction::PcRelative(relative) => {
+                emit_pc_relative_literal(
+                    &mut assembler,
+                    &mut entries,
+                    plan,
+                    instruction.guest,
+                    relative,
+                )?;
+                continue;
             }
             InstAction::Direct(_) => {
                 return Err(unsupported_action(
@@ -338,7 +508,7 @@ mod tests {
     }
 
     #[test]
-    fn dsr_emit_rejects_pc_relative_copy_subset() {
+    fn dsr_emit_relocates_pc_relative_address_subset() {
         let mut plan = copy_plan();
         plan.instructions[0].action = InstAction::PcRelative(PcRelativeInst {
             kind: PcRelativeKind::Adr,
@@ -347,17 +517,8 @@ mod tests {
             word: 0x1000_8000,
         });
         let mut cache = TranslationCache::new(16 * 1024).expect("allocate translation cache");
-        let error = match emit_block(&mut cache, &plan) {
-            Ok(_) => panic!("PC-relative instruction should not emit in Task 4"),
-            Err(error) => error,
-        };
-        assert!(matches!(
-            error,
-            DsrError::UnsupportedBlockAction {
-                class: "PC-relative instruction",
-                ..
-            }
-        ));
+        let emitted = emit_block(&mut cache, &plan).expect("emit relocated ADR");
+        assert!(emitted.len() > 36);
     }
 
     #[test]
