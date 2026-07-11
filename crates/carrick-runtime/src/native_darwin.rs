@@ -82,6 +82,15 @@ const _: () = assert!(carrick_mem::vdso::LINUX_VVAR_BASE & ((1 << 32) - 1) == 0)
 const NATIVE_DARWIN_HARD_PAGEZERO_END: u64 = 0x1_0000_0000;
 const NATIVE_EVENT_TRAP: i32 = 1;
 const NATIVE_EVENT_KICK: i32 = 2;
+
+/// True in a host process created by a GUEST `fork` (not the run-elf root
+/// child, which the CLI forks for isolation). Guest-forked children must exit
+/// through `exec_helpers::forked_child_exit` so their guest CPU is published
+/// for the parent's wait4/waitid child-time accounting (the HVF loop's
+/// `is_forked_guest_process` branch); the root child's exit is reported to the
+/// CLI, which does no such accounting. Survives execve (same host process).
+static NATIVE_FORKED_GUEST_CHILD: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 const VM_INHERIT_SHARE: libc::c_int = 0;
 const VM_INHERIT_COPY: libc::c_int = 1;
 
@@ -1271,6 +1280,20 @@ fn run_native_thread_loop(
                         resume_guest(va.raw(), resume_pc)?;
                     }
                     DispatchOutcome::Exit { code } => {
+                        if NATIVE_FORKED_GUEST_CHILD.load(std::sync::atomic::Ordering::Acquire) {
+                            // Mirror the HVF loop's forked-child exit: publish
+                            // this child's guest CPU (`record_child_exit`) so
+                            // the parent's wait4/waitid roll it into
+                            // RUSAGE_CHILDREN / times cutime, then `_exit`.
+                            // The vfork parent (if any) is released by the
+                            // completion pipe's EOF on `_exit`.
+                            dispatcher.cleanup_sysv_ipc_on_process_exit();
+                            crate::exec_helpers::forked_child_exit(
+                                code,
+                                dispatcher.stdout(),
+                                dispatcher.stderr(),
+                            );
+                        }
                         return Ok(NativeThreadLoopOutcome::ProcessExit(code));
                     }
                     other => {
@@ -2609,6 +2632,7 @@ fn handle_native_fork(
             close_fd(read_fd);
             *vfork_completion = Some(NativeVforkCompletion { fd: write_fd });
         }
+        NATIVE_FORKED_GUEST_CHILD.store(true, std::sync::atomic::Ordering::Release);
         native_trace_fork_phase("child-guard-installed");
         native_after_fork_child(dispatcher);
         native_trace_fork_phase("child-dispatcher-reset");
