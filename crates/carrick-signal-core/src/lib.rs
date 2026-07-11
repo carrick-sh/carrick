@@ -118,6 +118,23 @@ fn lock_thread_pending() -> std::sync::MutexGuard<'static, Option<HashMap<i32, u
     guard
 }
 
+/// ATFORK-PREPARE guard over the thread-pending table (see
+/// [`hold_thread_pending_for_fork`]): held by the FORKING thread across
+/// `fork()` so a fork child can never inherit `THREAD_PENDING`'s mutex in a
+/// LOCKED state from another thread (a backend's child-exit watcher or pump
+/// mid-`publish_pending_for`) — the child's signal reinit reads/clears the
+/// table and would otherwise park forever on the COW lock copy.
+pub struct ThreadPendingForkGuard(
+    #[allow(dead_code)] std::sync::MutexGuard<'static, Option<HashMap<i32, u64>>>,
+);
+
+/// Acquire the thread-pending mutex for an atfork-prepare hold across a host
+/// `fork()`. Drop the guard IMMEDIATELY after the fork returns, in BOTH
+/// processes, before any pending-table use (the mutex is not reentrant).
+pub fn hold_thread_pending_for_fork() -> ThreadPendingForkGuard {
+    ThreadPendingForkGuard(lock_thread_pending())
+}
+
 /// Set the thread-directed pending `signum` bit for `tid`. This is the pure
 /// store half of a thread-directed publish; backends layer their own wakeups
 /// (the HVF self-pipe / per-thread pipe; the KVM vCPU kick) around the call.

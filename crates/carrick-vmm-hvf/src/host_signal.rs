@@ -279,6 +279,34 @@ pub fn publish_pending_for(tid: i32, signum: i32) {
     wake_signal_pump_pipe();
 }
 
+/// ATFORK-PREPARE bundle for a guest `fork`: every fork-shared signal-static
+/// mutex that a NON-forking auxiliary thread can hold — the child-exit
+/// watcher publishing an exit (`child_watch` tables → `publish_pending_for`'s
+/// `THREAD_PENDING` → `wake_thread_waiter`'s `THREAD_WAITERS`). The FORKING
+/// thread acquires the bundle immediately before `libc::fork()` and drops it
+/// immediately after in BOTH processes; a fork child therefore never inherits
+/// one of these mutexes in a LOCKED state (a COW lock no surviving child
+/// thread would ever release — the child's `reinit_after_fork` →
+/// `child_watch::clear` wedge behind the execpermitchurn load TIMEOUTs).
+/// The three stores are only ever locked transiently and non-nested, so the
+/// bundle acquisition cannot deadlock against their users.
+pub struct SignalForkLocks {
+    _child_watch: carrick_signal_core::child_watch::ChildWatchForkGuard,
+    _thread_pending: carrick_signal_core::ThreadPendingForkGuard,
+    _waiters: parking_lot::MutexGuard<'static, HashMap<i32, ThreadWakeRegistration>>,
+}
+
+/// Acquire the atfork-prepare bundle (see [`SignalForkLocks`]). Call
+/// immediately before `libc::fork()`; drop immediately after in both
+/// processes, strictly before any child-side signal reinit.
+pub fn hold_signal_locks_for_fork() -> SignalForkLocks {
+    SignalForkLocks {
+        _child_watch: carrick_signal_core::child_watch::hold_for_fork(),
+        _thread_pending: carrick_signal_core::hold_thread_pending_for_fork(),
+        _waiters: THREAD_WAITERS.lock(),
+    }
+}
+
 /// Record that guest tid `parent_tid` forked child `child_pid`, and arm an
 /// `EVFILT_PROC`/`NOTE_EXIT` watch for the child on the signal pump's kqueue so
 /// the pump publishes SIGCHLD to `parent_tid` when the child exits. Called from
