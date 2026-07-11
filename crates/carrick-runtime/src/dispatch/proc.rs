@@ -2752,9 +2752,14 @@ impl SyscallDispatcher {
                     && !options.contains(LinuxWaitOptions::WNOWAIT)
                     && terminal
                 {
-                    let child_guest_us =
-                        crate::guest_cpu::reap_child_guest_ns(carrick_portable::si_pid(&info) as u32) / 1000;
-                    crate::guest_cpu::add_reaped_child(child_guest_us, 0);
+                    // Host waitid returns no rusage; the published channel is
+                    // the only source (under the native provider it carries the
+                    // child's full Darwin CPU, published at exit).
+                    let child_guest_ns =
+                        crate::guest_cpu::reap_child_guest_ns(carrick_portable::si_pid(&info) as u32);
+                    let (child_user_us, child_system_us) =
+                        crate::guest_cpu::reaped_child_cpu_parts(child_guest_ns, None);
+                    crate::guest_cpu::add_reaped_child(child_user_us, child_system_us);
                     // Tear down the now-dead child's leaked host VM node (bhyve);
                     // no-op on KVM/HVF. See the wait4 reap path.
                     carrick_hal::vm_backend::reap_child_vm(carrick_portable::si_pid(&info) as u32);
@@ -3066,10 +3071,14 @@ impl SyscallDispatcher {
                         && let Some((pid, status, guest_ns)) =
                             crate::guest_cpu::reap_adopted_child(std::process::id(), host_target)
                     {
-                        let child_user_us = guest_ns / 1000;
-                        crate::guest_cpu::add_reaped_child(child_user_us, 0);
+                        // Adopted reap: this process was never the host parent,
+                        // so there is no host rusage — the published channel is
+                        // the only source under every provider.
+                        let (child_user_us, child_system_us) =
+                            crate::guest_cpu::reaped_child_cpu_parts(guest_ns, None);
+                        crate::guest_cpu::add_reaped_child(child_user_us, child_system_us);
                         if rusage_addr.0 != 0 {
-                            let child_rusage = rusage_from_us(child_user_us, 0);
+                            let child_rusage = rusage_from_us(child_user_us, child_system_us);
                             if memory
                                 .write_bytes(rusage_addr.0, child_rusage.abi_bytes())
                                 .is_err()
@@ -3219,13 +3228,18 @@ impl SyscallDispatcher {
             }
             let tv_us = |t: libc::timeval| t.tv_sec as u64 * 1_000_000 + t.tv_usec as u64;
             let drain_child_guest_cpu = should_drain_child_guest_cpu(transport, terminal_reap);
-            let child_guest_us = if drain_child_guest_cpu {
-                crate::guest_cpu::reap_child_guest_ns(result as u32) / 1000
+            let child_guest_ns = if drain_child_guest_cpu {
+                crate::guest_cpu::reap_child_guest_ns(result as u32)
             } else {
                 0
             };
-            let child_user_us = child_guest_us + tv_us(host_rusage.ru_utime);
-            let child_system_us = tv_us(host_rusage.ru_stime);
+            // The published-guest-CPU channel and the host wait4 rusage combine
+            // per-provider (additive under VMMs, host-authoritative under the
+            // native backend) — single-sourced in `reaped_child_cpu_parts`.
+            let (child_user_us, child_system_us) = crate::guest_cpu::reaped_child_cpu_parts(
+                child_guest_ns,
+                Some((tv_us(host_rusage.ru_utime), tv_us(host_rusage.ru_stime))),
+            );
             if drain_child_guest_cpu {
                 crate::guest_cpu::add_reaped_child(child_user_us, child_system_us);
             }
