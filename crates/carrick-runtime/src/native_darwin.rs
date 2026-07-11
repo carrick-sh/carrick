@@ -880,6 +880,18 @@ fn run_image_in_current_process(
         apply_native_relative_relocations(&mut memory, relative_relocations)?;
     }
     let _ = crate::ulock::preinit_waiter_table();
+    // PID-namespace launch placement (container path only; `run-elf` never
+    // requests it): the same identity-init fallback as the HVF threaded loop —
+    // this process becomes the ns-init (ns-pid 1), and every native fork
+    // descendant registers through the inherited shared region
+    // (`allocate_child_ns_pid_pre_fork` in `handle_native_fork`). Without this
+    // the request made by `Runtime::execute` was silently dropped, so a native
+    // container ran with HOST pids: the container root was not pid 1 and its
+    // children's getppid() never read 1 (the pidnsroot divergence). Must run
+    // before the guest's first fork so descendants inherit one mapping.
+    if crate::namespace::pid::requested() && !crate::namespace::pid::enabled() {
+        let _ = crate::namespace::pid::init(std::process::id());
+    }
     // Guest code runs natively on host threads here, so Darwin's own process
     // accounting is the guest CPU clock (times/getrusage//proc/stat/CPU
     // itimers/RLIMIT_CPU all read through guest_cpu). Process state: forked
