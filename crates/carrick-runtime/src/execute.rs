@@ -279,6 +279,10 @@ impl Runtime {
                     dispatcher.set_cwd(cwd.as_str());
                 }
                 dispatcher.set_credentials(spec.uid, spec.gid);
+                // Launch-time container syscall policy (the Docker default-
+                // seccomp model, or unconfined) — before boot, inherited by the
+                // whole guest process tree. See crate::container_policy.
+                dispatcher.apply_seccomp_policy(spec.seccomp_policy);
 
                 let hosts_entries = runtime_network.guest_hosts_entries().map_err(|e| {
                     RuntimeError::Unsupported(format!("network hosts setup failed: {e}"))
@@ -395,6 +399,8 @@ impl Runtime {
                     dispatcher.set_cwd(cwd.as_str());
                 }
                 dispatcher.set_credentials(spec.uid, spec.gid);
+                // Same launch-time policy application as the Host branch.
+                dispatcher.apply_seccomp_policy(spec.seccomp_policy);
 
                 install_fs_backend(
                     &mut dispatcher,
@@ -775,6 +781,7 @@ mod exit_code_tests {
             extra_hosts: Vec::new(),
             uid: 0,
             gid: 0,
+            seccomp_policy: carrick_spec::SeccompPolicy::ContainerDefault,
         }
     }
 

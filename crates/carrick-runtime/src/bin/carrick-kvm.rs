@@ -78,6 +78,9 @@ fn main() {
                 extra_hosts: Vec::new(),
                 uid: 0,
                 gid: 0,
+                // run-oci is a container-shaped dev driver: model docker's
+                // launch-time default seccomp policy like `carrick run`.
+                seccomp_policy: carrick_spec::SeccompPolicy::ContainerDefault,
             };
             match carrick_runtime::runtime::run_oci(&spec) {
                 Ok(result) => {

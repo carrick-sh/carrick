@@ -222,6 +222,7 @@ fn build_created_state(
             max_traps: req.max_traps,
             stop_signal,
             stop_timeout: req.stop_timeout,
+            security_opts: req.security_opts.clone(),
         },
     }
 }
@@ -403,6 +404,7 @@ fn rebuild_request_from_state(state: &ContainerState) -> carrick_engine::CliRunR
         // preserved across relaunch; engine.run ignores these, so leave unset.
         stop_signal: None,
         stop_timeout: None,
+        security_opts: c.security_opts.clone(),
     }
 }
 
@@ -1202,6 +1204,9 @@ pub(crate) fn exec(
         // `stop`ped, so it carries no stop config.
         stop_signal: None,
         stop_timeout: None,
+        // docker exec runs under the container's seccomp profile: reuse the
+        // container's persisted security options.
+        security_opts: state.config.security_opts.clone(),
     };
 
     let engine = carrick_engine::Engine::new(store);
@@ -1826,6 +1831,7 @@ mod tests {
                 max_traps: 4242,
                 stop_signal: Some(libc::SIGQUIT),
                 stop_timeout: Some(15),
+                security_opts: vec!["seccomp=unconfined".into()],
             },
         }
     }
@@ -1858,6 +1864,9 @@ mod tests {
         assert_eq!(req.pid, carrick_spec::PidMode::Private);
         assert_eq!(req.network_aliases, vec!["api".to_string()]);
         assert!(!req.rm);
+        // start/restart relaunch under the SAME launch-time syscall policy the
+        // container was created with.
+        assert_eq!(req.security_opts, vec!["seccomp=unconfined".to_string()]);
     }
 
     #[test]

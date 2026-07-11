@@ -1715,6 +1715,15 @@ pub struct SyscallDispatcher {
     /// process memory copy and sibling threads share them (process-wide), which
     /// matches Linux's filter-inheritance semantics. See [`crate::seccomp`].
     seccomp: crate::seccomp::SeccompState,
+    /// Launch-time container syscall-deny policy (the Docker default-seccomp
+    /// model), checked at dispatch entry before any handler — alongside the
+    /// guest-installed filters above, which stack on top of it exactly like a
+    /// guest filter stacks on Docker's launch profile. `None` = unconfined.
+    /// Plain field set once before boot (`apply_seccomp_policy`), read through
+    /// `&self`; a forked child inherits it via the process memory copy and it
+    /// survives in-process execve — per-process-tree, like a seccomp filter.
+    /// See [`crate::container_policy`].
+    container_policy: Option<crate::container_policy::ContainerPolicy>,
     /// SysV shared-memory registry (per-process; host-file-backed so forked
     /// guests share segments by inode through `/tmp/carrick-shm/`).
     sysv: Mutex<sysv::SysvShmState>,
@@ -2007,6 +2016,9 @@ impl SyscallDispatcher {
             signal: Mutex::new(signal::SignalState::new()),
             fs: fs::FsState::new(),
             seccomp: crate::seccomp::SeccompState::default(),
+            // Unconfined until a frontend applies a policy: bare run-elf boots
+            // and unit tests keep today's handler-honest behavior.
+            container_policy: None,
             sysv: Mutex::new(sysv::SysvShmState::new()),
             network: std::sync::Arc::new(crate::network::RuntimeNetwork::host_default()),
             page_geometry: crate::page_profile::PageGeometry {
@@ -2504,6 +2516,43 @@ impl SyscallDispatcher {
         self.dispatch_inner(request, memory, reporter, None)
     }
 
+    /// Apply a launch-time container syscall policy (the `carrick run` /
+    /// `--security-opt seccomp=…` resolution). Must be called before the guest
+    /// boots — the field is then read-only and inherited across guest
+    /// fork/execve like a Linux seccomp filter. `Unconfined` clears it.
+    pub fn apply_seccomp_policy(&mut self, policy: carrick_spec::SeccompPolicy) {
+        self.container_policy = match policy {
+            carrick_spec::SeccompPolicy::ContainerDefault => {
+                Some(crate::container_policy::ContainerPolicy::docker_default_model())
+            }
+            carrick_spec::SeccompPolicy::Unconfined => None,
+        };
+    }
+
+    /// Evaluate the launch-time container deny table against `request` before
+    /// its handler runs — the carrick seam where Docker's default seccomp
+    /// profile sits (after the guest issues the syscall, before any handler).
+    /// Returns `Some(errno outcome)` for a policy-denied call, `None` to pass
+    /// through. The denial is recorded as a *policy* event (distinct from
+    /// `UnhandledSyscall`, so coverage reporting never counts it as an
+    /// unimplemented handler).
+    fn container_policy_precheck(
+        &self,
+        request: &SyscallRequest,
+        reporter: &CompatReporter,
+    ) -> Option<DispatchOutcome> {
+        let policy = self.container_policy.as_ref()?;
+        let errno = policy.denied_errno(request.number.raw())?;
+        let name = lookup_aarch64(request.number.raw()).map_or("unknown", |syscall| syscall.name);
+        reporter.record(CompatEvent::partial_syscall(
+            request.number.raw(),
+            name,
+            request.args,
+            "denied by launch-time container syscall policy (Docker default-seccomp model)",
+        ));
+        Some(DispatchOutcome::Errno { errno })
+    }
+
     /// Evaluate installed seccomp filters against `request` before its handler
     /// runs. Returns `Some(outcome)` when a filter blocks the call (ERRNO →
     /// that errno; KILL/TRAP → terminate, fail-closed), or `None` to allow it.
@@ -2559,7 +2608,14 @@ impl SyscallDispatcher {
     }
 
     pub(crate) fn identity_fast_path_enabled(&self) -> bool {
+        // The EL1 shim answers identity syscalls without a dispatch, so it must
+        // be off whenever a guest filter is active OR the launch-time policy
+        // denies an identity syscall (the Docker default model never does —
+        // container runs keep the fast path).
         !self.seccomp.is_active()
+            && !self.container_policy.as_ref().is_some_and(|policy| {
+                policy.denies_any(crate::container_policy::IDENTITY_FAST_PATH_SYSCALLS)
+            })
     }
 
     // (see `watch_addr` below)
@@ -2577,6 +2633,13 @@ impl SyscallDispatcher {
         registry: &crate::thread::ThreadRegistry,
         futex: &crate::thread::FutexTable,
     ) -> Result<DispatchOutcome, DispatchError> {
+        // Launch-time container policy first (it is installed before the guest
+        // boots, like Docker's profile), then guest-installed seccomp filters —
+        // both process-wide, both before any handler, including the lockless
+        // hot path.
+        if let Some(outcome) = self.container_policy_precheck(&request, reporter) {
+            return Ok(outcome);
+        }
         // seccomp veto applies on the multi-threaded path too (filters are
         // process-wide), before any handler — including the lockless hot path.
         if let Some(outcome) = self.seccomp_precheck(&request) {
@@ -2852,6 +2915,20 @@ impl SyscallDispatcher {
             name: ::std::borrow::Cow::Borrowed(name),
             args: request.args,
         });
+
+        // Launch-time container policy: the Docker default-seccomp model vetoes
+        // a denied syscall before its handler runs, exactly where the guest's
+        // own filters are checked below.
+        if let Some(outcome) = self.container_policy_precheck(&request, reporter) {
+            let (retval, errno) = outcome.retval_errno();
+            reporter.record(CompatEvent::SyscallReturn {
+                number: request.number.raw(),
+                name: ::std::borrow::Cow::Borrowed(name),
+                retval,
+                errno,
+            });
+            return Ok(outcome);
+        }
 
         // seccomp: installed cBPF filters get to veto the syscall before its
         // handler runs (ERRNO / kill), mirroring the kernel's pre-syscall check.
@@ -8773,5 +8850,189 @@ mod rosetta_handshake_tests {
                 errno: LINUX_EFAULT
             }
         );
+    }
+}
+
+#[cfg(test)]
+mod container_policy_dispatch_tests {
+    //! End-to-end tests for the launch-time container syscall policy at the
+    //! dispatch-entry seam: deny hit, miss passthrough, unconfined opt-out
+    //! (handlers stay honest ENOSYS), both dispatch paths, fork inheritance,
+    //! and survival across the dispatcher's execve-time state resets.
+    use super::*;
+    use crate::compat::CompatReporter;
+    use carrick_spec::SeccompPolicy;
+
+    const SYS_ADD_KEY: u64 = 217;
+    const SYS_REQUEST_KEY: u64 = 218;
+    const SYS_KEYCTL: u64 = 219;
+    const SYS_GETPID: u64 = 172;
+    const MEM_BASE: u64 = 0x4000_0000;
+
+    fn confined_dispatcher() -> SyscallDispatcher {
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.apply_seccomp_policy(SeccompPolicy::ContainerDefault);
+        dispatcher
+    }
+
+    fn dispatch_one(dispatcher: &mut SyscallDispatcher, nr: u64) -> DispatchOutcome {
+        let reporter = CompatReporter::default();
+        let mut memory = LinearMemory::new(MEM_BASE, vec![0u8; 4096]);
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(nr, SyscallArgs([0; 6])),
+                &mut memory,
+                &reporter,
+            )
+            .expect("dispatch")
+    }
+
+    #[test]
+    fn policy_denies_keyring_family_with_eperm_before_handler() {
+        let mut dispatcher = confined_dispatcher();
+        for nr in [SYS_ADD_KEY, SYS_REQUEST_KEY, SYS_KEYCTL] {
+            assert_eq!(
+                dispatch_one(&mut dispatcher, nr),
+                DispatchOutcome::Errno { errno: LINUX_EPERM },
+                "syscall {nr} must be policy-denied EPERM at dispatch entry"
+            );
+        }
+    }
+
+    #[test]
+    fn policy_denial_reports_as_policy_not_unimplemented() {
+        let dispatcher = confined_dispatcher();
+        let reporter = CompatReporter::default();
+        let mut memory = LinearMemory::new(MEM_BASE, vec![0u8; 4096]);
+        let mut dispatcher = dispatcher;
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(SYS_ADD_KEY, SyscallArgs([0; 6])),
+                &mut memory,
+                &reporter,
+            )
+            .expect("dispatch");
+        let report = reporter.snapshot();
+        assert!(
+            report
+                .partial_syscalls
+                .iter()
+                .any(|e| e.name == "add_key" && e.reason.contains("container syscall policy")),
+            "policy denial must surface as a policy event: {report:?}"
+        );
+        assert!(
+            !report
+                .unhandled_syscalls
+                .iter()
+                .any(|e| e.name == "add_key"),
+            "policy denial must NOT count as an unimplemented handler: {report:?}"
+        );
+    }
+
+    #[test]
+    fn policy_miss_passes_through_to_handler() {
+        let mut dispatcher = confined_dispatcher();
+        // getpid is NOT in the deny table: the handler must run and answer.
+        match dispatch_one(&mut dispatcher, SYS_GETPID) {
+            DispatchOutcome::Returned { value } => assert!(value > 0, "getpid returned {value}"),
+            other => panic!("getpid must reach its handler under the policy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unconfined_opt_out_keeps_handlers_honest_enosys() {
+        // Unconfined (run-elf default / --security-opt seccomp=unconfined):
+        // the keyring handlers keep their honest absent-backend ENOSYS — the
+        // policy layer NEVER leaks into handler behavior.
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.apply_seccomp_policy(SeccompPolicy::Unconfined);
+        for nr in [SYS_ADD_KEY, SYS_REQUEST_KEY, SYS_KEYCTL] {
+            assert_eq!(
+                dispatch_one(&mut dispatcher, nr),
+                DispatchOutcome::Errno {
+                    errno: LINUX_ENOSYS
+                },
+                "unconfined keyring syscall {nr} must stay honest ENOSYS"
+            );
+        }
+        // And a fresh dispatcher (no policy applied at all) is unconfined too.
+        let mut bare = SyscallDispatcher::new();
+        assert_eq!(
+            dispatch_one(&mut bare, SYS_ADD_KEY),
+            DispatchOutcome::Errno {
+                errno: LINUX_ENOSYS
+            }
+        );
+    }
+
+    #[test]
+    fn policy_applies_on_threaded_dispatch_path_too() {
+        let dispatcher = confined_dispatcher();
+        let registry =
+            crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(2200));
+        let reporter = CompatReporter::default();
+        let mut memory = LinearMemory::new(MEM_BASE, vec![0u8; 4096]);
+        let outcome = dispatcher
+            .dispatch_threaded(
+                SyscallRequest::new(SYS_KEYCTL, SyscallArgs([0; 6])),
+                &mut memory,
+                &reporter,
+                registry.main_tid(),
+                &registry,
+                &crate::thread::FutexTable::new(),
+            )
+            .expect("threaded dispatch");
+        assert_eq!(outcome, DispatchOutcome::Errno { errno: LINUX_EPERM });
+    }
+
+    #[test]
+    fn policy_survives_execve_time_dispatcher_resets() {
+        // carrick's guest execve keeps the dispatcher object and selectively
+        // resets per-image state (signal handlers, executable path). The
+        // policy must survive those resets — like a Linux seccomp filter
+        // surviving execve.
+        let mut dispatcher = confined_dispatcher();
+        dispatcher.reset_signal_handlers_on_execve();
+        dispatcher.set_executable_path("/replaced/image".to_string());
+        assert_eq!(
+            dispatch_one(&mut dispatcher, SYS_ADD_KEY),
+            DispatchOutcome::Errno { errno: LINUX_EPERM }
+        );
+    }
+
+    #[test]
+    fn policy_is_inherited_by_forked_children() {
+        // The runtime's guest fork is a host fork: the child inherits the
+        // dispatcher (and thus the policy table) via the process memory copy.
+        // Prove it with a real fork — the child dispatches add_key and reports
+        // the outcome through its exit code.
+        let mut dispatcher = confined_dispatcher();
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed");
+        if child == 0 {
+            let denied = matches!(
+                dispatch_one(&mut dispatcher, SYS_ADD_KEY),
+                DispatchOutcome::Errno { errno } if errno == LINUX_EPERM
+            );
+            // SAFETY: _exit is async-signal-safe; no cleanup wanted post-fork.
+            unsafe { libc::_exit(if denied { 0 } else { 1 }) };
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "forked child must inherit the deny table (status {status:#x})"
+        );
+    }
+
+    #[test]
+    fn docker_default_policy_keeps_identity_fast_path() {
+        // The Docker default model never denies identity syscalls, so a
+        // container run must NOT lose the EL1-shim fast path.
+        let dispatcher = confined_dispatcher();
+        assert!(dispatcher.identity_fast_path_enabled());
+        // A guest seccomp filter still disables it, policy or not.
+        dispatcher.seccomp.install(vec![]);
+        assert!(!dispatcher.identity_fast_path_enabled());
     }
 }
