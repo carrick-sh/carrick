@@ -378,6 +378,81 @@ fn relocated_direct_word(word: u32, exit: super::types::DirectExit) -> Result<u3
     Ok(relocated)
 }
 
+fn emit_indirect_exit(
+    assembler: &mut VecAssembler<Aarch64Relocation>,
+    entries: &mut Vec<PcMapEntry>,
+    plan: &BlockPlan,
+    guest: GuestVa,
+    exit: super::types::IndirectExit,
+) -> Result<(), DsrError> {
+    let register = gpr_index(exit.register)
+        .ok_or_else(|| unsupported_action(plan, guest, 0, "indirect exit with non-GPR target"))?;
+    if register == 18 {
+        map_next(assembler, entries, guest)?;
+        dynasmrt::dynasm!(assembler
+            ; .arch aarch64
+            ; ldr x17, [x18, #144]
+        );
+    } else if register != 17 {
+        emit_word(
+            assembler,
+            entries,
+            guest,
+            0xaa00_03f1 | (register << 16), // mov x17, xN
+        )?;
+    }
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; str x17, [x18, #1080]
+    );
+    let link = (exit.kind == super::types::IndirectKind::Call).then_some(exit.resume);
+    if let Some(link) = link {
+        emit_mov_u64(assembler, entries, guest, 30, link.raw())?;
+    }
+    emit_mov_u64(assembler, entries, guest, 17, guest.raw())?;
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; str x17, [x18, #1088]
+    );
+    if let Some(link) = link {
+        emit_mov_u64(assembler, entries, guest, 17, link.raw())?;
+        map_next(assembler, entries, guest)?;
+        dynasmrt::dynasm!(assembler
+            ; .arch aarch64
+            ; str x17, [x18, #1104]
+            ; mov w17, #1
+            ; str w17, [x18, #1112]
+        );
+    } else {
+        map_next(assembler, entries, guest)?;
+        dynasmrt::dynasm!(assembler
+            ; .arch aarch64
+            ; str wzr, [x18, #1112]
+        );
+    }
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; mov w17, #3
+        ; str w17, [x18, #1096]
+    );
+    emit_mov_u64(
+        assembler,
+        entries,
+        guest,
+        17,
+        super::gateway::indirect_exit_address(),
+    )?;
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; br x17
+    );
+    Ok(())
+}
+
 pub(super) fn emit_block(
     cache: &mut TranslationCache,
     plan: &BlockPlan,
@@ -550,6 +625,13 @@ pub(super) fn emit_block(
                 super::gateway::direct_exit_address(),
             )?;
         }
+    } else if let PlannedExit::Indirect { exit, .. } = plan.exit {
+        map_next(&assembler, &mut entries, exit_guest)?;
+        dynasmrt::dynasm!(assembler
+            ; .arch aarch64
+            ; str x17, [x18, #136]
+        );
+        emit_indirect_exit(&mut assembler, &mut entries, plan, exit_guest, exit)?;
     } else {
         map_next(&assembler, &mut entries, exit_guest)?;
         assembler.push_u32(exit_word(plan)?);
@@ -671,7 +753,7 @@ mod tests {
     }
 
     #[test]
-    fn dsr_emit_direct_link_and_rejects_indirect_exit() {
+    fn dsr_emit_direct_link_and_indirect_resolver_exit() {
         let mut direct = copy_plan();
         direct.exit = PlannedExit::Direct {
             guest: GuestVa(0x4008),
@@ -700,17 +782,8 @@ mod tests {
                 resume: GuestVa(0x400c),
             },
         };
-        let error = match emit_block(&mut cache, &indirect) {
-            Ok(_) => panic!("indirect exit should not emit before Task 8"),
-            Err(error) => error,
-        };
-        assert!(matches!(
-            error,
-            DsrError::UnsupportedBlockAction {
-                class: "indirect exit",
-                ..
-            }
-        ));
+        let emitted = emit_block(&mut cache, &indirect).expect("emit indirect resolver exit");
+        assert!(emitted.direct_links().is_empty());
     }
 
     #[test]
