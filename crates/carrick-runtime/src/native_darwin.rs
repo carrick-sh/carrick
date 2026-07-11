@@ -7869,9 +7869,9 @@ mod tests {
                     }
                     // Explicit teardown: the kick state was never thread-bound
                     // by prepare_kick_target, so skip release_kick_target's
-                    // unbind.
+                    // unbind; `sibling` (and its kick_state) drops with the
+                    // closure.
                     sibling.kicker.unregister(sib_tid);
-                    sibling.kick_state = None;
                 })
                 .expect("spawn quiesce sibling")
         };
