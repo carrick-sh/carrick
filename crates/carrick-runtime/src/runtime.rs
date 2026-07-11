@@ -158,7 +158,7 @@ enum VdsoDebugMode {
     ClockSyscalls,
 }
 
-fn vdso_enabled_for_debug() -> bool {
+pub(crate) fn vdso_enabled_for_debug() -> bool {
     vdso_debug_mode() != VdsoDebugMode::Disabled
 }
 
@@ -197,17 +197,35 @@ fn hardware_tso_for_debug_from_env(requested: bool, disable: Option<&str>) -> bo
     requested && !debug_env_flag_enabled(disable)
 }
 
-fn with_optional_vdso<A: carrick_hal::GuestArch>(
+pub(crate) fn with_optional_vdso<A: carrick_hal::GuestArch>(
     image: AddressSpace,
 ) -> Result<AddressSpace, AddressSpaceError> {
-    match vdso_debug_mode() {
-        VdsoDebugMode::Full => image.with_vdso_bytes(A::vdso_bytes()),
-        // Debug variants are aarch64-only escape hatches; only the production image routes through GuestArch.
-        VdsoDebugMode::Disabled => Ok(image),
-        VdsoDebugMode::NoGetrandom => image.with_vdso_without_getrandom(),
-        VdsoDebugMode::NoFastpaths => image.with_vdso_without_fastpaths(),
-        VdsoDebugMode::ClockSyscalls => image.with_vdso_clock_syscalls(),
-    }
+    with_optional_vdso_at::<A>(
+        image,
+        crate::vdso::LINUX_VVAR_BASE,
+        crate::vdso::LINUX_VDSO_BASE,
+    )
+}
+
+/// [`with_optional_vdso`] with caller-chosen vvar/vdso guest VAs — the Darwin
+/// native backend relocates both pages out of the Darwin-reserved host VA hole
+/// the canonical bases sit in (see `AddressSpace::with_vdso_bytes_at`). The
+/// same `CARRICK_DISABLE_VDSO` / `CARRICK_VDSO_MODE` debug controls apply.
+pub(crate) fn with_optional_vdso_at<A: carrick_hal::GuestArch>(
+    image: AddressSpace,
+    vvar_base: u64,
+    vdso_base: u64,
+) -> Result<AddressSpace, AddressSpaceError> {
+    let vdso_bytes = match vdso_debug_mode() {
+        VdsoDebugMode::Full => A::vdso_bytes(),
+        VdsoDebugMode::Disabled => return Ok(image),
+        // Debug variants are aarch64-only escape hatches; only the production
+        // image routes through GuestArch.
+        VdsoDebugMode::NoGetrandom => crate::vdso::vdso_image_bytes_without_getrandom(),
+        VdsoDebugMode::NoFastpaths => crate::vdso::vdso_image_bytes_without_fastpaths(),
+        VdsoDebugMode::ClockSyscalls => crate::vdso::vdso_image_bytes_with_clock_syscalls(),
+    };
+    image.with_vdso_bytes_at(vdso_bytes, vvar_base, vdso_base)
 }
 
 /// JSON-serialisable snapshot of the guest layout the trap engine is about
