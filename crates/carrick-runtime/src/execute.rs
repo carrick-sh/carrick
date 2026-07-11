@@ -157,7 +157,6 @@ impl Runtime {
             rosetta_license_notice();
         }
         let execution_plan = crate::page_profile::resolve_execution_plan(spec)?;
-        crate::page_profile::validate_native_code_mode(spec.native_code_mode, &execution_plan)?;
         if execution_plan.backend != crate::page_profile::ExecutionBackend::NativeDarwin {
             debug_assert_eq!(
                 execution_plan.page_geometry.linux_page_size,
@@ -349,7 +348,6 @@ impl Runtime {
                         env,
                         spec.max_traps,
                         debug_path.as_ref(),
-                        spec.native_code_mode,
                         &execution_plan,
                     )
                 } else {
@@ -463,7 +461,6 @@ impl Runtime {
                         env,
                         spec.max_traps,
                         debug_path.as_ref(),
-                        spec.native_code_mode,
                         &execution_plan,
                     )
                 } else {

@@ -198,31 +198,39 @@ pub fn decide_linux4k_on_16k_mapping<const N: usize>(
 pub(crate) struct ExecutionPlan {
     pub backend: ExecutionBackend,
     pub page_geometry: PageGeometry,
+    pub native_code_mode: NativeCodeModeRequest,
     pub diagnostics: Vec<String>,
 }
 
 pub(crate) fn resolve_execution_plan(spec: &RunSpec) -> Result<ExecutionPlan, RuntimeError> {
-    resolve_execution_plan_for_request_for_host(
+    let mut plan = resolve_execution_plan_for_request_for_host(
         spec.platform,
         spec.exec_backend,
         spec.native_page_profile,
         BackendCapabilities::current(),
         host_page_size(),
-    )
+    )?;
+    validate_native_code_mode(spec.native_code_mode, &plan)?;
+    plan.native_code_mode = spec.native_code_mode;
+    Ok(plan)
 }
 
 pub(crate) fn resolve_execution_plan_for_request(
     platform: Platform,
     exec_backend: ExecBackendRequest,
     native_page_profile: NativePageProfileRequest,
+    native_code_mode: NativeCodeModeRequest,
 ) -> Result<ExecutionPlan, RuntimeError> {
-    resolve_execution_plan_for_request_for_host(
+    let mut plan = resolve_execution_plan_for_request_for_host(
         platform,
         exec_backend,
         native_page_profile,
         BackendCapabilities::current(),
         host_page_size(),
-    )
+    )?;
+    validate_native_code_mode(native_code_mode, &plan)?;
+    plan.native_code_mode = native_code_mode;
+    Ok(plan)
 }
 
 pub(crate) fn validate_native_code_mode(
@@ -288,6 +296,7 @@ fn resolve_execution_plan_for_request_for_host(
                 linux_page_size: DEFAULT_LINUX_PAGE_SIZE,
                 native_profile: None,
             },
+            native_code_mode: NativeCodeModeRequest::Brk,
             diagnostics: Vec::new(),
         }),
         ExecBackendRequest::Native => {
@@ -350,6 +359,7 @@ fn native_plan(
             linux_page_size,
             native_profile: Some(profile),
         },
+        native_code_mode: NativeCodeModeRequest::Brk,
         diagnostics: vec![format!(
             "native page profile selected: profile={profile:?} host_page_size={host_page_size} linux_page_size={linux_page_size}"
         )],
@@ -487,6 +497,7 @@ mod tests {
                 linux_page_size: DEFAULT_LINUX_PAGE_SIZE,
                 native_profile: None,
             },
+            native_code_mode: NativeCodeModeRequest::Brk,
             diagnostics: Vec::new(),
         };
         let linux4k = native_plan(NativePageProfileRequest::Linux4k, DARWIN_NATIVE_PAGE_SIZE)
