@@ -105,6 +105,43 @@ static PROC_PENDING: AtomicU64 = AtomicU64::new(0);
 /// `rt_pending_counts`, not here.
 static THREAD_PENDING: Mutex<Option<HashMap<i32, u64>>> = Mutex::new(None);
 
+/// Lock-free MAY-HAVE-PENDING hint over `THREAD_PENDING`, bit `tid % 64`. The
+/// delivery cycle runs on EVERY syscall return / kick / sigreturn of every
+/// guest thread; taking the global mutex + HashMap lookup on the (overwhelming
+/// majority) empty path is pure per-dispatch cost that compounds under load.
+/// The hint is an EXACT MIRROR of "some tid hashing to this bit has a nonzero
+/// mask": every mutation of the map happens with the mutex held and updates
+/// the hint before release (publish ORs its bit in; removals recompute from
+/// the surviving keys). A clear bit therefore proves no entry for that tid
+/// exists — the reader skips the mutex. A set bit may be a hash collision
+/// (`tid % 64`), which merely falls back to the locked path. A reader racing a
+/// publisher mid-critical-section linearizes BEFORE the publish; the
+/// publisher's kick (the established publish→kick contract) forces a fresh
+/// delivery cycle that sees the bit.
+static THREAD_PENDING_TID_HINT: AtomicU64 = AtomicU64::new(0);
+
+/// The [`THREAD_PENDING_TID_HINT`] bit for `tid`.
+fn tid_hint_bit(tid: i32) -> u64 {
+    1u64 << ((tid as u32) & 63)
+}
+
+/// Recompute [`THREAD_PENDING_TID_HINT`] from the map's surviving nonzero
+/// entries. MUST be called with the `THREAD_PENDING` lock held (the guard
+/// argument proves it) after any removal, so the hint never keeps a stale set
+/// bit alive across an emptied slot — and, critically, never LOSES a bit a
+/// colliding tid still needs.
+fn recompute_tid_hint(guard: &std::sync::MutexGuard<'_, Option<HashMap<i32, u64>>>) {
+    let mut hint = 0u64;
+    if let Some(map) = guard.as_ref() {
+        for (&tid, &mask) in map {
+            if mask != 0 {
+                hint |= tid_hint_bit(tid);
+            }
+        }
+    }
+    THREAD_PENDING_TID_HINT.store(hint, Ordering::SeqCst);
+}
+
 /// Lock the thread-pending table, lazily initialising it, and recover the guard
 /// if a panicking thread poisoned the mutex (the contents are a plain bitmask,
 /// never left half-updated — and a poisoned signal table must not crash delivery).
@@ -144,6 +181,8 @@ pub fn publish_pending_for(tid: i32, signum: i32) {
         let mut guard = lock_thread_pending();
         let map = guard.get_or_insert_with(HashMap::new);
         *map.entry(tid).or_insert(0) |= bit;
+        // Under the lock, so the hint is an exact mirror at release.
+        THREAD_PENDING_TID_HINT.fetch_or(tid_hint_bit(tid), Ordering::SeqCst);
     }
 }
 
@@ -179,7 +218,10 @@ fn take_proc_pending_in(wait_set: SigSet) -> i32 {
 /// Returns `0` (`NO_PENDING_SIGNAL`) if neither is set. This is the single point
 /// of consumption (called under the dispatcher lock in `deliver_pending_signal`).
 pub fn take_pending_for(tid: i32) -> i32 {
-    {
+    // Lock-free empty fast path: a clear hint bit proves no THREAD_PENDING
+    // entry for this tid exists (see THREAD_PENDING_TID_HINT), so the global
+    // mutex + map lookup is skipped on the hot no-signal-pending path.
+    if THREAD_PENDING_TID_HINT.load(Ordering::SeqCst) & tid_hint_bit(tid) != 0 {
         let mut guard = lock_thread_pending();
         if let Some(map) = guard.as_mut()
             && let Some(mask) = map.get_mut(&tid)
@@ -189,6 +231,7 @@ pub fn take_pending_for(tid: i32) -> i32 {
             *mask &= *mask - 1; // clear the lowest set bit
             if *mask == 0 {
                 map.remove(&tid);
+                recompute_tid_hint(&guard);
             }
             return signum;
         }
@@ -200,7 +243,8 @@ pub fn take_pending_for(tid: i32) -> i32 {
 /// `rt_sigtimedwait`: signals outside the waited set must remain pending for
 /// normal delivery instead of being consumed and requeued.
 pub fn take_pending_in_for(tid: i32, wait_set: SigSet) -> i32 {
-    {
+    // Lock-free empty fast path (see THREAD_PENDING_TID_HINT).
+    if THREAD_PENDING_TID_HINT.load(Ordering::SeqCst) & tid_hint_bit(tid) != 0 {
         // The stored per-tid mask is wire form (bit `signum-1`), the same
         // convention as `wait_set.raw()`, so a bitwise AND yields the pending
         // signums that are in the waited set; drain only the lowest, leaving
@@ -215,6 +259,7 @@ pub fn take_pending_in_for(tid: i32, wait_set: SigSet) -> i32 {
                 *mask &= !thread_pending_bit(signum);
                 if *mask == 0 {
                     map.remove(&tid);
+                    recompute_tid_hint(&guard);
                 }
                 return signum;
             }
@@ -229,6 +274,10 @@ pub fn take_pending_in_for(tid: i32, wait_set: SigSet) -> i32 {
 /// process-directed mask). Backends combine this with their own sources (the
 /// HVF `PROC_PENDING`/xsignal peek) in `has_pending_for`.
 pub fn thread_pending_has(tid: i32) -> bool {
+    // Lock-free empty fast path (see THREAD_PENDING_TID_HINT).
+    if THREAD_PENDING_TID_HINT.load(Ordering::SeqCst) & tid_hint_bit(tid) == 0 {
+        return false;
+    }
     let mut guard = lock_thread_pending();
     guard
         .as_mut()
@@ -240,6 +289,10 @@ pub fn thread_pending_has(tid: i32) -> bool {
 /// `block_mask`. A blocked signal does not count, except SIGKILL/SIGSTOP which
 /// can never be blocked.
 pub fn thread_pending_deliverable(tid: i32, block_mask: SigBlockMask) -> bool {
+    // Lock-free empty fast path (see THREAD_PENDING_TID_HINT).
+    if THREAD_PENDING_TID_HINT.load(Ordering::SeqCst) & tid_hint_bit(tid) == 0 {
+        return false;
+    }
     let always_deliverable = thread_pending_bit(LINUX_SIGKILL) | thread_pending_bit(LINUX_SIGSTOP);
     let mut guard = lock_thread_pending();
     guard
@@ -312,17 +365,21 @@ pub fn clear_proc_pending() {
 /// exits so a recycled tid never inherits a stale signal). A forked child also
 /// clears the whole table via [`clear_thread_pending`].
 pub fn forget_thread(tid: i32) {
-    if let Some(map) = lock_thread_pending().as_mut() {
+    let mut guard = lock_thread_pending();
+    if let Some(map) = guard.as_mut() {
         map.remove(&tid);
     }
+    recompute_tid_hint(&guard);
 }
 
 /// Clear the entire thread-directed pending table (fork reinit: the child is
 /// single-threaded, so inherited sibling-directed entries are stale).
 pub fn clear_thread_pending() {
-    if let Some(map) = lock_thread_pending().as_mut() {
+    let mut guard = lock_thread_pending();
+    if let Some(map) = guard.as_mut() {
         map.clear();
     }
+    recompute_tid_hint(&guard);
 }
 
 /// The guest tids that currently have a thread-directed signal pending.
@@ -437,6 +494,77 @@ mod tests {
             !child_watch::is_tracked(0x6161),
             "child-exit watches must be empty"
         );
+    }
+
+    /// The tid-hint fast path must never hide a published signal — including
+    /// across drains that empty a slot a COLLIDING tid (same `tid % 64` bit)
+    /// still needs, and across publish-after-drain cycles (a sticky-clear hint
+    /// would strand the re-published signal).
+    #[test]
+    fn tid_hint_fast_path_never_hides_published_signal() {
+        let tid = 0x7a11_i32;
+        let colliding = tid + 64; // same hint bit
+        forget_thread(tid);
+        forget_thread(colliding);
+
+        // Publish to both colliding tids; drain one — the OTHER must survive
+        // the recompute (its bit is shared).
+        publish_pending_for(tid, 10);
+        publish_pending_for(colliding, 12);
+        assert_eq!(take_pending_for(tid), 10);
+        assert!(thread_pending_has(colliding), "collision bit must survive");
+        assert_eq!(take_pending_for(colliding), 12);
+        assert!(!thread_pending_has(colliding));
+
+        // Publish after a full drain: the hint must be re-set, not sticky-clear.
+        publish_pending_for(tid, 14);
+        assert!(thread_pending_has(tid));
+        assert_eq!(take_pending_for(tid), 14);
+        assert_eq!(take_pending_for(tid), NO_PENDING_SIGNAL);
+
+        // The set-restricted taker honours the hint the same way.
+        publish_pending_for(tid, 10);
+        assert_eq!(
+            take_pending_in_for(tid, SigSet::EMPTY.with(10)),
+            10,
+            "wait-set take must see the re-published signal"
+        );
+        assert_eq!(
+            take_pending_in_for(tid, SigSet::EMPTY.with(10)),
+            NO_PENDING_SIGNAL
+        );
+        forget_thread(tid);
+        forget_thread(colliding);
+    }
+
+    /// Concurrent publish/take stress across the hint: every published signal
+    /// is eventually taken by its target (no lost delivery through the
+    /// lock-free fast path). Bounded, deterministic outcome.
+    #[test]
+    fn tid_hint_concurrent_publish_take_loses_nothing() {
+        let tid = 0x7b22_i32;
+        forget_thread(tid);
+        const ROUNDS: usize = 2000;
+        let publisher = std::thread::spawn(move || {
+            for _ in 0..ROUNDS {
+                publish_pending_for(tid, 10);
+                while thread_pending_has(tid) {
+                    std::thread::yield_now();
+                }
+            }
+        });
+        let mut taken = 0usize;
+        while taken < ROUNDS {
+            if take_pending_for(tid) == 10 {
+                taken += 1;
+            } else {
+                std::thread::yield_now();
+            }
+        }
+        publisher.join().expect("publisher thread");
+        assert_eq!(taken, ROUNDS);
+        assert_eq!(take_pending_for(tid), NO_PENDING_SIGNAL);
+        forget_thread(tid);
     }
 
     /// Test helper: the lowest pending signum for `tid` WITHOUT consuming it
