@@ -404,6 +404,21 @@ impl<V: X86Vmm> GuestMemory for X86EngineCore<V> {
         self.protections.set_no_write(address, len, no_write);
     }
 
+    fn set_unmapped(&mut self, address: u64, len: usize, unmapped: bool) {
+        self.protections.set_unmapped(address, len, unmapped);
+    }
+
+    fn set_mapping_protection(
+        &mut self,
+        address: u64,
+        len: usize,
+        no_access: bool,
+        no_write: bool,
+    ) {
+        self.protections
+            .set_mapping_protection(address, len, no_access, no_write);
+    }
+
     /// Resolve a guest futex VA to the host address of its `MAP_SHARED` backing
     /// (the boot aperture OR a runtime file-backed alias), so a cross-process
     /// futex routes through the bare-`SYS_futex` shared path instead of the
@@ -429,21 +444,12 @@ impl<V: X86Vmm> GuestMemory for X86EngineCore<V> {
     /// (`write_bytes_unchecked` -> `write_bytes_raw`) bypass both. `no_write` is
     /// x86-only, so this lives here, not in the shared default.
     fn write_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
-        if !bytes.is_empty() {
-            if self.protections.range_no_access(address, bytes.len()) {
-                trace_x86_efault("write-na", address, bytes.len());
-                return Err(MemoryError::OutOfBounds {
-                    address,
-                    length: bytes.len(),
-                });
-            }
-            if self.protections.range_no_write(address, bytes.len()) {
-                trace_x86_efault("write-ro", address, bytes.len());
-                return Err(MemoryError::OutOfBounds {
-                    address,
-                    length: bytes.len(),
-                });
-            }
+        if !bytes.is_empty() && self.protections.range_write_denied(address, bytes.len()) {
+            trace_x86_efault("write-denied", address, bytes.len());
+            return Err(MemoryError::OutOfBounds {
+                address,
+                length: bytes.len(),
+            });
         }
         self.write_bytes_raw(address, bytes)
     }
@@ -571,14 +577,9 @@ impl<V: X86Vmm> GuestMemory for X86EngineCore<V> {
         } else if let Some(e) = protect_err {
             return Err(e);
         }
-        // Syscall-path WRITE gate: a PROT_READ (no PROT_WRITE) mapping is read-only,
-        // so a kernel write into it must EFAULT (the x86 analog of HVF's
-        // validate_guest_write_range; reads from it are still fine). A writable prot
-        // clears it; PROT_NONE is covered by the no_access set. The dispatcher calls
-        // protect_range with the prot for BOTH mmap and mprotect, so this one hook
-        // covers a region read-only from creation AND a later mprotect(PROT_READ).
-        let read_only = prot != 0 && prot & carrick_abi::LINUX_PROT_WRITE == 0;
-        self.protections.set_no_write(address, len, read_only);
+        // Logical VMA permissions are published atomically by the dispatcher.
+        // This hook only edits page tables: internal first-touch setup also uses
+        // `prot=0` and must not overwrite the requested RW/RO metadata.
         self.flush_current_tlb()
     }
 
@@ -600,12 +601,16 @@ impl<V: X86Vmm> GuestMemory for X86EngineCore<V> {
 
     fn unmap_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
         self.vm.unmap_range(address, len)?;
-        self.flush_current_tlb()
+        self.flush_current_tlb()?;
+        self.protections.set_unmapped(address, len, true);
+        Ok(())
     }
 
     fn unmap_alias_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
         self.vm.unmap_alias_range(address, len)?;
-        self.flush_current_tlb()
+        self.flush_current_tlb()?;
+        self.protections.set_unmapped(address, len, true);
+        Ok(())
     }
 }
 

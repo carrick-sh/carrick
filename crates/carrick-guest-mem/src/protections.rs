@@ -1,4 +1,4 @@
-//! Process-wide PROT_NONE range bookkeeping, shared by every hypervisor backend.
+//! Process-wide guest-VMA protection bookkeeping, shared by every backend.
 //!
 //! When the guest `mprotect(PROT_NONE)`s (or `munmap`s) a range, a later
 //! syscall whose buffer overlaps that range must fault with `EFAULT` exactly as
@@ -6,7 +6,9 @@
 //! (the host-side check; making the GUEST's own EL0 access fault needs stage-1
 //! edits + signal injection, which the page-table managers handle separately).
 //!
-//! This set is the single source of truth for that host-side check. It is
+//! These sets are the single source of truth for that host-side check and keep
+//! mapped `PROT_NONE` distinct from post-`munmap` holes for Linux `si_code`.
+//! They are
 //! **process-wide**: sibling vCPU threads (a `clone(CLONE_VM)` thread group run
 //! on one VM) MUST share ONE instance — wrapped in [`std::sync::Arc`] — so a
 //! `mprotect` made by any guest thread is observed by every other thread's
@@ -21,8 +23,8 @@
 //! gate directly — one shared host-side EFAULT check every backend inherits.
 //! `carrick-mem::protections` re-exports it for back-compat.
 //!
-//! Interior mutability ([`parking_lot::RwLock`]) so the shared `Arc` needs no
-//! outer lock and `set_no_access`/`range_no_access` both take `&self`. The HVF
+//! One interior [`parking_lot::RwLock`] covers all VMA-classification sets, so
+//! transitions are coherent and the shared `Arc` needs no outer lock. The HVF
 //! and KVM backends both hold an `Arc<MemoryProtections>` and clone it into each
 //! sibling; a `fork(2)` child gets an INDEPENDENT copy (the Linux COW of the
 //! whole process duplicates the underlying `Vec`, or `MemoryProtections::snapshot`
@@ -32,22 +34,20 @@
 //! [`GuestMemory`]: crate::GuestMemory
 
 /// Sorted, merged, non-overlapping `[start, end)` guest-address ranges with an
-/// O(log n) overlap query. The shared building block for both protection sets in
-/// [`MemoryProtections`]: the PROT_NONE set and the read-only (no-write) set.
+/// O(log n) overlap query. The shared building block for the PROT_NONE,
+/// unmapped, and read-only sets in [`MemoryProtections`].
 #[derive(Default)]
 struct RangeSet {
-    ranges: parking_lot::RwLock<Vec<(u64, u64)>>,
+    ranges: Vec<(u64, u64)>,
 }
 
 impl RangeSet {
     fn from_ranges(ranges: Vec<(u64, u64)>) -> Self {
-        Self {
-            ranges: parking_lot::RwLock::new(ranges),
-        }
+        Self { ranges }
     }
 
     fn snapshot(&self) -> Vec<(u64, u64)> {
-        self.ranges.read().clone()
+        self.ranges.clone()
     }
 
     /// True if `[address, address+length)` overlaps any range in the set.
@@ -56,9 +56,8 @@ impl RangeSet {
         if end <= address {
             return false;
         }
-        let ranges = self.ranges.read();
-        let idx = ranges.partition_point(|&(_, e)| e <= address);
-        ranges
+        let idx = self.ranges.partition_point(|&(_, e)| e <= address);
+        self.ranges
             .get(idx)
             .is_some_and(|&(s, e)| address < e && s < end)
     }
@@ -66,18 +65,19 @@ impl RangeSet {
     /// Add (`present=true`, merging adjacent/overlapping) or remove
     /// (`present=false`, splitting a partially-cleared range into the surviving
     /// ends) the range `[address, address+len)`, keeping the set sorted + merged.
-    fn set(&self, address: u64, len: usize, present: bool) {
+    fn set(&mut self, address: u64, len: usize, present: bool) {
         let end = address.saturating_add(len as u64);
         if end <= address {
             return;
         }
-        let mut ranges = self.ranges.write();
         if present {
             let mut start = address;
             let mut merged_end = end;
-            let idx = ranges.partition_point(|&(_, range_end)| range_end < start);
+            let idx = self
+                .ranges
+                .partition_point(|&(_, range_end)| range_end < start);
             let mut remove_end = idx;
-            while let Some(&(range_start, range_end)) = ranges.get(remove_end) {
+            while let Some(&(range_start, range_end)) = self.ranges.get(remove_end) {
                 if range_start > merged_end {
                     break;
                 }
@@ -85,14 +85,16 @@ impl RangeSet {
                 merged_end = merged_end.max(range_end);
                 remove_end += 1;
             }
-            ranges.splice(idx..remove_end, [(start, merged_end)]);
+            self.ranges.splice(idx..remove_end, [(start, merged_end)]);
             return;
         }
 
-        let idx = ranges.partition_point(|&(_, range_end)| range_end <= address);
+        let idx = self
+            .ranges
+            .partition_point(|&(_, range_end)| range_end <= address);
         let mut remove_end = idx;
         let mut replacement = Vec::new();
-        while let Some(&(s, e)) = ranges.get(remove_end) {
+        while let Some(&(s, e)) = self.ranges.get(remove_end) {
             if s >= end {
                 break;
             }
@@ -105,23 +107,26 @@ impl RangeSet {
             remove_end += 1;
         }
         if idx != remove_end {
-            ranges.splice(idx..remove_end, replacement);
+            self.ranges.splice(idx..remove_end, replacement);
         }
     }
 }
 
+#[derive(Default)]
+struct ProtectionState {
+    no_access: RangeSet,
+    unmapped: RangeSet,
+    no_write: RangeSet,
+}
+
 /// The process-wide host-side protection sets a backend enforces on the syscall
-/// path: the PROT_NONE set (any access faults `EFAULT`) and the read-only set (a
-/// WRITE faults `EFAULT`). See the module docs for the sharing contract.
+/// path: live PROT_NONE, unmapped holes, and read-only mappings. See the module
+/// docs for the sharing contract.
 #[derive(Default)]
 pub struct MemoryProtections {
-    /// Guest ranges that are `PROT_NONE` — any syscall access faults `EFAULT`.
-    no_access: RangeSet,
-    /// Guest ranges that are READ-ONLY (`PROT_READ` without `PROT_WRITE`) — a
-    /// syscall WRITE faults `EFAULT`, but a READ is fine. The x86 analog of HVF's
-    /// `validate_guest_write_range`; backends with their own per-mapping write
-    /// model (HVF) leave this empty.
-    no_write: RangeSet,
+    /// One lock covers every VMA classification so readers see coherent state
+    /// and the hot path pays one lock acquisition, not one per range set.
+    state: parking_lot::RwLock<ProtectionState>,
 }
 
 impl MemoryProtections {
@@ -130,53 +135,124 @@ impl MemoryProtections {
     /// state across fork.
     pub fn from_ranges(ranges: Vec<(u64, u64)>) -> Self {
         Self {
-            no_access: RangeSet::from_ranges(ranges),
-            no_write: RangeSet::default(),
+            state: parking_lot::RwLock::new(ProtectionState {
+                no_access: RangeSet::from_ranges(ranges),
+                ..ProtectionState::default()
+            }),
         }
     }
 
     /// A point-in-time copy of the PROT_NONE ranges.
     pub fn snapshot(&self) -> Vec<(u64, u64)> {
-        self.no_access.snapshot()
+        self.state.read().no_access.snapshot()
     }
 
     /// A point-in-time copy of both syscall-path protection sets.
     pub fn snapshot_all(&self) -> ProtectionSnapshot {
+        let state = self.state.read();
         ProtectionSnapshot {
-            no_access: self.no_access.snapshot(),
-            no_write: self.no_write.snapshot(),
+            no_access: state.no_access.snapshot(),
+            unmapped: state.unmapped.snapshot(),
+            no_write: state.no_write.snapshot(),
         }
     }
 
     /// Seed both syscall-path protection sets from a fork-time snapshot.
     pub fn from_snapshot(snapshot: ProtectionSnapshot) -> Self {
         Self {
-            no_access: RangeSet::from_ranges(snapshot.no_access),
-            no_write: RangeSet::from_ranges(snapshot.no_write),
+            state: parking_lot::RwLock::new(ProtectionState {
+                no_access: RangeSet::from_ranges(snapshot.no_access),
+                unmapped: RangeSet::from_ranges(snapshot.unmapped),
+                no_write: RangeSet::from_ranges(snapshot.no_write),
+            }),
         }
     }
 
     /// True if `[address, address+length)` overlaps any PROT_NONE range — a syscall
     /// buffer there must fault `EFAULT` (read OR write).
     pub fn range_no_access(&self, address: u64, length: usize) -> bool {
-        self.no_access.contains(address, length)
+        let state = self.state.read();
+        state.no_access.contains(address, length) || state.unmapped.contains(address, length)
     }
 
-    /// Record (`no_access=true`) or clear (`false`) a PROT_NONE range.
+    /// True only for a live `PROT_NONE` mapping. Unlike
+    /// [`Self::range_no_access`], this excludes post-`munmap` holes so fault
+    /// delivery can distinguish Linux `SEGV_ACCERR` from `SEGV_MAPERR`.
+    pub fn range_prot_none(&self, address: u64, length: usize) -> bool {
+        self.state.read().no_access.contains(address, length)
+    }
+
+    /// True when the range was removed from the guest VMA set.
+    pub fn range_unmapped(&self, address: u64, length: usize) -> bool {
+        self.state.read().unmapped.contains(address, length)
+    }
+
+    /// True when a syscall write must fail: PROT_NONE, post-unmap, or a live
+    /// read-only mapping. All three sets are sampled under one read lock.
+    pub fn range_write_denied(&self, address: u64, length: usize) -> bool {
+        let state = self.state.read();
+        state.no_access.contains(address, length)
+            || state.unmapped.contains(address, length)
+            || state.no_write.contains(address, length)
+    }
+
+    /// True when a hardware `MAPERR` must be upgraded to Linux `ACCERR`: the
+    /// VMA is live but denies the access. Post-unmap holes are excluded.
+    pub fn range_fault_is_access_error(&self, address: u64, length: usize) -> bool {
+        let state = self.state.read();
+        state.no_access.contains(address, length) || state.no_write.contains(address, length)
+    }
+
+    /// Record (`no_access=true`) or clear (`false`) a live PROT_NONE range.
+    /// Any protection update establishes a live mapping, so it also clears
+    /// stale post-unmap state for the same range.
     pub fn set_no_access(&self, address: u64, len: usize, no_access: bool) {
-        self.no_access.set(address, len, no_access);
+        let mut state = self.state.write();
+        state.unmapped.set(address, len, false);
+        state.no_access.set(address, len, no_access);
+    }
+
+    /// Record or clear a post-unmap hole. Removing a VMA also clears its prior
+    /// PROT_NONE/read-only attributes so a later reuse cannot inherit them.
+    pub fn set_unmapped(&self, address: u64, len: usize, unmapped: bool) {
+        let mut state = self.state.write();
+        if unmapped {
+            state.no_access.set(address, len, false);
+            state.no_write.set(address, len, false);
+        }
+        state.unmapped.set(address, len, unmapped);
     }
 
     /// True if `[address, address+length)` overlaps any READ-ONLY range — a syscall
     /// WRITE there must fault `EFAULT` (a READ is allowed).
     pub fn range_no_write(&self, address: u64, length: usize) -> bool {
-        self.no_write.contains(address, length)
+        self.state.read().no_write.contains(address, length)
     }
 
     /// Record (`no_write=true`, a `PROT_READ`-only range) or clear (`false`, the
     /// range became writable / unmapped) a read-only range.
     pub fn set_no_write(&self, address: u64, len: usize, no_write: bool) {
-        self.no_write.set(address, len, no_write);
+        let mut state = self.state.write();
+        if no_write {
+            state.unmapped.set(address, len, false);
+        }
+        state.no_write.set(address, len, no_write);
+    }
+
+    /// Publish the complete protection state of a live mapping atomically.
+    /// This prevents sibling vCPUs from observing a transient accessible gap
+    /// while an unmapped range becomes PROT_NONE/read-only or vice versa.
+    pub fn set_mapping_protection(
+        &self,
+        address: u64,
+        len: usize,
+        no_access: bool,
+        no_write: bool,
+    ) {
+        let mut state = self.state.write();
+        state.unmapped.set(address, len, false);
+        state.no_access.set(address, len, no_access);
+        state.no_write.set(address, len, no_write);
     }
 }
 
@@ -184,6 +260,7 @@ impl MemoryProtections {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProtectionSnapshot {
     pub no_access: Vec<(u64, u64)>,
+    pub unmapped: Vec<(u64, u64)>,
     pub no_write: Vec<(u64, u64)>,
 }
 
@@ -248,11 +325,39 @@ mod tests {
         let p = MemoryProtections::default();
         p.set_no_access(0x1000, 0x1000, true);
         p.set_no_write(0x4000, 0x1000, true);
+        p.set_unmapped(0x8000, 0x1000, true);
 
         let cloned = MemoryProtections::from_snapshot(p.snapshot_all());
 
         assert!(cloned.range_no_access(0x1800, 0x10));
+        assert!(cloned.range_prot_none(0x1800, 0x10));
         assert!(cloned.range_no_write(0x4800, 0x10));
         assert!(!cloned.range_no_access(0x4800, 0x10));
+        assert!(cloned.range_no_access(0x8800, 0x10));
+        assert!(cloned.range_unmapped(0x8800, 0x10));
+        assert!(!cloned.range_prot_none(0x8800, 0x10));
+    }
+
+    #[test]
+    fn mapped_prot_none_is_distinct_from_unmapped_and_reuse_clears_hole() {
+        let p = MemoryProtections::default();
+        p.set_no_access(0x1000, 0x1000, true);
+        assert!(p.range_no_access(0x1800, 1));
+        assert!(p.range_prot_none(0x1800, 1));
+        assert!(!p.range_unmapped(0x1800, 1));
+
+        p.set_unmapped(0x1000, 0x1000, true);
+        assert!(p.range_no_access(0x1800, 1));
+        assert!(!p.range_prot_none(0x1800, 1));
+        assert!(p.range_unmapped(0x1800, 1));
+
+        p.set_mapping_protection(0x1000, 0x1000, true, false);
+        assert!(p.range_prot_none(0x1800, 1));
+        assert!(!p.range_unmapped(0x1800, 1));
+
+        p.set_mapping_protection(0x1000, 0x1000, false, true);
+        assert!(!p.range_no_access(0x1800, 1));
+        assert!(p.range_no_write(0x1800, 1));
+        assert!(!p.range_unmapped(0x1800, 1));
     }
 }

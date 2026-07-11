@@ -528,6 +528,14 @@ fn host_fd_file_len(fd: i32) -> Option<u64> {
         None
     }
 }
+
+fn mark_range_unmapped(memory: &mut impl GuestMemory, address: u64, len: usize) {
+    // `no_write` describes a live read-only VMA. It must not survive unmap:
+    // fault delivery uses this metadata to distinguish Linux ACCERR from
+    // MAPERR, and a reused VA must start without its prior owner's permission.
+    memory.set_unmapped(address, len, true);
+}
+
 /// VMA-metadata answer for a `madvise` range, computed without touching guest
 /// memory. `fully_mapped` is false when any page in the range falls in an
 /// unmapped hole (→ ENOMEM). `writable`/`shared` describe the covering VMAs and
@@ -1224,6 +1232,13 @@ impl SyscallDispatcher {
                     this.mem.lock().overlay.free(overlay_va);
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 }
+                let prot_none = prot_flags.is_empty();
+                memory.set_mapping_protection(
+                    requested.0,
+                    length_usize,
+                    prot_none,
+                    !prot_none && !prot_flags.contains(LinuxProtFlags::WRITE),
+                );
                 this.commit_eager_locked_range(locked_range);
                 this.record_dynamic_mapping(
                     requested.0,
@@ -1343,7 +1358,12 @@ impl SyscallDispatcher {
                     // itself PROT_NONE — touching it would crash carrick).
                     let prot_none = pf.is_empty();
                     if let Ok(l) = usize::try_from(length) {
-                        memory.set_no_access(va, l, prot_none);
+                        memory.set_mapping_protection(
+                            va,
+                            l,
+                            prot_none,
+                            !prot_none && !pf.contains(LinuxProtFlags::WRITE),
+                        );
                     }
                     this.mark_range_resident(va, length);
                     this.commit_eager_locked_range(locked_range);
@@ -1398,22 +1418,20 @@ impl SyscallDispatcher {
                     // the eager arena (mirrors the file-mmap arm); the
                     // host-side no_access gate is kept in sync for EFAULT.
                     let prot_none = prot_flags.is_empty();
-                    memory.set_no_access(addr, map_len_usize, false);
-                    memory.set_no_write(
+                    memory.set_mapping_protection(
                         addr,
                         map_len_usize,
+                        prot_none,
                         !prot_none && !prot_flags.contains(LinuxProtFlags::WRITE),
                     );
                     if prot_none {
-                        memory.set_no_access(addr, map_len_usize, true);
                         let _ = memory.protect_range(addr, map_len_usize, 0);
                     } else {
                         let _ = memory.protect_range(addr, map_len_usize, 0);
                         this.track_resident_fault_range(addr, length, prot_flags);
                     }
                     if let Err(errno) = this.commit_mmap_locked_range(memory, locked_range) {
-                        memory.set_no_access(addr, map_len_usize, false);
-                        memory.set_no_write(addr, map_len_usize, false);
+                        memory.set_mapping_protection(addr, map_len_usize, false, false);
                         let _ = memory.protect_range(
                             addr,
                             map_len_usize,
@@ -1469,9 +1487,7 @@ impl SyscallDispatcher {
             let prot_none = prot_flags.is_empty();
             if prot_none && map_flags.contains(LinuxMmapFlags::ANONYMOUS) {
                 let locked_range = this.prepare_mmap_locked_range(map_flags, address, length)?;
-                memory.set_no_access(address, length_usize, false);
-                memory.set_no_write(address, length_usize, false);
-                memory.set_no_access(address, length_usize, true);
+                memory.set_mapping_protection(address, length_usize, true, false);
                 // protect_range runs UNCONDITIONALLY so a demand-paged backend
                 // (bhyve) records a reservation across the WHOLE mmap arena,
                 // not just the first `mmap_arena_size()` bytes — Go's page
@@ -1502,10 +1518,10 @@ impl SyscallDispatcher {
                 && !mmap_address_uses_alias(address, length, layout)
             {
                 let locked_range = this.prepare_mmap_locked_range(map_flags, address, length)?;
-                memory.set_no_access(address, length_usize, false);
-                memory.set_no_write(
+                memory.set_mapping_protection(
                     address,
                     length_usize,
+                    false,
                     !prot_flags.contains(LinuxProtFlags::WRITE),
                 );
                 // Unconditional (see the PROT_NONE arm above): reserve across
@@ -1685,10 +1701,10 @@ impl SyscallDispatcher {
                 // but carrick's syscall-path EFAULT check consults `no_access` —
                 // clear it here, or reads/writes of guest buffers in this range
                 // wrongly EFAULT.
-                memory.set_no_access(address, length_usize, prot_none);
-                memory.set_no_write(
+                memory.set_mapping_protection(
                     address,
                     length_usize,
+                    prot_none,
                     !prot_none && !prot_flags.contains(LinuxProtFlags::WRITE),
                 );
                 if !map_flags.contains(LinuxMmapFlags::ANONYMOUS)
@@ -1724,7 +1740,6 @@ impl SyscallDispatcher {
             }
 
             let locked_range = this.prepare_mmap_locked_range(map_flags, address, length)?;
-            memory.set_no_access(address, length_usize, false);
             // Stamp the file content via the UNCHECKED path: this is carrick
             // loading the mapping, not a guest write. The final prot may be
             // read-only, and the dynamic loader's `mmap(whole-lib, PROT_READ)`
@@ -1732,12 +1747,10 @@ impl SyscallDispatcher {
             // it `MAP_FIXED`s each segment in — so the checked `write_bytes`
             // (x86's read-only write gate) would wrongly EFAULT our own load.
             let _ = memory.write_bytes_unchecked(address, &bytes);
-            if prot_none {
-                memory.set_no_access(address, length_usize, true);
-            }
-            memory.set_no_write(
+            memory.set_mapping_protection(
                 address,
                 length_usize,
+                prot_none,
                 !prot_none && !prot_flags.contains(LinuxProtFlags::WRITE),
             );
             // Make the requested protection guest-visible (also restores RW for
@@ -1824,7 +1837,7 @@ impl SyscallDispatcher {
                 if let Some(len) = align_up_u64(length, page_size)
                     && let Ok(len_usize) = usize::try_from(len)
                 {
-                    cx.memory.set_no_access(address.0, len_usize, true);
+                    mark_range_unmapped(&mut *cx.memory, address.0, len_usize);
                 }
                 this.writeback_shared(cx, &alloc, true);
                 return Ok(DispatchOutcome::Returned { value: 0 });
@@ -1852,7 +1865,7 @@ impl SyscallDispatcher {
                     // its own 2 MiB block + L3 table) — else the spare pool leaks
                     // one table per alias and a churning guest hits OutOfTables.
                     let _ = cx.memory.unmap_alias_range(address.0, len_usize);
-                    cx.memory.set_no_access(address.0, len_usize, true);
+                    mark_range_unmapped(&mut *cx.memory, address.0, len_usize);
                 }
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
@@ -1871,7 +1884,7 @@ impl SyscallDispatcher {
                 // behavior).
                 if let Ok(len_usize) = usize::try_from(len) {
                     let _ = cx.memory.unmap_range(address.0, len_usize);
-                    cx.memory.set_no_access(address.0, len_usize, true);
+                    mark_range_unmapped(&mut *cx.memory, address.0, len_usize);
                 }
                 if address.0.checked_add(len) == Some(mem.mmap_next) {
                     mem.mmap_next = address.0;
@@ -2099,12 +2112,11 @@ impl SyscallDispatcher {
                 {
                     let tail_len = tail_end - tail_start;
                     if let Ok(tl) = usize::try_from(tail_len) {
-                        // Mark no-access so the SYSCALL path (mincore/read_bytes)
-                        // also reports the tail unmapped (mincore → ENOMEM),
-                        // matching Linux — not just a stage-1 fault on EL0 access.
-                        // A reusing mmap clears no-access in its seed.
-                        memory.set_no_access(tail_start, tl, true);
+                        // Invalidate guest translation first, then publish the
+                        // post-unmap VMA state last so backend protection hooks
+                        // cannot overwrite it with live PROT_NONE metadata.
                         let _ = memory.unmap_range(tail_start, tl);
+                        mark_range_unmapped(memory, tail_start, tl);
                     }
                     let mut mem = this.mem.lock();
                     if tail_end == mem.mmap_next {
@@ -2158,7 +2170,7 @@ impl SyscallDispatcher {
                     // invalidated pages → a level-3 translation fault.)
                     let grow_len_u64 = new_size - old_size;
                     if let Ok(grow_len) = usize::try_from(grow_len_u64) {
-                        memory.set_no_access(old_end, grow_len, false);
+                        memory.set_mapping_protection(old_end, grow_len, false, false);
                         if memory
                             .protect_range(old_end, grow_len, LINUX_PROT_READ | LINUX_PROT_WRITE)
                             .is_err()
@@ -2186,7 +2198,7 @@ impl SyscallDispatcher {
             };
             // Clear stale no-access tracking on the destination — it may be a
             // range reclaimed from a prior munmap (which marked it no-access).
-            memory.set_no_access(new_addr, new_len, false);
+            memory.set_mapping_protection(new_addr, new_len, false, false);
             if reused {
                 let _ = memory.zero_guest_range(new_addr, new_len);
             }
@@ -2237,11 +2249,8 @@ impl SyscallDispatcher {
                     && old_len > 0
                 {
                     let mut mem = this.mem.lock();
-                    // No-access so the syscall path also reports the source
-                    // unmapped (mincore → ENOMEM), matching Linux; a reusing
-                    // mmap clears it in its seed.
-                    memory.set_no_access(old_address.0, old_len, true);
                     let _ = memory.unmap_range(old_address.0, old_len);
+                    mark_range_unmapped(memory, old_address.0, old_len);
                     if old_address.0.checked_add(old_size) == Some(mem.mmap_next) {
                         mem.mmap_next = old_address.0;
                         while let Some(pos) = mem
@@ -2272,6 +2281,12 @@ impl SyscallDispatcher {
             if !address.0.is_multiple_of(page_size) {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
+            let Some(length) = align_up_u64(length, page_size) else {
+                return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+            };
+            let Ok(len) = usize::try_from(length) else {
+                return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+            };
             // Linux mprotect returns ENOMEM when the range covers unmapped VA
             // (a hole in the address space). carrick previously SUCCEEDED on any
             // page-aligned address regardless of whether it was mapped (LTP
@@ -2282,57 +2297,55 @@ impl SyscallDispatcher {
             // already mprotect'd to PROT_NONE (glibc/Go/jemalloc guard pages —
             // the dominant re-mprotect pattern) is no_access, so the gated read
             // would FALSELY report it unmapped and ENOMEM the common case.
-            // `read_bytes_raw` faults only on a genuine backing hole (an address
-            // in no mapped region, e.g. NULL), exactly Linux's "unmapped VA"
-            // condition. It is strictly more permissive than Linux (which requires
-            // the WHOLE range mapped — we only probe the start page), so it never
-            // rejects a valid mapping. Probe BEFORE mutating no_access so we don't
-            // stamp tracking onto a foreign/unmapped range.
-            if cx.memory.read_bytes_raw(address.0, 1).is_err() {
+            // `read_bytes_raw` catches an address with no backing (e.g. NULL),
+            // while the explicit unmapped set catches retained arena backing
+            // after munmap across the whole rounded range. Probe BEFORE changing
+            // protection metadata so a hole cannot be resurrected as a VMA.
+            if cx
+                .memory
+                .protections()
+                .is_some_and(|p| p.range_unmapped(address.0, len))
+                || cx.memory.read_bytes_raw(address.0, 1).is_err()
+            {
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
             }
-            let Some(length) = align_up_u64(length, page_size) else {
-                return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
-            };
             // A shared mapping of a F_SEAL_WRITE memfd cannot be upgraded to
             // writable (memfd_create01 check_mfd_non_writeable).
             if prot & LINUX_PROT_WRITE != 0 && this.range_is_write_sealed_shared(address.0, length) {
                 return Ok(DispatchOutcome::errno(LINUX_EPERM));
             }
-            if let Ok(len) = usize::try_from(length) {
-                let prot_none = LinuxProtFlags::from_bits_truncate(prot).is_empty();
-                cx.memory.set_no_access(address.0, len, prot_none);
-                cx.memory.set_no_write(
-                    address.0,
-                    len,
-                    !prot_none && prot & LINUX_PROT_WRITE == 0,
-                );
-                // Make the new protection guest-VISIBLE (a violating access
-                // faults during EL0 execution) by editing the stage-1/PML4
-                // page tables. In the private mmap arena a failed edit is
-                // fatal (eager backends must succeed there). The identity
-                // image/heap/interpreter ranges are edited BEST-EFFORT: the
-                // ELF loader now boots .text/.rodata read-only, so a guest
-                // mprotect there (ld.so RELRO, a test unprotecting .rodata)
-                // must actually flip the leaves — but a hole inside the
-                // range (unmapped identity VA on x86) degrades to the
-                // historical host-side-only behaviour instead of failing.
-                // The shared/overlay apertures and high-VA aliases keep
-                // host-side checks only (unchanged).
-                let layout = this.mem.lock().layout;
-                if range_within(address.0, length, layout.mmap_base, layout.mmap_size) {
-                    if cx.memory.protect_range(address.0, len, prot).is_err() {
-                        return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
-                    }
-                } else if mprotect_range_in_identity_image(address.0, length, layout) {
-                    let _ = cx.memory.protect_range(address.0, len, prot);
+            // Make the new protection guest-VISIBLE (a violating access
+            // faults during EL0 execution) by editing the stage-1/PML4
+            // page tables. In the private mmap arena a failed edit is
+            // fatal (eager backends must succeed there). The identity
+            // image/heap/interpreter ranges are edited BEST-EFFORT: the
+            // ELF loader now boots .text/.rodata read-only, so a guest
+            // mprotect there (ld.so RELRO, a test unprotecting .rodata)
+            // must actually flip the leaves — but a hole inside the
+            // range (unmapped identity VA on x86) degrades to the
+            // historical host-side-only behaviour instead of failing.
+            // The shared/overlay apertures and high-VA aliases keep
+            // host-side checks only (unchanged).
+            let layout = this.mem.lock().layout;
+            if range_within(address.0, length, layout.mmap_base, layout.mmap_size) {
+                if cx.memory.protect_range(address.0, len, prot).is_err() {
+                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 }
-                this.update_dynamic_mapping_prot(
-                    address.0,
-                    length,
-                    LinuxProtFlags::from_bits_retain(prot),
-                );
+            } else if mprotect_range_in_identity_image(address.0, length, layout) {
+                let _ = cx.memory.protect_range(address.0, len, prot);
             }
+            let prot_none = LinuxProtFlags::from_bits_truncate(prot).is_empty();
+            cx.memory.set_mapping_protection(
+                address.0,
+                len,
+                prot_none,
+                !prot_none && prot & LINUX_PROT_WRITE == 0,
+            );
+            this.update_dynamic_mapping_prot(
+                address.0,
+                length,
+                LinuxProtFlags::from_bits_retain(prot),
+            );
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
@@ -2938,11 +2951,190 @@ mod tests {
         }
     }
 
+    struct ProtectionTrackingMemory {
+        inner: CountingMmapMemory,
+        protections: carrick_guest_mem::protections::MemoryProtections,
+    }
+
+    impl ProtectionTrackingMemory {
+        fn new(base: u64, len: usize) -> Self {
+            Self {
+                inner: CountingMmapMemory::new(base, len),
+                protections: carrick_guest_mem::protections::MemoryProtections::default(),
+            }
+        }
+    }
+
+    impl GuestMemory for ProtectionTrackingMemory {
+        fn protections(&self) -> Option<&carrick_guest_mem::protections::MemoryProtections> {
+            Some(&self.protections)
+        }
+
+        fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+            self.inner.read_bytes_raw(address, length)
+        }
+
+        fn write_bytes_raw(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+            self.inner.write_bytes_raw(address, bytes)
+        }
+
+        fn zero_backing(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
+            self.inner.zero_backing(address, len)
+        }
+
+        fn set_no_access(&mut self, address: u64, len: usize, no_access: bool) {
+            self.protections.set_no_access(address, len, no_access);
+        }
+
+        fn set_no_write(&mut self, address: u64, len: usize, no_write: bool) {
+            self.protections.set_no_write(address, len, no_write);
+        }
+
+        fn set_unmapped(&mut self, address: u64, len: usize, unmapped: bool) {
+            self.protections.set_unmapped(address, len, unmapped);
+        }
+
+        fn set_mapping_protection(
+            &mut self,
+            address: u64,
+            len: usize,
+            no_access: bool,
+            no_write: bool,
+        ) {
+            self.protections
+                .set_mapping_protection(address, len, no_access, no_write);
+        }
+
+        fn protect_range(
+            &mut self,
+            address: u64,
+            len: usize,
+            prot: u64,
+        ) -> Result<(), MemoryError> {
+            self.inner.protect_range(address, len, prot)
+        }
+    }
+
     fn returned(outcome: DispatchOutcome) -> i64 {
         match outcome {
             DispatchOutcome::Returned { value } => value,
             other => panic!("expected Returned, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn munmap_clears_read_only_tracking_before_writable_reuse() {
+        const SYS_MMAP: u64 = 222;
+        const SYS_MUNMAP: u64 = 215;
+        const SYS_MPROTECT: u64 = 226;
+
+        let mut dispatcher = SyscallDispatcher::new();
+        let mut memory = ProtectionTrackingMemory::new(LINUX_MMAP_BASE, LINUX_PAGE_SIZE as usize);
+        let reporter = CompatReporter::default();
+        let read_only = SyscallRequest::new(
+            SYS_MMAP,
+            SyscallArgs([
+                0,
+                LINUX_PAGE_SIZE,
+                LINUX_PROT_READ,
+                LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
+                u64::MAX,
+                0,
+            ]),
+        );
+
+        assert_eq!(
+            returned(
+                dispatcher
+                    .dispatch(read_only, &mut memory, &reporter)
+                    .expect("read-only mmap dispatch")
+            ),
+            LINUX_MMAP_BASE as i64
+        );
+        assert!(
+            memory
+                .protections
+                .range_no_write(LINUX_MMAP_BASE, LINUX_PAGE_SIZE as usize)
+        );
+
+        let unmap = SyscallRequest::new(
+            SYS_MUNMAP,
+            SyscallArgs([LINUX_MMAP_BASE, LINUX_PAGE_SIZE, 0, 0, 0, 0]),
+        );
+        assert_eq!(
+            dispatcher
+                .dispatch(unmap, &mut memory, &reporter)
+                .expect("munmap dispatch"),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        assert!(
+            memory
+                .protections
+                .range_no_access(LINUX_MMAP_BASE, LINUX_PAGE_SIZE as usize)
+        );
+        assert!(
+            !memory
+                .protections
+                .range_no_write(LINUX_MMAP_BASE, LINUX_PAGE_SIZE as usize),
+            "an unmapped VA must not retain stale read-only VMA evidence"
+        );
+        assert_eq!(
+            crate::vcpu_loop::upgrade_protection_si_code(
+                &memory,
+                crate::linux_abi::LINUX_SIGSEGV,
+                1,
+                LINUX_MMAP_BASE,
+            ),
+            1,
+            "a post-munmap translation fault is SEGV_MAPERR, not a permission fault"
+        );
+
+        let protect_hole = SyscallRequest::new(
+            SYS_MPROTECT,
+            SyscallArgs([LINUX_MMAP_BASE, LINUX_PAGE_SIZE, LINUX_PROT_READ, 0, 0, 0]),
+        );
+        assert_eq!(
+            dispatcher
+                .dispatch(protect_hole, &mut memory, &reporter)
+                .expect("mprotect post-munmap hole dispatch"),
+            DispatchOutcome::errno(LINUX_ENOMEM),
+            "retained host backing must not let mprotect resurrect an unmapped VMA"
+        );
+        assert!(
+            memory
+                .protections
+                .range_unmapped(LINUX_MMAP_BASE, LINUX_PAGE_SIZE as usize)
+        );
+
+        let writable = SyscallRequest::new(
+            SYS_MMAP,
+            SyscallArgs([
+                0,
+                LINUX_PAGE_SIZE,
+                LINUX_PROT_READ | LINUX_PROT_WRITE,
+                LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
+                u64::MAX,
+                0,
+            ]),
+        );
+        assert_eq!(
+            returned(
+                dispatcher
+                    .dispatch(writable, &mut memory, &reporter)
+                    .expect("writable reuse mmap dispatch")
+            ),
+            LINUX_MMAP_BASE as i64
+        );
+        assert!(
+            !memory
+                .protections
+                .range_no_access(LINUX_MMAP_BASE, LINUX_PAGE_SIZE as usize)
+        );
+        assert!(
+            !memory
+                .protections
+                .range_no_write(LINUX_MMAP_BASE, LINUX_PAGE_SIZE as usize)
+        );
     }
 
     #[test]

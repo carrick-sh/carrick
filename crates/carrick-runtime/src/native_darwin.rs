@@ -791,7 +791,7 @@ fn run_native_thread_loop(
             };
             si_code = {
                 let memory = memory.lock();
-                crate::vcpu_loop::upgrade_prot_none_si_code(&*memory, signum, si_code, si_addr)
+                crate::vcpu_loop::upgrade_protection_si_code(&*memory, signum, si_code, si_addr)
             };
             if signum == crate::linux_abi::LINUX_SIGSEGV
                 && let Some((grow_start, grow_len)) = dispatcher.mmap_growdown_fault_plan(si_addr)
@@ -4934,11 +4934,10 @@ impl NativeMappedMemory {
                 "native Darwin alias guest length too large: 0x{address:x}+0x{len:x}"
             ))
         })?;
-        self.protections
-            .set_no_access(address, len_usize, prot_none);
-        self.protections.set_no_write(
+        self.protections.set_mapping_protection(
             address,
             len_usize,
+            prot_none,
             !prot_none && final_prot & libc::PROT_WRITE == 0,
         );
         self.regions.push(NativeMappedRegion {
@@ -4959,10 +4958,7 @@ impl GuestMemory for NativeMappedMemory {
     }
 
     fn write_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
-        if !bytes.is_empty()
-            && (self.protections.range_no_access(address, bytes.len())
-                || self.protections.range_no_write(address, bytes.len()))
-        {
+        if !bytes.is_empty() && self.protections.range_write_denied(address, bytes.len()) {
             return Err(MemoryError::OutOfBounds {
                 address,
                 length: bytes.len(),
@@ -5043,9 +5039,23 @@ impl GuestMemory for NativeMappedMemory {
         self.protections.set_no_write(address, len, no_write);
     }
 
+    fn set_unmapped(&mut self, address: u64, len: usize, unmapped: bool) {
+        self.protections.set_unmapped(address, len, unmapped);
+    }
+
+    fn set_mapping_protection(
+        &mut self,
+        address: u64,
+        len: usize,
+        no_access: bool,
+        no_write: bool,
+    ) {
+        self.protections
+            .set_mapping_protection(address, len, no_access, no_write);
+    }
+
     fn guest_range_is_writable(&self, address: u64, length: usize) -> bool {
-        !(self.protections.range_no_access(address, length)
-            || self.protections.range_no_write(address, length))
+        !self.protections.range_write_denied(address, length)
     }
 
     fn protect_range(&mut self, address: u64, len: usize, prot: u64) -> Result<(), MemoryError> {
@@ -5099,8 +5109,9 @@ impl GuestMemory for NativeMappedMemory {
     }
 
     fn unmap_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
-        self.set_no_access(address, len, true);
-        self.protect_range(address, len, 0)
+        self.protect_range(address, len, 0)?;
+        self.set_unmapped(address, len, true);
+        Ok(())
     }
 
     fn shared_futex_location(

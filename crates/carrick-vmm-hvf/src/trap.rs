@@ -3624,7 +3624,9 @@ impl HvfVmState {
             };
             if require_guest_writable
                 && (!mapping.guest_writable
-                    || self.protections.range_no_write(chunk_address, chunk_len))
+                    || self
+                        .protections
+                        .range_write_denied(chunk_address, chunk_len))
             {
                 return Err(MemoryError::OutOfBounds { address, length });
             }

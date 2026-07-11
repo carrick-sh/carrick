@@ -2255,7 +2255,7 @@ impl SyscallDispatcher {
                     .and_then(|len| usize::try_from(len).ok())
             {
                 let _ = cx.memory.unmap_alias_range(addr, len);
-                cx.memory.set_no_access(addr, len, true);
+                cx.memory.set_unmapped(addr, len, true);
             }
             Ok(DispatchOutcome::Returned { value: 0 })
         }

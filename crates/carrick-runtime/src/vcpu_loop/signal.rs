@@ -127,16 +127,14 @@ pub(crate) fn el0_debug_signal(esr: u64) -> Option<(i32, i32)> {
     }
 }
 
-/// Upgrade `SEGV_MAPERR` to `SEGV_ACCERR` when the faulting VA lies inside a
-/// range the guest mapped/`mprotect`ed `PROT_NONE`. Linux reports ACCERR there
-/// — the VMA exists, the permission doesn't — but carrick expresses PROT_NONE
-/// as a NON-PRESENT leaf (aarch64 invalid descriptor / x86 P=0), whose raw
-/// fault class decodes as MAPERR on both ISAs. The engine's process-wide
-/// [`carrick_guest_mem::protections::MemoryProtections`] no-access set (the
-/// same one the syscall-path EFAULT gate consults) is the tracked PROT_NONE
-/// state, so consult it at delivery time. Anything not tracked there (a
-/// genuinely unmapped VA) keeps MAPERR.
-pub(crate) fn upgrade_prot_none_si_code<M: GuestMemory>(
+/// Upgrade `SEGV_MAPERR` to `SEGV_ACCERR` when Carrick's protection metadata
+/// says the faulting VA belongs to a live mapping that denies the access.
+/// Linux reports ACCERR there because the VMA exists. Carrick can otherwise
+/// see MAPERR when `PROT_NONE` is represented by a non-present guest leaf, or
+/// when Darwin reports an initial read-only host mapping as a translation-style
+/// fault. The process-wide no-access and no-write sets are the durable VMA
+/// permission evidence; an address in neither set remains a genuine MAPERR.
+pub(crate) fn upgrade_protection_si_code<M: GuestMemory>(
     memory: &M,
     signum: i32,
     si_code: i32,
@@ -149,7 +147,7 @@ pub(crate) fn upgrade_prot_none_si_code<M: GuestMemory>(
         && si_code == SEGV_MAPERR
         && memory
             .protections()
-            .is_some_and(|p| p.range_no_access(fault_addr, 1))
+            .is_some_and(|p| p.range_fault_is_access_error(fault_addr, 1))
     {
         SEGV_ACCERR
     } else {
