@@ -4,10 +4,10 @@ use super::super::NativeUcontextSnapshot;
 use super::block::{BlockPlan, PlannedExit, PlannedInst};
 use super::cache::TranslationCache;
 use super::emit::{EmittedBlock, emit_block};
-use super::gateway::enter_translated;
+use super::gateway::{IndirectTargetCache, enter_translated, enter_translated_with_cache};
 use super::types::{
     CodeGeneration, DirectExit, DirectKind, DsrError, IndirectExit, IndirectKind, InstAction,
-    NativeDsrExit, PcRelativeInst, PcRelativeKind,
+    NativeDsrExit, PcRelativeInst, PcRelativeKind, SensitiveExit, SensitiveKind,
 };
 
 fn legacy_brk_round_trip(
@@ -583,7 +583,8 @@ fn dsr_direct_flow_condition_codes_and_virtual_x18_bits_choose_guest_edges() {
             NativeDsrExit::ResolveDirect {
                 source: start,
                 target: GuestVa(start.raw() + 8),
-            }
+            },
+            "conditional word 0x{word:08x}"
         );
     }
 }
@@ -754,6 +755,691 @@ fn dsr_indirect_flow_branch_reads_virtual_guest_x18() {
             link: None,
         }
     );
+}
+
+#[test]
+fn dsr_indirect_flow_cache_hit_stays_in_translated_code() {
+    let source_guest = GuestVa(0x18_100);
+    let target_guest = GuestVa(0x18_200);
+    let mut code = TranslationCache::new(16 * 1024).expect("allocate indirect cache-hit code");
+    let target = emit_block(
+        &mut code,
+        &BlockPlan {
+            start: target_guest,
+            end: GuestVa(target_guest.raw() + 4),
+            generation: CodeGeneration::INITIAL,
+            instructions: Vec::new(),
+            exit: PlannedExit::Syscall {
+                guest: target_guest,
+                resume: GuestVa(target_guest.raw() + 4),
+            },
+        },
+    )
+    .expect("emit indirect cache-hit target");
+    let source = emit_block(
+        &mut code,
+        &BlockPlan {
+            start: source_guest,
+            end: GuestVa(source_guest.raw() + 4),
+            generation: CodeGeneration::INITIAL,
+            instructions: Vec::new(),
+            exit: PlannedExit::Indirect {
+                guest: source_guest,
+                word: 0xd61f_0000, // br x0
+                exit: IndirectExit {
+                    kind: IndirectKind::Branch,
+                    register: bad64::Reg::X0,
+                    resume: GuestVa(source_guest.raw() + 4),
+                },
+            },
+        },
+    )
+    .expect("emit indirect cache-hit source");
+    let indirect = IndirectTargetCache::new();
+    indirect.publish(target_guest, CodeGeneration::INITIAL, target.entry());
+
+    let mut stack = vec![0_u8; 16 * 1024];
+    let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    snapshot.x[0] = target_guest.raw();
+    snapshot.pstate = 0x8000_0000;
+    let expected_x15 = snapshot.x[15];
+    let expected_x16 = snapshot.x[16];
+    let expected_x17 = snapshot.x[17];
+    let expected_pstate = snapshot.pstate;
+    let mut exit = NativeDsrExit::ResolveIndirect {
+        source: source_guest,
+        target: target_guest,
+        link: None,
+    };
+    enter_translated_with_cache(source.entry(), &mut snapshot, &mut exit, &indirect)
+        .expect("execute cached indirect branch");
+
+    assert_eq!(
+        exit,
+        NativeDsrExit::Syscall {
+            resume: GuestVa(target_guest.raw() + 4)
+        }
+    );
+    assert_eq!(snapshot.x[15], expected_x15);
+    assert_eq!(snapshot.x[16], expected_x16);
+    assert_eq!(snapshot.x[17], expected_x17);
+    assert_eq!(snapshot.pstate, expected_pstate);
+}
+
+#[test]
+fn dsr_indirect_flow_cached_blr_sets_guest_link_register() {
+    let source_guest = GuestVa(0x18_300);
+    let target_guest = GuestVa(0x18_400);
+    let resume_guest = GuestVa(source_guest.raw() + 4);
+    let mut code = TranslationCache::new(16 * 1024).expect("allocate cached BLR code");
+    let target = emit_block(
+        &mut code,
+        &BlockPlan {
+            start: target_guest,
+            end: GuestVa(target_guest.raw() + 4),
+            generation: CodeGeneration::INITIAL,
+            instructions: Vec::new(),
+            exit: PlannedExit::Syscall {
+                guest: target_guest,
+                resume: GuestVa(target_guest.raw() + 4),
+            },
+        },
+    )
+    .expect("emit cached BLR target");
+    let source = emit_block(
+        &mut code,
+        &BlockPlan {
+            start: source_guest,
+            end: resume_guest,
+            generation: CodeGeneration::INITIAL,
+            instructions: Vec::new(),
+            exit: PlannedExit::Indirect {
+                guest: source_guest,
+                word: 0xd63f_0000, // blr x0
+                exit: IndirectExit {
+                    kind: IndirectKind::Call,
+                    register: bad64::Reg::X0,
+                    resume: resume_guest,
+                },
+            },
+        },
+    )
+    .expect("emit cached BLR source");
+    let indirect = IndirectTargetCache::new();
+    indirect.publish(target_guest, CodeGeneration::INITIAL, target.entry());
+    let mut stack = vec![0_u8; 16 * 1024];
+    let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    snapshot.x[0] = target_guest.raw();
+    let mut exit = NativeDsrExit::ResolveIndirect {
+        source: source_guest,
+        target: target_guest,
+        link: Some(resume_guest),
+    };
+
+    enter_translated_with_cache(source.entry(), &mut snapshot, &mut exit, &indirect)
+        .expect("execute cached BLR");
+
+    assert_eq!(snapshot.x[30], resume_guest.raw());
+    assert!(matches!(exit, NativeDsrExit::Syscall { .. }));
+}
+
+#[test]
+fn dsr_sensitive_flow_reports_guest_pc_and_resume() {
+    let mut cache = TranslationCache::new(16 * 1024).expect("allocate sensitive cache");
+    let plan = BlockPlan {
+        start: GuestVa(0x1a_000),
+        end: GuestVa(0x1a_004),
+        generation: CodeGeneration::INITIAL,
+        instructions: Vec::new(),
+        exit: PlannedExit::Sensitive {
+            guest: GuestVa(0x1a_000),
+            word: 0xd53b_d040,
+            exit: SensitiveExit {
+                kind: SensitiveKind::ReadTpidr,
+                register: Some(bad64::Reg::X0),
+                resume: GuestVa(0x1a_004),
+            },
+        },
+    };
+    let emitted = emit_block(&mut cache, &plan).expect("emit sensitive exit");
+    let mut stack = vec![0_u8; 16 * 1024];
+    let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    let mut exit = NativeDsrExit::Sensitive {
+        guest_pc: GuestVa(0x1a_000),
+        resume: GuestVa(0x1a_004),
+    };
+    enter_translated(emitted.entry(), &mut snapshot, &mut exit).expect("execute sensitive exit");
+    assert_eq!(
+        exit,
+        NativeDsrExit::Sensitive {
+            guest_pc: GuestVa(0x1a_000),
+            resume: GuestVa(0x1a_004),
+        }
+    );
+}
+
+#[test]
+fn dsr_virtual_x18_rewrites_destination_and_distinct_x17_operand() {
+    let mut cache = TranslationCache::new(16 * 1024).expect("allocate x18 rewrite cache");
+    let plan = BlockPlan {
+        start: GuestVa(0x1b_000),
+        end: GuestVa(0x1b_00c),
+        generation: CodeGeneration::INITIAL,
+        instructions: vec![
+            PlannedInst {
+                guest: GuestVa(0x1b_000),
+                action: super::decode::classify(0x9278_0032, GuestVa(0x1b_000))
+                    .expect("classify x18 AND"),
+            },
+            PlannedInst {
+                guest: GuestVa(0x1b_004),
+                action: super::decode::classify(0x8b11_0252, GuestVa(0x1b_004))
+                    .expect("classify x18 plus x17"),
+            },
+        ],
+        exit: PlannedExit::Syscall {
+            guest: GuestVa(0x1b_008),
+            resume: GuestVa(0x1b_00c),
+        },
+    };
+    let emitted = emit_block(&mut cache, &plan).expect("emit x18 rewrites");
+    let mut stack = vec![0_u8; 16 * 1024];
+    let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    snapshot.x[1] = 0x123;
+    let expected_x17 = snapshot.x[17];
+    let mut exit = NativeDsrExit::Syscall {
+        resume: GuestVa(0x1b_00c),
+    };
+    enter_translated(emitted.entry(), &mut snapshot, &mut exit).expect("execute x18 rewrites");
+    assert_eq!(snapshot.x[18], 0x100_u64.wrapping_add(expected_x17));
+    assert_eq!(snapshot.x[17], expected_x17);
+}
+
+#[test]
+fn dsr_virtual_x28_rewrites_destination_and_distinct_x17_operand() {
+    let mut cache = TranslationCache::new(16 * 1024).expect("allocate x28 rewrite cache");
+    let plan = BlockPlan {
+        start: GuestVa(0x1b_100),
+        end: GuestVa(0x1b_10c),
+        generation: CodeGeneration::INITIAL,
+        instructions: vec![
+            PlannedInst {
+                guest: GuestVa(0x1b_100),
+                action: super::decode::classify(0x9100_043c, GuestVa(0x1b_100))
+                    .expect("classify add x28, x1, #1"),
+            },
+            PlannedInst {
+                guest: GuestVa(0x1b_104),
+                action: super::decode::classify(0x8b11_039c, GuestVa(0x1b_104))
+                    .expect("classify x28 plus x17"),
+            },
+        ],
+        exit: PlannedExit::Syscall {
+            guest: GuestVa(0x1b_108),
+            resume: GuestVa(0x1b_10c),
+        },
+    };
+    let emitted = emit_block(&mut cache, &plan).expect("emit x28 rewrites");
+    let mut stack = vec![0_u8; 16 * 1024];
+    let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    snapshot.x[1] = 0x123;
+    let expected_x17 = snapshot.x[17];
+    let mut exit = NativeDsrExit::Syscall {
+        resume: GuestVa(0x1b_10c),
+    };
+    enter_translated(emitted.entry(), &mut snapshot, &mut exit).expect("execute x28 rewrites");
+    assert_eq!(snapshot.x[28], 0x124_u64.wrapping_add(expected_x17));
+    assert_eq!(snapshot.x[17], expected_x17);
+}
+
+#[test]
+fn dsr_vdso_x18_rewrites_match_native_execution() {
+    let words = [
+        0x2941_0c12,
+        0x2a12_03fb,
+        0x0b1b_024c,
+        0x3940_0a12,
+        0x5310_3e52,
+        0x2a10_6250,
+        0x3840_4dd2,
+        0x2a0d_224d,
+        0x3940_0152,
+        0xaa0e_224e,
+        0x3940_09d2,
+        0x5310_3e52,
+        0x2a0e_624e,
+        0x3940_0552,
+        0x3900_0572,
+        0xaa08_03f2,
+        0xcb08_0251,
+        0x8b12_0012,
+        0x3900_0249,
+        0x9100_2243,
+        0x3900_164a,
+        0x3900_0e4b,
+        0x3900_0a4c,
+        0x3900_064d,
+        0x3800_4e4e,
+        0x3900_0e4f,
+        0x3900_0a50,
+        0xaa03_03f2,
+    ];
+    assert_eq!(
+        unsafe { super::super::carrick_native_install_trap_handler() },
+        0
+    );
+
+    for (index, word) in words.into_iter().enumerate() {
+        let guest = GuestVa(0x1b_100 + index as u64 * 0x10);
+        let action = super::decode::classify(word, guest).expect("classify vDSO x18 word");
+        assert!(matches!(action, InstAction::VirtualizedX18 { .. }));
+        let mut memory = [0_u8; 512];
+        for (offset, byte) in memory.iter_mut().enumerate() {
+            *byte = offset as u8;
+        }
+        let pristine = memory;
+        let base = unsafe { memory.as_mut_ptr().add(128) } as u64;
+        let mut stack = vec![0_u8; 16 * 1024];
+        let mut initial = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+        for register in &mut initial.x {
+            *register = base;
+        }
+        initial.x[8] = 1;
+        initial.x[17] = base;
+        initial.x[18] = base;
+
+        let mut native_cache = TranslationCache::new(16 * 1024).expect("allocate native oracle");
+        let mut writer = native_cache
+            .begin_write(8)
+            .expect("begin native oracle write");
+        writer
+            .write_words(&[word, super::super::BRK_NATIVE_SYSCALL])
+            .expect("write native oracle words");
+        let native = writer.publish().expect("publish native oracle");
+        let mut expected = initial;
+        legacy_brk_round_trip(native.entry(), &mut expected).unwrap_or_else(|error| {
+            panic!("native vDSO x18 oracle failed for 0x{word:08x}: {error}")
+        });
+        let expected_memory = memory;
+
+        memory.copy_from_slice(&pristine);
+        let mut dsr_cache = TranslationCache::new(16 * 1024).expect("allocate DSR oracle");
+        let emitted = emit_block(
+            &mut dsr_cache,
+            &BlockPlan {
+                start: guest,
+                end: GuestVa(guest.raw() + 8),
+                generation: CodeGeneration::INITIAL,
+                instructions: vec![PlannedInst { guest, action }],
+                exit: PlannedExit::Syscall {
+                    guest: GuestVa(guest.raw() + 4),
+                    resume: GuestVa(guest.raw() + 8),
+                },
+            },
+        )
+        .expect("emit DSR vDSO x18 oracle");
+        let mut observed = initial;
+        let mut exit = NativeDsrExit::Syscall {
+            resume: GuestVa(guest.raw() + 8),
+        };
+        enter_translated(emitted.entry(), &mut observed, &mut exit)
+            .expect("execute DSR vDSO x18 oracle");
+
+        assert_eq!(
+            observed.x, expected.x,
+            "GPR mismatch for vDSO word 0x{word:08x}"
+        );
+        assert_eq!(
+            observed.pstate, expected.pstate,
+            "NZCV mismatch for vDSO word 0x{word:08x}"
+        );
+        assert_eq!(
+            memory, expected_memory,
+            "memory mismatch for vDSO word 0x{word:08x}"
+        );
+    }
+}
+
+#[test]
+fn dsr_signal_fault_reconstructs_copied_instruction_pc() {
+    assert_eq!(
+        unsafe { super::super::carrick_native_install_trap_handler() },
+        0
+    );
+    let mut cache = TranslationCache::new(16 * 1024).expect("allocate fault cache");
+    let plan = BlockPlan {
+        start: GuestVa(0x1c_000),
+        end: GuestVa(0x1c_008),
+        generation: CodeGeneration::INITIAL,
+        instructions: vec![PlannedInst {
+            guest: GuestVa(0x1c_000),
+            action: InstAction::Copy(0xf940_0000), // ldr x0, [x0]
+        }],
+        exit: PlannedExit::Syscall {
+            guest: GuestVa(0x1c_004),
+            resume: GuestVa(0x1c_008),
+        },
+    };
+    let emitted = emit_block(&mut cache, &plan).expect("emit faulting block");
+    let mut stack = vec![0_u8; 16 * 1024];
+    let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    snapshot.x[0] = 1;
+    let mut exit = NativeDsrExit::Fault {
+        guest_pc: GuestVa(0),
+        signal: 0,
+        code: 0,
+        address: GuestVa(0),
+        rewrite_scratch: 0,
+        rewrite_context_scratch: 0,
+    };
+    enter_translated(emitted.entry(), &mut snapshot, &mut exit).expect("capture DSR fault");
+    let NativeDsrExit::Fault {
+        guest_pc,
+        signal,
+        address,
+        ..
+    } = exit
+    else {
+        panic!("expected fault exit, got {exit:?}");
+    };
+    assert!(signal == libc::SIGSEGV || signal == libc::SIGBUS);
+    assert_eq!(address, GuestVa(1));
+    assert_ne!(snapshot.esr, 0, "fault ESR must survive DSR signal exit");
+    let offset = u32::try_from(guest_pc.raw() - emitted.entry().host().raw() as u64)
+        .expect("fault cache offset");
+    assert_eq!(
+        emitted
+            .map()
+            .guest_for_cache(super::types::CacheOffset::published(offset)),
+        Some(GuestVa(0x1c_000))
+    );
+}
+
+#[test]
+fn dsr_signal_fault_recovers_context_when_physical_x28_is_zero() {
+    assert_eq!(
+        unsafe { super::super::carrick_native_install_trap_handler() },
+        0
+    );
+    let guest = GuestVa(0x1c_100);
+    let mut cache = TranslationCache::new(16 * 1024).expect("allocate x28 recovery cache");
+    let emitted = emit_block(
+        &mut cache,
+        &BlockPlan {
+            start: guest,
+            end: GuestVa(guest.raw() + 8),
+            generation: CodeGeneration::INITIAL,
+            // Deliberately bypass classification to model a corrupted
+            // physical-x28 invariant immediately before a gateway exit.
+            instructions: vec![PlannedInst {
+                guest,
+                action: InstAction::Copy(0xaa1f_03fc), // mov x28, xzr
+            }],
+            exit: PlannedExit::Syscall {
+                guest: GuestVa(guest.raw() + 4),
+                resume: GuestVa(guest.raw() + 8),
+            },
+        },
+    )
+    .expect("emit physical x18 corruption oracle");
+    let mut stack = vec![0_u8; 16 * 1024];
+    let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    let expected_virtual_x28 = snapshot.x[28];
+    let mut exit = NativeDsrExit::Fault {
+        guest_pc: GuestVa(0),
+        signal: 0,
+        code: 0,
+        address: GuestVa(0),
+        rewrite_scratch: 0,
+        rewrite_context_scratch: 0,
+    };
+
+    enter_translated(emitted.entry(), &mut snapshot, &mut exit)
+        .expect("recover signal gateway context through the host-stack handoff");
+
+    assert!(
+        matches!(
+            exit,
+            NativeDsrExit::Fault {
+                signal: libc::SIGSEGV,
+                address: GuestVa(136),
+                ..
+            }
+        ),
+        "unexpected x28 recovery exit: {exit:?}"
+    );
+    assert_eq!(snapshot.x[28], expected_virtual_x28);
+}
+
+#[test]
+fn dsr_kick_routes_stale_sigpipe_through_gateway() {
+    assert_eq!(
+        unsafe { super::super::carrick_native_install_trap_handler() },
+        0
+    );
+    let guest = GuestVa(0x1c_200);
+    let mut cache = TranslationCache::new(16 * 1024).expect("allocate kick cache");
+    let emitted = emit_block(
+        &mut cache,
+        &BlockPlan {
+            start: guest,
+            end: GuestVa(guest.raw() + 4),
+            generation: CodeGeneration::INITIAL,
+            instructions: Vec::new(),
+            exit: PlannedExit::Direct {
+                guest,
+                word: 0x1400_0000,
+                exit: DirectExit {
+                    kind: DirectKind::Branch,
+                    target: guest,
+                    resume: GuestVa(guest.raw() + 4),
+                    condition: None,
+                    register: None,
+                    bit: None,
+                },
+            },
+        },
+    )
+    .expect("emit kick loop");
+    let link = emitted.direct_links()[0];
+    cache
+        .patch_direct_branch(
+            super::cache::LinkSite {
+                source: emitted.entry(),
+                slot: link.slot,
+            },
+            emitted.entry(),
+        )
+        .expect("link kick loop");
+    let target = unsafe { libc::pthread_self() };
+    let mut signal_set = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+    let mut old_set = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+    assert_eq!(unsafe { libc::sigemptyset(signal_set.as_mut_ptr()) }, 0);
+    let mut signal_set = unsafe { signal_set.assume_init() };
+    assert_eq!(
+        unsafe { libc::sigaddset(&mut signal_set, libc::SIGPIPE) },
+        0
+    );
+    assert_eq!(
+        unsafe { libc::pthread_sigmask(libc::SIG_UNBLOCK, &signal_set, old_set.as_mut_ptr()) },
+        0
+    );
+    let old_set = unsafe { old_set.assume_init() };
+    let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sender_finished = std::sync::Arc::clone(&finished);
+    let sender = std::thread::spawn(move || {
+        while !sender_finished.load(std::sync::atomic::Ordering::Acquire) {
+            assert_eq!(unsafe { libc::pthread_kill(target, libc::SIGPIPE) }, 0);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    });
+    let mut stack = vec![0_u8; 16 * 1024];
+    let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    let mut exit = NativeDsrExit::Kick {
+        resume: guest,
+        rewrite_scratch: 0,
+        rewrite_context_scratch: 0,
+    };
+
+    enter_translated(emitted.entry(), &mut snapshot, &mut exit)
+        .expect("exit stale SIGPIPE through DSR gateway");
+    finished.store(true, std::sync::atomic::Ordering::Release);
+    sender.join().expect("join SIGPIPE sender");
+    assert_eq!(
+        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &old_set, std::ptr::null_mut()) },
+        0
+    );
+
+    assert!(
+        matches!(exit, NativeDsrExit::Kick { .. }),
+        "unexpected stale SIGPIPE exit: {exit:?}"
+    );
+}
+
+#[test]
+fn dsr_signal_fault_recovers_scratch_in_expanded_x18_load() {
+    assert_eq!(
+        unsafe { super::super::carrick_native_install_trap_handler() },
+        0
+    );
+    let mut cache = TranslationCache::new(16 * 1024).expect("allocate x18 fault cache");
+    let guest_pc = GuestVa(0x1d_000);
+    let plan = BlockPlan {
+        start: guest_pc,
+        end: GuestVa(guest_pc.raw() + 8),
+        generation: CodeGeneration::INITIAL,
+        instructions: vec![PlannedInst {
+            guest: guest_pc,
+            action: super::decode::classify(0xf940_0012, guest_pc).expect("classify ldr x18, [x0]"),
+        }],
+        exit: PlannedExit::Syscall {
+            guest: GuestVa(guest_pc.raw() + 4),
+            resume: GuestVa(guest_pc.raw() + 8),
+        },
+    };
+    let emitted = emit_block(&mut cache, &plan).expect("emit expanded x18 load");
+    let mut stack = vec![0_u8; 16 * 1024];
+    let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    snapshot.x[0] = 1;
+    let original_x18 = snapshot.x[18];
+    let original = snapshot;
+    let mut exit = NativeDsrExit::Fault {
+        guest_pc: GuestVa(0),
+        signal: 0,
+        code: 0,
+        address: GuestVa(0),
+        rewrite_scratch: 0,
+        rewrite_context_scratch: 0,
+    };
+    enter_translated(emitted.entry(), &mut snapshot, &mut exit)
+        .expect("capture expanded x18 fault");
+    let NativeDsrExit::Fault {
+        guest_pc: cache_pc,
+        rewrite_scratch,
+        rewrite_context_scratch,
+        ..
+    } = exit
+    else {
+        panic!("expected expanded fault exit, got {exit:?}");
+    };
+    assert!(
+        cache_pc.raw() >= emitted.entry().host().raw() as u64,
+        "expanded fault reported non-cache PC 0x{:x} before entry 0x{:x}",
+        cache_pc.raw(),
+        emitted.entry().host().raw()
+    );
+    let offset = super::types::CacheOffset::published(
+        u32::try_from(cache_pc.raw() - emitted.entry().host().raw() as u64)
+            .expect("expanded fault offset"),
+    );
+    let recovery = emitted
+        .recovery()
+        .iter()
+        .find(|entry| entry.cache == offset)
+        .expect("expanded instruction recovery")
+        .action;
+    super::recover_rewrite_state(
+        &mut snapshot,
+        recovery,
+        rewrite_scratch,
+        rewrite_context_scratch,
+    )
+    .expect("recover expanded x18 scratch");
+    assert_eq!(snapshot.x[18], original_x18);
+    for index in 0..31 {
+        if index != 0 {
+            assert_eq!(snapshot.x[index], original.x[index], "x{index}");
+        }
+    }
+}
+
+#[test]
+fn dsr_signal_fault_preserves_destination_in_expanded_literal_load() {
+    assert_eq!(
+        unsafe { super::super::carrick_native_install_trap_handler() },
+        0
+    );
+    let mut cache = TranslationCache::new(16 * 1024).expect("allocate literal fault cache");
+    let guest_pc = GuestVa(0x1e_000);
+    let plan = BlockPlan {
+        start: guest_pc,
+        end: GuestVa(guest_pc.raw() + 8),
+        generation: CodeGeneration::INITIAL,
+        instructions: vec![PlannedInst {
+            guest: guest_pc,
+            action: InstAction::PcRelative(PcRelativeInst {
+                kind: PcRelativeKind::LiteralLoad,
+                target: GuestVa(1),
+                destination: Some(bad64::Reg::X0),
+                word: 0x5800_0000,
+            }),
+        }],
+        exit: PlannedExit::Syscall {
+            guest: GuestVa(guest_pc.raw() + 4),
+            resume: GuestVa(guest_pc.raw() + 8),
+        },
+    };
+    let emitted = emit_block(&mut cache, &plan).expect("emit expanded literal fault");
+    let mut stack = vec![0_u8; 16 * 1024];
+    let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    let original = snapshot;
+    let mut exit = NativeDsrExit::Fault {
+        guest_pc: GuestVa(0),
+        signal: 0,
+        code: 0,
+        address: GuestVa(0),
+        rewrite_scratch: 0,
+        rewrite_context_scratch: 0,
+    };
+    enter_translated(emitted.entry(), &mut snapshot, &mut exit)
+        .expect("capture expanded literal fault");
+    let NativeDsrExit::Fault {
+        guest_pc: cache_pc,
+        rewrite_scratch,
+        rewrite_context_scratch,
+        ..
+    } = exit
+    else {
+        panic!("expected literal fault exit, got {exit:?}");
+    };
+    let offset = super::types::CacheOffset::published(
+        u32::try_from(cache_pc.raw() - emitted.entry().host().raw() as u64)
+            .expect("literal fault offset"),
+    );
+    let recovery = emitted
+        .recovery()
+        .iter()
+        .find(|entry| entry.cache == offset)
+        .expect("literal instruction recovery")
+        .action;
+    super::recover_rewrite_state(
+        &mut snapshot,
+        recovery,
+        rewrite_scratch,
+        rewrite_context_scratch,
+    )
+    .expect("recover literal scratch");
+    assert_eq!(snapshot.x, original.x);
 }
 
 #[test]

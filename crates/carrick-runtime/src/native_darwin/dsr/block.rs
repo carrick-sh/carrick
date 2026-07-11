@@ -53,6 +53,11 @@ pub(super) enum PlannedExit {
         word: u32,
         op: bad64::Op,
     },
+    VirtualizedX28 {
+        guest: GuestVa,
+        word: u32,
+        op: bad64::Op,
+    },
 }
 
 impl PlannedExit {
@@ -64,7 +69,8 @@ impl PlannedExit {
             | Self::Direct { guest, .. }
             | Self::Indirect { guest, .. }
             | Self::Unsupported { guest, .. }
-            | Self::VirtualizedX18 { guest, .. } => guest,
+            | Self::VirtualizedX18 { guest, .. }
+            | Self::VirtualizedX28 { guest, .. } => guest,
         }
     }
 }
@@ -125,7 +131,10 @@ fn plan_with_reader(
         let action = decode::classify(word, pc)?;
         let next = checked_next(pc)?;
         let exit = match action {
-            InstAction::Copy(_) | InstAction::PcRelative(_) => {
+            InstAction::Copy(_)
+            | InstAction::PcRelative(_)
+            | InstAction::VirtualizedX18 { .. }
+            | InstAction::VirtualizedX28 { .. } => {
                 instructions.push(PlannedInst { guest: pc, action });
                 if next == boundary {
                     Some(PlannedExit::Continue {
@@ -158,11 +167,6 @@ fn plan_with_reader(
                 exit,
             }),
             InstAction::Unsupported { word, op } => Some(PlannedExit::Unsupported {
-                guest: pc,
-                word,
-                op,
-            }),
-            InstAction::VirtualizedX18 { word, op } => Some(PlannedExit::VirtualizedX18 {
                 guest: pc,
                 word,
                 op,

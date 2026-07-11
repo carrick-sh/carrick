@@ -83,11 +83,12 @@ fn malformed(pc: GuestVa, word: u32, op: Op) -> DsrError {
     }
 }
 
-fn register_is_x18(register: Reg) -> bool {
-    matches!(register, Reg::X18 | Reg::W18)
+fn register_matches_gpr(register: Reg, index: u32) -> bool {
+    let raw = register as u32;
+    raw == bad64::Reg::X0 as u32 + index || raw == bad64::Reg::W0 as u32 + index
 }
 
-fn operand_mentions_x18(operand: &Operand) -> bool {
+fn operand_mentions_gpr(operand: &Operand, index: u32) -> bool {
     match operand {
         Operand::ShiftReg { reg, .. }
         | Operand::QualReg { reg, .. }
@@ -96,12 +97,19 @@ fn operand_mentions_x18(operand: &Operand) -> bool {
         | Operand::MemOffset { reg, .. }
         | Operand::MemPreIdx { reg, .. }
         | Operand::MemPostIdxImm { reg, .. }
-        | Operand::AccumArray { reg, .. } => register_is_x18(*reg),
-        Operand::MultiReg { regs, .. } => regs.iter().flatten().copied().any(register_is_x18),
+        | Operand::AccumArray { reg, .. } => register_matches_gpr(*reg, index),
+        Operand::MultiReg { regs, .. } => regs
+            .iter()
+            .flatten()
+            .copied()
+            .any(|register| register_matches_gpr(register, index)),
         Operand::MemPostIdxReg(regs)
         | Operand::MemExt { regs, .. }
-        | Operand::IndexedElement { regs, .. } => regs.iter().copied().any(register_is_x18),
-        Operand::SmeTile { reg, .. } => reg.is_some_and(register_is_x18),
+        | Operand::IndexedElement { regs, .. } => regs
+            .iter()
+            .copied()
+            .any(|register| register_matches_gpr(register, index)),
+        Operand::SmeTile { reg, .. } => reg.is_some_and(|reg| register_matches_gpr(reg, index)),
         Operand::Imm32 { .. }
         | Operand::Imm64 { .. }
         | Operand::FImm32(_)
@@ -115,8 +123,20 @@ fn operand_mentions_x18(operand: &Operand) -> bool {
 }
 
 pub(super) fn decoded_operands_mention_x18(word: u32, pc: GuestVa) -> bool {
-    bad64::decode(word, pc.raw())
-        .is_ok_and(|instruction| instruction.operands().iter().any(operand_mentions_x18))
+    decoded_operands_mention_gpr(word, pc, 18)
+}
+
+pub(super) fn decoded_operands_mention_x28(word: u32, pc: GuestVa) -> bool {
+    decoded_operands_mention_gpr(word, pc, 28)
+}
+
+pub(super) fn decoded_operands_mention_gpr(word: u32, pc: GuestVa, index: u32) -> bool {
+    bad64::decode(word, pc.raw()).is_ok_and(|instruction| {
+        instruction
+            .operands()
+            .iter()
+            .any(|operand| operand_mentions_gpr(operand, index))
+    })
 }
 
 fn direct(
@@ -185,6 +205,24 @@ pub(super) fn classify(word: u32, pc: GuestVa) -> Result<InstAction, DsrError> {
     })?;
     let op = instruction.op();
     let operands = instruction.operands();
+    let mentions_x18 = operands
+        .iter()
+        .any(|operand| operand_mentions_gpr(operand, 18));
+    let mentions_x28 = operands
+        .iter()
+        .any(|operand| operand_mentions_gpr(operand, 28));
+
+    let virtualized = || {
+        if mentions_x18 && mentions_x28 {
+            InstAction::Unsupported { word, op }
+        } else if mentions_x18 {
+            InstAction::VirtualizedX18 { word, op }
+        } else if mentions_x28 {
+            InstAction::VirtualizedX28 { word, op }
+        } else {
+            InstAction::Copy(word)
+        }
+    };
 
     if let Some(condition) = branch_condition(op) {
         let mut action = direct(pc, word, op, DirectKind::Conditional, operands)?;
@@ -254,12 +292,23 @@ pub(super) fn classify(word: u32, pc: GuestVa) -> Result<InstAction, DsrError> {
             [Operand::Reg { reg, .. }, Operand::SysReg(SysReg::DCZID_EL0)] => {
                 sensitive(pc, SensitiveKind::ReadDczid, Some(*reg))
             }
+            [
+                Operand::Reg { .. },
+                Operand::SysReg(SysReg::CNTVCT_EL0 | SysReg::CNTFRQ_EL0),
+            ] => {
+                // Native16k executes these host-readable EL0 registers
+                // directly. Keeping them in-cache is also essential for the
+                // guest vDSO and timing-heavy workloads.
+                Ok(virtualized())
+            }
+            [Operand::Reg { .. }, Operand::SysReg(SysReg::NZCV)] => Ok(virtualized()),
             _ => Ok(InstAction::Unsupported { word, op }),
         },
         Op::MSR => match operands {
             [Operand::SysReg(SysReg::TPIDR_EL0), Operand::Reg { reg, .. }] => {
                 sensitive(pc, SensitiveKind::WriteTpidr, Some(*reg))
             }
+            [Operand::SysReg(SysReg::NZCV), Operand::Reg { .. }] => Ok(virtualized()),
             _ => Ok(InstAction::Unsupported { word, op }),
         },
         Op::DC if (word & !0x1f) == 0xd50b_7420 => {
@@ -272,9 +321,6 @@ pub(super) fn classify(word: u32, pc: GuestVa) -> Result<InstAction, DsrError> {
             sensitive(pc, SensitiveKind::IcIvau, first_reg(operands))
         }
         Op::DC | Op::IC | Op::HVC | Op::SMC | Op::ERET => Ok(InstAction::Unsupported { word, op }),
-        _ if operands.iter().any(operand_mentions_x18) => {
-            Ok(InstAction::VirtualizedX18 { word, op })
-        }
-        _ => Ok(InstAction::Copy(word)),
+        _ => Ok(virtualized()),
     }
 }
