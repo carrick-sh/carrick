@@ -172,6 +172,23 @@ pub(super) enum DsrError {
     Decode { pc: u64, word: u32, detail: String },
     #[error("DSR decoded malformed {op:?} 0x{word:08x} at guest PC 0x{pc:x}")]
     Malformed { pc: u64, word: u32, op: bad64::Op },
+    #[error("DSR block policy error: {0}")]
+    BlockPolicy(String),
+    #[error("DSR could not read guest instruction at 0x{pc:x}: {detail}")]
+    MemoryRead { pc: u64, detail: String },
+    #[error(
+        "DSR cannot emit {class} {op:?} 0x{word:08x} at guest PC 0x{guest_pc:x} in block 0x{block_start:x} generation {generation}"
+    )]
+    UnsupportedBlockAction {
+        block_start: u64,
+        generation: u64,
+        guest_pc: u64,
+        word: u32,
+        op: bad64::Op,
+        class: &'static str,
+    },
+    #[error("DSR assembler failed: {0}")]
+    Assembler(String),
     #[error("DSR cache policy error: {0}")]
     CachePolicy(String),
     #[error("DSR host operation {operation} failed: {error}")]
