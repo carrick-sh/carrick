@@ -1880,11 +1880,21 @@ fn run_threaded_hvf_loop(
 // SINGLE-threaded loop below keeps its own free-fn `shared_futex_wait` (it has no
 // `PlatformFutex` handle and is HVF-local).
 
-struct SharedFutexWaiterGuard(usize);
+struct SharedFutexWaiterGuard(usize, std::cell::Cell<bool>);
+
+impl SharedFutexWaiterGuard {
+    /// Mark the wait as completing WOKEN (FUTEX_WAIT returns 0): the exit
+    /// keeps a self-woken waiter claimable by the next wake's count (see
+    /// `carrick_host::ulock::waiter_exit`). EINTR/ETIMEDOUT exits leave the
+    /// default `false`.
+    fn mark_woken(&self) {
+        self.1.set(true);
+    }
+}
 
 impl Drop for SharedFutexWaiterGuard {
     fn drop(&mut self) {
-        crate::ulock::waiter_exit(self.0);
+        crate::ulock::waiter_exit(self.0, self.1.get());
     }
 }
 
@@ -1903,7 +1913,7 @@ fn shared_futex_wait(
 ) -> i64 {
     let host_addr = host_addr.raw();
     crate::ulock::waiter_enter(waiter_key);
-    let _waiter_guard = SharedFutexWaiterGuard(waiter_key);
+    let waiter_guard = SharedFutexWaiterGuard(waiter_key, std::cell::Cell::new(false));
     let deadline = timeout.map(|d| std::time::Instant::now() + d);
     let host_value = unsafe { (host_addr as *const u32).read() };
     crate::probes::futex_route(host_addr as u64, 99, value as i32, host_value as u64);
@@ -1930,6 +1940,7 @@ fn shared_futex_wait(
         if r >= 0 {
             let current = unsafe { (host_addr as *const u32).read() };
             if current != value {
+                waiter_guard.mark_woken();
                 return 0;
             }
             continue;

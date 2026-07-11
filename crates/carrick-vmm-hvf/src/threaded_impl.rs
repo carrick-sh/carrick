@@ -47,8 +47,8 @@ impl SharedFutexSyscall for HvfShared {
         carrick_host::ulock::requeued_waiter_enter(waiter_key)
     }
 
-    fn wait_end(&self, waiter_key: usize) {
-        carrick_host::ulock::waiter_exit(waiter_key);
+    fn wait_end(&self, waiter_key: usize, woken: bool) {
+        carrick_host::ulock::waiter_exit(waiter_key, woken);
     }
 
     fn wait_end_requeued(
