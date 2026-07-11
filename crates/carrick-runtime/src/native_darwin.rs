@@ -1595,6 +1595,25 @@ fn native_die_by_signal(dispatcher: &SyscallDispatcher, signum: i32) -> ! {
     )
 }
 
+/// Restore the interrupted context from the returning handler's sigframe,
+/// then run one signal-delivery cycle at the just-restored user PC. Linux
+/// delivers every deliverable pending signal before returning to the
+/// interrupted context, so a second queued instance chains handler-to-handler
+/// off `rt_sigreturn` instead of waiting for the next syscall or kick —
+/// mirroring the HVF vCPU loop's `DispatchOutcome::SigReturn` arm, whose
+/// loop tail services signals with `interrupted_pc = restored pc` (not as a
+/// syscall boundary, so no retval is applied and SA_RESTART stays off).
+fn sigreturn_restore_and_deliver(
+    dispatcher: &SyscallDispatcher,
+    trap: &mut NativeSignalTrap<'_>,
+    tid: crate::thread::ThreadId,
+) -> Result<Option<crate::vcpu_loop::PendingSignalAction>, RuntimeError> {
+    let restored_sigmask = trap.restore_from_sigframe()?;
+    dispatcher.restore_signal_mask(tid, carrick_abi::SigSet::from_raw(restored_sigmask));
+    let restored_pc = trap.pc();
+    crate::vcpu_loop::deliver_pending_signal(trap, dispatcher, None, tid, Some(restored_pc))
+}
+
 fn resume_guest_from_sigreturn(
     dispatcher: &SyscallDispatcher,
     memory: &SharedNativeMemory,
@@ -1604,8 +1623,15 @@ fn resume_guest_from_sigreturn(
     let pc = {
         let mut memory = memory.lock();
         let mut trap = NativeSignalTrap::new(&mut memory, snapshot, None);
-        let restored_sigmask = trap.restore_from_sigframe()?;
-        dispatcher.restore_signal_mask(tid, carrick_abi::SigSet::from_raw(restored_sigmask));
+        let action = sigreturn_restore_and_deliver(dispatcher, &mut trap, tid)?;
+        if let Some(action) = action {
+            if let Some(signum) = action.stop_signal {
+                crate::exec_helpers::stop_by_signal(signum);
+            }
+            if let Some(signum) = action.term_signal {
+                native_die_by_signal(dispatcher, signum);
+            }
+        }
         let pc = trap.pc();
         trap.commit();
         pc
@@ -6674,6 +6700,101 @@ mod tests {
         assert_eq!(trap.regs.v, interrupted.v);
         assert_eq!(trap.regs.fpsr, interrupted.fpsr);
         assert_eq!(trap.regs.fpcr, interrupted.fpcr);
+    }
+
+    /// Linux delivers EVERY deliverable pending signal before returning to the
+    /// interrupted context: when a second instance of a queued (RT) signal is
+    /// still pending as a handler returns, `rt_sigreturn` must chain straight
+    /// into the next handler rather than resume the interrupted PC and wait
+    /// for the next syscall or kick boundary. Regression: probe `dnotify`
+    /// (`handler_seq_second_after_syscall` / `forked_handler_seq_ok`) after
+    /// vDSO enablement removed the clock_gettime traps that used to mask this.
+    #[test]
+    fn native_sigreturn_delivers_next_pending_signal_before_resume() {
+        const INTERRUPTED_PC: u64 = 0x4000;
+        const HANDLER_PC: u64 = 0x5000;
+        let sig = 34; // SIGRTMIN: queued, so a second instance can be pending
+        let mut stack = vec![0_u8; 16 * 1024];
+        let stack_start = stack.as_mut_ptr() as u64;
+        let stack_end = stack_start + stack.len() as u64;
+        let mut memory = NativeMappedMemory {
+            regions: vec![NativeMappedRegion {
+                start: stack_start,
+                end: stack_end,
+                host_protects: false,
+                shared_futex: false,
+                guest_writable: true,
+                default_prot: crate::linux_abi::LINUX_PROT_READ
+                    | crate::linux_abi::LINUX_PROT_WRITE,
+                shared_key_base: 0,
+                shared_key_offset: 0,
+            }],
+            protections: MemoryProtections::default(),
+            native_page_protections: BTreeMap::new(),
+            native_write_exec_writable_pages: BTreeSet::new(),
+            linux4k_page_protections: BTreeMap::new(),
+            exclusive_reservation: None,
+            host_page_size: 16 * 1024,
+            linux_page_size: 16 * 1024,
+        };
+        let interrupted = NativeUcontextSnapshot {
+            sp: stack_end,
+            pc: INTERRUPTED_PC,
+            pstate: 0x6000_0000,
+            ..NativeUcontextSnapshot::default()
+        };
+        let dispatcher = SyscallDispatcher::new();
+        let tid = crate::thread::ThreadId::synthetic_for_tests(0x5347); // "SG"
+
+        // First instance delivered: handler frame is live, guest runs at the
+        // handler. (saved_sigmask = 0: the interrupted context blocked nothing.)
+        let mut trap = NativeSignalTrap::new(&mut memory, interrupted, None);
+        trap.inject_signal(
+            sig,
+            HANDLER_PC,
+            0,
+            None,
+            Some(INTERRUPTED_PC),
+            None,
+            0,
+            None,
+            None,
+            false,
+        )
+        .expect("inject first native handler frame");
+        assert_eq!(trap.pc(), HANDLER_PC);
+
+        // A second instance was queued while the first handler ran.
+        let action = carrick_abi::LinuxSigaction {
+            sa_handler: HANDLER_PC,
+            sa_flags: 0,
+            sa_restorer: 0,
+            sa_mask: [0; carrick_abi::LINUX_SIGSET_WORDS],
+        };
+        dispatcher.record_pending_signal_action(tid, sig, action);
+        dispatcher.mark_signal_pending(tid, sig);
+
+        // The handler returns: rt_sigreturn must chain into the next handler
+        // at the restored PC, not resume the interrupted context.
+        let outcome = sigreturn_restore_and_deliver(&dispatcher, &mut trap, tid)
+            .expect("sigreturn restore and deliver");
+        if let Some(outcome) = &outcome {
+            assert_eq!(outcome.term_signal, None);
+            assert_eq!(outcome.stop_signal, None);
+        }
+        assert_eq!(
+            trap.pc(),
+            HANDLER_PC,
+            "second pending instance must be delivered at rt_sigreturn, \
+             before the interrupted context resumes"
+        );
+
+        // The chained frame still returns to the original interrupted context.
+        trap.restore_from_sigframe()
+            .expect("restore chained native handler frame");
+        assert_eq!(trap.pc(), INTERRUPTED_PC);
+        assert_eq!(dispatcher.take_deliverable_pending(tid), None);
+        dispatcher.forget_thread_signal_state(tid);
     }
 
     #[test]
