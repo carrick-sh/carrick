@@ -821,9 +821,11 @@ plan.
 - [ ] **Step 4: Profile before considering assembly lookup**
 
   Add counters for resolver exits, one-entry hits, translations, and duplicate
-  publication races. Run static PIE probes and record counts. Do not implement
-  a larger assembly hash table unless indirect misses are a material share of
-  runtime after Task 12 workloads.
+  publication races. Verify their state transitions with handcrafted call/return
+  ELFs here. Record shipped static-PIE counts after Task 9 supplies the sensitive
+  startup instructions those binaries require. Do not implement a larger
+  assembly hash table unless indirect misses are a material share of runtime
+  after Task 12 workloads.
 
 - [ ] **Step 5: Verify and commit**
 
@@ -834,8 +836,8 @@ plan.
   cargo test -p carrick-runtime native_darwin::dsr::oracle --lib
   ```
 
-  Expected: indirect-flow state matches direct execution and invalid targets
-  produce deterministic diagnostics.
+  Expected: indirect-flow state matches independently asserted architectural
+  state and invalid targets produce deterministic diagnostics.
 
   Commit: `feat(native): resolve indirect DSR control flow`
 

@@ -6021,6 +6021,24 @@ impl NativeMappedMemory {
             .map_or(0, |region| region.default_prot)
     }
 
+    fn guest_address_is_executable(&self, address: u64) -> bool {
+        let prot = if self.uses_linux4k_subpages() {
+            let host_page = address & !(self.host_page_size - 1);
+            let subpage = ((address - host_page) / self.linux_page_size) as usize;
+            self.linux4k_host_page_protections(host_page)
+                .get(subpage)
+                .copied()
+                .unwrap_or(0)
+        } else {
+            let page = address & !(self.host_page_size - 1);
+            self.native_page_protections
+                .get(&page)
+                .copied()
+                .unwrap_or_else(|| self.default_linux_prot_at(address))
+        };
+        prot & crate::linux_abi::LINUX_PROT_EXEC != 0
+    }
+
     fn linux4k_host_page_protections(&self, page_start: u64) -> [u64; 4] {
         self.linux4k_page_protections
             .get(&page_start)
@@ -7637,6 +7655,81 @@ mod tests {
         )
         .expect("run linked DSR loop ELF");
         assert_eq!(result.exit_code, 0, "stderr={:?}", result.stderr);
+    }
+
+    #[test]
+    fn dsr_indirect_flow_runtime_calls_and_returns_through_guest_lr() {
+        let words = [
+            0x9400_0002, // bl function
+            0x1400_0002, // b exit
+            0xd65f_03c0, // function: ret
+            0xd280_0000, // exit: mov x0, #0
+            0xd280_0ba8, // mov x8, #93 (exit)
+            SVC_0,
+        ];
+        let mut file = tempfile::NamedTempFile::new().expect("create DSR return ELF fixture");
+        std::io::Write::write_all(&mut file, &dsr_test_elf(&words))
+            .expect("write DSR return ELF fixture");
+        let plan = ExecutionPlan {
+            backend: crate::page_profile::ExecutionBackend::NativeDarwin,
+            page_geometry: crate::page_profile::PageGeometry {
+                host_page_size: 16 * 1024,
+                linux_page_size: 16 * 1024,
+                native_profile: Some(carrick_spec::NativePageProfile::Native16k),
+            },
+            native_code_mode: carrick_spec::NativeCodeModeRequest::Dsr,
+            diagnostics: Vec::new(),
+        };
+        let result = run_static_elf(
+            file.path(),
+            SyscallDispatcher::new(),
+            ["dsr-return".to_string()],
+            std::iter::empty::<String>(),
+            16,
+            None,
+            &plan,
+        )
+        .expect("run DSR return ELF");
+        assert_eq!(result.exit_code, 0, "stderr={:?}", result.stderr);
+    }
+
+    #[test]
+    fn dsr_indirect_flow_runtime_rejects_unaligned_and_unmapped_targets() {
+        let plan = ExecutionPlan {
+            backend: crate::page_profile::ExecutionBackend::NativeDarwin,
+            page_geometry: crate::page_profile::PageGeometry {
+                host_page_size: 16 * 1024,
+                linux_page_size: 16 * 1024,
+                native_profile: Some(carrick_spec::NativePageProfile::Native16k),
+            },
+            native_code_mode: carrick_spec::NativeCodeModeRequest::Dsr,
+            diagnostics: Vec::new(),
+        };
+        for (target_word, expected) in [
+            (0xd280_0020, "target is not instruction aligned"), // mov x0, #1
+            (0xd280_0000, "outside an executable guest mapping"), // mov x0, #0
+        ] {
+            let words = [target_word, 0xd61f_0000]; // br x0
+            let mut file = tempfile::NamedTempFile::new().expect("create invalid-target ELF");
+            std::io::Write::write_all(&mut file, &dsr_test_elf(&words))
+                .expect("write invalid-target ELF");
+            let result = run_static_elf(
+                file.path(),
+                SyscallDispatcher::new(),
+                ["dsr-invalid-target".to_string()],
+                std::iter::empty::<String>(),
+                16,
+                None,
+                &plan,
+            )
+            .expect("collect invalid-target child result");
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            assert_eq!(result.exit_code, 125, "stderr={stderr}");
+            assert!(
+                stderr.contains(expected),
+                "unexpected error output: {stderr}"
+            );
+        }
     }
 
     #[test]
