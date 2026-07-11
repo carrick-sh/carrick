@@ -1731,6 +1731,7 @@ fn run_native_dsr_thread_loop(
         };
         let resume = match exit {
             dsr::ThreadExit::Syscall { resume } => resume,
+            dsr::ThreadExit::Continue => continue,
             dsr::ThreadExit::Unsupported(detail) => {
                 return Err(RuntimeError::Unsupported(format!(
                     "native DSR produced unsupported exit {detail}"
@@ -7527,22 +7528,9 @@ mod tests {
         bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
     }
 
-    fn dsr_straight_line_syscall_elf() -> Vec<u8> {
+    fn dsr_test_elf(words: &[u32]) -> Vec<u8> {
         const CODE_OFFSET: usize = 0x1000;
-        let words = [
-            0xd280_1588, // mov x8, #172 (getpid)
-            SVC_0,
-            0xd100_43e1, // sub x1, sp, #16
-            0xf900_0020, // str x0, [x1]
-            0xd280_0020, // mov x0, #1
-            0xd280_0102, // mov x2, #8
-            0xd280_0808, // mov x8, #64 (write)
-            SVC_0,
-            0xd280_0000, // mov x0, #0
-            0xd280_0ba8, // mov x8, #93 (exit)
-            SVC_0,
-        ];
-        let code_len = words.len() * std::mem::size_of::<u32>();
+        let code_len = std::mem::size_of_val(words);
         let mut elf = vec![0_u8; CODE_OFFSET + code_len];
         elf[..16].copy_from_slice(&[0x7f, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         write_u16(&mut elf, 16, 3); // ET_DYN
@@ -7561,10 +7549,26 @@ mod tests {
         write_u64(&mut elf, 96, code_len as u64);
         write_u64(&mut elf, 104, code_len as u64);
         write_u64(&mut elf, 112, 0x1000);
-        for (index, word) in words.into_iter().enumerate() {
+        for (index, word) in words.iter().copied().enumerate() {
             write_u32(&mut elf, CODE_OFFSET + index * 4, word);
         }
         elf
+    }
+
+    fn dsr_straight_line_syscall_elf() -> Vec<u8> {
+        dsr_test_elf(&[
+            0xd280_1588, // mov x8, #172 (getpid)
+            SVC_0,
+            0xd100_43e1, // sub x1, sp, #16
+            0xf900_0020, // str x0, [x1]
+            0xd280_0020, // mov x0, #1
+            0xd280_0102, // mov x2, #8
+            0xd280_0808, // mov x8, #64 (write)
+            SVC_0,
+            0xd280_0000, // mov x0, #0
+            0xd280_0ba8, // mov x8, #93 (exit)
+            SVC_0,
+        ])
     }
 
     #[test]
@@ -7598,6 +7602,41 @@ mod tests {
         assert_eq!(result.stdout.len(), 8, "stderr={:?}", result.stderr);
         let pid = u64::from_le_bytes(result.stdout.try_into().expect("eight-byte pid output"));
         assert!(pid > 0);
+    }
+
+    #[test]
+    fn dsr_direct_flow_runtime_resolves_and_links_backward_loop() {
+        let words = [
+            0xd280_0080, // mov x0, #4
+            0xf100_0400, // subs x0, x0, #1
+            0xb5ff_ffe0, // cbnz x0, -4
+            0xd280_0ba8, // mov x8, #93 (exit)
+            SVC_0,
+        ];
+        let mut file = tempfile::NamedTempFile::new().expect("create DSR loop ELF fixture");
+        std::io::Write::write_all(&mut file, &dsr_test_elf(&words))
+            .expect("write DSR loop ELF fixture");
+        let plan = ExecutionPlan {
+            backend: crate::page_profile::ExecutionBackend::NativeDarwin,
+            page_geometry: crate::page_profile::PageGeometry {
+                host_page_size: 16 * 1024,
+                linux_page_size: 16 * 1024,
+                native_profile: Some(carrick_spec::NativePageProfile::Native16k),
+            },
+            native_code_mode: carrick_spec::NativeCodeModeRequest::Dsr,
+            diagnostics: Vec::new(),
+        };
+        let result = run_static_elf(
+            file.path(),
+            SyscallDispatcher::new(),
+            ["dsr-loop".to_string()],
+            std::iter::empty::<String>(),
+            16,
+            None,
+            &plan,
+        )
+        .expect("run linked DSR loop ELF");
+        assert_eq!(result.exit_code, 0, "stderr={:?}", result.stderr);
     }
 
     #[test]

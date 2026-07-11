@@ -1,10 +1,17 @@
 #![allow(dead_code)] // Cache publication is wired into block emission in Task 4.
 
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use carrick_guest_mem::HostVa;
 
-use super::types::{CacheVa, DsrError};
+use super::types::{CacheOffset, CacheVa, DsrError};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct LinkSite {
+    pub(super) source: CacheVa,
+    pub(super) slot: CacheOffset,
+}
 
 pub(super) struct PublishedCode {
     entry: CacheVa,
@@ -107,6 +114,43 @@ impl TranslationCache {
         let start = self.base.as_ptr() as usize;
         let end = start.saturating_add(self.cursor);
         (start..end).contains(&pc.raw())
+    }
+
+    pub(super) fn patch_direct_branch(
+        &mut self,
+        site: LinkSite,
+        target: CacheVa,
+    ) -> Result<(), DsrError> {
+        let source = site
+            .source
+            .host()
+            .raw()
+            .checked_add(site.slot.get() as usize)
+            .ok_or_else(|| DsrError::CachePolicy("direct-link source overflow".to_string()))?;
+        if !source.is_multiple_of(4) {
+            return Err(DsrError::CachePolicy(format!(
+                "direct-link source is not instruction aligned: 0x{source:x}"
+            )));
+        }
+        let displacement = (target.host().raw() as i128) - (source as i128);
+        if displacement % 4 != 0 {
+            return Err(DsrError::CachePolicy(format!(
+                "direct-link displacement is not instruction aligned: {displacement}"
+            )));
+        }
+        let words = displacement / 4;
+        if !(-(1_i128 << 25)..(1_i128 << 25)).contains(&words) {
+            return Err(DsrError::CachePolicy(format!(
+                "direct-link target is outside AArch64 B range: {displacement} bytes"
+            )));
+        }
+        let word = 0x1400_0000 | ((words as i64 as u32) & 0x03ff_ffff);
+        unsafe { libc::pthread_jit_write_protect_np(0) };
+        let instruction = unsafe { &*(source as *const AtomicU32) };
+        instruction.store(word, Ordering::Release);
+        unsafe { super::super::carrick_native_clear_icache(source as *mut _, 4) };
+        unsafe { libc::pthread_jit_write_protect_np(1) };
+        Ok(())
     }
 }
 
