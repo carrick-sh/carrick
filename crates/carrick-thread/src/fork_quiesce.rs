@@ -138,6 +138,20 @@ pub fn begin_exec_replacement(owner_tid: carrick_hal::ThreadId) {
     exec_owner().store(owner_tid.raw(), Ordering::SeqCst);
 }
 
+/// CAS-claim the exec-replacement marker. The native exec teardown raises it
+/// BEFORE serializing on the fork token: exec must WIN against a token holder
+/// that cannot make progress on its own — a vfork-suspended leader (Linux
+/// kills a vfork-waiting thread during a sibling's execve) or a forker
+/// mid-quiesce (its drain aborts on this flag). Returns false when another
+/// thread's execve already owns the group; the caller retires. The HVF path
+/// keeps the plain [`begin_exec_replacement`], serialized by its topology
+/// lock.
+pub fn try_begin_exec_replacement(owner_tid: carrick_hal::ThreadId) -> bool {
+    exec_owner()
+        .compare_exchange(0, owner_tid.raw(), Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+}
+
 pub fn end_exec_replacement() {
     exec_owner().store(0, Ordering::SeqCst);
 }
@@ -543,6 +557,26 @@ mod tests {
              rounds completed)",
             rounds.load(Ordering::Relaxed)
         );
+    }
+
+    #[test]
+    fn exec_replacement_claim_is_exclusive_until_ended() {
+        // Serialize with any test touching the process-global exec owner.
+        let a = carrick_hal::ThreadId::synthetic_for_tests(701);
+        let b = carrick_hal::ThreadId::synthetic_for_tests(702);
+        assert!(try_begin_exec_replacement(a), "first claim wins");
+        assert!(
+            !try_begin_exec_replacement(b),
+            "second concurrent execve must lose the claim and retire"
+        );
+        assert!(exec_replacing_other_thread(b));
+        assert!(!exec_replacing_other_thread(a));
+        end_exec_replacement();
+        assert!(
+            try_begin_exec_replacement(b),
+            "the claim is reusable after end_exec_replacement"
+        );
+        end_exec_replacement();
     }
 
     #[test]
