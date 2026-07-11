@@ -176,6 +176,12 @@ pub struct SyntheticProcContext {
     pub locked_memory: Vec<GuestMemoryRange>,
     pub brk_current: u64,
     pub mmap_next: u64,
+    /// The memory layout's heap (brk arena) base — see
+    /// [`crate::vfs::OpenContext::heap_base`]. 0 = unknown.
+    pub heap_base: u64,
+    /// Guest VAs are host VAs (native exec backend) — see
+    /// [`crate::vfs::OpenContext::native_guest_va`].
+    pub native_guest_va: bool,
     pub ruid: u32,
     pub euid: u32,
     pub suid: u32,
@@ -1939,6 +1945,8 @@ impl Vfs for ProcVfs {
             locked_memory: ctx.locked_memory.unwrap_or(&[]).to_vec(),
             brk_current: ctx.brk_current,
             mmap_next: ctx.mmap_next,
+            heap_base: ctx.heap_base,
+            native_guest_va: ctx.native_guest_va,
             ruid: ctx.ruid,
             euid: ctx.euid,
             suid: ctx.suid,
@@ -2273,30 +2281,51 @@ fn cpus_allowed_list(ncpu: usize) -> String {
     }
 }
 
-/// The guest's committed virtual size in kB for `/proc/self/status` VmSize.
-/// Sums the guest's own VMAs (clamping the heap to the current break and the
-/// mmap arena to its used high-water mark, exactly as `/proc/self/maps` does)
-/// so the 512 GiB reserved mmap window never leaks into the reported size.
-/// Falls back to the host virtual size minus the reserved arena when VMA info
-/// isn't available (the default context used for a size-only stat).
-fn guest_committed_vm_kb(ctx: &SyntheticProcContext, host_virtual_bytes: u64) -> u64 {
-    if let Some(regions) = ctx.address_space_regions.as_deref() {
-        let mut total = 0u64;
-        for r in regions {
-            let mut end = r.end;
-            if r.start == LINUX_HEAP_BASE && ctx.brk_current > r.start && ctx.brk_current <= r.end {
-                end = ctx.brk_current;
-            } else if r.start == LINUX_MMAP_BASE
-                && ctx.mmap_next > r.start
-                && ctx.mmap_next <= r.end
-            {
-                end = ctx.mmap_next;
-            }
-            total = total.saturating_add(end.saturating_sub(r.start));
+/// The guest's committed VMA spans for `/proc/self/status`: every snapshot
+/// region with the heap clamped to the current break and the mmap arena
+/// clamped to its used high-water mark (exactly as `/proc/self/maps` does),
+/// PLUS the brk-grown heap span when the snapshot carries no heap region (the
+/// native backend maps its brk heap lazily and never lists it as an image
+/// region). `None` when there is no usable VMA snapshot. VmSize sums this
+/// list and the native VmRSS measurement walks the SAME list, so the pair is
+/// coherent by construction (resident-within-spans ≤ total-span bytes).
+fn guest_vm_ranges(ctx: &SyntheticProcContext) -> Option<Vec<(u64, u64)>> {
+    let regions = ctx.address_space_regions.as_deref()?;
+    let mut ranges: Vec<(u64, u64)> = Vec::with_capacity(regions.len() + 1);
+    let mut snapshot_has_heap_region = false;
+    for r in regions {
+        let mut end = r.end;
+        if r.start == LINUX_HEAP_BASE && ctx.brk_current > r.start && ctx.brk_current <= r.end {
+            end = ctx.brk_current;
+        } else if r.start == LINUX_MMAP_BASE && ctx.mmap_next > r.start && ctx.mmap_next <= r.end {
+            end = ctx.mmap_next;
         }
-        // A non-empty VMA snapshot is the precise source; use it. An empty/zero
-        // snapshot (no regions captured on this backend) falls through to the
-        // host-virtual-size estimate below so VmSize is never spuriously 0.
+        if ctx.heap_base != 0 && r.start == ctx.heap_base {
+            snapshot_has_heap_region = true;
+        }
+        ranges.push((r.start, end));
+    }
+    if !snapshot_has_heap_region && ctx.heap_base != 0 && ctx.brk_current > ctx.heap_base {
+        ranges.push((ctx.heap_base, ctx.brk_current));
+    }
+    // An empty/zero snapshot (no regions captured on this backend) is unusable;
+    // the caller falls back to the host-virtual-size estimate so VmSize is
+    // never spuriously 0.
+    ranges
+        .iter()
+        .any(|(start, end)| end > start)
+        .then_some(ranges)
+}
+
+/// The guest's committed virtual size in kB for `/proc/self/status` VmSize:
+/// the [`guest_vm_ranges`] total when a VMA snapshot exists, else a host
+/// virtual-size estimate.
+fn guest_committed_vm_kb(ranges: Option<&[(u64, u64)]>, host_virtual_bytes: u64) -> u64 {
+    if let Some(ranges) = ranges {
+        let total: u64 = ranges
+            .iter()
+            .map(|(start, end)| end.saturating_sub(*start))
+            .sum();
         if total > 0 {
             return total / 1024;
         }
@@ -2339,8 +2368,25 @@ fn synthetic_proc_self_status(ctx: &SyntheticProcContext) -> String {
     // heuristics). Derive it from the guest's own VMAs when known (clamping the
     // heap to brk and the mmap arena to its used high-water mark, like
     // /proc/self/maps does); else subtract the reserved arena from the host size.
-    let vsize_kb = guest_committed_vm_kb(ctx, host.virtual_bytes);
-    let rss_kb = host.resident_bytes / 1024;
+    let vm_ranges = guest_vm_ranges(ctx);
+    let vsize_kb = guest_committed_vm_kb(vm_ranges.as_deref(), host.virtual_bytes);
+    // VmRSS: on the VMM backends the host process is dominated by the guest
+    // (its RAM lives in this process), so the whole-process phys_footprint is
+    // the honest resident size. Under the NATIVE backend guest VAs are host
+    // VAs but the host process also carries the carrick runtime itself —
+    // phys_footprint over-reports the guest (measured 19 MB vs a ~0.5 MB
+    // guest) and can exceed the modeled VmSize. Measure residency over
+    // exactly the VmSize spans instead (mach region walk), which keeps
+    // VmRSS ≤ VmSize by construction rather than by clamping.
+    let measured_native_rss_kb = if ctx.native_guest_va {
+        vm_ranges
+            .as_deref()
+            .and_then(crate::host_proc::resident_bytes_in_ranges)
+            .map(|bytes| bytes / 1024)
+    } else {
+        None
+    };
+    let rss_kb = measured_native_rss_kb.unwrap_or(host.resident_bytes / 1024);
     let peak_kb = vsize_kb.max(host.maxrss_bytes / 1024);
     let hwm_kb = host.maxrss_bytes / 1024;
     // Pid/Tgid must match what getpid()/gettid() return — in a PID namespace

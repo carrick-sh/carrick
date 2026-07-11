@@ -547,6 +547,105 @@ mod imp {
         }
     }
 
+    /// Measured resident bytes within the given virtual-address ranges of THIS
+    /// process, from a `mach_vm_region(VM_REGION_EXTENDED_INFO)` walk
+    /// (`pages_resident` per mach region, clipped to the queried overlap).
+    ///
+    /// This exists for the native exec backend, where guest VAs ARE host VAs:
+    /// the whole-process `phys_footprint` includes the carrick runtime's own
+    /// memory and can exceed the guest's modeled VmSize, so `/proc/self/status`
+    /// VmRSS is instead MEASURED over exactly the guest's VMA spans. Ranges are
+    /// merged before walking so overlapping inputs never double-count. `None`
+    /// only if the first region query of every range fails.
+    #[allow(deprecated)] // libc::mach_task_self_ — see self_resource_usage.
+    pub fn resident_bytes_in_ranges(ranges: &[(u64, u64)]) -> Option<u64> {
+        const VM_REGION_EXTENDED_INFO: i32 = 13;
+        /// mach/vm_region.h `vm_region_extended_info` (flavor 13).
+        #[repr(C)]
+        #[derive(Default)]
+        struct VmRegionExtendedInfo {
+            protection: i32,
+            user_tag: u32,
+            pages_resident: u32,
+            pages_shared_now_private: u32,
+            pages_swapped_out: u32,
+            pages_dirtied: u32,
+            ref_count: u32,
+            shadow_depth: u16,
+            external_pager: u8,
+            share_mode: u8,
+            pages_reusable: u32,
+        }
+        const VM_REGION_EXTENDED_INFO_COUNT: u32 =
+            (std::mem::size_of::<VmRegionExtendedInfo>() / std::mem::size_of::<i32>()) as u32;
+
+        let mut merged: Vec<(u64, u64)> = ranges.iter().copied().filter(|(s, e)| e > s).collect();
+        merged.sort_unstable();
+        merged.dedup_by(|next, prev| {
+            if next.0 <= prev.1 {
+                prev.1 = prev.1.max(next.1);
+                true
+            } else {
+                false
+            }
+        });
+
+        let task = unsafe { libc::mach_task_self_ };
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(1) as u64;
+        let mut resident = 0u64;
+        let mut any_query_succeeded = false;
+        for (start, end) in merged {
+            let mut addr: libc::mach_vm_address_t = start;
+            loop {
+                let mut size: libc::mach_vm_size_t = 0;
+                let mut info = VmRegionExtendedInfo::default();
+                let mut count = VM_REGION_EXTENDED_INFO_COUNT;
+                let mut object_name: libc::mach_port_t = 0;
+                // SAFETY: queries this process's VM map with a matching
+                // flavor/count and a correctly sized out-struct (cast to the
+                // int-array parameter type, as the basic64 walk above does).
+                let kr = unsafe {
+                    mach_vm_region(
+                        task,
+                        &mut addr,
+                        &mut size,
+                        VM_REGION_EXTENDED_INFO,
+                        &mut info as *mut VmRegionExtendedInfo as *mut i32,
+                        &mut count,
+                        &mut object_name,
+                    )
+                };
+                if object_name != 0 {
+                    let _ = unsafe { mach_port_deallocate(task, object_name) };
+                }
+                if kr != libc::KERN_SUCCESS || addr >= end {
+                    // Past the last mapping (or past this range): next range.
+                    if kr == libc::KERN_SUCCESS {
+                        any_query_succeeded = true;
+                    }
+                    break;
+                }
+                any_query_succeeded = true;
+                let Some(region_end) = addr.checked_add(size) else {
+                    break;
+                };
+                let overlap = region_end.min(end).saturating_sub(addr.max(start));
+                // pages_resident covers the whole mach region; native guest
+                // mappings are their own mach regions so boundaries align —
+                // clip to the overlap anyway so a wider host region can never
+                // over-count the queried span.
+                resident = resident.saturating_add(
+                    (u64::from(info.pages_resident).saturating_mul(page)).min(overlap),
+                );
+                if region_end <= addr {
+                    break;
+                }
+                addr = region_end;
+            }
+        }
+        any_query_succeeded.then_some(resident)
+    }
+
     /// (user_us, system_us) CPU time for the current thread, from
     /// `thread_info(THREAD_BASIC_INFO)`. Used by `getrusage(RUSAGE_THREAD)`.
     pub fn self_thread_cpu_us() -> Option<(u64, u64)> {
@@ -1096,6 +1195,12 @@ mod imp {
         None
     }
 
+    /// Native-backend VmRSS measurement is a Darwin mach-walk; no equivalent
+    /// is needed here (the native exec backend is macOS-only).
+    pub fn resident_bytes_in_ranges(_ranges: &[(u64, u64)]) -> Option<u64> {
+        None
+    }
+
     /// (user_us, system_us) CPU time for the CURRENT thread, from the host
     /// kernel's own per-thread accounting: `getrusage(RUSAGE_THREAD)`. KVM
     /// guest execution is charged to the vCPU thread as guest time, which
@@ -1151,8 +1256,8 @@ mod imp {
 #[cfg(target_os = "macos")]
 pub use imp::self_cpu_total_ns;
 pub use imp::{
-    current_thread_port, is_guest_process, pid_info, self_resource_usage, self_thread_cpu_us,
-    self_vm_region_count, thread_run_state_char,
+    current_thread_port, is_guest_process, pid_info, resident_bytes_in_ranges, self_resource_usage,
+    self_thread_cpu_us, self_vm_region_count, thread_run_state_char,
 };
 
 /// Mach port type alias for the registry (real on macOS, u32 elsewhere).
@@ -1202,6 +1307,50 @@ mod accounting_smoke {
             total_ns / 1000 >= getrusage_cpu_us / 2,
             "self_cpu_total_ns {total_ns}ns under-reports getrusage {getrusage_cpu_us}µs"
         );
+    }
+
+    /// The mach-walk residency measurement: touched pages of a private mapping
+    /// count as resident, the result never exceeds the queried span, and
+    /// passing the same range twice must not double-count (merge invariant).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn resident_bytes_in_ranges_measures_touched_pages() {
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let len = page * 4;
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(base, libc::MAP_FAILED);
+        // Touch two of the four pages.
+        unsafe {
+            std::ptr::write_volatile(base.cast::<u8>(), 1);
+            std::ptr::write_volatile(base.cast::<u8>().add(page), 1);
+        }
+        let range = (base as u64, base as u64 + len as u64);
+        let resident =
+            super::resident_bytes_in_ranges(&[range]).expect("mach region walk succeeds");
+        assert!(
+            resident >= 2 * page as u64,
+            "two touched pages must be resident (got {resident} bytes)"
+        );
+        assert!(
+            resident <= len as u64,
+            "residency is clipped to the queried span (got {resident} > {len})"
+        );
+        let doubled =
+            super::resident_bytes_in_ranges(&[range, range]).expect("duplicate ranges still walk");
+        assert_eq!(
+            doubled, resident,
+            "overlapping input ranges must merge, not double-count"
+        );
+        unsafe { libc::munmap(base, len) };
     }
 
     #[test]
