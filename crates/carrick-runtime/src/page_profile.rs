@@ -373,6 +373,7 @@ mod tests {
             extra_hosts: Vec::new(),
             uid: 0,
             gid: 0,
+            seccomp_policy: carrick_spec::SeccompPolicy::ContainerDefault,
         }
     }
 

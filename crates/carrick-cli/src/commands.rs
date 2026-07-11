@@ -148,6 +148,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 stop_signal: None,
                 stop_timeout: None,
                 publish: vec![],
+                security_opt: vec![],
                 pid: carrick_spec::PidMode::Private,
                 detach: false,
                 forward_env: vec![],
@@ -199,6 +200,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             forward_env,
             exec_backend,
             native_page_profile,
+            security_opt,
             args,
         } => {
             // Apply forwarded env BEFORE anything reads it (host_facts caches the
@@ -226,6 +228,15 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                         .context("failed to compose rootfs layers")?,
                 )
             };
+            // run-elf drives a bare host ELF: UNCONFINED by default (handlers
+            // stay honest). `--security-opt seccomp=default` opts into the
+            // container policy model `carrick run` applies by default.
+            let seccomp_policy = carrick_engine::resolve_seccomp_policy(
+                carrick_spec::SeccompPolicy::Unconfined,
+                &security_opt,
+            )
+            .map_err(anyhow::Error::msg)?;
+            dispatcher.apply_seccomp_policy(seccomp_policy);
             install_fs_backend(&mut dispatcher, fs)?;
             // Bind-mount host paths into the guest. `--fs host` is a sandboxed
             // scratch (NOT the real host FS), so this is the only way to expose a
@@ -514,6 +525,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             stop_signal,
             stop_timeout,
             publish,
+            security_opt,
             pid,
             detach,
             forward_env,
@@ -589,6 +601,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 published_ports,
                 stop_signal,
                 stop_timeout,
+                security_opts: security_opt,
             };
 
             // Stand up the fork-shared alias-IPA counter NOW, in the root process,
@@ -776,6 +789,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             publish,
             stop_signal,
             stop_timeout,
+            security_opt,
             pull,
             command,
         } => {
@@ -830,6 +844,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 published_ports: parse_publish_specs(parsed_network.mode, &publish)?,
                 stop_signal,
                 stop_timeout,
+                security_opts: security_opt,
             };
             crate::lifecycle::create(req, store.clone(), name)?;
         }

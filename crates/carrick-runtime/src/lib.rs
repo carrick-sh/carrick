@@ -287,6 +287,7 @@ pub mod vcpu_loop;
 /// The platform-neutral shared threaded vCPU run loop + `HostBackend` seam (F3).
 pub mod threaded_loop;
 
+pub(crate) mod container_policy;
 #[cfg(feature = "platform-macos")]
 pub mod execute;
 pub mod pty_relay;
@@ -1363,6 +1364,9 @@ pub mod runtime {
             dispatcher.set_cwd(cwd.as_str());
         }
         dispatcher.set_credentials(spec.uid, spec.gid);
+        // Launch-time container syscall policy (the Docker default-seccomp
+        // model, or unconfined) — same seam as the macOS execute.rs arms.
+        dispatcher.apply_seccomp_policy(spec.seccomp_policy);
         for mount in &spec.mounts {
             let host_path = PathBuf::from(mount.source.as_std_path());
             let target_path = PathBuf::from(mount.target.as_std_path());
