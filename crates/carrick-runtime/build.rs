@@ -26,6 +26,7 @@ fn main() {
     }
     if os == "macos" && arch == "aarch64" {
         println!("cargo:rerun-if-changed=csrc/native_darwin.c");
+        println!("cargo:rerun-if-changed=src/native_darwin/dsr/gateway_aarch64.S");
         cc::Build::new()
             .file("csrc/native_darwin.c")
             .file("src/native_darwin/dsr/gateway_aarch64.S")

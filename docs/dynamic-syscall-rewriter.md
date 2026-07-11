@@ -706,7 +706,6 @@ plan.
 - Modify: `crates/carrick-runtime/src/native_darwin/dsr/emit.rs`
 - Modify: `crates/carrick-runtime/src/native_darwin/dsr/cache.rs`
 - Modify: `crates/carrick-runtime/src/native_darwin/dsr/gateway.rs`
-- Modify: `crates/carrick-cli/tests/conformance.rs`
 - Modify: `conformance-probes/src/bin/syscallregpreserve.rs`
 - Modify: `crates/carrick-cli/tests/probe-oracle/arm64-musl/syscallregpreserve`
 
@@ -738,31 +737,32 @@ plan.
   Every unresolved edge exits with its architectural guest target. The Rust
   coordinator looks up or translates `(target, generation)`, then resumes at
   the cache address. Direct patching is added only after the slow path passes all
-  graph tests. Patches use a cache write transaction and are published
-  atomically; a concurrent executor must see either the resolver stub or the
-  complete linked branch.
+  graph tests. Patches use a JIT write-protection transaction and one aligned
+  atomic instruction store followed by instruction-cache invalidation; an
+  executor must see either the resolver branch or the complete linked branch.
 
 - [ ] **Step 4: Verify and commit**
 
   Before the commit, extend `syscallregpreserve` with x18, NZCV, and FP/SIMD
-  preservation cases. Record its expected mismatch before the complete save set
-  is enabled, then require byte-identical Docker-oracle output under DSR. Run a
-  30-sample signed-CLI `perf_trap_floor` comparison against native `brk`; stop if
-  the end-to-end p50 no longer shows a performance win.
+  preservation cases and record byte-identical native-Linux output. Do not claim
+  that the shipped Rust static PIE runs under DSR yet: its startup path requires
+  indirect returns from Task 8 and sensitive TLS/system-register handling from
+  Task 9. Task 9 runs this probe under DSR and owns the 30-sample signed-CLI
+  `perf_trap_floor` stop gate at the earliest honest end-to-end point.
 
   Run:
 
   ```bash
   cargo test -p carrick-runtime dsr_direct_flow --lib
-  cargo test -p carrick-runtime dsr_oracle --lib
-  just build
-  target/release/carrick run-elf --exec-backend native \
-    --native-page-profile native16k --native-code-mode dsr \
-    conformance-probes/target/native-pie/aarch64-unknown-linux-musl/release/syscallregpreserve
+  cargo test -p carrick-runtime native_darwin::dsr::oracle --lib
+  ./scripts/build-probes.sh --native-pie
+  docker run --rm --platform linux/arm64 \
+    -v "$PWD/conformance-probes:/p:ro" alpine:latest \
+    /p/target/native-pie/aarch64-unknown-linux-musl/release/syscallregpreserve
   ```
 
-  Expected: all direct-flow tests match direct execution before and after
-  linking.
+  Expected: all direct-flow tests match architectural state before and after
+  linking, and Linux reports every extended syscall-preservation field `true`.
 
   Commit: `feat(native): link direct DSR control flow`
 
@@ -831,7 +831,7 @@ plan.
 
   ```bash
   cargo test -p carrick-runtime dsr_indirect_flow --lib
-  cargo test -p carrick-runtime dsr_oracle --lib
+  cargo test -p carrick-runtime native_darwin::dsr::oracle --lib
   ```
 
   Expected: indirect-flow state matches direct execution and invalid targets
@@ -897,11 +897,22 @@ plan.
 
 - [ ] **Step 5: Verify and commit**
 
+  Extend this task's verification with the first honest shipped-static-PIE and
+  end-to-end performance gates. Run `syscallregpreserve` under signed DSR and
+  require byte-identical output to its checked-in Docker oracle. Then run 30
+  separate signed-CLI `perf_trap_floor` samples for native16k `brk` and DSR,
+  record p50, p95, min, IQR, and provenance in
+  `docs/perf-results/native-dsr-syscall-floor.jsonl`, and stop before Task 10 if
+  DSR does not beat same-revision `brk` at p50.
+
   Run:
 
   ```bash
   cargo test -p carrick-runtime dsr_signal_fault --lib
   just build
+  target/release/carrick run-elf --exec-backend native \
+    --native-page-profile native16k --native-code-mode dsr \
+    conformance-probes/target/native-pie/aarch64-unknown-linux-musl/release/syscallregpreserve
   cargo test -p carrick-cli --test conformance native --no-fail-fast
   ```
 

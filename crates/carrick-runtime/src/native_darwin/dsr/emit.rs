@@ -63,6 +63,13 @@ impl InstructionMap {
 pub(super) struct EmittedBlock {
     code: PublishedCode,
     map: InstructionMap,
+    direct_links: Vec<DirectLink>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct DirectLink {
+    pub(super) slot: CacheOffset,
+    pub(super) target: GuestVa,
 }
 
 impl EmittedBlock {
@@ -76,6 +83,10 @@ impl EmittedBlock {
 
     pub(super) const fn map(&self) -> &InstructionMap {
         &self.map
+    }
+
+    pub(super) fn direct_links(&self) -> &[DirectLink] {
+        &self.direct_links
     }
 }
 
@@ -310,12 +321,70 @@ fn emit_pc_relative_literal(
     Ok(())
 }
 
+fn emit_gateway_exit(
+    assembler: &mut VecAssembler<Aarch64Relocation>,
+    entries: &mut Vec<PcMapEntry>,
+    guest: GuestVa,
+    target: GuestVa,
+    source: Option<GuestVa>,
+    status: u32,
+    gateway: u64,
+) -> Result<(), DsrError> {
+    emit_mov_u64(assembler, entries, guest, 17, target.raw())?;
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; str x17, [x18, #1080]
+    );
+    if let Some(source) = source {
+        emit_mov_u64(assembler, entries, guest, 17, source.raw())?;
+        map_next(assembler, entries, guest)?;
+        dynasmrt::dynasm!(assembler
+            ; .arch aarch64
+            ; str x17, [x18, #1088]
+        );
+    }
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; mov w17, status
+        ; str w17, [x18, #1096]
+    );
+    emit_mov_u64(assembler, entries, guest, 17, gateway)?;
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; br x17
+    );
+    Ok(())
+}
+
+fn relocated_direct_word(word: u32, exit: super::types::DirectExit) -> Result<u32, DsrError> {
+    let immediate = 2_u32;
+    let mut relocated = match exit.kind {
+        super::types::DirectKind::Conditional | super::types::DirectKind::CompareZero { .. } => {
+            (word & !0x00ff_ffe0) | (immediate << 5)
+        }
+        super::types::DirectKind::TestBit { .. } => (word & !0x0007_ffe0) | (immediate << 5),
+        _ => {
+            return Err(DsrError::BlockPolicy(format!(
+                "cannot relocate non-conditional direct word 0x{word:08x}"
+            )));
+        }
+    };
+    if matches!(exit.register, Some(bad64::Reg::X18 | bad64::Reg::W18)) {
+        relocated = (relocated & !0x1f) | 17;
+    }
+    Ok(relocated)
+}
+
 pub(super) fn emit_block(
     cache: &mut TranslationCache,
     plan: &BlockPlan,
 ) -> Result<EmittedBlock, DsrError> {
     let mut assembler = VecAssembler::<Aarch64Relocation>::new(0);
     let mut entries = Vec::with_capacity(plan.instructions.len() + 8);
+    let mut direct_links = Vec::new();
     map_next(&assembler, &mut entries, plan.start)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
@@ -387,24 +456,100 @@ pub(super) fn emit_block(
     }
 
     let exit_guest = plan.exit.guest_pc();
-    if matches!(plan.exit, PlannedExit::Syscall { .. }) {
+    if let PlannedExit::Syscall { resume, .. } = plan.exit {
         map_next(&assembler, &mut entries, exit_guest)?;
         dynasmrt::dynasm!(assembler
             ; .arch aarch64
             ; str x17, [x18, #136]
         );
-        emit_mov_u64(
+        emit_gateway_exit(
             &mut assembler,
             &mut entries,
             exit_guest,
-            17,
+            resume,
+            None,
+            1,
             super::gateway::syscall_exit_address(),
         )?;
+    } else if let PlannedExit::Direct { word, exit, .. } = plan.exit {
         map_next(&assembler, &mut entries, exit_guest)?;
         dynasmrt::dynasm!(assembler
             ; .arch aarch64
-            ; br x17
+            ; str x17, [x18, #136]
         );
+        if exit.kind == super::types::DirectKind::Call {
+            emit_mov_u64(
+                &mut assembler,
+                &mut entries,
+                exit_guest,
+                30,
+                exit.resume.raw(),
+            )?;
+        }
+        if matches!(
+            exit.kind,
+            super::types::DirectKind::Branch | super::types::DirectKind::Call
+        ) {
+            let slot = current_offset(&assembler)?;
+            direct_links.push(DirectLink {
+                slot,
+                target: exit.target,
+            });
+            emit_word(&mut assembler, &mut entries, exit_guest, 0x1400_0001)?;
+            emit_gateway_exit(
+                &mut assembler,
+                &mut entries,
+                exit_guest,
+                exit.target,
+                Some(exit_guest),
+                2,
+                super::gateway::direct_exit_address(),
+            )?;
+        } else {
+            if matches!(exit.register, Some(bad64::Reg::X18 | bad64::Reg::W18)) {
+                map_next(&assembler, &mut entries, exit_guest)?;
+                dynasmrt::dynasm!(assembler
+                    ; .arch aarch64
+                    ; ldr x17, [x18, #144]
+                );
+            }
+            emit_word(
+                &mut assembler,
+                &mut entries,
+                exit_guest,
+                relocated_direct_word(word, exit)?,
+            )?;
+            let fall_slot = current_offset(&assembler)?;
+            direct_links.push(DirectLink {
+                slot: fall_slot,
+                target: exit.resume,
+            });
+            emit_word(&mut assembler, &mut entries, exit_guest, 0x1400_0002)?;
+            let taken_slot = current_offset(&assembler)?;
+            direct_links.push(DirectLink {
+                slot: taken_slot,
+                target: exit.target,
+            });
+            emit_word(&mut assembler, &mut entries, exit_guest, 0x1400_0012)?;
+            emit_gateway_exit(
+                &mut assembler,
+                &mut entries,
+                exit_guest,
+                exit.resume,
+                Some(exit_guest),
+                2,
+                super::gateway::direct_exit_address(),
+            )?;
+            emit_gateway_exit(
+                &mut assembler,
+                &mut entries,
+                exit_guest,
+                exit.target,
+                Some(exit_guest),
+                2,
+                super::gateway::direct_exit_address(),
+            )?;
+        }
     } else {
         map_next(&assembler, &mut entries, exit_guest)?;
         assembler.push_u32(exit_word(plan)?);
@@ -426,7 +571,11 @@ pub(super) fn emit_block(
     let mut writer = cache.begin_write(bytes.len())?;
     writer.write_words(&words)?;
     let code = writer.publish()?;
-    Ok(EmittedBlock { code, map })
+    Ok(EmittedBlock {
+        code,
+        map,
+        direct_links,
+    })
 }
 
 #[cfg(test)]
@@ -464,7 +613,7 @@ mod tests {
     fn dsr_emit_copy_only_block_decodes_back_with_exact_maps() {
         let mut cache = TranslationCache::new(16 * 1024).expect("allocate translation cache");
         let emitted = emit_block(&mut cache, &copy_plan()).expect("emit copy-only block");
-        assert_eq!(emitted.len(), 36);
+        assert_eq!(emitted.len(), 64);
         let original_words = [0xd503_201f, 0x9100_0400];
         let entry_word =
             unsafe { std::ptr::read_unaligned(emitted.entry().host().raw() as *const u32) };
@@ -522,49 +671,46 @@ mod tests {
     }
 
     #[test]
-    fn dsr_emit_rejects_direct_and_indirect_exits() {
-        let cases = [
-            (
-                PlannedExit::Direct {
-                    guest: GuestVa(0x4008),
-                    word: 0x1400_0002,
-                    exit: DirectExit {
-                        kind: DirectKind::Branch,
-                        target: GuestVa(0x4010),
-                        resume: GuestVa(0x400c),
-                        condition: None,
-                        register: None,
-                        bit: None,
-                    },
-                },
-                "direct exit",
-            ),
-            (
-                PlannedExit::Indirect {
-                    guest: GuestVa(0x4008),
-                    word: 0xd61f_0000,
-                    exit: IndirectExit {
-                        kind: IndirectKind::Branch,
-                        register: bad64::Reg::X0,
-                        resume: GuestVa(0x400c),
-                    },
-                },
-                "indirect exit",
-            ),
-        ];
-        for (exit, expected_class) in cases {
-            let mut plan = copy_plan();
-            plan.exit = exit;
-            let mut cache = TranslationCache::new(16 * 1024).expect("allocate translation cache");
-            let error = match emit_block(&mut cache, &plan) {
-                Ok(_) => panic!("{expected_class} should not emit in Task 4"),
-                Err(error) => error,
-            };
-            assert!(matches!(
-                error,
-                DsrError::UnsupportedBlockAction { class, .. } if class == expected_class
-            ));
-        }
+    fn dsr_emit_direct_link_and_rejects_indirect_exit() {
+        let mut direct = copy_plan();
+        direct.exit = PlannedExit::Direct {
+            guest: GuestVa(0x4008),
+            word: 0x1400_0002,
+            exit: DirectExit {
+                kind: DirectKind::Branch,
+                target: GuestVa(0x4010),
+                resume: GuestVa(0x400c),
+                condition: None,
+                register: None,
+                bit: None,
+            },
+        };
+        let mut cache = TranslationCache::new(16 * 1024).expect("allocate translation cache");
+        let emitted = emit_block(&mut cache, &direct).expect("emit direct link");
+        assert_eq!(emitted.direct_links().len(), 1);
+        assert_eq!(emitted.direct_links()[0].target, GuestVa(0x4010));
+
+        let mut indirect = copy_plan();
+        indirect.exit = PlannedExit::Indirect {
+            guest: GuestVa(0x4008),
+            word: 0xd61f_0000,
+            exit: IndirectExit {
+                kind: IndirectKind::Branch,
+                register: bad64::Reg::X0,
+                resume: GuestVa(0x400c),
+            },
+        };
+        let error = match emit_block(&mut cache, &indirect) {
+            Ok(_) => panic!("indirect exit should not emit before Task 8"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            DsrError::UnsupportedBlockAction {
+                class: "indirect exit",
+                ..
+            }
+        ));
     }
 
     #[test]

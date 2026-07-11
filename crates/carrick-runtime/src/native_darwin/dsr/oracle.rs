@@ -3,10 +3,11 @@ use carrick_guest_mem::GuestVa;
 use super::super::NativeUcontextSnapshot;
 use super::block::{BlockPlan, PlannedExit, PlannedInst};
 use super::cache::TranslationCache;
-use super::emit::emit_block;
+use super::emit::{EmittedBlock, emit_block};
 use super::gateway::enter_translated;
 use super::types::{
-    CodeGeneration, DsrError, InstAction, NativeDsrExit, PcRelativeInst, PcRelativeKind,
+    CodeGeneration, DirectExit, DirectKind, DsrError, InstAction, NativeDsrExit, PcRelativeInst,
+    PcRelativeKind,
 };
 
 fn legacy_brk_round_trip(
@@ -306,6 +307,332 @@ fn dsr_pc_relative_adrp_writes_virtual_guest_x18_without_clobbering_x17() {
     enter_translated(emitted.entry(), &mut snapshot, &mut exit).expect("execute ADRP relocation");
     assert_eq!(snapshot.x[17], expected_x17);
     assert_eq!(snapshot.x[18], target.raw());
+}
+
+#[test]
+fn dsr_direct_flow_unresolved_branch_reports_guest_target() {
+    let mut stack = vec![0_u8; 16 * 1024];
+    let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    let target = GuestVa(0x9000);
+    let plan = BlockPlan {
+        start: GuestVa(0x8000),
+        end: GuestVa(0x8004),
+        generation: CodeGeneration::INITIAL,
+        instructions: Vec::new(),
+        exit: PlannedExit::Direct {
+            guest: GuestVa(0x8000),
+            word: 0x1400_0400,
+            exit: DirectExit {
+                kind: DirectKind::Branch,
+                target,
+                resume: GuestVa(0x8004),
+                condition: None,
+                register: None,
+                bit: None,
+            },
+        },
+    };
+    let mut cache = TranslationCache::new(16 * 1024).expect("allocate direct-flow cache");
+    let emitted = emit_block(&mut cache, &plan).expect("emit unresolved direct branch");
+    let mut exit = NativeDsrExit::ResolveDirect {
+        source: GuestVa(0x8000),
+        target,
+    };
+    enter_translated(emitted.entry(), &mut snapshot, &mut exit)
+        .expect("execute unresolved direct branch");
+    assert_eq!(
+        exit,
+        NativeDsrExit::ResolveDirect {
+            source: GuestVa(0x8000),
+            target,
+        }
+    );
+}
+
+fn patch_direct_target(
+    cache: &mut TranslationCache,
+    source: &EmittedBlock,
+    guest_target: GuestVa,
+    target: &EmittedBlock,
+) {
+    let link = source
+        .direct_links()
+        .iter()
+        .find(|link| link.target == guest_target)
+        .expect("find direct link target");
+    cache
+        .patch_direct_branch(
+            super::cache::LinkSite {
+                source: source.entry(),
+                slot: link.slot,
+            },
+            target.entry(),
+        )
+        .expect("patch direct link");
+}
+
+fn syscall_plan(start: GuestVa, word: u32) -> BlockPlan {
+    BlockPlan {
+        start,
+        end: GuestVa(start.raw() + 8),
+        generation: CodeGeneration::INITIAL,
+        instructions: vec![PlannedInst {
+            guest: start,
+            action: InstAction::Copy(word),
+        }],
+        exit: PlannedExit::Syscall {
+            guest: GuestVa(start.raw() + 4),
+            resume: GuestVa(start.raw() + 8),
+        },
+    }
+}
+
+#[test]
+fn dsr_direct_flow_linked_branch_stays_in_translated_code_and_preserves_x17() {
+    let mut cache = TranslationCache::new(32 * 1024).expect("allocate linked-flow cache");
+    let source_plan = BlockPlan {
+        start: GuestVa(0xa000),
+        end: GuestVa(0xa008),
+        generation: CodeGeneration::INITIAL,
+        instructions: vec![PlannedInst {
+            guest: GuestVa(0xa000),
+            action: InstAction::Copy(0x9100_0631), // add x17, x17, #1
+        }],
+        exit: PlannedExit::Direct {
+            guest: GuestVa(0xa004),
+            word: 0x1400_03ff,
+            exit: DirectExit {
+                kind: DirectKind::Branch,
+                target: GuestVa(0xb000),
+                resume: GuestVa(0xa008),
+                condition: None,
+                register: None,
+                bit: None,
+            },
+        },
+    };
+    let source = emit_block(&mut cache, &source_plan).expect("emit linked source");
+    let target = emit_block(&mut cache, &syscall_plan(GuestVa(0xb000), 0x9100_0400))
+        .expect("emit linked target"); // add x0, x0, #1
+    patch_direct_target(&mut cache, &source, GuestVa(0xb000), &target);
+
+    let mut stack = vec![0_u8; 16 * 1024];
+    let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    let expected_x0 = snapshot.x[0] + 1;
+    let expected_x17 = snapshot.x[17] + 1;
+    let mut exit = NativeDsrExit::ResolveDirect {
+        source: GuestVa(0xa004),
+        target: GuestVa(0xb000),
+    };
+    enter_translated(source.entry(), &mut snapshot, &mut exit).expect("execute linked branch");
+    assert_eq!(snapshot.x[0], expected_x0);
+    assert_eq!(snapshot.x[17], expected_x17);
+    assert_eq!(
+        exit,
+        NativeDsrExit::Syscall {
+            resume: GuestVa(0xb008)
+        }
+    );
+}
+
+#[test]
+fn dsr_direct_flow_conditional_edges_select_taken_and_fallthrough_links() {
+    let mut cache = TranslationCache::new(64 * 1024).expect("allocate conditional-flow cache");
+    let source_plan = BlockPlan {
+        start: GuestVa(0xc000),
+        end: GuestVa(0xc004),
+        generation: CodeGeneration::INITIAL,
+        instructions: Vec::new(),
+        exit: PlannedExit::Direct {
+            guest: GuestVa(0xc000),
+            word: 0xb400_0800, // cbz x0, 0xc100
+            exit: DirectExit {
+                kind: DirectKind::CompareZero { nonzero: false },
+                target: GuestVa(0xc100),
+                resume: GuestVa(0xc004),
+                condition: None,
+                register: Some(bad64::Reg::X0),
+                bit: None,
+            },
+        },
+    };
+    let source = emit_block(&mut cache, &source_plan).expect("emit conditional source");
+    let fallthrough = emit_block(&mut cache, &syscall_plan(GuestVa(0xc004), 0x9100_0821))
+        .expect("emit fallthrough target"); // add x1, x1, #2
+    let taken = emit_block(&mut cache, &syscall_plan(GuestVa(0xc100), 0x9100_0421))
+        .expect("emit taken target"); // add x1, x1, #1
+    patch_direct_target(&mut cache, &source, GuestVa(0xc004), &fallthrough);
+    patch_direct_target(&mut cache, &source, GuestVa(0xc100), &taken);
+
+    for (x0, increment, resume) in [(0, 1, 0xc108), (7, 2, 0xc00c)] {
+        let mut stack = vec![0_u8; 16 * 1024];
+        let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+        snapshot.x[0] = x0;
+        let expected_x1 = snapshot.x[1] + increment;
+        let mut exit = NativeDsrExit::ResolveDirect {
+            source: GuestVa(0xc000),
+            target: GuestVa(0xc100),
+        };
+        enter_translated(source.entry(), &mut snapshot, &mut exit)
+            .expect("execute linked conditional branch");
+        assert_eq!(snapshot.x[1], expected_x1);
+        assert_eq!(
+            exit,
+            NativeDsrExit::Syscall {
+                resume: GuestVa(resume)
+            }
+        );
+    }
+}
+
+#[test]
+fn dsr_direct_flow_linked_call_observes_guest_lr() {
+    let mut cache = TranslationCache::new(32 * 1024).expect("allocate call-flow cache");
+    let call_plan = BlockPlan {
+        start: GuestVa(0xd000),
+        end: GuestVa(0xd004),
+        generation: CodeGeneration::INITIAL,
+        instructions: Vec::new(),
+        exit: PlannedExit::Direct {
+            guest: GuestVa(0xd000),
+            word: 0x9400_0400,
+            exit: DirectExit {
+                kind: DirectKind::Call,
+                target: GuestVa(0xe000),
+                resume: GuestVa(0xd004),
+                condition: None,
+                register: None,
+                bit: None,
+            },
+        },
+    };
+    let call = emit_block(&mut cache, &call_plan).expect("emit linked call");
+    let nested_plan = BlockPlan {
+        start: GuestVa(0xe000),
+        end: GuestVa(0xe004),
+        generation: CodeGeneration::INITIAL,
+        instructions: Vec::new(),
+        exit: PlannedExit::Direct {
+            guest: GuestVa(0xe000),
+            word: 0x9400_0040,
+            exit: DirectExit {
+                kind: DirectKind::Call,
+                target: GuestVa(0xe100),
+                resume: GuestVa(0xe004),
+                condition: None,
+                register: None,
+                bit: None,
+            },
+        },
+    };
+    let nested = emit_block(&mut cache, &nested_plan).expect("emit nested call");
+    let callee = emit_block(&mut cache, &syscall_plan(GuestVa(0xe100), 0x9100_03c0))
+        .expect("emit final callee"); // add x0, x30, #0
+    patch_direct_target(&mut cache, &call, GuestVa(0xe000), &nested);
+    patch_direct_target(&mut cache, &nested, GuestVa(0xe100), &callee);
+    let mut stack = vec![0_u8; 16 * 1024];
+    let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    let mut exit = NativeDsrExit::ResolveDirect {
+        source: GuestVa(0xd000),
+        target: GuestVa(0xe000),
+    };
+    enter_translated(call.entry(), &mut snapshot, &mut exit).expect("execute linked call");
+    assert_eq!(snapshot.x[30], 0xe004);
+    assert_eq!(snapshot.x[0], 0xe004);
+}
+
+#[test]
+fn dsr_direct_flow_condition_codes_and_virtual_x18_bits_choose_guest_edges() {
+    let cases = [
+        (0x5400_0040, 0_u64), // b.eq +8; seeded NZCV has Z set
+        (0x3600_0052, 0_u64), // tbz w18, #0, +8
+        (0x3700_0052, 1_u64), // tbnz w18, #0, +8
+    ];
+    for (word, guest_x18) in cases {
+        let start = GuestVa(0x12_000);
+        let action = super::decode::classify(word, start).expect("classify conditional edge");
+        let InstAction::Direct(exit) = action else {
+            panic!("conditional word did not classify as direct: 0x{word:08x}");
+        };
+        let plan = BlockPlan {
+            start,
+            end: GuestVa(start.raw() + 4),
+            generation: CodeGeneration::INITIAL,
+            instructions: Vec::new(),
+            exit: PlannedExit::Direct {
+                guest: start,
+                word,
+                exit,
+            },
+        };
+        let mut cache = TranslationCache::new(16 * 1024).expect("allocate condition cache");
+        let emitted = emit_block(&mut cache, &plan).expect("emit condition edge");
+        let mut stack = vec![0_u8; 16 * 1024];
+        let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+        snapshot.x[18] = guest_x18;
+        let expected_x17 = snapshot.x[17];
+        let mut observed = NativeDsrExit::ResolveDirect {
+            source: start,
+            target: exit.target,
+        };
+        enter_translated(emitted.entry(), &mut snapshot, &mut observed)
+            .expect("execute conditional edge");
+        assert_eq!(snapshot.x[17], expected_x17);
+        assert_eq!(
+            observed,
+            NativeDsrExit::ResolveDirect {
+                source: start,
+                target: GuestVa(start.raw() + 8),
+            }
+        );
+    }
+}
+
+#[test]
+fn dsr_direct_flow_linked_backward_loop_reaches_fallthrough() {
+    let mut cache = TranslationCache::new(32 * 1024).expect("allocate loop-flow cache");
+    let loop_plan = BlockPlan {
+        start: GuestVa(0xf000),
+        end: GuestVa(0xf008),
+        generation: CodeGeneration::INITIAL,
+        instructions: vec![PlannedInst {
+            guest: GuestVa(0xf000),
+            action: InstAction::Copy(0xf100_0400), // subs x0, x0, #1
+        }],
+        exit: PlannedExit::Direct {
+            guest: GuestVa(0xf004),
+            word: 0xb5ff_ffe0, // cbnz x0, 0xf000
+            exit: DirectExit {
+                kind: DirectKind::CompareZero { nonzero: true },
+                target: GuestVa(0xf000),
+                resume: GuestVa(0xf008),
+                condition: None,
+                register: Some(bad64::Reg::X0),
+                bit: None,
+            },
+        },
+    };
+    let loop_block = emit_block(&mut cache, &loop_plan).expect("emit linked loop");
+    let done = emit_block(&mut cache, &syscall_plan(GuestVa(0xf008), 0xd503_201f))
+        .expect("emit loop fallthrough");
+    patch_direct_target(&mut cache, &loop_block, GuestVa(0xf000), &loop_block);
+    patch_direct_target(&mut cache, &loop_block, GuestVa(0xf008), &done);
+    let mut stack = vec![0_u8; 16 * 1024];
+    let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    snapshot.x[0] = 4;
+    let mut exit = NativeDsrExit::ResolveDirect {
+        source: GuestVa(0xf004),
+        target: GuestVa(0xf000),
+    };
+    enter_translated(loop_block.entry(), &mut snapshot, &mut exit)
+        .expect("execute linked backward loop");
+    assert_eq!(snapshot.x[0], 0);
+    assert_eq!(
+        exit,
+        NativeDsrExit::Syscall {
+            resume: GuestVa(0xf010)
+        }
+    );
 }
 
 #[test]

@@ -140,6 +140,10 @@ pub(super) enum NativeDsrExit {
     Syscall {
         resume: GuestVa,
     },
+    ResolveDirect {
+        source: GuestVa,
+        target: GuestVa,
+    },
     ResolveIndirect {
         source: GuestVa,
         target: GuestVa,
