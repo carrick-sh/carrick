@@ -502,6 +502,29 @@ impl SyscallDispatcher {
         s.process_pending_siginfos.clear();
     }
 
+    /// Retire EVERY per-thread signal entry except `keep`'s, in a fork CHILD
+    /// of a multithreaded parent (before `migrate_thread_signal_state` re-keys
+    /// `keep` to the child's new main tid). fork(2) clones only the calling
+    /// thread: the sibling tids' masks/altstacks/pendings are records of
+    /// threads that do not exist in the child — and the child's fresh registry
+    /// allocates tids from its own host-pid-anchored base, which can COLLIDE
+    /// with a dead parent sibling's tid, silently resurrecting its blocked
+    /// mask or SA_ONSTACK stack for an unrelated new thread. Process-level
+    /// (thread-group shared) state is deliberately untouched: the fork-clear
+    /// of the shared pending set is `migrate_thread_signal_state`'s job, and
+    /// handlers are process-global (inherited across fork per POSIX).
+    pub fn retire_sibling_thread_signal_state(&self, keep: crate::thread::ThreadId) {
+        let mut s = self.signal.lock();
+        s.masks.retain(|t, _| *t == keep);
+        s.pendings.retain(|t, _| *t == keep);
+        s.rt_pending_counts.retain(|(t, _), _| *t == keep);
+        s.pending_actions.retain(|(t, _), _| *t == keep);
+        s.pending_siginfos.retain(|(t, _), _| *t == keep);
+        s.altstack.retain(|t, _| *t == keep);
+        s.handler_frames.retain(|t, _| *t == keep);
+        s.restore_masks.retain(|t, _| *t == keep);
+    }
+
     /// Initialize a new `CLONE_THREAD` task's per-thread signal state. Linux
     /// threads inherit the creator's blocked-signal mask at clone time, while
     /// pending signals and alternate signal stacks are not inherited by the new
@@ -2548,6 +2571,76 @@ mod tests {
         assert!(!namespace_member_standard_kill_needs_xsig(LINUX_SIGSTOP));
         assert!(!namespace_member_standard_kill_needs_xsig(34));
         assert!(!namespace_member_standard_kill_needs_xsig(65));
+    }
+
+    #[test]
+    fn fork_child_retires_sibling_thread_signal_state() {
+        // MT fork: the child inherits the parent's per-tid signal maps, but
+        // only the forking thread survives. Sibling entries must be retired
+        // BEFORE `migrate_thread_signal_state` — the child's fresh registry
+        // re-allocates tids from its own (host-pid-anchored) base, which can
+        // collide with a dead parent sibling's tid and resurrect its
+        // mask/altstack. Process-level (thread-group) state is migrate's job
+        // and must be untouched here.
+        let d = SyscallDispatcher::new();
+        let keeper = crate::thread::ThreadId::synthetic_for_tests(100);
+        let sib_a = crate::thread::ThreadId::synthetic_for_tests(101);
+        let sib_b = crate::thread::ThreadId::synthetic_for_tests(102);
+        {
+            let mut s = d.signal.lock();
+            for tid in [keeper, sib_a, sib_b] {
+                s.masks.insert(tid, SigSet::from_raw(1 << 9));
+                s.pendings.insert(tid, SigSet::from_raw(1 << 11));
+                s.rt_pending_counts.insert((tid, 34), 2);
+                s.pending_actions.insert((tid, 34), VecDeque::new());
+                s.pending_siginfos.insert((tid, 34), VecDeque::new());
+                s.altstack
+                    .insert(tid, carrick_abi::LinuxSigaltstack::empty());
+                s.handler_frames.insert(tid, vec![true]);
+                s.restore_masks.insert(tid, SigSet::from_raw(1));
+            }
+            s.process_pending = SigSet::from_raw(1 << 14);
+        }
+
+        d.retire_sibling_thread_signal_state(keeper);
+
+        let s = d.signal.lock();
+        for tid in [sib_a, sib_b] {
+            assert!(!s.masks.contains_key(&tid), "sibling mask retired");
+            assert!(!s.pendings.contains_key(&tid), "sibling pending retired");
+            assert!(!s.altstack.contains_key(&tid), "sibling altstack retired");
+            assert!(
+                !s.handler_frames.contains_key(&tid),
+                "sibling handler frames retired"
+            );
+            assert!(
+                !s.restore_masks.contains_key(&tid),
+                "sibling restore mask retired"
+            );
+            assert!(
+                !s.rt_pending_counts.keys().any(|(t, _)| *t == tid),
+                "sibling rt pending counts retired"
+            );
+            assert!(
+                !s.pending_actions.keys().any(|(t, _)| *t == tid),
+                "sibling pending actions retired"
+            );
+            assert!(
+                !s.pending_siginfos.keys().any(|(t, _)| *t == tid),
+                "sibling pending siginfos retired"
+            );
+        }
+        assert_eq!(s.mask_for(keeper), SigSet::from_raw(1 << 9));
+        assert!(s.altstack.contains_key(&keeper), "keeper altstack intact");
+        assert!(
+            s.rt_pending_counts.contains_key(&(keeper, 34)),
+            "keeper rt counts intact"
+        );
+        assert_eq!(
+            s.process_pending,
+            SigSet::from_raw(1 << 14),
+            "process-level pending untouched (fork-clear is migrate's job)"
+        );
     }
 
     #[test]
