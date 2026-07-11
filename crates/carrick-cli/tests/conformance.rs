@@ -2306,6 +2306,12 @@ fn probe_campaign_dir(target: &str, exec_backend: Option<&str>) -> PathBuf {
     }
 }
 
+/// Transport helpers that live in `src/bin` (so every probe build produces
+/// them for every target) but are NOT probes: they never run standalone
+/// against the oracle. `probeinit` is the direct-ELF container init shim —
+/// under the injection transport it would fork/exec ITSELF at `/tmp/p`.
+const PROBE_HELPERS: &[&str] = &["probeinit"];
+
 fn probe_source_names() -> BTreeSet<String> {
     let src_dir = repo_path("conformance-probes/src/bin");
     let Ok(entries) = std::fs::read_dir(src_dir) else {
@@ -2320,6 +2326,7 @@ fn probe_source_names() -> BTreeSet<String> {
             }
             path.file_stem()
                 .and_then(|n| n.to_str())
+                .filter(|name| !PROBE_HELPERS.contains(name))
                 .map(str::to_string)
         })
         .collect()
@@ -2430,8 +2437,35 @@ fn run_carrick_probe_with_backend_env(
     run_carrick_probe_process(command, Some(stdin_bytes), deadline)
 }
 
+/// Direct-ELF transport: bind the static probe into the image at `/tmp/p`
+/// (where the injection snippet writes it, and where self-exec probes expect
+/// to find themselves) and run it UNDER the static `probeinit` shim so the
+/// process topology matches the oracle's: init is ns-pid 1, the probe is its
+/// child (`pidnsroot` reads getppid()==1). Executing the probe directly as
+/// the container command made it ns-pid 1 itself — a topology no injection
+/// oracle ever exhibits.
 fn run_carrick_bound_probe(bin: &PathBuf, lane: Lane, probe: &Path, deadline: Duration) -> String {
-    let volume = format!("{}:/tmp/carrick-probe:ro", probe.display());
+    run_carrick_bound_probe_with_backend_env(bin, lane, probe, deadline, None)
+}
+
+fn run_carrick_bound_probe_with_backend_env(
+    bin: &PathBuf,
+    lane: Lane,
+    probe: &Path,
+    deadline: Duration,
+    backend_env: Option<(&'static str, &'static str)>,
+) -> String {
+    let init = probe
+        .parent()
+        .expect("probe binaries live in a target directory")
+        .join("probeinit");
+    assert!(
+        init.is_file(),
+        "probeinit transport helper missing at {} — run scripts/build-probes.sh",
+        init.display()
+    );
+    let probe_volume = format!("{}:/tmp/p:ro", probe.display());
+    let init_volume = format!("{}:/tmp/carrick-init:ro", init.display());
     let mut command = Command::new(bin);
     command
         .args([
@@ -2443,10 +2477,17 @@ fn run_carrick_bound_probe(bin: &PathBuf, lane: Lane, probe: &Path, deadline: Du
             "host",
             "--volume",
         ])
-        .arg(volume)
+        .arg(probe_volume)
+        .arg("--volume")
+        .arg(init_volume)
         .arg(lane.image)
-        .arg("/tmp/carrick-probe")
+        .arg("/tmp/carrick-init")
         .env("CARRICK_ACCEPT_ROSETTA_TERMS", "0");
+    if let Some((exec_backend, native_page_profile)) = backend_env {
+        command
+            .env("CARRICK_EXEC_BACKEND", exec_backend)
+            .env("CARRICK_NATIVE_PAGE_PROFILE", native_page_profile);
+    }
     // Docker consumes the injected payload before exec, leaving the probe an
     // EOF pipe on stdin. Preserve that fd shape for direct native probes.
     run_carrick_probe_process(command, Some(&[]), deadline)
@@ -3382,6 +3423,69 @@ fn native_conformance_container_executes_libc_probe() {
                 && !out.contains("unsupported in this backend")
                 && !out.contains("no HVF fallback was attempted"),
             "native container libc probe failed for profile {profile}:\n{out}"
+        );
+    }
+}
+
+#[test]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn native_direct_elf_transport_preserves_init_topology() {
+    // The direct-ELF transport must reproduce the INJECTION oracle's process
+    // shape: the probe is a CHILD of the container init (ns-pid 1) and finds
+    // itself at /tmp/p. Guards two seams at once:
+    //   * the `probeinit` transport shim (probe as init's child, /tmp/p bound) —
+    //     without it the probe was ns-pid 1 itself (pidnsroot read
+    //     parent_is_init=false) and self-exec probes found no /tmp/p
+    //     (sigwaitalarm's child exited 127);
+    //   * native PID-namespace launch placement — without it a native
+    //     container ran with HOST pids, so no parent could ever read as 1.
+    let _serial = CONFORMANCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let Some(bin) = carrick_bin() else {
+        eprintln!(
+            "SKIP native_direct_elf_transport_preserves_init_topology: target/release/carrick not built"
+        );
+        return;
+    };
+    ensure_signed(&bin);
+    let dir = probe_campaign_dir("aarch64-unknown-linux-musl", Some("native"));
+    let pidnsroot = dir.join("pidnsroot");
+    let sigwaitalarm = dir.join("sigwaitalarm");
+    if !pidnsroot.is_file() || !sigwaitalarm.is_file() || !dir.join("probeinit").is_file() {
+        eprintln!(
+            "SKIP native_direct_elf_transport_preserves_init_topology: native PIE probes not built \
+             (scripts/build-probes.sh --native-pie)"
+        );
+        return;
+    }
+
+    for profile in ["native16k", "linux4k"] {
+        let out = run_carrick_bound_probe_with_backend_env(
+            &bin,
+            ARM64,
+            &pidnsroot,
+            CASE_DEADLINE,
+            Some(("native", profile)),
+        );
+        assert!(
+            out.contains("parent_is_init=true")
+                && out.contains("child_parent_is_me=true")
+                && out.contains("wait_returned_child=true")
+                && out.contains("child_pid_eq_fork_ret=true"),
+            "direct-ELF transport lost the init topology for profile {profile}:\n{out}"
+        );
+
+        let out = run_carrick_bound_probe_with_backend_env(
+            &bin,
+            ARM64,
+            &sigwaitalarm,
+            CASE_DEADLINE,
+            Some(("native", profile)),
+        );
+        assert!(
+            out.contains("sigwait_alarm_child_exited=true")
+                && out.contains("sigwait_alarm_child_status_zero=true"),
+            "direct-ELF transport broke the /tmp/p self-exec for profile {profile}:\n{out}"
         );
     }
 }
