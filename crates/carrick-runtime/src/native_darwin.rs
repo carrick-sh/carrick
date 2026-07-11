@@ -956,6 +956,22 @@ fn run_image_in_current_process(
                 "native Darwin thread group ended without a process exit".to_string(),
             ))
         }
+        NativeThreadLoopOutcome::ExecReplacedThread => {
+            // Another thread's execve replaced the image: the exec'd thread
+            // owns the process and terminates it via `_exit`. This initial
+            // host thread must never exit the process out from under the new
+            // image — join whatever handles remain (the exec'd thread's own
+            // handle blocks until process death unless the teardown's join
+            // already took it), then park forever. Joining an empty vec here
+            // previously fell into the unconditional error above and KILLED
+            // the exec'd process (lost exec). A join error (a panicked,
+            // already-retired sibling) changes nothing: the image owns the
+            // process either way.
+            let _ = thread_runtime.join_spawned_threads();
+            loop {
+                std::thread::park();
+            }
+        }
     }
 }
 
@@ -973,6 +989,16 @@ enum NativeThreadStart {
 enum NativeThreadLoopOutcome {
     ProcessExit(i32),
     ThreadDone,
+    /// This thread was retired because ANOTHER thread's execve replaced the
+    /// thread group. Distinct from `ThreadDone` because the process's INITIAL
+    /// host thread must react differently: the exec'd thread owns the process
+    /// image now and terminates the process via `_exit`, so the initial
+    /// thread must wait/park forever. Treating this as a plain `ThreadDone`
+    /// let `run_image_in_current_process`'s unconditional "thread group ended
+    /// without a process exit" error EXIT the process out from under the
+    /// running exec'd image whenever the teardown's join-take emptied the
+    /// handle vec first (a lost exec on a Linux-legal shape).
+    ExecReplacedThread,
 }
 
 fn native_clone_child_context(
@@ -1088,7 +1114,7 @@ fn run_native_thread_loop(
             if thread_runtime.finish_thread(&dispatcher, &memory) {
                 return Ok(NativeThreadLoopOutcome::ProcessExit(0));
             }
-            return Ok(NativeThreadLoopOutcome::ThreadDone);
+            return Ok(NativeThreadLoopOutcome::ExecReplacedThread);
         }
         thread_runtime.park_for_fork_quiesce();
         if snapshot.event_kind == NATIVE_EVENT_KICK {
@@ -1486,7 +1512,7 @@ fn run_native_thread_loop(
                                 if thread_runtime.finish_thread(&dispatcher, &memory) {
                                     return Ok(NativeThreadLoopOutcome::ProcessExit(0));
                                 }
-                                return Ok(NativeThreadLoopOutcome::ThreadDone);
+                                return Ok(NativeThreadLoopOutcome::ExecReplacedThread);
                             }
                         }
                     }
@@ -1512,7 +1538,7 @@ fn run_native_thread_loop(
                                         if thread_runtime.finish_thread(&dispatcher, &memory) {
                                             return Ok(NativeThreadLoopOutcome::ProcessExit(0));
                                         }
-                                        return Ok(NativeThreadLoopOutcome::ThreadDone);
+                                        return Ok(NativeThreadLoopOutcome::ExecReplacedThread);
                                     }
                                 }
                                 let entry = image.entry();
@@ -1962,7 +1988,13 @@ impl NativeThreadRuntime {
                     Ok(Ok(NativeThreadLoopOutcome::ProcessExit(code))) => unsafe {
                         libc::_exit(code);
                     },
-                    Ok(Ok(NativeThreadLoopOutcome::ThreadDone)) => {}
+                    // A spawned sibling retired by an exec replacement ends
+                    // exactly like a normal thread exit; only the INITIAL
+                    // thread's caller distinguishes the two.
+                    Ok(Ok(
+                        NativeThreadLoopOutcome::ThreadDone
+                        | NativeThreadLoopOutcome::ExecReplacedThread,
+                    )) => {}
                     Ok(Err(err)) => {
                         if let Some(sender) = ready.take() {
                             let _ = sender.send(Err(err.to_string()));
