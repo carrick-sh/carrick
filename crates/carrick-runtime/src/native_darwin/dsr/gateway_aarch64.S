@@ -102,8 +102,10 @@ _carrick_dsr_enter_raw:
 .p2align 2
 .globl _carrick_dsr_exit_syscall
 .globl _carrick_dsr_exit_direct
+.globl _carrick_dsr_exit_indirect
 _carrick_dsr_exit_syscall:
 _carrick_dsr_exit_direct:
+_carrick_dsr_exit_indirect:
     // The emitted stub saved guest x17 through physical x18 before branching.
     stp x0, x1, [x18, #0]
     stp x2, x3, [x18, #16]

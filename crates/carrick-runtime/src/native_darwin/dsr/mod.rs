@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 pub(super) mod block;
 pub(super) mod cache;
 pub(super) mod decode;
@@ -18,6 +20,20 @@ pub(super) struct ThreadTranslator {
     cache: cache::TranslationCache,
     blocks: BTreeMap<(carrick_guest_mem::GuestVa, types::CodeGeneration), types::CacheVa>,
     pending: BTreeMap<(carrick_guest_mem::GuestVa, types::CodeGeneration), Vec<cache::LinkSite>>,
+    resume_entry: Option<(
+        carrick_guest_mem::GuestVa,
+        types::CodeGeneration,
+        types::CacheVa,
+    )>,
+    stats: ResolverStats,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct ResolverStats {
+    pub(super) resolver_exits: u64,
+    pub(super) one_entry_hits: u64,
+    pub(super) translations: u64,
+    pub(super) duplicate_publications: u64,
 }
 
 impl ThreadTranslator {
@@ -26,6 +42,8 @@ impl ThreadTranslator {
             cache: cache::TranslationCache::new(capacity)?,
             blocks: BTreeMap::new(),
             pending: BTreeMap::new(),
+            resume_entry: None,
+            stats: ResolverStats::default(),
         })
     }
 
@@ -40,6 +58,7 @@ impl ThreadTranslator {
         }
         let block = block::plan_block(memory, guest, types::CodeGeneration::INITIAL, 256)?;
         let emitted = emit::emit_block(&mut self.cache, &block)?;
+        self.stats.translations = self.stats.translations.saturating_add(1);
         let entry = emitted.entry();
         let links = emitted.direct_links().to_vec();
         self.blocks.insert(key, entry);
@@ -64,12 +83,50 @@ impl ThreadTranslator {
         Ok(entry)
     }
 
+    fn resolve_indirect(
+        &mut self,
+        memory: &super::NativeMappedMemory,
+        source: carrick_guest_mem::GuestVa,
+        target: carrick_guest_mem::GuestVa,
+    ) -> Result<types::CacheVa, types::DsrError> {
+        self.stats.resolver_exits = self.stats.resolver_exits.saturating_add(1);
+        if !target.raw().is_multiple_of(4) {
+            return Err(types::DsrError::InvalidIndirectTarget {
+                source_pc: source.raw(),
+                target: target.raw(),
+                reason: "target is not instruction aligned",
+            });
+        }
+        if !memory.guest_address_is_executable(target.raw()) {
+            return Err(types::DsrError::InvalidIndirectTarget {
+                source_pc: source.raw(),
+                target: target.raw(),
+                reason: "target is outside an executable guest mapping",
+            });
+        }
+        self.translate(memory, target)
+    }
+
+    #[cfg(test)]
+    pub(super) const fn resolver_stats(&self) -> ResolverStats {
+        self.stats
+    }
+
     pub(super) fn enter_once(
         &mut self,
         memory: &super::NativeMappedMemory,
         snapshot: &mut super::NativeUcontextSnapshot,
     ) -> Result<ThreadExit, types::DsrError> {
-        let entry = self.translate(memory, carrick_guest_mem::GuestVa(snapshot.pc))?;
+        let guest = carrick_guest_mem::GuestVa(snapshot.pc);
+        let entry = match self.resume_entry.take() {
+            Some((cached_guest, generation, entry))
+                if cached_guest == guest && generation == types::CodeGeneration::INITIAL =>
+            {
+                self.stats.one_entry_hits = self.stats.one_entry_hits.saturating_add(1);
+                entry
+            }
+            _ => self.translate(memory, guest)?,
+        };
         let mut exit = types::NativeDsrExit::Syscall {
             resume: carrick_guest_mem::GuestVa(snapshot.pc),
         };
@@ -78,6 +135,12 @@ impl ThreadTranslator {
             types::NativeDsrExit::Syscall { resume } => ThreadExit::Syscall { resume },
             types::NativeDsrExit::ResolveDirect { target, .. } => {
                 self.translate(memory, target)?;
+                snapshot.pc = target.raw();
+                ThreadExit::Continue
+            }
+            types::NativeDsrExit::ResolveIndirect { source, target, .. } => {
+                let entry = self.resolve_indirect(memory, source, target)?;
+                self.resume_entry = Some((target, types::CodeGeneration::INITIAL, entry));
                 snapshot.pc = target.raw();
                 ThreadExit::Continue
             }
@@ -94,6 +157,12 @@ mod tests {
     use proptest::prelude::*;
 
     const PC: GuestVa = GuestVa(0x1000);
+
+    #[test]
+    fn dsr_indirect_resolver_stats_start_at_zero() {
+        let translator = super::ThreadTranslator::new(16 * 1024).expect("create translator");
+        assert_eq!(translator.resolver_stats(), super::ResolverStats::default());
+    }
 
     #[test]
     fn classifies_copy_syscall_and_control_flow() {
@@ -447,4 +516,3 @@ mod tests {
         assert!(matches!(error, super::types::DsrError::CachePolicy(_)));
     }
 }
-use std::collections::BTreeMap;

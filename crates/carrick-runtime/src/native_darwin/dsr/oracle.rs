@@ -6,8 +6,8 @@ use super::cache::TranslationCache;
 use super::emit::{EmittedBlock, emit_block};
 use super::gateway::enter_translated;
 use super::types::{
-    CodeGeneration, DirectExit, DirectKind, DsrError, InstAction, NativeDsrExit, PcRelativeInst,
-    PcRelativeKind,
+    CodeGeneration, DirectExit, DirectKind, DsrError, IndirectExit, IndirectKind, InstAction,
+    NativeDsrExit, PcRelativeInst, PcRelativeKind,
 };
 
 fn legacy_brk_round_trip(
@@ -631,6 +631,127 @@ fn dsr_direct_flow_linked_backward_loop_reaches_fallthrough() {
         exit,
         NativeDsrExit::Syscall {
             resume: GuestVa(0xf010)
+        }
+    );
+}
+
+#[test]
+fn dsr_indirect_flow_unresolved_return_reports_guest_register_target() {
+    let mut cache = TranslationCache::new(16 * 1024).expect("allocate indirect-flow cache");
+    let plan = BlockPlan {
+        start: GuestVa(0x13_000),
+        end: GuestVa(0x13_004),
+        generation: CodeGeneration::INITIAL,
+        instructions: Vec::new(),
+        exit: PlannedExit::Indirect {
+            guest: GuestVa(0x13_000),
+            word: 0xd65f_03c0,
+            exit: IndirectExit {
+                kind: IndirectKind::Return,
+                register: bad64::Reg::X30,
+                resume: GuestVa(0x13_004),
+            },
+        },
+    };
+    let emitted = emit_block(&mut cache, &plan).expect("emit unresolved return");
+    let mut stack = vec![0_u8; 16 * 1024];
+    let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    snapshot.x[30] = 0x14_000;
+    let mut exit = NativeDsrExit::ResolveIndirect {
+        source: GuestVa(0x13_000),
+        target: GuestVa(0x14_000),
+        link: None,
+    };
+    enter_translated(emitted.entry(), &mut snapshot, &mut exit).expect("execute unresolved return");
+    assert_eq!(
+        exit,
+        NativeDsrExit::ResolveIndirect {
+            source: GuestVa(0x13_000),
+            target: GuestVa(0x14_000),
+            link: None,
+        }
+    );
+}
+
+#[test]
+fn dsr_indirect_flow_blr_sets_guest_link_and_alternates_targets() {
+    let mut cache = TranslationCache::new(16 * 1024).expect("allocate BLR cache");
+    let plan = BlockPlan {
+        start: GuestVa(0x15_000),
+        end: GuestVa(0x15_004),
+        generation: CodeGeneration::INITIAL,
+        instructions: Vec::new(),
+        exit: PlannedExit::Indirect {
+            guest: GuestVa(0x15_000),
+            word: 0xd63f_00a0, // blr x5
+            exit: IndirectExit {
+                kind: IndirectKind::Call,
+                register: bad64::Reg::X5,
+                resume: GuestVa(0x15_004),
+            },
+        },
+    };
+    let emitted = emit_block(&mut cache, &plan).expect("emit BLR");
+    for target in [GuestVa(0x16_000), GuestVa(0x17_000), GuestVa(0x16_000)] {
+        let mut stack = vec![0_u8; 16 * 1024];
+        let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+        snapshot.x[5] = target.raw();
+        let mut exit = NativeDsrExit::ResolveIndirect {
+            source: GuestVa(0x15_000),
+            target,
+            link: Some(GuestVa(0x15_004)),
+        };
+        enter_translated(emitted.entry(), &mut snapshot, &mut exit).expect("execute BLR");
+        assert_eq!(snapshot.x[30], 0x15_004);
+        assert_eq!(
+            exit,
+            NativeDsrExit::ResolveIndirect {
+                source: GuestVa(0x15_000),
+                target,
+                link: Some(GuestVa(0x15_004)),
+            }
+        );
+    }
+}
+
+#[test]
+fn dsr_indirect_flow_branch_reads_virtual_guest_x18() {
+    let mut cache = TranslationCache::new(16 * 1024).expect("allocate x18 branch cache");
+    let plan = BlockPlan {
+        start: GuestVa(0x18_000),
+        end: GuestVa(0x18_004),
+        generation: CodeGeneration::INITIAL,
+        instructions: Vec::new(),
+        exit: PlannedExit::Indirect {
+            guest: GuestVa(0x18_000),
+            word: 0xd61f_0240, // br x18
+            exit: IndirectExit {
+                kind: IndirectKind::Branch,
+                register: bad64::Reg::X18,
+                resume: GuestVa(0x18_004),
+            },
+        },
+    };
+    let emitted = emit_block(&mut cache, &plan).expect("emit virtual x18 branch");
+    let mut stack = vec![0_u8; 16 * 1024];
+    let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    snapshot.x[18] = 0x19_000;
+    let expected_x17 = snapshot.x[17];
+    let mut exit = NativeDsrExit::ResolveIndirect {
+        source: GuestVa(0x18_000),
+        target: GuestVa(0x19_000),
+        link: None,
+    };
+    enter_translated(emitted.entry(), &mut snapshot, &mut exit)
+        .expect("execute virtual x18 branch");
+    assert_eq!(snapshot.x[17], expected_x17);
+    assert_eq!(snapshot.x[18], 0x19_000);
+    assert_eq!(
+        exit,
+        NativeDsrExit::ResolveIndirect {
+            source: GuestVa(0x18_000),
+            target: GuestVa(0x19_000),
+            link: None,
         }
     );
 }
