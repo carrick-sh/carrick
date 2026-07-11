@@ -1,5 +1,7 @@
+pub(super) mod block;
 pub(super) mod cache;
 pub(super) mod decode;
+pub(super) mod emit;
 pub(super) mod types;
 
 #[cfg(test)]

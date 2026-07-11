@@ -110,6 +110,7 @@ carrick-spec = { path = "../carrick-spec" }
 applevisor.workspace = true
 applevisor-sys.workspace = true
 bad64.workspace = true
+dynasmrt.workspace = true
 
 [build-dependencies]
 cc = "1"
