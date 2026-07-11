@@ -530,12 +530,18 @@ pub(crate) fn run_static_elf<A, E>(
     env: E,
     max_traps: usize,
     debug_state_path: Option<&PathBuf>,
+    code_mode: carrick_spec::NativeCodeModeRequest,
     plan: &ExecutionPlan,
 ) -> Result<RunResult, RuntimeError>
 where
     A: IntoIterator<Item = String>,
     E: IntoIterator<Item = String>,
 {
+    if code_mode == carrick_spec::NativeCodeModeRequest::Dsr {
+        return Err(RuntimeError::Unsupported(
+            "native DSR selected, but translated execution is not implemented yet".to_string(),
+        ));
+    }
     let Some(geometry) = plan.page_geometry.native_geometry() else {
         return Err(RuntimeError::Unsupported(
             "native Darwin run-elf selected without native page geometry".to_string(),
@@ -590,12 +596,18 @@ pub(crate) fn run_elf_from_dispatcher_debug<A, E>(
     env: E,
     max_traps: usize,
     debug_state_path: Option<&PathBuf>,
+    code_mode: carrick_spec::NativeCodeModeRequest,
     plan: &ExecutionPlan,
 ) -> Result<RunResult, RuntimeError>
 where
     A: IntoIterator<Item = String>,
     E: IntoIterator<Item = String>,
 {
+    if code_mode == carrick_spec::NativeCodeModeRequest::Dsr {
+        return Err(RuntimeError::Unsupported(
+            "native DSR selected, but translated execution is not implemented yet".to_string(),
+        ));
+    }
     let Some(geometry) = plan.page_geometry.native_geometry() else {
         return Err(RuntimeError::Unsupported(
             "native Darwin container launch selected without native page geometry".to_string(),

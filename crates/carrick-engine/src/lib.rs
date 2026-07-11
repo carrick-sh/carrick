@@ -121,6 +121,7 @@ pub struct CliRunRequest {
     pub pull: carrick_image::PullPolicy,
     pub exec_backend: carrick_spec::ExecBackendRequest,
     pub native_page_profile: carrick_spec::NativePageProfileRequest,
+    pub native_code_mode: carrick_spec::NativeCodeModeRequest,
     /// PID namespace mode (`docker run --pid`). Defaults to `Private`.
     pub pid: PidMode,
     pub network: NetworkMode,
@@ -455,6 +456,7 @@ pub fn resolve_run_spec(req: CliRunRequest, image: ResolvedImage) -> Result<RunS
         platform,
         exec_backend: req.exec_backend,
         native_page_profile: req.native_page_profile,
+        native_code_mode: req.native_code_mode,
         pid: req.pid,
         hostname: req.hostname,
         network,
@@ -572,6 +574,7 @@ mod tests {
             pull: carrick_image::PullPolicy::Missing,
             exec_backend: carrick_spec::ExecBackendRequest::Auto,
             native_page_profile: carrick_spec::NativePageProfileRequest::Auto,
+            native_code_mode: carrick_spec::NativeCodeModeRequest::Brk,
             pid: PidMode::default(),
             network: NetworkMode::Host,
             network_bridge: None,
@@ -593,10 +596,11 @@ mod tests {
     }
 
     #[test]
-    fn execution_backend_and_page_profile_flow_into_run_spec() {
+    fn execution_backend_page_profile_and_code_mode_flow_into_run_spec() {
         let mut req = base_req(None);
         req.exec_backend = carrick_spec::ExecBackendRequest::Native;
         req.native_page_profile = carrick_spec::NativePageProfileRequest::Linux4k;
+        req.native_code_mode = carrick_spec::NativeCodeModeRequest::Dsr;
 
         let image = make_test_image(None, Some(vec!["/bin/ls".into()]), vec![], None);
         let spec = resolve_run_spec(req, image).expect("resolve run spec");
@@ -605,6 +609,10 @@ mod tests {
         assert_eq!(
             spec.native_page_profile,
             carrick_spec::NativePageProfileRequest::Linux4k
+        );
+        assert_eq!(
+            spec.native_code_mode,
+            carrick_spec::NativeCodeModeRequest::Dsr
         );
     }
 
@@ -769,6 +777,7 @@ mod tests {
             pull: carrick_image::PullPolicy::Missing,
             exec_backend: carrick_spec::ExecBackendRequest::Auto,
             native_page_profile: carrick_spec::NativePageProfileRequest::Auto,
+            native_code_mode: carrick_spec::NativeCodeModeRequest::Brk,
             pid: PidMode::default(),
             network: NetworkMode::Host,
             network_bridge: None,
@@ -820,6 +829,7 @@ mod tests {
             pull: carrick_image::PullPolicy::Missing,
             exec_backend: carrick_spec::ExecBackendRequest::Auto,
             native_page_profile: carrick_spec::NativePageProfileRequest::Auto,
+            native_code_mode: carrick_spec::NativeCodeModeRequest::Brk,
             pid: PidMode::default(),
             network: NetworkMode::Host,
             network_bridge: None,
@@ -870,6 +880,7 @@ mod tests {
             pull: carrick_image::PullPolicy::Missing,
             exec_backend: carrick_spec::ExecBackendRequest::Auto,
             native_page_profile: carrick_spec::NativePageProfileRequest::Auto,
+            native_code_mode: carrick_spec::NativeCodeModeRequest::Brk,
             pid: PidMode::default(),
             network: NetworkMode::Host,
             network_bridge: None,
@@ -920,6 +931,7 @@ mod tests {
             pull: carrick_image::PullPolicy::Missing,
             exec_backend: carrick_spec::ExecBackendRequest::Auto,
             native_page_profile: carrick_spec::NativePageProfileRequest::Auto,
+            native_code_mode: carrick_spec::NativeCodeModeRequest::Brk,
             pid: PidMode::default(),
             network: NetworkMode::Host,
             network_bridge: None,
@@ -979,6 +991,7 @@ mod tests {
             pull: carrick_image::PullPolicy::Missing,
             exec_backend: carrick_spec::ExecBackendRequest::Auto,
             native_page_profile: carrick_spec::NativePageProfileRequest::Auto,
+            native_code_mode: carrick_spec::NativeCodeModeRequest::Brk,
             pid: PidMode::default(),
             network: NetworkMode::Host,
             network_bridge: None,
@@ -1027,6 +1040,7 @@ mod tests {
                 pull: carrick_image::PullPolicy::Missing,
                 exec_backend: carrick_spec::ExecBackendRequest::Auto,
                 native_page_profile: carrick_spec::NativePageProfileRequest::Auto,
+                native_code_mode: carrick_spec::NativeCodeModeRequest::Brk,
                 pid: PidMode::default(),
                 network: NetworkMode::Host,
                 network_bridge: None,
