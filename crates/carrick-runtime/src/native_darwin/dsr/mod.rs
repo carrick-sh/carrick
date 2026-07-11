@@ -2,7 +2,55 @@ pub(super) mod block;
 pub(super) mod cache;
 pub(super) mod decode;
 pub(super) mod emit;
+pub(super) mod gateway;
+#[cfg(test)]
+mod oracle;
 pub(super) mod types;
+
+#[derive(Debug)]
+pub(super) enum ThreadExit {
+    Syscall { resume: carrick_guest_mem::GuestVa },
+    Unsupported(String),
+}
+
+pub(super) struct ThreadTranslator {
+    cache: cache::TranslationCache,
+}
+
+impl ThreadTranslator {
+    pub(super) fn new(capacity: usize) -> Result<Self, types::DsrError> {
+        Ok(Self {
+            cache: cache::TranslationCache::new(capacity)?,
+        })
+    }
+
+    pub(super) fn enter_once(
+        &mut self,
+        memory: &super::NativeMappedMemory,
+        snapshot: &mut super::NativeUcontextSnapshot,
+    ) -> Result<ThreadExit, types::DsrError> {
+        let block = block::plan_block(
+            memory,
+            carrick_guest_mem::GuestVa(snapshot.pc),
+            types::CodeGeneration::INITIAL,
+            256,
+        )?;
+        let mut exit = match block.exit {
+            block::PlannedExit::Syscall { resume, .. } => types::NativeDsrExit::Syscall { resume },
+            _ => types::NativeDsrExit::Unsupported {
+                guest_pc: carrick_guest_mem::GuestVa(snapshot.pc),
+                word: 0,
+                op: bad64::Op::UDF,
+            },
+        };
+        let emitted = emit::emit_block(&mut self.cache, &block)?;
+        gateway::enter_translated(emitted.entry(), snapshot, &mut exit)?;
+        Ok(match exit {
+            types::NativeDsrExit::Syscall { resume } => ThreadExit::Syscall { resume },
+            other => ThreadExit::Unsupported(format!("{other:?}")),
+        })
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -41,6 +89,29 @@ mod tests {
             classify(0xd65f_03c0, PC),
             Ok(InstAction::Indirect(exit)) if exit.kind == IndirectKind::Return
         ));
+    }
+
+    #[test]
+    fn copy_subset_rejects_virtualized_x18_operands() {
+        for word in [
+            0xd280_0032, // mov x18, #1
+            0xf940_0240, // ldr x0, [x18]
+        ] {
+            assert!(super::decode::decoded_operands_mention_x18(word, PC));
+            assert!(matches!(
+                classify(word, PC),
+                Ok(InstAction::VirtualizedX18 { word: observed, .. }) if observed == word
+            ));
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn copy_subset_never_contains_virtualized_x18(word in any::<u32>()) {
+            if matches!(classify(word, PC), Ok(InstAction::Copy(_))) {
+                prop_assert!(!super::decode::decoded_operands_mention_x18(word, PC));
+            }
+        }
     }
 
     #[test]
@@ -221,9 +292,15 @@ mod tests {
         }
         let mut status = 0;
         assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        let fatal_handler_exit = libc::WIFEXITED(status)
+            && matches!(
+                libc::WEXITSTATUS(status),
+                value if value == 128 + libc::SIGBUS || value == 128 + libc::SIGSEGV
+            );
         assert!(
-            libc::WIFSIGNALED(status)
-                && matches!(libc::WTERMSIG(status), libc::SIGBUS | libc::SIGSEGV),
+            fatal_handler_exit
+                || (libc::WIFSIGNALED(status)
+                    && matches!(libc::WTERMSIG(status), libc::SIGBUS | libc::SIGSEGV)),
             "child unexpectedly survived W/X violation: status=0x{status:x}"
         );
     }

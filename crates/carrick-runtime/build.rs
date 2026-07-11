@@ -28,6 +28,7 @@ fn main() {
         println!("cargo:rerun-if-changed=csrc/native_darwin.c");
         cc::Build::new()
             .file("csrc/native_darwin.c")
+            .file("src/native_darwin/dsr/gateway_aarch64.S")
             .warnings(true)
             .compile("carrick_native_darwin");
     }

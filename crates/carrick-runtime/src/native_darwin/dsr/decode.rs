@@ -83,6 +83,42 @@ fn malformed(pc: GuestVa, word: u32, op: Op) -> DsrError {
     }
 }
 
+fn register_is_x18(register: Reg) -> bool {
+    matches!(register, Reg::X18 | Reg::W18)
+}
+
+fn operand_mentions_x18(operand: &Operand) -> bool {
+    match operand {
+        Operand::ShiftReg { reg, .. }
+        | Operand::QualReg { reg, .. }
+        | Operand::Reg { reg, .. }
+        | Operand::MemReg(reg)
+        | Operand::MemOffset { reg, .. }
+        | Operand::MemPreIdx { reg, .. }
+        | Operand::MemPostIdxImm { reg, .. }
+        | Operand::AccumArray { reg, .. } => register_is_x18(*reg),
+        Operand::MultiReg { regs, .. } => regs.iter().flatten().copied().any(register_is_x18),
+        Operand::MemPostIdxReg(regs)
+        | Operand::MemExt { regs, .. }
+        | Operand::IndexedElement { regs, .. } => regs.iter().copied().any(register_is_x18),
+        Operand::SmeTile { reg, .. } => reg.is_some_and(register_is_x18),
+        Operand::Imm32 { .. }
+        | Operand::Imm64 { .. }
+        | Operand::FImm32(_)
+        | Operand::SysReg(_)
+        | Operand::Label(_)
+        | Operand::ImplSpec { .. }
+        | Operand::Cond(_)
+        | Operand::Name(_)
+        | Operand::StrImm { .. } => false,
+    }
+}
+
+pub(super) fn decoded_operands_mention_x18(word: u32, pc: GuestVa) -> bool {
+    bad64::decode(word, pc.raw())
+        .is_ok_and(|instruction| instruction.operands().iter().any(operand_mentions_x18))
+}
+
 fn direct(
     pc: GuestVa,
     word: u32,
@@ -236,6 +272,9 @@ pub(super) fn classify(word: u32, pc: GuestVa) -> Result<InstAction, DsrError> {
             sensitive(pc, SensitiveKind::IcIvau, first_reg(operands))
         }
         Op::DC | Op::IC | Op::HVC | Op::SMC | Op::ERET => Ok(InstAction::Unsupported { word, op }),
+        _ if operands.iter().any(operand_mentions_x18) => {
+            Ok(InstAction::VirtualizedX18 { word, op })
+        }
         _ => Ok(InstAction::Copy(word)),
     }
 }

@@ -126,6 +126,7 @@ pub(super) struct SensitiveExit {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum InstAction {
     Copy(u32),
+    VirtualizedX18 { word: u32, op: bad64::Op },
     PcRelative(PcRelativeInst),
     Direct(DirectExit),
     Indirect(IndirectExit),
@@ -165,7 +166,7 @@ pub(super) enum NativeDsrExit {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(super) enum DsrError {
+pub(in crate::native_darwin) enum DsrError {
     #[error("DSR PC overflow at guest PC 0x{pc:x}")]
     PcOverflow { pc: u64 },
     #[error("DSR could not decode 0x{word:08x} at guest PC 0x{pc:x}: {detail}")]
@@ -189,6 +190,8 @@ pub(super) enum DsrError {
     },
     #[error("DSR assembler failed: {0}")]
     Assembler(String),
+    #[error("DSR gateway failed: {0}")]
+    Gateway(String),
     #[error("DSR cache policy error: {0}")]
     CachePolicy(String),
     #[error("DSR host operation {operation} failed: {error}")]

@@ -38,9 +38,18 @@ probe, conformance, and Docker-oracle infrastructure.
   selected `dynasmrt` version, with decode-back tests for every emitted word.
 - Use the existing `libc` crate for Darwin APIs. Do not add ad-hoc C ABI
   declarations when `libc` exposes the symbol.
-- Keep the stable context gateway small and auditable. It must preserve all
-  guest-visible GPRs, SP, NZCV, FP/SIMD registers, FPSR, FPCR, guest TLS state,
-  and the original guest PC before entering Rust.
+- Keep the stable context gateway small and auditable. Translated code reserves
+  physical `x18` as a per-thread `DsrContext` pointer; the guest's architectural
+  `x18` value is virtualized in that context. The gateway must preserve all
+  guest-visible GPRs (including virtualized `x18`), SP, NZCV, FP/SIMD registers,
+  FPSR, FPCR, guest TLS state, and the original guest PC before entering Rust.
+  A copy-only block must reject any instruction whose decoded operands mention
+  `x18`; such instructions require an explicit lowering before they can enter
+  the fast path.
+- The syscall gateway must be exception-free and must not read or write below
+  guest SP. A `brk`/signal/ucontext exit is useful only as a diagnostic oracle;
+  it is not an acceptable DSR implementation because it retains the trap cost
+  this work is intended to remove.
 - Unsupported instructions and transitions fail with a typed diagnostic that
   includes the guest PC, raw instruction word, decoded operation, cache
   generation, and block start. Never fall through to original guest code.
@@ -527,9 +536,6 @@ plan.
 - Modify: `crates/carrick-runtime/build.rs`
 - Modify: `crates/carrick-runtime/src/native_darwin/dsr/emit.rs`
 - Modify: `crates/carrick-runtime/src/native_darwin.rs`
-- Modify: `crates/carrick-cli/tests/conformance.rs`
-- Modify: `conformance-probes/src/bin/syscallregpreserve.rs`
-- Modify: `crates/carrick-cli/tests/probe-oracle/arm64-musl/syscallregpreserve`
 
 **Interfaces:**
 
@@ -547,14 +553,24 @@ plan.
 
 - Constraint: Rust code always runs on the saved host stack with host TLS/x18
   state; translated guest code always runs on the guest stack with guest state.
+- Constraint: translated code keeps physical `x18` equal to the current
+  `DsrContext`. Guest `x18` lives in the context and is never silently exposed
+  as the physical register.
+- Stop condition: do not proceed to Tasks 6-11 unless a straight-line syscall
+  round trip completes without SIGTRAP/SIGSEGV/SIGBUS and an optimized
+  same-revision 30-sample gateway-floor comparison beats the existing `brk`
+  round trip at the p50. Task 7 repeats the comparison through the signed CLI
+  once enough control flow exists to run the shipped probe. These are
+  feasibility gates, not promised final workload speedups.
 
-- [ ] **Step 1: Write a red full-state oracle test**
+- [ ] **Step 1: Write red full-state and reserved-register oracle tests**
 
   Seed x0..x30, SP, NZCV, v0..v31, FPSR, and FPCR with distinct values. Execute
   a translated straight-line block that changes only an enumerated subset and
   exits. Compare the resulting state with the same instruction sequence run
   directly in a fork-isolated native function. Include x16, x17, x18, and LR
-  explicitly.
+  explicitly. Add decode-table and generated tests proving no instruction whose
+  operands mention `x18` can remain `InstAction::Copy`.
 
 - [ ] **Step 2: Verify red**
 
@@ -566,13 +582,18 @@ plan.
 
   Expected: compilation fails because the gateway does not exist.
 
-- [ ] **Step 3: Implement the audited gateway**
+- [ ] **Step 3: Implement the audited exception-free gateway**
 
-  The assembly entry saves complete guest state before using a scratch register,
-  switches to the recorded host SP and host TLS/x18 ABI, writes a
-  `NativeDsrExit`, and returns to Rust. Resume performs the inverse transition.
-  Add compile-time offset assertions shared with the existing C ucontext layout.
-  Do not call Rust directly on the guest stack.
+  `DsrContext` owns the complete guest snapshot plus the saved host stack and
+  callee-saved state. Assembly entry loads all physical guest registers except
+  x18, installs `DsrContext *` in physical x18, and uses x17 only after saving
+  the guest's x17 in the context. Every emitted entry restores guest x17 through
+  x18 before its first guest instruction. Exit stubs save guest x17 through x18,
+  branch via x17, save the remaining state, restore the host stack and host x18
+  ABI, write a `NativeDsrExit`, and only then return to Rust. Resume performs the
+  inverse transition. Add compile-time offset assertions shared with the
+  existing C ucontext layout. Do not call Rust directly on the guest stack and
+  do not use guest stack memory as gateway scratch.
 
 - [ ] **Step 4: Route translated `svc #0` through the existing dispatcher**
 
@@ -582,11 +603,15 @@ plan.
   snapshot. Add a DSR-only integration test executing raw `getpid`, writing the
   result, and exiting.
 
-- [ ] **Step 5: Red-first the shipped register-preservation probe**
+- [ ] **Step 5: Run the preliminary performance feasibility gate**
 
-  Before enabling the complete save set, run `syscallregpreserve` under DSR and
-  record the expected mismatch. Restore the complete gateway and require exact
-  Docker-oracle output. Add NZCV and FP/SIMD preservation cases to the probe.
+  Compare the exception-free gateway with the existing `brk`/signal transport
+  in one optimized test binary. Use 30 batches with equal transition counts,
+  report both p50 values and their ratio, and fail unless DSR is faster. This
+  isolates the boundary mechanism; it is not an end-to-end syscall or workload
+  claim. Current same-revision proof (2026-07-11, Apple Silicon): 30 batches of
+  200 transitions measured DSR p50 31.2 ns versus `brk` p50 2207.9 ns, ratio
+  0.014. Re-run rather than treating this number as permanent.
 
 - [ ] **Step 6: Verify and commit**
 
@@ -594,14 +619,14 @@ plan.
 
   ```bash
   cargo test -p carrick-runtime dsr_gateway --lib
-  just build
-  target/release/carrick run-elf --exec-backend native \
-    --native-page-profile native16k --native-code-mode dsr \
-    conformance-probes/target/native-pie/aarch64-unknown-linux-musl/release/syscallregpreserve
+  cargo test --release -p carrick-runtime \
+    dsr_gateway_perf_feasibility_30_samples --lib -- --ignored --nocapture
   ```
 
-  Expected: unit oracle state matches and the probe output is byte-identical to
-  `crates/carrick-cli/tests/probe-oracle/arm64-musl/syscallregpreserve`.
+  Expected: full-state and straight-line dispatcher oracles match, no transport
+  signal is involved in DSR entry/exit, and the 30-sample gateway floor clears
+  the Task 5 p50 feasibility gate. If it does not, stop and retain Tasks 1-4 as
+  the bounded experiment rather than continuing on hoped-for gains.
 
   Commit: `feat(native): dispatch syscalls through the DSR gateway`
 
@@ -675,6 +700,9 @@ plan.
 - Modify: `crates/carrick-runtime/src/native_darwin/dsr/emit.rs`
 - Modify: `crates/carrick-runtime/src/native_darwin/dsr/cache.rs`
 - Modify: `crates/carrick-runtime/src/native_darwin/dsr/gateway.rs`
+- Modify: `crates/carrick-cli/tests/conformance.rs`
+- Modify: `conformance-probes/src/bin/syscallregpreserve.rs`
+- Modify: `crates/carrick-cli/tests/probe-oracle/arm64-musl/syscallregpreserve`
 
 **Interfaces:**
 
@@ -710,11 +738,21 @@ plan.
 
 - [ ] **Step 4: Verify and commit**
 
+  Before the commit, extend `syscallregpreserve` with x18, NZCV, and FP/SIMD
+  preservation cases. Record its expected mismatch before the complete save set
+  is enabled, then require byte-identical Docker-oracle output under DSR. Run a
+  30-sample signed-CLI `perf_trap_floor` comparison against native `brk`; stop if
+  the end-to-end p50 no longer shows a performance win.
+
   Run:
 
   ```bash
   cargo test -p carrick-runtime dsr_direct_flow --lib
   cargo test -p carrick-runtime dsr_oracle --lib
+  just build
+  target/release/carrick run-elf --exec-backend native \
+    --native-page-profile native16k --native-code-mode dsr \
+    conformance-probes/target/native-pie/aarch64-unknown-linux-musl/release/syscallregpreserve
   ```
 
   Expected: all direct-flow tests match direct execution before and after

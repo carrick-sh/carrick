@@ -538,11 +538,6 @@ where
     A: IntoIterator<Item = String>,
     E: IntoIterator<Item = String>,
 {
-    if plan.native_code_mode == carrick_spec::NativeCodeModeRequest::Dsr {
-        return Err(RuntimeError::Unsupported(
-            "native DSR selected, but translated execution is not implemented yet".to_string(),
-        ));
-    }
     let Some(geometry) = plan.page_geometry.native_geometry() else {
         return Err(RuntimeError::Unsupported(
             "native Darwin run-elf selected without native page geometry".to_string(),
@@ -603,11 +598,6 @@ where
     A: IntoIterator<Item = String>,
     E: IntoIterator<Item = String>,
 {
-    if plan.native_code_mode == carrick_spec::NativeCodeModeRequest::Dsr {
-        return Err(RuntimeError::Unsupported(
-            "native DSR selected, but translated execution is not implemented yet".to_string(),
-        ));
-    }
     let Some(geometry) = plan.page_geometry.native_geometry() else {
         return Err(RuntimeError::Unsupported(
             "native Darwin container launch selected without native page geometry".to_string(),
@@ -931,11 +921,12 @@ fn run_image_in_current_process(
         RuntimeError::Unsupported("native Darwin image has no initial stack".to_string())
     })?;
     let entry = image.entry();
-    let memory = Arc::new(parking_lot::Mutex::new(NativeMappedMemory::map(
+    let memory = Arc::new(parking_lot::Mutex::new(NativeMappedMemory::map_for_plan(
         &image,
         native_memory_layout(),
         plan.page_geometry.host_page_size,
         plan.page_geometry.linux_page_size,
+        plan,
     )?));
     {
         let mut memory = memory.lock();
@@ -1122,6 +1113,16 @@ fn run_native_thread_loop(
     thread_runtime: &mut NativeThreadRuntime,
     start: NativeThreadStart,
 ) -> Result<NativeThreadLoopOutcome, RuntimeError> {
+    if plan.native_code_mode == carrick_spec::NativeCodeModeRequest::Dsr {
+        return run_native_dsr_thread_loop(
+            dispatcher,
+            memory,
+            reporter,
+            max_traps,
+            thread_runtime,
+            start,
+        );
+    }
     let trace_syscalls = std::env::var_os("CARRICK_NATIVE_TRACE_SYSCALLS").is_some();
     let mut guest_tpidr_el0 = match &start {
         NativeThreadStart::Initial { .. } => 0,
@@ -1692,6 +1693,101 @@ fn run_native_thread_loop(
                         )));
                     }
                 }
+            }
+        }
+    }
+}
+
+fn run_native_dsr_thread_loop(
+    dispatcher: Arc<SyscallDispatcher>,
+    memory: SharedNativeMemory,
+    reporter: Arc<CompatReporter>,
+    max_traps: usize,
+    thread_runtime: &mut NativeThreadRuntime,
+    start: NativeThreadStart,
+) -> Result<NativeThreadLoopOutcome, RuntimeError> {
+    let mut snapshot = match start {
+        NativeThreadStart::Initial { entry, initial_sp } => NativeUcontextSnapshot {
+            sp: initial_sp,
+            pc: entry,
+            ..NativeUcontextSnapshot::default()
+        },
+        NativeThreadStart::Detached { context, .. } => *context,
+    };
+    let mut translator = dsr::ThreadTranslator::new(64 * 1024 * 1024)
+        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+    let mut traps = 0_usize;
+
+    loop {
+        traps = traps.saturating_add(1);
+        if traps > max_traps {
+            return Err(RuntimeError::TrapLimitExceeded { max_traps });
+        }
+        let exit = {
+            let memory = memory.lock();
+            translator
+                .enter_once(&memory, &mut snapshot)
+                .map_err(|error| RuntimeError::Unsupported(error.to_string()))?
+        };
+        let resume = match exit {
+            dsr::ThreadExit::Syscall { resume } => resume,
+            dsr::ThreadExit::Unsupported(detail) => {
+                return Err(RuntimeError::Unsupported(format!(
+                    "native DSR produced unsupported exit {detail}"
+                )));
+            }
+        };
+
+        let request = SyscallRequest::new(
+            snapshot.x[8],
+            SyscallArgs([
+                snapshot.x[0],
+                snapshot.x[1],
+                snapshot.x[2],
+                snapshot.x[3],
+                snapshot.x[4],
+                snapshot.x[5],
+            ]),
+        )
+        .with_current_guest_sp(Some(snapshot.sp));
+        let outcome = dispatch_native_syscall(
+            &dispatcher,
+            request,
+            &memory,
+            thread_runtime,
+            &reporter,
+            false,
+        )?;
+        match outcome {
+            DispatchOutcome::Returned { value } => {
+                snapshot.x[0] = value as u64;
+                snapshot.pc = resume.raw();
+            }
+            DispatchOutcome::Errno { errno } => {
+                snapshot.x[0] = errno.guest_retval() as u64;
+                snapshot.pc = resume.raw();
+            }
+            DispatchOutcome::Exit { code } => {
+                if NATIVE_FORKED_GUEST_CHILD.load(std::sync::atomic::Ordering::Acquire) {
+                    dispatcher.cleanup_sysv_ipc_on_process_exit();
+                    crate::exec_helpers::forked_child_exit(
+                        code,
+                        dispatcher.stdout(),
+                        dispatcher.stderr(),
+                    );
+                }
+                return Ok(NativeThreadLoopOutcome::ProcessExit(code));
+            }
+            DispatchOutcome::ThreadExit { code } => {
+                if thread_runtime.finish_thread(&dispatcher, &memory) {
+                    return Ok(NativeThreadLoopOutcome::ProcessExit(code));
+                }
+                return Ok(NativeThreadLoopOutcome::ThreadDone);
+            }
+            other => {
+                return Err(RuntimeError::Unsupported(format!(
+                    "native DSR Task 5 does not yet support dispatcher outcome {other:?}"
+                )));
             }
         }
     }
@@ -5281,6 +5377,7 @@ struct NativeMappedMemory {
     exclusive_reservation: Option<NativeExclusiveReservation>,
     host_page_size: u64,
     linux_page_size: u64,
+    native_code_mode: carrick_spec::NativeCodeModeRequest,
 }
 
 #[derive(Clone, Copy)]
@@ -5325,11 +5422,44 @@ fn native_region_linux_prot(read: bool, write: bool, exec: bool) -> u64 {
 }
 
 impl NativeMappedMemory {
+    #[cfg(test)]
     fn map(
         image: &AddressSpace,
         layout: MemoryLayout,
         host_page_size: u64,
         linux_page_size: u64,
+    ) -> Result<Self, RuntimeError> {
+        Self::map_with_code_mode(
+            image,
+            layout,
+            host_page_size,
+            linux_page_size,
+            carrick_spec::NativeCodeModeRequest::Brk,
+        )
+    }
+
+    fn map_for_plan(
+        image: &AddressSpace,
+        layout: MemoryLayout,
+        host_page_size: u64,
+        linux_page_size: u64,
+        plan: &ExecutionPlan,
+    ) -> Result<Self, RuntimeError> {
+        Self::map_with_code_mode(
+            image,
+            layout,
+            host_page_size,
+            linux_page_size,
+            plan.native_code_mode,
+        )
+    }
+
+    fn map_with_code_mode(
+        image: &AddressSpace,
+        layout: MemoryLayout,
+        host_page_size: u64,
+        linux_page_size: u64,
+        native_code_mode: carrick_spec::NativeCodeModeRequest,
     ) -> Result<Self, RuntimeError> {
         if let Some(region) = image
             .regions()
@@ -5343,7 +5473,10 @@ impl NativeMappedMemory {
         }
         let mut regions = Vec::new();
         for region in image.regions() {
-            map_region(region)?;
+            map_region(
+                region,
+                native_code_mode == carrick_spec::NativeCodeModeRequest::Brk,
+            )?;
             if region.start == NATIVE_DARWIN_VDSO_BASE && region.perms.execute {
                 relocate_vdso_vvar_loads(region)?;
             }
@@ -5368,6 +5501,7 @@ impl NativeMappedMemory {
             &carrick_mem::memory::sigreturn_trampoline_bytes(),
             libc::PROT_READ | libc::PROT_EXEC,
             true,
+            native_code_mode == carrick_spec::NativeCodeModeRequest::Brk,
         )?;
         regions.push(NativeMappedRegion {
             start: NATIVE_DARWIN_SIGRETURN_TRAMPOLINE_BASE,
@@ -5464,6 +5598,7 @@ impl NativeMappedMemory {
             exclusive_reservation: None,
             host_page_size,
             linux_page_size,
+            native_code_mode,
         };
         // Publishing the vvar contents is part of establishing the address
         // space: the initial boot maps here, and an execve replacement re-maps
@@ -5641,11 +5776,12 @@ impl NativeMappedMemory {
                 )));
             }
         }
-        let mut replacement = Self::map(
+        let mut replacement = Self::map_for_plan(
             image,
             native_memory_layout(),
             plan.page_geometry.host_page_size,
             plan.page_geometry.linux_page_size,
+            plan,
         )?;
         apply_native_relative_relocations(&mut replacement, relative_relocations)?;
         *self = replacement;
@@ -5780,7 +5916,9 @@ impl NativeMappedMemory {
             address: operation_address,
             length: operation_len,
         })? as *mut u8;
-        patch_syscalls(ptr, page_len);
+        if self.native_code_mode == carrick_spec::NativeCodeModeRequest::Brk {
+            patch_syscalls(ptr, page_len);
+        }
         unsafe { carrick_native_clear_icache(ptr.cast(), page_len) };
         let prot = self
             .native_page_protections
@@ -6978,7 +7116,7 @@ fn native16k_host_prot(prot: u64) -> libc::c_int {
     host_prot
 }
 
-fn map_region(region: &MemoryRegion) -> Result<(), RuntimeError> {
+fn map_region(region: &MemoryRegion, rewrite_guest_code: bool) -> Result<(), RuntimeError> {
     let length_u64 = region.end.checked_sub(region.start).ok_or_else(|| {
         RuntimeError::Unsupported("native Darwin empty inverted region".to_string())
     })?;
@@ -7031,8 +7169,10 @@ fn map_region(region: &MemoryRegion) -> Result<(), RuntimeError> {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), mapped.cast::<u8>(), bytes.len());
         }
     }
-    if region.perms.execute {
+    if region.perms.execute && rewrite_guest_code {
         patch_syscalls(mapped.cast::<u8>(), bytes.len());
+    }
+    if region.perms.execute {
         unsafe { carrick_native_clear_icache(mapped, bytes.len()) };
     }
 
@@ -7053,6 +7193,7 @@ fn map_bytes_region(
     bytes: &[u8],
     final_prot: libc::c_int,
     executable: bool,
+    rewrite_guest_code: bool,
 ) -> Result<(), RuntimeError> {
     let length = usize::try_from(length_u64).map_err(|_| {
         RuntimeError::Unsupported(format!(
@@ -7098,8 +7239,10 @@ fn map_bytes_region(
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), mapped.cast::<u8>(), bytes.len());
         }
     }
-    if executable {
+    if executable && rewrite_guest_code {
         patch_syscalls(mapped.cast::<u8>(), bytes.len());
+    }
+    if executable {
         unsafe { carrick_native_clear_icache(mapped, bytes.len()) };
     }
     let protect = unsafe { libc::mprotect(mapped, length, final_prot) };
@@ -7372,6 +7515,91 @@ mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
 
+    fn write_u16(bytes: &mut [u8], offset: usize, value: u16) {
+        bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn write_u32(bytes: &mut [u8], offset: usize, value: u32) {
+        bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn write_u64(bytes: &mut [u8], offset: usize, value: u64) {
+        bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn dsr_straight_line_syscall_elf() -> Vec<u8> {
+        const CODE_OFFSET: usize = 0x1000;
+        let words = [
+            0xd280_1588, // mov x8, #172 (getpid)
+            SVC_0,
+            0xd100_43e1, // sub x1, sp, #16
+            0xf900_0020, // str x0, [x1]
+            0xd280_0020, // mov x0, #1
+            0xd280_0102, // mov x2, #8
+            0xd280_0808, // mov x8, #64 (write)
+            SVC_0,
+            0xd280_0000, // mov x0, #0
+            0xd280_0ba8, // mov x8, #93 (exit)
+            SVC_0,
+        ];
+        let code_len = words.len() * std::mem::size_of::<u32>();
+        let mut elf = vec![0_u8; CODE_OFFSET + code_len];
+        elf[..16].copy_from_slice(&[0x7f, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        write_u16(&mut elf, 16, 3); // ET_DYN
+        write_u16(&mut elf, 18, 183); // EM_AARCH64
+        write_u32(&mut elf, 20, 1);
+        write_u64(&mut elf, 24, 0); // entry, relocated to native PIE base
+        write_u64(&mut elf, 32, 64); // program-header offset
+        write_u16(&mut elf, 52, 64);
+        write_u16(&mut elf, 54, 56);
+        write_u16(&mut elf, 56, 1);
+        write_u32(&mut elf, 64, 1); // PT_LOAD
+        write_u32(&mut elf, 68, 5); // PF_R | PF_X
+        write_u64(&mut elf, 72, CODE_OFFSET as u64);
+        write_u64(&mut elf, 80, 0);
+        write_u64(&mut elf, 88, 0);
+        write_u64(&mut elf, 96, code_len as u64);
+        write_u64(&mut elf, 104, code_len as u64);
+        write_u64(&mut elf, 112, 0x1000);
+        for (index, word) in words.into_iter().enumerate() {
+            write_u32(&mut elf, CODE_OFFSET + index * 4, word);
+        }
+        elf
+    }
+
+    #[test]
+    fn dsr_gateway_dispatches_straight_line_getpid_write_and_exit() {
+        let mut file = tempfile::NamedTempFile::new().expect("create DSR ELF fixture");
+        std::io::Write::write_all(&mut file, &dsr_straight_line_syscall_elf())
+            .expect("write DSR ELF fixture");
+        let plan = ExecutionPlan {
+            backend: crate::page_profile::ExecutionBackend::NativeDarwin,
+            page_geometry: crate::page_profile::PageGeometry {
+                host_page_size: 16 * 1024,
+                linux_page_size: 16 * 1024,
+                native_profile: Some(carrick_spec::NativePageProfile::Native16k),
+            },
+            native_code_mode: carrick_spec::NativeCodeModeRequest::Dsr,
+            diagnostics: Vec::new(),
+        };
+        let dispatcher = SyscallDispatcher::new();
+        dispatcher.set_stream_stdio(true);
+        let result = run_static_elf(
+            file.path(),
+            dispatcher,
+            ["dsr-syscall".to_string()],
+            std::iter::empty::<String>(),
+            16,
+            None,
+            &plan,
+        )
+        .expect("run straight-line DSR syscall ELF");
+        assert_eq!(result.exit_code, 0, "stderr={:?}", result.stderr);
+        assert_eq!(result.stdout.len(), 8, "stderr={:?}", result.stderr);
+        let pid = u64::from_le_bytes(result.stdout.try_into().expect("eight-byte pid output"));
+        assert!(pid > 0);
+    }
+
     #[test]
     fn native_fd_wait_deadline_survives_wait_variant_changes() {
         let now = Instant::now();
@@ -7470,6 +7698,7 @@ mod tests {
             exclusive_reservation: None,
             host_page_size: 16 * 1024,
             linux_page_size: 16 * 1024,
+            native_code_mode: carrick_spec::NativeCodeModeRequest::Brk,
         };
         NativeSignalTrap::new(&mut memory, restored, None).commit();
 
@@ -7507,6 +7736,7 @@ mod tests {
             exclusive_reservation: None,
             host_page_size: 16 * 1024,
             linux_page_size: 16 * 1024,
+            native_code_mode: carrick_spec::NativeCodeModeRequest::Brk,
         };
         let mut interrupted = NativeUcontextSnapshot {
             sp: stack_end,
@@ -7634,6 +7864,7 @@ mod tests {
             exclusive_reservation: None,
             host_page_size: 16 * 1024,
             linux_page_size: 16 * 1024,
+            native_code_mode: carrick_spec::NativeCodeModeRequest::Brk,
         };
         let interrupted = NativeUcontextSnapshot {
             sp: stack_end,
