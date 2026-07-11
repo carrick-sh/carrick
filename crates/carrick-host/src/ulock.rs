@@ -60,6 +60,15 @@ mod imp {
         requeue_to_value: AtomicU32,
         logical_requeued: AtomicU32,
         logical_wake: AtomicU32,
+        /// Physical wakes whose `count` decrement the WAKER already performed
+        /// (`note_physical_wakes`): the woken waiter settles one credit on
+        /// exit instead of decrementing `count` again. Keeps `count`
+        /// synchronous with the kernel queue — Linux's FUTEX_WAKE return
+        /// value counts dequeues AT WAKE TIME, while a woken-but-not-yet-
+        /// rescheduled waiter's own bookkeeping lags by its reschedule
+        /// latency (unbounded under load; probe futexforkrequeue counted 431
+        /// "waiters" on a queue holding 200).
+        wake_credits: AtomicU32,
     }
 
     #[link(name = "System")]
@@ -212,9 +221,43 @@ mod imp {
         }
     }
 
+    /// An exiting waiter settles ONE accounting unit: the credit its waker
+    /// pre-paid (`note_physical_wakes`) when present, else its own `count`
+    /// entry (timeout / EINTR / value-mismatch exits, where no waker was
+    /// involved). A racing waiter that self-decremented before its waker's
+    /// transfer landed leaves `count` transiently low plus one stale credit,
+    /// which the NEXT exit consumes — bounded and self-repairing, unlike the
+    /// unbounded reschedule-latency lag of pure self-accounting.
+    fn settle_waiter_exit(slot: &WaiterSlot) {
+        if !consume_one(&slot.wake_credits) {
+            let _ = consume_one(&slot.count);
+        }
+    }
+
+    /// Transfer `n` dequeued waiters' accounting to the WAKER: decrement
+    /// `count` now — Linux dequeues under the futex bucket lock at wake time,
+    /// so its FUTEX_WAKE return value never re-counts an already-woken waiter
+    /// — and leave `n` credits for the woken waiters' [`settle_waiter_exit`].
+    /// The claim is LOGICAL: `count` is the queue Linux would dequeue from,
+    /// and the os_sync wakes issued afterwards are best-effort hints (a
+    /// waiter between its ≤20 ms wait slices is physically missed but still
+    /// logically dequeued; it returns through its slice loop and settles the
+    /// credit). Count-first/credit-second ordering: the failure mode of the
+    /// opposite order is a permanently-high `count` (a racing waiter consumes
+    /// the credit AND the waker still decrements), while this order's worst
+    /// transient self-repairs on the next exit.
+    fn note_logical_dequeues(slot: &WaiterSlot, n: u32) {
+        for _ in 0..n {
+            let _ = consume_one(&slot.count);
+        }
+        if n > 0 {
+            slot.wake_credits.fetch_add(n, Ordering::AcqRel);
+        }
+    }
+
     pub fn waiter_exit(host_addr: usize) {
         if let Some(slot) = waiter_slot(host_addr) {
-            let _ = consume_one(&slot.count);
+            settle_waiter_exit(slot);
         }
     }
 
@@ -240,7 +283,7 @@ mod imp {
             return false;
         };
         if consume_one(&slot.logical_wake) {
-            let _ = consume_one(&slot.count);
+            settle_waiter_exit(slot);
             let _ = consume_one(&slot.logical_requeued);
             return true;
         }
@@ -252,7 +295,7 @@ mod imp {
             return true;
         };
         let had_credit = consume_one(&slot.logical_wake);
-        let _ = consume_one(&slot.count);
+        settle_waiter_exit(slot);
         if had_credit {
             let _ = consume_one(&slot.logical_requeued);
             true
@@ -324,58 +367,52 @@ mod imp {
             return 0;
         }
         let physical_target = parked.min(target);
-        let physical_woke = if physical_target == 0 {
-            0
-        } else if physical_target == 1 {
-            if wake(host_addr, false) >= 0 { 1 } else { 0 }
-        } else if physical_target >= parked {
-            if wake(host_addr, true) >= 0 {
-                physical_target
-            } else {
-                0
-            }
+        // Logical dequeue FIRST (claim-then-wake: a woken waiter must always
+        // find its credit already reserved), then best-effort os_sync hints.
+        note_logical_dequeues(slot, physical_target);
+        issue_physical_wakes(host_addr, physical_target, parked);
+        let logical_woke = target.min(logical);
+        reserve_logical_wakes(waiter_key, logical_woke);
+        i64::from(physical_target.max(logical_woke))
+    }
+
+    /// Best-effort os_sync wake hints for up to `target` of `parked` waiters.
+    /// Return codes are deliberately NOT fed back into the count: a waiter
+    /// between its ≤20 ms wait slices yields ENOENT here yet is still
+    /// logically dequeued (see `note_logical_dequeues`), returning through
+    /// its slice loop.
+    fn issue_physical_wakes(host_addr: usize, target: u32, parked: u32) {
+        if target == 0 {
+            return;
+        }
+        if target == 1 {
+            let _ = wake(host_addr, false);
+        } else if target >= parked {
+            let _ = wake(host_addr, true);
         } else {
-            let mut woke = 0u32;
-            for _ in 0..physical_target {
+            for _ in 0..target {
                 if wake(host_addr, false) < 0 {
                     break;
                 }
-                woke += 1;
             }
-            woke
-        };
-        let logical_woke = target.min(logical);
-        reserve_logical_wakes(waiter_key, logical_woke);
-        i64::from(physical_woke.max(logical_woke))
+        }
     }
 
     fn wake_physical_counted(host_addr: usize, waiter_key: usize, n: u32) -> i64 {
         if n == 0 {
             return 0;
         }
-        let parked = waiter_count(waiter_key);
+        let Some(slot) = waiter_slot(waiter_key) else {
+            return 0;
+        };
+        let parked = slot.count.load(Ordering::Acquire);
         if parked == 0 {
             return 0;
         }
         let target = parked.min(n);
-        if target == 1 {
-            return if wake(host_addr, false) >= 0 { 1 } else { 0 };
-        }
-        if n >= parked {
-            return if wake(host_addr, true) >= 0 {
-                i64::from(target)
-            } else {
-                0
-            };
-        }
-        let mut woke = 0i64;
-        for _ in 0..target {
-            if wake(host_addr, false) < 0 {
-                break;
-            }
-            woke += 1;
-        }
-        woke
+        note_logical_dequeues(slot, target);
+        issue_physical_wakes(host_addr, target, parked);
+        i64::from(target)
     }
 
     pub fn requeue_counted(
@@ -536,5 +573,71 @@ mod tests {
             rc < 0,
             "wake with no waiters should report an error, got {rc}"
         );
+    }
+
+    /// Linux's FUTEX_WAKE return value counts waiters dequeued from the
+    /// KERNEL queue at wake time. carrick counts via the fork-shared side
+    /// table, which the WOKEN waiter used to decrement ITSELF on resume — so
+    /// a woken-but-not-yet-rescheduled waiter (descheduled under load) stayed
+    /// counted, and a subsequent wake re-counted it. Probe futexforkrequeue:
+    /// `wake_original_count=431` with exactly 200 waiters actually remaining
+    /// (the requeue's 800 physically-woken waiters lingering in word0's
+    /// count). The waker must transfer the decrement at physical-wake time,
+    /// leaving a credit the woken waiter settles instead of re-decrementing.
+    #[test]
+    fn wake_counted_excludes_woken_but_unexited_waiters() {
+        use super::{waiter_debug_counts, waiter_enter, waiter_exit, wake_counted};
+        use std::time::{Duration, Instant};
+        static WORD: AtomicU32 = AtomicU32::new(0);
+        let addr = &WORD as *const AtomicU32 as usize;
+        let mut joins = Vec::new();
+        for _ in 0..3 {
+            joins.push(std::thread::spawn(move || {
+                waiter_enter(addr);
+                let _ = wait(addr, 0, 15_000_000); // 15s cap; woken below
+                // A woken waiter that the scheduler has not run yet: its own
+                // bookkeeping (wait_end) lags the wake by the reschedule
+                // latency — the load-coupled window this test freezes open.
+                std::thread::sleep(Duration::from_secs(2));
+                waiter_exit(addr);
+            }));
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while waiter_debug_counts(addr).count < 3 {
+            assert!(Instant::now() < deadline, "waiters never registered");
+            std::thread::yield_now();
+        }
+        // Registration precedes the kernel park; retry (bounded) until two
+        // waiters have actually blocked in os_sync and been woken. Each
+        // successful wake happens strictly before the woken thread's
+        // waiter_exit (it sleeps 2s first), so the lag window stays open.
+        let mut woke_direct = 0i64;
+        while woke_direct < 2 {
+            assert!(Instant::now() < deadline, "never woke 2 waiters");
+            woke_direct += wake_counted(addr, addr, (2 - woke_direct) as u32).max(0);
+            if woke_direct < 2 {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        assert_eq!(woke_direct, 2);
+        // Exactly ONE waiter remains in the kernel queue; the two just-woken
+        // (still sleeping before their wait_end) must not be re-counted.
+        // Bounded retry only for the remaining waiter's own park latency — a
+        // single wake report must never exceed the 1 real waiter.
+        let mut woke_rest = 0i64;
+        while woke_rest == 0 {
+            assert!(Instant::now() < deadline, "never woke the last waiter");
+            woke_rest = wake_counted(addr, addr, u32::MAX).max(0);
+            if woke_rest == 0 {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        assert_eq!(
+            woke_rest, 1,
+            "woken-but-unexited waiters re-counted by a subsequent wake"
+        );
+        for j in joins {
+            j.join().expect("join waiter");
+        }
     }
 }
