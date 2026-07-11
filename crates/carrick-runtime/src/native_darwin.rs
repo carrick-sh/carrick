@@ -1006,6 +1006,33 @@ struct NativeCloneThreadRequest {
     clear_child_tid_addr: u64,
 }
 
+/// Outcome of [`NativeThreadRuntime::acquire_fork_token`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeForkTokenFlow {
+    Acquired,
+    /// An execve by ANOTHER thread is replacing the thread group; the caller
+    /// must retire this thread instead of proceeding.
+    RetireForExec,
+}
+
+/// How a fork request left `handle_native_fork`.
+enum NativeForkFlow {
+    /// The guest was resumed (parent, child, or an errno return).
+    Resumed,
+    /// The fork was abandoned because an execve by another thread is
+    /// replacing the thread group; the run loop must retire this thread.
+    RetireForExec,
+}
+
+/// How the pre-exec sibling teardown left `native_terminate_siblings_for_exec`.
+enum NativeExecTeardownFlow {
+    /// Siblings (if any) are gone; proceed with the image replacement.
+    Proceed,
+    /// ANOTHER thread's execve won the race; the caller must retire this
+    /// thread (its execve never happens — the whole group is being replaced).
+    RetireForExec,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_native_thread_loop(
     dispatcher: Arc<SyscallDispatcher>,
@@ -1050,6 +1077,20 @@ fn run_native_thread_loop(
         }
 
         let mut snapshot = snapshot_ucontext()?;
+        // Dispatch-boundary barrier — the native "run-loop top", where this
+        // thread holds NO locks. An execve replacement by another thread
+        // retires this thread (Linux: execve destroys every sibling; the
+        // normal thread-exit path is the HVF sibling exit shape); a fork
+        // quiesce parks it (kicker unregister → barrier → re-register) and
+        // then the snapshot is processed normally, so the kick-ack path stays
+        // intact.
+        if crate::fork_quiesce::exec_replacing_other_thread(thread_runtime.tid()) {
+            if thread_runtime.finish_thread(&dispatcher, &memory) {
+                return Ok(NativeThreadLoopOutcome::ProcessExit(0));
+            }
+            return Ok(NativeThreadLoopOutcome::ThreadDone);
+        }
+        thread_runtime.park_for_fork_quiesce();
         if snapshot.event_kind == NATIVE_EVENT_KICK {
             resume_guest_after_kick(&dispatcher, &memory, snapshot, thread_runtime.tid())?;
             continue;
@@ -1423,7 +1464,6 @@ fn run_native_thread_loop(
                             )?;
                             continue;
                         }
-                        thread_runtime.require_single_threaded("fork")?;
                         let request = NativeForkRequest {
                             pidfd_out,
                             clone_parent,
@@ -1433,17 +1473,24 @@ fn run_native_thread_loop(
                             child_stack,
                             vfork,
                         };
-                        handle_native_fork(
+                        match handle_native_fork(
                             &dispatcher,
                             &memory,
                             thread_runtime,
                             &mut vfork_completion,
                             request,
                             resume_pc,
-                        )?;
+                        )? {
+                            NativeForkFlow::Resumed => {}
+                            NativeForkFlow::RetireForExec => {
+                                if thread_runtime.finish_thread(&dispatcher, &memory) {
+                                    return Ok(NativeThreadLoopOutcome::ProcessExit(0));
+                                }
+                                return Ok(NativeThreadLoopOutcome::ThreadDone);
+                            }
+                        }
                     }
                     DispatchOutcome::Execve { path, argv, env } => {
-                        thread_runtime.require_single_threaded("execve")?;
                         let proc_argv: Vec<String> = argv
                             .iter()
                             .map(|value| String::from_utf8_lossy(value).into_owned())
@@ -1451,6 +1498,23 @@ fn run_native_thread_loop(
                         let proc_env = env.clone();
                         match load_native_execve_image(&dispatcher, &path, argv, env, &plan) {
                             Ok((image, relative_relocations, resolved)) => {
+                                // Point of no return: only AFTER the image
+                                // loaded successfully may the thread group be
+                                // destroyed (a failed execve leaves every
+                                // sibling running, per Linux).
+                                match native_terminate_siblings_for_exec(
+                                    &dispatcher,
+                                    &memory,
+                                    thread_runtime,
+                                )? {
+                                    NativeExecTeardownFlow::Proceed => {}
+                                    NativeExecTeardownFlow::RetireForExec => {
+                                        if thread_runtime.finish_thread(&dispatcher, &memory) {
+                                            return Ok(NativeThreadLoopOutcome::ProcessExit(0));
+                                        }
+                                        return Ok(NativeThreadLoopOutcome::ThreadDone);
+                                    }
+                                }
                                 let entry = image.entry();
                                 let initial_sp =
                                     image.initial_stack_pointer().ok_or_else(|| {
@@ -1773,6 +1837,45 @@ impl NativeThreadRuntime {
         }
     }
 
+    /// Park this thread at the process fork barrier while a sibling's fork
+    /// quiesce is in flight (the native analogue of HVF's
+    /// `release_and_park_vcpu_for_fork`). Order is the contract the forker's
+    /// drain depends on: UNREGISTER from the kicker first (the drain counts
+    /// registered threads down to 1 — the forker), park second, re-register
+    /// after release. The kick STATE stays bound (same host thread); only the
+    /// registry entry cycles. No-op when no quiesce is in flight.
+    fn park_for_fork_quiesce(&self) {
+        if !crate::fork_quiesce::is_quiescing() {
+            return;
+        }
+        self.kicker.unregister(self.tid);
+        crate::fork_quiesce::barrier().park_if_quiescing();
+        if let Some(state) = &self.kick_state {
+            self.kicker.register(
+                self.tid,
+                Box::new(NativeKickHandle::for_current_thread(Arc::clone(state))),
+            );
+        }
+    }
+
+    /// Acquire the process-wide fork token, parking at any in-flight fork's
+    /// barrier so its drain can count this thread (mirrors `handle_fork`'s
+    /// token loop). Also the fork↔exec mutual exclusion: the exec teardown
+    /// takes the same token, and a loser that observes an exec replacement by
+    /// ANOTHER thread abandons its syscall and retires (Linux: execve kills
+    /// every sibling; a concurrent fork/exec in a doomed thread never
+    /// completes).
+    fn acquire_fork_token(&self) -> NativeForkTokenFlow {
+        while !crate::fork_quiesce::barrier().try_begin_fork() {
+            if crate::fork_quiesce::exec_replacing_other_thread(self.tid) {
+                return NativeForkTokenFlow::RetireForExec;
+            }
+            self.park_for_fork_quiesce();
+            std::thread::yield_now();
+        }
+        NativeForkTokenFlow::Acquired
+    }
+
     fn signal_thread(&self, target: crate::thread::ThreadId, signum: i32) -> i64 {
         if !self.registry.is_live(target) {
             return crate::linux_abi::LINUX_ESRCH.guest_retval();
@@ -1942,16 +2045,6 @@ impl NativeThreadRuntime {
         crate::host_signal::forget_thread(self.tid.raw());
         dispatcher.forget_thread_signal_state(self.tid);
         last
-    }
-
-    fn require_single_threaded(&self, operation: &str) -> Result<(), RuntimeError> {
-        let live = self.registry.live_count();
-        if live == 1 {
-            return Ok(());
-        }
-        Err(RuntimeError::Unsupported(format!(
-            "native Darwin {operation} with {live} live guest threads is not yet supported"
-        )))
     }
 
     fn join_spawned_threads(&self) -> Result<(), RuntimeError> {
@@ -2301,7 +2394,18 @@ fn dispatch_native_syscall(
                     Ok(NativeWaitResult::TimedOut) => {
                         return Ok(DispatchOutcome::Returned { value: on_timeout });
                     }
-                    Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+                    Err(errno) => {
+                        if errno == crate::linux_abi::LINUX_EINTR
+                            && native_wait_park_if_quiesce_nudge(
+                                dispatcher,
+                                thread_runtime,
+                                sig_mask,
+                            )
+                        {
+                            continue;
+                        }
+                        return Ok(DispatchOutcome::Errno { errno });
+                    }
                 }
             }
             DispatchOutcome::WaitOnPollFds {
@@ -2320,7 +2424,18 @@ fn dispatch_native_syscall(
                     Ok(NativeWaitResult::TimedOut) => {
                         return Ok(DispatchOutcome::Returned { value: on_timeout });
                     }
-                    Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+                    Err(errno) => {
+                        if errno == crate::linux_abi::LINUX_EINTR
+                            && native_wait_park_if_quiesce_nudge(
+                                dispatcher,
+                                thread_runtime,
+                                sig_mask,
+                            )
+                        {
+                            continue;
+                        }
+                        return Ok(DispatchOutcome::Errno { errno });
+                    }
                 }
             }
             DispatchOutcome::WaitOnFdsSelect {
@@ -2347,7 +2462,18 @@ fn dispatch_native_syscall(
                         }
                         return Ok(DispatchOutcome::Returned { value: 0 });
                     }
-                    Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+                    Err(errno) => {
+                        if errno == crate::linux_abi::LINUX_EINTR
+                            && native_wait_park_if_quiesce_nudge(
+                                dispatcher,
+                                thread_runtime,
+                                sig_mask,
+                            )
+                        {
+                            continue;
+                        }
+                        return Ok(DispatchOutcome::Errno { errno });
+                    }
                 }
             }
             DispatchOutcome::WaitOnSignals {
@@ -2375,18 +2501,37 @@ fn dispatch_native_syscall(
                 }
             },
             DispatchOutcome::FutexWait { wait, timeout } => {
-                return Ok(DispatchOutcome::Returned {
-                    value: wait_native_futex(dispatcher, thread_runtime, wait, timeout, 0),
-                });
+                let value = wait_native_futex(dispatcher, thread_runtime, wait, timeout, 0);
+                // A pure fork-quiesce nudge: park, then RE-DISPATCH the
+                // syscall (revalidating the futex word — Linux syscall
+                // restart semantics) instead of surfacing a spurious EINTR.
+                if value == crate::linux_abi::LINUX_EINTR.guest_retval()
+                    && native_wait_park_if_quiesce_nudge(
+                        dispatcher,
+                        thread_runtime,
+                        carrick_abi::WaitSigMask::NONE,
+                    )
+                {
+                    continue;
+                }
+                return Ok(DispatchOutcome::Returned { value });
             }
             DispatchOutcome::FutexWaitv {
                 wait,
                 timeout,
                 index,
             } => {
-                return Ok(DispatchOutcome::Returned {
-                    value: wait_native_futex(dispatcher, thread_runtime, wait, timeout, index),
-                });
+                let value = wait_native_futex(dispatcher, thread_runtime, wait, timeout, index);
+                if value == crate::linux_abi::LINUX_EINTR.guest_retval()
+                    && native_wait_park_if_quiesce_nudge(
+                        dispatcher,
+                        thread_runtime,
+                        carrick_abi::WaitSigMask::NONE,
+                    )
+                {
+                    continue;
+                }
+                return Ok(DispatchOutcome::Returned { value });
             }
             DispatchOutcome::SharedFutexWait {
                 location,
@@ -2394,17 +2539,25 @@ fn dispatch_native_syscall(
                 value,
                 timeout,
             } => {
-                return Ok(DispatchOutcome::Returned {
-                    value: wait_native_shared_futex(
+                let retval = wait_native_shared_futex(
+                    dispatcher,
+                    thread_runtime,
+                    location,
+                    waiter_key,
+                    value,
+                    timeout,
+                    0,
+                );
+                if retval == crate::linux_abi::LINUX_EINTR.guest_retval()
+                    && native_wait_park_if_quiesce_nudge(
                         dispatcher,
                         thread_runtime,
-                        location,
-                        waiter_key,
-                        value,
-                        timeout,
-                        0,
-                    ),
-                });
+                        carrick_abi::WaitSigMask::NONE,
+                    )
+                {
+                    continue;
+                }
+                return Ok(DispatchOutcome::Returned { value: retval });
             }
             DispatchOutcome::SharedFutexWaitv {
                 location,
@@ -2413,17 +2566,25 @@ fn dispatch_native_syscall(
                 timeout,
                 index,
             } => {
-                return Ok(DispatchOutcome::Returned {
-                    value: wait_native_shared_futex(
+                let retval = wait_native_shared_futex(
+                    dispatcher,
+                    thread_runtime,
+                    location,
+                    waiter_key,
+                    value,
+                    timeout,
+                    index,
+                );
+                if retval == crate::linux_abi::LINUX_EINTR.guest_retval()
+                    && native_wait_park_if_quiesce_nudge(
                         dispatcher,
                         thread_runtime,
-                        location,
-                        waiter_key,
-                        value,
-                        timeout,
-                        index,
-                    ),
-                });
+                        carrick_abi::WaitSigMask::NONE,
+                    )
+                {
+                    continue;
+                }
+                return Ok(DispatchOutcome::Returned { value: retval });
             }
             DispatchOutcome::WaitOnSharedWord {
                 location,
@@ -2440,6 +2601,13 @@ fn dispatch_native_syscall(
                     0,
                 );
                 if retval == crate::linux_abi::LINUX_EINTR.guest_retval() {
+                    if native_wait_park_if_quiesce_nudge(
+                        dispatcher,
+                        thread_runtime,
+                        carrick_abi::WaitSigMask::NONE,
+                    ) {
+                        continue;
+                    }
                     return Ok(DispatchOutcome::Errno {
                         errno: crate::linux_abi::LINUX_EINTR,
                     });
@@ -2493,6 +2661,18 @@ fn dispatch_native_syscall(
                                 });
                             }
                             Err(errno) => {
+                                // Quiesce nudge: park, then continue the INNER
+                                // drive loop so the partial write's offset is
+                                // preserved (never re-dispatch a partial write).
+                                if errno == crate::linux_abi::LINUX_EINTR
+                                    && native_wait_park_if_quiesce_nudge(
+                                        dispatcher,
+                                        thread_runtime,
+                                        carrick_abi::WaitSigMask::NONE,
+                                    )
+                                {
+                                    continue;
+                                }
                                 if write.offset() > 0 {
                                     return Ok(DispatchOutcome::Returned {
                                         value: write.offset() as i64,
@@ -2507,13 +2687,35 @@ fn dispatch_native_syscall(
             DispatchOutcome::WaitOnProcExit { pid, sig_mask } => {
                 match wait_native_proc_exit(dispatcher, thread_runtime, pid, sig_mask) {
                     Ok(NativeWaitResult::Ready) | Ok(NativeWaitResult::TimedOut) => continue,
-                    Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+                    Err(errno) => {
+                        if errno == crate::linux_abi::LINUX_EINTR
+                            && native_wait_park_if_quiesce_nudge(
+                                dispatcher,
+                                thread_runtime,
+                                sig_mask,
+                            )
+                        {
+                            continue;
+                        }
+                        return Ok(DispatchOutcome::Errno { errno });
+                    }
                 }
             }
             DispatchOutcome::WaitOnProcState { sig_mask, .. } => {
                 match wait_native_proc_state(dispatcher, thread_runtime, sig_mask) {
                     Ok(NativeWaitResult::Ready) | Ok(NativeWaitResult::TimedOut) => continue,
-                    Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+                    Err(errno) => {
+                        if errno == crate::linux_abi::LINUX_EINTR
+                            && native_wait_park_if_quiesce_nudge(
+                                dispatcher,
+                                thread_runtime,
+                                sig_mask,
+                            )
+                        {
+                            continue;
+                        }
+                        return Ok(DispatchOutcome::Errno { errno });
+                    }
                 }
             }
             DispatchOutcome::WaitOnSleep {
@@ -2572,7 +2774,7 @@ fn wait_native_futex(
         thread_runtime
             .futex
             .wait_prepared_for_thread(wait, timeout, thread_runtime.tid(), &|| {
-                native_wait_should_interrupt(
+                native_wait_interrupt_or_stw(
                     dispatcher,
                     thread_runtime.tid(),
                     carrick_abi::WaitSigMask::NONE,
@@ -2600,7 +2802,7 @@ fn wait_native_shared_futex(
     woken_value: i64,
 ) -> i64 {
     let interrupted = || {
-        native_wait_should_interrupt(
+        native_wait_interrupt_or_stw(
             dispatcher,
             thread_runtime.tid(),
             carrick_abi::WaitSigMask::NONE,
@@ -2630,6 +2832,15 @@ fn wait_native_signals(
 ) -> NativeSignalWaitResult {
     let tid = thread_runtime.tid();
     loop {
+        // Stop-the-world boundary: an exec replacement surfaces EINTR (the
+        // run-loop top retires the thread); a fork quiesce parks HERE — the
+        // waiter's ppoll layer returns Interrupted on the nudge, so without
+        // this park the loop would spin re-arming slices for the whole
+        // quiesce.
+        if crate::fork_quiesce::exec_replacing_other_thread(tid) {
+            return NativeSignalWaitResult::Interrupted;
+        }
+        thread_runtime.park_for_fork_quiesce();
         let Some(slice) = crate::vcpu_loop::signal_wait_slice(deadline, timeout) else {
             return NativeSignalWaitResult::TimedOut;
         };
@@ -2835,6 +3046,16 @@ fn wait_native_sleep_until(
                 if native_wait_should_interrupt(dispatcher, tid, sig_mask) {
                     return Err(crate::linux_abi::LINUX_EINTR);
                 }
+                // A fork-quiesce nudge: park HERE (the loop re-blocks on the
+                // ORIGINAL deadline, so the sleep is not restarted) instead
+                // of surfacing a spurious EINTR. An exec replacement takes
+                // the EINTR path below via the loop's next wait returning
+                // Interrupted with nothing pending — the run-loop top
+                // retires the thread on the teardown's next kick.
+                thread_runtime.park_for_fork_quiesce();
+                if crate::fork_quiesce::exec_replacing_other_thread(tid) {
+                    return Err(crate::linux_abi::LINUX_EINTR);
+                }
             }
             crate::io_wait::WaitResult::Errno(errno) => return Err(errno),
         }
@@ -2851,6 +3072,46 @@ fn native_wait_should_interrupt(
     let block_mask = native_wait_block_mask(dispatcher, tid, sig_mask);
     crate::host_signal::has_unblocked_pending_for(tid.raw(), block_mask)
         || dispatcher.has_deliverable_dispatch_pending_for_wait(tid, sig_mask)
+}
+
+/// Blocking-wait interrupt predicate INCLUDING the stop-the-world edges: a
+/// fork quiesce or an execve replacement by another thread must pull a parked
+/// waiter back to its dispatch boundary (the io_wait ppoll layer surfaces
+/// both on its own; the parking-lot futex paths only see the caller-supplied
+/// predicate, so the OR lives here). Callers classify the resulting
+/// `Interrupted` with [`native_wait_park_if_quiesce_nudge`] so a pure quiesce
+/// nudge never reaches the guest as EINTR.
+fn native_wait_interrupt_or_stw(
+    dispatcher: &SyscallDispatcher,
+    tid: crate::thread::ThreadId,
+    sig_mask: carrick_abi::WaitSigMask,
+) -> bool {
+    native_wait_should_interrupt(dispatcher, tid, sig_mask)
+        || crate::fork_quiesce::is_quiescing()
+        || crate::fork_quiesce::exec_replacing_other_thread(tid)
+}
+
+/// Classify an `Interrupted` wait: returns true (after PARKING at the fork
+/// barrier) iff it was a pure fork-quiesce nudge — no real deliverable
+/// signal — so the caller retries/re-dispatches instead of surfacing a
+/// guest-visible spurious EINTR (the HVF park-and-retry contract). A real
+/// pending signal, an exec replacement (the run-loop top retires the thread;
+/// the teardown keeps re-kicking until it gets there), or a nudge whose
+/// quiesce already ended all return false and take the normal EINTR path.
+fn native_wait_park_if_quiesce_nudge(
+    dispatcher: &SyscallDispatcher,
+    thread_runtime: &NativeThreadRuntime,
+    sig_mask: carrick_abi::WaitSigMask,
+) -> bool {
+    let tid = thread_runtime.tid();
+    if native_wait_should_interrupt(dispatcher, tid, sig_mask)
+        || crate::fork_quiesce::exec_replacing_other_thread(tid)
+        || !crate::fork_quiesce::is_quiescing()
+    {
+        return false;
+    }
+    thread_runtime.park_for_fork_quiesce();
+    true
 }
 
 fn native_wait_block_mask(
@@ -2897,15 +3158,107 @@ fn handle_native_fork(
     vfork_completion: &mut Option<NativeVforkCompletion>,
     request: NativeForkRequest,
     resume_pc: u64,
-) -> Result<(), RuntimeError> {
+) -> Result<NativeForkFlow, RuntimeError> {
     if request.clone_parent {
         return Err(RuntimeError::Unsupported(
             "native Darwin run-elf fork does not yet support CLONE_PARENT".to_string(),
         ));
     }
+    // Serialize forks (and exclude a concurrent execve teardown): the same
+    // CAS token the HVF fork barrier uses. A loser parks at the in-flight
+    // fork's barrier so its drain counts this thread; a loser that observes
+    // an execve replacement retires instead (its whole thread group is being
+    // destroyed — the fork never happens, matching Linux).
+    if thread_runtime.acquire_fork_token() == NativeForkTokenFlow::RetireForExec {
+        return Ok(NativeForkFlow::RetireForExec);
+    }
+    let barrier = crate::fork_quiesce::barrier();
+    // Multithreaded fork: stop the world first. Siblings park at their
+    // dispatch boundaries (run-loop top / blocking-wait retry points) holding
+    // NO carrick locks; the drain completes only when the KICKER count falls
+    // to 1 (parking siblings unregister first, park second — same contract as
+    // HVF's `handle_fork`). Exited-mid-quiesce threads also leave the count.
+    let mut quiesced = false;
+    if thread_runtime.registry.live_count() > 1 {
+        // W^X boundary (311fae9e), kept narrow and explicit: W+X pages while
+        // multithreaded are already unreachable (creation is rejected while
+        // MT, and thread creation is rejected while W+X exists) — if the
+        // invariant ever breaks, fail honestly instead of forking a torn
+        // W^X state machine.
+        if memory.lock().has_native16k_write_exec_pages() {
+            barrier.end_fork();
+            return Err(RuntimeError::Unsupported(
+                "native Darwin multithreaded fork with write-exec pages is not supported"
+                    .to_string(),
+            ));
+        }
+        barrier.set_quiescing();
+        thread_runtime.kicker.kick_all_except(thread_runtime.tid());
+        thread_runtime.platform_futex.notify_signal_pending();
+        // Bounded drain (10 s, generously above the sub-millisecond norm): a
+        // sibling that never parks means a blocking wait arm is not surfacing
+        // `is_quiescing()`; abort loudly so the core (`bt all`) names the
+        // stranded thread — mirroring the HVF drain's failure discipline.
+        let drain_deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if thread_runtime.kicker.count() <= 1 {
+                break;
+            }
+            if Instant::now() >= drain_deadline {
+                tracing::error!(
+                    kicker = thread_runtime.kicker.count(),
+                    paused = barrier.paused_count(),
+                    pid = std::process::id(),
+                    forker_tid = thread_runtime.tid().raw(),
+                    "native fork quiesce drain: sibling guest thread(s) failed to reach \
+                     the dispatch-boundary barrier in 10s — a blocking wait arm is not \
+                     surfacing is_quiescing(). Aborting (core: `bt all` names the \
+                     stranded thread) rather than forking a torn runtime.",
+                );
+                std::process::abort();
+            }
+            thread_runtime.kicker.kick_all_except(thread_runtime.tid());
+            thread_runtime.platform_futex.notify_signal_pending();
+            std::thread::sleep(Duration::from_micros(200));
+        }
+        quiesced = true;
+    }
+    // Drain in-flight EXIT CLEANUPS before forking: an exiting thread has
+    // already left the kicker (so the quiesce above never counted it) but may
+    // still be mutating process-global signal state under process-wide
+    // mutexes; `libc::fork` landing inside that window hands the child a
+    // mutex held by a thread that does not exist in it (the HVF go-os_exec
+    // vfork wedge). Bounded, then proceed (status-quo risk) — mirrors HVF.
+    {
+        let cleanup_deadline = Instant::now() + Duration::from_secs(5);
+        while crate::fork_quiesce::exit_cleanups_in_flight() > 0 {
+            if Instant::now() >= cleanup_deadline {
+                tracing::error!(
+                    in_flight = crate::fork_quiesce::exit_cleanups_in_flight(),
+                    "native fork: exit-cleanup drain timed out after 5s; forking anyway \
+                     (child may inherit a held cleanup lock)"
+                );
+                break;
+            }
+            std::thread::yield_now();
+        }
+    }
+    let end_fork_state = |quiesced: bool| {
+        if quiesced {
+            barrier.end_quiesce();
+        }
+        barrier.end_fork();
+    };
     let vfork_pipe = if request.vfork.is_some() {
         memory.lock().set_fork_inheritance(true);
-        Some(pipe_pair()?)
+        match pipe_pair() {
+            Ok(pipe) => Some(pipe),
+            Err(error) => {
+                memory.lock().set_fork_inheritance(false);
+                end_fork_state(quiesced);
+                return Err(error);
+            }
+        }
     } else {
         None
     };
@@ -2927,12 +3280,27 @@ fn handle_native_fork(
                 close_fd(write_fd);
                 memory.lock().set_fork_inheritance(false);
             }
-            return resume_guest(
+            end_fork_state(quiesced);
+            resume_guest(
                 crate::linux_abi::LINUX_EAGAIN.guest_retval() as u64,
                 resume_pc,
-            );
+            )?;
+            return Ok(NativeForkFlow::Resumed);
         }
     };
+    // Hold the quiesce barrier's internal mutex ACROSS the fork: a sibling
+    // parking for this quiesce leaves the kicker count BEFORE it parks, so
+    // the drain above can be satisfied while that sibling is still inside
+    // `park_if_quiescing`'s lock-increment window HOLDING the barrier mutex
+    // — a fork landing there hands the child the mutex locked forever (the
+    // captured-live HVF go-os_exec wedge). Owning it here excludes that
+    // window by mutual exclusion, and — because entering/leaving the
+    // condvar wait also requires it — guarantees every parked sibling is
+    // fully quiescent in the kernel at the fork instant, which is what makes
+    // the child's `end_quiesce` (notify on the COW condvar copy) safe.
+    // Dropped on both sides immediately after the fork, before any barrier
+    // call.
+    let paused_guard = barrier.lock_paused_across_fork();
     // ATFORK-PREPARE: pin every fork-shared signal-static mutex an auxiliary
     // thread can hold (the child-exit watcher mid-publish: child-watch tables,
     // THREAD_PENDING, THREAD_WAITERS) on THIS thread across fork(), then
@@ -2947,6 +3315,7 @@ fn handle_native_fork(
     // Both branches: the forking thread (the sole survivor in the child) owns
     // the guards and must release them before any signal-static use below.
     drop(fork_signal_locks);
+    drop(paused_guard);
     if child < 0 {
         crate::guest_cpu::abort_prepared_child_record();
         if let Some((read_fd, write_fd)) = vfork_pipe {
@@ -2954,12 +3323,22 @@ fn handle_native_fork(
             close_fd(write_fd);
             memory.lock().set_fork_inheritance(false);
         }
-        return resume_guest(
+        end_fork_state(quiesced);
+        resume_guest(
             crate::linux_abi::LINUX_EAGAIN.guest_retval() as u64,
             resume_pc,
-        );
+        )?;
+        return Ok(NativeForkFlow::Resumed);
     }
     if child == 0 {
+        // Repair the inherited barrier state FIRST: the quiesce/fork flags
+        // (and the parked-thread count, which belongs to PARENT threads that
+        // do not exist here) would otherwise park this child's run loop at
+        // its first boundary check or satisfy a future MT fork's drain with
+        // phantom parkers — the HVF child arm's exact sequence.
+        barrier.end_quiesce();
+        barrier.end_fork();
+        barrier.reset_paused_for_child();
         if let Some((read_fd, write_fd)) = vfork_pipe {
             close_fd(read_fd);
             *vfork_completion = Some(NativeVforkCompletion { fd: write_fd });
@@ -2969,6 +3348,12 @@ fn handle_native_fork(
         native_after_fork_child(dispatcher);
         native_trace_fork_phase("child-dispatcher-reset");
         thread_runtime.reset_after_fork_child();
+        // Retire SIBLING per-tid signal state before re-keying the forking
+        // thread's own: fork clones only the calling thread, and the child's
+        // fresh registry allocates tids that can collide with a dead parent
+        // sibling's entry (regression:
+        // fork_child_retires_sibling_thread_signal_state).
+        dispatcher.retire_sibling_thread_signal_state(parent_tid);
         dispatcher.migrate_thread_signal_state(parent_tid, thread_runtime.tid());
         thread_runtime.prepare_kick_target()?;
         native_trace_fork_phase("child-thread-runtime-reset");
@@ -2993,14 +3378,27 @@ fn handle_native_fork(
             }
         }
         native_trace_fork_phase("child-resume");
-        return resume_guest_detached(0, resume_pc);
+        resume_guest_detached(0, resume_pc)?;
+        return Ok(NativeForkFlow::Resumed);
     }
-    if let Some((read_fd, write_fd)) = vfork_pipe {
+    // Release the parked siblings now — the fork is done; the vfork suspend
+    // below must run with siblings LIVE (HVF suspends after end_quiesce too).
+    // The fork TOKEN is held across the vfork suspend so a sibling's fork
+    // cannot start a new quiesce while this thread is unparkable in read().
+    if quiesced {
+        barrier.end_quiesce();
+    }
+    let vfork_wait = if let Some((read_fd, write_fd)) = vfork_pipe {
         close_fd(write_fd);
-        wait_native_vfork_completion(read_fd)?;
+        let wait = wait_native_vfork_completion(read_fd);
         close_fd(read_fd);
         memory.lock().set_fork_inheritance(false);
-    }
+        wait
+    } else {
+        Ok(())
+    };
+    barrier.end_fork();
+    vfork_wait?;
     crate::guest_cpu::publish_prepared_child_record_parent_ref(prepared_child_record, child as u32);
     crate::namespace::pid::notify_child_registered();
     crate::run_state::publish_child_booting(child as u32);
@@ -3014,7 +3412,106 @@ fn handle_native_fork(
         let _ = memory.lock().write_bytes(addr, &tid);
     }
     native_register_child_exit_watch(dispatcher, child, request.exit_signal, thread_runtime.tid());
-    resume_guest(guest_child_pid as u64, resume_pc)
+    resume_guest(guest_child_pid as u64, resume_pc)?;
+    Ok(NativeForkFlow::Resumed)
+}
+
+/// Linux execve(2) replaces the WHOLE thread group: every sibling thread is
+/// destroyed and the new image starts single-threaded. The native mirror of
+/// `terminate_siblings_for_exec`: raise the exec-replacement flag, kick every
+/// sibling to its dispatch boundary where it retires COOPERATIVELY through
+/// the normal thread-exit path (`finish_thread` — the HVF sibling exit shape,
+/// including the CLONE_CHILD_CLEARTID clear+wake against the old image),
+/// drain until this thread is the only live one, reclaim straggler records,
+/// and JOIN the sibling host threads so none is still unwinding when
+/// `replace_image` tears the old mappings down.
+///
+/// Runs AFTER the replacement image loaded successfully — a failed execve
+/// must leave the thread group intact (Linux's point of no return).
+fn native_terminate_siblings_for_exec(
+    dispatcher: &SyscallDispatcher,
+    memory: &SharedNativeMemory,
+    thread_runtime: &mut NativeThreadRuntime,
+) -> Result<NativeExecTeardownFlow, RuntimeError> {
+    if thread_runtime.registry.live_count() <= 1 {
+        return Ok(NativeExecTeardownFlow::Proceed);
+    }
+    // The fork token is the fork↔exec mutual exclusion: an in-flight fork
+    // quiesce completes (this thread parks for it inside the token loop)
+    // before the teardown starts, and no fork can start mid-teardown. A lost
+    // race against ANOTHER thread's execve retires this thread instead.
+    if thread_runtime.acquire_fork_token() == NativeForkTokenFlow::RetireForExec {
+        return Ok(NativeExecTeardownFlow::RetireForExec);
+    }
+    let barrier = crate::fork_quiesce::barrier();
+    // W^X boundary (311fae9e), kept narrow and explicit — see the fork-side
+    // twin; unreachable while the creation-side rejections hold.
+    if memory.lock().has_native16k_write_exec_pages() {
+        barrier.end_fork();
+        return Err(RuntimeError::Unsupported(
+            "native Darwin multithreaded execve with write-exec pages is not supported".to_string(),
+        ));
+    }
+    crate::fork_quiesce::begin_exec_replacement(thread_runtime.tid());
+    thread_runtime.kicker.kick_all_except(thread_runtime.tid());
+    thread_runtime.platform_futex.notify_signal_pending();
+    // Drain until every sibling has RETIRED. Both counts matter: the registry
+    // entry drops in `finish_thread` (a thread transiently unregistered from
+    // the kicker — e.g. re-registering after a fork park — is still live and
+    // must not be missed), and the kicker entry drops with it. Bounded 5 s
+    // (mirrors HVF): a sibling that cannot retire — e.g. a vfork parent
+    // suspended in the completion read — surfaces the typed error instead of
+    // wedging the exec.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if thread_runtime.registry.live_count() <= 1 && thread_runtime.kicker.count() <= 1 {
+            break;
+        }
+        if Instant::now() >= deadline {
+            crate::fork_quiesce::end_exec_replacement();
+            barrier.end_fork();
+            return Err(RuntimeError::Trap(TrapError::Hypervisor(format!(
+                "native execve thread-group teardown timed out: live={} kicker={}",
+                thread_runtime.registry.live_count(),
+                thread_runtime.kicker.count()
+            ))));
+        }
+        thread_runtime.kicker.kick_all_except(thread_runtime.tid());
+        thread_runtime.platform_futex.notify_signal_pending();
+        std::thread::sleep(Duration::from_micros(200));
+    }
+    // Straggler records: a thread that had a tid but never reached a
+    // boundary (spawn raced the teardown). Reclaim exactly what its own
+    // retirement would have (mirrors HVF's remove_all_except sweep).
+    let removed = thread_runtime
+        .registry
+        .remove_all_except(thread_runtime.tid());
+    for tid in removed {
+        thread_runtime.kicker.unregister(tid);
+        crate::run_state::clear_guest_tid(tid.raw());
+        crate::host_signal::forget_thread(tid.raw());
+        dispatcher.forget_thread_signal_state(tid);
+    }
+    // Join the sibling HOST threads so none is mid-unwind while the image is
+    // replaced. Skip self when the exec came from a spawned thread (joining
+    // self deadlocks); dropping that handle detaches it — this thread runs
+    // the new image and the process exits via its `_exit`.
+    let current = std::thread::current().id();
+    loop {
+        let handles = std::mem::take(&mut *thread_runtime.threads.lock());
+        if handles.is_empty() {
+            break;
+        }
+        for handle in handles {
+            if handle.thread().id() == current {
+                continue;
+            }
+            let _ = handle.join();
+        }
+    }
+    crate::fork_quiesce::end_exec_replacement();
+    barrier.end_fork();
+    Ok(NativeExecTeardownFlow::Proceed)
 }
 
 fn native_trace_fork_phase(phase: &str) {
@@ -7078,6 +7575,138 @@ mod tests {
             .unregister(crate::thread::ThreadId::synthetic_for_tests(0x424b));
         // SAFETY: dropped exactly once, after the mutex holder released.
         unsafe { std::mem::ManuallyDrop::drop(&mut runtime) };
+    }
+
+    /// Serializes the tests below that raise the PROCESS-GLOBAL stop-the-world
+    /// flags (fork quiesce / exec replacement) so they cannot interleave with
+    /// each other.
+    static STW_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The native fork-quiesce park contract at the dispatch boundary:
+    /// a sibling observing `is_quiescing()` UNREGISTERS from the kicker first
+    /// (the forker's drain counts registered threads down to 1), parks at the
+    /// barrier, and RE-REGISTERS its kick handle after release — so a later
+    /// quiesce (or thread-directed kick) still reaches it.
+    #[test]
+    fn fork_quiesce_parks_native_sibling_and_reregisters_kicker() {
+        use carrick_hal::VcpuRegistry as _;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let _stw = STW_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let runtime = NativeThreadRuntime::new_current();
+        let sib_tid = runtime.registry.register_child(0);
+        let mut sibling = runtime.sibling(sib_tid);
+        let kicker = Arc::clone(&runtime.kicker);
+        let registered = Arc::new(AtomicBool::new(false));
+        let reregistered_count = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let handle = {
+            let registered = Arc::clone(&registered);
+            let reregistered_count = Arc::clone(&reregistered_count);
+            let release = Arc::clone(&release);
+            thread::Builder::new()
+                .name("test-quiesce-sibling".into())
+                .spawn(move || {
+                    // Production registration shape minus the trap-handler
+                    // install (no guest here): bound state + registered handle.
+                    let state = Arc::new(NativeKickState::new().expect("kick state"));
+                    sibling.kick_state = Some(Arc::clone(&state));
+                    sibling.kicker.register(
+                        sib_tid,
+                        Box::new(NativeKickHandle::for_current_thread(state)),
+                    );
+                    registered.store(true, Ordering::SeqCst);
+                    while !crate::fork_quiesce::is_quiescing() {
+                        thread::yield_now();
+                    }
+                    // The dispatch-boundary behavior under test.
+                    sibling.park_for_fork_quiesce();
+                    reregistered_count.store(sibling.kicker.count(), Ordering::SeqCst);
+                    while !release.load(Ordering::SeqCst) {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    // Explicit teardown: the kick state was never thread-bound
+                    // by prepare_kick_target, so skip release_kick_target's
+                    // unbind.
+                    sibling.kicker.unregister(sib_tid);
+                    sibling.kick_state = None;
+                })
+                .expect("spawn quiesce sibling")
+        };
+        while !registered.load(Ordering::SeqCst) {
+            thread::yield_now();
+        }
+        // This test's "forker" (the harness thread) is not kicker-registered
+        // (that is prepare_kick_target's job in the run loop), so the counts
+        // here are sibling-only: 1 registered, draining to 0.
+        assert_eq!(kicker.count(), 1, "sibling registered");
+
+        let barrier = crate::fork_quiesce::barrier();
+        assert!(barrier.try_begin_fork(), "no other fork in flight");
+        barrier.set_quiescing();
+        // The forker's drain predicate: the sibling leaves the kicker BEFORE
+        // parking, so the count draining means it is at the barrier.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while kicker.count() > 0 {
+            assert!(
+                Instant::now() < deadline,
+                "sibling never unregistered for the quiesce (kicker={})",
+                kicker.count()
+            );
+            thread::yield_now();
+        }
+        barrier.end_quiesce();
+        barrier.end_fork();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while reregistered_count.load(Ordering::SeqCst) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "sibling never released from the fork barrier"
+            );
+            thread::yield_now();
+        }
+        assert_eq!(
+            reregistered_count.load(Ordering::SeqCst),
+            1,
+            "sibling must re-register its kick handle after the park"
+        );
+        release.store(true, Ordering::SeqCst);
+        handle.join().expect("join quiesce sibling");
+        runtime.registry.exit(sib_tid);
+    }
+
+    /// The exec-teardown nudge seam: a sibling blocked in a native private
+    /// futex wait must surface `Interrupted` (EINTR at the boundary, where
+    /// the run-loop top retires it) once another thread begins an execve
+    /// replacement — not sleep out its timeout. Pre-fix the wait predicate
+    /// ignored the exec flag and this timed out (ETIMEDOUT after 10 s).
+    #[test]
+    fn exec_replacement_interrupts_native_futex_wait() {
+        let _stw = STW_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let runtime = NativeThreadRuntime::new_current();
+        let sib_tid = runtime.registry.register_child(0);
+        let sibling = runtime.sibling(sib_tid);
+
+        crate::fork_quiesce::begin_exec_replacement(runtime.tid());
+        let value = {
+            let dispatcher = SyscallDispatcher::new();
+            let wait = sibling.futex.prepare_wait(0x9000);
+            wait_native_futex(
+                &dispatcher,
+                &sibling,
+                wait,
+                Some(Duration::from_secs(10)),
+                0,
+            )
+        };
+        crate::fork_quiesce::end_exec_replacement();
+        assert_eq!(
+            value,
+            crate::linux_abi::LINUX_EINTR.guest_retval(),
+            "an exec replacement must interrupt a sibling's futex wait"
+        );
+        runtime.registry.exit(sib_tid);
     }
 
     #[test]
