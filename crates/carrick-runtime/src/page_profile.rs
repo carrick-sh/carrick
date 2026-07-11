@@ -1,7 +1,7 @@
 use crate::runtime::RuntimeError;
 use carrick_spec::{
-    BackendCapabilities, ExecBackendRequest, HostExecution, HostOs, NativePageGeometry,
-    NativePageProfile, NativePageProfileRequest, Platform, RunSpec,
+    BackendCapabilities, ExecBackendRequest, HostExecution, HostOs, NativeCodeModeRequest,
+    NativePageGeometry, NativePageProfile, NativePageProfileRequest, Platform, RunSpec,
 };
 
 pub(crate) const DEFAULT_LINUX_PAGE_SIZE: u64 = carrick_abi::LINUX_PAGE_SIZE;
@@ -225,6 +225,31 @@ pub(crate) fn resolve_execution_plan_for_request(
     )
 }
 
+pub(crate) fn validate_native_code_mode(
+    mode: NativeCodeModeRequest,
+    plan: &ExecutionPlan,
+) -> Result<(), RuntimeError> {
+    if mode == NativeCodeModeRequest::Brk {
+        return Ok(());
+    }
+    if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        return Err(RuntimeError::Unsupported(
+            "native DSR requires a macOS/AArch64 host build".to_string(),
+        ));
+    }
+    if plan.backend != ExecutionBackend::NativeDarwin {
+        return Err(RuntimeError::Unsupported(
+            "native DSR requires --exec-backend=native".to_string(),
+        ));
+    }
+    if plan.page_geometry.native_profile != Some(NativePageProfile::Native16k) {
+        return Err(RuntimeError::Unsupported(
+            "native DSR currently requires --native-page-profile=native16k".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 fn resolve_execution_plan_for_host(
     spec: &RunSpec,
@@ -367,6 +392,7 @@ mod tests {
             platform,
             exec_backend,
             native_page_profile: page,
+            native_code_mode: carrick_spec::NativeCodeModeRequest::Brk,
             pid: carrick_spec::PidMode::Private,
             hostname: None,
             network: carrick_spec::NetworkNamespaceSpec::default(),
@@ -450,6 +476,32 @@ mod tests {
             RuntimeError::Unsupported(message)
                 if message.contains("macOS") && message.contains("Linux")
         ));
+    }
+
+    #[test]
+    fn dsr_requires_native16k_darwin_plan() {
+        let hvf = ExecutionPlan {
+            backend: ExecutionBackend::Hvf,
+            page_geometry: PageGeometry {
+                host_page_size: DEFAULT_LINUX_PAGE_SIZE,
+                linux_page_size: DEFAULT_LINUX_PAGE_SIZE,
+                native_profile: None,
+            },
+            diagnostics: Vec::new(),
+        };
+        let linux4k = native_plan(NativePageProfileRequest::Linux4k, DARWIN_NATIVE_PAGE_SIZE)
+            .expect("linux4k plan");
+        let native16k = native_plan(NativePageProfileRequest::Native16k, DARWIN_NATIVE_PAGE_SIZE)
+            .expect("native16k plan");
+
+        assert!(validate_native_code_mode(carrick_spec::NativeCodeModeRequest::Dsr, &hvf).is_err());
+        assert!(
+            validate_native_code_mode(carrick_spec::NativeCodeModeRequest::Dsr, &linux4k).is_err()
+        );
+        validate_native_code_mode(carrick_spec::NativeCodeModeRequest::Dsr, &native16k)
+            .expect("DSR accepts native16k Darwin plan on the compiled macOS/AArch64 lane");
+        validate_native_code_mode(carrick_spec::NativeCodeModeRequest::Brk, &hvf)
+            .expect("brk mode preserves existing non-native requests");
     }
 
     #[test]

@@ -254,6 +254,20 @@ pub enum NativePageProfileRequest {
     Linux4k,
 }
 
+/// Instruction-execution vehicle for the Darwin-native backend.
+///
+/// `Brk` preserves the established in-place syscall patching path. `Dsr`
+/// selects the same-ISA dynamic rewriter and is validated against the resolved
+/// host/guest execution plan before any image mappings are installed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
+pub enum NativeCodeModeRequest {
+    #[default]
+    Brk,
+    Dsr,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NativePageProfile {
@@ -764,6 +778,10 @@ pub struct RunSpec {
     /// backends; explicit native profiles are validated by the runtime plan.
     #[serde(default)]
     pub native_page_profile: NativePageProfileRequest,
+    /// Native-only instruction-execution vehicle. `Brk` is the stable default;
+    /// `Dsr` selects the experimental same-ISA dynamic rewriter.
+    #[serde(default)]
+    pub native_code_mode: NativeCodeModeRequest,
     /// PID namespace mode (`docker run --pid`). `Private` (default) gives the
     /// container its own pid ns (init == pid 1); `Host` shares the host pid ns.
     #[serde(default)]
@@ -877,7 +895,7 @@ mod tests {
     }
 
     #[test]
-    fn run_spec_defaults_execution_backend_and_native_page_profile() {
+    fn run_spec_defaults_execution_backend_native_page_profile_and_code_mode() {
         let json = r#"{
             "executable": "/bin/sh",
             "argv": ["/bin/sh"],
@@ -896,6 +914,15 @@ mod tests {
         let spec: RunSpec = serde_json::from_str(json).expect("legacy spec should deserialize");
         assert_eq!(spec.exec_backend, ExecBackendRequest::Auto);
         assert_eq!(spec.native_page_profile, NativePageProfileRequest::Auto);
+        assert_eq!(spec.native_code_mode, NativeCodeModeRequest::Brk);
+    }
+
+    #[test]
+    fn native_code_mode_dsr_serializes_to_stable_cli_vocabulary() {
+        assert_eq!(
+            serde_json::to_string(&NativeCodeModeRequest::Dsr).expect("serialize DSR mode"),
+            r#""dsr""#
+        );
     }
 
     #[test]
