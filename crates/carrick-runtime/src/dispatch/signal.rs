@@ -2056,6 +2056,11 @@ impl SyscallDispatcher {
         if !is_valid_signum(signum) {
             return DispatchOutcome::errno(LINUX_EINVAL);
         }
+        // rt_sigqueueinfo/rt_tgsigqueueinfo name one thread group. Unlike
+        // kill(2), zero and negative pid encodings never mean a group/broadcast.
+        if ns_target <= 0 {
+            return DispatchOutcome::errno(LINUX_EINVAL);
+        }
         let s = signum as i32;
 
         // Read the caller's siginfo once; the kernel re-stamps si_signo.
@@ -2103,14 +2108,25 @@ impl SyscallDispatcher {
         let host_pid = std::process::id() as i64;
         let is_self = ns_target == host_pid || ns_target == LINUX_BOOTSTRAP_PID as i64;
         if !is_self {
-            // Cross-process signal that a plain host kill can't carry faithfully
-            // for this target: route it through the shared explicit-signal ring
-            // carrying sender identity and optional si_value, then nudge the
-            // target. `ns_target` is already the target's HOST pid here.
-            if should_route_specific_xsig(ns_target as i32, s) {
-                let target_host = ns_target as i32;
-                let sender_ns = crate::namespace::pid::self_ns_pid() as i32;
+            // A queued cross-process signal always needs the explicit-signal ring:
+            // even a host-carryable standard signal loses SI_QUEUE and si_value if
+            // it follows the plain-kill policy. `ns_target` is already the target's
+            // HOST pid here. Signal 0 remains an existence check with no payload.
+            if s != 0
+                && let Ok(target_host) = i32::try_from(ns_target)
+                && target_host > 0
+            {
+                // Preserve ESRCH/EPERM ordering without delivering a host signal.
                 let sender_uid = self.cred_snapshot().euid;
+                match bootstrap_signal_send_as(
+                    SignalTarget::from_host_kill_pid(ns_target),
+                    /* signum = */ 0,
+                    Some(sender_uid),
+                ) {
+                    DispatchOutcome::Returned { value: 0 } => {}
+                    outcome => return outcome,
+                }
+                let sender_ns = crate::namespace::pid::self_ns_pid() as i32;
                 // si_value lives at offset 24 of the siginfo = `_pad[0..8]`.
                 let value = user_info
                     .and_then(|i| i._pad.get(0..8).and_then(|b| b.try_into().ok()))
@@ -2136,11 +2152,18 @@ impl SyscallDispatcher {
                     crate::host_signal::xsig_nudge(target_host);
                     return DispatchOutcome::Returned { value: 0 };
                 }
+                // A host kill cannot preserve the queued payload. Report resource
+                // exhaustion instead of silently delivering a different signal.
+                return DispatchOutcome::errno(LINUX_EAGAIN);
             }
-            // Non-ring route (or ring full outside a private pid namespace):
-            // kill(2)-style host route. `ns_target` is already the host-domain
-            // kill(2) pid encoding here (translated above when ns is active).
-            return bootstrap_signal_send(SignalTarget::from_host_kill_pid(ns_target), signum);
+            // Signal 0 retains the kill(2)-style host route for its existence
+            // check, but Linux still applies the caller's signal permissions.
+            let sender_uid = self.cred_snapshot().euid;
+            return bootstrap_signal_send_as(
+                SignalTarget::from_host_kill_pid(ns_target),
+                signum,
+                Some(sender_uid),
+            );
         }
 
         // Self-target (single-threaded, or no sibling registry hit): queue
@@ -2525,6 +2548,254 @@ mod tests {
         assert!(!namespace_member_standard_kill_needs_xsig(LINUX_SIGSTOP));
         assert!(!namespace_member_standard_kill_needs_xsig(34));
         assert!(!namespace_member_standard_kill_needs_xsig(65));
+    }
+
+    #[test]
+    fn rt_sigqueueinfo_rejects_nonpositive_tgid_with_einval() {
+        let d = SyscallDispatcher::new();
+        let mut memory = crate::dispatch::LinearMemory::new(0, vec![0u8; 4096]);
+        let reporter = crate::compat::CompatReporter::default();
+        let cx = crate::dispatch::SyscallCtx {
+            request: crate::dispatch::SyscallRequest::new(
+                138,
+                crate::dispatch::SyscallArgs::from([0, 0, 0, 0, 0, 0]),
+            ),
+            memory: &mut memory,
+            reporter: &reporter,
+            thread: None,
+        };
+
+        for tgid in [0, -1, -2] {
+            assert_eq!(
+                d.sigqueueinfo_common(&cx, tgid, tgid, 0, GuestPtr(0), false),
+                DispatchOutcome::errno(LINUX_EINVAL),
+                "rt_sigqueueinfo tgid {tgid} must not use kill-style target semantics"
+            );
+        }
+    }
+
+    #[test]
+    fn cross_process_sigqueue_usr1_ring_full_returns_eagain_without_host_kill_fallback() {
+        use zerocopy::IntoBytes;
+
+        let _g = XSIG_RING_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert!(
+            !crate::namespace::pid::enabled(),
+            "the regression is the ordinary non-namespaced route"
+        );
+
+        carrick_signal_core::xsig::xsig_init();
+        let me = std::process::id() as i32;
+        let usr1 = crate::linux_abi::LINUX_SIGUSR1;
+        let _ = carrick_signal_core::xsig::xsig_drain_for_self();
+        // Fill with null signals so parallel signal-wait tests cannot observe
+        // this capacity fixture as deliverable pending work.
+        for slot in 0..256 {
+            assert!(
+                carrick_signal_core::xsig::xsig_enqueue(
+                    me,
+                    0,
+                    crate::linux_abi::LINUX_SI_QUEUE,
+                    slot,
+                    0,
+                    i64::from(slot),
+                    0,
+                ),
+                "ring slot {slot} must be available"
+            );
+        }
+        assert!(
+            !carrick_signal_core::xsig::xsig_enqueue(
+                me,
+                0,
+                crate::linux_abi::LINUX_SI_QUEUE,
+                999,
+                0,
+                0,
+                0,
+            ),
+            "the regression requires a full ring"
+        );
+
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn signal target");
+        let child_pid = i64::from(child.id());
+        assert!(
+            !should_route_specific_xsig(child_pid as i32, usr1),
+            "plain kill policy deliberately keeps ordinary SIGUSR1 off the ring"
+        );
+
+        let d = SyscallDispatcher::new();
+        let mut memory = crate::dispatch::LinearMemory::new(0, vec![0u8; 4096]);
+        let reporter = crate::compat::CompatReporter::default();
+        let siginfo = LinuxSiginfo::rt_queue(usr1, me, 0, 0x5eed_cafe);
+        memory.write_bytes(0x400, siginfo.as_bytes()).unwrap();
+        let cx = crate::dispatch::SyscallCtx {
+            request: crate::dispatch::SyscallRequest::new(
+                138,
+                crate::dispatch::SyscallArgs::from([child_pid as u64, usr1 as u64, 0x400, 0, 0, 0]),
+            ),
+            memory: &mut memory,
+            reporter: &reporter,
+            thread: None,
+        };
+        let outcome = d.sigqueueinfo_common(
+            &cx,
+            child_pid,
+            child_pid,
+            usr1 as u64,
+            GuestPtr(0x400),
+            false,
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = carrick_signal_core::xsig::xsig_drain_for_self();
+
+        assert_eq!(
+            outcome,
+            DispatchOutcome::errno(LINUX_EAGAIN),
+            "queued delivery must report ring exhaustion instead of losing si_value via host kill"
+        );
+    }
+
+    #[test]
+    fn cross_process_sigqueue_checks_guest_credentials_before_ring_capacity() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use zerocopy::IntoBytes;
+
+        let _g = XSIG_RING_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert!(
+            !crate::namespace::pid::enabled(),
+            "the regression is the ordinary non-namespaced route"
+        );
+
+        carrick_signal_core::xsig::xsig_init();
+        let me = std::process::id() as i32;
+        let usr1 = crate::linux_abi::LINUX_SIGUSR1;
+        let _ = carrick_signal_core::xsig::xsig_drain_for_self();
+        // Null-signal entries consume capacity without waking parallel waiters.
+        for slot in 0..256 {
+            assert!(carrick_signal_core::xsig::xsig_enqueue(
+                me,
+                0,
+                crate::linux_abi::LINUX_SI_QUEUE,
+                slot,
+                0,
+                i64::from(slot),
+                0,
+            ));
+        }
+
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn signal target");
+        let child_pid = i64::from(child.id());
+        let target_euid = 2000u32;
+        let cred_path = std::path::PathBuf::from(format!("/tmp/carrick-cred-{child_pid}"));
+        let _ = std::fs::remove_file(&cred_path);
+        std::fs::write(&cred_path, target_euid.to_le_bytes()).expect("publish target guest euid");
+        let mut permissions = std::fs::metadata(&cred_path)
+            .expect("read target cred metadata")
+            .permissions();
+        permissions.set_mode(0o600);
+        std::fs::set_permissions(&cred_path, permissions).expect("secure target cred fixture");
+        let published_euid = crate::cred_ipc::read_target(child_pid as i32);
+
+        let d = SyscallDispatcher::new();
+        d.set_credentials(1000, 1000);
+        let mut memory = crate::dispatch::LinearMemory::new(0, vec![0u8; 4096]);
+        let reporter = crate::compat::CompatReporter::default();
+        let siginfo = LinuxSiginfo::rt_queue(usr1, me, 1000, 0x5eed_cafe);
+        memory.write_bytes(0x400, siginfo.as_bytes()).unwrap();
+        let cx = crate::dispatch::SyscallCtx {
+            request: crate::dispatch::SyscallRequest::new(
+                138,
+                crate::dispatch::SyscallArgs::from([child_pid as u64, usr1 as u64, 0x400, 0, 0, 0]),
+            ),
+            memory: &mut memory,
+            reporter: &reporter,
+            thread: None,
+        };
+        let outcome = d.sigqueueinfo_common(
+            &cx,
+            child_pid,
+            child_pid,
+            usr1 as u64,
+            GuestPtr(0x400),
+            false,
+        );
+
+        let _ = std::fs::remove_file(cred_path);
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = carrick_signal_core::xsig::xsig_drain_for_self();
+
+        assert_eq!(published_euid, Some(target_euid));
+        assert_eq!(
+            outcome,
+            DispatchOutcome::errno(LINUX_EPERM),
+            "guest credential denial must precede ring-full EAGAIN"
+        );
+    }
+
+    #[test]
+    fn cross_process_sigqueue_signal_zero_checks_guest_credentials() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        assert!(
+            !crate::namespace::pid::enabled(),
+            "the regression is the ordinary non-namespaced route"
+        );
+
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn signal target");
+        let child_pid = i64::from(child.id());
+        let target_euid = 2000u32;
+        let cred_path = std::path::PathBuf::from(format!("/tmp/carrick-cred-{child_pid}"));
+        let _ = std::fs::remove_file(&cred_path);
+        std::fs::write(&cred_path, target_euid.to_le_bytes()).expect("publish target guest euid");
+        let mut permissions = std::fs::metadata(&cred_path)
+            .expect("read target cred metadata")
+            .permissions();
+        permissions.set_mode(0o600);
+        std::fs::set_permissions(&cred_path, permissions).expect("secure target cred fixture");
+        let published_euid = crate::cred_ipc::read_target(child_pid as i32);
+
+        let d = SyscallDispatcher::new();
+        d.set_credentials(1000, 1000);
+        let mut memory = crate::dispatch::LinearMemory::new(0, vec![0u8; 4096]);
+        let reporter = crate::compat::CompatReporter::default();
+        let cx = crate::dispatch::SyscallCtx {
+            request: crate::dispatch::SyscallRequest::new(
+                138,
+                crate::dispatch::SyscallArgs::from([child_pid as u64, 0, 0, 0, 0, 0]),
+            ),
+            memory: &mut memory,
+            reporter: &reporter,
+            thread: None,
+        };
+        let outcome = d.sigqueueinfo_common(&cx, child_pid, child_pid, 0, GuestPtr(0), false);
+
+        let _ = std::fs::remove_file(cred_path);
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert_eq!(published_euid, Some(target_euid));
+        assert_eq!(
+            outcome,
+            DispatchOutcome::errno(LINUX_EPERM),
+            "signal 0 must apply the guest credential permission check"
+        );
     }
 
     #[test]
