@@ -5984,6 +5984,23 @@ impl GuestMemory for NativeMappedMemory {
     fn unmap_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
         self.protect_range(address, len, 0)?;
         self.set_unmapped(address, len, true);
+        // Retire file-identity futex keys on unmapped file aliases: region
+        // entries are never pruned, and `shared_futex_location`'s newest-wins
+        // lookup would otherwise keep FILE-keying a shared-arena VA that the
+        // guest munmapped and later reused for an ANON MAP_SHARED word (served
+        // by the boot arena entry, no new region push) — this process would
+        // key the word by the dead file while every other process VA-keys the
+        // same physical word, silently missing cross-process wakes. A partial
+        // munmap also neutralizes the remainder's key: that degrades the
+        // still-mapped tail to VA-keying (the pre-file-key behavior), which is
+        // strictly safer than mis-keying the reused portion.
+        let end = address.saturating_add(len as u64);
+        for region in &mut self.regions {
+            if region.shared_key_base != 0 && region.start < end && address < region.end {
+                region.shared_key_base = 0;
+                region.shared_key_offset = 0;
+            }
+        }
         Ok(())
     }
 
@@ -8342,6 +8359,72 @@ mod tests {
             let anon = crate::memory::LINUX_SHARED_FILE_BASE + 0x100_0000;
             let anon_ok = key(anon) == Some(anon as usize);
             unsafe { libc::_exit(i32::from(!(ok && anon_ok))) };
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        let _ = std::fs::remove_file(&path);
+        assert!(libc::WIFEXITED(status), "child status was 0x{status:x}");
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+    }
+
+    /// munmap must retire a file alias's futex-key material: region entries
+    /// are never pruned, so after the guest unmaps file A and the shared-arena
+    /// VA is reused for an ANON MAP_SHARED word (served by the boot arena
+    /// region — no new region push), a stale newest-wins alias entry would
+    /// keep FILE-keying the word in THIS process while every other process
+    /// VA-keys the same physical word — missed cross-process wakes, the exact
+    /// hang class the file-identity keys fixed, reintroduced via VA reuse.
+    #[test]
+    fn native_unmapped_file_alias_stops_file_keying_reused_va() {
+        let path = std::env::temp_dir().join(format!(
+            ".carrick-native-futexkey-unmap-{}-{:x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0)
+        ));
+        std::fs::write(&path, vec![0u8; 16 * 1024]).expect("seed checkpoint file");
+        let child = unsafe { libc::fork() };
+        assert!(
+            child >= 0,
+            "fork failed: {}",
+            std::io::Error::last_os_error()
+        );
+        if child == 0 {
+            let layout = native_memory_layout();
+            let image = AddressSpace::from_regions(0, Vec::new())
+                .expect("empty native test image should be valid");
+            let mut memory = NativeMappedMemory::map(&image, layout, 16 * 1024, 16 * 1024)
+                .expect("native mapping set should map");
+            let fd = unsafe {
+                let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+                libc::open(c.as_ptr(), libc::O_RDWR)
+            };
+            if fd < 0 {
+                unsafe { libc::_exit(2) };
+            }
+            let va = crate::memory::LINUX_SHARED_FILE_BASE;
+            let prot = libc::PROT_READ | libc::PROT_WRITE;
+            if memory
+                .map_host_alias(va, 16 * 1024, &[], Some((fd, 0, prot)), false)
+                .is_err()
+            {
+                unsafe { libc::_exit(3) };
+            }
+            let word = va + 0x4c;
+            let key = |memory: &NativeMappedMemory| {
+                memory.shared_futex_location(word).map(|l| l.waiter_key())
+            };
+            // Sanity: while mapped, the word is file-keyed (not the VA).
+            let file_keyed = matches!(key(&memory), Some(k) if k != word as usize);
+            if memory.unmap_range(va, 16 * 1024).is_err() {
+                unsafe { libc::_exit(4) };
+            }
+            // After munmap the reused VA is an arena word again: it must key
+            // by VA like every other process, never by the dead file.
+            let va_keyed_after = key(&memory) == Some(word as usize);
+            unsafe { libc::_exit(i32::from(!(file_keyed && va_keyed_after))) };
         }
         let mut status = 0;
         assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
