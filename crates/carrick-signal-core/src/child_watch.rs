@@ -178,6 +178,28 @@ pub fn clear() {
     }
 }
 
+/// ATFORK-PREPARE guard over BOTH child-watch mutexes (see [`hold_for_fork`]).
+/// Held by the FORKING thread across `fork()` so a fork child can never
+/// inherit either mutex in a LOCKED state from another thread (the child-exit
+/// watcher mid-`take`/`register`): the child's own reinit path calls [`clear`]
+/// and would otherwise park forever on a COW lock copy that no surviving
+/// thread will ever release.
+pub struct ChildWatchForkGuard {
+    _watches: std::sync::MutexGuard<'static, Option<HashMap<i32, (i32, i32)>>>,
+    _siginfos: std::sync::MutexGuard<'static, Option<ChildSiginfoQueue>>,
+}
+
+/// Acquire both child-watch mutexes for an atfork-prepare hold across a host
+/// `fork()`. Drop the guard IMMEDIATELY after the fork returns — in BOTH the
+/// parent and the child, and strictly BEFORE the child calls [`clear`] (the
+/// mutexes are not reentrant).
+pub fn hold_for_fork() -> ChildWatchForkGuard {
+    ChildWatchForkGuard {
+        _watches: lock(),
+        _siginfos: lock_siginfos(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

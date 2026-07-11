@@ -259,15 +259,39 @@ impl carrick_hal::VcpuKick for NativeKickHandle {
 /// the `timer_delivery` OnceLock and inherited across fork — always kick the
 /// LIVE registry: `NativeThreadRuntime::new_current` installs it at boot and
 /// again in a fork child (`reset_after_fork_child`).
-static NATIVE_PROCESS_KICKER: parking_lot::Mutex<Option<Arc<carrick_hal::GenericVcpuRegistry>>> =
-    parking_lot::Mutex::new(None);
+///
+/// FORK-SAFE BY CONSTRUCTION: this is a plain `AtomicPtr`, NOT a mutex. A
+/// mutex here would be COW-inherited in a LOCKED state by a fork child
+/// whenever some other parent thread (timer fire, child-exit publish) was
+/// mid-`kick_all` at fork time, wedging the child's `new_current` reinstall
+/// forever — the same fork×kick race class as the registry's own handles
+/// mutex (see `NativeThreadRuntime::drop`). Installed registries are
+/// intentionally never released (one small leak per boot/fork-child
+/// install), which is exactly what lets readers use the raw pointer without
+/// a load/free race.
+static NATIVE_PROCESS_KICKER: std::sync::atomic::AtomicPtr<carrick_hal::GenericVcpuRegistry> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+/// Publish `kicker` as THE process kick registry (boot + fork-child reset).
+/// The previous registry (if any) is deliberately leaked — a kicker thread
+/// may hold a reference to it right now, and the bounded leak (one per
+/// install) is what makes the reader side lock-free and fork-safe.
+fn install_native_process_kicker(kicker: &Arc<carrick_hal::GenericVcpuRegistry>) {
+    let raw = Arc::into_raw(Arc::clone(kicker)).cast_mut();
+    let _leaked_previous = NATIVE_PROCESS_KICKER.swap(raw, std::sync::atomic::Ordering::AcqRel);
+}
 
 fn kick_all_native_guest_threads() {
-    let kicker = NATIVE_PROCESS_KICKER.lock().clone();
-    if let Some(kicker) = kicker {
-        use carrick_hal::VcpuRegistry as _;
-        kicker.kick_all();
+    let raw = NATIVE_PROCESS_KICKER.load(std::sync::atomic::Ordering::Acquire);
+    if raw.is_null() {
+        return;
     }
+    // SAFETY: pointers installed by `install_native_process_kicker` come from
+    // `Arc::into_raw` and are never released (leak-on-replace), so the
+    // registry outlives every reader.
+    let kicker = unsafe { &*raw };
+    use carrick_hal::VcpuRegistry as _;
+    kicker.kick_all();
 }
 
 /// Deliver a process-directed timer signal to a native guest: publish into the
@@ -1656,6 +1680,11 @@ struct NativeThreadRuntime {
     kick_state: Option<Arc<NativeKickState>>,
     threads: Arc<parking_lot::Mutex<Vec<std::thread::JoinHandle<()>>>>,
     finished: bool,
+    /// True on the COW copy a fork child replaces in `reset_after_fork_child`:
+    /// its `kicker` registry mutexes may have been inherited LOCKED (another
+    /// parent thread mid-`kick_all` at fork time), so `Drop` must not touch
+    /// them — see the fork×kick deadlock note on `Drop`.
+    forked_stale: bool,
 }
 
 impl NativeThreadRuntime {
@@ -1670,7 +1699,7 @@ impl NativeThreadRuntime {
         // Publish the fresh registry as THE process kicker (boot and fork-child
         // reset both come through here) so timer fallback threads kick the
         // live guest threads, never a stale pre-fork registry.
-        *NATIVE_PROCESS_KICKER.lock() = Some(Arc::clone(&kicker));
+        install_native_process_kicker(&kicker);
         let runtime = Self {
             tid,
             registry,
@@ -1681,6 +1710,7 @@ impl NativeThreadRuntime {
             kick_state: None,
             threads: Arc::new(parking_lot::Mutex::new(Vec::new())),
             finished: false,
+            forked_stale: false,
         };
         runtime
             .registry
@@ -1689,6 +1719,14 @@ impl NativeThreadRuntime {
     }
 
     fn reset_after_fork_child(&mut self) {
+        // The runtime being replaced is the parent's COW copy. Its kicker
+        // registry mutexes may have been inherited LOCKED (another parent
+        // thread mid-`kick_all` at fork instant); mark it stale so the
+        // assignment's implicit Drop discards it without locking them —
+        // pre-fix the child deadlocked here in `release_kick_target` →
+        // `unregister` (the clone3signalflight/execpermitchurn load-coupled
+        // campaign TIMEOUTs).
+        self.forked_stale = true;
         *self = Self::new_current();
     }
 
@@ -1707,6 +1745,7 @@ impl NativeThreadRuntime {
             kick_state: None,
             threads: Arc::clone(&self.threads),
             finished: false,
+            forked_stale: false,
         }
     }
 
@@ -1934,6 +1973,30 @@ impl NativeThreadRuntime {
 
 impl Drop for NativeThreadRuntime {
     fn drop(&mut self) {
+        if self.forked_stale {
+            // COW copy discarded by a fork child (`reset_after_fork_child`):
+            // the inherited kicker registry's std mutexes may have been
+            // captured LOCKED by another parent thread mid-`kick_all` at fork
+            // time. Neither `unregister` (locks them; the observed
+            // clone3signalflight/execpermitchurn wedge — a fork child parked
+            // forever in `__psynch_mutexwait` under `release_kick_target`)
+            // nor dropping the registry (pthread_mutex_destroy on a locked
+            // copy) is safe here, and no parent thread exists in the child to
+            // ever release them. Leak the registry copy and the kick-state
+            // binding — bounded to one small allocation per fork — while the
+            // child's replacement runtime installed a fresh registry via
+            // `new_current`. Regression:
+            // `fork_child_reset_skips_cow_locked_kick_registry`.
+            if let Some(state) = self.kick_state.take() {
+                std::mem::forget(state);
+            }
+            let stale_registry = std::mem::replace(
+                &mut self.kicker,
+                Arc::new(carrick_hal::GenericVcpuRegistry::new()),
+            );
+            std::mem::forget(stale_registry);
+            return;
+        }
         self.release_kick_target();
     }
 }
@@ -2870,7 +2933,20 @@ fn handle_native_fork(
             );
         }
     };
+    // ATFORK-PREPARE: pin every fork-shared signal-static mutex an auxiliary
+    // thread can hold (the child-exit watcher mid-publish: child-watch tables,
+    // THREAD_PENDING, THREAD_WAITERS) on THIS thread across fork(), then
+    // release immediately in both processes. Without this, a fork landing
+    // while the watcher held one left the child's COW lock copy locked
+    // forever and the child wedged in reinit_after_fork → child_watch::clear
+    // (the execpermitchurn/clone3signalflight load-coupled TIMEOUTs). The
+    // kicker registry needs no hold: a stale COW runtime skips it entirely
+    // (`forked_stale` in NativeThreadRuntime::drop).
+    let fork_signal_locks = crate::host_signal::hold_signal_locks_for_fork();
     let child = unsafe { libc::fork() };
+    // Both branches: the forking thread (the sole survivor in the child) owns
+    // the guards and must release them before any signal-static use below.
+    drop(fork_signal_locks);
     if child < 0 {
         crate::guest_cpu::abort_prepared_child_record();
         if let Some((read_fd, write_fd)) = vfork_pipe {
@@ -6904,6 +6980,104 @@ mod tests {
         let child = runtime.sibling(child_tid);
         assert_eq!(child.waiter.tid(), child_tid);
         runtime.registry.exit(child_tid);
+    }
+
+    /// A fork child inherits the vCPU-kick registry as a COW copy — including
+    /// its `std::sync::Mutex` state. If any OTHER parent thread was inside
+    /// `kick_all` (timer fire, child-exit publish, xsig nudge) at fork time,
+    /// the child's copy of the handles mutex is locked forever, and the old
+    /// `reset_after_fork_child` path deadlocked the child in
+    /// `Drop → release_kick_target → unregister` before it could resume the
+    /// guest: the load-coupled clone3signalflight/execpermitchurn campaign
+    /// TIMEOUTs (fork storms × kick storms). The stale COW runtime must be
+    /// discarded WITHOUT touching the inherited registry mutexes.
+    #[test]
+    fn fork_child_reset_skips_cow_locked_kick_registry() {
+        use carrick_hal::VcpuRegistry as _;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        #[derive(Clone)]
+        struct BlockingKick {
+            entered: Arc<AtomicBool>,
+            release: Arc<AtomicBool>,
+        }
+        impl carrick_hal::VcpuKick for BlockingKick {
+            fn kick(&self) {
+                self.entered.store(true, Ordering::SeqCst);
+                // Hold the registry's handles mutex (we are called from
+                // kick_all) until the test releases us — spanning the fork.
+                while !self.release.load(Ordering::SeqCst) {
+                    thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+
+        // ManuallyDrop: while the blocking kicker holds the handles mutex, a
+        // panic-unwind of a failed assert below must not drop the runtime
+        // (release_kick_target would wedge the unwinding test thread). On the
+        // success path the holder is released + joined first, then the
+        // runtime is dropped normally so no wedge-prone handle stays behind
+        // in the installed process kicker for later tests to trip on.
+        let mut runtime = std::mem::ManuallyDrop::new(NativeThreadRuntime::new_current());
+        let entered = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        runtime.kicker.register(
+            crate::thread::ThreadId::synthetic_for_tests(0x424b), // "BK"
+            Box::new(BlockingKick {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            }),
+        );
+        let kicker = Arc::clone(&runtime.kicker);
+        let holder = thread::Builder::new()
+            .name("test-kick-holder".into())
+            .spawn(move || {
+                use carrick_hal::VcpuRegistry as _;
+                kicker.kick_all();
+            })
+            .expect("spawn kick holder");
+        while !entered.load(Ordering::SeqCst) {
+            thread::yield_now();
+        }
+
+        // SAFETY: plain fork; the child only runs the reset-under-test and
+        // reports through its exit status.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed");
+        if child == 0 {
+            // Pre-fix this deadlocked on the COW-locked handles mutex and the
+            // child never exited; the parent's bounded reap below caught it.
+            runtime.reset_after_fork_child();
+            unsafe { libc::_exit(0) };
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut status: libc::c_int = -1;
+        loop {
+            let rc = unsafe { libc::waitpid(child, &mut status, libc::WNOHANG) };
+            if rc == child {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "fork child wedged in reset_after_fork_child (COW-locked registry)"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "fork child died abnormally: status={status:#x}"
+        );
+        // Success: release the holder so the handles mutex is free again,
+        // then tear the runtime down normally — leaving no forever-blocking
+        // kick handle in the installed process kicker for later tests.
+        release.store(true, Ordering::SeqCst);
+        holder.join().expect("join kick holder");
+        runtime
+            .kicker
+            .unregister(crate::thread::ThreadId::synthetic_for_tests(0x424b));
+        // SAFETY: dropped exactly once, after the mutex holder released.
+        unsafe { std::mem::ManuallyDrop::drop(&mut runtime) };
     }
 
     #[test]
