@@ -118,3 +118,4 @@ cc = "1"
 carrick-test-support = { path = "../carrick-test-support" }
 tempfile.workspace = true
 carrick-image = { path = "../carrick-image" }
+proptest.workspace = true

@@ -407,8 +407,8 @@ where
         carrick_spec::Platform::host_native(),
         options.exec_backend,
         options.native_page_profile,
+        options.native_code_mode,
     )?;
-    crate::page_profile::validate_native_code_mode(options.native_code_mode, &plan)?;
     match plan.backend {
         crate::page_profile::ExecutionBackend::Hvf => {
             run_static_elf_with_hvf_args_and_dispatcher_debug(
@@ -428,7 +428,6 @@ where
                 env,
                 options.max_traps,
                 options.debug_state_path,
-                options.native_code_mode,
                 &plan,
             )
         }
