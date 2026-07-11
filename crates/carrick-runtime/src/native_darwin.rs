@@ -64,6 +64,21 @@ const NATIVE_DARWIN_HEAP_SIZE: u64 = 128 * 1024 * 1024;
 // native direct-mapped arena above Carrick's shared/private aperture windows.
 const NATIVE_DARWIN_MMAP_BASE: u64 = 0xa0_0000_0000;
 const NATIVE_DARWIN_MMAP_SIZE: u64 = 32 * 1024 * 1024 * 1024;
+// The canonical Linux vvar/vdso VAs (0x2E_0000_0000/0x2E_0001_0000) sit inside
+// a Darwin-reserved host VA hole: mmap(MAP_FIXED) and mach_vm_allocate refuse
+// [63 GiB, 448 GiB) with EACCES/KERN_NO_SPACE in any Darwin process (measured
+// on macOS 27, entitlements make no difference), and native guest VAs ARE host
+// VAs. Relocate both pages by +512 GiB into the proven-mappable high span the
+// other native windows already occupy (above the 0x70..0x80 GiB*4 randomized
+// malloc zones, disjoint from the 0x90/0x98 apertures, the 0xA0..0xA8 mmap
+// arena, and the ~1 TiB stack). The vvar base must stay a multiple of 1<<32
+// whose high half fits one `movz #imm16, lsl #32` — the injected vDSO page's
+// hardcoded vvar loads are rewritten to it at map time.
+const NATIVE_DARWIN_VVAR_BASE: u64 = carrick_mem::vdso::LINUX_VVAR_BASE + (0x80 << 32);
+const NATIVE_DARWIN_VDSO_BASE: u64 = carrick_mem::vdso::LINUX_VDSO_BASE + (0x80 << 32);
+const _: () = assert!(NATIVE_DARWIN_VVAR_BASE & ((1 << 32) - 1) == 0);
+const _: () = assert!(NATIVE_DARWIN_VVAR_BASE >> 32 <= u16::MAX as u64);
+const _: () = assert!(carrick_mem::vdso::LINUX_VVAR_BASE & ((1 << 32) - 1) == 0);
 const NATIVE_DARWIN_HARD_PAGEZERO_END: u64 = 0x1_0000_0000;
 const NATIVE_EVENT_TRAP: i32 = 1;
 const NATIVE_EVENT_KICK: i32 = 2;
@@ -307,8 +322,16 @@ where
         NATIVE_DARWIN_PIE_BASE,
         geometry.host_page_size,
     )?
-    .with_vdso_auxv(false)
-    .with_linux_initial_stack_page_size(argv, env, geometry.linux_page_size)?;
+    .with_vdso_auxv(crate::runtime::vdso_enabled_for_debug());
+    // Same vDSO image + debug-mode selection as the HVF boot/execve builders,
+    // relocated to the native-mappable bases (`NATIVE_DARWIN_VVAR_BASE`).
+    // `NativeMappedMemory::map` rewrites the code page's vvar loads and stamps
+    // the vvar data page.
+    let image = with_native_vdso(image)?.with_linux_initial_stack_page_size(
+        argv,
+        env,
+        geometry.linux_page_size,
+    )?;
     maybe_dump_debug_state(&image, debug_state_path);
 
     run_image_in_child(image, dispatcher, max_traps, relative_relocations, plan)
@@ -365,8 +388,12 @@ where
         NATIVE_DARWIN_PIE_BASE,
         geometry.host_page_size,
     )?
-    .with_vdso_auxv(false)
-    .with_linux_initial_stack_page_size(argv, env, geometry.linux_page_size)?;
+    .with_vdso_auxv(crate::runtime::vdso_enabled_for_debug());
+    let image = with_native_vdso(image)?.with_linux_initial_stack_page_size(
+        argv,
+        env,
+        geometry.linux_page_size,
+    )?;
     maybe_dump_debug_state(&image, debug_state_path);
 
     run_image_in_child(image, dispatcher, max_traps, relative_relocations, plan)
@@ -416,14 +443,19 @@ fn load_native_execve_image(
         geometry.host_page_size,
     )
     .map_err(|_| crate::linux_abi::LINUX_ENOEXEC)?
-    .with_vdso_auxv(false)
-    .with_linux_initial_stack_execfn_page_size(
-        argv,
-        env,
-        resolved.as_bytes(),
-        geometry.linux_page_size,
-    )
-    .map_err(|_| crate::linux_abi::LINUX_ENOENT)?;
+    .with_vdso_auxv(crate::runtime::vdso_enabled_for_debug());
+    // Mirror the HVF execve builder: the replacement image carries fresh
+    // vvar/vdso regions; `replace_image` → `NativeMappedMemory::map` re-stamps
+    // the vvar for the new image.
+    let image = with_native_vdso(image)
+        .map_err(|_| crate::linux_abi::LINUX_ENOENT)?
+        .with_linux_initial_stack_execfn_page_size(
+            argv,
+            env,
+            resolved.as_bytes(),
+            geometry.linux_page_size,
+        )
+        .map_err(|_| crate::linux_abi::LINUX_ENOENT)?;
     Ok((image, relative_relocations, resolved))
 }
 
@@ -434,6 +466,33 @@ fn native_memory_layout() -> MemoryLayout {
         mmap_base: NATIVE_DARWIN_MMAP_BASE,
         mmap_size: NATIVE_DARWIN_MMAP_SIZE,
     }
+}
+
+/// Attach the shared vDSO (same ELF image + `CARRICK_DISABLE_VDSO` /
+/// `CARRICK_VDSO_MODE` debug controls as the HVF builders) at the
+/// native-mappable relocated bases, repointing `AT_SYSINFO_EHDR` accordingly.
+fn with_native_vdso(image: AddressSpace) -> Result<AddressSpace, AddressSpaceError> {
+    crate::runtime::with_optional_vdso_at::<carrick_hal::Aarch64GuestArch>(
+        image,
+        NATIVE_DARWIN_VVAR_BASE,
+        NATIVE_DARWIN_VDSO_BASE,
+    )
+}
+
+/// `(counter_freq_hz, clock_uptime_raw_ns)` — the SAME calibration sources the
+/// HVF vvar stamper uses (re-exported from carrick-vmm-hvf's sysreg module), so
+/// the native and HVF vvar pages describe one timeline. The off-target stub
+/// returns `freq == 0`, which skips the clock words exactly like HVF's
+/// zero-frequency guard; the native backend only ever RUNS on aarch64 macOS.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn native_vvar_clock_sources() -> (u64, u64) {
+    let (_, freq) = crate::trap::host_counter();
+    (freq, crate::trap::host_clock_uptime_ns())
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+fn native_vvar_clock_sources() -> (u64, u64) {
+    (0, 0)
 }
 
 fn canonical_host_executable_path(path: &Path) -> String {
@@ -2554,6 +2613,11 @@ fn handle_native_fork(
         native_trace_fork_phase("child-thread-runtime-reset");
         crate::guest_cpu::reset();
         crate::guest_cpu::complete_child_record_post_fork_child();
+        // P2 getrandom fork-safety: give the child its own vvar RNG generation
+        // (its PID) so the COW-inherited userspace getrandom state reseeds
+        // instead of replaying the parent's keystream — the native counterpart
+        // of the HVF child-side re-stamp in `fork_rebuild`.
+        memory.lock().restamp_vdso_rng_generation_after_fork()?;
         crate::run_state::reinit_booting_after_fork();
         let self_tid = (crate::namespace::pid::self_ns_pid() as i32).to_le_bytes();
         if let Some(addr) = request.parent_tid_addr {
@@ -4122,6 +4186,9 @@ impl NativeMappedMemory {
         let mut regions = Vec::new();
         for region in image.regions() {
             map_region(region)?;
+            if region.start == NATIVE_DARWIN_VDSO_BASE && region.perms.execute {
+                relocate_vdso_vvar_loads(region)?;
+            }
             regions.push(NativeMappedRegion {
                 start: region.start,
                 end: region.end,
@@ -4218,7 +4285,7 @@ impl NativeMappedMemory {
             })?;
             protections.set_no_write(span.start, len, true);
         }
-        Ok(Self {
+        let memory = Self {
             regions,
             protections,
             native_page_protections: BTreeMap::new(),
@@ -4227,7 +4294,112 @@ impl NativeMappedMemory {
             exclusive_reservation: None,
             host_page_size,
             linux_page_size,
-        })
+        };
+        // Publishing the vvar contents is part of establishing the address
+        // space: the initial boot maps here, and an execve replacement re-maps
+        // here (`replace_image`), so both get a freshly stamped vvar.
+        memory.stamp_vdso_vvar()?;
+        Ok(memory)
+    }
+
+    /// Publish the vvar data page (RNG generation + clock calibration) for a
+    /// freshly mapped image — the native counterpart of the HVF vvar stamper
+    /// (`populate_vdso_data_page` in carrick-vmm-hvf/src/trap.rs). It uses the
+    /// same calibration sources and publishes the SAME realtime offset via
+    /// [`crate::vdso::set_realtime_off_ns`], so the userspace vDSO fast paths
+    /// and the trapping syscall clock paths cannot drift apart
+    /// (clock_gettime04 coherence). No-op when the image carries no vDSO
+    /// (CARRICK_DISABLE_VDSO).
+    ///
+    /// Natively the guest's `mrs cntvct_el0` reads the HOST counter directly
+    /// (there is no CNTVOFF virtualization), so this stamping is correct only
+    /// while the raw counter and CLOCK_UPTIME_RAW share one timeline on the
+    /// host. That equivalence is gated empirically by the
+    /// `native_el0_counter_reads_track_clock_uptime_raw` test below.
+    fn stamp_vdso_vvar(&self) -> Result<(), RuntimeError> {
+        if !self.vvar_region_is_mapped() {
+            return Ok(());
+        }
+        // RNG generation first and unconditionally (getrandom needs no
+        // calibrated counter): this process's host PID, unique per process and
+        // re-stamped in a forked child, so the userspace getrandom blob
+        // reseeds instead of reusing a COW-inherited keystream.
+        let pid = unsafe { libc::getpid() } as u64;
+        let mut words = vec![(crate::vdso::VVAR_OFF_RNG_GENERATION, pid)];
+        let (freq, mono_ns) = native_vvar_clock_sources();
+        if freq != 0 {
+            let unix_ns = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0);
+            let realtime_off = unix_ns.wrapping_sub(mono_ns);
+            crate::vdso::set_realtime_off_ns(realtime_off);
+            words.push((crate::vdso::VVAR_OFF_FREQ, freq));
+            words.push((crate::vdso::VVAR_OFF_REALTIME_OFF_NS, realtime_off));
+        }
+        self.write_vvar_words(&words)
+    }
+
+    /// Re-stamp the vvar RNG generation with THIS process's PID — the native
+    /// fork-child counterpart of the HVF child-side re-stamp in `fork_rebuild`.
+    /// The child's distinct generation forces the userspace getrandom blob to
+    /// reseed instead of replaying the parent's keystream (gated by the
+    /// getrandomvdsofork probe). No-op when the vDSO is disabled.
+    fn restamp_vdso_rng_generation_after_fork(&self) -> Result<(), RuntimeError> {
+        if !self.vvar_region_is_mapped() {
+            return Ok(());
+        }
+        let pid = unsafe { libc::getpid() } as u64;
+        self.write_vvar_words(&[(crate::vdso::VVAR_OFF_RNG_GENERATION, pid)])
+    }
+
+    fn vvar_region_is_mapped(&self) -> bool {
+        self.region_contains(
+            NATIVE_DARWIN_VVAR_BASE,
+            crate::vdso::LINUX_VVAR_SIZE as usize,
+        )
+    }
+
+    /// Write little-endian u64s into the vvar data page. The vvar is mapped
+    /// read-only for the guest, so the containing host page flips writable for
+    /// the duration of the write. Every caller runs before guest code can
+    /// observe the page (boot mapping, execve replacement, a fresh
+    /// single-threaded fork child), so the transient writability is invisible.
+    fn write_vvar_words(&self, words: &[(usize, u64)]) -> Result<(), RuntimeError> {
+        let vvar_end = NATIVE_DARWIN_VVAR_BASE + crate::vdso::LINUX_VVAR_SIZE;
+        let (page_start, page_len) = self
+            .host_page_range(NATIVE_DARWIN_VVAR_BASE, vvar_end)
+            .map_err(|_| {
+                RuntimeError::Unsupported("native Darwin vvar page range overflow".to_string())
+            })?;
+        let page_ptr = usize::try_from(page_start).map_err(|_| {
+            RuntimeError::Unsupported(format!(
+                "native Darwin vvar page too large: {page_start:#x}"
+            ))
+        })? as *mut libc::c_void;
+        if unsafe { libc::mprotect(page_ptr, page_len, libc::PROT_READ | libc::PROT_WRITE) } != 0 {
+            return Err(last_io_error("mprotect native Darwin vvar page writable"));
+        }
+        for &(offset, value) in words {
+            debug_assert!(
+                offset + std::mem::size_of::<u64>() <= crate::vdso::LINUX_VVAR_SIZE as usize
+            );
+            let address = NATIVE_DARWIN_VVAR_BASE + offset as u64;
+            let bytes = value.to_le_bytes();
+            // SAFETY: the vvar region is mapped at its fixed VA (checked by the
+            // callers via vvar_region_is_mapped) and was just made writable.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    address as usize as *mut u8,
+                    bytes.len(),
+                );
+            }
+        }
+        if unsafe { libc::mprotect(page_ptr, page_len, libc::PROT_READ) } != 0 {
+            return Err(last_io_error("restore native Darwin vvar page read-only"));
+        }
+        Ok(())
     }
 
     fn set_fork_inheritance(&self, share: bool) {
@@ -5799,6 +5971,46 @@ fn region_prot(region: &MemoryRegion) -> libc::c_int {
     prot
 }
 
+/// `movz Xd, #imm16, lsl #32` (sf=1, opc=10, hw=10), any destination register.
+const fn movz_x_lsl32(imm16: u16) -> u32 {
+    0xd2c0_0000 | ((imm16 as u32) << 5)
+}
+
+/// Rewrite the injected vDSO code page's hardcoded vvar-base loads from the
+/// canonical `LINUX_VVAR_BASE` to `NATIVE_DARWIN_VVAR_BASE`. The vDSO clock
+/// functions and the getrandom blob each materialise the vvar VA with a single
+/// `movz Xn, #(LINUX_VVAR_BASE >> 32), lsl #32`; both bases are exact 1<<32
+/// multiples (const-asserted above), so retargeting is a pure immediate swap.
+/// This pass runs ONLY on carrick's own vDSO page — never on guest-owned code,
+/// where an immediate rewrite would corrupt legitimate instructions.
+fn relocate_vdso_vvar_loads(region: &MemoryRegion) -> Result<(), RuntimeError> {
+    let length = region.bytes().len();
+    let base = usize::try_from(region.start).map_err(|_| {
+        RuntimeError::Unsupported(format!(
+            "native Darwin vdso base too large: {:#x}",
+            region.start
+        ))
+    })? as *mut u8;
+    let canonical = movz_x_lsl32((carrick_mem::vdso::LINUX_VVAR_BASE >> 32) as u16);
+    let relocated = movz_x_lsl32((NATIVE_DARWIN_VVAR_BASE >> 32) as u16);
+    const RD_MASK: u32 = 0x1f;
+    if unsafe { libc::mprotect(base.cast(), length, libc::PROT_READ | libc::PROT_WRITE) } != 0 {
+        return Err(last_io_error("mprotect native Darwin vdso page writable"));
+    }
+    for index in 0..length / std::mem::size_of::<u32>() {
+        let ptr = unsafe { base.add(index * std::mem::size_of::<u32>()).cast::<u32>() };
+        let word = unsafe { std::ptr::read_unaligned(ptr) };
+        if word & !RD_MASK == canonical {
+            unsafe { std::ptr::write_unaligned(ptr, relocated | (word & RD_MASK)) };
+        }
+    }
+    unsafe { carrick_native_clear_icache(base.cast(), length) };
+    if unsafe { libc::mprotect(base.cast(), length, libc::PROT_READ | libc::PROT_EXEC) } != 0 {
+        return Err(last_io_error("restore native Darwin vdso page protections"));
+    }
+    Ok(())
+}
+
 fn patch_syscalls(base: *mut u8, length: usize) {
     patch_syscalls_recording(base, length, |_, _| {});
 }
@@ -6328,6 +6540,10 @@ mod tests {
                 crate::memory::LINUX_PRIVATE_OVERLAY_BASE,
                 crate::memory::LINUX_PRIVATE_OVERLAY_BASE
                     + crate::memory::LINUX_PRIVATE_OVERLAY_SIZE,
+            ),
+            (
+                NATIVE_DARWIN_VVAR_BASE,
+                NATIVE_DARWIN_VDSO_BASE + crate::vdso::LINUX_VDSO_SIZE,
             ),
         ];
         for window in fixed {
@@ -7724,5 +7940,147 @@ mod tests {
         let elf = Elf::parse(&static_pie).expect("synthetic static PIE should parse");
 
         assert!(native_image_needs_eager_relocations(&elf));
+    }
+
+    /// Empirical hazard gate for the native vDSO (see `stamp_vdso_vvar`):
+    /// natively the guest's vDSO clock code reads the RAW `cntvct_el0` /
+    /// `cntfrq_el0` at EL0, while the dispatcher's clock paths and the stamped
+    /// vvar realtime offset are based on CLOCK_UPTIME_RAW. This proves, on the
+    /// host actually running the suite, that (a) EL0 reads of both registers
+    /// do not fault in a plain Darwin userspace process and (b) the raw
+    /// counter and CLOCK_UPTIME_RAW share ONE timeline: two raw reads
+    /// bracketing a CLOCK_UPTIME_RAW read must enclose it (modulo conversion
+    /// rounding). If a host ever diverges (e.g. a raw counter that keeps
+    /// ticking through suspend while CLOCK_UPTIME_RAW does not — the behavior
+    /// HVF documents for older hosts in trap.rs), this fails and the native
+    /// vDSO clock stamping must be re-based before trusting native clocks
+    /// there.
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn native_el0_counter_reads_track_clock_uptime_raw() {
+        let (ticks_before, freq) = crate::trap::host_counter();
+        assert!(freq > 0, "CNTFRQ_EL0 read zero at EL0");
+        let uptime_ns = crate::trap::host_clock_uptime_ns();
+        let (ticks_after, _) = crate::trap::host_counter();
+        assert!(ticks_after >= ticks_before, "CNTVCT_EL0 went backwards");
+        let to_ns = |ticks: u64| (ticks as u128 * 1_000_000_000 / u128::from(freq)) as u64;
+        // One counter tick + 1µs of conversion rounding slack.
+        let slack_ns = 1_000_000_000 / freq + 1_000;
+        let raw_before_ns = to_ns(ticks_before);
+        let raw_after_ns = to_ns(ticks_after);
+        assert!(
+            raw_before_ns <= uptime_ns + slack_ns,
+            "raw CNTVCT ({raw_before_ns} ns) is ahead of CLOCK_UPTIME_RAW ({uptime_ns} ns): timelines diverge"
+        );
+        assert!(
+            uptime_ns <= raw_after_ns + slack_ns,
+            "raw CNTVCT ({raw_after_ns} ns) is behind CLOCK_UPTIME_RAW ({uptime_ns} ns): timelines diverge"
+        );
+    }
+
+    /// Mapping an image that carries the vDSO must (a) stamp the read-only
+    /// vvar page — RNG generation = this process's PID, non-zero counter
+    /// frequency, and a realtime offset that is also published to the shared
+    /// syscall-path store — (b) route the injected vDSO code page through the
+    /// native syscall-instruction translation pass (no `svc #0` survives; the
+    /// brk replacement is present), (c) rewrite the code page's hardcoded
+    /// canonical vvar-base loads to the relocated native base, and (d) support
+    /// the fork-child RNG generation re-stamp against the once-again read-only
+    /// page.
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn native_map_stamps_vvar_and_patches_vdso_svc() {
+        let child = unsafe { libc::fork() };
+        assert!(
+            child >= 0,
+            "fork failed: {}",
+            std::io::Error::last_os_error()
+        );
+        if child == 0 {
+            let page_size = 16 * 1024_u64;
+            let layout = MemoryLayout {
+                heap_base: NATIVE_DARWIN_HEAP_BASE,
+                heap_size: page_size,
+                mmap_base: NATIVE_DARWIN_MMAP_BASE,
+                mmap_size: page_size,
+            };
+            let image = AddressSpace::from_regions(0, Vec::new()).and_then(|image| {
+                image.with_vdso_bytes_at(
+                    crate::vdso::vdso_image_bytes(),
+                    NATIVE_DARWIN_VVAR_BASE,
+                    NATIVE_DARWIN_VDSO_BASE,
+                )
+            });
+            let Ok(image) = image else {
+                unsafe { libc::_exit(10) }
+            };
+            let memory = match NativeMappedMemory::map(&image, layout, page_size, page_size) {
+                Ok(memory) => memory,
+                Err(err) => {
+                    child_write_stderr(format!("map failed: {err}\n").as_bytes());
+                    unsafe { libc::_exit(11) }
+                }
+            };
+            let read_vvar_u64 = |offset: usize| unsafe {
+                std::ptr::read_volatile((NATIVE_DARWIN_VVAR_BASE as usize + offset) as *const u64)
+            };
+            let pid = unsafe { libc::getpid() } as u64;
+            if read_vvar_u64(crate::vdso::VVAR_OFF_RNG_GENERATION) != pid {
+                unsafe { libc::_exit(12) }
+            }
+            if read_vvar_u64(crate::vdso::VVAR_OFF_FREQ) == 0 {
+                unsafe { libc::_exit(13) }
+            }
+            let realtime_off = read_vvar_u64(crate::vdso::VVAR_OFF_REALTIME_OFF_NS);
+            if realtime_off == 0 || crate::vdso::realtime_off_ns() != Some(realtime_off) {
+                unsafe { libc::_exit(14) }
+            }
+            // The injected vDSO ELF page went through the same syscall
+            // translation pass as ordinary executable pages, and its hardcoded
+            // vvar-base loads were retargeted at the relocated native base.
+            let vdso_words: Vec<u32> = unsafe {
+                std::slice::from_raw_parts(
+                    NATIVE_DARWIN_VDSO_BASE as usize as *const u8,
+                    crate::vdso::LINUX_VDSO_SIZE as usize,
+                )
+            }
+            .chunks_exact(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect();
+            if vdso_words.contains(&SVC_0) {
+                unsafe { libc::_exit(15) }
+            }
+            if !vdso_words.contains(&BRK_NATIVE_SYSCALL) {
+                unsafe { libc::_exit(16) }
+            }
+            let canonical_movz = movz_x_lsl32((crate::vdso::LINUX_VVAR_BASE >> 32) as u16);
+            let relocated_movz = movz_x_lsl32((NATIVE_DARWIN_VVAR_BASE >> 32) as u16);
+            if vdso_words.iter().any(|w| w & !0x1f == canonical_movz) {
+                unsafe { libc::_exit(17) }
+            }
+            if !vdso_words.iter().any(|w| w & !0x1f == relocated_movz) {
+                unsafe { libc::_exit(18) }
+            }
+            // Fork re-stamp mechanism: scribble the generation, re-stamp, and
+            // verify the read-only page carries this process's PID again.
+            if memory
+                .write_vvar_words(&[(crate::vdso::VVAR_OFF_RNG_GENERATION, 0xdead_beef)])
+                .is_err()
+                || read_vvar_u64(crate::vdso::VVAR_OFF_RNG_GENERATION) != 0xdead_beef
+            {
+                unsafe { libc::_exit(19) }
+            }
+            if memory.restamp_vdso_rng_generation_after_fork().is_err()
+                || read_vvar_u64(crate::vdso::VVAR_OFF_RNG_GENERATION) != pid
+            {
+                unsafe { libc::_exit(20) }
+            }
+            unsafe { libc::_exit(0) }
+        }
+
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(libc::WIFEXITED(status), "child status was 0x{status:x}");
+        assert_eq!(libc::WEXITSTATUS(status), 0, "vvar/vdso child check failed");
     }
 }
