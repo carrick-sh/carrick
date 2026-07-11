@@ -282,6 +282,92 @@ fn deliver_native_process_signal(signum: i32) {
     kick_all_native_guest_threads();
 }
 
+/// Native child-exit watch glue. HVF arms `EVFILT_PROC`/`NOTE_EXIT` on its
+/// signal-pump kqueue and KVM's pump reaper peeks tracked pids; the native
+/// backend has neither, so a lazily started per-process watcher thread owns
+/// the equivalent kqueue. Without it, child-exit signals were only discovered
+/// by `native_poll_child_exit_watches` INSIDE wait-type syscalls — a parent
+/// SPINNING in guest code (its clock reads satisfied by the vDSO, so no trap
+/// ever happens) never observed SIGCHLD for an exited child (`sigchld`
+/// probe: `sigchld_handler_ran=false`).
+///
+/// The kqueue fd is stamped with its owner pid: threads (and kqueue
+/// registrations) do not survive `fork`, so a fork child's first
+/// `native_register_child_exit_watch` observes the pid mismatch and starts a
+/// fresh watcher. The neutral watch table itself was already cleared by
+/// `host_signal::reinit_after_fork`.
+static NATIVE_CHILD_WATCH_KQ: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+static NATIVE_CHILD_WATCH_OWNER: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+static NATIVE_CHILD_WATCH_SPAWN: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+/// The watcher's kqueue for THIS process, starting the watcher thread on first
+/// use (and again after fork, keyed by owner pid). `None` if the kqueue or the
+/// thread could not be created — callers fall back to the wait-path polling.
+fn ensure_native_child_watcher() -> Option<RawFd> {
+    use std::sync::atomic::Ordering;
+    let self_pid = std::process::id();
+    let fd = NATIVE_CHILD_WATCH_KQ.load(Ordering::Acquire);
+    if fd >= 0 && NATIVE_CHILD_WATCH_OWNER.load(Ordering::Acquire) == self_pid {
+        return Some(fd);
+    }
+    let _spawn_guard = NATIVE_CHILD_WATCH_SPAWN.lock();
+    let fd = NATIVE_CHILD_WATCH_KQ.load(Ordering::Acquire);
+    if fd >= 0 && NATIVE_CHILD_WATCH_OWNER.load(Ordering::Acquire) == self_pid {
+        return Some(fd);
+    }
+    let kq = carrick_host_bsd::kqueue::Kqueue::new_internal()?;
+    let raw = kq.raw_fd();
+    let spawned = thread::Builder::new()
+        .name("carrick-native-childwatch".to_string())
+        .spawn(move || run_native_child_watcher(kq))
+        .is_ok();
+    if !spawned {
+        return None;
+    }
+    // A stale parent fd number may linger here after fork (kqueues are not
+    // inherited); the number was already dead, so overwriting loses nothing.
+    NATIVE_CHILD_WATCH_KQ.store(raw, Ordering::Release);
+    NATIVE_CHILD_WATCH_OWNER.store(self_pid, Ordering::Release);
+    Some(raw)
+}
+
+fn run_native_child_watcher(kq: carrick_host_bsd::kqueue::Kqueue) {
+    let mut events = [carrick_host_bsd::kqueue::Kevent::empty(); 8];
+    loop {
+        match kq.wait(&[], &mut events, None) {
+            Ok(n) => {
+                for event in events.iter().take(n) {
+                    let Some(child) = event.proc_exit_ident() else {
+                        continue;
+                    };
+                    native_publish_child_exit(child);
+                }
+            }
+            Err(errno) if errno == libc::EINTR => {}
+            // EBADF: the fd was torn down (process exit teardown); anything
+            // else is equally unrecoverable for this watcher. The wait-path
+            // polling remains as the delivery backstop.
+            Err(_) => return,
+        }
+    }
+}
+
+/// Resolve a child's exit against the neutral watch table and deliver the
+/// requested clone exit signal to the recorded parent tid: publish + kick-all,
+/// the same shape as `deliver_native_process_signal` (the parent may be
+/// spinning in guest code with no dispatch edge to piggyback on). `take` is the
+/// publish-once guard against wait4's synchronous terminal-reap cancel.
+fn native_publish_child_exit(child: i32) {
+    let Some((parent_tid, exit_signal)) = crate::host_signal::take_child_exit_parent(child) else {
+        return;
+    };
+    if exit_signal != 0 {
+        crate::host_signal::publish_pending_for(parent_tid, exit_signal);
+    }
+    kick_all_native_guest_threads();
+}
+
 /// Native `TimerDelivery`: there is no signal-pump kqueue, so every interval
 /// timer runs the SHARED timer-core timing loop on a fallback thread —
 /// wall-clock sleeps for `ITIMER_REAL`, guest-CPU polling against the native
@@ -2844,6 +2930,27 @@ fn native_register_child_exit_watch(
         );
     }
     crate::host_signal::register_child_exit_watch(child, tid.raw(), signum);
+    native_arm_child_exit_watch(child);
+}
+
+/// Arm the async watcher for `child` (the native analogue of HVF's pump-kqueue
+/// EVFILT_PROC arm). ESRCH/ENOENT means the child raced its own exit AND has
+/// already become unwatchable; if its status is reapable, deliver the exit
+/// signal the missed one-shot can no longer publish. The same already-dead
+/// check runs after a SUCCESSFUL arm too: the one-shot only fires for exits
+/// after registration.
+fn native_arm_child_exit_watch(child: i32) {
+    if let Some(kq) = ensure_native_child_watcher() {
+        let arm = carrick_host_bsd::kqueue::apply_changes(
+            kq,
+            &[carrick_host_bsd::kqueue::Kevent::proc_exit(child)],
+        );
+        if matches!(arm, Ok(()) | Err(libc::ESRCH | libc::ENOENT))
+            && native_child_status_ready(child)
+        {
+            native_publish_child_exit(child);
+        }
+    }
 }
 
 fn native_poll_child_exit_watches() {
@@ -8026,6 +8133,63 @@ mod tests {
             failures.is_empty(),
             "sharing native mapping classes broke the fork child: {failures:?}"
         );
+    }
+
+    /// The native child-exit watcher must deliver the clone exit signal
+    /// ASYNCHRONOUSLY — publish to the parent tid with no wait-path polling
+    /// involved (the `sigchld` probe's parent spins in guest code and never
+    /// enters a wait). Forked host proof per the native skill's order: register
+    /// a watch for a live child, let it exit, and observe the pending signal
+    /// appear without ever calling `native_poll_child_exit_watches`.
+    #[test]
+    fn native_child_exit_watch_publishes_asynchronously() {
+        let tid = 0x7d0_57a5; // synthetic guest tid; nothing else publishes to it
+        let mut release = [0 as RawFd; 2];
+        assert_eq!(unsafe { libc::pipe(release.as_mut_ptr()) }, 0);
+        let child = unsafe { libc::fork() };
+        assert!(
+            child >= 0,
+            "fork failed: {}",
+            std::io::Error::last_os_error()
+        );
+        if child == 0 {
+            unsafe {
+                libc::close(release[1]);
+                let mut byte = 0u8;
+                let _ = libc::read(release[0], (&raw mut byte).cast(), 1);
+                libc::_exit(0);
+            }
+        }
+        unsafe { libc::close(release[0]) };
+
+        // Register while the child is alive: the one-shot NOTE_EXIT is the
+        // delivery edge under test (not the already-dead fallback).
+        crate::host_signal::register_child_exit_watch(child, tid, crate::linux_abi::LINUX_SIGCHLD);
+        native_arm_child_exit_watch(child);
+        assert!(
+            !crate::host_signal::has_pending_for(tid),
+            "no signal may be pending while the child is alive"
+        );
+
+        // Release the child; the watcher thread must publish SIGCHLD to the
+        // parent tid on its own.
+        unsafe { libc::close(release[1]) };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !crate::host_signal::has_pending_for(tid) {
+            assert!(
+                Instant::now() < deadline,
+                "child-exit watcher did not publish the exit signal within 5s"
+            );
+            std::thread::yield_now();
+        }
+
+        // The publish-once guard already consumed the watch entry.
+        assert_eq!(crate::host_signal::take_child_exit_parent(child), None);
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+        // Drain the synthetic tid so no other host-signal test sees it.
+        let _ = carrick_signal_core::take_pending_for(tid);
     }
 
     #[test]
