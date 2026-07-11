@@ -63,6 +63,11 @@ pub(crate) struct CreateHostConfig {
     pub dns_search: Option<Vec<String>>,
     pub dns_options: Option<Vec<String>>,
     pub volumes_from: Option<Vec<String>>,
+    /// Docker `HostConfig.SecurityOpt` (e.g. `["seccomp=unconfined"]`).
+    /// Validated at create time through the same `resolve_seccomp_policy` the
+    /// CLI uses — an API client that asks for a sandbox shape carrick cannot
+    /// honor gets a 400, never a silently different policy.
+    pub security_opt: Option<Vec<String>>,
 }
 
 #[derive(Deserialize, Default)]
