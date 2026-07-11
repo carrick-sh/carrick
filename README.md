@@ -96,7 +96,12 @@ rejected.
 
 See the dated
 [native feasibility and conformance evidence](docs/2026-07-09-no-vmm-native-feasibility-evidence.md)
-for current measurements and known gaps.
+and the
+[native fork benchmark](docs/2026-07-10-native-fork-benchmark-evidence.md)
+for measurements and known gaps. As of 2026-07-11 the native16k musl
+conformance lane measures 376/376 probes byte-identical with Docker arm64,
+and native `fork` is ~3.4x faster than HVF (1.53x host Darwin) with
+host-COW memory scaling.
 
 ---
 
