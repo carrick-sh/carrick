@@ -3087,6 +3087,15 @@ impl SyscallDispatcher {
                         guest_ns,
                     }) = adopted
                     {
+                        // Linux makes the child-exit signal observable by the
+                        // time waitpid returns. A DIRECT child's terminal reap
+                        // publishes its watch entry synchronously below; an
+                        // adopted child's SIGCHLD instead rides the xsig ring
+                        // (enqueued by the orphan BEFORE it published this
+                        // reapable record) — drain it now so the signal is
+                        // pending before this wait4 completes, not whenever the
+                        // async nudge lands.
+                        this.drain_xsignals_process_directed();
                         // Adopted reap: this process was never the host parent,
                         // so there is no host rusage — the published channel is
                         // the only source under every provider.

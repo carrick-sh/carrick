@@ -258,12 +258,13 @@ pub(crate) fn forked_child_exit(
     let pid = std::process::id();
     crate::guest_cpu::adopt_children_of(pid);
     let adopted_parent = crate::guest_cpu::adopted_parent_for(pid);
-    crate::guest_cpu::record_child_exit_status(
-        pid,
-        crate::guest_cpu::total_ns(),
-        (code & 0xff) << 8,
-        adopted_parent.is_some(),
-    );
+    // Enqueue the subreaper's SIGCHLD BEFORE publishing the reapable exit
+    // record: the parent's wait4 observes `exit_ready` (Acquire) and then
+    // drains the xsig ring so the exit signal is pending by the time wait4
+    // returns, matching Linux's "the child-exit signal is observable when
+    // waitpid returns". Enqueued after the record, the parent could reap and
+    // return between the two and read a not-yet-delivered SIGCHLD
+    // (childsubreaper sigchld_from_orphan=false, load-coupled).
     if let Some(parent) = adopted_parent {
         let _ = crate::host_signal::xsig_enqueue(
             parent as i32,
@@ -276,6 +277,12 @@ pub(crate) fn forked_child_exit(
         );
         crate::host_signal::xsig_nudge(parent as i32);
     }
+    crate::guest_cpu::record_child_exit_status(
+        pid,
+        crate::guest_cpu::total_ns(),
+        (code & 0xff) << 8,
+        adopted_parent.is_some(),
+    );
     let stdout_buf = stdout_buf.as_ref();
     let stderr_buf = stderr_buf.as_ref();
     let _ = unsafe { libc::write(1, stdout_buf.as_ptr() as *const _, stdout_buf.len()) };
@@ -336,12 +343,9 @@ pub(crate) fn forked_child_die_by_signal(
     let pid = std::process::id();
     crate::guest_cpu::adopt_children_of(pid);
     let adopted_parent = crate::guest_cpu::adopted_parent_for(pid);
-    crate::guest_cpu::record_child_exit_status(
-        pid,
-        crate::guest_cpu::total_ns(),
-        signum & 0x7f,
-        adopted_parent.is_some(),
-    );
+    // Enqueue-before-record, as in `forked_child_exit`: the reaping wait4
+    // drains the ring on an adopted reap, so the ring entry must exist by the
+    // time the exit record is observable.
     if let Some(parent) = adopted_parent {
         let _ = crate::host_signal::xsig_enqueue(
             parent as i32,
@@ -354,6 +358,12 @@ pub(crate) fn forked_child_die_by_signal(
         );
         crate::host_signal::xsig_nudge(parent as i32);
     }
+    crate::guest_cpu::record_child_exit_status(
+        pid,
+        crate::guest_cpu::total_ns(),
+        signum & 0x7f,
+        adopted_parent.is_some(),
+    );
     let stdout_buf = stdout_buf.as_ref();
     let stderr_buf = stderr_buf.as_ref();
     let _ = unsafe { libc::write(1, stdout_buf.as_ptr() as *const _, stdout_buf.len()) };
