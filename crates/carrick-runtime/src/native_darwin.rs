@@ -4394,6 +4394,17 @@ struct NativeMappedRegion {
     shared_futex: bool,
     guest_writable: bool,
     default_prot: u64,
+    /// File-identity futex-key base (`trap::shared_file_key_base`) for a
+    /// direct host `MAP_SHARED` FILE mapping, else 0. Two processes mapping
+    /// the same file at DIFFERENT guest addresses (native exec rebuilds the
+    /// address space, so an exec'd child re-attaches an LTP checkpoint page
+    /// wherever mmap lands) must resolve one futex word to ONE waiter-count
+    /// key; a guest-VA key made the exec'd child's FUTEX_WAKE miss the
+    /// parent's registered waiter (ltpcheckpointexec). 0 keeps VA-keying:
+    /// anon MAP_SHARED is fork-inherited at the SAME VA everywhere.
+    shared_key_base: u64,
+    /// File offset of `start` for `shared_key_base != 0` regions.
+    shared_key_offset: u64,
 }
 
 fn native_region_linux_prot(read: bool, write: bool, exec: bool) -> u64 {
@@ -4444,6 +4455,8 @@ impl NativeMappedMemory {
                     region.perms.write,
                     region.perms.execute,
                 ),
+                shared_key_base: 0,
+                shared_key_offset: 0,
             });
         }
         map_bytes_region(
@@ -4461,6 +4474,8 @@ impl NativeMappedMemory {
             shared_futex: false,
             guest_writable: false,
             default_prot: crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_EXEC,
+            shared_key_base: 0,
+            shared_key_offset: 0,
         });
         map_anonymous_region(layout.heap_base, layout.heap_size, false)?;
         regions.push(NativeMappedRegion {
@@ -4470,6 +4485,8 @@ impl NativeMappedMemory {
             shared_futex: false,
             guest_writable: true,
             default_prot: crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_WRITE,
+            shared_key_base: 0,
+            shared_key_offset: 0,
         });
         map_anonymous_region(layout.mmap_base, layout.mmap_size, false)?;
         regions.push(NativeMappedRegion {
@@ -4483,6 +4500,8 @@ impl NativeMappedMemory {
             } else {
                 0
             },
+            shared_key_base: 0,
+            shared_key_offset: 0,
         });
         map_anonymous_region(
             crate::memory::LINUX_SHARED_FILE_BASE,
@@ -4500,6 +4519,8 @@ impl NativeMappedMemory {
             shared_futex: true,
             guest_writable: true,
             default_prot: crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_WRITE,
+            shared_key_base: 0,
+            shared_key_offset: 0,
         });
         map_anonymous_region(
             crate::memory::LINUX_PRIVATE_OVERLAY_BASE,
@@ -4517,6 +4538,8 @@ impl NativeMappedMemory {
             shared_futex: false,
             guest_writable: true,
             default_prot: crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_WRITE,
+            shared_key_base: 0,
+            shared_key_offset: 0,
         });
         let protections = MemoryProtections::default();
         for span in image.ro_spans() {
@@ -5586,6 +5609,19 @@ impl NativeMappedMemory {
         };
         let mmap_fd = if direct_file { fd } else { -1 };
         let mmap_offset = if direct_file { offset } else { 0 };
+        // File-identity futex key material (see `NativeMappedRegion`): only a
+        // DIRECT host MAP_SHARED file mapping is physically coherent with an
+        // independent mapping of the same file, so only it earns a file key.
+        // The pread-copy fallback (unaligned offset) is anon-backed — a file
+        // key there would count waiters that no physical wake can reach.
+        let (shared_key_base, shared_key_offset) = if direct_file {
+            (
+                crate::trap::shared_file_key_base(fd),
+                u64::try_from(offset).unwrap_or_default(),
+            )
+        } else {
+            (0, 0)
+        };
         let mapped = unsafe {
             libc::mmap(
                 addr,
@@ -5682,6 +5718,8 @@ impl NativeMappedMemory {
             shared_futex: file.is_some(),
             guest_writable: final_prot & libc::PROT_WRITE != 0,
             default_prot: if prot_none { 0 } else { final_prot as u64 },
+            shared_key_base,
+            shared_key_offset,
         });
         Ok(())
     }
@@ -5957,17 +5995,32 @@ impl GuestMemory for NativeMappedMemory {
             return None;
         }
         let end = guest_addr.checked_add(std::mem::size_of::<u32>() as u64)?;
-        let shared = self
-            .regions
-            .iter()
-            .any(|region| region.shared_futex && guest_addr >= region.start && end <= region.end);
-        if !shared {
-            return None;
-        }
+        // Newest matching region wins (`.rev()`): file aliases are pushed after
+        // the boot-time shared-file arena that covers the same VA range, and
+        // the alias carries the file-identity key material.
+        let region = self.regions.iter().rev().find(|region| {
+            region.shared_futex && guest_addr >= region.start && end <= region.end
+        })?;
         let word = usize::try_from(guest_addr).ok()?;
+        // Guest VA == host VA under native, so the physical os_sync SHARED
+        // wait/wake already rendezvous across mappings; the waiter-COUNT key
+        // must too. A direct MAP_SHARED file mapping keys by file identity +
+        // file offset (HVF's scheme): the native exec rebuilds the address
+        // space, so an exec'd child re-attaches the same file at a different
+        // VA and a VA key would miss the parent's registered waiter
+        // (ltpcheckpointexec). Anon MAP_SHARED (fork-inherited, same VA in
+        // every process) keeps the VA key.
+        let waiter_key = if region.shared_key_base == 0 {
+            word
+        } else {
+            let file_offset = region
+                .shared_key_offset
+                .saturating_add(guest_addr - region.start);
+            crate::trap::shared_futex_waiter_key(region.shared_key_base, file_offset)
+        };
         Some(carrick_guest_mem::SharedFutexLocation::Direct {
             word: carrick_guest_mem::HostVa(word),
-            waiter_key: word,
+            waiter_key,
         })
     }
 
@@ -6524,6 +6577,8 @@ mod tests {
                 guest_writable: true,
                 default_prot: crate::linux_abi::LINUX_PROT_READ
                     | crate::linux_abi::LINUX_PROT_WRITE,
+                shared_key_base: 0,
+                shared_key_offset: 0,
             }],
             protections: MemoryProtections::default(),
             native_page_protections: BTreeMap::new(),
@@ -8223,6 +8278,74 @@ mod tests {
 
         let mut status = 0;
         assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(libc::WIFEXITED(status), "child status was 0x{status:x}");
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+    }
+
+    /// Two direct MAP_SHARED mappings of the SAME file at DIFFERENT guest
+    /// addresses must resolve one futex word to ONE waiter-count key (the
+    /// native exec rebuilds the address space, so an exec'd child re-attaches
+    /// an LTP checkpoint page at a fresh VA — ltpcheckpointexec). Anon shared
+    /// arena words keep VA keys. Forked, per the fixed-address discipline.
+    #[test]
+    fn native_shared_file_futex_keys_are_mapping_independent() {
+        let path = std::env::temp_dir().join(format!(
+            ".carrick-native-futexkey-{}-{:x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0)
+        ));
+        std::fs::write(&path, vec![0u8; 16 * 1024]).expect("seed checkpoint file");
+        let child = unsafe { libc::fork() };
+        assert!(
+            child >= 0,
+            "fork failed: {}",
+            std::io::Error::last_os_error()
+        );
+        if child == 0 {
+            let layout = native_memory_layout();
+            let image = AddressSpace::from_regions(0, Vec::new())
+                .expect("empty native test image should be valid");
+            let mut memory = NativeMappedMemory::map(&image, layout, 16 * 1024, 16 * 1024)
+                .expect("native mapping set should map");
+            let open = || unsafe {
+                let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+                libc::open(c.as_ptr(), libc::O_RDWR)
+            };
+            let (fd1, fd2) = (open(), open());
+            if fd1 < 0 || fd2 < 0 {
+                unsafe { libc::_exit(2) };
+            }
+            let va1 = crate::memory::LINUX_SHARED_FILE_BASE;
+            let va2 = crate::memory::LINUX_SHARED_FILE_BASE + 0x20_0000;
+            let prot = libc::PROT_READ | libc::PROT_WRITE;
+            if memory
+                .map_host_alias(va1, 16 * 1024, &[], Some((fd1, 0, prot)), false)
+                .is_err()
+                || memory
+                    .map_host_alias(va2, 16 * 1024, &[], Some((fd2, 0, prot)), false)
+                    .is_err()
+            {
+                unsafe { libc::_exit(3) };
+            }
+            let key = |addr: u64| memory.shared_futex_location(addr).map(|l| l.waiter_key());
+            let word = 0x4c; // the LTP checkpoint word offset
+            let ok = match (key(va1 + word), key(va2 + word)) {
+                // Cross-mapping rendezvous: same file+offset → same key, and it
+                // is NOT the VA (either VA would differ from the other's key).
+                (Some(k1), Some(k2)) => k1 == k2 && k1 != (va1 + word) as usize,
+                _ => false,
+            };
+            // An anon shared-arena word (no file identity) still keys by VA.
+            let anon = crate::memory::LINUX_SHARED_FILE_BASE + 0x100_0000;
+            let anon_ok = key(anon) == Some(anon as usize);
+            unsafe { libc::_exit(i32::from(!(ok && anon_ok))) };
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        let _ = std::fs::remove_file(&path);
         assert!(libc::WIFEXITED(status), "child status was 0x{status:x}");
         assert_eq!(libc::WEXITSTATUS(status), 0);
     }

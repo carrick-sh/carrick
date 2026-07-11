@@ -476,8 +476,14 @@ fn mix_futex_key(mut x: u64) -> u64 {
     x ^ (x >> 31)
 }
 
+/// File-identity base for a `MAP_SHARED` file futex-word key: a hash of the
+/// backing file's `(st_dev, st_ino)`, `0` when the fd cannot be stat'd (the
+/// caller falls back to address-keying). Public because the Darwin-NATIVE
+/// backend derives its waiter keys with the SAME scheme: two processes mapping
+/// the same file at different addresses (an exec'd child re-attaching an LTP
+/// checkpoint page) must land in one waiter-count slot.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn shared_file_key_base(fd: libc::c_int) -> u64 {
+pub fn shared_file_key_base(fd: libc::c_int) -> u64 {
     let mut st: libc::stat = unsafe { core::mem::zeroed() };
     if unsafe { libc::fstat(fd, &mut st) } != 0 {
         return 0;
@@ -486,8 +492,10 @@ fn shared_file_key_base(fd: libc::c_int) -> u64 {
     if key == 0 { 1 } else { key }
 }
 
+/// Mapping-independent waiter key for a shared file futex word: the file's
+/// [`shared_file_key_base`] mixed with the word's file offset.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn shared_futex_waiter_key(base: u64, file_offset: u64) -> usize {
+pub fn shared_futex_waiter_key(base: u64, file_offset: u64) -> usize {
     let key = mix_futex_key(base ^ file_offset.rotate_left(17));
     let key = if key == 0 { 1 } else { key };
     key as usize
