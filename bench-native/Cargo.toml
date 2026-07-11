@@ -37,8 +37,16 @@ name = "perf_disk_meta"
 path = "../conformance-probes/src/bin/perf_disk_meta.rs"
 
 [[bin]]
+name = "perf_fork"
+path = "../conformance-probes/src/bin/perf_fork.rs"
+
+[[bin]]
 name = "perf_fork_exec"
 path = "../conformance-probes/src/bin/perf_fork_exec.rs"
+
+[[bin]]
+name = "perf_fork_scale"
+path = "../conformance-probes/src/bin/perf_fork_scale.rs"
 
 [[bin]]
 name = "perf_disk_vol"
