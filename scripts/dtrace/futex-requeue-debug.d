@@ -15,6 +15,18 @@ dtrace:::BEGIN
 }
 
 carrick*:::futex-route
+/(pid == $target || progenyof($target)) && (int)arg2 != 99/
+{
+    @futex_route_all[(int)arg2, (int)arg3] = count();
+}
+
+carrick*:::futex-route
+/(pid == $target || progenyof($target)) && (int)arg2 == 99/
+{
+    @futex_pre_wait[(int)arg3] = count();
+}
+
+carrick*:::futex-route
 /(pid == $target || progenyof($target)) && ((int)arg2 == 3 || (int)arg2 == 4)/
 {
     @futex_route[(int)arg2, (int)arg3] = count();
@@ -51,10 +63,15 @@ carrick*:::ulock-requeue
 }
 
 tick-1s { secs++; }
-tick-1s /secs >= 60/ { exit(0); }
+tick-1s /secs >= 90/ { timed_out = 1; exit(0); }
 
 END
 {
+    printf("\ntrace_timed_out=%d\n", timed_out);
+    printf("\n==== futex routes all ====\n");
+    printa("  op=%d shared=%d %@d\n", @futex_route_all);
+    printf("\n==== futex pre-wait expected values ====\n");
+    printa("  expected=%d %@d\n", @futex_pre_wait);
     printf("\n==== futex routes ====\n");
     printa("  op=%d shared=%d %@d\n", @futex_route);
     printf("\n==== requeue calls ====\n");
