@@ -1164,6 +1164,19 @@ fn run_native_thread_loop(
 
             let guarded = memory.lock().linux4k_address_is_guarded(fault_address);
             if guarded {
+                // linux4k boundary: the guarded-page (mixed 4K permission)
+                // fault emulation is not multithread-safe — concurrent
+                // guarded faults corrupt its decode/backing-copy state
+                // (forkfpreclaim on linux4k: mismatched fault/instruction
+                // ranges, intermittent host SIGSEGV; task_c2615fa2 tracks
+                // making it MT-safe). Explicit typed error, never a crash.
+                if thread_runtime.registry.live_count() > 1 {
+                    return Err(RuntimeError::Unsupported(format!(
+                        "native linux4k guarded-page access at 0x{fault_address:x} from a \
+                         multithreaded guest is not yet supported: the 4K-on-16K \
+                         guarded-page fault emulation is not multithread-safe"
+                    )));
+                }
                 let mut memory = memory.lock();
                 emulate_linux4k_guarded_fault(&mut memory, &mut snapshot)?;
                 drop(memory);
@@ -3212,6 +3225,23 @@ fn handle_native_fork(
     // HVF's `handle_fork`). Exited-mid-quiesce threads also leave the count.
     let mut quiesced = false;
     if thread_runtime.registry.live_count() > 1 {
+        // linux4k boundary: the 4K-on-16K guarded-page fault emulation is not
+        // multithread-safe (MT guarded faults corrupt its state and could
+        // SIGSEGV the host — forkfpreclaim on linux4k; task_c2615fa2 tracks
+        // making it MT-safe). MT fork on linux4k keeps the honest typed
+        // rejection it had before MT fork landed; the run-loop's guarded-
+        // fault arm carries the matching MT rejection, so a linux4k MT guest
+        // fails typed at whichever boundary it reaches first, never with a
+        // host crash.
+        if memory.lock().uses_linux4k_subpages() {
+            barrier.end_fork();
+            return Err(RuntimeError::Unsupported(
+                "native Darwin multithreaded fork on the linux4k page profile is not yet \
+                 supported: the 4K-on-16K guarded-page fault emulation is not \
+                 multithread-safe"
+                    .to_string(),
+            ));
+        }
         // W^X boundary (311fae9e), kept narrow and explicit: W+X pages while
         // multithreaded are already unreachable (creation is rejected while
         // MT, and thread creation is rejected while W+X exists) — if the
