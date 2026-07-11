@@ -117,10 +117,20 @@ fn case_happy_path() {
 
 fn case_extra_size_fault() {
     unsafe {
-        const PAGE: usize = 4096;
+        // The RUNTIME page size, not a hardcoded 4096: libc rounds mprotect to
+        // page granularity, so on a 16 KiB-page kernel a 4096-based layout
+        // would PROT_NONE the whole two-page mapping and this probe's own
+        // `*args_ptr` store below would (correctly) SIGSEGV. The faulting tail
+        // must start exactly at the second page for every geometry.
+        let page = libc::sysconf(libc::_SC_PAGESIZE);
+        if page <= 0 {
+            report!(clone3_extra_size_efault_or_blocked = false);
+            return;
+        }
+        let page = page as usize;
         let mapping = libc::mmap(
             core::ptr::null_mut(),
-            PAGE * 2,
+            page * 2,
             libc::PROT_READ | libc::PROT_WRITE,
             libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
             -1,
@@ -130,10 +140,10 @@ fn case_extra_size_fault() {
             report!(clone3_extra_size_efault_or_blocked = false);
             return;
         }
-        let second = (mapping as usize + PAGE) as *mut libc::c_void;
-        let _ = libc::mprotect(second, PAGE, libc::PROT_NONE);
+        let second = (mapping as usize + page) as *mut libc::c_void;
+        let _ = libc::mprotect(second, page, libc::PROT_NONE);
         let args_ptr =
-            (mapping as usize + PAGE - core::mem::size_of::<CloneArgs>()) as *mut CloneArgs;
+            (mapping as usize + page - core::mem::size_of::<CloneArgs>()) as *mut CloneArgs;
         *args_ptr = CloneArgs::default();
         (*args_ptr).exit_signal = libc::SIGCHLD as u64;
         let ok = rejected_without_child(
@@ -141,7 +151,7 @@ fn case_extra_size_fault() {
             core::mem::size_of::<CloneArgs>() + 1,
             efault_or_blocked,
         );
-        let _ = libc::munmap(mapping, PAGE * 2);
+        let _ = libc::munmap(mapping, page * 2);
         report!(clone3_extra_size_efault_or_blocked = ok);
     }
 }
