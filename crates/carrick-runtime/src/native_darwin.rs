@@ -333,6 +333,8 @@ fn ensure_native_child_watcher() -> Option<RawFd> {
 }
 
 fn run_native_child_watcher(kq: carrick_host_bsd::kqueue::Kqueue) {
+    use std::sync::atomic::Ordering;
+    let raw = kq.raw_fd();
     let mut events = [carrick_host_bsd::kqueue::Kevent::empty(); 8];
     loop {
         match kq.wait(&[], &mut events, None) {
@@ -348,9 +350,15 @@ fn run_native_child_watcher(kq: carrick_host_bsd::kqueue::Kqueue) {
             // EBADF: the fd was torn down (process exit teardown); anything
             // else is equally unrecoverable for this watcher. The wait-path
             // polling remains as the delivery backstop.
-            Err(_) => return,
+            Err(_) => break,
         }
     }
+    // Un-publish this watcher's fd BEFORE the owned kqueue drops (closing it),
+    // so the next arm respawns a fresh watcher instead of hitting EBADF on a
+    // lingering number. Compare-exchange: if a concurrent EBADF-arm already
+    // forgot us (or a respawned watcher reused the number), leave it alone —
+    // the worst outcome is one redundant respawn, never a lost publish.
+    let _ = NATIVE_CHILD_WATCH_KQ.compare_exchange(raw, -1, Ordering::AcqRel, Ordering::Acquire);
 }
 
 /// Resolve a child's exit against the neutral watch table and deliver the
@@ -2940,16 +2948,30 @@ fn native_register_child_exit_watch(
 /// check runs after a SUCCESSFUL arm too: the one-shot only fires for exits
 /// after registration.
 fn native_arm_child_exit_watch(child: i32) {
-    if let Some(kq) = ensure_native_child_watcher() {
+    use std::sync::atomic::Ordering;
+    for attempt in 0..2 {
+        let Some(kq) = ensure_native_child_watcher() else {
+            return;
+        };
         let arm = carrick_host_bsd::kqueue::apply_changes(
             kq,
             &[carrick_host_bsd::kqueue::Kevent::proc_exit(child)],
         );
+        // EBADF: the advertised kqueue is dead (its watcher exited and dropped
+        // it, closing the fd, while the number lingered in the static). Forget
+        // the stale fd so ensure() respawns a fresh watcher, and re-arm once —
+        // otherwise async delivery silently disappears for every later child.
+        if arm == Err(libc::EBADF) && attempt == 0 {
+            let _ =
+                NATIVE_CHILD_WATCH_KQ.compare_exchange(kq, -1, Ordering::AcqRel, Ordering::Acquire);
+            continue;
+        }
         if matches!(arm, Ok(()) | Err(libc::ESRCH | libc::ENOENT))
             && native_child_status_ready(child)
         {
             native_publish_child_exit(child);
         }
+        return;
     }
 }
 
@@ -8226,7 +8248,17 @@ mod tests {
         );
         if child == 0 {
             unsafe {
-                libc::close(release[1]);
+                // Drop every inherited fd except the release pipe before
+                // parking: this child holds copies of EVERY fd of the parallel
+                // test process (bound sockets, listeners), and while it blocks
+                // those copies keep ports alive under a concurrent
+                // port-release test — the pre-existing parallel-suite fork
+                // hazard this child should not amplify.
+                for fd in 3..4096 {
+                    if fd != release[0] {
+                        libc::close(fd);
+                    }
+                }
                 let mut byte = 0u8;
                 let _ = libc::read(release[0], (&raw mut byte).cast(), 1);
                 libc::_exit(0);
@@ -8243,8 +8275,13 @@ mod tests {
             "no signal may be pending while the child is alive"
         );
 
-        // Release the child; the watcher thread must publish SIGCHLD to the
-        // parent tid on its own.
+        // Release the child with an EXPLICIT byte, not close-EOF: a sibling
+        // fork test's child inherits a copy of this pipe's write end, so EOF
+        // would deadlock two concurrent fork tests against each other.
+        assert_eq!(
+            unsafe { libc::write(release[1], b"x".as_ptr().cast(), 1) },
+            1
+        );
         unsafe { libc::close(release[1]) };
         let deadline = Instant::now() + Duration::from_secs(5);
         while !crate::host_signal::has_pending_for(tid) {
@@ -8261,6 +8298,73 @@ mod tests {
         assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
         assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
         // Drain the synthetic tid so no other host-signal test sees it.
+        let _ = carrick_signal_core::take_pending_for(tid);
+    }
+
+    /// If the watcher thread dies its owned kqueue drops (fd closed) while the
+    /// published fd number lingers — every later arm gets EBADF, which must
+    /// NOT silently disable async delivery: the arm forgets the stale fd and
+    /// respawns a fresh watcher. Model the dead watcher by publishing a
+    /// closed fd, then require end-to-end delivery to still work.
+    #[test]
+    fn native_child_exit_watch_recovers_from_dead_watcher_fd() {
+        use std::sync::atomic::Ordering;
+        let bad = unsafe { libc::dup(0) };
+        assert!(bad >= 0, "dup(0) failed");
+        unsafe { libc::close(bad) };
+        NATIVE_CHILD_WATCH_KQ.store(bad, Ordering::Release);
+        NATIVE_CHILD_WATCH_OWNER.store(std::process::id(), Ordering::Release);
+
+        let tid = 0x7d0_57a6; // synthetic guest tid, distinct from the async test
+        let mut release = [0 as RawFd; 2];
+        assert_eq!(unsafe { libc::pipe(release.as_mut_ptr()) }, 0);
+        let child = unsafe { libc::fork() };
+        assert!(
+            child >= 0,
+            "fork failed: {}",
+            std::io::Error::last_os_error()
+        );
+        if child == 0 {
+            unsafe {
+                // Drop every inherited fd except the release pipe before
+                // parking: this child holds copies of EVERY fd of the parallel
+                // test process (bound sockets, listeners), and while it blocks
+                // those copies keep ports alive under a concurrent
+                // port-release test — the pre-existing parallel-suite fork
+                // hazard this child should not amplify.
+                for fd in 3..4096 {
+                    if fd != release[0] {
+                        libc::close(fd);
+                    }
+                }
+                let mut byte = 0u8;
+                let _ = libc::read(release[0], (&raw mut byte).cast(), 1);
+                libc::_exit(0);
+            }
+        }
+        unsafe { libc::close(release[0]) };
+
+        crate::host_signal::register_child_exit_watch(child, tid, crate::linux_abi::LINUX_SIGCHLD);
+        native_arm_child_exit_watch(child);
+
+        // Explicit-byte release; see the async test for the close-EOF hazard.
+        assert_eq!(
+            unsafe { libc::write(release[1], b"x".as_ptr().cast(), 1) },
+            1
+        );
+        unsafe { libc::close(release[1]) };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !crate::host_signal::has_pending_for(tid) {
+            assert!(
+                Instant::now() < deadline,
+                "arm against a dead watcher fd silently lost async delivery"
+            );
+            std::thread::yield_now();
+        }
+
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
         let _ = carrick_signal_core::take_pending_for(tid);
     }
 
