@@ -302,7 +302,14 @@ fn claim_record(section: &ProcessSection, id: u32, want: u64, want_tid: bool) ->
             if generation == 0 {
                 continue;
             }
-            if record.run_state.load(Ordering::Acquire) == 0 {
+            // Adopt when the slot is still EMPTY (the pre-fork metadata
+            // record) — or when it already holds THIS pid's process state:
+            // the parent's Booting seed can land between our find_record miss
+            // and this scan, and claiming a fresh record instead would leave
+            // the stale seed shadowing every later publish (first-match flip).
+            let raw = record.run_state.load(Ordering::Acquire);
+            let ours = raw == 0 || (raw & KIND_TID == 0 && (raw & PID_MASK) as u32 == id);
+            if ours {
                 record.run_state.store(want, Ordering::Release);
                 return ProcessRecordRef {
                     index,
@@ -337,15 +344,67 @@ pub fn reinit_booting_after_fork() {
     publish_for(std::process::id(), RunState::Booting);
 }
 
-/// Publish `Booting` for a just-forked CHILD pid, from the PARENT, before the
-/// parent's fork returns. This closes the race where the parent polls
-/// `/proc/<child>/stat` faster than the child can run its own
-/// `reinit_booting_after_fork`: without it, those first parent reads see the
-/// child's host boot-`ppoll` as `S` (the pauseinterrupt2 bug). The table is
-/// shared, so this parent-side write IS the entry the child later updates to
-/// Running/Blocked from its own vCPU. Does NOT touch the parent's cached slot.
+/// SEED `Booting` for a just-forked CHILD pid, from the PARENT. This closes
+/// the race where the parent polls `/proc/<child>/stat` faster than the child
+/// can run its own `reinit_booting_after_fork`: without it, those first parent
+/// reads see the child's host boot-`ppoll` as `S` (the pauseinterrupt2 bug).
+/// The table is shared, so the seeded entry IS the one the child later updates
+/// to Running/Blocked from its own vCPU. Does NOT touch the parent's cached
+/// slot.
+///
+/// The seed NEVER overwrites a state the child already published: the parent's
+/// post-fork seed is UNORDERED with the child's own boot, and under load a
+/// descheduled parent's late seed used to land over the child's `Blocked` —
+/// with the child parked in a host blocking wait (sysvsem semop wait-for-zero)
+/// and unable to republish, `/proc/<pid>/stat` read `R` for the whole park
+/// (the round-8 sysvsem GETZCNT sleepers undercount). Any published state is
+/// fresher than the seed by definition, so the seed only fills EMPTY slots
+/// (compare-exchange from 0).
 pub fn publish_child_booting(child_pid: u32) {
-    publish_for(child_pid, RunState::Booting);
+    if child_pid == 0 {
+        return;
+    }
+    let section = processes();
+    let want = pack(child_pid, RunState::Booting);
+    // A decodable process state for this pid already exists — the child (or an
+    // earlier seed) published; never regress it.
+    if find_record(section, child_pid, false).is_some() {
+        return;
+    }
+    // Adopt the pre-fork metadata record only while still EMPTY. CAS from 0 so
+    // a concurrent first publish from the child wins and is never clobbered.
+    for record in section.records.iter() {
+        if record.host_pid.load(Ordering::Acquire) != child_pid {
+            continue;
+        }
+        if record.generation.load(Ordering::Acquire) == 0 {
+            continue;
+        }
+        let raw = record.run_state.load(Ordering::Acquire);
+        if raw & KIND_TID != 0 {
+            // An aliasing worker-tid entry of another process — not ours.
+            continue;
+        }
+        if raw != 0 && (raw & PID_MASK) as u32 != child_pid {
+            continue;
+        }
+        // Either the CAS seeds the empty slot, or the child's first publish
+        // beat us to it — both mean a state now exists for this pid.
+        let _ = record
+            .run_state
+            .compare_exchange(0, want, Ordering::AcqRel, Ordering::Acquire);
+        return;
+    }
+    // No record for this pid at all. The fork paths stamp the child's metadata
+    // record before seeding, so this is only reachable from direct callers
+    // (tests); claim a fresh record so early /proc polls still read `R`.
+    let generation = KernelArena::global().allocate_generation();
+    match section.claim(Some(HostPid::new(child_pid)), generation, |record| {
+        record.run_state.store(want, Ordering::Relaxed);
+    }) {
+        Ok(_) => {}
+        Err(err) => abort_on_arena_error(err),
+    }
 }
 
 /// Read the published run-state of `pid` (any guest process, or a worker thread
@@ -357,12 +416,19 @@ pub fn publish_child_booting(child_pid: u32) {
 /// state is authoritative and is never shadowed by a worker-tid entry that
 /// happens to alias the value. A worker-tid entry is returned only when no
 /// process entry claims the id (the genuine cross-process `/proc/<tid>` case).
+///
+/// Among process entries, a NON-`Booting` state outranks a `Booting` one:
+/// `Booting` is the only state a party other than the process itself (the
+/// parent's post-fork seed) ever writes, so if a seed/first-publish straddle
+/// ever leaves two process entries for one pid, the `Booting` one is by
+/// definition the stale seed and must not shadow the live state.
 pub fn published(pid: u32) -> Option<RunState> {
     if pid == 0 {
         return None;
     }
     let section = processes();
     let mut tid_hit = None;
+    let mut booting_hit = None;
     for record in section.records.iter() {
         if record.host_pid.load(Ordering::Acquire) != pid {
             continue;
@@ -376,12 +442,16 @@ pub fn published(pid: u32) -> Option<RunState> {
             && p == pid
         {
             if raw & KIND_TID == 0 {
-                return Some(st); // a process entry for this id is authoritative
+                if st != RunState::Booting {
+                    return Some(st); // a live process state is authoritative
+                }
+                booting_hit = Some(st); // possibly a stale seed; prefer a live entry
+            } else {
+                tid_hit = Some(st); // used only if no process entry exists
             }
-            tid_hit = Some(st); // remember; used only if no process entry exists
         }
     }
-    tid_hit
+    booting_hit.or(tid_hit)
 }
 
 /// The Linux `/proc/<pid>/stat` state char for `pid`, preferring the published
@@ -570,6 +640,162 @@ mod tests {
             "no worker entry created for the leader"
         );
         wipe_id(me);
+    }
+
+    #[test]
+    fn late_parent_seed_never_regresses_a_published_state() {
+        // The parent's post-fork Booting seed is UNORDERED with the child's own
+        // publishes: under load the parent can be descheduled after fork() long
+        // enough for the child to boot, publish `Blocked`, and park in a host
+        // blocking syscall (sysvsem semop wait-for-zero) it never returns from
+        // until woken. A late seed must not overwrite that state — the child
+        // cannot republish while parked, so a clobber reads `R` in
+        // /proc/<pid>/stat for the whole park (the round-8 sysvsem GETZCNT
+        // sleepers undercount).
+        let pid = 0x51F0_0002u32;
+        wipe_id(pid);
+        publish_for(pid, RunState::Booting);
+        publish_for(pid, RunState::Running);
+        publish_for(pid, RunState::Blocked);
+        publish_child_booting(pid);
+        assert_eq!(
+            published(pid),
+            Some(RunState::Blocked),
+            "late parent seed regressed the child's published Blocked state"
+        );
+        wipe_id(pid);
+    }
+
+    #[test]
+    fn seed_publishes_booting_when_nothing_is_published() {
+        // The seed's reason to exist (pauseinterrupt2): a parent that polls
+        // /proc/<child>/stat before the child publishes anything must read `R`
+        // (Booting), not the child's host boot-park `S`.
+        let pid = 0x51F0_0003u32;
+        wipe_id(pid);
+        publish_child_booting(pid);
+        assert_eq!(published(pid), Some(RunState::Booting));
+        wipe_id(pid);
+    }
+
+    #[test]
+    fn seed_adopts_an_empty_metadata_record_without_duplicating() {
+        // The pre-fork registration's metadata record (host pid stamped,
+        // run_state empty) is THE child's record; the seed must write into it,
+        // not claim a second one.
+        let pid = 0x51F0_0004u32;
+        wipe_id(pid);
+        let section = processes();
+        let generation = KernelArena::global().allocate_generation();
+        let meta = match section.claim(Some(HostPid::new(pid)), generation, |record| {
+            record
+                .parent_host_pid
+                .store(1, std::sync::atomic::Ordering::Relaxed);
+        }) {
+            Ok(r) => r,
+            Err(err) => unreachable!("claim metadata record: {err:?}"),
+        };
+        publish_child_booting(pid);
+        assert_eq!(published(pid), Some(RunState::Booting));
+        let live = section
+            .records
+            .iter()
+            .filter(|record| {
+                record.host_pid.load(Ordering::Acquire) == pid
+                    && record.generation.load(Ordering::Acquire) != 0
+            })
+            .count();
+        assert_eq!(
+            live, 1,
+            "seed must adopt the metadata record, not duplicate"
+        );
+        section.release(meta);
+        wipe_id(pid);
+    }
+
+    #[test]
+    fn published_prefers_a_live_state_over_a_booting_seed_duplicate() {
+        // If a seed/first-publish straddle ever leaves TWO process entries for
+        // one pid, the Booting one is by definition the stale seed — the reader
+        // must prefer the live state regardless of slot order.
+        let pid = 0x51F0_0005u32;
+        for (first, second) in [
+            (RunState::Booting, RunState::Blocked),
+            (RunState::Blocked, RunState::Booting),
+        ] {
+            wipe_id(pid);
+            let section = processes();
+            for st in [first, second] {
+                let generation = KernelArena::global().allocate_generation();
+                if let Err(err) = section.claim(Some(HostPid::new(pid)), generation, |record| {
+                    record
+                        .run_state
+                        .store(pack(pid, st), std::sync::atomic::Ordering::Relaxed);
+                }) {
+                    unreachable!("claim duplicate record: {err:?}");
+                }
+            }
+            assert_eq!(
+                published(pid),
+                Some(RunState::Blocked),
+                "reader returned the stale Booting seed (order {first:?}, {second:?})"
+            );
+            wipe_id(pid);
+        }
+    }
+
+    #[test]
+    fn parent_seed_races_child_blocked_publish_across_fork() {
+        // Cross-process reducer for the round-8 sysvsem GETZCNT undercount:
+        // a REAL fork child publishes `Blocked` through the shared arena and
+        // parks; the parent's seed lands strictly after and must not regress
+        // it. Mirrors parent-descheduled-after-fork under campaign load.
+        init_table();
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed");
+        if child == 0 {
+            // Child: exactly what a native fork child does before parking in
+            // a host blocking semop — reinit, then publish Blocked. Atomics on
+            // the pre-fork-mapped arena only (fork-safe in a threaded harness).
+            reinit_booting_after_fork();
+            publish(RunState::Blocked);
+            unsafe {
+                let req = libc::timespec {
+                    tv_sec: 30,
+                    tv_nsec: 0,
+                };
+                libc::nanosleep(&req, core::ptr::null_mut());
+                libc::_exit(0);
+            }
+        }
+        let child_pid = child as u32;
+        let mut blocked_seen = false;
+        for _ in 0..5000 {
+            if published(child_pid) == Some(RunState::Blocked) {
+                blocked_seen = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        // The parent's seed arrives AFTER the child is provably parked-blocked.
+        let after_seed = if blocked_seen {
+            publish_child_booting(child_pid);
+            published(child_pid)
+        } else {
+            None
+        };
+        unsafe {
+            libc::kill(child, libc::SIGKILL);
+            let mut status = 0;
+            libc::waitpid(child, &mut status, 0);
+        }
+        wipe_id(child_pid);
+        assert!(blocked_seen, "child never published Blocked");
+        assert_eq!(
+            after_seed,
+            Some(RunState::Blocked),
+            "parent's late Booting seed clobbered the parked child's Blocked state"
+        );
     }
 
     #[test]
