@@ -11,11 +11,19 @@ struct DsrContext {
     alignment_pad: u64,
     host_v8_v15: [[u8; 16]; 8],
     entry: u64,
-    exit_resume: u64,
+    exit_target: u64,
+    exit_source: u64,
+    exit_status: u32,
+    exit_pad: u32,
 }
 
 impl DsrContext {
-    fn new(snapshot: NativeUcontextSnapshot, entry: CacheVa, exit_resume: u64) -> Self {
+    fn new(snapshot: NativeUcontextSnapshot, entry: CacheVa, exit: NativeDsrExit) -> Self {
+        let (exit_target, exit_source, exit_status) = match exit {
+            NativeDsrExit::Syscall { resume } => (resume.raw(), 0, 1),
+            NativeDsrExit::ResolveDirect { source, target } => (target.raw(), source.raw(), 2),
+            _ => (0, 0, 0),
+        };
         Self {
             snapshot,
             host_sp: 0,
@@ -23,7 +31,10 @@ impl DsrContext {
             alignment_pad: 0,
             host_v8_v15: [[0; 16]; 8],
             entry: entry.host().raw() as u64,
-            exit_resume,
+            exit_target,
+            exit_source,
+            exit_status,
+            exit_pad: 0,
         }
     }
 }
@@ -34,16 +45,23 @@ const _: () = assert!(std::mem::offset_of!(DsrContext, host_sp) == 832);
 const _: () = assert!(std::mem::offset_of!(DsrContext, host_x19_x30) == 840);
 const _: () = assert!(std::mem::offset_of!(DsrContext, host_v8_v15) == 944);
 const _: () = assert!(std::mem::offset_of!(DsrContext, entry) == 1072);
-const _: () = assert!(std::mem::offset_of!(DsrContext, exit_resume) == 1080);
-const _: () = assert!(std::mem::size_of::<DsrContext>() == 1088);
+const _: () = assert!(std::mem::offset_of!(DsrContext, exit_target) == 1080);
+const _: () = assert!(std::mem::offset_of!(DsrContext, exit_source) == 1088);
+const _: () = assert!(std::mem::offset_of!(DsrContext, exit_status) == 1096);
+const _: () = assert!(std::mem::size_of::<DsrContext>() == 1104);
 
 unsafe extern "C" {
     fn carrick_dsr_enter_raw(context: *mut DsrContext) -> libc::c_int;
     fn carrick_dsr_exit_syscall();
+    fn carrick_dsr_exit_direct();
 }
 
 pub(super) fn syscall_exit_address() -> u64 {
     carrick_dsr_exit_syscall as *const () as usize as u64
+}
+
+pub(super) fn direct_exit_address() -> u64 {
+    carrick_dsr_exit_direct as *const () as usize as u64
 }
 
 pub(super) fn enter_translated(
@@ -51,21 +69,35 @@ pub(super) fn enter_translated(
     snapshot: &mut NativeUcontextSnapshot,
     exit: &mut NativeDsrExit,
 ) -> Result<(), DsrError> {
-    let exit_resume = match *exit {
-        NativeDsrExit::Syscall { resume } => resume.raw(),
-        _ => {
-            return Err(DsrError::Gateway(
-                "Task 5 gateway only accepts syscall exits".to_string(),
-            ));
-        }
-    };
-    let mut context = DsrContext::new(*snapshot, entry, exit_resume);
+    if !matches!(
+        *exit,
+        NativeDsrExit::Syscall { .. } | NativeDsrExit::ResolveDirect { .. }
+    ) {
+        return Err(DsrError::Gateway(
+            "DSR gateway only accepts syscall or direct exits".to_string(),
+        ));
+    }
+    let mut context = DsrContext::new(*snapshot, entry, *exit);
     let rc = unsafe { carrick_dsr_enter_raw(&mut context) };
-    if rc != 1 {
+    if rc != 1 && rc != 2 {
         return Err(DsrError::Gateway(format!(
             "translated entry returned invalid gateway status {rc}"
         )));
     }
     *snapshot = context.snapshot;
+    *exit = match rc {
+        1 => NativeDsrExit::Syscall {
+            resume: carrick_guest_mem::GuestVa(context.exit_target),
+        },
+        2 => NativeDsrExit::ResolveDirect {
+            source: carrick_guest_mem::GuestVa(context.exit_source),
+            target: carrick_guest_mem::GuestVa(context.exit_target),
+        },
+        _ => {
+            return Err(DsrError::Gateway(format!(
+                "translated entry returned invalid gateway status {rc}"
+            )));
+        }
+    };
     Ok(())
 }

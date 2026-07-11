@@ -11,7 +11,9 @@
 .equ CTX_HOST_X19, 840
 .equ CTX_HOST_V8, 944
 .equ CTX_ENTRY, 1072
-.equ CTX_EXIT_RESUME, 1080
+.equ CTX_EXIT_TARGET, 1080
+.equ CTX_EXIT_SOURCE, 1088
+.equ CTX_EXIT_STATUS, 1096
 
 .globl _carrick_dsr_enter_raw
 _carrick_dsr_enter_raw:
@@ -99,7 +101,9 @@ _carrick_dsr_enter_raw:
 
 .p2align 2
 .globl _carrick_dsr_exit_syscall
+.globl _carrick_dsr_exit_direct
 _carrick_dsr_exit_syscall:
+_carrick_dsr_exit_direct:
     // The emitted stub saved guest x17 through physical x18 before branching.
     stp x0, x1, [x18, #0]
     stp x2, x3, [x18, #16]
@@ -118,7 +122,7 @@ _carrick_dsr_exit_syscall:
     stp x29, x30, [x18, #232]
     mov x17, sp
     str x17, [x18, #SNAP_SP]
-    ldr x17, [x18, #CTX_EXIT_RESUME]
+    ldr x17, [x18, #CTX_EXIT_TARGET]
     str x17, [x18, #SNAP_PC]
     mrs x17, nzcv
     str x17, [x18, #SNAP_PSTATE]
@@ -160,5 +164,5 @@ _carrick_dsr_exit_syscall:
     ldp x25, x26, [x10, #48]
     ldp x27, x28, [x10, #64]
     ldp x29, x30, [x10, #80]
-    mov w0, #1
+    ldr w0, [x9, #CTX_EXIT_STATUS]
     ret

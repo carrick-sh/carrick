@@ -10,18 +10,58 @@ pub(super) mod types;
 #[derive(Debug)]
 pub(super) enum ThreadExit {
     Syscall { resume: carrick_guest_mem::GuestVa },
+    Continue,
     Unsupported(String),
 }
 
 pub(super) struct ThreadTranslator {
     cache: cache::TranslationCache,
+    blocks: BTreeMap<(carrick_guest_mem::GuestVa, types::CodeGeneration), types::CacheVa>,
+    pending: BTreeMap<(carrick_guest_mem::GuestVa, types::CodeGeneration), Vec<cache::LinkSite>>,
 }
 
 impl ThreadTranslator {
     pub(super) fn new(capacity: usize) -> Result<Self, types::DsrError> {
         Ok(Self {
             cache: cache::TranslationCache::new(capacity)?,
+            blocks: BTreeMap::new(),
+            pending: BTreeMap::new(),
         })
+    }
+
+    fn translate(
+        &mut self,
+        memory: &super::NativeMappedMemory,
+        guest: carrick_guest_mem::GuestVa,
+    ) -> Result<types::CacheVa, types::DsrError> {
+        let key = (guest, types::CodeGeneration::INITIAL);
+        if let Some(entry) = self.blocks.get(&key) {
+            return Ok(*entry);
+        }
+        let block = block::plan_block(memory, guest, types::CodeGeneration::INITIAL, 256)?;
+        let emitted = emit::emit_block(&mut self.cache, &block)?;
+        let entry = emitted.entry();
+        let links = emitted.direct_links().to_vec();
+        self.blocks.insert(key, entry);
+
+        for link in links {
+            let target_key = (link.target, types::CodeGeneration::INITIAL);
+            let site = cache::LinkSite {
+                source: entry,
+                slot: link.slot,
+            };
+            if let Some(target) = self.blocks.get(&target_key) {
+                self.cache.patch_direct_branch(site, *target)?;
+            } else {
+                self.pending.entry(target_key).or_default().push(site);
+            }
+        }
+        if let Some(sites) = self.pending.remove(&key) {
+            for site in sites {
+                self.cache.patch_direct_branch(site, entry)?;
+            }
+        }
+        Ok(entry)
     }
 
     pub(super) fn enter_once(
@@ -29,24 +69,18 @@ impl ThreadTranslator {
         memory: &super::NativeMappedMemory,
         snapshot: &mut super::NativeUcontextSnapshot,
     ) -> Result<ThreadExit, types::DsrError> {
-        let block = block::plan_block(
-            memory,
-            carrick_guest_mem::GuestVa(snapshot.pc),
-            types::CodeGeneration::INITIAL,
-            256,
-        )?;
-        let mut exit = match block.exit {
-            block::PlannedExit::Syscall { resume, .. } => types::NativeDsrExit::Syscall { resume },
-            _ => types::NativeDsrExit::Unsupported {
-                guest_pc: carrick_guest_mem::GuestVa(snapshot.pc),
-                word: 0,
-                op: bad64::Op::UDF,
-            },
+        let entry = self.translate(memory, carrick_guest_mem::GuestVa(snapshot.pc))?;
+        let mut exit = types::NativeDsrExit::Syscall {
+            resume: carrick_guest_mem::GuestVa(snapshot.pc),
         };
-        let emitted = emit::emit_block(&mut self.cache, &block)?;
-        gateway::enter_translated(emitted.entry(), snapshot, &mut exit)?;
+        gateway::enter_translated(entry, snapshot, &mut exit)?;
         Ok(match exit {
             types::NativeDsrExit::Syscall { resume } => ThreadExit::Syscall { resume },
+            types::NativeDsrExit::ResolveDirect { target, .. } => {
+                self.translate(memory, target)?;
+                snapshot.pc = target.raw();
+                ThreadExit::Continue
+            }
             other => ThreadExit::Unsupported(format!("{other:?}")),
         })
     }
@@ -413,3 +447,4 @@ mod tests {
         assert!(matches!(error, super::types::DsrError::CachePolicy(_)));
     }
 }
+use std::collections::BTreeMap;
