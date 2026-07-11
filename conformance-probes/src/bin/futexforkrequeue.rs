@@ -142,6 +142,7 @@ unsafe fn reap_children(pids: &[libc::pid_t], deadline: Instant) -> (usize, bool
 
 fn main() {
     unsafe {
+        let print_counts = std::env::args().any(|arg| arg == "counts");
         let page = libc::mmap(
             std::ptr::null_mut(),
             4096,
@@ -233,6 +234,26 @@ fn main() {
 
         println!("shared_map_ok=true");
         println!("pipe_ok=true");
+        if print_counts {
+            println!("pre_wait_pipe_count={ready}");
+            println!("cmp_requeue_return_count={moved}");
+            println!("returned_after_requeue_count={returned_after_requeue}");
+            println!("wake_destination_count={wake1}");
+            println!("wake_original_count={wake0}");
+            println!("final_returned_count={final_returned}");
+            println!(
+                "normal_wakes_count={}",
+                (&*(normal_wakes as *const AtomicU32)).load(Ordering::SeqCst)
+            );
+            println!(
+                "timed_out_count={}",
+                (&*(timed_out as *const AtomicU32)).load(Ordering::SeqCst)
+            );
+            println!(
+                "other_returns_count={}",
+                (&*(other_returns as *const AtomicU32)).load(Ordering::SeqCst)
+            );
+        }
         println!("fork_failures_zero={}", fork_failures == 0);
         println!("forked_all={}", pids.len() == WAITERS);
         println!("ready_all={}", ready == pids.len());
@@ -253,7 +274,10 @@ fn main() {
             "wake_original_count_expected={}",
             wake0 == (WAITERS as u32 - WAKE_COUNT - REQUEUE_COUNT) as libc::c_long
         );
-        println!("returned_count_expected={}", final_returned == WAITERS as u32);
+        println!(
+            "returned_count_expected={}",
+            final_returned == WAITERS as u32
+        );
         println!("returned_all={}", final_returned == pids.len() as u32);
         println!(
             "normal_wake_count_expected={}",
