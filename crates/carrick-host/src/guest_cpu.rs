@@ -1080,7 +1080,33 @@ pub fn record_child_exit_status(pid: u32, guest_ns: u64, status: i32, status_rea
     });
 }
 
-pub fn reap_adopted_child(waiter_pid: u32, target_pid: i32) -> Option<(u32, i32, u64)> {
+/// One `wait4`-shaped observation of this waiter's adopted children.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdoptedChildWait {
+    /// An adopted child had published its exit; the record's status was
+    /// consumed (reaped) by this call.
+    Reaped {
+        pid: u32,
+        status: i32,
+        guest_ns: u64,
+    },
+    /// An adopted child exists but has not yet published its exit; the caller
+    /// should park on its exit and re-classify.
+    Pending(u32),
+}
+
+/// Classify this waiter's adopted-child state for `target_pid` in a SINGLE
+/// table scan, reaping a ready child if one is found.
+///
+/// The two-call shape (`reap_adopted_child` then `pending_adopted_child`) is
+/// racy: an exiting orphan flips `exit_ready` false→true concurrently
+/// (`record_child_exit_status`), and if the flip lands between the two scans
+/// the first misses it (not ready yet) and the second skips it (ready now) —
+/// the waiter falsely concludes ECHILD. Reading `exit_ready` once per record
+/// closes that window: `false` → `Pending` (park and re-classify; the flip is
+/// one-way), `true` → reap now.
+pub fn adopted_child_wait(waiter_pid: u32, target_pid: i32) -> Option<AdoptedChildWait> {
+    let mut pending = None;
     for record in iter_child_records() {
         let pid = record_host_pid(record);
         if !adopted_flag(record) {
@@ -1092,21 +1118,43 @@ pub fn reap_adopted_child(waiter_pid: u32, target_pid: i32) -> Option<(u32, i32,
         if target_pid > 0 && pid != target_pid as u32 {
             continue;
         }
-        if !record_exit_ready(record) {
-            continue;
+        if record_exit_ready(record) {
+            let status = record_exit_status(record);
+            let ns = record_guest_ns(record);
+            if record_ns_pid(record) == 0 {
+                release_record(record);
+            } else {
+                record.guest_ns.store(0, Ordering::Release);
+                clear_virtual_ptrace(record);
+                store_exit_ready(record, false);
+            }
+            return Some(AdoptedChildWait::Reaped {
+                pid,
+                status,
+                guest_ns: ns,
+            });
         }
-        let status = record_exit_status(record);
-        let ns = record_guest_ns(record);
-        if record_ns_pid(record) == 0 {
-            release_record(record);
-        } else {
-            record.guest_ns.store(0, Ordering::Release);
-            clear_virtual_ptrace(record);
-            store_exit_ready(record, false);
+        if pending.is_none() {
+            pending = Some(pid);
         }
-        return Some((pid, status, ns));
     }
-    None
+    pending.map(AdoptedChildWait::Pending)
+}
+
+/// Reap an adopted child that has published its exit, or `None`. A `wait4`
+/// that must also distinguish "no adopted child" (ECHILD) from "adopted child
+/// still running" (park) must use [`adopted_child_wait`] instead — calling this
+/// and then `pending_adopted_child` as two scans reopens the classification
+/// race documented on [`adopted_child_wait`].
+pub fn reap_adopted_child(waiter_pid: u32, target_pid: i32) -> Option<(u32, i32, u64)> {
+    match adopted_child_wait(waiter_pid, target_pid) {
+        Some(AdoptedChildWait::Reaped {
+            pid,
+            status,
+            guest_ns,
+        }) => Some((pid, status, guest_ns)),
+        _ => None,
+    }
 }
 
 /// Return an adopted child that this waiter should block on until it publishes
@@ -1847,6 +1895,44 @@ mod tests {
         assert!(!record_exit_ready(record));
 
         release_child_record(r);
+    }
+
+    /// The `wait4` ECHILD fallback classifies adopted children in ONE scan:
+    /// a live orphan is `Pending` (park target), an exited one is `Reaped`
+    /// (consumed), and only a truly absent child is `None` (real ECHILD).
+    /// Pins the fix for the reap-then-pending double-scan race where an orphan
+    /// publishing its exit between the two scans was misreported as ECHILD
+    /// (childsubreaper `wait_reaped_orphan=false` under the native backend).
+    #[test]
+    fn adopted_child_wait_single_scan_classifies_pending_then_reaps() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        init_child_table();
+        let parent = 919_191;
+        let child = 919_192;
+
+        let _ = reap_child_guest_ns(child);
+        register_for_test(child, parent, 0, true);
+
+        // Live orphan: the single scan says "park", never "no child".
+        assert_eq!(
+            adopted_child_wait(parent, child as i32),
+            Some(AdoptedChildWait::Pending(child))
+        );
+
+        // Exit publication (the adopted flag forces status_ready, matching the
+        // forked-child exit path): the same call now reaps.
+        record_child_exit_status(child, 4321, 0x0700, false);
+        assert_eq!(
+            adopted_child_wait(parent, child as i32),
+            Some(AdoptedChildWait::Reaped {
+                pid: child,
+                status: 0x0700,
+                guest_ns: 4321,
+            })
+        );
+
+        // Consumed exactly once: a further wait is a genuine ECHILD.
+        assert_eq!(adopted_child_wait(parent, child as i32), None);
     }
 
     #[test]
