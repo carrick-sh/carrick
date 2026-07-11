@@ -356,6 +356,58 @@ mod imp {
         false
     }
 
+    /// Convert a `rusage_info` time value to nanoseconds. The `ri_*_time`
+    /// fields are in MACH TIME UNITS, not nanoseconds: on Apple Silicon the
+    /// timebase is 125/3 (~41.67 ns/unit), so treating them as nanoseconds
+    /// under-reports CPU ~41.7× (measured: a 1.185 s burn read back as 28 ms,
+    /// which kept `times(2)` under its 10 ms tick — probe `accounting`
+    /// `times_cpu_pos=false` under the native backend, where the host value is
+    /// the only CPU source). On Intel the timebase is 1/1 and this is identity.
+    fn mach_ticks_to_ns(ticks: u64) -> u64 {
+        static TIMEBASE: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
+        let (numer, denom) = *TIMEBASE.get_or_init(|| {
+            let mut info = libc::mach_timebase_info { numer: 0, denom: 0 };
+            // SAFETY: fills the fixed-size out-struct; failure leaves zeros,
+            // mapped to the 1/1 identity below rather than a divide-by-zero.
+            if unsafe { libc::mach_timebase_info(&mut info) } != libc::KERN_SUCCESS
+                || info.denom == 0
+            {
+                (1, 1)
+            } else {
+                (info.numer, info.denom)
+            }
+        });
+        (u128::from(ticks) * u128::from(numer) / u128::from(denom)) as u64
+    }
+
+    /// Convert a `rusage_info` mach-time-unit value to microseconds.
+    pub(super) fn mach_ticks_to_us(ticks: u64) -> u64 {
+        mach_ticks_to_ns(ticks) / 1000
+    }
+
+    /// This process's total CPU time (user + system) in nanoseconds, from
+    /// `proc_pid_rusage`. The Darwin-native provider for guest CPU accounting
+    /// under the native exec backend, where guest cycles are ordinary host
+    /// execution and the host kernel's bookkeeping is the source of truth.
+    pub fn self_cpu_total_ns() -> Option<u64> {
+        let mut ri: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
+        // SAFETY: see `self_resource_usage` — V2 flavor writes one
+        // rusage_info_v2 through the struct address cast to `rusage_info_t*`.
+        let rc = unsafe {
+            libc::proc_pid_rusage(
+                std::process::id() as libc::c_int,
+                libc::RUSAGE_INFO_V2,
+                &mut ri as *mut libc::rusage_info_v2 as *mut libc::rusage_info_t,
+            )
+        };
+        if rc != 0 {
+            return None;
+        }
+        Some(mach_ticks_to_ns(
+            ri.ri_user_time.saturating_add(ri.ri_system_time),
+        ))
+    }
+
     /// This process's resource usage, queried from the host kernel:
     /// `proc_pid_rusage(RUSAGE_INFO_V2)` for CPU time (live + reaped threads),
     /// child CPU time, resident size, pageins; `task_info(MACH_TASK_BASIC_INFO)`
@@ -385,10 +437,12 @@ mod imp {
             )
         };
         if rc == 0 {
-            usage.user_us = ri.ri_user_time / 1000;
-            usage.system_us = ri.ri_system_time / 1000;
-            usage.child_user_us = ri.ri_child_user_time / 1000;
-            usage.child_system_us = ri.ri_child_system_time / 1000;
+            // ri_*_time are mach time units, NOT nanoseconds (see
+            // `mach_ticks_to_ns`); the former `/1000` under-reported ~41.7×.
+            usage.user_us = mach_ticks_to_us(ri.ri_user_time);
+            usage.system_us = mach_ticks_to_us(ri.ri_system_time);
+            usage.child_user_us = mach_ticks_to_us(ri.ri_child_user_time);
+            usage.child_system_us = mach_ticks_to_us(ri.ri_child_system_time);
             usage.resident_bytes = ri.ri_phys_footprint;
             usage.majflt = ri.ri_pageins;
         }
@@ -428,9 +482,17 @@ mod imp {
         // Linux split of "guest userspace compute" vs "kernel work on its
         // behalf". A guest that has run no vCPU (pure host bootstrap) just keeps
         // the proc_pid_rusage user time.
-        let guest_us = crate::guest_cpu::total_us();
-        if guest_us > 0 {
-            usage.user_us = usage.user_us.saturating_add(guest_us);
+        //
+        // Native provider: guest cycles ARE this process's host CPU, and
+        // `guest_cpu::total_us()` reads the SAME proc_pid_rusage counters as
+        // above — adding it would double-count. The converted user/system split
+        // is already the honest native model (guest utime = host user time,
+        // guest stime = host system time).
+        if !crate::guest_cpu::native_darwin_provider() {
+            let guest_us = crate::guest_cpu::total_us();
+            if guest_us > 0 {
+                usage.user_us = usage.user_us.saturating_add(guest_us);
+            }
         }
         Some(usage)
     }
@@ -1081,6 +1143,8 @@ mod imp {
     }
 }
 
+#[cfg(target_os = "macos")]
+pub use imp::self_cpu_total_ns;
 pub use imp::{
     current_thread_port, is_guest_process, pid_info, self_resource_usage, self_thread_cpu_us,
     self_vm_region_count, thread_run_state_char,
@@ -1094,6 +1158,47 @@ pub type ThreadPort = u32;
 
 #[cfg(test)]
 mod accounting_smoke {
+    /// `self_resource_usage` CPU times must agree with the kernel's own
+    /// `getrusage(RUSAGE_SELF)` (both are µs of this process's CPU). The old
+    /// code read `proc_pid_rusage`'s mach-time-unit fields as nanoseconds and
+    /// under-reported ~41.7× on Apple Silicon — this test fails against that
+    /// interpretation. Tolerances are wide (2×) because other test threads
+    /// keep burning CPU between the two reads, only monotonically inflating
+    /// the later one.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn self_cpu_matches_getrusage_units() {
+        // Burn enough CPU that unit errors dominate scheduling noise.
+        let mut acc: u64 = 1;
+        for _ in 0..40_000_000u64 {
+            acc = acc.wrapping_mul(6364136223846793005).wrapping_add(1);
+            acc ^= acc >> 17;
+        }
+        std::hint::black_box(acc);
+        let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) }, 0);
+        let getrusage_cpu_us = (ru.ru_utime.tv_sec as u64 * 1_000_000 + ru.ru_utime.tv_usec as u64)
+            + (ru.ru_stime.tv_sec as u64 * 1_000_000 + ru.ru_stime.tv_usec as u64);
+        let usage = super::self_resource_usage().expect("resource usage available");
+        // The HVF guest_cpu addition is 0 in unit tests, so user+system here is
+        // purely the converted proc_pid_rusage reading.
+        let converted_us = usage.user_us + usage.system_us;
+        assert!(
+            converted_us >= getrusage_cpu_us / 2,
+            "converted CPU {converted_us}µs under-reports getrusage {getrusage_cpu_us}µs — \
+             mach-time-unit conversion regressed"
+        );
+        assert!(
+            converted_us <= getrusage_cpu_us.saturating_mul(2).saturating_add(100_000),
+            "converted CPU {converted_us}µs over-reports getrusage {getrusage_cpu_us}µs"
+        );
+        let total_ns = super::self_cpu_total_ns().expect("self cpu total");
+        assert!(
+            total_ns / 1000 >= getrusage_cpu_us / 2,
+            "self_cpu_total_ns {total_ns}ns under-reports getrusage {getrusage_cpu_us}µs"
+        );
+    }
+
     #[test]
     fn self_resource_usage_does_not_crash() {
         let u = super::self_resource_usage();
