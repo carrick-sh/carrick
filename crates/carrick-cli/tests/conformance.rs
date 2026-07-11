@@ -3737,6 +3737,32 @@ fn native16k_epoll_zero_interest_mod_wakes_waiter() {
 
 #[test]
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn native16k_mprotect_exec_permissions_match_linux() {
+    let _serial = CONFORMANCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let Some(bin) = carrick_bin() else {
+        eprintln!(
+            "SKIP native16k_mprotect_exec_permissions_match_linux: target/release/carrick not built"
+        );
+        return;
+    };
+    ensure_signed(&bin);
+    let probe = ensure_native_static_pie_probe("mprotectexec");
+    let output = run_native_run_elf_with_args(&bin, &probe, "native16k", &["status"]);
+
+    assert!(
+        output.contains("status=exit status: 0")
+            && output.contains("nonexec_mmap_faults=true")
+            && output.contains("exec_mmap_fetch_allowed=true")
+            && output.contains("mprotect_drop_exec_faults=true")
+            && output.contains("mprotect_add_exec_fetch_allowed=true")
+            && output.contains("mprotect_exec_only_fetch_allowed=true"),
+        "native16k mmap/mprotect executable permissions diverged from Linux:\n{output}"
+    );
+}
+
+#[test]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn native_conformance_run_elf_supports_clone_child_stack() {
     let _serial = CONFORMANCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 

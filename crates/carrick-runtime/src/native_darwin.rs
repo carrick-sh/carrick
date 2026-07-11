@@ -7,7 +7,7 @@
 //! details and the native run loop. Unsupported dispatcher outcomes fail
 //! explicitly rather than falling back to HVF.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::os::fd::{FromRawFd, RawFd};
 use std::path::{Path, PathBuf};
@@ -775,6 +775,19 @@ fn run_native_thread_loop(
                 continue;
             }
 
+            let write_exec_resolved = {
+                let mut memory = memory.lock();
+                memory.resolve_native16k_write_exec_fault(
+                    fault_address,
+                    snapshot.pc,
+                    snapshot.esr,
+                )?
+            };
+            if write_exec_resolved {
+                resume_guest_snapshot(&snapshot)?;
+                continue;
+            }
+
             let guarded = memory.lock().linux4k_address_is_guarded(fault_address);
             if guarded {
                 let mut memory = memory.lock();
@@ -995,6 +1008,30 @@ fn run_native_thread_loop(
                         child_tid_addr,
                         clear_child_tid_addr,
                     } => {
+                        let clone_rejection = memory.lock().native16k_clone_thread_rejection();
+                        if let Some(reason) = clone_rejection {
+                            let syscall_name = if request.number.raw() == 435 {
+                                "clone3"
+                            } else {
+                                "clone"
+                            };
+                            reporter.record(crate::compat::CompatEvent::partial_syscall(
+                                request.number.raw(),
+                                syscall_name,
+                                request.args,
+                                reason,
+                            ));
+                            resume_guest_after_syscall(
+                                &dispatcher,
+                                &memory,
+                                snapshot,
+                                resume_pc,
+                                crate::linux_abi::LINUX_EOPNOTSUPP.guest_retval(),
+                                request.number.raw(),
+                                thread_runtime.tid(),
+                            )?;
+                            continue;
+                        }
                         let tid = thread_runtime.spawn_clone_thread(
                             &dispatcher,
                             &memory,
@@ -1052,6 +1089,33 @@ fn run_native_thread_loop(
                         child_stack,
                         vfork,
                     } => {
+                        let vfork_rejection = vfork
+                            .is_some()
+                            .then(|| memory.lock().native16k_vfork_rejection())
+                            .flatten();
+                        if let Some(reason) = vfork_rejection {
+                            let syscall_name = if request.number.raw() == 435 {
+                                "clone3"
+                            } else {
+                                "clone"
+                            };
+                            reporter.record(crate::compat::CompatEvent::partial_syscall(
+                                request.number.raw(),
+                                syscall_name,
+                                request.args,
+                                reason,
+                            ));
+                            resume_guest_after_syscall(
+                                &dispatcher,
+                                &memory,
+                                snapshot,
+                                resume_pc,
+                                crate::linux_abi::LINUX_EOPNOTSUPP.guest_retval(),
+                                request.number.raw(),
+                                thread_runtime.tid(),
+                            )?;
+                            continue;
+                        }
                         thread_runtime.require_single_threaded("fork")?;
                         let request = NativeForkRequest {
                             pidfd_out,
@@ -4001,6 +4065,7 @@ struct NativeMappedMemory {
     regions: Vec<NativeMappedRegion>,
     protections: MemoryProtections,
     native_page_protections: BTreeMap<u64, u64>,
+    native_write_exec_writable_pages: BTreeSet<u64>,
     linux4k_page_protections: BTreeMap<u64, [u64; 4]>,
     exclusive_reservation: Option<NativeExclusiveReservation>,
     host_page_size: u64,
@@ -4157,6 +4222,7 @@ impl NativeMappedMemory {
             regions,
             protections,
             native_page_protections: BTreeMap::new(),
+            native_write_exec_writable_pages: BTreeSet::new(),
             linux4k_page_protections: BTreeMap::new(),
             exclusive_reservation: None,
             host_page_size,
@@ -4292,6 +4358,178 @@ impl NativeMappedMemory {
 
     fn uses_linux4k_subpages(&self) -> bool {
         self.host_page_size == 16 * 1024 && self.linux_page_size == 4 * 1024
+    }
+
+    fn native16k_write_exec_page(&self, address: u64) -> Option<u64> {
+        if self.uses_linux4k_subpages()
+            || !self.regions.iter().any(|region| {
+                region.host_protects && address >= region.start && address < region.end
+            })
+        {
+            return None;
+        }
+        let page_start = address & !(self.host_page_size - 1);
+        let prot = self
+            .native_page_protections
+            .get(&page_start)
+            .copied()
+            .unwrap_or_else(|| self.default_linux_prot_at(address));
+        let write_exec = crate::linux_abi::LINUX_PROT_WRITE | crate::linux_abi::LINUX_PROT_EXEC;
+        (prot & write_exec == write_exec).then_some(page_start)
+    }
+
+    fn has_native16k_write_exec_pages(&self) -> bool {
+        if self.host_page_size != 16 * 1024 || self.linux_page_size != self.host_page_size {
+            return false;
+        }
+        let write_exec = crate::linux_abi::LINUX_PROT_WRITE | crate::linux_abi::LINUX_PROT_EXEC;
+        self.native_page_protections
+            .values()
+            .copied()
+            .chain(self.regions.iter().map(|region| region.default_prot))
+            .any(|prot| prot & write_exec == write_exec)
+    }
+
+    fn native16k_clone_thread_rejection(&self) -> Option<&'static str> {
+        self.has_native16k_write_exec_pages()
+            .then_some("native16k cannot create a guest thread while write-exec pages are present")
+    }
+
+    fn native16k_vfork_rejection(&self) -> Option<&'static str> {
+        self.has_native16k_write_exec_pages().then_some(
+            "native16k cannot vfork while write-exec pages are present because vfork shares writable mappings",
+        )
+    }
+
+    fn make_native16k_write_exec_page_writable(
+        &mut self,
+        page_start: u64,
+        operation_address: u64,
+        operation_len: usize,
+    ) -> Result<(), MemoryError> {
+        if self.native_write_exec_writable_pages.contains(&page_start) {
+            return Ok(());
+        }
+        self.mprotect_host_page(
+            page_start,
+            libc::PROT_READ | libc::PROT_WRITE,
+            operation_address,
+            operation_len,
+        )?;
+        self.native_write_exec_writable_pages.insert(page_start);
+        Ok(())
+    }
+
+    fn make_native16k_write_exec_page_executable(
+        &mut self,
+        page_start: u64,
+        operation_address: u64,
+        operation_len: usize,
+    ) -> Result<(), MemoryError> {
+        if !self.native_write_exec_writable_pages.contains(&page_start) {
+            return Ok(());
+        }
+        let page_len =
+            usize::try_from(self.host_page_size).map_err(|_| MemoryError::OutOfBounds {
+                address: operation_address,
+                length: operation_len,
+            })?;
+        let ptr = usize::try_from(page_start).map_err(|_| MemoryError::OutOfBounds {
+            address: operation_address,
+            length: operation_len,
+        })? as *mut u8;
+        patch_syscalls(ptr, page_len);
+        unsafe { carrick_native_clear_icache(ptr.cast(), page_len) };
+        let prot = self
+            .native_page_protections
+            .get(&page_start)
+            .copied()
+            .unwrap_or_else(|| self.default_linux_prot_at(page_start));
+        self.mprotect_host_page(
+            page_start,
+            native16k_host_prot(prot),
+            operation_address,
+            operation_len,
+        )?;
+        self.native_write_exec_writable_pages.remove(&page_start);
+        Ok(())
+    }
+
+    fn prepare_native16k_write_exec_host_write(
+        &mut self,
+        address: u64,
+        len: usize,
+    ) -> Result<(), MemoryError> {
+        if len == 0 || self.uses_linux4k_subpages() {
+            return Ok(());
+        }
+        let end = address
+            .checked_add(len as u64)
+            .ok_or(MemoryError::OutOfBounds {
+                address,
+                length: len,
+            })?;
+        let mut page = address & !(self.host_page_size - 1);
+        while page < end {
+            if self.native16k_write_exec_page(page).is_some() {
+                self.make_native16k_write_exec_page_writable(page, address, len)?;
+            }
+            page = page.saturating_add(self.host_page_size);
+        }
+        Ok(())
+    }
+
+    fn resolve_native16k_write_exec_fault(
+        &mut self,
+        fault_address: u64,
+        pc: u64,
+        esr: u64,
+    ) -> Result<bool, RuntimeError> {
+        let Some(page_start) = self.native16k_write_exec_page(fault_address) else {
+            return Ok(false);
+        };
+        let ec = (esr >> 26) & 0x3f;
+        let fault_status = esr & 0x3f;
+        if !matches!(fault_status, 0x0c..=0x0f) {
+            return Ok(false);
+        }
+        if matches!(ec, 0x20 | 0x21) {
+            if !self.native_write_exec_writable_pages.contains(&page_start) {
+                return Ok(false);
+            }
+            self.make_native16k_write_exec_page_executable(
+                page_start,
+                fault_address,
+                self.host_page_size as usize,
+            )
+            .map_err(|error| {
+                RuntimeError::Unsupported(format!(
+                    "native16k could not make guest write-exec page 0x{page_start:x} executable: {error}"
+                ))
+            })?;
+            return Ok(true);
+        }
+        let write_data_abort = matches!(ec, 0x24 | 0x25) && esr & (1 << 6) != 0;
+        if !write_data_abort || self.native_write_exec_writable_pages.contains(&page_start) {
+            return Ok(false);
+        }
+        let pc_page = pc & !(self.host_page_size - 1);
+        if pc_page == page_start {
+            return Err(RuntimeError::Unsupported(format!(
+                "native16k cannot write a guest RWX page while executing from the same 16K host page at pc=0x{pc:x} addr=0x{fault_address:x}"
+            )));
+        }
+        self.make_native16k_write_exec_page_writable(
+            page_start,
+            fault_address,
+            self.host_page_size as usize,
+        )
+        .map_err(|error| {
+            RuntimeError::Unsupported(format!(
+                "native16k could not make guest write-exec page 0x{page_start:x} writable: {error}"
+            ))
+        })?;
+        Ok(true)
     }
 
     fn default_linux_prot_at(&self, address: u64) -> u64 {
@@ -4617,7 +4855,10 @@ impl NativeMappedMemory {
                 .get(&page_start)
                 .copied()
                 .unwrap_or_else(|| self.default_linux_prot_at(page_start));
-            return linux_prot_to_native(prot);
+            if self.native_write_exec_writable_pages.contains(&page_start) {
+                return libc::PROT_READ | libc::PROT_WRITE;
+            }
+            return native16k_host_prot(prot);
         }
         let protections = self.linux4k_host_page_protections(page_start);
         match self.classify_linux4k_host_page(protections) {
@@ -5028,6 +5269,127 @@ impl NativeMappedMemory {
         });
         Ok(())
     }
+
+    fn protect_native16k_range_with<F>(
+        &mut self,
+        address: u64,
+        len: usize,
+        prot: u64,
+        mut set_host_prot: F,
+    ) -> Result<(), MemoryError>
+    where
+        F: FnMut(u64, usize, libc::c_int) -> Result<(), MemoryError>,
+    {
+        let host_prot = native16k_host_prot(prot);
+        let mut pages = BTreeSet::new();
+        for (start, end) in self.host_protected_overlaps(address, len) {
+            let (page_start, page_len) = self.host_page_range(start, end)?;
+            let page_end = page_start.saturating_add(page_len as u64);
+            let mut page = page_start;
+            while page < page_end {
+                pages.insert(page);
+                page = page.saturating_add(self.host_page_size);
+            }
+        }
+        let host_page_len =
+            usize::try_from(self.host_page_size).map_err(|_| MemoryError::OutOfBounds {
+                address,
+                length: len,
+            })?;
+
+        let pages: Vec<(u64, *mut libc::c_void)> = pages
+            .into_iter()
+            .map(|page_start| {
+                let ptr = usize::try_from(page_start).map_err(|_| MemoryError::OutOfBounds {
+                    address,
+                    length: len,
+                })? as *mut libc::c_void;
+                Ok((page_start, ptr))
+            })
+            .collect::<Result<_, MemoryError>>()?;
+
+        struct ProtectionSnapshot {
+            page_start: u64,
+            ptr: *mut libc::c_void,
+            old_host_prot: libc::c_int,
+            patched_words: Vec<(usize, u32)>,
+        }
+
+        let mut snapshots = Vec::with_capacity(pages.len());
+        let apply_result = (|| {
+            for &(page_start, ptr) in &pages {
+                let old_host_prot = self.native_host_prot_for_page(page_start);
+                if prot & crate::linux_abi::LINUX_PROT_EXEC != 0 {
+                    set_host_prot(
+                        page_start,
+                        host_page_len,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                    )?;
+                    let mut patched_words = Vec::new();
+                    patch_syscalls_recording(
+                        ptr.cast::<u8>(),
+                        host_page_len,
+                        |offset, original| patched_words.push((offset, original)),
+                    );
+                    snapshots.push(ProtectionSnapshot {
+                        page_start,
+                        ptr,
+                        old_host_prot,
+                        patched_words,
+                    });
+                    unsafe { carrick_native_clear_icache(ptr, host_page_len) };
+                } else {
+                    snapshots.push(ProtectionSnapshot {
+                        page_start,
+                        ptr,
+                        old_host_prot,
+                        patched_words: Vec::new(),
+                    });
+                }
+                set_host_prot(page_start, host_page_len, host_prot)?;
+            }
+            Ok(())
+        })();
+
+        if let Err(error) = apply_result {
+            let mut rollback_error = None;
+            for snapshot in snapshots.iter().rev() {
+                if !snapshot.patched_words.is_empty() {
+                    match set_host_prot(
+                        snapshot.page_start,
+                        host_page_len,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                    ) {
+                        Ok(()) => unsafe {
+                            for &(offset, original) in &snapshot.patched_words {
+                                let word = snapshot.ptr.cast::<u8>().add(offset).cast::<u32>();
+                                std::ptr::write_unaligned(word, original);
+                            }
+                            carrick_native_clear_icache(snapshot.ptr, host_page_len);
+                        },
+                        Err(restore_error) => rollback_error = Some(restore_error),
+                    }
+                }
+                if let Err(restore_error) =
+                    set_host_prot(snapshot.page_start, host_page_len, snapshot.old_host_prot)
+                {
+                    rollback_error = Some(restore_error);
+                }
+            }
+            if let Some(rollback_error) = rollback_error {
+                return Err(MemoryError::HostMap(format!(
+                    "native16k protection failed: {error}; rollback failed: {rollback_error}"
+                )));
+            }
+            return Err(error);
+        }
+
+        for (page_start, _) in pages {
+            self.native_page_protections.insert(page_start, prot);
+            self.native_write_exec_writable_pages.remove(&page_start);
+        }
+        Ok(())
+    }
 }
 
 impl GuestMemory for NativeMappedMemory {
@@ -5098,6 +5460,7 @@ impl GuestMemory for NativeMappedMemory {
             return Err(MemoryError::OutOfBounds { address, length });
         }
         self.invalidate_exclusive_range(address, length);
+        self.prepare_native16k_write_exec_host_write(address, length)?;
         let ptr = usize::try_from(address)
             .map_err(|_| MemoryError::OutOfBounds { address, length })?
             as *mut u8;
@@ -5149,41 +5512,19 @@ impl GuestMemory for NativeMappedMemory {
         if self.uses_linux4k_subpages() {
             return self.protect_linux4k_range(address, len, prot);
         }
-        let host_prot = linux_prot_to_native(prot);
-        let overlaps: Vec<(u64, u64)> = self.host_protected_overlaps(address, len).collect();
-        for (start, end) in overlaps {
-            let (page_start, page_len) = self.host_page_range(start, end)?;
+        self.protect_native16k_range_with(address, len, prot, |page_start, page_len, host_prot| {
             let ptr = usize::try_from(page_start).map_err(|_| MemoryError::OutOfBounds {
                 address,
                 length: len,
             })? as *mut libc::c_void;
-            if prot & crate::linux_abi::LINUX_PROT_EXEC != 0 {
-                let writable =
-                    unsafe { libc::mprotect(ptr, page_len, libc::PROT_READ | libc::PROT_WRITE) };
-                if writable != 0 {
-                    return Err(MemoryError::OutOfBounds {
-                        address,
-                        length: len,
-                    });
-                }
-                patch_syscalls(ptr.cast::<u8>(), page_len);
-                unsafe { carrick_native_clear_icache(ptr, page_len) };
+            if unsafe { libc::mprotect(ptr, page_len, host_prot) } != 0 {
+                return Err(MemoryError::HostMap(format!(
+                    "mprotect native Darwin host page 0x{page_start:x}: {}",
+                    std::io::Error::last_os_error()
+                )));
             }
-            let rc = unsafe { libc::mprotect(ptr, page_len, host_prot) };
-            if rc != 0 {
-                return Err(MemoryError::OutOfBounds {
-                    address,
-                    length: len,
-                });
-            }
-            let mut page = page_start;
-            let page_end = page_start.saturating_add(page_len as u64);
-            while page < page_end {
-                self.native_page_protections.insert(page, prot);
-                page = page.saturating_add(self.host_page_size);
-            }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     fn unmap_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
@@ -5235,6 +5576,15 @@ fn linux_prot_to_native(prot: u64) -> libc::c_int {
     }
     if prot & crate::linux_abi::LINUX_PROT_EXEC != 0 {
         host_prot |= libc::PROT_EXEC;
+    }
+    host_prot
+}
+
+fn native16k_host_prot(prot: u64) -> libc::c_int {
+    let mut host_prot = linux_prot_to_native(prot);
+    let write_exec = crate::linux_abi::LINUX_PROT_WRITE | crate::linux_abi::LINUX_PROT_EXEC;
+    if prot & write_exec == write_exec {
+        host_prot &= !libc::PROT_WRITE;
     }
     host_prot
 }
@@ -5450,9 +5800,14 @@ fn region_prot(region: &MemoryRegion) -> libc::c_int {
 }
 
 fn patch_syscalls(base: *mut u8, length: usize) {
+    patch_syscalls_recording(base, length, |_, _| {});
+}
+
+fn patch_syscalls_recording(base: *mut u8, length: usize, mut record: impl FnMut(usize, u32)) {
     let words = length / std::mem::size_of::<u32>();
     for index in 0..words {
-        let ptr = unsafe { base.add(index * std::mem::size_of::<u32>()).cast::<u32>() };
+        let offset = index * std::mem::size_of::<u32>();
+        let ptr = unsafe { base.add(offset).cast::<u32>() };
         let word = unsafe { std::ptr::read_unaligned(ptr) };
         let patched = if word == SVC_0 {
             Some(BRK_NATIVE_SYSCALL)
@@ -5483,8 +5838,9 @@ fn patch_syscalls(base: *mut u8, length: usize) {
         } else {
             None
         };
-        if let Some(word) = patched {
-            unsafe { std::ptr::write_unaligned(ptr, word) };
+        if let Some(patched_word) = patched {
+            record(offset, word);
+            unsafe { std::ptr::write_unaligned(ptr, patched_word) };
         }
     }
 }
@@ -5585,6 +5941,7 @@ fn last_io_error(context: &str) -> RuntimeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::{Cell, RefCell};
 
     #[test]
     fn native_fd_wait_deadline_survives_wait_variant_changes() {
@@ -5679,6 +6036,7 @@ mod tests {
             regions: Vec::new(),
             protections: MemoryProtections::default(),
             native_page_protections: BTreeMap::new(),
+            native_write_exec_writable_pages: BTreeSet::new(),
             linux4k_page_protections: BTreeMap::new(),
             exclusive_reservation: None,
             host_page_size: 16 * 1024,
@@ -5713,6 +6071,7 @@ mod tests {
             }],
             protections: MemoryProtections::default(),
             native_page_protections: BTreeMap::new(),
+            native_write_exec_writable_pages: BTreeSet::new(),
             linux4k_page_protections: BTreeMap::new(),
             exclusive_reservation: None,
             host_page_size: 16 * 1024,
@@ -6038,6 +6397,351 @@ mod tests {
                 },
             );
             unsafe { libc::_exit(i32::from(result.is_err())) };
+        }
+
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFEXITED(status), "child status was 0x{status:x}");
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+    }
+
+    #[test]
+    fn native16k_write_exec_page_transitions_between_write_and_execute() {
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            let page_size = 16 * 1024_u64;
+            let layout = MemoryLayout {
+                heap_base: NATIVE_DARWIN_HEAP_BASE,
+                heap_size: page_size,
+                mmap_base: NATIVE_DARWIN_MMAP_BASE,
+                mmap_size: page_size,
+            };
+            let image = AddressSpace::from_regions(0, Vec::new())
+                .expect("empty native test image should be valid");
+            let transitioned = NativeMappedMemory::map(&image, layout, page_size, page_size)
+                .and_then(|mut memory| {
+                    let write_exec = crate::linux_abi::LINUX_PROT_READ
+                        | crate::linux_abi::LINUX_PROT_WRITE
+                        | crate::linux_abi::LINUX_PROT_EXEC;
+                    memory
+                        .protect_range(layout.mmap_base, page_size as usize, write_exec)
+                        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+                    let data_write_esr = (0x25_u64 << 26) | (1 << 6) | 0x0f;
+                    if !memory.resolve_native16k_write_exec_fault(
+                        layout.mmap_base,
+                        NATIVE_DARWIN_PIE_BASE,
+                        data_write_esr,
+                    )? {
+                        return Err(RuntimeError::Unsupported(
+                            "write-exec data fault was not resolved".to_string(),
+                        ));
+                    }
+                    let ret = 0xd65f_03c0_u32;
+                    unsafe {
+                        std::ptr::write_unaligned(
+                            usize::try_from(layout.mmap_base).map_err(|_| {
+                                RuntimeError::Unsupported("test address overflow".to_string())
+                            })? as *mut u32,
+                            ret,
+                        );
+                    }
+                    if !memory.resolve_native16k_write_exec_fault(
+                        layout.mmap_base,
+                        layout.mmap_base,
+                        (0x21_u64 << 26) | 0x0f,
+                    )? {
+                        return Err(RuntimeError::Unsupported(
+                            "write-exec instruction fault was not resolved".to_string(),
+                        ));
+                    }
+                    let entry: unsafe extern "C" fn() = unsafe {
+                        std::mem::transmute(usize::try_from(layout.mmap_base).map_err(|_| {
+                            RuntimeError::Unsupported("test address overflow".to_string())
+                        })? as *mut libc::c_void)
+                    };
+                    unsafe { entry() };
+                    Ok(())
+                });
+            unsafe { libc::_exit(i32::from(transitioned.is_err())) };
+        }
+
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFEXITED(status), "child status was 0x{status:x}");
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+    }
+
+    #[test]
+    fn native16k_write_exec_rejects_same_page_self_modification() {
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            let page_size = 16 * 1024_u64;
+            let layout = MemoryLayout {
+                heap_base: NATIVE_DARWIN_HEAP_BASE,
+                heap_size: page_size,
+                mmap_base: NATIVE_DARWIN_MMAP_BASE,
+                mmap_size: page_size,
+            };
+            let image = AddressSpace::from_regions(0, Vec::new())
+                .expect("empty native test image should be valid");
+            let rejected = NativeMappedMemory::map(&image, layout, page_size, page_size)
+                .and_then(|mut memory| {
+                    let write_exec = crate::linux_abi::LINUX_PROT_READ
+                        | crate::linux_abi::LINUX_PROT_WRITE
+                        | crate::linux_abi::LINUX_PROT_EXEC;
+                    memory
+                        .protect_range(layout.mmap_base, page_size as usize, write_exec)
+                        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+                    let data_write_esr = (0x25_u64 << 26) | (1 << 6) | 0x0f;
+                    Ok(memory
+                        .resolve_native16k_write_exec_fault(
+                            layout.mmap_base,
+                            layout.mmap_base,
+                            data_write_esr,
+                        )
+                        .is_err())
+                })
+                .unwrap_or(false);
+            unsafe { libc::_exit(i32::from(!rejected)) };
+        }
+
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFEXITED(status), "child status was 0x{status:x}");
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+    }
+
+    #[test]
+    fn native16k_write_exec_does_not_consume_data_translation_fault() {
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            let page_size = 16 * 1024_u64;
+            let layout = MemoryLayout {
+                heap_base: NATIVE_DARWIN_HEAP_BASE,
+                heap_size: page_size,
+                mmap_base: NATIVE_DARWIN_MMAP_BASE,
+                mmap_size: page_size,
+            };
+            let image = AddressSpace::from_regions(0, Vec::new())
+                .expect("empty native test image should be valid");
+            let accepted = NativeMappedMemory::map(&image, layout, page_size, page_size)
+                .and_then(|mut memory| {
+                    let write_exec = crate::linux_abi::LINUX_PROT_READ
+                        | crate::linux_abi::LINUX_PROT_WRITE
+                        | crate::linux_abi::LINUX_PROT_EXEC;
+                    memory
+                        .protect_range(layout.mmap_base, page_size as usize, write_exec)
+                        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+                    memory.resolve_native16k_write_exec_fault(
+                        layout.mmap_base,
+                        NATIVE_DARWIN_PIE_BASE,
+                        (0x25_u64 << 26) | (1 << 6) | 0x04,
+                    )
+                })
+                .unwrap_or(true);
+            unsafe { libc::_exit(i32::from(accepted)) };
+        }
+
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFEXITED(status), "child status was 0x{status:x}");
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+    }
+
+    #[test]
+    fn native16k_write_exec_does_not_consume_instruction_translation_fault() {
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            let page_size = 16 * 1024_u64;
+            let layout = MemoryLayout {
+                heap_base: NATIVE_DARWIN_HEAP_BASE,
+                heap_size: page_size,
+                mmap_base: NATIVE_DARWIN_MMAP_BASE,
+                mmap_size: page_size,
+            };
+            let image = AddressSpace::from_regions(0, Vec::new())
+                .expect("empty native test image should be valid");
+            let accepted = NativeMappedMemory::map(&image, layout, page_size, page_size)
+                .and_then(|mut memory| {
+                    let write_exec = crate::linux_abi::LINUX_PROT_READ
+                        | crate::linux_abi::LINUX_PROT_WRITE
+                        | crate::linux_abi::LINUX_PROT_EXEC;
+                    memory
+                        .protect_range(layout.mmap_base, page_size as usize, write_exec)
+                        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+                    if !memory.resolve_native16k_write_exec_fault(
+                        layout.mmap_base,
+                        NATIVE_DARWIN_PIE_BASE,
+                        (0x25_u64 << 26) | (1 << 6) | 0x0f,
+                    )? {
+                        return Err(RuntimeError::Unsupported(
+                            "permission write fault was not resolved".to_string(),
+                        ));
+                    }
+                    memory.resolve_native16k_write_exec_fault(
+                        layout.mmap_base,
+                        layout.mmap_base,
+                        (0x21_u64 << 26) | 0x04,
+                    )
+                })
+                .unwrap_or(true);
+            unsafe { libc::_exit(i32::from(accepted)) };
+        }
+
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFEXITED(status), "child status was 0x{status:x}");
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+    }
+
+    #[test]
+    fn native16k_write_exec_rejects_later_clone_thread() {
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            let page_size = 16 * 1024_u64;
+            let layout = MemoryLayout {
+                heap_base: NATIVE_DARWIN_HEAP_BASE,
+                heap_size: page_size,
+                mmap_base: NATIVE_DARWIN_MMAP_BASE,
+                mmap_size: page_size,
+            };
+            let image = AddressSpace::from_regions(0, Vec::new())
+                .expect("empty native test image should be valid");
+            let rejected = NativeMappedMemory::map(&image, layout, page_size, page_size)
+                .and_then(|mut memory| {
+                    let write_exec = crate::linux_abi::LINUX_PROT_READ
+                        | crate::linux_abi::LINUX_PROT_WRITE
+                        | crate::linux_abi::LINUX_PROT_EXEC;
+                    memory
+                        .protect_range(layout.mmap_base, page_size as usize, write_exec)
+                        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+                    Ok(memory
+                        .native16k_clone_thread_rejection()
+                        .is_some_and(|reason| reason.contains("write-exec")))
+                })
+                .unwrap_or(false);
+            unsafe { libc::_exit(i32::from(!rejected)) };
+        }
+
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFEXITED(status), "child status was 0x{status:x}");
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+    }
+
+    #[test]
+    fn native16k_write_exec_rejects_later_vfork() {
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            let page_size = 16 * 1024_u64;
+            let layout = MemoryLayout {
+                heap_base: NATIVE_DARWIN_HEAP_BASE,
+                heap_size: page_size,
+                mmap_base: NATIVE_DARWIN_MMAP_BASE,
+                mmap_size: page_size,
+            };
+            let image = AddressSpace::from_regions(0, Vec::new())
+                .expect("empty native test image should be valid");
+            let rejected = NativeMappedMemory::map(&image, layout, page_size, page_size)
+                .and_then(|mut memory| {
+                    let write_exec = crate::linux_abi::LINUX_PROT_READ
+                        | crate::linux_abi::LINUX_PROT_WRITE
+                        | crate::linux_abi::LINUX_PROT_EXEC;
+                    memory
+                        .protect_range(layout.mmap_base, page_size as usize, write_exec)
+                        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+                    Ok(memory
+                        .native16k_vfork_rejection()
+                        .is_some_and(|reason| reason.contains("vfork")))
+                })
+                .unwrap_or(false);
+            unsafe { libc::_exit(i32::from(!rejected)) };
+        }
+
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFEXITED(status), "child status was 0x{status:x}");
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+    }
+
+    #[test]
+    fn native16k_protection_transaction_rolls_back_late_host_failure() {
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            let page_size = 16 * 1024_u64;
+            let layout = MemoryLayout {
+                heap_base: NATIVE_DARWIN_HEAP_BASE,
+                heap_size: page_size,
+                mmap_base: NATIVE_DARWIN_MMAP_BASE,
+                mmap_size: 2 * page_size,
+            };
+            let image = AddressSpace::from_regions(0, Vec::new())
+                .expect("empty native test image should be valid");
+            let restored = NativeMappedMemory::map(&image, layout, page_size, page_size)
+                .and_then(|mut memory| {
+                    memory
+                        .write_bytes_raw(layout.mmap_base, &SVC_0.to_le_bytes())
+                        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+                    memory
+                        .write_bytes_raw(layout.mmap_base + page_size, &SVC_0.to_le_bytes())
+                        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+
+                    let calls = Cell::new(0_usize);
+                    let operations = RefCell::new(Vec::new());
+                    let result = memory.protect_native16k_range_with(
+                        layout.mmap_base,
+                        (2 * page_size) as usize,
+                        crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_EXEC,
+                        |page_start, page_len, host_prot| {
+                            let call = calls.get() + 1;
+                            calls.set(call);
+                            operations.borrow_mut().push((page_start, host_prot));
+                            if call == 4 {
+                                return Err(MemoryError::HostMap(
+                                    "injected final protection failure".to_string(),
+                                ));
+                            }
+                            let ptr = usize::try_from(page_start).map_err(|_| {
+                                MemoryError::OutOfBounds {
+                                    address: page_start,
+                                    length: page_len,
+                                }
+                            })? as *mut libc::c_void;
+                            if unsafe { libc::mprotect(ptr, page_len, host_prot) } != 0 {
+                                return Err(MemoryError::HostMap(
+                                    std::io::Error::last_os_error().to_string(),
+                                ));
+                            }
+                            Ok(())
+                        },
+                    );
+
+                    let writable = unsafe {
+                        libc::mprotect(
+                            layout.mmap_base as *mut libc::c_void,
+                            (2 * page_size) as usize,
+                            libc::PROT_READ | libc::PROT_WRITE,
+                        )
+                    } == 0;
+                    let words_restored = writable
+                        && memory.read_u32(layout.mmap_base).ok() == Some(SVC_0)
+                        && memory.read_u32(layout.mmap_base + page_size).ok() == Some(SVC_0);
+                    let rollback_calls = operations.borrow();
+                    Ok(result.is_err()
+                        && rollback_calls.len() >= 8
+                        && memory.native_page_protections.is_empty()
+                        && memory.native_write_exec_writable_pages.is_empty()
+                        && words_restored)
+                })
+                .unwrap_or(false);
+            unsafe { libc::_exit(i32::from(!restored)) };
         }
 
         let mut status = 0;
