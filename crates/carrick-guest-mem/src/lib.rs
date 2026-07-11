@@ -257,8 +257,8 @@ where
 /// backend may be the real HVF-backed address space or the in-memory
 /// `LinearMemory` used by unit tests.
 pub trait GuestMemory {
-    /// The process-wide PROT_NONE set this backend enforces on the syscall path,
-    /// or `None` for a modelless backend (the in-memory test models). When
+    /// The process-wide inaccessible/unmapped sets this backend enforces on the
+    /// syscall path, or `None` for a modelless backend (the in-memory test models). When
     /// `Some`, the default [`read_bytes`](Self::read_bytes) /
     /// [`write_bytes`](Self::write_bytes) fault any buffer overlapping a recorded
     /// range with `EFAULT` BEFORE touching backing — the single shared host-side
@@ -268,7 +268,7 @@ pub trait GuestMemory {
         None
     }
 
-    /// PERMISSION-CHECKED guest read. DEFAULT: run the PROT_NONE gate
+    /// PERMISSION-CHECKED guest read. DEFAULT: run the inaccessible-range gate
     /// (`protections()`), then delegate to [`read_bytes_raw`](Self::read_bytes_raw).
     /// Backends must NOT override this — implement `read_bytes_raw` instead so the
     /// one shared gate always runs.
@@ -414,6 +414,32 @@ pub trait GuestMemory {
     /// the same buffer remain allowed. Default: no-op for memory models that do
     /// not track read-only syscall buffers.
     fn set_no_write(&mut self, _address: u64, _len: usize, _no_write: bool) {}
+
+    /// Mark a guest range as removed from the VMA set (`unmapped=true`) or
+    /// clear that state on reuse. Real backends with protection metadata
+    /// override this so fault delivery can distinguish post-`munmap`
+    /// `SEGV_MAPERR` from mapped `PROT_NONE` `SEGV_ACCERR`. The fallback keeps
+    /// the historical syscall-buffer EFAULT behavior for simple test models.
+    fn set_unmapped(&mut self, address: u64, len: usize, unmapped: bool) {
+        if unmapped {
+            self.set_no_write(address, len, false);
+        }
+        self.set_no_access(address, len, unmapped);
+    }
+
+    /// Publish all permission metadata for one live mapping as a single state
+    /// transition. Real shared-memory backends override this to keep sibling
+    /// vCPUs from observing an accessible gap between separate updates.
+    fn set_mapping_protection(
+        &mut self,
+        address: u64,
+        len: usize,
+        no_access: bool,
+        no_write: bool,
+    ) {
+        self.set_no_access(address, len, no_access);
+        self.set_no_write(address, len, no_write);
+    }
 
     /// Change the guest-VISIBLE protection of `[address, address+len)` by
     /// editing the EL1 stage-1 page descriptors and flushing the stage-1 TLB,

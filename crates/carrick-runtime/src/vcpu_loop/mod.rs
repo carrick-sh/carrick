@@ -365,7 +365,7 @@ use signal::deliver_fault_signal;
 pub(crate) use signal::{
     FaultSignalDisposition, deliver_pending_signal, inject_fault_signal, lower_el0_fault,
     partial_write_interrupt_outcome, raise_sigpipe_for_blocking_write, signal_progress_count,
-    signal_wait_expired, signal_wait_remaining, signal_wait_slice, upgrade_prot_none_si_code,
+    signal_wait_expired, signal_wait_remaining, signal_wait_slice, upgrade_protection_si_code,
 };
 // Test-only re-exports: the `tests` module below names these (via `use super::*`)
 // but no non-test in-crate caller does, so gate them to avoid an unused-import
@@ -1943,12 +1943,12 @@ where
                     // GuestFault path. `from_el0_direct` selects whether the
                     // sigframe records the faulting PC as the resume target.
                     if let Some((signum, si_code, si_addr)) = lower_el0_fault(syndrome, elr, far) {
-                        // PROT_NONE is a non-present stage-1 leaf → the raw
-                        // DFSC decodes as MAPERR; Linux reports ACCERR for an
-                        // access to a live PROT_NONE mapping. Upgrade from the
-                        // tracked no-access set (LTP mmap05 / roprotect probe).
+                        // Raw hardware/host faults can decode as MAPERR even
+                        // when Carrick tracks a live VMA denying the access.
+                        // Upgrade from the shared protection metadata (LTP
+                        // mmap05 / roprotect probe).
                         let si_code =
-                            signal::upgrade_prot_none_si_code(&engine, signum, si_code, si_addr);
+                            signal::upgrade_protection_si_code(&engine, signum, si_code, si_addr);
                         let interrupted_pc = if from_el0_direct { Some(elr) } else { None };
                         if let Some(outcome) = deliver_fault_signal(
                             &kernel,
@@ -1993,12 +1993,11 @@ where
                     // interrupted user context before surfacing the fault, so the
                     // live PC is the faulting instruction, not a syscall-return
                     // RCX path.
-                    // PROT_NONE is a non-present PML4 leaf → #PF PFEC.P=0
-                    // decodes as MAPERR; Linux reports ACCERR for an access to
-                    // a live PROT_NONE mapping. Upgrade from the tracked
-                    // no-access set (LTP mmap05 / roprotect probe).
+                    // A backend can surface MAPERR even when Carrick tracks a
+                    // live VMA denying the access. Upgrade from the shared
+                    // protection metadata (LTP mmap05 / roprotect probe).
                     let si_code =
-                        signal::upgrade_prot_none_si_code(&engine, signum, si_code, fault_addr);
+                        signal::upgrade_protection_si_code(&engine, signum, si_code, fault_addr);
                     let interrupted_pc = Some(engine.current_pc()?);
                     if let Some(outcome) = deliver_fault_signal(
                         &kernel,
@@ -2485,9 +2484,38 @@ fn service_signals_threaded<E: ThreadedEngine>(
 
 #[cfg(test)]
 mod tests {
-    use super::signal::lower_el0_fault;
+    use super::signal::{lower_el0_fault, upgrade_protection_si_code};
     use super::*;
     use std::time::Duration;
+
+    struct ProtectionOnlyMemory {
+        protections: carrick_guest_mem::protections::MemoryProtections,
+    }
+
+    impl GuestMemory for ProtectionOnlyMemory {
+        fn protections(&self) -> Option<&carrick_guest_mem::protections::MemoryProtections> {
+            Some(&self.protections)
+        }
+
+        fn read_bytes_raw(
+            &self,
+            address: u64,
+            length: usize,
+        ) -> Result<Vec<u8>, carrick_guest_mem::MemoryError> {
+            Err(carrick_guest_mem::MemoryError::OutOfBounds { address, length })
+        }
+
+        fn write_bytes_raw(
+            &mut self,
+            address: u64,
+            bytes: &[u8],
+        ) -> Result<(), carrick_guest_mem::MemoryError> {
+            Err(carrick_guest_mem::MemoryError::OutOfBounds {
+                address,
+                length: bytes.len(),
+            })
+        }
+    }
 
     #[test]
     fn exec_replacement_treats_removed_sibling_as_done_after_flag_clears() {
@@ -2641,7 +2669,43 @@ mod tests {
     const SIGSEGV: i32 = 11;
     const SIGBUS: i32 = 7;
     const SEGV_MAPERR: i32 = 1;
+    const SEGV_ACCERR: i32 = 2;
     const BUS_ADRALN: i32 = 1;
+
+    #[test]
+    fn tracked_live_protections_upgrade_maperr_but_unmapped_does_not() {
+        let address = 0x9000_0000;
+        let memory = ProtectionOnlyMemory {
+            protections: carrick_guest_mem::protections::MemoryProtections::default(),
+        };
+        memory.protections.set_no_write(address, 0x4000, true);
+
+        assert_eq!(
+            upgrade_protection_si_code(&memory, SIGSEGV, SEGV_MAPERR, address),
+            SEGV_ACCERR,
+            "a tracked read-only VMA exists, so Linux reports permission denial"
+        );
+        assert_eq!(
+            upgrade_protection_si_code(&memory, SIGSEGV, SEGV_MAPERR, address + 0x4000),
+            SEGV_MAPERR,
+            "an address outside tracked mappings remains an unmapped fault"
+        );
+
+        memory.protections.set_no_write(address, 0x4000, false);
+        memory.protections.set_no_access(address, 0x4000, true);
+        assert_eq!(
+            upgrade_protection_si_code(&memory, SIGSEGV, SEGV_MAPERR, address),
+            SEGV_ACCERR,
+            "a live PROT_NONE VMA is also a Linux permission fault"
+        );
+
+        memory.protections.set_unmapped(address, 0x4000, true);
+        assert_eq!(
+            upgrade_protection_si_code(&memory, SIGSEGV, SEGV_MAPERR, address),
+            SEGV_MAPERR,
+            "munmap removes the VMA, so a later translation fault stays MAPERR"
+        );
+    }
 
     #[test]
     fn lower_el0_fault_covers_both_debug_and_abort_arms() {
