@@ -299,6 +299,13 @@ pub struct OpenContext<'a> {
     pub locked_memory: Option<&'a [GuestMemoryRange]>,
     pub brk_current: u64,
     pub mmap_next: u64,
+    /// The memory layout's heap (brk arena) base. With `brk_current` it names
+    /// the brk-grown heap span for VmSize/VmRSS when the VMA snapshot carries
+    /// no heap region (the native backend maps its heap lazily). 0 = unknown.
+    pub heap_base: u64,
+    /// True when guest virtual addresses ARE host virtual addresses (the
+    /// native exec backend), enabling measured VmRSS over the guest's VMAs.
+    pub native_guest_va: bool,
     pub ruid: u32,
     pub euid: u32,
     pub suid: u32,

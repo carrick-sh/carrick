@@ -791,6 +791,12 @@ fn run_image_in_current_process(
     // itimers/RLIMIT_CPU all read through guest_cpu). Process state: forked
     // children inherit it; execve re-enters the same run loop.
     crate::guest_cpu::set_native_darwin_provider();
+    // Publish the boot image's region list + auxv to the dispatcher —
+    // /proc/self/maps//status VmSize/VmRSS and /proc/self/auxv render from it.
+    // The native execve path already does this for replacement images; without
+    // the boot-time call the snapshot held only dynamic mmaps, so VmSize
+    // missed the image/stack entirely (and fell below the measured VmRSS).
+    crate::vcpu_loop::apply_image_proc_state(&dispatcher, &image);
     carrick_signal_core::xsig::xsig_init();
     carrick_signal_core::fasync::fasync_init();
     crate::host_signal::install_default_handlers();
