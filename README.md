@@ -62,6 +62,44 @@ just run run ubuntu:24.04 /bin/echo hi      # docker-style: pull an image + run 
 
 ---
 
+## Experimental Native Execution
+
+Carrick also has an experimental Darwin-native backend for same-ISA
+`linux/arm64` binaries. It executes guest instructions directly in a macOS
+process, without an HVF vCPU. The default remains the release-quality HVF path;
+native execution is explicit and trusted-code-only:
+
+```sh
+target/release/carrick run \
+  --exec-backend native \
+  --native-page-profile native16k \
+  ubuntu:24.04 /bin/echo hi
+```
+
+The native backend has two page profiles:
+
+- **`native16k` (preferred):** exposes the host's 16K page geometry and uses
+  direct Darwin mappings and protections. Neither OCI image metadata nor the
+  AArch64 ISA by itself requires 4K pages; use this profile unless the workload
+  depends on Linux-visible 4K mapping, protection, or fault boundaries.
+- **`linux4k` (compatibility):** presents 4K Linux page semantics on a 16K
+  Darwin host. It has a guarded slow path for a bounded set of mixed-page data
+  accesses, but it is incomplete and may reject mixed executable pages,
+  mixed shared-file aliases, or unsupported guarded AArch64 instructions.
+
+Selecting `linux4k` never falls back to HVF. An unsupported mapping or
+instruction fails with a native-backend diagnostic so the compatibility gap is
+visible. Every native image mapping must lie above macOS's hard 4 GiB arm64
+`__PAGEZERO`. PIE/`ET_DYN` is the practical supported path; a high-address
+`ET_EXEC` image can work, while ordinary low-address `ET_EXEC` images are
+rejected.
+
+See the dated
+[native feasibility and conformance evidence](docs/2026-07-09-no-vmm-native-feasibility-evidence.md)
+for current measurements and known gaps.
+
+---
+
 ## What Works Today
 
 Carrick's most complete path is `platform-macos`: AArch64 Linux guests running
