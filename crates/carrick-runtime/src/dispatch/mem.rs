@@ -617,6 +617,50 @@ impl SyscallDispatcher {
         dynamic_mapping_overlaps_sorted(&self.mem.lock().dynamic_maps, start, len)
     }
 
+    fn range_intersects_shared_mapping(&self, start: u64, len: u64) -> bool {
+        let Some(end) = start.checked_add(len) else {
+            return false;
+        };
+        let mem = self.mem.lock();
+        mem.dynamic_maps
+            .iter()
+            .chain(mem.address_space_regions.iter().flatten())
+            .any(|map| map.sharing == ProcMapSharing::Shared && map.start < end && map.end > start)
+    }
+
+    fn native16k_write_exec_rejection(
+        &self,
+        thread: Option<ThreadCtx<'_>>,
+        shared: bool,
+        alias: bool,
+    ) -> Option<&'static str> {
+        if self.page_geometry.native_profile != Some(carrick_spec::NativePageProfile::Native16k) {
+            return None;
+        }
+        if shared {
+            return Some("native16k shared write-exec mappings are not yet coherent across fork");
+        }
+        if alias {
+            return Some("native16k alias write-exec mmap is not yet protection-aware");
+        }
+        thread
+            .is_some_and(|thread| thread.registry.live_count() > 1)
+            .then_some(
+                "native16k write-exec mappings are not safe with multiple live guest threads",
+            )
+    }
+
+    fn native16k_exec_transition_rejection(
+        &self,
+        thread: Option<ThreadCtx<'_>>,
+    ) -> Option<&'static str> {
+        (self.page_geometry.native_profile == Some(carrick_spec::NativePageProfile::Native16k)
+            && thread.is_some_and(|thread| thread.registry.live_count() > 1))
+        .then_some(
+            "native16k executable protection transition is not safe with multiple live guest threads",
+        )
+    }
+
     fn record_write_sealed_shared_map(&self, start: u64, len: u64) {
         if let Some(range) =
             crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(start.saturating_add(len)))
@@ -789,15 +833,37 @@ impl SyscallDispatcher {
             return;
         };
         let mut mem = self.mem.lock();
-        for map in &mut mem.dynamic_maps {
-            if ranges_overlap(start, len, map.start, map.end) {
-                map.read = read;
-                map.write = write;
-                map.execute = execute;
-                map.start = map.start.max(start);
-                map.end = map.end.min(end);
+        let maps = std::mem::take(&mut mem.dynamic_maps);
+        let mut updated = Vec::with_capacity(maps.len().saturating_add(2));
+        for map in maps {
+            if map.start >= end || map.end <= start {
+                updated.push(map);
+                continue;
+            }
+
+            let protected_start = map.start.max(start);
+            let protected_end = map.end.min(end);
+            if map.start < protected_start {
+                let mut left = map.clone();
+                left.end = protected_start;
+                updated.push(left);
+            }
+
+            let mut protected = map.clone();
+            protected.start = protected_start;
+            protected.end = protected_end;
+            protected.read = read;
+            protected.write = write;
+            protected.execute = execute;
+            updated.push(protected);
+
+            if protected_end < map.end {
+                let mut right = map;
+                right.start = protected_end;
+                updated.push(right);
             }
         }
+        mem.dynamic_maps = updated;
     }
 
     /// Reset memory-accounting state that Linux destroys across `execve(2)`.
@@ -1172,6 +1238,28 @@ impl SyscallDispatcher {
                     != 0
             {
                 return Ok(DispatchOutcome::errno(LINUX_EPERM));
+            }
+
+            let fixed_write_exec_alias = if map_flags.contains(LinuxMmapFlags::FIXED) {
+                let layout = this.mem.lock().layout;
+                !range_within(requested.0, length, layout.mmap_base, layout.mmap_size)
+            } else {
+                false
+            };
+            if prot_flags.contains(LinuxProtFlags::WRITE | LinuxProtFlags::EXEC)
+                && let Some(reason) = this.native16k_write_exec_rejection(
+                    cx.thread,
+                    map_sharing == MmapSharing::Shared,
+                    fixed_write_exec_alias,
+                )
+            {
+                cx.reporter.record(CompatEvent::partial_syscall(
+                    cx.number(),
+                    "mmap",
+                    cx.raw_args(),
+                    reason,
+                ));
+                return Ok(DispatchOutcome::errno(LINUX_EOPNOTSUPP));
             }
 
             if fixed_noreplace && this.dynamic_mapping_overlaps(requested.0, length) {
@@ -1669,6 +1757,18 @@ impl SyscallDispatcher {
             // (notably Go's 0xc000000000 arena probe) are preserved instead of
             // being relocated into the low mmap arena.
             if mmap_address_uses_alias(address, length, layout) {
+                if prot_flags.contains(LinuxProtFlags::WRITE | LinuxProtFlags::EXEC)
+                    && let Some(reason) =
+                        this.native16k_write_exec_rejection(cx.thread, false, true)
+                {
+                    cx.reporter.record(CompatEvent::partial_syscall(
+                        cx.number(),
+                        "mmap",
+                        cx.raw_args(),
+                        reason,
+                    ));
+                    return Ok(DispatchOutcome::errno(LINUX_EOPNOTSUPP));
+                }
                 // Reject a genuinely non-canonical hint (bits 55:48 of the
                 // ORIGINAL address neither all-0 nor all-1). With TCR_EL1.TBI on,
                 // canonicality is decided by bits 55:48, not 63:48. A canonical
@@ -2275,6 +2375,7 @@ impl SyscallDispatcher {
             if prot & !LinuxProtFlags::SUPPORTED_MASK != 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
+            let prot_flags = LinuxProtFlags::from_bits_retain(prot);
             if length == 0 {
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
@@ -2314,6 +2415,33 @@ impl SyscallDispatcher {
             if prot & LINUX_PROT_WRITE != 0 && this.range_is_write_sealed_shared(address.0, length) {
                 return Ok(DispatchOutcome::errno(LINUX_EPERM));
             }
+            let layout = this.mem.lock().layout;
+            if prot_flags.contains(LinuxProtFlags::EXEC)
+                && let Some(reason) = this.native16k_exec_transition_rejection(cx.thread)
+            {
+                cx.reporter.record(CompatEvent::partial_syscall(
+                    cx.number(),
+                    "mprotect",
+                    cx.raw_args(),
+                    reason,
+                ));
+                return Ok(DispatchOutcome::errno(LINUX_EOPNOTSUPP));
+            }
+            if prot_flags.contains(LinuxProtFlags::WRITE | LinuxProtFlags::EXEC)
+                && let Some(reason) = this.native16k_write_exec_rejection(
+                    cx.thread,
+                    this.range_intersects_shared_mapping(address.0, length),
+                    mmap_address_uses_alias(address.0, length, layout),
+                )
+            {
+                cx.reporter.record(CompatEvent::partial_syscall(
+                    cx.number(),
+                    "mprotect",
+                    cx.raw_args(),
+                    reason,
+                ));
+                return Ok(DispatchOutcome::errno(LINUX_EOPNOTSUPP));
+            }
             // Make the new protection guest-VISIBLE (a violating access
             // faults during EL0 execution) by editing the stage-1/PML4
             // page tables. In the private mmap arena a failed edit is
@@ -2326,13 +2454,23 @@ impl SyscallDispatcher {
             // historical host-side-only behaviour instead of failing.
             // The shared/overlay apertures and high-VA aliases keep
             // host-side checks only (unchanged).
-            let layout = this.mem.lock().layout;
             if range_within(address.0, length, layout.mmap_base, layout.mmap_size) {
                 if cx.memory.protect_range(address.0, len, prot).is_err() {
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 }
             } else if mprotect_range_in_identity_image(address.0, length, layout) {
-                let _ = cx.memory.protect_range(address.0, len, prot);
+                if cx.memory.protect_range(address.0, len, prot).is_err()
+                    && this.page_geometry.native_profile
+                        == Some(carrick_spec::NativePageProfile::Native16k)
+                {
+                    cx.reporter.record(CompatEvent::partial_syscall(
+                        cx.number(),
+                        "mprotect",
+                        cx.raw_args(),
+                        "native16k backend protection failure",
+                    ));
+                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                }
             }
             let prot_none = LinuxProtFlags::from_bits_truncate(prot).is_empty();
             cx.memory.set_mapping_protection(
@@ -2344,7 +2482,7 @@ impl SyscallDispatcher {
             this.update_dynamic_mapping_prot(
                 address.0,
                 length,
-                LinuxProtFlags::from_bits_retain(prot),
+                prot_flags,
             );
             Ok(DispatchOutcome::Returned { value: 0 })
         }
@@ -2956,6 +3094,29 @@ mod tests {
         protections: carrick_guest_mem::protections::MemoryProtections,
     }
 
+    struct FailingProtectMemory {
+        inner: CountingMmapMemory,
+    }
+
+    impl GuestMemory for FailingProtectMemory {
+        fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+            self.inner.read_bytes_raw(address, length)
+        }
+
+        fn write_bytes_raw(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+            self.inner.write_bytes_raw(address, bytes)
+        }
+
+        fn protect_range(
+            &mut self,
+            _address: u64,
+            _len: usize,
+            _prot: u64,
+        ) -> Result<(), MemoryError> {
+            Err(MemoryError::Unsupported)
+        }
+    }
+
     impl ProtectionTrackingMemory {
         fn new(base: u64, len: usize) -> Self {
             Self {
@@ -3020,6 +3181,398 @@ mod tests {
             DispatchOutcome::Returned { value } => value,
             other => panic!("expected Returned, got {other:?}"),
         }
+    }
+
+    fn native16k_dispatcher() -> SyscallDispatcher {
+        SyscallDispatcher::with_page_geometry(crate::page_profile::PageGeometry {
+            host_page_size: 16 * 1024,
+            linux_page_size: 16 * 1024,
+            native_profile: Some(carrick_spec::NativePageProfile::Native16k),
+        })
+    }
+
+    fn threaded_memory_call(
+        dispatcher: &SyscallDispatcher,
+        memory: &mut impl GuestMemory,
+        registry: &crate::thread::ThreadRegistry,
+        reporter: &CompatReporter,
+        request: SyscallRequest,
+    ) -> DispatchOutcome {
+        dispatcher
+            .dispatch_threaded(
+                request,
+                memory,
+                reporter,
+                registry.main_tid(),
+                registry,
+                &crate::thread::FutexTable::new(),
+            )
+            .expect("threaded memory dispatch")
+    }
+
+    fn assert_partial_reason(reporter: &CompatReporter, syscall: &str, needle: &str) {
+        let report = reporter.snapshot();
+        assert!(
+            report
+                .partial_syscalls
+                .iter()
+                .any(|entry| entry.name == syscall && entry.reason.contains(needle)),
+            "missing {syscall} partial-syscall reason containing {needle:?}: {report:?}"
+        );
+    }
+
+    #[test]
+    fn native16k_rejects_shared_write_exec_mmap() {
+        const SYS_MMAP: u64 = 222;
+        const PAGE_SIZE: u64 = 16 * 1024;
+
+        let dispatcher = native16k_dispatcher();
+        let registry =
+            crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1000));
+        let reporter = CompatReporter::default();
+        let mut memory = CountingMmapMemory::new(LINUX_MMAP_BASE, PAGE_SIZE as usize);
+        let outcome = threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MMAP,
+                SyscallArgs([
+                    0,
+                    PAGE_SIZE,
+                    LINUX_PROT_READ | LINUX_PROT_WRITE | crate::linux_abi::LINUX_PROT_EXEC,
+                    LINUX_MAP_SHARED | LINUX_MAP_ANONYMOUS,
+                    u64::MAX,
+                    0,
+                ]),
+            ),
+        );
+
+        assert_eq!(outcome, DispatchOutcome::errno(LINUX_EOPNOTSUPP));
+        assert_partial_reason(&reporter, "mmap", "shared write-exec");
+    }
+
+    #[test]
+    fn native16k_rejects_multithreaded_write_exec_mmap() {
+        const SYS_MMAP: u64 = 222;
+        const PAGE_SIZE: u64 = 16 * 1024;
+
+        let dispatcher = native16k_dispatcher();
+        let registry =
+            crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1100));
+        registry.register_child(0);
+        let reporter = CompatReporter::default();
+        let mut memory = CountingMmapMemory::new(LINUX_MMAP_BASE, PAGE_SIZE as usize);
+        let outcome = threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MMAP,
+                SyscallArgs([
+                    0,
+                    PAGE_SIZE,
+                    LINUX_PROT_READ | LINUX_PROT_WRITE | crate::linux_abi::LINUX_PROT_EXEC,
+                    LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
+                    u64::MAX,
+                    0,
+                ]),
+            ),
+        );
+
+        assert_eq!(outcome, DispatchOutcome::errno(LINUX_EOPNOTSUPP));
+        assert_partial_reason(&reporter, "mmap", "multiple live guest threads");
+    }
+
+    #[test]
+    fn native16k_rejects_write_exec_alias_mmap() {
+        const SYS_MMAP: u64 = 222;
+        const PAGE_SIZE: u64 = 16 * 1024;
+
+        let dispatcher = native16k_dispatcher();
+        let registry =
+            crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1150));
+        let reporter = CompatReporter::default();
+        let mut memory = CountingMmapMemory::new(LINUX_MMAP_BASE, PAGE_SIZE as usize);
+        let outcome = threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MMAP,
+                SyscallArgs([
+                    crate::memory::LINUX_HIGH_VA_THRESHOLD,
+                    PAGE_SIZE,
+                    LINUX_PROT_READ | LINUX_PROT_WRITE | crate::linux_abi::LINUX_PROT_EXEC,
+                    LINUX_MAP_FIXED | LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
+                    u64::MAX,
+                    0,
+                ]),
+            ),
+        );
+
+        assert_eq!(outcome, DispatchOutcome::errno(LINUX_EOPNOTSUPP));
+        assert_partial_reason(&reporter, "mmap", "alias write-exec");
+    }
+
+    #[test]
+    fn native16k_rejects_write_exec_alias_mprotect() {
+        const SYS_MPROTECT: u64 = 226;
+        const PAGE_SIZE: u64 = 16 * 1024;
+        let address = crate::memory::LINUX_HIGH_VA_THRESHOLD;
+
+        let dispatcher = native16k_dispatcher();
+        dispatcher.record_dynamic_mapping(
+            address,
+            PAGE_SIZE,
+            LinuxProtFlags::READ | LinuxProtFlags::WRITE,
+            ProcMapSharing::Private,
+            String::new(),
+        );
+        let registry =
+            crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1160));
+        let reporter = CompatReporter::default();
+        let mut memory = CountingMmapMemory::new(address, PAGE_SIZE as usize);
+        let outcome = threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MPROTECT,
+                SyscallArgs([
+                    address,
+                    PAGE_SIZE,
+                    LINUX_PROT_READ | LINUX_PROT_WRITE | crate::linux_abi::LINUX_PROT_EXEC,
+                    0,
+                    0,
+                    0,
+                ]),
+            ),
+        );
+
+        assert_eq!(outcome, DispatchOutcome::errno(LINUX_EOPNOTSUPP));
+        assert_partial_reason(&reporter, "mprotect", "alias write-exec");
+        assert_eq!(memory.protect_calls.get(), 0);
+    }
+
+    #[test]
+    fn native16k_shared_provenance_survives_partial_mprotect() {
+        const SYS_MPROTECT: u64 = 226;
+        const PAGE_SIZE: u64 = 16 * 1024;
+        const MAP_LEN: u64 = 3 * PAGE_SIZE;
+
+        let dispatcher = native16k_dispatcher();
+        dispatcher.record_dynamic_mapping(
+            LINUX_MMAP_BASE,
+            MAP_LEN,
+            LinuxProtFlags::READ | LinuxProtFlags::WRITE,
+            ProcMapSharing::Shared,
+            String::new(),
+        );
+        let registry =
+            crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1175));
+        let reporter = CompatReporter::default();
+        let mut memory = CountingMmapMemory::new(LINUX_MMAP_BASE, MAP_LEN as usize);
+
+        let middle = threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MPROTECT,
+                SyscallArgs([
+                    LINUX_MMAP_BASE + PAGE_SIZE,
+                    PAGE_SIZE,
+                    LINUX_PROT_READ,
+                    0,
+                    0,
+                    0,
+                ]),
+            ),
+        );
+        assert_eq!(middle, DispatchOutcome::Returned { value: 0 });
+        let maps = dispatcher.mem.lock().dynamic_maps.clone();
+        assert_eq!(
+            maps.len(),
+            3,
+            "partial mprotect must preserve VMA fragments"
+        );
+        assert!(
+            maps.iter().all(|map| map.sharing == ProcMapSharing::Shared),
+            "all fragments must retain shared provenance: {maps:?}"
+        );
+
+        let left_write_exec = threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MPROTECT,
+                SyscallArgs([
+                    LINUX_MMAP_BASE,
+                    PAGE_SIZE,
+                    LINUX_PROT_READ | LINUX_PROT_WRITE | crate::linux_abi::LINUX_PROT_EXEC,
+                    0,
+                    0,
+                    0,
+                ]),
+            ),
+        );
+        assert_eq!(left_write_exec, DispatchOutcome::errno(LINUX_EOPNOTSUPP));
+        assert_partial_reason(&reporter, "mprotect", "shared write-exec");
+    }
+
+    #[test]
+    fn native16k_rejects_multithreaded_exec_mprotect() {
+        const SYS_MPROTECT: u64 = 226;
+        const PAGE_SIZE: u64 = 16 * 1024;
+
+        let dispatcher = native16k_dispatcher();
+        dispatcher.record_dynamic_mapping(
+            LINUX_MMAP_BASE,
+            PAGE_SIZE,
+            LinuxProtFlags::READ | LinuxProtFlags::WRITE,
+            ProcMapSharing::Private,
+            String::new(),
+        );
+        let registry =
+            crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1185));
+        registry.register_child(0);
+        let reporter = CompatReporter::default();
+        let mut memory = CountingMmapMemory::new(LINUX_MMAP_BASE, PAGE_SIZE as usize);
+        let outcome = threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MPROTECT,
+                SyscallArgs([
+                    LINUX_MMAP_BASE,
+                    PAGE_SIZE,
+                    LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_EXEC,
+                    0,
+                    0,
+                    0,
+                ]),
+            ),
+        );
+
+        assert_eq!(outcome, DispatchOutcome::errno(LINUX_EOPNOTSUPP));
+        assert_partial_reason(&reporter, "mprotect", "executable protection transition");
+        assert_eq!(memory.protect_calls.get(), 0);
+    }
+
+    #[test]
+    fn native16k_identity_mprotect_propagates_backend_failure() {
+        const SYS_MPROTECT: u64 = 226;
+        const PAGE_SIZE: u64 = 16 * 1024;
+
+        let mut dispatcher = native16k_dispatcher();
+        let reporter = CompatReporter::default();
+        let mut memory = FailingProtectMemory {
+            inner: CountingMmapMemory::new(LINUX_HEAP_BASE, PAGE_SIZE as usize),
+        };
+        let outcome = dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    SYS_MPROTECT,
+                    SyscallArgs([LINUX_HEAP_BASE, PAGE_SIZE, LINUX_PROT_READ, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .expect("identity mprotect dispatch");
+
+        assert_eq!(outcome, DispatchOutcome::errno(LINUX_ENOMEM));
+        assert_partial_reason(&reporter, "mprotect", "backend protection failure");
+    }
+
+    #[test]
+    fn native16k_rejects_shared_write_exec_mprotect() {
+        const SYS_MPROTECT: u64 = 226;
+        const PAGE_SIZE: u64 = 16 * 1024;
+
+        let dispatcher = native16k_dispatcher();
+        dispatcher.record_dynamic_mapping(
+            LINUX_MMAP_BASE,
+            PAGE_SIZE,
+            LinuxProtFlags::READ | LinuxProtFlags::WRITE,
+            ProcMapSharing::Shared,
+            String::new(),
+        );
+        let registry =
+            crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1200));
+        let reporter = CompatReporter::default();
+        let mut memory = CountingMmapMemory::new(LINUX_MMAP_BASE, PAGE_SIZE as usize);
+        let outcome = threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MPROTECT,
+                SyscallArgs([
+                    LINUX_MMAP_BASE,
+                    PAGE_SIZE,
+                    LINUX_PROT_READ | LINUX_PROT_WRITE | crate::linux_abi::LINUX_PROT_EXEC,
+                    0,
+                    0,
+                    0,
+                ]),
+            ),
+        );
+
+        assert_eq!(outcome, DispatchOutcome::errno(LINUX_EOPNOTSUPP));
+        assert_partial_reason(&reporter, "mprotect", "shared write-exec");
+        assert_eq!(memory.protect_calls.get(), 0);
+    }
+
+    #[test]
+    fn native16k_rejects_multithreaded_write_exec_mprotect() {
+        const SYS_MPROTECT: u64 = 226;
+        const PAGE_SIZE: u64 = 16 * 1024;
+
+        let dispatcher = native16k_dispatcher();
+        dispatcher.record_dynamic_mapping(
+            LINUX_MMAP_BASE,
+            PAGE_SIZE,
+            LinuxProtFlags::READ | LinuxProtFlags::WRITE,
+            ProcMapSharing::Private,
+            String::new(),
+        );
+        let registry =
+            crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1300));
+        registry.register_child(0);
+        let reporter = CompatReporter::default();
+        let mut memory = CountingMmapMemory::new(LINUX_MMAP_BASE, PAGE_SIZE as usize);
+        let outcome = threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MPROTECT,
+                SyscallArgs([
+                    LINUX_MMAP_BASE,
+                    PAGE_SIZE,
+                    LINUX_PROT_READ | LINUX_PROT_WRITE | crate::linux_abi::LINUX_PROT_EXEC,
+                    0,
+                    0,
+                    0,
+                ]),
+            ),
+        );
+
+        assert_eq!(outcome, DispatchOutcome::errno(LINUX_EOPNOTSUPP));
+        assert_partial_reason(&reporter, "mprotect", "multiple live guest threads");
+        assert_eq!(memory.protect_calls.get(), 0);
     }
 
     #[test]
