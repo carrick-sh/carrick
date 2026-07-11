@@ -1,246 +1,116 @@
 # Native Darwin Backend Handoff
 
-Date: 2026-07-10
+Date: 2026-07-11
 
-Branch: `codex/architecture-evidence-gates`
-
-Implementation HEAD at handoff start: `311fae9e`
-(`fix(native): virtualize private write-exec pages`)
+Branch: `codex/architecture-evidence-gates` (fast-forwarded onto `main` at
+campaign close).
 
 Detailed local ledger: `.superpowers/sdd/progress.md` (git-ignored). This file
-is the tracked continuation snapshot; the ledger contains the full campaign
-history and attribution evidence.
+is the tracked continuation snapshot.
 
-## Active Goal
+## Goal Status: PROBE TARGET MET
 
 > Reach 100% conformance probes and more than 15% strict LTP parity on the
-> native16k Darwin backend; communicate linux4k incompatibility to users; only
-> block the goal if real workloads are found that require full linux4k
-> compatibility.
+> native16k Darwin backend; communicate linux4k incompatibility to users.
 
-The goal is unfinished and paused at this handoff. It is neither complete nor
-blocked.
+| Gate | Result | Evidence |
+| --- | --- | --- |
+| native16k musl probes | **376/376 PASS (100%), measured** | `/tmp/carrick-native16k-probes-20260711-round11.log`, 228s, exit 0 |
+| strict clean LTP parity | 829/1492 (55.6%) — round-1 authority, >15% met | `/tmp/carrick-native16k-ltp-round1.jsonl` |
+| fork benchmark (all 3 gates) | PASS — fork p50 1.53x host (gate 2x), p95 1.36x (gate 3x), fork_exec 2.63x faster than HVF | `docs/2026-07-10-native-fork-benchmark-evidence.md` |
+| linux4k user statement | accurate (README page-profile section; MT shapes are typed rejections) | commit 58d858db |
+| `just ci` | run at campaign close (see final commits) | — |
 
-## Current Authority
+The gated musl set grew 374 → 376 rows during the campaign (new probes
+`execfromthread`, `vforkexecthread`). GNU remains a report-only lane
+(368/8 at round 11, improved from 344/27 at round 6).
 
-| Surface | Confirmed result | Evidence |
-| --- | ---: | --- |
-| native16k musl probes | 355/374 PASS (94.9%), 19 gaps | `/tmp/carrick-native16k-probes-20260710-round5.log` |
-| native16k GNU probes | 348/374 PASS, 26 report-only DIFFs | same round-5 log |
-| strict clean LTP parity | 829/1492 (55.6%) | `/tmp/carrick-native16k-ltp-round1.jsonl` and `.log` |
-| raw LTP differential parity | 1318/1492 (88.3%) | same LTP artifacts; do not use as the goal metric |
+**Caveat for the next session:** the strict-LTP number is the 2026-07-10
+round-1 authority; ~45 commits landed after it. The probes and unit suites
+say nothing regressed, but a fresh full LTP campaign is the right next
+validation before quoting the LTP number externally. A signed live
+"real workload" demo (beyond the probe/benchmark batteries) was also not
+re-run at close.
 
-The strict LTP goal is met by a wide margin. The probe goal is not met.
+## What Landed (2026-07-10 → 2026-07-11, ~35 commits cf9dfd1c..HEAD)
 
-`mprotectexec` passes the focused Linux differential test after `311fae9e`, so
-the clean-lane projection is 356/374 with 18 remaining gaps. That number is not
-authoritative until a full native16k probe campaign confirms it. Keep reporting
-355/374 as the measured aggregate until then.
+1. **Fork benchmark** (cf9dfd1c, bc6c680b, 7c53b70c): first native fork
+   numbers; all acceptance gates pass; native fork memory scaling tracks
+   host COW (+24% @256MiB vs HVF's +121%). `perf_fork_scale` gained argv
+   knobs (run-elf cannot inject guest env).
+2. **Native vDSO** (3fd3cd83, e69c9597): Darwin reserves host VA
+   [63 GiB, 448 GiB) — canonical vvar/vdso bases relocated to +512 GiB with
+   `AT_SYSINFO_EHDR` repoint and a vdso-page-only movz rewrite. EL0 counter
+   timeline gated by unit test.
+3. **Guest CPU time** (03e721ec..31a409be): native provider inside the
+   existing `guest_cpu` readers; `proc_pid_rusage` mach-time-unit conversion
+   fixed (cross-backend); ITIMER_VIRTUAL/PROF via shared timer-core;
+   VmRSS measured over the exact VmSize spans.
+4. **Lifecycle** (477fba6b..385e8963): async child-exit watcher (kqueue
+   EVFILT_PROC); single-scan adopted-child wait; file-identity futex keys
+   (+ unmap retirement); xsig enqueue-before-record; clone3args probe was
+   4K-hardcoded (its SIGSEGV was correct 16K behavior).
+5. **Residuals** (662fdd60..8a80b70e): host-observed death outranks
+   published run-state; native pid-ns placement honored; probeinit shim
+   gives the direct-ELF transport the oracle's process topology.
+6. **memmap** (b5683bea): geometry-neutral reshape (pagesize_sane; A2
+   blocked-grow forced by construction at any page size).
+7. **Regression waves** (post-round-7 triage): dnotify = latent missing
+   delivery cycle at sigreturn resume, exposed by the vDSO (8ccf81c7);
+   EINTR classification for non-set caught signals (9dded86b); fork-safe
+   auxiliary-thread locks — ATFORK bundle + AtomicPtr kicker (5afae824);
+   shared-futex logical dequeue + self-woken pool + phantom-credit fix
+   (73990820, e964894c, 0806a4ae).
+8. **MT fork/exec** (e2f298b4..33910df3): dispatch-boundary quiesce
+   mirroring the HVF barrier; child sibling-record retirement; cooperative
+   exec teardown; ExecReplacedThread + exited-leader park (lost-exec races
+   closed); exec-wins CAS vs vfork-suspended leader; linux4k MT shapes are
+   typed rejections pending task_c2615fa2. Native now exceeds HVF on
+   exec-from-thread and vfork-suspend-exec shapes.
+9. **keydeny container policy** (1d7d5d46..054bbb7a): launch-time
+   syscall-policy layer at dispatch entry modeling Docker's default seccomp
+   (keyring syscalls → EPERM); handlers stay honest-ENOSYS; `--security-opt`
+   on run/create/run-elf + serve API; harness mirrors suites'
+   `seccomp=unconfined` flags.
+10. **sysvsem seed race** (fb706eae): parent's post-fork Booting seed no
+    longer clobbers a child's published Blocked state (CAS-from-empty +
+    adoption hardening + reader tiebreak); proven by fault injection.
+11. **Signal hot path** (2e1ba443): lock-free empty fast path (sticky-raise
+    hints) recovered preemptsigstorm's throughput margin shaved by the
+    campaign's per-dispatch additions.
 
-The user-facing page-profile contract is committed at `b9f0269c`. It prefers
-`native16k`, describes `linux4k` as incomplete 4K-on-16K compatibility, and
-states that unsupported native cases do not fall back to HVF.
+Every task went through independent review (spec + quality) with fix waves
+for all Critical/Important findings; evidence per task in the git-ignored
+`.superpowers/sdd/native16k-task-*-report.md` and `native16k-r*-report.md`.
 
-## Latest Implementation
+## Known Follow-Ups (task chips filed)
 
-Commit `311fae9e` closes the ordinary private `mprotectexec` shape without
-asking Darwin for a persistent writable-executable mapping:
+- task_89f76fff: structural enforcement of signal pending-hint coherence
+  (convention-only today; hottest-path hazard class).
+- task_c2615fa2: linux4k guarded-fault emulation is not MT-safe (typed
+  rejections in place).
+- task_3c89e226: wait-family adopted-child gaps (waitid, WNOHANG).
+- task_e1f4d3b4: stale bootstrap_host_pid on the off-authority bare
+  run-elf path.
+- task_b07cef09: amd64 memmap probe oracles hash-stale until fleet re-bless.
+- task_a0899be2: parallel-suite fork/port-release test flake (pre-existing,
+  reproduced with campaign tests skipped).
+- CMP_REQUEUE self_woken under-count (needs identity-carrying credit
+  design); doubly-pending set-vs-nonset sigtimedwait divergence (needs
+  scoped wait-set-only helper) — both deferred with reviewer-verified
+  worse-than-disease rationales, recorded in
+  `.superpowers/sdd/native16k-r2-loadcoupled-report.md`.
+- Untracked `docs/dynamic-syscall-rewriter.md` (a DSR RFC drafted during
+  agent work) awaits a maintainer keep/drop decision.
 
-- private, direct-arena, single-threaded native16k W+X pages alternate host
-  protection between RX and RW on AArch64 permission faults;
-- returning to execution restores translated syscall instructions and clears
-  the instruction cache;
-- multi-page protection changes roll back in reverse order, using sparse
-  instruction undo records rather than full-page snapshots;
-- partial `mprotect` splits VMA metadata and preserves shared/private
-  provenance;
-- backend protection failure is returned before dispatcher metadata commits;
-- the probe now requires a clean child exit for executable-fetch success, so
-  setup failures can no longer appear green.
+## Standing Constraints (unchanged)
 
-The implementation deliberately returns `EOPNOTSUPP` and records partial
-syscall evidence for shapes whose invariants are not yet supportable:
-
-- shared W+X mappings;
-- high/alias W+X mappings;
-- executable `mprotect` with sibling guest threads;
-- creating a clone thread after W+X state exists;
-- `vfork` while W+X state exists.
-
-Same-16K-host-page self-modification while executing from that page remains
-explicitly unsupported at the fault boundary.
-
-Ordinary `fork` remains supported because private mappings inherit through host
-COW. These limits are correctness boundaries, not candidates for silent
-permission widening.
-
-Fresh verification on the exact commit candidate:
-
-- `cargo test -p carrick-runtime --lib`: 625 passed, 0 failed;
-- targeted runtime/CLI clippy with `-D warnings`: clean;
-- `just lint-domains`, `just fmt-check`, and `git diff --check`: clean;
-- `just build`: release binary rebuilt and signed;
-- `codesign --verify --verbose=2 target/release/carrick`: valid;
-- `native16k_mprotect_exec_permissions_match_linux`: passed;
-- direct signed native16k output: all five permission invariants true, with
-  statuses `139,0,139,0,0`;
-- fresh signed live stress: 20/20 passed.
-
-The full probe campaign, full `just ci`, and fork benchmark were not rerun after
-this commit. Do not imply otherwise.
-
-## First Next Action: Fork Benchmark
-
-Measure the payoff before doing more conformance work. No native-backend fork
-number has been established yet.
-
-### Harness preparation
-
-`bench-native/Cargo.toml` currently exposes `perf_fork_exec`, but not
-`perf_fork` or `perf_fork_scale`. Add both bins, pointing at the existing probe
-sources, and commit that harness-only change separately. Do not alter the probe
-algorithms while establishing the first baseline.
-
-Build the exact-source Linux and Darwin binaries:
-
-```sh
-./scripts/build-probes.sh --native-pie
-cargo build --release --manifest-path bench-native/Cargo.toml \
-  --bin perf_fork --bin perf_fork_exec --bin perf_fork_scale
-just build
-```
-
-### Lanes
-
-Run lanes serially. Never overlap a Carrick lane with Docker.
-
-1. native16k, using the native PIE Linux binary with `run-elf`;
-2. HVF, using the same Linux binary and default backend;
-3. native arm64 Docker Linux, using the same Linux binary;
-4. host Darwin, using the `bench-native` binary built from the same source.
-
-Measure at least `perf_fork` and `perf_fork_exec`. Run 3-5 complete repetitions
-per lane after warm-up and retain every raw log. Then run one diagnostic
-`perf_fork_scale` matrix, starting with `(threads=0, mem=0)`,
-`(threads=0, mem=256)`, and `(threads=4, mem=0)`. Treat a native threaded-lane
-rejection or failure as evidence, not as a reason to omit the point.
-
-Representative Carrick invocations:
-
-```sh
-CARRICK_RUN_ID=native-fork-<rep> timeout 180 \
-  target/release/carrick run-elf --raw \
-  --exec-backend native --native-page-profile native16k \
-  conformance-probes/target/native-pie/aarch64-unknown-linux-musl/release/perf_fork
-
-CARRICK_RUN_ID=hvf-fork-<rep> timeout 180 \
-  target/release/carrick run-elf --raw \
-  conformance-probes/target/native-pie/aarch64-unknown-linux-musl/release/perf_fork
-```
-
-Use the corresponding `perf_fork_exec` path for spawn measurements. For Docker,
-use the established base64 injection transport so the timing probe itself is
-identical and injection occurs before its internal measurement loop. Run the
-host binaries directly from `bench-native/target/release/`.
-
-Acceptance gates from the approved design:
-
-- native `perf_fork` p50 <= 2x host Darwin p50;
-- native `perf_fork` p95 <= 3x host Darwin p95;
-- native `perf_fork_exec` materially beats warmed HVF.
-
-Report absolute p50/p95 values and native/host, native/HVF, and native/Docker
-ratios. Do not retrofit a numeric definition of "materially" after seeing the
-result.
-
-Historical references only, not current baselines:
-
-- recent HVF `perf_fork` p50 was roughly 2.06-2.14 ms;
-- recent HVF `perf_fork_exec` p50 was roughly 7.23-7.98 ms;
-- the 2026-07-08 host Darwin `fork_exec` p50 was 1607.875 us;
-- the corresponding Docker `fork_exec` p50 was 82.833 us.
-
-Record host model, macOS version, git SHA, backend/page profile, run ID, probe
-hash, p50, p95, minimum, and iteration count. Audit for leftover Carrick,
-Docker, and `yes` processes after every lane. Use scoped run IDs and
-`scripts/sudo/kill.sh <run-id>`; never use a broad `pkill`.
-
-## Remaining Probe Work
-
-Assuming the aggregate lane confirms `mprotectexec`, the projected 18 gaps are:
-
-```text
-accounting
-childsubreaper
-clone3args
-execthreads
-forkfpreclaim
-getrandomvdso
-getrandomvdsofork
-getrandomvdsoloop
-itimer
-keydeny
-ltpcheckpointexec
-memmap
-pidnsroot
-sigchld
-sigwaitalarm
-sysvsem
-vdsosymbols
-waitidcputime
-```
-
-After the fork benchmark, rerun the full native16k lane to promote
-`mprotectexec` from projection to authority. Then work deterministic clusters:
-
-1. native vDSO: `getrandomvdso*` and `vdsosymbols`;
-2. guest CPU-time/accounting: `accounting`, `itimer`, `waitidcputime`;
-3. lifecycle: `childsubreaper`, `clone3args`, `execthreads`,
-   `forkfpreclaim`, `ltpcheckpointexec`, and `sigchld`;
-4. transport/namespace/signal/SysV residuals.
-
-`keydeny` is a Docker default-seccomp policy mismatch. Linux keyring syscalls
-are available to unprivileged processes outside that policy. Do not make absent
-Carrick keyring handlers return `EPERM` just to match Docker; close it through a
-container policy layer or a real keyring implementation.
-
-## Aggregate Recheck
-
-```sh
-./scripts/build-probes.sh --native-pie
-just build
-set -o pipefail
-CARRICK_EXEC_BACKEND=native \
-CARRICK_NATIVE_PAGE_PROFILE=native16k \
-CARRICK_RUN_ID=native16k-probes-round6 \
-cargo test -p carrick-cli --test conformance conformance_probes \
-  -- --nocapture 2>&1 | \
-  tee /tmp/carrick-native16k-probes-20260710-round6.log
-```
-
-The test can remain nonzero while named probe gaps exist; classify the complete
-PASS/FAIL list and distinguish that expected final assertion from a crash or
-incomplete campaign. Keep Carrick and live Docker phases disjoint and verify
-process residue at phase boundaries.
-
-Before claiming the goal complete, require all of:
-
-- measured 374/374 native16k musl probes;
-- strict clean LTP parity still above 15%;
-- the approved linux4k compatibility statement remains accurate;
-- `just ci` passes;
-- a signed live native16k workload demonstrates the backend end to end;
-- tracked tree is clean and each change is in a narrow logical commit.
-
-## Debugging Constraints
-
-- Read `.agents/skills/carrick-native-debug/SKILL.md` before native fault or
-  lifecycle triage.
-- Use `carrick debug lldb-run` or the native fatal record for hangs/faults;
-  compare the relevant lifecycle contract with HVF before changing behavior.
-- Build and run with `just build`; plain `cargo build` is not a runnable gate.
-- Preserve Apple `ld64` and verify signing. Do not use `lld` for Carrick.
-- Do not read Linux kernel or other GPL source. Use specifications, man pages,
-  and differential Linux observation.
-- Keep commits logical and update `.superpowers/sdd/progress.md` after each
-  measured result or architectural decision.
+- Build with `just build` (signed); `lld` never; no `--no-verify`.
+- Clean-room: no Linux kernel/glibc/UAPI source.
+- Load sensitivity is first-class: classify races vs time-assumptions vs
+  measurement; never retry-until-green. Statistical 20-rep batteries are
+  insensitive to ~1/950-row campaign rates — lead with mechanism + fault
+  injection.
+- Never overlap Carrick and Docker phases; scoped `CARRICK_RUN_ID`s +
+  `scripts/sudo/kill.sh`.
+- Read `.agents/skills/carrick-native-debug/SKILL.md` before native triage.
