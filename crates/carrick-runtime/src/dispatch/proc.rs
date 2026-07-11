@@ -3064,12 +3064,28 @@ impl SyscallDispatcher {
                     }
                 }
             };
+            // Adopted children (subreaper orphans): the host kernel answers
+            // ECHILD because this process never was the host parent. Classify
+            // ready-vs-pending in ONE table scan (`adopted_child_wait`): the
+            // orphan's exit publication (`record_child_exit_status`) flips
+            // `exit_ready` false→true concurrently with this wait, and two
+            // separate scans (reap-ready first, then pending) let the flip land
+            // BETWEEN them — both miss and a live adopted child was reported
+            // ECHILD (childsubreaper `wait_reaped_orphan=false` under native).
+            let adopted = match result {
+                Err(errno) if errno == crate::linux_abi::LINUX_ECHILD => {
+                    crate::guest_cpu::adopted_child_wait(std::process::id(), host_target)
+                }
+                _ => None,
+            };
             let result = match result {
                 Ok(value) => value,
                 Err(errno) => {
-                    if errno == crate::linux_abi::LINUX_ECHILD
-                        && let Some((pid, status, guest_ns)) =
-                            crate::guest_cpu::reap_adopted_child(std::process::id(), host_target)
+                    if let Some(crate::guest_cpu::AdoptedChildWait::Reaped {
+                        pid,
+                        status,
+                        guest_ns,
+                    }) = adopted
                     {
                         // Adopted reap: this process was never the host parent,
                         // so there is no host rusage — the published channel is
@@ -3101,11 +3117,14 @@ impl SyscallDispatcher {
                             value: i64::from(value),
                         });
                     }
+                    // Not-yet-exited adopted child: park on its exit. Uses the
+                    // SAME single scan's answer — a fresh `pending_adopted_child`
+                    // re-scan here would reopen the reap/pending window this
+                    // classification just closed.
                     if host_options & libc::WNOHANG == 0
                         && !options
                             .intersects(LinuxWaitOptions::WUNTRACED | LinuxWaitOptions::WCONTINUED)
-                        && let Some(pid) =
-                            crate::guest_cpu::pending_adopted_child(std::process::id(), host_target)
+                        && let Some(crate::guest_cpu::AdoptedChildWait::Pending(pid)) = adopted
                     {
                         let tid = Self::ctx_tid(cx);
                         let non_interrupting = this.non_interrupting_signal_mask(tid);
