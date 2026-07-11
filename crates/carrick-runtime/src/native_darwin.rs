@@ -684,6 +684,11 @@ fn run_image_in_current_process(
         apply_native_relative_relocations(&mut memory, relative_relocations)?;
     }
     let _ = crate::ulock::preinit_waiter_table();
+    // Guest code runs natively on host threads here, so Darwin's own process
+    // accounting is the guest CPU clock (times/getrusage//proc/stat/CPU
+    // itimers/RLIMIT_CPU all read through guest_cpu). Process state: forked
+    // children inherit it; execve re-enters the same run loop.
+    crate::guest_cpu::set_native_darwin_provider();
     carrick_signal_core::xsig::xsig_init();
     carrick_signal_core::fasync::fasync_init();
     crate::host_signal::install_default_handlers();

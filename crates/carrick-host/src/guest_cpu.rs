@@ -20,7 +20,7 @@
 //! Linux's per-process CPU accounting.
 
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use carrick_kernel::arena::{ArenaError, KernelArena};
@@ -58,6 +58,53 @@ fn monotonic_ns() -> u64 {
         .elapsed()
         .as_nanos()
         .min(u64::MAX as u128) as u64
+}
+
+// ---- Native-backend provider ----
+//
+// The Darwin-native exec backend runs guest code directly as host execution,
+// which is the INVERSE of the VMM backends: guest cycles DO accrue to the host
+// process/thread CPU counters, and the `hv_vcpu_run` bracketing above never
+// fires. The provider seam is therefore a process-global mode switch INSIDE the
+// readers, not recording calls at native execution boundaries: (a) Darwin's own
+// bookkeeping already counts every native guest cycle (including signal-bridge
+// emulation and fault handling) with no seam to miss, (b) wall-clock bracketing
+// would over-count preemption by unrelated host load, and (c) every consumer
+// (`times`/`getrusage`, `/proc/<pid>/stat`, the CPU-itimer poll, RLIMIT_CPU)
+// keeps calling the same functions unchanged. The flag is process state: set
+// once at native run-loop entry, inherited by forked children (`reset()` does
+// not clear it), and irrelevant after exec (the replacement runtime re-enters
+// through the same native entry).
+static NATIVE_DARWIN_PROVIDER: AtomicBool = AtomicBool::new(false);
+
+/// Switch the process-total CPU readers to Darwin's own process accounting.
+/// Called once when the native exec backend enters its run loop.
+pub fn set_native_darwin_provider() {
+    NATIVE_DARWIN_PROVIDER.store(true, Ordering::Release);
+}
+
+/// Whether guest CPU time is sourced from Darwin's process accounting (native
+/// exec backend) instead of the vCPU-run bracketing table.
+pub fn native_darwin_provider() -> bool {
+    NATIVE_DARWIN_PROVIDER.load(Ordering::Acquire)
+}
+
+#[cfg(test)]
+pub(crate) fn clear_native_darwin_provider_for_test() {
+    NATIVE_DARWIN_PROVIDER.store(false, Ordering::Release);
+}
+
+/// Darwin's answer for this process's guest CPU total (user + system ns).
+/// `None` off-macOS or if libproc fails; callers fall back to the slot table.
+fn native_self_cpu_ns() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        crate::host_proc::self_cpu_total_ns()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
 }
 
 /// Mark this vCPU thread as actively executing guest code. Called immediately
@@ -104,14 +151,26 @@ pub fn timed_run<T>(run: impl FnOnce() -> T) -> T {
     result
 }
 
-/// Process-wide guest CPU time (nanoseconds): the sum across all vCPU slots.
+/// Process-wide guest CPU time (nanoseconds): the sum across all vCPU slots,
+/// or Darwin's own process CPU total under the native provider (where the
+/// kernel's number is always current — there is no uncommitted in-flight run).
 pub fn total_ns() -> u64 {
+    if native_darwin_provider()
+        && let Some(ns) = native_self_cpu_ns()
+    {
+        return ns;
+    }
     EXEC_SLOTS.iter().map(|s| s.load(Ordering::Relaxed)).sum()
 }
 
 /// Process-wide guest CPU time including active `hv_vcpu_run` calls that have
 /// not trapped back to the runtime yet.
 pub fn total_ns_including_active() -> u64 {
+    if native_darwin_provider()
+        && let Some(ns) = native_self_cpu_ns()
+    {
+        return ns;
+    }
     let now = monotonic_ns();
     EXEC_SLOTS
         .iter()
@@ -146,7 +205,17 @@ pub fn total_us() -> u64 {
 /// an in-flight run). For getrusage(RUSAGE_THREAD): the guest's getrusage traps
 /// out and runs the dispatch ON its own vCPU thread, so this thread's slot is the
 /// calling guest thread's CPU. Saturating.
+///
+/// Native provider: the dispatch likewise runs on the guest's own host thread,
+/// and that thread's Darwin user time IS the guest thread's user CPU (system
+/// time is reported separately by the getrusage reader).
 pub fn this_thread_us() -> u64 {
+    #[cfg(target_os = "macos")]
+    if native_darwin_provider()
+        && let Some((user_us, _system_us)) = crate::host_proc::self_thread_cpu_us()
+    {
+        return user_us;
+    }
     MY_SLOT.with(|&slot| {
         let committed = EXEC_SLOTS[slot].load(Ordering::Relaxed);
         let start = ACTIVE_START_NS[slot].load(Ordering::Acquire);
@@ -1126,6 +1195,38 @@ pub fn add_reaped_child(user_us: u64, system_us: u64) {
     CHILD_SYS_US.fetch_add(system_us, Ordering::Relaxed);
 }
 
+/// Combine a reaped child's published guest CPU (`record_child_exit`'s
+/// `guest_ns` channel) with the host `wait4` rusage into the (user_us,
+/// system_us) pair to feed [`add_reaped_child`]. The two sources overlap
+/// differently per provider, so this is the ONE place the split is decided —
+/// wait4, waitid, and the adopted-child reap all route through it:
+///
+/// * VMM backends: guest cycles never accrue to the child host process, so the
+///   published value (guest user time) and the host rusage (carrick's own
+///   syscall work in the child) are DISJOINT and add: `user = published +
+///   host_user`, `system = host_system`.
+/// * Native provider: guest cycles ARE the child host process's CPU, so the
+///   published value measures the SAME quantity as the host rusage (captured
+///   slightly earlier, at the child's exit publish). Adding both would
+///   double-count; the host rusage is the complete, authoritative reading when
+///   the reap path has one (`wait4`). A reap with no host rusage (host
+///   `waitid` returns none; an adopted child was reaped by a different host
+///   parent) uses the published value, which is user+system with no split —
+///   reported as user time.
+pub fn reaped_child_cpu_parts(
+    published_guest_ns: u64,
+    host_rusage_us: Option<(u64, u64)>,
+) -> (u64, u64) {
+    let published_us = published_guest_ns / 1000;
+    match (native_darwin_provider(), host_rusage_us) {
+        (true, Some((host_user_us, host_system_us))) => (host_user_us, host_system_us),
+        (_, None) => (published_us, 0),
+        (false, Some((host_user_us, host_system_us))) => {
+            (published_us + host_user_us, host_system_us)
+        }
+    }
+}
+
 /// This process's accumulated reaped-child user / system CPU (microseconds).
 pub fn child_user_us() -> u64 {
     CHILD_USER_US.load(Ordering::Relaxed)
@@ -1161,6 +1262,67 @@ mod tests {
         assert_eq!(total_us(), 3000);
         reset();
         assert_eq!(total_ns(), 0);
+    }
+
+    /// Under the native provider the process totals come from Darwin's own
+    /// accounting: positive after burning CPU, monotone non-decreasing, and
+    /// identical between `total_ns` and `total_ns_including_active` (the
+    /// kernel's number has no uncommitted in-flight component). The slot table
+    /// stays empty — proof the value came from the provider, not bracketing.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_provider_reports_darwin_cpu_monotonically() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        reset();
+        set_native_darwin_provider();
+        let first = total_ns();
+        assert!(first > 0, "process has burned CPU before this test");
+        let mut acc: u64 = 1;
+        for _ in 0..20_000_000u64 {
+            acc = acc.wrapping_mul(6364136223846793005).wrapping_add(1);
+            acc ^= acc >> 17;
+        }
+        std::hint::black_box(acc);
+        let second = total_ns();
+        assert!(
+            second > first,
+            "Darwin CPU total must advance across a burn ({first} → {second})"
+        );
+        assert!(total_ns_including_active() >= second);
+        assert!(total_us() >= second / 1000);
+        clear_native_darwin_provider_for_test();
+        // With the provider off the slot table is authoritative again — and
+        // empty, proving the values above came from Darwin, not the slots.
+        assert_eq!(total_ns(), 0);
+        reset();
+    }
+
+    #[test]
+    fn reaped_child_cpu_parts_adds_disjoint_sources_on_vmm_backends() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        clear_native_darwin_provider_for_test();
+        // Published guest ns + host rusage are disjoint under a VMM: they add.
+        assert_eq!(
+            reaped_child_cpu_parts(5_000_000, Some((2_000, 300))),
+            (7_000, 300)
+        );
+        // No host rusage (waitid, adopted reap): published only.
+        assert_eq!(reaped_child_cpu_parts(5_000_000, None), (5_000, 0));
+    }
+
+    #[test]
+    fn reaped_child_cpu_parts_prefers_host_rusage_under_native_provider() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        set_native_darwin_provider();
+        // Native: the published channel and host rusage measure the SAME CPU;
+        // host rusage (complete, split) wins — never added on top.
+        assert_eq!(
+            reaped_child_cpu_parts(5_000_000, Some((4_900, 100))),
+            (4_900, 100)
+        );
+        // No host rusage: the published (user+system) value, reported as user.
+        assert_eq!(reaped_child_cpu_parts(5_000_000, None), (5_000, 0));
+        clear_native_darwin_provider_for_test();
     }
 
     #[test]
