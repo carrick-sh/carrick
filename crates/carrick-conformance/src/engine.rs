@@ -115,6 +115,18 @@ pub(crate) fn carrick_argv(suite: &Suite, carrick_bin: &str, run_id: &str) -> Ve
     // fuzzy-sync verdicts. The one-shot image-guard gives the same skew safety
     // for free.
     a.extend(suite.carrick_flags.iter().cloned());
+    // Oracle-fidelity symmetry for the launch-time syscall policy: `carrick run`
+    // models Docker's default seccomp profile BY DEFAULT (matching a bare
+    // `docker run` oracle), so a suite whose docker oracle is deliberately
+    // UNCONFINED (`--security-opt seccomp=unconfined` in docker_flags — the
+    // keyring/pidfd_getfd/fanotify/clone3 families compare real-syscall
+    // capability, not container policy) must run the carrick side unconfined
+    // too. Forward exactly that flag pair so the two engines always run under
+    // the same container policy shape.
+    if suite.docker_flags.iter().any(|f| f == "seccomp=unconfined") {
+        a.push("--security-opt".to_string());
+        a.push("seccomp=unconfined".to_string());
+    }
     if let Some(ep) = suite.entrypoint.as_ref().and_then(|e| e.for_carrick()) {
         a.push("--entrypoint".to_string());
         a.push(ep);
@@ -456,5 +468,41 @@ mod tests {
             .find(|w| w[0] == "--platform")
             .map(|w| w[1].as_str());
         assert_eq!(platform, Some("linux/amd64"));
+    }
+
+    fn has_unconfined(argv: &[String]) -> bool {
+        argv.windows(2)
+            .any(|w| w[0] == "--security-opt" && w[1] == "seccomp=unconfined")
+    }
+
+    #[test]
+    fn carrick_argv_mirrors_docker_seccomp_unconfined() {
+        // A suite whose docker oracle is deliberately unconfined (keyring/
+        // pidfd_getfd/fanotify/clone3 families compare real-syscall capability)
+        // must run the carrick side unconfined too — otherwise carrick's
+        // default container policy (the Docker default-seccomp model) would be
+        // compared against an unconfined oracle.
+        let mut suite = Suite::for_test("localhost:5050/ltp:arm64", &["add_key01"]);
+        suite.docker_flags = vec![
+            "--security-opt".to_string(),
+            "seccomp=unconfined".to_string(),
+        ];
+        let argv = carrick_argv(&suite, "target/release/carrick", "conf-1");
+        assert!(
+            has_unconfined(&argv),
+            "carrick side must mirror the oracle's seccomp=unconfined: {argv:?}"
+        );
+    }
+
+    #[test]
+    fn carrick_argv_stays_default_confined_without_docker_unconfined() {
+        // Default suites (no docker unconfined flag) run BOTH engines under the
+        // default container policy: no --security-opt is injected.
+        let suite = Suite::for_test("localhost:5050/ltp:arm64", &["true"]);
+        let argv = carrick_argv(&suite, "target/release/carrick", "conf-1");
+        assert!(
+            !argv.iter().any(|t| t == "--security-opt"),
+            "no security-opt for a default-confined suite: {argv:?}"
+        );
     }
 }
