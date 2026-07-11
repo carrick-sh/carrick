@@ -391,6 +391,25 @@ pub fn published_stat_char(pid: u32) -> Option<char> {
     published(pid).map(RunState::stat_char)
 }
 
+/// Test-only cleanup: zero every slot (either kind) holding this low-32 id, so
+/// a test that published into the process-shared table leaves it clean for the
+/// others (also used by the `/proc` state-derivation seam tests in `vfs/proc`).
+#[cfg(test)]
+pub(crate) fn wipe_id_for_tests(id: u32) {
+    let section = processes();
+    for (index, record) in section.records.iter().enumerate() {
+        if record.host_pid.load(Ordering::Relaxed) == id {
+            let generation = record.generation.load(Ordering::Relaxed);
+            if generation != 0 {
+                section.release(ProcessRecordRef {
+                    index,
+                    generation: ProcessGeneration::new(generation),
+                });
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -504,18 +523,7 @@ mod tests {
     /// Zero every slot (either kind) holding this low-32 id, so a test leaves the
     /// process-shared table clean for the others.
     fn wipe_id(id: u32) {
-        let section = processes();
-        for (index, record) in section.records.iter().enumerate() {
-            if record.host_pid.load(Ordering::Relaxed) == id {
-                let generation = record.generation.load(Ordering::Relaxed);
-                if generation != 0 {
-                    section.release(ProcessRecordRef {
-                        index,
-                        generation: ProcessGeneration::new(generation),
-                    });
-                }
-            }
-        }
+        wipe_id_for_tests(id);
     }
 
     #[test]
