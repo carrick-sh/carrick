@@ -72,14 +72,19 @@ pub trait SharedFutexSyscall: Send + Sync {
         self.wait_start(waiter_key);
         false
     }
-    fn wait_end(&self, _waiter_key: usize) {}
+    /// `woken` is the guest-visible outcome of the wait being closed (`true`
+    /// for FUTEX_WAIT returning 0 — a wake or the slice loop's value
+    /// re-check; `false` for ETIMEDOUT/EINTR). Side-table hosts use it to
+    /// keep a self-woken waiter claimable by the next wake's count (Linux
+    /// keeps such a waiter queued until a FUTEX_WAKE dequeues it).
+    fn wait_end(&self, _waiter_key: usize, _woken: bool) {}
     fn wait_end_requeued(
         &self,
         _location: SharedFutexLocation,
         waiter_key: usize,
         _value: u32,
     ) -> bool {
-        self.wait_end(waiter_key);
+        self.wait_end(waiter_key, false);
         true
     }
     fn try_complete_requeued(&self, _waiter_key: usize) -> bool {
@@ -223,7 +228,7 @@ impl<S: SharedFutexSyscall> PlatformFutex for FutexTableFutex<S> {
                 }
                 return ret;
             }
-            self.shared.wait_end(waiter_key);
+            self.shared.wait_end(waiter_key, ret == 0);
             if ret != 0 {
                 return ret;
             }

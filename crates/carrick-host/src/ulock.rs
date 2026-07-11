@@ -29,6 +29,7 @@ pub struct WaiterDebugCounts {
     pub requeue_count: u32,
     pub logical_requeued: u32,
     pub logical_wake: u32,
+    pub self_woken: u32,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -61,7 +62,7 @@ mod imp {
         logical_requeued: AtomicU32,
         logical_wake: AtomicU32,
         /// Physical wakes whose `count` decrement the WAKER already performed
-        /// (`note_physical_wakes`): the woken waiter settles one credit on
+        /// (`note_logical_dequeues`): the woken waiter settles one credit on
         /// exit instead of decrementing `count` again. Keeps `count`
         /// synchronous with the kernel queue — Linux's FUTEX_WAKE return
         /// value counts dequeues AT WAKE TIME, while a woken-but-not-yet-
@@ -69,6 +70,12 @@ mod imp {
         /// latency (unbounded under load; probe futexforkrequeue counted 431
         /// "waiters" on a queue holding 200).
         wake_credits: AtomicU32,
+        /// Waiters that left the wait WOKEN without a waker's credit — the
+        /// slice loop's value re-check or an os_sync at-entry mismatch. On
+        /// Linux they would still be queued until a FUTEX_WAKE dequeued and
+        /// counted them, so they stay claimable by the next wake (see
+        /// `settle_waiter_exit` / `wake_counted`).
+        self_woken: AtomicU32,
     }
 
     #[link(name = "System")]
@@ -179,6 +186,7 @@ mod imp {
             requeue_count: slot.requeue_count.load(Ordering::Acquire),
             logical_requeued: slot.logical_requeued.load(Ordering::Acquire),
             logical_wake: slot.logical_wake.load(Ordering::Acquire),
+            self_woken: slot.self_woken.load(Ordering::Acquire),
         }
     }
 
@@ -222,15 +230,26 @@ mod imp {
     }
 
     /// An exiting waiter settles ONE accounting unit: the credit its waker
-    /// pre-paid (`note_physical_wakes`) when present, else its own `count`
-    /// entry (timeout / EINTR / value-mismatch exits, where no waker was
-    /// involved). A racing waiter that self-decremented before its waker's
+    /// pre-paid (`note_logical_dequeues`) when present, else its own `count`
+    /// entry. A no-credit exit that was nonetheless WOKEN left the queue on
+    /// its own (the ≤20 ms slice loop's value re-check, or an os_sync
+    /// at-entry value mismatch) — on Linux that waiter would STAY QUEUED
+    /// until a FUTEX_WAKE dequeued (and counted) it, so its unit moves to
+    /// the claimable `self_woken` pool for the next wake's count instead of
+    /// vanishing (probe futexforkrequeue under load: the guest stores
+    /// word0=1, a waiter self-wakes on the re-check before the guest's
+    /// FUTEX_WAKE lands, and the wake reported 199 of Linux's exact 200). A
+    /// timeout/EINTR exit left the queue on Linux too, so its unit is
+    /// dropped. A racing waiter that self-settled before its waker's
     /// transfer landed leaves `count` transiently low plus one stale credit,
     /// which the NEXT exit consumes — bounded and self-repairing, unlike the
     /// unbounded reschedule-latency lag of pure self-accounting.
-    fn settle_waiter_exit(slot: &WaiterSlot) {
-        if !consume_one(&slot.wake_credits) {
-            let _ = consume_one(&slot.count);
+    fn settle_waiter_exit(slot: &WaiterSlot, woken: bool) {
+        if consume_one(&slot.wake_credits) {
+            return;
+        }
+        if consume_one(&slot.count) && woken {
+            slot.self_woken.fetch_add(1, Ordering::AcqRel);
         }
     }
 
@@ -255,9 +274,13 @@ mod imp {
         }
     }
 
-    pub fn waiter_exit(host_addr: usize) {
+    /// `woken` is the guest-visible outcome of the wait this exit closes
+    /// (`true` for FUTEX_WAIT returning 0 — physical wake or value re-check;
+    /// `false` for ETIMEDOUT/EINTR): it selects whether a no-credit unit
+    /// stays claimable (see [`settle_waiter_exit`]).
+    pub fn waiter_exit(host_addr: usize, woken: bool) {
         if let Some(slot) = waiter_slot(host_addr) {
-            settle_waiter_exit(slot);
+            settle_waiter_exit(slot, woken);
         }
     }
 
@@ -283,7 +306,9 @@ mod imp {
             return false;
         };
         if consume_one(&slot.logical_wake) {
-            settle_waiter_exit(slot);
+            // Requeued-waiter completion is by definition waker-initiated
+            // (the logical-wake credit) — never a claimable self-wake.
+            settle_waiter_exit(slot, false);
             let _ = consume_one(&slot.logical_requeued);
             return true;
         }
@@ -295,7 +320,11 @@ mod imp {
             return true;
         };
         let had_credit = consume_one(&slot.logical_wake);
-        settle_waiter_exit(slot);
+        // Destination-side exits keep the simpler drop semantics: the
+        // logical_requeued/logical_wake machinery already covers in-flight
+        // requeued waiters, and layering self_woken on top risks
+        // double-claims (a requeue after a value change is inherently racy).
+        settle_waiter_exit(slot, false);
         if had_credit {
             let _ = consume_one(&slot.logical_requeued);
             true
@@ -361,19 +390,28 @@ mod imp {
             return 0;
         };
         let parked = slot.count.load(Ordering::Acquire);
+        let self_woken = slot.self_woken.load(Ordering::Acquire);
         let logical = slot.logical_requeued.load(Ordering::Acquire);
-        let target = parked.max(logical).min(n);
+        let target = parked.saturating_add(self_woken).max(logical).min(n);
         if target == 0 {
             return 0;
         }
-        let physical_target = parked.min(target);
-        // Logical dequeue FIRST (claim-then-wake: a woken waiter must always
+        // Claim self-woken units FIRST: those waiters already returned via
+        // the value re-check (Linux would dequeue them from the bucket right
+        // here), so they need neither a credit nor a physical wake — they
+        // only need counting.
+        let mut self_claim = 0u32;
+        while self_claim < target.min(self_woken) && consume_one(&slot.self_woken) {
+            self_claim += 1;
+        }
+        let physical_target = parked.min(target - self_claim);
+        // Logical dequeue next (claim-then-wake: a woken waiter must always
         // find its credit already reserved), then best-effort os_sync hints.
         note_logical_dequeues(slot, physical_target);
         issue_physical_wakes(host_addr, physical_target, parked);
         let logical_woke = target.min(logical);
         reserve_logical_wakes(waiter_key, logical_woke);
-        i64::from(physical_target.max(logical_woke))
+        i64::from((self_claim + physical_target).max(logical_woke))
     }
 
     /// Best-effort os_sync wake hints for up to `target` of `parked` waiters.
@@ -518,7 +556,7 @@ mod imp {
         true
     }
     pub fn waiter_enter(_host_addr: usize) {}
-    pub fn waiter_exit(_host_addr: usize) {}
+    pub fn waiter_exit(_host_addr: usize, _woken: bool) {}
     pub fn requeued_waiter_enter(_host_addr: usize) -> bool {
         false
     }
@@ -594,12 +632,12 @@ mod tests {
         for _ in 0..3 {
             joins.push(std::thread::spawn(move || {
                 waiter_enter(addr);
-                let _ = wait(addr, 0, 15_000_000); // 15s cap; woken below
+                let woken = wait(addr, 0, 15_000_000) >= 0; // 15s cap; woken below
                 // A woken waiter that the scheduler has not run yet: its own
                 // bookkeeping (wait_end) lags the wake by the reschedule
                 // latency — the load-coupled window this test freezes open.
                 std::thread::sleep(Duration::from_secs(2));
-                waiter_exit(addr);
+                waiter_exit(addr, woken);
             }));
         }
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -639,5 +677,45 @@ mod tests {
         for j in joins {
             j.join().expect("join waiter");
         }
+    }
+
+    /// A waiter that exits WOKEN without a waker credit left via the slice
+    /// loop's value re-check (carrick's lost-wake recovery). Linux has no
+    /// such exit: that waiter stays queued until a FUTEX_WAKE dequeues and
+    /// COUNTS it. So the unit must stay claimable by the next wake — probe
+    /// futexforkrequeue under load: the guest stores word0=1, one of the 200
+    /// remaining waiters self-wakes on its ≤20 ms re-check before the guest's
+    /// FUTEX_WAKE lands, and the wake reported 199 instead of Linux's exact
+    /// 200. A timeout/EINTR exit left the queue on Linux too and must NOT be
+    /// claimable.
+    #[test]
+    fn wake_counts_self_woken_waiters_exactly_once() {
+        use super::{waiter_enter, waiter_exit, wake_counted};
+        static WORD3: AtomicU32 = AtomicU32::new(0);
+        let addr = &WORD3 as *const AtomicU32 as usize;
+
+        // Self-woken exit (value re-check): claimable exactly once.
+        waiter_enter(addr);
+        waiter_exit(addr, true);
+        assert_eq!(
+            wake_counted(addr, addr, u32::MAX),
+            1,
+            "a self-woken waiter must be counted by the next wake"
+        );
+        assert_eq!(
+            wake_counted(addr, addr, u32::MAX),
+            0,
+            "a self-woken waiter must be claimable exactly once"
+        );
+
+        // Timeout/EINTR exit: gone from the queue on Linux too — never
+        // claimable.
+        waiter_enter(addr);
+        waiter_exit(addr, false);
+        assert_eq!(
+            wake_counted(addr, addr, u32::MAX),
+            0,
+            "a timed-out waiter must not be counted by a later wake"
+        );
     }
 }
