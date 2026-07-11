@@ -90,6 +90,21 @@ pub(crate) fn create_container(body: &[u8], name: Option<&str>) -> (u16, String)
         .and_then(|hc| hc.volumes_from.as_ref())
         .cloned()
         .unwrap_or_default();
+    let security_opts = host_config
+        .and_then(|hc| hc.security_opt.as_ref())
+        .cloned()
+        .unwrap_or_default();
+    // Validate NOW, mirroring the CLI's posture: a client that explicitly
+    // requests `seccomp=unconfined` must get it (before the launch-time policy
+    // existed, ignoring this field was harmless — now ignoring it would
+    // silently invert the requested sandbox), and an option carrick cannot
+    // honor is refused with a clear error, never silently dropped.
+    if let Err(e) = carrick_engine::resolve_seccomp_policy(
+        carrick_spec::SeccompPolicy::ContainerDefault,
+        &security_opts,
+    ) {
+        return (400, error_json(&e));
+    }
     let network = match create_network_selection(
         host_config,
         req.networking_config.as_ref(),
@@ -118,6 +133,7 @@ pub(crate) fn create_container(body: &[u8], name: Option<&str>) -> (u16, String)
         dns_search: &dns_search,
         dns_options: &dns_options,
         volumes_from: &volumes_from,
+        security_opts: &security_opts,
     };
     match crate::serve::spawn::create_container(&image, &cmd, &opts) {
         // `id` is the 64-hex container id `carrick create` generated; the Docker

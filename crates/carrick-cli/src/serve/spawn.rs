@@ -31,6 +31,10 @@ pub(crate) struct CreateContainerOpts<'a> {
     pub dns_search: &'a [String],
     pub dns_options: &'a [String],
     pub volumes_from: &'a [String],
+    /// Docker `HostConfig.SecurityOpt`, already validated by the handler;
+    /// forwarded verbatim so `carrick create` persists them in `RunConfig`
+    /// and start/restart/exec relaunch under the requested policy.
+    pub security_opts: &'a [String],
 }
 
 pub(crate) fn create_container(
@@ -102,6 +106,9 @@ pub(crate) fn create_container(
     }
     for source in opts.volumes_from {
         c.arg("--volumes-from").arg(source);
+    }
+    for opt in opts.security_opts {
+        c.arg("--security-opt").arg(opt);
     }
     c.arg(image);
     for a in cmd {

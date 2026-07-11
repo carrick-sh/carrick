@@ -326,6 +326,115 @@ async fn create_container_honors_auto_remove_for_compose_run() {
 }
 
 #[tokio::test]
+async fn create_rejects_unsupported_security_opt() {
+    // HostConfig.SecurityOpt goes through the same resolve_seccomp_policy the
+    // CLI uses: a sandbox shape carrick cannot honor (custom profile JSON,
+    // apparmor options) must be a clear 400 at create time — silently
+    // accepting it would misrepresent the sandbox the client configured.
+    let (_server, sock, _dir) = spawn_server();
+    let docker =
+        bollard::Docker::connect_with_unix(&sock, 5, bollard::API_DEFAULT_VERSION).unwrap();
+    let err = docker
+        .create_container(
+            Some(bollard::container::CreateContainerOptions {
+                name: "m0secoptbogus".to_string(),
+                ..Default::default()
+            }),
+            bollard::container::Config {
+                image: Some("ubuntu:24.04".to_string()),
+                cmd: Some(vec!["/bin/true".to_string()]),
+                host_config: Some(bollard::secret::HostConfig {
+                    security_opt: Some(vec!["seccomp=/etc/custom-profile.json".to_string()]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("unsupported --security-opt must be refused at create");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("unsupported") && msg.contains("seccomp"),
+        "error must name the refused option: {msg}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires built aarch64 probes and boots HVF guests"]
+async fn create_security_opt_flows_to_launch_policy() {
+    // End-to-end for the API path of the launch-time container syscall policy:
+    // SecurityOpt=["seccomp=unconfined"] must reach the guest (keyring syscalls
+    // stay honest ENOSYS), and the default (no SecurityOpt) must apply the
+    // Docker default-seccomp model (EPERM). Uses the keydeny conformance probe,
+    // whose output is one line per observation.
+    let Some(probe) = find_aarch64_probe("keydeny") else {
+        eprintln!("SKIP create_security_opt_flows_to_launch_policy: probe keydeny not built");
+        return;
+    };
+    let bind = format!("{}:/tmp/p:ro", probe.display());
+    let (_server, sock, _dir) = spawn_server();
+    let docker =
+        bollard::Docker::connect_with_unix(&sock, 30, bollard::API_DEFAULT_VERSION).unwrap();
+
+    for (name, security_opt, expected_errno) in [
+        // Explicit unconfined: policy off, honest absent-backend ENOSYS(38).
+        ("m0secoptunconfined", Some(vec!["seccomp=unconfined"]), 38),
+        // No SecurityOpt: docker-shaped default profile model, EPERM(1).
+        ("m0secoptdefault", None, 1),
+    ] {
+        let _ = std::process::Command::new(assert_cmd::cargo::cargo_bin("carrick"))
+            .args(["rm", "-f", name])
+            .output();
+        let security_opt: Option<Vec<String>> =
+            security_opt.map(|v| v.into_iter().map(str::to_string).collect());
+        let created = docker
+            .create_container(
+                Some(bollard::container::CreateContainerOptions {
+                    name: name.to_string(),
+                    ..Default::default()
+                }),
+                bollard::container::Config {
+                    image: Some("ubuntu:24.04".to_string()),
+                    cmd: Some(vec!["/tmp/p".to_string()]),
+                    host_config: Some(bollard::secret::HostConfig {
+                        binds: Some(vec![bind.clone()]),
+                        security_opt: security_opt.clone(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        // The requested options survive the create re-exec into the persisted
+        // RunConfig (what start/restart/exec relaunch under).
+        let state = carrick_runtime::container::ContainerState::load(&created.id).unwrap();
+        assert_eq!(
+            state.config.security_opts,
+            security_opt.unwrap_or_default(),
+            "{name}: persisted security_opts"
+        );
+
+        docker
+            .start_container(
+                name,
+                None::<bollard::container::StartContainerOptions<String>>,
+            )
+            .await
+            .unwrap();
+        wait_container_exit(&docker, name).await;
+        let output = container_output(&docker, name).await;
+        for key in ["add_key_errno", "request_key_errno", "keyctl_join_errno"] {
+            assert!(
+                output.contains(&format!("{key}={expected_errno}")),
+                "{name}: expected {key}={expected_errno} in probe output:\n{output}"
+            );
+        }
+        let _ = docker.remove_container(name, None).await;
+    }
+}
+
+#[tokio::test]
 async fn network_lifecycle_supports_compose_bridge_resource() {
     let (_server, sock, _dir) = spawn_server();
     let docker =
