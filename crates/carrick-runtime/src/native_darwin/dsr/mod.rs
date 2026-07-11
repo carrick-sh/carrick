@@ -11,8 +11,17 @@ pub(super) mod types;
 
 #[derive(Debug)]
 pub(super) enum ThreadExit {
-    Syscall { resume: carrick_guest_mem::GuestVa },
+    Syscall {
+        resume: carrick_guest_mem::GuestVa,
+    },
     Continue,
+    Sensitive(types::SensitiveExit),
+    Fault {
+        signal: i32,
+        code: i32,
+        address: carrick_guest_mem::GuestVa,
+    },
+    Kick,
     Unsupported(String),
 }
 
@@ -25,7 +34,18 @@ pub(super) struct ThreadTranslator {
         types::CodeGeneration,
         types::CacheVa,
     )>,
+    indirect_cache: gateway::IndirectTargetCache,
     stats: ResolverStats,
+    sensitive: BTreeMap<(carrick_guest_mem::GuestVa, types::CodeGeneration), types::SensitiveExit>,
+    unsupported: BTreeMap<(carrick_guest_mem::GuestVa, types::CodeGeneration), (u32, bad64::Op)>,
+    published: Vec<PublishedBlock>,
+}
+
+struct PublishedBlock {
+    entry: types::CacheVa,
+    len: usize,
+    map: Vec<emit::PcMapEntry>,
+    recovery: Vec<emit::RecoveryEntry>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -43,7 +63,11 @@ impl ThreadTranslator {
             blocks: BTreeMap::new(),
             pending: BTreeMap::new(),
             resume_entry: None,
+            indirect_cache: gateway::IndirectTargetCache::new(),
             stats: ResolverStats::default(),
+            sensitive: BTreeMap::new(),
+            unsupported: BTreeMap::new(),
+            published: Vec::new(),
         })
     }
 
@@ -57,9 +81,35 @@ impl ThreadTranslator {
             return Ok(*entry);
         }
         let block = block::plan_block(memory, guest, types::CodeGeneration::INITIAL, 256)?;
+        if let block::PlannedExit::Sensitive {
+            guest: sensitive_guest,
+            exit,
+            ..
+        } = block.exit
+        {
+            self.sensitive
+                .insert((sensitive_guest, types::CodeGeneration::INITIAL), exit);
+        }
+        if let block::PlannedExit::Unsupported {
+            guest: unsupported_guest,
+            word,
+            op,
+        } = block.exit
+        {
+            self.unsupported.insert(
+                (unsupported_guest, types::CodeGeneration::INITIAL),
+                (word, op),
+            );
+        }
         let emitted = emit::emit_block(&mut self.cache, &block)?;
         self.stats.translations = self.stats.translations.saturating_add(1);
         let entry = emitted.entry();
+        self.published.push(PublishedBlock {
+            entry,
+            len: emitted.len(),
+            map: emitted.map().entries().to_vec(),
+            recovery: emitted.recovery().to_vec(),
+        });
         let links = emitted.direct_links().to_vec();
         self.blocks.insert(key, entry);
 
@@ -83,6 +133,51 @@ impl ThreadTranslator {
         Ok(entry)
     }
 
+    fn guest_pc_for_cache(
+        &self,
+        cache_pc: carrick_guest_mem::GuestVa,
+    ) -> Result<(carrick_guest_mem::GuestVa, Option<emit::RecoveryAction>), types::DsrError> {
+        let cache_pc = usize::try_from(cache_pc.raw()).map_err(|_| {
+            types::DsrError::CachePolicy(format!(
+                "cache PC does not fit host pointer: 0x{:x}",
+                cache_pc.raw()
+            ))
+        })?;
+        for block in &self.published {
+            let start = block.entry.host().raw();
+            let Some(end) = start.checked_add(block.len) else {
+                continue;
+            };
+            if !(start..end).contains(&cache_pc) {
+                continue;
+            }
+            let offset = u32::try_from(cache_pc - start).map_err(|_| {
+                types::DsrError::CachePolicy("cache PC offset exceeds u32".to_string())
+            })?;
+            let guest = block
+                .map
+                .iter()
+                .find(|entry| entry.cache == types::CacheOffset::published(offset))
+                .map(|entry| entry.guest)
+                .ok_or_else(|| {
+                    types::DsrError::CachePolicy(format!(
+                        "cache PC 0x{cache_pc:x} is not an emitted instruction boundary"
+                    ))
+                })?;
+            let recovery = block
+                .recovery
+                .iter()
+                .find(|entry| entry.cache == types::CacheOffset::published(offset))
+                .map(|entry| entry.action);
+            return Ok((guest, recovery));
+        }
+        Err(types::DsrError::CachePolicy(format!(
+            "cache PC 0x{cache_pc:x} is outside published DSR blocks (signal_gateway=0x{:x}, common_gateway=0x{:x})",
+            gateway::signal_exit_address(),
+            gateway::direct_exit_address(),
+        )))
+    }
+
     fn resolve_indirect(
         &mut self,
         memory: &super::NativeMappedMemory,
@@ -104,7 +199,10 @@ impl ThreadTranslator {
                 reason: "target is outside an executable guest mapping",
             });
         }
-        self.translate(memory, target)
+        let entry = self.translate(memory, target)?;
+        self.indirect_cache
+            .publish(target, types::CodeGeneration::INITIAL, entry);
+        Ok(entry)
     }
 
     #[cfg(test)]
@@ -130,7 +228,7 @@ impl ThreadTranslator {
         let mut exit = types::NativeDsrExit::Syscall {
             resume: carrick_guest_mem::GuestVa(snapshot.pc),
         };
-        gateway::enter_translated(entry, snapshot, &mut exit)?;
+        gateway::enter_translated_with_cache(entry, snapshot, &mut exit, &self.indirect_cache)?;
         Ok(match exit {
             types::NativeDsrExit::Syscall { resume } => ThreadExit::Syscall { resume },
             types::NativeDsrExit::ResolveDirect { target, .. } => {
@@ -144,9 +242,146 @@ impl ThreadTranslator {
                 snapshot.pc = target.raw();
                 ThreadExit::Continue
             }
+            types::NativeDsrExit::Sensitive { guest_pc, .. } => {
+                let exit = self
+                    .sensitive
+                    .get(&(guest_pc, types::CodeGeneration::INITIAL))
+                    .copied()
+                    .ok_or_else(|| {
+                        types::DsrError::BlockPolicy(format!(
+                            "missing sensitive-exit metadata for guest PC 0x{:x}",
+                            guest_pc.raw()
+                        ))
+                    })?;
+                ThreadExit::Sensitive(exit)
+            }
+            types::NativeDsrExit::Unsupported { guest_pc, .. } => {
+                let (word, op) = self
+                    .unsupported
+                    .get(&(guest_pc, types::CodeGeneration::INITIAL))
+                    .copied()
+                    .ok_or_else(|| {
+                        types::DsrError::BlockPolicy(format!(
+                            "missing unsupported-exit metadata for guest PC 0x{:x}",
+                            guest_pc.raw()
+                        ))
+                    })?;
+                ThreadExit::Unsupported(format!(
+                    "{op:?} 0x{word:08x} at guest PC 0x{:x}",
+                    guest_pc.raw()
+                ))
+            }
+            types::NativeDsrExit::Fault {
+                guest_pc,
+                signal,
+                code,
+                address,
+                rewrite_scratch,
+                rewrite_context_scratch,
+            } => {
+                let (guest_pc, recovery) = self.guest_pc_for_cache(guest_pc).map_err(|error| {
+                    types::DsrError::CachePolicy(format!(
+                        "{error}; trapped signal={signal} code={code} address=0x{:x}",
+                        address.raw()
+                    ))
+                })?;
+                if let Some(recovery) = recovery {
+                    recover_rewrite_state(
+                        snapshot,
+                        recovery,
+                        rewrite_scratch,
+                        rewrite_context_scratch,
+                    )?;
+                }
+                snapshot.pc = guest_pc.raw();
+                ThreadExit::Fault {
+                    signal,
+                    code,
+                    address,
+                }
+            }
+            types::NativeDsrExit::Kick {
+                resume,
+                rewrite_scratch,
+                rewrite_context_scratch,
+            } => {
+                let (guest_pc, recovery) = self.guest_pc_for_cache(resume)?;
+                if let Some(recovery) = recovery {
+                    recover_rewrite_state(
+                        snapshot,
+                        recovery,
+                        rewrite_scratch,
+                        rewrite_context_scratch,
+                    )?;
+                }
+                snapshot.pc = guest_pc.raw();
+                ThreadExit::Kick
+            }
             other => ThreadExit::Unsupported(format!("{other:?}")),
         })
     }
+}
+
+fn recover_rewrite_state(
+    snapshot: &mut super::NativeUcontextSnapshot,
+    action: emit::RecoveryAction,
+    saved_scratch: u64,
+    saved_context_scratch: u64,
+) -> Result<(), types::DsrError> {
+    let (register, context_register) = match action {
+        emit::RecoveryAction::RestoreScratch { register }
+        | emit::RecoveryAction::CommitVirtualizedAndRestoreScratch { register, .. } => {
+            (register, None)
+        }
+        emit::RecoveryAction::RestoreScratchAndContext {
+            register,
+            context_register,
+        }
+        | emit::RecoveryAction::CommitVirtualizedAndRestoreScratchAndContext {
+            register,
+            context_register,
+            ..
+        } => (register, Some(context_register)),
+    };
+    let index = usize::try_from(register)
+        .map_err(|_| types::DsrError::CachePolicy("rewrite scratch index overflow".to_string()))?;
+    let current = snapshot.x.get(index).copied().ok_or_else(|| {
+        types::DsrError::CachePolicy(format!("rewrite scratch x{register} is outside snapshot"))
+    })?;
+    let virtual_register = match action {
+        emit::RecoveryAction::CommitVirtualizedAndRestoreScratch {
+            virtual_register, ..
+        }
+        | emit::RecoveryAction::CommitVirtualizedAndRestoreScratchAndContext {
+            virtual_register,
+            ..
+        } => Some(virtual_register),
+        _ => None,
+    };
+    if let Some(virtual_register) = virtual_register {
+        let virtual_index = usize::try_from(virtual_register).map_err(|_| {
+            types::DsrError::CachePolicy("virtual register index overflow".to_string())
+        })?;
+        let slot = snapshot.x.get_mut(virtual_index).ok_or_else(|| {
+            types::DsrError::CachePolicy(format!(
+                "virtual register x{virtual_register} is outside snapshot"
+            ))
+        })?;
+        *slot = current;
+    }
+    snapshot.x[index] = saved_scratch;
+    if let Some(context_register) = context_register {
+        let context_index = usize::try_from(context_register).map_err(|_| {
+            types::DsrError::CachePolicy("rewrite context scratch index overflow".to_string())
+        })?;
+        let slot = snapshot.x.get_mut(context_index).ok_or_else(|| {
+            types::DsrError::CachePolicy(format!(
+                "rewrite context scratch x{context_register} is outside snapshot"
+            ))
+        })?;
+        *slot = saved_context_scratch;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -195,26 +430,107 @@ mod tests {
     }
 
     #[test]
-    fn copy_subset_rejects_virtualized_x18_operands() {
-        for word in [
-            0xd280_0032, // mov x18, #1
-            0xf940_0240, // ldr x0, [x18]
-        ] {
+    fn copy_subset_rejects_virtualized_register_operands() {
+        for word in [0xd280_0032, 0xf940_0240] {
             assert!(super::decode::decoded_operands_mention_x18(word, PC));
             assert!(matches!(
                 classify(word, PC),
                 Ok(InstAction::VirtualizedX18 { word: observed, .. }) if observed == word
             ));
         }
+        for word in [0xd280_003c, 0xf940_0380] {
+            assert!(super::decode::decoded_operands_mention_x28(word, PC));
+            assert!(matches!(
+                classify(word, PC),
+                Ok(InstAction::VirtualizedX28 { word: observed, .. }) if observed == word
+            ));
+        }
     }
 
     proptest! {
         #[test]
-        fn copy_subset_never_contains_virtualized_x18(word in any::<u32>()) {
+        fn copy_subset_never_contains_virtualized_registers(word in any::<u32>()) {
             if matches!(classify(word, PC), Ok(InstAction::Copy(_))) {
                 prop_assert!(!super::decode::decoded_operands_mention_x18(word, PC));
+                prop_assert!(!super::decode::decoded_operands_mention_x28(word, PC));
             }
         }
+    }
+
+    #[test]
+    #[ignore = "set CARRICK_DSR_SCAN_ELF to audit a built AArch64 ELF"]
+    fn dsr_static_elf_reserved_register_decode_audit() {
+        let path = std::env::var("CARRICK_DSR_SCAN_ELF").expect("CARRICK_DSR_SCAN_ELF");
+        let bytes = std::fs::read(&path).expect("read scan ELF");
+        let elf = goblin::elf::Elf::parse(&bytes).expect("parse scan ELF");
+        let mut blind_spots = Vec::new();
+        for header in elf.program_headers.iter().filter(|header| {
+            header.p_type == goblin::elf::program_header::PT_LOAD
+                && header.p_flags & goblin::elf::program_header::PF_X != 0
+        }) {
+            let start = usize::try_from(header.p_offset).expect("segment offset");
+            let length = usize::try_from(header.p_filesz).expect("segment length");
+            for (index, chunk) in bytes[start..start + length].chunks_exact(4).enumerate() {
+                let word = u32::from_le_bytes(chunk.try_into().expect("instruction word"));
+                let pc =
+                    GuestVa(header.p_vaddr + u64::try_from(index * 4).expect("instruction PC"));
+                let Ok(instruction) = bad64::decode(word, pc.raw()) else {
+                    continue;
+                };
+                let text_mentions_reserved = instruction
+                    .to_string()
+                    .split(|character: char| !character.is_ascii_alphanumeric())
+                    .any(|token| matches!(token, "x18" | "w18" | "x28" | "w28"));
+                let decoder_mentions_reserved =
+                    super::decode::decoded_operands_mention_x18(word, pc)
+                        || super::decode::decoded_operands_mention_x28(word, pc);
+                if text_mentions_reserved && !decoder_mentions_reserved {
+                    blind_spots.push(format!("0x{:x}: 0x{word:08x} {instruction}", pc.raw()));
+                }
+            }
+        }
+        assert!(
+            blind_spots.is_empty(),
+            "bad64 operand audit missed x18/x28 references:\n{}",
+            blind_spots.join("\n")
+        );
+    }
+
+    #[test]
+    fn dsr_vdso_reserved_register_decode_audit() {
+        let bytes = carrick_mem::vdso::vdso_image_bytes();
+        let elf = goblin::elf::Elf::parse(&bytes).expect("parse vDSO ELF");
+        let mut blind_spots = Vec::new();
+        for header in elf.program_headers.iter().filter(|header| {
+            header.p_type == goblin::elf::program_header::PT_LOAD
+                && header.p_flags & goblin::elf::program_header::PF_X != 0
+        }) {
+            let start = usize::try_from(header.p_offset).expect("segment offset");
+            let length = usize::try_from(header.p_filesz).expect("segment length");
+            for (index, chunk) in bytes[start..start + length].chunks_exact(4).enumerate() {
+                let word = u32::from_le_bytes(chunk.try_into().expect("instruction word"));
+                let pc =
+                    GuestVa(header.p_vaddr + u64::try_from(index * 4).expect("instruction PC"));
+                let Ok(instruction) = bad64::decode(word, pc.raw()) else {
+                    continue;
+                };
+                let text_mentions_reserved = instruction
+                    .to_string()
+                    .split(|character: char| !character.is_ascii_alphanumeric())
+                    .any(|token| matches!(token, "x18" | "w18" | "x28" | "w28"));
+                let decoder_mentions_reserved =
+                    super::decode::decoded_operands_mention_x18(word, pc)
+                        || super::decode::decoded_operands_mention_x28(word, pc);
+                if text_mentions_reserved && !decoder_mentions_reserved {
+                    blind_spots.push(format!("0x{:x}: 0x{word:08x} {instruction}", pc.raw()));
+                }
+            }
+        }
+        assert!(
+            blind_spots.is_empty(),
+            "vDSO operand audit missed x18/x28 references:\n{}",
+            blind_spots.join("\n")
+        );
     }
 
     #[test]
@@ -260,6 +576,32 @@ mod tests {
         assert!(matches!(
             classify(0xd50b_7520, PC),
             Ok(InstAction::Sensitive(exit)) if exit.kind == SensitiveKind::IcIvau
+        ));
+    }
+
+    #[test]
+    fn dsr_counter_register_reads_execute_directly() {
+        assert!(matches!(
+            classify(0xd53b_e042, PC),
+            Ok(InstAction::Copy(0xd53b_e042))
+        ));
+        assert!(matches!(
+            classify(0xd53b_e002, PC),
+            Ok(InstAction::Copy(0xd53b_e002))
+        ));
+        assert!(matches!(
+            classify(0xd53b_e052, PC),
+            Ok(InstAction::VirtualizedX18 {
+                word: 0xd53b_e052,
+                ..
+            })
+        ));
+        assert!(matches!(
+            classify(0xd53b_e05c, PC),
+            Ok(InstAction::VirtualizedX28 {
+                word: 0xd53b_e05c,
+                ..
+            })
         ));
     }
 
