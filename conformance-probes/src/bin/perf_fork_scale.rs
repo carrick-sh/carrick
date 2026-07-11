@@ -5,6 +5,11 @@
 //!   FORK_THREADS=<n>   spawn n extra parked threads before forking (default 0)
 //!   FORK_MEM_MB=<n>    allocate + touch n MiB (resident) before forking (default 0)
 //!
+//! Direct-launch transports (`carrick run-elf`, DTrace) cannot inject guest env
+//! vars, so both knobs also accept positional argv: `perf_fork_scale [threads
+//! [mem_mb]]`. Env wins over argv (same idiom as clonebasic). The timed loop is
+//! knob-independent.
+//!
 //! POSIX fork only clones the calling thread; the child _exit(0)s immediately
 //! (async-signal-safe), so forking a multithreaded / large-RSS process is valid.
 //! Under carrick this exercises the fork-quiesce barrier across sibling vCPUs and
@@ -16,8 +21,8 @@
 //!   fork_p50_us=<f>  fork_p95_us=<f>  fork_min_us=<f>  iters=<u>
 //!   threads=<u>  mem_mb=<u>  nproc=<u>
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use std::{env, thread};
 
@@ -52,16 +57,25 @@ fn wait_for_child(pid: libc::pid_t) {
     }
 }
 
-fn env_usize(key: &str) -> usize {
+fn env_usize(key: &str) -> Option<usize> {
     env::var(key)
         .ok()
         .and_then(|s| s.trim().parse::<usize>().ok())
-        .unwrap_or(0)
+}
+
+fn argv_usize(index: usize) -> Option<usize> {
+    env::args()
+        .nth(index)
+        .and_then(|s| s.trim().parse::<usize>().ok())
 }
 
 fn main() {
-    let n_threads = env_usize("FORK_THREADS");
-    let mem_mb = env_usize("FORK_MEM_MB");
+    let n_threads = env_usize("FORK_THREADS")
+        .or_else(|| argv_usize(1))
+        .unwrap_or(0);
+    let mem_mb = env_usize("FORK_MEM_MB")
+        .or_else(|| argv_usize(2))
+        .unwrap_or(0);
 
     // Resident memory: allocate mem_mb MiB and touch every page so it is actually
     // faulted-in (RSS), not just reserved. Kept alive across the whole loop.
