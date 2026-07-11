@@ -254,6 +254,14 @@ static int carrick_native_enter_guest_x18_abi(void) {
     return 0;
 }
 
+int carrick_native_dsr_enter_guest_abi(void) {
+    return carrick_native_enter_guest_x18_abi();
+}
+
+void carrick_native_dsr_enter_host_abi(void) {
+    carrick_native_enter_host_x18_abi();
+}
+
 static void carrick_native_write_literal(const char *s) {
     size_t len = 0;
     while (s[len] != 0) {

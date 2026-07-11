@@ -32,12 +32,7 @@ impl InstructionMap {
         let mut forward = BTreeMap::new();
         let mut inverse = BTreeMap::new();
         for entry in &entries {
-            if forward.insert(entry.guest, entry.cache).is_some() {
-                return Err(DsrError::CachePolicy(format!(
-                    "duplicate guest PC in DSR instruction map: 0x{:x}",
-                    entry.guest.raw()
-                )));
-            }
+            forward.entry(entry.guest).or_insert(entry.cache);
             if inverse.insert(entry.cache, entry.guest).is_some() {
                 return Err(DsrError::CachePolicy(format!(
                     "duplicate cache offset in DSR instruction map: {}",
@@ -109,6 +104,12 @@ fn exit_word(plan: &BlockPlan) -> Result<u32, DsrError> {
         PlannedExit::Syscall { .. } => Ok(BRK_DSR_SYSCALL),
         PlannedExit::Sensitive { .. } => Ok(BRK_DSR_SENSITIVE),
         PlannedExit::Unsupported { .. } => Ok(BRK_DSR_UNSUPPORTED),
+        PlannedExit::VirtualizedX18 { guest, word, .. } => Err(unsupported_action(
+            plan,
+            guest,
+            word,
+            "virtualized x18 instruction",
+        )),
         PlannedExit::Direct { guest, word, .. } => {
             Err(unsupported_action(plan, guest, word, "direct exit"))
         }
@@ -118,15 +119,66 @@ fn exit_word(plan: &BlockPlan) -> Result<u32, DsrError> {
     }
 }
 
+fn current_offset(assembler: &VecAssembler<Aarch64Relocation>) -> Result<CacheOffset, DsrError> {
+    u32::try_from(assembler.offset().0)
+        .map(CacheOffset::published)
+        .map_err(|_| DsrError::CachePolicy("emitted block exceeds u32 offsets".to_string()))
+}
+
+fn map_next(
+    assembler: &VecAssembler<Aarch64Relocation>,
+    entries: &mut Vec<PcMapEntry>,
+    guest: GuestVa,
+) -> Result<(), DsrError> {
+    entries.push(PcMapEntry {
+        guest,
+        cache: current_offset(assembler)?,
+    });
+    Ok(())
+}
+
+fn emit_mov_u64(
+    assembler: &mut VecAssembler<Aarch64Relocation>,
+    entries: &mut Vec<PcMapEntry>,
+    guest: GuestVa,
+    register: u32,
+    value: u64,
+) -> Result<(), DsrError> {
+    for halfword in 0..4_u32 {
+        map_next(assembler, entries, guest)?;
+        let immediate = ((value >> (halfword * 16)) & 0xffff) as u32;
+        let base = if halfword == 0 {
+            0xd280_0000
+        } else {
+            0xf280_0000
+        };
+        assembler.push_u32(base | (halfword << 21) | (immediate << 5) | register);
+    }
+    Ok(())
+}
+
 pub(super) fn emit_block(
     cache: &mut TranslationCache,
     plan: &BlockPlan,
 ) -> Result<EmittedBlock, DsrError> {
     let mut assembler = VecAssembler::<Aarch64Relocation>::new(0);
-    let mut entries = Vec::with_capacity(plan.instructions.len() + 1);
+    let mut entries = Vec::with_capacity(plan.instructions.len() + 8);
+    map_next(&assembler, &mut entries, plan.start)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; ldr x17, [x18, #136]
+    );
     for instruction in &plan.instructions {
         let word = match instruction.action {
             InstAction::Copy(word) => word,
+            InstAction::VirtualizedX18 { word, .. } => {
+                return Err(unsupported_action(
+                    plan,
+                    instruction.guest,
+                    word,
+                    "virtualized x18 instruction",
+                ));
+            }
             InstAction::PcRelative(relative) => {
                 return Err(unsupported_action(
                     plan,
@@ -160,22 +212,33 @@ pub(super) fn emit_block(
                 )));
             }
         };
-        let offset = u32::try_from(assembler.offset().0)
-            .map_err(|_| DsrError::CachePolicy("emitted block exceeds u32 offsets".to_string()))?;
-        entries.push(PcMapEntry {
-            guest: instruction.guest,
-            cache: CacheOffset::published(offset),
-        });
+        map_next(&assembler, &mut entries, instruction.guest)?;
         assembler.push_u32(word);
     }
 
-    let exit_offset = u32::try_from(assembler.offset().0)
-        .map_err(|_| DsrError::CachePolicy("emitted block exceeds u32 offsets".to_string()))?;
-    entries.push(PcMapEntry {
-        guest: plan.exit.guest_pc(),
-        cache: CacheOffset::published(exit_offset),
-    });
-    assembler.push_u32(exit_word(plan)?);
+    let exit_guest = plan.exit.guest_pc();
+    if matches!(plan.exit, PlannedExit::Syscall { .. }) {
+        map_next(&assembler, &mut entries, exit_guest)?;
+        dynasmrt::dynasm!(assembler
+            ; .arch aarch64
+            ; str x17, [x18, #136]
+        );
+        emit_mov_u64(
+            &mut assembler,
+            &mut entries,
+            exit_guest,
+            17,
+            super::gateway::syscall_exit_address(),
+        )?;
+        map_next(&assembler, &mut entries, exit_guest)?;
+        dynasmrt::dynasm!(assembler
+            ; .arch aarch64
+            ; br x17
+        );
+    } else {
+        map_next(&assembler, &mut entries, exit_guest)?;
+        assembler.push_u32(exit_word(plan)?);
+    }
     let bytes = assembler
         .finalize()
         .map_err(|error| DsrError::Assembler(error.to_string()))?;
@@ -231,37 +294,46 @@ mod tests {
     fn dsr_emit_copy_only_block_decodes_back_with_exact_maps() {
         let mut cache = TranslationCache::new(16 * 1024).expect("allocate translation cache");
         let emitted = emit_block(&mut cache, &copy_plan()).expect("emit copy-only block");
-        assert_eq!(emitted.len(), 12);
+        assert_eq!(emitted.len(), 36);
         let original_words = [0xd503_201f, 0x9100_0400];
-        let expected_ops = [bad64::Op::NOP, bad64::Op::ADD, bad64::Op::BRK];
-        for (index, expected_op) in expected_ops.into_iter().enumerate() {
-            let offset = index * 4;
+        let entry_word =
+            unsafe { std::ptr::read_unaligned(emitted.entry().host().raw() as *const u32) };
+        assert_eq!(
+            bad64::decode(entry_word, emitted.entry().host().raw() as u64)
+                .expect("decode entry restore")
+                .op(),
+            bad64::Op::LDR
+        );
+        for (index, original_word) in original_words.into_iter().enumerate() {
+            let offset = (index + 1) * 4;
             let pointer = (emitted.entry().host().raw() + offset) as *const u32;
             let word = unsafe { std::ptr::read_unaligned(pointer) };
             let decoded = bad64::decode(word, emitted.entry().host().raw() as u64 + offset as u64)
                 .expect("decode emitted instruction");
-            assert_eq!(decoded.op(), expected_op);
-            if let Some(original_word) = original_words.get(index) {
-                let original = bad64::decode(*original_word, 0x4000 + offset as u64)
-                    .expect("decode original instruction");
-                assert_eq!(decoded.operands(), original.operands());
-            }
+            let original = bad64::decode(original_word, 0x4000 + index as u64 * 4)
+                .expect("decode original instruction");
+            assert_eq!(decoded.op(), original.op());
+            assert_eq!(decoded.operands(), original.operands());
         }
 
-        let expected_guests = [GuestVa(0x4000), GuestVa(0x4004), GuestVa(0x4008)];
-        assert_eq!(emitted.map().entries().len(), expected_guests.len());
-        for (index, guest) in expected_guests.into_iter().enumerate() {
-            let offset = CacheOffset::published((index * 4) as u32);
+        assert_eq!(
+            emitted.map().cache_for_guest(GuestVa(0x4000)),
+            Some(CacheOffset::published(0))
+        );
+        assert_eq!(
+            emitted.map().guest_for_cache(CacheOffset::published(4)),
+            Some(GuestVa(0x4000))
+        );
+        assert_eq!(
+            emitted.map().cache_for_guest(GuestVa(0x4004)),
+            Some(CacheOffset::published(8))
+        );
+        for entry in emitted.map().entries() {
+            assert_eq!(entry.cache.get() % 4, 0);
             assert_eq!(
-                emitted.map().entries()[index],
-                PcMapEntry {
-                    guest,
-                    cache: offset
-                }
+                emitted.map().guest_for_cache(entry.cache),
+                Some(entry.guest)
             );
-            assert_eq!(emitted.map().cache_for_guest(guest), Some(offset));
-            assert_eq!(emitted.map().guest_for_cache(offset), Some(guest));
-            assert_eq!(emitted.map().entries()[index].cache.get() % 4, 0);
         }
     }
 
@@ -346,10 +418,10 @@ mod tests {
         let mut cache = TranslationCache::new(16 * 1024).expect("allocate translation cache");
         let emitted = emit_block(&mut cache, &plan).expect("emit bounded block");
         let exit =
-            unsafe { std::ptr::read_unaligned((emitted.entry().host().raw() + 4) as *const u32) };
+            unsafe { std::ptr::read_unaligned((emitted.entry().host().raw() + 8) as *const u32) };
         assert_eq!(exit, BRK_DSR_CONTINUE);
         assert_eq!(
-            emitted.map().guest_for_cache(CacheOffset::published(4)),
+            emitted.map().guest_for_cache(CacheOffset::published(8)),
             Some(GuestVa(0x4004))
         );
     }

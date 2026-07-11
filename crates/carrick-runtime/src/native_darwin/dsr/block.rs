@@ -48,6 +48,11 @@ pub(super) enum PlannedExit {
         word: u32,
         op: bad64::Op,
     },
+    VirtualizedX18 {
+        guest: GuestVa,
+        word: u32,
+        op: bad64::Op,
+    },
 }
 
 impl PlannedExit {
@@ -58,7 +63,8 @@ impl PlannedExit {
             | Self::Sensitive { guest, .. }
             | Self::Direct { guest, .. }
             | Self::Indirect { guest, .. }
-            | Self::Unsupported { guest, .. } => guest,
+            | Self::Unsupported { guest, .. }
+            | Self::VirtualizedX18 { guest, .. } => guest,
         }
     }
 }
@@ -152,6 +158,11 @@ fn plan_with_reader(
                 exit,
             }),
             InstAction::Unsupported { word, op } => Some(PlannedExit::Unsupported {
+                guest: pc,
+                word,
+                op,
+            }),
+            InstAction::VirtualizedX18 { word, op } => Some(PlannedExit::VirtualizedX18 {
                 guest: pc,
                 word,
                 op,
