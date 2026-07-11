@@ -177,6 +177,12 @@ use std::collections::HashMap;
 
 mod sysreg;
 use sysreg::*;
+// The vvar clock calibration sources (EL0 counter/frequency reads + the
+// CLOCK_UPTIME_RAW monotonic base). Exported so the Darwin-native backend's
+// vvar stamper calibrates from the IDENTICAL sources as `populate_vdso_data_page`
+// below — one timeline definition, not a per-backend re-derivation.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub use sysreg::{host_clock_uptime_ns, host_counter};
 
 // Process-wide PROT_NONE bookkeeping is a neutral-core abstraction shared with
 // every other backend (KVM included) — see carrick_mem::protections. Both hold
