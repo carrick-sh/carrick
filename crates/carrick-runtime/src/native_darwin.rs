@@ -6204,6 +6204,7 @@ impl NativeMappedMemory {
             linux_page_size,
             native_code_mode,
             None,
+            None,
         )
     }
 
@@ -6214,6 +6215,7 @@ impl NativeMappedMemory {
         linux_page_size: u64,
         native_code_mode: carrick_spec::NativeCodeModeRequest,
         reusable_translator: Option<Arc<dsr::ProcessTranslator>>,
+        exec_map_dsr_tid: Option<crate::thread::ThreadId>,
     ) -> Result<Self, RuntimeError> {
         if let Some(region) = image
             .regions()
@@ -6227,9 +6229,17 @@ impl NativeMappedMemory {
         }
         let mut regions = Vec::new();
         for region in image.regions() {
-            map_region(region, native_code_mode)?;
+            map_region(region, native_code_mode, exec_map_dsr_tid)?;
             if region.start == NATIVE_DARWIN_VDSO_BASE && region.perms.execute {
+                native_exec_map_detail(
+                    exec_map_dsr_tid,
+                    crate::probes::DsrCacheLifecyclePhase::ExecMapVvarBegin,
+                );
                 relocate_vdso_vvar_loads(region, native_code_mode)?;
+                native_exec_map_detail(
+                    exec_map_dsr_tid,
+                    crate::probes::DsrCacheLifecyclePhase::ExecMapVvarEnd,
+                );
             }
             regions.push(NativeMappedRegion {
                 start: region.start,
@@ -6253,6 +6263,7 @@ impl NativeMappedMemory {
             libc::PROT_READ | libc::PROT_EXEC,
             true,
             native_code_mode,
+            exec_map_dsr_tid,
         )?;
         regions.push(NativeMappedRegion {
             start: NATIVE_DARWIN_SIGRETURN_TRAMPOLINE_BASE,
@@ -6265,7 +6276,15 @@ impl NativeMappedMemory {
             shared_key_base: 0,
             shared_key_offset: 0,
         });
+        native_exec_map_detail(
+            exec_map_dsr_tid,
+            crate::probes::DsrCacheLifecyclePhase::ExecMapMmapBegin,
+        );
         map_anonymous_region(layout.heap_base, layout.heap_size, false)?;
+        native_exec_map_detail(
+            exec_map_dsr_tid,
+            crate::probes::DsrCacheLifecyclePhase::ExecMapMmapEnd,
+        );
         regions.push(NativeMappedRegion {
             start: layout.heap_base,
             end: checked_add_u64(layout.heap_base, layout.heap_size, "native heap end")?,
@@ -6276,7 +6295,15 @@ impl NativeMappedMemory {
             shared_key_base: 0,
             shared_key_offset: 0,
         });
+        native_exec_map_detail(
+            exec_map_dsr_tid,
+            crate::probes::DsrCacheLifecyclePhase::ExecMapMmapBegin,
+        );
         map_anonymous_region(layout.mmap_base, layout.mmap_size, false)?;
+        native_exec_map_detail(
+            exec_map_dsr_tid,
+            crate::probes::DsrCacheLifecyclePhase::ExecMapMmapEnd,
+        );
         regions.push(NativeMappedRegion {
             start: layout.mmap_base,
             end: checked_add_u64(layout.mmap_base, layout.mmap_size, "native mmap arena end")?,
@@ -6291,11 +6318,19 @@ impl NativeMappedMemory {
             shared_key_base: 0,
             shared_key_offset: 0,
         });
+        native_exec_map_detail(
+            exec_map_dsr_tid,
+            crate::probes::DsrCacheLifecyclePhase::ExecMapMmapBegin,
+        );
         map_anonymous_region(
             crate::memory::LINUX_SHARED_FILE_BASE,
             crate::memory::LINUX_SHARED_FILE_SIZE,
             true,
         )?;
+        native_exec_map_detail(
+            exec_map_dsr_tid,
+            crate::probes::DsrCacheLifecyclePhase::ExecMapMmapEnd,
+        );
         regions.push(NativeMappedRegion {
             start: crate::memory::LINUX_SHARED_FILE_BASE,
             end: checked_add_u64(
@@ -6310,11 +6345,19 @@ impl NativeMappedMemory {
             shared_key_base: 0,
             shared_key_offset: 0,
         });
+        native_exec_map_detail(
+            exec_map_dsr_tid,
+            crate::probes::DsrCacheLifecyclePhase::ExecMapMmapBegin,
+        );
         map_anonymous_region(
             crate::memory::LINUX_PRIVATE_OVERLAY_BASE,
             crate::memory::LINUX_PRIVATE_OVERLAY_SIZE,
             false,
         )?;
+        native_exec_map_detail(
+            exec_map_dsr_tid,
+            crate::probes::DsrCacheLifecyclePhase::ExecMapMmapEnd,
+        );
         regions.push(NativeMappedRegion {
             start: crate::memory::LINUX_PRIVATE_OVERLAY_BASE,
             end: checked_add_u64(
@@ -6368,7 +6411,15 @@ impl NativeMappedMemory {
         // Publishing the vvar contents is part of establishing the address
         // space: the initial boot maps here, and an execve replacement re-maps
         // here (`replace_image`), so both get a freshly stamped vvar.
+        native_exec_map_detail(
+            exec_map_dsr_tid,
+            crate::probes::DsrCacheLifecyclePhase::ExecMapVvarBegin,
+        );
         memory.stamp_vdso_vvar()?;
+        native_exec_map_detail(
+            exec_map_dsr_tid,
+            crate::probes::DsrCacheLifecyclePhase::ExecMapVvarEnd,
+        );
         Ok(memory)
     }
 
@@ -6571,6 +6622,7 @@ impl NativeMappedMemory {
             plan.page_geometry.linux_page_size,
             plan.native_code_mode,
             reusable_translator,
+            dsr_tid,
         )?;
         lifecycle(crate::probes::DsrCacheLifecyclePhase::ExecImageMapEnd);
         lifecycle(crate::probes::DsrCacheLifecyclePhase::ExecRelocationBegin);
@@ -7982,9 +8034,19 @@ fn native16k_host_prot(
     host_prot
 }
 
+fn native_exec_map_detail(
+    dsr_tid: Option<crate::thread::ThreadId>,
+    phase: crate::probes::DsrCacheLifecyclePhase,
+) {
+    if let Some(tid) = dsr_tid {
+        crate::probes::dsr_cache_lifecycle(tid.raw(), phase, 0, 0, 0);
+    }
+}
+
 fn map_region(
     region: &MemoryRegion,
     native_code_mode: carrick_spec::NativeCodeModeRequest,
+    exec_map_dsr_tid: Option<crate::thread::ThreadId>,
 ) -> Result<(), RuntimeError> {
     let length_u64 = region.end.checked_sub(region.start).ok_or_else(|| {
         RuntimeError::Unsupported("native Darwin empty inverted region".to_string())
@@ -8009,6 +8071,10 @@ fn map_region(
     } else {
         libc::MAP_PRIVATE
     };
+    native_exec_map_detail(
+        exec_map_dsr_tid,
+        crate::probes::DsrCacheLifecyclePhase::ExecMapMmapBegin,
+    );
     let mapped = unsafe {
         libc::mmap(
             addr,
@@ -8031,24 +8097,48 @@ fn map_region(
             region.start
         )));
     }
+    native_exec_map_detail(
+        exec_map_dsr_tid,
+        crate::probes::DsrCacheLifecyclePhase::ExecMapMmapEnd,
+    );
 
     let bytes = region.bytes();
     if !bytes.is_empty() {
+        native_exec_map_detail(
+            exec_map_dsr_tid,
+            crate::probes::DsrCacheLifecyclePhase::ExecMapCopyBegin,
+        );
         unsafe {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), mapped.cast::<u8>(), bytes.len());
         }
+        native_exec_map_detail(
+            exec_map_dsr_tid,
+            crate::probes::DsrCacheLifecyclePhase::ExecMapCopyEnd,
+        );
     }
     if region.perms.execute && native_code_mode == carrick_spec::NativeCodeModeRequest::Brk {
         patch_syscalls(mapped.cast::<u8>(), bytes.len());
     }
     if region.perms.execute {
+        native_exec_map_detail(
+            exec_map_dsr_tid,
+            crate::probes::DsrCacheLifecyclePhase::ExecMapIcacheBegin,
+        );
         unsafe { carrick_native_clear_icache(mapped, bytes.len()) };
+        native_exec_map_detail(
+            exec_map_dsr_tid,
+            crate::probes::DsrCacheLifecyclePhase::ExecMapIcacheEnd,
+        );
     }
 
     let mut prot = region_prot(region);
     if region.perms.execute && native_code_mode == carrick_spec::NativeCodeModeRequest::Dsr {
         prot = (prot & !libc::PROT_EXEC) | libc::PROT_READ;
     }
+    native_exec_map_detail(
+        exec_map_dsr_tid,
+        crate::probes::DsrCacheLifecyclePhase::ExecMapProtectBegin,
+    );
     let protect = unsafe { libc::mprotect(mapped, length, prot) };
     if protect != 0 {
         return Err(last_io_error(&format!(
@@ -8056,6 +8146,10 @@ fn map_region(
             region.start, region.end
         )));
     }
+    native_exec_map_detail(
+        exec_map_dsr_tid,
+        crate::probes::DsrCacheLifecyclePhase::ExecMapProtectEnd,
+    );
     Ok(())
 }
 
@@ -8066,6 +8160,7 @@ fn map_bytes_region(
     final_prot: libc::c_int,
     executable: bool,
     native_code_mode: carrick_spec::NativeCodeModeRequest,
+    exec_map_dsr_tid: Option<crate::thread::ThreadId>,
 ) -> Result<(), RuntimeError> {
     let length = usize::try_from(length_u64).map_err(|_| {
         RuntimeError::Unsupported(format!(
@@ -8086,6 +8181,10 @@ fn map_bytes_region(
             "native Darwin byte region start too large: 0x{start:x}"
         ))
     })? as *mut libc::c_void;
+    native_exec_map_detail(
+        exec_map_dsr_tid,
+        crate::probes::DsrCacheLifecyclePhase::ExecMapMmapBegin,
+    );
     let mapped = unsafe {
         libc::mmap(
             addr,
@@ -8106,28 +8205,56 @@ fn map_bytes_region(
             "native Darwin mmap did not honor MAP_FIXED for byte region 0x{start:x}"
         )));
     }
+    native_exec_map_detail(
+        exec_map_dsr_tid,
+        crate::probes::DsrCacheLifecyclePhase::ExecMapMmapEnd,
+    );
     if !bytes.is_empty() {
+        native_exec_map_detail(
+            exec_map_dsr_tid,
+            crate::probes::DsrCacheLifecyclePhase::ExecMapCopyBegin,
+        );
         unsafe {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), mapped.cast::<u8>(), bytes.len());
         }
+        native_exec_map_detail(
+            exec_map_dsr_tid,
+            crate::probes::DsrCacheLifecyclePhase::ExecMapCopyEnd,
+        );
     }
     if executable && native_code_mode == carrick_spec::NativeCodeModeRequest::Brk {
         patch_syscalls(mapped.cast::<u8>(), bytes.len());
     }
     if executable {
+        native_exec_map_detail(
+            exec_map_dsr_tid,
+            crate::probes::DsrCacheLifecyclePhase::ExecMapIcacheBegin,
+        );
         unsafe { carrick_native_clear_icache(mapped, bytes.len()) };
+        native_exec_map_detail(
+            exec_map_dsr_tid,
+            crate::probes::DsrCacheLifecyclePhase::ExecMapIcacheEnd,
+        );
     }
     let final_prot = if executable && native_code_mode == carrick_spec::NativeCodeModeRequest::Dsr {
         (final_prot & !libc::PROT_EXEC) | libc::PROT_READ
     } else {
         final_prot
     };
+    native_exec_map_detail(
+        exec_map_dsr_tid,
+        crate::probes::DsrCacheLifecyclePhase::ExecMapProtectBegin,
+    );
     let protect = unsafe { libc::mprotect(mapped, length, final_prot) };
     if protect != 0 {
         return Err(last_io_error(&format!(
             "mprotect native Darwin byte region 0x{start:x}+0x{length_u64:x}"
         )));
     }
+    native_exec_map_detail(
+        exec_map_dsr_tid,
+        crate::probes::DsrCacheLifecyclePhase::ExecMapProtectEnd,
+    );
     Ok(())
 }
 
@@ -8768,6 +8895,7 @@ mod tests {
         map_region(
             &image.regions()[0],
             carrick_spec::NativeCodeModeRequest::Dsr,
+            None,
         )
         .expect("map DSR original code page");
 

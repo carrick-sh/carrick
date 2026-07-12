@@ -87,21 +87,21 @@ assertion.
 - Modify: `crates/carrick-runtime/src/native_darwin.rs`
 - Modify: `scripts/dtrace/dsr-fork.d`
 
-- [ ] **Step 1: Thread typed exec-only context**
+- [x] **Step 1: Thread typed exec-only context**
 
 Add an `Option<crate::thread::ThreadId>` detail context to
 `map_with_code_mode_and_translator`, `map_region`, and `map_bytes_region`.
 Every initial/test mapping passes `None`; `replace_image` passes its `dsr_tid`.
 Use one helper that emits a typed lifecycle phase only for `Some(tid)`.
 
-- [ ] **Step 2: Bracket the five components**
+- [x] **Step 2: Bracket the five components**
 
 Bracket each relevant `mmap`, copy, I-cache publication, and `mprotect` without
 moving the operation or changing its condition. Bracket the vDSO relocation
 inside the image loop and `stamp_vdso_vvar` under the same vvar total. Bracket
 each of the four anonymous aperture mappings as Darwin mapping time.
 
-- [ ] **Step 3: Aggregate repeated intervals per exec**
+- [x] **Step 3: Aggregate repeated intervals per exec**
 
 In `dsr-fork.d`, keep a mapping-detail pairing state separate from the existing
 outer subphase state. Add each completed nested interval to the matching
@@ -109,7 +109,7 @@ per-pid/tid total. At outer `ExecImageMapEnd` (ordinal 8), print exactly one
 sample for each component, clear totals, and report open/overwrite/missing
 pairs at `END`.
 
-- [ ] **Step 4: Verify and commit**
+- [x] **Step 4: Verify and commit**
 
 ```bash
 cargo test -p carrick-observability dsr_probe_abi --lib -- --nocapture
