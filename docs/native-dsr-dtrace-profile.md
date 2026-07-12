@@ -334,6 +334,17 @@ the scalar gateway from 0.471 to 0.273 us and the batch-16 syscall floor from
 ABBA intervals, and correctness proofs are recorded in
 `perf-results/native-dsr-gateway-candidate-v1.jsonl`.
 
+Translation follow-up (2026-07-12) used typed decode, plan, emit,
+publication/index, and duplicate-wait boundaries across syscall-floor, V8, JIT
+rewrite, and concurrent first-publication workloads. Emit reached about 14.4%
+of the two short code-churn walls but only about 4% of syscall-floor and V8
+wall. Two 30-process release decompositions then bounded guarded emission at
+1.666/1.667 us p50: dynasm is about 12%, MAP_JIT publication 7.5%, bad64 decode
+5%, and byte reshaping 2%. No isolated candidate reaches the 10% emit gate;
+the area stops without production churn. Exact evidence is in
+`perf-results/native-dsr-translation-subphases.jsonl` and
+`perf-results/native-dsr-emission-components-v1.jsonl`.
+
 Every candidate starts with a deterministic red mechanism test, runs focused
 correctness plus a signed workload, and receives a fixed-order ABBA comparison
 with a seeded bootstrap interval. A plausible change without a supported wall

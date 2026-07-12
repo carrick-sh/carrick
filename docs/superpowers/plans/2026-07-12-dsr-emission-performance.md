@@ -1,5 +1,9 @@
 # Native DSR Emission Performance Plan
 
+> **Status (2026-07-12):** complete with an evidence-backed stop. No isolated
+> emission component or candidate cleared the selection thresholds, so no
+> production emission change is authorized.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use
 > `superpowers:executing-plans` to implement this plan task-by-task. Steps use
 > checkbox (`- [ ]`) syntax for tracking.
@@ -47,13 +51,13 @@ storage.
   dynasm finalize, byte-to-word reshape, MAP_JIT copy/publish, and 1/4/16-block
   write-window shapes.
 
-- [ ] **Step 1: Write red benchmark shape and output tests**
+- [x] **Step 1: Write red benchmark shape and output tests**
 
 Add ignored release benchmarks with stable machine keys and tests that reject
 missing, non-finite, or non-positive component values. Pass every result through
 `black_box` and keep benchmark state thread-local.
 
-- [ ] **Step 2: Implement exact component benchmarks**
+- [x] **Step 2: Implement exact component benchmarks**
 
 Measure current production primitives, including `bad64::decode` where emit
 rewrites operands, `VecAssembler::new`/emission/`finalize`, the current
@@ -61,22 +65,34 @@ rewrites operands, `VecAssembler::new`/emission/`finalize`, the current
 Separately benchmark `VecAssembler::new_with_capacity`, direct byte copying,
 and 1/4/16 logical blocks per MAP_JIT write window without changing production.
 
-- [ ] **Step 3: Collect two independent 30-process campaigns**
+- [x] **Step 3: Collect two independent 30-process campaigns**
 
 Use release tests, 20,000 sampled batches where practical, AC power, and the
 same binary hash in both campaigns. Check in raw arrays, p50/p95/min/IQR,
 binary/host provenance, and fixture block shapes.
 
-- [ ] **Step 4: Select only a stable component and candidate**
+- [x] **Step 4: Select only a stable component and candidate**
 
 Require the current component to explain at least 20% of the 3.716 ms JIT emit
 baseline in both campaigns and the candidate primitive to improve that
 component by at least 20%. If no component qualifies, record emission as
 resolved below the next pole and stop.
 
+**Stop result:** guarded emission is 1.666/1.667 us p50. Default dynasm is
+11.70/11.97% of that total, MAP_JIT copy/publish 7.50%, bad64 decode
+4.98/5.16%, and byte reshaping 2.04/2.16%. Preallocating dynasm storage cuts
+that primitive by about 54% but projects to only 6.4-6.5% of full emission;
+direct bytes project to 1.7-1.9%. A 16-block write window projects to 5.9% and
+is not directly implementable for an on-demand current block without
+speculative translation and a separate failure-atomic design. No production
+candidate is selected. Evidence is in
+`docs/perf-results/native-dsr-emission-components-v1.jsonl`.
+
 ---
 
 ### Task 2: Implement the selected Rust-ecosystem candidate
+
+**Not entered:** Task 1 selected no candidate.
 
 **Files:**
 - Modify: `crates/carrick-runtime/src/native_darwin/dsr/emit.rs`
@@ -111,6 +127,9 @@ red-first test against the pre-candidate file when practical.
 ---
 
 ### Task 3: Promote or reject the candidate
+
+**Not entered:** the decomposition stop record is the final decision; there is
+no candidate binary to promote or reject.
 
 **Files:**
 - Modify: `crates/carrick-cli/tests/dsr_trace_overhead.rs`
