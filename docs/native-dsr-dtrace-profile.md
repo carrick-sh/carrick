@@ -123,6 +123,36 @@ only 264 preparations use `ResumeEntryHit`. The first normal-loop experiment
 therefore makes the typed last-prepared entry persistent and generation
 validated.
 
+#### Accepted prepare result
+
+Commit `23993da4` makes the existing thread-local
+`(GuestVa, CodeGeneration, CacheVa)` entry persistent. Every fallback
+translation or process-index lookup publishes the tuple; a matching PC reuses
+it only while the executable-page generation still matches. Key/generation
+mismatches discard it, and fork/exec retain their existing clears.
+
+Against signed baseline `a0b22a2e`, fixed ABBA evidence measured:
+
+| Workload | Baseline p50 | Candidate p50 | Ratio estimate | 95% interval | Result |
+| --- | ---: | ---: | ---: | ---: | --- |
+| syscall floor, n=30 each | 0.705 us | 0.678 us | 0.9603 | 0.9342–0.9891 | pass |
+| direct V8, n=10 each | 7933.22 ms | 7908.30 ms | 0.9967 | 0.9927–1.0022 | pass against 1.01 |
+
+The automatically enabled broad profile recorded 44,250 `ResumeEntryHit`,
+1,151 `BlockIndexHit`, and 23 `Translated` outcomes. Relative to the starting
+264 resume hits and 45,140 block hits, 43,986 outcomes—97.4% of the former
+block-hit volume—moved to the validated thread-local path. The profiled prepare
+aggregate fell from 66.79 ms to 38.46 ms, but this enabled-DTrace number is
+diagnostic; the untraced 3.97% syscall-floor estimate is the promoted
+performance claim.
+
+The evidence, including signed hashes/inodes and power context, is checked in
+as
+[`native-dsr-prepare-cache-v1.jsonl`](perf-results/native-dsr-prepare-cache-v1.jsonl).
+The red/green unit proof and canonical mutation test show that generation
+changes cannot reuse the stale prepared entry. A four-entry fallback is not
+warranted.
+
 ### Indirect-heavy V8
 
 The direct V8 profile at `281417c8` captured 416,997 successful resolver exits,
@@ -203,29 +233,32 @@ Full samples and codesign provenance are in
 These results bound the disabled instrumentation cost; they do not prove that
 it is exactly zero.
 
-Enabled profiles are report-only diagnostics on the same instrumented binary:
+Enabled profiles are report-only diagnostics. The current artifact was
+refreshed on signed commit `5724f9a6`, where `--profile dsr` automatically
+enables its const-specialized prepare/run probes before sudo and traced-child
+creation:
 
 | Enabled profile/workload | Untraced p50 | Profiled p50 | Ratio estimate | 95% interval |
 | --- | ---: | ---: | ---: | ---: |
-| broad / syscall floor, n=4 each | 59.68 ms | 1034.51 ms | 15.08 | 2.14–18.36 |
-| indirect / direct V8, n=4 each | 7986.19 ms | 9655.35 ms | 1.200 | 1.009–1.246 |
-| fork / fork-exec, n=4 each | 1378.54 ms | 3231.17 ms | 2.343 | 2.235–2.440 |
+| broad / syscall floor, n=4 each | 68.63 ms | 1231.99 ms | 17.04 | 16.08–19.89 |
+| indirect / direct V8, n=4 each | 7682.31 ms | 8879.72 ms | 1.155 | 1.142–1.173 |
+| fork / fork-exec, n=4 each | 1385.16 ms | 2879.93 ms | 2.074 | 2.034–2.128 |
 
 Full samples are in
 [`native-dsr-dtrace-enabled-overhead.jsonl`](perf-results/native-dsr-dtrace-enabled-overhead.jsonl).
-The enabled run switched to battery power, and four samples are too few for a
-portable overhead claim. The values quantify this recorded diagnostic run and
-explain why profile nanoseconds are not substituted for untraced workload
-measurements.
+The refreshed run remained on AC power, but four samples per role are still too
+few for a portable overhead claim. The values quantify this recorded
+diagnostic run and explain why profile nanoseconds are not substituted for
+untraced workload measurements.
 
 ## Optimization order and proof rule
 
-After promoting the indirect cache, the remaining measured queue is:
+After promoting the indirect and prepare caches, the remaining measured queue
+is:
 
-1. repeated prepare lookup, using syscall-floor wall time and outcome counts;
-2. exec subdivision, followed by the largest reproducible subphase;
-3. a low-perturbation scalar/SIMD gateway benchmark;
-4. translation/publication, reprofiled after cache misses fall.
+1. exec subdivision, followed by the largest reproducible subphase;
+2. a low-perturbation scalar/SIMD gateway benchmark;
+3. translation/publication, reprofiled after cache misses fall.
 
 Every candidate starts with a deterministic red mechanism test, runs focused
 correctness plus a signed workload, and receives a fixed-order ABBA comparison
