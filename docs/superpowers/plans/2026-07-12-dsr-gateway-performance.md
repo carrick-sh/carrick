@@ -60,18 +60,24 @@ before code changes.
 
 ## Task 1: Attribute closure and wrapper costs
 
-- [ ] Add ignored, opt-in release microbenchmarks for (a) one paired
+- [x] Add ignored, opt-in release microbenchmarks for (a) one paired
   `carrick_native_dsr_enter_guest_abi` / `enter_host_abi` closure on a correctly
   initialized thread and (b) `DsrContext` construction plus snapshot
   publication with all values passed through `black_box`.
-- [ ] Use the same 16-operation batches, 20,000 samples, 30 process
+- [x] Use the same 16-operation batches, 20,000 samples, 30 process
   repetitions, counter conversion, and positive finite checks as the gateway
   probe. Do not use DTrace on the hot boundary.
-- [ ] Record raw arrays, p50/p95/min/IQR, release binary hash, and power facts
+- [x] Record raw arrays, p50/p95/min/IQR, release binary hash, and power facts
   in `native-dsr-gateway-components-v1.jsonl`.
-- [ ] Select a component only if its stable p50 is at least 20% of the 0.474 us
+- [x] Select a component only if its stable p50 is at least 20% of the 0.474 us
   scalar baseline in two independent 30-run campaigns. Otherwise stop and
   profile a broader dispatch boundary.
+
+**Selection result:** the ABI closure is selected. Its process-p50 median is
+0.211 us in both campaigns, 44.5% of the 0.474 us scalar gateway baseline.
+Wrapper construction/publication is 0.026 us in both campaigns, only 5.5%, so
+Task 2A is deferred. Exact arrays and provenance are in
+`docs/perf-results/native-dsr-gateway-components-v1.jsonl`.
 
 ## Task 2A: Reuse the gateway frame only if wrapper cost wins
 
@@ -89,6 +95,8 @@ before code changes.
   snapshot copies; it has not addressed the measured component.
 
 ## Task 2B: Optimize the ABI closure only if closure cost wins
+
+**Selected by Task 1:** yes; decompose before changing behavior.
 
 - [ ] Decompose custom-x18 transition and signal-mask transition with a
   sampled, opt-in aggregate counter. Emission must be once per process, not a
