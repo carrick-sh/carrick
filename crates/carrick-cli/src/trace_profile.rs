@@ -59,6 +59,10 @@ impl TraceProfileKind {
         }
     }
 
+    pub(crate) const fn requires_runtime_profile(self) -> bool {
+        matches!(self, Self::Dsr)
+    }
+
     #[cfg(target_os = "macos")]
     pub(crate) fn bundled_script(self) -> &'static str {
         match self {
@@ -703,6 +707,13 @@ mod tests {
         assert_eq!(sample.record_type, RecordType::Sample);
         assert_eq!(sample.required_u64("duration_ns").expect("duration"), 9000);
         ProfileRecord::parse("DSRPROF1|complete|profile=dsr|bounded=0").expect("complete");
+    }
+
+    #[test]
+    fn broad_profile_requires_runtime_phase_instrumentation() {
+        assert!(TraceProfileKind::Dsr.requires_runtime_profile());
+        assert!(!TraceProfileKind::DsrIndirect.requires_runtime_profile());
+        assert!(!TraceProfileKind::DsrFork.requires_runtime_profile());
     }
 
     #[test]
