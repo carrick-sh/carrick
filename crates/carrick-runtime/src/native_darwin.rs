@@ -1119,6 +1119,7 @@ fn run_native_thread_loop(
             memory,
             reporter,
             max_traps,
+            plan,
             thread_runtime,
             start,
         );
@@ -1703,6 +1704,7 @@ fn run_native_dsr_thread_loop(
     memory: SharedNativeMemory,
     reporter: Arc<CompatReporter>,
     max_traps: usize,
+    plan: Arc<ExecutionPlan>,
     thread_runtime: &mut NativeThreadRuntime,
     start: NativeThreadStart,
 ) -> Result<NativeThreadLoopOutcome, RuntimeError> {
@@ -1731,7 +1733,10 @@ fn run_native_dsr_thread_loop(
             return Err(RuntimeError::TrapLimitExceeded { max_traps });
         }
         let exit = {
-            let memory = memory.lock();
+            let mut memory = memory.lock();
+            memory
+                .prepare_dsr_execution(snapshot.pc)
+                .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
             translator
                 .enter_once(&memory, &mut snapshot)
                 .map_err(|error| RuntimeError::Unsupported(error.to_string()))?
@@ -1812,6 +1817,13 @@ fn run_native_dsr_thread_loop(
                         "native DSR trapped unexpected host signal {signal} at guest PC 0x{:x}",
                         snapshot.pc
                     )));
+                }
+                if memory.lock().resolve_native16k_write_exec_fault(
+                    address.raw(),
+                    snapshot.pc,
+                    snapshot.esr,
+                )? {
+                    continue;
                 }
                 snapshot = lower_dsr_fault(
                     &dispatcher,
@@ -1914,6 +1926,65 @@ fn run_native_dsr_thread_loop(
                     return Ok(NativeThreadLoopOutcome::ProcessExit(code));
                 }
                 return Ok(NativeThreadLoopOutcome::ThreadDone);
+            }
+            DispatchOutcome::CloneThread {
+                stack,
+                tls,
+                flags: _,
+                parent_tid_addr,
+                child_tid_addr,
+                clear_child_tid_addr,
+            } => {
+                let clone_rejection = memory.lock().native16k_clone_thread_rejection();
+                if let Some(reason) = clone_rejection {
+                    let syscall_name = if request.number.raw() == 435 {
+                        "clone3"
+                    } else {
+                        "clone"
+                    };
+                    reporter.record(crate::compat::CompatEvent::partial_syscall(
+                        request.number.raw(),
+                        syscall_name,
+                        request.args,
+                        reason,
+                    ));
+                    snapshot = complete_dsr_syscall(
+                        &dispatcher,
+                        &memory,
+                        snapshot,
+                        thread_runtime.tid(),
+                        request.number.raw(),
+                        crate::linux_abi::LINUX_EOPNOTSUPP.guest_retval(),
+                        resume,
+                    )?;
+                    continue;
+                }
+                let tid = thread_runtime.spawn_clone_thread(
+                    &dispatcher,
+                    &memory,
+                    &reporter,
+                    &plan,
+                    max_traps,
+                    NativeCloneThreadRequest {
+                        context: snapshot,
+                        resume_pc: resume.raw(),
+                        parent_guest_tpidr_el0: guest_tpidr_el0,
+                        stack,
+                        tls,
+                        parent_tid_addr,
+                        child_tid_addr,
+                        clear_child_tid_addr,
+                    },
+                )?;
+                snapshot = complete_dsr_syscall(
+                    &dispatcher,
+                    &memory,
+                    snapshot,
+                    thread_runtime.tid(),
+                    request.number.raw(),
+                    i64::from(tid.raw()),
+                    resume,
+                )?;
             }
             other => {
                 return Err(RuntimeError::Unsupported(format!(
@@ -5665,6 +5736,7 @@ struct NativeMappedMemory {
     host_page_size: u64,
     linux_page_size: u64,
     native_code_mode: carrick_spec::NativeCodeModeRequest,
+    dsr_generations: dsr::cache::PageGenerationTable,
 }
 
 #[derive(Clone, Copy)]
@@ -5709,6 +5781,55 @@ fn native_region_linux_prot(read: bool, write: bool, exec: bool) -> u64 {
 }
 
 impl NativeMappedMemory {
+    fn note_dsr_code_mutation(
+        &self,
+        address: u64,
+        len: usize,
+    ) -> Result<Option<dsr::types::CodeGeneration>, MemoryError> {
+        if self.native_code_mode != carrick_spec::NativeCodeModeRequest::Dsr || len == 0 {
+            return Ok(None);
+        }
+        let end = address
+            .checked_add(len as u64)
+            .ok_or(MemoryError::OutOfBounds {
+                address,
+                length: len,
+            })?;
+        self.dsr_generations
+            .note_guest_code_write(
+                carrick_guest_mem::GuestVa(address)..carrick_guest_mem::GuestVa(end),
+            )
+            .map(Some)
+            .map_err(|error| MemoryError::HostMap(error.to_string()))
+    }
+
+    fn dsr_generation_observation(
+        &self,
+        pc: carrick_guest_mem::GuestVa,
+    ) -> Result<dsr::cache::PageGenerationObservation, dsr::types::DsrError> {
+        self.dsr_generations.observe(pc)
+    }
+
+    fn range_may_execute(&self, address: u64, len: usize) -> bool {
+        if len == 0 {
+            return false;
+        }
+        let end = address.saturating_add(len as u64);
+        let mut page = address & !(self.host_page_size - 1);
+        while page < end {
+            let prot = self
+                .native_page_protections
+                .get(&page)
+                .copied()
+                .unwrap_or_else(|| self.default_linux_prot_at(page));
+            if prot & crate::linux_abi::LINUX_PROT_EXEC != 0 {
+                return true;
+            }
+            page = page.saturating_add(self.host_page_size);
+        }
+        false
+    }
+
     #[cfg(test)]
     fn map(
         image: &AddressSpace,
@@ -5760,12 +5881,9 @@ impl NativeMappedMemory {
         }
         let mut regions = Vec::new();
         for region in image.regions() {
-            map_region(
-                region,
-                native_code_mode == carrick_spec::NativeCodeModeRequest::Brk,
-            )?;
+            map_region(region, native_code_mode)?;
             if region.start == NATIVE_DARWIN_VDSO_BASE && region.perms.execute {
-                relocate_vdso_vvar_loads(region)?;
+                relocate_vdso_vvar_loads(region, native_code_mode)?;
             }
             regions.push(NativeMappedRegion {
                 start: region.start,
@@ -5788,7 +5906,7 @@ impl NativeMappedMemory {
             &carrick_mem::memory::sigreturn_trampoline_bytes(),
             libc::PROT_READ | libc::PROT_EXEC,
             true,
-            native_code_mode == carrick_spec::NativeCodeModeRequest::Brk,
+            native_code_mode,
         )?;
         regions.push(NativeMappedRegion {
             start: NATIVE_DARWIN_SIGRETURN_TRAMPOLINE_BASE,
@@ -5886,6 +6004,8 @@ impl NativeMappedMemory {
             host_page_size,
             linux_page_size,
             native_code_mode,
+            dsr_generations: dsr::cache::PageGenerationTable::new(host_page_size)
+                .map_err(|error| RuntimeError::Unsupported(error.to_string()))?,
         };
         // Publishing the vvar contents is part of establishing the address
         // space: the initial boot maps here, and an execve replacement re-maps
@@ -6175,6 +6295,7 @@ impl NativeMappedMemory {
         if self.native_write_exec_writable_pages.contains(&page_start) {
             return Ok(());
         }
+        self.note_dsr_code_mutation(page_start, self.host_page_size as usize)?;
         self.mprotect_host_page(
             page_start,
             libc::PROT_READ | libc::PROT_WRITE,
@@ -6214,12 +6335,22 @@ impl NativeMappedMemory {
             .unwrap_or_else(|| self.default_linux_prot_at(page_start));
         self.mprotect_host_page(
             page_start,
-            native16k_host_prot(prot),
+            native16k_host_prot(prot, self.native_code_mode),
             operation_address,
             operation_len,
         )?;
         self.native_write_exec_writable_pages.remove(&page_start);
         Ok(())
+    }
+
+    fn prepare_dsr_execution(&mut self, pc: u64) -> Result<(), MemoryError> {
+        if self.native_code_mode != carrick_spec::NativeCodeModeRequest::Dsr {
+            return Ok(());
+        }
+        let Some(page_start) = self.native16k_write_exec_page(pc) else {
+            return Ok(());
+        };
+        self.make_native16k_write_exec_page_executable(page_start, pc, self.host_page_size as usize)
     }
 
     fn prepare_native16k_write_exec_host_write(
@@ -6643,7 +6774,7 @@ impl NativeMappedMemory {
             if self.native_write_exec_writable_pages.contains(&page_start) {
                 return libc::PROT_READ | libc::PROT_WRITE;
             }
-            return native16k_host_prot(prot);
+            return native16k_host_prot(prot, self.native_code_mode);
         }
         let protections = self.linux4k_host_page_protections(page_start);
         match self.classify_linux4k_host_page(protections) {
@@ -7080,7 +7211,7 @@ impl NativeMappedMemory {
     where
         F: FnMut(u64, usize, libc::c_int) -> Result<(), MemoryError>,
     {
-        let host_prot = native16k_host_prot(prot);
+        let host_prot = native16k_host_prot(prot, self.native_code_mode);
         let mut pages = BTreeSet::new();
         for (start, end) in self.host_protected_overlaps(address, len) {
             let (page_start, page_len) = self.host_page_range(start, end)?;
@@ -7120,17 +7251,21 @@ impl NativeMappedMemory {
             for &(page_start, ptr) in &pages {
                 let old_host_prot = self.native_host_prot_for_page(page_start);
                 if prot & crate::linux_abi::LINUX_PROT_EXEC != 0 {
-                    set_host_prot(
-                        page_start,
-                        host_page_len,
-                        libc::PROT_READ | libc::PROT_WRITE,
-                    )?;
                     let mut patched_words = Vec::new();
-                    patch_syscalls_recording(
-                        ptr.cast::<u8>(),
-                        host_page_len,
-                        |offset, original| patched_words.push((offset, original)),
-                    );
+                    if self.native_code_mode == carrick_spec::NativeCodeModeRequest::Brk {
+                        set_host_prot(
+                            page_start,
+                            host_page_len,
+                            libc::PROT_READ | libc::PROT_WRITE,
+                        )?;
+                        patch_syscalls_recording(
+                            ptr.cast::<u8>(),
+                            host_page_len,
+                            |offset, original| patched_words.push((offset, original)),
+                        );
+                    } else {
+                        set_host_prot(page_start, host_page_len, libc::PROT_READ)?;
+                    }
                     snapshots.push(ProtectionSnapshot {
                         page_start,
                         ptr,
@@ -7260,6 +7395,9 @@ impl GuestMemory for NativeMappedMemory {
             return Err(MemoryError::OutOfBounds { address, length });
         }
         self.invalidate_exclusive_range(address, length);
+        if self.range_may_execute(address, length) {
+            self.note_dsr_code_mutation(address, length)?;
+        }
         self.prepare_native16k_write_exec_host_write(address, length)?;
         let ptr = usize::try_from(address)
             .map_err(|_| MemoryError::OutOfBounds { address, length })?
@@ -7309,22 +7447,34 @@ impl GuestMemory for NativeMappedMemory {
                 length: len,
             });
         }
-        if self.uses_linux4k_subpages() {
-            return self.protect_linux4k_range(address, len, prot);
-        }
-        self.protect_native16k_range_with(address, len, prot, |page_start, page_len, host_prot| {
-            let ptr = usize::try_from(page_start).map_err(|_| MemoryError::OutOfBounds {
+        let old_exec = self.range_may_execute(address, len);
+        let result = if self.uses_linux4k_subpages() {
+            self.protect_linux4k_range(address, len, prot)
+        } else {
+            self.protect_native16k_range_with(
                 address,
-                length: len,
-            })? as *mut libc::c_void;
-            if unsafe { libc::mprotect(ptr, page_len, host_prot) } != 0 {
-                return Err(MemoryError::HostMap(format!(
-                    "mprotect native Darwin host page 0x{page_start:x}: {}",
-                    std::io::Error::last_os_error()
-                )));
-            }
-            Ok(())
-        })
+                len,
+                prot,
+                |page_start, page_len, host_prot| {
+                    let ptr = usize::try_from(page_start).map_err(|_| MemoryError::OutOfBounds {
+                        address,
+                        length: len,
+                    })? as *mut libc::c_void;
+                    if unsafe { libc::mprotect(ptr, page_len, host_prot) } != 0 {
+                        return Err(MemoryError::HostMap(format!(
+                            "mprotect native Darwin host page 0x{page_start:x}: {}",
+                            std::io::Error::last_os_error()
+                        )));
+                    }
+                    Ok(())
+                },
+            )
+        };
+        result?;
+        if old_exec || prot & crate::linux_abi::LINUX_PROT_EXEC != 0 {
+            self.note_dsr_code_mutation(address, len)?;
+        }
+        Ok(())
     }
 
     fn unmap_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
@@ -7412,16 +7562,27 @@ fn linux_prot_to_native(prot: u64) -> libc::c_int {
     host_prot
 }
 
-fn native16k_host_prot(prot: u64) -> libc::c_int {
+fn native16k_host_prot(
+    prot: u64,
+    native_code_mode: carrick_spec::NativeCodeModeRequest,
+) -> libc::c_int {
     let mut host_prot = linux_prot_to_native(prot);
     let write_exec = crate::linux_abi::LINUX_PROT_WRITE | crate::linux_abi::LINUX_PROT_EXEC;
     if prot & write_exec == write_exec {
         host_prot &= !libc::PROT_WRITE;
     }
+    if native_code_mode == carrick_spec::NativeCodeModeRequest::Dsr
+        && prot & crate::linux_abi::LINUX_PROT_EXEC != 0
+    {
+        host_prot = (host_prot & !libc::PROT_EXEC) | libc::PROT_READ;
+    }
     host_prot
 }
 
-fn map_region(region: &MemoryRegion, rewrite_guest_code: bool) -> Result<(), RuntimeError> {
+fn map_region(
+    region: &MemoryRegion,
+    native_code_mode: carrick_spec::NativeCodeModeRequest,
+) -> Result<(), RuntimeError> {
     let length_u64 = region.end.checked_sub(region.start).ok_or_else(|| {
         RuntimeError::Unsupported("native Darwin empty inverted region".to_string())
     })?;
@@ -7474,14 +7635,17 @@ fn map_region(region: &MemoryRegion, rewrite_guest_code: bool) -> Result<(), Run
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), mapped.cast::<u8>(), bytes.len());
         }
     }
-    if region.perms.execute && rewrite_guest_code {
+    if region.perms.execute && native_code_mode == carrick_spec::NativeCodeModeRequest::Brk {
         patch_syscalls(mapped.cast::<u8>(), bytes.len());
     }
     if region.perms.execute {
         unsafe { carrick_native_clear_icache(mapped, bytes.len()) };
     }
 
-    let prot = region_prot(region);
+    let mut prot = region_prot(region);
+    if region.perms.execute && native_code_mode == carrick_spec::NativeCodeModeRequest::Dsr {
+        prot = (prot & !libc::PROT_EXEC) | libc::PROT_READ;
+    }
     let protect = unsafe { libc::mprotect(mapped, length, prot) };
     if protect != 0 {
         return Err(last_io_error(&format!(
@@ -7498,7 +7662,7 @@ fn map_bytes_region(
     bytes: &[u8],
     final_prot: libc::c_int,
     executable: bool,
-    rewrite_guest_code: bool,
+    native_code_mode: carrick_spec::NativeCodeModeRequest,
 ) -> Result<(), RuntimeError> {
     let length = usize::try_from(length_u64).map_err(|_| {
         RuntimeError::Unsupported(format!(
@@ -7544,12 +7708,17 @@ fn map_bytes_region(
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), mapped.cast::<u8>(), bytes.len());
         }
     }
-    if executable && rewrite_guest_code {
+    if executable && native_code_mode == carrick_spec::NativeCodeModeRequest::Brk {
         patch_syscalls(mapped.cast::<u8>(), bytes.len());
     }
     if executable {
         unsafe { carrick_native_clear_icache(mapped, bytes.len()) };
     }
+    let final_prot = if executable && native_code_mode == carrick_spec::NativeCodeModeRequest::Dsr {
+        (final_prot & !libc::PROT_EXEC) | libc::PROT_READ
+    } else {
+        final_prot
+    };
     let protect = unsafe { libc::mprotect(mapped, length, final_prot) };
     if protect != 0 {
         return Err(last_io_error(&format!(
@@ -7648,7 +7817,10 @@ const fn movz_x_lsl32(imm16: u16) -> u32 {
 /// multiples (const-asserted above), so retargeting is a pure immediate swap.
 /// This pass runs ONLY on carrick's own vDSO page — never on guest-owned code,
 /// where an immediate rewrite would corrupt legitimate instructions.
-fn relocate_vdso_vvar_loads(region: &MemoryRegion) -> Result<(), RuntimeError> {
+fn relocate_vdso_vvar_loads(
+    region: &MemoryRegion,
+    native_code_mode: carrick_spec::NativeCodeModeRequest,
+) -> Result<(), RuntimeError> {
     let length = region.bytes().len();
     let base = usize::try_from(region.start).map_err(|_| {
         RuntimeError::Unsupported(format!(
@@ -7670,7 +7842,12 @@ fn relocate_vdso_vvar_loads(region: &MemoryRegion) -> Result<(), RuntimeError> {
         }
     }
     unsafe { carrick_native_clear_icache(base.cast(), length) };
-    if unsafe { libc::mprotect(base.cast(), length, libc::PROT_READ | libc::PROT_EXEC) } != 0 {
+    let final_prot = if native_code_mode == carrick_spec::NativeCodeModeRequest::Dsr {
+        libc::PROT_READ
+    } else {
+        libc::PROT_READ | libc::PROT_EXEC
+    };
+    if unsafe { libc::mprotect(base.cast(), length, final_prot) } != 0 {
         return Err(last_io_error("restore native Darwin vdso page protections"));
     }
     Ok(())
@@ -8127,6 +8304,54 @@ mod tests {
     }
 
     #[test]
+    fn dsr_original_executable_page_is_a_nonexecute_backstop() {
+        let address = 0x70_0000_0000_u64;
+        let image = AddressSpace::from_segments(
+            address,
+            [(
+                address,
+                carrick_mem::elf::SegmentPerms {
+                    read: true,
+                    write: false,
+                    execute: true,
+                },
+                0xd65f_03c0_u32.to_le_bytes().to_vec(),
+                16 * 1024,
+            )],
+        )
+        .expect("build direct-entry image");
+        map_region(
+            &image.regions()[0],
+            carrick_spec::NativeCodeModeRequest::Dsr,
+        )
+        .expect("map DSR original code page");
+
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork direct-entry child");
+        if pid == 0 {
+            unsafe {
+                libc::signal(libc::SIGBUS, libc::SIG_DFL);
+                libc::signal(libc::SIGSEGV, libc::SIG_DFL);
+            }
+            let original: unsafe extern "C" fn() = unsafe {
+                std::mem::transmute(usize::try_from(address).expect("direct-entry address"))
+            };
+            unsafe { original() };
+            unsafe { libc::_exit(0) };
+        }
+        let status = waitpid_blocking(pid).expect("wait direct-entry child");
+        assert!(libc::WIFSIGNALED(status));
+        assert!(matches!(
+            libc::WTERMSIG(status),
+            libc::SIGSEGV | libc::SIGBUS
+        ));
+        assert_eq!(
+            unsafe { libc::munmap(address as *mut libc::c_void, 16 * 1024) },
+            0
+        );
+    }
+
+    #[test]
     fn native_fd_wait_deadline_survives_wait_variant_changes() {
         let now = Instant::now();
         let existing = now + Duration::from_secs(10);
@@ -8225,6 +8450,8 @@ mod tests {
             host_page_size: 16 * 1024,
             linux_page_size: 16 * 1024,
             native_code_mode: carrick_spec::NativeCodeModeRequest::Brk,
+            dsr_generations: dsr::cache::PageGenerationTable::new(16 * 1024)
+                .expect("generation table"),
         };
         NativeSignalTrap::new(&mut memory, restored, None).commit();
 
@@ -8263,6 +8490,8 @@ mod tests {
             host_page_size: 16 * 1024,
             linux_page_size: 16 * 1024,
             native_code_mode: carrick_spec::NativeCodeModeRequest::Brk,
+            dsr_generations: dsr::cache::PageGenerationTable::new(16 * 1024)
+                .expect("generation table"),
         };
         let mut interrupted = NativeUcontextSnapshot {
             sp: stack_end,
@@ -8391,6 +8620,8 @@ mod tests {
             host_page_size: 16 * 1024,
             linux_page_size: 16 * 1024,
             native_code_mode: carrick_spec::NativeCodeModeRequest::Brk,
+            dsr_generations: dsr::cache::PageGenerationTable::new(16 * 1024)
+                .expect("generation table"),
         };
         let interrupted = NativeUcontextSnapshot {
             sp: stack_end,
@@ -9387,6 +9618,53 @@ mod tests {
                 })
                 .is_ok_and(|word| word == BRK_NATIVE_SYSCALL);
             unsafe { libc::_exit(i32::from(!patched)) };
+        }
+
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFEXITED(status), "child status was 0x{status:x}");
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+    }
+
+    #[test]
+    fn native16k_dsr_exec_protection_preserves_linux_syscall_words() {
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            let page_size = 16 * 1024_u64;
+            let layout = MemoryLayout {
+                heap_base: NATIVE_DARWIN_HEAP_BASE,
+                heap_size: page_size,
+                mmap_base: NATIVE_DARWIN_MMAP_BASE,
+                mmap_size: page_size,
+            };
+            let image = AddressSpace::from_regions(0, Vec::new())
+                .expect("empty native test image should be valid");
+            let preserved = NativeMappedMemory::map_with_code_mode(
+                &image,
+                layout,
+                page_size,
+                page_size,
+                carrick_spec::NativeCodeModeRequest::Dsr,
+            )
+            .and_then(|mut memory| {
+                memory
+                    .protect_range(layout.mmap_base, page_size as usize, 0)
+                    .map_err(|err| RuntimeError::Unsupported(format!("test reserve: {err}")))?;
+                memory
+                    .write_bytes_unchecked(layout.mmap_base, &SVC_0.to_le_bytes())
+                    .map_err(|err| RuntimeError::Unsupported(format!("test write: {err}")))?;
+                memory
+                    .protect_range(
+                        layout.mmap_base,
+                        page_size as usize,
+                        crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_EXEC,
+                    )
+                    .map_err(|err| RuntimeError::Unsupported(format!("test protect: {err}")))?;
+                memory.read_u32(layout.mmap_base)
+            })
+            .is_ok_and(|word| word == SVC_0);
+            unsafe { libc::_exit(i32::from(!preserved)) };
         }
 
         let mut status = 0;

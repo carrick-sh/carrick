@@ -993,6 +993,58 @@ fn dsr_virtual_x28_rewrites_destination_and_distinct_x17_operand() {
 }
 
 #[test]
+fn dsr_generation_guard_rejects_stale_block_before_guest_instruction() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let generation = AtomicU64::new(CodeGeneration::INITIAL.get());
+    let guest = GuestVa(0x1b_200);
+    let plan = BlockPlan {
+        start: guest,
+        end: GuestVa(guest.raw() + 8),
+        generation: CodeGeneration::INITIAL,
+        instructions: vec![PlannedInst {
+            guest,
+            action: InstAction::Copy(0x9100_0400), // add x0, x0, #1
+        }],
+        exit: PlannedExit::Syscall {
+            guest: GuestVa(guest.raw() + 4),
+            resume: GuestVa(guest.raw() + 8),
+        },
+    };
+    let mut cache = TranslationCache::new(16 * 1024).expect("allocate generation guard cache");
+    let emitted = super::emit::emit_block_with_generation(
+        &mut cache,
+        &plan,
+        super::emit::GenerationGuard::new(&generation, CodeGeneration::INITIAL),
+    )
+    .expect("emit guarded block");
+    let mut stack = vec![0_u8; 16 * 1024];
+    let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    let original_x0 = snapshot.x[0];
+    let mut exit = NativeDsrExit::Syscall {
+        resume: GuestVa(guest.raw() + 8),
+    };
+    enter_translated(emitted.entry(), &mut snapshot, &mut exit).expect("execute current block");
+    assert_eq!(snapshot.x[0], original_x0 + 1);
+
+    generation.store(1, Ordering::Release);
+    snapshot.x[0] = original_x0;
+    snapshot.pc = guest.raw();
+    enter_translated(emitted.entry(), &mut snapshot, &mut exit).expect("reject stale block");
+    assert_eq!(
+        snapshot.x[0], original_x0,
+        "stale guest instruction executed"
+    );
+    assert_eq!(
+        exit,
+        NativeDsrExit::ResolveDirect {
+            source: guest,
+            target: guest,
+        }
+    );
+}
+
+#[test]
 fn dsr_vdso_x18_rewrites_match_native_execution() {
     let words = [
         0x2941_0c12,

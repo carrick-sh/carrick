@@ -1,16 +1,225 @@
 #![allow(dead_code)] // Cache publication is wired into block emission in Task 4.
 
+use std::collections::BTreeMap;
+use std::ops::Range;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use carrick_guest_mem::HostVa;
+use carrick_guest_mem::{GuestVa, HostVa};
+use parking_lot::RwLock;
 
-use super::types::{CacheOffset, CacheVa, DsrError};
+use super::types::{CacheOffset, CacheVa, CodeGeneration, DsrError};
+
+pub(in crate::native_darwin) struct PageGenerationTable {
+    page_size: u64,
+    next: AtomicU64,
+    pages: RwLock<BTreeMap<GuestVa, Arc<AtomicU64>>>,
+}
+
+#[derive(Clone)]
+pub(in crate::native_darwin) struct PageGenerationObservation {
+    page: GuestVa,
+    expected: CodeGeneration,
+    current: Arc<AtomicU64>,
+}
+
+impl PageGenerationObservation {
+    pub(super) const fn page(&self) -> GuestVa {
+        self.page
+    }
+
+    pub(super) const fn expected(&self) -> CodeGeneration {
+        self.expected
+    }
+
+    pub(super) fn current(&self) -> CodeGeneration {
+        CodeGeneration::claimed(self.current.load(Ordering::Acquire))
+    }
+
+    pub(super) fn current_atomic(&self) -> &AtomicU64 {
+        &self.current
+    }
+}
+
+impl PageGenerationTable {
+    pub(in crate::native_darwin) fn new(page_size: u64) -> Result<Self, DsrError> {
+        if page_size == 0 || !page_size.is_power_of_two() {
+            return Err(DsrError::CachePolicy(format!(
+                "DSR generation page size must be a nonzero power of two, got {page_size}"
+            )));
+        }
+        Ok(Self {
+            page_size,
+            next: AtomicU64::new(CodeGeneration::INITIAL.get()),
+            pages: RwLock::new(BTreeMap::new()),
+        })
+    }
+
+    pub(in crate::native_darwin) fn note_guest_code_write(
+        &self,
+        range: Range<GuestVa>,
+    ) -> Result<CodeGeneration, DsrError> {
+        if range.start.raw() >= range.end.raw() {
+            return Err(DsrError::CachePolicy(format!(
+                "DSR code mutation range is empty or reversed: 0x{:x}..0x{:x}",
+                range.start.raw(),
+                range.end.raw()
+            )));
+        }
+        let generation = self
+            .next
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_add(1)
+            })
+            .map(|previous| CodeGeneration::claimed(previous + 1))
+            .map_err(|_| DsrError::CachePolicy("DSR code generation overflow".to_string()))?;
+        let page_mask = self.page_size - 1;
+        let mut page = range.start.raw() & !page_mask;
+        let last = range.end.raw().saturating_sub(1) & !page_mask;
+        let mut pages = self.pages.write();
+        loop {
+            pages
+                .entry(GuestVa(page))
+                .or_insert_with(|| Arc::new(AtomicU64::new(CodeGeneration::INITIAL.get())))
+                .store(generation.get(), Ordering::Release);
+            if page == last {
+                break;
+            }
+            page = page.checked_add(self.page_size).ok_or_else(|| {
+                DsrError::CachePolicy("DSR generation page range overflow".to_string())
+            })?;
+        }
+        Ok(generation)
+    }
+
+    pub(in crate::native_darwin) fn invalidate_page(
+        &self,
+        page: GuestVa,
+        generation: CodeGeneration,
+    ) -> Result<(), DsrError> {
+        let page = GuestVa(page.raw() & !(self.page_size - 1));
+        let observed = self.generation_for_pc(page)?;
+        if observed != generation {
+            return Err(DsrError::GenerationChanged {
+                page: page.raw(),
+                expected: generation.get(),
+                observed: observed.get(),
+            });
+        }
+        Ok(())
+    }
+
+    pub(in crate::native_darwin) fn generation_for_pc(
+        &self,
+        pc: GuestVa,
+    ) -> Result<CodeGeneration, DsrError> {
+        let page = GuestVa(pc.raw() & !(self.page_size - 1));
+        Ok(self
+            .pages
+            .read()
+            .get(&page)
+            .map(|generation| CodeGeneration::claimed(generation.load(Ordering::Acquire)))
+            .unwrap_or(CodeGeneration::INITIAL))
+    }
+
+    pub(in crate::native_darwin) fn observe(
+        &self,
+        pc: GuestVa,
+    ) -> Result<PageGenerationObservation, DsrError> {
+        let page = GuestVa(pc.raw() & !(self.page_size - 1));
+        let current = self
+            .pages
+            .write()
+            .entry(page)
+            .or_insert_with(|| Arc::new(AtomicU64::new(CodeGeneration::INITIAL.get())))
+            .clone();
+        let expected = CodeGeneration::claimed(current.load(Ordering::Acquire));
+        Ok(PageGenerationObservation {
+            page,
+            expected,
+            current,
+        })
+    }
+
+    pub(in crate::native_darwin) fn is_current(
+        &self,
+        pc: GuestVa,
+        generation: CodeGeneration,
+    ) -> Result<bool, DsrError> {
+        Ok(self.generation_for_pc(pc)? == generation)
+    }
+
+    pub(in crate::native_darwin) fn fork_view(&self) -> Self {
+        let pages = self
+            .pages
+            .read()
+            .iter()
+            .map(|(page, generation)| {
+                (
+                    *page,
+                    Arc::new(AtomicU64::new(generation.load(Ordering::Acquire))),
+                )
+            })
+            .collect();
+        Self {
+            page_size: self.page_size,
+            next: AtomicU64::new(self.next.load(Ordering::Acquire)),
+            pages: RwLock::new(pages),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct LinkSite {
     pub(super) source: CacheVa,
     pub(super) slot: CacheOffset,
+}
+
+#[derive(Default)]
+pub(super) struct PageBlockDependencies {
+    blocks: BTreeMap<GuestVa, Vec<(GuestVa, CodeGeneration)>>,
+}
+
+impl PageBlockDependencies {
+    pub(super) fn record(&mut self, page: GuestVa, block: GuestVa, generation: CodeGeneration) {
+        let blocks = self.blocks.entry(page).or_default();
+        if !blocks.contains(&(block, generation)) {
+            blocks.push((block, generation));
+        }
+    }
+
+    pub(super) fn invalidate_page(
+        &mut self,
+        page: GuestVa,
+        current: CodeGeneration,
+    ) -> Vec<(GuestVa, CodeGeneration)> {
+        let Some(blocks) = self.blocks.get_mut(&page) else {
+            return Vec::new();
+        };
+        let mut stale = Vec::new();
+        blocks.retain(|dependency| {
+            if dependency.1 == current {
+                true
+            } else {
+                stale.push(*dependency);
+                false
+            }
+        });
+        stale
+    }
+
+    #[cfg(test)]
+    pub(super) fn contains(
+        &self,
+        page: GuestVa,
+        block: GuestVa,
+        generation: CodeGeneration,
+    ) -> bool {
+        self.blocks
+            .get(&page)
+            .is_some_and(|blocks| blocks.contains(&(block, generation)))
+    }
 }
 
 pub(super) struct PublishedCode {
@@ -35,7 +244,7 @@ pub(super) struct TranslationCache {
 }
 
 impl TranslationCache {
-    pub(super) fn new(requested_capacity: usize) -> Result<Self, DsrError> {
+    pub(in crate::native_darwin) fn new(requested_capacity: usize) -> Result<Self, DsrError> {
         if requested_capacity == 0 {
             return Err(DsrError::CachePolicy(
                 "translation cache capacity must be nonzero".to_string(),
@@ -217,5 +426,124 @@ impl Drop for CacheWriter<'_> {
         if self.write_enabled {
             unsafe { libc::pthread_jit_write_protect_np(1) };
         }
+    }
+}
+
+#[cfg(test)]
+mod generation_tests {
+    use std::ops::Range;
+
+    use carrick_guest_mem::GuestVa;
+    use proptest::prelude::*;
+
+    use super::super::types::CodeGeneration;
+    use super::PageGenerationTable;
+
+    const PAGE_SIZE: u64 = 0x4000;
+    const PAGE: GuestVa = GuestVa(0x20_000);
+
+    #[derive(Clone, Copy, Debug)]
+    enum Operation {
+        Write(u8),
+        ProtectExecutable,
+        Translate,
+        Execute,
+        ForkView,
+        Unmap,
+    }
+
+    fn operation_strategy() -> impl Strategy<Value = Operation> {
+        prop_oneof![
+            any::<u8>().prop_map(Operation::Write),
+            Just(Operation::ProtectExecutable),
+            Just(Operation::Translate),
+            Just(Operation::Execute),
+            Just(Operation::ForkView),
+            Just(Operation::Unmap),
+        ]
+    }
+
+    proptest! {
+        #[test]
+        fn dsr_generation_never_executes_stale_published_bytes(
+            operations in prop::collection::vec(operation_strategy(), 1..128)
+        ) {
+            let generations = PageGenerationTable::new(PAGE_SIZE).expect("generation table");
+            let mut current_value = None;
+            let mut published = None;
+
+            for operation in operations {
+                match operation {
+                    Operation::Write(value) => {
+                        current_value = Some(value);
+                        generations.note_guest_code_write(page_range()).expect("note write");
+                    }
+                    Operation::ProtectExecutable => {
+                        generations.note_guest_code_write(page_range()).expect("note protection transition");
+                    }
+                    Operation::Translate => {
+                        if let Some(value) = current_value {
+                            let generation = generations.generation_for_pc(PAGE).expect("page generation");
+                            published = Some((generation, value));
+                        }
+                    }
+                    Operation::Execute => {
+                        if let Some((generation, value)) = published
+                            && generations.is_current(PAGE, generation).expect("current generation")
+                        {
+                            prop_assert_eq!(Some(value), current_value);
+                        }
+                    }
+                    Operation::ForkView => {
+                        let child = generations.fork_view();
+                        prop_assert_eq!(
+                            child.generation_for_pc(PAGE).expect("child generation"),
+                            generations.generation_for_pc(PAGE).expect("parent generation"),
+                        );
+                    }
+                    Operation::Unmap => {
+                        current_value = None;
+                        let generation = generations.note_guest_code_write(page_range()).expect("note unmap");
+                        generations.invalidate_page(PAGE, generation).expect("invalidate page");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dsr_generation_observation_tracks_page_mutations_at_stable_address() {
+        let generations = PageGenerationTable::new(PAGE_SIZE).expect("generation table");
+        let observation = generations.observe(PAGE).expect("observe page");
+        assert_eq!(observation.expected(), CodeGeneration::INITIAL);
+        assert_eq!(observation.current(), CodeGeneration::INITIAL);
+
+        let changed = generations
+            .note_guest_code_write(page_range())
+            .expect("note write");
+        assert_eq!(observation.current(), changed);
+        assert_ne!(observation.current(), observation.expected());
+    }
+
+    #[test]
+    fn dsr_generation_reverse_dependencies_retire_only_stale_page_blocks() {
+        let mut dependencies = super::PageBlockDependencies::default();
+        let first = GuestVa(PAGE.raw() + 0x100);
+        let second = GuestVa(PAGE.raw() + 0x200);
+        let other_page = GuestVa(PAGE.raw() + PAGE_SIZE);
+        dependencies.record(PAGE, first, CodeGeneration::INITIAL);
+        dependencies.record(PAGE, second, CodeGeneration::claimed(1));
+        dependencies.record(other_page, other_page, CodeGeneration::INITIAL);
+
+        assert_eq!(
+            dependencies.invalidate_page(PAGE, CodeGeneration::claimed(1)),
+            vec![(first, CodeGeneration::INITIAL)]
+        );
+        assert!(dependencies.contains(PAGE, second, CodeGeneration::claimed(1)));
+        assert!(dependencies.contains(other_page, other_page, CodeGeneration::INITIAL));
+    }
+
+    fn page_range() -> Range<GuestVa> {
+        PAGE..GuestVa(PAGE.raw() + PAGE_SIZE)
     }
 }

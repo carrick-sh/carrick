@@ -1,13 +1,14 @@
 #![allow(dead_code)] // Emitted blocks enter the context gateway in Task 5.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::AtomicU64;
 
 use carrick_guest_mem::GuestVa;
 use dynasmrt::{DynasmApi, DynasmLabelApi, VecAssembler, aarch64::Aarch64Relocation};
 
 use super::block::{BlockPlan, PlannedExit};
 use super::cache::{PublishedCode, TranslationCache};
-use super::types::{CacheOffset, CacheVa, DsrError, InstAction};
+use super::types::{CacheOffset, CacheVa, CodeGeneration, DsrError, InstAction};
 
 const BRK_DSR_CONTINUE: u32 = 0xd43a_0020;
 const BRK_DSR_SYSCALL: u32 = 0xd43a_0040;
@@ -65,6 +66,21 @@ pub(super) struct EmittedBlock {
     map: InstructionMap,
     direct_links: Vec<DirectLink>,
     recovery: Vec<RecoveryEntry>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct GenerationGuard {
+    address: u64,
+    expected: CodeGeneration,
+}
+
+impl GenerationGuard {
+    pub(super) fn new(current: &AtomicU64, expected: CodeGeneration) -> Self {
+        Self {
+            address: current as *const AtomicU64 as u64,
+            expected,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -866,15 +882,82 @@ pub(super) fn emit_block(
     cache: &mut TranslationCache,
     plan: &BlockPlan,
 ) -> Result<EmittedBlock, DsrError> {
+    emit_block_inner(cache, plan, None)
+}
+
+pub(super) fn emit_block_with_generation(
+    cache: &mut TranslationCache,
+    plan: &BlockPlan,
+    guard: GenerationGuard,
+) -> Result<EmittedBlock, DsrError> {
+    emit_block_inner(cache, plan, Some(guard))
+}
+
+fn emit_block_inner(
+    cache: &mut TranslationCache,
+    plan: &BlockPlan,
+    guard: Option<GenerationGuard>,
+) -> Result<EmittedBlock, DsrError> {
     let mut assembler = VecAssembler::<Aarch64Relocation>::new(0);
     let mut entries = Vec::with_capacity(plan.instructions.len() + 8);
     let mut direct_links = Vec::new();
     let mut recovery = Vec::new();
+    let stale = guard.map(|_| assembler.new_dynamic_label());
     map_next(&assembler, &mut entries, plan.start)?;
-    dynasmrt::dynasm!(assembler
-        ; .arch aarch64
-        ; ldr x17, [x28, #136]
-    );
+    if let (Some(guard), Some(stale)) = (guard, stale) {
+        dynasmrt::dynasm!(assembler
+            ; .arch aarch64
+            ; str x16, [x28, #1120]
+        );
+        emit_word(
+            &mut assembler,
+            &mut entries,
+            plan.start,
+            0xd53b_4211, // mrs x17, nzcv
+        )?;
+        map_next(&assembler, &mut entries, plan.start)?;
+        dynasmrt::dynasm!(assembler
+            ; .arch aarch64
+            ; str x17, [x28, #264]
+        );
+        emit_mov_u64(&mut assembler, &mut entries, plan.start, 16, guard.address)?;
+        map_next(&assembler, &mut entries, plan.start)?;
+        dynasmrt::dynasm!(assembler
+            ; .arch aarch64
+            ; ldar x16, [x16]
+        );
+        emit_mov_u64(
+            &mut assembler,
+            &mut entries,
+            plan.start,
+            17,
+            guard.expected.get(),
+        )?;
+        map_next(&assembler, &mut entries, plan.start)?;
+        dynasmrt::dynasm!(assembler
+            ; .arch aarch64
+            ; cmp x16, x17
+            ; b.ne =>stale
+            ; ldr x17, [x28, #264]
+        );
+        emit_word(
+            &mut assembler,
+            &mut entries,
+            plan.start,
+            0xd51b_4211, // msr nzcv, x17
+        )?;
+        map_next(&assembler, &mut entries, plan.start)?;
+        dynasmrt::dynasm!(assembler
+            ; .arch aarch64
+            ; ldr x16, [x28, #1120]
+            ; ldr x17, [x28, #136]
+        );
+    } else {
+        dynasmrt::dynasm!(assembler
+            ; .arch aarch64
+            ; ldr x17, [x28, #136]
+        );
+    }
     for instruction in &plan.instructions {
         let word = match instruction.action {
             InstAction::Copy(word) => word,
@@ -1116,6 +1199,35 @@ pub(super) fn emit_block(
     } else {
         map_next(&assembler, &mut entries, exit_guest)?;
         assembler.push_u32(exit_word(plan)?);
+    }
+    if let Some(stale) = stale {
+        map_next(&assembler, &mut entries, plan.start)?;
+        dynasmrt::dynasm!(assembler
+            ; .arch aarch64
+            ; =>stale
+            ; ldr x17, [x28, #264]
+        );
+        emit_word(
+            &mut assembler,
+            &mut entries,
+            plan.start,
+            0xd51b_4211, // msr nzcv, x17
+        )?;
+        map_next(&assembler, &mut entries, plan.start)?;
+        dynasmrt::dynasm!(assembler
+            ; .arch aarch64
+            ; ldr x16, [x28, #1120]
+            ; ldr x17, [x28, #136]
+        );
+        emit_gateway_exit(
+            &mut assembler,
+            &mut entries,
+            plan.start,
+            plan.start,
+            Some(plan.start),
+            2,
+            super::gateway::direct_exit_address(),
+        )?;
     }
     let bytes = assembler
         .finalize()
