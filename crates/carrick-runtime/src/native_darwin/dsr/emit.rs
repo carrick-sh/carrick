@@ -1067,6 +1067,15 @@ fn emit_block_inner(
             ; .arch aarch64
             ; b.ne =>stale
         );
+        // A direct-linked chain can enter the gateway from a different block
+        // than the one that began this translated run. Publish this block's
+        // generation so sensitive-exit metadata is resolved against the block
+        // that actually produced the exit.
+        map_next(&assembler, &mut entries, plan.start)?;
+        dynasmrt::dynasm!(assembler
+            ; .arch aarch64
+            ; str x17, [x28, super::gateway::CTX_GENERATION]
+        );
         map_next(&assembler, &mut entries, plan.start)?;
         dynasmrt::dynasm!(assembler
             ; .arch aarch64

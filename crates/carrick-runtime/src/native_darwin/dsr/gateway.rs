@@ -123,9 +123,9 @@ impl DsrContext {
                 link.map_or(0, carrick_guest_mem::GuestVa::raw),
                 u32::from(link.is_some()),
             ),
-            NativeDsrExit::Sensitive { guest_pc, resume } => {
-                (resume.raw(), guest_pc.raw(), 6, 0, 0)
-            }
+            NativeDsrExit::Sensitive {
+                guest_pc, resume, ..
+            } => (resume.raw(), guest_pc.raw(), 6, 0, 0),
             NativeDsrExit::Unsupported { guest_pc, .. } => {
                 (guest_pc.raw(), guest_pc.raw(), 7, 0, 0)
             }
@@ -316,6 +316,7 @@ fn enter_translated_raw(
         6 => NativeDsrExit::Sensitive {
             guest_pc: carrick_guest_mem::GuestVa(context.exit_source),
             resume: carrick_guest_mem::GuestVa(context.exit_target),
+            generation: CodeGeneration::claimed(context.generation),
         },
         7 => NativeDsrExit::Unsupported {
             guest_pc: carrick_guest_mem::GuestVa(context.exit_source),
