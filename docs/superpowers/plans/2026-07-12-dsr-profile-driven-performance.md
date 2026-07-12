@@ -966,6 +966,12 @@ The next mapping attempt requires finer `mmap`/copy/publication/protection/vvar
 attribution; do not repeat this candidate or infer that all mapping work is
 cache maintenance.
 
+The approved follow-up is
+`docs/superpowers/plans/2026-07-12-dsr-exec-map-decomposition.md`. It adds only
+exec-scoped nested profiling, reconciles five detail totals against every outer
+image-map sample, and requires a stable component above 30% before authorizing
+another mapping optimization.
+
 ---
 
 ### Task 10: Establish a low-perturbation gateway benchmark
