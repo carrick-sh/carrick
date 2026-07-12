@@ -28,6 +28,16 @@ pub(super) enum ThreadExit {
     Unsupported(String),
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct PreparedEntry {
+    entry: types::CacheVa,
+    generation: types::CodeGeneration,
+}
+
+pub(super) struct PreparedExit {
+    exit: types::NativeDsrExit,
+}
+
 pub(super) struct ThreadTranslator {
     process: Arc<ProcessTranslator>,
     resume_entry: Option<(
@@ -331,11 +341,11 @@ impl ThreadTranslator {
         }
     }
 
-    pub(super) fn enter_once(
+    pub(super) fn prepare_entry(
         &mut self,
         memory: &super::NativeMappedMemory,
-        snapshot: &mut super::NativeUcontextSnapshot,
-    ) -> Result<ThreadExit, types::DsrError> {
+        snapshot: &super::NativeUcontextSnapshot,
+    ) -> Result<PreparedEntry, types::DsrError> {
         let guest = carrick_guest_mem::GuestVa(snapshot.pc);
         let (entry, generation) = match self.resume_entry.take() {
             Some((cached_guest, generation, entry))
@@ -347,11 +357,34 @@ impl ThreadTranslator {
             }
             _ => self.translate(memory, guest)?,
         };
+        Ok(PreparedEntry { entry, generation })
+    }
+
+    pub(super) fn enter_prepared(
+        &mut self,
+        prepared: PreparedEntry,
+        snapshot: &mut super::NativeUcontextSnapshot,
+    ) -> Result<PreparedExit, types::DsrError> {
         let mut exit = types::NativeDsrExit::Syscall {
             resume: carrick_guest_mem::GuestVa(snapshot.pc),
         };
-        gateway::enter_translated_with_cache(entry, snapshot, &mut exit, &self.indirect_cache)?;
-        Ok(match exit {
+        gateway::enter_translated_with_cache(
+            prepared.entry,
+            snapshot,
+            &mut exit,
+            &self.indirect_cache,
+        )?;
+        Ok(PreparedExit { exit })
+    }
+
+    pub(super) fn finish_exit(
+        &mut self,
+        memory: &super::NativeMappedMemory,
+        snapshot: &mut super::NativeUcontextSnapshot,
+        prepared: PreparedEntry,
+        exit: PreparedExit,
+    ) -> Result<ThreadExit, types::DsrError> {
+        Ok(match exit.exit {
             types::NativeDsrExit::Syscall { resume } => ThreadExit::Syscall { resume },
             types::NativeDsrExit::ResolveDirect { target, .. } => {
                 self.translate(memory, target)?;
@@ -371,7 +404,7 @@ impl ThreadTranslator {
                     .state
                     .lock()
                     .sensitive
-                    .get(&(guest_pc, generation))
+                    .get(&(guest_pc, prepared.generation))
                     .copied()
                     .ok_or_else(|| {
                         types::DsrError::BlockPolicy(format!(
@@ -387,7 +420,7 @@ impl ThreadTranslator {
                     .state
                     .lock()
                     .unsupported
-                    .get(&(guest_pc, generation))
+                    .get(&(guest_pc, prepared.generation))
                     .copied()
                     .ok_or_else(|| {
                         types::DsrError::BlockPolicy(format!(
