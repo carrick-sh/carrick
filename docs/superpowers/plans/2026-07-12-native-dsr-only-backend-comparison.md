@@ -263,7 +263,10 @@ scripts/run-probe.sh nativebrk
 rg -n "NativeCodeModeRequest|native_code_mode|native-code-mode|CARRICK_NATIVE_CODE_MODE|BRK_NATIVE_|BRK_DSR_|legacy_brk_round_trip|patch_syscalls|decode_native_trap" crates bench-native conformance-probes scripts README.md
 ```
 
-Expected: tests/clippy pass, `MATCH nativebrk`, and the final audit has no matches.
+Expected: tests/clippy pass and `MATCH nativebrk`. The audit may match only the
+exact negative CLI rejection fixture and the old-JSON serde compatibility
+fixture; list those matches explicitly. Any production, runtime-state, script,
+or current-documentation match fails the task.
 
 - [ ] **Step 8: Commit**
 
@@ -278,6 +281,10 @@ Verified: focused tests, clippy with warnings denied, and native BRK transport a
 
 Co-Authored-By: Codex <codex@openai.com>"
 ```
+
+The Task 1 audit may list only the exact negative CLI rejection and old-JSON
+serde compatibility fixtures. Any production, runtime-state, script, or
+current-documentation match fails this verification.
 
 ---
 
@@ -321,6 +328,10 @@ Verified: nativebrk Carrick/Docker MATCH, lane tests, and current-doc mode audit
 
 Co-Authored-By: Codex <codex@openai.com>"
 ```
+
+The current-documentation audit may list only the exact negative CLI rejection and
+old-JSON serde compatibility fixtures. Any other match is a remaining removal
+gap and must be fixed before the evidence commit.
 
 ---
 
@@ -737,6 +748,10 @@ Verified: RUST_TEST_THREADS=1 just ci; signed workload suite; authoritative nati
 
 Co-Authored-By: Codex <codex@openai.com>"
 ```
+
+The final source audit may list only the exact negative CLI rejection and
+old-JSON serde compatibility fixtures. Any other match is a remaining removal
+gap and must be fixed before the evidence commit.
 
 ---
 
