@@ -83,6 +83,209 @@ pub struct UlockRequeueProbe {
     pub to_logical_wake: u32,
 }
 
+macro_rules! dsr_ordinal_enum {
+    (
+        $(#[$meta:meta])*
+        pub enum $name:ident {
+            $($variant:ident = $value:expr),+ $(,)?
+        }
+    ) => {
+        $(#[$meta])*
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        #[repr(u32)]
+        pub enum $name {
+            $($variant = $value),+
+        }
+
+        impl $name {
+            pub const ALL: [Self; dsr_ordinal_enum!(@count $($variant),+)] = [
+                $(Self::$variant),+
+            ];
+
+            #[inline(always)]
+            pub const fn raw(self) -> u32 {
+                self as u32
+            }
+        }
+    };
+    (@count $($variant:ident),+) => {
+        <[()]>::len(&[$(dsr_ordinal_enum!(@unit $variant)),+])
+    };
+    (@unit $variant:ident) => { () };
+}
+
+dsr_ordinal_enum! {
+    /// Typed reason a translated DSR run slice returned to Rust.
+    pub enum DsrExitKind {
+        Syscall = 1,
+        DirectResolver = 2,
+        IndirectResolver = 3,
+        Fault = 4,
+        Kick = 5,
+        Sensitive = 6,
+        Unsupported = 7,
+    }
+}
+
+dsr_ordinal_enum! {
+    /// Result of preparing a guest PC for translated execution.
+    pub enum DsrPrepareOutcome {
+        ResumeEntryHit = 1,
+        BlockIndexHit = 2,
+        Translated = 3,
+        Failed = 4,
+    }
+}
+
+dsr_ordinal_enum! {
+    /// Stable diagnostic category for a DSR operation result.
+    pub enum DsrOperationOutcome {
+        Success = 0,
+        PcOverflow = 1,
+        Decode = 2,
+        Malformed = 3,
+        BlockPolicy = 4,
+        MemoryRead = 5,
+        UnsupportedBlockAction = 6,
+        Assembler = 7,
+        Gateway = 8,
+        CachePolicy = 9,
+        GenerationChanged = 10,
+        Host = 11,
+    }
+}
+
+dsr_ordinal_enum! {
+    /// Resolver family used for a translated control-flow exit.
+    pub enum DsrResolveKind {
+        Direct = 1,
+        Indirect = 2,
+    }
+}
+
+dsr_ordinal_enum! {
+    /// Low-cardinality DSR translation-cache event.
+    pub enum DsrCacheEventKind {
+        BlockHit = 1,
+        BlockMiss = 2,
+        TargetPublish = 3,
+        Invalidate = 4,
+        BlockPublish = 5,
+        CapacityFailure = 6,
+    }
+}
+
+dsr_ordinal_enum! {
+    /// Process role for a DSR cache lifecycle boundary.
+    pub enum DsrCacheRole {
+        Common = 0,
+        Parent = 1,
+        Child = 2,
+    }
+}
+
+dsr_ordinal_enum! {
+    /// Stable DSR cache lifecycle boundary.
+    pub enum DsrCacheLifecyclePhase {
+        ForkChildRepairBegin = 1,
+        ForkChildRepairEnd = 2,
+        ExecResetBegin = 3,
+        ExecResetEnd = 4,
+    }
+}
+
+#[cfg(test)]
+mod dsr_probe_abi {
+    use super::{
+        DsrCacheEventKind, DsrCacheLifecyclePhase, DsrCacheRole, DsrExitKind, DsrOperationOutcome,
+        DsrPrepareOutcome, DsrResolveKind,
+    };
+
+    fn assert_unique(values: &[u32]) {
+        let mut sorted = values.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), values.len());
+    }
+
+    #[test]
+    fn exit_kind_values_match_gateway_status() {
+        assert_eq!(DsrExitKind::Syscall.raw(), 1);
+        assert_eq!(DsrExitKind::DirectResolver.raw(), 2);
+        assert_eq!(DsrExitKind::IndirectResolver.raw(), 3);
+        assert_eq!(DsrExitKind::Fault.raw(), 4);
+        assert_eq!(DsrExitKind::Kick.raw(), 5);
+        assert_eq!(DsrExitKind::Sensitive.raw(), 6);
+        assert_eq!(DsrExitKind::Unsupported.raw(), 7);
+    }
+
+    #[test]
+    fn prepare_outcome_values_are_stable_and_unique() {
+        assert_eq!(DsrPrepareOutcome::ResumeEntryHit.raw(), 1);
+        assert_eq!(DsrPrepareOutcome::BlockIndexHit.raw(), 2);
+        assert_eq!(DsrPrepareOutcome::Translated.raw(), 3);
+        assert_eq!(DsrPrepareOutcome::Failed.raw(), 4);
+        assert_unique(&DsrPrepareOutcome::ALL.map(DsrPrepareOutcome::raw));
+    }
+
+    #[test]
+    fn operation_outcome_values_match_dsr_error_categories() {
+        assert_eq!(DsrOperationOutcome::Success.raw(), 0);
+        assert_eq!(DsrOperationOutcome::PcOverflow.raw(), 1);
+        assert_eq!(DsrOperationOutcome::Decode.raw(), 2);
+        assert_eq!(DsrOperationOutcome::Malformed.raw(), 3);
+        assert_eq!(DsrOperationOutcome::BlockPolicy.raw(), 4);
+        assert_eq!(DsrOperationOutcome::MemoryRead.raw(), 5);
+        assert_eq!(DsrOperationOutcome::UnsupportedBlockAction.raw(), 6);
+        assert_eq!(DsrOperationOutcome::Assembler.raw(), 7);
+        assert_eq!(DsrOperationOutcome::Gateway.raw(), 8);
+        assert_eq!(DsrOperationOutcome::CachePolicy.raw(), 9);
+        assert_eq!(DsrOperationOutcome::GenerationChanged.raw(), 10);
+        assert_eq!(DsrOperationOutcome::Host.raw(), 11);
+        assert_unique(&DsrOperationOutcome::ALL.map(DsrOperationOutcome::raw));
+    }
+
+    #[test]
+    fn resolver_cache_and_lifecycle_values_are_stable_and_unique() {
+        assert_eq!(DsrResolveKind::Direct.raw(), 1);
+        assert_eq!(DsrResolveKind::Indirect.raw(), 2);
+        assert_unique(&DsrResolveKind::ALL.map(DsrResolveKind::raw));
+
+        assert_eq!(DsrCacheEventKind::BlockHit.raw(), 1);
+        assert_eq!(DsrCacheEventKind::BlockMiss.raw(), 2);
+        assert_eq!(DsrCacheEventKind::TargetPublish.raw(), 3);
+        assert_eq!(DsrCacheEventKind::Invalidate.raw(), 4);
+        assert_eq!(DsrCacheEventKind::BlockPublish.raw(), 5);
+        assert_eq!(DsrCacheEventKind::CapacityFailure.raw(), 6);
+        assert_unique(&DsrCacheEventKind::ALL.map(DsrCacheEventKind::raw));
+
+        assert_eq!(DsrCacheRole::Common.raw(), 0);
+        assert_eq!(DsrCacheRole::Parent.raw(), 1);
+        assert_eq!(DsrCacheRole::Child.raw(), 2);
+        assert_unique(&DsrCacheRole::ALL.map(DsrCacheRole::raw));
+
+        assert_eq!(DsrCacheLifecyclePhase::ForkChildRepairBegin.raw(), 1);
+        assert_eq!(DsrCacheLifecyclePhase::ForkChildRepairEnd.raw(), 2);
+        assert_eq!(DsrCacheLifecyclePhase::ExecResetBegin.raw(), 3);
+        assert_eq!(DsrCacheLifecyclePhase::ExecResetEnd.raw(), 4);
+        assert_unique(&DsrCacheLifecyclePhase::ALL.map(DsrCacheLifecyclePhase::raw));
+    }
+
+    #[test]
+    fn probe_wrappers_expose_typed_scalar_only_signatures() {
+        let _: fn(i32, u64) = super::dsr_prepare_begin;
+        let _: fn(i32, u64, u64, u64, DsrPrepareOutcome) = super::dsr_prepare_end;
+        let _: fn(i32, u64, u64, u64) = super::dsr_run_begin;
+        let _: fn(i32, DsrExitKind, u64, u64, i32) = super::dsr_run_end;
+        let _: fn(i32, u64, u64) = super::dsr_translate_begin;
+        let _: fn(i32, u64, u64, u64, u64, DsrOperationOutcome) = super::dsr_translate_end;
+        let _: fn(i32, DsrResolveKind, u64, u64) = super::dsr_resolve_begin;
+        let _: fn(i32, DsrResolveKind, u64, u64, DsrOperationOutcome) = super::dsr_resolve_end;
+        let _: fn(i32, DsrCacheEventKind, u64, u64, u64, u64) = super::dsr_cache_event;
+        let _: fn(DsrCacheRole, DsrCacheLifecyclePhase, u64, u64, u64) = super::dsr_cache_lifecycle;
+    }
+}
+
 #[cfg(any(
     target_os = "macos",
     all(
@@ -145,6 +348,22 @@ mod real {
         // `vcpu__trap`.
         fn syscall__entry(_: u64, _: &str, _: u64) {}
         fn syscall__return(_: u64, _: &str, _: i64, _: i32) {}
+        /// DSR guest-entry preparation boundaries. All arguments are copied
+        /// scalars so disabled probes do not materialize diagnostic state.
+        fn dsr__prepare__begin(_: i32, _: u64) {}
+        fn dsr__prepare__end(_: i32, _: u64, _: u64, _: u64, _: u32) {}
+        /// One translated execution slice, from gateway entry to typed exit.
+        fn dsr__run__begin(_: i32, _: u64, _: u64, _: u64) {}
+        fn dsr__run__end(_: i32, _: u32, _: u64, _: u64, _: i32) {}
+        /// Block decode, planning, emission, and publication boundaries.
+        fn dsr__translate__begin(_: i32, _: u64, _: u64) {}
+        fn dsr__translate__end(_: i32, _: u64, _: u64, _: u64, _: u64, _: u32) {}
+        /// Direct and indirect translated-control-flow resolution boundaries.
+        fn dsr__resolve__begin(_: i32, _: u32, _: u64, _: u64) {}
+        fn dsr__resolve__end(_: i32, _: u32, _: u64, _: u64, _: u32) {}
+        /// Translation-cache activity and fork/exec lifecycle boundaries.
+        fn dsr__cache__event(_: i32, _: u32, _: u64, _: u64, _: u64, _: u64) {}
+        fn dsr__cache__lifecycle(_: u32, _: u32, _: u64, _: u64, _: u64) {}
         // arg2 is the ADDRESS of a `SyscallArgs` ([u64; 6]); DTrace copyin's 48
         // bytes — same raw-pointer convention as `syscall__entry`, no JSON.
         fn unhandled__syscall(_: u64, _: &str, _: u64) {}
@@ -460,6 +679,129 @@ mod real {
         /// configured subrange. Kept separate because macOS DTrace drops a sixth
         /// USDT argument at some probe sites.
         fn guest__mem__subcount(_: u32, _: u64, _: u64, _: u64) {}
+    }
+
+    #[inline(always)]
+    pub fn dsr_prepare_begin(tid: i32, guest_pc: u64) {
+        carrick_usdt::dsr__prepare__begin!(|| (tid, guest_pc));
+    }
+
+    #[inline(always)]
+    pub fn dsr_prepare_end(
+        tid: i32,
+        guest_pc: u64,
+        cache_pc: u64,
+        generation: u64,
+        outcome: super::DsrPrepareOutcome,
+    ) {
+        carrick_usdt::dsr__prepare__end!(|| {
+            (tid, guest_pc, cache_pc, generation, outcome.raw())
+        });
+    }
+
+    #[inline(always)]
+    pub fn dsr_run_begin(tid: i32, guest_pc: u64, cache_pc: u64, generation: u64) {
+        carrick_usdt::dsr__run__begin!(|| (tid, guest_pc, cache_pc, generation));
+    }
+
+    #[inline(always)]
+    pub fn dsr_run_end(
+        tid: i32,
+        kind: super::DsrExitKind,
+        guest_pc: u64,
+        target_pc: u64,
+        status: i32,
+    ) {
+        carrick_usdt::dsr__run__end!(|| (tid, kind.raw(), guest_pc, target_pc, status));
+    }
+
+    #[inline(always)]
+    pub fn dsr_translate_begin(tid: i32, guest_pc: u64, generation: u64) {
+        carrick_usdt::dsr__translate__begin!(|| (tid, guest_pc, generation));
+    }
+
+    #[inline(always)]
+    pub fn dsr_translate_end(
+        tid: i32,
+        guest_pc: u64,
+        generation: u64,
+        cache_pc: u64,
+        emitted_bytes: u64,
+        outcome: super::DsrOperationOutcome,
+    ) {
+        carrick_usdt::dsr__translate__end!(|| {
+            (
+                tid,
+                guest_pc,
+                generation,
+                cache_pc,
+                emitted_bytes,
+                outcome.raw(),
+            )
+        });
+    }
+
+    #[inline(always)]
+    pub fn dsr_resolve_begin(
+        tid: i32,
+        kind: super::DsrResolveKind,
+        source_pc: u64,
+        target_pc: u64,
+    ) {
+        carrick_usdt::dsr__resolve__begin!(|| (tid, kind.raw(), source_pc, target_pc));
+    }
+
+    #[inline(always)]
+    pub fn dsr_resolve_end(
+        tid: i32,
+        kind: super::DsrResolveKind,
+        source_pc: u64,
+        target_pc: u64,
+        outcome: super::DsrOperationOutcome,
+    ) {
+        carrick_usdt::dsr__resolve__end!(|| {
+            (tid, kind.raw(), source_pc, target_pc, outcome.raw())
+        });
+    }
+
+    #[inline(always)]
+    pub fn dsr_cache_event(
+        tid: i32,
+        kind: super::DsrCacheEventKind,
+        guest_pc: u64,
+        generation: u64,
+        used_bytes: u64,
+        capacity_bytes: u64,
+    ) {
+        carrick_usdt::dsr__cache__event!(|| {
+            (
+                tid,
+                kind.raw(),
+                guest_pc,
+                generation,
+                used_bytes,
+                capacity_bytes,
+            )
+        });
+    }
+
+    #[inline(always)]
+    pub fn dsr_cache_lifecycle(
+        role: super::DsrCacheRole,
+        phase: super::DsrCacheLifecyclePhase,
+        used_bytes: u64,
+        block_count: u64,
+        generation_count: u64,
+    ) {
+        carrick_usdt::dsr__cache__lifecycle!(|| {
+            (
+                role.raw(),
+                phase.raw(),
+                used_bytes,
+                block_count,
+                generation_count,
+            )
+        });
     }
 
     pub fn fork_pre(pc: u64, elr: u64, cpsr: u64) {
@@ -1327,6 +1669,16 @@ mod stub {
         };
     }
 
+    stub!(dsr_prepare_begin(tid: i32, guest_pc: u64));
+    stub!(dsr_prepare_end(tid: i32, guest_pc: u64, cache_pc: u64, generation: u64, outcome: super::DsrPrepareOutcome));
+    stub!(dsr_run_begin(tid: i32, guest_pc: u64, cache_pc: u64, generation: u64));
+    stub!(dsr_run_end(tid: i32, kind: super::DsrExitKind, guest_pc: u64, target_pc: u64, status: i32));
+    stub!(dsr_translate_begin(tid: i32, guest_pc: u64, generation: u64));
+    stub!(dsr_translate_end(tid: i32, guest_pc: u64, generation: u64, cache_pc: u64, emitted_bytes: u64, outcome: super::DsrOperationOutcome));
+    stub!(dsr_resolve_begin(tid: i32, kind: super::DsrResolveKind, source_pc: u64, target_pc: u64));
+    stub!(dsr_resolve_end(tid: i32, kind: super::DsrResolveKind, source_pc: u64, target_pc: u64, outcome: super::DsrOperationOutcome));
+    stub!(dsr_cache_event(tid: i32, kind: super::DsrCacheEventKind, guest_pc: u64, generation: u64, used_bytes: u64, capacity_bytes: u64));
+    stub!(dsr_cache_lifecycle(role: super::DsrCacheRole, phase: super::DsrCacheLifecyclePhase, used_bytes: u64, block_count: u64, generation_count: u64));
     stub!(fork_pre(pc: u64, elr: u64, cpsr: u64));
     stub!(path_open(path: &str, result_size: u64, errno: i32));
     stub!(itimer_fire(signum: i32, generation: u64));
