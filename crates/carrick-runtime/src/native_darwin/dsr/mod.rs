@@ -450,6 +450,10 @@ impl ThreadTranslator {
                 snapshot.pc = guest_pc.raw();
                 ThreadExit::Kick
             }
+            types::NativeDsrExit::KickAtEntry { resume } => {
+                snapshot.pc = resume.raw();
+                ThreadExit::Kick
+            }
             other => ThreadExit::Unsupported(format!("{other:?}")),
         })
     }

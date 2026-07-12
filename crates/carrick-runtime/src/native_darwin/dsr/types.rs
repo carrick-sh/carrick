@@ -173,6 +173,9 @@ pub(super) enum NativeDsrExit {
         rewrite_context_scratch: u64,
         generation_pstate_scratch: u64,
     },
+    KickAtEntry {
+        resume: GuestVa,
+    },
     StaleGeneration {
         guest_pc: GuestVa,
         observed: CodeGeneration,
