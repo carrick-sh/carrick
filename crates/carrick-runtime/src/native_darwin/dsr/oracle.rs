@@ -824,6 +824,75 @@ fn dsr_indirect_flow_branch_reads_virtual_guest_x18() {
 }
 
 #[test]
+fn dsr_indirect_cache_keeps_old_index_aliases_hot() {
+    let source_guest = GuestVa(0x41_000);
+    let first = GuestVa(0x42_000);
+    let second = GuestVa(0x48_000);
+    assert_eq!(
+        (first.raw() >> 2) & 1023,
+        (second.raw() >> 2) & 1023,
+        "fixture must collide under the old page-offset index",
+    );
+
+    let target_plan = |target: GuestVa| BlockPlan {
+        start: target,
+        end: GuestVa(target.raw() + 4),
+        generation: CodeGeneration::INITIAL,
+        instructions: Vec::new(),
+        exit: PlannedExit::Syscall {
+            guest: target,
+            resume: GuestVa(target.raw() + 4),
+        },
+    };
+    let mut code = TranslationCache::new(32 * 1024).expect("allocate alias oracle");
+    let first_block = emit_block(&mut code, &target_plan(first)).expect("emit first alias target");
+    let second_block =
+        emit_block(&mut code, &target_plan(second)).expect("emit second alias target");
+    let source = emit_block(
+        &mut code,
+        &BlockPlan {
+            start: source_guest,
+            end: GuestVa(source_guest.raw() + 4),
+            generation: CodeGeneration::INITIAL,
+            instructions: Vec::new(),
+            exit: PlannedExit::Indirect {
+                guest: source_guest,
+                word: 0xd61f_0000, // br x0
+                exit: IndirectExit {
+                    kind: IndirectKind::Branch,
+                    register: bad64::Reg::X0,
+                    resume: GuestVa(source_guest.raw() + 4),
+                },
+            },
+        },
+    )
+    .expect("emit alias source");
+    let indirect = IndirectTargetCache::new();
+    indirect.publish(first, CodeGeneration::INITIAL, first_block.entry());
+    indirect.publish(second, CodeGeneration::INITIAL, second_block.entry());
+
+    let mut stack = vec![0_u8; 16 * 1024];
+    for target in [first, second] {
+        let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+        snapshot.x[0] = target.raw();
+        let mut exit = NativeDsrExit::ResolveIndirect {
+            source: source_guest,
+            target,
+            link: None,
+        };
+        enter_translated_with_cache(source.entry(), &mut snapshot, &mut exit, &indirect)
+            .expect("execute cached alias target");
+        assert_eq!(
+            exit,
+            NativeDsrExit::Syscall {
+                resume: GuestVa(target.raw() + 4),
+            },
+            "both stable targets must remain cached",
+        );
+    }
+}
+
+#[test]
 fn dsr_indirect_flow_cache_hit_stays_in_translated_code() {
     let source_guest = GuestVa(0x18_100);
     let target_guest = GuestVa(0x18_200);
