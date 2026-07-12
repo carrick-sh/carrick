@@ -7982,6 +7982,13 @@ fn native16k_host_prot(
     host_prot
 }
 
+const fn native_mapping_needs_icache_publication(
+    executable: bool,
+    native_code_mode: carrick_spec::NativeCodeModeRequest,
+) -> bool {
+    executable && !matches!(native_code_mode, carrick_spec::NativeCodeModeRequest::Dsr)
+}
+
 fn map_region(
     region: &MemoryRegion,
     native_code_mode: carrick_spec::NativeCodeModeRequest,
@@ -8041,7 +8048,7 @@ fn map_region(
     if region.perms.execute && native_code_mode == carrick_spec::NativeCodeModeRequest::Brk {
         patch_syscalls(mapped.cast::<u8>(), bytes.len());
     }
-    if region.perms.execute {
+    if native_mapping_needs_icache_publication(region.perms.execute, native_code_mode) {
         unsafe { carrick_native_clear_icache(mapped, bytes.len()) };
     }
 
@@ -8114,7 +8121,7 @@ fn map_bytes_region(
     if executable && native_code_mode == carrick_spec::NativeCodeModeRequest::Brk {
         patch_syscalls(mapped.cast::<u8>(), bytes.len());
     }
-    if executable {
+    if native_mapping_needs_icache_publication(executable, native_code_mode) {
         unsafe { carrick_native_clear_icache(mapped, bytes.len()) };
     }
     let final_prot = if executable && native_code_mode == carrick_spec::NativeCodeModeRequest::Dsr {
