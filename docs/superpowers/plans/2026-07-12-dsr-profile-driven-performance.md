@@ -1002,7 +1002,7 @@ within 1%. Evidence is in
 - Consumes: DSR gateway entry/exit, scalar and SIMD guest states, existing performance schema.
 - Produces: untraced scalar and SIMD gateway distributions that can support an assembly change without DTrace boundary cost.
 
-- [ ] **Step 1: Write the probe and host parser tests red**
+- [x] **Step 1: Write the probe and host parser tests red**
 
 The probe prints:
 
@@ -1020,15 +1020,22 @@ The scalar loop crosses a DSR syscall boundary without guest SIMD operations.
 The SIMD loop seeds and verifies all observable vector registers around the same
 boundary. Add the case to the existing performance registry.
 
-- [ ] **Step 2: Run parser tests red, then implement the probe**
+- [x] **Step 2: Run parser tests red, then implement the probe**
 
 Build via `scripts/build-probes.sh --native-pie`; run signed DSR; require exact
 SIMD sentinel preservation and finite positive metrics.
 
-- [ ] **Step 3: Collect baseline ABBA/noise evidence**
+- [x] **Step 3: Collect baseline ABBA/noise evidence**
 
 Run at least 30 repetitions, record p50/p95/min/IQR and host/power provenance,
 and check in `native-dsr-gateway-baseline.jsonl`.
+
+**Baseline result:** 30 signed, untraced static-PIE repetitions are complete.
+Across per-process p50 values, scalar is 0.474 us (IQR 0.003 us) and SIMD is
+0.625 us (IQR 0.003 us). The dynamic glibc PIE smoke is also green at
+0.477/0.633 us. The SIMD metric includes its fixed seed-and-verify sequence;
+all 32 vector registers are checked on every crossing. Evidence is in
+`docs/perf-results/native-dsr-gateway-baseline.jsonl`.
 
 - [ ] **Step 4: Audit gateway instructions against the oracle**
 
