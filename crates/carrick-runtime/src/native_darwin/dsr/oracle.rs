@@ -827,8 +827,12 @@ fn dsr_indirect_flow_branch_reads_virtual_guest_x18() {
 fn dsr_indirect_flow_cache_hit_stays_in_translated_code() {
     let source_guest = GuestVa(0x18_100);
     let target_guest = GuestVa(0x18_200);
+    let generation = std::sync::atomic::AtomicU64::new(CodeGeneration::INITIAL.get());
     let mut code = TranslationCache::new(16 * 1024).expect("allocate indirect cache-hit code");
-    let target = emit_block(
+    // Production blocks carry a generation guard.  That guard must observe
+    // the original guest x17 after an inline-cache hit, not the x17 scratch
+    // used to hold the indirect target.
+    let target = super::emit::emit_block_with_generation(
         &mut code,
         &BlockPlan {
             start: target_guest,
@@ -840,6 +844,7 @@ fn dsr_indirect_flow_cache_hit_stays_in_translated_code() {
                 resume: GuestVa(target_guest.raw() + 4),
             },
         },
+        super::emit::GenerationGuard::new(&generation, CodeGeneration::INITIAL),
     )
     .expect("emit indirect cache-hit target");
     let source = emit_block(
@@ -1303,6 +1308,10 @@ fn dsr_signal_fault_reconstructs_copied_instruction_pc() {
         rewrite_scratch: 0,
         rewrite_context_scratch: 0,
         generation_pstate_scratch: 0,
+        indirect_x15_scratch: 0,
+        indirect_x30_scratch: 0,
+        physical_x18: 0,
+        gateway_phase: 0,
     };
     enter_translated(emitted.entry(), &mut snapshot, &mut exit).expect("capture DSR fault");
     let NativeDsrExit::Fault {
@@ -1365,6 +1374,10 @@ fn dsr_signal_fault_recovers_context_when_physical_x28_is_zero() {
         rewrite_scratch: 0,
         rewrite_context_scratch: 0,
         generation_pstate_scratch: 0,
+        indirect_x15_scratch: 0,
+        indirect_x30_scratch: 0,
+        physical_x18: 0,
+        gateway_phase: 0,
     };
 
     enter_translated(emitted.entry(), &mut snapshot, &mut exit)
@@ -1484,6 +1497,8 @@ fn dsr_concurrency_kick_exits_guarded_linked_loop_without_corrupting_guest_state
         rewrite_scratch: 0,
         rewrite_context_scratch: 0,
         generation_pstate_scratch: 0,
+        indirect_x15_scratch: 0,
+        indirect_x30_scratch: 0,
     };
 
     enter_translated(emitted.entry(), &mut snapshot, &mut exit)
@@ -1503,6 +1518,8 @@ fn dsr_concurrency_kick_exits_guarded_linked_loop_without_corrupting_guest_state
         rewrite_scratch,
         rewrite_context_scratch,
         generation_pstate_scratch,
+        indirect_x15_scratch,
+        indirect_x30_scratch,
     } = exit
     else {
         unreachable!("matched kick above")
@@ -1521,6 +1538,8 @@ fn dsr_concurrency_kick_exits_guarded_linked_loop_without_corrupting_guest_state
             rewrite_scratch,
             rewrite_context_scratch,
             generation_pstate_scratch,
+            indirect_x15_scratch,
+            indirect_x30_scratch,
         )
         .expect("recover interrupted generation guard");
     }
@@ -1637,6 +1656,10 @@ fn dsr_signal_fault_recovers_scratch_in_expanded_x18_load() {
         rewrite_scratch: 0,
         rewrite_context_scratch: 0,
         generation_pstate_scratch: 0,
+        indirect_x15_scratch: 0,
+        indirect_x30_scratch: 0,
+        physical_x18: 0,
+        gateway_phase: 0,
     };
     enter_translated(emitted.entry(), &mut snapshot, &mut exit)
         .expect("capture expanded x18 fault");
@@ -1671,6 +1694,8 @@ fn dsr_signal_fault_recovers_scratch_in_expanded_x18_load() {
         rewrite_scratch,
         rewrite_context_scratch,
         original.pstate,
+        original.x[15],
+        original.x[30],
     )
     .expect("recover expanded x18 scratch");
     assert_eq!(snapshot.x[18], original_x18);
@@ -1719,6 +1744,10 @@ fn dsr_signal_fault_preserves_destination_in_expanded_literal_load() {
         rewrite_scratch: 0,
         rewrite_context_scratch: 0,
         generation_pstate_scratch: 0,
+        indirect_x15_scratch: 0,
+        indirect_x30_scratch: 0,
+        physical_x18: 0,
+        gateway_phase: 0,
     };
     enter_translated(emitted.entry(), &mut snapshot, &mut exit)
         .expect("capture expanded literal fault");
@@ -1747,6 +1776,8 @@ fn dsr_signal_fault_preserves_destination_in_expanded_literal_load() {
         rewrite_scratch,
         rewrite_context_scratch,
         original.pstate,
+        original.x[15],
+        original.x[30],
     )
     .expect("recover literal scratch");
     assert_eq!(snapshot.x, original.x);

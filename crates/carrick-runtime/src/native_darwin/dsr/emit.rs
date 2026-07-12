@@ -86,8 +86,11 @@ impl GenerationGuard {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum RecoveryAction {
     Noop,
+    RestoreGuestX17,
     RestoreGenerationGuardRegisters,
     RestoreGenerationGuard,
+    RestoreIndirectRegisters,
+    RestoreIndirectResolver,
     RestoreScratch {
         register: u32,
     },
@@ -514,6 +517,10 @@ fn emit_gateway_exit(
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
         ; mov w17, status
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
         ; str w17, [x28, #1096]
     );
     emit_mov_u64(assembler, entries, guest, 17, gateway)?;
@@ -554,54 +561,78 @@ fn emit_indirect_exit(
     plan: &BlockPlan,
     guest: GuestVa,
     exit: super::types::IndirectExit,
+    recovery: &mut Vec<RecoveryEntry>,
 ) -> Result<(), DsrError> {
     let register = gpr_index(exit.register)
         .ok_or_else(|| unsupported_action(plan, guest, 0, "indirect exit with non-GPR target"))?;
+    // Capture every scratch value before using physical x17 as the target
+    // register.  A kick may land on any following resolver instruction; its
+    // recovery entry must always point at a complete pre-instruction state.
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; str x15, [x28, #1160]
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; str x16, [x28, #1120]
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; str x17, [x28, #1128]
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; str x30, [x28, #1168]
+    );
     if let Some(offset) = virtual_snapshot_offset(register) {
         emit_word(
             assembler,
             entries,
             guest,
-            0xf940_0000 | ((offset / 8) << 10) | (28 << 5) | 17,
+            0xf940_0000 | ((offset / 8) << 10) | (28 << 5) | 18,
         )?;
-    } else if register != 17 {
+    } else if register != 18 {
         emit_word(
             assembler,
             entries,
             guest,
-            0xaa00_03f1 | (register << 16), // mov x17, xN
+            0xaa00_03f2 | (register << 16), // mov x18, xN
         )?;
     }
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; str x18, [x28, #1080]
+    );
+    emit_word(assembler, entries, guest, 0xd53b_4210)?; // mrs x16, nzcv
+    let register_recovery = current_offset(assembler)?;
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; str x16, [x28, #936]
+    );
+    recovery.push(RecoveryEntry {
+        cache: register_recovery,
+        action: RecoveryAction::RestoreIndirectRegisters,
+    });
+    let full_recovery_start = current_offset(assembler)?;
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; ldr x17, [x28, #1080]
+    );
     let link = (exit.kind == super::types::IndirectKind::Call).then_some(exit.resume);
     if let Some(link) = link {
         emit_mov_u64(assembler, entries, guest, 30, link.raw())?;
     }
-    map_next(assembler, entries, guest)?;
-    dynasmrt::dynasm!(assembler
-        ; .arch aarch64
-        ; str x17, [x28, #1080]
-    );
     // A per-thread direct-mapped cache keeps repeated indirect calls and
-    // returns inside translated code. Guest x17 was saved by the block exit;
-    // preserve x15/x16 while they serve as lookup scratch, and restore all
-    // guest-visible scratch state on both hit and miss paths.
+    // returns inside translated code. Restore every guest-visible scratch
+    // value on both hit and miss paths.
     let miss = assembler.new_dynamic_label();
-    map_next(assembler, entries, guest)?;
-    dynasmrt::dynasm!(assembler
-        ; .arch aarch64
-        ; str x15, [x28, #120]
-    );
-    map_next(assembler, entries, guest)?;
-    dynasmrt::dynasm!(assembler
-        ; .arch aarch64
-        ; str x16, [x28, #128]
-    );
-    emit_word(assembler, entries, guest, 0xd53b_4210)?; // mrs x16, nzcv
-    map_next(assembler, entries, guest)?;
-    dynasmrt::dynasm!(assembler
-        ; .arch aarch64
-        ; str x16, [x28, #264]
-    );
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
@@ -660,28 +691,49 @@ fn emit_indirect_exit(
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
-        ; ldr x17, [x15, #16]
+        ; ldr x18, [x15, #16]
     );
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
-        ; cbz x17, =>miss
+        ; cbz x18, =>miss
+    );
+    // Physical x18 is the only non-guest branch scratch.  Preserve the
+    // validated cache PC in the context while guest x15/x16/x17 and NZCV are
+    // restored, then reload and recheck it immediately before the branch.
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; str x18, [x28, #1072]
     );
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
-        ; ldr x16, [x28, #264]
+        ; ldr x16, [x28, #936]
     );
     emit_word(assembler, entries, guest, 0xd51b_4210)?; // msr nzcv, x16
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
-        ; ldr x15, [x28, #120]
+        ; ldr x15, [x28, #1160]
     );
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
-        ; ldr x16, [x28, #128]
+        ; ldr x16, [x28, #1120]
+    );
+    // Keep the validated cache PC out of custom physical x18 for the final
+    // branch. Every translated block restores guest x17 at entry, so ordinary
+    // physical x17 can safely carry this internal edge.
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; ldr x17, [x28, #1072]
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; cbz x17, =>miss
     );
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
@@ -697,18 +749,18 @@ fn emit_indirect_exit(
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
-        ; ldr x16, [x28, #264]
+        ; ldr x16, [x28, #936]
     );
     emit_word(assembler, entries, guest, 0xd51b_4210)?; // msr nzcv, x16
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
-        ; ldr x15, [x28, #120]
+        ; ldr x15, [x28, #1160]
     );
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
-        ; ldr x16, [x28, #128]
+        ; ldr x16, [x28, #1120]
     );
     emit_mov_u64(assembler, entries, guest, 17, guest.raw())?;
     map_next(assembler, entries, guest)?;
@@ -722,7 +774,15 @@ fn emit_indirect_exit(
         dynasmrt::dynasm!(assembler
             ; .arch aarch64
             ; str x17, [x28, #1104]
+        );
+        map_next(assembler, entries, guest)?;
+        dynasmrt::dynasm!(assembler
+            ; .arch aarch64
             ; mov w17, #1
+        );
+        map_next(assembler, entries, guest)?;
+        dynasmrt::dynasm!(assembler
+            ; .arch aarch64
             ; str w17, [x28, #1112]
         );
     } else {
@@ -736,6 +796,10 @@ fn emit_indirect_exit(
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
         ; mov w17, #3
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
         ; str w17, [x28, #1096]
     );
     emit_mov_u64(
@@ -750,6 +814,13 @@ fn emit_indirect_exit(
         ; .arch aarch64
         ; br x17
     );
+    let resolver_end = current_offset(assembler)?;
+    for offset in (full_recovery_start.get()..resolver_end.get()).step_by(4) {
+        recovery.push(RecoveryEntry {
+            cache: CacheOffset::published(offset),
+            action: RecoveryAction::RestoreIndirectResolver,
+        });
+    }
     Ok(())
 }
 
@@ -916,6 +987,19 @@ fn emit_block_inner(
         cache: entry_marker,
         action: RecoveryAction::Noop,
     });
+    // x17 is the internal indirect-edge register. Its guest value is saved at
+    // every block exit and restored before either the generation guard or the
+    // first guest instruction executes.
+    let restore_x17 = current_offset(&assembler)?;
+    map_next(&assembler, &mut entries, plan.start)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; ldr x17, [x28, #136]
+    );
+    recovery.push(RecoveryEntry {
+        cache: restore_x17,
+        action: RecoveryAction::RestoreGuestX17,
+    });
     let stale = guard.map(|_| assembler.new_dynamic_label());
     if let (Some(guard), Some(stale)) = (guard, stale) {
         let guard_start = current_offset(&assembler)?;
@@ -1011,12 +1095,6 @@ fn emit_block_inner(
                 action: RecoveryAction::RestoreGenerationGuard,
             });
         }
-    } else {
-        map_next(&assembler, &mut entries, plan.start)?;
-        dynasmrt::dynasm!(assembler
-            ; .arch aarch64
-            ; ldr x17, [x28, #136]
-        );
     }
     for instruction in &plan.instructions {
         let word = match instruction.action {
@@ -1104,12 +1182,17 @@ fn emit_block_inner(
     }
 
     let exit_guest = plan.exit.guest_pc();
+    map_next(&assembler, &mut entries, exit_guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; str x17, [x28, #136]
+    );
+    map_next(&assembler, &mut entries, exit_guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; str x17, [x28, #1128]
+    );
     if let PlannedExit::Syscall { resume, .. } = plan.exit {
-        map_next(&assembler, &mut entries, exit_guest)?;
-        dynasmrt::dynasm!(assembler
-            ; .arch aarch64
-            ; str x17, [x28, #136]
-        );
         emit_gateway_exit(
             &mut assembler,
             &mut entries,
@@ -1120,11 +1203,6 @@ fn emit_block_inner(
             super::gateway::syscall_exit_address(),
         )?;
     } else if let PlannedExit::Direct { word, exit, .. } = plan.exit {
-        map_next(&assembler, &mut entries, exit_guest)?;
-        dynasmrt::dynasm!(assembler
-            ; .arch aarch64
-            ; str x17, [x28, #136]
-        );
         if exit.kind == super::types::DirectKind::Call {
             emit_mov_u64(
                 &mut assembler,
@@ -1204,18 +1282,15 @@ fn emit_block_inner(
             )?;
         }
     } else if let PlannedExit::Indirect { exit, .. } = plan.exit {
-        map_next(&assembler, &mut entries, exit_guest)?;
-        dynasmrt::dynasm!(assembler
-            ; .arch aarch64
-            ; str x17, [x28, #136]
-        );
-        emit_indirect_exit(&mut assembler, &mut entries, plan, exit_guest, exit)?;
+        emit_indirect_exit(
+            &mut assembler,
+            &mut entries,
+            plan,
+            exit_guest,
+            exit,
+            &mut recovery,
+        )?;
     } else if let PlannedExit::Sensitive { exit, .. } = plan.exit {
-        map_next(&assembler, &mut entries, exit_guest)?;
-        dynasmrt::dynasm!(assembler
-            ; .arch aarch64
-            ; str x17, [x28, #136]
-        );
         emit_gateway_exit(
             &mut assembler,
             &mut entries,
@@ -1226,11 +1301,6 @@ fn emit_block_inner(
             super::gateway::sensitive_exit_address(),
         )?;
     } else if let PlannedExit::Continue { target, .. } = plan.exit {
-        map_next(&assembler, &mut entries, exit_guest)?;
-        dynasmrt::dynasm!(assembler
-            ; .arch aarch64
-            ; str x17, [x28, #136]
-        );
         let slot = current_offset(&assembler)?;
         direct_links.push(DirectLink { slot, target });
         emit_word(&mut assembler, &mut entries, exit_guest, 0x1400_0001)?;
@@ -1244,11 +1314,6 @@ fn emit_block_inner(
             super::gateway::direct_exit_address(),
         )?;
     } else if let PlannedExit::Unsupported { .. } = plan.exit {
-        map_next(&assembler, &mut entries, exit_guest)?;
-        dynasmrt::dynasm!(assembler
-            ; .arch aarch64
-            ; str x17, [x28, #136]
-        );
         emit_gateway_exit(
             &mut assembler,
             &mut entries,
@@ -1366,7 +1431,7 @@ mod tests {
     fn dsr_emit_copy_only_block_decodes_back_with_exact_maps() {
         let mut cache = TranslationCache::new(16 * 1024).expect("allocate translation cache");
         let emitted = emit_block(&mut cache, &copy_plan()).expect("emit copy-only block");
-        assert_eq!(emitted.len(), 68);
+        assert_eq!(emitted.len(), 72);
         let original_words = [0xd503_201f, 0x9100_0400];
         let entry_word =
             unsafe { std::ptr::read_unaligned(emitted.entry().host().raw() as *const u32) };
@@ -1486,6 +1551,89 @@ mod tests {
         };
         let emitted = emit_block(&mut cache, &indirect).expect("emit indirect resolver exit");
         assert!(emitted.direct_links().is_empty());
+    }
+
+    #[test]
+    fn dsr_every_emitted_instruction_has_a_guest_pc_mapping() {
+        let mut plans = vec![copy_plan()];
+        let mut indirect = copy_plan();
+        indirect.exit = PlannedExit::Indirect {
+            guest: GuestVa(0x4008),
+            word: 0xd63f_0000,
+            exit: IndirectExit {
+                kind: IndirectKind::Call,
+                register: bad64::Reg::X0,
+                resume: GuestVa(0x400c),
+            },
+        };
+        plans.push(indirect);
+
+        let mut cache = TranslationCache::new(32 * 1024).expect("allocate translation cache");
+        for plan in plans {
+            let emitted = emit_block(&mut cache, &plan).expect("emit mapped block");
+            for offset in (0..emitted.len()).step_by(4) {
+                let offset = CacheOffset::published(offset as u32);
+                assert!(
+                    emitted.map().guest_for_cache(offset).is_some(),
+                    "emitted instruction at cache offset {} has no guest PC mapping",
+                    offset.get()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dsr_indirect_resolver_recovery_is_contiguous_after_scratch_mutation() {
+        let mut indirect = copy_plan();
+        indirect.exit = PlannedExit::Indirect {
+            guest: GuestVa(0x4008),
+            word: 0xd65f_03c0,
+            exit: IndirectExit {
+                kind: IndirectKind::Return,
+                register: bad64::Reg::X30,
+                resume: GuestVa(0x400c),
+            },
+        };
+        let mut cache = TranslationCache::new(16 * 1024).expect("allocate translation cache");
+        let emitted = emit_block(&mut cache, &indirect).expect("emit indirect resolver");
+        let resolver = emitted
+            .recovery()
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry.action,
+                    RecoveryAction::RestoreIndirectRegisters
+                        | RecoveryAction::RestoreIndirectResolver
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            matches!(
+                resolver.first().map(|entry| entry.action),
+                Some(RecoveryAction::RestoreIndirectRegisters)
+            ),
+            "resolver must publish its partial recovery point first"
+        );
+        assert!(
+            resolver
+                .iter()
+                .skip(1)
+                .all(|entry| entry.action == RecoveryAction::RestoreIndirectResolver),
+            "every instruction after the scratch snapshot must have full recovery"
+        );
+        assert!(
+            resolver
+                .windows(2)
+                .all(|pair| pair[1].cache.get() == pair[0].cache.get() + 4),
+            "resolver recovery metadata must cover every instruction without gaps"
+        );
+        assert!(
+            emitted
+                .recovery()
+                .iter()
+                .any(|entry| entry.action == RecoveryAction::RestoreGuestX17),
+            "internal x17 edges need a target-entry recovery point"
+        );
     }
 
     #[test]

@@ -14,6 +14,7 @@
 .equ CTX_EXIT_TARGET, 1080
 .equ CTX_EXIT_SOURCE, 1088
 .equ CTX_EXIT_STATUS, 1096
+.equ CTX_GATEWAY_PHASE, 1152
 
 .globl _carrick_dsr_enter_raw
 _carrick_dsr_enter_raw:
@@ -121,6 +122,8 @@ _carrick_dsr_exit_signal:
     ldr x17, [x9, #CTX_HOST_SP]
     mov sp, x17
     mov x19, x9
+    mov w10, #2
+    str w10, [x19, #CTX_GATEWAY_PHASE]
     bl _carrick_native_dsr_enter_host_abi
     mov x9, x19
     b carrick_dsr_restore_host
@@ -130,6 +133,8 @@ _carrick_dsr_exit_direct:
 _carrick_dsr_exit_indirect:
 _carrick_dsr_exit_sensitive:
 _carrick_dsr_exit_unsupported:
+.globl _carrick_dsr_exit_common_start
+_carrick_dsr_exit_common_start:
 carrick_dsr_exit_common:
     // The emitted stub saved guest x17 through physical x28 before branching.
     stp x0, x1, [x28, #0]
@@ -174,10 +179,17 @@ carrick_dsr_exit_common:
     stp q28, q29, [x28, #(SNAP_V0 + 448)]
     stp q30, q31, [x28, #(SNAP_V0 + 480)]
 
+    // Phase 2 means the complete guest snapshot and typed exit are stable.
+    // A kick during the following host-mask transition may therefore abandon
+    // its interrupted host frame through carrick_dsr_exit_signal.
+    mov w17, #2
+    str w17, [x28, #CTX_GATEWAY_PHASE]
     mov x19, x28
     ldr x17, [x19, #CTX_HOST_SP]
     mov sp, x17
     bl _carrick_native_dsr_enter_host_abi
+.globl _carrick_dsr_exit_common_end
+_carrick_dsr_exit_common_end:
     mov x9, x19
 carrick_dsr_restore_host:
     add x10, x9, #CTX_HOST_V8

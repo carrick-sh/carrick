@@ -52,6 +52,7 @@ pub(super) struct ThreadTranslator {
     )>,
     indirect_cache: gateway::IndirectTargetCache,
     stats: ResolverStats,
+    last_kick: Option<(carrick_guest_mem::GuestVa, Option<emit::RecoveryAction>)>,
 }
 
 pub(super) struct ProcessTranslator {
@@ -100,6 +101,7 @@ impl ThreadTranslator {
             resume_entry: None,
             indirect_cache: gateway::IndirectTargetCache::new(),
             stats: ResolverStats::default(),
+            last_kick: None,
         }
     }
 
@@ -108,14 +110,15 @@ impl ThreadTranslator {
         self.resume_entry = None;
         self.indirect_cache.clear();
         self.stats = ResolverStats::default();
+        self.last_kick = None;
     }
 
     pub(super) fn reset_for_exec(&mut self, next: Arc<ProcessTranslator>) {
-        self.process.reset_for_exec();
         self.process = next;
         self.resume_entry = None;
         self.indirect_cache.clear();
         self.stats = ResolverStats::default();
+        self.last_kick = None;
     }
 }
 
@@ -140,18 +143,6 @@ impl ProcessTranslator {
         let state = self.state.lock();
         state.cache.after_fork_child();
         state.publications.after_fork_child();
-    }
-
-    fn reset_for_exec(&self) {
-        let mut state = self.state.lock();
-        state.blocks.clear();
-        state.pending.clear();
-        state.stats = ResolverStats::default();
-        state.sensitive.clear();
-        state.unsupported.clear();
-        state.published.clear();
-        state.dependencies = cache::PageBlockDependencies::default();
-        state.publications.reset_for_exec();
     }
 }
 
@@ -285,8 +276,22 @@ impl ProcessState {
                 .map(|entry| entry.action);
             return Ok((guest, recovery));
         }
+        let first = self
+            .published
+            .first()
+            .map(|block| (block.entry.host().raw(), block.len));
+        let last = self
+            .published
+            .last()
+            .map(|block| (block.entry.host().raw(), block.len));
+        let in_cache = self
+            .cache
+            .contains_host_pc(carrick_guest_mem::HostVa(cache_pc));
         Err(types::DsrError::CachePolicy(format!(
-            "cache PC 0x{cache_pc:x} is outside published DSR blocks (signal_gateway=0x{:x}, common_gateway=0x{:x})",
+            "cache PC 0x{cache_pc:x} is outside published DSR blocks \
+             (in_cache={in_cache}, published={}, first={first:?}, last={last:?}, \
+             signal_gateway=0x{:x}, common_gateway=0x{:x})",
+            self.published.len(),
             gateway::signal_exit_address(),
             gateway::direct_exit_address(),
         )))
@@ -456,11 +461,30 @@ impl ThreadTranslator {
                 rewrite_scratch,
                 rewrite_context_scratch,
                 generation_pstate_scratch,
+                indirect_x15_scratch,
+                indirect_x30_scratch,
+                physical_x18,
+                gateway_phase,
             } => {
                 let (guest_pc, recovery) = self.guest_pc_for_cache(guest_pc).map_err(|error| {
                     types::DsrError::CachePolicy(format!(
-                        "{error}; trapped signal={signal} code={code} address=0x{:x}",
-                        address.raw()
+                        "{error}; trapped signal={signal} code={code} address=0x{:x} \
+                         sp=0x{:x} lr=0x{:x} x0=0x{:x} x16=0x{:x} x17=0x{:x} \
+                         guest_x18=0x{:x} physical_x18=0x{physical_x18:x} \
+                         gateway_phase={gateway_phase} x28=0x{:x} \
+                         esr=0x{:x} far=0x{:x} \
+                         last_kick={:?}",
+                        address.raw(),
+                        snapshot.sp,
+                        snapshot.x[30],
+                        snapshot.x[0],
+                        snapshot.x[16],
+                        snapshot.x[17],
+                        snapshot.x[18],
+                        snapshot.x[28],
+                        snapshot.esr,
+                        snapshot.far,
+                        self.last_kick,
                     ))
                 })?;
                 if let Some(recovery) = recovery {
@@ -470,6 +494,8 @@ impl ThreadTranslator {
                         rewrite_scratch,
                         rewrite_context_scratch,
                         generation_pstate_scratch,
+                        indirect_x15_scratch,
+                        indirect_x30_scratch,
                     )?;
                 }
                 snapshot.pc = guest_pc.raw();
@@ -483,6 +509,8 @@ impl ThreadTranslator {
                 rewrite_scratch,
                 rewrite_context_scratch,
                 generation_pstate_scratch,
+                indirect_x15_scratch,
+                indirect_x30_scratch,
             } => {
                 let (guest_pc, recovery) = self.guest_pc_for_cache(resume)?;
                 if let Some(recovery) = recovery {
@@ -492,8 +520,11 @@ impl ThreadTranslator {
                         rewrite_scratch,
                         rewrite_context_scratch,
                         generation_pstate_scratch,
+                        indirect_x15_scratch,
+                        indirect_x30_scratch,
                     )?;
                 }
+                self.last_kick = Some((guest_pc, recovery));
                 snapshot.pc = guest_pc.raw();
                 ThreadExit::Kick
             }
@@ -512,9 +543,15 @@ fn recover_rewrite_state(
     saved_scratch: u64,
     saved_context_scratch: u64,
     saved_generation_pstate: u64,
+    saved_indirect_x15: u64,
+    saved_indirect_x30: u64,
 ) -> Result<(), types::DsrError> {
     let (register, context_register) = match action {
         emit::RecoveryAction::Noop => return Ok(()),
+        emit::RecoveryAction::RestoreGuestX17 => {
+            snapshot.x[17] = saved_context_scratch;
+            return Ok(());
+        }
         emit::RecoveryAction::RestoreGenerationGuardRegisters => {
             snapshot.x[16] = saved_scratch;
             snapshot.x[17] = saved_context_scratch;
@@ -523,6 +560,20 @@ fn recover_rewrite_state(
         emit::RecoveryAction::RestoreGenerationGuard => {
             snapshot.x[16] = saved_scratch;
             snapshot.x[17] = saved_context_scratch;
+            snapshot.pstate = saved_generation_pstate;
+            return Ok(());
+        }
+        emit::RecoveryAction::RestoreIndirectRegisters => {
+            snapshot.x[15] = saved_indirect_x15;
+            snapshot.x[16] = saved_scratch;
+            snapshot.x[17] = saved_context_scratch;
+            return Ok(());
+        }
+        emit::RecoveryAction::RestoreIndirectResolver => {
+            snapshot.x[15] = saved_indirect_x15;
+            snapshot.x[16] = saved_scratch;
+            snapshot.x[17] = saved_context_scratch;
+            snapshot.x[30] = saved_indirect_x30;
             snapshot.pstate = saved_generation_pstate;
             return Ok(());
         }
@@ -594,6 +645,28 @@ mod tests {
     fn dsr_indirect_resolver_stats_start_at_zero() {
         let translator = super::ThreadTranslator::new(16 * 1024).expect("create translator");
         assert_eq!(translator.resolver_stats(), super::ResolverStats::default());
+    }
+
+    #[test]
+    fn dsr_exec_switch_keeps_retiring_translator_metadata_alive() {
+        let old = std::sync::Arc::new(
+            super::ProcessTranslator::new(16 * 1024).expect("create old translator"),
+        );
+        let key = (PC, super::types::CodeGeneration::INITIAL);
+        let entry = super::types::CacheVa::published(carrick_guest_mem::HostVa(0x1000));
+        old.state.lock().publications.get_or_publish(key, || entry);
+        let mut thread = super::ThreadTranslator::for_process(std::sync::Arc::clone(&old));
+        let next = std::sync::Arc::new(
+            super::ProcessTranslator::new(16 * 1024).expect("create next translator"),
+        );
+
+        thread.reset_for_exec(next);
+
+        assert_eq!(
+            old.state.lock().publications.published_count(),
+            1,
+            "pre-exec threads must retain old PC metadata until their Arc retires"
+        );
     }
 
     #[test]

@@ -166,12 +166,18 @@ pub(super) enum NativeDsrExit {
         rewrite_scratch: u64,
         rewrite_context_scratch: u64,
         generation_pstate_scratch: u64,
+        indirect_x15_scratch: u64,
+        indirect_x30_scratch: u64,
+        physical_x18: u64,
+        gateway_phase: u32,
     },
     Kick {
         resume: GuestVa,
         rewrite_scratch: u64,
         rewrite_context_scratch: u64,
         generation_pstate_scratch: u64,
+        indirect_x15_scratch: u64,
+        indirect_x30_scratch: u64,
     },
     KickAtEntry {
         resume: GuestVa,
