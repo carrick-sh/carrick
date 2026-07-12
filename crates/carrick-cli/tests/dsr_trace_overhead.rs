@@ -410,7 +410,7 @@ fn run_workload(
     );
     match workload {
         Workload::SyscallFloor if !wall_time_metric => {
-            parse_metric(&text, "trap_p50_us").expect("trap_p50_us")
+            parse_metric(&text, "trap_trimmed_mean_us").expect("trap_trimmed_mean_us")
         }
         Workload::SyscallFloor => elapsed_ms,
         Workload::DirectV8 => {
