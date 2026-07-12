@@ -130,3 +130,35 @@ fn indirect_profile_aggregates_sources_pairs_and_exact_total_once() {
         1
     );
 }
+
+#[test]
+fn fork_profile_pairs_repair_reset_and_first_prepare_latency() {
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/dtrace/dsr-fork.d");
+    let script = std::fs::read_to_string(path).unwrap();
+    for probe in [
+        "dsr-cache-lifecycle",
+        "dsr-prepare-begin",
+        "fork-pre",
+        "fork-post",
+        "syscall::fork:entry",
+        "syscall::fork:return",
+    ] {
+        assert!(script.contains(probe), "missing {probe}");
+    }
+    for phase in [
+        "fork-child-repair",
+        "first-prepare-after-fork",
+        "exec-reset",
+        "first-prepare-after-exec",
+    ] {
+        assert!(
+            script.contains(&format!("DSRPROF1|sample|phase={phase}")),
+            "missing {phase} sample"
+        );
+        assert!(
+            script.contains(&format!("DSRPROF1|incomplete|phase={phase}")),
+            "missing {phase} incomplete row"
+        );
+    }
+}

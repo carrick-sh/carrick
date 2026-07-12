@@ -285,7 +285,7 @@ carrick*:::dsr-cache-capacity
 carrick*:::dsr-cache-lifecycle
 /(pid == $target || progenyof($target))/
 {
-    @cache_lifecycle_count[pid, (arg0 * 100) + arg1] = count();
+    @cache_lifecycle_count[pid, arg0, arg1] = count();
 }
 
 tick-1s
@@ -344,7 +344,7 @@ END
     printa("DSRPROF1|incomplete|phase=dispatcher|pid=%d|kind=missing-begin|value=%@d\n", @dispatch_missing_begin);
 
     printa("DSRPROF1|count|phase=cache-event|pid=%d|kind=%d|value=%@d\n", @cache_event_count);
-    printa("DSRPROF1|count|phase=cache-lifecycle|pid=%d|kind=%d|value=%@d\n", @cache_lifecycle_count);
+    printa("DSRPROF1|count|phase=cache-lifecycle|pid=%d|tid=%d|kind=%d|value=%@d\n", @cache_lifecycle_count);
     printa("DSRPROF1|high-water|metric=cache-bytes|pid=%d|used=%@d|capacity=%@d\n", @cache_used, @cache_capacity);
     printf("DSRPROF1|complete|profile=dsr|bounded=%d\n", bounded);
 }

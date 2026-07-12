@@ -2123,7 +2123,7 @@ fn run_native_dsr_thread_loop(
                         child_stack,
                     } => {
                         if fork_child {
-                            translator.after_fork_child();
+                            translator.after_fork_child(thread_runtime.tid().raw());
                             if child_stack != 0 {
                                 snapshot.sp = child_stack;
                             }

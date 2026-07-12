@@ -287,7 +287,7 @@ mod dsr_probe_abi {
         let _: fn(i32, DsrResolveKind, u64, u64, DsrOperationOutcome) = super::dsr_resolve_end;
         let _: fn(i32, DsrCacheEventKind, u64, u64, u64) = super::dsr_cache_event;
         let _: fn(DsrCacheRole, u64) = super::dsr_cache_capacity;
-        let _: fn(DsrCacheRole, DsrCacheLifecyclePhase, u64, u64, u64) = super::dsr_cache_lifecycle;
+        let _: fn(i32, DsrCacheLifecyclePhase, u64, u64, u64) = super::dsr_cache_lifecycle;
     }
 }
 
@@ -373,7 +373,7 @@ mod real {
         /// Translation-cache activity and fork/exec lifecycle boundaries.
         fn dsr__cache__event(_: i32, _: u32, _: u64, _: u64, _: u64) {}
         fn dsr__cache__capacity(_: u32, _: u64) {}
-        fn dsr__cache__lifecycle(_: u32, _: u32, _: u64, _: u64, _: u64) {}
+        fn dsr__cache__lifecycle(_: i32, _: u32, _: u64, _: u64, _: u64) {}
         // arg2 is the ADDRESS of a `SyscallArgs` ([u64; 6]); DTrace copyin's 48
         // bytes — same raw-pointer convention as `syscall__entry`, no JSON.
         fn unhandled__syscall(_: u64, _: &str, _: u64) {}
@@ -786,20 +786,14 @@ mod real {
 
     #[inline(always)]
     pub fn dsr_cache_lifecycle(
-        role: super::DsrCacheRole,
+        tid: i32,
         phase: super::DsrCacheLifecyclePhase,
         used_bytes: u64,
         block_count: u64,
         generation_count: u64,
     ) {
         carrick_usdt::dsr__cache__lifecycle!(|| {
-            (
-                role.raw(),
-                phase.raw(),
-                used_bytes,
-                block_count,
-                generation_count,
-            )
+            (tid, phase.raw(), used_bytes, block_count, generation_count)
         });
     }
 
@@ -1678,7 +1672,7 @@ mod stub {
     stub!(dsr_resolve_end(tid: i32, kind: super::DsrResolveKind, source_pc: u64, target_pc: u64, outcome: super::DsrOperationOutcome));
     stub!(dsr_cache_event(tid: i32, kind: super::DsrCacheEventKind, guest_pc: u64, generation: u64, used_bytes: u64));
     stub!(dsr_cache_capacity(role: super::DsrCacheRole, capacity_bytes: u64));
-    stub!(dsr_cache_lifecycle(role: super::DsrCacheRole, phase: super::DsrCacheLifecyclePhase, used_bytes: u64, block_count: u64, generation_count: u64));
+    stub!(dsr_cache_lifecycle(tid: i32, phase: super::DsrCacheLifecyclePhase, used_bytes: u64, block_count: u64, generation_count: u64));
     stub!(fork_pre(pc: u64, elr: u64, cpsr: u64));
     stub!(path_open(path: &str, result_size: u64, errno: i32));
     stub!(itimer_fire(signum: i32, generation: u64));
