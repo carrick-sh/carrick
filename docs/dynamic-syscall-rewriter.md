@@ -1267,3 +1267,15 @@ control-flow regressions are explicit follow-up work, not unfinished steps in
 this implementation/evidence plan. See `docs/native-dsr-ltp-campaign.md`,
 `docs/perf-results/native-dsr.jsonl`, and
 `docs/perf-results/native-dsr-profile.jsonl`.
+
+Profiling follow-up (2026-07-12): the durable `carrick trace --profile` surface
+now attributes the remaining DSR costs with versioned, fail-closed JSONL. The
+measured optimization queue is indirect target-cache collisions, repeated
+prepare lookup, exec subdivision, a low-perturbation gateway benchmark, then
+translation/publication. This is an ordered experiment program, not a claim
+that every proposed structure will win: each candidate must improve an
+untraced workload or leave an evidence-backed stop record. See the
+[measured profile report](native-dsr-dtrace-profile.md), the
+[approved design](superpowers/specs/2026-07-12-dsr-profile-driven-performance-design.md),
+and the
+[execution plan](superpowers/plans/2026-07-12-dsr-profile-driven-performance.md).

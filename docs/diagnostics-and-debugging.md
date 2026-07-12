@@ -64,6 +64,25 @@ is **essential** when tracing an interactive `-t` guest, whose terminal stream
 would otherwise interleave with probe lines and be unreadable. The file is
 written as root: `cat`/`grep` it without sudo, `rm` may need sudo.
 
+### Built-in DSR profiles
+
+For performance attribution on the Darwin-native dynamic syscall rewriter, use
+`--profile dsr`, `--profile dsr-indirect`, or `--profile dsr-fork` with
+`--summary-jsonl FILE`. The broad profile measures prepare/run/resolve/translate
+and dispatcher phases, the indirect profile attributes resolver misses by
+guest source and target, and the fork profile measures child repair and exec
+lifecycle intervals. `--profile` conflicts with a custom `--script`;
+`--summary-jsonl` requires a profile. Use a separate `--trace-out` path when the
+raw `DSRPROF1` stream should be retained.
+
+The parser fails closed on malformed or truncated streams, missing completion,
+incomplete phase pairs, and DTrace drops. Enabled profiling is deliberately
+diagnostic and can materially perturb runtime, so use its counts and phase
+relationships to choose work, then prove improvements with untraced workload
+measurements. The supported commands, schema, measured overhead, current long
+poles, and interruption behavior are recorded in the
+[native DSR profile report](native-dsr-dtrace-profile.md).
+
 ### USDT probe families
 
 The probes are static USDT, wired at the translation boundaries via the `usdt`
