@@ -8,6 +8,12 @@
 
 **Tech Stack:** Rust 1.96.0, typed DSR address/generation domains, `dynasmrt` AArch64 emission, `bad64` decode oracles, `parking_lot`, `rand` deterministic bootstrap statistics, `signal-hook`, macOS libdtrace/USDT, signed native execution, and the native arm64 Docker Linux oracle for semantics only.
 
+**Status:** Complete on 2026-07-12. Four candidates were promoted, two
+measured variants were rejected or stopped, all three final profiles completed
+naturally without drops, and the signed ecosystem/full-CI campaign passed.
+The next work is a new attribution plan for translated execution and native
+return outside translation, not another speculative change to emission.
+
 ## Global Constraints
 
 - Scope is Darwin-native AArch64 DSR; do not preserve or modify the legacy `brk` executor.
@@ -1161,7 +1167,7 @@ without a production candidate. Evidence is in
 - Consumes: every accepted candidate/evidence artifact and every inconclusive stop record.
 - Produces: final ranked remaining costs and a green correctness/performance handoff.
 
-- [ ] **Step 1: Run focused and full repository gates**
+- [x] **Step 1: Run focused and full repository gates**
 
 ```bash
 just fmt-check
@@ -1174,31 +1180,40 @@ just ci
 
 Expected: all pass from the repository root.
 
-- [ ] **Step 2: Run signed ecosystem workloads sequentially**
+- [x] **Step 2: Run signed ecosystem workloads sequentially**
 
 Run static and PIE Rust, static and PIE Go, V8/Node, fork/vfork/exec, and the
 generation/invalidation/concurrency probe set. Stamp and clean every run ID.
 Do not run Docker concurrently.
 
-- [ ] **Step 3: Run Linux semantic comparisons separately**
+- [x] **Step 3: Run Linux semantic comparisons separately**
 
 For any behavior-affecting probe, run the native arm64 Docker oracle after all
 Carrick runs complete. Use in-container `bpftrace` when syscall shape is needed.
 
-- [ ] **Step 4: Re-run all three DSR profiles**
+- [x] **Step 4: Re-run all three DSR profiles**
 
 Require complete summaries, zero drops/incomplete pairs, exact reconciliation,
 and current host/binary provenance. Compare the final ranking with the initial
 prepare/indirect/exec/gateway/translation baseline.
 
-- [ ] **Step 5: Publish final evidence and stop records**
+- [x] **Step 5: Publish final evidence and stop records**
 
 Document every accepted change, rejected variant, confidence interval, and
 remaining pole. Mark an area complete only with a promoted improvement or the
 design's two-variant evidence-backed stop condition.
 
-- [ ] **Step 6: Commit the final campaign**
+- [x] **Step 6: Commit the final campaign**
 
 Use a `docs(native): record profile-driven DSR performance` commit with a body
 that names exact correctness gates, before/after workload medians, confidence
 intervals, and remaining architectural issues.
+
+**Final result:** `RUST_TEST_THREADS=1 just ci`, the signed build, DOF check,
+Rust static/dynamic PIE, Go static/dynamic PIE, V8, JIT generation,
+concurrent-first-publication, non-leader exec, vfork/exec, and the separate
+native-arm64 Docker comparison all pass. The final broad, indirect, and fork
+profiles are natural completions with zero drops and incomplete pairs. Exact
+provenance, accepted ratios, rejection thresholds, artifact hashes, and the
+remaining architectural watch list are in
+`docs/perf-results/native-dsr-profile-driven-final.jsonl`.
