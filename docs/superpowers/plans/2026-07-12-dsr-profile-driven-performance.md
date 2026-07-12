@@ -972,6 +972,14 @@ exec-scoped nested profiling, reconciles five detail totals against every outer
 image-map sample, and requires a stable component above 30% before authorizing
 another mapping optimization.
 
+**Decomposition result:** two exact 220-exec runs rank byte copy first at
+61.94% and 62.25% of profiled image-map p50. Unaccounted work is about 19% and
+Darwin mapping about 9.2%; all other named details are below 5%. Because the
+repeated enabled probes inflate wall time, the selected copy plan must validate
+that rank with aggregate timing before changing backing representation.
+Evidence is in
+`docs/perf-results/native-dsr-exec-map-decomposition-v1.jsonl`.
+
 ---
 
 ### Task 10: Establish a low-perturbation gateway benchmark
