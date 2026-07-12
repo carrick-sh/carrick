@@ -525,7 +525,11 @@ fn emit_gateway_exit(
     Ok(())
 }
 
-fn relocated_direct_word(word: u32, exit: super::types::DirectExit) -> Result<u32, DsrError> {
+fn relocated_direct_word(
+    word: u32,
+    exit: super::types::DirectExit,
+    virtual_scratch: Option<u32>,
+) -> Result<u32, DsrError> {
     let immediate = 2_u32;
     let mut relocated = match exit.kind {
         super::types::DirectKind::Conditional | super::types::DirectKind::CompareZero { .. } => {
@@ -538,11 +542,8 @@ fn relocated_direct_word(word: u32, exit: super::types::DirectExit) -> Result<u3
             )));
         }
     };
-    if matches!(
-        exit.register,
-        Some(bad64::Reg::X18 | bad64::Reg::W18 | bad64::Reg::X28 | bad64::Reg::W28)
-    ) {
-        relocated = (relocated & !0x1f) | 17;
+    if let Some(scratch) = virtual_scratch {
+        relocated = (relocated & !0x1f) | scratch;
     }
     Ok(relocated)
 }
@@ -1153,21 +1154,23 @@ fn emit_block_inner(
                 super::gateway::direct_exit_address(),
             )?;
         } else {
-            if let Some(register) = exit.register.and_then(gpr_index)
-                && let Some(offset) = virtual_snapshot_offset(register)
-            {
+            let virtual_offset = exit
+                .register
+                .and_then(gpr_index)
+                .and_then(virtual_snapshot_offset);
+            if let Some(offset) = virtual_offset {
                 emit_word(
                     &mut assembler,
                     &mut entries,
                     exit_guest,
-                    0xf940_0000 | ((offset / 8) << 10) | (28 << 5) | 17,
+                    0xf940_0000 | ((offset / 8) << 10) | (28 << 5) | 18,
                 )?;
             }
             emit_word(
                 &mut assembler,
                 &mut entries,
                 exit_guest,
-                relocated_direct_word(word, exit)?,
+                relocated_direct_word(word, exit, virtual_offset.map(|_| 18))?,
             )?;
             let fall_slot = current_offset(&assembler)?;
             direct_links.push(DirectLink {
