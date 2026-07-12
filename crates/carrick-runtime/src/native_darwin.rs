@@ -6230,7 +6230,12 @@ impl NativeMappedMemory {
         native_exec_map_profile_start(exec_map_dsr_tid);
         let mut regions = Vec::new();
         for region in image.regions() {
-            map_region(region, native_code_mode, exec_map_dsr_tid)?;
+            map_region(
+                region,
+                native_code_mode,
+                exec_map_dsr_tid,
+                image.initial_stack_pointer(),
+            )?;
             if region.start == NATIVE_DARWIN_VDSO_BASE && region.perms.execute {
                 native_exec_map_detail(
                     exec_map_dsr_tid,
@@ -8163,10 +8168,35 @@ fn native_exec_map_detail(
     }
 }
 
+fn native_region_copy_window(
+    region: &MemoryRegion,
+    initial_stack_pointer: Option<u64>,
+) -> std::ops::Range<usize> {
+    let full = 0..region.bytes().len();
+    let stack_start = crate::memory::LINUX_STACK_TOP - crate::memory::LINUX_STACK_SIZE;
+    if region.start != stack_start || region.end != crate::memory::LINUX_STACK_TOP {
+        return full;
+    }
+    let Some(stack_pointer) = initial_stack_pointer else {
+        return full;
+    };
+    let Some(offset) = stack_pointer.checked_sub(region.start) else {
+        return full;
+    };
+    let Ok(offset) = usize::try_from(offset) else {
+        return full;
+    };
+    if offset > region.bytes().len() {
+        return full;
+    }
+    offset..region.bytes().len()
+}
+
 fn map_region(
     region: &MemoryRegion,
     native_code_mode: carrick_spec::NativeCodeModeRequest,
     exec_map_dsr_tid: Option<crate::thread::ThreadId>,
+    initial_stack_pointer: Option<u64>,
 ) -> Result<(), RuntimeError> {
     let length_u64 = region.end.checked_sub(region.start).ok_or_else(|| {
         RuntimeError::Unsupported("native Darwin empty inverted region".to_string())
@@ -8225,14 +8255,20 @@ fn map_region(
     );
 
     let bytes = region.bytes();
-    if !bytes.is_empty() {
+    let copy_window = native_region_copy_window(region, initial_stack_pointer);
+    let copy_bytes = &bytes[copy_window.clone()];
+    if !copy_bytes.is_empty() {
         native_exec_map_detail(
             exec_map_dsr_tid,
             crate::probes::DsrCacheLifecyclePhase::ExecMapCopyBegin,
-            u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            u64::try_from(copy_bytes.len()).unwrap_or(u64::MAX),
         );
         unsafe {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), mapped.cast::<u8>(), bytes.len());
+            std::ptr::copy_nonoverlapping(
+                copy_bytes.as_ptr(),
+                mapped.cast::<u8>().add(copy_window.start),
+                copy_bytes.len(),
+            );
         }
         native_exec_map_detail(
             exec_map_dsr_tid,
@@ -9031,6 +9067,7 @@ mod tests {
         map_region(
             &image.regions()[0],
             carrick_spec::NativeCodeModeRequest::Dsr,
+            None,
             None,
         )
         .expect("map DSR original code page");
@@ -10517,6 +10554,42 @@ mod tests {
             native_region_copy_window(&non_stack.regions()[0], Some(initialized)),
             0..non_stack.regions()[0].bytes().len()
         );
+    }
+
+    #[test]
+    fn native_stack_suffix_mapping_preserves_sp_and_zero_prefix() {
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            let image = AddressSpace::from_regions(0, Vec::new())
+                .and_then(|image| {
+                    image.with_linux_initial_stack(
+                        [b"stack-window".as_slice()],
+                        std::iter::empty::<&[u8]>(),
+                    )
+                })
+                .expect("build initial stack");
+            let sp = image.initial_stack_pointer().expect("stack pointer");
+            let mapped = NativeMappedMemory::map_with_code_mode(
+                &image,
+                native_memory_layout(),
+                16 * 1024,
+                16 * 1024,
+                carrick_spec::NativeCodeModeRequest::Dsr,
+            )
+            .is_ok();
+            if !mapped {
+                unsafe { libc::_exit(2) };
+            }
+            let argc = unsafe { (sp as *const u64).read() };
+            let below = unsafe { ((sp - 8) as *const u64).read() };
+            unsafe { libc::_exit(i32::from(!(argc == 1 && below == 0))) };
+        }
+
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFEXITED(status), "child status was 0x{status:x}");
+        assert_eq!(libc::WEXITSTATUS(status), 0);
     }
 
     #[test]
