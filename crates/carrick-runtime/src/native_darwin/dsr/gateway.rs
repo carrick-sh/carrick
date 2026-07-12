@@ -97,6 +97,8 @@ struct DsrContext {
     entry_pad: u32,
     indirect_x15_scratch: u64,
     indirect_x30_scratch: u64,
+    cache_start: u64,
+    cache_end: u64,
 }
 
 impl DsrContext {
@@ -106,6 +108,8 @@ impl DsrContext {
         exit: NativeDsrExit,
         indirect_cache: *const IndirectTargetCacheEntry,
         generation: CodeGeneration,
+        cache_start: usize,
+        cache_end: usize,
     ) -> Self {
         let (exit_target, exit_source, _exit_status, exit_link, exit_has_link) = match exit {
             NativeDsrExit::Syscall { resume } => (resume.raw(), 0, 1, 0, 0),
@@ -157,6 +161,8 @@ impl DsrContext {
             entry_pad: 0,
             indirect_x15_scratch: snapshot.x[15],
             indirect_x30_scratch: snapshot.x[30],
+            cache_start: cache_start as u64,
+            cache_end: cache_end as u64,
         }
     }
 }
@@ -180,7 +186,9 @@ const _: () = assert!(std::mem::offset_of!(DsrContext, generation) == 1144);
 const _: () = assert!(std::mem::offset_of!(DsrContext, entry_in_progress) == 1152);
 const _: () = assert!(std::mem::offset_of!(DsrContext, indirect_x15_scratch) == 1160);
 const _: () = assert!(std::mem::offset_of!(DsrContext, indirect_x30_scratch) == 1168);
-const _: () = assert!(std::mem::size_of::<DsrContext>() == 1184);
+const _: () = assert!(std::mem::offset_of!(DsrContext, cache_start) == 1176);
+const _: () = assert!(std::mem::offset_of!(DsrContext, cache_end) == 1184);
+const _: () = assert!(std::mem::size_of::<DsrContext>() == 1200);
 const _: () = assert!(std::mem::size_of::<IndirectTargetCacheEntry>() == 32);
 const _: () = assert!(std::mem::offset_of!(IndirectTargetCacheEntry, guest) == 0);
 const _: () = assert!(std::mem::offset_of!(IndirectTargetCacheEntry, generation) == 8);
@@ -231,6 +239,8 @@ pub(super) fn enter_translated(
         exit,
         std::ptr::null(),
         CodeGeneration::INITIAL,
+        0,
+        usize::MAX,
     )
 }
 
@@ -246,6 +256,27 @@ pub(super) fn enter_translated_with_cache(
         exit,
         indirect_cache.as_ptr(),
         CodeGeneration::INITIAL,
+        0,
+        usize::MAX,
+    )
+}
+
+pub(super) fn enter_translated_with_cache_range(
+    entry: CacheVa,
+    snapshot: &mut NativeUcontextSnapshot,
+    exit: &mut NativeDsrExit,
+    indirect_cache: &IndirectTargetCache,
+    cache_start: usize,
+    cache_end: usize,
+) -> Result<(), DsrError> {
+    enter_translated_raw(
+        entry,
+        snapshot,
+        exit,
+        indirect_cache.as_ptr(),
+        CodeGeneration::INITIAL,
+        cache_start,
+        cache_end,
     )
 }
 
@@ -255,6 +286,8 @@ fn enter_translated_raw(
     exit: &mut NativeDsrExit,
     indirect_cache: *const IndirectTargetCacheEntry,
     generation: CodeGeneration,
+    cache_start: usize,
+    cache_end: usize,
 ) -> Result<(), DsrError> {
     if !matches!(
         *exit,
@@ -270,7 +303,15 @@ fn enter_translated_raw(
             "DSR gateway only accepts syscall or control-flow exits".to_string(),
         ));
     }
-    let mut context = DsrContext::new(*snapshot, entry, *exit, indirect_cache, generation);
+    let mut context = DsrContext::new(
+        *snapshot,
+        entry,
+        *exit,
+        indirect_cache,
+        generation,
+        cache_start,
+        cache_end,
+    );
     let rc = unsafe { carrick_dsr_enter_raw(&mut context) };
     if !matches!(rc, 1..=8) {
         return Err(DsrError::Gateway(format!(

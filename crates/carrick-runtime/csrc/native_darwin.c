@@ -54,6 +54,8 @@ struct carrick_native_dsr_signal_context {
     uint32_t entry_pad;
     uint64_t indirect_x15_scratch;
     uint64_t indirect_x30_scratch;
+    uint64_t cache_start;
+    uint64_t cache_end;
 };
 
 _Static_assert(offsetof(struct carrick_native_dsr_signal_context, host_sp) == 832,
@@ -74,6 +76,10 @@ _Static_assert(offsetof(struct carrick_native_dsr_signal_context, indirect_x15_s
                "DSR indirect x15 scratch offset");
 _Static_assert(offsetof(struct carrick_native_dsr_signal_context, indirect_x30_scratch) == 1168,
                "DSR indirect x30 scratch offset");
+_Static_assert(offsetof(struct carrick_native_dsr_signal_context, cache_start) == 1176,
+               "DSR cache start offset");
+_Static_assert(offsetof(struct carrick_native_dsr_signal_context, cache_end) == 1184,
+               "DSR cache end offset");
 
 struct carrick_native_kick_state {
     _Atomic uint64_t requested;
@@ -195,6 +201,7 @@ static _Thread_local int32_t carrick_native_last_signal_code;
 static _Thread_local uint64_t carrick_native_last_fault_address;
 static _Thread_local struct carrick_native_dsr_signal_context
     *carrick_native_active_dsr_context;
+static _Thread_local bool carrick_native_dsr_test_phase_zero_host_kick;
 
 extern void carrick_dsr_exit_signal(void);
 extern unsigned char carrick_dsr_exit_common_start[];
@@ -308,12 +315,23 @@ int carrick_native_dsr_enter_guest_abi(void *context) {
         carrick_native_active_dsr_context = 0;
         return -1;
     }
+    if (carrick_native_dsr_test_phase_zero_host_kick) {
+        carrick_native_dsr_test_phase_zero_host_kick = false;
+        ((struct carrick_native_dsr_signal_context *)context)->entry_in_progress = 0;
+        if (raise(SIGPIPE) != 0) {
+            return -1;
+        }
+    }
     if (carrick_native_unblock_kick_signal() != 0) {
         carrick_native_active_dsr_context = 0;
         carrick_native_enter_host_x18_abi();
         return -1;
     }
     return 0;
+}
+
+void carrick_native_dsr_test_phase_zero_host_kick_once(void) {
+    carrick_native_dsr_test_phase_zero_host_kick = true;
 }
 
 void carrick_native_dsr_enter_host_abi(void) {
@@ -517,10 +535,17 @@ static void carrick_native_trap_handler(int sig, siginfo_t *info, void *uap) {
             // exit below without replacing the completed guest exit with the
             // host library PC.
         } else if (event_kind == CARRICK_NATIVE_EVENT_KICK &&
-                   context->entry_in_progress == 1) {
+                   (context->entry_in_progress == 1 ||
+                    (context->entry_in_progress == 0 &&
+                     (interrupted_pc < context->cache_start ||
+                      interrupted_pc >= context->cache_end)))) {
             // The kick became deliverable while the gateway was still inside
-            // pthread_sigmask. No translated instruction has run, so the
-            // context's original guest PC and registers are authoritative.
+            // pthread_sigmask, or a stale active-context window exposed a host
+            // PC while phase zero claimed translated execution. No translated
+            // instruction at that PC can be authoritative: DSR executes only
+            // inside the MAP_JIT cache, whose bounds are carried in-context.
+            // Preserve the original guest snapshot rather than replacing it
+            // with host registers.
             context->exit_target = context->snapshot.pc;
             context->exit_source = 0;
             context->exit_status = 8;
