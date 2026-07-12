@@ -66,8 +66,10 @@ just run run ubuntu:24.04 /bin/echo hi      # docker-style: pull an image + run 
 
 Carrick also has an experimental Darwin-native backend for same-ISA
 `linux/arm64` binaries. It executes guest instructions directly in a macOS
-process, without an HVF vCPU. The default remains the release-quality HVF path;
-native execution is explicit and trusted-code-only:
+process, without an HVF vCPU. Darwin-native execution always uses the dynamic
+syscall rewriter (DSR); there is no alternate native instruction-execution
+mode. The default remains the release-quality HVF path, while native execution
+is explicit and trusted-code-only:
 
 ```sh
 target/release/carrick run \
