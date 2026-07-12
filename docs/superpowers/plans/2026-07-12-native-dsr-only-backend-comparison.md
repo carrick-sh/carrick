@@ -50,6 +50,9 @@
 - Modify: `crates/carrick-cli/src/commands.rs`
 - Modify: `crates/carrick-cli/src/lifecycle.rs`
 - Modify: `crates/carrick-cli/tests/cli.rs`
+- Modify: `crates/carrick-cli/tests/conformance.rs`
+- Modify: `crates/carrick-conformance/src/lane.rs`
+- Modify: `crates/carrick-conformance/src/main.rs`
 - Modify: `crates/carrick-runtime/src/container.rs`
 - Modify: `crates/carrick-runtime/src/execute.rs`
 - Modify: `crates/carrick-runtime/src/page_profile.rs`
@@ -166,6 +169,20 @@ pub(crate) fn resolve_execution_plan_for_request(
 Serde's normal unknown-field behavior reads old container state but ignores the
 removed value; new state never writes it.
 
+Remove the mode argument from native conformance helpers. Replace
+`run_native_code_mode_run_elf_with_args` with:
+
+```rust
+fn run_native_run_elf_with_args(
+    bin: &Path, probe: &Path, native_page_profile: &'static str,
+    guest_args: &[&str],
+) -> ProbeOutput
+```
+
+Keep the `macos-native-dsr` lane and overlay names for result-history
+continuity, but inject only `--exec-backend native --native-page-profile
+native16k`. Rename the lane test and assert `--native-code-mode` is absent.
+
 - [ ] **Step 4: Make native mapping and execution unconditionally DSR**
 
 `run_native_thread_loop` delegates directly:
@@ -252,7 +269,8 @@ Expected: tests/clippy pass, `MATCH nativebrk`, and the final audit has no match
 
 ```bash
 git add crates/carrick-spec crates/carrick-engine crates/carrick-cli/src \
-  crates/carrick-cli/tests/cli.rs crates/carrick-runtime/src \
+  crates/carrick-cli/tests/cli.rs crates/carrick-cli/tests/conformance.rs \
+  crates/carrick-conformance/src crates/carrick-runtime/src \
   crates/carrick-runtime/csrc/native_darwin.c conformance-probes/src/bin/nativebrk.rs
 git commit -m "refactor(native): make DSR the sole execution path" -m "Remove native code-mode policy, the legacy SIGTRAP executor, generated BRK sentinels, and the BRK comparison oracle while preserving guest ABI semantics.
 
@@ -266,9 +284,6 @@ Co-Authored-By: Codex <codex@openai.com>"
 ### Task 2: Prove guest `brk` semantics and migrate the native lane/current docs
 
 **Files:**
-- Modify: `crates/carrick-cli/tests/conformance.rs`
-- Modify: `crates/carrick-conformance/src/lane.rs`
-- Modify: `crates/carrick-conformance/src/main.rs`
 - Modify: `README.md`
 - Modify: `docs/dynamic-syscall-rewriter.md`
 - Modify: `docs/native-dsr-static-campaign.md`
@@ -277,26 +292,10 @@ Co-Authored-By: Codex <codex@openai.com>"
 - Modify: `docs/diagnostics-and-debugging.md`
 
 **Interfaces:**
-- Consumes: Task 1 DSR-only CLI, `nativebrk`, and the existing probe harness.
-- Produces: a native16k lane without a code-mode flag and current DSR-only docs.
+- Consumes: Task 1 DSR-only CLI/lane and the `nativebrk` witness.
+- Produces: current DSR-only documentation with historical evidence preserved.
 
-- [ ] **Step 1: Remove mode arguments from conformance helpers**
-
-Replace `run_native_code_mode_run_elf_with_args` with:
-
-```rust
-fn run_native_run_elf_with_args(
-    bin: &Path, probe: &Path, native_page_profile: &'static str,
-    guest_args: &[&str],
-) -> ProbeOutput
-```
-
-The command supplies `--exec-backend native --native-page-profile native16k`.
-Keep the `macos-native-dsr` lane/overlay names for historical result continuity,
-but its injected arguments contain only backend and page profile. Rename the
-lane test and assert `--native-code-mode` is absent.
-
-- [ ] **Step 2: Update current docs without rewriting dated history**
+- [ ] **Step 1: Update current docs without rewriting dated history**
 
 Remove obsolete mode arguments from current commands and describe DSR as the
 only native path. In `dynamic-syscall-rewriter.md`, replace dual-mode bring-up
@@ -304,7 +303,7 @@ instructions with a superseded-history note and link to the approved design.
 Do not rewrite dated plans, old JSONL, or evidence that truthfully records the
 former comparison.
 
-- [ ] **Step 3: Verify and commit**
+- [ ] **Step 2: Verify and commit**
 
 ```bash
 cargo test -p carrick-conformance lane::tests --lib
@@ -313,11 +312,10 @@ rg -n "native-code-mode|CARRICK_NATIVE_CODE_MODE" README.md \
   docs/dynamic-syscall-rewriter.md docs/native-dsr-static-campaign.md \
   docs/native-dsr-ltp-campaign.md docs/native-dsr-dtrace-profile.md \
   docs/diagnostics-and-debugging.md crates scripts bench-native conformance-probes
-git add conformance-probes/src/bin/nativebrk.rs crates/carrick-cli/tests/conformance.rs \
-  crates/carrick-conformance/src README.md docs/dynamic-syscall-rewriter.md \
+git add README.md docs/dynamic-syscall-rewriter.md \
   docs/native-dsr-static-campaign.md docs/native-dsr-ltp-campaign.md \
   docs/native-dsr-dtrace-profile.md docs/diagnostics-and-debugging.md
-git commit -m "test(native): prove DSR breakpoint semantics" -m "Add a guest-authored BRK witness, remove obsolete code-mode arguments from the native lane, and update current documentation to DSR-only execution.
+git commit -m "docs(native): document DSR-only execution" -m "Update current native commands and architecture text for the sole DSR execution path while preserving dated BRK comparison evidence as historical context.
 
 Verified: nativebrk Carrick/Docker MATCH, lane tests, and current-doc mode audit.
 
