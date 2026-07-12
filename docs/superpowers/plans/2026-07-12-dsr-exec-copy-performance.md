@@ -48,11 +48,14 @@ below 0.95; syscall-floor and direct V8 do not regress beyond their existing
 - Modify: `scripts/dtrace/dsr-fork.d`
 - Modify: `crates/carrick-cli/tests/trace_profile.rs`
 
-- [ ] **Step 1: Add a typed aggregate probe red**
+- [x] **Step 1: Add a typed aggregate probe red**
 
 Add `DsrExecMapDetailKind::{Mmap, Copy, Icache, Protect, Vvar}` and
 `dsr_exec_map_detail(tid, kind, duration_ns, bytes, operations)`. Pin exact
 ordinals, uniqueness, real/stub signatures, and five script output rows.
+
+Observed: all typed ABI tests pass; the script contract fails at
+`missing dsr-exec-map-detail`.
 
 - [ ] **Step 2: Accumulate only in runtime-profile mode**
 
