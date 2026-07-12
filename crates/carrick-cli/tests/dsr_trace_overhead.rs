@@ -246,6 +246,19 @@ fn improvement_policy_requires_supported_nonzero_gain() {
 }
 
 #[test]
+fn relative_gate_paths_are_workspace_relative() {
+    let root = Path::new("/workspace/carrick");
+    assert_eq!(
+        resolve_repo_path(PathBuf::from("target/perf/candidate"), root),
+        PathBuf::from("/workspace/carrick/target/perf/candidate"),
+    );
+    assert_eq!(
+        resolve_repo_path(PathBuf::from("/tmp/candidate"), root),
+        PathBuf::from("/tmp/candidate"),
+    );
+}
+
+#[test]
 #[ignore = "explicit 30+10 ABBA signed-binary performance gate"]
 fn disabled_probe_overhead() {
     run_binary_gate(
@@ -717,7 +730,16 @@ fn repo_root() -> PathBuf {
 }
 
 fn required_path(key: &str) -> PathBuf {
-    PathBuf::from(std::env::var_os(key).unwrap_or_else(|| panic!("{key} is required")))
+    let path = PathBuf::from(std::env::var_os(key).unwrap_or_else(|| panic!("{key} is required")));
+    resolve_repo_path(path, &repo_root())
+}
+
+fn resolve_repo_path(path: PathBuf, root: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        root.join(path)
+    }
 }
 
 fn host_context() -> HostContext {
