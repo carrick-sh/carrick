@@ -11,17 +11,16 @@ executor is neither a control lane nor part of this campaign.
 - Mode: `--exec-backend native --native-page-profile native16k
   --native-code-mode dsr`.
 - Full LTP artifact:
-  `target/conformance/native-dsr-ltp-b4c39562.jsonl` at `b4c39562`.
+  `target/conformance/native-dsr-ltp-b5178a99.jsonl` at documentation HEAD
+  `b5178a99`, using runtime `cba2eb9c`.
 - Focused post-campaign fixes: `d5fd9e00` rejects host PCs during phase-zero
   kicks; `10bebc42` removes the last ordinary indirect-target transit through
   physical `x18`; `cba2eb9c` validates target generations in target blocks.
 - Current signed binary SHA-256 after those runtime fixes:
   `d7df4fa70656edc449afea7656b8c5e1e9f092797db587a3b40d67715514de86`.
 
-The full artifact is retained rather than relabelled as a current-HEAD run.
-The two later changes have focused proof below. A final full rerun at current
-HEAD remains required before changing the mode's default or making a stronger
-parity claim.
+This is a current-runtime full run. Docker supplied 1,492 cached oracle rows in
+a separate phase; no Carrick and Docker guests overlapped.
 
 ## Strict LTP result
 
@@ -29,25 +28,25 @@ The selected corpus contains 1,492 rows. The fresh DSR/Linux differential is:
 
 | Classification | Rows |
 | --- | ---: |
-| match | 1,325 |
-| diff | 57 |
+| match | 1,331 |
+| diff | 58 |
 | new | 12 |
-| regression | 97 |
+| regression | 90 |
 | timeout | 1 |
-| gating regressions plus timeout | 98 |
+| gating regressions plus timeout | 91 |
 | no-assertion rows on both sides | 227 |
 
-Carrick produced 1,126 successful, 363 failed, two empty, and one missing
+Carrick produced 1,129 successful, 359 failed, three empty, and one missing
 result. These are differential harness classifications, not a claim that DSR
-implements 1,325 Linux syscalls or that all matching rows pass on Linux.
+implements 1,331 Linux syscalls or that all matching rows pass on Linux.
 
-The run eliminated all earlier PC-zero DSR cache-policy exits. It exposed one
-remaining host-PC kick in `ltp-mq_open01`; `d5fd9e00` fixed that phase-zero
-classification and its deterministic oracle test passes. Twelve focused
-`mq_open01` launches produced no DSR cache-policy error after the fix. Eleven
-ordinary test failures were contaminated by stale `/test_mqueue` state after
-scoped cleanup could not sudo, so they are not evidence that `mq_open01`
-semantics were repaired.
+The run contains no DSR cache-PC or cache-policy exit; the earlier PC-zero and
+host-PC kick failures are absent. Five typed DSR instruction-read errors target
+addresses outside guest memory. Three are differential regressions
+(`ltp-profil01`, `ltp-timer_settime01`, and `ltp-timer_settime03`); two occur in
+rows whose overall result matches Linux (`ltp-epoll-ltp` and
+`ltp-perf_event_open02`). They are explicit signal/control-flow limitations,
+not crashes or silent execution fallbacks, and remain narrowing work.
 
 `CLONE_PARENT` remains a typed runtime limitation. The other LTP regressions
 are syscall-emulation and process-model work until minimized evidence shows a
@@ -108,9 +107,16 @@ distribution, not a per-branch cost. Exact samples and caveats are in
 
 ## Current decision
 
-DSR remains an opt-in experiment. It has crossed the important mechanism
-thresholds—static parity, dynamic PIE execution, direct V8 generated code, Go
-PIE, and correct Rust static-PIE fork+exec—but it has not crossed the workload
-or performance threshold for a default-mode decision. The next proof points
-are a current-HEAD full LTP rerun, fork-heavy CPython completion, and fork
-lifecycle attribution.
+DSR remains an opt-in experiment: the default-mode gate is **NO-GO**. It has
+crossed the important mechanism thresholds—static parity, dynamic PIE
+execution, direct V8 generated code, Go PIE, and correct Rust static-PIE
+fork+exec—but it has not crossed the workload or performance threshold. The 91
+gating LTP rows, three DSR control-flow regressions, official Node wrapper
+failure, CPython multiprocessing timeout, and 60.7x fork+exec latency gap are
+specific blockers. The next proof points are narrowing the three DSR target
+errors, fork-heavy CPython completion, and fork lifecycle attribution.
+
+The final workspace gate, `just ci`, passes. One first-attempt failure in the
+unrelated epoll edge-trigger host test passed five immediate focused reruns; a
+complete second `just ci` then passed all formatting, lint, dependency, matrix,
+build, documentation, host-test, and integration-test stages.
