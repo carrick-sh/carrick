@@ -1278,12 +1278,8 @@ mod tests {
         };
         let image = super::super::AddressSpace::from_regions(0, Vec::new())
             .map_err(|error| error.to_string())?;
-        let mut memory = super::super::NativeMappedMemory::map_with_code_mode(
-            &image,
-            layout,
-            page_size,
-            page_size,
-            carrick_spec::NativeCodeModeRequest::Dsr,
+        let mut memory = super::super::NativeMappedMemory::map_with_translator(
+            &image, layout, page_size, page_size, None, None,
         )
         .map_err(|error| error.to_string())?;
         let code = words

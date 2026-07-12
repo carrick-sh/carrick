@@ -119,10 +119,9 @@ pub fn run_carrick(
         !mount || fs_mode == "host",
         "bind-mount perf cases require carrick --fs host"
     );
-    let direct_native_dsr = !mount
-        && std::env::var("CARRICK_EXEC_BACKEND").is_ok_and(|value| value == "native")
-        && std::env::var("CARRICK_NATIVE_CODE_MODE").is_ok_and(|value| value == "dsr");
-    if direct_native_dsr {
+    let direct_native =
+        !mount && std::env::var("CARRICK_EXEC_BACKEND").is_ok_and(|value| value == "native");
+    if direct_native {
         let probe_path = probe.to_string_lossy().into_owned();
         let child = Command::new(bin)
             .args([
@@ -132,8 +131,6 @@ pub fn run_carrick(
                 "native",
                 "--native-page-profile",
                 "native16k",
-                "--native-code-mode",
-                "dsr",
                 &probe_path,
             ])
             .env("CARRICK_RUN_ID", run_id)

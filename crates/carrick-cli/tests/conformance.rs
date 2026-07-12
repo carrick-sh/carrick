@@ -2702,7 +2702,8 @@ fn run_native_run_elf_with_args(
     native_page_profile: &'static str,
     guest_args: &[&str],
 ) -> String {
-    run_native_code_mode_run_elf_with_args(bin, probe, native_page_profile, None, guest_args)
+    let run_id = case_run_id();
+    run_native_run_elf_with_run_id(bin, probe, native_page_profile, guest_args, &run_id)
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -2712,20 +2713,20 @@ fn run_native_dsr_run_elf_with_args(
     native_page_profile: &'static str,
     guest_args: &[&str],
 ) -> String {
-    run_native_code_mode_run_elf_with_args(bin, probe, native_page_profile, Some("dsr"), guest_args)
+    let run_id = case_run_id();
+    run_native_run_elf_with_run_id(bin, probe, native_page_profile, guest_args, &run_id)
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn run_native_code_mode_run_elf_with_args(
+fn run_native_run_elf_with_run_id(
     bin: &PathBuf,
     probe: &PathBuf,
     native_page_profile: &'static str,
-    native_code_mode: Option<&'static str>,
     guest_args: &[&str],
+    run_id: &str,
 ) -> String {
     use std::os::unix::process::CommandExt;
 
-    let run_id = case_run_id();
     let mut command = Command::new(bin);
     command.args([
         "run-elf",
@@ -2735,15 +2736,12 @@ fn run_native_code_mode_run_elf_with_args(
         "--native-page-profile",
         native_page_profile,
     ]);
-    if let Some(mode) = native_code_mode {
-        command.args(["--native-code-mode", mode]);
-    }
     command.arg(probe);
     if !guest_args.is_empty() {
         command.arg("--").args(guest_args);
     }
     let child = command
-        .env("CARRICK_RUN_ID", &run_id)
+        .env("CARRICK_RUN_ID", run_id)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .process_group(0)
@@ -2753,7 +2751,7 @@ fn run_native_code_mode_run_elf_with_args(
     let done = Arc::new(AtomicBool::new(false));
     let watcher = {
         let done = Arc::clone(&done);
-        let run_id = run_id.clone();
+        let run_id = String::from(run_id);
         std::thread::spawn(move || {
             let start = Instant::now();
             while !done.load(Ordering::Relaxed) {

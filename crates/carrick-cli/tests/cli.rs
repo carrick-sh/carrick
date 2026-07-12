@@ -9,6 +9,32 @@ use carrick_test_support::gzip_tar;
 use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 
+fn command() -> Command {
+    Command::cargo_bin("carrick").expect("carrick test binary")
+}
+
+#[test]
+fn native_code_mode_flag_is_not_public_policy() {
+    let output = command()
+        .args([
+            "run-elf",
+            "--exec-backend",
+            "native",
+            "--native-page-profile",
+            "native16k",
+            "--native-code-mode",
+            "dsr",
+            "/does/not/matter",
+        ])
+        .output()
+        .expect("run carrick CLI parser");
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("unexpected argument '--native-code-mode'")
+    );
+}
+
 #[test]
 fn inspect_elf_command_prints_json_metadata() {
     let dir = tempfile::tempdir().unwrap();

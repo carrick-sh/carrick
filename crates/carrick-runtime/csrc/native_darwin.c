@@ -4,7 +4,6 @@
 #ifndef _DARWIN_C_SOURCE
 #define _DARWIN_C_SOURCE
 #endif
-
 #include <dlfcn.h>
 #include <errno.h>
 #include <libkern/OSCacheControl.h>
@@ -186,19 +185,9 @@ uint64_t carrick_native_kick_state_acknowledged(void *opaque) {
 }
 
 #if defined(__aarch64__)
-static _Thread_local sigjmp_buf carrick_native_env;
-static _Thread_local sigjmp_buf carrick_native_return_env;
-static _Thread_local volatile sig_atomic_t carrick_native_env_ready;
-static _Thread_local ucontext_t carrick_native_uc;
-static _Thread_local ucontext_t *carrick_native_pending_uc;
 static _Thread_local unsigned char carrick_native_signal_stack[64 * 1024]
     __attribute__((aligned(16)));
 static _Thread_local uint64_t carrick_native_host_tpidr_el0;
-static _Thread_local volatile sig_atomic_t carrick_native_bootstrap_pending;
-static _Thread_local int32_t carrick_native_last_event_kind;
-static _Thread_local int32_t carrick_native_last_signal;
-static _Thread_local int32_t carrick_native_last_signal_code;
-static _Thread_local uint64_t carrick_native_last_fault_address;
 static _Thread_local struct carrick_native_dsr_signal_context
     *carrick_native_active_dsr_context;
 static _Thread_local bool carrick_native_dsr_test_phase_zero_host_kick;
@@ -223,30 +212,13 @@ static int carrick_native_block_kick_signal(void);
 
 #define CARRICK_NATIVE_CUSTOM_X18_BIT UINT64_C(0x0001000000000000)
 #define CARRICK_NATIVE_TPIDR_BASE_MASK UINT64_C(0xfffffffffff00000)
-#define CARRICK_NATIVE_EVENT_TRAP 1
+#define CARRICK_NATIVE_EVENT_SIGNAL 1
 #define CARRICK_NATIVE_EVENT_KICK 2
-
-static struct __darwin_mcontext64 *carrick_native_mcontext(void) {
-    return carrick_native_uc.uc_mcontext;
-}
-
-__attribute__((always_inline)) static inline void carrick_native_copy_mcontext(
-    struct __darwin_mcontext64 *destination,
-    const struct __darwin_mcontext64 *source) {
-    __builtin_memcpy_inline(
-        destination,
-        source,
-        sizeof(*destination));
-}
 
 static uint64_t carrick_native_read_tpidr_el0(void) {
     uint64_t value;
     __asm__ volatile("mrs %0, TPIDR_EL0" : "=r"(value));
     return value;
-}
-
-static void carrick_native_write_tpidr_el0(uint64_t value) {
-    __asm__ volatile("msr TPIDR_EL0, %0" : : "r"(value) : "memory");
 }
 
 // The public setter aborts on a same-state call. Signal entry can race that
@@ -467,49 +439,12 @@ static void carrick_native_fatal_signal_handler(int sig, siginfo_t *info, void *
     _exit(128 + sig);
 }
 
-static int carrick_native_prepare_guest_mask(sigset_t *mask) {
-    return sigdelset(mask, SIGTRAP) != 0 ||
-           sigdelset(mask, SIGSEGV) != 0 ||
-           sigdelset(mask, SIGBUS) != 0 ||
-           sigdelset(mask, SIGILL) != 0 ||
-           sigdelset(mask, SIGPIPE) != 0
-               ? -1
-               : 0;
-}
-
-static int carrick_native_prepare_host_mask(sigset_t *mask) {
-    return sigdelset(mask, SIGTRAP) != 0 ||
-           sigdelset(mask, SIGSEGV) != 0 ||
-           sigdelset(mask, SIGBUS) != 0 ||
-           sigdelset(mask, SIGILL) != 0 ||
-           sigaddset(mask, SIGPIPE) != 0
-               ? -1
-               : 0;
-}
-
-static void carrick_native_trap_handler(int sig, siginfo_t *info, void *uap) {
-    if (sig == SIGTRAP && carrick_native_bootstrap_pending && uap != 0) {
-        ucontext_t *uc = (ucontext_t *)uap;
-        struct __darwin_mcontext64 *seeded = carrick_native_mcontext();
-        if (uc->uc_mcontext == 0 || seeded == 0) {
-            _exit(128 + sig);
-        }
-        carrick_native_bootstrap_pending = 0;
-        carrick_native_copy_mcontext(uc->uc_mcontext, seeded);
-        carrick_native_pending_uc = 0;
-        if (carrick_native_prepare_guest_mask(&uc->uc_sigmask) != 0 ||
-            carrick_native_enter_guest_x18_abi() != 0) {
-            _exit(128 + sig);
-        }
-        return;
-    }
-
-    int32_t event_kind = CARRICK_NATIVE_EVENT_TRAP;
+static void carrick_native_dsr_signal_handler(int sig, siginfo_t *info, void *uap) {
+    int32_t event_kind = CARRICK_NATIVE_EVENT_SIGNAL;
     if (sig == SIGPIPE) {
         bool requested = carrick_native_kick_state_take(
             carrick_native_bound_kick_state);
-        if (carrick_native_active_dsr_context == 0 &&
-            !carrick_native_env_ready) {
+        if (carrick_native_active_dsr_context == 0) {
             if (requested) {
                 carrick_native_dsr_deferred_kick = 1;
             }
@@ -523,12 +458,12 @@ static void carrick_native_trap_handler(int sig, siginfo_t *info, void *uap) {
         if (!requested && carrick_native_active_dsr_context == 0) {
             return;
         }
-        if ((!carrick_native_env_ready && carrick_native_active_dsr_context == 0) || uap == 0) {
+        if (uap == 0) {
             return;
         }
         event_kind = CARRICK_NATIVE_EVENT_KICK;
     } else if ((sig != SIGTRAP && sig != SIGSEGV && sig != SIGBUS) ||
-               (!carrick_native_env_ready && carrick_native_active_dsr_context == 0) || uap == 0) {
+               carrick_native_active_dsr_context == 0 || uap == 0) {
         carrick_native_fatal_signal_handler(sig, info, uap);
     }
 
@@ -616,45 +551,7 @@ static void carrick_native_trap_handler(int sig, siginfo_t *info, void *uap) {
         return;
     }
 
-    carrick_native_copy_mcontext(
-        &carrick_native_uc.__mcontext_data,
-        uc->uc_mcontext);
-    carrick_native_enter_host_x18_abi();
-    carrick_native_write_tpidr_el0(carrick_native_host_tpidr_el0);
-    carrick_native_last_event_kind = event_kind;
-    carrick_native_last_signal = sig;
-    carrick_native_last_signal_code = info != 0 ? info->si_code : 0;
-    carrick_native_last_fault_address = info != 0 ? (uintptr_t)info->si_addr : 0;
-    carrick_native_uc.uc_mcontext = &carrick_native_uc.__mcontext_data;
-    carrick_native_pending_uc = uc;
-    carrick_native_env_ready = 0;
-    // Rust dispatch runs before this signal handler returns, so restore the
-    // pre-trap host mask now while keeping Carrick's trap transport unblocked.
-    if (carrick_native_prepare_host_mask(&uc->uc_sigmask) != 0) {
-        _exit(128 + sig);
-    }
-    int mask_rc = pthread_sigmask(SIG_SETMASK, &uc->uc_sigmask, 0);
-    if (mask_rc != 0) {
-        _exit(128 + sig);
-    }
-    if (sigsetjmp(carrick_native_return_env, 1) == 0) {
-        siglongjmp(carrick_native_env, 1);
-    }
-
-    ucontext_t *pending = carrick_native_pending_uc;
-    if (pending == 0 || pending->uc_mcontext == 0) {
-        _exit(128 + sig);
-    }
-    if (carrick_native_prepare_guest_mask(&pending->uc_sigmask) != 0) {
-        _exit(128 + sig);
-    }
-    carrick_native_copy_mcontext(
-        pending->uc_mcontext,
-        &carrick_native_uc.__mcontext_data);
-    carrick_native_pending_uc = 0;
-    if (carrick_native_enter_guest_x18_abi() != 0) {
-        _exit(128 + sig);
-    }
+    carrick_native_fatal_signal_handler(sig, info, uap);
 }
 
 int carrick_native_unblock_transport_signals(void) {
@@ -700,7 +597,7 @@ static int carrick_native_unblock_kick_signal(void) {
     return 0;
 }
 
-int carrick_native_install_trap_handler(void) {
+int carrick_native_install_dsr_signal_handlers(void) {
     if (carrick_native_init_custom_x18() != 0) {
         return -1;
     }
@@ -730,7 +627,7 @@ int carrick_native_install_trap_handler(void) {
 
     struct sigaction action;
     memset(&action, 0, sizeof(action));
-    action.sa_sigaction = carrick_native_trap_handler;
+    action.sa_sigaction = carrick_native_dsr_signal_handler;
     action.sa_flags = SA_SIGINFO | SA_ONSTACK;
     sigfillset(&action.sa_mask);
     if (sigaction(SIGTRAP, &action, 0) != 0) {
@@ -738,7 +635,7 @@ int carrick_native_install_trap_handler(void) {
     }
 
     memset(&action, 0, sizeof(action));
-    action.sa_sigaction = carrick_native_trap_handler;
+    action.sa_sigaction = carrick_native_dsr_signal_handler;
     action.sa_flags = SA_SIGINFO | SA_ONSTACK;
     sigfillset(&action.sa_mask);
     if (sigaction(SIGSEGV, &action, 0) != 0) {
@@ -757,216 +654,11 @@ int carrick_native_install_trap_handler(void) {
     return 0;
 }
 
-int carrick_native_seed_ucontext(
-    const struct carrick_native_ucontext_snapshot *snapshot) {
-    if (snapshot == 0) {
-        errno = EINVAL;
-        return -1;
-    }
-
-    memset(&carrick_native_uc, 0, sizeof(carrick_native_uc));
-    carrick_native_uc.uc_mcontext = &carrick_native_uc.__mcontext_data;
-    struct __darwin_mcontext64 *mc = carrick_native_mcontext();
-    if (mc == 0) {
-        errno = EINVAL;
-        return -1;
-    }
-    for (int i = 0; i < 29; i++) {
-        mc->__ss.__x[i] = snapshot->x[i];
-    }
-    mc->__ss.__fp = snapshot->x[29];
-    mc->__ss.__lr = snapshot->x[30];
-    mc->__ss.__sp = snapshot->sp;
-    mc->__ss.__pc = snapshot->pc;
-    mc->__ss.__cpsr = (uint32_t)snapshot->pstate;
-    memcpy(mc->__ns.__v, snapshot->v, sizeof(snapshot->v));
-    mc->__ns.__fpsr = snapshot->fpsr;
-    mc->__ns.__fpcr = snapshot->fpcr;
-    carrick_native_last_signal = snapshot->signal;
-    carrick_native_last_signal_code = snapshot->signal_code;
-    carrick_native_last_fault_address = snapshot->fault_address;
-    carrick_native_last_event_kind = 0;
-    carrick_native_pending_uc = 0;
-    carrick_native_bootstrap_pending = 0;
-    carrick_native_env_ready = 0;
-    return 0;
-}
-
-static int carrick_native_bootstrap_seeded_context(void) {
-    if (carrick_native_mcontext() == 0) {
-        errno = EINVAL;
-        return -1;
-    }
-    if (sigsetjmp(carrick_native_env, 1) == 0) {
-        carrick_native_env_ready = 1;
-        carrick_native_pending_uc = 0;
-        carrick_native_bootstrap_pending = 1;
-        if (raise(SIGTRAP) != 0) {
-            carrick_native_bootstrap_pending = 0;
-            carrick_native_env_ready = 0;
-            return -1;
-        }
-        carrick_native_bootstrap_pending = 0;
-        carrick_native_env_ready = 0;
-        errno = EFAULT;
-        return -1;
-    }
-    carrick_native_env_ready = 0;
-    return 1;
-}
-
-int carrick_native_enter(uint64_t entry, uint64_t sp) {
-    struct carrick_native_ucontext_snapshot initial;
-    memset(&initial, 0, sizeof(initial));
-    initial.pc = entry;
-    initial.sp = sp;
-    if (carrick_native_seed_ucontext(&initial) != 0) {
-        return -1;
-    }
-    return carrick_native_bootstrap_seeded_context();
-}
-
-int carrick_native_resume(void) {
-    struct __darwin_mcontext64 *mc = carrick_native_mcontext();
-    if (mc == 0 || carrick_native_pending_uc == 0) {
-        errno = EINVAL;
-        return -1;
-    }
-    if (sigsetjmp(carrick_native_env, 1) == 0) {
-        carrick_native_env_ready = 1;
-        siglongjmp(carrick_native_return_env, 1);
-    }
-    carrick_native_env_ready = 0;
-    return 1;
-}
-
-int carrick_native_resume_detached_context(void) {
-    return carrick_native_bootstrap_seeded_context();
-}
-
-int carrick_native_snapshot_ucontext(struct carrick_native_ucontext_snapshot *out) {
-    if (out == 0) {
-        return -1;
-    }
-    memset(out, 0, sizeof(*out));
-    struct __darwin_mcontext64 *mc = carrick_native_mcontext();
-    if (mc == 0) {
-        return -1;
-    }
-    for (int i = 0; i < 29; i++) {
-        out->x[i] = mc->__ss.__x[i];
-    }
-    out->x[29] = mc->__ss.__fp;
-    out->x[30] = mc->__ss.__lr;
-    out->sp = mc->__ss.__sp;
-    out->pc = mc->__ss.__pc;
-    out->pstate = mc->__ss.__cpsr;
-    memcpy(out->v, mc->__ns.__v, sizeof(out->v));
-    out->fpsr = mc->__ns.__fpsr;
-    out->fpcr = mc->__ns.__fpcr;
-    out->event_kind = carrick_native_last_event_kind;
-    out->signal = carrick_native_last_signal;
-    out->signal_code = carrick_native_last_signal_code;
-    out->fault_address = carrick_native_last_fault_address;
-    out->esr = mc->__es.__esr;
-    out->far = mc->__es.__far;
-    return 0;
-}
-
-void carrick_native_set_return(uint64_t value) {
-    struct __darwin_mcontext64 *mc = carrick_native_mcontext();
-    if (mc != 0) {
-        mc->__ss.__x[0] = value;
-    }
-}
-
-void carrick_native_set_pc(uint64_t pc) {
-    struct __darwin_mcontext64 *mc = carrick_native_mcontext();
-    if (mc != 0) {
-        mc->__ss.__pc = pc;
-    }
-}
-
-void carrick_native_set_sp(uint64_t sp) {
-    struct __darwin_mcontext64 *mc = carrick_native_mcontext();
-    if (mc != 0) {
-        mc->__ss.__sp = sp;
-    }
-}
-
-void carrick_native_set_register(uint32_t index, uint64_t value) {
-    struct __darwin_mcontext64 *mc = carrick_native_mcontext();
-    if (mc == 0) {
-        return;
-    }
-    if (index < 29) {
-        mc->__ss.__x[index] = value;
-    } else if (index == 29) {
-        mc->__ss.__fp = value;
-    } else if (index == 30) {
-        mc->__ss.__lr = value;
-    }
-}
-
-void carrick_native_set_vector(uint32_t index, const uint8_t value[16]) {
-    struct __darwin_mcontext64 *mc = carrick_native_mcontext();
-    if (mc != 0 && index < 32 && value != 0) {
-        memcpy(&mc->__ns.__v[index], value, 16);
-    }
-}
-
-void carrick_native_set_processor_state(
-    uint64_t pstate,
-    uint32_t fpsr,
-    uint32_t fpcr) {
-    struct __darwin_mcontext64 *mc = carrick_native_mcontext();
-    if (mc != 0) {
-        mc->__ss.__cpsr = (uint32_t)pstate;
-        mc->__ns.__fpsr = fpsr;
-        mc->__ns.__fpcr = fpcr;
-    }
-}
-
 void carrick_native_clear_icache(void *start, size_t len) {
     sys_icache_invalidate(start, len);
 }
 #else
-int carrick_native_install_trap_handler(void) { return -1; }
-int carrick_native_seed_ucontext(
-    const struct carrick_native_ucontext_snapshot *snapshot) {
-    (void)snapshot;
-    return -1;
-}
-int carrick_native_enter(uint64_t entry, uint64_t sp) {
-    (void)entry;
-    (void)sp;
-    return -1;
-}
-int carrick_native_resume(void) { return -1; }
-int carrick_native_resume_detached_context(void) { return -1; }
-int carrick_native_snapshot_ucontext(struct carrick_native_ucontext_snapshot *out) {
-    (void)out;
-    return -1;
-}
-void carrick_native_set_return(uint64_t value) { (void)value; }
-void carrick_native_set_pc(uint64_t pc) { (void)pc; }
-void carrick_native_set_sp(uint64_t sp) { (void)sp; }
-void carrick_native_set_register(uint32_t index, uint64_t value) {
-    (void)index;
-    (void)value;
-}
-void carrick_native_set_vector(uint32_t index, const uint8_t value[16]) {
-    (void)index;
-    (void)value;
-}
-void carrick_native_set_processor_state(
-    uint64_t pstate,
-    uint32_t fpsr,
-    uint32_t fpcr) {
-    (void)pstate;
-    (void)fpsr;
-    (void)fpcr;
-}
+int carrick_native_install_dsr_signal_handlers(void) { return -1; }
 void carrick_native_clear_icache(void *start, size_t len) {
     (void)start;
     (void)len;
