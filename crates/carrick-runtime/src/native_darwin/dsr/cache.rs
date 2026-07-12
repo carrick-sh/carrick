@@ -368,6 +368,14 @@ impl TranslationCache {
         })
     }
 
+    pub(super) fn reset_after_fork_for_exec(&mut self) {
+        // The sole surviving child thread inherits the MAP_JIT mapping and no
+        // cache writer can be live across the quiesced fork. Reuse the mapping
+        // instead of calling MAP_JIT/libdispatch again in the fork child.
+        unsafe { libc::pthread_jit_write_protect_np(1) };
+        self.cursor = 0;
+    }
+
     pub(super) fn begin_write(&mut self, len: usize) -> Result<CacheWriter<'_>, DsrError> {
         if len == 0 || !len.is_multiple_of(std::mem::size_of::<u32>()) {
             return Err(DsrError::CachePolicy(format!(

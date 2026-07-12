@@ -134,7 +134,9 @@ fn plan_with_reader(
             InstAction::Copy(_)
             | InstAction::PcRelative(_)
             | InstAction::VirtualizedX18 { .. }
-            | InstAction::VirtualizedX28 { .. } => {
+            | InstAction::VirtualizedX28 { .. }
+            | InstAction::VirtualizedX18X28ReadOnly { .. }
+            | InstAction::VirtualizedX18WriteX28Read { .. } => {
                 instructions.push(PlannedInst { guest: pc, action });
                 if next == boundary {
                     Some(PlannedExit::Continue {
