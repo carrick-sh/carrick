@@ -2168,6 +2168,27 @@ fn run_native_dsr_thread_loop(
                     }
                 }
             }
+            DispatchOutcome::MapHostAlias {
+                va,
+                ipa: _,
+                len,
+                payload,
+                file,
+                prot_none,
+            } => {
+                memory
+                    .lock()
+                    .map_host_alias(va.raw(), len, &payload, file, prot_none)?;
+                snapshot = complete_dsr_syscall(
+                    &dispatcher,
+                    &memory,
+                    snapshot,
+                    thread_runtime.tid(),
+                    request.number.raw(),
+                    va.raw() as i64,
+                    resume,
+                )?;
+            }
             other => {
                 return Err(RuntimeError::Unsupported(format!(
                     "native DSR Task 5 does not yet support dispatcher outcome {other:?}"
@@ -7283,6 +7304,12 @@ impl NativeMappedMemory {
                 false,
             ),
         };
+        let host_final_prot = native16k_host_prot(final_prot as u64, self.native_code_mode);
+        let mmap_prot = if direct_file {
+            host_final_prot
+        } else {
+            mmap_prot
+        };
         let mmap_fd = if direct_file { fd } else { -1 };
         let mmap_offset = if direct_file { offset } else { 0 };
         // File-identity futex key material (see `NativeMappedRegion`): only a
@@ -7343,8 +7370,8 @@ impl NativeMappedMemory {
                     }
                 }
             }
-            if final_prot != mmap_prot {
-                let rc = unsafe { libc::mprotect(mapped, host_map_len_usize, final_prot) };
+            if host_final_prot != mmap_prot {
+                let rc = unsafe { libc::mprotect(mapped, host_map_len_usize, host_final_prot) };
                 if rc != 0 {
                     unsafe { libc::close(fd) };
                     return Err(last_io_error(&format!(

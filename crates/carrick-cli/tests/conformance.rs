@@ -2291,6 +2291,19 @@ fn probe_transport(exec_backend: Option<&str>, libc: &str) -> ProbeTransport {
     }
 }
 
+fn probe_set_allowed(libc: &str, requested: Option<&str>) -> bool {
+    requested.is_none_or(|requested| requested == libc)
+}
+
+fn probe_name_allowed(name: &str, requested: Option<&str>) -> bool {
+    requested.is_none_or(|requested| {
+        requested
+            .split(',')
+            .map(str::trim)
+            .any(|candidate| candidate == name)
+    })
+}
+
 /// Directory holding the compiled probe executables for a target triple, if built.
 fn probes_dir(target: &str) -> PathBuf {
     repo_path(&format!("conformance-probes/target/{target}/release"))
@@ -3159,6 +3172,8 @@ fn conformance_probes() {
 
     let mut nongating_diffs: Vec<String> = Vec::new();
     let requested_exec_backend = std::env::var("CARRICK_EXEC_BACKEND").ok();
+    let requested_probe_libc = std::env::var("CARRICK_PROBE_LIBC").ok();
+    let requested_probe_names = std::env::var("CARRICK_PROBE_FILTER").ok();
     for lane in LANES {
         if !lane_allowed_for_backend(lane, requested_exec_backend.as_deref()) {
             eprintln!(
@@ -3184,6 +3199,15 @@ fn conformance_probes() {
         // guest natively (set_gates_here): the macOS amd64-via-Rosetta lane is
         // report-only because Rosetta, not carrick, is translating it.
         for set in lane.probe_sets {
+            if !probe_set_allowed(set.libc, requested_probe_libc.as_deref()) {
+                eprintln!(
+                    "SKIP conformance_probes[{}:{}]: CARRICK_PROBE_LIBC requested {}",
+                    lane.label,
+                    set.libc,
+                    requested_probe_libc.as_deref().unwrap_or("all")
+                );
+                continue;
+            }
             // Set-level gating (whole-set intent-gating native ISA) drives the
             // report-only SUMMARY; individual probes additionally gate via the
             // per-probe `probe_gates` allowlist below (so a curated x86 subset can
@@ -3210,7 +3234,11 @@ fn conformance_probes() {
                         // by the perf gate (tests/perf_runner.rs); they live in
                         // src/bin/ only to share build-probes.sh and have no place in
                         // a differential CORRECTNESS diff (their output never matches).
-                        .map(|n| !GATE_SKIP_PROBES.contains(&n) && !n.starts_with("perf_"))
+                        .map(|n| {
+                            !GATE_SKIP_PROBES.contains(&n)
+                                && !n.starts_with("perf_")
+                                && probe_name_allowed(n, requested_probe_names.as_deref())
+                        })
                         .unwrap_or(true)
                 })
                 .collect();
@@ -4149,6 +4177,30 @@ fn native_musl_probe_campaign_uses_direct_elf_transport() {
         probe_transport(Some("hvf"), "musl"),
         ProbeTransport::ContainerInjection
     );
+}
+
+#[test]
+fn probe_campaign_libc_filter_selects_exact_set() {
+    assert!(probe_set_allowed("musl", Some("musl")));
+    assert!(!probe_set_allowed("gnu", Some("musl")));
+    assert!(probe_set_allowed("gnu", None));
+}
+
+#[test]
+fn probe_campaign_name_filter_selects_requested_cases() {
+    assert!(probe_name_allowed(
+        "aliassize",
+        Some("aliassize,forkshared")
+    ));
+    assert!(probe_name_allowed(
+        "forkshared",
+        Some("aliassize,forkshared")
+    ));
+    assert!(!probe_name_allowed(
+        "devnullseek",
+        Some("aliassize,forkshared")
+    ));
+    assert!(probe_name_allowed("devnullseek", None));
 }
 
 #[test]
