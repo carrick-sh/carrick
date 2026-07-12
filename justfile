@@ -248,6 +248,10 @@ sign:
 bench PROFILE="quick":
     ./scripts/measure-perf.sh {{PROFILE}}
 
+# Report-only native16k/HVF comparison over identical direct-ELF artifacts.
+bench-backends PROFILE="quick":
+    ./scripts/measure-perf.sh backends {{PROFILE}}
+
 # --- Linux / KVM aarch64 MVP (spec: hal-seam-kvm-mvp) ----------------------
 
 # Build the freestanding hello-aarch64 KVM-MVP fixture (Mac-native: clang + rust-lld).
