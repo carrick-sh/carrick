@@ -105,13 +105,11 @@ fn drain_checked_with_deadline(
             false
         })
     };
-    let output = child
-        .wait_with_output()
-        .map_err(|error| format!("wait for backend sample: {error}"))?;
-    done.store(true, Ordering::Relaxed);
-    let timed_out = watcher
-        .join()
-        .map_err(|_| "backend deadline watcher panicked".to_owned())?;
+    let wait_result = child.wait_with_output();
+    let (output, timed_out) = finalize_backend_wait(wait_result, &done, watcher, || {
+        unsafe { libc::kill(-pid, libc::SIGKILL) };
+        scoped_kill_guests(repo_root, run_id);
+    })?;
     scoped_kill_guests(repo_root, run_id);
 
     let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -130,6 +128,32 @@ fn drain_checked_with_deadline(
         ));
     }
     Ok(combined)
+}
+
+fn finalize_backend_wait<T, F>(
+    wait_result: std::io::Result<T>,
+    done: &AtomicBool,
+    watcher: std::thread::JoinHandle<bool>,
+    on_wait_error: F,
+) -> Result<(T, bool), String>
+where
+    F: FnOnce(),
+{
+    let wait_error = wait_result
+        .as_ref()
+        .err()
+        .map(|error| format!("wait for backend sample: {error}"));
+    if wait_error.is_some() {
+        on_wait_error();
+    }
+    done.store(true, Ordering::Relaxed);
+    let watcher_result = watcher.join();
+    if let Some(error) = wait_error {
+        return Err(error);
+    }
+    let timed_out = watcher_result.map_err(|_| "backend deadline watcher panicked".to_owned())?;
+    let output = wait_result.map_err(|error| format!("wait for backend sample: {error}"))?;
+    Ok((output, timed_out))
 }
 
 /// Canonical direct-ELF invocation for one Carrick backend. Both variants use
@@ -352,6 +376,7 @@ pub fn run_docker(repo_root: &Path, run_id: &str, probe_b64: &[u8], mount: bool)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
 
     #[test]
     fn injected_probe_snippet_exports_normalized_nproc() {
@@ -374,5 +399,29 @@ mod tests {
                 .any(|window| window == ["--exec-backend", "hvf"])
         );
         assert!(!native.iter().any(|arg| arg == "--native-code-mode"));
+    }
+
+    #[test]
+    fn wait_error_forces_cleanup_before_watcher_shutdown() {
+        let done = Arc::new(AtomicBool::new(false));
+        let watcher_done = Arc::clone(&done);
+        let watcher = std::thread::spawn(move || {
+            while !watcher_done.load(Ordering::Relaxed) {
+                std::thread::yield_now();
+            }
+            false
+        });
+        let cleaned = AtomicBool::new(false);
+        let wait_result: std::io::Result<()> = Err(std::io::Error::other("synthetic wait error"));
+
+        let error = finalize_backend_wait(wait_result, &done, watcher, || {
+            assert!(!done.load(Ordering::Relaxed));
+            cleaned.store(true, Ordering::Relaxed);
+        })
+        .expect_err("wait error");
+
+        assert!(error.contains("synthetic wait error"));
+        assert!(cleaned.load(Ordering::Relaxed));
+        assert!(done.load(Ordering::Relaxed));
     }
 }
