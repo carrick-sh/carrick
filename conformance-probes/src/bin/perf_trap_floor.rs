@@ -10,11 +10,15 @@
 //!   trap_trimmed_mean_us=<f>
 //!   gettid_p50_us=<f>  gettid_p95_us=<f>  gettid_min_us=<f>
 //!   empty_p50_us=<f>  empty_p95_us=<f>  empty_min_us=<f>
-//!   iters=<u>  nproc=<u>
+//!   trap_batch_p50_us=<f>  trap_batch_trimmed_mean_us=<f>
+//!   batch=16  batch_samples=<u>  iters=<u>  nproc=<u>
 use std::thread;
 
 const ITERS: usize = 20000;
 const WARMUP: usize = 2000;
+const BATCH: usize = 16;
+const BATCH_SAMPLES: usize = 5000;
+const BATCH_WARMUP_SAMPLES: usize = 200;
 
 fn nproc() -> usize {
     thread::available_parallelism()
@@ -92,6 +96,14 @@ fn summarize(mut samples: Vec<u64>, frequency: u64) -> TimingSummary {
     }
 }
 
+fn summarize_batched(samples: Vec<u64>, frequency: u64, batch: usize) -> TimingSummary {
+    assert!(batch > 0, "batch size must be nonzero");
+    let batch_frequency = frequency
+        .checked_mul(batch as u64)
+        .expect("batch frequency must fit u64");
+    summarize(samples, batch_frequency)
+}
+
 fn measure(frequency: u64, mut operation: impl FnMut()) -> TimingSummary {
     for _ in 0..WARMUP {
         operation();
@@ -103,6 +115,23 @@ fn measure(frequency: u64, mut operation: impl FnMut()) -> TimingSummary {
         samples.push(read_counter().wrapping_sub(t0));
     }
     summarize(samples, frequency)
+}
+
+fn measure_batched(frequency: u64, mut operation: impl FnMut()) -> TimingSummary {
+    for _ in 0..BATCH_WARMUP_SAMPLES {
+        for _ in 0..BATCH {
+            operation();
+        }
+    }
+    let mut samples = Vec::with_capacity(BATCH_SAMPLES);
+    for _ in 0..BATCH_SAMPLES {
+        let t0 = read_counter();
+        for _ in 0..BATCH {
+            operation();
+        }
+        samples.push(read_counter().wrapping_sub(t0));
+    }
+    summarize_batched(samples, frequency, BATCH)
 }
 
 fn print_summary(prefix: &str, summary: TimingSummary) {
@@ -129,12 +158,26 @@ fn main() {
     let empty = measure(frequency, || {
         std::hint::black_box(());
     });
+    let getpid_batch = measure_batched(frequency, || {
+        std::hint::black_box(unsafe { libc::syscall(libc::SYS_getpid) });
+    });
+    let gettid_batch = measure_batched(frequency, || {
+        std::hint::black_box(unsafe { libc::syscall(libc::SYS_gettid) });
+    });
+    let empty_batch = measure_batched(frequency, || {
+        std::hint::black_box(());
+    });
 
     // Retain the established `trap_*` keys for the existing perf runner.
     print_summary("trap", getpid);
     print_summary("gettid", gettid);
     print_summary("empty", empty);
+    print_summary("trap_batch", getpid_batch);
+    print_summary("gettid_batch", gettid_batch);
+    print_summary("empty_batch", empty_batch);
     println!("iters={ITERS}");
+    println!("batch={BATCH}");
+    println!("batch_samples={BATCH_SAMPLES}");
     println!("nproc={}", nproc());
 }
 
