@@ -37,6 +37,8 @@ pub(super) enum ThreadFault {
 pub(super) struct PreparedEntry {
     entry: types::CacheVa,
     generation: types::CodeGeneration,
+    cache_start: usize,
+    cache_end: usize,
 }
 
 pub(super) struct PreparedExit {
@@ -366,7 +368,13 @@ impl ThreadTranslator {
             }
             _ => self.translate(memory, guest)?,
         };
-        Ok(PreparedEntry { entry, generation })
+        let cache_range = self.process.state.lock().cache.host_range();
+        Ok(PreparedEntry {
+            entry,
+            generation,
+            cache_start: cache_range.start,
+            cache_end: cache_range.end,
+        })
     }
 
     pub(super) fn enter_prepared(
@@ -377,11 +385,13 @@ impl ThreadTranslator {
         let mut exit = types::NativeDsrExit::Syscall {
             resume: carrick_guest_mem::GuestVa(snapshot.pc),
         };
-        gateway::enter_translated_with_cache(
+        gateway::enter_translated_with_cache_range(
             prepared.entry,
             snapshot,
             &mut exit,
             &self.indirect_cache,
+            prepared.cache_start,
+            prepared.cache_end,
         )?;
         Ok(PreparedExit { exit })
     }
