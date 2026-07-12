@@ -10206,6 +10206,18 @@ mod tests {
     }
 
     #[test]
+    fn dsr_source_mappings_do_not_publish_host_icache() {
+        assert!(!native_mapping_needs_icache_publication(
+            true,
+            carrick_spec::NativeCodeModeRequest::Dsr,
+        ));
+        assert!(!native_mapping_needs_icache_publication(
+            false,
+            carrick_spec::NativeCodeModeRequest::Dsr,
+        ));
+    }
+
+    #[test]
     fn native_linux4k_uniform_host_page_can_become_executable() {
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
