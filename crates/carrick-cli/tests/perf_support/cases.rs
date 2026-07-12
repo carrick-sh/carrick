@@ -350,7 +350,9 @@ pub const CASES: &[PerfCase] = &[
         dimension: "disk",
         workload: "overlay_small_updates",
         guest_args: &[],
-        backend_pair_support: BackendPairSupport::DirectElf,
+        backend_pair_support: BackendPairSupport::Unsupported(
+            "requires the optional fs-memory feature and in-memory overlay semantics; the backend-pair direct-ELF runner does not enable them",
+        ),
         metric_key: "overlay_small_updates_total_us",
         unit: "us",
         higher_is_better: false,
@@ -476,9 +478,24 @@ mod tests {
                     assert!(!c.mount_scratch);
                     assert!(!c.cross_boundary);
                     assert_eq!(c.artifact, PerfArtifact::StaticMusl);
+                    assert_eq!(c.carrick_fs_mode, "host");
                 }
                 BackendPairSupport::Unsupported(reason) => assert!(!reason.trim().is_empty()),
             }
+        }
+    }
+
+    #[test]
+    fn memory_fs_cases_are_explicitly_unsupported_by_backend_pair() {
+        for case in CASES.iter().filter(|case| case.carrick_fs_mode == "memory") {
+            assert!(
+                matches!(
+                    case.backend_pair_support,
+                    BackendPairSupport::Unsupported(reason) if !reason.trim().is_empty()
+                ),
+                "memory-fs case {} must not silently use the direct-ELF default filesystem",
+                case.workload
+            );
         }
     }
 
