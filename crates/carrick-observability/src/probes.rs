@@ -193,6 +193,16 @@ dsr_ordinal_enum! {
         ForkChildRepairEnd = 2,
         ExecResetBegin = 3,
         ExecResetEnd = 4,
+        ExecImageUnmapBegin = 5,
+        ExecImageUnmapEnd = 6,
+        ExecImageMapBegin = 7,
+        ExecImageMapEnd = 8,
+        ExecCacheResetBegin = 9,
+        ExecCacheResetEnd = 10,
+        ExecRelocationBegin = 11,
+        ExecRelocationEnd = 12,
+        ExecTranslatorHandoffBegin = 13,
+        ExecTranslatorHandoffEnd = 14,
     }
 }
 
@@ -272,6 +282,16 @@ mod dsr_probe_abi {
         assert_eq!(DsrCacheLifecyclePhase::ForkChildRepairEnd.raw(), 2);
         assert_eq!(DsrCacheLifecyclePhase::ExecResetBegin.raw(), 3);
         assert_eq!(DsrCacheLifecyclePhase::ExecResetEnd.raw(), 4);
+        assert_eq!(DsrCacheLifecyclePhase::ExecImageUnmapBegin.raw(), 5);
+        assert_eq!(DsrCacheLifecyclePhase::ExecImageUnmapEnd.raw(), 6);
+        assert_eq!(DsrCacheLifecyclePhase::ExecImageMapBegin.raw(), 7);
+        assert_eq!(DsrCacheLifecyclePhase::ExecImageMapEnd.raw(), 8);
+        assert_eq!(DsrCacheLifecyclePhase::ExecCacheResetBegin.raw(), 9);
+        assert_eq!(DsrCacheLifecyclePhase::ExecCacheResetEnd.raw(), 10);
+        assert_eq!(DsrCacheLifecyclePhase::ExecRelocationBegin.raw(), 11);
+        assert_eq!(DsrCacheLifecyclePhase::ExecRelocationEnd.raw(), 12);
+        assert_eq!(DsrCacheLifecyclePhase::ExecTranslatorHandoffBegin.raw(), 13);
+        assert_eq!(DsrCacheLifecyclePhase::ExecTranslatorHandoffEnd.raw(), 14);
         assert_unique(&DsrCacheLifecyclePhase::ALL.map(DsrCacheLifecyclePhase::raw));
     }
 

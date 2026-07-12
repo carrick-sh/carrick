@@ -827,7 +827,7 @@ command completed naturally with zero drops and incomplete pairs.
 - Consumes: existing `dsr-cache-lifecycle` exec begin/end probes and `dsr-fork` pairing.
 - Produces: stable scalar lifecycle phases for unmap, map/protection, cache reset/allocation, relocation/vvar, and translator handoff; JSONL samples reconcile with the outer interval.
 
-- [ ] **Step 1: Add red ABI and bundled-script tests**
+- [x] **Step 1: Add red ABI and bundled-script tests**
 
 Define typed ordinals without renumbering existing phases:
 
@@ -848,7 +848,7 @@ Extend ABI uniqueness tests and require `dsr-fork.d` to emit samples named
 `exec-image-unmap`, `exec-image-map`, `exec-cache-reset`, `exec-relocation`, and
 `exec-translator-handoff`.
 
-- [ ] **Step 2: Run red**
+- [x] **Step 2: Run red**
 
 ```bash
 cargo test -p carrick-observability dsr_probe_abi --lib -- --nocapture
@@ -857,20 +857,20 @@ cargo test -p carrick-cli --test trace_profile fork_profile -- --nocapture
 
 Expected: new enum variants and sample names are absent.
 
-- [ ] **Step 3: Instrument non-overlapping runtime boundaries**
+- [x] **Step 3: Instrument non-overlapping runtime boundaries**
 
 Fire the typed begin/end pairs around the exact operations inside native exec
 replacement. Keep arguments scalar: tid, phase, used bytes, block count, and
 generation-page count. Do not clock inside Rust; DTrace supplies timestamps.
 
-- [ ] **Step 4: Pair and reconcile in `dsr-fork.d`**
+- [x] **Step 4: Pair and reconcile in `dsr-fork.d`**
 
 Use thread-local start timestamps and open/overwrite/missing-begin aggregates
 for every new phase. Emit sampled duration rows. Add an `exec-accounted` exact
 total and verify the sum of subphase durations does not exceed the outer
 `exec-reset` duration for the same pid/tid; emit incomplete rows on mismatch.
 
-- [ ] **Step 5: Run parser, probe, live profile, and 220-sample gate**
+- [x] **Step 5: Run parser, probe, live profile, and 220-sample gate**
 
 ```bash
 cargo test -p carrick-observability dsr_probe_abi --lib -- --nocapture
@@ -883,7 +883,7 @@ Run the existing 220-iteration static-PIE fork/exec workload under `dsr-fork`.
 Expected: 220 samples per outer and subphase class, zero drops/incomplete pairs,
 and per-event subphase sums bounded by the outer interval.
 
-- [ ] **Step 6: Commit the subdivision**
+- [x] **Step 6: Commit the subdivision**
 
 ```bash
 git add crates/carrick-observability/src/probes.rs \
@@ -894,6 +894,16 @@ git commit -m "diagnostics(native): subdivide DSR exec replacement" \
   -m "Attribute the outer exec interval to non-overlapping image, cache, relocation, and translator phases before choosing a structural optimization." \
   -m "Co-Authored-By: Codex <codex@openai.com>"
 ```
+
+**Initial live record:** 220 complete samples per phase, natural completion,
+zero drops/incomplete pairs, and every subphase sum below its matching outer
+interval (maximum accounted/outer ratio 0.9755). P50/p95: image map plus
+protections/vvar 1.055/1.165 ms; reusable cache reset 477.8/529.1 us; old-image
+unmap 84.5/110.9 us; translator handoff 14.4/18.8 us; relocation 9.2/16.4 us;
+outer reset 1.724/1.885 ms. Mapping contributes 61.7% of summed outer time,
+cache reset 26.7%, unmap 5.0%, handoff 0.9%, and relocation 0.6%. Median
+unaccounted boundary work is 91.1 us. The clean committed rerun in Task 9 is
+the selection authority.
 
 ---
 

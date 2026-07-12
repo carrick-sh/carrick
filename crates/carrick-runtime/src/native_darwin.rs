@@ -1660,6 +1660,7 @@ fn run_native_thread_loop(
                                     &image,
                                     &relative_relocations,
                                     &plan,
+                                    None,
                                 )?;
                                 crate::namespace::pid::mark_self_execed();
                                 let cmdline = proc_argv.join(" ");
@@ -2203,9 +2204,13 @@ fn run_native_dsr_thread_loop(
                         crate::vcpu_loop::apply_image_proc_state(&dispatcher, &image);
                         dispatcher.close_cloexec_fds();
                         translator.begin_exec_reset();
-                        memory
-                            .lock()
-                            .replace_image(&image, &relative_relocations, &plan)?;
+                        memory.lock().replace_image(
+                            &image,
+                            &relative_relocations,
+                            &plan,
+                            Some(thread_runtime.tid()),
+                        )?;
+                        translator.begin_exec_handoff();
                         let next_process = memory.lock().dsr_process_translator()?;
                         translator.reset_for_exec(next_process);
                         crate::namespace::pid::mark_self_execed();
@@ -6502,7 +6507,14 @@ impl NativeMappedMemory {
         image: &AddressSpace,
         relative_relocations: &[NativeRelativeRelocation],
         plan: &ExecutionPlan,
+        dsr_tid: Option<crate::thread::ThreadId>,
     ) -> Result<(), RuntimeError> {
+        let lifecycle = |phase| {
+            if let Some(tid) = dsr_tid {
+                crate::probes::dsr_cache_lifecycle(tid.raw(), phase, 0, 0, 0);
+            }
+        };
+        lifecycle(crate::probes::DsrCacheLifecyclePhase::ExecImageUnmapBegin);
         let mut ranges: Vec<(u64, u64)> = self
             .regions
             .iter()
@@ -6536,6 +6548,8 @@ impl NativeMappedMemory {
                 )));
             }
         }
+        lifecycle(crate::probes::DsrCacheLifecyclePhase::ExecImageUnmapEnd);
+        lifecycle(crate::probes::DsrCacheLifecyclePhase::ExecCacheResetBegin);
         let reusable_translator = if plan.native_code_mode
             == carrick_spec::NativeCodeModeRequest::Dsr
             && NATIVE_FORKED_GUEST_CHILD.load(std::sync::atomic::Ordering::Acquire)
@@ -6548,6 +6562,8 @@ impl NativeMappedMemory {
         } else {
             None
         };
+        lifecycle(crate::probes::DsrCacheLifecyclePhase::ExecCacheResetEnd);
+        lifecycle(crate::probes::DsrCacheLifecyclePhase::ExecImageMapBegin);
         let mut replacement = Self::map_with_code_mode_and_translator(
             image,
             native_memory_layout(),
@@ -6556,8 +6572,11 @@ impl NativeMappedMemory {
             plan.native_code_mode,
             reusable_translator,
         )?;
+        lifecycle(crate::probes::DsrCacheLifecyclePhase::ExecImageMapEnd);
+        lifecycle(crate::probes::DsrCacheLifecyclePhase::ExecRelocationBegin);
         apply_native_relative_relocations(&mut replacement, relative_relocations)?;
         *self = replacement;
+        lifecycle(crate::probes::DsrCacheLifecyclePhase::ExecRelocationEnd);
         Ok(())
     }
 

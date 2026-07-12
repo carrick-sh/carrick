@@ -8,6 +8,7 @@ BEGIN
     self->fork_first_active = 0;
     self->exec_reset_active = 0;
     self->exec_first_active = 0;
+    self->exec_subphase_active = 0;
 }
 
 proc:::exit
@@ -203,6 +204,118 @@ carrick*:::dsr-prepare-begin
     self->exec_first_active = 0;
 }
 
+/* Phases 5..14: non-overlapping exec replacement subphases. */
+carrick*:::dsr-cache-lifecycle
+/(pid == $target || progenyof($target)) &&
+ (arg1 == 5 || arg1 == 7 || arg1 == 9 || arg1 == 11 || arg1 == 13) &&
+ self->exec_subphase_active/
+{
+    @exec_subphase_overwrite[pid, arg0, arg1] = count();
+}
+
+carrick*:::dsr-cache-lifecycle
+/(pid == $target || progenyof($target)) && arg1 == 5 && !self->exec_subphase_active/
+{
+    @exec_image_unmap_open[pid, arg0] = sum(1);
+}
+
+carrick*:::dsr-cache-lifecycle
+/(pid == $target || progenyof($target)) && arg1 == 7 && !self->exec_subphase_active/
+{
+    @exec_image_map_open[pid, arg0] = sum(1);
+}
+
+carrick*:::dsr-cache-lifecycle
+/(pid == $target || progenyof($target)) && arg1 == 9 && !self->exec_subphase_active/
+{
+    @exec_cache_reset_open[pid, arg0] = sum(1);
+}
+
+carrick*:::dsr-cache-lifecycle
+/(pid == $target || progenyof($target)) && arg1 == 11 && !self->exec_subphase_active/
+{
+    @exec_relocation_open[pid, arg0] = sum(1);
+}
+
+carrick*:::dsr-cache-lifecycle
+/(pid == $target || progenyof($target)) && arg1 == 13 && !self->exec_subphase_active/
+{
+    @exec_translator_handoff_open[pid, arg0] = sum(1);
+}
+
+carrick*:::dsr-cache-lifecycle
+/(pid == $target || progenyof($target)) &&
+ (arg1 == 5 || arg1 == 7 || arg1 == 9 || arg1 == 11 || arg1 == 13)/
+{
+    self->exec_subphase_active = 1;
+    self->exec_subphase_started = timestamp;
+    self->exec_subphase_phase = arg1;
+    self->exec_subphase_tid = arg0;
+}
+
+carrick*:::dsr-cache-lifecycle
+/(pid == $target || progenyof($target)) &&
+ (arg1 == 6 || arg1 == 8 || arg1 == 10 || arg1 == 12 || arg1 == 14) &&
+ (!self->exec_subphase_active || self->exec_subphase_phase + 1 != arg1)/
+{
+    @exec_subphase_missing_begin[pid, arg0, arg1] = count();
+}
+
+carrick*:::dsr-cache-lifecycle
+/(pid == $target || progenyof($target)) && arg1 == 6 &&
+ self->exec_subphase_active && self->exec_subphase_phase == 5/
+{
+    this->ns = timestamp - self->exec_subphase_started;
+    printf("DSRPROF1|sample|phase=exec-image-unmap|pid=%d|tid=%d|duration_ns=%d\n",
+        pid, arg0, this->ns);
+    @exec_image_unmap_open[pid, self->exec_subphase_tid] = sum(-1);
+    self->exec_subphase_active = 0;
+}
+
+carrick*:::dsr-cache-lifecycle
+/(pid == $target || progenyof($target)) && arg1 == 8 &&
+ self->exec_subphase_active && self->exec_subphase_phase == 7/
+{
+    this->ns = timestamp - self->exec_subphase_started;
+    printf("DSRPROF1|sample|phase=exec-image-map|pid=%d|tid=%d|duration_ns=%d\n",
+        pid, arg0, this->ns);
+    @exec_image_map_open[pid, self->exec_subphase_tid] = sum(-1);
+    self->exec_subphase_active = 0;
+}
+
+carrick*:::dsr-cache-lifecycle
+/(pid == $target || progenyof($target)) && arg1 == 10 &&
+ self->exec_subphase_active && self->exec_subphase_phase == 9/
+{
+    this->ns = timestamp - self->exec_subphase_started;
+    printf("DSRPROF1|sample|phase=exec-cache-reset|pid=%d|tid=%d|duration_ns=%d\n",
+        pid, arg0, this->ns);
+    @exec_cache_reset_open[pid, self->exec_subphase_tid] = sum(-1);
+    self->exec_subphase_active = 0;
+}
+
+carrick*:::dsr-cache-lifecycle
+/(pid == $target || progenyof($target)) && arg1 == 12 &&
+ self->exec_subphase_active && self->exec_subphase_phase == 11/
+{
+    this->ns = timestamp - self->exec_subphase_started;
+    printf("DSRPROF1|sample|phase=exec-relocation|pid=%d|tid=%d|duration_ns=%d\n",
+        pid, arg0, this->ns);
+    @exec_relocation_open[pid, self->exec_subphase_tid] = sum(-1);
+    self->exec_subphase_active = 0;
+}
+
+carrick*:::dsr-cache-lifecycle
+/(pid == $target || progenyof($target)) && arg1 == 14 &&
+ self->exec_subphase_active && self->exec_subphase_phase == 13/
+{
+    this->ns = timestamp - self->exec_subphase_started;
+    printf("DSRPROF1|sample|phase=exec-translator-handoff|pid=%d|tid=%d|duration_ns=%d\n",
+        pid, arg0, this->ns);
+    @exec_translator_handoff_open[pid, self->exec_subphase_tid] = sum(-1);
+    self->exec_subphase_active = 0;
+}
+
 tick-1s
 {
     secs++;
@@ -232,6 +345,13 @@ END
     printa("DSRPROF1|incomplete|phase=exec-reset|pid=%d|tid=%d|kind=missing-begin|value=%@d\n", @exec_reset_missing_begin);
     printa("DSRPROF1|incomplete|phase=first-prepare-after-exec|pid=%d|tid=%d|kind=open|value=%@d\n", @exec_first_open);
     printa("DSRPROF1|incomplete|phase=first-prepare-after-exec|pid=%d|tid=%d|kind=overwrite|value=%@d\n", @exec_first_overwrite);
+    printa("DSRPROF1|incomplete|phase=exec-image-unmap|pid=%d|tid=%d|kind=open|value=%@d\n", @exec_image_unmap_open);
+    printa("DSRPROF1|incomplete|phase=exec-image-map|pid=%d|tid=%d|kind=open|value=%@d\n", @exec_image_map_open);
+    printa("DSRPROF1|incomplete|phase=exec-cache-reset|pid=%d|tid=%d|kind=open|value=%@d\n", @exec_cache_reset_open);
+    printa("DSRPROF1|incomplete|phase=exec-relocation|pid=%d|tid=%d|kind=open|value=%@d\n", @exec_relocation_open);
+    printa("DSRPROF1|incomplete|phase=exec-translator-handoff|pid=%d|tid=%d|kind=open|value=%@d\n", @exec_translator_handoff_open);
+    printa("DSRPROF1|incomplete|phase=exec-subphase|pid=%d|tid=%d|kind=overwrite-%d|value=%@d\n", @exec_subphase_overwrite);
+    printa("DSRPROF1|incomplete|phase=exec-subphase|pid=%d|tid=%d|kind=missing-begin-%d|value=%@d\n", @exec_subphase_missing_begin);
     printf("DSRPROF1|complete|profile=dsr-fork|bounded=%d|target_exit_reason=%d\n",
         bounded, target_exit_reason);
 }
