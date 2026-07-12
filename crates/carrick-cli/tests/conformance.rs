@@ -2707,17 +2707,6 @@ fn run_native_run_elf_with_args(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn run_native_dsr_run_elf_with_args(
-    bin: &PathBuf,
-    probe: &PathBuf,
-    native_page_profile: &'static str,
-    guest_args: &[&str],
-) -> String {
-    let run_id = case_run_id();
-    run_native_run_elf_with_run_id(bin, probe, native_page_profile, guest_args, &run_id)
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn run_native_run_elf_with_run_id(
     bin: &PathBuf,
     probe: &PathBuf,
@@ -3693,7 +3682,7 @@ fn native_conformance_run_elf_supports_plain_fork_probe() {
             "native run-elf mapfixed fork probe failed for profile {profile}:\n{out}"
         );
     }
-    let dsr = run_native_dsr_run_elf_with_args(&bin, &probe, "native16k", &[]);
+    let dsr = run_native_run_elf_with_args(&bin, &probe, "native16k", &[]);
     assert!(
         dsr.contains("status=exit status: 0")
             && dsr.contains("setup_ok=true")
@@ -3718,7 +3707,7 @@ fn native_conformance_dsr_exec_from_non_leader_replaces_image() {
     };
     ensure_signed(&bin);
     let probe = ensure_native_static_pie_probe("execfromthread");
-    let output = run_native_dsr_run_elf_with_args(&bin, &probe, "native16k", &[]);
+    let output = run_native_run_elf_with_args(&bin, &probe, "native16k", &[]);
     assert!(
         output.contains("status=exit status: 0")
             && output.contains("exec_from_thread_stage2_reached=true")
@@ -3742,7 +3731,7 @@ fn native_conformance_dsr_vfork_exec_from_sibling_completes() {
     };
     ensure_signed(&bin);
     let probe = ensure_native_static_pie_probe("vforkexecthread");
-    let output = run_native_dsr_run_elf_with_args(&bin, &probe, "native16k", &[]);
+    let output = run_native_run_elf_with_args(&bin, &probe, "native16k", &[]);
     assert!(
         output.contains("status=exit status: 0")
             && output.contains("vfork_exec_stage2_reached=true")
@@ -3959,9 +3948,9 @@ fn native16k_mprotect_exec_permissions_match_linux() {
     ensure_signed(&bin);
     let probe = ensure_native_static_pie_probe("mprotectexec");
     let output = run_native_run_elf_with_args(&bin, &probe, "native16k", &["status"]);
-    let dsr_output = run_native_dsr_run_elf_with_args(&bin, &probe, "native16k", &["jit"]);
+    let dsr_output = run_native_run_elf_with_args(&bin, &probe, "native16k", &["jit"]);
     let dsr_concurrent_output =
-        run_native_dsr_run_elf_with_args(&bin, &probe, "native16k", &["jit-concurrent"]);
+        run_native_run_elf_with_args(&bin, &probe, "native16k", &["jit-concurrent"]);
 
     assert!(
         output.contains("status=exit status: 0")
@@ -4000,7 +3989,7 @@ fn native16k_dsr_preserves_executable_constant_pool() {
     };
     ensure_signed(&bin);
     let probe = ensure_native_static_pie_probe("dsrconstantpool");
-    let output = run_native_dsr_run_elf_with_args(&bin, &probe, "native16k", &[]);
+    let output = run_native_run_elf_with_args(&bin, &probe, "native16k", &[]);
     assert!(
         output.contains("status=exit status: 0")
             && output.contains("constant_word_match=true")
