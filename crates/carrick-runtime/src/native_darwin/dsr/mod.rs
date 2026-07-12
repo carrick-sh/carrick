@@ -153,10 +153,11 @@ impl ThreadTranslator {
         }
     }
 
-    pub(super) fn after_fork_child(&mut self) {
+    pub(super) fn after_fork_child(&mut self, tid: i32) {
+        self.tid = tid;
         let (used_bytes, block_count, generation_count) = self.process.lifecycle_snapshot();
         probes::dsr_cache_lifecycle(
-            probes::DsrCacheRole::Child,
+            self.tid,
             probes::DsrCacheLifecyclePhase::ForkChildRepairBegin,
             used_bytes,
             block_count,
@@ -169,7 +170,7 @@ impl ThreadTranslator {
         self.last_kick = None;
         let (used_bytes, block_count, generation_count) = self.process.lifecycle_snapshot();
         probes::dsr_cache_lifecycle(
-            probes::DsrCacheRole::Child,
+            self.tid,
             probes::DsrCacheLifecyclePhase::ForkChildRepairEnd,
             used_bytes,
             block_count,
@@ -180,7 +181,7 @@ impl ThreadTranslator {
     pub(super) fn begin_exec_reset(&self) {
         let (used_bytes, block_count, generation_count) = self.process.lifecycle_snapshot();
         probes::dsr_cache_lifecycle(
-            probes::DsrCacheRole::Common,
+            self.tid,
             probes::DsrCacheLifecyclePhase::ExecResetBegin,
             used_bytes,
             block_count,
@@ -196,7 +197,7 @@ impl ThreadTranslator {
         self.last_kick = None;
         let (used_bytes, block_count, generation_count) = self.process.lifecycle_snapshot();
         probes::dsr_cache_lifecycle(
-            probes::DsrCacheRole::Common,
+            self.tid,
             probes::DsrCacheLifecyclePhase::ExecResetEnd,
             used_bytes,
             block_count,
@@ -1396,8 +1397,10 @@ mod tests {
         let process = std::sync::Arc::new(
             super::ProcessTranslator::new(16 * 1024).expect("create translator"),
         );
-        let translator = super::ThreadTranslator::for_process(process, 37);
+        let mut translator = super::ThreadTranslator::for_process(process, 37);
         assert_eq!(translator.tid, 37);
+        translator.after_fork_child(73);
+        assert_eq!(translator.tid, 73);
     }
 
     #[test]
