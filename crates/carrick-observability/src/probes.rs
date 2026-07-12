@@ -203,6 +203,16 @@ dsr_ordinal_enum! {
         ExecRelocationEnd = 12,
         ExecTranslatorHandoffBegin = 13,
         ExecTranslatorHandoffEnd = 14,
+        ExecMapMmapBegin = 15,
+        ExecMapMmapEnd = 16,
+        ExecMapCopyBegin = 17,
+        ExecMapCopyEnd = 18,
+        ExecMapIcacheBegin = 19,
+        ExecMapIcacheEnd = 20,
+        ExecMapProtectBegin = 21,
+        ExecMapProtectEnd = 22,
+        ExecMapVvarBegin = 23,
+        ExecMapVvarEnd = 24,
     }
 }
 
@@ -292,6 +302,16 @@ mod dsr_probe_abi {
         assert_eq!(DsrCacheLifecyclePhase::ExecRelocationEnd.raw(), 12);
         assert_eq!(DsrCacheLifecyclePhase::ExecTranslatorHandoffBegin.raw(), 13);
         assert_eq!(DsrCacheLifecyclePhase::ExecTranslatorHandoffEnd.raw(), 14);
+        assert_eq!(DsrCacheLifecyclePhase::ExecMapMmapBegin.raw(), 15);
+        assert_eq!(DsrCacheLifecyclePhase::ExecMapMmapEnd.raw(), 16);
+        assert_eq!(DsrCacheLifecyclePhase::ExecMapCopyBegin.raw(), 17);
+        assert_eq!(DsrCacheLifecyclePhase::ExecMapCopyEnd.raw(), 18);
+        assert_eq!(DsrCacheLifecyclePhase::ExecMapIcacheBegin.raw(), 19);
+        assert_eq!(DsrCacheLifecyclePhase::ExecMapIcacheEnd.raw(), 20);
+        assert_eq!(DsrCacheLifecyclePhase::ExecMapProtectBegin.raw(), 21);
+        assert_eq!(DsrCacheLifecyclePhase::ExecMapProtectEnd.raw(), 22);
+        assert_eq!(DsrCacheLifecyclePhase::ExecMapVvarBegin.raw(), 23);
+        assert_eq!(DsrCacheLifecyclePhase::ExecMapVvarEnd.raw(), 24);
         assert_unique(&DsrCacheLifecyclePhase::ALL.map(DsrCacheLifecyclePhase::raw));
     }
 
