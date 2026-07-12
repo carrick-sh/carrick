@@ -230,6 +230,21 @@ publication, final protection, and vvar work must be separated before another
 structural change. Compact provenance and results are in
 [`native-dsr-exec-icache-v1.jsonl`](perf-results/native-dsr-exec-icache-v1.jsonl).
 
+The follow-up nested profile reconciled five mapping details against all 220
+outer image-map intervals in each of two runs. Both runs had identical pid/tid
+sets, natural completion, zero drops/incomplete pairs, and no negative
+residual. Byte copy ranked first at 61.94% and 62.25% of profiled image-map
+p50; unaccounted construction was about 19%, Darwin mapping about 9.2%, final
+protection about 4.2%, I-cache publication about 3.7%, and vvar work about
+1.9%. This rank is stable and selects copy for further proof.
+
+The nested probes raise `perf_fork_exec` p50 from roughly 11.2 ms to roughly
+14.0 ms, so the component magnitudes are diagnostic attribution, not untraced
+cost claims. The selected copy plan must first replace repeated DTrace
+boundaries with low-perturbation aggregate timing before authorizing a backing
+representation change. Exact distributions and raw-profile hashes are in
+[`native-dsr-exec-map-decomposition-v1.jsonl`](perf-results/native-dsr-exec-map-decomposition-v1.jsonl).
+
 ## Instrumentation overhead
 
 The disabled-probe gate compares distinct signed binaries in fixed ABBA order

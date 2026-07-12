@@ -132,7 +132,7 @@ Use `diagnostics(native): decompose DSR exec image mapping`.
 - Modify: this plan
 - Modify: `docs/superpowers/plans/2026-07-12-dsr-profile-driven-performance.md`
 
-- [ ] **Step 1: Build signed and run two profiles**
+- [x] **Step 1: Build signed and run two profiles**
 
 ```bash
 just build
@@ -153,7 +153,7 @@ CARRICK_RUN_ID=dsr-map-detail-v2 target/release/carrick trace \
   conformance-probes/target/native-pie/aarch64-unknown-linux-musl/release/perf_fork_exec
 ```
 
-- [ ] **Step 2: Reconcile exact per-exec accounting**
+- [x] **Step 2: Reconcile exact per-exec accounting**
 
 Join rows by pid/tid. For each of 220 execs in each run, compute `unaccounted =
 exec-image-map - sum(five details)`. Reject negative values, missing rows,
@@ -161,7 +161,7 @@ non-natural completion, any drop/incomplete pair, or mismatched pid/tid sets.
 Publish compact p50/p95/min/IQR, fractions, binary/profile hashes, host/power,
 and completion facts in the checked-in JSONL; keep raw files local by hash.
 
-- [ ] **Step 3: Apply the deterministic selection rule**
+- [x] **Step 3: Apply the deterministic selection rule**
 
 Select the same largest component only when it contributes at least 30% of
 image-map p50 in both runs and ranking is stable. Write and immediately execute
@@ -169,7 +169,14 @@ a focused child plan with a red mechanism test and a fixed 10% outer exec-reset
 gate. If no component qualifies, record no selection and continue with the
 umbrella gateway benchmark rather than guessing.
 
-- [ ] **Step 4: Commit**
+**Observed:** byte copy contributes 61.94% and 62.25% and ranks first in both
+runs. Every one of 220 pid/tid sets per run reconciles with a non-negative
+residual. Copy qualifies, with the explicit caveat that repeated enabled probe
+cost is inside these diagnostic intervals. The selected child plan is
+`docs/superpowers/plans/2026-07-12-dsr-exec-copy-performance.md` and begins with
+low-perturbation aggregate validation.
+
+- [x] **Step 4: Commit**
 
 Use `docs(native): attribute DSR exec image mapping`; the body must name both
 profile hashes, exact ranking, accounting residual, and the selected or
