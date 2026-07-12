@@ -1,7 +1,8 @@
 # Native DSR Gateway Performance Plan
 
-> **Status (2026-07-12):** approved for direct execution. The untraced baseline
-> is checked in; instruction audit complete; component attribution next.
+> **Status (2026-07-12):** complete. The deferred-kick candidate passed the
+> focused correctness, fixed-order ABBA, and full serial CI gates and is
+> promoted.
 
 **Goal:** reduce the signed native DSR syscall floor by at least 5% without
 weakening Linux-visible register state, Darwin ABI conformance, asynchronous
@@ -102,13 +103,14 @@ Task 2A is deferred. Exact arrays and provenance are in
   benchmark-only entrypoints around the production primitives. This proved
   lower-perturbation than adding even a disabled counter branch to the hot
   gateway; it emits once per process and adds no production-path work.
-- [ ] Preserve the ordering invariant: publish context, enter custom-x18 ABI,
-  then unblock kick on entry; block kick, clear context, then enter host x18 ABI
-  on exit.
-- [ ] Any signal-mask replacement must be a Darwin-native primitive with a
-  linearizable close point. Polling-only or delayed-kick approximations are
-  rejected.
-- [ ] Run the phase-zero, phase-one, phase-two, pending-kick, signal, fault,
+- [x] Preserve the ordering invariant: publish context, enter custom-x18 ABI,
+  then make kick delivery available on first entry; enter host x18 ABI before
+  clearing context on exit, so an arriving signal is handled on exactly one
+  side of the active-context boundary.
+- [x] Any signal-mask replacement must retain Darwin-native signal delivery
+  with a linearizable capture/consume boundary. Polling-only or lossy delayed
+  delivery is rejected.
+- [x] Run the phase-zero, phase-one, phase-two, pending-kick, signal, fault,
   custom-x18, and fork-child oracles red-first against any reordered closure.
 
 **Decomposition result:** the paired SIGPIPE unblock/block transition is
@@ -118,28 +120,40 @@ only lowers the mask pair to 0.198 us, proving that set construction is not the
 long pole. Evidence is in
 `docs/perf-results/native-dsr-gateway-closure-decomposition-v1.jsonl`.
 
-**Selected candidate:** keep SIGPIPE deliverable while host code runs, defer a
-host-window kick in thread-local state, and consume it at the next linearizable
-gateway entry before translated execution. Preserve the active-context and
-custom-x18 ordering; add red phase/window tests before changing C or assembly.
+**Implemented candidate:** SIGPIPE is unblocked once per initialized thread and
+remains deliverable while host or translated code runs. A signal with no active
+DSR context consumes the requested kick into thread-local deferred state; the
+next gateway entry publishes `KickAtEntry` before executing translated code.
+Handler installation clears inherited deferred state in a fork child. Red-first
+tests proved host-window delivery, entry consumption, and fork reset before the
+implementation was retained.
 
 ## Task 3: Candidate promotion gate
 
-- [ ] Freeze distinct signed baseline/candidate binaries by SHA-256, inode,
+- [x] Freeze distinct signed baseline/candidate binaries by SHA-256, inode,
   CDHash, and source commit. Use fixed ABBA order and 10,000 seeded bootstrap
   median-ratio resamples.
-- [ ] Run at least 30 static-PIE gateway repetitions per role. Require scalar
+- [x] Run at least 30 static-PIE gateway repetitions per role. Require scalar
   p50 improvement at least 5% with 95% upper ratio below 1.0. SIMD sentinel
   preservation is exact; SIMD p50 may not regress more than 1%.
-- [ ] Run the existing batch-16 syscall floor and direct V8 gates. Each upper
+- [x] Run the existing batch-16 syscall floor and direct V8 gates. Each upper
   ratio must remain at or below 1.01.
-- [ ] Run Rust static PIE, Rust dynamic PIE through its real loader, Go PIE,
+- [x] Run Rust static PIE, Rust dynamic PIE through its real loader, Go PIE,
   vfork sibling exec, non-leader exec, full-state, signal/kick/fault, and fork
   reset proofs.
-- [ ] Run `RUST_TEST_THREADS=1 just ci`. Record any ordinary parallel-suite
+- [x] Run `RUST_TEST_THREADS=1 just ci`. Record any ordinary parallel-suite
   flakes separately; do not waive focused failures.
-- [ ] Promote only if all thresholds pass. Otherwise restore the candidate and
+- [x] Promote only if all thresholds pass. Otherwise restore the candidate and
   keep its evidence as a rejected experiment.
+
+**Promotion result:** the scalar gateway p50 fell from 0.471 to 0.273 us
+(ratio 0.5796, 95% interval 0.5778-0.5860), and the batch-16 syscall floor fell
+from 0.486 to 0.281 us (ratio 0.5776, upper interval 0.5798). The SIMD gateway
+improved from 0.625 to 0.443 us with exact vector sentinels, and direct V8
+improved from 7663.36 to 7517.46 ms (ratio 0.9804, upper interval 0.9834).
+Focused DSR oracles, static/dynamic PIE, Go PIE, vfork/non-leader exec, and
+clippy are green. Provenance and decisions are in
+`docs/perf-results/native-dsr-gateway-candidate-v1.jsonl`.
 
 ## Stop conditions and next architecture
 
