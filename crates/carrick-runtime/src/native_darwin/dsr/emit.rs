@@ -707,20 +707,21 @@ fn emit_indirect_exit(
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
-        ; ldr x18, [x15, #16]
+        ; ldr x17, [x15, #16]
     );
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
-        ; cbz x18, =>miss
+        ; cbz x17, =>miss
     );
-    // Physical x18 is the only non-guest branch scratch.  Preserve the
-    // validated cache PC in the context while guest x15/x16/x17 and NZCV are
-    // restored, then reload and recheck it immediately before the branch.
+    // Keep ordinary translated targets out of custom physical x18 entirely.
+    // Preserve the validated cache PC from physical x17 in the context while
+    // guest x15/x16/x17 and NZCV are restored, then reload and recheck it
+    // immediately before the branch.
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
-        ; str x18, [x28, #1072]
+        ; str x17, [x28, #1072]
     );
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
