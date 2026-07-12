@@ -980,6 +980,14 @@ that rank with aggregate timing before changing backing representation.
 Evidence is in
 `docs/perf-results/native-dsr-exec-map-decomposition-v1.jsonl`.
 
+**Accepted copy result:** the low-perturbation aggregate profile exposed
+8,904,704 copied bytes per exec, including the fully materialized 8 MiB initial
+stack. Copying only its initialized suffix reduces copy volume to 516,816
+bytes, image-map p50 by about 85%, outer exec-reset p50 by about 52%, and
+signed fork-exec wall p50 by 17.7%. V8 and batch-16 syscall-floor gates stay
+within 1%. Evidence is in
+`docs/perf-results/native-dsr-stack-window-v1.jsonl`.
+
 ---
 
 ### Task 10: Establish a low-perturbation gateway benchmark

@@ -260,6 +260,25 @@ so the next candidate copies only that initialized suffix. Exact aggregate
 durations, byte/operation totals, and hashes are in
 [`native-dsr-exec-map-aggregate-v1.jsonl`](perf-results/native-dsr-exec-map-aggregate-v1.jsonl).
 
+#### Accepted initialized-stack copy result
+
+Commit `7e28af59` uses the authoritative initial SP to copy only the initialized
+suffix of the exact canonical 8 MiB stack into its already-zero Darwin mapping.
+All other regions and ambiguous stack shapes retain the full copy path. Copy
+volume falls from 8,904,704 to 516,816 bytes. Across two complete profiles,
+image-map p50 falls by 84.8% and 85.0%, and outer exec-reset p50 falls by 52.5%
+and 52.3%.
+
+The signed ABBA gate measures a larger end-to-end result than the rejected
+I-cache experiment: fork-exec wall p50 falls from 1391.52 ms to 1145.79 ms
+(ratio 0.8229, interval 0.8119–0.8354). Direct V8 passes at ratio 1.0023 with
+upper 1.0065. A 16-call batched syscall-floor metric fixes the single-call
+counter-resolution problem without moving the 1% limit; it passes at ratio
+0.9980 with interval 0.9939–1.0031. Signed Rust static/dynamic PIE, Go PIE,
+direct V8, vfork, non-leader exec, and stack/SP proofs are green. Compact
+evidence and raw hashes are in
+[`native-dsr-stack-window-v1.jsonl`](perf-results/native-dsr-stack-window-v1.jsonl).
+
 ## Instrumentation overhead
 
 The disabled-probe gate compares distinct signed binaries in fixed ABBA order

@@ -1298,3 +1298,13 @@ The candidate is promoted without the four-entry fallback. The next target is
 subdividing the 1.581 ms outer exec interval before selecting a structural
 change. Evidence is in
 `docs/perf-results/native-dsr-prepare-cache-v1.jsonl`.
+
+Third accepted optimization (2026-07-12): exec image mapping was copying a
+fully materialized 8 MiB initial-stack vector into an already-zero Darwin
+mapping. Copying only the initialized suffix beginning at the authoritative
+initial SP reduces copy volume from 8,904,704 to 516,816 bytes, image-map p50
+by about 85%, outer exec-reset p50 by about 52%, and signed end-to-end
+fork-exec wall p50 from 1391.52 ms to 1145.79 ms (ratio 0.8229, 95% interval
+0.8119–0.8354). Direct V8 and a higher-resolution batch-16 syscall-floor gate
+remain within their 1% limits. Evidence is in
+`docs/perf-results/native-dsr-stack-window-v1.jsonl`.
