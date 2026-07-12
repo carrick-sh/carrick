@@ -57,7 +57,7 @@ ordinals, uniqueness, real/stub signatures, and five script output rows.
 Observed: all typed ABI tests pass; the script contract fails at
 `missing dsr-exec-map-detail`.
 
-- [ ] **Step 2: Accumulate only in runtime-profile mode**
+- [x] **Step 2: Accumulate only in runtime-profile mode**
 
 When `CARRICK_DSR_PROFILE` is present, use monotonic host timing around the
 existing operations and accumulate duration, bytes, and operation count in one

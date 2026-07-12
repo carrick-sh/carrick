@@ -6227,6 +6227,7 @@ impl NativeMappedMemory {
                 region.start, region.end
             )));
         }
+        native_exec_map_profile_start(exec_map_dsr_tid);
         let mut regions = Vec::new();
         for region in image.regions() {
             map_region(region, native_code_mode, exec_map_dsr_tid)?;
@@ -6234,11 +6235,13 @@ impl NativeMappedMemory {
                 native_exec_map_detail(
                     exec_map_dsr_tid,
                     crate::probes::DsrCacheLifecyclePhase::ExecMapVvarBegin,
+                    region.len(),
                 );
                 relocate_vdso_vvar_loads(region, native_code_mode)?;
                 native_exec_map_detail(
                     exec_map_dsr_tid,
                     crate::probes::DsrCacheLifecyclePhase::ExecMapVvarEnd,
+                    0,
                 );
             }
             regions.push(NativeMappedRegion {
@@ -6279,11 +6282,13 @@ impl NativeMappedMemory {
         native_exec_map_detail(
             exec_map_dsr_tid,
             crate::probes::DsrCacheLifecyclePhase::ExecMapMmapBegin,
+            layout.heap_size,
         );
         map_anonymous_region(layout.heap_base, layout.heap_size, false)?;
         native_exec_map_detail(
             exec_map_dsr_tid,
             crate::probes::DsrCacheLifecyclePhase::ExecMapMmapEnd,
+            0,
         );
         regions.push(NativeMappedRegion {
             start: layout.heap_base,
@@ -6298,11 +6303,13 @@ impl NativeMappedMemory {
         native_exec_map_detail(
             exec_map_dsr_tid,
             crate::probes::DsrCacheLifecyclePhase::ExecMapMmapBegin,
+            layout.mmap_size,
         );
         map_anonymous_region(layout.mmap_base, layout.mmap_size, false)?;
         native_exec_map_detail(
             exec_map_dsr_tid,
             crate::probes::DsrCacheLifecyclePhase::ExecMapMmapEnd,
+            0,
         );
         regions.push(NativeMappedRegion {
             start: layout.mmap_base,
@@ -6321,6 +6328,7 @@ impl NativeMappedMemory {
         native_exec_map_detail(
             exec_map_dsr_tid,
             crate::probes::DsrCacheLifecyclePhase::ExecMapMmapBegin,
+            crate::memory::LINUX_SHARED_FILE_SIZE,
         );
         map_anonymous_region(
             crate::memory::LINUX_SHARED_FILE_BASE,
@@ -6330,6 +6338,7 @@ impl NativeMappedMemory {
         native_exec_map_detail(
             exec_map_dsr_tid,
             crate::probes::DsrCacheLifecyclePhase::ExecMapMmapEnd,
+            0,
         );
         regions.push(NativeMappedRegion {
             start: crate::memory::LINUX_SHARED_FILE_BASE,
@@ -6348,6 +6357,7 @@ impl NativeMappedMemory {
         native_exec_map_detail(
             exec_map_dsr_tid,
             crate::probes::DsrCacheLifecyclePhase::ExecMapMmapBegin,
+            crate::memory::LINUX_PRIVATE_OVERLAY_SIZE,
         );
         map_anonymous_region(
             crate::memory::LINUX_PRIVATE_OVERLAY_BASE,
@@ -6357,6 +6367,7 @@ impl NativeMappedMemory {
         native_exec_map_detail(
             exec_map_dsr_tid,
             crate::probes::DsrCacheLifecyclePhase::ExecMapMmapEnd,
+            0,
         );
         regions.push(NativeMappedRegion {
             start: crate::memory::LINUX_PRIVATE_OVERLAY_BASE,
@@ -6414,12 +6425,15 @@ impl NativeMappedMemory {
         native_exec_map_detail(
             exec_map_dsr_tid,
             crate::probes::DsrCacheLifecyclePhase::ExecMapVvarBegin,
+            crate::vdso::LINUX_VVAR_SIZE,
         );
         memory.stamp_vdso_vvar()?;
         native_exec_map_detail(
             exec_map_dsr_tid,
             crate::probes::DsrCacheLifecyclePhase::ExecMapVvarEnd,
+            0,
         );
+        native_exec_map_profile_finish();
         Ok(memory)
     }
 
@@ -8034,12 +8048,118 @@ fn native16k_host_prot(
     host_prot
 }
 
+#[derive(Clone, Copy, Default)]
+struct NativeExecMapDetailTotal {
+    duration_ns: u64,
+    bytes: u64,
+    operations: u64,
+}
+
+struct NativeExecMapProfile {
+    tid: crate::thread::ThreadId,
+    active: Option<(crate::probes::DsrExecMapDetailKind, std::time::Instant, u64)>,
+    totals: [NativeExecMapDetailTotal; 5],
+}
+
+impl NativeExecMapProfile {
+    fn new(tid: crate::thread::ThreadId) -> Self {
+        Self {
+            tid,
+            active: None,
+            totals: [NativeExecMapDetailTotal::default(); 5],
+        }
+    }
+
+    fn begin(&mut self, kind: crate::probes::DsrExecMapDetailKind, bytes: u64) {
+        self.active = Some((kind, std::time::Instant::now(), bytes));
+    }
+
+    fn end(&mut self, kind: crate::probes::DsrExecMapDetailKind) {
+        let Some((active_kind, started, bytes)) = self.active.take() else {
+            return;
+        };
+        if active_kind != kind {
+            return;
+        }
+        let index = kind.raw() as usize - 1;
+        let total = &mut self.totals[index];
+        total.duration_ns = total
+            .duration_ns
+            .saturating_add(u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));
+        total.bytes = total.bytes.saturating_add(bytes);
+        total.operations = total.operations.saturating_add(1);
+    }
+
+    fn emit(self) {
+        for (kind, total) in crate::probes::DsrExecMapDetailKind::ALL
+            .into_iter()
+            .zip(self.totals)
+        {
+            crate::probes::dsr_exec_map_detail(
+                self.tid.raw(),
+                kind,
+                total.duration_ns,
+                total.bytes,
+                total.operations,
+            );
+        }
+    }
+}
+
+thread_local! {
+    static NATIVE_EXEC_MAP_PROFILE: std::cell::RefCell<Option<NativeExecMapProfile>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn native_exec_map_profile_start(dsr_tid: Option<crate::thread::ThreadId>) {
+    let profile = if std::env::var_os("CARRICK_DSR_PROFILE").is_some() {
+        dsr_tid.map(NativeExecMapProfile::new)
+    } else {
+        None
+    };
+    NATIVE_EXEC_MAP_PROFILE.with(|slot| *slot.borrow_mut() = profile);
+}
+
+fn native_exec_map_profile_finish() {
+    NATIVE_EXEC_MAP_PROFILE.with(|slot| {
+        if let Some(profile) = slot.borrow_mut().take() {
+            profile.emit();
+        }
+    });
+}
+
 fn native_exec_map_detail(
     dsr_tid: Option<crate::thread::ThreadId>,
     phase: crate::probes::DsrCacheLifecyclePhase,
+    bytes: u64,
 ) {
-    if let Some(tid) = dsr_tid {
-        crate::probes::dsr_cache_lifecycle(tid.raw(), phase, 0, 0, 0);
+    if dsr_tid.is_none() {
+        return;
+    }
+    use crate::probes::{DsrCacheLifecyclePhase as Phase, DsrExecMapDetailKind as Kind};
+    let boundary = match phase {
+        Phase::ExecMapMmapBegin => Some((Kind::Mmap, true)),
+        Phase::ExecMapMmapEnd => Some((Kind::Mmap, false)),
+        Phase::ExecMapCopyBegin => Some((Kind::Copy, true)),
+        Phase::ExecMapCopyEnd => Some((Kind::Copy, false)),
+        Phase::ExecMapIcacheBegin => Some((Kind::Icache, true)),
+        Phase::ExecMapIcacheEnd => Some((Kind::Icache, false)),
+        Phase::ExecMapProtectBegin => Some((Kind::Protect, true)),
+        Phase::ExecMapProtectEnd => Some((Kind::Protect, false)),
+        Phase::ExecMapVvarBegin => Some((Kind::Vvar, true)),
+        Phase::ExecMapVvarEnd => Some((Kind::Vvar, false)),
+        _ => None,
+    };
+    if let Some((kind, begin)) = boundary {
+        NATIVE_EXEC_MAP_PROFILE.with(|slot| {
+            if let Some(profile) = slot.borrow_mut().as_mut() {
+                if begin {
+                    profile.begin(kind, bytes);
+                } else {
+                    profile.end(kind);
+                }
+            }
+        });
     }
 }
 
@@ -8074,6 +8194,7 @@ fn map_region(
     native_exec_map_detail(
         exec_map_dsr_tid,
         crate::probes::DsrCacheLifecyclePhase::ExecMapMmapBegin,
+        length_u64,
     );
     let mapped = unsafe {
         libc::mmap(
@@ -8100,6 +8221,7 @@ fn map_region(
     native_exec_map_detail(
         exec_map_dsr_tid,
         crate::probes::DsrCacheLifecyclePhase::ExecMapMmapEnd,
+        0,
     );
 
     let bytes = region.bytes();
@@ -8107,6 +8229,7 @@ fn map_region(
         native_exec_map_detail(
             exec_map_dsr_tid,
             crate::probes::DsrCacheLifecyclePhase::ExecMapCopyBegin,
+            u64::try_from(bytes.len()).unwrap_or(u64::MAX),
         );
         unsafe {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), mapped.cast::<u8>(), bytes.len());
@@ -8114,6 +8237,7 @@ fn map_region(
         native_exec_map_detail(
             exec_map_dsr_tid,
             crate::probes::DsrCacheLifecyclePhase::ExecMapCopyEnd,
+            0,
         );
     }
     if region.perms.execute && native_code_mode == carrick_spec::NativeCodeModeRequest::Brk {
@@ -8123,11 +8247,13 @@ fn map_region(
         native_exec_map_detail(
             exec_map_dsr_tid,
             crate::probes::DsrCacheLifecyclePhase::ExecMapIcacheBegin,
+            u64::try_from(bytes.len()).unwrap_or(u64::MAX),
         );
         unsafe { carrick_native_clear_icache(mapped, bytes.len()) };
         native_exec_map_detail(
             exec_map_dsr_tid,
             crate::probes::DsrCacheLifecyclePhase::ExecMapIcacheEnd,
+            0,
         );
     }
 
@@ -8138,6 +8264,7 @@ fn map_region(
     native_exec_map_detail(
         exec_map_dsr_tid,
         crate::probes::DsrCacheLifecyclePhase::ExecMapProtectBegin,
+        length_u64,
     );
     let protect = unsafe { libc::mprotect(mapped, length, prot) };
     if protect != 0 {
@@ -8149,6 +8276,7 @@ fn map_region(
     native_exec_map_detail(
         exec_map_dsr_tid,
         crate::probes::DsrCacheLifecyclePhase::ExecMapProtectEnd,
+        0,
     );
     Ok(())
 }
@@ -8184,6 +8312,7 @@ fn map_bytes_region(
     native_exec_map_detail(
         exec_map_dsr_tid,
         crate::probes::DsrCacheLifecyclePhase::ExecMapMmapBegin,
+        length_u64,
     );
     let mapped = unsafe {
         libc::mmap(
@@ -8208,11 +8337,13 @@ fn map_bytes_region(
     native_exec_map_detail(
         exec_map_dsr_tid,
         crate::probes::DsrCacheLifecyclePhase::ExecMapMmapEnd,
+        0,
     );
     if !bytes.is_empty() {
         native_exec_map_detail(
             exec_map_dsr_tid,
             crate::probes::DsrCacheLifecyclePhase::ExecMapCopyBegin,
+            u64::try_from(bytes.len()).unwrap_or(u64::MAX),
         );
         unsafe {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), mapped.cast::<u8>(), bytes.len());
@@ -8220,6 +8351,7 @@ fn map_bytes_region(
         native_exec_map_detail(
             exec_map_dsr_tid,
             crate::probes::DsrCacheLifecyclePhase::ExecMapCopyEnd,
+            0,
         );
     }
     if executable && native_code_mode == carrick_spec::NativeCodeModeRequest::Brk {
@@ -8229,11 +8361,13 @@ fn map_bytes_region(
         native_exec_map_detail(
             exec_map_dsr_tid,
             crate::probes::DsrCacheLifecyclePhase::ExecMapIcacheBegin,
+            u64::try_from(bytes.len()).unwrap_or(u64::MAX),
         );
         unsafe { carrick_native_clear_icache(mapped, bytes.len()) };
         native_exec_map_detail(
             exec_map_dsr_tid,
             crate::probes::DsrCacheLifecyclePhase::ExecMapIcacheEnd,
+            0,
         );
     }
     let final_prot = if executable && native_code_mode == carrick_spec::NativeCodeModeRequest::Dsr {
@@ -8244,6 +8378,7 @@ fn map_bytes_region(
     native_exec_map_detail(
         exec_map_dsr_tid,
         crate::probes::DsrCacheLifecyclePhase::ExecMapProtectBegin,
+        length_u64,
     );
     let protect = unsafe { libc::mprotect(mapped, length, final_prot) };
     if protect != 0 {
@@ -8254,6 +8389,7 @@ fn map_bytes_region(
     native_exec_map_detail(
         exec_map_dsr_tid,
         crate::probes::DsrCacheLifecyclePhase::ExecMapProtectEnd,
+        0,
     );
     Ok(())
 }
