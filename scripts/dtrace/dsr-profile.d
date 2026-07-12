@@ -7,6 +7,9 @@ BEGIN
     self->prepare_active = 0;
     self->run_active = 0;
     self->translate_active = 0;
+    self->translate_subphase_active = 0;
+    self->translate_subphase_kind = 0;
+    self->translate_wait_active = 0;
     self->resolve_active = 0;
     self->dispatch_active = 0;
 }
@@ -180,6 +183,82 @@ carrick*:::dsr-translate-end
     self->translate_active = 0;
 }
 
+/* non-overlapping translation subphases; kind 5 is nested duplicate wait */
+carrick*:::dsr-translate-subphase-begin
+/(pid == $target || progenyof($target)) && arg1 != 5 && self->translate_subphase_active/
+{
+    @translate_subphase_overwrite[pid] = count();
+}
+
+carrick*:::dsr-translate-subphase-begin
+/(pid == $target || progenyof($target)) && arg1 != 5 && !self->translate_subphase_active/
+{
+    @translate_subphase_open[pid, arg0, arg1] = sum(1);
+}
+
+carrick*:::dsr-translate-subphase-begin
+/(pid == $target || progenyof($target)) && arg1 != 5/
+{
+    self->translate_subphase_active = 1;
+    self->translate_subphase_kind = arg1;
+    self->translate_subphase_started = timestamp;
+}
+
+carrick*:::dsr-translate-subphase-end
+/(pid == $target || progenyof($target)) && arg1 != 5 && (!self->translate_subphase_active || self->translate_subphase_kind != arg1)/
+{
+    @translate_subphase_missing_begin[pid, arg1] = count();
+}
+
+carrick*:::dsr-translate-subphase-end
+/(pid == $target || progenyof($target)) && arg1 != 5 && self->translate_subphase_active && self->translate_subphase_kind == arg1/
+{
+    this->ns = timestamp - self->translate_subphase_started;
+    @translate_subphase_count[pid, arg1] = count();
+    @translate_subphase_total[pid, arg1] = sum(this->ns);
+    @translate_subphase_min[pid, arg1] = min(this->ns);
+    @translate_subphase_max[pid, arg1] = max(this->ns);
+    @translate_subphase_open[pid, arg0, arg1] = sum(-1);
+    self->translate_subphase_active = 0;
+}
+
+carrick*:::dsr-translate-subphase-begin
+/(pid == $target || progenyof($target)) && arg1 == 5 && self->translate_wait_active/
+{
+    @translate_subphase_overwrite[pid] = count();
+}
+
+carrick*:::dsr-translate-subphase-begin
+/(pid == $target || progenyof($target)) && arg1 == 5 && !self->translate_wait_active/
+{
+    @translate_subphase_open[pid, arg0, arg1] = sum(1);
+}
+
+carrick*:::dsr-translate-subphase-begin
+/(pid == $target || progenyof($target)) && arg1 == 5/
+{
+    self->translate_wait_active = 1;
+    self->translate_wait_started = timestamp;
+}
+
+carrick*:::dsr-translate-subphase-end
+/(pid == $target || progenyof($target)) && arg1 == 5 && !self->translate_wait_active/
+{
+    @translate_subphase_missing_begin[pid, arg1] = count();
+}
+
+carrick*:::dsr-translate-subphase-end
+/(pid == $target || progenyof($target)) && arg1 == 5 && self->translate_wait_active/
+{
+    this->ns = timestamp - self->translate_wait_started;
+    @translate_subphase_count[pid, arg1] = count();
+    @translate_subphase_total[pid, arg1] = sum(this->ns);
+    @translate_subphase_min[pid, arg1] = min(this->ns);
+    @translate_subphase_max[pid, arg1] = max(this->ns);
+    @translate_subphase_open[pid, arg0, arg1] = sum(-1);
+    self->translate_wait_active = 0;
+}
+
 /* direct and indirect resolver work */
 carrick*:::dsr-resolve-begin
 /(pid == $target || progenyof($target)) && self->resolve_active/
@@ -331,6 +410,14 @@ END
     printa("DSRPROF1|incomplete|phase=translate|pid=%d|tid=%d|kind=open|value=%@d\n", @translate_open);
     printa("DSRPROF1|incomplete|phase=translate|pid=%d|kind=overwrite|value=%@d\n", @translate_overwrite);
     printa("DSRPROF1|incomplete|phase=translate|pid=%d|kind=missing-begin|value=%@d\n", @translate_missing_begin);
+
+    printa("DSRPROF1|count|phase=translation-subphase|pid=%d|kind=%d|value=%@d\n", @translate_subphase_count);
+    printa("DSRPROF1|total|phase=translation-subphase|pid=%d|kind=%d|value_ns=%@d\n", @translate_subphase_total);
+    printa("DSRPROF1|minimum|phase=translation-subphase|pid=%d|kind=%d|value_ns=%@d\n", @translate_subphase_min);
+    printa("DSRPROF1|maximum|phase=translation-subphase|pid=%d|kind=%d|value_ns=%@d\n", @translate_subphase_max);
+    printa("DSRPROF1|incomplete|phase=translation-subphase|pid=%d|tid=%d|kind=%d|value=%@d\n", @translate_subphase_open);
+    printa("DSRPROF1|incomplete|phase=translation-subphase|pid=%d|kind=overwrite|value=%@d\n", @translate_subphase_overwrite);
+    printa("DSRPROF1|incomplete|phase=translation-subphase|pid=%d|kind=missing-%d|value=%@d\n", @translate_subphase_missing_begin);
 
     printa("DSRPROF1|count|phase=resolve|pid=%d|kind=%d|value=%@d\n", @resolve_count);
     printa("DSRPROF1|total|phase=resolve|pid=%d|kind=%d|value_ns=%@d\n", @resolve_total);

@@ -390,106 +390,173 @@ impl ProcessState {
         probes::dsr_translate_begin(tid, guest.raw(), generation.get());
         let translation_started = self.profiling.then(std::time::Instant::now);
         let result = (|| -> Result<TranslationResult, types::DsrError> {
-            let block = block::plan_block(memory, guest, generation, 256)?;
-            if observation.current() != generation {
-                return Err(types::DsrError::GenerationChanged {
-                    page: guest.raw(),
-                    expected: generation.get(),
-                    observed: observation.current().get(),
-                });
-            }
-            if let block::PlannedExit::Sensitive {
-                guest: sensitive_guest,
-                exit,
-                ..
-            } = block.exit
-            {
-                self.sensitive.insert((sensitive_guest, generation), exit);
-            }
-            if let block::PlannedExit::Unsupported {
-                guest: unsupported_guest,
-                word,
-                op,
-            } = block.exit
-            {
-                self.unsupported
-                    .insert((unsupported_guest, generation), (word, op));
-            }
-            let emitted = emit::emit_block_with_generation(
-                &mut self.cache,
-                &block,
-                emit::GenerationGuard::new(observation.current_atomic(), generation),
-            )?;
-            let emitted_bytes = u64::try_from(emitted.len()).unwrap_or(u64::MAX);
-            probes::dsr_cache_event(
+            probes::dsr_translate_subphase_begin(
                 tid,
-                probes::DsrCacheEventKind::BlockPublish,
+                probes::DsrTranslationSubphase::Decode,
                 guest.raw(),
                 generation.get(),
-                u64::try_from(self.cache.used_bytes()).unwrap_or(u64::MAX),
             );
-            if observation.current() != generation {
-                return Err(types::DsrError::GenerationChanged {
-                    page: guest.raw(),
-                    expected: generation.get(),
-                    observed: observation.current().get(),
-                });
-            }
-            if let Some(started) = translation_started {
-                self.stats.translation_ns = self.stats.translation_ns.saturating_add(
-                    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            let block_result = block::plan_block(memory, guest, generation, 256);
+            probes::dsr_translate_subphase_end(
+                tid,
+                probes::DsrTranslationSubphase::Decode,
+                guest.raw(),
+                generation.get(),
+            );
+            let block = block_result?;
+
+            probes::dsr_translate_subphase_begin(
+                tid,
+                probes::DsrTranslationSubphase::Plan,
+                guest.raw(),
+                generation.get(),
+            );
+            let plan_result = (|| -> Result<(), types::DsrError> {
+                if observation.current() != generation {
+                    return Err(types::DsrError::GenerationChanged {
+                        page: guest.raw(),
+                        expected: generation.get(),
+                        observed: observation.current().get(),
+                    });
+                }
+                if let block::PlannedExit::Sensitive {
+                    guest: sensitive_guest,
+                    exit,
+                    ..
+                } = block.exit
+                {
+                    self.sensitive.insert((sensitive_guest, generation), exit);
+                }
+                if let block::PlannedExit::Unsupported {
+                    guest: unsupported_guest,
+                    word,
+                    op,
+                } = block.exit
+                {
+                    self.unsupported
+                        .insert((unsupported_guest, generation), (word, op));
+                }
+                Ok(())
+            })();
+            probes::dsr_translate_subphase_end(
+                tid,
+                probes::DsrTranslationSubphase::Plan,
+                guest.raw(),
+                generation.get(),
+            );
+            plan_result?;
+
+            probes::dsr_translate_subphase_begin(
+                tid,
+                probes::DsrTranslationSubphase::Emit,
+                guest.raw(),
+                generation.get(),
+            );
+            let emitted_result = (|| {
+                let emitted = emit::emit_block_with_generation(
+                    &mut self.cache,
+                    &block,
+                    emit::GenerationGuard::new(observation.current_atomic(), generation),
+                )?;
+                let emitted_bytes = u64::try_from(emitted.len()).unwrap_or(u64::MAX);
+                probes::dsr_cache_event(
+                    tid,
+                    probes::DsrCacheEventKind::BlockPublish,
+                    guest.raw(),
+                    generation.get(),
+                    u64::try_from(self.cache.used_bytes()).unwrap_or(u64::MAX),
                 );
-            }
-            self.stats.translations = self.stats.translations.saturating_add(1);
+                if observation.current() != generation {
+                    return Err(types::DsrError::GenerationChanged {
+                        page: guest.raw(),
+                        expected: generation.get(),
+                        observed: observation.current().get(),
+                    });
+                }
+                if let Some(started) = translation_started {
+                    self.stats.translation_ns = self.stats.translation_ns.saturating_add(
+                        u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                    );
+                }
+                self.stats.translations = self.stats.translations.saturating_add(1);
+                Ok::<_, types::DsrError>((emitted, emitted_bytes))
+            })();
+            probes::dsr_translate_subphase_end(
+                tid,
+                probes::DsrTranslationSubphase::Emit,
+                guest.raw(),
+                generation.get(),
+            );
+            let (emitted, emitted_bytes) = emitted_result?;
+
+            probes::dsr_translate_subphase_begin(
+                tid,
+                probes::DsrTranslationSubphase::PublicationIndex,
+                guest.raw(),
+                generation.get(),
+            );
             let entry = emitted.entry();
-            let published_entry = self.publications.get_or_publish(key, || entry);
-            if published_entry != entry {
-                self.stats.duplicate_publications =
-                    self.stats.duplicate_publications.saturating_add(1);
-                return Ok(TranslationResult {
-                    entry: published_entry,
+            let publication_result = (|| -> Result<TranslationResult, types::DsrError> {
+                let published_entry = self
+                    .publications
+                    .get_or_publish_profiled(tid, key, || entry);
+                if published_entry != entry {
+                    self.stats.duplicate_publications =
+                        self.stats.duplicate_publications.saturating_add(1);
+                    return Ok(TranslationResult {
+                        entry: published_entry,
+                        generation,
+                        outcome: TranslationOutcome::Translated,
+                        emitted_bytes,
+                        cache_used_bytes: u64::try_from(self.cache.used_bytes())
+                            .unwrap_or(u64::MAX),
+                    });
+                }
+                self.published.push(PublishedBlock {
+                    entry,
+                    len: emitted.len(),
+                    map: emitted.map().entries().to_vec(),
+                    recovery: emitted.recovery().to_vec(),
+                    _generation: observation,
+                });
+                let links = emitted.direct_links().to_vec();
+                self.blocks.insert(key, entry);
+                self.dependencies.record(source_page, guest, generation);
+
+                for link in links {
+                    let target_generation =
+                        memory.dsr_generation_observation(link.target)?.expected();
+                    let target_key = (link.target, target_generation);
+                    let site = cache::LinkSite {
+                        source: entry,
+                        slot: link.slot,
+                    };
+                    if let Some(target) = self.blocks.get(&target_key) {
+                        self.cache.patch_direct_branch(site, *target)?;
+                    } else {
+                        self.pending.entry(target_key).or_default().push(site);
+                    }
+                }
+                if let Some(sites) = self.pending.remove(&key) {
+                    for site in sites {
+                        self.cache.patch_direct_branch(site, entry)?;
+                    }
+                }
+                Ok(TranslationResult {
+                    entry,
                     generation,
                     outcome: TranslationOutcome::Translated,
                     emitted_bytes,
                     cache_used_bytes: u64::try_from(self.cache.used_bytes()).unwrap_or(u64::MAX),
-                });
-            }
-            self.published.push(PublishedBlock {
-                entry,
-                len: emitted.len(),
-                map: emitted.map().entries().to_vec(),
-                recovery: emitted.recovery().to_vec(),
-                _generation: observation,
-            });
-            let links = emitted.direct_links().to_vec();
-            self.blocks.insert(key, entry);
-            self.dependencies.record(source_page, guest, generation);
-
-            for link in links {
-                let target_generation = memory.dsr_generation_observation(link.target)?.expected();
-                let target_key = (link.target, target_generation);
-                let site = cache::LinkSite {
-                    source: entry,
-                    slot: link.slot,
-                };
-                if let Some(target) = self.blocks.get(&target_key) {
-                    self.cache.patch_direct_branch(site, *target)?;
-                } else {
-                    self.pending.entry(target_key).or_default().push(site);
-                }
-            }
-            if let Some(sites) = self.pending.remove(&key) {
-                for site in sites {
-                    self.cache.patch_direct_branch(site, entry)?;
-                }
-            }
-            Ok(TranslationResult {
-                entry,
-                generation,
-                outcome: TranslationOutcome::Translated,
-                emitted_bytes,
-                cache_used_bytes: u64::try_from(self.cache.used_bytes()).unwrap_or(u64::MAX),
-            })
+                })
+            })();
+            probes::dsr_translate_subphase_end(
+                tid,
+                probes::DsrTranslationSubphase::PublicationIndex,
+                guest.raw(),
+                generation.get(),
+            );
+            publication_result
         })();
 
         let (cache_pc, emitted_bytes, outcome) = match &result {
