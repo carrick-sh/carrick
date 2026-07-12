@@ -132,6 +132,8 @@ pub(super) enum InstAction {
     Copy(u32),
     VirtualizedX18 { word: u32, op: bad64::Op },
     VirtualizedX28 { word: u32, op: bad64::Op },
+    VirtualizedX18X28ReadOnly { word: u32, op: bad64::Op },
+    VirtualizedX18WriteX28Read { word: u32, op: bad64::Op },
     PcRelative(PcRelativeInst),
     Direct(DirectExit),
     Indirect(IndirectExit),

@@ -451,6 +451,14 @@ pub trait GuestMemory {
         Ok(())
     }
 
+    /// Whether this backend can safely publish executable protection changes
+    /// while sibling guest threads remain live. Backends default to the
+    /// conservative answer; translation-backed execution can opt in when
+    /// executable guest bytes are never run directly.
+    fn supports_concurrent_exec_protection(&self) -> bool {
+        false
+    }
+
     /// Make `[address, address+len)` unmapped in stage-1 (faults until reused),
     /// for guest `munmap`. Default: no-op.
     fn unmap_range(&mut self, _address: u64, _len: usize) -> Result<(), MemoryError> {

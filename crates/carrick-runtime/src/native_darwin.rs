@@ -1462,7 +1462,7 @@ fn run_native_thread_loop(
                         child_tid_addr,
                         clear_child_tid_addr,
                     } => {
-                        let clone_rejection = memory.lock().native16k_clone_thread_rejection();
+                        let clone_rejection = native_clone_thread_rejection(&memory);
                         if let Some(reason) = clone_rejection {
                             let syscall_name = if request.number.raw() == 435 {
                                 "clone3"
@@ -1917,6 +1917,24 @@ fn run_native_dsr_thread_loop(
             ]),
         )
         .with_current_guest_sp(Some(snapshot.sp));
+        if trace_syscalls {
+            child_write_stderr(
+                format!(
+                    "native trace dsr pid={} tid={} pc=0x{:x} nr={} args={:x},{:x},{:x},{:x},{:x},{:x}\n",
+                    unsafe { libc::getpid() },
+                    thread_runtime.tid().raw(),
+                    snapshot.pc,
+                    request.number.raw(),
+                    request.args.0[0],
+                    request.args.0[1],
+                    request.args.0[2],
+                    request.args.0[3],
+                    request.args.0[4],
+                    request.args.0[5],
+                )
+                .as_bytes(),
+            );
+        }
         let outcome = dispatch_native_syscall(
             &dispatcher,
             request,
@@ -1986,7 +2004,7 @@ fn run_native_dsr_thread_loop(
                 child_tid_addr,
                 clear_child_tid_addr,
             } => {
-                let clone_rejection = memory.lock().native16k_clone_thread_rejection();
+                let clone_rejection = native_clone_thread_rejection(&memory);
                 if let Some(reason) = clone_rejection {
                     let syscall_name = if request.number.raw() == 435 {
                         "clone3"
@@ -3561,6 +3579,15 @@ fn dispatch_native_syscall(
     }
 }
 
+fn native_clone_thread_rejection(memory: &SharedNativeMemory) -> Option<&'static str> {
+    if NATIVE_FORKED_GUEST_CHILD.load(std::sync::atomic::Ordering::Acquire) {
+        return Some(
+            "native Darwin cannot create guest threads in a fork child: emulated execve cannot reset the host libdispatch post-fork state",
+        );
+    }
+    memory.lock().native16k_clone_thread_rejection()
+}
+
 /// Preserve one guest deadline across internal readiness re-dispatches, even
 /// when an fd lifecycle change switches between poll-backed and empty-fd waits.
 /// The outer `Option` is `None` only when the deadline has expired.
@@ -4030,12 +4057,11 @@ fn handle_native_fork(
                     .to_string(),
             ));
         }
-        // W^X boundary (311fae9e), kept narrow and explicit: W+X pages while
-        // multithreaded are already unreachable (creation is rejected while
-        // MT, and thread creation is rejected while W+X exists) — if the
-        // invariant ever breaks, fail honestly instead of forking a torn
-        // W^X state machine.
-        if memory.lock().has_native16k_write_exec_pages() {
+        // Direct-execution W^X boundary (311fae9e), kept narrow and explicit.
+        // DSR never executes original bytes and carries generation state across
+        // fork, so its quiesced process copy is safe; brk mode still rejects a
+        // potentially torn patch/protection state machine.
+        if memory.lock().write_exec_blocks_multithreaded_lifecycle() {
             barrier.end_fork();
             return Err(RuntimeError::Unsupported(
                 "native Darwin multithreaded fork with write-exec pages is not supported"
@@ -4359,9 +4385,10 @@ fn native_terminate_siblings_for_exec(
         thread_runtime.platform_futex.notify_signal_pending();
         std::thread::sleep(Duration::from_micros(200));
     }
-    // W^X boundary (311fae9e), kept narrow and explicit — see the fork-side
-    // twin; unreachable while the creation-side rejections hold.
-    if memory.lock().has_native16k_write_exec_pages() {
+    // Direct-execution W^X boundary (311fae9e), kept narrow and explicit — see
+    // the fork-side twin. DSR retires the old translator after the sibling
+    // drain and therefore does not carry patched executable bytes into exec.
+    if memory.lock().write_exec_blocks_multithreaded_lifecycle() {
         crate::fork_quiesce::end_exec_replacement();
         barrier.end_fork();
         return Err(RuntimeError::Unsupported(
@@ -6135,6 +6162,24 @@ impl NativeMappedMemory {
         linux_page_size: u64,
         native_code_mode: carrick_spec::NativeCodeModeRequest,
     ) -> Result<Self, RuntimeError> {
+        Self::map_with_code_mode_and_translator(
+            image,
+            layout,
+            host_page_size,
+            linux_page_size,
+            native_code_mode,
+            None,
+        )
+    }
+
+    fn map_with_code_mode_and_translator(
+        image: &AddressSpace,
+        layout: MemoryLayout,
+        host_page_size: u64,
+        linux_page_size: u64,
+        native_code_mode: carrick_spec::NativeCodeModeRequest,
+        reusable_translator: Option<Arc<dsr::ProcessTranslator>>,
+    ) -> Result<Self, RuntimeError> {
         if let Some(region) = image
             .regions()
             .iter()
@@ -6273,10 +6318,14 @@ impl NativeMappedMemory {
             dsr_generations: dsr::cache::PageGenerationTable::new(host_page_size)
                 .map_err(|error| RuntimeError::Unsupported(error.to_string()))?,
             dsr_translator: if native_code_mode == carrick_spec::NativeCodeModeRequest::Dsr {
-                Some(Arc::new(
-                    dsr::ProcessTranslator::new(64 * 1024 * 1024)
-                        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?,
-                ))
+                if let Some(translator) = reusable_translator {
+                    Some(translator)
+                } else {
+                    Some(Arc::new(
+                        dsr::ProcessTranslator::new(64 * 1024 * 1024)
+                            .map_err(|error| RuntimeError::Unsupported(error.to_string()))?,
+                    ))
+                }
             } else {
                 None
             },
@@ -6457,12 +6506,25 @@ impl NativeMappedMemory {
                 )));
             }
         }
-        let mut replacement = Self::map_for_plan(
+        let reusable_translator = if plan.native_code_mode
+            == carrick_spec::NativeCodeModeRequest::Dsr
+            && NATIVE_FORKED_GUEST_CHILD.load(std::sync::atomic::Ordering::Acquire)
+        {
+            let translator = self.dsr_translator.take();
+            if let Some(translator) = &translator {
+                translator.reset_after_fork_for_exec();
+            }
+            translator
+        } else {
+            None
+        };
+        let mut replacement = Self::map_with_code_mode_and_translator(
             image,
             native_memory_layout(),
             plan.page_geometry.host_page_size,
             plan.page_geometry.linux_page_size,
-            plan,
+            plan.native_code_mode,
+            reusable_translator,
         )?;
         apply_native_relative_relocations(&mut replacement, relative_relocations)?;
         *self = replacement;
@@ -6549,7 +6611,15 @@ impl NativeMappedMemory {
             .any(|prot| prot & write_exec == write_exec)
     }
 
+    fn write_exec_blocks_multithreaded_lifecycle(&self) -> bool {
+        self.native_code_mode != carrick_spec::NativeCodeModeRequest::Dsr
+            && self.has_native16k_write_exec_pages()
+    }
+
     fn native16k_clone_thread_rejection(&self) -> Option<&'static str> {
+        if self.native_code_mode == carrick_spec::NativeCodeModeRequest::Dsr {
+            return None;
+        }
         self.has_native16k_write_exec_pages()
             .then_some("native16k cannot create a guest thread while write-exec pages are present")
     }
@@ -7755,6 +7825,10 @@ impl GuestMemory for NativeMappedMemory {
             self.note_dsr_code_mutation(address, len)?;
         }
         Ok(())
+    }
+
+    fn supports_concurrent_exec_protection(&self) -> bool {
+        self.native_code_mode == carrick_spec::NativeCodeModeRequest::Dsr
     }
 
     fn unmap_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
@@ -9829,6 +9903,47 @@ mod tests {
                 })
                 .unwrap_or(false);
             unsafe { libc::_exit(i32::from(!rejected)) };
+        }
+
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFEXITED(status), "child status was 0x{status:x}");
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+    }
+
+    #[test]
+    fn native16k_dsr_write_exec_allows_later_clone_thread() {
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            let page_size = 16 * 1024_u64;
+            let layout = MemoryLayout {
+                heap_base: NATIVE_DARWIN_HEAP_BASE,
+                heap_size: page_size,
+                mmap_base: NATIVE_DARWIN_MMAP_BASE,
+                mmap_size: page_size,
+            };
+            let image = AddressSpace::from_regions(0, Vec::new())
+                .expect("empty native test image should be valid");
+            let accepted = NativeMappedMemory::map_with_code_mode(
+                &image,
+                layout,
+                page_size,
+                page_size,
+                carrick_spec::NativeCodeModeRequest::Dsr,
+            )
+            .and_then(|mut memory| {
+                let write_exec = crate::linux_abi::LINUX_PROT_READ
+                    | crate::linux_abi::LINUX_PROT_WRITE
+                    | crate::linux_abi::LINUX_PROT_EXEC;
+                memory
+                    .protect_range(layout.mmap_base, page_size as usize, write_exec)
+                    .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+                Ok(memory.native16k_clone_thread_rejection().is_none()
+                    && !memory.write_exec_blocks_multithreaded_lifecycle())
+            })
+            .unwrap_or(false);
+            unsafe { libc::_exit(i32::from(!accepted)) };
         }
 
         let mut status = 0;

@@ -107,6 +107,18 @@ pub(super) enum RecoveryAction {
         context_register: u32,
         virtual_register: u32,
     },
+    RestoreDualVirtualReadOnly {
+        x18_scratch: u32,
+        x28_scratch: u32,
+        context_scratch: u32,
+    },
+    CommitDualVirtualAndRestore {
+        x18_scratch: u32,
+        x28_scratch: u32,
+        context_scratch: u32,
+        virtual_register: u32,
+        virtual_scratch: u32,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -874,6 +886,150 @@ fn rewritten_virtual_word(
     None
 }
 
+fn rewritten_dual_virtual_read_only_word(
+    word: u32,
+    guest: GuestVa,
+) -> Option<(u32, u32, u32, u32)> {
+    let original = bad64::decode(word, guest.raw()).ok()?;
+    let free = (9_u32..=17)
+        .rev()
+        .filter(|register| !super::decode::decoded_operands_mention_gpr(word, guest, *register))
+        .collect::<Vec<_>>();
+    let fields = [0_u32, 5, 10, 16];
+    let x18_fields = fields
+        .into_iter()
+        .filter(|shift| ((word >> shift) & 0x1f) == 18)
+        .collect::<Vec<_>>();
+    let x28_fields = fields
+        .into_iter()
+        .filter(|shift| ((word >> shift) & 0x1f) == 28)
+        .collect::<Vec<_>>();
+    for &x18_scratch in &free {
+        for &x28_scratch in free.iter().filter(|candidate| **candidate != x18_scratch) {
+            let context_scratch = *free
+                .iter()
+                .find(|candidate| **candidate != x18_scratch && **candidate != x28_scratch)?;
+            for x18_mask in 1_u32..(1_u32 << x18_fields.len()) {
+                for x28_mask in 1_u32..(1_u32 << x28_fields.len()) {
+                    let mut candidate_word = word;
+                    for (index, shift) in x18_fields.iter().copied().enumerate() {
+                        if x18_mask & (1 << index) != 0 {
+                            candidate_word =
+                                (candidate_word & !(0x1f << shift)) | (x18_scratch << shift);
+                        }
+                    }
+                    for (index, shift) in x28_fields.iter().copied().enumerate() {
+                        if x28_mask & (1 << index) != 0 {
+                            candidate_word =
+                                (candidate_word & !(0x1f << shift)) | (x28_scratch << shift);
+                        }
+                    }
+                    let Ok(candidate) = bad64::decode(candidate_word, guest.raw()) else {
+                        continue;
+                    };
+                    if candidate.op() != original.op()
+                        || super::decode::decoded_operands_mention_gpr(candidate_word, guest, 18)
+                        || super::decode::decoded_operands_mention_gpr(candidate_word, guest, 28)
+                    {
+                        continue;
+                    }
+                    let normalized = candidate
+                        .to_string()
+                        .replace(&format!("x{x18_scratch}"), "x18")
+                        .replace(&format!("w{x18_scratch}"), "w18")
+                        .replace(&format!("x{x28_scratch}"), "x28")
+                        .replace(&format!("w{x28_scratch}"), "w28");
+                    if normalized == original.to_string() {
+                        return Some((x18_scratch, x28_scratch, context_scratch, candidate_word));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn emit_dual_virtual(
+    assembler: &mut VecAssembler<Aarch64Relocation>,
+    entries: &mut Vec<PcMapEntry>,
+    plan: &BlockPlan,
+    guest: GuestVa,
+    word: u32,
+    commit_virtual: Option<u32>,
+    recovery: &mut Vec<RecoveryEntry>,
+) -> Result<(), DsrError> {
+    let (x18_scratch, x28_scratch, context_scratch, rewritten) =
+        rewritten_dual_virtual_read_only_word(word, guest).ok_or_else(|| {
+            unsupported_action(plan, guest, word, "unrewritable x18/x28 instruction")
+        })?;
+    for save in [
+        0xf900_0000 | ((1160 / 8) << 10) | (28 << 5) | x18_scratch,
+        0xf900_0000 | ((1120 / 8) << 10) | (28 << 5) | x28_scratch,
+        0xf900_0000 | ((1128 / 8) << 10) | (28 << 5) | context_scratch,
+    ] {
+        emit_word(assembler, entries, guest, save)?;
+    }
+    let restore = RecoveryAction::RestoreDualVirtualReadOnly {
+        x18_scratch,
+        x28_scratch,
+        context_scratch,
+    };
+    for instruction in [
+        0xaa1c_03e0 | context_scratch,
+        0xf940_0000 | ((144 / 8) << 10) | (context_scratch << 5) | x18_scratch,
+        0xf940_0000 | ((224 / 8) << 10) | (context_scratch << 5) | x28_scratch,
+        rewritten,
+    ] {
+        recovery.push(RecoveryEntry {
+            cache: current_offset(assembler)?,
+            action: restore,
+        });
+        emit_word(assembler, entries, guest, instruction)?;
+    }
+    if let Some(virtual_register) = commit_virtual {
+        let (virtual_scratch, snapshot_offset) = match virtual_register {
+            18 => (x18_scratch, 144),
+            28 => (x28_scratch, 224),
+            _ => {
+                return Err(unsupported_action(
+                    plan,
+                    guest,
+                    word,
+                    "invalid dual virtual destination",
+                ));
+            }
+        };
+        recovery.push(RecoveryEntry {
+            cache: current_offset(assembler)?,
+            action: RecoveryAction::CommitDualVirtualAndRestore {
+                x18_scratch,
+                x28_scratch,
+                context_scratch,
+                virtual_register,
+                virtual_scratch,
+            },
+        });
+        emit_word(
+            assembler,
+            entries,
+            guest,
+            0xf900_0000 | ((snapshot_offset / 8) << 10) | (context_scratch << 5) | virtual_scratch,
+        )?;
+    }
+    for instruction in [
+        0xf940_0000 | ((1160 / 8) << 10) | (context_scratch << 5) | x18_scratch,
+        0xf940_0000 | ((1120 / 8) << 10) | (context_scratch << 5) | x28_scratch,
+        0xf940_0000 | ((1128 / 8) << 10) | (28 << 5) | context_scratch,
+    ] {
+        recovery.push(RecoveryEntry {
+            cache: current_offset(assembler)?,
+            action: restore,
+        });
+        emit_word(assembler, entries, guest, instruction)?;
+    }
+    Ok(())
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "virtual-register emission carries its explicit recovery contract"
@@ -1130,6 +1286,30 @@ fn emit_block_inner(
                     word,
                     28,
                     224,
+                    &mut recovery,
+                )?;
+                continue;
+            }
+            InstAction::VirtualizedX18X28ReadOnly { word, .. } => {
+                emit_dual_virtual(
+                    &mut assembler,
+                    &mut entries,
+                    plan,
+                    instruction.guest,
+                    word,
+                    None,
+                    &mut recovery,
+                )?;
+                continue;
+            }
+            InstAction::VirtualizedX18WriteX28Read { word, .. } => {
+                emit_dual_virtual(
+                    &mut assembler,
+                    &mut entries,
+                    plan,
+                    instruction.guest,
+                    word,
+                    Some(18),
                     &mut recovery,
                 )?;
                 continue;

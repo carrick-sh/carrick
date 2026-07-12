@@ -198,6 +198,14 @@ fn sensitive(
 }
 
 pub(super) fn classify(word: u32, pc: GuestVa) -> Result<InstAction, DsrError> {
+    // FEAT_CHK's fixed `chkfeat x16` encoding is also architecturally a HINT
+    // on implementations without the extension. bad64 0.12 predates this
+    // Armv8.9 alias and rejects the otherwise copy-safe instruction. x16 is an
+    // ordinary guest register while translated code is running, so native
+    // execution preserves both the implemented and HINT behaviors.
+    if word == 0xd503_251f {
+        return Ok(InstAction::Copy(word));
+    }
     let instruction = bad64::decode(word, pc.raw()).map_err(|error| DsrError::Decode {
         pc: pc.raw(),
         word,
@@ -214,7 +222,56 @@ pub(super) fn classify(word: u32, pc: GuestVa) -> Result<InstAction, DsrError> {
 
     let virtualized = || {
         if mentions_x18 && mentions_x28 {
-            InstAction::Unsupported { word, op }
+            let writes_x18_from_x28 = matches!(
+                operands,
+                [
+                    Operand::Reg { reg: destination, .. },
+                    Operand::Reg { reg: source, .. },
+                    ..
+                ] if register_matches_gpr(*destination, 18)
+                    && register_matches_gpr(*source, 28)
+            );
+            let loads_x18_from_x28 = matches!(
+                (op, operands),
+                (
+                    Op::LDR,
+                    [
+                        Operand::Reg { reg: destination, .. },
+                        Operand::MemOffset { reg: base, .. }
+                    ]
+                ) if register_matches_gpr(*destination, 18)
+                    && register_matches_gpr(*base, 28)
+            ) || matches!(
+                (op, operands),
+                (
+                    Op::LDP,
+                    [
+                        Operand::Reg { .. },
+                        Operand::Reg { reg: destination, .. },
+                        Operand::MemOffset { reg: base, .. }
+                    ]
+                ) if register_matches_gpr(*destination, 18)
+                    && register_matches_gpr(*base, 28)
+            );
+            if (matches!(op, Op::ADD | Op::SUB) && writes_x18_from_x28) || loads_x18_from_x28 {
+                InstAction::VirtualizedX18WriteX28Read { word, op }
+            } else if matches!(
+                (op, operands),
+                (
+                    Op::STP,
+                    [
+                        Operand::Reg { .. },
+                        Operand::Reg { .. },
+                        Operand::MemOffset { .. }
+                    ]
+                ) | (Op::STR, [Operand::Reg { .. }, Operand::MemOffset { .. }])
+            ) {
+                // Offset-form stores only read their data registers and base;
+                // unlike pre/post-index forms they cannot update guest x28.
+                InstAction::VirtualizedX18X28ReadOnly { word, op }
+            } else {
+                InstAction::Unsupported { word, op }
+            }
         } else if mentions_x18 {
             InstAction::VirtualizedX18 { word, op }
         } else if mentions_x28 {
@@ -302,6 +359,10 @@ pub(super) fn classify(word: u32, pc: GuestVa) -> Result<InstAction, DsrError> {
                 Ok(virtualized())
             }
             [Operand::Reg { .. }, Operand::SysReg(SysReg::NZCV)] => Ok(virtualized()),
+            [
+                Operand::Reg { .. },
+                Operand::SysReg(SysReg::FPCR | SysReg::FPSR),
+            ] => Ok(virtualized()),
             _ => Ok(InstAction::Unsupported { word, op }),
         },
         Op::MSR => match operands {
@@ -309,6 +370,10 @@ pub(super) fn classify(word: u32, pc: GuestVa) -> Result<InstAction, DsrError> {
                 sensitive(pc, SensitiveKind::WriteTpidr, Some(*reg))
             }
             [Operand::SysReg(SysReg::NZCV), Operand::Reg { .. }] => Ok(virtualized()),
+            [
+                Operand::SysReg(SysReg::FPCR | SysReg::FPSR),
+                Operand::Reg { .. },
+            ] => Ok(virtualized()),
             _ => Ok(InstAction::Unsupported { word, op }),
         },
         Op::DC if (word & !0x1f) == 0xd50b_7420 => {

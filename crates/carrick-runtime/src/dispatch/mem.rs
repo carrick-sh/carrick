@@ -630,6 +630,7 @@ impl SyscallDispatcher {
 
     fn native16k_write_exec_rejection(
         &self,
+        memory: &dyn GuestMemory,
         thread: Option<ThreadCtx<'_>>,
         shared: bool,
         alias: bool,
@@ -639,6 +640,9 @@ impl SyscallDispatcher {
         }
         if shared {
             return Some("native16k shared write-exec mappings are not yet coherent across fork");
+        }
+        if memory.supports_concurrent_exec_protection() {
+            return None;
         }
         if alias {
             return Some("native16k alias write-exec mmap is not yet protection-aware");
@@ -652,8 +656,12 @@ impl SyscallDispatcher {
 
     fn native16k_exec_transition_rejection(
         &self,
+        memory: &dyn GuestMemory,
         thread: Option<ThreadCtx<'_>>,
     ) -> Option<&'static str> {
+        if memory.supports_concurrent_exec_protection() {
+            return None;
+        }
         (self.page_geometry.native_profile == Some(carrick_spec::NativePageProfile::Native16k)
             && thread.is_some_and(|thread| thread.registry.live_count() > 1))
         .then_some(
@@ -1248,6 +1256,7 @@ impl SyscallDispatcher {
             };
             if prot_flags.contains(LinuxProtFlags::WRITE | LinuxProtFlags::EXEC)
                 && let Some(reason) = this.native16k_write_exec_rejection(
+                    &*memory,
                     cx.thread,
                     map_sharing == MmapSharing::Shared,
                     fixed_write_exec_alias,
@@ -1759,7 +1768,7 @@ impl SyscallDispatcher {
             if mmap_address_uses_alias(address, length, layout) {
                 if prot_flags.contains(LinuxProtFlags::WRITE | LinuxProtFlags::EXEC)
                     && let Some(reason) =
-                        this.native16k_write_exec_rejection(cx.thread, false, true)
+                        this.native16k_write_exec_rejection(&*memory, cx.thread, false, true)
                 {
                     cx.reporter.record(CompatEvent::partial_syscall(
                         cx.number(),
@@ -2417,7 +2426,8 @@ impl SyscallDispatcher {
             }
             let layout = this.mem.lock().layout;
             if prot_flags.contains(LinuxProtFlags::EXEC)
-                && let Some(reason) = this.native16k_exec_transition_rejection(cx.thread)
+                && let Some(reason) =
+                    this.native16k_exec_transition_rejection(cx.memory, cx.thread)
             {
                 cx.reporter.record(CompatEvent::partial_syscall(
                     cx.number(),
@@ -2429,6 +2439,7 @@ impl SyscallDispatcher {
             }
             if prot_flags.contains(LinuxProtFlags::WRITE | LinuxProtFlags::EXEC)
                 && let Some(reason) = this.native16k_write_exec_rejection(
+                    cx.memory,
                     cx.thread,
                     this.range_intersects_shared_mapping(address.0, length),
                     mmap_address_uses_alias(address.0, length, layout),
@@ -2471,6 +2482,14 @@ impl SyscallDispatcher {
                     ));
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 }
+            } else if cx.memory.supports_concurrent_exec_protection()
+                && cx.memory.protect_range(address.0, len, prot).is_err()
+            {
+                // DSR-backed native aliases are real host mappings and keep
+                // executable bytes non-executable. Apply the protection so a
+                // write to an RWX page faults through generation invalidation;
+                // legacy VMM aliases retain their host-side-only behavior.
+                return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
             }
             let prot_none = LinuxProtFlags::from_bits_truncate(prot).is_empty();
             cx.memory.set_mapping_protection(
@@ -3089,6 +3108,31 @@ mod tests {
         }
     }
 
+    struct ConcurrentExecMemory(CountingMmapMemory);
+
+    impl GuestMemory for ConcurrentExecMemory {
+        fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+            self.0.read_bytes_raw(address, length)
+        }
+
+        fn write_bytes_raw(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+            self.0.write_bytes_raw(address, bytes)
+        }
+
+        fn protect_range(
+            &mut self,
+            address: u64,
+            len: usize,
+            prot: u64,
+        ) -> Result<(), MemoryError> {
+            self.0.protect_range(address, len, prot)
+        }
+
+        fn supports_concurrent_exec_protection(&self) -> bool {
+            true
+        }
+    }
+
     struct ProtectionTrackingMemory {
         inner: CountingMmapMemory,
         protections: carrick_guest_mem::protections::MemoryProtections,
@@ -3467,6 +3511,88 @@ mod tests {
         assert_eq!(outcome, DispatchOutcome::errno(LINUX_EOPNOTSUPP));
         assert_partial_reason(&reporter, "mprotect", "executable protection transition");
         assert_eq!(memory.protect_calls.get(), 0);
+    }
+
+    #[test]
+    fn native16k_allows_multithreaded_exec_mprotect_for_translation_backend() {
+        const SYS_MPROTECT: u64 = 226;
+        const PAGE_SIZE: u64 = 16 * 1024;
+
+        let dispatcher = native16k_dispatcher();
+        dispatcher.record_dynamic_mapping(
+            LINUX_MMAP_BASE,
+            PAGE_SIZE,
+            LinuxProtFlags::READ | LinuxProtFlags::WRITE,
+            ProcMapSharing::Private,
+            String::new(),
+        );
+        let registry =
+            crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1186));
+        registry.register_child(0);
+        let reporter = CompatReporter::default();
+        let mut memory =
+            ConcurrentExecMemory(CountingMmapMemory::new(LINUX_MMAP_BASE, PAGE_SIZE as usize));
+        let outcome = threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MPROTECT,
+                SyscallArgs([
+                    LINUX_MMAP_BASE,
+                    PAGE_SIZE,
+                    LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_EXEC,
+                    0,
+                    0,
+                    0,
+                ]),
+            ),
+        );
+
+        assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
+        assert_eq!(memory.0.protect_calls.get(), 1);
+    }
+
+    #[test]
+    fn native16k_allows_private_alias_write_exec_for_translation_backend() {
+        const SYS_MPROTECT: u64 = 226;
+        const PAGE_SIZE: u64 = 16 * 1024;
+        let address = crate::memory::LINUX_HIGH_VA_THRESHOLD;
+
+        let dispatcher = native16k_dispatcher();
+        dispatcher.record_dynamic_mapping(
+            address,
+            PAGE_SIZE,
+            LinuxProtFlags::READ | LinuxProtFlags::WRITE,
+            ProcMapSharing::Private,
+            String::new(),
+        );
+        let registry =
+            crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1187));
+        registry.register_child(0);
+        let reporter = CompatReporter::default();
+        let mut memory = ConcurrentExecMemory(CountingMmapMemory::new(address, PAGE_SIZE as usize));
+        let outcome = threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MPROTECT,
+                SyscallArgs([
+                    address,
+                    PAGE_SIZE,
+                    LINUX_PROT_READ | LINUX_PROT_WRITE | crate::linux_abi::LINUX_PROT_EXEC,
+                    0,
+                    0,
+                    0,
+                ]),
+            ),
+        );
+
+        assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
+        assert_eq!(memory.0.protect_calls.get(), 1);
     }
 
     #[test]

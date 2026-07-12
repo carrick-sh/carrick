@@ -144,6 +144,19 @@ impl ProcessTranslator {
         state.cache.after_fork_child();
         state.publications.after_fork_child();
     }
+
+    pub(super) fn reset_after_fork_for_exec(&self) {
+        let mut state = self.state.lock();
+        state.published.clear();
+        state.cache.reset_after_fork_for_exec();
+        state.blocks.clear();
+        state.pending.clear();
+        state.stats = ResolverStats::default();
+        state.sensitive.clear();
+        state.unsupported.clear();
+        state.dependencies = cache::PageBlockDependencies::default();
+        state.publications.reset_for_exec();
+    }
 }
 
 impl ProcessState {
@@ -581,6 +594,73 @@ fn recover_rewrite_state(
             snapshot.pstate = saved_generation_pstate;
             return Ok(());
         }
+        emit::RecoveryAction::RestoreDualVirtualReadOnly {
+            x18_scratch,
+            x28_scratch,
+            context_scratch,
+        } => {
+            for (register, value) in [
+                (x18_scratch, saved_indirect_x15),
+                (x28_scratch, saved_scratch),
+                (context_scratch, saved_context_scratch),
+            ] {
+                let index = usize::try_from(register).map_err(|_| {
+                    types::DsrError::CachePolicy("dual virtual scratch index overflow".to_string())
+                })?;
+                let slot = snapshot.x.get_mut(index).ok_or_else(|| {
+                    types::DsrError::CachePolicy(format!(
+                        "dual virtual scratch x{register} is outside snapshot"
+                    ))
+                })?;
+                *slot = value;
+            }
+            return Ok(());
+        }
+        emit::RecoveryAction::CommitDualVirtualAndRestore {
+            x18_scratch,
+            x28_scratch,
+            context_scratch,
+            virtual_register,
+            virtual_scratch,
+        } => {
+            let virtual_scratch_index = usize::try_from(virtual_scratch).map_err(|_| {
+                types::DsrError::CachePolicy("dual virtual result index overflow".to_string())
+            })?;
+            let value = snapshot
+                .x
+                .get(virtual_scratch_index)
+                .copied()
+                .ok_or_else(|| {
+                    types::DsrError::CachePolicy(format!(
+                        "dual virtual result x{virtual_scratch} is outside snapshot"
+                    ))
+                })?;
+            let virtual_index = usize::try_from(virtual_register).map_err(|_| {
+                types::DsrError::CachePolicy("dual virtual destination overflow".to_string())
+            })?;
+            let virtual_slot = snapshot.x.get_mut(virtual_index).ok_or_else(|| {
+                types::DsrError::CachePolicy(format!(
+                    "dual virtual destination x{virtual_register} is outside snapshot"
+                ))
+            })?;
+            *virtual_slot = value;
+            for (register, value) in [
+                (x18_scratch, saved_indirect_x15),
+                (x28_scratch, saved_scratch),
+                (context_scratch, saved_context_scratch),
+            ] {
+                let index = usize::try_from(register).map_err(|_| {
+                    types::DsrError::CachePolicy("dual virtual scratch index overflow".to_string())
+                })?;
+                let slot = snapshot.x.get_mut(index).ok_or_else(|| {
+                    types::DsrError::CachePolicy(format!(
+                        "dual virtual scratch x{register} is outside snapshot"
+                    ))
+                })?;
+                *slot = value;
+            }
+            return Ok(());
+        }
         emit::RecoveryAction::RestoreScratch { register }
         | emit::RecoveryAction::CommitVirtualizedAndRestoreScratch { register, .. } => {
             (register, None)
@@ -674,10 +754,74 @@ mod tests {
     }
 
     #[test]
+    fn dsr_fork_child_exec_reuses_and_clears_inherited_translator() {
+        let process =
+            super::ProcessTranslator::new(16 * 1024).expect("create inherited translator");
+        let key = (PC, super::types::CodeGeneration::INITIAL);
+        let entry = super::types::CacheVa::published(carrick_guest_mem::HostVa(0x1000));
+        process
+            .state
+            .lock()
+            .publications
+            .get_or_publish(key, || entry);
+
+        process.reset_after_fork_for_exec();
+
+        let state = process.state.lock();
+        assert_eq!(state.publications.published_count(), 0);
+        assert!(state.blocks.is_empty());
+        assert!(state.published.is_empty());
+    }
+
+    #[test]
     fn classifies_copy_syscall_and_control_flow() {
         assert!(matches!(
             classify(0x9100_0400, PC),
             Ok(InstAction::Copy(0x9100_0400))
+        ));
+        assert!(matches!(
+            classify(0xd503_251f, PC),
+            Ok(InstAction::Copy(0xd503_251f))
+        ));
+        for word in [0xd53b_4416, 0xd51b_4416, 0xd53b_4436, 0xd51b_4436] {
+            assert!(
+                matches!(classify(word, PC), Ok(InstAction::Copy(observed)) if observed == word)
+            );
+        }
+        assert!(matches!(
+            classify(0xa900_4b82, PC),
+            Ok(InstAction::VirtualizedX18X28ReadOnly {
+                word: 0xa900_4b82,
+                ..
+            })
+        ));
+        assert!(matches!(
+            classify(0xf900_0e5c, PC),
+            Ok(InstAction::VirtualizedX18X28ReadOnly {
+                word: 0xf900_0e5c,
+                ..
+            })
+        ));
+        assert!(matches!(
+            classify(0x910a_6392, PC),
+            Ok(InstAction::VirtualizedX18WriteX28Read {
+                word: 0x910a_6392,
+                ..
+            })
+        ));
+        assert!(matches!(
+            classify(0xcb16_0392, PC),
+            Ok(InstAction::VirtualizedX18WriteX28Read {
+                word: 0xcb16_0392,
+                ..
+            })
+        ));
+        assert!(matches!(
+            classify(0xa94d_cb8f, PC),
+            Ok(InstAction::VirtualizedX18WriteX28Read {
+                word: 0xa94d_cb8f,
+                ..
+            })
         ));
         assert!(matches!(
             classify(0xd400_0001, PC),

@@ -1128,6 +1128,128 @@ fn dsr_virtual_x28_rewrites_destination_and_distinct_x17_operand() {
 }
 
 #[test]
+fn dsr_dual_virtual_read_only_store_uses_guest_x18_and_x28() {
+    let guest = GuestVa(0x1b_180);
+    let plan = BlockPlan {
+        start: guest,
+        end: GuestVa(guest.raw() + 12),
+        generation: CodeGeneration::INITIAL,
+        instructions: vec![
+            PlannedInst {
+                guest,
+                action: super::decode::classify(0xa900_4b82, guest)
+                    .expect("classify stp x2, x18, [x28]"),
+            },
+            PlannedInst {
+                guest: GuestVa(guest.raw() + 4),
+                action: super::decode::classify(0xa90b_4b91, GuestVa(guest.raw() + 4))
+                    .expect("classify stp x17, x18, [x28, #176]"),
+            },
+        ],
+        exit: PlannedExit::Syscall {
+            guest: GuestVa(guest.raw() + 8),
+            resume: GuestVa(guest.raw() + 12),
+        },
+    };
+    let mut cache = TranslationCache::new(16 * 1024).expect("allocate dual rewrite cache");
+    let emitted = emit_block(&mut cache, &plan).expect("emit dual virtual store");
+    let mut stored = [0_u64; 24];
+    let mut stack = vec![0_u8; 16 * 1024];
+    let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    snapshot.x[2] = 0x2222_2222_2222_2222;
+    snapshot.x[18] = 0x1818_1818_1818_1818;
+    snapshot.x[28] = stored.as_mut_ptr() as u64;
+    let expected_x15_x17 = [snapshot.x[15], snapshot.x[16], snapshot.x[17]];
+    let mut exit = NativeDsrExit::Syscall {
+        resume: GuestVa(guest.raw() + 12),
+    };
+
+    enter_translated(emitted.entry(), &mut snapshot, &mut exit)
+        .expect("execute dual virtual store");
+
+    assert_eq!(&stored[..2], &[snapshot.x[2], snapshot.x[18]]);
+    assert_eq!(&stored[22..], &[snapshot.x[17], snapshot.x[18]]);
+    assert_eq!(
+        [snapshot.x[15], snapshot.x[16], snapshot.x[17]],
+        expected_x15_x17
+    );
+    assert_eq!(snapshot.x[28], stored.as_mut_ptr() as u64);
+}
+
+#[test]
+fn dsr_dual_virtual_add_commits_guest_x18_from_guest_x28() {
+    let guest = GuestVa(0x1b_1c0);
+    let plan = BlockPlan {
+        start: guest,
+        end: GuestVa(guest.raw() + 8),
+        generation: CodeGeneration::INITIAL,
+        instructions: vec![PlannedInst {
+            guest,
+            action: super::decode::classify(0x910a_6392, guest)
+                .expect("classify add x18, x28, #0x298"),
+        }],
+        exit: PlannedExit::Syscall {
+            guest: GuestVa(guest.raw() + 4),
+            resume: GuestVa(guest.raw() + 8),
+        },
+    };
+    let mut cache = TranslationCache::new(16 * 1024).expect("allocate dual add cache");
+    let emitted = emit_block(&mut cache, &plan).expect("emit dual virtual add");
+    let mut stack = vec![0_u8; 16 * 1024];
+    let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    snapshot.x[28] = 0x8000;
+    let expected_x15_x17 = [snapshot.x[15], snapshot.x[16], snapshot.x[17]];
+    let mut exit = NativeDsrExit::Syscall {
+        resume: GuestVa(guest.raw() + 8),
+    };
+
+    enter_translated(emitted.entry(), &mut snapshot, &mut exit).expect("execute dual virtual add");
+
+    assert_eq!(snapshot.x[18], 0x8298);
+    assert_eq!(snapshot.x[28], 0x8000);
+    assert_eq!(
+        [snapshot.x[15], snapshot.x[16], snapshot.x[17]],
+        expected_x15_x17
+    );
+}
+
+#[test]
+fn dsr_dual_virtual_load_commits_guest_x18_and_ordinary_destination() {
+    let guest = GuestVa(0x1b_200);
+    let plan = BlockPlan {
+        start: guest,
+        end: GuestVa(guest.raw() + 8),
+        generation: CodeGeneration::INITIAL,
+        instructions: vec![PlannedInst {
+            guest,
+            action: super::decode::classify(0xa94d_cb8f, guest)
+                .expect("classify ldp x15, x18, [x28, #216]"),
+        }],
+        exit: PlannedExit::Syscall {
+            guest: GuestVa(guest.raw() + 4),
+            resume: GuestVa(guest.raw() + 8),
+        },
+    };
+    let mut cache = TranslationCache::new(16 * 1024).expect("allocate dual load cache");
+    let emitted = emit_block(&mut cache, &plan).expect("emit dual virtual load");
+    let mut source = [0_u64; 29];
+    source[27] = 0x1515_1515_1515_1515;
+    source[28] = 0x1818_1818_1818_1818;
+    let mut stack = vec![0_u8; 16 * 1024];
+    let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    snapshot.x[28] = source.as_ptr() as u64;
+    let mut exit = NativeDsrExit::Syscall {
+        resume: GuestVa(guest.raw() + 8),
+    };
+
+    enter_translated(emitted.entry(), &mut snapshot, &mut exit).expect("execute dual virtual load");
+
+    assert_eq!(snapshot.x[15], source[27]);
+    assert_eq!(snapshot.x[18], source[28]);
+    assert_eq!(snapshot.x[28], source.as_ptr() as u64);
+}
+
+#[test]
 fn dsr_generation_guard_rejects_stale_block_before_guest_instruction() {
     use std::sync::atomic::{AtomicU64, Ordering};
 
