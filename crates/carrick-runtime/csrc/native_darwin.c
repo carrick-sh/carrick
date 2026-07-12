@@ -45,6 +45,8 @@ struct carrick_native_dsr_signal_context {
     uint64_t exit_target;
     uint64_t exit_source;
     uint32_t exit_status;
+    uint8_t gateway_tail[52];
+    uint32_t entry_in_progress;
 };
 
 _Static_assert(offsetof(struct carrick_native_dsr_signal_context, host_sp) == 832,
@@ -55,6 +57,8 @@ _Static_assert(offsetof(struct carrick_native_dsr_signal_context, exit_source) =
                "DSR signal source offset");
 _Static_assert(offsetof(struct carrick_native_dsr_signal_context, exit_status) == 1096,
                "DSR signal status offset");
+_Static_assert(offsetof(struct carrick_native_dsr_signal_context, entry_in_progress) == 1152,
+               "DSR entry-progress offset");
 
 struct carrick_native_kick_state {
     _Atomic uint64_t requested;
@@ -188,6 +192,9 @@ static uint64_t carrick_native_update_tpidr_address;
 static pthread_once_t carrick_native_update_tpidr_once = PTHREAD_ONCE_INIT;
 static int carrick_native_update_tpidr_errno;
 
+static int carrick_native_unblock_kick_signal(void);
+static int carrick_native_block_kick_signal(void);
+
 #define CARRICK_NATIVE_CUSTOM_X18_BIT UINT64_C(0x0001000000000000)
 #define CARRICK_NATIVE_TPIDR_BASE_MASK UINT64_C(0xfffffffffff00000)
 #define CARRICK_NATIVE_EVENT_TRAP 1
@@ -280,12 +287,24 @@ static int carrick_native_enter_guest_x18_abi(void) {
 
 int carrick_native_dsr_enter_guest_abi(void *context) {
     carrick_native_active_dsr_context = context;
-    return carrick_native_enter_guest_x18_abi();
+    if (carrick_native_enter_guest_x18_abi() != 0) {
+        carrick_native_active_dsr_context = 0;
+        return -1;
+    }
+    if (carrick_native_unblock_kick_signal() != 0) {
+        carrick_native_active_dsr_context = 0;
+        carrick_native_enter_host_x18_abi();
+        return -1;
+    }
+    return 0;
 }
 
 void carrick_native_dsr_enter_host_abi(void) {
     carrick_native_active_dsr_context = 0;
     carrick_native_enter_host_x18_abi();
+    if (carrick_native_block_kick_signal() != 0) {
+        _exit(127);
+    }
 }
 
 static void carrick_native_snapshot_mcontext(
@@ -448,7 +467,15 @@ static void carrick_native_trap_handler(int sig, siginfo_t *info, void *uap) {
         // Preserve the first interrupted cache PC and register snapshot. If
         // the recovery gateway itself faults, overwriting them would turn the
         // useful guest fault into an unmappable gateway address.
-        if (context->exit_status != 4 && context->exit_status != 5) {
+        if (event_kind == CARRICK_NATIVE_EVENT_KICK &&
+            context->entry_in_progress != 0) {
+            // The kick became deliverable while the gateway was still inside
+            // pthread_sigmask. No translated instruction has run, so the
+            // context's original guest PC and registers are authoritative.
+            context->exit_target = context->snapshot.pc;
+            context->exit_source = 0;
+            context->exit_status = 8;
+        } else if (context->exit_status != 4 && context->exit_status != 5) {
             carrick_native_snapshot_mcontext(
                 &context->snapshot,
                 uc->uc_mcontext,
@@ -537,6 +564,19 @@ static int carrick_native_block_kick_signal(void) {
         return -1;
     }
     int rc = pthread_sigmask(SIG_BLOCK, &kick, 0);
+    if (rc != 0) {
+        errno = rc;
+        return -1;
+    }
+    return 0;
+}
+
+static int carrick_native_unblock_kick_signal(void) {
+    sigset_t kick;
+    if (sigemptyset(&kick) != 0 || sigaddset(&kick, SIGPIPE) != 0) {
+        return -1;
+    }
+    int rc = pthread_sigmask(SIG_UNBLOCK, &kick, 0);
     if (rc != 0) {
         errno = rc;
         return -1;

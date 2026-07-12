@@ -92,6 +92,8 @@ struct DsrContext {
     rewrite_context_scratch: u64,
     indirect_cache: *const IndirectTargetCacheEntry,
     generation: u64,
+    entry_in_progress: u32,
+    entry_pad: u32,
 }
 
 impl DsrContext {
@@ -148,6 +150,8 @@ impl DsrContext {
             exit_link_pad: 0,
             indirect_cache,
             generation: generation.get(),
+            entry_in_progress: 1,
+            entry_pad: 0,
         }
     }
 }
@@ -168,7 +172,8 @@ const _: () = assert!(std::mem::offset_of!(DsrContext, rewrite_scratch) == 1120)
 const _: () = assert!(std::mem::offset_of!(DsrContext, rewrite_context_scratch) == 1128);
 const _: () = assert!(std::mem::offset_of!(DsrContext, indirect_cache) == 1136);
 const _: () = assert!(std::mem::offset_of!(DsrContext, generation) == 1144);
-const _: () = assert!(std::mem::size_of::<DsrContext>() == 1152);
+const _: () = assert!(std::mem::offset_of!(DsrContext, entry_in_progress) == 1152);
+const _: () = assert!(std::mem::size_of::<DsrContext>() == 1168);
 const _: () = assert!(std::mem::size_of::<IndirectTargetCacheEntry>() == 32);
 const _: () = assert!(std::mem::offset_of!(IndirectTargetCacheEntry, guest) == 0);
 const _: () = assert!(std::mem::offset_of!(IndirectTargetCacheEntry, generation) == 8);
@@ -260,7 +265,7 @@ fn enter_translated_raw(
     }
     let mut context = DsrContext::new(*snapshot, entry, *exit, indirect_cache, generation);
     let rc = unsafe { carrick_dsr_enter_raw(&mut context) };
-    if !matches!(rc, 1..=7) {
+    if !matches!(rc, 1..=8) {
         return Err(DsrError::Gateway(format!(
             "translated entry returned invalid gateway status {rc}"
         )));
@@ -303,6 +308,9 @@ fn enter_translated_raw(
             guest_pc: carrick_guest_mem::GuestVa(context.exit_source),
             word: 0,
             op: bad64::Op::UDF,
+        },
+        8 => NativeDsrExit::KickAtEntry {
+            resume: carrick_guest_mem::GuestVa(context.exit_target),
         },
         _ => {
             return Err(DsrError::Gateway(format!(
