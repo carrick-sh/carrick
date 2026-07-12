@@ -364,14 +364,26 @@ fn prepare_cache_improvement() {
 fn stack_window_improvement() {
     run_binary_gate(
         "stack-window-improvement",
-        &[BinaryGate {
-            workload: Workload::ForkExec,
-            cycles: 5,
-            policy: BinaryGatePolicy::Improvement(ImprovementPolicy {
-                upper_bound: 0.95,
-                minimum_estimate_gain: 0.10,
-            }),
-        }],
+        &[
+            BinaryGate {
+                workload: Workload::ForkExec,
+                cycles: 5,
+                policy: BinaryGatePolicy::Improvement(ImprovementPolicy {
+                    upper_bound: 0.95,
+                    minimum_estimate_gain: 0.10,
+                }),
+            },
+            BinaryGate {
+                workload: Workload::SyscallFloor,
+                cycles: 15,
+                policy: BinaryGatePolicy::NonInferiority { upper_bound: 1.01 },
+            },
+            BinaryGate {
+                workload: Workload::DirectV8,
+                cycles: 5,
+                policy: BinaryGatePolicy::NonInferiority { upper_bound: 1.01 },
+            },
+        ],
         "CARRICK_DSR_OPTIMIZATION_OUT",
     );
 }
