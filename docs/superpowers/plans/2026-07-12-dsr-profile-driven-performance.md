@@ -411,7 +411,7 @@ git commit -m "test(native): expose indirect-cache alias thrash" \
 - Consumes: the red alias oracle from Task 3.
 - Produces: `INDIRECT_CACHE_ENTRIES = 8192`, `indirect_cache_index(GuestVa) -> usize`, and matching emitted `eor`/`ubfx` lookup code within 256 KiB per thread.
 
-- [ ] **Step 1: Add layout and index contract tests**
+- [x] **Step 1: Add layout and index contract tests**
 
 ```rust
 #[test]
@@ -432,7 +432,7 @@ fn mixed_index_separates_old_page_offset_aliases() {
 }
 ```
 
-- [ ] **Step 2: Run the new tests red**
+- [x] **Step 2: Run the new tests red**
 
 ```bash
 cargo test -p carrick-runtime indirect_cache_ --lib -- --nocapture
@@ -441,7 +441,7 @@ cargo test -p carrick-runtime indirect_cache_ --lib -- --nocapture
 Expected: FAIL because the table is still 1,024 entries and the old aliases
 still share an index.
 
-- [ ] **Step 3: Implement the shared Rust index**
+- [x] **Step 3: Implement the shared Rust index**
 
 Replace the old constants/index with:
 
@@ -462,7 +462,7 @@ fn indirect_cache_index(guest: carrick_guest_mem::GuestVa) -> usize {
 Use `indirect_cache_index` from `publish`. Keep entry size, release publication,
 clear ordering, and `DsrContext` offsets unchanged.
 
-- [ ] **Step 4: Emit the identical mixed index**
+- [x] **Step 4: Emit the identical mixed index**
 
 Replace the 10-bit `ubfx` with:
 
@@ -477,7 +477,7 @@ dynasmrt::dynasm!(assembler
 Retain the base load, 32-byte shift, acquire key load, target comparison,
 nonzero cache-PC check, generation guard, register restoration, and miss exit.
 
-- [ ] **Step 5: Run the red oracle green and the full focused oracle**
+- [x] **Step 5: Run the red oracle green and the full focused oracle**
 
 ```bash
 cargo test -p carrick-runtime \
@@ -490,11 +490,12 @@ cargo test -p carrick-runtime dsr_signal_fault --lib -- --nocapture
 Expected: both old-alias targets remain hot and all existing
 indirect/generation/signal tests pass.
 
-- [ ] **Step 6: Commit the cache experiment**
+- [x] **Step 6: Commit the cache experiment**
 
 ```bash
 git add crates/carrick-runtime/src/native_darwin/dsr/gateway.rs \
-  crates/carrick-runtime/src/native_darwin/dsr/emit.rs
+  crates/carrick-runtime/src/native_darwin/dsr/emit.rs \
+  docs/superpowers/plans/2026-07-12-dsr-profile-driven-performance.md
 git commit -m "perf(native): mix and expand the DSR indirect cache" \
   -m "Use the approved 256 KiB per-thread budget and mix page-number bits into the emitted direct-map index so hot targets with identical page offsets no longer evict each other." \
   -m "Co-Authored-By: Codex <codex@openai.com>"
