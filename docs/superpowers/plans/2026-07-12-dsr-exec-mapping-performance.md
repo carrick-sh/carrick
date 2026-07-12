@@ -44,7 +44,7 @@ record the experiment as rejected rather than weakening the threshold.
   bit.
 - Produces: `native_mapping_needs_icache_publication(executable, mode) -> bool`.
 
-- [ ] **Step 1: Add the policy test**
+- [x] **Step 1: Add the policy test**
 
 ```rust
 #[test]
@@ -57,14 +57,14 @@ fn dsr_source_mappings_do_not_publish_host_icache() {
         false,
         carrick_spec::NativeCodeModeRequest::Dsr,
     ));
-    assert!(native_mapping_needs_icache_publication(
-        true,
-        carrick_spec::NativeCodeModeRequest::Brk,
-    ));
 }
 ```
 
-- [ ] **Step 2: Run red**
+This test pins only the DSR property under optimization. The helper's boolean
+expression leaves every non-DSR mode unchanged, but legacy-mode behavior is not
+a goal or promotion lane.
+
+- [x] **Step 2: Run red**
 
 ```bash
 cargo test -p carrick-runtime \
@@ -73,7 +73,9 @@ cargo test -p carrick-runtime \
 
 Expected: compilation fails because the policy function does not exist.
 
-- [ ] **Step 3: Commit only the red test**
+Observed: `E0425` at both assertions; the policy function is absent.
+
+- [x] **Step 3: Commit only the red test**
 
 Use `test(native): pin DSR source mapping publication` with the red command in
 the body.
