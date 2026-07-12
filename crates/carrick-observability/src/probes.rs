@@ -152,6 +152,8 @@ dsr_ordinal_enum! {
         CachePolicy = 9,
         GenerationChanged = 10,
         Host = 11,
+        CacheCapacity = 12,
+        InvalidTarget = 13,
     }
 }
 
@@ -242,6 +244,8 @@ mod dsr_probe_abi {
         assert_eq!(DsrOperationOutcome::CachePolicy.raw(), 9);
         assert_eq!(DsrOperationOutcome::GenerationChanged.raw(), 10);
         assert_eq!(DsrOperationOutcome::Host.raw(), 11);
+        assert_eq!(DsrOperationOutcome::CacheCapacity.raw(), 12);
+        assert_eq!(DsrOperationOutcome::InvalidTarget.raw(), 13);
         assert_unique(&DsrOperationOutcome::ALL.map(DsrOperationOutcome::raw));
     }
 
