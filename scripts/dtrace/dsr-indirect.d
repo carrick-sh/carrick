@@ -6,6 +6,12 @@ BEGIN
     active = 1;
 }
 
+proc:::exit
+/pid == $target/
+{
+    target_exit_reason = arg0;
+}
+
 proc:::create
 /(pid == $target || progenyof($target))/
 {
@@ -60,5 +66,6 @@ END
     printa("DSRPROF1|count|phase=indirect-pair|pid=%d|source_pc=%#x|target_pc=%#x|value=%@d\n", @pair);
     printa("DSRPROF1|count|phase=indirect-total|pid=%d|kind=2|value=%@d\n", @indirect_total);
     printa("DSRPROF1|count|phase=indirect-outcome|pid=%d|kind=%d|value=%@d\n", @outcome);
-    printf("DSRPROF1|complete|profile=dsr-indirect|bounded=%d\n", bounded);
+    printf("DSRPROF1|complete|profile=dsr-indirect|bounded=%d|target_exit_reason=%d\n",
+        bounded, target_exit_reason);
 }

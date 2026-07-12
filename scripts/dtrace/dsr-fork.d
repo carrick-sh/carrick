@@ -10,6 +10,12 @@ BEGIN
     self->exec_first_active = 0;
 }
 
+proc:::exit
+/pid == $target/
+{
+    target_exit_reason = arg0;
+}
+
 proc:::create
 /(pid == $target || progenyof($target))/
 {
@@ -226,5 +232,6 @@ END
     printa("DSRPROF1|incomplete|phase=exec-reset|pid=%d|tid=%d|kind=missing-begin|value=%@d\n", @exec_reset_missing_begin);
     printa("DSRPROF1|incomplete|phase=first-prepare-after-exec|pid=%d|tid=%d|kind=open|value=%@d\n", @exec_first_open);
     printa("DSRPROF1|incomplete|phase=first-prepare-after-exec|pid=%d|tid=%d|kind=overwrite|value=%@d\n", @exec_first_overwrite);
-    printf("DSRPROF1|complete|profile=dsr-fork|bounded=%d\n", bounded);
+    printf("DSRPROF1|complete|profile=dsr-fork|bounded=%d|target_exit_reason=%d\n",
+        bounded, target_exit_reason);
 }
