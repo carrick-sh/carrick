@@ -1127,7 +1127,7 @@ duplicate waits/publications. Emit is selected specifically for code churn.
 Evidence is in
 `docs/perf-results/native-dsr-translation-subphases.jsonl`.
 
-- [ ] **Step 5: Write, commit, and execute the selected focused child plan**
+- [x] **Step 5: Write, commit, and execute the selected focused child plan**
 
 Require at least 10% improvement in the selected subphase and an improved cold
 or code-churn wall-time gate, with duplicate-publication, generation,
@@ -1138,6 +1138,14 @@ invalidation, and fork concurrency remaining green.
 bad64-dependent rewrites, dynasmrt construction/finalization, byte reshaping,
 MAP_JIT publication, and 1/4/16-block write windows. It authorizes only a
 measured Rust/dynasmrt candidate and retains the 10% emit plus churn-wall gate.
+
+**Child plan result:** two 30-process campaigns found no independently
+actionable component above 20% of guarded emission. Dynasm preallocation is the
+largest isolated candidate but projects to only 6.4-6.5% emit improvement;
+direct bytes project below 2%, and a 16-block MAP_JIT window projects to 5.9%
+while requiring speculative translation. The child plan therefore stops
+without a production candidate. Evidence is in
+`docs/perf-results/native-dsr-emission-components-v1.jsonl`.
 
 ---
 
