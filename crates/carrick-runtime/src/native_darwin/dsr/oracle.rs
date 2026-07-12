@@ -827,7 +827,8 @@ fn dsr_indirect_flow_branch_reads_virtual_guest_x18() {
 fn dsr_indirect_flow_cache_hit_stays_in_translated_code() {
     let source_guest = GuestVa(0x18_100);
     let target_guest = GuestVa(0x18_200);
-    let generation = std::sync::atomic::AtomicU64::new(CodeGeneration::INITIAL.get());
+    let target_generation = CodeGeneration::claimed(2);
+    let generation = std::sync::atomic::AtomicU64::new(target_generation.get());
     let mut code = TranslationCache::new(16 * 1024).expect("allocate indirect cache-hit code");
     // Production blocks carry a generation guard.  That guard must observe
     // the original guest x17 after an inline-cache hit, not the x17 scratch
@@ -837,14 +838,14 @@ fn dsr_indirect_flow_cache_hit_stays_in_translated_code() {
         &BlockPlan {
             start: target_guest,
             end: GuestVa(target_guest.raw() + 4),
-            generation: CodeGeneration::INITIAL,
+            generation: target_generation,
             instructions: Vec::new(),
             exit: PlannedExit::Syscall {
                 guest: target_guest,
                 resume: GuestVa(target_guest.raw() + 4),
             },
         },
-        super::emit::GenerationGuard::new(&generation, CodeGeneration::INITIAL),
+        super::emit::GenerationGuard::new(&generation, target_generation),
     )
     .expect("emit indirect cache-hit target");
     let source = emit_block(
@@ -867,7 +868,7 @@ fn dsr_indirect_flow_cache_hit_stays_in_translated_code() {
     )
     .expect("emit indirect cache-hit source");
     let indirect = IndirectTargetCache::new();
-    indirect.publish(target_guest, CodeGeneration::INITIAL, target.entry());
+    indirect.publish(target_guest, target_generation, target.entry());
 
     let mut stack = vec![0_u8; 16 * 1024];
     let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
@@ -895,6 +896,29 @@ fn dsr_indirect_flow_cache_hit_stays_in_translated_code() {
     assert_eq!(snapshot.x[16], expected_x16);
     assert_eq!(snapshot.x[17], expected_x17);
     assert_eq!(snapshot.pstate, expected_pstate);
+
+    generation.store(3, std::sync::atomic::Ordering::Release);
+    let mut stale_snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    stale_snapshot.x[0] = target_guest.raw();
+    let mut stale_exit = NativeDsrExit::ResolveIndirect {
+        source: source_guest,
+        target: target_guest,
+        link: None,
+    };
+    enter_translated_with_cache(
+        source.entry(),
+        &mut stale_snapshot,
+        &mut stale_exit,
+        &indirect,
+    )
+    .expect("execute stale cached indirect target");
+    assert_eq!(
+        stale_exit,
+        NativeDsrExit::ResolveDirect {
+            source: target_guest,
+            target: target_guest,
+        }
+    );
 }
 
 #[test]

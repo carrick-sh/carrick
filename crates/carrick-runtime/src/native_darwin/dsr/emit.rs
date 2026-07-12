@@ -684,26 +684,9 @@ fn emit_indirect_exit(
         ; .arch aarch64
         ; b.ne =>miss
     );
-    map_next(assembler, entries, guest)?;
-    dynasmrt::dynasm!(assembler
-        ; .arch aarch64
-        ; ldr x16, [x15, #8]
-    );
-    map_next(assembler, entries, guest)?;
-    dynasmrt::dynasm!(assembler
-        ; .arch aarch64
-        ; ldr x17, [x28, super::gateway::CTX_GENERATION]
-    );
-    map_next(assembler, entries, guest)?;
-    dynasmrt::dynasm!(assembler
-        ; .arch aarch64
-        ; cmp x16, x17
-    );
-    map_next(assembler, entries, guest)?;
-    dynasmrt::dynasm!(assembler
-        ; .arch aarch64
-        ; b.ne =>miss
-    );
+    // The cache entry's generation belongs to the target page, not the source
+    // block in the current gateway context. The target block's first-instruction
+    // generation guard is the authoritative stale-code check.
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
