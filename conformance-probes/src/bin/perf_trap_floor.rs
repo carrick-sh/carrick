@@ -150,4 +150,13 @@ mod tests {
         assert_eq!(summary.min_us, 1.0);
         assert_eq!(summary.trimmed_mean_us, 5.5);
     }
+
+    #[test]
+    fn batched_summary_reports_per_operation_latency() {
+        let summary = summarize_batched(vec![160_u64; 10], 1_000_000, 16);
+        assert_eq!(summary.p50_us, 10.0);
+        assert_eq!(summary.p95_us, 10.0);
+        assert_eq!(summary.min_us, 10.0);
+        assert_eq!(summary.trimmed_mean_us, 10.0);
+    }
 }
