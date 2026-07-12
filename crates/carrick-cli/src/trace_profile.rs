@@ -280,6 +280,7 @@ pub(crate) struct CompletionState {
     complete: bool,
     bounded: bool,
     high_cardinality_overflow: bool,
+    incomplete_pairs: u64,
     drops: ProfileCaptureStatus,
 }
 
@@ -427,14 +428,19 @@ impl ProfileSummary {
 
         let (profile, bounded) =
             completion.ok_or_else(|| anyhow!("profile stream is missing its completion record"))?;
+        let incomplete_pairs = grouped.values().fold(0_u64, |total, builder| {
+            total.saturating_add(builder.incomplete)
+        });
         let completion = CompletionState {
             complete: !bounded
+                && incomplete_pairs == 0
                 && capture_status.aggregation_drops == 0
                 && capture_status.dynamic_drops == 0
                 && capture_status.other_drops == 0,
             bounded,
             high_cardinality_overflow: capture_status.aggregation_drops != 0
                 || capture_status.dynamic_drops != 0,
+            incomplete_pairs,
             drops: capture_status,
         };
 
@@ -522,11 +528,12 @@ impl ProfileSummary {
 
     pub(crate) fn render_human(&self) -> String {
         format!(
-            "DSR profile {}: {} metric row(s), complete={}, bounded={}, drops={}/{}/{}/{}",
+            "DSR profile {}: {} metric row(s), complete={}, bounded={}, incomplete_pairs={}, drops={}/{}/{}/{}",
             self.profile.as_str(),
             self.metrics.len().saturating_sub(1),
             self.completion.complete,
             self.completion.bounded,
+            self.completion.incomplete_pairs,
             self.completion.drops.principal_drops,
             self.completion.drops.aggregation_drops,
             self.completion.drops.dynamic_drops,
@@ -699,6 +706,8 @@ mod tests {
         )
         .expect("profile summary");
         let rows = summary.json_rows();
+        assert!(!summary.completion.complete);
+        assert_eq!(summary.completion.incomplete_pairs, 1);
         assert_eq!(rows.len(), 5);
         assert!(rows.iter().any(|row| matches!(
             row.metric,

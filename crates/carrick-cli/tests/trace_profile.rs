@@ -76,3 +76,33 @@ fn bundled_profile_scripts_emit_one_versioned_completion() {
         assert!(script.contains("progenyof($target)"));
     }
 }
+
+#[test]
+fn broad_profile_pairs_phases_and_emits_exact_metric_shapes() {
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/dtrace/dsr-profile.d");
+    let script = std::fs::read_to_string(path).unwrap();
+    for probe in [
+        "dsr-prepare-begin",
+        "dsr-run-begin",
+        "dsr-translate-begin",
+        "dsr-resolve-begin",
+        "syscall-entry",
+        "dsr-cache-event",
+        "dsr-cache-capacity",
+        "dsr-cache-lifecycle",
+    ] {
+        assert!(script.contains(probe), "missing {probe}");
+    }
+    for record in [
+        "DSRPROF1|count|phase=run",
+        "DSRPROF1|total|phase=run",
+        "DSRPROF1|minimum|phase=run",
+        "DSRPROF1|maximum|phase=run",
+        "DSRPROF1|sample|phase=run",
+        "DSRPROF1|incomplete|phase=run",
+        "DSRPROF1|high-water|metric=cache-bytes",
+    ] {
+        assert!(script.contains(record), "missing {record}");
+    }
+}
