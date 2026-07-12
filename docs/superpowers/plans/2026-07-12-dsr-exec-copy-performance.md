@@ -135,6 +135,14 @@ seeded bootstrap resamples. The end-to-end p50 estimate must improve at least
 10% with upper ratio below 0.95. Promote only a full pass; otherwise restore
 the full stack copy and publish the rejection.
 
+The first combined gate passed fork-exec (ratio 0.8229, interval
+0.8119–0.8354) and V8 (ratio 1.0023, interval 0.9951–1.0065), but the
+single-syscall floor reported ratio 1.0246. Its 1% limit is only about 6.5 ns
+at the measured 0.65 us, below the host counter's approximately 41.7 ns tick.
+Before deciding, add a 16-syscall batched per-operation metric and rerun the
+unchanged 1% limit against the same frozen binaries. Do not waive the limit or
+interpret sub-tick differences as evidence.
+
 ---
 
 ### Task 3: Remove stack construction materialization, then reassess backing
