@@ -172,8 +172,60 @@ unsafe fn run_jit_rewrite() {
     libc::munmap(page.cast(), len);
 }
 
+unsafe fn run_jit_concurrent_first_publication() {
+    let len = 16 * 1024;
+    let page = libc::mmap(
+        core::ptr::null_mut(),
+        len,
+        libc::PROT_READ | libc::PROT_WRITE,
+        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+        -1,
+        0,
+    ) as *mut u8;
+    if page.cast::<libc::c_void>() == libc::MAP_FAILED {
+        report!(jit_concurrent_setup_ok = false);
+        return;
+    }
+
+    write_return_value(page, 41);
+    sync_generated_code(page);
+    let executable = libc::mprotect(page.cast(), len, libc::PROT_READ | libc::PROT_EXEC) == 0;
+    if !executable {
+        report!(jit_concurrent_setup_ok = false);
+        libc::munmap(page.cast(), len);
+        return;
+    }
+
+    let start = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let address = page as usize;
+    let first_start = std::sync::Arc::clone(&start);
+    let first = std::thread::spawn(move || {
+        first_start.wait();
+        call_return_value(address as *mut u8)
+    });
+    let address = page as usize;
+    let second_start = std::sync::Arc::clone(&start);
+    let second = std::thread::spawn(move || {
+        second_start.wait();
+        call_return_value(address as *mut u8)
+    });
+    start.wait();
+    let first_value = first.join().unwrap_or(0);
+    let second_value = second.join().unwrap_or(0);
+
+    report!(
+        jit_concurrent_setup_ok = true,
+        jit_concurrent_values_match = first_value == 41 && second_value == 41,
+    );
+    libc::munmap(page.cast(), len);
+}
+
 fn main() {
     unsafe {
+        if std::env::args().any(|arg| arg == "jit-concurrent") {
+            run_jit_concurrent_first_publication();
+            return;
+        }
         if std::env::args().any(|arg| arg == "jit") {
             run_jit_rewrite();
             return;
