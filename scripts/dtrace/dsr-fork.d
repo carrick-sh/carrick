@@ -206,6 +206,62 @@ carrick*:::dsr-prepare-begin
     self->exec_first_active = 0;
 }
 
+/* Low-perturbation exec-map totals: one probe per component and exec. */
+carrick*:::dsr-exec-map-detail
+/(pid == $target || progenyof($target)) && arg1 == 1/
+{
+    printf("DSRPROF1|sample|phase=exec-map-mmap|pid=%d|tid=%d|duration_ns=%d\n",
+        pid, arg0, arg2);
+    printf("DSRPROF1|count|phase=exec-map-mmap-bytes|pid=%d|tid=%d|value=%d\n",
+        pid, arg0, arg3);
+    printf("DSRPROF1|count|phase=exec-map-mmap-operations|pid=%d|tid=%d|value=%d\n",
+        pid, arg0, arg4);
+}
+
+carrick*:::dsr-exec-map-detail
+/(pid == $target || progenyof($target)) && arg1 == 2/
+{
+    printf("DSRPROF1|sample|phase=exec-map-copy|pid=%d|tid=%d|duration_ns=%d\n",
+        pid, arg0, arg2);
+    printf("DSRPROF1|count|phase=exec-map-copy-bytes|pid=%d|tid=%d|value=%d\n",
+        pid, arg0, arg3);
+    printf("DSRPROF1|count|phase=exec-map-copy-operations|pid=%d|tid=%d|value=%d\n",
+        pid, arg0, arg4);
+}
+
+carrick*:::dsr-exec-map-detail
+/(pid == $target || progenyof($target)) && arg1 == 3/
+{
+    printf("DSRPROF1|sample|phase=exec-map-icache|pid=%d|tid=%d|duration_ns=%d\n",
+        pid, arg0, arg2);
+    printf("DSRPROF1|count|phase=exec-map-icache-bytes|pid=%d|tid=%d|value=%d\n",
+        pid, arg0, arg3);
+    printf("DSRPROF1|count|phase=exec-map-icache-operations|pid=%d|tid=%d|value=%d\n",
+        pid, arg0, arg4);
+}
+
+carrick*:::dsr-exec-map-detail
+/(pid == $target || progenyof($target)) && arg1 == 4/
+{
+    printf("DSRPROF1|sample|phase=exec-map-protect|pid=%d|tid=%d|duration_ns=%d\n",
+        pid, arg0, arg2);
+    printf("DSRPROF1|count|phase=exec-map-protect-bytes|pid=%d|tid=%d|value=%d\n",
+        pid, arg0, arg3);
+    printf("DSRPROF1|count|phase=exec-map-protect-operations|pid=%d|tid=%d|value=%d\n",
+        pid, arg0, arg4);
+}
+
+carrick*:::dsr-exec-map-detail
+/(pid == $target || progenyof($target)) && arg1 == 5/
+{
+    printf("DSRPROF1|sample|phase=exec-map-vvar|pid=%d|tid=%d|duration_ns=%d\n",
+        pid, arg0, arg2);
+    printf("DSRPROF1|count|phase=exec-map-vvar-bytes|pid=%d|tid=%d|value=%d\n",
+        pid, arg0, arg3);
+    printf("DSRPROF1|count|phase=exec-map-vvar-operations|pid=%d|tid=%d|value=%d\n",
+        pid, arg0, arg4);
+}
+
 /* Phases 15..24: repeated details nested inside exec image mapping. */
 carrick*:::dsr-cache-lifecycle
 /(pid == $target || progenyof($target)) && arg1 == 7/
