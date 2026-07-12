@@ -1723,6 +1723,31 @@ fn run_native_thread_loop(
     }
 }
 
+#[inline(never)]
+fn prepare_and_enter_dsr<const PROFILE: bool>(
+    translator: &mut dsr::ThreadTranslator,
+    memory: &SharedNativeMemory,
+    snapshot: &mut NativeUcontextSnapshot,
+) -> Result<(dsr::PreparedEntry, dsr::PreparedExit), RuntimeError> {
+    let prepared = {
+        let mut memory = memory.lock();
+        memory
+            .prepare_dsr_execution(snapshot.pc)
+            .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+        translator
+            .prepare_entry::<PROFILE>(&memory, snapshot)
+            .map_err(|error| RuntimeError::Unsupported(error.to_string()))?
+    };
+    // Translation and executable-page preparation require the shared memory
+    // lock; running guest instructions must not hold it. A guest can spin
+    // indefinitely between syscalls while a sibling needs this lock to publish
+    // the value that ends the spin (altstacktid/mmapfileshare_mt/telemetrymap).
+    let raw_exit = translator
+        .enter_prepared::<PROFILE>(prepared, snapshot)
+        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+    Ok((prepared, raw_exit))
+}
+
 fn run_native_dsr_thread_loop(
     dispatcher: Arc<SyscallDispatcher>,
     memory: SharedNativeMemory,
@@ -1749,6 +1774,17 @@ fn run_native_dsr_thread_loop(
     let process_translator = memory.lock().dsr_process_translator()?;
     let mut translator =
         dsr::ThreadTranslator::for_process(process_translator, thread_runtime.tid().raw());
+    let prepare_and_enter: fn(
+        &mut dsr::ThreadTranslator,
+        &SharedNativeMemory,
+        &mut NativeUcontextSnapshot,
+    )
+        -> Result<(dsr::PreparedEntry, dsr::PreparedExit), RuntimeError> =
+        if translator.profiling_enabled() {
+            prepare_and_enter_dsr::<true>
+        } else {
+            prepare_and_enter_dsr::<false>
+        };
     let trace_syscalls = std::env::var_os("CARRICK_NATIVE_TRACE_SYSCALLS").is_some();
     let mut vfork_completion: Option<NativeVforkCompletion> = None;
     let mut traps = 0_usize;
@@ -1769,23 +1805,7 @@ fn run_native_dsr_thread_loop(
             return Ok(NativeThreadLoopOutcome::ExecReplacedThread);
         }
         thread_runtime.park_for_fork_quiesce();
-        let prepared = {
-            let mut memory = memory.lock();
-            memory
-                .prepare_dsr_execution(snapshot.pc)
-                .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
-            translator
-                .prepare_entry(&memory, &snapshot)
-                .map_err(|error| RuntimeError::Unsupported(error.to_string()))?
-        };
-        // Translation and executable-page preparation require the shared
-        // memory lock; running guest instructions must not hold it. A guest
-        // can spin indefinitely between syscalls while a sibling needs this
-        // lock to complete its own syscall and publish the value that ends the
-        // spin (altstacktid/mmapfileshare_mt/telemetrymap).
-        let raw_exit = translator
-            .enter_prepared(prepared, &mut snapshot)
-            .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+        let (prepared, raw_exit) = prepare_and_enter(&mut translator, &memory, &mut snapshot)?;
         let exit = translator
             .finish_exit(&memory.lock(), &mut snapshot, prepared, raw_exit)
             .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;

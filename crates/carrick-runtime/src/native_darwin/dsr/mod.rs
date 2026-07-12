@@ -609,13 +609,19 @@ impl ThreadTranslator {
         }
     }
 
-    pub(super) fn prepare_entry(
+    pub(super) fn profiling_enabled(&self) -> bool {
+        self.profiling
+    }
+
+    pub(super) fn prepare_entry<const PROFILE: bool>(
         &mut self,
         memory: &super::NativeMappedMemory,
         snapshot: &super::NativeUcontextSnapshot,
     ) -> Result<PreparedEntry, types::DsrError> {
         let guest = carrick_guest_mem::GuestVa(snapshot.pc);
-        probes::dsr_prepare_begin(self.tid, guest.raw());
+        if PROFILE {
+            probes::dsr_prepare_begin(self.tid, guest.raw());
+        }
         let selection = (|| -> Result<_, types::DsrError> {
             match self.resume_entry.take() {
                 Some((cached_guest, generation, entry))
@@ -640,13 +646,15 @@ impl ThreadTranslator {
         let (entry, generation, outcome) = match selection {
             Ok(selection) => selection,
             Err(error) => {
-                probes::dsr_prepare_end(
-                    self.tid,
-                    guest.raw(),
-                    0,
-                    0,
-                    probes::DsrPrepareOutcome::Failed,
-                );
+                if PROFILE {
+                    probes::dsr_prepare_end(
+                        self.tid,
+                        guest.raw(),
+                        0,
+                        0,
+                        probes::DsrPrepareOutcome::Failed,
+                    );
+                }
                 return Err(error);
             }
         };
@@ -657,17 +665,19 @@ impl ThreadTranslator {
             cache_start: cache_range.start,
             cache_end: cache_range.end,
         };
-        probes::dsr_prepare_end(
-            self.tid,
-            guest.raw(),
-            entry.host().raw() as u64,
-            generation.get(),
-            outcome,
-        );
+        if PROFILE {
+            probes::dsr_prepare_end(
+                self.tid,
+                guest.raw(),
+                entry.host().raw() as u64,
+                generation.get(),
+                outcome,
+            );
+        }
         Ok(prepared)
     }
 
-    pub(super) fn enter_prepared(
+    pub(super) fn enter_prepared<const PROFILE: bool>(
         &mut self,
         prepared: PreparedEntry,
         snapshot: &mut super::NativeUcontextSnapshot,
@@ -679,12 +689,14 @@ impl ThreadTranslator {
         if self.profiling {
             self.stats.gateway_entries = self.stats.gateway_entries.saturating_add(1);
         }
-        probes::dsr_run_begin(
-            self.tid,
-            guest_pc,
-            prepared.entry.host().raw() as u64,
-            prepared.generation.get(),
-        );
+        if PROFILE {
+            probes::dsr_run_begin(
+                self.tid,
+                guest_pc,
+                prepared.entry.host().raw() as u64,
+                prepared.generation.get(),
+            );
+        }
         let gateway_result = gateway::enter_translated_with_cache_range(
             prepared.entry,
             snapshot,
@@ -694,17 +706,21 @@ impl ThreadTranslator {
             prepared.cache_end,
         );
         if let Err(error) = gateway_result {
-            probes::dsr_run_end(
-                self.tid,
-                probes::DsrExitKind::Unsupported,
-                guest_pc,
-                0,
-                i32::try_from(error.probe_outcome().raw()).unwrap_or(i32::MAX),
-            );
+            if PROFILE {
+                probes::dsr_run_end(
+                    self.tid,
+                    probes::DsrExitKind::Unsupported,
+                    guest_pc,
+                    0,
+                    i32::try_from(error.probe_outcome().raw()).unwrap_or(i32::MAX),
+                );
+            }
             return Err(error);
         }
-        let (kind, exit_guest_pc, target_pc, status) = exit.probe_fields();
-        probes::dsr_run_end(self.tid, kind, exit_guest_pc, target_pc, status);
+        if PROFILE {
+            let (kind, exit_guest_pc, target_pc, status) = exit.probe_fields();
+            probes::dsr_run_end(self.tid, kind, exit_guest_pc, target_pc, status);
+        }
         Ok(PreparedExit { exit })
     }
 
