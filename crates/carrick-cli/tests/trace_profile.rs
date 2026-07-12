@@ -106,3 +106,27 @@ fn broad_profile_pairs_phases_and_emits_exact_metric_shapes() {
         assert!(script.contains(record), "missing {record}");
     }
 }
+
+#[test]
+fn indirect_profile_aggregates_sources_pairs_and_exact_total_once() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../scripts/dtrace/dsr-indirect.d");
+    let script = std::fs::read_to_string(path).unwrap();
+    assert!(script.contains("dsr-resolve-begin"));
+    assert!(script.contains("dsr-resolve-end"));
+    assert!(script.contains("arg1 == 2"));
+    assert!(script.contains("@source[pid, arg2]"));
+    assert!(script.contains("@pair[pid, arg2, arg3]"));
+    assert_eq!(
+        script
+            .matches("DSRPROF1|count|phase=indirect-total")
+            .count(),
+        1
+    );
+    assert_eq!(
+        script
+            .matches("DSRPROF1|count|phase=indirect-outcome")
+            .count(),
+        1
+    );
+}
