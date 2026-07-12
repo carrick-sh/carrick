@@ -49,6 +49,7 @@ impl BinaryRole {
 #[derive(Clone, Copy, Debug)]
 enum Workload {
     SyscallFloor,
+    MonomorphicIndirect,
     DirectV8,
     ForkExec,
 }
@@ -105,6 +106,7 @@ impl Workload {
     const fn label(self) -> &'static str {
         match self {
             Self::SyscallFloor => "syscall-floor",
+            Self::MonomorphicIndirect => "monomorphic-indirect",
             Self::DirectV8 => "direct-v8",
             Self::ForkExec => "fork-exec",
         }
@@ -113,6 +115,7 @@ impl Workload {
     const fn unit(self) -> &'static str {
         match self {
             Self::SyscallFloor => "us",
+            Self::MonomorphicIndirect => "ns-per-call",
             Self::DirectV8 | Self::ForkExec => "ms-wall",
         }
     }
@@ -120,6 +123,7 @@ impl Workload {
     const fn profile(self) -> &'static str {
         match self {
             Self::SyscallFloor => "dsr",
+            Self::MonomorphicIndirect => "dsr-indirect",
             Self::DirectV8 => "dsr-indirect",
             Self::ForkExec => "dsr-fork",
         }
@@ -128,6 +132,7 @@ impl Workload {
     const fn timeout_secs(self) -> u64 {
         match self {
             Self::SyscallFloor => 30,
+            Self::MonomorphicIndirect => 30,
             Self::DirectV8 => 90,
             Self::ForkExec => 60,
         }
@@ -259,6 +264,23 @@ fn relative_gate_paths_are_workspace_relative() {
 }
 
 #[test]
+fn monomorphic_indirect_gate_uses_the_static_pie_probe() {
+    let root = Path::new("/workspace/carrick");
+    let args = workload_args(Workload::MonomorphicIndirect, root, "mono");
+    assert_eq!(
+        Workload::MonomorphicIndirect.label(),
+        "monomorphic-indirect"
+    );
+    assert_eq!(Workload::MonomorphicIndirect.unit(), "ns-per-call");
+    assert_eq!(
+        args.last().map(String::as_str),
+        Some(
+            "/workspace/carrick/conformance-probes/target/native-pie/aarch64-unknown-linux-musl/release/perf_dsr_indirect"
+        ),
+    );
+}
+
+#[test]
 #[ignore = "explicit 30+10 ABBA signed-binary performance gate"]
 fn disabled_probe_overhead() {
     run_binary_gate(
@@ -293,6 +315,20 @@ fn indirect_cache_improvement() {
             }),
         }],
         "CARRICK_DSR_OPTIMIZATION_OUT",
+    );
+}
+
+#[test]
+#[ignore = "explicit opt-in indirect-cache hit-path non-inferiority gate"]
+fn indirect_cache_hit_noninferiority() {
+    run_binary_gate(
+        "indirect-cache-hit-noninferiority",
+        &[BinaryGate {
+            workload: Workload::MonomorphicIndirect,
+            cycles: 15,
+            policy: BinaryGatePolicy::NonInferiority { upper_bound: 1.02 },
+        }],
+        "CARRICK_DSR_HIT_OUT",
     );
 }
 
@@ -581,6 +617,9 @@ fn run_workload(
             parse_metric(&text, "trap_trimmed_mean_us").expect("trap_trimmed_mean_us")
         }
         Workload::SyscallFloor => elapsed_ms,
+        Workload::MonomorphicIndirect => {
+            parse_metric(&text, "indirect_p50_ns").expect("indirect_p50_ns")
+        }
         Workload::DirectV8 => {
             assert!(
                 text.contains("v8-smoke ok"),
@@ -610,6 +649,19 @@ fn workload_args(workload: Workload, root: &Path, run_id: &str) -> Vec<String> {
             "--native-code-mode".to_owned(),
             "dsr".to_owned(),
             root.join("conformance-probes/target/native-pie/aarch64-unknown-linux-musl/release/perf_trap_floor")
+                .to_string_lossy()
+                .into_owned(),
+        ],
+        Workload::MonomorphicIndirect => vec![
+            "run-elf".to_owned(),
+            "--raw".to_owned(),
+            "--exec-backend".to_owned(),
+            "native".to_owned(),
+            "--native-page-profile".to_owned(),
+            "native16k".to_owned(),
+            "--native-code-mode".to_owned(),
+            "dsr".to_owned(),
+            root.join("conformance-probes/target/native-pie/aarch64-unknown-linux-musl/release/perf_dsr_indirect")
                 .to_string_lossy()
                 .into_owned(),
         ],
@@ -718,6 +770,7 @@ fn workload_seed(workload: Workload) -> u64 {
         Workload::SyscallFloor => 1,
         Workload::DirectV8 => 2,
         Workload::ForkExec => 3,
+        Workload::MonomorphicIndirect => 4,
     }
 }
 

@@ -507,6 +507,9 @@ git commit -m "perf(native): mix and expand the DSR indirect cache" \
 
 **Files:**
 - Create: `docs/perf-results/native-dsr-indirect-cache-v1.jsonl`
+- Create: `docs/perf-results/native-dsr-indirect-cache-hit-v1.jsonl`
+- Create: `conformance-probes/src/bin/perf_dsr_indirect.rs`
+- Modify: `crates/carrick-cli/tests/dsr_trace_overhead.rs`
 - Modify: `docs/native-dsr-dtrace-profile.md`
 - Modify: `docs/superpowers/plans/2026-07-12-dsr-profile-driven-performance.md`
 
@@ -547,7 +550,28 @@ scripts/sudo/kill.sh dsr-cache-v1
 
 Expected: `v8-smoke ok` and no leftover stamped processes.
 
-- [ ] **Step 3: Run the improvement ABBA gate**
+- [ ] **Step 3: Bound the monomorphic hit-path cost**
+
+Build `perf_dsr_indirect` as an AArch64 static PIE. Its single inline `blr`
+site calls one fixed target and returns to one fixed resume PC in 20,000-call
+batches, so both directions exercise stable emitted-cache hits after warmup.
+Run it under Carrick and native Linux for mechanism validation, then collect 30
+ABBA samples per binary:
+
+```bash
+CARRICK_DSR_BASELINE_BIN=target/perf/dsr-indirect-cache/baseline-carrick \
+CARRICK_DSR_CANDIDATE_BIN=target/perf/dsr-indirect-cache/candidate-carrick \
+CARRICK_DSR_BASELINE_COMMIT="$baseline_commit" \
+CARRICK_DSR_CANDIDATE_COMMIT="$candidate_commit" \
+CARRICK_DSR_HIT_OUT=docs/perf-results/native-dsr-indirect-cache-hit-v1.jsonl \
+  cargo test -p carrick-cli --test dsr_trace_overhead \
+  indirect_cache_hit_noninferiority -- --ignored --nocapture --test-threads=1
+```
+
+Expected: the candidate/base p50 ratio interval includes or lies below 1.0 and
+its upper bound is at most 1.02.
+
+- [ ] **Step 4: Run the improvement ABBA gate**
 
 ```bash
 CARRICK_DSR_BASELINE_BIN=target/perf/dsr-indirect-cache/baseline-carrick \
@@ -562,7 +586,7 @@ CARRICK_DSR_OPTIMIZATION_OUT=docs/perf-results/native-dsr-indirect-cache-v1.json
 Expected for promotion: candidate V8 median is at least 1% faster and the
 bootstrap ratio upper bound is below 1.0.
 
-- [ ] **Step 4: Re-run the exact indirect profile**
+- [ ] **Step 5: Re-run the exact indirect profile**
 
 ```bash
 CARRICK_RUN_ID=dsr-cache-v1-profile target/release/carrick trace \
@@ -579,10 +603,10 @@ CARRICK_RUN_ID=dsr-cache-v1-profile target/release/carrick trace \
 Expected: complete, zero drops/incomplete pairs, exact total equals source and
 pair sums, and resolver exits fall materially from 416,997.
 
-- [ ] **Step 5: Apply the decision table**
+- [ ] **Step 6: Apply the decision table**
 
-- Promote v1 only if correctness is green, the improvement gate passes, and
-  resolver exits fall.
+- Promote v1 only if correctness is green, the monomorphic hit-path bound and
+  V8 improvement gate pass, and resolver exits fall.
 - If resolver exits fall but wall time is inconclusive, record v1 as rejected
   and execute a two-way 4,096-set cache experiment using the same 256 KiB.
 - If two-way remains inconclusive, execute a four-way 2,048-set experiment.
@@ -593,7 +617,7 @@ Each associative experiment receives its own red alias/eviction oracle,
 separate commit, signed binary, JSONL, and the same V8 gate. Never stack an
 untested variant on an unaccepted one.
 
-- [ ] **Step 6: Commit the accepted evidence or rejection record**
+- [ ] **Step 7: Commit the accepted evidence or rejection record**
 
 Use subject `perf(native): promote the DSR indirect cache` for an accepted
 variant or `docs(native): record indirect-cache experiment` when all bounded
