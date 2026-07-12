@@ -197,12 +197,6 @@ pub(in crate::native_darwin) enum DsrError {
     Malformed { pc: u64, word: u32, op: bad64::Op },
     #[error("DSR block policy error: {0}")]
     BlockPolicy(String),
-    #[error("DSR invalid indirect target 0x{target:x} from 0x{source_pc:x}: {reason}")]
-    InvalidIndirectTarget {
-        source_pc: u64,
-        target: u64,
-        reason: &'static str,
-    },
     #[error("DSR could not read guest instruction at 0x{pc:x}: {detail}")]
     MemoryRead { pc: u64, detail: String },
     #[error(
