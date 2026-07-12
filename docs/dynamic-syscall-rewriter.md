@@ -1279,3 +1279,12 @@ untraced workload or leave an evidence-backed stop record. See the
 [approved design](superpowers/specs/2026-07-12-dsr-profile-driven-performance-design.md),
 and the
 [execution plan](superpowers/plans/2026-07-12-dsr-profile-driven-performance.md).
+
+First accepted optimization (2026-07-12): the 8,192-entry mixed indirect cache
+reduced the direct V8 p50 from 7982.07 ms to 7883.38 ms (ratio estimate 0.9869,
+95% interval 0.9674–0.9993) and successful resolver exits from 416,997 to
+132,213. A separate monomorphic call/return gate bounded the hit path at ratio
+0.9804 with an upper interval of 1.0031 against the 1.02 limit. The candidate
+is promoted; the next target is repeated prepare lookup. Full provenance and
+samples are in `docs/perf-results/native-dsr-indirect-cache-v1.jsonl` and
+`docs/perf-results/native-dsr-indirect-cache-hit-v1.jsonl`.
