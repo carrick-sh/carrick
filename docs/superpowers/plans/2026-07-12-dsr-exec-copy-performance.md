@@ -156,12 +156,20 @@ markers are green. Evidence is checked in at
 
 **Files:** determined by a fresh post-Task-2 profile and a focused child plan.
 
-- [ ] **Step 1: Reprofile outside image mapping**
+- [x] **Step 1: Reprofile outside image mapping**
 
 Task 2 eliminates the second 8 MiB copy but `build_linux_initial_stack` still
 allocates/zeroes that vector before mapping. Add attribution around exec image
 construction only if end-to-end improvement is materially smaller than the
 image-map gain.
+
+**Decision:** defer the sparse-stack rewrite. The signed end-to-end gain is
+about 246 ms across the 200-iteration fork-exec workload, while the measured
+outer exec-reset saving projects to about 185 ms. The end-to-end result is not
+materially smaller than the image-map gain, so the condition for adding image
+construction attribution is false. Continue to the gateway benchmark; revisit
+this task only if a later post-promotion profile ranks stack construction as a
+stable long pole.
 
 - [ ] **Step 2: Specify a sparse initialized stack window**
 
