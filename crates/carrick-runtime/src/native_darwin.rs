@@ -9856,7 +9856,7 @@ mod tests {
     }
 
     #[test]
-    fn dsr_gateway_unblocks_kicks_only_while_guest_runs() {
+    fn dsr_gateway_keeps_kicks_deliverable_across_host_and_guest_windows() {
         std::thread::spawn(|| {
             let mut kick: libc::sigset_t = unsafe { std::mem::zeroed() };
             let mut original: libc::sigset_t = unsafe { std::mem::zeroed() };
@@ -9885,7 +9885,7 @@ mod tests {
                 unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut current) },
                 0
             );
-            assert_eq!(unsafe { libc::sigismember(&current, libc::SIGPIPE) }, 1);
+            assert_eq!(unsafe { libc::sigismember(&current, libc::SIGPIPE) }, 0);
 
             assert_eq!(
                 unsafe {

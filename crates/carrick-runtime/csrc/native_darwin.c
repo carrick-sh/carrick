@@ -202,6 +202,8 @@ static _Thread_local uint64_t carrick_native_last_fault_address;
 static _Thread_local struct carrick_native_dsr_signal_context
     *carrick_native_active_dsr_context;
 static _Thread_local bool carrick_native_dsr_test_phase_zero_host_kick;
+static _Thread_local volatile sig_atomic_t carrick_native_dsr_deferred_kick;
+static _Thread_local bool carrick_native_dsr_kick_unblocked;
 
 extern void carrick_dsr_exit_signal(void);
 extern unsigned char carrick_dsr_exit_common_start[];
@@ -311,6 +313,15 @@ static int carrick_native_enter_guest_x18_abi(void) {
 
 int carrick_native_dsr_enter_guest_abi(void *context) {
     carrick_native_active_dsr_context = context;
+    if (carrick_native_dsr_deferred_kick) {
+        struct carrick_native_dsr_signal_context *deferred = context;
+        carrick_native_dsr_deferred_kick = 0;
+        deferred->exit_target = deferred->snapshot.pc;
+        deferred->exit_source = 0;
+        deferred->exit_status = 8;
+        carrick_native_active_dsr_context = 0;
+        return 1;
+    }
     if (carrick_native_enter_guest_x18_abi() != 0) {
         carrick_native_active_dsr_context = 0;
         return -1;
@@ -322,11 +333,13 @@ int carrick_native_dsr_enter_guest_abi(void *context) {
             return -1;
         }
     }
-    if (carrick_native_unblock_kick_signal() != 0) {
+    if (!carrick_native_dsr_kick_unblocked &&
+        carrick_native_unblock_kick_signal() != 0) {
         carrick_native_active_dsr_context = 0;
         carrick_native_enter_host_x18_abi();
         return -1;
     }
+    carrick_native_dsr_kick_unblocked = true;
     return 0;
 }
 
@@ -335,15 +348,12 @@ void carrick_native_dsr_test_phase_zero_host_kick_once(void) {
 }
 
 void carrick_native_dsr_enter_host_abi(void) {
-    // Close the guest signal window before touching TLS.  The TLS assignment
-    // itself calls `_tlv_get_addr`; if a kick interrupted that call while the
-    // previous context pointer was still visible, the handler mistook the
-    // dyld PC for translated code and reported an unmappable cache fault.
-    if (carrick_native_block_kick_signal() != 0) {
-        _exit(127);
-    }
-    carrick_native_active_dsr_context = 0;
+    // Keep the kick transport deliverable in host code. Host-window kicks are
+    // deferred by the signal handler and consumed at the next gateway entry;
+    // blocking here made two pthread_sigmask transitions the dominant gateway
+    // cost.
     carrick_native_enter_host_x18_abi();
+    carrick_native_active_dsr_context = 0;
 }
 
 // Test-only measurement entrypoints. They are not called by the production
@@ -498,6 +508,13 @@ static void carrick_native_trap_handler(int sig, siginfo_t *info, void *uap) {
     if (sig == SIGPIPE) {
         bool requested = carrick_native_kick_state_take(
             carrick_native_bound_kick_state);
+        if (carrick_native_active_dsr_context == 0 &&
+            !carrick_native_env_ready) {
+            if (requested) {
+                carrick_native_dsr_deferred_kick = 1;
+            }
+            return;
+        }
         // A coalesced or stale SIGPIPE can arrive after another path consumed
         // the pending bit. Returning directly to DSR code is unsafe because
         // Darwin's signal return does not reliably preserve custom x18. Route
@@ -693,6 +710,8 @@ int carrick_native_install_trap_handler(void) {
     if (carrick_native_block_kick_signal() != 0) {
         return -1;
     }
+    carrick_native_dsr_deferred_kick = 0;
+    carrick_native_dsr_kick_unblocked = false;
     carrick_native_host_tpidr_el0 = carrick_native_read_tpidr_el0();
     stack_t current_stack;
     memset(&current_stack, 0, sizeof(current_stack));
