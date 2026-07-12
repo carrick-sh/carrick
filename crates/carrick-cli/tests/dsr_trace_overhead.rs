@@ -49,6 +49,8 @@ impl BinaryRole {
 #[derive(Clone, Copy, Debug)]
 enum Workload {
     SyscallFloor,
+    GatewayScalar,
+    GatewaySimd,
     MonomorphicIndirect,
     DirectV8,
     ForkExec,
@@ -106,6 +108,8 @@ impl Workload {
     const fn label(self) -> &'static str {
         match self {
             Self::SyscallFloor => "syscall-floor",
+            Self::GatewayScalar => "gateway-scalar",
+            Self::GatewaySimd => "gateway-simd",
             Self::MonomorphicIndirect => "monomorphic-indirect",
             Self::DirectV8 => "direct-v8",
             Self::ForkExec => "fork-exec",
@@ -114,7 +118,7 @@ impl Workload {
 
     const fn unit(self) -> &'static str {
         match self {
-            Self::SyscallFloor => "us",
+            Self::SyscallFloor | Self::GatewayScalar | Self::GatewaySimd => "us",
             Self::MonomorphicIndirect => "ns-per-call",
             Self::DirectV8 | Self::ForkExec => "ms-wall",
         }
@@ -123,6 +127,7 @@ impl Workload {
     const fn profile(self) -> &'static str {
         match self {
             Self::SyscallFloor => "dsr",
+            Self::GatewayScalar | Self::GatewaySimd => "dsr",
             Self::MonomorphicIndirect => "dsr-indirect",
             Self::DirectV8 => "dsr-indirect",
             Self::ForkExec => "dsr-fork",
@@ -131,7 +136,7 @@ impl Workload {
 
     const fn timeout_secs(self) -> u64 {
         match self {
-            Self::SyscallFloor => 30,
+            Self::SyscallFloor | Self::GatewayScalar | Self::GatewaySimd => 30,
             Self::MonomorphicIndirect => 30,
             Self::DirectV8 => 90,
             Self::ForkExec => 60,
@@ -281,6 +286,25 @@ fn monomorphic_indirect_gate_uses_the_static_pie_probe() {
 }
 
 #[test]
+fn gateway_gate_uses_scalar_and_simd_metrics_from_static_pie() {
+    let root = Path::new("/workspace/carrick");
+    for (workload, label, unit) in [
+        (Workload::GatewayScalar, "gateway-scalar", "us"),
+        (Workload::GatewaySimd, "gateway-simd", "us"),
+    ] {
+        let args = workload_args(workload, root, "gateway");
+        assert_eq!(workload.label(), label);
+        assert_eq!(workload.unit(), unit);
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some(
+                "/workspace/carrick/conformance-probes/target/native-pie/aarch64-unknown-linux-musl/release/perf_dsr_gateway"
+            ),
+        );
+    }
+}
+
+#[test]
 #[ignore = "explicit 30+10 ABBA signed-binary performance gate"]
 fn disabled_probe_overhead() {
     run_binary_gate(
@@ -399,6 +423,40 @@ fn stack_window_batched_syscall_floor() {
             policy: BinaryGatePolicy::NonInferiority { upper_bound: 1.01 },
         }],
         "CARRICK_DSR_OPTIMIZATION_OUT",
+    );
+}
+
+#[test]
+#[ignore = "explicit opt-in DSR gateway closure performance gate"]
+fn gateway_closure_improvement() {
+    run_binary_gate(
+        "gateway-closure-improvement",
+        &[
+            BinaryGate {
+                workload: Workload::GatewayScalar,
+                cycles: 15,
+                policy: BinaryGatePolicy::Improvement(ImprovementPolicy {
+                    upper_bound: 1.0,
+                    minimum_estimate_gain: 0.05,
+                }),
+            },
+            BinaryGate {
+                workload: Workload::GatewaySimd,
+                cycles: 15,
+                policy: BinaryGatePolicy::NonInferiority { upper_bound: 1.01 },
+            },
+            BinaryGate {
+                workload: Workload::SyscallFloor,
+                cycles: 15,
+                policy: BinaryGatePolicy::NonInferiority { upper_bound: 1.01 },
+            },
+            BinaryGate {
+                workload: Workload::DirectV8,
+                cycles: 5,
+                policy: BinaryGatePolicy::NonInferiority { upper_bound: 1.01 },
+            },
+        ],
+        "CARRICK_DSR_GATEWAY_OUT",
     );
 }
 
@@ -660,6 +718,12 @@ fn run_workload(
             parse_metric(&text, "trap_batch_trimmed_mean_us").expect("trap_batch_trimmed_mean_us")
         }
         Workload::SyscallFloor => elapsed_ms,
+        Workload::GatewayScalar => {
+            parse_metric(&text, "gateway_scalar_p50_us").expect("gateway_scalar_p50_us")
+        }
+        Workload::GatewaySimd => {
+            parse_metric(&text, "gateway_simd_p50_us").expect("gateway_simd_p50_us")
+        }
         Workload::MonomorphicIndirect => {
             parse_metric(&text, "indirect_p50_ns").expect("indirect_p50_ns")
         }
@@ -692,6 +756,19 @@ fn workload_args(workload: Workload, root: &Path, run_id: &str) -> Vec<String> {
             "--native-code-mode".to_owned(),
             "dsr".to_owned(),
             root.join("conformance-probes/target/native-pie/aarch64-unknown-linux-musl/release/perf_trap_floor")
+                .to_string_lossy()
+                .into_owned(),
+        ],
+        Workload::GatewayScalar | Workload::GatewaySimd => vec![
+            "run-elf".to_owned(),
+            "--raw".to_owned(),
+            "--exec-backend".to_owned(),
+            "native".to_owned(),
+            "--native-page-profile".to_owned(),
+            "native16k".to_owned(),
+            "--native-code-mode".to_owned(),
+            "dsr".to_owned(),
+            root.join("conformance-probes/target/native-pie/aarch64-unknown-linux-musl/release/perf_dsr_gateway")
                 .to_string_lossy()
                 .into_owned(),
         ],
@@ -814,6 +891,8 @@ fn workload_seed(workload: Workload) -> u64 {
         Workload::DirectV8 => 2,
         Workload::ForkExec => 3,
         Workload::MonomorphicIndirect => 4,
+        Workload::GatewayScalar => 5,
+        Workload::GatewaySimd => 6,
     }
 }
 

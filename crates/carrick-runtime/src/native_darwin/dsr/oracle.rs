@@ -1848,6 +1848,134 @@ fn dsr_pending_kick_during_gateway_entry_keeps_guest_pc() {
 }
 
 #[test]
+fn dsr_host_window_kick_is_deferred_to_next_gateway_entry() {
+    assert_eq!(
+        unsafe { super::super::carrick_native_install_trap_handler() },
+        0
+    );
+    let guest = GuestVa(0x1c_340);
+    let mut cache = TranslationCache::new(16 * 1024).expect("allocate host-window cache");
+    let emitted = emit_block(
+        &mut cache,
+        &BlockPlan {
+            start: guest,
+            end: GuestVa(guest.raw() + 4),
+            generation: CodeGeneration::INITIAL,
+            instructions: Vec::new(),
+            exit: PlannedExit::Syscall {
+                guest,
+                resume: GuestVa(guest.raw() + 4),
+            },
+        },
+    )
+    .expect("emit host-window block");
+    let state = super::super::NativeKickState::new().expect("create host-window state");
+    state.bind_current().expect("bind host-window state");
+
+    let mut kick: libc::sigset_t = unsafe { std::mem::zeroed() };
+    let mut original: libc::sigset_t = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::sigemptyset(&mut kick);
+        libc::sigaddset(&mut kick, libc::SIGPIPE);
+    }
+    assert_eq!(
+        unsafe { libc::pthread_sigmask(libc::SIG_UNBLOCK, &kick, &mut original) },
+        0
+    );
+    assert!(state.request());
+    assert_eq!(
+        unsafe { libc::pthread_kill(libc::pthread_self(), libc::SIGPIPE) },
+        0
+    );
+
+    let mut stack = vec![0_u8; 16 * 1024];
+    let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    snapshot.pc = guest.raw();
+    let expected = snapshot;
+    let mut exit = NativeDsrExit::Syscall {
+        resume: GuestVa(guest.raw() + 4),
+    };
+    enter_translated(emitted.entry(), &mut snapshot, &mut exit)
+        .expect("consume deferred host-window kick");
+
+    state.unbind_current();
+    assert_eq!(
+        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &original, std::ptr::null_mut()) },
+        0
+    );
+    assert_eq!(exit, NativeDsrExit::KickAtEntry { resume: guest });
+    assert_eq!(snapshot.x, expected.x);
+    assert_eq!(snapshot.sp, expected.sp);
+    assert_eq!(snapshot.pc, expected.pc);
+}
+
+#[test]
+fn dsr_reinstall_clears_inherited_host_window_kick() {
+    assert_eq!(
+        unsafe { super::super::carrick_native_install_trap_handler() },
+        0
+    );
+    let state = super::super::NativeKickState::new().expect("create reinstall state");
+    state.bind_current().expect("bind reinstall state");
+    let mut kick: libc::sigset_t = unsafe { std::mem::zeroed() };
+    let mut original: libc::sigset_t = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::sigemptyset(&mut kick);
+        libc::sigaddset(&mut kick, libc::SIGPIPE);
+    }
+    assert_eq!(
+        unsafe { libc::pthread_sigmask(libc::SIG_UNBLOCK, &kick, &mut original) },
+        0
+    );
+    assert!(state.request());
+    assert_eq!(
+        unsafe { libc::pthread_kill(libc::pthread_self(), libc::SIGPIPE) },
+        0
+    );
+
+    // `prepare_kick_target` re-installs the handler in a real fork child. The
+    // child must not inherit a kick that was directed at the parent thread.
+    assert_eq!(
+        unsafe { super::super::carrick_native_install_trap_handler() },
+        0
+    );
+    let guest = GuestVa(0x1c_360);
+    let mut cache = TranslationCache::new(16 * 1024).expect("allocate reinstall cache");
+    let emitted = emit_block(
+        &mut cache,
+        &BlockPlan {
+            start: guest,
+            end: GuestVa(guest.raw() + 4),
+            generation: CodeGeneration::INITIAL,
+            instructions: Vec::new(),
+            exit: PlannedExit::Syscall {
+                guest,
+                resume: GuestVa(guest.raw() + 4),
+            },
+        },
+    )
+    .expect("emit reinstall block");
+    let mut stack = vec![0_u8; 16 * 1024];
+    let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    snapshot.pc = guest.raw();
+    let mut exit = NativeDsrExit::Syscall { resume: guest };
+    enter_translated(emitted.entry(), &mut snapshot, &mut exit)
+        .expect("enter after handler reinstall");
+
+    state.unbind_current();
+    assert_eq!(
+        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &original, std::ptr::null_mut()) },
+        0
+    );
+    assert_eq!(
+        exit,
+        NativeDsrExit::Syscall {
+            resume: GuestVa(guest.raw() + 4)
+        }
+    );
+}
+
+#[test]
 fn dsr_phase_zero_host_kick_keeps_original_guest_snapshot() {
     unsafe extern "C" {
         fn carrick_native_dsr_test_phase_zero_host_kick_once();
