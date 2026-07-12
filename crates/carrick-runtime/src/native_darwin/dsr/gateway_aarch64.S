@@ -80,14 +80,12 @@ _carrick_dsr_enter_raw:
     ldp x29, x30, [x28, #232]
     ldr x17, [x28, #SNAP_SP]
     mov sp, x17
-    // Physical x18 is reserved by the custom-x18 ABI and guest x18 is
-    // virtualized, so it is the only scratch register that does not destroy
-    // guest state at the first translated instruction. Restore guest x17
-    // before entering the generation guard; the guard may then snapshot the
-    // current x16/x17 state uniformly for initial and directly linked blocks.
-    ldr x18, [x28, #CTX_ENTRY]
-    ldr x17, [x28, #136]
-    br x18
+    // Branch through physical x17, which every translated block restores from
+    // snapshot.x[17] at entry. Do not stage the cache entry in custom x18:
+    // Darwin can lose that register across asynchronous signal/TLS traffic,
+    // producing an instruction abort at PC zero before the block starts.
+    ldr x17, [x28, #CTX_ENTRY]
+    br x17
 
 9:
     mov x9, x19
