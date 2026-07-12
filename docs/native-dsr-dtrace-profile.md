@@ -140,6 +140,33 @@ The profile observes resolver exits, which are misses. It does not count
 fast-path indirect hits, so these data cannot state a miss rate. A cache change
 must reduce resolver exits and independently improve untraced V8 wall time.
 
+#### Accepted cache result
+
+Commit `f70ec7f8` expanded the direct map from 1,024 to 8,192 entries (exactly
+256 KiB per guest thread) and changed the index from page-offset bits to
+`((guest ^ (guest >> 12)) >> 2) & 8191`. Rust publication and emitted AArch64
+use the same formula; entry layout, release publication, fork/exec clearing,
+and target generation guards are unchanged.
+
+Against signed baseline `905b2c11`, the fixed ABBA V8 gate measured:
+
+| Metric | Baseline | Candidate | Decision |
+| --- | ---: | ---: | --- |
+| direct V8 p50, n=10 each | 7982.07 ms | 7883.38 ms | ratio 0.9869, 95% interval 0.9674–0.9993; pass |
+| successful resolver exits | 416,997 | 132,213 | down 68.3% |
+| distinct missed targets | 41,152 | 41,151 | effectively unchanged workload surface |
+| monomorphic indirect p50, n=30 each | 7.335 ns | 7.196 ns | ratio 0.9804, interval 0.9434–1.0031, limit 1.02; pass |
+
+The candidate profile completed naturally with `target_exit_reason=1`, zero
+drops, zero incomplete pairs, 9,516 source sites, and 43,030 source-target
+pairs. The wall-time and hit-path samples, signed binary hashes, inodes,
+codesign output, host/power context, and bootstrap policy are checked in as
+[`native-dsr-indirect-cache-v1.jsonl`](perf-results/native-dsr-indirect-cache-v1.jsonl)
+and
+[`native-dsr-indirect-cache-hit-v1.jsonl`](perf-results/native-dsr-indirect-cache-hit-v1.jsonl).
+The large miss reduction translating into a smaller end-to-end win is expected:
+V8 also spends time in guest computation, translation, syscalls, and startup.
+
 ### Fork and exec
 
 The static-PIE fork/exec profile at `87a63918` captured 220 samples in each
@@ -193,13 +220,12 @@ measurements.
 
 ## Optimization order and proof rule
 
-The measured queue is:
+After promoting the indirect cache, the remaining measured queue is:
 
-1. indirect target-cache collisions, using V8 wall time and resolver counts;
-2. repeated prepare lookup, using syscall-floor wall time and outcome counts;
-3. exec subdivision, followed by the largest reproducible subphase;
-4. a low-perturbation scalar/SIMD gateway benchmark;
-5. translation/publication, reprofiled after cache misses fall.
+1. repeated prepare lookup, using syscall-floor wall time and outcome counts;
+2. exec subdivision, followed by the largest reproducible subphase;
+3. a low-perturbation scalar/SIMD gateway benchmark;
+4. translation/publication, reprofiled after cache misses fall.
 
 Every candidate starts with a deterministic red mechanism test, runs focused
 correctness plus a signed workload, and receives a fixed-order ABBA comparison
