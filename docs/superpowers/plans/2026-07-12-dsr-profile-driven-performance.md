@@ -942,7 +942,7 @@ The selected plan must include a red mechanism test, exact implementation,
 subphase and outer exec p50, vfork/non-leader exec/static/PIE correctness, and a
 revert rule. Commit that plan before executing it.
 
-- [ ] **Step 4: Execute the selected plan inline**
+- [x] **Step 4: Execute the selected plan inline**
 
 Use `superpowers:executing-plans`, promote only a passing candidate, and update
 this umbrella plan with commit, evidence path, old/new p50/p95, and remaining
@@ -956,6 +956,15 @@ plus protection/vvar work is stable at 61.7% and 61.8% of outer time (p50
 `docs/superpowers/plans/2026-07-12-dsr-exec-mapping-performance.md`. Its first
 experiment removes DSR-only I-cache publication for source bytes that are
 mapped non-executable and never fetched by the host CPU.
+
+**Execution result:** rejected and restored. The candidate improved image-map
+p50 by 3.5% and outer exec-reset p50 by 1.8%, below the fixed 10% gates; outer
+p95 was flat at ratio 1.0020. Evidence is checked in at
+`docs/perf-results/native-dsr-exec-icache-v1.jsonl`. Image mapping remains the
+largest exec subphase, but cache publication is not its dominant mechanism.
+The next mapping attempt requires finer `mmap`/copy/publication/protection/vvar
+attribution; do not repeat this candidate or infer that all mapping work is
+cache maintenance.
 
 ---
 
