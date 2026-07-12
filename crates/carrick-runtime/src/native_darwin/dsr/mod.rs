@@ -39,6 +39,7 @@ pub(super) struct ThreadTranslator {
     sensitive: BTreeMap<(carrick_guest_mem::GuestVa, types::CodeGeneration), types::SensitiveExit>,
     unsupported: BTreeMap<(carrick_guest_mem::GuestVa, types::CodeGeneration), (u32, bad64::Op)>,
     published: Vec<PublishedBlock>,
+    dependencies: cache::PageBlockDependencies,
 }
 
 struct PublishedBlock {
@@ -46,6 +47,7 @@ struct PublishedBlock {
     len: usize,
     map: Vec<emit::PcMapEntry>,
     recovery: Vec<emit::RecoveryEntry>,
+    _generation: cache::PageGenerationObservation,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -68,6 +70,7 @@ impl ThreadTranslator {
             sensitive: BTreeMap::new(),
             unsupported: BTreeMap::new(),
             published: Vec::new(),
+            dependencies: cache::PageBlockDependencies::default(),
         })
     }
 
@@ -75,20 +78,32 @@ impl ThreadTranslator {
         &mut self,
         memory: &super::NativeMappedMemory,
         guest: carrick_guest_mem::GuestVa,
-    ) -> Result<types::CacheVa, types::DsrError> {
-        let key = (guest, types::CodeGeneration::INITIAL);
-        if let Some(entry) = self.blocks.get(&key) {
-            return Ok(*entry);
+    ) -> Result<(types::CacheVa, types::CodeGeneration), types::DsrError> {
+        let observation = memory.dsr_generation_observation(guest)?;
+        let source_page = observation.page();
+        let generation = observation.expected();
+        for stale in self.dependencies.invalidate_page(source_page, generation) {
+            self.blocks.remove(&stale);
         }
-        let block = block::plan_block(memory, guest, types::CodeGeneration::INITIAL, 256)?;
+        let key = (guest, generation);
+        if let Some(entry) = self.blocks.get(&key) {
+            return Ok((*entry, generation));
+        }
+        let block = block::plan_block(memory, guest, generation, 256)?;
+        if observation.current() != generation {
+            return Err(types::DsrError::GenerationChanged {
+                page: guest.raw(),
+                expected: generation.get(),
+                observed: observation.current().get(),
+            });
+        }
         if let block::PlannedExit::Sensitive {
             guest: sensitive_guest,
             exit,
             ..
         } = block.exit
         {
-            self.sensitive
-                .insert((sensitive_guest, types::CodeGeneration::INITIAL), exit);
+            self.sensitive.insert((sensitive_guest, generation), exit);
         }
         if let block::PlannedExit::Unsupported {
             guest: unsupported_guest,
@@ -96,12 +111,21 @@ impl ThreadTranslator {
             op,
         } = block.exit
         {
-            self.unsupported.insert(
-                (unsupported_guest, types::CodeGeneration::INITIAL),
-                (word, op),
-            );
+            self.unsupported
+                .insert((unsupported_guest, generation), (word, op));
         }
-        let emitted = emit::emit_block(&mut self.cache, &block)?;
+        let emitted = emit::emit_block_with_generation(
+            &mut self.cache,
+            &block,
+            emit::GenerationGuard::new(observation.current_atomic(), generation),
+        )?;
+        if observation.current() != generation {
+            return Err(types::DsrError::GenerationChanged {
+                page: guest.raw(),
+                expected: generation.get(),
+                observed: observation.current().get(),
+            });
+        }
         self.stats.translations = self.stats.translations.saturating_add(1);
         let entry = emitted.entry();
         self.published.push(PublishedBlock {
@@ -109,12 +133,15 @@ impl ThreadTranslator {
             len: emitted.len(),
             map: emitted.map().entries().to_vec(),
             recovery: emitted.recovery().to_vec(),
+            _generation: observation,
         });
         let links = emitted.direct_links().to_vec();
         self.blocks.insert(key, entry);
+        self.dependencies.record(source_page, guest, generation);
 
         for link in links {
-            let target_key = (link.target, types::CodeGeneration::INITIAL);
+            let target_generation = memory.dsr_generation_observation(link.target)?.expected();
+            let target_key = (link.target, target_generation);
             let site = cache::LinkSite {
                 source: entry,
                 slot: link.slot,
@@ -130,7 +157,7 @@ impl ThreadTranslator {
                 self.cache.patch_direct_branch(site, entry)?;
             }
         }
-        Ok(entry)
+        Ok((entry, generation))
     }
 
     fn guest_pc_for_cache(
@@ -199,9 +226,8 @@ impl ThreadTranslator {
                 reason: "target is outside an executable guest mapping",
             });
         }
-        let entry = self.translate(memory, target)?;
-        self.indirect_cache
-            .publish(target, types::CodeGeneration::INITIAL, entry);
+        let (entry, generation) = self.translate(memory, target)?;
+        self.indirect_cache.publish(target, generation, entry);
         Ok(entry)
     }
 
@@ -216,12 +242,13 @@ impl ThreadTranslator {
         snapshot: &mut super::NativeUcontextSnapshot,
     ) -> Result<ThreadExit, types::DsrError> {
         let guest = carrick_guest_mem::GuestVa(snapshot.pc);
-        let entry = match self.resume_entry.take() {
+        let (entry, generation) = match self.resume_entry.take() {
             Some((cached_guest, generation, entry))
-                if cached_guest == guest && generation == types::CodeGeneration::INITIAL =>
+                if cached_guest == guest
+                    && memory.dsr_generation_observation(guest)?.expected() == generation =>
             {
                 self.stats.one_entry_hits = self.stats.one_entry_hits.saturating_add(1);
-                entry
+                (entry, generation)
             }
             _ => self.translate(memory, guest)?,
         };
@@ -238,14 +265,15 @@ impl ThreadTranslator {
             }
             types::NativeDsrExit::ResolveIndirect { source, target, .. } => {
                 let entry = self.resolve_indirect(memory, source, target)?;
-                self.resume_entry = Some((target, types::CodeGeneration::INITIAL, entry));
+                let target_generation = memory.dsr_generation_observation(target)?.expected();
+                self.resume_entry = Some((target, target_generation, entry));
                 snapshot.pc = target.raw();
                 ThreadExit::Continue
             }
             types::NativeDsrExit::Sensitive { guest_pc, .. } => {
                 let exit = self
                     .sensitive
-                    .get(&(guest_pc, types::CodeGeneration::INITIAL))
+                    .get(&(guest_pc, generation))
                     .copied()
                     .ok_or_else(|| {
                         types::DsrError::BlockPolicy(format!(
@@ -258,7 +286,7 @@ impl ThreadTranslator {
             types::NativeDsrExit::Unsupported { guest_pc, .. } => {
                 let (word, op) = self
                     .unsupported
-                    .get(&(guest_pc, types::CodeGeneration::INITIAL))
+                    .get(&(guest_pc, generation))
                     .copied()
                     .ok_or_else(|| {
                         types::DsrError::BlockPolicy(format!(

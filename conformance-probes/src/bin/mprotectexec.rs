@@ -91,8 +91,93 @@ fn fetch_allowed(st: i32) -> bool {
     libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 0
 }
 
+#[cfg(target_arch = "aarch64")]
+unsafe fn write_return_value(page: *mut u8, value: u16) {
+    let words = page.cast::<u32>();
+    words.write(0x5280_0000 | (u32::from(value) << 5)); // mov w0, #value
+    words.add(1).write(0xd65f_03c0); // ret
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn sync_generated_code(page: *mut u8) {
+    core::arch::asm!("dc cvau, {page}", page = in(reg) page, options(nostack, preserves_flags));
+    core::arch::asm!("dsb ish", options(nostack, preserves_flags));
+    core::arch::asm!("ic ivau, {page}", page = in(reg) page, options(nostack, preserves_flags));
+    core::arch::asm!("dsb ish", options(nostack, preserves_flags));
+    core::arch::asm!("isb", options(nostack, preserves_flags));
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn write_return_value(page: *mut u8, value: u16) {
+    // mov eax, imm32; ret
+    page.write(0xb8);
+    page.add(1).cast::<u32>().write_unaligned(u32::from(value));
+    page.add(5).write(0xc3);
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn sync_generated_code(_page: *mut u8) {}
+
+unsafe fn call_return_value(page: *mut u8) -> u32 {
+    let function: unsafe extern "C" fn() -> u32 = core::mem::transmute(page);
+    function()
+}
+
+unsafe fn run_jit_rewrite() {
+    let len = 16 * 1024;
+    let page = libc::mmap(
+        core::ptr::null_mut(),
+        len,
+        libc::PROT_READ | libc::PROT_WRITE,
+        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+        -1,
+        0,
+    ) as *mut u8;
+    if page.cast::<libc::c_void>() == libc::MAP_FAILED {
+        report!(jit_setup_ok = false);
+        return;
+    }
+
+    write_return_value(page, 17);
+    sync_generated_code(page);
+    let first_protect = libc::mprotect(page.cast(), len, libc::PROT_READ | libc::PROT_EXEC) == 0;
+    let first = first_protect.then(|| call_return_value(page)).unwrap_or(0);
+
+    let writable = libc::mprotect(page.cast(), len, libc::PROT_READ | libc::PROT_WRITE) == 0;
+    if writable {
+        write_return_value(page, 29);
+        sync_generated_code(page);
+    }
+    let second_protect = writable
+        && libc::mprotect(page.cast(), len, libc::PROT_READ | libc::PROT_EXEC) == 0;
+    let second = second_protect.then(|| call_return_value(page)).unwrap_or(0);
+
+    let address = page as usize;
+    let first_thread = std::thread::spawn(move || {
+        call_return_value(address as *mut u8)
+    });
+    let address = page as usize;
+    let second_thread = std::thread::spawn(move || {
+        call_return_value(address as *mut u8)
+    });
+    let thread_a = first_thread.join().unwrap_or(0);
+    let thread_b = second_thread.join().unwrap_or(0);
+
+    report!(
+        jit_setup_ok = first_protect && second_protect,
+        jit_first_value = first,
+        jit_second_value = second,
+        jit_thread_values_match = thread_a == 29 && thread_b == 29,
+    );
+    libc::munmap(page.cast(), len);
+}
+
 fn main() {
     unsafe {
+        if std::env::args().any(|arg| arg == "jit") {
+            run_jit_rewrite();
+            return;
+        }
         let report_status = std::env::args().any(|arg| arg == "status");
         // Case 1: mmap PROT_READ|WRITE (no EXEC) → jump must fault SIGSEGV (NX).
         let rw = child_exec(libc::PROT_READ | libc::PROT_WRITE, None);
