@@ -250,6 +250,10 @@ impl ConcurrentPublicationIndex {
 }
 
 impl PageBlockDependencies {
+    pub(super) fn page_count(&self) -> usize {
+        self.blocks.len()
+    }
+
     pub(super) fn record(&mut self, page: GuestVa, block: GuestVa, generation: CodeGeneration) {
         let blocks = self.blocks.entry(page).or_default();
         if !blocks.contains(&(block, generation)) {
@@ -386,10 +390,11 @@ impl TranslationCache {
             DsrError::CachePolicy("translation cache cursor overflow".to_string())
         })?;
         if end > self.capacity {
-            return Err(DsrError::CachePolicy(format!(
-                "translation cache exhausted: requested={len} remaining={}",
-                self.capacity - self.cursor
-            )));
+            return Err(DsrError::CacheCapacity {
+                requested: len,
+                used: self.cursor,
+                capacity: self.capacity,
+            });
         }
         let start = self.cursor;
         unsafe { libc::pthread_jit_write_protect_np(0) };
@@ -544,6 +549,24 @@ mod generation_tests {
 
     const PAGE_SIZE: u64 = 0x4000;
     const PAGE: GuestVa = GuestVa(0x20_000);
+
+    #[test]
+    fn translation_cache_exhaustion_is_typed() {
+        let mut cache = super::TranslationCache::new(16 * 1024).expect("translation cache");
+        let error = match cache.begin_write(cache.capacity_bytes() + 4) {
+            Ok(_) => panic!("oversized reservation succeeded"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            super::super::types::DsrError::CacheCapacity {
+                requested,
+                used: 0,
+                capacity
+            } if requested == capacity + 4
+        ));
+    }
 
     #[derive(Clone, Copy, Debug)]
     enum Operation {
