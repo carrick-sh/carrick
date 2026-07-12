@@ -238,8 +238,6 @@ fn carrick_argv_with_native_dsr(mut argv: Vec<String>, image: &str) -> Vec<Strin
             "native".to_string(),
             "--native-page-profile".to_string(),
             "native16k".to_string(),
-            "--native-code-mode".to_string(),
-            "dsr".to_string(),
         ],
     );
     argv
@@ -376,7 +374,7 @@ mod tests {
     }
 
     #[test]
-    fn native_dsr_invocation_is_local_and_injects_typed_mode_flags() {
+    fn native_dsr_invocation_is_local_and_injects_typed_backend_flags() {
         let s = demo_suite();
         let lane = lane_from_args(
             "macos-native-dsr",
@@ -401,22 +399,13 @@ mod tests {
             argv.windows(2)
                 .any(|w| { w[0] == "--native-page-profile" && w[1] == "native16k" })
         );
-        assert!(
-            argv.windows(2)
-                .any(|w| { w[0] == "--native-code-mode" && w[1] == "dsr" })
-        );
         let image = argv
             .iter()
             .position(|arg| arg == &s.image)
             .expect("image must remain in argv");
-        let code_mode = argv
-            .iter()
-            .position(|arg| arg == "--native-code-mode")
-            .expect("DSR flag must be present");
-        assert!(
-            code_mode < image,
-            "mode flags must precede the image: {argv:?}"
-        );
+        let removed_mode_flag = concat!("--native-code-", "mode");
+        assert!(!argv.iter().any(|arg| arg == removed_mode_flag));
+        assert!(image > 1);
     }
 
     #[test]

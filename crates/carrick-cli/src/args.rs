@@ -37,9 +37,7 @@ use std::path::PathBuf;
 #[cfg(feature = "platform-macos")]
 use carrick_runtime::compat::CompatReportFormat;
 use carrick_runtime::runtime::DEFAULT_MAX_TRAPS;
-use carrick_spec::{
-    ExecBackendRequest, FsBackendKind, NativeCodeModeRequest, NativePageProfileRequest, PidMode,
-};
+use carrick_spec::{ExecBackendRequest, FsBackendKind, NativePageProfileRequest, PidMode};
 use clap::{Parser, Subcommand};
 
 use crate::trace_profile::TraceProfileKind;
@@ -135,9 +133,6 @@ pub(crate) enum Commands {
         /// Page profile for the native execution backend.
         #[arg(long = "native-page-profile", value_enum, default_value_t = NativePageProfileRequest::Auto, env = "CARRICK_NATIVE_PAGE_PROFILE")]
         native_page_profile: NativePageProfileRequest,
-        /// Instruction execution mode for the Darwin-native backend.
-        #[arg(long = "native-code-mode", value_enum, default_value_t = NativeCodeModeRequest::Brk, env = "CARRICK_NATIVE_CODE_MODE")]
-        native_code_mode: NativeCodeModeRequest,
         /// Launch-time syscall policy. `run-elf` drives a bare host ELF and
         /// defaults to UNCONFINED (no policy); pass `seccomp=default` to opt
         /// into the container policy model `carrick run` applies by default
@@ -315,9 +310,6 @@ pub(crate) enum Commands {
         /// Page profile for the native execution backend.
         #[arg(long = "native-page-profile", value_enum, default_value_t = NativePageProfileRequest::Auto, env = "CARRICK_NATIVE_PAGE_PROFILE")]
         native_page_profile: NativePageProfileRequest,
-        /// Instruction execution mode for the Darwin-native backend.
-        #[arg(long = "native-code-mode", value_enum, default_value_t = NativeCodeModeRequest::Brk, env = "CARRICK_NATIVE_CODE_MODE")]
-        native_code_mode: NativeCodeModeRequest,
         /// PID namespace mode (like `docker run --pid`). `private` (default)
         /// runs the container in its own PID namespace (init is pid 1); `host`
         /// shares the host PID namespace (no remap).
@@ -428,9 +420,6 @@ pub(crate) enum Commands {
         /// Page profile for the native execution backend.
         #[arg(long = "native-page-profile", value_enum, default_value_t = NativePageProfileRequest::Auto, env = "CARRICK_NATIVE_PAGE_PROFILE")]
         native_page_profile: NativePageProfileRequest,
-        /// Instruction execution mode for the Darwin-native backend.
-        #[arg(long = "native-code-mode", value_enum, default_value_t = NativeCodeModeRequest::Brk, env = "CARRICK_NATIVE_CODE_MODE")]
-        native_code_mode: NativeCodeModeRequest,
         #[arg(long, value_enum, default_value_t = PidMode::Private)]
         pid: PidMode,
         /// Docker `--pull` policy: `always` re-checks the registry and re-pulls a
@@ -963,9 +952,7 @@ pub(crate) enum NetworkCommand {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Commands};
-    #[cfg(feature = "platform-macos")]
-    use carrick_spec::NativeCodeModeRequest;
+    use super::Cli;
     use clap::Parser;
 
     #[test]
@@ -982,29 +969,5 @@ mod tests {
             Cli::try_parse_from(["carrick", "volume", "inspect", "vol1", "vol2"]).is_ok(),
             "volume inspect should accept multiple names"
         );
-    }
-
-    #[test]
-    #[cfg(feature = "platform-macos")]
-    fn run_elf_accepts_explicit_dsr_code_mode() {
-        let cli = Cli::try_parse_from([
-            "carrick",
-            "run-elf",
-            "/tmp/probe",
-            "--exec-backend",
-            "native",
-            "--native-page-profile",
-            "native16k",
-            "--native-code-mode",
-            "dsr",
-        ])
-        .expect("parse DSR mode");
-        assert!(matches!(
-            cli.command,
-            Commands::RunElf {
-                native_code_mode: NativeCodeModeRequest::Dsr,
-                ..
-            }
-        ));
     }
 }

@@ -85,9 +85,6 @@ pub struct RunConfig {
     /// Native page profile request preserved across start/restart/exec.
     #[serde(default)]
     pub native_page_profile: carrick_spec::NativePageProfileRequest,
-    /// Native instruction-execution mode preserved across start/restart/exec.
-    #[serde(default)]
-    pub native_code_mode: carrick_spec::NativeCodeModeRequest,
     /// Container env overrides (`-e`/`--env-file`), re-applied over the image env.
     pub env: Vec<String>,
     /// `-w/--workdir`.
@@ -211,7 +208,6 @@ impl Default for RunConfig {
             platform: None,
             exec_backend: carrick_spec::ExecBackendRequest::Auto,
             native_page_profile: carrick_spec::NativePageProfileRequest::Auto,
-            native_code_mode: carrick_spec::NativeCodeModeRequest::Brk,
             env: Vec::new(),
             workdir: None,
             user: None,

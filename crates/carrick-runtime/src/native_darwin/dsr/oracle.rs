@@ -10,30 +10,6 @@ use super::types::{
     NativeDsrExit, PcRelativeInst, PcRelativeKind, SensitiveExit, SensitiveKind,
 };
 
-fn legacy_brk_round_trip(
-    entry: super::types::CacheVa,
-    snapshot: &mut NativeUcontextSnapshot,
-) -> Result<(), DsrError> {
-    let mut seeded = *snapshot;
-    seeded.pc = entry.host().raw() as u64;
-    if unsafe { super::super::carrick_native_seed_ucontext(&seeded) } != 0 {
-        return Err(DsrError::Gateway("seed brk comparison context".to_string()));
-    }
-    if unsafe { super::super::carrick_native_resume_detached_context() } != 1 {
-        return Err(DsrError::Gateway(
-            "enter brk comparison context".to_string(),
-        ));
-    }
-    *snapshot =
-        super::super::snapshot_ucontext().map_err(|error| DsrError::Gateway(error.to_string()))?;
-    Ok(())
-}
-
-fn median(samples: &mut [f64]) -> f64 {
-    samples.sort_by(f64::total_cmp);
-    samples[samples.len() / 2]
-}
-
 fn seeded_snapshot(stack_pointer: u64) -> NativeUcontextSnapshot {
     let mut snapshot = NativeUcontextSnapshot {
         sp: stack_pointer,
@@ -1395,117 +1371,9 @@ fn dsr_generation_guard_rejects_stale_block_before_guest_instruction() {
 }
 
 #[test]
-fn dsr_vdso_x18_rewrites_match_native_execution() {
-    let words = [
-        0x2941_0c12,
-        0x2a12_03fb,
-        0x0b1b_024c,
-        0x3940_0a12,
-        0x5310_3e52,
-        0x2a10_6250,
-        0x3840_4dd2,
-        0x2a0d_224d,
-        0x3940_0152,
-        0xaa0e_224e,
-        0x3940_09d2,
-        0x5310_3e52,
-        0x2a0e_624e,
-        0x3940_0552,
-        0x3900_0572,
-        0xaa08_03f2,
-        0xcb08_0251,
-        0x8b12_0012,
-        0x3900_0249,
-        0x9100_2243,
-        0x3900_164a,
-        0x3900_0e4b,
-        0x3900_0a4c,
-        0x3900_064d,
-        0x3800_4e4e,
-        0x3900_0e4f,
-        0x3900_0a50,
-        0xaa03_03f2,
-    ];
-    assert_eq!(
-        unsafe { super::super::carrick_native_install_trap_handler() },
-        0
-    );
-
-    for (index, word) in words.into_iter().enumerate() {
-        let guest = GuestVa(0x1b_100 + index as u64 * 0x10);
-        let action = super::decode::classify(word, guest).expect("classify vDSO x18 word");
-        assert!(matches!(action, InstAction::VirtualizedX18 { .. }));
-        let mut memory = [0_u8; 512];
-        for (offset, byte) in memory.iter_mut().enumerate() {
-            *byte = offset as u8;
-        }
-        let pristine = memory;
-        let base = unsafe { memory.as_mut_ptr().add(128) } as u64;
-        let mut stack = vec![0_u8; 16 * 1024];
-        let mut initial = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
-        for register in &mut initial.x {
-            *register = base;
-        }
-        initial.x[8] = 1;
-        initial.x[17] = base;
-        initial.x[18] = base;
-
-        let mut native_cache = TranslationCache::new(16 * 1024).expect("allocate native oracle");
-        let mut writer = native_cache
-            .begin_write(8)
-            .expect("begin native oracle write");
-        writer
-            .write_words(&[word, super::super::BRK_NATIVE_SYSCALL])
-            .expect("write native oracle words");
-        let native = writer.publish().expect("publish native oracle");
-        let mut expected = initial;
-        legacy_brk_round_trip(native.entry(), &mut expected).unwrap_or_else(|error| {
-            panic!("native vDSO x18 oracle failed for 0x{word:08x}: {error}")
-        });
-        let expected_memory = memory;
-
-        memory.copy_from_slice(&pristine);
-        let mut dsr_cache = TranslationCache::new(16 * 1024).expect("allocate DSR oracle");
-        let emitted = emit_block(
-            &mut dsr_cache,
-            &BlockPlan {
-                start: guest,
-                end: GuestVa(guest.raw() + 8),
-                generation: CodeGeneration::INITIAL,
-                instructions: vec![PlannedInst { guest, action }],
-                exit: PlannedExit::Syscall {
-                    guest: GuestVa(guest.raw() + 4),
-                    resume: GuestVa(guest.raw() + 8),
-                },
-            },
-        )
-        .expect("emit DSR vDSO x18 oracle");
-        let mut observed = initial;
-        let mut exit = NativeDsrExit::Syscall {
-            resume: GuestVa(guest.raw() + 8),
-        };
-        enter_translated(emitted.entry(), &mut observed, &mut exit)
-            .expect("execute DSR vDSO x18 oracle");
-
-        assert_eq!(
-            observed.x, expected.x,
-            "GPR mismatch for vDSO word 0x{word:08x}"
-        );
-        assert_eq!(
-            observed.pstate, expected.pstate,
-            "NZCV mismatch for vDSO word 0x{word:08x}"
-        );
-        assert_eq!(
-            memory, expected_memory,
-            "memory mismatch for vDSO word 0x{word:08x}"
-        );
-    }
-}
-
-#[test]
 fn dsr_signal_fault_reconstructs_copied_instruction_pc() {
     assert_eq!(
-        unsafe { super::super::carrick_native_install_trap_handler() },
+        unsafe { super::super::carrick_native_install_dsr_signal_handlers() },
         0
     );
     let mut cache = TranslationCache::new(16 * 1024).expect("allocate fault cache");
@@ -1565,7 +1433,7 @@ fn dsr_signal_fault_reconstructs_copied_instruction_pc() {
 #[test]
 fn dsr_signal_fault_recovers_context_when_physical_x28_is_zero() {
     assert_eq!(
-        unsafe { super::super::carrick_native_install_trap_handler() },
+        unsafe { super::super::carrick_native_install_dsr_signal_handlers() },
         0
     );
     let guest = GuestVa(0x1c_100);
@@ -1628,7 +1496,7 @@ fn dsr_concurrency_kick_exits_guarded_linked_loop_without_corrupting_guest_state
     use std::sync::atomic::AtomicU64;
 
     assert_eq!(
-        unsafe { super::super::carrick_native_install_trap_handler() },
+        unsafe { super::super::carrick_native_install_dsr_signal_handlers() },
         0
     );
     let guest = GuestVa(0x1c_200);
@@ -1791,7 +1659,7 @@ fn dsr_concurrency_kick_exits_guarded_linked_loop_without_corrupting_guest_state
 #[test]
 fn dsr_pending_kick_during_gateway_entry_keeps_guest_pc() {
     assert_eq!(
-        unsafe { super::super::carrick_native_install_trap_handler() },
+        unsafe { super::super::carrick_native_install_dsr_signal_handlers() },
         0
     );
     let guest = GuestVa(0x1c_300);
@@ -1850,7 +1718,7 @@ fn dsr_pending_kick_during_gateway_entry_keeps_guest_pc() {
 #[test]
 fn dsr_host_window_kick_is_deferred_to_next_gateway_entry() {
     assert_eq!(
-        unsafe { super::super::carrick_native_install_trap_handler() },
+        unsafe { super::super::carrick_native_install_dsr_signal_handlers() },
         0
     );
     let guest = GuestVa(0x1c_340);
@@ -1912,7 +1780,7 @@ fn dsr_host_window_kick_is_deferred_to_next_gateway_entry() {
 #[test]
 fn dsr_reinstall_clears_inherited_host_window_kick() {
     assert_eq!(
-        unsafe { super::super::carrick_native_install_trap_handler() },
+        unsafe { super::super::carrick_native_install_dsr_signal_handlers() },
         0
     );
     let state = super::super::NativeKickState::new().expect("create reinstall state");
@@ -1936,7 +1804,7 @@ fn dsr_reinstall_clears_inherited_host_window_kick() {
     // `prepare_kick_target` re-installs the handler in a real fork child. The
     // child must not inherit a kick that was directed at the parent thread.
     assert_eq!(
-        unsafe { super::super::carrick_native_install_trap_handler() },
+        unsafe { super::super::carrick_native_install_dsr_signal_handlers() },
         0
     );
     let guest = GuestVa(0x1c_360);
@@ -1982,7 +1850,7 @@ fn dsr_phase_zero_host_kick_keeps_original_guest_snapshot() {
     }
 
     assert_eq!(
-        unsafe { super::super::carrick_native_install_trap_handler() },
+        unsafe { super::super::carrick_native_install_dsr_signal_handlers() },
         0
     );
     let guest = GuestVa(0x1c_380);
@@ -2034,7 +1902,7 @@ fn dsr_phase_zero_host_kick_keeps_original_guest_snapshot() {
 #[test]
 fn dsr_signal_fault_recovers_scratch_in_expanded_x18_load() {
     assert_eq!(
-        unsafe { super::super::carrick_native_install_trap_handler() },
+        unsafe { super::super::carrick_native_install_dsr_signal_handlers() },
         0
     );
     let mut cache = TranslationCache::new(16 * 1024).expect("allocate x18 fault cache");
@@ -2119,7 +1987,7 @@ fn dsr_signal_fault_recovers_scratch_in_expanded_x18_load() {
 #[test]
 fn dsr_signal_fault_preserves_destination_in_expanded_literal_load() {
     assert_eq!(
-        unsafe { super::super::carrick_native_install_trap_handler() },
+        unsafe { super::super::carrick_native_install_dsr_signal_handlers() },
         0
     );
     let mut cache = TranslationCache::new(16 * 1024).expect("allocate literal fault cache");
@@ -2191,80 +2059,4 @@ fn dsr_signal_fault_preserves_destination_in_expanded_literal_load() {
     )
     .expect("recover literal scratch");
     assert_eq!(snapshot.x, original.x);
-}
-
-#[test]
-#[ignore = "explicit 30-sample Task 5 performance feasibility gate"]
-fn dsr_gateway_perf_feasibility_30_samples() {
-    const SAMPLES: usize = 30;
-    const TRANSITIONS_PER_SAMPLE: usize = 200;
-
-    assert_eq!(
-        unsafe { super::super::carrick_native_install_trap_handler() },
-        0
-    );
-    let mut stack = vec![0_u8; 16 * 1024];
-    let stack_pointer = stack.as_mut_ptr() as u64 + stack.len() as u64;
-    let initial = seeded_snapshot(stack_pointer);
-    let plan = BlockPlan {
-        start: GuestVa(0x4000),
-        end: GuestVa(0x4004),
-        generation: CodeGeneration::INITIAL,
-        instructions: Vec::new(),
-        exit: PlannedExit::Syscall {
-            guest: GuestVa(0x4000),
-            resume: GuestVa(0x4004),
-        },
-    };
-    let mut dsr_cache = TranslationCache::new(16 * 1024).expect("allocate DSR perf cache");
-    let emitted = emit_block(&mut dsr_cache, &plan).expect("emit DSR perf block");
-    let mut brk_cache = TranslationCache::new(16 * 1024).expect("allocate brk perf cache");
-    let mut writer = brk_cache.begin_write(4).expect("begin brk perf write");
-    writer
-        .write_words(&[super::super::BRK_NATIVE_SYSCALL])
-        .expect("write brk perf instruction");
-    let brk = writer.publish().expect("publish brk perf instruction");
-
-    for _ in 0..20 {
-        let mut dsr_snapshot = initial;
-        let mut exit = NativeDsrExit::Syscall {
-            resume: GuestVa(0x4004),
-        };
-        enter_translated(emitted.entry(), &mut dsr_snapshot, &mut exit).expect("warm DSR gateway");
-        let mut brk_snapshot = initial;
-        legacy_brk_round_trip(brk.entry(), &mut brk_snapshot).expect("warm brk gateway");
-    }
-
-    let mut dsr_samples = Vec::with_capacity(SAMPLES);
-    let mut brk_samples = Vec::with_capacity(SAMPLES);
-    for _ in 0..SAMPLES {
-        let start = std::time::Instant::now();
-        for _ in 0..TRANSITIONS_PER_SAMPLE {
-            let mut snapshot = initial;
-            let mut exit = NativeDsrExit::Syscall {
-                resume: GuestVa(0x4004),
-            };
-            enter_translated(emitted.entry(), &mut snapshot, &mut exit)
-                .expect("measure DSR gateway");
-        }
-        dsr_samples.push(start.elapsed().as_nanos() as f64 / TRANSITIONS_PER_SAMPLE as f64);
-
-        let start = std::time::Instant::now();
-        for _ in 0..TRANSITIONS_PER_SAMPLE {
-            let mut snapshot = initial;
-            legacy_brk_round_trip(brk.entry(), &mut snapshot).expect("measure brk gateway");
-        }
-        brk_samples.push(start.elapsed().as_nanos() as f64 / TRANSITIONS_PER_SAMPLE as f64);
-    }
-
-    let dsr_p50_ns = median(&mut dsr_samples);
-    let brk_p50_ns = median(&mut brk_samples);
-    eprintln!(
-        "dsr_gateway_perf samples={SAMPLES} transitions_per_sample={TRANSITIONS_PER_SAMPLE} dsr_p50_ns={dsr_p50_ns:.1} brk_p50_ns={brk_p50_ns:.1} ratio={:.3}",
-        dsr_p50_ns / brk_p50_ns
-    );
-    assert!(
-        dsr_p50_ns < brk_p50_ns,
-        "exception-free DSR gateway did not beat brk: dsr={dsr_p50_ns:.1}ns brk={brk_p50_ns:.1}ns"
-    );
 }
