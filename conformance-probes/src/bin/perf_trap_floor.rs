@@ -7,6 +7,7 @@
 //! Raw `syscall(172)` (not `getpid()`) so glibc/musl's pid cache can't elide
 //! the trap. Output (key=value, parsed by the perf gate, NOT diffed):
 //!   trap_p50_us=<f>  trap_p95_us=<f>  trap_min_us=<f>
+//!   trap_trimmed_mean_us=<f>
 //!   gettid_p50_us=<f>  gettid_p95_us=<f>  gettid_min_us=<f>
 //!   empty_p50_us=<f>  empty_p95_us=<f>  empty_min_us=<f>
 //!   iters=<u>  nproc=<u>
@@ -26,6 +27,7 @@ struct TimingSummary {
     p50_us: f64,
     p95_us: f64,
     min_us: f64,
+    trimmed_mean_us: f64,
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -78,10 +80,15 @@ fn summarize(mut samples: Vec<u64>, frequency: u64) -> TimingSummary {
             .min(samples.len() - 1);
         ticks_to_us(samples[idx])
     };
+    let trim = samples.len() / 20;
+    let trimmed = &samples[trim..samples.len() - trim];
+    let trimmed_mean_ticks = trimmed.iter().map(|ticks| *ticks as f64).sum::<f64>()
+        / trimmed.len() as f64;
     TimingSummary {
         p50_us: percentile(0.50),
         p95_us: percentile(0.95),
         min_us: ticks_to_us(samples[0]),
+        trimmed_mean_us: trimmed_mean_ticks * 1_000_000.0 / frequency as f64,
     }
 }
 
@@ -102,6 +109,10 @@ fn print_summary(prefix: &str, summary: TimingSummary) {
     println!("{prefix}_p50_us={:.3}", summary.p50_us);
     println!("{prefix}_p95_us={:.3}", summary.p95_us);
     println!("{prefix}_min_us={:.3}", summary.min_us);
+    println!(
+        "{prefix}_trimmed_mean_us={:.3}",
+        summary.trimmed_mean_us
+    );
 }
 
 fn main() {
@@ -137,5 +148,6 @@ mod tests {
         assert_eq!(summary.p50_us, 5.0);
         assert_eq!(summary.p95_us, 10.0);
         assert_eq!(summary.min_us, 1.0);
+        assert_eq!(summary.trimmed_mean_us, 5.5);
     }
 }
