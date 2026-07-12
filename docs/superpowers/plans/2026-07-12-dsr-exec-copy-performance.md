@@ -93,7 +93,7 @@ writes argv/env/auxv only near its top. Darwin's fresh anonymous stack mapping
 is already zero-filled. The initialized stack suffix begins at the authoritative
 `AddressSpace::initial_stack_pointer`; copying the zero prefix is redundant.
 
-- [ ] **Step 1: Pin the copy window red**
+- [x] **Step 1: Pin the copy window red**
 
 Add a pure `native_region_copy_window(region, initial_sp) -> Range<usize>`
 test. For the exact Linux stack extent, require the range to begin at
@@ -105,6 +105,9 @@ cargo test -p carrick-runtime native_region_copy_window --lib -- --nocapture
 ```
 
 Expected red: the helper is absent.
+
+Observed: rustc reports `E0425` at the canonical-stack, absent-SP, and
+non-stack policy assertions.
 
 - [ ] **Step 2: Copy the selected window at its guest offset**
 

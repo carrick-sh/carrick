@@ -10470,6 +10470,56 @@ mod tests {
     }
 
     #[test]
+    fn native_region_copy_window_uses_only_initialized_stack_suffix() {
+        let stack_start = crate::memory::LINUX_STACK_TOP - crate::memory::LINUX_STACK_SIZE;
+        let image = AddressSpace::from_segments(
+            0,
+            [(
+                stack_start,
+                carrick_mem::elf::SegmentPerms {
+                    read: true,
+                    write: true,
+                    execute: false,
+                },
+                Vec::new(),
+                crate::memory::LINUX_STACK_SIZE,
+            )],
+        )
+        .expect("build canonical stack region");
+        let region = &image.regions()[0];
+        let initialized = crate::memory::LINUX_STACK_TOP - 4096;
+        let stack_len = usize::try_from(crate::memory::LINUX_STACK_SIZE).expect("stack fits host");
+
+        assert_eq!(
+            native_region_copy_window(region, Some(initialized)),
+            stack_len - 4096..stack_len
+        );
+        assert_eq!(
+            native_region_copy_window(region, None),
+            0..region.bytes().len()
+        );
+
+        let non_stack = AddressSpace::from_segments(
+            0,
+            [(
+                0x10_0000_0000,
+                carrick_mem::elf::SegmentPerms {
+                    read: true,
+                    write: false,
+                    execute: false,
+                },
+                vec![1, 2, 3, 4],
+                16 * 1024,
+            )],
+        )
+        .expect("build non-stack region");
+        assert_eq!(
+            native_region_copy_window(&non_stack.regions()[0], Some(initialized)),
+            0..non_stack.regions()[0].bytes().len()
+        );
+    }
+
+    #[test]
     fn native_linux4k_uniform_host_page_can_become_executable() {
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
