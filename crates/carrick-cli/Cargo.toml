@@ -71,6 +71,7 @@ libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+rand.workspace = true
 tokio.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
@@ -86,7 +87,6 @@ tracing-subscriber.workspace = true
 carrick-test-support = { path = "../carrick-test-support" }
 assert_cmd.workspace = true
 predicates.workspace = true
-rand.workspace = true
 tempfile.workspace = true
 bollard.workspace = true
 futures-util.workspace = true

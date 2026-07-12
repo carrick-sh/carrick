@@ -44,8 +44,8 @@ pub fn is_noisy(summary: &Summary) -> bool {
     summary.p50 > 0.0 && (summary.iqr / summary.p50) > 0.10
 }
 
-#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+#[allow(dead_code, reason = "consumed by backend-pair report evidence")]
 pub struct RatioInterval {
     pub estimate: f64,
     pub lower: f64,
@@ -53,7 +53,7 @@ pub struct RatioInterval {
     pub resamples: usize,
 }
 
-#[cfg(test)]
+#[allow(dead_code, reason = "consumed by backend-pair report evidence")]
 pub fn bootstrap_median_ratio(
     baseline: &[f64],
     candidate: &[f64],
@@ -105,8 +105,8 @@ pub fn bootstrap_median_ratio(
     })
 }
 
-#[cfg(test)]
-fn sample_median(values: &[f64]) -> Option<f64> {
+#[allow(dead_code, reason = "consumed by seeded bootstrap statistics")]
+pub fn sample_median(values: &[f64]) -> Option<f64> {
     if values.is_empty() {
         return None;
     }

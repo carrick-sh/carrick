@@ -15,7 +15,7 @@ fn cmd_stdout(program: &str, args: &[&str]) -> Option<String> {
     if s.is_empty() { None } else { Some(s) }
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct HostFacts {
     pub model: Option<String>,
     pub perf_cores: Option<String>,
