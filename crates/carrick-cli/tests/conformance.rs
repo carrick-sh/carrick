@@ -3962,6 +3962,8 @@ fn native16k_mprotect_exec_permissions_match_linux() {
     let probe = ensure_native_static_pie_probe("mprotectexec");
     let output = run_native_run_elf_with_args(&bin, &probe, "native16k", &["status"]);
     let dsr_output = run_native_dsr_run_elf_with_args(&bin, &probe, "native16k", &["jit"]);
+    let dsr_concurrent_output =
+        run_native_dsr_run_elf_with_args(&bin, &probe, "native16k", &["jit-concurrent"]);
 
     assert!(
         output.contains("status=exit status: 0")
@@ -3978,6 +3980,12 @@ fn native16k_mprotect_exec_permissions_match_linux() {
             && dsr_output.contains("jit_second_value=29")
             && dsr_output.contains("jit_thread_values_match=true"),
         "native16k DSR executed stale JIT code:\n{dsr_output}"
+    );
+    assert!(
+        dsr_concurrent_output.contains("status=exit status: 0")
+            && dsr_concurrent_output.contains("jit_concurrent_setup_ok=true")
+            && dsr_concurrent_output.contains("jit_concurrent_values_match=true"),
+        "native16k DSR concurrent first publication diverged:\n{dsr_concurrent_output}"
     );
 }
 
