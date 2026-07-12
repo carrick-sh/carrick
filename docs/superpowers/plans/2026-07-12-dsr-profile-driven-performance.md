@@ -758,7 +758,7 @@ git commit -m "perf(native): retain validated DSR prepared entries" \
 - Consumes: signed before/after binaries, `prepare_cache_improvement`, and the broad `dsr` profile.
 - Produces: accepted persistent last-entry cache, bounded four-entry fallback, or an evidence-backed stop record.
 
-- [ ] **Step 1: Freeze signed before/after binaries with provenance**
+- [x] **Step 1: Freeze signed before/after binaries with provenance**
 
 Use a detached worktree for the pre-prepare commit and copy distinct binaries to
 `target/perf/dsr-prepare-cache/{baseline,candidate}-carrick`. Record SHA-256,
@@ -766,7 +766,7 @@ inodes, commits, codesign, host, and power. Capture the two commit IDs in
 `baseline_commit` and `candidate_commit` before later harness or documentation
 commits can move `HEAD`.
 
-- [ ] **Step 2: Run the improvement gate**
+- [x] **Step 2: Run the improvement gate**
 
 ```bash
 CARRICK_DSR_BASELINE_BIN=target/perf/dsr-prepare-cache/baseline-carrick \
@@ -781,13 +781,13 @@ CARRICK_DSR_OPTIMIZATION_OUT=docs/perf-results/native-dsr-prepare-cache-v1.jsonl
 Expected for promotion: syscall-floor estimate improves by at least 1% with
 upper bound below 1.0; V8 upper bound stays at or below 1.01.
 
-- [ ] **Step 3: Re-run the broad profile and reconcile**
+- [x] **Step 3: Re-run the broad profile and reconcile**
 
 Use the exact syscall-floor command from the profiling baseline. Require at
 least 90% of the former 45,140 block-index outcomes to become resume-entry hits,
 with zero drops and incomplete pairs.
 
-- [ ] **Step 4: Apply the bounded fallback**
+- [x] **Step 4: Apply the bounded fallback**
 
 If one persistent entry misses the 90% count goal or wall gate, replace it with
 a four-entry thread-local direct map keyed by mixed guest PC and guarded by
@@ -795,11 +795,22 @@ a four-entry thread-local direct map keyed by mixed guest PC and guarded by
 `native-dsr-prepare-cache-v2.jsonl`. If v2 also fails the wall gate, record the
 area inconclusive and restore the smallest correct state.
 
-- [ ] **Step 5: Commit the decision**
+- [x] **Step 5: Commit the decision**
 
 Commit the accepted evidence and report update, or a rejection record naming
 both variants and their intervals. Promote the accepted candidate as the exec
 area's baseline.
+
+**Promotion record:** accepted the one-entry candidate at `23993da4`; the
+four-entry fallback was not run. Signed baseline `a0b22a2e` (`e38e6b04…`, inode
+22907801) and candidate (`fa8532b8…`, inode 22907932) were distinct. The
+syscall-floor p50 changed 0.705 us to 0.678 us; ratio 0.960340, interval
+0.934247–0.989146. V8 ratio was 0.996667, interval 0.992741–1.002235 against
+1.01. The complete broad profile moved 43,986 outcomes (97.4% of the old
+block-hit count) to `ResumeEntryHit`: 44,250 resume hits, 1,151 block hits, and
+23 translations. Commit `5724f9a6` also makes `--profile dsr` enable the
+required const-specialized runtime probes automatically; its exact operator
+command completed naturally with zero drops and incomplete pairs.
 
 ---
 

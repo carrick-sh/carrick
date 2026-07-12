@@ -1288,3 +1288,13 @@ reduced the direct V8 p50 from 7982.07 ms to 7883.38 ms (ratio estimate 0.9869,
 is promoted; the next target is repeated prepare lookup. Full provenance and
 samples are in `docs/perf-results/native-dsr-indirect-cache-v1.jsonl` and
 `docs/perf-results/native-dsr-indirect-cache-hit-v1.jsonl`.
+
+Second accepted optimization (2026-07-12): persistent generation-validated
+prepared entries reduced syscall-floor p50 from 0.705 us to 0.678 us (ratio
+0.9603, 95% interval 0.9342–0.9891) without regressing direct V8. The broad
+profile moved 43,986 outcomes to the typed thread-local fast path: resume hits
+rose from 264 to 44,250 and process block-index hits fell from 45,140 to 1,151.
+The candidate is promoted without the four-entry fallback. The next target is
+subdividing the 1.581 ms outer exec interval before selecting a structural
+change. Evidence is in
+`docs/perf-results/native-dsr-prepare-cache-v1.jsonl`.
