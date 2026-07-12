@@ -53,6 +53,54 @@ enum Workload {
     ForkExec,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ImprovementPolicy {
+    upper_bound: f64,
+    minimum_estimate_gain: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum BinaryGatePolicy {
+    NonInferiority { upper_bound: f64 },
+    Improvement(ImprovementPolicy),
+}
+
+impl BinaryGatePolicy {
+    const fn upper_bound(self) -> f64 {
+        match self {
+            Self::NonInferiority { upper_bound } => upper_bound,
+            Self::Improvement(policy) => policy.upper_bound,
+        }
+    }
+
+    const fn minimum_estimate_gain(self) -> Option<f64> {
+        match self {
+            Self::NonInferiority { .. } => None,
+            Self::Improvement(policy) => Some(policy.minimum_estimate_gain),
+        }
+    }
+
+    fn passes(self, interval: RatioInterval) -> bool {
+        match self {
+            Self::NonInferiority { upper_bound } => {
+                interval.lower <= 1.0 && interval.upper <= upper_bound
+            }
+            Self::Improvement(policy) => passes_improvement(interval, policy),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BinaryGate {
+    workload: Workload,
+    cycles: usize,
+    policy: BinaryGatePolicy,
+}
+
+fn passes_improvement(interval: RatioInterval, policy: ImprovementPolicy) -> bool {
+    interval.upper < policy.upper_bound && interval.estimate <= 1.0 - policy.minimum_estimate_gain
+}
+
 impl Workload {
     const fn label(self) -> &'static str {
         match self {
@@ -141,6 +189,8 @@ enum EvidenceRow {
         candidate: Summary,
         ratio: RatioInterval,
         upper_bound_limit: Option<f64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        minimum_estimate_gain: Option<f64>,
         pass: Option<bool>,
     },
 }
@@ -161,83 +211,103 @@ fn bootstrap_ratio() {
 }
 
 #[test]
+fn improvement_policy_requires_supported_nonzero_gain() {
+    let policy = ImprovementPolicy {
+        upper_bound: 1.0,
+        minimum_estimate_gain: 0.01,
+    };
+    assert!(passes_improvement(
+        RatioInterval {
+            estimate: 0.98,
+            lower: 0.97,
+            upper: 0.995,
+            resamples: 10_000,
+        },
+        policy,
+    ));
+    assert!(!passes_improvement(
+        RatioInterval {
+            estimate: 0.995,
+            lower: 0.98,
+            upper: 0.999,
+            resamples: 10_000,
+        },
+        policy,
+    ));
+    assert!(!passes_improvement(
+        RatioInterval {
+            estimate: 0.98,
+            lower: 0.96,
+            upper: 1.001,
+            resamples: 10_000,
+        },
+        policy,
+    ));
+}
+
+#[test]
 #[ignore = "explicit 30+10 ABBA signed-binary performance gate"]
 fn disabled_probe_overhead() {
-    let root = repo_root();
-    let baseline_path = required_path("CARRICK_DSR_BASELINE_BIN");
-    let candidate_path = required_path("CARRICK_DSR_CANDIDATE_BIN");
-    let output = required_path("CARRICK_DSR_OVERHEAD_OUT");
-    let baseline = binary_provenance(
-        BinaryRole::Baseline,
-        &baseline_path,
-        std::env::var("CARRICK_DSR_BASELINE_COMMIT").unwrap_or_else(|_| BASELINE_COMMIT.to_owned()),
+    run_binary_gate(
+        "disabled-probe",
+        &[
+            BinaryGate {
+                workload: Workload::SyscallFloor,
+                cycles: 15,
+                policy: BinaryGatePolicy::NonInferiority { upper_bound: 1.02 },
+            },
+            BinaryGate {
+                workload: Workload::DirectV8,
+                cycles: 5,
+                policy: BinaryGatePolicy::NonInferiority { upper_bound: 1.01 },
+            },
+        ],
+        "CARRICK_DSR_OVERHEAD_OUT",
     );
-    let candidate = binary_provenance(
-        BinaryRole::Candidate,
-        &candidate_path,
-        std::env::var("CARRICK_DSR_CANDIDATE_COMMIT")
-            .unwrap_or_else(|_| git_head().unwrap_or_else(|| "unknown".to_owned())),
-    );
-    assert_distinct_binaries(&baseline, &candidate);
+}
 
-    let mut rows = vec![EvidenceRow::Run {
-        schema: SCHEMA,
-        mode: "disabled-probe",
-        epoch_secs: epoch_secs(),
-        schedule: "ABBA",
-        bootstrap_seed: BOOTSTRAP_SEED,
-        bootstrap_resamples: BOOTSTRAP_RESAMPLES,
-        host: host_context(),
-        binaries: vec![baseline.clone(), candidate.clone()],
-    }];
-    let mut decisions = Vec::new();
-    for (workload, cycles, limit) in [
-        (Workload::SyscallFloor, 15, 1.02),
-        (Workload::DirectV8, 5, 1.01),
-    ] {
-        let collected = collect_abba(
-            "disabled-probe",
-            workload,
-            cycles,
-            &baseline_path,
-            &candidate_path,
-            BinaryRole::Baseline,
-            BinaryRole::Candidate,
-            false,
-            &root,
-            &mut rows,
-        );
-        let ratio = bootstrap_median_ratio(
-            &collected[&BinaryRole::Baseline],
-            &collected[&BinaryRole::Candidate],
-            BOOTSTRAP_SEED ^ workload_seed(workload),
-            BOOTSTRAP_RESAMPLES,
-        )
-        .expect("bootstrap disabled-probe ratio");
-        let pass = ratio.lower <= 1.0 && ratio.upper <= limit;
-        rows.push(EvidenceRow::Decision {
-            schema: SCHEMA,
-            mode: "disabled-probe",
-            workload: workload.label(),
-            unit: workload.unit(),
-            baseline_role: BinaryRole::Baseline,
-            candidate_role: BinaryRole::Candidate,
-            baseline: summarize(&collected[&BinaryRole::Baseline]).expect("baseline summary"),
-            candidate: summarize(&collected[&BinaryRole::Candidate]).expect("candidate summary"),
-            ratio,
-            upper_bound_limit: Some(limit),
-            pass: Some(pass),
-        });
-        decisions.push((workload.label(), pass, ratio, limit));
-    }
-    write_jsonl_atomic(&output, &rows);
-    for (workload, pass, ratio, limit) in decisions {
-        assert!(
-            pass,
-            "{workload} disabled-probe regression: interval [{:.6}, {:.6}], limit {limit:.3}",
-            ratio.lower, ratio.upper
-        );
-    }
+#[test]
+#[ignore = "explicit opt-in indirect-cache performance gate"]
+fn indirect_cache_improvement() {
+    run_binary_gate(
+        "indirect-cache-improvement",
+        &[BinaryGate {
+            workload: Workload::DirectV8,
+            cycles: 5,
+            policy: BinaryGatePolicy::Improvement(ImprovementPolicy {
+                upper_bound: 1.0,
+                minimum_estimate_gain: 0.01,
+            }),
+        }],
+        "CARRICK_DSR_OPTIMIZATION_OUT",
+    );
+}
+
+#[test]
+#[ignore = "explicit opt-in prepare-cache performance gate"]
+fn prepare_cache_improvement() {
+    run_binary_gate(
+        "prepare-cache-improvement",
+        &[
+            BinaryGate {
+                workload: Workload::SyscallFloor,
+                cycles: 15,
+                policy: BinaryGatePolicy::Improvement(ImprovementPolicy {
+                    upper_bound: 1.0,
+                    minimum_estimate_gain: 0.01,
+                }),
+            },
+            BinaryGate {
+                workload: Workload::DirectV8,
+                cycles: 5,
+                policy: BinaryGatePolicy::Improvement(ImprovementPolicy {
+                    upper_bound: 1.01,
+                    minimum_estimate_gain: 0.0,
+                }),
+            },
+        ],
+        "CARRICK_DSR_OPTIMIZATION_OUT",
+    );
 }
 
 #[test]
@@ -301,10 +371,95 @@ fn enabled_profile_overhead() {
             candidate: summarize(&collected[&BinaryRole::Profiled]).expect("profiled summary"),
             ratio,
             upper_bound_limit: None,
+            minimum_estimate_gain: None,
             pass: None,
         });
     }
     write_jsonl_atomic(&output, &rows);
+}
+
+fn run_binary_gate(mode: &'static str, gates: &[BinaryGate], output_env: &str) {
+    let root = repo_root();
+    let baseline_path = required_path("CARRICK_DSR_BASELINE_BIN");
+    let candidate_path = required_path("CARRICK_DSR_CANDIDATE_BIN");
+    let output = required_path(output_env);
+    let baseline_commit = std::env::var("CARRICK_DSR_BASELINE_COMMIT").unwrap_or_else(|_| {
+        if mode == "disabled-probe" {
+            BASELINE_COMMIT.to_owned()
+        } else {
+            panic!("CARRICK_DSR_BASELINE_COMMIT is required for optimization evidence")
+        }
+    });
+    let candidate_commit = std::env::var("CARRICK_DSR_CANDIDATE_COMMIT").unwrap_or_else(|_| {
+        if mode == "disabled-probe" {
+            git_head().unwrap_or_else(|| "unknown".to_owned())
+        } else {
+            panic!("CARRICK_DSR_CANDIDATE_COMMIT is required for optimization evidence")
+        }
+    });
+    let baseline = binary_provenance(BinaryRole::Baseline, &baseline_path, baseline_commit);
+    let candidate = binary_provenance(BinaryRole::Candidate, &candidate_path, candidate_commit);
+    assert_distinct_binaries(&baseline, &candidate);
+
+    let mut rows = vec![EvidenceRow::Run {
+        schema: SCHEMA,
+        mode,
+        epoch_secs: epoch_secs(),
+        schedule: "ABBA",
+        bootstrap_seed: BOOTSTRAP_SEED,
+        bootstrap_resamples: BOOTSTRAP_RESAMPLES,
+        host: host_context(),
+        binaries: vec![baseline, candidate],
+    }];
+    let mut decisions = Vec::new();
+    for gate in gates {
+        let collected = collect_abba(
+            mode,
+            gate.workload,
+            gate.cycles,
+            &baseline_path,
+            &candidate_path,
+            BinaryRole::Baseline,
+            BinaryRole::Candidate,
+            false,
+            &root,
+            &mut rows,
+        );
+        let ratio = bootstrap_median_ratio(
+            &collected[&BinaryRole::Baseline],
+            &collected[&BinaryRole::Candidate],
+            BOOTSTRAP_SEED ^ workload_seed(gate.workload),
+            BOOTSTRAP_RESAMPLES,
+        )
+        .expect("bootstrap signed-binary ratio");
+        let pass = gate.policy.passes(ratio);
+        rows.push(EvidenceRow::Decision {
+            schema: SCHEMA,
+            mode,
+            workload: gate.workload.label(),
+            unit: gate.workload.unit(),
+            baseline_role: BinaryRole::Baseline,
+            candidate_role: BinaryRole::Candidate,
+            baseline: summarize(&collected[&BinaryRole::Baseline]).expect("baseline summary"),
+            candidate: summarize(&collected[&BinaryRole::Candidate]).expect("candidate summary"),
+            ratio,
+            upper_bound_limit: Some(gate.policy.upper_bound()),
+            minimum_estimate_gain: gate.policy.minimum_estimate_gain(),
+            pass: Some(pass),
+        });
+        decisions.push((gate.workload, gate.policy, pass, ratio));
+    }
+    write_jsonl_atomic(&output, &rows);
+    for (workload, policy, pass, ratio) in decisions {
+        assert!(
+            pass,
+            "{} {mode} failed: estimate {:.6}, interval [{:.6}, {:.6}], policy {policy:?}",
+            workload.label(),
+            ratio.estimate,
+            ratio.lower,
+            ratio.upper,
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
