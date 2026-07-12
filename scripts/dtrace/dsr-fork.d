@@ -9,6 +9,8 @@ BEGIN
     self->exec_reset_active = 0;
     self->exec_first_active = 0;
     self->exec_subphase_active = 0;
+    self->exec_map_active = 0;
+    self->exec_map_detail_active = 0;
 }
 
 proc:::exit
@@ -204,6 +206,137 @@ carrick*:::dsr-prepare-begin
     self->exec_first_active = 0;
 }
 
+/* Phases 15..24: repeated details nested inside exec image mapping. */
+carrick*:::dsr-cache-lifecycle
+/(pid == $target || progenyof($target)) && arg1 == 7/
+{
+    self->exec_map_active = 1;
+    self->exec_map_mmap_total = 0;
+    self->exec_map_copy_total = 0;
+    self->exec_map_icache_total = 0;
+    self->exec_map_protect_total = 0;
+    self->exec_map_vvar_total = 0;
+    @exec_map_detail_outer_open[pid, arg0] = sum(1);
+}
+
+carrick*:::dsr-cache-lifecycle
+/(pid == $target || progenyof($target)) &&
+ (arg1 == 15 || arg1 == 17 || arg1 == 19 || arg1 == 21 || arg1 == 23) &&
+ self->exec_map_detail_active/
+{
+    @exec_map_detail_overwrite[pid, arg0, arg1] = count();
+}
+
+carrick*:::dsr-cache-lifecycle
+/(pid == $target || progenyof($target)) && arg1 == 15 && !self->exec_map_detail_active/
+{
+    @exec_map_mmap_open[pid, arg0] = sum(1);
+}
+
+carrick*:::dsr-cache-lifecycle
+/(pid == $target || progenyof($target)) && arg1 == 17 && !self->exec_map_detail_active/
+{
+    @exec_map_copy_open[pid, arg0] = sum(1);
+}
+
+carrick*:::dsr-cache-lifecycle
+/(pid == $target || progenyof($target)) && arg1 == 19 && !self->exec_map_detail_active/
+{
+    @exec_map_icache_open[pid, arg0] = sum(1);
+}
+
+carrick*:::dsr-cache-lifecycle
+/(pid == $target || progenyof($target)) && arg1 == 21 && !self->exec_map_detail_active/
+{
+    @exec_map_protect_open[pid, arg0] = sum(1);
+}
+
+carrick*:::dsr-cache-lifecycle
+/(pid == $target || progenyof($target)) && arg1 == 23 && !self->exec_map_detail_active/
+{
+    @exec_map_vvar_open[pid, arg0] = sum(1);
+}
+
+carrick*:::dsr-cache-lifecycle
+/(pid == $target || progenyof($target)) &&
+ (arg1 == 15 || arg1 == 17 || arg1 == 19 || arg1 == 21 || arg1 == 23)/
+{
+    self->exec_map_detail_active = 1;
+    self->exec_map_detail_started = timestamp;
+    self->exec_map_detail_phase = arg1;
+    self->exec_map_detail_tid = arg0;
+}
+
+carrick*:::dsr-cache-lifecycle
+/(pid == $target || progenyof($target)) &&
+ (arg1 == 16 || arg1 == 18 || arg1 == 20 || arg1 == 22 || arg1 == 24) &&
+ (!self->exec_map_detail_active || self->exec_map_detail_phase + 1 != arg1)/
+{
+    @exec_map_detail_missing_begin[pid, arg0, arg1] = count();
+}
+
+carrick*:::dsr-cache-lifecycle
+/(pid == $target || progenyof($target)) && arg1 == 16 &&
+ self->exec_map_detail_active && self->exec_map_detail_phase == 15/
+{
+    self->exec_map_mmap_total += timestamp - self->exec_map_detail_started;
+    @exec_map_mmap_open[pid, self->exec_map_detail_tid] = sum(-1);
+    self->exec_map_detail_active = 0;
+}
+
+carrick*:::dsr-cache-lifecycle
+/(pid == $target || progenyof($target)) && arg1 == 18 &&
+ self->exec_map_detail_active && self->exec_map_detail_phase == 17/
+{
+    self->exec_map_copy_total += timestamp - self->exec_map_detail_started;
+    @exec_map_copy_open[pid, self->exec_map_detail_tid] = sum(-1);
+    self->exec_map_detail_active = 0;
+}
+
+carrick*:::dsr-cache-lifecycle
+/(pid == $target || progenyof($target)) && arg1 == 20 &&
+ self->exec_map_detail_active && self->exec_map_detail_phase == 19/
+{
+    self->exec_map_icache_total += timestamp - self->exec_map_detail_started;
+    @exec_map_icache_open[pid, self->exec_map_detail_tid] = sum(-1);
+    self->exec_map_detail_active = 0;
+}
+
+carrick*:::dsr-cache-lifecycle
+/(pid == $target || progenyof($target)) && arg1 == 22 &&
+ self->exec_map_detail_active && self->exec_map_detail_phase == 21/
+{
+    self->exec_map_protect_total += timestamp - self->exec_map_detail_started;
+    @exec_map_protect_open[pid, self->exec_map_detail_tid] = sum(-1);
+    self->exec_map_detail_active = 0;
+}
+
+carrick*:::dsr-cache-lifecycle
+/(pid == $target || progenyof($target)) && arg1 == 24 &&
+ self->exec_map_detail_active && self->exec_map_detail_phase == 23/
+{
+    self->exec_map_vvar_total += timestamp - self->exec_map_detail_started;
+    @exec_map_vvar_open[pid, self->exec_map_detail_tid] = sum(-1);
+    self->exec_map_detail_active = 0;
+}
+
+carrick*:::dsr-cache-lifecycle
+/(pid == $target || progenyof($target)) && arg1 == 8 && self->exec_map_active/
+{
+    printf("DSRPROF1|sample|phase=exec-map-mmap|pid=%d|tid=%d|duration_ns=%d\n",
+        pid, arg0, self->exec_map_mmap_total);
+    printf("DSRPROF1|sample|phase=exec-map-copy|pid=%d|tid=%d|duration_ns=%d\n",
+        pid, arg0, self->exec_map_copy_total);
+    printf("DSRPROF1|sample|phase=exec-map-icache|pid=%d|tid=%d|duration_ns=%d\n",
+        pid, arg0, self->exec_map_icache_total);
+    printf("DSRPROF1|sample|phase=exec-map-protect|pid=%d|tid=%d|duration_ns=%d\n",
+        pid, arg0, self->exec_map_protect_total);
+    printf("DSRPROF1|sample|phase=exec-map-vvar|pid=%d|tid=%d|duration_ns=%d\n",
+        pid, arg0, self->exec_map_vvar_total);
+    @exec_map_detail_outer_open[pid, arg0] = sum(-1);
+    self->exec_map_active = 0;
+}
+
 /* Phases 5..14: non-overlapping exec replacement subphases. */
 carrick*:::dsr-cache-lifecycle
 /(pid == $target || progenyof($target)) &&
@@ -350,6 +483,14 @@ END
     printa("DSRPROF1|incomplete|phase=exec-cache-reset|pid=%d|tid=%d|kind=open|value=%@d\n", @exec_cache_reset_open);
     printa("DSRPROF1|incomplete|phase=exec-relocation|pid=%d|tid=%d|kind=open|value=%@d\n", @exec_relocation_open);
     printa("DSRPROF1|incomplete|phase=exec-translator-handoff|pid=%d|tid=%d|kind=open|value=%@d\n", @exec_translator_handoff_open);
+    printa("DSRPROF1|incomplete|phase=exec-map-accounting|pid=%d|tid=%d|kind=open|value=%@d\n", @exec_map_detail_outer_open);
+    printa("DSRPROF1|incomplete|phase=exec-map-mmap|pid=%d|tid=%d|kind=open|value=%@d\n", @exec_map_mmap_open);
+    printa("DSRPROF1|incomplete|phase=exec-map-copy|pid=%d|tid=%d|kind=open|value=%@d\n", @exec_map_copy_open);
+    printa("DSRPROF1|incomplete|phase=exec-map-icache|pid=%d|tid=%d|kind=open|value=%@d\n", @exec_map_icache_open);
+    printa("DSRPROF1|incomplete|phase=exec-map-protect|pid=%d|tid=%d|kind=open|value=%@d\n", @exec_map_protect_open);
+    printa("DSRPROF1|incomplete|phase=exec-map-vvar|pid=%d|tid=%d|kind=open|value=%@d\n", @exec_map_vvar_open);
+    printa("DSRPROF1|incomplete|phase=exec-map-detail|pid=%d|tid=%d|kind=overwrite-%d|value=%@d\n", @exec_map_detail_overwrite);
+    printa("DSRPROF1|incomplete|phase=exec-map-detail|pid=%d|tid=%d|kind=missing-begin-%d|value=%@d\n", @exec_map_detail_missing_begin);
     printa("DSRPROF1|incomplete|phase=exec-subphase|pid=%d|tid=%d|kind=overwrite-%d|value=%@d\n", @exec_subphase_overwrite);
     printa("DSRPROF1|incomplete|phase=exec-subphase|pid=%d|tid=%d|kind=missing-begin-%d|value=%@d\n", @exec_subphase_missing_begin);
     printf("DSRPROF1|complete|profile=dsr-fork|bounded=%d|target_exit_reason=%d\n",
