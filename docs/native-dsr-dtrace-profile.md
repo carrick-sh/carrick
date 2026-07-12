@@ -214,6 +214,22 @@ translator installation. It includes mapping, protection, relocation, and
 handoff work in addition to cache reset. It is a real long pole, but it must be
 subdivided before selecting an implementation.
 
+The added non-overlapping exec subphases then produced two complete 220-exec
+runs. Image mapping/protection/vvar was stable at 61.7% and 61.8% of outer
+time, with cache reset second at 26.7% and 27.0%; every other named phase was
+below 6%. This selected image mapping for the first fixed-gate experiment.
+
+Skipping the two host I-cache publications for DSR source mappings produced a
+real but insufficient effect. Across matching complete profiles,
+`exec-image-map` p50 moved from 1.0439 ms to 1.0073 ms (ratio 0.9649, 3.5%
+gain), while outer `exec-reset` moved from 1.6990 ms to 1.6683 ms (ratio
+0.9819, 1.8% gain). Outer p95 was effectively flat/slightly worse at ratio
+1.0020. Both missed the precommitted 10% gates, so the cache publications were
+restored. This narrows the next mapping profile: `mmap`, byte copy, cache
+publication, final protection, and vvar work must be separated before another
+structural change. Compact provenance and results are in
+[`native-dsr-exec-icache-v1.jsonl`](perf-results/native-dsr-exec-icache-v1.jsonl).
+
 ## Instrumentation overhead
 
 The disabled-probe gate compares distinct signed binaries in fixed ABBA order

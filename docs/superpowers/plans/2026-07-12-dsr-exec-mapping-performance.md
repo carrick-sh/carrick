@@ -131,14 +131,14 @@ why DSR source mappings are never instruction-fetch targets and name the tests.
 **Files:**
 - No source changes unless a real correctness failure is found.
 
-- [ ] **Step 1: Build and verify the signed candidate**
+- [x] **Step 1: Build and verify the signed candidate**
 
 ```bash
 just build
 otool -l target/release/carrick | grep -A2 __dof_carrick
 ```
 
-- [ ] **Step 2: Run direct signed workloads**
+- [x] **Step 2: Run direct signed workloads**
 
 Use the already-built, provenance-recorded workload artifacts; do not rebuild
 them between baseline and candidate. Run the Rust static PIE fork/exec probe,
@@ -190,7 +190,12 @@ Stamp every direct run and use `scripts/sudo/kill.sh <run-id>` only if its run
 does not exit naturally. Expected: all retain their success markers and exit
 zero.
 
-- [ ] **Step 3: Confirm the semantic-oracle boundary**
+**Decision note:** the fixed timing gate failed before this campaign was
+needed. Focused unit, generation, signal/fault, clippy, signed build, and the
+profile workload were green; the broader signed workload campaign was not run
+for a candidate that could not be promoted.
+
+- [x] **Step 3: Confirm the semantic-oracle boundary**
 
 Do not claim a new Linux syscall-shape result from this experiment: it changes
 only Darwin host I-cache maintenance after bytes have already been copied. The
@@ -208,7 +213,7 @@ separate Docker-only phase before diagnosing Carrick.
 - Modify: `docs/superpowers/plans/2026-07-12-dsr-exec-mapping-performance.md`
 - Modify: `docs/superpowers/plans/2026-07-12-dsr-profile-driven-performance.md`
 
-- [ ] **Step 1: Freeze signed before/after binaries**
+- [x] **Step 1: Freeze signed before/after binaries**
 
 The host sudoers rule authorizes only this worktree's canonical
 `target/release/carrick`, so trace each build from that path rather than trying
@@ -220,7 +225,7 @@ The baseline release binary must be built from the red-test commit; tests do
 not alter release code, so an already-signed binary from its runtime parent is
 valid only when its hash and source commit are recorded explicitly.
 
-- [ ] **Step 2: Run matching 220-exec profiles**
+- [x] **Step 2: Run matching 220-exec profiles**
 
 Use the exact `perf_fork_exec` `dsr-fork` command from the selection evidence.
 Require `target_exit_reason=1`, 220 samples for outer and every subphase, zero
@@ -228,7 +233,7 @@ drops/incomplete pairs, and exact per-pid/tid reconciliation. Store compact
 before/after summaries plus source-profile SHA-256 values in
 `native-dsr-exec-icache-v1.jsonl`.
 
-- [ ] **Step 3: Apply the fixed decision**
+- [x] **Step 3: Apply the fixed decision**
 
 Pass only when:
 
@@ -240,7 +245,12 @@ Pass only when:
 If the decision passes, promote. If it fails, restore the two calls in a normal
 follow-up commit and publish the rejection evidence; do not move the 10% rule.
 
-- [ ] **Step 4: Commit the decision**
+**Observed:** image-map p50 ratio 0.9649 (3.5% gain) and outer exec-reset
+p50 ratio 0.9819 (1.8% gain), with outer p95 ratio 1.0020. Both p50 gates fail.
+The two calls are restored and the rejection is recorded in
+`docs/perf-results/native-dsr-exec-icache-v1.jsonl`.
+
+- [x] **Step 4: Commit the decision**
 
 Use `perf(native): promote DSR exec mapping` for a pass or
 `docs(native): reject DSR exec icache experiment` for a failure. Include exact
