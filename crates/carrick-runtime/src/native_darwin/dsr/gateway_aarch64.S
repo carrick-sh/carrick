@@ -101,6 +101,11 @@ _carrick_dsr_enter_raw:
     ldp x25, x26, [x10, #48]
     ldp x27, x28, [x10, #64]
     ldp x29, x30, [x10, #80]
+    cmp w0, #1
+    b.ne 8f
+    ldr w0, [x9, #CTX_EXIT_STATUS]
+    ret
+8:
     mov w0, #-1
     ret
 
