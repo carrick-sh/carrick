@@ -397,9 +397,18 @@ fn perf_gate() {
         eprintln!("SKIP perf_gate: Docker not reachable");
         return;
     }
-    // All probes built?
+    // Optional subset: CARRICK_PERF_FILTER=<substr> runs only matching workloads.
+    // Apply it to the availability check too, so a focused DSR measurement is
+    // not skipped because an unrelated probe family has not been built.
+    let filter = std::env::var("CARRICK_PERF_FILTER").ok();
+    // All selected probes built?
     for case in CASES {
         if !case_runnable(case) {
+            continue;
+        }
+        if let Some(f) = &filter
+            && !case.workload.contains(f.as_str())
+        {
             continue;
         }
         if !probe_path(&root, case).exists() {
@@ -416,8 +425,6 @@ fn perf_gate() {
     }
     ensure_signed(&root, &bin);
 
-    // Optional subset: CARRICK_PERF_FILTER=<substr> runs only matching workloads.
-    let filter = std::env::var("CARRICK_PERF_FILTER").ok();
     let date = today_string();
     for case in CASES {
         if !case_runnable(case) {

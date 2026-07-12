@@ -119,6 +119,32 @@ pub fn run_carrick(
         !mount || fs_mode == "host",
         "bind-mount perf cases require carrick --fs host"
     );
+    let direct_native_dsr = !mount
+        && std::env::var("CARRICK_EXEC_BACKEND").is_ok_and(|value| value == "native")
+        && std::env::var("CARRICK_NATIVE_CODE_MODE").is_ok_and(|value| value == "dsr");
+    if direct_native_dsr {
+        let probe_path = probe.to_string_lossy().into_owned();
+        let child = Command::new(bin)
+            .args([
+                "run-elf",
+                "--raw",
+                "--exec-backend",
+                "native",
+                "--native-page-profile",
+                "native16k",
+                "--native-code-mode",
+                "dsr",
+                &probe_path,
+            ])
+            .env("CARRICK_RUN_ID", run_id)
+            .env("CARRICK_EXPOSED_CPUS", CPU_PIN.to_string())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .expect("spawn native DSR perf probe");
+        return drain_with_deadline(child, repo_root, run_id);
+    }
     if fs_mode == "memory" {
         let probe_path = probe.to_string_lossy().into_owned();
         let child = Command::new(bin)
