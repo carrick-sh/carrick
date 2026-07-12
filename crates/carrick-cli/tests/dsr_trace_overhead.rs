@@ -17,7 +17,6 @@ use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 
 const SCHEMA: &str = "carrick.dsr-overhead.v1";
-const BASELINE_COMMIT: &str = "fcd17c14a9046929f9602ec9d81580d2d3317287";
 const BOOTSTRAP_SEED: u64 = 0x4453_522d_4f56_4844;
 const BOOTSTRAP_RESAMPLES: usize = 10_000;
 const V8_IMAGE: &str = "localhost:5005/carrick-nodejs-conformance:24.16.0-26.2.0";
@@ -269,6 +268,17 @@ fn relative_gate_paths_are_workspace_relative() {
 }
 
 #[test]
+fn performance_surface_has_no_implicit_legacy_comparison() {
+    let source = include_str!("dsr_trace_overhead.rs");
+    let legacy_entrypoint = ["disabled_probe_", "overhead"].concat();
+    let hard_coded_commit = ["const BASELINE_", "COMMIT"].concat();
+    let legacy_mode = ["disabled-", "probe"].concat();
+    assert!(!source.contains(&legacy_entrypoint));
+    assert!(!source.contains(&hard_coded_commit));
+    assert!(!source.contains(&legacy_mode));
+}
+
+#[test]
 fn monomorphic_indirect_gate_uses_the_static_pie_probe() {
     let root = Path::new("/workspace/carrick");
     let args = workload_args(Workload::MonomorphicIndirect, root, "mono");
@@ -302,27 +312,6 @@ fn gateway_gate_uses_scalar_and_simd_metrics_from_static_pie() {
             ),
         );
     }
-}
-
-#[test]
-#[ignore = "explicit 30+10 ABBA signed-binary performance gate"]
-fn disabled_probe_overhead() {
-    run_binary_gate(
-        "disabled-probe",
-        &[
-            BinaryGate {
-                workload: Workload::SyscallFloor,
-                cycles: 15,
-                policy: BinaryGatePolicy::NonInferiority { upper_bound: 1.02 },
-            },
-            BinaryGate {
-                workload: Workload::DirectV8,
-                cycles: 5,
-                policy: BinaryGatePolicy::NonInferiority { upper_bound: 1.01 },
-            },
-        ],
-        "CARRICK_DSR_OVERHEAD_OUT",
-    );
 }
 
 #[test]
@@ -533,20 +522,10 @@ fn run_binary_gate(mode: &'static str, gates: &[BinaryGate], output_env: &str) {
     let baseline_path = required_path("CARRICK_DSR_BASELINE_BIN");
     let candidate_path = required_path("CARRICK_DSR_CANDIDATE_BIN");
     let output = required_path(output_env);
-    let baseline_commit = std::env::var("CARRICK_DSR_BASELINE_COMMIT").unwrap_or_else(|_| {
-        if mode == "disabled-probe" {
-            BASELINE_COMMIT.to_owned()
-        } else {
-            panic!("CARRICK_DSR_BASELINE_COMMIT is required for optimization evidence")
-        }
-    });
-    let candidate_commit = std::env::var("CARRICK_DSR_CANDIDATE_COMMIT").unwrap_or_else(|_| {
-        if mode == "disabled-probe" {
-            git_head().unwrap_or_else(|| "unknown".to_owned())
-        } else {
-            panic!("CARRICK_DSR_CANDIDATE_COMMIT is required for optimization evidence")
-        }
-    });
+    let baseline_commit = std::env::var("CARRICK_DSR_BASELINE_COMMIT")
+        .expect("CARRICK_DSR_BASELINE_COMMIT is required for optimization evidence");
+    let candidate_commit = std::env::var("CARRICK_DSR_CANDIDATE_COMMIT")
+        .expect("CARRICK_DSR_CANDIDATE_COMMIT is required for optimization evidence");
     let baseline = binary_provenance(BinaryRole::Baseline, &baseline_path, baseline_commit);
     let candidate = binary_provenance(BinaryRole::Candidate, &candidate_path, candidate_commit);
     assert_distinct_binaries(&baseline, &candidate);
