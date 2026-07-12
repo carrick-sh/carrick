@@ -2189,6 +2189,21 @@ fn run_native_dsr_thread_loop(
                     resume,
                 )?;
             }
+            DispatchOutcome::SignalThread {
+                tid: target,
+                signum,
+            } => {
+                let value = thread_runtime.signal_thread(target, signum);
+                snapshot = complete_dsr_syscall(
+                    &dispatcher,
+                    &memory,
+                    snapshot,
+                    thread_runtime.tid(),
+                    request.number.raw(),
+                    value,
+                    resume,
+                )?;
+            }
             other => {
                 return Err(RuntimeError::Unsupported(format!(
                     "native DSR Task 5 does not yet support dispatcher outcome {other:?}"
