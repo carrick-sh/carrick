@@ -360,6 +360,23 @@ fn prepare_cache_improvement() {
 }
 
 #[test]
+#[ignore = "explicit opt-in initialized-stack copy performance gate"]
+fn stack_window_improvement() {
+    run_binary_gate(
+        "stack-window-improvement",
+        &[BinaryGate {
+            workload: Workload::ForkExec,
+            cycles: 5,
+            policy: BinaryGatePolicy::Improvement(ImprovementPolicy {
+                upper_bound: 0.95,
+                minimum_estimate_gain: 0.10,
+            }),
+        }],
+        "CARRICK_DSR_OPTIMIZATION_OUT",
+    );
+}
+
+#[test]
 #[ignore = "explicit opt-in DTrace profile cost measurement"]
 fn enabled_profile_overhead() {
     let root = repo_root();
