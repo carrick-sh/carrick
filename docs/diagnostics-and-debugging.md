@@ -71,7 +71,9 @@ For performance attribution on the Darwin-native dynamic syscall rewriter, use
 `--summary-jsonl FILE`. The broad profile measures prepare/run/resolve/translate
 and dispatcher phases, the indirect profile attributes resolver misses by
 guest source and target, and the fork profile measures child repair and exec
-lifecycle intervals. `--profile` conflicts with a custom `--script`;
+lifecycle intervals. DSR is the sole Darwin-native instruction-execution path,
+so native trace commands require no separate code-mode selection. `--profile`
+conflicts with a custom `--script`;
 `--summary-jsonl` requires a profile. Use a separate `--trace-out` path when the
 raw `DSRPROF1` stream should be retained.
 
