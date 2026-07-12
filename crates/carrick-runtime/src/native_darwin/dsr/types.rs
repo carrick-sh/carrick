@@ -3,10 +3,14 @@
 use carrick_guest_mem::{GuestVa, HostVa};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(super) struct CodeGeneration(u64);
+pub(in crate::native_darwin) struct CodeGeneration(u64);
 
 impl CodeGeneration {
     pub(super) const INITIAL: Self = Self(0);
+
+    pub(super) const fn claimed(value: u64) -> Self {
+        Self(value)
+    }
 
     pub(super) fn next(self) -> Option<Self> {
         self.0.checked_add(1).map(Self)
@@ -213,6 +217,14 @@ pub(in crate::native_darwin) enum DsrError {
     Gateway(String),
     #[error("DSR cache policy error: {0}")]
     CachePolicy(String),
+    #[error(
+        "DSR executable page 0x{page:x} changed generation: expected {expected:?}, observed {observed:?}"
+    )]
+    GenerationChanged {
+        page: u64,
+        expected: u64,
+        observed: u64,
+    },
     #[error("DSR host operation {operation} failed: {error}")]
     Host {
         operation: &'static str,
