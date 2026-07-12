@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use carrick_observability::probes;
 use parking_lot::Mutex;
 
 pub(super) mod block;
@@ -47,6 +48,7 @@ pub(super) struct PreparedExit {
 
 pub(super) struct ThreadTranslator {
     process: Arc<ProcessTranslator>,
+    tid: i32,
     resume_entry: Option<(
         carrick_guest_mem::GuestVa,
         types::CodeGeneration,
@@ -73,6 +75,22 @@ struct ProcessState {
     dependencies: cache::PageBlockDependencies,
     publications: cache::ConcurrentPublicationIndex,
     profiling: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TranslationOutcome {
+    BlockIndexHit,
+    Translated,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TranslationResult {
+    entry: types::CacheVa,
+    generation: types::CodeGeneration,
+    outcome: TranslationOutcome,
+    emitted_bytes: u64,
+    cache_used_bytes: u64,
+    cache_capacity_bytes: u64,
 }
 
 struct PublishedBlock {
@@ -118,14 +136,16 @@ pub(super) struct ProfileSnapshot {
 impl ThreadTranslator {
     #[cfg(test)]
     pub(super) fn new(capacity: usize) -> Result<Self, types::DsrError> {
-        Ok(Self::for_process(Arc::new(ProcessTranslator::new(
-            capacity,
-        )?)))
+        Ok(Self::for_process(
+            Arc::new(ProcessTranslator::new(capacity)?),
+            0,
+        ))
     }
 
-    pub(super) fn for_process(process: Arc<ProcessTranslator>) -> Self {
+    pub(super) fn for_process(process: Arc<ProcessTranslator>, tid: i32) -> Self {
         Self {
             process,
+            tid,
             resume_entry: None,
             indirect_cache: gateway::IndirectTargetCache::new(),
             stats: ResolverStats::default(),
@@ -135,11 +155,38 @@ impl ThreadTranslator {
     }
 
     pub(super) fn after_fork_child(&mut self) {
+        let (used_bytes, block_count, generation_count) = self.process.lifecycle_snapshot();
+        probes::dsr_cache_lifecycle(
+            probes::DsrCacheRole::Child,
+            probes::DsrCacheLifecyclePhase::ForkChildRepairBegin,
+            used_bytes,
+            block_count,
+            generation_count,
+        );
         self.process.after_fork_child();
         self.resume_entry = None;
         self.indirect_cache.clear();
         self.stats = ResolverStats::default();
         self.last_kick = None;
+        let (used_bytes, block_count, generation_count) = self.process.lifecycle_snapshot();
+        probes::dsr_cache_lifecycle(
+            probes::DsrCacheRole::Child,
+            probes::DsrCacheLifecyclePhase::ForkChildRepairEnd,
+            used_bytes,
+            block_count,
+            generation_count,
+        );
+    }
+
+    pub(super) fn begin_exec_reset(&self) {
+        let (used_bytes, block_count, generation_count) = self.process.lifecycle_snapshot();
+        probes::dsr_cache_lifecycle(
+            probes::DsrCacheRole::Common,
+            probes::DsrCacheLifecyclePhase::ExecResetBegin,
+            used_bytes,
+            block_count,
+            generation_count,
+        );
     }
 
     pub(super) fn reset_for_exec(&mut self, next: Arc<ProcessTranslator>) {
@@ -148,6 +195,14 @@ impl ThreadTranslator {
         self.indirect_cache.clear();
         self.stats = ResolverStats::default();
         self.last_kick = None;
+        let (used_bytes, block_count, generation_count) = self.process.lifecycle_snapshot();
+        probes::dsr_cache_lifecycle(
+            probes::DsrCacheRole::Common,
+            probes::DsrCacheLifecyclePhase::ExecResetEnd,
+            used_bytes,
+            block_count,
+            generation_count,
+        );
     }
 
     pub(super) fn profile_snapshot(&self) -> ProfileSnapshot {
@@ -220,6 +275,15 @@ impl ProcessTranslator {
         })
     }
 
+    fn lifecycle_snapshot(&self) -> (u64, u64, u64) {
+        let state = self.state.lock();
+        (
+            u64::try_from(state.cache.used_bytes()).unwrap_or(u64::MAX),
+            u64::try_from(state.blocks.len()).unwrap_or(u64::MAX),
+            u64::try_from(state.dependencies.page_count()).unwrap_or(u64::MAX),
+        )
+    }
+
     fn after_fork_child(&self) {
         let state = self.state.lock();
         state.cache.after_fork_child();
@@ -243,9 +307,10 @@ impl ProcessTranslator {
 impl ProcessState {
     fn translate(
         &mut self,
+        tid: i32,
         memory: &super::NativeMappedMemory,
         guest: carrick_guest_mem::GuestVa,
-    ) -> Result<(types::CacheVa, types::CodeGeneration), types::DsrError> {
+    ) -> Result<TranslationResult, types::DsrError> {
         let observation = memory.dsr_generation_observation(guest)?;
         let source_page = observation.page();
         let generation = observation.expected();
@@ -258,6 +323,14 @@ impl ProcessState {
         }
         for stale in stale_blocks {
             self.blocks.remove(&stale);
+            probes::dsr_cache_event(
+                tid,
+                probes::DsrCacheEventKind::Invalidate,
+                stale.0.raw(),
+                stale.1.get(),
+                u64::try_from(self.cache.used_bytes()).unwrap_or(u64::MAX),
+                u64::try_from(self.cache.capacity_bytes()).unwrap_or(u64::MAX),
+            );
         }
         let key = (guest, generation);
         if self.profiling {
@@ -267,89 +340,169 @@ impl ProcessState {
             if self.profiling {
                 self.stats.cache_lookup_hits = self.stats.cache_lookup_hits.saturating_add(1);
             }
-            return Ok((*entry, generation));
+            probes::dsr_cache_event(
+                tid,
+                probes::DsrCacheEventKind::BlockHit,
+                guest.raw(),
+                generation.get(),
+                u64::try_from(self.cache.used_bytes()).unwrap_or(u64::MAX),
+                u64::try_from(self.cache.capacity_bytes()).unwrap_or(u64::MAX),
+            );
+            return Ok(TranslationResult {
+                entry: *entry,
+                generation,
+                outcome: TranslationOutcome::BlockIndexHit,
+                emitted_bytes: 0,
+                cache_used_bytes: u64::try_from(self.cache.used_bytes()).unwrap_or(u64::MAX),
+                cache_capacity_bytes: u64::try_from(self.cache.capacity_bytes())
+                    .unwrap_or(u64::MAX),
+            });
         }
+        probes::dsr_cache_event(
+            tid,
+            probes::DsrCacheEventKind::BlockMiss,
+            guest.raw(),
+            generation.get(),
+            u64::try_from(self.cache.used_bytes()).unwrap_or(u64::MAX),
+            u64::try_from(self.cache.capacity_bytes()).unwrap_or(u64::MAX),
+        );
+        probes::dsr_translate_begin(tid, guest.raw(), generation.get());
         let translation_started = self.profiling.then(std::time::Instant::now);
-        let block = block::plan_block(memory, guest, generation, 256)?;
-        if observation.current() != generation {
-            return Err(types::DsrError::GenerationChanged {
-                page: guest.raw(),
-                expected: generation.get(),
-                observed: observation.current().get(),
+        let result = (|| -> Result<TranslationResult, types::DsrError> {
+            let block = block::plan_block(memory, guest, generation, 256)?;
+            if observation.current() != generation {
+                return Err(types::DsrError::GenerationChanged {
+                    page: guest.raw(),
+                    expected: generation.get(),
+                    observed: observation.current().get(),
+                });
+            }
+            if let block::PlannedExit::Sensitive {
+                guest: sensitive_guest,
+                exit,
+                ..
+            } = block.exit
+            {
+                self.sensitive.insert((sensitive_guest, generation), exit);
+            }
+            if let block::PlannedExit::Unsupported {
+                guest: unsupported_guest,
+                word,
+                op,
+            } = block.exit
+            {
+                self.unsupported
+                    .insert((unsupported_guest, generation), (word, op));
+            }
+            let emitted = emit::emit_block_with_generation(
+                &mut self.cache,
+                &block,
+                emit::GenerationGuard::new(observation.current_atomic(), generation),
+            )?;
+            let emitted_bytes = u64::try_from(emitted.len()).unwrap_or(u64::MAX);
+            probes::dsr_cache_event(
+                tid,
+                probes::DsrCacheEventKind::BlockPublish,
+                guest.raw(),
+                generation.get(),
+                u64::try_from(self.cache.used_bytes()).unwrap_or(u64::MAX),
+                u64::try_from(self.cache.capacity_bytes()).unwrap_or(u64::MAX),
+            );
+            if observation.current() != generation {
+                return Err(types::DsrError::GenerationChanged {
+                    page: guest.raw(),
+                    expected: generation.get(),
+                    observed: observation.current().get(),
+                });
+            }
+            if let Some(started) = translation_started {
+                self.stats.translation_ns = self.stats.translation_ns.saturating_add(
+                    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                );
+            }
+            self.stats.translations = self.stats.translations.saturating_add(1);
+            let entry = emitted.entry();
+            let published_entry = self.publications.get_or_publish(key, || entry);
+            if published_entry != entry {
+                self.stats.duplicate_publications =
+                    self.stats.duplicate_publications.saturating_add(1);
+                return Ok(TranslationResult {
+                    entry: published_entry,
+                    generation,
+                    outcome: TranslationOutcome::Translated,
+                    emitted_bytes,
+                    cache_used_bytes: u64::try_from(self.cache.used_bytes()).unwrap_or(u64::MAX),
+                    cache_capacity_bytes: u64::try_from(self.cache.capacity_bytes())
+                        .unwrap_or(u64::MAX),
+                });
+            }
+            self.published.push(PublishedBlock {
+                entry,
+                len: emitted.len(),
+                map: emitted.map().entries().to_vec(),
+                recovery: emitted.recovery().to_vec(),
+                _generation: observation,
             });
-        }
-        if let block::PlannedExit::Sensitive {
-            guest: sensitive_guest,
-            exit,
-            ..
-        } = block.exit
-        {
-            self.sensitive.insert((sensitive_guest, generation), exit);
-        }
-        if let block::PlannedExit::Unsupported {
-            guest: unsupported_guest,
-            word,
-            op,
-        } = block.exit
-        {
-            self.unsupported
-                .insert((unsupported_guest, generation), (word, op));
-        }
-        let emitted = emit::emit_block_with_generation(
-            &mut self.cache,
-            &block,
-            emit::GenerationGuard::new(observation.current_atomic(), generation),
-        )?;
-        if observation.current() != generation {
-            return Err(types::DsrError::GenerationChanged {
-                page: guest.raw(),
-                expected: generation.get(),
-                observed: observation.current().get(),
-            });
-        }
-        if let Some(started) = translation_started {
-            self.stats.translation_ns = self
-                .stats
-                .translation_ns
-                .saturating_add(u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));
-        }
-        self.stats.translations = self.stats.translations.saturating_add(1);
-        let entry = emitted.entry();
-        let published_entry = self.publications.get_or_publish(key, || entry);
-        if published_entry != entry {
-            self.stats.duplicate_publications = self.stats.duplicate_publications.saturating_add(1);
-            return Ok((published_entry, generation));
-        }
-        self.published.push(PublishedBlock {
-            entry,
-            len: emitted.len(),
-            map: emitted.map().entries().to_vec(),
-            recovery: emitted.recovery().to_vec(),
-            _generation: observation,
-        });
-        let links = emitted.direct_links().to_vec();
-        self.blocks.insert(key, entry);
-        self.dependencies.record(source_page, guest, generation);
+            let links = emitted.direct_links().to_vec();
+            self.blocks.insert(key, entry);
+            self.dependencies.record(source_page, guest, generation);
 
-        for link in links {
-            let target_generation = memory.dsr_generation_observation(link.target)?.expected();
-            let target_key = (link.target, target_generation);
-            let site = cache::LinkSite {
-                source: entry,
-                slot: link.slot,
-            };
-            if let Some(target) = self.blocks.get(&target_key) {
-                self.cache.patch_direct_branch(site, *target)?;
-            } else {
-                self.pending.entry(target_key).or_default().push(site);
+            for link in links {
+                let target_generation = memory.dsr_generation_observation(link.target)?.expected();
+                let target_key = (link.target, target_generation);
+                let site = cache::LinkSite {
+                    source: entry,
+                    slot: link.slot,
+                };
+                if let Some(target) = self.blocks.get(&target_key) {
+                    self.cache.patch_direct_branch(site, *target)?;
+                } else {
+                    self.pending.entry(target_key).or_default().push(site);
+                }
             }
-        }
-        if let Some(sites) = self.pending.remove(&key) {
-            for site in sites {
-                self.cache.patch_direct_branch(site, entry)?;
+            if let Some(sites) = self.pending.remove(&key) {
+                for site in sites {
+                    self.cache.patch_direct_branch(site, entry)?;
+                }
             }
+            Ok(TranslationResult {
+                entry,
+                generation,
+                outcome: TranslationOutcome::Translated,
+                emitted_bytes,
+                cache_used_bytes: u64::try_from(self.cache.used_bytes()).unwrap_or(u64::MAX),
+                cache_capacity_bytes: u64::try_from(self.cache.capacity_bytes())
+                    .unwrap_or(u64::MAX),
+            })
+        })();
+
+        let (cache_pc, emitted_bytes, outcome) = match &result {
+            Ok(translated) => (
+                translated.entry.host().raw() as u64,
+                translated.emitted_bytes,
+                probes::DsrOperationOutcome::Success,
+            ),
+            Err(error) => (0, 0, error.probe_outcome()),
+        };
+        probes::dsr_translate_end(
+            tid,
+            guest.raw(),
+            generation.get(),
+            cache_pc,
+            emitted_bytes,
+            outcome,
+        );
+        if matches!(&result, Err(types::DsrError::CacheCapacity { .. })) {
+            probes::dsr_cache_event(
+                tid,
+                probes::DsrCacheEventKind::CapacityFailure,
+                guest.raw(),
+                generation.get(),
+                u64::try_from(self.cache.used_bytes()).unwrap_or(u64::MAX),
+                u64::try_from(self.cache.capacity_bytes()).unwrap_or(u64::MAX),
+            );
         }
-        Ok((entry, generation))
+        result
     }
 
     fn guest_pc_for_cache(
@@ -417,8 +570,8 @@ impl ThreadTranslator {
         &mut self,
         memory: &super::NativeMappedMemory,
         guest: carrick_guest_mem::GuestVa,
-    ) -> Result<(types::CacheVa, types::CodeGeneration), types::DsrError> {
-        self.process.state.lock().translate(memory, guest)
+    ) -> Result<TranslationResult, types::DsrError> {
+        self.process.state.lock().translate(self.tid, memory, guest)
     }
 
     fn guest_pc_for_cache(
@@ -433,11 +586,20 @@ impl ThreadTranslator {
         memory: &super::NativeMappedMemory,
         _source: carrick_guest_mem::GuestVa,
         target: carrick_guest_mem::GuestVa,
-    ) -> Result<types::CacheVa, types::DsrError> {
+    ) -> Result<(types::CacheVa, types::CodeGeneration), types::DsrError> {
         self.stats.resolver_exits = self.stats.resolver_exits.saturating_add(1);
-        let (entry, generation) = self.translate(memory, target)?;
-        self.indirect_cache.publish(target, generation, entry);
-        Ok(entry)
+        let translated = self.translate(memory, target)?;
+        self.indirect_cache
+            .publish(target, translated.generation, translated.entry);
+        probes::dsr_cache_event(
+            self.tid,
+            probes::DsrCacheEventKind::TargetPublish,
+            target.raw(),
+            translated.generation.get(),
+            translated.cache_used_bytes,
+            translated.cache_capacity_bytes,
+        );
+        Ok((translated.entry, translated.generation))
     }
 
     #[cfg(test)]
@@ -464,23 +626,56 @@ impl ThreadTranslator {
         snapshot: &super::NativeUcontextSnapshot,
     ) -> Result<PreparedEntry, types::DsrError> {
         let guest = carrick_guest_mem::GuestVa(snapshot.pc);
-        let (entry, generation) = match self.resume_entry.take() {
-            Some((cached_guest, generation, entry))
-                if cached_guest == guest
-                    && memory.dsr_generation_observation(guest)?.expected() == generation =>
-            {
-                self.stats.one_entry_hits = self.stats.one_entry_hits.saturating_add(1);
-                (entry, generation)
+        probes::dsr_prepare_begin(self.tid, guest.raw());
+        let selection = (|| -> Result<_, types::DsrError> {
+            match self.resume_entry.take() {
+                Some((cached_guest, generation, entry))
+                    if cached_guest == guest
+                        && memory.dsr_generation_observation(guest)?.expected() == generation =>
+                {
+                    self.stats.one_entry_hits = self.stats.one_entry_hits.saturating_add(1);
+                    Ok((entry, generation, probes::DsrPrepareOutcome::ResumeEntryHit))
+                }
+                _ => {
+                    let translated = self.translate(memory, guest)?;
+                    let outcome = match translated.outcome {
+                        TranslationOutcome::BlockIndexHit => {
+                            probes::DsrPrepareOutcome::BlockIndexHit
+                        }
+                        TranslationOutcome::Translated => probes::DsrPrepareOutcome::Translated,
+                    };
+                    Ok((translated.entry, translated.generation, outcome))
+                }
             }
-            _ => self.translate(memory, guest)?,
+        })();
+        let (entry, generation, outcome) = match selection {
+            Ok(selection) => selection,
+            Err(error) => {
+                probes::dsr_prepare_end(
+                    self.tid,
+                    guest.raw(),
+                    0,
+                    0,
+                    probes::DsrPrepareOutcome::Failed,
+                );
+                return Err(error);
+            }
         };
         let cache_range = self.process.state.lock().cache.host_range();
-        Ok(PreparedEntry {
+        let prepared = PreparedEntry {
             entry,
             generation,
             cache_start: cache_range.start,
             cache_end: cache_range.end,
-        })
+        };
+        probes::dsr_prepare_end(
+            self.tid,
+            guest.raw(),
+            entry.host().raw() as u64,
+            generation.get(),
+            outcome,
+        );
+        Ok(prepared)
     }
 
     pub(super) fn enter_prepared(
@@ -488,20 +683,39 @@ impl ThreadTranslator {
         prepared: PreparedEntry,
         snapshot: &mut super::NativeUcontextSnapshot,
     ) -> Result<PreparedExit, types::DsrError> {
+        let guest_pc = snapshot.pc;
         let mut exit = types::NativeDsrExit::Syscall {
             resume: carrick_guest_mem::GuestVa(snapshot.pc),
         };
         if self.profiling {
             self.stats.gateway_entries = self.stats.gateway_entries.saturating_add(1);
         }
-        gateway::enter_translated_with_cache_range(
+        probes::dsr_run_begin(
+            self.tid,
+            guest_pc,
+            prepared.entry.host().raw() as u64,
+            prepared.generation.get(),
+        );
+        let gateway_result = gateway::enter_translated_with_cache_range(
             prepared.entry,
             snapshot,
             &mut exit,
             &self.indirect_cache,
             prepared.cache_start,
             prepared.cache_end,
-        )?;
+        );
+        if let Err(error) = gateway_result {
+            probes::dsr_run_end(
+                self.tid,
+                probes::DsrExitKind::Unsupported,
+                guest_pc,
+                0,
+                i32::try_from(error.probe_outcome().raw()).unwrap_or(i32::MAX),
+            );
+            return Err(error);
+        }
+        let (kind, exit_guest_pc, target_pc, status) = exit.probe_fields();
+        probes::dsr_run_end(self.tid, kind, exit_guest_pc, target_pc, status);
         Ok(PreparedExit { exit })
     }
 
@@ -527,13 +741,48 @@ impl ThreadTranslator {
         }
         Ok(match exit.exit {
             types::NativeDsrExit::Syscall { resume } => ThreadExit::Syscall { resume },
-            types::NativeDsrExit::ResolveDirect { target, .. } => {
-                self.translate(memory, target)?;
+            types::NativeDsrExit::ResolveDirect { source, target } => {
+                probes::dsr_resolve_begin(
+                    self.tid,
+                    probes::DsrResolveKind::Direct,
+                    source.raw(),
+                    target.raw(),
+                );
+                if let Err(error) = self.translate(memory, target) {
+                    probes::dsr_resolve_end(
+                        self.tid,
+                        probes::DsrResolveKind::Direct,
+                        source.raw(),
+                        target.raw(),
+                        error.probe_outcome(),
+                    );
+                    return Err(error);
+                }
+                probes::dsr_resolve_end(
+                    self.tid,
+                    probes::DsrResolveKind::Direct,
+                    source.raw(),
+                    target.raw(),
+                    probes::DsrOperationOutcome::Success,
+                );
                 snapshot.pc = target.raw();
                 ThreadExit::Continue
             }
             types::NativeDsrExit::ResolveIndirect { source, target, .. } => {
+                probes::dsr_resolve_begin(
+                    self.tid,
+                    probes::DsrResolveKind::Indirect,
+                    source.raw(),
+                    target.raw(),
+                );
                 if !target.raw().is_multiple_of(4) {
+                    probes::dsr_resolve_end(
+                        self.tid,
+                        probes::DsrResolveKind::Indirect,
+                        source.raw(),
+                        target.raw(),
+                        probes::DsrOperationOutcome::InvalidTarget,
+                    );
                     snapshot.pc = source.raw();
                     return Ok(ThreadExit::Fault {
                         kind: ThreadFault::Guest {
@@ -544,6 +793,13 @@ impl ThreadTranslator {
                     });
                 }
                 if !memory.guest_address_is_executable(target.raw()) {
+                    probes::dsr_resolve_end(
+                        self.tid,
+                        probes::DsrResolveKind::Indirect,
+                        source.raw(),
+                        target.raw(),
+                        probes::DsrOperationOutcome::InvalidTarget,
+                    );
                     snapshot.pc = source.raw();
                     return Ok(ThreadExit::Fault {
                         kind: ThreadFault::Guest {
@@ -557,8 +813,27 @@ impl ThreadTranslator {
                         address: target,
                     });
                 }
-                let entry = self.resolve_indirect(memory, source, target)?;
-                let target_generation = memory.dsr_generation_observation(target)?.expected();
+                let (entry, target_generation) = match self.resolve_indirect(memory, source, target)
+                {
+                    Ok(resolved) => resolved,
+                    Err(error) => {
+                        probes::dsr_resolve_end(
+                            self.tid,
+                            probes::DsrResolveKind::Indirect,
+                            source.raw(),
+                            target.raw(),
+                            error.probe_outcome(),
+                        );
+                        return Err(error);
+                    }
+                };
+                probes::dsr_resolve_end(
+                    self.tid,
+                    probes::DsrResolveKind::Indirect,
+                    source.raw(),
+                    target.raw(),
+                    probes::DsrOperationOutcome::Success,
+                );
                 self.resume_entry = Some((target, target_generation, entry));
                 snapshot.pc = target.raw();
                 ThreadExit::Continue
@@ -852,10 +1127,290 @@ fn recover_rewrite_state(
 mod tests {
     use super::decode::classify;
     use super::types::{DirectKind, IndirectKind, InstAction, PcRelativeKind, SensitiveKind};
-    use carrick_guest_mem::GuestVa;
+    use carrick_guest_mem::{GuestMemory, GuestVa};
     use proptest::prelude::*;
 
     const PC: GuestVa = GuestVa(0x1000);
+
+    fn mapped_dsr_test_memory(
+        words: &[u32],
+    ) -> Result<(super::super::NativeMappedMemory, GuestVa), String> {
+        let page_size = 16 * 1024_u64;
+        let layout = super::super::MemoryLayout {
+            heap_base: super::super::NATIVE_DARWIN_HEAP_BASE,
+            heap_size: page_size,
+            mmap_base: super::super::NATIVE_DARWIN_MMAP_BASE,
+            mmap_size: page_size,
+        };
+        let image = super::super::AddressSpace::from_regions(0, Vec::new())
+            .map_err(|error| error.to_string())?;
+        let mut memory = super::super::NativeMappedMemory::map_with_code_mode(
+            &image,
+            layout,
+            page_size,
+            page_size,
+            carrick_spec::NativeCodeModeRequest::Dsr,
+        )
+        .map_err(|error| error.to_string())?;
+        let code = words
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect::<Vec<_>>();
+        memory
+            .write_bytes_raw(layout.mmap_base, &code)
+            .map_err(|error| error.to_string())?;
+        memory
+            .protect_range(
+                layout.mmap_base,
+                page_size as usize,
+                crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_EXEC,
+            )
+            .map_err(|error| error.to_string())?;
+        Ok((memory, GuestVa(layout.mmap_base)))
+    }
+
+    #[test]
+    fn dsr_translation_result_distinguishes_publish_and_index_hit() {
+        let child = unsafe { libc::fork() };
+        assert!(
+            child >= 0,
+            "fork failed: {}",
+            std::io::Error::last_os_error()
+        );
+        if child == 0 {
+            let result = (|| -> Result<(), String> {
+                let (memory, guest) = mapped_dsr_test_memory(&[0xd400_0001])?;
+                let process =
+                    super::ProcessTranslator::new(16 * 1024).map_err(|error| error.to_string())?;
+                let mut state = process.state.lock();
+                let first = state
+                    .translate(0, &memory, guest)
+                    .map_err(|error| error.to_string())?;
+                let second = state
+                    .translate(0, &memory, guest)
+                    .map_err(|error| error.to_string())?;
+                if first.outcome != super::TranslationOutcome::Translated
+                    || second.outcome != super::TranslationOutcome::BlockIndexHit
+                    || first.entry != second.entry
+                {
+                    return Err(format!(
+                        "unexpected outcomes: first={first:?} second={second:?}"
+                    ));
+                }
+                drop(state);
+                let (used_bytes, block_count, generation_count) = process.lifecycle_snapshot();
+                if used_bytes == 0 || block_count != 1 || generation_count != 1 {
+                    return Err(format!(
+                        "unexpected lifecycle snapshot: used={used_bytes} blocks={block_count} generations={generation_count}"
+                    ));
+                }
+                if first.cache_used_bytes != used_bytes || first.cache_capacity_bytes != 16 * 1024 {
+                    return Err(format!(
+                        "unexpected cache metrics: used={} capacity={}",
+                        first.cache_used_bytes, first.cache_capacity_bytes
+                    ));
+                }
+                Ok(())
+            })();
+            if let Err(error) = &result {
+                super::super::child_write_stderr(format!("{error}\n").as_bytes());
+            }
+            unsafe { libc::_exit(i32::from(result.is_err())) };
+        }
+
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(libc::WIFEXITED(status), "child status was 0x{status:x}");
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+    }
+
+    #[test]
+    fn dsr_error_probe_outcomes_cover_every_error_category() {
+        use carrick_observability::probes::DsrOperationOutcome;
+
+        let op = bad64::decode(0xd400_0001, PC.raw())
+            .expect("decode svc")
+            .op();
+        let cases = [
+            (
+                super::types::DsrError::PcOverflow { pc: PC.raw() },
+                DsrOperationOutcome::PcOverflow,
+            ),
+            (
+                super::types::DsrError::Decode {
+                    pc: PC.raw(),
+                    word: 0,
+                    detail: "decode".to_string(),
+                },
+                DsrOperationOutcome::Decode,
+            ),
+            (
+                super::types::DsrError::Malformed {
+                    pc: PC.raw(),
+                    word: 0xd400_0001,
+                    op,
+                },
+                DsrOperationOutcome::Malformed,
+            ),
+            (
+                super::types::DsrError::BlockPolicy("block".to_string()),
+                DsrOperationOutcome::BlockPolicy,
+            ),
+            (
+                super::types::DsrError::MemoryRead {
+                    pc: PC.raw(),
+                    detail: "read".to_string(),
+                },
+                DsrOperationOutcome::MemoryRead,
+            ),
+            (
+                super::types::DsrError::UnsupportedBlockAction {
+                    block_start: PC.raw(),
+                    generation: 1,
+                    guest_pc: PC.raw(),
+                    word: 0xd400_0001,
+                    op,
+                    class: "test",
+                },
+                DsrOperationOutcome::UnsupportedBlockAction,
+            ),
+            (
+                super::types::DsrError::Assembler("assembler".to_string()),
+                DsrOperationOutcome::Assembler,
+            ),
+            (
+                super::types::DsrError::Gateway("gateway".to_string()),
+                DsrOperationOutcome::Gateway,
+            ),
+            (
+                super::types::DsrError::CachePolicy("cache".to_string()),
+                DsrOperationOutcome::CachePolicy,
+            ),
+            (
+                super::types::DsrError::GenerationChanged {
+                    page: PC.raw(),
+                    expected: 1,
+                    observed: 2,
+                },
+                DsrOperationOutcome::GenerationChanged,
+            ),
+            (
+                super::types::DsrError::Host {
+                    operation: "test",
+                    error: std::io::Error::from_raw_os_error(libc::EINVAL),
+                },
+                DsrOperationOutcome::Host,
+            ),
+            (
+                super::types::DsrError::CacheCapacity {
+                    requested: 8,
+                    used: 12,
+                    capacity: 16,
+                },
+                DsrOperationOutcome::CacheCapacity,
+            ),
+        ];
+
+        for (error, expected) in cases {
+            assert_eq!(error.probe_outcome(), expected, "error={error}");
+        }
+    }
+
+    #[test]
+    fn native_dsr_exit_probe_fields_classify_every_variant() {
+        use super::types::{CodeGeneration, NativeDsrExit};
+        use carrick_observability::probes::DsrExitKind;
+
+        let op = bad64::decode(0xd400_0001, PC.raw())
+            .expect("decode svc")
+            .op();
+        let target = GuestVa(0x2000);
+        let cases = [
+            (
+                NativeDsrExit::Syscall { resume: target },
+                (DsrExitKind::Syscall, target.raw(), 0, 1),
+            ),
+            (
+                NativeDsrExit::ResolveDirect { source: PC, target },
+                (DsrExitKind::DirectResolver, PC.raw(), target.raw(), 2),
+            ),
+            (
+                NativeDsrExit::ResolveIndirect {
+                    source: PC,
+                    target,
+                    link: None,
+                },
+                (DsrExitKind::IndirectResolver, PC.raw(), target.raw(), 3),
+            ),
+            (
+                NativeDsrExit::Fault {
+                    guest_pc: PC,
+                    signal: libc::SIGSEGV,
+                    code: 0,
+                    address: target,
+                    rewrite_scratch: 0,
+                    rewrite_context_scratch: 0,
+                    generation_pstate_scratch: 0,
+                    indirect_x15_scratch: 0,
+                    indirect_x30_scratch: 0,
+                    physical_x18: 0,
+                    gateway_phase: 0,
+                },
+                (DsrExitKind::Fault, PC.raw(), target.raw(), 4),
+            ),
+            (
+                NativeDsrExit::Kick {
+                    resume: target,
+                    rewrite_scratch: 0,
+                    rewrite_context_scratch: 0,
+                    generation_pstate_scratch: 0,
+                    indirect_x15_scratch: 0,
+                    indirect_x30_scratch: 0,
+                },
+                (DsrExitKind::Kick, target.raw(), 0, 5),
+            ),
+            (
+                NativeDsrExit::Sensitive {
+                    guest_pc: PC,
+                    resume: target,
+                    generation: CodeGeneration::INITIAL,
+                },
+                (DsrExitKind::Sensitive, PC.raw(), target.raw(), 6),
+            ),
+            (
+                NativeDsrExit::Unsupported {
+                    guest_pc: PC,
+                    word: 0xd400_0001,
+                    op,
+                },
+                (DsrExitKind::Unsupported, PC.raw(), 0, 7),
+            ),
+            (
+                NativeDsrExit::KickAtEntry { resume: target },
+                (DsrExitKind::Kick, target.raw(), 0, 8),
+            ),
+            (
+                NativeDsrExit::StaleGeneration {
+                    guest_pc: PC,
+                    observed: CodeGeneration::INITIAL,
+                },
+                (DsrExitKind::DirectResolver, PC.raw(), PC.raw(), 2),
+            ),
+        ];
+
+        for (exit, expected) in cases {
+            assert_eq!(exit.probe_fields(), expected, "exit={exit:?}");
+        }
+    }
+
+    #[test]
+    fn thread_translator_stores_the_guest_tid() {
+        let process = std::sync::Arc::new(
+            super::ProcessTranslator::new(16 * 1024).expect("create translator"),
+        );
+        let translator = super::ThreadTranslator::for_process(process, 37);
+        assert_eq!(translator.tid, 37);
+    }
 
     #[test]
     fn dsr_indirect_resolver_stats_start_at_zero() {
@@ -877,7 +1432,7 @@ mod tests {
         let key = (PC, super::types::CodeGeneration::INITIAL);
         let entry = super::types::CacheVa::published(carrick_guest_mem::HostVa(0x1000));
         old.state.lock().publications.get_or_publish(key, || entry);
-        let mut thread = super::ThreadTranslator::for_process(std::sync::Arc::clone(&old));
+        let mut thread = super::ThreadTranslator::for_process(std::sync::Arc::clone(&old), 0);
         let next = std::sync::Arc::new(
             super::ProcessTranslator::new(16 * 1024).expect("create next translator"),
         );
@@ -1411,6 +1966,13 @@ mod tests {
             Ok(_) => panic!("oversized write should exhaust cache"),
             Err(error) => error,
         };
-        assert!(matches!(error, super::types::DsrError::CachePolicy(_)));
+        assert!(matches!(
+            error,
+            super::types::DsrError::CacheCapacity {
+                requested: 16_388,
+                used: 0,
+                capacity: 16_384,
+            }
+        ));
     }
 }

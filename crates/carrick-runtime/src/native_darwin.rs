@@ -1747,7 +1747,8 @@ fn run_native_dsr_thread_loop(
         NativeThreadStart::Detached { context, .. } => *context,
     };
     let process_translator = memory.lock().dsr_process_translator()?;
-    let mut translator = dsr::ThreadTranslator::for_process(process_translator);
+    let mut translator =
+        dsr::ThreadTranslator::for_process(process_translator, thread_runtime.tid().raw());
     let trace_syscalls = std::env::var_os("CARRICK_NATIVE_TRACE_SYSCALLS").is_some();
     let mut vfork_completion: Option<NativeVforkCompletion> = None;
     let mut traps = 0_usize;
@@ -2181,6 +2182,7 @@ fn run_native_dsr_thread_loop(
                         );
                         crate::vcpu_loop::apply_image_proc_state(&dispatcher, &image);
                         dispatcher.close_cloexec_fds();
+                        translator.begin_exec_reset();
                         memory
                             .lock()
                             .replace_image(&image, &relative_relocations, &plan)?;

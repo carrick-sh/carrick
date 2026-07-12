@@ -196,6 +196,39 @@ pub(super) enum NativeDsrExit {
     },
 }
 
+impl NativeDsrExit {
+    pub(super) fn probe_fields(
+        self,
+    ) -> (carrick_observability::probes::DsrExitKind, u64, u64, i32) {
+        use carrick_observability::probes::DsrExitKind;
+
+        match self {
+            Self::Syscall { resume } => (DsrExitKind::Syscall, resume.raw(), 0, 1),
+            Self::ResolveDirect { source, target } => {
+                (DsrExitKind::DirectResolver, source.raw(), target.raw(), 2)
+            }
+            Self::ResolveIndirect { source, target, .. } => {
+                (DsrExitKind::IndirectResolver, source.raw(), target.raw(), 3)
+            }
+            Self::Fault {
+                guest_pc, address, ..
+            } => (DsrExitKind::Fault, guest_pc.raw(), address.raw(), 4),
+            Self::Kick { resume, .. } => (DsrExitKind::Kick, resume.raw(), 0, 5),
+            Self::Sensitive {
+                guest_pc, resume, ..
+            } => (DsrExitKind::Sensitive, guest_pc.raw(), resume.raw(), 6),
+            Self::Unsupported { guest_pc, .. } => (DsrExitKind::Unsupported, guest_pc.raw(), 0, 7),
+            Self::KickAtEntry { resume } => (DsrExitKind::Kick, resume.raw(), 0, 8),
+            Self::StaleGeneration { guest_pc, .. } => (
+                DsrExitKind::DirectResolver,
+                guest_pc.raw(),
+                guest_pc.raw(),
+                2,
+            ),
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub(in crate::native_darwin) enum DsrError {
     #[error("DSR PC overflow at guest PC 0x{pc:x}")]
@@ -226,6 +259,14 @@ pub(in crate::native_darwin) enum DsrError {
     #[error("DSR cache policy error: {0}")]
     CachePolicy(String),
     #[error(
+        "DSR translation cache exhausted: requested={requested} used={used} capacity={capacity}"
+    )]
+    CacheCapacity {
+        requested: usize,
+        used: usize,
+        capacity: usize,
+    },
+    #[error(
         "DSR executable page 0x{page:x} changed generation: expected {expected:?}, observed {observed:?}"
     )]
     GenerationChanged {
@@ -238,4 +279,25 @@ pub(in crate::native_darwin) enum DsrError {
         operation: &'static str,
         error: std::io::Error,
     },
+}
+
+impl DsrError {
+    pub(super) fn probe_outcome(&self) -> carrick_observability::probes::DsrOperationOutcome {
+        use carrick_observability::probes::DsrOperationOutcome;
+
+        match self {
+            Self::PcOverflow { .. } => DsrOperationOutcome::PcOverflow,
+            Self::Decode { .. } => DsrOperationOutcome::Decode,
+            Self::Malformed { .. } => DsrOperationOutcome::Malformed,
+            Self::BlockPolicy(_) => DsrOperationOutcome::BlockPolicy,
+            Self::MemoryRead { .. } => DsrOperationOutcome::MemoryRead,
+            Self::UnsupportedBlockAction { .. } => DsrOperationOutcome::UnsupportedBlockAction,
+            Self::Assembler(_) => DsrOperationOutcome::Assembler,
+            Self::Gateway(_) => DsrOperationOutcome::Gateway,
+            Self::CachePolicy(_) => DsrOperationOutcome::CachePolicy,
+            Self::CacheCapacity { .. } => DsrOperationOutcome::CacheCapacity,
+            Self::GenerationChanged { .. } => DsrOperationOutcome::GenerationChanged,
+            Self::Host { .. } => DsrOperationOutcome::Host,
+        }
+    }
 }
