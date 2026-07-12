@@ -39,8 +39,8 @@ CARRICK_EXEC_BACKEND=native \
     -- --nocapture
 ```
 
-The conformance harness also exposes the same execution mode as the isolated
-`macos-native-dsr` lane. Its Carrick invocation injects:
+The conformance harness also exposes the same native execution path as the
+isolated `macos-native-dsr` lane. Its Carrick invocation injects:
 
 ```text
 --exec-backend native --native-page-profile native16k
@@ -64,7 +64,8 @@ hand edits. Every existing arm64 suite remains selectable on this lane.
 - Decoder: `bad64` 0.12 series
 - Emitter: `dynasmrt` 5.0 series
 - Property tests: `proptest` 1.11 series
-- Guest profile: Darwin-native `native16k`, DSR code mode
+- Guest profile: Darwin-native `native16k`; DSR is the sole native execution
+  path
 - Probe libc: musl
 - Oracle: cached native-arm64 Docker Linux results; Carrick and Docker phases
   were not run concurrently

@@ -1,7 +1,8 @@
 //! Conformance LANE: how a suite's `carrick run` is executed. `Hvf` runs the
 //! local signed binary (the existing behavior); `MacosNativeDsr` runs that same
-//! binary with the opt-in native16k DSR execution mode; `Kvm` wraps the SAME
-//! carrick argv as `limactl shell <vm> -- env … <carrick-in-guest> run …`,
+//! binary with the opt-in native backend and native16k page profile, whose sole
+//! execution path is DSR; `Kvm` wraps the SAME carrick argv as `limactl shell
+//! <vm> -- env … <carrick-in-guest> run …`,
 //! rewriting the `localhost` conformance-registry host to the lima gateway so
 //! the guest can pull from the mac registry. `KvmLocal` runs a platform-linux
 //! carrick binary directly on a Linux host with `/dev/kvm`. `BhyveLocal` and
