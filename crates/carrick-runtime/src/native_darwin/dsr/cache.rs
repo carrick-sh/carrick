@@ -420,6 +420,14 @@ impl TranslationCache {
         start..start.saturating_add(self.capacity)
     }
 
+    pub(super) const fn used_bytes(&self) -> usize {
+        self.cursor
+    }
+
+    pub(super) const fn capacity_bytes(&self) -> usize {
+        self.capacity
+    }
+
     pub(super) fn patch_direct_branch(
         &mut self,
         site: LinkSite,
