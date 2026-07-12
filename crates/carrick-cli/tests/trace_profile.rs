@@ -141,6 +141,7 @@ fn fork_profile_pairs_repair_reset_and_first_prepare_latency() {
     let script = std::fs::read_to_string(path).unwrap();
     for probe in [
         "dsr-cache-lifecycle",
+        "dsr-exec-map-detail",
         "dsr-prepare-begin",
         "fork-pre",
         "fork-post",

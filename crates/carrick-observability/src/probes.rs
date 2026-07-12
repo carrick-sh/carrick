@@ -216,11 +216,22 @@ dsr_ordinal_enum! {
     }
 }
 
+dsr_ordinal_enum! {
+    /// Aggregate component of one native DSR exec image mapping.
+    pub enum DsrExecMapDetailKind {
+        Mmap = 1,
+        Copy = 2,
+        Icache = 3,
+        Protect = 4,
+        Vvar = 5,
+    }
+}
+
 #[cfg(test)]
 mod dsr_probe_abi {
     use super::{
-        DsrCacheEventKind, DsrCacheLifecyclePhase, DsrCacheRole, DsrExitKind, DsrOperationOutcome,
-        DsrPrepareOutcome, DsrResolveKind,
+        DsrCacheEventKind, DsrCacheLifecyclePhase, DsrCacheRole, DsrExecMapDetailKind, DsrExitKind,
+        DsrOperationOutcome, DsrPrepareOutcome, DsrResolveKind,
     };
 
     fn assert_unique(values: &[u32]) {
@@ -313,6 +324,13 @@ mod dsr_probe_abi {
         assert_eq!(DsrCacheLifecyclePhase::ExecMapVvarBegin.raw(), 23);
         assert_eq!(DsrCacheLifecyclePhase::ExecMapVvarEnd.raw(), 24);
         assert_unique(&DsrCacheLifecyclePhase::ALL.map(DsrCacheLifecyclePhase::raw));
+
+        assert_eq!(DsrExecMapDetailKind::Mmap.raw(), 1);
+        assert_eq!(DsrExecMapDetailKind::Copy.raw(), 2);
+        assert_eq!(DsrExecMapDetailKind::Icache.raw(), 3);
+        assert_eq!(DsrExecMapDetailKind::Protect.raw(), 4);
+        assert_eq!(DsrExecMapDetailKind::Vvar.raw(), 5);
+        assert_unique(&DsrExecMapDetailKind::ALL.map(DsrExecMapDetailKind::raw));
     }
 
     #[test]
@@ -328,6 +346,7 @@ mod dsr_probe_abi {
         let _: fn(i32, DsrCacheEventKind, u64, u64, u64) = super::dsr_cache_event;
         let _: fn(DsrCacheRole, u64) = super::dsr_cache_capacity;
         let _: fn(i32, DsrCacheLifecyclePhase, u64, u64, u64) = super::dsr_cache_lifecycle;
+        let _: fn(i32, DsrExecMapDetailKind, u64, u64, u64) = super::dsr_exec_map_detail;
     }
 }
 
@@ -414,6 +433,7 @@ mod real {
         fn dsr__cache__event(_: i32, _: u32, _: u64, _: u64, _: u64) {}
         fn dsr__cache__capacity(_: u32, _: u64) {}
         fn dsr__cache__lifecycle(_: i32, _: u32, _: u64, _: u64, _: u64) {}
+        fn dsr__exec__map__detail(_: i32, _: u32, _: u64, _: u64, _: u64) {}
         // arg2 is the ADDRESS of a `SyscallArgs` ([u64; 6]); DTrace copyin's 48
         // bytes — same raw-pointer convention as `syscall__entry`, no JSON.
         fn unhandled__syscall(_: u64, _: &str, _: u64) {}
@@ -834,6 +854,19 @@ mod real {
     ) {
         carrick_usdt::dsr__cache__lifecycle!(|| {
             (tid, phase.raw(), used_bytes, block_count, generation_count)
+        });
+    }
+
+    #[inline(always)]
+    pub fn dsr_exec_map_detail(
+        tid: i32,
+        kind: super::DsrExecMapDetailKind,
+        duration_ns: u64,
+        bytes: u64,
+        operations: u64,
+    ) {
+        carrick_usdt::dsr__exec__map__detail!(|| {
+            (tid, kind.raw(), duration_ns, bytes, operations)
         });
     }
 
@@ -1713,6 +1746,7 @@ mod stub {
     stub!(dsr_cache_event(tid: i32, kind: super::DsrCacheEventKind, guest_pc: u64, generation: u64, used_bytes: u64));
     stub!(dsr_cache_capacity(role: super::DsrCacheRole, capacity_bytes: u64));
     stub!(dsr_cache_lifecycle(tid: i32, phase: super::DsrCacheLifecyclePhase, used_bytes: u64, block_count: u64, generation_count: u64));
+    stub!(dsr_exec_map_detail(tid: i32, kind: super::DsrExecMapDetailKind, duration_ns: u64, bytes: u64, operations: u64));
     stub!(fork_pre(pc: u64, elr: u64, cpsr: u64));
     stub!(path_open(path: &str, result_size: u64, errno: i32));
     stub!(itimer_fire(signum: i32, generation: u64));
