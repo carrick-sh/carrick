@@ -517,7 +517,6 @@ END
     printa("DSRPROF1|incomplete|phase=exec-cache-reset|pid=%d|tid=%d|kind=open|value=%@d\n", @exec_cache_reset_open);
     printa("DSRPROF1|incomplete|phase=exec-relocation|pid=%d|tid=%d|kind=open|value=%@d\n", @exec_relocation_open);
     printa("DSRPROF1|incomplete|phase=exec-translator-handoff|pid=%d|tid=%d|kind=open|value=%@d\n", @exec_translator_handoff_open);
-    printa("DSRPROF1|incomplete|phase=exec-map-accounting|pid=%d|tid=%d|kind=open|value=%@d\n", @exec_map_detail_outer_open);
     printa("DSRPROF1|incomplete|phase=exec-map-mmap|pid=%d|tid=%d|kind=open|value=%@d\n", @exec_map_mmap_open);
     printa("DSRPROF1|incomplete|phase=exec-map-copy|pid=%d|tid=%d|kind=open|value=%@d\n", @exec_map_copy_open);
     printa("DSRPROF1|incomplete|phase=exec-map-icache|pid=%d|tid=%d|kind=open|value=%@d\n", @exec_map_icache_open);
