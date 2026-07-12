@@ -9,7 +9,12 @@
 
 mod perf_support;
 
-use perf_support::cases::{CASES, PerfArtifact, PerfCase};
+use perf_support::backend_pair::{
+    ArtifactIdentity, BACKEND_PAIR_ORDER, BackendEvidenceRow, BackendMeasurement, BackendRun,
+    CarrickBackend, collect_backend_pair, comparison_row, validate_same_artifact,
+    write_backend_rows_atomic,
+};
+use perf_support::cases::{BackendPairSupport, CASES, PerfArtifact, PerfCase};
 use perf_support::invoke::{self, CPU_PIN, IMAGE};
 use perf_support::metric::Metrics;
 use perf_support::provenance::{self, HostFacts, ResultRow};
@@ -51,6 +56,50 @@ fn probe_path(root: &Path, case: &PerfCase) -> PathBuf {
             case.probe
         )),
     }
+}
+
+fn backend_pair_probe_path(root: &Path, case: &PerfCase) -> PathBuf {
+    match case.artifact {
+        PerfArtifact::StaticMusl => root.join(format!(
+            "conformance-probes/target/native-pie/aarch64-unknown-linux-musl/release/{}",
+            case.probe
+        )),
+        PerfArtifact::DynamicGlibc => probe_path(root, case),
+    }
+}
+
+fn backend_pair_report_path(root: &Path, requested: &Path) -> PathBuf {
+    if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        root.join(requested)
+    }
+}
+
+#[test]
+fn backend_pair_uses_native_pie_artifact() {
+    let case = CASES
+        .iter()
+        .find(|case| case.workload == "trap_floor")
+        .expect("trap floor case");
+    assert_eq!(
+        backend_pair_probe_path(Path::new("/repo"), case),
+        Path::new(
+            "/repo/conformance-probes/target/native-pie/aarch64-unknown-linux-musl/release/perf_trap_floor"
+        )
+    );
+}
+
+#[test]
+fn backend_pair_report_path_is_root_relative() {
+    assert_eq!(
+        backend_pair_report_path(Path::new("/repo"), Path::new("docs/perf-results/run.jsonl")),
+        Path::new("/repo/docs/perf-results/run.jsonl")
+    );
+    assert_eq!(
+        backend_pair_report_path(Path::new("/repo"), Path::new("/tmp/run.jsonl")),
+        Path::new("/tmp/run.jsonl")
+    );
 }
 
 fn docker_ok() -> bool {
@@ -127,6 +176,37 @@ fn parse_sample(output: &str, metric_key: &str) -> Sample {
         value: m.get_f64(metric_key),
         nproc: m.get_u64("nproc"),
     }
+}
+
+fn parse_backend_pair_sample(output: &str, metric_key: &str) -> Result<f64, String> {
+    let sample = parse_sample(output, metric_key);
+    let nproc = sample
+        .nproc
+        .ok_or_else(|| "missing normalization metric nproc".to_owned())?;
+    if nproc != CPU_PIN as u64 {
+        return Err(format!("wrong nproc {nproc}; expected {CPU_PIN}"));
+    }
+    let value = sample
+        .value
+        .ok_or_else(|| format!("missing metric {metric_key}"))?;
+    if !value.is_finite() {
+        return Err(format!("non-finite metric {metric_key}: {value}"));
+    }
+    Ok(value)
+}
+
+#[test]
+fn backend_pair_rejects_missing_metric() {
+    let error = parse_backend_pair_sample("nproc=4", "trap_p50_us")
+        .expect_err("a missing metric must invalidate the report");
+    assert!(error.contains("missing metric trap_p50_us"));
+}
+
+#[test]
+fn backend_pair_rejects_wrong_nproc() {
+    let error = parse_backend_pair_sample("trap_p50_us=1.25\nnproc=10", "trap_p50_us")
+        .expect_err("an unnormalized sample must invalidate the report");
+    assert!(error.contains("wrong nproc 10"));
 }
 
 fn run_case(root: &Path, bin: &PathBuf, case: &PerfCase) -> Vec<ResultRow> {
@@ -373,6 +453,124 @@ fn today_string() -> String {
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|| "unknown-date".into())
+}
+
+const BACKEND_BOOTSTRAP_SEED: u64 = 0x4e31_364b_2d48_5646;
+const BACKEND_BOOTSTRAP_RESAMPLES: usize = 10_000;
+
+fn run_backend_pair_report() -> Result<(), String> {
+    let _serial = PERF_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let root = repo_root();
+    let bin = carrick_bin(&root)
+        .ok_or_else(|| "target/release/carrick not built; run `just build`".to_owned())?;
+    ensure_signed(&root, &bin);
+    let requested_report = std::env::var_os("CARRICK_BACKEND_REPORT")
+        .map(PathBuf::from)
+        .ok_or_else(|| "CARRICK_BACKEND_REPORT is required".to_owned())?;
+    let report = backend_pair_report_path(&root, &requested_report);
+    if let Some(parent) = report.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("create backend report directory: {error}"))?;
+    }
+
+    let filter = std::env::var("CARRICK_PERF_FILTER").ok();
+    let mut rows = vec![BackendEvidenceRow::Run(BackendRun {
+        schema: 1,
+        epoch_secs: provenance::epoch_secs(),
+        schedule: BACKEND_PAIR_ORDER,
+        bootstrap_seed: BACKEND_BOOTSTRAP_SEED,
+        bootstrap_resamples: BACKEND_BOOTSTRAP_RESAMPLES,
+        git_sha: provenance::git_sha(),
+        host: HostFacts::capture(),
+    })];
+
+    for case in CASES {
+        if filter
+            .as_ref()
+            .is_some_and(|value| !case.workload.contains(value))
+        {
+            continue;
+        }
+        if let BackendPairSupport::Unsupported(reason) = case.backend_pair_support {
+            rows.push(BackendEvidenceRow::Skip(
+                perf_support::backend_pair::BackendSkip {
+                    workload: case.workload.to_owned(),
+                    reason: reason.to_owned(),
+                },
+            ));
+            continue;
+        }
+
+        let probe = backend_pair_probe_path(&root, case);
+        if !probe.exists() {
+            return Err(format!(
+                "backend pair probe {} is missing; run scripts/build-probes.sh",
+                probe.display()
+            ));
+        }
+        let artifact_before = ArtifactIdentity::from_file(case.probe, &probe)
+            .map_err(|error| format!("identify probe {}: {error}", probe.display()))?;
+        let mut run_sample = |backend| {
+            let output =
+                invoke::run_carrick_backend(&bin, &root, backend, &probe, case.guest_args)?;
+            parse_backend_pair_sample(&output, case.metric_key)
+                .map_err(|error| format!("{} {backend:?}: {error}", case.workload))
+        };
+        let warmups = warmup_reps();
+        if warmups > 0 {
+            collect_backend_pair(warmups, cooldown(), &mut run_sample)
+                .map_err(|error| format!("{} warmup: {error}", case.workload))?;
+        }
+        let samples = collect_backend_pair(reps(), cooldown(), run_sample)?;
+        let artifact_after = ArtifactIdentity::from_file(case.probe, &probe)
+            .map_err(|error| format!("re-identify probe {}: {error}", probe.display()))?;
+        validate_same_artifact(&artifact_before, &artifact_after)?;
+        let native_summary = stats::summarize(&samples.native16k)
+            .ok_or_else(|| format!("{}: too few native16k samples", case.workload))?;
+        let hvf_summary = stats::summarize(&samples.hvf)
+            .ok_or_else(|| format!("{}: too few HVF samples", case.workload))?;
+        rows.push(BackendEvidenceRow::Measurement(BackendMeasurement {
+            workload: case.workload.to_owned(),
+            backend: CarrickBackend::Native16k,
+            artifact: artifact_before.clone(),
+            metric: case.metric_key.to_owned(),
+            unit: case.unit.to_owned(),
+            higher_is_better: case.higher_is_better,
+            samples: samples.native16k.clone(),
+            summary: native_summary,
+        }));
+        rows.push(BackendEvidenceRow::Measurement(BackendMeasurement {
+            workload: case.workload.to_owned(),
+            backend: CarrickBackend::Hvf,
+            artifact: artifact_before,
+            metric: case.metric_key.to_owned(),
+            unit: case.unit.to_owned(),
+            higher_is_better: case.higher_is_better,
+            samples: samples.hvf.clone(),
+            summary: hvf_summary,
+        }));
+        let mut comparison = comparison_row(
+            case.workload,
+            case.higher_is_better,
+            &samples.native16k,
+            &samples.hvf,
+            BACKEND_BOOTSTRAP_SEED,
+            BACKEND_BOOTSTRAP_RESAMPLES,
+        )
+        .ok_or_else(|| format!("{}: too few samples for comparison", case.workload))?;
+        comparison.metric = case.metric_key.to_owned();
+        comparison.unit = case.unit.to_owned();
+        rows.push(BackendEvidenceRow::Comparison(comparison));
+    }
+
+    write_backend_rows_atomic(&report, &rows)
+        .map_err(|error| format!("write {}: {error}", report.display()))
+}
+
+#[test]
+#[ignore = "requires signed carrick and deliberate serial native16k/HVF sampling"]
+fn backend_pair_report() {
+    run_backend_pair_report().expect("backend-pair report");
 }
 
 #[test]

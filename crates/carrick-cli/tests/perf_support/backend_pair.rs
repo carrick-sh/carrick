@@ -4,6 +4,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::io::Write;
 use std::path::Path;
+use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -18,6 +19,57 @@ pub const BACKEND_PAIR_ORDER: [CarrickBackend; 4] = [
     CarrickBackend::Hvf,
     CarrickBackend::Native16k,
 ];
+
+#[derive(Debug, PartialEq)]
+pub struct BackendPairSamples {
+    pub native16k: Vec<f64>,
+    pub hvf: Vec<f64>,
+}
+
+pub fn collect_backend_pair_once<F>(mut run: F) -> Result<Vec<(CarrickBackend, f64)>, String>
+where
+    F: FnMut(CarrickBackend) -> Result<f64, String>,
+{
+    BACKEND_PAIR_ORDER
+        .into_iter()
+        .map(|backend| run(backend).map(|value| (backend, value)))
+        .collect()
+}
+
+/// Collect complete ABBA cycles serially. Cooldown follows every completed
+/// process, including an invalid one, before its error is returned.
+pub fn collect_backend_pair<F>(
+    cycles: usize,
+    cooldown: Duration,
+    mut run: F,
+) -> Result<BackendPairSamples, String>
+where
+    F: FnMut(CarrickBackend) -> Result<f64, String>,
+{
+    let mut samples = BackendPairSamples {
+        native16k: Vec::with_capacity(cycles.saturating_mul(2)),
+        hvf: Vec::with_capacity(cycles.saturating_mul(2)),
+    };
+    for _ in 0..cycles {
+        for backend in BACKEND_PAIR_ORDER {
+            let result = run(backend);
+            std::thread::sleep(cooldown);
+            let value = result?;
+            match backend {
+                CarrickBackend::Native16k => samples.native16k.push(value),
+                CarrickBackend::Hvf => samples.hvf.push(value),
+            }
+        }
+    }
+    if samples.native16k.len() < 2 || samples.hvf.len() < 2 {
+        return Err(format!(
+            "too few samples: native16k={} hvf={} (need at least 2 each)",
+            samples.native16k.len(),
+            samples.hvf.len()
+        ));
+    }
+    Ok(samples)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ArtifactIdentity {
@@ -167,6 +219,25 @@ pub fn write_backend_rows_atomic(path: &Path, rows: &[BackendEvidenceRow]) -> st
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+
+    #[test]
+    fn collector_runs_native_hvf_hvf_native() {
+        let seen = RefCell::new(Vec::new());
+        collect_backend_pair_once(|backend| {
+            seen.borrow_mut().push(backend);
+            Ok(1.0)
+        })
+        .expect("collect");
+        assert_eq!(*seen.borrow(), BACKEND_PAIR_ORDER);
+    }
+
+    #[test]
+    fn collector_rejects_too_few_samples() {
+        let error = collect_backend_pair(0, Duration::ZERO, |_| Ok(1.0))
+            .expect_err("zero cycles cannot produce a comparison");
+        assert!(error.contains("too few samples"));
+    }
 
     #[test]
     fn backend_pair_schedule_is_drift_balanced() {
