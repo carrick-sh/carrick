@@ -1091,22 +1091,22 @@ pass. Evidence is in
 - Consumes: promoted indirect/prepare/exec/gateway baselines.
 - Produces: decode, plan, emit, publication/index, and duplicate-wait attribution plus a deterministic decision whether translation still warrants work.
 
-- [ ] **Step 1: Add stable typed subphase ordinals and red ABI tests**
+- [x] **Step 1: Add stable typed subphase ordinals and red ABI tests**
 
 Define begin/end probe phases for decode, plan, emit, publication/index update,
 and duplicate-publication wait. Keep scalar args and compile-time uniqueness.
 
-- [ ] **Step 2: Instrument exact non-overlapping boundaries**
+- [x] **Step 2: Instrument exact non-overlapping boundaries**
 
 Use DTrace timestamps. Preserve the current total translate pair so subphase
 sums reconcile with it. Emit open/overwrite/missing-begin rows.
 
-- [ ] **Step 3: Profile cold start, V8, code churn, and concurrent publication**
+- [x] **Step 3: Profile cold start, V8, code churn, and concurrent publication**
 
 Run each Carrick workload separately. Require zero drops/incomplete pairs and
 check in the aggregate JSONL with provenance.
 
-- [ ] **Step 4: Apply the translation decision rule**
+- [x] **Step 4: Apply the translation decision rule**
 
 - If no subphase contributes at least 10% of relevant untraced workload wall
   time, record translation as below the next pole and stop.
@@ -1117,11 +1117,27 @@ check in the aggregate JSONL with provenance.
 - If decode/emit dominates, benchmark `bad64`/`dynasmrt` usage and batch shape
   before changing instruction coverage.
 
+**Selection result:** four complete profiles have zero drops and incomplete
+pairs. Profiling-only untraced aggregates exclude USDT boundary cost. Emit is
+3.716 ms p50, 14.34% of stable JIT-rewrite wall, and 3.628 ms p50, 14.47% of
+concurrent-first-publication wall. It is only 4.22% of syscall-floor wall and
+3.98% of direct V8 wall. Decode and publication are each below 5% of churn
+wall, plan is negligible, and both the DTrace and aggregate lanes observed zero
+duplicate waits/publications. Emit is selected specifically for code churn.
+Evidence is in
+`docs/perf-results/native-dsr-translation-subphases.jsonl`.
+
 - [ ] **Step 5: Write, commit, and execute the selected focused child plan**
 
 Require at least 10% improvement in the selected subphase and an improved cold
 or code-churn wall-time gate, with duplicate-publication, generation,
 invalidation, and fork concurrency remaining green.
+
+**Child plan written:**
+`docs/superpowers/plans/2026-07-12-dsr-emission-performance.md` first benchmarks
+bad64-dependent rewrites, dynasmrt construction/finalization, byte reshaping,
+MAP_JIT publication, and 1/4/16-block write windows. It authorizes only a
+measured Rust/dynasmrt candidate and retains the 10% emit plus churn-wall gate.
 
 ---
 
