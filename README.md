@@ -261,5 +261,6 @@ shared `carrick-aarch64` engine; platform-neutral state lives in
 ## License Policy
 
 The crate is dual licensed as `Apache-2.0 OR MIT`. Dependencies are selected
-from permissive Rust ecosystem crates. `deny.toml` records the allowed
-dependency licenses.
+from reviewed Rust ecosystem crates. Most use permissive licenses; the DSR's
+`dynasm` and `dynasmrt` dependencies use `MPL-2.0`. `deny.toml` records the
+allowed dependency licenses and `cargo deny` enforces that policy.
