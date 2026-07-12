@@ -54,6 +54,7 @@ pub(super) struct ThreadTranslator {
     )>,
     indirect_cache: gateway::IndirectTargetCache,
     stats: ResolverStats,
+    profiling: bool,
     last_kick: Option<(carrick_guest_mem::GuestVa, Option<emit::RecoveryAction>)>,
 }
 
@@ -71,6 +72,7 @@ struct ProcessState {
     published: Vec<PublishedBlock>,
     dependencies: cache::PageBlockDependencies,
     publications: cache::ConcurrentPublicationIndex,
+    profiling: bool,
 }
 
 struct PublishedBlock {
@@ -87,6 +89,30 @@ pub(super) struct ResolverStats {
     pub(super) one_entry_hits: u64,
     pub(super) translations: u64,
     pub(super) duplicate_publications: u64,
+    pub(super) gateway_entries: u64,
+    pub(super) syscall_exits: u64,
+    pub(super) direct_resolver_exits: u64,
+    pub(super) cache_lookups: u64,
+    pub(super) cache_lookup_hits: u64,
+    pub(super) invalidated_blocks: u64,
+    pub(super) translation_ns: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct ProfileSnapshot {
+    pub(super) resolver_exits: u64,
+    pub(super) one_entry_hits: u64,
+    pub(super) translations: u64,
+    pub(super) duplicate_publications: u64,
+    pub(super) gateway_entries: u64,
+    pub(super) syscall_exits: u64,
+    pub(super) direct_resolver_exits: u64,
+    pub(super) cache_lookups: u64,
+    pub(super) cache_lookup_hits: u64,
+    pub(super) invalidated_blocks: u64,
+    pub(super) translation_ns: u64,
+    pub(super) cache_used_bytes: usize,
+    pub(super) cache_capacity_bytes: usize,
 }
 
 impl ThreadTranslator {
@@ -103,6 +129,7 @@ impl ThreadTranslator {
             resume_entry: None,
             indirect_cache: gateway::IndirectTargetCache::new(),
             stats: ResolverStats::default(),
+            profiling: std::env::var_os("CARRICK_DSR_PROFILE").is_some(),
             last_kick: None,
         }
     }
@@ -122,6 +149,57 @@ impl ThreadTranslator {
         self.stats = ResolverStats::default();
         self.last_kick = None;
     }
+
+    pub(super) fn profile_snapshot(&self) -> ProfileSnapshot {
+        let process = self.process.state.lock();
+        ProfileSnapshot {
+            resolver_exits: self.stats.resolver_exits,
+            one_entry_hits: self.stats.one_entry_hits,
+            translations: process.stats.translations,
+            duplicate_publications: process.stats.duplicate_publications,
+            gateway_entries: self.stats.gateway_entries,
+            syscall_exits: self.stats.syscall_exits,
+            direct_resolver_exits: self.stats.direct_resolver_exits,
+            cache_lookups: process.stats.cache_lookups,
+            cache_lookup_hits: process.stats.cache_lookup_hits,
+            invalidated_blocks: process.stats.invalidated_blocks,
+            translation_ns: process.stats.translation_ns,
+            cache_used_bytes: process.cache.used_bytes(),
+            cache_capacity_bytes: process.cache.capacity_bytes(),
+        }
+    }
+}
+
+impl Drop for ThreadTranslator {
+    fn drop(&mut self) {
+        if !self.profiling {
+            return;
+        }
+        let profile = self.profile_snapshot();
+        super::child_write_stderr(
+            format!(
+                "native dsr profile gateway_entries={} syscall_exits={} \
+                 direct_resolver_exits={} indirect_resolver_exits={} \
+                 one_entry_hits={} cache_lookups={} cache_lookup_hits={} \
+                 translations={} translation_ns={} duplicate_publications={} \
+                 invalidated_blocks={} cache_used_bytes={} cache_capacity_bytes={}\n",
+                profile.gateway_entries,
+                profile.syscall_exits,
+                profile.direct_resolver_exits,
+                profile.resolver_exits,
+                profile.one_entry_hits,
+                profile.cache_lookups,
+                profile.cache_lookup_hits,
+                profile.translations,
+                profile.translation_ns,
+                profile.duplicate_publications,
+                profile.invalidated_blocks,
+                profile.cache_used_bytes,
+                profile.cache_capacity_bytes,
+            )
+            .as_bytes(),
+        );
+    }
 }
 
 impl ProcessTranslator {
@@ -137,6 +215,7 @@ impl ProcessTranslator {
                 published: Vec::new(),
                 dependencies: cache::PageBlockDependencies::default(),
                 publications: cache::ConcurrentPublicationIndex::default(),
+                profiling: std::env::var_os("CARRICK_DSR_PROFILE").is_some(),
             }),
         })
     }
@@ -170,13 +249,27 @@ impl ProcessState {
         let observation = memory.dsr_generation_observation(guest)?;
         let source_page = observation.page();
         let generation = observation.expected();
-        for stale in self.dependencies.invalidate_page(source_page, generation) {
+        let stale_blocks = self.dependencies.invalidate_page(source_page, generation);
+        if self.profiling {
+            self.stats.invalidated_blocks = self
+                .stats
+                .invalidated_blocks
+                .saturating_add(u64::try_from(stale_blocks.len()).unwrap_or(u64::MAX));
+        }
+        for stale in stale_blocks {
             self.blocks.remove(&stale);
         }
         let key = (guest, generation);
+        if self.profiling {
+            self.stats.cache_lookups = self.stats.cache_lookups.saturating_add(1);
+        }
         if let Some(entry) = self.blocks.get(&key) {
+            if self.profiling {
+                self.stats.cache_lookup_hits = self.stats.cache_lookup_hits.saturating_add(1);
+            }
             return Ok((*entry, generation));
         }
+        let translation_started = self.profiling.then(std::time::Instant::now);
         let block = block::plan_block(memory, guest, generation, 256)?;
         if observation.current() != generation {
             return Err(types::DsrError::GenerationChanged {
@@ -213,6 +306,12 @@ impl ProcessState {
                 expected: generation.get(),
                 observed: observation.current().get(),
             });
+        }
+        if let Some(started) = translation_started {
+            self.stats.translation_ns = self
+                .stats
+                .translation_ns
+                .saturating_add(u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));
         }
         self.stats.translations = self.stats.translations.saturating_add(1);
         let entry = emitted.entry();
@@ -349,6 +448,13 @@ impl ThreadTranslator {
             one_entry_hits: self.stats.one_entry_hits,
             translations: process.translations,
             duplicate_publications: process.duplicate_publications,
+            gateway_entries: self.stats.gateway_entries,
+            syscall_exits: self.stats.syscall_exits,
+            direct_resolver_exits: self.stats.direct_resolver_exits,
+            cache_lookups: process.cache_lookups,
+            cache_lookup_hits: process.cache_lookup_hits,
+            invalidated_blocks: process.invalidated_blocks,
+            translation_ns: process.translation_ns,
         }
     }
 
@@ -385,6 +491,9 @@ impl ThreadTranslator {
         let mut exit = types::NativeDsrExit::Syscall {
             resume: carrick_guest_mem::GuestVa(snapshot.pc),
         };
+        if self.profiling {
+            self.stats.gateway_entries = self.stats.gateway_entries.saturating_add(1);
+        }
         gateway::enter_translated_with_cache_range(
             prepared.entry,
             snapshot,
@@ -403,6 +512,19 @@ impl ThreadTranslator {
         prepared: PreparedEntry,
         exit: PreparedExit,
     ) -> Result<ThreadExit, types::DsrError> {
+        if self.profiling {
+            match exit.exit {
+                types::NativeDsrExit::Syscall { .. } => {
+                    self.stats.syscall_exits = self.stats.syscall_exits.saturating_add(1);
+                }
+                types::NativeDsrExit::ResolveDirect { .. } => {
+                    self.stats.direct_resolver_exits =
+                        self.stats.direct_resolver_exits.saturating_add(1);
+                }
+                types::NativeDsrExit::ResolveIndirect { .. } => {}
+                _ => {}
+            }
+        }
         Ok(match exit.exit {
             types::NativeDsrExit::Syscall { resume } => ThreadExit::Syscall { resume },
             types::NativeDsrExit::ResolveDirect { target, .. } => {
@@ -739,6 +861,12 @@ mod tests {
     fn dsr_indirect_resolver_stats_start_at_zero() {
         let translator = super::ThreadTranslator::new(16 * 1024).expect("create translator");
         assert_eq!(translator.resolver_stats(), super::ResolverStats::default());
+        let profile = translator.profile_snapshot();
+        assert_eq!(profile.gateway_entries, 0);
+        assert_eq!(profile.syscall_exits, 0);
+        assert_eq!(profile.cache_lookups, 0);
+        assert_eq!(profile.cache_used_bytes, 0);
+        assert_eq!(profile.cache_capacity_bytes, 16 * 1024);
     }
 
     #[test]
