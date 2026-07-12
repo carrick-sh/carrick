@@ -282,10 +282,11 @@ mod dsr_probe_abi {
         let _: fn(i32, u64, u64, u64) = super::dsr_run_begin;
         let _: fn(i32, DsrExitKind, u64, u64, i32) = super::dsr_run_end;
         let _: fn(i32, u64, u64) = super::dsr_translate_begin;
-        let _: fn(i32, u64, u64, u64, u64, DsrOperationOutcome) = super::dsr_translate_end;
+        let _: fn(i32, u64, u64, u64, DsrOperationOutcome) = super::dsr_translate_end;
         let _: fn(i32, DsrResolveKind, u64, u64) = super::dsr_resolve_begin;
         let _: fn(i32, DsrResolveKind, u64, u64, DsrOperationOutcome) = super::dsr_resolve_end;
-        let _: fn(i32, DsrCacheEventKind, u64, u64, u64, u64) = super::dsr_cache_event;
+        let _: fn(i32, DsrCacheEventKind, u64, u64, u64) = super::dsr_cache_event;
+        let _: fn(DsrCacheRole, u64) = super::dsr_cache_capacity;
         let _: fn(DsrCacheRole, DsrCacheLifecyclePhase, u64, u64, u64) = super::dsr_cache_lifecycle;
     }
 }
@@ -352,6 +353,10 @@ mod real {
         // `vcpu__trap`.
         fn syscall__entry(_: u64, _: &str, _: u64) {}
         fn syscall__return(_: u64, _: &str, _: i64, _: i32) {}
+        // The Rust provider accepts six arguments, but macOS has returned a
+        // constant zero for arg5 at real DSR probe sites. Keep this scalar ABI
+        // at five arguments or fewer and use a low-frequency companion probe
+        // when another value is required.
         /// DSR guest-entry preparation boundaries. All arguments are copied
         /// scalars so disabled probes do not materialize diagnostic state.
         fn dsr__prepare__begin(_: i32, _: u64) {}
@@ -361,12 +366,13 @@ mod real {
         fn dsr__run__end(_: i32, _: u32, _: u64, _: u64, _: i32) {}
         /// Block decode, planning, emission, and publication boundaries.
         fn dsr__translate__begin(_: i32, _: u64, _: u64) {}
-        fn dsr__translate__end(_: i32, _: u64, _: u64, _: u64, _: u64, _: u32) {}
+        fn dsr__translate__end(_: i32, _: u64, _: u64, _: u64, _: u32) {}
         /// Direct and indirect translated-control-flow resolution boundaries.
         fn dsr__resolve__begin(_: i32, _: u32, _: u64, _: u64) {}
         fn dsr__resolve__end(_: i32, _: u32, _: u64, _: u64, _: u32) {}
         /// Translation-cache activity and fork/exec lifecycle boundaries.
-        fn dsr__cache__event(_: i32, _: u32, _: u64, _: u64, _: u64, _: u64) {}
+        fn dsr__cache__event(_: i32, _: u32, _: u64, _: u64, _: u64) {}
+        fn dsr__cache__capacity(_: u32, _: u64) {}
         fn dsr__cache__lifecycle(_: u32, _: u32, _: u64, _: u64, _: u64) {}
         // arg2 is the ADDRESS of a `SyscallArgs` ([u64; 6]); DTrace copyin's 48
         // bytes — same raw-pointer convention as `syscall__entry`, no JSON.
@@ -728,20 +734,12 @@ mod real {
     pub fn dsr_translate_end(
         tid: i32,
         guest_pc: u64,
-        generation: u64,
         cache_pc: u64,
         emitted_bytes: u64,
         outcome: super::DsrOperationOutcome,
     ) {
         carrick_usdt::dsr__translate__end!(|| {
-            (
-                tid,
-                guest_pc,
-                generation,
-                cache_pc,
-                emitted_bytes,
-                outcome.raw(),
-            )
+            (tid, guest_pc, cache_pc, emitted_bytes, outcome.raw())
         });
     }
 
@@ -775,18 +773,15 @@ mod real {
         guest_pc: u64,
         generation: u64,
         used_bytes: u64,
-        capacity_bytes: u64,
     ) {
         carrick_usdt::dsr__cache__event!(|| {
-            (
-                tid,
-                kind.raw(),
-                guest_pc,
-                generation,
-                used_bytes,
-                capacity_bytes,
-            )
+            (tid, kind.raw(), guest_pc, generation, used_bytes)
         });
+    }
+
+    #[inline(always)]
+    pub fn dsr_cache_capacity(role: super::DsrCacheRole, capacity_bytes: u64) {
+        carrick_usdt::dsr__cache__capacity!(|| (role.raw(), capacity_bytes));
     }
 
     #[inline(always)]
@@ -1678,10 +1673,11 @@ mod stub {
     stub!(dsr_run_begin(tid: i32, guest_pc: u64, cache_pc: u64, generation: u64));
     stub!(dsr_run_end(tid: i32, kind: super::DsrExitKind, guest_pc: u64, target_pc: u64, status: i32));
     stub!(dsr_translate_begin(tid: i32, guest_pc: u64, generation: u64));
-    stub!(dsr_translate_end(tid: i32, guest_pc: u64, generation: u64, cache_pc: u64, emitted_bytes: u64, outcome: super::DsrOperationOutcome));
+    stub!(dsr_translate_end(tid: i32, guest_pc: u64, cache_pc: u64, emitted_bytes: u64, outcome: super::DsrOperationOutcome));
     stub!(dsr_resolve_begin(tid: i32, kind: super::DsrResolveKind, source_pc: u64, target_pc: u64));
     stub!(dsr_resolve_end(tid: i32, kind: super::DsrResolveKind, source_pc: u64, target_pc: u64, outcome: super::DsrOperationOutcome));
-    stub!(dsr_cache_event(tid: i32, kind: super::DsrCacheEventKind, guest_pc: u64, generation: u64, used_bytes: u64, capacity_bytes: u64));
+    stub!(dsr_cache_event(tid: i32, kind: super::DsrCacheEventKind, guest_pc: u64, generation: u64, used_bytes: u64));
+    stub!(dsr_cache_capacity(role: super::DsrCacheRole, capacity_bytes: u64));
     stub!(dsr_cache_lifecycle(role: super::DsrCacheRole, phase: super::DsrCacheLifecyclePhase, used_bytes: u64, block_count: u64, generation_count: u64));
     stub!(fork_pre(pc: u64, elr: u64, cpsr: u64));
     stub!(path_open(path: &str, result_size: u64, errno: i32));

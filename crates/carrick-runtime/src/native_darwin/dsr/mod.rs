@@ -90,7 +90,6 @@ struct TranslationResult {
     outcome: TranslationOutcome,
     emitted_bytes: u64,
     cache_used_bytes: u64,
-    cache_capacity_bytes: u64,
 }
 
 struct PublishedBlock {
@@ -259,7 +258,7 @@ impl Drop for ThreadTranslator {
 
 impl ProcessTranslator {
     pub(super) fn new(capacity: usize) -> Result<Self, types::DsrError> {
-        Ok(Self {
+        let translator = Self {
             state: Mutex::new(ProcessState {
                 cache: cache::TranslationCache::new(capacity)?,
                 blocks: BTreeMap::new(),
@@ -272,7 +271,12 @@ impl ProcessTranslator {
                 publications: cache::ConcurrentPublicationIndex::default(),
                 profiling: std::env::var_os("CARRICK_DSR_PROFILE").is_some(),
             }),
-        })
+        };
+        probes::dsr_cache_capacity(
+            probes::DsrCacheRole::Common,
+            u64::try_from(capacity).unwrap_or(u64::MAX),
+        );
+        Ok(translator)
     }
 
     fn lifecycle_snapshot(&self) -> (u64, u64, u64) {
@@ -288,6 +292,9 @@ impl ProcessTranslator {
         let state = self.state.lock();
         state.cache.after_fork_child();
         state.publications.after_fork_child();
+        let capacity = u64::try_from(state.cache.capacity_bytes()).unwrap_or(u64::MAX);
+        drop(state);
+        probes::dsr_cache_capacity(probes::DsrCacheRole::Child, capacity);
     }
 
     pub(super) fn reset_after_fork_for_exec(&self) {
@@ -329,7 +336,6 @@ impl ProcessState {
                 stale.0.raw(),
                 stale.1.get(),
                 u64::try_from(self.cache.used_bytes()).unwrap_or(u64::MAX),
-                u64::try_from(self.cache.capacity_bytes()).unwrap_or(u64::MAX),
             );
         }
         let key = (guest, generation);
@@ -346,7 +352,6 @@ impl ProcessState {
                 guest.raw(),
                 generation.get(),
                 u64::try_from(self.cache.used_bytes()).unwrap_or(u64::MAX),
-                u64::try_from(self.cache.capacity_bytes()).unwrap_or(u64::MAX),
             );
             return Ok(TranslationResult {
                 entry: *entry,
@@ -354,8 +359,6 @@ impl ProcessState {
                 outcome: TranslationOutcome::BlockIndexHit,
                 emitted_bytes: 0,
                 cache_used_bytes: u64::try_from(self.cache.used_bytes()).unwrap_or(u64::MAX),
-                cache_capacity_bytes: u64::try_from(self.cache.capacity_bytes())
-                    .unwrap_or(u64::MAX),
             });
         }
         probes::dsr_cache_event(
@@ -364,7 +367,6 @@ impl ProcessState {
             guest.raw(),
             generation.get(),
             u64::try_from(self.cache.used_bytes()).unwrap_or(u64::MAX),
-            u64::try_from(self.cache.capacity_bytes()).unwrap_or(u64::MAX),
         );
         probes::dsr_translate_begin(tid, guest.raw(), generation.get());
         let translation_started = self.profiling.then(std::time::Instant::now);
@@ -406,7 +408,6 @@ impl ProcessState {
                 guest.raw(),
                 generation.get(),
                 u64::try_from(self.cache.used_bytes()).unwrap_or(u64::MAX),
-                u64::try_from(self.cache.capacity_bytes()).unwrap_or(u64::MAX),
             );
             if observation.current() != generation {
                 return Err(types::DsrError::GenerationChanged {
@@ -432,8 +433,6 @@ impl ProcessState {
                     outcome: TranslationOutcome::Translated,
                     emitted_bytes,
                     cache_used_bytes: u64::try_from(self.cache.used_bytes()).unwrap_or(u64::MAX),
-                    cache_capacity_bytes: u64::try_from(self.cache.capacity_bytes())
-                        .unwrap_or(u64::MAX),
                 });
             }
             self.published.push(PublishedBlock {
@@ -471,8 +470,6 @@ impl ProcessState {
                 outcome: TranslationOutcome::Translated,
                 emitted_bytes,
                 cache_used_bytes: u64::try_from(self.cache.used_bytes()).unwrap_or(u64::MAX),
-                cache_capacity_bytes: u64::try_from(self.cache.capacity_bytes())
-                    .unwrap_or(u64::MAX),
             })
         })();
 
@@ -484,14 +481,7 @@ impl ProcessState {
             ),
             Err(error) => (0, 0, error.probe_outcome()),
         };
-        probes::dsr_translate_end(
-            tid,
-            guest.raw(),
-            generation.get(),
-            cache_pc,
-            emitted_bytes,
-            outcome,
-        );
+        probes::dsr_translate_end(tid, guest.raw(), cache_pc, emitted_bytes, outcome);
         if matches!(&result, Err(types::DsrError::CacheCapacity { .. })) {
             probes::dsr_cache_event(
                 tid,
@@ -499,7 +489,6 @@ impl ProcessState {
                 guest.raw(),
                 generation.get(),
                 u64::try_from(self.cache.used_bytes()).unwrap_or(u64::MAX),
-                u64::try_from(self.cache.capacity_bytes()).unwrap_or(u64::MAX),
             );
         }
         result
@@ -597,7 +586,6 @@ impl ThreadTranslator {
             target.raw(),
             translated.generation.get(),
             translated.cache_used_bytes,
-            translated.cache_capacity_bytes,
         );
         Ok((translated.entry, translated.generation))
     }
@@ -1204,10 +1192,10 @@ mod tests {
                         "unexpected lifecycle snapshot: used={used_bytes} blocks={block_count} generations={generation_count}"
                     ));
                 }
-                if first.cache_used_bytes != used_bytes || first.cache_capacity_bytes != 16 * 1024 {
+                if first.cache_used_bytes != used_bytes {
                     return Err(format!(
-                        "unexpected cache metrics: used={} capacity={}",
-                        first.cache_used_bytes, first.cache_capacity_bytes
+                        "unexpected cache used bytes: result={} snapshot={used_bytes}",
+                        first.cache_used_bytes,
                     ));
                 }
                 Ok(())

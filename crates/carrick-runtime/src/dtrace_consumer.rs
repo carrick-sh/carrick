@@ -488,6 +488,7 @@ pub fn run_child_under_dtrace(
     let mut all_opts: Vec<(&str, &str)> = vec![
         ("bufsize", "4m"),
         ("aggsize", "4m"),
+        ("dynvarsize", "64m"),
         ("aggrate", "1ms"),
         ("statusrate", "10ms"),
         ("strsize", "512"),
