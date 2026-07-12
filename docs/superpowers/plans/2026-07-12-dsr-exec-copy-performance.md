@@ -117,7 +117,7 @@ the selected byte count to the aggregate profiler. Do not scan for zeroes, move
 the stack pointer, shrink the mapped region, change protection, or alter any
 non-stack mapping. Initial and exec mappings share the same Linux semantics.
 
-- [ ] **Step 3: Verify correctness**
+- [x] **Step 3: Verify correctness**
 
 Run the helper test, existing initial-stack/auxv tests in `carrick-mem`, native
 stack mapping tests, DSR execute protection/generation/fault tests, clippy, and
@@ -125,7 +125,7 @@ the signed Rust static/dynamic PIE, Go PIE, direct V8, vfork, and non-leader
 exec campaign from the parent plan. The mapped word at SP and all success
 markers must remain exact; bytes immediately below SP must remain zero.
 
-- [ ] **Step 4: Measure and decide**
+- [x] **Step 4: Measure and decide**
 
 Run two 220-exec aggregate profiles. Require copy bytes to fall by at least
 7.5 MiB, image-map p50 and outer exec-reset p50 to improve by at least 10%,
@@ -142,6 +142,13 @@ at the measured 0.65 us, below the host counter's approximately 41.7 ns tick.
 Before deciding, add a 16-syscall batched per-operation metric and rerun the
 unchanged 1% limit against the same frozen binaries. Do not waive the limit or
 interpret sub-tick differences as evidence.
+
+**Final decision:** promote. Copy bytes fall by 8,387,888; image-map ratios are
+0.1524 and 0.1499; outer exec-reset ratios are 0.4745 and 0.4769. Signed ABBA
+fork-exec ratio is 0.8229 (interval 0.8119–0.8354), V8 upper ratio is 1.0065,
+and the corrected batch-16 syscall-floor upper ratio is 1.0031. All correctness
+markers are green. Evidence is checked in at
+`docs/perf-results/native-dsr-stack-window-v1.jsonl`.
 
 ---
 
