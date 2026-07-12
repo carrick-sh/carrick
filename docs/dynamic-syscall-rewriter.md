@@ -1320,3 +1320,15 @@ fixed-order ABBA gate, scalar gateway p50 fell from 0.471 to 0.273 us (ratio
 0.281 us, SIMD improved with exact vector preservation, and direct V8 remained
 inside its 1% non-regression bound while improving. Evidence is in
 `docs/perf-results/native-dsr-gateway-candidate-v1.jsonl`.
+
+Translation/emission stop result (2026-07-12): typed profiles selected emission
+only for short JIT-churn workloads, where it is about 14.4% of wall; it remains
+about 4% of syscall-floor and direct-V8 wall. Two independent 30-process
+decompositions measured guarded emission at 1.666/1.667 us p50. Dynasm is the
+largest isolated component at about 12%; preallocation halves that primitive
+but projects to only 6.4-6.5% of total emission. MAP_JIT publication, bad64
+decode, and byte reshaping are smaller, and batching would require speculative
+multi-block translation. No production candidate clears the proof thresholds,
+so the area is closed without code churn. Evidence is in
+`docs/perf-results/native-dsr-translation-subphases.jsonl` and
+`docs/perf-results/native-dsr-emission-components-v1.jsonl`.

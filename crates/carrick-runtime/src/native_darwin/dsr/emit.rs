@@ -1587,6 +1587,101 @@ mod tests {
     };
     use super::*;
 
+    #[derive(Clone, Copy)]
+    struct EmissionComponentSummary {
+        p50_us: f64,
+        p95_us: f64,
+        min_us: f64,
+    }
+
+    fn format_emission_component(name: &str, summary: EmissionComponentSummary) -> String {
+        format!(
+            "{name}_p50_us={:.3}\n{name}_p95_us={:.3}\n{name}_min_us={:.3}",
+            summary.p50_us, summary.p95_us, summary.min_us
+        )
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn read_counter() -> u64 {
+        let value: u64;
+        unsafe {
+            core::arch::asm!(
+                "mrs {value}, cntvct_el0",
+                value = out(reg) value,
+                options(nomem, nostack, preserves_flags),
+            );
+        }
+        value
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn counter_frequency() -> u64 {
+        let value: u64;
+        unsafe {
+            core::arch::asm!(
+                "mrs {value}, cntfrq_el0",
+                value = out(reg) value,
+                options(nomem, nostack, preserves_flags),
+            );
+        }
+        value
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn measure_emission_component(
+        samples: usize,
+        batch: usize,
+        logical_operations: usize,
+        mut operation: impl FnMut(),
+    ) -> EmissionComponentSummary {
+        for _ in 0..128 {
+            operation();
+        }
+        let mut ticks = Vec::with_capacity(samples);
+        for _ in 0..samples {
+            let start = read_counter();
+            for _ in 0..batch {
+                operation();
+            }
+            ticks.push(read_counter().wrapping_sub(start));
+        }
+        ticks.sort_unstable();
+        let frequency = counter_frequency() as f64;
+        let divisor = (batch * logical_operations) as f64;
+        let to_us = |value: u64| value as f64 * 1_000_000.0 / frequency / divisor;
+        let rank = |percentile: f64| {
+            let index = (((ticks.len() as f64) * percentile).ceil() as usize)
+                .saturating_sub(1)
+                .min(ticks.len() - 1);
+            to_us(ticks[index])
+        };
+        EmissionComponentSummary {
+            p50_us: rank(0.50),
+            p95_us: rank(0.95),
+            min_us: to_us(ticks[0]),
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn assert_valid_component(summary: EmissionComponentSummary) {
+        assert!(summary.p50_us.is_finite() && summary.p50_us > 0.0);
+        assert!(summary.p95_us.is_finite() && summary.p95_us > 0.0);
+        assert!(summary.min_us.is_finite() && summary.min_us > 0.0);
+    }
+
+    #[test]
+    fn emission_component_output_has_stable_machine_keys() {
+        let summary = EmissionComponentSummary {
+            p50_us: 0.101,
+            p95_us: 0.202,
+            min_us: 0.050,
+        };
+        assert_eq!(
+            format_emission_component("dynasm_default", summary),
+            "dynasm_default_p50_us=0.101\ndynasm_default_p95_us=0.202\ndynasm_default_min_us=0.050"
+        );
+    }
+
     fn copy_plan() -> BlockPlan {
         BlockPlan {
             start: GuestVa(0x4000),
@@ -1607,6 +1702,109 @@ mod tests {
                 resume: GuestVa(0x400c),
             },
         }
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    #[ignore = "explicit opt-in native DSR emission component benchmark"]
+    fn dsr_emission_component_benchmark() {
+        const WORDS: [u32; 64] = [0xd503_201f; 64];
+        let bytes = WORDS
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect::<Vec<_>>();
+
+        let bad64_decode = measure_emission_component(20_000, 16, 1, || {
+            std::hint::black_box(
+                bad64::decode(std::hint::black_box(0xf940_0280), 0x4000)
+                    .expect("decode benchmark word"),
+            );
+        });
+        let dynasm_default = measure_emission_component(4_000, 16, 1, || {
+            let mut assembler = VecAssembler::<Aarch64Relocation>::new(0);
+            for word in WORDS {
+                assembler.push_u32(word);
+            }
+            std::hint::black_box(assembler.finalize().expect("finalize default assembler"));
+        });
+        let dynasm_reserved = measure_emission_component(4_000, 16, 1, || {
+            let mut assembler = VecAssembler::<Aarch64Relocation>::new_with_capacity(
+                0,
+                WORDS.len() * 4,
+                0,
+                0,
+                2,
+                0,
+                4,
+            );
+            for word in WORDS {
+                assembler.push_u32(word);
+            }
+            std::hint::black_box(assembler.finalize().expect("finalize reserved assembler"));
+        });
+        let reshape_words = measure_emission_component(20_000, 16, 1, || {
+            std::hint::black_box(
+                bytes
+                    .chunks_exact(4)
+                    .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                    .collect::<Vec<_>>(),
+            );
+        });
+        let copy_bytes = measure_emission_component(20_000, 16, 1, || {
+            let mut destination = [0_u8; WORDS.len() * 4];
+            destination.copy_from_slice(&bytes);
+            std::hint::black_box(destination);
+        });
+
+        let measure_jit_window = |logical_blocks: usize| {
+            let mut cache =
+                TranslationCache::new(32 * 1024 * 1024).expect("allocate emission benchmark cache");
+            let words = WORDS.repeat(logical_blocks);
+            measure_emission_component(2_000, 1, logical_blocks, || {
+                let mut writer = cache
+                    .begin_write(words.len() * std::mem::size_of::<u32>())
+                    .expect("begin benchmark cache write");
+                writer.write_words(&words).expect("write benchmark words");
+                std::hint::black_box(writer.publish().expect("publish benchmark words"));
+            })
+        };
+        let jit_window_1 = measure_jit_window(1);
+        let jit_window_4 = measure_jit_window(4);
+        let jit_window_16 = measure_jit_window(16);
+
+        let generation = std::sync::atomic::AtomicU64::new(CodeGeneration::INITIAL.get());
+        let plan = copy_plan();
+        let mut cache = TranslationCache::new(32 * 1024 * 1024)
+            .expect("allocate full emission benchmark cache");
+        let full_guarded_emit = measure_emission_component(4_000, 1, 1, || {
+            std::hint::black_box(
+                emit_block_with_generation(
+                    &mut cache,
+                    &plan,
+                    GenerationGuard::new(&generation, CodeGeneration::INITIAL),
+                )
+                .expect("emit guarded benchmark block"),
+            );
+        });
+
+        for (name, summary) in [
+            ("bad64_decode", bad64_decode),
+            ("dynasm_default", dynasm_default),
+            ("dynasm_reserved", dynasm_reserved),
+            ("reshape_words", reshape_words),
+            ("copy_bytes", copy_bytes),
+            ("jit_window_1", jit_window_1),
+            ("jit_window_4", jit_window_4),
+            ("jit_window_16", jit_window_16),
+            ("full_guarded_emit", full_guarded_emit),
+        ] {
+            assert_valid_component(summary);
+            println!("{}", format_emission_component(name, summary));
+        }
+        println!("pure_samples=20000");
+        println!("dynasm_samples=4000");
+        println!("jit_samples=2000");
+        println!("full_emit_samples=4000");
     }
 
     #[test]
