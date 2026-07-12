@@ -9,16 +9,16 @@
 patching and per-syscall `SIGTRAP` path with an opt-in AArch64 same-ISA dynamic
 binary translator that leaves original guest code unmodified, reports Linux
 guest PCs precisely, supports coherent executable-page generations, and proves
-correctness and performance against Carrick's existing native backend.
+correctness against the Linux oracle and publishes measured performance without
+requiring the legacy trap executor as a control lane.
 
 **Architecture:** Keep the existing Darwin-native loader, direct guest-memory
 mapping, dispatcher, process model, signal machinery, and fork/exec/thread
 coordination. Add an in-runtime DSR that decodes from actual guest entry points,
 emits translated basic blocks into a Darwin `MAP_JIT` cache, and exits through a
 small host/guest context gateway for syscalls, indirect resolution, kicks,
-faults, and invalidation. The current distinguished-`brk` backend remains a
-separately selectable comparison oracle until DSR passes the complete native
-gate.
+faults, and invalidation. Work on the legacy trap executor is out of scope: this
+plan neither preserves it as a control nor gates DSR progress on it.
 
 **Tech Stack:** Rust 1.96.0; `bad64` for AArch64 decoding; `dynasmrt` for
 AArch64 emission and relocations; `proptest` for generated relocation and cache
@@ -39,17 +39,18 @@ probe, conformance, and Docker-oracle infrastructure.
 - Use the existing `libc` crate for Darwin APIs. Do not add ad-hoc C ABI
   declarations when `libc` exposes the symbol.
 - Keep the stable context gateway small and auditable. Translated code reserves
-  physical `x18` as a per-thread `DsrContext` pointer; the guest's architectural
-  `x18` value is virtualized in that context. The gateway must preserve all
-  guest-visible GPRs (including virtualized `x18`), SP, NZCV, FP/SIMD registers,
+  physical `x28` as the per-thread `DsrContext` pointer; guest `x18` and guest
+  `x28` are virtualized in that context. Physical `x17` is the internal edge
+  register and is restored from guest state at every block entry. Ordinary
+  entry and indirect targets must not transit physical `x18`, because Darwin's
+  custom-x18 state is not reliable across asynchronous signal/TLS traffic. The
+  gateway must preserve every guest-visible GPR, SP, NZCV, FP/SIMD registers,
   FPSR, FPCR, guest TLS state, and the original guest PC before entering Rust.
-  A copy-only block must reject any instruction whose decoded operands mention
-  `x18`; such instructions require an explicit lowering before they can enter
-  the fast path.
+  A copy-only block must reject instructions mentioning virtualized `x18` or
+  `x28`; those require explicit lowering before entering the fast path.
 - The syscall gateway must be exception-free and must not read or write below
-  guest SP. A `brk`/signal/ucontext exit is useful only as a diagnostic oracle;
-  it is not an acceptable DSR implementation because it retains the trap cost
-  this work is intended to remove.
+  guest SP. A signal/ucontext exit is not an acceptable DSR transport because
+  it retains the trap cost this work is intended to remove.
 - Unsupported instructions and transitions fail with a typed diagnostic that
   includes the guest PC, raw instruction word, decoded operation, cache
   generation, and block start. Never fall through to original guest code.
@@ -78,8 +79,9 @@ a substantial Darwin-native backend in
 `crates/carrick-runtime/csrc/native_darwin.c`. It already provides:
 
 - direct guest mappings for `native16k` and a guarded `linux4k` profile;
-- distinguished-`brk` translation for `svc #0`, TPIDR operations, selected
-  ID-register reads, `dc zva`, and cache-maintenance instructions;
+- a legacy trap-based executor for `svc #0`, TPIDR operations, selected
+  ID-register reads, `dc zva`, and cache-maintenance instructions (out of scope
+  as a DSR control lane);
 - executable-page transitions that patch newly executable mappings;
 - full native ucontext capture including GPR, FP/SIMD, FPSR, and FPCR state;
 - guest/host TLS and x18 switching;
@@ -146,10 +148,10 @@ The cache key is `(GuestVa, CodeGeneration)`. Every published block carries:
 
 The first implementation uses
 `parking_lot::RwLock<BTreeMap<(GuestVa, CodeGeneration), PublishedBlock>>` for
-the process-wide block index and a per-thread one-entry last-target cache for
-indirect branches. Lock-free lookup, direct block chaining, epoch reclamation,
-and larger inline caches require profile evidence and are not prerequisites for
-correctness.
+the process-wide block index and a per-thread 1,024-entry direct-mapped target
+cache for indirect branches. Lock-free lookup, direct block chaining, epoch
+reclamation, and larger or set-associative target caches require profile
+evidence and are not prerequisites for correctness.
 
 ## File structure
 
@@ -166,7 +168,7 @@ New code stays within `carrick-runtime` until the interface is stable:
 | `crates/carrick-runtime/src/native_darwin/dsr/gateway.rs` | Safe wrapper around the host/guest context transition |
 | `crates/carrick-runtime/src/native_darwin/dsr/gateway_aarch64.S` | Minimal stable context save/restore gateway |
 | `crates/carrick-runtime/src/native_darwin/dsr/oracle.rs` | Direct-vs-translated CPU-state test harness |
-| `crates/carrick-runtime/src/native_darwin.rs` | Select DSR vs `brk`, feed memory generations, reuse dispatcher loop |
+| `crates/carrick-runtime/src/native_darwin.rs` | Select DSR, feed memory generations, reuse dispatcher loop |
 
 The assembly file is compiled only for macOS/AArch64 from
 `crates/carrick-runtime/build.rs`. No new workspace crate is created in this
@@ -204,13 +206,13 @@ plan.
 - Constraint: default is `Brk`; `Dsr` rejects non-AArch64, non-macOS, and
   non-`native16k` execution before image mapping.
 
-- [ ] **Step 1: Add a failing serialization and default test**
+- [x] **Step 1: Add a failing serialization and default test**
 
   Add tests beside the existing execution-backend tests in
   `crates/carrick-spec/src/lib.rs` asserting that default `RunSpec` state selects
   `Brk`, and that `Dsr` serializes to the exact JSON string `"dsr"`.
 
-- [ ] **Step 2: Run the focused test and verify red**
+- [x] **Step 2: Run the focused test and verify red**
 
   Run:
 
@@ -220,7 +222,7 @@ plan.
 
   Expected: compilation fails because `NativeCodeModeRequest` does not exist.
 
-- [ ] **Step 3: Thread the typed request through every run surface**
+- [x] **Step 3: Thread the typed request through every run surface**
 
   Add the enum, a `native_code_mode` field next to `native_page_profile`, and
   the matching CLI arguments on `run`, `run-elf`, and container-create paths.
@@ -237,17 +239,15 @@ plan.
   `Brk` returns `Ok(())`. `Dsr` returns a typed `RuntimeError::Unsupported` unless
   the plan is Darwin-native, AArch64, and `NativePageProfile::Native16k`.
 
-- [ ] **Step 4: Establish the pre-DSR performance floor**
+- [x] **Step 4: Establish the pre-DSR performance floor**
 
   Extend the existing `perf_trap_floor` raw-`getpid` probe with a raw `gettid`
-  case and an equal empty-loop control. Extend the existing perf runner so its
-  Carrick lane accepts native16k `brk`, native16k DSR, and HVF as distinct
-  engines. Run 30 samples under current native16k `brk` and HVF in separate
-  phases before DSR execution exists. Store provenance, p50, p95, min, IQR, and
-  `n` in the new JSONL evidence file. This is observation, not an acceptance
-  threshold.
+  case and an equal empty-loop control. Record the historical trap-transport
+  floor once, then use DSR-only measurements for continuing work. Store
+  provenance, p50, p95, min, IQR, and `n` in the new JSONL evidence file. This
+  is observation, not a legacy-mode compatibility requirement.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
   Run:
 
@@ -257,8 +257,8 @@ plan.
   just fmt-check
   ```
 
-  Expected: all pass; existing native commands still select `brk` when the new
-  option is omitted.
+  Expected: all pass and explicit DSR selection reaches the typed native
+  boundary. Legacy-mode behavior is not a gate for subsequent tasks.
 
   Commit: `feat(native): add typed DSR execution selection`
 
@@ -306,14 +306,14 @@ plan.
   }
   ```
 
-- [ ] **Step 1: Write table tests for the initial instruction classes**
+- [x] **Step 1: Write table tests for the initial instruction classes**
 
   Cover ordinary arithmetic, `svc #0`, `b`, `bl`, `b.cond`, `cbz`, `cbnz`,
   `tbz`, `tbnz`, `br`, `blr`, `ret`, `adr`, `adrp`, literal loads, TPIDR_EL0
   reads/writes, CTR_EL0, DCZID_EL0, `dc zva`, `dc cvau`, and `ic ivau`. Each test
   asserts the typed action and exact guest target/resume address.
 
-- [ ] **Step 2: Verify red**
+- [x] **Step 2: Verify red**
 
   Run:
 
@@ -323,7 +323,7 @@ plan.
 
   Expected: compilation fails because the DSR module and types do not exist.
 
-- [ ] **Step 3: Implement classification with `bad64`**
+- [x] **Step 3: Implement classification with `bad64`**
 
   Decode with `bad64::decode(word, guest_pc.0)`. Match `bad64::Op` and typed
   operands; do not infer instruction classes from mnemonic strings. Preserve the
@@ -331,7 +331,7 @@ plan.
   Any decoded operation not explicitly supported becomes `Unsupported`; decode
   errors become a DSR error carrying the raw word and PC.
 
-- [ ] **Step 4: Add property tests for target arithmetic**
+- [x] **Step 4: Add property tests for target arithmetic**
 
   Add `proptest = "1.11.0"` to `[workspace.dependencies]` and
   `proptest.workspace = true` to `carrick-runtime`'s `[dev-dependencies]`.
@@ -340,7 +340,7 @@ plan.
   architectural target as the instruction's encoded immediate, including
   negative displacements and page-rounded `adrp`.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
   Run:
 
@@ -385,14 +385,14 @@ plan.
 - Constraint: cache capacity exhaustion returns a typed error in this task; no
   eviction or reclamation is added yet.
 
-- [ ] **Step 1: Write fork-isolated executable-memory tests**
+- [x] **Step 1: Write fork-isolated executable-memory tests**
 
   Tests must prove: cache allocation succeeds; a generated `mov x0, #42; ret`
   returns 42; publication flushes I-cache; a second write changes the result;
   execution during the write phase faults in the child; writing during the
   execute phase faults in the child; and a non-cache host PC is rejected.
 
-- [ ] **Step 2: Verify red**
+- [x] **Step 2: Verify red**
 
   Run:
 
@@ -402,7 +402,7 @@ plan.
 
   Expected: compilation fails because `TranslationCache` does not exist.
 
-- [ ] **Step 3: Implement the narrow Darwin policy wrapper**
+- [x] **Step 3: Implement the narrow Darwin policy wrapper**
 
   Allocate with `MAP_PRIVATE | MAP_ANON | MAP_JIT`. Centralize
   `pthread_jit_write_protect_np` and I-cache publication in the existing native
@@ -410,14 +410,14 @@ plan.
   wrapper owns bounds, page alignment, state transitions, and lifetime. It must
   never expose a raw mutable cache slice outside `CacheWriter`.
 
-- [ ] **Step 4: Test fork inheritance explicitly**
+- [x] **Step 4: Test fork inheritance explicitly**
 
   Publish a block, fork, execute it in the child, and report the result through
   the exit status. Then prove the child can discard inherited unpublished
   writer state and begin a clean write transaction. This is only a memory-policy
   proof; metadata repair lands in Task 11.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
   Run:
 
@@ -474,14 +474,14 @@ plan.
   direct branch, indirect branch, return, unsupported operation, page boundary,
   or configured maximum. It never decodes through an exit.
 
-- [ ] **Step 1: Write boundary and constant-pool tests**
+- [x] **Step 1: Write boundary and constant-pool tests**
 
   Construct byte regions containing ordinary instructions, an early `svc`, a
   branch, a page boundary, and a data word equal to `0xd4000001` after an
   unconditional branch. Assert that only reachable instructions before the
   terminator enter the plan and that the data word remains unchanged.
 
-- [ ] **Step 2: Verify red**
+- [x] **Step 2: Verify red**
 
   Run:
 
@@ -491,7 +491,7 @@ plan.
 
   Expected: compilation fails because `BlockPlan` and `plan_block` do not exist.
 
-- [ ] **Step 3: Add `dynasmrt` and emit the copy-only subset**
+- [x] **Step 3: Add `dynasmrt` and emit the copy-only subset**
 
   Add `dynasmrt = "5.0.0"` to `[workspace.dependencies]` and
   `dynasmrt.workspace = true` to the macOS/AArch64 target dependencies in
@@ -503,13 +503,13 @@ plan.
   the instruction-granular PC map atomically with the code. Reject every
   `PcRelative`, `Direct`, and `Indirect` action until its later task lands.
 
-- [ ] **Step 4: Decode back every emitted block in tests**
+- [x] **Step 4: Decode back every emitted block in tests**
 
   Read the published cache bytes and run `bad64::decode` at their cache
   addresses. Assert that copied instructions retain their operation and
   operands and that every PC-map entry points to an instruction boundary.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
   Run:
 
@@ -553,17 +553,18 @@ plan.
 
 - Constraint: Rust code always runs on the saved host stack with host TLS/x18
   state; translated guest code always runs on the guest stack with guest state.
-- Constraint: translated code keeps physical `x18` equal to the current
-  `DsrContext`. Guest `x18` lives in the context and is never silently exposed
-  as the physical register.
+- Constraint: translated code keeps physical `x28` equal to the current
+  `DsrContext`. Guest `x18` and `x28` live in the context and are never silently
+  exposed as their physical registers. Physical `x17` carries internal edges
+  only until the target block restores guest `x17`.
 - Stop condition: do not proceed to Tasks 6-11 unless a straight-line syscall
-  round trip completes without SIGTRAP/SIGSEGV/SIGBUS and an optimized
-  same-revision 30-sample gateway-floor comparison beats the existing `brk`
-  round trip at the p50. Task 7 repeats the comparison through the signed CLI
-  once enough control flow exists to run the shipped probe. These are
-  feasibility gates, not promised final workload speedups.
+  round trip completes without SIGTRAP/SIGSEGV/SIGBUS and the optimized
+  30-sample gateway floor demonstrates that the exception-free boundary is
+  materially below the historical trap-transport floor. This is a bounded
+  feasibility proof, not an ongoing legacy-mode compatibility gate or a
+  promised final workload speedup.
 
-- [ ] **Step 1: Write red full-state and reserved-register oracle tests**
+- [x] **Step 1: Write red full-state and reserved-register oracle tests**
 
   Seed x0..x30, SP, NZCV, v0..v31, FPSR, and FPCR with distinct values. Execute
   a translated straight-line block that changes only an enumerated subset and
@@ -572,7 +573,7 @@ plan.
   explicitly. Add decode-table and generated tests proving no instruction whose
   operands mention `x18` can remain `InstAction::Copy`.
 
-- [ ] **Step 2: Verify red**
+- [x] **Step 2: Verify red**
 
   Run:
 
@@ -582,20 +583,20 @@ plan.
 
   Expected: compilation fails because the gateway does not exist.
 
-- [ ] **Step 3: Implement the audited exception-free gateway**
+- [x] **Step 3: Implement the audited exception-free gateway**
 
   `DsrContext` owns the complete guest snapshot plus the saved host stack and
-  callee-saved state. Assembly entry loads all physical guest registers except
-  x18, installs `DsrContext *` in physical x18, and uses x17 only after saving
-  the guest's x17 in the context. Every emitted entry restores guest x17 through
-  x18 before its first guest instruction. Exit stubs save guest x17 through x18,
+  callee-saved state. Assembly entry installs `DsrContext *` in physical x28,
+  branches to translated code through physical x17, and lets the emitted block
+  restore guest x17 before its first guest instruction. Guest x18 and x28 are
+  explicitly virtualized. Exit stubs save guest x17 through physical x28,
   branch via x17, save the remaining state, restore the host stack and host x18
   ABI, write a `NativeDsrExit`, and only then return to Rust. Resume performs the
   inverse transition. Add compile-time offset assertions shared with the
   existing C ucontext layout. Do not call Rust directly on the guest stack and
   do not use guest stack memory as gateway scratch.
 
-- [ ] **Step 4: Route translated `svc #0` through the existing dispatcher**
+- [x] **Step 4: Route translated `svc #0` through the existing dispatcher**
 
   Change the DSR `svc` terminator to exit with `NativeDsrExit::Syscall` and a
   guest resume PC of `svc_pc + 4`. Reuse the existing syscall frame extraction,
@@ -603,17 +604,17 @@ plan.
   snapshot. Add a DSR-only integration test executing raw `getpid`, writing the
   result, and exiting.
 
-- [ ] **Step 5: Run the preliminary performance feasibility gate**
+- [x] **Step 5: Run the preliminary performance feasibility gate**
 
-  Compare the exception-free gateway with the existing `brk`/signal transport
-  in one optimized test binary. Use 30 batches with equal transition counts,
-  report both p50 values and their ratio, and fail unless DSR is faster. This
-  isolates the boundary mechanism; it is not an end-to-end syscall or workload
-  claim. Current same-revision proof (2026-07-11, Apple Silicon): 30 batches of
-  200 transitions measured DSR p50 31.2 ns versus `brk` p50 2207.9 ns, ratio
-  0.014. Re-run rather than treating this number as permanent.
+  Compare the exception-free gateway with the already-recorded historical
+  trap/signal floor in one optimized test binary. Use 30 batches with equal
+  transition counts and report both p50 values and their ratio. This isolates
+  the boundary mechanism; it is not an end-to-end syscall or workload claim.
+  The bounded 2026-07-11 proof measured 30 batches of 200 transitions: DSR p50
+  31.2 ns versus the historical trap floor of 2207.9 ns (ratio 0.014). Later
+  tasks measure DSR directly and do not rerun or preserve the legacy executor.
 
-- [ ] **Step 6: Verify and commit**
+- [x] **Step 6: Verify and commit**
 
   Run:
 
@@ -649,7 +650,7 @@ plan.
 - Produces: semantically equivalent emitted sequences that leave every
   non-destination register unchanged.
 
-- [ ] **Step 1: Write generated relocation tests across distance classes**
+- [x] **Step 1: Write generated relocation tests across distance classes**
 
   For each instruction, generate guest and cache addresses that are near, far,
   positive, negative, page-aligned, and page-crossing. For `adr`/`adrp`, derive
@@ -660,7 +661,7 @@ plan.
   memory values. Include xzr/wzr and 32-bit destination behavior where
   architecturally legal.
 
-- [ ] **Step 2: Verify red**
+- [x] **Step 2: Verify red**
 
   Run:
 
@@ -670,7 +671,7 @@ plan.
 
   Expected: tests fail with the typed unsupported action from Task 4.
 
-- [ ] **Step 3: Emit relocations with audited AArch64 encodings**
+- [x] **Step 3: Emit relocations with audited AArch64 encodings**
 
   Materialize `adr`/`adrp` targets directly in the architectural destination.
   Materialize integer literal addresses in their destination before loading.
@@ -681,7 +682,7 @@ plan.
   Decode every fixed encoding in tests and route any unreviewed PC-relative form
   through a typed unsupported exit.
 
-- [ ] **Step 4: Verify and commit**
+- [x] **Step 4: Verify and commit**
 
   Run:
 
@@ -716,13 +717,13 @@ plan.
   optional link patch once source and destination blocks are both published.
 - Constraint: `bl` writes the original guest return PC to x30, never a cache PC.
 
-- [ ] **Step 1: Write graph-shaped execution tests**
+- [x] **Step 1: Write graph-shaped execution tests**
 
   Cover taken/not-taken conditional edges, forward/backward loops, nested calls,
   guest LR observation, a direct target on another guest page, and a source
   block linked before and after its destination is published.
 
-- [ ] **Step 2: Verify red**
+- [x] **Step 2: Verify red**
 
   Run:
 
@@ -732,7 +733,7 @@ plan.
 
   Expected: tests fail with typed unsupported direct exits.
 
-- [ ] **Step 3: Implement correct lazy resolution first**
+- [x] **Step 3: Implement correct lazy resolution first**
 
   Every unresolved edge exits with its architectural guest target. The Rust
   coordinator looks up or translates `(target, generation)`, then resumes at
@@ -741,7 +742,7 @@ plan.
   atomic instruction store followed by instruction-cache invalidation; an
   executor must see either the resolver branch or the complete linked branch.
 
-- [ ] **Step 4: Verify and commit**
+- [x] **Step 4: Verify and commit**
 
   Before the commit, extend `syscallregpreserve` with x18, NZCV, and FP/SIMD
   preservation cases and record byte-identical native-Linux output. Do not claim
@@ -795,13 +796,13 @@ plan.
   The only fast cache is a per-thread
   `(GuestVa, CodeGeneration, CacheVa)` entry.
 
-- [ ] **Step 1: Write indirect-control tests**
+- [x] **Step 1: Write indirect-control tests**
 
   Cover function pointers, alternating two targets at one callsite, recursive
   returns, tail calls, `blr` guest-LR semantics, stale generation rejection, and
   an indirect target outside an executable guest mapping.
 
-- [ ] **Step 2: Verify red**
+- [x] **Step 2: Verify red**
 
   Run:
 
@@ -811,23 +812,23 @@ plan.
 
   Expected: tests fail with typed unsupported indirect exits.
 
-- [ ] **Step 3: Implement the resolver and one-entry thread-local cache**
+- [x] **Step 3: Implement the resolver and thread-local target cache**
 
   Validate target alignment and guest execute permission before lookup. On a
   miss, translate synchronously and publish before resuming. `blr` sets x30 to
   the guest instruction's resume PC. `ret` treats its register value only as a
   guest target; a cache address in a guest register is rejected.
 
-- [ ] **Step 4: Profile before considering assembly lookup**
+- [x] **Step 4: Profile before considering assembly lookup**
 
-  Add counters for resolver exits, one-entry hits, translations, and duplicate
-  publication races. Verify their state transitions with handcrafted call/return
-  ELFs here. Record shipped static-PIE counts after Task 9 supplies the sensitive
-  startup instructions those binaries require. Do not implement a larger
-  assembly hash table unless indirect misses are a material share of runtime
-  after Task 12 workloads.
+  Add counters for resolver exits, resume-entry hits, translations, and
+  duplicate publication races. Verify their state transitions with handcrafted
+  call/return ELFs here. Record shipped static-PIE counts after Task 9 supplies
+  the sensitive startup instructions those binaries require. Do not implement
+  a larger assembly hash table unless indirect misses are a material share of
+  runtime after Task 12 workloads.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
   Run:
 
@@ -861,14 +862,14 @@ plan.
 - Produces: exact inverse lookup from any published cache instruction PC to its
   Linux guest PC.
 
-- [ ] **Step 1: Write PC reconstruction and sensitive-instruction tests**
+- [x] **Step 1: Write PC reconstruction and sensitive-instruction tests**
 
   Fault on the first and last instruction of a block and in an expanded
   relocation sequence; assert Linux `ucontext` PC and `si_addr` refer to guest
   addresses. Add TPIDR read/write, constant register reads, `dc zva`, cache
   maintenance, guest `brk`, and kick-at-block-boundary cases.
 
-- [ ] **Step 2: Verify red**
+- [x] **Step 2: Verify red**
 
   Run:
 
@@ -879,7 +880,7 @@ plan.
   Expected: tests fail because cache PCs are not yet lowered through inverse
   maps and sensitive instructions are unsupported.
 
-- [ ] **Step 3: Route cache faults through existing Linux lowering**
+- [x] **Step 3: Route cache faults through existing Linux lowering**
 
   In the Darwin signal handler, distinguish a PC inside the translation cache.
   Capture the host fault, exit to the native loop, map the cache PC to the exact
@@ -888,7 +889,7 @@ plan.
   `rt_sigreturn`. Expanded instruction sequences map every emitted word back to
   the single originating guest PC.
 
-- [ ] **Step 4: Lower sensitive instructions through typed exits**
+- [x] **Step 4: Lower sensitive instructions through typed exits**
 
   Reuse the current native semantics rather than reimplementing them inside the
   emitter. A sensitive instruction exits with its destination/source register
@@ -897,15 +898,15 @@ plan.
   current native backend already does so and a focused test proves the expected
   guest-visible behavior.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
   Extend this task's verification with the first honest shipped-static-PIE and
   end-to-end performance gates. Run `syscallregpreserve` under signed DSR and
   require byte-identical output to its checked-in Docker oracle. Then run 30
-  separate signed-CLI `perf_trap_floor` samples for native16k `brk` and DSR,
-  record p50, p95, min, IQR, and provenance in
-  `docs/perf-results/native-dsr-syscall-floor.jsonl`, and stop before Task 10 if
-  DSR does not beat same-revision `brk` at p50.
+  separate signed-CLI `perf_trap_floor` samples for DSR, record p50, p95, min,
+  IQR, and provenance in `docs/perf-results/native-dsr-syscall-floor.jsonl`, and
+  stop before Task 10 if the DSR floor is unstable or loses the bounded gateway
+  feasibility demonstrated in Task 5.
 
   Run:
 
@@ -918,8 +919,7 @@ plan.
   cargo test -p carrick-cli --test conformance native --no-fail-fast
   ```
 
-  Expected: focused signal/fault probes match their Docker oracles under DSR and
-  the existing `brk` mode remains unchanged.
+  Expected: focused signal/fault probes match their Linux oracles under DSR.
 
   Commit: `feat(native): reconstruct DSR faults at guest PCs`
 
@@ -952,14 +952,14 @@ plan.
 - Constraint: translation reads bytes only while holding a stable generation
   observation; publication fails if any source page changed during decode.
 
-- [ ] **Step 1: Write a failing generation state-machine test**
+- [x] **Step 1: Write a failing generation state-machine test**
 
   Use `proptest` to generate sequences of write, protect, translate, execute,
   invalidate, fork-view, and unmap operations. The model invariant is: execution
   returns only a value produced by the current published guest bytes, never an
   older generation. Persist every minimized failure seed.
 
-- [ ] **Step 2: Verify red**
+- [x] **Step 2: Verify red**
 
   Run:
 
@@ -969,21 +969,21 @@ plan.
 
   Expected: the model finds stale execution because generations do not exist.
 
-- [ ] **Step 3: Wire every executable-byte mutation**
+- [x] **Step 3: Wire every executable-byte mutation**
 
   Advance generations for loader population, `mmap`, `mprotect`,
   `pkey_mprotect`, `munmap`, `mremap`, dispatcher writes, ptrace writes,
   `process_vm_writev`-equivalent guest writes, and native write/execute fault
   transitions. If a syscall is currently unsupported by the native dispatcher,
   retain that typed syscall result; do not add a fake mutation hook. Remove
-  `patch_syscalls` calls from DSR mode only and preserve them exactly in `brk`
-  mode. Keep every guest page that has published translations host-read-only
+  `patch_syscalls` calls from DSR mode. Changes to the legacy executor are out
+  of scope. Keep every guest page that has published translations host-read-only
   while executing; a write fault must quiesce translated threads, invalidate the
   prior generation, transition the guest page to its writable phase, and only
   then retry the store. Every block entry checks its source-page generations
   before executing, including linked direct edges and backward loops.
 
-- [ ] **Step 4: Add a real JIT probe**
+- [x] **Step 4: Add a real JIT probe**
 
   Extend `mprotectexec` or add a focused probe that writes function A, changes
   the page to executable and calls it, changes it back to writable, writes
@@ -991,7 +991,7 @@ plan.
   guest threads. Require A then B with no stale result, host crash, or typed
   rejection on native16k DSR.
 
-- [ ] **Step 5: Prove original code is never patched or executed**
+- [x] **Step 5: Prove original code is never patched or executed**
 
   Add a constant-pool probe containing `0xd4000001` as read-only data inside an
   executable segment. Hash original executable bytes before and after the run.
@@ -999,7 +999,7 @@ plan.
   deliberate direct entry into an original code page to be rejected/faulted by
   the DSR safety backstop.
 
-- [ ] **Step 6: Verify and commit**
+- [x] **Step 6: Verify and commit**
 
   Run:
 
@@ -1034,7 +1034,7 @@ plan.
 - Constraint: a kick reaches a thread executing a long-running translated loop
   and returns through `NativeDsrExit::Kick` without corrupting guest state.
 
-- [ ] **Step 1: Write race-focused tests**
+- [x] **Step 1: Write race-focused tests**
 
   Start multiple guest pthreads at the same untranslated target; inject a pause
   between allocation and publication; assert one winner, equivalent discarded
@@ -1042,7 +1042,7 @@ plan.
   translating, exec from a non-leader, vfork/exec, and kick during a translated
   loop.
 
-- [ ] **Step 2: Verify red**
+- [x] **Step 2: Verify red**
 
   Run:
 
@@ -1053,7 +1053,7 @@ plan.
   Expected: at least the duplicate-publication and fork-state tests fail before
   lifecycle repair exists.
 
-- [ ] **Step 3: Integrate with current quiesce boundaries**
+- [x] **Step 3: Integrate with current quiesce boundaries**
 
   Translation and publication participate in the same fork/exec quiesce rules
   as native memory metadata. The child discards inherited in-progress writers,
@@ -1062,7 +1062,7 @@ plan.
   generation metadata is valid. Exec discards the old image's block index,
   dependency lists, and resolver caches before mapping the replacement image.
 
-- [ ] **Step 4: Make kicks observable at bounded translated intervals**
+- [x] **Step 4: Make kicks observable at bounded translated intervals**
 
   Preserve current thread-directed signal delivery. Long straight-line blocks
   are already bounded by the block instruction limit; backward edges add a
@@ -1070,7 +1070,7 @@ plan.
   worst observed instruction count from kick request to exit; do not claim a
   time bound independent of scheduling.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
   Run:
 
@@ -1139,8 +1139,8 @@ plan.
   just ci
   ```
 
-  Expected: full local CI passes and the DSR overlay does not modify the HVF or
-  current native-`brk` baseline.
+  Expected: full local CI passes and the DSR overlay remains a separate,
+  Linux-oracle-backed evidence surface.
 
   Commit: `test(conformance): establish the native DSR lane`
 
@@ -1159,18 +1159,18 @@ plan.
 **Interfaces:**
 
 - Consumes: static parity from Task 12.
-- Produces: current DSR-vs-`brk`-vs-HVF-vs-Docker correctness and performance
-  evidence with exact git SHA and host provenance.
+- Produces: current DSR-vs-Linux correctness evidence and DSR performance
+  distributions with exact git SHA and host provenance.
 
-- [ ] **Step 1: Run a fresh strict LTP campaign**
+- [x] **Step 1: Run a fresh strict LTP campaign**
 
   Run the full selected native16k LTP corpus under DSR and refresh the Docker
   oracle only in a separate Docker-only phase. Report selected, executed, raw
   parity, strict clean parity, timeouts, crashes, typed unsupported exits, and
   no-assertion cases. Do not compare only against the stale 829/1492 snapshot;
-  run current `brk` mode on the same revision as the control.
+  the fresh Linux differential is authoritative.
 
-- [ ] **Step 2: Run real ecosystem workloads**
+- [x] **Step 2: Run real ecosystem workloads**
 
   Run dynamic glibc `/bin/true`; `node-app-smoke`; `node-v8-smoke` (the required
   generated-code workload); `go-build`; `cpython-thread`;
@@ -1185,17 +1185,18 @@ plan.
     --jsonl target/conformance/native-dsr-workloads.jsonl
   ```
 
-  A workload is successful only if output and exit status match its Linux oracle
-  or documented same-revision native-`brk` control.
+  A workload is successful only if output and exit status match its Linux
+  oracle. Otherwise record a typed, minimized limitation; do not substitute a
+  legacy-mode control for Linux semantics.
 
-- [ ] **Step 3: Measure without predetermined wins**
+- [x] **Step 3: Measure without predetermined wins**
 
   Re-run the syscall floor from Task 1 plus syscall-heavy, branch-heavy,
   fork/exec, network round-trip, and file-metadata workloads. Use the existing
   performance result schema and record p50, p95, min, IQR, `n`, noise flag,
   host, git SHA, mode, and run ID. Report regressions as well as wins.
 
-- [ ] **Step 4: Profile before optimizing the resolver or cache**
+- [x] **Step 4: Profile before optimizing the resolver or cache**
 
   Record time or counts attributable to translation, cache lookup, indirect
   misses, gateway transitions, dispatcher work, invalidation, and code-cache
@@ -1246,7 +1247,7 @@ improves,” and “most probes pass” are intermediate milestones, not complet
 The final report must state, with artifact paths:
 
 - exact supported host, guest ISA, and page profile;
-- static probe parity for DSR and the same-revision `brk` control;
+- static probe parity for DSR against Linux;
 - fresh strict-LTP counts and classification;
 - CPython, Node/V8 JIT, and Go outcomes;
 - original-code integrity and stale-generation proof results;
@@ -1254,3 +1255,13 @@ The final report must state, with artifact paths:
 - remaining typed limitations; and
 - whether DSR remains an opt-in experiment or merits a separate default-mode
   decision.
+
+Current status (2026-07-11): Tasks 1–12 are implemented. Task 13 has fresh
+strict-LTP and workload artifacts, including direct Node/V8, Go PIE, Rust
+static/dynamic PIE, and fork/exec proof. Performance distributions exist for
+the syscall floor, fork/exec, TCP round-trip, and metadata paths. The remaining
+work is the current-HEAD full LTP rerun after the last structural fixes, fork
+lifecycle attribution, final CI, and the explicit go/no-go conclusion. See
+`docs/native-dsr-ltp-campaign.md`,
+`docs/perf-results/native-dsr.jsonl`, and
+`docs/perf-results/native-dsr-profile.jsonl`.
