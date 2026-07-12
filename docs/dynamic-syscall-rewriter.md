@@ -1105,20 +1105,20 @@ plan.
 - Constraint: each newly supported instruction class begins with a minimized
   failing reproducer and direct-vs-translated state oracle case.
 
-- [ ] **Step 1: Run the complete static-musl DSR lane**
+- [x] **Step 1: Run the complete static-musl DSR lane**
 
   Run all Carrick cases first, then Docker cache misses. Capture every typed DSR
   unsupported diagnostic and classify by instruction/control-flow mechanism,
   not by probe name alone.
 
-- [ ] **Step 2: Close gaps one mechanism at a time**
+- [x] **Step 2: Close gaps one mechanism at a time**
 
   For each instruction class: reduce one failing block; add a red decoder or
   execution-oracle test; implement the class using `bad64` and `dynasmrt`; prove
   the focused probe; rerun every probe sharing the same failure signature; make
   one narrow commit with the proof in its body.
 
-- [ ] **Step 3: Reach the static stop condition**
+- [x] **Step 3: Reach the static stop condition**
 
   Stop this task only when one of these is true:
 
@@ -1130,7 +1130,7 @@ plan.
   A crash, signal death, silent original-code fallback, or untyped unsupported
   error is never an acceptable baseline entry.
 
-- [ ] **Step 4: Verify and commit**
+- [x] **Step 4: Verify and commit**
 
   Run:
 

@@ -110,8 +110,13 @@ test *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail
     if [ "{{os()}}" = "macos" ]; then
-        # macOS runs every workspace crate's lib tests (HVF backend included).
-        exec cargo test --workspace --lib {{ARGS}}
+        # Runtime tests exercise process-wide signal dispositions, custom-x18
+        # transitions, and fork from the test harness. Running those cases on
+        # parallel harness threads lets one oracle's temporary process state
+        # corrupt another; keep the other workspace crates parallel and give
+        # carrick-runtime a serial test process with identical coverage.
+        cargo test --workspace --exclude carrick-runtime --lib {{ARGS}}
+        exec env RUST_TEST_THREADS=1 cargo test -p carrick-runtime --lib {{ARGS}}
     fi
     # Off-macOS: run the lib tests of THIS host's own crates only (-p list from
     # _platform_crates) under the backend feature set — `--workspace --lib` would
@@ -342,4 +347,3 @@ musl-record BIN:
     echo "musl-record: see the last UnsupportedPlatform / ENOSYS syscall above."
     echo "musl-record: this is informational only — recorded, never gating."
     exit 0
-
