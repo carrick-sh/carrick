@@ -527,6 +527,10 @@ target/perf/dsr-indirect-cache/candidate-carrick
 Record commits, SHA-256 values, inodes, codesign details, host, and power state.
 Reject identical hashes or inodes.
 
+Capture `baseline_commit` and `candidate_commit` shell variables when the
+binaries are frozen. Pass those recorded values to the gate; do not recompute
+them from a later documentation or harness commit.
+
 - [ ] **Step 2: Run signed correctness and V8 smoke**
 
 ```bash
@@ -548,8 +552,8 @@ Expected: `v8-smoke ok` and no leftover stamped processes.
 ```bash
 CARRICK_DSR_BASELINE_BIN=target/perf/dsr-indirect-cache/baseline-carrick \
 CARRICK_DSR_CANDIDATE_BIN=target/perf/dsr-indirect-cache/candidate-carrick \
-CARRICK_DSR_BASELINE_COMMIT="$(git rev-parse HEAD^)" \
-CARRICK_DSR_CANDIDATE_COMMIT="$(git rev-parse HEAD)" \
+CARRICK_DSR_BASELINE_COMMIT="$baseline_commit" \
+CARRICK_DSR_CANDIDATE_COMMIT="$candidate_commit" \
 CARRICK_DSR_OPTIMIZATION_OUT=docs/perf-results/native-dsr-indirect-cache-v1.jsonl \
   cargo test -p carrick-cli --test dsr_trace_overhead \
   indirect_cache_improvement -- --ignored --nocapture --test-threads=1
@@ -725,15 +729,17 @@ git commit -m "perf(native): retain validated DSR prepared entries" \
 
 Use a detached worktree for the pre-prepare commit and copy distinct binaries to
 `target/perf/dsr-prepare-cache/{baseline,candidate}-carrick`. Record SHA-256,
-inodes, commits, codesign, host, and power.
+inodes, commits, codesign, host, and power. Capture the two commit IDs in
+`baseline_commit` and `candidate_commit` before later harness or documentation
+commits can move `HEAD`.
 
 - [ ] **Step 2: Run the improvement gate**
 
 ```bash
 CARRICK_DSR_BASELINE_BIN=target/perf/dsr-prepare-cache/baseline-carrick \
 CARRICK_DSR_CANDIDATE_BIN=target/perf/dsr-prepare-cache/candidate-carrick \
-CARRICK_DSR_BASELINE_COMMIT="$(git rev-parse HEAD^)" \
-CARRICK_DSR_CANDIDATE_COMMIT="$(git rev-parse HEAD)" \
+CARRICK_DSR_BASELINE_COMMIT="$baseline_commit" \
+CARRICK_DSR_CANDIDATE_COMMIT="$candidate_commit" \
 CARRICK_DSR_OPTIMIZATION_OUT=docs/perf-results/native-dsr-prepare-cache-v1.jsonl \
   cargo test -p carrick-cli --test dsr_trace_overhead \
   prepare_cache_improvement -- --ignored --nocapture --test-threads=1
