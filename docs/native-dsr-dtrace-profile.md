@@ -318,12 +318,21 @@ untraced workload measurements.
 
 ## Optimization order and proof rule
 
-After promoting the indirect and prepare caches, the remaining measured queue
-is:
+After promoting the indirect cache, prepare cache, stack-copy window, and
+gateway closure, the remaining measured queue is:
 
-1. exec subdivision, followed by the largest reproducible subphase;
-2. a low-perturbation scalar/SIMD gateway benchmark;
-3. translation/publication, reprofiled after cache misses fall.
+1. translation/publication, reprofiled after cache misses and fixed gateway
+   work have fallen;
+2. broader decode/dispatch and native-return attribution if translation is no
+   longer a stable long pole.
+
+The gateway experiment deliberately kept DTrace off the hot boundary. Exact
+release component benchmarks attributed 0.201 us of the 0.211 us closure to
+the paired `pthread_sigmask` calls. The promoted deferred-kick design reduces
+the scalar gateway from 0.471 to 0.273 us and the batch-16 syscall floor from
+0.486 to 0.281 us; SIMD and direct V8 also improve. The mechanism, fixed-order
+ABBA intervals, and correctness proofs are recorded in
+`perf-results/native-dsr-gateway-candidate-v1.jsonl`.
 
 Every candidate starts with a deterministic red mechanism test, runs focused
 correctness plus a signed workload, and receives a fixed-order ABBA comparison

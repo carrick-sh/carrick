@@ -1308,3 +1308,15 @@ fork-exec wall p50 from 1391.52 ms to 1145.79 ms (ratio 0.8229, 95% interval
 0.8119–0.8354). Direct V8 and a higher-resolution batch-16 syscall-floor gate
 remain within their 1% limits. Evidence is in
 `docs/perf-results/native-dsr-stack-window-v1.jsonl`.
+
+Fourth accepted optimization (2026-07-12): closure decomposition showed that
+`pthread_sigmask` consumed 95.3% of the 0.211 us gateway ABI closure. SIGPIPE
+is now unblocked once per initialized thread and remains deliverable across
+host and translated windows; an active-null host-window kick is retained in
+thread-local state and published as `KickAtEntry` before the next translated
+instruction. Fork-child installation resets inherited deferred state. In the
+fixed-order ABBA gate, scalar gateway p50 fell from 0.471 to 0.273 us (ratio
+0.5796, upper interval 0.5860), the batch-16 syscall floor fell from 0.486 to
+0.281 us, SIMD improved with exact vector preservation, and direct V8 remained
+inside its 1% non-regression bound while improving. Evidence is in
+`docs/perf-results/native-dsr-gateway-candidate-v1.jsonl`.
