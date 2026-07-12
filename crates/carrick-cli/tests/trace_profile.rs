@@ -154,6 +154,11 @@ fn fork_profile_pairs_repair_reset_and_first_prepare_latency() {
         "first-prepare-after-fork",
         "exec-reset",
         "first-prepare-after-exec",
+        "exec-image-unmap",
+        "exec-image-map",
+        "exec-cache-reset",
+        "exec-relocation",
+        "exec-translator-handoff",
     ] {
         assert!(
             script.contains(&format!("DSRPROF1|sample|phase={phase}")),

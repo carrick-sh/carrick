@@ -189,6 +189,17 @@ impl ThreadTranslator {
         );
     }
 
+    pub(super) fn begin_exec_handoff(&self) {
+        let (used_bytes, block_count, generation_count) = self.process.lifecycle_snapshot();
+        probes::dsr_cache_lifecycle(
+            self.tid,
+            probes::DsrCacheLifecyclePhase::ExecTranslatorHandoffBegin,
+            used_bytes,
+            block_count,
+            generation_count,
+        );
+    }
+
     pub(super) fn reset_for_exec(&mut self, next: Arc<ProcessTranslator>) {
         self.process = next;
         self.resume_entry = None;
@@ -196,6 +207,13 @@ impl ThreadTranslator {
         self.stats = ResolverStats::default();
         self.last_kick = None;
         let (used_bytes, block_count, generation_count) = self.process.lifecycle_snapshot();
+        probes::dsr_cache_lifecycle(
+            self.tid,
+            probes::DsrCacheLifecyclePhase::ExecTranslatorHandoffEnd,
+            used_bytes,
+            block_count,
+            generation_count,
+        );
         probes::dsr_cache_lifecycle(
             self.tid,
             probes::DsrCacheLifecyclePhase::ExecResetEnd,
