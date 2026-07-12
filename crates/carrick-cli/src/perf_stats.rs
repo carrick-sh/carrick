@@ -2,10 +2,6 @@
 //!
 //! p50/p95 use the nearest-rank method, matching the in-guest performance
 //! probes so the harness and trace-profile output share one definition.
-#![cfg_attr(
-    not(test),
-    allow(dead_code, reason = "consumed by the Task 4 profile CLI")
-)]
 
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 pub struct Summary {
@@ -43,6 +39,7 @@ pub fn summarize(values: &[f64]) -> Option<Summary> {
     })
 }
 
+#[allow(dead_code, reason = "consumed by the Task 8 overhead gate")]
 pub fn is_noisy(summary: &Summary) -> bool {
     summary.p50 > 0.0 && (summary.iqr / summary.p50) > 0.10
 }

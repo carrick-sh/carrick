@@ -42,6 +42,8 @@ use carrick_spec::{
 };
 use clap::{Parser, Subcommand};
 
+use crate::trace_profile::TraceProfileKind;
+
 #[derive(Debug, Parser)]
 #[command(author, version, about)]
 pub(crate) struct Cli {
@@ -690,6 +692,12 @@ pub(crate) enum Commands {
         /// stream cost. The script sees the same carrick USDT providers.
         #[arg(short = 's', long = "script")]
         script: Option<std::path::PathBuf>,
+        /// Run one of Carrick's bounded, machine-readable DSR profiles.
+        #[arg(long, value_enum, conflicts_with = "script")]
+        profile: Option<TraceProfileKind>,
+        /// Atomically publish the parsed profile as versioned JSONL.
+        #[arg(long, value_name = "FILE", requires = "profile")]
+        summary_jsonl: Option<std::path::PathBuf>,
         /// Write DTrace events + aggregations to this file instead of stdout.
         /// Essential when tracing an interactive (`-t`) guest: without it the
         /// probe output intermixes with the guest's own terminal stream. The

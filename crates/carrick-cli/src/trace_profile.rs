@@ -1,8 +1,3 @@
-#![cfg_attr(
-    not(test),
-    allow(dead_code, reason = "consumed by the Task 4 profile CLI")
-)]
-
 use std::collections::{BTreeMap, btree_map::Entry};
 use std::fs;
 use std::io::Write;
@@ -11,6 +6,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 
 use crate::perf_stats::{Summary, summarize};
@@ -55,6 +51,23 @@ pub(crate) enum TraceProfileKind {
 }
 
 impl TraceProfileKind {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Dsr => "dsr",
+            Self::DsrIndirect => "dsr-indirect",
+            Self::DsrFork => "dsr-fork",
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn bundled_script(self) -> &'static str {
+        match self {
+            Self::Dsr => carrick_runtime::dtrace_consumer::BUNDLED_DSR_PROFILE_D,
+            Self::DsrIndirect => carrick_runtime::dtrace_consumer::BUNDLED_DSR_INDIRECT_D,
+            Self::DsrFork => carrick_runtime::dtrace_consumer::BUNDLED_DSR_FORK_D,
+        }
+    }
+
     fn parse_protocol(value: &str) -> Result<Self> {
         match value {
             "dsr" => Ok(Self::Dsr),
@@ -173,10 +186,23 @@ pub(crate) struct ProfileCaptureStatus {
     pub(crate) other_drops: u64,
 }
 
+#[cfg(target_os = "macos")]
+impl From<carrick_runtime::dtrace_consumer::DTraceRunReport> for ProfileCaptureStatus {
+    fn from(report: carrick_runtime::dtrace_consumer::DTraceRunReport) -> Self {
+        Self {
+            principal_drops: report.principal_drops,
+            aggregation_drops: report.aggregation_drops,
+            dynamic_drops: report.dynamic_drops,
+            other_drops: report.other_drops,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ProfileProvenance {
     pub(crate) run_id: String,
     pub(crate) git_sha: String,
+    pub(crate) git_dirty: Option<bool>,
     pub(crate) binary_sha256: String,
     pub(crate) command: Vec<String>,
     pub(crate) host: String,
@@ -263,6 +289,8 @@ pub(crate) struct ProfileJsonRow {
     profile: TraceProfileKind,
     run_id: String,
     git_sha: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    git_dirty: Option<bool>,
     binary_sha256: String,
     command: Vec<String>,
     host: String,
@@ -289,6 +317,12 @@ pub(crate) struct ProfileSummary {
 }
 
 impl ProfileSummary {
+    pub(crate) fn from_path(path: &Path, capture_status: ProfileCaptureStatus) -> Result<Self> {
+        let contents = fs::read_to_string(path)
+            .with_context(|| format!("read DSR profile stream {}", path.display()))?;
+        Self::from_lines(contents.lines(), capture_status)
+    }
+
     pub(crate) fn from_lines<I, S>(lines: I, capture_status: ProfileCaptureStatus) -> Result<Self>
     where
         I: IntoIterator<Item = S>,
@@ -475,6 +509,31 @@ impl ProfileSummary {
         self.provenance = provenance;
     }
 
+    pub(crate) fn require_profile(&self, expected: TraceProfileKind) -> Result<()> {
+        if self.profile != expected {
+            bail!(
+                "profile stream completed as {}, expected {}",
+                self.profile.as_str(),
+                expected.as_str()
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn render_human(&self) -> String {
+        format!(
+            "DSR profile {}: {} metric row(s), complete={}, bounded={}, drops={}/{}/{}/{}",
+            self.profile.as_str(),
+            self.metrics.len().saturating_sub(1),
+            self.completion.complete,
+            self.completion.bounded,
+            self.completion.drops.principal_drops,
+            self.completion.drops.aggregation_drops,
+            self.completion.drops.dynamic_drops,
+            self.completion.drops.other_drops,
+        )
+    }
+
     fn json_rows(&self) -> Vec<ProfileJsonRow> {
         self.metrics
             .iter()
@@ -483,6 +542,7 @@ impl ProfileSummary {
                 profile: self.profile,
                 run_id: self.provenance.run_id.clone(),
                 git_sha: self.provenance.git_sha.clone(),
+                git_dirty: self.provenance.git_dirty,
                 binary_sha256: self.provenance.binary_sha256.clone(),
                 command: self.provenance.command.clone(),
                 host: self.provenance.host.clone(),
@@ -493,6 +553,51 @@ impl ProfileSummary {
             })
             .collect()
     }
+}
+
+pub(crate) fn capture_provenance(binary: &Path, command: &[String]) -> Result<ProfileProvenance> {
+    let binary_bytes =
+        fs::read(binary).with_context(|| format!("read traced binary {}", binary.display()))?;
+    let binary_sha256 = format!("{:x}", Sha256::digest(binary_bytes));
+    let git_sha = command_output("git", &["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".into());
+    let git_dirty = git_dirty();
+    let host = command_output("hostname", &[]).unwrap_or_else(|| "unknown".into());
+    let run_id = std::env::var("CARRICK_RUN_ID").unwrap_or_else(|_| {
+        format!(
+            "dsr-{}-{}",
+            chrono::Utc::now().format("%Y%m%dT%H%M%S%.3fZ"),
+            std::process::id()
+        )
+    });
+    Ok(ProfileProvenance {
+        run_id,
+        git_sha,
+        git_dirty,
+        binary_sha256,
+        command: command.to_vec(),
+        host,
+    })
+}
+
+fn git_dirty() -> Option<bool> {
+    let output = std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .output()
+        .ok()?;
+    output.status.success().then_some(!output.stdout.is_empty())
+}
+
+fn command_output(program: &str, args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8(output.stdout).ok()?;
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_owned())
 }
 
 pub(crate) fn write_summary_atomic(
@@ -651,6 +756,19 @@ mod tests {
     }
 
     #[test]
+    fn requested_profile_must_match_stream_completion() {
+        let summary = ProfileSummary::from_lines(
+            ["DSRPROF1|complete|profile=dsr-fork|bounded=0"],
+            ProfileCaptureStatus::default(),
+        )
+        .expect("summary");
+        assert!(summary.require_profile(TraceProfileKind::Dsr).is_err());
+        summary
+            .require_profile(TraceProfileKind::DsrFork)
+            .expect("matching profile");
+    }
+
+    #[test]
     fn writes_provenance_rich_jsonl_atomically() {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("profile.jsonl");
@@ -662,6 +780,7 @@ mod tests {
         summary.set_provenance(ProfileProvenance {
             run_id: "test-run".to_owned(),
             git_sha: "abc123".to_owned(),
+            git_dirty: Some(true),
             binary_sha256: "def456".to_owned(),
             command: vec!["run-elf".to_owned(), "fixture".to_owned()],
             host: "test-host".to_owned(),
@@ -671,6 +790,7 @@ mod tests {
         let row: serde_json::Value = serde_json::from_str(contents.trim()).expect("JSON row");
         assert_eq!(row["schema"], JSON_SCHEMA);
         assert_eq!(row["run_id"], "test-run");
+        assert_eq!(row["git_dirty"], true);
         assert_eq!(row["metric"]["type"], "completion");
     }
 }

@@ -71,8 +71,6 @@ use anyhow::{Context, bail};
 use carrick_image::{ImageReference, ImageStore};
 use carrick_runtime::compat::{CompatReporter, SyscallArgs};
 use carrick_runtime::dispatch::{LinearMemory, SyscallDispatcher, SyscallRequest};
-#[cfg(target_os = "macos")]
-use carrick_runtime::dtrace_consumer::join_ids;
 use carrick_runtime::elf::{inspect_elf, plan_elf_load};
 use carrick_runtime::memory::AddressSpace;
 use carrick_runtime::rootfs::RootFs;
@@ -101,7 +99,11 @@ use crate::runtime_util::{
     parse_publish_specs, parse_volume_mount, resolve_volumes_from_specs, truncate_str,
 };
 #[cfg(target_os = "macos")]
-use crate::trace_cli::{current_supplementary_groups, trace_drop_credentials};
+use crate::trace_cli::{
+    TraceSudoInvocation, current_supplementary_groups, trace_drop_credentials, trace_sudo_argv,
+};
+#[cfg(target_os = "macos")]
+use crate::trace_profile::{ProfileSummary, capture_provenance, write_summary_atomic};
 
 pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
     let Cli { store, command } = cli;
@@ -1009,6 +1011,8 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
         Commands::Trace {
             flowindent,
             script,
+            profile,
+            summary_jsonl,
             trace_out,
             command,
             forward_env,
@@ -1032,6 +1036,11 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 }
                 let me = std::env::current_exe()
                     .context("failed to resolve current carrick binary path")?;
+                if let (Some(raw), Some(summary)) = (&trace_out, &summary_jsonl)
+                    && raw == summary
+                {
+                    bail!("--trace-out and --summary-jsonl must name different files");
+                }
                 if unsafe { libc::geteuid() } != 0 {
                     // libdtrace needs root to open /dev/dtrace. Re-exec the
                     // whole `carrick trace ...` invocation under sudo so the
@@ -1046,66 +1055,85 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     // across as `--forward-env KEY=VAL` CLI args (which survive
                     // sudo, unlike env vars, and don't need SETENV in sudoers);
                     // the re-exec'd carrick sets them before spawning the child.
-                    let mut forwarded: Vec<std::ffi::OsString> =
-                        vec![me.as_os_str().to_owned(), std::ffi::OsString::from("trace")];
-                    if flowindent {
-                        forwarded.push(std::ffi::OsString::from("--flowindent"));
-                    }
-                    if let Some(ref s) = script {
-                        forwarded.push(std::ffi::OsString::from("--script"));
-                        forwarded.push(s.as_os_str().to_owned());
-                    }
-                    if let Some(ref o) = trace_out {
-                        forwarded.push(std::ffi::OsString::from("--trace-out"));
-                        forwarded.push(o.as_os_str().to_owned());
-                    }
-                    forwarded.push(std::ffi::OsString::from("--trace-uid"));
-                    forwarded.push(unsafe { libc::getuid() }.to_string().into());
-                    forwarded.push(std::ffi::OsString::from("--trace-gid"));
-                    forwarded.push(unsafe { libc::getgid() }.to_string().into());
                     let groups = current_supplementary_groups();
-                    if !groups.is_empty() {
-                        forwarded.push(std::ffi::OsString::from("--trace-groups"));
-                        forwarded.push(join_ids(&groups).into());
-                    }
-                    for (k, v) in std::env::vars_os() {
-                        let key = k.to_string_lossy();
-                        if key.starts_with("CARRICK_")
-                            || matches!(key.as_ref(), "HOME" | "USER" | "LOGNAME" | "SHELL")
+                    let mut environment = Vec::new();
+                    for (key, value) in std::env::vars_os() {
+                        let key_text = key.to_string_lossy();
+                        if key_text.starts_with("CARRICK_")
+                            || matches!(key_text.as_ref(), "HOME" | "USER" | "LOGNAME" | "SHELL")
                         {
-                            forwarded.push(std::ffi::OsString::from("--forward-env"));
-                            let mut kv = k;
-                            kv.push("=");
-                            kv.push(v);
-                            forwarded.push(kv);
+                            environment.push((key, value));
                         }
                     }
-                    forwarded.push(std::ffi::OsString::from("--"));
-                    forwarded.extend(command.iter().map(std::ffi::OsString::from));
+                    let forwarded = trace_sudo_argv(&TraceSudoInvocation {
+                        executable: &me,
+                        flowindent,
+                        script: script.as_deref(),
+                        profile,
+                        summary_jsonl: summary_jsonl.as_deref(),
+                        trace_out: trace_out.as_deref(),
+                        uid: unsafe { libc::getuid() },
+                        gid: unsafe { libc::getgid() },
+                        groups: &groups,
+                        forwarded_env: &environment,
+                        command: &command,
+                    });
                     let err = std::process::Command::new("sudo").args(&forwarded).exec();
                     bail!("carrick trace: failed to re-exec under sudo: {}", err);
                 }
-                let script_src =
-                    match &script {
-                        Some(path) => Some(std::fs::read_to_string(path).with_context(|| {
+                let script_src = match (&script, profile) {
+                    (Some(path), None) => {
+                        Some(std::fs::read_to_string(path).with_context(|| {
                             format!("failed to read D script {}", path.display())
-                        })?),
-                        None => None,
-                    };
+                        })?)
+                    }
+                    (None, Some(profile)) => Some(profile.bundled_script().to_owned()),
+                    (None, None) => None,
+                    (Some(_), Some(_)) => {
+                        bail!("--script and --profile cannot be used together")
+                    }
+                };
+                let internal_trace = if profile.is_some() && trace_out.is_none() {
+                    Some(tempfile::NamedTempFile::new().context("create temporary DSR trace")?)
+                } else {
+                    None
+                };
+                let output_path = trace_out
+                    .as_deref()
+                    .or_else(|| internal_trace.as_ref().map(tempfile::NamedTempFile::path));
+                let drop_credentials = trace_drop_credentials(trace_uid, trace_gid, &trace_groups);
                 let opts = carrick_runtime::dtrace_consumer::TraceOptions {
                     flowindent,
                     script: script_src,
-                    out_path: trace_out.as_ref().map(|p| p.to_string_lossy().into_owned()),
-                    drop_credentials: trace_drop_credentials(trace_uid, trace_gid, &trace_groups),
+                    out_path: output_path.map(|path| path.to_string_lossy().into_owned()),
+                    drop_credentials: drop_credentials.clone(),
+                    print_remaining_aggregates: profile.is_none(),
                 };
-                carrick_runtime::dtrace_consumer::run_child_under_dtrace(&me, &command, &opts)
-                    .map_err(|e| anyhow::anyhow!("trace failed: {}", e))?;
+                let report =
+                    carrick_runtime::dtrace_consumer::run_child_under_dtrace(&me, &command, &opts)
+                        .map_err(|e| anyhow::anyhow!("trace failed: {}", e))?;
+                if let Some(requested_profile) = profile {
+                    let raw_path = output_path
+                        .ok_or_else(|| anyhow::anyhow!("profile trace has no output path"))?;
+                    let mut summary = ProfileSummary::from_path(raw_path, report.into())?;
+                    summary.require_profile(requested_profile)?;
+                    summary.set_provenance(capture_provenance(&me, &command)?);
+                    eprintln!("{}", summary.render_human());
+                    if let Some(summary_path) = summary_jsonl.as_deref() {
+                        let owner = drop_credentials
+                            .as_ref()
+                            .map(|value| (value.uid, value.gid));
+                        write_summary_atomic(summary_path, &summary, owner)?;
+                    }
+                }
             }
             #[cfg(not(target_os = "macos"))]
             {
                 let _ = (
                     flowindent,
                     script,
+                    profile,
+                    summary_jsonl,
                     trace_out,
                     command,
                     forward_env,
