@@ -646,7 +646,7 @@ held at 41,151 versus 41,152. No associative fallback is warranted.
 - Consumes: `ThreadTranslator.resume_entry`, `PreparedEntry`, `CodeGeneration`, and `NativeMappedMemory::dsr_generation_observation`.
 - Produces: persistent last-prepared-entry lookup that is cleared on fork/exec and invalidated on generation mismatch.
 
-- [ ] **Step 1: Write red cache-state tests**
+- [x] **Step 1: Write red cache-state tests**
 
 ```rust
 #[test]
@@ -698,7 +698,7 @@ fn generation_change_discards_last_prepared_entry() {
 }
 ```
 
-- [ ] **Step 2: Run red**
+- [x] **Step 2: Run red**
 
 ```bash
 cargo test -p carrick-runtime repeated_prepare_keeps_valid_last_entry_hot --lib -- --nocapture
@@ -709,7 +709,7 @@ Expected: `repeated_prepare_keeps_valid_last_entry_hot` fails because the normal
 prepare path never publishes the slot. The generation-change test is a safety
 oracle and may already pass; it must remain green after publication changes.
 
-- [ ] **Step 3: Implement persistent publication and validation**
+- [x] **Step 3: Implement persistent publication and validation**
 
 Replace `self.resume_entry.take()` with a non-consuming copy of the typed tuple.
 After any successful fallback lookup/translation, publish:
@@ -722,7 +722,7 @@ On a matching guest PC with mismatched generation, clear the slot before the
 fallback. Preserve existing clears in `after_fork_child` and `reset_for_exec`.
 Do not add an untyped raw-PC cache.
 
-- [ ] **Step 4: Run focused correctness**
+- [x] **Step 4: Run focused correctness**
 
 ```bash
 cargo test -p carrick-runtime repeated_prepare --lib -- --nocapture
@@ -735,11 +735,11 @@ cargo test -p carrick-runtime dsr_fork --lib -- --nocapture
 Expected: persistent hits occur only at the current generation and all
 fork/invalidation/concurrency tests pass.
 
-- [ ] **Step 5: Commit the experiment**
+- [x] **Step 5: Commit the experiment**
 
 ```bash
 git add crates/carrick-runtime/src/native_darwin/dsr/mod.rs \
-  crates/carrick-runtime/src/native_darwin/dsr/oracle.rs
+  docs/superpowers/plans/2026-07-12-dsr-profile-driven-performance.md
 git commit -m "perf(native): retain validated DSR prepared entries" \
   -m "Publish successful prepares into a persistent typed last-entry slot so repeated syscall resumes avoid the process block index while generation checks remain authoritative." \
   -m "Co-Authored-By: Codex <codex@openai.com>"
