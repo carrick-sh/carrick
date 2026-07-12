@@ -344,6 +344,22 @@ _EVENTRING_KINDS = {
     13: ("EPMASK", lambda a, b, c: f"origin={a} raw={b:#x} last={c:#x}"),
     14: ("EPMASKFD", lambda a, b, c: f"origin={a} gfd={b} hfd={c}"),
     15: ("EPEDGE", lambda a, b, c: f"gfd={a} edge={b:#x} count={c}"),
+    16: (
+        "DSRFAULT",
+        lambda a, b, c: f"pc={((a & 0xffffffff) | ((b & 0xffffffff) << 32)):#018x} signal={c}",
+    ),
+    17: (
+        "DSRFAULT",
+        lambda a, b, c: f"address={((a & 0xffffffff) | ((b & 0xffffffff) << 32)):#018x} esr={c & 0xffffffff:#010x}",
+    ),
+    18: (
+        "DSRFAULT",
+        lambda a, b, c: f"sp={((a & 0xffffffff) | ((b & 0xffffffff) << 32)):#018x}",
+    ),
+    19: (
+        "DSRFAULT",
+        lambda a, b, c: f"lr={((a & 0xffffffff) | ((b & 0xffffffff) << 32)):#018x}",
+    ),
 }
 
 
