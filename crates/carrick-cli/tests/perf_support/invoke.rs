@@ -11,6 +11,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use super::backend_pair::CarrickBackend;
+
 const PROBE_SNIPPET: &str = "export BENCH_NPROC=4; base64 -d > /tmp/p && chmod +x /tmp/p && /tmp/p";
 const SAMPLE_DEADLINE: Duration = Duration::from_secs(60);
 const PLATFORM: &str = "linux/arm64";
@@ -77,6 +79,100 @@ fn drain_with_deadline(child: std::process::Child, repo_root: &Path, run_id: &st
     let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
     combined.push_str(&String::from_utf8_lossy(&out.stderr));
     normalize(&combined)
+}
+
+fn drain_checked_with_deadline(
+    child: std::process::Child,
+    repo_root: &Path,
+    run_id: &str,
+) -> Result<String, String> {
+    let pid = child.id() as i32;
+    let done = Arc::new(AtomicBool::new(false));
+    let watcher = {
+        let done = Arc::clone(&done);
+        let repo_root = repo_root.to_path_buf();
+        let run_id = run_id.to_owned();
+        std::thread::spawn(move || {
+            let start = Instant::now();
+            while !done.load(Ordering::Relaxed) {
+                if start.elapsed() > SAMPLE_DEADLINE {
+                    unsafe { libc::kill(-pid, libc::SIGKILL) };
+                    scoped_kill_guests(&repo_root, &run_id);
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            false
+        })
+    };
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("wait for backend sample: {error}"))?;
+    done.store(true, Ordering::Relaxed);
+    let timed_out = watcher
+        .join()
+        .map_err(|_| "backend deadline watcher panicked".to_owned())?;
+    scoped_kill_guests(repo_root, run_id);
+
+    let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
+    combined.push_str(&String::from_utf8_lossy(&output.stderr));
+    let combined = normalize(&combined);
+    if timed_out {
+        return Err(format!(
+            "backend sample timed out after {}s: {combined}",
+            SAMPLE_DEADLINE.as_secs()
+        ));
+    }
+    if !output.status.success() {
+        return Err(format!(
+            "backend sample exited with status {}: {combined}",
+            output.status
+        ));
+    }
+    Ok(combined)
+}
+
+/// Canonical direct-ELF invocation for one Carrick backend. Both variants use
+/// the exact same probe path and guest arguments; only backend policy differs.
+pub fn backend_args(backend: CarrickBackend, probe: &Path, guest_args: &[&str]) -> Vec<String> {
+    let mut args = vec!["run-elf".to_owned(), "--raw".to_owned()];
+    match backend {
+        CarrickBackend::Native16k => args.extend([
+            "--exec-backend".to_owned(),
+            "native".to_owned(),
+            "--native-page-profile".to_owned(),
+            "native16k".to_owned(),
+        ]),
+        CarrickBackend::Hvf => {
+            args.extend(["--exec-backend".to_owned(), "hvf".to_owned()]);
+        }
+    }
+    args.push(probe.to_string_lossy().into_owned());
+    args.extend(guest_args.iter().map(|arg| (*arg).to_owned()));
+    args
+}
+
+/// Run one direct-ELF sample in its own process group with a scoped run id.
+/// The function returns only a clean, successful process output; timeout and
+/// nonzero status are hard errors and cleanup runs for both backends.
+pub fn run_carrick_backend(
+    bin: &Path,
+    repo_root: &Path,
+    backend: CarrickBackend,
+    probe: &Path,
+    guest_args: &[&str],
+) -> Result<String, String> {
+    let run_id = perf_run_id();
+    let child = Command::new(bin)
+        .args(backend_args(backend, probe, guest_args))
+        .env("CARRICK_RUN_ID", &run_id)
+        .env("CARRICK_EXPOSED_CPUS", CPU_PIN.to_string())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .map_err(|error| format!("spawn {backend:?} backend sample: {error}"))?;
+    drain_checked_with_deadline(child, repo_root, &run_id)
 }
 
 fn feed_stdin(child: &mut std::process::Child, bytes: &[u8]) {
@@ -260,5 +356,23 @@ mod tests {
     #[test]
     fn injected_probe_snippet_exports_normalized_nproc() {
         assert!(PROBE_SNIPPET.contains("export BENCH_NPROC=4;"));
+    }
+
+    #[test]
+    fn native_and_hvf_use_the_same_direct_elf_artifact() {
+        let probe = Path::new("/repo/probes/perf_trap_floor");
+        let native = backend_args(CarrickBackend::Native16k, probe, &[]);
+        let hvf = backend_args(CarrickBackend::Hvf, probe, &[]);
+        assert_eq!(native.last(), hvf.last());
+        assert!(
+            native
+                .windows(2)
+                .any(|window| window == ["--exec-backend", "native"])
+        );
+        assert!(
+            hvf.windows(2)
+                .any(|window| window == ["--exec-backend", "hvf"])
+        );
+        assert!(!native.iter().any(|arg| arg == "--native-code-mode"));
     }
 }

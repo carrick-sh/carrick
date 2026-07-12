@@ -9,6 +9,12 @@ pub enum PerfArtifact {
     DynamicGlibc,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendPairSupport {
+    DirectElf,
+    Unsupported(&'static str),
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct PerfCase {
     /// Probe binary name in conformance-probes/.../release/ (no extension).
@@ -17,6 +23,10 @@ pub struct PerfCase {
     pub artifact: PerfArtifact,
     pub dimension: &'static str,
     pub workload: &'static str,
+    /// Arguments passed after the canonical direct-ELF probe path.
+    pub guest_args: &'static [&'static str],
+    /// Whether this case can compare identical direct-ELF artifacts.
+    pub backend_pair_support: BackendPairSupport,
     /// Key the probe prints whose value is the per-rep metric.
     pub metric_key: &'static str,
     pub unit: &'static str,
@@ -48,6 +58,8 @@ pub const CASES: &[PerfCase] = &[
         artifact: PerfArtifact::StaticMusl,
         dimension: "syscall",
         workload: "trap_floor",
+        guest_args: &[],
+        backend_pair_support: BackendPairSupport::DirectElf,
         metric_key: "trap_p50_us",
         unit: "us",
         higher_is_better: false,
@@ -62,6 +74,8 @@ pub const CASES: &[PerfCase] = &[
         artifact: PerfArtifact::StaticMusl,
         dimension: "syscall",
         workload: "dsr_gateway_scalar",
+        guest_args: &[],
+        backend_pair_support: BackendPairSupport::DirectElf,
         metric_key: "gateway_scalar_p50_us",
         unit: "us",
         higher_is_better: false,
@@ -75,6 +89,8 @@ pub const CASES: &[PerfCase] = &[
         artifact: PerfArtifact::StaticMusl,
         dimension: "syscall",
         workload: "dsr_gateway_simd",
+        guest_args: &[],
+        backend_pair_support: BackendPairSupport::DirectElf,
         metric_key: "gateway_simd_p50_us",
         unit: "us",
         higher_is_better: false,
@@ -88,6 +104,8 @@ pub const CASES: &[PerfCase] = &[
         artifact: PerfArtifact::StaticMusl,
         dimension: "syscall",
         workload: "futex_pingpong",
+        guest_args: &[],
+        backend_pair_support: BackendPairSupport::DirectElf,
         metric_key: "futex_pingpong_p50_us",
         unit: "us",
         higher_is_better: false,
@@ -103,6 +121,8 @@ pub const CASES: &[PerfCase] = &[
         artifact: PerfArtifact::StaticMusl,
         dimension: "syscall",
         workload: "wait_pipe_pingpong",
+        guest_args: &[],
+        backend_pair_support: BackendPairSupport::DirectElf,
         metric_key: "wait_pipe_pingpong_p50_us",
         unit: "us",
         higher_is_better: false,
@@ -118,6 +138,8 @@ pub const CASES: &[PerfCase] = &[
         artifact: PerfArtifact::StaticMusl,
         dimension: "syscall",
         workload: "epoll_pipe_loop",
+        guest_args: &[],
+        backend_pair_support: BackendPairSupport::DirectElf,
         metric_key: "epoll_pipe_loop_p50_us",
         unit: "us",
         higher_is_better: false,
@@ -131,6 +153,8 @@ pub const CASES: &[PerfCase] = &[
         artifact: PerfArtifact::StaticMusl,
         dimension: "syscall",
         workload: "stdio_burst",
+        guest_args: &[],
+        backend_pair_support: BackendPairSupport::DirectElf,
         metric_key: "stdio_burst_total_us",
         unit: "us",
         higher_is_better: false,
@@ -144,6 +168,8 @@ pub const CASES: &[PerfCase] = &[
         artifact: PerfArtifact::StaticMusl,
         dimension: "syscall",
         workload: "writev_burst",
+        guest_args: &[],
+        backend_pair_support: BackendPairSupport::DirectElf,
         metric_key: "writev_burst_total_us",
         unit: "us",
         higher_is_better: false,
@@ -157,6 +183,8 @@ pub const CASES: &[PerfCase] = &[
         artifact: PerfArtifact::StaticMusl,
         dimension: "syscall",
         workload: "pwritev_burst",
+        guest_args: &[],
+        backend_pair_support: BackendPairSupport::DirectElf,
         metric_key: "pwritev_burst_total_us",
         unit: "us",
         higher_is_better: false,
@@ -170,6 +198,8 @@ pub const CASES: &[PerfCase] = &[
         artifact: PerfArtifact::StaticMusl,
         dimension: "syscall",
         workload: "preadv_burst",
+        guest_args: &[],
+        backend_pair_support: BackendPairSupport::DirectElf,
         metric_key: "preadv_burst_total_us",
         unit: "us",
         higher_is_better: false,
@@ -185,6 +215,8 @@ pub const CASES: &[PerfCase] = &[
         artifact: PerfArtifact::StaticMusl,
         dimension: "memory",
         workload: "mmap_churn",
+        guest_args: &[],
+        backend_pair_support: BackendPairSupport::DirectElf,
         metric_key: "mmap_churn_total_us",
         unit: "us",
         higher_is_better: false,
@@ -201,6 +233,8 @@ pub const CASES: &[PerfCase] = &[
         artifact: PerfArtifact::StaticMusl,
         dimension: "memory",
         workload: "shared_anon_churn",
+        guest_args: &[],
+        backend_pair_support: BackendPairSupport::DirectElf,
         metric_key: "shared_anon_churn_total_us",
         unit: "us",
         higher_is_better: false,
@@ -216,6 +250,8 @@ pub const CASES: &[PerfCase] = &[
         artifact: PerfArtifact::StaticMusl,
         dimension: "memory",
         workload: "fork_mmap_snapshot",
+        guest_args: &[],
+        backend_pair_support: BackendPairSupport::DirectElf,
         metric_key: "fork_mmap_snapshot_total_us",
         unit: "us",
         higher_is_better: false,
@@ -233,6 +269,8 @@ pub const CASES: &[PerfCase] = &[
         artifact: PerfArtifact::StaticMusl,
         dimension: "process",
         workload: "fork_exec",
+        guest_args: &[],
+        backend_pair_support: BackendPairSupport::DirectElf,
         metric_key: "fork_exec_p50_us",
         unit: "us",
         higher_is_better: false,
@@ -246,6 +284,8 @@ pub const CASES: &[PerfCase] = &[
         artifact: PerfArtifact::StaticMusl,
         dimension: "network",
         workload: "tcp_rr",
+        guest_args: &[],
+        backend_pair_support: BackendPairSupport::DirectElf,
         metric_key: "tcp_rr_p50_us",
         unit: "us",
         higher_is_better: false,
@@ -260,6 +300,8 @@ pub const CASES: &[PerfCase] = &[
         artifact: PerfArtifact::StaticMusl,
         dimension: "network",
         workload: "tcp_stream",
+        guest_args: &[],
+        backend_pair_support: BackendPairSupport::DirectElf,
         metric_key: "tcp_stream_mbps",
         unit: "MB/s",
         higher_is_better: true,
@@ -274,6 +316,8 @@ pub const CASES: &[PerfCase] = &[
         artifact: PerfArtifact::StaticMusl,
         dimension: "disk",
         workload: "stat_storm",
+        guest_args: &[],
+        backend_pair_support: BackendPairSupport::DirectElf,
         metric_key: "stat_p50_us",
         unit: "us",
         higher_is_better: false,
@@ -288,6 +332,8 @@ pub const CASES: &[PerfCase] = &[
         artifact: PerfArtifact::StaticMusl,
         dimension: "disk",
         workload: "large_meta",
+        guest_args: &[],
+        backend_pair_support: BackendPairSupport::DirectElf,
         metric_key: "large_meta_total_us",
         unit: "us",
         higher_is_better: false,
@@ -303,6 +349,8 @@ pub const CASES: &[PerfCase] = &[
         artifact: PerfArtifact::StaticMusl,
         dimension: "disk",
         workload: "overlay_small_updates",
+        guest_args: &[],
+        backend_pair_support: BackendPairSupport::DirectElf,
         metric_key: "overlay_small_updates_total_us",
         unit: "us",
         higher_is_better: false,
@@ -319,6 +367,10 @@ pub const CASES: &[PerfCase] = &[
         artifact: PerfArtifact::DynamicGlibc,
         dimension: "dynamic",
         workload: "dynamic_overlay_small_updates",
+        guest_args: &[],
+        backend_pair_support: BackendPairSupport::Unsupported(
+            "requires an OCI image and glibc dynamic loader, not direct run-elf",
+        ),
         metric_key: "dynamic_overlay_small_updates_total_us",
         unit: "us",
         higher_is_better: false,
@@ -334,6 +386,10 @@ pub const CASES: &[PerfCase] = &[
         artifact: PerfArtifact::StaticMusl,
         dimension: "disk",
         workload: "vol_write",
+        guest_args: &[],
+        backend_pair_support: BackendPairSupport::Unsupported(
+            "requires a host bind mount, which direct run-elf does not provide",
+        ),
         metric_key: "disk_vol_write_mbps",
         unit: "MB/s",
         higher_is_better: true,
@@ -347,6 +403,10 @@ pub const CASES: &[PerfCase] = &[
         artifact: PerfArtifact::StaticMusl,
         dimension: "disk",
         workload: "vol_read",
+        guest_args: &[],
+        backend_pair_support: BackendPairSupport::Unsupported(
+            "requires a host bind mount, which direct run-elf does not provide",
+        ),
         metric_key: "disk_vol_read_mbps",
         unit: "MB/s",
         higher_is_better: true,
@@ -362,6 +422,10 @@ pub const CASES: &[PerfCase] = &[
         artifact: PerfArtifact::StaticMusl,
         dimension: "network",
         workload: "xboundary_rtt",
+        guest_args: &[],
+        backend_pair_support: BackendPairSupport::Unsupported(
+            "requires coordinated host-client and guest-server processes",
+        ),
         metric_key: "xrtt_p50_us",
         unit: "us",
         higher_is_better: false,
@@ -375,6 +439,10 @@ pub const CASES: &[PerfCase] = &[
         artifact: PerfArtifact::StaticMusl,
         dimension: "network",
         workload: "xboundary_stream",
+        guest_args: &[],
+        backend_pair_support: BackendPairSupport::Unsupported(
+            "requires coordinated host-client and guest-server processes",
+        ),
         metric_key: "xstream_mbps",
         unit: "MB/s",
         higher_is_better: true,
@@ -402,6 +470,14 @@ mod tests {
             );
             if c.mount_scratch {
                 assert_eq!(c.carrick_fs_mode, "host");
+            }
+            match c.backend_pair_support {
+                BackendPairSupport::DirectElf => {
+                    assert!(!c.mount_scratch);
+                    assert!(!c.cross_boundary);
+                    assert_eq!(c.artifact, PerfArtifact::StaticMusl);
+                }
+                BackendPairSupport::Unsupported(reason) => assert!(!reason.trim().is_empty()),
             }
         }
     }
