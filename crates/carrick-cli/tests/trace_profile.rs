@@ -70,10 +70,13 @@ fn bundled_profile_scripts_emit_one_versioned_completion() {
             .join("../../scripts/dtrace")
             .join(name);
         let script = std::fs::read_to_string(path).unwrap();
-        let completion = format!("DSRPROF1|complete|profile={profile}|bounded=%d");
+        let completion =
+            format!("DSRPROF1|complete|profile={profile}|bounded=%d|target_exit_reason=%d");
         assert_eq!(script.matches(&completion).count(), 1);
         assert!(script.contains("proc:::create"));
         assert!(script.contains("progenyof($target)"));
+        assert!(script.contains("pid == $target"));
+        assert!(script.contains("target_exit_reason = arg0"));
     }
 }
 

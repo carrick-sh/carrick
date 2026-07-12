@@ -184,6 +184,7 @@ pub(crate) struct ProfileCaptureStatus {
     pub(crate) aggregation_drops: u64,
     pub(crate) dynamic_drops: u64,
     pub(crate) other_drops: u64,
+    pub(crate) interrupted: bool,
 }
 
 #[cfg(target_os = "macos")]
@@ -194,6 +195,7 @@ impl From<carrick_runtime::dtrace_consumer::DTraceRunReport> for ProfileCaptureS
             aggregation_drops: report.aggregation_drops,
             dynamic_drops: report.dynamic_drops,
             other_drops: report.other_drops,
+            interrupted: report.interrupted,
         }
     }
 }
@@ -279,6 +281,7 @@ pub(crate) enum ProfileMetric {
 pub(crate) struct CompletionState {
     complete: bool,
     bounded: bool,
+    target_exit_reason: u64,
     high_cardinality_overflow: bool,
     incomplete_pairs: u64,
     cardinality: ProfileCardinality,
@@ -367,7 +370,12 @@ impl ProfileSummary {
                     1 => true,
                     other => bail!("completion bounded field must be 0 or 1, got {other}"),
                 };
-                completion = Some((profile, bounded));
+                // macOS proc:::exit arg0 is the CLD_* reason. CLD_EXITED is 1;
+                // signal termination (for example an interrupted trace) is not
+                // a successful profile completion. Default old DSRPROF1 streams
+                // to CLD_EXITED so checked-in pre-field evidence remains readable.
+                let target_exit_reason = record.optional_u64("target_exit_reason")?.unwrap_or(1);
+                completion = Some((profile, bounded, target_exit_reason));
                 continue;
             }
 
@@ -433,7 +441,7 @@ impl ProfileSummary {
             }
         }
 
-        let (profile, bounded) =
+        let (profile, bounded, target_exit_reason) =
             completion.ok_or_else(|| anyhow!("profile stream is missing its completion record"))?;
         let incomplete_pairs = grouped.values().fold(0_u64, |total, builder| {
             total.saturating_add(builder.incomplete)
@@ -463,11 +471,14 @@ impl ProfileSummary {
         };
         let completion = CompletionState {
             complete: !bounded
+                && target_exit_reason == 1
+                && !capture_status.interrupted
                 && incomplete_pairs == 0
                 && capture_status.aggregation_drops == 0
                 && capture_status.dynamic_drops == 0
                 && capture_status.other_drops == 0,
             bounded,
+            target_exit_reason,
             high_cardinality_overflow: capture_status.aggregation_drops != 0
                 || capture_status.dynamic_drops != 0,
             incomplete_pairs,
@@ -559,11 +570,13 @@ impl ProfileSummary {
 
     pub(crate) fn render_human(&self) -> String {
         format!(
-            "DSR profile {}: {} metric row(s), complete={}, bounded={}, incomplete_pairs={}, drops={}/{}/{}/{}",
+            "DSR profile {}: {} metric row(s), complete={}, bounded={}, interrupted={}, target_exit_reason={}, incomplete_pairs={}, drops={}/{}/{}/{}",
             self.profile.as_str(),
             self.metrics.len().saturating_sub(1),
             self.completion.complete,
             self.completion.bounded,
+            self.completion.drops.interrupted,
+            self.completion.target_exit_reason,
             self.completion.incomplete_pairs,
             self.completion.drops.principal_drops,
             self.completion.drops.aggregation_drops,
@@ -803,6 +816,31 @@ mod tests {
             ProfileSummary::from_lines(["DSRPROF1|complete|profile=dsr|bounded=0"], status)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn signaled_target_exit_cannot_complete_a_profile() {
+        let summary = ProfileSummary::from_lines(
+            ["DSRPROF1|complete|profile=dsr|bounded=0|target_exit_reason=2"],
+            ProfileCaptureStatus::default(),
+        )
+        .expect("signaled profile summary");
+        assert!(!summary.completion.complete);
+        assert_eq!(summary.completion.target_exit_reason, 2);
+    }
+
+    #[test]
+    fn interrupted_capture_cannot_complete_a_profile() {
+        let summary = ProfileSummary::from_lines(
+            ["DSRPROF1|complete|profile=dsr|bounded=0|target_exit_reason=1"],
+            ProfileCaptureStatus {
+                interrupted: true,
+                ..ProfileCaptureStatus::default()
+            },
+        )
+        .expect("interrupted profile summary");
+        assert!(!summary.completion.complete);
+        assert!(summary.completion.drops.interrupted);
     }
 
     #[test]

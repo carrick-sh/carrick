@@ -11,6 +11,12 @@ BEGIN
     self->dispatch_active = 0;
 }
 
+proc:::exit
+/pid == $target/
+{
+    target_exit_reason = arg0;
+}
+
 proc:::create
 /(pid == $target || progenyof($target))/
 {
@@ -346,5 +352,6 @@ END
     printa("DSRPROF1|count|phase=cache-event|pid=%d|kind=%d|value=%@d\n", @cache_event_count);
     printa("DSRPROF1|count|phase=cache-lifecycle|pid=%d|tid=%d|kind=%d|value=%@d\n", @cache_lifecycle_count);
     printa("DSRPROF1|high-water|metric=cache-bytes|pid=%d|used=%@d|capacity=%@d\n", @cache_used, @cache_capacity);
-    printf("DSRPROF1|complete|profile=dsr|bounded=%d\n", bounded);
+    printf("DSRPROF1|complete|profile=dsr|bounded=%d|target_exit_reason=%d\n",
+        bounded, target_exit_reason);
 }
