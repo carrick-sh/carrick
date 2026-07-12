@@ -528,6 +528,10 @@ unsafe extern "C" {
     fn carrick_native_dsr_enter_guest_abi(context: *mut libc::c_void) -> libc::c_int;
     #[cfg(test)]
     fn carrick_native_dsr_enter_host_abi();
+    #[cfg(test)]
+    fn carrick_native_dsr_benchmark_signal_mask_pair() -> libc::c_int;
+    #[cfg(test)]
+    fn carrick_native_dsr_benchmark_custom_x18_pair() -> libc::c_int;
     fn carrick_native_clear_icache(start: *mut libc::c_void, len: usize);
 }
 
