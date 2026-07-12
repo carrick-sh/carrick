@@ -142,6 +142,12 @@ struct NativeUcontextSnapshot {
     far: u64,
 }
 
+type DsrPrepareAndEnterFn = fn(
+    &mut dsr::ThreadTranslator,
+    &SharedNativeMemory,
+    &mut NativeUcontextSnapshot,
+) -> Result<(dsr::PreparedEntry, dsr::PreparedExit), RuntimeError>;
+
 #[derive(Clone, Copy)]
 struct NativeRelativeRelocation {
     address: u64,
@@ -1774,17 +1780,11 @@ fn run_native_dsr_thread_loop(
     let process_translator = memory.lock().dsr_process_translator()?;
     let mut translator =
         dsr::ThreadTranslator::for_process(process_translator, thread_runtime.tid().raw());
-    let prepare_and_enter: fn(
-        &mut dsr::ThreadTranslator,
-        &SharedNativeMemory,
-        &mut NativeUcontextSnapshot,
-    )
-        -> Result<(dsr::PreparedEntry, dsr::PreparedExit), RuntimeError> =
-        if translator.profiling_enabled() {
-            prepare_and_enter_dsr::<true>
-        } else {
-            prepare_and_enter_dsr::<false>
-        };
+    let prepare_and_enter: DsrPrepareAndEnterFn = if translator.profiling_enabled() {
+        prepare_and_enter_dsr::<true>
+    } else {
+        prepare_and_enter_dsr::<false>
+    };
     let trace_syscalls = std::env::var_os("CARRICK_NATIVE_TRACE_SYSCALLS").is_some();
     let mut vfork_completion: Option<NativeVforkCompletion> = None;
     let mut traps = 0_usize;

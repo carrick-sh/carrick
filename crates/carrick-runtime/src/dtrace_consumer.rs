@@ -72,6 +72,8 @@
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_uint, c_void};
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Bundled D program. Mirrors `scripts/dtrace/syscalls.d` so the build artifact
 /// is self-contained.
@@ -145,6 +147,30 @@ pub struct DTraceRunReport {
     pub aggregation_drops: u64,
     pub dynamic_drops: u64,
     pub other_drops: u64,
+    pub interrupted: bool,
+}
+
+struct InterruptRegistrations(Vec<signal_hook::SigId>);
+
+impl InterruptRegistrations {
+    fn install(interrupted: &Arc<AtomicBool>) -> Result<Self, DTraceError> {
+        let mut registrations = Vec::with_capacity(2);
+        for signal in [libc::SIGINT, libc::SIGTERM] {
+            registrations.push(
+                signal_hook::flag::register(signal, Arc::clone(interrupted))
+                    .map_err(DTraceError::SignalHandler)?,
+            );
+        }
+        Ok(Self(registrations))
+    }
+}
+
+impl Drop for InterruptRegistrations {
+    fn drop(&mut self) {
+        for registration in self.0.drain(..) {
+            signal_hook::low_level::unregister(registration);
+        }
+    }
 }
 
 fn record_drop(report: &mut DTraceRunReport, kind: c_int, drops: u64) {
@@ -249,6 +275,8 @@ unsafe extern "C" {
 pub enum DTraceError {
     #[error("dtrace_open failed: errno={0}")]
     Open(c_int),
+    #[error("install DTrace interrupt handler: {0}")]
+    SignalHandler(std::io::Error),
     #[error("dtrace_setopt('{key}'='{val}') failed: {msg}")]
     SetOpt {
         key: String,
@@ -472,6 +500,7 @@ pub fn run_child_under_dtrace(
         opts.drop_credentials.as_ref().map(|c| (c.uid, c.gid)),
     )?;
     let hdl = DtraceHandle::open()?;
+    let interrupted = Arc::new(AtomicBool::new(false));
     let mut report = DTraceRunReport::default();
     if unsafe {
         dtrace_handle_drop(
@@ -549,6 +578,11 @@ pub fn run_child_under_dtrace(
         return Err(DTraceError::Go(msg));
     }
 
+    // libdtrace installs its own process-signal handlers during activation.
+    // Register after `dtrace_go` so signal-hook chains that final handler
+    // instead of having our flag handler replaced before the consume loop.
+    let _interrupt_registrations = InterruptRegistrations::install(&interrupted)?;
+
     unsafe { dtrace_proc_continue(hdl.as_ptr(), proc_h.as_ptr()) };
 
     // When a custom D script is supplied, the user is responsible for bounding
@@ -573,6 +607,10 @@ pub fn run_child_under_dtrace(
         unsafe { fflush(out.fp()) };
         let proc_state = unsafe { dtrace_proc_state(hdl.as_ptr(), proc_h.as_ptr()) };
         let child_terminal = proc_state == PS_DEAD || proc_state == PS_UNDEAD;
+        if interrupted.load(Ordering::Acquire) {
+            report.interrupted = true;
+            break;
+        }
         match status {
             DTRACE_WORKSTATUS_DONE => break,
             DTRACE_WORKSTATUS_OKAY => {
@@ -588,6 +626,7 @@ pub fn run_child_under_dtrace(
     }
 
     unsafe { dtrace_stop(hdl.as_ptr()) };
+    report.interrupted |= interrupted.load(Ordering::Acquire);
     if opts.print_remaining_aggregates {
         unsafe { dtrace_aggregate_snap(hdl.as_ptr()) };
         unsafe { dtrace_aggregate_print(hdl.as_ptr(), out.fp(), std::ptr::null_mut()) };
@@ -728,6 +767,7 @@ mod tests {
                 aggregation_drops: 2,
                 dynamic_drops: 12,
                 other_drops: 6,
+                interrupted: false,
             }
         );
     }
