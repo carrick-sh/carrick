@@ -51,12 +51,12 @@ image-map p50. Otherwise publish the profile as non-selecting.
 - Modify: `crates/carrick-observability/src/probes.rs`
 - Modify: `crates/carrick-cli/tests/trace_profile.rs`
 
-- [ ] **Step 1: Add ordinals 15 through 24**
+- [x] **Step 1: Add ordinals 15 through 24**
 
 Add stable pairs for `ExecMapMmap`, `ExecMapCopy`, `ExecMapIcache`,
 `ExecMapProtect`, and `ExecMapVvar`. Extend the ordinal/uniqueness test.
 
-- [ ] **Step 2: Extend the script-surface test red**
+- [x] **Step 2: Extend the script-surface test red**
 
 Require `dsr-fork.d` to emit sampled and incomplete rows named
 `exec-map-mmap`, `exec-map-copy`, `exec-map-icache`, `exec-map-protect`, and
@@ -71,7 +71,10 @@ cargo test -p carrick-cli --test trace_profile \
 Expected: the ordinal test passes; the script-surface test fails because the D
 program does not yet produce the five rows.
 
-- [ ] **Step 3: Commit the red surface**
+Observed: all five typed ABI tests pass; the script-surface test fails first at
+`missing exec-map-mmap sample`.
+
+- [x] **Step 3: Commit the red surface**
 
 Use `test(trace): pin DSR exec map detail phases` and record the exact red
 assertion.
