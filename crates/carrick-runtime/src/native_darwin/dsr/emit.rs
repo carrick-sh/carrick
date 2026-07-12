@@ -905,6 +905,16 @@ fn emit_block_inner(
     let mut entries = Vec::with_capacity(plan.instructions.len() + 8);
     let mut direct_links = Vec::new();
     let mut recovery = Vec::new();
+    let entry_marker = current_offset(&assembler)?;
+    map_next(&assembler, &mut entries, plan.start)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; str wzr, [x28, #1152]
+    );
+    recovery.push(RecoveryEntry {
+        cache: entry_marker,
+        action: RecoveryAction::Noop,
+    });
     let stale = guard.map(|_| assembler.new_dynamic_label());
     if let (Some(guard), Some(stale)) = (guard, stale) {
         let guard_start = current_offset(&assembler)?;

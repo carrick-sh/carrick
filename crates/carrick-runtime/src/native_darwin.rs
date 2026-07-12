@@ -518,6 +518,10 @@ unsafe extern "C" {
     fn carrick_native_kick_state_requested(state: *mut libc::c_void) -> u64;
     #[cfg(test)]
     fn carrick_native_kick_state_acknowledged(state: *mut libc::c_void) -> u64;
+    #[cfg(test)]
+    fn carrick_native_dsr_enter_guest_abi(context: *mut libc::c_void) -> libc::c_int;
+    #[cfg(test)]
+    fn carrick_native_dsr_enter_host_abi();
     fn carrick_native_clear_icache(start: *mut libc::c_void, len: usize);
 }
 
@@ -9389,6 +9393,49 @@ mod tests {
         })
         .join()
         .expect("join native transport signal test thread");
+    }
+
+    #[test]
+    fn dsr_gateway_unblocks_kicks_only_while_guest_runs() {
+        std::thread::spawn(|| {
+            let mut kick: libc::sigset_t = unsafe { std::mem::zeroed() };
+            let mut original: libc::sigset_t = unsafe { std::mem::zeroed() };
+            unsafe {
+                libc::sigemptyset(&mut kick);
+                libc::sigaddset(&mut kick, libc::SIGPIPE);
+            }
+            assert_eq!(
+                unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &kick, &mut original) },
+                0
+            );
+
+            assert_eq!(
+                unsafe { carrick_native_dsr_enter_guest_abi(std::ptr::null_mut()) },
+                0
+            );
+            let mut current: libc::sigset_t = unsafe { std::mem::zeroed() };
+            assert_eq!(
+                unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut current) },
+                0
+            );
+            assert_eq!(unsafe { libc::sigismember(&current, libc::SIGPIPE) }, 0);
+
+            unsafe { carrick_native_dsr_enter_host_abi() };
+            assert_eq!(
+                unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut current) },
+                0
+            );
+            assert_eq!(unsafe { libc::sigismember(&current, libc::SIGPIPE) }, 1);
+
+            assert_eq!(
+                unsafe {
+                    libc::pthread_sigmask(libc::SIG_SETMASK, &original, std::ptr::null_mut())
+                },
+                0
+            );
+        })
+        .join()
+        .expect("join DSR kick-mask test thread");
     }
 
     #[test]

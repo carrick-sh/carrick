@@ -1425,6 +1425,65 @@ fn dsr_concurrency_kick_exits_guarded_linked_loop_without_corrupting_guest_state
 }
 
 #[test]
+fn dsr_pending_kick_during_gateway_entry_keeps_guest_pc() {
+    assert_eq!(
+        unsafe { super::super::carrick_native_install_trap_handler() },
+        0
+    );
+    let guest = GuestVa(0x1c_300);
+    let mut cache = TranslationCache::new(16 * 1024).expect("allocate entry-kick cache");
+    let emitted = emit_block(
+        &mut cache,
+        &BlockPlan {
+            start: guest,
+            end: GuestVa(guest.raw() + 4),
+            generation: CodeGeneration::INITIAL,
+            instructions: Vec::new(),
+            exit: PlannedExit::Syscall {
+                guest,
+                resume: GuestVa(guest.raw() + 4),
+            },
+        },
+    )
+    .expect("emit entry-kick block");
+    let state = super::super::NativeKickState::new().expect("create entry-kick state");
+    state.bind_current().expect("bind entry-kick state");
+
+    let mut kick: libc::sigset_t = unsafe { std::mem::zeroed() };
+    let mut original: libc::sigset_t = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::sigemptyset(&mut kick);
+        libc::sigaddset(&mut kick, libc::SIGPIPE);
+    }
+    assert_eq!(
+        unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &kick, &mut original) },
+        0
+    );
+    assert!(state.request());
+    assert_eq!(
+        unsafe { libc::pthread_kill(libc::pthread_self(), libc::SIGPIPE) },
+        0
+    );
+
+    let mut stack = vec![0_u8; 16 * 1024];
+    let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    snapshot.pc = guest.raw();
+    let mut exit = NativeDsrExit::Syscall { resume: guest };
+    enter_translated(emitted.entry(), &mut snapshot, &mut exit)
+        .expect("exit pending kick at DSR entry");
+
+    state.unbind_current();
+    assert_eq!(
+        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &original, std::ptr::null_mut()) },
+        0
+    );
+    assert!(
+        matches!(exit, NativeDsrExit::KickAtEntry { resume } if resume == guest),
+        "entry kick must preserve the guest resume PC, got {exit:?}"
+    );
+}
+
+#[test]
 fn dsr_signal_fault_recovers_scratch_in_expanded_x18_load() {
     assert_eq!(
         unsafe { super::super::carrick_native_install_trap_handler() },
