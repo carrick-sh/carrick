@@ -92,8 +92,11 @@ struct DsrContext {
     rewrite_context_scratch: u64,
     indirect_cache: *const IndirectTargetCacheEntry,
     generation: u64,
+    /// Gateway phase: 1 entering, 0 translated code, 2 leaving after capture.
     entry_in_progress: u32,
     entry_pad: u32,
+    indirect_x15_scratch: u64,
+    indirect_x30_scratch: u64,
 }
 
 impl DsrContext {
@@ -152,6 +155,8 @@ impl DsrContext {
             generation: generation.get(),
             entry_in_progress: 1,
             entry_pad: 0,
+            indirect_x15_scratch: snapshot.x[15],
+            indirect_x30_scratch: snapshot.x[30],
         }
     }
 }
@@ -173,7 +178,9 @@ const _: () = assert!(std::mem::offset_of!(DsrContext, rewrite_context_scratch) 
 const _: () = assert!(std::mem::offset_of!(DsrContext, indirect_cache) == 1136);
 const _: () = assert!(std::mem::offset_of!(DsrContext, generation) == 1144);
 const _: () = assert!(std::mem::offset_of!(DsrContext, entry_in_progress) == 1152);
-const _: () = assert!(std::mem::size_of::<DsrContext>() == 1168);
+const _: () = assert!(std::mem::offset_of!(DsrContext, indirect_x15_scratch) == 1160);
+const _: () = assert!(std::mem::offset_of!(DsrContext, indirect_x30_scratch) == 1168);
+const _: () = assert!(std::mem::size_of::<DsrContext>() == 1184);
 const _: () = assert!(std::mem::size_of::<IndirectTargetCacheEntry>() == 32);
 const _: () = assert!(std::mem::offset_of!(IndirectTargetCacheEntry, guest) == 0);
 const _: () = assert!(std::mem::offset_of!(IndirectTargetCacheEntry, generation) == 8);
@@ -293,12 +300,18 @@ fn enter_translated_raw(
             rewrite_scratch: context.rewrite_scratch,
             rewrite_context_scratch: context.rewrite_context_scratch,
             generation_pstate_scratch: context.generation_pstate_scratch,
+            indirect_x15_scratch: context.indirect_x15_scratch,
+            indirect_x30_scratch: context.indirect_x30_scratch,
+            physical_x18: context.exit_link,
+            gateway_phase: context.exit_has_link,
         },
         5 => NativeDsrExit::Kick {
             resume: carrick_guest_mem::GuestVa(context.exit_target),
             rewrite_scratch: context.rewrite_scratch,
             rewrite_context_scratch: context.rewrite_context_scratch,
             generation_pstate_scratch: context.generation_pstate_scratch,
+            indirect_x15_scratch: context.indirect_x15_scratch,
+            indirect_x30_scratch: context.indirect_x30_scratch,
         },
         6 => NativeDsrExit::Sensitive {
             guest_pc: carrick_guest_mem::GuestVa(context.exit_source),
