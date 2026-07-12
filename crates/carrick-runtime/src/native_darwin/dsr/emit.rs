@@ -10,11 +10,6 @@ use super::block::{BlockPlan, PlannedExit};
 use super::cache::{PublishedCode, TranslationCache};
 use super::types::{CacheOffset, CacheVa, CodeGeneration, DsrError, InstAction};
 
-const BRK_DSR_CONTINUE: u32 = 0xd43a_0020;
-const BRK_DSR_SYSCALL: u32 = 0xd43a_0040;
-const BRK_DSR_SENSITIVE: u32 = 0xd43a_0060;
-const BRK_DSR_UNSUPPORTED: u32 = 0xd43a_0080;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct PcMapEntry {
     pub(super) guest: GuestVa,
@@ -171,33 +166,6 @@ fn unsupported_action(
         word,
         op,
         class,
-    }
-}
-
-fn exit_word(plan: &BlockPlan) -> Result<u32, DsrError> {
-    match plan.exit {
-        PlannedExit::Continue { .. } => Ok(BRK_DSR_CONTINUE),
-        PlannedExit::Syscall { .. } => Ok(BRK_DSR_SYSCALL),
-        PlannedExit::Sensitive { .. } => Ok(BRK_DSR_SENSITIVE),
-        PlannedExit::Unsupported { .. } => Ok(BRK_DSR_UNSUPPORTED),
-        PlannedExit::VirtualizedX18 { guest, word, .. } => Err(unsupported_action(
-            plan,
-            guest,
-            word,
-            "virtualized x18 instruction",
-        )),
-        PlannedExit::VirtualizedX28 { guest, word, .. } => Err(unsupported_action(
-            plan,
-            guest,
-            word,
-            "virtualized x28 instruction",
-        )),
-        PlannedExit::Direct { guest, word, .. } => {
-            Err(unsupported_action(plan, guest, word, "direct exit"))
-        }
-        PlannedExit::Indirect { guest, word, .. } => {
-            Err(unsupported_action(plan, guest, word, "indirect exit"))
-        }
     }
 }
 
@@ -1506,8 +1474,9 @@ fn emit_block_inner(
             super::gateway::unsupported_exit_address(),
         )?;
     } else {
-        map_next(&assembler, &mut entries, exit_guest)?;
-        assembler.push_u32(exit_word(plan)?);
+        return Err(DsrError::BlockPolicy(
+            "virtualized register action escaped the DSR copy stream".to_string(),
+        ));
     }
     if let Some(stale) = stale {
         dynasmrt::dynasm!(assembler
@@ -1583,7 +1552,7 @@ mod tests {
     use super::super::block::{BlockLimit, PlannedInst};
     use super::super::types::{
         CodeGeneration, DirectExit, DirectKind, IndirectExit, IndirectKind, PcRelativeInst,
-        PcRelativeKind,
+        PcRelativeKind, SensitiveExit, SensitiveKind,
     };
     use super::*;
 
@@ -1701,6 +1670,90 @@ mod tests {
                 guest: GuestVa(0x4008),
                 resume: GuestVa(0x400c),
             },
+        }
+    }
+
+    fn emitted_words_for_all_gateway_exits() -> Vec<Vec<u32>> {
+        let syscall = copy_plan();
+
+        let mut direct = copy_plan();
+        direct.exit = PlannedExit::Direct {
+            guest: GuestVa(0x4008),
+            word: 0x1400_0002,
+            exit: DirectExit {
+                kind: DirectKind::Branch,
+                target: GuestVa(0x4010),
+                resume: GuestVa(0x400c),
+                condition: None,
+                register: None,
+                bit: None,
+            },
+        };
+
+        let mut indirect = copy_plan();
+        indirect.exit = PlannedExit::Indirect {
+            guest: GuestVa(0x4008),
+            word: 0xd61f_0000,
+            exit: IndirectExit {
+                kind: IndirectKind::Branch,
+                register: bad64::Reg::X0,
+                resume: GuestVa(0x400c),
+            },
+        };
+
+        let mut sensitive = copy_plan();
+        sensitive.exit = PlannedExit::Sensitive {
+            guest: GuestVa(0x4008),
+            word: 0xd53b_d040,
+            exit: SensitiveExit {
+                kind: SensitiveKind::ReadTpidr,
+                register: Some(bad64::Reg::X0),
+                resume: GuestVa(0x400c),
+            },
+        };
+
+        let mut continuation = copy_plan();
+        continuation.instructions.truncate(1);
+        continuation.end = GuestVa(0x4004);
+        continuation.exit = PlannedExit::Continue {
+            target: GuestVa(0x4004),
+            limit: BlockLimit::InstructionLimit,
+        };
+
+        let mut unsupported = copy_plan();
+        unsupported.exit = PlannedExit::Unsupported {
+            guest: GuestVa(0x4008),
+            word: 0,
+            op: bad64::Op::UDF,
+        };
+
+        let mut cache = TranslationCache::new(128 * 1024).expect("allocate exit emission cache");
+        [
+            syscall,
+            direct,
+            indirect,
+            sensitive,
+            continuation,
+            unsupported,
+        ]
+        .into_iter()
+        .map(|plan| {
+            let emitted = emit_block(&mut cache, &plan).expect("emit gateway exit");
+            (0..emitted.len() / 4)
+                .map(|index| unsafe {
+                    std::ptr::read_unaligned(
+                        (emitted.entry().host().raw() + index * 4) as *const u32,
+                    )
+                })
+                .collect()
+        })
+        .collect()
+    }
+
+    #[test]
+    fn carrick_owned_emitted_blocks_contain_no_brk_transport() {
+        for words in emitted_words_for_all_gateway_exits() {
+            assert!(words.iter().all(|word| word & 0xffe0_001f != 0xd420_0000));
         }
     }
 

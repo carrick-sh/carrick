@@ -389,7 +389,6 @@ pub struct RunStaticElfBackendOptions<'a> {
     pub debug_state_path: Option<&'a PathBuf>,
     pub exec_backend: carrick_spec::ExecBackendRequest,
     pub native_page_profile: carrick_spec::NativePageProfileRequest,
-    pub native_code_mode: carrick_spec::NativeCodeModeRequest,
 }
 
 pub fn run_static_elf_with_backend_args_and_dispatcher_debug<A, E>(
@@ -407,7 +406,6 @@ where
         carrick_spec::Platform::host_native(),
         options.exec_backend,
         options.native_page_profile,
-        options.native_code_mode,
     )?;
     match plan.backend {
         crate::page_profile::ExecutionBackend::Hvf => {

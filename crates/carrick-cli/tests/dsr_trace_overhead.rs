@@ -753,8 +753,6 @@ fn workload_args(workload: Workload, root: &Path, run_id: &str) -> Vec<String> {
             "native".to_owned(),
             "--native-page-profile".to_owned(),
             "native16k".to_owned(),
-            "--native-code-mode".to_owned(),
-            "dsr".to_owned(),
             root.join("conformance-probes/target/native-pie/aarch64-unknown-linux-musl/release/perf_trap_floor")
                 .to_string_lossy()
                 .into_owned(),
@@ -766,8 +764,6 @@ fn workload_args(workload: Workload, root: &Path, run_id: &str) -> Vec<String> {
             "native".to_owned(),
             "--native-page-profile".to_owned(),
             "native16k".to_owned(),
-            "--native-code-mode".to_owned(),
-            "dsr".to_owned(),
             root.join("conformance-probes/target/native-pie/aarch64-unknown-linux-musl/release/perf_dsr_gateway")
                 .to_string_lossy()
                 .into_owned(),
@@ -779,8 +775,6 @@ fn workload_args(workload: Workload, root: &Path, run_id: &str) -> Vec<String> {
             "native".to_owned(),
             "--native-page-profile".to_owned(),
             "native16k".to_owned(),
-            "--native-code-mode".to_owned(),
-            "dsr".to_owned(),
             root.join("conformance-probes/target/native-pie/aarch64-unknown-linux-musl/release/perf_dsr_indirect")
                 .to_string_lossy()
                 .into_owned(),
@@ -800,8 +794,6 @@ fn workload_args(workload: Workload, root: &Path, run_id: &str) -> Vec<String> {
             "native".to_owned(),
             "--native-page-profile".to_owned(),
             "native16k".to_owned(),
-            "--native-code-mode".to_owned(),
-            "dsr".to_owned(),
             V8_IMAGE.to_owned(),
             V8_SCRIPT.to_owned(),
         ],
@@ -812,8 +804,6 @@ fn workload_args(workload: Workload, root: &Path, run_id: &str) -> Vec<String> {
             "native".to_owned(),
             "--native-page-profile".to_owned(),
             "native16k".to_owned(),
-            "--native-code-mode".to_owned(),
-            "dsr".to_owned(),
             root.join("conformance-probes/target/native-pie/aarch64-unknown-linux-musl/release/perf_fork_exec")
                 .to_string_lossy()
                 .into_owned(),

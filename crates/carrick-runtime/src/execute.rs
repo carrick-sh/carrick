@@ -775,7 +775,6 @@ mod exit_code_tests {
             platform: Platform::Aarch64,
             exec_backend: ExecBackendRequest::Native,
             native_page_profile: page_profile,
-            native_code_mode: carrick_spec::NativeCodeModeRequest::Brk,
             pid: PidMode::Host,
             hostname: None,
             network: NetworkNamespaceSpec::default(),

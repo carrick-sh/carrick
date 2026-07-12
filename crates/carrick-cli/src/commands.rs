@@ -156,7 +156,6 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 forward_env: vec![],
                 exec_backend: carrick_spec::ExecBackendRequest::Auto,
                 native_page_profile: carrick_spec::NativePageProfileRequest::Auto,
-                native_code_mode: carrick_spec::NativeCodeModeRequest::Brk,
                 command: vec!["/bin/sh".to_owned()],
             }
         }
@@ -203,7 +202,6 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             forward_env,
             exec_backend,
             native_page_profile,
-            native_code_mode,
             security_opt,
             args,
         } => {
@@ -313,7 +311,6 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     debug_state_path: debug_state_path.as_ref(),
                     exec_backend,
                     native_page_profile,
-                    native_code_mode,
                 },
             )
             .with_context(|| format!("failed to run static ELF {}", path.display()))?;
@@ -510,7 +507,6 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             fs,
             exec_backend,
             native_page_profile,
-            native_code_mode,
             network,
             network_alias,
             ip,
@@ -591,7 +587,6 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 fs,
                 exec_backend,
                 native_page_profile,
-                native_code_mode,
                 pid,
                 network: parsed_network.mode,
                 network_bridge: parsed_network.bridge,
@@ -773,7 +768,6 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             fs,
             exec_backend,
             native_page_profile,
-            native_code_mode,
             pid,
             network,
             network_alias,
@@ -836,7 +830,6 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 fs,
                 exec_backend,
                 native_page_profile,
-                native_code_mode,
                 pid,
                 network: parsed_network.mode,
                 network_bridge: parsed_network.bridge,
