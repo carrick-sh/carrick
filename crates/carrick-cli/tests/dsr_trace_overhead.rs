@@ -389,6 +389,20 @@ fn stack_window_improvement() {
 }
 
 #[test]
+#[ignore = "explicit opt-in batched syscall-floor audit"]
+fn stack_window_batched_syscall_floor() {
+    run_binary_gate(
+        "stack-window-batched-syscall-floor",
+        &[BinaryGate {
+            workload: Workload::SyscallFloor,
+            cycles: 15,
+            policy: BinaryGatePolicy::NonInferiority { upper_bound: 1.01 },
+        }],
+        "CARRICK_DSR_OPTIMIZATION_OUT",
+    );
+}
+
+#[test]
 #[ignore = "explicit opt-in DTrace profile cost measurement"]
 fn enabled_profile_overhead() {
     let root = repo_root();
@@ -643,7 +657,7 @@ fn run_workload(
     );
     match workload {
         Workload::SyscallFloor if !wall_time_metric => {
-            parse_metric(&text, "trap_trimmed_mean_us").expect("trap_trimmed_mean_us")
+            parse_metric(&text, "trap_batch_trimmed_mean_us").expect("trap_batch_trimmed_mean_us")
         }
         Workload::SyscallFloor => elapsed_ms,
         Workload::MonomorphicIndirect => {
