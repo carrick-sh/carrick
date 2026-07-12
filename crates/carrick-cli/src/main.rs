@@ -124,9 +124,11 @@ mod commands;
 mod debug;
 mod fs_setup;
 mod lifecycle;
+mod perf_stats;
 mod runtime_util;
 mod serve;
 mod trace_cli;
+mod trace_profile;
 
 use clap::Parser;
 
