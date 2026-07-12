@@ -590,6 +590,72 @@ fn dsr_direct_flow_condition_codes_and_virtual_x18_bits_choose_guest_edges() {
 }
 
 #[test]
+fn dsr_guarded_link_after_virtual_x18_condition_preserves_guest_x17() {
+    use std::sync::atomic::AtomicU64;
+
+    let generation = AtomicU64::new(CodeGeneration::INITIAL.get());
+    let source_guest = GuestVa(0x12_100);
+    let target_guest = GuestVa(source_guest.raw() + 8);
+    let word = 0x3700_0052; // tbnz w18, #0, +8
+    let InstAction::Direct(exit) =
+        super::decode::classify(word, source_guest).expect("classify virtual-x18 edge")
+    else {
+        panic!("virtual-x18 condition did not classify as direct");
+    };
+    let source_plan = BlockPlan {
+        start: source_guest,
+        end: GuestVa(source_guest.raw() + 4),
+        generation: CodeGeneration::INITIAL,
+        instructions: Vec::new(),
+        exit: PlannedExit::Direct {
+            guest: source_guest,
+            word,
+            exit,
+        },
+    };
+    let target_plan = BlockPlan {
+        start: target_guest,
+        end: GuestVa(target_guest.raw() + 8),
+        generation: CodeGeneration::INITIAL,
+        instructions: vec![PlannedInst {
+            guest: target_guest,
+            action: InstAction::Copy(0xaa11_03e0), // mov x0, x17
+        }],
+        exit: PlannedExit::Syscall {
+            guest: GuestVa(target_guest.raw() + 4),
+            resume: GuestVa(target_guest.raw() + 8),
+        },
+    };
+    let mut cache = TranslationCache::new(32 * 1024).expect("allocate virtual-edge cache");
+    let source = super::emit::emit_block_with_generation(
+        &mut cache,
+        &source_plan,
+        super::emit::GenerationGuard::new(&generation, CodeGeneration::INITIAL),
+    )
+    .expect("emit guarded virtual edge");
+    let target = super::emit::emit_block_with_generation(
+        &mut cache,
+        &target_plan,
+        super::emit::GenerationGuard::new(&generation, CodeGeneration::INITIAL),
+    )
+    .expect("emit guarded virtual target");
+    patch_direct_target(&mut cache, &source, target_guest, &target);
+
+    let mut stack = vec![0_u8; 16 * 1024];
+    let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    snapshot.x[18] = 1;
+    snapshot.x[17] = 0x1717_1717_1717_1717;
+    let expected_x17 = snapshot.x[17];
+    let mut observed = NativeDsrExit::Syscall {
+        resume: GuestVa(target_guest.raw() + 8),
+    };
+    enter_translated(source.entry(), &mut snapshot, &mut observed)
+        .expect("execute linked virtual-x18 condition");
+    assert_eq!(snapshot.x[0], expected_x17);
+    assert_eq!(snapshot.x[17], expected_x17);
+}
+
+#[test]
 fn dsr_direct_flow_linked_backward_loop_reaches_fallthrough() {
     let mut cache = TranslationCache::new(32 * 1024).expect("allocate loop-flow cache");
     let loop_plan = BlockPlan {
@@ -953,6 +1019,59 @@ fn dsr_virtual_x18_rewrites_destination_and_distinct_x17_operand() {
     enter_translated(emitted.entry(), &mut snapshot, &mut exit).expect("execute x18 rewrites");
     assert_eq!(snapshot.x[18], 0x100_u64.wrapping_add(expected_x17));
     assert_eq!(snapshot.x[17], expected_x17);
+}
+
+#[test]
+fn dsr_virtual_x18_madd_then_aliasing_loads_preserve_computed_address() {
+    let mut cache = TranslationCache::new(16 * 1024).expect("allocate x18 alias cache");
+    let plan = BlockPlan {
+        start: GuestVa(0x1b_080),
+        end: GuestVa(0x1b_090),
+        generation: CodeGeneration::INITIAL,
+        instructions: vec![
+            PlannedInst {
+                guest: GuestVa(0x1b_080),
+                action: super::decode::classify(0x9b0b_2612, GuestVa(0x1b_080))
+                    .expect("classify madd x18, x16, x11, x9"),
+            },
+            PlannedInst {
+                guest: GuestVa(0x1b_084),
+                action: super::decode::classify(0xb940_0251, GuestVa(0x1b_084))
+                    .expect("classify ldr w17, [x18]"),
+            },
+            PlannedInst {
+                guest: GuestVa(0x1b_088),
+                action: super::decode::classify(0x7940_0e52, GuestVa(0x1b_088))
+                    .expect("classify ldrh w18, [x18, #6]"),
+            },
+        ],
+        exit: PlannedExit::Syscall {
+            guest: GuestVa(0x1b_08c),
+            resume: GuestVa(0x1b_090),
+        },
+    };
+    let generation = std::sync::atomic::AtomicU64::new(CodeGeneration::INITIAL.get());
+    let emitted = super::emit::emit_block_with_generation(
+        &mut cache,
+        &plan,
+        super::emit::GenerationGuard::new(&generation, CodeGeneration::INITIAL),
+    )
+    .expect("emit guarded x18 aliasing loads");
+    let mut record = [0_u8; 16];
+    record[..4].copy_from_slice(&0x1234_5678_u32.to_le_bytes());
+    record[6..8].copy_from_slice(&0x9abc_u16.to_le_bytes());
+    let mut stack = vec![0_u8; 16 * 1024];
+    let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    snapshot.x[9] = record.as_ptr() as u64;
+    snapshot.x[11] = 24;
+    snapshot.x[16] = 0;
+    let mut exit = NativeDsrExit::Syscall {
+        resume: GuestVa(0x1b_090),
+    };
+    enter_translated(emitted.entry(), &mut snapshot, &mut exit)
+        .expect("execute x18 aliasing loads");
+    assert_eq!(snapshot.x[17], 0x1234_5678);
+    assert_eq!(snapshot.x[18], 0x9abc);
 }
 
 #[test]
