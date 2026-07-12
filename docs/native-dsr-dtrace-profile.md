@@ -2,7 +2,7 @@
 
 **Measured:** 2026-07-12
 
-**Scope:** Darwin-native AArch64, `native16k`, opt-in DSR
+**Scope:** Darwin-native AArch64, `native16k` (DSR-only)
 
 **Status:** diagnostic baseline for the
 [profile-driven optimization plan](superpowers/plans/2026-07-12-dsr-profile-driven-performance.md)
@@ -35,7 +35,6 @@ CARRICK_RUN_ID=dsr-profile-smoke target/release/carrick trace \
   --trace-out target/conformance/dsr-profile-smoke.raw \
   --summary-jsonl target/conformance/dsr-profile-smoke.jsonl -- \
   run-elf --raw --exec-backend native --native-page-profile native16k \
-  --native-code-mode dsr \
   conformance-probes/target/native-pie/aarch64-unknown-linux-musl/release/perf_trap_floor
 ```
 
@@ -49,7 +48,6 @@ CARRICK_RUN_ID=dsr-indirect-v8 target/release/carrick trace \
   run --name dsr-indirect-v8 --max-traps 18446744073709551615 \
   --raw --fs host --entrypoint /opt/nodejs-conformance/bin/node24 \
   --exec-backend native --native-page-profile native16k \
-  --native-code-mode dsr \
   localhost:5005/carrick-nodejs-conformance:24.16.0-26.2.0 \
   /opt/nodejs-conformance/fixtures/v8-smoke.js
 ```
@@ -62,7 +60,6 @@ CARRICK_RUN_ID=dsr-fork-profile target/release/carrick trace \
   --trace-out target/conformance/dsr-fork-profile.raw \
   --summary-jsonl target/conformance/dsr-fork-profile.jsonl -- \
   run-elf --raw --exec-backend native --native-page-profile native16k \
-  --native-code-mode dsr \
   conformance-probes/target/native-pie/aarch64-unknown-linux-musl/release/perf_fork_exec
 ```
 

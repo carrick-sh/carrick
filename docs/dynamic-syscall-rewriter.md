@@ -1,5 +1,11 @@
 # Same-ISA Dynamic Syscall Rewriter Implementation Plan
 
+> **Historical plan, superseded:** This document records the opt-in DSR
+> bring-up and its dated evidence. Darwin-native execution is now DSR-only; the
+> former execution-mode selection surface and legacy trap executor have been
+> removed. Current architecture and command policy are defined by the
+> [approved DSR-only backend design](superpowers/specs/2026-07-12-native-dsr-only-backend-comparison-design.md).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use
 > `superpowers:subagent-driven-development` (recommended) or
 > `superpowers:executing-plans` to implement this plan task-by-task. Steps use
@@ -197,14 +203,14 @@ plan.
 - Modify: `crates/carrick-cli/tests/perf_support/cases.rs`
 - Create: `docs/perf-results/native-dsr-syscall-floor.jsonl`
 
-**Interfaces:**
+**Interfaces (historical):**
 
-- Produces: `NativeCodeModeRequest::{Brk,Dsr}` in `carrick-spec`, serialized as
-  `brk` and `dsr`.
-- Produces: CLI/environment selection
-  `--native-code-mode <brk|dsr>` / `CARRICK_NATIVE_CODE_MODE`.
-- Constraint: default is `Brk`; `Dsr` rejects non-AArch64, non-macOS, and
-  non-`native16k` execution before image mapping.
+- This task originally added a public choice between the legacy trap executor
+  and DSR. That transitional selection surface was removed by the approved
+  DSR-only backend design linked above.
+- The DSR request rejected non-AArch64, non-macOS, and non-`native16k`
+  execution before image mapping. Those platform constraints remain on the
+  sole native execution path.
 
 - [x] **Step 1: Add a failing serialization and default test**
 
@@ -914,7 +920,7 @@ plan.
   cargo test -p carrick-runtime dsr_signal_fault --lib
   just build
   target/release/carrick run-elf --exec-backend native \
-    --native-page-profile native16k --native-code-mode dsr \
+    --native-page-profile native16k \
     conformance-probes/target/native-pie/aarch64-unknown-linux-musl/release/syscallregpreserve
   cargo test -p carrick-cli --test conformance native --no-fail-fast
   ```
@@ -1267,6 +1273,12 @@ control-flow regressions are explicit follow-up work, not unfinished steps in
 this implementation/evidence plan. See `docs/native-dsr-ltp-campaign.md`,
 `docs/perf-results/native-dsr.jsonl`, and
 `docs/perf-results/native-dsr-profile.jsonl`.
+
+Operational status (2026-07-12): the opt-in/default-mode decision above is
+preserved as the outcome of this campaign, but no longer describes the current
+native interface. The approved follow-up design removed the legacy executor
+and made DSR the sole Darwin-native instruction-execution path. HVF remains the
+default backend.
 
 Profiling follow-up (2026-07-12): the durable `carrick trace --profile` surface
 now attributes the remaining DSR costs with versioned, fail-closed JSONL. The

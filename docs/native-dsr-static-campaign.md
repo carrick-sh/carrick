@@ -34,7 +34,6 @@ just build
 scripts/build-probes.sh --native-pie
 CARRICK_EXEC_BACKEND=native \
   CARRICK_NATIVE_PAGE_PROFILE=native16k \
-  CARRICK_NATIVE_CODE_MODE=dsr \
   CARRICK_PROBE_LIBC=musl \
   cargo test -p carrick-cli --test conformance conformance_probes \
     -- --nocapture
@@ -44,7 +43,7 @@ The conformance harness also exposes the same execution mode as the isolated
 `macos-native-dsr` lane. Its Carrick invocation injects:
 
 ```text
---exec-backend native --native-page-profile native16k --native-code-mode dsr
+--exec-backend native --native-page-profile native16k
 ```
 
 The lane retains the native `linux/arm64` Docker oracle and writes only
@@ -109,6 +108,8 @@ byte-identical with their Linux oracle classifications under DSR. Stop condition
 not patched in DSR mode, and no static probe reached an untyped fallback to the
 original executable mapping.
 
-This does not make DSR the default. The mode remains experimental, same-ISA,
-native16k-only, and trusted-code-only until Task 13 establishes current LTP,
-dynamic workload, generated-code, and performance evidence.
+This campaign did not make the native backend the default; HVF remains the
+default backend. Darwin-native execution is now DSR-only, experimental,
+same-ISA, native16k-only, and trusted-code-only. Task 13 records the dated LTP,
+dynamic workload, generated-code, and performance evidence that informed that
+later architecture decision.

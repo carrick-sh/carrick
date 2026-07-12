@@ -1,15 +1,15 @@
 # Native DSR correctness campaign — 2026-07-11
 
-This is the current evidence ledger for the opt-in Darwin-native AArch64
-dynamic syscall rewriter. Linux is the semantic oracle. The legacy native
-executor is neither a control lane nor part of this campaign.
+This is the dated evidence ledger for the Darwin-native AArch64 dynamic syscall
+rewriter. Linux is the semantic oracle. The legacy native executor was neither
+a control lane nor part of this campaign and has since been removed; DSR is now
+the sole Darwin-native instruction-execution path.
 
 ## Provenance and supported surface
 
 - Host: `Mac16,12`, Darwin arm64, macOS 27.0.
 - Guest: Linux AArch64, `native16k` page profile.
-- Mode: `--exec-backend native --native-page-profile native16k
-  --native-code-mode dsr`.
+- Mode: `--exec-backend native --native-page-profile native16k` (DSR-only).
 - Full LTP artifact:
   `target/conformance/native-dsr-ltp-b5178a99.jsonl` at documentation HEAD
   `b5178a99`, using runtime `cba2eb9c`.
@@ -105,16 +105,22 @@ includes Carrick and image startup on both sides; it is a branch/JIT workload
 distribution, not a per-branch cost. Exact samples and caveats are in
 `docs/perf-results/native-dsr.jsonl`.
 
-## Current decision
+## Campaign decision and current status
 
-DSR remains an opt-in experiment: the default-mode gate is **NO-GO**. It has
-crossed the important mechanism thresholds—static parity, dynamic PIE
-execution, direct V8 generated code, Go PIE, and correct Rust static-PIE
-fork+exec—but it has not crossed the workload or performance threshold. The 91
-gating LTP rows, three DSR control-flow regressions, official Node wrapper
-failure, CPython multiprocessing timeout, and 60.7x fork+exec latency gap are
-specific blockers. The next proof points are narrowing the three DSR target
-errors, fork-heavy CPython completion, and fork lifecycle attribution.
+At the close of this campaign, DSR remained an opt-in experiment and its
+default-mode gate was **NO-GO**. It had crossed the important mechanism
+thresholds—static parity, dynamic PIE execution, direct V8 generated code, Go
+PIE, and correct Rust static-PIE fork+exec—but not the workload or performance
+threshold. The 91 gating LTP rows, three DSR control-flow regressions, official
+Node wrapper failure, CPython multiprocessing timeout, and 60.7x fork+exec
+latency gap were specific blockers. The next proof points were narrowing the
+three DSR target errors, fork-heavy CPython completion, and fork lifecycle
+attribution.
+
+The subsequent approved architecture removed the legacy executor and made DSR
+the sole Darwin-native execution path. This does not promote native over HVF:
+HVF remains the release-quality default, and the limitations measured here
+remain dated evidence rather than being erased by the interface simplification.
 
 The final workspace gate, `just ci`, passes. One first-attempt failure in the
 unrelated epoll edge-trigger host test passed five immediate focused reruns; a
