@@ -54,12 +54,14 @@ pub fn is_stale(registry_digest: Option<&str>, last_pulled: Option<&str>) -> boo
     }
 }
 
-/// PER-LANE sidecar: the hvf lane's image store lives on the mac, the kvm
-/// lane's lives in the lima guest — a refresh of one says nothing about the
-/// other, so each lane records its own last-pulled digests.
+/// Per-image-store sidecar: HVF and native DSR share the macOS Carrick store;
+/// the KVM lane's store lives in the lima guest and direct remote-host lanes
+/// have their own stores. A refresh of one store says nothing about another.
 fn sidecar_path(lane: &crate::lane::Lane) -> PathBuf {
     match lane {
-        crate::lane::Lane::Hvf => PathBuf::from("target/conformance/image-digests.json"),
+        crate::lane::Lane::Hvf | crate::lane::Lane::MacosNativeDsr => {
+            PathBuf::from("target/conformance/image-digests.json")
+        }
         crate::lane::Lane::Kvm(_) => PathBuf::from("target/conformance/image-digests.kvm.json"),
         crate::lane::Lane::KvmLocal(_) => {
             PathBuf::from("target/conformance/image-digests.kvm-local.json")
@@ -153,6 +155,7 @@ pub fn refresh_stale_images(
         // on a present cache, so the rmi is what forces a fresh fetch.
         let ok = match lane {
             crate::lane::Lane::Hvf
+            | crate::lane::Lane::MacosNativeDsr
             | crate::lane::Lane::KvmLocal(_)
             | crate::lane::Lane::BhyveLocal(_)
             | crate::lane::Lane::NvmmLocal(_) => {
