@@ -288,7 +288,7 @@ git commit -m "test(native): gate attributable DSR improvements" \
 - Consumes: `IndirectTargetCache::publish`, `enter_translated_with_cache`, emitted indirect lookup, typed `GuestVa`/`CacheVa`, and target generation guards.
 - Produces: `dsr_indirect_cache_keeps_old_index_aliases_hot`, a deterministic execution oracle that is red with the 1,024-entry page-offset index.
 
-- [ ] **Step 1: Write the old-alias red oracle**
+- [x] **Step 1: Write the old-alias red oracle**
 
 Add an oracle beside `dsr_indirect_flow_cache_hit_stays_in_translated_code`.
 It uses executable targets separated by `0x6000`, proves those addresses alias
@@ -299,19 +299,29 @@ both, then enters the emitted source once for each target:
 #[test]
 fn dsr_indirect_cache_keeps_old_index_aliases_hot() {
     let source_guest = GuestVa(0x41_000);
-    let first = carrick_guest_mem::GuestVa(0x4_2000);
-    let second = carrick_guest_mem::GuestVa(0x4_8000);
+    let first = GuestVa(0x42_000);
+    let second = GuestVa(0x48_000);
     assert_eq!(
         (first.raw() >> 2) & 1023,
         (second.raw() >> 2) & 1023,
         "fixture must collide under the old page-offset index",
     );
 
+    let target_plan = |target: GuestVa| BlockPlan {
+        start: target,
+        end: GuestVa(target.raw() + 4),
+        generation: CodeGeneration::INITIAL,
+        instructions: Vec::new(),
+        exit: PlannedExit::Syscall {
+            guest: target,
+            resume: GuestVa(target.raw() + 4),
+        },
+    };
     let mut code = TranslationCache::new(32 * 1024).expect("allocate alias oracle");
-    let first_block = emit_block(&mut code, &syscall_plan(first, 0xd400_0001))
-        .expect("emit first target");
-    let second_block = emit_block(&mut code, &syscall_plan(second, 0xd400_0001))
-        .expect("emit second target");
+    let first_block = emit_block(&mut code, &target_plan(first))
+        .expect("emit first alias target");
+    let second_block = emit_block(&mut code, &target_plan(second))
+        .expect("emit second alias target");
     let source = emit_block(
         &mut code,
         &BlockPlan {
@@ -361,7 +371,7 @@ This executes the production emitted lookup; it does not simulate the cache in
 Rust. With the old direct-map formula, publishing `second` overwrites `first`,
 so the first entry returns `ResolveIndirect` instead of reaching its syscall.
 
-- [ ] **Step 2: Run red and retain the exact failure**
+- [x] **Step 2: Run red and retain the exact failure**
 
 Run:
 
@@ -373,10 +383,15 @@ cargo test -p carrick-runtime \
 Expected: FAIL on the first target because the two targets overwrite the same
 direct-map entry.
 
-- [ ] **Step 3: Commit only the red oracle**
+Observed: the first target returned
+`ResolveIndirect { source: GuestVa(266240), target: GuestVa(270336), link: None }`
+instead of `Syscall { resume: GuestVa(270340) }`.
+
+- [x] **Step 3: Commit only the red oracle**
 
 ```bash
-git add crates/carrick-runtime/src/native_darwin/dsr/oracle.rs
+git add crates/carrick-runtime/src/native_darwin/dsr/oracle.rs \
+  docs/superpowers/plans/2026-07-12-dsr-profile-driven-performance.md
 git commit -m "test(native): expose indirect-cache alias thrash" \
   -m "Alternate two executable targets that share the old page-offset index and prove the direct-mapped cache repeatedly returns to the resolver." \
   -m "Co-Authored-By: Codex <codex@openai.com>"
