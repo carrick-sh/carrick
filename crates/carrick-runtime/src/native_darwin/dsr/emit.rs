@@ -1363,18 +1363,18 @@ mod tests {
     fn dsr_emit_copy_only_block_decodes_back_with_exact_maps() {
         let mut cache = TranslationCache::new(16 * 1024).expect("allocate translation cache");
         let emitted = emit_block(&mut cache, &copy_plan()).expect("emit copy-only block");
-        assert_eq!(emitted.len(), 64);
+        assert_eq!(emitted.len(), 68);
         let original_words = [0xd503_201f, 0x9100_0400];
         let entry_word =
             unsafe { std::ptr::read_unaligned(emitted.entry().host().raw() as *const u32) };
         assert_eq!(
             bad64::decode(entry_word, emitted.entry().host().raw() as u64)
-                .expect("decode entry restore")
+                .expect("decode entry marker")
                 .op(),
-            bad64::Op::LDR
+            bad64::Op::STR
         );
         for (index, original_word) in original_words.into_iter().enumerate() {
-            let offset = (index + 1) * 4;
+            let offset = (index + 2) * 4;
             let pointer = (emitted.entry().host().raw() + offset) as *const u32;
             let word = unsafe { std::ptr::read_unaligned(pointer) };
             let decoded = bad64::decode(word, emitted.entry().host().raw() as u64 + offset as u64)
@@ -1395,7 +1395,7 @@ mod tests {
         );
         assert_eq!(
             emitted.map().cache_for_guest(GuestVa(0x4004)),
-            Some(CacheOffset::published(8))
+            Some(CacheOffset::published(12))
         );
         for entry in emitted.map().entries() {
             assert_eq!(entry.cache.get() % 4, 0);
@@ -1499,7 +1499,7 @@ mod tests {
         assert_eq!(emitted.direct_links().len(), 1);
         assert_eq!(emitted.direct_links()[0].target, GuestVa(0x4004));
         assert_eq!(
-            emitted.map().guest_for_cache(CacheOffset::published(8)),
+            emitted.map().guest_for_cache(CacheOffset::published(12)),
             Some(GuestVa(0x4004))
         );
     }

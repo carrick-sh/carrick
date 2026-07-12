@@ -1768,15 +1768,26 @@ fn run_native_dsr_thread_loop(
             return Ok(NativeThreadLoopOutcome::ExecReplacedThread);
         }
         thread_runtime.park_for_fork_quiesce();
-        let exit = {
+        let prepared = {
             let mut memory = memory.lock();
             memory
                 .prepare_dsr_execution(snapshot.pc)
                 .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
             translator
-                .enter_once(&memory, &mut snapshot)
+                .prepare_entry(&memory, &snapshot)
                 .map_err(|error| RuntimeError::Unsupported(error.to_string()))?
         };
+        // Translation and executable-page preparation require the shared
+        // memory lock; running guest instructions must not hold it. A guest
+        // can spin indefinitely between syscalls while a sibling needs this
+        // lock to complete its own syscall and publish the value that ends the
+        // spin (altstacktid/mmapfileshare_mt/telemetrymap).
+        let raw_exit = translator
+            .enter_prepared(prepared, &mut snapshot)
+            .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+        let exit = translator
+            .finish_exit(&memory.lock(), &mut snapshot, prepared, raw_exit)
+            .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
         let resume = match exit {
             dsr::ThreadExit::Syscall { resume } => resume,
             dsr::ThreadExit::Continue => continue,
