@@ -11,6 +11,11 @@ BEGIN
     self->exec_subphase_active = 0;
     self->exec_map_active = 0;
     self->exec_map_detail_active = 0;
+    self->exec_map_mmap_total = 0;
+    self->exec_map_copy_total = 0;
+    self->exec_map_icache_total = 0;
+    self->exec_map_protect_total = 0;
+    self->exec_map_vvar_total = 0;
 }
 
 proc:::exit
