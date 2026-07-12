@@ -2204,6 +2204,9 @@ fn run_native_dsr_thread_loop(
                     resume,
                 )?;
             }
+            DispatchOutcome::SignalDeath { signum } => {
+                native_die_by_signal(&dispatcher, signum);
+            }
             other => {
                 return Err(RuntimeError::Unsupported(format!(
                     "native DSR Task 5 does not yet support dispatcher outcome {other:?}"
