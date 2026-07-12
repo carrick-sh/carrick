@@ -1847,6 +1847,14 @@ fn run_native_dsr_thread_loop(
                     dsr::ThreadFault::Host { signal, code } => (signal, code),
                     dsr::ThreadFault::Guest { signum, code } => (signum, code),
                 };
+                crate::event_ring::rec_dsr_fault(
+                    snapshot.pc,
+                    address.raw(),
+                    signal,
+                    snapshot.esr,
+                    snapshot.sp,
+                    snapshot.x[30],
+                );
                 if trace_syscalls {
                     child_write_stderr(
                         format!(

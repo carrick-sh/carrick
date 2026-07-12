@@ -607,19 +607,23 @@ fn emit_indirect_exit(
             guest,
             0xf940_0000 | ((offset / 8) << 10) | (28 << 5) | 18,
         )?;
-    } else if register != 18 {
+        map_next(assembler, entries, guest)?;
+        dynasmrt::dynasm!(assembler
+            ; .arch aarch64
+            ; str x18, [x28, #1080]
+        );
+    } else {
+        // Keep ordinary guest targets out of physical x18. Darwin does not
+        // reliably restore custom x18 across asynchronous signals, and V8's
+        // write-fault/invalidation traffic can interrupt this two-instruction
+        // window. Store the guest register directly into the context instead.
         emit_word(
             assembler,
             entries,
             guest,
-            0xaa00_03f2 | (register << 16), // mov x18, xN
+            0xf900_0000 | ((1080 / 8) << 10) | (28 << 5) | register,
         )?;
     }
-    map_next(assembler, entries, guest)?;
-    dynasmrt::dynasm!(assembler
-        ; .arch aarch64
-        ; str x18, [x28, #1080]
-    );
     emit_word(assembler, entries, guest, 0xd53b_4210)?; // mrs x16, nzcv
     let register_recovery = current_offset(assembler)?;
     map_next(assembler, entries, guest)?;
@@ -1740,6 +1744,37 @@ mod tests {
         };
         let emitted = emit_block(&mut cache, &indirect).expect("emit indirect resolver exit");
         assert!(emitted.direct_links().is_empty());
+    }
+
+    #[test]
+    fn dsr_return_publishes_guest_lr_without_physical_x18_staging() {
+        let mut plan = copy_plan();
+        plan.exit = PlannedExit::Indirect {
+            guest: GuestVa(0x4008),
+            word: 0xd65f_03c0,
+            exit: IndirectExit {
+                kind: IndirectKind::Return,
+                register: bad64::Reg::X30,
+                resume: GuestVa(0x400c),
+            },
+        };
+        let mut cache = TranslationCache::new(16 * 1024).expect("allocate return cache");
+        let emitted = emit_block(&mut cache, &plan).expect("emit return resolver");
+        let words = (0..emitted.len() / 4)
+            .map(|index| unsafe {
+                std::ptr::read_unaligned((emitted.entry().host().raw() + index * 4) as *const u32)
+            })
+            .collect::<Vec<_>>();
+        let direct_lr_store = 0xf900_0000 | ((1080 / 8) << 10) | (28 << 5) | 30; // str x30, [x28, #1080]
+
+        assert!(
+            words.contains(&direct_lr_store),
+            "return resolver must publish guest x30 directly"
+        );
+        assert!(
+            !words.contains(&0xaa1e_03f2),
+            "return resolver must not stage guest x30 through physical x18"
+        );
     }
 
     #[test]

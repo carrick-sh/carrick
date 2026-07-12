@@ -64,6 +64,10 @@ pub const EPWFD: u8 = 12;
 pub const EPMASK: u8 = 13;
 pub const EPMASKFD: u8 = 14;
 pub const EPEDGE: u8 = 15;
+pub const DSRFAULT_PC: u8 = 16;
+pub const DSRFAULT_ADDR: u8 = 17;
+pub const DSRFAULT_SP: u8 = 18;
+pub const DSRFAULT_LR: u8 = 19;
 
 #[cfg(feature = "event-ring-dump")]
 fn dir() -> Option<&'static str> {
@@ -89,6 +93,42 @@ pub fn rec(kind: u8, a: i32, b: i32, c: i32) {
     RING[i].hi.store(hi, Ordering::Relaxed);
     #[cfg(feature = "event-ring-dump")]
     maybe_start_watchdog();
+}
+
+#[inline]
+fn encode_dsr_fault(
+    pc: u64,
+    address: u64,
+    signal: i32,
+    esr: u64,
+    sp: u64,
+    lr: u64,
+) -> [(u8, i32, i32, i32); 4] {
+    [
+        (
+            DSRFAULT_PC,
+            pc as u32 as i32,
+            (pc >> 32) as u32 as i32,
+            signal,
+        ),
+        (
+            DSRFAULT_ADDR,
+            address as u32 as i32,
+            (address >> 32) as u32 as i32,
+            esr as u32 as i32,
+        ),
+        (DSRFAULT_SP, sp as u32 as i32, (sp >> 32) as u32 as i32, 0),
+        (DSRFAULT_LR, lr as u32 as i32, (lr >> 32) as u32 as i32, 0),
+    ]
+}
+
+/// Record a full-width DSR guest PC and fault address without allocation or
+/// syscalls. The adjacent records are paired by order in the per-process ring.
+#[inline]
+pub fn rec_dsr_fault(pc: u64, address: u64, signal: i32, esr: u64, sp: u64, lr: u64) {
+    for (kind, a, b, c) in encode_dsr_fault(pc, address, signal, esr, sp, lr) {
+        rec(kind, a, b, c);
+    }
 }
 
 /// Cheap, stable 32-bit hash of an AF_UNIX path, so a `connect` can be matched
@@ -158,6 +198,23 @@ fn decode(kind: u8, a: i32, b: i32, c: i32) -> String {
         EPMASK => format!("EPMASK   origin={a} raw={b:#x} last={c:#x}"),
         EPMASKFD => format!("EPMASKFD origin={a} gfd={b} hfd={c}"),
         EPEDGE => format!("EPEDGE   gfd={a} edge={b:#x} count={c}"),
+        DSRFAULT_PC => format!(
+            "DSRFAULT pc={:#018x} signal={c}",
+            (a as u32 as u64) | ((b as u32 as u64) << 32)
+        ),
+        DSRFAULT_ADDR => format!(
+            "DSRFAULT address={:#018x} esr={:#010x}",
+            (a as u32 as u64) | ((b as u32 as u64) << 32),
+            c as u32
+        ),
+        DSRFAULT_SP => format!(
+            "DSRFAULT sp={:#018x}",
+            (a as u32 as u64) | ((b as u32 as u64) << 32)
+        ),
+        DSRFAULT_LR => format!(
+            "DSRFAULT lr={:#018x}",
+            (a as u32 as u64) | ((b as u32 as u64) << 32)
+        ),
         _ => String::new(),
     }
 }
@@ -191,5 +248,45 @@ fn dump(path: &str) {
     }
     if let Ok(mut f) = std::fs::File::create(path) {
         let _ = f.write_all(out.as_bytes());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dsr_fault_events_preserve_full_width_pc_address_signal_and_esr() {
+        let pc = 0x0000_00a0_1234_5678;
+        let address = 0xffff_00a0_9abc_def0;
+        let signal = 11;
+        let esr = 0x9600_0045;
+
+        assert_eq!(
+            encode_dsr_fault(
+                pc,
+                address,
+                signal,
+                esr,
+                0x0000_00ff_1234_5678,
+                0x400f_64380
+            ),
+            [
+                (
+                    DSRFAULT_PC,
+                    pc as u32 as i32,
+                    (pc >> 32) as u32 as i32,
+                    signal,
+                ),
+                (
+                    DSRFAULT_ADDR,
+                    address as u32 as i32,
+                    (address >> 32) as u32 as i32,
+                    esr as i32,
+                ),
+                (DSRFAULT_SP, 0x1234_5678, 0x0000_00ff, 0),
+                (DSRFAULT_LR, 0x00f6_4380, 0x0000_0004, 0),
+            ]
+        );
     }
 }
