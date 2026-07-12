@@ -379,7 +379,7 @@ tick-1s
 }
 
 tick-1s
-/secs >= 15/
+/secs >= 45/
 {
     bounded = 1;
     exit(0);
