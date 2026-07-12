@@ -1029,6 +1029,13 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                         unsafe { std::env::set_var(k, v) };
                     }
                 }
+                if profile.is_some_and(|kind| kind.requires_runtime_profile()) {
+                    // The broad profile's prepare/run probes are const-specialized
+                    // out unless this is present before both sudo reconstruction
+                    // and traced-child creation. This branch is still
+                    // single-threaded and precedes the runtime.
+                    unsafe { std::env::set_var("CARRICK_DSR_PROFILE", "1") };
+                }
                 if command.is_empty() {
                     bail!(
                         "trace needs a carrick subcommand to forward (e.g. `carrick trace run alpine:latest /bin/busybox echo hi`)"
