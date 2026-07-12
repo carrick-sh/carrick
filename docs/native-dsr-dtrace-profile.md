@@ -245,6 +245,21 @@ boundaries with low-perturbation aggregate timing before authorizing a backing
 representation change. Exact distributions and raw-profile hashes are in
 [`native-dsr-exec-map-decomposition-v1.jsonl`](perf-results/native-dsr-exec-map-decomposition-v1.jsonl).
 
+The replacement aggregate profiler removes the repeated probe boundaries and
+reads the monotonic clock only in runtime-profile mode. Two further 220-exec
+runs assign 89.34% and 88.43% of image-map p50 to copy: 8,904,704 bytes in six
+operations per exec. Aggregate profiled guest p50 falls to 12.10 ms and
+12.18 ms from the nested profiler's 14.18 ms and 13.97 ms, satisfying the 10%
+overhead-reduction gate while strengthening the copy attribution.
+
+The 8.9 MiB payload is much larger than the 517 KiB fixture. Code inspection
+confirms `build_linux_initial_stack` materializes the full 8 MiB stack even
+though initialized argv/env/auxv data occupies only the suffix beginning at the
+initial stack pointer. Fresh Darwin anonymous mappings are already zero-filled,
+so the next candidate copies only that initialized suffix. Exact aggregate
+durations, byte/operation totals, and hashes are in
+[`native-dsr-exec-map-aggregate-v1.jsonl`](perf-results/native-dsr-exec-map-aggregate-v1.jsonl).
+
 ## Instrumentation overhead
 
 The disabled-probe gate compares distinct signed binaries in fixed ABBA order

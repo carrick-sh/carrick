@@ -5,9 +5,9 @@
 > syntax for durable progress tracking.
 
 **Goal:** Determine the low-perturbation cost of materializing an exec image
-into Darwin fixed mappings and, only if copy remains at least 30% of image-map
-time, replace the redundant second materialization with page-aligned immutable
-backing that Darwin can map copy-on-write.
+into Darwin fixed mappings, remove the proven redundant 8 MiB initial-stack
+prefix copy, and reconsider page-aligned immutable backing only after the
+remaining ELF payload is reprofiled.
 
 **Current evidence:** repeated nested DTrace boundaries rank byte copy at
 61.94% and 62.25% of profiled image-map p50 in two exact 220-exec runs. Those
@@ -16,20 +16,14 @@ boundaries also raise the guest benchmark p50 from roughly 11.2 ms to roughly
 on their own.
 
 **Architecture boundary:** `carrick-mem::MemoryRegion` currently stores a
-`Vec<u8>`. ELF loading first copies file spans into that vector; native exec
-then copies the vector a second time into fresh anonymous fixed mappings. A
-page-aligned immutable region backing could preserve the first materialization
-and let Darwin install a private COW view with the existing
-`mach_vm_remap(copy=TRUE)` mechanism in `carrick-host`. This is a cross-cutting
-memory-representation change, not a local `memcpy` tweak. Do not add an
-in-process exec-path cache: forked host processes would diverge, and validating
-file identity/staleness would be a separate semantic project.
-
-**Ecosystem leverage:** use `memmap2` for portable RAII page-aligned backing
-(already present in `Cargo.lock`) and extend the existing
-`carrick_host::host_mapping::OwnedHostMapping` Mach remap abstraction instead
-of adding another raw Mach FFI block. Keep `Vec<u8>` as the portable fallback
-until all mutation/clone/serialization users are audited.
+`Vec<u8>`. The initial-stack builder materializes all 8 MiB even though its
+initialized argv/env/auxv window begins near the top. Native mapping already
+creates a zero-filled 8 MiB extent, so it can copy only the suffix beginning at
+the authoritative initial SP without changing `MemoryRegion` yet. This is the
+smallest semantic seam and the first candidate. Page-aligned immutable ELF
+backing via `memmap2` and the existing `OwnedHostMapping` Mach remap abstraction
+remains a later ecosystem-leveraged option; no in-process exec cache is allowed
+because forked host processes would diverge.
 
 **Promotion gates:** exact workload output and DSR generation/fault tests;
 Rust static PIE, Rust dynamic PIE, Go PIE, direct V8, vfork and non-leader exec;
@@ -66,7 +60,7 @@ exec-local typed struct. Emit five aggregate probes immediately before outer
 Remove the high-frequency lifecycle detail emissions; retain ordinals 15–24 as
 reserved ABI values but no longer fire them.
 
-- [ ] **Step 3: Verify the lower-perturbation profile**
+- [x] **Step 3: Verify the lower-perturbation profile**
 
 Run two signed 220-exec profiles with the same command and reconcile the five
 aggregate rows to the outer interval. Require copy to remain first and at least
@@ -75,77 +69,94 @@ runs; aggregate profiling must reduce that enabled overhead by at least 10%.
 If copy falls below 30%, publish a non-selection and continue with the umbrella
 gateway benchmark.
 
-- [ ] **Step 4: Commit**
+Observed: copy remains first at 89.34% and 88.43% in two exact 220-exec
+runs, moving 8,904,704 bytes in six operations. Aggregate-profile guest p50 is
+14.7% and 12.8% below the two nested-profile runs, passing the 10% overhead
+reduction gate.
+
+- [x] **Step 4: Commit**
 
 Use `diagnostics(native): aggregate DSR exec map timing` with exact before/after
 profile overhead and component rank.
 
 ---
 
-### Task 2: Audit a page-aligned immutable region backing
+### Task 2: Skip the initial stack's already-zero prefix
 
 **Files:**
-- Modify: this plan
-- Create: `docs/superpowers/specs/2026-07-12-native-prepared-image-backing.md`
-- Inspect: `crates/carrick-mem/src/memory.rs`
-- Inspect: `crates/carrick-host/src/host_mapping.rs`
-- Inspect: native exec/load call sites
+- Modify: `crates/carrick-runtime/src/native_darwin.rs`
+- Test: `crates/carrick-runtime/src/native_darwin.rs`
 
-- [ ] **Step 1: Inventory representation semantics**
+**Evidence:** every profiled exec copies 8,904,704 bytes. The fixture ELF is
+517 KiB, while `build_linux_initial_stack` allocates an 8 MiB zero vector and
+writes argv/env/auxv only near its top. Darwin's fresh anonymous stack mapping
+is already zero-filled. The initialized stack suffix begins at the authoritative
+`AddressSpace::initial_stack_pointer`; copying the zero prefix is redundant.
 
-Enumerate every `MemoryRegion` constructor, clone, mutation, serialization,
-zero-prefix, relocation, stack, vDSO/vvar, and fork use. Separate immutable ELF
-load regions from mutable/runtime regions. Record which callers require deep
-copy versus COW.
+- [ ] **Step 1: Pin the copy window red**
 
-- [ ] **Step 2: Quantify bytes and false opportunities**
+Add a pure `native_region_copy_window(region, initial_sp) -> Range<usize>`
+test. For the exact Linux stack extent, require the range to begin at
+`initial_sp - region.start` and end at `region.bytes().len()`. For every other
+region, absent SP, or out-of-range SP, require the full byte range. Run:
 
-Record per-exec payload bytes and operations from Task 1. For
-`perf_fork_exec`, the writable ELF load has only about 6 KiB more `p_memsz`
-than `p_filesz`; therefore trailing-zero/BSS trimming cannot be claimed as the
-10% solution. Measure rather than infer savings from zero fill.
+```bash
+cargo test -p carrick-runtime native_region_copy_window --lib -- --nocapture
+```
 
-- [ ] **Step 3: Specify the minimum seam**
+Expected red: the helper is absent.
 
-The spec must define a portable `RegionBacking` abstraction, `memmap2`-owned
-page-aligned immutable backing, mutation/COW semantics, Darwin fixed-address
-remap through `carrick-host`, fallback copy behavior, protection transitions,
-fork inheritance, and generation invalidation. It must show that preparation
-does not merely move the same copy earlier inside the measured workload.
+- [ ] **Step 2: Copy the selected window at its guest offset**
 
-- [ ] **Step 4: Decide implementation readiness**
+Compute the window in `map_with_code_mode_and_translator` and pass it to
+`map_region`. Copy `bytes[window.clone()]` to `mapped + window.start`; report
+the selected byte count to the aggregate profiler. Do not scan for zeroes, move
+the stack pointer, shrink the mapped region, change protection, or alter any
+non-stack mapping. Initial and exec mappings share the same Linux semantics.
 
-Proceed only if Task 1 still assigns at least 30% to copy and the spec finds a
-single materialization reusable at native map time without stale-file or
-fork-coherence shortcuts. Otherwise record the architectural blocker and move
-to the gateway benchmark.
+- [ ] **Step 3: Verify correctness**
+
+Run the helper test, existing initial-stack/auxv tests in `carrick-mem`, native
+stack mapping tests, DSR execute protection/generation/fault tests, clippy, and
+the signed Rust static/dynamic PIE, Go PIE, direct V8, vfork, and non-leader
+exec campaign from the parent plan. The mapped word at SP and all success
+markers must remain exact; bytes immediately below SP must remain zero.
+
+- [ ] **Step 4: Measure and decide**
+
+Run two 220-exec aggregate profiles. Require copy bytes to fall by at least
+7.5 MiB, image-map p50 and outer exec-reset p50 to improve by at least 10%,
+and exact reconciliation. Then compare distinct signed binaries in fixed ABBA
+order with at least ten 200-iteration `perf_fork_exec` runs per role and 10,000
+seeded bootstrap resamples. The end-to-end p50 estimate must improve at least
+10% with upper ratio below 0.95. Promote only a full pass; otherwise restore
+the full stack copy and publish the rejection.
 
 ---
 
-### Task 3: Implement and gate prepared backing, if authorized by Task 2
+### Task 3: Remove stack construction materialization, then reassess backing
 
-**Files:** determined exactly by the Task 2 spec; do not begin from this
-umbrella description alone.
+**Files:** determined by a fresh post-Task-2 profile and a focused child plan.
 
-- [ ] **Step 1: Write red backing and COW tests**
+- [ ] **Step 1: Reprofile outside image mapping**
 
-Cover page alignment, byte identity, zero tail, clone isolation, writable data
-after exec, repeated self-exec reset, fork parent/child isolation, executable
-generation invalidation, and fallback copy.
+Task 2 eliminates the second 8 MiB copy but `build_linux_initial_stack` still
+allocates/zeroes that vector before mapping. Add attribution around exec image
+construction only if end-to-end improvement is materially smaller than the
+image-map gain.
 
-- [ ] **Step 2: Implement with existing abstractions**
+- [ ] **Step 2: Specify a sparse initialized stack window**
 
-Add the portable backing seam and extend `OwnedHostMapping` for fixed-address
-private remap. No new raw Mach FFI in runtime and no legacy native-executor
-optimization work.
+If construction is material, extend `MemoryRegion` deliberately to represent
+an initialized window at a nonzero region offset. Preserve its current
+initialized-prefix behavior for all existing callers, and cover read/write,
+clone, serialization, stage-1/HVF, native, x86, vDSO, and auxv consumers. Do
+not disguise an 8 MiB allocation as preparation outside the measured phase.
 
-- [ ] **Step 3: Run correctness and performance gates**
+- [ ] **Step 3: Reconsider immutable ELF backing only after reprofile**
 
-Use the exact signed workload campaign and fixed promotion gates above. Compare
-distinct signed binaries in ABBA order; record hashes, inodes, codesign, host,
-power, all raw summary hashes, bootstrap seed, and confidence interval.
-
-- [ ] **Step 4: Promote or restore**
-
-Promote only a full pass. Otherwise restore the copy path in a normal commit
-and publish the rejection evidence without weakening thresholds.
+If the remaining approximately 0.5 MiB ELF copy still contributes at least 30%
+of image-map time, write the page-aligned `memmap2` plus existing
+`OwnedHostMapping::remap_copy` spec. Otherwise continue to the umbrella gateway
+benchmark. No in-process exec cache is allowed because forked host processes
+would diverge.
