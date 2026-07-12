@@ -79,7 +79,7 @@ performance harness.
 - Produces ten matching real and stub wrappers for prepare, run, translate,
   resolve, cache event, and cache lifecycle begin/end surfaces.
 
-- [ ] **Step 1: Write red ordinal tests**
+- [x] **Step 1: Write red ordinal tests**
 
 ```rust
 #[test]
@@ -109,13 +109,13 @@ fn dsr_probe_ordinals_are_unique() {
 }
 ```
 
-- [ ] **Step 2: Verify red**
+- [x] **Step 2: Verify red**
 
 Run: `cargo test -p carrick-observability dsr_probe_abi --lib`
 
 Expected: compilation fails because the enums do not exist.
 
-- [ ] **Step 3: Add ordinal enums**
+- [x] **Step 3: Add ordinal enums**
 
 Use this exact pattern:
 
@@ -156,7 +156,7 @@ DsrCacheLifecyclePhase::{ForkChildRepairBegin = 1,
     ForkChildRepairEnd = 2, ExecResetBegin = 3, ExecResetEnd = 4}
 ```
 
-- [ ] **Step 4: Add scalar USDT definitions and wrappers**
+- [x] **Step 4: Add scalar USDT definitions and wrappers**
 
 ```rust
 fn dsr__prepare__begin(_: i32, _: u64) {}
@@ -185,7 +185,7 @@ pub fn dsr_run_end(tid: i32, kind: super::DsrExitKind,
 No wrapper creates `String`, `Vec`, or an eager tuple, reads a clock, or calls
 `std::process::id`. Add identical `stub!` signatures.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 ```bash
 cargo test -p carrick-observability dsr_probe_abi --lib
@@ -213,7 +213,7 @@ git commit -m "diagnostics(native): define the DSR probe ABI" \
 - Produces `TranslationOutcome`, structured translation results, and complete
   begin/end pairing at the DSR runtime seams.
 
-- [ ] **Step 1: Write a red translation-outcome test**
+- [x] **Step 1: Write a red translation-outcome test**
 
 ```rust
 #[test]
@@ -231,13 +231,13 @@ fn dsr_translation_result_distinguishes_publish_and_index_hit() {
 Move an existing oracle memory-helper body into `mapped_dsr_test_memory`; do not
 duplicate an ELF or mapping builder.
 
-- [ ] **Step 2: Verify red**
+- [x] **Step 2: Verify red**
 
 Run: `cargo test -p carrick-runtime dsr_translation_result_distinguishes --lib`
 
 Expected: missing `TranslationOutcome` and structured result fields.
 
-- [ ] **Step 3: Return typed outcomes**
+- [x] **Step 3: Return typed outcomes**
 
 ```rust
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -255,14 +255,14 @@ Change `ProcessState::translate` and `ThreadTranslator::translate` to return the
 struct. The block-index early return is `BlockIndexHit`; a publication is
 `Translated`.
 
-- [ ] **Step 4: Store the guest tid**
+- [x] **Step 4: Store the guest tid**
 
 Change the constructor to
 `ThreadTranslator::for_process(process: Arc<ProcessTranslator>, tid: i32)` and
 store `tid`. Unit tests pass `0`; the live loop passes the existing raw guest
 tid accessor, never a host pthread ID.
 
-- [ ] **Step 5: Fire prepare, translation, and cache probes**
+- [x] **Step 5: Fire prepare, translation, and cache probes**
 
 At `prepare_entry`, fire begin before lookup and end on every outcome:
 
@@ -279,7 +279,7 @@ Fire `BlockHit`, `BlockMiss`, `Invalidate`, `BlockPublish`, and
 `CapacityFailure` at exact branches. Read cache used/capacity under the existing
 process lock; add no atomics.
 
-- [ ] **Step 6: Classify every gateway return**
+- [x] **Step 6: Classify every gateway return**
 
 Add a total `NativeDsrExit::probe_fields` match returning
 `(DsrExitKind, guest_pc, target_pc, status)` for all seven variants. Fire
@@ -287,7 +287,7 @@ Add a total `NativeDsrExit::probe_fields` match returning
 `dsr_run_end` immediately after it returns, before resolver or dispatcher work.
 On gateway error, emit an `Unsupported` end with nonzero status.
 
-- [ ] **Step 7: Bracket resolution and lifecycle**
+- [x] **Step 7: Bracket resolution and lifecycle**
 
 Fire resolve begin/end around direct and indirect resolver arms; `outcome=0`
 means `DsrOperationOutcome::Success`, and every `DsrError` variant maps totally
@@ -298,7 +298,7 @@ Wrap `after_fork_child` and `reset_for_exec` with lifecycle begin/end. Capture
 cache bytes, published-block count, and dependency-page count under the existing
 lock; add read-only `len()` accessors instead of duplicate counters.
 
-- [ ] **Step 8: Verify and commit**
+- [x] **Step 8: Verify and commit**
 
 ```bash
 cargo test -p carrick-runtime native_darwin::dsr --lib
@@ -330,7 +330,7 @@ git commit -m "diagnostics(native): instrument typed DSR phases" \
   derives so later CLI work consumes one typed vocabulary.
 - Protocol prefix `DSRPROF1`; JSON schema `carrick.dsr-profile.v1`.
 
-- [ ] **Step 1: Write red parser tests**
+- [x] **Step 1: Write red parser tests**
 
 ```rust
 #[test]
@@ -355,13 +355,13 @@ fn rejects_unknown_duplicate_and_truncated_protocol() {
 }
 ```
 
-- [ ] **Step 2: Verify red**
+- [x] **Step 2: Verify red**
 
 Run: `cargo test -p carrick-cli --bin carrick trace_profile`
 
 Expected: missing module and parser types.
 
-- [ ] **Step 3: Implement strict parsing**
+- [x] **Step 3: Implement strict parsing**
 
 ```rust
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -392,7 +392,7 @@ Reject unknown prefix/type, fields without `=`, empty or duplicate keys,
 invalid integers, more than one completion, missing completion, and protocol
 records after completion.
 
-- [ ] **Step 4: Aggregate deterministically**
+- [x] **Step 4: Aggregate deterministically**
 
 Group by present `(phase,pid,tid,kind,source_pc,target_pc)` fields. Merge exact
 count/total/min/max rows. Move the existing nearest-rank `Summary`,
@@ -401,7 +401,7 @@ existing integration-test module re-export that file with `#[path]`, so the
 profile parser and performance gate share one implementation. Publish
 incomplete-pair rows separately and exclude them from duration samples.
 
-- [ ] **Step 5: Write provenance-rich JSONL atomically**
+- [x] **Step 5: Write provenance-rich JSONL atomically**
 
 ```rust
 #[derive(serde::Serialize)]
@@ -422,7 +422,7 @@ struct ProfileJsonRow {
 Write with `NamedTempFile::new_in(parent)`, `flush`, `sync_all`, optional
 `fchown`, and `persist`. Any failure leaves the requested path unchanged.
 
-- [ ] **Step 6: Verify and commit**
+- [x] **Step 6: Verify and commit**
 
 ```bash
 cargo test -p carrick-cli --bin carrick trace_profile
@@ -461,7 +461,7 @@ git commit -m "feat(trace): parse versioned DSR profiles" \
   the consumer's final default aggregation dump because their `END` clauses
   already emit the complete machine protocol.
 
-- [ ] **Step 1: Write red clap tests**
+- [x] **Step 1: Write red clap tests**
 
 ```rust
 #[test]
@@ -475,7 +475,7 @@ fn trace_profile_argument_relationships_are_enforced() {
 }
 ```
 
-- [ ] **Step 2: Add typed clap arguments**
+- [x] **Step 2: Add typed clap arguments**
 
 Import the Task 3 `TraceProfileKind` into `args.rs`. Add
 `profile: Option<TraceProfileKind>` with `conflicts_with="script"`, and
@@ -483,7 +483,7 @@ Import the Task 3 `TraceProfileKind` into `args.rs`. Add
 used without `--summary-jsonl` when the operator wants only raw output or the
 human summary.
 
-- [ ] **Step 3: Embed valid smoke programs**
+- [x] **Step 3: Embed valid smoke programs**
 
 Add `BUNDLED_DSR_PROFILE_D`, `BUNDLED_DSR_INDIRECT_D`, and
 `BUNDLED_DSR_FORK_D` constants via `include_str!`. Until Tasks 5–7 replace them,
@@ -508,7 +508,7 @@ the default and user-supplied scripts; use `false` for the three built-in
 profiles so libdtrace cannot append an unversioned duplicate aggregation dump
 after the completion record.
 
-- [ ] **Step 4: Surface libdtrace drops**
+- [x] **Step 4: Surface libdtrace drops**
 
 Mirror the public `dtrace_dropdata_t` layout and register
 `dtrace_handle_drop` before `dtrace_go`. The callback only increments fixed
@@ -530,14 +530,14 @@ dynamic drops additionally set the high-cardinality overflow flag. The parser
 computes cardinality from the emitted source/pair rows instead of asking D to
 maintain a second aggregation over the same keys.
 
-- [ ] **Step 5: Forward profile arguments through auto-sudo**
+- [x] **Step 5: Forward profile arguments through auto-sudo**
 
 Extract sudo argv reconstruction into a pure tested helper. Forward `--profile`,
 `--summary-jsonl`, and `--trace-out` exactly. Select the embedded script. If
 `--trace-out` is absent, create an internal `NamedTempFile`; never mix protocol
 records with guest output.
 
-- [ ] **Step 6: Parse and publish after tracing**
+- [x] **Step 6: Parse and publish after tracing**
 
 After DTrace returns, read the raw stream, parse it, attach command/git/binary/
 host/run provenance plus the `DTraceRunReport`, atomically write the summary
@@ -545,7 +545,7 @@ with caller uid/gid when requested, render a concise human summary to stderr,
 and delete only an internal raw file. A parser error preserves any existing
 summary.
 
-- [ ] **Step 7: Verify and commit**
+- [x] **Step 7: Verify and commit**
 
 ```bash
 cargo test -p carrick-cli --test trace_profile --no-fail-fast
@@ -574,7 +574,7 @@ git commit -m "feat(trace): add built-in DSR profile selection" \
   cache high-water records for prepare, run, translate, resolve, dispatcher,
   cache, and lifecycle phases.
 
-- [ ] **Step 1: Add a red complete-shape fixture**
+- [x] **Step 1: Add a red complete-shape fixture**
 
 ```text
 DSRPROF1|count|phase=run|pid=10|kind=3|value=9
@@ -589,7 +589,7 @@ DSRPROF1|complete|profile=dsr|bounded=0
 
 Assert exact run, incomplete, and high-water JSON rows.
 
-- [ ] **Step 2: Pair every low-cardinality phase**
+- [x] **Step 2: Pair every low-cardinality phase**
 
 Use this pattern for run slices and repeat it for prepare, translate, resolve,
 and existing syscall entry/return:
@@ -624,7 +624,7 @@ Add a separate sampled end clause gated by
 `DSRPROF1|sample` record before the aggregate clause clears the state. A begin
 while active increments an overwrite aggregation before replacing the timestamp.
 
-- [ ] **Step 3: Aggregate events and emit stable END records**
+- [x] **Step 3: Aggregate events and emit stable END records**
 
 Count every exit kind, cache event, lifecycle event, and prepare outcome. Track
 cache high-water with `max(arg4)` and capacity with `max(arg5)`. Emit every
@@ -642,7 +642,7 @@ Reuse the tested process-tree tracker from Task 4. A normal foreground workload
 must end with `bounded=0`; `bounded=1` is explicit incomplete evidence, not a
 successful natural profile.
 
-- [ ] **Step 4: Compile and run the signed smoke**
+- [x] **Step 4: Compile and run the signed smoke**
 
 ```bash
 just build
@@ -658,7 +658,7 @@ Expected: guest exits zero; JSONL contains every phase class exercised by the
 fixture, represents optional absent classes explicitly, has one completion,
 and reports zero required incomplete pairs and zero libdtrace drops.
 
-- [ ] **Step 5: Cross-check and commit**
+- [x] **Step 5: Cross-check and commit**
 
 Repeat with `CARRICK_DSR_PROFILE=1`. Exact DTrace exit totals must reconcile
 with Rust totals; any lifecycle-boundary delta is documented, and unexplained
@@ -684,7 +684,7 @@ git commit -m "feat(trace): profile complete DSR phase timing" \
 - Produces source and `(source,target)` resolver counts, aggregation
   cardinality, and overflow status.
 
-- [ ] **Step 1: Add a red high-cardinality fixture**
+- [x] **Step 1: Add a red high-cardinality fixture**
 
 ```text
 DSRPROF1|count|phase=indirect-source|pid=10|source_pc=0x4000|value=12
@@ -695,7 +695,7 @@ DSRPROF1|complete|profile=dsr-indirect|bounded=0
 Assert guest PCs become numeric JSON fields, cardinality is derived as one,
 and a supplied nonzero aggregation-drop report marks the profile incomplete.
 
-- [ ] **Step 2: Implement the bounded D program**
+- [x] **Step 2: Implement the bounded D program**
 
 ```d
 carrick*:::dsr-resolve-begin
@@ -711,7 +711,7 @@ pair, an exact indirect total, and one completion record. The Rust parser
 derives source/pair cardinality and combines it with the libdtrace drop report.
 Do not attach to `dsr-run-end`, which would duplicate the resolver stream.
 
-- [ ] **Step 3: Run direct V8**
+- [x] **Step 3: Run direct V8**
 
 ```bash
 CARRICK_DSR_PROFILE=1 CARRICK_RUN_ID=dsr-indirect-v8 timeout 30 \
@@ -730,7 +730,7 @@ Expected: `v8-smoke ok`; source counts sum to the script's exact indirect total
 and reconcile with the Rust profile's indirect resolver count from the same
 run; top pairs are present with zero aggregation/dynamic drops.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add scripts/dtrace/dsr-indirect.d crates/carrick-cli/tests/trace_profile.rs
@@ -754,7 +754,7 @@ git commit -m "feat(trace): attribute indirect DSR resolver sites" \
 - Reports repair/reset duration and the time from each lifecycle boundary to
   the child's next DSR prepare.
 
-- [ ] **Step 1: Add a red lifecycle fixture**
+- [x] **Step 1: Add a red lifecycle fixture**
 
 ```text
 DSRPROF1|sample|phase=fork-child-repair|pid=21|tid=21|duration_ns=1200
@@ -767,7 +767,7 @@ DSRPROF1|complete|profile=dsr-fork|bounded=0
 Assert all four samples survive parsing and that a lifecycle start without its
 matching end is published as an incomplete pair.
 
-- [ ] **Step 2: Implement process-tree lifecycle pairing**
+- [x] **Step 2: Implement process-tree lifecycle pairing**
 
 In `scripts/dtrace/dsr-fork.d`, key associative state by process and guest
 thread. Pair cache-lifecycle phases `1/2` for fork-child repair and `3/4` for
@@ -781,7 +781,7 @@ to distinguish parent and child transitions. Clear all per-process state at
 Reuse the tested process-tree tracker and use a 30-second fallback tick; the
 200-iteration proof must complete naturally with `bounded=0`.
 
-- [ ] **Step 3: Exercise static PIE fork plus exec**
+- [x] **Step 3: Exercise static PIE fork plus exec**
 
 Build and sign the current binary, then run the existing Rust static-PIE fork
 fixture for 200 iterations:
@@ -802,7 +802,7 @@ one first-prepare-after-fork interval; execing children have the corresponding
 reset and first-prepare-after-exec intervals; required incomplete counts are
 zero.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add scripts/dtrace/dsr-fork.d crates/carrick-cli/tests/trace_profile.rs
@@ -826,7 +826,7 @@ git commit -m "feat(trace): profile DSR fork and exec repair" \
 - Modify: `docs/diagnostics-and-debugging.md`
 - Modify: `docs/dynamic-syscall-rewriter.md`
 
-- [ ] **Step 1: Add the reusable Rust measurement gate**
+- [x] **Step 1: Add the reusable Rust measurement gate**
 
 Add workspace `rand = "0.9.4"` and a Carrick CLI dev-dependency. Extend the
 existing perf statistics module with a seeded bootstrap median-ratio interval;
@@ -849,7 +849,7 @@ git commit -m "test(native): automate DSR probe overhead gate" \
   -m "Reuse the Rust performance harness for deterministic ABBA collection and bootstrap non-inferiority decisions across distinct signed binaries."
 ```
 
-- [ ] **Step 2: Freeze distinct signed binaries**
+- [x] **Step 2: Freeze distinct signed binaries**
 
 Build the signed pre-instrumentation binary from approved design commit
 `fcd17c14` in a detached temporary worktree and the signed candidate from the
@@ -874,7 +874,7 @@ and build command for each. Do not compare two paths that resolve to the same
 inode or hash. Remove the detached worktree only after its frozen binary hash
 is present in the evidence.
 
-- [ ] **Step 3: Run the disabled-probe ABBA gate**
+- [x] **Step 3: Run the disabled-probe ABBA gate**
 
 With no DTrace consumer attached, alternate binaries in ABBA order to reduce
 thermal and scheduler bias:
@@ -903,7 +903,7 @@ upper bound is at most 1.02 for syscall-floor and 1.01 for direct V8. A failure
 blocks landing and requires revisiting the probe closure or call-site shape; it
 is not waived as expected USDT overhead.
 
-- [ ] **Step 4: Measure enabled-profiler cost separately**
+- [x] **Step 4: Measure enabled-profiler cost separately**
 
 Keeping the instrumented binary fixed, measure each built-in profile against
 its identical untraced workload: syscall-floor for `dsr`, direct V8 for
@@ -920,14 +920,14 @@ CARRICK_DSR_ENABLED_OUT=docs/perf-results/native-dsr-dtrace-enabled-overhead.jso
   enabled_profile_overhead -- --ignored --nocapture --test-threads=1
 ```
 
-- [ ] **Step 5: Verify hard failure behavior**
+- [x] **Step 5: Verify hard failure behavior**
 
 Feed malformed, truncated, duplicate-completion, and incomplete-pair streams to
 the parser tests. Interrupt a live profile with SIGINT and verify the raw trace
 is retained, no successful completion is invented, and no partial summary is
 atomically published as complete.
 
-- [ ] **Step 6: Document measured conclusions only**
+- [x] **Step 6: Document measured conclusions only**
 
 In `docs/native-dsr-dtrace-profile.md`, document:
 
@@ -944,7 +944,7 @@ Add a short operator-facing profile section to
 results actually measured. Do not convert projections or one-off samples into
 official performance claims.
 
-- [ ] **Step 7: Run the final repository and runtime gates**
+- [x] **Step 7: Run the final repository and runtime gates**
 
 ```bash
 just build
@@ -963,7 +963,7 @@ Expected: the full local gate passes, the signed binary retains the DOF
 section, all three live profiles complete with valid summaries, evidence JSONL
 parses line-by-line, and the worktree contains only intentional artifacts.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add docs/native-dsr-dtrace-profile.md \
@@ -994,3 +994,20 @@ The work is complete only when all of the following are true:
   measured and reported separately.
 - `just ci`, the DOF-section check, and all three signed live runs pass from the
   repository root.
+
+## Completion record
+
+Completed 2026-07-12. Tasks 1 through 8 landed as commits `04094a4f`,
+`649103c0`, `8a2625df`, `be441fa2`, `281417c8`, `87a63918`, `d4ed6507`,
+`6b6d5aad`, `39cc323f`, `8fdf8c9d`, and `93d03d5e`. The signed natural broad,
+indirect, and fork profiles completed with `target_exit_reason=1`, zero required
+incomplete pairs, and zero DTrace drops. The disabled and enabled ABBA artifacts
+are `docs/perf-results/native-dsr-dtrace-disabled-overhead.jsonl` and
+`docs/perf-results/native-dsr-dtrace-enabled-overhead.jsonl`; measured results
+and limitations are in `docs/native-dsr-dtrace-profile.md`.
+
+The live PTY interruption proof sent Ctrl-C while `dsr-indirect` was active.
+The raw path was retained, the CLI failed with `profile stream is missing its
+completion record`, no summary was published as complete, and stamped cleanup
+found no remaining workload. Optimization work is intentionally tracked in the
+separate profile-driven performance plan.

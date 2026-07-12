@@ -53,7 +53,7 @@
 - Consumes: `carrick trace --profile {dsr,dsr-indirect,dsr-fork}`, `DSRPROF1`, and the two existing overhead JSONL artifacts.
 - Produces: a committed before-state with exact counts, lifecycle percentiles, overhead intervals, commands, limitations, and links used by every later task.
 
-- [ ] **Step 1: Validate the two checked-in evidence candidates**
+- [x] **Step 1: Validate the two checked-in evidence candidates**
 
 Run:
 
@@ -67,7 +67,7 @@ jq -c 'select(.record == "decision")' \
 Expected: every line parses; disabled syscall-floor and V8 decisions have
 `"pass":true`; enabled decisions are report-only with `"pass":null`.
 
-- [ ] **Step 2: Write the operator profile report**
+- [x] **Step 2: Write the operator profile report**
 
 Create `docs/native-dsr-dtrace-profile.md` with these exact measured sections:
 
@@ -90,21 +90,21 @@ Also document the three CLI invocations, `target_exit_reason`, interruption
 behavior, zero-drop/incomplete-pair requirement, host, binary SHA, workload,
 and the disabled/enabled overhead decisions.
 
-- [ ] **Step 3: Link the report from the two existing docs**
+- [x] **Step 3: Link the report from the two existing docs**
 
 Add an operator-facing paragraph to `docs/diagnostics-and-debugging.md` and a
 measured-results paragraph to `docs/dynamic-syscall-rewriter.md`. State that
 the optimization queue is indirect cache, prepare lookup, exec subdivision,
 gateway, then translation/publication.
 
-- [ ] **Step 4: Close the profiling implementation plan**
+- [x] **Step 4: Close the profiling implementation plan**
 
 Mark Tasks 1 through 8 and completion criteria complete in
 `docs/superpowers/plans/2026-07-12-dsr-dtrace-profiling.md`, citing the two
 evidence files and the live PTY Ctrl-C proof. Do not mark any optimization task
 complete.
 
-- [ ] **Step 5: Verify and commit the baseline**
+- [x] **Step 5: Verify and commit the baseline**
 
 Run:
 
