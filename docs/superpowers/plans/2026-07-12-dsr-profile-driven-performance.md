@@ -1037,11 +1037,22 @@ Across per-process p50 values, scalar is 0.474 us (IQR 0.003 us) and SIMD is
 all 32 vector registers are checked on every crossing. Evidence is in
 `docs/perf-results/native-dsr-gateway-baseline.jsonl`.
 
-- [ ] **Step 4: Audit gateway instructions against the oracle**
+- [x] **Step 4: Audit gateway instructions against the oracle**
 
 Classify every save/restore as guest-observable, host-ABI-required, signal
 recovery-required, or redundant. Record the disassembly and category in the
 gateway child plan. No assembly is removed in this task.
+
+**Audit result:** no unconditional save/restore is redundant. The complete
+guest GPR, NZCV, FPCR/FPSR, and SIMD state is Linux-observable across a
+syscall. Host x19-x30, SP, and the lower halves of v8-v15 are Darwin ABI state.
+Saving full q8-q15 exceeds the host ABI's lower-half requirement but narrowing
+those four store/load pairs does not reduce instruction count. Signal-mask and
+custom-x18 transitions close the recovery window and remain correctness
+requirements. The compiled wrapper also performs an 832-byte snapshot copy
+immediately after the raw gateway returns; that and the ABI closure calls are
+the measured next candidates. The classification and gates are in
+`docs/superpowers/plans/2026-07-12-dsr-gateway-performance.md`.
 
 - [ ] **Step 5: Write and execute a focused gateway child plan**
 
@@ -1050,6 +1061,11 @@ variant removes only instructions proven redundant. A scalar/SIMD specialization
 is allowed only when emitted block metadata proves which state may be omitted.
 Acceptance is at least 5% syscall-floor improvement with upper ratio below 1.0,
 no V8 regression beyond 1%, and all register/signal/kick/fault oracles green.
+
+**Child plan written:** the instruction audit proved that there is no honest
+unconditional-removal variant, so the plan does not invent one. It first
+separates closure and wrapper costs, then permits structural per-thread context
+reuse or closure changes only when a component clears its proof threshold.
 
 ---
 

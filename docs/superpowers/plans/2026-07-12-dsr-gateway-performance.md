@@ -1,0 +1,132 @@
+# Native DSR Gateway Performance Plan
+
+> **Status (2026-07-12):** approved for direct execution. The untraced baseline
+> is checked in; instruction audit complete; component attribution next.
+
+**Goal:** reduce the signed native DSR syscall floor by at least 5% without
+weakening Linux-visible register state, Darwin ABI conformance, asynchronous
+kick delivery, signal/fault recovery, fork correctness, or static/dynamic PIE
+workloads.
+
+**Baseline:** `docs/perf-results/native-dsr-gateway-baseline.jsonl` records 30
+untraced static-PIE processes. Median process p50 is 0.474 us scalar and 0.625
+us SIMD, with 0.003 us IQR for each. The SIMD lane includes fixed guest-side
+seed/verify instructions; the gateway itself currently saves/restores full
+SIMD state for both lanes, so their difference is not a SIMD gateway-cost
+estimate.
+
+**Files:**
+- Modify: `crates/carrick-runtime/src/native_darwin/dsr/gateway.rs`
+- Modify: `crates/carrick-runtime/src/native_darwin/dsr/gateway_aarch64.S`
+- Modify: `crates/carrick-runtime/src/native_darwin.rs`
+- Modify: `crates/carrick-runtime/src/native_darwin/dsr/oracle.rs`
+- Modify: `crates/carrick-cli/tests/dsr_trace_overhead.rs`
+- Use: `conformance-probes/src/bin/perf_dsr_gateway.rs`
+- Create: `docs/perf-results/native-dsr-gateway-components-v1.jsonl`
+- Create: `docs/perf-results/native-dsr-gateway-candidate-v1.jsonl`
+
+## Instruction audit
+
+The checked-in release disassembly matches
+`gateway_aarch64.S`; `_carrick_dsr_enter_raw` starts at `0x100525cb4` in the
+frozen baseline binary and `_carrick_dsr_exit_common_start` at `0x100525e00`.
+The exact address is provenance, not an ABI.
+
+| Instruction group | Classification | Decision |
+|---|---|---|
+| Save/restore host SP and x19-x30 | Darwin host ABI | Keep. The gateway branches away and later returns to its Rust caller. |
+| Save/restore host q8-q15 | Darwin host ABI | Keep at least d8-d15. Full-q preservation exceeds the ABI, but using d pairs keeps the same eight instructions and is not a 5% candidate. |
+| Call guest/host ABI closures | Signal recovery and custom-x18 ABI | Keep until separately measured. They publish/clear the active context, toggle custom x18, and open/close the SIGPIPE kick window in the required order. |
+| Restore/capture x0-x30, SP, and PC | Guest-observable Linux state | Keep. Physical x17/x28 staging and virtual x18/x28 are covered by recovery oracles. |
+| Restore/capture NZCV | Guest-observable Linux state | Keep; a Linux syscall does not authorize flag corruption. |
+| Restore/capture FPCR and FPSR | Guest-observable Linux state | Keep. |
+| Restore/capture q0-q31 | Guest-observable Linux state | Keep. A scalar current block does not prove inherited SIMD state dead. |
+| Gateway phase/status/target publication | Signal/fault/kick recovery | Keep. Phase 2 is the stable-snapshot boundary used by asynchronous recovery. |
+| Restore host q8-q15 and x19-x30 after closure | Darwin host ABI | Keep. |
+
+**Conclusion:** no unconditional assembly instruction is proven redundant.
+Static scalar/SIMD specialization is architecturally invalid because state may
+have been produced by an earlier directly linked block. A future lazy-SIMD
+design would need per-thread residency/dirty state across the whole translated
+chain, signal materialization, fork reset, and an oracle proving every state
+transition; it is not authorized by this plan.
+
+The release disassembly also shows a call to `memcpy` with length `0x340`
+(832 bytes, exactly `NativeUcontextSnapshot`) immediately after
+`_carrick_dsr_enter_raw` returns. `DsrContext::new` embeds another full snapshot
+and initializes a 1200-byte frame before entry. These wrapper costs and the ABI
+closure calls are plausible structural long poles; they must be separated
+before code changes.
+
+## Task 1: Attribute closure and wrapper costs
+
+- [ ] Add ignored, opt-in release microbenchmarks for (a) one paired
+  `carrick_native_dsr_enter_guest_abi` / `enter_host_abi` closure on a correctly
+  initialized thread and (b) `DsrContext` construction plus snapshot
+  publication with all values passed through `black_box`.
+- [ ] Use the same 16-operation batches, 20,000 samples, 30 process
+  repetitions, counter conversion, and positive finite checks as the gateway
+  probe. Do not use DTrace on the hot boundary.
+- [ ] Record raw arrays, p50/p95/min/IQR, release binary hash, and power facts
+  in `native-dsr-gateway-components-v1.jsonl`.
+- [ ] Select a component only if its stable p50 is at least 20% of the 0.474 us
+  scalar baseline in two independent 30-run campaigns. Otherwise stop and
+  profile a broader dispatch boundary.
+
+## Task 2A: Reuse the gateway frame only if wrapper cost wins
+
+- [ ] Write red ownership tests proving one frame per `ThreadTranslator`, no
+  sharing between guest threads, clean fork-child reset, and no active-context
+  pointer surviving an exit or error.
+- [ ] Move the authoritative snapshot into a per-thread gateway frame so the
+  832-byte ingress/egress copy is removed rather than moved. Expose typed
+  snapshot access to dispatch. Do not put mutable frame state in the
+  process-wide translator/cache.
+- [ ] Preserve every compile-time offset assertion and the physical-x28
+  contract. Signal capture must continue to see a contiguous snapshot at
+  offset zero and phase/status metadata at their established offsets.
+- [ ] Reject a variant that merely reuses allocation while retaining both
+  snapshot copies; it has not addressed the measured component.
+
+## Task 2B: Optimize the ABI closure only if closure cost wins
+
+- [ ] Decompose custom-x18 transition and signal-mask transition with a
+  sampled, opt-in aggregate counter. Emission must be once per process, not a
+  DTrace event per gateway crossing.
+- [ ] Preserve the ordering invariant: publish context, enter custom-x18 ABI,
+  then unblock kick on entry; block kick, clear context, then enter host x18 ABI
+  on exit.
+- [ ] Any signal-mask replacement must be a Darwin-native primitive with a
+  linearizable close point. Polling-only or delayed-kick approximations are
+  rejected.
+- [ ] Run the phase-zero, phase-one, phase-two, pending-kick, signal, fault,
+  custom-x18, and fork-child oracles red-first against any reordered closure.
+
+## Task 3: Candidate promotion gate
+
+- [ ] Freeze distinct signed baseline/candidate binaries by SHA-256, inode,
+  CDHash, and source commit. Use fixed ABBA order and 10,000 seeded bootstrap
+  median-ratio resamples.
+- [ ] Run at least 30 static-PIE gateway repetitions per role. Require scalar
+  p50 improvement at least 5% with 95% upper ratio below 1.0. SIMD sentinel
+  preservation is exact; SIMD p50 may not regress more than 1%.
+- [ ] Run the existing batch-16 syscall floor and direct V8 gates. Each upper
+  ratio must remain at or below 1.01.
+- [ ] Run Rust static PIE, Rust dynamic PIE through its real loader, Go PIE,
+  vfork sibling exec, non-leader exec, full-state, signal/kick/fault, and fork
+  reset proofs.
+- [ ] Run `RUST_TEST_THREADS=1 just ci`. Record any ordinary parallel-suite
+  flakes separately; do not waive focused failures.
+- [ ] Promote only if all thresholds pass. Otherwise restore the candidate and
+  keep its evidence as a rejected experiment.
+
+## Stop conditions and next architecture
+
+- If neither wrapper nor closure clears 20%, do not churn gateway assembly.
+  Add a low-perturbation split around syscall decode/dispatch and native return
+  publication, then select the next stable component above 30%.
+- Do not infer dead SIMD state from the current block. Lazy SIMD is a separate
+  architecture project requiring chain-wide state ownership and signal/fork
+  materialization proofs.
+- Do not use an in-process global cache or shared mutable gateway frame; real
+  host forks and multiple guest threads make either design incorrect.
