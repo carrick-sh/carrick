@@ -84,6 +84,10 @@ pub const BUNDLED_D_SCRIPT: &str = include_str!("../../../scripts/dtrace/syscall
 /// the C preprocessor enabled (DTRACE_C_CPP).
 pub const BUNDLED_GUEST_STACK_D: &str = include_str!("../../../scripts/dtrace/guest_stack.d");
 
+pub const BUNDLED_DSR_PROFILE_D: &str = include_str!("../../../scripts/dtrace/dsr-profile.d");
+pub const BUNDLED_DSR_INDIRECT_D: &str = include_str!("../../../scripts/dtrace/dsr-indirect.d");
+pub const BUNDLED_DSR_FORK_D: &str = include_str!("../../../scripts/dtrace/dsr-fork.d");
+
 const DTRACE_VERSION: c_int = 3;
 const DTRACE_PROBESPEC_NAME: c_int = 3;
 const DTRACE_C_ZDEFS: c_uint = 0x0004;
@@ -100,10 +104,68 @@ const PS_UNDEAD: c_int = 4;
 // stream was silent. Mirrors dtrace(1)'s chew/chewrec.
 const DTRACE_CONSUME_THIS: c_int = 0;
 const DTRACE_CONSUME_NEXT: c_int = 1;
+const DTRACEACT_EXIT: u16 = 2;
+
+const DTRACEDROP_PRINCIPAL: c_int = 0;
+const DTRACEDROP_AGGREGATION: c_int = 1;
+const DTRACEDROP_DYNAMIC: c_int = 2;
+const DTRACEDROP_DYNRINSE: c_int = 3;
+const DTRACEDROP_DYNDIRTY: c_int = 4;
 
 type ConsumeProbeFn = extern "C" fn(data: *const c_void, arg: *mut c_void) -> c_int;
 type ConsumeRecFn =
     extern "C" fn(data: *const c_void, rec: *const c_void, arg: *mut c_void) -> c_int;
+type HandleDropFn = extern "C" fn(data: *const DtraceDropData, arg: *mut c_void) -> c_int;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DtraceRecDesc {
+    action: u16,
+    size: u32,
+    offset: u32,
+    alignment: u16,
+    format: u16,
+    argument: u64,
+    user_argument: u64,
+}
+
+#[repr(C)]
+struct DtraceDropData {
+    handle: *mut DtraceHdl,
+    cpu: c_int,
+    kind: c_int,
+    drops: u64,
+    total: u64,
+    message: *const c_char,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DTraceRunReport {
+    pub principal_drops: u64,
+    pub aggregation_drops: u64,
+    pub dynamic_drops: u64,
+    pub other_drops: u64,
+}
+
+fn record_drop(report: &mut DTraceRunReport, kind: c_int, drops: u64) {
+    let counter = match kind {
+        DTRACEDROP_PRINCIPAL => &mut report.principal_drops,
+        DTRACEDROP_AGGREGATION => &mut report.aggregation_drops,
+        DTRACEDROP_DYNAMIC | DTRACEDROP_DYNRINSE | DTRACEDROP_DYNDIRTY => &mut report.dynamic_drops,
+        _ => &mut report.other_drops,
+    };
+    *counter = counter.saturating_add(drops);
+}
+
+extern "C" fn handle_drop(data: *const DtraceDropData, arg: *mut c_void) -> c_int {
+    if data.is_null() || arg.is_null() {
+        return 0;
+    }
+    let report = unsafe { &mut *arg.cast::<DTraceRunReport>() };
+    let data = unsafe { &*data };
+    record_drop(report, data.kind, data.drops);
+    0
+}
 
 extern "C" fn chew(_data: *const c_void, _arg: *mut c_void) -> c_int {
     DTRACE_CONSUME_THIS
@@ -112,6 +174,11 @@ extern "C" fn chew(_data: *const c_void, _arg: *mut c_void) -> c_int {
 extern "C" fn chewrec(_data: *const c_void, rec: *const c_void, _arg: *mut c_void) -> c_int {
     // NULL rec marks the end of this probe's records — advance to the next.
     if rec.is_null() {
+        DTRACE_CONSUME_NEXT
+    } else if unsafe { &*rec.cast::<DtraceRecDesc>() }.action == DTRACEACT_EXIT {
+        // `exit(status)` is a libdtrace control action, not trace output. Asking
+        // libdtrace to format it prints the bare status (for example `0`) and
+        // corrupts a machine protocol emitted by the following END clause.
         DTRACE_CONSUME_NEXT
     } else {
         DTRACE_CONSUME_THIS
@@ -150,6 +217,7 @@ unsafe extern "C" {
     fn dtrace_proc_continue(hdl: *mut DtraceHdl, proc: *mut PsProchandle);
     fn dtrace_proc_state(hdl: *mut DtraceHdl, proc: *mut PsProchandle) -> c_int;
     fn dtrace_go(hdl: *mut DtraceHdl) -> c_int;
+    fn dtrace_handle_drop(hdl: *mut DtraceHdl, callback: HandleDropFn, arg: *mut c_void) -> c_int;
     fn dtrace_stop(hdl: *mut DtraceHdl) -> c_int;
     fn dtrace_sleep(hdl: *mut DtraceHdl);
     fn dtrace_work(
@@ -195,6 +263,8 @@ pub enum DTraceError {
     ProcCreate(String),
     #[error("dtrace_go failed: {0}")]
     Go(String),
+    #[error("dtrace_handle_drop failed: {0}")]
+    HandleDrop(String),
     #[error("dtrace_work failed: {0}")]
     Work(String),
     #[error("argv contains nul byte: {0:?}")]
@@ -333,7 +403,7 @@ unsafe fn errmsg(hdl: *mut DtraceHdl) -> String {
 }
 
 /// Toggles applied to the libdtrace consumer before `dtrace_go`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct TraceOptions {
     /// When true, sets the libdtrace `flowindent` option — same as
     /// running `dtrace -F`. Indents each entry/return event by call
@@ -349,6 +419,22 @@ pub struct TraceOptions {
     /// Credentials the traced carrick child should drop to before it dispatches
     /// the requested command. The libdtrace parent still runs as root.
     pub drop_credentials: Option<TraceDropCredentials>,
+    /// Print any aggregations that remain after the D program's `END` clause.
+    /// Built-in profiles emit their complete protocol from `END` and disable
+    /// this to prevent an unversioned duplicate dump.
+    pub print_remaining_aggregates: bool,
+}
+
+impl Default for TraceOptions {
+    fn default() -> Self {
+        Self {
+            flowindent: false,
+            script: None,
+            out_path: None,
+            drop_credentials: None,
+            print_remaining_aggregates: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -372,7 +458,7 @@ pub fn run_child_under_dtrace(
     child_path: &Path,
     child_argv: &[String],
     opts: &TraceOptions,
-) -> Result<(), DTraceError> {
+) -> Result<DTraceRunReport, DTraceError> {
     let trace_argv = trace_exec_argv(child_path, child_argv, opts.drop_credentials.as_ref())?;
     let mut argv_ptrs: Vec<*const c_char> = trace_argv.argv.iter().map(|s| s.as_ptr()).collect();
     argv_ptrs.push(std::ptr::null());
@@ -386,6 +472,17 @@ pub fn run_child_under_dtrace(
         opts.drop_credentials.as_ref().map(|c| (c.uid, c.gid)),
     )?;
     let hdl = DtraceHandle::open()?;
+    let mut report = DTraceRunReport::default();
+    if unsafe {
+        dtrace_handle_drop(
+            hdl.as_ptr(),
+            handle_drop,
+            (&mut report as *mut DTraceRunReport).cast(),
+        )
+    } != 0
+    {
+        return Err(DTraceError::HandleDrop(hdl.errmsg()));
+    }
 
     // Sensible runtime defaults are appended to in `all_opts` below.
     let mut all_opts: Vec<(&str, &str)> = vec![
@@ -490,9 +587,12 @@ pub fn run_child_under_dtrace(
     }
 
     unsafe { dtrace_stop(hdl.as_ptr()) };
-    unsafe { dtrace_aggregate_snap(hdl.as_ptr()) };
-    unsafe { dtrace_aggregate_print(hdl.as_ptr(), out.fp(), std::ptr::null_mut()) };
-    Ok(())
+    if opts.print_remaining_aggregates {
+        unsafe { dtrace_aggregate_snap(hdl.as_ptr()) };
+        unsafe { dtrace_aggregate_print(hdl.as_ptr(), out.fp(), std::ptr::null_mut()) };
+    }
+    unsafe { fflush(out.fp()) };
+    Ok(report)
 }
 
 fn trace_exec_argv(
@@ -535,7 +635,12 @@ pub fn join_ids(ids: &[u32]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{TRACE_CHILD_COMMAND, TraceDropCredentials, join_ids, trace_exec_argv};
+    use super::{
+        DTRACE_CONSUME_NEXT, DTRACE_CONSUME_THIS, DTRACEACT_EXIT, DTRACEDROP_AGGREGATION,
+        DTRACEDROP_DYNAMIC, DTRACEDROP_DYNDIRTY, DTRACEDROP_DYNRINSE, DTRACEDROP_PRINCIPAL,
+        DTraceRunReport, DtraceRecDesc, TRACE_CHILD_COMMAND, TraceDropCredentials, TraceOptions,
+        chewrec, join_ids, record_drop, trace_exec_argv,
+    };
     use std::ffi::CString;
     use std::path::Path;
 
@@ -598,5 +703,66 @@ mod tests {
         assert_eq!(join_ids(&[]), "");
         assert_eq!(join_ids(&[20]), "20");
         assert_eq!(join_ids(&[20, 12, 501]), "20,12,501");
+    }
+
+    #[test]
+    fn macos_drop_ordinals_and_categories_are_pinned() {
+        assert_eq!(DTRACEDROP_PRINCIPAL, 0);
+        assert_eq!(DTRACEDROP_AGGREGATION, 1);
+        assert_eq!(DTRACEDROP_DYNAMIC, 2);
+        assert_eq!(DTRACEDROP_DYNRINSE, 3);
+        assert_eq!(DTRACEDROP_DYNDIRTY, 4);
+
+        let mut report = DTraceRunReport::default();
+        record_drop(&mut report, DTRACEDROP_PRINCIPAL, 1);
+        record_drop(&mut report, DTRACEDROP_AGGREGATION, 2);
+        record_drop(&mut report, DTRACEDROP_DYNAMIC, 3);
+        record_drop(&mut report, DTRACEDROP_DYNRINSE, 4);
+        record_drop(&mut report, DTRACEDROP_DYNDIRTY, 5);
+        record_drop(&mut report, 9, 6);
+        assert_eq!(
+            report,
+            DTraceRunReport {
+                principal_drops: 1,
+                aggregation_drops: 2,
+                dynamic_drops: 12,
+                other_drops: 6,
+            }
+        );
+    }
+
+    #[test]
+    fn default_trace_options_print_remaining_aggregates() {
+        assert!(TraceOptions::default().print_remaining_aggregates);
+    }
+
+    #[test]
+    fn record_consumer_suppresses_exit_status_but_formats_protocol_records() {
+        let exit = DtraceRecDesc {
+            action: DTRACEACT_EXIT,
+            size: 0,
+            offset: 0,
+            alignment: 0,
+            format: 0,
+            argument: 0,
+            user_argument: 0,
+        };
+        let printf = DtraceRecDesc { action: 3, ..exit };
+        assert_eq!(
+            chewrec(
+                std::ptr::null(),
+                (&exit as *const DtraceRecDesc).cast(),
+                std::ptr::null_mut(),
+            ),
+            DTRACE_CONSUME_NEXT
+        );
+        assert_eq!(
+            chewrec(
+                std::ptr::null(),
+                (&printf as *const DtraceRecDesc).cast(),
+                std::ptr::null_mut(),
+            ),
+            DTRACE_CONSUME_THIS
+        );
     }
 }
