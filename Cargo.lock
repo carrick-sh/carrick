@@ -397,6 +397,7 @@ dependencies = [
  "hyper-util",
  "libc",
  "predicates",
+ "rand 0.9.4",
  "serde",
  "serde_json",
  "sha2",

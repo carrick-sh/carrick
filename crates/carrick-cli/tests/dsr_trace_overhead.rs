@@ -1,0 +1,623 @@
+#![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
+
+#[path = "../src/perf_stats.rs"]
+mod perf_stats;
+
+use std::collections::BTreeMap;
+use std::io::{BufWriter, Write};
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use perf_stats::{RatioInterval, Summary, bootstrap_median_ratio, summarize};
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+use tempfile::NamedTempFile;
+
+const SCHEMA: &str = "carrick.dsr-overhead.v1";
+const BASELINE_COMMIT: &str = "fcd17c14a9046929f9602ec9d81580d2d3317287";
+const BOOTSTRAP_SEED: u64 = 0x4453_522d_4f56_4844;
+const BOOTSTRAP_RESAMPLES: usize = 10_000;
+const V8_IMAGE: &str = "localhost:5005/carrick-nodejs-conformance:24.16.0-26.2.0";
+const V8_ENTRYPOINT: &str = "/opt/nodejs-conformance/bin/node24";
+const V8_SCRIPT: &str = "/opt/nodejs-conformance/fixtures/v8-smoke.js";
+
+static RUN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum BinaryRole {
+    Baseline,
+    Candidate,
+    Untraced,
+    Profiled,
+}
+
+impl BinaryRole {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Baseline => "baseline",
+            Self::Candidate => "candidate",
+            Self::Untraced => "untraced",
+            Self::Profiled => "profiled",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Workload {
+    SyscallFloor,
+    DirectV8,
+    ForkExec,
+}
+
+impl Workload {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::SyscallFloor => "syscall-floor",
+            Self::DirectV8 => "direct-v8",
+            Self::ForkExec => "fork-exec",
+        }
+    }
+
+    const fn unit(self) -> &'static str {
+        match self {
+            Self::SyscallFloor => "us",
+            Self::DirectV8 | Self::ForkExec => "ms-wall",
+        }
+    }
+
+    const fn profile(self) -> &'static str {
+        match self {
+            Self::SyscallFloor => "dsr",
+            Self::DirectV8 => "dsr-indirect",
+            Self::ForkExec => "dsr-fork",
+        }
+    }
+
+    const fn timeout_secs(self) -> u64 {
+        match self {
+            Self::SyscallFloor => 30,
+            Self::DirectV8 => 90,
+            Self::ForkExec => 60,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct HostContext {
+    model: Option<String>,
+    macos: Option<String>,
+    logical_cpus: Option<String>,
+    power_source: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct BinaryProvenance {
+    role: BinaryRole,
+    path: String,
+    commit: String,
+    sha256: String,
+    device: u64,
+    inode: u64,
+    codesign: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "record", rename_all = "kebab-case")]
+enum EvidenceRow {
+    Run {
+        schema: &'static str,
+        mode: &'static str,
+        epoch_secs: u64,
+        schedule: &'static str,
+        bootstrap_seed: u64,
+        bootstrap_resamples: usize,
+        host: HostContext,
+        binaries: Vec<BinaryProvenance>,
+    },
+    Sample {
+        schema: &'static str,
+        mode: &'static str,
+        workload: &'static str,
+        unit: &'static str,
+        sequence: usize,
+        cycle: usize,
+        slot: usize,
+        role: BinaryRole,
+        value: f64,
+        run_id: String,
+    },
+    Decision {
+        schema: &'static str,
+        mode: &'static str,
+        workload: &'static str,
+        unit: &'static str,
+        baseline_role: BinaryRole,
+        candidate_role: BinaryRole,
+        baseline: Summary,
+        candidate: Summary,
+        ratio: RatioInterval,
+        upper_bound_limit: Option<f64>,
+        pass: Option<bool>,
+    },
+}
+
+#[test]
+fn bootstrap_ratio() {
+    let interval = bootstrap_median_ratio(
+        &[100.0, 101.0, 102.0, 103.0, 104.0],
+        &[99.0, 100.0, 101.0, 102.0, 103.0],
+        42,
+        2_000,
+    )
+    .expect("ratio interval");
+    assert_eq!(interval.resamples, 2_000);
+    assert!((interval.estimate - 0.990_196_078_431_372_6).abs() < 1e-12);
+    assert!((interval.lower - 0.961_538_461_538_461_6).abs() < 1e-12);
+    assert!((interval.upper - 1.019_801_980_198_019_8).abs() < 1e-12);
+}
+
+#[test]
+#[ignore = "explicit 30+10 ABBA signed-binary performance gate"]
+fn disabled_probe_overhead() {
+    let root = repo_root();
+    let baseline_path = required_path("CARRICK_DSR_BASELINE_BIN");
+    let candidate_path = required_path("CARRICK_DSR_CANDIDATE_BIN");
+    let output = required_path("CARRICK_DSR_OVERHEAD_OUT");
+    let baseline = binary_provenance(
+        BinaryRole::Baseline,
+        &baseline_path,
+        std::env::var("CARRICK_DSR_BASELINE_COMMIT").unwrap_or_else(|_| BASELINE_COMMIT.to_owned()),
+    );
+    let candidate = binary_provenance(
+        BinaryRole::Candidate,
+        &candidate_path,
+        std::env::var("CARRICK_DSR_CANDIDATE_COMMIT")
+            .unwrap_or_else(|_| git_head().unwrap_or_else(|| "unknown".to_owned())),
+    );
+    assert_distinct_binaries(&baseline, &candidate);
+
+    let mut rows = vec![EvidenceRow::Run {
+        schema: SCHEMA,
+        mode: "disabled-probe",
+        epoch_secs: epoch_secs(),
+        schedule: "ABBA",
+        bootstrap_seed: BOOTSTRAP_SEED,
+        bootstrap_resamples: BOOTSTRAP_RESAMPLES,
+        host: host_context(),
+        binaries: vec![baseline.clone(), candidate.clone()],
+    }];
+    let mut decisions = Vec::new();
+    for (workload, cycles, limit) in [
+        (Workload::SyscallFloor, 15, 1.02),
+        (Workload::DirectV8, 5, 1.01),
+    ] {
+        let collected = collect_abba(
+            "disabled-probe",
+            workload,
+            cycles,
+            &baseline_path,
+            &candidate_path,
+            BinaryRole::Baseline,
+            BinaryRole::Candidate,
+            false,
+            &root,
+            &mut rows,
+        );
+        let ratio = bootstrap_median_ratio(
+            &collected[&BinaryRole::Baseline],
+            &collected[&BinaryRole::Candidate],
+            BOOTSTRAP_SEED ^ workload_seed(workload),
+            BOOTSTRAP_RESAMPLES,
+        )
+        .expect("bootstrap disabled-probe ratio");
+        let pass = ratio.lower <= 1.0 && ratio.upper <= limit;
+        rows.push(EvidenceRow::Decision {
+            schema: SCHEMA,
+            mode: "disabled-probe",
+            workload: workload.label(),
+            unit: workload.unit(),
+            baseline_role: BinaryRole::Baseline,
+            candidate_role: BinaryRole::Candidate,
+            baseline: summarize(&collected[&BinaryRole::Baseline]).expect("baseline summary"),
+            candidate: summarize(&collected[&BinaryRole::Candidate]).expect("candidate summary"),
+            ratio,
+            upper_bound_limit: Some(limit),
+            pass: Some(pass),
+        });
+        decisions.push((workload.label(), pass, ratio, limit));
+    }
+    write_jsonl_atomic(&output, &rows);
+    for (workload, pass, ratio, limit) in decisions {
+        assert!(
+            pass,
+            "{workload} disabled-probe regression: interval [{:.6}, {:.6}], limit {limit:.3}",
+            ratio.lower, ratio.upper
+        );
+    }
+}
+
+#[test]
+#[ignore = "explicit opt-in DTrace profile cost measurement"]
+fn enabled_profile_overhead() {
+    let root = repo_root();
+    let candidate_path = required_path("CARRICK_DSR_CANDIDATE_BIN");
+    let output = required_path("CARRICK_DSR_ENABLED_OUT");
+    let candidate = binary_provenance(
+        BinaryRole::Candidate,
+        &candidate_path,
+        std::env::var("CARRICK_DSR_CANDIDATE_COMMIT")
+            .unwrap_or_else(|_| git_head().unwrap_or_else(|| "unknown".to_owned())),
+    );
+    let mut rows = vec![EvidenceRow::Run {
+        schema: SCHEMA,
+        mode: "enabled-profile",
+        epoch_secs: epoch_secs(),
+        schedule: "ABBA",
+        bootstrap_seed: BOOTSTRAP_SEED,
+        bootstrap_resamples: BOOTSTRAP_RESAMPLES,
+        host: host_context(),
+        binaries: vec![candidate],
+    }];
+    let cycles = std::env::var("CARRICK_DSR_ENABLED_CYCLES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(2);
+    for workload in [
+        Workload::SyscallFloor,
+        Workload::DirectV8,
+        Workload::ForkExec,
+    ] {
+        let collected = collect_abba(
+            "enabled-profile",
+            workload,
+            cycles,
+            &candidate_path,
+            &candidate_path,
+            BinaryRole::Untraced,
+            BinaryRole::Profiled,
+            true,
+            &root,
+            &mut rows,
+        );
+        let ratio = bootstrap_median_ratio(
+            &collected[&BinaryRole::Untraced],
+            &collected[&BinaryRole::Profiled],
+            BOOTSTRAP_SEED ^ workload_seed(workload),
+            BOOTSTRAP_RESAMPLES,
+        )
+        .expect("bootstrap enabled-profile ratio");
+        rows.push(EvidenceRow::Decision {
+            schema: SCHEMA,
+            mode: "enabled-profile",
+            workload: workload.label(),
+            unit: "ms-wall",
+            baseline_role: BinaryRole::Untraced,
+            candidate_role: BinaryRole::Profiled,
+            baseline: summarize(&collected[&BinaryRole::Untraced]).expect("untraced summary"),
+            candidate: summarize(&collected[&BinaryRole::Profiled]).expect("profiled summary"),
+            ratio,
+            upper_bound_limit: None,
+            pass: None,
+        });
+    }
+    write_jsonl_atomic(&output, &rows);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_abba(
+    mode: &'static str,
+    workload: Workload,
+    cycles: usize,
+    first_binary: &Path,
+    second_binary: &Path,
+    first_role: BinaryRole,
+    second_role: BinaryRole,
+    profile_second: bool,
+    root: &Path,
+    rows: &mut Vec<EvidenceRow>,
+) -> BTreeMap<BinaryRole, Vec<f64>> {
+    let mut samples = BTreeMap::from([(first_role, Vec::new()), (second_role, Vec::new())]);
+    let mut sequence = 0;
+    for cycle in 0..cycles {
+        for (slot, (role, binary, profiled)) in [
+            (first_role, first_binary, false),
+            (second_role, second_binary, profile_second),
+            (second_role, second_binary, profile_second),
+            (first_role, first_binary, false),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let run_id = next_run_id(mode, workload, role);
+            let wall_time_metric = mode == "enabled-profile";
+            let value = run_workload(binary, workload, profiled, wall_time_metric, root, &run_id);
+            let unit = if wall_time_metric {
+                "ms-wall"
+            } else {
+                workload.unit()
+            };
+            eprintln!(
+                "dsr-overhead[{mode}/{}] cycle={cycle} slot={slot} role={} value={value:.6} {}",
+                workload.label(),
+                role.label(),
+                unit
+            );
+            samples.get_mut(&role).expect("known role").push(value);
+            rows.push(EvidenceRow::Sample {
+                schema: SCHEMA,
+                mode,
+                workload: workload.label(),
+                unit,
+                sequence,
+                cycle,
+                slot,
+                role,
+                value,
+                run_id,
+            });
+            sequence += 1;
+            std::thread::sleep(cooldown());
+        }
+    }
+    samples
+}
+
+fn run_workload(
+    binary: &Path,
+    workload: Workload,
+    profiled: bool,
+    wall_time_metric: bool,
+    root: &Path,
+    run_id: &str,
+) -> f64 {
+    let inner = workload_args(workload, root, run_id);
+    let args = if profiled {
+        let mut args = vec![
+            "trace".to_owned(),
+            "--profile".to_owned(),
+            workload.profile().to_owned(),
+            "--".to_owned(),
+        ];
+        args.extend(inner);
+        args
+    } else {
+        inner
+    };
+    let started = Instant::now();
+    let output = Command::new("timeout")
+        .arg(workload.timeout_secs().to_string())
+        .arg(binary)
+        .args(&args)
+        .env("CARRICK_RUN_ID", run_id)
+        .env("CARRICK_EXPOSED_CPUS", "4")
+        .env_remove("CARRICK_DSR_PROFILE")
+        .output()
+        .unwrap_or_else(|error| panic!("spawn {}: {error}", binary.display()));
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
+    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    scoped_cleanup(root, run_id);
+    assert!(
+        output.status.success(),
+        "{} {} failed status={:?}:\n{text}",
+        binary.display(),
+        workload.label(),
+        output.status.code()
+    );
+    match workload {
+        Workload::SyscallFloor if !wall_time_metric => {
+            parse_metric(&text, "trap_p50_us").expect("trap_p50_us")
+        }
+        Workload::SyscallFloor => elapsed_ms,
+        Workload::DirectV8 => {
+            assert!(
+                text.contains("v8-smoke ok"),
+                "missing V8 success marker:\n{text}"
+            );
+            elapsed_ms
+        }
+        Workload::ForkExec => {
+            assert!(
+                text.contains("fork_exec_p50_us="),
+                "missing fork output:\n{text}"
+            );
+            elapsed_ms
+        }
+    }
+}
+
+fn workload_args(workload: Workload, root: &Path, run_id: &str) -> Vec<String> {
+    match workload {
+        Workload::SyscallFloor => vec![
+            "run-elf".to_owned(),
+            "--raw".to_owned(),
+            "--exec-backend".to_owned(),
+            "native".to_owned(),
+            "--native-page-profile".to_owned(),
+            "native16k".to_owned(),
+            "--native-code-mode".to_owned(),
+            "dsr".to_owned(),
+            root.join("conformance-probes/target/native-pie/aarch64-unknown-linux-musl/release/perf_trap_floor")
+                .to_string_lossy()
+                .into_owned(),
+        ],
+        Workload::DirectV8 => vec![
+            "run".to_owned(),
+            "--name".to_owned(),
+            format!("{run_id}-v8"),
+            "--max-traps".to_owned(),
+            u64::MAX.to_string(),
+            "--raw".to_owned(),
+            "--fs".to_owned(),
+            "host".to_owned(),
+            "--entrypoint".to_owned(),
+            V8_ENTRYPOINT.to_owned(),
+            "--exec-backend".to_owned(),
+            "native".to_owned(),
+            "--native-page-profile".to_owned(),
+            "native16k".to_owned(),
+            "--native-code-mode".to_owned(),
+            "dsr".to_owned(),
+            V8_IMAGE.to_owned(),
+            V8_SCRIPT.to_owned(),
+        ],
+        Workload::ForkExec => vec![
+            "run-elf".to_owned(),
+            "--raw".to_owned(),
+            "--exec-backend".to_owned(),
+            "native".to_owned(),
+            "--native-page-profile".to_owned(),
+            "native16k".to_owned(),
+            "--native-code-mode".to_owned(),
+            "dsr".to_owned(),
+            root.join("conformance-probes/target/native-pie/aarch64-unknown-linux-musl/release/perf_fork_exec")
+                .to_string_lossy()
+                .into_owned(),
+        ],
+    }
+}
+
+fn binary_provenance(role: BinaryRole, path: &Path, commit: String) -> BinaryProvenance {
+    let canonical = path
+        .canonicalize()
+        .unwrap_or_else(|error| panic!("canonicalize {}: {error}", path.display()));
+    let metadata = std::fs::metadata(&canonical).expect("binary metadata");
+    let bytes = std::fs::read(&canonical).expect("read binary");
+    let codesign = command_text("codesign", &["-dv", "--verbose=4"], Some(&canonical));
+    assert!(
+        codesign.contains("Signature=") || codesign.contains("adhoc"),
+        "{} is not signed:\n{codesign}",
+        canonical.display()
+    );
+    BinaryProvenance {
+        role,
+        path: canonical.to_string_lossy().into_owned(),
+        commit,
+        sha256: format!("{:x}", Sha256::digest(bytes)),
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        codesign,
+    }
+}
+
+fn assert_distinct_binaries(left: &BinaryProvenance, right: &BinaryProvenance) {
+    assert_ne!((left.device, left.inode), (right.device, right.inode));
+    assert_ne!(left.sha256, right.sha256);
+    assert_ne!(left.path, right.path);
+}
+
+fn parse_metric(output: &str, key: &str) -> Option<f64> {
+    output.lines().find_map(|line| {
+        let (candidate, value) = line.split_once('=')?;
+        (candidate.trim() == key)
+            .then(|| value.trim().parse::<f64>().ok())
+            .flatten()
+    })
+}
+
+fn scoped_cleanup(root: &Path, run_id: &str) {
+    let _ = Command::new(root.join("scripts/sudo/kill.sh"))
+        .arg(run_id)
+        .output();
+}
+
+fn next_run_id(mode: &str, workload: Workload, role: BinaryRole) -> String {
+    format!(
+        "dsr-oh-{}-{}-{}-{}-{}",
+        std::process::id(),
+        mode,
+        workload.label(),
+        role.label(),
+        RUN_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+fn cooldown() -> Duration {
+    Duration::from_millis(
+        std::env::var("CARRICK_DSR_OVERHEAD_COOLDOWN_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(250),
+    )
+}
+
+fn workload_seed(workload: Workload) -> u64 {
+    match workload {
+        Workload::SyscallFloor => 1,
+        Workload::DirectV8 => 2,
+        Workload::ForkExec => 3,
+    }
+}
+
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("workspace root")
+        .to_path_buf()
+}
+
+fn required_path(key: &str) -> PathBuf {
+    PathBuf::from(std::env::var_os(key).unwrap_or_else(|| panic!("{key} is required")))
+}
+
+fn host_context() -> HostContext {
+    HostContext {
+        model: command_stdout("sysctl", &["-n", "hw.model"]),
+        macos: command_stdout("sw_vers", &["-productVersion"]),
+        logical_cpus: command_stdout("sysctl", &["-n", "hw.logicalcpu"]),
+        power_source: command_stdout("pmset", &["-g", "batt"]),
+    }
+}
+
+fn git_head() -> Option<String> {
+    command_stdout("git", &["rev-parse", "HEAD"])
+}
+
+fn command_stdout(program: &str, args: &[&str]) -> Option<String> {
+    let output = Command::new(program).args(args).output().ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn command_text(program: &str, args: &[&str], trailing: Option<&Path>) -> String {
+    let mut command = Command::new(program);
+    command.args(args);
+    if let Some(path) = trailing {
+        command.arg(path);
+    }
+    let output = command.output().expect("run provenance command");
+    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    text.trim().to_owned()
+}
+
+fn epoch_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn write_jsonl_atomic(path: &Path, rows: &[EvidenceRow]) {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent).expect("create evidence directory");
+    let mut temporary = NamedTempFile::new_in(parent).expect("create evidence temporary");
+    {
+        let mut writer = BufWriter::new(temporary.as_file_mut());
+        for row in rows {
+            serde_json::to_writer(&mut writer, row).expect("serialize evidence row");
+            writer.write_all(b"\n").expect("terminate evidence row");
+        }
+        writer.flush().expect("flush evidence JSONL");
+    }
+    temporary.as_file().sync_all().expect("sync evidence JSONL");
+    temporary.persist(path).expect("publish evidence JSONL");
+}

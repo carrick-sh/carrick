@@ -45,6 +45,82 @@ pub fn is_noisy(summary: &Summary) -> bool {
 }
 
 #[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+pub struct RatioInterval {
+    pub estimate: f64,
+    pub lower: f64,
+    pub upper: f64,
+    pub resamples: usize,
+}
+
+#[cfg(test)]
+pub fn bootstrap_median_ratio(
+    baseline: &[f64],
+    candidate: &[f64],
+    seed: u64,
+    resamples: usize,
+) -> Option<RatioInterval> {
+    use rand::{Rng, SeedableRng, rngs::StdRng};
+
+    if baseline.is_empty()
+        || candidate.is_empty()
+        || resamples == 0
+        || baseline
+            .iter()
+            .any(|value| !value.is_finite() || *value <= 0.0)
+        || candidate
+            .iter()
+            .any(|value| !value.is_finite() || *value < 0.0)
+    {
+        return None;
+    }
+
+    let baseline_median = sample_median(baseline)?;
+    let candidate_median = sample_median(candidate)?;
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut baseline_sample = Vec::with_capacity(baseline.len());
+    let mut candidate_sample = Vec::with_capacity(candidate.len());
+    let mut ratios = Vec::with_capacity(resamples);
+    for _ in 0..resamples {
+        baseline_sample.clear();
+        candidate_sample.clear();
+        for _ in 0..baseline.len() {
+            baseline_sample.push(baseline[rng.random_range(0..baseline.len())]);
+        }
+        for _ in 0..candidate.len() {
+            candidate_sample.push(candidate[rng.random_range(0..candidate.len())]);
+        }
+        let denominator = sample_median(&baseline_sample)?;
+        if denominator <= 0.0 {
+            return None;
+        }
+        ratios.push(sample_median(&candidate_sample)? / denominator);
+    }
+    ratios.sort_by(|left, right| left.total_cmp(right));
+    Some(RatioInterval {
+        estimate: candidate_median / baseline_median,
+        lower: nearest_rank(&ratios, 0.025),
+        upper: nearest_rank(&ratios, 0.975),
+        resamples,
+    })
+}
+
+#[cfg(test)]
+fn sample_median(values: &[f64]) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|left, right| left.total_cmp(right));
+    let middle = sorted.len() / 2;
+    if sorted.len().is_multiple_of(2) {
+        Some((sorted[middle - 1] + sorted[middle]) / 2.0)
+    } else {
+        Some(sorted[middle])
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -82,5 +158,23 @@ mod tests {
         };
         assert!(!is_noisy(&tight));
         assert!(is_noisy(&wide));
+    }
+
+    #[test]
+    fn bootstrap_median_ratio_is_seeded_and_pinned() {
+        let baseline = [100.0, 101.0, 102.0, 103.0, 104.0];
+        let candidate = [99.0, 100.0, 101.0, 102.0, 103.0];
+        let interval = bootstrap_median_ratio(&baseline, &candidate, 42, 2_000)
+            .expect("non-empty finite samples");
+        assert_eq!(interval.resamples, 2_000);
+        assert!((interval.estimate - (101.0 / 102.0)).abs() < 1e-12);
+        assert!((interval.lower - 0.961_538_461_538_461_6).abs() < 1e-12);
+        assert!((interval.upper - 1.019_801_980_198_019_8).abs() < 1e-12);
+    }
+
+    #[test]
+    fn bootstrap_median_ratio_rejects_empty_or_zero_baseline() {
+        assert!(bootstrap_median_ratio(&[], &[1.0], 1, 10).is_none());
+        assert!(bootstrap_median_ratio(&[0.0], &[1.0], 1, 10).is_none());
     }
 }
