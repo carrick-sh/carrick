@@ -20,12 +20,17 @@ pub(super) enum ThreadExit {
     Continue,
     Sensitive(types::SensitiveExit),
     Fault {
-        signal: i32,
-        code: i32,
+        kind: ThreadFault,
         address: carrick_guest_mem::GuestVa,
     },
     Kick,
     Unsupported(String),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) enum ThreadFault {
+    Host { signal: i32, code: i32 },
+    Guest { signum: i32, code: i32 },
 }
 
 #[derive(Clone, Copy)]
@@ -307,24 +312,10 @@ impl ThreadTranslator {
     fn resolve_indirect(
         &mut self,
         memory: &super::NativeMappedMemory,
-        source: carrick_guest_mem::GuestVa,
+        _source: carrick_guest_mem::GuestVa,
         target: carrick_guest_mem::GuestVa,
     ) -> Result<types::CacheVa, types::DsrError> {
         self.stats.resolver_exits = self.stats.resolver_exits.saturating_add(1);
-        if !target.raw().is_multiple_of(4) {
-            return Err(types::DsrError::InvalidIndirectTarget {
-                source_pc: source.raw(),
-                target: target.raw(),
-                reason: "target is not instruction aligned",
-            });
-        }
-        if !memory.guest_address_is_executable(target.raw()) {
-            return Err(types::DsrError::InvalidIndirectTarget {
-                source_pc: source.raw(),
-                target: target.raw(),
-                reason: "target is outside an executable guest mapping",
-            });
-        }
         let (entry, generation) = self.translate(memory, target)?;
         self.indirect_cache.publish(target, generation, entry);
         Ok(entry)
@@ -392,6 +383,30 @@ impl ThreadTranslator {
                 ThreadExit::Continue
             }
             types::NativeDsrExit::ResolveIndirect { source, target, .. } => {
+                if !target.raw().is_multiple_of(4) {
+                    snapshot.pc = source.raw();
+                    return Ok(ThreadExit::Fault {
+                        kind: ThreadFault::Guest {
+                            signum: carrick_abi::LINUX_SIGBUS,
+                            code: carrick_abi::LINUX_BUS_ADRALN,
+                        },
+                        address: target,
+                    });
+                }
+                if !memory.guest_address_is_executable(target.raw()) {
+                    snapshot.pc = source.raw();
+                    return Ok(ThreadExit::Fault {
+                        kind: ThreadFault::Guest {
+                            signum: carrick_abi::LINUX_SIGSEGV,
+                            code: if memory.region_contains(target.raw(), 1) {
+                                carrick_abi::LINUX_SEGV_ACCERR
+                            } else {
+                                carrick_abi::LINUX_SEGV_MAPERR
+                            },
+                        },
+                        address: target,
+                    });
+                }
                 let entry = self.resolve_indirect(memory, source, target)?;
                 let target_generation = memory.dsr_generation_observation(target)?.expected();
                 self.resume_entry = Some((target, target_generation, entry));
@@ -459,8 +474,7 @@ impl ThreadTranslator {
                 }
                 snapshot.pc = guest_pc.raw();
                 ThreadExit::Fault {
-                    signal,
-                    code,
+                    kind: ThreadFault::Host { signal, code },
                     address,
                 }
             }

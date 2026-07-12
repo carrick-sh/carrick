@@ -1842,11 +1842,11 @@ fn run_native_dsr_thread_loop(
                 snapshot.pc = exit.resume.raw();
                 continue;
             }
-            dsr::ThreadExit::Fault {
-                signal,
-                code,
-                address,
-            } => {
+            dsr::ThreadExit::Fault { kind, address } => {
+                let (signal, code) = match kind {
+                    dsr::ThreadFault::Host { signal, code } => (signal, code),
+                    dsr::ThreadFault::Guest { signum, code } => (signum, code),
+                };
                 if trace_syscalls {
                     child_write_stderr(
                         format!(
@@ -1859,17 +1859,21 @@ fn run_native_dsr_thread_loop(
                         .as_bytes(),
                     );
                 }
-                if !matches!(signal, libc::SIGSEGV | libc::SIGBUS | libc::SIGTRAP) {
+                if matches!(kind, dsr::ThreadFault::Host { .. })
+                    && !matches!(signal, libc::SIGSEGV | libc::SIGBUS | libc::SIGTRAP)
+                {
                     return Err(RuntimeError::Unsupported(format!(
                         "native DSR trapped unexpected host signal {signal} at guest PC 0x{:x}",
                         snapshot.pc
                     )));
                 }
-                if memory.lock().resolve_native16k_write_exec_fault(
-                    address.raw(),
-                    snapshot.pc,
-                    snapshot.esr,
-                )? {
+                if matches!(kind, dsr::ThreadFault::Host { .. })
+                    && memory.lock().resolve_native16k_write_exec_fault(
+                        address.raw(),
+                        snapshot.pc,
+                        snapshot.esr,
+                    )?
+                {
                     continue;
                 }
                 snapshot = lower_dsr_fault(
@@ -1877,7 +1881,7 @@ fn run_native_dsr_thread_loop(
                     &memory,
                     snapshot,
                     thread_runtime.tid(),
-                    code,
+                    kind,
                     address.raw(),
                 )?;
                 continue;
@@ -2315,11 +2319,12 @@ fn lower_dsr_fault(
     memory: &SharedNativeMemory,
     snapshot: NativeUcontextSnapshot,
     tid: crate::thread::ThreadId,
-    host_code: i32,
+    fault: dsr::ThreadFault,
     fault_address: u64,
 ) -> Result<NativeUcontextSnapshot, RuntimeError> {
-    let _ = host_code;
-    if let Some((page, prot)) = dispatcher.resident_fault_plan(fault_address) {
+    if matches!(fault, dsr::ThreadFault::Host { .. })
+        && let Some((page, prot)) = dispatcher.resident_fault_plan(fault_address)
+    {
         let mut memory = memory.lock();
         let linux_page_size = memory.linux_page_size as usize;
         if memory.protect_range(page, linux_page_size, prot).is_ok() {
@@ -2328,16 +2333,25 @@ fn lower_dsr_fault(
             return Ok(snapshot);
         }
     }
-    if memory
-        .lock()
-        .resolve_native16k_write_exec_fault(fault_address, snapshot.pc, snapshot.esr)?
+    if matches!(fault, dsr::ThreadFault::Host { .. })
+        && memory.lock().resolve_native16k_write_exec_fault(
+            fault_address,
+            snapshot.pc,
+            snapshot.esr,
+        )?
     {
         return Ok(snapshot);
     }
-    let Some((mut signum, mut si_code, si_addr)) =
-        crate::vcpu_loop::lower_el0_fault(snapshot.esr, snapshot.pc, fault_address)
-    else {
-        native_die_by_signal(dispatcher, crate::linux_abi::LINUX_SIGSEGV);
+    let (mut signum, mut si_code, si_addr) = match fault {
+        dsr::ThreadFault::Guest { signum, code } => (signum, code, fault_address),
+        dsr::ThreadFault::Host { .. } => {
+            let Some(lowered) =
+                crate::vcpu_loop::lower_el0_fault(snapshot.esr, snapshot.pc, fault_address)
+            else {
+                native_die_by_signal(dispatcher, crate::linux_abi::LINUX_SIGSEGV);
+            };
+            lowered
+        }
     };
     si_code = {
         let memory = memory.lock();
@@ -8458,7 +8472,7 @@ mod tests {
     }
 
     #[test]
-    fn dsr_indirect_flow_runtime_rejects_unaligned_and_unmapped_targets() {
+    fn dsr_indirect_flow_runtime_lowers_invalid_targets_to_guest_signals() {
         let plan = ExecutionPlan {
             backend: crate::page_profile::ExecutionBackend::NativeDarwin,
             page_geometry: crate::page_profile::PageGeometry {
@@ -8469,9 +8483,9 @@ mod tests {
             native_code_mode: carrick_spec::NativeCodeModeRequest::Dsr,
             diagnostics: Vec::new(),
         };
-        for (target_word, expected) in [
-            (0xd280_0020, "target is not instruction aligned"), // mov x0, #1
-            (0xd280_0000, "outside an executable guest mapping"), // mov x0, #0
+        for (target_word, expected_signal) in [
+            (0xd280_0020, crate::linux_abi::LINUX_SIGBUS), // mov x0, #1
+            (0xd280_0000, crate::linux_abi::LINUX_SIGSEGV), // mov x0, #0
         ] {
             let words = [target_word, 0xd61f_0000]; // br x0
             let mut file = tempfile::NamedTempFile::new().expect("create invalid-target ELF");
@@ -8487,11 +8501,11 @@ mod tests {
                 &plan,
             )
             .expect("collect invalid-target child result");
-            let stderr = String::from_utf8_lossy(&result.stderr);
-            assert_eq!(result.exit_code, 125, "stderr={stderr}");
-            assert!(
-                stderr.contains(expected),
-                "unexpected error output: {stderr}"
+            assert_eq!(
+                result.exit_code,
+                128 + expected_signal,
+                "stderr={}",
+                String::from_utf8_lossy(&result.stderr)
             );
         }
     }

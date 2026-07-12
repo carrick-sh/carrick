@@ -248,6 +248,13 @@ pub const LINUX_SIGTTOU: i32 = 22; // background tty write/ctl → stop
 pub const LINUX_SIGURG: i32 = 23; // macOS 16; default action = Ignore
 pub const LINUX_SIGXCPU: i32 = 24;
 pub const LINUX_SIGXFSZ: i32 = 25;
+
+// Linux signal-frame `si_code` values for synchronous memory faults. These
+// are guest ABI values, not host `libc` constants (the numeric domains happen
+// to overlap on Darwin today).
+pub const LINUX_SEGV_MAPERR: i32 = 1;
+pub const LINUX_SEGV_ACCERR: i32 = 2;
+pub const LINUX_BUS_ADRALN: i32 = 1;
 pub const LINUX_SIGVTALRM: i32 = 26;
 pub const LINUX_SIGPROF: i32 = 27;
 pub const LINUX_SIGWINCH: i32 = 28; // default action = Ignore
