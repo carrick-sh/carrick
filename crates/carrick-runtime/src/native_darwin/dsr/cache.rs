@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use carrick_guest_mem::{GuestVa, HostVa};
-use parking_lot::RwLock;
+use parking_lot::{Condvar, Mutex, RwLock};
 
 use super::types::{CacheOffset, CacheVa, CodeGeneration, DsrError};
 
@@ -181,6 +181,74 @@ pub(super) struct PageBlockDependencies {
     blocks: BTreeMap<GuestVa, Vec<(GuestVa, CodeGeneration)>>,
 }
 
+#[derive(Clone, Copy)]
+enum PublicationState {
+    Building,
+    Published(CacheVa),
+}
+
+#[derive(Default)]
+pub(super) struct ConcurrentPublicationIndex {
+    state: Mutex<BTreeMap<(GuestVa, CodeGeneration), PublicationState>>,
+    changed: Condvar,
+    builders: AtomicU64,
+}
+
+impl ConcurrentPublicationIndex {
+    pub(super) fn get_or_publish(
+        &self,
+        key: (GuestVa, CodeGeneration),
+        build: impl FnOnce() -> CacheVa,
+    ) -> CacheVa {
+        let mut state = self.state.lock();
+        loop {
+            match state.get(&key).copied() {
+                Some(PublicationState::Published(entry)) => return entry,
+                Some(PublicationState::Building) => {
+                    self.changed.wait(&mut state);
+                }
+                None => {
+                    state.insert(key, PublicationState::Building);
+                    break;
+                }
+            }
+        }
+        drop(state);
+        self.builders.fetch_add(1, Ordering::Relaxed);
+        let entry = build();
+        let mut state = self.state.lock();
+        state.insert(key, PublicationState::Published(entry));
+        self.changed.notify_all();
+        entry
+    }
+
+    pub(super) fn after_fork_child(&self) {
+        self.state
+            .lock()
+            .retain(|_, state| matches!(state, PublicationState::Published(_)));
+        self.changed.notify_all();
+    }
+
+    pub(super) fn reset_for_exec(&self) {
+        self.state.lock().clear();
+        self.changed.notify_all();
+    }
+
+    #[cfg(test)]
+    pub(super) fn published_count(&self) -> usize {
+        self.state
+            .lock()
+            .values()
+            .filter(|state| matches!(state, PublicationState::Published(_)))
+            .count()
+    }
+
+    #[cfg(test)]
+    pub(super) fn builder_count(&self) -> u64 {
+        self.builders.load(Ordering::Relaxed)
+    }
+}
+
 impl PageBlockDependencies {
     pub(super) fn record(&mut self, page: GuestVa, block: GuestVa, generation: CodeGeneration) {
         let blocks = self.blocks.entry(page).or_default();
@@ -242,6 +310,13 @@ pub(super) struct TranslationCache {
     capacity: usize,
     cursor: usize,
 }
+
+// SAFETY: the mapping is process-wide and contains no thread-affine pointer
+// provenance. Every mutation, including the thread-local MAP_JIT write-enable
+// window, is serialized by `ProcessTranslator::state`; published instructions
+// are immutable except for aligned atomic direct-link patches under that same
+// lock.
+unsafe impl Send for TranslationCache {}
 
 impl TranslationCache {
     pub(in crate::native_darwin) fn new(requested_capacity: usize) -> Result<Self, DsrError> {
@@ -317,6 +392,13 @@ impl TranslationCache {
             written: 0,
             write_enabled: true,
         })
+    }
+
+    /// Repair the per-thread MAP_JIT protection bit inherited by the sole
+    /// surviving thread after `fork(2)`.  Quiescence guarantees no writer is
+    /// live at the fork instant, so the child always starts executable-only.
+    pub(super) fn after_fork_child(&self) {
+        unsafe { libc::pthread_jit_write_protect_np(1) };
     }
 
     pub(super) fn contains_host_pc(&self, pc: HostVa) -> bool {
@@ -541,6 +623,140 @@ mod generation_tests {
         );
         assert!(dependencies.contains(PAGE, second, CodeGeneration::claimed(1)));
         assert!(dependencies.contains(other_page, other_page, CodeGeneration::INITIAL));
+    }
+
+    #[test]
+    fn dsr_concurrency_duplicate_publication_has_one_winner() {
+        use std::sync::{Arc, Barrier};
+
+        let publications = Arc::new(super::ConcurrentPublicationIndex::default());
+        let barrier = Arc::new(Barrier::new(2));
+        let key = (PAGE, CodeGeneration::INITIAL);
+        let winner_entry = super::CacheVa::published(carrick_guest_mem::HostVa(0x1000));
+        let mut threads = Vec::new();
+        for _ in 0..2 {
+            let publications = Arc::clone(&publications);
+            let barrier = Arc::clone(&barrier);
+            threads.push(std::thread::spawn(move || {
+                publications.get_or_publish(key, || {
+                    barrier.wait();
+                    winner_entry
+                })
+            }));
+        }
+        barrier.wait();
+        let results = threads
+            .into_iter()
+            .map(|thread| thread.join().expect("publication thread"))
+            .collect::<Vec<_>>();
+        assert_eq!(results, vec![winner_entry, winner_entry]);
+        assert_eq!(publications.published_count(), 1);
+        assert_eq!(publications.builder_count(), 1);
+    }
+
+    #[test]
+    fn dsr_concurrency_waiter_cannot_observe_partial_publication() {
+        use std::sync::{Arc, Barrier, mpsc};
+
+        let publications = Arc::new(super::ConcurrentPublicationIndex::default());
+        let allocated = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let key = (PAGE, CodeGeneration::INITIAL);
+        let entry = super::CacheVa::published(carrick_guest_mem::HostVa(0x3000));
+        let builder = {
+            let publications = Arc::clone(&publications);
+            let allocated = Arc::clone(&allocated);
+            let release = Arc::clone(&release);
+            std::thread::spawn(move || {
+                publications.get_or_publish(key, || {
+                    allocated.wait();
+                    release.wait();
+                    entry
+                })
+            })
+        };
+        allocated.wait();
+        let (sent, received) = mpsc::channel();
+        let waiter = {
+            let publications = Arc::clone(&publications);
+            std::thread::spawn(move || {
+                let observed = publications.get_or_publish(key, || entry);
+                sent.send(observed).expect("send publication result");
+            })
+        };
+        assert!(
+            matches!(
+                received.recv_timeout(std::time::Duration::from_millis(20)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ),
+            "waiter observed a candidate before publication"
+        );
+        release.wait();
+        assert_eq!(
+            received
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("published result"),
+            entry
+        );
+        assert_eq!(builder.join().expect("join publication builder"), entry);
+        waiter.join().expect("join publication waiter");
+    }
+
+    #[test]
+    fn dsr_concurrency_fork_child_discards_in_progress_publication() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Barrier};
+
+        let publications = Arc::new(super::ConcurrentPublicationIndex::default());
+        let ready = Arc::new(Barrier::new(2));
+        let release = Arc::new(AtomicBool::new(false));
+        let key = (PAGE, CodeGeneration::INITIAL);
+        let builder = {
+            let publications = Arc::clone(&publications);
+            let ready = Arc::clone(&ready);
+            let release = Arc::clone(&release);
+            std::thread::spawn(move || {
+                publications.get_or_publish(key, || {
+                    ready.wait();
+                    while !release.load(Ordering::Acquire) {
+                        std::hint::spin_loop();
+                    }
+                    super::CacheVa::published(carrick_guest_mem::HostVa(0x1000))
+                })
+            })
+        };
+        ready.wait();
+
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork publication child");
+        if pid == 0 {
+            publications.after_fork_child();
+            let entry = publications.get_or_publish(key, || {
+                super::CacheVa::published(carrick_guest_mem::HostVa(0x2000))
+            });
+            unsafe { libc::_exit(i32::from(entry.host().raw() != 0x2000)) };
+        }
+        release.store(true, Ordering::Release);
+        builder.join().expect("join parent publication builder");
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFEXITED(status), "child status 0x{status:x}");
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+    }
+
+    #[test]
+    fn dsr_concurrency_exec_reset_discards_published_index() {
+        let publications = super::ConcurrentPublicationIndex::default();
+        let key = (PAGE, CodeGeneration::INITIAL);
+        let first = publications.get_or_publish(key, || {
+            super::CacheVa::published(carrick_guest_mem::HostVa(0x1000))
+        });
+        publications.reset_for_exec();
+        let second = publications.get_or_publish(key, || {
+            super::CacheVa::published(carrick_guest_mem::HostVa(0x2000))
+        });
+        assert_ne!(first, second);
+        assert_eq!(publications.builder_count(), 2);
     }
 
     fn page_range() -> Range<GuestVa> {

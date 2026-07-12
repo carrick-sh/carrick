@@ -53,6 +53,15 @@ impl IndirectTargetCache {
         entry.guest.store(guest.raw(), Ordering::Release);
     }
 
+    pub(super) fn clear(&self) {
+        for entry in self.entries.iter() {
+            // Make the entry unreachable before clearing its payload.
+            entry.guest.store(0, Ordering::Release);
+            entry.generation.store(0, Ordering::Relaxed);
+            entry.cache.store(0, Ordering::Relaxed);
+        }
+    }
+
     fn as_ptr(&self) -> *const IndirectTargetCacheEntry {
         self.entries.as_ptr()
     }
@@ -69,7 +78,7 @@ struct DsrContext {
     snapshot: NativeUcontextSnapshot,
     host_sp: u64,
     host_x19_x30: [u64; 12],
-    alignment_pad: u64,
+    generation_pstate_scratch: u64,
     host_v8_v15: [[u8; 16]; 8],
     entry: u64,
     exit_target: u64,
@@ -120,10 +129,12 @@ impl DsrContext {
             _ => (0, 0, 0, 0, 0),
         };
         Self {
+            rewrite_scratch: snapshot.x[16],
+            rewrite_context_scratch: snapshot.x[17],
+            generation_pstate_scratch: snapshot.pstate,
             snapshot,
             host_sp: 0,
             host_x19_x30: [0; 12],
-            alignment_pad: 0,
             host_v8_v15: [[0; 16]; 8],
             entry: entry.host().raw() as u64,
             exit_target,
@@ -135,8 +146,6 @@ impl DsrContext {
             exit_link,
             exit_has_link,
             exit_link_pad: 0,
-            rewrite_scratch: 0,
-            rewrite_context_scratch: 0,
             indirect_cache,
             generation: generation.get(),
         }
@@ -147,6 +156,7 @@ const _: () = assert!(std::mem::size_of::<NativeUcontextSnapshot>() == 832);
 const _: () = assert!(std::mem::offset_of!(DsrContext, snapshot) == 0);
 const _: () = assert!(std::mem::offset_of!(DsrContext, host_sp) == 832);
 const _: () = assert!(std::mem::offset_of!(DsrContext, host_x19_x30) == 840);
+const _: () = assert!(std::mem::offset_of!(DsrContext, generation_pstate_scratch) == 936);
 const _: () = assert!(std::mem::offset_of!(DsrContext, host_v8_v15) == 944);
 const _: () = assert!(std::mem::offset_of!(DsrContext, entry) == 1072);
 const _: () = assert!(std::mem::offset_of!(DsrContext, exit_target) == 1080);
@@ -277,11 +287,13 @@ fn enter_translated_raw(
             address: carrick_guest_mem::GuestVa(context.snapshot.fault_address),
             rewrite_scratch: context.rewrite_scratch,
             rewrite_context_scratch: context.rewrite_context_scratch,
+            generation_pstate_scratch: context.generation_pstate_scratch,
         },
         5 => NativeDsrExit::Kick {
             resume: carrick_guest_mem::GuestVa(context.exit_target),
             rewrite_scratch: context.rewrite_scratch,
             rewrite_context_scratch: context.rewrite_context_scratch,
+            generation_pstate_scratch: context.generation_pstate_scratch,
         },
         6 => NativeDsrExit::Sensitive {
             guest_pc: carrick_guest_mem::GuestVa(context.exit_source),

@@ -3667,6 +3667,63 @@ fn native_conformance_run_elf_supports_plain_fork_probe() {
             "native run-elf mapfixed fork probe failed for profile {profile}:\n{out}"
         );
     }
+    let dsr = run_native_dsr_run_elf_with_args(&bin, &probe, "native16k", &[]);
+    assert!(
+        dsr.contains("status=exit status: 0")
+            && dsr.contains("setup_ok=true")
+            && dsr.contains("child_map_fixed_ok=true")
+            && dsr.contains("parent_value_preserved=true")
+            && dsr.contains("parent_clobbered_by_child=false"),
+        "native16k DSR mapfixed fork probe failed:\n{dsr}"
+    );
+}
+
+#[test]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn native_conformance_dsr_exec_from_non_leader_replaces_image() {
+    let _serial = CONFORMANCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let Some(bin) = carrick_bin() else {
+        eprintln!(
+            "SKIP native_conformance_dsr_exec_from_non_leader_replaces_image: \
+             target/release/carrick not built"
+        );
+        return;
+    };
+    ensure_signed(&bin);
+    let probe = ensure_native_static_pie_probe("execfromthread");
+    let output = run_native_dsr_run_elf_with_args(&bin, &probe, "native16k", &[]);
+    assert!(
+        output.contains("status=exit status: 0")
+            && output.contains("exec_from_thread_stage2_reached=true")
+            && output.contains("exec_from_thread_count_is_one=true")
+            && !output.contains("exec_from_thread_replaced_image=false"),
+        "native16k DSR non-leader exec did not replace the image:\n{output}"
+    );
+}
+
+#[test]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn native_conformance_dsr_vfork_exec_from_sibling_completes() {
+    let _serial = CONFORMANCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let Some(bin) = carrick_bin() else {
+        eprintln!(
+            "SKIP native_conformance_dsr_vfork_exec_from_sibling_completes: \
+             target/release/carrick not built"
+        );
+        return;
+    };
+    ensure_signed(&bin);
+    let probe = ensure_native_static_pie_probe("vforkexecthread");
+    let output = run_native_dsr_run_elf_with_args(&bin, &probe, "native16k", &[]);
+    assert!(
+        output.contains("status=exit status: 0")
+            && output.contains("vfork_exec_stage2_reached=true")
+            && output.contains("vfork_child_survived_exec=true")
+            && !output.contains("stage1_survived_vfork_suspend=true"),
+        "native16k DSR vfork/exec lifecycle diverged:\n{output}"
+    );
 }
 
 #[test]

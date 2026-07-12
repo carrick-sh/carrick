@@ -1,4 +1,7 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use parking_lot::Mutex;
 
 pub(super) mod block;
 pub(super) mod cache;
@@ -26,9 +29,7 @@ pub(super) enum ThreadExit {
 }
 
 pub(super) struct ThreadTranslator {
-    cache: cache::TranslationCache,
-    blocks: BTreeMap<(carrick_guest_mem::GuestVa, types::CodeGeneration), types::CacheVa>,
-    pending: BTreeMap<(carrick_guest_mem::GuestVa, types::CodeGeneration), Vec<cache::LinkSite>>,
+    process: Arc<ProcessTranslator>,
     resume_entry: Option<(
         carrick_guest_mem::GuestVa,
         types::CodeGeneration,
@@ -36,10 +37,22 @@ pub(super) struct ThreadTranslator {
     )>,
     indirect_cache: gateway::IndirectTargetCache,
     stats: ResolverStats,
+}
+
+pub(super) struct ProcessTranslator {
+    state: Mutex<ProcessState>,
+}
+
+struct ProcessState {
+    cache: cache::TranslationCache,
+    blocks: BTreeMap<(carrick_guest_mem::GuestVa, types::CodeGeneration), types::CacheVa>,
+    pending: BTreeMap<(carrick_guest_mem::GuestVa, types::CodeGeneration), Vec<cache::LinkSite>>,
+    stats: ResolverStats,
     sensitive: BTreeMap<(carrick_guest_mem::GuestVa, types::CodeGeneration), types::SensitiveExit>,
     unsupported: BTreeMap<(carrick_guest_mem::GuestVa, types::CodeGeneration), (u32, bad64::Op)>,
     published: Vec<PublishedBlock>,
     dependencies: cache::PageBlockDependencies,
+    publications: cache::ConcurrentPublicationIndex,
 }
 
 struct PublishedBlock {
@@ -59,21 +72,75 @@ pub(super) struct ResolverStats {
 }
 
 impl ThreadTranslator {
+    #[cfg(test)]
     pub(super) fn new(capacity: usize) -> Result<Self, types::DsrError> {
-        Ok(Self {
-            cache: cache::TranslationCache::new(capacity)?,
-            blocks: BTreeMap::new(),
-            pending: BTreeMap::new(),
+        Ok(Self::for_process(Arc::new(ProcessTranslator::new(
+            capacity,
+        )?)))
+    }
+
+    pub(super) fn for_process(process: Arc<ProcessTranslator>) -> Self {
+        Self {
+            process,
             resume_entry: None,
             indirect_cache: gateway::IndirectTargetCache::new(),
             stats: ResolverStats::default(),
-            sensitive: BTreeMap::new(),
-            unsupported: BTreeMap::new(),
-            published: Vec::new(),
-            dependencies: cache::PageBlockDependencies::default(),
+        }
+    }
+
+    pub(super) fn after_fork_child(&mut self) {
+        self.process.after_fork_child();
+        self.resume_entry = None;
+        self.indirect_cache.clear();
+        self.stats = ResolverStats::default();
+    }
+
+    pub(super) fn reset_for_exec(&mut self, next: Arc<ProcessTranslator>) {
+        self.process.reset_for_exec();
+        self.process = next;
+        self.resume_entry = None;
+        self.indirect_cache.clear();
+        self.stats = ResolverStats::default();
+    }
+}
+
+impl ProcessTranslator {
+    pub(super) fn new(capacity: usize) -> Result<Self, types::DsrError> {
+        Ok(Self {
+            state: Mutex::new(ProcessState {
+                cache: cache::TranslationCache::new(capacity)?,
+                blocks: BTreeMap::new(),
+                pending: BTreeMap::new(),
+                stats: ResolverStats::default(),
+                sensitive: BTreeMap::new(),
+                unsupported: BTreeMap::new(),
+                published: Vec::new(),
+                dependencies: cache::PageBlockDependencies::default(),
+                publications: cache::ConcurrentPublicationIndex::default(),
+            }),
         })
     }
 
+    fn after_fork_child(&self) {
+        let state = self.state.lock();
+        state.cache.after_fork_child();
+        state.publications.after_fork_child();
+    }
+
+    fn reset_for_exec(&self) {
+        let mut state = self.state.lock();
+        state.blocks.clear();
+        state.pending.clear();
+        state.stats = ResolverStats::default();
+        state.sensitive.clear();
+        state.unsupported.clear();
+        state.published.clear();
+        state.dependencies = cache::PageBlockDependencies::default();
+        state.publications.reset_for_exec();
+    }
+}
+
+impl ProcessState {
     fn translate(
         &mut self,
         memory: &super::NativeMappedMemory,
@@ -128,6 +195,11 @@ impl ThreadTranslator {
         }
         self.stats.translations = self.stats.translations.saturating_add(1);
         let entry = emitted.entry();
+        let published_entry = self.publications.get_or_publish(key, || entry);
+        if published_entry != entry {
+            self.stats.duplicate_publications = self.stats.duplicate_publications.saturating_add(1);
+            return Ok((published_entry, generation));
+        }
         self.published.push(PublishedBlock {
             entry,
             len: emitted.len(),
@@ -204,6 +276,23 @@ impl ThreadTranslator {
             gateway::direct_exit_address(),
         )))
     }
+}
+
+impl ThreadTranslator {
+    fn translate(
+        &mut self,
+        memory: &super::NativeMappedMemory,
+        guest: carrick_guest_mem::GuestVa,
+    ) -> Result<(types::CacheVa, types::CodeGeneration), types::DsrError> {
+        self.process.state.lock().translate(memory, guest)
+    }
+
+    fn guest_pc_for_cache(
+        &self,
+        cache_pc: carrick_guest_mem::GuestVa,
+    ) -> Result<(carrick_guest_mem::GuestVa, Option<emit::RecoveryAction>), types::DsrError> {
+        self.process.state.lock().guest_pc_for_cache(cache_pc)
+    }
 
     fn resolve_indirect(
         &mut self,
@@ -232,8 +321,14 @@ impl ThreadTranslator {
     }
 
     #[cfg(test)]
-    pub(super) const fn resolver_stats(&self) -> ResolverStats {
-        self.stats
+    pub(super) fn resolver_stats(&self) -> ResolverStats {
+        let process = self.process.state.lock().stats;
+        ResolverStats {
+            resolver_exits: self.stats.resolver_exits,
+            one_entry_hits: self.stats.one_entry_hits,
+            translations: process.translations,
+            duplicate_publications: process.duplicate_publications,
+        }
     }
 
     pub(super) fn enter_once(
@@ -272,6 +367,9 @@ impl ThreadTranslator {
             }
             types::NativeDsrExit::Sensitive { guest_pc, .. } => {
                 let exit = self
+                    .process
+                    .state
+                    .lock()
                     .sensitive
                     .get(&(guest_pc, generation))
                     .copied()
@@ -285,6 +383,9 @@ impl ThreadTranslator {
             }
             types::NativeDsrExit::Unsupported { guest_pc, .. } => {
                 let (word, op) = self
+                    .process
+                    .state
+                    .lock()
                     .unsupported
                     .get(&(guest_pc, generation))
                     .copied()
@@ -306,6 +407,7 @@ impl ThreadTranslator {
                 address,
                 rewrite_scratch,
                 rewrite_context_scratch,
+                generation_pstate_scratch,
             } => {
                 let (guest_pc, recovery) = self.guest_pc_for_cache(guest_pc).map_err(|error| {
                     types::DsrError::CachePolicy(format!(
@@ -319,6 +421,7 @@ impl ThreadTranslator {
                         recovery,
                         rewrite_scratch,
                         rewrite_context_scratch,
+                        generation_pstate_scratch,
                     )?;
                 }
                 snapshot.pc = guest_pc.raw();
@@ -332,6 +435,7 @@ impl ThreadTranslator {
                 resume,
                 rewrite_scratch,
                 rewrite_context_scratch,
+                generation_pstate_scratch,
             } => {
                 let (guest_pc, recovery) = self.guest_pc_for_cache(resume)?;
                 if let Some(recovery) = recovery {
@@ -340,6 +444,7 @@ impl ThreadTranslator {
                         recovery,
                         rewrite_scratch,
                         rewrite_context_scratch,
+                        generation_pstate_scratch,
                     )?;
                 }
                 snapshot.pc = guest_pc.raw();
@@ -355,8 +460,21 @@ fn recover_rewrite_state(
     action: emit::RecoveryAction,
     saved_scratch: u64,
     saved_context_scratch: u64,
+    saved_generation_pstate: u64,
 ) -> Result<(), types::DsrError> {
     let (register, context_register) = match action {
+        emit::RecoveryAction::Noop => return Ok(()),
+        emit::RecoveryAction::RestoreGenerationGuardRegisters => {
+            snapshot.x[16] = saved_scratch;
+            snapshot.x[17] = saved_context_scratch;
+            return Ok(());
+        }
+        emit::RecoveryAction::RestoreGenerationGuard => {
+            snapshot.x[16] = saved_scratch;
+            snapshot.x[17] = saved_context_scratch;
+            snapshot.pstate = saved_generation_pstate;
+            return Ok(());
+        }
         emit::RecoveryAction::RestoreScratch { register }
         | emit::RecoveryAction::CommitVirtualizedAndRestoreScratch { register, .. } => {
             (register, None)
