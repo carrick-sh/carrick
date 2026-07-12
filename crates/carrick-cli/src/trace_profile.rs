@@ -468,6 +468,7 @@ impl ProfileSummary {
         let incomplete_pairs = grouped.values().fold(0_u64, |total, builder| {
             total.saturating_add(builder.incomplete)
         });
+        let has_metrics = !grouped.is_empty() || !high_water.is_empty();
         let cardinality = ProfileCardinality {
             indirect_sources: u64::try_from(
                 grouped
@@ -494,6 +495,7 @@ impl ProfileSummary {
         let completion = CompletionState {
             complete: !bounded
                 && target_exit_reason == 1
+                && has_metrics
                 && !capture_status.interrupted
                 && incomplete_pairs == 0
                 && capture_status.aggregation_drops == 0
@@ -746,6 +748,16 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn empty_profile_stream_cannot_be_complete() {
+        let summary = ProfileSummary::from_lines(
+            ["DSRPROF1|complete|profile=dsr|bounded=0|target_exit_reason=1"],
+            ProfileCaptureStatus::default(),
+        )
+        .expect("syntactically valid empty profile");
+        assert!(!summary.completion.complete);
     }
 
     #[test]
