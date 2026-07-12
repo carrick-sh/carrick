@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use carrick_guest_mem::{GuestVa, HostVa};
+use carrick_observability::probes;
 use parking_lot::{Condvar, Mutex, RwLock};
 
 use super::types::{CacheOffset, CacheVa, CodeGeneration, DsrError};
@@ -200,12 +201,52 @@ impl ConcurrentPublicationIndex {
         key: (GuestVa, CodeGeneration),
         build: impl FnOnce() -> CacheVa,
     ) -> CacheVa {
+        self.get_or_publish_with_wait_hooks(key, build, || {}, || {})
+    }
+
+    pub(super) fn get_or_publish_profiled(
+        &self,
+        tid: i32,
+        key: (GuestVa, CodeGeneration),
+        build: impl FnOnce() -> CacheVa,
+    ) -> CacheVa {
+        self.get_or_publish_with_wait_hooks(
+            key,
+            build,
+            || {
+                probes::dsr_translate_subphase_begin(
+                    tid,
+                    probes::DsrTranslationSubphase::DuplicateWait,
+                    key.0.raw(),
+                    key.1.get(),
+                );
+            },
+            || {
+                probes::dsr_translate_subphase_end(
+                    tid,
+                    probes::DsrTranslationSubphase::DuplicateWait,
+                    key.0.raw(),
+                    key.1.get(),
+                );
+            },
+        )
+    }
+
+    fn get_or_publish_with_wait_hooks(
+        &self,
+        key: (GuestVa, CodeGeneration),
+        build: impl FnOnce() -> CacheVa,
+        mut wait_begin: impl FnMut(),
+        mut wait_end: impl FnMut(),
+    ) -> CacheVa {
         let mut state = self.state.lock();
         loop {
             match state.get(&key).copied() {
                 Some(PublicationState::Published(entry)) => return entry,
                 Some(PublicationState::Building) => {
+                    wait_begin();
                     self.changed.wait(&mut state);
+                    wait_end();
                 }
                 None => {
                     state.insert(key, PublicationState::Building);
@@ -695,6 +736,25 @@ mod generation_tests {
             .collect::<Vec<_>>();
         assert_eq!(results, vec![winner_entry, winner_entry]);
         assert_eq!(publications.published_count(), 1);
+        assert_eq!(publications.builder_count(), 1);
+    }
+
+    #[test]
+    fn dsr_profiled_publication_preserves_the_winner() {
+        let publications = super::ConcurrentPublicationIndex::default();
+        let key = (PAGE, CodeGeneration::INITIAL);
+        let entry = super::CacheVa::published(carrick_guest_mem::HostVa(0x1800));
+
+        assert_eq!(
+            publications.get_or_publish_profiled(37, key, || entry),
+            entry
+        );
+        assert_eq!(
+            publications.get_or_publish_profiled(37, key, || {
+                super::CacheVa::published(carrick_guest_mem::HostVa(0x2800))
+            }),
+            entry
+        );
         assert_eq!(publications.builder_count(), 1);
     }
 

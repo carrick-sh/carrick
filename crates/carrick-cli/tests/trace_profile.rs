@@ -89,6 +89,8 @@ fn broad_profile_pairs_phases_and_emits_exact_metric_shapes() {
         "dsr-prepare-begin",
         "dsr-run-begin",
         "dsr-translate-begin",
+        "dsr-translate-subphase-begin",
+        "dsr-translate-subphase-end",
         "dsr-resolve-begin",
         "syscall-entry",
         "dsr-cache-event",
@@ -104,9 +106,21 @@ fn broad_profile_pairs_phases_and_emits_exact_metric_shapes() {
         "DSRPROF1|maximum|phase=run",
         "DSRPROF1|sample|phase=run",
         "DSRPROF1|incomplete|phase=run",
+        "DSRPROF1|count|phase=translation-subphase",
+        "DSRPROF1|total|phase=translation-subphase",
+        "DSRPROF1|minimum|phase=translation-subphase",
+        "DSRPROF1|maximum|phase=translation-subphase",
+        "DSRPROF1|incomplete|phase=translation-subphase",
         "DSRPROF1|high-water|metric=cache-bytes",
     ] {
         assert!(script.contains(record), "missing {record}");
+    }
+    for declaration in [
+        "self->translate_subphase_active = 0",
+        "self->translate_subphase_kind = 0",
+        "self->translate_wait_active = 0",
+    ] {
+        assert!(script.contains(declaration), "missing {declaration}");
     }
 }
 

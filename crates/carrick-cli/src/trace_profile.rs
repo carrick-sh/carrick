@@ -447,6 +447,24 @@ impl ProfileSummary {
 
         let (profile, bounded, target_exit_reason) =
             completion.ok_or_else(|| anyhow!("profile stream is missing its completion record"))?;
+        for (scope, builder) in &grouped {
+            let exact_fields = [
+                builder.count.is_some(),
+                builder.total_ns.is_some(),
+                builder.minimum_ns.is_some(),
+                builder.maximum_ns.is_some(),
+            ];
+            if scope.phase.as_deref() == Some("translation-subphase")
+                && exact_fields.iter().any(|present| *present)
+                && !exact_fields.iter().all(|present| *present)
+            {
+                bail!(
+                    "translation subphase aggregate is truncated for pid={:?} kind={:?}",
+                    scope.pid,
+                    scope.kind
+                );
+            }
+        }
         let incomplete_pairs = grouped.values().fold(0_u64, |total, builder| {
             total.saturating_add(builder.incomplete)
         });
@@ -788,6 +806,33 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn translation_subphase_aggregates_fail_closed_when_truncated() {
+        assert!(
+            ProfileSummary::from_lines(
+                [
+                    "DSRPROF1|count|phase=translation-subphase|pid=10|kind=1|value=9",
+                    "DSRPROF1|complete|profile=dsr|bounded=0",
+                ],
+                ProfileCaptureStatus::default(),
+            )
+            .is_err()
+        );
+
+        let summary = ProfileSummary::from_lines(
+            [
+                "DSRPROF1|count|phase=translation-subphase|pid=10|kind=1|value=9",
+                "DSRPROF1|total|phase=translation-subphase|pid=10|kind=1|value_ns=90000",
+                "DSRPROF1|minimum|phase=translation-subphase|pid=10|kind=1|value_ns=7000",
+                "DSRPROF1|maximum|phase=translation-subphase|pid=10|kind=1|value_ns=15000",
+                "DSRPROF1|complete|profile=dsr|bounded=0",
+            ],
+            ProfileCaptureStatus::default(),
+        )
+        .expect("complete translation subphase");
+        assert!(summary.completion.complete);
     }
 
     #[test]

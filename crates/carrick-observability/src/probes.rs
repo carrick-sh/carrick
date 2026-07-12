@@ -227,11 +227,22 @@ dsr_ordinal_enum! {
     }
 }
 
+dsr_ordinal_enum! {
+    /// Non-overlapping component of a DSR block translation.
+    pub enum DsrTranslationSubphase {
+        Decode = 1,
+        Plan = 2,
+        Emit = 3,
+        PublicationIndex = 4,
+        DuplicateWait = 5,
+    }
+}
+
 #[cfg(test)]
 mod dsr_probe_abi {
     use super::{
         DsrCacheEventKind, DsrCacheLifecyclePhase, DsrCacheRole, DsrExecMapDetailKind, DsrExitKind,
-        DsrOperationOutcome, DsrPrepareOutcome, DsrResolveKind,
+        DsrOperationOutcome, DsrPrepareOutcome, DsrResolveKind, DsrTranslationSubphase,
     };
 
     fn assert_unique(values: &[u32]) {
@@ -331,6 +342,13 @@ mod dsr_probe_abi {
         assert_eq!(DsrExecMapDetailKind::Protect.raw(), 4);
         assert_eq!(DsrExecMapDetailKind::Vvar.raw(), 5);
         assert_unique(&DsrExecMapDetailKind::ALL.map(DsrExecMapDetailKind::raw));
+
+        assert_eq!(DsrTranslationSubphase::Decode.raw(), 1);
+        assert_eq!(DsrTranslationSubphase::Plan.raw(), 2);
+        assert_eq!(DsrTranslationSubphase::Emit.raw(), 3);
+        assert_eq!(DsrTranslationSubphase::PublicationIndex.raw(), 4);
+        assert_eq!(DsrTranslationSubphase::DuplicateWait.raw(), 5);
+        assert_unique(&DsrTranslationSubphase::ALL.map(DsrTranslationSubphase::raw));
     }
 
     #[test]
@@ -341,6 +359,8 @@ mod dsr_probe_abi {
         let _: fn(i32, DsrExitKind, u64, u64, i32) = super::dsr_run_end;
         let _: fn(i32, u64, u64) = super::dsr_translate_begin;
         let _: fn(i32, u64, u64, u64, DsrOperationOutcome) = super::dsr_translate_end;
+        let _: fn(i32, DsrTranslationSubphase, u64, u64) = super::dsr_translate_subphase_begin;
+        let _: fn(i32, DsrTranslationSubphase, u64, u64) = super::dsr_translate_subphase_end;
         let _: fn(i32, DsrResolveKind, u64, u64) = super::dsr_resolve_begin;
         let _: fn(i32, DsrResolveKind, u64, u64, DsrOperationOutcome) = super::dsr_resolve_end;
         let _: fn(i32, DsrCacheEventKind, u64, u64, u64) = super::dsr_cache_event;
@@ -426,6 +446,8 @@ mod real {
         /// Block decode, planning, emission, and publication boundaries.
         fn dsr__translate__begin(_: i32, _: u64, _: u64) {}
         fn dsr__translate__end(_: i32, _: u64, _: u64, _: u64, _: u32) {}
+        fn dsr__translate__subphase__begin(_: i32, _: u32, _: u64, _: u64) {}
+        fn dsr__translate__subphase__end(_: i32, _: u32, _: u64, _: u64) {}
         /// Direct and indirect translated-control-flow resolution boundaries.
         fn dsr__resolve__begin(_: i32, _: u32, _: u64, _: u64) {}
         fn dsr__resolve__end(_: i32, _: u32, _: u64, _: u64, _: u32) {}
@@ -800,6 +822,30 @@ mod real {
     ) {
         carrick_usdt::dsr__translate__end!(|| {
             (tid, guest_pc, cache_pc, emitted_bytes, outcome.raw())
+        });
+    }
+
+    #[inline(always)]
+    pub fn dsr_translate_subphase_begin(
+        tid: i32,
+        subphase: super::DsrTranslationSubphase,
+        guest_pc: u64,
+        generation: u64,
+    ) {
+        carrick_usdt::dsr__translate__subphase__begin!(|| {
+            (tid, subphase.raw(), guest_pc, generation)
+        });
+    }
+
+    #[inline(always)]
+    pub fn dsr_translate_subphase_end(
+        tid: i32,
+        subphase: super::DsrTranslationSubphase,
+        guest_pc: u64,
+        generation: u64,
+    ) {
+        carrick_usdt::dsr__translate__subphase__end!(|| {
+            (tid, subphase.raw(), guest_pc, generation)
         });
     }
 
@@ -1741,6 +1787,8 @@ mod stub {
     stub!(dsr_run_end(tid: i32, kind: super::DsrExitKind, guest_pc: u64, target_pc: u64, status: i32));
     stub!(dsr_translate_begin(tid: i32, guest_pc: u64, generation: u64));
     stub!(dsr_translate_end(tid: i32, guest_pc: u64, cache_pc: u64, emitted_bytes: u64, outcome: super::DsrOperationOutcome));
+    stub!(dsr_translate_subphase_begin(tid: i32, subphase: super::DsrTranslationSubphase, guest_pc: u64, generation: u64));
+    stub!(dsr_translate_subphase_end(tid: i32, subphase: super::DsrTranslationSubphase, guest_pc: u64, generation: u64));
     stub!(dsr_resolve_begin(tid: i32, kind: super::DsrResolveKind, source_pc: u64, target_pc: u64));
     stub!(dsr_resolve_end(tid: i32, kind: super::DsrResolveKind, source_pc: u64, target_pc: u64, outcome: super::DsrOperationOutcome));
     stub!(dsr_cache_event(tid: i32, kind: super::DsrCacheEventKind, guest_pc: u64, generation: u64, used_bytes: u64));
