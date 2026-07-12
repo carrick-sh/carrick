@@ -1054,7 +1054,7 @@ immediately after the raw gateway returns; that and the ABI closure calls are
 the measured next candidates. The classification and gates are in
 `docs/superpowers/plans/2026-07-12-dsr-gateway-performance.md`.
 
-- [ ] **Step 5: Write and execute a focused gateway child plan**
+- [x] **Step 5: Write and execute a focused gateway child plan**
 
 Create `docs/superpowers/plans/2026-07-12-dsr-gateway-performance.md`. The first
 variant removes only instructions proven redundant. A scalar/SIMD specialization
@@ -1066,6 +1066,15 @@ no V8 regression beyond 1%, and all register/signal/kick/fault oracles green.
 unconditional-removal variant, so the plan does not invent one. It first
 separates closure and wrapper costs, then permits structural per-thread context
 reuse or closure changes only when a component clears its proof threshold.
+
+**Accepted result:** component timing selected the 0.211 us ABI closure, and
+decomposition attributed 0.201 us to its paired signal-mask calls. Keeping
+SIGPIPE deliverable and deferring active-null host-window kicks to the next
+typed gateway entry reduces scalar gateway p50 from 0.471 to 0.273 us and the
+batch-16 syscall floor from 0.486 to 0.281 us. The SIMD sentinel, direct V8,
+static/dynamic PIE, Go PIE, fork/exec, signal, fault, kick, and register gates
+pass. Evidence is in
+`docs/perf-results/native-dsr-gateway-candidate-v1.jsonl`.
 
 ---
 
