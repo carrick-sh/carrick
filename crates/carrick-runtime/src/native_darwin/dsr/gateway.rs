@@ -571,6 +571,96 @@ fn measure_gateway_components() -> (GatewayComponentSummary, GatewayComponentSum
     }
 }
 
+#[cfg(all(test, target_arch = "aarch64"))]
+fn measure_closure_subcomponents() -> (
+    GatewayComponentSummary,
+    GatewayComponentSummary,
+    GatewayComponentSummary,
+) {
+    let result = std::thread::spawn(|| {
+        let mut kick: libc::sigset_t = unsafe { std::mem::zeroed() };
+        let mut original: libc::sigset_t = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::sigemptyset(&mut kick);
+            libc::sigaddset(&mut kick, libc::SIGPIPE);
+        }
+        assert_eq!(
+            unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &kick, &mut original) },
+            0
+        );
+
+        assert_eq!(
+            unsafe { super::super::carrick_native_dsr_benchmark_custom_x18_pair() },
+            0
+        );
+        let measure_signal_mask = || {
+            measure_component(|| {
+                let result =
+                    unsafe { super::super::carrick_native_dsr_benchmark_signal_mask_pair() };
+                std::hint::black_box(result);
+            })
+        };
+        let measure_custom_x18 = || {
+            measure_component(|| {
+                let result =
+                    unsafe { super::super::carrick_native_dsr_benchmark_custom_x18_pair() };
+                std::hint::black_box(result);
+            })
+        };
+        let measure_signal_mask_prebuilt = || {
+            measure_component(|| {
+                let unblock = unsafe {
+                    libc::pthread_sigmask(libc::SIG_UNBLOCK, &kick, std::ptr::null_mut())
+                };
+                let block =
+                    unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &kick, std::ptr::null_mut()) };
+                std::hint::black_box((unblock, block));
+            })
+        };
+        let (signal_mask, signal_mask_prebuilt, custom_x18) = if unsafe { libc::getpid() } & 1 == 0
+        {
+            (
+                measure_signal_mask(),
+                measure_signal_mask_prebuilt(),
+                measure_custom_x18(),
+            )
+        } else {
+            let custom_x18 = measure_custom_x18();
+            (
+                measure_signal_mask(),
+                measure_signal_mask_prebuilt(),
+                custom_x18,
+            )
+        };
+
+        let mut current: libc::sigset_t = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut current) },
+            0
+        );
+        assert_eq!(unsafe { libc::sigismember(&current, libc::SIGPIPE) }, 1);
+        assert_eq!(
+            unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &original, std::ptr::null_mut()) },
+            0
+        );
+        (signal_mask, signal_mask_prebuilt, custom_x18)
+    })
+    .join();
+    match result {
+        Ok(summaries) => summaries,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
+#[cfg(all(test, not(target_arch = "aarch64")))]
+fn measure_closure_subcomponents() -> (
+    GatewayComponentSummary,
+    GatewayComponentSummary,
+    GatewayComponentSummary,
+) {
+    panic!("native DSR closure component benchmark requires AArch64")
+}
+
 #[cfg(all(test, not(target_arch = "aarch64")))]
 fn measure_gateway_components() -> (GatewayComponentSummary, GatewayComponentSummary) {
     panic!("native DSR gateway component benchmark requires AArch64")
@@ -613,6 +703,31 @@ mod component_benchmark_tests {
         }
         println!("{}", format_component_summary("closure", closure));
         println!("{}", format_component_summary("wrapper", wrapper));
+        println!("component_iters=20000");
+        println!("component_batch=16");
+    }
+
+    #[test]
+    #[ignore = "explicit opt-in native DSR closure decomposition"]
+    fn dsr_gateway_closure_component_benchmark() {
+        let (signal_mask, signal_mask_prebuilt, custom_x18) = measure_closure_subcomponents();
+        for summary in [signal_mask, signal_mask_prebuilt, custom_x18] {
+            assert!(summary.p50_us.is_finite() && summary.p50_us > 0.0);
+            assert!(summary.p95_us.is_finite() && summary.p95_us > 0.0);
+            assert!(summary.min_us.is_finite() && summary.min_us > 0.0);
+        }
+        println!(
+            "{}",
+            format_component_summary("closure_signal_mask", signal_mask)
+        );
+        println!(
+            "{}",
+            format_component_summary("closure_signal_mask_prebuilt", signal_mask_prebuilt)
+        );
+        println!(
+            "{}",
+            format_component_summary("closure_custom_x18", custom_x18)
+        );
         println!("component_iters=20000");
         println!("component_batch=16");
     }
