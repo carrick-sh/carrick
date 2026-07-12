@@ -122,6 +122,10 @@ fn broad_profile_pairs_phases_and_emits_exact_metric_shapes() {
     ] {
         assert!(script.contains(declaration), "missing {declaration}");
     }
+    assert!(
+        script.contains("/secs >= 45/"),
+        "broad profile must leave enough bounded time for profiled V8"
+    );
 }
 
 #[test]
