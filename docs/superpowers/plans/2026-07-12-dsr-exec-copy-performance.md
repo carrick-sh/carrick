@@ -109,7 +109,7 @@ Expected red: the helper is absent.
 Observed: rustc reports `E0425` at the canonical-stack, absent-SP, and
 non-stack policy assertions.
 
-- [ ] **Step 2: Copy the selected window at its guest offset**
+- [x] **Step 2: Copy the selected window at its guest offset**
 
 Compute the window in `map_with_code_mode_and_translator` and pass it to
 `map_region`. Copy `bytes[window.clone()]` to `mapped + window.start`; report
