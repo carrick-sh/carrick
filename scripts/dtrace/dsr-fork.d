@@ -262,18 +262,8 @@ carrick*:::dsr-exec-map-detail
         pid, arg0, arg4);
 }
 
-/* Phases 15..24: repeated details nested inside exec image mapping. */
-carrick*:::dsr-cache-lifecycle
-/(pid == $target || progenyof($target)) && arg1 == 7/
-{
-    self->exec_map_active = 1;
-    self->exec_map_mmap_total = 0;
-    self->exec_map_copy_total = 0;
-    self->exec_map_icache_total = 0;
-    self->exec_map_protect_total = 0;
-    self->exec_map_vvar_total = 0;
-    @exec_map_detail_outer_open[pid, arg0] = sum(1);
-}
+/* Reserved phases 15..24 are no longer fired; aggregate detail probes above
+ * replace their high-frequency begin/end pairs. */
 
 carrick*:::dsr-cache-lifecycle
 /(pid == $target || progenyof($target)) &&
@@ -374,23 +364,6 @@ carrick*:::dsr-cache-lifecycle
     self->exec_map_vvar_total += timestamp - self->exec_map_detail_started;
     @exec_map_vvar_open[pid, self->exec_map_detail_tid] = sum(-1);
     self->exec_map_detail_active = 0;
-}
-
-carrick*:::dsr-cache-lifecycle
-/(pid == $target || progenyof($target)) && arg1 == 8 && self->exec_map_active/
-{
-    printf("DSRPROF1|sample|phase=exec-map-mmap|pid=%d|tid=%d|duration_ns=%d\n",
-        pid, arg0, self->exec_map_mmap_total);
-    printf("DSRPROF1|sample|phase=exec-map-copy|pid=%d|tid=%d|duration_ns=%d\n",
-        pid, arg0, self->exec_map_copy_total);
-    printf("DSRPROF1|sample|phase=exec-map-icache|pid=%d|tid=%d|duration_ns=%d\n",
-        pid, arg0, self->exec_map_icache_total);
-    printf("DSRPROF1|sample|phase=exec-map-protect|pid=%d|tid=%d|duration_ns=%d\n",
-        pid, arg0, self->exec_map_protect_total);
-    printf("DSRPROF1|sample|phase=exec-map-vvar|pid=%d|tid=%d|duration_ns=%d\n",
-        pid, arg0, self->exec_map_vvar_total);
-    @exec_map_detail_outer_open[pid, arg0] = sum(-1);
-    self->exec_map_active = 0;
 }
 
 /* Phases 5..14: non-overlapping exec replacement subphases. */
