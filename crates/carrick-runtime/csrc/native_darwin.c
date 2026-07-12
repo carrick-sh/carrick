@@ -45,8 +45,15 @@ struct carrick_native_dsr_signal_context {
     uint64_t exit_target;
     uint64_t exit_source;
     uint32_t exit_status;
-    uint8_t gateway_tail[52];
+    uint32_t exit_pad;
+    uint64_t exit_link;
+    uint32_t exit_has_link;
+    uint32_t exit_link_pad;
+    uint8_t gateway_tail[32];
     uint32_t entry_in_progress;
+    uint32_t entry_pad;
+    uint64_t indirect_x15_scratch;
+    uint64_t indirect_x30_scratch;
 };
 
 _Static_assert(offsetof(struct carrick_native_dsr_signal_context, host_sp) == 832,
@@ -57,8 +64,16 @@ _Static_assert(offsetof(struct carrick_native_dsr_signal_context, exit_source) =
                "DSR signal source offset");
 _Static_assert(offsetof(struct carrick_native_dsr_signal_context, exit_status) == 1096,
                "DSR signal status offset");
+_Static_assert(offsetof(struct carrick_native_dsr_signal_context, exit_link) == 1104,
+               "DSR signal physical x18 offset");
+_Static_assert(offsetof(struct carrick_native_dsr_signal_context, exit_has_link) == 1112,
+               "DSR signal phase offset");
 _Static_assert(offsetof(struct carrick_native_dsr_signal_context, entry_in_progress) == 1152,
                "DSR entry-progress offset");
+_Static_assert(offsetof(struct carrick_native_dsr_signal_context, indirect_x15_scratch) == 1160,
+               "DSR indirect x15 scratch offset");
+_Static_assert(offsetof(struct carrick_native_dsr_signal_context, indirect_x30_scratch) == 1168,
+               "DSR indirect x30 scratch offset");
 
 struct carrick_native_kick_state {
     _Atomic uint64_t requested;
@@ -182,6 +197,8 @@ static _Thread_local struct carrick_native_dsr_signal_context
     *carrick_native_active_dsr_context;
 
 extern void carrick_dsr_exit_signal(void);
+extern unsigned char carrick_dsr_exit_common_start[];
+extern unsigned char carrick_dsr_exit_common_end[];
 
 typedef void (*carrick_native_update_tpidr_fn)(uint64_t, uint64_t);
 _Static_assert(sizeof(carrick_native_update_tpidr_fn) == sizeof(uint64_t),
@@ -300,11 +317,15 @@ int carrick_native_dsr_enter_guest_abi(void *context) {
 }
 
 void carrick_native_dsr_enter_host_abi(void) {
-    carrick_native_active_dsr_context = 0;
-    carrick_native_enter_host_x18_abi();
+    // Close the guest signal window before touching TLS.  The TLS assignment
+    // itself calls `_tlv_get_addr`; if a kick interrupted that call while the
+    // previous context pointer was still visible, the handler mistook the
+    // dyld PC for translated code and reported an unmappable cache fault.
     if (carrick_native_block_kick_signal() != 0) {
         _exit(127);
     }
+    carrick_native_active_dsr_context = 0;
+    carrick_native_enter_host_x18_abi();
 }
 
 static void carrick_native_snapshot_mcontext(
@@ -464,11 +485,39 @@ static void carrick_native_trap_handler(int sig, siginfo_t *info, void *uap) {
     if (carrick_native_active_dsr_context != 0) {
         struct carrick_native_dsr_signal_context *context =
             carrick_native_active_dsr_context;
+        uintptr_t interrupted_pc = uc->uc_mcontext->__ss.__pc;
+        uintptr_t common_start = (uintptr_t)carrick_dsr_exit_common_start;
+        uintptr_t common_end = (uintptr_t)carrick_dsr_exit_common_end;
+        // An emitted exit publishes its typed status before branching into the
+        // stable context-save gateway. A kick in that short window is already
+        // at a host boundary: replacing the published exit with a Kick would
+        // report the gateway PC as translated guest code and discard an
+        // in-flight syscall. The common gateway only stores guest registers
+        // until its final host transition, so return to it once with further
+        // kick delivery blocked and its physical context register reasserted.
+        // carrick_native_dsr_enter_host_abi performs the normal idempotent mask
+        // transition before Rust observes the queued Linux signal.
+        if (event_kind == CARRICK_NATIVE_EVENT_KICK &&
+            context->exit_status != 0 &&
+            interrupted_pc >= common_start && interrupted_pc < common_end) {
+            if (sigaddset(&uc->uc_sigmask, SIGPIPE) != 0) {
+                _exit(128 + sig);
+            }
+            uc->uc_mcontext->__ss.__x[28] = (uintptr_t)context;
+            return;
+        }
         // Preserve the first interrupted cache PC and register snapshot. If
         // the recovery gateway itself faults, overwriting them would turn the
         // useful guest fault into an unmappable gateway address.
         if (event_kind == CARRICK_NATIVE_EVENT_KICK &&
-            context->entry_in_progress != 0) {
+            context->entry_in_progress == 2) {
+            // The stable gateway already captured every guest register and
+            // published a typed exit, then a kick interrupted the host-mask
+            // transition itself.  Abandon that host frame through the signal
+            // exit below without replacing the completed guest exit with the
+            // host library PC.
+        } else if (event_kind == CARRICK_NATIVE_EVENT_KICK &&
+                   context->entry_in_progress == 1) {
             // The kick became deliverable while the gateway was still inside
             // pthread_sigmask. No translated instruction has run, so the
             // context's original guest PC and registers are authoritative.
@@ -485,6 +534,11 @@ static void carrick_native_trap_handler(int sig, siginfo_t *info, void *uap) {
             context->snapshot.signal_code = info != 0 ? info->si_code : 0;
             context->snapshot.fault_address =
                 info != 0 ? (uintptr_t)info->si_addr : 0;
+            // Guest x18 is virtualized, so the ordinary snapshot deliberately
+            // preserves its guest value.  Retain the interrupted physical x18
+            // separately for diagnosing faults at the inline-cache branch.
+            context->exit_link = uc->uc_mcontext->__ss.__x[18];
+            context->exit_has_link = context->entry_in_progress;
             context->exit_target = uc->uc_mcontext->__ss.__pc;
             context->exit_source = uc->uc_mcontext->__ss.__pc;
             context->exit_status = event_kind == CARRICK_NATIVE_EVENT_KICK ? 5 : 4;
