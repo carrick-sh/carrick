@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, btree_map::Entry};
 use std::fs;
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::os::fd::AsRawFd;
 use std::path::Path;
 
@@ -281,7 +281,14 @@ pub(crate) struct CompletionState {
     bounded: bool,
     high_cardinality_overflow: bool,
     incomplete_pairs: u64,
+    cardinality: ProfileCardinality,
     drops: ProfileCaptureStatus,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub(crate) struct ProfileCardinality {
+    indirect_sources: u64,
+    indirect_pairs: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -431,6 +438,29 @@ impl ProfileSummary {
         let incomplete_pairs = grouped.values().fold(0_u64, |total, builder| {
             total.saturating_add(builder.incomplete)
         });
+        let cardinality = ProfileCardinality {
+            indirect_sources: u64::try_from(
+                grouped
+                    .keys()
+                    .filter(|scope| {
+                        scope.phase.as_deref() == Some("indirect-source")
+                            && scope.source_pc.is_some()
+                    })
+                    .count(),
+            )
+            .unwrap_or(u64::MAX),
+            indirect_pairs: u64::try_from(
+                grouped
+                    .keys()
+                    .filter(|scope| {
+                        scope.phase.as_deref() == Some("indirect-pair")
+                            && scope.source_pc.is_some()
+                            && scope.target_pc.is_some()
+                    })
+                    .count(),
+            )
+            .unwrap_or(u64::MAX),
+        };
         let completion = CompletionState {
             complete: !bounded
                 && incomplete_pairs == 0
@@ -441,6 +471,7 @@ impl ProfileSummary {
             high_cardinality_overflow: capture_status.aggregation_drops != 0
                 || capture_status.dynamic_drops != 0,
             incomplete_pairs,
+            cardinality,
             drops: capture_status,
         };
 
@@ -620,13 +651,16 @@ pub(crate) fn write_summary_atomic(
         .with_context(|| format!("create profile output directory {}", parent.display()))?;
     let mut temporary = NamedTempFile::new_in(parent)
         .with_context(|| format!("create temporary profile in {}", parent.display()))?;
-    for row in summary.json_rows() {
-        serde_json::to_writer(&mut temporary, &row).context("serialize DSR profile row")?;
-        temporary
-            .write_all(b"\n")
-            .context("terminate DSR profile row")?;
+    {
+        let mut writer = BufWriter::new(temporary.as_file_mut());
+        for row in summary.json_rows() {
+            serde_json::to_writer(&mut writer, &row).context("serialize DSR profile row")?;
+            writer
+                .write_all(b"\n")
+                .context("terminate DSR profile row")?;
+        }
+        writer.flush().context("flush buffered DSR profile JSONL")?;
     }
-    temporary.flush().context("flush DSR profile JSONL")?;
     temporary
         .as_file()
         .sync_all()
@@ -740,6 +774,7 @@ mod tests {
         };
         let summary = ProfileSummary::from_lines(
             [
+                "DSRPROF1|count|phase=indirect-source|pid=10|source_pc=0x4000|value=12",
                 "DSRPROF1|count|phase=indirect-pair|pid=10|source_pc=0x4000|target_pc=0x8000|value=7",
                 "DSRPROF1|complete|profile=dsr-indirect|bounded=0",
             ],
@@ -748,8 +783,14 @@ mod tests {
         .expect("profile summary");
         assert!(!summary.completion.complete);
         assert!(summary.completion.high_cardinality_overflow);
-        assert_eq!(summary.metrics[0].scope.source_pc, Some(0x4000));
-        assert_eq!(summary.metrics[0].scope.target_pc, Some(0x8000));
+        assert_eq!(summary.completion.cardinality.indirect_sources, 1);
+        assert_eq!(summary.completion.cardinality.indirect_pairs, 1);
+        assert!(summary.metrics.iter().any(|metric| {
+            metric.scope.source_pc == Some(0x4000) && metric.scope.target_pc.is_none()
+        }));
+        assert!(summary.metrics.iter().any(|metric| {
+            metric.scope.source_pc == Some(0x4000) && metric.scope.target_pc == Some(0x8000)
+        }));
     }
 
     #[test]
