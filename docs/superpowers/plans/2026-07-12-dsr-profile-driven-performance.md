@@ -921,12 +921,12 @@ the selection authority.
 - Consumes: the 220-sample subphase JSONL from Task 8.
 - Produces: one focused, approved implementation plan for the largest reproducible subphase; no exec optimization occurs before this selection.
 
-- [ ] **Step 1: Rank p50, p95, and total contribution**
+- [x] **Step 1: Rank p50, p95, and total contribution**
 
 Aggregate each subphase across 220 samples and compute its fraction of the outer
 1.581 ms p50. Record noise and incomplete-pair status.
 
-- [ ] **Step 2: Select by deterministic rule**
+- [x] **Step 2: Select by deterministic rule**
 
 - Choose mapping when unmap plus map/protection is the largest contribution.
 - Choose cache reset when reset/allocation alone is largest.
@@ -935,7 +935,7 @@ Aggregate each subphase across 220 samples and compute its fraction of the outer
 - If no subphase contributes at least 30% or the ranking changes across two
   complete reruns, record exec as not yet attributable and move to Task 10.
 
-- [ ] **Step 3: Write the focused child plan**
+- [x] **Step 3: Write the focused child plan**
 
 The selected plan must include a red mechanism test, exact implementation,
 220-sample before/after gate requiring at least 10% improvement in both selected
@@ -947,6 +947,15 @@ revert rule. Commit that plan before executing it.
 Use `superpowers:executing-plans`, promote only a passing candidate, and update
 this umbrella plan with commit, evidence path, old/new p50/p95, and remaining
 exec ranking.
+
+**Selection record:** two complete 220-exec runs are checked in as compact
+evidence at `docs/perf-results/native-dsr-exec-subphases-v1.jsonl`. Image map
+plus protection/vvar work is stable at 61.7% and 61.8% of outer time (p50
+1.055 ms and 1.007 ms); cache reset is 26.7% and 27.0%; no other phase exceeds
+6%. Mapping is the only phase above 30%, so the selected child plan is
+`docs/superpowers/plans/2026-07-12-dsr-exec-mapping-performance.md`. Its first
+experiment removes DSR-only I-cache publication for source bytes that are
+mapped non-executable and never fetched by the host CPU.
 
 ---
 
