@@ -1332,3 +1332,18 @@ multi-block translation. No production candidate clears the proof thresholds,
 so the area is closed without code churn. Evidence is in
 `docs/perf-results/native-dsr-translation-subphases.jsonl` and
 `docs/perf-results/native-dsr-emission-components-v1.jsonl`.
+
+Final profile-driven campaign result (2026-07-12): the indirect cache,
+generation-validated prepared-entry cache, initialized-stack copy window, and
+deferred-kick gateway design are promoted with fixed-order before/after
+evidence. The source-mapping I-cache removal was restored after only 1.8-3.5%
+improvement, and emission stopped because no isolated candidate projects to the
+10% gate. The signed full repository gate and Rust static/dynamic PIE, Go
+static/dynamic PIE, V8, JIT generation/concurrent publication, fork, vfork, and
+exec proofs pass. Final broad, indirect, and fork profiles complete naturally
+with zero drops or incomplete pairs. The remaining measured task is broader
+translated-execution/native-return attribution; translation itself is about
+5.6% of untraced V8 wall and emission about 4%. Fixed-address Linux ET_EXEC
+below 4 GiB remains incompatible with Darwin's `__PAGEZERO`, while static PIE
+is supported and proven. Full provenance and architectural caveats are in
+`docs/perf-results/native-dsr-profile-driven-final.jsonl`.

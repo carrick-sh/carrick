@@ -345,6 +345,53 @@ the area stops without production churn. Exact evidence is in
 `perf-results/native-dsr-translation-subphases.jsonl` and
 `perf-results/native-dsr-emission-components-v1.jsonl`.
 
+## Final campaign and remaining architecture
+
+The campaign promoted four measured changes:
+
+- the indirect resolver cache reduced direct-V8 wall p50 from 7982.07 to
+  7883.38 ms (ratio 0.9869, 95% interval 0.9674-0.9993);
+- the persistent prepared-entry cache reduced the syscall-floor p50 from 0.705
+  to 0.678 us (ratio 0.9603, interval 0.9342-0.9891);
+- copying only the initialized initial-stack suffix reduced fork-exec p50 from
+  1391.52 to 1145.79 ms (ratio 0.8229, interval 0.8119-0.8354);
+- deferred host-window kicks reduced scalar gateway p50 from 0.471 to 0.273 us
+  and batch-16 syscall-floor p50 from 0.486 to 0.281 us. The respective ratio
+  intervals are 0.5778-0.5860 and 0.5742-0.5798.
+
+Two paths stopped on their declared thresholds. Removing source-mapping I-cache
+publication improved image-map p50 by only 3.5% and exec-reset by 1.8%, below
+the 10% gate, so it was restored. Emission decomposition found no isolated
+candidate projecting to a 10% guarded-emission gain: dynasm preallocation
+projects 6.4-6.5%, a 16-block write window 5.9%, and direct bytes below 2%.
+`bad64` decode is about 5% of guarded emission and is not a current performance
+priority.
+
+The final signed broad profile records a 0.281 us batch-16 syscall floor,
+210,667 prepared-entry hits, 1,443 translations, and 7.24 ms total emission.
+The V8 indirect profile records 131,953 successful resolver exits. The fork
+profile completes 200 iterations at 11.078 ms p50. All three runs ended
+naturally with zero DTrace drops and incomplete pairs.
+
+The correctness handoff covers Rust static PIE and dynamic glibc PIE, Go static
+PIE and dynamic glibc PIE, direct V8, JIT rewrite and concurrent first
+publication, non-leader exec, and vfork/exec. The Go static-PIE proof runs a
+goroutine-backed HTTP server/client through graceful shutdown. A fixed-address
+Linux ET_EXEC below 4 GiB remains outside the Darwin-native address model
+because Mach-O reserves that range with `__PAGEZERO`; this is distinct from
+static linking, which is proven with static PIE.
+
+Translation is now bounded rather than presumed to be the broad pole: the
+low-perturbation V8 aggregate attributes about 5.6% of wall to all translation
+and about 4% to emission. The next plan should attribute translated execution
+and native-return time outside translation across V8 and syscall-heavy
+workloads. `ProcessTranslator` still serializes translation state, but the
+concurrent campaign observed no duplicate publication or wait; changing that
+architecture requires a reproducer that first proves contention. Focused fork,
+vfork, exec, and 200-iteration lifecycle gates are green, but they are not a
+claim of complete fork correctness. The complete machine-readable handoff is
+[`native-dsr-profile-driven-final.jsonl`](perf-results/native-dsr-profile-driven-final.jsonl).
+
 Every candidate starts with a deterministic red mechanism test, runs focused
 correctness plus a signed workload, and receives a fixed-order ABBA comparison
 with a seeded bootstrap interval. A plausible change without a supported wall
