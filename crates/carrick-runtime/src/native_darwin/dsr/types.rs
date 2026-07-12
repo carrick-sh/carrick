@@ -165,11 +165,13 @@ pub(super) enum NativeDsrExit {
         address: GuestVa,
         rewrite_scratch: u64,
         rewrite_context_scratch: u64,
+        generation_pstate_scratch: u64,
     },
     Kick {
         resume: GuestVa,
         rewrite_scratch: u64,
         rewrite_context_scratch: u64,
+        generation_pstate_scratch: u64,
     },
     StaleGeneration {
         guest_pc: GuestVa,
