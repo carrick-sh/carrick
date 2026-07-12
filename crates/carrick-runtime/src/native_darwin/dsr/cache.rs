@@ -415,6 +415,11 @@ impl TranslationCache {
         (start..end).contains(&pc.raw())
     }
 
+    pub(super) fn host_range(&self) -> Range<usize> {
+        let start = self.base.as_ptr() as usize;
+        start..start.saturating_add(self.capacity)
+    }
+
     pub(super) fn patch_direct_branch(
         &mut self,
         site: LinkSite,

@@ -1755,6 +1755,62 @@ fn dsr_pending_kick_during_gateway_entry_keeps_guest_pc() {
 }
 
 #[test]
+fn dsr_phase_zero_host_kick_keeps_original_guest_snapshot() {
+    unsafe extern "C" {
+        fn carrick_native_dsr_test_phase_zero_host_kick_once();
+    }
+
+    assert_eq!(
+        unsafe { super::super::carrick_native_install_trap_handler() },
+        0
+    );
+    let guest = GuestVa(0x1c_380);
+    let mut cache = TranslationCache::new(16 * 1024).expect("allocate host-kick cache");
+    let emitted = emit_block(
+        &mut cache,
+        &BlockPlan {
+            start: guest,
+            end: GuestVa(guest.raw() + 4),
+            generation: CodeGeneration::INITIAL,
+            instructions: Vec::new(),
+            exit: PlannedExit::Syscall {
+                guest,
+                resume: GuestVa(guest.raw() + 4),
+            },
+        },
+    )
+    .expect("emit host-kick block");
+    let indirect = IndirectTargetCache::new();
+    let mut stack = vec![0_u8; 16 * 1024];
+    let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    snapshot.pc = guest.raw();
+    let expected = snapshot;
+    let mut exit = NativeDsrExit::Syscall {
+        resume: GuestVa(guest.raw() + 4),
+    };
+
+    unsafe { carrick_native_dsr_test_phase_zero_host_kick_once() };
+    super::gateway::enter_translated_with_cache_range(
+        emitted.entry(),
+        &mut snapshot,
+        &mut exit,
+        &indirect,
+        emitted.entry().host().raw(),
+        emitted.entry().host().raw() + emitted.len(),
+    )
+    .expect("classify phase-zero host kick");
+
+    assert_eq!(
+        exit,
+        NativeDsrExit::KickAtEntry { resume: guest },
+        "host kick must resume the original guest PC"
+    );
+    assert_eq!(snapshot.x, expected.x);
+    assert_eq!(snapshot.sp, expected.sp);
+    assert_eq!(snapshot.pc, expected.pc);
+}
+
+#[test]
 fn dsr_signal_fault_recovers_scratch_in_expanded_x18_load() {
     assert_eq!(
         unsafe { super::super::carrick_native_install_trap_handler() },
