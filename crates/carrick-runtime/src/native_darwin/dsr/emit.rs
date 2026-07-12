@@ -85,6 +85,9 @@ impl GenerationGuard {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum RecoveryAction {
+    Noop,
+    RestoreGenerationGuardRegisters,
+    RestoreGenerationGuard,
     RestoreScratch {
         register: u32,
     },
@@ -903,23 +906,49 @@ fn emit_block_inner(
     let mut direct_links = Vec::new();
     let mut recovery = Vec::new();
     let stale = guard.map(|_| assembler.new_dynamic_label());
-    map_next(&assembler, &mut entries, plan.start)?;
     if let (Some(guard), Some(stale)) = (guard, stale) {
+        let guard_start = current_offset(&assembler)?;
+        map_next(&assembler, &mut entries, plan.start)?;
         dynasmrt::dynasm!(assembler
             ; .arch aarch64
             ; str x16, [x28, #1120]
         );
+        recovery.push(RecoveryEntry {
+            cache: guard_start,
+            action: RecoveryAction::Noop,
+        });
+        let save_x17 = current_offset(&assembler)?;
+        map_next(&assembler, &mut entries, plan.start)?;
+        dynasmrt::dynasm!(assembler
+            ; .arch aarch64
+            ; str x17, [x28, #1128]
+        );
+        recovery.push(RecoveryEntry {
+            cache: save_x17,
+            action: RecoveryAction::Noop,
+        });
+        let read_pstate = current_offset(&assembler)?;
         emit_word(
             &mut assembler,
             &mut entries,
             plan.start,
-            0xd53b_4211, // mrs x17, nzcv
+            0xd53b_4210, // mrs x16, nzcv
         )?;
+        recovery.push(RecoveryEntry {
+            cache: read_pstate,
+            action: RecoveryAction::Noop,
+        });
+        let save_pstate = current_offset(&assembler)?;
         map_next(&assembler, &mut entries, plan.start)?;
         dynasmrt::dynasm!(assembler
             ; .arch aarch64
-            ; str x17, [x28, #264]
+            ; str x16, [x28, #936]
         );
+        recovery.push(RecoveryEntry {
+            cache: save_pstate,
+            action: RecoveryAction::RestoreGenerationGuardRegisters,
+        });
+        let guard_ready = current_offset(&assembler)?;
         emit_mov_u64(&mut assembler, &mut entries, plan.start, 16, guard.address)?;
         map_next(&assembler, &mut entries, plan.start)?;
         dynasmrt::dynasm!(assembler
@@ -937,22 +966,42 @@ fn emit_block_inner(
         dynasmrt::dynasm!(assembler
             ; .arch aarch64
             ; cmp x16, x17
+        );
+        map_next(&assembler, &mut entries, plan.start)?;
+        dynasmrt::dynasm!(assembler
+            ; .arch aarch64
             ; b.ne =>stale
-            ; ldr x17, [x28, #264]
+        );
+        map_next(&assembler, &mut entries, plan.start)?;
+        dynasmrt::dynasm!(assembler
+            ; .arch aarch64
+            ; ldr x16, [x28, #936]
         );
         emit_word(
             &mut assembler,
             &mut entries,
             plan.start,
-            0xd51b_4211, // msr nzcv, x17
+            0xd51b_4210, // msr nzcv, x16
         )?;
         map_next(&assembler, &mut entries, plan.start)?;
         dynasmrt::dynasm!(assembler
             ; .arch aarch64
             ; ldr x16, [x28, #1120]
-            ; ldr x17, [x28, #136]
         );
+        map_next(&assembler, &mut entries, plan.start)?;
+        dynasmrt::dynasm!(assembler
+            ; .arch aarch64
+            ; ldr x17, [x28, #1128]
+        );
+        let guard_end = current_offset(&assembler)?;
+        for offset in (guard_ready.get()..guard_end.get()).step_by(4) {
+            recovery.push(RecoveryEntry {
+                cache: CacheOffset::published(offset),
+                action: RecoveryAction::RestoreGenerationGuard,
+            });
+        }
     } else {
+        map_next(&assembler, &mut entries, plan.start)?;
         dynasmrt::dynasm!(assembler
             ; .arch aarch64
             ; ldr x17, [x28, #136]
@@ -1201,24 +1250,39 @@ fn emit_block_inner(
         assembler.push_u32(exit_word(plan)?);
     }
     if let Some(stale) = stale {
-        map_next(&assembler, &mut entries, plan.start)?;
         dynasmrt::dynasm!(assembler
             ; .arch aarch64
             ; =>stale
-            ; ldr x17, [x28, #264]
+        );
+        let stale_start = current_offset(&assembler)?;
+        map_next(&assembler, &mut entries, plan.start)?;
+        dynasmrt::dynasm!(assembler
+            ; .arch aarch64
+            ; ldr x16, [x28, #936]
         );
         emit_word(
             &mut assembler,
             &mut entries,
             plan.start,
-            0xd51b_4211, // msr nzcv, x17
+            0xd51b_4210, // msr nzcv, x16
         )?;
         map_next(&assembler, &mut entries, plan.start)?;
         dynasmrt::dynasm!(assembler
             ; .arch aarch64
             ; ldr x16, [x28, #1120]
-            ; ldr x17, [x28, #136]
         );
+        map_next(&assembler, &mut entries, plan.start)?;
+        dynasmrt::dynasm!(assembler
+            ; .arch aarch64
+            ; ldr x17, [x28, #1128]
+        );
+        let stale_end = current_offset(&assembler)?;
+        for offset in (stale_start.get()..stale_end.get()).step_by(4) {
+            recovery.push(RecoveryEntry {
+                cache: CacheOffset::published(offset),
+                action: RecoveryAction::RestoreGenerationGuard,
+            });
+        }
         emit_gateway_exit(
             &mut assembler,
             &mut entries,
@@ -1328,6 +1392,37 @@ mod tests {
             assert_eq!(
                 emitted.map().guest_for_cache(entry.cache),
                 Some(entry.guest)
+            );
+        }
+    }
+
+    #[test]
+    fn dsr_generation_guard_has_recovery_for_every_interruptible_instruction() {
+        use std::sync::atomic::AtomicU64;
+
+        let generation = AtomicU64::new(CodeGeneration::INITIAL.get());
+        let mut cache = TranslationCache::new(16 * 1024).expect("allocate translation cache");
+        let emitted = emit_block_with_generation(
+            &mut cache,
+            &copy_plan(),
+            GenerationGuard::new(&generation, CodeGeneration::INITIAL),
+        )
+        .expect("emit guarded block");
+        let words = (0..emitted.len() / 4)
+            .map(|index| unsafe {
+                std::ptr::read_unaligned((emitted.entry().host().raw() + index * 4) as *const u32)
+            })
+            .collect::<Vec<_>>();
+        let first_guest = words
+            .iter()
+            .position(|word| *word == 0xd503_201f)
+            .expect("first copied guest instruction");
+        for index in 0..first_guest {
+            let offset = CacheOffset::published((index * 4) as u32);
+            assert!(
+                emitted.recovery().iter().any(|entry| entry.cache == offset),
+                "generation-guard instruction at cache offset {} has no recovery metadata",
+                offset.get()
             );
         }
     }

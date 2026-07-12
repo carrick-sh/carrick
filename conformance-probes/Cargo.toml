@@ -32,3 +32,9 @@ libc = "0.2"
 opt-level = "z"
 strip = true
 panic = "abort"
+
+# Keep this standalone probe crate independent even when a git worktree lives
+# below another Carrick checkout. Cargo otherwise walks up to that checkout's
+# workspace, where the relative `conformance-probes` exclusion does not match
+# `.worktrees/<name>/conformance-probes`.
+[workspace]

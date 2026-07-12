@@ -1087,8 +1087,16 @@ enum NativeForkTokenFlow {
 
 /// How a fork request left `handle_native_fork`.
 enum NativeForkFlow {
-    /// The guest was resumed (parent, child, or an errno return).
-    Resumed,
+    /// Resume the caller at the instruction after the fork-like syscall.
+    ///
+    /// `fork_child` selects the detached-context transport for the historical
+    /// brk executor.  DSR owns an explicit snapshot instead and uses the same
+    /// bit to repair process-cache state inherited from the parent.
+    Resume {
+        value: i64,
+        fork_child: bool,
+        child_stack: u64,
+    },
     /// The fork was abandoned because an execve by another thread is
     /// replacing the thread group; the run loop must retire this thread.
     RetireForExec,
@@ -1573,9 +1581,21 @@ fn run_native_thread_loop(
                             thread_runtime,
                             &mut vfork_completion,
                             request,
-                            resume_pc,
                         )? {
-                            NativeForkFlow::Resumed => {}
+                            NativeForkFlow::Resume {
+                                value,
+                                fork_child,
+                                child_stack,
+                            } => {
+                                if fork_child {
+                                    if child_stack != 0 {
+                                        unsafe { carrick_native_set_sp(child_stack) };
+                                    }
+                                    resume_guest_detached(value as u64, resume_pc)?;
+                                } else {
+                                    resume_guest(value as u64, resume_pc)?;
+                                }
+                            }
                             NativeForkFlow::RetireForExec => {
                                 if thread_runtime.finish_thread(&dispatcher, &memory) {
                                     return Ok(NativeThreadLoopOutcome::ProcessExit(0));
@@ -1722,9 +1742,10 @@ fn run_native_dsr_thread_loop(
         },
         NativeThreadStart::Detached { context, .. } => *context,
     };
-    let mut translator = dsr::ThreadTranslator::new(64 * 1024 * 1024)
-        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+    let process_translator = memory.lock().dsr_process_translator()?;
+    let mut translator = dsr::ThreadTranslator::for_process(process_translator);
     let trace_syscalls = std::env::var_os("CARRICK_NATIVE_TRACE_SYSCALLS").is_some();
+    let mut vfork_completion: Option<NativeVforkCompletion> = None;
     let mut traps = 0_usize;
 
     loop {
@@ -1732,6 +1753,17 @@ fn run_native_dsr_thread_loop(
         if traps > max_traps {
             return Err(RuntimeError::TrapLimitExceeded { max_traps });
         }
+        // Match the brk executor's lock-free dispatch boundary. A kick out of
+        // translated code returns here, where fork may park this thread and a
+        // successful execve by another thread must retire it before it can
+        // re-enter the old image.
+        if crate::fork_quiesce::exec_replacing_other_thread(thread_runtime.tid()) {
+            if thread_runtime.finish_thread(&dispatcher, &memory) {
+                return Ok(NativeThreadLoopOutcome::ProcessExit(0));
+            }
+            return Ok(NativeThreadLoopOutcome::ExecReplacedThread);
+        }
+        thread_runtime.park_for_fork_quiesce();
         let exit = {
             let mut memory = memory.lock();
             memory
@@ -1985,6 +2017,156 @@ fn run_native_dsr_thread_loop(
                     i64::from(tid.raw()),
                     resume,
                 )?;
+            }
+            DispatchOutcome::Fork {
+                pidfd_out,
+                clone_parent,
+                parent_tid_addr,
+                child_tid_addr,
+                exit_signal,
+                child_stack,
+                vfork,
+            } => {
+                let vfork_rejection = vfork
+                    .is_some()
+                    .then(|| memory.lock().native16k_vfork_rejection())
+                    .flatten();
+                if let Some(reason) = vfork_rejection {
+                    let syscall_name = if request.number.raw() == 435 {
+                        "clone3"
+                    } else {
+                        "clone"
+                    };
+                    reporter.record(crate::compat::CompatEvent::partial_syscall(
+                        request.number.raw(),
+                        syscall_name,
+                        request.args,
+                        reason,
+                    ));
+                    snapshot = complete_dsr_syscall(
+                        &dispatcher,
+                        &memory,
+                        snapshot,
+                        thread_runtime.tid(),
+                        request.number.raw(),
+                        crate::linux_abi::LINUX_EOPNOTSUPP.guest_retval(),
+                        resume,
+                    )?;
+                    continue;
+                }
+                let syscall_nr = request.number.raw();
+                let fork_request = NativeForkRequest {
+                    pidfd_out,
+                    clone_parent,
+                    parent_tid_addr,
+                    child_tid_addr,
+                    exit_signal,
+                    child_stack,
+                    vfork,
+                };
+                match handle_native_fork(
+                    &dispatcher,
+                    &memory,
+                    thread_runtime,
+                    &mut vfork_completion,
+                    fork_request,
+                )? {
+                    NativeForkFlow::Resume {
+                        value,
+                        fork_child,
+                        child_stack,
+                    } => {
+                        if fork_child {
+                            translator.after_fork_child();
+                            if child_stack != 0 {
+                                snapshot.sp = child_stack;
+                            }
+                        }
+                        snapshot = complete_dsr_syscall(
+                            &dispatcher,
+                            &memory,
+                            snapshot,
+                            thread_runtime.tid(),
+                            syscall_nr,
+                            value,
+                            resume,
+                        )?;
+                    }
+                    NativeForkFlow::RetireForExec => {
+                        if thread_runtime.finish_thread(&dispatcher, &memory) {
+                            return Ok(NativeThreadLoopOutcome::ProcessExit(0));
+                        }
+                        return Ok(NativeThreadLoopOutcome::ExecReplacedThread);
+                    }
+                }
+            }
+            DispatchOutcome::Execve { path, argv, env } => {
+                let proc_argv: Vec<String> = argv
+                    .iter()
+                    .map(|value| String::from_utf8_lossy(value).into_owned())
+                    .collect();
+                let proc_env = env.clone();
+                match load_native_execve_image(&dispatcher, &path, argv, env, &plan) {
+                    Ok((image, relative_relocations, resolved)) => {
+                        match native_terminate_siblings_for_exec(
+                            &dispatcher,
+                            &memory,
+                            thread_runtime,
+                        )? {
+                            NativeExecTeardownFlow::Proceed => {}
+                            NativeExecTeardownFlow::RetireForExec => {
+                                if thread_runtime.finish_thread(&dispatcher, &memory) {
+                                    return Ok(NativeThreadLoopOutcome::ProcessExit(0));
+                                }
+                                return Ok(NativeThreadLoopOutcome::ExecReplacedThread);
+                            }
+                        }
+                        let entry = image.entry();
+                        let initial_sp = image.initial_stack_pointer().ok_or_else(|| {
+                            RuntimeError::Unsupported(
+                                "native Darwin DSR execve image has no initial stack".to_string(),
+                            )
+                        })?;
+                        dispatcher.reset_memory_state_on_execve();
+                        dispatcher.reset_signal_handlers_on_execve();
+                        dispatcher.set_executable_identity(
+                            resolved.clone(),
+                            proc_argv.clone(),
+                            proc_env,
+                        );
+                        crate::vcpu_loop::apply_image_proc_state(&dispatcher, &image);
+                        dispatcher.close_cloexec_fds();
+                        memory
+                            .lock()
+                            .replace_image(&image, &relative_relocations, &plan)?;
+                        let next_process = memory.lock().dsr_process_translator()?;
+                        translator.reset_for_exec(next_process);
+                        crate::namespace::pid::mark_self_execed();
+                        let cmdline = proc_argv.join(" ");
+                        crate::dispatch::set_host_process_name(cmdline.as_bytes());
+                        if let Some(mut completion) = vfork_completion.take() {
+                            completion.notify();
+                        }
+                        guest_tpidr_el0 = 0;
+                        snapshot = NativeUcontextSnapshot {
+                            sp: initial_sp,
+                            pc: entry,
+                            ..NativeUcontextSnapshot::default()
+                        };
+                        crate::exec_helpers::stop_after_traced_exec(&dispatcher);
+                    }
+                    Err(errno) => {
+                        snapshot = complete_dsr_syscall(
+                            &dispatcher,
+                            &memory,
+                            snapshot,
+                            thread_runtime.tid(),
+                            request.number.raw(),
+                            errno.guest_retval(),
+                            resume,
+                        )?;
+                    }
+                }
             }
             other => {
                 return Err(RuntimeError::Unsupported(format!(
@@ -3720,7 +3902,6 @@ fn handle_native_fork(
     thread_runtime: &mut NativeThreadRuntime,
     vfork_completion: &mut Option<NativeVforkCompletion>,
     request: NativeForkRequest,
-    resume_pc: u64,
 ) -> Result<NativeForkFlow, RuntimeError> {
     if request.clone_parent {
         return Err(RuntimeError::Unsupported(
@@ -3742,11 +3923,11 @@ fn handle_native_fork(
                 "native fork could not acquire the fork token within its backstop \
                  deadline; degrading to EAGAIN"
             );
-            resume_guest(
-                crate::linux_abi::LINUX_EAGAIN.guest_retval() as u64,
-                resume_pc,
-            )?;
-            return Ok(NativeForkFlow::Resumed);
+            return Ok(NativeForkFlow::Resume {
+                value: crate::linux_abi::LINUX_EAGAIN.guest_retval(),
+                fork_child: false,
+                child_stack: 0,
+            });
         }
     }
     let barrier = crate::fork_quiesce::barrier();
@@ -3884,11 +4065,11 @@ fn handle_native_fork(
                 memory.lock().set_fork_inheritance(false);
             }
             end_fork_state(quiesced);
-            resume_guest(
-                crate::linux_abi::LINUX_EAGAIN.guest_retval() as u64,
-                resume_pc,
-            )?;
-            return Ok(NativeForkFlow::Resumed);
+            return Ok(NativeForkFlow::Resume {
+                value: crate::linux_abi::LINUX_EAGAIN.guest_retval(),
+                fork_child: false,
+                child_stack: 0,
+            });
         }
     };
     // Hold the quiesce barrier's internal mutex ACROSS the fork: a sibling
@@ -3927,11 +4108,11 @@ fn handle_native_fork(
             memory.lock().set_fork_inheritance(false);
         }
         end_fork_state(quiesced);
-        resume_guest(
-            crate::linux_abi::LINUX_EAGAIN.guest_retval() as u64,
-            resume_pc,
-        )?;
-        return Ok(NativeForkFlow::Resumed);
+        return Ok(NativeForkFlow::Resume {
+            value: crate::linux_abi::LINUX_EAGAIN.guest_retval(),
+            fork_child: false,
+            child_stack: 0,
+        });
     }
     if child == 0 {
         // Repair the inherited barrier state FIRST: the quiesce/fork flags
@@ -3983,14 +4164,12 @@ fn handle_native_fork(
         if let Some(addr) = request.child_tid_addr {
             let _ = memory.lock().write_bytes(addr, &self_tid);
         }
-        if request.child_stack != 0 {
-            unsafe {
-                carrick_native_set_sp(request.child_stack);
-            }
-        }
         native_trace_fork_phase("child-resume");
-        resume_guest_detached(0, resume_pc)?;
-        return Ok(NativeForkFlow::Resumed);
+        return Ok(NativeForkFlow::Resume {
+            value: 0,
+            fork_child: true,
+            child_stack: request.child_stack,
+        });
     }
     // Release the parked siblings now — the fork is done; the vfork suspend
     // below must run with siblings LIVE (HVF suspends after end_quiesce too).
@@ -4043,8 +4222,11 @@ fn handle_native_fork(
         let _ = memory.lock().write_bytes(addr, &tid);
     }
     native_register_child_exit_watch(dispatcher, child, request.exit_signal, thread_runtime.tid());
-    resume_guest(guest_child_pid as u64, resume_pc)?;
-    Ok(NativeForkFlow::Resumed)
+    Ok(NativeForkFlow::Resume {
+        value: i64::from(guest_child_pid),
+        fork_child: false,
+        child_stack: 0,
+    })
 }
 
 /// Linux execve(2) replaces the WHOLE thread group: every sibling thread is
@@ -5737,6 +5919,7 @@ struct NativeMappedMemory {
     linux_page_size: u64,
     native_code_mode: carrick_spec::NativeCodeModeRequest,
     dsr_generations: dsr::cache::PageGenerationTable,
+    dsr_translator: Option<Arc<dsr::ProcessTranslator>>,
 }
 
 #[derive(Clone, Copy)]
@@ -5781,6 +5964,14 @@ fn native_region_linux_prot(read: bool, write: bool, exec: bool) -> u64 {
 }
 
 impl NativeMappedMemory {
+    fn dsr_process_translator(&self) -> Result<Arc<dsr::ProcessTranslator>, RuntimeError> {
+        self.dsr_translator.as_ref().map(Arc::clone).ok_or_else(|| {
+            RuntimeError::Unsupported(
+                "native DSR process translator is unavailable outside DSR mode".to_string(),
+            )
+        })
+    }
+
     fn note_dsr_code_mutation(
         &self,
         address: u64,
@@ -6006,6 +6197,14 @@ impl NativeMappedMemory {
             native_code_mode,
             dsr_generations: dsr::cache::PageGenerationTable::new(host_page_size)
                 .map_err(|error| RuntimeError::Unsupported(error.to_string()))?,
+            dsr_translator: if native_code_mode == carrick_spec::NativeCodeModeRequest::Dsr {
+                Some(Arc::new(
+                    dsr::ProcessTranslator::new(64 * 1024 * 1024)
+                        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?,
+                ))
+            } else {
+                None
+            },
         };
         // Publishing the vvar contents is part of establishing the address
         // space: the initial boot maps here, and an execve replacement re-maps
@@ -8121,6 +8320,48 @@ mod tests {
     }
 
     #[test]
+    fn dsr_generation_guard_preserves_x16_x17_and_flags_across_linked_blocks() {
+        let words = [
+            0xd280_0530, // mov x16, #41
+            0xd280_0551, // mov x17, #42
+            0xeb00_001f, // cmp x0, x0 (Z=1)
+            0x1400_0001, // b target
+            0x5400_00a1, // target: b.ne fail
+            0xd100_a600, // sub x0, x16, #41
+            0xd100_aa21, // sub x1, x17, #42
+            0xaa01_0000, // orr x0, x0, x1
+            0x1400_0002, // b exit
+            0xd280_0c60, // fail: mov x0, #99
+            0xd280_0ba8, // exit: mov x8, #93
+            SVC_0,
+        ];
+        let mut file = tempfile::NamedTempFile::new().expect("create DSR guard ELF fixture");
+        std::io::Write::write_all(&mut file, &dsr_test_elf(&words))
+            .expect("write DSR guard ELF fixture");
+        let plan = ExecutionPlan {
+            backend: crate::page_profile::ExecutionBackend::NativeDarwin,
+            page_geometry: crate::page_profile::PageGeometry {
+                host_page_size: 16 * 1024,
+                linux_page_size: 16 * 1024,
+                native_profile: Some(carrick_spec::NativePageProfile::Native16k),
+            },
+            native_code_mode: carrick_spec::NativeCodeModeRequest::Dsr,
+            diagnostics: Vec::new(),
+        };
+        let result = run_static_elf(
+            file.path(),
+            SyscallDispatcher::new(),
+            ["dsr-guard-state".to_string()],
+            std::iter::empty::<String>(),
+            16,
+            None,
+            &plan,
+        )
+        .expect("run linked DSR guard-state ELF");
+        assert_eq!(result.exit_code, 0, "stderr={:?}", result.stderr);
+    }
+
+    #[test]
     fn dsr_indirect_flow_runtime_calls_and_returns_through_guest_lr() {
         let words = [
             0x9400_0002, // bl function
@@ -8452,6 +8693,7 @@ mod tests {
             native_code_mode: carrick_spec::NativeCodeModeRequest::Brk,
             dsr_generations: dsr::cache::PageGenerationTable::new(16 * 1024)
                 .expect("generation table"),
+            dsr_translator: None,
         };
         NativeSignalTrap::new(&mut memory, restored, None).commit();
 
@@ -8492,6 +8734,7 @@ mod tests {
             native_code_mode: carrick_spec::NativeCodeModeRequest::Brk,
             dsr_generations: dsr::cache::PageGenerationTable::new(16 * 1024)
                 .expect("generation table"),
+            dsr_translator: None,
         };
         let mut interrupted = NativeUcontextSnapshot {
             sp: stack_end,
@@ -8622,6 +8865,7 @@ mod tests {
             native_code_mode: carrick_spec::NativeCodeModeRequest::Brk,
             dsr_generations: dsr::cache::PageGenerationTable::new(16 * 1024)
                 .expect("generation table"),
+            dsr_translator: None,
         };
         let interrupted = NativeUcontextSnapshot {
             sp: stack_end,

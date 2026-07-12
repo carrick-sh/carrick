@@ -1183,6 +1183,7 @@ fn dsr_signal_fault_reconstructs_copied_instruction_pc() {
         address: GuestVa(0),
         rewrite_scratch: 0,
         rewrite_context_scratch: 0,
+        generation_pstate_scratch: 0,
     };
     enter_translated(emitted.entry(), &mut snapshot, &mut exit).expect("capture DSR fault");
     let NativeDsrExit::Fault {
@@ -1244,6 +1245,7 @@ fn dsr_signal_fault_recovers_context_when_physical_x28_is_zero() {
         address: GuestVa(0),
         rewrite_scratch: 0,
         rewrite_context_scratch: 0,
+        generation_pstate_scratch: 0,
     };
 
     enter_translated(emitted.entry(), &mut snapshot, &mut exit)
@@ -1264,33 +1266,46 @@ fn dsr_signal_fault_recovers_context_when_physical_x28_is_zero() {
 }
 
 #[test]
-fn dsr_kick_routes_stale_sigpipe_through_gateway() {
+fn dsr_concurrency_kick_exits_guarded_linked_loop_without_corrupting_guest_state() {
+    use std::sync::atomic::AtomicU64;
+
     assert_eq!(
         unsafe { super::super::carrick_native_install_trap_handler() },
         0
     );
     let guest = GuestVa(0x1c_200);
     let mut cache = TranslationCache::new(16 * 1024).expect("allocate kick cache");
-    let emitted = emit_block(
+    let generation = AtomicU64::new(CodeGeneration::INITIAL.get());
+    let emitted = super::emit::emit_block_with_generation(
         &mut cache,
         &BlockPlan {
             start: guest,
-            end: GuestVa(guest.raw() + 4),
+            end: GuestVa(guest.raw() + 12),
             generation: CodeGeneration::INITIAL,
-            instructions: Vec::new(),
+            instructions: vec![
+                PlannedInst {
+                    guest,
+                    action: InstAction::Copy(0x9100_0400), // add x0, x0, #1
+                },
+                PlannedInst {
+                    guest: GuestVa(guest.raw() + 4),
+                    action: InstAction::Copy(0xc89f_fc20), // stlr x0, [x1]
+                },
+            ],
             exit: PlannedExit::Direct {
-                guest,
+                guest: GuestVa(guest.raw() + 8),
                 word: 0x1400_0000,
                 exit: DirectExit {
                     kind: DirectKind::Branch,
                     target: guest,
-                    resume: GuestVa(guest.raw() + 4),
+                    resume: GuestVa(guest.raw() + 12),
                     condition: None,
                     register: None,
                     bit: None,
                 },
             },
         },
+        super::emit::GenerationGuard::new(&generation, CodeGeneration::INITIAL),
     )
     .expect("emit kick loop");
     let link = emitted.direct_links()[0];
@@ -1317,26 +1332,44 @@ fn dsr_kick_routes_stale_sigpipe_through_gateway() {
         0
     );
     let old_set = unsafe { old_set.assume_init() };
-    let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let sender_finished = std::sync::Arc::clone(&finished);
+    let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let sender_counter = std::sync::Arc::clone(&counter);
     let sender = std::thread::spawn(move || {
-        while !sender_finished.load(std::sync::atomic::Ordering::Acquire) {
-            assert_eq!(unsafe { libc::pthread_kill(target, libc::SIGPIPE) }, 0);
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let requested_at = loop {
+            let observed = sender_counter.load(std::sync::atomic::Ordering::Acquire);
+            if observed != 0 {
+                break observed;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "translated loop did not publish its instruction counter"
+            );
+            std::hint::spin_loop();
+        };
+        assert_eq!(unsafe { libc::pthread_kill(target, libc::SIGPIPE) }, 0);
+        requested_at
     });
     let mut stack = vec![0_u8; 16 * 1024];
     let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    snapshot.x[0] = 0;
+    snapshot.x[1] = std::sync::Arc::as_ptr(&counter) as u64;
+    snapshot.x[16] = 0x1616_1616_1616_1616;
+    snapshot.x[17] = 0x1717_1717_1717_1717;
+    snapshot.pstate = 0xa000_0000;
+    let expected_x16 = snapshot.x[16];
+    let expected_x17 = snapshot.x[17];
+    let expected_pstate = snapshot.pstate;
     let mut exit = NativeDsrExit::Kick {
         resume: guest,
         rewrite_scratch: 0,
         rewrite_context_scratch: 0,
+        generation_pstate_scratch: 0,
     };
 
     enter_translated(emitted.entry(), &mut snapshot, &mut exit)
         .expect("exit stale SIGPIPE through DSR gateway");
-    finished.store(true, std::sync::atomic::Ordering::Release);
-    sender.join().expect("join SIGPIPE sender");
+    let requested_at = sender.join().expect("join SIGPIPE sender");
     assert_eq!(
         unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &old_set, std::ptr::null_mut()) },
         0
@@ -1345,6 +1378,49 @@ fn dsr_kick_routes_stale_sigpipe_through_gateway() {
     assert!(
         matches!(exit, NativeDsrExit::Kick { .. }),
         "unexpected stale SIGPIPE exit: {exit:?}"
+    );
+    let NativeDsrExit::Kick {
+        resume,
+        rewrite_scratch,
+        rewrite_context_scratch,
+        generation_pstate_scratch,
+    } = exit
+    else {
+        unreachable!("matched kick above")
+    };
+    let offset = u32::try_from(resume.raw() - emitted.entry().host().raw() as u64)
+        .expect("kick cache offset");
+    if let Some(recovery) = emitted
+        .recovery()
+        .iter()
+        .find(|entry| entry.cache == super::types::CacheOffset::published(offset))
+        .map(|entry| entry.action)
+    {
+        super::recover_rewrite_state(
+            &mut snapshot,
+            recovery,
+            rewrite_scratch,
+            rewrite_context_scratch,
+            generation_pstate_scratch,
+        )
+        .expect("recover interrupted generation guard");
+    }
+    assert_eq!(snapshot.x[16], expected_x16);
+    assert_eq!(snapshot.x[17], expected_x17);
+    assert_eq!(snapshot.pstate, expected_pstate);
+    let instruction_delta = snapshot.x[0].saturating_sub(requested_at);
+    let instructions_per_iteration = u64::from(link.slot.get() / 4 + 1);
+    let observed_instruction_bound = instruction_delta
+        .saturating_add(1)
+        .saturating_mul(instructions_per_iteration);
+    eprintln!(
+        "DSR kick exited within {observed_instruction_bound} translated instruction(s) \
+         after the request ({instruction_delta} complete loop iterations)"
+    );
+    assert!(
+        observed_instruction_bound <= 100_000,
+        "kick required more than 100000 translated instructions from request to exit: \
+         observed upper bound {observed_instruction_bound}"
     );
 }
 
@@ -1382,6 +1458,7 @@ fn dsr_signal_fault_recovers_scratch_in_expanded_x18_load() {
         address: GuestVa(0),
         rewrite_scratch: 0,
         rewrite_context_scratch: 0,
+        generation_pstate_scratch: 0,
     };
     enter_translated(emitted.entry(), &mut snapshot, &mut exit)
         .expect("capture expanded x18 fault");
@@ -1415,6 +1492,7 @@ fn dsr_signal_fault_recovers_scratch_in_expanded_x18_load() {
         recovery,
         rewrite_scratch,
         rewrite_context_scratch,
+        original.pstate,
     )
     .expect("recover expanded x18 scratch");
     assert_eq!(snapshot.x[18], original_x18);
@@ -1462,6 +1540,7 @@ fn dsr_signal_fault_preserves_destination_in_expanded_literal_load() {
         address: GuestVa(0),
         rewrite_scratch: 0,
         rewrite_context_scratch: 0,
+        generation_pstate_scratch: 0,
     };
     enter_translated(emitted.entry(), &mut snapshot, &mut exit)
         .expect("capture expanded literal fault");
@@ -1489,6 +1568,7 @@ fn dsr_signal_fault_preserves_destination_in_expanded_literal_load() {
         recovery,
         rewrite_scratch,
         rewrite_context_scratch,
+        original.pstate,
     )
     .expect("recover literal scratch");
     assert_eq!(snapshot.x, original.x);
