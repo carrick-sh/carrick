@@ -819,6 +819,32 @@ mod tests {
     }
 
     #[test]
+    fn fork_lifecycle_samples_and_open_pair_survive_parsing() {
+        let summary = ProfileSummary::from_lines(
+            [
+                "DSRPROF1|sample|phase=fork-child-repair|pid=21|tid=21|duration_ns=1200",
+                "DSRPROF1|sample|phase=first-prepare-after-fork|pid=21|tid=21|duration_ns=800",
+                "DSRPROF1|sample|phase=exec-reset|pid=21|tid=21|duration_ns=900",
+                "DSRPROF1|sample|phase=first-prepare-after-exec|pid=21|tid=21|duration_ns=700",
+                "DSRPROF1|incomplete|phase=exec-reset|pid=21|tid=21|kind=open|value=1",
+                "DSRPROF1|complete|profile=dsr-fork|bounded=0",
+            ],
+            ProfileCaptureStatus::default(),
+        )
+        .expect("fork profile");
+        assert_eq!(
+            summary
+                .metrics
+                .iter()
+                .filter(|metric| matches!(metric.metric, ProfileMetric::SampledDuration { .. }))
+                .count(),
+            4
+        );
+        assert_eq!(summary.completion.incomplete_pairs, 1);
+        assert!(!summary.completion.complete);
+    }
+
+    #[test]
     fn writes_provenance_rich_jsonl_atomically() {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("profile.jsonl");
