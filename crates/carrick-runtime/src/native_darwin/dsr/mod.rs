@@ -113,6 +113,10 @@ pub(super) struct ResolverStats {
     pub(super) cache_lookup_hits: u64,
     pub(super) invalidated_blocks: u64,
     pub(super) translation_ns: u64,
+    pub(super) translation_decode_ns: u64,
+    pub(super) translation_plan_ns: u64,
+    pub(super) translation_emit_ns: u64,
+    pub(super) translation_publication_ns: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -128,6 +132,10 @@ pub(super) struct ProfileSnapshot {
     pub(super) cache_lookup_hits: u64,
     pub(super) invalidated_blocks: u64,
     pub(super) translation_ns: u64,
+    pub(super) translation_decode_ns: u64,
+    pub(super) translation_plan_ns: u64,
+    pub(super) translation_emit_ns: u64,
+    pub(super) translation_publication_ns: u64,
     pub(super) cache_used_bytes: usize,
     pub(super) cache_capacity_bytes: usize,
 }
@@ -237,6 +245,10 @@ impl ThreadTranslator {
             cache_lookup_hits: process.stats.cache_lookup_hits,
             invalidated_blocks: process.stats.invalidated_blocks,
             translation_ns: process.stats.translation_ns,
+            translation_decode_ns: process.stats.translation_decode_ns,
+            translation_plan_ns: process.stats.translation_plan_ns,
+            translation_emit_ns: process.stats.translation_emit_ns,
+            translation_publication_ns: process.stats.translation_publication_ns,
             cache_used_bytes: process.cache.used_bytes(),
             cache_capacity_bytes: process.cache.capacity_bytes(),
         }
@@ -254,7 +266,9 @@ impl Drop for ThreadTranslator {
                 "native dsr profile gateway_entries={} syscall_exits={} \
                  direct_resolver_exits={} indirect_resolver_exits={} \
                  one_entry_hits={} cache_lookups={} cache_lookup_hits={} \
-                 translations={} translation_ns={} duplicate_publications={} \
+                 translations={} translation_ns={} translation_decode_ns={} \
+                 translation_plan_ns={} translation_emit_ns={} \
+                 translation_publication_ns={} duplicate_publications={} \
                  invalidated_blocks={} cache_used_bytes={} cache_capacity_bytes={}\n",
                 profile.gateway_entries,
                 profile.syscall_exits,
@@ -265,6 +279,10 @@ impl Drop for ThreadTranslator {
                 profile.cache_lookup_hits,
                 profile.translations,
                 profile.translation_ns,
+                profile.translation_decode_ns,
+                profile.translation_plan_ns,
+                profile.translation_emit_ns,
+                profile.translation_publication_ns,
                 profile.duplicate_publications,
                 profile.invalidated_blocks,
                 profile.cache_used_bytes,
@@ -396,7 +414,13 @@ impl ProcessState {
                 guest.raw(),
                 generation.get(),
             );
+            let decode_started = self.profiling.then(std::time::Instant::now);
             let block_result = block::plan_block(memory, guest, generation, 256);
+            if let Some(started) = decode_started {
+                self.stats.translation_decode_ns = self.stats.translation_decode_ns.saturating_add(
+                    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                );
+            }
             probes::dsr_translate_subphase_end(
                 tid,
                 probes::DsrTranslationSubphase::Decode,
@@ -411,6 +435,7 @@ impl ProcessState {
                 guest.raw(),
                 generation.get(),
             );
+            let plan_started = self.profiling.then(std::time::Instant::now);
             let plan_result = (|| -> Result<(), types::DsrError> {
                 if observation.current() != generation {
                     return Err(types::DsrError::GenerationChanged {
@@ -438,6 +463,11 @@ impl ProcessState {
                 }
                 Ok(())
             })();
+            if let Some(started) = plan_started {
+                self.stats.translation_plan_ns = self.stats.translation_plan_ns.saturating_add(
+                    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                );
+            }
             probes::dsr_translate_subphase_end(
                 tid,
                 probes::DsrTranslationSubphase::Plan,
@@ -452,6 +482,7 @@ impl ProcessState {
                 guest.raw(),
                 generation.get(),
             );
+            let emit_started = self.profiling.then(std::time::Instant::now);
             let emitted_result = (|| {
                 let emitted = emit::emit_block_with_generation(
                     &mut self.cache,
@@ -481,6 +512,11 @@ impl ProcessState {
                 self.stats.translations = self.stats.translations.saturating_add(1);
                 Ok::<_, types::DsrError>((emitted, emitted_bytes))
             })();
+            if let Some(started) = emit_started {
+                self.stats.translation_emit_ns = self.stats.translation_emit_ns.saturating_add(
+                    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                );
+            }
             probes::dsr_translate_subphase_end(
                 tid,
                 probes::DsrTranslationSubphase::Emit,
@@ -495,6 +531,7 @@ impl ProcessState {
                 guest.raw(),
                 generation.get(),
             );
+            let publication_started = self.profiling.then(std::time::Instant::now);
             let entry = emitted.entry();
             let publication_result = (|| -> Result<TranslationResult, types::DsrError> {
                 let published_entry = self
@@ -550,6 +587,12 @@ impl ProcessState {
                     cache_used_bytes: u64::try_from(self.cache.used_bytes()).unwrap_or(u64::MAX),
                 })
             })();
+            if let Some(started) = publication_started {
+                self.stats.translation_publication_ns =
+                    self.stats.translation_publication_ns.saturating_add(
+                        u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                    );
+            }
             probes::dsr_translate_subphase_end(
                 tid,
                 probes::DsrTranslationSubphase::PublicationIndex,
@@ -691,6 +734,10 @@ impl ThreadTranslator {
             cache_lookup_hits: process.cache_lookup_hits,
             invalidated_blocks: process.invalidated_blocks,
             translation_ns: process.translation_ns,
+            translation_decode_ns: process.translation_decode_ns,
+            translation_plan_ns: process.translation_plan_ns,
+            translation_emit_ns: process.translation_emit_ns,
+            translation_publication_ns: process.translation_publication_ns,
         }
     }
 
@@ -1557,6 +1604,10 @@ mod tests {
         assert_eq!(profile.cache_lookups, 0);
         assert_eq!(profile.cache_used_bytes, 0);
         assert_eq!(profile.cache_capacity_bytes, 16 * 1024);
+        assert_eq!(profile.translation_decode_ns, 0);
+        assert_eq!(profile.translation_plan_ns, 0);
+        assert_eq!(profile.translation_emit_ns, 0);
+        assert_eq!(profile.translation_publication_ns, 0);
     }
 
     #[test]
