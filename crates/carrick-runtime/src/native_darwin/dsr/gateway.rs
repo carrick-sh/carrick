@@ -5,8 +5,9 @@ use super::types::{CacheVa, CodeGeneration, DsrError, NativeDsrExit};
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub(super) const INDIRECT_CACHE_ENTRIES: usize = 1024;
+pub(super) const INDIRECT_CACHE_ENTRIES: usize = 8192;
 pub(super) const INDIRECT_CACHE_MASK: u64 = (INDIRECT_CACHE_ENTRIES - 1) as u64;
+pub(super) const INDIRECT_CACHE_INDEX_BITS: u32 = 13;
 pub(super) const INDIRECT_CACHE_ENTRY_SHIFT: u32 = 5;
 pub(super) const CTX_INDIRECT_CACHE: u32 = 1136;
 pub(super) const CTX_GENERATION: u32 = 1144;
@@ -17,6 +18,13 @@ struct IndirectTargetCacheEntry {
     generation: AtomicU64,
     cache: AtomicU64,
     pad: u64,
+}
+
+#[inline(always)]
+fn indirect_cache_index(guest: carrick_guest_mem::GuestVa) -> usize {
+    let raw = guest.raw();
+    let mixed = raw ^ (raw >> 12);
+    ((mixed >> 2) & INDIRECT_CACHE_MASK) as usize
 }
 
 pub(super) struct IndirectTargetCache {
@@ -35,17 +43,13 @@ impl IndirectTargetCache {
         }
     }
 
-    fn index(guest: carrick_guest_mem::GuestVa) -> usize {
-        ((guest.raw() >> 2) & INDIRECT_CACHE_MASK) as usize
-    }
-
     pub(super) fn publish(
         &self,
         guest: carrick_guest_mem::GuestVa,
         generation: CodeGeneration,
         cache: CacheVa,
     ) {
-        let entry = &self.entries[Self::index(guest)];
+        let entry = &self.entries[indirect_cache_index(guest)];
         entry
             .cache
             .store(cache.host().raw() as u64, Ordering::Relaxed);
@@ -278,6 +282,28 @@ pub(super) fn enter_translated_with_cache_range(
         cache_start,
         cache_end,
     )
+}
+
+#[cfg(test)]
+mod indirect_cache_tests {
+    use super::*;
+
+    #[test]
+    fn indirect_cache_uses_approved_256kib_layout() {
+        assert_eq!(INDIRECT_CACHE_ENTRIES, 8192);
+        assert_eq!(std::mem::size_of::<IndirectTargetCacheEntry>(), 32);
+        assert_eq!(
+            INDIRECT_CACHE_ENTRIES * std::mem::size_of::<IndirectTargetCacheEntry>(),
+            256 * 1024,
+        );
+    }
+
+    #[test]
+    fn mixed_index_separates_old_page_offset_aliases() {
+        let first = carrick_guest_mem::GuestVa(0x42_000);
+        let second = carrick_guest_mem::GuestVa(0x48_000);
+        assert_ne!(indirect_cache_index(first), indirect_cache_index(second));
+    }
 }
 
 fn enter_translated_raw(

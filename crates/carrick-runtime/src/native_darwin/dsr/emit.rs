@@ -662,7 +662,12 @@ fn emit_indirect_exit(
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
-        ; ubfx x16, x17, #2, #10
+        ; eor x16, x17, x17, LSR #12
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; ubfx x16, x16, #2, #super::gateway::INDIRECT_CACHE_INDEX_BITS
     );
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
