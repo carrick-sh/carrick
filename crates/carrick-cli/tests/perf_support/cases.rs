@@ -55,6 +55,33 @@ pub const CASES: &[PerfCase] = &[
         carrick_fs_mode: "host",
         cross_boundary: false,
     },
+    // Latency (lower better): low-perturbation native DSR gateway crossing
+    // with no guest SIMD activity.
+    PerfCase {
+        probe: "perf_dsr_gateway",
+        artifact: PerfArtifact::StaticMusl,
+        dimension: "syscall",
+        workload: "dsr_gateway_scalar",
+        metric_key: "gateway_scalar_p50_us",
+        unit: "us",
+        higher_is_better: false,
+        mount_scratch: false,
+        carrick_fs_mode: "host",
+        cross_boundary: false,
+    },
+    // Same boundary with every AArch64 SIMD register seeded and verified.
+    PerfCase {
+        probe: "perf_dsr_gateway",
+        artifact: PerfArtifact::StaticMusl,
+        dimension: "syscall",
+        workload: "dsr_gateway_simd",
+        metric_key: "gateway_simd_p50_us",
+        unit: "us",
+        higher_is_better: false,
+        mount_scratch: false,
+        carrick_fs_mode: "host",
+        cross_boundary: false,
+    },
     // Latency (lower better): private futex wait/wake handoff.
     PerfCase {
         probe: "perf_futex_pingpong",
@@ -383,6 +410,16 @@ mod tests {
     fn registry_contains_syscall_perf_surface() {
         let required = [
             ("trap_floor", "perf_trap_floor", "trap_p50_us"),
+            (
+                "dsr_gateway_scalar",
+                "perf_dsr_gateway",
+                "gateway_scalar_p50_us",
+            ),
+            (
+                "dsr_gateway_simd",
+                "perf_dsr_gateway",
+                "gateway_simd_p50_us",
+            ),
             (
                 "futex_pingpong",
                 "perf_futex_pingpong",

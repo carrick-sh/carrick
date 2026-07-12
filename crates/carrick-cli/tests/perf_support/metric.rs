@@ -58,4 +58,20 @@ mod tests {
         let m = Metrics::parse(SAMPLE);
         assert_eq!(m.get_f64("nope"), None);
     }
+
+    #[test]
+    fn parses_dsr_gateway_surface() {
+        let m = Metrics::parse(
+            "gateway_scalar_p50_us=0.481\n\
+             gateway_scalar_p95_us=0.500\n\
+             gateway_scalar_min_us=0.458\n\
+             gateway_simd_p50_us=0.487\n\
+             gateway_simd_p95_us=0.521\n\
+             gateway_simd_min_us=0.458\n\
+             iters=20000\n",
+        );
+        assert_eq!(m.get_f64("gateway_scalar_p50_us"), Some(0.481));
+        assert_eq!(m.get_f64("gateway_simd_p50_us"), Some(0.487));
+        assert_eq!(m.get_u64("iters"), Some(20000));
+    }
 }
