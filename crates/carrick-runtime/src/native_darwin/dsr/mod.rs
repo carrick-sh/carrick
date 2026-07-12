@@ -623,25 +623,22 @@ impl ThreadTranslator {
             probes::dsr_prepare_begin(self.tid, guest.raw());
         }
         let selection = (|| -> Result<_, types::DsrError> {
-            match self.resume_entry.take() {
-                Some((cached_guest, generation, entry))
-                    if cached_guest == guest
-                        && memory.dsr_generation_observation(guest)?.expected() == generation =>
+            if let Some((cached_guest, generation, entry)) = self.resume_entry {
+                if cached_guest == guest
+                    && memory.dsr_generation_observation(guest)?.expected() == generation
                 {
                     self.stats.one_entry_hits = self.stats.one_entry_hits.saturating_add(1);
-                    Ok((entry, generation, probes::DsrPrepareOutcome::ResumeEntryHit))
+                    return Ok((entry, generation, probes::DsrPrepareOutcome::ResumeEntryHit));
                 }
-                _ => {
-                    let translated = self.translate(memory, guest)?;
-                    let outcome = match translated.outcome {
-                        TranslationOutcome::BlockIndexHit => {
-                            probes::DsrPrepareOutcome::BlockIndexHit
-                        }
-                        TranslationOutcome::Translated => probes::DsrPrepareOutcome::Translated,
-                    };
-                    Ok((translated.entry, translated.generation, outcome))
-                }
+                self.resume_entry = None;
             }
+            let translated = self.translate(memory, guest)?;
+            self.resume_entry = Some((guest, translated.generation, translated.entry));
+            let outcome = match translated.outcome {
+                TranslationOutcome::BlockIndexHit => probes::DsrPrepareOutcome::BlockIndexHit,
+                TranslationOutcome::Translated => probes::DsrPrepareOutcome::Translated,
+            };
+            Ok((translated.entry, translated.generation, outcome))
         })();
         let (entry, generation, outcome) = match selection {
             Ok(selection) => selection,
@@ -1227,6 +1224,52 @@ mod tests {
         assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
         assert!(libc::WIFEXITED(status), "child status was 0x{status:x}");
         assert_eq!(libc::WEXITSTATUS(status), 0);
+    }
+
+    #[test]
+    fn repeated_prepare_keeps_valid_last_entry_hot() {
+        let (memory, guest) = mapped_dsr_test_memory(&[0xd400_0001]).expect("map test memory");
+        let snapshot = super::super::NativeUcontextSnapshot {
+            pc: guest.raw(),
+            ..Default::default()
+        };
+        let mut translator = super::ThreadTranslator::new(16 * 1024).expect("create translator");
+        let first = translator
+            .prepare_entry::<false>(&memory, &snapshot)
+            .expect("prepare first entry");
+        let before = translator.profile_snapshot();
+        let second = translator
+            .prepare_entry::<false>(&memory, &snapshot)
+            .expect("prepare repeated entry");
+        let after = translator.profile_snapshot();
+        assert_eq!(first.entry, second.entry);
+        assert_eq!(after.one_entry_hits - before.one_entry_hits, 1);
+    }
+
+    #[test]
+    fn generation_change_discards_last_prepared_entry() {
+        let (memory, guest) = mapped_dsr_test_memory(&[0xd400_0001]).expect("map test memory");
+        let snapshot = super::super::NativeUcontextSnapshot {
+            pc: guest.raw(),
+            ..Default::default()
+        };
+        let mut translator = super::ThreadTranslator::new(16 * 1024).expect("create translator");
+        let first = translator
+            .prepare_entry::<false>(&memory, &snapshot)
+            .expect("prepare first entry");
+        let changed = memory
+            .note_dsr_code_mutation(guest.raw(), 4)
+            .expect("record code mutation")
+            .expect("DSR generation");
+        let before = translator.profile_snapshot();
+        let second = translator
+            .prepare_entry::<false>(&memory, &snapshot)
+            .expect("prepare after mutation");
+        let after = translator.profile_snapshot();
+        assert_eq!(second.generation, changed);
+        assert_ne!(first.generation, second.generation);
+        assert_eq!(after.one_entry_hits, before.one_entry_hits);
+        assert_ne!(first.entry, second.entry);
     }
 
     #[test]
