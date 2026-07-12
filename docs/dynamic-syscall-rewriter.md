@@ -1204,7 +1204,7 @@ plan.
   caches, lock-free publication, eviction, or epoch reclamation when the profile
   identifies a material bottleneck or capacity limit.
 
-- [ ] **Step 5: Apply the final go/no-go gate**
+- [x] **Step 5: Apply the final go/no-go gate**
 
   DSR may be documented as an experimental alternative when:
 
@@ -1221,7 +1221,7 @@ plan.
   Defaulting native execution to DSR is explicitly outside this plan and
   requires a separate decision based on this evidence.
 
-- [ ] **Step 6: Verify and commit**
+- [x] **Step 6: Verify and commit**
 
   Run:
 
@@ -1256,12 +1256,14 @@ The final report must state, with artifact paths:
 - whether DSR remains an opt-in experiment or merits a separate default-mode
   decision.
 
-Current status (2026-07-11): Tasks 1–12 are implemented. Task 13 has fresh
+Final status (2026-07-11): Tasks 1–13 are implemented. Task 13 has fresh
 strict-LTP and workload artifacts, including direct Node/V8, Go PIE, Rust
 static/dynamic PIE, and fork/exec proof. Performance distributions exist for
-the syscall floor, fork/exec, TCP round-trip, and metadata paths. The remaining
-work is the current-HEAD full LTP rerun after the last structural fixes, fork
-lifecycle attribution, final CI, and the explicit go/no-go conclusion. See
-`docs/native-dsr-ltp-campaign.md`,
+the syscall floor, fork/exec, TCP round-trip, metadata, and generated-code
+paths. The current-runtime LTP result is 1,331 MATCH and 91 gating rows with no
+DSR cache-policy exit. The default-mode decision is NO-GO; DSR remains opt-in.
+Full `just ci` passes. Fork lifecycle attribution and the three typed DSR
+control-flow regressions are explicit follow-up work, not unfinished steps in
+this implementation/evidence plan. See `docs/native-dsr-ltp-campaign.md`,
 `docs/perf-results/native-dsr.jsonl`, and
 `docs/perf-results/native-dsr-profile.jsonl`.
