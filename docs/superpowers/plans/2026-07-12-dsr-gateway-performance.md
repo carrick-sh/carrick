@@ -98,9 +98,10 @@ Task 2A is deferred. Exact arrays and provenance are in
 
 **Selected by Task 1:** yes; decompose before changing behavior.
 
-- [ ] Decompose custom-x18 transition and signal-mask transition with a
-  sampled, opt-in aggregate counter. Emission must be once per process, not a
-  DTrace event per gateway crossing.
+- [x] Decompose custom-x18 transition and signal-mask transition with exact
+  benchmark-only entrypoints around the production primitives. This proved
+  lower-perturbation than adding even a disabled counter branch to the hot
+  gateway; it emits once per process and adds no production-path work.
 - [ ] Preserve the ordering invariant: publish context, enter custom-x18 ABI,
   then unblock kick on entry; block kick, clear context, then enter host x18 ABI
   on exit.
@@ -109,6 +110,18 @@ Task 2A is deferred. Exact arrays and provenance are in
   rejected.
 - [ ] Run the phase-zero, phase-one, phase-two, pending-kick, signal, fault,
   custom-x18, and fork-child oracles red-first against any reordered closure.
+
+**Decomposition result:** the paired SIGPIPE unblock/block transition is
+0.201 us p50 in both 30-process campaigns, 95.3% of the selected 0.211 us
+closure. The custom-x18 pair is 0.005/0.008 us. Reusing a prebuilt `sigset_t`
+only lowers the mask pair to 0.198 us, proving that set construction is not the
+long pole. Evidence is in
+`docs/perf-results/native-dsr-gateway-closure-decomposition-v1.jsonl`.
+
+**Selected candidate:** keep SIGPIPE deliverable while host code runs, defer a
+host-window kick in thread-local state, and consume it at the next linearizable
+gateway entry before translated execution. Preserve the active-context and
+custom-x18 ordering; add red phase/window tests before changing C or assembly.
 
 ## Task 3: Candidate promotion gate
 

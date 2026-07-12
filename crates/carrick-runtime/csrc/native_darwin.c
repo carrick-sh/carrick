@@ -346,6 +346,26 @@ void carrick_native_dsr_enter_host_abi(void) {
     carrick_native_enter_host_x18_abi();
 }
 
+// Test-only measurement entrypoints. They are not called by the production
+// gateway and therefore add no branch or counter traffic to its hot path. Each
+// pair invokes the exact primitives used by the ABI closure while returning to
+// the same state in which it started.
+int carrick_native_dsr_benchmark_signal_mask_pair(void) {
+    if (carrick_native_unblock_kick_signal() != 0) {
+        return -1;
+    }
+    return carrick_native_block_kick_signal();
+}
+
+int carrick_native_dsr_benchmark_custom_x18_pair(void) {
+    if (carrick_native_init_custom_x18() != 0) {
+        return -1;
+    }
+    carrick_native_set_custom_x18(true);
+    carrick_native_set_custom_x18(false);
+    return 0;
+}
+
 static void carrick_native_snapshot_mcontext(
     struct carrick_native_ucontext_snapshot *out,
     const struct __darwin_mcontext64 *mc,
