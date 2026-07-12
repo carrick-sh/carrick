@@ -92,7 +92,7 @@ the body.
 - Produces: no `carrick_native_clear_icache` call from `map_region` or
   `map_bytes_region` when mode is DSR.
 
-- [ ] **Step 1: Implement the narrow predicate**
+- [x] **Step 1: Implement the narrow predicate**
 
 ```rust
 const fn native_mapping_needs_icache_publication(
@@ -107,7 +107,7 @@ Use it at both current cache-clear call sites. Do not change `mmap`, byte copy,
 final protection, vDSO-vvar relocation, translated-cache publication, or the
 legacy patch path.
 
-- [ ] **Step 2: Run mapping and DSR correctness**
+- [x] **Step 2: Run mapping and DSR correctness**
 
 ```bash
 cargo test -p carrick-runtime \
@@ -119,7 +119,7 @@ cargo test -p carrick-runtime dsr_signal_fault --lib -- --nocapture
 cargo clippy -p carrick-runtime --lib -- -D warnings
 ```
 
-- [ ] **Step 3: Commit the candidate**
+- [x] **Step 3: Commit the candidate**
 
 Use `perf(native): skip DSR source icache publication`. The body must explain
 why DSR source mappings are never instruction-fetch targets and name the tests.
