@@ -3,7 +3,7 @@ use carrick_guest_mem::GuestVa;
 use super::super::NativeUcontextSnapshot;
 use super::block::{BlockPlan, PlannedExit, PlannedInst};
 use super::cache::TranslationCache;
-use super::emit::{EmittedBlock, emit_block};
+use super::emit::{EmittedBlock, GenerationGuard, emit_block, emit_block_with_generation};
 use super::gateway::{IndirectTargetCache, enter_translated, enter_translated_with_cache};
 use super::types::{
     CodeGeneration, DirectExit, DirectKind, DsrError, IndirectExit, IndirectKind, InstAction,
@@ -956,11 +956,15 @@ fn dsr_indirect_flow_cached_blr_sets_guest_link_register() {
 
 #[test]
 fn dsr_sensitive_flow_reports_guest_pc_and_resume() {
+    use std::sync::atomic::AtomicU64;
+
     let mut cache = TranslationCache::new(16 * 1024).expect("allocate sensitive cache");
+    let generation = CodeGeneration::claimed(1);
+    let current_generation = AtomicU64::new(generation.get());
     let plan = BlockPlan {
         start: GuestVa(0x1a_000),
         end: GuestVa(0x1a_004),
-        generation: CodeGeneration::INITIAL,
+        generation,
         instructions: Vec::new(),
         exit: PlannedExit::Sensitive {
             guest: GuestVa(0x1a_000),
@@ -972,12 +976,18 @@ fn dsr_sensitive_flow_reports_guest_pc_and_resume() {
             },
         },
     };
-    let emitted = emit_block(&mut cache, &plan).expect("emit sensitive exit");
+    let emitted = emit_block_with_generation(
+        &mut cache,
+        &plan,
+        GenerationGuard::new(&current_generation, generation),
+    )
+    .expect("emit sensitive exit");
     let mut stack = vec![0_u8; 16 * 1024];
     let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
     let mut exit = NativeDsrExit::Sensitive {
         guest_pc: GuestVa(0x1a_000),
         resume: GuestVa(0x1a_004),
+        generation: CodeGeneration::INITIAL,
     };
     enter_translated(emitted.entry(), &mut snapshot, &mut exit).expect("execute sensitive exit");
     assert_eq!(
@@ -985,6 +995,7 @@ fn dsr_sensitive_flow_reports_guest_pc_and_resume() {
         NativeDsrExit::Sensitive {
             guest_pc: GuestVa(0x1a_000),
             resume: GuestVa(0x1a_004),
+            generation,
         }
     );
 }

@@ -3497,6 +3497,13 @@ fn dispatch_native_syscall(
                     }
                 }
             },
+            DispatchOutcome::BlockingRecordLock(lock) => {
+                // The dispatcher released all subsystem locks before returning
+                // this typed outcome. Native guest threads are independent host
+                // pthreads, so siblings remain able to release the conflicting
+                // lock while this thread blocks in the host fcntl.
+                return Ok(crate::dispatch::drive_blocking_record_lock(&lock));
+            }
             DispatchOutcome::WaitOnProcExit { pid, sig_mask } => {
                 match wait_native_proc_exit(dispatcher, thread_runtime, pid, sig_mask) {
                     Ok(NativeWaitResult::Ready) | Ok(NativeWaitResult::TimedOut) => continue,

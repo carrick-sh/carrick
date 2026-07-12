@@ -418,13 +418,17 @@ impl ThreadTranslator {
                 snapshot.pc = target.raw();
                 ThreadExit::Continue
             }
-            types::NativeDsrExit::Sensitive { guest_pc, .. } => {
+            types::NativeDsrExit::Sensitive {
+                guest_pc,
+                generation,
+                ..
+            } => {
                 let exit = self
                     .process
                     .state
                     .lock()
                     .sensitive
-                    .get(&(guest_pc, prepared.generation))
+                    .get(&(guest_pc, generation))
                     .copied()
                     .ok_or_else(|| {
                         types::DsrError::BlockPolicy(format!(

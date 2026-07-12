@@ -157,6 +157,7 @@ pub(super) enum NativeDsrExit {
     Sensitive {
         guest_pc: GuestVa,
         resume: GuestVa,
+        generation: CodeGeneration,
     },
     Fault {
         guest_pc: GuestVa,
