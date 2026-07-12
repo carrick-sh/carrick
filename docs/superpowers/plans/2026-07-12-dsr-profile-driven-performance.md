@@ -133,14 +133,13 @@ git commit -m "docs(native): publish DSR profiling baseline" \
 
 **Files:**
 - Modify: `crates/carrick-cli/tests/dsr_trace_overhead.rs`
-- Modify: `crates/carrick-cli/src/perf_stats.rs`
 - Test: `crates/carrick-cli/tests/dsr_trace_overhead.rs`
 
 **Interfaces:**
 - Consumes: `CARRICK_DSR_BASELINE_BIN`, `CARRICK_DSR_CANDIDATE_BIN`, commit IDs, workload commands, and `bootstrap_median_ratio`.
 - Produces: ignored tests `indirect_cache_improvement`, `prepare_cache_improvement`, and `gateway_improvement`, each atomically writing the existing `carrick.dsr-overhead.v1` schema.
 
-- [ ] **Step 1: Write the failing decision-policy tests**
+- [x] **Step 1: Write the failing decision-policy tests**
 
 Add a pure helper and tests:
 
@@ -177,7 +176,7 @@ fn improvement_policy_requires_supported_nonzero_gain() {
 }
 ```
 
-- [ ] **Step 2: Run the test red**
+- [x] **Step 2: Run the test red**
 
 Run:
 
@@ -188,14 +187,14 @@ cargo test -p carrick-cli --test dsr_trace_overhead improvement_policy -- --noca
 Expected: FAIL because `ImprovementPolicy` and `passes_improvement` do not yet
 exist.
 
-- [ ] **Step 3: Implement the policy and reusable binary gate**
+- [x] **Step 3: Implement the policy and reusable binary gate**
 
 Refactor the disabled binary comparison into:
 
 ```rust
 fn run_binary_gate(
     mode: &'static str,
-    workloads: &[(Workload, usize, ImprovementPolicy)],
+    gates: &[BinaryGate],
     output_env: &str,
 ) {
     // Reuse provenance validation, fixed ABBA collection, seeded bootstrap,
@@ -211,10 +210,14 @@ Add ignored entry points with exact policies:
 fn indirect_cache_improvement() {
     run_binary_gate(
         "indirect-cache-improvement",
-        &[(Workload::DirectV8, 5, ImprovementPolicy {
-            upper_bound: 1.0,
-            minimum_estimate_gain: 0.01,
-        })],
+        &[BinaryGate {
+            workload: Workload::DirectV8,
+            cycles: 5,
+            policy: BinaryGatePolicy::Improvement(ImprovementPolicy {
+                upper_bound: 1.0,
+                minimum_estimate_gain: 0.01,
+            }),
+        }],
         "CARRICK_DSR_OPTIMIZATION_OUT",
     );
 }
@@ -225,14 +228,22 @@ fn prepare_cache_improvement() {
     run_binary_gate(
         "prepare-cache-improvement",
         &[
-            (Workload::SyscallFloor, 15, ImprovementPolicy {
-                upper_bound: 1.0,
-                minimum_estimate_gain: 0.01,
-            }),
-            (Workload::DirectV8, 5, ImprovementPolicy {
-                upper_bound: 1.01,
-                minimum_estimate_gain: 0.0,
-            }),
+            BinaryGate {
+                workload: Workload::SyscallFloor,
+                cycles: 15,
+                policy: BinaryGatePolicy::Improvement(ImprovementPolicy {
+                    upper_bound: 1.0,
+                    minimum_estimate_gain: 0.01,
+                }),
+            },
+            BinaryGate {
+                workload: Workload::DirectV8,
+                cycles: 5,
+                policy: BinaryGatePolicy::Improvement(ImprovementPolicy {
+                    upper_bound: 1.01,
+                    minimum_estimate_gain: 0.0,
+                }),
+            },
         ],
         "CARRICK_DSR_OPTIMIZATION_OUT",
     );
@@ -242,7 +253,7 @@ fn prepare_cache_improvement() {
 The existing disabled non-inferiority and enabled report-only tests must keep
 their current policies and evidence schema.
 
-- [ ] **Step 4: Run focused tests and clippy**
+- [x] **Step 4: Run focused tests and clippy**
 
 Run:
 
@@ -255,11 +266,11 @@ cargo clippy -p carrick-cli --test dsr_trace_overhead -- -D warnings
 
 Expected: all tests pass and the ignored live gates compile without running.
 
-- [ ] **Step 5: Commit the reusable gate**
+- [x] **Step 5: Commit the reusable gate**
 
 ```bash
 git add crates/carrick-cli/tests/dsr_trace_overhead.rs \
-  crates/carrick-cli/src/perf_stats.rs
+  docs/superpowers/plans/2026-07-12-dsr-profile-driven-performance.md
 git commit -m "test(native): gate attributable DSR improvements" \
   -m "Reuse signed-binary ABBA collection and deterministic bootstrap intervals for cache and gateway changes that must prove a nonzero workload gain." \
   -m "Co-Authored-By: Codex <codex@openai.com>"
@@ -521,6 +532,8 @@ Expected: `v8-smoke ok` and no leftover stamped processes.
 ```bash
 CARRICK_DSR_BASELINE_BIN=target/perf/dsr-indirect-cache/baseline-carrick \
 CARRICK_DSR_CANDIDATE_BIN=target/perf/dsr-indirect-cache/candidate-carrick \
+CARRICK_DSR_BASELINE_COMMIT="$(git rev-parse HEAD^)" \
+CARRICK_DSR_CANDIDATE_COMMIT="$(git rev-parse HEAD)" \
 CARRICK_DSR_OPTIMIZATION_OUT=docs/perf-results/native-dsr-indirect-cache-v1.jsonl \
   cargo test -p carrick-cli --test dsr_trace_overhead \
   indirect_cache_improvement -- --ignored --nocapture --test-threads=1
@@ -703,6 +716,8 @@ inodes, commits, codesign, host, and power.
 ```bash
 CARRICK_DSR_BASELINE_BIN=target/perf/dsr-prepare-cache/baseline-carrick \
 CARRICK_DSR_CANDIDATE_BIN=target/perf/dsr-prepare-cache/candidate-carrick \
+CARRICK_DSR_BASELINE_COMMIT="$(git rev-parse HEAD^)" \
+CARRICK_DSR_CANDIDATE_COMMIT="$(git rev-parse HEAD)" \
 CARRICK_DSR_OPTIMIZATION_OUT=docs/perf-results/native-dsr-prepare-cache-v1.jsonl \
   cargo test -p carrick-cli --test dsr_trace_overhead \
   prepare_cache_improvement -- --ignored --nocapture --test-threads=1
