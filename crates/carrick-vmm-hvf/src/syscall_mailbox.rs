@@ -34,6 +34,13 @@ pub struct HvfSyscallTransportError {
 }
 
 impl HvfSyscallTransport {
+    pub const fn raw(self) -> u32 {
+        match self {
+            Self::Legacy => 0,
+            Self::Mailbox => 1,
+        }
+    }
+
     pub fn parse(value: Option<&str>) -> Result<Self, HvfSyscallTransportError> {
         match value {
             None | Some("mailbox") => Ok(Self::Mailbox),
@@ -249,6 +256,10 @@ impl MailboxBinding {
 
     pub const fn transport(&self) -> HvfSyscallTransport {
         self.transport
+    }
+
+    pub const fn sequence(&self) -> u64 {
+        self.last_sequence
     }
 
     /// Refresh the host pointer and generation after a VM/vCPU rebuild.
