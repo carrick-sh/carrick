@@ -1,3 +1,7 @@
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+
+use carrick_guest_mem::protections::MemoryProtections;
 use carrick_guest_mem::{GuestVa, HostVa};
 
 use super::super::NativeUcontextSnapshot;
@@ -12,6 +16,523 @@ use super::types::{
     MemoryAccess, MemoryBase, MemoryClass, MemoryVirtualization, MemoryWriteback, NativeDsrExit,
     PcRelativeInst, PcRelativeKind, SensitiveExit, SensitiveKind,
 };
+
+struct BiasedTranslatorFixture {
+    memory: super::super::NativeMappedMemory,
+    translator: super::ThreadTranslator,
+    guest_code: GuestVa,
+    guest_data: GuestVa,
+    data_host: HostVa,
+    host_bias: crate::native_darwin::address::NativeHostBias,
+    _mapping: crate::native_darwin::address::OwnedHostMapping,
+}
+
+fn biased_translator_fixture(words: &[u32], guest_code: GuestVa) -> BiasedTranslatorFixture {
+    const BIAS: u64 = 0x80_0000_0000;
+    const PAGE_SIZE: u64 = 16 * 1024;
+    const MAPPING_LEN: usize = 2 * PAGE_SIZE as usize;
+    let host_bias = crate::native_darwin::address::NativeHostBias::new(BIAS, PAGE_SIZE)
+        .expect("construct live biased host bias");
+    let mapping = crate::native_darwin::address::OwnedHostMapping::map_exact(
+        HostVa((BIAS + guest_code.raw()) as usize),
+        MAPPING_LEN,
+        libc::PROT_READ | libc::PROT_WRITE,
+        libc::MAP_ANON | libc::MAP_PRIVATE,
+    )
+    .expect("map live biased fixture");
+    let code = words
+        .iter()
+        .flat_map(|word| word.to_le_bytes())
+        .collect::<Vec<_>>();
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            code.as_ptr(),
+            mapping.range().start.raw() as *mut u8,
+            code.len(),
+        );
+    }
+    let guest_data = GuestVa(guest_code.raw() + PAGE_SIZE);
+    let data_host = HostVa(mapping.range().start.raw() + PAGE_SIZE as usize);
+    let process =
+        Arc::new(super::ProcessTranslator::new(64 * 1024).expect("create live translator"));
+    let memory = super::super::NativeMappedMemory {
+        address_mode: crate::native_darwin::address::NativeAddressMode::Biased { host_bias },
+        owned_host_ranges: vec![mapping.range()],
+        regions: vec![
+            super::super::NativeMappedRegion {
+                start: guest_code.raw(),
+                end: guest_code.raw() + PAGE_SIZE,
+                host_protects: false,
+                shared_futex: false,
+                guest_writable: false,
+                default_prot: crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_EXEC,
+                shared_key_base: 0,
+                shared_key_offset: 0,
+            },
+            super::super::NativeMappedRegion {
+                start: guest_data.raw(),
+                end: guest_data.raw() + PAGE_SIZE,
+                host_protects: false,
+                shared_futex: false,
+                guest_writable: true,
+                default_prot: crate::linux_abi::LINUX_PROT_READ
+                    | crate::linux_abi::LINUX_PROT_WRITE,
+                shared_key_base: 0,
+                shared_key_offset: 0,
+            },
+        ],
+        protections: MemoryProtections::default(),
+        native_page_protections: BTreeMap::new(),
+        native_write_exec_writable_pages: BTreeSet::new(),
+        linux4k_page_protections: BTreeMap::new(),
+        exclusive_reservation: None,
+        host_page_size: PAGE_SIZE,
+        linux_page_size: PAGE_SIZE,
+        dsr_generations: super::cache::PageGenerationTable::new(PAGE_SIZE)
+            .expect("create live generation table"),
+        dsr_translator: Some(Arc::clone(&process)),
+    };
+    BiasedTranslatorFixture {
+        memory,
+        translator: super::ThreadTranslator::for_process(process, 0),
+        guest_code,
+        guest_data,
+        data_host,
+        host_bias,
+        _mapping: mapping,
+    }
+}
+
+#[test]
+fn biased_live_signal_gateway_recovers_pre_and_post_operation_faults() {
+    assert_eq!(
+        unsafe { super::super::carrick_native_install_dsr_signal_handlers() },
+        0
+    );
+
+    {
+        let mut fixture =
+            biased_translator_fixture(&[0xf940_0020, 0xd400_0001], GuestVa(0x20_0000_0000));
+        let invalid_guest = GuestVa(0x10_0000);
+        let mut stack = vec![0_u8; 16 * 1024];
+        let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+        snapshot.pc = fixture.guest_code.raw();
+        snapshot.x[1] = invalid_guest.raw();
+        let original = snapshot;
+        let prepared = fixture
+            .translator
+            .prepare_entry::<false>(&fixture.memory, &snapshot)
+            .expect("prepare live biased pre-operation fault");
+        let prepared_exit = fixture
+            .translator
+            .enter_prepared::<false>(prepared, &mut snapshot)
+            .expect("enter live biased pre-operation fault");
+        let exit = fixture
+            .translator
+            .finish_exit(&fixture.memory, &mut snapshot, prepared, prepared_exit)
+            .expect("finish live biased pre-operation fault");
+        assert!(matches!(
+            exit,
+            super::ThreadExit::Fault {
+                kind: super::ThreadFault::Host { signal, .. },
+                address: super::ThreadFaultAddress::Host(address),
+            } if matches!(signal, libc::SIGSEGV | libc::SIGBUS)
+                && address == HostVa((fixture.host_bias.get() + invalid_guest.raw()) as usize)
+        ));
+        assert_eq!(snapshot.pc, fixture.guest_code.raw());
+        assert_eq!(snapshot.x[1], original.x[1]);
+        assert_eq!(snapshot.x[16], original.x[16]);
+        assert_eq!(snapshot.x[17], original.x[17]);
+    }
+
+    {
+        let mut fixture =
+            biased_translator_fixture(&[0xf840_8420, 0xd400_0001], GuestVa(0x20_0001_0000));
+        let loaded = 0x1122_3344_5566_7788_u64;
+        unsafe { *(fixture.data_host.raw() as *mut u64) = loaded };
+        let mut stack = vec![0_u8; 16 * 1024];
+        let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+        snapshot.pc = fixture.guest_code.raw();
+        snapshot.x[1] = fixture.guest_data.raw();
+        snapshot.x[27] = 1;
+        let original_x16 = snapshot.x[16];
+        let original_x17 = snapshot.x[17];
+        let prepared = fixture
+            .translator
+            .prepare_entry::<false>(&fixture.memory, &snapshot)
+            .expect("prepare live biased post-operation fault");
+        fixture
+            .translator
+            .patch_first_completed_recovery_for_test(
+                fixture.guest_code,
+                0xf940_0369, // ldr x9, [x27] with x27=1
+            )
+            .expect("patch completed cleanup instruction");
+        let prepared_exit = fixture
+            .translator
+            .enter_prepared::<false>(prepared, &mut snapshot)
+            .expect("enter live biased post-operation fault");
+        let exit = fixture
+            .translator
+            .finish_exit(&fixture.memory, &mut snapshot, prepared, prepared_exit)
+            .expect("finish live biased post-operation fault");
+        assert!(matches!(
+            exit,
+            super::ThreadExit::Fault {
+                kind: super::ThreadFault::Host { signal, .. },
+                address: super::ThreadFaultAddress::Host(HostVa(1)),
+            } if matches!(signal, libc::SIGSEGV | libc::SIGBUS)
+        ));
+        assert_eq!(snapshot.pc, fixture.guest_code.raw() + 4);
+        assert_eq!(snapshot.x[0], loaded);
+        assert_eq!(snapshot.x[1], fixture.guest_data.raw() + 8);
+        assert_eq!(snapshot.x[16], original_x16);
+        assert_eq!(snapshot.x[17], original_x17);
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum BiasedRecoveryMatrixShape {
+    ScalarPre,
+    ScalarPost,
+    Literal,
+    VirtualX18,
+    VirtualX28,
+    X16X17Collision,
+}
+
+impl BiasedRecoveryMatrixShape {
+    fn words(self) -> Vec<u32> {
+        match self {
+            Self::ScalarPre => vec![0xf81f_8c20, 0xd400_0001],
+            Self::ScalarPost => vec![0xf840_8420, 0xd400_0001],
+            Self::Literal => vec![0x5800_0040, 0xd400_0001, 0x5566_7788, 0x1122_3344],
+            Self::VirtualX18 => vec![0xf940_0240, 0xd400_0001],
+            Self::VirtualX28 => vec![0xf940_0380, 0xd400_0001],
+            Self::X16X17Collision => vec![0xf940_0211, 0xd400_0001],
+        }
+    }
+
+    fn configure(self, fixture: &BiasedTranslatorFixture, snapshot: &mut NativeUcontextSnapshot) {
+        const VALUE: u64 = 0x1122_3344_5566_7788;
+        const INITIAL: u64 = 0xaabb_ccdd_eeff_0011;
+        unsafe { *(fixture.data_host.raw() as *mut u64) = INITIAL };
+        match self {
+            Self::ScalarPre => {
+                snapshot.x[0] = VALUE;
+                snapshot.x[1] = fixture.guest_data.raw() + 8;
+            }
+            Self::ScalarPost => {
+                unsafe { *(fixture.data_host.raw() as *mut u64) = VALUE };
+                snapshot.x[1] = fixture.guest_data.raw();
+            }
+            Self::Literal => {}
+            Self::VirtualX18 => {
+                unsafe { *(fixture.data_host.raw() as *mut u64) = VALUE };
+                snapshot.x[18] = fixture.guest_data.raw();
+            }
+            Self::VirtualX28 => {
+                unsafe { *(fixture.data_host.raw() as *mut u64) = VALUE };
+                snapshot.x[28] = fixture.guest_data.raw();
+            }
+            Self::X16X17Collision => {
+                unsafe { *(fixture.data_host.raw() as *mut u64) = VALUE };
+                snapshot.x[16] = fixture.guest_data.raw();
+            }
+        }
+        snapshot.x[27] = 1;
+    }
+}
+
+#[test]
+fn biased_recovery_matrix_routes_every_offset_through_finish_exit() {
+    assert_eq!(
+        unsafe { super::super::carrick_native_install_dsr_signal_handlers() },
+        0
+    );
+    let shapes = [
+        BiasedRecoveryMatrixShape::ScalarPre,
+        BiasedRecoveryMatrixShape::ScalarPost,
+        BiasedRecoveryMatrixShape::Literal,
+        BiasedRecoveryMatrixShape::VirtualX18,
+        BiasedRecoveryMatrixShape::VirtualX28,
+        BiasedRecoveryMatrixShape::X16X17Collision,
+    ];
+    for (shape_index, shape) in shapes.into_iter().enumerate() {
+        let guest_code = GuestVa(0x20_0010_0000 + shape_index as u64 * 0x10_0000);
+        let expected = {
+            let mut fixture = biased_translator_fixture(&shape.words(), guest_code);
+            let mut stack = vec![0_u8; 16 * 1024];
+            let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+            snapshot.pc = guest_code.raw();
+            shape.configure(&fixture, &mut snapshot);
+            let original = snapshot;
+            let prepared = fixture
+                .translator
+                .prepare_entry::<false>(&fixture.memory, &snapshot)
+                .expect("prepare matrix expected execution");
+            let exit = fixture
+                .translator
+                .enter_prepared::<false>(prepared, &mut snapshot)
+                .expect("enter matrix expected execution");
+            assert!(matches!(
+                fixture
+                    .translator
+                    .finish_exit(&fixture.memory, &mut snapshot, prepared, exit)
+                    .expect("finish matrix expected execution"),
+                super::ThreadExit::Syscall { .. }
+            ));
+            (original, snapshot)
+        };
+
+        let recovery_count = {
+            let mut fixture = biased_translator_fixture(&shape.words(), guest_code);
+            let mut stack = vec![0_u8; 16 * 1024];
+            let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+            snapshot.pc = guest_code.raw();
+            shape.configure(&fixture, &mut snapshot);
+            fixture
+                .translator
+                .prepare_entry::<false>(&fixture.memory, &snapshot)
+                .expect("prepare matrix recovery count");
+            fixture
+                .translator
+                .recovery_points_for_test(guest_code)
+                .len()
+        };
+        assert!(recovery_count > 0, "shape={shape:?}");
+
+        for point_index in 0..recovery_count {
+            let mut fixture = biased_translator_fixture(&shape.words(), guest_code);
+            let mut stack = vec![0_u8; 16 * 1024];
+            let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+            snapshot.pc = guest_code.raw();
+            shape.configure(&fixture, &mut snapshot);
+            let prepared = fixture
+                .translator
+                .prepare_entry::<false>(&fixture.memory, &snapshot)
+                .expect("prepare matrix recovery point");
+            let (cache_pc, action) = fixture
+                .translator
+                .recovery_points_for_test(guest_code)
+                .get(point_index)
+                .copied()
+                .expect("matrix recovery point");
+            fixture
+                .translator
+                .patch_recovery_word_for_test(cache_pc, 0xf940_0369)
+                .expect("patch matrix recovery point");
+            let fault = fixture
+                .translator
+                .enter_prepared::<false>(prepared, &mut snapshot)
+                .expect("enter matrix recovery fault");
+            let fault_exit = fault.exit;
+            let fault_snapshot = snapshot;
+            let super::types::NativeDsrExit::Fault {
+                guest_pc: resume,
+                rewrite_scratch,
+                rewrite_context_scratch,
+                generation_pstate_scratch,
+                indirect_x15_scratch,
+                indirect_x30_scratch,
+                ..
+            } = fault_exit
+            else {
+                panic!("shape={shape:?} point={point_index} expected fault, got {fault_exit:?}");
+            };
+            let kick = super::PreparedExit {
+                exit: super::types::NativeDsrExit::Kick {
+                    resume,
+                    rewrite_scratch,
+                    rewrite_context_scratch,
+                    generation_pstate_scratch,
+                    indirect_x15_scratch,
+                    indirect_x30_scratch,
+                },
+            };
+            let completed = action.instruction_complete();
+            let expected_snapshot = if completed { expected.1 } else { expected.0 };
+
+            let mut recovered_fault = fault_snapshot;
+            let fault_result = fixture
+                .translator
+                .finish_exit(
+                    &fixture.memory,
+                    &mut recovered_fault,
+                    prepared,
+                    super::PreparedExit { exit: fault_exit },
+                )
+                .expect("finish matrix fault");
+            assert!(matches!(
+                fault_result,
+                super::ThreadExit::Fault {
+                    address: super::ThreadFaultAddress::Host(HostVa(1)),
+                    ..
+                }
+            ));
+
+            let mut recovered_kick = fault_snapshot;
+            assert!(matches!(
+                fixture
+                    .translator
+                    .finish_exit(&fixture.memory, &mut recovered_kick, prepared, kick)
+                    .expect("finish matrix kick"),
+                super::ThreadExit::Kick
+            ));
+            for (kind, recovered) in [("fault", recovered_fault), ("kick", recovered_kick)] {
+                assert_eq!(
+                    recovered.pc,
+                    guest_code.raw() + if completed { 4 } else { 0 },
+                    "shape={shape:?} point={point_index} kind={kind} PC"
+                );
+                assert_eq!(
+                    recovered.x, expected_snapshot.x,
+                    "shape={shape:?} point={point_index} kind={kind} registers"
+                );
+                assert_eq!(
+                    recovered.sp, expected_snapshot.sp,
+                    "shape={shape:?} point={point_index} kind={kind} SP"
+                );
+            }
+            let observed_data = unsafe { *(fixture.data_host.raw() as *const u64) };
+            if matches!(shape, BiasedRecoveryMatrixShape::ScalarPre) {
+                assert_eq!(
+                    observed_data,
+                    if completed {
+                        0x1122_3344_5566_7788
+                    } else {
+                        0xaabb_ccdd_eeff_0011
+                    },
+                    "shape={shape:?} point={point_index} store completion"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn biased_store_exclusive_preamble_retries_and_block_entry_fails_spuriously() {
+    assert_eq!(
+        unsafe { super::super::carrick_native_install_dsr_signal_handlers() },
+        0
+    );
+    let guest_code = GuestVa(0x20_0080_0000);
+    for point_index in 0..3 {
+        let mut fixture = biased_translator_fixture(
+            &[0xc85f_7c20, 0x9100_0400, 0xc802_7c20, 0xd400_0001],
+            guest_code,
+        );
+        unsafe { *(fixture.data_host.raw() as *mut u64) = 41 };
+        let mut stack = vec![0_u8; 16 * 1024];
+        let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+        snapshot.pc = guest_code.raw();
+        snapshot.x[1] = fixture.guest_data.raw();
+        snapshot.x[2] = u64::MAX;
+        snapshot.x[27] = 1;
+        let prepared = fixture
+            .translator
+            .prepare_entry::<false>(&fixture.memory, &snapshot)
+            .expect("prepare store-exclusive preamble");
+        let stxr_guest = GuestVa(guest_code.raw() + 8);
+        let points = fixture.translator.instruction_points_for_test(stxr_guest);
+        assert_eq!(points.len(), 3, "store-exclusive preamble width");
+        fixture
+            .translator
+            .patch_instruction_word_for_test(points[point_index], 0xf940_0369)
+            .expect("patch store-exclusive preamble");
+        let fault = fixture
+            .translator
+            .enter_prepared::<false>(prepared, &mut snapshot)
+            .expect("enter store-exclusive preamble fault");
+        let fault_exit = fault.exit;
+        let fault_snapshot = snapshot;
+        let super::types::NativeDsrExit::Fault {
+            guest_pc: resume,
+            rewrite_scratch,
+            rewrite_context_scratch,
+            generation_pstate_scratch,
+            indirect_x15_scratch,
+            indirect_x30_scratch,
+            ..
+        } = fault_exit
+        else {
+            panic!("expected store-exclusive preamble fault, got {fault_exit:?}");
+        };
+        let mut recovered_fault = fault_snapshot;
+        assert!(matches!(
+            fixture
+                .translator
+                .finish_exit(
+                    &fixture.memory,
+                    &mut recovered_fault,
+                    prepared,
+                    super::PreparedExit { exit: fault_exit },
+                )
+                .expect("finish store-exclusive preamble fault"),
+            super::ThreadExit::Fault {
+                address: super::ThreadFaultAddress::Host(HostVa(1)),
+                ..
+            }
+        ));
+        let mut recovered_kick = fault_snapshot;
+        assert!(matches!(
+            fixture
+                .translator
+                .finish_exit(
+                    &fixture.memory,
+                    &mut recovered_kick,
+                    prepared,
+                    super::PreparedExit {
+                        exit: super::types::NativeDsrExit::Kick {
+                            resume,
+                            rewrite_scratch,
+                            rewrite_context_scratch,
+                            generation_pstate_scratch,
+                            indirect_x15_scratch,
+                            indirect_x30_scratch,
+                        },
+                    },
+                )
+                .expect("finish store-exclusive preamble kick"),
+            super::ThreadExit::Kick
+        ));
+        for recovered in [recovered_fault, recovered_kick] {
+            assert_eq!(recovered.pc, stxr_guest.raw());
+            assert_eq!(recovered.x[0], 42);
+            assert_eq!(recovered.x[1], fixture.guest_data.raw());
+            assert_eq!(recovered.x[2], u64::MAX);
+            assert_eq!(recovered.x[27], 1);
+        }
+        assert_eq!(unsafe { *(fixture.data_host.raw() as *const u64) }, 41);
+    }
+
+    let mut fixture =
+        biased_translator_fixture(&[0xc802_7c20, 0xd400_0001], GuestVa(0x20_0090_0000));
+    unsafe { *(fixture.data_host.raw() as *mut u64) = 41 };
+    let mut stack = vec![0_u8; 16 * 1024];
+    let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    snapshot.pc = fixture.guest_code.raw();
+    snapshot.x[0] = 99;
+    snapshot.x[1] = fixture.guest_data.raw();
+    snapshot.x[2] = 0;
+    let prepared = fixture
+        .translator
+        .prepare_entry::<false>(&fixture.memory, &snapshot)
+        .expect("prepare block-entry store-exclusive");
+    let exit = fixture
+        .translator
+        .enter_prepared::<false>(prepared, &mut snapshot)
+        .expect("enter block-entry store-exclusive");
+    assert!(matches!(
+        fixture
+            .translator
+            .finish_exit(&fixture.memory, &mut snapshot, prepared, exit)
+            .expect("finish block-entry store-exclusive"),
+        super::ThreadExit::Syscall { .. }
+    ));
+    assert_eq!(snapshot.x[2], 1);
+    assert_eq!(unsafe { *(fixture.data_host.raw() as *const u64) }, 41);
+}
 
 #[cfg(target_arch = "aarch64")]
 #[test]

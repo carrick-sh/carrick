@@ -1,4 +1,4 @@
-#![allow(dead_code)] // Emitted blocks enter the context gateway in Task 5.
+#![allow(dead_code)]
 
 use std::collections::BTreeMap;
 use std::sync::atomic::AtomicU64;
@@ -1770,9 +1770,8 @@ fn emit_block_inner(
     for instruction in &plan.instructions {
         let word = match instruction.action {
             InstAction::Copy(word) => word,
-            // Task 4 only types audited memory operations. Direct register-
-            // based emission remains byte-identical; mode-specialized lowering
-            // is Task 5. Preserve the existing relocated-literal lowering.
+            // Direct register-based emission remains byte-identical; biased
+            // mode materializes host addresses before the audited operation.
             InstAction::Memory(memory) => {
                 if let EmitAddressMode::Biased { host_bias } = mode {
                     emit_biased_memory(

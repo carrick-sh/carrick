@@ -758,6 +758,156 @@ impl ThreadTranslator {
         }
     }
 
+    #[cfg(test)]
+    fn patch_first_completed_recovery_for_test(
+        &mut self,
+        guest: carrick_guest_mem::GuestVa,
+        word: u32,
+    ) -> Result<carrick_guest_mem::HostVa, types::DsrError> {
+        let cache_pc = self
+            .recovery_points_for_test(guest)
+            .into_iter()
+            .find_map(|(cache_pc, action)| {
+                matches!(
+                    action,
+                    emit::RecoveryAction::RecoverBiasedMemory(recovery)
+                        if recovery.instruction_complete
+                )
+                .then_some(cache_pc)
+            })
+            .ok_or_else(|| {
+                types::DsrError::CachePolicy(format!(
+                    "no completed biased recovery instruction for guest PC 0x{:x}",
+                    guest.raw()
+                ))
+            })?;
+        self.patch_recovery_word_for_test(cache_pc, word)?;
+        Ok(cache_pc.host())
+    }
+
+    #[cfg(test)]
+    fn recovery_points_for_test(
+        &self,
+        guest: carrick_guest_mem::GuestVa,
+    ) -> Vec<(types::CacheVa, emit::RecoveryAction)> {
+        let state = self.process.state.lock();
+        state
+            .published
+            .iter()
+            .flat_map(|block| {
+                block.recovery.iter().filter_map(|recovery| {
+                    if !matches!(
+                        recovery.action,
+                        emit::RecoveryAction::RestoreScratch { .. }
+                            | emit::RecoveryAction::RestoreScratchCompleted { .. }
+                            | emit::RecoveryAction::CommitVirtualizedAndRestoreScratch { .. }
+                            | emit::RecoveryAction::RestoreScratchAndContext { .. }
+                            | emit::RecoveryAction::RestoreScratchAndContextCompleted { .. }
+                            | emit::RecoveryAction::CommitVirtualizedAndRestoreScratchAndContext {
+                                ..
+                            }
+                            | emit::RecoveryAction::RestoreDualVirtualReadOnly { .. }
+                            | emit::RecoveryAction::RestoreDualVirtualReadOnlyCompleted { .. }
+                            | emit::RecoveryAction::CommitDualVirtualAndRestore { .. }
+                            | emit::RecoveryAction::RecoverBiasedMemory(_)
+                    ) {
+                        return None;
+                    }
+                    let mapped_guest = block
+                        .map
+                        .iter()
+                        .find(|mapping| mapping.cache == recovery.cache)
+                        .map(|mapping| mapping.guest);
+                    if mapped_guest != Some(guest) {
+                        return None;
+                    }
+                    block
+                        .entry
+                        .host()
+                        .raw()
+                        .checked_add(recovery.cache.get() as usize)
+                        .map(carrick_guest_mem::HostVa)
+                        .map(types::CacheVa::published)
+                        .map(|cache_pc| (cache_pc, recovery.action))
+                })
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn patch_recovery_word_for_test(
+        &mut self,
+        cache_pc: types::CacheVa,
+        word: u32,
+    ) -> Result<(), types::DsrError> {
+        let mut state = self.process.state.lock();
+        let is_recovery = state.published.iter().any(|block| {
+            let start = block.entry.host().raw();
+            block.recovery.iter().any(|recovery| {
+                start
+                    .checked_add(recovery.cache.get() as usize)
+                    .is_some_and(|address| address == cache_pc.host().raw())
+            })
+        });
+        if !is_recovery {
+            return Err(types::DsrError::CachePolicy(format!(
+                "test patch target is not a recovery instruction: 0x{:x}",
+                cache_pc.host().raw()
+            )));
+        }
+        state.cache.patch_word_for_test(cache_pc, word)
+    }
+
+    #[cfg(test)]
+    fn instruction_points_for_test(
+        &self,
+        guest: carrick_guest_mem::GuestVa,
+    ) -> Vec<types::CacheVa> {
+        let state = self.process.state.lock();
+        state
+            .published
+            .iter()
+            .flat_map(|block| {
+                block.map.iter().filter_map(|mapping| {
+                    if mapping.guest != guest {
+                        return None;
+                    }
+                    block
+                        .entry
+                        .host()
+                        .raw()
+                        .checked_add(mapping.cache.get() as usize)
+                        .map(carrick_guest_mem::HostVa)
+                        .map(types::CacheVa::published)
+                })
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn patch_instruction_word_for_test(
+        &mut self,
+        cache_pc: types::CacheVa,
+        word: u32,
+    ) -> Result<(), types::DsrError> {
+        let mut state = self.process.state.lock();
+        let is_instruction = state.published.iter().any(|block| {
+            let start = block.entry.host().raw();
+            block.map.iter().any(|mapping| {
+                start
+                    .checked_add(mapping.cache.get() as usize)
+                    .is_some_and(|address| address == cache_pc.host().raw())
+            })
+        });
+        if !is_instruction {
+            return Err(types::DsrError::CachePolicy(format!(
+                "test patch target is not an emitted instruction: 0x{:x}",
+                cache_pc.host().raw()
+            )));
+        }
+        state.cache.patch_word_for_test(cache_pc, word)
+    }
+
     pub(super) fn profiling_enabled(&self) -> bool {
         self.profiling
     }

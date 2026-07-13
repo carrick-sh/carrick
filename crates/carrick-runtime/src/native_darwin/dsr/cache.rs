@@ -510,6 +510,26 @@ impl TranslationCache {
         unsafe { libc::pthread_jit_write_protect_np(1) };
         Ok(())
     }
+
+    #[cfg(test)]
+    pub(super) fn patch_word_for_test(
+        &mut self,
+        instruction: CacheVa,
+        word: u32,
+    ) -> Result<(), DsrError> {
+        let address = instruction.host().raw();
+        if !address.is_multiple_of(4) || !self.contains_host_pc(HostVa(address)) {
+            return Err(DsrError::CachePolicy(format!(
+                "test patch address is outside published cache: 0x{address:x}"
+            )));
+        }
+        unsafe { libc::pthread_jit_write_protect_np(0) };
+        let instruction = unsafe { &*(address as *const AtomicU32) };
+        instruction.store(word, Ordering::Release);
+        unsafe { super::super::carrick_native_clear_icache(address as *mut _, 4) };
+        unsafe { libc::pthread_jit_write_protect_np(1) };
+        Ok(())
+    }
 }
 
 impl Drop for TranslationCache {
@@ -607,6 +627,23 @@ mod generation_tests {
                 capacity
             } if requested == capacity + 4
         ));
+    }
+
+    #[test]
+    fn translation_cache_test_patch_replaces_a_published_word() {
+        let mut cache = super::TranslationCache::new(16 * 1024).expect("translation cache");
+        let mut writer = cache.begin_write(4).expect("reserve test word");
+        writer.write_words(&[0xd503_201f]).expect("write nop");
+        let published = writer.publish().expect("publish nop");
+
+        cache
+            .patch_word_for_test(published.entry(), 0xd420_0000)
+            .expect("patch published word");
+
+        assert_eq!(
+            unsafe { *(published.entry().host().raw() as *const u32) },
+            0xd420_0000
+        );
     }
 
     #[derive(Clone, Copy, Debug)]
