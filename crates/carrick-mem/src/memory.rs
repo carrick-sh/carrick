@@ -2822,6 +2822,21 @@ pub fn el1_vectors_bytes_mailbox(identity_fast_path: bool) -> Vec<u8> {
     );
     emit(&mut bytes, &mut cursor, enc_movz_w16(1));
     emit(&mut bytes, &mut cursor, AARCH64_STLR_W16_X17_OPCODE);
+    // The request used x16/x17 as publication scratch. Put the guest's original
+    // values back into the live register file before trapping so a normal mailbox
+    // response can preserve them without any host register API calls. Exceptional
+    // host paths may replace them; the continuation snapshots whichever values
+    // are live after HVC into the resume fields below.
+    emit(
+        &mut bytes,
+        &mut cursor,
+        enc_ldr_xt_sp(16, AARCH64_SYSCALL_MAILBOX_OFF_RESUME_X16),
+    );
+    emit(
+        &mut bytes,
+        &mut cursor,
+        enc_ldr_xt_sp(17, AARCH64_SYSCALL_MAILBOX_OFF_RESUME_X17),
+    );
     emit(&mut bytes, &mut cursor, AARCH64_HVC_SYSCALL_OPCODE);
 
     emit(
@@ -4053,6 +4068,8 @@ mod syscall_mailbox_tests {
             .iter()
             .position(|word| *word == AARCH64_HVC_SYSCALL_OPCODE)
             .expect("request hvc");
+        assert_eq!(decode_ldr_x_sp(words[hvc - 2]), Some((16, 168)));
+        assert_eq!(decode_ldr_x_sp(words[hvc - 1]), Some((17, 176)));
         assert_eq!(decode_str_x_sp(words[hvc + 1]), Some((16, 168)));
         assert_eq!(decode_str_x_sp(words[hvc + 2]), Some((17, 176)));
         assert!(words[hvc + 3..].contains(&AARCH64_LDAR_W16_X17_OPCODE));

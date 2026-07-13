@@ -935,26 +935,11 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
         // `eret` already consumed ELR_EL1 (= svc+4), so we do NOT re-advance the
         // PC — we just write x0 (and restore x9, below).
         self.pending_resume_pc = None;
-        // Write the syscall result into x0. The guest resume PC is already correct:
-        // ELR_EL1 (= svc+4) was latched by the exception and is restored by the EL1
-        // vector's `eret`. We must NOT advance it again, or the instruction after
-        // the `svc` would be skipped.
-        self.vcpu.set_reg(Reg::X(0), return_value as u64)?;
-        // Restore the guest's x9 IFF this backend's trap vehicle clobbered it. The
-        // Linux aarch64 syscall ABI preserves x1..x30 across an `svc`, and musl
-        // relies on it (`__expand_heap` holds its malloc-context pointer in x9 across
-        // `brk(2)` and then `str x10, [x9, #920]`). KVM's EL1 sentinel vector clobbers
-        // x9 as the sentinel-store scratch, so it stashes the guest's x9 in a scratch
-        // sysreg (TPIDR_EL1, free at EL0) and returns it as `Some` here. HVF's `hvc #2`
-        // vehicle clobbers NO GPR (x9 stays live in the register file), so it returns
-        // `None` and we must NOT write x9 — a blanket `set_reg(X9, 0)` would DESTROY
-        // the guest's live malloc-context pointer and fault it at `[0 + 920]`
-        // (=0x398), the alpine/musl dynamic-binary crash. (glibc never held a live x9
-        // across an svc, which masked even the KVM case until alpine/musl.)
-        if let Some(saved_x9) = self.vcpu.get_saved_x9()? {
-            self.vcpu.set_reg(Reg::X(9), saved_x9)?;
-        }
-        Ok(())
+        // The backend owns the completion vehicle. KVM's default writes x0 and
+        // restores its sentinel-clobbered x9; HVF mailbox mode release-publishes
+        // the return payload without register calls. ELR_EL1 already points past
+        // the SVC, so neither path advances PC here.
+        self.vcpu.complete_syscall_return(return_value)
     }
 
     fn is_forked_child(&self) -> bool {
@@ -1194,7 +1179,7 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
         // The fault ESR is only valid between fault and delivery; clear it so a
         // later async signal doesn't reuse a stale synchronous-fault syndrome.
         self.last_fault_esr = 0;
-        Ok(())
+        self.vcpu.prepare_register_resume()
     }
 
     fn restore_from_sigframe(&mut self) -> Result<u64, TrapError> {
@@ -1202,6 +1187,7 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
         // saved_pc — mirroring the per-backend impls.
         let fpsimd = self.vm.fpsimd_enabled();
         let r = <Self as ThreadedEngine>::Arch::restore_sigframe(self, fpsimd)?;
+        self.vcpu.prepare_register_resume()?;
         Ok(r.sigmask)
     }
 }

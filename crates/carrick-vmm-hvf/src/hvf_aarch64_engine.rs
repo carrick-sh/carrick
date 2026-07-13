@@ -37,7 +37,7 @@ use carrick_guest_mem::{GuestVa, MemoryError, SharedFutexLocation};
 use carrick_hal::{GuestEntryRegs, GuestVmBackend, Reg, SlotId, SysReg, TrapError, VcpuRegistry};
 use carrick_mem::memory::AddressSpace;
 
-use crate::syscall_mailbox::MailboxBinding;
+use crate::syscall_mailbox::{HvfSyscallTransport, MailboxBinding};
 use crate::trap::{
     GuestMappingPlan, HvfInner, HvfVmState, ThreadSpec, VcpuSnapshot, hvf_get_reg, hvf_get_sys_reg,
     hvf_set_reg, hvf_set_sys_reg, set_simd_fp_reg_v,
@@ -231,6 +231,42 @@ impl Aarch64Vcpu for HvfAarch64Vcpu {
         Ok(None)
     }
 
+    fn complete_syscall_return(&mut self, return_value: i64) -> Result<(), TrapError> {
+        match self.mailbox.transport() {
+            HvfSyscallTransport::Mailbox => {
+                self.mailbox
+                    .publish_normal_return(return_value)
+                    .map_err(|error| {
+                        let diagnostics = self.mailbox.diagnostics();
+                        TrapError::Hypervisor(format!(
+                            "mailbox return publication failed: {error}; diagnostics={diagnostics:?}; attempted_return={return_value}"
+                        ))
+                    })
+            }
+            HvfSyscallTransport::Legacy => {
+                hvf_set_reg(&self.inner, carrick_hal::Reg::X(0), return_value as u64)
+                    .map_err(os_to_trap)?;
+                self.mailbox
+                    .publish_registers_prepared()
+                    .map_err(|error| {
+                        TrapError::Hypervisor(format!(
+                            "legacy mailbox return publication failed: {error}"
+                        ))
+                    })
+            }
+        }
+    }
+
+    fn prepare_register_resume(&mut self) -> Result<(), TrapError> {
+        self.mailbox
+            .publish_register_resume_if_outstanding()
+            .map_err(|error| {
+                TrapError::Hypervisor(format!(
+                    "mailbox register-resume publication failed: {error}"
+                ))
+            })
+    }
+
     fn stamp_guest_thread_id(&self, tid: u64) -> Result<(), TrapError> {
         use applevisor::prelude::SysReg;
         // HVF's `gettid` fast path reads CONTEXTIDR_EL1 (serviced at EL1, no
@@ -244,7 +280,7 @@ impl Aarch64Vcpu for HvfAarch64Vcpu {
     }
 
     fn run(&mut self) -> Result<Aarch64Exit, TrapError> {
-        HvfInner::run_to_exit(&mut self.inner)
+        HvfInner::run_to_exit(&mut self.inner, &mut self.mailbox)
     }
 
     fn kick(&self) -> Result<(), TrapError> {
