@@ -45,6 +45,11 @@ start. Smoke/full membership remains authoritative in
 | 2026-07-13 | `2a7d3046` | Node-sized split Direct range reducer | 1 | RED `Redirected` to `0x7000000000`; GREEN segment-wise | `host_proc::imp::direct_vm_reservation_tests::fork_child_split_canonical_range_is_accepted_segmentwise` | Measured target crosses adjacent delegated dyld-empty regions, not one region plus a vacant tail. Every genuine gap is now owned exactly. |
 | 2026-07-13 | `2a7d3046` | `ltp-eventfd01` isolated | 1 | MATCH; carrick 4/4, oracle 4/4 | `target/conformance/native-direct-reservation-eventfd01-mach2-060.jsonl` | Originating gzip exec collision is fixed end-to-end. |
 | 2026-07-13 | `2a7d3046` | Node app/V8 smoke isolated | 1 | 2 REGRESSION; both complete wrapper and abort `rc=134`, no reservation collision | `target/conformance/native-direct-reservation-node-mach2-060.jsonl` | Direct reducer reaches Node startup assertion on `uv_thread_create`; this is the P1 post-fork thread rejection, not a mapping failure. |
+| 2026-07-13 | worktree | `forkexecpthread` staged reducer | 1 | Production RED: stage2 reached, `pthread_create_errno=11`; unsafe diagnostic GREEN; Docker GREEN | `conformance-probes/src/bin/forkexecpthread.rs` | The blanket guard is real, but one post-fork pthread is not enough to prove Apple runtime safety. |
+| 2026-07-13 | worktree | Node app/V8 with unsafe post-fork threads | 1 | app REGRESSION; V8 MATCH | `target/conformance/native-postfork-node-unsafe.jsonl` | V8 closes its originating `uv_thread_create` failure. App reaches a repeatable host `SIGTRAP` inside libdispatch. |
+| 2026-07-13 | worktree | Go build/runtime/sync with unsafe post-fork threads | 1 | build TIMEOUT; runtime CARRICK_CRASH 17/18; sync REGRESSION 51/52 | `target/conformance/native-postfork-go-unsafe.jsonl` | Subprocess tests reach the same libdispatch trap. Runtime also exposes a separate user-arena memory fault for P2 triage. |
+| 2026-07-13 | worktree | CPython threading with unsafe post-fork threads | 1 | REGRESSION; 174/194 pass, 20 fail, 1 skip; 21 fatal trap records | `target/conformance/native-postfork-cpython-threading-unsafe.jsonl` | Unsafe thread creation replaces `EOPNOTSUPP` with deterministic libdispatch failures; not a viable production repair. |
+| 2026-07-13 | worktree | common host-trap symbolication | 1 | PC `0x1877f2410` = libdispatch deduplicated trap +36; LR `0x1877be4b8` = `_dispatch_sema4_wait+56` | `target/conformance/raw/conf-{63249,64365,69065}-*.err` | Apple libdispatch fork-of-multithreaded-parent state is the first common failure boundary. Select PID-preserving host self-reexec. |
 
 ## Active failure clusters
 
@@ -52,7 +57,7 @@ start. Smoke/full membership remains authoritative in
 | ---: | --- | --- | --- | --- |
 | P0 | `THREAD_WAITERS` remains locked in a fork child | live LLDB stack plus deterministic contended-fork reducer | fixed in `6d3cf627`; four signed single-suite runs complete, multi-suite load proof pending | no CPython timeout in workers=4 smoke repeats |
 | P0 | Direct-exec target reservation rejects split dyld range | red/green Node-sized reducer plus signed eventfd/Node runs | fixed in `2a7d3046`; eventfd MATCH, Node reaches downstream thread guard; multi-suite load proof pending | no reservation collision in workers=4 smoke repeats |
-| P1 | Post-fork exec child cannot create guest threads | Go/CPython raw output and explicit runtime guard | deliberate rejection; architecture repair required | `execthreads`, `go-build`, Go runtime/sync, CPython threading/subprocess all complete |
+| P1 | Post-fork exec child cannot create guest threads | red/green staged reducer plus Node/Go/CPython unsafe samples and libdispatch symbolication | one pthread can start, but real subprocesses trap in inherited libdispatch state; self-reexec architecture selected | `forkexecpthread`, Node, Go, and CPython run after PID-preserving host self-reexec |
 | P2 | Remaining ecosystem/LTP differences | no fresh full native run yet | unknown | classify from measured full run after P0/P1 blockers clear |
 
 ## Bless checklist
@@ -74,9 +79,7 @@ start. Smoke/full membership remains authoritative in
 
 ## Current next action
 
-Write and execute the P1 post-fork thread lifecycle plan. Keep the production
-guard fail-closed while the diagnostic bypass captures the minimal
-fork-exec-`pthread_create` and Node `uv_thread_create` paths. Repair Carrick-owned
-copied state when evidence permits; escalate to PID-preserving self-reexec if
-Apple runtime state remains irreparable. After P1, run multi-suite smoke at four
+Write the measured PID-preserving self-reexec design and implementation plan.
+Keep the production guard fail-closed and retain the exact-value diagnostic
+only until the handoff path replaces it. After P1, run multi-suite smoke at four
 workers to provide the actual load proof for both P0 fixes.
