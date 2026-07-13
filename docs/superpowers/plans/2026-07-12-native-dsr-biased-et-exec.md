@@ -188,12 +188,16 @@ Use aligned deterministic candidates:
 
 ```rust
 const BIAS_CANDIDATES: [u64; 4] = [
-    0x10_0000_0000,
-    0x20_0000_0000,
-    0x30_0000_0000,
-    0x40_0000_0000,
+    0x80_0000_0000,
+    0xc0_0000_0000,
+    0x100_0000_0000,
+    0x140_0000_0000,
 ];
 ```
+
+These are 512, 768, 1024, and 1280 GiB. They deliberately start above
+Darwin's measured 63–448 GiB reserved VA hole; lower candidates cannot be
+acquired even when otherwise vacant.
 
 Validate ELF/interpreter segments, stack, heap, mmap arena, vDSO/vvar, trampoline, and address overflow under each candidate. Change initial `map_region`, `map_bytes_region`, and `map_anonymous_region` ownership to accept `NativeAddressMode`. Permit later `MAP_FIXED` only inside a recorded owned interval.
 
