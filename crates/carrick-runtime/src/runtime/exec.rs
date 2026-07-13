@@ -81,15 +81,9 @@ pub(crate) fn load_execve_image(
         dispatcher.read_exec_file(p).or_else(|| host_read(p))
     })
     .map_err(|_| LINUX_ENOEXEC)?;
-    // Mirror the boot builder: the syscall shim installs the identity-fast-path
-    // EL1 vectors + the kernel-hole identity page (see finish_and_run_image).
-    let vectors_and_id = |a: AddressSpace| -> Result<AddressSpace, AddressSpaceError> {
-        if crate::syscall_shim_enabled() {
-            a.with_el1_vectors_shim()?.with_identity_page()
-        } else {
-            a.with_el1_vectors()
-        }
-    };
+    // Mirror the boot builder exactly: execve retains the macOS/HVF mailbox
+    // transport and the feature-gated identity fast path selected for the
+    // container. Native DSR and non-macOS VMMs use different lifecycle modules.
     let mut staged = raw.with_vdso_auxv(vdso_enabled_for_debug());
     if needs_at_base {
         staged = staged.with_auxv_base(ROSETTA_AT_BASE_PLACEHOLDER);
@@ -101,7 +95,7 @@ pub(crate) fn load_execve_image(
     let linux_page_size = dispatcher.linux_page_size();
     let image = staged
         .with_el0_trampoline_bytes(HvfArch::entry_trampoline_bytes())
-        .and_then(vectors_and_id)
+        .and_then(with_hvf_syscall_mailbox)
         .and_then(|a| a.with_stage1_page_tables())
         .and_then(with_optional_vdso::<HvfArch>)
         .and_then(|a| {
