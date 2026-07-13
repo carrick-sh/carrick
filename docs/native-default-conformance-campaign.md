@@ -68,6 +68,14 @@ start. Smoke/full membership remains authoritative in
 
 ## Current next action
 
-Write the red-first implementation plan for the contended-fork registry and
-exact Direct reservation slices. Keep the post-fork thread guard fail-closed
-until the diagnostic lifecycle experiment is captured and classified.
+Execute the two approved, independent P0 plans:
+
+1. [`native-fork-waiter-reset`](superpowers/plans/2026-07-13-native-fork-waiter-reset.md)
+   pins the copied-contention mechanism red, installs a fork-resettable waiter
+   backing, and repeats the originating CPython lane under load.
+2. [`native-direct-exec-reservation`](superpowers/plans/2026-07-13-native-direct-exec-reservation.md)
+   pins the split-range collision red, switches to exact non-overwriting Mach
+   allocation, and repeats the originating Node/eventfd lanes under load.
+
+Keep the post-fork thread guard fail-closed until these P0 fixes land and the
+diagnostic lifecycle experiment is captured and classified.
