@@ -1,13 +1,16 @@
 //! Darwin-native execution backend.
 //!
-//! Same-ISA Linux ELFs are loaded into a forked host child, their `svc #0`
-//! instructions are patched to synchronous `brk` traps, and those traps are
-//! dispatched through the existing Linux syscall layer. OCI/container setup is
-//! shared with the other runtime backends; this module owns only image loading
-//! details and the native run loop. Unsupported dispatcher outcomes fail
+//! Same-ISA Linux ELFs are loaded into a forked host child and execute only as
+//! DSR-translated native code. DSR gateways dispatch Linux syscalls through the
+//! existing syscall layer; guest code is never executed directly. OCI/container
+//! setup is shared with the other runtime backends, while this module owns image
+//! loading and the native run loop. Unsupported dispatcher outcomes fail
 //! explicitly rather than falling back to HVF.
 
+mod address;
 mod dsr;
+
+use address::NativeAddressMode;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
@@ -5145,6 +5148,9 @@ fn emulate_linux4k_guarded_fault(
 }
 
 struct NativeMappedMemory {
+    // Task 1 establishes ownership; later biased-mapping tasks consume it.
+    #[allow(dead_code)]
+    address_mode: NativeAddressMode,
     regions: Vec<NativeMappedRegion>,
     protections: MemoryProtections,
     native_page_protections: BTreeMap<u64, u64>,
@@ -5461,6 +5467,7 @@ impl NativeMappedMemory {
             protections.set_no_write(span.start, len, true);
         }
         let memory = Self {
+            address_mode: NativeAddressMode::Direct,
             regions,
             protections,
             native_page_protections: BTreeMap::new(),
@@ -8125,6 +8132,7 @@ mod tests {
         let stack_start = stack.as_mut_ptr() as u64;
         let stack_end = stack_start + stack.len() as u64;
         let mut memory = NativeMappedMemory {
+            address_mode: NativeAddressMode::Direct,
             regions: vec![NativeMappedRegion {
                 start: stack_start,
                 end: stack_end,
@@ -8255,6 +8263,7 @@ mod tests {
         let stack_start = stack.as_mut_ptr() as u64;
         let stack_end = stack_start + stack.len() as u64;
         let mut memory = NativeMappedMemory {
+            address_mode: NativeAddressMode::Direct,
             regions: vec![NativeMappedRegion {
                 start: stack_start,
                 end: stack_end,
