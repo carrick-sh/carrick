@@ -55,7 +55,7 @@ pub struct ResourceUsage {
 #[derive(Debug)]
 pub enum DirectVmReservationOutcome {
     Reserved(DirectVmReservation),
-    DelegatedDyldSharedPmapCow,
+    DelegatedDyldSharedPmapEmpty,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,7 +181,7 @@ mod imp {
     const VM_REGION_BASIC_INFO_COUNT_64: u32 = 9;
     const VM_REGION_EXTENDED_INFO: i32 = 13;
     const VM_MEMORY_SHARED_PMAP: u32 = 32;
-    const SM_COW: u8 = 3;
+    const SM_EMPTY: u8 = 3;
 
     #[repr(C)]
     #[derive(Default)]
@@ -692,7 +692,7 @@ mod imp {
 
     /// Acquire one future Direct interval without overwriting any host mapping.
     /// A redirected nonfixed mmap is accepted only when both Mach region
-    /// flavors identify the measured dyld delegated shared-pmap COW covering
+    /// flavors identify the measured dyld delegated shared-pmap empty covering
     /// entry. Every other redirect is a collision.
     #[allow(deprecated)] // libc::mach_task_self_ is the stable self-task port here.
     pub fn reserve_self_direct_vm_range(
@@ -818,9 +818,9 @@ mod imp {
             && !shared
             && reserved
             && extended.user_tag == VM_MEMORY_SHARED_PMAP
-            && extended.share_mode == SM_COW
+            && extended.share_mode == SM_EMPTY
         {
-            return Ok(DirectVmReservationOutcome::DelegatedDyldSharedPmapCow);
+            return Ok(DirectVmReservationOutcome::DelegatedDyldSharedPmapEmpty);
         }
 
         Err(DirectVmReservationError::Occupied {
@@ -875,7 +875,7 @@ mod imp {
                     .expect("reserve exact allocatable interval")
                 {
                     DirectVmReservationOutcome::Reserved(guard) => guard,
-                    DirectVmReservationOutcome::DelegatedDyldSharedPmapCow => {
+                    DirectVmReservationOutcome::DelegatedDyldSharedPmapEmpty => {
                         panic!("ordinary scratch interval was classified as delegated")
                     }
                 };
@@ -901,12 +901,12 @@ mod imp {
         }
 
         #[test]
-        fn canonical_dyld_delegated_tuple_is_accepted() {
+        fn canonical_dyld_delegated_empty_tuple_is_accepted() {
             fork_test(|| {
                 assert!(matches!(
                     reserve_self_direct_vm_range(0x4_0000_0000, PAGE as u64)
                         .expect("classify canonical dyld gap"),
-                    DirectVmReservationOutcome::DelegatedDyldSharedPmapCow
+                    DirectVmReservationOutcome::DelegatedDyldSharedPmapEmpty
                 ));
             });
         }

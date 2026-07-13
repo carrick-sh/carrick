@@ -5877,10 +5877,12 @@ impl NativeMappedMemory {
             plan.page_geometry.host_page_size,
         )
         .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
-        let target_only = if matches!(native_layout.address_mode(), NativeAddressMode::Direct) {
-            subtract_host_ranges(native_layout.owned_ranges(), &self.owned_host_ranges)
-        } else {
-            Vec::new()
+        let target_only = match (self.address_mode, native_layout.address_mode()) {
+            (NativeAddressMode::Direct, NativeAddressMode::Direct) => {
+                subtract_host_ranges(native_layout.owned_ranges(), &self.owned_host_ranges)
+            }
+            (_, NativeAddressMode::Direct) => native_layout.owned_ranges().to_vec(),
+            (_, NativeAddressMode::Biased { .. }) => Vec::new(),
         };
         let mut direct_target_reservations = Vec::with_capacity(target_only.len());
         let reset_inherited_translator =
@@ -5896,7 +5898,7 @@ impl NativeMappedMemory {
         // This is the final pre-PONR screen. The layout, target-only range
         // vector, reservation-vector capacity, and replacement MAP_JIT cache
         // are all allocated first. Each allocatable interval becomes an exact
-        // PROT_NONE guard; only the measured dyld delegated shared-pmap COW
+        // PROT_NONE guard; only the measured dyld delegated shared-pmap empty
         // covering tuple may proceed without one. No allocator or mmap may run
         // after this loop before old-image retirement.
         for range in &target_only {
@@ -5917,7 +5919,7 @@ impl NativeMappedMemory {
                 crate::host_proc::DirectVmReservationOutcome::Reserved(reservation) => {
                     direct_target_reservations.push(reservation);
                 }
-                crate::host_proc::DirectVmReservationOutcome::DelegatedDyldSharedPmapCow => {}
+                crate::host_proc::DirectVmReservationOutcome::DelegatedDyldSharedPmapEmpty => {}
             }
         }
         Ok(PreparedNativeExecMapping {
@@ -8396,6 +8398,45 @@ mod tests {
     #[test]
     fn direct_source_rejects_direct_target_only_collision_before_retirement() {
         assert_direct_target_collision_is_prevalidated(LifecycleImageKind::DirectPie);
+    }
+
+    #[test]
+    fn biased_source_owned_host_interval_is_not_transferable_to_direct_target() {
+        fork_test(|| {
+            let plan = native16k_test_plan();
+            let source = lifecycle_image(LifecycleImageKind::LowExec, 0x4b);
+            let memory = NativeMappedMemory::map(
+                &source,
+                native_memory_layout(),
+                plan.page_geometry.host_page_size,
+                plan.page_geometry.linux_page_size,
+            )
+            .expect("map biased source image");
+            let source_guest = source.regions()[0].start;
+            let source_host = memory
+                .host_address(carrick_guest_mem::GuestVa(source_guest))
+                .expect("translate biased source image")
+                .raw() as u64;
+            assert!(source_host >= NATIVE_DARWIN_HARD_PAGEZERO_END);
+            let target = lifecycle_image_at(source_host, 0x72);
+
+            let error = memory
+                .prepare_exec_mapping(&target, &plan)
+                .err()
+                .expect("biased source ownership cannot transfer to a Direct target");
+            assert!(
+                error
+                    .to_string()
+                    .contains("native direct VM reservation collision"),
+                "unexpected error: {error}"
+            );
+            assert_eq!(
+                memory
+                    .read_bytes(source_guest + 0x80, 1)
+                    .expect("old biased image survives target screening"),
+                [0x4b]
+            );
+        });
     }
 
     #[test]
