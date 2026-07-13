@@ -42,13 +42,16 @@ start. Smoke/full membership remains authoritative in
 | 2026-07-13 | `6d3cf627` | contended `THREAD_WAITERS` fork reducer | 1 | RED at 2 s before fix; GREEN in 0.07 s after fix | `host_signal::tests::fork_child_resets_contended_thread_waiters` | Deterministically proved copied parking-lot contention. Child now publishes a preallocated empty backing without touching the inherited queue. |
 | 2026-07-13 | `6d3cf627` | `cpython-threading` isolated | 1 | REGRESSION; 175/194 pass, 19 fail, 1 skip; no timeout/crash | `target/conformance/native-waiter-cpython-threading-serial.jsonl` | Originating 300 s waiter timeout is gone. Remaining failures are the separately tracked post-fork thread rejection. |
 | 2026-07-13 | `6d3cf627` | `cpython-threading` repeat stability | configured 4; 1 selected suite | 3/3 REGRESSION; each 175/194 pass, 19 fail, 1 skip; no timeout/crash | `target/conformance/native-waiter-cpython-threading-repeat-r{1,2,3}.jsonl` | Repeat-stable single-suite result. Not counted as concurrent load evidence; multi-suite smoke remains required. |
+| 2026-07-13 | `2a7d3046` | Node-sized split Direct range reducer | 1 | RED `Redirected` to `0x7000000000`; GREEN segment-wise | `host_proc::imp::direct_vm_reservation_tests::fork_child_split_canonical_range_is_accepted_segmentwise` | Measured target crosses adjacent delegated dyld-empty regions, not one region plus a vacant tail. Every genuine gap is now owned exactly. |
+| 2026-07-13 | `2a7d3046` | `ltp-eventfd01` isolated | 1 | MATCH; carrick 4/4, oracle 4/4 | `target/conformance/native-direct-reservation-eventfd01-mach2-060.jsonl` | Originating gzip exec collision is fixed end-to-end. |
+| 2026-07-13 | `2a7d3046` | Node app/V8 smoke isolated | 1 | 2 REGRESSION; both complete wrapper and abort `rc=134`, no reservation collision | `target/conformance/native-direct-reservation-node-mach2-060.jsonl` | Direct reducer reaches Node startup assertion on `uv_thread_create`; this is the P1 post-fork thread rejection, not a mapping failure. |
 
 ## Active failure clusters
 
 | Priority | Cluster | Authority | Current status | Target |
 | ---: | --- | --- | --- | --- |
 | P0 | `THREAD_WAITERS` remains locked in a fork child | live LLDB stack plus deterministic contended-fork reducer | fixed in `6d3cf627`; four signed single-suite runs complete, multi-suite load proof pending | no CPython timeout in workers=4 smoke repeats |
-| P0 | Direct-exec target reservation rejects split dyld range | native smoke raw logs for gzip and Node | root cause localized; no fix yet | exact non-overwriting reservation plus Node/gzip live passes |
+| P0 | Direct-exec target reservation rejects split dyld range | red/green Node-sized reducer plus signed eventfd/Node runs | fixed in `2a7d3046`; eventfd MATCH, Node reaches downstream thread guard; multi-suite load proof pending | no reservation collision in workers=4 smoke repeats |
 | P1 | Post-fork exec child cannot create guest threads | Go/CPython raw output and explicit runtime guard | deliberate rejection; architecture repair required | `execthreads`, `go-build`, Go runtime/sync, CPython threading/subprocess all complete |
 | P2 | Remaining ecosystem/LTP differences | no fresh full native run yet | unknown | classify from measured full run after P0/P1 blockers clear |
 
@@ -71,11 +74,9 @@ start. Smoke/full membership remains authoritative in
 
 ## Current next action
 
-Execute the remaining independent P0 plan,
-[`native-direct-exec-reservation`](superpowers/plans/2026-07-13-native-direct-exec-reservation.md):
-pin the split-range collision red, switch to exact non-overwriting Mach
-allocation, and repeat the originating Node/eventfd lanes. Then run multi-suite
-smoke at four workers to provide the actual load proof for both P0 fixes.
-
-Keep the post-fork thread guard fail-closed until these P0 fixes land and the
-diagnostic lifecycle experiment is captured and classified.
+Write and execute the P1 post-fork thread lifecycle plan. Keep the production
+guard fail-closed while the diagnostic bypass captures the minimal
+fork-exec-`pthread_create` and Node `uv_thread_create` paths. Repair Carrick-owned
+copied state when evidence permits; escalate to PID-preserving self-reexec if
+Apple runtime state remains irreparable. After P1, run multi-suite smoke at four
+workers to provide the actual load proof for both P0 fixes.
