@@ -154,7 +154,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 pid: carrick_spec::PidMode::Private,
                 detach: false,
                 forward_env: vec![],
-                exec_backend: carrick_spec::ExecBackendRequest::Auto,
+                exec_backend: carrick_spec::ExecBackendRequest::Native,
                 native_page_profile: carrick_spec::NativePageProfileRequest::Auto,
                 command: vec!["/bin/sh".to_owned()],
             }

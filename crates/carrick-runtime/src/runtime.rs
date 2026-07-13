@@ -408,7 +408,7 @@ where
         options.native_page_profile,
     )?;
     match plan.backend {
-        crate::page_profile::ExecutionBackend::Hvf => {
+        crate::page_profile::ExecutionBackend::Vmm => {
             run_static_elf_with_hvf_args_and_dispatcher_debug(
                 path,
                 dispatcher,
