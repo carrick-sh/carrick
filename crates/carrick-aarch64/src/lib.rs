@@ -26,6 +26,7 @@
 #![allow(clippy::too_many_arguments)]
 
 pub mod engine;
+pub mod mailbox;
 pub mod vmm;
 
 pub use engine::Aarch64EngineCore;
