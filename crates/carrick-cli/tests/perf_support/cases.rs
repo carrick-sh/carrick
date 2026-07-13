@@ -259,6 +259,21 @@ pub const CASES: &[PerfCase] = &[
         carrick_fs_mode: "host",
         cross_boundary: false,
     },
+    // Latency (lower better): fork→child exit→reap without exec.
+    PerfCase {
+        probe: "perf_fork",
+        artifact: PerfArtifact::StaticMusl,
+        dimension: "process",
+        workload: "fork",
+        guest_args: &[],
+        backend_pair_support: BackendPairSupport::DirectElf,
+        metric_key: "fork_p50_us",
+        unit: "us",
+        higher_is_better: false,
+        mount_scratch: false,
+        carrick_fs_mode: "host",
+        cross_boundary: false,
+    },
     // Latency (lower better): end-to-end process spawn — fork→execve(self)→exit
     // →reap per rep. carrick must fork the guest-carrying process, stand up a
     // fresh guest for the exec'd image, and reap it, vs docker's in-kernel
@@ -272,6 +287,37 @@ pub const CASES: &[PerfCase] = &[
         guest_args: &[],
         backend_pair_support: BackendPairSupport::DirectElf,
         metric_key: "fork_exec_p50_us",
+        unit: "us",
+        higher_is_better: false,
+        mount_scratch: false,
+        carrick_fs_mode: "host",
+        cross_boundary: false,
+    },
+    // Latency (lower better): fork from an otherwise unscaled process. Explicit
+    // argv keeps the sampled shape identical across both direct backends.
+    PerfCase {
+        probe: "perf_fork_scale",
+        artifact: PerfArtifact::StaticMusl,
+        dimension: "process",
+        workload: "fork_scale_0m",
+        guest_args: &["0", "0"],
+        backend_pair_support: BackendPairSupport::DirectElf,
+        metric_key: "fork_p50_us",
+        unit: "us",
+        higher_is_better: false,
+        mount_scratch: false,
+        carrick_fs_mode: "host",
+        cross_boundary: false,
+    },
+    // Same fork shape with 256 MiB resident and touched before sampling.
+    PerfCase {
+        probe: "perf_fork_scale",
+        artifact: PerfArtifact::StaticMusl,
+        dimension: "process",
+        workload: "fork_scale_256m",
+        guest_args: &["0", "256"],
+        backend_pair_support: BackendPairSupport::DirectElf,
+        metric_key: "fork_p50_us",
         unit: "us",
         higher_is_better: false,
         mount_scratch: false,
