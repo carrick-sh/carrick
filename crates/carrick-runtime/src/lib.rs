@@ -135,8 +135,27 @@ pub mod interactive_supervisor;
 pub mod layer_cache;
 pub mod namespace;
 pub(crate) mod native_darwin;
+#[cfg(target_os = "macos")]
+pub(crate) mod native_exec_capsule;
 pub mod network;
 pub mod page_profile;
+
+/// Execute the transport-only PID preservation diagnostic for the private
+/// native self-reexec path. This is intentionally exposed only as a narrow
+/// function rather than publishing the internal capsule schema.
+#[cfg(target_os = "macos")]
+pub fn native_self_reexec_pid_probe() -> anyhow::Result<()> {
+    native_exec_capsule::begin_pid_probe()
+}
+
+/// Consume a private native self-reexec PID probe capsule.
+#[cfg(target_os = "macos")]
+pub fn resume_native_self_reexec_pid_probe(
+    capsule_fd: i32,
+    nonce: &str,
+) -> anyhow::Result<(u32, u32)> {
+    native_exec_capsule::resume_pid_probe(capsule_fd, nonce)
+}
 // `linux_abi` was lifted into the leaf crate `carrick-abi` (build-graph split,
 // docs/archive/build-decomposition-design.md §3.A-A1). Re-exported under the original
 // path so every `crate::linux_abi::…` / `carrick_runtime::linux_abi::…` site is

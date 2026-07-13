@@ -163,6 +163,19 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
     };
 
     match command {
+        #[cfg(feature = "platform-macos")]
+        Commands::NativeExecPidProbe => {
+            carrick_runtime::native_self_reexec_pid_probe()?;
+            anyhow::bail!("native self-reexec unexpectedly returned successfully")
+        }
+        #[cfg(feature = "platform-macos")]
+        Commands::NativeExecResume { capsule_fd, nonce } => {
+            let (before, after) =
+                carrick_runtime::resume_native_self_reexec_pid_probe(capsule_fd, &nonce)?;
+            println!("native_self_reexec_pid_before={before}");
+            println!("native_self_reexec_pid_after={after}");
+            println!("native_self_reexec_pid_preserved={}", before == after);
+        }
         Commands::InspectElf { path } => {
             let metadata = inspect_elf(&path)
                 .with_context(|| format!("failed to inspect {}", path.display()))?;
