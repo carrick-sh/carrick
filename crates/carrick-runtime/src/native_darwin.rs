@@ -3611,8 +3611,9 @@ fn handle_native_fork(
     // (`forked_stale` in NativeThreadRuntime::drop).
     let fork_signal_locks = crate::host_signal::hold_signal_locks_for_fork();
     let child = unsafe { libc::fork() };
-    // Both branches: the forking thread (the sole survivor in the child) owns
-    // the guards and must release them before any signal-static use below.
+    // Both branches: drop the prepare bundle before any signal-static use.
+    // The parent releases its guards normally; the child publishes a fresh
+    // waiter backing instead of unlocking a copied contended parking queue.
     drop(fork_signal_locks);
     drop(paused_guard);
     if child < 0 {
