@@ -10,6 +10,11 @@ use super::block::{BlockPlan, PlannedExit};
 use super::cache::{PublishedCode, TranslationCache};
 use super::types::{CacheOffset, CacheVa, CodeGeneration, DsrError, InstAction};
 
+const _: () = assert!(super::super::address::INVALID_BIASED_HOST_ADDRESS_BIT == 1 << 47);
+const BIASED_FAST_ADDRESS_BITS: u32 = 40;
+const _: () =
+    assert!(super::super::address::BIASED_GUEST_APERTURE_END <= 1 << BIASED_FAST_ADDRESS_BITS);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum EmitAddressMode {
     Direct,
@@ -1253,6 +1258,120 @@ fn emit_with_biased_recovery(
     emit_word(assembler, entries, guest, word)
 }
 
+fn emit_biased_materialize_u64(
+    assembler: &mut VecAssembler<Aarch64Relocation>,
+    entries: &mut Vec<PcMapEntry>,
+    recovery: &mut Vec<RecoveryEntry>,
+    guest: GuestVa,
+    register: u32,
+    value: u64,
+    action: BiasedMemoryRecovery,
+) -> Result<(), DsrError> {
+    let chunks = [
+        value as u16,
+        (value >> 16) as u16,
+        (value >> 32) as u16,
+        (value >> 48) as u16,
+    ];
+    let first = chunks.iter().position(|chunk| *chunk != 0).unwrap_or(0);
+    emit_with_biased_recovery(
+        assembler,
+        entries,
+        recovery,
+        guest,
+        0xd280_0000 | ((first as u32) << 21) | ((u32::from(chunks[first])) << 5) | register,
+        action,
+    )?;
+    for (index, chunk) in chunks.into_iter().enumerate() {
+        if index == first || chunk == 0 {
+            continue;
+        }
+        emit_with_biased_recovery(
+            assembler,
+            entries,
+            recovery,
+            guest,
+            0xf280_0000 | ((index as u32) << 21) | ((u32::from(chunk)) << 5) | register,
+            action,
+        )?;
+    }
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "effective-address lowering shares the biased emission and recovery context"
+)]
+fn emit_biased_effective_guest_address(
+    assembler: &mut VecAssembler<Aarch64Relocation>,
+    entries: &mut Vec<PcMapEntry>,
+    recovery: &mut Vec<RecoveryEntry>,
+    guest: GuestVa,
+    memory: super::types::MemoryAccess,
+    rewritten: u32,
+    base_scratch: u32,
+    effective_scratch: u32,
+    action: BiasedMemoryRecovery,
+) -> Result<(), DsrError> {
+    match memory.effective_address {
+        super::types::MemoryEffectiveAddress::Base => emit_with_biased_recovery(
+            assembler,
+            entries,
+            recovery,
+            guest,
+            0xaa00_03e0 | (base_scratch << 16) | effective_scratch,
+            action,
+        ),
+        super::types::MemoryEffectiveAddress::Immediate(offset) => {
+            emit_biased_materialize_u64(
+                assembler,
+                entries,
+                recovery,
+                guest,
+                effective_scratch,
+                offset as u64,
+                action,
+            )?;
+            emit_with_biased_recovery(
+                assembler,
+                entries,
+                recovery,
+                guest,
+                0x8b00_0000 | (effective_scratch << 16) | (base_scratch << 5) | effective_scratch,
+                action,
+            )
+        }
+        super::types::MemoryEffectiveAddress::RegisterOffset { extend, shift } => {
+            if shift > 4 {
+                return Err(DsrError::BlockPolicy(format!(
+                    "biased register offset shift {shift} exceeds ADD extended range at guest PC 0x{:x}",
+                    guest.raw()
+                )));
+            }
+            let option = match extend {
+                super::types::MemoryIndexExtend::Uxtw => 2,
+                super::types::MemoryIndexExtend::Uxtx => 3,
+                super::types::MemoryIndexExtend::Sxtw => 6,
+                super::types::MemoryIndexExtend::Sxtx => 7,
+            };
+            let index = (rewritten >> 16) & 0x1f;
+            emit_with_biased_recovery(
+                assembler,
+                entries,
+                recovery,
+                guest,
+                0x8b20_0000
+                    | (index << 16)
+                    | (option << 13)
+                    | (u32::from(shift) << 10)
+                    | (base_scratch << 5)
+                    | effective_scratch,
+                action,
+            )
+        }
+    }
+}
+
 fn is_store_exclusive(op: bad64::Op) -> bool {
     matches!(
         op,
@@ -1306,9 +1425,35 @@ fn emit_biased_store_exclusive(
             "store-exclusive with virtual or literal base in biased mode",
         ));
     };
+    let compare_base = if matches!(base, bad64::Reg::SP | bad64::Reg::WSP) {
+        emit_word(assembler, entries, guest, 0x9100_03f2)?; // mov x18, sp
+        18
+    } else {
+        gpr_index(base).ok_or_else(|| {
+            unsupported_action(
+                plan,
+                guest,
+                memory.word,
+                "store-exclusive with non-GPR base in biased mode",
+            )
+        })?
+    };
     // Any ordinary host store after LDXR clears the local exclusive monitor.
-    // Keep this preamble load-only: physical x18 is not guest-visible and can
-    // transiently hold the translated address until the exclusive store.
+    // Keep this preamble load/ALU-only: physical x18 is not guest-visible and
+    // can transiently hold the range predicate and translated address until
+    // STXR. LSR/CBNZ are flags-neutral, preserving guest NZCV.
+    emit_word(
+        assembler,
+        entries,
+        guest,
+        0xd368_fc00 | (compare_base << 5) | 18, // lsr x18, base, #40
+    )?;
+    emit_word(
+        assembler,
+        entries,
+        guest,
+        0xb500_0092, // cbnz x18, invalid (+16)
+    )?;
     emit_word(
         assembler,
         entries,
@@ -1328,6 +1473,20 @@ fn emit_biased_store_exclusive(
         ));
     };
     emit_word(assembler, entries, guest, add)?;
+    emit_word(assembler, entries, guest, 0x1400_0004)?; // b translated (+16)
+    emit_word(
+        assembler,
+        entries,
+        guest,
+        0xf940_0000 | ((1192 / 8) << 10) | (28 << 5) | 18,
+    )?;
+    emit_word(assembler, entries, guest, add)?;
+    emit_word(
+        assembler,
+        entries,
+        guest,
+        0xb251_0000 | (18 << 5) | 18, // orr x18, x18, #1 << 47
+    )?;
     let rewritten = (memory.word & !(0x1f << 5)) | (18 << 5);
     emit_word(assembler, entries, guest, rewritten)?;
     // There is deliberately no cleanup instruction. The next emitted guest
@@ -1510,6 +1669,48 @@ fn emit_biased_memory(
         }
     };
     emit_with_biased_recovery(assembler, entries, recovery, guest, load_base, action)?;
+    emit_biased_effective_guest_address(
+        assembler,
+        entries,
+        recovery,
+        guest,
+        memory,
+        rewritten,
+        base_scratch,
+        bias_scratch,
+        action,
+    )?;
+    emit_with_biased_recovery(
+        assembler,
+        entries,
+        recovery,
+        guest,
+        0xd368_fc00 | (bias_scratch << 5) | 18,
+        action,
+    )?; // lsr x18, effective, #40
+    emit_with_biased_recovery(
+        assembler,
+        entries,
+        recovery,
+        guest,
+        0xb400_0052, // cbz x18, +8
+        action,
+    )?;
+    // Publish only an address outside the flags-neutral 40-bit fast window.
+    // The final aperture guard covers the ceiling-to-1-TiB sliver. Larger
+    // values use the tagged host access below, which cannot alias a Darwin
+    // user mapping, and recovery reports this guest value instead of the
+    // deliberately invalid host FAR. Keeping the valid path store-free is
+    // part of the DSR hot-path contract.
+    emit_with_biased_recovery(
+        assembler,
+        entries,
+        recovery,
+        guest,
+        0xf900_0000 | ((1200 / 8) << 10) | (28 << 5) | bias_scratch,
+        action,
+    )?;
+    emit_with_biased_recovery(assembler, entries, recovery, guest, load_base, action)?;
     emit_with_biased_recovery(
         assembler,
         entries,
@@ -1526,6 +1727,22 @@ fn emit_biased_memory(
         0x8b00_0000 | (bias_scratch << 16) | (base_scratch << 5) | base_scratch,
         action,
     )?;
+    emit_with_biased_recovery(
+        assembler,
+        entries,
+        recovery,
+        guest,
+        0xb400_0052, // cbz x18, +8
+        action,
+    )?;
+    emit_with_biased_recovery(
+        assembler,
+        entries,
+        recovery,
+        guest,
+        0xb251_0000 | (base_scratch << 5) | base_scratch,
+        action,
+    )?; // orr base, base, #1 << 47
     emit_with_biased_recovery(assembler, entries, recovery, guest, rewritten, action)?;
     action.instruction_complete = true;
 
@@ -2592,6 +2809,7 @@ mod tests {
                     word,
                     op: bad64::Op::LDR,
                     base: MemoryBase::Register(bad64::Reg::X1),
+                    effective_address: super::super::types::MemoryEffectiveAddress::Base,
                     writeback: MemoryWriteback::None,
                     class: MemoryClass::Scalar,
                     virtualization: super::super::types::MemoryVirtualization::None,
@@ -2629,6 +2847,43 @@ mod tests {
             std::ptr::read_unaligned((emitted.entry().host().raw() + index * 4) as *const u32)
         });
         assert!(words.into_iter().any(|emitted_word| emitted_word == word));
+    }
+
+    #[test]
+    fn biased_in_range_memory_skips_fault_address_publication_store() {
+        let word = 0xf940_0020; // ldr x0, [x1]
+        let mut plan = copy_plan();
+        plan.instructions = vec![PlannedInst {
+            guest: GuestVa(0x4000),
+            action: super::super::decode::classify(word, GuestVa(0x4000))
+                .expect("classify biased memory"),
+        }];
+        plan.end = GuestVa(0x4008);
+        plan.exit = PlannedExit::Syscall {
+            guest: GuestVa(0x4004),
+            resume: GuestVa(0x4008),
+        };
+        let host_bias =
+            super::super::super::address::NativeHostBias::new(0x80_0000_0000, 16 * 1024)
+                .expect("valid bias");
+        let mut cache = TranslationCache::new(16 * 1024).expect("allocate translation cache");
+        let emitted = emit_block(&mut cache, &plan, EmitAddressMode::Biased { host_bias })
+            .expect("emit biased memory block");
+        let words: Vec<u32> = (0..emitted.len() / 4)
+            .map(|index| unsafe {
+                std::ptr::read_unaligned((emitted.entry().host().raw() + index * 4) as *const u32)
+            })
+            .collect();
+        let store_masked = 0xf900_0000 | ((1200 / 8) << 10) | (28 << 5);
+        let store = words
+            .iter()
+            .position(|word| word & !0x1f == store_masked)
+            .expect("biased invalid path publishes exact guest fault address");
+        assert_eq!(
+            words.get(store.wrapping_sub(1)).copied(),
+            Some(0xb400_0052),
+            "cbz must skip the publication store for every in-range access"
+        );
     }
 
     #[test]

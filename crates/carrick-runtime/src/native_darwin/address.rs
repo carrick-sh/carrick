@@ -12,6 +12,12 @@ pub(super) const BIAS_CANDIDATES: [u64; 4] = [
     0x140_0000_0000,
 ];
 const DARWIN_USER_VA_END: u64 = 0x8000_0000_0000;
+pub(super) const BIASED_GUEST_APERTURE_END: u64 = carrick_mem::memory::LINUX_STACK_TOP;
+// Literal loads can address up to 1 MiB beyond their PC. Keep one additional
+// collision-probed guard band so a near-ceiling literal or a multi-byte access
+// crossing the architectural ceiling still faults in Carrick-owned memory.
+const BIASED_GUEST_OVERFLOW_GUARD_SIZE: u64 = 1024 * 1024;
+pub(super) const INVALID_BIASED_HOST_ADDRESS_BIT: u64 = 1 << 47;
 
 pub(super) struct OwnedHostMapping {
     range: Range<HostVa>,
@@ -140,6 +146,7 @@ impl CandidateLayout {
                 page_size: host_page_size,
             });
         }
+        let biased = matches!(mode, NativeAddressMode::Biased { .. });
         let mut ranges = Vec::with_capacity(guest_ranges.len());
         for guest in guest_ranges {
             if guest.start.raw() >= guest.end.raw() {
@@ -164,6 +171,13 @@ impl CandidateLayout {
                     start: guest.start.raw(),
                     length: guest.end.raw().saturating_sub(guest.start.raw()),
                 })?;
+            if biased && aligned_end > BIASED_GUEST_APERTURE_END {
+                return Err(NativeAddressError::OutsideBiasedGuestAperture {
+                    start: aligned_start,
+                    end: aligned_end,
+                    aperture_end: BIASED_GUEST_APERTURE_END,
+                });
+            }
             let host = mode.to_host_range(GuestVa(aligned_start)..GuestVa(aligned_end))?;
             if host.end.raw() as u64 > DARWIN_USER_VA_END {
                 return Err(NativeAddressError::OutsideDarwinUserRange {
@@ -171,6 +185,23 @@ impl CandidateLayout {
                     end: host.end.raw(),
                 });
             }
+            ranges.push(host);
+        }
+        if biased {
+            let guard_end = BIASED_GUEST_APERTURE_END
+                .checked_add(BIASED_GUEST_OVERFLOW_GUARD_SIZE)
+                .ok_or(NativeAddressError::GuestRangeOverflow {
+                    start: BIASED_GUEST_APERTURE_END,
+                    length: BIASED_GUEST_OVERFLOW_GUARD_SIZE,
+                })?;
+            let host = mode.to_host_range(GuestVa(0)..GuestVa(guard_end))?;
+            if host.end.raw() as u64 > DARWIN_USER_VA_END {
+                return Err(NativeAddressError::OutsideDarwinUserRange {
+                    start: host.start.raw(),
+                    end: host.end.raw(),
+                });
+            }
+            ranges.clear();
             ranges.push(host);
         }
         ranges.sort_unstable_by_key(|range| range.start.raw());
@@ -192,9 +223,18 @@ impl CandidateLayout {
         })
     }
 
+    #[cfg(test)]
     fn try_map(&self) -> Result<Vec<OwnedHostMapping>, NativeAddressError> {
+        self.try_map_excluding(&[])
+    }
+
+    fn try_map_excluding(
+        &self,
+        reusable: &[Range<HostVa>],
+    ) -> Result<Vec<OwnedHostMapping>, NativeAddressError> {
+        let target_only = subtract_host_ranges(&self.ranges, reusable);
         let mut mappings = Vec::with_capacity(self.ranges.len());
-        for range in &self.ranges {
+        for range in &target_only {
             mappings.push(map_reservation(range.start.raw(), range.end.raw())?);
         }
         Ok(mappings)
@@ -207,6 +247,32 @@ impl CandidateLayout {
             ranges: ranges.into(),
         }
     }
+}
+
+fn subtract_host_ranges(
+    ranges: &[Range<HostVa>],
+    reusable: &[Range<HostVa>],
+) -> Vec<Range<HostVa>> {
+    let mut result = Vec::new();
+    for range in ranges {
+        let mut cursor = range.start.raw();
+        for keep in reusable {
+            if keep.end.raw() <= cursor || keep.start.raw() >= range.end.raw() {
+                continue;
+            }
+            if keep.start.raw() > cursor {
+                result.push(HostVa(cursor)..HostVa(keep.start.raw()));
+            }
+            cursor = cursor.max(keep.end.raw()).min(range.end.raw());
+            if cursor == range.end.raw() {
+                break;
+            }
+        }
+        if cursor < range.end.raw() {
+            result.push(HostVa(cursor)..HostVa(range.end.raw()));
+        }
+    }
+    result
 }
 
 fn map_reservation(start: usize, end: usize) -> Result<OwnedHostMapping, NativeAddressError> {
@@ -249,6 +315,24 @@ impl NativeLayout {
         layout: MemoryLayout,
         host_page_size: u64,
     ) -> Result<Self, NativeAddressError> {
+        Self::select(image, layout, host_page_size, &[])
+    }
+
+    pub(super) fn for_exec(
+        image: &AddressSpace,
+        layout: MemoryLayout,
+        host_page_size: u64,
+        reusable_owned_ranges: &[Range<HostVa>],
+    ) -> Result<Self, NativeAddressError> {
+        Self::select(image, layout, host_page_size, reusable_owned_ranges)
+    }
+
+    fn select(
+        image: &AddressSpace,
+        layout: MemoryLayout,
+        host_page_size: u64,
+        reusable_owned_ranges: &[Range<HostVa>],
+    ) -> Result<Self, NativeAddressError> {
         if image
             .regions()
             .iter()
@@ -288,7 +372,7 @@ impl NativeLayout {
                     continue;
                 }
             };
-            match candidate.try_map() {
+            match candidate.try_map_excluding(reusable_owned_ranges) {
                 Ok(reservations) => {
                     return Ok(Self {
                         mode: candidate.mode,
@@ -320,6 +404,43 @@ impl NativeLayout {
 
     pub(super) fn owned_ranges(&self) -> &[Range<HostVa>] {
         &self.owned_ranges
+    }
+
+    pub(super) fn reset_biased_aperture_to_guards(&self) -> Result<(), NativeAddressError> {
+        if !matches!(self.mode, NativeAddressMode::Biased { .. }) {
+            return Ok(());
+        }
+        for range in &self.owned_ranges {
+            let length = range.end.raw().checked_sub(range.start.raw()).ok_or(
+                NativeAddressError::InvalidHostRange {
+                    start: range.start.raw(),
+                    length: 0,
+                },
+            )?;
+            let flags = self.fixed_mapping_flags(
+                range.start,
+                length,
+                libc::MAP_ANON | libc::MAP_PRIVATE | libc::MAP_NORESERVE,
+            )?;
+            let mapped = unsafe {
+                libc::mmap(
+                    range.start.raw() as *mut libc::c_void,
+                    length,
+                    libc::PROT_NONE,
+                    flags,
+                    -1,
+                    0,
+                )
+            };
+            if mapped == libc::MAP_FAILED || mapped as usize != range.start.raw() {
+                return Err(NativeAddressError::HostMapping {
+                    requested: range.start.raw(),
+                    length,
+                    source: std::io::Error::last_os_error(),
+                });
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn commit_if_ok<T, E>(self, result: Result<T, E>) -> Result<T, E> {
@@ -478,6 +599,14 @@ pub(super) enum NativeAddressError {
     GuestRangeOverflow { start: u64, length: u64 },
     #[error("native host range is outside Darwin user VA: 0x{start:x}..0x{end:x}")]
     OutsideDarwinUserRange { start: usize, end: usize },
+    #[error(
+        "native guest range 0x{start:x}..0x{end:x} exceeds biased aperture end 0x{aperture_end:x}"
+    )]
+    OutsideBiasedGuestAperture {
+        start: u64,
+        end: u64,
+        aperture_end: u64,
+    },
     #[error("no collision-free native host bias: {detail}")]
     NoCollisionFreeBias { detail: String },
     #[error("native fixed mapping is outside an owned range: 0x{start:x}+0x{length:x}")]
@@ -689,7 +818,93 @@ mod tests {
     }
 
     #[test]
-    fn biased_fixed_mapping_is_limited_to_owned_ranges() {
+    fn biased_aperture_guards_null_and_unmodeled_gaps_without_replacing_sentinels() {
+        fork_test(|| {
+            let page_size = TEST_PAGE_SIZE as u64;
+            let guest_start = GuestVa(0x40_0000);
+            let first_null_host = HostVa(0x80_0000_0000);
+            let sentinel = OwnedHostMapping::map_exact(
+                first_null_host,
+                TEST_PAGE_SIZE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+            )
+            .expect("occupy first candidate's translated null page");
+            unsafe {
+                std::ptr::write_bytes(first_null_host.raw() as *mut u8, 0x5a, TEST_PAGE_SIZE);
+            }
+            let image = AddressSpace::from_segments(
+                guest_start.raw(),
+                [(
+                    guest_start.raw(),
+                    carrick_mem::elf::SegmentPerms {
+                        read: true,
+                        write: false,
+                        execute: true,
+                    },
+                    vec![0; TEST_PAGE_SIZE],
+                    page_size,
+                )],
+            )
+            .expect("build low test image");
+            let layout = MemoryLayout {
+                heap_base: 0x8_0000_0000,
+                heap_size: page_size,
+                mmap_base: 0xa0_0000_0000,
+                mmap_size: page_size,
+            };
+
+            let selected = NativeLayout::for_image(&image, layout, page_size)
+                .expect("select collision-free guarded aperture");
+            assert_eq!(
+                selected.address_mode().to_host(GuestVa(0)).unwrap(),
+                HostVa(0xc0_0000_0000),
+                "the pre-existing null-page collision must reject the first bias"
+            );
+            assert_eq!(unsafe { *(first_null_host.raw() as *const u8) }, 0x5a);
+
+            let gap_guest = GuestVa(0x10_0000_0000);
+            let gap_host = selected
+                .address_mode()
+                .to_host(gap_guest)
+                .expect("translate unmodeled guest gap");
+            assert!(
+                matches!(
+                    OwnedHostMapping::map_exact(
+                        gap_host,
+                        TEST_PAGE_SIZE,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_PRIVATE | libc::MAP_ANON,
+                    ),
+                    Err(NativeAddressError::HostCollision { .. })
+                ),
+                "a later host mapping must not acquire an owned guest gap"
+            );
+            assert!(selected.owned_ranges().iter().any(|range| {
+                range.start <= selected.address_mode().to_host(GuestVa(0)).unwrap()
+                    && gap_host < range.end
+            }));
+            let ceiling_last = selected
+                .address_mode()
+                .to_host(GuestVa(carrick_mem::memory::LINUX_STACK_TOP - 1))
+                .expect("translate last in-aperture byte");
+            let ceiling_guard = selected
+                .address_mode()
+                .to_host(GuestVa(carrick_mem::memory::LINUX_STACK_TOP))
+                .expect("translate first byte above guest ceiling");
+            assert!(
+                selected
+                    .owned_ranges()
+                    .iter()
+                    .any(|range| { range.start <= ceiling_last && ceiling_guard < range.end })
+            );
+            drop(selected);
+            drop(sentinel);
+        });
+    }
+
+    #[test]
+    fn biased_fixed_mapping_accepts_owned_gaps_and_rejects_outside_aperture() {
         fork_test(|| {
             let page_size = TEST_PAGE_SIZE as u64;
             let guest_start = GuestVa(0x40_0000);
@@ -726,9 +941,21 @@ mod tests {
                     & libc::MAP_FIXED,
                 libc::MAP_FIXED
             );
+            assert_eq!(
+                selected
+                    .fixed_mapping_flags(
+                        HostVa(owned.raw() + 2 * TEST_PAGE_SIZE),
+                        TEST_PAGE_SIZE,
+                        libc::MAP_ANON | libc::MAP_PRIVATE,
+                    )
+                    .expect("authorize fixed replacement inside owned gap")
+                    & libc::MAP_FIXED,
+                libc::MAP_FIXED
+            );
+            let outside = selected.owned_ranges().last().unwrap().end;
             assert!(matches!(
                 selected.fixed_mapping_flags(
-                    HostVa(owned.raw() + 2 * TEST_PAGE_SIZE),
+                    outside,
                     TEST_PAGE_SIZE,
                     libc::MAP_ANON | libc::MAP_PRIVATE,
                 ),
@@ -853,10 +1080,8 @@ mod tests {
                 })
                 .collect();
             assert_eq!(containing.len(), 1, "adjacent subpages must coalesce");
-            assert_eq!(
-                containing[0].clone(),
-                host_start..HostVa(host_start.raw() + TEST_PAGE_SIZE)
-            );
+            assert!(containing[0].start.raw() < host_start.raw());
+            assert!(containing[0].end.raw() >= host_start.raw() + TEST_PAGE_SIZE);
 
             drop(selected);
             let vacancy = OwnedHostMapping::map_exact(

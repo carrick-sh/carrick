@@ -119,8 +119,9 @@ Biased: host = guest + host_bias
 ```
 
 Reverse fault translation subtracts the bias only after proving the host address
-belongs to a biased guest mapping. Host faults outside those ranges remain host
-faults and must never be mislabeled as guest addresses.
+belongs to the Carrick-owned biased aperture, including its guard gaps. Host
+faults outside that aperture remain host faults and must never be mislabeled as
+guest addresses.
 
 ## Bias selection and transactional mapping
 
@@ -138,6 +139,13 @@ validates the complete prospective layout, including:
 - signal trampoline;
 - overflow against the usable Darwin user address range.
 
+The semantic biased guest aperture is the contiguous interval from guest zero
+through the exclusive fixed ceiling `LINUX_STACK_TOP`. Carrick also reserves a
+bounded 1 MiB overflow guard so a near-ceiling literal or multi-byte access
+cannot escape into unrelated host memory. Candidate selection acquires this
+entire translated aperture as one collision-probed `PROT_NONE` ownership
+interval; it does not reserve only the image's currently modeled mappings.
+
 Each candidate is attempted transactionally. Carrick requests exact host
 ranges without `MAP_FIXED`. Darwin may treat the supplied address as a hint; if
 the returned address differs, Carrick immediately unmaps it, cleans up every
@@ -145,14 +153,17 @@ range already acquired for that candidate, and tries the next candidate. This
 probing path therefore cannot replace Carrick, dyld, allocator, shared-cache,
 or other live mappings.
 
-After Carrick owns a range, its normal protection and remapping operations may
-operate only inside that owned interval. A typed owned-range check guards any
-later fixed mapping operation.
+After Carrick owns the aperture, its normal protection and remapping operations
+may replace only subranges inside that owned interval. A typed owned-range check
+guards any later fixed mapping operation. The rest of the aperture stays
+`PROT_NONE`, including guest zero and every unmodeled gap, so those faults occur
+inside Carrick-owned address space and can be lowered deterministically.
 
 Guest address zero remains invalid. In biased mode it corresponds arithmetically
-to `host_bias`, but Carrick leaves guest gaps unmapped. A null or otherwise
-unmapped access therefore faults at an unowned biased address and is lowered
-back to the correct Linux guest fault.
+to `host_bias`, but that host page remains a `PROT_NONE` Carrick-owned guard. A
+null or otherwise unmapped access therefore lowers back to the correct Linux
+guest fault without depending on whatever mapping happens to exist at a later
+bias candidate.
 
 Mapping attempts are all-or-nothing. Before the Linux `execve` point of no
 return, candidate validation errors return the appropriate guest errno. After
@@ -235,6 +246,17 @@ Writeback updates remain in guest coordinates. Exclusive semantics operate on
 the translated host address while guest-visible reservation/fault reporting
 uses the guest address.
 
+The fixed guest ceiling is exclusive. Biased lowering computes the exact guest
+effective address for every memory form. A flags-neutral `LSR`/`CBZ` check keeps
+guest NZCV unchanged and gives all addresses below 1 TiB the normal translated
+host operand without publishing per-access recovery state. The `PROT_NONE`
+overflow guard covers the narrow interval from `LINUX_STACK_TOP` to 1 TiB, so
+those addresses still fault inside Carrick-owned memory. A larger address
+publishes that exact guest value, tags the host operand with a bit outside
+Darwin's user address range, and deliberately faults without allowing the guest
+address to alias unrelated host memory. Signal recovery then reports the
+published guest address. Direct emission is unchanged by this check.
+
 The bias is immutable gateway context, not a guest-visible reserved register.
 Scratch selection must compose with DSR's existing x17 entry transport and
 x18/x28 virtualization. If an instruction cannot be lowered without corrupting
@@ -270,9 +292,13 @@ and thread-local state while leaving guest coordinates unchanged.
 For `execve`, after the existing successful-load and sibling-teardown point:
 
 1. classify the replacement image as direct or biased;
-2. validate a complete candidate layout before changing the current image;
-3. retire old DSR metadata and unmap only ranges owned by the old guest image;
-4. map the replacement transactionally in its new address mode;
+2. validate a complete candidate layout before changing the current image,
+   subtracting current Carrick-owned ranges from collision probes so an
+   overlapping replacement may reuse them;
+3. retire old DSR metadata and unmap only old ranges the replacement will not
+   retain;
+4. transfer retained ownership, restore a retained biased aperture to
+   `PROT_NONE` guards, and map the replacement only inside that authority;
 5. rebuild stack, auxv, vDSO/vvar, signal trampoline, and memory accounting;
 6. reset registers and DSR translator state in guest coordinates;
 7. publish the replacement only when every mapping and relocation succeeds.

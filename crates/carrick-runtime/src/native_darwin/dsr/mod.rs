@@ -1192,6 +1192,7 @@ impl ThreadTranslator {
                 indirect_x30_scratch,
                 physical_x18,
                 gateway_phase,
+                biased_guest_fault_address,
             } => {
                 let (guest_pc, recovery) = self.guest_pc_for_cache(guest_pc).map_err(|error| {
                     types::DsrError::CachePolicy(format!(
@@ -1232,6 +1233,19 @@ impl ThreadTranslator {
                     (
                         ThreadFault::Guest { signum, code },
                         ThreadFaultAddress::Guest(guest_pc),
+                    )
+                } else if recovery.is_some_and(|action| {
+                    matches!(action, emit::RecoveryAction::RecoverBiasedMemory(_))
+                }) && biased_guest_fault_address
+                    >= super::address::BIASED_GUEST_APERTURE_END
+                {
+                    snapshot.far = biased_guest_fault_address;
+                    snapshot.fault_address = biased_guest_fault_address;
+                    (
+                        ThreadFault::Host { signal, code },
+                        ThreadFaultAddress::Guest(carrick_guest_mem::GuestVa(
+                            biased_guest_fault_address,
+                        )),
                     )
                 } else {
                     (
@@ -1945,6 +1959,7 @@ mod tests {
                     indirect_x30_scratch: 0,
                     physical_x18: 0,
                     gateway_phase: 0,
+                    biased_guest_fault_address: 0,
                 },
                 (DsrExitKind::Fault, PC.raw(), target.raw(), 4),
             ),
