@@ -79,8 +79,9 @@
 
 use parking_lot::Mutex;
 use std::collections::HashMap;
+use std::mem::ManuallyDrop;
 use std::os::fd::RawFd;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU8, Ordering};
 use std::sync::{Arc, LazyLock};
 
 use crate::linux_abi::LINUX_SIGINT;
@@ -187,9 +188,6 @@ pub fn block_hvf_private_thread_signals() -> HvfPrivateSignalMaskGuard {
 // helpers; the per-signum SKIP set (the HVF-specific exclusions layered on top of
 // the neutral `is_host_routable` base) stays HVF glue in the install code below.
 
-static THREAD_WAITERS: LazyLock<Mutex<HashMap<i32, ThreadWakeRegistration>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
 // The `child_pid -> (parent_tid, exit_signal)` registry that records, for each
 // watched guest child, the guest tid to wake on the child's exit and the signal
 // the guest asked for (clone exit_signal / clone3 `exit_signal`), is now the
@@ -208,6 +206,85 @@ static THREAD_WAITERS: LazyLock<Mutex<HashMap<i32, ThreadWakeRegistration>>> =
 struct ThreadWakeRegistration {
     fds: Arc<ThreadWakeFds>,
 }
+
+type ThreadWaiterMap = HashMap<i32, ThreadWakeRegistration>;
+
+/// A waiter registry whose mutex backing can be abandoned after `fork(2)`.
+///
+/// A parking-lot mutex with queued parent threads is not safe to unlock or
+/// relock in the single-threaded child: its copied queue references threads
+/// which do not exist there. Published backings therefore live for the process
+/// lifetime. The fork prepare guard preallocates a clean replacement which the
+/// child can publish without allocating, unlocking, or destroying the copied
+/// contended backing.
+struct ForkResetWaiterRegistry {
+    current: AtomicPtr<Mutex<ThreadWaiterMap>>,
+}
+
+impl ForkResetWaiterRegistry {
+    fn new() -> Self {
+        let backing = Box::into_raw(Box::new(Mutex::new(HashMap::new())));
+        Self {
+            current: AtomicPtr::new(backing),
+        }
+    }
+
+    fn lock(&self) -> parking_lot::MutexGuard<'_, ThreadWaiterMap> {
+        let backing = self.current.load(Ordering::SeqCst);
+        // SAFETY: `new` publishes a non-null boxed mutex before the registry is
+        // visible. Child resets publish another boxed mutex, and published
+        // backings are intentionally never freed, so the loaded pointer remains
+        // valid for the returned guard's lifetime.
+        unsafe { &*backing }.lock()
+    }
+
+    fn hold_for_fork(&'static self) -> ThreadWaitersForkGuard {
+        // Allocate before taking the current lock: the child branch must not
+        // enter the allocator after fork while parent allocator locks may be
+        // inherited from vanished threads.
+        let fresh = Box::new(Mutex::new(HashMap::new()));
+        let guard = self.lock();
+        ThreadWaitersForkGuard {
+            registry: self,
+            owner_pid: unsafe { libc::getpid() },
+            guard: ManuallyDrop::new(guard),
+            fresh: ManuallyDrop::new(fresh),
+        }
+    }
+}
+
+struct ThreadWaitersForkGuard {
+    registry: &'static ForkResetWaiterRegistry,
+    owner_pid: libc::pid_t,
+    guard: ManuallyDrop<parking_lot::MutexGuard<'static, ThreadWaiterMap>>,
+    fresh: ManuallyDrop<Box<Mutex<ThreadWaiterMap>>>,
+}
+
+impl Drop for ThreadWaitersForkGuard {
+    fn drop(&mut self) {
+        if unsafe { libc::getpid() } == self.owner_pid {
+            // SAFETY: the parent owns both values and drops this guard exactly
+            // once. Unlock before freeing the unused replacement.
+            unsafe {
+                ManuallyDrop::drop(&mut self.guard);
+                ManuallyDrop::drop(&mut self.fresh);
+            }
+            return;
+        }
+
+        // SAFETY: this child is the sole surviving thread and this Drop runs
+        // exactly once. Move out the pre-fork allocation and publish it. The
+        // inherited guard remains deliberately undropped because unlocking its
+        // copied parking queue can wait forever on vanished parent threads.
+        let fresh = unsafe { ManuallyDrop::take(&mut self.fresh) };
+        self.registry
+            .current
+            .store(Box::into_raw(fresh), Ordering::SeqCst);
+    }
+}
+
+static THREAD_WAITERS: LazyLock<ForkResetWaiterRegistry> =
+    LazyLock::new(ForkResetWaiterRegistry::new);
 
 struct ThreadWakeFds {
     read_fd: RawFd,
@@ -284,26 +361,32 @@ pub fn publish_pending_for(tid: i32, signum: i32) {
 /// watcher publishing an exit (`child_watch` tables → `publish_pending_for`'s
 /// `THREAD_PENDING` → `wake_thread_waiter`'s `THREAD_WAITERS`). The FORKING
 /// thread acquires the bundle immediately before `libc::fork()` and drops it
-/// immediately after in BOTH processes; a fork child therefore never inherits
-/// one of these mutexes in a LOCKED state (a COW lock no surviving child
-/// thread would ever release — the child's `reinit_after_fork` →
-/// `child_watch::clear` wedge behind the execpermitchurn load TIMEOUTs).
+/// immediately after in BOTH processes. Ordinary guards unlock normally;
+/// `THREAD_WAITERS` instead publishes a preallocated empty backing in the child
+/// and abandons its copied contended parking queue. A fork child therefore
+/// never tries to reuse a lock whose owner or queued waiters vanished (the
+/// child's `reinit_after_fork` wedge behind the execpermitchurn load TIMEOUTs).
 /// The three stores are only ever locked transiently and non-nested, so the
 /// bundle acquisition cannot deadlock against their users.
 pub struct SignalForkLocks {
+    // Declared first so its child-side reset runs before the other guards drop.
+    _waiters: ThreadWaitersForkGuard,
     _child_watch: carrick_signal_core::child_watch::ChildWatchForkGuard,
     _thread_pending: carrick_signal_core::ThreadPendingForkGuard,
-    _waiters: parking_lot::MutexGuard<'static, HashMap<i32, ThreadWakeRegistration>>,
 }
 
 /// Acquire the atfork-prepare bundle (see [`SignalForkLocks`]). Call
-/// immediately before `libc::fork()`; drop immediately after in both
-/// processes, strictly before any child-side signal reinit.
+/// immediately before `libc::fork()`; drop immediately after in both processes
+/// to unlock parent state or publish child replacements, strictly before any
+/// child-side signal reinit.
 pub fn hold_signal_locks_for_fork() -> SignalForkLocks {
+    let child_watch = carrick_signal_core::child_watch::hold_for_fork();
+    let thread_pending = carrick_signal_core::hold_thread_pending_for_fork();
+    let waiters = THREAD_WAITERS.hold_for_fork();
     SignalForkLocks {
-        _child_watch: carrick_signal_core::child_watch::hold_for_fork(),
-        _thread_pending: carrick_signal_core::hold_thread_pending_for_fork(),
-        _waiters: THREAD_WAITERS.lock(),
+        _waiters: waiters,
+        _child_watch: child_watch,
+        _thread_pending: thread_pending,
     }
 }
 
@@ -1202,6 +1285,67 @@ mod tests {
     /// (libtest collection order is not stable).
     fn ensure_pump_pipe_for_test() {
         let _ = pump_install_pipe();
+    }
+
+    fn wait_for_child_exit_bounded(pid: libc::pid_t, timeout: std::time::Duration) -> i32 {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let mut status = 0;
+            let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+            if waited == pid {
+                return status;
+            }
+            assert_eq!(
+                waited,
+                0,
+                "waitpid({pid}) failed: {}",
+                std::io::Error::last_os_error()
+            );
+            if std::time::Instant::now() >= deadline {
+                let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+                let _ = unsafe { libc::waitpid(pid, &mut status, 0) };
+                panic!("child {pid} did not exit within {timeout:?}; status=0x{status:x}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn fork_child_resets_contended_thread_waiters() {
+        let _fork_serial = crate::fork_test_lock();
+        let _g = TEST_LOCK.lock();
+        reset_after_supervisor_fork();
+
+        let signal_locks = hold_signal_locks_for_fork();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let contender = std::thread::spawn(move || {
+            started_tx
+                .send(())
+                .expect("report waiter-lock contention start");
+            let _waiters = THREAD_WAITERS.lock();
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("contender reaches waiter lock");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let child = unsafe { libc::fork() };
+        assert!(
+            child >= 0,
+            "fork failed: {}",
+            std::io::Error::last_os_error()
+        );
+        if child == 0 {
+            drop(signal_locks);
+            reinit_after_fork();
+            unsafe { libc::_exit(0) };
+        }
+
+        drop(signal_locks);
+        contender.join().expect("waiter contender exits");
+        let status = wait_for_child_exit_bounded(child, std::time::Duration::from_secs(2));
+        assert!(libc::WIFEXITED(status), "child status was 0x{status:x}");
+        assert_eq!(libc::WEXITSTATUS(status), 0);
     }
 
     #[test]
