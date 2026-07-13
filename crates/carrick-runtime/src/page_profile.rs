@@ -9,7 +9,7 @@ const DARWIN_NATIVE_PAGE_SIZE: u64 = 16_384;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ExecutionBackend {
-    Hvf,
+    Vmm,
     NativeDarwin,
 }
 
@@ -256,8 +256,8 @@ fn resolve_execution_plan_for_request_for_host(
     }
 
     match exec_backend {
-        ExecBackendRequest::Auto | ExecBackendRequest::Hvf => Ok(ExecutionPlan {
-            backend: ExecutionBackend::Hvf,
+        ExecBackendRequest::Vmm => Ok(ExecutionPlan {
+            backend: ExecutionBackend::Vmm,
             page_geometry: PageGeometry {
                 host_page_size: DEFAULT_LINUX_PAGE_SIZE,
                 linux_page_size: DEFAULT_LINUX_PAGE_SIZE,
@@ -268,13 +268,13 @@ fn resolve_execution_plan_for_request_for_host(
         ExecBackendRequest::Native => {
             if host_caps.host_os != HostOs::Macos {
                 return Err(RuntimeError::Unsupported(format!(
-                    "native Darwin execution backend requires macOS host, got {:?}",
+                    "native Darwin execution backend requires macOS host, got {:?}; pass --exec-backend vmm to request the platform VMM",
                     host_caps.host_os
                 )));
             }
             if host_caps.host_execution(platform) != HostExecution::Native {
                 return Err(RuntimeError::Unsupported(format!(
-                    "native execution backend does not support cross-ISA guest platform {:?} on {:?} host",
+                    "native execution backend does not support cross-ISA guest platform {:?} on {:?} host; pass --exec-backend vmm to request the platform VMM",
                     platform, host_caps.host_isa
                 )));
             }
@@ -291,7 +291,7 @@ fn native_plan(
         NativePageProfileRequest::Auto => {
             if host_page_size != DARWIN_NATIVE_PAGE_SIZE {
                 return Err(RuntimeError::Unsupported(format!(
-                    "native execution unsupported on host page size {host_page_size}"
+                    "native execution unsupported on host page size {host_page_size}; pass --exec-backend vmm to request the platform VMM"
                 )));
             }
             NativePageProfile::Native16k
@@ -299,7 +299,7 @@ fn native_plan(
         NativePageProfileRequest::Native16k => {
             if host_page_size != DARWIN_NATIVE_PAGE_SIZE {
                 return Err(RuntimeError::Unsupported(format!(
-                    "native16k requires host page size 16384, got {host_page_size}"
+                    "native16k requires host page size 16384, got {host_page_size}; pass --exec-backend vmm to request the platform VMM"
                 )));
             }
             NativePageProfile::Native16k
@@ -307,7 +307,7 @@ fn native_plan(
         NativePageProfileRequest::Linux4k => {
             if host_page_size != DARWIN_NATIVE_PAGE_SIZE {
                 return Err(RuntimeError::Unsupported(format!(
-                    "linux4k native page profile requires host page size 16384, got {host_page_size}"
+                    "linux4k native page profile requires host page size 16384, got {host_page_size}; pass --exec-backend vmm to request the platform VMM"
                 )));
             }
             NativePageProfile::Linux4kOn16k
@@ -386,13 +386,13 @@ mod tests {
     }
 
     #[test]
-    fn hvf_request_ignores_native_page_geometry() {
+    fn vmm_request_uses_linux_page_geometry() {
         let plan = resolve_execution_plan(&spec(
-            ExecBackendRequest::Hvf,
+            ExecBackendRequest::Vmm,
             NativePageProfileRequest::Auto,
         ))
-        .expect("hvf plan");
-        assert_eq!(plan.backend, ExecutionBackend::Hvf);
+        .expect("vmm plan");
+        assert_eq!(plan.backend, ExecutionBackend::Vmm);
         assert_eq!(
             plan.page_geometry.linux_page_size,
             carrick_abi::LINUX_PAGE_SIZE
@@ -402,9 +402,9 @@ mod tests {
     }
 
     #[test]
-    fn explicit_hvf_rejects_explicit_native_page_profile() {
+    fn explicit_vmm_rejects_explicit_native_page_profile() {
         let err = resolve_execution_plan(&spec(
-            ExecBackendRequest::Hvf,
+            ExecBackendRequest::Vmm,
             NativePageProfileRequest::Linux4k,
         ))
         .expect_err("explicit native page profile requires native backend");
@@ -412,6 +412,21 @@ mod tests {
             err.to_string()
                 .contains("native page profile requires --exec-backend=native")
         );
+    }
+
+    #[test]
+    fn omitted_backend_resolves_native_on_macos_aarch64() {
+        let plan = resolve_execution_plan_for_host(
+            &spec(
+                ExecBackendRequest::default(),
+                NativePageProfileRequest::Auto,
+            ),
+            caps(HostOs::Macos, Platform::Aarch64),
+            DARWIN_NATIVE_PAGE_SIZE,
+        )
+        .expect("default backend should resolve to native");
+
+        assert_eq!(plan.backend, ExecutionBackend::NativeDarwin);
     }
 
     #[test]
@@ -433,6 +448,7 @@ mod tests {
                 if message.contains("cross-ISA")
                     && message.contains("Amd64")
                     && message.contains("Aarch64")
+                    && message.contains("--exec-backend vmm")
         ));
     }
 
@@ -448,7 +464,9 @@ mod tests {
         assert!(matches!(
             err,
             RuntimeError::Unsupported(message)
-                if message.contains("macOS") && message.contains("Linux")
+                if message.contains("macOS")
+                    && message.contains("Linux")
+                    && message.contains("--exec-backend vmm")
         ));
     }
 
