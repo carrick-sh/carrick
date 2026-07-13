@@ -183,8 +183,10 @@ pub struct MailboxBinding {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MailboxDiagnostics {
+    pub generation: u64,
     pub sequence: u64,
     pub state: u32,
+    pub response_action: u32,
     pub native_nr: u64,
     pub return_value: u64,
 }
@@ -201,8 +203,12 @@ impl MailboxBinding {
         // sampled only while the vCPU is stopped after a protocol failure.
         unsafe {
             MailboxDiagnostics {
+                generation: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).generation)),
                 sequence: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).sequence)),
                 state: self.state().load(Ordering::Acquire),
+                response_action: core::ptr::read_volatile(core::ptr::addr_of!(
+                    (*mailbox).response_action
+                )),
                 native_nr: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).native_nr)),
                 return_value: core::ptr::read_volatile(core::ptr::addr_of!(
                     (*mailbox).return_value
@@ -250,11 +256,18 @@ impl MailboxBinding {
     /// # Safety
     ///
     /// `host` must satisfy the same mapping requirements as [`Self::new`].
-    pub unsafe fn rebind(&mut self, host: NonNull<Aarch64SyscallMailbox>, preserve_request: bool) {
+    pub unsafe fn rebind(
+        &mut self,
+        host: NonNull<Aarch64SyscallMailbox>,
+        preserve_outstanding: bool,
+    ) {
         self.host = host;
         self.generation = fresh_generation();
         let state = self.state().load(Ordering::Acquire);
-        let preserve_request = preserve_request && state == MailboxState::RequestReady.raw();
+        let preserved_state = preserve_outstanding.then_some(state).filter(|state| {
+            *state == MailboxState::RequestReady.raw()
+                || *state == MailboxState::ResponseReady.raw()
+        });
         // SAFETY: the binding owns this mapped mailbox slot.
         unsafe {
             self.write_volatile(
@@ -273,13 +286,12 @@ impl MailboxBinding {
                 core::ptr::addr_of_mut!((*self.host.as_ptr()).generation),
                 self.generation,
             );
-            if !preserve_request {
+            if preserved_state.is_none() {
                 self.write_volatile(core::ptr::addr_of_mut!((*self.host.as_ptr()).sequence), 0);
             }
         }
-        if preserve_request {
-            self.state()
-                .store(MailboxState::RequestReady.raw(), Ordering::Release);
+        if let Some(state) = preserved_state {
+            self.state().store(state, Ordering::Release);
         } else {
             self.last_sequence = 0;
             self.state()
@@ -584,6 +596,32 @@ mod tests {
     }
 
     #[test]
+    fn rebind_preserves_an_inflight_response_for_vector_continuation() {
+        let (mut binding, mut mailbox) = binding();
+        publish_valid_request(&binding, &mut mailbox);
+        binding.take_request().expect("protocol").expect("request");
+        binding.publish_normal_return(77).expect("response");
+        let sequence = mailbox.sequence;
+        let before = binding.generation();
+        let pointer = NonNull::from(mailbox.as_mut());
+
+        unsafe { binding.rebind(pointer, true) };
+
+        assert_ne!(binding.generation(), before);
+        assert_eq!(mailbox.generation, binding.generation());
+        assert_eq!(mailbox.sequence, sequence);
+        assert_eq!(mailbox.return_value, 77);
+        assert_eq!(
+            mailbox.response_action,
+            MailboxResponseAction::NormalReturn.raw()
+        );
+        assert_eq!(
+            mailbox.state.load(Ordering::Acquire),
+            MailboxState::ResponseReady.raw()
+        );
+    }
+
+    #[test]
     fn valid_request_is_acquired_once_and_decoded_without_registers() {
         let (mut binding, mut mailbox) = binding();
         publish_valid_request(&binding, &mut mailbox);
@@ -800,5 +838,48 @@ mod tests {
         binding
             .publish_register_resume_if_outstanding()
             .expect("idle resume");
+    }
+
+    #[test]
+    fn interruption_phase_model_dispatches_and_responds_once() {
+        let (mut binding, mut mailbox) = binding();
+
+        // Before construction and during unpublished payload mutation, the host
+        // owns nothing and cannot dispatch.
+        assert!(binding.take_request().expect("idle").is_none());
+        mailbox.args[0] = 0xfeed;
+        assert!(binding.take_request().expect("partial payload").is_none());
+
+        // Publication transfers one request to the host. Re-consuming the same
+        // sequence while host ownership is held fails closed.
+        publish_valid_request(&binding, &mut mailbox);
+        assert!(binding.take_request().expect("request").is_some());
+        assert!(matches!(
+            binding.take_request(),
+            Err(MailboxConsumeError::Protocol(
+                MailboxProtocolError::NonIncreasingSequence { .. }
+            ))
+        ));
+
+        // Response payload alone does not transfer ownership. Publication does,
+        // and a second response for the same request is rejected.
+        mailbox.return_value = 77;
+        assert_eq!(
+            mailbox.state.load(Ordering::Acquire),
+            MailboxState::RequestReady.raw()
+        );
+        binding.publish_normal_return(77).expect("response");
+        assert_eq!(
+            mailbox.state.load(Ordering::Acquire),
+            MailboxState::ResponseReady.raw()
+        );
+        assert!(binding.publish_normal_return(88).is_err());
+
+        // Model the vector's final release store after EL0 return. No stale
+        // request remains dispatchable.
+        mailbox
+            .state
+            .store(MailboxState::Idle.raw(), Ordering::Release);
+        assert!(binding.take_request().expect("returned idle").is_none());
     }
 }

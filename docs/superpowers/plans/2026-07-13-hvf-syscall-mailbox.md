@@ -492,7 +492,7 @@ git commit -m "feat(hvf): complete ordinary syscalls through the mailbox" -m "De
 - Modify: `crates/carrick-cli/tests/conformance.rs`
 - Modify: `docs/conformance-coverage.md`
 
-- [ ] **Step 1: Add a red guest register witness**
+- [x] **Step 1: Add a red guest register witness**
 
 `mailboxregs` uses an AArch64 assembly function to seed x1..x30 with distinct
 nonzero sentinels, issue a non-identity syscall (`getppid`), and copy the
@@ -503,7 +503,7 @@ itself passes there, then temporarily force an intentionally clobbering vector
 in the test branch and prove the mismatch is detected before restoring the
 real implementation.
 
-- [ ] **Step 2: Add focused signed HVF tests**
+- [x] **Step 2: Add focused signed HVF tests**
 
 Add `trap_hvf` cases for mailbox and forced-legacy mode covering:
 
@@ -520,7 +520,7 @@ Add `trap_hvf` cases for mailbox and forced-legacy mode covering:
 Use scoped `CARRICK_RUN_ID`; never run Docker concurrently with these HVF
 tests.
 
-- [ ] **Step 3: Implement the seven-phase interruption matrix**
+- [x] **Step 3: Implement the seven-phase interruption matrix**
 
 Host-neutral protocol tests inject interruption at: before construction,
 during payload, after request publication, during host ownership, after
@@ -532,7 +532,7 @@ sleep hooks: signal/kick before HVC, signal pending during host dispatch,
 signal entry after request, and signal immediately after return. Use existing
 signal injection facilities and the always-on event ring, not `eprintln!`.
 
-- [ ] **Step 4: Run the red-first differential gate**
+- [x] **Step 4: Run the red-first differential gate**
 
 From the repository root, with Carrick and Docker phases separate:
 
@@ -547,7 +547,7 @@ Capture binary-safe logs with `grep -a`. First demonstrate `mailboxregs` detects
 the deliberately broken register-preservation variant, then restore and prove
 MATCH against Docker.
 
-- [ ] **Step 5: Commit correctness coverage**
+- [x] **Step 5: Commit correctness coverage**
 
 ```sh
 git add conformance-probes/src/bin/mailboxregs.rs \

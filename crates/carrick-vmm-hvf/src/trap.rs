@@ -3125,14 +3125,14 @@ impl HvfVmState {
         &self,
         vcpu: &applevisor::vcpu::Vcpu,
         binding: &mut MailboxBinding,
-        preserve_request: bool,
+        preserve_outstanding: bool,
     ) -> Result<(), TrapError> {
         use applevisor::prelude::SysReg;
 
         let pointer = self.mailbox_host_pointer(binding.slot())?;
         // SAFETY: the refreshed pointer covers the same uniquely leased slot in
         // the rebuilt VM mapping and remains live until another rebuild/drop.
-        unsafe { binding.rebind(pointer, preserve_request) };
+        unsafe { binding.rebind(pointer, preserve_outstanding) };
         vcpu.set_sys_reg(SysReg::SP_EL1, binding.slot().guest_address())
             .map_err(hvf_error)
     }
@@ -5441,13 +5441,15 @@ impl HvfInner {
                 let far_el1 = vcpu.get_sys_reg(SysReg::FAR_EL1).unwrap_or(0);
                 let spsr_el1 = vcpu.get_sys_reg(SysReg::SPSR_EL1).unwrap_or(0);
                 let ec = (esr_el1 >> 26) & 0x3f;
+                let mailbox_diagnostics = mailbox.diagnostics();
                 eprintln!(
                     "FAIL-LOUD pid={pid}: guest executed at EL1 and faulted \
                      (current-EL sync vector) — carrick state corruption (a guest \
                      resume left PSTATE at EL1, commonly a signal handler entered \
                      with SPSR_EL1=EL1h). Was a silent 100% CPU spin before the \
                      hvc #3 vector trap. esr_el1={esr_el1:#x} ec={ec:#x} \
-                     elr_el1={elr_el1:#x} far_el1={far_el1:#x} spsr_el1={spsr_el1:#x}",
+                     elr_el1={elr_el1:#x} far_el1={far_el1:#x} spsr_el1={spsr_el1:#x} \
+                     mailbox={mailbox_diagnostics:?}",
                     pid = unsafe { libc::getpid() },
                 );
                 return Err(TrapError::GuestAtEl1 {

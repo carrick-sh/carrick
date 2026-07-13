@@ -310,6 +310,7 @@ underlying gap got fixed):
 
 | Invariant | Owned by | Stands in for (LTP) |
 |---|---|---|
+| **AArch64 ordinary-syscall ABI preservation through the HVF mailbox: `getppid` changes only x0 while x1..x30 and SP retain distinct sentinels. Proven red with x16/x17 restoration removed (`mismatch_mask=0x00018000`) before the production vector matched Linux.** | ✅ `mailboxregs` | (AArch64 syscall ABI) |
 | uname/sysinfo/getrlimit/prlimit64/prctl/getrandom/sched_getaffinity/sched_yield/getpriority/gettid/umask/getcpu/capget | ✅ `sysinfo` | uname01–04, sysinfo01–03, getrlimit01–03, prlimit64_01–02, prctl01–08, getrandom01–05, sched_getaffinity01, sched_yield01, getpriority01/02, gettid01, umask01–03, getcpu01/02, capget01/02 |
 | **`PR_SET_DUMPABLE`/`PR_GET_DUMPABLE` tri-state round-trip (0↔1↔2) + EINVAL on bogus values** | ✅ `prctldumpable` | prctl04, prctl08 |
 | **setfsuid/setfsgid fs-id model: a tracked fsuid/fsgid (default = euid/egid, reset by every set*uid/set*gid) that setfs*id RETURNS (the previous value) and updates when privileged or the arg matches r/e/s/fs; `(uid_t)-1` is a query** | ✅ `setfsid` | setfsuid01/03, setfsgid01/02 (setfsuid04 = fs-id DAC open() enforcement, the host-backed guest-root class — deferred) |
