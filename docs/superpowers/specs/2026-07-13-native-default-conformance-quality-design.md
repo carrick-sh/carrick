@@ -61,8 +61,8 @@ The failures separate into three measured classes:
 2. **Direct-exec reservation false collisions.** Node and gzip replacements
    fail before image retirement because hint-based `mmap` redirects to
    `0x7000000000`. After a current Direct mapping splits the dyld delegated
-   range, the old single-covering-region test no longer recognizes the vacant
-   tail.
+   range into adjacent empty Mach regions, the old single-covering-region test
+   cannot classify the complete target interval.
 3. **Post-fork thread creation.** `go-runtime`, `go-sync`, and 19 CPython
    threading assertions reach the explicit `EOPNOTSUPP` guard that prevents
    guest thread creation after fork-to-emulated-exec. `go-build` separately
@@ -154,22 +154,26 @@ Current code must time out; repaired code must exit promptly. The live
 
 ### Slice B: exact non-overwriting Direct reservations
 
-Replace the hint-based first attempt with an exact Mach reservation using
-`mach_vm_allocate(..., VM_FLAGS_FIXED)` without `VM_FLAGS_OVERWRITE`. The local
-SDK contract says fixed allocation succeeds at the requested address only when
-possible; overwrite is a separate explicit flag. Protect a successful
-allocation with `VM_PROT_NONE` and keep the existing RAII reservation through
-image mapping and relocation.
+Replace the hint-based attempt with a segment walk over the complete target
+interval. Acquire every true gap exactly with
+`mach_vm_allocate(..., VM_FLAGS_FIXED)` without `VM_FLAGS_OVERWRITE`, protect it
+with `VM_PROT_NONE`, and retain every acquired span in the existing RAII guard
+through image mapping and relocation. The local SDK contract says fixed
+allocation succeeds at the requested address only when possible; overwrite is
+a separate explicit flag.
 
-If exact allocation reports no space, accept only the already measured dyld
-delegated empty tuple. Never use `MAP_FIXED` as a vacancy probe and never accept
-an arbitrary gap without acquiring ownership. Use maintained Rust Mach bindings
-rather than adding a new raw FFI declaration.
+When exact allocation reports no space, skip only the measured dyld delegated
+empty tuple and continue at that region's end. This handles a target spanning
+multiple adjacent delegated regions without treating them as one covering
+region. Never use `MAP_FIXED` as a vacancy probe and never accept an arbitrary
+gap without acquiring ownership. Use maintained Rust Mach bindings rather than
+adding a new raw FFI declaration.
 
 The red host test reproduces the real split shape: map a source page in the
-canonical Direct range, fork, then reserve the Node-sized target tail. Existing
-sentinel-preservation tests remain the collision safety gate. Live gzip exec,
-Node app smoke, and Node V8 smoke prove the workload path.
+canonical Direct range, fork, then classify the Node-sized target across the
+adjacent dyld regions. Existing sentinel-preservation tests remain the
+collision safety gate. Live gzip exec must match; Node app and V8 smoke must
+advance past reservation to the separately tracked post-fork thread gate.
 
 ### Slice C: post-fork thread lifecycle
 
