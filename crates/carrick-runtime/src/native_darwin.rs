@@ -5877,12 +5877,13 @@ impl NativeMappedMemory {
             plan.page_geometry.host_page_size,
         )
         .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
-        let target_only = match (self.address_mode, native_layout.address_mode()) {
-            (NativeAddressMode::Direct, NativeAddressMode::Direct) => {
-                subtract_host_ranges(native_layout.owned_ranges(), &self.owned_host_ranges)
-            }
-            (_, NativeAddressMode::Direct) => native_layout.owned_ranges().to_vec(),
-            (_, NativeAddressMode::Biased { .. }) => Vec::new(),
+        let target_only = if matches!(native_layout.address_mode(), NativeAddressMode::Direct) {
+            // Every Carrick-owned overlap can transfer continuously into a
+            // Direct replacement, regardless of the source address mode.
+            // External mappings remain in target_only and fail the screen.
+            subtract_host_ranges(native_layout.owned_ranges(), &self.owned_host_ranges)
+        } else {
+            Vec::new()
         };
         let mut direct_target_reservations = Vec::with_capacity(target_only.len());
         let reset_inherited_translator =
@@ -5950,11 +5951,10 @@ impl NativeMappedMemory {
                     .to_string(),
             ));
         }
-        let retained_direct_ranges = if matches!(self.address_mode, NativeAddressMode::Direct)
-            && matches!(
-                prepared.native_layout.address_mode(),
-                NativeAddressMode::Direct
-            ) {
+        let retained_direct_ranges = if matches!(
+            prepared.native_layout.address_mode(),
+            NativeAddressMode::Direct
+        ) {
             prepared.native_layout.owned_ranges()
         } else {
             &[]
@@ -8401,41 +8401,57 @@ mod tests {
     }
 
     #[test]
-    fn biased_source_owned_host_interval_is_not_transferable_to_direct_target() {
+    fn biased_guest_execve_transfers_owned_overlap_to_high_direct_target() {
         fork_test(|| {
-            let plan = native16k_test_plan();
-            let source = lifecycle_image(LifecycleImageKind::LowExec, 0x4b);
-            let memory = NativeMappedMemory::map(
-                &source,
-                native_memory_layout(),
-                plan.page_geometry.host_page_size,
-                plan.page_geometry.linux_page_size,
-            )
-            .expect("map biased source image");
-            let source_guest = source.regions()[0].start;
-            let source_host = memory
-                .host_address(carrick_guest_mem::GuestVa(source_guest))
-                .expect("translate biased source image")
-                .raw() as u64;
-            assert!(source_host >= NATIVE_DARWIN_HARD_PAGEZERO_END);
-            let target = lifecycle_image_at(source_host, 0x72);
+            use std::os::unix::fs::PermissionsExt;
 
-            let error = memory
-                .prepare_exec_mapping(&target, &plan)
-                .err()
-                .expect("biased source ownership cannot transfer to a Direct target");
-            assert!(
-                error
-                    .to_string()
-                    .contains("native direct VM reservation collision"),
-                "unexpected error: {error}"
-            );
+            let source_guest_base = 0x40_0000;
+            let target_base = address::BIAS_CANDIDATES[0] + source_guest_base;
+            let blockers: Vec<_> = address::BIAS_CANDIDATES
+                .into_iter()
+                .skip(1)
+                .map(|bias| {
+                    address::OwnedHostMapping::map_exact(
+                        carrick_guest_mem::HostVa((bias + source_guest_base) as usize),
+                        16 * 1024,
+                        libc::PROT_NONE,
+                        libc::MAP_ANON | libc::MAP_PRIVATE,
+                    )
+                    .expect("block alternate source bias")
+                })
+                .collect();
+            let mut target = tempfile::NamedTempFile::new().expect("create high Direct target");
+            std::io::Write::write_all(&mut target, &exec_target_pc_elf_at(target_base))
+                .expect("write high Direct target");
+            std::fs::set_permissions(target.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("make high Direct target executable");
+            let mut source = tempfile::NamedTempFile::new().expect("create biased exec source");
+            std::io::Write::write_all(
+                &mut source,
+                &execve_source_elf(LifecycleImageKind::LowExec, target.path()),
+            )
+            .expect("write biased exec source");
+
+            let dispatcher = SyscallDispatcher::new();
+            dispatcher.set_stream_stdio(true);
+            let result = run_static_elf(
+                source.path(),
+                dispatcher,
+                ["biased-overlap-exec".to_string()],
+                std::iter::empty::<String>(),
+                64,
+                None,
+                &native16k_test_plan(),
+            )
+            .expect("run biased-to-high-Direct overlap exec");
+            assert_eq!(result.exit_code, 0, "stderr={:?}", result.stderr);
+            assert_eq!(result.stdout.len(), 8, "stderr={:?}", result.stderr);
             assert_eq!(
-                memory
-                    .read_bytes(source_guest + 0x80, 1)
-                    .expect("old biased image survives target screening"),
-                [0x4b]
+                u64::from_le_bytes(result.stdout.try_into().expect("eight-byte guest PC")),
+                target_base,
+                "high Direct target must execute at the biased source's prior host-owned page"
             );
+            drop(blockers);
         });
     }
 
@@ -8550,6 +8566,22 @@ mod tests {
             LifecycleImageKind::DirectPie => dsr_test_elf(&words),
             LifecycleImageKind::LowExec => dsr_low_et_exec_test_elf(&words),
         }
+    }
+
+    fn exec_target_pc_elf_at(guest_base: u64) -> Vec<u8> {
+        let words = [
+            0x1000_0000, // adr x0, . (architectural guest PC)
+            0xd100_43e1, // sub x1, sp, #16
+            0xf900_0020, // str x0, [x1]
+            0xd280_0020, // mov x0, #1 (stdout)
+            0xd280_0102, // mov x2, #8
+            0xd280_0808, // mov x8, #64 (write)
+            SVC_0,
+            0xd280_0000, // mov x0, #0
+            0xd280_0ba8, // mov x8, #93 (exit)
+            SVC_0,
+        ];
+        dsr_et_exec_test_elf_at(&words, guest_base)
     }
 
     #[test]
