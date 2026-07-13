@@ -143,7 +143,7 @@ volatile access because a running guest is not a Rust thread.
 - Create: `crates/carrick-aarch64/src/mailbox.rs`
 - Modify: `crates/carrick-aarch64/src/lib.rs`
 
-- [ ] **Step 1: Add layout and value tests first**
+- [x] **Step 1: Add layout and value tests first**
 
 Tests must assert size, alignment, every offset in the table above, enum raw
 values, and uniqueness. Add protocol-model tests for:
@@ -164,7 +164,7 @@ items so they fail to compile. Confirm RED:
 cargo test -p carrick-aarch64 mailbox --lib -- --nocapture
 ```
 
-- [ ] **Step 2: Implement the wire type without backend dependencies**
+- [x] **Step 2: Implement the wire type without backend dependencies**
 
 Keep mutation methods out of the wire struct. Provide typed raw-value parsers
 that return errors for unknown values. Use `std::sync::atomic::AtomicU32` only
@@ -173,7 +173,7 @@ for `state`; payload access belongs to the HVF binding module.
 Add const assertions using `size_of`, `align_of`, and `offset_of`; do not rely
 only on runtime tests.
 
-- [ ] **Step 3: Run and commit**
+- [x] **Step 3: Run and commit**
 
 ```sh
 cargo test -p carrick-aarch64 mailbox --lib -- --nocapture
@@ -204,7 +204,7 @@ git commit -m "feat(arch): define aarch64 syscall mailbox protocol" -m "Add a fi
 - macOS VMM initial and execve image construction install the same vector and
   arena. Native DSR and non-macOS VMM image construction do not.
 
-- [ ] **Step 1: Add red region and decoded-word tests**
+- [x] **Step 1: Add red region and decoded-word tests**
 
 Extend the current vector tests to prove:
 
@@ -231,13 +231,13 @@ cargo test -p carrick-mem mailbox --lib -- --nocapture
 cargo test -p carrick-mem el1_vectors --lib -- --nocapture
 ```
 
-- [ ] **Step 2: Implement the arena builder**
+- [x] **Step 2: Implement the arena builder**
 
 Add constants directly after the identity-page constants. Update every
 `AddressSpace` destructuring/reconstruction site so new metadata is not lost;
 the fixed base means no new serialized control-register field is required.
 
-- [ ] **Step 3: Implement vector emission**
+- [x] **Step 3: Implement vector emission**
 
 Factor shared identity dispatch rather than duplicating its instruction table.
 Use SP_EL1 as the slot base. At exception entry, save any scratch register
@@ -248,14 +248,14 @@ host-prepared signal or sigreturn registers under `RegistersPrepared`.
 The vector never polls. It performs one request publication, one HVC, one
 response validation, and one `eret`.
 
-- [ ] **Step 4: Install only on the macOS VMM path**
+- [x] **Step 4: Install only on the macOS VMM path**
 
 In both initial image setup and `runtime/exec.rs`, select the mailbox vector and
 arena under the macOS VMM build. Keep KVM AArch64 on the existing vector until
 separate evidence. The `syscall-shim` feature controls identity handlers, not
 whether the mailbox exists.
 
-- [ ] **Step 5: Run and commit**
+- [x] **Step 5: Run and commit**
 
 ```sh
 cargo test -p carrick-mem mailbox --lib -- --nocapture
@@ -293,7 +293,7 @@ git commit -m "feat(arch): publish syscalls through an el1 mailbox" -m "Reserve 
 - A process-global monotonic atomic supplies nonzero generations on initial
   bind and every vCPU incarnation/rebind.
 
-- [ ] **Step 1: Add red allocator and protocol-consumer tests**
+- [x] **Step 1: Add red allocator and protocol-consumer tests**
 
 Unit tests use an aligned in-memory mailbox and prove:
 
@@ -314,7 +314,7 @@ Confirm RED:
 cargo test -p carrick-vmm-hvf syscall_mailbox --lib -- --nocapture
 ```
 
-- [ ] **Step 2: Implement allocator, lease, and volatile payload access**
+- [x] **Step 2: Implement allocator, lease, and volatile payload access**
 
 The allocator may use `parking_lot::Mutex<[bool; 256]>`; this state is
 thread-shared inside one process and COW-copied only after Carrick has quiesced
@@ -324,7 +324,7 @@ Read/write non-atomic fields with `read_volatile`/`write_volatile`. Validate the
 header before any frame conversion. Use the wire `state` atomic for
 release/acquire publication.
 
-- [ ] **Step 3: Expand `HvfAarch64Vcpu`**
+- [x] **Step 3: Expand `HvfAarch64Vcpu`**
 
 Replace the tuple newtype with named fields:
 
@@ -345,7 +345,7 @@ the host pointer with `host_ptr(LINUX_SYSCALL_MAILBOX_BASE + offset, 256)`, stam
 the header, and set SP_EL1 to the slot guest address. Failure before first guest
 entry returns `TrapError`, never a null binding.
 
-- [ ] **Step 4: Rebind every vCPU lifecycle path**
+- [x] **Step 4: Rebind every vCPU lifecycle path**
 
 Create one helper `rebind_mailbox_after_vcpu_create(vcpu, binding)` that:
 
@@ -370,7 +370,7 @@ rg -n 'SP_EL1|create_vcpu|new_vcpu|replace\(vcpu' \
 
 Every fresh vCPU must be followed by mailbox binding before it can run.
 
-- [ ] **Step 5: Run and commit**
+- [x] **Step 5: Run and commit**
 
 ```sh
 cargo test -p carrick-vmm-hvf syscall_mailbox --lib -- --nocapture
@@ -406,11 +406,14 @@ git commit -m "feat(hvf): bind a mailbox to each logical vcpu" -m "Allocate Carr
 - HVF mailbox mode overrides the hook to publish `NormalReturn`; it issues no
   `hv_vcpu_set_reg(x0)`.
 - HVF legacy mode keeps the default register completion.
-- `HvfAarch64Vcpu::run` calls `prepare_outstanding_request_for_reentry()` before
-  `hv_vcpu_run`: `RequestReady` becomes `RegistersPrepared`, `ResponseReady` is
-  left for the vector, and `Idle` is a normal EL0/kick entry.
+- Signal injection and sigreturn call an explicit backend hook after replacing
+  the live resume context. HVF publishes `RegistersPrepared` from that hook;
+  internal EL1 maintenance leaves `RequestReady` host-owned until ordinary
+  completion. (A generic pre-run heuristic was rejected by the signed mmap
+  smoke because page-table maintenance legitimately re-enters the vCPU before
+  the syscall has a return value.)
 
-- [ ] **Step 1: Add red shared-engine tests with a mock vCPU**
+- [x] **Step 1: Add red shared-engine tests with a mock vCPU**
 
 Extend `carrick-aarch64` mocks to prove generic completion delegates exactly
 once and does not separately set x0. Keep a KVM/default-hook test proving x0 and
@@ -435,13 +438,13 @@ cargo test -p carrick-aarch64 complete_syscall --lib -- --nocapture
 cargo test -p carrick-vmm-hvf mailbox_decode --lib -- --nocapture
 ```
 
-- [ ] **Step 2: Implement the backend completion hook**
+- [x] **Step 2: Implement the backend completion hook**
 
 Move the current engine x0/x9 body into the trait default without changing its
 ordering. Override only in HVF. Do not add a mailbox capability conditional to
 the runtime dispatcher.
 
-- [ ] **Step 3: Decode mailbox ownership at HVC2**
+- [x] **Step 3: Decode mailbox ownership at HVC2**
 
 In `run_to_exit`, after identifying HVC2:
 
@@ -454,19 +457,15 @@ In `run_to_exit`, after identifying HVC2:
 
 Keep `hvc #3` fail-loud behavior distinct from protocol errors.
 
-- [ ] **Step 4: Implement automatic `RegistersPrepared` re-entry**
+- [x] **Step 4: Implement explicit `RegistersPrepared` publication**
 
-Immediately before every `hv_vcpu_run`, inspect the binding. A still-owned
-`RequestReady` means the runtime intentionally prepared live registers without
-calling normal completion (signal handler entry, `rt_sigreturn`, ptrace stop/
-resume, or fork-child state), so publish `RegistersPrepared`. This central
-hook is the only exceptional response publication site.
+After signal injection or sigreturn replaces the live resume registers, call a
+backend hook that publishes `RegistersPrepared` for an outstanding mailbox.
+This happens after all register edits and before guest entry. Do not infer the
+action from `hv_vcpu_run`: mmap/mprotect may run Carrick's internal EL1
+maintenance trampoline while dispatch still owns `RequestReady`.
 
-This must happen after all host register edits and before guest entry. It must
-not run while dispatch still owns the vCPU; the runtime calls `run` only after
-an outcome is complete.
-
-- [ ] **Step 5: Run and commit**
+- [x] **Step 5: Run and commit**
 
 ```sh
 cargo test -p carrick-aarch64 complete_syscall --lib -- --nocapture

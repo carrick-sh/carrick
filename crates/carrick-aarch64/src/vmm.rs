@@ -217,6 +217,31 @@ pub trait Aarch64Vcpu {
         Ok(None)
     }
 
+    /// Complete one ordinary syscall through this backend's return transport.
+    ///
+    /// The default is the established register path used by KVM: write x0 and
+    /// restore x9 only when the trap vehicle reports that it clobbered it. HVF
+    /// overrides this in mailbox mode so ordinary completion performs no
+    /// Hypervisor.framework register calls; its diagnostic legacy mode retains
+    /// the same register behavior.
+    fn complete_syscall_return(&mut self, return_value: i64) -> Result<(), TrapError> {
+        self.set_reg(Reg::X(0), return_value as u64)?;
+        if let Some(saved_x9) = self.get_saved_x9()? {
+            self.set_reg(Reg::X(9), saved_x9)?;
+        }
+        Ok(())
+    }
+
+    /// Publish that the host has replaced the live register resume context.
+    ///
+    /// Most backends return directly through their register file and need no
+    /// extra work. HVF mailbox mode overrides this so signal injection and
+    /// sigreturn bypass a pending ordinary-return payload without treating
+    /// unrelated internal EL1 maintenance as a syscall response.
+    fn prepare_register_resume(&mut self) -> Result<(), TrapError> {
+        Ok(())
+    }
+
     /// Stamp the guest-visible thread id into the per-thread scratch sysreg the
     /// EL1-vector `gettid` fast path reads, so `gettid(2)` is serviced at EL1
     /// without a host trap. DEFAULT `Ok(())` (no-op) ⟹ this backend has no
@@ -646,4 +671,98 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
     /// A guest thread is exiting: destroy its vCPU (freeing an HVF concurrent-vCPU
     /// slot). KVM no-op (vCPU drops with the engine).
     fn destroy_vcpu_on_thread_exit(&mut self, _vcpu: &mut Self::Vcpu) {}
+}
+
+#[cfg(test)]
+mod completion_tests {
+    use super::*;
+
+    struct RegisterCompletionVcpu {
+        writes: Vec<(Reg, u64)>,
+        saved_x9: Option<u64>,
+    }
+
+    impl Aarch64Vcpu for RegisterCompletionVcpu {
+        fn get_reg(&self, _r: Reg) -> Result<u64, TrapError> {
+            Ok(0)
+        }
+
+        fn set_reg(&mut self, r: Reg, v: u64) -> Result<(), TrapError> {
+            self.writes.push((r, v));
+            Ok(())
+        }
+
+        fn get_sys_reg(&self, _r: SysReg) -> Result<u64, TrapError> {
+            Ok(0)
+        }
+
+        fn set_sys_reg(&mut self, _r: SysReg, _v: u64) -> Result<(), TrapError> {
+            Ok(())
+        }
+
+        fn get_vreg(&self, _n: u32) -> Result<u128, TrapError> {
+            Ok(0)
+        }
+
+        fn set_vreg(&mut self, _n: u32, _v: u128) -> Result<(), TrapError> {
+            Ok(())
+        }
+
+        fn get_fpcr(&self) -> Result<u64, TrapError> {
+            Ok(0)
+        }
+
+        fn set_fpcr(&mut self, _v: u64) -> Result<(), TrapError> {
+            Ok(())
+        }
+
+        fn get_fpsr(&self) -> Result<u64, TrapError> {
+            Ok(0)
+        }
+
+        fn set_fpsr(&mut self, _v: u64) -> Result<(), TrapError> {
+            Ok(())
+        }
+
+        fn get_esr_el1(&self) -> Result<u64, TrapError> {
+            Ok(0)
+        }
+
+        fn get_far_el1(&self) -> Result<u64, TrapError> {
+            Ok(0)
+        }
+
+        fn snapshot(&self) -> Result<Aarch64VcpuSnapshot, TrapError> {
+            Err(TrapError::Hypervisor("unused test snapshot".into()))
+        }
+
+        fn restore(&mut self, _snap: &Aarch64VcpuSnapshot) -> Result<(), TrapError> {
+            Ok(())
+        }
+
+        fn get_saved_x9(&self) -> Result<Option<u64>, TrapError> {
+            Ok(self.saved_x9)
+        }
+
+        fn run(&mut self) -> Result<Aarch64Exit, TrapError> {
+            Ok(Aarch64Exit::Halt)
+        }
+
+        fn kick(&self) -> Result<(), TrapError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn default_complete_syscall_return_preserves_register_transport() {
+        let mut vcpu = RegisterCompletionVcpu {
+            writes: Vec::new(),
+            saved_x9: Some(0x9999),
+        };
+        vcpu.complete_syscall_return(-9).expect("completion");
+        assert_eq!(
+            vcpu.writes,
+            vec![(Reg::X(0), (-9_i64) as u64), (Reg::X(9), 0x9999)]
+        );
+    }
 }

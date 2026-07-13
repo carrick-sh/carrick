@@ -151,10 +151,14 @@ pub struct MailboxRequest {
     pub esr: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum MailboxConsumeError {
     #[error("invalid AArch64 syscall mailbox request: {0:?}")]
     Protocol(MailboxProtocolError),
+    #[error("AArch64 syscall HVC arrived without a published mailbox request")]
+    MissingRequest,
+    #[error("legacy HVF syscall register decode failed: {0}")]
+    Legacy(String),
 }
 
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
@@ -177,12 +181,35 @@ pub struct MailboxBinding {
     transport: HvfSyscallTransport,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MailboxDiagnostics {
+    pub sequence: u64,
+    pub state: u32,
+    pub native_nr: u64,
+    pub return_value: u64,
+}
+
 // SAFETY: the pointer names a fixed, process-lifetime HVF guest mapping. A
 // binding has one logical vCPU owner and moves only with that vCPU to its owning
 // host thread; guest/host ownership is synchronized by the mailbox state word.
 unsafe impl Send for MailboxBinding {}
 
 impl MailboxBinding {
+    pub fn diagnostics(&self) -> MailboxDiagnostics {
+        let mailbox = self.host.as_ptr();
+        // SAFETY: the binding owns a live complete mailbox slot. Diagnostics are
+        // sampled only while the vCPU is stopped after a protocol failure.
+        unsafe {
+            MailboxDiagnostics {
+                sequence: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).sequence)),
+                state: self.state().load(Ordering::Acquire),
+                native_nr: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).native_nr)),
+                return_value: core::ptr::read_volatile(core::ptr::addr_of!(
+                    (*mailbox).return_value
+                )),
+            }
+        }
+    }
     /// Bind a Carrick-owned slot to its fixed host mapping.
     ///
     /// # Safety
@@ -306,6 +333,25 @@ impl MailboxBinding {
         Ok(Some(request))
     }
 
+    /// Decode an HVC2 syscall from the selected internal transport. Both modes
+    /// validate and consume the mailbox publication; diagnostic legacy mode then
+    /// deliberately obtains the frame through the supplied register reader.
+    pub fn decode_request<F>(
+        &mut self,
+        legacy_decode: F,
+    ) -> Result<MailboxRequest, MailboxConsumeError>
+    where
+        F: FnOnce() -> Result<MailboxRequest, MailboxConsumeError>,
+    {
+        let request = self
+            .take_request()?
+            .ok_or(MailboxConsumeError::MissingRequest)?;
+        match self.transport {
+            HvfSyscallTransport::Mailbox => Ok(request),
+            HvfSyscallTransport::Legacy => legacy_decode(),
+        }
+    }
+
     pub fn publish_normal_return(&mut self, value: i64) -> Result<(), MailboxConsumeError> {
         self.require_request_ready()?;
         // SAFETY: the host owns RequestReady and publishes state only after both
@@ -338,6 +384,36 @@ impl MailboxBinding {
         self.state()
             .store(MailboxState::ResponseReady.raw(), Ordering::Release);
         Ok(())
+    }
+
+    /// Mark an outstanding syscall response as register-prepared after the host
+    /// has explicitly replaced the resume context (signal injection/sigreturn).
+    /// Internal EL1 maintenance must not call this: it re-enters the same vCPU
+    /// while the original syscall request is still awaiting its ordinary result.
+    pub fn publish_register_resume_if_outstanding(&mut self) -> Result<(), MailboxConsumeError> {
+        match MailboxState::try_from(self.state().load(Ordering::Acquire)) {
+            Ok(MailboxState::RequestReady | MailboxState::ResponseReady) => {
+                // SAFETY: the vCPU is stopped and the host owns both response
+                // states. Prepared intentionally supersedes a normal payload when
+                // signal delivery replaces the live return context.
+                unsafe {
+                    self.write_volatile(
+                        core::ptr::addr_of_mut!((*self.host.as_ptr()).response_action),
+                        MailboxResponseAction::RegistersPrepared.raw(),
+                    );
+                }
+                self.state()
+                    .store(MailboxState::ResponseReady.raw(), Ordering::Release);
+                Ok(())
+            }
+            Ok(MailboxState::Idle) => Ok(()),
+            Err(unknown) => Err(MailboxConsumeError::Protocol(
+                MailboxProtocolError::UnexpectedState {
+                    expected: MailboxState::RequestReady,
+                    actual: unknown.0,
+                },
+            )),
+        }
     }
 
     fn require_request_ready(&self) -> Result<(), MailboxConsumeError> {
@@ -619,5 +695,110 @@ mod tests {
         );
         let error = HvfSyscallTransport::parse(Some("auto")).expect_err("invalid value");
         assert!(error.to_string().contains("CARRICK_HVF_SYSCALL_TRANSPORT"));
+    }
+
+    #[test]
+    fn mailbox_decode_never_invokes_legacy_register_reader() {
+        let (mut binding, mut mailbox) = binding();
+        publish_valid_request(&binding, &mut mailbox);
+        let mut register_reads = 0;
+        let request = binding
+            .decode_request(|| {
+                register_reads += 1;
+                Err(MailboxConsumeError::MissingRequest)
+            })
+            .expect("mailbox request");
+        assert_eq!(request.frame.x8, 64);
+        assert_eq!(register_reads, 0);
+    }
+
+    #[test]
+    fn legacy_decode_validates_mailbox_then_invokes_register_reader() {
+        let allocator = Arc::new(MailboxSlotAllocator::new());
+        let lease = allocator.allocate().expect("slot");
+        let mut mailbox = Box::new(Aarch64SyscallMailbox {
+            magic: 0,
+            version: 0,
+            size: 0,
+            generation: 0,
+            sequence: 0,
+            state: std::sync::atomic::AtomicU32::new(0),
+            trap_kind: 0,
+            response_action: 0,
+            flags: 0,
+            native_nr: 0,
+            args: [0; 6],
+            x8: 0,
+            resume_pc: 0,
+            spsr: 0,
+            fp: 0,
+            lr: 0,
+            sp: 0,
+            esr: 0,
+            return_value: 0,
+            resume_x16: 0,
+            resume_x17: 0,
+            reserved: [0; 72],
+        });
+        let pointer = NonNull::from(mailbox.as_mut());
+        let mut binding =
+            unsafe { MailboxBinding::new(lease, pointer, HvfSyscallTransport::Legacy) };
+        publish_valid_request(&binding, &mut mailbox);
+        let mut register_reads = 0;
+        let request = binding
+            .decode_request(|| {
+                register_reads += 1;
+                Ok(MailboxRequest {
+                    frame: carrick_guest_mem::Aarch64SyscallFrame {
+                        x0: 90,
+                        x1: 91,
+                        x2: 92,
+                        x3: 93,
+                        x4: 94,
+                        x5: 95,
+                        x8: 172,
+                    },
+                    native_nr: 172,
+                    resume_pc: 0x7777,
+                    spsr: 0,
+                    fp: 0,
+                    lr: 0,
+                    sp: 0,
+                    esr: 0,
+                })
+            })
+            .expect("legacy request");
+        assert_eq!(request.frame.x8, 172);
+        assert_eq!(register_reads, 1);
+    }
+
+    #[test]
+    fn explicit_register_resume_prepares_only_an_outstanding_request() {
+        let (mut binding, mut mailbox) = binding();
+        publish_valid_request(&binding, &mut mailbox);
+        assert_eq!(
+            mailbox.state.load(Ordering::Acquire),
+            MailboxState::RequestReady.raw()
+        );
+        binding
+            .publish_register_resume_if_outstanding()
+            .expect("prepared resume");
+        assert_eq!(
+            mailbox.response_action,
+            MailboxResponseAction::RegistersPrepared.raw()
+        );
+        assert_eq!(
+            mailbox.state.load(Ordering::Acquire),
+            MailboxState::ResponseReady.raw()
+        );
+        binding
+            .publish_register_resume_if_outstanding()
+            .expect("prepared response overwrite");
+        mailbox
+            .state
+            .store(MailboxState::Idle.raw(), Ordering::Release);
+        binding
+            .publish_register_resume_if_outstanding()
+            .expect("idle resume");
     }
 }
