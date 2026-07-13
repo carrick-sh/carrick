@@ -3123,6 +3123,21 @@ where
         .collect()
 }
 
+/// Resolve the integration probe pool width without changing the historical
+/// auto policy. `CARRICK_PROBE_WORKERS` is deliberately local to this test
+/// harness; the standalone conformance binary owns its separate worker knob.
+fn probe_worker_count(requested: Option<&str>, available: Option<usize>) -> Result<usize, String> {
+    match requested {
+        Some(raw) => raw
+            .parse::<usize>()
+            .map(|workers| workers.clamp(1, 8))
+            .map_err(|error| format!("invalid CARRICK_PROBE_WORKERS={raw:?}: {error}")),
+        None => Ok(available
+            .map(|workers| workers.saturating_sub(2).clamp(1, 8))
+            .unwrap_or(4)),
+    }
+}
+
 #[test]
 fn conformance_probes() {
     let _serial = CONFORMANCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -3161,6 +3176,12 @@ fn conformance_probes() {
     let requested_exec_backend = std::env::var("CARRICK_EXEC_BACKEND").ok();
     let requested_probe_libc = std::env::var("CARRICK_PROBE_LIBC").ok();
     let requested_probe_names = std::env::var("CARRICK_PROBE_FILTER").ok();
+    let requested_probe_workers = std::env::var("CARRICK_PROBE_WORKERS").ok();
+    let n_workers = probe_worker_count(
+        requested_probe_workers.as_deref(),
+        std::thread::available_parallelism().ok().map(|n| n.get()),
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
     for lane in LANES {
         if !lane_allowed_for_backend(lane, requested_exec_backend.as_deref()) {
             eprintln!(
@@ -3247,10 +3268,6 @@ fn conformance_probes() {
             let (quarantine, parallel): (Vec<PathBuf>, Vec<PathBuf>) =
                 probes.into_iter().partition(|p| is_timing_sensitive(p));
             let transport = probe_transport(requested_exec_backend.as_deref(), set.libc);
-
-            let n_workers = std::thread::available_parallelism()
-                .map(|n| n.get().saturating_sub(2).clamp(1, 8))
-                .unwrap_or(4);
 
             // TWO PHASES so the HVF runtime under test NEVER runs concurrently with
             // the Docker LinuxKit VM (the oracle): mixing them starves both and skews
@@ -4196,6 +4213,39 @@ fn probe_campaign_name_filter_selects_requested_cases() {
         Some("aliassize,forkshared")
     ));
     assert!(probe_name_allowed("devnullseek", None));
+}
+
+#[test]
+fn probe_workers_default_preserves_auto_parallelism() {
+    assert_eq!(probe_worker_count(None, Some(10)).expect("auto workers"), 8);
+    assert_eq!(probe_worker_count(None, Some(6)).expect("auto workers"), 4);
+    assert_eq!(probe_worker_count(None, None).expect("fallback workers"), 4);
+}
+
+#[test]
+fn probe_workers_explicit_one_serializes_the_lane() {
+    assert_eq!(
+        probe_worker_count(Some("1"), Some(10)).expect("explicit workers"),
+        1
+    );
+}
+
+#[test]
+fn probe_workers_explicit_values_are_clamped_to_the_supported_range() {
+    assert_eq!(
+        probe_worker_count(Some("0"), Some(10)).expect("zero clamps to one"),
+        1
+    );
+    assert_eq!(
+        probe_worker_count(Some("99"), Some(10)).expect("large value clamps to eight"),
+        8
+    );
+}
+
+#[test]
+fn probe_workers_rejects_non_numeric_values() {
+    let error = probe_worker_count(Some("many"), Some(10)).expect_err("invalid worker count");
+    assert!(error.contains("CARRICK_PROBE_WORKERS"));
 }
 
 #[test]
