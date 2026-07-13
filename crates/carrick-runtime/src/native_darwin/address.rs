@@ -5,7 +5,7 @@ use carrick_guest_mem::{GuestVa, HostVa};
 use crate::dispatch::MemoryLayout;
 use crate::memory::AddressSpace;
 
-const BIAS_CANDIDATES: [u64; 4] = [
+pub(super) const BIAS_CANDIDATES: [u64; 4] = [
     0x80_0000_0000,
     0xc0_0000_0000,
     0x100_0000_0000,
@@ -66,6 +66,7 @@ impl OwnedHostMapping {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn range(&self) -> Range<HostVa> {
         self.range.clone()
     }
@@ -100,9 +101,8 @@ impl CandidateLayout {
         image: &AddressSpace,
         layout: MemoryLayout,
         host_page_size: u64,
-        host_bias: NativeHostBias,
+        mode: NativeAddressMode,
     ) -> Result<Self, NativeAddressError> {
-        let mode = NativeAddressMode::Biased { host_bias };
         let mut guest_ranges = Vec::with_capacity(image.regions().len() + 5);
         for region in image.regions() {
             guest_ranges.push(GuestVa(region.start)..GuestVa(region.end));
@@ -142,17 +142,29 @@ impl CandidateLayout {
         }
         let mut ranges = Vec::with_capacity(guest_ranges.len());
         for guest in guest_ranges {
-            if guest.start.raw() >= guest.end.raw()
-                || guest.start.raw() & page_mask != 0
-                || guest.end.raw() & page_mask != 0
-            {
+            if guest.start.raw() >= guest.end.raw() {
                 return Err(NativeAddressError::InvalidGuestRange {
                     start: guest.start.raw(),
                     end: guest.end.raw(),
                     page_size: host_page_size,
                 });
             }
-            let host = mode.to_host_range(guest)?;
+            // Mach VM owns mappings in host-page units even when an ELF or
+            // injected runtime region contains fewer bytes (the vvar is a
+            // Linux 4K page under native16k). Reserve the complete host pages
+            // that a later fixed mapping can replace, rather than rejecting a
+            // valid image because its byte range is not host-page sized.
+            let aligned_start = guest.start.raw() & !page_mask;
+            let aligned_end = guest
+                .end
+                .raw()
+                .checked_add(page_mask)
+                .map(|end| end & !page_mask)
+                .ok_or(NativeAddressError::GuestRangeOverflow {
+                    start: guest.start.raw(),
+                    length: guest.end.raw().saturating_sub(guest.start.raw()),
+                })?;
+            let host = mode.to_host_range(GuestVa(aligned_start)..GuestVa(aligned_end))?;
             if host.end.raw() as u64 > DARWIN_USER_VA_END {
                 return Err(NativeAddressError::OutsideDarwinUserRange {
                     start: host.start.raw(),
@@ -183,18 +195,7 @@ impl CandidateLayout {
     fn try_map(&self) -> Result<Vec<OwnedHostMapping>, NativeAddressError> {
         let mut mappings = Vec::with_capacity(self.ranges.len());
         for range in &self.ranges {
-            let length = range.end.raw().checked_sub(range.start.raw()).ok_or(
-                NativeAddressError::InvalidHostRange {
-                    start: range.start.raw(),
-                    length: 0,
-                },
-            )?;
-            mappings.push(OwnedHostMapping::map_exact(
-                range.start,
-                length,
-                libc::PROT_NONE,
-                libc::MAP_ANON | libc::MAP_PRIVATE | libc::MAP_NORESERVE,
-            )?);
+            mappings.push(map_reservation(range.start.raw(), range.end.raw())?);
         }
         Ok(mappings)
     }
@@ -206,6 +207,18 @@ impl CandidateLayout {
             ranges: ranges.into(),
         }
     }
+}
+
+fn map_reservation(start: usize, end: usize) -> Result<OwnedHostMapping, NativeAddressError> {
+    let length = end
+        .checked_sub(start)
+        .ok_or(NativeAddressError::InvalidHostRange { start, length: 0 })?;
+    OwnedHostMapping::map_exact(
+        HostVa(start),
+        length,
+        libc::PROT_NONE,
+        libc::MAP_ANON | libc::MAP_PRIVATE | libc::MAP_NORESERVE,
+    )
 }
 
 fn checked_guest_range(start: u64, length: u64) -> Result<Range<GuestVa>, NativeAddressError> {
@@ -241,31 +254,46 @@ impl NativeLayout {
             .iter()
             .all(|region| region.start >= super::NATIVE_DARWIN_HARD_PAGEZERO_END)
         {
+            let candidate = CandidateLayout::for_image(
+                image,
+                layout,
+                host_page_size,
+                NativeAddressMode::Direct,
+            )?;
+            // Preserve the established direct PIE fast path: identity mappings
+            // retain their legacy MAP_FIXED behavior. We still normalize and
+            // record the complete typed host-page ownership plan so exec can
+            // transfer overlapping Carrick-owned intervals and retire every
+            // old page. Only biased layouts acquire collision-probed RAII
+            // reservations.
             return Ok(Self {
                 mode: NativeAddressMode::Direct,
                 reservations: Vec::new(),
-                owned_ranges: Vec::new(),
+                owned_ranges: candidate.ranges,
             });
         }
 
         let mut last_error = None;
         for bias in BIAS_CANDIDATES {
             let host_bias = NativeHostBias::new(bias, host_page_size)?;
-            let candidate =
-                match CandidateLayout::for_image(image, layout, host_page_size, host_bias) {
-                    Ok(candidate) => candidate,
-                    Err(error) => {
-                        last_error = Some(error.to_string());
-                        continue;
-                    }
-                };
+            let candidate = match CandidateLayout::for_image(
+                image,
+                layout,
+                host_page_size,
+                NativeAddressMode::Biased { host_bias },
+            ) {
+                Ok(candidate) => candidate,
+                Err(error) => {
+                    last_error = Some(error.to_string());
+                    continue;
+                }
+            };
             match candidate.try_map() {
                 Ok(reservations) => {
-                    let owned_ranges = reservations.iter().map(OwnedHostMapping::range).collect();
                     return Ok(Self {
                         mode: candidate.mode,
                         reservations,
-                        owned_ranges,
+                        owned_ranges: candidate.ranges,
                     });
                 }
                 Err(error) => last_error = Some(error.to_string()),
@@ -305,12 +333,10 @@ impl NativeLayout {
     }
 
     pub(super) fn commit(mut self) -> (NativeAddressMode, Vec<Range<HostVa>>) {
-        let owned_ranges = self
-            .reservations
-            .drain(..)
-            .map(OwnedHostMapping::commit)
-            .collect();
-        (self.mode, owned_ranges)
+        for reservation in self.reservations.drain(..) {
+            let _ = reservation.commit();
+        }
+        (self.mode, self.owned_ranges)
     }
 }
 
@@ -318,7 +344,6 @@ impl NativeLayout {
 pub(super) struct NativeHostBias(u64);
 
 impl NativeHostBias {
-    #[allow(dead_code)] // Staged for the biased-layout work in Tasks 2-7.
     pub(super) fn new(bias: u64, page_size: u64) -> Result<Self, NativeAddressError> {
         if bias == 0 || !page_size.is_power_of_two() || bias & page_size.saturating_sub(1) != 0 {
             return Err(NativeAddressError::InvalidBias { bias, page_size });
@@ -334,14 +359,10 @@ impl NativeHostBias {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum NativeAddressMode {
     Direct,
-    #[allow(dead_code)] // Staged for the biased-layout work in Tasks 2-7.
-    Biased {
-        host_bias: NativeHostBias,
-    },
+    Biased { host_bias: NativeHostBias },
 }
 
 impl NativeAddressMode {
-    #[allow(dead_code)] // Staged for the biased-layout work in Tasks 2-7.
     pub(super) fn to_host(self, address: GuestVa) -> Result<HostVa, NativeAddressError> {
         let bias = self.bias();
         let translated = address
@@ -359,7 +380,6 @@ impl NativeAddressMode {
             })
     }
 
-    #[allow(dead_code)] // Staged for the biased-layout work in Tasks 2-7.
     pub(super) fn to_guest(self, address: HostVa) -> Result<GuestVa, NativeAddressError> {
         let address = address.raw() as u64;
         let bias = self.bias();
@@ -369,7 +389,6 @@ impl NativeAddressMode {
             .ok_or(NativeAddressError::BelowBias { address, bias })
     }
 
-    #[allow(dead_code)] // Staged for the biased-layout work in Tasks 2-7.
     pub(super) fn to_host_range(
         self,
         range: Range<GuestVa>,
@@ -377,7 +396,7 @@ impl NativeAddressMode {
         Ok(self.to_host(range.start)?..self.to_host(range.end)?)
     }
 
-    #[allow(dead_code)] // Staged for the biased-layout work in Tasks 2-7.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn to_guest_range(
         self,
         range: Range<HostVa>,
@@ -421,7 +440,6 @@ impl NativeAddressMode {
 }
 
 #[derive(Debug, thiserror::Error)]
-#[allow(dead_code)] // Staged for the biased-layout work in Tasks 2-7.
 pub(super) enum NativeAddressError {
     #[error("native host bias 0x{bias:x} is invalid for page size 0x{page_size:x}")]
     InvalidBias { bias: u64, page_size: u64 },
@@ -780,6 +798,112 @@ mod tests {
             )
             .expect("failed setup rolled back the mapped candidate page");
             drop(vacant);
+        });
+    }
+
+    #[test]
+    fn adjacent_linux_subpages_share_one_host_page_reservation_and_roll_back() {
+        fork_test(|| {
+            let linux_page_size = 0x1000_u64;
+            let host_page_size = TEST_PAGE_SIZE as u64;
+            let guest_start = 0x40_0000_u64;
+            let image = AddressSpace::from_segments(
+                guest_start,
+                [
+                    (
+                        guest_start,
+                        carrick_mem::elf::SegmentPerms {
+                            read: true,
+                            write: false,
+                            execute: true,
+                        },
+                        vec![0x11; linux_page_size as usize],
+                        linux_page_size,
+                    ),
+                    (
+                        guest_start + linux_page_size,
+                        carrick_mem::elf::SegmentPerms {
+                            read: true,
+                            write: true,
+                            execute: false,
+                        },
+                        vec![0x22; linux_page_size as usize],
+                        linux_page_size,
+                    ),
+                ],
+            )
+            .expect("build adjacent-subpage image");
+            let layout = MemoryLayout {
+                heap_base: 0x8_0000_0000,
+                heap_size: host_page_size,
+                mmap_base: 0xa0_0000_0000,
+                mmap_size: host_page_size,
+            };
+            let selected =
+                NativeLayout::for_image(&image, layout, host_page_size).expect("select layout");
+            let host_start = selected
+                .address_mode()
+                .to_host(GuestVa(guest_start))
+                .expect("translate first subpage");
+            let containing: Vec<_> = selected
+                .owned_ranges()
+                .iter()
+                .filter(|range| {
+                    range.start.raw() <= host_start.raw() && host_start.raw() < range.end.raw()
+                })
+                .collect();
+            assert_eq!(containing.len(), 1, "adjacent subpages must coalesce");
+            assert_eq!(
+                containing[0].clone(),
+                host_start..HostVa(host_start.raw() + TEST_PAGE_SIZE)
+            );
+
+            drop(selected);
+            let vacancy = OwnedHostMapping::map_exact(
+                host_start,
+                TEST_PAGE_SIZE,
+                libc::PROT_NONE,
+                libc::MAP_ANON | libc::MAP_PRIVATE,
+            )
+            .expect("dropping the candidate releases the complete host page");
+            drop(vacancy);
+        });
+    }
+
+    #[test]
+    fn direct_replacement_records_the_same_typed_owned_ranges() {
+        fork_test(|| {
+            let page_size = TEST_PAGE_SIZE as u64;
+            let start = 0x70_1000_0000_u64;
+            let image = AddressSpace::from_segments(
+                start,
+                [(
+                    start,
+                    carrick_mem::elf::SegmentPerms {
+                        read: true,
+                        write: false,
+                        execute: true,
+                    },
+                    vec![0; TEST_PAGE_SIZE],
+                    page_size,
+                )],
+            )
+            .expect("build direct replacement image");
+            let layout = MemoryLayout {
+                heap_base: 0x70_2000_0000,
+                heap_size: page_size,
+                mmap_base: 0x70_3000_0000,
+                mmap_size: page_size,
+            };
+            let initial =
+                NativeLayout::for_image(&image, layout, page_size).expect("reserve direct image");
+            assert_eq!(initial.address_mode(), NativeAddressMode::Direct);
+            let (_, owned) = initial.commit();
+            let replacement = NativeLayout::for_image(&image, layout, page_size)
+                .expect("plan replacement direct ranges");
+            assert_eq!(replacement.address_mode(), NativeAddressMode::Direct);
+            assert_eq!(replacement.owned_ranges(), owned);
+            drop(replacement);
         });
     }
 }
