@@ -49,6 +49,7 @@ pub(crate) struct NativeGuestExecV1 {
     pub(crate) exec_host_fs_fallback: bool,
     pub(crate) max_traps: u64,
     pub(crate) native_page_profile: carrick_spec::NativePageProfileRequest,
+    pub(crate) fd_table: crate::dispatch::fd_table::NativeReexecFdTableV1,
 }
 
 impl NativeExecCapsuleV1 {
@@ -76,6 +77,9 @@ impl NativeGuestExecV1 {
             || self.rootfs.root_path.is_empty()
             || self.rootfs.root_path.len() > MAX_PATH_LEN
             || self.max_traps == 0
+            || self.fd_table.files.len() > MAX_VECTOR_ITEMS
+            || self.fd_table.descriptions.len() > MAX_VECTOR_ITEMS
+            || self.fd_table.close_on_exec_host_fds.len() > MAX_VECTOR_ITEMS
         {
             return Err(NativeExecCapsuleError::InvalidField("guest_exec"));
         }
@@ -124,6 +128,9 @@ pub(crate) fn begin_guest_exec(
     let rootfs = dispatcher
         .native_fs_reexec_authority()
         .map_err(|error| anyhow::anyhow!("native guest exec rootfs is ineligible: {error:?}"))?;
+    let fd_table = dispatcher
+        .snapshot_native_reexec_fd_table()
+        .map_err(|error| anyhow::anyhow!("native guest exec fd table is ineligible: {error}"))?;
     let payload = NativeExecCapsuleV1 {
         producer_pid: unsafe { libc::getpid() as u32 },
         purpose: NativeExecCapsulePurposeV1::GuestExec,
@@ -139,6 +146,7 @@ pub(crate) fn begin_guest_exec(
             exec_host_fs_fallback: dispatcher.exec_host_fs_fallback(),
             max_traps: u64::try_from(max_traps)?,
             native_page_profile,
+            fd_table,
         }),
     };
     let mut nonce = [0_u8; 16];
@@ -151,8 +159,37 @@ fn exec_capsule(payload: NativeExecCapsuleV1, nonce: [u8; 16]) -> anyhow::Result
     let capsule = tempfile::tempfile()?;
     write_capsule(capsule.as_raw_fd(), nonce, &payload)?;
 
+    let mut prepared_host_fds = Vec::new();
+    if let Some(guest) = &payload.guest_exec {
+        for (fd, expected_flags) in guest.fd_table.survivor_host_fds() {
+            if let Err(error) = prepare_host_fd_flags(
+                fd,
+                expected_flags,
+                expected_flags & !libc::FD_CLOEXEC,
+                &mut prepared_host_fds,
+            ) {
+                restore_host_fd_flags(&prepared_host_fds);
+                return Err(error);
+            }
+        }
+        for fd in &guest.fd_table.close_on_exec_host_fds {
+            let flags = unsafe { libc::fcntl(*fd, libc::F_GETFD) };
+            if flags < 0 {
+                restore_host_fd_flags(&prepared_host_fds);
+                return Err(std::io::Error::last_os_error().into());
+            }
+            if let Err(error) =
+                prepare_host_fd_flags(*fd, flags, flags | libc::FD_CLOEXEC, &mut prepared_host_fds)
+            {
+                restore_host_fd_flags(&prepared_host_fds);
+                return Err(error);
+            }
+        }
+    }
+
     let old_flags = unsafe { libc::fcntl(capsule.as_raw_fd(), libc::F_GETFD) };
     if old_flags < 0 {
+        restore_host_fd_flags(&prepared_host_fds);
         return Err(std::io::Error::last_os_error().into());
     }
     if unsafe {
@@ -163,6 +200,7 @@ fn exec_capsule(payload: NativeExecCapsuleV1, nonce: [u8; 16]) -> anyhow::Result
         )
     } < 0
     {
+        restore_host_fd_flags(&prepared_host_fds);
         return Err(std::io::Error::last_os_error().into());
     }
 
@@ -203,7 +241,38 @@ fn exec_capsule(payload: NativeExecCapsuleV1, nonce: [u8; 16]) -> anyhow::Result
     unsafe {
         libc::fcntl(capsule.as_raw_fd(), libc::F_SETFD, old_flags);
     }
+    restore_host_fd_flags(&prepared_host_fds);
     Err(exec_error.into())
+}
+
+fn prepare_host_fd_flags(
+    fd: i32,
+    expected_flags: i32,
+    desired_flags: i32,
+    prepared: &mut Vec<(i32, i32)>,
+) -> anyhow::Result<()> {
+    let current = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if current < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    if current != expected_flags {
+        anyhow::bail!("native reexec host fd {fd} flags changed during preparation");
+    }
+    if current != desired_flags {
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, desired_flags) } < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        prepared.push((fd, current));
+    }
+    Ok(())
+}
+
+fn restore_host_fd_flags(prepared: &[(i32, i32)]) {
+    for (fd, flags) in prepared.iter().rev() {
+        unsafe {
+            libc::fcntl(*fd, libc::F_SETFD, *flags);
+        }
+    }
 }
 
 pub(crate) fn resume(fd: RawFd, nonce_hex: &str) -> anyhow::Result<crate::NativeSelfReexecOutcome> {
@@ -453,6 +522,11 @@ mod tests {
                 exec_host_fs_fallback: false,
                 max_traps: 100,
                 native_page_profile: carrick_spec::NativePageProfileRequest::Native16k,
+                fd_table: crate::dispatch::fd_table::NativeReexecFdTableV1 {
+                    files: Vec::new(),
+                    descriptions: Vec::new(),
+                    close_on_exec_host_fds: Vec::new(),
+                },
             }),
         }
     }

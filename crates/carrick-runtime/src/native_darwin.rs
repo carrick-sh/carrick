@@ -721,6 +721,9 @@ pub(crate) fn resume_guest_from_capsule(
     }
     dispatcher.set_cwd(&guest.cwd);
     dispatcher.set_stream_stdio(guest.stream_stdio);
+    dispatcher
+        .restore_native_reexec_fd_table(&guest.fd_table)
+        .map_err(|error| anyhow::anyhow!("restore native guest fd table: {error}"))?;
     let (image, relative_relocations, resolved, executable_digest) = load_native_execve_image(
         &dispatcher,
         &guest.resolved_path,
@@ -1607,7 +1610,12 @@ fn run_native_dsr_thread_loop(
                 match load_native_execve_image(&dispatcher, &path, argv, env, &plan) {
                     Ok((image, relative_relocations, resolved, executable_digest)) => {
                         if NATIVE_FORKED_GUEST_CHILD.load(std::sync::atomic::Ordering::Acquire) {
-                            if !dispatcher.native_reexec_minimal_fd_state_eligible() {
+                            if let Err(reason) = dispatcher.validate_native_reexec_fd_state() {
+                                tracing::warn!(
+                                    %reason,
+                                    descriptors = ?dispatcher.native_reexec_fd_state_summary(),
+                                    "native fork-child host self-reexec rejected unsupported fd state"
+                                );
                                 snapshot = complete_dsr_syscall(
                                     &dispatcher,
                                     &memory,
