@@ -222,8 +222,10 @@ phase-1 policy is:
 ### Guest memory
 
 Native Darwin needs a new `GuestMemory` implementation over real host mappings.
-Unlike HVF, there is no guest physical memory hidden behind a VM. Guest virtual
-addresses are host virtual addresses.
+Unlike HVF, there is no guest physical memory hidden behind a VM. In Direct
+mode, a guest virtual address is the host virtual address. In Biased mode, host
+mappings are reached through `NativeHostBias`, while every guest-visible
+coordinate remains the Linux guest virtual address.
 
 #### Darwin low-address boundary
 
