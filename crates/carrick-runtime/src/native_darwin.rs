@@ -903,11 +903,8 @@ fn run_image_in_current_process(
         plan.page_geometry.host_page_size,
         plan.page_geometry.linux_page_size,
         plan,
+        relative_relocations,
     )?));
-    {
-        let mut memory = memory.lock();
-        apply_native_relative_relocations(&mut memory, relative_relocations)?;
-    }
     let _ = crate::ulock::preinit_waiter_table();
     // PID-namespace launch placement (container path only; `run-elf` never
     // requests it): the same identity-init fallback as the HVF threaded loop —
@@ -1544,6 +1541,46 @@ fn run_native_dsr_thread_loop(
                 let proc_env = env.clone();
                 match load_native_execve_image(&dispatcher, &path, argv, env, &plan) {
                     Ok((image, relative_relocations, resolved)) => {
+                        let entry = image.entry();
+                        let Some(initial_sp) = image.initial_stack_pointer() else {
+                            snapshot = complete_dsr_syscall(
+                                &dispatcher,
+                                &memory,
+                                snapshot,
+                                thread_runtime.tid(),
+                                request.number.raw(),
+                                crate::linux_abi::LINUX_ENOEXEC.guest_retval(),
+                                resume,
+                            )?;
+                            continue;
+                        };
+                        // Select and reserve the replacement host layout and
+                        // allocate its translator before Linux's point of no
+                        // return. A collision or allocation failure leaves the
+                        // old image, sibling set, dispatcher, and DSR cache live.
+                        let prepared_mapping = match memory
+                            .lock()
+                            .prepare_exec_mapping(&image, &plan)
+                        {
+                            Ok(prepared) => prepared,
+                            Err(error) => {
+                                tracing::warn!(
+                                    %error,
+                                    path = resolved,
+                                    "native execve replacement validation failed before image retirement"
+                                );
+                                snapshot = complete_dsr_syscall(
+                                    &dispatcher,
+                                    &memory,
+                                    snapshot,
+                                    thread_runtime.tid(),
+                                    request.number.raw(),
+                                    crate::linux_abi::LINUX_ENOMEM.guest_retval(),
+                                    resume,
+                                )?;
+                                continue;
+                            }
+                        };
                         match native_terminate_siblings_for_exec(
                             &dispatcher,
                             &memory,
@@ -1557,12 +1594,26 @@ fn run_native_dsr_thread_loop(
                                 return Ok(NativeThreadLoopOutcome::ExecReplacedThread);
                             }
                         }
-                        let entry = image.entry();
-                        let initial_sp = image.initial_stack_pointer().ok_or_else(|| {
-                            RuntimeError::Unsupported(
-                                "native Darwin DSR execve image has no initial stack".to_string(),
+                        memory
+                            .lock()
+                            .replace_image(
+                                &image,
+                                &relative_relocations,
+                                &plan,
+                                Some(thread_runtime.tid()),
+                                prepared_mapping,
                             )
-                        })?;
+                            .map_err(|error| {
+                                RuntimeError::Trap(TrapError::Hypervisor(format!(
+                                    "native execve failed after retiring the old owned address space: {error}"
+                                )))
+                            })?;
+                        // Publish process-visible exec state only after the
+                        // complete replacement mapping, vvar, relocations, and
+                        // translator allocation have succeeded. Before this
+                        // point a validation failure returned to the old image;
+                        // after retirement, failure is fatal and no partial
+                        // dispatcher identity may escape.
                         dispatcher.reset_memory_state_on_execve();
                         dispatcher.reset_signal_handlers_on_execve();
                         dispatcher.set_executable_identity(
@@ -1573,12 +1624,6 @@ fn run_native_dsr_thread_loop(
                         crate::vcpu_loop::apply_image_proc_state(&dispatcher, &image);
                         dispatcher.close_cloexec_fds();
                         translator.begin_exec_reset();
-                        memory.lock().replace_image(
-                            &image,
-                            &relative_relocations,
-                            &plan,
-                            Some(thread_runtime.tid()),
-                        )?;
                         translator.begin_exec_handoff();
                         let next_process = memory.lock().dsr_process_translator()?;
                         translator.reset_for_exec(next_process);
@@ -1650,7 +1695,7 @@ fn run_native_dsr_thread_loop(
             }
             other => {
                 return Err(RuntimeError::Unsupported(format!(
-                    "native DSR Task 5 does not yet support dispatcher outcome {other:?}"
+                    "native DSR does not support dispatcher outcome {other:?}"
                 )));
             }
         }
@@ -5195,12 +5240,11 @@ fn emulate_linux4k_guarded_fault(
 }
 
 struct NativeMappedMemory {
-    #[allow(dead_code)] // Consumed by the biased runtime-boundary work in Task 3.
     address_mode: NativeAddressMode,
-    // Host-coordinate authority for fixed remaps and validated reverse faults.
-    // Direct mode intentionally has no recorded intervals: its legacy mapping
-    // behavior remains unchanged.
-    #[allow(dead_code)] // Consumed by the biased runtime-boundary work in Task 3.
+    // Host-coordinate authority for image retirement, biased fixed remaps,
+    // and validated reverse faults. Biased intervals are collision-reserved;
+    // direct intervals are normalized planned ownership recorded after the
+    // established unreserved MAP_FIXED mapping path succeeds.
     owned_host_ranges: Vec<std::ops::Range<carrick_guest_mem::HostVa>>,
     regions: Vec<NativeMappedRegion>,
     protections: MemoryProtections,
@@ -5212,6 +5256,18 @@ struct NativeMappedMemory {
     linux_page_size: u64,
     dsr_generations: dsr::cache::PageGenerationTable,
     dsr_translator: Option<Arc<dsr::ProcessTranslator>>,
+}
+
+struct PreparedNativeExecMapping {
+    native_layout: NativeLayout,
+    process_translator: Arc<dsr::ProcessTranslator>,
+    reset_inherited_translator: bool,
+}
+
+#[derive(Clone, Copy)]
+struct NativeMappingPageSizes {
+    host: u64,
+    linux: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -5253,6 +5309,36 @@ fn native_region_linux_prot(read: bool, write: bool, exec: bool) -> u64 {
         prot |= crate::linux_abi::LINUX_PROT_EXEC;
     }
     prot
+}
+
+fn subtract_host_ranges(
+    owned: &[std::ops::Range<carrick_guest_mem::HostVa>],
+    retained: &[std::ops::Range<carrick_guest_mem::HostVa>],
+) -> Vec<std::ops::Range<carrick_guest_mem::HostVa>> {
+    let mut result = Vec::new();
+    for range in owned {
+        let mut cursor = range.start.raw();
+        for keep in retained {
+            if keep.end.raw() <= cursor || keep.start.raw() >= range.end.raw() {
+                continue;
+            }
+            if keep.start.raw() > cursor {
+                result.push(
+                    carrick_guest_mem::HostVa(cursor)..carrick_guest_mem::HostVa(keep.start.raw()),
+                );
+            }
+            cursor = cursor.max(keep.end.raw()).min(range.end.raw());
+            if cursor == range.end.raw() {
+                break;
+            }
+        }
+        if cursor < range.end.raw() {
+            result.push(
+                carrick_guest_mem::HostVa(cursor)..carrick_guest_mem::HostVa(range.end.raw()),
+            );
+        }
+    }
+    result
 }
 
 impl NativeMappedMemory {
@@ -5358,10 +5444,25 @@ impl NativeMappedMemory {
         host_page_size: u64,
         linux_page_size: u64,
         _plan: &ExecutionPlan,
+        relative_relocations: &[NativeRelativeRelocation],
     ) -> Result<Self, RuntimeError> {
-        Self::map_with_translator(image, layout, host_page_size, linux_page_size, None, None)
+        let native_layout = NativeLayout::for_image(image, layout, host_page_size)
+            .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+        Self::map_with_layout(
+            image,
+            layout,
+            NativeMappingPageSizes {
+                host: host_page_size,
+                linux: linux_page_size,
+            },
+            native_layout,
+            None,
+            None,
+            relative_relocations,
+        )
     }
 
+    #[cfg(test)]
     fn map_with_translator(
         image: &AddressSpace,
         layout: MemoryLayout,
@@ -5370,18 +5471,31 @@ impl NativeMappedMemory {
         reusable_translator: Option<Arc<dsr::ProcessTranslator>>,
         exec_map_dsr_tid: Option<crate::thread::ThreadId>,
     ) -> Result<Self, RuntimeError> {
-        if let Some(region) = image
-            .regions()
-            .iter()
-            .find(|region| region.start < NATIVE_DARWIN_HARD_PAGEZERO_END)
-        {
-            return Err(RuntimeError::Unsupported(format!(
-                "native Darwin cannot directly map guest region 0x{:x}..0x{:x} below 0x{NATIVE_DARWIN_HARD_PAGEZERO_END:x}: arm64 Mach-O enforces a hard 4 GiB __PAGEZERO; use a PIE/ET_DYN image or an address-virtualizing backend",
-                region.start, region.end
-            )));
-        }
         let native_layout = NativeLayout::for_image(image, layout, host_page_size)
             .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+        Self::map_with_layout(
+            image,
+            layout,
+            NativeMappingPageSizes {
+                host: host_page_size,
+                linux: linux_page_size,
+            },
+            native_layout,
+            reusable_translator,
+            exec_map_dsr_tid,
+            &[],
+        )
+    }
+
+    fn map_with_layout(
+        image: &AddressSpace,
+        layout: MemoryLayout,
+        page_sizes: NativeMappingPageSizes,
+        native_layout: NativeLayout,
+        reusable_translator: Option<Arc<dsr::ProcessTranslator>>,
+        exec_map_dsr_tid: Option<crate::thread::ThreadId>,
+        relative_relocations: &[NativeRelativeRelocation],
+    ) -> Result<Self, RuntimeError> {
         native_exec_map_profile_start(exec_map_dsr_tid);
         let mut regions = Vec::new();
         for region in image.regions() {
@@ -5477,7 +5591,7 @@ impl NativeMappedMemory {
             host_protects: true,
             shared_futex: false,
             guest_writable: true,
-            default_prot: if linux_page_size == host_page_size {
+            default_prot: if page_sizes.linux == page_sizes.host {
                 crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_WRITE
             } else {
                 0
@@ -5559,7 +5673,7 @@ impl NativeMappedMemory {
         let address_mode = native_layout.address_mode();
         let owned_host_ranges = native_layout.owned_ranges().to_vec();
         let setup: Result<Self, RuntimeError> = (|| {
-            let memory = Self {
+            let mut memory = Self {
                 address_mode,
                 owned_host_ranges,
                 regions,
@@ -5568,9 +5682,9 @@ impl NativeMappedMemory {
                 native_write_exec_writable_pages: BTreeSet::new(),
                 linux4k_page_protections: BTreeMap::new(),
                 exclusive_reservation: None,
-                host_page_size,
-                linux_page_size,
-                dsr_generations: dsr::cache::PageGenerationTable::new(host_page_size)
+                host_page_size: page_sizes.host,
+                linux_page_size: page_sizes.linux,
+                dsr_generations: dsr::cache::PageGenerationTable::new(page_sizes.host)
                     .map_err(|error| RuntimeError::Unsupported(error.to_string()))?,
                 dsr_translator: if let Some(translator) = reusable_translator {
                     Some(translator)
@@ -5595,6 +5709,7 @@ impl NativeMappedMemory {
                 crate::probes::DsrCacheLifecyclePhase::ExecMapVvarEnd,
                 0,
             );
+            apply_native_relative_relocations(&mut memory, relative_relocations)?;
             Ok(memory)
         })();
         let memory = native_layout.commit_if_ok(setup)?;
@@ -5733,12 +5848,41 @@ impl NativeMappedMemory {
         }
     }
 
+    fn prepare_exec_mapping(
+        &self,
+        image: &AddressSpace,
+        plan: &ExecutionPlan,
+    ) -> Result<PreparedNativeExecMapping, RuntimeError> {
+        let native_layout = NativeLayout::for_image(
+            image,
+            native_memory_layout(),
+            plan.page_geometry.host_page_size,
+        )
+        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+        let reset_inherited_translator =
+            NATIVE_FORKED_GUEST_CHILD.load(std::sync::atomic::Ordering::Acquire);
+        let process_translator = if reset_inherited_translator {
+            self.dsr_process_translator()?
+        } else {
+            Arc::new(
+                dsr::ProcessTranslator::new(64 * 1024 * 1024)
+                    .map_err(|error| RuntimeError::Unsupported(error.to_string()))?,
+            )
+        };
+        Ok(PreparedNativeExecMapping {
+            native_layout,
+            process_translator,
+            reset_inherited_translator,
+        })
+    }
+
     fn replace_image(
         &mut self,
         image: &AddressSpace,
         relative_relocations: &[NativeRelativeRelocation],
         plan: &ExecutionPlan,
         dsr_tid: Option<crate::thread::ThreadId>,
+        prepared: PreparedNativeExecMapping,
     ) -> Result<(), RuntimeError> {
         let lifecycle = |phase| {
             if let Some(tid) = dsr_tid {
@@ -5746,65 +5890,67 @@ impl NativeMappedMemory {
             }
         };
         lifecycle(crate::probes::DsrCacheLifecyclePhase::ExecImageUnmapBegin);
-        let mut ranges: Vec<(u64, u64)> = self
-            .regions
-            .iter()
-            .map(|region| (region.start, region.end))
-            .collect();
-        ranges.sort_unstable_by_key(|range| range.0);
-        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
-        for (start, end) in ranges {
-            if let Some(last) = merged.last_mut()
-                && start <= last.1
-            {
-                last.1 = last.1.max(end);
-                continue;
-            }
-            merged.push((start, end));
+        if self.owned_host_ranges.is_empty() {
+            return Err(RuntimeError::Unsupported(
+                "native Darwin execve cannot retire an address space without owned host ranges"
+                    .to_string(),
+            ));
         }
-        for (start, end) in merged {
-            let len = usize::try_from(end.saturating_sub(start)).map_err(|_| {
+        let retained_direct_ranges = if matches!(self.address_mode, NativeAddressMode::Direct)
+            && matches!(
+                prepared.native_layout.address_mode(),
+                NativeAddressMode::Direct
+            ) {
+            prepared.native_layout.owned_ranges()
+        } else {
+            &[]
+        };
+        let retired_ranges = subtract_host_ranges(&self.owned_host_ranges, retained_direct_ranges);
+        for range in &retired_ranges {
+            let start = range.start.raw();
+            let end = range.end.raw();
+            let len = end.checked_sub(start).ok_or_else(|| {
                 RuntimeError::Unsupported(format!(
-                    "native Darwin execve unmap range too large: 0x{start:x}..0x{end:x}"
+                    "native Darwin execve owned range is inverted: 0x{start:x}..0x{end:x}"
                 ))
             })?;
-            let address = self
-                .host_address(carrick_guest_mem::GuestVa(start))
-                .map_err(|error| RuntimeError::Unsupported(error.to_string()))?
-                .raw() as *mut libc::c_void;
-            if len != 0 && unsafe { libc::munmap(address, len) } != 0 {
+            if len != 0 && unsafe { libc::munmap(start as *mut libc::c_void, len) } != 0 {
                 return Err(last_io_error(&format!(
-                    "munmap native Darwin execve range 0x{start:x}..0x{end:x}"
+                    "munmap native Darwin execve owned range 0x{start:x}..0x{end:x}"
                 )));
             }
         }
         lifecycle(crate::probes::DsrCacheLifecyclePhase::ExecImageUnmapEnd);
-        lifecycle(crate::probes::DsrCacheLifecyclePhase::ExecCacheResetBegin);
-        let reusable_translator =
-            if NATIVE_FORKED_GUEST_CHILD.load(std::sync::atomic::Ordering::Acquire) {
-                let translator = self.dsr_translator.take();
-                if let Some(translator) = &translator {
-                    translator.reset_after_fork_for_exec();
-                }
-                translator
-            } else {
-                None
-            };
-        lifecycle(crate::probes::DsrCacheLifecyclePhase::ExecCacheResetEnd);
         lifecycle(crate::probes::DsrCacheLifecyclePhase::ExecImageMapBegin);
-        let mut replacement = Self::map_with_translator(
+        lifecycle(crate::probes::DsrCacheLifecyclePhase::ExecRelocationBegin);
+        let inherited_translator = prepared
+            .reset_inherited_translator
+            .then(|| Arc::clone(&prepared.process_translator));
+        let replacement = Self::map_with_layout(
             image,
             native_memory_layout(),
-            plan.page_geometry.host_page_size,
-            plan.page_geometry.linux_page_size,
-            reusable_translator,
+            NativeMappingPageSizes {
+                host: plan.page_geometry.host_page_size,
+                linux: plan.page_geometry.linux_page_size,
+            },
+            prepared.native_layout,
+            Some(prepared.process_translator),
             dsr_tid,
+            relative_relocations,
         )?;
-        lifecycle(crate::probes::DsrCacheLifecyclePhase::ExecImageMapEnd);
-        lifecycle(crate::probes::DsrCacheLifecyclePhase::ExecRelocationBegin);
-        apply_native_relative_relocations(&mut replacement, relative_relocations)?;
-        *self = replacement;
         lifecycle(crate::probes::DsrCacheLifecyclePhase::ExecRelocationEnd);
+        lifecycle(crate::probes::DsrCacheLifecyclePhase::ExecImageMapEnd);
+        lifecycle(crate::probes::DsrCacheLifecyclePhase::ExecCacheResetBegin);
+        if let Some(translator) = inherited_translator {
+            // A fork child cannot allocate a fresh JIT cache safely, so exec
+            // reuses its inherited mapping. Keep the old cache intact until
+            // the complete replacement image is mapped and relocated; only
+            // then clear its inherited publications before the thread-level
+            // handoff can execute the new image.
+            translator.reset_after_fork_for_exec();
+        }
+        lifecycle(crate::probes::DsrCacheLifecyclePhase::ExecCacheResetEnd);
+        *self = replacement;
         Ok(())
     }
 
@@ -7984,6 +8130,517 @@ mod tests {
             write_u32(&mut elf, CODE_OFFSET + index * 4, word);
         }
         elf
+    }
+
+    fn dsr_low_et_exec_test_elf(words: &[u32]) -> Vec<u8> {
+        const CODE_OFFSET: usize = 0x1000;
+        const GUEST_BASE: u64 = 0x40_0000;
+        let code_len = std::mem::size_of_val(words);
+        let mut elf = vec![0_u8; CODE_OFFSET + code_len];
+        elf[..16].copy_from_slice(&[0x7f, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        write_u16(&mut elf, 16, goblin::elf::header::ET_EXEC);
+        write_u16(&mut elf, 18, 183); // EM_AARCH64
+        write_u32(&mut elf, 20, 1);
+        write_u64(&mut elf, 24, GUEST_BASE);
+        write_u64(&mut elf, 32, 64); // program-header offset
+        write_u16(&mut elf, 52, 64);
+        write_u16(&mut elf, 54, 56);
+        write_u16(&mut elf, 56, 1);
+        write_u32(&mut elf, 64, 1); // PT_LOAD
+        write_u32(&mut elf, 68, 5); // PF_R | PF_X
+        write_u64(&mut elf, 72, CODE_OFFSET as u64);
+        write_u64(&mut elf, 80, GUEST_BASE);
+        write_u64(&mut elf, 88, GUEST_BASE);
+        write_u64(&mut elf, 96, code_len as u64);
+        write_u64(&mut elf, 104, code_len as u64);
+        write_u64(&mut elf, 112, 0x1000);
+        for (index, word) in words.iter().copied().enumerate() {
+            write_u32(&mut elf, CODE_OFFSET + index * 4, word);
+        }
+        elf
+    }
+
+    #[test]
+    fn low_et_exec_selects_biased_mode_and_exits_zero() {
+        let words = [
+            0xd280_0540, // mov x0, #42
+            0xd100_43e1, // sub x1, sp, #16
+            0xf900_0020, // str x0, [x1]
+            0xf940_0022, // ldr x2, [x1]
+            0xd100_a840, // sub x0, x2, #42 (exit 0 iff biased memory round-trips)
+            0xd280_0ba8, // mov x8, #93 (exit)
+            SVC_0,
+        ];
+        let mut file = tempfile::NamedTempFile::new().expect("create low ET_EXEC fixture");
+        std::io::Write::write_all(&mut file, &dsr_low_et_exec_test_elf(&words))
+            .expect("write low ET_EXEC fixture");
+        let plan = ExecutionPlan {
+            backend: crate::page_profile::ExecutionBackend::NativeDarwin,
+            page_geometry: crate::page_profile::PageGeometry {
+                host_page_size: 16 * 1024,
+                linux_page_size: 16 * 1024,
+                native_profile: Some(carrick_spec::NativePageProfile::Native16k),
+            },
+            diagnostics: Vec::new(),
+        };
+        let result = run_static_elf(
+            file.path(),
+            SyscallDispatcher::new(),
+            ["low-et-exec".to_string()],
+            std::iter::empty::<String>(),
+            16,
+            None,
+            &plan,
+        )
+        .expect("run low ET_EXEC through biased DSR");
+        assert_eq!(result.exit_code, 0, "stderr={:?}", result.stderr);
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum LifecycleImageKind {
+        DirectPie,
+        LowExec,
+    }
+
+    fn native16k_test_plan() -> ExecutionPlan {
+        ExecutionPlan {
+            backend: crate::page_profile::ExecutionBackend::NativeDarwin,
+            page_geometry: crate::page_profile::PageGeometry {
+                host_page_size: 16 * 1024,
+                linux_page_size: 16 * 1024,
+                native_profile: Some(carrick_spec::NativePageProfile::Native16k),
+            },
+            diagnostics: Vec::new(),
+        }
+    }
+
+    fn lifecycle_image(kind: LifecycleImageKind, marker: u8) -> AddressSpace {
+        let start = match kind {
+            LifecycleImageKind::DirectPie => NATIVE_DARWIN_PIE_BASE,
+            LifecycleImageKind::LowExec => 0x40_0000,
+        };
+        AddressSpace::from_segments(
+            start,
+            [(
+                start,
+                carrick_mem::elf::SegmentPerms {
+                    read: true,
+                    write: true,
+                    execute: false,
+                },
+                vec![marker; 16 * 1024],
+                16 * 1024,
+            )],
+        )
+        .expect("build lifecycle image")
+    }
+
+    fn encode_adr(register: u8, byte_offset: i64) -> u32 {
+        assert!(register < 32);
+        assert!((-(1 << 20)..(1 << 20)).contains(&byte_offset));
+        let immediate = (byte_offset as u64) & 0x1f_ffff;
+        0x1000_0000
+            | (((immediate & 0x3) as u32) << 29)
+            | ((((immediate >> 2) & 0x7_ffff) as u32) << 5)
+            | u32::from(register)
+    }
+
+    fn execve_source_elf(kind: LifecycleImageKind, target: &Path) -> Vec<u8> {
+        const CODE_OFFSET: usize = 0x1000;
+        let path = target.as_os_str().as_encoded_bytes();
+        let code_len = 8 * std::mem::size_of::<u32>();
+        let words = [
+            encode_adr(0, code_len as i64), // x0 = target path
+            0xd280_0001,                    // mov x1, #0 (argv)
+            0xd280_0002,                    // mov x2, #0 (envp)
+            0xd280_1ba8,                    // mov x8, #221 (execve)
+            SVC_0,
+            0xd280_0c60, // exec failure: mov x0, #99
+            0xd280_0ba8, // mov x8, #93 (exit)
+            SVC_0,
+        ];
+        // Keeping the pathname immediately after code makes ADR independent of
+        // direct vs biased host placement and leaves every architectural
+        // pointer guest-valued.
+        let mut payload = Vec::with_capacity(code_len + path.len() + 1);
+        for word in words {
+            payload.extend_from_slice(&word.to_le_bytes());
+        }
+        payload.extend_from_slice(path);
+        payload.push(0);
+        let (elf_type, guest_base) = match kind {
+            LifecycleImageKind::DirectPie => (goblin::elf::header::ET_DYN, 0),
+            LifecycleImageKind::LowExec => (goblin::elf::header::ET_EXEC, 0x40_0000),
+        };
+        let mut elf = vec![0_u8; CODE_OFFSET + payload.len()];
+        elf[..16].copy_from_slice(&[0x7f, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        write_u16(&mut elf, 16, elf_type);
+        write_u16(&mut elf, 18, 183);
+        write_u32(&mut elf, 20, 1);
+        write_u64(&mut elf, 24, guest_base);
+        write_u64(&mut elf, 32, 64);
+        write_u16(&mut elf, 52, 64);
+        write_u16(&mut elf, 54, 56);
+        write_u16(&mut elf, 56, 1);
+        write_u32(&mut elf, 64, 1);
+        write_u32(&mut elf, 68, 5); // PF_R | PF_X
+        write_u64(&mut elf, 72, CODE_OFFSET as u64);
+        write_u64(&mut elf, 80, guest_base);
+        write_u64(&mut elf, 88, guest_base);
+        write_u64(&mut elf, 96, payload.len() as u64);
+        write_u64(&mut elf, 104, payload.len() as u64);
+        write_u64(&mut elf, 112, 0x1000);
+        elf[CODE_OFFSET..].copy_from_slice(&payload);
+        elf
+    }
+
+    fn exec_target_pc_elf(kind: LifecycleImageKind) -> Vec<u8> {
+        let words = [
+            0x1000_0000, // adr x0, . (architectural guest PC)
+            0xd100_43e1, // sub x1, sp, #16
+            0xf900_0020, // str x0, [x1]
+            0xd280_0020, // mov x0, #1 (stdout)
+            0xd280_0102, // mov x2, #8
+            0xd280_0808, // mov x8, #64 (write)
+            SVC_0,
+            0xd280_0000, // mov x0, #0
+            0xd280_0ba8, // mov x8, #93 (exit)
+            SVC_0,
+        ];
+        match kind {
+            LifecycleImageKind::DirectPie => dsr_test_elf(&words),
+            LifecycleImageKind::LowExec => dsr_low_et_exec_test_elf(&words),
+        }
+    }
+
+    #[test]
+    fn direct_guest_execve_runs_low_target_in_guest_coordinates() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut target = tempfile::NamedTempFile::new().expect("create low exec target");
+        std::io::Write::write_all(
+            &mut target,
+            &exec_target_pc_elf(LifecycleImageKind::LowExec),
+        )
+        .expect("write low exec target");
+        std::fs::set_permissions(target.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("make low exec target executable");
+
+        let mut source = tempfile::NamedTempFile::new().expect("create direct exec source");
+        std::io::Write::write_all(
+            &mut source,
+            &execve_source_elf(LifecycleImageKind::DirectPie, target.path()),
+        )
+        .expect("write direct exec source");
+
+        let dispatcher = SyscallDispatcher::new();
+        dispatcher.set_stream_stdio(true);
+        let result = run_static_elf(
+            source.path(),
+            dispatcher,
+            ["direct-exec-low".to_string()],
+            std::iter::empty::<String>(),
+            64,
+            None,
+            &native16k_test_plan(),
+        )
+        .expect("run direct guest execve into low ET_EXEC target");
+        assert_eq!(result.exit_code, 0, "stderr={:?}", result.stderr);
+        assert_eq!(result.stdout.len(), 8, "stderr={:?}", result.stderr);
+        assert_eq!(
+            u64::from_le_bytes(result.stdout.try_into().expect("eight-byte guest PC")),
+            0x40_0000,
+            "replacement target must observe its architectural guest PC"
+        );
+    }
+
+    fn assert_exec_transition(source: LifecycleImageKind, target: LifecycleImageKind) {
+        fork_test(|| {
+            let plan = native16k_test_plan();
+            let source_image = lifecycle_image(source, 0x31);
+            let target_image = lifecycle_image(target, 0x72);
+            let mut memory = NativeMappedMemory::map(
+                &source_image,
+                native_memory_layout(),
+                plan.page_geometry.host_page_size,
+                plan.page_geometry.linux_page_size,
+            )
+            .expect("map source lifecycle image");
+            let source_mode = memory.address_mode();
+            let source_process = memory.dsr_process_translator().expect("source translator");
+            let prepared = memory
+                .prepare_exec_mapping(&target_image, &plan)
+                .expect("preselect replacement layout");
+            let prepared_mode = prepared.native_layout.address_mode();
+            let prepared_process = Arc::clone(&prepared.process_translator);
+
+            memory
+                .replace_image(&target_image, &[], &plan, None, prepared)
+                .expect("replace lifecycle image");
+
+            let expected_target_biased = matches!(target, LifecycleImageKind::LowExec);
+            assert_eq!(
+                matches!(memory.address_mode(), NativeAddressMode::Biased { .. }),
+                expected_target_biased,
+                "source={source:?} target={target:?}"
+            );
+            assert_eq!(memory.address_mode(), prepared_mode);
+            assert!(Arc::ptr_eq(
+                &memory
+                    .dsr_process_translator()
+                    .expect("replacement translator"),
+                &prepared_process
+            ));
+            assert!(
+                !Arc::ptr_eq(&source_process, &prepared_process),
+                "root exec must hand off to a fresh process translator"
+            );
+            if matches!(source, LifecycleImageKind::LowExec)
+                && matches!(target, LifecycleImageKind::LowExec)
+            {
+                assert_ne!(
+                    source_mode, prepared_mode,
+                    "biased->biased must reserve a different still-free bias"
+                );
+            }
+
+            let guest_start = target_image.regions()[0].start;
+            let guest_end = target_image.regions()[0].end;
+            assert_eq!(guest_end - guest_start, 16 * 1024);
+            assert!(memory.region_contains(guest_start, 16 * 1024));
+            assert!(!memory.region_contains(guest_start - 1, 1));
+            assert_eq!(
+                memory
+                    .read_bytes(guest_start + 0x100, 1)
+                    .expect("read target marker"),
+                [0x72]
+            );
+            memory
+                .write_bytes(guest_start + 0x100, &[0xa5])
+                .expect("write target by guest address");
+            assert_eq!(
+                memory
+                    .read_bytes(guest_start + 0x100, 1)
+                    .expect("read guest write"),
+                [0xa5]
+            );
+            let host = memory
+                .host_address(carrick_guest_mem::GuestVa(guest_start + 0x100))
+                .expect("translate target guest address");
+            assert_eq!(
+                host.raw() as u64 == guest_start + 0x100,
+                !expected_target_biased
+            );
+        });
+    }
+
+    #[test]
+    fn exec_transitions_preserve_guest_addresses_across_modes() {
+        for (source, target) in [
+            (LifecycleImageKind::DirectPie, LifecycleImageKind::LowExec),
+            (LifecycleImageKind::LowExec, LifecycleImageKind::DirectPie),
+            (LifecycleImageKind::LowExec, LifecycleImageKind::LowExec),
+        ] {
+            assert_exec_transition(source, target);
+        }
+    }
+
+    #[test]
+    fn direct_exec_preserves_the_identity_fast_path_and_owned_ranges() {
+        assert_exec_transition(LifecycleImageKind::DirectPie, LifecycleImageKind::DirectPie);
+        let old = [carrick_guest_mem::HostVa(0x4000)..carrick_guest_mem::HostVa(0xc000)];
+        let target = [carrick_guest_mem::HostVa(0x8000)..carrick_guest_mem::HostVa(0x1_0000)];
+        assert_eq!(
+            subtract_host_ranges(&old, &target),
+            [carrick_guest_mem::HostVa(0x4000)..carrick_guest_mem::HostVa(0x8000)],
+            "direct exec must retain the overlapping Carrick-owned pages continuously"
+        );
+    }
+
+    #[test]
+    fn failed_biased_exec_preselection_preserves_the_old_image() {
+        fork_test(|| {
+            let plan = native16k_test_plan();
+            let image = lifecycle_image(LifecycleImageKind::LowExec, 0x4d);
+            let memory = NativeMappedMemory::map(
+                &image,
+                native_memory_layout(),
+                plan.page_geometry.host_page_size,
+                plan.page_geometry.linux_page_size,
+            )
+            .expect("map old biased image");
+            let old_mode = memory.address_mode();
+            let old_bias = old_mode.bias();
+            let guest_start = image.regions()[0].start;
+            let blockers: Vec<_> = address::BIAS_CANDIDATES
+                .into_iter()
+                .filter(|bias| *bias != old_bias)
+                .map(|bias| {
+                    address::OwnedHostMapping::map_exact(
+                        carrick_guest_mem::HostVa((bias + guest_start) as usize),
+                        16 * 1024,
+                        libc::PROT_NONE,
+                        libc::MAP_ANON | libc::MAP_PRIVATE,
+                    )
+                    .expect("block alternate bias")
+                })
+                .collect();
+
+            let error = memory
+                .prepare_exec_mapping(&image, &plan)
+                .err()
+                .expect("all bias candidates must be unavailable");
+            assert!(
+                error
+                    .to_string()
+                    .contains("no collision-free native host bias")
+            );
+            assert_eq!(memory.address_mode(), old_mode);
+            assert_eq!(
+                memory
+                    .read_bytes(guest_start + 0x80, 1)
+                    .expect("old image remains mapped"),
+                [0x4d]
+            );
+            drop(blockers);
+        });
+    }
+
+    #[test]
+    fn fork_child_inherits_the_parent_bias() {
+        fork_test(|| {
+            let plan = native16k_test_plan();
+            let image = lifecycle_image(LifecycleImageKind::LowExec, 0x5a);
+            let memory = NativeMappedMemory::map(
+                &image,
+                native_memory_layout(),
+                plan.page_geometry.host_page_size,
+                plan.page_geometry.linux_page_size,
+            )
+            .expect("map parent biased image");
+            let parent_mode = memory.address_mode();
+            let guest = image.regions()[0].start + 0x120;
+            let parent_host = memory
+                .host_address(carrick_guest_mem::GuestVa(guest))
+                .expect("translate parent guest address");
+            let child = unsafe { libc::fork() };
+            assert!(
+                child >= 0,
+                "fork biased child: {}",
+                std::io::Error::last_os_error()
+            );
+            if child == 0 {
+                let inherited = memory.address_mode() == parent_mode
+                    && memory
+                        .host_address(carrick_guest_mem::GuestVa(guest))
+                        .is_ok_and(|host| host == parent_host)
+                    && memory
+                        .read_bytes(guest, 1)
+                        .is_ok_and(|bytes| bytes == [0x5a]);
+                unsafe { libc::_exit(i32::from(!inherited)) };
+            }
+            let status = waitpid_blocking(child).expect("wait biased child");
+            assert!(libc::WIFEXITED(status), "child status={status:#x}");
+            assert_eq!(libc::WEXITSTATUS(status), 0);
+            assert_eq!(memory.address_mode(), parent_mode);
+        });
+    }
+
+    #[test]
+    fn fork_child_exec_reuses_translator_and_reselects_layout() {
+        fork_test(|| {
+            let plan = native16k_test_plan();
+            let source = lifecycle_image(LifecycleImageKind::LowExec, 0x21);
+            let target = lifecycle_image(LifecycleImageKind::LowExec, 0x43);
+            let mut memory = NativeMappedMemory::map(
+                &source,
+                native_memory_layout(),
+                plan.page_geometry.host_page_size,
+                plan.page_geometry.linux_page_size,
+            )
+            .expect("map parent image before fork");
+            let parent_mode = memory.address_mode();
+            let inherited_process = memory.dsr_process_translator().expect("parent translator");
+            let child = unsafe { libc::fork() };
+            assert!(
+                child >= 0,
+                "fork exec child: {}",
+                std::io::Error::last_os_error()
+            );
+            if child == 0 {
+                NATIVE_FORKED_GUEST_CHILD.store(true, std::sync::atomic::Ordering::Release);
+                let prepared = memory
+                    .prepare_exec_mapping(&target, &plan)
+                    .expect("prepare fork-child replacement without allocating a translator");
+                let prepared_mode = prepared.native_layout.address_mode();
+                let reused = prepared.reset_inherited_translator
+                    && Arc::ptr_eq(&prepared.process_translator, &inherited_process)
+                    && prepared_mode != parent_mode;
+                if !reused {
+                    unsafe { libc::_exit(2) };
+                }
+                if memory
+                    .replace_image(&target, &[], &plan, None, prepared)
+                    .is_err()
+                {
+                    unsafe { libc::_exit(3) };
+                }
+                let passed = memory.address_mode() == prepared_mode
+                    && Arc::ptr_eq(
+                        &memory.dsr_process_translator().expect("child translator"),
+                        &inherited_process,
+                    )
+                    && memory
+                        .read_bytes(target.regions()[0].start + 0x40, 1)
+                        .is_ok_and(|bytes| bytes == [0x43]);
+                unsafe { libc::_exit(i32::from(!passed)) };
+            }
+            let status = waitpid_blocking(child).expect("wait exec child");
+            assert!(libc::WIFEXITED(status), "child status={status:#x}");
+            assert_eq!(libc::WEXITSTATUS(status), 0);
+            assert_eq!(memory.address_mode(), parent_mode);
+        });
+    }
+
+    #[test]
+    fn biased_vdso_and_vvar_remain_guest_addressed() {
+        fork_test(|| {
+            let plan = native16k_test_plan();
+            let image = with_native_vdso(lifecycle_image(LifecycleImageKind::LowExec, 0x19))
+                .expect("attach native vDSO");
+            let memory = NativeMappedMemory::map(
+                &image,
+                native_memory_layout(),
+                plan.page_geometry.host_page_size,
+                plan.page_geometry.linux_page_size,
+            )
+            .expect("map biased vDSO image");
+            assert!(matches!(
+                memory.address_mode(),
+                NativeAddressMode::Biased { .. }
+            ));
+            for (guest, len) in [
+                (NATIVE_DARWIN_VVAR_BASE, crate::vdso::LINUX_VVAR_SIZE),
+                (NATIVE_DARWIN_VDSO_BASE, crate::vdso::LINUX_VDSO_SIZE),
+            ] {
+                assert!(memory.region_contains(guest, len as usize));
+                assert_eq!(
+                    memory
+                        .read_bytes(guest, 1)
+                        .expect("read runtime guest page")
+                        .len(),
+                    1
+                );
+                let host = memory
+                    .host_address(carrick_guest_mem::GuestVa(guest))
+                    .expect("translate runtime guest page");
+                assert_ne!(host.raw() as u64, guest);
+                assert_eq!(
+                    memory.guest_fault_address(host),
+                    Some(carrick_guest_mem::GuestVa(guest))
+                );
+            }
+        });
     }
 
     fn dsr_straight_line_syscall_elf() -> Vec<u8> {
