@@ -252,6 +252,11 @@ bench PROFILE="quick":
 bench-backends PROFILE="quick":
     ./scripts/measure-perf.sh backends {{PROFILE}}
 
+# Report-only legacy/mailbox HVF syscall-transport comparison over identical
+# signed VMM commands and native-PIE guest artifacts.
+bench-hvf-mailbox PROFILE="quick":
+    ./scripts/measure-perf.sh hvf-mailbox {{PROFILE}}
+
 # --- Linux / KVM aarch64 MVP (spec: hal-seam-kvm-mvp) ----------------------
 
 # Build the freestanding hello-aarch64 KVM-MVP fixture (Mac-native: clang + rust-lld).

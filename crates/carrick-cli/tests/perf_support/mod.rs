@@ -3,6 +3,7 @@
 //! it is pulled in via `mod perf_support;` from perf_runner.rs.
 pub mod backend_pair;
 pub mod cases;
+pub mod hvf_mailbox_pair;
 pub mod invoke;
 pub mod metric;
 pub mod provenance;

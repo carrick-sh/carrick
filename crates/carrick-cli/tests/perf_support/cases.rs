@@ -67,6 +67,22 @@ pub const CASES: &[PerfCase] = &[
         carrick_fs_mode: "host",
         cross_boundary: false,
     },
+    // Latency control (lower better): arithmetic only inside the timed loop.
+    // A syscall-transport change should leave this lane effectively flat.
+    PerfCase {
+        probe: "perf_direct_compute",
+        artifact: PerfArtifact::StaticMusl,
+        dimension: "compute",
+        workload: "direct_compute",
+        guest_args: &[],
+        backend_pair_support: BackendPairSupport::DirectElf,
+        metric_key: "direct_compute_total_us",
+        unit: "us",
+        higher_is_better: false,
+        mount_scratch: false,
+        carrick_fs_mode: "host",
+        cross_boundary: false,
+    },
     // Latency (lower better): low-perturbation native DSR gateway crossing
     // with no guest SIMD activity.
     PerfCase {
