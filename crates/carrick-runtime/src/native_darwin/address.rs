@@ -290,7 +290,20 @@ impl NativeLayout {
             .fixed_mapping_flags(&self.owned_ranges, start, length, flags)
     }
 
-    #[allow(dead_code)] // Consumed when NativeMappedMemory takes ownership in Tasks 3 and 6.
+    pub(super) fn owned_ranges(&self) -> &[Range<HostVa>] {
+        &self.owned_ranges
+    }
+
+    pub(super) fn commit_if_ok<T, E>(self, result: Result<T, E>) -> Result<T, E> {
+        match result {
+            Ok(value) => {
+                let _ = self.commit();
+                Ok(value)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     pub(super) fn commit(mut self) -> (NativeAddressMode, Vec<Range<HostVa>>) {
         let owned_ranges = self
             .reservations
@@ -699,6 +712,70 @@ mod tests {
                 ),
                 Err(NativeAddressError::FixedOutsideOwned { .. })
             ));
+        });
+    }
+
+    #[test]
+    fn failed_post_mapping_setup_releases_candidate_ranges() {
+        fork_test(|| {
+            let page_size = TEST_PAGE_SIZE as u64;
+            let guest_start = GuestVa(0x40_0000);
+            let image = AddressSpace::from_segments(
+                guest_start.raw(),
+                [(
+                    guest_start.raw(),
+                    carrick_mem::elf::SegmentPerms {
+                        read: true,
+                        write: true,
+                        execute: false,
+                    },
+                    vec![0; TEST_PAGE_SIZE],
+                    page_size,
+                )],
+            )
+            .expect("build low test image");
+            let layout = MemoryLayout {
+                heap_base: 0x8_0000_0000,
+                heap_size: page_size,
+                mmap_base: 0xa0_0000_0000,
+                mmap_size: page_size,
+            };
+            let selected =
+                NativeLayout::for_image(&image, layout, page_size).expect("select biased layout");
+            let host_start = selected
+                .address_mode()
+                .to_host(guest_start)
+                .expect("translate mapped guest page");
+            let flags = selected
+                .fixed_mapping_flags(
+                    host_start,
+                    TEST_PAGE_SIZE,
+                    libc::MAP_ANON | libc::MAP_PRIVATE,
+                )
+                .expect("authorize owned fixed mapping");
+            let mapped = unsafe {
+                libc::mmap(
+                    host_start.raw() as *mut libc::c_void,
+                    TEST_PAGE_SIZE,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    flags,
+                    -1,
+                    0,
+                )
+            };
+            assert_eq!(mapped as usize, host_start.raw());
+
+            let setup: Result<(), &str> = Err("injected post-mapping setup failure");
+            assert!(selected.commit_if_ok(setup).is_err());
+
+            let vacant = OwnedHostMapping::map_exact(
+                host_start,
+                TEST_PAGE_SIZE,
+                libc::PROT_NONE,
+                libc::MAP_ANON | libc::MAP_PRIVATE,
+            )
+            .expect("failed setup rolled back the mapped candidate page");
+            drop(vacant);
         });
     }
 }

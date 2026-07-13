@@ -5480,43 +5480,48 @@ impl NativeMappedMemory {
             })?;
             protections.set_no_write(span.start, len, true);
         }
-        let (address_mode, owned_host_ranges) = native_layout.commit();
-        let memory = Self {
-            address_mode,
-            owned_host_ranges,
-            regions,
-            protections,
-            native_page_protections: BTreeMap::new(),
-            native_write_exec_writable_pages: BTreeSet::new(),
-            linux4k_page_protections: BTreeMap::new(),
-            exclusive_reservation: None,
-            host_page_size,
-            linux_page_size,
-            dsr_generations: dsr::cache::PageGenerationTable::new(host_page_size)
-                .map_err(|error| RuntimeError::Unsupported(error.to_string()))?,
-            dsr_translator: if let Some(translator) = reusable_translator {
-                Some(translator)
-            } else {
-                Some(Arc::new(
-                    dsr::ProcessTranslator::new(64 * 1024 * 1024)
-                        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?,
-                ))
-            },
-        };
-        // Publishing the vvar contents is part of establishing the address
-        // space: the initial boot maps here, and an execve replacement re-maps
-        // here (`replace_image`), so both get a freshly stamped vvar.
-        native_exec_map_detail(
-            exec_map_dsr_tid,
-            crate::probes::DsrCacheLifecyclePhase::ExecMapVvarBegin,
-            crate::vdso::LINUX_VVAR_SIZE,
-        );
-        memory.stamp_vdso_vvar()?;
-        native_exec_map_detail(
-            exec_map_dsr_tid,
-            crate::probes::DsrCacheLifecyclePhase::ExecMapVvarEnd,
-            0,
-        );
+        let address_mode = native_layout.address_mode();
+        let owned_host_ranges = native_layout.owned_ranges().to_vec();
+        let setup: Result<Self, RuntimeError> = (|| {
+            let memory = Self {
+                address_mode,
+                owned_host_ranges,
+                regions,
+                protections,
+                native_page_protections: BTreeMap::new(),
+                native_write_exec_writable_pages: BTreeSet::new(),
+                linux4k_page_protections: BTreeMap::new(),
+                exclusive_reservation: None,
+                host_page_size,
+                linux_page_size,
+                dsr_generations: dsr::cache::PageGenerationTable::new(host_page_size)
+                    .map_err(|error| RuntimeError::Unsupported(error.to_string()))?,
+                dsr_translator: if let Some(translator) = reusable_translator {
+                    Some(translator)
+                } else {
+                    Some(Arc::new(
+                        dsr::ProcessTranslator::new(64 * 1024 * 1024)
+                            .map_err(|error| RuntimeError::Unsupported(error.to_string()))?,
+                    ))
+                },
+            };
+            // Publishing the vvar contents is part of establishing the address
+            // space: the initial boot maps here, and an execve replacement re-maps
+            // here (`replace_image`), so both get a freshly stamped vvar.
+            native_exec_map_detail(
+                exec_map_dsr_tid,
+                crate::probes::DsrCacheLifecyclePhase::ExecMapVvarBegin,
+                crate::vdso::LINUX_VVAR_SIZE,
+            );
+            memory.stamp_vdso_vvar()?;
+            native_exec_map_detail(
+                exec_map_dsr_tid,
+                crate::probes::DsrCacheLifecyclePhase::ExecMapVvarEnd,
+                0,
+            );
+            Ok(memory)
+        })();
+        let memory = native_layout.commit_if_ok(setup)?;
         native_exec_map_profile_finish();
         Ok(memory)
     }
