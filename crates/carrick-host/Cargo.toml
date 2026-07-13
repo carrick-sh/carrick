@@ -14,3 +14,6 @@ workspace = true
 [dependencies]
 carrick-kernel = { path = "../carrick-kernel" }
 libc.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+mach2.workspace = true

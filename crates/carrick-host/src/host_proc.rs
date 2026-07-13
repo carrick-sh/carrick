@@ -105,7 +105,7 @@ impl std::fmt::Display for DirectVmReservationError {
                 actual,
             } => write!(
                 formatter,
-                "native direct VM reservation collision at 0x{requested_start:x}..0x{requested_end:x}: nonfixed mmap redirected to 0x{actual:x}"
+                "native direct VM reservation at 0x{requested_start:x}..0x{requested_end:x}: fixed Mach allocation unexpectedly returned 0x{actual:x}"
             ),
             Self::Occupied {
                 requested_start,
@@ -145,11 +145,16 @@ impl std::error::Error for DirectVmReservationError {}
 #[derive(Debug)]
 pub struct DirectVmReservation {
     #[cfg(target_os = "macos")]
-    address: usize,
-    #[cfg(target_os = "macos")]
-    length: usize,
+    spans: Vec<DirectVmReservationSpan>,
     #[cfg(target_os = "macos")]
     armed: bool,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+struct DirectVmReservationSpan {
+    address: u64,
+    length: u64,
 }
 
 impl DirectVmReservation {
@@ -165,7 +170,10 @@ impl Drop for DirectVmReservation {
     fn drop(&mut self) {
         #[cfg(target_os = "macos")]
         if self.armed {
-            let _ = unsafe { libc::munmap(self.address as *mut libc::c_void, self.length) };
+            let task = unsafe { mach2::traps::mach_task_self() };
+            for span in &self.spans {
+                let _ = unsafe { mach2::vm::mach_vm_deallocate(task, span.address, span.length) };
+            }
         }
     }
 }
@@ -173,8 +181,8 @@ impl Drop for DirectVmReservation {
 #[cfg(target_os = "macos")]
 mod imp {
     use super::{
-        DirectVmReservation, DirectVmReservationError, DirectVmReservationOutcome, GuestProcInfo,
-        ResourceUsage,
+        DirectVmReservation, DirectVmReservationError, DirectVmReservationOutcome,
+        DirectVmReservationSpan, GuestProcInfo, ResourceUsage,
     };
 
     const VM_REGION_BASIC_INFO_64: i32 = 9;
@@ -694,13 +702,70 @@ mod imp {
         }
     }
 
+    enum ExactReservationResult {
+        Reserved,
+        NoSpace,
+    }
+
+    fn reserve_exact_vm_span(
+        task: libc::mach_port_t,
+        start: u64,
+        length: u64,
+    ) -> Result<ExactReservationResult, DirectVmReservationError> {
+        let end = start
+            .checked_add(length)
+            .ok_or(DirectVmReservationError::InvalidRange { start, length })?;
+        let mut address = start;
+        // SAFETY: the caller supplies a checked, non-empty range.
+        // `VM_FLAGS_FIXED` requests this exact interval; overwrite is a
+        // separate Mach flag which Carrick deliberately never passes, so an
+        // occupied page makes the call fail instead of replacing host memory.
+        let allocation_kr = unsafe {
+            mach2::vm::mach_vm_allocate(
+                task,
+                &mut address,
+                length,
+                mach2::vm_statistics::VM_FLAGS_FIXED,
+            )
+        };
+        if allocation_kr == mach2::kern_return::KERN_NO_SPACE {
+            return Ok(ExactReservationResult::NoSpace);
+        }
+        if allocation_kr != libc::KERN_SUCCESS {
+            return Err(DirectVmReservationError::Kernel {
+                operation: "mach_vm_allocate fixed native direct reservation",
+                code: allocation_kr,
+            });
+        }
+        if address != start {
+            let _ = unsafe { mach2::vm::mach_vm_deallocate(task, address, length) };
+            return Err(DirectVmReservationError::Redirected {
+                requested_start: start,
+                requested_end: end,
+                actual: address,
+            });
+        }
+        let protect_kr = unsafe {
+            mach2::vm::mach_vm_protect(task, address, length, 0, mach2::vm_prot::VM_PROT_NONE)
+        };
+        if protect_kr != libc::KERN_SUCCESS {
+            let _ = unsafe { mach2::vm::mach_vm_deallocate(task, address, length) };
+            return Err(DirectVmReservationError::Kernel {
+                operation: "mach_vm_protect native direct reservation",
+                code: protect_kr,
+            });
+        }
+        Ok(ExactReservationResult::Reserved)
+    }
+
     /// Acquire one future Direct interval without overwriting any host mapping.
-    /// A redirected nonfixed mmap is accepted only when both Mach region
-    /// flavors identify the measured dyld delegated shared-pmap empty covering
-    /// entry. XNU retags that same entry from `VM_MEMORY_SHARED_PMAP` to
-    /// `VM_MEMORY_UNSHARED_PMAP` when it becomes unnested after `fork`; every
-    /// other redirect is a collision.
-    #[allow(deprecated)] // libc::mach_task_self_ is the stable self-task port here.
+    /// Exact fixed allocations own ordinary vacant spans. A mapped segment is
+    /// skipped only when both Mach region flavors identify the measured dyld
+    /// delegated shared-pmap empty tuple. XNU retags that entry from
+    /// `VM_MEMORY_SHARED_PMAP` to `VM_MEMORY_UNSHARED_PMAP` when it becomes
+    /// unnested after `fork`; every other occupied segment is a collision.
+    /// Mixed ranges retain exact guards for every true gap, so a split dyld
+    /// entry cannot leave its vacant tail unowned before image retirement.
     pub fn reserve_self_direct_vm_range(
         start: u64,
         length: u64,
@@ -709,141 +774,158 @@ mod imp {
             .checked_add(length)
             .filter(|end| length != 0 && *end > start)
             .ok_or(DirectVmReservationError::InvalidRange { start, length })?;
-        let requested = usize::try_from(start)
+        let _ = usize::try_from(start)
             .map_err(|_| DirectVmReservationError::InvalidRange { start, length })?;
-        let length = usize::try_from(length)
+        let _ = usize::try_from(length)
             .map_err(|_| DirectVmReservationError::InvalidRange { start, length })?;
-        let mapped = unsafe {
-            libc::mmap(
-                requested as *mut libc::c_void,
-                length,
-                libc::PROT_NONE,
-                libc::MAP_ANON | libc::MAP_PRIVATE,
-                -1,
-                0,
-            )
+        let task = unsafe { mach2::traps::mach_task_self() };
+        let mut reservation = DirectVmReservation {
+            spans: Vec::new(),
+            armed: true,
         };
-        if mapped == libc::MAP_FAILED {
-            return Err(DirectVmReservationError::Host {
-                operation: "mmap native direct reservation",
-                errno: std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
-            });
-        }
-        let actual = mapped as usize;
-        if actual == requested {
-            return Ok(DirectVmReservationOutcome::Reserved(DirectVmReservation {
-                address: actual,
-                length,
-                armed: true,
-            }));
-        }
-        let _ = unsafe { libc::munmap(mapped, length) };
-
-        let task = unsafe { libc::mach_task_self_ };
-        let mut basic_address = start as libc::mach_vm_address_t;
-        let mut basic_size: libc::mach_vm_size_t = 0;
-        let mut basic = [0i32; 16];
-        let mut basic_count = VM_REGION_BASIC_INFO_COUNT_64;
-        let mut basic_object: libc::mach_port_t = 0;
-        let basic_kr = unsafe {
-            mach_vm_region(
-                task,
-                &mut basic_address,
-                &mut basic_size,
-                VM_REGION_BASIC_INFO_64,
-                basic.as_mut_ptr(),
-                &mut basic_count,
-                &mut basic_object,
-            )
-        };
-        if basic_object != 0 {
-            let _ = unsafe { mach_port_deallocate(task, basic_object) };
-        }
-        if basic_kr != libc::KERN_SUCCESS {
-            return Err(DirectVmReservationError::Kernel {
-                operation: "mach_vm_region basic64 after redirected mmap",
-                code: basic_kr,
-            });
-        }
-        let basic_end =
-            basic_address
-                .checked_add(basic_size)
-                .ok_or(DirectVmReservationError::Kernel {
-                    operation: "mach_vm_region basic64 range overflow",
-                    code: basic_kr,
+        let mut cursor = start;
+        while cursor < end {
+            reservation
+                .spans
+                .try_reserve(1)
+                .map_err(|_| DirectVmReservationError::Host {
+                    operation: "reserve native direct span metadata",
+                    errno: libc::ENOMEM,
                 })?;
-        if basic_address > start || basic_end < end {
-            return Err(DirectVmReservationError::Redirected {
+            match reserve_exact_vm_span(task, cursor, end - cursor)? {
+                ExactReservationResult::Reserved => {
+                    reservation.spans.push(DirectVmReservationSpan {
+                        address: cursor,
+                        length: end - cursor,
+                    });
+                    cursor = end;
+                    continue;
+                }
+                ExactReservationResult::NoSpace => {}
+            }
+
+            let mut basic_address = cursor as libc::mach_vm_address_t;
+            let mut basic_size: libc::mach_vm_size_t = 0;
+            let mut basic = [0i32; 16];
+            let mut basic_count = VM_REGION_BASIC_INFO_COUNT_64;
+            let mut basic_object: libc::mach_port_t = 0;
+            let basic_kr = unsafe {
+                mach_vm_region(
+                    task,
+                    &mut basic_address,
+                    &mut basic_size,
+                    VM_REGION_BASIC_INFO_64,
+                    basic.as_mut_ptr(),
+                    &mut basic_count,
+                    &mut basic_object,
+                )
+            };
+            if basic_object != 0 {
+                let _ = unsafe { mach_port_deallocate(task, basic_object) };
+            }
+            if basic_kr != libc::KERN_SUCCESS {
+                return Err(DirectVmReservationError::Kernel {
+                    operation: "mach_vm_region basic64 after fixed allocation no-space",
+                    code: basic_kr,
+                });
+            }
+            let basic_end =
+                basic_address
+                    .checked_add(basic_size)
+                    .ok_or(DirectVmReservationError::Kernel {
+                        operation: "mach_vm_region basic64 range overflow",
+                        code: basic_kr,
+                    })?;
+
+            if basic_address > cursor {
+                let gap_end = basic_address.min(end);
+                match reserve_exact_vm_span(task, cursor, gap_end - cursor)? {
+                    ExactReservationResult::Reserved => {
+                        reservation.spans.push(DirectVmReservationSpan {
+                            address: cursor,
+                            length: gap_end - cursor,
+                        });
+                        cursor = gap_end;
+                    }
+                    // A mapping raced into the measured gap. Re-query it rather
+                    // than overwriting or trusting stale vacancy information.
+                    ExactReservationResult::NoSpace => {}
+                }
+                continue;
+            }
+
+            let mut extended_address = cursor as libc::mach_vm_address_t;
+            let mut extended_size: libc::mach_vm_size_t = 0;
+            let mut extended = VmRegionExtendedInfo::default();
+            let mut extended_count = VM_REGION_EXTENDED_INFO_COUNT;
+            let mut extended_object: libc::mach_port_t = 0;
+            let extended_kr = unsafe {
+                mach_vm_region(
+                    task,
+                    &mut extended_address,
+                    &mut extended_size,
+                    VM_REGION_EXTENDED_INFO,
+                    &mut extended as *mut VmRegionExtendedInfo as *mut i32,
+                    &mut extended_count,
+                    &mut extended_object,
+                )
+            };
+            if extended_object != 0 {
+                let _ = unsafe { mach_port_deallocate(task, extended_object) };
+            }
+            if extended_kr != libc::KERN_SUCCESS {
+                return Err(DirectVmReservationError::Kernel {
+                    operation: "mach_vm_region extended after fixed allocation no-space",
+                    code: extended_kr,
+                });
+            }
+            let extended_end = extended_address.checked_add(extended_size).ok_or(
+                DirectVmReservationError::Kernel {
+                    operation: "mach_vm_region extended range overflow",
+                    code: extended_kr,
+                },
+            )?;
+            let protection = basic[0];
+            let max_protection = basic[1];
+            let shared = basic[3] != 0;
+            let reserved = basic[4] != 0;
+            let delegated_end = basic_end.min(extended_end).min(end);
+            if basic_address <= cursor
+                && extended_address <= cursor
+                && delegated_end > cursor
+                && protection == libc::VM_PROT_READ
+                && max_protection == libc::VM_PROT_READ
+                && !shared
+                && reserved
+                && matches!(
+                    extended.user_tag,
+                    VM_MEMORY_SHARED_PMAP | VM_MEMORY_UNSHARED_PMAP
+                )
+                && extended.share_mode == SM_EMPTY
+            {
+                cursor = delegated_end;
+                continue;
+            }
+
+            return Err(DirectVmReservationError::Occupied {
                 requested_start: start,
                 requested_end: end,
-                actual: actual as u64,
+                mapped_start: basic_address,
+                mapped_end: basic_end,
+                protection,
+                max_protection,
+                shared,
+                reserved,
+                user_tag: extended.user_tag,
+                share_mode: extended.share_mode,
             });
         }
 
-        let mut extended_address = start as libc::mach_vm_address_t;
-        let mut extended_size: libc::mach_vm_size_t = 0;
-        let mut extended = VmRegionExtendedInfo::default();
-        let mut extended_count = VM_REGION_EXTENDED_INFO_COUNT;
-        let mut extended_object: libc::mach_port_t = 0;
-        let extended_kr = unsafe {
-            mach_vm_region(
-                task,
-                &mut extended_address,
-                &mut extended_size,
-                VM_REGION_EXTENDED_INFO,
-                &mut extended as *mut VmRegionExtendedInfo as *mut i32,
-                &mut extended_count,
-                &mut extended_object,
-            )
-        };
-        if extended_object != 0 {
-            let _ = unsafe { mach_port_deallocate(task, extended_object) };
+        if reservation.spans.is_empty() {
+            Ok(DirectVmReservationOutcome::DelegatedDyldPmapEmpty)
+        } else {
+            Ok(DirectVmReservationOutcome::Reserved(reservation))
         }
-        if extended_kr != libc::KERN_SUCCESS {
-            return Err(DirectVmReservationError::Kernel {
-                operation: "mach_vm_region extended after redirected mmap",
-                code: extended_kr,
-            });
-        }
-        let extended_end = extended_address.checked_add(extended_size).ok_or(
-            DirectVmReservationError::Kernel {
-                operation: "mach_vm_region extended range overflow",
-                code: extended_kr,
-            },
-        )?;
-        let protection = basic[0];
-        let max_protection = basic[1];
-        let shared = basic[3] != 0;
-        let reserved = basic[4] != 0;
-        if basic_address <= start
-            && basic_end >= end
-            && extended_address <= start
-            && extended_end >= end
-            && protection == libc::VM_PROT_READ
-            && max_protection == libc::VM_PROT_READ
-            && !shared
-            && reserved
-            && matches!(
-                extended.user_tag,
-                VM_MEMORY_SHARED_PMAP | VM_MEMORY_UNSHARED_PMAP
-            )
-            && extended.share_mode == SM_EMPTY
-        {
-            return Ok(DirectVmReservationOutcome::DelegatedDyldPmapEmpty);
-        }
-
-        Err(DirectVmReservationError::Occupied {
-            requested_start: start,
-            requested_end: end,
-            mapped_start: basic_address,
-            mapped_end: basic_end,
-            protection,
-            max_protection,
-            shared,
-            reserved,
-            user_tag: extended.user_tag,
-            share_mode: extended.share_mode,
-        })
     }
 
     #[cfg(test)]
@@ -953,6 +1035,50 @@ mod imp {
                 assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
                 assert!(libc::WIFEXITED(status), "child status was 0x{status:x}");
                 assert_eq!(libc::WEXITSTATUS(status), 0);
+            });
+        }
+
+        #[test]
+        fn fork_child_split_canonical_range_is_accepted_segmentwise() {
+            fork_test(|| {
+                let source = 0x4_0000_0000usize;
+                let mapped = unsafe {
+                    libc::mmap(
+                        source as *mut libc::c_void,
+                        PAGE,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_ANON | libc::MAP_PRIVATE | libc::MAP_FIXED,
+                        -1,
+                        0,
+                    )
+                };
+                assert_eq!(mapped as usize, source);
+                unsafe { mapped.cast::<u8>().write(0x5e) };
+
+                let child = unsafe { libc::fork() };
+                assert!(
+                    child >= 0,
+                    "fork direct-mapped child: {}",
+                    std::io::Error::last_os_error()
+                );
+                if child == 0 {
+                    let outcome = reserve_self_direct_vm_range(0x4_0002_4000, 0x0628_0000);
+                    match outcome {
+                        Ok(DirectVmReservationOutcome::Reserved(guard)) => drop(guard),
+                        Ok(DirectVmReservationOutcome::DelegatedDyldPmapEmpty) => {}
+                        Err(error) => panic!(
+                            "Node-sized split Direct range was not accepted segmentwise: {error:?}"
+                        ),
+                    }
+                    assert_eq!(unsafe { mapped.cast::<u8>().read() }, 0x5e);
+                    unsafe { libc::_exit(0) };
+                }
+
+                let mut status = 0;
+                assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+                assert!(libc::WIFEXITED(status), "child status was 0x{status:x}");
+                assert_eq!(libc::WEXITSTATUS(status), 0);
+                assert_eq!(unsafe { mapped.cast::<u8>().read() }, 0x5e);
             });
         }
 
