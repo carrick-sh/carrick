@@ -11,7 +11,7 @@ use super::cache::{PublishedCode, TranslationCache};
 use super::types::{CacheOffset, CacheVa, CodeGeneration, DsrError, InstAction};
 
 const _: () = assert!(super::super::address::INVALID_BIASED_HOST_ADDRESS_BIT == 1 << 47);
-const BIASED_FAST_ADDRESS_BITS: u32 = 40;
+const BIASED_FAST_ADDRESS_BITS: u32 = 41;
 const _: () =
     assert!(super::super::address::BIASED_GUEST_APERTURE_END <= 1 << BIASED_FAST_ADDRESS_BITS);
 
@@ -1418,129 +1418,6 @@ fn emit_biased_effective_guest_address(
     }
 }
 
-fn is_store_exclusive(op: bad64::Op) -> bool {
-    matches!(
-        op,
-        bad64::Op::STLXP
-            | bad64::Op::STLXR
-            | bad64::Op::STLXRB
-            | bad64::Op::STLXRH
-            | bad64::Op::STXP
-            | bad64::Op::STXR
-            | bad64::Op::STXRB
-            | bad64::Op::STXRH
-    )
-}
-
-fn emit_biased_store_exclusive(
-    assembler: &mut VecAssembler<Aarch64Relocation>,
-    entries: &mut Vec<PcMapEntry>,
-    plan: &BlockPlan,
-    guest: GuestVa,
-    memory: super::types::MemoryAccess,
-    recovery: &mut Vec<RecoveryEntry>,
-) -> Result<(), DsrError> {
-    if guest == plan.start {
-        // The gateway and generation guard contain ordinary stores, so an
-        // exclusive monitor cannot survive into a block-entry STXR. Report a
-        // permitted spurious failure and let the guest retry from its LDXR.
-        let status = (memory.word >> 16) & 0x1f;
-        return emit_word(
-            assembler,
-            entries,
-            guest,
-            0x5280_0020 | status, // mov w<status>, #1
-        );
-    }
-    if memory.virtualization != super::types::MemoryVirtualization::None
-        || super::decode::decoded_operands_mention_x18(memory.word, guest)
-        || super::decode::decoded_operands_mention_x28(memory.word, guest)
-    {
-        return Err(unsupported_action(
-            plan,
-            guest,
-            memory.word,
-            "store-exclusive with virtual x18/x28 operand in biased mode",
-        ));
-    }
-    let super::types::MemoryBase::Register(base) = memory.base else {
-        return Err(unsupported_action(
-            plan,
-            guest,
-            memory.word,
-            "store-exclusive with virtual or literal base in biased mode",
-        ));
-    };
-    let compare_base = if matches!(base, bad64::Reg::SP | bad64::Reg::WSP) {
-        emit_word(assembler, entries, guest, 0x9100_03f2)?; // mov x18, sp
-        18
-    } else {
-        gpr_index(base).ok_or_else(|| {
-            unsupported_action(
-                plan,
-                guest,
-                memory.word,
-                "store-exclusive with non-GPR base in biased mode",
-            )
-        })?
-    };
-    // Any ordinary host store after LDXR clears the local exclusive monitor.
-    // Keep this preamble load/ALU-only: physical x18 is not guest-visible and
-    // can transiently hold the range predicate and translated address until
-    // STXR. LSR/CBNZ are flags-neutral, preserving guest NZCV.
-    emit_word(
-        assembler,
-        entries,
-        guest,
-        0xd368_fc00 | (compare_base << 5) | 18, // lsr x18, base, #40
-    )?;
-    emit_word(
-        assembler,
-        entries,
-        guest,
-        0xb500_0092, // cbnz x18, invalid (+16)
-    )?;
-    emit_word(
-        assembler,
-        entries,
-        guest,
-        0xf940_0000 | ((1192 / 8) << 10) | (28 << 5) | 18,
-    )?;
-    let add = if matches!(base, bad64::Reg::SP | bad64::Reg::WSP) {
-        0x8b32_63f2 // add x18, sp, x18, uxtx
-    } else if let Some(base) = gpr_index(base) {
-        0x8b00_0000 | (18 << 16) | (base << 5) | 18
-    } else {
-        return Err(unsupported_action(
-            plan,
-            guest,
-            memory.word,
-            "store-exclusive with non-GPR base in biased mode",
-        ));
-    };
-    emit_word(assembler, entries, guest, add)?;
-    emit_word(assembler, entries, guest, 0x1400_0004)?; // b translated (+16)
-    emit_word(
-        assembler,
-        entries,
-        guest,
-        0xf940_0000 | ((1192 / 8) << 10) | (28 << 5) | 18,
-    )?;
-    emit_word(assembler, entries, guest, add)?;
-    emit_word(
-        assembler,
-        entries,
-        guest,
-        0xb251_0000 | (18 << 5) | 18, // orr x18, x18, #1 << 47
-    )?;
-    let rewritten = (memory.word & !(0x1f << 5)) | (18 << 5);
-    emit_word(assembler, entries, guest, rewritten)?;
-    // There is deliberately no cleanup instruction. The next emitted guest
-    // instruction owns the following PC, so a completed STXR is never retried.
-    let _ = recovery;
-    Ok(())
-}
-
 #[allow(
     clippy::too_many_arguments,
     reason = "biased memory lowering keeps emission and recovery metadata together"
@@ -1562,17 +1439,18 @@ fn emit_biased_memory(
             "memory family unsupported in biased mode",
         ));
     }
-    if memory.class == super::types::MemoryClass::Exclusive
-        && memory.virtualization != super::types::MemoryVirtualization::None
-    {
+    if memory.class == super::types::MemoryClass::Exclusive {
         return Err(unsupported_action(
             plan,
             guest,
             memory.word,
-            "exclusive result/data in virtual x18/x28 would clear the monitor",
+            "exclusive access leaked past its typed execution boundary",
         ));
     }
-    if memory.writeback != super::types::MemoryWriteback::None
+    if matches!(
+        memory.class,
+        super::types::MemoryClass::Scalar | super::types::MemoryClass::Pair
+    ) && memory.writeback != super::types::MemoryWriteback::None
         && format!("{:?}", memory.op).starts_with("LD")
     {
         let encoded_base = (memory.word >> 5) & 0x1f;
@@ -1588,9 +1466,6 @@ fn emit_biased_memory(
                 "constrained writeback load overlaps its base register",
             ));
         }
-    }
-    if memory.class == super::types::MemoryClass::Exclusive && is_store_exclusive(memory.op) {
-        return emit_biased_store_exclusive(assembler, entries, plan, guest, memory, recovery);
     }
     if let super::types::MemoryBase::Literal(target) = memory.base {
         let materialized = if target.raw() < super::super::address::BIASED_GUEST_LITERAL_TARGET_END
@@ -1741,9 +1616,9 @@ fn emit_biased_memory(
         entries,
         recovery,
         guest,
-        0xd368_fc00 | (bias_scratch << 5) | 18,
+        0xd340_fc00 | (BIASED_FAST_ADDRESS_BITS << 16) | (bias_scratch << 5) | 18,
         action,
-    )?; // lsr x18, effective, #40
+    )?; // lsr x18, effective, #BIASED_FAST_ADDRESS_BITS
     emit_with_biased_recovery(
         assembler,
         entries,
@@ -3023,92 +2898,6 @@ mod tests {
     }
 
     #[test]
-    fn biased_exclusive_pair_has_no_host_store_between_ldxr_and_stxr() {
-        let start = GuestVa(0x4000);
-        let instructions = [0xc85f_7c20, 0x9100_0400, 0xc802_7c20]
-            .into_iter()
-            .enumerate()
-            .map(|(index, word)| PlannedInst {
-                guest: GuestVa(start.raw() + index as u64 * 4),
-                action: super::super::decode::classify(
-                    word,
-                    GuestVa(start.raw() + index as u64 * 4),
-                )
-                .expect("classify exclusive loop word"),
-            })
-            .collect();
-        let plan = BlockPlan {
-            start,
-            end: GuestVa(0x4010),
-            generation: CodeGeneration::INITIAL,
-            instructions,
-            exit: PlannedExit::Syscall {
-                guest: GuestVa(0x400c),
-                resume: GuestVa(0x4010),
-            },
-        };
-        let host_bias =
-            crate::native_darwin::address::NativeHostBias::new(0x80_0000_0000, 16 * 1024)
-                .expect("construct host bias");
-        let mut cache = TranslationCache::new(16 * 1024).expect("allocate exclusive cache");
-        let emitted = emit_block(&mut cache, &plan, EmitAddressMode::Biased { host_bias })
-            .expect("emit exclusive loop");
-        let words = (0..emitted.len() / 4)
-            .map(|index| unsafe {
-                std::ptr::read_unaligned((emitted.entry().host().raw() + index * 4) as *const u32)
-            })
-            .collect::<Vec<_>>();
-        let decoded = words
-            .iter()
-            .enumerate()
-            .filter_map(|(index, word)| {
-                bad64::decode(*word, index as u64 * 4)
-                    .ok()
-                    .map(|instruction| (index, instruction.op()))
-            })
-            .collect::<Vec<_>>();
-        let ldxr = decoded
-            .iter()
-            .find(|(_, op)| *op == bad64::Op::LDXR)
-            .map(|(index, _)| *index)
-            .expect("find emitted LDXR");
-        let stxr = decoded
-            .iter()
-            .find(|(_, op)| *op == bad64::Op::STXR)
-            .map(|(index, _)| *index)
-            .expect("find emitted STXR");
-        for index in (stxr - 2)..=stxr {
-            let offset = CacheOffset::published((index * 4) as u32);
-            assert_eq!(
-                emitted.map().guest_for_cache(offset),
-                Some(GuestVa(0x4008)),
-                "exclusive preamble offset {index} must retry the STXR guest PC"
-            );
-            assert!(
-                emitted.recovery().iter().all(|entry| entry.cache != offset),
-                "exclusive preamble offset {index} must not restore transient physical x18"
-            );
-        }
-        for (index, op) in decoded {
-            if ldxr < index && index < stxr {
-                assert!(
-                    !matches!(
-                        op,
-                        bad64::Op::STR
-                            | bad64::Op::STRB
-                            | bad64::Op::STRH
-                            | bad64::Op::STP
-                            | bad64::Op::STUR
-                            | bad64::Op::STURB
-                            | bad64::Op::STURH
-                    ),
-                    "host store {op:?} at emitted index {index} clears exclusive monitor"
-                );
-            }
-        }
-    }
-
-    #[test]
     fn biased_constrained_writeback_load_overlap_fails_closed() {
         for word in [
             0xf840_8421, // ldr x1, [x1], #8
@@ -3132,37 +2921,20 @@ mod tests {
     }
 
     #[test]
-    fn biased_exclusive_virtual_results_fail_but_virtual_base_load_is_supported() {
-        let host_bias =
-            crate::native_darwin::address::NativeHostBias::new(0x80_0000_0000, 16 * 1024)
-                .expect("construct host bias");
-        for word in [
-            0xc85f_7c32, // ldxr x18, [x1]
-            0xc802_7c32, // stxr w2, x18, [x1]
-        ] {
-            let mut plan = copy_plan();
-            plan.instructions = vec![PlannedInst {
-                guest: GuestVa(0x4000),
-                action: super::super::decode::classify(word, GuestVa(0x4000))
-                    .expect("classify virtual exclusive"),
-            }];
-            let mut cache = TranslationCache::new(16 * 1024).expect("allocate exclusive cache");
-            assert!(matches!(
-                emit_block(&mut cache, &plan, EmitAddressMode::Biased { host_bias },),
-                Err(DsrError::UnsupportedBlockAction { .. })
-            ));
-        }
-
-        let word = 0xc85f_7e40; // ldxr x0, [x18]
+    fn biased_simd_post_index_does_not_alias_gpr_base_by_register_number() {
+        let word = 0x4cdf_2c00; // ld1 {v0.2d-v3.2d}, [x0], #64
         let mut plan = copy_plan();
         plan.instructions = vec![PlannedInst {
             guest: GuestVa(0x4000),
             action: super::super::decode::classify(word, GuestVa(0x4000))
-                .expect("classify virtual-base LDXR"),
+                .expect("classify Go SIMD post-index load"),
         }];
-        let mut cache = TranslationCache::new(16 * 1024).expect("allocate virtual-base cache");
+        let host_bias =
+            crate::native_darwin::address::NativeHostBias::new(0x80_0000_0000, 16 * 1024)
+                .expect("construct host bias");
+        let mut cache = TranslationCache::new(16 * 1024).expect("allocate SIMD cache");
         emit_block(&mut cache, &plan, EmitAddressMode::Biased { host_bias })
-            .expect("emit virtual-base LDXR");
+            .expect("SIMD destination numbering must not overlap its GPR base");
     }
 
     #[test]

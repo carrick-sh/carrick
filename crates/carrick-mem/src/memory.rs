@@ -1014,6 +1014,18 @@ impl AddressSpace {
         self
     }
 
+    /// Remove backend-unsafe AArch64 capabilities before serializing auxv.
+    pub fn without_auxv_hwcap(mut self, capabilities: crate::linux_abi::LinuxAarch64Hwcap) -> Self {
+        for entry in &mut self.linux_auxv {
+            if entry.a_type == LINUX_AT_HWCAP {
+                let advertised = crate::linux_abi::LinuxAarch64Hwcap::from_bits_retain(entry.a_val);
+                *entry = LinuxAuxvEntry::new(LINUX_AT_HWCAP, (advertised - capabilities).bits());
+            }
+        }
+        self.linux_auxv_image.clear();
+        self
+    }
+
     /// Ensure an `AT_BASE` auxv entry is present (replacing any existing one).
     ///
     /// Used for the Rosetta redirect of a *dynamic* x86_64 target: carrick loads
@@ -3077,9 +3089,17 @@ fn linux_auxv_from_load_plan_with_vdso(
     auxv.push(LinuxAuxvEntry::new(LINUX_AT_SECURE, 0));
     auxv.push(LinuxAuxvEntry::new(LINUX_AT_CLKTCK, 100));
     // Minimal AArch64 HWCAP — enough for glibc to decide it can use the
-    // "modern" optimized routines. Bits picked from /usr/include/asm/hwcap.h
-    // (FP, ASIMD, AES, PMULL, SHA1, SHA2, CRC32, ATOMICS).
-    auxv.push(LinuxAuxvEntry::new(LINUX_AT_HWCAP, 0x1fb));
+    // "modern" optimized routines. Backends may remove features that their
+    // execution boundary cannot preserve before serializing the stack.
+    let hwcap = crate::linux_abi::LinuxAarch64Hwcap::FP
+        | crate::linux_abi::LinuxAarch64Hwcap::ASIMD
+        | crate::linux_abi::LinuxAarch64Hwcap::AES
+        | crate::linux_abi::LinuxAarch64Hwcap::PMULL
+        | crate::linux_abi::LinuxAarch64Hwcap::SHA1
+        | crate::linux_abi::LinuxAarch64Hwcap::SHA2
+        | crate::linux_abi::LinuxAarch64Hwcap::CRC32
+        | crate::linux_abi::LinuxAarch64Hwcap::ATOMICS;
+    auxv.push(LinuxAuxvEntry::new(LINUX_AT_HWCAP, hwcap.bits()));
     auxv.push(LinuxAuxvEntry::new(LINUX_AT_HWCAP2, 0));
     if include_vdso {
         // Point the guest at carrick's vDSO so libc/Go resolve
@@ -3391,6 +3411,31 @@ mod loader_tests {
                 .iter()
                 .any(|entry| entry.a_type == crate::linux_abi::LINUX_AT_SYSINFO_EHDR),
             "AT_SYSINFO_EHDR should be absent when vDSO is disabled"
+        );
+    }
+
+    #[test]
+    fn linux_auxv_can_withhold_backend_unsafe_hwcap_features() {
+        let mut image = AddressSpace::from_regions(0, Vec::new()).unwrap();
+        image.linux_auxv = vec![LinuxAuxvEntry::new(
+            crate::linux_abi::LINUX_AT_HWCAP,
+            (crate::linux_abi::LinuxAarch64Hwcap::FP
+                | crate::linux_abi::LinuxAarch64Hwcap::ASIMD
+                | crate::linux_abi::LinuxAarch64Hwcap::SHA2)
+                .bits(),
+        )];
+
+        let image = image.without_auxv_hwcap(crate::linux_abi::LinuxAarch64Hwcap::SHA2);
+        let hwcap = image
+            .linux_auxv
+            .iter()
+            .find(|entry| entry.a_type == crate::linux_abi::LINUX_AT_HWCAP)
+            .expect("retain AT_HWCAP");
+        let hwcap_value = hwcap.a_val;
+        assert_eq!(
+            hwcap_value,
+            (crate::linux_abi::LinuxAarch64Hwcap::FP | crate::linux_abi::LinuxAarch64Hwcap::ASIMD)
+                .bits()
         );
     }
 

@@ -12,7 +12,11 @@ pub(super) const BIAS_CANDIDATES: [u64; 4] = [
     0x140_0000_0000,
 ];
 const DARWIN_USER_VA_END: u64 = 0x8000_0000_0000;
-pub(super) const BIASED_GUEST_APERTURE_END: u64 = carrick_mem::memory::LINUX_STACK_TOP;
+// Go's arm64 runtime probes and fixes its heap arena at 0x140_0000_0000, above
+// Carrick's Linux stack placement. The biased aperture is the emulated task
+// address ceiling, not the stack ceiling, and must own that complete range so
+// unchecked translated guest pointers cannot alias unrelated host mappings.
+pub(super) const BIASED_GUEST_APERTURE_END: u64 = 0x200_0000_0000;
 // AArch64 literal loads have a signed imm19 scaled by four, so their complete
 // displacement window is 1 MiB. Reserve that window plus one host page: the
 // page-sized headroom contains the tail of the maximum-width (16-byte) access
@@ -625,8 +629,8 @@ pub(super) enum NativeAddressError {
 #[cfg(test)]
 mod tests {
     use super::{
-        BIASED_GUEST_LITERAL_DISPLACEMENT_WINDOW, CandidateLayout, NativeAddressError,
-        NativeAddressMode, NativeHostBias, NativeLayout, OwnedHostMapping,
+        BIASED_GUEST_APERTURE_END, BIASED_GUEST_LITERAL_DISPLACEMENT_WINDOW, CandidateLayout,
+        NativeAddressError, NativeAddressMode, NativeHostBias, NativeLayout, OwnedHostMapping,
     };
     use crate::dispatch::MemoryLayout;
     use crate::memory::AddressSpace;
@@ -893,19 +897,19 @@ mod tests {
                 range.start <= selected.address_mode().to_host(GuestVa(0)).unwrap()
                     && gap_host < range.end
             }));
-            let ceiling_last = selected
+            let aperture_last = selected
                 .address_mode()
-                .to_host(GuestVa(carrick_mem::memory::LINUX_STACK_TOP - 1))
+                .to_host(GuestVa(BIASED_GUEST_APERTURE_END - 1))
                 .expect("translate last in-aperture byte");
-            let ceiling_guard = selected
+            let aperture_guard = selected
                 .address_mode()
-                .to_host(GuestVa(carrick_mem::memory::LINUX_STACK_TOP))
+                .to_host(GuestVa(BIASED_GUEST_APERTURE_END))
                 .expect("translate first byte above guest ceiling");
             assert!(
                 selected
                     .owned_ranges()
                     .iter()
-                    .any(|range| { range.start <= ceiling_last && ceiling_guard < range.end })
+                    .any(|range| { range.start <= aperture_last && aperture_guard < range.end })
             );
             drop(selected);
             drop(sentinel);
@@ -921,9 +925,9 @@ mod tests {
 
             let page_size = TEST_PAGE_SIZE as u64;
             let low_guest_start = 0x40_0000;
-            let ceiling_guest_start = carrick_mem::memory::LINUX_STACK_TOP - page_size;
+            let ceiling_guest_start = BIASED_GUEST_APERTURE_END - page_size;
             let old_guard_end =
-                carrick_mem::memory::LINUX_STACK_TOP + BIASED_GUEST_LITERAL_DISPLACEMENT_WINDOW;
+                BIASED_GUEST_APERTURE_END + BIASED_GUEST_LITERAL_DISPLACEMENT_WINDOW;
             let first_sentinel_host = HostVa((0x80_0000_0000 + old_guard_end) as usize);
             let sentinel = OwnedHostMapping::map_exact(
                 first_sentinel_host,
@@ -978,7 +982,7 @@ mod tests {
             let selected = NativeLayout::for_image(&image, layout, page_size)
                 .expect("select collision-free literal guard after removing sentinel");
 
-            let instruction = carrick_mem::memory::LINUX_STACK_TOP - 4;
+            let instruction = BIASED_GUEST_APERTURE_END - 4;
             let literal_start = instruction + MAX_POSITIVE_LITERAL_DISPLACEMENT;
             let literal_end = literal_start + MAX_LITERAL_ACCESS_WIDTH;
             let host_start = selected
@@ -1046,6 +1050,17 @@ mod tests {
                         libc::MAP_ANON | libc::MAP_PRIVATE,
                     )
                     .expect("authorize fixed replacement inside owned gap")
+                    & libc::MAP_FIXED,
+                libc::MAP_FIXED
+            );
+            let go_arena = selected
+                .address_mode()
+                .to_host(GuestVa(0x140_0000_0000))
+                .expect("translate Go fixed arena");
+            assert_eq!(
+                selected
+                    .fixed_mapping_flags(go_arena, 0x400_000, libc::MAP_ANON | libc::MAP_PRIVATE,)
+                    .expect("authorize Go fixed arena inside owned aperture")
                     & libc::MAP_FIXED,
                 libc::MAP_FIXED
             );

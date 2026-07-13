@@ -768,6 +768,9 @@ pub(super) fn classify(word: u32, pc: GuestVa) -> Result<InstAction, DsrError> {
     };
 
     if let Some(mut memory) = classify_memory(pc, word, op, operands)? {
+        if memory.class == MemoryClass::Exclusive {
+            return sensitive(pc, SensitiveKind::Exclusive(word), None);
+        }
         if memory.class != MemoryClass::Literal
             && (mentions_x18_outside_base || mentions_x28_outside_base)
         {
@@ -901,13 +904,26 @@ mod tests {
     const PC: GuestVa = GuestVa(0x4000);
 
     #[test]
+    fn exclusive_accesses_are_typed_execution_boundaries() {
+        for word in [0x885f_fc9b, 0x881b_fc83] {
+            assert!(matches!(
+                classify(word, PC),
+                Ok(InstAction::Sensitive(SensitiveExit {
+                    kind: SensitiveKind::Exclusive(encoded),
+                    resume: GuestVa(0x4004),
+                    ..
+                })) if encoded == word
+            ));
+        }
+    }
+
+    #[test]
     fn classifies_memory_operands_for_biased_lowering() {
         let cases = [
             (0xf940_0020, MemoryClass::Scalar, MemoryWriteback::None),
             (0xf81f_0ffe, MemoryClass::Scalar, MemoryWriteback::PreIndex),
             (0xa8c1_7bfd, MemoryClass::Pair, MemoryWriteback::PostIndex),
             (0x3dc0_0020, MemoryClass::Simd, MemoryWriteback::None),
-            (0xc85f_7c20, MemoryClass::Exclusive, MemoryWriteback::None),
             (0xf8e1_0022, MemoryClass::Atomic, MemoryWriteback::None),
             (0x5800_0040, MemoryClass::Literal, MemoryWriteback::None),
             // Standard Advanced SIMD post-index register form.
