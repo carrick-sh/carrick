@@ -132,6 +132,7 @@ fn plan_with_reader(
         let next = checked_next(pc)?;
         let exit = match action {
             InstAction::Copy(_)
+            | InstAction::Memory(_)
             | InstAction::PcRelative(_)
             | InstAction::VirtualizedX18 { .. }
             | InstAction::VirtualizedX28 { .. }
@@ -291,6 +292,27 @@ mod tests {
         let start = GuestVa(0x7000);
         let (plan, reads) = plan_words(&[0xd503_201f, 0xd503_201f], start, 0x1000, 1);
         assert_eq!(reads, 1);
+        assert!(matches!(
+            plan.exit,
+            PlannedExit::Continue {
+                limit: BlockLimit::InstructionLimit,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn dsr_block_retains_memory_actions_in_the_instruction_stream() {
+        let start = GuestVa(0x8000);
+        let (plan, reads) = plan_words(&[0xf940_0020], start, 0x1000, 1);
+        assert_eq!(reads, 1);
+        assert!(matches!(
+            plan.instructions.as_slice(),
+            [PlannedInst {
+                action: InstAction::Memory(_),
+                ..
+            }]
+        ));
         assert!(matches!(
             plan.exit,
             PlannedExit::Continue {
