@@ -88,6 +88,7 @@ bad64 = "0.12.0"
 bitflags = "2.10.0"
 dynasmrt = "5.0.0"
 libc = "0.2"
+mach2 = "0.6.0"
 camino = { version = "1.2.1", features = ["serde1"] }
 cap-std = "4"
 clap = { version = "4.5.51", features = ["derive", "env"] }
