@@ -176,6 +176,10 @@ pub(super) struct MemoryAccess {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::native_darwin) enum SensitiveKind {
+    /// AArch64 exclusive load/store lowered at a typed DSR boundary.  A DSR
+    /// block transition performs host stores, so the hardware reservation
+    /// cannot be carried faithfully across translated basic blocks.
+    Exclusive(u32),
     ReadTpidr,
     WriteTpidr,
     ReadCtr,

@@ -554,7 +554,10 @@ where
         NATIVE_DARWIN_PIE_BASE,
         geometry.host_page_size,
     )?
-    .with_vdso_auxv(crate::runtime::vdso_enabled_for_debug());
+    .with_vdso_auxv(crate::runtime::vdso_enabled_for_debug())
+    .without_auxv_hwcap(
+        carrick_abi::LinuxAarch64Hwcap::SHA2 | carrick_abi::LinuxAarch64Hwcap::ATOMICS,
+    );
     // Same vDSO image + debug-mode selection as the HVF boot/execve builders,
     // relocated to the native-mappable bases (`NATIVE_DARWIN_VVAR_BASE`).
     // `NativeMappedMemory::map` rewrites the code page's vvar loads and stamps
@@ -620,7 +623,10 @@ where
         NATIVE_DARWIN_PIE_BASE,
         geometry.host_page_size,
     )?
-    .with_vdso_auxv(crate::runtime::vdso_enabled_for_debug());
+    .with_vdso_auxv(crate::runtime::vdso_enabled_for_debug())
+    .without_auxv_hwcap(
+        carrick_abi::LinuxAarch64Hwcap::SHA2 | carrick_abi::LinuxAarch64Hwcap::ATOMICS,
+    );
     let image = with_native_vdso(image)?.with_linux_initial_stack_page_size(
         argv,
         env,
@@ -684,7 +690,10 @@ fn load_native_execve_image(
         geometry.host_page_size,
     )
     .map_err(|_| crate::linux_abi::LINUX_ENOEXEC)?
-    .with_vdso_auxv(crate::runtime::vdso_enabled_for_debug());
+    .with_vdso_auxv(crate::runtime::vdso_enabled_for_debug())
+    .without_auxv_hwcap(
+        carrick_abi::LinuxAarch64Hwcap::SHA2 | carrick_abi::LinuxAarch64Hwcap::ATOMICS,
+    );
     // Mirror the HVF execve builder: the replacement image carries fresh
     // vvar/vdso regions; `replace_image` → `NativeMappedMemory::map` re-stamps
     // the vvar for the new image.
@@ -1254,14 +1263,31 @@ fn run_native_dsr_thread_loop(
             dsr::ThreadExit::Syscall { resume } => resume,
             dsr::ThreadExit::Continue => continue,
             dsr::ThreadExit::Sensitive(exit) => {
-                let register = exit.register.ok_or_else(|| {
-                    RuntimeError::Unsupported(format!(
-                        "native DSR sensitive {:?} exit has no register",
-                        exit.kind
-                    ))
-                })?;
+                let required_register = || {
+                    exit.register.ok_or_else(|| {
+                        RuntimeError::Unsupported(format!(
+                            "native DSR sensitive {:?} exit has no register",
+                            exit.kind
+                        ))
+                    })
+                };
                 match exit.kind {
+                    dsr::types::SensitiveKind::Exclusive(word) => {
+                        let guest_pc = exit.resume.raw().checked_sub(4).ok_or_else(|| {
+                            RuntimeError::Unsupported(
+                                "native DSR exclusive resume PC underflow".to_string(),
+                            )
+                        })?;
+                        emulate_dsr_exclusive_access(
+                            &mut memory.lock(),
+                            &mut snapshot,
+                            &mut thread_runtime.exclusive_reservation,
+                            word,
+                            guest_pc,
+                        )?;
+                    }
                     dsr::types::SensitiveKind::ReadTpidr => {
+                        let register = required_register()?;
                         if !native_snapshot_write_reg(&mut snapshot, register, guest_tpidr_el0) {
                             return Err(RuntimeError::Unsupported(format!(
                                 "native DSR could not write TPIDR result to {register}"
@@ -1269,6 +1295,7 @@ fn run_native_dsr_thread_loop(
                         }
                     }
                     dsr::types::SensitiveKind::WriteTpidr => {
+                        let register = required_register()?;
                         guest_tpidr_el0 = native_snapshot_read_reg(&snapshot, register)
                             .ok_or_else(|| {
                                 RuntimeError::Unsupported(format!(
@@ -1277,6 +1304,7 @@ fn run_native_dsr_thread_loop(
                             })?;
                     }
                     dsr::types::SensitiveKind::ReadCtr => {
+                        let register = required_register()?;
                         if !native_snapshot_write_reg(&mut snapshot, register, NATIVE_CTR_EL0) {
                             return Err(RuntimeError::Unsupported(format!(
                                 "native DSR could not write CTR_EL0 result to {register}"
@@ -1284,6 +1312,7 @@ fn run_native_dsr_thread_loop(
                         }
                     }
                     dsr::types::SensitiveKind::ReadDczid => {
+                        let register = required_register()?;
                         if !native_snapshot_write_reg(&mut snapshot, register, NATIVE_DCZID_EL0) {
                             return Err(RuntimeError::Unsupported(format!(
                                 "native DSR could not write DCZID_EL0 result to {register}"
@@ -1291,6 +1320,7 @@ fn run_native_dsr_thread_loop(
                         }
                     }
                     dsr::types::SensitiveKind::DcZva => {
+                        let register = required_register()?;
                         let address =
                             native_snapshot_read_reg(&snapshot, register).ok_or_else(|| {
                                 RuntimeError::Unsupported(format!(
@@ -2095,6 +2125,10 @@ struct NativeThreadRuntime {
     kicker: Arc<carrick_hal::GenericVcpuRegistry>,
     kick_state: Option<Arc<NativeKickState>>,
     threads: Arc<parking_lot::Mutex<Vec<std::thread::JoinHandle<()>>>>,
+    /// Per-guest-thread software reservation for DSR exclusive accesses.
+    /// Host gateway/context stores clear the architectural monitor at every
+    /// translated block boundary, so it cannot be the authority here.
+    exclusive_reservation: Option<NativeExclusiveReservation>,
     finished: bool,
     /// True on the COW copy a fork child replaces in `reset_after_fork_child`:
     /// its `kicker` registry mutexes may have been inherited LOCKED (another
@@ -2125,6 +2159,7 @@ impl NativeThreadRuntime {
             kicker,
             kick_state: None,
             threads: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            exclusive_reservation: None,
             finished: false,
             forked_stale: false,
         };
@@ -2153,6 +2188,7 @@ impl NativeThreadRuntime {
             kicker: Arc::clone(&self.kicker),
             kick_state: None,
             threads: Arc::clone(&self.threads),
+            exclusive_reservation: None,
             finished: false,
             forked_stale: false,
         }
@@ -3667,7 +3703,7 @@ fn handle_native_fork(
     };
     let vfork_pipe = if request.vfork.is_some() {
         memory.lock().set_fork_inheritance(true);
-        match pipe_pair() {
+        match vfork_pipe_pair() {
             Ok(pipe) => Some(pipe),
             Err(error) => {
                 memory.lock().set_fork_inheritance(false);
@@ -5002,6 +5038,130 @@ fn exclusive_access_width(op: bad64::Op, transfer_reg: bad64::Reg) -> Option<usi
     }
 }
 
+fn emulate_dsr_exclusive_access(
+    memory: &mut NativeMappedMemory,
+    snapshot: &mut NativeUcontextSnapshot,
+    reservation: &mut Option<NativeExclusiveReservation>,
+    word: u32,
+    guest_pc: u64,
+) -> Result<(), RuntimeError> {
+    let instruction = bad64::decode(word, guest_pc).map_err(|error| {
+        RuntimeError::Unsupported(format!(
+            "native DSR could not decode exclusive word 0x{word:08x} at 0x{guest_pc:x}: {error:?}"
+        ))
+    })?;
+    let load = matches!(
+        instruction.op(),
+        bad64::Op::LDAXR
+            | bad64::Op::LDAXRB
+            | bad64::Op::LDAXRH
+            | bad64::Op::LDXR
+            | bad64::Op::LDXRB
+            | bad64::Op::LDXRH
+    );
+    let acquire = matches!(
+        instruction.op(),
+        bad64::Op::LDAXR | bad64::Op::LDAXRB | bad64::Op::LDAXRH
+    );
+    let release = matches!(
+        instruction.op(),
+        bad64::Op::STLXR | bad64::Op::STLXRB | bad64::Op::STLXRH
+    );
+    let (status_reg, transfer_reg, memory_operand) = if load {
+        let [
+            bad64::Operand::Reg {
+                reg: transfer_reg,
+                arrspec: None,
+            },
+            memory_operand,
+        ] = instruction.operands()
+        else {
+            return Err(RuntimeError::Unsupported(format!(
+                "native DSR exclusive load does not support operands for {instruction}"
+            )));
+        };
+        (None, *transfer_reg, *memory_operand)
+    } else {
+        let [
+            bad64::Operand::Reg {
+                reg: status_reg,
+                arrspec: None,
+            },
+            bad64::Operand::Reg {
+                reg: transfer_reg,
+                arrspec: None,
+            },
+            memory_operand,
+        ] = instruction.operands()
+        else {
+            return Err(RuntimeError::Unsupported(format!(
+                "native DSR exclusive store does not support operands for {instruction}"
+            )));
+        };
+        (Some(*status_reg), *transfer_reg, *memory_operand)
+    };
+    let width = exclusive_access_width(instruction.op(), transfer_reg).ok_or_else(|| {
+        RuntimeError::Unsupported(format!(
+            "native DSR exclusive access does not support width for {instruction}"
+        ))
+    })?;
+    let (address, writeback) =
+        decode_native_scalar_address(snapshot, memory_operand).ok_or_else(|| {
+            RuntimeError::Unsupported(format!(
+                "native DSR exclusive access does not support addressing for {instruction}"
+            ))
+        })?;
+    if writeback.is_some() {
+        return Err(RuntimeError::Unsupported(format!(
+            "native DSR exclusive access rejects writeback for {instruction}"
+        )));
+    }
+    if !memory.native_range_allows(address, width, !load) {
+        return Err(RuntimeError::Unsupported(format!(
+            "native DSR exclusive {instruction} violates guest permissions at 0x{address:x}"
+        )));
+    }
+
+    if load {
+        let value = memory
+            .exclusive_load_for(address, width, acquire, reservation)
+            .map_err(|error| {
+                RuntimeError::Unsupported(format!(
+                    "native DSR exclusive load failed at 0x{address:x}: {error}"
+                ))
+            })?;
+        if !native_snapshot_write_reg(snapshot, transfer_reg, value) {
+            return Err(RuntimeError::Unsupported(format!(
+                "native DSR exclusive load could not write {transfer_reg}"
+            )));
+        }
+    } else {
+        let value = native_snapshot_read_reg(snapshot, transfer_reg).ok_or_else(|| {
+            RuntimeError::Unsupported(format!(
+                "native DSR exclusive store could not read {transfer_reg}"
+            ))
+        })?;
+        let stored = memory
+            .exclusive_store_for(address, width, value, release, reservation)
+            .map_err(|error| {
+                RuntimeError::Unsupported(format!(
+                    "native DSR exclusive store failed at 0x{address:x}: {error}"
+                ))
+            })?;
+        let status_reg = status_reg.ok_or_else(|| {
+            RuntimeError::Unsupported(format!(
+                "native DSR exclusive store lacks status register for {instruction}"
+            ))
+        })?;
+        if !native_snapshot_write_reg(snapshot, status_reg, u64::from(!stored)) {
+            return Err(RuntimeError::Unsupported(format!(
+                "native DSR exclusive store could not write {status_reg}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn emulate_linux4k_guarded_exclusive_access(
     memory: &mut NativeMappedMemory,
     snapshot: &mut NativeUcontextSnapshot,
@@ -5380,6 +5540,7 @@ struct NativeMappedMemory {
     native_write_exec_writable_pages: BTreeSet<u64>,
     linux4k_page_protections: BTreeMap<u64, [u64; 4]>,
     exclusive_reservation: Option<NativeExclusiveReservation>,
+    exclusive_sequences: BTreeMap<NativeExclusiveLocation, NativeExclusiveSequence>,
     host_page_size: u64,
     linux_page_size: u64,
     dsr_generations: dsr::cache::PageGenerationTable,
@@ -5401,9 +5562,26 @@ struct NativeMappingPageSizes {
 
 #[derive(Clone, Copy)]
 struct NativeExclusiveReservation {
+    location: NativeExclusiveLocation,
+    observed: u64,
+    sequence: NativeExclusiveSequence,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct NativeExclusiveLocation {
     address: u64,
     width: usize,
-    observed: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct NativeExclusiveSequence(u64);
+
+impl NativeExclusiveSequence {
+    const INITIAL: Self = Self(0);
+
+    fn next(self) -> Self {
+        Self(self.0.wrapping_add(1))
+    }
 }
 
 struct NativeMappedRegion {
@@ -5813,6 +5991,7 @@ impl NativeMappedMemory {
                 native_write_exec_writable_pages: BTreeSet::new(),
                 linux4k_page_protections: BTreeMap::new(),
                 exclusive_reservation: None,
+                exclusive_sequences: BTreeMap::new(),
                 host_page_size: page_sizes.host,
                 linux_page_size: page_sizes.linux,
                 dsr_generations: dsr::cache::PageGenerationTable::new(page_sizes.host)
@@ -6392,6 +6571,37 @@ impl NativeMappedMemory {
         prot & crate::linux_abi::LINUX_PROT_EXEC != 0
     }
 
+    fn native_range_allows(&self, address: u64, len: usize, write: bool) -> bool {
+        if len == 0 {
+            return false;
+        }
+        if self.uses_linux4k_subpages() {
+            return self.linux4k_range_allows(address, len, write);
+        }
+        let Some(end) = address.checked_add(len as u64) else {
+            return false;
+        };
+        let required = if write {
+            crate::linux_abi::LINUX_PROT_WRITE
+        } else {
+            crate::linux_abi::LINUX_PROT_READ
+        };
+        let mut cursor = address;
+        while cursor < end {
+            let page = cursor & !(self.host_page_size - 1);
+            let prot = self
+                .native_page_protections
+                .get(&page)
+                .copied()
+                .unwrap_or_else(|| self.default_linux_prot_at(cursor));
+            if prot & required == 0 {
+                return false;
+            }
+            cursor = page.saturating_add(self.host_page_size).min(end);
+        }
+        true
+    }
+
     fn linux4k_host_page_protections(&self, page_start: u64) -> [u64; 4] {
         self.linux4k_page_protections
             .get(&page_start)
@@ -6456,6 +6666,37 @@ impl NativeMappedMemory {
     }
 
     fn invalidate_exclusive_range(&mut self, address: u64, len: usize) {
+        let end = address.checked_add(len as u64);
+        if let Some(end) = end {
+            // DSR exclusive locations are scalar 1/2/4/8-byte accesses. An
+            // overlapping key can therefore start no earlier than address-7
+            // and strictly before the write end. Range the ordered map by that
+            // window rather than walking every exclusive location ever seen:
+            // Go's compiler issues DC ZVA continuously, and the old O(total
+            // locations) scan turned each 64-byte zero into a workload-wide
+            // traversal after a few thousand mutex addresses had accumulated.
+            let lower = NativeExclusiveLocation {
+                address: address.saturating_sub(7),
+                width: 0,
+            };
+            let upper = NativeExclusiveLocation {
+                address: end,
+                width: 0,
+            };
+            for (location, sequence) in self.exclusive_sequences.range_mut(lower..upper) {
+                let location_end = location.address.saturating_add(location.width as u64);
+                if address < location_end {
+                    *sequence = sequence.next();
+                }
+            }
+        } else {
+            // An overflowing host-mediated write is rejected by its caller,
+            // but conservatively invalidate every tracked reservation before
+            // that error returns.
+            for sequence in self.exclusive_sequences.values_mut() {
+                *sequence = sequence.next();
+            }
+        }
         let Some(reservation) = self.exclusive_reservation else {
             return;
         };
@@ -6463,12 +6704,15 @@ impl NativeMappedMemory {
             self.exclusive_reservation = None;
             return;
         };
-        let Some(reservation_end) = reservation.address.checked_add(reservation.width as u64)
+        let Some(reservation_end) = reservation
+            .location
+            .address
+            .checked_add(reservation.location.width as u64)
         else {
             self.exclusive_reservation = None;
             return;
         };
-        if address < reservation_end && reservation.address < end {
+        if address < reservation_end && reservation.location.address < end {
             self.exclusive_reservation = None;
         }
     }
@@ -6586,6 +6830,19 @@ impl NativeMappedMemory {
         width: usize,
         acquire: bool,
     ) -> Result<u64, MemoryError> {
+        let mut reservation = self.exclusive_reservation.take();
+        let result = self.exclusive_load_for(address, width, acquire, &mut reservation);
+        self.exclusive_reservation = reservation;
+        result
+    }
+
+    fn exclusive_load_for(
+        &mut self,
+        address: u64,
+        width: usize,
+        acquire: bool,
+        reservation: &mut Option<NativeExclusiveReservation>,
+    ) -> Result<u64, MemoryError> {
         if !address.is_multiple_of(width as u64) || !self.region_contains(address, width) {
             return Err(MemoryError::OutOfBounds {
                 address,
@@ -6611,10 +6868,15 @@ impl NativeMappedMemory {
             }
         };
         self.restore_temporary_host_access(&changed, address, width)?;
-        self.exclusive_reservation = Some(NativeExclusiveReservation {
-            address,
-            width,
+        let location = NativeExclusiveLocation { address, width };
+        let sequence = *self
+            .exclusive_sequences
+            .entry(location)
+            .or_insert(NativeExclusiveSequence::INITIAL);
+        *reservation = Some(NativeExclusiveReservation {
+            location,
             observed,
+            sequence,
         });
         Ok(observed)
     }
@@ -6626,10 +6888,30 @@ impl NativeMappedMemory {
         value: u64,
         release: bool,
     ) -> Result<bool, MemoryError> {
-        let Some(reservation) = self.exclusive_reservation.take() else {
+        let mut reservation = self.exclusive_reservation.take();
+        let result = self.exclusive_store_for(address, width, value, release, &mut reservation);
+        self.exclusive_reservation = reservation;
+        result
+    }
+
+    fn exclusive_store_for(
+        &mut self,
+        address: u64,
+        width: usize,
+        value: u64,
+        release: bool,
+        reservation: &mut Option<NativeExclusiveReservation>,
+    ) -> Result<bool, MemoryError> {
+        let Some(reservation) = reservation.take() else {
             return Ok(false);
         };
-        if reservation.address != address || reservation.width != width {
+        let location = NativeExclusiveLocation { address, width };
+        let sequence = self
+            .exclusive_sequences
+            .get(&location)
+            .copied()
+            .unwrap_or(NativeExclusiveSequence::INITIAL);
+        if reservation.location != location || reservation.sequence != sequence {
             return Ok(false);
         }
         let changed = self.prepare_temporary_host_access(address, width, true)?;
@@ -6678,6 +6960,9 @@ impl NativeMappedMemory {
                 _ => return Err(MemoryError::Unsupported),
             }
         };
+        if stored {
+            self.exclusive_sequences.insert(location, sequence.next());
+        }
         self.restore_temporary_host_access(&changed, address, width)?;
         Ok(stored)
     }
@@ -7115,6 +7400,22 @@ impl NativeMappedMemory {
             return Err(RuntimeError::Unsupported(format!(
                 "native Darwin mmap did not honor MAP_FIXED for alias 0x{address:x}"
             )));
+        }
+
+        // MAP_FIXED replaces the physical host pages, so none of the prior
+        // mapping's protection overrides remain authoritative. Leaving a
+        // stale PROT_NONE entry here lets a later temporary host access restore
+        // the newly writable page to no-access (Go user arenas remap freed
+        // 8 MiB chunks this way). Clear whole host pages, matching mmap's
+        // replacement granularity; Linux-4K subpage state is stale for the
+        // same reason.
+        let replaced_end = guest_map_start.saturating_add(host_map_len);
+        let mut replaced_page = guest_map_start;
+        while replaced_page < replaced_end {
+            self.native_page_protections.remove(&replaced_page);
+            self.native_write_exec_writable_pages.remove(&replaced_page);
+            self.linux4k_page_protections.remove(&replaced_page);
+            replaced_page = replaced_page.saturating_add(self.host_page_size);
         }
 
         if file.is_none() && !payload.is_empty() {
@@ -8037,6 +8338,26 @@ fn pipe_pair() -> Result<(RawFd, RawFd), RuntimeError> {
     }
 }
 
+/// Private vfork parent-suspend channel. Both ends must be close-on-host-exec:
+/// the child-side write end closing is the success notification when a forked
+/// native guest crosses the host self-reexec path, while a failed guest exec
+/// keeps the descriptor open and correctly leaves the parent suspended.
+fn vfork_pipe_pair() -> Result<(RawFd, RawFd), RuntimeError> {
+    let (read_fd, write_fd) = pipe_pair()?;
+    for fd in [read_fd, write_fd] {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+            let error = std::io::Error::last_os_error();
+            close_fd(read_fd);
+            close_fd(write_fd);
+            return Err(RuntimeError::FsBackend(anyhow::anyhow!(
+                "configure native vfork completion pipe close-on-exec: {error}"
+            )));
+        }
+    }
+    Ok((read_fd, write_fd))
+}
+
 fn close_fd(fd: RawFd) {
     unsafe {
         libc::close(fd);
@@ -8220,6 +8541,7 @@ mod tests {
             native_write_exec_writable_pages: BTreeSet::new(),
             linux4k_page_protections: BTreeMap::new(),
             exclusive_reservation: None,
+            exclusive_sequences: BTreeMap::new(),
             host_page_size: 16 * 1024,
             linux_page_size: 16 * 1024,
             dsr_generations: dsr::cache::PageGenerationTable::new(16 * 1024)
@@ -8242,6 +8564,169 @@ mod tests {
                 Some(carrick_guest_mem::GuestVa(0x40_0080))
             );
             assert!(memory.read_bytes(0, 1).is_err());
+        });
+    }
+
+    #[test]
+    fn dsr_exclusive_reservation_survives_typed_block_boundaries() {
+        fork_test(|| {
+            let address = 0x40_0080;
+            let mut memory = biased_test_memory(carrick_guest_mem::GuestVa(0x40_0000), 0x4000);
+            memory
+                .atomic_store(address, 4, 1)
+                .expect("seed atomic word");
+            let mut snapshot = NativeUcontextSnapshot::default();
+            snapshot.x[4] = address;
+            snapshot.x[3] = 2;
+            let mut reservation = None;
+
+            emulate_dsr_exclusive_access(
+                &mut memory,
+                &mut snapshot,
+                &mut reservation,
+                0x885f_fc9b, // ldaxr w27, [x4]
+                0x61b34,
+            )
+            .expect("emulate split exclusive load");
+            assert_eq!(snapshot.x[27], 1);
+            emulate_dsr_exclusive_access(
+                &mut memory,
+                &mut snapshot,
+                &mut reservation,
+                0x881b_fc83, // stlxr w27, w3, [x4]
+                0x61b40,
+            )
+            .expect("emulate split exclusive store");
+            assert_eq!(snapshot.x[27], 0, "unchanged reservation must store");
+            assert_eq!(memory.atomic_load(address, 4).expect("read stored word"), 2);
+
+            emulate_dsr_exclusive_access(
+                &mut memory,
+                &mut snapshot,
+                &mut reservation,
+                0x885f_fc9b,
+                0x61b34,
+            )
+            .expect("reload reservation");
+            memory
+                .atomic_store(address, 4, 3)
+                .expect("interfere with reservation");
+            snapshot.x[3] = 4;
+            emulate_dsr_exclusive_access(
+                &mut memory,
+                &mut snapshot,
+                &mut reservation,
+                0x881b_fc83,
+                0x61b40,
+            )
+            .expect("emulate failed exclusive store");
+            assert_eq!(snapshot.x[27], 1, "changed reservation must fail");
+            assert_eq!(
+                memory
+                    .atomic_load(address, 4)
+                    .expect("read interfered word"),
+                3
+            );
+
+            emulate_dsr_exclusive_access(
+                &mut memory,
+                &mut snapshot,
+                &mut reservation,
+                0x885f_fc9b,
+                0x61b34,
+            )
+            .expect("reserve before ABA interference");
+            memory
+                .atomic_store(address, 4, 9)
+                .expect("write intermediate ABA value");
+            memory
+                .atomic_store(address, 4, 3)
+                .expect("restore observed ABA value");
+            snapshot.x[3] = 5;
+            emulate_dsr_exclusive_access(
+                &mut memory,
+                &mut snapshot,
+                &mut reservation,
+                0x881b_fc83,
+                0x61b40,
+            )
+            .expect("emulate stale ABA store");
+            assert_eq!(snapshot.x[27], 1, "ABA must invalidate reservation");
+            assert_eq!(memory.atomic_load(address, 4).unwrap(), 3);
+        });
+    }
+
+    #[test]
+    fn dsr_exclusive_scalar_subword_widths_use_the_software_reservation() {
+        fork_test(|| {
+            let address = 0x40_0080;
+            let mut memory = biased_test_memory(carrick_guest_mem::GuestVa(0x40_0000), 0x4000);
+            for (width, load, store, initial) in [
+                (1, 0x085f_7c20, 0x0802_7c20, 0x12),   // ldxrb/stxrb w0, [x1]
+                (2, 0x485f_7c20, 0x4802_7c20, 0x1234), // ldxrh/stxrh w0, [x1]
+            ] {
+                memory
+                    .atomic_store(address, width, initial)
+                    .expect("seed subword exclusive value");
+                let mut snapshot = NativeUcontextSnapshot::default();
+                snapshot.x[1] = address;
+                snapshot.x[2] = u64::MAX;
+                let mut reservation = None;
+
+                emulate_dsr_exclusive_access(
+                    &mut memory,
+                    &mut snapshot,
+                    &mut reservation,
+                    load,
+                    0x62000,
+                )
+                .expect("emulate subword exclusive load");
+                assert_eq!(snapshot.x[0], initial);
+                snapshot.x[0] = initial + 1;
+                emulate_dsr_exclusive_access(
+                    &mut memory,
+                    &mut snapshot,
+                    &mut reservation,
+                    store,
+                    0x62004,
+                )
+                .expect("emulate subword exclusive store");
+                assert_eq!(snapshot.x[2], 0, "subword store must consume reservation");
+                assert_eq!(
+                    memory
+                        .atomic_load(address, width)
+                        .expect("read subword exclusive value"),
+                    initial + 1
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn biased_alias_remap_discards_stale_page_protection() {
+        fork_test(|| {
+            let address = 0x40_0000;
+            let len = 16 * 1024;
+            let mut memory = biased_test_memory(carrick_guest_mem::GuestVa(address), len);
+            memory
+                .protect_range(address, len, 0)
+                .expect("protect old alias none");
+            assert!(!memory.native_range_allows(address, 1, true));
+
+            memory
+                .map_host_alias(address, len as u64, &[], None, false)
+                .expect("replace old alias with writable mapping");
+            assert!(
+                memory.native_range_allows(address, 1, true),
+                "MAP_FIXED replacement must discard the prior mapping's PROT_NONE metadata"
+            );
+            memory
+                .write_bytes(address, &[0x5a])
+                .expect("write remapped alias");
+            assert_eq!(
+                memory.read_bytes(address, 1).expect("read remapped alias"),
+                [0x5a]
+            );
         });
     }
 
@@ -8503,14 +8988,14 @@ mod tests {
     }
 
     #[test]
-    fn biased_guest_ceiling_is_exclusive_without_rejecting_its_last_byte() {
+    fn biased_stack_ceiling_is_exclusive_without_rejecting_its_last_byte() {
         for (name, words, expected_exit) in [
             (
                 "ceiling-last",
                 vec![
                     0xd29f_ffe0, // movz x0, #0xffff
                     0xf2bf_ffc0, // movk x0, #0xfffe, lsl #16
-                    0xf2c0_1fe0, // movk x0, #0xff, lsl #32 (ceiling - 1)
+                    0xf2c0_1fe0, // movk x0, #0xff, lsl #32 (stack top - 1)
                     0x3940_0000, // ldrb w0, [x0]
                     0xd280_0000, // mov x0, #0
                     0xd280_0ba8, // mov x8, #93
@@ -8522,7 +9007,7 @@ mod tests {
                 "ceiling",
                 vec![
                     0xd2bf_ffe0, // movz x0, #0xffff, lsl #16
-                    0xf2c0_1fe0, // movk x0, #0xff, lsl #32 (ceiling)
+                    0xf2c0_1fe0, // movk x0, #0xff, lsl #32 (stack top)
                     0x3940_0000, // ldrb w0, [x0]
                     0xd280_0ba8, // mov x8, #93
                     SVC_0,
@@ -8554,7 +9039,7 @@ mod tests {
 
     #[test]
     fn biased_address_above_ceiling_cannot_alias_an_outside_host_sentinel() {
-        const OUTSIDE_GUEST: u64 = carrick_mem::memory::LINUX_STACK_TOP + 0x20_0000;
+        const OUTSIDE_GUEST: u64 = address::BIASED_GUEST_APERTURE_END + 0x20_0000;
         let outside_host = carrick_guest_mem::HostVa((0x80_0000_0000 + OUTSIDE_GUEST) as usize);
         let sentinel = address::OwnedHostMapping::map_exact(
             outside_host,
@@ -8566,8 +9051,8 @@ mod tests {
         unsafe { std::ptr::write_bytes(outside_host.raw() as *mut u8, 0x5a, 0x4000) };
         let words = [
             0xd280_0000, // movz x0, #0
-            0xf2a0_03e0, // movk x0, #0x1f, lsl #16
-            0xf2c0_2000, // movk x0, #0x100, lsl #32 (ceiling + 2 MiB)
+            0xf2a0_0400, // movk x0, #0x20, lsl #16
+            0xf2c0_4000, // movk x0, #0x200, lsl #32 (aperture + 2 MiB)
             0x3940_0000, // ldrb w0, [x0]
             0xd280_0ba8, // mov x8, #93
             SVC_0,
@@ -9748,6 +10233,7 @@ mod tests {
             native_write_exec_writable_pages: BTreeSet::new(),
             linux4k_page_protections: BTreeMap::new(),
             exclusive_reservation: None,
+            exclusive_sequences: BTreeMap::new(),
             host_page_size: 16 * 1024,
             linux_page_size: 16 * 1024,
             dsr_generations: dsr::cache::PageGenerationTable::new(16 * 1024)
@@ -9880,6 +10366,7 @@ mod tests {
             native_write_exec_writable_pages: BTreeSet::new(),
             linux4k_page_protections: BTreeMap::new(),
             exclusive_reservation: None,
+            exclusive_sequences: BTreeMap::new(),
             host_page_size: 16 * 1024,
             linux_page_size: 16 * 1024,
             dsr_generations: dsr::cache::PageGenerationTable::new(16 * 1024)
@@ -10541,6 +11028,7 @@ mod tests {
             native_write_exec_writable_pages: BTreeSet::new(),
             linux4k_page_protections: BTreeMap::new(),
             exclusive_reservation: None,
+            exclusive_sequences: BTreeMap::new(),
             host_page_size: page_size,
             linux_page_size: page_size,
             dsr_generations: dsr::cache::PageGenerationTable::new(page_size)
@@ -11349,6 +11837,24 @@ mod tests {
         assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
         assert!(libc::WIFEXITED(status), "child status was 0x{status:x}");
         assert_eq!(libc::WEXITSTATUS(status), 0);
+    }
+
+    #[test]
+    fn native_vfork_completion_pipe_closes_across_host_exec() {
+        let (read_fd, write_fd) = vfork_pipe_pair().expect("create vfork completion pipe");
+        let read_flags = unsafe { libc::fcntl(read_fd, libc::F_GETFD) };
+        let write_flags = unsafe { libc::fcntl(write_fd, libc::F_GETFD) };
+        close_fd(read_fd);
+        close_fd(write_fd);
+
+        assert!(read_flags >= 0, "read-end F_GETFD failed");
+        assert!(write_flags >= 0, "write-end F_GETFD failed");
+        assert_ne!(read_flags & libc::FD_CLOEXEC, 0, "read end must be private");
+        assert_ne!(
+            write_flags & libc::FD_CLOEXEC,
+            0,
+            "host self-reexec must close the child completion end"
+        );
     }
 
     #[test]
