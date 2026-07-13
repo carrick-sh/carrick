@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use super::backend_pair::CarrickBackend;
+use super::hvf_mailbox_pair::HvfSyscallTransport;
 
 const PROBE_SNIPPET: &str = "export BENCH_NPROC=4; base64 -d > /tmp/p && chmod +x /tmp/p && /tmp/p";
 const SAMPLE_DEADLINE: Duration = Duration::from_secs(60);
@@ -210,6 +211,30 @@ pub fn run_carrick_backend(
     let child = command
         .spawn()
         .map_err(|error| format!("spawn {backend:?} backend sample: {error}"))?;
+    drain_checked_with_deadline(child, repo_root, &run_id)
+}
+
+/// Run the same direct-ELF VMM command under one internal syscall transport.
+/// The executable, argv, CPU exposure, and guest artifact remain identical;
+/// only the private transport-selection environment variable changes.
+pub fn run_carrick_hvf_transport(
+    bin: &Path,
+    repo_root: &Path,
+    transport: HvfSyscallTransport,
+    probe: &Path,
+    guest_args: &[&str],
+) -> Result<String, String> {
+    let run_id = std::env::var("CARRICK_HVF_MAILBOX_RUN_ID").unwrap_or_else(|_| perf_run_id());
+    let mut command = Command::new(bin);
+    command
+        .args(backend_args(CarrickBackend::Hvf, probe, guest_args))
+        .env("CARRICK_RUN_ID", &run_id)
+        .env("CARRICK_EXPOSED_CPUS", CPU_PIN.to_string())
+        .env("CARRICK_HVF_SYSCALL_TRANSPORT", transport.env_value());
+    isolate_backend_process(&mut command);
+    let child = command
+        .spawn()
+        .map_err(|error| format!("spawn {transport:?} transport sample: {error}"))?;
     drain_checked_with_deadline(child, repo_root, &run_id)
 }
 
