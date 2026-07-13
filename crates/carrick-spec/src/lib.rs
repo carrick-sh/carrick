@@ -232,14 +232,69 @@ pub enum FsBackendKind {
     Host,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 #[serde(rename_all = "snake_case")]
-#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
 pub enum ExecBackendRequest {
     #[default]
-    Auto,
-    Hvf,
     Native,
+    Vmm,
+}
+
+impl ExecBackendRequest {
+    fn parse_value(input: &str, ignore_case: bool) -> Result<Self, String> {
+        let matches = |expected: &str| {
+            if ignore_case {
+                input.eq_ignore_ascii_case(expected)
+            } else {
+                input == expected
+            }
+        };
+
+        if matches("native") {
+            Ok(Self::Native)
+        } else if matches("vmm") {
+            Ok(Self::Vmm)
+        } else if matches("auto") {
+            Err(
+                "execution backend 'auto' was removed; omit --exec-backend for native execution or pass --exec-backend vmm"
+                    .to_string(),
+            )
+        } else if matches("hvf") {
+            Err("execution backend 'hvf' was renamed; pass --exec-backend vmm".to_string())
+        } else {
+            Err(format!(
+                "unknown execution backend '{input}'; expected 'native' or 'vmm'"
+            ))
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ExecBackendRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let input = String::deserialize(deserializer)?;
+        Self::parse_value(&input, false).map_err(serde::de::Error::custom)
+    }
+}
+
+#[cfg(feature = "clap")]
+impl clap::ValueEnum for ExecBackendRequest {
+    fn value_variants<'a>() -> &'a [Self] {
+        &[Self::Native, Self::Vmm]
+    }
+
+    fn from_str(input: &str, ignore_case: bool) -> Result<Self, String> {
+        Self::parse_value(input, ignore_case)
+    }
+
+    fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
+        Some(match self {
+            Self::Native => clap::builder::PossibleValue::new("native"),
+            Self::Vmm => clap::builder::PossibleValue::new("vmm"),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -798,6 +853,74 @@ pub struct RunSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exec_backend_defaults_to_native() {
+        assert_eq!(ExecBackendRequest::default(), ExecBackendRequest::Native);
+    }
+
+    #[test]
+    fn exec_backend_serde_accepts_only_native_and_vmm() {
+        assert_eq!(
+            serde_json::from_str::<ExecBackendRequest>(r#""native""#)
+                .expect("native backend should deserialize"),
+            ExecBackendRequest::Native
+        );
+        assert_eq!(
+            serde_json::from_str::<ExecBackendRequest>(r#""vmm""#)
+                .expect("vmm backend should deserialize"),
+            ExecBackendRequest::Vmm
+        );
+
+        let auto = serde_json::from_str::<ExecBackendRequest>(r#""auto""#)
+            .expect_err("auto must be rejected");
+        assert!(
+            auto.to_string().contains(
+                "execution backend 'auto' was removed; omit --exec-backend for native execution or pass --exec-backend vmm"
+            ),
+            "unexpected auto migration error: {auto}"
+        );
+
+        let hvf = serde_json::from_str::<ExecBackendRequest>(r#""hvf""#)
+            .expect_err("hvf must be rejected");
+        assert!(
+            hvf.to_string()
+                .contains("execution backend 'hvf' was renamed; pass --exec-backend vmm"),
+            "unexpected hvf migration error: {hvf}"
+        );
+    }
+
+    #[cfg(feature = "clap")]
+    #[test]
+    fn exec_backend_clap_accepts_only_native_and_vmm() {
+        use clap::ValueEnum;
+
+        assert_eq!(
+            ExecBackendRequest::from_str("native", false).expect("native should parse"),
+            ExecBackendRequest::Native
+        );
+        assert_eq!(
+            ExecBackendRequest::from_str("vmm", false).expect("vmm should parse"),
+            ExecBackendRequest::Vmm
+        );
+
+        let values = ExecBackendRequest::value_variants();
+        assert_eq!(
+            values,
+            &[ExecBackendRequest::Native, ExecBackendRequest::Vmm]
+        );
+
+        let auto = ExecBackendRequest::from_str("auto", false).expect_err("auto must fail");
+        assert_eq!(
+            auto,
+            "execution backend 'auto' was removed; omit --exec-backend for native execution or pass --exec-backend vmm"
+        );
+        let hvf = ExecBackendRequest::from_str("hvf", false).expect_err("hvf must fail");
+        assert_eq!(
+            hvf,
+            "execution backend 'hvf' was renamed; pass --exec-backend vmm"
+        );
+    }
 
     #[test]
     fn run_spec_network_defaults_to_host() {
