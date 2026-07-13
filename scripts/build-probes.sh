@@ -37,7 +37,7 @@ cd "$(dirname "$0")/.."
 HOST_ARCH="$(uname -m)"
 MODE="${1:-default}"
 
-if [ "$MODE" = "--native-pie" ]; then
+if [ "$MODE" = "--native-pie" ] || [ "$MODE" = "--native-pie-musl" ]; then
   if [ "$HOST_ARCH" != "arm64" ] && [ "$HOST_ARCH" != "aarch64" ]; then
     echo "--native-pie requires an arm64 host" >&2
     exit 2
@@ -59,6 +59,13 @@ if [ "$MODE" = "--native-pie" ]; then
       readelf -h "$probe" | awk '\''$1 == "Type:" { found = 1; if ($2 != "DYN") exit 1 } END { if (!found) exit 1 }'\''
       "$probe" >/dev/null
     '
+
+  if [ "$MODE" = "--native-pie-musl" ]; then
+    dir="conformance-probes/target/native-pie/aarch64-unknown-linux-musl/release"
+    count=$(find "$dir" -maxdepth 1 -type f ! -name '*.*' 2>/dev/null | wc -l | tr -d ' ')
+    echo "native PIE probes built: $dir ($count binaries)"
+    exit 0
+  fi
 
   docker run --rm --platform linux/arm64 \
     -v "$PWD/conformance-probes:/p" -w /p \
@@ -86,7 +93,7 @@ if [ "$MODE" = "--native-pie" ]; then
 fi
 
 if [ "$MODE" != "default" ]; then
-  echo "usage: $0 [--native-pie]" >&2
+  echo "usage: $0 [--native-pie|--native-pie-musl]" >&2
   exit 2
 fi
 

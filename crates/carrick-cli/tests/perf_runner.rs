@@ -15,6 +15,13 @@ use perf_support::backend_pair::{
     validate_same_artifact, write_backend_rows_atomic,
 };
 use perf_support::cases::{BackendPairSupport, CASES, PerfArtifact, PerfCase};
+use perf_support::hvf_mailbox_pair::{
+    BOOTSTRAP_RESAMPLES as HVF_BOOTSTRAP_RESAMPLES, BOOTSTRAP_SEED as HVF_BOOTSTRAP_SEED,
+    FULL_SAMPLE_BLOCKS, FULL_WARMUP_BLOCKS, HvfSyscallTransport, SELECTED_WORKLOADS,
+    TRANSPORT_PAIR_ORDER, TransportEvidenceRow, TransportInvalid, TransportMeasurement,
+    TransportRun, collect_transport_pair, comparison_row as transport_comparison_row,
+    write_transport_rows_atomic,
+};
 use perf_support::invoke::{self, CPU_PIN, IMAGE};
 use perf_support::metric::Metrics;
 use perf_support::provenance::{self, HostFacts, ResultRow};
@@ -82,6 +89,22 @@ fn backend_pair_report_path(root: &Path, requested: &Path) -> PathBuf {
     } else {
         root.join(requested)
     }
+}
+
+fn hvf_mailbox_blocks(variable: &str, default: usize) -> usize {
+    std::env::var(variable)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+fn git_dirty(root: &Path) -> bool {
+    Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(root)
+        .output()
+        .map(|output| !output.stdout.is_empty())
+        .unwrap_or(true)
 }
 
 fn v8_backend_args(backend: CarrickBackend, immutable_image: &str) -> Vec<String> {
@@ -247,6 +270,18 @@ fn backend_pair_contains_required_process_cases() {
             .find(|case| case.workload == workload)
             .unwrap_or_else(|| panic!("missing {workload}"));
         assert_eq!(case.backend_pair_support, BackendPairSupport::DirectElf);
+    }
+}
+
+#[test]
+fn hvf_mailbox_campaign_cases_are_direct_identical_elf_workloads() {
+    for workload in SELECTED_WORKLOADS {
+        let case = CASES
+            .iter()
+            .find(|case| case.workload == *workload)
+            .unwrap_or_else(|| panic!("missing {workload}"));
+        assert_eq!(case.backend_pair_support, BackendPairSupport::DirectElf);
+        assert!(matches!(case.artifact, PerfArtifact::StaticMusl));
     }
 }
 
@@ -444,6 +479,26 @@ fn parse_backend_pair_case_sample(output: &str, case: &PerfCase) -> Result<f64, 
         return Err(format!("wrong mem_mb {mem_mb}; expected {expected_mem_mb}"));
     }
     Ok(value)
+}
+
+fn hvf_transport_metric(case: &PerfCase) -> (&'static str, &'static str) {
+    if case.workload == "trap_floor" {
+        ("trap_batch_trimmed_mean_us", "us")
+    } else {
+        (case.metric_key, case.unit)
+    }
+}
+
+#[test]
+fn hvf_transport_uses_batched_trap_metric_to_avoid_counter_quantization() {
+    let case = CASES
+        .iter()
+        .find(|case| case.workload == "trap_floor")
+        .expect("trap floor");
+    assert_eq!(
+        hvf_transport_metric(case),
+        ("trap_batch_trimmed_mean_us", "us")
+    );
 }
 
 #[test]
@@ -883,10 +938,185 @@ fn run_backend_pair_report() -> Result<(), String> {
         .map_err(|error| format!("write {}: {error}", report.display()))
 }
 
+fn run_hvf_mailbox_report() -> Result<(), String> {
+    let _serial = PERF_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let root = repo_root();
+    let bin = carrick_bin(&root)
+        .ok_or_else(|| "target/release/carrick not built; run `just build`".to_owned())?;
+    ensure_signed(&root, &bin);
+    let requested_report = std::env::var_os("CARRICK_HVF_MAILBOX_REPORT")
+        .map(PathBuf::from)
+        .ok_or_else(|| "CARRICK_HVF_MAILBOX_REPORT is required".to_owned())?;
+    let report = backend_pair_report_path(&root, &requested_report);
+    if let Some(parent) = report.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("create transport report directory: {error}"))?;
+    }
+
+    let warmup_blocks = hvf_mailbox_blocks("CARRICK_HVF_MAILBOX_WARMUP_BLOCKS", FULL_WARMUP_BLOCKS);
+    let sample_blocks = hvf_mailbox_blocks("CARRICK_HVF_MAILBOX_SAMPLE_BLOCKS", FULL_SAMPLE_BLOCKS);
+    let cooldown =
+        Duration::from_secs(hvf_mailbox_blocks("CARRICK_HVF_MAILBOX_COOLDOWN_SECS", 1) as u64);
+    let carrick_before = ArtifactIdentity::from_file("target/release/carrick", &bin)
+        .map_err(|error| format!("identify signed carrick: {error}"))?;
+    let mut rows = vec![TransportEvidenceRow::Run(TransportRun {
+        schema: 1,
+        epoch_secs: provenance::epoch_secs(),
+        schedule: TRANSPORT_PAIR_ORDER,
+        warmup_blocks,
+        sample_blocks,
+        samples_per_transport: sample_blocks.saturating_mul(2),
+        bootstrap_seed: HVF_BOOTSTRAP_SEED,
+        bootstrap_resamples: HVF_BOOTSTRAP_RESAMPLES,
+        git_sha: provenance::git_sha(),
+        git_dirty: git_dirty(&root),
+        carrick: carrick_before.clone(),
+        host: HostFacts::capture(),
+    })];
+
+    let mut invalid = None;
+    for workload in SELECTED_WORKLOADS {
+        let Some(case) = CASES.iter().find(|case| case.workload == *workload) else {
+            invalid = Some(format!("missing selected workload {workload}"));
+            break;
+        };
+        let probe = backend_pair_probe_path(&root, case);
+        if !probe.exists() {
+            invalid = Some(format!(
+                "transport probe {} is missing; run scripts/build-probes.sh --native-pie",
+                probe.display()
+            ));
+            break;
+        }
+        let artifact_before = match ArtifactIdentity::from_file(case.probe, &probe) {
+            Ok(identity) => identity,
+            Err(error) => {
+                invalid = Some(format!("identify probe {}: {error}", probe.display()));
+                break;
+            }
+        };
+        let (metric_key, unit) = hvf_transport_metric(case);
+        let mut run_sample = |transport| {
+            let output =
+                invoke::run_carrick_hvf_transport(&bin, &root, transport, &probe, case.guest_args)?;
+            if case.workload == "trap_floor" {
+                parse_backend_pair_sample(&output, metric_key)
+            } else {
+                parse_backend_pair_case_sample(&output, case)
+            }
+            .map_err(|error| format!("{} {transport:?}: {error}", case.workload))
+        };
+        if warmup_blocks > 0
+            && let Err(error) = collect_transport_pair(warmup_blocks, cooldown, &mut run_sample)
+        {
+            invalid = Some(format!("{} warmup: {error}", case.workload));
+            break;
+        }
+        let samples = match collect_transport_pair(sample_blocks, cooldown, run_sample) {
+            Ok(samples) => samples,
+            Err(error) => {
+                invalid = Some(format!("{} sample: {error}", case.workload));
+                break;
+            }
+        };
+        let artifact_after = match ArtifactIdentity::from_file(case.probe, &probe) {
+            Ok(identity) => identity,
+            Err(error) => {
+                invalid = Some(format!("re-identify probe {}: {error}", probe.display()));
+                break;
+            }
+        };
+        if let Err(error) = validate_same_artifact(&artifact_before, &artifact_after) {
+            invalid = Some(format!("{}: {error}", case.workload));
+            break;
+        }
+        let Some(legacy_summary) = stats::summarize(&samples.legacy) else {
+            invalid = Some(format!("{}: too few legacy samples", case.workload));
+            break;
+        };
+        let Some(mailbox_summary) = stats::summarize(&samples.mailbox) else {
+            invalid = Some(format!("{}: too few mailbox samples", case.workload));
+            break;
+        };
+        rows.push(TransportEvidenceRow::EndToEndMeasurement(
+            TransportMeasurement {
+                workload: case.workload.to_owned(),
+                transport: HvfSyscallTransport::Legacy,
+                artifact: artifact_before.clone(),
+                metric: metric_key.to_owned(),
+                unit: unit.to_owned(),
+                samples: samples.legacy.clone(),
+                summary: legacy_summary,
+            },
+        ));
+        rows.push(TransportEvidenceRow::EndToEndMeasurement(
+            TransportMeasurement {
+                workload: case.workload.to_owned(),
+                transport: HvfSyscallTransport::Mailbox,
+                artifact: artifact_before,
+                metric: metric_key.to_owned(),
+                unit: unit.to_owned(),
+                samples: samples.mailbox.clone(),
+                summary: mailbox_summary,
+            },
+        ));
+        let Some(comparison) = transport_comparison_row(
+            case.workload,
+            metric_key,
+            unit,
+            &samples.legacy,
+            &samples.mailbox,
+        ) else {
+            invalid = Some(format!(
+                "{}: comparison could not be computed",
+                case.workload
+            ));
+            break;
+        };
+        eprintln!(
+            "hvf-mailbox[{}] legacy_p50={:.3}{} mailbox_p50={:.3}{} ratio={:.4} ci=[{:.4},{:.4}] {:?}",
+            case.workload,
+            comparison.legacy.p50,
+            unit,
+            comparison.mailbox.p50,
+            unit,
+            comparison.ratio.estimate,
+            comparison.ratio.lower,
+            comparison.ratio.upper,
+            comparison.verdict,
+        );
+        rows.push(TransportEvidenceRow::Comparison(comparison));
+    }
+
+    let carrick_after = ArtifactIdentity::from_file("target/release/carrick", &bin)
+        .map_err(|error| format!("re-identify signed carrick: {error}"))?;
+    if let Err(error) = validate_same_artifact(&carrick_before, &carrick_after) {
+        invalid = Some(format!("signed carrick changed during campaign: {error}"));
+    }
+    if let Some(reason) = &invalid {
+        rows.push(TransportEvidenceRow::Invalid(TransportInvalid {
+            workload: "campaign".to_owned(),
+            reason: reason.clone(),
+        }));
+    }
+    write_transport_rows_atomic(&report, &rows)
+        .map_err(|error| format!("write {}: {error}", report.display()))?;
+    if let Some(reason) = invalid {
+        return Err(reason);
+    }
+    Ok(())
+}
+
 #[test]
 #[ignore = "requires signed carrick and deliberate serial native16k/HVF sampling"]
 fn backend_pair_report() {
     run_backend_pair_report().expect("backend-pair report");
+}
+
+#[test]
+#[ignore = "requires signed carrick and deliberate serial legacy/mailbox sampling"]
+fn hvf_mailbox_report() {
+    run_hvf_mailbox_report().expect("HVF mailbox report");
 }
 
 #[test]
