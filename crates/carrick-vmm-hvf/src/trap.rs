@@ -5279,6 +5279,7 @@ impl HvfInner {
     /// sys64 MRS read inline (a loop `continue`).
     pub(crate) fn run_to_exit(
         vcpu: &mut applevisor::vcpu::Vcpu,
+        mailbox: &mut MailboxBinding,
     ) -> Result<carrick_aarch64::Aarch64Exit, TrapError> {
         use applevisor::prelude::*;
         use carrick_aarch64::Aarch64Exit;
@@ -5517,25 +5518,51 @@ impl HvfInner {
                     });
                 }
             }
-            // A genuine guest EL0 `svc`. Read the syscall frame; the engine owns
-            // the pending-syscall/SA_RESTART state (it sets last_syscall_nr/orig_x0
-            // from the frame). resume_pc = ELR_EL1 (= svc+4), which the EL1
-            // vector's `eret` consumes.
-            let resume_pc = vcpu.get_sys_reg(SysReg::ELR_EL1).unwrap_or(0);
-            let frame = carrick_hal::read_aarch64_syscall_frame(|r| hvf_get_reg(vcpu, r))
-                .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+            // A genuine guest EL0 `svc`. HVC2 from the mailbox vector consumes
+            // the release-published frame without any register/sysreg API reads.
+            // The diagnostic legacy mode still validates that publication, then
+            // deliberately reads the live registers for an apples-to-apples
+            // transport comparison. A direct SVC exit (no EL1 HVC vehicle) keeps
+            // the historical register decode as a defensive compatibility path.
+            let legacy_decode = || {
+                let resume_pc = vcpu.get_sys_reg(SysReg::ELR_EL1).map_err(|error| {
+                    crate::syscall_mailbox::MailboxConsumeError::Legacy(error.to_string())
+                })?;
+                let frame = carrick_hal::read_aarch64_syscall_frame(|r| hvf_get_reg(vcpu, r))
+                    .map_err(|error| {
+                        crate::syscall_mailbox::MailboxConsumeError::Legacy(error.to_string())
+                    })?;
+                Ok(crate::syscall_mailbox::MailboxRequest {
+                    native_nr: frame.x8,
+                    frame,
+                    resume_pc,
+                    spsr: vcpu.get_sys_reg(SysReg::SPSR_EL1).unwrap_or(0),
+                    fp: vcpu.get_reg(Reg::X29).unwrap_or(0),
+                    lr: vcpu.get_reg(Reg::LR).unwrap_or(0),
+                    sp: vcpu.get_sys_reg(SysReg::SP_EL0).unwrap_or(0),
+                    esr: vcpu.get_sys_reg(SysReg::ESR_EL1).unwrap_or(0),
+                })
+            };
+            let request = if is_aarch64_hvc_exception(exception.syndrome) {
+                mailbox.decode_request(legacy_decode)
+            } else {
+                legacy_decode()
+            }
+            .map_err(|error| {
+                let pc = vcpu.get_reg(Reg::PC).unwrap_or(0);
+                TrapError::Hypervisor(format!("{error}; vcpu_pc={pc:#x}"))
+            })?;
+            let frame = request.frame;
+            let resume_pc = request.resume_pc;
             // vcpu_trap probe parity: guest PC at the trap (= ELR_EL1) + the live
             // FP/SP/LR so a DTrace consumer can walk the guest call chain. The
             // stack-region bases require the per-thread mapping list (on
             // HvfVmState, not reachable here), so report zero bases.
-            let lr = vcpu.get_reg(Reg::LR).unwrap_or(0);
-            let fp = vcpu.get_reg(Reg::X29).unwrap_or(0);
-            let sp = vcpu.get_sys_reg(SysReg::SP_EL0).unwrap_or(0);
             crate::probes::vcpu_trap(&crate::compat::GuestRegs {
                 pc: resume_pc,
-                sp,
-                fp,
-                lr,
+                sp: request.sp,
+                fp: request.fp,
+                lr: request.lr,
                 x8: frame.x8,
                 x0: frame.x0,
                 stack_guest_base: 0,
