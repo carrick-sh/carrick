@@ -3598,27 +3598,57 @@ fn native_conformance_run_elf_executes_libc_probe() {
 
 #[test]
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn native_conformance_rejects_fixed_et_exec_below_hard_pagezero() {
+fn native_low_et_exec_runs_through_biased_dsr() {
     let _serial = CONFORMANCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     let Some(bin) = carrick_bin() else {
         eprintln!(
-            "SKIP native_conformance_rejects_fixed_et_exec_below_hard_pagezero: target/release/carrick not built"
+            "SKIP native_low_et_exec_runs_through_biased_dsr: target/release/carrick not built"
         );
         return;
     };
     ensure_signed(&bin);
     let probe = ensure_native_et_exec_probe("devnullseek");
 
-    for profile in ["native16k", "linux4k"] {
-        let out = run_native_run_elf(&bin, &probe, profile);
-        assert!(
-            out.contains("status=exit status: 125")
-                && out.contains("hard 4 GiB __PAGEZERO")
-                && out.contains("PIE/ET_DYN"),
-            "native fixed ET_EXEC rejection was not typed for profile {profile}:\n{out}"
+    let out = run_native_run_elf(&bin, &probe, "native16k");
+    assert!(
+        out.contains("status=exit status: 0")
+            && out.contains("devnull_lseek_cur0=true")
+            && out.contains("devnull_lseek_set=true"),
+        "native16k did not execute low ET_EXEC through biased DSR:\n{out}"
+    );
+}
+
+#[test]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn native_low_et_exec_fork_preserves_guest_addresses() {
+    let _serial = CONFORMANCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let Some(bin) = carrick_bin() else {
+        eprintln!(
+            "SKIP native_low_et_exec_fork_preserves_guest_addresses: target/release/carrick not built"
         );
-    }
+        return;
+    };
+    ensure_signed(&bin);
+    let probe = ensure_native_et_exec_probe("nativeetexecfork");
+
+    let out = run_native_run_elf(&bin, &probe, "native16k");
+    let witness_lines = out
+        .lines()
+        .filter(|line| line.starts_with("parent_function_pc_below_4g="))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        witness_lines,
+        [
+            "parent_function_pc_below_4g=true parent_static_data_below_4g=true child_function_pc_same=true child_static_data_same=true child_static_value_retained=true child_exit_zero=true"
+        ],
+        "native16k low ET_EXEC fork witness was not one-line and guest-valued:\n{out}"
+    );
+    assert!(
+        out.contains("status=exit status: 0"),
+        "native16k low ET_EXEC fork witness failed:\n{out}"
+    );
 }
 
 #[test]

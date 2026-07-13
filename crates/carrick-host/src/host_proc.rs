@@ -55,7 +55,7 @@ pub struct ResourceUsage {
 #[derive(Debug)]
 pub enum DirectVmReservationOutcome {
     Reserved(DirectVmReservation),
-    DelegatedDyldSharedPmapEmpty,
+    DelegatedDyldPmapEmpty,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,6 +181,10 @@ mod imp {
     const VM_REGION_BASIC_INFO_COUNT_64: u32 = 9;
     const VM_REGION_EXTENDED_INFO: i32 = 13;
     const VM_MEMORY_SHARED_PMAP: u32 = 32;
+    // mach/vm_statistics.h: a nested shared pmap receives this tag after it
+    // becomes unnested, including in a fork child that inherited a Direct
+    // guest mapping inside the canonical dyld range.
+    const VM_MEMORY_UNSHARED_PMAP: u32 = 35;
     const SM_EMPTY: u8 = 3;
 
     #[repr(C)]
@@ -693,7 +697,9 @@ mod imp {
     /// Acquire one future Direct interval without overwriting any host mapping.
     /// A redirected nonfixed mmap is accepted only when both Mach region
     /// flavors identify the measured dyld delegated shared-pmap empty covering
-    /// entry. Every other redirect is a collision.
+    /// entry. XNU retags that same entry from `VM_MEMORY_SHARED_PMAP` to
+    /// `VM_MEMORY_UNSHARED_PMAP` when it becomes unnested after `fork`; every
+    /// other redirect is a collision.
     #[allow(deprecated)] // libc::mach_task_self_ is the stable self-task port here.
     pub fn reserve_self_direct_vm_range(
         start: u64,
@@ -817,10 +823,13 @@ mod imp {
             && max_protection == libc::VM_PROT_READ
             && !shared
             && reserved
-            && extended.user_tag == VM_MEMORY_SHARED_PMAP
+            && matches!(
+                extended.user_tag,
+                VM_MEMORY_SHARED_PMAP | VM_MEMORY_UNSHARED_PMAP
+            )
             && extended.share_mode == SM_EMPTY
         {
-            return Ok(DirectVmReservationOutcome::DelegatedDyldSharedPmapEmpty);
+            return Ok(DirectVmReservationOutcome::DelegatedDyldPmapEmpty);
         }
 
         Err(DirectVmReservationError::Occupied {
@@ -875,7 +884,7 @@ mod imp {
                     .expect("reserve exact allocatable interval")
                 {
                     DirectVmReservationOutcome::Reserved(guard) => guard,
-                    DirectVmReservationOutcome::DelegatedDyldSharedPmapEmpty => {
+                    DirectVmReservationOutcome::DelegatedDyldPmapEmpty => {
                         panic!("ordinary scratch interval was classified as delegated")
                     }
                 };
@@ -906,8 +915,44 @@ mod imp {
                 assert!(matches!(
                     reserve_self_direct_vm_range(0x4_0000_0000, PAGE as u64)
                         .expect("classify canonical dyld gap"),
-                    DirectVmReservationOutcome::DelegatedDyldSharedPmapEmpty
+                    DirectVmReservationOutcome::DelegatedDyldPmapEmpty
                 ));
+            });
+        }
+
+        #[test]
+        fn fork_child_canonical_unnested_dyld_gap_is_accepted() {
+            fork_test(|| {
+                let source = 0x4_0000_0000usize;
+                let mapped = unsafe {
+                    libc::mmap(
+                        source as *mut libc::c_void,
+                        PAGE,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_ANON | libc::MAP_PRIVATE | libc::MAP_FIXED,
+                        -1,
+                        0,
+                    )
+                };
+                assert_eq!(mapped as usize, source);
+
+                let child = unsafe { libc::fork() };
+                assert!(
+                    child >= 0,
+                    "fork direct-mapped child: {}",
+                    std::io::Error::last_os_error()
+                );
+                if child == 0 {
+                    let accepted = matches!(
+                        reserve_self_direct_vm_range(0x4_0002_0000, PAGE as u64),
+                        Ok(DirectVmReservationOutcome::DelegatedDyldPmapEmpty)
+                    );
+                    unsafe { libc::_exit(i32::from(!accepted)) };
+                }
+                let mut status = 0;
+                assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+                assert!(libc::WIFEXITED(status), "child status was 0x{status:x}");
+                assert_eq!(libc::WEXITSTATUS(status), 0);
             });
         }
 

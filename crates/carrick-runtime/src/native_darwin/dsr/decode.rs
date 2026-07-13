@@ -896,7 +896,8 @@ mod tests {
 
     #[test]
     fn audited_bad64_memory_operand_shapes_are_stable() {
-        let cases: &[(u32, fn(&Operand) -> bool)] = &[
+        type OperandShape = fn(&Operand) -> bool;
+        let cases: &[(u32, OperandShape)] = &[
             // bad64 0.12 normalizes this zero-offset exclusive form to
             // `MemOffset`, rather than `MemReg`.
             (0xc85f_7c20, |operand| {
