@@ -4162,6 +4162,54 @@ fn cached_probe_oracle_output_is_normalized() {
 }
 
 #[test]
+fn cached_mailbox_register_oracle_matches_its_source() {
+    let cached = cached_probe_oracle("arm64", "musl", "mailboxregs")
+        .expect("shipped mailboxregs oracle matches its source");
+    assert_eq!(
+        cached,
+        "mailboxregs return_positive=true mismatch_mask=0x00000000 sp_preserved=true"
+    );
+}
+
+#[test]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn hvf_syscall_transports_preserve_guest_registers() {
+    let _serial = CONFORMANCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(bin) = carrick_bin() else {
+        eprintln!("SKIP hvf_syscall_transports_preserve_guest_registers: carrick not built");
+        return;
+    };
+    ensure_signed(&bin);
+    let probe = ensure_native_static_pie_probe("mailboxregs");
+    let expected = "mailboxregs return_positive=true mismatch_mask=0x00000000 sp_preserved=true";
+
+    for transport in ["mailbox", "legacy"] {
+        let mut command = Command::new(&bin);
+        command
+            .args(["run-elf", "--raw", "--exec-backend", "vmm"])
+            .arg(&probe)
+            .env("CARRICK_HVF_SYSCALL_TRANSPORT", transport)
+            .env("CARRICK_RUN_ID", case_run_id());
+        let output = run_carrick_probe_process(command, None, CASE_DEADLINE);
+        assert_eq!(normalize(&output), expected, "transport={transport}");
+    }
+
+    let mut invalid = Command::new(&bin);
+    invalid
+        .args(["run-elf", "--raw", "--exec-backend", "vmm"])
+        .arg(&probe)
+        .env("CARRICK_HVF_SYSCALL_TRANSPORT", "auto")
+        .env("CARRICK_RUN_ID", case_run_id());
+    let output = run_carrick_probe_process(invalid, None, CASE_DEADLINE);
+    assert!(
+        output.contains("invalid CARRICK_HVF_SYSCALL_TRANSPORT value \"auto\"")
+            && output.contains("expected `legacy` or `mailbox`"),
+        "invalid transport must fail before guest entry: {output}"
+    );
+    assert!(!output.contains("mailboxregs return_positive"));
+}
+
+#[test]
 fn probe_gates_decision_allowlist_logic() {
     // A set that already gates (native ISA, intent-gating) gates every probe,
     // regardless of allowlist / host.
