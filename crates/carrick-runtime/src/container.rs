@@ -341,8 +341,21 @@ impl ContainerState {
     pub fn load(id: &str) -> std::io::Result<Self> {
         let path = state_path(id)?;
         let bytes = std::fs::read(&path)?; // nosemgrep
-        serde_json::from_slice(&bytes)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        serde_json::from_slice(&bytes).map_err(|error| {
+            let detail = error.to_string();
+            let action = if detail.contains("execution backend") {
+                "; recreate the container with --exec-backend vmm if it requires virtualized execution"
+            } else {
+                ""
+            };
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "failed to load container state '{}' for '{id}': {detail}{action}",
+                    path.display()
+                ),
+            )
+        })
     }
 
     /// Remove this container's registry directory.
@@ -574,6 +587,10 @@ mod tests {
         let s: ContainerState = serde_json::from_str(legacy).expect("legacy state loads");
         assert!(s.config.scratch_path.is_none());
         assert!(s.config.region_path.is_none());
+        assert_eq!(
+            s.config.exec_backend,
+            carrick_spec::ExecBackendRequest::Native
+        );
         // Load-bearing: a legacy entry with NO config object must default
         // max_traps to DEFAULT_MAX_TRAPS, not 0 (0 trips the trap limit at once).
         assert_eq!(s.config.max_traps, crate::runtime::DEFAULT_MAX_TRAPS);
@@ -585,6 +602,10 @@ mod tests {
             "exit_code":null,"auto_remove":false,"config":{"env":["A=1"]}}"#;
         let s_nt: ContainerState = serde_json::from_str(no_traps).expect("loads");
         assert_eq!(s_nt.config.max_traps, crate::runtime::DEFAULT_MAX_TRAPS);
+        assert_eq!(
+            s_nt.config.exec_backend,
+            carrick_spec::ExecBackendRequest::Native
+        );
 
         // A fully-populated config round-trips (all P5 relaunch fields).
         let mut s2 = s.clone();
@@ -602,6 +623,7 @@ mod tests {
         s2.config.max_traps = 4242;
         s2.config.stop_signal = Some(3);
         s2.config.stop_timeout = Some(7);
+        s2.config.exec_backend = carrick_spec::ExecBackendRequest::Vmm;
         let json = serde_json::to_string(&s2).expect("serialize");
         let round: ContainerState = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(round.config.scratch_path.as_deref(), Some("/p/scratch"));
@@ -615,5 +637,49 @@ mod tests {
         assert_eq!(round.config.max_traps, 4242);
         assert_eq!(round.config.stop_signal, Some(3));
         assert_eq!(round.config.stop_timeout, Some(7));
+        assert_eq!(
+            round.config.exec_backend,
+            carrick_spec::ExecBackendRequest::Vmm
+        );
+
+        for (legacy_backend, guidance) in [
+            ("auto", "omit --exec-backend"),
+            ("hvf", "--exec-backend vmm"),
+        ] {
+            let incompatible = no_traps.replace(
+                r#""config":{"env":["A=1"]}"#,
+                &format!(r#""config":{{"env":["A=1"],"exec_backend":"{legacy_backend}"}}"#),
+            );
+            let error = serde_json::from_str::<ContainerState>(&incompatible)
+                .expect_err("explicit legacy backend must fail")
+                .to_string();
+            assert!(error.contains(guidance), "unexpected error: {error}");
+        }
+    }
+
+    #[test]
+    fn load_reports_path_and_recreate_action_for_incompatible_backend() {
+        let id = format!("legacy-backend-{}", std::process::id());
+        let dir = container_dir_checked(&id).expect("safe test id");
+        std::fs::create_dir_all(&dir).expect("create test registry directory"); // nosemgrep
+        let path = state_path(&id).expect("state path");
+        let incompatible = format!(
+            r#"{{"id":"{id}","name":null,"image":"img","command":[],
+                "status":"created","supervisor_pid":0,"init_pid":0,"created_secs":0,
+                "exit_code":null,"auto_remove":false,
+                "config":{{"exec_backend":"hvf"}}}}"#
+        );
+        std::fs::write(&path, incompatible).expect("write incompatible state"); // nosemgrep
+
+        let error = ContainerState::load(&id).expect_err("legacy backend state must fail");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        let message = error.to_string();
+        assert!(message.contains(&path.display().to_string()), "{message}");
+        assert!(
+            message.contains("recreate the container with --exec-backend vmm"),
+            "{message}"
+        );
+        let _ = ContainerState::remove(&id);
     }
 }
