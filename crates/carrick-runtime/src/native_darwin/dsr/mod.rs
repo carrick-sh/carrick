@@ -1235,7 +1235,11 @@ impl ThreadTranslator {
                         ThreadFaultAddress::Guest(guest_pc),
                     )
                 } else if recovery.is_some_and(|action| {
-                    matches!(action, emit::RecoveryAction::RecoverBiasedMemory(_))
+                    matches!(
+                        action,
+                        emit::RecoveryAction::RecoverBiasedMemory(_)
+                            | emit::RecoveryAction::RestoreScratchInvalidBiasedLiteral { .. }
+                    )
                 }) && biased_guest_fault_address
                     >= super::address::BIASED_GUEST_APERTURE_END
                 {
@@ -1519,6 +1523,7 @@ fn recover_rewrite_state(
             return Ok(());
         }
         emit::RecoveryAction::RestoreScratch { register }
+        | emit::RecoveryAction::RestoreScratchInvalidBiasedLiteral { register }
         | emit::RecoveryAction::RestoreScratchCompleted { register }
         | emit::RecoveryAction::CommitVirtualizedAndRestoreScratch { register, .. } => {
             (register, None)

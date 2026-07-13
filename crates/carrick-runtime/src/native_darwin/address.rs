@@ -13,10 +13,13 @@ pub(super) const BIAS_CANDIDATES: [u64; 4] = [
 ];
 const DARWIN_USER_VA_END: u64 = 0x8000_0000_0000;
 pub(super) const BIASED_GUEST_APERTURE_END: u64 = carrick_mem::memory::LINUX_STACK_TOP;
-// Literal loads can address up to 1 MiB beyond their PC. Keep one additional
-// collision-probed guard band so a near-ceiling literal or a multi-byte access
-// crossing the architectural ceiling still faults in Carrick-owned memory.
-const BIASED_GUEST_OVERFLOW_GUARD_SIZE: u64 = 1024 * 1024;
+// AArch64 literal loads have a signed imm19 scaled by four, so their complete
+// displacement window is 1 MiB. Reserve that window plus one host page: the
+// page-sized headroom contains the tail of the maximum-width (16-byte) access
+// and keeps the bound aligned with Mach VM ownership granularity.
+const BIASED_GUEST_LITERAL_DISPLACEMENT_WINDOW: u64 = 1024 * 1024;
+pub(super) const BIASED_GUEST_LITERAL_TARGET_END: u64 =
+    BIASED_GUEST_APERTURE_END + BIASED_GUEST_LITERAL_DISPLACEMENT_WINDOW;
 pub(super) const INVALID_BIASED_HOST_ADDRESS_BIT: u64 = 1 << 47;
 
 pub(super) struct OwnedHostMapping {
@@ -188,12 +191,18 @@ impl CandidateLayout {
             ranges.push(host);
         }
         if biased {
-            let guard_end = BIASED_GUEST_APERTURE_END
-                .checked_add(BIASED_GUEST_OVERFLOW_GUARD_SIZE)
+            let guard_size = BIASED_GUEST_LITERAL_DISPLACEMENT_WINDOW
+                .checked_add(host_page_size)
                 .ok_or(NativeAddressError::GuestRangeOverflow {
                     start: BIASED_GUEST_APERTURE_END,
-                    length: BIASED_GUEST_OVERFLOW_GUARD_SIZE,
+                    length: BIASED_GUEST_LITERAL_DISPLACEMENT_WINDOW,
                 })?;
+            let guard_end = BIASED_GUEST_APERTURE_END.checked_add(guard_size).ok_or(
+                NativeAddressError::GuestRangeOverflow {
+                    start: BIASED_GUEST_APERTURE_END,
+                    length: guard_size,
+                },
+            )?;
             let host = mode.to_host_range(GuestVa(0)..GuestVa(guard_end))?;
             if host.end.raw() as u64 > DARWIN_USER_VA_END {
                 return Err(NativeAddressError::OutsideDarwinUserRange {
@@ -616,8 +625,8 @@ pub(super) enum NativeAddressError {
 #[cfg(test)]
 mod tests {
     use super::{
-        CandidateLayout, NativeAddressError, NativeAddressMode, NativeHostBias, NativeLayout,
-        OwnedHostMapping,
+        BIASED_GUEST_LITERAL_DISPLACEMENT_WINDOW, CandidateLayout, NativeAddressError,
+        NativeAddressMode, NativeHostBias, NativeLayout, OwnedHostMapping,
     };
     use crate::dispatch::MemoryLayout;
     use crate::memory::AddressSpace;
@@ -900,6 +909,94 @@ mod tests {
             );
             drop(selected);
             drop(sentinel);
+        });
+    }
+
+    #[test]
+    fn biased_literal_max_width_access_is_collision_probed_past_the_old_guard() {
+        fork_test(|| {
+            const MAX_POSITIVE_LITERAL_DISPLACEMENT: u64 =
+                BIASED_GUEST_LITERAL_DISPLACEMENT_WINDOW - 4;
+            const MAX_LITERAL_ACCESS_WIDTH: u64 = 16;
+
+            let page_size = TEST_PAGE_SIZE as u64;
+            let low_guest_start = 0x40_0000;
+            let ceiling_guest_start = carrick_mem::memory::LINUX_STACK_TOP - page_size;
+            let old_guard_end =
+                carrick_mem::memory::LINUX_STACK_TOP + BIASED_GUEST_LITERAL_DISPLACEMENT_WINDOW;
+            let first_sentinel_host = HostVa((0x80_0000_0000 + old_guard_end) as usize);
+            let sentinel = OwnedHostMapping::map_exact(
+                first_sentinel_host,
+                TEST_PAGE_SIZE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+            )
+            .expect("map sentinel immediately beyond the old literal guard");
+            unsafe {
+                std::ptr::write_bytes(first_sentinel_host.raw() as *mut u8, 0x5a, TEST_PAGE_SIZE);
+            }
+            let image = AddressSpace::from_segments(
+                low_guest_start,
+                [
+                    (
+                        low_guest_start,
+                        carrick_mem::elf::SegmentPerms {
+                            read: true,
+                            write: false,
+                            execute: true,
+                        },
+                        vec![0; TEST_PAGE_SIZE],
+                        page_size,
+                    ),
+                    (
+                        ceiling_guest_start,
+                        carrick_mem::elf::SegmentPerms {
+                            read: true,
+                            write: false,
+                            execute: true,
+                        },
+                        vec![0; TEST_PAGE_SIZE],
+                        page_size,
+                    ),
+                ],
+            )
+            .expect("build near-ceiling literal image");
+            let layout = MemoryLayout {
+                heap_base: 0x8_0000_0000,
+                heap_size: page_size,
+                mmap_base: 0xa0_0000_0000,
+                mmap_size: page_size,
+            };
+
+            assert!(matches!(
+                NativeLayout::for_image(&image, layout, page_size),
+                Err(NativeAddressError::NoCollisionFreeBias { .. })
+            ));
+            assert_eq!(unsafe { *(first_sentinel_host.raw() as *const u8) }, 0x5a);
+            drop(sentinel);
+
+            let selected = NativeLayout::for_image(&image, layout, page_size)
+                .expect("select collision-free literal guard after removing sentinel");
+
+            let instruction = carrick_mem::memory::LINUX_STACK_TOP - 4;
+            let literal_start = instruction + MAX_POSITIVE_LITERAL_DISPLACEMENT;
+            let literal_end = literal_start + MAX_LITERAL_ACCESS_WIDTH;
+            let host_start = selected
+                .address_mode()
+                .to_host(GuestVa(literal_start))
+                .expect("translate maximum positive literal target");
+            let host_end = selected
+                .address_mode()
+                .to_host(GuestVa(literal_end))
+                .expect("translate maximum-width literal end");
+            assert!(
+                selected
+                    .owned_ranges()
+                    .iter()
+                    .any(|range| { range.start <= host_start && host_end <= range.end })
+            );
+
+            drop(selected);
         });
     }
 
