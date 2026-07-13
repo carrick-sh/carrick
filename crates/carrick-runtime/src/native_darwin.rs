@@ -39,6 +39,7 @@ use carrick_hal::{
 use goblin::elf::Elf;
 use goblin::elf::header::ET_DYN;
 use goblin::elf::reloc::{R_AARCH64_NONE, R_AARCH64_RELATIVE};
+use sha2::Digest;
 
 #[cfg(test)]
 const SVC_0: u32 = 0xd400_0001;
@@ -636,7 +637,15 @@ fn load_native_execve_image(
     argv: Vec<Vec<u8>>,
     env: Vec<Vec<u8>>,
     plan: &ExecutionPlan,
-) -> Result<(AddressSpace, Vec<NativeRelativeRelocation>, String), crate::linux_abi::LinuxErrno> {
+) -> Result<
+    (
+        AddressSpace,
+        Vec<NativeRelativeRelocation>,
+        String,
+        [u8; 32],
+    ),
+    crate::linux_abi::LinuxErrno,
+> {
     let geometry = plan
         .page_geometry
         .native_geometry()
@@ -661,6 +670,7 @@ fn load_native_execve_image(
         .read_exec_file(&resolved)
         .or_else(|| host_read(&resolved))
         .ok_or(crate::linux_abi::LINUX_ENOENT)?;
+    let executable_digest: [u8; 32] = sha2::Sha256::digest(&file).into();
     let relative_relocations = native_relative_relocations(&file, NATIVE_DARWIN_PIE_BASE)
         .map_err(|_| crate::linux_abi::LINUX_ENOEXEC)?;
     let image = AddressSpace::load_elf_bytes_with_reader_at_pie_base_without_runtime_regions(
@@ -687,7 +697,52 @@ fn load_native_execve_image(
             geometry.linux_page_size,
         )
         .map_err(|_| crate::linux_abi::LINUX_ENOENT)?;
-    Ok((image, relative_relocations, resolved))
+    Ok((image, relative_relocations, resolved, executable_digest))
+}
+
+pub(crate) fn resume_guest_from_capsule(
+    guest: crate::native_exec_capsule::NativeGuestExecV1,
+    argv: Vec<Vec<u8>>,
+    env: Vec<Vec<u8>>,
+) -> anyhow::Result<i32> {
+    let max_traps = usize::try_from(guest.max_traps)?;
+    let plan = crate::page_profile::resolve_execution_plan_for_request(
+        carrick_spec::Platform::host_native(),
+        carrick_spec::ExecBackendRequest::Native,
+        guest.native_page_profile,
+    )?;
+    let mut dispatcher = SyscallDispatcher::new();
+    dispatcher.set_page_geometry(plan.page_geometry);
+    dispatcher.set_memory_layout(native_memory_layout());
+    let backend = crate::fs_backend::HostFsBackend::attach_for_reexec(&guest.rootfs)?;
+    let _ = dispatcher.set_fs_backend(Box::new(backend));
+    if !guest.exec_host_fs_fallback {
+        dispatcher.sandbox_exec_to_container();
+    }
+    dispatcher.set_cwd(&guest.cwd);
+    dispatcher.set_stream_stdio(guest.stream_stdio);
+    let (image, relative_relocations, resolved, executable_digest) = load_native_execve_image(
+        &dispatcher,
+        &guest.resolved_path,
+        argv.clone(),
+        env.clone(),
+        &plan,
+    )
+    .map_err(|errno| anyhow::anyhow!("reload guest executable failed: {errno:?}"))?;
+    if executable_digest != guest.executable_digest {
+        anyhow::bail!("guest executable changed across native host self-reexec");
+    }
+    dispatcher.reset_memory_state_on_execve();
+    dispatcher.reset_signal_handlers_on_execve();
+    dispatcher.set_executable_identity(
+        resolved,
+        argv.iter()
+            .map(|value| String::from_utf8_lossy(value).into_owned())
+            .collect(),
+        env,
+    );
+    run_image_in_current_process(image, dispatcher, max_traps, &relative_relocations, &plan)
+        .map_err(anyhow::Error::from)
 }
 
 fn native_memory_layout() -> MemoryLayout {
@@ -1542,13 +1597,58 @@ fn run_native_dsr_thread_loop(
                 }
             }
             DispatchOutcome::Execve { path, argv, env } => {
+                let capsule_argv = argv.clone();
+                let capsule_env = env.clone();
                 let proc_argv: Vec<String> = argv
                     .iter()
                     .map(|value| String::from_utf8_lossy(value).into_owned())
                     .collect();
                 let proc_env = env.clone();
                 match load_native_execve_image(&dispatcher, &path, argv, env, &plan) {
-                    Ok((image, relative_relocations, resolved)) => {
+                    Ok((image, relative_relocations, resolved, executable_digest)) => {
+                        if NATIVE_FORKED_GUEST_CHILD.load(std::sync::atomic::Ordering::Acquire) {
+                            if !dispatcher.native_reexec_minimal_fd_state_eligible() {
+                                snapshot = complete_dsr_syscall(
+                                    &dispatcher,
+                                    &memory,
+                                    snapshot,
+                                    thread_runtime.tid(),
+                                    request.number.raw(),
+                                    crate::linux_abi::LINUX_EOPNOTSUPP.guest_retval(),
+                                    resume,
+                                )?;
+                                continue;
+                            }
+                            if let Err(error) = crate::native_exec_capsule::begin_guest_exec(
+                                &dispatcher,
+                                resolved.clone(),
+                                capsule_argv,
+                                capsule_env,
+                                executable_digest,
+                                max_traps,
+                                &plan,
+                            ) {
+                                tracing::warn!(
+                                    %error,
+                                    path = resolved,
+                                    "native fork-child host self-reexec preparation failed"
+                                );
+                                snapshot = complete_dsr_syscall(
+                                    &dispatcher,
+                                    &memory,
+                                    snapshot,
+                                    thread_runtime.tid(),
+                                    request.number.raw(),
+                                    crate::linux_abi::LINUX_EIO.guest_retval(),
+                                    resume,
+                                )?;
+                                continue;
+                            }
+                            return Err(RuntimeError::Unsupported(
+                                "native host self-reexec unexpectedly returned successfully"
+                                    .to_owned(),
+                            ));
+                        }
                         let entry = image.entry();
                         let Some(initial_sp) = image.initial_stack_pointer() else {
                             snapshot = complete_dsr_syscall(

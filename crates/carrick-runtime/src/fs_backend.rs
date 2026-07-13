@@ -1678,11 +1678,16 @@ impl HostFsBackend {
         let root_path = host_root_path(&self.dir)
             .ok_or_else(|| std::io::Error::other("F_GETPATH failed for host filesystem root"))?;
         let (device, inode) = host_dir_identity(self.dir.as_raw_fd())?;
+        let current_pid = unsafe { libc::getpid() as u32 };
         Ok(HostFsReexecAuthority {
             root_path: root_path.as_os_str().as_bytes().to_vec(),
             device,
             inode,
-            cleanup_on_drop: self._scratch.is_some() || self._attached_cleanup_path.is_some(),
+            cleanup_on_drop: native_reexec_transfers_cleanup(
+                self.owner_pid,
+                current_pid,
+                self._scratch.is_some() || self._attached_cleanup_path.is_some(),
+            ),
         })
     }
 
@@ -2306,6 +2311,11 @@ impl HostFsBackend {
         }
         false
     }
+}
+
+#[cfg(target_os = "macos")]
+fn native_reexec_transfers_cleanup(owner_pid: u32, current_pid: u32, owns_root: bool) -> bool {
+    owns_root && owner_pid == current_pid
 }
 
 /// Extended attribute that carries the guest-intended file mode. carrick runs
@@ -5117,6 +5127,14 @@ mod tests {
         assert!(path.exists());
         drop(resumed);
         assert!(!path.exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn fork_descendant_does_not_claim_reexec_cleanup_lock() {
+        assert!(native_reexec_transfers_cleanup(41, 41, true));
+        assert!(!native_reexec_transfers_cleanup(41, 42, true));
+        assert!(!native_reexec_transfers_cleanup(41, 41, false));
     }
 
     #[test]

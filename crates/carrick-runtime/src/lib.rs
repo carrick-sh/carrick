@@ -148,13 +148,20 @@ pub fn native_self_reexec_pid_probe() -> anyhow::Result<()> {
     native_exec_capsule::begin_pid_probe()
 }
 
+/// Result of consuming the private native host-self-exec capsule.
+#[cfg(target_os = "macos")]
+pub enum NativeSelfReexecOutcome {
+    PidProbe { before: u32, after: u32 },
+    GuestExit(i32),
+}
+
 /// Consume a private native self-reexec PID probe capsule.
 #[cfg(target_os = "macos")]
-pub fn resume_native_self_reexec_pid_probe(
+pub fn resume_native_self_reexec(
     capsule_fd: i32,
     nonce: &str,
-) -> anyhow::Result<(u32, u32)> {
-    native_exec_capsule::resume_pid_probe(capsule_fd, nonce)
+) -> anyhow::Result<NativeSelfReexecOutcome> {
+    native_exec_capsule::resume(capsule_fd, nonce)
 }
 // `linux_abi` was lifted into the leaf crate `carrick-abi` (build-graph split,
 // docs/archive/build-decomposition-design.md §3.A-A1). Re-exported under the original
