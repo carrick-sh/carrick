@@ -432,6 +432,11 @@ mod real {
         // `vcpu__trap`.
         fn syscall__entry(_: u64, _: &str, _: u64) {}
         fn syscall__return(_: u64, _: &str, _: i64, _: i32) {}
+        /// HVF syscall-transport attribution. `transport`: 0=legacy, 1=mailbox;
+        /// `phase`: 0=request decode, 1=ordinary return publication. The final
+        /// three counters are actual HVF register/sysreg API operations in that
+        /// phase, not inferred wall-time attribution.
+        fn hvf__syscall__transport(_: u32, _: u32, _: u64, _: u32, _: u32, _: u32) {}
         // The Rust provider accepts six arguments, but macOS has returned a
         // constant zero for arg5 at real DSR probe sites. Keep this scalar ABI
         // at five arguments or fewer and use a low-frequency companion probe
@@ -771,6 +776,25 @@ mod real {
         /// configured subrange. Kept separate because macOS DTrace drops a sixth
         /// USDT argument at some probe sites.
         fn guest__mem__subcount(_: u32, _: u64, _: u64, _: u64) {}
+    }
+
+    #[inline(always)]
+    pub fn hvf_syscall_transport(
+        transport: u32,
+        phase: u32,
+        sequence: u64,
+        register_reads: u32,
+        sysreg_reads: u32,
+        register_writes: u32,
+    ) {
+        carrick_usdt::hvf__syscall__transport!(|| (
+            transport,
+            phase,
+            sequence,
+            register_reads,
+            sysreg_reads,
+            register_writes,
+        ));
     }
 
     #[inline(always)]
@@ -1782,6 +1806,7 @@ mod stub {
     }
 
     stub!(dsr_prepare_begin(tid: i32, guest_pc: u64));
+    stub!(hvf_syscall_transport(transport: u32, phase: u32, sequence: u64, register_reads: u32, sysreg_reads: u32, register_writes: u32));
     stub!(dsr_prepare_end(tid: i32, guest_pc: u64, cache_pc: u64, generation: u64, outcome: super::DsrPrepareOutcome));
     stub!(dsr_run_begin(tid: i32, guest_pc: u64, cache_pc: u64, generation: u64));
     stub!(dsr_run_end(tid: i32, kind: super::DsrExitKind, guest_pc: u64, target_pc: u64, status: i32));
