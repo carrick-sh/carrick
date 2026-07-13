@@ -554,7 +554,8 @@ fn native_low_et_exec_runs_through_biased_dsr() {
     let probe = ensure_native_et_exec_probe("devnullseek");
     let out = run_native_run_elf(&bin, &probe, "native16k");
     assert!(out.contains("status=exit status: 0"), "{out}");
-    assert!(out.contains("seekable=false"), "{out}");
+    assert!(out.contains("devnull_lseek_cur0=true"), "{out}");
+    assert!(out.contains("devnull_lseek_set=true"), "{out}");
 }
 ```
 
@@ -617,4 +618,3 @@ Co-Authored-By: Codex <codex@openai.com>"
 This plan is complete when a signed low-address AArch64 `ET_EXEC` runs through native16k DSR; guest pointers, faults, and diagnostics remain Linux-valued; host collisions are non-destructive; direct PIE emission is byte-pinned; guest BRK semantics pass; and `just ci` passes.
 
 Next, write and approve a separate post-fork multithreaded DSR `execve` design/plan, rerun the authoritative native probe lane, and only then resume `just bench-backends full`.
-
