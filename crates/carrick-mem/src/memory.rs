@@ -197,6 +197,39 @@ const _: () = assert!(
 // stamps the read-only vvar.
 pub const LINUX_IDENTITY_PAGE_BASE: u64 = LINUX_EL1_MAINT_BASE + LINUX_EL1_MAINT_SIZE;
 pub const LINUX_IDENTITY_PAGE_SIZE: u64 = 0x4000;
+pub const LINUX_SYSCALL_MAILBOX_BASE: u64 = LINUX_IDENTITY_PAGE_BASE + LINUX_IDENTITY_PAGE_SIZE;
+pub const LINUX_SYSCALL_MAILBOX_ARENA_SIZE: u64 = 0x1_0000;
+pub const LINUX_SYSCALL_MAILBOX_SLOT_SIZE: u64 = 0x100;
+pub const LINUX_SYSCALL_MAILBOX_SLOTS: usize = 256;
+pub const AARCH64_SYSCALL_MAILBOX_OFF_SEQUENCE: u64 = 24;
+pub const AARCH64_SYSCALL_MAILBOX_OFF_STATE: u64 = 32;
+pub const AARCH64_SYSCALL_MAILBOX_OFF_TRAP_KIND: u64 = 36;
+pub const AARCH64_SYSCALL_MAILBOX_OFF_RESPONSE_ACTION: u64 = 40;
+pub const AARCH64_SYSCALL_MAILBOX_OFF_FLAGS: u64 = 44;
+pub const AARCH64_SYSCALL_MAILBOX_OFF_ARGS: u64 = 56;
+pub const AARCH64_SYSCALL_MAILBOX_OFF_X8: u64 = 104;
+pub const AARCH64_SYSCALL_MAILBOX_OFF_RESUME_PC: u64 = 112;
+pub const AARCH64_SYSCALL_MAILBOX_OFF_SPSR: u64 = 120;
+pub const AARCH64_SYSCALL_MAILBOX_OFF_FP: u64 = 128;
+pub const AARCH64_SYSCALL_MAILBOX_OFF_LR: u64 = 136;
+pub const AARCH64_SYSCALL_MAILBOX_OFF_SP: u64 = 144;
+pub const AARCH64_SYSCALL_MAILBOX_OFF_ESR: u64 = 152;
+pub const AARCH64_SYSCALL_MAILBOX_OFF_RETURN_VALUE: u64 = 160;
+pub const AARCH64_SYSCALL_MAILBOX_OFF_RESUME_X16: u64 = 168;
+pub const AARCH64_SYSCALL_MAILBOX_OFF_RESUME_X17: u64 = 176;
+const _: () = assert!(LINUX_SYSCALL_MAILBOX_BASE % 0x4000 == 0);
+const _: () = assert!(
+    LINUX_SYSCALL_MAILBOX_SLOT_SIZE * LINUX_SYSCALL_MAILBOX_SLOTS as u64
+        == LINUX_SYSCALL_MAILBOX_ARENA_SIZE
+);
+const _: () = assert!(
+    (LINUX_SYSCALL_MAILBOX_BASE - LINUX_KERNEL_REGION_BASE) + LINUX_SYSCALL_MAILBOX_ARENA_SIZE
+        == 0x1F_8000
+);
+const _: () = assert!(
+    (LINUX_SYSCALL_MAILBOX_BASE - LINUX_KERNEL_REGION_BASE) + LINUX_SYSCALL_MAILBOX_ARENA_SIZE
+        <= 0x20_0000
+);
 // Field byte offsets within the identity page (one little-endian u32 each).
 pub const IDENTITY_OFF_PID: u64 = 0x00;
 pub const IDENTITY_OFF_UID: u64 = 0x04;
@@ -290,6 +323,12 @@ const AARCH64_MRS_TPIDR_EL1_X16_OPCODE: u32 = 0xd538_d090;
 const AARCH64_MRS_ESR_EL1_X16_OPCODE: u32 = 0xd538_5210;
 const AARCH64_LSR_X16_X16_26_OPCODE: u32 = 0xd35a_fe10;
 const AARCH64_CMP_X16_SVC64_OPCODE: u32 = 0xf100_561f;
+const AARCH64_MRS_ELR_EL1_X16_OPCODE: u32 = 0xd538_4030;
+const AARCH64_MRS_SPSR_EL1_X16_OPCODE: u32 = 0xd538_4010;
+const AARCH64_MRS_SP_EL0_X16_OPCODE: u32 = 0xd538_4110;
+const AARCH64_ADD_X16_X16_ONE_OPCODE: u32 = 0x9100_0610;
+const AARCH64_STLR_W16_X17_OPCODE: u32 = 0x889f_fe30;
+const AARCH64_LDAR_W16_X17_OPCODE: u32 = 0x88df_fe30;
 // AArch64 `tlbi vmalle1is` — invalidate all stage-1 TLB entries for the
 // current EL in the inner-shareable domain. Required after the host flips
 // SCTLR_EL1.M from 0 to 1 via `set_sys_reg` because the guest never
@@ -1162,6 +1201,13 @@ impl AddressSpace {
         self.with_el1_vectors_from_bytes(el1_vectors_bytes_shim())
     }
 
+    pub fn with_el1_vectors_mailbox(
+        self,
+        identity_fast_path: bool,
+    ) -> Result<Self, AddressSpaceError> {
+        self.with_el1_vectors_from_bytes(el1_vectors_bytes_mailbox(identity_fast_path))
+    }
+
     fn with_el1_vectors_from_bytes(self, bytes: Vec<u8>) -> Result<Self, AddressSpaceError> {
         let start = LINUX_EL1_VECTORS_BASE;
         let end =
@@ -1255,6 +1301,49 @@ impl AddressSpace {
         image.initial_stack_pointer = initial_stack_pointer;
         image.linux_auxv = linux_auxv;
         image.linux_auxv_image = linux_auxv_image; // preserve /proc/self/auxv (`..` drops it)
+        image.el0_trampoline_entry = el0_trampoline_entry;
+        image.el1_vectors_base = el1_vectors_base;
+        image.stage1_page_tables_base = stage1_page_tables_base;
+        image.ro_spans = ro_spans;
+        Ok(image)
+    }
+
+    pub fn with_syscall_mailbox_arena(self) -> Result<Self, AddressSpaceError> {
+        let start = LINUX_SYSCALL_MAILBOX_BASE;
+        let end = start.checked_add(LINUX_SYSCALL_MAILBOX_ARENA_SIZE).ok_or(
+            AddressSpaceError::RegionOverflow {
+                start,
+                size: LINUX_SYSCALL_MAILBOX_ARENA_SIZE,
+            },
+        )?;
+        let region = MemoryRegion {
+            start,
+            end,
+            perms: SegmentPerms {
+                read: true,
+                write: true,
+                execute: false,
+            },
+            shared: false,
+            bytes: vec![0_u8; LINUX_SYSCALL_MAILBOX_ARENA_SIZE as usize],
+        };
+
+        let AddressSpace {
+            entry,
+            regions,
+            initial_stack_pointer,
+            linux_auxv,
+            linux_auxv_image,
+            el0_trampoline_entry,
+            el1_vectors_base,
+            stage1_page_tables_base,
+            ro_spans,
+            ..
+        } = self;
+        let mut image = Self::from_regions(entry, regions.into_iter().chain([region]).collect())?;
+        image.initial_stack_pointer = initial_stack_pointer;
+        image.linux_auxv = linux_auxv;
+        image.linux_auxv_image = linux_auxv_image;
         image.el0_trampoline_entry = el0_trampoline_entry;
         image.el1_vectors_base = el1_vectors_base;
         image.stage1_page_tables_base = stage1_page_tables_base;
@@ -2387,6 +2476,10 @@ fn enc_bne(pc: u64, target: u64) -> u32 {
     let imm19 = (((target as i64 - pc as i64) >> 2) as u32) & 0x7FFFF;
     0x5400_0001 | (imm19 << 5)
 }
+fn enc_b(pc: u64, target: u64) -> u32 {
+    let imm26 = (((target as i64 - pc as i64) >> 2) as u32) & 0x03FF_FFFF;
+    0x1400_0000 | imm26
+}
 fn enc_cbz_xn(reg: u32, pc: u64, target: u64) -> u32 {
     let imm19 = (((target as i64 - pc as i64) >> 2) as u32) & 0x7FFFF;
     0xB400_0000 | (imm19 << 5) | (reg & 0x1F)
@@ -2417,6 +2510,34 @@ fn enc_ldr_wt_xn(rt: u32, rn: u32, off: u64) -> u32 {
 // `ldr w0, [x0, #off]` (off must be a multiple of 4).
 fn enc_ldr_w0_x0(off: u64) -> u32 {
     enc_ldr_wt_xn(0, 0, off)
+}
+
+fn enc_str_xt_sp(rt: u32, off: u64) -> u32 {
+    0xF900_03E0 | (((off as u32 / 8) & 0xFFF) << 10) | (rt & 0x1F)
+}
+
+fn enc_ldr_xt_sp(rt: u32, off: u64) -> u32 {
+    0xF940_03E0 | (((off as u32 / 8) & 0xFFF) << 10) | (rt & 0x1F)
+}
+
+fn enc_str_wt_sp(rt: u32, off: u64) -> u32 {
+    0xB900_03E0 | (((off as u32 / 4) & 0xFFF) << 10) | (rt & 0x1F)
+}
+
+fn enc_ldr_wt_sp(rt: u32, off: u64) -> u32 {
+    0xB940_03E0 | (((off as u32 / 4) & 0xFFF) << 10) | (rt & 0x1F)
+}
+
+fn enc_add_xd_sp(rd: u32, imm: u16) -> u32 {
+    0x9100_03E0 | ((u32::from(imm) & 0xFFF) << 10) | (rd & 0x1F)
+}
+
+fn enc_movz_w16(imm: u16) -> u32 {
+    0x5280_0010 | (u32::from(imm) << 5)
+}
+
+fn enc_cmp_w16_imm(imm: u16) -> u32 {
+    0x7100_021F | ((u32::from(imm) & 0xFFF) << 10)
 }
 
 /// Like [`el1_vectors_bytes`], but the lower-EL synchronous slot (0x400) holds
@@ -2559,6 +2680,241 @@ pub fn el1_vectors_bytes_shim() -> Vec<u8> {
         cursor + 8 <= dispatch + AARCH64_VECTOR_SLOT_SIZE,
         "shim dispatcher overruns its 0x80 vector slot"
     );
+    bytes
+}
+
+const MAILBOX_HANDLER_OFFSET: usize = 0xA00;
+const MAILBOX_HANDLER_SIZE: usize = 0x200;
+
+pub fn el1_vectors_bytes_mailbox(identity_fast_path: bool) -> Vec<u8> {
+    let mut bytes = if identity_fast_path {
+        el1_vectors_bytes_shim()
+    } else {
+        el1_vectors_bytes()
+    };
+    let put = |bytes: &mut [u8], off: usize, op: u32| {
+        bytes[off..off + 4].copy_from_slice(&op.to_le_bytes());
+    };
+
+    let dispatch = AARCH64_VECTOR_LOWER_EL_SYNC_OFFSET;
+    let mailbox_entry = if identity_fast_path {
+        const ESR_GUARD_LEN: usize = 6 * 4;
+        dispatch + ESR_GUARD_LEN + (IDENTITY_SYSCALLS.len() + 1) * 8
+    } else {
+        dispatch
+    };
+    put(
+        &mut bytes,
+        mailbox_entry,
+        enc_b(mailbox_entry as u64, MAILBOX_HANDLER_OFFSET as u64),
+    );
+
+    let mut cursor = MAILBOX_HANDLER_OFFSET;
+    let emit = |bytes: &mut [u8], cursor: &mut usize, opcode: u32| {
+        put(bytes, *cursor, opcode);
+        *cursor += 4;
+    };
+
+    emit(&mut bytes, &mut cursor, AARCH64_MSR_TPIDR_EL1_X16_OPCODE);
+    emit(&mut bytes, &mut cursor, AARCH64_MRS_ESR_EL1_X16_OPCODE);
+    emit(&mut bytes, &mut cursor, AARCH64_LSR_X16_X16_26_OPCODE);
+    emit(&mut bytes, &mut cursor, AARCH64_CMP_X16_SVC64_OPCODE);
+    emit(&mut bytes, &mut cursor, AARCH64_MRS_TPIDR_EL1_X16_OPCODE);
+    let non_svc_branch = cursor;
+    emit(&mut bytes, &mut cursor, 0);
+
+    emit(
+        &mut bytes,
+        &mut cursor,
+        enc_str_xt_sp(16, AARCH64_SYSCALL_MAILBOX_OFF_RESUME_X16),
+    );
+    emit(
+        &mut bytes,
+        &mut cursor,
+        enc_str_xt_sp(17, AARCH64_SYSCALL_MAILBOX_OFF_RESUME_X17),
+    );
+    for register in 0..=5 {
+        emit(
+            &mut bytes,
+            &mut cursor,
+            enc_str_xt_sp(
+                register,
+                AARCH64_SYSCALL_MAILBOX_OFF_ARGS + u64::from(register) * 8,
+            ),
+        );
+    }
+    emit(
+        &mut bytes,
+        &mut cursor,
+        enc_str_xt_sp(8, AARCH64_SYSCALL_MAILBOX_OFF_X8),
+    );
+    emit(
+        &mut bytes,
+        &mut cursor,
+        enc_str_xt_sp(29, AARCH64_SYSCALL_MAILBOX_OFF_FP),
+    );
+    emit(
+        &mut bytes,
+        &mut cursor,
+        enc_str_xt_sp(30, AARCH64_SYSCALL_MAILBOX_OFF_LR),
+    );
+
+    for (mrs, offset) in [
+        (
+            AARCH64_MRS_ELR_EL1_X16_OPCODE,
+            AARCH64_SYSCALL_MAILBOX_OFF_RESUME_PC,
+        ),
+        (
+            AARCH64_MRS_SPSR_EL1_X16_OPCODE,
+            AARCH64_SYSCALL_MAILBOX_OFF_SPSR,
+        ),
+        (
+            AARCH64_MRS_SP_EL0_X16_OPCODE,
+            AARCH64_SYSCALL_MAILBOX_OFF_SP,
+        ),
+        (
+            AARCH64_MRS_ESR_EL1_X16_OPCODE,
+            AARCH64_SYSCALL_MAILBOX_OFF_ESR,
+        ),
+    ] {
+        emit(&mut bytes, &mut cursor, mrs);
+        emit(&mut bytes, &mut cursor, enc_str_xt_sp(16, offset));
+    }
+
+    emit(
+        &mut bytes,
+        &mut cursor,
+        enc_ldr_xt_sp(16, AARCH64_SYSCALL_MAILBOX_OFF_SEQUENCE),
+    );
+    emit(&mut bytes, &mut cursor, AARCH64_ADD_X16_X16_ONE_OPCODE);
+    emit(
+        &mut bytes,
+        &mut cursor,
+        enc_str_xt_sp(16, AARCH64_SYSCALL_MAILBOX_OFF_SEQUENCE),
+    );
+    emit(&mut bytes, &mut cursor, enc_movz_w16(1));
+    emit(
+        &mut bytes,
+        &mut cursor,
+        enc_str_wt_sp(16, AARCH64_SYSCALL_MAILBOX_OFF_TRAP_KIND),
+    );
+    emit(&mut bytes, &mut cursor, enc_movz_w16(0));
+    emit(
+        &mut bytes,
+        &mut cursor,
+        enc_str_wt_sp(16, AARCH64_SYSCALL_MAILBOX_OFF_RESPONSE_ACTION),
+    );
+    emit(
+        &mut bytes,
+        &mut cursor,
+        enc_str_wt_sp(16, AARCH64_SYSCALL_MAILBOX_OFF_FLAGS),
+    );
+    emit(
+        &mut bytes,
+        &mut cursor,
+        enc_add_xd_sp(17, AARCH64_SYSCALL_MAILBOX_OFF_STATE as u16),
+    );
+    emit(&mut bytes, &mut cursor, enc_movz_w16(1));
+    emit(&mut bytes, &mut cursor, AARCH64_STLR_W16_X17_OPCODE);
+    emit(&mut bytes, &mut cursor, AARCH64_HVC_SYSCALL_OPCODE);
+
+    emit(
+        &mut bytes,
+        &mut cursor,
+        enc_str_xt_sp(16, AARCH64_SYSCALL_MAILBOX_OFF_RESUME_X16),
+    );
+    emit(
+        &mut bytes,
+        &mut cursor,
+        enc_str_xt_sp(17, AARCH64_SYSCALL_MAILBOX_OFF_RESUME_X17),
+    );
+    emit(
+        &mut bytes,
+        &mut cursor,
+        enc_add_xd_sp(17, AARCH64_SYSCALL_MAILBOX_OFF_STATE as u16),
+    );
+    emit(&mut bytes, &mut cursor, AARCH64_LDAR_W16_X17_OPCODE);
+    emit(&mut bytes, &mut cursor, enc_cmp_w16_imm(2));
+    let invalid_state_branch = cursor;
+    emit(&mut bytes, &mut cursor, 0);
+    emit(
+        &mut bytes,
+        &mut cursor,
+        enc_ldr_wt_sp(16, AARCH64_SYSCALL_MAILBOX_OFF_RESPONSE_ACTION),
+    );
+    emit(&mut bytes, &mut cursor, enc_cmp_w16_imm(1));
+    let normal_branch = cursor;
+    emit(&mut bytes, &mut cursor, 0);
+    emit(&mut bytes, &mut cursor, enc_cmp_w16_imm(2));
+    let prepared_branch = cursor;
+    emit(&mut bytes, &mut cursor, 0);
+    let invalid_action_branch = cursor;
+    emit(&mut bytes, &mut cursor, 0);
+
+    let normal_return = cursor;
+    emit(
+        &mut bytes,
+        &mut cursor,
+        enc_ldr_xt_sp(0, AARCH64_SYSCALL_MAILBOX_OFF_RETURN_VALUE),
+    );
+    let normal_finalize_branch = cursor;
+    emit(&mut bytes, &mut cursor, 0);
+
+    let finalize = cursor;
+    emit(&mut bytes, &mut cursor, enc_movz_w16(0));
+    emit(&mut bytes, &mut cursor, AARCH64_STLR_W16_X17_OPCODE);
+    emit(
+        &mut bytes,
+        &mut cursor,
+        enc_ldr_xt_sp(16, AARCH64_SYSCALL_MAILBOX_OFF_RESUME_X16),
+    );
+    emit(
+        &mut bytes,
+        &mut cursor,
+        enc_ldr_xt_sp(17, AARCH64_SYSCALL_MAILBOX_OFF_RESUME_X17),
+    );
+    emit(&mut bytes, &mut cursor, AARCH64_ERET_OPCODE);
+
+    let legacy_hvc = cursor;
+    emit(&mut bytes, &mut cursor, AARCH64_HVC_SYSCALL_OPCODE);
+    emit(&mut bytes, &mut cursor, AARCH64_ERET_OPCODE);
+    let invalid_state = cursor;
+    emit(&mut bytes, &mut cursor, AARCH64_HVC_FAULT_OPCODE);
+    let invalid_action = cursor;
+    emit(&mut bytes, &mut cursor, AARCH64_HVC_FAULT_OPCODE);
+
+    put(
+        &mut bytes,
+        non_svc_branch,
+        enc_bne(non_svc_branch as u64, legacy_hvc as u64),
+    );
+    put(
+        &mut bytes,
+        invalid_state_branch,
+        enc_bne(invalid_state_branch as u64, invalid_state as u64),
+    );
+    put(
+        &mut bytes,
+        normal_branch,
+        enc_beq(normal_branch as u64, normal_return as u64),
+    );
+    put(
+        &mut bytes,
+        prepared_branch,
+        enc_beq(prepared_branch as u64, finalize as u64),
+    );
+    put(
+        &mut bytes,
+        invalid_action_branch,
+        enc_b(invalid_action_branch as u64, invalid_action as u64),
+    );
+    put(
+        &mut bytes,
+        normal_finalize_branch,
+        enc_b(normal_finalize_branch as u64, finalize as u64),
+    );
+
+    debug_assert!(cursor <= MAILBOX_HANDLER_OFFSET + MAILBOX_HANDLER_SIZE);
     bytes
 }
 
@@ -3510,6 +3866,228 @@ mod stage1_tests {
         // they resolve by identity and must NOT be re-based on their IPA.
         assert!(is_high_va(LINUX_HIGH_VA_THRESHOLD));
         assert!(!needs_stage1_translation(LINUX_HIGH_VA_THRESHOLD, 16));
+    }
+}
+
+#[cfg(test)]
+mod syscall_mailbox_tests {
+    use super::*;
+
+    fn rd_u32(bytes: &[u8], offset: usize) -> u32 {
+        u32::from_le_bytes(
+            bytes[offset..offset + 4]
+                .try_into()
+                .expect("instruction word"),
+        )
+    }
+
+    fn decode_b(op: u32, pc: usize) -> Option<usize> {
+        if op & 0xFC00_0000 != 0x1400_0000 {
+            return None;
+        }
+        let imm26 = (op & 0x03FF_FFFF) as i64;
+        let signed = (imm26 << 38) >> 38;
+        Some((pc as i64 + (signed << 2)) as usize)
+    }
+
+    fn decode_str_x_sp(op: u32) -> Option<(u32, usize)> {
+        if op & 0xFFC0_03E0 != 0xF900_03E0 {
+            return None;
+        }
+        Some((op & 0x1F, (((op >> 10) & 0xFFF) * 8) as usize))
+    }
+
+    fn decode_ldr_x_sp(op: u32) -> Option<(u32, usize)> {
+        if op & 0xFFC0_03E0 != 0xF940_03E0 {
+            return None;
+        }
+        Some((op & 0x1F, (((op >> 10) & 0xFFF) * 8) as usize))
+    }
+
+    fn decode_cmp_x8_for_test(op: u32) -> Option<u16> {
+        if op & !(0xFFF << 10) == 0xF100_011F {
+            Some(((op >> 10) & 0xFFF) as u16)
+        } else {
+            None
+        }
+    }
+
+    #[test]
+    fn mailbox_arena_tiles_the_remaining_kernel_hole() {
+        assert_eq!(LINUX_SYSCALL_MAILBOX_BASE % 0x4000, 0);
+        assert_eq!(LINUX_SYSCALL_MAILBOX_ARENA_SIZE, 0x1_0000);
+        assert_eq!(
+            LINUX_SYSCALL_MAILBOX_ARENA_SIZE,
+            LINUX_SYSCALL_MAILBOX_SLOT_SIZE * LINUX_SYSCALL_MAILBOX_SLOTS as u64
+        );
+        assert_eq!(
+            LINUX_SYSCALL_MAILBOX_BASE + LINUX_SYSCALL_MAILBOX_ARENA_SIZE,
+            LINUX_KERNEL_REGION_BASE + 0x1F_8000
+        );
+    }
+
+    #[test]
+    fn mailbox_arena_builder_installs_private_zeroed_rw_nx_region() {
+        let image = AddressSpace::from_segments(
+            0x1000,
+            [(
+                0x1000,
+                SegmentPerms {
+                    read: true,
+                    write: false,
+                    execute: true,
+                },
+                vec![0; 4],
+                4,
+            )],
+        )
+        .expect("minimal image")
+        .with_syscall_mailbox_arena()
+        .expect("mailbox arena");
+        let region = image
+            .regions()
+            .iter()
+            .find(|region| region.start == LINUX_SYSCALL_MAILBOX_BASE)
+            .expect("mailbox region");
+        assert_eq!(region.len(), LINUX_SYSCALL_MAILBOX_ARENA_SIZE);
+        assert!(region.perms.read && region.perms.write && !region.perms.execute);
+        assert!(!region.shared);
+        assert_eq!(
+            region.bytes(),
+            vec![0_u8; LINUX_SYSCALL_MAILBOX_ARENA_SIZE as usize]
+        );
+
+        let rebuilt = image.with_identity_page().expect("later builder");
+        assert!(
+            rebuilt
+                .regions()
+                .iter()
+                .any(|region| region.start == LINUX_SYSCALL_MAILBOX_BASE)
+        );
+    }
+
+    #[test]
+    fn mailbox_vector_publishes_complete_syscall_frame_before_hvc2() {
+        let bytes = el1_vectors_bytes_mailbox(false);
+        let handler = decode_b(
+            rd_u32(&bytes, AARCH64_VECTOR_LOWER_EL_SYNC_OFFSET),
+            AARCH64_VECTOR_LOWER_EL_SYNC_OFFSET,
+        )
+        .expect("sync slot must branch to mailbox handler");
+        assert_eq!(handler, MAILBOX_HANDLER_OFFSET);
+        assert_eq!(rd_u32(&bytes, handler), AARCH64_MSR_TPIDR_EL1_X16_OPCODE);
+        assert_eq!(rd_u32(&bytes, handler + 4), AARCH64_MRS_ESR_EL1_X16_OPCODE);
+        assert_eq!(rd_u32(&bytes, handler + 8), AARCH64_LSR_X16_X16_26_OPCODE);
+        assert_eq!(rd_u32(&bytes, handler + 12), AARCH64_CMP_X16_SVC64_OPCODE);
+        assert_eq!(
+            rd_u32(&bytes, handler + 16),
+            AARCH64_MRS_TPIDR_EL1_X16_OPCODE
+        );
+
+        let words: Vec<u32> = bytes[handler..handler + MAILBOX_HANDLER_SIZE]
+            .chunks_exact(4)
+            .map(|word| u32::from_le_bytes(word.try_into().expect("word")))
+            .collect();
+        for (register, offset) in [
+            (0, 56),
+            (1, 64),
+            (2, 72),
+            (3, 80),
+            (4, 88),
+            (5, 96),
+            (8, 104),
+            (29, 128),
+            (30, 136),
+        ] {
+            assert!(
+                words
+                    .iter()
+                    .copied()
+                    .any(|word| decode_str_x_sp(word) == Some((register, offset))),
+                "missing store x{register} -> mailbox+{offset}"
+            );
+        }
+        for opcode in [
+            AARCH64_MRS_ELR_EL1_X16_OPCODE,
+            AARCH64_MRS_SPSR_EL1_X16_OPCODE,
+            AARCH64_MRS_SP_EL0_X16_OPCODE,
+            AARCH64_MRS_ESR_EL1_X16_OPCODE,
+        ] {
+            assert!(
+                words.contains(&opcode),
+                "missing sysreg capture {opcode:#x}"
+            );
+        }
+
+        let sequence_increment = words
+            .iter()
+            .position(|word| *word == AARCH64_ADD_X16_X16_ONE_OPCODE)
+            .expect("sequence increment");
+        let request_publication = words
+            .iter()
+            .position(|word| *word == AARCH64_STLR_W16_X17_OPCODE)
+            .expect("request release publication");
+        let hvc = words
+            .iter()
+            .position(|word| *word == AARCH64_HVC_SYSCALL_OPCODE)
+            .expect("hvc #2 exit");
+        assert!(sequence_increment < request_publication && request_publication < hvc);
+    }
+
+    #[test]
+    fn mailbox_continuation_preserves_scratch_and_validates_response() {
+        let bytes = el1_vectors_bytes_mailbox(false);
+        let words: Vec<u32> = bytes
+            [MAILBOX_HANDLER_OFFSET..MAILBOX_HANDLER_OFFSET + MAILBOX_HANDLER_SIZE]
+            .chunks_exact(4)
+            .map(|word| u32::from_le_bytes(word.try_into().expect("word")))
+            .collect();
+        let hvc = words
+            .iter()
+            .position(|word| *word == AARCH64_HVC_SYSCALL_OPCODE)
+            .expect("request hvc");
+        assert_eq!(decode_str_x_sp(words[hvc + 1]), Some((16, 168)));
+        assert_eq!(decode_str_x_sp(words[hvc + 2]), Some((17, 176)));
+        assert!(words[hvc + 3..].contains(&AARCH64_LDAR_W16_X17_OPCODE));
+        assert!(
+            words[hvc + 3..]
+                .iter()
+                .copied()
+                .any(|word| decode_ldr_x_sp(word) == Some((0, 160)))
+        );
+        assert!(
+            words[hvc + 3..]
+                .iter()
+                .copied()
+                .any(|word| decode_ldr_x_sp(word) == Some((16, 168)))
+        );
+        assert!(
+            words[hvc + 3..]
+                .iter()
+                .copied()
+                .any(|word| decode_ldr_x_sp(word) == Some((17, 176)))
+        );
+        assert!(
+            words[hvc + 3..]
+                .iter()
+                .filter(|word| **word == AARCH64_HVC_FAULT_OPCODE)
+                .count()
+                >= 2,
+            "invalid state and response action must each fail loud"
+        );
+    }
+
+    #[test]
+    fn mailbox_vector_retains_identity_fast_paths_when_enabled() {
+        let bytes = el1_vectors_bytes_mailbox(true);
+        let dispatch = AARCH64_VECTOR_LOWER_EL_SYNC_OFFSET;
+        assert_eq!(rd_u32(&bytes, dispatch), AARCH64_MSR_TPIDR_EL1_X16_OPCODE);
+        assert!(
+            bytes[dispatch..dispatch + AARCH64_VECTOR_SLOT_SIZE]
+                .chunks_exact(4)
+                .map(|word| u32::from_le_bytes(word.try_into().expect("word")))
+                .any(|word| decode_cmp_x8_for_test(word) == Some(172))
+        );
     }
 }
 
