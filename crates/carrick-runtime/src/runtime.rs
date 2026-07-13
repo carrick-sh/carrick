@@ -893,6 +893,24 @@ fn kernel_arena_run_scope() -> String {
         .collect()
 }
 
+/// Install the macOS/HVF AArch64 syscall transport in a freshly loaded image.
+///
+/// Every ordinary SVC publishes its complete frame through an EL1-only mailbox
+/// before exiting to HVF. The optional identity shim remains an independent
+/// optimization inside the vector: disabling it does not return HVF to the
+/// register-scraping transport. Keeping this builder shared by boot and
+/// `execve` also makes the transport immutable across a container lifecycle.
+fn with_hvf_syscall_mailbox(image: AddressSpace) -> Result<AddressSpace, AddressSpaceError> {
+    let identity_fast_path = crate::syscall_shim_enabled();
+    let image = image.with_el1_vectors_mailbox(identity_fast_path)?;
+    let image = if identity_fast_path {
+        image.with_identity_page()?
+    } else {
+        image
+    };
+    image.with_syscall_mailbox_arena()
+}
+
 /// Finish a freshly-loaded image (its initial stack already set, if any) and
 /// run it: install the EL0 trampoline, EL1 vectors, stage-1 page tables and
 /// vDSO, optionally dump debug state, then enter the HVF run loop. This
@@ -914,14 +932,11 @@ fn finish_and_run_image(
     use carrick_hal::GuestArch as _;
     type HvfArch = <HvfTrapEngine as carrick_hal::ThreadedEngine>::Arch;
     let image = image.with_el0_trampoline_bytes(HvfArch::entry_trampoline_bytes())?;
-    // The syscall shim swaps the legacy EL1 vectors for the identity-fast-path
-    // dispatcher and adds the kernel-hole identity page it reads. Opt-in; the
-    // legacy path is byte-identical when off. See docs/syscall-shim-design.md.
-    let image = if crate::syscall_shim_enabled() {
-        image.with_el1_vectors_shim()?.with_identity_page()?
-    } else {
-        image.with_el1_vectors()?
-    };
+    // macOS/HVF ordinary syscalls always publish through the EL1-only mailbox.
+    // The feature-gated identity handlers remain a no-exit fast path within
+    // that vector; native DSR and the non-macOS VMM lifecycle never enter this
+    // builder.
+    let image = with_hvf_syscall_mailbox(image)?;
     let image = image.with_stage1_page_tables()?;
     let image = with_optional_vdso::<HvfArch>(image)?;
     if let Some(p) = maybe_dump_debug_state(&image, debug_state_path) {
