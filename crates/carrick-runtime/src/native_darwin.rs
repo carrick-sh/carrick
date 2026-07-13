@@ -648,6 +648,7 @@ fn load_native_execve_image(
         AddressSpace,
         Vec<NativeRelativeRelocation>,
         String,
+        Vec<Vec<u8>>,
         [u8; 32],
     ),
     crate::linux_abi::LinuxErrno,
@@ -697,6 +698,11 @@ fn load_native_execve_image(
     // Mirror the HVF execve builder: the replacement image carries fresh
     // vvar/vdso regions; `replace_image` → `NativeMappedMemory::map` re-stamps
     // the vvar for the new image.
+    // A fork-child host self-reexec must carry the argv after shebang
+    // resolution. Carrying the original script argv alongside the resolved
+    // interpreter path resumes `/bin/sh` with the script as argv[0] but no
+    // script operand, so the shell goes interactive on stdin.
+    let resolved_argv = argv.clone();
     let image = with_native_vdso(image)
         .map_err(|_| crate::linux_abi::LINUX_ENOENT)?
         .with_linux_initial_stack_execfn_page_size(
@@ -706,7 +712,13 @@ fn load_native_execve_image(
             geometry.linux_page_size,
         )
         .map_err(|_| crate::linux_abi::LINUX_ENOENT)?;
-    Ok((image, relative_relocations, resolved, executable_digest))
+    Ok((
+        image,
+        relative_relocations,
+        resolved,
+        resolved_argv,
+        executable_digest,
+    ))
 }
 
 pub(crate) fn resume_guest_from_capsule(
@@ -733,14 +745,15 @@ pub(crate) fn resume_guest_from_capsule(
     dispatcher
         .restore_native_reexec_fd_table(&guest.fd_table)
         .map_err(|error| anyhow::anyhow!("restore native guest fd table: {error}"))?;
-    let (image, relative_relocations, resolved, executable_digest) = load_native_execve_image(
-        &dispatcher,
-        &guest.resolved_path,
-        argv.clone(),
-        env.clone(),
-        &plan,
-    )
-    .map_err(|errno| anyhow::anyhow!("reload guest executable failed: {errno:?}"))?;
+    let (image, relative_relocations, resolved, _resolved_argv, executable_digest) =
+        load_native_execve_image(
+            &dispatcher,
+            &guest.resolved_path,
+            argv.clone(),
+            env.clone(),
+            &plan,
+        )
+        .map_err(|errno| anyhow::anyhow!("reload guest executable failed: {errno:?}"))?;
     if executable_digest != guest.executable_digest {
         anyhow::bail!("guest executable changed across native host self-reexec");
     }
@@ -1630,7 +1643,6 @@ fn run_native_dsr_thread_loop(
                 }
             }
             DispatchOutcome::Execve { path, argv, env } => {
-                let capsule_argv = argv.clone();
                 let capsule_env = env.clone();
                 let proc_argv: Vec<String> = argv
                     .iter()
@@ -1638,7 +1650,13 @@ fn run_native_dsr_thread_loop(
                     .collect();
                 let proc_env = env.clone();
                 match load_native_execve_image(&dispatcher, &path, argv, env, &plan) {
-                    Ok((image, relative_relocations, resolved, executable_digest)) => {
+                    Ok((
+                        image,
+                        relative_relocations,
+                        resolved,
+                        resolved_argv,
+                        executable_digest,
+                    )) => {
                         if NATIVE_FORKED_GUEST_CHILD.load(std::sync::atomic::Ordering::Acquire) {
                             if let Err(reason) = dispatcher.validate_native_reexec_fd_state() {
                                 tracing::warn!(
@@ -1660,7 +1678,7 @@ fn run_native_dsr_thread_loop(
                             if let Err(error) = crate::native_exec_capsule::begin_guest_exec(
                                 &dispatcher,
                                 resolved.clone(),
-                                capsule_argv,
+                                resolved_argv,
                                 capsule_env,
                                 executable_digest,
                                 max_traps,
