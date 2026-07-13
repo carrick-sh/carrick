@@ -170,11 +170,16 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
         }
         #[cfg(feature = "platform-macos")]
         Commands::NativeExecResume { capsule_fd, nonce } => {
-            let (before, after) =
-                carrick_runtime::resume_native_self_reexec_pid_probe(capsule_fd, &nonce)?;
-            println!("native_self_reexec_pid_before={before}");
-            println!("native_self_reexec_pid_after={after}");
-            println!("native_self_reexec_pid_preserved={}", before == after);
+            match carrick_runtime::resume_native_self_reexec(capsule_fd, &nonce)? {
+                carrick_runtime::NativeSelfReexecOutcome::PidProbe { before, after } => {
+                    println!("native_self_reexec_pid_before={before}");
+                    println!("native_self_reexec_pid_after={after}");
+                    println!("native_self_reexec_pid_preserved={}", before == after);
+                }
+                carrick_runtime::NativeSelfReexecOutcome::GuestExit(code) => {
+                    std::process::exit(code);
+                }
+            }
         }
         Commands::InspectElf { path } => {
             let metadata = inspect_elf(&path)

@@ -2336,6 +2336,20 @@ impl SyscallDispatcher {
         *self.io.stream_stdio.lock() = on;
     }
 
+    /// Whether guest stdout/stderr are live inherited host descriptors. Native
+    /// host self-reexec restores this execution-mode bit in the fresh dispatcher.
+    pub fn stream_stdio_enabled(&self) -> bool {
+        *self.io.stream_stdio.lock()
+    }
+
+    /// Capsule version 1 initially carries only bare stdio. Reject every richer
+    /// fd-table shape before host exec until typed descriptor snapshots land.
+    pub fn native_reexec_minimal_fd_state_eligible(&self) -> bool {
+        self.io.open_files.read().is_empty()
+            && *self.io.stdio_cloexec.lock() == [false; 3]
+            && *self.io.closed_stdio.lock() == [false; 3]
+    }
+
     /// Called after `libc::fork(2)` returns into a child: the child
     /// inherited the parent's buffered stdout/stderr, but we don't
     /// want to re-print those bytes when the child eventually exits

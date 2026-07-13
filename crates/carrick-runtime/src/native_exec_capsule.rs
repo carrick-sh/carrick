@@ -27,9 +27,10 @@ const MAX_PATH_LEN: usize = 4096;
 pub(crate) struct NativeExecCapsuleV1 {
     pub(crate) producer_pid: u32,
     pub(crate) purpose: NativeExecCapsulePurposeV1,
-    pub(crate) executable_path: Vec<u8>,
+    pub(crate) host_executable_path: Vec<u8>,
     pub(crate) argv: Vec<Vec<u8>>,
     pub(crate) env: Vec<Vec<u8>>,
+    pub(crate) guest_exec: Option<NativeGuestExecV1>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -38,13 +39,46 @@ pub(crate) enum NativeExecCapsulePurposeV1 {
     GuestExec,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct NativeGuestExecV1 {
+    pub(crate) resolved_path: String,
+    pub(crate) executable_digest: [u8; 32],
+    pub(crate) rootfs: crate::fs_backend::HostFsReexecAuthority,
+    pub(crate) cwd: String,
+    pub(crate) stream_stdio: bool,
+    pub(crate) exec_host_fs_fallback: bool,
+    pub(crate) max_traps: u64,
+    pub(crate) native_page_profile: carrick_spec::NativePageProfileRequest,
+}
+
 impl NativeExecCapsuleV1 {
     fn validate(&self) -> Result<(), NativeExecCapsuleError> {
-        if self.executable_path.is_empty() || self.executable_path.len() > MAX_PATH_LEN {
-            return Err(NativeExecCapsuleError::InvalidField("executable_path"));
+        if self.host_executable_path.is_empty() || self.host_executable_path.len() > MAX_PATH_LEN {
+            return Err(NativeExecCapsuleError::InvalidField("host_executable_path"));
         }
         validate_byte_vector("argv", &self.argv)?;
         validate_byte_vector("env", &self.env)?;
+        match (self.purpose, &self.guest_exec) {
+            (NativeExecCapsulePurposeV1::PidProbe, None) => {}
+            (NativeExecCapsulePurposeV1::GuestExec, Some(guest)) => guest.validate()?,
+            _ => return Err(NativeExecCapsuleError::InvalidField("purpose")),
+        }
+        Ok(())
+    }
+}
+
+impl NativeGuestExecV1 {
+    fn validate(&self) -> Result<(), NativeExecCapsuleError> {
+        if self.resolved_path.is_empty()
+            || self.resolved_path.len() > MAX_PATH_LEN
+            || self.cwd.is_empty()
+            || self.cwd.len() > MAX_PATH_LEN
+            || self.rootfs.root_path.is_empty()
+            || self.rootfs.root_path.len() > MAX_PATH_LEN
+            || self.max_traps == 0
+        {
+            return Err(NativeExecCapsuleError::InvalidField("guest_exec"));
+        }
         Ok(())
     }
 }
@@ -56,13 +90,64 @@ pub(crate) fn begin_pid_probe() -> anyhow::Result<()> {
     let payload = NativeExecCapsuleV1 {
         producer_pid,
         purpose: NativeExecCapsulePurposeV1::PidProbe,
-        executable_path: executable_bytes.clone(),
+        host_executable_path: executable_bytes,
         argv: Vec::new(),
         env: Vec::new(),
+        guest_exec: None,
     };
     let mut nonce = [0_u8; 16];
     getrandom::fill(&mut nonce)
         .map_err(|error| anyhow::anyhow!("generate native exec capsule nonce: {error}"))?;
+    exec_capsule(payload, nonce)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn begin_guest_exec(
+    dispatcher: &crate::dispatch::SyscallDispatcher,
+    resolved_path: String,
+    argv: Vec<Vec<u8>>,
+    env: Vec<Vec<u8>>,
+    executable_digest: [u8; 32],
+    max_traps: usize,
+    plan: &crate::page_profile::ExecutionPlan,
+) -> anyhow::Result<()> {
+    let executable = std::env::current_exe()?;
+    let native_page_profile = match plan.page_geometry.native_profile {
+        Some(carrick_spec::NativePageProfile::Native16k) => {
+            carrick_spec::NativePageProfileRequest::Native16k
+        }
+        Some(carrick_spec::NativePageProfile::Linux4kOn16k) => {
+            carrick_spec::NativePageProfileRequest::Linux4k
+        }
+        None => anyhow::bail!("native guest exec has no native page profile"),
+    };
+    let rootfs = dispatcher
+        .native_fs_reexec_authority()
+        .map_err(|error| anyhow::anyhow!("native guest exec rootfs is ineligible: {error:?}"))?;
+    let payload = NativeExecCapsuleV1 {
+        producer_pid: unsafe { libc::getpid() as u32 },
+        purpose: NativeExecCapsulePurposeV1::GuestExec,
+        host_executable_path: executable.as_os_str().as_bytes().to_vec(),
+        argv,
+        env,
+        guest_exec: Some(NativeGuestExecV1 {
+            resolved_path,
+            executable_digest,
+            rootfs,
+            cwd: dispatcher.cwd(),
+            stream_stdio: dispatcher.stream_stdio_enabled(),
+            exec_host_fs_fallback: dispatcher.exec_host_fs_fallback(),
+            max_traps: u64::try_from(max_traps)?,
+            native_page_profile,
+        }),
+    };
+    let mut nonce = [0_u8; 16];
+    getrandom::fill(&mut nonce)
+        .map_err(|error| anyhow::anyhow!("generate native exec capsule nonce: {error}"))?;
+    exec_capsule(payload, nonce)
+}
+
+fn exec_capsule(payload: NativeExecCapsuleV1, nonce: [u8; 16]) -> anyhow::Result<()> {
     let capsule = tempfile::tempfile()?;
     write_capsule(capsule.as_raw_fd(), nonce, &payload)?;
 
@@ -83,7 +168,7 @@ pub(crate) fn begin_pid_probe() -> anyhow::Result<()> {
 
     let nonce_hex = encode_nonce(nonce);
     let fd_arg = capsule.as_raw_fd().to_string();
-    let executable_c = CString::new(executable_bytes)?;
+    let executable_c = CString::new(payload.host_executable_path.clone())?;
     let argv = [
         executable_c.clone(),
         CString::new("__native-exec-resume")?,
@@ -121,12 +206,9 @@ pub(crate) fn begin_pid_probe() -> anyhow::Result<()> {
     Err(exec_error.into())
 }
 
-pub(crate) fn resume_pid_probe(fd: RawFd, nonce_hex: &str) -> anyhow::Result<(u32, u32)> {
+pub(crate) fn resume(fd: RawFd, nonce_hex: &str) -> anyhow::Result<crate::NativeSelfReexecOutcome> {
     let nonce = decode_nonce(nonce_hex)?;
     let payload = read_capsule_once(fd, nonce)?;
-    if payload.purpose != NativeExecCapsulePurposeV1::PidProbe {
-        anyhow::bail!("native exec capsule purpose is not a PID probe");
-    }
     let current_pid = unsafe { libc::getpid() as u32 };
     if payload.producer_pid != current_pid {
         anyhow::bail!(
@@ -136,13 +218,26 @@ pub(crate) fn resume_pid_probe(fd: RawFd, nonce_hex: &str) -> anyhow::Result<(u3
         );
     }
     let current_executable = std::env::current_exe()?;
-    if current_executable.as_os_str().as_bytes() != payload.executable_path {
+    if current_executable.as_os_str().as_bytes() != payload.host_executable_path {
         anyhow::bail!("native self-reexec resumed through a different executable");
     }
     unsafe {
         libc::close(fd);
     }
-    Ok((payload.producer_pid, current_pid))
+    match payload.purpose {
+        NativeExecCapsulePurposeV1::PidProbe => Ok(crate::NativeSelfReexecOutcome::PidProbe {
+            before: payload.producer_pid,
+            after: current_pid,
+        }),
+        NativeExecCapsulePurposeV1::GuestExec => {
+            let guest = payload
+                .guest_exec
+                .ok_or_else(|| anyhow::anyhow!("native guest exec capsule has no guest state"))?;
+            let exit_code =
+                crate::native_darwin::resume_guest_from_capsule(guest, payload.argv, payload.env)?;
+            Ok(crate::NativeSelfReexecOutcome::GuestExit(exit_code))
+        }
+    }
 }
 
 fn encode_nonce(nonce: [u8; 16]) -> String {
@@ -334,16 +429,31 @@ mod tests {
 
     use super::{
         HEADER_LEN, MAX_ITEM_LEN, NativeExecCapsulePurposeV1, NativeExecCapsuleV1,
-        read_capsule_once, write_capsule,
+        NativeGuestExecV1, read_capsule_once, write_capsule,
     };
 
     fn sample() -> NativeExecCapsuleV1 {
         NativeExecCapsuleV1 {
             producer_pid: 42,
             purpose: NativeExecCapsulePurposeV1::GuestExec,
-            executable_path: b"/bin/probe".to_vec(),
+            host_executable_path: b"/bin/probe".to_vec(),
             argv: vec![b"probe".to_vec(), b"stage2".to_vec()],
             env: vec![b"A=B".to_vec()],
+            guest_exec: Some(NativeGuestExecV1 {
+                resolved_path: "/bin/probe".to_owned(),
+                executable_digest: [0x11; 32],
+                rootfs: crate::fs_backend::HostFsReexecAuthority {
+                    root_path: b"/tmp/root".to_vec(),
+                    device: 1,
+                    inode: 2,
+                    cleanup_on_drop: false,
+                },
+                cwd: "/".to_owned(),
+                stream_stdio: true,
+                exec_host_fs_fallback: false,
+                max_traps: 100,
+                native_page_profile: carrick_spec::NativePageProfileRequest::Native16k,
+            }),
         }
     }
 
