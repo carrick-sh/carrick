@@ -170,6 +170,9 @@
 // dispatcher — the last edge blocking a future carrick-vmm-hvf crate (A3).
 use crate::elf::SegmentPerms;
 use crate::memory::AddressSpace;
+use crate::syscall_mailbox::{
+    HvfSyscallTransport, MailboxBinding, MailboxSlotAllocator, MailboxSlotId,
+};
 use carrick_aarch64::Aarch64VcpuSnapshot;
 use carrick_guest_mem::MemoryError;
 use serde::Serialize;
@@ -2315,6 +2318,12 @@ pub(crate) struct HvfVmState {
     /// descriptor stores so a concurrent sibling hardware walk stays safe
     /// without quiescing.
     page_tables: std::sync::Arc<parking_lot::Mutex<Option<crate::page_table::PageTableManager>>>,
+    /// Carrick-owned logical mailbox slots shared by every vCPU in this VM.
+    /// Slot identity is deliberately independent of opaque/recycled HVF ids.
+    mailbox_slots: std::sync::Arc<MailboxSlotAllocator>,
+    /// Internal diagnostic transport selection, parsed once before first entry
+    /// and inherited by every sibling/rebuild. This is not public CLI policy.
+    syscall_transport: HvfSyscallTransport,
     /// The Linux syscall number (x8) and original arg0 (x0) of the most recent
     /// `svc` trap, captured before the dispatcher overwrites x0 with the retval.
     /// Used to restart an `EINTR`'d restartable syscall under SA_RESTART: the
@@ -2482,10 +2491,10 @@ struct MappingView {
 /// only thing HVF carries on top is the backend-owned `last_exit_class` (the
 /// trap class latched at the exit the snapshot was taken on), which the neutral
 /// type deliberately does NOT model. This is the "neutral core + backend extra"
-/// shape: the per-VMM HVF↔neutral mapping (CPSR ↔ `core.pstate`, the `*_EL1`
-/// sysreg names ↔ their neutral aliases, and HVF seeding SP_EL1 from
-/// `core.sp_el0` since it captures no separate SP_EL1) lives in
-/// `snapshot_vcpu_from`/`restore_vcpu*`. The TTBR1_EL1 (Rosetta x86-64 high-half
+/// shape: the per-VMM HVF↔neutral mapping (CPSR ↔ `core.pstate` and the `*_EL1`
+/// sysreg names ↔ their neutral aliases) lives in
+/// `snapshot_vcpu_from`/`restore_vcpu*`; mailbox rebinding owns SP_EL1. The
+/// TTBR1_EL1 (Rosetta x86-64 high-half
 /// root) / ACTLR_EL1 (Rosetta EnTSO) / TPIDR*_EL0 (musl TLS, vDSO/rseq) capture
 /// rationales are documented on the neutral fields.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -2618,6 +2627,8 @@ pub struct ThreadSpec {
     /// Shared stage-1 page-table editor (one VM ⇒ one set of tables; siblings
     /// share this so concurrent edits serialize through its mutex).
     page_tables: std::sync::Arc<parking_lot::Mutex<Option<crate::page_table::PageTableManager>>>,
+    mailbox_slots: std::sync::Arc<MailboxSlotAllocator>,
+    syscall_transport: HvfSyscallTransport,
 }
 
 // SAFETY: `ThreadSpec` carries raw `*mut u8` host pointers (inside the
@@ -2653,13 +2664,15 @@ impl HvfVmState {
     /// TTBR/CPACR/CNTKCTL/VBAR/SP/vdso setup into one constructor.
     pub(crate) fn new_with_plan(
         plan: &GuestMappingPlan,
-    ) -> Result<(HvfVmState, applevisor::vcpu::Vcpu), TrapError> {
+    ) -> Result<(HvfVmState, applevisor::vcpu::Vcpu, MailboxBinding), TrapError> {
         use applevisor::prelude::*;
 
         let (vm, permit) = create_vm_with_admission(VmCreateAdmission::Initial)?;
         let vcpu = create_vcpu_with_permit(&vm, permit)?;
         enable_el0_counter_access(vcpu.id());
 
+        let syscall_transport = HvfSyscallTransport::from_env()
+            .map_err(|error| TrapError::Hypervisor(error.to_string()))?;
         let mut state = HvfVmState {
             _vm: std::mem::ManuallyDrop::new(vm),
             mappings: Vec::new(),
@@ -2670,6 +2683,8 @@ impl HvfVmState {
             forked_no_exec: false,
             protections: std::sync::Arc::new(MemoryProtections::default()),
             page_tables: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+            mailbox_slots: std::sync::Arc::new(MailboxSlotAllocator::new()),
+            syscall_transport,
             last_syscall_nr: None,
             last_syscall_orig_x0: 0,
             vcpu_id: vcpu.id(),
@@ -2833,10 +2848,8 @@ impl HvfVmState {
                 .map_err(hvf_error)?;
         }
         if let Some(stack_pointer) = plan.initial_stack_pointer {
-            // Running at EL1h, so seed both SP_EL1 (current SP) and SP_EL0
-            // (in case anything ever drops back to EL0).
-            vcpu.set_sys_reg(SysReg::SP_EL1, stack_pointer)
-                .map_err(hvf_error)?;
+            // SP_EL0 is the Linux userspace stack. SP_EL1 is reserved for the
+            // per-vCPU syscall mailbox and is bound after mappings are live.
             vcpu.set_sys_reg(SysReg::SP_EL0, stack_pointer)
                 .map_err(hvf_error)?;
         }
@@ -2844,7 +2857,8 @@ impl HvfVmState {
         // CNTVCT_EL0 in userspace. Best-effort: if the page isn't mapped (a load
         // path without with_vdso) just skip — the guest falls back to syscalls.
         state.populate_vdso_data_page();
-        Ok((state, vcpu))
+        let mailbox = state.allocate_mailbox_for_vcpu(&vcpu)?;
+        Ok((state, vcpu, mailbox))
     }
 }
 
@@ -3052,12 +3066,75 @@ impl HvfVmState {
 
     /// Create a fresh vCPU bound to this VM (the boot/clone/fork/reclaim
     /// vcpu_create; admission is the bounded scheduler's job, NOT this path).
-    pub(crate) fn add_vcpu(&mut self) -> Result<applevisor::vcpu::Vcpu, TrapError> {
+    pub(crate) fn add_vcpu(
+        &mut self,
+    ) -> Result<(applevisor::vcpu::Vcpu, MailboxBinding), TrapError> {
         let vcpu = create_vcpu(&self._vm)?;
         enable_el0_counter_access(vcpu.id());
         self.vcpu_id = vcpu.id();
         self.vcpu_handle = vcpu.get_handle();
-        Ok(vcpu)
+        let mailbox = self.allocate_mailbox_for_vcpu(&vcpu)?;
+        Ok((vcpu, mailbox))
+    }
+
+    fn mailbox_host_pointer(
+        &self,
+        slot: MailboxSlotId,
+    ) -> Result<std::ptr::NonNull<carrick_aarch64::mailbox::Aarch64SyscallMailbox>, TrapError> {
+        let address = slot.guest_address();
+        let pointer = self
+            .host_ptr(
+                address,
+                carrick_aarch64::mailbox::AARCH64_SYSCALL_MAILBOX_SIZE as usize,
+            )
+            .ok_or_else(|| {
+                TrapError::Hypervisor(format!(
+                    "AArch64 syscall mailbox slot {} at {address:#x} is not mapped",
+                    slot.raw()
+                ))
+            })?;
+        std::ptr::NonNull::new(pointer.cast()).ok_or_else(|| {
+            TrapError::Hypervisor(format!(
+                "AArch64 syscall mailbox slot {} resolved to a null host pointer",
+                slot.raw()
+            ))
+        })
+    }
+
+    fn allocate_mailbox_for_vcpu(
+        &self,
+        vcpu: &applevisor::vcpu::Vcpu,
+    ) -> Result<MailboxBinding, TrapError> {
+        use applevisor::prelude::SysReg;
+
+        let lease = self
+            .mailbox_slots
+            .allocate()
+            .map_err(|error| TrapError::Hypervisor(error.to_string()))?;
+        let address = lease.id().guest_address();
+        let pointer = self.mailbox_host_pointer(lease.id())?;
+        // SAFETY: `mailbox_host_pointer` resolved the complete fixed slot from
+        // this VM's process-lifetime mapping, and the lease uniquely owns it.
+        let binding = unsafe { MailboxBinding::new(lease, pointer, self.syscall_transport) };
+        vcpu.set_sys_reg(SysReg::SP_EL1, address)
+            .map_err(hvf_error)?;
+        Ok(binding)
+    }
+
+    fn rebind_mailbox_after_vcpu_create(
+        &self,
+        vcpu: &applevisor::vcpu::Vcpu,
+        binding: &mut MailboxBinding,
+        preserve_request: bool,
+    ) -> Result<(), TrapError> {
+        use applevisor::prelude::SysReg;
+
+        let pointer = self.mailbox_host_pointer(binding.slot())?;
+        // SAFETY: the refreshed pointer covers the same uniquely leased slot in
+        // the rebuilt VM mapping and remains live until another rebuild/drop.
+        unsafe { binding.rebind(pointer, preserve_request) };
+        vcpu.set_sys_reg(SysReg::SP_EL1, binding.slot().guest_address())
+            .map_err(hvf_error)
     }
 
     /// Host pointer backing `[gpa, gpa+len)`, or `None` if unmapped. The
@@ -3978,6 +4055,7 @@ impl HvfVmState {
     pub(crate) fn reclaim_resume(
         &mut self,
         vcpu: &mut applevisor::vcpu::Vcpu,
+        mailbox: &mut MailboxBinding,
     ) -> Result<(), TrapError> {
         let snap = self
             .reclaim_snapshot
@@ -3991,6 +4069,7 @@ impl HvfVmState {
         // the (already hv_vcpu_destroy'd) old one — mirror the fork rebuild.
         std::mem::forget(std::mem::replace(vcpu, new_vcpu));
         HvfInner::restore_vcpu_into(vcpu, &snap)?;
+        self.rebind_mailbox_after_vcpu_create(vcpu, mailbox, true)?;
         self.last_exit_class = snap.last_exit_class;
         Ok(())
     }
@@ -4076,6 +4155,7 @@ impl HvfVmState {
     pub(crate) fn shared_wait_resume(
         &mut self,
         vcpu: &mut applevisor::vcpu::Vcpu,
+        mailbox: &mut MailboxBinding,
         replay_alias_union: bool,
     ) -> Result<(), TrapError> {
         let snap = self.reclaim_snapshot.take().ok_or_else(|| {
@@ -4171,6 +4251,7 @@ impl HvfVmState {
         }
 
         HvfInner::restore_vcpu_into(vcpu, &snap)?;
+        self.rebind_mailbox_after_vcpu_create(vcpu, mailbox, true)?;
         self.last_exit_class = snap.last_exit_class;
         Ok(())
     }
@@ -4216,6 +4297,7 @@ impl HvfVmState {
     pub(crate) fn rebuild_vcpu_after_fork(
         &mut self,
         vcpu: &mut applevisor::vcpu::Vcpu,
+        mailbox: &mut MailboxBinding,
     ) -> Result<(), TrapError> {
         let snap = FORK_VCPU_SNAPSHOT
             .with(|s| s.borrow_mut().take())
@@ -4237,6 +4319,7 @@ impl HvfVmState {
         std::mem::forget(std::mem::replace(vcpu, new_vcpu));
         replace_destroyed_vm(self, new_vm);
         HvfInner::restore_vcpu_into(vcpu, &snap)?;
+        self.rebind_mailbox_after_vcpu_create(vcpu, mailbox, true)?;
         self.last_exit_class = snap.last_exit_class;
         Ok(())
     }
@@ -4443,10 +4526,15 @@ impl HvfVmState {
     pub(crate) fn fork_rebuild(
         &mut self,
         vcpu: &mut applevisor::vcpu::Vcpu,
+        mailbox: &mut MailboxBinding,
         snap: &VcpuSnapshot,
         is_child: bool,
     ) -> Result<(), TrapError> {
         let role = if is_child { 1 } else { 0 };
+        if is_child {
+            self.mailbox_slots
+                .retain_only_after_fork_child(mailbox.slot());
+        }
         let rebuild_start = std::time::Instant::now();
         let elapsed_us = |start: std::time::Instant| -> u64 {
             let micros = start.elapsed().as_micros();
@@ -4718,6 +4806,7 @@ impl HvfVmState {
         // parent, 0 for child).
         let phase_start = std::time::Instant::now();
         HvfInner::restore_vcpu_into(vcpu, snap)?;
+        self.rebind_mailbox_after_vcpu_create(vcpu, mailbox, true)?;
         self.last_exit_class = snap.last_exit_class;
         crate::probes::fork_lifecycle(role + 4, 16, elapsed_us(phase_start), 0, 0);
         crate::probes::fork_rebuild(role, 3, desc_count, local_maps, elapsed_us(rebuild_start));
@@ -4768,6 +4857,8 @@ impl HvfVmState {
             mappings,
             protections: std::sync::Arc::clone(&self.protections),
             page_tables: std::sync::Arc::clone(&self.page_tables),
+            mailbox_slots: std::sync::Arc::clone(&self.mailbox_slots),
+            syscall_transport: self.syscall_transport,
         })
     }
 
@@ -4778,12 +4869,14 @@ impl HvfVmState {
     /// the vCPU (HVF requires vCPU create+run+destroy on one thread).
     pub(crate) fn from_thread_spec(
         spec: ThreadSpec,
-    ) -> Result<(HvfVmState, applevisor::vcpu::Vcpu), TrapError> {
+    ) -> Result<(HvfVmState, applevisor::vcpu::Vcpu, MailboxBinding), TrapError> {
         let ThreadSpec {
             vm,
             mappings,
             protections,
             page_tables,
+            mailbox_slots,
+            syscall_transport,
         } = spec;
 
         // The spec captured `vm` at clone time. If a fork rebuilt the VM since
@@ -4807,6 +4900,8 @@ impl HvfVmState {
             forked_no_exec: false,
             protections,
             page_tables,
+            mailbox_slots,
+            syscall_transport,
             last_syscall_nr: None,
             last_syscall_orig_x0: 0,
             vcpu_id: vcpu.id(),
@@ -4826,7 +4921,8 @@ impl HvfVmState {
             state.mappings.push(mapping.into_unowned_region());
         }
 
-        Ok((state, vcpu))
+        let mailbox = state.allocate_mailbox_for_vcpu(&vcpu)?;
+        Ok((state, vcpu, mailbox))
     }
 
     /// `execve(2)` image replacement: tear down + rebuild the VM around the new
@@ -4835,6 +4931,7 @@ impl HvfVmState {
     pub(crate) fn execve_rebuild(
         &mut self,
         vcpu: &mut applevisor::vcpu::Vcpu,
+        mailbox: &mut MailboxBinding,
         plan: &GuestMappingPlan,
     ) -> Result<(), TrapError> {
         use applevisor::prelude::*;
@@ -4891,6 +4988,9 @@ impl HvfVmState {
         self.protections = std::sync::Arc::new(MemoryProtections::default());
         self.seed_readonly_spans_from_plan(plan);
         self.page_tables = std::sync::Arc::new(parking_lot::Mutex::new(None));
+        // execve is a fresh single-threaded image. Give it a fresh allocator and
+        // lease so no pre-exec logical-vCPU ownership can leak into the new VM.
+        self.mailbox_slots = std::sync::Arc::new(MailboxSlotAllocator::new());
         self.last_syscall_nr = None;
         self.last_syscall_orig_x0 = 0;
 
@@ -4959,8 +5059,6 @@ impl HvfVmState {
                 .map_err(hvf_error)?;
         }
         if let Some(stack_pointer) = plan.initial_stack_pointer {
-            vcpu.set_sys_reg(SysReg::SP_EL1, stack_pointer)
-                .map_err(hvf_error)?;
             vcpu.set_sys_reg(SysReg::SP_EL0, stack_pointer)
                 .map_err(hvf_error)?;
         }
@@ -4976,6 +5074,7 @@ impl HvfVmState {
         let actual_mair = vcpu.get_sys_reg(SysReg::MAIR_EL1).unwrap_or(0);
         crate::probes::execve_sysregs(actual_sctlr, actual_ttbr0, actual_mair);
         self.populate_vdso_data_page();
+        *mailbox = self.allocate_mailbox_for_vcpu(vcpu)?;
         Ok(())
     }
 }
@@ -5006,16 +5105,16 @@ impl HvfInner {
             fpcr = vcpu.get_reg(Reg::FPCR).map_err(hvf_error)? as u32;
         }
         let sp_el0 = vcpu.get_sys_reg(SysReg::SP_EL0).map_err(hvf_error)?;
+        let sp_el1 = vcpu.get_sys_reg(SysReg::SP_EL1).map_err(hvf_error)?;
         Ok(VcpuSnapshot {
             core: Aarch64VcpuSnapshot {
                 gprs,
                 pc: vcpu.get_reg(Reg::PC).map_err(hvf_error)?,
                 pstate: vcpu.get_reg(Reg::CPSR).map_err(hvf_error)?,
                 sp_el0,
-                // HVF captures no separate SP_EL1 (its EL1 trampoline never pushes a
-                // kernel stack); mirror sp_el0 so the neutral round-trip is total —
-                // `restore_vcpu*` seeds SP_EL1 from `core.sp_el0`, not this field.
-                sp_el1: sp_el0,
+                // SP_EL1 is the per-vCPU syscall-mailbox address. Rebuild paths
+                // refresh it from the binding after restoring this snapshot.
+                sp_el1,
                 elr_el1: vcpu.get_sys_reg(SysReg::ELR_EL1).map_err(hvf_error)?,
                 spsr_el1: vcpu.get_sys_reg(SysReg::SPSR_EL1).map_err(hvf_error)?,
                 ttbr0: vcpu.get_sys_reg(SysReg::TTBR0_EL1).map_err(hvf_error)?,
@@ -5161,11 +5260,8 @@ impl HvfInner {
             .map_err(hvf_error)?;
         vcpu.set_sys_reg(SysReg::TPIDR_EL0, snap.core.tpidr_el0)
             .map_err(hvf_error)?;
-        // SP_EL1 for the brief EL1h trampoline window. The trampoline only executes
-        // one `eret` and touches no stack, but give it a sane value (the child's EL0
-        // stack works; the trampoline never pushes).
-        vcpu.set_sys_reg(SysReg::SP_EL1, snap.core.sp_el0)
-            .map_err(hvf_error)?;
+        // SP_EL1 was already set to this sibling's mailbox by materialization.
+        // The trampoline does not touch it before `eret` enters EL0.
         // Enable the MMU last, identically to the parent.
         vcpu.set_sys_reg(SysReg::SCTLR_EL1, snap.core.sctlr)
             .map_err(hvf_error)?;
