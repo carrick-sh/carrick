@@ -4189,7 +4189,7 @@ fn probe_gates_decision_allowlist_logic() {
 fn native_probe_campaign_selects_only_same_isa_lane() {
     assert!(lane_allowed_for_backend(&ARM64, Some("native")));
     assert!(!lane_allowed_for_backend(&AMD64, Some("native")));
-    assert!(lane_allowed_for_backend(&ARM64, Some("hvf")));
+    assert!(lane_allowed_for_backend(&ARM64, Some("vmm")));
     assert!(lane_allowed_for_backend(&AMD64, None));
 }
 
@@ -4216,7 +4216,7 @@ fn native_musl_probe_campaign_uses_direct_elf_transport() {
         ProbeTransport::ContainerInjection
     );
     assert_eq!(
-        probe_transport(Some("hvf"), "musl"),
+        probe_transport(Some("vmm"), "musl"),
         ProbeTransport::ContainerInjection
     );
 }

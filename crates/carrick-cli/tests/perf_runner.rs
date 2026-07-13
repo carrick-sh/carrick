@@ -103,7 +103,7 @@ fn v8_backend_args(backend: CarrickBackend, immutable_image: &str) -> Vec<String
             "native16k".to_owned(),
         ]),
         CarrickBackend::Hvf => {
-            args.extend(["--exec-backend".to_owned(), "hvf".to_owned()]);
+            args.extend(["--exec-backend".to_owned(), "vmm".to_owned()]);
         }
     }
     args.extend([immutable_image.to_owned(), V8_SCRIPT.to_owned()]);
@@ -288,6 +288,10 @@ fn v8_backend_commands_share_the_workload_contract() {
     assert_eq!(
         backend_neutral_v8_args(&native),
         backend_neutral_v8_args(&hvf)
+    );
+    assert!(
+        hvf.windows(2)
+            .any(|window| window == ["--exec-backend", "vmm"])
     );
 }
 
