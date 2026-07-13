@@ -37,6 +37,7 @@ use carrick_guest_mem::{GuestVa, MemoryError, SharedFutexLocation};
 use carrick_hal::{GuestEntryRegs, GuestVmBackend, Reg, SlotId, SysReg, TrapError, VcpuRegistry};
 use carrick_mem::memory::AddressSpace;
 
+use crate::syscall_mailbox::MailboxBinding;
 use crate::trap::{
     GuestMappingPlan, HvfInner, HvfVmState, ThreadSpec, VcpuSnapshot, hvf_get_reg, hvf_get_sys_reg,
     hvf_set_reg, hvf_set_sys_reg, set_simd_fp_reg_v,
@@ -52,11 +53,11 @@ pub type HvfAarch64Engine = Aarch64EngineCore<HvfAarch64Vmm>;
 /// `next_syscall` runs into EL0). Mirrors `KvmAarch64Vmm::bring_up`.
 pub fn bring_up(image: &AddressSpace) -> Result<HvfAarch64Engine, TrapError> {
     let plan = GuestMappingPlan::from_address_space(image)?;
-    let (state, vcpu) = HvfVmState::new_with_plan(&plan)?;
+    let (state, vcpu, mailbox) = HvfVmState::new_with_plan(&plan)?;
     let vmm = HvfAarch64Vmm { state };
     Ok(Aarch64EngineCore::from_parts(
         vmm,
-        HvfAarch64Vcpu::new(vcpu),
+        HvfAarch64Vcpu::new(vcpu, mailbox),
     ))
 }
 
@@ -64,9 +65,9 @@ pub fn bring_up(image: &AddressSpace) -> Result<HvfAarch64Engine, TrapError> {
 //
 // HVF's `VcpuSnapshot` is now `{ core: Aarch64VcpuSnapshot, last_exit_class }`, so
 // the neutral view IS the `core` and these conversions are trivial. The
-// per-register HVF↔neutral mapping (CPSR ↔ pstate, the `*_EL1` sysreg names, HVF
-// seeding SP_EL1 from `core.sp_el0`) lives in `snapshot_vcpu_from`/`restore_vcpu*`,
-// not here. `last_exit_class` is engine-owned and not part of the neutral
+// per-register HVF↔neutral mapping (CPSR ↔ pstate and the `*_EL1` sysreg names)
+// lives in `snapshot_vcpu_from`/`restore_vcpu*`; mailbox rebinding owns SP_EL1.
+// `last_exit_class` is engine-owned and not part of the neutral
 // snapshot, so `to_neutral` drops it and `from_neutral` re-attaches a
 // caller-supplied value (0 except on the engine-owned reclaim path).
 
@@ -96,11 +97,17 @@ pub(crate) fn from_neutral(s: &Aarch64VcpuSnapshot, last_exit_class: u64) -> Vcp
 /// the old `ManuallyDrop<HvfInner>` discipline, now per-half.) The reclaim/fork
 /// rebuilds raw-`hv_vcpu_destroy`/recreate the inner vCPU via `std::mem::replace`
 /// inside it (`replace_destroyed_vcpu`), never running applevisor Drop.
-pub struct HvfAarch64Vcpu(pub(crate) std::mem::ManuallyDrop<applevisor::vcpu::Vcpu>);
+pub struct HvfAarch64Vcpu {
+    pub(crate) inner: std::mem::ManuallyDrop<applevisor::vcpu::Vcpu>,
+    pub(crate) mailbox: MailboxBinding,
+}
 
 impl HvfAarch64Vcpu {
-    pub(crate) fn new(vcpu: applevisor::vcpu::Vcpu) -> Self {
-        Self(std::mem::ManuallyDrop::new(vcpu))
+    pub(crate) fn new(vcpu: applevisor::vcpu::Vcpu, mailbox: MailboxBinding) -> Self {
+        Self {
+            inner: std::mem::ManuallyDrop::new(vcpu),
+            mailbox,
+        }
     }
 }
 
@@ -116,16 +123,16 @@ fn os_to_trap(e: carrick_hal::OsError) -> TrapError {
 
 impl Aarch64Vcpu for HvfAarch64Vcpu {
     fn get_reg(&self, r: Reg) -> Result<u64, TrapError> {
-        hvf_get_reg(&self.0, r).map_err(os_to_trap)
+        hvf_get_reg(&self.inner, r).map_err(os_to_trap)
     }
     fn set_reg(&mut self, r: Reg, v: u64) -> Result<(), TrapError> {
-        hvf_set_reg(&self.0, r, v).map_err(os_to_trap)
+        hvf_set_reg(&self.inner, r, v).map_err(os_to_trap)
     }
     fn get_sys_reg(&self, r: SysReg) -> Result<u64, TrapError> {
-        hvf_get_sys_reg(&self.0, r).map_err(os_to_trap)
+        hvf_get_sys_reg(&self.inner, r).map_err(os_to_trap)
     }
     fn set_sys_reg(&mut self, r: SysReg, v: u64) -> Result<(), TrapError> {
-        hvf_set_sys_reg(&self.0, r, v).map_err(os_to_trap)
+        hvf_set_sys_reg(&self.inner, r, v).map_err(os_to_trap)
     }
 
     fn get_vreg(&self, n: u32) -> Result<u128, TrapError> {
@@ -135,7 +142,7 @@ impl Aarch64Vcpu for HvfAarch64Vcpu {
                 "vreg index {n} out of range"
             )));
         }
-        self.0
+        self.inner
             .get_simd_fp_reg(crate::trap::SIMD_FP_TABLE[idx])
             .map_err(|e| TrapError::Hypervisor(e.to_string()))
     }
@@ -149,7 +156,7 @@ impl Aarch64Vcpu for HvfAarch64Vcpu {
         // The u128-by-value ABI-bug workaround: route the V-register WRITE through
         // the C shim (applevisor's `set_simd_fp_reg` zeroes via the wrong register
         // class). Reads are pointer-based and unaffected (above).
-        let rc = set_simd_fp_reg_v(self.0.id(), crate::trap::SIMD_FP_TABLE[idx], v);
+        let rc = set_simd_fp_reg_v(self.inner.id(), crate::trap::SIMD_FP_TABLE[idx], v);
         if rc == 0 {
             Ok(())
         } else {
@@ -159,33 +166,33 @@ impl Aarch64Vcpu for HvfAarch64Vcpu {
         }
     }
     fn get_fpcr(&self) -> Result<u64, TrapError> {
-        self.0
+        self.inner
             .get_reg(applevisor::vcpu::Reg::FPCR)
             .map_err(|e| TrapError::Hypervisor(e.to_string()))
     }
     fn set_fpcr(&mut self, v: u64) -> Result<(), TrapError> {
-        self.0
+        self.inner
             .set_reg(applevisor::vcpu::Reg::FPCR, v)
             .map_err(|e| TrapError::Hypervisor(e.to_string()))
     }
     fn get_fpsr(&self) -> Result<u64, TrapError> {
-        self.0
+        self.inner
             .get_reg(applevisor::vcpu::Reg::FPSR)
             .map_err(|e| TrapError::Hypervisor(e.to_string()))
     }
     fn set_fpsr(&mut self, v: u64) -> Result<(), TrapError> {
-        self.0
+        self.inner
             .set_reg(applevisor::vcpu::Reg::FPSR, v)
             .map_err(|e| TrapError::Hypervisor(e.to_string()))
     }
 
     fn get_esr_el1(&self) -> Result<u64, TrapError> {
-        self.0
+        self.inner
             .get_sys_reg(applevisor::vcpu::SysReg::ESR_EL1)
             .map_err(|e| TrapError::Hypervisor(e.to_string()))
     }
     fn get_far_el1(&self) -> Result<u64, TrapError> {
-        self.0
+        self.inner
             .get_sys_reg(applevisor::vcpu::SysReg::FAR_EL1)
             .map_err(|e| TrapError::Hypervisor(e.to_string()))
     }
@@ -195,13 +202,13 @@ impl Aarch64Vcpu for HvfAarch64Vcpu {
         // FPSR/FPCR + ACTLR/TPIDRRO/TPIDR_EL1), gated like the signal path on
         // `fpsimd_save_enabled()`. The engine owns `last_exit_class`, so it is not
         // carried here (restored from the vCPU latch on the inner restore path).
-        HvfInner::snapshot_vcpu_from(&self.0).map(|s| to_neutral(&s))
+        HvfInner::snapshot_vcpu_from(&self.inner).map(|s| to_neutral(&s))
     }
     fn restore(&mut self, snap: &Aarch64VcpuSnapshot) -> Result<(), TrapError> {
         // last_exit_class is engine-owned; the neutral snapshot doesn't carry it, so
         // restore 0 (the inner restore overwrites the vCPU latch from the snapshot's
         // own field, which we set to 0 — the trap loop relatches it on the next exit).
-        HvfInner::restore_vcpu_into(&mut self.0, &from_neutral(snap, 0))
+        HvfInner::restore_vcpu_into(&mut self.inner, &from_neutral(snap, 0))
     }
 
     fn restore_thread_start(&mut self, snap: &Aarch64VcpuSnapshot) -> Result<(), TrapError> {
@@ -209,7 +216,7 @@ impl Aarch64Vcpu for HvfAarch64Vcpu {
         // enter via the EL0 trampoline (PC=trampoline, SPSR_EL1=EL0t, ELR_EL1=snap.pc)
         // — distinct from the plain `restore` a fork resume uses. (KVM keeps the trait
         // default, which is a plain restore.)
-        HvfInner::restore_vcpu_thread_start_into(&mut self.0, &from_neutral(snap, 0))
+        HvfInner::restore_vcpu_thread_start_into(&mut self.inner, &from_neutral(snap, 0))
     }
 
     fn get_saved_x9(&self) -> Result<Option<u64>, TrapError> {
@@ -231,29 +238,29 @@ impl Aarch64Vcpu for HvfAarch64Vcpu {
         // preserves x16 while checking ESR_EL1. Written via the applevisor
         // `SysReg` directly: the neutral `carrick_hal::SysReg` has no
         // CONTEXTIDR_EL1 variant (it is an HVF-private fast-path detail).
-        self.0
+        self.inner
             .set_sys_reg(SysReg::CONTEXTIDR_EL1, tid)
             .map_err(|e| TrapError::Hypervisor(e.to_string()))
     }
 
     fn run(&mut self) -> Result<Aarch64Exit, TrapError> {
-        HvfInner::run_to_exit(&mut self.0)
+        HvfInner::run_to_exit(&mut self.inner)
     }
 
     fn kick(&self) -> Result<(), TrapError> {
         use carrick_hal::VcpuKick as _;
-        crate::vcpu_kick::VcpuKickHandle::new(self.0.get_handle()).kick();
+        crate::vcpu_kick::VcpuKickHandle::new(self.inner.get_handle()).kick();
         Ok(())
     }
 
     fn set_hardware_tso(&mut self, tso: bool) -> Result<(), TrapError> {
         const EN_TSO: u64 = 1 << 1;
         let actlr = self
-            .0
+            .inner
             .get_sys_reg(applevisor::vcpu::SysReg::ACTLR_EL1)
             .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
         let next = if tso { actlr | EN_TSO } else { actlr & !EN_TSO };
-        self.0
+        self.inner
             .set_sys_reg(applevisor::vcpu::SysReg::ACTLR_EL1, next)
             .map_err(|e| TrapError::Hypervisor(e.to_string()))
     }
@@ -446,7 +453,8 @@ impl Aarch64Vmm for HvfAarch64Vmm {
     // ── vCPU lifecycle ──
 
     fn add_vcpu(&mut self) -> Result<Self::Vcpu, TrapError> {
-        self.state.add_vcpu().map(HvfAarch64Vcpu::new)
+        let (vcpu, mailbox) = self.state.add_vcpu()?;
+        Ok(HvfAarch64Vcpu::new(vcpu, mailbox))
     }
 
     fn fork_admission_check(&self) -> Result<(), TrapError> {
@@ -487,8 +495,12 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         // no GPR and ELR_EL1 (= post-svc) is restored by the snapshot, so the child
         // resumes mid-clone exactly like the parent.
         let snap = from_neutral(snapshot, 0);
-        self.state
-            .fork_rebuild(&mut vcpu.0, &snap, /*is_child=*/ true)
+        self.state.fork_rebuild(
+            &mut vcpu.inner,
+            &mut vcpu.mailbox,
+            &snap,
+            /*is_child=*/ true,
+        )
     }
 
     fn rebuild_parent_after_fork(
@@ -501,8 +513,12 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         // of every quiesced sibling's regions, restore the register file. (HVF tore
         // its VM down in `freeze_ram_for_fork`, so the parent must rebuild too.)
         let snap = from_neutral(snapshot, 0);
-        self.state
-            .fork_rebuild(&mut vcpu.0, &snap, /*is_child=*/ false)
+        self.state.fork_rebuild(
+            &mut vcpu.inner,
+            &mut vcpu.mailbox,
+            &snap,
+            /*is_child=*/ false,
+        )
     }
 
     fn execve_rebuild(
@@ -513,7 +529,8 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         // Tear down + rebuild the VM around the new image, reset the vCPU to "initial
         // process startup" (zeroed GPRs, EL0 trampoline). Clears the alias registry.
         let plan = GuestMappingPlan::from_address_space(new_image)?;
-        self.state.execve_rebuild(&mut vcpu.0, &plan)
+        self.state
+            .execve_rebuild(&mut vcpu.inner, &mut vcpu.mailbox, &plan)
     }
 
     // ── threaded sibling lifecycle ──
@@ -542,7 +559,7 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         // `self.state.reclaim_snapshot` (read by `rebind_to_slot` on the SAME
         // thread), so the engine's serialized bytes are unused — return a zeroed
         // snapshot the engine drops. The vCPU handle is left stale until the wake.
-        self.state.reclaim_park(&mut vcpu.0)?;
+        self.state.reclaim_park(&mut vcpu.inner)?;
         Ok(zeroed_snapshot())
     }
 
@@ -550,7 +567,7 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         &mut self,
         vcpu: &mut Self::Vcpu,
     ) -> Result<Aarch64VcpuSnapshot, TrapError> {
-        self.state.shared_wait_park(&mut vcpu.0)?;
+        self.state.shared_wait_park(&mut vcpu.inner)?;
         Ok(zeroed_snapshot())
     }
 
@@ -564,7 +581,8 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         // restore the parked state, writing the new vCPU back through `vcpu`. The
         // engine's `_snapshot` placeholder is ignored — HVF `take`s its own stashed
         // `reclaim_snapshot`. Slot id ignored (HVF recreates its OWN vCPU; no pool).
-        self.state.reclaim_resume(&mut vcpu.0)
+        self.state
+            .reclaim_resume(&mut vcpu.inner, &mut vcpu.mailbox)
     }
 
     fn rebind_shared_wait_state(
@@ -573,8 +591,11 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         _snapshot: &Aarch64VcpuSnapshot,
         vcpu: &mut Self::Vcpu,
     ) -> Result<(), TrapError> {
-        self.state
-            .shared_wait_resume(&mut vcpu.0, /*replay_alias_union=*/ false)
+        self.state.shared_wait_resume(
+            &mut vcpu.inner,
+            &mut vcpu.mailbox,
+            /*replay_alias_union=*/ false,
+        )
     }
 
     fn rebind_shared_wait_state_mt(
@@ -588,8 +609,11 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         // a high-VA alias a still-parked sibling mapped would otherwise be
         // missing from the rebuilt VM's stage-2 (same shape as the fork
         // rebuild's sibling-union replay).
-        self.state
-            .shared_wait_resume(&mut vcpu.0, /*replay_alias_union=*/ true)
+        self.state.shared_wait_resume(
+            &mut vcpu.inner,
+            &mut vcpu.mailbox,
+            /*replay_alias_union=*/ true,
+        )
     }
 
     fn release_vm_after_reclaim_park(&mut self) -> Result<bool, TrapError> {
@@ -620,12 +644,12 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         // mirror the inherited (UNOWNED) mapping metadata. Returns the (Vmm, vCPU)
         // pair; the engine restores the seeded snapshot via `restore_thread_start`
         // (HVF's EL0-trampoline thread-start for a brand-new vCPU).
-        let (state, vcpu) = HvfVmState::from_thread_spec(builder)?;
-        Ok((Self { state }, HvfAarch64Vcpu::new(vcpu)))
+        let (state, vcpu, mailbox) = HvfVmState::from_thread_spec(builder)?;
+        Ok((Self { state }, HvfAarch64Vcpu::new(vcpu, mailbox)))
     }
 
     fn set_guest_sp(&self, vcpu: &Self::Vcpu, sp: u64) -> Result<(), TrapError> {
-        vcpu.0
+        vcpu.inner
             .set_sys_reg(applevisor::vcpu::SysReg::SP_EL0, sp)
             .map_err(|e| TrapError::Hypervisor(e.to_string()))
     }
@@ -637,7 +661,7 @@ impl Aarch64Vmm for HvfAarch64Vmm {
     // ── multithreaded-fork sibling lifecycle ──
 
     fn release_vcpu_for_fork(&mut self, vcpu: &mut Self::Vcpu) -> Result<(), TrapError> {
-        self.state.release_vcpu_for_fork(&mut vcpu.0)
+        self.state.release_vcpu_for_fork(&mut vcpu.inner)
     }
 
     fn publish_vm_for_siblings(&self) -> Result<(), TrapError> {
@@ -646,11 +670,12 @@ impl Aarch64Vmm for HvfAarch64Vmm {
     }
 
     fn rebuild_vcpu_after_fork(&mut self, vcpu: &mut Self::Vcpu) -> Result<(), TrapError> {
-        self.state.rebuild_vcpu_after_fork(&mut vcpu.0)
+        self.state
+            .rebuild_vcpu_after_fork(&mut vcpu.inner, &mut vcpu.mailbox)
     }
 
     fn destroy_vcpu_on_thread_exit(&mut self, vcpu: &mut Self::Vcpu) {
-        self.state.destroy_vcpu_on_thread_exit(&mut vcpu.0);
+        self.state.destroy_vcpu_on_thread_exit(&mut vcpu.inner);
     }
 
     fn fpsimd_enabled(&self) -> bool {
