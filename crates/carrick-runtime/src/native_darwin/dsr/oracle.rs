@@ -302,6 +302,8 @@ fn biased_recovery_matrix_routes_every_offset_through_finish_exit() {
         };
         assert!(recovery_count > 0, "shape={shape:?}");
 
+        let mut skipped_invalid_publication = false;
+        let mut skipped_invalid_tag = false;
         for point_index in 0..recovery_count {
             let mut fixture = biased_translator_fixture(&shape.words(), guest_code);
             let mut stack = vec![0_u8; 16 * 1024];
@@ -318,6 +320,8 @@ fn biased_recovery_matrix_routes_every_offset_through_finish_exit() {
                 .get(point_index)
                 .copied()
                 .expect("matrix recovery point");
+            let original_word =
+                unsafe { std::ptr::read_unaligned(cache_pc.host().raw() as *const u32) };
             fixture
                 .translator
                 .patch_recovery_word_for_test(cache_pc, 0xf940_0369)
@@ -338,7 +342,21 @@ fn biased_recovery_matrix_routes_every_offset_through_finish_exit() {
                 ..
             } = fault_exit
             else {
-                panic!("shape={shape:?} point={point_index} expected fault, got {fault_exit:?}");
+                assert!(
+                    matches!(fault_exit, super::types::NativeDsrExit::Syscall { .. }),
+                    "shape={shape:?} point={point_index} expected fault or an audited skipped invalid-path instruction, got {fault_exit:?}"
+                );
+                let publication_store = 0xf900_0000 | ((1200 / 8) << 10) | (28 << 5);
+                if original_word & !0x1f == publication_store {
+                    skipped_invalid_publication = true;
+                } else if original_word & !0x3ff == 0xb251_0000 {
+                    skipped_invalid_tag = true;
+                } else {
+                    panic!(
+                        "shape={shape:?} point={point_index} unexpectedly skipped word 0x{original_word:08x}"
+                    );
+                }
+                continue;
             };
             let kick = super::PreparedExit {
                 exit: super::types::NativeDsrExit::Kick {
@@ -407,6 +425,15 @@ fn biased_recovery_matrix_routes_every_offset_through_finish_exit() {
                 );
             }
         }
+        let has_checked_nonliteral_address = !matches!(shape, BiasedRecoveryMatrixShape::Literal);
+        assert_eq!(
+            skipped_invalid_publication, has_checked_nonliteral_address,
+            "shape={shape:?} invalid-address publication path"
+        );
+        assert_eq!(
+            skipped_invalid_tag, has_checked_nonliteral_address,
+            "shape={shape:?} invalid-host tagging path"
+        );
     }
 }
 
@@ -417,7 +444,9 @@ fn biased_store_exclusive_preamble_retries_and_block_entry_fails_spuriously() {
         0
     );
     let guest_code = GuestVa(0x20_0080_0000);
-    for point_index in 0..3 {
+    // Every instruction except the invalid-only host-address tag executes for
+    // this in-range reservation. Fault each executable point in isolation.
+    for point_index in [0_usize, 1, 2, 3, 4, 8] {
         let mut fixture = biased_translator_fixture(
             &[0xc85f_7c20, 0x9100_0400, 0xc802_7c20, 0xd400_0001],
             guest_code,
@@ -435,7 +464,7 @@ fn biased_store_exclusive_preamble_retries_and_block_entry_fails_spuriously() {
             .expect("prepare store-exclusive preamble");
         let stxr_guest = GuestVa(guest_code.raw() + 8);
         let points = fixture.translator.instruction_points_for_test(stxr_guest);
-        assert_eq!(points.len(), 3, "store-exclusive preamble width");
+        assert_eq!(points.len(), 9, "store-exclusive preamble width");
         fixture
             .translator
             .patch_instruction_word_for_test(points[point_index], 0xf940_0369)
@@ -576,6 +605,7 @@ fn biased_memory_families_access_guest_data() {
                     word,
                     op: bad64::decode(word, 0x4000).expect("decode fixture").op(),
                     base: MemoryBase::Register(base_register),
+                    effective_address: super::types::MemoryEffectiveAddress::Base,
                     writeback: MemoryWriteback::None,
                     class,
                     virtualization: MemoryVirtualization::None,
@@ -593,8 +623,10 @@ fn biased_memory_families_access_guest_data() {
         snapshot.x[1] = guest;
         snapshot.x[2] = guest;
         snapshot.x[0] = 1;
+        snapshot.pstate = 0x6000_0000;
         let expected_x16 = snapshot.x[16];
         let expected_x17 = snapshot.x[17];
+        let expected_pstate = snapshot.pstate;
         let mut exit = NativeDsrExit::Syscall {
             resume: GuestVa(0x4008),
         };
@@ -607,6 +639,7 @@ fn biased_memory_families_access_guest_data() {
         .expect("execute biased fixture");
         assert_eq!(snapshot.x[16], expected_x16, "word=0x{word:08x}");
         assert_eq!(snapshot.x[17], expected_x17, "word=0x{word:08x}");
+        assert_eq!(snapshot.pstate, expected_pstate, "word=0x{word:08x}");
         match class {
             MemoryClass::Pair => {
                 assert_eq!(snapshot.x[0], words[0]);
@@ -623,6 +656,71 @@ fn biased_memory_families_access_guest_data() {
             _ => assert_eq!(snapshot.x[0], words[0]),
         }
     }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn biased_memory_preserves_nzcv_for_the_following_conditional_instruction() {
+    const BIAS: u64 = 0x80_0000_0000;
+    const GUEST: u64 = 0x6_0000_0000;
+    let host_bias = crate::native_darwin::address::NativeHostBias::new(BIAS, 16 * 1024)
+        .expect("construct host bias");
+    let mapping = crate::native_darwin::address::OwnedHostMapping::map_exact(
+        HostVa((BIAS + GUEST) as usize),
+        16 * 1024,
+        libc::PROT_READ | libc::PROT_WRITE,
+        libc::MAP_ANON | libc::MAP_PRIVATE,
+    )
+    .expect("map NZCV oracle data");
+    unsafe { *(mapping.range().start.raw() as *mut u64) = 0x1122_3344_5566_7788 };
+    let words = [
+        0xf940_0020, // ldr x0, [x1]
+        0x9a84_0062, // csel x2, x3, x4, eq
+    ];
+    let plan = BlockPlan {
+        start: GuestVa(0x5000),
+        end: GuestVa(0x500c),
+        generation: CodeGeneration::INITIAL,
+        instructions: words
+            .into_iter()
+            .enumerate()
+            .map(|(index, word)| PlannedInst {
+                guest: GuestVa(0x5000 + index as u64 * 4),
+                action: super::decode::classify(word, GuestVa(0x5000 + index as u64 * 4))
+                    .expect("classify NZCV oracle word"),
+            })
+            .collect(),
+        exit: PlannedExit::Syscall {
+            guest: GuestVa(0x5008),
+            resume: GuestVa(0x500c),
+        },
+    };
+    let mut cache = TranslationCache::new(16 * 1024).expect("allocate NZCV oracle cache");
+    let emitted = emit_block(
+        &mut cache,
+        &plan,
+        super::emit::EmitAddressMode::Biased { host_bias },
+    )
+    .expect("emit NZCV oracle");
+    let mut stack = vec![0_u8; 16 * 1024];
+    let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    snapshot.x[1] = GUEST;
+    snapshot.x[3] = 0x1111;
+    snapshot.x[4] = 0x2222;
+    snapshot.pstate = 0x4000_0000; // Z=1: EQ must select x3.
+    let mut exit = NativeDsrExit::Syscall {
+        resume: GuestVa(0x500c),
+    };
+    super::gateway::enter_translated_in_mode(
+        emitted.entry(),
+        &mut snapshot,
+        &mut exit,
+        crate::native_darwin::address::NativeAddressMode::Biased { host_bias },
+    )
+    .expect("execute NZCV oracle");
+    assert_eq!(snapshot.x[0], 0x1122_3344_5566_7788);
+    assert_eq!(snapshot.x[2], 0x1111, "CSEL observed clobbered guest NZCV");
+    assert_eq!(snapshot.pstate, 0x4000_0000);
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -939,6 +1037,7 @@ fn biased_literal_load_commits_virtual_x18() {
                 word,
                 op: bad64::Op::LDR,
                 base: MemoryBase::Literal(GuestVa(GUEST)),
+                effective_address: super::types::MemoryEffectiveAddress::Base,
                 writeback: MemoryWriteback::None,
                 class: MemoryClass::Literal,
                 virtualization: MemoryVirtualization::None,
@@ -2465,6 +2564,7 @@ fn dsr_signal_fault_reconstructs_copied_instruction_pc() {
         indirect_x30_scratch: 0,
         physical_x18: 0,
         gateway_phase: 0,
+        biased_guest_fault_address: 0,
     };
     enter_translated(emitted.entry(), &mut snapshot, &mut exit).expect("capture DSR fault");
     let NativeDsrExit::Fault {
@@ -2531,6 +2631,7 @@ fn dsr_signal_fault_recovers_context_when_physical_x28_is_zero() {
         indirect_x30_scratch: 0,
         physical_x18: 0,
         gateway_phase: 0,
+        biased_guest_fault_address: 0,
     };
 
     enter_translated(emitted.entry(), &mut snapshot, &mut exit)
@@ -2998,6 +3099,7 @@ fn dsr_signal_fault_recovers_scratch_in_expanded_x18_load() {
         indirect_x30_scratch: 0,
         physical_x18: 0,
         gateway_phase: 0,
+        biased_guest_fault_address: 0,
     };
     enter_translated(emitted.entry(), &mut snapshot, &mut exit)
         .expect("capture expanded x18 fault");
@@ -3086,6 +3188,7 @@ fn dsr_signal_fault_preserves_destination_in_expanded_literal_load() {
         indirect_x30_scratch: 0,
         physical_x18: 0,
         gateway_phase: 0,
+        biased_guest_fault_address: 0,
     };
     enter_translated(emitted.entry(), &mut snapshot, &mut exit)
         .expect("capture expanded literal fault");

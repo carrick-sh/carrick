@@ -104,6 +104,8 @@ struct DsrContext {
     cache_start: u64,
     cache_end: u64,
     host_bias: u64,
+    biased_guest_fault_address: u64,
+    biased_fault_pad: u64,
 }
 
 impl DsrContext {
@@ -174,6 +176,8 @@ impl DsrContext {
             cache_start: cache_start as u64,
             cache_end: cache_end as u64,
             host_bias: address_mode.bias(),
+            biased_guest_fault_address: 0,
+            biased_fault_pad: 0,
         }
     }
 }
@@ -200,7 +204,8 @@ const _: () = assert!(std::mem::offset_of!(DsrContext, indirect_x30_scratch) == 
 const _: () = assert!(std::mem::offset_of!(DsrContext, cache_start) == 1176);
 const _: () = assert!(std::mem::offset_of!(DsrContext, cache_end) == 1184);
 const _: () = assert!(std::mem::offset_of!(DsrContext, host_bias) == 1192);
-const _: () = assert!(std::mem::size_of::<DsrContext>() == 1200);
+const _: () = assert!(std::mem::offset_of!(DsrContext, biased_guest_fault_address) == 1200);
+const _: () = assert!(std::mem::size_of::<DsrContext>() == 1216);
 const _: () = assert!(std::mem::size_of::<IndirectTargetCacheEntry>() == 32);
 const _: () = assert!(std::mem::offset_of!(IndirectTargetCacheEntry, guest) == 0);
 const _: () = assert!(std::mem::offset_of!(IndirectTargetCacheEntry, generation) == 8);
@@ -339,7 +344,11 @@ mod indirect_cache_tests {
     fn dsr_context_appends_host_bias_without_shifting_gateway_fields() {
         assert_eq!(std::mem::offset_of!(DsrContext, cache_end), 1184);
         assert_eq!(std::mem::offset_of!(DsrContext, host_bias), 1192);
-        assert_eq!(std::mem::size_of::<DsrContext>(), 1200);
+        assert_eq!(
+            std::mem::offset_of!(DsrContext, biased_guest_fault_address),
+            1200
+        );
+        assert_eq!(std::mem::size_of::<DsrContext>(), 1216);
     }
 }
 
@@ -421,6 +430,7 @@ fn enter_translated_raw(
             indirect_x30_scratch: context.indirect_x30_scratch,
             physical_x18: context.exit_link,
             gateway_phase: context.exit_has_link,
+            biased_guest_fault_address: context.biased_guest_fault_address,
         },
         5 => NativeDsrExit::Kick {
             resume: carrick_guest_mem::GuestVa(context.exit_target),

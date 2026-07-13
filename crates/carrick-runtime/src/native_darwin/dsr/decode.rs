@@ -5,8 +5,8 @@ use carrick_guest_mem::GuestVa;
 
 use super::types::{
     DirectExit, DirectKind, DsrError, IndirectExit, IndirectKind, InstAction, MemoryAccess,
-    MemoryBase, MemoryClass, MemoryVirtualization, MemoryWriteback, PcRelativeInst, PcRelativeKind,
-    SensitiveExit, SensitiveKind,
+    MemoryBase, MemoryClass, MemoryEffectiveAddress, MemoryIndexExtend, MemoryVirtualization,
+    MemoryWriteback, PcRelativeInst, PcRelativeKind, SensitiveExit, SensitiveKind,
 };
 
 fn resume_pc(pc: GuestVa) -> Result<GuestVa, DsrError> {
@@ -145,6 +145,42 @@ fn base_register(operands: &[Operand]) -> Option<(Reg, MemoryWriteback)> {
         Operand::MemPreIdx { reg, .. } => Some((*reg, MemoryWriteback::PreIndex)),
         Operand::MemPostIdxImm { reg, .. } => Some((*reg, MemoryWriteback::PostIndex)),
         Operand::MemPostIdxReg(regs) => Some((regs[0], MemoryWriteback::PostIndex)),
+        _ => None,
+    })
+}
+
+fn signed_immediate(imm: Imm) -> Option<i64> {
+    match imm {
+        Imm::Signed(value) => Some(value),
+        Imm::Unsigned(value) => i64::try_from(value).ok(),
+    }
+}
+
+fn memory_effective_address(operands: &[Operand]) -> Option<MemoryEffectiveAddress> {
+    operands.iter().find_map(|operand| match operand {
+        Operand::MemReg(_) | Operand::MemPostIdxImm { .. } | Operand::MemPostIdxReg(_) => {
+            Some(MemoryEffectiveAddress::Base)
+        }
+        Operand::MemOffset { offset, .. } => {
+            signed_immediate(*offset).map(MemoryEffectiveAddress::Immediate)
+        }
+        Operand::MemPreIdx { imm, .. } => {
+            signed_immediate(*imm).map(MemoryEffectiveAddress::Immediate)
+        }
+        Operand::MemExt { shift, .. } => {
+            let (extend, amount) = match shift.unwrap_or(bad64::Shift::UXTX(0)) {
+                bad64::Shift::UXTW(amount) => (MemoryIndexExtend::Uxtw, amount),
+                bad64::Shift::SXTW(amount) => (MemoryIndexExtend::Sxtw, amount),
+                bad64::Shift::UXTX(amount) | bad64::Shift::LSL(amount) => {
+                    (MemoryIndexExtend::Uxtx, amount)
+                }
+                bad64::Shift::SXTX(amount) => (MemoryIndexExtend::Sxtx, amount),
+                _ => return None,
+            };
+            u8::try_from(amount)
+                .ok()
+                .map(|shift| MemoryEffectiveAddress::RegisterOffset { extend, shift })
+        }
         _ => None,
     })
 }
@@ -547,6 +583,11 @@ fn classify_memory(
         None => return Ok(None),
     };
     let base = memory_base(pc, word, op, operands)?;
+    let effective_address = if matches!(base, MemoryBase::Literal(_)) {
+        MemoryEffectiveAddress::Base
+    } else {
+        memory_effective_address(operands).ok_or_else(|| malformed(pc, word, op))?
+    };
     let writeback = base_register(operands)
         .map(|(_, writeback)| writeback)
         .unwrap_or(MemoryWriteback::None);
@@ -554,6 +595,7 @@ fn classify_memory(
         word,
         op,
         base,
+        effective_address,
         writeback,
         class,
         virtualization: MemoryVirtualization::None,

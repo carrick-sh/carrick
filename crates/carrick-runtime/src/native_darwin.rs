@@ -1069,9 +1069,9 @@ enum NativeForkTokenFlow {
 enum NativeForkFlow {
     /// Resume the caller at the instruction after the fork-like syscall.
     ///
-    /// `fork_child` selects the detached-context transport for the historical
-    /// brk executor.  DSR owns an explicit snapshot instead and uses the same
-    /// bit to repair process-cache state inherited from the parent.
+    /// DSR owns an explicit snapshot. `fork_child` records that the snapshot
+    /// resumed in a host-fork child so process-cache and publication state can
+    /// be repaired before translated execution continues.
     Resume {
         value: i64,
         fork_child: bool,
@@ -1176,10 +1176,11 @@ fn run_native_dsr_thread_loop(
         if traps > max_traps {
             return Err(RuntimeError::TrapLimitExceeded { max_traps });
         }
-        // Match the brk executor's lock-free dispatch boundary. A kick out of
-        // translated code returns here, where fork may park this thread and a
-        // successful execve by another thread must retire it before it can
-        // re-enter the old image.
+        // A kick out of DSR-translated code returns to this lock-free dispatch
+        // boundary. Fork may park the thread here, and a successful execve by
+        // another thread must retire it before it can re-enter the old image.
+        // The placement descends from the removed direct executor, but DSR is
+        // the only native instruction engine now.
         if crate::fork_quiesce::exec_replacing_other_thread(thread_runtime.tid()) {
             if thread_runtime.finish_thread(&dispatcher, &memory) {
                 return Ok(NativeThreadLoopOutcome::ProcessExit(0));
@@ -3469,10 +3470,11 @@ fn handle_native_fork(
                     .to_string(),
             ));
         }
-        // Direct-execution W^X boundary (311fae9e), kept narrow and explicit.
-        // DSR never executes original bytes and carries generation state across
-        // fork, so its quiesced process copy is safe; brk mode still rejects a
-        // potentially torn patch/protection state machine.
+        // Historical direct-execution W^X boundary (311fae9e), retained as an
+        // explicit lifecycle hook. DSR never executes original bytes, carries
+        // generation state across fork, and currently returns false here, so
+        // native DSR does not reject this lifecycle on that removed executor's
+        // patch/protection concern.
         if memory.lock().write_exec_blocks_multithreaded_lifecycle() {
             barrier.end_fork();
             return Err(RuntimeError::Unsupported(
@@ -5368,13 +5370,15 @@ impl NativeMappedMemory {
         &self,
         address: carrick_guest_mem::HostVa,
     ) -> Option<carrick_guest_mem::GuestVa> {
-        if matches!(self.address_mode, NativeAddressMode::Biased { .. })
-            && !self
+        if matches!(self.address_mode, NativeAddressMode::Biased { .. }) {
+            if !self
                 .owned_host_ranges
                 .iter()
                 .any(|range| address >= range.start && address < range.end)
-        {
-            return None;
+            {
+                return None;
+            }
+            return self.address_mode.to_guest(address).ok();
         }
         let guest = self.address_mode.to_guest(address).ok()?;
         self.region_contains(guest.raw(), 1).then_some(guest)
@@ -5871,10 +5875,11 @@ impl NativeMappedMemory {
         image: &AddressSpace,
         plan: &ExecutionPlan,
     ) -> Result<PreparedNativeExecMapping, RuntimeError> {
-        let native_layout = NativeLayout::for_image(
+        let native_layout = NativeLayout::for_exec(
             image,
             native_memory_layout(),
             plan.page_geometry.host_page_size,
+            &self.owned_host_ranges,
         )
         .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
         let target_only = if matches!(native_layout.address_mode(), NativeAddressMode::Direct) {
@@ -5951,15 +5956,8 @@ impl NativeMappedMemory {
                     .to_string(),
             ));
         }
-        let retained_direct_ranges = if matches!(
-            prepared.native_layout.address_mode(),
-            NativeAddressMode::Direct
-        ) {
-            prepared.native_layout.owned_ranges()
-        } else {
-            &[]
-        };
-        let retired_ranges = subtract_host_ranges(&self.owned_host_ranges, retained_direct_ranges);
+        let retained_target_ranges = prepared.native_layout.owned_ranges();
+        let retired_ranges = subtract_host_ranges(&self.owned_host_ranges, retained_target_ranges);
         for range in &retired_ranges {
             let start = range.start.raw();
             let end = range.end.raw();
@@ -5983,6 +5981,9 @@ impl NativeMappedMemory {
             reset_inherited_translator,
             direct_target_reservations,
         } = prepared;
+        native_layout
+            .reset_biased_aperture_to_guards()
+            .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
         let inherited_translator =
             reset_inherited_translator.then(|| Arc::clone(&process_translator));
         let replacement = Self::map_with_layout(
@@ -8157,6 +8158,31 @@ mod tests {
     }
 
     #[test]
+    fn biased_owned_guard_gap_lowers_without_accepting_arbitrary_host_memory() {
+        let mut memory = biased_test_memory(carrick_guest_mem::GuestVa(0x40_0000), 0x4000);
+        let mapped = memory.owned_host_ranges[0].clone();
+        let host_bias = memory
+            .address_mode()
+            .to_host(carrick_guest_mem::GuestVa(0))
+            .expect("translate guest null");
+        memory.owned_host_ranges = vec![host_bias..mapped.end];
+
+        assert_eq!(
+            lower_dsr_fault_address(&memory, dsr::ThreadFaultAddress::Host(host_bias),)
+                .expect("lower owned guard fault"),
+            carrick_guest_mem::GuestVa(0)
+        );
+        let arbitrary = carrick_guest_mem::HostVa((&memory as *const _) as usize);
+        assert!(
+            lower_dsr_fault_address(&memory, dsr::ThreadFaultAddress::Host(arbitrary),).is_err()
+        );
+        assert_eq!(
+            unsafe { libc::munmap(mapped.start.raw() as *mut libc::c_void, 0x4000) },
+            0
+        );
+    }
+
+    #[test]
     fn biased_memory_preserves_synthetic_guest_brk_address() {
         let memory = biased_test_memory(carrick_guest_mem::GuestVa(0x40_0000), 0x4000);
         let guest_pc = carrick_guest_mem::GuestVa(0x40_0080);
@@ -8303,6 +8329,154 @@ mod tests {
         assert_eq!(result.exit_code, 0, "stderr={:?}", result.stderr);
     }
 
+    #[test]
+    fn low_et_exec_null_dereference_delivers_zero_si_addr() {
+        const GUEST_BASE: u64 = 0x40_0000;
+        const ACTION_OFFSET: usize = 0x80;
+        const HANDLER_OFFSET: usize = 12 * 4;
+        let words = [
+            0xd280_0160, // mov x0, #11 (SIGSEGV)
+            0xd280_1001, // mov x1, #0x80
+            0xf2a0_0801, // movk x1, #0x40, lsl #16 (0x400080)
+            0xd280_0002, // mov x2, #0
+            0xd280_0103, // mov x3, #8
+            0xd280_10c8, // mov x8, #134 (rt_sigaction)
+            SVC_0,
+            0xd280_0000, // mov x0, #0
+            0xf940_0001, // ldr x1, [x0] (fault at guest address zero)
+            0xd280_0c60, // mov x0, #99 (unreachable)
+            0xd280_0ba8, // mov x8, #93 (exit)
+            SVC_0,
+            0xf940_0820, // handler: ldr x0, [x1, #16] (siginfo.si_addr)
+            0xf100_001f, // cmp x0, #0
+            0x9a9f_07e0, // cset x0, ne
+            0xd280_0ba8, // mov x8, #93 (exit)
+            SVC_0,
+        ];
+        let mut elf = dsr_et_exec_test_elf_at(&words, GUEST_BASE);
+        let segment_offset = 0x1000;
+        elf.resize(segment_offset + ACTION_OFFSET + 32, 0);
+        let action = segment_offset + ACTION_OFFSET;
+        elf[action..action + 8]
+            .copy_from_slice(&(GUEST_BASE + HANDLER_OFFSET as u64).to_le_bytes());
+        elf[action + 8..action + 16]
+            .copy_from_slice(&crate::linux_abi::LINUX_SA_SIGINFO.to_le_bytes());
+        write_u64(&mut elf, 96, (ACTION_OFFSET + 32) as u64);
+        write_u64(&mut elf, 104, (ACTION_OFFSET + 32) as u64);
+
+        let mut file = tempfile::NamedTempFile::new().expect("create null-fault ET_EXEC fixture");
+        std::io::Write::write_all(&mut file, &elf).expect("write null-fault ET_EXEC fixture");
+        let result = run_static_elf(
+            file.path(),
+            SyscallDispatcher::new(),
+            ["low-et-exec-null-fault".to_string()],
+            std::iter::empty::<String>(),
+            32,
+            None,
+            &native16k_test_plan(),
+        )
+        .expect("null dereference must reach Linux signal delivery");
+        assert_eq!(
+            result.exit_code,
+            0,
+            "SA_SIGINFO handler observed nonzero si_addr or gateway stopped early: stderr={}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+
+    #[test]
+    fn biased_guest_ceiling_is_exclusive_without_rejecting_its_last_byte() {
+        for (name, words, expected_exit) in [
+            (
+                "ceiling-last",
+                vec![
+                    0xd29f_ffe0, // movz x0, #0xffff
+                    0xf2bf_ffc0, // movk x0, #0xfffe, lsl #16
+                    0xf2c0_1fe0, // movk x0, #0xff, lsl #32 (ceiling - 1)
+                    0x3940_0000, // ldrb w0, [x0]
+                    0xd280_0000, // mov x0, #0
+                    0xd280_0ba8, // mov x8, #93
+                    SVC_0,
+                ],
+                0,
+            ),
+            (
+                "ceiling",
+                vec![
+                    0xd2bf_ffe0, // movz x0, #0xffff, lsl #16
+                    0xf2c0_1fe0, // movk x0, #0xff, lsl #32 (ceiling)
+                    0x3940_0000, // ldrb w0, [x0]
+                    0xd280_0ba8, // mov x8, #93
+                    SVC_0,
+                ],
+                128 + crate::linux_abi::LINUX_SIGSEGV,
+            ),
+        ] {
+            let mut file = tempfile::NamedTempFile::new().expect("create ceiling fixture");
+            std::io::Write::write_all(&mut file, &dsr_low_et_exec_test_elf(&words))
+                .expect("write ceiling fixture");
+            let result = run_static_elf(
+                file.path(),
+                SyscallDispatcher::new(),
+                [name.to_string()],
+                std::iter::empty::<String>(),
+                32,
+                None,
+                &native16k_test_plan(),
+            )
+            .expect("collect biased ceiling result");
+            assert_eq!(
+                result.exit_code,
+                expected_exit,
+                "{name}: stderr={}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+    }
+
+    #[test]
+    fn biased_address_above_ceiling_cannot_alias_an_outside_host_sentinel() {
+        const OUTSIDE_GUEST: u64 = carrick_mem::memory::LINUX_STACK_TOP + 0x20_0000;
+        let outside_host = carrick_guest_mem::HostVa((0x80_0000_0000 + OUTSIDE_GUEST) as usize);
+        let sentinel = address::OwnedHostMapping::map_exact(
+            outside_host,
+            0x4000,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANON,
+        )
+        .expect("map outside-host sentinel");
+        unsafe { std::ptr::write_bytes(outside_host.raw() as *mut u8, 0x5a, 0x4000) };
+        let words = [
+            0xd280_0000, // movz x0, #0
+            0xf2a0_03e0, // movk x0, #0x1f, lsl #16
+            0xf2c0_2000, // movk x0, #0x100, lsl #32 (ceiling + 2 MiB)
+            0x3940_0000, // ldrb w0, [x0]
+            0xd280_0ba8, // mov x8, #93
+            SVC_0,
+        ];
+        let mut file = tempfile::NamedTempFile::new().expect("create outside-aperture fixture");
+        std::io::Write::write_all(&mut file, &dsr_low_et_exec_test_elf(&words))
+            .expect("write outside-aperture fixture");
+        let result = run_static_elf(
+            file.path(),
+            SyscallDispatcher::new(),
+            ["outside-aperture".to_string()],
+            std::iter::empty::<String>(),
+            32,
+            None,
+            &native16k_test_plan(),
+        )
+        .expect("collect outside-aperture result");
+        assert_eq!(
+            result.exit_code,
+            128 + crate::linux_abi::LINUX_SIGSEGV,
+            "outside guest address aliased sentinel: stderr={}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(unsafe { *(outside_host.raw() as *const u8) }, 0x5a);
+        drop(sentinel);
+    }
+
     #[derive(Clone, Copy, Debug)]
     enum LifecycleImageKind {
         DirectPie,
@@ -8407,19 +8581,6 @@ mod tests {
 
             let source_guest_base = 0x40_0000;
             let target_base = address::BIAS_CANDIDATES[0] + source_guest_base;
-            let blockers: Vec<_> = address::BIAS_CANDIDATES
-                .into_iter()
-                .skip(1)
-                .map(|bias| {
-                    address::OwnedHostMapping::map_exact(
-                        carrick_guest_mem::HostVa((bias + source_guest_base) as usize),
-                        16 * 1024,
-                        libc::PROT_NONE,
-                        libc::MAP_ANON | libc::MAP_PRIVATE,
-                    )
-                    .expect("block alternate source bias")
-                })
-                .collect();
             let mut target = tempfile::NamedTempFile::new().expect("create high Direct target");
             std::io::Write::write_all(&mut target, &exec_target_pc_elf_at(target_base))
                 .expect("write high Direct target");
@@ -8451,7 +8612,6 @@ mod tests {
                 target_base,
                 "high Direct target must execute at the biased source's prior host-owned page"
             );
-            drop(blockers);
         });
     }
 
@@ -8787,9 +8947,9 @@ mod tests {
             if matches!(source, LifecycleImageKind::LowExec)
                 && matches!(target, LifecycleImageKind::LowExec)
             {
-                assert_ne!(
+                assert_eq!(
                     source_mode, prepared_mode,
-                    "biased->biased must reserve a different still-free bias"
+                    "biased->biased must transfer the collision-probed aperture"
                 );
             }
 
@@ -8859,26 +9019,38 @@ mod tests {
             )
             .expect("map old biased image");
             let old_mode = memory.address_mode();
-            let old_bias = old_mode.bias();
             let guest_start = image.regions()[0].start;
-            let blockers: Vec<_> = address::BIAS_CANDIDATES
-                .into_iter()
-                .filter(|bias| *bias != old_bias)
-                .map(|bias| {
-                    address::OwnedHostMapping::map_exact(
-                        carrick_guest_mem::HostVa((bias + guest_start) as usize),
+            let invalid_target = AddressSpace::from_segments(
+                guest_start,
+                [
+                    (
+                        guest_start,
+                        carrick_mem::elf::SegmentPerms {
+                            read: true,
+                            write: false,
+                            execute: true,
+                        },
+                        vec![0x71; 16 * 1024],
                         16 * 1024,
-                        libc::PROT_NONE,
-                        libc::MAP_ANON | libc::MAP_PRIVATE,
-                    )
-                    .expect("block alternate bias")
-                })
-                .collect();
+                    ),
+                    (
+                        address::BIASED_GUEST_APERTURE_END,
+                        carrick_mem::elf::SegmentPerms {
+                            read: true,
+                            write: false,
+                            execute: false,
+                        },
+                        vec![0x72; 16 * 1024],
+                        16 * 1024,
+                    ),
+                ],
+            )
+            .expect("build target beyond biased ceiling");
 
             let error = memory
-                .prepare_exec_mapping(&image, &plan)
+                .prepare_exec_mapping(&invalid_target, &plan)
                 .err()
-                .expect("all bias candidates must be unavailable");
+                .expect("target beyond biased ceiling must fail before retirement");
             assert!(
                 error
                     .to_string()
@@ -8891,7 +9063,6 @@ mod tests {
                     .expect("old image remains mapped"),
                 [0x4d]
             );
-            drop(blockers);
         });
     }
 
@@ -8962,9 +9133,12 @@ mod tests {
                     .prepare_exec_mapping(&target, &plan)
                     .expect("prepare fork-child replacement without allocating a translator");
                 let prepared_mode = prepared.native_layout.address_mode();
+                // The inherited Carrick-owned aperture is reusable authority;
+                // a biased replacement keeps its bias instead of probing a
+                // different candidate after fork.
                 let reused = prepared.reset_inherited_translator
                     && Arc::ptr_eq(&prepared.process_translator, &inherited_process)
-                    && prepared_mode != parent_mode;
+                    && prepared_mode == parent_mode;
                 if !reused {
                     unsafe { libc::_exit(2) };
                 }
