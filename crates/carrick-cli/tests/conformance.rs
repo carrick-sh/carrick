@@ -3790,6 +3790,33 @@ fn native_conformance_dsr_vfork_exec_from_sibling_completes() {
 
 #[test]
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn native_conformance_dsr_fork_exec_can_create_thread() {
+    let _serial = CONFORMANCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let Some(bin) = carrick_bin() else {
+        eprintln!(
+            "SKIP native_conformance_dsr_fork_exec_can_create_thread: \
+             target/release/carrick not built"
+        );
+        return;
+    };
+    ensure_signed(&bin);
+    let probe = ensure_native_static_pie_probe("forkexecpthread");
+    let output = run_native_run_elf_with_args(&bin, &probe, "native16k", &[]);
+    assert!(
+        output.contains("status=exit status: 0")
+            && output.contains("fork_exec_stage2_reached=true")
+            && output.contains("post_exec_pthread_create_ok=true")
+            && output.contains("post_exec_pthread_create_errno=0")
+            && output.contains("post_exec_worker_ran=true")
+            && output.contains("post_exec_pthread_join_ok=true")
+            && output.contains("parent_observed_child_success=true"),
+        "native16k DSR fork/exec replacement could not create a thread:\n{output}"
+    );
+}
+
+#[test]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn native_conformance_run_elf_supports_sysv_message_wakes() {
     let _serial = CONFORMANCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 

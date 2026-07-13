@@ -2992,8 +2992,17 @@ fn dispatch_native_syscall(
     }
 }
 
+fn native_unsafe_postfork_threads_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value == Some(std::ffi::OsStr::new("1"))
+}
+
 fn native_clone_thread_rejection(memory: &SharedNativeMemory) -> Option<&'static str> {
-    if NATIVE_FORKED_GUEST_CHILD.load(std::sync::atomic::Ordering::Acquire) {
+    let unsafe_postfork_threads = native_unsafe_postfork_threads_enabled(
+        std::env::var_os("CARRICK_NATIVE_UNSAFE_POSTFORK_THREADS").as_deref(),
+    );
+    if NATIVE_FORKED_GUEST_CHILD.load(std::sync::atomic::Ordering::Acquire)
+        && !unsafe_postfork_threads
+    {
         return Some(
             "native Darwin cannot create guest threads in a fork child: emulated execve cannot reset the host libdispatch post-fork state",
         );
@@ -9854,6 +9863,22 @@ mod tests {
             native_clone_child_context(parent, 0x4020, 0, None, 0x7777);
         assert_eq!(inherited_stack.sp, 0x7000);
         assert_eq!(inherited_tls, 0x7777);
+    }
+
+    #[test]
+    fn native_unsafe_postfork_threads_requires_exact_one() {
+        use std::ffi::OsStr;
+
+        assert!(!native_unsafe_postfork_threads_enabled(None));
+        for value in ["", "0", "true", "01", "yes"] {
+            assert!(
+                !native_unsafe_postfork_threads_enabled(Some(OsStr::new(value))),
+                "unexpectedly accepted {value:?}"
+            );
+        }
+        assert!(native_unsafe_postfork_threads_enabled(Some(OsStr::new(
+            "1"
+        ))));
     }
 
     #[test]
