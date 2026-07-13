@@ -129,6 +129,7 @@
 //! lowest-free-descriptor, capped at the guest's soft `RLIMIT_NOFILE`.
 
 use std::collections::{HashMap, VecDeque};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Component, Path};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -691,7 +692,7 @@ pub(crate) use epoll_shim::{
     new_epoll_wake_registry, notify_inmem_epoll, register_epoll_kqueue, unregister_epoll_kqueue,
 };
 pub(crate) use fifo_beacon::after_fork_child as reset_fifo_beacons_after_fork_child;
-mod fd_table;
+pub(crate) mod fd_table;
 mod fifo_beacon;
 mod ioring;
 #[macro_use]
@@ -2344,10 +2345,416 @@ impl SyscallDispatcher {
 
     /// Capsule version 1 initially carries only bare stdio. Reject every richer
     /// fd-table shape before host exec until typed descriptor snapshots land.
-    pub fn native_reexec_minimal_fd_state_eligible(&self) -> bool {
-        self.io.open_files.read().is_empty()
-            && *self.io.stdio_cloexec.lock() == [false; 3]
-            && *self.io.closed_stdio.lock() == [false; 3]
+    pub(crate) fn validate_native_reexec_fd_state(&self) -> Result<(), String> {
+        let stdio_cloexec = *self.io.stdio_cloexec.lock();
+        let closed_stdio = *self.io.closed_stdio.lock();
+        let table = self.io.open_files.read();
+        for fd in 0..=2 {
+            if !table.contains_key(&fd) && (stdio_cloexec[fd as usize] || closed_stdio[fd as usize])
+            {
+                return Err(format!(
+                    "unsupported bare stdio state: cloexec={stdio_cloexec:?} closed={closed_stdio:?}"
+                ));
+            }
+        }
+        drop(table);
+        self.snapshot_native_reexec_fd_table().map(|_| ())
+    }
+
+    pub(crate) fn native_reexec_fd_state_summary(&self) -> Vec<String> {
+        let table = self.io.open_files.read();
+        let mut summary = table
+            .iter()
+            .map(|(fd, open_file)| {
+                let description = open_file.description.read();
+                format!(
+                    "fd={fd} cloexec={} kind={}",
+                    open_file.fd_flags & crate::linux_abi::LINUX_FD_CLOEXEC != 0,
+                    description.reexec_kind_name()
+                )
+            })
+            .collect::<Vec<_>>();
+        summary.sort();
+        summary
+    }
+
+    pub(crate) fn snapshot_native_reexec_fd_table(&self) -> Result<NativeReexecFdTableV1, String> {
+        let mut entries = self
+            .io
+            .open_files
+            .read()
+            .iter()
+            .map(|(fd, open_file)| (*fd, open_file.clone()))
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|(fd, _)| *fd);
+
+        let mut description_ids = std::collections::HashMap::<usize, u32>::new();
+        let mut descriptions = Vec::new();
+        let mut files = Vec::new();
+        let mut close_on_exec_host_fds = Vec::new();
+        let mut survivor_host_fds = std::collections::HashSet::new();
+
+        for (_, open_file) in &entries {
+            if open_file.fd_flags & crate::linux_abi::LINUX_FD_CLOEXEC != 0
+                && let Some(host_fd) = open_file.description.read().reexec_host_fd()
+            {
+                close_on_exec_host_fds.push(host_fd);
+            }
+        }
+
+        for (guest_fd, open_file) in entries {
+            if open_file.fd_flags & crate::linux_abi::LINUX_FD_CLOEXEC != 0 {
+                continue;
+            }
+            let key = std::sync::Arc::as_ptr(&open_file.description) as usize;
+            let description_id = if let Some(id) = description_ids.get(&key) {
+                *id
+            } else {
+                let description = open_file.description.read();
+                let record = match &*description {
+                    OpenDescription::HostPipe {
+                        base,
+                        host_fd,
+                        is_read_end,
+                        pipe_id,
+                        pty: None,
+                        bidirectional,
+                        write_kind,
+                    } => {
+                        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+                        if unsafe { libc::fstat(host_fd.raw(), stat.as_mut_ptr()) } < 0 {
+                            return Err(format!(
+                                "fstat host pipe for guest fd {guest_fd}: {}",
+                                std::io::Error::last_os_error()
+                            ));
+                        }
+                        let stat = unsafe { stat.assume_init() };
+                        let host_fd_flags = unsafe { libc::fcntl(host_fd.raw(), libc::F_GETFD) };
+                        if host_fd_flags < 0 {
+                            return Err(format!(
+                                "F_GETFD host pipe for guest fd {guest_fd}: {}",
+                                std::io::Error::last_os_error()
+                            ));
+                        }
+                        survivor_host_fds.insert(host_fd.raw());
+                        NativeReexecDescriptionV1::Pipe {
+                            host_fd: host_fd.raw(),
+                            original_host_fd_flags: host_fd_flags,
+                            host_device: stat.st_dev as u64,
+                            host_inode: stat.st_ino,
+                            host_mode: stat.st_mode as u32,
+                            status_flags: base.status_flags(),
+                            pipe_capacity: base.pipe_capacity(),
+                            is_read_end: *is_read_end,
+                            pipe_id: *pipe_id,
+                            bidirectional: *bidirectional,
+                            write_kind: *write_kind,
+                        }
+                    }
+                    OpenDescription::HostFile {
+                        base,
+                        host_fd,
+                        metadata,
+                        writable,
+                    } => {
+                        if metadata.kind != RootFsEntryKind::File {
+                            return Err(format!(
+                                "host file metadata is not regular at guest fd {guest_fd}"
+                            ));
+                        }
+                        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+                        if unsafe { libc::fstat(host_fd.raw(), stat.as_mut_ptr()) } < 0 {
+                            return Err(format!(
+                                "fstat host file for guest fd {guest_fd}: {}",
+                                std::io::Error::last_os_error()
+                            ));
+                        }
+                        let stat = unsafe { stat.assume_init() };
+                        let host_fd_flags = unsafe { libc::fcntl(host_fd.raw(), libc::F_GETFD) };
+                        if host_fd_flags < 0 {
+                            return Err(format!(
+                                "F_GETFD host file for guest fd {guest_fd}: {}",
+                                std::io::Error::last_os_error()
+                            ));
+                        }
+                        survivor_host_fds.insert(host_fd.raw());
+                        NativeReexecDescriptionV1::File {
+                            host_fd: host_fd.raw(),
+                            original_host_fd_flags: host_fd_flags,
+                            host_device: stat.st_dev as u64,
+                            host_inode: stat.st_ino,
+                            host_mode: stat.st_mode as u32,
+                            status_flags: base.status_flags(),
+                            guest_path: metadata.path.as_os_str().as_bytes().to_vec(),
+                            guest_mode: metadata.mode,
+                            guest_size: u64::try_from(metadata.size).map_err(|_| {
+                                format!("host file size is too large at guest fd {guest_fd}")
+                            })?,
+                            writable: *writable,
+                        }
+                    }
+                    OpenDescription::HostSocket {
+                        base,
+                        host_fd,
+                        family,
+                        type_,
+                        mcast_memberships,
+                        synthetic_recv,
+                    } => {
+                        if !mcast_memberships.is_empty() || !synthetic_recv.is_empty() {
+                            return Err(format!(
+                                "host socket has queued synthetic state at guest fd {guest_fd}"
+                            ));
+                        }
+                        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+                        if unsafe { libc::fstat(host_fd.raw(), stat.as_mut_ptr()) } < 0 {
+                            return Err(format!(
+                                "fstat host socket for guest fd {guest_fd}: {}",
+                                std::io::Error::last_os_error()
+                            ));
+                        }
+                        let stat = unsafe { stat.assume_init() };
+                        let host_fd_flags = unsafe { libc::fcntl(host_fd.raw(), libc::F_GETFD) };
+                        if host_fd_flags < 0 {
+                            return Err(format!(
+                                "F_GETFD host socket for guest fd {guest_fd}: {}",
+                                std::io::Error::last_os_error()
+                            ));
+                        }
+                        survivor_host_fds.insert(host_fd.raw());
+                        NativeReexecDescriptionV1::Socket {
+                            host_fd: host_fd.raw(),
+                            original_host_fd_flags: host_fd_flags,
+                            host_device: stat.st_dev as u64,
+                            host_inode: stat.st_ino,
+                            host_mode: stat.st_mode as u32,
+                            status_flags: base.status_flags(),
+                            family: *family,
+                            type_: *type_,
+                        }
+                    }
+                    other => {
+                        return Err(format!(
+                            "unsupported surviving descriptor kind {} at guest fd {guest_fd}",
+                            other.reexec_kind_name()
+                        ));
+                    }
+                };
+                let id = u32::try_from(descriptions.len())
+                    .map_err(|_| "too many native reexec descriptions".to_owned())?;
+                descriptions.push(record);
+                description_ids.insert(key, id);
+                id
+            };
+            files.push(NativeReexecFdV1 {
+                guest_fd,
+                fd_flags: open_file.fd_flags,
+                description_id,
+            });
+        }
+        close_on_exec_host_fds.retain(|fd| !survivor_host_fds.contains(fd));
+        close_on_exec_host_fds.sort_unstable();
+        close_on_exec_host_fds.dedup();
+        Ok(NativeReexecFdTableV1 {
+            files,
+            descriptions,
+            close_on_exec_host_fds,
+        })
+    }
+
+    pub(crate) fn restore_native_reexec_fd_table(
+        &self,
+        snapshot: &NativeReexecFdTableV1,
+    ) -> Result<(), String> {
+        let mut descriptions = Vec::with_capacity(snapshot.descriptions.len());
+        for record in &snapshot.descriptions {
+            let description = match record {
+                NativeReexecDescriptionV1::Pipe {
+                    host_fd,
+                    original_host_fd_flags,
+                    host_device,
+                    host_inode,
+                    host_mode,
+                    status_flags,
+                    pipe_capacity,
+                    is_read_end,
+                    pipe_id,
+                    bidirectional,
+                    write_kind,
+                } => {
+                    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+                    if unsafe { libc::fstat(*host_fd, stat.as_mut_ptr()) } < 0 {
+                        return Err(format!(
+                            "fstat inherited host pipe {host_fd}: {}",
+                            std::io::Error::last_os_error()
+                        ));
+                    }
+                    let stat = unsafe { stat.assume_init() };
+                    if stat.st_dev as u64 != *host_device
+                        || stat.st_ino != *host_inode
+                        || stat.st_mode as u32 != *host_mode
+                    {
+                        return Err(format!("inherited host pipe {host_fd} identity changed"));
+                    }
+                    if unsafe { libc::fcntl(*host_fd, libc::F_SETFD, *original_host_fd_flags) } < 0
+                    {
+                        return Err(format!(
+                            "restore inherited host pipe flags {host_fd}: {}",
+                            std::io::Error::last_os_error()
+                        ));
+                    }
+                    let mut base = OpenDescriptionBase::new(*status_flags);
+                    base.set_pipe_capacity(*pipe_capacity);
+                    OpenDescription::HostPipe {
+                        base,
+                        host_fd: HostFdRef::new(*host_fd),
+                        is_read_end: *is_read_end,
+                        pipe_id: *pipe_id,
+                        pty: None,
+                        bidirectional: *bidirectional,
+                        write_kind: *write_kind,
+                    }
+                }
+                NativeReexecDescriptionV1::File {
+                    host_fd,
+                    original_host_fd_flags,
+                    host_device,
+                    host_inode,
+                    host_mode,
+                    status_flags,
+                    guest_path,
+                    guest_mode,
+                    guest_size,
+                    writable,
+                } => {
+                    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+                    if unsafe { libc::fstat(*host_fd, stat.as_mut_ptr()) } < 0 {
+                        return Err(format!(
+                            "fstat inherited host file {host_fd}: {}",
+                            std::io::Error::last_os_error()
+                        ));
+                    }
+                    let stat = unsafe { stat.assume_init() };
+                    if stat.st_dev as u64 != *host_device
+                        || stat.st_ino != *host_inode
+                        || stat.st_mode as u32 != *host_mode
+                    {
+                        return Err(format!("inherited host file {host_fd} identity changed"));
+                    }
+                    if unsafe { libc::fcntl(*host_fd, libc::F_SETFD, *original_host_fd_flags) } < 0
+                    {
+                        return Err(format!(
+                            "restore inherited host file flags {host_fd}: {}",
+                            std::io::Error::last_os_error()
+                        ));
+                    }
+                    OpenDescription::HostFile {
+                        base: OpenDescriptionBase::new(*status_flags),
+                        host_fd: HostFdRef::new(*host_fd),
+                        metadata: RootFsMetadata {
+                            path: std::path::PathBuf::from(std::ffi::OsString::from_vec(
+                                guest_path.clone(),
+                            )),
+                            kind: RootFsEntryKind::File,
+                            mode: *guest_mode,
+                            size: usize::try_from(*guest_size).map_err(|_| {
+                                format!("guest host-file size is too large for fd {host_fd}")
+                            })?,
+                        },
+                        writable: *writable,
+                    }
+                }
+                NativeReexecDescriptionV1::Socket {
+                    host_fd,
+                    original_host_fd_flags,
+                    host_device: _,
+                    host_inode: _,
+                    host_mode,
+                    status_flags,
+                    family,
+                    type_,
+                } => {
+                    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+                    if unsafe { libc::fstat(*host_fd, stat.as_mut_ptr()) } < 0 {
+                        return Err(format!(
+                            "fstat inherited host socket {host_fd}: {}",
+                            std::io::Error::last_os_error()
+                        ));
+                    }
+                    let stat = unsafe { stat.assume_init() };
+                    let mut actual_type = 0_i32;
+                    let mut actual_type_len = libc::socklen_t::try_from(std::mem::size_of::<i32>())
+                        .map_err(|_| "socket type length overflow".to_owned())?;
+                    if unsafe {
+                        libc::getsockopt(
+                            *host_fd,
+                            libc::SOL_SOCKET,
+                            libc::SO_TYPE,
+                            (&raw mut actual_type).cast(),
+                            &raw mut actual_type_len,
+                        )
+                    } < 0
+                    {
+                        return Err(format!(
+                            "inspect inherited host socket {host_fd}: {}",
+                            std::io::Error::last_os_error()
+                        ));
+                    }
+                    if stat.st_mode as u32 & libc::S_IFMT as u32 != *host_mode & libc::S_IFMT as u32
+                        || actual_type != (*type_ & 0xf)
+                    {
+                        return Err(format!(
+                            "inherited host socket {host_fd} type changed: mode={:#o}/{:#o} type={}/{}",
+                            stat.st_mode,
+                            host_mode,
+                            actual_type,
+                            type_ & 0xf
+                        ));
+                    }
+                    if unsafe { libc::fcntl(*host_fd, libc::F_SETFD, *original_host_fd_flags) } < 0
+                    {
+                        return Err(format!(
+                            "restore inherited host socket flags {host_fd}: {}",
+                            std::io::Error::last_os_error()
+                        ));
+                    }
+                    OpenDescription::HostSocket {
+                        base: OpenDescriptionBase::new(*status_flags),
+                        host_fd: HostFdRef::new(*host_fd),
+                        family: *family,
+                        type_: *type_,
+                        mcast_memberships: Vec::new(),
+                        synthetic_recv: VecDeque::new(),
+                    }
+                }
+            };
+            descriptions.push(std::sync::Arc::new(RwLock::new(description)));
+        }
+
+        let mut table = self.io.open_files.write();
+        for file in &snapshot.files {
+            if file.guest_fd < 0
+                || file.fd_flags & crate::linux_abi::LINUX_FD_CLOEXEC != 0
+                || table.contains_key(&file.guest_fd)
+            {
+                return Err(format!(
+                    "invalid native reexec guest fd record {}",
+                    file.guest_fd
+                ));
+            }
+            let description = descriptions
+                .get(file.description_id as usize)
+                .ok_or_else(|| "native reexec description id is out of range".to_owned())?;
+            table.insert(
+                file.guest_fd,
+                OpenFile::new(std::sync::Arc::clone(description), file.fd_flags),
+            );
+            if (0..=2).contains(&file.guest_fd) {
+                self.io.closed_stdio.lock()[file.guest_fd as usize] = false;
+            }
+        }
+        *self.io.next_fd.lock() = 3;
+        Ok(())
     }
 
     /// Called after `libc::fork(2)` returns into a child: the child
@@ -8889,6 +9296,175 @@ mod rosetta_handshake_tests {
                 errno: LINUX_EFAULT
             }
         );
+    }
+}
+
+#[cfg(test)]
+mod native_reexec_fd_tests {
+    use super::*;
+    use std::io::{Seek, Write};
+    use std::os::fd::IntoRawFd;
+
+    #[test]
+    fn host_pipe_snapshot_restores_guest_aliases_and_kernel_identity() {
+        let mut pipe_fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
+        let description = std::sync::Arc::new(RwLock::new(OpenDescription::HostPipe {
+            base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_WRONLY),
+            host_fd: HostFdRef::new(pipe_fds[1]),
+            is_read_end: false,
+            pipe_id: 91,
+            pty: None,
+            bidirectional: false,
+            write_kind: HostWriteKind::PipeLike,
+        }));
+        let source = SyscallDispatcher::new();
+        source
+            .io
+            .open_files
+            .write()
+            .insert(1, OpenFile::new(std::sync::Arc::clone(&description), 0));
+        source
+            .io
+            .open_files
+            .write()
+            .insert(7, OpenFile::new(std::sync::Arc::clone(&description), 0));
+        let snapshot = source.snapshot_native_reexec_fd_table().unwrap();
+        assert_eq!(snapshot.files.len(), 2);
+        assert_eq!(snapshot.descriptions.len(), 1);
+        std::mem::forget(source);
+        drop(description);
+
+        let resumed = SyscallDispatcher::new();
+        resumed.restore_native_reexec_fd_table(&snapshot).unwrap();
+        let table = resumed.io.open_files.read();
+        let first = table.get(&1).unwrap();
+        let alias = table.get(&7).unwrap();
+        assert!(std::sync::Arc::ptr_eq(
+            &first.description,
+            &alias.description
+        ));
+        let raw = match &*first.description.read() {
+            OpenDescription::HostPipe { host_fd, .. } => host_fd.raw(),
+            other => panic!("restored wrong description: {other:?}"),
+        };
+        assert_eq!(unsafe { libc::write(raw, b"ok".as_ptr().cast(), 2) }, 2);
+        drop(table);
+        let mut bytes = [0_u8; 2];
+        assert_eq!(
+            unsafe { libc::read(pipe_fds[0], bytes.as_mut_ptr().cast(), bytes.len()) },
+            2
+        );
+        assert_eq!(&bytes, b"ok");
+        unsafe { libc::close(pipe_fds[0]) };
+    }
+
+    #[test]
+    fn unsupported_survivor_is_rejected_but_cloexec_is_omitted() {
+        let dispatcher = SyscallDispatcher::new();
+        let description = std::sync::Arc::new(RwLock::new(OpenDescription::SyntheticFile {
+            base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDONLY),
+            path: "/synthetic".to_owned(),
+            contents: Vec::new(),
+            offset: 0,
+        }));
+        dispatcher
+            .io
+            .open_files
+            .write()
+            .insert(9, OpenFile::new(std::sync::Arc::clone(&description), 0));
+        assert!(dispatcher.snapshot_native_reexec_fd_table().is_err());
+        dispatcher
+            .io
+            .open_files
+            .write()
+            .get_mut(&9)
+            .unwrap()
+            .fd_flags = crate::linux_abi::LINUX_FD_CLOEXEC;
+        let snapshot = dispatcher.snapshot_native_reexec_fd_table().unwrap();
+        assert!(snapshot.files.is_empty());
+        assert!(snapshot.descriptions.is_empty());
+    }
+
+    #[test]
+    fn host_file_snapshot_preserves_open_description_offset() {
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(b"abcdef").unwrap();
+        file.seek(std::io::SeekFrom::Start(3)).unwrap();
+        let host_fd = file.into_raw_fd();
+        let source = SyscallDispatcher::new();
+        source.io.open_files.write().insert(
+            2,
+            OpenFile::new(
+                std::sync::Arc::new(RwLock::new(OpenDescription::HostFile {
+                    base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDWR),
+                    host_fd: HostFdRef::new(host_fd),
+                    metadata: RootFsMetadata {
+                        path: std::path::PathBuf::from("/tmp/log"),
+                        kind: RootFsEntryKind::File,
+                        mode: 0o600,
+                        size: 6,
+                    },
+                    writable: true,
+                })),
+                0,
+            ),
+        );
+        source.io.stdio_cloexec.lock()[2] = true;
+        assert!(source.validate_native_reexec_fd_state().is_ok());
+        let snapshot = source.snapshot_native_reexec_fd_table().unwrap();
+        std::mem::forget(source);
+
+        let resumed = SyscallDispatcher::new();
+        resumed.restore_native_reexec_fd_table(&snapshot).unwrap();
+        let open_file = resumed.io.open_files.read().get(&2).unwrap().clone();
+        let raw = match &*open_file.description.read() {
+            OpenDescription::HostFile { host_fd, .. } => host_fd.raw(),
+            other => panic!("restored wrong description: {other:?}"),
+        };
+        assert_eq!(unsafe { libc::lseek(raw, 0, libc::SEEK_CUR) }, 3);
+    }
+
+    #[test]
+    fn host_socket_snapshot_preserves_connected_kernel_endpoint() {
+        let mut sockets = [-1; 2];
+        assert_eq!(
+            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sockets.as_mut_ptr(),) },
+            0
+        );
+        let source = SyscallDispatcher::new();
+        source.io.open_files.write().insert(
+            0,
+            OpenFile::new(
+                std::sync::Arc::new(RwLock::new(OpenDescription::HostSocket {
+                    base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDWR),
+                    host_fd: HostFdRef::new(sockets[0]),
+                    family: crate::linux_abi::LINUX_AF_UNIX,
+                    type_: crate::linux_abi::LINUX_SOCK_STREAM,
+                    mcast_memberships: Vec::new(),
+                    synthetic_recv: VecDeque::new(),
+                })),
+                0,
+            ),
+        );
+        let snapshot = source.snapshot_native_reexec_fd_table().unwrap();
+        std::mem::forget(source);
+
+        let resumed = SyscallDispatcher::new();
+        resumed.restore_native_reexec_fd_table(&snapshot).unwrap();
+        let open_file = resumed.io.open_files.read().get(&0).unwrap().clone();
+        let raw = match &*open_file.description.read() {
+            OpenDescription::HostSocket { host_fd, .. } => host_fd.raw(),
+            other => panic!("restored wrong description: {other:?}"),
+        };
+        assert_eq!(unsafe { libc::write(raw, b"ok".as_ptr().cast(), 2) }, 2);
+        let mut bytes = [0_u8; 2];
+        assert_eq!(
+            unsafe { libc::read(sockets[1], bytes.as_mut_ptr().cast(), bytes.len()) },
+            2
+        );
+        assert_eq!(&bytes, b"ok");
+        unsafe { libc::close(sockets[1]) };
     }
 }
 
