@@ -52,6 +52,8 @@ start. Smoke/full membership remains authoritative in
 | 2026-07-13 | worktree | common host-trap symbolication | 1 | PC `0x1877f2410` = libdispatch deduplicated trap +36; LR `0x1877be4b8` = `_dispatch_sema4_wait+56` | `target/conformance/raw/conf-{63249,64365,69065}-*.err` | Apple libdispatch fork-of-multithreaded-parent state is the first common failure boundary. Select PID-preserving host self-reexec. |
 | 2026-07-13 | worktree after `05e06fab` | capsule transport and host-root authority | 1 | PID before/after identical; malformed resume rejected; exact root reattached; substituted root rejected | `native_self_reexec_transport_preserves_pid`; `fs_backend::tests::*reexec_authority*` | Versioned one-shot transport and durable `--fs host` authority are green. Capsule version 1 still rejects memory-fs and non-bare fd tables before host exec. |
 | 2026-07-13 | worktree after `05e06fab` | signed `forkexecpthread` through host self-reexec | 1 | official test PASS; 5/5 direct repeats report all six success fields true | `native_conformance_dsr_fork_exec_can_create_thread`; run IDs `native-selfreexec-pthread-repeat-{1..5}` | First production path creates and joins a guest pthread after fork/exec with no unsafe switch. Initial EAGAIN was descendant cleanup-lock ownership; next RED was a missing native memory layout in the fresh dispatcher. Both are fixed and pinned. Expand exec-surviving fd/process state before ecosystem promotion. |
+| 2026-07-13 | `6d9a0757` | Node app/V8 before fd expansion | 1 | 2 REGRESSION; shell helpers fail `EOPNOTSUPP`, no trap/crash/timeout | `target/conformance/native-selfreexec-node.jsonl` | Fail-closed capsule gate measured non-`CLOEXEC` command-substitution pipes, redirected files, then Unix-socket stdio. Implement these ordinary survivor classes; keep libuv epoll/eventfd state omitted by `CLOEXEC`. |
+| 2026-07-13 | worktree after `6d9a0757` | Node app/V8 after host fd snapshots | 1 | 2 MATCH; app 10.185 s, V8 8.843 s; no host trap | `target/conformance/native-selfreexec-node-green.jsonl` | Host pipes, regular files, sockets, and descriptor aliases survive PID-preserving host exec with kernel identity/type validation. First real ecosystem blocker is closed; performance is explicitly out of campaign scope. |
 
 ## Active failure clusters
 
@@ -59,7 +61,7 @@ start. Smoke/full membership remains authoritative in
 | ---: | --- | --- | --- | --- |
 | P0 | `THREAD_WAITERS` remains locked in a fork child | live LLDB stack plus deterministic contended-fork reducer | fixed in `6d3cf627`; four signed single-suite runs complete, multi-suite load proof pending | no CPython timeout in workers=4 smoke repeats |
 | P0 | Direct-exec target reservation rejects split dyld range | red/green Node-sized reducer plus signed eventfd/Node runs | fixed in `2a7d3046`; eventfd MATCH, Node reaches downstream thread guard; multi-suite load proof pending | no reservation collision in workers=4 smoke repeats |
-| P1 | Post-fork exec child cannot create guest threads | red/green staged reducer plus Node/Go/CPython unsafe samples and libdispatch symbolication | PID-preserving host self-reexec is live for bare-stdio/host-fs state; signed reducer and 5/5 repeats pass without unsafe bypass; descriptor/process-state expansion and ecosystem proof remain | `forkexecpthread`, Node, Go, and CPython run after PID-preserving host self-reexec |
+| P1 | Post-fork exec child cannot create guest threads | red/green staged reducer plus Node/Go/CPython unsafe samples and libdispatch symbolication | signed reducer + 5/5 repeats pass without bypass; Node app/V8 are MATCH through self-reexec; Go/CPython and process-state expansion remain | `forkexecpthread`, Node, Go, and CPython run after PID-preserving host self-reexec |
 | P2 | Remaining ecosystem/LTP differences | no fresh full native run yet | unknown | classify from measured full run after P0/P1 blockers clear |
 
 ## Bless checklist
@@ -81,9 +83,8 @@ start. Smoke/full membership remains authoritative in
 
 ## Current next action
 
-Add red-first exec-state coverage for cwd, signal state, `CLOEXEC`, and ordinary
-host-backed descriptor aliases, then expand capsule eligibility only for the
-classes required by Node, Go, and CPython. Keep the production guard and unsafe
-diagnostic until those ecosystem lanes pass through the supported path. After
-P1, run multi-suite smoke at four workers to provide the actual load proof for
-both P0 fixes.
+Run the isolated Go build/runtime/sync lanes to measure the next real survivor or
+process-state boundary, then do the same for CPython threading/subprocess. Add
+red-first cwd/signal/credential probes before removing the guard and unsafe
+diagnostic. After P1, run multi-suite smoke at four workers to provide the
+actual load proof for both P0 fixes.

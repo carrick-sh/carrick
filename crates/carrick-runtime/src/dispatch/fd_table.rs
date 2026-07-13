@@ -477,12 +477,90 @@ impl OpenDescriptionBase {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum HostWriteKind {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum HostWriteKind {
     PipeLike,
     SocketLike,
     RegularFile,
     Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct NativeReexecFdTableV1 {
+    pub(crate) files: Vec<NativeReexecFdV1>,
+    pub(crate) descriptions: Vec<NativeReexecDescriptionV1>,
+    pub(crate) close_on_exec_host_fds: Vec<i32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct NativeReexecFdV1 {
+    pub(crate) guest_fd: i32,
+    pub(crate) fd_flags: u64,
+    pub(crate) description_id: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum NativeReexecDescriptionV1 {
+    Pipe {
+        host_fd: i32,
+        original_host_fd_flags: i32,
+        host_device: u64,
+        host_inode: u64,
+        host_mode: u32,
+        status_flags: u64,
+        pipe_capacity: i64,
+        is_read_end: bool,
+        pipe_id: u64,
+        bidirectional: bool,
+        write_kind: HostWriteKind,
+    },
+    File {
+        host_fd: i32,
+        original_host_fd_flags: i32,
+        host_device: u64,
+        host_inode: u64,
+        host_mode: u32,
+        status_flags: u64,
+        guest_path: Vec<u8>,
+        guest_mode: u32,
+        guest_size: u64,
+        writable: bool,
+    },
+    Socket {
+        host_fd: i32,
+        original_host_fd_flags: i32,
+        host_device: u64,
+        host_inode: u64,
+        host_mode: u32,
+        status_flags: u64,
+        family: i32,
+        type_: i32,
+    },
+}
+
+impl NativeReexecFdTableV1 {
+    pub(crate) fn survivor_host_fds(&self) -> Vec<(i32, i32)> {
+        self.descriptions
+            .iter()
+            .map(|description| match description {
+                NativeReexecDescriptionV1::Pipe {
+                    host_fd,
+                    original_host_fd_flags,
+                    ..
+                }
+                | NativeReexecDescriptionV1::File {
+                    host_fd,
+                    original_host_fd_flags,
+                    ..
+                }
+                | NativeReexecDescriptionV1::Socket {
+                    host_fd,
+                    original_host_fd_flags,
+                    ..
+                } => (*host_fd, *original_host_fd_flags),
+            })
+            .collect()
+    }
 }
 
 impl HostWriteKind {
@@ -993,6 +1071,37 @@ impl OpenFile {
 }
 
 impl OpenDescription {
+    pub(super) fn reexec_host_fd(&self) -> Option<i32> {
+        match self {
+            Self::HostPipe { host_fd, .. }
+            | Self::HostSocket { host_fd, .. }
+            | Self::HostFile { host_fd, .. }
+            | Self::Mqueue { host_fd, .. } => Some(host_fd.raw()),
+            _ => None,
+        }
+    }
+
+    pub(super) fn reexec_kind_name(&self) -> &'static str {
+        match self {
+            Self::File { .. } => "file",
+            Self::Directory { .. } => "directory",
+            Self::SyntheticFile { .. } => "synthetic_file",
+            Self::EventFd { .. } => "eventfd",
+            Self::TimerFd { .. } => "timerfd",
+            Self::Epoll { .. } => "epoll",
+            Self::Pidfd { .. } => "pidfd",
+            Self::Inotify { .. } => "inotify",
+            Self::SignalFd { .. } => "signalfd",
+            Self::PipeReader { .. } => "pipe_reader",
+            Self::PipeWriter { .. } => "pipe_writer",
+            Self::HostPipe { .. } => "host_pipe",
+            Self::HostSocket { .. } => "host_socket",
+            Self::HostFile { .. } => "host_file",
+            Self::Netlink { .. } => "netlink",
+            Self::Mqueue { .. } => "mqueue",
+        }
+    }
+
     /// The guest path this fd was opened at, for descriptions that track one
     /// (regular files, directories, synthetic files). `None` for host-fd-backed
     /// or anonymous descriptions. Used to serve `readlink(/proc/self/fd/N)`.
