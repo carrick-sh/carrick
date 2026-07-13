@@ -191,6 +191,20 @@ fn any_direct_child_ptrace_trap_stop_ready() -> bool {
         .any(child_ptrace_trap_stop_ready)
 }
 
+/// Snapshot the direct children that still exist as host children of this
+/// waiter. The neutral process table can intentionally outlive a host zombie
+/// (namespace bookkeeping and failed guest copies both defer final release),
+/// but an any-child kqueue park must never arm that stale pid forever.
+#[cfg(target_os = "macos")]
+fn host_direct_children_for_wait(waiter_pid: u32) -> Vec<u32> {
+    crate::guest_cpu::direct_children_for_wait(waiter_pid)
+        .into_iter()
+        .filter(|child| {
+            carrick_host::host_proc::pid_info(*child).is_some_and(|info| info.ppid == waiter_pid)
+        })
+        .collect()
+}
+
 #[cfg(target_os = "macos")]
 fn child_status_ready(pid: i32) -> bool {
     if pid > 0
@@ -815,7 +829,7 @@ impl ThreadWaiter {
     ) -> ProcExitWait {
         let mut watched = std::collections::HashSet::<i32>::new();
         let mut changes = Vec::<Kevent>::new();
-        let cap = (crate::guest_cpu::direct_children_for_wait(std::process::id()).len()
+        let cap = (host_direct_children_for_wait(std::process::id()).len()
             + self.signal_pipe_count())
         .max(1);
         let mut events_out: Vec<Kevent> = vec![Kevent::empty(); cap];
@@ -823,7 +837,7 @@ impl ThreadWaiter {
             if child_status_ready(-1) {
                 break WaitResult::Ready;
             }
-            for child in crate::guest_cpu::direct_children_for_wait(std::process::id()) {
+            for child in host_direct_children_for_wait(std::process::id()) {
                 let Ok(child) = i32::try_from(child) else {
                     continue;
                 };
@@ -832,7 +846,15 @@ impl ThreadWaiter {
                 }
             }
             if watched.is_empty() && changes.is_empty() {
-                return ProcExitWait::KqueueDead;
+                // The dispatcher's WNOHANG pre-check observed a child, but it
+                // was reaped before this park (possibly by a sibling waiter),
+                // or only a stale neutral record remains. Re-dispatch now so
+                // host wait4 returns the authoritative status/ECHILD. Falling
+                // through to the P_ALL fallback is unsafe on Darwin: waitid
+                // reports success with an empty siginfo when there are no
+                // children, which otherwise turns this race into an infinite
+                // 50 ms polling loop.
+                return ProcExitWait::Done(WaitResult::Ready);
             }
             let ts = Some(libc::timespec {
                 tv_sec: 0,
@@ -1675,6 +1697,56 @@ mod tests {
         }
 
         assert!(ready, "wait4(-1) must observe an exited child via P_ALL");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn any_child_watch_excludes_a_reaped_stale_process_record() {
+        let _fork_serial = crate::fork_test_lock();
+        crate::guest_cpu::init_child_table();
+        let parent = std::process::id();
+        let prepared = crate::guest_cpu::prepare_child_record_pre_fork(parent, 0, 0, false, 0)
+            .expect("prepare child record");
+        let mut release_pipe = [-1, -1];
+        assert_eq!(unsafe { libc::pipe(release_pipe.as_mut_ptr()) }, 0);
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed");
+        if child == 0 {
+            unsafe {
+                libc::close(release_pipe[1]);
+                let mut byte = 0_u8;
+                let _ = libc::read(release_pipe[0], std::ptr::from_mut(&mut byte).cast(), 1);
+                libc::close(release_pipe[0]);
+            }
+            unsafe { libc::_exit(0) };
+        }
+        unsafe { libc::close(release_pipe[0]) };
+        crate::guest_cpu::publish_prepared_child_record_parent_ref(prepared, child as u32);
+
+        assert!(
+            super::host_direct_children_for_wait(parent).contains(&(child as u32)),
+            "a live or zombie direct child must remain watchable"
+        );
+
+        assert_eq!(
+            unsafe { libc::write(release_pipe[1], b"x".as_ptr().cast(), 1) },
+            1
+        );
+        unsafe { libc::close(release_pipe[1]) };
+
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(
+            crate::guest_cpu::direct_children_for_wait(parent).contains(&(child as u32)),
+            "the test must leave the neutral record stale after the host reap"
+        );
+
+        let watchable = super::host_direct_children_for_wait(parent);
+        let _ = crate::guest_cpu::reap_child_guest_ns(child as u32);
+        assert!(
+            !watchable.contains(&(child as u32)),
+            "a fully reaped host pid must not keep wait4(-1) parked"
+        );
     }
 
     /// The finite-timeout arm of `wait_kqueue` must cap each kevent slice at the

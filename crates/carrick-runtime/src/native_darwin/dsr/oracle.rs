@@ -99,6 +99,7 @@ fn biased_translator_fixture(words: &[u32], guest_code: GuestVa) -> BiasedTransl
         native_write_exec_writable_pages: BTreeSet::new(),
         linux4k_page_protections: BTreeMap::new(),
         exclusive_reservation: None,
+        exclusive_sequences: BTreeMap::new(),
         host_page_size: PAGE_SIZE,
         linux_page_size: PAGE_SIZE,
         dsr_generations: super::cache::PageGenerationTable::new(PAGE_SIZE)
@@ -486,129 +487,6 @@ fn biased_recovery_matrix_routes_every_offset_through_finish_exit() {
     }
 }
 
-#[test]
-fn biased_store_exclusive_preamble_retries_and_block_entry_fails_spuriously() {
-    let _signal_oracle = install_signal_handlers_for_oracle();
-    let guest_code = GuestVa(0x20_0080_0000);
-    // Every instruction except the invalid-only host-address tag executes for
-    // this in-range reservation. Fault each executable point in isolation.
-    for point_index in [0_usize, 1, 2, 3, 4, 8] {
-        let mut fixture = biased_translator_fixture(
-            &[0xc85f_7c20, 0x9100_0400, 0xc802_7c20, 0xd400_0001],
-            guest_code,
-        );
-        unsafe { *(fixture.data_host.raw() as *mut u64) = 41 };
-        let mut stack = vec![0_u8; 16 * 1024];
-        let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
-        snapshot.pc = guest_code.raw();
-        snapshot.x[1] = fixture.guest_data.raw();
-        snapshot.x[2] = u64::MAX;
-        snapshot.x[27] = 1;
-        let prepared = fixture
-            .translator
-            .prepare_entry::<false>(&fixture.memory, &snapshot)
-            .expect("prepare store-exclusive preamble");
-        let stxr_guest = GuestVa(guest_code.raw() + 8);
-        let points = fixture.translator.instruction_points_for_test(stxr_guest);
-        assert_eq!(points.len(), 9, "store-exclusive preamble width");
-        fixture
-            .translator
-            .patch_instruction_word_for_test(points[point_index], 0xf940_0369)
-            .expect("patch store-exclusive preamble");
-        let fault = fixture
-            .translator
-            .enter_prepared::<false>(prepared, &mut snapshot)
-            .expect("enter store-exclusive preamble fault");
-        let fault_exit = fault.exit;
-        let fault_snapshot = snapshot;
-        let super::types::NativeDsrExit::Fault {
-            guest_pc: resume,
-            rewrite_scratch,
-            rewrite_context_scratch,
-            generation_pstate_scratch,
-            indirect_x15_scratch,
-            indirect_x30_scratch,
-            ..
-        } = fault_exit
-        else {
-            panic!("expected store-exclusive preamble fault, got {fault_exit:?}");
-        };
-        let mut recovered_fault = fault_snapshot;
-        assert!(matches!(
-            fixture
-                .translator
-                .finish_exit(
-                    &fixture.memory,
-                    &mut recovered_fault,
-                    prepared,
-                    super::PreparedExit { exit: fault_exit },
-                )
-                .expect("finish store-exclusive preamble fault"),
-            super::ThreadExit::Fault {
-                address: super::ThreadFaultAddress::Host(HostVa(1)),
-                ..
-            }
-        ));
-        let mut recovered_kick = fault_snapshot;
-        assert!(matches!(
-            fixture
-                .translator
-                .finish_exit(
-                    &fixture.memory,
-                    &mut recovered_kick,
-                    prepared,
-                    super::PreparedExit {
-                        exit: super::types::NativeDsrExit::Kick {
-                            resume,
-                            rewrite_scratch,
-                            rewrite_context_scratch,
-                            generation_pstate_scratch,
-                            indirect_x15_scratch,
-                            indirect_x30_scratch,
-                        },
-                    },
-                )
-                .expect("finish store-exclusive preamble kick"),
-            super::ThreadExit::Kick
-        ));
-        for recovered in [recovered_fault, recovered_kick] {
-            assert_eq!(recovered.pc, stxr_guest.raw());
-            assert_eq!(recovered.x[0], 42);
-            assert_eq!(recovered.x[1], fixture.guest_data.raw());
-            assert_eq!(recovered.x[2], u64::MAX);
-            assert_eq!(recovered.x[27], 1);
-        }
-        assert_eq!(unsafe { *(fixture.data_host.raw() as *const u64) }, 41);
-    }
-
-    let mut fixture =
-        biased_translator_fixture(&[0xc802_7c20, 0xd400_0001], GuestVa(0x20_0090_0000));
-    unsafe { *(fixture.data_host.raw() as *mut u64) = 41 };
-    let mut stack = vec![0_u8; 16 * 1024];
-    let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
-    snapshot.pc = fixture.guest_code.raw();
-    snapshot.x[0] = 99;
-    snapshot.x[1] = fixture.guest_data.raw();
-    snapshot.x[2] = 0;
-    let prepared = fixture
-        .translator
-        .prepare_entry::<false>(&fixture.memory, &snapshot)
-        .expect("prepare block-entry store-exclusive");
-    let exit = fixture
-        .translator
-        .enter_prepared::<false>(prepared, &mut snapshot)
-        .expect("enter block-entry store-exclusive");
-    assert!(matches!(
-        fixture
-            .translator
-            .finish_exit(&fixture.memory, &mut snapshot, prepared, exit)
-            .expect("finish block-entry store-exclusive"),
-        super::ThreadExit::Syscall { .. }
-    ));
-    assert_eq!(snapshot.x[2], 1);
-    assert_eq!(unsafe { *(fixture.data_host.raw() as *const u64) }, 41);
-}
-
 #[cfg(target_arch = "aarch64")]
 #[test]
 fn biased_memory_families_access_guest_data() {
@@ -632,7 +510,6 @@ fn biased_memory_families_access_guest_data() {
         (0xf940_0020, MemoryClass::Scalar),
         (0xa940_0440, MemoryClass::Pair),
         (0x3dc0_0020, MemoryClass::Simd),
-        (0xc85f_7c20, MemoryClass::Exclusive),
         (0xf8e0_0041, MemoryClass::Atomic),
     ];
     for (word, class) in fixtures {
@@ -770,211 +647,6 @@ fn biased_memory_preserves_nzcv_for_the_following_conditional_instruction() {
 }
 
 #[cfg(target_arch = "aarch64")]
-#[test]
-fn biased_exclusive_retry_sequence_updates_once() {
-    const BIAS: u64 = 0x80_0000_0000;
-    const GUEST: u64 = 0x5_0000_0000;
-    let host_bias = crate::native_darwin::address::NativeHostBias::new(BIAS, 16 * 1024)
-        .expect("construct host bias");
-    let mapping = crate::native_darwin::address::OwnedHostMapping::map_exact(
-        HostVa((BIAS + GUEST) as usize),
-        16 * 1024,
-        libc::PROT_READ | libc::PROT_WRITE,
-        libc::MAP_ANON | libc::MAP_PRIVATE,
-    )
-    .expect("map biased exclusive data");
-    let value = unsafe { &mut *(mapping.range().start.raw() as *mut u64) };
-    *value = 41;
-    for (ldxr, stxr, use_sp) in [
-        (0xc85f_7c20, 0xc802_7c20, false),
-        (0xc85f_7fe0, 0xc802_7fe0, true),
-    ] {
-        *value = 41;
-        let plan = BlockPlan {
-            start: GuestVa(0x8000),
-            end: GuestVa(0x8010),
-            generation: CodeGeneration::INITIAL,
-            instructions: [ldxr, 0x9100_0400, stxr]
-                .into_iter()
-                .enumerate()
-                .map(|(index, word)| PlannedInst {
-                    guest: GuestVa(0x8000 + index as u64 * 4),
-                    action: super::decode::classify(word, GuestVa(0x8000 + index as u64 * 4))
-                        .expect("classify exclusive word"),
-                })
-                .collect(),
-            exit: PlannedExit::Syscall {
-                guest: GuestVa(0x800c),
-                resume: GuestVa(0x8010),
-            },
-        };
-        let mut cache = TranslationCache::new(16 * 1024).expect("allocate exclusive cache");
-        let emitted = emit_block(
-            &mut cache,
-            &plan,
-            super::emit::EmitAddressMode::Biased { host_bias },
-        )
-        .expect("emit exclusive sequence");
-        let mut host_stack = vec![0_u8; 16 * 1024];
-        let mut snapshot =
-            seeded_snapshot(host_stack.as_mut_ptr() as u64 + host_stack.len() as u64);
-        snapshot.x[1] = GUEST;
-        if use_sp {
-            snapshot.sp = GUEST;
-        }
-        snapshot.x[2] = u64::MAX;
-        let mut exit = NativeDsrExit::Syscall {
-            resume: GuestVa(0x8010),
-        };
-        super::gateway::enter_translated_in_mode(
-            emitted.entry(),
-            &mut snapshot,
-            &mut exit,
-            crate::native_darwin::address::NativeAddressMode::Biased { host_bias },
-        )
-        .expect("execute exclusive sequence");
-        assert_eq!(snapshot.x[2], 0, "STXR status for use_sp={use_sp}");
-        assert_eq!(*value, 42, "exclusive update for use_sp={use_sp}");
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
-#[test]
-fn biased_exclusive_byte_half_pair_variants_succeed() {
-    const BIAS: u64 = 0x80_0000_0000;
-    const GUEST: u64 = 0xa_0000_0000;
-    let host_bias = crate::native_darwin::address::NativeHostBias::new(BIAS, 16 * 1024)
-        .expect("construct host bias");
-    let mapping = crate::native_darwin::address::OwnedHostMapping::map_exact(
-        HostVa((BIAS + GUEST) as usize),
-        16 * 1024,
-        libc::PROT_READ | libc::PROT_WRITE,
-        libc::MAP_ANON | libc::MAP_PRIVATE,
-    )
-    .expect("map exclusive variant data");
-    let data =
-        unsafe { std::slice::from_raw_parts_mut(mapping.range().start.raw() as *mut u64, 2) };
-    let variants: &[(&[u32], [u64; 2])] = &[
-        (&[0x085f_7c20, 0x1100_0400, 0x0802_7c20], [0x12, 0]),
-        (&[0x485f_7c20, 0x1100_0400, 0x4802_7c20], [0x1234, 0]),
-        (
-            &[0xc87f_0c20, 0x9100_0400, 0x9100_0463, 0xc822_0c20],
-            [41, 99],
-        ),
-        (
-            &[0xc87f_8c20, 0x9100_0400, 0x9100_0463, 0xc822_8c20],
-            [41, 99],
-        ),
-    ];
-    for (index, (words, initial)) in variants.iter().enumerate() {
-        data.copy_from_slice(initial);
-        let start = GuestVa(0xf000 + index as u64 * 0x100);
-        let plan = BlockPlan {
-            start,
-            end: GuestVa(start.raw() + (words.len() as u64 + 1) * 4),
-            generation: CodeGeneration::INITIAL,
-            instructions: words
-                .iter()
-                .copied()
-                .enumerate()
-                .map(|(offset, word)| PlannedInst {
-                    guest: GuestVa(start.raw() + offset as u64 * 4),
-                    action: super::decode::classify(word, GuestVa(start.raw() + offset as u64 * 4))
-                        .expect("classify exclusive variant"),
-                })
-                .collect(),
-            exit: PlannedExit::Syscall {
-                guest: GuestVa(start.raw() + words.len() as u64 * 4),
-                resume: GuestVa(start.raw() + (words.len() as u64 + 1) * 4),
-            },
-        };
-        let mut cache = TranslationCache::new(16 * 1024).expect("allocate variant cache");
-        let emitted = emit_block(
-            &mut cache,
-            &plan,
-            super::emit::EmitAddressMode::Biased { host_bias },
-        )
-        .expect("emit exclusive variant");
-        let mut stack = vec![0_u8; 16 * 1024];
-        let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
-        snapshot.x[1] = GUEST;
-        snapshot.x[2] = u64::MAX;
-        let mut exit = NativeDsrExit::Syscall {
-            resume: GuestVa(start.raw() + (words.len() as u64 + 1) * 4),
-        };
-        super::gateway::enter_translated_in_mode(
-            emitted.entry(),
-            &mut snapshot,
-            &mut exit,
-            crate::native_darwin::address::NativeAddressMode::Biased { host_bias },
-        )
-        .expect("execute exclusive variant");
-        assert_eq!(snapshot.x[2], 0, "variant {index} status");
-        match index {
-            0 => assert_eq!(data[0] & 0xff, (initial[0] + 1) & 0xff),
-            1 => assert_eq!(data[0] & 0xffff, (initial[0] + 1) & 0xffff),
-            _ => assert_eq!(data, &[initial[0] + 1, initial[1] + 1]),
-        }
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
-#[test]
-fn biased_block_entry_stxr_reports_spurious_failure() {
-    const BIAS: u64 = 0x80_0000_0000;
-    const GUEST: u64 = 0x6_0000_0000;
-    let host_bias = crate::native_darwin::address::NativeHostBias::new(BIAS, 16 * 1024)
-        .expect("construct host bias");
-    let mapping = crate::native_darwin::address::OwnedHostMapping::map_exact(
-        HostVa((BIAS + GUEST) as usize),
-        16 * 1024,
-        libc::PROT_READ | libc::PROT_WRITE,
-        libc::MAP_ANON | libc::MAP_PRIVATE,
-    )
-    .expect("map boundary exclusive data");
-    let value = unsafe { &mut *(mapping.range().start.raw() as *mut u64) };
-    *value = 41;
-    let word = 0xc802_7c20;
-    let plan = BlockPlan {
-        start: GuestVa(0x9000),
-        end: GuestVa(0x9008),
-        generation: CodeGeneration::INITIAL,
-        instructions: vec![PlannedInst {
-            guest: GuestVa(0x9000),
-            action: super::decode::classify(word, GuestVa(0x9000)).expect("classify boundary STXR"),
-        }],
-        exit: PlannedExit::Syscall {
-            guest: GuestVa(0x9004),
-            resume: GuestVa(0x9008),
-        },
-    };
-    let mut cache = TranslationCache::new(16 * 1024).expect("allocate boundary cache");
-    let emitted = emit_block(
-        &mut cache,
-        &plan,
-        super::emit::EmitAddressMode::Biased { host_bias },
-    )
-    .expect("emit boundary STXR");
-    let mut stack = vec![0_u8; 16 * 1024];
-    let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
-    snapshot.x[0] = 99;
-    snapshot.x[1] = GUEST;
-    snapshot.x[2] = 0;
-    let mut exit = NativeDsrExit::Syscall {
-        resume: GuestVa(0x9008),
-    };
-    super::gateway::enter_translated_in_mode(
-        emitted.entry(),
-        &mut snapshot,
-        &mut exit,
-        crate::native_darwin::address::NativeAddressMode::Biased { host_bias },
-    )
-    .expect("execute boundary STXR");
-    assert_eq!(snapshot.x[2], 1);
-    assert_eq!(*value, 41);
-}
-
-#[cfg(target_arch = "aarch64")]
 fn run_biased_single_memory(
     word: u32,
     guest_pc: GuestVa,
@@ -1055,6 +727,125 @@ fn biased_pre_post_writeback_stays_in_guest_coordinates() {
     );
     assert_eq!(words[0], GUEST);
     assert_eq!(virtual_overlap.x[18], GUEST + 8);
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn biased_simd_structure_post_index_matches_memequal_load() {
+    const BIAS: u64 = 0x80_0000_0000;
+    const GUEST: u64 = 0xa_0001_0000;
+    let host_bias = crate::native_darwin::address::NativeHostBias::new(BIAS, 16 * 1024)
+        .expect("construct host bias");
+    let mapping = crate::native_darwin::address::OwnedHostMapping::map_exact(
+        HostVa((BIAS + GUEST) as usize),
+        16 * 1024,
+        libc::PROT_READ | libc::PROT_WRITE,
+        libc::MAP_ANON | libc::MAP_PRIVATE,
+    )
+    .expect("map memequal data");
+    let bytes = unsafe {
+        std::slice::from_raw_parts_mut(mapping.range().start.raw() as *mut u8, 16 * 1024)
+    };
+    for (index, byte) in bytes[..64].iter_mut().enumerate() {
+        *byte = index as u8;
+    }
+
+    let mut stack = vec![0_u8; 16 * 1024];
+    let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    snapshot.x[0] = GUEST;
+    run_biased_single_memory(0x4cdf_2c00, GuestVa(0xd000), host_bias, &mut snapshot);
+
+    assert_eq!(snapshot.x[0], GUEST + 64);
+    for (index, vector) in snapshot.v[..4].iter().enumerate() {
+        assert_eq!(*vector, bytes[index * 16..(index + 1) * 16]);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn biased_memequal_vector_sequence_compares_equal_blocks() {
+    const BIAS: u64 = 0x80_0000_0000;
+    const GUEST: u64 = 0xa_0002_0000;
+    let host_bias = crate::native_darwin::address::NativeHostBias::new(BIAS, 16 * 1024)
+        .expect("construct host bias");
+    let mapping = crate::native_darwin::address::OwnedHostMapping::map_exact(
+        HostVa((BIAS + GUEST) as usize),
+        16 * 1024,
+        libc::PROT_READ | libc::PROT_WRITE,
+        libc::MAP_ANON | libc::MAP_PRIVATE,
+    )
+    .expect("map paired memequal data");
+    let bytes = unsafe {
+        std::slice::from_raw_parts_mut(mapping.range().start.raw() as *mut u8, 16 * 1024)
+    };
+    for (index, byte) in bytes[..64].iter_mut().enumerate() {
+        *byte = index as u8;
+    }
+    let (first, second) = bytes[..128].split_at_mut(64);
+    second.copy_from_slice(first);
+
+    let words = [
+        0x4cdf_2c00,
+        0x4cdf_2c24,
+        0x6ee0_8c88,
+        0x6ee1_8ca9,
+        0x6ee2_8cca,
+        0x6ee3_8ceb,
+        0x4e28_1d28,
+        0x4e28_1d48,
+        0x4e28_1d68,
+        0x4e08_3d04,
+        0x4e18_3d05,
+    ];
+    let start = GuestVa(0xd100);
+    let instructions = words
+        .into_iter()
+        .enumerate()
+        .map(|(index, word)| {
+            let guest = GuestVa(start.raw() + index as u64 * 4);
+            PlannedInst {
+                guest,
+                action: super::decode::classify(word, guest).expect("classify memequal word"),
+            }
+        })
+        .collect();
+    let syscall = GuestVa(start.raw() + words.len() as u64 * 4);
+    let plan = BlockPlan {
+        start,
+        end: GuestVa(syscall.raw() + 4),
+        generation: CodeGeneration::INITIAL,
+        instructions,
+        exit: PlannedExit::Syscall {
+            guest: syscall,
+            resume: GuestVa(syscall.raw() + 4),
+        },
+    };
+    let mut cache = TranslationCache::new(16 * 1024).expect("allocate memequal cache");
+    let emitted = emit_block(
+        &mut cache,
+        &plan,
+        super::emit::EmitAddressMode::Biased { host_bias },
+    )
+    .expect("emit memequal vector sequence");
+    let mut stack = vec![0_u8; 16 * 1024];
+    let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    snapshot.x[0] = GUEST;
+    snapshot.x[1] = GUEST + 64;
+    let mut exit = NativeDsrExit::Syscall {
+        resume: GuestVa(syscall.raw() + 4),
+    };
+    super::gateway::enter_translated_in_mode(
+        emitted.entry(),
+        &mut snapshot,
+        &mut exit,
+        crate::native_darwin::address::NativeAddressMode::Biased { host_bias },
+    )
+    .expect("execute memequal vector sequence");
+
+    assert_eq!(snapshot.x[0], GUEST + 64);
+    assert_eq!(snapshot.x[1], GUEST + 128);
+    assert_eq!(snapshot.x[4], u64::MAX);
+    assert_eq!(snapshot.x[5], u64::MAX);
 }
 
 #[cfg(target_arch = "aarch64")]

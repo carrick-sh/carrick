@@ -54,6 +54,13 @@ start. Smoke/full membership remains authoritative in
 | 2026-07-13 | worktree after `05e06fab` | signed `forkexecpthread` through host self-reexec | 1 | official test PASS; 5/5 direct repeats report all six success fields true | `native_conformance_dsr_fork_exec_can_create_thread`; run IDs `native-selfreexec-pthread-repeat-{1..5}` | First production path creates and joins a guest pthread after fork/exec with no unsafe switch. Initial EAGAIN was descendant cleanup-lock ownership; next RED was a missing native memory layout in the fresh dispatcher. Both are fixed and pinned. Expand exec-surviving fd/process state before ecosystem promotion. |
 | 2026-07-13 | `6d9a0757` | Node app/V8 before fd expansion | 1 | 2 REGRESSION; shell helpers fail `EOPNOTSUPP`, no trap/crash/timeout | `target/conformance/native-selfreexec-node.jsonl` | Fail-closed capsule gate measured non-`CLOEXEC` command-substitution pipes, redirected files, then Unix-socket stdio. Implement these ordinary survivor classes; keep libuv epoll/eventfd state omitted by `CLOEXEC`. |
 | 2026-07-13 | worktree after `6d9a0757` | Node app/V8 after host fd snapshots | 1 | 2 MATCH; app 10.185 s, V8 8.843 s; no host trap | `target/conformance/native-selfreexec-node-green.jsonl` | Host pipes, regular files, sockets, and descriptor aliases survive PID-preserving host exec with kernel identity/type validation. First real ecosystem blocker is closed; performance is explicitly out of campaign scope. |
+| 2026-07-13 | worktree | stale any-child process-record reducer | 1 | RED: reaped child remained in watched set; GREEN after live-host filtering | `io_wait::tests::any_child_watch_excludes_a_reaped_stale_process_record` | Live LLDB found `wait4(-1)` parked on an already-reaped PID while no host children existed. Any-child waits now filter the fork-coherent table against current direct-child identity and redispatch immediately when the set is empty. |
+| 2026-07-13 | worktree | native vfork completion across host self-reexec | 1 | RED: both pipe ends had descriptor flags `0`; GREEN: both carry `FD_CLOEXEC` | `native_darwin::tests::native_vfork_completion_pipe_closes_across_host_exec` | The child reached Go after self-reexec but the parent waited forever because the private completion writer survived. Successful host exec now closes it atomically; failed guest exec retains normal vfork completion ownership. |
+| 2026-07-13 | worktree | exact fresh-cache Go build workload | 1 | `BUILD_OK`; real 55.20 s, user 86.38 s, sys 56.21 s | live signed workload; harness evidence below | Replaced whole-map exclusive invalidation on every 64-byte `DC ZVA` with an overlap-bounded range scan. The prior sample remained live after 222.88 s inside `invalidate_exclusive_range`; the fixed run completes. |
+| 2026-07-13 | worktree | `go-build --lane macos-native-dsr` | 1 | MATCH; Carrick Success in 54.077 s; cached oracle Success | `target/conformance/native-go-exclusive-range-green.jsonl` | First Go real-workload lane is green after software exclusive reservations, self-reexec wait/vfork repairs, the 2 TiB biased aperture, SIMD lowering repair, and honest HWCAP advertisement. Continue with Go runtime/sync before promotion to the full ecosystem. |
+| 2026-07-13 | worktree | `go-sync --lane macos-native-dsr` | 1 | MATCH; 52/52 on both sides; Carrick 10.578 s | `target/conformance/native-go-runtime-sync-r1.jsonl` | The synchronization workload is green. Performance ratio is report-only and out of campaign scope. |
+| 2026-07-13 | worktree | Go UserArena alias-reuse reducer | 1 | RED: writable `MAP_FIXED` retained prior `PROT_NONE` page metadata; GREEN after replacement reset; focused workload 3/3 PASS | `native-go-userarena.trace`; `native_darwin::tests::biased_alias_remap_discards_stale_page_protection` | The 103,311-line syscall trace showed 8 MiB UserArena chunks reserved, protected none, then remapped writable before a direct `STP` fault. Alias replacement now retires native-page, write-exec, and Linux-4K subpage protection caches at host-page granularity. |
+| 2026-07-13 | worktree | `go-runtime --lane macos-native-dsr` after alias fix | 1 | MATCH; 52/52 on both sides; Carrick 32.418 s | `target/conformance/native-go-runtime-alias-remap-green.jsonl` | The originating UserArena crash is closed. Go build/runtime/sync smoke lanes are all measured MATCH; next ladder rung is CPython threading/subprocess. |
 
 ## Active failure clusters
 
@@ -61,12 +68,12 @@ start. Smoke/full membership remains authoritative in
 | ---: | --- | --- | --- | --- |
 | P0 | `THREAD_WAITERS` remains locked in a fork child | live LLDB stack plus deterministic contended-fork reducer | fixed in `6d3cf627`; four signed single-suite runs complete, multi-suite load proof pending | no CPython timeout in workers=4 smoke repeats |
 | P0 | Direct-exec target reservation rejects split dyld range | red/green Node-sized reducer plus signed eventfd/Node runs | fixed in `2a7d3046`; eventfd MATCH, Node reaches downstream thread guard; multi-suite load proof pending | no reservation collision in workers=4 smoke repeats |
-| P1 | Post-fork exec child cannot create guest threads | red/green staged reducer plus Node/Go/CPython unsafe samples and libdispatch symbolication | signed reducer + 5/5 repeats pass without bypass; Node app/V8 are MATCH through self-reexec; Go/CPython and process-state expansion remain | `forkexecpthread`, Node, Go, and CPython run after PID-preserving host self-reexec |
+| P1 | Post-fork exec child cannot create guest threads | red/green staged reducer plus Node/Go/CPython unsafe samples and libdispatch symbolication | signed reducer + 5/5 repeats pass without bypass; Node app/V8 and Go build/runtime/sync are MATCH through self-reexec; CPython remains | `forkexecpthread`, Node, Go, and CPython run after PID-preserving host self-reexec |
 | P2 | Remaining ecosystem/LTP differences | no fresh full native run yet | unknown | classify from measured full run after P0/P1 blockers clear |
 
 ## Bless checklist
 
-- [ ] `just ci`
+- [x] `just ci`
 - [ ] signed native conformance probes
 - [ ] smoke serial
 - [ ] smoke workers=4, three consecutive runs
@@ -83,8 +90,7 @@ start. Smoke/full membership remains authoritative in
 
 ## Current next action
 
-Run the isolated Go build/runtime/sync lanes to measure the next real survivor or
-process-state boundary, then do the same for CPython threading/subprocess. Add
-red-first cwd/signal/credential probes before removing the guard and unsafe
-diagnostic. After P1, run multi-suite smoke at four workers to provide the
-actual load proof for both P0 fixes.
+Run isolated CPython threading/subprocess now that Go build/runtime/sync are
+measured MATCH. Fix the next real survivor or process-state boundary from those
+workloads. After P1, run multi-suite smoke at four workers to provide the actual
+load proof for both P0 fixes.

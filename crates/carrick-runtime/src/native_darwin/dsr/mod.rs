@@ -858,56 +858,6 @@ impl ThreadTranslator {
         state.cache.patch_word_for_test(cache_pc, word)
     }
 
-    #[cfg(test)]
-    fn instruction_points_for_test(
-        &self,
-        guest: carrick_guest_mem::GuestVa,
-    ) -> Vec<types::CacheVa> {
-        let state = self.process.state.lock();
-        state
-            .published
-            .iter()
-            .flat_map(|block| {
-                block.map.iter().filter_map(|mapping| {
-                    if mapping.guest != guest {
-                        return None;
-                    }
-                    block
-                        .entry
-                        .host()
-                        .raw()
-                        .checked_add(mapping.cache.get() as usize)
-                        .map(carrick_guest_mem::HostVa)
-                        .map(types::CacheVa::published)
-                })
-            })
-            .collect()
-    }
-
-    #[cfg(test)]
-    fn patch_instruction_word_for_test(
-        &mut self,
-        cache_pc: types::CacheVa,
-        word: u32,
-    ) -> Result<(), types::DsrError> {
-        let mut state = self.process.state.lock();
-        let is_instruction = state.published.iter().any(|block| {
-            let start = block.entry.host().raw();
-            block.map.iter().any(|mapping| {
-                start
-                    .checked_add(mapping.cache.get() as usize)
-                    .is_some_and(|address| address == cache_pc.host().raw())
-            })
-        });
-        if !is_instruction {
-            return Err(types::DsrError::CachePolicy(format!(
-                "test patch target is not an emitted instruction: 0x{:x}",
-                cache_pc.host().raw()
-            )));
-        }
-        state.cache.patch_word_for_test(cache_pc, word)
-    }
-
     pub(super) fn profiling_enabled(&self) -> bool {
         self.profiling
     }

@@ -173,6 +173,21 @@ pub const LINUX_AT_EXECFN: u64 = 31;
 pub const LINUX_AT_SYSINFO_EHDR: u64 = 33;
 pub const LINUX_PAGE_SIZE: u64 = 4096;
 
+bitflags! {
+    /// AArch64 Linux `AT_HWCAP` feature bits published to the guest.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct LinuxAarch64Hwcap: u64 {
+        const FP = 1 << 0;
+        const ASIMD = 1 << 1;
+        const AES = 1 << 3;
+        const PMULL = 1 << 4;
+        const SHA1 = 1 << 5;
+        const SHA2 = 1 << 6;
+        const CRC32 = 1 << 7;
+        const ATOMICS = 1 << 8;
+    }
+}
+
 /// Round `value` up to the next multiple of `alignment`, returning `None` on
 /// overflow. `alignment` must be non-zero. Replaces the ~half-dozen private
 /// `align_up` copies that were scattered across the memory/IPC subsystems.
