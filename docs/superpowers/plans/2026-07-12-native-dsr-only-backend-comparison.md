@@ -8,6 +8,26 @@
 
 **Tech Stack:** Rust 1.96.0, edition 2024, clap/serde, DSR AArch64 emission, C ucontext gateway support, conformance probes, existing `perf_stats` and JSONL provenance, shell/just, codesign, Docker oracle.
 
+## Measured status (2026-07-13)
+
+The correctness prerequisite now includes signed low-address static `ET_EXEC`.
+XNU's measured minimum `__PAGEZERO` is 4 GiB, so native16k selects typed address
+modes: direct DSR retains identity mappings and byte-identical memory emission,
+while biased DSR maps a low Linux image at one collision-selected high host
+bias. PC, SP, LR, register pointers, fault addresses, signal frames, auxv,
+`/proc`, and diagnostics remain guest-coordinate values in both modes. Biased
+lowering audits scalar, pair, SIMD, atomic, exclusive, and literal memory
+families and fails closed with a typed error for unsupported forms.
+
+The current signed binary runs the low static `devnullseek` fixture with both
+markers and exit zero. Its separate static fork witness proves below-4-GiB
+parent code/data addresses, identical child guest addresses, retained static
+data, and zero child exit. These measured acceptance results do not authorize a
+performance publication: `altstacktid` independently times out, and the earlier
+331/378 campaign crossed the post-fork lifecycle defect. That campaign is not
+valid performance authority, `just bench-backends full` was not run for this
+closeout, and no projected probe counts are substituted for a fresh run.
+
 ## Global Constraints
 
 - Build runnable guests through `just build` or `scripts/build-signed.sh`; never run a bare `cargo build` artifact.
