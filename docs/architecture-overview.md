@@ -23,7 +23,8 @@ This page is the architectural deep-dive. For the syscall-by-syscall translation
 machinery below at runtime see [diagnostics-and-debugging.md](diagnostics-and-debugging.md).
 
 > [!NOTE]
-> This document describes the mature macOS/HVF AArch64 execution path. The
+> This document describes the mature macOS/HVF AArch64 execution path selected
+> with `--exec-backend vmm`, not the user CLI's native DSR default. The
 > platform split for Linux/KVM, FreeBSD/bhyve, NetBSD/NVMM, and the shared
 > x86_64 engine is covered in [hal.md](hal.md). Those backends reuse the same
 > runtime contract but differ in their raw VMM entry, register, memory, and host

@@ -1,11 +1,12 @@
 # Carrick
 
-Carrick is an experimental Linux binary compatibility layer. Its mature path
-runs unmodified Linux binaries on macOS / Apple Silicon as native host
-processes: each guest thread owns a hardware-virtualized vCPU, every guest
-syscall traps into Rust, and the runtime re-expresses Linux behavior with host
-kernel primitives. There is no guest Linux kernel, no second scheduler, and no
-separate VM process for each container.
+Carrick is an experimental Linux binary compatibility layer. It runs unmodified
+Linux binaries on macOS / Apple Silicon as native host processes and
+re-expresses Linux behavior with host kernel primitives. The ordinary same-ISA
+path executes guest instructions directly with the dynamic syscall rewriter
+(DSR); an explicit portable VMM policy retains the more mature macOS/HVF path.
+There is no guest Linux kernel, no second scheduler, and no separate VM process
+for each container.
 
 The same runtime is being split along two explicit axes:
 
@@ -21,7 +22,7 @@ sizes.
 > runs real workloads end-to-end on the macOS/HVF path, including `apt-get
 > install`, `python3 -m http.server`, and Go / Node.js / CPython conformance
 > slices. The non-macOS and x86_64 lanes are under active bring-up and are not
-> equivalent to the default macOS release path. Syscall coverage is partial
+> equivalent to the mature macOS/HVF compatibility path. Syscall coverage is partial
 > ([the emulation map](docs/syscalls-emulation-map.md) lists the current table),
 > guest behavior is incomplete, and the runtime has had **no adversarial security
 > review**. A guest is not a hardened trust boundary; do not run untrusted code
@@ -39,8 +40,9 @@ brew install --HEAD carrick
 ```
 
 The formula builds from source and ad-hoc codesigns the `carrick` binary with
-the `com.apple.security.hypervisor` entitlement so Hypervisor.framework can run
-guests. Non-macOS backends are source builds for target hosts today.
+the `com.apple.security.hypervisor` entitlement so the optional VMM backend can
+use Hypervisor.framework. Non-macOS backends are source builds for target hosts
+today.
 
 ---
 
@@ -48,13 +50,14 @@ guests. Non-macOS backends are source builds for target hosts today.
 
 ```sh
 just build                                  # build + codesign the release binary
-just run run ubuntu:24.04 /bin/echo hi      # docker-style: pull an image + run it
+just run run ubuntu:24.04 /bin/echo hi      # omitted backend: native DSR
 ./target/release/carrick run python:3.12-slim python3 -m http.server 8000
+./target/release/carrick run --exec-backend vmm ubuntu:24.04 /bin/echo hi
 ```
 
 > [!IMPORTANT]
-> On macOS, a guest can only run from a **codesigned** binary. `cargo build`
-> strips the signature, so a bare build fails every run with `HV_DENIED`
+> On macOS, the **VMM backend** can only run from a codesigned binary. `cargo
+> build` strips the signature, so `--exec-backend vmm` fails with `HV_DENIED`
 > (`0xfae94007`). `just build` uses
 > [`scripts/build-signed.sh`](scripts/build-signed.sh) to re-apply the
 > entitlement after linking. Use plain `cargo build`/`cargo test` for
@@ -62,21 +65,32 @@ just run run ubuntu:24.04 /bin/echo hi      # docker-style: pull an image + run 
 
 ---
 
-## Experimental Native Execution
+## Execution Backends
 
-Carrick also has an experimental Darwin-native backend for same-ISA
+Carrick defaults to an experimental Darwin-native backend for same-ISA
 `linux/arm64` binaries. It executes guest instructions directly in a macOS
 process, without an HVF vCPU. Darwin-native execution always uses the dynamic
 syscall rewriter (DSR); there is no alternate native instruction-execution
-mode. The default remains the release-quality HVF path, while native execution
-is explicit and trusted-code-only:
+mode. Omit `--exec-backend` (or pass `native`) to select it. Native execution is
+trusted-code-only and does not fall back when it encounters a compatibility
+gap:
 
 ```sh
 target/release/carrick run \
-  --exec-backend native \
   --native-page-profile native16k \
   ubuntu:24.04 /bin/echo hi
 ```
+
+Select the portable VMM compatibility policy explicitly when a workload needs
+the more mature macOS/HVF implementation:
+
+```sh
+target/release/carrick run --exec-backend vmm ubuntu:24.04 /bin/echo hi
+```
+
+The backend choice is container policy: create, start, restart, exec, fork,
+clone, and guest `execve` retain it unchanged. A native compatibility error may
+recommend `--exec-backend vmm`, but Carrick never retries automatically.
 
 The native backend has two page profiles:
 

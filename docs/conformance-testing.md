@@ -10,8 +10,10 @@ commands for different reasons:
   no Docker, no signed binary.
 * **Runtime conformance** — observable behavior is pinned by differential tests
   that run an identical workload under carrick and under a real Linux container
-  (the Docker oracle) and diff the output. The default macOS/HVF lane uses
-  `linux/arm64`; local x86_64 backend lanes use `linux/amd64`. Guest-running
+  (the Docker oracle) and diff the output. The default conformance lane is
+  macOS/HVF and explicitly passes `--exec-backend vmm`; this is distinct from
+  the user CLI's native default. It uses `linux/arm64`; local x86_64 backend
+  lanes use `linux/amd64` and likewise request `vmm`. Guest-running
   macOS lanes need a signed release binary and a reachable Docker daemon unless
   the oracle verdict is cached.
 
@@ -56,7 +58,7 @@ they run from a plain `cargo build` artifact and stay green on any machine.
 The primary runtime gate is `carrick-conformance`, driven through `just`:
 
 ```sh
-just conformance                 # full tier, default local HVF lane
+just conformance                 # full tier, explicit local VMM/HVF lane
 just conformance smoke           # smoke tier
 just conformance full --bless    # refresh baseline/oracle outputs when intended
 just matrix                      # re-render docs/support-matrix.md from results
@@ -74,8 +76,9 @@ cargo run -p carrick-conformance -- --lane nvmm-local --tier smoke
 ```
 
 Those lanes expect a platform-native `carrick` binary built with the matching
-`platform-*` feature and generally inject `--platform linux/amd64`. Backend
-expected gaps belong in backend overlays, not in the main HVF baseline.
+`platform-*` feature and inject `--exec-backend vmm` plus, where appropriate,
+`--platform linux/amd64`. Backend expected gaps belong in backend overlays, not
+in the main HVF baseline.
 
 ## Legacy differential probe suite vs Docker
 
