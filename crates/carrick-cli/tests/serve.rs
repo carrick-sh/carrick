@@ -64,6 +64,10 @@ fn spawn_server() -> (ServerGuard, String, tempfile::TempDir) {
     let bin = assert_cmd::cargo::cargo_bin("carrick");
     ensure_codesigned(&bin);
     let mut child = std::process::Command::new(bin)
+        // This integration suite is the codesigned macOS/HVF lane. Keep that
+        // execution model explicit now that ordinary CLI policy defaults to
+        // native DSR; the server's self-spawned `carrick create` inherits it.
+        .env("CARRICK_EXEC_BACKEND", "vmm")
         .args(["serve", "--docker-api", "--host", &sock_str])
         .spawn()
         .unwrap();

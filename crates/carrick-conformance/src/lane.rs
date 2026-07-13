@@ -157,9 +157,10 @@ pub fn carrick_invocation_argv(
 ) -> Vec<String> {
     let base = carrick_argv(suite, carrick_bin, run_id); // [carrick_bin, "run", …flags…, image, …cmd]
     match lane {
-        Lane::Hvf => base,
+        Lane::Hvf => carrick_argv_with_exec_backend(base, &suite.image, "vmm"),
         Lane::MacosNativeDsr => carrick_argv_with_native_dsr(base, &suite.image),
         Lane::KvmLocal(_) | Lane::BhyveLocal(_) | Lane::NvmmLocal(_) => {
+            let base = carrick_argv_with_exec_backend(base, &suite.image, "vmm");
             carrick_argv_with_platform(base, &suite.image, DockerPlatform::LinuxAmd64)
         }
         Lane::Kvm(cfg) => {
@@ -173,6 +174,7 @@ pub fn carrick_invocation_argv(
                 inner.push("env".to_string());
                 inner.push(format!("CARRICK_INSECURE_REGISTRIES={host}"));
             }
+            let base = carrick_argv_with_exec_backend(base, &suite.image, "vmm");
             inner.extend(base.into_iter().map(|tok| {
                 if tok == suite.image {
                     rewrite_registry_host(&tok, "localhost", &cfg.gateway)
@@ -228,18 +230,30 @@ pub fn carrick_invocation_argv(
 }
 
 fn carrick_argv_with_native_dsr(mut argv: Vec<String>, image: &str) -> Vec<String> {
+    argv = carrick_argv_with_exec_backend(argv, image, "native");
     let image_idx = argv
         .iter()
         .position(|tok| tok == image)
         .unwrap_or(argv.len());
     argv.splice(
         image_idx..image_idx,
-        [
-            "--exec-backend".to_string(),
-            "native".to_string(),
-            "--native-page-profile".to_string(),
-            "native16k".to_string(),
-        ],
+        ["--native-page-profile".to_string(), "native16k".to_string()],
+    );
+    argv
+}
+
+fn carrick_argv_with_exec_backend(
+    mut argv: Vec<String>,
+    image: &str,
+    backend: &str,
+) -> Vec<String> {
+    let image_idx = argv
+        .iter()
+        .position(|tok| tok == image)
+        .unwrap_or(argv.len());
+    argv.splice(
+        image_idx..image_idx,
+        ["--exec-backend".to_string(), backend.to_string()],
     );
     argv
 }
@@ -328,6 +342,26 @@ mod tests {
         Suite::for_test("localhost:5005/carrick-go-conformance:1.24", &["true"])
     }
 
+    fn assert_explicit_backend_before_image(argv: &[String], image: &str, backend: &str) {
+        let backend_pairs = argv
+            .windows(2)
+            .filter(|window| window[0] == "--exec-backend" && window[1] == backend)
+            .count();
+        assert_eq!(backend_pairs, 1, "unexpected backend argv: {argv:?}");
+        let backend_index = argv
+            .iter()
+            .position(|argument| argument == "--exec-backend")
+            .expect("backend flag");
+        let image_index = argv
+            .iter()
+            .position(|argument| argument == image)
+            .expect("image argument");
+        assert!(
+            backend_index < image_index,
+            "backend must precede image: {argv:?}"
+        );
+    }
+
     #[test]
     fn rewrite_localhost_registry_host_in_image_ref() {
         // The conformance images live at localhost:5005/... on the mac; from the
@@ -372,6 +406,7 @@ mod tests {
         assert_eq!(argv[1], "run");
         assert!(argv.contains(&"localhost:5005/carrick-go-conformance:1.24".to_string()));
         assert!(!argv.contains(&"limactl".to_string()));
+        assert_explicit_backend_before_image(&argv, &s.image, "vmm");
     }
 
     #[test]
@@ -407,6 +442,8 @@ mod tests {
         let removed_mode_flag = concat!("--native-code-", "mode");
         assert!(!argv.iter().any(|arg| arg == removed_mode_flag));
         assert!(image > 1);
+        assert_explicit_backend_before_image(&argv, &s.image, "native");
+        assert!(!argv.iter().any(|argument| argument == "vmm"));
     }
 
     #[test]
@@ -433,6 +470,7 @@ mod tests {
         assert!(inner.contains("CARRICK_INSECURE_REGISTRIES=host.lima.internal:5005"));
         assert!(inner.contains("/home/user/carrick/target/release/carrick"));
         assert!(inner.contains(" run "));
+        assert_eq!(inner.matches("--exec-backend vmm").count(), 1, "{inner}");
         // image-ref host rewritten to the gateway, un-rewritten host absent:
         assert!(inner.contains("host.lima.internal:5005/carrick-go-conformance:1.24"));
         assert!(!inner.contains("localhost:5005/carrick-go-conformance:1.24"));
@@ -469,6 +507,7 @@ mod tests {
         );
         assert!(argv.contains(&"localhost:5005/carrick-go-conformance:1.24".to_string()));
         assert!(!argv.contains(&"limactl".to_string()));
+        assert_explicit_backend_before_image(&argv, &s.image, "vmm");
     }
 
     #[test]
@@ -488,6 +527,7 @@ mod tests {
         );
         assert!(argv.contains(&"localhost:5005/carrick-go-conformance:1.24".to_string()));
         assert!(!argv.contains(&"limactl".to_string()));
+        assert_explicit_backend_before_image(&argv, &s.image, "vmm");
     }
 
     #[test]
@@ -507,6 +547,7 @@ mod tests {
         );
         assert!(argv.contains(&"localhost:5005/carrick-go-conformance:1.24".to_string()));
         assert!(!argv.contains(&"limactl".to_string()));
+        assert_explicit_backend_before_image(&argv, &s.image, "vmm");
     }
 
     #[test]
@@ -568,11 +609,16 @@ mod tests {
     }
 
     #[test]
-    fn dry_run_hvf_matches_legacy_carrick_argv() {
-        // Behavior-preservation: the Hvf dry-run argv equals the pre-lane argv.
+    fn dry_run_hvf_changes_only_explicit_backend_policy() {
         let s = demo_suite();
         let legacy = crate::engine::carrick_argv(&s, "target/release/carrick", "conf-1-2");
-        let now = carrick_invocation_argv(&s, "target/release/carrick", "conf-1-2", &Lane::Hvf);
+        let mut now = carrick_invocation_argv(&s, "target/release/carrick", "conf-1-2", &Lane::Hvf);
+        let backend_index = now
+            .iter()
+            .position(|argument| argument == "--exec-backend")
+            .expect("explicit backend policy");
+        assert_eq!(now[backend_index + 1], "vmm");
+        now.drain(backend_index..backend_index + 2);
         assert_eq!(legacy, now);
     }
 }
