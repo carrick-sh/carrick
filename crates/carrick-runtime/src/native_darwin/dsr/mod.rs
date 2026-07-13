@@ -55,6 +55,7 @@ pub(super) struct PreparedEntry {
     generation: types::CodeGeneration,
     cache_start: usize,
     cache_end: usize,
+    address_mode: super::address::NativeAddressMode,
 }
 
 pub(super) struct PreparedExit {
@@ -503,6 +504,7 @@ impl ProcessState {
                     &mut self.cache,
                     &block,
                     emit::GenerationGuard::new(observation.current_atomic(), generation),
+                    memory.address_mode().into(),
                 )?;
                 let emitted_bytes = u64::try_from(emitted.len()).unwrap_or(u64::MAX);
                 probes::dsr_cache_event(
@@ -808,6 +810,7 @@ impl ThreadTranslator {
             generation,
             cache_start: cache_range.start,
             cache_end: cache_range.end,
+            address_mode: memory.address_mode(),
         };
         if PROFILE {
             probes::dsr_prepare_end(
@@ -848,6 +851,7 @@ impl ThreadTranslator {
             &self.indirect_cache,
             prepared.cache_start,
             prepared.cache_end,
+            prepared.address_mode,
         );
         if let Err(error) = gateway_result {
             if PROFILE {
@@ -1071,7 +1075,7 @@ impl ThreadTranslator {
                         indirect_x30_scratch,
                     )?;
                 }
-                snapshot.pc = guest_pc.raw();
+                snapshot.pc = recovery_resume_pc(guest_pc, recovery)?;
                 let (kind, address) = if let Some((signum, code)) =
                     crate::vcpu_loop::el0_debug_signal(snapshot.esr)
                 {
@@ -1108,7 +1112,7 @@ impl ThreadTranslator {
                     )?;
                 }
                 self.last_kick = Some((guest_pc, recovery));
-                snapshot.pc = guest_pc.raw();
+                snapshot.pc = recovery_resume_pc(guest_pc, recovery)?;
                 ThreadExit::Kick
             }
             types::NativeDsrExit::KickAtEntry { resume } => {
@@ -1117,6 +1121,19 @@ impl ThreadTranslator {
             }
             other => ThreadExit::Unsupported(format!("{other:?}")),
         })
+    }
+}
+
+fn recovery_resume_pc(
+    guest_pc: carrick_guest_mem::GuestVa,
+    recovery: Option<emit::RecoveryAction>,
+) -> Result<u64, types::DsrError> {
+    if recovery.is_some_and(emit::RecoveryAction::instruction_complete) {
+        guest_pc.raw().checked_add(4).ok_or_else(|| {
+            types::DsrError::CachePolicy("DSR completed-instruction resume PC overflow".to_string())
+        })
+    } else {
+        Ok(guest_pc.raw())
     }
 }
 
@@ -1129,6 +1146,111 @@ fn recover_rewrite_state(
     saved_indirect_x15: u64,
     saved_indirect_x30: u64,
 ) -> Result<(), types::DsrError> {
+    if let emit::RecoveryAction::RecoverBiasedMemory(recovery) = action {
+        let saved_values = [
+            saved_scratch,
+            saved_context_scratch,
+            saved_indirect_x15,
+            saved_indirect_x30,
+        ];
+        let base_value = if recovery.commit_base {
+            let index = usize::try_from(recovery.base_scratch).map_err(|_| {
+                types::DsrError::CachePolicy("biased base scratch index overflow".to_string())
+            })?;
+            let current = snapshot.x.get(index).copied().ok_or_else(|| {
+                types::DsrError::CachePolicy(format!(
+                    "biased base scratch x{} is outside snapshot",
+                    recovery.base_scratch
+                ))
+            })?;
+            Some(match recovery.base_coordinate {
+                // AArch64 pre/post-index writeback is modulo 2^64. The memory
+                // access used a valid translated address before the update;
+                // only the architectural result may wrap below the bias.
+                emit::BiasedBaseCoordinate::Host => current.wrapping_sub(recovery.host_bias.get()),
+                emit::BiasedBaseCoordinate::Guest => current,
+            })
+        } else {
+            None
+        };
+        let virtual_x18 = recovery
+            .virtual_x18_scratch
+            .map(|register| {
+                usize::try_from(register)
+                    .ok()
+                    .and_then(|index| snapshot.x.get(index).copied())
+                    .ok_or_else(|| {
+                        types::DsrError::CachePolicy(format!(
+                            "biased virtual x18 scratch x{register} is outside snapshot"
+                        ))
+                    })
+            })
+            .transpose()?;
+        let virtual_x28 = recovery
+            .virtual_x28_scratch
+            .map(|register| {
+                usize::try_from(register)
+                    .ok()
+                    .and_then(|index| snapshot.x.get(index).copied())
+                    .ok_or_else(|| {
+                        types::DsrError::CachePolicy(format!(
+                            "biased virtual x28 scratch x{register} is outside snapshot"
+                        ))
+                    })
+            })
+            .transpose()?;
+        let scratch_count = usize::from(recovery.scratch_count);
+        if scratch_count > recovery.scratch_registers.len() {
+            return Err(types::DsrError::CachePolicy(format!(
+                "biased recovery scratch count {scratch_count} exceeds capacity"
+            )));
+        }
+        for (register, value) in recovery.scratch_registers[..scratch_count]
+            .iter()
+            .copied()
+            .zip(saved_values)
+        {
+            let index = usize::try_from(register).map_err(|_| {
+                types::DsrError::CachePolicy("biased scratch index overflow".to_string())
+            })?;
+            let slot = snapshot.x.get_mut(index).ok_or_else(|| {
+                types::DsrError::CachePolicy(format!(
+                    "biased scratch x{register} is outside snapshot"
+                ))
+            })?;
+            *slot = value;
+        }
+        if let Some(value) = virtual_x18 {
+            snapshot.x[18] = value;
+        }
+        if let Some(value) = virtual_x28 {
+            snapshot.x[28] = value;
+        }
+        if let Some(value) = base_value {
+            match recovery.base {
+                emit::BiasedBase::Register(register) => {
+                    let index = usize::try_from(register).map_err(|_| {
+                        types::DsrError::CachePolicy("biased guest base index overflow".to_string())
+                    })?;
+                    let slot = snapshot.x.get_mut(index).ok_or_else(|| {
+                        types::DsrError::CachePolicy(format!(
+                            "biased guest base x{register} is outside snapshot"
+                        ))
+                    })?;
+                    *slot = value;
+                }
+                emit::BiasedBase::StackPointer => snapshot.sp = value,
+                emit::BiasedBase::VirtualX18 => snapshot.x[18] = value,
+                emit::BiasedBase::VirtualX28 => snapshot.x[28] = value,
+                emit::BiasedBase::None => {
+                    return Err(types::DsrError::CachePolicy(
+                        "biased recovery attempted to commit a missing base".to_string(),
+                    ));
+                }
+            }
+        }
+        return Ok(());
+    }
     let (register, context_register) = match action {
         emit::RecoveryAction::Noop => return Ok(()),
         emit::RecoveryAction::RestoreGuestX17 => {
@@ -1161,6 +1283,11 @@ fn recover_rewrite_state(
             return Ok(());
         }
         emit::RecoveryAction::RestoreDualVirtualReadOnly {
+            x18_scratch,
+            x28_scratch,
+            context_scratch,
+        }
+        | emit::RecoveryAction::RestoreDualVirtualReadOnlyCompleted {
             x18_scratch,
             x28_scratch,
             context_scratch,
@@ -1228,10 +1355,15 @@ fn recover_rewrite_state(
             return Ok(());
         }
         emit::RecoveryAction::RestoreScratch { register }
+        | emit::RecoveryAction::RestoreScratchCompleted { register }
         | emit::RecoveryAction::CommitVirtualizedAndRestoreScratch { register, .. } => {
             (register, None)
         }
         emit::RecoveryAction::RestoreScratchAndContext {
+            register,
+            context_register,
+        }
+        | emit::RecoveryAction::RestoreScratchAndContextCompleted {
             register,
             context_register,
         }
@@ -1240,6 +1372,11 @@ fn recover_rewrite_state(
             context_register,
             ..
         } => (register, Some(context_register)),
+        emit::RecoveryAction::RecoverBiasedMemory(_) => {
+            return Err(types::DsrError::CachePolicy(
+                "biased recovery escaped its typed handler".to_string(),
+            ));
+        }
     };
     let index = usize::try_from(register)
         .map_err(|_| types::DsrError::CachePolicy("rewrite scratch index overflow".to_string()))?;
@@ -1286,13 +1423,93 @@ fn recover_rewrite_state(
 mod tests {
     use super::decode::classify;
     use super::types::{
-        DirectKind, IndirectKind, InstAction, MemoryBase, MemoryClass, PcRelativeKind,
-        SensitiveKind,
+        DirectKind, IndirectKind, InstAction, MemoryBase, MemoryClass, MemoryVirtualization,
+        PcRelativeKind, SensitiveKind,
     };
     use carrick_guest_mem::{GuestMemory, GuestVa};
     use proptest::prelude::*;
 
     const PC: GuestVa = GuestVa(0x1000);
+
+    fn biased_recovery_fixture(
+        base: super::emit::BiasedBase,
+        coordinate: super::emit::BiasedBaseCoordinate,
+        complete: bool,
+    ) -> super::emit::RecoveryAction {
+        super::emit::RecoveryAction::RecoverBiasedMemory(super::emit::BiasedMemoryRecovery {
+            scratch_registers: [9, 10, 0, 0],
+            scratch_count: 2,
+            base_scratch: 9,
+            base,
+            base_coordinate: coordinate,
+            commit_base: true,
+            virtual_x18_scratch: None,
+            virtual_x28_scratch: None,
+            host_bias: super::super::address::NativeHostBias::new(0x80_0000_0000, 16 * 1024)
+                .expect("construct host bias"),
+            instruction_complete: complete,
+        })
+    }
+
+    #[test]
+    fn biased_recovery_resume_and_wrapping_writeback_are_architectural() {
+        let retry = biased_recovery_fixture(
+            super::emit::BiasedBase::Register(0),
+            super::emit::BiasedBaseCoordinate::Host,
+            false,
+        );
+        let completed = biased_recovery_fixture(
+            super::emit::BiasedBase::Register(0),
+            super::emit::BiasedBaseCoordinate::Host,
+            true,
+        );
+        assert_eq!(
+            super::recovery_resume_pc(PC, Some(retry)).unwrap(),
+            PC.raw()
+        );
+        assert_eq!(
+            super::recovery_resume_pc(PC, Some(completed)).unwrap(),
+            PC.raw() + 4
+        );
+
+        let mut snapshot = super::super::NativeUcontextSnapshot::default();
+        snapshot.x[9] = 3;
+        super::recover_rewrite_state(&mut snapshot, completed, 0xaa, 0xbb, 0, 0, 0)
+            .expect("recover wrapped writeback");
+        assert_eq!(snapshot.x[0], 3_u64.wrapping_sub(0x80_0000_0000));
+        assert_eq!(snapshot.x[9], 0xaa);
+        assert_eq!(snapshot.x[10], 0xbb);
+    }
+
+    #[test]
+    fn biased_recovery_commits_register_sp_and_virtual_bases_last() {
+        let bias = 0x80_0000_0000;
+        let guest = 0x1234_5000;
+        for base in [
+            super::emit::BiasedBase::Register(16),
+            super::emit::BiasedBase::StackPointer,
+            super::emit::BiasedBase::VirtualX18,
+            super::emit::BiasedBase::VirtualX28,
+        ] {
+            let action =
+                biased_recovery_fixture(base, super::emit::BiasedBaseCoordinate::Host, true);
+            let mut snapshot = super::super::NativeUcontextSnapshot::default();
+            snapshot.x[9] = bias + guest;
+            super::recover_rewrite_state(&mut snapshot, action, 0xaa, 0xbb, 0, 0, 0)
+                .expect("recover biased base");
+            match base {
+                super::emit::BiasedBase::Register(16) => assert_eq!(snapshot.x[16], guest),
+                super::emit::BiasedBase::StackPointer => assert_eq!(snapshot.sp, guest),
+                super::emit::BiasedBase::VirtualX18 => assert_eq!(snapshot.x[18], guest),
+                super::emit::BiasedBase::VirtualX28 => assert_eq!(snapshot.x[28], guest),
+                super::emit::BiasedBase::Register(_) | super::emit::BiasedBase::None => {
+                    panic!("unexpected recovery base")
+                }
+            }
+            assert_eq!(snapshot.x[9], 0xaa);
+            assert_eq!(snapshot.x[10], 0xbb);
+        }
+    }
 
     fn mapped_dsr_test_memory(
         words: &[u32],
@@ -1693,17 +1910,15 @@ mod tests {
         }
         assert!(matches!(
             classify(0xa900_4b82, PC),
-            Ok(InstAction::VirtualizedX18X28ReadOnly {
-                word: 0xa900_4b82,
-                ..
-            })
+            Ok(InstAction::Memory(memory))
+                if memory.word == 0xa900_4b82
+                    && memory.virtualization == MemoryVirtualization::X18X28ReadOnly
         ));
         assert!(matches!(
             classify(0xf900_0e5c, PC),
-            Ok(InstAction::VirtualizedX18X28ReadOnly {
-                word: 0xf900_0e5c,
-                ..
-            })
+            Ok(InstAction::Memory(memory))
+                if memory.word == 0xf900_0e5c
+                    && memory.virtualization == MemoryVirtualization::X18X28ReadOnly
         ));
         assert!(matches!(
             classify(0x910a_6392, PC),
@@ -1721,10 +1936,9 @@ mod tests {
         ));
         assert!(matches!(
             classify(0xa94d_cb8f, PC),
-            Ok(InstAction::VirtualizedX18WriteX28Read {
-                word: 0xa94d_cb8f,
-                ..
-            })
+            Ok(InstAction::Memory(memory))
+                if memory.word == 0xa94d_cb8f
+                    && memory.virtualization == MemoryVirtualization::X18WriteX28Read
         ));
         assert!(matches!(
             classify(0xd400_0001, PC),

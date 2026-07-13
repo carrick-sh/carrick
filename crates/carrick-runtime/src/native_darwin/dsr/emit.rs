@@ -3,12 +3,31 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::AtomicU64;
 
-use carrick_guest_mem::GuestVa;
+use carrick_guest_mem::{GuestVa, HostVa};
 use dynasmrt::{DynasmApi, DynasmLabelApi, VecAssembler, aarch64::Aarch64Relocation};
 
 use super::block::{BlockPlan, PlannedExit};
 use super::cache::{PublishedCode, TranslationCache};
 use super::types::{CacheOffset, CacheVa, CodeGeneration, DsrError, InstAction};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum EmitAddressMode {
+    Direct,
+    Biased {
+        host_bias: super::super::address::NativeHostBias,
+    },
+}
+
+impl From<super::super::address::NativeAddressMode> for EmitAddressMode {
+    fn from(mode: super::super::address::NativeAddressMode) -> Self {
+        match mode {
+            super::super::address::NativeAddressMode::Direct => Self::Direct,
+            super::super::address::NativeAddressMode::Biased { host_bias } => {
+                Self::Biased { host_bias }
+            }
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct PcMapEntry {
@@ -89,11 +108,18 @@ pub(super) enum RecoveryAction {
     RestoreScratch {
         register: u32,
     },
+    RestoreScratchCompleted {
+        register: u32,
+    },
     CommitVirtualizedAndRestoreScratch {
         register: u32,
         virtual_register: u32,
     },
     RestoreScratchAndContext {
+        register: u32,
+        context_register: u32,
+    },
+    RestoreScratchAndContextCompleted {
         register: u32,
         context_register: u32,
     },
@@ -107,6 +133,11 @@ pub(super) enum RecoveryAction {
         x28_scratch: u32,
         context_scratch: u32,
     },
+    RestoreDualVirtualReadOnlyCompleted {
+        x18_scratch: u32,
+        x28_scratch: u32,
+        context_scratch: u32,
+    },
     CommitDualVirtualAndRestore {
         x18_scratch: u32,
         x28_scratch: u32,
@@ -114,6 +145,51 @@ pub(super) enum RecoveryAction {
         virtual_register: u32,
         virtual_scratch: u32,
     },
+    RecoverBiasedMemory(BiasedMemoryRecovery),
+}
+
+impl RecoveryAction {
+    pub(super) const fn instruction_complete(self) -> bool {
+        match self {
+            Self::RestoreScratchCompleted { .. }
+            | Self::RestoreScratchAndContextCompleted { .. }
+            | Self::RestoreDualVirtualReadOnlyCompleted { .. }
+            | Self::CommitVirtualizedAndRestoreScratch { .. }
+            | Self::CommitVirtualizedAndRestoreScratchAndContext { .. }
+            | Self::CommitDualVirtualAndRestore { .. } => true,
+            Self::RecoverBiasedMemory(recovery) => recovery.instruction_complete,
+            _ => false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum BiasedBase {
+    Register(u32),
+    StackPointer,
+    VirtualX18,
+    VirtualX28,
+    None,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum BiasedBaseCoordinate {
+    Host,
+    Guest,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct BiasedMemoryRecovery {
+    pub(super) scratch_registers: [u32; 4],
+    pub(super) scratch_count: u8,
+    pub(super) base_scratch: u32,
+    pub(super) base: BiasedBase,
+    pub(super) base_coordinate: BiasedBaseCoordinate,
+    pub(super) commit_base: bool,
+    pub(super) virtual_x18_scratch: Option<u32>,
+    pub(super) virtual_x28_scratch: Option<u32>,
+    pub(super) host_bias: super::super::address::NativeHostBias,
+    pub(super) instruction_complete: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -311,7 +387,7 @@ fn emit_pc_relative_address(
     }
     recovery.push(RecoveryEntry {
         cache: current_offset(assembler)?,
-        action: RecoveryAction::RestoreScratch { register: scratch },
+        action: RecoveryAction::RestoreScratchCompleted { register: scratch },
     });
     emit_word(
         assembler,
@@ -330,7 +406,7 @@ fn emit_recovering_scratch_sequence(
     assembler: &mut VecAssembler<Aarch64Relocation>,
     entries: &mut Vec<PcMapEntry>,
     guest: GuestVa,
-    target: GuestVa,
+    target: MaterializedAddress,
     memory_word: u32,
     scratch: u32,
     commit_virtual: Option<(u32, u32)>,
@@ -379,10 +455,25 @@ fn emit_recovering_scratch_sequence(
     }
     recovery.push(RecoveryEntry {
         cache: current_offset(assembler)?,
-        action: RecoveryAction::RestoreScratch { register: scratch },
+        action: RecoveryAction::RestoreScratchCompleted { register: scratch },
     });
     emit_word(assembler, entries, guest, restore)?;
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MaterializedAddress {
+    Guest(GuestVa),
+    Host(HostVa),
+}
+
+impl MaterializedAddress {
+    fn raw(self) -> u64 {
+        match self {
+            Self::Guest(address) => address.raw(),
+            Self::Host(address) => address.raw() as u64,
+        }
+    }
 }
 
 fn emit_pc_relative_literal(
@@ -391,6 +482,7 @@ fn emit_pc_relative_literal(
     plan: &BlockPlan,
     guest: GuestVa,
     relative: super::types::PcRelativeInst,
+    target: MaterializedAddress,
     recovery: &mut Vec<RecoveryEntry>,
 ) -> Result<(), DsrError> {
     let opc = relative.word >> 30;
@@ -400,14 +492,7 @@ fn emit_pc_relative_literal(
     if relative.kind == super::types::PcRelativeKind::LiteralPrefetch {
         let word = 0xf980_0000 | (scratch << 5) | destination;
         return emit_recovering_scratch_sequence(
-            assembler,
-            entries,
-            guest,
-            relative.target,
-            word,
-            scratch,
-            None,
-            recovery,
+            assembler, entries, guest, target, word, scratch, None, recovery,
         );
     }
 
@@ -427,14 +512,7 @@ fn emit_pc_relative_literal(
         };
         let word = base | (scratch << 5) | destination;
         return emit_recovering_scratch_sequence(
-            assembler,
-            entries,
-            guest,
-            relative.target,
-            word,
-            scratch,
-            None,
-            recovery,
+            assembler, entries, guest, target, word, scratch, None, recovery,
         );
     }
 
@@ -462,7 +540,7 @@ fn emit_pc_relative_literal(
         assembler,
         entries,
         guest,
-        relative.target,
+        target,
         base | (scratch << 5) | load_destination,
         scratch,
         virtual_destination.map(|offset| (destination, offset)),
@@ -935,6 +1013,11 @@ fn emit_dual_virtual(
         x28_scratch,
         context_scratch,
     };
+    let completed_restore = RecoveryAction::RestoreDualVirtualReadOnlyCompleted {
+        x18_scratch,
+        x28_scratch,
+        context_scratch,
+    };
     for instruction in [
         0xaa1c_03e0 | context_scratch,
         0xf940_0000 | ((144 / 8) << 10) | (context_scratch << 5) | x18_scratch,
@@ -984,7 +1067,7 @@ fn emit_dual_virtual(
     ] {
         recovery.push(RecoveryEntry {
             cache: current_offset(assembler)?,
-            action: restore,
+            action: completed_restore,
         });
         emit_word(assembler, entries, guest, instruction)?;
     }
@@ -1053,7 +1136,7 @@ fn emit_virtualized_register(
     emit_word(assembler, entries, guest, store_virtual)?;
     recovery.push(RecoveryEntry {
         cache: current_offset(assembler)?,
-        action: RecoveryAction::RestoreScratchAndContext {
+        action: RecoveryAction::RestoreScratchAndContextCompleted {
             register: scratch,
             context_register: context_scratch,
         },
@@ -1061,7 +1144,7 @@ fn emit_virtualized_register(
     emit_word(assembler, entries, guest, restore)?;
     recovery.push(RecoveryEntry {
         cache: current_offset(assembler)?,
-        action: RecoveryAction::RestoreScratchAndContext {
+        action: RecoveryAction::RestoreScratchAndContextCompleted {
             register: scratch,
             context_register: context_scratch,
         },
@@ -1070,25 +1153,487 @@ fn emit_virtualized_register(
     Ok(())
 }
 
+const BIASED_SCRATCH_CONTEXT_OFFSETS: [u32; 4] = [1120, 1128, 1160, 1168];
+
+fn biased_base(memory: super::types::MemoryAccess) -> Result<BiasedBase, DsrError> {
+    match memory.base {
+        super::types::MemoryBase::Register(register) => {
+            if matches!(register, bad64::Reg::SP | bad64::Reg::WSP) {
+                Ok(BiasedBase::StackPointer)
+            } else {
+                gpr_index(register)
+                    .map(BiasedBase::Register)
+                    .ok_or_else(|| {
+                        DsrError::BlockPolicy(format!(
+                            "biased memory base {register:?} is not a GPR or SP"
+                        ))
+                    })
+            }
+        }
+        super::types::MemoryBase::VirtualX18 => Ok(BiasedBase::VirtualX18),
+        super::types::MemoryBase::VirtualX28 => Ok(BiasedBase::VirtualX28),
+        super::types::MemoryBase::Literal(_) => Ok(BiasedBase::None),
+    }
+}
+
+fn rewritten_biased_virtual_word(
+    memory: super::types::MemoryAccess,
+    guest: GuestVa,
+) -> Result<(u32, Option<u32>, Option<u32>), DsrError> {
+    match memory.virtualization {
+        super::types::MemoryVirtualization::None => Ok((memory.word, None, None)),
+        super::types::MemoryVirtualization::X18 => {
+            let (scratch, _, word) =
+                rewritten_virtual_word(memory.word, guest, 18).ok_or_else(|| {
+                    DsrError::BlockPolicy("biased x18 memory operand is not rewritable".to_string())
+                })?;
+            Ok((word, Some(scratch), None))
+        }
+        super::types::MemoryVirtualization::X28 => {
+            let (scratch, _, word) =
+                rewritten_virtual_word(memory.word, guest, 28).ok_or_else(|| {
+                    DsrError::BlockPolicy("biased x28 memory operand is not rewritable".to_string())
+                })?;
+            Ok((word, None, Some(scratch)))
+        }
+        super::types::MemoryVirtualization::X18X28ReadOnly
+        | super::types::MemoryVirtualization::X18WriteX28Read => {
+            let (x18, x28, _, word) = rewritten_dual_virtual_read_only_word(memory.word, guest)
+                .ok_or_else(|| {
+                    DsrError::BlockPolicy(
+                        "biased x18/x28 memory operands are not rewritable".to_string(),
+                    )
+                })?;
+            Ok((word, Some(x18), Some(x28)))
+        }
+        super::types::MemoryVirtualization::Unsupported => Err(DsrError::BlockPolicy(
+            "biased memory has unsupported x18/x28 virtualization".to_string(),
+        )),
+    }
+}
+
+fn biased_scratch_registers(
+    word: u32,
+    guest: GuestVa,
+    already: &[u32],
+    count: usize,
+) -> Option<Vec<u32>> {
+    let mut selected = Vec::with_capacity(count);
+    for register in (9_u32..=17)
+        .rev()
+        .chain((0_u32..=8).rev())
+        .chain([30, 29, 27])
+    {
+        if already.contains(&register)
+            || selected.contains(&register)
+            || super::decode::decoded_operands_mention_gpr(word, guest, register)
+        {
+            continue;
+        }
+        selected.push(register);
+        if selected.len() == count {
+            return Some(selected);
+        }
+    }
+    None
+}
+
+fn emit_with_biased_recovery(
+    assembler: &mut VecAssembler<Aarch64Relocation>,
+    entries: &mut Vec<PcMapEntry>,
+    recovery: &mut Vec<RecoveryEntry>,
+    guest: GuestVa,
+    word: u32,
+    action: BiasedMemoryRecovery,
+) -> Result<(), DsrError> {
+    recovery.push(RecoveryEntry {
+        cache: current_offset(assembler)?,
+        action: RecoveryAction::RecoverBiasedMemory(action),
+    });
+    emit_word(assembler, entries, guest, word)
+}
+
+fn is_store_exclusive(op: bad64::Op) -> bool {
+    matches!(
+        op,
+        bad64::Op::STLXP
+            | bad64::Op::STLXR
+            | bad64::Op::STLXRB
+            | bad64::Op::STLXRH
+            | bad64::Op::STXP
+            | bad64::Op::STXR
+            | bad64::Op::STXRB
+            | bad64::Op::STXRH
+    )
+}
+
+fn emit_biased_store_exclusive(
+    assembler: &mut VecAssembler<Aarch64Relocation>,
+    entries: &mut Vec<PcMapEntry>,
+    plan: &BlockPlan,
+    guest: GuestVa,
+    memory: super::types::MemoryAccess,
+    recovery: &mut Vec<RecoveryEntry>,
+) -> Result<(), DsrError> {
+    if guest == plan.start {
+        // The gateway and generation guard contain ordinary stores, so an
+        // exclusive monitor cannot survive into a block-entry STXR. Report a
+        // permitted spurious failure and let the guest retry from its LDXR.
+        let status = (memory.word >> 16) & 0x1f;
+        return emit_word(
+            assembler,
+            entries,
+            guest,
+            0x5280_0020 | status, // mov w<status>, #1
+        );
+    }
+    if memory.virtualization != super::types::MemoryVirtualization::None
+        || super::decode::decoded_operands_mention_x18(memory.word, guest)
+        || super::decode::decoded_operands_mention_x28(memory.word, guest)
+    {
+        return Err(unsupported_action(
+            plan,
+            guest,
+            memory.word,
+            "store-exclusive with virtual x18/x28 operand in biased mode",
+        ));
+    }
+    let super::types::MemoryBase::Register(base) = memory.base else {
+        return Err(unsupported_action(
+            plan,
+            guest,
+            memory.word,
+            "store-exclusive with virtual or literal base in biased mode",
+        ));
+    };
+    // Any ordinary host store after LDXR clears the local exclusive monitor.
+    // Keep this preamble load-only: physical x18 is not guest-visible and can
+    // transiently hold the translated address until the exclusive store.
+    emit_word(
+        assembler,
+        entries,
+        guest,
+        0xf940_0000 | ((1192 / 8) << 10) | (28 << 5) | 18,
+    )?;
+    let add = if matches!(base, bad64::Reg::SP | bad64::Reg::WSP) {
+        0x8b32_63f2 // add x18, sp, x18, uxtx
+    } else if let Some(base) = gpr_index(base) {
+        0x8b00_0000 | (18 << 16) | (base << 5) | 18
+    } else {
+        return Err(unsupported_action(
+            plan,
+            guest,
+            memory.word,
+            "store-exclusive with non-GPR base in biased mode",
+        ));
+    };
+    emit_word(assembler, entries, guest, add)?;
+    let rewritten = (memory.word & !(0x1f << 5)) | (18 << 5);
+    emit_word(assembler, entries, guest, rewritten)?;
+    // There is deliberately no cleanup instruction. The next emitted guest
+    // instruction owns the following PC, so a completed STXR is never retried.
+    let _ = recovery;
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "biased memory lowering keeps emission and recovery metadata together"
+)]
+fn emit_biased_memory(
+    assembler: &mut VecAssembler<Aarch64Relocation>,
+    entries: &mut Vec<PcMapEntry>,
+    plan: &BlockPlan,
+    guest: GuestVa,
+    memory: super::types::MemoryAccess,
+    host_bias: super::super::address::NativeHostBias,
+    recovery: &mut Vec<RecoveryEntry>,
+) -> Result<(), DsrError> {
+    if memory.class == super::types::MemoryClass::Unsupported {
+        return Err(unsupported_action(
+            plan,
+            guest,
+            memory.word,
+            "memory family unsupported in biased mode",
+        ));
+    }
+    if memory.class == super::types::MemoryClass::Exclusive
+        && memory.virtualization != super::types::MemoryVirtualization::None
+    {
+        return Err(unsupported_action(
+            plan,
+            guest,
+            memory.word,
+            "exclusive result/data in virtual x18/x28 would clear the monitor",
+        ));
+    }
+    if memory.writeback != super::types::MemoryWriteback::None
+        && format!("{:?}", memory.op).starts_with("LD")
+    {
+        let encoded_base = (memory.word >> 5) & 0x1f;
+        let first_destination = memory.word & 0x1f;
+        let second_destination = (memory.word >> 10) & 0x1f;
+        let pair_overlap =
+            memory.class == super::types::MemoryClass::Pair && second_destination == encoded_base;
+        if first_destination == encoded_base || pair_overlap {
+            return Err(unsupported_action(
+                plan,
+                guest,
+                memory.word,
+                "constrained writeback load overlaps its base register",
+            ));
+        }
+    }
+    if memory.class == super::types::MemoryClass::Exclusive && is_store_exclusive(memory.op) {
+        return emit_biased_store_exclusive(assembler, entries, plan, guest, memory, recovery);
+    }
+    if let super::types::MemoryBase::Literal(target) = memory.base {
+        let host_target = target.raw().checked_add(host_bias.get()).ok_or_else(|| {
+            DsrError::BlockPolicy(format!(
+                "biased literal target overflow at guest PC 0x{:x}",
+                guest.raw()
+            ))
+        })?;
+        return emit_pc_relative_literal(
+            assembler,
+            entries,
+            plan,
+            guest,
+            super::types::PcRelativeInst {
+                kind: if memory.op == bad64::Op::PRFM {
+                    super::types::PcRelativeKind::LiteralPrefetch
+                } else {
+                    super::types::PcRelativeKind::LiteralLoad
+                },
+                target,
+                destination: None,
+                word: memory.word,
+            },
+            MaterializedAddress::Host(HostVa(usize::try_from(host_target).map_err(|_| {
+                DsrError::BlockPolicy(format!(
+                    "biased literal host target 0x{host_target:x} does not fit HostVa"
+                ))
+            })?)),
+            recovery,
+        );
+    }
+
+    let base = biased_base(memory)?;
+    let (mut rewritten, virtual_x18_scratch, virtual_x28_scratch) =
+        rewritten_biased_virtual_word(memory, guest)?;
+    let mut scratch_registers = [0_u32; 4];
+    let mut scratch_count = 0_usize;
+    for register in [virtual_x18_scratch, virtual_x28_scratch]
+        .into_iter()
+        .flatten()
+    {
+        if !scratch_registers[..scratch_count].contains(&register) {
+            scratch_registers[scratch_count] = register;
+            scratch_count += 1;
+        }
+    }
+    let extra =
+        biased_scratch_registers(memory.word, guest, &scratch_registers[..scratch_count], 2)
+            .ok_or_else(|| {
+                unsupported_action(plan, guest, memory.word, "no safe biased memory scratch")
+            })?;
+    let base_scratch = extra[0];
+    let bias_scratch = extra[1];
+    for register in extra {
+        if scratch_count >= scratch_registers.len() {
+            return Err(unsupported_action(
+                plan,
+                guest,
+                memory.word,
+                "biased memory needs more than four scratch registers",
+            ));
+        }
+        scratch_registers[scratch_count] = register;
+        scratch_count += 1;
+    }
+    rewritten = (rewritten & !(0x1f << 5)) | (base_scratch << 5);
+
+    for (index, register) in scratch_registers[..scratch_count]
+        .iter()
+        .copied()
+        .enumerate()
+    {
+        let offset = BIASED_SCRATCH_CONTEXT_OFFSETS[index];
+        emit_word(
+            assembler,
+            entries,
+            guest,
+            0xf900_0000 | ((offset / 8) << 10) | (28 << 5) | register,
+        )?;
+    }
+    let mut action = BiasedMemoryRecovery {
+        scratch_registers,
+        scratch_count: scratch_count as u8,
+        base_scratch,
+        base,
+        base_coordinate: BiasedBaseCoordinate::Guest,
+        commit_base: false,
+        virtual_x18_scratch: None,
+        virtual_x28_scratch: None,
+        host_bias,
+        instruction_complete: false,
+    };
+    for (virtual_register, scratch) in [(18_u32, virtual_x18_scratch), (28, virtual_x28_scratch)] {
+        if let Some(scratch) = scratch {
+            emit_with_biased_recovery(
+                assembler,
+                entries,
+                recovery,
+                guest,
+                0xf940_0000 | (((virtual_register * 8) / 8) << 10) | (28 << 5) | scratch,
+                action,
+            )?;
+            if virtual_register == 18 {
+                action.virtual_x18_scratch = Some(scratch);
+            } else {
+                action.virtual_x28_scratch = Some(scratch);
+            }
+        }
+    }
+    let load_base = match base {
+        BiasedBase::Register(register) => 0xaa00_03e0 | (register << 16) | base_scratch,
+        BiasedBase::StackPointer => 0x9100_03e0 | base_scratch,
+        BiasedBase::VirtualX18 => 0xf940_0000 | ((144 / 8) << 10) | (28 << 5) | base_scratch,
+        BiasedBase::VirtualX28 => 0xf940_0000 | ((224 / 8) << 10) | (28 << 5) | base_scratch,
+        BiasedBase::None => {
+            return Err(unsupported_action(
+                plan,
+                guest,
+                memory.word,
+                "biased non-literal memory has no base",
+            ));
+        }
+    };
+    emit_with_biased_recovery(assembler, entries, recovery, guest, load_base, action)?;
+    emit_with_biased_recovery(
+        assembler,
+        entries,
+        recovery,
+        guest,
+        0xf940_0000 | ((1192 / 8) << 10) | (28 << 5) | bias_scratch,
+        action,
+    )?;
+    emit_with_biased_recovery(
+        assembler,
+        entries,
+        recovery,
+        guest,
+        0x8b00_0000 | (bias_scratch << 16) | (base_scratch << 5) | base_scratch,
+        action,
+    )?;
+    emit_with_biased_recovery(assembler, entries, recovery, guest, rewritten, action)?;
+    action.instruction_complete = true;
+
+    let has_writeback = memory.writeback != super::types::MemoryWriteback::None;
+    if has_writeback {
+        action.base_coordinate = BiasedBaseCoordinate::Host;
+        action.commit_base = true;
+    }
+    for (virtual_register, scratch) in [(18_u32, virtual_x18_scratch), (28, virtual_x28_scratch)] {
+        if let Some(scratch) = scratch {
+            emit_with_biased_recovery(
+                assembler,
+                entries,
+                recovery,
+                guest,
+                0xf900_0000 | (((virtual_register * 8) / 8) << 10) | (28 << 5) | scratch,
+                action,
+            )?;
+            if virtual_register == 18 {
+                action.virtual_x18_scratch = None;
+            } else {
+                action.virtual_x28_scratch = None;
+            }
+        }
+    }
+    if has_writeback {
+        emit_with_biased_recovery(
+            assembler,
+            entries,
+            recovery,
+            guest,
+            0xcb00_0000 | (bias_scratch << 16) | (base_scratch << 5) | base_scratch,
+            action,
+        )?;
+        action.base_coordinate = BiasedBaseCoordinate::Guest;
+        let commit = match base {
+            BiasedBase::Register(register) => 0xaa00_03e0 | (base_scratch << 16) | register,
+            BiasedBase::StackPointer => 0x9100_001f | (base_scratch << 5),
+            BiasedBase::VirtualX18 => 0xf900_0000 | ((144 / 8) << 10) | (28 << 5) | base_scratch,
+            BiasedBase::VirtualX28 => 0xf900_0000 | ((224 / 8) << 10) | (28 << 5) | base_scratch,
+            BiasedBase::None => {
+                return Err(unsupported_action(
+                    plan,
+                    guest,
+                    memory.word,
+                    "biased writeback has no base",
+                ));
+            }
+        };
+        emit_with_biased_recovery(assembler, entries, recovery, guest, commit, action)?;
+        action.commit_base = false;
+    }
+    for (index, register) in scratch_registers[..scratch_count]
+        .iter()
+        .copied()
+        .enumerate()
+        .rev()
+    {
+        let offset = BIASED_SCRATCH_CONTEXT_OFFSETS[index];
+        emit_with_biased_recovery(
+            assembler,
+            entries,
+            recovery,
+            guest,
+            0xf940_0000 | ((offset / 8) << 10) | (28 << 5) | register,
+            action,
+        )?;
+    }
+    Ok(())
+}
+
 pub(super) fn emit_block(
     cache: &mut TranslationCache,
     plan: &BlockPlan,
+    mode: EmitAddressMode,
 ) -> Result<EmittedBlock, DsrError> {
-    emit_block_inner(cache, plan, None)
+    emit_block_inner(cache, plan, None, mode)
+}
+
+pub(super) fn emit_block_direct(
+    cache: &mut TranslationCache,
+    plan: &BlockPlan,
+) -> Result<EmittedBlock, DsrError> {
+    emit_block(cache, plan, EmitAddressMode::Direct)
 }
 
 pub(super) fn emit_block_with_generation(
     cache: &mut TranslationCache,
     plan: &BlockPlan,
     guard: GenerationGuard,
+    mode: EmitAddressMode,
 ) -> Result<EmittedBlock, DsrError> {
-    emit_block_inner(cache, plan, Some(guard))
+    emit_block_inner(cache, plan, Some(guard), mode)
+}
+
+pub(super) fn emit_block_with_generation_direct(
+    cache: &mut TranslationCache,
+    plan: &BlockPlan,
+    guard: GenerationGuard,
+) -> Result<EmittedBlock, DsrError> {
+    emit_block_with_generation(cache, plan, guard, EmitAddressMode::Direct)
 }
 
 fn emit_block_inner(
     cache: &mut TranslationCache,
     plan: &BlockPlan,
     guard: Option<GenerationGuard>,
+    mode: EmitAddressMode,
 ) -> Result<EmittedBlock, DsrError> {
     let mut assembler = VecAssembler::<Aarch64Relocation>::new(0);
     let mut entries = Vec::with_capacity(plan.instructions.len() + 8);
@@ -1229,6 +1774,18 @@ fn emit_block_inner(
             // based emission remains byte-identical; mode-specialized lowering
             // is Task 5. Preserve the existing relocated-literal lowering.
             InstAction::Memory(memory) => {
+                if let EmitAddressMode::Biased { host_bias } = mode {
+                    emit_biased_memory(
+                        &mut assembler,
+                        &mut entries,
+                        plan,
+                        instruction.guest,
+                        memory,
+                        host_bias,
+                        &mut recovery,
+                    )?;
+                    continue;
+                }
                 match memory.virtualization {
                     super::types::MemoryVirtualization::None => {}
                     super::types::MemoryVirtualization::X18 => {
@@ -1332,6 +1889,7 @@ fn emit_block_inner(
                             destination: None,
                             word: memory.word,
                         },
+                        MaterializedAddress::Guest(target),
                         &mut recovery,
                     )?;
                     continue;
@@ -1411,6 +1969,7 @@ fn emit_block_inner(
                     plan,
                     instruction.guest,
                     relative,
+                    MaterializedAddress::Guest(relative.target),
                     &mut recovery,
                 )?;
                 continue;
@@ -1852,7 +2411,7 @@ mod tests {
         ]
         .into_iter()
         .map(|plan| {
-            let emitted = emit_block(&mut cache, &plan).expect("emit gateway exit");
+            let emitted = emit_block_direct(&mut cache, &plan).expect("emit gateway exit");
             (0..emitted.len() / 4)
                 .map(|index| unsafe {
                     std::ptr::read_unaligned(
@@ -1945,7 +2504,7 @@ mod tests {
             .expect("allocate full emission benchmark cache");
         let full_guarded_emit = measure_emission_component(4_000, 1, 1, || {
             std::hint::black_box(
-                emit_block_with_generation(
+                emit_block_with_generation_direct(
                     &mut cache,
                     &plan,
                     GenerationGuard::new(&generation, CodeGeneration::INITIAL),
@@ -1977,7 +2536,7 @@ mod tests {
     #[test]
     fn dsr_emit_copy_only_block_decodes_back_with_exact_maps() {
         let mut cache = TranslationCache::new(16 * 1024).expect("allocate translation cache");
-        let emitted = emit_block(&mut cache, &copy_plan()).expect("emit copy-only block");
+        let emitted = emit_block_direct(&mut cache, &copy_plan()).expect("emit copy-only block");
         assert_eq!(emitted.len(), 72);
         let original_words = [0xd503_201f, 0x9100_0400];
         let entry_word =
@@ -2045,9 +2604,343 @@ mod tests {
             },
         };
         let mut cache = TranslationCache::new(16 * 1024).expect("allocate translation cache");
-        let emitted = emit_block(&mut cache, &plan).expect("emit direct memory block");
+        let emitted = emit_block_direct(&mut cache, &plan).expect("emit direct memory block");
         let pointer = (emitted.entry().host().raw() + 8) as *const u32;
         assert_eq!(unsafe { std::ptr::read_unaligned(pointer) }, word);
+    }
+
+    #[test]
+    fn direct_memory_emission_is_word_identical() {
+        let word = 0xf940_0020;
+        let mut plan = copy_plan();
+        plan.instructions = vec![PlannedInst {
+            guest: GuestVa(0x4000),
+            action: super::super::decode::classify(word, GuestVa(0x4000))
+                .expect("classify direct memory"),
+        }];
+        plan.end = GuestVa(0x4008);
+        plan.exit = PlannedExit::Syscall {
+            guest: GuestVa(0x4004),
+            resume: GuestVa(0x4008),
+        };
+        let mut cache = TranslationCache::new(16 * 1024).expect("allocate translation cache");
+        let emitted = emit_block(&mut cache, &plan, EmitAddressMode::Direct)
+            .expect("emit direct memory block");
+        let words = (0..emitted.len() / 4).map(|index| unsafe {
+            std::ptr::read_unaligned((emitted.entry().host().raw() + index * 4) as *const u32)
+        });
+        assert!(words.into_iter().any(|emitted_word| emitted_word == word));
+    }
+
+    #[test]
+    fn direct_memory_emission_matches_full_copy_block_bytes() {
+        let word = 0xf940_0020;
+        let mut memory = copy_plan();
+        memory.instructions = vec![PlannedInst {
+            guest: GuestVa(0x4000),
+            action: super::super::decode::classify(word, GuestVa(0x4000))
+                .expect("classify direct memory"),
+        }];
+        memory.exit = PlannedExit::Syscall {
+            guest: GuestVa(0x4004),
+            resume: GuestVa(0x4008),
+        };
+        let mut copy = memory.clone();
+        copy.instructions[0].action = InstAction::Copy(word);
+        let mut memory_cache =
+            TranslationCache::new(16 * 1024).expect("allocate direct memory cache");
+        let mut copy_cache = TranslationCache::new(16 * 1024).expect("allocate direct copy cache");
+        let memory_emitted = emit_block(&mut memory_cache, &memory, EmitAddressMode::Direct)
+            .expect("emit typed direct memory");
+        let copy_emitted = emit_block(&mut copy_cache, &copy, EmitAddressMode::Direct)
+            .expect("emit copied direct memory");
+        assert_eq!(memory_emitted.len(), copy_emitted.len());
+        let memory_bytes = unsafe {
+            std::slice::from_raw_parts(
+                memory_emitted.entry().host().raw() as *const u8,
+                memory_emitted.len(),
+            )
+        };
+        let copy_bytes = unsafe {
+            std::slice::from_raw_parts(
+                copy_emitted.entry().host().raw() as *const u8,
+                copy_emitted.len(),
+            )
+        };
+        assert_eq!(memory_bytes, copy_bytes);
+    }
+
+    #[test]
+    fn biased_memory_rejects_unsupported_families() {
+        let word = 0x8598_5f6f;
+        let mut plan = copy_plan();
+        plan.instructions = vec![PlannedInst {
+            guest: GuestVa(0x4000),
+            action: super::super::decode::classify(word, GuestVa(0x4000))
+                .expect("classify unsupported SVE memory"),
+        }];
+        let host_bias =
+            crate::native_darwin::address::NativeHostBias::new(0x80_0000_0000, 16 * 1024)
+                .expect("construct host bias");
+        let mut cache = TranslationCache::new(16 * 1024).expect("allocate translation cache");
+        assert!(matches!(
+            emit_block(&mut cache, &plan, EmitAddressMode::Biased { host_bias },),
+            Err(DsrError::UnsupportedBlockAction { .. })
+        ));
+    }
+
+    #[test]
+    fn biased_memory_scratch_selection_handles_x16_x17_operands() {
+        for word in [
+            0xf940_0030, // ldr x16, [x1]
+            0xf900_0031, // str x17, [x1]
+            0xf940_0200, // ldr x0, [x16]
+            0xf940_0220, // ldr x0, [x17]
+        ] {
+            let mut plan = copy_plan();
+            plan.instructions = vec![PlannedInst {
+                guest: GuestVa(0x4000),
+                action: super::super::decode::classify(word, GuestVa(0x4000))
+                    .expect("classify x16/x17 memory fixture"),
+            }];
+            let host_bias =
+                crate::native_darwin::address::NativeHostBias::new(0x80_0000_0000, 16 * 1024)
+                    .expect("construct host bias");
+            let mut cache = TranslationCache::new(16 * 1024).expect("allocate translation cache");
+            emit_block(&mut cache, &plan, EmitAddressMode::Biased { host_bias })
+                .unwrap_or_else(|error| panic!("0x{word:08x} did not lower: {error}"));
+        }
+    }
+
+    #[test]
+    fn biased_exclusive_pair_has_no_host_store_between_ldxr_and_stxr() {
+        let start = GuestVa(0x4000);
+        let instructions = [0xc85f_7c20, 0x9100_0400, 0xc802_7c20]
+            .into_iter()
+            .enumerate()
+            .map(|(index, word)| PlannedInst {
+                guest: GuestVa(start.raw() + index as u64 * 4),
+                action: super::super::decode::classify(
+                    word,
+                    GuestVa(start.raw() + index as u64 * 4),
+                )
+                .expect("classify exclusive loop word"),
+            })
+            .collect();
+        let plan = BlockPlan {
+            start,
+            end: GuestVa(0x4010),
+            generation: CodeGeneration::INITIAL,
+            instructions,
+            exit: PlannedExit::Syscall {
+                guest: GuestVa(0x400c),
+                resume: GuestVa(0x4010),
+            },
+        };
+        let host_bias =
+            crate::native_darwin::address::NativeHostBias::new(0x80_0000_0000, 16 * 1024)
+                .expect("construct host bias");
+        let mut cache = TranslationCache::new(16 * 1024).expect("allocate exclusive cache");
+        let emitted = emit_block(&mut cache, &plan, EmitAddressMode::Biased { host_bias })
+            .expect("emit exclusive loop");
+        let words = (0..emitted.len() / 4)
+            .map(|index| unsafe {
+                std::ptr::read_unaligned((emitted.entry().host().raw() + index * 4) as *const u32)
+            })
+            .collect::<Vec<_>>();
+        let decoded = words
+            .iter()
+            .enumerate()
+            .filter_map(|(index, word)| {
+                bad64::decode(*word, index as u64 * 4)
+                    .ok()
+                    .map(|instruction| (index, instruction.op()))
+            })
+            .collect::<Vec<_>>();
+        let ldxr = decoded
+            .iter()
+            .find(|(_, op)| *op == bad64::Op::LDXR)
+            .map(|(index, _)| *index)
+            .expect("find emitted LDXR");
+        let stxr = decoded
+            .iter()
+            .find(|(_, op)| *op == bad64::Op::STXR)
+            .map(|(index, _)| *index)
+            .expect("find emitted STXR");
+        for index in (stxr - 2)..=stxr {
+            let offset = CacheOffset::published((index * 4) as u32);
+            assert_eq!(
+                emitted.map().guest_for_cache(offset),
+                Some(GuestVa(0x4008)),
+                "exclusive preamble offset {index} must retry the STXR guest PC"
+            );
+            assert!(
+                emitted.recovery().iter().all(|entry| entry.cache != offset),
+                "exclusive preamble offset {index} must not restore transient physical x18"
+            );
+        }
+        for (index, op) in decoded {
+            if ldxr < index && index < stxr {
+                assert!(
+                    !matches!(
+                        op,
+                        bad64::Op::STR
+                            | bad64::Op::STRB
+                            | bad64::Op::STRH
+                            | bad64::Op::STP
+                            | bad64::Op::STUR
+                            | bad64::Op::STURB
+                            | bad64::Op::STURH
+                    ),
+                    "host store {op:?} at emitted index {index} clears exclusive monitor"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn biased_constrained_writeback_load_overlap_fails_closed() {
+        for word in [
+            0xf840_8421, // ldr x1, [x1], #8
+            0xa8c1_0821, // ldp x1, x2, [x1], #16
+        ] {
+            let mut plan = copy_plan();
+            plan.instructions = vec![PlannedInst {
+                guest: GuestVa(0x4000),
+                action: super::super::decode::classify(word, GuestVa(0x4000))
+                    .expect("classify constrained writeback load"),
+            }];
+            let host_bias =
+                crate::native_darwin::address::NativeHostBias::new(0x80_0000_0000, 16 * 1024)
+                    .expect("construct host bias");
+            let mut cache = TranslationCache::new(16 * 1024).expect("allocate overlap cache");
+            assert!(matches!(
+                emit_block(&mut cache, &plan, EmitAddressMode::Biased { host_bias },),
+                Err(DsrError::UnsupportedBlockAction { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn biased_exclusive_virtual_results_fail_but_virtual_base_load_is_supported() {
+        let host_bias =
+            crate::native_darwin::address::NativeHostBias::new(0x80_0000_0000, 16 * 1024)
+                .expect("construct host bias");
+        for word in [
+            0xc85f_7c32, // ldxr x18, [x1]
+            0xc802_7c32, // stxr w2, x18, [x1]
+        ] {
+            let mut plan = copy_plan();
+            plan.instructions = vec![PlannedInst {
+                guest: GuestVa(0x4000),
+                action: super::super::decode::classify(word, GuestVa(0x4000))
+                    .expect("classify virtual exclusive"),
+            }];
+            let mut cache = TranslationCache::new(16 * 1024).expect("allocate exclusive cache");
+            assert!(matches!(
+                emit_block(&mut cache, &plan, EmitAddressMode::Biased { host_bias },),
+                Err(DsrError::UnsupportedBlockAction { .. })
+            ));
+        }
+
+        let word = 0xc85f_7e40; // ldxr x0, [x18]
+        let mut plan = copy_plan();
+        plan.instructions = vec![PlannedInst {
+            guest: GuestVa(0x4000),
+            action: super::super::decode::classify(word, GuestVa(0x4000))
+                .expect("classify virtual-base LDXR"),
+        }];
+        let mut cache = TranslationCache::new(16 * 1024).expect("allocate virtual-base cache");
+        emit_block(&mut cache, &plan, EmitAddressMode::Biased { host_bias })
+            .expect("emit virtual-base LDXR");
+    }
+
+    #[test]
+    fn biased_recovery_offsets_transition_once_from_retry_to_resume() {
+        let word = 0xf81f_8c20; // str x0, [x1, #-8]!
+        let plan = BlockPlan {
+            start: GuestVa(0x4000),
+            end: GuestVa(0x4008),
+            generation: CodeGeneration::INITIAL,
+            instructions: vec![PlannedInst {
+                guest: GuestVa(0x4000),
+                action: super::super::decode::classify(word, GuestVa(0x4000))
+                    .expect("classify writeback store"),
+            }],
+            exit: PlannedExit::Syscall {
+                guest: GuestVa(0x4004),
+                resume: GuestVa(0x4008),
+            },
+        };
+        let host_bias =
+            crate::native_darwin::address::NativeHostBias::new(0x80_0000_0000, 16 * 1024)
+                .expect("construct host bias");
+        let mut cache = TranslationCache::new(16 * 1024).expect("allocate recovery cache");
+        let emitted = emit_block(&mut cache, &plan, EmitAddressMode::Biased { host_bias })
+            .expect("emit writeback recovery matrix");
+        let actions = emitted
+            .recovery()
+            .iter()
+            .filter_map(|entry| match entry.action {
+                RecoveryAction::RecoverBiasedMemory(recovery) => Some(recovery),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let first_complete = actions
+            .iter()
+            .position(|action| action.instruction_complete)
+            .expect("post-memory recovery exists");
+        assert!(first_complete > 0);
+        assert!(
+            actions[..first_complete]
+                .iter()
+                .all(|action| !action.instruction_complete && !action.commit_base)
+        );
+        assert!(
+            actions[first_complete..]
+                .iter()
+                .all(|action| action.instruction_complete)
+        );
+        assert!(actions.iter().any(|action| {
+            action.commit_base && action.base_coordinate == BiasedBaseCoordinate::Host
+        }));
+        assert!(actions.iter().any(|action| {
+            action.commit_base && action.base_coordinate == BiasedBaseCoordinate::Guest
+        }));
+        assert!(!actions.last().expect("last recovery").commit_base);
+    }
+
+    #[test]
+    fn biased_dual_virtual_cleanup_does_not_recommit_restored_scratch() {
+        let word = 0xf940_0392; // ldr x18, [x28]
+        let mut plan = copy_plan();
+        plan.instructions = vec![PlannedInst {
+            guest: GuestVa(0x4000),
+            action: super::super::decode::classify(word, GuestVa(0x4000))
+                .expect("classify dual virtual load"),
+        }];
+        let host_bias =
+            crate::native_darwin::address::NativeHostBias::new(0x80_0000_0000, 16 * 1024)
+                .expect("construct host bias");
+        let mut cache = TranslationCache::new(16 * 1024).expect("allocate dual cache");
+        let emitted = emit_block(&mut cache, &plan, EmitAddressMode::Biased { host_bias })
+            .expect("emit dual virtual load");
+        let final_actions = emitted
+            .recovery()
+            .iter()
+            .filter_map(|entry| match entry.action {
+                RecoveryAction::RecoverBiasedMemory(recovery) => Some(recovery),
+                _ => None,
+            })
+            .rev()
+            .take(4)
+            .collect::<Vec<_>>();
+        assert_eq!(final_actions.len(), 4);
+        assert!(final_actions.iter().all(|action| {
+            action.instruction_complete
+                && action.virtual_x18_scratch.is_none()
+                && action.virtual_x28_scratch.is_none()
+        }));
     }
 
     #[test]
@@ -2073,7 +2966,7 @@ mod tests {
             },
         };
         let mut cache = TranslationCache::new(16 * 1024).expect("allocate translation cache");
-        let emitted = emit_block(&mut cache, &plan).expect("emit direct SVE memory block");
+        let emitted = emit_block_direct(&mut cache, &plan).expect("emit direct SVE memory block");
         let pointer = (emitted.entry().host().raw() + 8) as *const u32;
         assert_eq!(unsafe { std::ptr::read_unaligned(pointer) }, word);
     }
@@ -2104,7 +2997,7 @@ mod tests {
             },
         };
         let mut cache = TranslationCache::new(16 * 1024).expect("allocate translation cache");
-        emit_block(&mut cache, &plan).expect("emit direct SVE x18-index memory block");
+        emit_block_direct(&mut cache, &plan).expect("emit direct SVE x18-index memory block");
     }
 
     #[test]
@@ -2113,7 +3006,7 @@ mod tests {
 
         let generation = AtomicU64::new(CodeGeneration::INITIAL.get());
         let mut cache = TranslationCache::new(16 * 1024).expect("allocate translation cache");
-        let emitted = emit_block_with_generation(
+        let emitted = emit_block_with_generation_direct(
             &mut cache,
             &copy_plan(),
             GenerationGuard::new(&generation, CodeGeneration::INITIAL),
@@ -2148,7 +3041,7 @@ mod tests {
             word: 0x1000_8000,
         });
         let mut cache = TranslationCache::new(16 * 1024).expect("allocate translation cache");
-        let emitted = emit_block(&mut cache, &plan).expect("emit relocated ADR");
+        let emitted = emit_block_direct(&mut cache, &plan).expect("emit relocated ADR");
         assert!(emitted.len() > 36);
     }
 
@@ -2168,7 +3061,7 @@ mod tests {
             },
         };
         let mut cache = TranslationCache::new(16 * 1024).expect("allocate translation cache");
-        let emitted = emit_block(&mut cache, &direct).expect("emit direct link");
+        let emitted = emit_block_direct(&mut cache, &direct).expect("emit direct link");
         assert_eq!(emitted.direct_links().len(), 1);
         assert_eq!(emitted.direct_links()[0].target, GuestVa(0x4010));
 
@@ -2182,7 +3075,8 @@ mod tests {
                 resume: GuestVa(0x400c),
             },
         };
-        let emitted = emit_block(&mut cache, &indirect).expect("emit indirect resolver exit");
+        let emitted =
+            emit_block_direct(&mut cache, &indirect).expect("emit indirect resolver exit");
         assert!(emitted.direct_links().is_empty());
     }
 
@@ -2199,7 +3093,7 @@ mod tests {
             },
         };
         let mut cache = TranslationCache::new(16 * 1024).expect("allocate return cache");
-        let emitted = emit_block(&mut cache, &plan).expect("emit return resolver");
+        let emitted = emit_block_direct(&mut cache, &plan).expect("emit return resolver");
         let words = (0..emitted.len() / 4)
             .map(|index| unsafe {
                 std::ptr::read_unaligned((emitted.entry().host().raw() + index * 4) as *const u32)
@@ -2234,7 +3128,7 @@ mod tests {
 
         let mut cache = TranslationCache::new(32 * 1024).expect("allocate translation cache");
         for plan in plans {
-            let emitted = emit_block(&mut cache, &plan).expect("emit mapped block");
+            let emitted = emit_block_direct(&mut cache, &plan).expect("emit mapped block");
             for offset in (0..emitted.len()).step_by(4) {
                 let offset = CacheOffset::published(offset as u32);
                 assert!(
@@ -2259,7 +3153,7 @@ mod tests {
             },
         };
         let mut cache = TranslationCache::new(16 * 1024).expect("allocate translation cache");
-        let emitted = emit_block(&mut cache, &indirect).expect("emit indirect resolver");
+        let emitted = emit_block_direct(&mut cache, &indirect).expect("emit indirect resolver");
         let resolver = emitted
             .recovery()
             .iter()
@@ -2310,7 +3204,7 @@ mod tests {
             limit: BlockLimit::InstructionLimit,
         };
         let mut cache = TranslationCache::new(16 * 1024).expect("allocate translation cache");
-        let emitted = emit_block(&mut cache, &plan).expect("emit bounded block");
+        let emitted = emit_block_direct(&mut cache, &plan).expect("emit bounded block");
         assert_eq!(emitted.direct_links().len(), 1);
         assert_eq!(emitted.direct_links()[0].target, GuestVa(0x4004));
         assert_eq!(

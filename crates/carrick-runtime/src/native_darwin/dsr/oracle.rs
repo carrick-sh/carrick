@@ -3,12 +3,547 @@ use carrick_guest_mem::{GuestVa, HostVa};
 use super::super::NativeUcontextSnapshot;
 use super::block::{BlockPlan, PlannedExit, PlannedInst};
 use super::cache::TranslationCache;
-use super::emit::{EmittedBlock, GenerationGuard, emit_block, emit_block_with_generation};
+use super::emit::{
+    EmittedBlock, GenerationGuard, emit_block, emit_block_direct, emit_block_with_generation_direct,
+};
 use super::gateway::{IndirectTargetCache, enter_translated, enter_translated_with_cache};
 use super::types::{
     CodeGeneration, DirectExit, DirectKind, DsrError, IndirectExit, IndirectKind, InstAction,
-    NativeDsrExit, PcRelativeInst, PcRelativeKind, SensitiveExit, SensitiveKind,
+    MemoryAccess, MemoryBase, MemoryClass, MemoryVirtualization, MemoryWriteback, NativeDsrExit,
+    PcRelativeInst, PcRelativeKind, SensitiveExit, SensitiveKind,
 };
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn biased_memory_families_access_guest_data() {
+    const BIAS: u64 = 0x80_0000_0000;
+    let host_bias = crate::native_darwin::address::NativeHostBias::new(BIAS, 16 * 1024)
+        .expect("construct host bias");
+    let mode = super::emit::EmitAddressMode::Biased { host_bias };
+    const GUEST: u64 = 0x4_0000_0000;
+    let mapping = crate::native_darwin::address::OwnedHostMapping::map_exact(
+        HostVa((BIAS + GUEST) as usize),
+        16 * 1024,
+        libc::PROT_READ | libc::PROT_WRITE,
+        libc::MAP_ANON | libc::MAP_PRIVATE,
+    )
+    .expect("map biased oracle data");
+    let words =
+        unsafe { std::slice::from_raw_parts_mut(mapping.range().start.raw() as *mut u64, 2) };
+    words.copy_from_slice(&[0x1122_3344_5566_7788_u64, 0x99aa_bbcc_ddee_ff00]);
+    let guest = GUEST;
+    let fixtures = [
+        (0xf940_0020, MemoryClass::Scalar),
+        (0xa940_0440, MemoryClass::Pair),
+        (0x3dc0_0020, MemoryClass::Simd),
+        (0xc85f_7c20, MemoryClass::Exclusive),
+        (0xf8e0_0041, MemoryClass::Atomic),
+    ];
+    for (word, class) in fixtures {
+        let base_register = if class == MemoryClass::Pair || class == MemoryClass::Atomic {
+            bad64::Reg::X2
+        } else {
+            bad64::Reg::X1
+        };
+        let plan = BlockPlan {
+            start: GuestVa(0x4000),
+            end: GuestVa(0x4008),
+            generation: CodeGeneration::INITIAL,
+            instructions: vec![PlannedInst {
+                guest: GuestVa(0x4000),
+                action: InstAction::Memory(MemoryAccess {
+                    word,
+                    op: bad64::decode(word, 0x4000).expect("decode fixture").op(),
+                    base: MemoryBase::Register(base_register),
+                    writeback: MemoryWriteback::None,
+                    class,
+                    virtualization: MemoryVirtualization::None,
+                }),
+            }],
+            exit: PlannedExit::Syscall {
+                guest: GuestVa(0x4004),
+                resume: GuestVa(0x4008),
+            },
+        };
+        let mut cache = TranslationCache::new(16 * 1024).expect("allocate biased cache");
+        let emitted = emit_block(&mut cache, &plan, mode).expect("emit biased fixture");
+        let mut stack = vec![0_u8; 16 * 1024];
+        let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+        snapshot.x[1] = guest;
+        snapshot.x[2] = guest;
+        snapshot.x[0] = 1;
+        let expected_x16 = snapshot.x[16];
+        let expected_x17 = snapshot.x[17];
+        let mut exit = NativeDsrExit::Syscall {
+            resume: GuestVa(0x4008),
+        };
+        super::gateway::enter_translated_in_mode(
+            emitted.entry(),
+            &mut snapshot,
+            &mut exit,
+            crate::native_darwin::address::NativeAddressMode::Biased { host_bias },
+        )
+        .expect("execute biased fixture");
+        assert_eq!(snapshot.x[16], expected_x16, "word=0x{word:08x}");
+        assert_eq!(snapshot.x[17], expected_x17, "word=0x{word:08x}");
+        match class {
+            MemoryClass::Pair => {
+                assert_eq!(snapshot.x[0], words[0]);
+                assert_eq!(snapshot.x[1], words[1]);
+            }
+            MemoryClass::Simd => assert_eq!(snapshot.v[0], unsafe {
+                std::ptr::read_unaligned(words.as_ptr().cast::<[u8; 16]>())
+            }),
+            MemoryClass::Atomic => {
+                assert_eq!(snapshot.x[1], 0x1122_3344_5566_7788);
+                assert_eq!(words[0], 0x1122_3344_5566_7789);
+                words[0] = 0x1122_3344_5566_7788;
+            }
+            _ => assert_eq!(snapshot.x[0], words[0]),
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn biased_exclusive_retry_sequence_updates_once() {
+    const BIAS: u64 = 0x80_0000_0000;
+    const GUEST: u64 = 0x5_0000_0000;
+    let host_bias = crate::native_darwin::address::NativeHostBias::new(BIAS, 16 * 1024)
+        .expect("construct host bias");
+    let mapping = crate::native_darwin::address::OwnedHostMapping::map_exact(
+        HostVa((BIAS + GUEST) as usize),
+        16 * 1024,
+        libc::PROT_READ | libc::PROT_WRITE,
+        libc::MAP_ANON | libc::MAP_PRIVATE,
+    )
+    .expect("map biased exclusive data");
+    let value = unsafe { &mut *(mapping.range().start.raw() as *mut u64) };
+    *value = 41;
+    for (ldxr, stxr, use_sp) in [
+        (0xc85f_7c20, 0xc802_7c20, false),
+        (0xc85f_7fe0, 0xc802_7fe0, true),
+    ] {
+        *value = 41;
+        let plan = BlockPlan {
+            start: GuestVa(0x8000),
+            end: GuestVa(0x8010),
+            generation: CodeGeneration::INITIAL,
+            instructions: [ldxr, 0x9100_0400, stxr]
+                .into_iter()
+                .enumerate()
+                .map(|(index, word)| PlannedInst {
+                    guest: GuestVa(0x8000 + index as u64 * 4),
+                    action: super::decode::classify(word, GuestVa(0x8000 + index as u64 * 4))
+                        .expect("classify exclusive word"),
+                })
+                .collect(),
+            exit: PlannedExit::Syscall {
+                guest: GuestVa(0x800c),
+                resume: GuestVa(0x8010),
+            },
+        };
+        let mut cache = TranslationCache::new(16 * 1024).expect("allocate exclusive cache");
+        let emitted = emit_block(
+            &mut cache,
+            &plan,
+            super::emit::EmitAddressMode::Biased { host_bias },
+        )
+        .expect("emit exclusive sequence");
+        let mut host_stack = vec![0_u8; 16 * 1024];
+        let mut snapshot =
+            seeded_snapshot(host_stack.as_mut_ptr() as u64 + host_stack.len() as u64);
+        snapshot.x[1] = GUEST;
+        if use_sp {
+            snapshot.sp = GUEST;
+        }
+        snapshot.x[2] = u64::MAX;
+        let mut exit = NativeDsrExit::Syscall {
+            resume: GuestVa(0x8010),
+        };
+        super::gateway::enter_translated_in_mode(
+            emitted.entry(),
+            &mut snapshot,
+            &mut exit,
+            crate::native_darwin::address::NativeAddressMode::Biased { host_bias },
+        )
+        .expect("execute exclusive sequence");
+        assert_eq!(snapshot.x[2], 0, "STXR status for use_sp={use_sp}");
+        assert_eq!(*value, 42, "exclusive update for use_sp={use_sp}");
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn biased_exclusive_byte_half_pair_variants_succeed() {
+    const BIAS: u64 = 0x80_0000_0000;
+    const GUEST: u64 = 0xa_0000_0000;
+    let host_bias = crate::native_darwin::address::NativeHostBias::new(BIAS, 16 * 1024)
+        .expect("construct host bias");
+    let mapping = crate::native_darwin::address::OwnedHostMapping::map_exact(
+        HostVa((BIAS + GUEST) as usize),
+        16 * 1024,
+        libc::PROT_READ | libc::PROT_WRITE,
+        libc::MAP_ANON | libc::MAP_PRIVATE,
+    )
+    .expect("map exclusive variant data");
+    let data =
+        unsafe { std::slice::from_raw_parts_mut(mapping.range().start.raw() as *mut u64, 2) };
+    let variants: &[(&[u32], [u64; 2])] = &[
+        (&[0x085f_7c20, 0x1100_0400, 0x0802_7c20], [0x12, 0]),
+        (&[0x485f_7c20, 0x1100_0400, 0x4802_7c20], [0x1234, 0]),
+        (
+            &[0xc87f_0c20, 0x9100_0400, 0x9100_0463, 0xc822_0c20],
+            [41, 99],
+        ),
+        (
+            &[0xc87f_8c20, 0x9100_0400, 0x9100_0463, 0xc822_8c20],
+            [41, 99],
+        ),
+    ];
+    for (index, (words, initial)) in variants.iter().enumerate() {
+        data.copy_from_slice(initial);
+        let start = GuestVa(0xf000 + index as u64 * 0x100);
+        let plan = BlockPlan {
+            start,
+            end: GuestVa(start.raw() + (words.len() as u64 + 1) * 4),
+            generation: CodeGeneration::INITIAL,
+            instructions: words
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(offset, word)| PlannedInst {
+                    guest: GuestVa(start.raw() + offset as u64 * 4),
+                    action: super::decode::classify(word, GuestVa(start.raw() + offset as u64 * 4))
+                        .expect("classify exclusive variant"),
+                })
+                .collect(),
+            exit: PlannedExit::Syscall {
+                guest: GuestVa(start.raw() + words.len() as u64 * 4),
+                resume: GuestVa(start.raw() + (words.len() as u64 + 1) * 4),
+            },
+        };
+        let mut cache = TranslationCache::new(16 * 1024).expect("allocate variant cache");
+        let emitted = emit_block(
+            &mut cache,
+            &plan,
+            super::emit::EmitAddressMode::Biased { host_bias },
+        )
+        .expect("emit exclusive variant");
+        let mut stack = vec![0_u8; 16 * 1024];
+        let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+        snapshot.x[1] = GUEST;
+        snapshot.x[2] = u64::MAX;
+        let mut exit = NativeDsrExit::Syscall {
+            resume: GuestVa(start.raw() + (words.len() as u64 + 1) * 4),
+        };
+        super::gateway::enter_translated_in_mode(
+            emitted.entry(),
+            &mut snapshot,
+            &mut exit,
+            crate::native_darwin::address::NativeAddressMode::Biased { host_bias },
+        )
+        .expect("execute exclusive variant");
+        assert_eq!(snapshot.x[2], 0, "variant {index} status");
+        match index {
+            0 => assert_eq!(data[0] & 0xff, (initial[0] + 1) & 0xff),
+            1 => assert_eq!(data[0] & 0xffff, (initial[0] + 1) & 0xffff),
+            _ => assert_eq!(data, &[initial[0] + 1, initial[1] + 1]),
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn biased_block_entry_stxr_reports_spurious_failure() {
+    const BIAS: u64 = 0x80_0000_0000;
+    const GUEST: u64 = 0x6_0000_0000;
+    let host_bias = crate::native_darwin::address::NativeHostBias::new(BIAS, 16 * 1024)
+        .expect("construct host bias");
+    let mapping = crate::native_darwin::address::OwnedHostMapping::map_exact(
+        HostVa((BIAS + GUEST) as usize),
+        16 * 1024,
+        libc::PROT_READ | libc::PROT_WRITE,
+        libc::MAP_ANON | libc::MAP_PRIVATE,
+    )
+    .expect("map boundary exclusive data");
+    let value = unsafe { &mut *(mapping.range().start.raw() as *mut u64) };
+    *value = 41;
+    let word = 0xc802_7c20;
+    let plan = BlockPlan {
+        start: GuestVa(0x9000),
+        end: GuestVa(0x9008),
+        generation: CodeGeneration::INITIAL,
+        instructions: vec![PlannedInst {
+            guest: GuestVa(0x9000),
+            action: super::decode::classify(word, GuestVa(0x9000)).expect("classify boundary STXR"),
+        }],
+        exit: PlannedExit::Syscall {
+            guest: GuestVa(0x9004),
+            resume: GuestVa(0x9008),
+        },
+    };
+    let mut cache = TranslationCache::new(16 * 1024).expect("allocate boundary cache");
+    let emitted = emit_block(
+        &mut cache,
+        &plan,
+        super::emit::EmitAddressMode::Biased { host_bias },
+    )
+    .expect("emit boundary STXR");
+    let mut stack = vec![0_u8; 16 * 1024];
+    let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    snapshot.x[0] = 99;
+    snapshot.x[1] = GUEST;
+    snapshot.x[2] = 0;
+    let mut exit = NativeDsrExit::Syscall {
+        resume: GuestVa(0x9008),
+    };
+    super::gateway::enter_translated_in_mode(
+        emitted.entry(),
+        &mut snapshot,
+        &mut exit,
+        crate::native_darwin::address::NativeAddressMode::Biased { host_bias },
+    )
+    .expect("execute boundary STXR");
+    assert_eq!(snapshot.x[2], 1);
+    assert_eq!(*value, 41);
+}
+
+#[cfg(target_arch = "aarch64")]
+fn run_biased_single_memory(
+    word: u32,
+    guest_pc: GuestVa,
+    host_bias: crate::native_darwin::address::NativeHostBias,
+    snapshot: &mut NativeUcontextSnapshot,
+) {
+    let plan = BlockPlan {
+        start: guest_pc,
+        end: GuestVa(guest_pc.raw() + 8),
+        generation: CodeGeneration::INITIAL,
+        instructions: vec![PlannedInst {
+            guest: guest_pc,
+            action: super::decode::classify(word, guest_pc).expect("classify biased memory"),
+        }],
+        exit: PlannedExit::Syscall {
+            guest: GuestVa(guest_pc.raw() + 4),
+            resume: GuestVa(guest_pc.raw() + 8),
+        },
+    };
+    let mut cache = TranslationCache::new(16 * 1024).expect("allocate single-memory cache");
+    let emitted = emit_block(
+        &mut cache,
+        &plan,
+        super::emit::EmitAddressMode::Biased { host_bias },
+    )
+    .expect("emit single biased memory");
+    let mut exit = NativeDsrExit::Syscall {
+        resume: GuestVa(guest_pc.raw() + 8),
+    };
+    super::gateway::enter_translated_in_mode(
+        emitted.entry(),
+        snapshot,
+        &mut exit,
+        crate::native_darwin::address::NativeAddressMode::Biased { host_bias },
+    )
+    .expect("execute single biased memory");
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn biased_pre_post_writeback_stays_in_guest_coordinates() {
+    const BIAS: u64 = 0x80_0000_0000;
+    const GUEST: u64 = 0x7_0000_0000;
+    let host_bias = crate::native_darwin::address::NativeHostBias::new(BIAS, 16 * 1024)
+        .expect("construct host bias");
+    let mapping = crate::native_darwin::address::OwnedHostMapping::map_exact(
+        HostVa((BIAS + GUEST) as usize),
+        16 * 1024,
+        libc::PROT_READ | libc::PROT_WRITE,
+        libc::MAP_ANON | libc::MAP_PRIVATE,
+    )
+    .expect("map writeback data");
+    let words =
+        unsafe { std::slice::from_raw_parts_mut(mapping.range().start.raw() as *mut u64, 2) };
+    words.copy_from_slice(&[11, 22]);
+    let mut stack = vec![0_u8; 16 * 1024];
+
+    let mut pre = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    pre.x[0] = 77;
+    pre.x[1] = GUEST + 8;
+    run_biased_single_memory(0xf81f_8c20, GuestVa(0xa000), host_bias, &mut pre);
+    assert_eq!(pre.x[1], GUEST);
+    assert_eq!(words[0], 77);
+
+    let mut post = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    post.x[1] = GUEST;
+    run_biased_single_memory(0xf840_8420, GuestVa(0xb000), host_bias, &mut post);
+    assert_eq!(post.x[0], 77);
+    assert_eq!(post.x[1], GUEST + 8);
+
+    let mut virtual_overlap = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    virtual_overlap.x[18] = GUEST;
+    run_biased_single_memory(
+        0xf800_8652, // str x18, [x18], #8 (constrained overlap fixture)
+        GuestVa(0xc000),
+        host_bias,
+        &mut virtual_overlap,
+    );
+    assert_eq!(words[0], GUEST);
+    assert_eq!(virtual_overlap.x[18], GUEST + 8);
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn biased_literal_load_commits_virtual_x18() {
+    const BIAS: u64 = 0x80_0000_0000;
+    const GUEST: u64 = 0x8_0000_0000;
+    let host_bias = crate::native_darwin::address::NativeHostBias::new(BIAS, 16 * 1024)
+        .expect("construct host bias");
+    let mapping = crate::native_darwin::address::OwnedHostMapping::map_exact(
+        HostVa((BIAS + GUEST) as usize),
+        16 * 1024,
+        libc::PROT_READ | libc::PROT_WRITE,
+        libc::MAP_ANON | libc::MAP_PRIVATE,
+    )
+    .expect("map literal data");
+    unsafe { *(mapping.range().start.raw() as *mut u64) = 0xfeed_face_cafe_beef };
+    let word = 0x5800_0052;
+    let plan = BlockPlan {
+        start: GuestVa(0xd000),
+        end: GuestVa(0xd008),
+        generation: CodeGeneration::INITIAL,
+        instructions: vec![PlannedInst {
+            guest: GuestVa(0xd000),
+            action: InstAction::Memory(MemoryAccess {
+                word,
+                op: bad64::Op::LDR,
+                base: MemoryBase::Literal(GuestVa(GUEST)),
+                writeback: MemoryWriteback::None,
+                class: MemoryClass::Literal,
+                virtualization: MemoryVirtualization::None,
+            }),
+        }],
+        exit: PlannedExit::Syscall {
+            guest: GuestVa(0xd004),
+            resume: GuestVa(0xd008),
+        },
+    };
+    let mut cache = TranslationCache::new(16 * 1024).expect("allocate literal cache");
+    let emitted = emit_block(
+        &mut cache,
+        &plan,
+        super::emit::EmitAddressMode::Biased { host_bias },
+    )
+    .expect("emit biased literal");
+    let mut stack = vec![0_u8; 16 * 1024];
+    let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    let mut exit = NativeDsrExit::Syscall {
+        resume: GuestVa(0xd008),
+    };
+    super::gateway::enter_translated_in_mode(
+        emitted.entry(),
+        &mut snapshot,
+        &mut exit,
+        crate::native_darwin::address::NativeAddressMode::Biased { host_bias },
+    )
+    .expect("execute biased literal");
+    assert_eq!(snapshot.x[18], 0xfeed_face_cafe_beef);
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn biased_x16_x17_and_store_families_execute_architecturally() {
+    const BIAS: u64 = 0x80_0000_0000;
+    const GUEST: u64 = 0x9_0000_0000;
+    const VALUE: u64 = 0x1234_5678_9abc_def0;
+    let host_bias = crate::native_darwin::address::NativeHostBias::new(BIAS, 16 * 1024)
+        .expect("construct host bias");
+    let mapping = crate::native_darwin::address::OwnedHostMapping::map_exact(
+        HostVa((BIAS + GUEST) as usize),
+        16 * 1024,
+        libc::PROT_READ | libc::PROT_WRITE,
+        libc::MAP_ANON | libc::MAP_PRIVATE,
+    )
+    .expect("map operand-family data");
+    let words =
+        unsafe { std::slice::from_raw_parts_mut(mapping.range().start.raw() as *mut u64, 4) };
+    let mut stack = vec![0_u8; 16 * 1024];
+
+    type Configure = fn(&mut NativeUcontextSnapshot);
+    type Verify = fn(&NativeUcontextSnapshot, &[u64]);
+    let fixtures: [(u32, Configure, Verify); 4] = [
+        (
+            0xf940_0030,
+            |snapshot: &mut NativeUcontextSnapshot| snapshot.x[1] = GUEST,
+            |snapshot: &NativeUcontextSnapshot, words: &[u64]| assert_eq!(snapshot.x[16], words[0]),
+        ),
+        (
+            0xf900_0031,
+            |snapshot: &mut NativeUcontextSnapshot| {
+                snapshot.x[1] = GUEST;
+                snapshot.x[17] = VALUE;
+            },
+            |snapshot: &NativeUcontextSnapshot, words: &[u64]| {
+                assert_eq!(words[0], VALUE);
+                assert_eq!(snapshot.x[17], VALUE);
+            },
+        ),
+        (
+            0xf940_0200,
+            |snapshot: &mut NativeUcontextSnapshot| snapshot.x[16] = GUEST,
+            |snapshot: &NativeUcontextSnapshot, words: &[u64]| {
+                assert_eq!(snapshot.x[0], words[0]);
+                assert_eq!(snapshot.x[16], GUEST);
+            },
+        ),
+        (
+            0xf940_0220,
+            |snapshot: &mut NativeUcontextSnapshot| snapshot.x[17] = GUEST,
+            |snapshot: &NativeUcontextSnapshot, words: &[u64]| {
+                assert_eq!(snapshot.x[0], words[0]);
+                assert_eq!(snapshot.x[17], GUEST);
+            },
+        ),
+    ];
+    for (word, configure, verify) in fixtures {
+        words.fill(0);
+        words[0] = VALUE;
+        let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+        configure(&mut snapshot);
+        run_biased_single_memory(word, GuestVa(0xe000), host_bias, &mut snapshot);
+        verify(&snapshot, words);
+    }
+
+    words.fill(0);
+    let mut pair = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    pair.x[0] = 11;
+    pair.x[1] = 22;
+    pair.x[2] = GUEST;
+    run_biased_single_memory(0xa900_0440, GuestVa(0xe100), host_bias, &mut pair);
+    assert_eq!(&words[..2], &[11, 22]);
+
+    words.fill(0);
+    let mut simd = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    simd.x[1] = GUEST;
+    simd.v[0] = [0xa5; 16];
+    run_biased_single_memory(0x3d80_0020, GuestVa(0xe200), host_bias, &mut simd);
+    assert_eq!(
+        unsafe { std::slice::from_raw_parts(words.as_ptr().cast::<u8>(), 16) },
+        &[0xa5; 16]
+    );
+
+    words[0] = VALUE;
+    let mut register_offset = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    register_offset.x[1] = GUEST;
+    register_offset.x[2] = 0;
+    run_biased_single_memory(
+        0xf862_6820,
+        GuestVa(0xe300),
+        host_bias,
+        &mut register_offset,
+    );
+    assert_eq!(register_offset.x[0], VALUE);
+}
 
 fn seeded_snapshot(stack_pointer: u64) -> NativeUcontextSnapshot {
     let mut snapshot = NativeUcontextSnapshot {
@@ -46,7 +581,7 @@ fn run_full_state_oracle() -> Result<(), DsrError> {
         },
     };
     let mut cache = TranslationCache::new(16 * 1024)?;
-    let emitted = emit_block(&mut cache, &plan)?;
+    let emitted = emit_block_direct(&mut cache, &plan)?;
     let mut exit = NativeDsrExit::Syscall {
         resume: GuestVa(0x4008),
     };
@@ -133,7 +668,7 @@ fn dsr_pc_relative_adr_materializes_guest_target() {
         },
     };
     let mut cache = TranslationCache::new(16 * 1024).expect("allocate PC-relative cache");
-    let emitted = emit_block(&mut cache, &plan).expect("emit ADR relocation");
+    let emitted = emit_block_direct(&mut cache, &plan).expect("emit ADR relocation");
     let mut exit = NativeDsrExit::Syscall {
         resume: GuestVa(0x4008),
     };
@@ -166,7 +701,7 @@ fn dsr_pc_relative_literal_load_reads_guest_address() {
         },
     };
     let mut cache = TranslationCache::new(16 * 1024).expect("allocate literal-load cache");
-    let emitted = emit_block(&mut cache, &plan).expect("emit literal-load relocation");
+    let emitted = emit_block_direct(&mut cache, &plan).expect("emit literal-load relocation");
     let mut exit = NativeDsrExit::Syscall {
         resume: GuestVa(0x5008),
     };
@@ -230,7 +765,7 @@ fn dsr_pc_relative_literals_cover_integer_simd_prefetch_and_virtual_x18() {
         },
     };
     let mut cache = TranslationCache::new(16 * 1024).expect("allocate literal matrix cache");
-    let emitted = emit_block(&mut cache, &plan).expect("emit literal relocation matrix");
+    let emitted = emit_block_direct(&mut cache, &plan).expect("emit literal relocation matrix");
     for offset in (0..emitted.len()).step_by(4) {
         let address = emitted.entry().host().raw() + offset;
         let word = unsafe { std::ptr::read_unaligned(address as *const u32) };
@@ -278,7 +813,7 @@ fn dsr_pc_relative_adrp_writes_virtual_guest_x18_without_clobbering_x17() {
         },
     };
     let mut cache = TranslationCache::new(16 * 1024).expect("allocate ADRP cache");
-    let emitted = emit_block(&mut cache, &plan).expect("emit ADRP relocation");
+    let emitted = emit_block_direct(&mut cache, &plan).expect("emit ADRP relocation");
     let mut exit = NativeDsrExit::Syscall {
         resume: GuestVa(0x7008),
     };
@@ -311,7 +846,7 @@ fn dsr_direct_flow_unresolved_branch_reports_guest_target() {
         },
     };
     let mut cache = TranslationCache::new(16 * 1024).expect("allocate direct-flow cache");
-    let emitted = emit_block(&mut cache, &plan).expect("emit unresolved direct branch");
+    let emitted = emit_block_direct(&mut cache, &plan).expect("emit unresolved direct branch");
     let mut exit = NativeDsrExit::ResolveDirect {
         source: GuestVa(0x8000),
         target,
@@ -389,8 +924,8 @@ fn dsr_direct_flow_linked_branch_stays_in_translated_code_and_preserves_x17() {
             },
         },
     };
-    let source = emit_block(&mut cache, &source_plan).expect("emit linked source");
-    let target = emit_block(&mut cache, &syscall_plan(GuestVa(0xb000), 0x9100_0400))
+    let source = emit_block_direct(&mut cache, &source_plan).expect("emit linked source");
+    let target = emit_block_direct(&mut cache, &syscall_plan(GuestVa(0xb000), 0x9100_0400))
         .expect("emit linked target"); // add x0, x0, #1
     patch_direct_target(&mut cache, &source, GuestVa(0xb000), &target);
 
@@ -434,10 +969,10 @@ fn dsr_direct_flow_conditional_edges_select_taken_and_fallthrough_links() {
             },
         },
     };
-    let source = emit_block(&mut cache, &source_plan).expect("emit conditional source");
-    let fallthrough = emit_block(&mut cache, &syscall_plan(GuestVa(0xc004), 0x9100_0821))
+    let source = emit_block_direct(&mut cache, &source_plan).expect("emit conditional source");
+    let fallthrough = emit_block_direct(&mut cache, &syscall_plan(GuestVa(0xc004), 0x9100_0821))
         .expect("emit fallthrough target"); // add x1, x1, #2
-    let taken = emit_block(&mut cache, &syscall_plan(GuestVa(0xc100), 0x9100_0421))
+    let taken = emit_block_direct(&mut cache, &syscall_plan(GuestVa(0xc100), 0x9100_0421))
         .expect("emit taken target"); // add x1, x1, #1
     patch_direct_target(&mut cache, &source, GuestVa(0xc004), &fallthrough);
     patch_direct_target(&mut cache, &source, GuestVa(0xc100), &taken);
@@ -484,7 +1019,7 @@ fn dsr_direct_flow_linked_call_observes_guest_lr() {
             },
         },
     };
-    let call = emit_block(&mut cache, &call_plan).expect("emit linked call");
+    let call = emit_block_direct(&mut cache, &call_plan).expect("emit linked call");
     let nested_plan = BlockPlan {
         start: GuestVa(0xe000),
         end: GuestVa(0xe004),
@@ -503,8 +1038,8 @@ fn dsr_direct_flow_linked_call_observes_guest_lr() {
             },
         },
     };
-    let nested = emit_block(&mut cache, &nested_plan).expect("emit nested call");
-    let callee = emit_block(&mut cache, &syscall_plan(GuestVa(0xe100), 0x9100_03c0))
+    let nested = emit_block_direct(&mut cache, &nested_plan).expect("emit nested call");
+    let callee = emit_block_direct(&mut cache, &syscall_plan(GuestVa(0xe100), 0x9100_03c0))
         .expect("emit final callee"); // add x0, x30, #0
     patch_direct_target(&mut cache, &call, GuestVa(0xe000), &nested);
     patch_direct_target(&mut cache, &nested, GuestVa(0xe100), &callee);
@@ -544,7 +1079,7 @@ fn dsr_direct_flow_condition_codes_and_virtual_x18_bits_choose_guest_edges() {
             },
         };
         let mut cache = TranslationCache::new(16 * 1024).expect("allocate condition cache");
-        let emitted = emit_block(&mut cache, &plan).expect("emit condition edge");
+        let emitted = emit_block_direct(&mut cache, &plan).expect("emit condition edge");
         let mut stack = vec![0_u8; 16 * 1024];
         let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
         snapshot.x[18] = guest_x18;
@@ -605,13 +1140,13 @@ fn dsr_guarded_link_after_virtual_x18_condition_preserves_guest_x17() {
         },
     };
     let mut cache = TranslationCache::new(32 * 1024).expect("allocate virtual-edge cache");
-    let source = super::emit::emit_block_with_generation(
+    let source = super::emit::emit_block_with_generation_direct(
         &mut cache,
         &source_plan,
         super::emit::GenerationGuard::new(&generation, CodeGeneration::INITIAL),
     )
     .expect("emit guarded virtual edge");
-    let target = super::emit::emit_block_with_generation(
+    let target = super::emit::emit_block_with_generation_direct(
         &mut cache,
         &target_plan,
         super::emit::GenerationGuard::new(&generation, CodeGeneration::INITIAL),
@@ -657,8 +1192,8 @@ fn dsr_direct_flow_linked_backward_loop_reaches_fallthrough() {
             },
         },
     };
-    let loop_block = emit_block(&mut cache, &loop_plan).expect("emit linked loop");
-    let done = emit_block(&mut cache, &syscall_plan(GuestVa(0xf008), 0xd503_201f))
+    let loop_block = emit_block_direct(&mut cache, &loop_plan).expect("emit linked loop");
+    let done = emit_block_direct(&mut cache, &syscall_plan(GuestVa(0xf008), 0xd503_201f))
         .expect("emit loop fallthrough");
     patch_direct_target(&mut cache, &loop_block, GuestVa(0xf000), &loop_block);
     patch_direct_target(&mut cache, &loop_block, GuestVa(0xf008), &done);
@@ -698,7 +1233,7 @@ fn dsr_indirect_flow_unresolved_return_reports_guest_register_target() {
             },
         },
     };
-    let emitted = emit_block(&mut cache, &plan).expect("emit unresolved return");
+    let emitted = emit_block_direct(&mut cache, &plan).expect("emit unresolved return");
     let mut stack = vec![0_u8; 16 * 1024];
     let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
     snapshot.x[30] = 0x14_000;
@@ -736,7 +1271,7 @@ fn dsr_indirect_flow_blr_sets_guest_link_and_alternates_targets() {
             },
         },
     };
-    let emitted = emit_block(&mut cache, &plan).expect("emit BLR");
+    let emitted = emit_block_direct(&mut cache, &plan).expect("emit BLR");
     for target in [GuestVa(0x16_000), GuestVa(0x17_000), GuestVa(0x16_000)] {
         let mut stack = vec![0_u8; 16 * 1024];
         let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
@@ -777,7 +1312,7 @@ fn dsr_indirect_flow_branch_reads_virtual_guest_x18() {
             },
         },
     };
-    let emitted = emit_block(&mut cache, &plan).expect("emit virtual x18 branch");
+    let emitted = emit_block_direct(&mut cache, &plan).expect("emit virtual x18 branch");
     let mut stack = vec![0_u8; 16 * 1024];
     let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
     snapshot.x[18] = 0x19_000;
@@ -823,10 +1358,11 @@ fn dsr_indirect_cache_keeps_old_index_aliases_hot() {
         },
     };
     let mut code = TranslationCache::new(32 * 1024).expect("allocate alias oracle");
-    let first_block = emit_block(&mut code, &target_plan(first)).expect("emit first alias target");
+    let first_block =
+        emit_block_direct(&mut code, &target_plan(first)).expect("emit first alias target");
     let second_block =
-        emit_block(&mut code, &target_plan(second)).expect("emit second alias target");
-    let source = emit_block(
+        emit_block_direct(&mut code, &target_plan(second)).expect("emit second alias target");
+    let source = emit_block_direct(
         &mut code,
         &BlockPlan {
             start: source_guest,
@@ -880,7 +1416,7 @@ fn dsr_indirect_flow_cache_hit_stays_in_translated_code() {
     // Production blocks carry a generation guard.  That guard must observe
     // the original guest x17 after an inline-cache hit, not the x17 scratch
     // used to hold the indirect target.
-    let target = super::emit::emit_block_with_generation(
+    let target = super::emit::emit_block_with_generation_direct(
         &mut code,
         &BlockPlan {
             start: target_guest,
@@ -895,7 +1431,7 @@ fn dsr_indirect_flow_cache_hit_stays_in_translated_code() {
         super::emit::GenerationGuard::new(&generation, target_generation),
     )
     .expect("emit indirect cache-hit target");
-    let source = emit_block(
+    let source = emit_block_direct(
         &mut code,
         &BlockPlan {
             start: source_guest,
@@ -974,7 +1510,7 @@ fn dsr_indirect_flow_cached_blr_sets_guest_link_register() {
     let target_guest = GuestVa(0x18_400);
     let resume_guest = GuestVa(source_guest.raw() + 4);
     let mut code = TranslationCache::new(16 * 1024).expect("allocate cached BLR code");
-    let target = emit_block(
+    let target = emit_block_direct(
         &mut code,
         &BlockPlan {
             start: target_guest,
@@ -988,7 +1524,7 @@ fn dsr_indirect_flow_cached_blr_sets_guest_link_register() {
         },
     )
     .expect("emit cached BLR target");
-    let source = emit_block(
+    let source = emit_block_direct(
         &mut code,
         &BlockPlan {
             start: source_guest,
@@ -1047,7 +1583,7 @@ fn dsr_sensitive_flow_reports_guest_pc_and_resume() {
             },
         },
     };
-    let emitted = emit_block_with_generation(
+    let emitted = emit_block_with_generation_direct(
         &mut cache,
         &plan,
         GenerationGuard::new(&current_generation, generation),
@@ -1095,7 +1631,7 @@ fn dsr_virtual_x18_rewrites_destination_and_distinct_x17_operand() {
             resume: GuestVa(0x1b_00c),
         },
     };
-    let emitted = emit_block(&mut cache, &plan).expect("emit x18 rewrites");
+    let emitted = emit_block_direct(&mut cache, &plan).expect("emit x18 rewrites");
     let mut stack = vec![0_u8; 16 * 1024];
     let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
     snapshot.x[1] = 0x123;
@@ -1138,7 +1674,7 @@ fn dsr_virtual_x18_madd_then_aliasing_loads_preserve_computed_address() {
         },
     };
     let generation = std::sync::atomic::AtomicU64::new(CodeGeneration::INITIAL.get());
-    let emitted = super::emit::emit_block_with_generation(
+    let emitted = super::emit::emit_block_with_generation_direct(
         &mut cache,
         &plan,
         super::emit::GenerationGuard::new(&generation, CodeGeneration::INITIAL),
@@ -1185,7 +1721,7 @@ fn dsr_virtual_x28_rewrites_destination_and_distinct_x17_operand() {
             resume: GuestVa(0x1b_10c),
         },
     };
-    let emitted = emit_block(&mut cache, &plan).expect("emit x28 rewrites");
+    let emitted = emit_block_direct(&mut cache, &plan).expect("emit x28 rewrites");
     let mut stack = vec![0_u8; 16 * 1024];
     let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
     snapshot.x[1] = 0x123;
@@ -1223,7 +1759,7 @@ fn dsr_dual_virtual_read_only_store_uses_guest_x18_and_x28() {
         },
     };
     let mut cache = TranslationCache::new(16 * 1024).expect("allocate dual rewrite cache");
-    let emitted = emit_block(&mut cache, &plan).expect("emit dual virtual store");
+    let emitted = emit_block_direct(&mut cache, &plan).expect("emit dual virtual store");
     let mut stored = [0_u64; 24];
     let mut stack = vec![0_u8; 16 * 1024];
     let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
@@ -1265,7 +1801,7 @@ fn dsr_dual_virtual_add_commits_guest_x18_from_guest_x28() {
         },
     };
     let mut cache = TranslationCache::new(16 * 1024).expect("allocate dual add cache");
-    let emitted = emit_block(&mut cache, &plan).expect("emit dual virtual add");
+    let emitted = emit_block_direct(&mut cache, &plan).expect("emit dual virtual add");
     let mut stack = vec![0_u8; 16 * 1024];
     let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
     snapshot.x[28] = 0x8000;
@@ -1302,7 +1838,7 @@ fn dsr_dual_virtual_load_commits_guest_x18_and_ordinary_destination() {
         },
     };
     let mut cache = TranslationCache::new(16 * 1024).expect("allocate dual load cache");
-    let emitted = emit_block(&mut cache, &plan).expect("emit dual virtual load");
+    let emitted = emit_block_direct(&mut cache, &plan).expect("emit dual virtual load");
     let mut source = [0_u64; 29];
     source[27] = 0x1515_1515_1515_1515;
     source[28] = 0x1818_1818_1818_1818;
@@ -1340,7 +1876,7 @@ fn dsr_generation_guard_rejects_stale_block_before_guest_instruction() {
         },
     };
     let mut cache = TranslationCache::new(16 * 1024).expect("allocate generation guard cache");
-    let emitted = super::emit::emit_block_with_generation(
+    let emitted = super::emit::emit_block_with_generation_direct(
         &mut cache,
         &plan,
         super::emit::GenerationGuard::new(&generation, CodeGeneration::INITIAL),
@@ -1392,7 +1928,7 @@ fn dsr_signal_fault_reconstructs_copied_instruction_pc() {
             resume: GuestVa(0x1c_008),
         },
     };
-    let emitted = emit_block(&mut cache, &plan).expect("emit faulting block");
+    let emitted = emit_block_direct(&mut cache, &plan).expect("emit faulting block");
     let mut stack = vec![0_u8; 16 * 1024];
     let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
     snapshot.x[0] = 1;
@@ -1440,7 +1976,7 @@ fn dsr_signal_fault_recovers_context_when_physical_x28_is_zero() {
     );
     let guest = GuestVa(0x1c_100);
     let mut cache = TranslationCache::new(16 * 1024).expect("allocate x28 recovery cache");
-    let emitted = emit_block(
+    let emitted = emit_block_direct(
         &mut cache,
         &BlockPlan {
             start: guest,
@@ -1504,7 +2040,7 @@ fn dsr_concurrency_kick_exits_guarded_linked_loop_without_corrupting_guest_state
     let guest = GuestVa(0x1c_200);
     let mut cache = TranslationCache::new(16 * 1024).expect("allocate kick cache");
     let generation = AtomicU64::new(CodeGeneration::INITIAL.get());
-    let emitted = super::emit::emit_block_with_generation(
+    let emitted = super::emit::emit_block_with_generation_direct(
         &mut cache,
         &BlockPlan {
             start: guest,
@@ -1666,7 +2202,7 @@ fn dsr_pending_kick_during_gateway_entry_keeps_guest_pc() {
     );
     let guest = GuestVa(0x1c_300);
     let mut cache = TranslationCache::new(16 * 1024).expect("allocate entry-kick cache");
-    let emitted = emit_block(
+    let emitted = emit_block_direct(
         &mut cache,
         &BlockPlan {
             start: guest,
@@ -1725,7 +2261,7 @@ fn dsr_host_window_kick_is_deferred_to_next_gateway_entry() {
     );
     let guest = GuestVa(0x1c_340);
     let mut cache = TranslationCache::new(16 * 1024).expect("allocate host-window cache");
-    let emitted = emit_block(
+    let emitted = emit_block_direct(
         &mut cache,
         &BlockPlan {
             start: guest,
@@ -1811,7 +2347,7 @@ fn dsr_reinstall_clears_inherited_host_window_kick() {
     );
     let guest = GuestVa(0x1c_360);
     let mut cache = TranslationCache::new(16 * 1024).expect("allocate reinstall cache");
-    let emitted = emit_block(
+    let emitted = emit_block_direct(
         &mut cache,
         &BlockPlan {
             start: guest,
@@ -1857,7 +2393,7 @@ fn dsr_phase_zero_host_kick_keeps_original_guest_snapshot() {
     );
     let guest = GuestVa(0x1c_380);
     let mut cache = TranslationCache::new(16 * 1024).expect("allocate host-kick cache");
-    let emitted = emit_block(
+    let emitted = emit_block_direct(
         &mut cache,
         &BlockPlan {
             start: guest,
@@ -1888,6 +2424,7 @@ fn dsr_phase_zero_host_kick_keeps_original_guest_snapshot() {
         &indirect,
         emitted.entry().host().raw(),
         emitted.entry().host().raw() + emitted.len(),
+        crate::native_darwin::address::NativeAddressMode::Direct,
     )
     .expect("classify phase-zero host kick");
 
@@ -1922,7 +2459,7 @@ fn dsr_signal_fault_recovers_scratch_in_expanded_x18_load() {
             resume: GuestVa(guest_pc.raw() + 8),
         },
     };
-    let emitted = emit_block(&mut cache, &plan).expect("emit expanded x18 load");
+    let emitted = emit_block_direct(&mut cache, &plan).expect("emit expanded x18 load");
     let mut stack = vec![0_u8; 16 * 1024];
     let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
     snapshot.x[0] = 1;
@@ -2012,7 +2549,7 @@ fn dsr_signal_fault_preserves_destination_in_expanded_literal_load() {
             resume: GuestVa(guest_pc.raw() + 8),
         },
     };
-    let emitted = emit_block(&mut cache, &plan).expect("emit expanded literal fault");
+    let emitted = emit_block_direct(&mut cache, &plan).expect("emit expanded literal fault");
     let mut stack = vec![0_u8; 16 * 1024];
     let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
     let original = snapshot;

@@ -103,9 +103,14 @@ struct DsrContext {
     indirect_x30_scratch: u64,
     cache_start: u64,
     cache_end: u64,
+    host_bias: u64,
 }
 
 impl DsrContext {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the C gateway context is initialized from one explicit execution record"
+    )]
     fn new(
         snapshot: NativeUcontextSnapshot,
         entry: CacheVa,
@@ -114,6 +119,7 @@ impl DsrContext {
         generation: CodeGeneration,
         cache_start: usize,
         cache_end: usize,
+        address_mode: super::super::address::NativeAddressMode,
     ) -> Self {
         let (exit_target, exit_source, _exit_status, exit_link, exit_has_link) = match exit {
             NativeDsrExit::Syscall { resume } => (resume.raw(), 0, 1, 0, 0),
@@ -167,6 +173,7 @@ impl DsrContext {
             indirect_x30_scratch: snapshot.x[30],
             cache_start: cache_start as u64,
             cache_end: cache_end as u64,
+            host_bias: address_mode.bias(),
         }
     }
 }
@@ -192,6 +199,7 @@ const _: () = assert!(std::mem::offset_of!(DsrContext, indirect_x15_scratch) == 
 const _: () = assert!(std::mem::offset_of!(DsrContext, indirect_x30_scratch) == 1168);
 const _: () = assert!(std::mem::offset_of!(DsrContext, cache_start) == 1176);
 const _: () = assert!(std::mem::offset_of!(DsrContext, cache_end) == 1184);
+const _: () = assert!(std::mem::offset_of!(DsrContext, host_bias) == 1192);
 const _: () = assert!(std::mem::size_of::<DsrContext>() == 1200);
 const _: () = assert!(std::mem::size_of::<IndirectTargetCacheEntry>() == 32);
 const _: () = assert!(std::mem::offset_of!(IndirectTargetCacheEntry, guest) == 0);
@@ -245,6 +253,25 @@ pub(super) fn enter_translated(
         CodeGeneration::INITIAL,
         0,
         usize::MAX,
+        super::super::address::NativeAddressMode::Direct,
+    )
+}
+
+pub(super) fn enter_translated_in_mode(
+    entry: CacheVa,
+    snapshot: &mut NativeUcontextSnapshot,
+    exit: &mut NativeDsrExit,
+    address_mode: super::super::address::NativeAddressMode,
+) -> Result<(), DsrError> {
+    enter_translated_raw(
+        entry,
+        snapshot,
+        exit,
+        std::ptr::null(),
+        CodeGeneration::INITIAL,
+        0,
+        usize::MAX,
+        address_mode,
     )
 }
 
@@ -262,6 +289,7 @@ pub(super) fn enter_translated_with_cache(
         CodeGeneration::INITIAL,
         0,
         usize::MAX,
+        super::super::address::NativeAddressMode::Direct,
     )
 }
 
@@ -272,6 +300,7 @@ pub(super) fn enter_translated_with_cache_range(
     indirect_cache: &IndirectTargetCache,
     cache_start: usize,
     cache_end: usize,
+    address_mode: super::super::address::NativeAddressMode,
 ) -> Result<(), DsrError> {
     enter_translated_raw(
         entry,
@@ -281,6 +310,7 @@ pub(super) fn enter_translated_with_cache_range(
         CodeGeneration::INITIAL,
         cache_start,
         cache_end,
+        address_mode,
     )
 }
 
@@ -304,8 +334,19 @@ mod indirect_cache_tests {
         let second = carrick_guest_mem::GuestVa(0x48_000);
         assert_ne!(indirect_cache_index(first), indirect_cache_index(second));
     }
+
+    #[test]
+    fn dsr_context_appends_host_bias_without_shifting_gateway_fields() {
+        assert_eq!(std::mem::offset_of!(DsrContext, cache_end), 1184);
+        assert_eq!(std::mem::offset_of!(DsrContext, host_bias), 1192);
+        assert_eq!(std::mem::size_of::<DsrContext>(), 1200);
+    }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "raw gateway entry pins cache, generation, and address-mode authority together"
+)]
 fn enter_translated_raw(
     entry: CacheVa,
     snapshot: &mut NativeUcontextSnapshot,
@@ -314,6 +355,7 @@ fn enter_translated_raw(
     generation: CodeGeneration,
     cache_start: usize,
     cache_end: usize,
+    address_mode: super::super::address::NativeAddressMode,
 ) -> Result<(), DsrError> {
     if !matches!(
         *exit,
@@ -337,6 +379,7 @@ fn enter_translated_raw(
         generation,
         cache_start,
         cache_end,
+        address_mode,
     );
     let rc = unsafe { carrick_dsr_enter_raw(&mut context) };
     if !matches!(rc, 1..=8) {
@@ -546,6 +589,7 @@ fn measure_gateway_components() -> (GatewayComponentSummary, GatewayComponentSum
                     CodeGeneration::INITIAL,
                     0,
                     usize::MAX,
+                    super::super::address::NativeAddressMode::Direct,
                 );
                 let published = std::hint::black_box(context).snapshot;
                 std::hint::black_box(published);
