@@ -165,7 +165,7 @@ pub(super) enum NativeDsrExit {
         guest_pc: GuestVa,
         signal: i32,
         code: i32,
-        address: GuestVa,
+        address: carrick_guest_mem::HostVa,
         rewrite_scratch: u64,
         rewrite_context_scratch: u64,
         generation_pstate_scratch: u64,
@@ -212,7 +212,7 @@ impl NativeDsrExit {
             }
             Self::Fault {
                 guest_pc, address, ..
-            } => (DsrExitKind::Fault, guest_pc.raw(), address.raw(), 4),
+            } => (DsrExitKind::Fault, guest_pc.raw(), address.raw() as u64, 4),
             Self::Kick { resume, .. } => (DsrExitKind::Kick, resume.raw(), 0, 5),
             Self::Sensitive {
                 guest_pc, resume, ..

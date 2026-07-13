@@ -22,7 +22,7 @@ pub(super) enum ThreadExit {
     Sensitive(types::SensitiveExit),
     Fault {
         kind: ThreadFault,
-        address: carrick_guest_mem::GuestVa,
+        address: ThreadFaultAddress,
     },
     Kick,
     Unsupported(String),
@@ -32,6 +32,21 @@ pub(super) enum ThreadExit {
 pub(super) enum ThreadFault {
     Host { signal: i32, code: i32 },
     Guest { signum: i32, code: i32 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ThreadFaultAddress {
+    Host(carrick_guest_mem::HostVa),
+    Guest(carrick_guest_mem::GuestVa),
+}
+
+impl ThreadFaultAddress {
+    pub(super) fn raw(self) -> u64 {
+        match self {
+            Self::Host(address) => address.raw() as u64,
+            Self::Guest(address) => address.raw(),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -923,7 +938,7 @@ impl ThreadTranslator {
                             signum: carrick_abi::LINUX_SIGBUS,
                             code: carrick_abi::LINUX_BUS_ADRALN,
                         },
-                        address: target,
+                        address: ThreadFaultAddress::Guest(target),
                     });
                 }
                 if !memory.guest_address_is_executable(target.raw()) {
@@ -944,7 +959,7 @@ impl ThreadTranslator {
                                 carrick_abi::LINUX_SEGV_MAPERR
                             },
                         },
-                        address: target,
+                        address: ThreadFaultAddress::Guest(target),
                     });
                 }
                 let (entry, target_generation) = match self.resolve_indirect(memory, source, target)
@@ -1057,10 +1072,20 @@ impl ThreadTranslator {
                     )?;
                 }
                 snapshot.pc = guest_pc.raw();
-                ThreadExit::Fault {
-                    kind: ThreadFault::Host { signal, code },
-                    address,
-                }
+                let (kind, address) = if let Some((signum, code)) =
+                    crate::vcpu_loop::el0_debug_signal(snapshot.esr)
+                {
+                    (
+                        ThreadFault::Guest { signum, code },
+                        ThreadFaultAddress::Guest(guest_pc),
+                    )
+                } else {
+                    (
+                        ThreadFault::Host { signal, code },
+                        ThreadFaultAddress::Host(address),
+                    )
+                };
+                ThreadExit::Fault { kind, address }
             }
             types::NativeDsrExit::Kick {
                 resume,
@@ -1523,7 +1548,7 @@ mod tests {
                     guest_pc: PC,
                     signal: libc::SIGSEGV,
                     code: 0,
-                    address: target,
+                    address: carrick_guest_mem::HostVa(target.raw() as usize),
                     rewrite_scratch: 0,
                     rewrite_context_scratch: 0,
                     generation_pstate_scratch: 0,
