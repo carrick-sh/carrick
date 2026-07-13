@@ -80,6 +80,13 @@ const NATIVE_DARWIN_HARD_PAGEZERO_END: u64 = 0x1_0000_0000;
 static NATIVE_FORKED_GUEST_CHILD: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+#[cfg(test)]
+thread_local! {
+    static NATIVE_TEST_FAIL_EXEC_AFTER_SETUP: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+}
+
 /// Set by the exec teardown at its success point (BEFORE it lowers the
 /// transient exec-replacement owner), never cleared for the life of the
 /// image: "a spawned thread's execve replaced (or is replacing) this
@@ -1558,10 +1565,11 @@ fn run_native_dsr_thread_loop(
                         // allocate its translator before Linux's point of no
                         // return. A collision or allocation failure leaves the
                         // old image, sibling set, dispatcher, and DSR cache live.
-                        let prepared_mapping = match memory
-                            .lock()
-                            .prepare_exec_mapping(&image, &plan)
-                        {
+                        let prepared_mapping = {
+                            let memory = memory.lock();
+                            memory.prepare_exec_mapping(&image, &plan)
+                        };
+                        let prepared_mapping = match prepared_mapping {
                             Ok(prepared) => prepared,
                             Err(error) => {
                                 tracing::warn!(
@@ -5262,6 +5270,7 @@ struct PreparedNativeExecMapping {
     native_layout: NativeLayout,
     process_translator: Arc<dsr::ProcessTranslator>,
     reset_inherited_translator: bool,
+    direct_target_reservations: Vec<crate::host_proc::DirectVmReservation>,
 }
 
 #[derive(Clone, Copy)]
@@ -5710,6 +5719,15 @@ impl NativeMappedMemory {
                 0,
             );
             apply_native_relative_relocations(&mut memory, relative_relocations)?;
+            #[cfg(test)]
+            if exec_map_dsr_tid.is_some()
+                && NATIVE_TEST_FAIL_EXEC_AFTER_SETUP.with(|failpoint| failpoint.replace(false))
+            {
+                return Err(RuntimeError::Unsupported(
+                    "injected native exec failure after target mapping, vvar setup, and relocations"
+                        .to_string(),
+                ));
+            }
             Ok(memory)
         })();
         let memory = native_layout.commit_if_ok(setup)?;
@@ -5859,6 +5877,12 @@ impl NativeMappedMemory {
             plan.page_geometry.host_page_size,
         )
         .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+        let target_only = if matches!(native_layout.address_mode(), NativeAddressMode::Direct) {
+            subtract_host_ranges(native_layout.owned_ranges(), &self.owned_host_ranges)
+        } else {
+            Vec::new()
+        };
+        let mut direct_target_reservations = Vec::with_capacity(target_only.len());
         let reset_inherited_translator =
             NATIVE_FORKED_GUEST_CHILD.load(std::sync::atomic::Ordering::Acquire);
         let process_translator = if reset_inherited_translator {
@@ -5869,10 +5893,38 @@ impl NativeMappedMemory {
                     .map_err(|error| RuntimeError::Unsupported(error.to_string()))?,
             )
         };
+        // This is the final pre-PONR screen. The layout, target-only range
+        // vector, reservation-vector capacity, and replacement MAP_JIT cache
+        // are all allocated first. Each allocatable interval becomes an exact
+        // PROT_NONE guard; only the measured dyld delegated shared-pmap COW
+        // covering tuple may proceed without one. No allocator or mmap may run
+        // after this loop before old-image retirement.
+        for range in &target_only {
+            let length = range
+                .end
+                .raw()
+                .checked_sub(range.start.raw())
+                .ok_or_else(|| {
+                    RuntimeError::Unsupported(format!(
+                        "native direct exec target range is inverted: 0x{:x}..0x{:x}",
+                        range.start.raw(),
+                        range.end.raw()
+                    ))
+                })? as u64;
+            match crate::host_proc::reserve_self_direct_vm_range(range.start.raw() as u64, length)
+                .map_err(|error| RuntimeError::Unsupported(error.to_string()))?
+            {
+                crate::host_proc::DirectVmReservationOutcome::Reserved(reservation) => {
+                    direct_target_reservations.push(reservation);
+                }
+                crate::host_proc::DirectVmReservationOutcome::DelegatedDyldSharedPmapCow => {}
+            }
+        }
         Ok(PreparedNativeExecMapping {
             native_layout,
             process_translator,
             reset_inherited_translator,
+            direct_target_reservations,
         })
     }
 
@@ -5923,9 +5975,14 @@ impl NativeMappedMemory {
         lifecycle(crate::probes::DsrCacheLifecyclePhase::ExecImageUnmapEnd);
         lifecycle(crate::probes::DsrCacheLifecyclePhase::ExecImageMapBegin);
         lifecycle(crate::probes::DsrCacheLifecyclePhase::ExecRelocationBegin);
-        let inherited_translator = prepared
-            .reset_inherited_translator
-            .then(|| Arc::clone(&prepared.process_translator));
+        let PreparedNativeExecMapping {
+            native_layout,
+            process_translator,
+            reset_inherited_translator,
+            direct_target_reservations,
+        } = prepared;
+        let inherited_translator =
+            reset_inherited_translator.then(|| Arc::clone(&process_translator));
         let replacement = Self::map_with_layout(
             image,
             native_memory_layout(),
@@ -5933,8 +5990,8 @@ impl NativeMappedMemory {
                 host: plan.page_geometry.host_page_size,
                 linux: plan.page_geometry.linux_page_size,
             },
-            prepared.native_layout,
-            Some(prepared.process_translator),
+            native_layout,
+            Some(process_translator),
             dsr_tid,
             relative_relocations,
         )?;
@@ -5948,6 +6005,9 @@ impl NativeMappedMemory {
             // then clear its inherited publications before the thread-level
             // handoff can execute the new image.
             translator.reset_after_fork_for_exec();
+        }
+        for reservation in direct_target_reservations {
+            reservation.commit();
         }
         lifecycle(crate::probes::DsrCacheLifecyclePhase::ExecCacheResetEnd);
         *self = replacement;
@@ -7956,6 +8016,48 @@ mod tests {
         assert_eq!(libc::WEXITSTATUS(status), 0);
     }
 
+    fn fork_test_with_timeout(timeout: std::time::Duration, test: impl FnOnce()) {
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            assert_eq!(
+                unsafe { libc::setpgid(0, 0) },
+                0,
+                "create test process group"
+            );
+            test();
+            unsafe { libc::_exit(0) };
+        }
+        // The parent-side call closes the short race before the child sets its
+        // own process group. ESRCH/EACCES are harmless because the child call
+        // is authoritative and there is no exec between fork and setpgid.
+        let _ = unsafe { libc::setpgid(pid, pid) };
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let mut status = 0;
+            let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+            if waited == pid {
+                assert!(libc::WIFEXITED(status), "forked test status={status:#x}");
+                assert_eq!(libc::WEXITSTATUS(status), 0);
+                return;
+            }
+            assert!(
+                waited == 0
+                    || (waited < 0
+                        && std::io::Error::last_os_error().kind()
+                            == std::io::ErrorKind::Interrupted),
+                "waitpid failed: {}",
+                std::io::Error::last_os_error()
+            );
+            if std::time::Instant::now() >= deadline {
+                let _ = unsafe { libc::kill(-pid, libc::SIGKILL) };
+                let _ = waitpid_blocking(pid);
+                panic!("forked test timed out after {timeout:?}");
+            }
+            unsafe { libc::usleep(10_000) };
+        }
+    }
+
     fn biased_test_memory(
         guest_start: carrick_guest_mem::GuestVa,
         len: usize,
@@ -8132,16 +8234,15 @@ mod tests {
         elf
     }
 
-    fn dsr_low_et_exec_test_elf(words: &[u32]) -> Vec<u8> {
+    fn dsr_et_exec_test_elf_at(words: &[u32], guest_base: u64) -> Vec<u8> {
         const CODE_OFFSET: usize = 0x1000;
-        const GUEST_BASE: u64 = 0x40_0000;
         let code_len = std::mem::size_of_val(words);
         let mut elf = vec![0_u8; CODE_OFFSET + code_len];
         elf[..16].copy_from_slice(&[0x7f, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         write_u16(&mut elf, 16, goblin::elf::header::ET_EXEC);
         write_u16(&mut elf, 18, 183); // EM_AARCH64
         write_u32(&mut elf, 20, 1);
-        write_u64(&mut elf, 24, GUEST_BASE);
+        write_u64(&mut elf, 24, guest_base);
         write_u64(&mut elf, 32, 64); // program-header offset
         write_u16(&mut elf, 52, 64);
         write_u16(&mut elf, 54, 56);
@@ -8149,8 +8250,8 @@ mod tests {
         write_u32(&mut elf, 64, 1); // PT_LOAD
         write_u32(&mut elf, 68, 5); // PF_R | PF_X
         write_u64(&mut elf, 72, CODE_OFFSET as u64);
-        write_u64(&mut elf, 80, GUEST_BASE);
-        write_u64(&mut elf, 88, GUEST_BASE);
+        write_u64(&mut elf, 80, guest_base);
+        write_u64(&mut elf, 88, guest_base);
         write_u64(&mut elf, 96, code_len as u64);
         write_u64(&mut elf, 104, code_len as u64);
         write_u64(&mut elf, 112, 0x1000);
@@ -8158,6 +8259,10 @@ mod tests {
             write_u32(&mut elf, CODE_OFFSET + index * 4, word);
         }
         elf
+    }
+
+    fn dsr_low_et_exec_test_elf(words: &[u32]) -> Vec<u8> {
+        dsr_et_exec_test_elf_at(words, 0x40_0000)
     }
 
     #[test]
@@ -8219,6 +8324,10 @@ mod tests {
             LifecycleImageKind::DirectPie => NATIVE_DARWIN_PIE_BASE,
             LifecycleImageKind::LowExec => 0x40_0000,
         };
+        lifecycle_image_at(start, marker)
+    }
+
+    fn lifecycle_image_at(start: u64, marker: u8) -> AddressSpace {
         AddressSpace::from_segments(
             start,
             [(
@@ -8235,6 +8344,88 @@ mod tests {
         .expect("build lifecycle image")
     }
 
+    fn assert_direct_target_collision_is_prevalidated(source: LifecycleImageKind) {
+        fork_test(|| {
+            let plan = native16k_test_plan();
+            let source_image = lifecycle_image(source, 0x4b);
+            let memory = NativeMappedMemory::map(
+                &source_image,
+                native_memory_layout(),
+                plan.page_geometry.host_page_size,
+                plan.page_geometry.linux_page_size,
+            )
+            .expect("map source image");
+            let old_guest = source_image.regions()[0].start + 0x80;
+            let target_start = 0x70_1000_0000;
+            let target = lifecycle_image_at(target_start, 0x72);
+            let blocker = address::OwnedHostMapping::map_exact(
+                carrick_guest_mem::HostVa(target_start as usize),
+                16 * 1024,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANON | libc::MAP_PRIVATE,
+            )
+            .expect("occupy direct target-only page");
+            unsafe { (target_start as *mut u8).write(0x5e) };
+
+            let error = memory
+                .prepare_exec_mapping(&target, &plan)
+                .err()
+                .expect("target-only direct collision must fail before retirement");
+            assert!(
+                error
+                    .to_string()
+                    .contains("native direct VM reservation collision"),
+                "unexpected error: {error}"
+            );
+            assert_eq!(unsafe { (target_start as *const u8).read() }, 0x5e);
+            assert_eq!(
+                memory
+                    .read_bytes(old_guest, 1)
+                    .expect("old image survives target screening"),
+                [0x4b]
+            );
+            drop(blocker);
+        });
+    }
+
+    #[test]
+    fn biased_source_rejects_direct_target_only_collision_before_retirement() {
+        assert_direct_target_collision_is_prevalidated(LifecycleImageKind::LowExec);
+    }
+
+    #[test]
+    fn direct_source_rejects_direct_target_only_collision_before_retirement() {
+        assert_direct_target_collision_is_prevalidated(LifecycleImageKind::DirectPie);
+    }
+
+    #[test]
+    fn arbitrary_high_et_exec_uses_direct_dsr_coordinates() {
+        let guest_base = 0x70_1000_0000;
+        let words = [
+            0x1000_0000, // adr x0, .
+            0xd100_43e1, // sub x1, sp, #16
+            0xf900_0020, // str x0, [x1]
+            0xf940_0022, // ldr x2, [x1]
+            0xcb00_0040, // sub x0, x2, x0
+            0xd280_0ba8, // mov x8, #93 (exit)
+            SVC_0,
+        ];
+        let mut file = tempfile::NamedTempFile::new().expect("create high ET_EXEC fixture");
+        std::io::Write::write_all(&mut file, &dsr_et_exec_test_elf_at(&words, guest_base))
+            .expect("write high ET_EXEC fixture");
+        let result = run_static_elf(
+            file.path(),
+            SyscallDispatcher::new(),
+            ["high-et-exec".to_string()],
+            std::iter::empty::<String>(),
+            16,
+            None,
+            &native16k_test_plan(),
+        )
+        .expect("run high ET_EXEC through direct DSR");
+        assert_eq!(result.exit_code, 0, "stderr={:?}", result.stderr);
+    }
+
     fn encode_adr(register: u8, byte_offset: i64) -> u32 {
         assert!(register < 32);
         assert!((-(1 << 20)..(1 << 20)).contains(&byte_offset));
@@ -8248,26 +8439,33 @@ mod tests {
     fn execve_source_elf(kind: LifecycleImageKind, target: &Path) -> Vec<u8> {
         const CODE_OFFSET: usize = 0x1000;
         let path = target.as_os_str().as_encoded_bytes();
-        let code_len = 8 * std::mem::size_of::<u32>();
+        let code_len = 13 * std::mem::size_of::<u32>();
+        let failure_marker_offset = code_len + path.len() + 1 - 5 * std::mem::size_of::<u32>();
         let words = [
             encode_adr(0, code_len as i64), // x0 = target path
             0xd280_0001,                    // mov x1, #0 (argv)
             0xd280_0002,                    // mov x2, #0 (envp)
             0xd280_1ba8,                    // mov x8, #221 (execve)
             SVC_0,
-            0xd280_0c60, // exec failure: mov x0, #99
+            encode_adr(1, failure_marker_offset as i64), // old-image failure continuation
+            0xd280_0020,                                 // mov x0, #1 (stdout)
+            0xd280_0022,                                 // mov x2, #1
+            0xd280_0808,                                 // mov x8, #64 (write)
+            SVC_0,
+            0xd280_0c60, // mov x0, #99
             0xd280_0ba8, // mov x8, #93 (exit)
             SVC_0,
         ];
         // Keeping the pathname immediately after code makes ADR independent of
         // direct vs biased host placement and leaves every architectural
         // pointer guest-valued.
-        let mut payload = Vec::with_capacity(code_len + path.len() + 1);
+        let mut payload = Vec::with_capacity(code_len + path.len() + 2);
         for word in words {
             payload.extend_from_slice(&word.to_le_bytes());
         }
         payload.extend_from_slice(path);
         payload.push(0);
+        payload.push(b'!');
         let (elf_type, guest_base) = match kind {
             LifecycleImageKind::DirectPie => (goblin::elf::header::ET_DYN, 0),
             LifecycleImageKind::LowExec => (goblin::elf::header::ET_EXEC, 0x40_0000),
@@ -8314,43 +8512,161 @@ mod tests {
     }
 
     #[test]
-    fn direct_guest_execve_runs_low_target_in_guest_coordinates() {
+    fn preflight_exec_error_returns_enomem_without_deadlocking_old_image() {
         use std::os::unix::fs::PermissionsExt;
 
-        let mut target = tempfile::NamedTempFile::new().expect("create low exec target");
+        const TARGET_BASE: u64 = 0x70_1000_0000;
+        let target_words = [
+            0xd280_0000, // mov x0, #0
+            0xd280_0ba8, // mov x8, #93 (exit)
+            SVC_0,
+        ];
+        let mut target = tempfile::NamedTempFile::new().expect("create blocked exec target");
         std::io::Write::write_all(
             &mut target,
-            &exec_target_pc_elf(LifecycleImageKind::LowExec),
+            &dsr_et_exec_test_elf_at(&target_words, TARGET_BASE),
         )
-        .expect("write low exec target");
+        .expect("write blocked exec target");
         std::fs::set_permissions(target.path(), std::fs::Permissions::from_mode(0o700))
-            .expect("make low exec target executable");
-
-        let mut source = tempfile::NamedTempFile::new().expect("create direct exec source");
+            .expect("make blocked exec target executable");
+        let mut source = tempfile::NamedTempFile::new().expect("create exec source");
         std::io::Write::write_all(
             &mut source,
-            &execve_source_elf(LifecycleImageKind::DirectPie, target.path()),
+            &execve_source_elf(LifecycleImageKind::LowExec, target.path()),
         )
-        .expect("write direct exec source");
+        .expect("write exec source");
 
-        let dispatcher = SyscallDispatcher::new();
-        dispatcher.set_stream_stdio(true);
+        fork_test_with_timeout(std::time::Duration::from_secs(5), move || {
+            let blocker = address::OwnedHostMapping::map_exact(
+                carrick_guest_mem::HostVa(TARGET_BASE as usize),
+                16 * 1024,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANON | libc::MAP_PRIVATE,
+            )
+            .expect("occupy direct exec target");
+            let dispatcher = SyscallDispatcher::new();
+            dispatcher.set_stream_stdio(true);
+            let result = run_static_elf(
+                source.path(),
+                dispatcher,
+                ["preflight-error".to_string()],
+                std::iter::empty::<String>(),
+                64,
+                None,
+                &native16k_test_plan(),
+            )
+            .expect("run old image through rejected execve");
+            assert_eq!(result.exit_code, 99, "stderr={:?}", result.stderr);
+            assert_eq!(result.stdout, b"!");
+            drop(blocker);
+        });
+    }
+
+    #[test]
+    fn guest_execve_runs_all_required_address_mode_transitions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for (source_kind, target_kind, expected_pc) in [
+            (
+                LifecycleImageKind::DirectPie,
+                LifecycleImageKind::LowExec,
+                0x40_0000,
+            ),
+            (
+                LifecycleImageKind::LowExec,
+                LifecycleImageKind::DirectPie,
+                NATIVE_DARWIN_PIE_BASE,
+            ),
+            (
+                LifecycleImageKind::LowExec,
+                LifecycleImageKind::LowExec,
+                0x40_0000,
+            ),
+        ] {
+            let mut target = tempfile::NamedTempFile::new().expect("create exec target");
+            std::io::Write::write_all(&mut target, &exec_target_pc_elf(target_kind))
+                .expect("write exec target");
+            std::fs::set_permissions(target.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("make exec target executable");
+
+            let mut source = tempfile::NamedTempFile::new().expect("create exec source");
+            std::io::Write::write_all(&mut source, &execve_source_elf(source_kind, target.path()))
+                .expect("write exec source");
+
+            let dispatcher = SyscallDispatcher::new();
+            dispatcher.set_stream_stdio(true);
+            let result = run_static_elf(
+                source.path(),
+                dispatcher,
+                ["exec-transition".to_string()],
+                std::iter::empty::<String>(),
+                64,
+                None,
+                &native16k_test_plan(),
+            )
+            .expect("run guest execve transition");
+            assert_eq!(
+                result.exit_code, 0,
+                "source={source_kind:?} target={target_kind:?} stderr={:?}",
+                result.stderr
+            );
+            assert_eq!(
+                result.stdout.len(),
+                8,
+                "source={source_kind:?} target={target_kind:?} stderr={:?}",
+                result.stderr
+            );
+            assert_eq!(
+                u64::from_le_bytes(result.stdout.try_into().expect("eight-byte guest PC")),
+                expected_pc,
+                "source={source_kind:?} target={target_kind:?} must report architectural guest PC after its stack store and write syscall"
+            );
+        }
+    }
+
+    #[test]
+    fn post_retirement_exec_failure_is_fatal_without_old_image_resume() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut target = tempfile::NamedTempFile::new().expect("create late-failure target");
+        std::io::Write::write_all(
+            &mut target,
+            &exec_target_pc_elf(LifecycleImageKind::DirectPie),
+        )
+        .expect("write late-failure target");
+        std::fs::set_permissions(target.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("make late-failure target executable");
+        let mut source = tempfile::NamedTempFile::new().expect("create late-failure source");
+        std::io::Write::write_all(
+            &mut source,
+            &execve_source_elf(LifecycleImageKind::LowExec, target.path()),
+        )
+        .expect("write late-failure source");
+
+        NATIVE_TEST_FAIL_EXEC_AFTER_SETUP.with(|failpoint| failpoint.set(true));
         let result = run_static_elf(
             source.path(),
-            dispatcher,
-            ["direct-exec-low".to_string()],
+            SyscallDispatcher::new(),
+            ["late-exec-failure".to_string()],
             std::iter::empty::<String>(),
             64,
             None,
             &native16k_test_plan(),
         )
-        .expect("run direct guest execve into low ET_EXEC target");
-        assert_eq!(result.exit_code, 0, "stderr={:?}", result.stderr);
-        assert_eq!(result.stdout.len(), 8, "stderr={:?}", result.stderr);
-        assert_eq!(
-            u64::from_le_bytes(result.stdout.try_into().expect("eight-byte guest PC")),
-            0x40_0000,
-            "replacement target must observe its architectural guest PC"
+        .expect("collect fatal late-exec result");
+        NATIVE_TEST_FAIL_EXEC_AFTER_SETUP.with(|failpoint| failpoint.set(false));
+
+        assert_eq!(result.exit_code, 125, "stderr={:?}", result.stderr);
+        assert!(
+            String::from_utf8_lossy(&result.stderr)
+                .contains("native execve failed after retiring the old owned address space"),
+            "stderr={:?}",
+            result.stderr
+        );
+        assert!(
+            result.stdout.is_empty(),
+            "old-image exec failure continuation emitted {:?}",
+            result.stdout
         );
     }
 
