@@ -168,7 +168,7 @@ pub fn backend_args(backend: CarrickBackend, probe: &Path, guest_args: &[&str]) 
             "native16k".to_owned(),
         ]),
         CarrickBackend::Hvf => {
-            args.extend(["--exec-backend".to_owned(), "hvf".to_owned()]);
+            args.extend(["--exec-backend".to_owned(), "vmm".to_owned()]);
         }
     }
     args.push(probe.to_string_lossy().into_owned());
@@ -410,7 +410,7 @@ mod tests {
         );
         assert!(
             hvf.windows(2)
-                .any(|window| window == ["--exec-backend", "hvf"])
+                .any(|window| window == ["--exec-backend", "vmm"])
         );
         assert!(!native.iter().any(|arg| arg == "--native-code-mode"));
     }
