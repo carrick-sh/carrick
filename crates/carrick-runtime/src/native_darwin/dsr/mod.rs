@@ -1285,7 +1285,10 @@ fn recover_rewrite_state(
 #[cfg(test)]
 mod tests {
     use super::decode::classify;
-    use super::types::{DirectKind, IndirectKind, InstAction, PcRelativeKind, SensitiveKind};
+    use super::types::{
+        DirectKind, IndirectKind, InstAction, MemoryBase, MemoryClass, PcRelativeKind,
+        SensitiveKind,
+    };
     use carrick_guest_mem::{GuestMemory, GuestVa};
     use proptest::prelude::*;
 
@@ -1749,20 +1752,28 @@ mod tests {
 
     #[test]
     fn copy_subset_rejects_virtualized_register_operands() {
-        for word in [0xd280_0032, 0xf940_0240] {
+        for word in [0xd280_0032] {
             assert!(super::decode::decoded_operands_mention_x18(word, PC));
             assert!(matches!(
                 classify(word, PC),
                 Ok(InstAction::VirtualizedX18 { word: observed, .. }) if observed == word
             ));
         }
-        for word in [0xd280_003c, 0xf940_0380] {
+        for word in [0xd280_003c] {
             assert!(super::decode::decoded_operands_mention_x28(word, PC));
             assert!(matches!(
                 classify(word, PC),
                 Ok(InstAction::VirtualizedX28 { word: observed, .. }) if observed == word
             ));
         }
+        assert!(matches!(
+            classify(0xf940_0240, PC),
+            Ok(InstAction::Memory(memory)) if memory.base == MemoryBase::VirtualX18
+        ));
+        assert!(matches!(
+            classify(0xf940_0380, PC),
+            Ok(InstAction::Memory(memory)) if memory.base == MemoryBase::VirtualX28
+        ));
     }
 
     proptest! {
@@ -1876,8 +1887,9 @@ mod tests {
         ));
         assert!(matches!(
             classify(0x5800_0040, PC),
-            Ok(InstAction::PcRelative(inst))
-                if inst.kind == PcRelativeKind::LiteralLoad && inst.target == GuestVa(0x1008)
+            Ok(InstAction::Memory(memory))
+                if memory.class == MemoryClass::Literal
+                    && memory.base == MemoryBase::Literal(GuestVa(0x1008))
         ));
         assert!(matches!(
             classify(0xd53b_0020, PC),

@@ -110,6 +110,41 @@ pub(super) struct PcRelativeInst {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum MemoryBase {
+    Register(bad64::Reg),
+    VirtualX18,
+    VirtualX28,
+    Literal(GuestVa),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum MemoryWriteback {
+    None,
+    PreIndex,
+    PostIndex,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum MemoryClass {
+    Scalar,
+    Pair,
+    Simd,
+    Exclusive,
+    Atomic,
+    Literal,
+    Unsupported,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct MemoryAccess {
+    pub(super) word: u32,
+    pub(super) op: bad64::Op,
+    pub(super) base: MemoryBase,
+    pub(super) writeback: MemoryWriteback,
+    pub(super) class: MemoryClass,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::native_darwin) enum SensitiveKind {
     ReadTpidr,
     WriteTpidr,
@@ -130,6 +165,7 @@ pub(in crate::native_darwin) struct SensitiveExit {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum InstAction {
     Copy(u32),
+    Memory(MemoryAccess),
     VirtualizedX18 { word: u32, op: bad64::Op },
     VirtualizedX28 { word: u32, op: bad64::Op },
     VirtualizedX18X28ReadOnly { word: u32, op: bad64::Op },

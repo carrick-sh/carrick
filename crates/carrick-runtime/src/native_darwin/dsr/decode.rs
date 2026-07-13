@@ -4,8 +4,9 @@ use bad64::{Imm, Op, Operand, Reg, SysReg};
 use carrick_guest_mem::GuestVa;
 
 use super::types::{
-    DirectExit, DirectKind, DsrError, IndirectExit, IndirectKind, InstAction, PcRelativeInst,
-    PcRelativeKind, SensitiveExit, SensitiveKind,
+    DirectExit, DirectKind, DsrError, IndirectExit, IndirectKind, InstAction, MemoryAccess,
+    MemoryBase, MemoryClass, MemoryWriteback, PcRelativeInst, PcRelativeKind, SensitiveExit,
+    SensitiveKind,
 };
 
 fn resume_pc(pc: GuestVa) -> Result<GuestVa, DsrError> {
@@ -122,6 +123,396 @@ fn operand_mentions_gpr(operand: &Operand, index: u32) -> bool {
     }
 }
 
+fn operand_mentions_gpr_outside_memory_base(operand: &Operand, index: u32) -> bool {
+    match operand {
+        Operand::MemReg(_)
+        | Operand::MemOffset { .. }
+        | Operand::MemPreIdx { .. }
+        | Operand::MemPostIdxImm { .. } => false,
+        Operand::MemPostIdxReg(regs) | Operand::MemExt { regs, .. } => {
+            register_matches_gpr(regs[1], index)
+        }
+        _ => operand_mentions_gpr(operand, index),
+    }
+}
+
+fn base_register(operands: &[Operand]) -> Option<(Reg, MemoryWriteback)> {
+    operands.iter().find_map(|operand| match operand {
+        Operand::MemReg(reg) | Operand::MemOffset { reg, .. } => {
+            Some((*reg, MemoryWriteback::None))
+        }
+        Operand::MemExt { regs, .. } => Some((regs[0], MemoryWriteback::None)),
+        Operand::MemPreIdx { reg, .. } => Some((*reg, MemoryWriteback::PreIndex)),
+        Operand::MemPostIdxImm { reg, .. } => Some((*reg, MemoryWriteback::PostIndex)),
+        Operand::MemPostIdxReg(regs) => Some((regs[0], MemoryWriteback::PostIndex)),
+        _ => None,
+    })
+}
+
+fn encoded_base_index(register: Reg) -> Option<u32> {
+    let raw = register as u32;
+    let first_x = Reg::X0 as u32;
+    let last_x = Reg::X30 as u32;
+    if (first_x..=last_x).contains(&raw) {
+        Some(raw - first_x)
+    } else if register == Reg::SP {
+        Some(31)
+    } else {
+        None
+    }
+}
+
+fn memory_base(
+    pc: GuestVa,
+    word: u32,
+    op: Op,
+    operands: &[Operand],
+) -> Result<MemoryBase, DsrError> {
+    if let Some(target) = label(operands) {
+        return Ok(MemoryBase::Literal(target));
+    }
+    let (register, _) = base_register(operands).ok_or_else(|| malformed(pc, word, op))?;
+    let encoded = (word >> 5) & 0x1f;
+    if encoded_base_index(register) != Some(encoded) {
+        return Err(malformed(pc, word, op));
+    }
+    if register_matches_gpr(register, 18) {
+        Ok(MemoryBase::VirtualX18)
+    } else if register_matches_gpr(register, 28) {
+        Ok(MemoryBase::VirtualX28)
+    } else {
+        Ok(MemoryBase::Register(register))
+    }
+}
+
+fn is_standard_simd_register(register: Reg) -> bool {
+    let raw = register as u32;
+    [
+        (Reg::V0 as u32, Reg::V31 as u32),
+        (Reg::B0 as u32, Reg::B31 as u32),
+        (Reg::H0 as u32, Reg::H31 as u32),
+        (Reg::S0 as u32, Reg::S31 as u32),
+        (Reg::D0 as u32, Reg::D31 as u32),
+        (Reg::Q0 as u32, Reg::Q31 as u32),
+    ]
+    .iter()
+    .any(|(first, last)| (*first..=*last).contains(&raw))
+}
+
+fn has_standard_simd_transfer(operands: &[Operand]) -> bool {
+    operands.iter().any(|operand| match operand {
+        Operand::Reg { reg, .. } => is_standard_simd_register(*reg),
+        Operand::MultiReg { regs, .. } => regs
+            .iter()
+            .flatten()
+            .copied()
+            .any(is_standard_simd_register),
+        _ => false,
+    })
+}
+
+fn memory_class(op: Op, operands: &[Operand]) -> Option<MemoryClass> {
+    if label(operands).is_some() {
+        return matches!(op, Op::LDR | Op::LDRSW | Op::PRFM).then_some(MemoryClass::Literal);
+    }
+    match op {
+        Op::LDP | Op::LDNP | Op::LDPSW | Op::STP | Op::STNP => Some(MemoryClass::Pair),
+        Op::LDAXP
+        | Op::LDAXR
+        | Op::LDAXRB
+        | Op::LDAXRH
+        | Op::LDXP
+        | Op::LDXR
+        | Op::LDXRB
+        | Op::LDXRH
+        | Op::STLXP
+        | Op::STLXR
+        | Op::STLXRB
+        | Op::STLXRH
+        | Op::STXP
+        | Op::STXR
+        | Op::STXRB
+        | Op::STXRH => Some(MemoryClass::Exclusive),
+        Op::CAS
+        | Op::CASA
+        | Op::CASAB
+        | Op::CASAH
+        | Op::CASAL
+        | Op::CASALB
+        | Op::CASALH
+        | Op::CASB
+        | Op::CASH
+        | Op::CASL
+        | Op::CASLB
+        | Op::CASLH
+        | Op::CASP
+        | Op::CASPA
+        | Op::CASPAL
+        | Op::CASPL
+        | Op::LDADD
+        | Op::LDADDA
+        | Op::LDADDAB
+        | Op::LDADDAH
+        | Op::LDADDAL
+        | Op::LDADDALB
+        | Op::LDADDALH
+        | Op::LDADDB
+        | Op::LDADDH
+        | Op::LDADDL
+        | Op::LDADDLB
+        | Op::LDADDLH
+        | Op::LDAR
+        | Op::LDARB
+        | Op::LDARH
+        | Op::LDAPR
+        | Op::LDAPRB
+        | Op::LDAPRH
+        | Op::LDCLR
+        | Op::LDCLRA
+        | Op::LDCLRAB
+        | Op::LDCLRAH
+        | Op::LDCLRAL
+        | Op::LDCLRALB
+        | Op::LDCLRALH
+        | Op::LDCLRB
+        | Op::LDCLRH
+        | Op::LDCLRL
+        | Op::LDCLRLB
+        | Op::LDCLRLH
+        | Op::LDEOR
+        | Op::LDEORA
+        | Op::LDEORAB
+        | Op::LDEORAH
+        | Op::LDEORAL
+        | Op::LDEORALB
+        | Op::LDEORALH
+        | Op::LDEORB
+        | Op::LDEORH
+        | Op::LDEORL
+        | Op::LDEORLB
+        | Op::LDEORLH
+        | Op::LDSET
+        | Op::LDSETA
+        | Op::LDSETAB
+        | Op::LDSETAH
+        | Op::LDSETAL
+        | Op::LDSETALB
+        | Op::LDSETALH
+        | Op::LDSETB
+        | Op::LDSETH
+        | Op::LDSETL
+        | Op::LDSETLB
+        | Op::LDSETLH
+        | Op::LDSMAX
+        | Op::LDSMAXA
+        | Op::LDSMAXAB
+        | Op::LDSMAXAH
+        | Op::LDSMAXAL
+        | Op::LDSMAXALB
+        | Op::LDSMAXALH
+        | Op::LDSMAXB
+        | Op::LDSMAXH
+        | Op::LDSMAXL
+        | Op::LDSMAXLB
+        | Op::LDSMAXLH
+        | Op::LDSMIN
+        | Op::LDSMINA
+        | Op::LDSMINAB
+        | Op::LDSMINAH
+        | Op::LDSMINAL
+        | Op::LDSMINALB
+        | Op::LDSMINALH
+        | Op::LDSMINB
+        | Op::LDSMINH
+        | Op::LDSMINL
+        | Op::LDSMINLB
+        | Op::LDSMINLH
+        | Op::LDUMAX
+        | Op::LDUMAXA
+        | Op::LDUMAXAB
+        | Op::LDUMAXAH
+        | Op::LDUMAXAL
+        | Op::LDUMAXALB
+        | Op::LDUMAXALH
+        | Op::LDUMAXB
+        | Op::LDUMAXH
+        | Op::LDUMAXL
+        | Op::LDUMAXLB
+        | Op::LDUMAXLH
+        | Op::LDUMIN
+        | Op::LDUMINA
+        | Op::LDUMINAB
+        | Op::LDUMINAH
+        | Op::LDUMINAL
+        | Op::LDUMINALB
+        | Op::LDUMINALH
+        | Op::LDUMINB
+        | Op::LDUMINH
+        | Op::LDUMINL
+        | Op::LDUMINLB
+        | Op::LDUMINLH
+        | Op::STLLR
+        | Op::STLLRB
+        | Op::STLLRH
+        | Op::STLR
+        | Op::STLRB
+        | Op::STLRH
+        | Op::STADD
+        | Op::STADDB
+        | Op::STADDH
+        | Op::STADDL
+        | Op::STADDLB
+        | Op::STADDLH
+        | Op::STCLR
+        | Op::STCLRB
+        | Op::STCLRH
+        | Op::STCLRL
+        | Op::STCLRLB
+        | Op::STCLRLH
+        | Op::STEOR
+        | Op::STEORB
+        | Op::STEORH
+        | Op::STEORL
+        | Op::STEORLB
+        | Op::STEORLH
+        | Op::STSET
+        | Op::STSETB
+        | Op::STSETH
+        | Op::STSETL
+        | Op::STSETLB
+        | Op::STSETLH
+        | Op::STSMAX
+        | Op::STSMAXB
+        | Op::STSMAXH
+        | Op::STSMAXL
+        | Op::STSMAXLB
+        | Op::STSMAXLH
+        | Op::STSMIN
+        | Op::STSMINB
+        | Op::STSMINH
+        | Op::STSMINL
+        | Op::STSMINLB
+        | Op::STSMINLH
+        | Op::STUMAX
+        | Op::STUMAXB
+        | Op::STUMAXH
+        | Op::STUMAXL
+        | Op::STUMAXLB
+        | Op::STUMAXLH
+        | Op::STUMIN
+        | Op::STUMINB
+        | Op::STUMINH
+        | Op::STUMINL
+        | Op::STUMINLB
+        | Op::STUMINLH
+        | Op::SWP
+        | Op::SWPA
+        | Op::SWPAB
+        | Op::SWPAH
+        | Op::SWPAL
+        | Op::SWPALB
+        | Op::SWPALH
+        | Op::SWPB
+        | Op::SWPH
+        | Op::SWPL
+        | Op::SWPLB
+        | Op::SWPLH => Some(MemoryClass::Atomic),
+        Op::LD1
+        | Op::LD1R
+        | Op::LD2
+        | Op::LD2R
+        | Op::LD3
+        | Op::LD3R
+        | Op::LD4
+        | Op::LD4R
+        | Op::ST1
+        | Op::ST2
+        | Op::ST3
+        | Op::ST4 => Some(MemoryClass::Simd),
+        Op::LDAPUR
+        | Op::LDAPURB
+        | Op::LDAPURH
+        | Op::LDAPURSB
+        | Op::LDAPURSH
+        | Op::LDAPURSW
+        | Op::LDR
+        | Op::LDRB
+        | Op::LDRH
+        | Op::LDRSB
+        | Op::LDRSH
+        | Op::LDRSW
+        | Op::LDTR
+        | Op::LDTRB
+        | Op::LDTRH
+        | Op::LDTRSB
+        | Op::LDTRSH
+        | Op::LDTRSW
+        | Op::LDUR
+        | Op::LDURB
+        | Op::LDURH
+        | Op::LDURSB
+        | Op::LDURSH
+        | Op::LDURSW
+        | Op::PRFM
+        | Op::PRFUM
+        | Op::STLUR
+        | Op::STLURB
+        | Op::STLURH
+        | Op::STR
+        | Op::STRB
+        | Op::STRH
+        | Op::STTR
+        | Op::STTRB
+        | Op::STTRH
+        | Op::STUR
+        | Op::STURB
+        | Op::STURH => Some(if has_standard_simd_transfer(operands) {
+            MemoryClass::Simd
+        } else {
+            MemoryClass::Scalar
+        }),
+        _ => None,
+    }
+}
+
+fn has_memory_operand(operands: &[Operand]) -> bool {
+    operands.iter().any(|operand| {
+        matches!(
+            operand,
+            Operand::MemReg(_)
+                | Operand::MemOffset { .. }
+                | Operand::MemPreIdx { .. }
+                | Operand::MemPostIdxImm { .. }
+                | Operand::MemPostIdxReg(_)
+                | Operand::MemExt { .. }
+        )
+    })
+}
+
+fn classify_memory(
+    pc: GuestVa,
+    word: u32,
+    op: Op,
+    operands: &[Operand],
+) -> Result<Option<MemoryAccess>, DsrError> {
+    let class = match memory_class(op, operands) {
+        Some(class) => class,
+        None if has_memory_operand(operands) => MemoryClass::Unsupported,
+        None => return Ok(None),
+    };
+    let base = memory_base(pc, word, op, operands)?;
+    let writeback = base_register(operands)
+        .map(|(_, writeback)| writeback)
+        .unwrap_or(MemoryWriteback::None);
+    Ok(Some(MemoryAccess {
+        word,
+        op,
+        base,
+        writeback,
+        class,
+    }))
+}
+
 pub(super) fn decoded_operands_mention_x18(word: u32, pc: GuestVa) -> bool {
     decoded_operands_mention_gpr(word, pc, 18)
 }
@@ -219,6 +610,12 @@ pub(super) fn classify(word: u32, pc: GuestVa) -> Result<InstAction, DsrError> {
     let mentions_x28 = operands
         .iter()
         .any(|operand| operand_mentions_gpr(operand, 28));
+    let mentions_x18_outside_base = operands
+        .iter()
+        .any(|operand| operand_mentions_gpr_outside_memory_base(operand, 18));
+    let mentions_x28_outside_base = operands
+        .iter()
+        .any(|operand| operand_mentions_gpr_outside_memory_base(operand, 28));
 
     let virtualized = || {
         if mentions_x18 && mentions_x28 {
@@ -281,6 +678,14 @@ pub(super) fn classify(word: u32, pc: GuestVa) -> Result<InstAction, DsrError> {
         }
     };
 
+    if let Some(memory) = classify_memory(pc, word, op, operands)? {
+        if memory.class != MemoryClass::Literal
+            && (mentions_x18_outside_base || mentions_x28_outside_base)
+        {
+            return Ok(virtualized());
+        }
+        return Ok(InstAction::Memory(memory));
+    }
     if let Some(condition) = branch_condition(op) {
         let mut action = direct(pc, word, op, DirectKind::Conditional, operands)?;
         if let InstAction::Direct(exit) = &mut action {
@@ -333,12 +738,6 @@ pub(super) fn classify(word: u32, pc: GuestVa) -> Result<InstAction, DsrError> {
         })),
         Op::ADR => pc_relative(pc, word, op, PcRelativeKind::Adr, operands),
         Op::ADRP => pc_relative(pc, word, op, PcRelativeKind::Adrp, operands),
-        Op::LDR | Op::LDRSW if label(operands).is_some() => {
-            pc_relative(pc, word, op, PcRelativeKind::LiteralLoad, operands)
-        }
-        Op::PRFM if label(operands).is_some() => {
-            pc_relative(pc, word, op, PcRelativeKind::LiteralPrefetch, operands)
-        }
         Op::MRS => match operands {
             [Operand::Reg { reg, .. }, Operand::SysReg(SysReg::TPIDR_EL0)] => {
                 sensitive(pc, SensitiveKind::ReadTpidr, Some(*reg))
@@ -387,5 +786,152 @@ pub(super) fn classify(word: u32, pc: GuestVa) -> Result<InstAction, DsrError> {
         }
         Op::DC | Op::IC | Op::HVC | Op::SMC | Op::ERET => Ok(InstAction::Unsupported { word, op }),
         _ => Ok(virtualized()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::native_darwin::dsr::types::{MemoryBase, MemoryClass, MemoryWriteback};
+
+    const PC: GuestVa = GuestVa(0x4000);
+
+    #[test]
+    fn classifies_memory_operands_for_biased_lowering() {
+        let cases = [
+            (0xf940_0020, MemoryClass::Scalar, MemoryWriteback::None),
+            (0xf81f_0ffe, MemoryClass::Scalar, MemoryWriteback::PreIndex),
+            (0xa8c1_7bfd, MemoryClass::Pair, MemoryWriteback::PostIndex),
+            (0x3dc0_0020, MemoryClass::Simd, MemoryWriteback::None),
+            (0xc85f_7c20, MemoryClass::Exclusive, MemoryWriteback::None),
+            (0xf8e1_0022, MemoryClass::Atomic, MemoryWriteback::None),
+            (0x5800_0040, MemoryClass::Literal, MemoryWriteback::None),
+            // Standard Advanced SIMD post-index register form.
+            (0x4cc2_7020, MemoryClass::Simd, MemoryWriteback::PostIndex),
+            // Standard scalar register-offset form (`MemExt` in bad64).
+            (0xf862_6820, MemoryClass::Scalar, MemoryWriteback::None),
+        ];
+        for (word, class, writeback) in cases {
+            let InstAction::Memory(memory) = classify(word, PC).expect("classify memory") else {
+                panic!("0x{word:08x} was not classified as memory");
+            };
+            assert_eq!(memory.class, class, "word=0x{word:08x}");
+            assert_eq!(memory.writeback, writeback, "word=0x{word:08x}");
+        }
+    }
+
+    #[test]
+    fn memory_base_retains_virtual_register_metadata() {
+        assert!(matches!(
+            classify(0xf940_0240, PC), // ldr x0, [x18]
+            Ok(InstAction::Memory(memory)) if memory.base == MemoryBase::VirtualX18
+        ));
+        assert!(matches!(
+            classify(0xf940_0380, PC), // ldr x0, [x28]
+            Ok(InstAction::Memory(memory)) if memory.base == MemoryBase::VirtualX28
+        ));
+    }
+
+    #[test]
+    fn audited_bad64_memory_operand_shapes_are_stable() {
+        let cases: &[(u32, fn(&Operand) -> bool)] = &[
+            // bad64 0.12 normalizes this zero-offset exclusive form to
+            // `MemOffset`, rather than `MemReg`.
+            (0xc85f_7c20, |operand| {
+                matches!(operand, Operand::MemOffset { .. })
+            }),
+            (0xf940_0020, |operand| {
+                matches!(operand, Operand::MemOffset { .. })
+            }),
+            (0xf81f_0ffe, |operand| {
+                matches!(operand, Operand::MemPreIdx { .. })
+            }),
+            (0xa8c1_7bfd, |operand| {
+                matches!(operand, Operand::MemPostIdxImm { .. })
+            }),
+            (0x4cc2_7020, |operand| {
+                matches!(operand, Operand::MemPostIdxReg(_))
+            }),
+            (0xf862_6820, |operand| {
+                matches!(operand, Operand::MemExt { .. })
+            }),
+            (0x5800_0040, |operand| matches!(operand, Operand::Label(_))),
+        ];
+        for (word, expected) in cases {
+            let instruction = bad64::decode(*word, PC.raw()).expect("decode audited memory word");
+            assert!(
+                instruction.operands().iter().any(expected),
+                "unexpected operands for 0x{word:08x}: {instruction:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_base_virtual_registers_keep_virtualization_precedence() {
+        assert!(matches!(
+            classify(0xf940_0012, PC), // ldr x18, [x0]
+            Ok(InstAction::VirtualizedX18 { .. })
+        ));
+        assert!(matches!(
+            classify(0xf940_0392, PC), // ldr x18, [x28]
+            Ok(InstAction::VirtualizedX18WriteX28Read { .. })
+        ));
+        assert!(matches!(
+            classify(0x7940_0e52, PC), // ldrh w18, [x18, #6]
+            Ok(InstAction::VirtualizedX18 { .. })
+        ));
+        assert!(matches!(
+            classify(0x5800_0052, PC), // ldr x18, 0x4008
+            Ok(InstAction::Memory(memory))
+                if memory.class == MemoryClass::Literal
+                    && memory.base == MemoryBase::Literal(GuestVa(0x4008))
+        ));
+    }
+
+    #[test]
+    fn memory_operand_base_must_match_encoded_rn() {
+        let operands = [
+            Operand::Reg {
+                reg: Reg::X0,
+                arrspec: None,
+            },
+            Operand::MemOffset {
+                reg: Reg::X2,
+                offset: Imm::Signed(0),
+                mul_vl: false,
+                arrspec: None,
+            },
+        ];
+        assert!(matches!(
+            classify_memory(PC, 0xf940_0020, Op::LDR, &operands),
+            Err(DsrError::Malformed { .. })
+        ));
+
+        let invalid_base = [
+            Operand::Reg {
+                reg: Reg::X0,
+                arrspec: None,
+            },
+            Operand::MemReg(Reg::Q1),
+        ];
+        assert!(matches!(
+            classify_memory(PC, 0xf940_0020, Op::LDR, &invalid_base),
+            Err(DsrError::Malformed { .. })
+        ));
+    }
+
+    #[test]
+    fn unaudited_memory_family_remains_typed_for_direct_passthrough() {
+        let operands = [Operand::MemOffset {
+            reg: Reg::X1,
+            offset: Imm::Signed(0),
+            mul_vl: false,
+            arrspec: None,
+        }];
+        let memory = classify_memory(PC, 0x0000_0020, Op::ADD, &operands)
+            .expect("validate synthetic memory operand")
+            .expect("retain unaudited memory family");
+        assert_eq!(memory.class, MemoryClass::Unsupported);
+        assert_eq!(memory.base, MemoryBase::Register(Reg::X1));
     }
 }
