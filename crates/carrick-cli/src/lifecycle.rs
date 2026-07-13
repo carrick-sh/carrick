@@ -1778,9 +1778,10 @@ pub(crate) fn select_tail(data: &[u8], tail: Option<usize>) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::{
-        ContainerState, ContainerStatus, RunConfig, bridge_network_attachments, parse_signal,
-        ps_row_json, rebuild_request_from_state, render_format, reset_for_relaunch,
-        resolve_stop_signal, select_tail, stop_grace_secs, validate_published_port_availability,
+        ContainerState, ContainerStatus, RunConfig, bridge_network_attachments,
+        build_created_state, parse_signal, ps_row_json, rebuild_request_from_state, render_format,
+        reset_for_relaunch, resolve_stop_signal, select_tail, stop_grace_secs,
+        validate_published_port_availability,
     };
 
     fn sample_state() -> ContainerState {
@@ -1867,6 +1868,21 @@ mod tests {
         // start/restart relaunch under the SAME launch-time syscall policy the
         // container was created with.
         assert_eq!(req.security_opts, vec!["seccomp=unconfined".to_string()]);
+    }
+
+    #[test]
+    fn create_and_relaunch_preserve_explicit_vmm_backend() {
+        let mut req = rebuild_request_from_state(&sample_state());
+        req.exec_backend = carrick_spec::ExecBackendRequest::Vmm;
+
+        let state = build_created_state(&req, "container-id", None, 17, None);
+        assert_eq!(
+            state.config.exec_backend,
+            carrick_spec::ExecBackendRequest::Vmm
+        );
+
+        let rebuilt = rebuild_request_from_state(&state);
+        assert_eq!(rebuilt.exec_backend, carrick_spec::ExecBackendRequest::Vmm);
     }
 
     #[test]
