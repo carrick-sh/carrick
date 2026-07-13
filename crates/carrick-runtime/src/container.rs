@@ -206,7 +206,7 @@ impl Default for RunConfig {
     fn default() -> Self {
         Self {
             platform: None,
-            exec_backend: carrick_spec::ExecBackendRequest::Auto,
+            exec_backend: carrick_spec::ExecBackendRequest::Native,
             native_page_profile: carrick_spec::NativePageProfileRequest::Auto,
             env: Vec::new(),
             workdir: None,

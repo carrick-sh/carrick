@@ -42,6 +42,42 @@ use clap::{Parser, Subcommand};
 
 use crate::trace_profile::TraceProfileKind;
 
+#[derive(Clone)]
+struct ExecBackendValueParser;
+
+impl clap::builder::TypedValueParser for ExecBackendValueParser {
+    type Value = ExecBackendRequest;
+
+    fn parse_ref(
+        &self,
+        cmd: &clap::Command,
+        arg: Option<&clap::Arg>,
+        value: &std::ffi::OsStr,
+    ) -> Result<Self::Value, clap::Error> {
+        let Some(input) = value.to_str() else {
+            return Err(clap::Error::raw(
+                clap::error::ErrorKind::InvalidUtf8,
+                "execution backend must be valid UTF-8",
+            )
+            .with_cmd(cmd));
+        };
+        let ignore_case = arg.map(clap::Arg::is_ignore_case_set).unwrap_or(false);
+        <ExecBackendRequest as clap::ValueEnum>::from_str(input, ignore_case).map_err(|message| {
+            clap::Error::raw(clap::error::ErrorKind::ValueValidation, message).with_cmd(cmd)
+        })
+    }
+
+    fn possible_values(
+        &self,
+    ) -> Option<Box<dyn Iterator<Item = clap::builder::PossibleValue> + '_>> {
+        Some(Box::new(
+            <ExecBackendRequest as clap::ValueEnum>::value_variants()
+                .iter()
+                .filter_map(clap::ValueEnum::to_possible_value),
+        ))
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(author, version, about)]
 pub(crate) struct Cli {
@@ -128,7 +164,7 @@ pub(crate) enum Commands {
         #[arg(long = "forward-env", value_name = "KEY=VAL")]
         forward_env: Vec<String>,
         /// Execution backend policy. `native` is experimental and trusted-code-only.
-        #[arg(long = "exec-backend", value_enum, default_value_t = ExecBackendRequest::Auto, env = "CARRICK_EXEC_BACKEND")]
+        #[arg(long = "exec-backend", value_parser = ExecBackendValueParser, default_value = "native", env = "CARRICK_EXEC_BACKEND")]
         exec_backend: ExecBackendRequest,
         /// Page profile for the native execution backend.
         #[arg(long = "native-page-profile", value_enum, default_value_t = NativePageProfileRequest::Auto, env = "CARRICK_NATIVE_PAGE_PROFILE")]
@@ -305,7 +341,7 @@ pub(crate) enum Commands {
         #[arg(long, value_enum)]
         fs: Option<FsBackendKind>,
         /// Execution backend policy. `native` is experimental and trusted-code-only.
-        #[arg(long = "exec-backend", value_enum, default_value_t = ExecBackendRequest::Auto, env = "CARRICK_EXEC_BACKEND")]
+        #[arg(long = "exec-backend", value_parser = ExecBackendValueParser, default_value = "native", env = "CARRICK_EXEC_BACKEND")]
         exec_backend: ExecBackendRequest,
         /// Page profile for the native execution backend.
         #[arg(long = "native-page-profile", value_enum, default_value_t = NativePageProfileRequest::Auto, env = "CARRICK_NATIVE_PAGE_PROFILE")]
@@ -415,7 +451,7 @@ pub(crate) enum Commands {
         #[arg(long, value_enum)]
         fs: Option<FsBackendKind>,
         /// Execution backend policy. `native` is experimental and trusted-code-only.
-        #[arg(long = "exec-backend", value_enum, default_value_t = ExecBackendRequest::Auto, env = "CARRICK_EXEC_BACKEND")]
+        #[arg(long = "exec-backend", value_parser = ExecBackendValueParser, default_value = "native", env = "CARRICK_EXEC_BACKEND")]
         exec_backend: ExecBackendRequest,
         /// Page profile for the native execution backend.
         #[arg(long = "native-page-profile", value_enum, default_value_t = NativePageProfileRequest::Auto, env = "CARRICK_NATIVE_PAGE_PROFILE")]

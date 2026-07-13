@@ -14,6 +14,36 @@ fn command() -> Command {
 }
 
 #[test]
+fn exec_backend_help_lists_only_portable_values() {
+    command()
+        .env_remove("CARRICK_EXEC_BACKEND")
+        .args(["run-elf", "--help"])
+        .assert()
+        .success()
+        .stdout(contains("possible values: native, vmm"));
+}
+
+#[test]
+fn removed_auto_exec_backend_has_migration_guidance() {
+    command()
+        .env_remove("CARRICK_EXEC_BACKEND")
+        .args(["run-elf", "--exec-backend", "auto", "/does/not/matter"])
+        .assert()
+        .code(2)
+        .stderr(contains("omit --exec-backend"));
+}
+
+#[test]
+fn exec_backend_hvf_environment_value_has_migration_guidance() {
+    command()
+        .env("CARRICK_EXEC_BACKEND", "hvf")
+        .args(["run-elf", "/does/not/matter"])
+        .assert()
+        .code(2)
+        .stderr(contains("--exec-backend vmm"));
+}
+
+#[test]
 fn native_code_mode_flag_is_not_public_policy() {
     let output = command()
         .args([
