@@ -62,13 +62,13 @@ and the native arm64 Docker oracle.
 - Reads: `CARRICK_NATIVE_UNSAFE_POSTFORK_THREADS` only in
   `native_clone_thread_rejection`.
 
-- [ ] **Step 1: Add parser tests before implementation.**
+- [x] **Step 1: Add parser tests before implementation.**
 
   Add a pure unit test that requires `None`, the empty string, `0`, `true`, and
   `01` to be false, and only `Some(OsStr::new("1"))` to be true. Do not mutate
   the process environment in a parallel Rust test.
 
-- [ ] **Step 2: Run the focused test and observe RED.**
+- [x] **Step 2: Run the focused test and observe RED.**
 
   ```bash
   cargo test -p carrick-runtime native_unsafe_postfork_threads_requires_exact_one --lib -- --nocapture
@@ -76,7 +76,7 @@ and the native arm64 Docker oracle.
 
   Expected RED: the parser does not exist.
 
-- [ ] **Step 3: Implement the pure parser and guarded bypass.**
+- [x] **Step 3: Implement the pure parser and guarded bypass.**
 
   In `native_clone_thread_rejection`, preserve the existing fork-child reason
   unless the parser accepts
@@ -84,7 +84,7 @@ and the native arm64 Docker oracle.
   The switch bypasses only the fork-child rejection; it must not bypass
   `native16k_clone_thread_rejection` or any W+X lifecycle check.
 
-- [ ] **Step 4: Verify the focused unit and targeted lint.**
+- [x] **Step 4: Verify the focused unit and targeted lint.**
 
   ```bash
   cargo test -p carrick-runtime native_unsafe_postfork_threads_requires_exact_one --lib -- --nocapture
@@ -108,7 +108,7 @@ and the native arm64 Docker oracle.
 - Stage 2 calls `pthread_create`, waits for the worker to publish one atomic
   value, joins it, and reports deterministic booleans and any returned errno.
 
-- [ ] **Step 1: Add the line-exact probe.**
+- [x] **Step 1: Add the line-exact probe.**
 
   The child must use only async-signal-safe operations between `fork` and
   `execve`. Stage 2 runs after image replacement and prints:
@@ -125,14 +125,14 @@ and the native arm64 Docker oracle.
   Keep the parent wait bounded by the harness rather than adding probe-local
   alarm state.
 
-- [ ] **Step 2: Add the native signed test.**
+- [x] **Step 2: Add the native signed test.**
 
   Add `native_conformance_dsr_fork_exec_can_create_thread` beside the existing
   `execfromthread` and `vforkexecthread` tests. Build through
   `ensure_native_static_pie_probe("forkexecpthread")` and run through
   `run_native_run_elf_with_args` on `native16k`.
 
-- [ ] **Step 3: Run current production behavior and observe RED.**
+- [x] **Step 3: Run current production behavior and observe RED.**
 
   ```bash
   just build
@@ -144,7 +144,7 @@ and the native arm64 Docker oracle.
   Expected RED: stage 2 is reached, `pthread_create` returns the typed
   `EOPNOTSUPP` path, and no host trap is exposed.
 
-- [ ] **Step 4: Prove the Linux oracle.**
+- [x] **Step 4: Prove the Linux oracle.**
 
   Run the probe in a Docker-only phase through the normal probe gate or
   `scripts/probe-docker.sh forkexecpthread`. Preserve the output showing all
@@ -158,7 +158,7 @@ and the native arm64 Docker oracle.
 - Evidence: `target/conformance/native-postfork-*.jsonl`
 - Modify: `docs/native-default-conformance-campaign.md`
 
-- [ ] **Step 1: Rebuild, sign, and run the reducer with the unsafe opt-in.**
+- [x] **Step 1: Rebuild, sign, and run the reducer with the unsafe opt-in.**
 
   ```bash
   just build
@@ -173,7 +173,7 @@ and the native arm64 Docker oracle.
   Record whether the thread succeeds, Carrick returns a typed error, the host
   aborts, or the process times out. Reap the scoped run immediately.
 
-- [ ] **Step 2: Capture LLDB evidence for any abnormal result.**
+- [x] **Step 2: Capture LLDB evidence for any abnormal result.**
 
   ```bash
   CARRICK_NATIVE_UNSAFE_POSTFORK_THREADS=1 \
@@ -188,14 +188,21 @@ and the native arm64 Docker oracle.
   retain the equivalent exact invocation in the ledger. For SIGABRT, preserve
   the raw LLDB backtrace because the native fatal record does not cover it.
 
-- [ ] **Step 3: Sample the originating ecosystems under the same opt-in.**
+  **Measured correction:** the subprocess exits before the LLDB runner's 200 ms
+  stop poll can attach. The async-safe native fatal record is stable across
+  Node, Go, and CPython; `atos` against the live shared-cache load address maps
+  its PC to libdispatch's deduplicated client trap and LR to
+  `_dispatch_sema4_wait+56`. These two Apple frames are the classification
+  evidence; no speculative Carrick reset follows from them.
+
+- [x] **Step 3: Sample the originating ecosystems under the same opt-in.**
 
   Run serial native DSR suites for `node-app-smoke`, `node-v8-smoke`,
   `go-build`, `go-runtime`, `go-sync`, and `cpython-threading`, with distinct
   JSONL files. Use the conformance runner's environment forwarding if it
   scrubs host variables; confirm the guest-facing variables are unchanged.
 
-- [ ] **Step 4: Classify ownership from captured frames and state.**
+- [x] **Step 4: Classify ownership from captured frames and state.**
 
   Select exactly one branch:
 
@@ -210,6 +217,11 @@ and the native arm64 Docker oracle.
   - **Reducer defect:** real Linux fails identically, or the probe violates the
     post-fork async-signal-safe boundary. Fix the probe, re-prove Linux, and
     repeat Task 3 before selecting either repair.
+
+  **Selected branch:** Apple host-runtime state. A single reducer pthread can
+  run, but real subprocesses consistently execute libdispatch's client trap
+  from `_dispatch_sema4_wait` after the multithreaded parent fork. Continue to
+  Task 5; Task 4 is not applicable.
 
   Record the exact top frames, process/thread count, exit status, and selected
   branch in the campaign ledger. A stack label alone is insufficient; verify
@@ -269,7 +281,7 @@ and the native arm64 Docker oracle.
 - Add: `docs/superpowers/plans/2026-07-13-native-pid-preserving-self-reexec.md`
 - Modify: `docs/native-default-conformance-campaign.md`
 
-- [ ] **Step 1: Stop the unsafe experiment.**
+- [x] **Step 1: Stop the unsafe experiment.**
 
   Keep the production guard fail-closed. Do not add another reset, call an
   undocumented Apple reinitializer, or bless the failure.
