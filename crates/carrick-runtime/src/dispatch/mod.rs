@@ -2278,6 +2278,15 @@ impl SyscallDispatcher {
         self.fs.rootfs_vfs.overlay.name()
     }
 
+    /// Snapshot the exact durable filesystem root used by a native host
+    /// self-reexec. Memory-backed overlays reject this before guest image
+    /// retirement through the backend's typed `Unsupported` result.
+    pub fn native_fs_reexec_authority(
+        &self,
+    ) -> Result<crate::fs_backend::HostFsReexecAuthority, crate::fs_backend::BackendError> {
+        self.fs.rootfs_vfs.overlay.native_reexec_authority()
+    }
+
     /// Borrow the dispatcher's rootfs. Used by the runtime when the
     /// dispatcher returns `DispatchOutcome::Execve` and the new image
     /// has to be loaded from the same image layers.
