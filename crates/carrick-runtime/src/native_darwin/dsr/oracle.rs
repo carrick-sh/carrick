@@ -1,4 +1,4 @@
-use carrick_guest_mem::GuestVa;
+use carrick_guest_mem::{GuestVa, HostVa};
 
 use super::super::NativeUcontextSnapshot;
 use super::block::{BlockPlan, PlannedExit, PlannedInst};
@@ -1398,7 +1398,7 @@ fn dsr_signal_fault_reconstructs_copied_instruction_pc() {
         guest_pc: GuestVa(0),
         signal: 0,
         code: 0,
-        address: GuestVa(0),
+        address: HostVa(0),
         rewrite_scratch: 0,
         rewrite_context_scratch: 0,
         generation_pstate_scratch: 0,
@@ -1418,7 +1418,7 @@ fn dsr_signal_fault_reconstructs_copied_instruction_pc() {
         panic!("expected fault exit, got {exit:?}");
     };
     assert!(signal == libc::SIGSEGV || signal == libc::SIGBUS);
-    assert_eq!(address, GuestVa(1));
+    assert_eq!(address, HostVa(1));
     assert_ne!(snapshot.esr, 0, "fault ESR must survive DSR signal exit");
     let offset = u32::try_from(guest_pc.raw() - emitted.entry().host().raw() as u64)
         .expect("fault cache offset");
@@ -1464,7 +1464,7 @@ fn dsr_signal_fault_recovers_context_when_physical_x28_is_zero() {
         guest_pc: GuestVa(0),
         signal: 0,
         code: 0,
-        address: GuestVa(0),
+        address: HostVa(0),
         rewrite_scratch: 0,
         rewrite_context_scratch: 0,
         generation_pstate_scratch: 0,
@@ -1482,7 +1482,7 @@ fn dsr_signal_fault_recovers_context_when_physical_x28_is_zero() {
             exit,
             NativeDsrExit::Fault {
                 signal: libc::SIGSEGV,
-                address: GuestVa(136),
+                address: HostVa(136),
                 ..
             }
         ),
@@ -1930,7 +1930,7 @@ fn dsr_signal_fault_recovers_scratch_in_expanded_x18_load() {
         guest_pc: GuestVa(0),
         signal: 0,
         code: 0,
-        address: GuestVa(0),
+        address: HostVa(0),
         rewrite_scratch: 0,
         rewrite_context_scratch: 0,
         generation_pstate_scratch: 0,
@@ -2018,7 +2018,7 @@ fn dsr_signal_fault_preserves_destination_in_expanded_literal_load() {
         guest_pc: GuestVa(0),
         signal: 0,
         code: 0,
-        address: GuestVa(0),
+        address: HostVa(0),
         rewrite_scratch: 0,
         rewrite_context_scratch: 0,
         generation_pstate_scratch: 0,
