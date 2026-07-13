@@ -5920,7 +5920,7 @@ impl NativeMappedMemory {
                 crate::host_proc::DirectVmReservationOutcome::Reserved(reservation) => {
                     direct_target_reservations.push(reservation);
                 }
-                crate::host_proc::DirectVmReservationOutcome::DelegatedDyldSharedPmapEmpty => {}
+                crate::host_proc::DirectVmReservationOutcome::DelegatedDyldPmapEmpty => {}
             }
         }
         Ok(PreparedNativeExecMapping {

@@ -2135,20 +2135,18 @@ mod tests {
 
     #[test]
     fn copy_subset_rejects_virtualized_register_operands() {
-        for word in [0xd280_0032] {
-            assert!(super::decode::decoded_operands_mention_x18(word, PC));
-            assert!(matches!(
-                classify(word, PC),
-                Ok(InstAction::VirtualizedX18 { word: observed, .. }) if observed == word
-            ));
-        }
-        for word in [0xd280_003c] {
-            assert!(super::decode::decoded_operands_mention_x28(word, PC));
-            assert!(matches!(
-                classify(word, PC),
-                Ok(InstAction::VirtualizedX28 { word: observed, .. }) if observed == word
-            ));
-        }
+        let word = 0xd280_0032;
+        assert!(super::decode::decoded_operands_mention_x18(word, PC));
+        assert!(matches!(
+            classify(word, PC),
+            Ok(InstAction::VirtualizedX18 { word: observed, .. }) if observed == word
+        ));
+        let word = 0xd280_003c;
+        assert!(super::decode::decoded_operands_mention_x28(word, PC));
+        assert!(matches!(
+            classify(word, PC),
+            Ok(InstAction::VirtualizedX28 { word: observed, .. }) if observed == word
+        ));
         assert!(matches!(
             classify(0xf940_0240, PC),
             Ok(InstAction::Memory(memory)) if memory.base == MemoryBase::VirtualX18

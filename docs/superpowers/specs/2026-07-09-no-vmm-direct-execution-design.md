@@ -234,16 +234,32 @@ make a later low fixed mapping available. For PIE outputs, current `ld64` also
 ignores `-image_base`, so linker placement cannot move Carrick itself out of the
 way while retaining a valid arm64 process image.
 
-The direct backend must therefore distinguish two independent compatibility
-dimensions:
+The native backend must therefore distinguish two address modes:
 
-- PIE/`ET_DYN` Linux images may be loaded with a bias above `0x1_0000_0000` and
-  execute directly;
+- PIE/`ET_DYN` Linux images whose layouts are available use direct mode, where
+  host and guest addresses are identical;
 - fixed Linux `ET_EXEC` images with a required segment below 4 GiB cannot be
-  directly mapped and must fail with a typed diagnostic;
-- supporting those low fixed images requires address translation or code
-  rewriting. Changing the native page profile does not solve that address-space
-  collision.
+  directly mapped and use biased DSR, where the complete image has one
+  collision-selected high host bias;
+- an image that cannot fit in either mode fails with a typed diagnostic.
+
+Changing the native page profile does not solve the address-space collision.
+DSR solves it without rebasing the Linux architecture: PC, SP, LR, branch
+targets, register-held pointers, fault addresses, signal-frame pointers, auxv,
+`/proc` mappings, and diagnostics remain in guest coordinates. Only
+instruction fetches and host memory accesses add the bias. The audited biased
+lowerings cover scalar, pair, SIMD, atomic, exclusive, and literal memory
+families; every unsupported or ambiguous memory form fails closed through a
+typed error. Direct mode retains its byte-identical memory-emission fast path.
+
+Measured closeout (2026-07-13): the signed native16k binary runs the low static
+`devnullseek` `ET_EXEC` fixture to exit zero with both expected markers. A
+signed static fork witness proves a parent function PC and static pointer below
+4 GiB, identical child guest values, retained static data, and a zero child
+exit. These are correctness results only. The isolated `altstacktid` workload
+still times out, and the earlier 331/378 comparison campaign crossed a
+post-fork lifecycle defect, so neither is valid performance authority and no
+projected probe count is recorded here.
 
 References:
 

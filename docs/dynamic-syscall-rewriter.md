@@ -1355,7 +1355,33 @@ static/dynamic PIE, V8, JIT generation/concurrent publication, fork, vfork, and
 exec proofs pass. Final broad, indirect, and fork profiles complete naturally
 with zero drops or incomplete pairs. The remaining measured task is broader
 translated-execution/native-return attribution; translation itself is about
-5.6% of untraced V8 wall and emission about 4%. Fixed-address Linux ET_EXEC
-below 4 GiB remains incompatible with Darwin's `__PAGEZERO`, while static PIE
-is supported and proven. Full provenance and architectural caveats are in
+5.6% of untraced V8 wall and emission about 4%. Full provenance and
+architectural caveats are in
 `docs/perf-results/native-dsr-profile-driven-final.jsonl`.
+
+Biased `ET_EXEC` closeout (2026-07-13): a live arm64 loader experiment measured
+4 GiB as XNU's minimum `__PAGEZERO`, so a Linux image with required mappings
+below that boundary cannot use identity-mapped DSR. Native16k now has two typed
+address modes. `Direct` keeps the existing zero-bias path, including
+byte-identical emission for audited direct memory blocks. `Biased` places the
+complete guest mapping at a collision-selected high host bias and adds that
+bias only for instruction fetches and host memory accesses.
+
+Both modes keep the architectural contract in guest coordinates: PC, SP, LR,
+branch targets, register-held pointers, reported fault addresses, signal-frame
+pointers, auxv and initial-stack pointers, `/proc` mappings, and diagnostics.
+Biased lowering is audited for scalar, pair, SIMD, atomic, exclusive, and
+literal memory families. An unsupported or ambiguous memory form fails with a
+typed diagnostic instead of executing an untranslated low address.
+
+The current signed binary executes the low-address static `devnullseek`
+`ET_EXEC` fixture with both expected markers and exit status zero. A separate
+static fork witness also exits zero and proves that the parent function PC and
+static pointer are below 4 GiB, while the child observes the same guest values
+and retained static data. The direct full-block byte oracle remains green.
+These are correctness results, not projected probe counts.
+
+Performance authority remains deliberately separate. The isolated
+`altstacktid` workload times out, and the earlier 331/378 campaign crossed the
+post-fork lifecycle defect; neither result is valid native16k/HVF performance
+authority. No full backend campaign was published from this closeout.

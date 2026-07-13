@@ -569,7 +569,7 @@ mod tests {
         assert!(NativeHostBias::new(0, 0x4000).is_err());
         assert!(NativeHostBias::new(0x20_0000_0001, 0x4000).is_err());
         let mode = NativeAddressMode::Biased {
-            host_bias: NativeHostBias::new(u64::MAX & !0x3fff, 0x4000).unwrap(),
+            host_bias: NativeHostBias::new(!0x3fff_u64, 0x4000).unwrap(),
         };
         assert!(mode.to_host(GuestVa(0x4000)).is_err());
     }
@@ -591,7 +591,7 @@ mod tests {
         );
 
         let near_end = NativeAddressMode::Biased {
-            host_bias: NativeHostBias::new(u64::MAX & !0x3fff, 0x4000).unwrap(),
+            host_bias: NativeHostBias::new(!0x3fff_u64, 0x4000).unwrap(),
         };
         assert!(near_end.to_host_range(GuestVa(0)..GuestVa(0x4000)).is_err());
     }
