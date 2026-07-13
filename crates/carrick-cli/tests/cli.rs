@@ -13,6 +13,53 @@ fn command() -> Command {
     Command::cargo_bin("carrick").expect("carrick test binary")
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn native_self_reexec_transport_preserves_pid() {
+    let output = command()
+        .arg("__native-exec-pid-probe")
+        .output()
+        .expect("run native self-reexec PID probe");
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 PID probe output");
+    let before = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("native_self_reexec_pid_before="))
+        .expect("before PID line");
+    let after = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("native_self_reexec_pid_after="))
+        .expect("after PID line");
+    assert_eq!(before, after);
+    assert!(stdout.contains("native_self_reexec_pid_preserved=true\n"));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn native_self_reexec_private_commands_are_hidden_and_fail_closed() {
+    command()
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(contains("__native-exec-resume").not())
+        .stdout(contains("__native-exec-pid-probe").not());
+    command()
+        .args([
+            "__native-exec-resume",
+            "--capsule-fd",
+            "0",
+            "--nonce",
+            "00000000000000000000000000000000",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("not a regular file"));
+}
+
 #[test]
 fn exec_backend_help_lists_only_portable_values() {
     command()
