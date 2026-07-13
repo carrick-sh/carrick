@@ -63,6 +63,18 @@ pub enum BackendError {
     Unsupported,
 }
 
+/// Durable authority needed to reopen the exact host-filesystem overlay after
+/// a PID-preserving host exec. The path locates the already-populated scratch;
+/// device/inode identity prevents a substituted path from granting a different
+/// filesystem root.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HostFsReexecAuthority {
+    pub root_path: Vec<u8>,
+    pub device: u64,
+    pub inode: u64,
+    pub cleanup_on_drop: bool,
+}
+
 /// Real on-disk stat values for a path, read straight from the backing
 /// filesystem. Carries the bits a synthesized [`RootFsMetadata`] can't
 /// represent faithfully: the true file *type* (so a symlink reports as
@@ -112,6 +124,12 @@ pub struct SharedFileEntry {
 /// aware (see module docs); the dispatcher does its own overlay-first
 /// merging with the read-only rootfs underneath.
 pub trait FsBackend: Send + Sync {
+    /// Snapshot the durable root authority needed by native host self-reexec.
+    /// Memory and synthetic backends reject this boundary explicitly.
+    fn native_reexec_authority(&self) -> Result<HostFsReexecAuthority, BackendError> {
+        Err(BackendError::Unsupported)
+    }
+
     /// Look up `path`. Returns `Some(OverlayEntry::Deleted)` for a
     /// tombstoned path, `Some(File)` / `Some(Dir)` for entries the
     /// backend owns, and `None` when the backend has nothing to say
@@ -1276,6 +1294,10 @@ pub struct HostFsBackend {
     /// caller already owns the lifetime (e.g. tests with a custom
     /// `tempfile::TempDir`).
     _scratch: Option<tempfile::TempDir>,
+    /// Cleanup ownership adopted after a native host self-reexec. A TempDir
+    /// cannot be reconstructed from a path, so the resumed owner removes this
+    /// exact verified scratch explicitly on final process exit.
+    _attached_cleanup_path: Option<PathBuf>,
     /// Per-run advisory flock so a startup sweeper can `rm -rf`
     /// orphaned scratch directories left behind by crashed runs.
     /// Held for the lifetime of the backend.
@@ -1407,6 +1429,39 @@ fn host_root_prefix(dir: &cap_std::fs::Dir) -> Option<String> {
     }
 }
 
+/// Byte-preserving F_GETPATH of a cap-std root for native reexec authority.
+#[cfg(target_os = "macos")]
+fn host_root_path(dir: &cap_std::fs::Dir) -> Option<PathBuf> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStringExt;
+
+    let mut buf = [0_u8; libc::PATH_MAX as usize];
+    let rc = unsafe {
+        libc::fcntl(
+            dir.as_raw_fd(),
+            libc::F_GETPATH,
+            buf.as_mut_ptr() as *mut libc::c_char,
+        )
+    };
+    if rc < 0 {
+        return None;
+    }
+    let end = buf.iter().position(|byte| *byte == 0).unwrap_or(buf.len());
+    Some(PathBuf::from(std::ffi::OsString::from_vec(
+        buf[..end].to_vec(),
+    )))
+}
+
+#[cfg(target_os = "macos")]
+fn host_dir_identity(fd: i32) -> std::io::Result<(u64, u64)> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let stat = unsafe { stat.assume_init() };
+    Ok((stat.st_dev as u64, stat.st_ino))
+}
+
 /// `true` iff the open fd's real host path (`F_GETPATH`) lives at or under
 /// `root_prefix` — the sandbox-containment check for the fast paths. An
 /// intermediate (or followed-leaf) symlink the kernel resolved out of the root
@@ -1493,6 +1548,10 @@ impl Drop for HostFsBackend {
                     }
                 }
             }
+
+            if let Some(path) = self._attached_cleanup_path.take() {
+                let _ = std::fs::remove_dir_all(path);
+            }
         }
     }
 }
@@ -1535,6 +1594,7 @@ impl HostFsBackend {
         Ok(Self {
             dir,
             _scratch: Some(scratch),
+            _attached_cleanup_path: None,
             _lock: Some(lock),
             owner_pid: unsafe { libc::getpid() as u32 },
             root_prefix,
@@ -1576,6 +1636,7 @@ impl HostFsBackend {
         Self {
             dir,
             _scratch: None,
+            _attached_cleanup_path: None,
             _lock: None,
             owner_pid: unsafe { libc::getpid() as u32 },
             root_prefix,
@@ -1606,6 +1667,61 @@ impl HostFsBackend {
     pub fn attach_or_create(path: &Path) -> std::io::Result<Self> {
         std::fs::create_dir_all(path)?;
         Self::attach(path)
+    }
+
+    /// Snapshot the current contained root for native host self-reexec.
+    #[cfg(target_os = "macos")]
+    pub fn native_reexec_authority(&self) -> std::io::Result<HostFsReexecAuthority> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::ffi::OsStrExt;
+
+        let root_path = host_root_path(&self.dir)
+            .ok_or_else(|| std::io::Error::other("F_GETPATH failed for host filesystem root"))?;
+        let (device, inode) = host_dir_identity(self.dir.as_raw_fd())?;
+        Ok(HostFsReexecAuthority {
+            root_path: root_path.as_os_str().as_bytes().to_vec(),
+            device,
+            inode,
+            cleanup_on_drop: self._scratch.is_some() || self._attached_cleanup_path.is_some(),
+        })
+    }
+
+    /// Reopen the exact overlay described by a validated reexec authority.
+    #[cfg(target_os = "macos")]
+    pub fn attach_for_reexec(authority: &HostFsReexecAuthority) -> std::io::Result<Self> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::ffi::OsStringExt;
+
+        let path = PathBuf::from(std::ffi::OsString::from_vec(authority.root_path.clone()));
+        let dir = cap_std::fs::Dir::open_ambient_dir(&path, cap_std::ambient_authority())?;
+        let identity = host_dir_identity(dir.as_raw_fd())?;
+        if identity != (authority.device, authority.inode) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "native reexec host filesystem root identity changed",
+            ));
+        }
+        let root_prefix = host_root_prefix(&dir);
+        let lock = if authority.cleanup_on_drop {
+            Some(acquire_lockfile(&path)?)
+        } else {
+            None
+        };
+        Ok(Self {
+            dir,
+            _scratch: None,
+            _attached_cleanup_path: authority.cleanup_on_drop.then_some(path),
+            _lock: lock,
+            owner_pid: unsafe { libc::getpid() as u32 },
+            root_prefix,
+            fast_fs: fast_fs_enabled(),
+            stat_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            cache_pid: std::sync::atomic::AtomicU32::new(0),
+            use_stat_cache: stat_cache_enabled(),
+            overlay_mount: None,
+            watch_res_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            watch_cache_pid: std::sync::atomic::AtomicU32::new(0),
+        })
     }
 
     /// Fast `real_stat` for the common regular-file / directory case on
@@ -2847,6 +2963,17 @@ impl std::ops::Deref for DirAt<'_> {
 }
 
 impl FsBackend for HostFsBackend {
+    fn native_reexec_authority(&self) -> Result<HostFsReexecAuthority, BackendError> {
+        #[cfg(target_os = "macos")]
+        {
+            HostFsBackend::native_reexec_authority(self).map_err(|_| BackendError::Io)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Err(BackendError::Unsupported)
+        }
+    }
+
     fn lookup(&self, path: &str) -> Option<OverlayEntry> {
         let normalized = normalize(path)?;
         if normalized.as_os_str().is_empty() {
@@ -4946,6 +5073,58 @@ mod tests {
         let dir = cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority())
             .unwrap();
         (HostFsBackend::from_existing_dir(dir), scratch)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn host_backend_reexec_authority_reattaches_exact_root() {
+        let scratch = tempfile::tempdir().unwrap();
+        let backend = HostFsBackend::attach(scratch.path()).unwrap();
+        backend
+            .set_file_contents("/handoff", b"same-root".to_vec())
+            .unwrap();
+        let authority = backend.native_reexec_authority().unwrap();
+        let resumed = HostFsBackend::attach_for_reexec(&authority).unwrap();
+
+        assert_eq!(
+            resumed.file_contents("/handoff"),
+            Some(b"same-root".to_vec())
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn host_backend_reexec_authority_rejects_substituted_root() {
+        let scratch = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let backend = HostFsBackend::attach(scratch.path()).unwrap();
+        let mut authority = backend.native_reexec_authority().unwrap();
+        authority.root_path = other.path().as_os_str().as_encoded_bytes().to_vec();
+
+        assert!(HostFsBackend::attach_for_reexec(&authority).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn host_backend_reexec_authority_transfers_ephemeral_cleanup() {
+        let path = tempfile::tempdir().unwrap().keep();
+        let backend = HostFsBackend::attach(&path).unwrap();
+        let mut authority = backend.native_reexec_authority().unwrap();
+        authority.cleanup_on_drop = true;
+        drop(backend);
+
+        let resumed = HostFsBackend::attach_for_reexec(&authority).unwrap();
+        assert!(path.exists());
+        drop(resumed);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn memory_backend_rejects_native_reexec_authority() {
+        assert_eq!(
+            MemoryBackend::new().native_reexec_authority(),
+            Err(BackendError::Unsupported)
+        );
     }
 
     #[cfg(target_os = "macos")]
