@@ -1581,6 +1581,19 @@ mod tests {
 
     const PC: GuestVa = GuestVa(0x1000);
 
+    fn fork_test(test: impl FnOnce() + std::panic::UnwindSafe) {
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            let passed = std::panic::catch_unwind(test).is_ok();
+            unsafe { libc::_exit(i32::from(!passed)) };
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFEXITED(status), "child status was 0x{status:x}");
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+    }
+
     fn biased_recovery_fixture(
         base: super::emit::BiasedBase,
         coordinate: super::emit::BiasedBaseCoordinate,
@@ -1751,48 +1764,54 @@ mod tests {
 
     #[test]
     fn repeated_prepare_keeps_valid_last_entry_hot() {
-        let (memory, guest) = mapped_dsr_test_memory(&[0xd400_0001]).expect("map test memory");
-        let snapshot = super::super::NativeUcontextSnapshot {
-            pc: guest.raw(),
-            ..Default::default()
-        };
-        let mut translator = super::ThreadTranslator::new(16 * 1024).expect("create translator");
-        let first = translator
-            .prepare_entry::<false>(&memory, &snapshot)
-            .expect("prepare first entry");
-        let before = translator.profile_snapshot();
-        let second = translator
-            .prepare_entry::<false>(&memory, &snapshot)
-            .expect("prepare repeated entry");
-        let after = translator.profile_snapshot();
-        assert_eq!(first.entry, second.entry);
-        assert_eq!(after.one_entry_hits - before.one_entry_hits, 1);
+        fork_test(|| {
+            let (memory, guest) = mapped_dsr_test_memory(&[0xd400_0001]).expect("map test memory");
+            let snapshot = super::super::NativeUcontextSnapshot {
+                pc: guest.raw(),
+                ..Default::default()
+            };
+            let mut translator =
+                super::ThreadTranslator::new(16 * 1024).expect("create translator");
+            let first = translator
+                .prepare_entry::<false>(&memory, &snapshot)
+                .expect("prepare first entry");
+            let before = translator.profile_snapshot();
+            let second = translator
+                .prepare_entry::<false>(&memory, &snapshot)
+                .expect("prepare repeated entry");
+            let after = translator.profile_snapshot();
+            assert_eq!(first.entry, second.entry);
+            assert_eq!(after.one_entry_hits - before.one_entry_hits, 1);
+        });
     }
 
     #[test]
     fn generation_change_discards_last_prepared_entry() {
-        let (memory, guest) = mapped_dsr_test_memory(&[0xd400_0001]).expect("map test memory");
-        let snapshot = super::super::NativeUcontextSnapshot {
-            pc: guest.raw(),
-            ..Default::default()
-        };
-        let mut translator = super::ThreadTranslator::new(16 * 1024).expect("create translator");
-        let first = translator
-            .prepare_entry::<false>(&memory, &snapshot)
-            .expect("prepare first entry");
-        let changed = memory
-            .note_dsr_code_mutation(guest.raw(), 4)
-            .expect("record code mutation")
-            .expect("DSR generation");
-        let before = translator.profile_snapshot();
-        let second = translator
-            .prepare_entry::<false>(&memory, &snapshot)
-            .expect("prepare after mutation");
-        let after = translator.profile_snapshot();
-        assert_eq!(second.generation, changed);
-        assert_ne!(first.generation, second.generation);
-        assert_eq!(after.one_entry_hits, before.one_entry_hits);
-        assert_ne!(first.entry, second.entry);
+        fork_test(|| {
+            let (memory, guest) = mapped_dsr_test_memory(&[0xd400_0001]).expect("map test memory");
+            let snapshot = super::super::NativeUcontextSnapshot {
+                pc: guest.raw(),
+                ..Default::default()
+            };
+            let mut translator =
+                super::ThreadTranslator::new(16 * 1024).expect("create translator");
+            let first = translator
+                .prepare_entry::<false>(&memory, &snapshot)
+                .expect("prepare first entry");
+            let changed = memory
+                .note_dsr_code_mutation(guest.raw(), 4)
+                .expect("record code mutation")
+                .expect("DSR generation");
+            let before = translator.profile_snapshot();
+            let second = translator
+                .prepare_entry::<false>(&memory, &snapshot)
+                .expect("prepare after mutation");
+            let after = translator.profile_snapshot();
+            assert_eq!(second.generation, changed);
+            assert_ne!(first.generation, second.generation);
+            assert_eq!(after.one_entry_hits, before.one_entry_hits);
+            assert_ne!(first.entry, second.entry);
+        });
     }
 
     #[test]
