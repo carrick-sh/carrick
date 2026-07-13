@@ -5573,7 +5573,6 @@ impl HvfInner {
             crate::probes::hvf_syscall_transport(
                 mailbox.transport().raw(),
                 0,
-                mailbox.sequence(),
                 register_reads,
                 sysreg_reads,
                 0,

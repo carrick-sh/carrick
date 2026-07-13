@@ -260,7 +260,6 @@ impl Aarch64Vcpu for HvfAarch64Vcpu {
             crate::probes::hvf_syscall_transport(
                 transport.raw(),
                 1,
-                self.mailbox.sequence(),
                 0,
                 0,
                 u32::from(transport == HvfSyscallTransport::Legacy),

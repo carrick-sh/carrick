@@ -43,8 +43,8 @@ impl HvfSyscallTransport {
 
     pub fn parse(value: Option<&str>) -> Result<Self, HvfSyscallTransportError> {
         match value {
-            None | Some("mailbox") => Ok(Self::Mailbox),
-            Some("legacy") => Ok(Self::Legacy),
+            None | Some("legacy") => Ok(Self::Legacy),
+            Some("mailbox") => Ok(Self::Mailbox),
             Some(value) => Err(HvfSyscallTransportError {
                 value: value.to_owned(),
             }),
@@ -729,10 +729,10 @@ mod tests {
     }
 
     #[test]
-    fn transport_parser_is_explicit_and_defaults_to_mailbox() {
+    fn transport_parser_is_explicit_and_defaults_to_legacy() {
         assert_eq!(
             HvfSyscallTransport::parse(None).expect("default"),
-            HvfSyscallTransport::Mailbox
+            HvfSyscallTransport::Legacy
         );
         assert_eq!(
             HvfSyscallTransport::parse(Some("mailbox")).expect("mailbox"),

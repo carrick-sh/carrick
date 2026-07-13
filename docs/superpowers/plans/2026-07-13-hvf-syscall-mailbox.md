@@ -30,7 +30,7 @@ ABBA sampling and seeded bootstrap statistics.
   keep their existing transport.
 - No Linux kernel or other GPL implementation source.
 - No live native/VMM migration and no automatic fallback.
-- Production default after implementation is mailbox. The internal diagnostic
+- Production candidate during implementation is mailbox. The internal diagnostic
   environment `CARRICK_HVF_SYSCALL_TRANSPORT=legacy|mailbox` is validated before
   first guest entry and is never CLI or persisted container policy.
 - Boundary promotion requires mailbox/legacy p50 at most `0.90` and seeded 95%
@@ -42,6 +42,12 @@ ABBA sampling and seeded bootstrap statistics.
   blocks (sixty samples per mode). Boundary legs execute 200 transitions and
   must be raised before the campaign if timer quantization is visible.
 - Preserve unrelated `.codex/` and `last_1000_commits.txt` state.
+
+**Measured outcome (2026-07-13): reject.** The clean full ABBA campaign produced
+an exact `1.000 [1.000, 1.000]` trap-floor ratio, failing the frozen boundary
+gate, while all seven end-to-end guards passed. Legacy remains the production
+default; mailbox remains an internal explicit comparator. See
+[`docs/2026-07-13-hvf-syscall-mailbox-performance.md`](../../2026-07-13-hvf-syscall-mailbox-performance.md).
 
 ## Fixed mailbox layout
 

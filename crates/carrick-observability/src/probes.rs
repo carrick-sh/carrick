@@ -436,7 +436,7 @@ mod real {
         /// `phase`: 0=request decode, 1=ordinary return publication. The final
         /// three counters are actual HVF register/sysreg API operations in that
         /// phase, not inferred wall-time attribution.
-        fn hvf__syscall__transport(_: u32, _: u32, _: u64, _: u32, _: u32, _: u32) {}
+        fn hvf__syscall__transport(_: u32, _: u32, _: u32, _: u32, _: u32) {}
         // The Rust provider accepts six arguments, but macOS has returned a
         // constant zero for arg5 at real DSR probe sites. Keep this scalar ABI
         // at five arguments or fewer and use a low-frequency companion probe
@@ -782,7 +782,6 @@ mod real {
     pub fn hvf_syscall_transport(
         transport: u32,
         phase: u32,
-        sequence: u64,
         register_reads: u32,
         sysreg_reads: u32,
         register_writes: u32,
@@ -790,7 +789,6 @@ mod real {
         carrick_usdt::hvf__syscall__transport!(|| (
             transport,
             phase,
-            sequence,
             register_reads,
             sysreg_reads,
             register_writes,
@@ -1806,7 +1804,7 @@ mod stub {
     }
 
     stub!(dsr_prepare_begin(tid: i32, guest_pc: u64));
-    stub!(hvf_syscall_transport(transport: u32, phase: u32, sequence: u64, register_reads: u32, sysreg_reads: u32, register_writes: u32));
+    stub!(hvf_syscall_transport(transport: u32, phase: u32, register_reads: u32, sysreg_reads: u32, register_writes: u32));
     stub!(dsr_prepare_end(tid: i32, guest_pc: u64, cache_pc: u64, generation: u64, outcome: super::DsrPrepareOutcome));
     stub!(dsr_run_begin(tid: i32, guest_pc: u64, cache_pc: u64, generation: u64));
     stub!(dsr_run_end(tid: i32, kind: super::DsrExitKind, guest_pc: u64, target_pc: u64, status: i32));
