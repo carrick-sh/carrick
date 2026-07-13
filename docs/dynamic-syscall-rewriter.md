@@ -1367,9 +1367,11 @@ byte-identical emission for audited direct memory blocks. `Biased` places the
 complete guest mapping at a collision-selected high host bias and adds that
 bias only for instruction fetches and host memory accesses. Candidate selection
 reserves one contiguous `PROT_NONE` aperture from guest zero through the
-exclusive `LINUX_STACK_TOP` ceiling, plus a bounded 1 MiB crossing guard. Guest
-zero and every unmodeled gap therefore remain Carrick-owned guards rather than
-unowned host holes.
+exclusive `LINUX_STACK_TOP` ceiling, plus AArch64's complete 1 MiB literal
+displacement window and one host page of headroom. That final page contains the
+tail of a maximum-displacement 16-byte literal access. Guest zero and every
+unmodeled gap therefore remain Carrick-owned guards rather than unowned host
+holes.
 
 Both modes keep the architectural contract in guest coordinates: PC, SP, LR,
 branch targets, register-held pointers, reported fault addresses, signal-frame
@@ -1381,10 +1383,16 @@ typed diagnostic instead of executing an untranslated low address.
 Biased memory emission computes the exact guest effective address. A
 flags-neutral `LSR`/`CBZ` check preserves guest NZCV, and the normal sub-1-TiB
 path does not publish recovery state. The overflow guard covers the final
-ceiling-to-1-TiB sliver. A larger address publishes the guest address only on
-that invalid path and tags the host operand outside Darwin's user address
-range, preventing aliases with unrelated host mappings while preserving Linux
-`si_addr`. Direct emission remains unchanged.
+ceiling-to-1-TiB sliver and the full literal tail. A larger nonliteral address
+publishes the guest address only on that invalid path and tags the host operand
+outside Darwin's user address range, preventing aliases with unrelated host
+mappings while preserving Linux `si_addr`. Direct emission remains unchanged.
+
+A negative literal displacement near guest zero may wrap its architectural
+target in guest coordinates. Biased literal lowering publishes that exact
+wrapped `GuestVa` and uses the same tagged non-Darwin-user fault path, rather
+than rejecting translation when `guest + bias` overflows. Direct literal
+emission remains unchanged.
 
 Exec preflight treats current Carrick-owned ranges as reusable authority when a
 replacement layout overlaps them. After the point of no return, retained biased

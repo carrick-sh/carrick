@@ -17,6 +17,19 @@ use super::types::{
     PcRelativeInst, PcRelativeKind, SensitiveExit, SensitiveKind,
 };
 
+static SIGNAL_ORACLE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn install_signal_handlers_for_oracle() -> std::sync::MutexGuard<'static, ()> {
+    let guard = SIGNAL_ORACLE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert_eq!(
+        unsafe { super::super::carrick_native_install_dsr_signal_handlers() },
+        0
+    );
+    guard
+}
+
 struct BiasedTranslatorFixture {
     memory: super::super::NativeMappedMemory,
     translator: super::ThreadTranslator,
@@ -105,10 +118,7 @@ fn biased_translator_fixture(words: &[u32], guest_code: GuestVa) -> BiasedTransl
 
 #[test]
 fn biased_live_signal_gateway_recovers_pre_and_post_operation_faults() {
-    assert_eq!(
-        unsafe { super::super::carrick_native_install_dsr_signal_handlers() },
-        0
-    );
+    let _signal_oracle = install_signal_handlers_for_oracle();
 
     {
         let mut fixture =
@@ -191,6 +201,47 @@ fn biased_live_signal_gateway_recovers_pre_and_post_operation_faults() {
     }
 }
 
+#[test]
+fn biased_wrapped_negative_literal_fault_reports_guest_address() {
+    let _signal_oracle = install_signal_handlers_for_oracle();
+    const MIN_LITERAL_DISPLACEMENT: u64 = 1024 * 1024;
+    let guest_code = GuestVa(0x4000);
+    let wrapped_target = GuestVa(guest_code.raw().wrapping_sub(MIN_LITERAL_DISPLACEMENT));
+    let mut fixture = biased_translator_fixture(
+        &[
+            0x5880_0000, // ldr x0, #-1 MiB
+            0xd400_0001, // svc #0
+        ],
+        guest_code,
+    );
+    let mut stack = vec![0_u8; 16 * 1024];
+    let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    snapshot.pc = guest_code.raw();
+    let original_x0 = snapshot.x[0];
+    let prepared = fixture
+        .translator
+        .prepare_entry::<false>(&fixture.memory, &snapshot)
+        .expect("prepare wrapped negative biased literal");
+    let prepared_exit = fixture
+        .translator
+        .enter_prepared::<false>(prepared, &mut snapshot)
+        .expect("enter wrapped negative biased literal");
+    let exit = fixture
+        .translator
+        .finish_exit(&fixture.memory, &mut snapshot, prepared, prepared_exit)
+        .expect("finish wrapped negative biased literal");
+    assert!(matches!(
+        exit,
+        super::ThreadExit::Fault {
+            kind: super::ThreadFault::Host { signal, .. },
+            address: super::ThreadFaultAddress::Guest(address),
+        } if matches!(signal, libc::SIGSEGV | libc::SIGBUS) && address == wrapped_target
+    ));
+    assert_eq!(snapshot.pc, guest_code.raw());
+    assert_eq!(snapshot.fault_address, wrapped_target.raw());
+    assert_eq!(snapshot.x[0], original_x0);
+}
+
 #[derive(Clone, Copy, Debug)]
 enum BiasedRecoveryMatrixShape {
     ScalarPre,
@@ -246,10 +297,7 @@ impl BiasedRecoveryMatrixShape {
 
 #[test]
 fn biased_recovery_matrix_routes_every_offset_through_finish_exit() {
-    assert_eq!(
-        unsafe { super::super::carrick_native_install_dsr_signal_handlers() },
-        0
-    );
+    let _signal_oracle = install_signal_handlers_for_oracle();
     let shapes = [
         BiasedRecoveryMatrixShape::ScalarPre,
         BiasedRecoveryMatrixShape::ScalarPost,
@@ -310,6 +358,7 @@ fn biased_recovery_matrix_routes_every_offset_through_finish_exit() {
             let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
             snapshot.pc = guest_code.raw();
             shape.configure(&fixture, &mut snapshot);
+            let original_sp = snapshot.sp;
             let prepared = fixture
                 .translator
                 .prepare_entry::<false>(&fixture.memory, &snapshot)
@@ -408,7 +457,7 @@ fn biased_recovery_matrix_routes_every_offset_through_finish_exit() {
                     "shape={shape:?} point={point_index} kind={kind} registers"
                 );
                 assert_eq!(
-                    recovered.sp, expected_snapshot.sp,
+                    recovered.sp, original_sp,
                     "shape={shape:?} point={point_index} kind={kind} SP"
                 );
             }
@@ -439,10 +488,7 @@ fn biased_recovery_matrix_routes_every_offset_through_finish_exit() {
 
 #[test]
 fn biased_store_exclusive_preamble_retries_and_block_entry_fails_spuriously() {
-    assert_eq!(
-        unsafe { super::super::carrick_native_install_dsr_signal_handlers() },
-        0
-    );
+    let _signal_oracle = install_signal_handlers_for_oracle();
     let guest_code = GuestVa(0x20_0080_0000);
     // Every instruction except the invalid-only host-address tag executes for
     // this in-range reservation. Fault each executable point in isolation.
@@ -662,7 +708,7 @@ fn biased_memory_families_access_guest_data() {
 #[test]
 fn biased_memory_preserves_nzcv_for_the_following_conditional_instruction() {
     const BIAS: u64 = 0x80_0000_0000;
-    const GUEST: u64 = 0x6_0000_0000;
+    const GUEST: u64 = 0xb_0000_0000;
     let host_bias = crate::native_darwin::address::NativeHostBias::new(BIAS, 16 * 1024)
         .expect("construct host bias");
     let mapping = crate::native_darwin::address::OwnedHostMapping::map_exact(
@@ -2530,10 +2576,7 @@ fn dsr_generation_guard_rejects_stale_block_before_guest_instruction() {
 
 #[test]
 fn dsr_signal_fault_reconstructs_copied_instruction_pc() {
-    assert_eq!(
-        unsafe { super::super::carrick_native_install_dsr_signal_handlers() },
-        0
-    );
+    let _signal_oracle = install_signal_handlers_for_oracle();
     let mut cache = TranslationCache::new(16 * 1024).expect("allocate fault cache");
     let plan = BlockPlan {
         start: GuestVa(0x1c_000),
@@ -2591,10 +2634,7 @@ fn dsr_signal_fault_reconstructs_copied_instruction_pc() {
 
 #[test]
 fn dsr_signal_fault_recovers_context_when_physical_x28_is_zero() {
-    assert_eq!(
-        unsafe { super::super::carrick_native_install_dsr_signal_handlers() },
-        0
-    );
+    let _signal_oracle = install_signal_handlers_for_oracle();
     let guest = GuestVa(0x1c_100);
     let mut cache = TranslationCache::new(16 * 1024).expect("allocate x28 recovery cache");
     let emitted = emit_block_direct(
@@ -2655,10 +2695,7 @@ fn dsr_signal_fault_recovers_context_when_physical_x28_is_zero() {
 fn dsr_concurrency_kick_exits_guarded_linked_loop_without_corrupting_guest_state() {
     use std::sync::atomic::AtomicU64;
 
-    assert_eq!(
-        unsafe { super::super::carrick_native_install_dsr_signal_handlers() },
-        0
-    );
+    let _signal_oracle = install_signal_handlers_for_oracle();
     let guest = GuestVa(0x1c_200);
     let mut cache = TranslationCache::new(16 * 1024).expect("allocate kick cache");
     let generation = AtomicU64::new(CodeGeneration::INITIAL.get());
@@ -2818,10 +2855,7 @@ fn dsr_concurrency_kick_exits_guarded_linked_loop_without_corrupting_guest_state
 
 #[test]
 fn dsr_pending_kick_during_gateway_entry_keeps_guest_pc() {
-    assert_eq!(
-        unsafe { super::super::carrick_native_install_dsr_signal_handlers() },
-        0
-    );
+    let _signal_oracle = install_signal_handlers_for_oracle();
     let guest = GuestVa(0x1c_300);
     let mut cache = TranslationCache::new(16 * 1024).expect("allocate entry-kick cache");
     let emitted = emit_block_direct(
@@ -2877,10 +2911,7 @@ fn dsr_pending_kick_during_gateway_entry_keeps_guest_pc() {
 
 #[test]
 fn dsr_host_window_kick_is_deferred_to_next_gateway_entry() {
-    assert_eq!(
-        unsafe { super::super::carrick_native_install_dsr_signal_handlers() },
-        0
-    );
+    let _signal_oracle = install_signal_handlers_for_oracle();
     let guest = GuestVa(0x1c_340);
     let mut cache = TranslationCache::new(16 * 1024).expect("allocate host-window cache");
     let emitted = emit_block_direct(
@@ -2939,10 +2970,7 @@ fn dsr_host_window_kick_is_deferred_to_next_gateway_entry() {
 
 #[test]
 fn dsr_reinstall_clears_inherited_host_window_kick() {
-    assert_eq!(
-        unsafe { super::super::carrick_native_install_dsr_signal_handlers() },
-        0
-    );
+    let _signal_oracle = install_signal_handlers_for_oracle();
     let state = super::super::NativeKickState::new().expect("create reinstall state");
     state.bind_current().expect("bind reinstall state");
     let mut kick: libc::sigset_t = unsafe { std::mem::zeroed() };
@@ -3009,10 +3037,7 @@ fn dsr_phase_zero_host_kick_keeps_original_guest_snapshot() {
         fn carrick_native_dsr_test_phase_zero_host_kick_once();
     }
 
-    assert_eq!(
-        unsafe { super::super::carrick_native_install_dsr_signal_handlers() },
-        0
-    );
+    let _signal_oracle = install_signal_handlers_for_oracle();
     let guest = GuestVa(0x1c_380);
     let mut cache = TranslationCache::new(16 * 1024).expect("allocate host-kick cache");
     let emitted = emit_block_direct(
@@ -3062,10 +3087,7 @@ fn dsr_phase_zero_host_kick_keeps_original_guest_snapshot() {
 
 #[test]
 fn dsr_signal_fault_recovers_scratch_in_expanded_x18_load() {
-    assert_eq!(
-        unsafe { super::super::carrick_native_install_dsr_signal_handlers() },
-        0
-    );
+    let _signal_oracle = install_signal_handlers_for_oracle();
     let mut cache = TranslationCache::new(16 * 1024).expect("allocate x18 fault cache");
     let guest_pc = GuestVa(0x1d_000);
     let plan = BlockPlan {
@@ -3148,10 +3170,7 @@ fn dsr_signal_fault_recovers_scratch_in_expanded_x18_load() {
 
 #[test]
 fn dsr_signal_fault_preserves_destination_in_expanded_literal_load() {
-    assert_eq!(
-        unsafe { super::super::carrick_native_install_dsr_signal_handlers() },
-        0
-    );
+    let _signal_oracle = install_signal_handlers_for_oracle();
     let mut cache = TranslationCache::new(16 * 1024).expect("allocate literal fault cache");
     let guest_pc = GuestVa(0x1e_000);
     let plan = BlockPlan {

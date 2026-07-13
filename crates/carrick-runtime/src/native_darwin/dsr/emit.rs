@@ -113,6 +113,9 @@ pub(super) enum RecoveryAction {
     RestoreScratch {
         register: u32,
     },
+    RestoreScratchInvalidBiasedLiteral {
+        register: u32,
+    },
     RestoreScratchCompleted {
         register: u32,
     },
@@ -420,6 +423,36 @@ fn emit_recovering_scratch_sequence(
     let save = 0xf900_0000 | ((1120 / 8) << 10) | (28 << 5) | scratch;
     let restore = 0xf940_0000 | ((1120 / 8) << 10) | (28 << 5) | scratch;
     emit_word(assembler, entries, guest, save)?;
+    if let Some(invalid_guest) = target.invalid_biased_guest() {
+        for halfword in 0..4_u32 {
+            recovery.push(RecoveryEntry {
+                cache: current_offset(assembler)?,
+                action: RecoveryAction::RestoreScratch { register: scratch },
+            });
+            let immediate = ((invalid_guest.raw() >> (halfword * 16)) & 0xffff) as u32;
+            let base = if halfword == 0 {
+                0xd280_0000
+            } else {
+                0xf280_0000
+            };
+            emit_word(
+                assembler,
+                entries,
+                guest,
+                base | (halfword << 21) | (immediate << 5) | scratch,
+            )?;
+        }
+        recovery.push(RecoveryEntry {
+            cache: current_offset(assembler)?,
+            action: RecoveryAction::RestoreScratch { register: scratch },
+        });
+        emit_word(
+            assembler,
+            entries,
+            guest,
+            0xf900_0000 | ((1200 / 8) << 10) | (28 << 5) | scratch,
+        )?;
+    }
     for halfword in 0..4_u32 {
         recovery.push(RecoveryEntry {
             cache: current_offset(assembler)?,
@@ -440,7 +473,11 @@ fn emit_recovering_scratch_sequence(
     }
     recovery.push(RecoveryEntry {
         cache: current_offset(assembler)?,
-        action: RecoveryAction::RestoreScratch { register: scratch },
+        action: if target.invalid_biased_guest().is_some() {
+            RecoveryAction::RestoreScratchInvalidBiasedLiteral { register: scratch }
+        } else {
+            RecoveryAction::RestoreScratch { register: scratch }
+        },
     });
     emit_word(assembler, entries, guest, memory_word)?;
     if let Some((virtual_register, snapshot_offset)) = commit_virtual {
@@ -470,6 +507,7 @@ fn emit_recovering_scratch_sequence(
 enum MaterializedAddress {
     Guest(GuestVa),
     Host(HostVa),
+    InvalidBiased { guest: GuestVa, host: HostVa },
 }
 
 impl MaterializedAddress {
@@ -477,6 +515,14 @@ impl MaterializedAddress {
         match self {
             Self::Guest(address) => address.raw(),
             Self::Host(address) => address.raw() as u64,
+            Self::InvalidBiased { host, .. } => host.raw() as u64,
+        }
+    }
+
+    fn invalid_biased_guest(self) -> Option<GuestVa> {
+        match self {
+            Self::InvalidBiased { guest, .. } => Some(guest),
+            Self::Guest(_) | Self::Host(_) => None,
         }
     }
 }
@@ -1547,12 +1593,26 @@ fn emit_biased_memory(
         return emit_biased_store_exclusive(assembler, entries, plan, guest, memory, recovery);
     }
     if let super::types::MemoryBase::Literal(target) = memory.base {
-        let host_target = target.raw().checked_add(host_bias.get()).ok_or_else(|| {
-            DsrError::BlockPolicy(format!(
-                "biased literal target overflow at guest PC 0x{:x}",
-                guest.raw()
-            ))
-        })?;
+        let materialized = if target.raw() < super::super::address::BIASED_GUEST_LITERAL_TARGET_END
+        {
+            let host_target = target.raw().checked_add(host_bias.get()).ok_or_else(|| {
+                DsrError::BlockPolicy(format!(
+                    "biased literal target overflow at guest PC 0x{:x}",
+                    guest.raw()
+                ))
+            })?;
+            MaterializedAddress::Host(HostVa(usize::try_from(host_target).map_err(|_| {
+                DsrError::BlockPolicy(format!(
+                    "biased literal host target 0x{host_target:x} does not fit HostVa"
+                ))
+            })?))
+        } else {
+            let tag = super::super::address::INVALID_BIASED_HOST_ADDRESS_BIT;
+            MaterializedAddress::InvalidBiased {
+                guest: target,
+                host: HostVa((tag | (target.raw() & (tag - 1))) as usize),
+            }
+        };
         return emit_pc_relative_literal(
             assembler,
             entries,
@@ -1568,11 +1628,7 @@ fn emit_biased_memory(
                 destination: None,
                 word: memory.word,
             },
-            MaterializedAddress::Host(HostVa(usize::try_from(host_target).map_err(|_| {
-                DsrError::BlockPolicy(format!(
-                    "biased literal host target 0x{host_target:x} does not fit HostVa"
-                ))
-            })?)),
+            materialized,
             recovery,
         );
     }
