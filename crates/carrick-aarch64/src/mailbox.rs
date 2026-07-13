@@ -55,6 +55,81 @@ const _: () = assert!(core::mem::offset_of!(Aarch64SyscallMailbox, return_value)
 const _: () = assert!(core::mem::offset_of!(Aarch64SyscallMailbox, resume_x16) == 168);
 const _: () = assert!(core::mem::offset_of!(Aarch64SyscallMailbox, resume_x17) == 176);
 const _: () = assert!(core::mem::offset_of!(Aarch64SyscallMailbox, reserved) == 184);
+// The guest vector lives in `carrick-mem` (below this protocol crate in the
+// dependency graph), so it owns the instruction-immediate constants. Tie every
+// offset it emits back to this wire struct at compile time to prevent drift.
+const _: () =
+    assert!(AARCH64_SYSCALL_MAILBOX_SIZE == carrick_mem::memory::LINUX_SYSCALL_MAILBOX_SLOT_SIZE);
+const _: () =
+    assert!(AARCH64_SYSCALL_MAILBOX_SLOTS == carrick_mem::memory::LINUX_SYSCALL_MAILBOX_SLOTS);
+const _: () = assert!(
+    core::mem::offset_of!(Aarch64SyscallMailbox, sequence)
+        == carrick_mem::memory::AARCH64_SYSCALL_MAILBOX_OFF_SEQUENCE as usize
+);
+const _: () = assert!(
+    core::mem::offset_of!(Aarch64SyscallMailbox, state)
+        == carrick_mem::memory::AARCH64_SYSCALL_MAILBOX_OFF_STATE as usize
+);
+const _: () = assert!(
+    core::mem::offset_of!(Aarch64SyscallMailbox, trap_kind)
+        == carrick_mem::memory::AARCH64_SYSCALL_MAILBOX_OFF_TRAP_KIND as usize
+);
+const _: () = assert!(
+    core::mem::offset_of!(Aarch64SyscallMailbox, response_action)
+        == carrick_mem::memory::AARCH64_SYSCALL_MAILBOX_OFF_RESPONSE_ACTION as usize
+);
+const _: () = assert!(
+    core::mem::offset_of!(Aarch64SyscallMailbox, flags)
+        == carrick_mem::memory::AARCH64_SYSCALL_MAILBOX_OFF_FLAGS as usize
+);
+const _: () = assert!(
+    core::mem::offset_of!(Aarch64SyscallMailbox, native_nr)
+        == carrick_mem::memory::AARCH64_SYSCALL_MAILBOX_OFF_NATIVE_NR as usize
+);
+const _: () = assert!(
+    core::mem::offset_of!(Aarch64SyscallMailbox, args)
+        == carrick_mem::memory::AARCH64_SYSCALL_MAILBOX_OFF_ARGS as usize
+);
+const _: () = assert!(
+    core::mem::offset_of!(Aarch64SyscallMailbox, x8)
+        == carrick_mem::memory::AARCH64_SYSCALL_MAILBOX_OFF_X8 as usize
+);
+const _: () = assert!(
+    core::mem::offset_of!(Aarch64SyscallMailbox, resume_pc)
+        == carrick_mem::memory::AARCH64_SYSCALL_MAILBOX_OFF_RESUME_PC as usize
+);
+const _: () = assert!(
+    core::mem::offset_of!(Aarch64SyscallMailbox, spsr)
+        == carrick_mem::memory::AARCH64_SYSCALL_MAILBOX_OFF_SPSR as usize
+);
+const _: () = assert!(
+    core::mem::offset_of!(Aarch64SyscallMailbox, fp)
+        == carrick_mem::memory::AARCH64_SYSCALL_MAILBOX_OFF_FP as usize
+);
+const _: () = assert!(
+    core::mem::offset_of!(Aarch64SyscallMailbox, lr)
+        == carrick_mem::memory::AARCH64_SYSCALL_MAILBOX_OFF_LR as usize
+);
+const _: () = assert!(
+    core::mem::offset_of!(Aarch64SyscallMailbox, sp)
+        == carrick_mem::memory::AARCH64_SYSCALL_MAILBOX_OFF_SP as usize
+);
+const _: () = assert!(
+    core::mem::offset_of!(Aarch64SyscallMailbox, esr)
+        == carrick_mem::memory::AARCH64_SYSCALL_MAILBOX_OFF_ESR as usize
+);
+const _: () = assert!(
+    core::mem::offset_of!(Aarch64SyscallMailbox, return_value)
+        == carrick_mem::memory::AARCH64_SYSCALL_MAILBOX_OFF_RETURN_VALUE as usize
+);
+const _: () = assert!(
+    core::mem::offset_of!(Aarch64SyscallMailbox, resume_x16)
+        == carrick_mem::memory::AARCH64_SYSCALL_MAILBOX_OFF_RESUME_X16 as usize
+);
+const _: () = assert!(
+    core::mem::offset_of!(Aarch64SyscallMailbox, resume_x17)
+        == carrick_mem::memory::AARCH64_SYSCALL_MAILBOX_OFF_RESUME_X17 as usize
+);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
