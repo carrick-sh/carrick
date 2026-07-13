@@ -1274,15 +1274,6 @@ fn run_native_dsr_thread_loop(
                         snapshot.pc
                     )));
                 }
-                if matches!(kind, dsr::ThreadFault::Host { .. })
-                    && memory.lock().resolve_native16k_write_exec_fault(
-                        address.raw(),
-                        snapshot.pc,
-                        snapshot.esr,
-                    )?
-                {
-                    continue;
-                }
                 snapshot = lower_dsr_fault(
                     &dispatcher,
                     &memory,
@@ -1754,6 +1745,56 @@ fn lower_dsr_fault(
     fault: dsr::ThreadFault,
     fault_address: u64,
 ) -> Result<NativeUcontextSnapshot, RuntimeError> {
+    let biased_host_fault = matches!(fault, dsr::ThreadFault::Host { .. })
+        && matches!(
+            memory.lock().address_mode(),
+            NativeAddressMode::Biased { .. }
+        );
+    let fault_address = if biased_host_fault {
+        let memory = memory.lock();
+        let guest = memory
+            .guest_fault_address(carrick_guest_mem::HostVa(
+                usize::try_from(fault_address).map_err(|_| {
+                    RuntimeError::Unsupported(format!(
+                        "native DSR host fault address does not fit the host VA domain: 0x{fault_address:x}"
+                    ))
+                })?,
+            ))
+            .ok_or_else(|| {
+                RuntimeError::Unsupported(format!(
+                    "native DSR fault lies outside guest-owned host memory: 0x{fault_address:x}"
+                ))
+            })?;
+        if snapshot.far != 0 {
+            let far = usize::try_from(snapshot.far)
+                .ok()
+                .and_then(|far| memory.guest_fault_address(carrick_guest_mem::HostVa(far)));
+            snapshot.far = far
+                .ok_or_else(|| {
+                    RuntimeError::Unsupported(format!(
+                        "native DSR FAR lies outside guest-owned host memory: 0x{:x}",
+                        snapshot.far
+                    ))
+                })?
+                .raw();
+        }
+        if snapshot.fault_address != 0 {
+            let snapshot_fault = usize::try_from(snapshot.fault_address)
+                .ok()
+                .and_then(|address| memory.guest_fault_address(carrick_guest_mem::HostVa(address)));
+            snapshot.fault_address = snapshot_fault
+                .ok_or_else(|| {
+                    RuntimeError::Unsupported(format!(
+                        "native DSR signal fault address lies outside guest-owned host memory: 0x{:x}",
+                        snapshot.fault_address
+                    ))
+                })?
+                .raw();
+        }
+        guest.raw()
+    } else {
+        fault_address
+    };
     if matches!(fault, dsr::ThreadFault::Host { .. })
         && let Some((page, prot)) = dispatcher.resident_fault_plan(fault_address)
     {
@@ -5209,6 +5250,35 @@ fn native_region_linux_prot(read: bool, write: bool, exec: bool) -> u64 {
 }
 
 impl NativeMappedMemory {
+    fn address_mode(&self) -> NativeAddressMode {
+        self.address_mode
+    }
+
+    fn host_address(
+        &self,
+        address: carrick_guest_mem::GuestVa,
+    ) -> Result<carrick_guest_mem::HostVa, MemoryError> {
+        self.address_mode
+            .to_host(address)
+            .map_err(|error| MemoryError::HostMap(error.to_string()))
+    }
+
+    fn guest_fault_address(
+        &self,
+        address: carrick_guest_mem::HostVa,
+    ) -> Option<carrick_guest_mem::GuestVa> {
+        if matches!(self.address_mode, NativeAddressMode::Biased { .. })
+            && !self
+                .owned_host_ranges
+                .iter()
+                .any(|range| address >= range.start && address < range.end)
+        {
+            return None;
+        }
+        let guest = self.address_mode.to_guest(address).ok()?;
+        self.region_contains(guest.raw(), 1).then_some(guest)
+    }
+
     fn dsr_process_translator(&self) -> Result<Arc<dsr::ProcessTranslator>, RuntimeError> {
         self.dsr_translator.as_ref().map(Arc::clone).ok_or_else(|| {
             RuntimeError::Unsupported(
@@ -5321,7 +5391,7 @@ impl NativeMappedMemory {
                     crate::probes::DsrCacheLifecyclePhase::ExecMapVvarBegin,
                     region.len(),
                 );
-                relocate_vdso_vvar_loads(region)?;
+                relocate_vdso_vvar_loads(region, &native_layout)?;
                 native_exec_map_detail(
                     exec_map_dsr_tid,
                     crate::probes::DsrCacheLifecyclePhase::ExecMapVvarEnd,
@@ -5596,11 +5666,10 @@ impl NativeMappedMemory {
             .map_err(|_| {
                 RuntimeError::Unsupported("native Darwin vvar page range overflow".to_string())
             })?;
-        let page_ptr = usize::try_from(page_start).map_err(|_| {
-            RuntimeError::Unsupported(format!(
-                "native Darwin vvar page too large: {page_start:#x}"
-            ))
-        })? as *mut libc::c_void;
+        let page_ptr = self
+            .host_address(carrick_guest_mem::GuestVa(page_start))
+            .map_err(|error| RuntimeError::Unsupported(error.to_string()))?
+            .raw() as *mut libc::c_void;
         if unsafe { libc::mprotect(page_ptr, page_len, libc::PROT_READ | libc::PROT_WRITE) } != 0 {
             return Err(last_io_error("mprotect native Darwin vvar page writable"));
         }
@@ -5615,7 +5684,9 @@ impl NativeMappedMemory {
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     bytes.as_ptr(),
-                    address as usize as *mut u8,
+                    self.host_address(carrick_guest_mem::GuestVa(address))
+                        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?
+                        .raw() as *mut u8,
                     bytes.len(),
                 );
             }
@@ -5632,14 +5703,14 @@ impl NativeMappedMemory {
             if region.shared_futex || !region.guest_writable {
                 continue;
             }
-            let Ok(start) = usize::try_from(region.start) else {
+            let Ok(start) = self.host_address(carrick_guest_mem::GuestVa(region.start)) else {
                 continue;
             };
             let Ok(len) = usize::try_from(region.end.saturating_sub(region.start)) else {
                 continue;
             };
             let changed =
-                set_native_region_fork_inheritance(start as *mut libc::c_void, len, share);
+                set_native_region_fork_inheritance(start.raw() as *mut libc::c_void, len, share);
             if trace {
                 child_write_stderr(
                     format!(
@@ -5691,11 +5762,10 @@ impl NativeMappedMemory {
                     "native Darwin execve unmap range too large: 0x{start:x}..0x{end:x}"
                 ))
             })?;
-            let address = usize::try_from(start).map_err(|_| {
-                RuntimeError::Unsupported(format!(
-                    "native Darwin execve unmap address too large: 0x{start:x}"
-                ))
-            })? as *mut libc::c_void;
+            let address = self
+                .host_address(carrick_guest_mem::GuestVa(start))
+                .map_err(|error| RuntimeError::Unsupported(error.to_string()))?
+                .raw() as *mut libc::c_void;
             if len != 0 && unsafe { libc::munmap(address, len) } != 0 {
                 return Err(last_io_error(&format!(
                     "munmap native Darwin execve range 0x{start:x}..0x{end:x}"
@@ -5860,10 +5930,9 @@ impl NativeMappedMemory {
                 address: operation_address,
                 length: operation_len,
             })?;
-        let ptr = usize::try_from(page_start).map_err(|_| MemoryError::OutOfBounds {
-            address: operation_address,
-            length: operation_len,
-        })? as *mut u8;
+        let ptr = self
+            .host_address(carrick_guest_mem::GuestVa(page_start))?
+            .raw() as *mut u8;
         unsafe { carrick_native_clear_icache(ptr.cast(), page_len) };
         let prot = self
             .native_page_protections
@@ -6081,10 +6150,9 @@ impl NativeMappedMemory {
                 length: width,
             });
         }
-        let ptr = usize::try_from(address).map_err(|_| MemoryError::OutOfBounds {
-            address,
-            length: width,
-        })? as *mut u8;
+        let ptr = self
+            .host_address(carrick_guest_mem::GuestVa(address))?
+            .raw() as *mut u8;
         let changed = self.prepare_temporary_host_access(address, width, false)?;
         let observed = unsafe {
             match width {
@@ -6118,10 +6186,9 @@ impl NativeMappedMemory {
                 length: width,
             });
         }
-        let ptr = usize::try_from(address).map_err(|_| MemoryError::OutOfBounds {
-            address,
-            length: width,
-        })? as *mut u8;
+        let ptr = self
+            .host_address(carrick_guest_mem::GuestVa(address))?
+            .raw() as *mut u8;
         self.invalidate_exclusive_range(address, width);
         let changed = self.prepare_temporary_host_access(address, width, true)?;
         unsafe {
@@ -6155,10 +6222,9 @@ impl NativeMappedMemory {
                 length: width,
             });
         }
-        let ptr = usize::try_from(address).map_err(|_| MemoryError::OutOfBounds {
-            address,
-            length: width,
-        })? as *mut u8;
+        let ptr = self
+            .host_address(carrick_guest_mem::GuestVa(address))?
+            .raw() as *mut u8;
         self.invalidate_exclusive_range(address, width);
         let changed = self.prepare_temporary_host_access(address, width, true)?;
         let observed = unsafe {
@@ -6194,10 +6260,9 @@ impl NativeMappedMemory {
             });
         }
         let changed = self.prepare_temporary_host_access(address, width, false)?;
-        let ptr = usize::try_from(address).map_err(|_| MemoryError::OutOfBounds {
-            address,
-            length: width,
-        })? as *mut u8;
+        let ptr = self
+            .host_address(carrick_guest_mem::GuestVa(address))?
+            .raw() as *mut u8;
         let ordering = if acquire {
             std::sync::atomic::Ordering::Acquire
         } else {
@@ -6235,10 +6300,9 @@ impl NativeMappedMemory {
             return Ok(false);
         }
         let changed = self.prepare_temporary_host_access(address, width, true)?;
-        let ptr = usize::try_from(address).map_err(|_| MemoryError::OutOfBounds {
-            address,
-            length: width,
-        })? as *mut u8;
+        let ptr = self
+            .host_address(carrick_guest_mem::GuestVa(address))?
+            .raw() as *mut u8;
         let success = if release {
             std::sync::atomic::Ordering::Release
         } else {
@@ -6325,10 +6389,9 @@ impl NativeMappedMemory {
         operation_address: u64,
         operation_len: usize,
     ) -> Result<(), MemoryError> {
-        let ptr = usize::try_from(page_start).map_err(|_| MemoryError::OutOfBounds {
-            address: operation_address,
-            length: operation_len,
-        })? as *mut libc::c_void;
+        let ptr = self
+            .host_address(carrick_guest_mem::GuestVa(page_start))?
+            .raw() as *mut libc::c_void;
         let host_page_len =
             usize::try_from(self.host_page_size).map_err(|_| MemoryError::OutOfBounds {
                 address: operation_address,
@@ -6444,10 +6507,9 @@ impl NativeMappedMemory {
                 .iter()
                 .any(|value| value & crate::linux_abi::LINUX_PROT_EXEC != 0)
             {
-                let ptr = usize::try_from(page_start).map_err(|_| MemoryError::OutOfBounds {
-                    address,
-                    length: len,
-                })? as *mut u8;
+                let ptr = self
+                    .host_address(carrick_guest_mem::GuestVa(page_start))?
+                    .raw() as *mut u8;
                 let page_len =
                     usize::try_from(self.host_page_size).map_err(|_| MemoryError::OutOfBounds {
                         address,
@@ -6485,9 +6547,10 @@ impl NativeMappedMemory {
                 "native Darwin relocation outside mapped guest memory at 0x{address:x}"
             )));
         }
-        let ptr = usize::try_from(address).map_err(|_| {
-            RuntimeError::Unsupported(format!("guest address too large: 0x{address:x}"))
-        })? as *mut u64;
+        let ptr = self
+            .host_address(carrick_guest_mem::GuestVa(address))
+            .map_err(|error| RuntimeError::Unsupported(error.to_string()))?
+            .raw() as *mut u64;
         unsafe { std::ptr::write_unaligned(ptr, value) };
         Ok(())
     }
@@ -6498,10 +6561,7 @@ impl NativeMappedMemory {
         length: usize,
         flags: i32,
     ) -> Result<(carrick_guest_mem::HostVa, i32), MemoryError> {
-        let host_start = self
-            .address_mode
-            .to_host(carrick_guest_mem::GuestVa(guest_start))
-            .map_err(|error| MemoryError::HostMap(error.to_string()))?;
+        let host_start = self.host_address(carrick_guest_mem::GuestVa(guest_start))?;
         let flags = self
             .address_mode
             .fixed_mapping_flags(&self.owned_host_ranges, host_start, length, flags)
@@ -6763,7 +6823,7 @@ impl NativeMappedMemory {
         mut set_host_prot: F,
     ) -> Result<(), MemoryError>
     where
-        F: FnMut(u64, usize, libc::c_int) -> Result<(), MemoryError>,
+        F: FnMut(carrick_guest_mem::HostVa, usize, libc::c_int) -> Result<(), MemoryError>,
     {
         let host_prot = native16k_host_prot(prot);
         let mut pages = BTreeSet::new();
@@ -6782,19 +6842,17 @@ impl NativeMappedMemory {
                 length: len,
             })?;
 
-        let pages: Vec<(u64, *mut libc::c_void)> = pages
+        let pages: Vec<(u64, carrick_guest_mem::HostVa, *mut libc::c_void)> = pages
             .into_iter()
             .map(|page_start| {
-                let ptr = usize::try_from(page_start).map_err(|_| MemoryError::OutOfBounds {
-                    address,
-                    length: len,
-                })? as *mut libc::c_void;
-                Ok((page_start, ptr))
+                let host_page = self.host_address(carrick_guest_mem::GuestVa(page_start))?;
+                let ptr = host_page.raw() as *mut libc::c_void;
+                Ok((page_start, host_page, ptr))
             })
             .collect::<Result<_, MemoryError>>()?;
 
         struct ProtectionSnapshot {
-            page_start: u64,
+            host_page: carrick_guest_mem::HostVa,
             ptr: *mut libc::c_void,
             old_host_prot: libc::c_int,
             patched_words: Vec<(usize, u32)>,
@@ -6802,13 +6860,13 @@ impl NativeMappedMemory {
 
         let mut snapshots = Vec::with_capacity(pages.len());
         let apply_result = (|| {
-            for &(page_start, ptr) in &pages {
+            for &(page_start, host_page, ptr) in &pages {
                 let old_host_prot = self.native_host_prot_for_page(page_start);
                 if prot & crate::linux_abi::LINUX_PROT_EXEC != 0 {
                     let patched_words = Vec::new();
-                    set_host_prot(page_start, host_page_len, libc::PROT_READ)?;
+                    set_host_prot(host_page, host_page_len, libc::PROT_READ)?;
                     snapshots.push(ProtectionSnapshot {
-                        page_start,
+                        host_page,
                         ptr,
                         old_host_prot,
                         patched_words,
@@ -6816,13 +6874,13 @@ impl NativeMappedMemory {
                     unsafe { carrick_native_clear_icache(ptr, host_page_len) };
                 } else {
                     snapshots.push(ProtectionSnapshot {
-                        page_start,
+                        host_page,
                         ptr,
                         old_host_prot,
                         patched_words: Vec::new(),
                     });
                 }
-                set_host_prot(page_start, host_page_len, host_prot)?;
+                set_host_prot(host_page, host_page_len, host_prot)?;
             }
             Ok(())
         })();
@@ -6832,7 +6890,7 @@ impl NativeMappedMemory {
             for snapshot in snapshots.iter().rev() {
                 if !snapshot.patched_words.is_empty() {
                     match set_host_prot(
-                        snapshot.page_start,
+                        snapshot.host_page,
                         host_page_len,
                         libc::PROT_READ | libc::PROT_WRITE,
                     ) {
@@ -6847,7 +6905,7 @@ impl NativeMappedMemory {
                     }
                 }
                 if let Err(restore_error) =
-                    set_host_prot(snapshot.page_start, host_page_len, snapshot.old_host_prot)
+                    set_host_prot(snapshot.host_page, host_page_len, snapshot.old_host_prot)
                 {
                     rollback_error = Some(restore_error);
                 }
@@ -6860,7 +6918,7 @@ impl NativeMappedMemory {
             return Err(error);
         }
 
-        for (page_start, _) in pages {
+        for (page_start, _, _) in pages {
             self.native_page_protections.insert(page_start, prot);
             self.native_write_exec_writable_pages.remove(&page_start);
         }
@@ -6918,9 +6976,9 @@ impl GuestMemory for NativeMappedMemory {
         if !self.region_contains(address, length) {
             return Err(MemoryError::OutOfBounds { address, length });
         }
-        let ptr = usize::try_from(address)
-            .map_err(|_| MemoryError::OutOfBounds { address, length })?
-            as *const u8;
+        let ptr = self
+            .host_address(carrick_guest_mem::GuestVa(address))?
+            .raw() as *const u8;
         let mut out = vec![0u8; length];
         let changed = self.prepare_temporary_host_access(address, length, false)?;
         unsafe {
@@ -6940,9 +6998,9 @@ impl GuestMemory for NativeMappedMemory {
             self.note_dsr_code_mutation(address, length)?;
         }
         self.prepare_native16k_write_exec_host_write(address, length)?;
-        let ptr = usize::try_from(address)
-            .map_err(|_| MemoryError::OutOfBounds { address, length })?
-            as *mut u8;
+        let ptr = self
+            .host_address(carrick_guest_mem::GuestVa(address))?
+            .raw() as *mut u8;
         let changed = self.prepare_temporary_host_access(address, length, true)?;
         unsafe {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, length);
@@ -6996,14 +7054,12 @@ impl GuestMemory for NativeMappedMemory {
                 address,
                 len,
                 prot,
-                |page_start, page_len, host_prot| {
-                    let ptr = usize::try_from(page_start).map_err(|_| MemoryError::OutOfBounds {
-                        address,
-                        length: len,
-                    })? as *mut libc::c_void;
+                |host_page, page_len, host_prot| {
+                    let ptr = host_page.raw() as *mut libc::c_void;
                     if unsafe { libc::mprotect(ptr, page_len, host_prot) } != 0 {
                         return Err(MemoryError::HostMap(format!(
-                            "mprotect native Darwin host page 0x{page_start:x}: {}",
+                            "mprotect native Darwin host page 0x{:x}: {}",
+                            host_page.raw(),
                             std::io::Error::last_os_error()
                         )));
                     }
@@ -7059,17 +7115,20 @@ impl GuestMemory for NativeMappedMemory {
         let region = self.regions.iter().rev().find(|region| {
             region.shared_futex && guest_addr >= region.start && end <= region.end
         })?;
-        let word = usize::try_from(guest_addr).ok()?;
-        // Guest VA == host VA under native, so the physical os_sync SHARED
-        // wait/wake already rendezvous across mappings; the waiter-COUNT key
-        // must too. A direct MAP_SHARED file mapping keys by file identity +
+        let word = self
+            .host_address(carrick_guest_mem::GuestVa(guest_addr))
+            .ok()?
+            .raw();
+        // The physical os_sync SHARED wait/wake uses the translated host word,
+        // while waiter-count metadata remains guest-keyed. A direct MAP_SHARED
+        // file mapping keys that metadata by file identity +
         // file offset (HVF's scheme): the native exec rebuilds the address
         // space, so an exec'd child re-attaches the same file at a different
         // VA and a VA key would miss the parent's registered waiter
         // (ltpcheckpointexec). Anon MAP_SHARED (fork-inherited, same VA in
         // every process) keeps the VA key.
         let waiter_key = if region.shared_key_base == 0 {
-            word
+            usize::try_from(guest_addr).ok()?
         } else {
             let file_offset = region
                 .shared_key_offset
@@ -7604,14 +7663,16 @@ const fn movz_x_lsl32(imm16: u16) -> u32 {
 /// multiples (const-asserted above), so retargeting is a pure immediate swap.
 /// This pass runs ONLY on carrick's own vDSO page — never on guest-owned code,
 /// where an immediate rewrite would corrupt legitimate instructions.
-fn relocate_vdso_vvar_loads(region: &MemoryRegion) -> Result<(), RuntimeError> {
+fn relocate_vdso_vvar_loads(
+    region: &MemoryRegion,
+    native_layout: &NativeLayout,
+) -> Result<(), RuntimeError> {
     let length = region.bytes().len();
-    let base = usize::try_from(region.start).map_err(|_| {
-        RuntimeError::Unsupported(format!(
-            "native Darwin vdso base too large: {:#x}",
-            region.start
-        ))
-    })? as *mut u8;
+    let base = native_layout
+        .address_mode()
+        .to_host(carrick_guest_mem::GuestVa(region.start))
+        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?
+        .raw() as *mut u8;
     let canonical = movz_x_lsl32((carrick_mem::vdso::LINUX_VVAR_BASE >> 32) as u16);
     let relocated = movz_x_lsl32((NATIVE_DARWIN_VVAR_BASE >> 32) as u16);
     const RD_MASK: u32 = 0x1f;
@@ -7730,6 +7791,96 @@ fn last_io_error(context: &str) -> RuntimeError {
 mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
+
+    fn fork_test(test: impl FnOnce()) {
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            test();
+            unsafe { libc::_exit(0) };
+        }
+        let status = waitpid_blocking(pid).expect("wait for forked test");
+        assert!(libc::WIFEXITED(status), "forked test status={status:#x}");
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+    }
+
+    fn biased_test_memory(
+        guest_start: carrick_guest_mem::GuestVa,
+        len: usize,
+    ) -> NativeMappedMemory {
+        let mapped = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANON | libc::MAP_PRIVATE,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(mapped, libc::MAP_FAILED, "map biased test memory");
+        let host_start = mapped as usize;
+        let bias = (host_start as u64)
+            .checked_sub(guest_start.raw())
+            .expect("host mapping above guest base");
+        let host_bias = address::NativeHostBias::new(bias, 16 * 1024).expect("aligned bias");
+        NativeMappedMemory {
+            address_mode: NativeAddressMode::Biased { host_bias },
+            owned_host_ranges: vec![
+                carrick_guest_mem::HostVa(host_start)..carrick_guest_mem::HostVa(host_start + len),
+            ],
+            regions: vec![NativeMappedRegion {
+                start: guest_start.raw(),
+                end: guest_start.raw() + len as u64,
+                host_protects: true,
+                shared_futex: false,
+                guest_writable: true,
+                default_prot: crate::linux_abi::LINUX_PROT_READ
+                    | crate::linux_abi::LINUX_PROT_WRITE,
+                shared_key_base: 0,
+                shared_key_offset: 0,
+            }],
+            protections: MemoryProtections::default(),
+            native_page_protections: BTreeMap::new(),
+            native_write_exec_writable_pages: BTreeSet::new(),
+            linux4k_page_protections: BTreeMap::new(),
+            exclusive_reservation: None,
+            host_page_size: 16 * 1024,
+            linux_page_size: 16 * 1024,
+            dsr_generations: dsr::cache::PageGenerationTable::new(16 * 1024)
+                .expect("generation table"),
+            dsr_translator: None,
+        }
+    }
+
+    #[test]
+    fn biased_memory_keeps_guest_coordinates_at_runtime_boundaries() {
+        fork_test(|| {
+            let mut memory = biased_test_memory(carrick_guest_mem::GuestVa(0x40_0000), 0x4000);
+            memory.write_bytes(0x40_0080, b"dsr").unwrap();
+            assert_eq!(memory.read_bytes(0x40_0080, 3).unwrap(), b"dsr");
+            let host = memory
+                .host_address(carrick_guest_mem::GuestVa(0x40_0080))
+                .unwrap();
+            assert_eq!(
+                memory.guest_fault_address(host),
+                Some(carrick_guest_mem::GuestVa(0x40_0080))
+            );
+            assert!(memory.read_bytes(0, 1).is_err());
+        });
+    }
+
+    #[test]
+    fn arbitrary_host_pointer_is_not_a_guest_fault() {
+        let memory = biased_test_memory(carrick_guest_mem::GuestVa(0x40_0000), 0x4000);
+        let host = carrick_guest_mem::HostVa((&memory as *const _) as usize);
+        assert_eq!(memory.guest_fault_address(host), None);
+        let owned = &memory.owned_host_ranges[0];
+        assert_eq!(
+            unsafe { libc::munmap(owned.start.raw() as *mut libc::c_void, 0x4000) },
+            0
+        );
+    }
 
     fn write_u16(bytes: &mut [u8], offset: usize, value: u16) {
         bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
@@ -9242,21 +9393,16 @@ mod tests {
                         layout.mmap_base,
                         (2 * page_size) as usize,
                         crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_EXEC,
-                        |page_start, page_len, host_prot| {
+                        |host_page, page_len, host_prot| {
                             let call = calls.get() + 1;
                             calls.set(call);
-                            operations.borrow_mut().push((page_start, host_prot));
+                            operations.borrow_mut().push((host_page, host_prot));
                             if call == 4 {
                                 return Err(MemoryError::HostMap(
                                     "injected final protection failure".to_string(),
                                 ));
                             }
-                            let ptr = usize::try_from(page_start).map_err(|_| {
-                                MemoryError::OutOfBounds {
-                                    address: page_start,
-                                    length: page_len,
-                                }
-                            })? as *mut libc::c_void;
+                            let ptr = host_page.raw() as *mut libc::c_void;
                             if unsafe { libc::mprotect(ptr, page_len, host_prot) } != 0 {
                                 return Err(MemoryError::HostMap(
                                     std::io::Error::last_os_error().to_string(),
