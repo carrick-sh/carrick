@@ -125,6 +125,24 @@ pub(super) enum MemoryWriteback {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum MemoryEffectiveAddress {
+    Base,
+    Immediate(i64),
+    RegisterOffset {
+        extend: MemoryIndexExtend,
+        shift: u8,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum MemoryIndexExtend {
+    Uxtw,
+    Sxtw,
+    Uxtx,
+    Sxtx,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum MemoryClass {
     Scalar,
     Pair,
@@ -150,6 +168,7 @@ pub(super) struct MemoryAccess {
     pub(super) word: u32,
     pub(super) op: bad64::Op,
     pub(super) base: MemoryBase,
+    pub(super) effective_address: MemoryEffectiveAddress,
     pub(super) writeback: MemoryWriteback,
     pub(super) class: MemoryClass,
     pub(super) virtualization: MemoryVirtualization,
@@ -220,6 +239,7 @@ pub(super) enum NativeDsrExit {
         indirect_x30_scratch: u64,
         physical_x18: u64,
         gateway_phase: u32,
+        biased_guest_fault_address: u64,
     },
     Kick {
         resume: GuestVa,

@@ -1365,7 +1365,11 @@ below that boundary cannot use identity-mapped DSR. Native16k now has two typed
 address modes. `Direct` keeps the existing zero-bias path, including
 byte-identical emission for audited direct memory blocks. `Biased` places the
 complete guest mapping at a collision-selected high host bias and adds that
-bias only for instruction fetches and host memory accesses.
+bias only for instruction fetches and host memory accesses. Candidate selection
+reserves one contiguous `PROT_NONE` aperture from guest zero through the
+exclusive `LINUX_STACK_TOP` ceiling, plus a bounded 1 MiB crossing guard. Guest
+zero and every unmodeled gap therefore remain Carrick-owned guards rather than
+unowned host holes.
 
 Both modes keep the architectural contract in guest coordinates: PC, SP, LR,
 branch targets, register-held pointers, reported fault addresses, signal-frame
@@ -1373,6 +1377,20 @@ pointers, auxv and initial-stack pointers, `/proc` mappings, and diagnostics.
 Biased lowering is audited for scalar, pair, SIMD, atomic, exclusive, and
 literal memory families. An unsupported or ambiguous memory form fails with a
 typed diagnostic instead of executing an untranslated low address.
+
+Biased memory emission computes the exact guest effective address. A
+flags-neutral `LSR`/`CBZ` check preserves guest NZCV, and the normal sub-1-TiB
+path does not publish recovery state. The overflow guard covers the final
+ceiling-to-1-TiB sliver. A larger address publishes the guest address only on
+that invalid path and tags the host operand outside Darwin's user address
+range, preventing aliases with unrelated host mappings while preserving Linux
+`si_addr`. Direct emission remains unchanged.
+
+Exec preflight treats current Carrick-owned ranges as reusable authority when a
+replacement layout overlaps them. After the point of no return, retained biased
+ownership is restored to `PROT_NONE` guards before replacement subranges are
+mapped. This permits biased-to-biased reuse and direct/biased transitions
+without mistaking Carrick's current aperture for an external collision.
 
 The current signed binary executes the low-address static `devnullseek`
 `ET_EXEC` fixture with both expected markers and exit status zero. A separate
