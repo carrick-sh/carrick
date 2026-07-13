@@ -10,7 +10,7 @@
 mod address;
 mod dsr;
 
-use address::NativeAddressMode;
+use address::{NativeAddressMode, NativeLayout};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
@@ -5148,9 +5148,13 @@ fn emulate_linux4k_guarded_fault(
 }
 
 struct NativeMappedMemory {
-    // Task 1 establishes ownership; later biased-mapping tasks consume it.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Consumed by the biased runtime-boundary work in Task 3.
     address_mode: NativeAddressMode,
+    // Host-coordinate authority for fixed remaps and validated reverse faults.
+    // Direct mode intentionally has no recorded intervals: its legacy mapping
+    // behavior remains unchanged.
+    #[allow(dead_code)] // Consumed by the biased runtime-boundary work in Task 3.
+    owned_host_ranges: Vec<std::ops::Range<carrick_guest_mem::HostVa>>,
     regions: Vec<NativeMappedRegion>,
     protections: MemoryProtections,
     native_page_protections: BTreeMap<u64, u64>,
@@ -5300,10 +5304,17 @@ impl NativeMappedMemory {
                 region.start, region.end
             )));
         }
+        let native_layout = NativeLayout::for_image(image, layout, host_page_size)
+            .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
         native_exec_map_profile_start(exec_map_dsr_tid);
         let mut regions = Vec::new();
         for region in image.regions() {
-            map_region(region, exec_map_dsr_tid, image.initial_stack_pointer())?;
+            map_region(
+                region,
+                exec_map_dsr_tid,
+                image.initial_stack_pointer(),
+                &native_layout,
+            )?;
             if region.start == NATIVE_DARWIN_VDSO_BASE && region.perms.execute {
                 native_exec_map_detail(
                     exec_map_dsr_tid,
@@ -5339,6 +5350,7 @@ impl NativeMappedMemory {
             libc::PROT_READ | libc::PROT_EXEC,
             true,
             exec_map_dsr_tid,
+            &native_layout,
         )?;
         regions.push(NativeMappedRegion {
             start: NATIVE_DARWIN_SIGRETURN_TRAMPOLINE_BASE,
@@ -5356,7 +5368,7 @@ impl NativeMappedMemory {
             crate::probes::DsrCacheLifecyclePhase::ExecMapMmapBegin,
             layout.heap_size,
         );
-        map_anonymous_region(layout.heap_base, layout.heap_size, false)?;
+        map_anonymous_region(layout.heap_base, layout.heap_size, false, &native_layout)?;
         native_exec_map_detail(
             exec_map_dsr_tid,
             crate::probes::DsrCacheLifecyclePhase::ExecMapMmapEnd,
@@ -5377,7 +5389,7 @@ impl NativeMappedMemory {
             crate::probes::DsrCacheLifecyclePhase::ExecMapMmapBegin,
             layout.mmap_size,
         );
-        map_anonymous_region(layout.mmap_base, layout.mmap_size, false)?;
+        map_anonymous_region(layout.mmap_base, layout.mmap_size, false, &native_layout)?;
         native_exec_map_detail(
             exec_map_dsr_tid,
             crate::probes::DsrCacheLifecyclePhase::ExecMapMmapEnd,
@@ -5406,6 +5418,7 @@ impl NativeMappedMemory {
             crate::memory::LINUX_SHARED_FILE_BASE,
             crate::memory::LINUX_SHARED_FILE_SIZE,
             true,
+            &native_layout,
         )?;
         native_exec_map_detail(
             exec_map_dsr_tid,
@@ -5435,6 +5448,7 @@ impl NativeMappedMemory {
             crate::memory::LINUX_PRIVATE_OVERLAY_BASE,
             crate::memory::LINUX_PRIVATE_OVERLAY_SIZE,
             false,
+            &native_layout,
         )?;
         native_exec_map_detail(
             exec_map_dsr_tid,
@@ -5466,8 +5480,10 @@ impl NativeMappedMemory {
             })?;
             protections.set_no_write(span.start, len, true);
         }
+        let (address_mode, owned_host_ranges) = native_layout.commit();
         let memory = Self {
-            address_mode: NativeAddressMode::Direct,
+            address_mode,
+            owned_host_ranges,
             regions,
             protections,
             native_page_protections: BTreeMap::new(),
@@ -6471,6 +6487,23 @@ impl NativeMappedMemory {
         Ok(())
     }
 
+    fn fixed_mapping_target(
+        &self,
+        guest_start: u64,
+        length: usize,
+        flags: i32,
+    ) -> Result<(carrick_guest_mem::HostVa, i32), MemoryError> {
+        let host_start = self
+            .address_mode
+            .to_host(carrick_guest_mem::GuestVa(guest_start))
+            .map_err(|error| MemoryError::HostMap(error.to_string()))?;
+        let flags = self
+            .address_mode
+            .fixed_mapping_flags(&self.owned_host_ranges, host_start, length, flags)
+            .map_err(|error| MemoryError::HostMap(error.to_string()))?;
+        Ok((host_start, flags))
+    }
+
     fn remap_private(
         &mut self,
         address: u64,
@@ -6490,6 +6523,11 @@ impl NativeMappedMemory {
                 length: len,
             })?;
         let (page_start, page_len) = self.host_page_range(address, end)?;
+        let (host_start, flags) = self.fixed_mapping_target(
+            page_start,
+            page_len,
+            libc::MAP_ANON | libc::MAP_NORESERVE | libc::MAP_PRIVATE,
+        )?;
         let mut page = self.read_bytes_raw(page_start, page_len)?;
         let offset = usize::try_from(address.saturating_sub(page_start)).map_err(|_| {
             MemoryError::OutOfBounds {
@@ -6499,16 +6537,13 @@ impl NativeMappedMemory {
         })?;
         page[offset..offset + len].copy_from_slice(content);
 
-        let ptr = usize::try_from(page_start).map_err(|_| MemoryError::OutOfBounds {
-            address,
-            length: len,
-        })? as *mut libc::c_void;
+        let ptr = host_start.raw() as *mut libc::c_void;
         let mapped = unsafe {
             libc::mmap(
                 ptr,
                 page_len,
                 libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_ANON | libc::MAP_FIXED | libc::MAP_NORESERVE | libc::MAP_PRIVATE,
+                flags,
                 -1,
                 0,
             )
@@ -6558,26 +6593,16 @@ impl NativeMappedMemory {
                 "native Darwin alias too large: 0x{address:x}+0x{len:x}"
             ))
         })?;
-        let addr =
-            usize::try_from(if page_delta == 0 { address } else { page_start }).map_err(|_| {
-                RuntimeError::Unsupported(format!(
-                    "native Darwin alias start too large: 0x{address:x}"
-                ))
-            })? as *mut libc::c_void;
+        let guest_map_start = if page_delta == 0 { address } else { page_start };
 
         let (mmap_prot, final_prot, flags, fd, offset, direct_file) = match file {
-            Some((fd, offset, prot)) if page_delta == 0 => (
-                prot,
-                prot,
-                libc::MAP_SHARED | libc::MAP_FIXED,
-                fd,
-                offset,
-                true,
-            ),
+            Some((fd, offset, prot)) if page_delta == 0 => {
+                (prot, prot, libc::MAP_SHARED, fd, offset, true)
+            }
             Some((fd, offset, prot)) => (
                 libc::PROT_READ | libc::PROT_WRITE,
                 prot,
-                libc::MAP_ANON | libc::MAP_SHARED | libc::MAP_FIXED | libc::MAP_NORESERVE,
+                libc::MAP_ANON | libc::MAP_SHARED | libc::MAP_NORESERVE,
                 fd,
                 offset,
                 false,
@@ -6585,7 +6610,7 @@ impl NativeMappedMemory {
             None => (
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_ANON | libc::MAP_PRIVATE | libc::MAP_FIXED | libc::MAP_NORESERVE,
+                libc::MAP_ANON | libc::MAP_PRIVATE | libc::MAP_NORESERVE,
                 -1,
                 0,
                 false,
@@ -6599,6 +6624,17 @@ impl NativeMappedMemory {
         };
         let mmap_fd = if direct_file { fd } else { -1 };
         let mmap_offset = if direct_file { offset } else { 0 };
+        let (host_start, flags) =
+            match self.fixed_mapping_target(guest_map_start, host_map_len_usize, flags) {
+                Ok(target) => target,
+                Err(error) => {
+                    if file.is_some() {
+                        unsafe { libc::close(fd) };
+                    }
+                    return Err(RuntimeError::Unsupported(error.to_string()));
+                }
+            };
+        let addr = host_start.raw() as *mut libc::c_void;
         // File-identity futex key material (see `NativeMappedRegion`): only a
         // DIRECT host MAP_SHARED file mapping is physically coherent with an
         // independent mapping of the same file, so only it earns a file key.
@@ -7221,6 +7257,7 @@ fn map_region(
     region: &MemoryRegion,
     exec_map_dsr_tid: Option<crate::thread::ThreadId>,
     initial_stack_pointer: Option<u64>,
+    native_layout: &NativeLayout,
 ) -> Result<(), RuntimeError> {
     let length_u64 = region.end.checked_sub(region.start).ok_or_else(|| {
         RuntimeError::Unsupported("native Darwin empty inverted region".to_string())
@@ -7234,12 +7271,11 @@ fn map_region(
     if length == 0 {
         return Ok(());
     }
-    let addr = usize::try_from(region.start).map_err(|_| {
-        RuntimeError::Unsupported(format!(
-            "native Darwin region start too large: 0x{:x}",
-            region.start
-        ))
-    })? as *mut libc::c_void;
+    let host_start = native_layout
+        .address_mode()
+        .to_host(carrick_guest_mem::GuestVa(region.start))
+        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+    let addr = host_start.raw() as *mut libc::c_void;
     let share = if region.shared {
         libc::MAP_SHARED
     } else {
@@ -7250,12 +7286,19 @@ fn map_region(
         crate::probes::DsrCacheLifecyclePhase::ExecMapMmapBegin,
         length_u64,
     );
+    let flags = native_layout
+        .fixed_mapping_flags(
+            host_start,
+            length,
+            libc::MAP_ANON | libc::MAP_NORESERVE | share,
+        )
+        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
     let mapped = unsafe {
         libc::mmap(
             addr,
             length,
             libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_ANON | libc::MAP_FIXED | libc::MAP_NORESERVE | share,
+            flags,
             -1,
             0,
         )
@@ -7345,6 +7388,7 @@ fn map_bytes_region(
     final_prot: libc::c_int,
     executable: bool,
     exec_map_dsr_tid: Option<crate::thread::ThreadId>,
+    native_layout: &NativeLayout,
 ) -> Result<(), RuntimeError> {
     let length = usize::try_from(length_u64).map_err(|_| {
         RuntimeError::Unsupported(format!(
@@ -7360,22 +7404,29 @@ fn map_bytes_region(
             bytes.len()
         )));
     }
-    let addr = usize::try_from(start).map_err(|_| {
-        RuntimeError::Unsupported(format!(
-            "native Darwin byte region start too large: 0x{start:x}"
-        ))
-    })? as *mut libc::c_void;
+    let host_start = native_layout
+        .address_mode()
+        .to_host(carrick_guest_mem::GuestVa(start))
+        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+    let addr = host_start.raw() as *mut libc::c_void;
     native_exec_map_detail(
         exec_map_dsr_tid,
         crate::probes::DsrCacheLifecyclePhase::ExecMapMmapBegin,
         length_u64,
     );
+    let flags = native_layout
+        .fixed_mapping_flags(
+            host_start,
+            length,
+            libc::MAP_ANON | libc::MAP_NORESERVE | libc::MAP_PRIVATE,
+        )
+        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
     let mapped = unsafe {
         libc::mmap(
             addr,
             length,
             libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_ANON | libc::MAP_FIXED | libc::MAP_NORESERVE | libc::MAP_PRIVATE,
+            flags,
             -1,
             0,
         )
@@ -7447,7 +7498,12 @@ fn map_bytes_region(
     Ok(())
 }
 
-fn map_anonymous_region(start: u64, length: u64, shared: bool) -> Result<(), RuntimeError> {
+fn map_anonymous_region(
+    start: u64,
+    length: u64,
+    shared: bool,
+    native_layout: &NativeLayout,
+) -> Result<(), RuntimeError> {
     let length = usize::try_from(length).map_err(|_| {
         RuntimeError::Unsupported(format!(
             "native Darwin anonymous region too large: 0x{start:x}+0x{length:x}"
@@ -7456,22 +7512,29 @@ fn map_anonymous_region(start: u64, length: u64, shared: bool) -> Result<(), Run
     if length == 0 {
         return Ok(());
     }
-    let addr = usize::try_from(start).map_err(|_| {
-        RuntimeError::Unsupported(format!(
-            "native Darwin anonymous region start too large: 0x{start:x}"
-        ))
-    })? as *mut libc::c_void;
+    let host_start = native_layout
+        .address_mode()
+        .to_host(carrick_guest_mem::GuestVa(start))
+        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+    let addr = host_start.raw() as *mut libc::c_void;
     let share = if shared {
         libc::MAP_SHARED
     } else {
         libc::MAP_PRIVATE
     };
+    let flags = native_layout
+        .fixed_mapping_flags(
+            host_start,
+            length,
+            libc::MAP_ANON | libc::MAP_NORESERVE | share,
+        )
+        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
     let mapped = unsafe {
         libc::mmap(
             addr,
             length,
             libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_ANON | libc::MAP_FIXED | libc::MAP_NORESERVE | share,
+            flags,
             -1,
             0,
         )
@@ -8045,7 +8108,8 @@ mod tests {
             )],
         )
         .expect("build direct-entry image");
-        map_region(&image.regions()[0], None, None).expect("map DSR original code page");
+        map_region(&image.regions()[0], None, None, &NativeLayout::direct())
+            .expect("map DSR original code page");
 
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork direct-entry child");
@@ -8133,6 +8197,7 @@ mod tests {
         let stack_end = stack_start + stack.len() as u64;
         let mut memory = NativeMappedMemory {
             address_mode: NativeAddressMode::Direct,
+            owned_host_ranges: Vec::new(),
             regions: vec![NativeMappedRegion {
                 start: stack_start,
                 end: stack_end,
@@ -8264,6 +8329,7 @@ mod tests {
         let stack_end = stack_start + stack.len() as u64;
         let mut memory = NativeMappedMemory {
             address_mode: NativeAddressMode::Direct,
+            owned_host_ranges: Vec::new(),
             regions: vec![NativeMappedRegion {
                 start: stack_start,
                 end: stack_end,
@@ -8887,7 +8953,14 @@ mod tests {
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
         if pid == 0 {
-            let code = if map_anonymous_region(layout.mmap_base, layout.mmap_size, false).is_ok() {
+            let code = if map_anonymous_region(
+                layout.mmap_base,
+                layout.mmap_size,
+                false,
+                &NativeLayout::direct(),
+            )
+            .is_ok()
+            {
                 0
             } else {
                 1
@@ -8899,6 +8972,41 @@ mod tests {
         assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
         assert!(libc::WIFEXITED(status));
         assert_eq!(libc::WEXITSTATUS(status), 0);
+    }
+
+    #[test]
+    fn later_fixed_mapping_rejects_unowned_biased_host_range() {
+        let page_size = 16 * 1024;
+        let bias = address::NativeHostBias::new(0x80_0000_0000, page_size).expect("valid bias");
+        let owned_start = 0x80_0000_4000_usize;
+        let memory = NativeMappedMemory {
+            address_mode: NativeAddressMode::Biased { host_bias: bias },
+            owned_host_ranges: vec![
+                carrick_guest_mem::HostVa(owned_start)
+                    ..carrick_guest_mem::HostVa(owned_start + page_size as usize),
+            ],
+            regions: Vec::new(),
+            protections: MemoryProtections::default(),
+            native_page_protections: BTreeMap::new(),
+            native_write_exec_writable_pages: BTreeSet::new(),
+            linux4k_page_protections: BTreeMap::new(),
+            exclusive_reservation: None,
+            host_page_size: page_size,
+            linux_page_size: page_size,
+            dsr_generations: dsr::cache::PageGenerationTable::new(page_size)
+                .expect("generation table"),
+            dsr_translator: None,
+        };
+
+        assert!(
+            memory
+                .fixed_mapping_target(
+                    0x8000,
+                    page_size as usize,
+                    libc::MAP_ANON | libc::MAP_PRIVATE,
+                )
+                .is_err()
+        );
     }
 
     #[test]
@@ -9812,7 +9920,7 @@ mod tests {
             std::io::Error::last_os_error()
         );
         if outer == 0 {
-            let mapped = map_anonymous_region(start, len, shared).is_ok();
+            let mapped = map_anonymous_region(start, len, shared, &NativeLayout::direct()).is_ok();
             if !mapped {
                 unsafe { libc::_exit(2) };
             }
