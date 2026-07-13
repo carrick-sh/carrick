@@ -730,22 +730,19 @@ pub(super) fn classify(word: u32, pc: GuestVa) -> Result<InstAction, DsrError> {
             && (mentions_x18_outside_base || mentions_x28_outside_base)
         {
             let action = virtualized();
-            if memory.class == MemoryClass::Unsupported {
-                memory.virtualization = match action {
-                    InstAction::VirtualizedX18 { .. } => MemoryVirtualization::X18,
-                    InstAction::VirtualizedX28 { .. } => MemoryVirtualization::X28,
-                    InstAction::VirtualizedX18X28ReadOnly { .. } => {
-                        MemoryVirtualization::X18X28ReadOnly
-                    }
-                    InstAction::VirtualizedX18WriteX28Read { .. } => {
-                        MemoryVirtualization::X18WriteX28Read
-                    }
-                    InstAction::Unsupported { .. } => MemoryVirtualization::Unsupported,
-                    _ => MemoryVirtualization::None,
-                };
-                return Ok(InstAction::Memory(memory));
-            }
-            return Ok(action);
+            memory.virtualization = match action {
+                InstAction::VirtualizedX18 { .. } => MemoryVirtualization::X18,
+                InstAction::VirtualizedX28 { .. } => MemoryVirtualization::X28,
+                InstAction::VirtualizedX18X28ReadOnly { .. } => {
+                    MemoryVirtualization::X18X28ReadOnly
+                }
+                InstAction::VirtualizedX18WriteX28Read { .. } => {
+                    MemoryVirtualization::X18WriteX28Read
+                }
+                InstAction::Unsupported { .. } => MemoryVirtualization::Unsupported,
+                _ => MemoryVirtualization::None,
+            };
+            return Ok(InstAction::Memory(memory));
         }
         return Ok(InstAction::Memory(memory));
     }
@@ -935,15 +932,18 @@ mod tests {
     fn non_base_virtual_registers_keep_virtualization_precedence() {
         assert!(matches!(
             classify(0xf940_0012, PC), // ldr x18, [x0]
-            Ok(InstAction::VirtualizedX18 { .. })
+            Ok(InstAction::Memory(memory))
+                if memory.virtualization == MemoryVirtualization::X18
         ));
         assert!(matches!(
             classify(0xf940_0392, PC), // ldr x18, [x28]
-            Ok(InstAction::VirtualizedX18WriteX28Read { .. })
+            Ok(InstAction::Memory(memory))
+                if memory.virtualization == MemoryVirtualization::X18WriteX28Read
         ));
         assert!(matches!(
             classify(0x7940_0e52, PC), // ldrh w18, [x18, #6]
-            Ok(InstAction::VirtualizedX18 { .. })
+            Ok(InstAction::Memory(memory))
+                if memory.virtualization == MemoryVirtualization::X18
         ));
         assert!(matches!(
             classify(0x5800_0052, PC), // ldr x18, 0x4008

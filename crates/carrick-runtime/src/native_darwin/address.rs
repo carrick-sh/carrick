@@ -325,6 +325,10 @@ impl NativeHostBias {
         }
         Ok(Self(bias))
     }
+
+    pub(super) const fn get(self) -> u64 {
+        self.0
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -381,7 +385,7 @@ impl NativeAddressMode {
         Ok(self.to_guest(range.start)?..self.to_guest(range.end)?)
     }
 
-    fn bias(self) -> u64 {
+    pub(super) fn bias(self) -> u64 {
         match self {
             Self::Direct => 0,
             Self::Biased { host_bias } => host_bias.0,

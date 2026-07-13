@@ -55,6 +55,7 @@ struct carrick_native_dsr_signal_context {
     uint64_t indirect_x30_scratch;
     uint64_t cache_start;
     uint64_t cache_end;
+    uint64_t host_bias;
 };
 
 _Static_assert(offsetof(struct carrick_native_dsr_signal_context, host_sp) == 832,
@@ -79,6 +80,10 @@ _Static_assert(offsetof(struct carrick_native_dsr_signal_context, cache_start) =
                "DSR cache start offset");
 _Static_assert(offsetof(struct carrick_native_dsr_signal_context, cache_end) == 1184,
                "DSR cache end offset");
+_Static_assert(offsetof(struct carrick_native_dsr_signal_context, host_bias) == 1192,
+               "DSR host bias offset");
+_Static_assert(sizeof(struct carrick_native_dsr_signal_context) == 1200,
+               "DSR signal context size");
 
 struct carrick_native_kick_state {
     _Atomic uint64_t requested;
