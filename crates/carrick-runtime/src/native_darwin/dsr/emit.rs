@@ -1225,6 +1225,58 @@ fn emit_block_inner(
     for instruction in &plan.instructions {
         let word = match instruction.action {
             InstAction::Copy(word) => word,
+            // Task 4 only types audited memory operations. Direct register-
+            // based emission remains byte-identical; mode-specialized lowering
+            // is Task 5. Preserve the existing relocated-literal lowering.
+            InstAction::Memory(memory) => {
+                if memory.base == super::types::MemoryBase::VirtualX18 {
+                    emit_virtualized_register(
+                        &mut assembler,
+                        &mut entries,
+                        plan,
+                        instruction.guest,
+                        memory.word,
+                        18,
+                        144,
+                        &mut recovery,
+                    )?;
+                    continue;
+                }
+                if memory.base == super::types::MemoryBase::VirtualX28 {
+                    emit_virtualized_register(
+                        &mut assembler,
+                        &mut entries,
+                        plan,
+                        instruction.guest,
+                        memory.word,
+                        28,
+                        224,
+                        &mut recovery,
+                    )?;
+                    continue;
+                }
+                if let super::types::MemoryBase::Literal(target) = memory.base {
+                    emit_pc_relative_literal(
+                        &mut assembler,
+                        &mut entries,
+                        plan,
+                        instruction.guest,
+                        super::types::PcRelativeInst {
+                            kind: if memory.op == bad64::Op::PRFM {
+                                super::types::PcRelativeKind::LiteralPrefetch
+                            } else {
+                                super::types::PcRelativeKind::LiteralLoad
+                            },
+                            target,
+                            destination: None,
+                            word: memory.word,
+                        },
+                        &mut recovery,
+                    )?;
+                    continue;
+                }
+                memory.word
+            }
             InstAction::VirtualizedX18 { word, .. } => {
                 emit_virtualized_register(
                     &mut assembler,
@@ -1551,8 +1603,9 @@ fn emit_block_inner(
 mod tests {
     use super::super::block::{BlockLimit, PlannedInst};
     use super::super::types::{
-        CodeGeneration, DirectExit, DirectKind, IndirectExit, IndirectKind, PcRelativeInst,
-        PcRelativeKind, SensitiveExit, SensitiveKind,
+        CodeGeneration, DirectExit, DirectKind, IndirectExit, IndirectKind, MemoryAccess,
+        MemoryBase, MemoryClass, MemoryWriteback, PcRelativeInst, PcRelativeKind, SensitiveExit,
+        SensitiveKind,
     };
     use super::*;
 
@@ -1905,6 +1958,34 @@ mod tests {
                 Some(entry.guest)
             );
         }
+    }
+
+    #[test]
+    fn dsr_direct_memory_action_emits_the_original_word() {
+        let word = 0xf940_0020;
+        let plan = BlockPlan {
+            start: GuestVa(0x4000),
+            end: GuestVa(0x4008),
+            generation: CodeGeneration::INITIAL,
+            instructions: vec![PlannedInst {
+                guest: GuestVa(0x4000),
+                action: InstAction::Memory(MemoryAccess {
+                    word,
+                    op: bad64::Op::LDR,
+                    base: MemoryBase::Register(bad64::Reg::X1),
+                    writeback: MemoryWriteback::None,
+                    class: MemoryClass::Scalar,
+                }),
+            }],
+            exit: PlannedExit::Syscall {
+                guest: GuestVa(0x4004),
+                resume: GuestVa(0x4008),
+            },
+        };
+        let mut cache = TranslationCache::new(16 * 1024).expect("allocate translation cache");
+        let emitted = emit_block(&mut cache, &plan).expect("emit direct memory block");
+        let pointer = (emitted.entry().host().raw() + 8) as *const u32;
+        assert_eq!(unsafe { std::ptr::read_unaligned(pointer) }, word);
     }
 
     #[test]

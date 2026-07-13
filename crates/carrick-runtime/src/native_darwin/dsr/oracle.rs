@@ -205,12 +205,14 @@ fn dsr_pc_relative_literals_cover_integer_simd_prefetch_and_virtual_x18() {
             guest: GuestVa(0x6000 + index as u64 * 4),
             action: super::decode::classify(word, GuestVa(0x6000 + index as u64 * 4))
                 .and_then(|action| match action {
-                    InstAction::PcRelative(mut relative) => {
-                        relative.target = GuestVa(target);
-                        Ok(InstAction::PcRelative(relative))
+                    InstAction::Memory(mut memory)
+                        if memory.class == super::types::MemoryClass::Literal =>
+                    {
+                        memory.base = super::types::MemoryBase::Literal(GuestVa(target));
+                        Ok(InstAction::Memory(memory))
                     }
                     _ => Err(DsrError::BlockPolicy(format!(
-                        "literal test word 0x{word:08x} did not classify as PC-relative"
+                        "literal test word 0x{word:08x} did not classify as memory"
                     ))),
                 })
                 .expect("classify literal test instruction"),
