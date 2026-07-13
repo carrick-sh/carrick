@@ -232,7 +232,8 @@ impl Aarch64Vcpu for HvfAarch64Vcpu {
     }
 
     fn complete_syscall_return(&mut self, return_value: i64) -> Result<(), TrapError> {
-        match self.mailbox.transport() {
+        let transport = self.mailbox.transport();
+        let result = match transport {
             HvfSyscallTransport::Mailbox => {
                 self.mailbox
                     .publish_normal_return(return_value)
@@ -254,7 +255,18 @@ impl Aarch64Vcpu for HvfAarch64Vcpu {
                         ))
                     })
             }
+        };
+        if result.is_ok() {
+            crate::probes::hvf_syscall_transport(
+                transport.raw(),
+                1,
+                self.mailbox.sequence(),
+                0,
+                0,
+                u32::from(transport == HvfSyscallTransport::Legacy),
+            );
         }
+        result
     }
 
     fn prepare_register_resume(&mut self) -> Result<(), TrapError> {

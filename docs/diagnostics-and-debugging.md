@@ -166,6 +166,21 @@ commit only for a child that exits non-zero without exec'ing), and the
 fork/futex/job-control families. Writing a focused script is almost always
 faster than reading the full stream.
 
+For HVF syscall-transport attribution, the maintained
+[`hvf-syscall-transport.d`](../scripts/dtrace/hvf-syscall-transport.d) consumer
+counts the actual register API operations at request decode and ordinary return
+publication:
+
+```sh
+CARRICK_HVF_SYSCALL_TRANSPORT=mailbox target/release/carrick trace \
+  -s scripts/dtrace/hvf-syscall-transport.d -- \
+  run-elf --exec-backend vmm <native-pie-probe>
+```
+
+Transport `0` is legacy and `1` is mailbox; phase `0` is decode and phase `1`
+is return publication. An ordinary mailbox boundary should report zero register
+reads, sysreg reads, and register writes in both phases.
+
 ---
 
 ## 2. The event ring + lldb (zero-perturbation)

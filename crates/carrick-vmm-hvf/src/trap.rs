@@ -5526,23 +5526,39 @@ impl HvfInner {
             // deliberately reads the live registers for an apples-to-apples
             // transport comparison. A direct SVC exit (no EL1 HVC vehicle) keeps
             // the historical register decode as a defensive compatibility path.
-            let legacy_decode = || {
+            let mut register_reads = 0u32;
+            let mut sysreg_reads = 0u32;
+            let mut legacy_decode = || {
+                sysreg_reads += 1;
                 let resume_pc = vcpu.get_sys_reg(SysReg::ELR_EL1).map_err(|error| {
                     crate::syscall_mailbox::MailboxConsumeError::Legacy(error.to_string())
                 })?;
-                let frame = carrick_hal::read_aarch64_syscall_frame(|r| hvf_get_reg(vcpu, r))
-                    .map_err(|error| {
-                        crate::syscall_mailbox::MailboxConsumeError::Legacy(error.to_string())
-                    })?;
+                let frame = carrick_hal::read_aarch64_syscall_frame(|r| {
+                    register_reads += 1;
+                    hvf_get_reg(vcpu, r)
+                })
+                .map_err(|error| {
+                    crate::syscall_mailbox::MailboxConsumeError::Legacy(error.to_string())
+                })?;
+                sysreg_reads += 1;
+                let spsr = vcpu.get_sys_reg(SysReg::SPSR_EL1).unwrap_or(0);
+                register_reads += 1;
+                let fp = vcpu.get_reg(Reg::X29).unwrap_or(0);
+                register_reads += 1;
+                let lr = vcpu.get_reg(Reg::LR).unwrap_or(0);
+                sysreg_reads += 1;
+                let sp = vcpu.get_sys_reg(SysReg::SP_EL0).unwrap_or(0);
+                sysreg_reads += 1;
+                let esr = vcpu.get_sys_reg(SysReg::ESR_EL1).unwrap_or(0);
                 Ok(crate::syscall_mailbox::MailboxRequest {
                     native_nr: frame.x8,
                     frame,
                     resume_pc,
-                    spsr: vcpu.get_sys_reg(SysReg::SPSR_EL1).unwrap_or(0),
-                    fp: vcpu.get_reg(Reg::X29).unwrap_or(0),
-                    lr: vcpu.get_reg(Reg::LR).unwrap_or(0),
-                    sp: vcpu.get_sys_reg(SysReg::SP_EL0).unwrap_or(0),
-                    esr: vcpu.get_sys_reg(SysReg::ESR_EL1).unwrap_or(0),
+                    spsr,
+                    fp,
+                    lr,
+                    sp,
+                    esr,
                 })
             };
             let request = if is_aarch64_hvc_exception(exception.syndrome) {
@@ -5554,6 +5570,14 @@ impl HvfInner {
                 let pc = vcpu.get_reg(Reg::PC).unwrap_or(0);
                 TrapError::Hypervisor(format!("{error}; vcpu_pc={pc:#x}"))
             })?;
+            crate::probes::hvf_syscall_transport(
+                mailbox.transport().raw(),
+                0,
+                mailbox.sequence(),
+                register_reads,
+                sysreg_reads,
+                0,
+            );
             let frame = request.frame;
             let resume_pc = request.resume_pc;
             // vcpu_trap probe parity: guest PC at the trap (= ELR_EL1) + the live
