@@ -5,8 +5,8 @@ use carrick_guest_mem::GuestVa;
 
 use super::types::{
     DirectExit, DirectKind, DsrError, IndirectExit, IndirectKind, InstAction, MemoryAccess,
-    MemoryBase, MemoryClass, MemoryWriteback, PcRelativeInst, PcRelativeKind, SensitiveExit,
-    SensitiveKind,
+    MemoryBase, MemoryClass, MemoryVirtualization, MemoryWriteback, PcRelativeInst, PcRelativeKind,
+    SensitiveExit, SensitiveKind,
 };
 
 fn resume_pc(pc: GuestVa) -> Result<GuestVa, DsrError> {
@@ -211,7 +211,53 @@ fn has_standard_simd_transfer(operands: &[Operand]) -> bool {
     })
 }
 
+fn is_scalable_or_matrix_register(register: Reg) -> bool {
+    register.is_sve() || register.is_pred() || register == Reg::ZT0
+}
+
+fn has_scalable_or_matrix_shape(operands: &[Operand]) -> bool {
+    operands.iter().any(|operand| match operand {
+        Operand::ShiftReg { reg, .. }
+        | Operand::QualReg { reg, .. }
+        | Operand::Reg { reg, .. }
+        | Operand::MemReg(reg) => is_scalable_or_matrix_register(*reg),
+        Operand::MultiReg { regs, .. } => regs
+            .iter()
+            .flatten()
+            .copied()
+            .any(is_scalable_or_matrix_register),
+        Operand::MemOffset {
+            reg,
+            mul_vl,
+            arrspec,
+            ..
+        } => *mul_vl || arrspec.is_some() || is_scalable_or_matrix_register(*reg),
+        Operand::MemExt { regs, arrspec, .. } => {
+            arrspec.is_some() || regs.iter().copied().any(is_scalable_or_matrix_register)
+        }
+        Operand::MemPostIdxReg(regs) | Operand::IndexedElement { regs, .. } => {
+            regs.iter().copied().any(is_scalable_or_matrix_register)
+        }
+        Operand::MemPreIdx { reg, .. } | Operand::MemPostIdxImm { reg, .. } => {
+            is_scalable_or_matrix_register(*reg)
+        }
+        Operand::SmeTile { .. } | Operand::AccumArray { .. } => true,
+        Operand::Imm32 { .. }
+        | Operand::Imm64 { .. }
+        | Operand::FImm32(_)
+        | Operand::SysReg(_)
+        | Operand::Label(_)
+        | Operand::ImplSpec { .. }
+        | Operand::Cond(_)
+        | Operand::Name(_)
+        | Operand::StrImm { .. } => false,
+    })
+}
+
 fn memory_class(op: Op, operands: &[Operand]) -> Option<MemoryClass> {
+    if has_scalable_or_matrix_shape(operands) && has_memory_operand(operands) {
+        return Some(MemoryClass::Unsupported);
+    }
     if label(operands).is_some() {
         return matches!(op, Op::LDR | Op::LDRSW | Op::PRFM).then_some(MemoryClass::Literal);
     }
@@ -510,6 +556,7 @@ fn classify_memory(
         base,
         writeback,
         class,
+        virtualization: MemoryVirtualization::None,
     }))
 }
 
@@ -678,11 +725,27 @@ pub(super) fn classify(word: u32, pc: GuestVa) -> Result<InstAction, DsrError> {
         }
     };
 
-    if let Some(memory) = classify_memory(pc, word, op, operands)? {
+    if let Some(mut memory) = classify_memory(pc, word, op, operands)? {
         if memory.class != MemoryClass::Literal
             && (mentions_x18_outside_base || mentions_x28_outside_base)
         {
-            return Ok(virtualized());
+            let action = virtualized();
+            if memory.class == MemoryClass::Unsupported {
+                memory.virtualization = match action {
+                    InstAction::VirtualizedX18 { .. } => MemoryVirtualization::X18,
+                    InstAction::VirtualizedX28 { .. } => MemoryVirtualization::X28,
+                    InstAction::VirtualizedX18X28ReadOnly { .. } => {
+                        MemoryVirtualization::X18X28ReadOnly
+                    }
+                    InstAction::VirtualizedX18WriteX28Read { .. } => {
+                        MemoryVirtualization::X18WriteX28Read
+                    }
+                    InstAction::Unsupported { .. } => MemoryVirtualization::Unsupported,
+                    _ => MemoryVirtualization::None,
+                };
+                return Ok(InstAction::Memory(memory));
+            }
+            return Ok(action);
         }
         return Ok(InstAction::Memory(memory));
     }
@@ -792,7 +855,9 @@ pub(super) fn classify(word: u32, pc: GuestVa) -> Result<InstAction, DsrError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::native_darwin::dsr::types::{MemoryBase, MemoryClass, MemoryWriteback};
+    use crate::native_darwin::dsr::types::{
+        MemoryBase, MemoryClass, MemoryVirtualization, MemoryWriteback,
+    };
 
     const PC: GuestVa = GuestVa(0x4000);
 
@@ -933,5 +998,79 @@ mod tests {
             .expect("retain unaudited memory family");
         assert_eq!(memory.class, MemoryClass::Unsupported);
         assert_eq!(memory.base, MemoryBase::Register(Reg::X1));
+    }
+
+    fn assert_unsupported_memory(word: u32) {
+        let instruction = bad64::decode(word, PC.raw()).expect("decode unsupported fixture");
+        let InstAction::Memory(memory) = classify(word, PC).expect("classify unsupported memory")
+        else {
+            panic!("0x{word:08x} was not retained as typed memory: {instruction}");
+        };
+        assert_eq!(
+            memory.class,
+            MemoryClass::Unsupported,
+            "0x{word:08x}: {instruction:?}"
+        );
+    }
+
+    #[test]
+    fn sve_memory_is_not_standard_simd_or_scalar() {
+        let word = 0x8598_5f6f;
+        let instruction = bad64::decode(word, PC.raw()).expect("decode SVE fixture");
+        assert!(matches!(
+            instruction.operands(),
+            [
+                Operand::Reg { reg: Reg::Z15, .. },
+                Operand::MemOffset {
+                    reg: Reg::X27,
+                    mul_vl: true,
+                    ..
+                }
+            ]
+        ));
+        assert_unsupported_memory(word);
+    }
+
+    #[test]
+    fn sme_memory_is_not_standard_simd_or_scalar() {
+        // bad64 exposes the ZA slice as `AccumArray` and the address as
+        // `MemOffset { mul_vl: true, .. }`.
+        let word = 0xe100_004d;
+        let instruction = bad64::decode(word, PC.raw()).expect("decode SME fixture");
+        assert!(matches!(
+            instruction.operands(),
+            [
+                Operand::AccumArray { .. },
+                Operand::MemOffset {
+                    reg: Reg::X2,
+                    mul_vl: true,
+                    ..
+                }
+            ]
+        ));
+        assert_unsupported_memory(word);
+    }
+
+    #[test]
+    fn unsupported_memory_retains_non_base_virtualization() {
+        let cases = [
+            (0xa452_48af, Reg::X18, MemoryVirtualization::X18),
+            (0xa45c_48af, Reg::X28, MemoryVirtualization::X28),
+        ];
+        for (word, index, virtualization) in cases {
+            let instruction =
+                bad64::decode(word, PC.raw()).expect("decode SVE virtual-index fixture");
+            assert!(instruction.operands().iter().any(|operand| matches!(
+                operand,
+                Operand::MemExt { regs: [Reg::X5, observed], .. } if *observed == index
+            )));
+            let InstAction::Memory(memory) =
+                classify(word, PC).expect("classify SVE virtual-index memory")
+            else {
+                panic!("0x{word:08x} lost typed memory identity: {instruction}");
+            };
+            assert_eq!(memory.class, MemoryClass::Unsupported);
+            assert_eq!(memory.virtualization, virtualization);
+        }
     }
 }

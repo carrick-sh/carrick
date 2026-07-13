@@ -321,4 +321,20 @@ mod tests {
             }
         ));
     }
+
+    #[test]
+    fn dsr_block_retains_unsupported_virtualized_memory_actions() {
+        let start = GuestVa(0x9000);
+        let (plan, reads) = plan_words(&[0xa452_48af], start, 0x1000, 1);
+        assert_eq!(reads, 1);
+        assert!(matches!(
+            plan.instructions.as_slice(),
+            [PlannedInst {
+                action: InstAction::Memory(memory),
+                ..
+            }] if memory.class == super::super::types::MemoryClass::Unsupported
+                && memory.virtualization
+                    == super::super::types::MemoryVirtualization::X18
+        ));
+    }
 }

@@ -1229,6 +1229,67 @@ fn emit_block_inner(
             // based emission remains byte-identical; mode-specialized lowering
             // is Task 5. Preserve the existing relocated-literal lowering.
             InstAction::Memory(memory) => {
+                match memory.virtualization {
+                    super::types::MemoryVirtualization::None => {}
+                    super::types::MemoryVirtualization::X18 => {
+                        emit_virtualized_register(
+                            &mut assembler,
+                            &mut entries,
+                            plan,
+                            instruction.guest,
+                            memory.word,
+                            18,
+                            144,
+                            &mut recovery,
+                        )?;
+                        continue;
+                    }
+                    super::types::MemoryVirtualization::X28 => {
+                        emit_virtualized_register(
+                            &mut assembler,
+                            &mut entries,
+                            plan,
+                            instruction.guest,
+                            memory.word,
+                            28,
+                            224,
+                            &mut recovery,
+                        )?;
+                        continue;
+                    }
+                    super::types::MemoryVirtualization::X18X28ReadOnly => {
+                        emit_dual_virtual(
+                            &mut assembler,
+                            &mut entries,
+                            plan,
+                            instruction.guest,
+                            memory.word,
+                            None,
+                            &mut recovery,
+                        )?;
+                        continue;
+                    }
+                    super::types::MemoryVirtualization::X18WriteX28Read => {
+                        emit_dual_virtual(
+                            &mut assembler,
+                            &mut entries,
+                            plan,
+                            instruction.guest,
+                            memory.word,
+                            Some(18),
+                            &mut recovery,
+                        )?;
+                        continue;
+                    }
+                    super::types::MemoryVirtualization::Unsupported => {
+                        return Err(unsupported_action(
+                            plan,
+                            instruction.guest,
+                            memory.word,
+                            "unsupported memory virtualization",
+                        ));
+                    }
+                }
                 if memory.base == super::types::MemoryBase::VirtualX18 {
                     emit_virtualized_register(
                         &mut assembler,
@@ -1975,6 +2036,7 @@ mod tests {
                     base: MemoryBase::Register(bad64::Reg::X1),
                     writeback: MemoryWriteback::None,
                     class: MemoryClass::Scalar,
+                    virtualization: super::super::types::MemoryVirtualization::None,
                 }),
             }],
             exit: PlannedExit::Syscall {
@@ -1986,6 +2048,63 @@ mod tests {
         let emitted = emit_block(&mut cache, &plan).expect("emit direct memory block");
         let pointer = (emitted.entry().host().raw() + 8) as *const u32;
         assert_eq!(unsafe { std::ptr::read_unaligned(pointer) }, word);
+    }
+
+    #[test]
+    fn dsr_direct_unsupported_memory_action_emits_the_original_word() {
+        let word = 0x8598_5f6f;
+        let action = super::super::decode::classify(word, GuestVa(0x4000))
+            .expect("classify direct SVE memory");
+        assert!(matches!(
+            action,
+            InstAction::Memory(memory) if memory.class == MemoryClass::Unsupported
+        ));
+        let plan = BlockPlan {
+            start: GuestVa(0x4000),
+            end: GuestVa(0x4008),
+            generation: CodeGeneration::INITIAL,
+            instructions: vec![PlannedInst {
+                guest: GuestVa(0x4000),
+                action,
+            }],
+            exit: PlannedExit::Syscall {
+                guest: GuestVa(0x4004),
+                resume: GuestVa(0x4008),
+            },
+        };
+        let mut cache = TranslationCache::new(16 * 1024).expect("allocate translation cache");
+        let emitted = emit_block(&mut cache, &plan).expect("emit direct SVE memory block");
+        let pointer = (emitted.entry().host().raw() + 8) as *const u32;
+        assert_eq!(unsafe { std::ptr::read_unaligned(pointer) }, word);
+    }
+
+    #[test]
+    fn dsr_direct_unsupported_memory_keeps_virtual_index_rewrite() {
+        let word = 0xa452_48af;
+        let action = super::super::decode::classify(word, GuestVa(0x4000))
+            .expect("classify direct SVE x18-index memory");
+        assert!(matches!(
+            action,
+            InstAction::Memory(memory)
+                if memory.class == MemoryClass::Unsupported
+                    && memory.virtualization
+                        == super::super::types::MemoryVirtualization::X18
+        ));
+        let plan = BlockPlan {
+            start: GuestVa(0x4000),
+            end: GuestVa(0x4008),
+            generation: CodeGeneration::INITIAL,
+            instructions: vec![PlannedInst {
+                guest: GuestVa(0x4000),
+                action,
+            }],
+            exit: PlannedExit::Syscall {
+                guest: GuestVa(0x4004),
+                resume: GuestVa(0x4008),
+            },
+        };
+        let mut cache = TranslationCache::new(16 * 1024).expect("allocate translation cache");
+        emit_block(&mut cache, &plan).expect("emit direct SVE x18-index memory block");
     }
 
     #[test]
