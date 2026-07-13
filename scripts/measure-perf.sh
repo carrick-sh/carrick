@@ -56,7 +56,7 @@ if [[ "$mode" == "backends" ]]; then
   exit 0
 fi
 if [[ "$mode" == "hvf-mailbox" ]]; then
-  if ps -axo command= | grep -E 'carrick:[^:]+:' | grep -v grep >/dev/null; then
+  if ps -axo command= | grep -E 'carrick:[^:]+:|(^|[ /])target/release/carrick (run|run-elf|trace)( |$)' | grep -v grep >/dev/null; then
     echo "active carrick guest detected; refusing to contaminate mailbox campaign" >&2
     exit 1
   fi
@@ -71,7 +71,7 @@ if [[ "$mode" == "hvf-mailbox" ]]; then
   run_id="mailbox-perf-$$"
   export CARRICK_HVF_MAILBOX_RUN_ID="$run_id"
   export CARRICK_HVF_MAILBOX_REPORT="${CARRICK_HVF_MAILBOX_REPORT:-docs/perf-results/$(date +%F)-hvf-syscall-mailbox.jsonl}"
-  cleanup() { sudo -n "$PWD/scripts/sudo/kill.sh" "$run_id"; }
+  cleanup() { "$PWD/scripts/sudo/kill.sh" "$run_id"; }
   trap cleanup EXIT INT TERM
   echo "==> power state"
   pmset -g batt
