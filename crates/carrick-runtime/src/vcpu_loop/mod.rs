@@ -362,17 +362,13 @@ pub(crate) use quiesce::{fork_barrier, pt_barrier};
 // The threaded loop owns its backend-specific fault resolution. Native Darwin
 // reuses the architecture lowering and Linux signal-frame half below.
 use signal::deliver_fault_signal;
-pub(crate) use signal::{
-    FaultSignalDisposition, deliver_pending_signal, inject_fault_signal, lower_el0_fault,
-    partial_write_interrupt_outcome, raise_sigpipe_for_blocking_write, signal_progress_count,
-    signal_wait_expired, signal_wait_remaining, signal_wait_slice, upgrade_protection_si_code,
-};
-// Test-only re-exports: the `tests` module below names these (via `use super::*`)
-// but no non-test in-crate caller does, so gate them to avoid an unused-import
-// warning on the normal build.
-#[cfg(test)]
-pub(super) use signal::el0_debug_signal;
 pub(crate) use signal::is_default_ignore_signal;
+pub(crate) use signal::{
+    FaultSignalDisposition, deliver_pending_signal, el0_debug_signal, inject_fault_signal,
+    lower_el0_fault, partial_write_interrupt_outcome, raise_sigpipe_for_blocking_write,
+    signal_progress_count, signal_wait_expired, signal_wait_remaining, signal_wait_slice,
+    upgrade_protection_si_code,
+};
 
 // ===================================================================
 // Cross-platform kernel-half state.

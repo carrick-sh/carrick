@@ -1281,7 +1281,7 @@ fn run_native_dsr_thread_loop(
                     thread_runtime.tid(),
                     thread_runtime.registry.live_count(),
                     kind,
-                    address.raw(),
+                    address,
                 )?;
                 continue;
             }
@@ -1743,28 +1743,17 @@ fn lower_dsr_fault(
     tid: crate::thread::ThreadId,
     live_threads: usize,
     fault: dsr::ThreadFault,
-    fault_address: u64,
+    fault_address: dsr::ThreadFaultAddress,
 ) -> Result<NativeUcontextSnapshot, RuntimeError> {
-    let biased_host_fault = matches!(fault, dsr::ThreadFault::Host { .. })
+    let host_fault = matches!(fault_address, dsr::ThreadFaultAddress::Host(_));
+    let biased_host_fault = host_fault
         && matches!(
             memory.lock().address_mode(),
             NativeAddressMode::Biased { .. }
         );
-    let fault_address = if biased_host_fault {
+    let fault_address = lower_dsr_fault_address(&memory.lock(), fault_address)?.raw();
+    if biased_host_fault {
         let memory = memory.lock();
-        let guest = memory
-            .guest_fault_address(carrick_guest_mem::HostVa(
-                usize::try_from(fault_address).map_err(|_| {
-                    RuntimeError::Unsupported(format!(
-                        "native DSR host fault address does not fit the host VA domain: 0x{fault_address:x}"
-                    ))
-                })?,
-            ))
-            .ok_or_else(|| {
-                RuntimeError::Unsupported(format!(
-                    "native DSR fault lies outside guest-owned host memory: 0x{fault_address:x}"
-                ))
-            })?;
         if snapshot.far != 0 {
             let far = usize::try_from(snapshot.far)
                 .ok()
@@ -1791,10 +1780,7 @@ fn lower_dsr_fault(
                 })?
                 .raw();
         }
-        guest.raw()
-    } else {
-        fault_address
-    };
+    }
     if matches!(fault, dsr::ThreadFault::Host { .. })
         && let Some((page, prot)) = dispatcher.resident_fault_plan(fault_address)
     {
@@ -1880,6 +1866,26 @@ fn lower_dsr_fault(
         crate::vcpu_loop::FaultSignalDisposition::Terminate(signum) => {
             native_die_by_signal(dispatcher, signum)
         }
+    }
+}
+
+fn lower_dsr_fault_address(
+    memory: &NativeMappedMemory,
+    address: dsr::ThreadFaultAddress,
+) -> Result<carrick_guest_mem::GuestVa, RuntimeError> {
+    match address {
+        dsr::ThreadFaultAddress::Guest(address) => Ok(address),
+        dsr::ThreadFaultAddress::Host(address) => match memory.address_mode() {
+            NativeAddressMode::Direct => Ok(carrick_guest_mem::GuestVa(address.raw() as u64)),
+            NativeAddressMode::Biased { .. } => {
+                memory.guest_fault_address(address).ok_or_else(|| {
+                    RuntimeError::Unsupported(format!(
+                        "native DSR fault lies outside guest-owned host memory: 0x{:x}",
+                        address.raw()
+                    ))
+                })
+            }
+        },
     }
 }
 
@@ -7875,6 +7881,40 @@ mod tests {
         let memory = biased_test_memory(carrick_guest_mem::GuestVa(0x40_0000), 0x4000);
         let host = carrick_guest_mem::HostVa((&memory as *const _) as usize);
         assert_eq!(memory.guest_fault_address(host), None);
+        let owned = &memory.owned_host_ranges[0];
+        assert_eq!(
+            unsafe { libc::munmap(owned.start.raw() as *mut libc::c_void, 0x4000) },
+            0
+        );
+    }
+
+    #[test]
+    fn biased_memory_translates_host_fault_address_once() {
+        let memory = biased_test_memory(carrick_guest_mem::GuestVa(0x40_0000), 0x4000);
+        let host = memory
+            .host_address(carrick_guest_mem::GuestVa(0x40_0080))
+            .expect("translate test fault to host");
+        assert_eq!(
+            lower_dsr_fault_address(&memory, dsr::ThreadFaultAddress::Host(host))
+                .expect("lower owned host fault"),
+            carrick_guest_mem::GuestVa(0x40_0080)
+        );
+        let owned = &memory.owned_host_ranges[0];
+        assert_eq!(
+            unsafe { libc::munmap(owned.start.raw() as *mut libc::c_void, 0x4000) },
+            0
+        );
+    }
+
+    #[test]
+    fn biased_memory_preserves_synthetic_guest_brk_address() {
+        let memory = biased_test_memory(carrick_guest_mem::GuestVa(0x40_0000), 0x4000);
+        let guest_pc = carrick_guest_mem::GuestVa(0x40_0080);
+        assert_eq!(
+            lower_dsr_fault_address(&memory, dsr::ThreadFaultAddress::Guest(guest_pc))
+                .expect("preserve synthetic guest BRK address"),
+            guest_pc
+        );
         let owned = &memory.owned_host_ranges[0];
         assert_eq!(
             unsafe { libc::munmap(owned.start.raw() as *mut libc::c_void, 0x4000) },

@@ -363,7 +363,14 @@ fn enter_translated_raw(
             guest_pc: carrick_guest_mem::GuestVa(context.exit_target),
             signal: context.snapshot.signal,
             code: context.snapshot.signal_code,
-            address: carrick_guest_mem::GuestVa(context.snapshot.fault_address),
+            address: carrick_guest_mem::HostVa(
+                usize::try_from(context.snapshot.fault_address).map_err(|_| {
+                    DsrError::Gateway(format!(
+                        "host fault address does not fit HostVa: 0x{:x}",
+                        context.snapshot.fault_address
+                    ))
+                })?,
+            ),
             rewrite_scratch: context.rewrite_scratch,
             rewrite_context_scratch: context.rewrite_context_scratch,
             generation_pstate_scratch: context.generation_pstate_scratch,
