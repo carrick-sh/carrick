@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-13
 
-**Status:** approved
+**Status:** implemented; mailbox rejected as production default by the frozen gate
 
 **Scope:** container execution policy plus the macOS/HVF/AArch64 syscall boundary
 
@@ -20,6 +20,17 @@ This design does not make DSR a speculative tier in front of HVF. A DSR gap is
 a native-backend correctness or coverage problem, not an automatic request for
 a scarce VM. A container chooses one execution model and keeps it for its
 entire lifetime.
+
+## Measured outcome
+
+The execution-policy portion shipped as designed: native is the default and
+`--exec-backend vmm` is explicit, portable, and container-immutable. The HVF
+mailbox implementation passed its correctness gates and removed ordinary
+register API traffic, but the clean full ABBA campaign measured a trap-floor
+ratio of exactly `1.000 [1.000, 1.000]`, below the required 10% win. The
+production VMM path therefore remains on the legacy register transport;
+mailbox is retained only behind the private explicit diagnostic selector. See
+[`docs/2026-07-13-hvf-syscall-mailbox-performance.md`](../../2026-07-13-hvf-syscall-mailbox-performance.md).
 
 ## Fixed decisions
 
