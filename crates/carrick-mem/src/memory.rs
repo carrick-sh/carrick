@@ -206,6 +206,7 @@ pub const AARCH64_SYSCALL_MAILBOX_OFF_STATE: u64 = 32;
 pub const AARCH64_SYSCALL_MAILBOX_OFF_TRAP_KIND: u64 = 36;
 pub const AARCH64_SYSCALL_MAILBOX_OFF_RESPONSE_ACTION: u64 = 40;
 pub const AARCH64_SYSCALL_MAILBOX_OFF_FLAGS: u64 = 44;
+pub const AARCH64_SYSCALL_MAILBOX_OFF_NATIVE_NR: u64 = 48;
 pub const AARCH64_SYSCALL_MAILBOX_OFF_ARGS: u64 = 56;
 pub const AARCH64_SYSCALL_MAILBOX_OFF_X8: u64 = 104;
 pub const AARCH64_SYSCALL_MAILBOX_OFF_RESUME_PC: u64 = 112;
@@ -217,7 +218,7 @@ pub const AARCH64_SYSCALL_MAILBOX_OFF_ESR: u64 = 152;
 pub const AARCH64_SYSCALL_MAILBOX_OFF_RETURN_VALUE: u64 = 160;
 pub const AARCH64_SYSCALL_MAILBOX_OFF_RESUME_X16: u64 = 168;
 pub const AARCH64_SYSCALL_MAILBOX_OFF_RESUME_X17: u64 = 176;
-const _: () = assert!(LINUX_SYSCALL_MAILBOX_BASE % 0x4000 == 0);
+const _: () = assert!(LINUX_SYSCALL_MAILBOX_BASE.is_multiple_of(0x4000));
 const _: () = assert!(
     LINUX_SYSCALL_MAILBOX_SLOT_SIZE * LINUX_SYSCALL_MAILBOX_SLOTS as u64
         == LINUX_SYSCALL_MAILBOX_ARENA_SIZE
@@ -2751,6 +2752,11 @@ pub fn el1_vectors_bytes_mailbox(identity_fast_path: bool) -> Vec<u8> {
     emit(
         &mut bytes,
         &mut cursor,
+        enc_str_xt_sp(8, AARCH64_SYSCALL_MAILBOX_OFF_NATIVE_NR),
+    );
+    emit(
+        &mut bytes,
+        &mut cursor,
         enc_str_xt_sp(29, AARCH64_SYSCALL_MAILBOX_OFF_FP),
     );
     emit(
@@ -3914,7 +3920,7 @@ mod syscall_mailbox_tests {
 
     #[test]
     fn mailbox_arena_tiles_the_remaining_kernel_hole() {
-        assert_eq!(LINUX_SYSCALL_MAILBOX_BASE % 0x4000, 0);
+        assert!(LINUX_SYSCALL_MAILBOX_BASE.is_multiple_of(0x4000));
         assert_eq!(LINUX_SYSCALL_MAILBOX_ARENA_SIZE, 0x1_0000);
         assert_eq!(
             LINUX_SYSCALL_MAILBOX_ARENA_SIZE,
@@ -3995,6 +4001,7 @@ mod syscall_mailbox_tests {
             (3, 80),
             (4, 88),
             (5, 96),
+            (8, 48),
             (8, 104),
             (29, 128),
             (30, 136),
