@@ -107,6 +107,17 @@ fn git_dirty(root: &Path) -> bool {
         .unwrap_or(true)
 }
 
+fn command_fact(program: &str, arguments: &[&str], stderr: bool) -> Option<String> {
+    let output = Command::new(program).args(arguments).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let bytes = if stderr { output.stderr } else { output.stdout };
+    let value = String::from_utf8(bytes).ok()?;
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
 fn v8_backend_args(backend: CarrickBackend, immutable_image: &str) -> Vec<String> {
     let mut args = vec![
         "run".to_owned(),
@@ -966,11 +977,18 @@ fn run_hvf_mailbox_report() -> Result<(), String> {
         warmup_blocks,
         sample_blocks,
         samples_per_transport: sample_blocks.saturating_mul(2),
+        cooldown_secs: cooldown.as_secs(),
         bootstrap_seed: HVF_BOOTSTRAP_SEED,
         bootstrap_resamples: HVF_BOOTSTRAP_RESAMPLES,
         git_sha: provenance::git_sha(),
         git_dirty: git_dirty(&root),
         carrick: carrick_before.clone(),
+        codesign: command_fact(
+            "codesign",
+            &["-dv", "--verbose=2", bin.to_str().unwrap_or("")],
+            true,
+        ),
+        power_source: command_fact("pmset", &["-g", "batt"], false),
         host: HostFacts::capture(),
     })];
 
