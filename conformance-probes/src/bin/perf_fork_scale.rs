@@ -140,7 +140,9 @@ fn main() {
     println!("fork_p95_us={:.3}", pct(0.95));
     println!("fork_min_us={:.3}", samples_ns[0] as f64 / 1000.0);
     println!("iters={}", samples_ns.len());
-    println!("threads={}", n_threads);
-    println!("mem_mb={}", mem_mb);
+    // Echo the parsed values (rather than the raw argv/env strings): the
+    // backend-pair runner treats either mismatch as invalid evidence.
+    println!("threads={n_threads}");
+    println!("mem_mb={mem_mb}");
     println!("nproc={}", nproc());
 }

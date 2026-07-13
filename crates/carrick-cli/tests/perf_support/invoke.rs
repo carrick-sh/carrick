@@ -172,8 +172,22 @@ pub fn backend_args(backend: CarrickBackend, probe: &Path, guest_args: &[&str]) 
         }
     }
     args.push(probe.to_string_lossy().into_owned());
+    if !guest_args.is_empty() {
+        args.push("--".to_owned());
+    }
     args.extend(guest_args.iter().map(|arg| (*arg).to_owned()));
     args
+}
+
+fn isolate_backend_process(command: &mut Command) {
+    command
+        // An isolated process group is background relative to the test's
+        // terminal. Inheriting that terminal on stdin lets Carrick's exit-time
+        // tcsetattr receive SIGTTOU and stop the otherwise-complete sample.
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .process_group(0);
 }
 
 /// Run one direct-ELF sample in its own process group with a scoped run id.
@@ -187,13 +201,13 @@ pub fn run_carrick_backend(
     guest_args: &[&str],
 ) -> Result<String, String> {
     let run_id = perf_run_id();
-    let child = Command::new(bin)
+    let mut command = Command::new(bin);
+    command
         .args(backend_args(backend, probe, guest_args))
         .env("CARRICK_RUN_ID", &run_id)
-        .env("CARRICK_EXPOSED_CPUS", CPU_PIN.to_string())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .process_group(0)
+        .env("CARRICK_EXPOSED_CPUS", CPU_PIN.to_string());
+    isolate_backend_process(&mut command);
+    let child = command
         .spawn()
         .map_err(|error| format!("spawn {backend:?} backend sample: {error}"))?;
     drain_checked_with_deadline(child, repo_root, &run_id)
@@ -399,6 +413,36 @@ mod tests {
                 .any(|window| window == ["--exec-backend", "hvf"])
         );
         assert!(!native.iter().any(|arg| arg == "--native-code-mode"));
+    }
+
+    #[test]
+    fn direct_elf_guest_args_follow_the_clap_delimiter() {
+        let args = backend_args(
+            CarrickBackend::Native16k,
+            Path::new("/repo/probes/perf_fork_scale"),
+            &["0", "256"],
+        );
+        assert!(args.ends_with(&[
+            "/repo/probes/perf_fork_scale".to_owned(),
+            "--".to_owned(),
+            "0".to_owned(),
+            "256".to_owned(),
+        ]));
+    }
+
+    #[test]
+    fn backend_sample_does_not_inherit_terminal_stdin() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "if [ -t 0 ]; then exit 42; fi; printf isolated-stdin"]);
+        isolate_backend_process(&mut command);
+        let output = command
+            .spawn()
+            .expect("spawn isolated sample")
+            .wait_with_output()
+            .expect("wait for isolated sample");
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"isolated-stdin");
     }
 
     #[test]

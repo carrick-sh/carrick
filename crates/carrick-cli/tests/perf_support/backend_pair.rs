@@ -108,6 +108,10 @@ impl ArtifactIdentity {
     }
 }
 
+pub fn v8_artifact_identity(digest: &str) -> Result<ArtifactIdentity, String> {
+    ArtifactIdentity::oci("direct_v8", digest)
+}
+
 pub fn validate_same_artifact(
     native: &ArtifactIdentity,
     hvf: &ArtifactIdentity,
