@@ -136,12 +136,23 @@ pub(super) enum MemoryClass {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum MemoryVirtualization {
+    None,
+    X18,
+    X28,
+    X18X28ReadOnly,
+    X18WriteX28Read,
+    Unsupported,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct MemoryAccess {
     pub(super) word: u32,
     pub(super) op: bad64::Op,
     pub(super) base: MemoryBase,
     pub(super) writeback: MemoryWriteback,
     pub(super) class: MemoryClass,
+    pub(super) virtualization: MemoryVirtualization,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
