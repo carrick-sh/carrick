@@ -141,10 +141,12 @@ validates the complete prospective layout, including:
 
 The semantic biased guest aperture is the contiguous interval from guest zero
 through the exclusive fixed ceiling `LINUX_STACK_TOP`. Carrick also reserves a
-bounded 1 MiB overflow guard so a near-ceiling literal or multi-byte access
-cannot escape into unrelated host memory. Candidate selection acquires this
-entire translated aperture as one collision-probed `PROT_NONE` ownership
-interval; it does not reserve only the image's currently modeled mappings.
+bounded guard covering AArch64's complete 1 MiB literal-displacement window
+plus one host page of headroom. The extra page contains the tail of a
+maximum-displacement 16-byte literal access and keeps the ownership bound
+host-page aligned. Candidate selection acquires this entire translated aperture
+as one collision-probed `PROT_NONE` ownership interval; it does not reserve only
+the image's currently modeled mappings.
 
 Each candidate is attempted transactionally. Carrick requests exact host
 ranges without `MAP_FIXED`. Darwin may treat the supplied address as a hint; if
@@ -250,12 +252,20 @@ The fixed guest ceiling is exclusive. Biased lowering computes the exact guest
 effective address for every memory form. A flags-neutral `LSR`/`CBZ` check keeps
 guest NZCV unchanged and gives all addresses below 1 TiB the normal translated
 host operand without publishing per-access recovery state. The `PROT_NONE`
-overflow guard covers the narrow interval from `LINUX_STACK_TOP` to 1 TiB, so
-those addresses still fault inside Carrick-owned memory. A larger address
-publishes that exact guest value, tags the host operand with a bit outside
-Darwin's user address range, and deliberately faults without allowing the guest
-address to alias unrelated host memory. Signal recovery then reports the
-published guest address. Direct emission is unchanged by this check.
+overflow guard covers the narrow interval from `LINUX_STACK_TOP` to 1 TiB and
+continues through the maximum-width literal tail, so those addresses still
+fault inside Carrick-owned memory. A larger nonliteral address publishes that
+exact guest value, tags the host operand with a bit outside Darwin's user
+address range, and deliberately faults without allowing the guest address to
+alias unrelated host memory. Signal recovery then reports the published guest
+address. Direct emission is unchanged by this check.
+
+Literal lowering applies the same fail-closed rule without changing Direct
+mode. A negative literal displacement near guest zero can wrap the architectural
+target in the `GuestVa` domain. Biased emission publishes that exact wrapped
+guest value and uses a tagged non-Darwin-user host operand, so the access reaches
+Linux guest fault delivery rather than failing translation with a host overflow
+diagnostic.
 
 The bias is immutable gateway context, not a guest-visible reserved register.
 Scratch selection must compose with DSR's existing x17 entry transport and
