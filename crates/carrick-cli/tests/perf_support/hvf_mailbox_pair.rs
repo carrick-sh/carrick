@@ -148,11 +148,14 @@ pub struct TransportRun {
     pub warmup_blocks: usize,
     pub sample_blocks: usize,
     pub samples_per_transport: usize,
+    pub cooldown_secs: u64,
     pub bootstrap_seed: u64,
     pub bootstrap_resamples: usize,
     pub git_sha: Option<String>,
     pub git_dirty: bool,
     pub carrick: ArtifactIdentity,
+    pub codesign: Option<String>,
+    pub power_source: Option<String>,
     pub host: HostFacts,
 }
 
