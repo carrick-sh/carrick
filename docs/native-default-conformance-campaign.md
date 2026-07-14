@@ -126,3 +126,62 @@ but attributes only part of the observed wall time to translation/control.
 After reducing the dominant term to a non-pathological ratio, resume at the Go
 c94 reducer, then the remaining Go lane, CPython, workers=4 smoke, and the full
 bless ladder.
+
+
+## Task 3 measurement campaign (2026-07-14, signed, at 3e091fce lineage)
+
+Provenance: clean tree, signed binary
+`1c1d6737ffde92530e62871a32f4a4d19726e89233495213c4cf513ee3ba88bb`, Mac16,12,
+macOS 27.0, 10 CPUs, AC power, image
+`sha256:61998068...`. All runs scoped, cleaned, and re-parsed through the
+strict wire; evidence committed under `docs/perf-results/`.
+
+**Plane A (untraced absolute authority, warmup+5 per engine/workload):**
+
+| Workload | Carrick p50 | Docker p50 | Ratio | Outcome |
+| --- | --- | --- | --- | --- |
+| W1 import reducer | 19.360 s | 1.600 s | ceiling-truncated (>=12.1x) | all 5 typed `max-traps` at the 1,000,000-gateway ceiling |
+| W2 frozen compile | 3.520 s | 0.220 s | **16.00x** | all 5 completed, work product `5db57566...` |
+
+**Plane B (W2 ABBA off/on, warmup+5 per mode):** profile tax 1.13 percent
+(<=10 percent, durations usable); all 12 completed with clean scoped cleanup;
+45 complete thread groups over 23 PIDs per profiled run.
+
+**Additive model outcome — FAIL-CLOSED.** The committed analyzer raises
+`additive CPU reconciliation differs by more than 2%: 0.653181`. Exclusive
+DSR phases cover only 23-43 percent of measured user+system CPU (residual
+57-77 percent across one-thread and multithreaded runs). The residual tracks
+the blocked wall segments (~1.1-1.3x), not PID count: one-thread
+`exclusive 1.46 s + blocked 1.66 s ~= cpu 3.41 s`; the retained W1 ceiling
+profile shows `exclusive 21.2 s + blocked 42.1 s ~= cpu 69.0 s`. Untraced W2
+runs are system-time dominated (user 1.44 s / sys 2.31 s). Measured blocked
+wall is 55.0 percent of untraced wall (design rung threshold 30 percent). The
+evidence indicates the runtime burns host CPU during guest blocked segments
+(parking/wake machinery), an unprofiled term the additive model correctly
+refuses to overlook.
+
+**Count-scope outcome — FAIL-CLOSED.** Hottest-thread exclusive share is
+47.1 percent (selects `sensitive-exclusive`); aggregate-threads exclusive is
+21.7 percent (selects nothing at the 30 percent rung; aggregate is
+resolver-heavy at 58.4 percent with recurrence unproven). The scoped analyzer
+refuses to select a slice while the scopes disagree.
+
+**Plane C (fresh dtrace shape):** completed naturally, zero drops, zero
+incomplete pairs, 23 reconciled per-PID totals, 1,445 temporal ordering
+entries, exit mix by kind ordinal `{1: 7954, 2: 108042, 3: 107896, 5: 567,
+6: 235178}`. DTrace wall magnitude is inflated and excluded from decision
+inputs.
+
+**One-thread control (warmup+3 per plane):** untraced p50 3.490 s, profiled
+p50 3.490 s; per-run exclusive terms stable (translation 0.823-0.827 s,
+dispatch 0.408-0.412 s); residual 56.6-57.3 percent, consistent with the
+multithreaded runs.
+
+**Decision:** no typed decision row exists. The committed ladder fails closed
+on both the additive gate and scope reconciliation, exactly as designed. The
+measured dominant unaccounted term is blocked-segment host CPU burn. The
+follow-on plan (`docs/superpowers/plans/2026-07-14-native-compiler-selected-slice.md`)
+instruments park/wake and per-process startup CPU attribution so the additive
+model reconciles, repairs the parking/wake burn per the design's
+blocked-residual rung, and re-runs this campaign to obtain the typed decision
+row. No timeout, `max_traps`, or semantic weakening is involved.
