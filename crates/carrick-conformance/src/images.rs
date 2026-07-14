@@ -59,7 +59,7 @@ pub fn is_stale(registry_digest: Option<&str>, last_pulled: Option<&str>) -> boo
 /// have their own stores. A refresh of one store says nothing about another.
 fn sidecar_path(lane: &crate::lane::Lane) -> PathBuf {
     match lane {
-        crate::lane::Lane::Hvf | crate::lane::Lane::MacosNativeDsr => {
+        crate::lane::Lane::Hvf | crate::lane::Lane::MacosNativeDsr(_) => {
             PathBuf::from("target/conformance/image-digests.json")
         }
         crate::lane::Lane::Kvm(_) => PathBuf::from("target/conformance/image-digests.kvm.json"),
@@ -155,7 +155,7 @@ pub fn refresh_stale_images(
         // on a present cache, so the rmi is what forces a fresh fetch.
         let ok = match lane {
             crate::lane::Lane::Hvf
-            | crate::lane::Lane::MacosNativeDsr
+            | crate::lane::Lane::MacosNativeDsr(_)
             | crate::lane::Lane::KvmLocal(_)
             | crate::lane::Lane::BhyveLocal(_)
             | crate::lane::Lane::NvmmLocal(_) => {
