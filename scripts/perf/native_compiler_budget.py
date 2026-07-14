@@ -556,6 +556,12 @@ def validate_w1_profile_evidence(
         raise BudgetError("W1 raw evidence path must be a relative artifact path")
     artifact_path = (path.parent / evidence_rel).resolve()
     try:
+        artifact_path.relative_to(path.parent.resolve())
+    except ValueError as error:
+        raise BudgetError(
+            f"W1 raw evidence path escapes the evidence root: {evidence_rel}"
+        ) from error
+    try:
         compressed = artifact_path.read_bytes()
     except OSError as error:
         raise BudgetError(f"W1 raw profile artifact is missing: {artifact_path}") from error
@@ -1562,6 +1568,14 @@ def parse_dtrace_summary(
         if set(scope) - {"phase", "pid", "tid", "kind", "source_pc", "target_pc"}:
             raise BudgetError("DTrace scope has unknown fields")
         metric_type = metric.get("type")
+        if metric_type not in {
+            "exact",
+            "sampled-duration",
+            "high-water",
+            "completion",
+            "incomplete-pair",
+        }:
+            raise BudgetError(f"unknown DTrace metric type: {metric_type!r}")
         if metric_type == "completion":
             if set(metric) != {"type"} or scope:
                 raise BudgetError("DTrace completion metric is malformed")
@@ -1894,15 +1908,20 @@ def analyze(records: Sequence[RunRecord]) -> DecisionRecord:
             )
         blocked_ns = statistics.median(evidence.blocked_ns for evidence in additive)
         # Aggregated thread blocked time can exceed process wall; the trigger
-        # saturates at 1.0 rather than pretending to be a partition share.
-        blocked_share = min(blocked_ns / off_wall, 1.0)
+        # saturates at 1.0 rather than pretending to be a partition share, and
+        # the basis names the saturation so 1.0 is never ambiguous.
+        blocked_ratio = blocked_ns / off_wall
+        blocked_share = min(blocked_ratio, 1.0)
         if blocked_share >= 0.30:
+            basis = "low-tax-blocked-off-cpu-over-untraced-wall"
+            if blocked_ratio > 1.0:
+                basis += "-saturated"
             return DecisionRecord(
                 RESULT_SCHEMA,
                 "decision",
                 "blocked-residual",
                 blocked_share,
-                "low-tax-blocked-off-cpu-over-untraced-wall",
+                basis,
                 "process-wall",
                 tuple(record.run_id for record in abba),
                 profile_tax,
@@ -2221,10 +2240,12 @@ def _parse_dtrace_json(value: object) -> DtraceEvidence | None:
         ):
             raise BudgetError("DTrace typed ordering is malformed")
         ordering.append((item[0], item[1], item[2], item[3]))
+    if _nonnegative_int(raw["incomplete_pairs"], "DTrace incomplete pairs") != 0:
+        raise BudgetError("DTrace typed evidence must have zero incomplete pairs")
     return DtraceEvidence(
         True,
         False,
-        _nonnegative_int(raw["incomplete_pairs"], "DTrace incomplete pairs"),
+        0,
         raw_artifact_path,
         str(raw["raw_sha256"]),
         tuple(sorted(drops.items())),
@@ -2235,7 +2256,7 @@ def _parse_dtrace_json(value: object) -> DtraceEvidence | None:
 
 
 ABBA_LABEL_RE = re.compile(r"^(off|on)-(warmup|[1-9][0-9]*)$")
-BASELINE_LABEL_RE = re.compile(r"^baseline-(w1|w2)-(warmup|measured)-([0-9]+)$")
+BASELINE_LABEL_RE = re.compile(r"^baseline-(w1|w2)-(warmup|measured)-(0|[1-9][0-9]*)$")
 DOCKER_BINARY_SENTINEL = "0" * 64
 
 

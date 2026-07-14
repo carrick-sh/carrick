@@ -915,6 +915,73 @@ class ReviewFixContractTests(unittest.TestCase):
             with self.assertRaisesRegex(budget.BudgetError, "raw"):
                 budget.load_manifest(path)
 
+    def test_w1_evidence_path_cannot_escape_the_evidence_root(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            nested = root / "nested"
+            nested.mkdir()
+            fixture = nested / "fixture"
+            fixture.mkdir()
+            (fixture / "input.go").write_text("package p\n")
+            base = strict_w2_manifest_json(fixture / "input.go")
+            escape = root / "escape.log.gz"
+            escape.write_bytes((nested / "w1-raw.log.gz").read_bytes())
+            evidence_path = nested / "evidence.json"
+            evidence = json.loads(evidence_path.read_text())
+            evidence["raw_profile_evidence_path"] = "../escape.log.gz"
+            evidence_path.write_text(json.dumps(evidence, sort_keys=True) + "\n")
+            base["capture"]["w1_profile_evidence_sha256"] = sha256(
+                evidence_path.read_bytes()
+            )
+            path = nested / "manifest.json"
+            path.write_text(json.dumps(base) + "\n")
+            with self.assertRaisesRegex(budget.BudgetError, "escape"):
+                budget.load_manifest(path)
+
+    def test_retained_w2_representative_profile_reconciles_with_manifest(self):
+        manifest = json.loads(
+            (
+                pathlib.Path(__file__).resolve().parent
+                / "manifests"
+                / "native-compiler-w2-v1.json"
+            ).read_text()
+        )
+        representativeness = manifest["capture"]["representativeness"]
+        raw_bytes = gzip.decompress(
+            (EVIDENCE_ROOT / "native-compiler-w2-representative-profile-v1.log.gz").read_bytes()
+        )
+        self.assertEqual(sha256(raw_bytes), representativeness["profile_stderr_sha256"])
+        profile = budget.parse_nativeperf(
+            raw_bytes.decode("utf-8", errors="replace").splitlines()
+        )
+        budget.validate_profile(profile)
+        hottest = max(profile.threads, key=lambda thread: thread.gateway_entries)
+        self.assertEqual(
+            {
+                "gateway_entries": hottest.gateway_entries,
+                "exit_resolve_direct": hottest.value("exits", "exit_resolve_direct"),
+                "exit_resolve_indirect": hottest.value("exits", "exit_resolve_indirect"),
+                "exit_sensitive": hottest.value("exits", "exit_sensitive"),
+                "sensitive_exclusive": hottest.value("sensitive", "sensitive_exclusive"),
+            },
+            representativeness["w2_hottest"],
+        )
+
+    def test_blocked_residual_saturation_is_marked_in_the_basis(self):
+        profile = profile_with_budget(
+            gateway_entries=100,
+            sensitive_exclusive=10,
+            syscall_dispatch_ns=0,
+            blocked_ns=150,
+        )
+        records = strict_abba_records(profile)
+        decision = budget.analyze(records)
+        self.assertEqual(decision.selected_slice, "blocked-residual")
+        self.assertEqual(decision.share, 1.0)
+        self.assertEqual(
+            decision.basis, "low-tax-blocked-off-cpu-over-untraced-wall-saturated"
+        )
+
     def test_plane_c_binds_raw_trace_and_round_trips_all_shapes(self):
         with tempfile.TemporaryDirectory() as temp:
             artifact = pathlib.Path(temp)
@@ -948,6 +1015,7 @@ class ReviewFixContractTests(unittest.TestCase):
 
     def test_retained_real_plane_c_artifacts_parse_and_round_trip(self):
         root = EVIDENCE_ROOT / "real-plane-c-v1"
+        run_id = "nativeperf-w2-internal-runtime-atomic-1-4472f5b0"
         with tempfile.TemporaryDirectory() as temp:
             artifact = pathlib.Path(temp)
             raw_bytes = gzip.decompress((root / "dtrace.raw.gz").read_bytes())
@@ -956,17 +1024,51 @@ class ReviewFixContractTests(unittest.TestCase):
             (artifact / "dtrace-summary.jsonl").write_bytes(summary_bytes)
             evidence = budget.parse_dtrace_summary(
                 artifact / "dtrace-summary.jsonl",
-                expected_run_id="nativeperf-w2-internal-runtime-atomic-3-c0459f8d",
+                expected_run_id=run_id,
                 raw_path=artifact / "dtrace.raw",
             )
             self.assertTrue(evidence.complete)
             self.assertFalse(evidence.bounded)
             self.assertEqual(evidence.raw_sha256, sha256(raw_bytes))
             self.assertEqual(len(evidence.per_pid_gateway_counts), 23)
-            self.assertEqual(len(evidence.ordering), 1443)
+            self.assertEqual(len(evidence.ordering), 1448)
             self.assertTrue(any(entry[2] is None for entry in evidence.ordering))
             encoded = json.loads(json.dumps(budget._dtrace_json(evidence)))
             self.assertEqual(budget._parse_dtrace_json(encoded), evidence)
+            record = json.loads(gzip.decompress((root / "record.json.gz").read_bytes()))
+            decoded = budget.parse_result_row(record)
+            self.assertEqual(decoded.run_id, run_id)
+            self.assertEqual(decoded.plane, "dtrace")
+            self.assertEqual(decoded.dtrace, evidence)
+
+    def test_dtrace_summary_rejects_unknown_metric_types(self):
+        with tempfile.TemporaryDirectory() as temp:
+            artifact = pathlib.Path(temp)
+            summary = artifact / "dtrace-summary.jsonl"
+            raw = artifact / "dtrace.raw"
+            raw.write_text("".join(line + "\n" for line in dtrace_raw_lines(pid=42)))
+            rows = dtrace_rows(run_id="run-1", pid=42)
+            rows[0] = {**rows[0], "metric": {"type": "invented"}}
+            summary.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            with self.assertRaisesRegex(budget.BudgetError, "metric type"):
+                budget.parse_dtrace_summary(summary, expected_run_id="run-1", raw_path=raw)
+
+    def test_wire_dtrace_requires_zero_incomplete_pairs(self):
+        evidence = budget.DtraceEvidence(
+            True, False, 0, "dtrace.raw", "a" * 64, (), ((42, 1),), ((1, 1),), ()
+        )
+        encoded = json.loads(json.dumps(budget._dtrace_json(evidence)))
+        self.assertEqual(budget._parse_dtrace_json(encoded), evidence)
+        encoded["incomplete_pairs"] = 1
+        with self.assertRaisesRegex(budget.BudgetError, "incomplete"):
+            budget._parse_dtrace_json(encoded)
+
+    def test_schedule_label_rejects_leading_zero_repetition(self):
+        record = budget.RunRecord.synthetic(
+            plane="untraced", schedule_label="baseline-w1-measured-01"
+        )
+        with self.assertRaises(budget.BudgetError):
+            budget.parse_result_row(budget.run_record_json(record))
 
     def test_typed_outcomes_record_trap_ceiling_but_analysis_rejects_it(self):
         marker = budget.parse_max_traps_marker(
