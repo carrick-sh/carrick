@@ -36,6 +36,7 @@ pub struct WaiterDebugCounts {
 mod imp {
     use super::WaiterDebugCounts;
     use std::ffi::c_void;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::sync::OnceLock;
     use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -49,6 +50,17 @@ mod imp {
     /// 32-bit futex word.
     const FUTEX_WORD_SIZE: libc::size_t = 4;
     const WAITER_SLOTS: usize = 8192;
+    const WAITER_TABLE_MAGIC: u32 = 0x4357_5431;
+    const WAITER_TABLE_VERSION: u32 = 1;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct WaiterTableReexecAuthority {
+        pub fd: i32,
+        pub original_fd_flags: i32,
+        pub device: u64,
+        pub inode: u64,
+        pub size: u64,
+    }
 
     #[repr(C)]
     struct WaiterSlot {
@@ -77,6 +89,47 @@ mod imp {
         /// `settle_waiter_exit` / `wake_counted`).
         self_woken: AtomicU32,
     }
+
+    #[repr(C)]
+    struct WaiterTableLayout {
+        magic: AtomicU32,
+        version: AtomicU32,
+        slots: [WaiterSlot; WAITER_SLOTS],
+    }
+
+    struct WaiterTable {
+        base: usize,
+        fd: OwnedFd,
+    }
+
+    // SAFETY: `base` is a process-lifetime MAP_SHARED mapping. Every shared
+    // field is atomic and the owned fd only names that mapping's backing.
+    unsafe impl Send for WaiterTable {}
+    // SAFETY: same as Send.
+    unsafe impl Sync for WaiterTable {}
+
+    impl WaiterTable {
+        fn layout(&self) -> &WaiterTableLayout {
+            unsafe { &*(self.base as *const WaiterTableLayout) }
+        }
+
+        fn authority(&self) -> std::io::Result<WaiterTableReexecAuthority> {
+            waiter_table_authority(self.fd.as_raw_fd())
+        }
+    }
+
+    impl Drop for WaiterTable {
+        fn drop(&mut self) {
+            unsafe {
+                libc::munmap(
+                    self.base as *mut libc::c_void,
+                    std::mem::size_of::<WaiterTableLayout>(),
+                );
+            }
+        }
+    }
+
+    static WAITER_TABLE: OnceLock<Option<WaiterTable>> = OnceLock::new();
 
     #[link(name = "System")]
     unsafe extern "C" {
@@ -117,31 +170,187 @@ mod imp {
     }
 
     fn waiter_table() -> Option<&'static [WaiterSlot]> {
-        static CELL: OnceLock<usize> = OnceLock::new();
-        let base = *CELL.get_or_init(|| {
-            let bytes = WAITER_SLOTS.saturating_mul(std::mem::size_of::<WaiterSlot>());
-            if bytes == 0 {
-                return 0;
-            }
-            // SAFETY: a fresh anonymous shared mapping owned for process lifetime.
-            let p = unsafe {
-                libc::mmap(
-                    std::ptr::null_mut(),
-                    bytes,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_ANON | libc::MAP_SHARED,
-                    -1,
-                    0,
-                )
-            };
-            if p == libc::MAP_FAILED { 0 } else { p as usize }
-        });
-        if base == 0 {
-            return None;
+        WAITER_TABLE
+            .get_or_init(|| create_waiter_table().ok())
+            .as_ref()
+            .map(|table| table.layout().slots.as_slice())
+    }
+
+    fn create_waiter_table() -> std::io::Result<WaiterTable> {
+        let template = std::env::temp_dir().join(format!(
+            ".carrick-futex-waiters-{}-XXXXXX",
+            std::process::id()
+        ));
+        let mut path = std::ffi::CString::new(template.as_os_str().as_encoded_bytes())
+            .map_err(|_| std::io::Error::other("waiter table path contains NUL"))?
+            .into_bytes_with_nul();
+        let raw_fd = unsafe { libc::mkstemp(path.as_mut_ptr().cast()) };
+        if raw_fd < 0 {
+            return Err(std::io::Error::last_os_error());
         }
-        // SAFETY: `base` points at WAITER_SLOTS zeroed WaiterSlot values for the
-        // process lifetime; MAP_SHARED makes them coherent across fork.
-        Some(unsafe { std::slice::from_raw_parts(base as *const WaiterSlot, WAITER_SLOTS) })
+        let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+        if unsafe { libc::unlink(path.as_ptr().cast()) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let bytes = std::mem::size_of::<WaiterTableLayout>();
+        if unsafe { libc::ftruncate(fd.as_raw_fd(), bytes as libc::off_t) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let base = map_waiter_table(fd.as_raw_fd())?;
+        let table = WaiterTable { base, fd };
+        table
+            .layout()
+            .version
+            .store(WAITER_TABLE_VERSION, Ordering::Relaxed);
+        table
+            .layout()
+            .magic
+            .store(WAITER_TABLE_MAGIC, Ordering::Release);
+        Ok(table)
+    }
+
+    fn map_waiter_table(fd: i32) -> std::io::Result<usize> {
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                std::mem::size_of::<WaiterTableLayout>(),
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            )
+        };
+        if base == libc::MAP_FAILED {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(base as usize)
+        }
+    }
+
+    fn waiter_table_authority(fd: i32) -> std::io::Result<WaiterTableReexecAuthority> {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let stat = unsafe { stat.assume_init() };
+        Ok(WaiterTableReexecAuthority {
+            fd,
+            original_fd_flags: flags,
+            device: stat.st_dev as u64,
+            inode: stat.st_ino,
+            size: stat.st_size as u64,
+        })
+    }
+
+    fn attach_waiter_table(
+        authority: WaiterTableReexecAuthority,
+        transport_fd: i32,
+    ) -> std::io::Result<WaiterTable> {
+        if authority.size != std::mem::size_of::<WaiterTableLayout>() as u64 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "shared futex waiter table size changed",
+            ));
+        }
+        let flags = unsafe { libc::fcntl(transport_fd, libc::F_GETFD) };
+        if flags < 0 || flags != (authority.original_fd_flags & !libc::FD_CLOEXEC) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "shared futex waiter table flags changed",
+            ));
+        }
+        let actual = waiter_table_authority(transport_fd)?;
+        if actual.device != authority.device
+            || actual.inode != authority.inode
+            || actual.size != authority.size
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "shared futex waiter table identity changed",
+            ));
+        }
+        let duplicate = unsafe { libc::fcntl(transport_fd, libc::F_DUPFD_CLOEXEC, 0) };
+        if duplicate < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let fd = unsafe { OwnedFd::from_raw_fd(duplicate) };
+        if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, authority.original_fd_flags) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let base = map_waiter_table(fd.as_raw_fd())?;
+        let table = WaiterTable { base, fd };
+        if table.layout().magic.load(Ordering::Acquire) != WAITER_TABLE_MAGIC
+            || table.layout().version.load(Ordering::Acquire) != WAITER_TABLE_VERSION
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "shared futex waiter table magic/version changed",
+            ));
+        }
+        Ok(table)
+    }
+
+    fn adopt_waiter_table_from_reexec(
+        authority: WaiterTableReexecAuthority,
+    ) -> std::io::Result<WaiterTable> {
+        if authority.fd < 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "shared futex waiter table fd is negative",
+            ));
+        }
+        let transport = unsafe { OwnedFd::from_raw_fd(authority.fd) };
+        attach_waiter_table(authority, transport.as_raw_fd())
+    }
+
+    pub fn waiter_table_reexec_authority() -> std::io::Result<WaiterTableReexecAuthority> {
+        let table = WAITER_TABLE
+            .get_or_init(|| create_waiter_table().ok())
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("shared futex waiter table unavailable"))?;
+        table.authority()
+    }
+
+    pub fn init_waiter_table_from_reexec(
+        authority: WaiterTableReexecAuthority,
+    ) -> std::io::Result<()> {
+        let table = adopt_waiter_table_from_reexec(authority)?;
+        if let Some(existing) = WAITER_TABLE.get().and_then(Option::as_ref) {
+            let current = existing.authority()?;
+            let attached = table.authority()?;
+            if current.device == attached.device
+                && current.inode == attached.inode
+                && current.size == attached.size
+            {
+                return Ok(());
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "shared futex waiter singleton already names different backing",
+            ));
+        }
+        match WAITER_TABLE.set(Some(table)) {
+            Ok(()) => {}
+            Err(Some(table)) => {
+                drop(table);
+                return Err(std::io::Error::other(
+                    "shared futex waiter singleton raced during reexec attach",
+                ));
+            }
+            Err(None) => {
+                return Err(std::io::Error::other(
+                    "shared futex waiter singleton raced to unavailable state",
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn waiter_slot(host_addr: usize) -> Option<&'static WaiterSlot> {
@@ -157,13 +366,15 @@ mod imp {
             if seen == key {
                 return Some(slot);
             }
-            if seen == 0
-                && slot
+            if seen == 0 {
+                match slot
                     .key
                     .compare_exchange(0, key, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-            {
-                return Some(slot);
+                {
+                    Ok(_) => return Some(slot),
+                    Err(current) if current == key => return Some(slot),
+                    Err(_) => {}
+                }
             }
             idx = (idx + 1) & (WAITER_SLOTS - 1);
         }
@@ -539,11 +750,83 @@ mod imp {
         }
         None
     }
+
+    #[cfg(test)]
+    mod reexec_tests {
+        use super::*;
+
+        fn transport_authority(table: &WaiterTable) -> (WaiterTableReexecAuthority, i32) {
+            let mut authority = table.authority().expect("waiter authority");
+            let transport = unsafe { libc::fcntl(authority.fd, libc::F_DUPFD, 0) };
+            assert!(transport >= 0);
+            assert_eq!(
+                unsafe {
+                    libc::fcntl(
+                        transport,
+                        libc::F_SETFD,
+                        authority.original_fd_flags & !libc::FD_CLOEXEC,
+                    )
+                },
+                0
+            );
+            authority.fd = transport;
+            (authority, transport)
+        }
+
+        #[test]
+        fn inherited_waiter_authority_maps_same_slots_and_rejects_identity_change() {
+            let source = create_waiter_table().expect("source waiter table");
+            assert_ne!(
+                source
+                    .authority()
+                    .expect("source authority")
+                    .original_fd_flags
+                    & libc::FD_CLOEXEC,
+                0
+            );
+            source.layout().slots[0].count.store(17, Ordering::Release);
+            let (authority, transport) = transport_authority(&source);
+            let attached = attach_waiter_table(authority, transport).expect("attach waiter table");
+            assert_eq!(attached.layout().slots[0].count.load(Ordering::Acquire), 17);
+            unsafe {
+                libc::close(transport);
+            }
+
+            let (mut wrong, transport) = transport_authority(&source);
+            wrong.inode = wrong.inode.wrapping_add(1);
+            assert!(attach_waiter_table(wrong, transport).is_err());
+            unsafe {
+                libc::close(transport);
+            }
+        }
+
+        #[test]
+        fn failed_waiter_adoption_closes_the_transport_fd() {
+            let source = create_waiter_table().expect("source waiter table");
+            let (mut authority, transport) = transport_authority(&source);
+            authority.size = authority.size.wrapping_add(1);
+            assert!(adopt_waiter_table_from_reexec(authority).is_err());
+            assert_eq!(unsafe { libc::fcntl(transport, libc::F_GETFD) }, -1);
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EBADF)
+            );
+        }
+    }
 }
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 mod imp {
     use super::WaiterDebugCounts;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct WaiterTableReexecAuthority {
+        pub fd: i32,
+        pub original_fd_flags: i32,
+        pub device: u64,
+        pub inode: u64,
+        pub size: u64,
+    }
 
     pub fn wait(_host_addr: usize, _value: u32, _timeout_us: u32) -> i64 {
         -(libc::ENOSYS as i64)
@@ -573,6 +856,20 @@ mod imp {
     pub fn preinit_waiter_table() -> bool {
         true
     }
+    pub fn waiter_table_reexec_authority() -> std::io::Result<WaiterTableReexecAuthority> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "shared futex waiter transport is Darwin-only",
+        ))
+    }
+    pub fn init_waiter_table_from_reexec(
+        _authority: WaiterTableReexecAuthority,
+    ) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "shared futex waiter transport is Darwin-only",
+        ))
+    }
     pub fn waiter_enter(_host_addr: usize) {}
     pub fn waiter_exit(_host_addr: usize, _woken: bool) {}
     pub fn requeued_waiter_enter(_host_addr: usize) -> bool {
@@ -587,9 +884,10 @@ mod imp {
 }
 
 pub use imp::{
-    preinit_waiter_table, requeue_counted, requeued_waiter_complete, requeued_waiter_enter,
-    requeued_waiter_exit, take_requeue, wait, waiter_debug_counts, waiter_enter, waiter_exit, wake,
-    wake_counted,
+    WaiterTableReexecAuthority, init_waiter_table_from_reexec, preinit_waiter_table,
+    requeue_counted, requeued_waiter_complete, requeued_waiter_enter, requeued_waiter_exit,
+    take_requeue, wait, waiter_debug_counts, waiter_enter, waiter_exit,
+    waiter_table_reexec_authority, wake, wake_counted,
 };
 
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
@@ -629,6 +927,33 @@ mod tests {
             rc < 0,
             "wake with no waiters should report an error, got {rc}"
         );
+    }
+
+    #[test]
+    fn waiter_counts_are_visible_across_threads() {
+        use super::{waiter_debug_counts, waiter_enter, waiter_exit};
+        use std::sync::{Arc, Barrier};
+        static WORD: AtomicU32 = AtomicU32::new(0);
+        let addr = &WORD as *const AtomicU32 as usize;
+        let entered = Arc::new(Barrier::new(4));
+        let release = Arc::new(Barrier::new(4));
+        let mut joins = Vec::new();
+        for _ in 0..3 {
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            joins.push(std::thread::spawn(move || {
+                waiter_enter(addr);
+                entered.wait();
+                release.wait();
+                waiter_exit(addr, false);
+            }));
+        }
+        entered.wait();
+        assert_eq!(waiter_debug_counts(addr).count, 3);
+        release.wait();
+        for join in joins {
+            join.join().expect("join waiter counter");
+        }
     }
 
     /// Linux's FUTEX_WAKE return value counts waiters dequeued from the
