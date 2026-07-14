@@ -74,6 +74,15 @@ start. Smoke/full membership remains authoritative in
 | 2026-07-13 | `05e06fab` vs `089d5918` | same-host, identical-probe self-reexec A/B | 1 | fork-only 1.380 vs 1.425 ms; fork+exec 5.193 vs 12.255 ms | isolated signed historical build; current canonical probe binaries | DSR is present on both sides and fork cost is effectively unchanged. Activating PID-preserving host self-reexec adds about 7.0 ms per exec on this host; it is the dominant regression selected to preserve proven libdispatch correctness. |
 | 2026-07-13 | `458ad8df` | `dsr-fork` host-self-reexec waterfall | 1 | 220 samples per phase; natural completion; 3,084 metric rows; 0 incomplete pairs; 0 drops | `target/conformance/native-fork-exec-waterfall-r2.{raw,jsonl}` | Traced p50 attribution: preflight 1.417 ms, capsule preparation 1.329 ms, host exec 25.873 ms (startup 24.907 ms, kernel 0.745 ms, CLI dispatch 0.231 ms), capsule adoption 0.345 ms, restore 1.918 ms (dispatcher 0.654 ms, duplicate image load 1.148 ms, reset 0.019 ms). DTrace inflates startup but preserves the phase ordering and exposes the duplicate work. |
 | 2026-07-13 | `1d0788c8907f89ee96821dabdb3b576467b1eabc` | measured RED: canonical `perf_fork_exec`, five signed native repetitions plus `dsr-fork` lifecycle | 1 | five native p50s 11.528083-12.026333 ms, median 11.953750 ms; 5/5 `iters=200`; 220 legacy `host-self-reexec-image-load` pairs; 0 prepared-build/map phases; natural completion; 0 incomplete pairs; 0 drops | signed binary SHA-256 `cea50968844222d7f7f9ee222fe942325523789c294fbc82638598455b1f6ce4`; canonical probe SHA-256 `d68eb0e9feaa23358a682720b3886f8500f3b2ce0cc49ff3f79d0583f6baed0f`; uncommitted `target/conformance/native-prepared-image/red/` | Frozen pre-implementation authority. The controller command required `run-elf --raw` so the exact-source probe's stdout, including iteration and p50 evidence, was captured; the original non-raw logs are retained beside the measured runs as evidence of that corrected plan defect. |
+| 2026-07-13 | `5d7f95e8` | Task 8 artifact rebuild and exec reducer ladder | 1 | 431 musl + 431 GNU native-PIE probes rebuilt; signed Carrick verified; exact static, dynamic, shebang, descriptor, process-state, fork/exec/thread, and both-page-profile reducers green | `target/conformance/native-prepared-image/correctness/{provenance.txt,build-probes.log,exec-probe-reducers-both-profiles.log,dynamic-gnu-exec-reducers.log,exec-integration-reducers.log,exec-thread-reducers.log}` | Correctness authority was rebuilt from current sources. Frozen binary SHA-256 was `fbdcdd1f...a242ecf5`, CDHash `0818429c...18019eb`; the prepared-image marker is present. |
+| 2026-07-13 | worktree | complete signed native probe gate, then exact failed-probe rerun | 1 | initial 372 PASS / 9 FAIL in 224.58 s; three self-reexec state failures fixed; exact rerun leaves 6 FAIL and 3 PASS | `target/conformance/native-prepared-image/correctness/{conformance-probes-complete.log,conformance-probes-nine-serial-after-fixes.log}` | `keydeny`, `ltpcheckpointexec`, and `traceexecstop` are now green. The remaining `exitgroupthreads`, `futexforkwakegroups`, `mtsigrelease`, `procladder_epollmgr`, `procladder_mixed`, and `procladder_mt` all hit the deliberate post-fork-without-exec pthread `EAGAIN` safety guard. Keep them explicit; do not bless the probe gate yet. |
+| 2026-07-13 | `9e39fec5..1b5a6c57` | signed self-reexec state restoration regressions | 1 | bind-mount topology, seccomp policy, ptrace ownership, kernel-arena identity, and cross-exec futex waiter authority red-first then green | focused unit gates plus `target/conformance/native-prepared-image/correctness/{bind-mount-green.log,policy-ptrace-arena-final.log,shared-authorities-final.log}` | Prepared host self-reexec was losing ordinary durable runtime state. Typed capsule snapshots and validated inherited backing authorities close the three originating probe failures without weakening the safety guard. |
+| 2026-07-13 | worktree after state fixes | Node full ecosystem | 1 | 3/3 MATCH; Carrick/oracle ratios 29.33x, 23.01x, and 18.96x | `target/conformance/native-prepared-image/correctness/node-full-serial.jsonl` | Content coverage is green, including the full-only libuv row. The two successful suites remain pathologically above the oracle; this is correctness-blocking performance evidence, not a bless. |
+| 2026-07-13 | worktree before `0263eee1` | Go full ecosystem, interrupted at row 99/194 | 1 | 94 MATCH; 2 DIFF; 2 REGRESSION; `go-go_internal_srcimporter` wedged; no full-lane verdict | `target/conformance/native-prepared-image/correctness/go-full-serial.jsonl`; `target/conformance/native-prepared-image/correctness/cores/go-srcimporter-*.{core,bt.txt}` | Core evidence proved a `parking_lot` bucket / `SignalState` lock inversion in futex park validation. Do not count the partial rows as a full Go result. |
+| 2026-07-13 | `0263eee1` | futex signal lock-order reducer and exact Go c94/c99 repeats | 1 | deterministic lock cycle red-first then green; arrival race and lock-order tests 100/100; c99 naturally completed in 277.672 s without the old cycle | unit gates plus `target/conformance/native-prepared-image/correctness/{go-c94-c99-r3.jsonl,cores/go-types-r2-*.{core,bt.txt}}` | A monotonic interrupt generation removes the bucket-to-signal lock inversion. A prior c99 repeat was stopped prematurely; its core showed active compiler work, not the old deadlock. |
+| 2026-07-13 | `7006c2ac` | exact Go cgo SIMD-pair DSR reducer and bounded import check | 1 | `ldp q1, q2, [x1, #32]!` red-first then exact emitted-code green; DSR 127/127; signed `cgo -h` reaches normal usage exit; `TestImplicitsInfo` no longer reports `EFAULT` but fails after 15.90 s at 1,000,000 traps | emitted-code oracle `biased_simd_pair_preindex_preserves_register_files_and_writeback`; bounded run ID `task8-go-types-implicits-7006` | The DSR overlap guard had conflated SIMD q-register numbering with GPR x-register numbering. The decode error is fixed; the bounded real import now exposes pathological instruction/trap volume instead of `bad address`. |
+| 2026-07-13 | `7006c2ac` | `go-go_internal_srcimporter` after SIMD-pair fix | 1 | scoped stop after 1,392.649 s; Carrick CARRICK_CRASH vs cached Docker success; 516.56x (1,392,649 ms vs 2,696 ms); 42 scoped processes, 19 runnable, about 856-950% aggregate CPU | `target/conformance/native-prepared-image/correctness/go-c94-after-simd-pair.jsonl` | This is a P0 real-workload correctness blocker. The compiler subprocesses were active, not deadlocked, but none completed before the bounded stop. Do not restart full Go/CPython/load laddering until this is understood and reduced. |
+| 2026-07-13 | `0263eee1` + dirty DSR fix | bounded broad `dsr` profile of one-file cgo | 1 | 45 s diagnostic; 117,707 block hits, 67,199 misses/publishes across 14 PIDs; translate 1.678 s, resolve 1.919 s, prepare 0.308 s, dispatcher 0.317 s; no drops/capacity/invalidation | `target/conformance/native-prepared-image/correctness/{cgo-mini-dsr-summary.jsonl,cgo-mini-dsr-raw.log}` | DTrace inflation is acceptable and expected to scale proportionally, but untraced runs remain timing authority. The trace proves repeated per-process cold caches; its roughly 4.2 s of measured DSR/control work does not by itself explain the entire 45 s bounded run, so an AOT cache is only one hypothesis. |
 
 ## Active failure clusters
 
@@ -84,6 +93,7 @@ start. Smoke/full membership remains authoritative in
 | P0 | Direct-exec target reservation rejects split dyld range | red/green Node-sized reducer plus signed eventfd/Node runs | fixed in `2a7d3046`; eventfd MATCH, Node reaches downstream thread guard; multi-suite load proof pending | no reservation collision in workers=4 smoke repeats |
 | P1 | Post-fork exec child cannot create guest threads | red/green staged reducer plus Node/Go/CPython unsafe samples and libdispatch symbolication | signed reducer + 5/5 repeats pass without bypass; Node app/V8 and Go build/runtime/sync are MATCH through self-reexec; CPython remains | `forkexecpthread`, Node, Go, and CPython run after PID-preserving host self-reexec |
 | P1 | Native self-reexec loses process state | red/green exact reducers plus canonical CPython subprocess MATCH | fixed: shebang argv, file-backed xsignal continuity, credentials/groups, umask, ignored dispositions, rlimits, and closed stdio survive host exec | keep `cpython-subprocess` MATCH under smoke load and broader workloads |
+| P0 | Go compiler/import workloads have pathological native execution volume | untraced c94 and exact `TestImplicitsInfo`, plus bounded broad DSR profile | exact SIMD/GPR decode defect fixed; c94 still reaches 516.56x with active compiler children, and the import reducer exhausts 1,000,000 traps in 15.90 s | decompose instructions, traps, DSR cache misses, self-reexec/process startup, syscalls, and scheduler time; reduce the dominant term before resuming the correctness ladder |
 | P2 | Remaining ecosystem/LTP differences | no fresh full native run yet | unknown | classify from measured full run after P0/P1 blockers clear |
 
 ## Bless checklist
@@ -92,7 +102,7 @@ start. Smoke/full membership remains authoritative in
 - [ ] signed native conformance probes
 - [ ] smoke serial
 - [ ] smoke workers=4, three consecutive runs
-- [ ] Node full ecosystem
+- [x] Node full ecosystem content parity (performance remains blocking)
 - [ ] Go full ecosystem
 - [ ] CPython full ecosystem
 - [ ] LTP full ecosystem
@@ -105,11 +115,14 @@ start. Smoke/full membership remains authoritative in
 
 ## Current next action
 
-Close the P0 native process-spawn pathology before further workload laddering.
-Preserve the PID-preserving host-exec boundary selected by the libdispatch
-evidence, but remove its redundant preflight/materialization work and remeasure
-the canonical fork/fork-exec probes after each change. Treat a persistent DSR
-cache as a later bounded optimization: current translation is only part of the
-remaining cost, and emitted blocks embed process-specific gateway and host
-addresses. Once the ratio is non-pathological, resume workers=4 smoke stability
-and climb the full ecosystem lanes.
+Task 8 is incomplete and Task 9 has not started. Stop correctness laddering on
+the measured Go compiler/import performance blocker: c94 reached 516.56x with
+active compiler children, while the exact import reducer exhausted one million
+traps after 15.90 seconds. First account for instructions, traps, DSR cache
+misses, process/self-reexec startup, syscalls, and scheduler time with bounded
+profiles and untraced timing authority. A persistent/AOT DSR cache remains a
+hypothesis, not the diagnosis: the broad trace proves per-process cold caches
+but attributes only part of the observed wall time to translation/control.
+After reducing the dominant term to a non-pathological ratio, resume at the Go
+c94 reducer, then the remaining Go lane, CPython, workers=4 smoke, and the full
+bless ladder.
