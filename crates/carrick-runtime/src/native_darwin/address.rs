@@ -79,6 +79,19 @@ impl OwnedHostMapping {
         })
     }
 
+    fn adopt_existing(range: Range<HostVa>) -> Result<Self, NativeAddressError> {
+        if range.start.raw() >= range.end.raw() {
+            return Err(NativeAddressError::InvalidHostRange {
+                start: range.start.raw(),
+                length: range.end.raw().saturating_sub(range.start.raw()),
+            });
+        }
+        Ok(Self {
+            range,
+            unmap_on_drop: true,
+        })
+    }
+
     #[cfg(test)]
     pub(super) fn range(&self) -> Range<HostVa> {
         self.range.clone()
@@ -288,6 +301,23 @@ fn subtract_host_ranges(
     result
 }
 
+fn intersect_host_ranges(
+    ranges: &[Range<HostVa>],
+    reusable: &[Range<HostVa>],
+) -> Vec<Range<HostVa>> {
+    let mut result = Vec::new();
+    for range in ranges {
+        for keep in reusable {
+            let start = range.start.raw().max(keep.start.raw());
+            let end = range.end.raw().min(keep.end.raw());
+            if start < end {
+                result.push(HostVa(start)..HostVa(end));
+            }
+        }
+    }
+    result
+}
+
 fn map_reservation(start: usize, end: usize) -> Result<OwnedHostMapping, NativeAddressError> {
     let length = end
         .checked_sub(start)
@@ -386,7 +416,15 @@ impl NativeLayout {
                 }
             };
             match candidate.try_map_excluding(reusable_owned_ranges) {
-                Ok(reservations) => {
+                Ok(mut reservations) => {
+                    // A biased exec replacement transfers the old aperture's
+                    // reusable intervals into this layout. Adopt those mapped
+                    // intervals into the same RAII owner as newly reserved
+                    // target-only intervals, so the layout remains the sole
+                    // failure owner across the destructive replacement.
+                    for range in intersect_host_ranges(&candidate.ranges, reusable_owned_ranges) {
+                        reservations.push(OwnedHostMapping::adopt_existing(range)?);
+                    }
                     return Ok(Self {
                         mode: candidate.mode,
                         reservations,
