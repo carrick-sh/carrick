@@ -243,6 +243,17 @@ def budget_frames(
     pid: int = 10,
     tid: int = 11,
     era: int = 12,
+    # v2 attribution-contract fields.  Defaults keep every non-additive test
+    # untouched: thread_cpu defaults to the exclusive on-CPU phase sum (the
+    # same number the pre-v2 fixture used as its implicit "cpu_ns"), and
+    # process_cpu defaults to thread_cpu (helper_cpu == 0) so the additive
+    # gate reconciles without every caller having to reason about the new
+    # fields.
+    thread_cpu_ns: int | None = None,
+    blocked_cpu_ns: int = 0,
+    startup_wall_ns: int = 0,
+    startup_cpu_ns: int = 0,
+    process_cpu_ns: int | None = None,
 ):
     lines = nativeperf_frames(pid=pid, tid=tid, era=era)
     lines[0] = lines[0].replace("gateway_entries=2", f"gateway_entries={gateway_entries}").replace(
@@ -279,6 +290,24 @@ def budget_frames(
     ).replace("direct_resolver_exits=1", "direct_resolver_exits=0")
     if blocked_ns:
         lines[4] = lines[4].replace("phase_blocked_ns=0", f"phase_blocked_ns={blocked_ns}")
+    # phase_prepare_index_ns=10 + phase_translate_ns=3 + phase_translated_run_ns=20
+    # + phase_finish_exit_ns=4 + phase_sensitive_emulation_ns=0 +
+    # phase_syscall_dispatch_ns + phase_loop_quiesce_ns=2 — the fixed
+    # nativeperf_frames() base values that budget_frames never overrides,
+    # plus the caller-chosen syscall_dispatch_ns.
+    exclusive_sum = 10 + 3 + 20 + 4 + 0 + syscall_dispatch_ns + 2
+    resolved_thread_cpu = exclusive_sum if thread_cpu_ns is None else thread_cpu_ns
+    resolved_process_cpu = (
+        resolved_thread_cpu if process_cpu_ns is None else process_cpu_ns
+    )
+    prefix = f"NATIVEPERF1|thread|complete=1|pid={pid}|tid={tid}|era={era}|frame="
+    lines[0] += f"|thread_cpu_ns={resolved_thread_cpu}"
+    lines[4] += f"|phase_blocked_cpu_ns={blocked_cpu_ns}"
+    lines.append(
+        prefix
+        + f"process|startup_wall_ns={startup_wall_ns}|startup_cpu_ns={startup_cpu_ns}|"
+        f"process_cpu_ns={resolved_process_cpu}"
+    )
     return lines
 
 
@@ -288,6 +317,11 @@ def profile_with_budget(
     sensitive_exclusive: int,
     syscall_dispatch_ns: int,
     blocked_ns: int = 0,
+    thread_cpu_ns: int | None = None,
+    blocked_cpu_ns: int = 0,
+    startup_wall_ns: int = 0,
+    startup_cpu_ns: int = 0,
+    process_cpu_ns: int | None = None,
 ):
     return budget.parse_nativeperf(
         budget_frames(
@@ -295,19 +329,32 @@ def profile_with_budget(
             sensitive_exclusive=sensitive_exclusive,
             syscall_dispatch_ns=syscall_dispatch_ns,
             blocked_ns=blocked_ns,
+            thread_cpu_ns=thread_cpu_ns,
+            blocked_cpu_ns=blocked_cpu_ns,
+            startup_wall_ns=startup_wall_ns,
+            startup_cpu_ns=startup_cpu_ns,
+            process_cpu_ns=process_cpu_ns,
         )
     )
+
+
+def _process_cpu_total(profile):
+    """Sum, per pid, the max process_cpu_ns gauge across that pid's thread
+    groups.  Mirrors derive_additive_cpu_evidence's per-pid gauge semantics
+    so synthetic ABBA fixtures reconcile against the additive gate by
+    construction."""
+    by_pid: dict[int, int] = {}
+    for thread in profile.threads:
+        gauge = thread.value("process", "process_cpu_ns")
+        by_pid[thread.pid] = max(by_pid.get(thread.pid, 0), gauge)
+    return sum(by_pid.values())
 
 
 def strict_abba_records(
     profile, profiled_wall_ns=105, untraced_cpu_ns=100, profiled_cpu_ns=None
 ):
     if profiled_cpu_ns is None:
-        profiled_cpu_ns = sum(
-            thread.value(frame, field)
-            for thread in profile.threads
-            for frame, field, _ in budget.ON_CPU_PHASES
-        )
+        profiled_cpu_ns = _process_cpu_total(profile)
     records = []
     for label in budget.abba_schedule(samples=5):
         plane = "untraced" if label.startswith("off-") else "profiled"
@@ -756,6 +803,46 @@ class NativePerfV2Tests(unittest.TestCase):
             budget.parse_result_row(encoded)
 
 
+class AdditiveCpuEvidenceV2Tests(unittest.TestCase):
+    def test_v1_profile_is_rejected_by_additive_attribution(self):
+        profile = budget.parse_nativeperf(nativeperf_frames())
+        with self.assertRaisesRegex(
+            budget.BudgetError, "additive attribution requires NATIVEPERF v2"
+        ):
+            budget.derive_additive_cpu_evidence(profile, cpu_ns=100)
+
+    def test_helper_cpu_negative_is_rejected(self):
+        lines = nativeperf_frames_v2(thread_cpu_ns=50, process_cpu_ns=40, startup_cpu_ns=0)
+        profile = budget.parse_nativeperf(lines)
+        with self.assertRaisesRegex(budget.BudgetError, "helper CPU derivation is negative"):
+            budget.derive_additive_cpu_evidence(profile, cpu_ns=40)
+
+    def test_process_cpu_per_pid_uses_max_gauge_across_groups(self):
+        lines = nativeperf_frames_v2(
+            tid=11, thread_cpu_ns=10, process_cpu_ns=50, startup_cpu_ns=0
+        ) + nativeperf_frames_v2(
+            tid=12, thread_cpu_ns=10, process_cpu_ns=80, startup_cpu_ns=0
+        )
+        profile = budget.parse_nativeperf(lines)
+        additive = budget.derive_additive_cpu_evidence(profile, cpu_ns=80)
+        self.assertEqual(additive.process_cpu_ns, 80)
+        self.assertEqual(additive.thread_cpu_ns, 20)
+        self.assertEqual(additive.helper_cpu_ns, 60)
+        self.assertEqual(additive.startup_cpu_ns, 0)
+        self.assertEqual(additive.blocked_cpu_ns, 0)
+
+    def test_additive_residual_gate_rejects_both_signed_directions(self):
+        lines = nativeperf_frames_v2(thread_cpu_ns=40, process_cpu_ns=40, startup_cpu_ns=0)
+        profile = budget.parse_nativeperf(lines)
+        with self.assertRaisesRegex(budget.BudgetError, "2%"):
+            budget.derive_additive_cpu_evidence(profile, cpu_ns=100)
+        with self.assertRaisesRegex(budget.BudgetError, "2%"):
+            budget.derive_additive_cpu_evidence(profile, cpu_ns=10)
+        reconciled = budget.derive_additive_cpu_evidence(profile, cpu_ns=40)
+        self.assertEqual(reconciled.residual_ns, 0)
+        self.assertEqual(reconciled.residual_share, 0.0)
+
+
 class CaptureAndScheduleTests(unittest.TestCase):
     def test_docker_phase_rejects_any_live_carrick_process(self):
         clean = "  10 launchd\n  20 Docker Desktop\n"
@@ -1112,20 +1199,28 @@ class ReviewFixContractTests(unittest.TestCase):
             representativeness["w2_hottest"],
         )
 
-    def test_blocked_residual_saturation_is_marked_in_the_basis(self):
+    def test_blocked_cpu_rung_selects_scheduler_slice_from_measured_cpu(self):
+        # Migrated from the removed wall-based blocked-residual rung: the
+        # attribution term is now measured blocked CPU over untraced CPU,
+        # not aggregated blocked wall over untraced wall, and it no longer
+        # saturates at 1.0 — validate_profile already bounds blocked_cpu_ns
+        # by the thread's own blocked_ns wall.
         profile = profile_with_budget(
             gateway_entries=100,
             sensitive_exclusive=10,
             syscall_dispatch_ns=0,
             blocked_ns=150,
+            blocked_cpu_ns=40,
         )
         records = strict_abba_records(profile)
         decision = budget.analyze(records)
-        self.assertEqual(decision.selected_slice, "blocked-residual")
-        self.assertEqual(decision.share, 1.0)
+        self.assertEqual(decision.selected_slice, "blocked-cpu")
+        self.assertEqual(decision.scope, "process-cpu")
+        self.assertAlmostEqual(decision.share, 0.40)
         self.assertEqual(
-            decision.basis, "low-tax-blocked-off-cpu-over-untraced-wall-saturated"
+            decision.basis, "low-tax-measured-cpu-attribution-over-untraced-cpu"
         )
+        self.assertTrue(decision.duration_evidence_usable)
 
     def test_plane_c_binds_raw_trace_and_round_trips_all_shapes(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -1467,20 +1562,43 @@ class ReviewFixContractTests(unittest.TestCase):
         lines[5] = lines[5].replace("gateway_entries=2", "gateway_entries=4").replace(
             "direct_resolver_exits=1", "direct_resolver_exits=0"
         )
-        profile = budget.parse_nativeperf(lines)
-        counts = budget.derive_count_evidence(profile, scope="aggregate-threads")
+        v1_profile = budget.parse_nativeperf(lines)
+        counts = budget.derive_count_evidence(v1_profile, scope="aggregate-threads")
         self.assertEqual(dict(counts.sensitive_shares)["exclusive"], 0.5)
         self.assertEqual(dict(counts.sensitive_shares)["dc-zva"], 0.25)
         self.assertFalse(counts.resolver_recurring_pc_verified)
+
+        # Additive CPU attribution requires v2: the same exit/phase shape,
+        # now carrying the process frame plus thread/blocked CPU gauges.
+        v2_lines = list(lines)
+        v2_lines[0] += "|thread_cpu_ns=50"
+        v2_lines[4] += "|phase_blocked_cpu_ns=0"
+        v2_lines.append(
+            "NATIVEPERF1|thread|complete=1|pid=10|tid=11|era=12|frame=process|"
+            "startup_wall_ns=0|startup_cpu_ns=0|process_cpu_ns=50"
+        )
+        profile = budget.parse_nativeperf(v2_lines)
         # 10 + 3 + 20 + 4 + 6 + 5 + 2 = 50 on-CPU ns. Blocked is
         # separately retained and never double-counted into the CPU sum.
+        # process_cpu_ns=50 == thread_cpu_ns=50, so helper_cpu is zero and
+        # the residual reconciles exactly against the process-CPU total, not
+        # the exclusive-phase sum.
         additive = budget.derive_additive_cpu_evidence(profile, cpu_ns=50)
         self.assertEqual(additive.exclusive_sum_ns, 50)
         self.assertEqual(additive.blocked_ns, 0)
+        self.assertEqual(additive.thread_cpu_ns, 50)
+        self.assertEqual(additive.process_cpu_ns, 50)
+        self.assertEqual(additive.helper_cpu_ns, 0)
+        self.assertEqual(additive.blocked_cpu_ns, 0)
+        self.assertEqual(additive.startup_cpu_ns, 0)
         self.assertEqual(additive.residual_ns, 0)
+        self.assertEqual(additive.residual_share, 0.0)
         self.assertIsNone(additive.first_resolution_ns)
-        with self.assertRaisesRegex(budget.BudgetError, "negative additive residual"):
-            budget.derive_additive_cpu_evidence(profile, cpu_ns=49)
+        # A beyond-rounding overshoot in either direction is invalid: too
+        # little measured CPU relative to process_cpu_ns (double-counting)
+        # and too much (unattributed CPU) both fail the signed 2% gate.
+        with self.assertRaisesRegex(budget.BudgetError, "2%"):
+            budget.derive_additive_cpu_evidence(profile, cpu_ns=48)
         with self.assertRaisesRegex(budget.BudgetError, "2%"):
             budget.derive_additive_cpu_evidence(profile, cpu_ns=52)
 
@@ -1682,18 +1800,34 @@ class ReviewFixContractTests(unittest.TestCase):
         with self.assertRaisesRegex(budget.BudgetError, "2%"):
             budget.analyze(records)
 
-    def test_blocked_residual_rung_selects_scheduler_slice(self):
+    def test_analyze_validates_additive_model_rejects_negative_residual_too(self):
+        # process_cpu_ns totals 39 by default; a measured cpu_ns far below
+        # that overshoots the signed 2% gate in the other direction
+        # (double-counting), not just the "too much unattributed CPU" case
+        # covered above.
+        profile = profile_with_budget(
+            gateway_entries=100, sensitive_exclusive=40, syscall_dispatch_ns=0
+        )
+        records = strict_abba_records(profile, profiled_cpu_ns=10)
+        with self.assertRaisesRegex(budget.BudgetError, "2%"):
+            budget.analyze(records)
+
+    def test_blocked_cpu_rung_reports_process_cpu_scope(self):
+        # Migrated from the removed wall-based blocked-residual rung, which
+        # asserted scope="process-wall"; the measured-CPU replacement is
+        # scoped to process-cpu instead.
         profile = profile_with_budget(
             gateway_entries=100,
             sensitive_exclusive=10,
             syscall_dispatch_ns=0,
             blocked_ns=35,
+            blocked_cpu_ns=32,
         )
         records = strict_abba_records(profile)
         decision = budget.analyze(records)
-        self.assertEqual(decision.selected_slice, "blocked-residual")
-        self.assertEqual(decision.scope, "process-wall")
-        self.assertIn("wall", decision.basis)
+        self.assertEqual(decision.selected_slice, "blocked-cpu")
+        self.assertEqual(decision.scope, "process-cpu")
+        self.assertIn("cpu", decision.basis)
         self.assertTrue(decision.duration_evidence_usable)
 
     def test_analyzer_never_combines_count_and_cpu_fractions(self):
@@ -1711,6 +1845,112 @@ class ReviewFixContractTests(unittest.TestCase):
         decision = budget.analyze(records)
         self.assertEqual(decision.selected_slice, "syscall-dispatch")
         self.assertNotIn("two-term", decision.basis)
+
+    def test_startup_cpu_rung_selects_scheduler_slice(self):
+        profile = profile_with_budget(
+            gateway_entries=100,
+            sensitive_exclusive=10,
+            syscall_dispatch_ns=0,
+            startup_wall_ns=100,
+            startup_cpu_ns=35,
+        )
+        records = strict_abba_records(profile)
+        decision = budget.analyze(records)
+        self.assertEqual(decision.selected_slice, "startup-cpu")
+        self.assertEqual(decision.scope, "process-cpu")
+        self.assertAlmostEqual(decision.share, 0.35)
+        self.assertEqual(
+            decision.basis, "low-tax-measured-cpu-attribution-over-untraced-cpu"
+        )
+        self.assertTrue(decision.duration_evidence_usable)
+
+    def test_helper_cpu_rung_selects_scheduler_slice(self):
+        profile = profile_with_budget(
+            gateway_entries=100,
+            sensitive_exclusive=10,
+            syscall_dispatch_ns=0,
+            # thread_cpu defaults to the exclusive-phase sum (39); bumping
+            # process_cpu_ns above that leaves an unattributed helper share
+            # that only host-thread bookkeeping (not this guest thread's own
+            # phases) can explain.
+            process_cpu_ns=74,
+        )
+        records = strict_abba_records(profile)
+        decision = budget.analyze(records)
+        self.assertEqual(decision.selected_slice, "helper-cpu")
+        self.assertEqual(decision.scope, "process-cpu")
+        self.assertAlmostEqual(decision.share, 0.35)
+        self.assertEqual(
+            decision.basis, "low-tax-measured-cpu-attribution-over-untraced-cpu"
+        )
+
+    def test_duration_two_term_rung_considers_all_four_terms_but_cannot_be_satisfied(self):
+        # Structural coverage for the four-term duration set now feeding the
+        # existing two-term fallback (previously a single-element list with
+        # zero candidate pairs, since it only ever held syscall-dispatch).
+        # With every individual term held below the 30% single-select
+        # threshold, no pair of two such terms can reach the pair's 60%
+        # threshold (a<0.3 and b<0.3 implies a+b<0.6) — the same structural
+        # non-reachability the pre-existing two-term COUNT rung has always
+        # had. This proves the four terms are wired into the shared
+        # two_term_best fallback (0.20+0.20=0.40 is the closest pair here,
+        # not 0.0+0.0) and that the analyzer still fails closed rather than
+        # inventing a selection.
+        profile = profile_with_budget(
+            gateway_entries=100,
+            sensitive_exclusive=5,
+            syscall_dispatch_ns=20,
+            blocked_ns=25,
+            blocked_cpu_ns=20,
+            startup_wall_ns=50,
+            startup_cpu_ns=10,
+            process_cpu_ns=64,
+        )
+        records = strict_abba_records(profile)
+        with self.assertRaisesRegex(
+            budget.BudgetError,
+            "no independently verified slice satisfies the committed rule",
+        ):
+            budget.analyze(records)
+
+    def test_duration_share_above_one_fails_closed(self):
+        # blocked_cpu_ns can legitimately exceed untraced CPU when several
+        # threads block concurrently (their blocked CPU sums past a single
+        # thread's wall-clock capacity). That must fail closed, not silently
+        # saturate — the old wall-based rung's saturation semantics were
+        # retired along with it.
+        profile = profile_with_budget(
+            gateway_entries=100,
+            sensitive_exclusive=10,
+            syscall_dispatch_ns=0,
+            blocked_ns=150,
+            blocked_cpu_ns=150,
+        )
+        records = strict_abba_records(profile)
+        with self.assertRaisesRegex(
+            budget.BudgetError, "duration evidence does not reconcile to untraced CPU"
+        ):
+            budget.analyze(records)
+
+    def test_analyze_evidence_check_round_trips_a_blocked_cpu_decision(self):
+        profile = profile_with_budget(
+            gateway_entries=100,
+            sensitive_exclusive=10,
+            syscall_dispatch_ns=0,
+            blocked_ns=150,
+            blocked_cpu_ns=40,
+        )
+        records = strict_abba_records(profile)
+        decision = budget.analyze(records)
+        self.assertEqual(decision.selected_slice, "blocked-cpu")
+        rows = [budget.run_record_json(record) for record in records]
+        rows.append(budget.decision_record_json(decision))
+        with tempfile.TemporaryDirectory() as temp:
+            evidence = pathlib.Path(temp) / "evidence.jsonl"
+            evidence.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            checked = budget.analyze_evidence(evidence, check=True)
+            self.assertEqual(checked, decision)
+            self.assertEqual(checked.selected_slice, "blocked-cpu")
 
 
 class AnalyzerTests(unittest.TestCase):
