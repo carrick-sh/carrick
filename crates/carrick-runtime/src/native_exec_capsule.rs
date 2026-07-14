@@ -1276,6 +1276,22 @@ mod tests {
     }
 
     #[test]
+    fn legacy_v1_payload_without_profile_startup_defaults_to_none() {
+        let payload = sample();
+        let mut value = serde_json::to_value(payload).expect("serialize capsule");
+        value
+            .get_mut("guest_exec")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("guest payload")
+            .remove("profile_startup");
+
+        let decoded: NativeExecCapsuleV1 =
+            serde_json::from_value(value).expect("decode prior V1 payload");
+        let guest = decoded.guest_exec.expect("guest payload");
+        assert!(guest.profile_startup.is_none());
+    }
+
+    #[test]
     fn invalid_bind_mount_is_rejected_before_host_exec() {
         let mut payload = sample();
         payload
