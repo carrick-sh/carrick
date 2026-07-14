@@ -16,6 +16,173 @@ BEGIN
     self->exec_map_icache_total = 0;
     self->exec_map_protect_total = 0;
     self->exec_map_vvar_total = 0;
+    self->host_capsule_started = 0;
+    self->host_restore_started = 0;
+    self->host_dispatcher_started = 0;
+    self->host_image_load_started = 0;
+    self->host_reset_started = 0;
+    self->host_preflight_active = 0;
+    self->host_capsule_prepare_active = 0;
+}
+
+/* Phases 37/38/25: old-process preflight and capsule preparation. */
+carrick*:::dsr-cache-lifecycle
+/(pid == $target || progenyof($target)) && arg1 == 37/
+{
+    self->host_preflight_active = 1;
+    self->host_preflight_started = timestamp;
+    @host_preflight_open[pid, arg0] = sum(1);
+}
+
+carrick*:::dsr-cache-lifecycle
+/(pid == $target || progenyof($target)) && arg1 == 38 && self->host_preflight_active/
+{
+    this->ns = timestamp - self->host_preflight_started;
+    printf("DSRPROF1|sample|phase=host-self-reexec-preflight|pid=%d|tid=%d|duration_ns=%d\n",
+        pid, arg0, this->ns);
+    @host_preflight_open[pid, arg0] = sum(-1);
+    self->host_preflight_active = 0;
+    self->host_capsule_prepare_active = 1;
+    self->host_capsule_prepare_started = timestamp;
+    @host_capsule_prepare_open[pid, arg0] = sum(1);
+}
+
+carrick*:::dsr-cache-lifecycle
+/(pid == $target || progenyof($target)) && arg1 == 25 && self->host_capsule_prepare_active/
+{
+    this->ns = timestamp - self->host_capsule_prepare_started;
+    printf("DSRPROF1|sample|phase=host-self-reexec-capsule-prepare|pid=%d|tid=%d|duration_ns=%d\n",
+        pid, arg0, this->ns);
+    @host_capsule_prepare_open[pid, arg0] = sum(-1);
+    self->host_capsule_prepare_active = 0;
+}
+
+/* Phase 25/26: PID-preserving host self-exec startup.  Use a process-keyed
+ * associative array because thread-local D state does not survive exec(2). */
+carrick*:::dsr-cache-lifecycle
+/(pid == $target || progenyof($target)) && arg1 == 25/
+{
+    @host_reexec_open[pid, arg0] = sum(1);
+    host_reexec_started[pid] = timestamp;
+    host_reexec_tid[pid] = arg0;
+}
+
+proc:::exec-success
+/pid == $target || progenyof($target)/
+{
+    host_reexec_exec_success[pid] = timestamp;
+}
+
+carrick*:::dsr-cache-lifecycle
+/(pid == $target || progenyof($target)) && arg1 == 27/
+{
+    host_reexec_probes_ready[pid] = timestamp;
+}
+
+carrick*:::dsr-cache-lifecycle
+/(pid == $target || progenyof($target)) && arg1 == 26/
+{
+    this->ns = timestamp - host_reexec_started[pid];
+    printf("DSRPROF1|sample|phase=host-self-reexec|pid=%d|tid=%d|duration_ns=%d\n",
+        pid, arg0, this->ns);
+    this->kernel_ns = host_reexec_exec_success[pid] - host_reexec_started[pid];
+    printf("DSRPROF1|sample|phase=host-self-reexec-kernel|pid=%d|tid=%d|duration_ns=%d\n",
+        pid, arg0, this->kernel_ns);
+    this->resume_ns = timestamp - host_reexec_exec_success[pid];
+    printf("DSRPROF1|sample|phase=host-self-reexec-resume|pid=%d|tid=%d|duration_ns=%d\n",
+        pid, arg0, this->resume_ns);
+    this->register_ns = host_reexec_probes_ready[pid] - host_reexec_exec_success[pid];
+    printf("DSRPROF1|sample|phase=host-self-reexec-startup|pid=%d|tid=%d|duration_ns=%d\n",
+        pid, arg0, this->register_ns);
+    this->dispatch_ns = timestamp - host_reexec_probes_ready[pid];
+    printf("DSRPROF1|sample|phase=host-self-reexec-cli-dispatch|pid=%d|tid=%d|duration_ns=%d\n",
+        pid, arg0, this->dispatch_ns);
+    @host_reexec_open[pid, host_reexec_tid[pid]] = sum(-1);
+    host_reexec_started[pid] = 0;
+    host_reexec_tid[pid] = 0;
+    host_reexec_exec_success[pid] = 0;
+    host_reexec_probes_ready[pid] = 0;
+}
+
+/* Phases 28-36: post-dispatch capsule and guest-image reconstruction. */
+carrick*:::dsr-cache-lifecycle
+/(pid == $target || progenyof($target)) && arg1 == 28/
+{
+    self->host_capsule_started = timestamp;
+    @host_capsule_open[pid, arg0] = sum(1);
+}
+
+carrick*:::dsr-cache-lifecycle
+/(pid == $target || progenyof($target)) && arg1 == 29/
+{
+    this->ns = timestamp - self->host_capsule_started;
+    printf("DSRPROF1|sample|phase=host-self-reexec-capsule|pid=%d|tid=%d|duration_ns=%d\n",
+        pid, arg0, this->ns);
+    @host_capsule_open[pid, arg0] = sum(-1);
+    self->host_capsule_started = 0;
+}
+
+carrick*:::dsr-cache-lifecycle
+/(pid == $target || progenyof($target)) && arg1 == 30/
+{
+    self->host_restore_started = timestamp;
+    self->host_dispatcher_started = timestamp;
+    @host_restore_open[pid, arg0] = sum(1);
+    @host_dispatcher_open[pid, arg0] = sum(1);
+}
+
+carrick*:::dsr-cache-lifecycle
+/(pid == $target || progenyof($target)) && arg1 == 31/
+{
+    this->ns = timestamp - self->host_dispatcher_started;
+    printf("DSRPROF1|sample|phase=host-self-reexec-dispatcher|pid=%d|tid=%d|duration_ns=%d\n",
+        pid, arg0, this->ns);
+    @host_dispatcher_open[pid, arg0] = sum(-1);
+    self->host_dispatcher_started = 0;
+}
+
+carrick*:::dsr-cache-lifecycle
+/(pid == $target || progenyof($target)) && arg1 == 32/
+{
+    self->host_image_load_started = timestamp;
+    @host_image_load_open[pid, arg0] = sum(1);
+}
+
+carrick*:::dsr-cache-lifecycle
+/(pid == $target || progenyof($target)) && arg1 == 33/
+{
+    this->ns = timestamp - self->host_image_load_started;
+    printf("DSRPROF1|sample|phase=host-self-reexec-image-load|pid=%d|tid=%d|duration_ns=%d\n",
+        pid, arg0, this->ns);
+    @host_image_load_open[pid, arg0] = sum(-1);
+    self->host_image_load_started = 0;
+}
+
+carrick*:::dsr-cache-lifecycle
+/(pid == $target || progenyof($target)) && arg1 == 34/
+{
+    self->host_reset_started = timestamp;
+    @host_reset_open[pid, arg0] = sum(1);
+}
+
+carrick*:::dsr-cache-lifecycle
+/(pid == $target || progenyof($target)) && arg1 == 35/
+{
+    this->ns = timestamp - self->host_reset_started;
+    printf("DSRPROF1|sample|phase=host-self-reexec-reset|pid=%d|tid=%d|duration_ns=%d\n",
+        pid, arg0, this->ns);
+    @host_reset_open[pid, arg0] = sum(-1);
+    self->host_reset_started = 0;
+}
+
+carrick*:::dsr-cache-lifecycle
+/(pid == $target || progenyof($target)) && arg1 == 36/
+{
+    this->ns = timestamp - self->host_restore_started;
+    printf("DSRPROF1|sample|phase=host-self-reexec-restore|pid=%d|tid=%d|duration_ns=%d\n",
+        pid, arg0, this->ns);
+    @host_restore_open[pid, arg0] = sum(-1);
+    self->host_restore_started = 0;
 }
 
 proc:::exit
@@ -506,6 +673,14 @@ END
     printa("DSRPROF1|incomplete|phase=fork-child-repair|pid=%d|tid=%d|kind=missing-begin|value=%@d\n", @fork_repair_missing_begin);
     printa("DSRPROF1|incomplete|phase=first-prepare-after-fork|pid=%d|tid=%d|kind=open|value=%@d\n", @fork_first_open);
     printa("DSRPROF1|incomplete|phase=first-prepare-after-fork|pid=%d|tid=%d|kind=overwrite|value=%@d\n", @fork_first_overwrite);
+    printa("DSRPROF1|incomplete|phase=host-self-reexec|pid=%d|tid=%d|kind=open|value=%@d\n", @host_reexec_open);
+    printa("DSRPROF1|incomplete|phase=host-self-reexec-preflight|pid=%d|tid=%d|kind=open|value=%@d\n", @host_preflight_open);
+    printa("DSRPROF1|incomplete|phase=host-self-reexec-capsule-prepare|pid=%d|tid=%d|kind=open|value=%@d\n", @host_capsule_prepare_open);
+    printa("DSRPROF1|incomplete|phase=host-self-reexec-capsule|pid=%d|tid=%d|kind=open|value=%@d\n", @host_capsule_open);
+    printa("DSRPROF1|incomplete|phase=host-self-reexec-dispatcher|pid=%d|tid=%d|kind=open|value=%@d\n", @host_dispatcher_open);
+    printa("DSRPROF1|incomplete|phase=host-self-reexec-image-load|pid=%d|tid=%d|kind=open|value=%@d\n", @host_image_load_open);
+    printa("DSRPROF1|incomplete|phase=host-self-reexec-reset|pid=%d|tid=%d|kind=open|value=%@d\n", @host_reset_open);
+    printa("DSRPROF1|incomplete|phase=host-self-reexec-restore|pid=%d|tid=%d|kind=open|value=%@d\n", @host_restore_open);
 
     printa("DSRPROF1|incomplete|phase=exec-reset|pid=%d|tid=%d|kind=open|value=%@d\n", @exec_reset_open);
     printa("DSRPROF1|incomplete|phase=exec-reset|pid=%d|tid=%d|kind=overwrite|value=%@d\n", @exec_reset_overwrite);

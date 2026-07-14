@@ -745,6 +745,8 @@ pub(crate) fn resume_guest_from_capsule(
     dispatcher
         .restore_native_reexec_fd_table(&guest.fd_table)
         .map_err(|error| anyhow::anyhow!("restore native guest fd table: {error}"))?;
+    native_reexec_lifecycle(crate::probes::DsrCacheLifecyclePhase::HostSelfReexecDispatcherReady);
+    native_reexec_lifecycle(crate::probes::DsrCacheLifecyclePhase::HostSelfReexecImageLoadBegin);
     let (image, relative_relocations, resolved, _resolved_argv, executable_digest) =
         load_native_execve_image(
             &dispatcher,
@@ -754,9 +756,11 @@ pub(crate) fn resume_guest_from_capsule(
             &plan,
         )
         .map_err(|errno| anyhow::anyhow!("reload guest executable failed: {errno:?}"))?;
+    native_reexec_lifecycle(crate::probes::DsrCacheLifecyclePhase::HostSelfReexecImageLoadEnd);
     if executable_digest != guest.executable_digest {
         anyhow::bail!("guest executable changed across native host self-reexec");
     }
+    native_reexec_lifecycle(crate::probes::DsrCacheLifecyclePhase::HostSelfReexecResetBegin);
     dispatcher.reset_memory_state_on_execve();
     dispatcher.reset_signal_handlers_on_execve();
     dispatcher.set_executable_identity(
@@ -766,8 +770,15 @@ pub(crate) fn resume_guest_from_capsule(
             .collect(),
         env,
     );
+    native_reexec_lifecycle(crate::probes::DsrCacheLifecyclePhase::HostSelfReexecResetEnd);
+    native_reexec_lifecycle(crate::probes::DsrCacheLifecyclePhase::HostSelfReexecGuestEntry);
     run_image_in_current_process(image, dispatcher, max_traps, &relative_relocations, &plan)
         .map_err(anyhow::Error::from)
+}
+
+fn native_reexec_lifecycle(phase: crate::probes::DsrCacheLifecyclePhase) {
+    let tid = unsafe { libc::getpid() };
+    crate::probes::dsr_cache_lifecycle(tid, phase, 0, 0, 0);
 }
 
 fn native_memory_layout() -> MemoryLayout {
@@ -1643,6 +1654,11 @@ fn run_native_dsr_thread_loop(
                 }
             }
             DispatchOutcome::Execve { path, argv, env } => {
+                if NATIVE_FORKED_GUEST_CHILD.load(std::sync::atomic::Ordering::Acquire) {
+                    native_reexec_lifecycle(
+                        crate::probes::DsrCacheLifecyclePhase::HostSelfReexecPreflightBegin,
+                    );
+                }
                 let capsule_env = env.clone();
                 let proc_argv: Vec<String> = argv
                     .iter()

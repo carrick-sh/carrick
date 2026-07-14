@@ -930,6 +930,7 @@ mod tests {
             [
                 "DSRPROF1|sample|phase=fork-child-repair|pid=21|tid=21|duration_ns=1200",
                 "DSRPROF1|sample|phase=first-prepare-after-fork|pid=21|tid=21|duration_ns=800",
+                "DSRPROF1|sample|phase=host-self-reexec|pid=21|tid=21|duration_ns=1100",
                 "DSRPROF1|sample|phase=exec-reset|pid=21|tid=21|duration_ns=900",
                 "DSRPROF1|sample|phase=first-prepare-after-exec|pid=21|tid=21|duration_ns=700",
                 "DSRPROF1|incomplete|phase=exec-reset|pid=21|tid=21|kind=open|value=1",
@@ -944,7 +945,7 @@ mod tests {
                 .iter()
                 .filter(|metric| matches!(metric.metric, ProfileMetric::SampledDuration { .. }))
                 .count(),
-            4
+            5
         );
         assert_eq!(summary.completion.incomplete_pairs, 1);
         assert!(!summary.completion.complete);

@@ -148,6 +148,14 @@ use crate::runtime_util::register_dtrace_probes;
 fn main() -> anyhow::Result<()> {
     configure_process_environment();
     register_dtrace_probes();
+    #[cfg(feature = "platform-macos")]
+    carrick_runtime::probes::dsr_cache_lifecycle(
+        unsafe { libc::getpid() },
+        carrick_runtime::probes::DsrCacheLifecyclePhase::HostSelfReexecProbesReady,
+        0,
+        0,
+        0,
+    );
 
     run_cli(Cli::parse())
 }

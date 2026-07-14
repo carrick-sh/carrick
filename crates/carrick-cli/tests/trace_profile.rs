@@ -163,14 +163,29 @@ fn fork_profile_pairs_repair_reset_and_first_prepare_latency() {
         "dsr-prepare-begin",
         "fork-pre",
         "fork-post",
+        "proc:::exec-success",
         "syscall::fork:entry",
         "syscall::fork:return",
     ] {
         assert!(script.contains(probe), "missing {probe}");
     }
+    for phase in ["host-self-reexec-startup", "host-self-reexec-cli-dispatch"] {
+        assert!(
+            script.contains(&format!("DSRPROF1|sample|phase={phase}")),
+            "missing {phase} sample"
+        );
+    }
     for phase in [
         "fork-child-repair",
         "first-prepare-after-fork",
+        "host-self-reexec",
+        "host-self-reexec-preflight",
+        "host-self-reexec-capsule-prepare",
+        "host-self-reexec-capsule",
+        "host-self-reexec-dispatcher",
+        "host-self-reexec-image-load",
+        "host-self-reexec-reset",
+        "host-self-reexec-restore",
         "exec-reset",
         "first-prepare-after-exec",
         "exec-image-unmap",
