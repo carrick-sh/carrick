@@ -158,6 +158,19 @@ struct DirectVmReservationSpan {
 }
 
 impl DirectVmReservation {
+    /// Host VM spans this reservation owns and will retire while armed.
+    ///
+    /// A requested Direct range can contain dyld delegated shared-pmap holes,
+    /// so callers must use these measured spans rather than treating the
+    /// complete requested range as reservation-owned.
+    pub fn owned_spans(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        #[cfg(target_os = "macos")]
+        let spans = self.spans.iter().map(|span| (span.address, span.length));
+        #[cfg(not(target_os = "macos"))]
+        let spans = std::iter::empty();
+        spans
+    }
+
     pub fn commit(mut self) {
         #[cfg(target_os = "macos")]
         {

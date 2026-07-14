@@ -98,6 +98,10 @@ thread_local! {
         std::cell::RefCell<Option<Vec<(usize, u64)>>> = const {
             std::cell::RefCell::new(None)
         };
+    static NATIVE_TEST_SUPPLEMENTAL_ROLLBACKS:
+        std::cell::RefCell<Vec<std::ops::Range<carrick_guest_mem::HostVa>>> = const {
+            std::cell::RefCell::new(Vec::new())
+        };
 }
 
 #[cfg(test)]
@@ -129,6 +133,11 @@ fn take_native_prepared_mapping_failpoint(failpoint: NativePreparedMappingFailpo
 #[cfg(test)]
 fn set_native_test_vvar_words(words: Option<Vec<(usize, u64)>>) {
     NATIVE_TEST_VVAR_WORDS.with(|slot| *slot.borrow_mut() = words);
+}
+
+#[cfg(test)]
+fn take_native_test_supplemental_rollbacks() -> Vec<std::ops::Range<carrick_guest_mem::HostVa>> {
+    NATIVE_TEST_SUPPLEMENTAL_ROLLBACKS.with(|slot| std::mem::take(&mut *slot.borrow_mut()))
 }
 
 /// Set by the exec teardown at its success point (BEFORE it lowers the
@@ -5636,6 +5645,7 @@ struct PreparedNativeExecMapping {
     process_translator: Arc<dsr::ProcessTranslator>,
     reset_inherited_translator: bool,
     direct_target_reservations: Vec<crate::host_proc::DirectVmReservation>,
+    rollback_plan: NativeMappingRollbackPlan,
 }
 
 #[derive(Clone, Copy)]
@@ -5651,19 +5661,81 @@ impl NativeImageBacking<'_> {
     }
 }
 
-struct NativeMappedRangeGuard {
-    start: carrick_guest_mem::HostVa,
-    length: usize,
+struct NativeMappingRollbackPlan {
+    supplemental_ranges: Vec<std::ops::Range<carrick_guest_mem::HostVa>>,
+}
+
+impl NativeMappingRollbackPlan {
+    fn for_fresh_layout(layout: &NativeLayout) -> Self {
+        let supplemental_ranges = match layout.address_mode() {
+            NativeAddressMode::Direct => layout.owned_ranges().to_vec(),
+            NativeAddressMode::Biased { .. } => Vec::new(),
+        };
+        Self {
+            supplemental_ranges,
+        }
+    }
+
+    fn direct_exec(
+        owned_ranges: &[std::ops::Range<carrick_guest_mem::HostVa>],
+        mut reservation_ranges: Vec<std::ops::Range<carrick_guest_mem::HostVa>>,
+    ) -> Self {
+        normalize_host_ranges(&mut reservation_ranges);
+        Self {
+            supplemental_ranges: subtract_host_ranges(owned_ranges, &reservation_ranges),
+        }
+    }
+}
+
+struct NativeMappingRollback {
+    supplemental_ranges: Vec<std::ops::Range<carrick_guest_mem::HostVa>>,
+    mapped_supplemental_ranges: Vec<std::ops::Range<carrick_guest_mem::HostVa>>,
+    host_page_size: usize,
     armed: bool,
 }
 
-impl NativeMappedRangeGuard {
-    fn new(start: carrick_guest_mem::HostVa, length: usize) -> Self {
-        Self {
-            start,
-            length,
-            armed: true,
+impl NativeMappingRollback {
+    fn new(
+        plan: NativeMappingRollbackPlan,
+        host_page_size: u64,
+        capacity: usize,
+    ) -> Result<Self, RuntimeError> {
+        let host_page_size = usize::try_from(host_page_size).map_err(|_| {
+            RuntimeError::Unsupported(format!(
+                "native rollback host page size is not representable: 0x{host_page_size:x}"
+            ))
+        })?;
+        if !host_page_size.is_power_of_two() {
+            return Err(RuntimeError::Unsupported(format!(
+                "native rollback host page size is invalid: 0x{host_page_size:x}"
+            )));
         }
+        Ok(Self {
+            supplemental_ranges: plan.supplemental_ranges,
+            mapped_supplemental_ranges: Vec::with_capacity(capacity),
+            host_page_size,
+            armed: true,
+        })
+    }
+
+    fn track_mapping(&mut self, start: carrick_guest_mem::HostVa, length: usize) {
+        if length == 0 || self.supplemental_ranges.is_empty() {
+            return;
+        }
+        let page_mask = self.host_page_size.saturating_sub(1);
+        let mapped_start = start.raw() & !page_mask;
+        let mapped_end = start.raw().saturating_add(length).saturating_add(page_mask) & !page_mask;
+        for owned in &self.supplemental_ranges {
+            let overlap_start = mapped_start.max(owned.start.raw());
+            let overlap_end = mapped_end.min(owned.end.raw());
+            if overlap_start < overlap_end {
+                self.mapped_supplemental_ranges.push(
+                    carrick_guest_mem::HostVa(overlap_start)
+                        ..carrick_guest_mem::HostVa(overlap_end),
+                );
+            }
+        }
+        normalize_host_ranges(&mut self.mapped_supplemental_ranges);
     }
 
     fn commit(mut self) {
@@ -5671,34 +5743,21 @@ impl NativeMappedRangeGuard {
     }
 }
 
-impl Drop for NativeMappedRangeGuard {
+impl Drop for NativeMappingRollback {
     fn drop(&mut self) {
-        if self.armed && self.length != 0 {
-            unsafe {
-                libc::munmap(self.start.raw() as *mut libc::c_void, self.length);
+        if !self.armed {
+            return;
+        }
+        for range in &self.mapped_supplemental_ranges {
+            let length = range.end.raw().saturating_sub(range.start.raw());
+            if length == 0 {
+                continue;
             }
-        }
-    }
-}
-
-struct NativeMappingRollback {
-    ranges: Vec<NativeMappedRangeGuard>,
-}
-
-impl NativeMappingRollback {
-    fn new(capacity: usize) -> Self {
-        Self {
-            ranges: Vec::with_capacity(capacity),
-        }
-    }
-
-    fn track(&mut self, range: NativeMappedRangeGuard) {
-        self.ranges.push(range);
-    }
-
-    fn commit(self) {
-        for range in self.ranges {
-            range.commit();
+            #[cfg(test)]
+            NATIVE_TEST_SUPPLEMENTAL_ROLLBACKS.with(|slot| slot.borrow_mut().push(range.clone()));
+            unsafe {
+                libc::munmap(range.start.raw() as *mut libc::c_void, length);
+            }
         }
     }
 }
@@ -5714,6 +5773,13 @@ struct NativeMappingOptions<'a> {
     exec_map_dsr_tid: Option<crate::thread::ThreadId>,
     relative_relocations: &'a [NativeRelativeRelocation],
     backing: NativeImageBacking<'a>,
+    rollback_plan: NativeMappingRollbackPlan,
+}
+
+struct NativeByteRegionOptions {
+    final_prot: libc::c_int,
+    executable: bool,
+    exec_map_dsr_tid: Option<crate::thread::ThreadId>,
 }
 
 #[derive(Clone, Copy)]
@@ -5772,6 +5838,22 @@ fn native_region_linux_prot(read: bool, write: bool, exec: bool) -> u64 {
         prot |= crate::linux_abi::LINUX_PROT_EXEC;
     }
     prot
+}
+
+fn normalize_host_ranges(ranges: &mut Vec<std::ops::Range<carrick_guest_mem::HostVa>>) {
+    ranges.sort_unstable_by_key(|range| range.start.raw());
+    let mut write = 0;
+    for read in 0..ranges.len() {
+        if write != 0 && ranges[read].start.raw() <= ranges[write - 1].end.raw() {
+            if ranges[read].end.raw() > ranges[write - 1].end.raw() {
+                ranges[write - 1].end = ranges[read].end;
+            }
+        } else {
+            ranges.swap(write, read);
+            write += 1;
+        }
+    }
+    ranges.truncate(write);
 }
 
 fn subtract_host_ranges(
@@ -5913,6 +5995,7 @@ impl NativeMappedMemory {
     ) -> Result<Self, RuntimeError> {
         let native_layout = NativeLayout::for_image(image, layout, host_page_size)
             .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+        let rollback_plan = NativeMappingRollbackPlan::for_fresh_layout(&native_layout);
         Self::map_with_layout(
             image,
             layout,
@@ -5926,6 +6009,7 @@ impl NativeMappedMemory {
                 exec_map_dsr_tid: None,
                 relative_relocations,
                 backing: NativeImageBacking::AnonymousBytes,
+                rollback_plan,
             },
         )
     }
@@ -5939,6 +6023,7 @@ impl NativeMappedMemory {
         let native_layout =
             NativeLayout::for_image(&prepared.image, layout, plan.page_geometry.host_page_size)
                 .map_err(|error| RuntimeError::Unsupported(format!("prepared-map: {error}")))?;
+        let rollback_plan = NativeMappingRollbackPlan::for_fresh_layout(&native_layout);
         Self::map_with_layout(
             &prepared.image,
             layout,
@@ -5952,6 +6037,7 @@ impl NativeMappedMemory {
                 exec_map_dsr_tid: None,
                 relative_relocations: &prepared.relocations,
                 backing: NativeImageBacking::Prepared(prepared),
+                rollback_plan,
             },
         )
     }
@@ -5967,6 +6053,7 @@ impl NativeMappedMemory {
     ) -> Result<Self, RuntimeError> {
         let native_layout = NativeLayout::for_image(image, layout, host_page_size)
             .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+        let rollback_plan = NativeMappingRollbackPlan::for_fresh_layout(&native_layout);
         Self::map_with_layout(
             image,
             layout,
@@ -5980,6 +6067,7 @@ impl NativeMappedMemory {
                 exec_map_dsr_tid,
                 relative_relocations: &[],
                 backing: NativeImageBacking::AnonymousBytes,
+                rollback_plan,
             },
         )
     }
@@ -5996,17 +6084,20 @@ impl NativeMappedMemory {
             exec_map_dsr_tid,
             relative_relocations,
             backing,
+            rollback_plan,
         } = options;
         native_exec_map_profile_start(exec_map_dsr_tid);
         let mut regions = Vec::new();
-        let mut rollback = NativeMappingRollback::new(image.regions().len() + 5);
+        let mut rollback =
+            NativeMappingRollback::new(rollback_plan, page_sizes.host, image.regions().len() + 5)?;
         for (region_index, region) in image.regions().iter().enumerate() {
-            let mapped = match backing {
+            match backing {
                 NativeImageBacking::AnonymousBytes => map_region(
                     region,
                     exec_map_dsr_tid,
                     image.initial_stack_pointer(),
                     &native_layout,
+                    &mut rollback,
                 )?,
                 NativeImageBacking::Prepared(prepared) => {
                     let file_backing =
@@ -6026,10 +6117,10 @@ impl NativeMappedMemory {
                         prepared,
                         exec_map_dsr_tid,
                         &native_layout,
+                        &mut rollback,
                     )?
                 }
             };
-            rollback.track(mapped);
             if region.start == NATIVE_DARWIN_VDSO_BASE && region.perms.execute {
                 native_exec_map_detail(
                     exec_map_dsr_tid,
@@ -6058,15 +6149,18 @@ impl NativeMappedMemory {
                 shared_key_offset: 0,
             });
         }
-        rollback.track(map_bytes_region(
+        map_bytes_region(
             NATIVE_DARWIN_SIGRETURN_TRAMPOLINE_BASE,
             carrick_mem::memory::LINUX_SIGRETURN_TRAMPOLINE_SIZE,
             &carrick_mem::memory::sigreturn_trampoline_bytes(),
-            libc::PROT_READ | libc::PROT_EXEC,
-            true,
-            exec_map_dsr_tid,
+            NativeByteRegionOptions {
+                final_prot: libc::PROT_READ | libc::PROT_EXEC,
+                executable: true,
+                exec_map_dsr_tid,
+            },
             &native_layout,
-        )?);
+            &mut rollback,
+        )?;
         regions.push(NativeMappedRegion {
             start: NATIVE_DARWIN_SIGRETURN_TRAMPOLINE_BASE,
             end: NATIVE_DARWIN_SIGRETURN_TRAMPOLINE_BASE
@@ -6083,12 +6177,13 @@ impl NativeMappedMemory {
             crate::probes::DsrCacheLifecyclePhase::ExecMapMmapBegin,
             layout.heap_size,
         );
-        rollback.track(map_anonymous_region(
+        map_anonymous_region(
             layout.heap_base,
             layout.heap_size,
             false,
             &native_layout,
-        )?);
+            &mut rollback,
+        )?;
         native_exec_map_detail(
             exec_map_dsr_tid,
             crate::probes::DsrCacheLifecyclePhase::ExecMapMmapEnd,
@@ -6109,12 +6204,13 @@ impl NativeMappedMemory {
             crate::probes::DsrCacheLifecyclePhase::ExecMapMmapBegin,
             layout.mmap_size,
         );
-        rollback.track(map_anonymous_region(
+        map_anonymous_region(
             layout.mmap_base,
             layout.mmap_size,
             false,
             &native_layout,
-        )?);
+            &mut rollback,
+        )?;
         native_exec_map_detail(
             exec_map_dsr_tid,
             crate::probes::DsrCacheLifecyclePhase::ExecMapMmapEnd,
@@ -6139,12 +6235,13 @@ impl NativeMappedMemory {
             crate::probes::DsrCacheLifecyclePhase::ExecMapMmapBegin,
             crate::memory::LINUX_SHARED_FILE_SIZE,
         );
-        rollback.track(map_anonymous_region(
+        map_anonymous_region(
             crate::memory::LINUX_SHARED_FILE_BASE,
             crate::memory::LINUX_SHARED_FILE_SIZE,
             true,
             &native_layout,
-        )?);
+            &mut rollback,
+        )?;
         native_exec_map_detail(
             exec_map_dsr_tid,
             crate::probes::DsrCacheLifecyclePhase::ExecMapMmapEnd,
@@ -6169,12 +6266,13 @@ impl NativeMappedMemory {
             crate::probes::DsrCacheLifecyclePhase::ExecMapMmapBegin,
             crate::memory::LINUX_PRIVATE_OVERLAY_SIZE,
         );
-        rollback.track(map_anonymous_region(
+        map_anonymous_region(
             crate::memory::LINUX_PRIVATE_OVERLAY_BASE,
             crate::memory::LINUX_PRIVATE_OVERLAY_SIZE,
             false,
             &native_layout,
-        )?);
+            &mut rollback,
+        )?;
         native_exec_map_detail(
             exec_map_dsr_tid,
             crate::probes::DsrCacheLifecyclePhase::ExecMapMmapEnd,
@@ -6437,6 +6535,7 @@ impl NativeMappedMemory {
             Vec::new()
         };
         let mut direct_target_reservations = Vec::with_capacity(target_only.len());
+        let mut direct_reservation_ranges = Vec::with_capacity(target_only.len());
         let reset_inherited_translator =
             NATIVE_FORKED_GUEST_CHILD.load(std::sync::atomic::Ordering::Acquire);
         let process_translator = if reset_inherited_translator {
@@ -6469,16 +6568,45 @@ impl NativeMappedMemory {
                 .map_err(|error| RuntimeError::Unsupported(error.to_string()))?
             {
                 crate::host_proc::DirectVmReservationOutcome::Reserved(reservation) => {
+                    for (start, length) in reservation.owned_spans() {
+                        let end = start.checked_add(length).ok_or_else(|| {
+                            RuntimeError::Unsupported(format!(
+                                "native direct exec reservation range overflows: 0x{start:x}+0x{length:x}"
+                            ))
+                        })?;
+                        direct_reservation_ranges.push(
+                            carrick_guest_mem::HostVa(usize::try_from(start).map_err(|_| {
+                                RuntimeError::Unsupported(format!(
+                                    "native direct exec reservation start is not representable: 0x{start:x}"
+                                ))
+                            })?)
+                                ..carrick_guest_mem::HostVa(usize::try_from(end).map_err(|_| {
+                                    RuntimeError::Unsupported(format!(
+                                        "native direct exec reservation end is not representable: 0x{end:x}"
+                                    ))
+                                })?),
+                        );
+                    }
                     direct_target_reservations.push(reservation);
                 }
                 crate::host_proc::DirectVmReservationOutcome::DelegatedDyldPmapEmpty => {}
             }
         }
+        let rollback_plan = match native_layout.address_mode() {
+            NativeAddressMode::Direct => NativeMappingRollbackPlan::direct_exec(
+                native_layout.owned_ranges(),
+                direct_reservation_ranges,
+            ),
+            NativeAddressMode::Biased { .. } => NativeMappingRollbackPlan {
+                supplemental_ranges: Vec::new(),
+            },
+        };
         Ok(PreparedNativeExecMapping {
             native_layout,
             process_translator,
             reset_inherited_translator,
             direct_target_reservations,
+            rollback_plan,
         })
     }
 
@@ -6526,6 +6654,7 @@ impl NativeMappedMemory {
             process_translator,
             reset_inherited_translator,
             direct_target_reservations,
+            rollback_plan,
         } = prepared;
         native_layout
             .reset_biased_aperture_to_guards()
@@ -6545,6 +6674,7 @@ impl NativeMappedMemory {
                 exec_map_dsr_tid: dsr_tid,
                 relative_relocations,
                 backing: NativeImageBacking::AnonymousBytes,
+                rollback_plan,
             },
         )?;
         lifecycle(crate::probes::DsrCacheLifecyclePhase::ExecRelocationEnd);
@@ -8245,7 +8375,8 @@ fn map_region(
     exec_map_dsr_tid: Option<crate::thread::ThreadId>,
     initial_stack_pointer: Option<u64>,
     native_layout: &NativeLayout,
-) -> Result<NativeMappedRangeGuard, RuntimeError> {
+    rollback: &mut NativeMappingRollback,
+) -> Result<(), RuntimeError> {
     let length_u64 = region.end.checked_sub(region.start).ok_or_else(|| {
         RuntimeError::Unsupported("native Darwin empty inverted region".to_string())
     })?;
@@ -8256,7 +8387,7 @@ fn map_region(
         ))
     })?;
     if length == 0 {
-        return Ok(NativeMappedRangeGuard::new(carrick_guest_mem::HostVa(0), 0));
+        return Ok(());
     }
     let host_start = native_layout
         .address_mode()
@@ -8297,12 +8428,13 @@ fn map_region(
         )));
     }
     if mapped != addr {
+        unsafe { libc::munmap(mapped, length) };
         return Err(RuntimeError::Unsupported(format!(
             "native Darwin mmap did not honor MAP_FIXED for 0x{:x}",
             region.start
         )));
     }
-    let mapped_range = NativeMappedRangeGuard::new(host_start, length);
+    rollback.track_mapping(host_start, length);
     native_exec_map_detail(
         exec_map_dsr_tid,
         crate::probes::DsrCacheLifecyclePhase::ExecMapMmapEnd,
@@ -8332,7 +8464,7 @@ fn map_region(
         );
     }
     finalize_image_region_mapping(region, mapped, length, length_u64, exec_map_dsr_tid, false)?;
-    Ok(mapped_range)
+    Ok(())
 }
 
 fn map_prepared_region(
@@ -8342,7 +8474,8 @@ fn map_prepared_region(
     prepared: &ValidatedPreparedImage,
     exec_map_dsr_tid: Option<crate::thread::ThreadId>,
     native_layout: &NativeLayout,
-) -> Result<NativeMappedRangeGuard, RuntimeError> {
+    rollback: &mut NativeMappingRollback,
+) -> Result<(), RuntimeError> {
     #[cfg(test)]
     if region_index == 1
         && take_native_prepared_mapping_failpoint(NativePreparedMappingFailpoint::SecondRegionMap)
@@ -8413,7 +8546,7 @@ fn map_prepared_region(
             mapped, address
         )));
     }
-    let mapped_range = NativeMappedRangeGuard::new(host_start, length);
+    rollback.track_mapping(host_start, length);
     native_exec_map_detail(
         exec_map_dsr_tid,
         crate::probes::DsrCacheLifecyclePhase::ExecMapMmapEnd,
@@ -8421,25 +8554,29 @@ fn map_prepared_region(
     );
 
     finalize_image_region_mapping(region, mapped, length, length_u64, exec_map_dsr_tid, true)?;
-    Ok(mapped_range)
+    Ok(())
 }
 
 fn map_bytes_region(
     start: u64,
     length_u64: u64,
     bytes: &[u8],
-    final_prot: libc::c_int,
-    executable: bool,
-    exec_map_dsr_tid: Option<crate::thread::ThreadId>,
+    options: NativeByteRegionOptions,
     native_layout: &NativeLayout,
-) -> Result<NativeMappedRangeGuard, RuntimeError> {
+    rollback: &mut NativeMappingRollback,
+) -> Result<(), RuntimeError> {
+    let NativeByteRegionOptions {
+        final_prot,
+        executable,
+        exec_map_dsr_tid,
+    } = options;
     let length = usize::try_from(length_u64).map_err(|_| {
         RuntimeError::Unsupported(format!(
             "native Darwin byte region too large: 0x{start:x}+0x{length_u64:x}"
         ))
     })?;
     if length == 0 {
-        return Ok(NativeMappedRangeGuard::new(carrick_guest_mem::HostVa(0), 0));
+        return Ok(());
     }
     if bytes.len() > length {
         return Err(RuntimeError::Unsupported(format!(
@@ -8480,11 +8617,12 @@ fn map_bytes_region(
         )));
     }
     if mapped != addr {
+        unsafe { libc::munmap(mapped, length) };
         return Err(RuntimeError::Unsupported(format!(
             "native Darwin mmap did not honor MAP_FIXED for byte region 0x{start:x}"
         )));
     }
-    let mapped_range = NativeMappedRangeGuard::new(host_start, length);
+    rollback.track_mapping(host_start, length);
     native_exec_map_detail(
         exec_map_dsr_tid,
         crate::probes::DsrCacheLifecyclePhase::ExecMapMmapEnd,
@@ -8539,7 +8677,7 @@ fn map_bytes_region(
         crate::probes::DsrCacheLifecyclePhase::ExecMapProtectEnd,
         0,
     );
-    Ok(mapped_range)
+    Ok(())
 }
 
 fn map_anonymous_region(
@@ -8547,14 +8685,15 @@ fn map_anonymous_region(
     length: u64,
     shared: bool,
     native_layout: &NativeLayout,
-) -> Result<NativeMappedRangeGuard, RuntimeError> {
+    rollback: &mut NativeMappingRollback,
+) -> Result<(), RuntimeError> {
     let length = usize::try_from(length).map_err(|_| {
         RuntimeError::Unsupported(format!(
             "native Darwin anonymous region too large: 0x{start:x}+0x{length:x}"
         ))
     })?;
     if length == 0 {
-        return Ok(NativeMappedRangeGuard::new(carrick_guest_mem::HostVa(0), 0));
+        return Ok(());
     }
     let host_start = native_layout
         .address_mode()
@@ -8590,11 +8729,13 @@ fn map_anonymous_region(
         )));
     }
     if mapped != addr {
+        unsafe { libc::munmap(mapped, length) };
         return Err(RuntimeError::Unsupported(format!(
             "native Darwin mmap did not honor MAP_FIXED for anonymous region 0x{start:x}"
         )));
     }
-    Ok(NativeMappedRangeGuard::new(host_start, length))
+    rollback.track_mapping(host_start, length);
+    Ok(())
 }
 
 fn set_native_region_fork_inheritance(address: *mut libc::c_void, len: usize, share: bool) -> bool {
@@ -8789,6 +8930,21 @@ mod tests {
         let status = waitpid_blocking(pid).expect("wait for forked test");
         assert!(libc::WIFEXITED(status), "forked test status={status:#x}");
         assert_eq!(libc::WEXITSTATUS(status), 0);
+    }
+
+    fn direct_test_mapping_rollback(start: u64, length: u64) -> NativeMappingRollback {
+        let start = usize::try_from(start).expect("Direct test mapping start");
+        let length = usize::try_from(length).expect("Direct test mapping length");
+        NativeMappingRollback::new(
+            NativeMappingRollbackPlan {
+                supplemental_ranges: vec![
+                    carrick_guest_mem::HostVa(start)..carrick_guest_mem::HostVa(start + length),
+                ],
+            },
+            16 * 1024,
+            1,
+        )
+        .expect("construct Direct test rollback")
     }
 
     fn fork_test_with_timeout(timeout: std::time::Duration, test: impl FnOnce()) {
@@ -10460,9 +10616,16 @@ mod tests {
             )],
         )
         .expect("build direct-entry image");
-        map_region(&image.regions()[0], None, None, &NativeLayout::direct())
-            .expect("map DSR original code page")
-            .commit();
+        let mut rollback = direct_test_mapping_rollback(address, 16 * 1024);
+        map_region(
+            &image.regions()[0],
+            None,
+            None,
+            &NativeLayout::direct(),
+            &mut rollback,
+        )
+        .expect("map DSR original code page");
+        rollback.commit();
 
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork direct-entry child");
@@ -11324,14 +11487,17 @@ mod tests {
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
         if pid == 0 {
+            let mut rollback = direct_test_mapping_rollback(layout.mmap_base, layout.mmap_size);
             let code = if map_anonymous_region(
                 layout.mmap_base,
                 layout.mmap_size,
                 false,
                 &NativeLayout::direct(),
+                &mut rollback,
             )
             .is_ok()
             {
+                rollback.commit();
                 0
             } else {
                 1
@@ -12305,12 +12471,14 @@ mod tests {
             std::io::Error::last_os_error()
         );
         if outer == 0 {
-            let mapped = map_anonymous_region(start, len, shared, &NativeLayout::direct())
-                .map(NativeMappedRangeGuard::commit)
-                .is_ok();
+            let mut rollback = direct_test_mapping_rollback(start, len);
+            let mapped =
+                map_anonymous_region(start, len, shared, &NativeLayout::direct(), &mut rollback)
+                    .is_ok();
             if !mapped {
                 unsafe { libc::_exit(2) };
             }
+            rollback.commit();
             let child = unsafe { libc::fork() };
             if child == 0 {
                 unsafe { libc::_exit(0) };
@@ -12898,6 +13066,27 @@ mod tests {
         (image, relative_relocations, plan)
     }
 
+    fn native_biased_prepared_mapping_fixture() -> (AddressSpace, ExecutionPlan) {
+        let plan = native16k_test_plan();
+        let image = AddressSpace::load_elf_bytes_with_reader_at_pie_base_without_runtime_regions(
+            &dsr_low_et_exec_test_elf(&[0xd65f_03c0]),
+            &|_| None,
+            NATIVE_DARWIN_PIE_BASE,
+            plan.page_geometry.host_page_size,
+        )
+        .expect("load biased prepared mapping fixture")
+        .with_vdso_auxv(true);
+        let image = with_native_vdso(image)
+            .expect("add biased native vDSO")
+            .with_linux_initial_stack_page_size(
+                [b"biased-prepared-mapping".as_slice()],
+                std::iter::empty::<&[u8]>(),
+                plan.page_geometry.linux_page_size,
+            )
+            .expect("add biased prepared mapping stack");
+        (image, plan)
+    }
+
     fn validated_prepared_mapping_fixture(
         image: &AddressSpace,
         relocations: &[NativeRelativeRelocation],
@@ -12954,6 +13143,138 @@ mod tests {
                     .expect("read mapped region")
             })
             .collect()
+    }
+
+    fn native_mapping_class_ranges(
+        image: &AddressSpace,
+        layout: MemoryLayout,
+        mode: NativeAddressMode,
+        host_page_size: u64,
+    ) -> Vec<(&'static str, std::ops::Range<carrick_guest_mem::HostVa>)> {
+        fn host_range(
+            mode: NativeAddressMode,
+            start: u64,
+            length: u64,
+            page_size: u64,
+        ) -> std::ops::Range<carrick_guest_mem::HostVa> {
+            let mask = page_size - 1;
+            let aligned_start = start & !mask;
+            let aligned_end = start
+                .checked_add(length)
+                .and_then(|end| end.checked_add(mask))
+                .map(|end| end & !mask)
+                .expect("aligned native test range");
+            mode.to_host(carrick_guest_mem::GuestVa(aligned_start))
+                .expect("translate native test range start")
+                ..mode
+                    .to_host(carrick_guest_mem::GuestVa(aligned_end))
+                    .expect("translate native test range end")
+        }
+
+        let mut ranges = image
+            .regions()
+            .iter()
+            .map(|region| {
+                (
+                    "image",
+                    host_range(mode, region.start, region.len(), host_page_size),
+                )
+            })
+            .collect::<Vec<_>>();
+        ranges.extend([
+            (
+                "sigreturn",
+                host_range(
+                    mode,
+                    NATIVE_DARWIN_SIGRETURN_TRAMPOLINE_BASE,
+                    carrick_mem::memory::LINUX_SIGRETURN_TRAMPOLINE_SIZE,
+                    host_page_size,
+                ),
+            ),
+            (
+                "heap",
+                host_range(mode, layout.heap_base, layout.heap_size, host_page_size),
+            ),
+            (
+                "mmap",
+                host_range(mode, layout.mmap_base, layout.mmap_size, host_page_size),
+            ),
+            (
+                "shared aperture",
+                host_range(
+                    mode,
+                    crate::memory::LINUX_SHARED_FILE_BASE,
+                    crate::memory::LINUX_SHARED_FILE_SIZE,
+                    host_page_size,
+                ),
+            ),
+            (
+                "private overlay",
+                host_range(
+                    mode,
+                    crate::memory::LINUX_PRIVATE_OVERLAY_BASE,
+                    crate::memory::LINUX_PRIVATE_OVERLAY_SIZE,
+                    host_page_size,
+                ),
+            ),
+        ]);
+        ranges
+    }
+
+    fn assert_native_ranges_vacant(
+        ranges: impl IntoIterator<Item = (impl AsRef<str>, std::ops::Range<carrick_guest_mem::HostVa>)>,
+    ) {
+        for (name, range) in ranges {
+            let length = range
+                .end
+                .raw()
+                .checked_sub(range.start.raw())
+                .expect("vacancy range length");
+            let vacant = address::OwnedHostMapping::map_exact(
+                range.start,
+                length,
+                libc::PROT_NONE,
+                libc::MAP_ANON | libc::MAP_PRIVATE | libc::MAP_NORESERVE,
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{} range 0x{:x}..0x{:x} was not vacant: {error}",
+                    name.as_ref(),
+                    range.start.raw(),
+                    range.end.raw()
+                )
+            });
+            drop(vacant);
+        }
+    }
+
+    fn assert_supplemental_rollback_once(
+        expected: &[(&str, std::ops::Range<carrick_guest_mem::HostVa>)],
+        actual: &[std::ops::Range<carrick_guest_mem::HostVa>],
+    ) {
+        for (name, range) in expected {
+            let owners = actual
+                .iter()
+                .filter(|cleanup| {
+                    cleanup.start.raw() <= range.start.raw() && cleanup.end.raw() >= range.end.raw()
+                })
+                .count();
+            assert_eq!(
+                owners,
+                1,
+                "{name} range 0x{:x}..0x{:x} supplemental owners: {actual:?}",
+                range.start.raw(),
+                range.end.raw()
+            );
+        }
+        for (index, left) in actual.iter().enumerate() {
+            for right in &actual[index + 1..] {
+                assert!(
+                    left.end.raw() <= right.start.raw() || right.end.raw() <= left.start.raw(),
+                    "supplemental rollback ranges overlap: {left:?} and {right:?}"
+                );
+            }
+        }
     }
 
     fn assert_native_source_execution_denied(memory: &NativeMappedMemory, guest_pc: u64) {
@@ -13129,34 +13450,49 @@ mod tests {
     fn assert_prepared_mapping_failure_cleans_up(
         failpoint: NativePreparedMappingFailpoint,
         expected: &str,
+        all_classes_mapped: bool,
     ) {
         fork_test(|| {
             set_native_test_vvar_words(Some(Vec::new()));
             let (image, relocations, plan) = native_prepared_mapping_fixture(true);
+            let layout = native_memory_layout();
+            let selected =
+                NativeLayout::for_image(&image, layout, plan.page_geometry.host_page_size)
+                    .expect("select expected Direct cleanup layout");
+            assert_eq!(selected.address_mode(), NativeAddressMode::Direct);
+            let planned = native_mapping_class_ranges(
+                &image,
+                layout,
+                selected.address_mode(),
+                plan.page_geometry.host_page_size,
+            );
+            let owned = selected.owned_ranges().to_vec();
+            drop(selected);
             let validated = validated_prepared_mapping_fixture(
                 &image,
                 &relocations,
                 plan.page_geometry.host_page_size,
             );
+            assert!(take_native_test_supplemental_rollbacks().is_empty());
             set_native_prepared_mapping_failpoint(Some(failpoint));
-            let error = match NativeMappedMemory::map_prepared_for_plan(
-                &validated,
-                native_memory_layout(),
-                &plan,
-            ) {
+            let error = match NativeMappedMemory::map_prepared_for_plan(&validated, layout, &plan) {
                 Ok(_) => panic!("prepared mapping failpoint must fail"),
                 Err(error) => error,
             };
             assert_eq!(error.to_string(), expected);
-            let start = carrick_guest_mem::HostVa(image.regions()[0].start as usize);
-            let vacant = address::OwnedHostMapping::map_exact(
-                start,
-                usize::try_from(image.regions()[0].len()).expect("first region length"),
-                libc::PROT_NONE,
-                libc::MAP_ANON | libc::MAP_PRIVATE,
-            )
-            .expect("failed prepared mapping must retire direct image range");
-            drop(vacant);
+            let supplemental = take_native_test_supplemental_rollbacks();
+            if all_classes_mapped {
+                assert_supplemental_rollback_once(&planned, &supplemental);
+                assert_native_ranges_vacant(planned.clone());
+                assert_native_ranges_vacant(
+                    owned
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, range)| (format!("owned plan {index}"), range)),
+                );
+            } else {
+                assert_native_ranges_vacant(planned.into_iter().take(1));
+            }
             set_native_test_vvar_words(None);
         });
     }
@@ -13166,6 +13502,7 @@ mod tests {
         assert_prepared_mapping_failure_cleans_up(
             NativePreparedMappingFailpoint::SecondRegionMap,
             "unsupported in this backend: prepared-map: injected second-region mapping failure",
+            false,
         );
     }
 
@@ -13174,6 +13511,7 @@ mod tests {
         assert_prepared_mapping_failure_cleans_up(
             NativePreparedMappingFailpoint::Relocation,
             "unsupported in this backend: prepared-map: injected relocation failure",
+            true,
         );
     }
 
@@ -13182,6 +13520,7 @@ mod tests {
         assert_prepared_mapping_failure_cleans_up(
             NativePreparedMappingFailpoint::VvarStamp,
             "unsupported in this backend: prepared-map: injected vvar stamping failure",
+            true,
         );
     }
 
@@ -13190,6 +13529,179 @@ mod tests {
         assert_prepared_mapping_failure_cleans_up(
             NativePreparedMappingFailpoint::FinalProtection,
             "unsupported in this backend: prepared-map: injected final protection failure",
+            false,
         );
+    }
+
+    #[test]
+    fn native_prepared_mapping_biased_layout_has_one_reservation_owner() {
+        fork_test(|| {
+            set_native_test_vvar_words(Some(Vec::new()));
+            let (image, plan) = native_biased_prepared_mapping_fixture();
+            let layout = native_memory_layout();
+            let selected =
+                NativeLayout::for_image(&image, layout, plan.page_geometry.host_page_size)
+                    .expect("select expected biased cleanup layout");
+            assert!(matches!(
+                selected.address_mode(),
+                NativeAddressMode::Biased { .. }
+            ));
+            let planned = native_mapping_class_ranges(
+                &image,
+                layout,
+                selected.address_mode(),
+                plan.page_geometry.host_page_size,
+            );
+            let owned = selected.owned_ranges().to_vec();
+            drop(selected);
+            let validated =
+                validated_prepared_mapping_fixture(&image, &[], plan.page_geometry.host_page_size);
+            assert!(take_native_test_supplemental_rollbacks().is_empty());
+            set_native_prepared_mapping_failpoint(Some(NativePreparedMappingFailpoint::VvarStamp));
+            let error = match NativeMappedMemory::map_prepared_for_plan(&validated, layout, &plan) {
+                Ok(_) => panic!("biased late failpoint must fail"),
+                Err(error) => error,
+            };
+            assert_eq!(
+                error.to_string(),
+                "unsupported in this backend: prepared-map: injected vvar stamping failure"
+            );
+            assert!(
+                take_native_test_supplemental_rollbacks().is_empty(),
+                "the biased aperture reservation must be the sole rollback owner"
+            );
+            assert_native_ranges_vacant(planned);
+            assert_native_ranges_vacant(
+                owned
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, range)| (format!("biased owned plan {index}"), range)),
+            );
+            set_native_test_vvar_words(None);
+        });
+    }
+
+    #[test]
+    fn native_direct_exec_replacement_reservation_is_the_target_owner() {
+        fork_test(|| {
+            let plan = native16k_test_plan();
+            let source = lifecycle_image(LifecycleImageKind::DirectPie, 0x31);
+            let target = lifecycle_image_at(0x70_1000_0000, 0x72);
+            let layout = native_memory_layout();
+            let mut memory = NativeMappedMemory::map(
+                &source,
+                layout,
+                plan.page_geometry.host_page_size,
+                plan.page_geometry.linux_page_size,
+            )
+            .expect("map Direct replacement source");
+            let prepared = memory
+                .prepare_exec_mapping(&target, &plan)
+                .expect("reserve Direct replacement target");
+            assert_eq!(
+                prepared.native_layout.address_mode(),
+                NativeAddressMode::Direct
+            );
+            assert!(
+                !prepared.direct_target_reservations.is_empty(),
+                "the disjoint Direct target must have an authoritative reservation"
+            );
+            let planned = native_mapping_class_ranges(
+                &target,
+                layout,
+                prepared.native_layout.address_mode(),
+                plan.page_geometry.host_page_size,
+            );
+            let owned = prepared.native_layout.owned_ranges().to_vec();
+            let reserved_target = planned
+                .iter()
+                .find(|(name, _)| *name == "image")
+                .expect("reserved target image range")
+                .1
+                .clone();
+            assert!(take_native_test_supplemental_rollbacks().is_empty());
+            NATIVE_TEST_FAIL_EXEC_AFTER_SETUP.with(|failpoint| failpoint.set(true));
+            let error = memory
+                .replace_image(
+                    &target,
+                    &[],
+                    &plan,
+                    Some(crate::thread::ThreadId::main_from_host_pid()),
+                    prepared,
+                )
+                .expect_err("Direct replacement late failpoint must fail");
+            assert!(error.to_string().contains("injected native exec failure"));
+            let supplemental = take_native_test_supplemental_rollbacks();
+            assert!(
+                supplemental.iter().all(|range| {
+                    range.end.raw() <= reserved_target.start.raw()
+                        || reserved_target.end.raw() <= range.start.raw()
+                }),
+                "DirectVmReservation must be the sole target owner: {supplemental:?}"
+            );
+            assert_native_ranges_vacant(planned);
+            assert_native_ranges_vacant(
+                owned
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, range)| (format!("Direct exec owned plan {index}"), range)),
+            );
+        });
+    }
+
+    #[test]
+    fn native_biased_exec_replacement_adopts_the_aperture_owner() {
+        fork_test(|| {
+            let plan = native16k_test_plan();
+            let source = lifecycle_image(LifecycleImageKind::LowExec, 0x31);
+            let target = lifecycle_image(LifecycleImageKind::LowExec, 0x72);
+            let layout = native_memory_layout();
+            let mut memory = NativeMappedMemory::map(
+                &source,
+                layout,
+                plan.page_geometry.host_page_size,
+                plan.page_geometry.linux_page_size,
+            )
+            .expect("map biased replacement source");
+            let prepared = memory
+                .prepare_exec_mapping(&target, &plan)
+                .expect("adopt biased replacement aperture");
+            assert!(matches!(
+                prepared.native_layout.address_mode(),
+                NativeAddressMode::Biased { .. }
+            ));
+            assert!(prepared.direct_target_reservations.is_empty());
+            let planned = native_mapping_class_ranges(
+                &target,
+                layout,
+                prepared.native_layout.address_mode(),
+                plan.page_geometry.host_page_size,
+            );
+            let owned = prepared.native_layout.owned_ranges().to_vec();
+            assert!(take_native_test_supplemental_rollbacks().is_empty());
+            NATIVE_TEST_FAIL_EXEC_AFTER_SETUP.with(|failpoint| failpoint.set(true));
+            let error = match memory.replace_image(
+                &target,
+                &[],
+                &plan,
+                Some(crate::thread::ThreadId::main_from_host_pid()),
+                prepared,
+            ) {
+                Ok(()) => panic!("biased replacement late failpoint must fail"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("injected native exec failure"));
+            assert!(
+                take_native_test_supplemental_rollbacks().is_empty(),
+                "the adopted biased aperture must be the sole rollback owner"
+            );
+            assert_native_ranges_vacant(planned);
+            assert_native_ranges_vacant(
+                owned
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, range)| (format!("biased exec owned plan {index}"), range)),
+            );
+        });
     }
 }
