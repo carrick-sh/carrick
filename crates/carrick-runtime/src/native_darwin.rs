@@ -1699,6 +1699,8 @@ fn run_native_dsr_thread_loop(
                             }
                             if let Err(error) = crate::native_exec_capsule::begin_guest_exec(
                                 &dispatcher,
+                                &image,
+                                &relative_relocations,
                                 resolved.clone(),
                                 resolved_argv,
                                 capsule_env,

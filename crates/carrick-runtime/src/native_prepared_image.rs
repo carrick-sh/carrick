@@ -190,11 +190,45 @@ pub(crate) struct NativePreparedImageV1 {
     digest: [u8; 32],
 }
 
+impl NativePreparedImageV1 {
+    /// Task 4's transport-only bridge consumes the inherited record and closes
+    /// its raw fd before entering the legacy fresh-process loader. Task 6
+    /// replaces that bridge with `validate_for_resume`, which takes ownership
+    /// through a checked duplicate before mapping the prepared image.
+    #[cfg(test)]
+    #[cfg(target_os = "macos")]
+    pub(crate) fn with_artifact_fd_for_test(mut self, artifact_fd: RawFd) -> Self {
+        self.artifact_fd = artifact_fd;
+        self
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn close_inherited_before_legacy_resume(
+    record: NativePreparedImageV1,
+) -> std::io::Result<()> {
+    if unsafe { libc::close(record.artifact_fd) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 #[cfg(target_os = "macos")]
 pub(crate) struct PreparedImageArtifact {
     pub(crate) record: NativePreparedImageV1,
     pub(crate) file: File,
+}
+
+#[cfg(target_os = "macos")]
+impl PreparedImageArtifact {
+    pub(crate) fn transport_fd_snapshot(&self) -> (RawFd, i32) {
+        debug_assert_eq!(
+            std::os::fd::AsRawFd::as_raw_fd(&self.file),
+            self.record.artifact_fd
+        );
+        (self.record.artifact_fd, self.record.original_host_fd_flags)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
