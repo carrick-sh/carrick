@@ -2423,13 +2423,22 @@ impl SyscallDispatcher {
                 .nofile_soft
                 .load(std::sync::atomic::Ordering::Relaxed),
             rlimit_overrides,
+            seccomp_policy: if self.container_policy.is_some() {
+                carrick_spec::SeccompPolicy::ContainerDefault
+            } else {
+                carrick_spec::SeccompPolicy::Unconfined
+            },
+            ptrace_traceme: self.is_ptrace_traceme(),
         }
     }
 
     pub(crate) fn restore_native_reexec_process_state(
-        &self,
+        &mut self,
         state: &crate::native_exec_capsule::NativeReexecProcessStateV1,
     ) {
+        // These affect the very next syscall/exec boundary, so restore them
+        // before any other reconstructed process state can be observed.
+        self.apply_seccomp_policy(state.seccomp_policy);
         let credentials = state.credentials;
         *self.creds.lock() = creds::CredState {
             ruid: credentials.ruid,
@@ -2447,6 +2456,7 @@ impl SyscallDispatcher {
             .nofile_soft
             .store(state.nofile_soft, std::sync::atomic::Ordering::Relaxed);
         let mut process = self.proc.lock();
+        process.ptrace_traceme = state.ptrace_traceme;
         for (slot, limit) in process
             .rlimit_overrides
             .iter_mut()
@@ -9427,8 +9437,10 @@ mod native_reexec_fd_tests {
                     })
                 })
                 .collect(),
+            seccomp_policy: carrick_spec::SeccompPolicy::ContainerDefault,
+            ptrace_traceme: true,
         };
-        let resumed = SyscallDispatcher::new();
+        let mut resumed = SyscallDispatcher::new();
         resumed.restore_native_reexec_process_state(&state);
 
         assert_eq!(resumed.snapshot_native_reexec_process_state(), state);
