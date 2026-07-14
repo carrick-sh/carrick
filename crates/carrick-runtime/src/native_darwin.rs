@@ -871,6 +871,7 @@ pub(crate) fn resume_guest_from_capsule(
     dispatcher.set_memory_layout(native_memory_layout());
     let backend = crate::fs_backend::HostFsBackend::attach_for_reexec(&guest.rootfs)?;
     let _ = dispatcher.set_fs_backend(Box::new(backend));
+    dispatcher.restore_native_reexec_bind_mounts(&guest.bind_mounts);
     if !guest.exec_host_fs_fallback {
         dispatcher.sandbox_exec_to_container();
     }
