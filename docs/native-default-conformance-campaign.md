@@ -185,3 +185,43 @@ instruments park/wake and per-process startup CPU attribution so the additive
 model reconciles, repairs the parking/wake burn per the design's
 blocked-residual rung, and re-runs this campaign to obtain the typed decision
 row. No timeout, `max_traps`, or semantic weakening is involved.
+
+
+## Task 3 re-run with typed attribution (2026-07-14, signed, at 081c0d7d)
+
+The attribution increments (NATIVEPERF v2 frames, per-era thread CPU across
+self-reexec, the supervisor record with its pid-identity guard, the two-gate
+tree reconciliation, and count-rung abstention on scope disagreement) closed
+the additive model: gate1 (time-vs-rusage) and gate2 (children cover guests)
+both pass within +-0.5 percent on every profiled run.
+
+**The committed ladder emitted its first typed decision row**
+(`docs/perf-results/native-compiler-budget-v2.jsonl`, `analyze --check`
+green): `selected_slice = "helper-cpu"`, share 30.86 percent of untraced CPU,
+scope `process-cpu`, basis measured-cpu-attribution, profile tax 1.42
+percent. The count rungs abstained (hottest-thread exclusive ~47 percent vs
+aggregate ~22 percent still disagree — honestly recorded, not adjudicated).
+
+Measured attribution over the five profiled ABBA runs (medians over the
+3.740 s untraced CPU):
+
+| Term | Median | Share |
+| --- | --- | --- |
+| supervisor self CPU | 1.555 s | 41.6 percent |
+| in-guest-process helper threads | 1.154 s | 30.9 percent |
+| guest threads (all DSR execution) | 1.143 s | 30.6 percent |
+| syscall-dispatch (thread wall) | 0.361 s | 9.6 percent |
+| blocked-segment thread CPU | 0.003 s | 0.1 percent |
+| process startup | 0.001 s | ~0 percent |
+
+Host-side machinery (supervisor + helpers) is ~72 percent of all CPU; guest
+execution is ~31 percent. The pre-attribution hypotheses (startup cost,
+blocked-machinery churn, AOT-shaped translation dominance) are refuted by
+measurement. Plane A held steady (W2 16.00x, 3.520 s vs 0.220 s; W1 ceiling
+19.200 s, 11.93x truncated); one-thread control passes all gates with
+helper >= 0; Plane C complete with zero drops and 23 reconciled PIDs.
+
+The repair investigation now targets the helper-cpu slice first (per the
+decision row) with supervisor-cpu (41.6 percent) as the immediate next term —
+both are host-side runtime overhead, not DSR translation. No timeout,
+`max_traps`, or semantic weakening occurred anywhere in this campaign.
