@@ -375,16 +375,43 @@ fn kick_all_native_guest_threads() {
     kicker.kick_all();
 }
 
+/// Complete a native asynchronous-interrupt publication. Pending state MUST be
+/// durable before this function runs: the futex generation closes the
+/// predicate-to-park registration window, then the host kick pulls threads out
+/// of translated guest code. Reversing that order can lose both one-shot edges.
+fn wake_all_native_guest_threads_after_interrupt_publication() {
+    crate::thread::notify_current_futex_signal_pending();
+    kick_all_native_guest_threads();
+}
+
+/// Publish a thread-directed signal from a native helper/dispatch path whose
+/// producer may be running concurrently with the target's private-futex park.
+/// This is deliberately process-wide at the wake layer: these out-of-band
+/// producers do not retain the target's `NativeThreadRuntime`, while spurious
+/// sibling predicate rechecks are harmless.
+pub(crate) fn publish_native_pending_for(target_tid: i32, signum: i32) {
+    crate::host_signal::publish_pending_for_with_wake(
+        target_tid,
+        signum,
+        crate::host_signal::PublicationWake::CallerManaged,
+    );
+    wake_all_native_guest_threads_after_interrupt_publication();
+}
+
 /// Deliver a process-directed timer signal to a native guest: publish into the
 /// shared pending mask, then kick every native guest thread so the run loop's
 /// kick path (`resume_guest_after_kick` → `deliver_pending_signal`) injects it.
-/// The HVF fallback publishes only — its pump kqueue re-kicks busy vCPUs — but
-/// native has no pump, and a spinning guest that never traps (vDSO clock reads
-/// satisfy its spin loop in userspace) would otherwise never observe the
-/// signal.
-fn deliver_native_process_signal(signum: i32) {
-    crate::host_signal::publish_process_signal(signum);
-    kick_all_native_guest_threads();
+/// HVF event producers delegate their kick to the full signal pump. Native's
+/// wake-only pump is reserved for external host/xsignal ingress, so a native
+/// timer uses caller-managed publication and exactly one ordered direct kick.
+/// A spinning guest that never traps (vDSO clock reads satisfy its spin loop in
+/// userspace) would otherwise never observe the signal.
+pub(crate) fn deliver_native_process_signal(signum: i32) {
+    crate::host_signal::publish_process_signal_with_wake(
+        signum,
+        crate::host_signal::PublicationWake::CallerManaged,
+    );
+    wake_all_native_guest_threads_after_interrupt_publication();
 }
 
 /// Native child-exit watch glue. HVF arms `EVFILT_PROC`/`NOTE_EXIT` on its
@@ -476,18 +503,19 @@ fn native_publish_child_exit(child: i32) {
         return;
     };
     if exit_signal != 0 {
-        crate::host_signal::publish_pending_for(parent_tid, exit_signal);
+        publish_native_pending_for(parent_tid, exit_signal);
+    } else {
+        kick_all_native_guest_threads();
     }
-    kick_all_native_guest_threads();
 }
 
-/// Native `TimerDelivery`: there is no signal-pump kqueue, so every interval
-/// timer runs the SHARED timer-core timing loop on a fallback thread —
-/// wall-clock sleeps for `ITIMER_REAL`, guest-CPU polling against the native
-/// Darwin CPU provider for `ITIMER_VIRTUAL`/`ITIMER_PROF` — whose fire action
-/// is publish + kick-all. POSIX per-process timers mirror the KVM/bhyve/NVMM
-/// fallback shape with the same native fire action. Stateless: the kicker is
-/// resolved at fire time from `NATIVE_PROCESS_KICKER`.
+/// Native `TimerDelivery`: the wake-only signal pump does not register timer
+/// knotes, so every interval timer runs the SHARED timer-core timing loop on a
+/// fallback thread — wall-clock sleeps for `ITIMER_REAL`, guest-CPU polling
+/// against the native Darwin CPU provider for `ITIMER_VIRTUAL`/`ITIMER_PROF` —
+/// whose fire action is publish + kick-all. POSIX per-process timers mirror the
+/// KVM/bhyve/NVMM fallback shape with the same native fire action. Stateless:
+/// the kicker is resolved at fire time from `NATIVE_PROCESS_KICKER`.
 struct NativeTimerDelivery;
 
 impl carrick_hal::TimerDelivery for NativeTimerDelivery {
@@ -1229,6 +1257,7 @@ fn run_image_in_current_process(
     let plan = Arc::new(plan.clone());
     let mut thread_runtime = NativeThreadRuntime::new_current();
     thread_runtime.prepare_kick_target()?;
+    thread_runtime.start_signal_wake_pump();
     // Timer-signal delivery (setitimer/timer_settime): publish + kick-all via
     // the native kick registry. Must be registered before the guest's first
     // setitimer; the OnceLock handle is inherited by forked children and
@@ -2407,6 +2436,7 @@ struct NativeThreadRuntime {
     platform_futex: Arc<dyn carrick_hal::PlatformFutex>,
     waiter: crate::io_wait::ThreadWaiter,
     kicker: Arc<carrick_hal::GenericVcpuRegistry>,
+    signal_wake_pump: Option<crate::vcpu_kick::SignalPump>,
     kick_state: Option<Arc<NativeKickState>>,
     threads: Arc<parking_lot::Mutex<Vec<std::thread::JoinHandle<()>>>>,
     /// Per-guest-thread software reservation for DSR exclusive accesses.
@@ -2441,6 +2471,7 @@ impl NativeThreadRuntime {
             platform_futex,
             waiter: crate::io_wait::ThreadWaiter::new(tid),
             kicker,
+            signal_wake_pump: None,
             kick_state: None,
             threads: Arc::new(parking_lot::Mutex::new(Vec::new())),
             exclusive_reservation: None,
@@ -2454,8 +2485,16 @@ impl NativeThreadRuntime {
     }
 
     fn reset_after_fork_child(&mut self) {
+        // Only the calling thread survives fork; the copied JoinHandle names a
+        // parent-only pump thread. Dropping it in the child would try to stop/
+        // join a thread that cannot run, so abandon that COW guard and start a
+        // fresh wake-only pump over the child's fresh kicker/futex objects.
+        if let Some(inherited) = self.signal_wake_pump.take() {
+            std::mem::forget(inherited);
+        }
         self.forked_stale = true;
         *self = Self::new_current();
+        self.start_signal_wake_pump();
     }
 
     fn tid(&self) -> crate::thread::ThreadId {
@@ -2470,6 +2509,7 @@ impl NativeThreadRuntime {
             platform_futex: Arc::clone(&self.platform_futex),
             waiter: crate::io_wait::ThreadWaiter::new(tid),
             kicker: Arc::clone(&self.kicker),
+            signal_wake_pump: None,
             kick_state: None,
             threads: Arc::clone(&self.threads),
             exclusive_reservation: None,
@@ -2493,6 +2533,15 @@ impl NativeThreadRuntime {
         );
         self.kick_state = Some(state);
         Ok(())
+    }
+
+    fn start_signal_wake_pump(&mut self) {
+        if self.signal_wake_pump.is_none() {
+            self.signal_wake_pump = Some(crate::vcpu_kick::spawn_signal_wake_pump(
+                Arc::clone(&self.kicker) as Arc<dyn carrick_hal::VcpuRegistry>,
+                Arc::clone(&self.platform_futex),
+            ));
+        }
     }
 
     fn release_kick_target(&mut self) {
@@ -2556,7 +2605,11 @@ impl NativeThreadRuntime {
         if !self.registry.is_live(target) {
             return crate::linux_abi::LINUX_ESRCH.guest_retval();
         }
-        crate::host_signal::publish_pending_for(target.raw(), signum);
+        crate::host_signal::publish_pending_for_with_wake(
+            target.raw(),
+            signum,
+            crate::host_signal::PublicationWake::CallerManaged,
+        );
         self.platform_futex.notify_signal_pending_for(target);
         self.kicker.kick(target);
         0
@@ -4466,7 +4519,7 @@ fn native_poll_child_exit_watches() {
             continue;
         };
         if exit_signal != 0 {
-            crate::host_signal::publish_pending_for(parent_tid, exit_signal);
+            publish_native_pending_for(parent_tid, exit_signal);
         }
     }
 }
@@ -11361,6 +11414,7 @@ mod tests {
     /// flags (fork quiesce / exec replacement) so they cannot interleave with
     /// each other.
     static STW_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static NATIVE_PUMP_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// The native fork-quiesce park contract at the dispatch boundary:
     /// a sibling observing `is_quiescing()` UNREGISTERS from the kicker first
@@ -12912,6 +12966,230 @@ mod tests {
         assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
         // Drain the synthetic tid so no other host-signal test sees it.
         let _ = carrick_signal_core::take_pending_for(tid);
+    }
+
+    #[test]
+    fn native_timer_publication_between_futex_predicate_and_park_is_not_lost() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        carrick_signal_core::clear_proc_pending();
+        let runtime = NativeThreadRuntime::new_current();
+        let dispatcher = SyscallDispatcher::new();
+        let wait = runtime.futex.prepare_wait(0x71a3_0000);
+        let published = AtomicBool::new(false);
+
+        let outcome = runtime.futex.wait_prepared_for_thread(
+            wait,
+            Some(Duration::from_millis(25)),
+            runtime.tid(),
+            &|| {
+                let observed = native_wait_interrupt_or_stw(
+                    &dispatcher,
+                    runtime.tid(),
+                    carrick_abi::WaitSigMask::NONE,
+                );
+                if !published.swap(true, Ordering::SeqCst) {
+                    assert!(
+                        !observed,
+                        "timer signal must publish after the outer predicate check"
+                    );
+                    deliver_native_process_signal(crate::linux_abi::LINUX_SIGALRM);
+                }
+                observed
+            },
+        );
+
+        assert_eq!(outcome, crate::thread::FutexWaitOutcome::Interrupted);
+        assert!(native_wait_interrupt_or_stw(
+            &dispatcher,
+            runtime.tid(),
+            carrick_abi::WaitSigMask::NONE,
+        ));
+        carrick_signal_core::clear_proc_pending();
+    }
+
+    #[test]
+    fn native_fork_child_timer_publication_uses_one_direct_kick() {
+        use carrick_hal::VcpuRegistry as _;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Clone)]
+        struct CountingKick(Arc<AtomicUsize>);
+
+        impl carrick_hal::VcpuKick for CountingKick {
+            fn kick(&self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        fork_test(|| {
+            let runtime = NativeThreadRuntime::new_current();
+            let kicks = Arc::new(AtomicUsize::new(0));
+            runtime.kicker.register(
+                crate::thread::ThreadId::synthetic_for_tests(0x714e),
+                Box::new(CountingKick(Arc::clone(&kicks))),
+            );
+            carrick_signal_core::clear_proc_pending();
+            deliver_native_process_signal(crate::linux_abi::LINUX_SIGALRM);
+            assert_eq!(
+                kicks.load(Ordering::SeqCst),
+                1,
+                "fork child must schedule exactly one direct timer kick"
+            );
+            assert!(carrick_signal_core::has_process_pending());
+        });
+    }
+
+    #[test]
+    fn native_child_exit_publication_between_futex_predicate_and_park_is_not_lost() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let runtime = NativeThreadRuntime::new_current();
+        let dispatcher = SyscallDispatcher::new();
+        let child = 0x6c11_0001;
+        let parent_tid = runtime.tid().raw();
+        crate::host_signal::forget_thread(parent_tid);
+        crate::host_signal::register_child_exit_watch(
+            child,
+            parent_tid,
+            crate::linux_abi::LINUX_SIGCHLD,
+        );
+        let wait = runtime.futex.prepare_wait(0xc411_d000);
+        let published = AtomicBool::new(false);
+
+        let outcome = runtime.futex.wait_prepared_for_thread(
+            wait,
+            Some(Duration::from_millis(25)),
+            runtime.tid(),
+            &|| {
+                let observed = crate::host_signal::has_unblocked_pending_for(
+                    parent_tid,
+                    carrick_abi::SigBlockMask::NONE,
+                );
+                if !published.swap(true, Ordering::SeqCst) {
+                    assert!(
+                        !observed,
+                        "child-exit signal must publish after the outer predicate check"
+                    );
+                    native_publish_child_exit(child);
+                }
+                observed
+            },
+        );
+
+        assert_eq!(outcome, crate::thread::FutexWaitOutcome::Interrupted);
+        assert!(native_wait_interrupt_or_stw(
+            &dispatcher,
+            runtime.tid(),
+            carrick_abi::WaitSigMask::NONE,
+        ));
+        assert_eq!(crate::host_signal::take_child_exit_parent(child), None);
+        let _ = crate::host_signal::take_pending_for(parent_tid);
+        crate::host_signal::forget_thread(parent_tid);
+    }
+
+    #[test]
+    fn native_host_signal_pump_closes_private_futex_park_window() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let _pump_guard = NATIVE_PUMP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        carrick_signal_core::clear_proc_pending();
+        let mut runtime = NativeThreadRuntime::new_current();
+        runtime.start_signal_wake_pump();
+        let pump_ready = Instant::now() + Duration::from_secs(1);
+        while (crate::host_signal::pump_kqueue() < 0 || crate::host_signal::pump_pipe_read_fd() < 0)
+            && Instant::now() < pump_ready
+        {
+            thread::yield_now();
+        }
+        assert!(crate::host_signal::pump_kqueue() >= 0, "pump kqueue ready");
+        assert!(
+            crate::host_signal::pump_pipe_read_fd() >= 0,
+            "pump pipe ready"
+        );
+
+        let wait = runtime.futex.prepare_wait(0x517a_0000);
+        let published = AtomicBool::new(false);
+        let outcome = runtime.futex.wait_prepared_for_thread(
+            wait,
+            Some(Duration::from_millis(100)),
+            runtime.tid(),
+            &|| {
+                let observed = crate::host_signal::has_unblocked_pending_for(
+                    runtime.tid().raw(),
+                    carrick_abi::SigBlockMask::NONE,
+                );
+                if !published.swap(true, Ordering::SeqCst) {
+                    assert!(!observed, "host signal publishes after outer check");
+                    // This is the host-handler/pump ingress shape, deliberately
+                    // bypassing the native timer helper's direct futex wake.
+                    crate::host_signal::publish_process_signal(crate::linux_abi::LINUX_SIGALRM);
+                }
+                observed
+            },
+        );
+
+        assert_eq!(outcome, crate::thread::FutexWaitOutcome::Interrupted);
+        carrick_signal_core::clear_proc_pending();
+    }
+
+    #[test]
+    fn native_xsignal_nudge_pump_closes_private_futex_park_window() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let _pump_guard = NATIVE_PUMP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        carrick_signal_core::xsig::xsig_init();
+        let _ = carrick_signal_core::xsig::xsig_drain_for_self();
+        let mut runtime = NativeThreadRuntime::new_current();
+        runtime.start_signal_wake_pump();
+        let pump_ready = Instant::now() + Duration::from_secs(1);
+        while (crate::host_signal::pump_kqueue() < 0 || crate::host_signal::pump_pipe_read_fd() < 0)
+            && Instant::now() < pump_ready
+        {
+            thread::yield_now();
+        }
+        assert!(crate::host_signal::pump_kqueue() >= 0, "pump kqueue ready");
+        assert!(
+            crate::host_signal::pump_pipe_read_fd() >= 0,
+            "pump pipe ready"
+        );
+
+        let wait = runtime.futex.prepare_wait(0x517a_1000);
+        let published = AtomicBool::new(false);
+        let outcome = runtime.futex.wait_prepared_for_thread(
+            wait,
+            Some(Duration::from_millis(100)),
+            runtime.tid(),
+            &|| {
+                let observed = carrick_signal_core::xsig::xsig_has_unblocked_for_self(
+                    carrick_abi::SigBlockMask::NONE,
+                );
+                if !published.swap(true, Ordering::SeqCst) {
+                    assert!(!observed, "xsignal publishes after outer check");
+                    assert!(carrick_signal_core::xsig::xsig_enqueue(
+                        std::process::id() as i32,
+                        crate::linux_abi::LINUX_SIGUSR1,
+                        crate::linux_abi::LINUX_SI_USER,
+                        1,
+                        0,
+                        0,
+                        0,
+                    ));
+                    // The real nudge handler calls `notify_pending`, whose pump
+                    // side is this async-signal-safe pipe write.
+                    crate::host_signal::wake_signal_pump_pipe();
+                }
+                observed
+            },
+        );
+
+        assert_eq!(outcome, crate::thread::FutexWaitOutcome::Interrupted);
+        let drained = carrick_signal_core::xsig::xsig_drain_for_self();
+        assert_eq!(drained.len(), 1);
     }
 
     /// If the watcher thread dies its owned kqueue drops (fd closed) while the
