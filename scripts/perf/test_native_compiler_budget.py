@@ -2,6 +2,7 @@
 
 import hashlib
 import dataclasses
+import gzip
 import json
 import os
 import pathlib
@@ -15,11 +16,63 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import native_compiler_budget as budget
 
 
+EVIDENCE_ROOT = pathlib.Path(__file__).resolve().parent / "evidence"
+
+
 def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def w1_evidence_raw_lines(pid=41, tid=42, era=7):
+    lines = nativeperf_frames(pid=pid, tid=tid, era=era)
+    lines[0] = lines[0].replace("gateway_entries=2", "gateway_entries=100").replace(
+        "reconciled_exits=2", "reconciled_exits=100"
+    )
+    lines[1] = (
+        lines[1]
+        .replace("exit_syscall=1", "exit_syscall=0")
+        .replace("exit_resolve_direct=1", "exit_resolve_direct=10")
+        .replace("exit_resolve_indirect=0", "exit_resolve_indirect=20")
+        .replace("exit_sensitive=0", "exit_sensitive=70")
+    )
+    lines[2] = (
+        lines[2]
+        .replace("sensitive_exclusive=0", "sensitive_exclusive=40")
+        .replace("sensitive_read_tpidr=0", "sensitive_read_tpidr=30")
+    )
+    lines[3] = (
+        lines[3]
+        .replace("phase_prepare_index_count=2", "phase_prepare_index_count=100")
+        .replace("phase_translated_run_count=2", "phase_translated_run_count=100")
+        .replace("phase_finish_exit_count=2", "phase_finish_exit_count=100")
+    )
+    lines[4] = (
+        lines[4]
+        .replace(
+            "phase_sensitive_emulation_ns=0|phase_sensitive_emulation_count=0",
+            "phase_sensitive_emulation_ns=70|phase_sensitive_emulation_count=70",
+        )
+        .replace("phase_syscall_dispatch_count=1", "phase_syscall_dispatch_count=0")
+        .replace("phase_loop_quiesce_count=2", "phase_loop_quiesce_count=100")
+        .replace("phase_blocked_count=1", "phase_blocked_count=0")
+    )
+    lines[5] = (
+        lines[5]
+        .replace("gateway_entries=2", "gateway_entries=100")
+        .replace("syscall_exits=1", "syscall_exits=0")
+        .replace("direct_resolver_exits=1", "direct_resolver_exits=10")
+    )
+    return lines + [
+        f"native Darwin guest thread {tid} error: guest did not exit after 100 traps"
+    ]
+
+
 def strict_w2_manifest_json(input_path: pathlib.Path) -> dict:
+    raw_lines = w1_evidence_raw_lines()
+    raw_bytes = ("\n".join(raw_lines) + "\n").encode("utf-8")
+    raw_sha = sha256(raw_bytes)
+    raw_artifact = input_path.parent.parent / "w1-raw.log.gz"
+    raw_artifact.write_bytes(gzip.compress(raw_bytes))
     result = {
         "schema": "carrick.native-compiler-workload.v1",
         "name": "w2-fixture",
@@ -59,7 +112,7 @@ def strict_w2_manifest_json(input_path: pathlib.Path) -> dict:
                 "profile_cleanup_status": 0,
                 "profile_stderr_sha256": "4" * 64,
                 "profile_summary_sha256": "5" * 64,
-                "w1_profile_sha256": "6" * 64,
+                "w1_profile_sha256": raw_sha,
                 "w1_hottest": {
                     "gateway_entries": 100,
                     "exit_resolve_direct": 10,
@@ -88,7 +141,8 @@ def strict_w2_manifest_json(input_path: pathlib.Path) -> dict:
         "binary_sha256": "7" * 64,
         "manifest_sha256": "8" * 64,
         "raw_profile_source": "target/native-compiler-task2-review/fixture/stderr",
-        "raw_profile_sha256": "6" * 64,
+        "raw_profile_sha256": raw_sha,
+        "raw_profile_evidence_path": "w1-raw.log.gz",
         "complete_thread_groups": 1,
         "frames_per_group": 9,
         "required_frames": sorted(budget.REQUIRED_FRAMES),
@@ -163,10 +217,34 @@ def dtrace_rows(run_id="run-1", pid=42):
     ]
 
 
-def profile_with_budget(
-    *, gateway_entries: int, sensitive_exclusive: int, syscall_dispatch_ns: int
+def dtrace_raw_lines(pid=42):
+    return [
+        f"DSRPROF1|sample|phase=prepare|pid={pid}|tid={pid}|kind=1|duration_ns=100|interval=1024",
+        f"DSRPROF1|sample|phase=dispatcher|pid={pid}|kind=135|duration_ns=50|interval=1024",
+        f"DSRPROF1|count|phase=prepare|pid={pid}|tid={pid}|kind=1|value=1",
+        f"DSRPROF1|count|phase=prepare|pid={pid}|kind=2|value=1",
+        f"DSRPROF1|count|phase=run|pid={pid}|tid={pid}|kind=1|value=1",
+        f"DSRPROF1|count|phase=run|pid={pid}|kind=2|value=1",
+        f"DSRPROF1|total|phase=run|pid={pid}|kind=1|value_ns=7",
+        f"DSRPROF1|minimum|phase=run|pid={pid}|kind=1|value_ns=7",
+        f"DSRPROF1|maximum|phase=run|pid={pid}|kind=1|value_ns=7",
+        f"DSRPROF1|incomplete|phase=run|pid={pid}|kind=1|value=0",
+        f"DSRPROF1|high-water|metric=cache-bytes|pid={pid}|used=64|capacity=4096",
+        "DSRPROF1|complete|profile=dsr|bounded=0|target_exit_reason=1",
+    ]
+
+
+def budget_frames(
+    *,
+    gateway_entries: int,
+    sensitive_exclusive: int,
+    syscall_dispatch_ns: int,
+    blocked_ns: int = 0,
+    pid: int = 10,
+    tid: int = 11,
+    era: int = 12,
 ):
-    lines = nativeperf_frames()
+    lines = nativeperf_frames(pid=pid, tid=tid, era=era)
     lines[0] = lines[0].replace("gateway_entries=2", f"gateway_entries={gateway_entries}").replace(
         "reconciled_exits=2", f"reconciled_exits={gateway_entries}"
     )
@@ -199,12 +277,37 @@ def profile_with_budget(
     lines[5] = lines[5].replace("gateway_entries=2", f"gateway_entries={gateway_entries}").replace(
         "syscall_exits=1", "syscall_exits=0"
     ).replace("direct_resolver_exits=1", "direct_resolver_exits=0")
-    return budget.parse_nativeperf(lines)
+    if blocked_ns:
+        lines[4] = lines[4].replace("phase_blocked_ns=0", f"phase_blocked_ns={blocked_ns}")
+    return lines
+
+
+def profile_with_budget(
+    *,
+    gateway_entries: int,
+    sensitive_exclusive: int,
+    syscall_dispatch_ns: int,
+    blocked_ns: int = 0,
+):
+    return budget.parse_nativeperf(
+        budget_frames(
+            gateway_entries=gateway_entries,
+            sensitive_exclusive=sensitive_exclusive,
+            syscall_dispatch_ns=syscall_dispatch_ns,
+            blocked_ns=blocked_ns,
+        )
+    )
 
 
 def strict_abba_records(
-    profile, profiled_wall_ns=105, untraced_cpu_ns=100, profiled_cpu_ns=100
+    profile, profiled_wall_ns=105, untraced_cpu_ns=100, profiled_cpu_ns=None
 ):
+    if profiled_cpu_ns is None:
+        profiled_cpu_ns = sum(
+            thread.value(frame, field)
+            for thread in profile.threads
+            for frame, field, _ in budget.ON_CPU_PHASES
+        )
     records = []
     for label in budget.abba_schedule(samples=5):
         plane = "untraced" if label.startswith("off-") else "profiled"
@@ -474,6 +577,29 @@ class NativePerfTests(unittest.TestCase):
         with self.assertRaisesRegex(budget.BudgetError, "exit reconciliation"):
             budget.validate_profile(budget.parse_nativeperf(mismatch))
 
+    def test_profile_rejects_sensitive_emulation_count_mismatch(self):
+        lines = nativeperf_frames()
+        lines[1] = lines[1].replace("exit_resolve_direct=1", "exit_resolve_direct=0").replace(
+            "exit_sensitive=0", "exit_sensitive=1"
+        )
+        lines[2] = lines[2].replace("sensitive_read_ctr=0", "sensitive_read_ctr=1")
+        lines[5] = lines[5].replace("direct_resolver_exits=1", "direct_resolver_exits=0")
+        with self.assertRaisesRegex(budget.BudgetError, "sensitive emulation"):
+            budget.validate_profile(budget.parse_nativeperf(lines))
+
+    def test_wire_profile_rejects_unknown_or_missing_value_keys(self):
+        profile = budget.parse_nativeperf(nativeperf_frames())
+        record = budget.RunRecord.synthetic(profile=profile, schedule_label="on-1")
+        encoded = budget.run_record_json(record)
+        extra = json.loads(json.dumps(encoded))
+        extra["profile"]["threads"][0]["values"]["core.invented"] = 1
+        with self.assertRaisesRegex(budget.BudgetError, "profile value"):
+            budget.parse_result_row(extra)
+        missing = json.loads(json.dumps(encoded))
+        del missing["profile"]["threads"][0]["values"]["cache-gauge.cache_used_bytes"]
+        with self.assertRaisesRegex(budget.BudgetError, "profile value"):
+            budget.parse_result_row(missing)
+
     def test_profile_rejects_unknown_or_duplicate_fields(self):
         unknown = nativeperf_frames()
         unknown[0] += "|surprise=1"
@@ -570,7 +696,67 @@ class CaptureAndScheduleTests(unittest.TestCase):
             budget.parse_time_l("0.01 real 0.02 user 0.03 sys\n")
 
 
+def direct_w2_manifest(root: pathlib.Path, *, argv: tuple[str, ...], guest_input: pathlib.Path):
+    return budget.WorkloadManifest(
+        budget.WORKLOAD_SCHEMA,
+        "fixture",
+        "example.invalid/image:1",
+        "sha256:" + "1" * 64,
+        str(root),
+        argv,
+        (),
+        (budget.HashedFile(str(guest_input), "input.go", sha256(b"package p\n")),),
+        "2" * 64,
+        0,
+        sha256(b""),
+        1_000_000,
+        "native16k",
+        budget.W2Capture(
+            "w2-toolexec",
+            "test",
+            1,
+            (("CARRICK_TOOLEXEC_LOG", "/tmp/log"), ("GOFLAGS", "-work")),
+            (),
+            0,
+            argv[argv.index("-o") + 1],
+            "3" * 64,
+            (
+                budget.DockerReplay(0, sha256(b""), "3" * 64),
+                budget.DockerReplay(0, sha256(b""), "3" * 64),
+            ),
+            sha256(b"w1"),
+            sha256(b""),
+            "evidence.json",
+            "4" * 64,
+            (),
+            (),
+        ),
+        root / "manifest.json",
+    )
+
+
 class ReviewFixContractTests(unittest.TestCase):
+    def test_w2_docker_replay_script_fails_fast_before_exec(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            guest_input = root / "guest/input.go"
+            sentinel = root / "executed"
+            manifest = direct_w2_manifest(
+                root,
+                argv=("/usr/bin/true", "-o", str(root / "out/out.a"), str(guest_input)),
+                guest_input=guest_input,
+            )
+            script, output_path = budget.w2_replay_script(manifest)
+            self.assertTrue(script.startswith("set -eu"))
+            self.assertEqual(str(output_path), str(root / "out/out.a"))
+            result = subprocess.run(
+                ["/bin/sh", "-c", script, "replay", "/usr/bin/touch", str(sentinel)],
+                check=False,
+                capture_output=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(sentinel.exists())
+
     def test_carrick_transaction_always_cleans_up_and_writes_receipt(self):
         for failure in ("launch", "time", "artifact-parse"):
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temp:
@@ -667,9 +853,13 @@ class ReviewFixContractTests(unittest.TestCase):
             self.assertIn(str(artifact / "dtrace-summary.jsonl"), command)
 
             summary = artifact / "dtrace-summary.jsonl"
+            raw = artifact / "dtrace.raw"
             rows = dtrace_rows(run_id="run-1", pid=42)
             summary.write_text("".join(json.dumps(row) + "\n" for row in rows))
-            parsed = budget.parse_dtrace_summary(summary, expected_run_id="run-1")
+            raw.write_text("".join(line + "\n" for line in dtrace_raw_lines(pid=42)))
+            parsed = budget.parse_dtrace_summary(
+                summary, expected_run_id="run-1", raw_path=raw
+            )
             self.assertTrue(parsed.complete)
             self.assertEqual(parsed.per_pid_gateway_counts, ((42, 2),))
             self.assertEqual(parsed.exit_mix, ((1, 1), (2, 1)))
@@ -679,12 +869,104 @@ class ReviewFixContractTests(unittest.TestCase):
             ]
             summary.write_text("".join(json.dumps(row) + "\n" for row in bad))
             with self.assertRaisesRegex(budget.BudgetError, "DTrace.*incomplete"):
-                budget.parse_dtrace_summary(summary, expected_run_id="run-1")
+                budget.parse_dtrace_summary(summary, expected_run_id="run-1", raw_path=raw)
             malformed_kind = dtrace_rows(run_id="run-1", pid=42)
             malformed_kind[0]["scope"]["kind"] = "01"
             summary.write_text("".join(json.dumps(row) + "\n" for row in malformed_kind))
             with self.assertRaisesRegex(budget.BudgetError, "canonical decimal"):
-                budget.parse_dtrace_summary(summary, expected_run_id="run-1")
+                budget.parse_dtrace_summary(summary, expected_run_id="run-1", raw_path=raw)
+
+    def test_checked_in_w1_evidence_declares_and_reconciles_raw_artifact(self):
+        evidence_path = EVIDENCE_ROOT / "native-compiler-w1-current-profile-v1.json"
+        evidence = json.loads(evidence_path.read_text())
+        self.assertIn("raw_profile_evidence_path", evidence)
+        artifact = EVIDENCE_ROOT / evidence["raw_profile_evidence_path"]
+        raw_bytes = gzip.decompress(artifact.read_bytes())
+        self.assertEqual(sha256(raw_bytes), evidence["raw_profile_sha256"])
+        manifest = budget.load_manifest(
+            pathlib.Path(__file__).resolve().parent / "manifests" / "native-compiler-w2-v1.json"
+        )
+        self.assertEqual(manifest.name, "w2-internal-runtime-atomic")
+
+    def test_w1_evidence_rejects_raw_artifact_content_drift(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            fixture = root / "fixture"
+            fixture.mkdir()
+            (fixture / "input.go").write_text("package p\n")
+            base = strict_w2_manifest_json(fixture / "input.go")
+            path = root / "manifest.json"
+            path.write_text(json.dumps(base) + "\n")
+            budget.load_manifest(path)
+            evidence_path = root / "evidence.json"
+            evidence = json.loads(evidence_path.read_text())
+            evidence["hottest"]["sensitive_exclusive"] -= 1
+            declared = dict(base["capture"]["representativeness"])
+            declared["w1_hottest"] = {
+                **declared["w1_hottest"],
+                "sensitive_exclusive": declared["w1_hottest"]["sensitive_exclusive"] - 1,
+            }
+            base["capture"]["representativeness"] = declared
+            evidence_path.write_text(json.dumps(evidence, sort_keys=True) + "\n")
+            base["capture"]["w1_profile_evidence_sha256"] = sha256(
+                evidence_path.read_bytes()
+            )
+            path.write_text(json.dumps(base) + "\n")
+            with self.assertRaisesRegex(budget.BudgetError, "raw"):
+                budget.load_manifest(path)
+
+    def test_plane_c_binds_raw_trace_and_round_trips_all_shapes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            artifact = pathlib.Path(temp)
+            summary = artifact / "dtrace-summary.jsonl"
+            raw = artifact / "dtrace.raw"
+            summary.write_text(
+                "".join(json.dumps(row) + "\n" for row in dtrace_rows(run_id="run-1", pid=42))
+            )
+            raw_lines = dtrace_raw_lines(pid=42)
+            raw.write_text("".join(line + "\n" for line in raw_lines))
+            evidence = budget.parse_dtrace_summary(
+                summary, expected_run_id="run-1", raw_path=raw
+            )
+            self.assertEqual(evidence.raw_path, "dtrace.raw")
+            self.assertEqual(evidence.raw_sha256, sha256(raw.read_bytes()))
+            self.assertEqual(
+                evidence.ordering,
+                (("prepare", 42, 42, 1), ("dispatcher", 42, None, 135)),
+            )
+            encoded = json.loads(json.dumps(budget._dtrace_json(evidence)))
+            self.assertEqual(budget._parse_dtrace_json(encoded), evidence)
+            drifted = [
+                line.replace("value=1", "value=2")
+                if "|count|phase=run|" in line and "kind=2" in line
+                else line
+                for line in raw_lines
+            ]
+            raw.write_text("".join(line + "\n" for line in drifted))
+            with self.assertRaisesRegex(budget.BudgetError, "raw count"):
+                budget.parse_dtrace_summary(summary, expected_run_id="run-1", raw_path=raw)
+
+    def test_retained_real_plane_c_artifacts_parse_and_round_trip(self):
+        root = EVIDENCE_ROOT / "real-plane-c-v1"
+        with tempfile.TemporaryDirectory() as temp:
+            artifact = pathlib.Path(temp)
+            raw_bytes = gzip.decompress((root / "dtrace.raw.gz").read_bytes())
+            summary_bytes = gzip.decompress((root / "dtrace-summary.jsonl.gz").read_bytes())
+            (artifact / "dtrace.raw").write_bytes(raw_bytes)
+            (artifact / "dtrace-summary.jsonl").write_bytes(summary_bytes)
+            evidence = budget.parse_dtrace_summary(
+                artifact / "dtrace-summary.jsonl",
+                expected_run_id="nativeperf-w2-internal-runtime-atomic-3-c0459f8d",
+                raw_path=artifact / "dtrace.raw",
+            )
+            self.assertTrue(evidence.complete)
+            self.assertFalse(evidence.bounded)
+            self.assertEqual(evidence.raw_sha256, sha256(raw_bytes))
+            self.assertEqual(len(evidence.per_pid_gateway_counts), 23)
+            self.assertEqual(len(evidence.ordering), 1443)
+            self.assertTrue(any(entry[2] is None for entry in evidence.ordering))
+            encoded = json.loads(json.dumps(budget._dtrace_json(evidence)))
+            self.assertEqual(budget._parse_dtrace_json(encoded), evidence)
 
     def test_typed_outcomes_record_trap_ceiling_but_analysis_rejects_it(self):
         marker = budget.parse_max_traps_marker(
@@ -707,6 +989,53 @@ class ReviewFixContractTests(unittest.TestCase):
         record = budget.RunRecord.synthetic(outcome=outcome)
         with self.assertRaisesRegex(budget.BudgetError, "completed outcomes"):
             budget.analyze([record])
+
+    def test_untraced_max_traps_marker_is_typed_without_profile(self):
+        marker = budget.parse_max_traps_marker(
+            ["native Darwin guest thread 42 error: guest did not exit after 1000000 traps"]
+        )
+        outcome = budget.classify_outcome(
+            engine="carrick",
+            status=2,
+            expected_status=0,
+            stdout_matches=False,
+            gateway_entries=None,
+            gateway_limit=1_000_000,
+            max_traps_marker=marker,
+            ceiling_profile_identity=None,
+        )
+        self.assertEqual(outcome.kind, "max-traps")
+        self.assertEqual(outcome.ceiling_marker_thread_id, 42)
+        self.assertEqual(outcome.ceiling_marker_traps, 1_000_000)
+        self.assertIsNone(outcome.gateway_entries)
+        self.assertIsNone(outcome.ceiling_profile_identity)
+        record = budget.RunRecord.synthetic(outcome=outcome, plane="untraced")
+        decoded = budget.parse_result_row(budget.run_record_json(record))
+        self.assertEqual(decoded.outcome, outcome)
+
+    def test_untraced_max_traps_marker_still_requires_exact_ceiling(self):
+        with self.assertRaisesRegex(budget.BudgetError, "marker.*ceiling"):
+            budget.classify_outcome(
+                engine="carrick",
+                status=2,
+                expected_status=0,
+                stdout_matches=False,
+                gateway_entries=None,
+                gateway_limit=1_000_000,
+                max_traps_marker=budget.MaxTrapsMarker(42, 999_999),
+                ceiling_profile_identity=None,
+            )
+        with self.assertRaisesRegex(budget.BudgetError, "identity"):
+            budget.classify_outcome(
+                engine="carrick",
+                status=2,
+                expected_status=0,
+                stdout_matches=False,
+                gateway_entries=None,
+                gateway_limit=1_000_000,
+                max_traps_marker=budget.MaxTrapsMarker(42, 1_000_000),
+                ceiling_profile_identity=(41, 42, 7),
+            )
 
     def test_exit_two_without_exact_max_traps_marker_is_failed(self):
         outcome = budget.classify_outcome(
@@ -892,7 +1221,7 @@ class ReviewFixContractTests(unittest.TestCase):
             "direct_resolver_exits=1", "direct_resolver_exits=0"
         )
         profile = budget.parse_nativeperf(lines)
-        counts = budget.derive_count_evidence(profile)
+        counts = budget.derive_count_evidence(profile, scope="aggregate-threads")
         self.assertEqual(dict(counts.sensitive_shares)["exclusive"], 0.5)
         self.assertEqual(dict(counts.sensitive_shares)["dc-zva"], 0.25)
         self.assertFalse(counts.resolver_recurring_pc_verified)
@@ -923,6 +1252,122 @@ class ReviewFixContractTests(unittest.TestCase):
         with self.assertRaisesRegex(budget.BudgetError, "unknown timing field"):
             budget.parse_result_row(changed)
 
+    def test_result_rows_validate_engine_plane_cross_fields(self):
+        profile = budget.parse_nativeperf(nativeperf_frames())
+        base = budget.run_record_json(
+            budget.RunRecord.synthetic(profile=profile, schedule_label="on-1")
+        )
+
+        def variant(**changes):
+            row = json.loads(json.dumps(base))
+            for key, value in changes.items():
+                container = row
+                *parents, leaf = key.split(".")
+                for parent in parents:
+                    container = container[parent]
+                container[leaf] = value
+            return row
+
+        budget.parse_result_row(base)
+        cases = [
+            ("profile on untraced plane", variant(plane="untraced", schedule_label="off-1")),
+            ("profiled plane without profile", variant(profile=None)),
+            ("docker on profiled plane", variant(engine="docker")),
+            (
+                "docker with preflight receipt",
+                variant(
+                    engine="docker",
+                    plane="untraced",
+                    schedule_label="",
+                    profile=None,
+                    **{"provenance.binary_sha256": "0" * 64},
+                ),
+            ),
+            (
+                "carrick without preflight receipt",
+                variant(**{"provenance.preflight_sha256": None}),
+            ),
+            (
+                "docker with carrick cleanup",
+                variant(
+                    engine="docker",
+                    plane="untraced",
+                    schedule_label="",
+                    profile=None,
+                    **{
+                        "provenance.preflight_sha256": None,
+                        "provenance.binary_sha256": "0" * 64,
+                    },
+                ),
+            ),
+            (
+                "carrick with docker binary sentinel",
+                variant(**{"provenance.binary_sha256": "0" * 64}),
+            ),
+            (
+                "dtrace evidence on profiled plane",
+                variant(
+                    dtrace={
+                        "complete": True,
+                        "bounded": False,
+                        "incomplete_pairs": 0,
+                        "raw_path": "dtrace.raw",
+                        "raw_sha256": "a" * 64,
+                        "drops": {},
+                        "per_pid_gateway_counts": [],
+                        "exit_mix": [],
+                        "ordering": [],
+                    }
+                ),
+            ),
+            ("dtrace plane without dtrace evidence", variant(plane="dtrace", profile=None)),
+            (
+                "gateway count differing from profile ceiling",
+                variant(**{"outcome.gateway_entries": 3}),
+            ),
+            (
+                "baseline label on a profiled plane",
+                variant(schedule_label="baseline-w1-measured-1"),
+            ),
+            (
+                "baseline warmup with nonzero repetition",
+                variant(
+                    plane="untraced",
+                    profile=None,
+                    schedule_label="baseline-w1-warmup-0",
+                    repetition=2,
+                ),
+            ),
+            ("unknown schedule label", variant(schedule_label="adhoc-9")),
+            (
+                "abba label with wrong repetition",
+                variant(schedule_label="on-2"),
+            ),
+        ]
+        for name, row in cases:
+            with self.subTest(case=name):
+                with self.assertRaises(budget.BudgetError):
+                    budget.parse_result_row(row)
+
+    def test_docker_baseline_row_round_trips(self):
+        record = budget.RunRecord.synthetic(
+            plane="untraced", schedule_label="baseline-w1-measured-1"
+        )
+        row = budget.run_record_json(record)
+        row["engine"] = "docker"
+        row["provenance"]["preflight_sha256"] = None
+        row["provenance"]["binary_sha256"] = "0" * 64
+        row["cleanup"] = {
+            "status": "not-required",
+            "exit_status": None,
+            "descendants_absent": True,
+            "stdout": "",
+            "stderr": "",
+        }
+        decoded = budget.parse_result_row(row)
+        self.assertEqual(decoded.engine, "docker")
+        self.assertEqual(decoded.cleanup.status, "not-required")
+
     def test_analyze_check_requires_exact_order_warmups_and_one_decision(self):
         profile = profile_with_budget(
             gateway_entries=100,
@@ -946,6 +1391,63 @@ class ReviewFixContractTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(budget.BudgetError, "exactly one decision"):
                 budget.analyze_evidence(evidence, check=True)
+
+    def test_count_evidence_exposes_explicit_thread_scope(self):
+        lines = budget_frames(
+            gateway_entries=400, sensitive_exclusive=160, syscall_dispatch_ns=0
+        ) + budget_frames(
+            gateway_entries=240,
+            sensitive_exclusive=0,
+            syscall_dispatch_ns=0,
+            pid=20,
+            tid=21,
+        )
+        profile = budget.parse_nativeperf(lines)
+        hottest = budget.derive_count_evidence(profile, scope="hottest-thread")
+        aggregate = budget.derive_count_evidence(profile, scope="aggregate-threads")
+        self.assertEqual(hottest.scope, "hottest-thread")
+        self.assertEqual(aggregate.scope, "aggregate-threads")
+        self.assertEqual(dict(hottest.sensitive_shares)["exclusive"], 0.4)
+        self.assertEqual(dict(aggregate.sensitive_shares)["exclusive"], 0.25)
+        with self.assertRaisesRegex(budget.BudgetError, "scope"):
+            budget.derive_count_evidence(profile, scope="everything")
+
+    def test_count_scopes_must_agree_before_slice_selection(self):
+        lines = budget_frames(
+            gateway_entries=400, sensitive_exclusive=160, syscall_dispatch_ns=0
+        ) + budget_frames(
+            gateway_entries=390,
+            sensitive_exclusive=0,
+            syscall_dispatch_ns=0,
+            pid=20,
+            tid=21,
+        )
+        profile = budget.parse_nativeperf(lines)
+        records = strict_abba_records(profile)
+        with self.assertRaisesRegex(budget.BudgetError, "scope"):
+            budget.analyze(records)
+
+    def test_analyze_validates_additive_model_before_count_decision(self):
+        profile = profile_with_budget(
+            gateway_entries=100, sensitive_exclusive=40, syscall_dispatch_ns=0
+        )
+        records = strict_abba_records(profile, profiled_cpu_ns=78)
+        with self.assertRaisesRegex(budget.BudgetError, "2%"):
+            budget.analyze(records)
+
+    def test_blocked_residual_rung_selects_scheduler_slice(self):
+        profile = profile_with_budget(
+            gateway_entries=100,
+            sensitive_exclusive=10,
+            syscall_dispatch_ns=0,
+            blocked_ns=35,
+        )
+        records = strict_abba_records(profile)
+        decision = budget.analyze(records)
+        self.assertEqual(decision.selected_slice, "blocked-residual")
+        self.assertEqual(decision.scope, "process-wall")
+        self.assertIn("wall", decision.basis)
+        self.assertTrue(decision.duration_evidence_usable)
 
     def test_analyzer_never_combines_count_and_cpu_fractions(self):
         profile = profile_with_budget(
@@ -974,12 +1476,13 @@ class AnalyzerTests(unittest.TestCase):
             ),
             profiled_wall_ns=profiled_wall_ns,
             untraced_cpu_ns=100,
-            profiled_cpu_ns=100,
         )
 
     def test_decision_ignores_dtrace_wall_and_uses_profile_counts(self):
         records = self.abba_records()
-        dtrace = budget.DtraceEvidence(True, False, 0, (), (), (), (("slow", 999),))
+        dtrace = budget.DtraceEvidence(
+            True, False, 0, "dtrace.raw", "a" * 64, (), (), (), (("run", 42, 42, 999),)
+        )
         records = [dataclasses.replace(record, dtrace=dtrace) for record in records]
         self.assertEqual(budget.analyze(records).selected_slice, "sensitive-exclusive")
 
