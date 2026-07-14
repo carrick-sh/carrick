@@ -2346,18 +2346,6 @@ impl SyscallDispatcher {
     /// Capsule version 1 initially carries only bare stdio. Reject every richer
     /// fd-table shape before host exec until typed descriptor snapshots land.
     pub(crate) fn validate_native_reexec_fd_state(&self) -> Result<(), String> {
-        let stdio_cloexec = *self.io.stdio_cloexec.lock();
-        let closed_stdio = *self.io.closed_stdio.lock();
-        let table = self.io.open_files.read();
-        for fd in 0..=2 {
-            if !table.contains_key(&fd) && (stdio_cloexec[fd as usize] || closed_stdio[fd as usize])
-            {
-                return Err(format!(
-                    "unsupported bare stdio state: cloexec={stdio_cloexec:?} closed={closed_stdio:?}"
-                ));
-            }
-        }
-        drop(table);
         self.snapshot_native_reexec_fd_table().map(|_| ())
     }
 
@@ -2378,14 +2366,96 @@ impl SyscallDispatcher {
         summary
     }
 
+    pub(crate) fn snapshot_native_reexec_process_state(
+        &self,
+    ) -> crate::native_exec_capsule::NativeReexecProcessStateV1 {
+        let credentials = self.cred_snapshot();
+        let rlimit_overrides = self
+            .proc
+            .lock()
+            .rlimit_overrides
+            .iter()
+            .map(|limit| {
+                limit.map(|limit| crate::native_exec_capsule::NativeReexecRlimitV1 {
+                    current: limit.rlim_cur,
+                    maximum: limit.rlim_max,
+                })
+            })
+            .collect();
+        crate::native_exec_capsule::NativeReexecProcessStateV1 {
+            credentials: crate::native_exec_capsule::NativeReexecCredentialsV1 {
+                ruid: credentials.ruid,
+                euid: credentials.euid,
+                suid: credentials.suid,
+                rgid: credentials.rgid,
+                egid: credentials.egid,
+                sgid: credentials.sgid,
+                fsuid: credentials.fsuid,
+                fsgid: credentials.fsgid,
+                umask: credentials.umask,
+            },
+            supplementary_groups_override: self.setgroups_override.lock().clone(),
+            ignored_signals: self.native_reexec_ignored_signals().raw(),
+            nofile_soft: self
+                .io
+                .nofile_soft
+                .load(std::sync::atomic::Ordering::Relaxed),
+            rlimit_overrides,
+        }
+    }
+
+    pub(crate) fn restore_native_reexec_process_state(
+        &self,
+        state: &crate::native_exec_capsule::NativeReexecProcessStateV1,
+    ) {
+        let credentials = state.credentials;
+        *self.creds.lock() = creds::CredState {
+            ruid: credentials.ruid,
+            euid: credentials.euid,
+            suid: credentials.suid,
+            rgid: credentials.rgid,
+            egid: credentials.egid,
+            sgid: credentials.sgid,
+            fsuid: credentials.fsuid,
+            fsgid: credentials.fsgid,
+            umask: credentials.umask,
+        };
+        *self.setgroups_override.lock() = state.supplementary_groups_override.clone();
+        self.io
+            .nofile_soft
+            .store(state.nofile_soft, std::sync::atomic::Ordering::Relaxed);
+        let mut process = self.proc.lock();
+        for (slot, limit) in process
+            .rlimit_overrides
+            .iter_mut()
+            .zip(&state.rlimit_overrides)
+        {
+            *slot =
+                limit.map(|limit| crate::linux_abi::LinuxRlimit::new(limit.current, limit.maximum));
+        }
+        drop(process);
+        self.restore_native_reexec_ignored_signals(carrick_abi::SigSet::from_raw(
+            state.ignored_signals,
+        ));
+    }
+
     pub(crate) fn snapshot_native_reexec_fd_table(&self) -> Result<NativeReexecFdTableV1, String> {
-        let mut entries = self
-            .io
-            .open_files
-            .read()
+        let table = self.io.open_files.read();
+        let stdio_cloexec = *self.io.stdio_cloexec.lock();
+        let closed_stdio = *self.io.closed_stdio.lock();
+        let closed_stdio = std::array::from_fn(|index| {
+            let fd = index as i32;
+            table
+                .get(&fd)
+                .map_or(closed_stdio[index] || stdio_cloexec[index], |open_file| {
+                    open_file.fd_flags & crate::linux_abi::LINUX_FD_CLOEXEC != 0
+                })
+        });
+        let mut entries = table
             .iter()
             .map(|(fd, open_file)| (*fd, open_file.clone()))
             .collect::<Vec<_>>();
+        drop(table);
         entries.sort_by_key(|(fd, _)| *fd);
 
         let mut description_ids = std::collections::HashMap::<usize, u32>::new();
@@ -2559,6 +2629,7 @@ impl SyscallDispatcher {
             files,
             descriptions,
             close_on_exec_host_fds,
+            closed_stdio,
         })
     }
 
@@ -2731,6 +2802,8 @@ impl SyscallDispatcher {
             descriptions.push(std::sync::Arc::new(RwLock::new(description)));
         }
 
+        *self.io.closed_stdio.lock() = snapshot.closed_stdio;
+        *self.io.stdio_cloexec.lock() = [false; 3];
         let mut table = self.io.open_files.write();
         for file in &snapshot.files {
             if file.guest_fd < 0
@@ -9304,6 +9377,54 @@ mod native_reexec_fd_tests {
     use super::*;
     use std::io::{Seek, Write};
     use std::os::fd::IntoRawFd;
+
+    #[test]
+    fn process_state_round_trip_preserves_credentials_groups_umask_and_ignored_signals() {
+        let state = crate::native_exec_capsule::NativeReexecProcessStateV1 {
+            credentials: crate::native_exec_capsule::NativeReexecCredentialsV1 {
+                ruid: 1001,
+                euid: 1002,
+                suid: 1003,
+                rgid: 2001,
+                egid: 2002,
+                sgid: 2003,
+                fsuid: 1004,
+                fsgid: 2004,
+                umask: 0o027,
+            },
+            supplementary_groups_override: Some(vec![50, 2002, 65534]),
+            ignored_signals: carrick_abi::SigSet::EMPTY
+                .with(crate::linux_abi::LINUX_SIGPIPE)
+                .raw(),
+            nofile_soft: 1024,
+            rlimit_overrides: (0..16)
+                .map(|index| {
+                    (index == 3).then_some(crate::native_exec_capsule::NativeReexecRlimitV1 {
+                        current: 4096,
+                        maximum: 8192,
+                    })
+                })
+                .collect(),
+        };
+        let resumed = SyscallDispatcher::new();
+        resumed.restore_native_reexec_process_state(&state);
+
+        assert_eq!(resumed.snapshot_native_reexec_process_state(), state);
+    }
+
+    #[test]
+    fn stdio_closed_or_cloexec_before_exec_restores_closed() {
+        let source = SyscallDispatcher::new();
+        source.io.closed_stdio.lock()[0] = true;
+        source.io.stdio_cloexec.lock()[1] = true;
+        let snapshot = source.snapshot_native_reexec_fd_table().unwrap();
+        assert_eq!(snapshot.closed_stdio, [true, true, false]);
+
+        let resumed = SyscallDispatcher::new();
+        resumed.restore_native_reexec_fd_table(&snapshot).unwrap();
+        assert_eq!(*resumed.io.closed_stdio.lock(), [true, true, false]);
+        assert_eq!(*resumed.io.stdio_cloexec.lock(), [false; 3]);
+    }
 
     #[test]
     fn host_pipe_snapshot_restores_guest_aliases_and_kernel_identity() {

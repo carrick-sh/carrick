@@ -14,3 +14,4 @@ workspace = true
 [dependencies]
 carrick-abi = { path = "../carrick-abi" }
 libc.workspace = true
+tempfile.workspace = true

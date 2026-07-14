@@ -20,6 +20,7 @@
 //! flag (now private to this module) directly.
 
 use crate::signal_unblocked_by_mask;
+use std::os::fd::IntoRawFd;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicPtr, AtomicU32, Ordering};
 
 const XSIG_SLOTS: usize = 256;
@@ -49,33 +50,91 @@ struct XSigRing {
 }
 
 static XSIG_RING: AtomicPtr<XSigRing> = AtomicPtr::new(std::ptr::null_mut());
+static XSIG_RING_FD: AtomicI32 = AtomicI32::new(-1);
 static XSIG_DIRTY: AtomicBool = AtomicBool::new(false);
 
-/// Allocate the shared xsignal ring once (`MAP_SHARED|MAP_ANON`, inherited
-/// across fork). Idempotent: the post-fork `install_default_handlers` call sees
-/// a non-null pointer (the child inherited the mapping) and is a no-op, so all
-/// processes share ONE ring. Best-effort — a failed mmap leaves the ring absent
-/// and senders fall back to a plain host `kill`.
+/// Allocate the shared xsignal ring once. A deleted temporary file backs the
+/// mapping so native fork-children can carry its fd through a host self-reexec
+/// and remap the same ring; ordinary fork descendants inherit both mapping and
+/// fd. Best-effort — a failed allocation leaves the ring absent and senders
+/// fall back to a plain host `kill`.
 pub fn xsig_init() {
     if !XSIG_RING.load(Ordering::Acquire).is_null() {
         return;
     }
     let size = std::mem::size_of::<XSigRing>();
-    let p = unsafe {
+    let Ok(file) = tempfile::tempfile() else {
+        return;
+    };
+    if file.set_len(size as u64).is_err() {
+        return;
+    }
+    let fd = file.into_raw_fd();
+    if !xsig_adopt_reexec_fd(fd) {
+        unsafe {
+            libc::close(fd);
+        }
+    }
+}
+
+/// The private backing fd a native host self-reexec must preserve. The fd is
+/// never a guest descriptor and remains owned by this module.
+pub fn xsig_reexec_fd() -> Option<i32> {
+    let fd = XSIG_RING_FD.load(Ordering::Acquire);
+    (fd >= 0).then_some(fd)
+}
+
+/// Adopt a ring backing fd inherited through native host self-reexec.
+///
+/// The caller transfers process-lifetime ownership of `fd`. The fresh process
+/// has no old ring mapping, while ordinary fork descendants hit the idempotent
+/// already-mapped path and keep their inherited fd.
+pub fn xsig_adopt_reexec_fd(fd: i32) -> bool {
+    if fd < 0 {
+        return false;
+    }
+    if !XSIG_RING.load(Ordering::Acquire).is_null() {
+        return XSIG_RING_FD.load(Ordering::Acquire) == fd;
+    }
+    let size = std::mem::size_of::<XSigRing>();
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } < 0 {
+        return false;
+    }
+    let stat = unsafe { stat.assume_init() };
+    if stat.st_mode & libc::S_IFMT != libc::S_IFREG || stat.st_size != size as libc::off_t {
+        return false;
+    }
+    let mapping = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
             size,
             libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_SHARED | libc::MAP_ANON,
-            -1,
+            libc::MAP_SHARED,
+            fd,
             0,
         )
     };
-    if p == libc::MAP_FAILED {
-        return;
+    if mapping == libc::MAP_FAILED {
+        return false;
     }
-    // mmap zero-fills, so every slot's `used` is 0 (free) already.
-    XSIG_RING.store(p.cast::<XSigRing>(), Ordering::Release);
+    match XSIG_RING.compare_exchange(
+        std::ptr::null_mut(),
+        mapping.cast::<XSigRing>(),
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => {
+            XSIG_RING_FD.store(fd, Ordering::Release);
+            true
+        }
+        Err(_) => {
+            unsafe {
+                libc::munmap(mapping, size);
+            }
+            false
+        }
+    }
 }
 
 fn xsig_ring() -> Option<&'static XSigRing> {
@@ -253,6 +312,39 @@ mod tests {
         xsig_init();
         let second = XSIG_RING.load(Ordering::Acquire);
         assert_eq!(first, second, "a second xsig_init must not re-map the ring");
+    }
+
+    #[test]
+    fn reexec_backing_fd_maps_the_same_shared_ring() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_ring();
+        let fd = xsig_reexec_fd().expect("xsignal ring backing fd");
+        let size = std::mem::size_of::<XSigRing>();
+        let remapped = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            )
+        };
+        assert_ne!(remapped, libc::MAP_FAILED);
+
+        let me = std::process::id() as i32;
+        assert!(xsig_enqueue(me, 15, 0, 42, 0, 0, 0));
+        let remapped_ring = unsafe { &*remapped.cast::<XSigRing>() };
+        assert!(remapped_ring.slots.iter().any(|slot| {
+            slot.used.load(Ordering::Acquire) == 2
+                && slot.target_host_pid.load(Ordering::Acquire) == me
+                && slot.signum.load(Ordering::Acquire) == 15
+        }));
+
+        unsafe {
+            libc::munmap(remapped, size);
+        }
+        let _ = xsig_drain_for_self();
     }
 
     #[test]
