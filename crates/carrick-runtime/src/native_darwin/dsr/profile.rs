@@ -535,6 +535,58 @@ pub(in crate::native_darwin) fn claimed_process_startup() -> Option<(u64, u64)> 
     PROCESS_STARTUP.claimed()
 }
 
+/// Sentinel for "no baseline installed": u64::MAX nanoseconds is ~584 years
+/// of CPU time, not a realistic reading, so it safely distinguishes "unset"
+/// from a genuine zero baseline (a surviving thread that had consumed no CPU
+/// before the exec).
+const NO_THREAD_CPU_BASELINE_NS: u64 = u64::MAX;
+
+/// Baseline CPU (ns) for the ONE kernel thread that survives a PID-preserving
+/// host self-reexec (see `resume_guest_from_capsule`). Real execve keeps the
+/// calling thread's kernel CPU accounting intact — unlike fork, which starts
+/// a fresh thread at a zero counter — so without this baseline the post-exec
+/// era's flush would report the pre-exec era's CPU a second time (the
+/// pre-exec image already flushed its own record for it). Installed exactly
+/// once at post-exec runtime re-entry and consumed exactly once by the next
+/// `ThreadBudget::from_environment` call: in a freshly execve'd process image
+/// that is necessarily the surviving thread's own post-exec budget, since no
+/// other thread runs before it.
+static SURVIVING_THREAD_CPU_BASELINE_NS: AtomicU64 = AtomicU64::new(NO_THREAD_CPU_BASELINE_NS);
+
+/// Per-era thread CPU: the calling thread's live cumulative CPU counter minus
+/// whatever baseline was installed for this era (zero for a fresh kernel
+/// thread, since it never installs one — the subtraction is then a no-op).
+/// Saturates at zero so a measurement race that reads `current_thread_cpu_ns`
+/// a hair below the baseline can never underflow into a huge unsigned wrap.
+fn thread_cpu_since_baseline(current_thread_cpu_ns: u64, baseline_ns: u64) -> u64 {
+    current_thread_cpu_ns.saturating_sub(baseline_ns)
+}
+
+/// Install the surviving thread's CPU baseline at runtime re-entry after a
+/// PID-preserving host self-reexec. Environment gated like the sibling
+/// startup-window marks: a profile-off run performs no usage read here.
+pub(in crate::native_darwin) fn install_surviving_thread_cpu_baseline_at_reexec_entry() {
+    if std::env::var_os("CARRICK_DSR_PROFILE").is_none() {
+        return;
+    }
+    if let Ok(baseline_ns) = current_thread_cpu_total_ns() {
+        SURVIVING_THREAD_CPU_BASELINE_NS.store(baseline_ns, Ordering::Release);
+    }
+    // On a read failure, leave the slot unset: the surviving thread's budget
+    // then reads a zero baseline (as if it were a fresh thread) instead of
+    // stranding a half-written one. The same read failing again at that
+    // thread's own flush already fails the record closed via
+    // `ThreadUsageUnavailable`.
+}
+
+/// Consume (take) the installed baseline exactly once.
+fn take_surviving_thread_cpu_baseline_ns() -> u64 {
+    match SURVIVING_THREAD_CPU_BASELINE_NS.swap(NO_THREAD_CPU_BASELINE_NS, Ordering::AcqRel) {
+        NO_THREAD_CPU_BASELINE_NS => 0,
+        baseline_ns => baseline_ns,
+    }
+}
+
 /// Claim the process startup window at a gateway entry. Cheap once claimed:
 /// a single acquire load guards the usage/timer reads.
 pub(super) fn claim_process_startup() -> Result<(), ProfileError> {
@@ -558,9 +610,14 @@ pub(super) struct FlushGauges {
 
 /// Sample the flush-moment gauges for one thread group. Claims the startup
 /// window if no gateway entry has (a flush before first guest entry ends the
-/// window at the flush).
-pub(super) fn flush_gauges() -> Result<FlushGauges, ProfileError> {
-    let thread_cpu_ns = current_thread_cpu_total_ns()?;
+/// window at the flush). `thread_cpu_baseline_ns` is the era baseline
+/// installed on the flushing thread's `ThreadBudget` (zero for every thread
+/// except the one surviving a PID-preserving host self-reexec): the reported
+/// `thread_cpu_ns` is this era's OWN consumption, not the thread's lifetime
+/// total.
+pub(super) fn flush_gauges(thread_cpu_baseline_ns: u64) -> Result<FlushGauges, ProfileError> {
+    let thread_cpu_ns =
+        thread_cpu_since_baseline(current_thread_cpu_total_ns()?, thread_cpu_baseline_ns);
     let process_cpu_ns = process_cpu_total_ns()?;
     let (startup_wall_ns, startup_cpu_ns) =
         PROCESS_STARTUP.claim(monotonic_ticks(), process_cpu_ns)?;
@@ -759,17 +816,30 @@ pub(super) struct ThreadBudget {
     phase_ns: [u64; Phase::COUNT],
     phase_counts: [u64; Phase::COUNT],
     blocked_cpu_ns: u64,
+    thread_cpu_baseline_ns: u64,
     invalid: Option<ProfileError>,
 }
 
 impl ThreadBudget {
     pub(super) fn from_environment(tid: i32) -> Self {
-        Self::new(
-            std::env::var_os("CARRICK_DSR_PROFILE").is_some(),
+        let enabled = std::env::var_os("CARRICK_DSR_PROFILE").is_some();
+        let mut budget = Self::new(
+            enabled,
             // SAFETY: `getpid` has no preconditions.
             unsafe { libc::getpid() },
             tid,
-        )
+        );
+        if enabled {
+            // Consume the baseline installed at post-exec runtime re-entry
+            // (`install_surviving_thread_cpu_baseline_at_reexec_entry`). This
+            // is the FIRST `ThreadBudget` built in a freshly execve'd process
+            // image, so it is necessarily the surviving thread's own
+            // post-exec budget; every later budget in this image (spawned
+            // guest threads, or a process that never self-reexec'd) observes
+            // the unset sentinel and gets zero.
+            budget.thread_cpu_baseline_ns = take_surviving_thread_cpu_baseline_ns();
+        }
+        budget
     }
 
     fn new(enabled: bool, pid: libc::pid_t, tid: i32) -> Self {
@@ -784,12 +854,17 @@ impl ThreadBudget {
             phase_ns: [0; Phase::COUNT],
             phase_counts: [0; Phase::COUNT],
             blocked_cpu_ns: 0,
+            thread_cpu_baseline_ns: 0,
             invalid: None,
         }
     }
 
     pub(super) fn enabled(&self) -> bool {
         self.enabled
+    }
+
+    pub(super) fn thread_cpu_baseline_ns(&self) -> u64 {
+        self.thread_cpu_baseline_ns
     }
 
     pub(super) fn record_gateway_entry(&mut self) -> Result<(), ProfileError> {
@@ -993,6 +1068,15 @@ impl ThreadBudget {
         Self::new(false, pid, tid)
     }
 
+    /// Directly install an era CPU baseline, bypassing the process-global
+    /// single-shot slot that production code consumes through
+    /// `from_environment`. Lets tests exercise the era-delta computation
+    /// deterministically without racing a real self-reexec.
+    #[cfg(test)]
+    pub(super) fn install_thread_cpu_baseline_ns_for_test(&mut self, baseline_ns: u64) {
+        self.thread_cpu_baseline_ns = baseline_ns;
+    }
+
     #[cfg(test)]
     fn set_gateway_entries_for_test(&mut self, value: u64) {
         self.gateway_entries = value;
@@ -1022,6 +1106,32 @@ mod tests {
         );
         assert!(record.to_protocol_line(0).contains("complete=1"));
         assert!(record.to_protocol_line(7).contains("|thread_cpu_ns=7"));
+    }
+
+    #[test]
+    fn thread_budget_with_installed_baseline_reports_the_era_delta_and_saturates_at_zero() {
+        let mut budget = ThreadBudget::enabled_for_test(41, 42);
+        // Fresh threads (the common case) never install a baseline.
+        assert_eq!(budget.thread_cpu_baseline_ns(), 0);
+
+        budget.install_thread_cpu_baseline_ns_for_test(500);
+        assert_eq!(budget.thread_cpu_baseline_ns(), 500);
+
+        // The surviving exec-calling thread's kernel CPU counter is
+        // cumulative across the self-reexec: subtracting the baseline
+        // installed at post-exec runtime re-entry yields only THIS era's
+        // consumption.
+        assert_eq!(
+            thread_cpu_since_baseline(1_500, budget.thread_cpu_baseline_ns()),
+            1_000
+        );
+        // A measurement race that reads the current counter a hair below the
+        // installed baseline must saturate at zero instead of wrapping to a
+        // huge unsigned value.
+        assert_eq!(
+            thread_cpu_since_baseline(100, budget.thread_cpu_baseline_ns()),
+            0
+        );
     }
 
     fn syscall_phase_budget(blocked_wall_ns: u64) -> ThreadBudget {

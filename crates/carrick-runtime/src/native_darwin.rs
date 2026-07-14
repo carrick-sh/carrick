@@ -921,6 +921,12 @@ pub(crate) fn resume_guest_from_capsule(
         }
         None => dsr::profile::mark_native_process_runtime_entry(),
     }
+    // Thread CPU attribution across the same boundary: real execve keeps the
+    // calling thread's kernel CPU accounting intact (unlike fork, which
+    // starts a fresh thread at zero), so the ONE surviving thread's post-exec
+    // era must subtract a baseline captured here — otherwise its flush
+    // double-counts the CPU the pre-exec era already reported.
+    dsr::profile::install_surviving_thread_cpu_baseline_at_reexec_entry();
     if let Some(arena) = guest.kernel_arena {
         carrick_kernel::arena::KernelArena::init_global_from_reexec(
             carrick_kernel::arena::KernelArenaReexecAuthority {

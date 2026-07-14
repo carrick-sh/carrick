@@ -831,6 +831,47 @@ class AdditiveCpuEvidenceV2Tests(unittest.TestCase):
         self.assertEqual(additive.startup_cpu_ns, 0)
         self.assertEqual(additive.blocked_cpu_ns, 0)
 
+    def test_two_eras_of_the_same_pid_and_tid_sum_per_era_thread_cpu(self):
+        """Regression fixture for the exec-surviving-thread attribution bug:
+        across a PID-preserving host self-reexec, the exec-calling kernel
+        thread keeps the SAME tid and its kernel CPU counter survives the
+        exec. NATIVEPERF v2's contract is that `thread_cpu_ns` is PER ERA
+        (the CPU consumed during that era only); the producer is responsible
+        for baselining a post-exec era so it never repeats CPU a prior era
+        already flushed. This fixture supplies two eras of one (pid, tid)
+        each with an INDEPENDENT thread_cpu_ns (as a correct per-era-delta
+        producer would emit) and checks that the analyzer sums them across
+        the pid's groups, staying non-negative when process_cpu covers the
+        sum."""
+        pid = 30761
+        tid = 30761
+        pre_exec = nativeperf_frames_v2(
+            pid=pid,
+            tid=tid,
+            era=1,
+            thread_cpu_ns=15_000_000,
+            process_cpu_ns=15_000_000,
+            startup_wall_ns=100,
+            startup_cpu_ns=0,
+        )
+        post_exec = nativeperf_frames_v2(
+            pid=pid,
+            tid=tid,
+            era=2,
+            thread_cpu_ns=27_482_000,
+            process_cpu_ns=43_000_000,
+            startup_wall_ns=100,
+            startup_cpu_ns=0,
+        )
+        profile = budget.parse_nativeperf(pre_exec + post_exec)
+
+        additive = budget.derive_additive_cpu_evidence(profile, cpu_ns=43_000_000)
+
+        self.assertEqual(additive.process_cpu_ns, 43_000_000)
+        self.assertEqual(additive.thread_cpu_ns, 15_000_000 + 27_482_000)
+        self.assertGreaterEqual(additive.helper_cpu_ns, 0)
+        self.assertEqual(additive.helper_cpu_ns, 43_000_000 - (15_000_000 + 27_482_000))
+
     def test_additive_residual_gate_rejects_both_signed_directions(self):
         lines = nativeperf_frames_v2(thread_cpu_ns=40, process_cpu_ns=40, startup_cpu_ns=0)
         profile = budget.parse_nativeperf(lines)
