@@ -142,6 +142,40 @@ class HashedFile:
 
 
 @dataclasses.dataclass(frozen=True)
+class W1Capture:
+    kind: str
+    go_version: str
+    source: str
+    stdout_normalization: str
+
+
+@dataclasses.dataclass(frozen=True)
+class DockerReplay:
+    exit_status: int
+    stdout_sha256: str
+    output_sha256: str
+
+
+@dataclasses.dataclass(frozen=True)
+class W2Capture:
+    kind: str
+    source: str
+    candidate_count: int
+    capture_environment: tuple[tuple[str, str], ...]
+    replay_environment: tuple[tuple[str, str], ...]
+    captured_argv_index: int
+    expected_output_guest_path: str
+    expected_output_sha256: str
+    docker_replays: tuple[DockerReplay, DockerReplay]
+    w1_stdout_sha256: str
+    w1_stderr_sha256: str
+    w1_profile_evidence_path: str
+    w1_profile_evidence_sha256: str
+    rejected_candidates: tuple[tuple[tuple[str, object], ...], ...]
+    representativeness: tuple[tuple[str, object], ...]
+
+
+@dataclasses.dataclass(frozen=True)
 class WorkloadManifest:
     schema: str
     name: str
@@ -156,7 +190,7 @@ class WorkloadManifest:
     expected_stdout_sha256: str
     max_traps: int
     native_page_profile: str
-    capture: tuple[tuple[str, object], ...]
+    capture: W1Capture | W2Capture
     manifest_path: pathlib.Path = dataclasses.field(compare=False, repr=False)
 
 
@@ -177,6 +211,53 @@ MANIFEST_FIELDS = {
     "capture",
 }
 FILE_FIELDS = {"guest_path", "fixture_path", "sha256"}
+W1_CAPTURE_FIELDS = {"kind", "go_version", "source", "stdout_normalization"}
+W2_CAPTURE_FIELDS = {
+    "kind",
+    "source",
+    "candidate_count",
+    "capture_environment",
+    "replay_environment",
+    "captured_argv_index",
+    "expected_output_guest_path",
+    "expected_output_sha256",
+    "docker_replays",
+    "w1_stdout_sha256",
+    "w1_stderr_sha256",
+    "w1_profile_evidence_path",
+    "w1_profile_evidence_sha256",
+    "rejected_candidates",
+    "representativeness",
+}
+REPLAY_FIELDS = {"exit_status", "stdout_sha256", "output_sha256"}
+REPRESENTATIVENESS_FIELDS = {
+    "accepted_rule",
+    "profile_cleanup_status",
+    "profile_stderr_sha256",
+    "profile_summary_sha256",
+    "w1_profile_sha256",
+    "w1_hottest",
+    "w2_hottest",
+}
+HOTTEST_FIELDS = {
+    "gateway_entries",
+    "exit_resolve_direct",
+    "exit_resolve_indirect",
+    "exit_sensitive",
+    "sensitive_exclusive",
+}
+REJECTED_CANDIDATE_FIELDS = {
+    "aggregate_gateway_entries",
+    "candidate",
+    "hottest_exit_resolve_direct",
+    "hottest_exit_resolve_indirect",
+    "hottest_exit_sensitive",
+    "hottest_gateway_entries",
+    "hottest_sensitive_exclusive",
+    "reason",
+    "status",
+    "stderr_sha256",
+}
 
 
 def _require_type(mapping: Mapping[str, object], key: str, kind: type):
@@ -190,6 +271,295 @@ def _require_hash(value: str, name: str) -> str:
     if not HASH_RE.fullmatch(value):
         raise BudgetError(f"{name} must be a lowercase SHA-256")
     return value
+
+
+def _string_pairs(value: object, name: str) -> tuple[tuple[str, str], ...]:
+    if not isinstance(value, list):
+        raise BudgetError(f"{name} must be a sorted array of string pairs")
+    pairs = []
+    for entry in value:
+        if not isinstance(entry, list) or len(entry) != 2 or not all(
+            isinstance(item, str) for item in entry
+        ):
+            raise BudgetError(f"{name} must be a sorted array of string pairs")
+        pairs.append((entry[0], entry[1]))
+    if pairs != sorted(pairs) or len({key for key, _ in pairs}) != len(pairs):
+        raise BudgetError(f"{name} must be sorted with unique keys")
+    return tuple(pairs)
+
+
+def _parse_capture(raw: dict[str, object], env: tuple[tuple[str, str], ...]) -> W1Capture | W2Capture:
+    kind = raw.get("kind")
+    if kind == "w1-go-test":
+        unknown = set(raw) - W1_CAPTURE_FIELDS
+        missing = W1_CAPTURE_FIELDS - set(raw)
+        if unknown:
+            raise BudgetError(f"unknown W1 capture field(s): {', '.join(sorted(unknown))}")
+        if missing:
+            raise BudgetError(f"missing W1 capture field(s): {', '.join(sorted(missing))}")
+        values = {key: raw[key] for key in W1_CAPTURE_FIELDS}
+        if not all(isinstance(value, str) for value in values.values()):
+            raise BudgetError("W1 capture fields must be strings")
+        normalization = values["stdout_normalization"]
+        if normalization not in {"none", "go-test-duration"}:
+            raise BudgetError("unknown W1 stdout normalization")
+        return W1Capture(
+            kind="w1-go-test",
+            go_version=values["go_version"],
+            source=values["source"],
+            stdout_normalization=normalization,
+        )
+    if kind != "w2-toolexec":
+        raise BudgetError(f"unknown capture schema variant: {kind!r}")
+    unknown = set(raw) - W2_CAPTURE_FIELDS
+    missing = W2_CAPTURE_FIELDS - set(raw)
+    if unknown:
+        raise BudgetError(f"unknown W2 capture field(s): {', '.join(sorted(unknown))}")
+    if missing:
+        raise BudgetError(f"missing W2 capture field(s): {', '.join(sorted(missing))}")
+    capture_environment = _string_pairs(raw["capture_environment"], "capture environment")
+    replay_environment = _string_pairs(raw["replay_environment"], "replay environment")
+    if replay_environment != env:
+        raise BudgetError("W2 replay environment does not match workload environment")
+    capture_only = {"CARRICK_TOOLEXEC_LOG", "GOFLAGS"}
+    if capture_only & {key for key, _ in env} or capture_only & {
+        key for key, _ in replay_environment
+    }:
+        raise BudgetError("capture-only environment leaked into workload replay")
+    if not capture_only <= {key for key, _ in capture_environment}:
+        raise BudgetError("capture environment omits required capture-only variables")
+    replays_raw = raw["docker_replays"]
+    if not isinstance(replays_raw, list) or len(replays_raw) != 2:
+        raise BudgetError("W2 capture requires exactly two Docker replays")
+    replays = []
+    for entry in replays_raw:
+        if not isinstance(entry, dict) or set(entry) != REPLAY_FIELDS:
+            raise BudgetError("Docker replay requires exactly status/stdout/output fields")
+        status = entry["exit_status"]
+        stdout_sha = entry["stdout_sha256"]
+        output_sha = entry["output_sha256"]
+        if not isinstance(status, int) or isinstance(status, bool) or not isinstance(
+            stdout_sha, str
+        ) or not isinstance(output_sha, str):
+            raise BudgetError("Docker replay fields have invalid types")
+        _require_hash(stdout_sha, "Docker replay stdout_sha256")
+        _require_hash(output_sha, "Docker replay output_sha256")
+        replays.append(DockerReplay(status, stdout_sha, output_sha))
+    if replays[0] != replays[1]:
+        raise BudgetError("W2 requires matching Docker replay status/stdout/output digests")
+    expected_output = raw["expected_output_sha256"]
+    expected_path = raw["expected_output_guest_path"]
+    if not isinstance(expected_output, str) or not isinstance(expected_path, str):
+        raise BudgetError("W2 output contract fields must be strings")
+    _require_hash(expected_output, "W2 expected output")
+    if not expected_path.startswith("/") or replays[0].output_sha256 != expected_output:
+        raise BudgetError("W2 Docker replay does not satisfy the output contract")
+    representative = raw["representativeness"]
+    if not isinstance(representative, dict) or set(representative) != REPRESENTATIVENESS_FIELDS:
+        raise BudgetError("W2 representativeness has unknown or missing determinant fields")
+    if not isinstance(representative["accepted_rule"], str):
+        raise BudgetError("representativeness accepted_rule must be a string")
+    if (
+        not isinstance(representative["profile_cleanup_status"], int)
+        or isinstance(representative["profile_cleanup_status"], bool)
+        or representative["profile_cleanup_status"] != 0
+    ):
+        raise BudgetError("representativeness profile cleanup must be successful")
+    for hash_field in (
+        "profile_stderr_sha256",
+        "profile_summary_sha256",
+        "w1_profile_sha256",
+    ):
+        value = representative[hash_field]
+        if not isinstance(value, str):
+            raise BudgetError(f"representativeness {hash_field} must be a SHA-256")
+        _require_hash(value, f"representativeness {hash_field}")
+    for hottest_name in ("w1_hottest", "w2_hottest"):
+        hottest = representative[hottest_name]
+        if not isinstance(hottest, dict) or set(hottest) != HOTTEST_FIELDS or not all(
+            isinstance(value, int) and not isinstance(value, bool) and value >= 0
+            for value in hottest.values()
+        ):
+            raise BudgetError(f"representativeness {hottest_name} is malformed")
+        if sum(
+            hottest[key]
+            for key in ("exit_resolve_direct", "exit_resolve_indirect", "exit_sensitive")
+        ) > hottest["gateway_entries"] or hottest["sensitive_exclusive"] > hottest[
+            "exit_sensitive"
+        ]:
+            raise BudgetError(f"representativeness {hottest_name} counts do not reconcile")
+    rejected = raw["rejected_candidates"]
+    if not isinstance(rejected, list):
+        raise BudgetError("rejected candidates must be an array of objects")
+    for entry in rejected:
+        if not isinstance(entry, dict) or set(entry) != REJECTED_CANDIDATE_FIELDS:
+            raise BudgetError("rejected candidate has unknown or missing fields")
+        for name in REJECTED_CANDIDATE_FIELDS - {"candidate", "reason", "stderr_sha256"}:
+            if not isinstance(entry[name], int) or isinstance(entry[name], bool) or entry[name] < 0:
+                raise BudgetError(f"rejected candidate {name} must be non-negative")
+        if not isinstance(entry["candidate"], str) or not isinstance(entry["reason"], str):
+            raise BudgetError("rejected candidate name and reason must be strings")
+        if not isinstance(entry["stderr_sha256"], str):
+            raise BudgetError("rejected candidate stderr_sha256 must be a SHA-256")
+        _require_hash(entry["stderr_sha256"], "rejected candidate stderr_sha256")
+        if (
+            entry["hottest_exit_resolve_direct"]
+            + entry["hottest_exit_resolve_indirect"]
+            + entry["hottest_exit_sensitive"]
+            > entry["hottest_gateway_entries"]
+            or entry["hottest_sensitive_exclusive"] > entry["hottest_exit_sensitive"]
+            or entry["hottest_gateway_entries"] > entry["aggregate_gateway_entries"]
+        ):
+            raise BudgetError("rejected candidate counts do not reconcile")
+    candidate_count = raw["candidate_count"]
+    captured_index = raw["captured_argv_index"]
+    if not isinstance(candidate_count, int) or candidate_count <= 0:
+        raise BudgetError("candidate_count must be positive")
+    if not isinstance(captured_index, int) or captured_index < 0:
+        raise BudgetError("captured_argv_index must be non-negative")
+    for name in ("w1_stdout_sha256", "w1_stderr_sha256"):
+        value = raw[name]
+        if not isinstance(value, str):
+            raise BudgetError(f"{name} must be a SHA-256")
+        _require_hash(value, name)
+    evidence_path = raw["w1_profile_evidence_path"]
+    evidence_sha = raw["w1_profile_evidence_sha256"]
+    if not isinstance(evidence_path, str) or pathlib.PurePosixPath(evidence_path).is_absolute():
+        raise BudgetError("w1_profile_evidence_path must be relative")
+    if not isinstance(evidence_sha, str):
+        raise BudgetError("w1_profile_evidence_sha256 must be a SHA-256")
+    _require_hash(evidence_sha, "w1_profile_evidence_sha256")
+    source = raw["source"]
+    if not isinstance(source, str):
+        raise BudgetError("W2 source must be a string")
+    return W2Capture(
+        kind="w2-toolexec",
+        source=source,
+        candidate_count=candidate_count,
+        capture_environment=capture_environment,
+        replay_environment=replay_environment,
+        captured_argv_index=captured_index,
+        expected_output_guest_path=expected_path,
+        expected_output_sha256=expected_output,
+        docker_replays=(replays[0], replays[1]),
+        w1_stdout_sha256=str(raw["w1_stdout_sha256"]),
+        w1_stderr_sha256=str(raw["w1_stderr_sha256"]),
+        w1_profile_evidence_path=evidence_path,
+        w1_profile_evidence_sha256=evidence_sha,
+        rejected_candidates=tuple(tuple(sorted(entry.items())) for entry in rejected),
+        representativeness=tuple(sorted(representative.items())),
+    )
+
+
+def validate_w1_profile_evidence(
+    manifest_path: pathlib.Path, capture: W2Capture
+) -> None:
+    path = (manifest_path.parent / capture.w1_profile_evidence_path).resolve()
+    if _sha256_path(path) != capture.w1_profile_evidence_sha256:
+        raise BudgetError("W1 profile evidence SHA-256 mismatch")
+    raw = _exact_mapping(
+        _read_json(path),
+        {
+            "schema",
+            "run_id",
+            "binary_sha256",
+            "manifest_sha256",
+            "raw_profile_source",
+            "raw_profile_sha256",
+            "complete_thread_groups",
+            "frames_per_group",
+            "required_frames",
+            "hottest",
+            "outcome",
+            "cleanup",
+            "timing",
+        },
+        "W1 profile evidence",
+    )
+    if raw["schema"] != "carrick.native-compiler-w1-profile-evidence.v1":
+        raise BudgetError("unknown W1 profile evidence schema")
+    for name in ("binary_sha256", "manifest_sha256", "raw_profile_sha256"):
+        value = _string(raw[name], f"W1 evidence {name}")
+        _require_hash(value, f"W1 evidence {name}")
+    w1_manifest = manifest_path.with_name("native-compiler-w1-v1.json")
+    if w1_manifest.is_file() and raw["manifest_sha256"] != _sha256_path(w1_manifest):
+        raise BudgetError("W1 evidence manifest hash differs from the tree declaration")
+    representative = dict(capture.representativeness)
+    if raw["raw_profile_sha256"] != representative["w1_profile_sha256"]:
+        raise BudgetError("W1 evidence raw profile hash differs from capture determinant")
+    if not isinstance(raw["raw_profile_source"], str) or not raw["raw_profile_source"].startswith(
+        "target/native-compiler-task2-review/"
+    ):
+        raise BudgetError("W1 evidence raw source path is not the retained bounded run")
+    if _nonnegative_int(raw["complete_thread_groups"], "complete thread groups") == 0:
+        raise BudgetError("W1 evidence has no complete thread groups")
+    if _nonnegative_int(raw["frames_per_group"], "frames per group") != len(REQUIRED_FRAMES):
+        raise BudgetError("W1 evidence does not have nine frames per group")
+    if raw["required_frames"] != sorted(REQUIRED_FRAMES):
+        raise BudgetError("W1 evidence required frame set is incomplete")
+    hottest = _exact_mapping(raw["hottest"], HOTTEST_FIELDS | {"pid", "tid", "era"}, "W1 hottest")
+    if not all(isinstance(value, int) and not isinstance(value, bool) and value >= 0 for value in hottest.values()):
+        raise BudgetError("W1 hottest fields must be non-negative integers")
+    if {name: hottest[name] for name in HOTTEST_FIELDS} != representative["w1_hottest"]:
+        raise BudgetError("W1 evidence hottest counters differ from representativeness")
+    outcome = _exact_mapping(
+        raw["outcome"],
+        {
+            "kind",
+            "exit_status",
+            "work_units_completed",
+            "work_units_expected",
+            "ceiling_marker_thread_id",
+            "ceiling_marker_traps",
+            "ceiling_profile_identity",
+            "gateway_entries",
+            "gateway_limit",
+        },
+        "W1 evidence outcome",
+    )
+    marker = MaxTrapsMarker(
+        _nonnegative_int(outcome["ceiling_marker_thread_id"], "ceiling marker thread id"),
+        _nonnegative_int(outcome["ceiling_marker_traps"], "ceiling marker traps"),
+    )
+    identity_raw = outcome["ceiling_profile_identity"]
+    if not isinstance(identity_raw, list) or len(identity_raw) != 3:
+        raise BudgetError("W1 evidence ceiling identity must be pid/tid/era")
+    identity = tuple(
+        _nonnegative_int(item, "W1 evidence ceiling identity") for item in identity_raw
+    )
+    gateway_entries = _nonnegative_int(outcome["gateway_entries"], "W1 gateway entries")
+    gateway_limit = _nonnegative_int(outcome["gateway_limit"], "W1 gateway limit")
+    if identity != (hottest["pid"], hottest["tid"], hottest["era"]):
+        raise BudgetError("W1 evidence ceiling identity differs from hottest group")
+    if gateway_entries != hottest["gateway_entries"]:
+        raise BudgetError("W1 evidence outcome gateway count differs from hottest group")
+    derived = classify_outcome(
+        engine="carrick",
+        status=_nonnegative_int(outcome["exit_status"], "W1 exit status"),
+        expected_status=0,
+        stdout_matches=False,
+        gateway_entries=gateway_entries,
+        gateway_limit=gateway_limit,
+        max_traps_marker=marker,
+        ceiling_profile_identity=identity,
+    )
+    if (
+        outcome["kind"] != derived.kind
+        or outcome["work_units_completed"] != derived.work_units_completed
+        or outcome["work_units_expected"] != derived.work_units_expected
+    ):
+        raise BudgetError("W1 evidence typed outcome does not reconcile")
+    cleanup = _exact_mapping(
+        raw["cleanup"], {"status", "descendants_absent", "receipt_sha256"}, "W1 cleanup"
+    )
+    if cleanup["status"] != "clean" or cleanup["descendants_absent"] is not True:
+        raise BudgetError("W1 evidence cleanup is not clean")
+    _require_hash(_string(cleanup["receipt_sha256"], "cleanup receipt hash"), "cleanup receipt hash")
+    timing = _exact_mapping(
+        raw["timing"], {"wall_ns", "user_ns", "system_ns", "peak_rss_bytes"}, "W1 timing"
+    )
+    for name, value in timing.items():
+        _nonnegative_int(value, f"W1 timing {name}")
 
 
 def load_manifest(path: str | os.PathLike[str]) -> WorkloadManifest:
@@ -265,7 +635,7 @@ def load_manifest(path: str | os.PathLike[str]) -> WorkloadManifest:
                     f"sha256 mismatch for {fixture_path}: expected {sha256}, got {actual}"
                 )
         files.append(HashedFile(guest_path, fixture_path, sha256))
-    capture = _require_type(raw, "capture", dict)
+    capture_raw = _require_type(raw, "capture", dict)
     expected_exit = _require_type(raw, "expected_exit", int)
     max_traps = _require_type(raw, "max_traps", int)
     if expected_exit < 0 or expected_exit > 255:
@@ -276,6 +646,9 @@ def load_manifest(path: str | os.PathLike[str]) -> WorkloadManifest:
     expected_stdout_sha256 = _require_type(raw, "expected_stdout_sha256", str)
     _require_hash(executable_sha256, "executable_sha256")
     _require_hash(expected_stdout_sha256, "expected_stdout_sha256")
+    capture = _parse_capture(capture_raw, tuple(env))
+    if isinstance(capture, W2Capture):
+        validate_w1_profile_evidence(manifest_path, capture)
     return WorkloadManifest(
         schema=schema,
         name=_require_type(raw, "name", str),
@@ -290,14 +663,17 @@ def load_manifest(path: str | os.PathLike[str]) -> WorkloadManifest:
         expected_stdout_sha256=expected_stdout_sha256,
         max_traps=max_traps,
         native_page_profile=_require_type(raw, "native_page_profile", str),
-        capture=tuple(sorted(capture.items())),
+        capture=capture,
         manifest_path=manifest_path,
     )
 
 
 def stdout_digest(manifest: WorkloadManifest, stdout: bytes) -> str:
-    capture = dict(manifest.capture)
-    normalization = capture.get("stdout_normalization", "none")
+    normalization = (
+        manifest.capture.stdout_normalization
+        if isinstance(manifest.capture, W1Capture)
+        else "none"
+    )
     if normalization == "go-test-duration":
         stdout = re.sub(rb"\([0-9]+(?:\.[0-9]+)?s\)", b"(<duration>)", stdout)
     elif normalization != "none":
@@ -306,11 +682,10 @@ def stdout_digest(manifest: WorkloadManifest, stdout: bytes) -> str:
 
 
 def validate_work_product(manifest: WorkloadManifest, stderr_lines: Iterable[str]) -> None:
-    capture = dict(manifest.capture)
-    expected_path = capture.get("expected_output_guest_path")
-    expected_digest = capture.get("expected_output_sha256")
-    if expected_path is None and expected_digest is None:
+    if not isinstance(manifest.capture, W2Capture):
         return
+    expected_path = manifest.capture.expected_output_guest_path
+    expected_digest = manifest.capture.expected_output_sha256
     if not isinstance(expected_path, str) or not expected_path.startswith("/"):
         raise BudgetError("work-product contract has invalid guest path")
     if not isinstance(expected_digest, str) or not HASH_RE.fullmatch(expected_digest):
@@ -496,31 +871,136 @@ def validate_profile(run: ProfileRun) -> None:
         # cache-gauge frame is likewise a point-in-time gauge, never a delta.
 
 
+SENSITIVE_ORDER = (
+    ("sensitive_exclusive", "exclusive"),
+    ("sensitive_read_tpidr", "read-tpidr"),
+    ("sensitive_write_tpidr", "write-tpidr"),
+    ("sensitive_read_ctr", "read-ctr"),
+    ("sensitive_read_dczid", "read-dczid"),
+    ("sensitive_dc_zva", "dc-zva"),
+    ("sensitive_dc_cvau", "dc-cvau"),
+    ("sensitive_ic_ivau", "ic-ivau"),
+)
+ON_CPU_PHASES = (
+    ("phases-a", "phase_prepare_index_ns", "prepare-index"),
+    ("phases-a", "phase_translate_ns", "translation"),
+    ("phases-a", "phase_translated_run_ns", "translated-run"),
+    ("phases-a", "phase_finish_exit_ns", "finish-exit"),
+    ("phases-b", "phase_sensitive_emulation_ns", "sensitive-emulation"),
+    ("phases-b", "phase_syscall_dispatch_ns", "syscall-dispatch"),
+    ("phases-b", "phase_loop_quiesce_ns", "loop-quiesce"),
+)
+
+
+@dataclasses.dataclass(frozen=True)
+class CountEvidence:
+    sensitive_shares: tuple[tuple[str, float], ...]
+    resolver_exit_share: float
+    resolver_recurring_pc_verified: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class AdditiveCpuEvidence:
+    exclusive_terms_ns: tuple[tuple[str, int], ...]
+    exclusive_sum_ns: int
+    blocked_ns: int
+    residual_ns: int
+    residual_share: float
+    nested_translation_ns: int
+    first_resolution_ns: int | None
+
+
+def derive_count_evidence(profile: ProfileRun) -> CountEvidence:
+    validate_profile(profile)
+    gateway = sum(thread.gateway_entries for thread in profile.threads)
+    if gateway <= 0:
+        raise BudgetError("profile has no gateway exits")
+    sensitive_shares = tuple(
+        (
+            name,
+            sum(thread.value("sensitive", field) for thread in profile.threads) / gateway,
+        )
+        for field, name in SENSITIVE_ORDER
+    )
+    resolver_exits = sum(
+        thread.value("exits", "exit_resolve_direct")
+        + thread.value("exits", "exit_resolve_indirect")
+        for thread in profile.threads
+    )
+    # NATIVEPERF1 deliberately has no guest-PC cardinality.  Exit volume alone
+    # cannot prove recurrence; Plane C must supply that independent fact before
+    # a resolver slice is selectable.
+    return CountEvidence(sensitive_shares, resolver_exits / gateway, False)
+
+
+def derive_additive_cpu_evidence(profile: ProfileRun, cpu_ns: int) -> AdditiveCpuEvidence:
+    if cpu_ns <= 0:
+        raise BudgetError("additive profile requires positive measured CPU time")
+    validate_profile(profile)
+    terms = tuple(
+        (
+            name,
+            sum(thread.value(frame, field) for thread in profile.threads),
+        )
+        for frame, field, name in ON_CPU_PHASES
+    )
+    exclusive_sum = sum(value for _, value in terms)
+    residual = cpu_ns - exclusive_sum
+    if residual < 0:
+        raise BudgetError(
+            f"negative additive residual: cpu={cpu_ns}, exclusive={exclusive_sum}"
+        )
+    residual_share = residual / cpu_ns
+    if residual_share > 0.02:
+        raise BudgetError(
+            f"additive CPU reconciliation differs by more than 2%: {residual_share:.6f}"
+        )
+    blocked_ns = sum(
+        thread.value("phases-b", "phase_blocked_ns") for thread in profile.threads
+    )
+    nested_translation_ns = sum(
+        thread.value("resolver-times", "nested_translation_ns") for thread in profile.threads
+    )
+    return AdditiveCpuEvidence(
+        exclusive_terms_ns=terms,
+        exclusive_sum_ns=exclusive_sum,
+        blocked_ns=blocked_ns,
+        residual_ns=residual,
+        residual_share=residual_share,
+        nested_translation_ns=nested_translation_ns,
+        # Task 1 does not emit first-resolution latency.  Leaving this typed as
+        # unavailable is the explicit design reconciliation: AOT cannot be
+        # selected from nested translation alone.
+        first_resolution_ns=None,
+    )
+
+
 def profile_decision_inputs(profile: ProfileRun, cpu_ns: int) -> tuple[tuple[str, float], ...]:
     if cpu_ns <= 0:
         raise BudgetError("profile decision requires positive measured CPU time")
-    validate_profile(profile)
-    hottest = max(profile.threads, key=lambda thread: thread.gateway_entries)
-    gateway = hottest.gateway_entries
-    if gateway <= 0:
-        raise BudgetError("hottest profile thread has no gateway exits")
-    translation_ns = sum(
-        thread.value("resolver-times", "nested_translation_ns") for thread in profile.threads
-    )
-    syscall_ns = sum(
-        thread.value("phases-b", "phase_syscall_dispatch_ns") for thread in profile.threads
-    )
-    blocked_ns = sum(thread.value("phases-b", "phase_blocked_ns") for thread in profile.threads)
+    counts = derive_count_evidence(profile)
+    sensitive = dict(counts.sensitive_shares)
     values = {
-        "sensitive_exclusive": hottest.value("sensitive", "sensitive_exclusive") / gateway,
-        "resolver_recurrence": (
-            hottest.value("exits", "exit_resolve_direct")
-            + hottest.value("exits", "exit_resolve_indirect")
-        )
-        / gateway,
-        "cold_translation_ns": float(translation_ns),
-        "syscall_dispatch_ns": float(syscall_ns),
-        "blocked_residual_ns": float(blocked_ns),
+        "sensitive_exclusive": sensitive["exclusive"],
+        "resolver_recurrence": counts.resolver_exit_share,
+        "cold_translation_ns": float(
+            sum(
+                thread.value("resolver-times", "nested_translation_ns")
+                for thread in profile.threads
+            )
+        ),
+        "syscall_dispatch_ns": float(
+            sum(
+                thread.value("phases-b", "phase_syscall_dispatch_ns")
+                for thread in profile.threads
+            )
+        ),
+        "blocked_residual_ns": float(
+            sum(
+                thread.value("phases-b", "phase_blocked_ns")
+                for thread in profile.threads
+            )
+        ),
     }
     return tuple(sorted(values.items()))
 
@@ -614,6 +1094,356 @@ class TimeRecord:
     peak_rss_bytes: int
 
 
+@dataclasses.dataclass(frozen=True)
+class OracleReceipt:
+    schema: str
+    manifest_sha256: str
+    image_digest: str
+    executable_sha256: str
+    guest_files: tuple[tuple[str, str], ...]
+    oracle_status: str
+
+
+@dataclasses.dataclass(frozen=True)
+class CleanupReceipt:
+    status: str
+    exit_status: int | None
+    descendants_absent: bool
+    stdout: str
+    stderr: str
+
+
+@dataclasses.dataclass(frozen=True)
+class RunOutcome:
+    kind: str
+    exit_status: int
+    work_units_completed: int
+    work_units_expected: int
+    gateway_entries: int | None
+    gateway_limit: int
+    ceiling_marker_thread_id: int | None = None
+    ceiling_marker_traps: int | None = None
+    ceiling_profile_identity: tuple[int, int, int] | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class MaxTrapsMarker:
+    thread_id: int
+    traps: int
+
+
+@dataclasses.dataclass(frozen=True)
+class DtraceEvidence:
+    complete: bool
+    bounded: bool
+    incomplete_pairs: int
+    drops: tuple[tuple[str, int | bool], ...]
+    per_pid_gateway_counts: tuple[tuple[int, int], ...]
+    exit_mix: tuple[tuple[int, int], ...]
+    ordering: tuple[tuple[str, int | None, int | None], ...]
+
+
+def validate_oracle_receipt(manifest: WorkloadManifest, receipt: OracleReceipt) -> None:
+    if receipt.schema != "carrick.native-compiler-oracle-preflight.v1":
+        raise BudgetError("unknown oracle preflight schema")
+    if receipt.oracle_status != "verified":
+        raise BudgetError("oracle preflight is not verified")
+    if receipt.manifest_sha256 != _sha256_path(manifest.manifest_path):
+        raise BudgetError("oracle preflight manifest identity mismatch")
+    if receipt.image_digest != manifest.image_digest:
+        raise BudgetError("oracle preflight image identity mismatch")
+    if receipt.executable_sha256 != manifest.executable_sha256:
+        raise BudgetError("oracle preflight executable identity mismatch")
+    expected_files = tuple(sorted((item.guest_path, item.sha256) for item in manifest.files))
+    if receipt.guest_files != expected_files:
+        raise BudgetError("oracle preflight guest-file identity mismatch")
+
+
+MAX_TRAPS_RE = re.compile(
+    r"^native Darwin guest thread ([0-9]+) error: guest did not exit after ([0-9]+) traps$"
+)
+
+
+def parse_max_traps_marker(lines: Sequence[str]) -> MaxTrapsMarker | None:
+    markers = [
+        MaxTrapsMarker(int(match.group(1)), int(match.group(2)))
+        for line in lines
+        if (match := MAX_TRAPS_RE.fullmatch(line))
+    ]
+    if not markers:
+        return None
+    if len(set(markers)) != 1:
+        raise BudgetError("conflicting max-traps markers in Carrick stderr")
+    return markers[0]
+
+
+def reconcile_max_traps_marker(
+    profile: ProfileRun, marker: MaxTrapsMarker, gateway_limit: int
+) -> tuple[int, int, int]:
+    matches = [
+        (thread.pid, thread.tid, thread.era)
+        for thread in profile.threads
+        if thread.tid == marker.thread_id and thread.gateway_entries == gateway_limit
+    ]
+    if marker.traps != gateway_limit or len(matches) != 1:
+        raise BudgetError("max-traps marker does not bind one exact profile group at the ceiling")
+    return matches[0]
+
+
+def classify_outcome(
+    *,
+    engine: str,
+    status: int,
+    expected_status: int,
+    stdout_matches: bool,
+    gateway_entries: int | None,
+    gateway_limit: int,
+    max_traps_marker: MaxTrapsMarker | None = None,
+    ceiling_profile_identity: tuple[int, int, int] | None = None,
+) -> RunOutcome:
+    if engine not in {"carrick", "docker"}:
+        raise BudgetError(f"unknown outcome engine: {engine}")
+    if max_traps_marker is not None and (
+        engine != "carrick"
+        or max_traps_marker.traps != gateway_limit
+        or gateway_entries != gateway_limit
+        or ceiling_profile_identity is None
+        or ceiling_profile_identity[1] != max_traps_marker.thread_id
+    ):
+        raise BudgetError("max-traps marker does not reconcile to the profile ceiling")
+    if max_traps_marker is None and ceiling_profile_identity is not None:
+        raise BudgetError("ceiling profile identity lacks a max-traps marker")
+    if max_traps_marker is not None:
+        kind = "max-traps"
+    elif status == expected_status and stdout_matches:
+        kind = "completed"
+    else:
+        kind = "failed"
+    return RunOutcome(
+        kind=kind,
+        exit_status=status,
+        work_units_completed=1 if kind == "completed" else 0,
+        work_units_expected=1,
+        gateway_entries=gateway_entries,
+        gateway_limit=gateway_limit,
+        ceiling_marker_thread_id=(
+            None if max_traps_marker is None else max_traps_marker.thread_id
+        ),
+        ceiling_marker_traps=None if max_traps_marker is None else max_traps_marker.traps,
+        ceiling_profile_identity=ceiling_profile_identity,
+    )
+
+
+def baseline_schedule(samples: int = 5) -> tuple[tuple[str, str, str, int], ...]:
+    if samples <= 0:
+        raise BudgetError("baseline samples must be positive")
+    schedule = []
+    for engine in ("carrick", "docker"):
+        schedule.extend(((engine, "w1", "warmup", 0), (engine, "w2", "warmup", 0)))
+        for repetition in range(1, samples + 1):
+            schedule.extend(
+                (
+                    (engine, "w1", "measured", repetition),
+                    (engine, "w2", "measured", repetition),
+                )
+            )
+    return tuple(schedule)
+
+
+def carrick_transaction(
+    repo: pathlib.Path,
+    artifact: pathlib.Path,
+    run_id: str,
+    operation,
+    *,
+    cleanup_runner=None,
+    absence_checker=None,
+):
+    artifact.mkdir(parents=True, exist_ok=True)
+    if cleanup_runner is None:
+        cleanup_runner = lambda scoped_id: subprocess.run(
+            ["sudo", "-n", "scripts/sudo/kill.sh", scoped_id],
+            cwd=repo,
+            check=False,
+            text=True,
+            capture_output=True,
+            timeout=30,
+        )
+    if absence_checker is None:
+        absence_checker = _assert_run_id_absent
+    operation_error: BaseException | None = None
+    result = None
+    try:
+        result = operation()
+    except BaseException as error:
+        operation_error = error
+    cleanup_error: BaseException | None = None
+    cleanup_result = None
+    descendants_absent = False
+    try:
+        cleanup_result = cleanup_runner(run_id)
+        if cleanup_result.returncode != 0:
+            raise BudgetError(f"scoped cleanup failed for {run_id}")
+        absence_checker(run_id)
+        descendants_absent = True
+    except BaseException as error:
+        cleanup_error = error
+    receipt = CleanupReceipt(
+        status="clean" if cleanup_error is None else "failed",
+        exit_status=getattr(cleanup_result, "returncode", None),
+        descendants_absent=descendants_absent,
+        stdout=getattr(cleanup_result, "stdout", "") or "",
+        stderr=getattr(cleanup_result, "stderr", "") or "",
+    )
+    _atomic_write_json(artifact / "cleanup.json", dataclasses.asdict(receipt))
+    if cleanup_error is not None:
+        raise BudgetError(f"scoped cleanup failed for {run_id}: {cleanup_error}") from cleanup_error
+    if operation_error is not None:
+        raise operation_error
+    return result, receipt
+
+
+def dtrace_command(binary: pathlib.Path, guest_command: Sequence[str], artifact: pathlib.Path) -> list[str]:
+    return [
+        str(binary),
+        "trace",
+        "--profile",
+        "dsr",
+        "--trace-out",
+        str(artifact / "dtrace.raw"),
+        "--summary-jsonl",
+        str(artifact / "dtrace-summary.jsonl"),
+        "--",
+        *guest_command,
+    ]
+
+
+def parse_dtrace_summary(path: pathlib.Path, *, expected_run_id: str) -> DtraceEvidence:
+    rows = []
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line:
+            continue
+        try:
+            row = json.loads(line, object_pairs_hook=_pairs_no_duplicates)
+        except json.JSONDecodeError as error:
+            raise BudgetError(f"malformed DTrace summary row {line_number}: {error}") from error
+        if not isinstance(row, dict):
+            raise BudgetError("DTrace summary rows must be objects")
+        allowed = {
+            "schema",
+            "profile",
+            "run_id",
+            "git_sha",
+            "git_dirty",
+            "binary_sha256",
+            "command",
+            "host",
+            "scope",
+            "metric",
+            "sampling_interval",
+            "completion",
+        }
+        if set(row) - allowed or allowed - {"git_dirty", "sampling_interval"} - set(row):
+            raise BudgetError("DTrace summary row has unknown or missing fields")
+        if row["schema"] != "carrick.dsr-profile.v1" or row["profile"] != "dsr":
+            raise BudgetError("DTrace summary schema/profile mismatch")
+        if row["run_id"] != expected_run_id:
+            raise BudgetError("DTrace summary run-id mismatch")
+        rows.append(row)
+    if not rows:
+        raise BudgetError("DTrace summary is empty")
+    completion = rows[0]["completion"]
+    completion_fields = {
+        "complete",
+        "bounded",
+        "target_exit_reason",
+        "high_cardinality_overflow",
+        "incomplete_pairs",
+        "cardinality",
+        "drops",
+    }
+    if not isinstance(completion, dict) or set(completion) != completion_fields:
+        raise BudgetError("DTrace completion record is malformed")
+    if any(row["completion"] != completion for row in rows):
+        raise BudgetError("DTrace completion metadata differs across rows")
+    drops = completion["drops"]
+    drop_fields = {
+        "interrupted",
+        "principal_drops",
+        "aggregation_drops",
+        "dynamic_drops",
+        "other_drops",
+    }
+    if not isinstance(drops, dict) or set(drops) != drop_fields:
+        raise BudgetError("DTrace drop record is malformed")
+    if completion["incomplete_pairs"] != 0:
+        raise BudgetError("DTrace summary has incomplete pairs")
+    if any(bool(value) for value in drops.values()):
+        raise BudgetError("DTrace summary reports drops or interruption")
+    if completion["bounded"] or not completion["complete"] or completion[
+        "target_exit_reason"
+    ] != 1:
+        raise BudgetError("DTrace summary did not complete naturally and unbounded")
+    if completion["high_cardinality_overflow"]:
+        raise BudgetError("DTrace summary overflowed cardinality")
+    phase_pid_counts: dict[tuple[str, int], int] = {}
+    exit_mix: dict[int, int] = {}
+    ordering = []
+    completion_rows = 0
+    for row in rows:
+        scope = row["scope"]
+        metric = row["metric"]
+        if not isinstance(scope, dict) or not isinstance(metric, dict):
+            raise BudgetError("DTrace scope/metric must be objects")
+        if set(scope) - {"phase", "pid", "tid", "kind", "source_pc", "target_pc"}:
+            raise BudgetError("DTrace scope has unknown fields")
+        metric_type = metric.get("type")
+        if metric_type == "completion":
+            if set(metric) != {"type"} or scope:
+                raise BudgetError("DTrace completion metric is malformed")
+            completion_rows += 1
+            continue
+        phase = scope.get("phase")
+        pid = scope.get("pid")
+        kind = scope.get("kind")
+        ordering.append((str(phase), pid if isinstance(pid, int) else None, kind if isinstance(kind, int) else None))
+        if metric_type == "incomplete-pair":
+            raise BudgetError("DTrace summary contains an incomplete metric row")
+        if metric_type != "exact":
+            continue
+        if set(metric) - {"type", "count", "total_ns", "minimum_ns", "maximum_ns"}:
+            raise BudgetError("DTrace exact metric has unknown fields")
+        count = metric.get("count")
+        if count is None:
+            continue
+        if not isinstance(count, int) or count < 0 or not isinstance(pid, int) or not isinstance(
+            phase, str
+        ):
+            raise BudgetError("DTrace count metric lacks typed phase/pid/count")
+        phase_pid_counts[(phase, pid)] = phase_pid_counts.get((phase, pid), 0) + count
+        if phase == "run":
+            if not isinstance(kind, int):
+                raise BudgetError("DTrace run count lacks an exit kind")
+            exit_mix[kind] = exit_mix.get(kind, 0) + count
+    if completion_rows != 1:
+        raise BudgetError("DTrace summary requires exactly one completion row")
+    run_counts = {pid: count for (phase, pid), count in phase_pid_counts.items() if phase == "run"}
+    prepare_counts = {
+        pid: count for (phase, pid), count in phase_pid_counts.items() if phase == "prepare"
+    }
+    if not run_counts or run_counts != prepare_counts:
+        raise BudgetError("DTrace per-PID prepare/run count mismatch")
+    return DtraceEvidence(
+        complete=True,
+        bounded=False,
+        incomplete_pairs=0,
+        drops=tuple(sorted(drops.items())),
+        per_pid_gateway_counts=tuple(sorted(run_counts.items())),
+        exit_mix=tuple(sorted(exit_mix.items())),
+        ordering=tuple(ordering),
+    )
+
+
 def _seconds_ns(value: str) -> int:
     try:
         seconds = float(value)
@@ -643,50 +1473,78 @@ def parse_time_l(text: str) -> TimeRecord:
 @dataclasses.dataclass(frozen=True)
 class RunRecord:
     schema: str
+    record: str
+    engine: str
     workload: str
     plane: str
     repetition: int
+    schedule_label: str
     run_id: str
     binary_sha256: str
-    wall_ns: int
-    user_ns: int
-    system_ns: int
-    peak_rss_bytes: int
-    exit_status: int
-    work_units: int
-    cleanup_ok: bool
+    manifest_sha256: str
+    preflight_sha256: str | None
+    timing: TimeRecord
+    monotonic_elapsed_ns: int | None
+    outcome: RunOutcome
+    cleanup: CleanupReceipt
     profile: ProfileRun | None
-    decision_inputs: tuple[tuple[str, float], ...] = ()
-    dtrace_wall_shares: tuple[tuple[str, float], ...] = ()
-    schedule_label: str = ""
+    dtrace: DtraceEvidence | None = None
 
     @classmethod
-    def synthetic(cls, **shares: float) -> "RunRecord":
+    def synthetic(
+        cls,
+        *,
+        profile: ProfileRun | None = None,
+        outcome: RunOutcome | None = None,
+        plane: str = "profiled",
+        repetition: int = 1,
+        run_id: str = "synthetic",
+        schedule_label: str = "",
+        wall_ns: int = 1,
+        cpu_ns: int = 1,
+    ) -> "RunRecord":
+        if outcome is None:
+            outcome = RunOutcome("completed", 0, 1, 1, None, 1_000_000)
         return cls(
             RESULT_SCHEMA,
+            "run",
+            "carrick",
             "synthetic",
-            "profiled",
-            1,
-            "synthetic",
+            plane,
+            repetition,
+            schedule_label,
+            run_id,
             "0" * 64,
-            1,
-            1,
-            0,
-            1,
-            0,
-            1,
-            True,
-            None,
-            tuple(sorted(shares.items())),
+            "1" * 64,
+            "2" * 64,
+            TimeRecord(wall_ns, cpu_ns, 0, 1),
+            wall_ns,
+            outcome,
+            CleanupReceipt("clean", 0, True, "", ""),
+            profile,
         )
 
-    def with_dtrace_wall_shares(self, shares: Mapping[str, float]) -> "RunRecord":
-        return dataclasses.replace(self, dtrace_wall_shares=tuple(sorted(shares.items())))
+    @property
+    def wall_ns(self) -> int:
+        return self.timing.wall_ns
+
+    @property
+    def user_ns(self) -> int:
+        return self.timing.user_ns
+
+    @property
+    def system_ns(self) -> int:
+        return self.timing.system_ns
+
+    @property
+    def peak_rss_bytes(self) -> int:
+        return self.timing.peak_rss_bytes
 
 
 @dataclasses.dataclass(frozen=True)
 class DecisionRecord:
     schema: str
+    record: str
     selected_slice: str
     share: float
     basis: str
@@ -695,144 +1553,162 @@ class DecisionRecord:
     duration_evidence_usable: bool
 
 
-COUNT_DECISIONS = (
-    ("sensitive_exclusive", "sensitive-exclusive"),
-    ("resolver_recurrence", "resolver-recurrence"),
-)
-DURATION_DECISIONS = (
-    ("cold_translation_and_first_resolution", "cold-translation-aot-design"),
-    ("syscall_dispatch", "syscall-dispatch"),
-    ("blocked_residual", "blocked-residual"),
-)
+def _resolver_recurrence_verified(records: Sequence[RunRecord]) -> bool:
+    # The broad Plane C row retains exact ordering and mix but no source-PC
+    # recurrence.  Never promote resolver volume into recurrence without that
+    # independently produced field.
+    return False
+
+
+def _mean(values: Sequence[float], name: str) -> float:
+    if not values or any(value < 0 or value > 1 for value in values):
+        raise BudgetError(f"analysis share outside [0,1]: {name}")
+    return sum(values) / len(values)
 
 
 def analyze(records: Sequence[RunRecord]) -> DecisionRecord:
     if not records:
-        raise BudgetError("analysis requires at least one valid run")
-    for record in records:
-        if record.schema != RESULT_SCHEMA or not record.cleanup_ok or record.exit_status != 0:
-            raise BudgetError("analysis record is invalid or incomplete")
-    measured = [record for record in records if not record.schedule_label.endswith("warmup")]
-    if not measured:
-        raise BudgetError("analysis requires at least one measured run after warmups")
-    expected_labels = {
-        *(f"off-{index}" for index in range(1, 6)),
-        *(f"on-{index}" for index in range(1, 6)),
-    }
-    labels = [record.schedule_label for record in measured]
-    if len(labels) != len(expected_labels) or set(labels) != expected_labels:
-        raise BudgetError("analysis requires the complete measured ABBA label set exactly once")
-    for record in measured:
-        mode, _, repetition = record.schedule_label.partition("-")
-        expected_plane = "untraced" if mode == "off" else "profiled"
-        if record.plane != expected_plane or record.repetition != int(repetition):
-            raise BudgetError("measured ABBA label, plane, and repetition do not agree")
-    if len({record.workload for record in measured}) != 1 or len(
-        {record.binary_sha256 for record in measured}
-    ) != 1:
-        raise BudgetError("analysis requires one workload and binary across measured ABBA runs")
-    profiled = [record for record in measured if record.plane == "profiled"]
-    untraced = [record for record in measured if record.plane == "untraced"]
-    profile_inputs = []
-    for record in profiled:
-        values = dict(record.decision_inputs)
-        if len(values) != len(record.decision_inputs) or any(
-            key not in values for key, _ in COUNT_DECISIONS
+        raise BudgetError("analysis requires evidence records")
+    if any(record.schema != RESULT_SCHEMA or record.record != "run" for record in records):
+        raise BudgetError("analysis record has unknown schema/tag")
+    if any(record.outcome.kind != "completed" for record in records):
+        raise BudgetError("analysis accepts completed outcomes only")
+    abba = [record for record in records if record.schedule_label.startswith(("off-", "on-"))]
+    if tuple(record.schedule_label for record in abba) != abba_schedule(samples=5):
+        raise BudgetError("analysis requires exact ABBA order including warmups")
+    for record in abba:
+        expected_plane = "untraced" if record.schedule_label.startswith("off-") else "profiled"
+        expected_repetition = (
+            0
+            if record.schedule_label.endswith("warmup")
+            else int(record.schedule_label.rsplit("-", 1)[1])
+        )
+        if (
+            record.engine != "carrick"
+            or record.plane != expected_plane
+            or record.repetition != expected_repetition
+            or record.cleanup.status != "clean"
+            or not record.cleanup.descendants_absent
         ):
-            raise BudgetError("profiled count evidence is missing or duplicated")
-        profile_inputs.append(values)
-    duration_usable = True
-    profile_tax: float | None = None
-    if duration_usable:
-        off_wall = statistics.median(record.wall_ns for record in untraced)
-        on_wall = statistics.median(record.wall_ns for record in profiled)
-        if off_wall <= 0:
-            raise BudgetError("untraced ABBA wall median must be positive")
-        profile_tax = on_wall / off_wall - 1.0
-        duration_usable = profile_tax <= 0.10
-    count_shares: dict[str, float] = {}
-    for key, _ in COUNT_DECISIONS:
-        values = [inputs[key] for inputs in profile_inputs]
-        if any(value < 0 or value > 1 for value in values):
-            raise BudgetError(f"analysis share outside [0,1]: {key}")
-        count_shares[key] = sum(values) / len(values)
-    for key, selected in COUNT_DECISIONS:
-        if count_shares[key] >= 0.30:
+            raise BudgetError("ABBA engine/plane/repetition/cleanup metadata is invalid")
+    if len({record.workload for record in abba}) != 1 or len(
+        {record.binary_sha256 for record in abba}
+    ) != 1 or len({record.manifest_sha256 for record in abba}) != 1 or len(
+        {record.preflight_sha256 for record in abba}
+    ) != 1:
+        raise BudgetError("analysis requires one workload, binary, manifest, and preflight")
+    measured = [record for record in abba if not record.schedule_label.endswith("warmup")]
+    untraced = [record for record in measured if record.plane == "untraced"]
+    profiled = [record for record in measured if record.plane == "profiled"]
+    if len(untraced) != 5 or len(profiled) != 5:
+        raise BudgetError("analysis requires five measured ABBA samples per mode")
+    if any(record.profile is None for record in profiled):
+        raise BudgetError("profiled count evidence is missing")
+    off_wall = statistics.median(record.wall_ns for record in untraced)
+    on_wall = statistics.median(record.wall_ns for record in profiled)
+    if off_wall <= 0:
+        raise BudgetError("untraced ABBA wall median must be positive")
+    profile_tax = on_wall / off_wall - 1.0
+    duration_usable = profile_tax <= 0.10
+    count_evidence = [
+        derive_count_evidence(record.profile) for record in profiled if record.profile is not None
+    ]
+    sensitive_shares = {
+        name: _mean([dict(evidence.sensitive_shares)[name] for evidence in count_evidence], name)
+        for _, name in SENSITIVE_ORDER
+    }
+    for _, name in SENSITIVE_ORDER:
+        share = sensitive_shares[name]
+        if share >= 0.30:
             return DecisionRecord(
                 RESULT_SCHEMA,
-                selected,
-                count_shares[key],
+                "decision",
+                f"sensitive-{name}",
+                share,
                 "reconciled-profile-counts",
                 tuple(record.run_id for record in profiled),
                 profile_tax,
                 duration_usable,
             )
-    duration_shares: dict[str, float] = {}
-    if duration_usable:
-        untraced_cpu = statistics.median(
-            record.user_ns + record.system_ns for record in untraced
-        )
-        if untraced_cpu <= 0:
-            raise BudgetError("untraced ABBA CPU median must be positive")
-        duration_values = profile_inputs
-        cold = statistics.median(value.get("cold_translation_ns", 0.0) for value in duration_values)
-        duration_shares = {
-            "syscall_dispatch": statistics.median(
-                value.get("syscall_dispatch_ns", 0.0) for value in duration_values
-            )
-            / untraced_cpu,
-            "blocked_residual": statistics.median(
-                value.get("blocked_residual_ns", 0.0) for value in duration_values
-            )
-            / untraced_cpu,
-        }
-        if all("first_resolution_ns" in value for value in duration_values):
-            first = statistics.median(value["first_resolution_ns"] for value in duration_values)
-            duration_shares["cold_translation_and_first_resolution"] = (
-                cold + first
-            ) / untraced_cpu
-        if any(value < 0 or value > 1 for value in duration_shares.values()):
-            raise BudgetError("duration evidence does not reconcile to untraced CPU")
-        support = tuple(record.run_id for record in measured if record.plane in {"untraced", "profiled"})
-        for key, selected in DURATION_DECISIONS:
-            if duration_shares.get(key, 0.0) >= 0.30:
-                return DecisionRecord(
-                    RESULT_SCHEMA,
-                    selected,
-                    duration_shares[key],
-                    "low-tax-profile-durations-over-untraced-cpu",
-                    support,
-                    profile_tax,
-                    True,
-                )
-    combined = [
-        (count_shares[key], order, selected)
-        for order, (key, selected) in enumerate(COUNT_DECISIONS)
-    ]
-    if duration_usable:
-        offset = len(combined)
-        combined.extend(
-            (duration_shares[key], offset + order, selected)
-            for order, (key, selected) in enumerate(DURATION_DECISIONS)
-            if key in duration_shares
-        )
-    ranked = sorted(combined, key=lambda item: (-item[0], item[1]))
-    if len(ranked) >= 2 and ranked[0][0] + ranked[1][0] >= 0.60:
-        selected = f"{ranked[0][2]}+{ranked[1][2]}"
+    resolver_share = _mean(
+        [evidence.resolver_exit_share for evidence in count_evidence], "resolver-exit-share"
+    )
+    if resolver_share >= 0.30 and _resolver_recurrence_verified(records):
         return DecisionRecord(
             RESULT_SCHEMA,
-            selected,
-            ranked[0][0] + ranked[1][0],
-            "two-term",
+            "decision",
+            "resolver-recurrence",
+            resolver_share,
+            "reconciled-profile-counts-plus-recurring-pc-proof",
             tuple(record.run_id for record in profiled),
             profile_tax,
             duration_usable,
         )
-    if profile_tax is not None and profile_tax > 0.10:
+    duration_shares: dict[str, float] = {}
+    if duration_usable:
+        untraced_cpu = statistics.median(record.user_ns + record.system_ns for record in untraced)
+        if untraced_cpu <= 0:
+            raise BudgetError("untraced ABBA CPU median must be positive")
+        additive = [
+            derive_additive_cpu_evidence(record.profile, record.user_ns + record.system_ns)
+            for record in profiled
+            if record.profile is not None
+        ]
+        syscall_ns = statistics.median(
+            dict(evidence.exclusive_terms_ns)["syscall-dispatch"] for evidence in additive
+        )
+        duration_shares["syscall-dispatch"] = syscall_ns / untraced_cpu
+        if any(value < 0 or value > 1 for value in duration_shares.values()):
+            raise BudgetError("duration evidence does not reconcile to untraced CPU")
+        if duration_shares["syscall-dispatch"] >= 0.30:
+            return DecisionRecord(
+                RESULT_SCHEMA,
+                "decision",
+                "syscall-dispatch",
+                duration_shares["syscall-dispatch"],
+                "low-tax-exclusive-profile-duration-over-untraced-cpu",
+                tuple(record.run_id for record in abba),
+                profile_tax,
+                True,
+            )
+    # Two-term fallback is evaluated within one denominator only.  Count and
+    # CPU fractions are never added to one another.
+    count_terms = [(share, f"sensitive-{name}") for name, share in sensitive_shares.items()]
+    if _resolver_recurrence_verified(records):
+        count_terms.append((resolver_share, "resolver-recurrence"))
+    duration_terms = (
+        [(share, name) for name, share in duration_shares.items()] if duration_usable else []
+    )
+    for terms, basis in (
+        (count_terms, "two-term-profile-counts"),
+        (duration_terms, "two-term-profile-durations"),
+    ):
+        candidates = sorted(
+            (
+                (left[0] + right[0], left[1], right[1])
+                for index, left in enumerate(terms)
+                for right in terms[index + 1 :]
+                if left[0] + right[0] >= 0.60
+            ),
+            key=lambda item: (item[0], item[1], item[2]),
+        )
+        if candidates:
+            share, left, right = candidates[0]
+            return DecisionRecord(
+                RESULT_SCHEMA,
+                "decision",
+                f"{left}+{right}",
+                share,
+                basis,
+                tuple(record.run_id for record in profiled),
+                profile_tax,
+                duration_usable,
+            )
+    if not duration_usable:
         raise BudgetError(
             f"duration evidence unavailable: ABBA profile tax {profile_tax:.3f} exceeds 0.10"
         )
-    raise BudgetError("no two-term slice explains at least 60%")
+    raise BudgetError("no independently verified slice satisfies the committed rule")
 
 
 def _repo_root() -> pathlib.Path:
@@ -875,22 +1751,429 @@ def _append_jsonl(path: pathlib.Path, value: object) -> None:
         os.close(fd)
 
 
-def _record_json(record: RunRecord) -> dict[str, object]:
+def _profile_json(profile: ProfileRun | None) -> object:
+    if profile is None:
+        return None
+    return {
+        "threads": [
+            {
+                "pid": thread.pid,
+                "tid": thread.tid,
+                "era": thread.era,
+                "frames": sorted(thread.frames),
+                "values": dict(thread.values),
+            }
+            for thread in profile.threads
+        ]
+    }
+
+
+def _dtrace_json(evidence: DtraceEvidence | None) -> object:
+    if evidence is None:
+        return None
+    return {
+        "complete": evidence.complete,
+        "bounded": evidence.bounded,
+        "incomplete_pairs": evidence.incomplete_pairs,
+        "drops": dict(evidence.drops),
+        "per_pid_gateway_counts": [list(item) for item in evidence.per_pid_gateway_counts],
+        "exit_mix": [list(item) for item in evidence.exit_mix],
+        "ordering": [list(item) for item in evidence.ordering],
+    }
+
+
+def run_record_json(record: RunRecord) -> dict[str, object]:
+    return {
+        "schema": record.schema,
+        "record": record.record,
+        "engine": record.engine,
+        "workload": record.workload,
+        "plane": record.plane,
+        "repetition": record.repetition,
+        "schedule_label": record.schedule_label,
+        "run_id": record.run_id,
+        "provenance": {
+            "binary_sha256": record.binary_sha256,
+            "manifest_sha256": record.manifest_sha256,
+            "preflight_sha256": record.preflight_sha256,
+        },
+        "timing": {
+            "wall_ns": record.timing.wall_ns,
+            "user_ns": record.timing.user_ns,
+            "system_ns": record.timing.system_ns,
+            "peak_rss_bytes": record.timing.peak_rss_bytes,
+            "monotonic_elapsed_ns": record.monotonic_elapsed_ns,
+        },
+        "outcome": dataclasses.asdict(record.outcome),
+        "cleanup": dataclasses.asdict(record.cleanup),
+        "profile": _profile_json(record.profile),
+        "dtrace": _dtrace_json(record.dtrace),
+    }
+
+
+def decision_record_json(record: DecisionRecord) -> dict[str, object]:
     value = dataclasses.asdict(record)
-    if record.profile is not None:
-        value["profile"] = {
-            "threads": [
-                {
-                    "pid": thread.pid,
-                    "tid": thread.tid,
-                    "era": thread.era,
-                    "frames": sorted(thread.frames),
-                    "values": dict(thread.values),
-                }
-                for thread in record.profile.threads
-            ]
-        }
+    value["supporting_run_ids"] = list(record.supporting_run_ids)
     return value
+
+
+def _exact_mapping(value: object, fields: set[str], name: str) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise BudgetError(f"{name} must be an object")
+    unknown = set(value) - fields
+    missing = fields - set(value)
+    if unknown:
+        raise BudgetError(f"unknown {name} field(s): {', '.join(sorted(unknown))}")
+    if missing:
+        raise BudgetError(f"missing {name} field(s): {', '.join(sorted(missing))}")
+    return value
+
+
+def _nonnegative_int(value: object, name: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise BudgetError(f"{name} must be a non-negative integer")
+    return value
+
+
+def _string(value: object, name: str) -> str:
+    if not isinstance(value, str):
+        raise BudgetError(f"{name} must be a string")
+    return value
+
+
+def _parse_profile_json(value: object) -> ProfileRun | None:
+    if value is None:
+        return None
+    raw = _exact_mapping(value, {"threads"}, "profile")
+    threads_raw = raw["threads"]
+    if not isinstance(threads_raw, list):
+        raise BudgetError("profile threads must be an array")
+    threads = []
+    for entry in threads_raw:
+        thread = _exact_mapping(entry, {"pid", "tid", "era", "frames", "values"}, "profile thread")
+        frames = thread["frames"]
+        values = thread["values"]
+        if not isinstance(frames, list) or frames != sorted(REQUIRED_FRAMES):
+            raise BudgetError("profile thread frames are not the exact required set")
+        if not isinstance(values, dict) or not all(isinstance(key, str) for key in values):
+            raise BudgetError("profile thread values must be an object")
+        parsed_values = tuple(
+            sorted((key, _nonnegative_int(item, f"profile value {key}")) for key, item in values.items())
+        )
+        threads.append(
+            ProfileThread(
+                _nonnegative_int(thread["pid"], "profile pid"),
+                _nonnegative_int(thread["tid"], "profile tid"),
+                _nonnegative_int(thread["era"], "profile era"),
+                frozenset(frames),
+                parsed_values,
+            )
+        )
+    profile = ProfileRun(tuple(threads))
+    validate_profile(profile)
+    return profile
+
+
+def _parse_dtrace_json(value: object) -> DtraceEvidence | None:
+    if value is None:
+        return None
+    raw = _exact_mapping(
+        value,
+        {
+            "complete",
+            "bounded",
+            "incomplete_pairs",
+            "drops",
+            "per_pid_gateway_counts",
+            "exit_mix",
+            "ordering",
+        },
+        "dtrace",
+    )
+    if raw["complete"] is not True or raw["bounded"] is not False:
+        raise BudgetError("DTrace typed evidence is incomplete or bounded")
+    drops = raw["drops"]
+    if not isinstance(drops, dict) or not all(
+        isinstance(key, str)
+        and isinstance(item, int)
+        and not isinstance(item, bool)
+        and item == 0
+        for key, item in drops.items()
+    ):
+        raise BudgetError("DTrace typed drops must be an object")
+
+    def pairs(name: str) -> tuple[tuple[int, int], ...]:
+        value = raw[name]
+        if not isinstance(value, list) or not all(
+            isinstance(item, list)
+            and len(item) == 2
+            and all(isinstance(part, int) and not isinstance(part, bool) and part >= 0 for part in item)
+            for item in value
+        ):
+            raise BudgetError(f"DTrace typed {name} is malformed")
+        return tuple((item[0], item[1]) for item in value)
+
+    ordering_raw = raw["ordering"]
+    if not isinstance(ordering_raw, list):
+        raise BudgetError("DTrace typed ordering is malformed")
+    ordering = []
+    for item in ordering_raw:
+        if (
+            not isinstance(item, list)
+            or len(item) != 3
+            or not isinstance(item[0], str)
+            or not isinstance(item[1], int)
+            or isinstance(item[1], bool)
+            or item[1] < 0
+            or not isinstance(item[2], int)
+            or isinstance(item[2], bool)
+            or item[2] < 0
+        ):
+            raise BudgetError("DTrace typed ordering is malformed")
+        ordering.append((item[0], item[1], item[2]))
+    return DtraceEvidence(
+        True,
+        False,
+        _nonnegative_int(raw["incomplete_pairs"], "DTrace incomplete pairs"),
+        tuple(sorted(drops.items())),
+        pairs("per_pid_gateway_counts"),
+        pairs("exit_mix"),
+        tuple(ordering),
+    )
+
+
+def parse_result_row(value: object) -> RunRecord:
+    raw = _exact_mapping(
+        value,
+        {
+            "schema",
+            "record",
+            "engine",
+            "workload",
+            "plane",
+            "repetition",
+            "schedule_label",
+            "run_id",
+            "provenance",
+            "timing",
+            "outcome",
+            "cleanup",
+            "profile",
+            "dtrace",
+        },
+        "run",
+    )
+    if raw["schema"] != RESULT_SCHEMA or raw["record"] != "run":
+        raise BudgetError("unknown result schema/tag")
+    engine = _string(raw["engine"], "engine")
+    plane = _string(raw["plane"], "plane")
+    if engine not in {"carrick", "docker"} or plane not in {"untraced", "profiled", "dtrace"}:
+        raise BudgetError("unknown engine or plane")
+    provenance = _exact_mapping(
+        raw["provenance"],
+        {"binary_sha256", "manifest_sha256", "preflight_sha256"},
+        "provenance",
+    )
+    timing = _exact_mapping(
+        raw["timing"],
+        {"wall_ns", "user_ns", "system_ns", "peak_rss_bytes", "monotonic_elapsed_ns"},
+        "timing",
+    )
+    outcome = _exact_mapping(
+        raw["outcome"],
+        {
+            "kind",
+            "exit_status",
+            "work_units_completed",
+            "work_units_expected",
+            "gateway_entries",
+            "gateway_limit",
+            "ceiling_marker_thread_id",
+            "ceiling_marker_traps",
+            "ceiling_profile_identity",
+        },
+        "outcome",
+    )
+    cleanup = _exact_mapping(
+        raw["cleanup"],
+        {"status", "exit_status", "descendants_absent", "stdout", "stderr"},
+        "cleanup",
+    )
+    if not isinstance(outcome["kind"], str) or outcome["kind"] not in {
+        "completed",
+        "max-traps",
+        "failed",
+    }:
+        raise BudgetError("unknown outcome kind")
+    gateway_entries = outcome["gateway_entries"]
+    if gateway_entries is not None:
+        gateway_entries = _nonnegative_int(gateway_entries, "gateway entries")
+    ceiling_marker = outcome["ceiling_marker_traps"]
+    if ceiling_marker is not None:
+        ceiling_marker = _nonnegative_int(ceiling_marker, "ceiling marker traps")
+    marker_thread_id = outcome["ceiling_marker_thread_id"]
+    if marker_thread_id is not None:
+        marker_thread_id = _nonnegative_int(marker_thread_id, "ceiling marker thread id")
+    identity_raw = outcome["ceiling_profile_identity"]
+    ceiling_identity = None
+    if identity_raw is not None:
+        if not isinstance(identity_raw, (list, tuple)) or len(identity_raw) != 3:
+            raise BudgetError("ceiling profile identity must be pid/tid/era")
+        ceiling_identity = tuple(
+            _nonnegative_int(item, "ceiling profile identity") for item in identity_raw
+        )
+    monotonic = timing["monotonic_elapsed_ns"]
+    if monotonic is not None:
+        monotonic = _nonnegative_int(monotonic, "monotonic diagnostic")
+    outcome_kind = _string(outcome["kind"], "outcome kind")
+    exit_status = _nonnegative_int(outcome["exit_status"], "exit status")
+    completed = _nonnegative_int(outcome["work_units_completed"], "completed work units")
+    expected = _nonnegative_int(outcome["work_units_expected"], "expected work units")
+    gateway_limit = _nonnegative_int(outcome["gateway_limit"], "gateway limit")
+    if expected == 0 or completed > expected:
+        raise BudgetError("outcome work-unit metadata is invalid")
+    if outcome_kind == "completed" and completed != expected:
+        raise BudgetError("completed outcome did not complete every work unit")
+    if outcome_kind == "max-traps" and (
+        gateway_entries != gateway_limit
+        or ceiling_marker != gateway_limit
+        or marker_thread_id is None
+        or ceiling_identity is None
+        or ceiling_identity[1] != marker_thread_id
+    ):
+        raise BudgetError("max-traps outcome lacks ceiling evidence")
+    if outcome_kind != "max-traps" and any(
+        value is not None for value in (ceiling_marker, marker_thread_id, ceiling_identity)
+    ):
+        raise BudgetError("non-max-traps outcome carries ceiling evidence")
+    cleanup_status = _string(cleanup["status"], "cleanup status")
+    if cleanup_status not in {"clean", "failed", "not-required"}:
+        raise BudgetError("unknown cleanup status")
+    if not isinstance(cleanup["descendants_absent"], bool):
+        raise BudgetError("cleanup descendants_absent must be a boolean")
+    binary_sha = _string(provenance["binary_sha256"], "binary_sha256")
+    manifest_sha = _string(provenance["manifest_sha256"], "manifest_sha256")
+    _require_hash(binary_sha, "binary_sha256")
+    _require_hash(manifest_sha, "manifest_sha256")
+    preflight = provenance["preflight_sha256"]
+    if preflight is not None:
+        preflight = _string(preflight, "preflight_sha256")
+        _require_hash(preflight, "preflight_sha256")
+    return RunRecord(
+        schema=RESULT_SCHEMA,
+        record="run",
+        engine=engine,
+        workload=_string(raw["workload"], "workload"),
+        plane=plane,
+        repetition=_nonnegative_int(raw["repetition"], "repetition"),
+        schedule_label=_string(raw["schedule_label"], "schedule_label"),
+        run_id=_string(raw["run_id"], "run_id"),
+        binary_sha256=binary_sha,
+        manifest_sha256=manifest_sha,
+        preflight_sha256=preflight,
+        timing=TimeRecord(
+            _nonnegative_int(timing["wall_ns"], "wall_ns"),
+            _nonnegative_int(timing["user_ns"], "user_ns"),
+            _nonnegative_int(timing["system_ns"], "system_ns"),
+            _nonnegative_int(timing["peak_rss_bytes"], "peak_rss_bytes"),
+        ),
+        monotonic_elapsed_ns=monotonic,
+        outcome=RunOutcome(
+            outcome_kind,
+            exit_status,
+            completed,
+            expected,
+            gateway_entries,
+            gateway_limit,
+            marker_thread_id,
+            ceiling_marker,
+            ceiling_identity,
+        ),
+        cleanup=CleanupReceipt(
+            cleanup_status,
+            None
+            if cleanup["exit_status"] is None
+            else _nonnegative_int(cleanup["exit_status"], "cleanup exit status"),
+            cleanup["descendants_absent"],
+            _string(cleanup["stdout"], "cleanup stdout"),
+            _string(cleanup["stderr"], "cleanup stderr"),
+        ),
+        profile=_parse_profile_json(raw["profile"]),
+        dtrace=_parse_dtrace_json(raw["dtrace"]),
+    )
+
+
+def _parse_decision_row(value: object) -> DecisionRecord:
+    raw = _exact_mapping(
+        value,
+        {
+            "schema",
+            "record",
+            "selected_slice",
+            "share",
+            "basis",
+            "supporting_run_ids",
+            "profile_tax",
+            "duration_evidence_usable",
+        },
+        "decision",
+    )
+    if raw["schema"] != RESULT_SCHEMA or raw["record"] != "decision":
+        raise BudgetError("unknown decision schema/tag")
+    run_ids = raw["supporting_run_ids"]
+    if not isinstance(run_ids, list) or not all(isinstance(item, str) for item in run_ids):
+        raise BudgetError("decision supporting_run_ids must be strings")
+    share = raw["share"]
+    profile_tax = raw["profile_tax"]
+    if not isinstance(share, (int, float)) or isinstance(share, bool) or not 0 <= share <= 1:
+        raise BudgetError("decision share must be a number in [0,1]")
+    if profile_tax is not None and (
+        not isinstance(profile_tax, (int, float)) or isinstance(profile_tax, bool)
+    ):
+        raise BudgetError("decision profile_tax must be numeric or null")
+    if not isinstance(raw["duration_evidence_usable"], bool):
+        raise BudgetError("decision duration_evidence_usable must be boolean")
+    return DecisionRecord(
+        RESULT_SCHEMA,
+        "decision",
+        _string(raw["selected_slice"], "selected slice"),
+        float(share),
+        _string(raw["basis"], "decision basis"),
+        tuple(run_ids),
+        None if profile_tax is None else float(profile_tax),
+        raw["duration_evidence_usable"],
+    )
+
+
+def analyze_evidence(path: pathlib.Path, *, check: bool) -> DecisionRecord:
+    runs = []
+    decisions = []
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line:
+            continue
+        try:
+            raw = json.loads(line, object_pairs_hook=_pairs_no_duplicates)
+        except json.JSONDecodeError as error:
+            raise BudgetError(f"invalid evidence JSON row {line_number}: {error}") from error
+        if not isinstance(raw, dict):
+            raise BudgetError("evidence rows must be objects")
+        tag = raw.get("record")
+        if tag == "run":
+            runs.append(parse_result_row(raw))
+        elif tag == "decision":
+            decisions.append(_parse_decision_row(raw))
+        else:
+            raise BudgetError(f"unknown evidence record tag: {tag!r}")
+    if len(decisions) != 1:
+        raise BudgetError("evidence must contain exactly one decision row")
+    derived = analyze(runs)
+    if check and decision_record_json(derived) != decision_record_json(decisions[0]):
+        raise BudgetError("checked decision row does not match raw run evidence")
+    return derived
+
+
+def _record_json(record: RunRecord) -> dict[str, object]:
+    return run_record_json(record)
 
 
 def _assert_image_identity(manifest: WorkloadManifest) -> None:
@@ -906,7 +2189,7 @@ def _assert_image_identity(manifest: WorkloadManifest) -> None:
         )
 
 
-def _assert_guest_identities(manifest: WorkloadManifest) -> None:
+def _assert_guest_identities(manifest: WorkloadManifest) -> dict[str, str]:
     guest_files = [item for item in manifest.files if item.fixture_path is None]
     paths = sorted({manifest.argv[0], *(item.guest_path for item in guest_files)})
     result = subprocess.run(
@@ -937,6 +2220,53 @@ def _assert_guest_identities(manifest: WorkloadManifest) -> None:
             raise BudgetError(
                 f"guest sha256 mismatch for {path}: expected {digest}, got {observed.get(path)}"
             )
+    return observed
+
+
+def create_oracle_receipt(manifest: WorkloadManifest, path: pathlib.Path) -> OracleReceipt:
+    """Perform the Docker-only identity preflight and persist its result."""
+    _assert_no_live_carrick()
+    _assert_image_identity(manifest)
+    _assert_guest_identities(manifest)
+    receipt = OracleReceipt(
+        "carrick.native-compiler-oracle-preflight.v1",
+        _sha256_path(manifest.manifest_path),
+        manifest.image_digest,
+        manifest.executable_sha256,
+        tuple(sorted((item.guest_path, item.sha256) for item in manifest.files)),
+        "verified",
+    )
+    _atomic_write_json(path, dataclasses.asdict(receipt))
+    return receipt
+
+
+def load_oracle_receipt(path: pathlib.Path) -> OracleReceipt:
+    raw = _exact_mapping(
+        _read_json(path),
+        {
+            "schema",
+            "manifest_sha256",
+            "image_digest",
+            "executable_sha256",
+            "guest_files",
+            "oracle_status",
+        },
+        "oracle preflight",
+    )
+    guest_files = _string_pairs(raw["guest_files"], "oracle preflight guest_files")
+    receipt = OracleReceipt(
+        _string(raw["schema"], "oracle preflight schema"),
+        _string(raw["manifest_sha256"], "oracle preflight manifest_sha256"),
+        _string(raw["image_digest"], "oracle preflight image_digest"),
+        _string(raw["executable_sha256"], "oracle preflight executable_sha256"),
+        guest_files,
+        _string(raw["oracle_status"], "oracle preflight status"),
+    )
+    _require_hash(receipt.manifest_sha256, "oracle preflight manifest_sha256")
+    _require_hash(receipt.executable_sha256, "oracle preflight executable_sha256")
+    if not IMAGE_DIGEST_RE.fullmatch(receipt.image_digest):
+        raise BudgetError("oracle preflight image_digest is malformed")
+    return receipt
 
 
 def _time_command(command: list[str], cwd: pathlib.Path, env: Mapping[str, str], artifact: pathlib.Path):
@@ -947,25 +2277,25 @@ def _time_command(command: list[str], cwd: pathlib.Path, env: Mapping[str, str],
     started = time.monotonic_ns()
     with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
         result = subprocess.run(
-            ["/usr/bin/time", "-l", *command],
+            ["/usr/bin/time", "-l", "-o", str(time_path), *command],
             cwd=cwd,
             env=dict(env),
             stdout=stdout,
             stderr=stderr,
             check=False,
         )
-    wall_ns = time.monotonic_ns() - started
-    stderr_bytes = stderr_path.read_bytes()
-    stderr_text = stderr_bytes.decode("utf-8", "replace")
-    match = re.search(
-        r"(?ms)(\s*[0-9.]+ real\s+[0-9.]+ user\s+[0-9.]+ sys\s+.*)$", stderr_text
+    monotonic_elapsed_ns = time.monotonic_ns() - started
+    _atomic_write_json(
+        artifact / "monotonic-diagnostic.json",
+        {
+            "schema": RESULT_SCHEMA,
+            "record": "monotonic-diagnostic",
+            "elapsed_ns": monotonic_elapsed_ns,
+            "authority": False,
+        },
     )
-    if match is None:
-        raise BudgetError("/usr/bin/time -l trailer not found")
-    time_text = match.group(1)
-    time_path.write_text(time_text, encoding="utf-8")
-    timing = parse_time_l(time_text)
-    return result.returncode, dataclasses.replace(timing, wall_ns=wall_ns), stdout_path, stderr_path
+    timing = parse_time_l(time_path.read_text(encoding="utf-8"))
+    return result.returncode, timing, stdout_path, stderr_path
 
 
 def _fixture_mount(manifest: WorkloadManifest) -> pathlib.Path | None:
@@ -981,11 +2311,13 @@ def _fixture_mount(manifest: WorkloadManifest) -> pathlib.Path | None:
 
 def materialized_guest_command(
     manifest: WorkloadManifest,
+    *,
+    mount_path: pathlib.Path | None = None,
 ) -> tuple[pathlib.Path | None, tuple[str, ...]]:
     fixture = _fixture_mount(manifest)
     if fixture is None:
         return None, manifest.argv
-    steps: list[str] = []
+    steps: list[str] = ["set -eu"]
     for item in manifest.files:
         if item.fixture_path is None:
             continue
@@ -994,9 +2326,12 @@ def materialized_guest_command(
             relative = host.relative_to(fixture)
         except ValueError as error:
             raise BudgetError(f"fixture is outside workload mount root: {host}") from error
-        source = pathlib.PurePosixPath("/native-compiler-w2") / pathlib.PurePosixPath(
-            relative.as_posix()
+        source_root = (
+            pathlib.PurePosixPath(str(mount_path))
+            if mount_path is not None
+            else pathlib.PurePosixPath("/native-compiler-w2")
         )
+        source = source_root / pathlib.PurePosixPath(relative.as_posix())
         destination = pathlib.PurePosixPath(item.guest_path)
         steps.append(f"mkdir -p {sh_quote(str(destination.parent))}")
         steps.append(f"cp {sh_quote(str(source))} {sh_quote(str(destination))}")
@@ -1004,18 +2339,17 @@ def materialized_guest_command(
         if arg == "-o":
             output_parent = pathlib.PurePosixPath(manifest.argv[index + 1]).parent
             steps.append(f"mkdir -p {sh_quote(str(output_parent))}")
-    capture = dict(manifest.capture)
-    expected_output = capture.get("expected_output_guest_path")
-    if expected_output is None:
+    if not isinstance(manifest.capture, W2Capture):
         steps.append('exec "$@"')
     else:
+        expected_output = manifest.capture.expected_output_guest_path
         if not isinstance(expected_output, str) or not expected_output.startswith("/"):
             raise BudgetError("work-product contract has invalid guest path")
         steps.extend(
             (
+                f"rm -f {sh_quote(expected_output)}",
                 '"$@"',
-                "result=$?",
-                'if [ "$result" -ne 0 ]; then exit "$result"; fi',
+                f"test -f {sh_quote(expected_output)}",
                 f"digest=$(sha256sum {sh_quote(expected_output)})",
                 'digest=${digest%% *}',
                 "printf 'NATIVEWORK1|output_sha256=%s\\n' \"$digest\" >&2",
@@ -1071,6 +2405,7 @@ def run_phase(
     artifacts: pathlib.Path,
     results: pathlib.Path,
     schedule_label: str = "",
+    preflight_path: pathlib.Path | None = None,
 ) -> RunRecord:
     if engine not in {"carrick", "docker"}:
         raise BudgetError(f"unknown engine: {engine}")
@@ -1082,9 +2417,15 @@ def run_phase(
     git_sha, dirty = _git_clean(repo)
     if dirty:
         raise BudgetError("dirty Git state invalidates a measured run")
-    _assert_no_live_carrick()
-    _assert_image_identity(manifest)
-    _assert_guest_identities(manifest)
+    preflight_sha: str | None = None
+    if engine == "carrick":
+        if preflight_path is None:
+            raise BudgetError("Carrick measurement requires a Docker-only preflight receipt")
+        receipt = load_oracle_receipt(preflight_path)
+        validate_oracle_receipt(manifest, receipt)
+        preflight_sha = _sha256_path(preflight_path)
+    else:
+        _assert_no_live_carrick()
     binary = repo / "target/release/carrick"
     binary_sha = _sha256_path(binary) if engine == "carrick" else "0" * 64
     run_id = f"nativeperf-{manifest.name}-{repetition}-{uuid.uuid4().hex[:8]}"
@@ -1096,7 +2437,7 @@ def run_phase(
     if plane == "profiled":
         env["CARRICK_DSR_PROFILE"] = "1"
     if plane == "dtrace":
-        command = [str(binary), "trace", "--profile", "dsr", "--", *command[1:]]
+        command = dtrace_command(binary, command[1:], artifact)
     artifact.mkdir(parents=True, exist_ok=False)
     manifest_snapshot = artifact / "manifest.json"
     shutil.copyfile(manifest.manifest_path, manifest_snapshot)
@@ -1112,57 +2453,75 @@ def run_phase(
             "engine": engine,
             "plane": plane,
             "manifest_sha256": _sha256_path(manifest_snapshot),
+            "preflight_sha256": preflight_sha,
             "schedule_label": schedule_label,
         },
     )
-    status, timing, stdout_path, stderr_path = _time_command(command, repo, env, artifact)
-    cleanup_ok = True
+    def operation():
+        status, timing, stdout_path, stderr_path = _time_command(command, repo, env, artifact)
+        stdout_sha = stdout_digest(manifest, stdout_path.read_bytes())
+        stderr_lines = stderr_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        profile = None
+        if plane == "profiled":
+            profile = parse_nativeperf(stderr_lines)
+            validate_profile(profile)
+        gateway_entries = (
+            max(thread.gateway_entries for thread in profile.threads)
+            if profile is not None
+            else None
+        )
+        max_traps_marker = parse_max_traps_marker(stderr_lines) if profile is not None else None
+        ceiling_identity = (
+            reconcile_max_traps_marker(profile, max_traps_marker, manifest.max_traps)
+            if profile is not None and max_traps_marker is not None
+            else None
+        )
+        outcome = classify_outcome(
+            engine=engine,
+            status=status,
+            expected_status=manifest.expected_exit,
+            stdout_matches=stdout_sha == manifest.expected_stdout_sha256,
+            gateway_entries=gateway_entries,
+            gateway_limit=manifest.max_traps,
+            max_traps_marker=max_traps_marker,
+            ceiling_profile_identity=ceiling_identity,
+        )
+        if outcome.kind == "completed":
+            validate_work_product(manifest, stderr_lines)
+        dtrace = None
+        if plane == "dtrace":
+            dtrace = parse_dtrace_summary(
+                artifact / "dtrace-summary.jsonl", expected_run_id=run_id
+            )
+        diagnostic = _read_json(artifact / "monotonic-diagnostic.json")
+        monotonic = _nonnegative_int(diagnostic.get("elapsed_ns"), "monotonic elapsed_ns")
+        return timing, monotonic, outcome, profile, dtrace
+
     if engine == "carrick":
-        cleanup = subprocess.run(
-            ["sudo", "-n", "scripts/sudo/kill.sh", run_id],
-            cwd=repo,
-            check=False,
-            text=True,
-            capture_output=True,
-            timeout=30,
-        )
-        (artifact / "cleanup.txt").write_text(cleanup.stdout + cleanup.stderr, encoding="utf-8")
-        cleanup_ok = cleanup.returncode == 0
-        if cleanup_ok:
-            _assert_run_id_absent(run_id)
-        else:
-            raise BudgetError(f"scoped cleanup failed for {run_id}")
-    stdout_sha = stdout_digest(manifest, stdout_path.read_bytes())
-    if status != manifest.expected_exit or stdout_sha != manifest.expected_stdout_sha256:
-        raise BudgetError(
-            f"workload result mismatch: status={status}, stdout_sha256={stdout_sha}"
-        )
-    stderr_lines = stderr_path.read_text(encoding="utf-8", errors="replace").splitlines()
-    validate_work_product(manifest, stderr_lines)
-    profile = None
-    if plane == "profiled":
-        profile = parse_nativeperf(stderr_lines)
-        validate_profile(profile)
+        operation_result, cleanup = carrick_transaction(repo, artifact, run_id, operation)
+    else:
+        operation_result = operation()
+        cleanup = CleanupReceipt("not-required", None, True, "", "")
+        _atomic_write_json(artifact / "cleanup.json", dataclasses.asdict(cleanup))
+    timing, monotonic, outcome, profile, dtrace = operation_result
     record = RunRecord(
-        RESULT_SCHEMA,
-        manifest.name,
-        plane,
-        repetition,
-        run_id,
-        binary_sha,
-        timing.wall_ns,
-        timing.user_ns,
-        timing.system_ns,
-        timing.peak_rss_bytes,
-        status,
-        1,
-        cleanup_ok,
-        profile,
-        profile_decision_inputs(profile, timing.user_ns + timing.system_ns)
-        if profile is not None
-        else (),
-        (),
-        schedule_label,
+        schema=RESULT_SCHEMA,
+        record="run",
+        engine=engine,
+        workload=manifest.name,
+        plane=plane,
+        repetition=repetition,
+        schedule_label=schedule_label,
+        run_id=run_id,
+        binary_sha256=binary_sha,
+        manifest_sha256=_sha256_path(manifest_snapshot),
+        preflight_sha256=preflight_sha,
+        timing=timing,
+        monotonic_elapsed_ns=monotonic,
+        outcome=outcome,
+        cleanup=cleanup,
+        profile=profile,
+        dtrace=dtrace,
     )
     _atomic_write_json(artifact / "record.json", _record_json(record))
     _append_jsonl(results, _record_json(record))
@@ -1217,6 +2576,12 @@ def capture_w2(
     package: str | None = None,
 ) -> dict[str, object]:
     _assert_no_live_carrick()
+    prior_capture: dict[str, object] | None = None
+    if manifest_path.is_file():
+        prior_raw = _read_json(manifest_path)
+        value = prior_raw.get("capture")
+        if isinstance(value, dict):
+            prior_capture = value
     image = "localhost:5005/carrick-go-conformance:1.24"
     capture_root = pathlib.Path(tempfile.mkdtemp(prefix="carrick-w2-capture-", dir=repo / "target"))
     container = f"carrick-w2-capture-{uuid.uuid4().hex[:10]}"
@@ -1308,6 +2673,24 @@ def capture_w2(
         env = [item for item in captured_env if item[0] not in capture_only_keys]
         capture_env = [item for item in captured_env if item[0] in capture_only_keys]
         stdout_sha = hashlib.sha256(b"").hexdigest()
+        expected_output_path = next(
+            (argv[index + 1] for index, arg in enumerate(argv[:-1]) if arg == "-o"),
+            None,
+        )
+        if expected_output_path is None:
+            raise BudgetError("captured W2 compiler child has no -o output")
+        if prior_capture is None or not all(
+            key in prior_capture
+            for key in (
+                "rejected_candidates",
+                "representativeness",
+                "w1_profile_evidence_path",
+                "w1_profile_evidence_sha256",
+            )
+        ):
+            raise BudgetError(
+                "capture requires retained reviewed candidate and representativeness determinants"
+            )
         files = [
             {
                 "guest_path": guest,
@@ -1331,12 +2714,24 @@ def capture_w2(
             "max_traps": 1_000_000,
             "native_page_profile": "native16k",
             "capture": {
+                "kind": "w2-toolexec",
                 "source": "docker-toolexec",
                 "captured_argv_index": records.index(argv),
                 "candidate_count": len(candidates),
                 "w1_stdout_sha256": hashlib.sha256(result.stdout).hexdigest(),
                 "w1_stderr_sha256": hashlib.sha256(result.stderr).hexdigest(),
                 "capture_environment": [list(item) for item in capture_env],
+                "replay_environment": [list(item) for item in env],
+                "expected_output_guest_path": expected_output_path,
+                "expected_output_sha256": "0" * 64,
+                "docker_replays": [
+                    {"exit_status": 0, "stdout_sha256": stdout_sha, "output_sha256": "0" * 64},
+                    {"exit_status": 0, "stdout_sha256": stdout_sha, "output_sha256": "0" * 64},
+                ],
+                "rejected_candidates": prior_capture["rejected_candidates"],
+                "representativeness": prior_capture["representativeness"],
+                "w1_profile_evidence_path": prior_capture["w1_profile_evidence_path"],
+                "w1_profile_evidence_sha256": prior_capture["w1_profile_evidence_sha256"],
             },
         }
         _write_manifest(manifest_path, raw)
@@ -1356,12 +2751,16 @@ def capture_w2(
             (capture_root / f"replay-{repetition}.stderr").write_bytes(replay.stderr)
         raw["capture"] = {
             **dict(raw["capture"]),
-            "docker_replay_stdout_sha256": replay_digests,
-            "docker_replay_output_sha256": replay_output_digests,
-            "expected_output_guest_path": next(
-                (argv[index + 1] for index, arg in enumerate(argv[:-1]) if arg == "-o"),
-                None,
-            ),
+            "docker_replays": [
+                {
+                    "exit_status": 0,
+                    "stdout_sha256": stdout_digest,
+                    "output_sha256": output_digest,
+                }
+                for stdout_digest, output_digest in zip(
+                    replay_digests, replay_output_digests, strict=True
+                )
+            ],
             "expected_output_sha256": replay_output_digests[0],
         }
         if len(set(replay_output_digests)) != 1:
@@ -1430,12 +2829,9 @@ def _validate_command(paths: list[str]) -> int:
     return 0
 
 
-def _analyze_command(path: pathlib.Path) -> int:
-    records = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        raw = json.loads(line, object_pairs_hook=_pairs_no_duplicates)
-        records.append(RunRecord(**raw))
-    print(json.dumps(dataclasses.asdict(analyze(records)), sort_keys=True))
+def _analyze_command(path: pathlib.Path, *, check: bool) -> int:
+    decision = analyze_evidence(path, check=check)
+    print(json.dumps(decision_record_json(decision), sort_keys=True))
     return 0
 
 
@@ -1444,6 +2840,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     subparsers = parser.add_subparsers(dest="command", required=True)
     validate_parser = subparsers.add_parser("validate")
     validate_parser.add_argument("manifests", nargs="+")
+    preflight_parser = subparsers.add_parser("preflight")
+    preflight_parser.add_argument("manifest")
+    preflight_parser.add_argument("--output", type=pathlib.Path, required=True)
     capture_parser = subparsers.add_parser("capture-w2")
     capture_parser.add_argument(
         "--manifest", default="scripts/perf/manifests/native-compiler-w2-v1.json"
@@ -1464,12 +2863,27 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     run_parser.add_argument("--artifacts", type=pathlib.Path, required=True)
     run_parser.add_argument("--results", type=pathlib.Path, required=True)
+    run_parser.add_argument("--preflight", type=pathlib.Path)
+    baseline_parser = subparsers.add_parser("baseline")
+    baseline_parser.add_argument("--w1", required=True)
+    baseline_parser.add_argument("--w2", required=True)
+    baseline_parser.add_argument("--preflight-w1", type=pathlib.Path, required=True)
+    baseline_parser.add_argument("--preflight-w2", type=pathlib.Path, required=True)
+    baseline_parser.add_argument("--artifacts", type=pathlib.Path, required=True)
+    baseline_parser.add_argument("--results", type=pathlib.Path, required=True)
+    baseline_parser.add_argument("--samples", type=int, default=5)
     analyze_parser = subparsers.add_parser("analyze")
-    analyze_parser.add_argument("results", type=pathlib.Path)
+    analyze_parser.add_argument("--input", type=pathlib.Path, required=True)
+    analyze_parser.add_argument("--check", action="store_true")
     args = parser.parse_args(argv)
     try:
         if args.command == "validate":
             return _validate_command(args.manifests)
+        if args.command == "preflight":
+            manifest = load_manifest(args.manifest)
+            receipt = create_oracle_receipt(manifest, args.output)
+            print(json.dumps(dataclasses.asdict(receipt), sort_keys=True))
+            return 0
         if args.command == "capture-w2":
             repo = _repo_root()
             raw = capture_w2(
@@ -1479,6 +2893,27 @@ def main(argv: Sequence[str] | None = None) -> int:
                 package=args.package,
             )
             print(json.dumps(raw["capture"], sort_keys=True))
+            return 0
+        if args.command == "baseline":
+            manifests = {"w1": load_manifest(args.w1), "w2": load_manifest(args.w2)}
+            preflights = {"w1": args.preflight_w1, "w2": args.preflight_w2}
+            records = []
+            # `baseline_schedule` is deliberately engine-major: every Carrick
+            # sample completes and is reaped before the first Docker sample.
+            for engine, workload, sample_kind, repetition in baseline_schedule(args.samples):
+                records.append(
+                    run_phase(
+                        manifests[workload],
+                        engine=engine,
+                        plane="untraced",
+                        repetition=repetition,
+                        artifacts=args.artifacts,
+                        results=args.results,
+                        schedule_label=f"baseline-{workload}-{sample_kind}-{repetition}",
+                        preflight_path=preflights[workload] if engine == "carrick" else None,
+                    )
+                )
+            print(json.dumps([run_record_json(record) for record in records], sort_keys=True))
             return 0
         if args.command == "run":
             manifest = load_manifest(args.manifest)
@@ -1498,6 +2933,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                             artifacts=args.artifacts,
                             results=args.results,
                             schedule_label=label,
+                            preflight_path=args.preflight,
                         )
                     )
                 print(json.dumps([_record_json(record) for record in records], sort_keys=True))
@@ -1511,11 +2947,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                     repetition=args.repetition,
                     artifacts=args.artifacts,
                     results=args.results,
+                    preflight_path=args.preflight,
                 )
                 print(json.dumps(_record_json(record), sort_keys=True))
             return 0
         if args.command == "analyze":
-            return _analyze_command(args.results)
+            return _analyze_command(args.input, check=args.check)
         raise AssertionError(args.command)
     except (BudgetError, OSError, subprocess.SubprocessError) as error:
         print(f"native_compiler_budget: {error}", file=sys.stderr)
