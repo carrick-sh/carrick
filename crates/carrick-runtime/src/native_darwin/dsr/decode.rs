@@ -602,6 +602,60 @@ fn classify_memory(
     }))
 }
 
+/// Whether an AArch64 exclusive-family instruction acquires (`Load`) or
+/// releases (`Store`) the exclusive monitor. Used only by the block
+/// planner's bounded exclusive-region fusion scan
+/// (`block::try_fuse_exclusive_region`): `classify` itself does not
+/// distinguish these -- it converts every `MemoryClass::Exclusive` access to
+/// a `Sensitive` boundary before this distinction would matter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ExclusiveKind {
+    Load,
+    Store,
+}
+
+/// Identify whether `word` is an AArch64 exclusive load or store and, if
+/// so, decode it fully (base register, addressing, etc.) without routing
+/// through `classify`'s automatic conversion to `SensitiveKind::Exclusive`.
+/// Returns `Ok(None)` for any non-exclusive instruction, including ones
+/// `bad64` fails to decode.
+///
+/// This exists solely for the planner's region-fusion scan: it needs the
+/// load/store distinction and the addressing base (to check for a matching
+/// pair and to reject x18/x28-based accesses) *before* deciding whether to
+/// keep the existing trap behavior or attempt fusion.
+pub(super) fn classify_exclusive(
+    word: u32,
+    pc: GuestVa,
+) -> Result<Option<(ExclusiveKind, MemoryAccess)>, DsrError> {
+    let Ok(instruction) = bad64::decode(word, pc.raw()) else {
+        return Ok(None);
+    };
+    let op = instruction.op();
+    let kind = match op {
+        Op::LDAXP
+        | Op::LDAXR
+        | Op::LDAXRB
+        | Op::LDAXRH
+        | Op::LDXP
+        | Op::LDXR
+        | Op::LDXRB
+        | Op::LDXRH => ExclusiveKind::Load,
+        Op::STLXP
+        | Op::STLXR
+        | Op::STLXRB
+        | Op::STLXRH
+        | Op::STXP
+        | Op::STXR
+        | Op::STXRB
+        | Op::STXRH => ExclusiveKind::Store,
+        _ => return Ok(None),
+    };
+    let operands = instruction.operands();
+    let memory = classify_memory(pc, word, op, operands)?.ok_or_else(|| malformed(pc, word, op))?;
+    Ok(Some((kind, memory)))
+}
+
 pub(super) fn decoded_operands_mention_x18(word: u32, pc: GuestVa) -> bool {
     decoded_operands_mention_gpr(word, pc, 18)
 }

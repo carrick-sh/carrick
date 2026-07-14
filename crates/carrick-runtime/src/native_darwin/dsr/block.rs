@@ -4,7 +4,10 @@ use carrick_guest_mem::GuestVa;
 
 use super::super::NativeMappedMemory;
 use super::decode;
-use super::types::{CodeGeneration, DirectExit, DsrError, IndirectExit, InstAction, SensitiveExit};
+use super::types::{
+    CodeGeneration, DirectExit, DirectKind, DsrError, ExclusiveRegionExit, IndirectExit,
+    InstAction, MemoryBase, SensitiveExit,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct PlannedInst {
@@ -32,6 +35,16 @@ pub(super) enum PlannedExit {
         guest: GuestVa,
         word: u32,
         exit: SensitiveExit,
+    },
+    /// A fused exclusive region terminating the block (see
+    /// `try_fuse_exclusive_region`). Not yet produced by `plan_block`
+    /// (Task 1 keeps `plan_block`'s output identical to today's
+    /// `PlannedExit::Sensitive` behavior); Task 2 wires this in and teaches
+    /// the emitter to lower it to native code instead of a gateway trap.
+    ExclusiveRegion {
+        guest: GuestVa,
+        word: u32,
+        exit: ExclusiveRegionExit,
     },
     Direct {
         guest: GuestVa,
@@ -66,6 +79,7 @@ impl PlannedExit {
             Self::Continue { target, .. } => target,
             Self::Syscall { guest, .. }
             | Self::Sensitive { guest, .. }
+            | Self::ExclusiveRegion { guest, .. }
             | Self::Direct { guest, .. }
             | Self::Indirect { guest, .. }
             | Self::Unsupported { guest, .. }
@@ -159,6 +173,17 @@ fn plan_with_reader(
                 word,
                 exit,
             }),
+            // `decode::classify` never returns this today -- recognising a
+            // fused region needs the multi-instruction lookahead only the
+            // planner (not per-instruction decode) can do, via
+            // `try_fuse_exclusive_region`. This arm exists so `InstAction`
+            // stays exhaustively matched here, and so it is already correct
+            // for Task 2, which wires the recogniser into this loop.
+            InstAction::ExclusiveRegion(exit) => Some(PlannedExit::ExclusiveRegion {
+                guest: pc,
+                word,
+                exit,
+            }),
             InstAction::Direct(exit) => Some(PlannedExit::Direct {
                 guest: pc,
                 word,
@@ -208,6 +233,203 @@ pub(super) fn plan_block(
                 })
         },
     )
+}
+
+/// Bounded lookahead window (in instructions, load included) for exclusive-
+/// region fusion. Real AArch64 CAS/RMW retry loops emitted by compilers keep
+/// only a handful of instructions between the exclusive load and its
+/// matching store. An unbounded forward scan at decode time would let a
+/// corrupted or adversarial instruction stream turn block planning into an
+/// unbounded decode loop, so this is a small, hard cap -- a decode-time-DoS
+/// guard, not a tuning knob.
+const EXCLUSIVE_REGION_SCAN_LIMIT: usize = 32;
+
+/// Attempt to fuse the exclusive load at `start` (which must already be
+/// known to decode to an LDXR/LDAXR-family instruction; `load_word` is that
+/// decoded word) with its matching exclusive store into a single translated
+/// region, via a bounded forward scan.
+///
+/// Returns `Ok(None)` -- "not provably fusible; the caller must produce
+/// today's `PlannedExit::Sensitive` unchanged" -- unless ALL of the
+/// following hold:
+///   - `allow_fusion` is set. The caller must gate this on the block's
+///     address mode: fusion is Direct-mode (native16k/unbiased) only.
+///     Biased (linux4k) mode needs a scratch-register spill to materialize
+///     the host base, and that spill is itself a memory access between the
+///     exclusive pair, which would violate the forward-progress hazard
+///     below -- so biased mode keeps the trap path unconditionally.
+///   - the load's addressing base is a plain guest GPR, not x18/x28 (those
+///     are carrick's own reserved/virtualized registers, not guest-visible
+///     under this DSR).
+///   - a matching exclusive store -- same base register, also not x18/x28
+///     -- is found within `EXCLUSIVE_REGION_SCAN_LIMIT` instructions.
+///   - every instruction between the load and the store is a plain
+///     data-processing op (`InstAction::Copy`), except for at most one
+///     conditional branch (the CAS loop's compare-failure exit edge) whose
+///     target is not the load's own PC.
+///   - the store is immediately followed by exactly one conditional branch
+///     targeting the load's PC (the loop's retry edge). This closes the
+///     region.
+///   - nothing in the region crosses the containing page boundary.
+///   - nothing in the region is a syscall, another sensitive access
+///     (tpidr/ctr/dczid/dc/ic, or another exclusive access), a PC-relative
+///     instruction, an indirect branch, an unconditional branch, an
+///     ordinary (non-exclusive) memory access, or an access that touches
+///     carrick's virtualized x18/x28 registers. Beyond the CAS-loop-shape
+///     checks above, these follow from the same hazard: the ARM ARM only
+///     guarantees forward progress for an exclusive pair that contains no
+///     other explicit memory access, and ordinary loads/stores, x18/x28
+///     virtualization spills, and PC-relative literal loads are all memory
+///     accesses.
+///
+/// When in doubt this always returns `Ok(None)`: a missed fusion opportunity
+/// costs a gateway round-trip (today's status quo, unchanged); a wrongly
+/// accepted one risks a torn or livelocked guest atomic.
+fn try_fuse_exclusive_region(
+    start: GuestVa,
+    load_word: u32,
+    allow_fusion: bool,
+    boundary: GuestVa,
+    mut read: impl FnMut(GuestVa) -> Result<u32, DsrError>,
+) -> Result<Option<(Vec<PlannedInst>, ExclusiveRegionExit)>, DsrError> {
+    if !allow_fusion {
+        return Ok(None);
+    }
+    let Some((decode::ExclusiveKind::Load, load_memory)) =
+        decode::classify_exclusive(load_word, start)?
+    else {
+        return Ok(None);
+    };
+    if matches!(
+        load_memory.base,
+        MemoryBase::VirtualX18 | MemoryBase::VirtualX28
+    ) {
+        return Ok(None);
+    }
+
+    let mut instructions = vec![PlannedInst {
+        guest: start,
+        action: InstAction::Memory(load_memory),
+    }];
+    let mut pc = checked_next(start)?;
+    let mut found_exit_branch = false;
+    let mut store: Option<(GuestVa, u32)> = None;
+
+    for _ in 1..EXCLUSIVE_REGION_SCAN_LIMIT {
+        if pc == boundary {
+            return Ok(None);
+        }
+        let word = read(pc)?;
+        if let Some((kind, memory)) = decode::classify_exclusive(word, pc)? {
+            let is_matching_store = kind == decode::ExclusiveKind::Store
+                && memory.base == load_memory.base
+                && !matches!(memory.base, MemoryBase::VirtualX18 | MemoryBase::VirtualX28);
+            if !is_matching_store {
+                // Another exclusive access (a second load, or a store to a
+                // different address) inside the region: not the canonical
+                // shape. Fall back to the trap path.
+                return Ok(None);
+            }
+            instructions.push(PlannedInst {
+                guest: pc,
+                action: InstAction::Memory(memory),
+            });
+            store = Some((pc, word));
+            break;
+        }
+        let action = decode::classify(word, pc)?;
+        match action {
+            InstAction::Copy(_) => {
+                instructions.push(PlannedInst { guest: pc, action });
+            }
+            InstAction::Direct(exit) => {
+                if found_exit_branch
+                    || exit.target == start
+                    || matches!(exit.kind, DirectKind::Branch | DirectKind::Call)
+                {
+                    return Ok(None);
+                }
+                found_exit_branch = true;
+                instructions.push(PlannedInst { guest: pc, action });
+            }
+            // Everything else (an ordinary memory access, a PC-relative
+            // instruction, an indirect branch, a syscall, another sensitive
+            // access, or an x18/x28-virtualized instruction) either leaves
+            // the region's control flow in an unrecognised shape or is
+            // itself a memory access that would break the exclusive pair's
+            // forward-progress guarantee. Fall back to the trap path.
+            _ => return Ok(None),
+        }
+        pc = checked_next(pc)?;
+    }
+
+    let Some((store_pc, store_word)) = store else {
+        return Ok(None);
+    };
+    let retry_pc = checked_next(store_pc)?;
+    if retry_pc == boundary {
+        return Ok(None);
+    }
+    let retry_word = read(retry_pc)?;
+    if decode::classify_exclusive(retry_word, retry_pc)?.is_some() {
+        return Ok(None);
+    }
+    let InstAction::Direct(retry_exit) = decode::classify(retry_word, retry_pc)? else {
+        return Ok(None);
+    };
+    if retry_exit.target != start
+        || matches!(retry_exit.kind, DirectKind::Branch | DirectKind::Call)
+    {
+        return Ok(None);
+    }
+
+    let end = checked_next(retry_pc)?;
+    Ok(Some((
+        instructions,
+        ExclusiveRegionExit {
+            start,
+            end,
+            retry_edge: start,
+            load_word,
+            store_word,
+        },
+    )))
+}
+
+/// Plan a fused exclusive region as a single `BlockPlan`, using
+/// `try_fuse_exclusive_region`'s bounded scan. This is the recogniser's
+/// block-shaped entry point: Task 2 wires it into `plan_with_reader`'s
+/// `InstAction::Sensitive(SensitiveExit { kind: SensitiveKind::Exclusive(word),
+/// .. })` arm (guarded on the block's address mode) so a fusible region
+/// becomes the real `plan_block` output instead of falling through to
+/// `PlannedExit::Sensitive`. It is not wired in yet: `plan_block` above is
+/// unchanged, so guest behavior is unchanged by this task -- see this
+/// module's tests for the recogniser exercised directly.
+fn plan_exclusive_region_with_reader(
+    start: GuestVa,
+    generation: CodeGeneration,
+    load_word: u32,
+    allow_fusion: bool,
+    page_size: u64,
+    read: impl FnMut(GuestVa) -> Result<u32, DsrError>,
+) -> Result<Option<BlockPlan>, DsrError> {
+    let boundary = page_end(start, page_size)?;
+    let Some((instructions, exit)) =
+        try_fuse_exclusive_region(start, load_word, allow_fusion, boundary, read)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(BlockPlan {
+        start,
+        end: exit.end,
+        generation,
+        instructions,
+        exit: PlannedExit::ExclusiveRegion {
+            guest: start,
+            word: load_word,
+            exit,
+        },
+    }))
 }
 
 #[cfg(test)]
@@ -336,5 +558,285 @@ mod tests {
                 && memory.virtualization
                     == super::super::types::MemoryVirtualization::X18
         ));
+    }
+
+    mod exclusive_region_fusion {
+        use super::*;
+
+        // ldaxr w0, [x1]
+        const LDAXR_W0_X1: u32 = 0x885f_fc20;
+        // cmp w0, w2
+        const CMP_W0_W2: u32 = 0x6b02_001f;
+        // stlxr w3, w4, [x1]
+        const STLXR_W3_W4_X1: u32 = 0x8803_fc24;
+        // svc #0
+        const SVC0: u32 = 0xd400_0001;
+        // mrs x0, tpidr_el0
+        const MRS_TPIDR: u32 = 0xd53b_d040;
+        // ldr x0, [x1] -- an ordinary (non-exclusive) memory access.
+        const LDR_X0_X1: u32 = 0xf940_0020;
+        const COND_NE: u32 = 1;
+
+        /// Encode `b.<cond> target` at `pc`. Verified against the real
+        /// `b.ne` word cited by the exclusive-access diagnosis
+        /// (`.superpowers/sdd/exclusive-diagnosis.md`): encoding a
+        /// compare-failure branch 3 instructions ahead with `cond=NE`
+        /// reproduces its exact `0x54000061`.
+        fn encode_b_cond(pc: GuestVa, target: GuestVa, cond: u32) -> u32 {
+            let offset = (target.raw() as i64 - pc.raw() as i64) / 4;
+            let imm19 = (offset as u32) & 0x7_ffff;
+            0x5400_0000 | (imm19 << 5) | cond
+        }
+
+        /// Encode `cbnz w<rt>, target` at `pc`. Verified the same way: a
+        /// retry branch 4 instructions back with `rt=3` reproduces the
+        /// diagnosis's exact `0x35ffff83`.
+        fn encode_cbnz_w(pc: GuestVa, target: GuestVa, rt: u32) -> u32 {
+            let offset = (target.raw() as i64 - pc.raw() as i64) / 4;
+            let imm19 = (offset as u32) & 0x7_ffff;
+            0x3500_0000 | (imm19 << 5) | rt
+        }
+
+        /// Replace the encoded base register (bits [9:5], uniform across the
+        /// LDXR/STXR/LDAXR/STLXR single-register family) of an exclusive
+        /// access word.
+        fn with_base_register(word: u32, index: u32) -> u32 {
+            (word & !(0x1f << 5)) | (index << 5)
+        }
+
+        fn exclusive_region_words(
+            words: &[u32],
+            start: GuestVa,
+            load_word: u32,
+            allow_fusion: bool,
+            page_size: u64,
+        ) -> Result<Option<BlockPlan>, DsrError> {
+            plan_exclusive_region_with_reader(
+                start,
+                CodeGeneration::INITIAL,
+                load_word,
+                allow_fusion,
+                page_size,
+                |pc| {
+                    let offset = usize::try_from((pc.raw() - start.raw()) / 4)
+                        .map_err(|_| DsrError::BlockPolicy("test offset overflow".to_string()))?;
+                    words
+                        .get(offset)
+                        .copied()
+                        .ok_or_else(|| DsrError::MemoryRead {
+                            pc: pc.raw(),
+                            detail: "test region exhausted".to_string(),
+                        })
+                },
+            )
+        }
+
+        /// The canonical shape from the diagnosis:
+        /// `ldaxr/cmp/b.ne/stlxr/cbnz`. This is the positive case: it must
+        /// plan as ONE block whose instruction list contains the load, the
+        /// compare, the branch, and the store -- not a zero-instruction
+        /// sensitive exit.
+        #[test]
+        fn fuses_a_cas_retry_loop_into_one_block() {
+            let start = GuestVa(0x4000);
+            let branch_pc = GuestVa(0x4008);
+            let retry_pc = GuestVa(0x4010);
+            let out_pc = GuestVa(0x4014);
+            let words = [
+                LDAXR_W0_X1,
+                CMP_W0_W2,
+                encode_b_cond(branch_pc, out_pc, COND_NE),
+                STLXR_W3_W4_X1,
+                encode_cbnz_w(retry_pc, start, 3),
+                SVC0,
+            ];
+            assert_eq!(words[2], 0x5400_0061, "b.ne encoding matches the diagnosis");
+            assert_eq!(words[4], 0x35ff_ff83, "cbnz encoding matches the diagnosis");
+
+            let plan = exclusive_region_words(&words, start, LDAXR_W0_X1, true, 0x1000)
+                .expect("scan must not error")
+                .expect("canonical CAS loop must fuse");
+
+            assert_eq!(plan.start, start);
+            assert_eq!(plan.end, out_pc);
+            assert_eq!(plan.instructions.len(), 4, "load, compare, branch, store");
+            assert!(matches!(
+                plan.instructions[0],
+                PlannedInst {
+                    guest: GuestVa(0x4000),
+                    action: InstAction::Memory(memory),
+                } if memory.class == super::super::super::types::MemoryClass::Exclusive
+            ));
+            assert!(matches!(
+                plan.instructions[1],
+                PlannedInst {
+                    guest: GuestVa(0x4004),
+                    action: InstAction::Copy(CMP_W0_W2),
+                }
+            ));
+            assert!(matches!(
+                plan.instructions[2],
+                PlannedInst {
+                    guest: GuestVa(0x4008),
+                    action: InstAction::Direct(_),
+                }
+            ));
+            assert!(matches!(
+                plan.instructions[3],
+                PlannedInst {
+                    guest: GuestVa(0x400c),
+                    action: InstAction::Memory(memory),
+                } if memory.class == super::super::super::types::MemoryClass::Exclusive
+            ));
+            match plan.exit {
+                PlannedExit::ExclusiveRegion { guest, word, exit } => {
+                    assert_eq!(guest, start);
+                    assert_eq!(word, LDAXR_W0_X1);
+                    assert_eq!(exit.start, start);
+                    assert_eq!(exit.end, out_pc);
+                    assert_eq!(exit.retry_edge, start);
+                    assert_eq!(exit.load_word, LDAXR_W0_X1);
+                    assert_eq!(exit.store_word, STLXR_W3_W4_X1);
+                }
+                other => panic!("expected ExclusiveRegion exit, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn falls_back_when_fusion_is_not_allowed_in_this_address_mode() {
+            let start = GuestVa(0x4000);
+            let words = [
+                LDAXR_W0_X1,
+                CMP_W0_W2,
+                STLXR_W3_W4_X1,
+                encode_cbnz_w(GuestVa(0x400c), start, 3),
+            ];
+            let plan = exclusive_region_words(&words, start, LDAXR_W0_X1, false, 0x1000)
+                .expect("scan must not error");
+            assert!(plan.is_none());
+        }
+
+        #[test]
+        fn falls_back_when_no_matching_store_is_found_in_the_scan_window() {
+            let start = GuestVa(0x4000);
+            let mut words = vec![LDAXR_W0_X1];
+            words.extend(std::iter::repeat_n(
+                CMP_W0_W2,
+                EXCLUSIVE_REGION_SCAN_LIMIT + 4,
+            ));
+            let plan = exclusive_region_words(&words, start, LDAXR_W0_X1, true, 0x1_0000)
+                .expect("scan must not error");
+            assert!(plan.is_none());
+        }
+
+        #[test]
+        fn falls_back_on_a_syscall_inside_the_region() {
+            let start = GuestVa(0x4000);
+            let words = [
+                LDAXR_W0_X1,
+                SVC0,
+                STLXR_W3_W4_X1,
+                encode_cbnz_w(GuestVa(0x400c), start, 3),
+            ];
+            let plan = exclusive_region_words(&words, start, LDAXR_W0_X1, true, 0x1000)
+                .expect("scan must not error");
+            assert!(plan.is_none());
+        }
+
+        #[test]
+        fn falls_back_on_another_sensitive_op_inside_the_region() {
+            let start = GuestVa(0x4000);
+            let words = [
+                LDAXR_W0_X1,
+                MRS_TPIDR,
+                STLXR_W3_W4_X1,
+                encode_cbnz_w(GuestVa(0x400c), start, 3),
+            ];
+            let plan = exclusive_region_words(&words, start, LDAXR_W0_X1, true, 0x1000)
+                .expect("scan must not error");
+            assert!(plan.is_none());
+        }
+
+        #[test]
+        fn falls_back_on_another_exclusive_load_inside_the_region() {
+            let start = GuestVa(0x4000);
+            let words = [
+                LDAXR_W0_X1,
+                LDAXR_W0_X1,
+                STLXR_W3_W4_X1,
+                encode_cbnz_w(GuestVa(0x400c), start, 3),
+            ];
+            let plan = exclusive_region_words(&words, start, LDAXR_W0_X1, true, 0x1000)
+                .expect("scan must not error");
+            assert!(plan.is_none());
+        }
+
+        #[test]
+        fn falls_back_on_an_ordinary_memory_access_inside_the_region() {
+            let start = GuestVa(0x4000);
+            let words = [
+                LDAXR_W0_X1,
+                LDR_X0_X1,
+                STLXR_W3_W4_X1,
+                encode_cbnz_w(GuestVa(0x400c), start, 3),
+            ];
+            let plan = exclusive_region_words(&words, start, LDAXR_W0_X1, true, 0x1000)
+                .expect("scan must not error");
+            assert!(plan.is_none());
+        }
+
+        #[test]
+        fn falls_back_when_the_trailing_branch_is_not_the_retry_edge() {
+            let start = GuestVa(0x4000);
+            let branch_pc = GuestVa(0x4008);
+            let retry_pc = GuestVa(0x4010);
+            let out_pc = GuestVa(0x4014);
+            let wrong_target = GuestVa(0x9000);
+            let words = [
+                LDAXR_W0_X1,
+                CMP_W0_W2,
+                encode_b_cond(branch_pc, out_pc, COND_NE),
+                STLXR_W3_W4_X1,
+                // A branch out of the region that is not the recognised
+                // retry edge (it does not target the load's PC).
+                encode_cbnz_w(retry_pc, wrong_target, 3),
+                SVC0,
+            ];
+            let plan = exclusive_region_words(&words, start, LDAXR_W0_X1, true, 0x1000)
+                .expect("scan must not error");
+            assert!(plan.is_none());
+        }
+
+        #[test]
+        fn falls_back_for_an_x18_based_load_address() {
+            let start = GuestVa(0x4000);
+            let load_word = with_base_register(LDAXR_W0_X1, 18);
+            let store_word = with_base_register(STLXR_W3_W4_X1, 18);
+            let words = [
+                load_word,
+                CMP_W0_W2,
+                store_word,
+                encode_cbnz_w(GuestVa(0x400c), start, 3),
+            ];
+            let plan = exclusive_region_words(&words, start, load_word, true, 0x1000)
+                .expect("scan must not error");
+            assert!(plan.is_none());
+        }
+
+        #[test]
+        fn falls_back_for_an_x28_based_load_address() {
+            let start = GuestVa(0x4000);
+            let load_word = with_base_register(LDAXR_W0_X1, 28);
+            let store_word = with_base_register(STLXR_W3_W4_X1, 28);
+            let words = [
+                load_word,
+                CMP_W0_W2,
+                store_word,
+                encode_cbnz_w(GuestVa(0x400c), start, 3),
+            ];
+            let plan = exclusive_region_words(&words, start, load_word, true, 0x1000)
+                .expect("scan must not error");
+            assert!(plan.is_none());
+        }
     }
 }

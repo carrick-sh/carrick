@@ -2133,6 +2133,14 @@ fn emit_block_inner(
             }
             InstAction::Syscall { .. }
             | InstAction::Sensitive(_)
+            // `plan.instructions` never contains this today: block.rs's
+            // exclusive-region recogniser (Task 1 of the fusion plan) is not
+            // yet wired into `plan_block`, and even once it is, the region's
+            // load/store are represented as plain `InstAction::Memory`
+            // entries in `instructions` (see `try_fuse_exclusive_region`),
+            // not this variant. This arm exists only so the match stays
+            // exhaustive against the `InstAction` type.
+            | InstAction::ExclusiveRegion(_)
             | InstAction::Unsupported { .. } => {
                 return Err(DsrError::BlockPolicy(format!(
                     "terminator appeared in DSR copy stream at guest PC 0x{:x}",
