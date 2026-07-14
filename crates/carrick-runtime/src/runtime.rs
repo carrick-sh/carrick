@@ -393,7 +393,7 @@ pub struct RunStaticElfBackendOptions<'a> {
 
 pub fn run_static_elf_with_backend_args_and_dispatcher_debug<A, E>(
     path: impl AsRef<Path>,
-    dispatcher: SyscallDispatcher,
+    mut dispatcher: SyscallDispatcher,
     argv: A,
     env: E,
     options: RunStaticElfBackendOptions<'_>,
@@ -407,6 +407,7 @@ where
         options.exec_backend,
         options.native_page_profile,
     )?;
+    dispatcher.set_execution_backend(plan.backend);
     match plan.backend {
         crate::page_profile::ExecutionBackend::Vmm => {
             run_static_elf_with_hvf_args_and_dispatcher_debug(

@@ -81,7 +81,7 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::mem::ManuallyDrop;
 use std::os::fd::RawFd;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 
 use crate::linux_abi::LINUX_SIGINT;
@@ -372,6 +372,7 @@ pub fn publish_pending_for_with_wake(tid: i32, signum: i32, wake: PublicationWak
         notify_waiters_fallback();
     }
     if wake == PublicationWake::SignalPump {
+        mark_signal_pump_publication();
         wake_signal_pump_pipe();
     }
 }
@@ -572,6 +573,11 @@ static PENDING_PIPE_WRITE: AtomicI32 = AtomicI32::new(-1);
 /// only byte that should kick vCPUs out of guest userspace.
 static PUMP_PIPE_READ: AtomicI32 = AtomicI32::new(-1);
 static PUMP_PIPE_WRITE: AtomicI32 = AtomicI32::new(-1);
+/// Monotonic publication sequence for pump-owned durable signal state. Pipe
+/// bytes and kqueue events may be replaced, coalesced, or consumed before a
+/// vCPU target registers; this sequence lets the pump reconcile each new
+/// publication once without spinning on an unchanged blocked pending bit.
+static PUMP_PUBLICATION_GENERATION: AtomicU64 = AtomicU64::new(0);
 /// kqueue fd of this process's signal pump, holding an `EVFILT_USER` (ident 0)
 /// the pump blocks on. `notify_pump` triggers it (`NOTE_TRIGGER`) to wake the
 /// pump from a NORMAL thread (e.g. an interval-timer thread) without the
@@ -648,6 +654,14 @@ pub fn wake_signal_pump_pipe() {
             libc::write(pump, byte.as_ptr() as *const libc::c_void, 1);
         }
     }
+}
+
+pub(crate) fn mark_signal_pump_publication() {
+    PUMP_PUBLICATION_GENERATION.fetch_add(1, Ordering::SeqCst);
+}
+
+pub(crate) fn signal_pump_publication_generation() -> u64 {
+    PUMP_PUBLICATION_GENERATION.load(Ordering::SeqCst)
 }
 
 /// Wake the signal pump via BOTH channels — the dedicated pipe (EVFILT_READ)
@@ -829,6 +843,9 @@ pub fn reset_after_supervisor_fork() {
 /// readable. Async-signal-safe (a single non-blocking `write`); a full pipe
 /// already means a wake is pending, so EAGAIN is ignored.
 fn notify_pending() {
+    // The pending/ring store happens-before this call. Publish the durable
+    // generation before either losable notification channel.
+    mark_signal_pump_publication();
     let w = PENDING_PIPE_WRITE.load(Ordering::SeqCst);
     if w >= 0 {
         let byte = [1u8];
@@ -1031,6 +1048,7 @@ pub fn publish_process_signal_with_wake(signum: i32, wake: PublicationWake) {
     }
     notify_waiters_fallback();
     if wake == PublicationWake::SignalPump {
+        mark_signal_pump_publication();
         // A busy-waiting guest has no parked waiter to drain the self-pipe, so
         // the HVF-owned route wakes both independent pump channels. The native
         // caller-managed route performs its ordered futex-generation + direct

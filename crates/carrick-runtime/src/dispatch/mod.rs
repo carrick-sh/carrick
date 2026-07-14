@@ -1685,6 +1685,46 @@ enum VfsOpenAttempt {
     FallThrough,
 }
 
+/// Execution-backend owner of the vCPU wake after asynchronous signal
+/// publication. This is run-scoped dispatcher state, not a host-platform or
+/// process-global presence heuristic: macOS can execute the same container via
+/// native translation or HVF, and only the selected backend knows who kicks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AsyncSignalWakeOwner {
+    SignalPump,
+    NativeDirect,
+}
+
+impl AsyncSignalWakeOwner {
+    pub(crate) fn publish_process_signal(self, signum: i32) {
+        #[cfg(feature = "platform-macos")]
+        match self {
+            Self::SignalPump => crate::host_signal::publish_process_signal(signum),
+            Self::NativeDirect => crate::native_darwin::deliver_native_process_signal(signum),
+        }
+        #[cfg(not(feature = "platform-macos"))]
+        {
+            let _ = self;
+            crate::timer_delivery::deliver(signum);
+        }
+    }
+
+    pub(crate) fn publish_thread_signal(self, target_tid: i32, signum: i32) {
+        #[cfg(feature = "platform-macos")]
+        match self {
+            Self::SignalPump => crate::host_signal::publish_pending_for(target_tid, signum),
+            Self::NativeDirect => {
+                crate::native_darwin::publish_native_pending_for(target_tid, signum);
+            }
+        }
+        #[cfg(not(feature = "platform-macos"))]
+        {
+            let _ = self;
+            crate::host_signal::publish_pending_for(target_tid, signum);
+        }
+    }
+}
+
 pub struct SyscallDispatcher {
     /// Owned I/O subsystem state (buffered stdout/stderr, stream toggle,
     /// the open-fd table, next-fd cursor, and cwd). See [`fs::IoState`].
@@ -1760,6 +1800,10 @@ pub struct SyscallDispatcher {
     /// this after completing the syscall and starts the signal pump before
     /// re-entering guest code.
     signal_pump_requested: std::sync::atomic::AtomicBool,
+    /// Backend-selected owner for out-of-band signal wakes. Plain Copy state
+    /// is fixed before the first guest instruction, inherited through host
+    /// fork, and retained across emulated execve with the dispatcher.
+    async_signal_wake_owner: AsyncSignalWakeOwner,
     /// Whether `execve` image loading may fall back to reading the LITERAL host
     /// filesystem (`std::fs::read` at the absolute guest path) when the target
     /// is absent from the overlay/rootfs/bind-mounts. `true` only for bare
@@ -2045,6 +2089,7 @@ impl SyscallDispatcher {
             },
             setgroups_override: Mutex::new(None),
             signal_pump_requested: std::sync::atomic::AtomicBool::new(false),
+            async_signal_wake_owner: AsyncSignalWakeOwner::SignalPump,
             // Default: bare run-elf boot — allow the host-fs execve fallback.
             // Container constructors flip this off (see `with_rootfs*` /
             // `sandbox_exec_to_container`).
@@ -2081,6 +2126,24 @@ impl SyscallDispatcher {
 
     pub(crate) fn set_page_geometry(&mut self, page_geometry: crate::page_profile::PageGeometry) {
         self.page_geometry = page_geometry;
+    }
+
+    pub(crate) fn set_execution_backend(&mut self, backend: crate::page_profile::ExecutionBackend) {
+        self.async_signal_wake_owner = match backend {
+            crate::page_profile::ExecutionBackend::Vmm => AsyncSignalWakeOwner::SignalPump,
+            crate::page_profile::ExecutionBackend::NativeDarwin => {
+                AsyncSignalWakeOwner::NativeDirect
+            }
+        };
+    }
+
+    pub(crate) fn async_signal_wake_owner(&self) -> AsyncSignalWakeOwner {
+        self.async_signal_wake_owner
+    }
+
+    #[cfg(test)]
+    pub(crate) fn publish_rlimit_cpu_signal_for_test(&self, signum: i32) {
+        time::publish_rlimit_cpu_signal(self.async_signal_wake_owner(), signum);
     }
 
     pub(crate) fn set_memory_layout(&self, layout: MemoryLayout) {
