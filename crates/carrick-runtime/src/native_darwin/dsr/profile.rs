@@ -911,6 +911,13 @@ impl ThreadBudget {
         self.enabled
     }
 
+    /// The guest tid this budget is accounted to. Only needed so a FOREIGN
+    /// thread draining the sibling registry can name the thread it failed to
+    /// reconstruct a record for in a diagnostic.
+    pub(super) fn tid(&self) -> i32 {
+        self.tid
+    }
+
     pub(super) fn thread_cpu_baseline_ns(&self) -> u64 {
         self.thread_cpu_baseline_ns
     }
