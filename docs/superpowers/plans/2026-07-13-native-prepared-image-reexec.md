@@ -74,14 +74,14 @@ probe=conformance-probes/target/native-pie/aarch64-unknown-linux-musl/release/pe
 for sample in warmup r1 r2 r3 r4 r5; do
   run_id="native-prepared-red-$sample-$$"
   CARRICK_RUN_ID="$run_id" /usr/bin/time -p \
-    target/release/carrick run-elf \
+    target/release/carrick run-elf --raw \
       --native-page-profile native16k "$probe" \
     >"target/conformance/native-prepared-image/red/$sample.log" 2>&1
   sudo -n scripts/sudo/kill.sh "$run_id"
 done
 ```
 
-Expected: every recorded run reports `iterations=200`, no failed spawn, and a p50 near the current 12.1 ms median. Any materially different result must be explained before implementation.
+Expected: every recorded run reports `iters=200`, no failed spawn, and a p50 near the current 12.1 ms median. Any materially different result must be explained before implementation.
 
 - [ ] **Step 4: Capture the current lifecycle red profile**
 
