@@ -80,6 +80,7 @@ pub(super) struct ThreadTranslator {
     indirect_cache: gateway::IndirectTargetCache,
     stats: ResolverStats,
     budget: profile::ThreadBudget,
+    profile_finalized: bool,
     nested_translation_ns: u64,
     last_kick: Option<(carrick_guest_mem::GuestVa, Option<emit::RecoveryAction>)>,
 }
@@ -93,6 +94,7 @@ struct ProcessState {
     blocks: BTreeMap<(carrick_guest_mem::GuestVa, types::CodeGeneration), types::CacheVa>,
     pending: BTreeMap<(carrick_guest_mem::GuestVa, types::CodeGeneration), Vec<cache::LinkSite>>,
     stats: ResolverStats,
+    reported_stats: ResolverStats,
     sensitive: BTreeMap<(carrick_guest_mem::GuestVa, types::CodeGeneration), types::SensitiveExit>,
     unsupported: BTreeMap<(carrick_guest_mem::GuestVa, types::CodeGeneration), (u32, bad64::Op)>,
     published: Vec<PublishedBlock>,
@@ -141,6 +143,153 @@ pub(super) struct ResolverStats {
     pub(super) translation_plan_ns: u64,
     pub(super) translation_emit_ns: u64,
     pub(super) translation_publication_ns: u64,
+    invalid: Option<profile::ProfileError>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResolverStat {
+    ResolverExits,
+    OneEntryHits,
+    Translations,
+    DuplicatePublications,
+    GatewayEntries,
+    SyscallExits,
+    DirectResolverExits,
+    CacheLookups,
+    CacheLookupHits,
+    InvalidatedBlocks,
+    TranslationNs,
+    TranslationDecodeNs,
+    TranslationPlanNs,
+    TranslationEmitNs,
+    TranslationPublicationNs,
+}
+
+impl ResolverStat {
+    const ALL: [Self; 15] = [
+        Self::ResolverExits,
+        Self::OneEntryHits,
+        Self::Translations,
+        Self::DuplicatePublications,
+        Self::GatewayEntries,
+        Self::SyscallExits,
+        Self::DirectResolverExits,
+        Self::CacheLookups,
+        Self::CacheLookupHits,
+        Self::InvalidatedBlocks,
+        Self::TranslationNs,
+        Self::TranslationDecodeNs,
+        Self::TranslationPlanNs,
+        Self::TranslationEmitNs,
+        Self::TranslationPublicationNs,
+    ];
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::ResolverExits => "resolver_exits",
+            Self::OneEntryHits => "one_entry_hits",
+            Self::Translations => "translations",
+            Self::DuplicatePublications => "duplicate_publications",
+            Self::GatewayEntries => "gateway_entries",
+            Self::SyscallExits => "syscall_exits",
+            Self::DirectResolverExits => "direct_resolver_exits",
+            Self::CacheLookups => "cache_lookups",
+            Self::CacheLookupHits => "cache_lookup_hits",
+            Self::InvalidatedBlocks => "invalidated_blocks",
+            Self::TranslationNs => "translation_ns",
+            Self::TranslationDecodeNs => "translation_decode_ns",
+            Self::TranslationPlanNs => "translation_plan_ns",
+            Self::TranslationEmitNs => "translation_emit_ns",
+            Self::TranslationPublicationNs => "translation_publication_ns",
+        }
+    }
+}
+
+impl ResolverStats {
+    fn get(self, stat: ResolverStat) -> u64 {
+        match stat {
+            ResolverStat::ResolverExits => self.resolver_exits,
+            ResolverStat::OneEntryHits => self.one_entry_hits,
+            ResolverStat::Translations => self.translations,
+            ResolverStat::DuplicatePublications => self.duplicate_publications,
+            ResolverStat::GatewayEntries => self.gateway_entries,
+            ResolverStat::SyscallExits => self.syscall_exits,
+            ResolverStat::DirectResolverExits => self.direct_resolver_exits,
+            ResolverStat::CacheLookups => self.cache_lookups,
+            ResolverStat::CacheLookupHits => self.cache_lookup_hits,
+            ResolverStat::InvalidatedBlocks => self.invalidated_blocks,
+            ResolverStat::TranslationNs => self.translation_ns,
+            ResolverStat::TranslationDecodeNs => self.translation_decode_ns,
+            ResolverStat::TranslationPlanNs => self.translation_plan_ns,
+            ResolverStat::TranslationEmitNs => self.translation_emit_ns,
+            ResolverStat::TranslationPublicationNs => self.translation_publication_ns,
+        }
+    }
+
+    fn set(&mut self, stat: ResolverStat, value: u64) {
+        match stat {
+            ResolverStat::ResolverExits => self.resolver_exits = value,
+            ResolverStat::OneEntryHits => self.one_entry_hits = value,
+            ResolverStat::Translations => self.translations = value,
+            ResolverStat::DuplicatePublications => self.duplicate_publications = value,
+            ResolverStat::GatewayEntries => self.gateway_entries = value,
+            ResolverStat::SyscallExits => self.syscall_exits = value,
+            ResolverStat::DirectResolverExits => self.direct_resolver_exits = value,
+            ResolverStat::CacheLookups => self.cache_lookups = value,
+            ResolverStat::CacheLookupHits => self.cache_lookup_hits = value,
+            ResolverStat::InvalidatedBlocks => self.invalidated_blocks = value,
+            ResolverStat::TranslationNs => self.translation_ns = value,
+            ResolverStat::TranslationDecodeNs => self.translation_decode_ns = value,
+            ResolverStat::TranslationPlanNs => self.translation_plan_ns = value,
+            ResolverStat::TranslationEmitNs => self.translation_emit_ns = value,
+            ResolverStat::TranslationPublicationNs => self.translation_publication_ns = value,
+        }
+    }
+
+    fn add(&mut self, stat: ResolverStat, value: u64) {
+        if self.invalid.is_some() {
+            return;
+        }
+        match self.get(stat).checked_add(value) {
+            Some(total) => self.set(stat, total),
+            None => {
+                self.invalid = Some(profile::ProfileError::CounterOverflow(stat.name()));
+            }
+        }
+    }
+
+    fn add_elapsed(&mut self, stat: ResolverStat, elapsed: std::time::Duration) {
+        match u64::try_from(elapsed.as_nanos()) {
+            Ok(ns) => self.add(stat, ns),
+            Err(_) => {
+                self.invalid = Some(profile::ProfileError::CounterOverflow(stat.name()));
+            }
+        }
+    }
+
+    fn add_usize(&mut self, stat: ResolverStat, value: usize) {
+        match u64::try_from(value) {
+            Ok(value) => self.add(stat, value),
+            Err(_) => {
+                self.invalid = Some(profile::ProfileError::CounterOverflow(stat.name()));
+            }
+        }
+    }
+
+    fn checked_delta(self, prior: Self) -> Result<Self, profile::ProfileError> {
+        if let Some(error) = self.invalid.or(prior.invalid) {
+            return Err(error);
+        }
+        let mut delta = Self::default();
+        for stat in ResolverStat::ALL {
+            let value = self
+                .get(stat)
+                .checked_sub(prior.get(stat))
+                .ok_or(profile::ProfileError::CounterUnderflow(stat.name()))?;
+            delta.set(stat, value);
+        }
+        Ok(delta)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -160,6 +309,7 @@ pub(super) struct ProfileSnapshot {
     pub(super) translation_plan_ns: u64,
     pub(super) translation_emit_ns: u64,
     pub(super) translation_publication_ns: u64,
+    pub(super) nested_translation_ns: u64,
     pub(super) cache_used_bytes: usize,
     pub(super) cache_capacity_bytes: usize,
 }
@@ -181,6 +331,7 @@ impl ThreadTranslator {
             indirect_cache: gateway::IndirectTargetCache::new(),
             stats: ResolverStats::default(),
             budget: profile::ThreadBudget::from_environment(tid),
+            profile_finalized: false,
             nested_translation_ns: 0,
             last_kick: None,
         }
@@ -201,6 +352,7 @@ impl ThreadTranslator {
         self.indirect_cache.clear();
         self.stats = ResolverStats::default();
         self.budget.reset_after_fork_child(tid);
+        self.profile_finalized = false;
         self.nested_translation_ns = 0;
         self.last_kick = None;
         let (used_bytes, block_count, generation_count) = self.process.lifecycle_snapshot();
@@ -236,11 +388,23 @@ impl ThreadTranslator {
     }
 
     pub(super) fn reset_for_exec(&mut self, next: Arc<ProcessTranslator>) {
+        self.reset_for_exec_with_sink(next, |frames| {
+            let _ = profile::write_protocol_frames_to_fd(libc::STDERR_FILENO, frames);
+        });
+    }
+
+    fn reset_for_exec_with_sink(
+        &mut self,
+        next: Arc<ProcessTranslator>,
+        mut sink: impl FnMut(&[String]),
+    ) {
+        if let Some(frames) = self.take_profile_frames() {
+            sink(&frames);
+        }
         self.process = next;
         self.resume_entry = None;
         self.indirect_cache.clear();
-        self.stats = ResolverStats::default();
-        self.nested_translation_ns = 0;
+        self.start_next_profile_epoch();
         self.last_kick = None;
         let (used_bytes, block_count, generation_count) = self.process.lifecycle_snapshot();
         probes::dsr_cache_lifecycle(
@@ -259,6 +423,14 @@ impl ThreadTranslator {
         );
     }
 
+    pub(super) fn start_next_profile_epoch(&mut self) {
+        self.stats = ResolverStats::default();
+        self.budget.reset_after_exec();
+        self.profile_finalized = false;
+        self.nested_translation_ns = 0;
+    }
+
+    #[cfg(test)]
     pub(super) fn profile_snapshot(&self) -> ProfileSnapshot {
         let process = self.process.state.lock();
         ProfileSnapshot {
@@ -277,23 +449,67 @@ impl ThreadTranslator {
             translation_plan_ns: process.stats.translation_plan_ns,
             translation_emit_ns: process.stats.translation_emit_ns,
             translation_publication_ns: process.stats.translation_publication_ns,
+            nested_translation_ns: self.nested_translation_ns,
             cache_used_bytes: process.cache.used_bytes(),
             cache_capacity_bytes: process.cache.capacity_bytes(),
+        }
+    }
+
+    fn claim_profile_snapshot(&mut self) -> Result<ProfileSnapshot, profile::ProfileError> {
+        if let Some(error) = self.stats.invalid {
+            return Err(error);
+        }
+        let mut process = self.process.state.lock();
+        let delta = process.stats.checked_delta(process.reported_stats)?;
+        process.reported_stats = process.stats;
+        Ok(ProfileSnapshot {
+            resolver_exits: self.stats.resolver_exits,
+            one_entry_hits: self.stats.one_entry_hits,
+            translations: delta.translations,
+            duplicate_publications: delta.duplicate_publications,
+            gateway_entries: self.stats.gateway_entries,
+            syscall_exits: self.stats.syscall_exits,
+            direct_resolver_exits: self.stats.direct_resolver_exits,
+            cache_lookups: delta.cache_lookups,
+            cache_lookup_hits: delta.cache_lookup_hits,
+            invalidated_blocks: delta.invalidated_blocks,
+            translation_ns: delta.translation_ns,
+            translation_decode_ns: delta.translation_decode_ns,
+            translation_plan_ns: delta.translation_plan_ns,
+            translation_emit_ns: delta.translation_emit_ns,
+            translation_publication_ns: delta.translation_publication_ns,
+            nested_translation_ns: self.nested_translation_ns,
+            cache_used_bytes: process.cache.used_bytes(),
+            cache_capacity_bytes: process.cache.capacity_bytes(),
+        })
+    }
+
+    fn take_profile_frames(&mut self) -> Option<Vec<String>> {
+        if !self.budget.enabled() || self.profile_finalized {
+            return None;
+        }
+        self.profile_finalized = true;
+        let frames = self
+            .budget
+            .complete_record()
+            .and_then(|record| {
+                let snapshot = self.claim_profile_snapshot()?;
+                record.to_protocol_frames_with_resolver(snapshot)
+            })
+            .unwrap_or_else(|error| vec![self.budget.invalid_protocol_line(error)]);
+        Some(frames)
+    }
+
+    pub(super) fn finalize_profile_epoch(&mut self) {
+        if let Some(frames) = self.take_profile_frames() {
+            let _ = profile::write_protocol_frames_to_fd(libc::STDERR_FILENO, &frames);
         }
     }
 }
 
 impl Drop for ThreadTranslator {
     fn drop(&mut self) {
-        if !self.budget.enabled() {
-            return;
-        }
-        let profile = self.profile_snapshot();
-        let line = match self.budget.complete_record() {
-            Ok(record) => record.to_protocol_line_with_resolver(profile),
-            Err(error) => self.budget.invalid_protocol_line(error),
-        };
-        super::child_write_stderr(format!("{line}\n").as_bytes());
+        self.finalize_profile_epoch();
     }
 }
 
@@ -305,6 +521,7 @@ impl ProcessTranslator {
                 blocks: BTreeMap::new(),
                 pending: BTreeMap::new(),
                 stats: ResolverStats::default(),
+                reported_stats: ResolverStats::default(),
                 sensitive: BTreeMap::new(),
                 unsupported: BTreeMap::new(),
                 published: Vec::new(),
@@ -334,6 +551,7 @@ impl ProcessTranslator {
         state.cache.after_fork_child();
         state.publications.after_fork_child();
         state.stats = ResolverStats::default();
+        state.reported_stats = ResolverStats::default();
         let capacity = u64::try_from(state.cache.capacity_bytes()).unwrap_or(u64::MAX);
         drop(state);
         probes::dsr_cache_capacity(probes::DsrCacheRole::Child, capacity);
@@ -346,6 +564,7 @@ impl ProcessTranslator {
         state.blocks.clear();
         state.pending.clear();
         state.stats = ResolverStats::default();
+        state.reported_stats = ResolverStats::default();
         state.sensitive.clear();
         state.unsupported.clear();
         state.dependencies = cache::PageBlockDependencies::default();
@@ -365,10 +584,8 @@ impl ProcessState {
         let generation = observation.expected();
         let stale_blocks = self.dependencies.invalidate_page(source_page, generation);
         if self.profiling {
-            self.stats.invalidated_blocks = self
-                .stats
-                .invalidated_blocks
-                .saturating_add(u64::try_from(stale_blocks.len()).unwrap_or(u64::MAX));
+            self.stats
+                .add_usize(ResolverStat::InvalidatedBlocks, stale_blocks.len());
         }
         for stale in stale_blocks {
             self.blocks.remove(&stale);
@@ -382,11 +599,11 @@ impl ProcessState {
         }
         let key = (guest, generation);
         if self.profiling {
-            self.stats.cache_lookups = self.stats.cache_lookups.saturating_add(1);
+            self.stats.add(ResolverStat::CacheLookups, 1);
         }
         if let Some(entry) = self.blocks.get(&key) {
             if self.profiling {
-                self.stats.cache_lookup_hits = self.stats.cache_lookup_hits.saturating_add(1);
+                self.stats.add(ResolverStat::CacheLookupHits, 1);
             }
             probes::dsr_cache_event(
                 tid,
@@ -422,9 +639,8 @@ impl ProcessState {
             let decode_started = self.profiling.then(std::time::Instant::now);
             let block_result = block::plan_block(memory, guest, generation, 256);
             if let Some(started) = decode_started {
-                self.stats.translation_decode_ns = self.stats.translation_decode_ns.saturating_add(
-                    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
-                );
+                self.stats
+                    .add_elapsed(ResolverStat::TranslationDecodeNs, started.elapsed());
             }
             probes::dsr_translate_subphase_end(
                 tid,
@@ -469,9 +685,8 @@ impl ProcessState {
                 Ok(())
             })();
             if let Some(started) = plan_started {
-                self.stats.translation_plan_ns = self.stats.translation_plan_ns.saturating_add(
-                    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
-                );
+                self.stats
+                    .add_elapsed(ResolverStat::TranslationPlanNs, started.elapsed());
             }
             probes::dsr_translate_subphase_end(
                 tid,
@@ -511,17 +726,15 @@ impl ProcessState {
                     });
                 }
                 if let Some(started) = translation_started {
-                    self.stats.translation_ns = self.stats.translation_ns.saturating_add(
-                        u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
-                    );
+                    self.stats
+                        .add_elapsed(ResolverStat::TranslationNs, started.elapsed());
                 }
-                self.stats.translations = self.stats.translations.saturating_add(1);
+                self.stats.add(ResolverStat::Translations, 1);
                 Ok::<_, types::DsrError>((emitted, emitted_bytes))
             })();
             if let Some(started) = emit_started {
-                self.stats.translation_emit_ns = self.stats.translation_emit_ns.saturating_add(
-                    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
-                );
+                self.stats
+                    .add_elapsed(ResolverStat::TranslationEmitNs, started.elapsed());
             }
             probes::dsr_translate_subphase_end(
                 tid,
@@ -544,8 +757,7 @@ impl ProcessState {
                     .publications
                     .get_or_publish_profiled(tid, key, || entry);
                 if published_entry != entry {
-                    self.stats.duplicate_publications =
-                        self.stats.duplicate_publications.saturating_add(1);
+                    self.stats.add(ResolverStat::DuplicatePublications, 1);
                     return Ok(TranslationResult {
                         entry: published_entry,
                         generation,
@@ -594,10 +806,8 @@ impl ProcessState {
                 })
             })();
             if let Some(started) = publication_started {
-                self.stats.translation_publication_ns =
-                    self.stats.translation_publication_ns.saturating_add(
-                        u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
-                    );
+                self.stats
+                    .add_elapsed(ResolverStat::TranslationPublicationNs, started.elapsed());
             }
             probes::dsr_translate_subphase_end(
                 tid,
@@ -736,7 +946,7 @@ impl ThreadTranslator {
         _source: carrick_guest_mem::GuestVa,
         target: carrick_guest_mem::GuestVa,
     ) -> Result<(types::CacheVa, types::CodeGeneration), types::DsrError> {
-        self.stats.resolver_exits = self.stats.resolver_exits.saturating_add(1);
+        self.stats.add(ResolverStat::ResolverExits, 1);
         let translated = self.translate::<PROFILE>(memory, target)?;
         self.indirect_cache
             .publish(target, translated.generation, translated.entry);
@@ -769,6 +979,7 @@ impl ThreadTranslator {
             translation_plan_ns: process.translation_plan_ns,
             translation_emit_ns: process.translation_emit_ns,
             translation_publication_ns: process.translation_publication_ns,
+            invalid: self.stats.invalid.or(process.invalid),
         }
     }
 
@@ -950,7 +1161,7 @@ impl ThreadTranslator {
                 if cached_guest == guest
                     && memory.dsr_generation_observation(guest)?.expected() == generation
                 {
-                    self.stats.one_entry_hits = self.stats.one_entry_hits.saturating_add(1);
+                    self.stats.add(ResolverStat::OneEntryHits, 1);
                     return Ok((entry, generation, probes::DsrPrepareOutcome::ResumeEntryHit));
                 }
                 self.resume_entry = None;
@@ -1008,7 +1219,7 @@ impl ThreadTranslator {
             resume: carrick_guest_mem::GuestVa(snapshot.pc),
         };
         if self.budget.enabled() {
-            self.stats.gateway_entries = self.stats.gateway_entries.saturating_add(1);
+            self.stats.add(ResolverStat::GatewayEntries, 1);
         }
         if PROFILE {
             probes::dsr_run_begin(
@@ -1070,11 +1281,10 @@ impl ThreadTranslator {
         if self.budget.enabled() {
             match exit.exit {
                 types::NativeDsrExit::Syscall { .. } => {
-                    self.stats.syscall_exits = self.stats.syscall_exits.saturating_add(1);
+                    self.stats.add(ResolverStat::SyscallExits, 1);
                 }
                 types::NativeDsrExit::ResolveDirect { .. } => {
-                    self.stats.direct_resolver_exits =
-                        self.stats.direct_resolver_exits.saturating_add(1);
+                    self.stats.add(ResolverStat::DirectResolverExits, 1);
                 }
                 types::NativeDsrExit::ResolveIndirect { .. } => {}
                 _ => {}
@@ -2124,6 +2334,111 @@ mod tests {
             1,
             "pre-exec threads must retain old PC metadata until their Arc retires"
         );
+    }
+
+    fn protocol_value(frames: &[String], key: &str) -> u64 {
+        frames
+            .iter()
+            .flat_map(|frame| frame.split('|'))
+            .find_map(|field| field.strip_prefix(&format!("{key}=")))
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_else(|| panic!("missing protocol field {key}"))
+    }
+
+    #[test]
+    fn exec_finalizes_coherent_pre_and_post_eras() {
+        let old = std::sync::Arc::new(
+            super::ProcessTranslator::new(16 * 1024).expect("create old translator"),
+        );
+        old.state
+            .lock()
+            .stats
+            .add(super::ResolverStat::Translations, 3);
+        old.state
+            .lock()
+            .stats
+            .add(super::ResolverStat::TranslationNs, 11);
+        let mut thread = super::ThreadTranslator::for_process(old, 42);
+        thread.budget = super::profile::ThreadBudget::enabled_for_test(41, 42);
+        thread
+            .budget
+            .record_exit(super::profile::ExitClass::Syscall)
+            .expect("record pre-exec exit");
+        thread.nested_translation_ns = 17;
+        let next = std::sync::Arc::new(
+            super::ProcessTranslator::new(16 * 1024).expect("create next translator"),
+        );
+        next.state
+            .lock()
+            .stats
+            .add(super::ResolverStat::Translations, 5);
+        let mut pre_exec = Vec::new();
+
+        thread.reset_for_exec_with_sink(next, |frames| pre_exec.extend_from_slice(frames));
+
+        assert_eq!(protocol_value(&pre_exec, "era"), 0);
+        assert_eq!(protocol_value(&pre_exec, "gateway_entries"), 1);
+        assert_eq!(protocol_value(&pre_exec, "translations"), 3);
+        assert_eq!(protocol_value(&pre_exec, "nested_translation_ns"), 11);
+        assert_eq!(protocol_value(&pre_exec, "translate_phase_nested_ns"), 17);
+        let post_exec = thread.take_profile_frames().expect("post-exec era");
+        assert!(protocol_value(&post_exec, "era") > 0);
+        assert_eq!(protocol_value(&post_exec, "gateway_entries"), 0);
+        assert_eq!(protocol_value(&post_exec, "translations"), 5);
+        assert_eq!(protocol_value(&post_exec, "nested_translation_ns"), 0);
+        assert_eq!(protocol_value(&post_exec, "translate_phase_nested_ns"), 0);
+    }
+
+    #[test]
+    fn process_resolver_deltas_are_counted_exactly_once_across_threads() {
+        let process = std::sync::Arc::new(
+            super::ProcessTranslator::new(16 * 1024).expect("create translator"),
+        );
+        let mut first = super::ThreadTranslator::for_process(std::sync::Arc::clone(&process), 42);
+        let mut second = super::ThreadTranslator::for_process(std::sync::Arc::clone(&process), 43);
+        first.budget = super::profile::ThreadBudget::enabled_for_test(41, 42);
+        second.budget = super::profile::ThreadBudget::enabled_for_test(41, 43);
+        process
+            .state
+            .lock()
+            .stats
+            .add(super::ResolverStat::Translations, 7);
+        let first_frames = first.take_profile_frames().expect("first record");
+        process
+            .state
+            .lock()
+            .stats
+            .add(super::ResolverStat::Translations, 5);
+        let second_frames = second.take_profile_frames().expect("second record");
+
+        assert_eq!(protocol_value(&first_frames, "translations"), 7);
+        assert_eq!(protocol_value(&second_frames, "translations"), 5);
+        assert_eq!(
+            protocol_value(&first_frames, "translations")
+                + protocol_value(&second_frames, "translations"),
+            12
+        );
+    }
+
+    #[test]
+    fn resolver_overflow_invalidates_and_finalization_is_idempotent() {
+        let process = std::sync::Arc::new(
+            super::ProcessTranslator::new(16 * 1024).expect("create translator"),
+        );
+        let mut thread = super::ThreadTranslator::for_process(std::sync::Arc::clone(&process), 42);
+        thread.budget = super::profile::ThreadBudget::enabled_for_test(41, 42);
+        process.state.lock().stats.translations = u64::MAX;
+        process
+            .state
+            .lock()
+            .stats
+            .add(super::ResolverStat::Translations, 1);
+
+        let frames = thread.take_profile_frames().expect("invalid record");
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0].contains("|complete=0|"));
+        assert!(frames[0].contains("|reason=counter-overflow"));
+        assert!(thread.take_profile_frames().is_none());
     }
 
     #[test]
