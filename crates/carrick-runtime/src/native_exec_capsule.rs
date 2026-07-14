@@ -52,6 +52,8 @@ pub(crate) struct NativeGuestExecV1 {
     #[serde(default)]
     pub(crate) kernel_arena: Option<NativeReexecKernelArenaV1>,
     #[serde(default)]
+    pub(crate) shared_futex_waiters: Option<NativeReexecWaiterTableV1>,
+    #[serde(default)]
     pub(crate) bind_mounts: Vec<crate::vfs::bind::NativeReexecBindMountV1>,
     pub(crate) fd_table: crate::dispatch::fd_table::NativeReexecFdTableV1,
     pub(crate) xsig: NativeReexecXsigV1,
@@ -61,6 +63,15 @@ pub(crate) struct NativeGuestExecV1 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct NativeReexecKernelArenaV1 {
+    pub(crate) host_fd: i32,
+    pub(crate) original_host_fd_flags: i32,
+    pub(crate) host_device: u64,
+    pub(crate) host_inode: u64,
+    pub(crate) host_size: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct NativeReexecWaiterTableV1 {
     pub(crate) host_fd: i32,
     pub(crate) original_host_fd_flags: i32,
     pub(crate) host_device: u64,
@@ -145,6 +156,9 @@ impl NativeGuestExecV1 {
                     || arena.host_size
                         != std::mem::size_of::<carrick_kernel::arena::ArenaLayout>() as u64
             })
+            || self
+                .shared_futex_waiters
+                .is_some_and(|waiters| waiters.host_fd < 0 || waiters.host_size == 0)
             || (self.process_state.ptrace_traceme && self.kernel_arena.is_none())
             || self.bind_mounts.len() > MAX_VECTOR_ITEMS
             || self.fd_table.files.len() > MAX_VECTOR_ITEMS
@@ -240,6 +254,15 @@ pub(crate) fn begin_guest_exec(
             host_inode: authority.inode,
             host_size: authority.size,
         })?;
+    let shared_futex_waiters = crate::ulock::waiter_table_reexec_authority().map(|authority| {
+        NativeReexecWaiterTableV1 {
+            host_fd: authority.fd,
+            original_host_fd_flags: authority.original_fd_flags,
+            host_device: authority.device,
+            host_inode: authority.inode,
+            host_size: authority.size,
+        }
+    })?;
     let mut payload = NativeExecCapsuleV1 {
         producer_pid: unsafe { libc::getpid() as u32 },
         purpose: NativeExecCapsulePurposeV1::GuestExec,
@@ -256,6 +279,7 @@ pub(crate) fn begin_guest_exec(
             max_traps: u64::try_from(max_traps)?,
             native_page_profile,
             kernel_arena: Some(kernel_arena),
+            shared_futex_waiters: Some(shared_futex_waiters),
             bind_mounts,
             fd_table,
             xsig,
@@ -481,6 +505,13 @@ where
                 arena.host_fd,
                 arena.original_host_fd_flags,
                 arena.original_host_fd_flags & !libc::FD_CLOEXEC,
+            )?;
+        }
+        if let Some(waiters) = guest.shared_futex_waiters {
+            prepared_host_fds.prepare(
+                waiters.host_fd,
+                waiters.original_host_fd_flags,
+                waiters.original_host_fd_flags & !libc::FD_CLOEXEC,
             )?;
         }
         prepared_host_fds.prepare(
@@ -966,6 +997,7 @@ mod tests {
                 max_traps: 100,
                 native_page_profile: carrick_spec::NativePageProfileRequest::Native16k,
                 kernel_arena: None,
+                shared_futex_waiters: None,
                 bind_mounts: Vec::new(),
                 fd_table: crate::dispatch::fd_table::NativeReexecFdTableV1 {
                     files: Vec::new(),
@@ -1204,24 +1236,21 @@ mod tests {
     }
 
     #[test]
-    fn legacy_v1_payload_without_kernel_arena_keeps_legacy_attach_path() {
+    fn legacy_v1_payload_without_shared_authorities_keeps_legacy_attach_path() {
         let payload = sample();
         let mut value = serde_json::to_value(payload).expect("serialize capsule");
-        value
+        let guest = value
             .get_mut("guest_exec")
             .and_then(serde_json::Value::as_object_mut)
-            .expect("guest payload")
-            .remove("kernel_arena");
+            .expect("guest payload");
+        guest.remove("kernel_arena");
+        guest.remove("shared_futex_waiters");
 
         let decoded: NativeExecCapsuleV1 =
             serde_json::from_value(value).expect("decode prior V1 payload");
-        assert!(
-            decoded
-                .guest_exec
-                .expect("guest payload")
-                .kernel_arena
-                .is_none()
-        );
+        let guest = decoded.guest_exec.expect("guest payload");
+        assert!(guest.kernel_arena.is_none());
+        assert!(guest.shared_futex_waiters.is_none());
     }
 
     #[test]
@@ -1410,6 +1439,21 @@ mod tests {
             host_inode: arena_identity.st_ino,
             host_size: arena_identity.st_size as u64,
         });
+        let waiters = tempfile::tempfile().expect("shared futex waiter file");
+        waiters.set_len(4096).expect("size waiter table");
+        set_fd_flags(waiters.as_raw_fd(), libc::FD_CLOEXEC);
+        let waiter_identity = host_identity(waiters.as_raw_fd());
+        payload
+            .guest_exec
+            .as_mut()
+            .expect("guest payload")
+            .shared_futex_waiters = Some(super::NativeReexecWaiterTableV1 {
+            host_fd: waiters.as_raw_fd(),
+            original_host_fd_flags: libc::FD_CLOEXEC,
+            host_device: waiter_identity.st_dev as u64,
+            host_inode: waiter_identity.st_ino,
+            host_size: waiter_identity.st_size as u64,
+        });
         let mut saw_exec = false;
 
         let result = exec_capsule_with(payload, [0x33; 16], Some(artifact), |request| {
@@ -1423,6 +1467,7 @@ mod tests {
             assert_eq!(fd_flags(survivor.as_raw_fd()), 0);
             assert_eq!(fd_flags(close_on_exec.as_raw_fd()), libc::FD_CLOEXEC);
             assert_eq!(fd_flags(arena.as_raw_fd()), 0);
+            assert_eq!(fd_flags(waiters.as_raw_fd()), 0);
             std::io::Error::from_raw_os_error(libc::ENOENT)
         });
 
@@ -1437,6 +1482,7 @@ mod tests {
         assert_eq!(fd_flags(survivor.as_raw_fd()), libc::FD_CLOEXEC);
         assert_eq!(fd_flags(close_on_exec.as_raw_fd()), 0);
         assert_eq!(fd_flags(arena.as_raw_fd()), libc::FD_CLOEXEC);
+        assert_eq!(fd_flags(waiters.as_raw_fd()), libc::FD_CLOEXEC);
     }
 
     #[test]

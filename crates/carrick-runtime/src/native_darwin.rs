@@ -872,6 +872,16 @@ pub(crate) fn resume_guest_from_capsule(
         )
         .map_err(|error| anyhow::anyhow!("restore native kernel arena: {error}"))?;
     }
+    if let Some(waiters) = guest.shared_futex_waiters {
+        crate::ulock::init_waiter_table_from_reexec(crate::ulock::WaiterTableReexecAuthority {
+            fd: waiters.host_fd,
+            original_fd_flags: waiters.original_host_fd_flags,
+            device: waiters.host_device,
+            inode: waiters.host_inode,
+            size: waiters.host_size,
+        })
+        .map_err(|error| anyhow::anyhow!("restore native shared futex waiters: {error}"))?;
+    }
     let max_traps = usize::try_from(guest.max_traps)?;
     let plan = crate::page_profile::resolve_execution_plan_for_request(
         carrick_spec::Platform::host_native(),
