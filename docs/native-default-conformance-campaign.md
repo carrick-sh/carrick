@@ -187,7 +187,46 @@ blocked-residual rung, and re-runs this campaign to obtain the typed decision
 row. No timeout, `max_traps`, or semantic weakening is involved.
 
 
-## Task 3 re-run with typed attribution (2026-07-14, signed, at 081c0d7d)
+## Task 3 re-run with typed attribution (2026-07-14) — RETRACTED
+
+**This section's decision row and conclusions are RETRACTED.** The campaign at
+`081c0d7d` emitted a typed decision row selecting `helper-cpu` (30.86 percent)
+and concluded that host-side machinery was ~72 percent of CPU while guest
+execution was a ~31 percent minority. That conclusion is wrong and its
+supporting term is mislabeled.
+
+`helper-cpu` is a DERIVED residual (`process_cpu - sum(flushed thread_cpu)`),
+and guest worker threads do not flush their profile records: on `exit_group`
+the leader thread calls `_exit(2)`, which kills every sibling worker instantly
+— they run no code, so they emit no record while their DSR CPU remains in the
+process rusage gauge. Measured on the committed evidence, the Go compiler
+process flushed 299 ms of thread CPU against 1,290 ms of real process CPU
+(77 percent unattributed); across all guest processes 1.098 s of 2.281 s
+(48 percent) of guest CPU never reached a thread record. The residual is
+therefore mostly UNATTRIBUTED GUEST EXECUTION, not host pumps or watchers.
+
+What survives from that run and is NOT retracted:
+
+- Untraced Plane A authority: W2 completes at 16.00x Docker (p50 3.520 s vs
+  0.220 s); W1 remains ceiling-truncated (p50 19.200 s, 11.93x).
+- ABBA profile tax 1.42 percent; one-thread control and Plane C clean.
+- The supervisor term is directly measured (its own rusage record, not a
+  residual): supervisor self CPU is ~1.555 s, ~41.6 percent of untraced CPU.
+  This is real host-side overhead regardless of how the guest-side residual
+  redistributes.
+- Startup CPU (~1 ms) and blocked-segment thread CPU (~3 ms) are measured
+  negligible; those two pre-attribution hypotheses ARE refuted.
+
+An upper-plausibility guard now rejects any profile whose derived helper
+residual exceeds half a process's CPU, so this class of mis-attribution
+cannot silently produce a decision again. The campaign will be re-run once
+worker-thread flushing is fixed at the `exit_group` path, and a corrected
+decision row will replace this section.
+
+---
+
+## Superseded measurements from the retracted run (2026-07-14, at 081c0d7d)
+
 
 The attribution increments (NATIVEPERF v2 frames, per-era thread CPU across
 self-reexec, the supervisor record with its pid-identity guard, the two-gate
