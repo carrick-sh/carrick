@@ -109,6 +109,12 @@ FRAME_FIELDS_V2 = {
     "process": {"startup_wall_ns", "startup_cpu_ns", "process_cpu_ns"},
 }
 REQUIRED_FRAMES_V2 = frozenset(FRAME_FIELDS_V2)
+# The supervisor record (`NATIVEPERF1|supervisor|...`) is a v2-era, per-PROFILE
+# (not per-thread-group) record: the top-level `carrick run` process's own
+# getrusage(RUSAGE_SELF)/getrusage(RUSAGE_CHILDREN) CPU. It is a top-level
+# protocol "kind" (like "thread"/"invalid"), not a "frame" within a thread
+# group, so it is not part of FRAME_FIELDS_V2.
+SUPERVISOR_FIELDS = frozenset({"self_cpu_ns", "children_cpu_ns"})
 HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 IMAGE_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
@@ -779,9 +785,23 @@ class ProfileThread:
 
 
 @dataclasses.dataclass(frozen=True)
+class SupervisorRecord:
+    """The top-level `carrick run` process's own measured CPU (NATIVEPERF v2's
+    `NATIVEPERF1|supervisor|...` record). `self_cpu_ns` is that process's own
+    `getrusage(RUSAGE_SELF)`; `children_cpu_ns` is `getrusage(RUSAGE_CHILDREN)`,
+    which transitively covers the entire guest process tree it forked, waited
+    on, and reaped. At most one per profile; only meaningful (and only ever
+    emitted) alongside a v2 profile."""
+
+    self_cpu_ns: int
+    children_cpu_ns: int
+
+
+@dataclasses.dataclass(frozen=True)
 class ProfileRun:
     threads: tuple[ProfileThread, ...]
     version: int = 1
+    supervisor: SupervisorRecord | None = None
 
 
 def _parse_decimal(value: str, field: str) -> int:
@@ -834,9 +854,23 @@ def _frame_contract(frame: str, extras: set[str]) -> tuple[int | None, set[str]]
     raise BudgetError(f"missing field(s) in {frame}: {', '.join(sorted(missing))}")
 
 
+def _parse_supervisor_fields(fields: dict[str, str]) -> SupervisorRecord:
+    unknown = set(fields) - SUPERVISOR_FIELDS
+    missing = SUPERVISOR_FIELDS - set(fields)
+    if unknown:
+        raise BudgetError(f"unknown supervisor field(s): {', '.join(sorted(unknown))}")
+    if missing:
+        raise BudgetError(f"missing supervisor field(s): {', '.join(sorted(missing))}")
+    return SupervisorRecord(
+        _parse_decimal(fields["self_cpu_ns"], "self_cpu_ns"),
+        _parse_decimal(fields["children_cpu_ns"], "children_cpu_ns"),
+    )
+
+
 def parse_nativeperf(lines: Iterable[str]) -> ProfileRun:
     groups: dict[tuple[int, int, int], dict[str, dict[str, int]]] = {}
     group_versions: dict[tuple[int, int, int], set[int]] = {}
+    supervisor: SupervisorRecord | None = None
     saw_protocol = False
     for raw_line in lines:
         line = raw_line.strip()
@@ -847,6 +881,11 @@ def parse_nativeperf(lines: Iterable[str]) -> ProfileRun:
         if kind == "invalid":
             reason = fields.get("reason", "malformed")
             raise BudgetError(f"invalid native profile record: {reason}")
+        if kind == "supervisor":
+            if supervisor is not None:
+                raise BudgetError("duplicate supervisor record")
+            supervisor = _parse_supervisor_fields(fields)
+            continue
         if kind != "thread":
             raise BudgetError(f"unknown native profile record kind: {kind}")
         common = {"complete", "pid", "tid", "era", "frame"}
@@ -898,9 +937,13 @@ def parse_nativeperf(lines: Iterable[str]) -> ProfileRun:
         raise BudgetError(
             "mixed native profile contract versions across thread groups"
         )
-    return ProfileRun(
-        tuple(threads), version=profile_versions.pop() if profile_versions else 1
-    )
+    resolved_version = profile_versions.pop() if profile_versions else 1
+    if supervisor is not None and resolved_version != 2:
+        raise BudgetError(
+            "supervisor record requires a NATIVEPERF v2 profile: "
+            f"profile is v{resolved_version}"
+        )
+    return ProfileRun(tuple(threads), version=resolved_version, supervisor=supervisor)
 
 
 def validate_profile(run: ProfileRun) -> None:
@@ -1036,6 +1079,8 @@ class AdditiveCpuEvidence:
     startup_cpu_ns: int
     process_cpu_ns: int
     helper_cpu_ns: int
+    supervisor_self_cpu_ns: int
+    supervisor_children_cpu_ns: int
 
 
 def derive_count_evidence(profile: ProfileRun, *, scope: str) -> CountEvidence:
@@ -1075,6 +1120,10 @@ def derive_additive_cpu_evidence(profile: ProfileRun, cpu_ns: int) -> AdditiveCp
             f"{profile.version}"
         )
     validate_profile(profile)
+    if profile.supervisor is None:
+        raise BudgetError(
+            "supervisor record required for NATIVEPERF v2 additive attribution"
+        )
     terms = tuple(
         (
             name,
@@ -1122,12 +1171,43 @@ def derive_additive_cpu_evidence(profile: ProfileRun, cpu_ns: int) -> AdditiveCp
     thread_cpu_total = sum(thread_cpu_by_pid.values())
     blocked_cpu_total = sum(blocked_cpu_by_pid.values())
     helper_cpu_total = sum(helper_cpu_by_pid.values())
+    supervisor_self_cpu_ns = profile.supervisor.self_cpu_ns
+    supervisor_children_cpu_ns = profile.supervisor.children_cpu_ns
+    # Gate 1: cross-checks the external measurement (/usr/bin/time's cpu_ns,
+    # a wait4() sum over the whole process tree) against the SAME sum taken
+    # from inside the supervisor via getrusage(RUSAGE_SELF)+RUSAGE_CHILDREN.
+    # Both are kernel-computed over the identical descendant graph, so they
+    # should agree up to small measurement-moment skew.
+    gate1_share = (cpu_ns - (supervisor_self_cpu_ns + supervisor_children_cpu_ns)) / cpu_ns
+    if abs(gate1_share) > 0.02:
+        raise BudgetError(
+            "supervisor CPU does not reconcile with measured CPU by more than 2%: "
+            f"{gate1_share:.6f}"
+        )
+    # Gate 2: the supervisor's RUSAGE_CHILDREN must COVER the guest process
+    # tree's own measured CPU (it transitively includes every reaped
+    # descendant), with only a small bounded gap for post-flush teardown or
+    # any guest process this profile's threads didn't cover. Undershoot
+    # (children_cpu_ns < guest process CPU) is never valid: RUSAGE_CHILDREN
+    # cannot report LESS than what NATIVEPERF v2 measured inside those same
+    # processes.
+    gate2_gap = supervisor_children_cpu_ns - process_cpu_total
+    if gate2_gap < 0:
+        raise BudgetError(
+            "supervisor children CPU is less than guest process CPU: "
+            f"children={supervisor_children_cpu_ns}, guests={process_cpu_total}"
+        )
+    gate2_share = gate2_gap / cpu_ns
+    if gate2_share > 0.02:
+        raise BudgetError(
+            "supervisor children CPU exceeds guest process CPU by more than 2%: "
+            f"{gate2_share:.6f}"
+        )
+    # residual_ns/residual_share stay informational only (never a gate): the
+    # unattributed gap between /usr/bin/time's total and the sum of guest
+    # process_cpu, now that gate1+gate2 are the enforced reconciliation.
     residual = cpu_ns - process_cpu_total
     residual_share = residual / cpu_ns
-    if abs(residual_share) > 0.02:
-        raise BudgetError(
-            f"additive CPU reconciliation differs by more than 2%: {residual_share:.6f}"
-        )
     blocked_ns = sum(
         thread.value("phases-b", "phase_blocked_ns") for thread in profile.threads
     )
@@ -1150,6 +1230,8 @@ def derive_additive_cpu_evidence(profile: ProfileRun, cpu_ns: int) -> AdditiveCp
         startup_cpu_ns=startup_cpu_total,
         process_cpu_ns=process_cpu_total,
         helper_cpu_ns=helper_cpu_total,
+        supervisor_self_cpu_ns=supervisor_self_cpu_ns,
+        supervisor_children_cpu_ns=supervisor_children_cpu_ns,
     )
 
 
@@ -2026,6 +2108,14 @@ def analyze(records: Sequence[RunRecord]) -> DecisionRecord:
         duration_shares["helper-cpu"] = (
             statistics.median(evidence.helper_cpu_ns for evidence in additive) / untraced_cpu
         )
+        # supervisor-cpu: the top-level `carrick run` process's own CPU
+        # (getrusage(RUSAGE_SELF), Task 3), the same measured-CPU-attribution
+        # term as blocked/startup/helper-cpu, closing the additive model over
+        # the whole process tree rather than just the guest.
+        duration_shares["supervisor-cpu"] = (
+            statistics.median(evidence.supervisor_self_cpu_ns for evidence in additive)
+            / untraced_cpu
+        )
         if any(value < 0 or value > 1 for value in duration_shares.values()):
             raise BudgetError("duration evidence does not reconcile to untraced CPU")
         for name, basis in (
@@ -2033,6 +2123,7 @@ def analyze(records: Sequence[RunRecord]) -> DecisionRecord:
             ("blocked-cpu", "low-tax-measured-cpu-attribution-over-untraced-cpu"),
             ("startup-cpu", "low-tax-measured-cpu-attribution-over-untraced-cpu"),
             ("helper-cpu", "low-tax-measured-cpu-attribution-over-untraced-cpu"),
+            ("supervisor-cpu", "low-tax-measured-cpu-attribution-over-untraced-cpu"),
         ):
             if duration_shares[name] >= 0.30:
                 return DecisionRecord(
@@ -2153,6 +2244,15 @@ def _append_jsonl(path: pathlib.Path, value: object) -> None:
         os.close(fd)
 
 
+def _supervisor_json(supervisor: SupervisorRecord | None) -> object:
+    if supervisor is None:
+        return None
+    return {
+        "self_cpu_ns": supervisor.self_cpu_ns,
+        "children_cpu_ns": supervisor.children_cpu_ns,
+    }
+
+
 def _profile_json(profile: ProfileRun | None) -> object:
     if profile is None:
         return None
@@ -2166,7 +2266,8 @@ def _profile_json(profile: ProfileRun | None) -> object:
                 "values": dict(thread.values),
             }
             for thread in profile.threads
-        ]
+        ],
+        "supervisor": _supervisor_json(profile.supervisor),
     }
 
 
@@ -2245,10 +2346,21 @@ def _string(value: object, name: str) -> str:
     return value
 
 
+def _parse_supervisor_json(value: object) -> SupervisorRecord | None:
+    if value is None:
+        return None
+    raw = _exact_mapping(value, {"self_cpu_ns", "children_cpu_ns"}, "supervisor")
+    return SupervisorRecord(
+        _nonnegative_int(raw["self_cpu_ns"], "supervisor self_cpu_ns"),
+        _nonnegative_int(raw["children_cpu_ns"], "supervisor children_cpu_ns"),
+    )
+
+
 def _parse_profile_json(value: object) -> ProfileRun | None:
     if value is None:
         return None
-    raw = _exact_mapping(value, {"threads"}, "profile")
+    raw = _exact_mapping(value, {"threads", "supervisor"}, "profile")
+    supervisor = _parse_supervisor_json(raw["supervisor"])
     threads_raw = raw["threads"]
     if not isinstance(threads_raw, list):
         raise BudgetError("profile threads must be an array")
@@ -2297,9 +2409,13 @@ def _parse_profile_json(value: object) -> ProfileRun | None:
         )
     if len(profile_versions) > 1:
         raise BudgetError("mixed native profile contract versions across thread groups")
-    profile = ProfileRun(
-        tuple(threads), version=profile_versions.pop() if profile_versions else 1
-    )
+    resolved_version = profile_versions.pop() if profile_versions else 1
+    if supervisor is not None and resolved_version != 2:
+        raise BudgetError(
+            "supervisor record requires a NATIVEPERF v2 profile: "
+            f"profile is v{resolved_version}"
+        )
+    profile = ProfileRun(tuple(threads), version=resolved_version, supervisor=supervisor)
     validate_profile(profile)
     return profile
 
