@@ -162,6 +162,10 @@ pub(crate) fn begin_guest_exec(
     max_traps: usize,
     plan: &crate::page_profile::ExecutionPlan,
 ) -> anyhow::Result<()> {
+    emit_lifecycle(
+        unsafe { libc::getpid() },
+        crate::probes::DsrCacheLifecyclePhase::HostSelfReexecCapsulePrepareBegin,
+    );
     let executable = std::env::current_exe()?;
     let native_page_profile = match plan.page_geometry.native_profile {
         Some(carrick_spec::NativePageProfile::Native16k) => {
@@ -294,6 +298,10 @@ fn exec_capsule(payload: NativeExecCapsuleV1, nonce: [u8; 16]) -> anyhow::Result
         .chain(std::iter::once(std::ptr::null()))
         .collect::<Vec<_>>();
 
+    emit_lifecycle(
+        unsafe { libc::getpid() },
+        crate::probes::DsrCacheLifecyclePhase::HostSelfReexecBegin,
+    );
     unsafe {
         libc::execve(executable_c.as_ptr(), argv_ptrs.as_ptr(), env_ptrs.as_ptr());
     }
@@ -336,9 +344,18 @@ fn restore_host_fd_flags(prepared: &[(i32, i32)]) {
 }
 
 pub(crate) fn resume(fd: RawFd, nonce_hex: &str) -> anyhow::Result<crate::NativeSelfReexecOutcome> {
+    let current_pid = unsafe { libc::getpid() };
+    emit_lifecycle(
+        current_pid,
+        crate::probes::DsrCacheLifecyclePhase::HostSelfReexecEnd,
+    );
+    emit_lifecycle(
+        current_pid,
+        crate::probes::DsrCacheLifecyclePhase::HostSelfReexecCapsuleBegin,
+    );
     let nonce = decode_nonce(nonce_hex)?;
     let payload = read_capsule_once(fd, nonce)?;
-    let current_pid = unsafe { libc::getpid() as u32 };
+    let current_pid = current_pid as u32;
     if payload.producer_pid != current_pid {
         anyhow::bail!(
             "native self-reexec changed PID from {} to {}",
@@ -353,6 +370,10 @@ pub(crate) fn resume(fd: RawFd, nonce_hex: &str) -> anyhow::Result<crate::Native
     unsafe {
         libc::close(fd);
     }
+    emit_lifecycle(
+        current_pid as i32,
+        crate::probes::DsrCacheLifecyclePhase::HostSelfReexecCapsuleEnd,
+    );
     match payload.purpose {
         NativeExecCapsulePurposeV1::PidProbe => Ok(crate::NativeSelfReexecOutcome::PidProbe {
             before: payload.producer_pid,
@@ -363,11 +384,19 @@ pub(crate) fn resume(fd: RawFd, nonce_hex: &str) -> anyhow::Result<crate::Native
                 .guest_exec
                 .ok_or_else(|| anyhow::anyhow!("native guest exec capsule has no guest state"))?;
             adopt_xsig(&guest.xsig)?;
+            emit_lifecycle(
+                current_pid as i32,
+                crate::probes::DsrCacheLifecyclePhase::HostSelfReexecRestoreBegin,
+            );
             let exit_code =
                 crate::native_darwin::resume_guest_from_capsule(guest, payload.argv, payload.env)?;
             Ok(crate::NativeSelfReexecOutcome::GuestExit(exit_code))
         }
     }
+}
+
+fn emit_lifecycle(tid: i32, phase: crate::probes::DsrCacheLifecyclePhase) {
+    crate::probes::dsr_cache_lifecycle(tid, phase, 0, 0, 0);
 }
 
 fn snapshot_xsig() -> anyhow::Result<NativeReexecXsigV1> {
