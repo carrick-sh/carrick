@@ -668,6 +668,23 @@ pub struct AddressSpace {
     ro_spans: Vec<crate::elf::RoSpan>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryRegionMetadata {
+    pub start: carrick_guest_mem::GuestVa,
+    pub end: carrick_guest_mem::GuestVa,
+    pub perms: SegmentPerms,
+    pub shared: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddressSpaceMetadata {
+    pub entry: carrick_guest_mem::GuestVa,
+    pub initial_stack_pointer: carrick_guest_mem::GuestVa,
+    pub linux_auxv_image: Vec<u8>,
+    pub regions: Vec<MemoryRegionMetadata>,
+    pub ro_spans: Vec<crate::elf::RoSpan>,
+}
+
 #[derive(Clone, Copy)]
 enum LoadRegionShape {
     HvfMerged,
@@ -736,6 +753,23 @@ pub enum AddressSpaceError {
         other_start: u64,
         other_end: u64,
     },
+    #[error("metadata memory region must have start before end, got 0x{start:x}..0x{end:x}")]
+    InvalidMetadataRegion { start: u64, end: u64 },
+    #[error(
+        "metadata initial stack pointer 0x{stack_pointer:x} lies in {writable_region_count} writable regions, expected exactly one"
+    )]
+    MetadataStackPointerNotWritable {
+        stack_pointer: u64,
+        writable_region_count: usize,
+    },
+    #[error("metadata read-only span at 0x{start:x} is empty")]
+    MetadataRoSpanEmpty { start: u64 },
+    #[error("metadata read-only span 0x{start:x}..+0x{len:x} is not aligned to 4 KiB pages")]
+    MetadataRoSpanUnaligned { start: u64, len: u64 },
+    #[error("metadata read-only span at 0x{start:x} with size 0x{len:x} overflows")]
+    MetadataRoSpanOverflow { start: u64, len: u64 },
+    #[error("metadata read-only span 0x{start:x}..0x{end:x} is not contained in a readable region")]
+    MetadataRoSpanNotReadable { start: u64, end: u64 },
     #[error("memory region at 0x{start:x} with size {size} overflows")]
     RegionOverflow { start: u64, size: u64 },
     #[error("memory region size {0} does not fit this host")]
@@ -997,6 +1031,83 @@ impl AddressSpace {
             linux_auxv_image: Vec::new(),
             ro_spans: Vec::new(),
         })
+    }
+
+    pub fn from_metadata(metadata: AddressSpaceMetadata) -> Result<Self, AddressSpaceError> {
+        const PAGE_SIZE: u64 = 0x1000;
+
+        let AddressSpaceMetadata {
+            entry,
+            initial_stack_pointer,
+            linux_auxv_image,
+            regions,
+            ro_spans,
+        } = metadata;
+
+        let mut memory_regions = Vec::with_capacity(regions.len());
+        for region in regions {
+            let start = region.start.raw();
+            let end = region.end.raw();
+            if start >= end {
+                return Err(AddressSpaceError::InvalidMetadataRegion { start, end });
+            }
+            memory_regions.push(MemoryRegion {
+                start,
+                end,
+                perms: region.perms,
+                shared: region.shared,
+                bytes: Vec::new(),
+            });
+        }
+
+        let mut image = Self::from_regions(entry.raw(), memory_regions)?;
+        let stack_pointer = initial_stack_pointer.raw();
+        let writable_region_count = image
+            .regions
+            .iter()
+            .filter(|region| {
+                region.perms.write && stack_pointer >= region.start && stack_pointer < region.end
+            })
+            .count();
+        if writable_region_count != 1 {
+            return Err(AddressSpaceError::MetadataStackPointerNotWritable {
+                stack_pointer,
+                writable_region_count,
+            });
+        }
+
+        for span in &ro_spans {
+            if span.len == 0 {
+                return Err(AddressSpaceError::MetadataRoSpanEmpty { start: span.start });
+            }
+            if !span.start.is_multiple_of(PAGE_SIZE) || !span.len.is_multiple_of(PAGE_SIZE) {
+                return Err(AddressSpaceError::MetadataRoSpanUnaligned {
+                    start: span.start,
+                    len: span.len,
+                });
+            }
+            let end = span.start.checked_add(span.len).ok_or(
+                AddressSpaceError::MetadataRoSpanOverflow {
+                    start: span.start,
+                    len: span.len,
+                },
+            )?;
+            if !image
+                .regions
+                .iter()
+                .any(|region| region.perms.read && span.start >= region.start && end <= region.end)
+            {
+                return Err(AddressSpaceError::MetadataRoSpanNotReadable {
+                    start: span.start,
+                    end,
+                });
+            }
+        }
+
+        image.initial_stack_pointer = Some(stack_pointer);
+        image.linux_auxv_image = linux_auxv_image;
+        image.ro_spans = ro_spans;
+        Ok(image)
     }
 
     /// The exact serialized auxv byte image written to the guest stack, for
@@ -3190,6 +3301,245 @@ mod arena_size_tests {
         assert_eq!(resolve_arena_size(Some(u64::MAX)), LINUX_MMAP_SIZE_MAX);
         // The arena never collides with the interpreter base.
         const { assert!(LINUX_MMAP_BASE + LINUX_MMAP_SIZE_MAX <= LINUX_INTERPRETER_BASE) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::elf::RoSpan;
+    use carrick_guest_mem::GuestVa;
+
+    fn region(
+        start: u64,
+        end: u64,
+        read: bool,
+        write: bool,
+        execute: bool,
+    ) -> MemoryRegionMetadata {
+        MemoryRegionMetadata {
+            start: GuestVa(start),
+            end: GuestVa(end),
+            perms: SegmentPerms {
+                read,
+                write,
+                execute,
+            },
+            shared: false,
+        }
+    }
+
+    fn valid_metadata() -> AddressSpaceMetadata {
+        AddressSpaceMetadata {
+            entry: GuestVa(0x1000),
+            initial_stack_pointer: GuestVa(0x8ff0),
+            linux_auxv_image: vec![1, 2, 3, 4],
+            regions: vec![
+                MemoryRegionMetadata {
+                    start: GuestVa(0x1000),
+                    end: GuestVa(0x2000),
+                    perms: SegmentPerms {
+                        read: true,
+                        write: false,
+                        execute: true,
+                    },
+                    shared: false,
+                },
+                MemoryRegionMetadata {
+                    start: GuestVa(0x8000),
+                    end: GuestVa(0x9000),
+                    perms: SegmentPerms {
+                        read: true,
+                        write: true,
+                        execute: false,
+                    },
+                    shared: false,
+                },
+            ],
+            ro_spans: vec![RoSpan {
+                start: 0x1000,
+                len: 0x1000,
+                exec: true,
+            }],
+        }
+    }
+
+    #[test]
+    fn address_space_metadata_reconstructs_transport_neutral_view() {
+        let image = AddressSpace::from_metadata(valid_metadata()).expect("valid metadata");
+
+        assert_eq!(image.entry(), 0x1000);
+        assert_eq!(image.initial_stack_pointer(), Some(0x8ff0));
+        assert_eq!(image.linux_auxv_image(), &[1, 2, 3, 4]);
+        assert_eq!(image.ro_spans(), valid_metadata().ro_spans);
+        assert_eq!(image.regions().len(), 2);
+        assert_eq!(
+            (
+                image.regions()[0].start,
+                image.regions()[0].end,
+                image.regions()[0].perms,
+                image.regions()[0].shared,
+            ),
+            (
+                0x1000,
+                0x2000,
+                SegmentPerms {
+                    read: true,
+                    write: false,
+                    execute: true,
+                },
+                false,
+            )
+        );
+        assert_eq!(
+            (
+                image.regions()[1].start,
+                image.regions()[1].end,
+                image.regions()[1].perms,
+                image.regions()[1].shared,
+            ),
+            (
+                0x8000,
+                0x9000,
+                SegmentPerms {
+                    read: true,
+                    write: true,
+                    execute: false,
+                },
+                false,
+            )
+        );
+        assert!(
+            image
+                .regions()
+                .iter()
+                .all(|region| region.bytes().is_empty())
+        );
+    }
+
+    #[test]
+    fn address_space_metadata_sorts_regions_canonically() {
+        let mut metadata = valid_metadata();
+        metadata.regions.reverse();
+
+        let image = AddressSpace::from_metadata(metadata).expect("valid metadata");
+
+        assert_eq!(image.regions()[0].start, 0x1000);
+        assert_eq!(image.regions()[1].start, 0x8000);
+    }
+
+    #[test]
+    fn address_space_metadata_rejects_overlapping_regions() {
+        let mut metadata = valid_metadata();
+        metadata
+            .regions
+            .push(region(0x1800, 0x2800, true, false, false));
+
+        assert!(matches!(
+            AddressSpace::from_metadata(metadata),
+            Err(AddressSpaceError::OverlappingRegion { .. })
+        ));
+    }
+
+    #[test]
+    fn address_space_metadata_rejects_empty_or_inverted_regions() {
+        for invalid in [
+            region(0x3000, 0x3000, true, false, false),
+            region(0x4000, 0x3000, true, false, false),
+        ] {
+            let mut metadata = valid_metadata();
+            metadata.regions.push(invalid);
+
+            assert!(matches!(
+                AddressSpace::from_metadata(metadata),
+                Err(AddressSpaceError::InvalidMetadataRegion { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn address_space_metadata_rejects_stack_pointer_outside_writable_region() {
+        let mut metadata = valid_metadata();
+        metadata.initial_stack_pointer = GuestVa(0x7000);
+
+        assert!(matches!(
+            AddressSpace::from_metadata(metadata),
+            Err(AddressSpaceError::MetadataStackPointerNotWritable { .. })
+        ));
+    }
+
+    #[test]
+    fn address_space_metadata_accepts_ro_span_in_readable_writable_merged_region() {
+        let metadata = AddressSpaceMetadata {
+            entry: GuestVa(0x4000),
+            initial_stack_pointer: GuestVa(0x5ff0),
+            linux_auxv_image: Vec::new(),
+            regions: vec![region(0x4000, 0x6000, true, true, true)],
+            ro_spans: vec![RoSpan {
+                start: 0x4000,
+                len: 0x1000,
+                exec: true,
+            }],
+        };
+
+        let image = AddressSpace::from_metadata(metadata).expect("valid merged region metadata");
+        assert_eq!(image.ro_spans()[0].start, 0x4000);
+    }
+
+    #[test]
+    fn address_space_metadata_rejects_ro_span_outside_readable_regions() {
+        let mut metadata = valid_metadata();
+        metadata.ro_spans[0].start = 0x2000;
+
+        assert!(matches!(
+            AddressSpace::from_metadata(metadata),
+            Err(AddressSpaceError::MetadataRoSpanNotReadable { .. })
+        ));
+    }
+
+    #[test]
+    fn address_space_metadata_rejects_unaligned_ro_span() {
+        for invalid in [
+            RoSpan {
+                start: 0x1001,
+                len: 0x1000,
+                exec: true,
+            },
+            RoSpan {
+                start: 0x1000,
+                len: 0x1001,
+                exec: true,
+            },
+        ] {
+            let mut metadata = valid_metadata();
+            metadata.ro_spans = vec![invalid];
+
+            assert!(matches!(
+                AddressSpace::from_metadata(metadata),
+                Err(AddressSpaceError::MetadataRoSpanUnaligned { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn address_space_metadata_rejects_empty_or_overflowing_ro_span() {
+        let mut empty = valid_metadata();
+        empty.ro_spans[0].len = 0;
+        assert!(matches!(
+            AddressSpace::from_metadata(empty),
+            Err(AddressSpaceError::MetadataRoSpanEmpty { .. })
+        ));
+
+        let mut overflowing = valid_metadata();
+        overflowing.ro_spans[0] = RoSpan {
+            start: u64::MAX - 0xfff,
+            len: 0x1000,
+            exec: false,
+        };
+        assert!(matches!(
+            AddressSpace::from_metadata(overflowing),
+            Err(AddressSpaceError::MetadataRoSpanOverflow { .. })
+        ));
     }
 }
 
