@@ -863,7 +863,7 @@ impl SyscallDispatcher {
                         let limit = LinuxRlimit::new(rlim_cur, rlim_max);
                         *slot = Some(limit);
                         if resource == LINUX_RLIMIT_CPU {
-                            arm_rlimit_cpu(limit);
+                            arm_rlimit_cpu(limit, this.async_signal_wake_owner());
                         }
                     }
                 }
@@ -877,7 +877,7 @@ static RLIMIT_CPU_GENERATION: AtomicU64 = AtomicU64::new(0);
 const RLIMIT_CPU_RECHECK_NS: u64 = 1_000_000;
 const RLIMIT_CPU_REPEAT_NS: u64 = 1_000_000_000;
 
-fn arm_rlimit_cpu(limit: LinuxRlimit) {
+fn arm_rlimit_cpu(limit: LinuxRlimit, wake_owner: crate::dispatch::AsyncSignalWakeOwner) {
     let generation = RLIMIT_CPU_GENERATION
         .fetch_add(1, Ordering::SeqCst)
         .wrapping_add(1);
@@ -887,10 +887,15 @@ fn arm_rlimit_cpu(limit: LinuxRlimit) {
     }
     let _ = std::thread::Builder::new()
         .name("carrick-rlimit-cpu".to_owned())
-        .spawn(move || enforce_rlimit_cpu(generation, soft, hard));
+        .spawn(move || enforce_rlimit_cpu(generation, soft, hard, wake_owner));
 }
 
-fn enforce_rlimit_cpu(generation: u64, soft_secs: u64, hard_secs: u64) {
+fn enforce_rlimit_cpu(
+    generation: u64,
+    soft_secs: u64,
+    hard_secs: u64,
+    wake_owner: crate::dispatch::AsyncSignalWakeOwner,
+) {
     let soft_ns = rlimit_cpu_secs_to_ns(soft_secs);
     let hard_ns = rlimit_cpu_secs_to_ns(hard_secs);
     let mut next_sigxcpu_ns = soft_ns;
@@ -902,13 +907,13 @@ fn enforce_rlimit_cpu(generation: u64, soft_secs: u64, hard_secs: u64) {
         if let Some(hard) = hard_ns
             && now >= hard
         {
-            publish_rlimit_cpu_signal(crate::linux_abi::LINUX_SIGKILL);
+            publish_rlimit_cpu_signal(wake_owner, crate::linux_abi::LINUX_SIGKILL);
             return;
         }
         if let Some(soft) = next_sigxcpu_ns
             && now >= soft
         {
-            publish_rlimit_cpu_signal(crate::linux_abi::LINUX_SIGXCPU);
+            publish_rlimit_cpu_signal(wake_owner, crate::linux_abi::LINUX_SIGXCPU);
             next_sigxcpu_ns = now.checked_add(RLIMIT_CPU_REPEAT_NS);
         }
         let next = [next_sigxcpu_ns, hard_ns]
@@ -932,18 +937,11 @@ fn rlimit_cpu_secs_to_ns(secs: u64) -> Option<u64> {
     }
 }
 
-#[cfg(feature = "platform-macos")]
-fn publish_rlimit_cpu_signal(signum: i32) {
-    crate::native_darwin::deliver_native_process_signal(signum);
-}
-
-#[cfg(any(
-    feature = "platform-linux",
-    feature = "platform-freebsd",
-    feature = "platform-netbsd"
-))]
-fn publish_rlimit_cpu_signal(signum: i32) {
-    crate::timer_delivery::deliver(signum);
+pub(crate) fn publish_rlimit_cpu_signal(
+    wake_owner: crate::dispatch::AsyncSignalWakeOwner,
+    signum: i32,
+) {
+    wake_owner.publish_process_signal(signum);
 }
 
 /// The resource limit carrick reports for `getrlimit`/`prlimit64`, honoring any

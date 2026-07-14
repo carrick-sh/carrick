@@ -115,6 +115,11 @@ pub struct SignalPump {
     /// and so it can give up and detach rather than `join()` forever.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     exited: std::sync::Arc<ExitSignal>,
+    /// Raised after pipe/kqueue installation and the first stable durable-state
+    /// reconciliation. Tests and fork/start ordering checks can wait for this
+    /// exact boundary instead of sleeping on scheduler timing.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    ready: std::sync::Arc<ExitSignal>,
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     handle: Option<std::thread::JoinHandle<()>>,
 }
@@ -147,11 +152,32 @@ impl ExitSignal {
     fn raised(&self) -> bool {
         self.flag.load(std::sync::atomic::Ordering::SeqCst)
     }
+
+    fn wait_timeout(&self, timeout: std::time::Duration) -> bool {
+        if self.raised() {
+            return true;
+        }
+        let guard = self.mu.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = self
+            .cv
+            .wait_timeout_while(guard, timeout, |_| !self.raised());
+        self.raised()
+    }
 }
 
 impl SignalPump {
     pub fn stop(mut self) {
         self.stop_inner();
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub fn wait_until_ready(&self, timeout: std::time::Duration) -> bool {
+        self.ready.wait_timeout(timeout)
+    }
+
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    pub fn wait_until_ready(&self, _timeout: std::time::Duration) -> bool {
+        true
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -237,6 +263,46 @@ pub fn spawn_signal_wake_pump(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn reconcile_durable_signal_state(
+    kicker: &dyn carrick_hal::VcpuRegistry,
+    futex: &dyn carrick_hal::PlatformFutex,
+) {
+    if crate::host_signal::has_process_pending()
+        || crate::host_signal::xsig_has_unblocked_for_self(carrick_abi::SigBlockMask::NONE)
+    {
+        // Process-directed pending state can be consumed by any guest thread.
+        // Xsignals remain durable in the shared ring until dispatch drains
+        // them, so a replaced/pre-start pipe edge cannot be their authority.
+        kicker.kick_all();
+        futex.notify_signal_pending();
+    }
+    for tid in crate::host_signal::pending_thread_tids() {
+        // Per-thread pending state is equally durable. Reconcile it to the
+        // target only, preserving the same wake precision as the event path.
+        let tid = carrick_hal::ThreadId::from_wire_key(tid);
+        kicker.kick(tid);
+        futex.notify_signal_pending_for(tid);
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn reconcile_durable_signal_state_until_stable(
+    kicker: &dyn carrick_hal::VcpuRegistry,
+    futex: &dyn carrick_hal::PlatformFutex,
+) -> u64 {
+    loop {
+        let before = crate::host_signal::signal_pump_publication_generation();
+        reconcile_durable_signal_state(kicker, futex);
+        let after = crate::host_signal::signal_pump_publication_generation();
+        if before == after {
+            return after;
+        }
+        // A publication raced the snapshot. Reconcile again so returning the
+        // observed sequence can never hide state published after our scan.
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn spawn_signal_pump_inner(
     kicker: std::sync::Arc<dyn carrick_hal::VcpuRegistry>,
     futex: std::sync::Arc<dyn carrick_hal::PlatformFutex>,
@@ -244,8 +310,10 @@ fn spawn_signal_pump_inner(
 ) -> SignalPump {
     let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     let exited = ExitSignal::new();
+    let ready = ExitSignal::new();
     let thread_running = std::sync::Arc::clone(&running);
     let thread_exited = std::sync::Arc::clone(&exited);
+    let thread_ready = std::sync::Arc::clone(&ready);
     let handle = std::thread::Builder::new()
         .name("carrick-signal-pump".to_owned())
         .spawn(move || {
@@ -308,7 +376,24 @@ fn spawn_signal_pump_inner(
             // itimer::next_ident), so a changed live_ident == a new arm.
             let mut registered_timer_ident = [0usize; crate::itimer::ITIMER_COUNT];
             let mut out = [crate::darwin_kqueue::Kevent::empty()];
+            // First-start/restart reconciliation is unconditional: durable
+            // state can predate this pump and therefore its local sequence.
+            let mut observed_publication =
+                reconcile_durable_signal_state_until_stable(kicker.as_ref(), futex.as_ref());
+            thread_ready.raise();
             while thread_running.load(std::sync::atomic::Ordering::SeqCst) {
+                // Pipes and kqueue user events are notifications, never the
+                // source of truth. Reconcile before the FIRST wait and every
+                // subsequent wait so pre-start publication, fork pipe
+                // replacement, and coalesced edges all converge on durable
+                // process/thread/xsignal state.
+                let published = crate::host_signal::signal_pump_publication_generation();
+                if published != observed_publication {
+                    observed_publication = reconcile_durable_signal_state_until_stable(
+                        kicker.as_ref(),
+                        futex.as_ref(),
+                    );
+                }
                 // Reconcile registered timers with the armed slots BEFORE waiting,
                 // so a just-armed (or re-armed) timer is registered in this
                 // thread's kevent context and fires into the wait below. The
@@ -458,29 +543,6 @@ fn spawn_signal_pump_inner(
                 if !thread_running.load(std::sync::atomic::Ordering::SeqCst) {
                     break;
                 }
-                let pending_threads = crate::host_signal::pending_thread_tids();
-                if crate::host_signal::has_process_pending()
-                    || crate::host_signal::xsig_has_unblocked_for_self(
-                        carrick_abi::SigBlockMask::NONE,
-                    )
-                {
-                    // A process-directed signal can be delivered by any guest
-                    // thread. Xsignals sit in the fork-shared ring until a vCPU
-                    // reaches dispatch context and drains them, so the pump must
-                    // also kick on the ring peek, not just on already-drained
-                    // pending bits.
-                    kicker.kick_all();
-                    futex.notify_signal_pending();
-                }
-                for tid in pending_threads {
-                    // A thread-directed signal belongs to one guest tid. Wake
-                    // only that vCPU / futex waiter; siblings stay parked.
-                    // (The pending table stores raw keys exported with
-                    // `ThreadId::raw` at the publish sites.)
-                    let tid = carrick_hal::ThreadId::from_wire_key(tid);
-                    kicker.kick(tid);
-                    futex.notify_signal_pending_for(tid);
-                }
             }
             crate::host_signal::clear_pump_kqueue(kq_fd);
         })
@@ -488,6 +550,7 @@ fn spawn_signal_pump_inner(
     SignalPump {
         running,
         exited,
+        ready,
         handle,
     }
 }
@@ -514,6 +577,156 @@ mod tests {
     // VcpuKicker is now the shared GenericVcpuRegistry; its register/kick/… are
     // VcpuRegistry trait methods, so bring the trait into scope.
     use carrick_hal::VcpuRegistry;
+
+    #[derive(Clone)]
+    struct CountingKick(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl carrick_hal::VcpuKick for CountingKick {
+        fn kick(&self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn pump_test_parts() -> (
+        std::sync::Arc<VcpuKicker>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<dyn carrick_hal::PlatformFutex>,
+    ) {
+        let registry = std::sync::Arc::new(VcpuKicker::new());
+        let kicks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        registry.register(
+            carrick_hal::ThreadId::synthetic_for_tests(0x7055),
+            Box::new(CountingKick(std::sync::Arc::clone(&kicks))),
+        );
+        let futex: std::sync::Arc<dyn carrick_hal::PlatformFutex> = std::sync::Arc::new(
+            crate::threaded_impl::hvf_futex(std::sync::Arc::new(crate::thread::FutexTable::new())),
+        );
+        (registry, kicks, futex)
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn wait_for_kick(kicks: &std::sync::atomic::AtomicUsize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while kicks.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "signal pump did not reconcile durable pending state"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn wake_pump_reconciles_process_pending_published_before_start() {
+        let _g = crate::host_signal::pump_state_test_guard();
+        crate::host_signal::reset_after_supervisor_fork();
+        crate::host_signal::clear_proc_pending();
+        carrick_signal_core::publish_process_signal(crate::linux_abi::LINUX_SIGINT);
+        let (registry, kicks, futex) = pump_test_parts();
+
+        let pump = spawn_signal_wake_pump(registry, futex);
+        wait_for_kick(&kicks);
+        pump.stop();
+        crate::host_signal::clear_proc_pending();
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn wake_pump_reconciles_xsignal_published_before_start() {
+        let _g = crate::host_signal::pump_state_test_guard();
+        crate::host_signal::reset_after_supervisor_fork();
+        carrick_signal_core::xsig::xsig_init();
+        let _ = carrick_signal_core::xsig::xsig_drain_for_self();
+        assert!(carrick_signal_core::xsig::xsig_enqueue(
+            std::process::id() as i32,
+            crate::linux_abi::LINUX_SIGUSR1,
+            crate::linux_abi::LINUX_SI_USER,
+            1,
+            0,
+            0,
+            0,
+        ));
+        let (registry, kicks, futex) = pump_test_parts();
+
+        let pump = spawn_signal_wake_pump(registry, futex);
+        wait_for_kick(&kicks);
+        pump.stop();
+        let _ = carrick_signal_core::xsig::xsig_drain_for_self();
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn wake_pump_reconciles_pending_when_start_replaces_old_pipe() {
+        let _g = crate::host_signal::pump_state_test_guard();
+        crate::host_signal::reset_after_supervisor_fork();
+        crate::host_signal::clear_proc_pending();
+        let _ = crate::host_signal::pump_install_pipe();
+        crate::host_signal::publish_process_signal(crate::linux_abi::LINUX_SIGINT);
+        let (registry, kicks, futex) = pump_test_parts();
+
+        let pump = spawn_signal_wake_pump(registry, futex);
+        wait_for_kick(&kicks);
+        pump.stop();
+        crate::host_signal::clear_proc_pending();
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn wake_pump_does_not_repeat_unchanged_process_pending_on_spurious_edge() {
+        let _g = crate::host_signal::pump_state_test_guard();
+        crate::host_signal::reset_after_supervisor_fork();
+        crate::host_signal::clear_proc_pending();
+        crate::host_signal::publish_process_signal(crate::linux_abi::LINUX_SIGINT);
+        let (registry, kicks, futex) = pump_test_parts();
+        let pump = spawn_signal_wake_pump(registry, futex);
+        wait_for_kick(&kicks);
+
+        crate::host_signal::wake_signal_pump_pipe();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(
+            kicks.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "unchanged durable pending state must not cause duplicate kicks"
+        );
+
+        pump.stop();
+        crate::host_signal::clear_proc_pending();
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn wake_pump_parks_when_thread_pending_remains_undeliverable() {
+        let _g = crate::host_signal::pump_state_test_guard();
+        crate::host_signal::reset_after_supervisor_fork();
+        let tid = carrick_hal::ThreadId::synthetic_for_tests(0x7055);
+        crate::host_signal::forget_thread(tid.raw());
+        crate::host_signal::publish_pending_for(tid.raw(), crate::linux_abi::LINUX_SIGUSR1);
+        let (registry, kicks, futex) = pump_test_parts();
+        let pump = spawn_signal_wake_pump(registry, futex);
+        wait_for_kick(&kicks);
+
+        // Leave the pending bit in place as a blocked/otherwise-undeliverable
+        // target would, then deliver unrelated pipe edges. The pump must park,
+        // not repeatedly kick the same unchanged state.
+        for _ in 0..8 {
+            crate::host_signal::wake_signal_pump_pipe();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(
+            kicks.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "undeliverable pending state must not make the pump spin"
+        );
+
+        pump.stop();
+        assert_eq!(
+            crate::host_signal::take_pending_for(tid.raw()),
+            crate::linux_abi::LINUX_SIGUSR1
+        );
+        crate::host_signal::forget_thread(tid.raw());
+    }
 
     // On non-macOS, handles carry no live id, so kicks are no-ops; we still
     // exercise the registry bookkeeping (register/unregister) here. On macOS
