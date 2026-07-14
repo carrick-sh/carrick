@@ -102,6 +102,10 @@ thread_local! {
         std::cell::RefCell<Vec<std::ops::Range<carrick_guest_mem::HostVa>>> = const {
             std::cell::RefCell::new(Vec::new())
         };
+    static NATIVE_TEST_REEXEC_LIFECYCLE:
+        std::cell::RefCell<Option<Vec<crate::probes::DsrCacheLifecyclePhase>>> = const {
+            std::cell::RefCell::new(None)
+        };
 }
 
 #[cfg(test)]
@@ -138,6 +142,18 @@ fn set_native_test_vvar_words(words: Option<Vec<(usize, u64)>>) {
 #[cfg(test)]
 fn take_native_test_supplemental_rollbacks() -> Vec<std::ops::Range<carrick_guest_mem::HostVa>> {
     NATIVE_TEST_SUPPLEMENTAL_ROLLBACKS.with(|slot| std::mem::take(&mut *slot.borrow_mut()))
+}
+
+#[cfg(test)]
+fn set_native_reexec_lifecycle_capture(enabled: bool) {
+    NATIVE_TEST_REEXEC_LIFECYCLE.with(|slot| {
+        *slot.borrow_mut() = enabled.then(Vec::new);
+    });
+}
+
+#[cfg(test)]
+fn take_native_reexec_lifecycle_capture() -> Vec<crate::probes::DsrCacheLifecyclePhase> {
+    NATIVE_TEST_REEXEC_LIFECYCLE.with(|slot| slot.borrow_mut().take().unwrap_or_default())
 }
 
 /// Set by the exec teardown at its success point (BEFORE it lowers the
@@ -899,12 +915,23 @@ pub(crate) fn resume_guest_from_capsule(
         env,
     );
     native_reexec_lifecycle(crate::probes::DsrCacheLifecyclePhase::HostSelfReexecResetEnd);
-    native_reexec_lifecycle(crate::probes::DsrCacheLifecyclePhase::HostSelfReexecGuestEntry);
-    run_image_in_current_process(resumed.source, dispatcher, max_traps, &plan)
-        .map_err(anyhow::Error::from)
+    run_image_in_current_process(
+        resumed.source,
+        dispatcher,
+        max_traps,
+        &plan,
+        NativeCurrentProcessEntry::SelfReexecRestore,
+    )
+    .map_err(anyhow::Error::from)
 }
 
 fn native_reexec_lifecycle(phase: crate::probes::DsrCacheLifecyclePhase) {
+    #[cfg(test)]
+    NATIVE_TEST_REEXEC_LIFECYCLE.with(|slot| {
+        if let Some(phases) = slot.borrow_mut().as_mut() {
+            phases.push(phase);
+        }
+    });
     let tid = unsafe { libc::getpid() };
     crate::probes::dsr_cache_lifecycle(tid, phase, 0, 0, 0);
 }
@@ -1090,6 +1117,7 @@ fn run_image_in_child(
             dispatcher,
             max_traps,
             plan,
+            NativeCurrentProcessEntry::Initial,
         ) {
             Ok(code) => unsafe { libc::_exit(code) },
             Err(err) => {
@@ -1130,12 +1158,13 @@ fn run_image_in_current_process(
     dispatcher: SyscallDispatcher,
     max_traps: usize,
     plan: &ExecutionPlan,
+    process_entry: NativeCurrentProcessEntry,
 ) -> Result<i32, RuntimeError> {
     let initial_sp = source.image().initial_stack_pointer().ok_or_else(|| {
         RuntimeError::Unsupported("native Darwin image has no initial stack".to_string())
     })?;
     let entry = source.image().entry();
-    let (memory, image) = map_and_release_native_image_source(source, plan)?;
+    let (memory, image) = map_current_process_image_source(source, plan, process_entry)?;
     let memory = Arc::new(parking_lot::Mutex::new(memory));
     let _ = crate::ulock::preinit_waiter_table();
     // PID-namespace launch placement (container path only; `run-elf` never
@@ -1238,15 +1267,7 @@ fn map_native_image_source(
             relative_relocations,
         ),
         NativeImageSource::Prepared(prepared) => {
-            native_reexec_lifecycle(
-                crate::probes::DsrCacheLifecyclePhase::HostSelfReexecPreparedMapBegin,
-            );
-            let mapped =
-                NativeMappedMemory::map_prepared_for_plan(prepared, native_memory_layout(), plan)?;
-            native_reexec_lifecycle(
-                crate::probes::DsrCacheLifecyclePhase::HostSelfReexecPreparedMapEnd,
-            );
-            Ok(mapped)
+            NativeMappedMemory::map_prepared_for_plan(prepared, native_memory_layout(), plan)
         }
     }
 }
@@ -1263,6 +1284,24 @@ fn map_and_release_native_image_source(
     // owned source drops here and closes the validated artifact as well.
     let image = source.into_image();
     Ok((memory, image))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeCurrentProcessEntry {
+    Initial,
+    SelfReexecRestore,
+}
+
+fn map_current_process_image_source(
+    source: NativeImageSource,
+    plan: &ExecutionPlan,
+    process_entry: NativeCurrentProcessEntry,
+) -> Result<(NativeMappedMemory, AddressSpace), RuntimeError> {
+    let mapped = map_and_release_native_image_source(source, plan)?;
+    if process_entry == NativeCurrentProcessEntry::SelfReexecRestore {
+        native_reexec_lifecycle(crate::probes::DsrCacheLifecyclePhase::HostSelfReexecGuestEntry);
+    }
+    Ok(mapped)
 }
 
 enum NativeThreadStart {
@@ -5904,6 +5943,13 @@ struct NativeByteRegionOptions {
 }
 
 #[derive(Clone, Copy)]
+struct PreparedRegionMapping {
+    mapped: *mut libc::c_void,
+    mapped_length: usize,
+    logical_length: u64,
+}
+
+#[derive(Clone, Copy)]
 struct NativeExclusiveReservation {
     location: NativeExclusiveLocation,
     observed: u64,
@@ -6211,6 +6257,43 @@ impl NativeMappedMemory {
         let mut regions = Vec::new();
         let mut rollback =
             NativeMappingRollback::new(rollback_plan, page_sizes.host, image.regions().len() + 5)?;
+        let prepared_region_mappings = match backing {
+            NativeImageBacking::AnonymousBytes => None,
+            NativeImageBacking::Prepared(prepared) => {
+                native_reexec_lifecycle(
+                    crate::probes::DsrCacheLifecyclePhase::HostSelfReexecPreparedMapBegin,
+                );
+                let mappings = image
+                    .regions()
+                    .iter()
+                    .enumerate()
+                    .map(|(region_index, region)| {
+                        let file_backing = prepared
+                            .backings
+                            .get(region_index)
+                            .copied()
+                            .ok_or_else(|| {
+                                RuntimeError::Unsupported(format!(
+                                    "prepared-map: missing file backing for region {region_index}"
+                                ))
+                            })?;
+                        map_prepared_region_extent(
+                            region_index,
+                            region,
+                            file_backing,
+                            prepared,
+                            exec_map_dsr_tid,
+                            &native_layout,
+                            &mut rollback,
+                        )
+                    })
+                    .collect::<Result<Vec<_>, RuntimeError>>()?;
+                native_reexec_lifecycle(
+                    crate::probes::DsrCacheLifecyclePhase::HostSelfReexecPreparedMapEnd,
+                );
+                Some(mappings)
+            }
+        };
         for (region_index, region) in image.regions().iter().enumerate() {
             match backing {
                 NativeImageBacking::AnonymousBytes => map_region(
@@ -6220,26 +6303,23 @@ impl NativeMappedMemory {
                     &native_layout,
                     &mut rollback,
                 )?,
-                NativeImageBacking::Prepared(prepared) => {
-                    let file_backing =
-                        prepared
-                            .backings
-                            .get(region_index)
-                            .copied()
-                            .ok_or_else(|| {
-                                RuntimeError::Unsupported(format!(
-                                    "prepared-map: missing file backing for region {region_index}"
-                                ))
-                            })?;
-                    map_prepared_region(
-                        region_index,
+                NativeImageBacking::Prepared(_) => {
+                    let mapped = prepared_region_mappings
+                        .as_ref()
+                        .and_then(|mappings| mappings.get(region_index))
+                        .ok_or_else(|| {
+                            RuntimeError::Unsupported(format!(
+                                "prepared-map: missing mapped region {region_index}"
+                            ))
+                        })?;
+                    finalize_image_region_mapping(
                         region,
-                        file_backing,
-                        prepared,
+                        mapped.mapped,
+                        mapped.mapped_length,
+                        mapped.logical_length,
                         exec_map_dsr_tid,
-                        &native_layout,
-                        &mut rollback,
-                    )?
+                        true,
+                    )?;
                 }
             };
             if region.start == NATIVE_DARWIN_VDSO_BASE && region.perms.execute {
@@ -8595,7 +8675,7 @@ fn map_region(
     Ok(())
 }
 
-fn map_prepared_region(
+fn map_prepared_region_extent(
     region_index: usize,
     region: &MemoryRegion,
     backing: PreparedImageFileBacking,
@@ -8603,7 +8683,7 @@ fn map_prepared_region(
     exec_map_dsr_tid: Option<crate::thread::ThreadId>,
     native_layout: &NativeLayout,
     rollback: &mut NativeMappingRollback,
-) -> Result<(), RuntimeError> {
+) -> Result<PreparedRegionMapping, RuntimeError> {
     #[cfg(test)]
     if region_index == 1
         && take_native_prepared_mapping_failpoint(NativePreparedMappingFailpoint::SecondRegionMap)
@@ -8681,8 +8761,11 @@ fn map_prepared_region(
         0,
     );
 
-    finalize_image_region_mapping(region, mapped, length, length_u64, exec_map_dsr_tid, true)?;
-    Ok(())
+    Ok(PreparedRegionMapping {
+        mapped,
+        mapped_length: length,
+        logical_length: length_u64,
+    })
 }
 
 fn map_bytes_region(
@@ -14056,6 +14139,124 @@ mod tests {
             );
             assert_eq!(loader_calls.get(), 0);
             assert_eq!(unsafe { libc::fcntl(artifact_fd, libc::F_GETFD) }, -1);
+            set_native_test_vvar_words(None);
+        });
+    }
+
+    #[test]
+    fn native_prepared_resume_lifecycle_nests_validate_and_map_before_restore_close() {
+        fork_test(|| {
+            set_native_test_vvar_words(Some(Vec::new()));
+            let (image, relocations, plan) = native_prepared_mapping_fixture(false);
+            let record = native_prepared_resume_record(
+                &image,
+                &relocations,
+                plan.page_geometry.host_page_size,
+            );
+            set_native_reexec_lifecycle_capture(true);
+            let resumed =
+                select_resumed_image(Some(record), [0; 32], || Err(crate::linux_abi::LINUX_EIO))
+                    .expect("select prepared image");
+            let _mapped = map_current_process_image_source(
+                resumed.source,
+                &plan,
+                NativeCurrentProcessEntry::SelfReexecRestore,
+            )
+            .expect("map prepared image");
+            assert_eq!(
+                take_native_reexec_lifecycle_capture(),
+                vec![
+                    crate::probes::DsrCacheLifecyclePhase::HostSelfReexecPreparedValidateBegin,
+                    crate::probes::DsrCacheLifecyclePhase::HostSelfReexecPreparedValidateEnd,
+                    crate::probes::DsrCacheLifecyclePhase::HostSelfReexecPreparedMapBegin,
+                    crate::probes::DsrCacheLifecyclePhase::HostSelfReexecPreparedMapEnd,
+                    crate::probes::DsrCacheLifecyclePhase::HostSelfReexecGuestEntry,
+                ]
+            );
+            set_native_test_vvar_words(None);
+        });
+    }
+
+    #[test]
+    fn native_initial_mapping_does_not_close_self_reexec_restore() {
+        fork_test(|| {
+            set_native_test_vvar_words(Some(Vec::new()));
+            let (image, relative_relocations, plan) = native_prepared_mapping_fixture(false);
+            set_native_reexec_lifecycle_capture(true);
+            let _mapped = map_current_process_image_source(
+                NativeImageSource::Legacy {
+                    image,
+                    relative_relocations,
+                },
+                &plan,
+                NativeCurrentProcessEntry::Initial,
+            )
+            .expect("map initial image");
+
+            assert_eq!(take_native_reexec_lifecycle_capture(), Vec::new());
+            set_native_test_vvar_words(None);
+        });
+    }
+
+    #[test]
+    fn native_prepared_map_phase_is_incomplete_on_second_extent_failure() {
+        fork_test(|| {
+            set_native_test_vvar_words(Some(Vec::new()));
+            let (image, relocations, plan) = native_prepared_mapping_fixture(false);
+            let validated = validated_prepared_mapping_fixture(
+                &image,
+                &relocations,
+                plan.page_geometry.host_page_size,
+            );
+            set_native_prepared_mapping_failpoint(Some(
+                NativePreparedMappingFailpoint::SecondRegionMap,
+            ));
+            set_native_reexec_lifecycle_capture(true);
+            assert!(
+                NativeMappedMemory::map_prepared_for_plan(
+                    &validated,
+                    native_memory_layout(),
+                    &plan,
+                )
+                .is_err()
+            );
+            assert_eq!(
+                take_native_reexec_lifecycle_capture(),
+                vec![crate::probes::DsrCacheLifecyclePhase::HostSelfReexecPreparedMapBegin]
+            );
+            set_native_test_vvar_words(None);
+        });
+    }
+
+    #[test]
+    fn native_prepared_map_phase_completes_before_late_finalization_failure() {
+        fork_test(|| {
+            set_native_test_vvar_words(Some(Vec::new()));
+            let (image, relocations, plan) = native_prepared_mapping_fixture(false);
+            let validated = validated_prepared_mapping_fixture(
+                &image,
+                &relocations,
+                plan.page_geometry.host_page_size,
+            );
+            set_native_prepared_mapping_failpoint(Some(
+                NativePreparedMappingFailpoint::FinalProtection,
+            ));
+            set_native_reexec_lifecycle_capture(true);
+            assert!(
+                NativeMappedMemory::map_prepared_for_plan(
+                    &validated,
+                    native_memory_layout(),
+                    &plan,
+                )
+                .is_err()
+            );
+            assert_eq!(
+                take_native_reexec_lifecycle_capture(),
+                vec![
+                    crate::probes::DsrCacheLifecyclePhase::HostSelfReexecPreparedMapBegin,
+                    crate::probes::DsrCacheLifecyclePhase::HostSelfReexecPreparedMapEnd,
+                ]
+            );
             set_native_test_vvar_words(None);
         });
     }

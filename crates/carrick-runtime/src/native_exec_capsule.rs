@@ -265,14 +265,10 @@ fn attach_prepared_image_inner(
 ) -> Option<crate::native_prepared_image::PreparedImageArtifact> {
     #[cfg(not(test))]
     let _ = failpoint;
-    #[cfg(test)]
-    if failpoint == Some(PreparedImageFailpoint::Ineligible) {
-        tracing::debug!(
-            reason = "test failpoint",
-            "native prepared image is ineligible; using legacy self-reexec reload"
-        );
-        return None;
-    }
+    emit_lifecycle(
+        unsafe { libc::getpid() },
+        crate::probes::DsrCacheLifecyclePhase::HostSelfReexecPreparedBuildBegin,
+    );
     #[cfg(test)]
     if failpoint == Some(PreparedImageFailpoint::ArtifactCreation) {
         tracing::warn!(
@@ -281,30 +277,37 @@ fn attach_prepared_image_inner(
         );
         return None;
     }
-
+    #[cfg(test)]
+    let preparation = if failpoint == Some(PreparedImageFailpoint::Ineligible) {
+        Ok(
+            crate::native_prepared_image::PreparedImageDisposition::Ineligible(
+                crate::native_prepared_image::PreparedImageIneligibleReason::SharedRegion {
+                    index: 0,
+                },
+            ),
+        )
+    } else {
+        crate::native_prepared_image::prepare(image, relative_relocations, host_page_size)
+    };
+    #[cfg(not(test))]
+    let preparation =
+        crate::native_prepared_image::prepare(image, relative_relocations, host_page_size);
+    let disposition = match preparation {
+        Ok(disposition) => disposition,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "native prepared image construction failed; using legacy self-reexec reload"
+            );
+            return None;
+        }
+    };
     emit_lifecycle(
         unsafe { libc::getpid() },
-        crate::probes::DsrCacheLifecyclePhase::HostSelfReexecPreparedBuildBegin,
+        crate::probes::DsrCacheLifecyclePhase::HostSelfReexecPreparedBuildEnd,
     );
-    let disposition =
-        match crate::native_prepared_image::prepare(image, relative_relocations, host_page_size) {
-            Ok(disposition) => disposition,
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    "native prepared image construction failed; using legacy self-reexec reload"
-                );
-                return None;
-            }
-        };
     let artifact = match disposition {
-        crate::native_prepared_image::PreparedImageDisposition::Prepared(artifact) => {
-            emit_lifecycle(
-                unsafe { libc::getpid() },
-                crate::probes::DsrCacheLifecyclePhase::HostSelfReexecPreparedBuildEnd,
-            );
-            artifact
-        }
+        crate::native_prepared_image::PreparedImageDisposition::Prepared(artifact) => artifact,
         crate::native_prepared_image::PreparedImageDisposition::Ineligible(reason) => {
             tracing::debug!(
                 ?reason,
@@ -493,6 +496,22 @@ thread_local! {
     static LAST_PREEXEC_VALIDATION_ARTIFACT: std::cell::Cell<Option<(RawFd, bool)>> = const {
         std::cell::Cell::new(None)
     };
+    static NATIVE_EXEC_CAPSULE_LIFECYCLE_CAPTURE:
+        std::cell::RefCell<Option<Vec<crate::probes::DsrCacheLifecyclePhase>>> = const {
+            std::cell::RefCell::new(None)
+        };
+}
+
+#[cfg(test)]
+fn set_native_exec_capsule_lifecycle_capture(enabled: bool) {
+    NATIVE_EXEC_CAPSULE_LIFECYCLE_CAPTURE.with(|slot| {
+        *slot.borrow_mut() = enabled.then(Vec::new);
+    });
+}
+
+#[cfg(test)]
+fn take_native_exec_capsule_lifecycle_capture() -> Vec<crate::probes::DsrCacheLifecyclePhase> {
+    NATIVE_EXEC_CAPSULE_LIFECYCLE_CAPTURE.with(|slot| slot.borrow_mut().take().unwrap_or_default())
 }
 
 #[cfg(test)]
@@ -609,6 +628,12 @@ pub(crate) fn resume(fd: RawFd, nonce_hex: &str) -> anyhow::Result<crate::Native
 }
 
 fn emit_lifecycle(tid: i32, phase: crate::probes::DsrCacheLifecyclePhase) {
+    #[cfg(test)]
+    NATIVE_EXEC_CAPSULE_LIFECYCLE_CAPTURE.with(|slot| {
+        if let Some(phases) = slot.borrow_mut().as_mut() {
+            phases.push(phase);
+        }
+    });
     crate::probes::dsr_cache_lifecycle(tid, phase, 0, 0, 0);
 }
 
@@ -851,7 +876,8 @@ mod tests {
         NativeGuestExecV1, PreparedImageFailpoint, attach_prepared_image,
         attach_prepared_image_with_failpoint, exec_capsule_with,
         fail_next_artifact_fd_flag_preparation, fd_no_longer_refers_to, read_capsule_once,
-        take_last_preexec_validation_artifact, write_capsule,
+        set_native_exec_capsule_lifecycle_capture, take_last_preexec_validation_artifact,
+        take_native_exec_capsule_lifecycle_capture, write_capsule,
     };
 
     const HOST_PAGE_SIZE: u64 = 16 * 1024;
@@ -1067,6 +1093,27 @@ mod tests {
                 assert!(artifact_was_closed);
             }
         }
+    }
+
+    #[test]
+    fn normal_prepared_ineligibility_completes_the_build_lifecycle_pair() {
+        set_native_exec_capsule_lifecycle_capture(true);
+        let mut payload = sample();
+        let artifact = attach_prepared_image_with_failpoint(
+            &mut payload,
+            &synthetic_image(),
+            &[],
+            HOST_PAGE_SIZE,
+            PreparedImageFailpoint::Ineligible,
+        );
+        assert!(artifact.is_none());
+        assert_eq!(
+            take_native_exec_capsule_lifecycle_capture(),
+            vec![
+                crate::probes::DsrCacheLifecyclePhase::HostSelfReexecPreparedBuildBegin,
+                crate::probes::DsrCacheLifecyclePhase::HostSelfReexecPreparedBuildEnd,
+            ]
+        );
     }
 
     #[test]
