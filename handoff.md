@@ -3,8 +3,9 @@
 Date: 2026-07-14
 
 Integration state: `codex/native-conformance-quality` carries the completed
-second review-fix wave as `5b45cc01` and `7a475d18` (rebased onto `b5297188`),
-and main is fast-forwarded to `7a475d18`. The feature worktree at
+second review-fix wave (`5b45cc01`, `7a475d18`), the review closeout, the W2
+one-thread control manifest, and the Task 3 measurement evidence; main is
+fast-forwarded to the branch head. The feature worktree at
 `.worktrees/codex-native-conformance` is clean and retained as the campaign
 working copy.
 
@@ -19,11 +20,27 @@ hundreds of times slower than the Linux oracle is not ready to bless.
 **Current status: NOT BLESSED.** Prepared-image/self-reexec correctness has
 advanced substantially and Node content parity is green. Task 8 remains
 stopped on the pathological Go compiler/import workload. The performance
-measurement interlude is now fully review-approved: Task 1 (profiler) and
-Task 2 (immutable workloads, runner, analyzer) both passed independent review.
-The second Task 2 review's seven Important findings were fixed red-first and
-re-reviewed to a final "Ready to merge: Yes" verdict at `7a475d18`. The Task 3
-measurement campaign has NOT run and no optimization slice has been selected.
+measurement interlude is review-approved (Tasks 1 and 2) and the Task 3
+measurement campaign HAS RUN (2026-07-14, signed, evidence in
+`docs/perf-results/`). Its honest outcome: the committed analyzer FAILS
+CLOSED — the additive CPU model reconciles only 23-43 percent of measured
+CPU (gate error `0.653181` vs the 2 percent limit) and the count scopes
+disagree (hottest-thread exclusive 47.1 percent vs aggregate 21.7 percent) —
+so NO optimization slice is selected. The measured unaccounted term tracks
+blocked wall (55.0 percent of untraced wall) and is system-time dominated;
+the profile cannot yet distinguish per-syscall wait-machinery cost from
+per-process startup. The follow-on plan
+(`docs/superpowers/plans/2026-07-14-native-compiler-selected-slice.md`) adds
+typed attribution (blocked-CPU split, per-process startup, helper-thread
+CPU), extends the additive model, and re-runs the campaign to a typed
+decision row before any optimization.
+
+Fresh untraced authority: W2 completes at **16.00x** Docker (p50 3.520 s vs
+0.220 s, 5/5); W1 is ceiling-truncated (5/5 typed `max-traps` at p50
+19.360 s vs Docker 1.600 s). ABBA profile tax is 1.13 percent. A W2
+one-thread control manifest exists
+(`scripts/perf/manifests/native-compiler-w2-one-thread-v1.json`) with
+byte-identical output to W2.
 
 Authoritative tracked documents:
 
@@ -137,15 +154,21 @@ is absent next to the manifest.
 
 ## Exact next steps
 
-1. Run Task 3, the measurement campaign: untraced Plane A, profile-off/on
-   ABBA Plane B, proportional Plane C, on W1/W2 and the one-thread control.
-   The analyzer fails closed if the hottest-thread and aggregate scopes
-   disagree on the slice; reconcile with measured evidence.
-2. Select the dominant-term slice from the committed decision ladder and
-   implement the repair red-first. Require the reduced compiler/import
-   workload to complete naturally below 20x Docker, targeting 10x or better.
-   Do not raise timeouts or `max_traps`.
-3. Resume at exact c94, finish Go and classify its existing differences, then
+1. Execute the attribution plan
+   (`docs/superpowers/plans/2026-07-14-native-compiler-selected-slice.md`):
+   Task 1 adds `phase_blocked_cpu_ns`, a one-per-process `startup` frame, and
+   a `host-threads` helper-CPU frame to `NATIVEPERF1` (red-first, profile-off
+   path unchanged); Task 2 extends `derive_additive_cpu_evidence`/`analyze`
+   to consume them with the unchanged 2 percent gate.
+2. Re-run the measurement campaign (same frozen procedure as
+   `docs/perf-results/native-compiler-*-v1.jsonl`) to
+   `native-compiler-budget-v2.jsonl`; require `analyze --check` to emit
+   exactly one typed decision row or fail closed on a *named* term.
+3. Implement the selected repair red-first (candidates and their
+   design-committed prescriptions are enumerated in the plan's Task 4);
+   require the reduced compiler/import workload to complete naturally below
+   20x Docker, targeting 10x or better. Do not raise timeouts or `max_traps`.
+4. Resume at exact c94, finish Go and classify its existing differences, then
    run CPython serial, three workers=4 smoke repeats, the full candidate,
    overlay bless, post-bless run, and a live real-workload demonstration.
 
