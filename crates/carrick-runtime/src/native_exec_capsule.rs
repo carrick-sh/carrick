@@ -282,6 +282,10 @@ fn attach_prepared_image_inner(
         return None;
     }
 
+    emit_lifecycle(
+        unsafe { libc::getpid() },
+        crate::probes::DsrCacheLifecyclePhase::HostSelfReexecPreparedBuildBegin,
+    );
     let disposition =
         match crate::native_prepared_image::prepare(image, relative_relocations, host_page_size) {
             Ok(disposition) => disposition,
@@ -294,7 +298,13 @@ fn attach_prepared_image_inner(
             }
         };
     let artifact = match disposition {
-        crate::native_prepared_image::PreparedImageDisposition::Prepared(artifact) => artifact,
+        crate::native_prepared_image::PreparedImageDisposition::Prepared(artifact) => {
+            emit_lifecycle(
+                unsafe { libc::getpid() },
+                crate::probes::DsrCacheLifecyclePhase::HostSelfReexecPreparedBuildEnd,
+            );
+            artifact
+        }
         crate::native_prepared_image::PreparedImageDisposition::Ineligible(reason) => {
             tracing::debug!(
                 ?reason,
