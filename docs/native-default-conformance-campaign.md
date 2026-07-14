@@ -61,6 +61,14 @@ start. Smoke/full membership remains authoritative in
 | 2026-07-13 | worktree | `go-sync --lane macos-native-dsr` | 1 | MATCH; 52/52 on both sides; Carrick 10.578 s | `target/conformance/native-go-runtime-sync-r1.jsonl` | The synchronization workload is green. Performance ratio is report-only and out of campaign scope. |
 | 2026-07-13 | worktree | Go UserArena alias-reuse reducer | 1 | RED: writable `MAP_FIXED` retained prior `PROT_NONE` page metadata; GREEN after replacement reset; focused workload 3/3 PASS | `native-go-userarena.trace`; `native_darwin::tests::biased_alias_remap_discards_stale_page_protection` | The 103,311-line syscall trace showed 8 MiB UserArena chunks reserved, protected none, then remapped writable before a direct `STP` fault. Alias replacement now retires native-page, write-exec, and Linux-4K subpage protection caches at host-page granularity. |
 | 2026-07-13 | worktree | `go-runtime --lane macos-native-dsr` after alias fix | 1 | MATCH; 52/52 on both sides; Carrick 32.418 s | `target/conformance/native-go-runtime-alias-remap-green.jsonl` | The originating UserArena crash is closed. Go build/runtime/sync smoke lanes are all measured MATCH; next ladder rung is CPython threading/subprocess. |
+| 2026-07-13 | `07f18852` | `cpython-threading --lane macos-native-dsr` | 1 | REGRESSION; 191/193 pass; no crash/timeout | `target/conformance/native-cpython-threading-subprocess-r1.jsonl` | Only fork-without-exec then pthread creation remains. Production keeps the measured libdispatch safety guard; review these two esoteric cases as native-only gaps after ordinary workload state is complete. |
+| 2026-07-13 | `07f18852` | `cpython-subprocess --lane macos-native-dsr` | 1 | TIMEOUT at 300.188 s | `target/conformance/native-cpython-threading-subprocess-r1.jsonl` | LLDB found a self-reexec `/bin/sh` blocked on inherited stdin. Its capsule had resolved `/bin/sh` but retained only the original script argv. |
+| 2026-07-13 | `73774b18` | CPython shebang subprocess reducers | 1 | RED: two stable hangs; GREEN: 2/2 pass in 0.678 s | `POSIXProcessTestCase.test_args_string`; `POSIXProcessTestCase.test_call_string` | Native self-reexec now carries the argv after shebang resolution, so the interpreter receives the script operand instead of entering interactive mode. |
+| 2026-07-13 | `73774b18` | `POSIXProcessTestCase` extended shard | 1 | completed 77 tests in 556.087 s; 14 failures, 2 errors, 3 skips | live signed workload | Proved the old timeout became a deadline issue after the shebang fix and exposed ordinary process-state gaps. SIGINT/SIGTERM, credentials, umask, dispositions, and closed stdio were separated. |
+| 2026-07-13 | worktree | cross-process signal ring across native self-reexec | 1 | RED: `terminate`/`send_signal` both fail after 60.741 s; GREEN: 2/2 pass in 0.637 s | `native-cpython-subprocess-signals-green`; `xsig::tests::reexec_backing_fd_maps_the_same_shared_ring` | `MAP_SHARED|MAP_ANON` vanished across host exec, so parents wrote the old ring. The ring is now file-backed and capsule-adopted; `lsof` proved parent and resumed child share device `1,16`, inode `335855434`, size 10,240. |
+| 2026-07-13 | worktree | `cpython-subprocess --lane macos-native-dsr` with native timeout scale | 1 | REGRESSION; 271/275 vs oracle 280/280; completed in 578.932 s | `target/conformance/native-cpython-subprocess-xsig-green.jsonl` | No crash/timeout; signal and shebang blockers are closed. Remaining raw failures cluster in exec-surviving credentials/groups, umask, signal disposition reporting, and closed-stdio edge cases. |
+| 2026-07-13 | worktree | CPython exec-surviving process-state reducers | 1 | credentials/groups/umask/signals 6/6 in 5.079 s; closed stdio 2/2 in 6.030 s; pre-exec `RLIMIT_NOFILE=(64,64)` preserved | focused signed workloads plus `process_state_round_trip_preserves_credentials_groups_umask_and_ignored_signals` and `stdio_closed_or_cloexec_before_exec_restores_closed` | The typed native capsule now preserves credential overrides, supplementary groups, umask, ignored dispositions, rlimit overrides, and post-exec closed stdio. |
+| 2026-07-13 | worktree | `cpython-subprocess --lane macos-native-dsr` canonical oracle refresh | 1 | MATCH; Carrick 278/278, Docker 278/278; Carrick 577.471 s, Docker 20.895 s | `target/conformance/native-cpython-subprocess-oracle-refresh.jsonl`; `scripts/conformance/oracle-cache.jsonl` | Removed a stale oracle-only `nofile=1024` cap. Unmodified Docker and Carrick both advertise a high descriptor limit and skip the same two applicability checks. The suite is fully green; performance is report-only. A worktree-only scoped-cleanup sudo warning left no Carrick process alive at Docker phase entry. |
 
 ## Active failure clusters
 
@@ -69,6 +77,7 @@ start. Smoke/full membership remains authoritative in
 | P0 | `THREAD_WAITERS` remains locked in a fork child | live LLDB stack plus deterministic contended-fork reducer | fixed in `6d3cf627`; four signed single-suite runs complete, multi-suite load proof pending | no CPython timeout in workers=4 smoke repeats |
 | P0 | Direct-exec target reservation rejects split dyld range | red/green Node-sized reducer plus signed eventfd/Node runs | fixed in `2a7d3046`; eventfd MATCH, Node reaches downstream thread guard; multi-suite load proof pending | no reservation collision in workers=4 smoke repeats |
 | P1 | Post-fork exec child cannot create guest threads | red/green staged reducer plus Node/Go/CPython unsafe samples and libdispatch symbolication | signed reducer + 5/5 repeats pass without bypass; Node app/V8 and Go build/runtime/sync are MATCH through self-reexec; CPython remains | `forkexecpthread`, Node, Go, and CPython run after PID-preserving host self-reexec |
+| P1 | Native self-reexec loses process state | red/green exact reducers plus canonical CPython subprocess MATCH | fixed: shebang argv, file-backed xsignal continuity, credentials/groups, umask, ignored dispositions, rlimits, and closed stdio survive host exec | keep `cpython-subprocess` MATCH under smoke load and broader workloads |
 | P2 | Remaining ecosystem/LTP differences | no fresh full native run yet | unknown | classify from measured full run after P0/P1 blockers clear |
 
 ## Bless checklist
@@ -90,7 +99,8 @@ start. Smoke/full membership remains authoritative in
 
 ## Current next action
 
-Run isolated CPython threading/subprocess now that Go build/runtime/sync are
-measured MATCH. Fix the next real survivor or process-state boundary from those
-workloads. After P1, run multi-suite smoke at four workers to provide the actual
-load proof for both P0 fixes.
+Run the full smoke tier at four workers to provide the first real concurrent
+load proof for the P0 fixes and the completed native self-reexec path. Attribute
+every non-MATCH row before changing code. Keep the two measured
+fork-without-exec pthread cases separate for explicit native-gap review, then
+repeat the smoke tier until stable before climbing full ecosystem lanes.
