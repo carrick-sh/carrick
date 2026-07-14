@@ -325,7 +325,8 @@ Shared regions and representation limits are `Ineligible`; malformed internal ta
 
 Create the artifact with `tempfile::tempfile()`, allocate host-page-aligned extents, and `set_len` once. Scan the same copy window as the current mapper:
 
-- for the stack region, start at `initial_stack_pointer` rounded down to the host page;
+- for the stack region, start at the exact authoritative `initial_stack_pointer` so the
+  prefix remains a sparse hole; artifact extents and mapping offsets remain host-page aligned;
 - for all other regions, inspect the complete region bytes;
 - coalesce adjacent nonzero host pages into initialized spans;
 - `write_at` only those spans; and

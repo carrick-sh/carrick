@@ -137,6 +137,8 @@ pub mod namespace;
 pub(crate) mod native_darwin;
 #[cfg(target_os = "macos")]
 pub(crate) mod native_exec_capsule;
+#[cfg(target_os = "macos")]
+pub(crate) mod native_prepared_image;
 pub mod network;
 pub mod page_profile;
 
