@@ -500,7 +500,7 @@ impl ThreadTranslator {
             .complete_record()
             .and_then(|record| {
                 let snapshot = self.claim_profile_snapshot()?;
-                let gauges = profile::flush_gauges()?;
+                let gauges = profile::flush_gauges(self.budget.thread_cpu_baseline_ns())?;
                 record.to_protocol_frames_with_resolver(snapshot, gauges)
             })
             .unwrap_or_else(|error| vec![self.budget.invalid_protocol_line(error)]);
@@ -2408,6 +2408,30 @@ mod tests {
         assert_eq!(protocol_value(&post_exec, "translations"), 5);
         assert_eq!(protocol_value(&post_exec, "nested_translation_ns"), 0);
         assert_eq!(protocol_value(&post_exec, "translate_phase_nested_ns"), 0);
+    }
+
+    #[test]
+    fn post_exec_seeded_era_thread_cpu_excludes_the_installed_baseline() {
+        // Models runtime re-entry after a PID-preserving host self-reexec
+        // (`resume_guest_from_capsule`): the surviving thread's kernel CPU
+        // counter is cumulative across the exec, so its post-exec
+        // `ThreadBudget` carries an installed baseline. Install one
+        // comfortably above anything this era could plausibly consume before
+        // the flush below, so the era's own `thread_cpu_ns` must saturate at
+        // zero — proving the pre-exec CPU that era already flushed is
+        // excluded here rather than double-counted.
+        let process = std::sync::Arc::new(
+            super::ProcessTranslator::new(16 * 1024).expect("create translator"),
+        );
+        let mut thread = super::ThreadTranslator::for_process(process, 42);
+        thread.budget = super::profile::ThreadBudget::enabled_for_test(41, 42);
+        thread
+            .budget
+            .install_thread_cpu_baseline_ns_for_test(1_000_000_000_000);
+
+        let frames = thread.take_profile_frames().expect("post-exec-seeded era");
+
+        assert_eq!(protocol_value(&frames, "thread_cpu_ns"), 0);
     }
 
     #[test]
