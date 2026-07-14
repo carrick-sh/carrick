@@ -984,6 +984,7 @@ mod tests {
     fn fallback_self_reexec_lifecycle_survives_parsing_without_prepared_map() {
         let summary = ProfileSummary::from_lines(
             [
+                "DSRPROF1|sample|phase=host-self-reexec-prepared-build|pid=21|tid=21|duration_ns=900",
                 "DSRPROF1|sample|phase=host-self-reexec-image-load|pid=21|tid=21|duration_ns=1700",
                 "DSRPROF1|complete|profile=dsr-fork|bounded=0|target_exit_reason=1",
             ],
@@ -995,8 +996,15 @@ mod tests {
             .iter()
             .filter_map(|metric| metric.scope.phase.as_deref())
             .collect::<Vec<_>>();
-        assert_eq!(phases, ["host-self-reexec-image-load"]);
+        assert_eq!(
+            phases,
+            [
+                "host-self-reexec-image-load",
+                "host-self-reexec-prepared-build",
+            ]
+        );
         assert!(!phases.contains(&"host-self-reexec-prepared-map"));
+        assert_eq!(summary.completion.incomplete_pairs, 0);
         assert!(summary.completion.complete);
     }
 
