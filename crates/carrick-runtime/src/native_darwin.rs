@@ -27,7 +27,10 @@ use crate::dispatch::{
     SyscallRequest,
 };
 use crate::memory::{AddressSpace, AddressSpaceError, MemoryRegion};
-use crate::native_prepared_image::{NativeRelativeRelocation, native_region_copy_window};
+use crate::native_prepared_image::{
+    NativeRelativeRelocation, PreparedImageFileBacking, ValidatedPreparedImage,
+    native_region_copy_window,
+};
 use crate::page_profile::{
     ExecutionPlan, HostPageState, MixedPageReason, PageBacking, PagePerms, SubpageState,
     classify_host_page_state,
@@ -87,6 +90,45 @@ thread_local! {
     static NATIVE_TEST_FAIL_EXEC_AFTER_SETUP: std::cell::Cell<bool> = const {
         std::cell::Cell::new(false)
     };
+    static NATIVE_TEST_PREPARED_MAPPING_FAILPOINT:
+        std::cell::Cell<Option<NativePreparedMappingFailpoint>> = const {
+            std::cell::Cell::new(None)
+        };
+    static NATIVE_TEST_VVAR_WORDS:
+        std::cell::RefCell<Option<Vec<(usize, u64)>>> = const {
+            std::cell::RefCell::new(None)
+        };
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativePreparedMappingFailpoint {
+    SecondRegionMap,
+    Relocation,
+    VvarStamp,
+    FinalProtection,
+}
+
+#[cfg(test)]
+fn set_native_prepared_mapping_failpoint(failpoint: Option<NativePreparedMappingFailpoint>) {
+    NATIVE_TEST_PREPARED_MAPPING_FAILPOINT.with(|slot| slot.set(failpoint));
+}
+
+#[cfg(test)]
+fn take_native_prepared_mapping_failpoint(failpoint: NativePreparedMappingFailpoint) -> bool {
+    NATIVE_TEST_PREPARED_MAPPING_FAILPOINT.with(|slot| {
+        if slot.get() == Some(failpoint) {
+            slot.set(None);
+            true
+        } else {
+            false
+        }
+    })
+}
+
+#[cfg(test)]
+fn set_native_test_vvar_words(words: Option<Vec<(usize, u64)>>) {
+    NATIVE_TEST_VVAR_WORDS.with(|slot| *slot.borrow_mut() = words);
 }
 
 /// Set by the exec teardown at its success point (BEFORE it lowers the
@@ -5597,9 +5639,81 @@ struct PreparedNativeExecMapping {
 }
 
 #[derive(Clone, Copy)]
+enum NativeImageBacking<'a> {
+    AnonymousBytes,
+    Prepared(&'a ValidatedPreparedImage),
+}
+
+impl NativeImageBacking<'_> {
+    #[cfg(test)]
+    fn is_prepared(self) -> bool {
+        matches!(self, Self::Prepared(_))
+    }
+}
+
+struct NativeMappedRangeGuard {
+    start: carrick_guest_mem::HostVa,
+    length: usize,
+    armed: bool,
+}
+
+impl NativeMappedRangeGuard {
+    fn new(start: carrick_guest_mem::HostVa, length: usize) -> Self {
+        Self {
+            start,
+            length,
+            armed: true,
+        }
+    }
+
+    fn commit(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for NativeMappedRangeGuard {
+    fn drop(&mut self) {
+        if self.armed && self.length != 0 {
+            unsafe {
+                libc::munmap(self.start.raw() as *mut libc::c_void, self.length);
+            }
+        }
+    }
+}
+
+struct NativeMappingRollback {
+    ranges: Vec<NativeMappedRangeGuard>,
+}
+
+impl NativeMappingRollback {
+    fn new(capacity: usize) -> Self {
+        Self {
+            ranges: Vec::with_capacity(capacity),
+        }
+    }
+
+    fn track(&mut self, range: NativeMappedRangeGuard) {
+        self.ranges.push(range);
+    }
+
+    fn commit(self) {
+        for range in self.ranges {
+            range.commit();
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
 struct NativeMappingPageSizes {
     host: u64,
     linux: u64,
+}
+
+struct NativeMappingOptions<'a> {
+    reusable_translator: Option<Arc<dsr::ProcessTranslator>>,
+    exec_map_dsr_tid: Option<crate::thread::ThreadId>,
+    relative_relocations: &'a [NativeRelativeRelocation],
+    backing: NativeImageBacking<'a>,
 }
 
 #[derive(Clone, Copy)]
@@ -5807,9 +5921,38 @@ impl NativeMappedMemory {
                 linux: linux_page_size,
             },
             native_layout,
-            None,
-            None,
-            relative_relocations,
+            NativeMappingOptions {
+                reusable_translator: None,
+                exec_map_dsr_tid: None,
+                relative_relocations,
+                backing: NativeImageBacking::AnonymousBytes,
+            },
+        )
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn map_prepared_for_plan(
+        prepared: &ValidatedPreparedImage,
+        layout: MemoryLayout,
+        plan: &ExecutionPlan,
+    ) -> Result<Self, RuntimeError> {
+        let native_layout =
+            NativeLayout::for_image(&prepared.image, layout, plan.page_geometry.host_page_size)
+                .map_err(|error| RuntimeError::Unsupported(format!("prepared-map: {error}")))?;
+        Self::map_with_layout(
+            &prepared.image,
+            layout,
+            NativeMappingPageSizes {
+                host: plan.page_geometry.host_page_size,
+                linux: plan.page_geometry.linux_page_size,
+            },
+            native_layout,
+            NativeMappingOptions {
+                reusable_translator: None,
+                exec_map_dsr_tid: None,
+                relative_relocations: &prepared.relocations,
+                backing: NativeImageBacking::Prepared(prepared),
+            },
         )
     }
 
@@ -5832,9 +5975,12 @@ impl NativeMappedMemory {
                 linux: linux_page_size,
             },
             native_layout,
-            reusable_translator,
-            exec_map_dsr_tid,
-            &[],
+            NativeMappingOptions {
+                reusable_translator,
+                exec_map_dsr_tid,
+                relative_relocations: &[],
+                backing: NativeImageBacking::AnonymousBytes,
+            },
         )
     }
 
@@ -5843,19 +5989,47 @@ impl NativeMappedMemory {
         layout: MemoryLayout,
         page_sizes: NativeMappingPageSizes,
         native_layout: NativeLayout,
-        reusable_translator: Option<Arc<dsr::ProcessTranslator>>,
-        exec_map_dsr_tid: Option<crate::thread::ThreadId>,
-        relative_relocations: &[NativeRelativeRelocation],
+        options: NativeMappingOptions<'_>,
     ) -> Result<Self, RuntimeError> {
+        let NativeMappingOptions {
+            reusable_translator,
+            exec_map_dsr_tid,
+            relative_relocations,
+            backing,
+        } = options;
         native_exec_map_profile_start(exec_map_dsr_tid);
         let mut regions = Vec::new();
-        for region in image.regions() {
-            map_region(
-                region,
-                exec_map_dsr_tid,
-                image.initial_stack_pointer(),
-                &native_layout,
-            )?;
+        let mut rollback = NativeMappingRollback::new(image.regions().len() + 5);
+        for (region_index, region) in image.regions().iter().enumerate() {
+            let mapped = match backing {
+                NativeImageBacking::AnonymousBytes => map_region(
+                    region,
+                    exec_map_dsr_tid,
+                    image.initial_stack_pointer(),
+                    &native_layout,
+                )?,
+                NativeImageBacking::Prepared(prepared) => {
+                    let file_backing =
+                        prepared
+                            .backings
+                            .get(region_index)
+                            .copied()
+                            .ok_or_else(|| {
+                                RuntimeError::Unsupported(format!(
+                                    "prepared-map: missing file backing for region {region_index}"
+                                ))
+                            })?;
+                    map_prepared_region(
+                        region_index,
+                        region,
+                        file_backing,
+                        prepared,
+                        exec_map_dsr_tid,
+                        &native_layout,
+                    )?
+                }
+            };
+            rollback.track(mapped);
             if region.start == NATIVE_DARWIN_VDSO_BASE && region.perms.execute {
                 native_exec_map_detail(
                     exec_map_dsr_tid,
@@ -5884,7 +6058,7 @@ impl NativeMappedMemory {
                 shared_key_offset: 0,
             });
         }
-        map_bytes_region(
+        rollback.track(map_bytes_region(
             NATIVE_DARWIN_SIGRETURN_TRAMPOLINE_BASE,
             carrick_mem::memory::LINUX_SIGRETURN_TRAMPOLINE_SIZE,
             &carrick_mem::memory::sigreturn_trampoline_bytes(),
@@ -5892,7 +6066,7 @@ impl NativeMappedMemory {
             true,
             exec_map_dsr_tid,
             &native_layout,
-        )?;
+        )?);
         regions.push(NativeMappedRegion {
             start: NATIVE_DARWIN_SIGRETURN_TRAMPOLINE_BASE,
             end: NATIVE_DARWIN_SIGRETURN_TRAMPOLINE_BASE
@@ -5909,7 +6083,12 @@ impl NativeMappedMemory {
             crate::probes::DsrCacheLifecyclePhase::ExecMapMmapBegin,
             layout.heap_size,
         );
-        map_anonymous_region(layout.heap_base, layout.heap_size, false, &native_layout)?;
+        rollback.track(map_anonymous_region(
+            layout.heap_base,
+            layout.heap_size,
+            false,
+            &native_layout,
+        )?);
         native_exec_map_detail(
             exec_map_dsr_tid,
             crate::probes::DsrCacheLifecyclePhase::ExecMapMmapEnd,
@@ -5930,7 +6109,12 @@ impl NativeMappedMemory {
             crate::probes::DsrCacheLifecyclePhase::ExecMapMmapBegin,
             layout.mmap_size,
         );
-        map_anonymous_region(layout.mmap_base, layout.mmap_size, false, &native_layout)?;
+        rollback.track(map_anonymous_region(
+            layout.mmap_base,
+            layout.mmap_size,
+            false,
+            &native_layout,
+        )?);
         native_exec_map_detail(
             exec_map_dsr_tid,
             crate::probes::DsrCacheLifecyclePhase::ExecMapMmapEnd,
@@ -5955,12 +6139,12 @@ impl NativeMappedMemory {
             crate::probes::DsrCacheLifecyclePhase::ExecMapMmapBegin,
             crate::memory::LINUX_SHARED_FILE_SIZE,
         );
-        map_anonymous_region(
+        rollback.track(map_anonymous_region(
             crate::memory::LINUX_SHARED_FILE_BASE,
             crate::memory::LINUX_SHARED_FILE_SIZE,
             true,
             &native_layout,
-        )?;
+        )?);
         native_exec_map_detail(
             exec_map_dsr_tid,
             crate::probes::DsrCacheLifecyclePhase::ExecMapMmapEnd,
@@ -5985,12 +6169,12 @@ impl NativeMappedMemory {
             crate::probes::DsrCacheLifecyclePhase::ExecMapMmapBegin,
             crate::memory::LINUX_PRIVATE_OVERLAY_SIZE,
         );
-        map_anonymous_region(
+        rollback.track(map_anonymous_region(
             crate::memory::LINUX_PRIVATE_OVERLAY_BASE,
             crate::memory::LINUX_PRIVATE_OVERLAY_SIZE,
             false,
             &native_layout,
-        )?;
+        )?);
         native_exec_map_detail(
             exec_map_dsr_tid,
             crate::probes::DsrCacheLifecyclePhase::ExecMapMmapEnd,
@@ -6055,12 +6239,30 @@ impl NativeMappedMemory {
                 crate::probes::DsrCacheLifecyclePhase::ExecMapVvarBegin,
                 crate::vdso::LINUX_VVAR_SIZE,
             );
+            #[cfg(test)]
+            if backing.is_prepared()
+                && take_native_prepared_mapping_failpoint(NativePreparedMappingFailpoint::VvarStamp)
+            {
+                return Err(RuntimeError::Unsupported(
+                    "prepared-map: injected vvar stamping failure".to_string(),
+                ));
+            }
             memory.stamp_vdso_vvar()?;
             native_exec_map_detail(
                 exec_map_dsr_tid,
                 crate::probes::DsrCacheLifecyclePhase::ExecMapVvarEnd,
                 0,
             );
+            #[cfg(test)]
+            if backing.is_prepared()
+                && take_native_prepared_mapping_failpoint(
+                    NativePreparedMappingFailpoint::Relocation,
+                )
+            {
+                return Err(RuntimeError::Unsupported(
+                    "prepared-map: injected relocation failure".to_string(),
+                ));
+            }
             apply_native_relative_relocations(&mut memory, relative_relocations)?;
             #[cfg(test)]
             if exec_map_dsr_tid.is_some()
@@ -6074,6 +6276,7 @@ impl NativeMappedMemory {
             Ok(memory)
         })();
         let memory = native_layout.commit_if_ok(setup)?;
+        rollback.commit();
         native_exec_map_profile_finish();
         Ok(memory)
     }
@@ -6095,6 +6298,10 @@ impl NativeMappedMemory {
     fn stamp_vdso_vvar(&self) -> Result<(), RuntimeError> {
         if !self.vvar_region_is_mapped() {
             return Ok(());
+        }
+        #[cfg(test)]
+        if let Some(words) = NATIVE_TEST_VVAR_WORDS.with(|slot| slot.borrow().clone()) {
+            return self.write_vvar_words(&words);
         }
         // RNG generation first and unconditionally (getrandom needs no
         // calibrated counter): this process's host PID, unique per process and
@@ -6333,9 +6540,12 @@ impl NativeMappedMemory {
                 linux: plan.page_geometry.linux_page_size,
             },
             native_layout,
-            Some(process_translator),
-            dsr_tid,
-            relative_relocations,
+            NativeMappingOptions {
+                reusable_translator: Some(process_translator),
+                exec_map_dsr_tid: dsr_tid,
+                relative_relocations,
+                backing: NativeImageBacking::AnonymousBytes,
+            },
         )?;
         lifecycle(crate::probes::DsrCacheLifecyclePhase::ExecRelocationEnd);
         lifecycle(crate::probes::DsrCacheLifecyclePhase::ExecImageMapEnd);
@@ -7969,12 +8179,73 @@ fn native_exec_map_detail(
     }
 }
 
+fn finalize_image_region_mapping(
+    region: &MemoryRegion,
+    mapped: *mut libc::c_void,
+    mapped_length: usize,
+    logical_length: u64,
+    exec_map_dsr_tid: Option<crate::thread::ThreadId>,
+    _prepared: bool,
+) -> Result<(), RuntimeError> {
+    if region.perms.execute {
+        native_exec_map_detail(
+            exec_map_dsr_tid,
+            crate::probes::DsrCacheLifecyclePhase::ExecMapIcacheBegin,
+            logical_length,
+        );
+        unsafe {
+            carrick_native_clear_icache(
+                mapped,
+                usize::try_from(logical_length).unwrap_or(mapped_length),
+            )
+        };
+        native_exec_map_detail(
+            exec_map_dsr_tid,
+            crate::probes::DsrCacheLifecyclePhase::ExecMapIcacheEnd,
+            0,
+        );
+    }
+
+    #[cfg(test)]
+    if _prepared
+        && take_native_prepared_mapping_failpoint(NativePreparedMappingFailpoint::FinalProtection)
+    {
+        return Err(RuntimeError::Unsupported(
+            "prepared-map: injected final protection failure".to_string(),
+        ));
+    }
+    let mut protection = 0;
+    if region.perms.read || region.perms.execute {
+        protection |= libc::PROT_READ;
+    }
+    if region.perms.write {
+        protection |= libc::PROT_WRITE;
+    }
+    native_exec_map_detail(
+        exec_map_dsr_tid,
+        crate::probes::DsrCacheLifecyclePhase::ExecMapProtectBegin,
+        logical_length,
+    );
+    if unsafe { libc::mprotect(mapped, mapped_length, protection) } != 0 {
+        return Err(last_io_error(&format!(
+            "mprotect native Darwin image region 0x{:x}..0x{:x}",
+            region.start, region.end
+        )));
+    }
+    native_exec_map_detail(
+        exec_map_dsr_tid,
+        crate::probes::DsrCacheLifecyclePhase::ExecMapProtectEnd,
+        0,
+    );
+    Ok(())
+}
+
 fn map_region(
     region: &MemoryRegion,
     exec_map_dsr_tid: Option<crate::thread::ThreadId>,
     initial_stack_pointer: Option<u64>,
     native_layout: &NativeLayout,
-) -> Result<(), RuntimeError> {
+) -> Result<NativeMappedRangeGuard, RuntimeError> {
     let length_u64 = region.end.checked_sub(region.start).ok_or_else(|| {
         RuntimeError::Unsupported("native Darwin empty inverted region".to_string())
     })?;
@@ -7985,7 +8256,7 @@ fn map_region(
         ))
     })?;
     if length == 0 {
-        return Ok(());
+        return Ok(NativeMappedRangeGuard::new(carrick_guest_mem::HostVa(0), 0));
     }
     let host_start = native_layout
         .address_mode()
@@ -8031,6 +8302,7 @@ fn map_region(
             region.start
         )));
     }
+    let mapped_range = NativeMappedRangeGuard::new(host_start, length);
     native_exec_map_detail(
         exec_map_dsr_tid,
         crate::probes::DsrCacheLifecyclePhase::ExecMapMmapEnd,
@@ -8059,42 +8331,97 @@ fn map_region(
             0,
         );
     }
-    if region.perms.execute {
-        native_exec_map_detail(
-            exec_map_dsr_tid,
-            crate::probes::DsrCacheLifecyclePhase::ExecMapIcacheBegin,
-            u64::try_from(bytes.len()).unwrap_or(u64::MAX),
-        );
-        unsafe { carrick_native_clear_icache(mapped, bytes.len()) };
-        native_exec_map_detail(
-            exec_map_dsr_tid,
-            crate::probes::DsrCacheLifecyclePhase::ExecMapIcacheEnd,
-            0,
-        );
+    finalize_image_region_mapping(region, mapped, length, length_u64, exec_map_dsr_tid, false)?;
+    Ok(mapped_range)
+}
+
+fn map_prepared_region(
+    region_index: usize,
+    region: &MemoryRegion,
+    backing: PreparedImageFileBacking,
+    prepared: &ValidatedPreparedImage,
+    exec_map_dsr_tid: Option<crate::thread::ThreadId>,
+    native_layout: &NativeLayout,
+) -> Result<NativeMappedRangeGuard, RuntimeError> {
+    #[cfg(test)]
+    if region_index == 1
+        && take_native_prepared_mapping_failpoint(NativePreparedMappingFailpoint::SecondRegionMap)
+    {
+        return Err(RuntimeError::Unsupported(
+            "prepared-map: injected second-region mapping failure".to_string(),
+        ));
     }
 
-    let mut prot = region_prot(region);
-    if region.perms.execute {
-        prot = (prot & !libc::PROT_EXEC) | libc::PROT_READ;
+    let length_u64 = region.end.checked_sub(region.start).ok_or_else(|| {
+        RuntimeError::Unsupported("prepared-map: empty or inverted region".to_string())
+    })?;
+    let expected_extent = align_up_u64(
+        length_u64,
+        prepared.host_page_size(),
+        "prepared artifact region extent",
+    )?;
+    if backing.artifact_extent.get() != expected_extent {
+        return Err(RuntimeError::Unsupported(format!(
+            "prepared-map: region {region_index} extent mismatch: artifact=0x{:x}, expected=0x{expected_extent:x}",
+            backing.artifact_extent.get()
+        )));
     }
+    let length = usize::try_from(expected_extent).map_err(|_| {
+        RuntimeError::Unsupported(format!(
+            "prepared-map: region {region_index} is too large: 0x{expected_extent:x}"
+        ))
+    })?;
+    let artifact_offset = libc::off_t::try_from(backing.artifact_offset.get()).map_err(|_| {
+        RuntimeError::Unsupported(format!(
+            "prepared-map: region {region_index} artifact offset is not representable: 0x{:x}",
+            backing.artifact_offset.get()
+        ))
+    })?;
+    let host_start = native_layout
+        .address_mode()
+        .to_host(carrick_guest_mem::GuestVa(region.start))
+        .map_err(|error| RuntimeError::Unsupported(format!("prepared-map: {error}")))?;
+    let address = host_start.raw() as *mut libc::c_void;
     native_exec_map_detail(
         exec_map_dsr_tid,
-        crate::probes::DsrCacheLifecyclePhase::ExecMapProtectBegin,
+        crate::probes::DsrCacheLifecyclePhase::ExecMapMmapBegin,
         length_u64,
     );
-    let protect = unsafe { libc::mprotect(mapped, length, prot) };
-    if protect != 0 {
+    let flags = native_layout
+        .fixed_mapping_flags(host_start, length, libc::MAP_PRIVATE)
+        .map_err(|error| RuntimeError::Unsupported(format!("prepared-map: {error}")))?;
+    let mapped = unsafe {
+        libc::mmap(
+            address,
+            length,
+            libc::PROT_READ | libc::PROT_WRITE,
+            flags,
+            prepared.file_fd(),
+            artifact_offset,
+        )
+    };
+    if mapped == libc::MAP_FAILED {
         return Err(last_io_error(&format!(
-            "mprotect native Darwin region 0x{:x}..0x{:x}",
+            "prepared-map: mmap region {region_index} 0x{:x}..0x{:x}",
             region.start, region.end
         )));
     }
+    if mapped != address {
+        unsafe { libc::munmap(mapped, length) };
+        return Err(RuntimeError::Unsupported(format!(
+            "prepared-map: mmap region {region_index} returned {:p}, expected {:p}",
+            mapped, address
+        )));
+    }
+    let mapped_range = NativeMappedRangeGuard::new(host_start, length);
     native_exec_map_detail(
         exec_map_dsr_tid,
-        crate::probes::DsrCacheLifecyclePhase::ExecMapProtectEnd,
+        crate::probes::DsrCacheLifecyclePhase::ExecMapMmapEnd,
         0,
     );
-    Ok(())
+
+    finalize_image_region_mapping(region, mapped, length, length_u64, exec_map_dsr_tid, true)?;
+    Ok(mapped_range)
 }
 
 fn map_bytes_region(
@@ -8105,14 +8432,14 @@ fn map_bytes_region(
     executable: bool,
     exec_map_dsr_tid: Option<crate::thread::ThreadId>,
     native_layout: &NativeLayout,
-) -> Result<(), RuntimeError> {
+) -> Result<NativeMappedRangeGuard, RuntimeError> {
     let length = usize::try_from(length_u64).map_err(|_| {
         RuntimeError::Unsupported(format!(
             "native Darwin byte region too large: 0x{start:x}+0x{length_u64:x}"
         ))
     })?;
     if length == 0 {
-        return Ok(());
+        return Ok(NativeMappedRangeGuard::new(carrick_guest_mem::HostVa(0), 0));
     }
     if bytes.len() > length {
         return Err(RuntimeError::Unsupported(format!(
@@ -8157,6 +8484,7 @@ fn map_bytes_region(
             "native Darwin mmap did not honor MAP_FIXED for byte region 0x{start:x}"
         )));
     }
+    let mapped_range = NativeMappedRangeGuard::new(host_start, length);
     native_exec_map_detail(
         exec_map_dsr_tid,
         crate::probes::DsrCacheLifecyclePhase::ExecMapMmapEnd,
@@ -8211,7 +8539,7 @@ fn map_bytes_region(
         crate::probes::DsrCacheLifecyclePhase::ExecMapProtectEnd,
         0,
     );
-    Ok(())
+    Ok(mapped_range)
 }
 
 fn map_anonymous_region(
@@ -8219,14 +8547,14 @@ fn map_anonymous_region(
     length: u64,
     shared: bool,
     native_layout: &NativeLayout,
-) -> Result<(), RuntimeError> {
+) -> Result<NativeMappedRangeGuard, RuntimeError> {
     let length = usize::try_from(length).map_err(|_| {
         RuntimeError::Unsupported(format!(
             "native Darwin anonymous region too large: 0x{start:x}+0x{length:x}"
         ))
     })?;
     if length == 0 {
-        return Ok(());
+        return Ok(NativeMappedRangeGuard::new(carrick_guest_mem::HostVa(0), 0));
     }
     let host_start = native_layout
         .address_mode()
@@ -8266,7 +8594,7 @@ fn map_anonymous_region(
             "native Darwin mmap did not honor MAP_FIXED for anonymous region 0x{start:x}"
         )));
     }
-    Ok(())
+    Ok(NativeMappedRangeGuard::new(host_start, length))
 }
 
 fn set_native_region_fork_inheritance(address: *mut libc::c_void, len: usize, share: bool) -> bool {
@@ -8285,24 +8613,6 @@ fn set_native_region_fork_inheritance(address: *mut libc::c_void, len: usize, sh
     unsafe { minherit(address, len, inherit) == 0 }
 }
 
-fn region_prot(region: &MemoryRegion) -> libc::c_int {
-    let mut prot = 0;
-    if region.perms.read {
-        prot |= libc::PROT_READ;
-    }
-    if region.perms.write {
-        prot |= libc::PROT_WRITE;
-    }
-    // The large mmap arena is executable in the HVF stage-1 model so later
-    // guest mmap/mprotect can grant execute permission without remapping host
-    // memory. Native starts narrower: executable permissions are applied to
-    // initialized executable regions, not to lazy zero data arenas.
-    if region.perms.execute && !region.bytes().is_empty() {
-        prot |= libc::PROT_EXEC;
-    }
-    prot
-}
-
 /// `movz Xd, #imm16, lsl #32` (sf=1, opc=10, hw=10), any destination register.
 const fn movz_x_lsl32(imm16: u16) -> u32 {
     0xd2c0_0000 | ((imm16 as u32) << 5)
@@ -8319,7 +8629,12 @@ fn relocate_vdso_vvar_loads(
     region: &MemoryRegion,
     native_layout: &NativeLayout,
 ) -> Result<(), RuntimeError> {
-    let length = region.bytes().len();
+    let length = usize::try_from(region.len()).map_err(|_| {
+        RuntimeError::Unsupported(format!(
+            "native Darwin vDSO region is too large: 0x{:x}",
+            region.len()
+        ))
+    })?;
     let base = native_layout
         .address_mode()
         .to_host(carrick_guest_mem::GuestVa(region.start))
@@ -10146,7 +10461,8 @@ mod tests {
         )
         .expect("build direct-entry image");
         map_region(&image.regions()[0], None, None, &NativeLayout::direct())
-            .expect("map DSR original code page");
+            .expect("map DSR original code page")
+            .commit();
 
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork direct-entry child");
@@ -11989,7 +12305,9 @@ mod tests {
             std::io::Error::last_os_error()
         );
         if outer == 0 {
-            let mapped = map_anonymous_region(start, len, shared, &NativeLayout::direct()).is_ok();
+            let mapped = map_anonymous_region(start, len, shared, &NativeLayout::direct())
+                .map(NativeMappedRangeGuard::commit)
+                .is_ok();
             if !mapped {
                 unsafe { libc::_exit(2) };
             }
@@ -12542,5 +12860,336 @@ mod tests {
         assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
         assert!(libc::WIFEXITED(status), "child status was 0x{status:x}");
         assert_eq!(libc::WEXITSTATUS(status), 0, "vvar/vdso child check failed");
+    }
+
+    fn native_prepared_mapping_fixture(
+        relocations: bool,
+    ) -> (AddressSpace, Vec<NativeRelativeRelocation>, ExecutionPlan) {
+        let plan = native16k_test_plan();
+        let image = AddressSpace::load_elf_bytes_with_reader_at_pie_base_without_runtime_regions(
+            &dsr_test_elf(&[0xd65f_03c0]),
+            &|_| None,
+            NATIVE_DARWIN_PIE_BASE,
+            plan.page_geometry.host_page_size,
+        )
+        .expect("load prepared mapping fixture")
+        .with_vdso_auxv(true);
+        let image = with_native_vdso(image)
+            .expect("add native vDSO")
+            .with_linux_initial_stack_page_size(
+                [b"prepared-mapping".as_slice()],
+                [b"MODE=parity".as_slice()],
+                plan.page_geometry.linux_page_size,
+            )
+            .expect("add prepared mapping stack");
+        let relative_relocations = if relocations {
+            let target = image
+                .initial_stack_pointer()
+                .expect("initial stack pointer");
+            vec![NativeRelativeRelocation::new(
+                crate::native_prepared_image::PreparedGuestVa::new(target)
+                    .expect("typed relocation target"),
+                crate::native_prepared_image::PreparedGuestVa::new(0x1234_5678)
+                    .expect("typed relocation value"),
+            )]
+        } else {
+            Vec::new()
+        };
+        (image, relative_relocations, plan)
+    }
+
+    fn validated_prepared_mapping_fixture(
+        image: &AddressSpace,
+        relocations: &[NativeRelativeRelocation],
+        host_page_size: u64,
+    ) -> crate::native_prepared_image::ValidatedPreparedImage {
+        let artifact =
+            match crate::native_prepared_image::prepare(image, relocations, host_page_size)
+                .expect("prepare mapping artifact")
+            {
+                crate::native_prepared_image::PreparedImageDisposition::Prepared(artifact) => {
+                    artifact
+                }
+                crate::native_prepared_image::PreparedImageDisposition::Ineligible(reason) => {
+                    panic!("mapping fixture is ineligible: {reason:?}")
+                }
+            };
+        crate::native_prepared_image::validate_artifact_for_test(artifact)
+            .expect("validate mapping artifact")
+    }
+
+    fn retire_native_test_mapping(memory: &NativeMappedMemory) {
+        for range in &memory.owned_host_ranges {
+            let len = range
+                .end
+                .raw()
+                .checked_sub(range.start.raw())
+                .expect("owned mapping range");
+            if len != 0 {
+                assert_eq!(
+                    unsafe { libc::munmap(range.start.raw() as *mut libc::c_void, len) },
+                    0,
+                    "retire native test mapping 0x{:x}..0x{:x}: {}",
+                    range.start.raw(),
+                    range.end.raw(),
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+    }
+
+    fn native_mapping_region_bytes(
+        memory: &NativeMappedMemory,
+        image: &AddressSpace,
+    ) -> Vec<Vec<u8>> {
+        image
+            .regions()
+            .iter()
+            .map(|region| {
+                memory
+                    .read_bytes(
+                        region.start,
+                        usize::try_from(region.len()).expect("region length"),
+                    )
+                    .expect("read mapped region")
+            })
+            .collect()
+    }
+
+    fn assert_native_source_execution_denied(memory: &NativeMappedMemory, guest_pc: u64) {
+        let host_pc = memory
+            .host_address(carrick_guest_mem::GuestVa(guest_pc))
+            .expect("translate executable source page");
+        let child = unsafe { libc::fork() };
+        assert!(
+            child >= 0,
+            "fork execute probe: {}",
+            std::io::Error::last_os_error()
+        );
+        if child == 0 {
+            unsafe {
+                libc::signal(libc::SIGBUS, libc::SIG_DFL);
+                libc::signal(libc::SIGSEGV, libc::SIG_DFL);
+            }
+            let entry: unsafe extern "C" fn() = unsafe { std::mem::transmute(host_pc.raw()) };
+            unsafe { entry() };
+            unsafe { libc::_exit(99) };
+        }
+        let status = waitpid_blocking(child).expect("wait for execute probe");
+        assert!(
+            libc::WIFSIGNALED(status),
+            "source page executed: status={status:#x}"
+        );
+        assert!(
+            matches!(libc::WTERMSIG(status), libc::SIGBUS | libc::SIGSEGV),
+            "unexpected execute-denial signal: status={status:#x}"
+        );
+    }
+
+    #[test]
+    fn native_prepared_mapping_matches_anonymous_bytes_and_finalization() {
+        fork_test(|| {
+            set_native_test_vvar_words(Some(vec![
+                (crate::vdso::VVAR_OFF_RNG_GENERATION, 0x1111_2222),
+                (crate::vdso::VVAR_OFF_FREQ, 0x3333_4444),
+                (crate::vdso::VVAR_OFF_REALTIME_OFF_NS, 0x5555_6666),
+            ]));
+            let (image, no_relocations, plan) = native_prepared_mapping_fixture(false);
+            let validated = validated_prepared_mapping_fixture(
+                &image,
+                &no_relocations,
+                plan.page_geometry.host_page_size,
+            );
+
+            let legacy = NativeMappedMemory::map_for_plan(
+                &image,
+                native_memory_layout(),
+                plan.page_geometry.host_page_size,
+                plan.page_geometry.linux_page_size,
+                &plan,
+                &no_relocations,
+            )
+            .expect("map anonymous fixture");
+            let legacy_bytes = native_mapping_region_bytes(&legacy, &image);
+            let legacy_protections = legacy.protections.snapshot_all();
+            let legacy_mode = legacy.address_mode();
+            let legacy_owned = legacy.owned_host_ranges.clone();
+            let vvar_len = usize::try_from(crate::vdso::LINUX_VVAR_SIZE).expect("vvar length");
+            let legacy_vvar = legacy
+                .read_bytes(NATIVE_DARWIN_VVAR_BASE, vvar_len)
+                .expect("read legacy vvar");
+            assert_native_source_execution_denied(&legacy, image.entry());
+            retire_native_test_mapping(&legacy);
+            drop(legacy);
+
+            let prepared = NativeMappedMemory::map_prepared_for_plan(
+                &validated,
+                native_memory_layout(),
+                &plan,
+            )
+            .expect("map prepared fixture");
+            assert_eq!(validated.image.entry(), image.entry());
+            assert_eq!(
+                validated.image.initial_stack_pointer(),
+                image.initial_stack_pointer()
+            );
+            assert_eq!(
+                native_mapping_region_bytes(&prepared, &validated.image),
+                legacy_bytes
+            );
+            assert_eq!(prepared.protections.snapshot_all(), legacy_protections);
+            assert_eq!(prepared.address_mode(), legacy_mode);
+            assert_eq!(prepared.owned_host_ranges, legacy_owned);
+            assert_eq!(
+                prepared
+                    .read_bytes(NATIVE_DARWIN_VVAR_BASE, vvar_len)
+                    .expect("read prepared vvar"),
+                legacy_vvar
+            );
+            assert_eq!(
+                validated
+                    .image
+                    .regions()
+                    .iter()
+                    .map(|region| (region.start, region.end, region.perms, region.shared))
+                    .collect::<Vec<_>>(),
+                image
+                    .regions()
+                    .iter()
+                    .map(|region| (region.start, region.end, region.perms, region.shared))
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(validated.image.linux_auxv_image(), image.linux_auxv_image());
+            assert_eq!(validated.image.ro_spans(), image.ro_spans());
+            assert_native_source_execution_denied(&prepared, image.entry());
+
+            let artifact_fd = validated.file_fd();
+            assert!(unsafe { libc::fcntl(artifact_fd, libc::F_GETFD) } >= 0);
+            drop(validated);
+            assert_eq!(unsafe { libc::fcntl(artifact_fd, libc::F_GETFD) }, -1);
+            assert_eq!(
+                prepared
+                    .read_bytes(image.entry(), 4)
+                    .expect("mapping survives artifact close"),
+                0xd65f_03c0_u32.to_le_bytes()
+            );
+            set_native_test_vvar_words(None);
+        });
+    }
+
+    #[test]
+    fn native_prepared_mapping_matches_relocated_words() {
+        fork_test(|| {
+            set_native_test_vvar_words(Some(Vec::new()));
+            let (image, relocations, plan) = native_prepared_mapping_fixture(true);
+            let target = relocations[0].address().get();
+            let expected = relocations[0].value().get();
+            let legacy = NativeMappedMemory::map_for_plan(
+                &image,
+                native_memory_layout(),
+                plan.page_geometry.host_page_size,
+                plan.page_geometry.linux_page_size,
+                &plan,
+                &relocations,
+            )
+            .expect("map relocated anonymous fixture");
+            let legacy_word = u64::from_le_bytes(
+                legacy
+                    .read_bytes(target, 8)
+                    .expect("read legacy relocation")
+                    .try_into()
+                    .expect("legacy relocation width"),
+            );
+            retire_native_test_mapping(&legacy);
+            drop(legacy);
+            let validated = validated_prepared_mapping_fixture(
+                &image,
+                &relocations,
+                plan.page_geometry.host_page_size,
+            );
+            let prepared = NativeMappedMemory::map_prepared_for_plan(
+                &validated,
+                native_memory_layout(),
+                &plan,
+            )
+            .expect("map relocated prepared fixture");
+            let prepared_word = u64::from_le_bytes(
+                prepared
+                    .read_bytes(target, 8)
+                    .expect("read prepared relocation")
+                    .try_into()
+                    .expect("prepared relocation width"),
+            );
+            assert_eq!(prepared_word, expected);
+            assert_eq!(prepared_word, legacy_word);
+            set_native_test_vvar_words(None);
+        });
+    }
+
+    fn assert_prepared_mapping_failure_cleans_up(
+        failpoint: NativePreparedMappingFailpoint,
+        expected: &str,
+    ) {
+        fork_test(|| {
+            set_native_test_vvar_words(Some(Vec::new()));
+            let (image, relocations, plan) = native_prepared_mapping_fixture(true);
+            let validated = validated_prepared_mapping_fixture(
+                &image,
+                &relocations,
+                plan.page_geometry.host_page_size,
+            );
+            set_native_prepared_mapping_failpoint(Some(failpoint));
+            let error = match NativeMappedMemory::map_prepared_for_plan(
+                &validated,
+                native_memory_layout(),
+                &plan,
+            ) {
+                Ok(_) => panic!("prepared mapping failpoint must fail"),
+                Err(error) => error,
+            };
+            assert_eq!(error.to_string(), expected);
+            let start = carrick_guest_mem::HostVa(image.regions()[0].start as usize);
+            let vacant = address::OwnedHostMapping::map_exact(
+                start,
+                usize::try_from(image.regions()[0].len()).expect("first region length"),
+                libc::PROT_NONE,
+                libc::MAP_ANON | libc::MAP_PRIVATE,
+            )
+            .expect("failed prepared mapping must retire direct image range");
+            drop(vacant);
+            set_native_test_vvar_words(None);
+        });
+    }
+
+    #[test]
+    fn native_prepared_mapping_second_region_failure_retires_ranges() {
+        assert_prepared_mapping_failure_cleans_up(
+            NativePreparedMappingFailpoint::SecondRegionMap,
+            "unsupported in this backend: prepared-map: injected second-region mapping failure",
+        );
+    }
+
+    #[test]
+    fn native_prepared_mapping_relocation_failure_retires_ranges() {
+        assert_prepared_mapping_failure_cleans_up(
+            NativePreparedMappingFailpoint::Relocation,
+            "unsupported in this backend: prepared-map: injected relocation failure",
+        );
+    }
+
+    #[test]
+    fn native_prepared_mapping_vvar_failure_retires_ranges() {
+        assert_prepared_mapping_failure_cleans_up(
+            NativePreparedMappingFailpoint::VvarStamp,
+            "unsupported in this backend: prepared-map: injected vvar stamping failure",
+        );
+    }
+
+    #[test]
+    fn native_prepared_mapping_final_protection_failure_retires_ranges() {
+        assert_prepared_mapping_failure_cleans_up(
+            NativePreparedMappingFailpoint::FinalProtection,
+            "unsupported in this backend: prepared-map: injected final protection failure",
+        );
     }
 }
