@@ -352,6 +352,12 @@ impl ThreadTranslator {
         self.indirect_cache.clear();
         self.stats = ResolverStats::default();
         self.budget.reset_after_fork_child(tid);
+        if self.budget.enabled() {
+            // The child's rusage clock restarted at fork: restart the process
+            // startup window here so its first gateway entry claims the
+            // child's own bring-up cost (profile-off runs read no clocks).
+            profile::reset_process_startup_after_fork_child();
+        }
         self.profile_finalized = false;
         self.nested_translation_ns = 0;
         self.last_kick = None;
@@ -494,7 +500,8 @@ impl ThreadTranslator {
             .complete_record()
             .and_then(|record| {
                 let snapshot = self.claim_profile_snapshot()?;
-                record.to_protocol_frames_with_resolver(snapshot)
+                let gauges = profile::flush_gauges()?;
+                record.to_protocol_frames_with_resolver(snapshot, gauges)
             })
             .unwrap_or_else(|error| vec![self.budget.invalid_protocol_line(error)]);
         Some(frames)
@@ -1123,6 +1130,13 @@ impl ThreadTranslator {
         self.budget.add_phase(phase, elapsed_ns)
     }
 
+    pub(super) fn add_profile_blocked_cpu_ns(
+        &mut self,
+        elapsed_ns: u64,
+    ) -> Result<(), profile::ProfileError> {
+        self.budget.add_blocked_cpu_ns(elapsed_ns)
+    }
+
     pub(super) fn record_profile_exit(
         &mut self,
         class: profile::ExitClass,
@@ -1218,6 +1232,13 @@ impl ThreadTranslator {
         let mut exit = types::NativeDsrExit::Syscall {
             resume: carrick_guest_mem::GuestVa(snapshot.pc),
         };
+        if PROFILE {
+            // First gateway entry of any guest thread ends the process
+            // startup window (atomic claim; a single load once claimed).
+            if let Err(error) = profile::claim_process_startup() {
+                return Err(self.budget.invalidate(error).into());
+            }
+        }
         if self.budget.enabled() {
             self.stats.add(ResolverStat::GatewayEntries, 1);
         }
@@ -2418,6 +2439,31 @@ mod tests {
                 + protocol_value(&second_frames, "translations"),
             12
         );
+    }
+
+    #[test]
+    fn take_profile_frames_emits_typed_attribution_frames() {
+        let process = std::sync::Arc::new(
+            super::ProcessTranslator::new(16 * 1024).expect("create translator"),
+        );
+        let mut thread = super::ThreadTranslator::for_process(process, 42);
+        thread.budget = super::profile::ThreadBudget::enabled_for_test(41, 42);
+
+        let frames = thread.take_profile_frames().expect("attribution frames");
+
+        assert_eq!(frames.len(), 10);
+        assert!(frames.iter().any(|frame| frame.contains("|frame=process|")));
+        assert!(
+            frames
+                .iter()
+                .any(|frame| frame.contains("|phase_blocked_cpu_ns="))
+        );
+        // Gauge fields must parse; the flush-time process CPU of the test
+        // harness is always positive.
+        let _ = protocol_value(&frames, "thread_cpu_ns");
+        let _ = protocol_value(&frames, "startup_wall_ns");
+        let _ = protocol_value(&frames, "startup_cpu_ns");
+        assert!(protocol_value(&frames, "process_cpu_ns") > 0);
     }
 
     #[test]

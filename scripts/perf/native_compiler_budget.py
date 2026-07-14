@@ -97,6 +97,18 @@ FRAME_FIELDS = {
     "cache-gauge": {"cache_used_bytes", "cache_capacity_bytes"},
 }
 REQUIRED_FRAMES = frozenset(FRAME_FIELDS)
+# The v2 attribution contract: `core` gains the flush-moment thread CPU gauge,
+# `phases-b` gains the CPU consumed inside blocked wait segments, and a tenth
+# `process` frame carries the once-per-process startup window plus the
+# per-flush process CPU gauge. A profile is uniformly v1 or uniformly v2;
+# mixing contracts in one profile is rejected.
+FRAME_FIELDS_V2 = {
+    **{frame: set(fields) for frame, fields in FRAME_FIELDS.items()},
+    "core": FRAME_FIELDS["core"] | {"thread_cpu_ns"},
+    "phases-b": FRAME_FIELDS["phases-b"] | {"phase_blocked_cpu_ns"},
+    "process": {"startup_wall_ns", "startup_cpu_ns", "process_cpu_ns"},
+}
+REQUIRED_FRAMES_V2 = frozenset(FRAME_FIELDS_V2)
 HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 IMAGE_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
@@ -769,6 +781,7 @@ class ProfileThread:
 @dataclasses.dataclass(frozen=True)
 class ProfileRun:
     threads: tuple[ProfileThread, ...]
+    version: int = 1
 
 
 def _parse_decimal(value: str, field: str) -> int:
@@ -796,8 +809,34 @@ def _protocol_fields(line: str) -> tuple[str, dict[str, str]]:
     return kind, fields
 
 
+def _frame_contract(frame: str, extras: set[str]) -> tuple[int | None, set[str]]:
+    """Match one frame's field set against the v1/v2 contracts.
+
+    Returns (version, field set): version 1 or 2 for the contract-splitting
+    frames (core / phases-b / process), None for the version-neutral frames.
+    Raises the same unknown/missing diagnostics as the historical v1 parser.
+    """
+    fields_v1 = FRAME_FIELDS.get(frame)
+    fields_v2 = FRAME_FIELDS_V2.get(frame)
+    if fields_v1 is None and fields_v2 is None:
+        raise BudgetError(f"unknown profile frame: {frame}")
+    if fields_v1 is not None and extras == fields_v1:
+        return (None if fields_v1 == fields_v2 else 1), fields_v1
+    if fields_v2 is not None and extras == fields_v2:
+        return (None if fields_v1 == fields_v2 else 2), fields_v2
+    allowed = (fields_v1 or set()) | (fields_v2 or set())
+    unknown = extras - allowed
+    if unknown:
+        raise BudgetError(f"unknown field(s) in {frame}: {', '.join(sorted(unknown))}")
+    missing = (fields_v1 if fields_v1 is not None else fields_v2) - extras
+    if not missing:
+        raise BudgetError(f"malformed field set in {frame}")
+    raise BudgetError(f"missing field(s) in {frame}: {', '.join(sorted(missing))}")
+
+
 def parse_nativeperf(lines: Iterable[str]) -> ProfileRun:
     groups: dict[tuple[int, int, int], dict[str, dict[str, int]]] = {}
+    group_versions: dict[tuple[int, int, int], set[int]] = {}
     saw_protocol = False
     for raw_line in lines:
         line = raw_line.strip()
@@ -816,15 +855,8 @@ def parse_nativeperf(lines: Iterable[str]) -> ProfileRun:
         if fields["complete"] != "1":
             raise BudgetError("incomplete native profile record")
         frame = fields["frame"]
-        if frame not in FRAME_FIELDS:
-            raise BudgetError(f"unknown profile frame: {frame}")
         extras = set(fields) - common
-        unknown = extras - FRAME_FIELDS[frame]
-        missing = FRAME_FIELDS[frame] - extras
-        if unknown:
-            raise BudgetError(f"unknown field(s) in {frame}: {', '.join(sorted(unknown))}")
-        if missing:
-            raise BudgetError(f"missing field(s) in {frame}: {', '.join(sorted(missing))}")
+        version, frame_fields = _frame_contract(frame, extras)
         key = tuple(_parse_decimal(fields[name], name) for name in ("pid", "tid", "era"))
         group = groups.setdefault(key, {})
         if frame in group:
@@ -832,17 +864,28 @@ def parse_nativeperf(lines: Iterable[str]) -> ProfileRun:
                 f"duplicate frame {frame} for duplicate thread identity pid/tid/era {key}"
             )
         group[frame] = {
-            name: _parse_decimal(fields[name], name) for name in FRAME_FIELDS[frame]
+            name: _parse_decimal(fields[name], name) for name in frame_fields
         }
+        if version is not None:
+            group_versions.setdefault(key, set()).add(version)
     if not saw_protocol:
         raise BudgetError("no NATIVEPERF1 records found")
     threads: list[ProfileThread] = []
+    profile_versions: set[int] = set()
     for (pid, tid, era), frames in sorted(groups.items()):
-        missing = REQUIRED_FRAMES - set(frames)
+        versions = group_versions.get((pid, tid, era), set())
+        if len(versions) > 1:
+            raise BudgetError(
+                f"mixed native profile contract versions for {(pid, tid, era)}"
+            )
+        version = versions.pop() if versions else 1
+        required = REQUIRED_FRAMES if version == 1 else REQUIRED_FRAMES_V2
+        missing = required - set(frames)
         if missing:
             raise BudgetError(
                 f"missing profile frames for {(pid, tid, era)}: {', '.join(sorted(missing))}"
             )
+        profile_versions.add(version)
         values = tuple(
             sorted(
                 (f"{frame}.{field}", value)
@@ -851,13 +894,20 @@ def parse_nativeperf(lines: Iterable[str]) -> ProfileRun:
             )
         )
         threads.append(ProfileThread(pid, tid, era, frozenset(frames), values))
-    return ProfileRun(tuple(threads))
+    if len(profile_versions) > 1:
+        raise BudgetError(
+            "mixed native profile contract versions across thread groups"
+        )
+    return ProfileRun(
+        tuple(threads), version=profile_versions.pop() if profile_versions else 1
+    )
 
 
 def validate_profile(run: ProfileRun) -> None:
     if not run.threads:
         raise BudgetError("native profile has no complete threads")
     identities: set[tuple[int, int, int]] = set()
+    startup_by_pid: dict[int, tuple[int, int]] = {}
     for thread in run.threads:
         identity = (thread.pid, thread.tid, thread.era)
         if identity in identities:
@@ -919,6 +969,25 @@ def validate_profile(run: ProfileRun) -> None:
         # Resolver time is a process-epoch delta assigned exactly once; it is
         # intentionally not compared with one thread's prepare phase.  The
         # cache-gauge frame is likewise a point-in-time gauge, never a delta.
+        if run.version == 2:
+            if thread.value("phases-b", "phase_blocked_cpu_ns") > thread.value(
+                "phases-b", "phase_blocked_ns"
+            ):
+                raise BudgetError(f"blocked CPU exceeds blocked wall for {identity}")
+            startup = (
+                thread.value("process", "startup_wall_ns"),
+                thread.value("process", "startup_cpu_ns"),
+            )
+            if startup[1] > thread.value("process", "process_cpu_ns"):
+                raise BudgetError(f"startup CPU exceeds process CPU for {identity}")
+            # The startup window is claimed exactly once per process and
+            # republished verbatim on every group of the pid. process_cpu_ns
+            # stays a per-flush gauge: neither identical nor monotonic across
+            # a pid's groups.
+            if startup_by_pid.setdefault(thread.pid, startup) != startup:
+                raise BudgetError(
+                    f"startup gauge differs across pid {thread.pid} thread groups"
+                )
 
 
 SENSITIVE_ORDER = (
@@ -2134,17 +2203,27 @@ def _parse_profile_json(value: object) -> ProfileRun | None:
     if not isinstance(threads_raw, list):
         raise BudgetError("profile threads must be an array")
     threads = []
+    profile_versions: set[int] = set()
     for entry in threads_raw:
         thread = _exact_mapping(entry, {"pid", "tid", "era", "frames", "values"}, "profile thread")
         frames = thread["frames"]
         values = thread["values"]
-        if not isinstance(frames, list) or frames != sorted(REQUIRED_FRAMES):
+        if not isinstance(frames, list):
             raise BudgetError("profile thread frames are not the exact required set")
+        if frames == sorted(REQUIRED_FRAMES):
+            version = 1
+            fields_by_frame = FRAME_FIELDS
+        elif frames == sorted(REQUIRED_FRAMES_V2):
+            version = 2
+            fields_by_frame = FRAME_FIELDS_V2
+        else:
+            raise BudgetError("profile thread frames are not the exact required set")
+        profile_versions.add(version)
         if not isinstance(values, dict) or not all(isinstance(key, str) for key in values):
             raise BudgetError("profile thread values must be an object")
         expected_keys = {
             f"{frame}.{field}"
-            for frame, fields in FRAME_FIELDS.items()
+            for frame, fields in fields_by_frame.items()
             for field in fields
         }
         unknown_keys = set(values) - expected_keys
@@ -2166,7 +2245,11 @@ def _parse_profile_json(value: object) -> ProfileRun | None:
                 parsed_values,
             )
         )
-    profile = ProfileRun(tuple(threads))
+    if len(profile_versions) > 1:
+        raise BudgetError("mixed native profile contract versions across thread groups")
+    profile = ProfileRun(
+        tuple(threads), version=profile_versions.pop() if profile_versions else 1
+    )
     validate_profile(profile)
     return profile
 
