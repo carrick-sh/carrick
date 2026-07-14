@@ -147,16 +147,16 @@ def dtrace_rows(run_id="run-1", pid=42):
         "completion": completion,
     }
     return [
-        {**base, "scope": {"phase": "prepare", "pid": pid, "kind": 1},
+        {**base, "scope": {"phase": "prepare", "pid": pid, "kind": "1"},
          "metric": {"type": "exact", "count": 1, "total_ns": 1,
                     "minimum_ns": 1, "maximum_ns": 1}},
-        {**base, "scope": {"phase": "prepare", "pid": pid, "kind": 2},
+        {**base, "scope": {"phase": "prepare", "pid": pid, "kind": "2"},
          "metric": {"type": "exact", "count": 1, "total_ns": 1,
                     "minimum_ns": 1, "maximum_ns": 1}},
-        {**base, "scope": {"phase": "run", "pid": pid, "kind": 1},
+        {**base, "scope": {"phase": "run", "pid": pid, "kind": "1"},
          "metric": {"type": "exact", "count": 1, "total_ns": 1,
                     "minimum_ns": 1, "maximum_ns": 1}},
-        {**base, "scope": {"phase": "run", "pid": pid, "kind": 2},
+        {**base, "scope": {"phase": "run", "pid": pid, "kind": "2"},
          "metric": {"type": "exact", "count": 1, "total_ns": 1,
                     "minimum_ns": 1, "maximum_ns": 1}},
         {**base, "scope": {}, "metric": {"type": "completion"}},
@@ -679,6 +679,11 @@ class ReviewFixContractTests(unittest.TestCase):
             ]
             summary.write_text("".join(json.dumps(row) + "\n" for row in bad))
             with self.assertRaisesRegex(budget.BudgetError, "DTrace.*incomplete"):
+                budget.parse_dtrace_summary(summary, expected_run_id="run-1")
+            malformed_kind = dtrace_rows(run_id="run-1", pid=42)
+            malformed_kind[0]["scope"]["kind"] = "01"
+            summary.write_text("".join(json.dumps(row) + "\n" for row in malformed_kind))
+            with self.assertRaisesRegex(budget.BudgetError, "canonical decimal"):
                 budget.parse_dtrace_summary(summary, expected_run_id="run-1")
 
     def test_typed_outcomes_record_trap_ceiling_but_analysis_rejects_it(self):
