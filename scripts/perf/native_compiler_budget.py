@@ -2043,26 +2043,34 @@ def analyze(records: Sequence[RunRecord]) -> DecisionRecord:
         scope: next((name for _, name in SENSITIVE_ORDER if shares[name] >= 0.30), None)
         for scope, shares in scoped_sensitive.items()
     }
+    # A scope disagreement on the >=30% sensitive slice does not abort the
+    # analysis: it ABSTAINS.  Agreement (including agreement that no kind
+    # reaches 30%) is unchanged, and remains REQUIRED for a count decision
+    # to fire here.  The disagreement detail is carried forward so that, if
+    # no later rung independently decides, the eventual fail-closed error
+    # stays honest about why the count evidence could not decide.
+    scope_disagreements: list[str] = []
     if len(set(sensitive_slice_by_scope.values())) != 1:
-        raise BudgetError(
+        scope_disagreements.append(
             "count-evidence thread scopes disagree on the sensitive slice: "
             + ", ".join(
                 f"{scope}={name}" for scope, name in sorted(sensitive_slice_by_scope.items())
             )
         )
-    agreed_sensitive = sensitive_slice_by_scope["hottest-thread"]
-    if agreed_sensitive is not None:
-        return DecisionRecord(
-            RESULT_SCHEMA,
-            "decision",
-            f"sensitive-{agreed_sensitive}",
-            scoped_sensitive["hottest-thread"][agreed_sensitive],
-            "reconciled-profile-counts",
-            "hottest-thread+aggregate-threads",
-            tuple(record.run_id for record in profiled),
-            profile_tax,
-            duration_usable,
-        )
+    else:
+        agreed_sensitive = sensitive_slice_by_scope["hottest-thread"]
+        if agreed_sensitive is not None:
+            return DecisionRecord(
+                RESULT_SCHEMA,
+                "decision",
+                f"sensitive-{agreed_sensitive}",
+                scoped_sensitive["hottest-thread"][agreed_sensitive],
+                "reconciled-profile-counts",
+                "hottest-thread+aggregate-threads",
+                tuple(record.run_id for record in profiled),
+                profile_tax,
+                duration_usable,
+            )
     resolver_by_scope = {
         scope: _mean(
             [evidence.resolver_exit_share for evidence in count_evidence],
@@ -2163,22 +2171,35 @@ def analyze(records: Sequence[RunRecord]) -> DecisionRecord:
     selected_pairs = {
         None if best is None else (best[1], best[2]) for best in count_best.values()
     }
+    # Same abstention semantic as the single-kind sensitive rung: a scope
+    # disagreement on the best two-term pair does not abort the analysis
+    # here either.  It abstains, carrying the disagreement forward, and
+    # evaluation falls through to the duration two-term rung.  Agreement is
+    # unchanged and still required for a two-term count decision to fire.
     if len(selected_pairs) != 1:
-        raise BudgetError("count-evidence thread scopes disagree on the two-term slice")
-    best = count_best["hottest-thread"]
-    if best is not None:
-        share, left, right = best
-        return DecisionRecord(
-            RESULT_SCHEMA,
-            "decision",
-            f"{left}+{right}",
-            share,
-            "two-term-profile-counts",
-            "hottest-thread+aggregate-threads",
-            tuple(record.run_id for record in profiled),
-            profile_tax,
-            duration_usable,
+        scope_disagreements.append(
+            "count-evidence thread scopes disagree on the two-term slice: "
+            + ", ".join(
+                f"{scope}="
+                + ("None" if best is None else f"{best[1]}+{best[2]}")
+                for scope, best in sorted(count_best.items())
+            )
         )
+    else:
+        best = count_best["hottest-thread"]
+        if best is not None:
+            share, left, right = best
+            return DecisionRecord(
+                RESULT_SCHEMA,
+                "decision",
+                f"{left}+{right}",
+                share,
+                "two-term-profile-counts",
+                "hottest-thread+aggregate-threads",
+                tuple(record.run_id for record in profiled),
+                profile_tax,
+                duration_usable,
+            )
     duration_best = (
         two_term_best([(share, name) for name, share in duration_shares.items()])
         if duration_usable
@@ -2201,7 +2222,11 @@ def analyze(records: Sequence[RunRecord]) -> DecisionRecord:
         raise BudgetError(
             f"duration evidence unavailable: ABBA profile tax {profile_tax:.3f} exceeds 0.10"
         )
-    raise BudgetError("no independently verified slice satisfies the committed rule")
+    detail = "; ".join(scope_disagreements)
+    raise BudgetError(
+        "no independently verified slice satisfies the committed rule"
+        + (f" ({detail})" if detail else "")
+    )
 
 
 def _repo_root() -> pathlib.Path:
