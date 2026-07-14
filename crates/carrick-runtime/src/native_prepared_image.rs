@@ -4,12 +4,20 @@
 // production code.
 #![allow(dead_code)]
 
+#[cfg(target_os = "macos")]
 use crate::elf::{RoSpan, SegmentPerms};
-use crate::memory::{AddressSpace, AddressSpaceMetadata, MemoryRegion, MemoryRegionMetadata};
+use crate::memory::MemoryRegion;
+#[cfg(target_os = "macos")]
+use crate::memory::{AddressSpace, AddressSpaceMetadata, MemoryRegionMetadata};
 use serde::{Deserialize, Serialize};
+#[cfg(target_os = "macos")]
 use sha2::{Digest, Sha256};
+#[cfg(target_os = "macos")]
 use std::fs::File;
-use std::os::fd::{FromRawFd, RawFd};
+#[cfg(target_os = "macos")]
+use std::os::fd::FromRawFd;
+use std::os::fd::RawFd;
+#[cfg(target_os = "macos")]
 use std::os::unix::fs::FileExt;
 
 const PREPARED_IMAGE_MAGIC: &[u8; 16] = b"CARRICK-PREP-V1\0";
@@ -20,12 +28,35 @@ const MAX_ARTIFACT_SIZE: u64 = 1_073_741_824;
 const MAX_WRITTEN_BYTES: u64 = 536_870_912;
 const MAX_AUXV_BYTES: usize = 65_536;
 
+#[derive(Debug, Clone, Copy)]
+#[cfg(target_os = "macos")]
+struct PreparedImageLimits {
+    max_regions: usize,
+    max_initialized_spans: usize,
+    max_artifact_size: u64,
+    max_written_bytes: u64,
+    max_auxv_bytes: usize,
+}
+
+#[cfg(target_os = "macos")]
+impl PreparedImageLimits {
+    const fn v1() -> Self {
+        Self {
+            max_regions: MAX_REGIONS,
+            max_initialized_spans: MAX_INITIALIZED_SPANS,
+            max_artifact_size: MAX_ARTIFACT_SIZE,
+            max_written_bytes: MAX_WRITTEN_BYTES,
+            max_auxv_bytes: MAX_AUXV_BYTES,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PreparedGuestVa(u64);
 
 impl PreparedGuestVa {
-    fn new(value: u64) -> Self {
-        Self(value)
+    pub(crate) fn new(value: u64) -> Option<Self> {
+        (value <= crate::memory::LINUX_STACK_TOP).then_some(Self(value))
     }
 
     pub(crate) fn get(self) -> u64 {
@@ -37,8 +68,8 @@ impl PreparedGuestVa {
 pub(crate) struct PreparedGuestLen(u64);
 
 impl PreparedGuestLen {
-    fn new(value: u64, _stage: &'static str) -> Result<Self, NativePreparedImageError> {
-        Ok(Self(value))
+    fn new(value: u64) -> Option<Self> {
+        (value != 0 && value <= MAX_ARTIFACT_SIZE).then_some(Self(value))
     }
 
     pub(crate) fn get(self) -> u64 {
@@ -47,11 +78,24 @@ impl PreparedGuestLen {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct PreparedGuestOffset(u64);
+
+impl PreparedGuestOffset {
+    fn new(value: u64) -> Option<Self> {
+        (value <= MAX_ARTIFACT_SIZE).then_some(Self(value))
+    }
+
+    fn get(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PreparedArtifactOffset(u64);
 
 impl PreparedArtifactOffset {
-    fn new(value: u64) -> Self {
-        Self(value)
+    fn new(value: u64) -> Option<Self> {
+        (value <= MAX_ARTIFACT_SIZE).then_some(Self(value))
     }
 
     pub(crate) fn get(self) -> u64 {
@@ -63,10 +107,11 @@ impl PreparedArtifactOffset {
 pub(crate) struct PreparedRegionIndex(u16);
 
 impl PreparedRegionIndex {
-    fn new(value: usize) -> Result<Self, NativePreparedImageError> {
-        u16::try_from(value)
-            .map(Self)
-            .map_err(|_| validation("region-index-representation", Some(value), value as u64))
+    fn new(value: usize) -> Option<Self> {
+        if value >= MAX_REGIONS {
+            return None;
+        }
+        u16::try_from(value).ok().map(Self)
     }
 
     pub(crate) fn get(self) -> u16 {
@@ -76,8 +121,22 @@ impl PreparedRegionIndex {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct NativeRelativeRelocation {
-    pub(crate) address: u64,
-    pub(crate) value: u64,
+    address: PreparedGuestVa,
+    value: PreparedGuestVa,
+}
+
+impl NativeRelativeRelocation {
+    pub(crate) fn new(address: PreparedGuestVa, value: PreparedGuestVa) -> Self {
+        Self { address, value }
+    }
+
+    pub(crate) fn address(self) -> PreparedGuestVa {
+        self.address
+    }
+
+    pub(crate) fn value(self) -> PreparedGuestVa {
+        self.value
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,7 +158,7 @@ impl NativePreparedRegionV1 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct NativePreparedSpanV1 {
     region_index: PreparedRegionIndex,
-    guest_offset: PreparedGuestLen,
+    guest_offset: PreparedGuestOffset,
     artifact_offset: PreparedArtifactOffset,
     byte_len: PreparedGuestLen,
 }
@@ -132,6 +191,7 @@ pub(crate) struct NativePreparedImageV1 {
 }
 
 #[derive(Debug)]
+#[cfg(target_os = "macos")]
 pub(crate) struct PreparedImageArtifact {
     pub(crate) record: NativePreparedImageV1,
     pub(crate) file: File,
@@ -144,6 +204,7 @@ pub(crate) struct PreparedImageFileBacking {
 }
 
 #[derive(Debug)]
+#[cfg(target_os = "macos")]
 pub(crate) struct ValidatedPreparedImage {
     pub(crate) file: File,
     pub(crate) image: AddressSpace,
@@ -152,6 +213,7 @@ pub(crate) struct ValidatedPreparedImage {
 }
 
 #[derive(Debug)]
+#[cfg(target_os = "macos")]
 pub(crate) enum PreparedImageDisposition {
     Prepared(PreparedImageArtifact),
     Ineligible(PreparedImageIneligibleReason),
@@ -199,6 +261,7 @@ pub(crate) enum NativePreparedImageError {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[cfg(target_os = "macos")]
 struct FileIdentity {
     device: u64,
     inode: u64,
@@ -207,6 +270,7 @@ struct FileIdentity {
     fd_flags: i32,
 }
 
+#[cfg(target_os = "macos")]
 impl FileIdentity {
     fn for_fd(fd: RawFd) -> Result<Self, NativePreparedImageError> {
         let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
@@ -243,8 +307,10 @@ impl FileIdentity {
     }
 }
 
+#[cfg(target_os = "macos")]
 struct RawFdGuard(RawFd);
 
+#[cfg(target_os = "macos")]
 impl Drop for RawFdGuard {
     fn drop(&mut self) {
         unsafe {
@@ -277,23 +343,39 @@ pub(crate) fn native_region_copy_window(
     offset..region.bytes().len()
 }
 
+#[cfg(target_os = "macos")]
 pub(crate) fn prepare(
     image: &AddressSpace,
     relocations: &[NativeRelativeRelocation],
     host_page_size: u64,
 ) -> Result<PreparedImageDisposition, NativePreparedImageError> {
-    if image.regions().len() > MAX_REGIONS {
+    prepare_with_limits(
+        image,
+        relocations,
+        host_page_size,
+        PreparedImageLimits::v1(),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn prepare_with_limits(
+    image: &AddressSpace,
+    relocations: &[NativeRelativeRelocation],
+    host_page_size: u64,
+    limits: PreparedImageLimits,
+) -> Result<PreparedImageDisposition, NativePreparedImageError> {
+    if image.regions().len() > limits.max_regions {
         return Ok(ineligible_limit(
             "region-count",
             image.regions().len() as u64,
-            MAX_REGIONS as u64,
+            limits.max_regions as u64,
         ));
     }
-    if image.linux_auxv_image().len() > MAX_AUXV_BYTES {
+    if image.linux_auxv_image().len() > limits.max_auxv_bytes {
         return Ok(ineligible_limit(
             "auxv-bytes",
             image.linux_auxv_image().len() as u64,
-            MAX_AUXV_BYTES as u64,
+            limits.max_auxv_bytes as u64,
         ));
     }
     if host_page_size == 0 || !host_page_size.is_power_of_two() {
@@ -329,20 +411,29 @@ pub(crate) fn prepare(
         let next_size = artifact_size
             .checked_add(extent)
             .ok_or_else(|| validation("artifact-size-overflow", Some(index), extent))?;
-        if next_size > MAX_ARTIFACT_SIZE {
+        if next_size > limits.max_artifact_size {
             return Ok(ineligible_limit(
                 "artifact-size",
                 next_size,
-                MAX_ARTIFACT_SIZE,
+                limits.max_artifact_size,
             ));
         }
+        let guest_start = PreparedGuestVa::new(region.start)
+            .ok_or_else(|| validation("region-start-representation", Some(index), region.start))?;
+        let guest_end = PreparedGuestVa::new(region.end)
+            .ok_or_else(|| validation("region-end-representation", Some(index), region.end))?;
+        let artifact_offset = PreparedArtifactOffset::new(artifact_size).ok_or_else(|| {
+            validation("artifact-offset-representation", Some(index), artifact_size)
+        })?;
+        let artifact_extent = PreparedGuestLen::new(extent)
+            .ok_or_else(|| validation("artifact-extent-representation", Some(index), extent))?;
         regions.push(NativePreparedRegionV1 {
-            guest_start: PreparedGuestVa::new(region.start),
-            guest_end: PreparedGuestVa::new(region.end),
+            guest_start,
+            guest_end,
             permissions: permissions_to_wire(region.perms),
             shared: region.shared,
-            artifact_offset: PreparedArtifactOffset::new(artifact_size),
-            artifact_extent: PreparedGuestLen::new(extent, "artifact-region-extent")?,
+            artifact_offset,
+            artifact_extent,
         });
         artifact_size = next_size;
     }
@@ -366,6 +457,54 @@ pub(crate) fn prepare(
                 .min(window.end);
             let page = &region.bytes()[cursor..next_boundary];
             if page.iter().any(|byte| *byte != 0) {
+                if run_start.is_none() {
+                    let projected_spans =
+                        initialized_spans.len().checked_add(1).ok_or_else(|| {
+                            validation(
+                                "initialized-span-count-overflow",
+                                Some(region_index),
+                                initialized_spans.len() as u64,
+                            )
+                        })?;
+                    if projected_spans > limits.max_initialized_spans {
+                        return Ok(ineligible_limit(
+                            "initialized-span-count",
+                            projected_spans as u64,
+                            limits.max_initialized_spans as u64,
+                        ));
+                    }
+                }
+                let pending_bytes = u64::try_from(run_bytes.len())
+                    .ok()
+                    .and_then(|length| {
+                        u64::try_from(page.len())
+                            .ok()
+                            .and_then(|page_length| length.checked_add(page_length))
+                    })
+                    .ok_or_else(|| {
+                        validation(
+                            "projected-written-byte-overflow",
+                            Some(region_index),
+                            written_byte_count,
+                        )
+                    })?;
+                let projected_written =
+                    written_byte_count
+                        .checked_add(pending_bytes)
+                        .ok_or_else(|| {
+                            validation(
+                                "projected-written-byte-overflow",
+                                Some(region_index),
+                                written_byte_count,
+                            )
+                        })?;
+                if projected_written > limits.max_written_bytes {
+                    return Ok(ineligible_limit(
+                        "written-byte-count",
+                        projected_written,
+                        limits.max_written_bytes,
+                    ));
+                }
                 run_start.get_or_insert(cursor);
                 run_bytes.extend_from_slice(page);
             } else if let Some(start) = run_start.take() {
@@ -392,20 +531,6 @@ pub(crate) fn prepare(
                 &mut written_byte_count,
             )?;
         }
-        if initialized_spans.len() > MAX_INITIALIZED_SPANS {
-            return Ok(ineligible_limit(
-                "initialized-span-count",
-                initialized_spans.len() as u64,
-                MAX_INITIALIZED_SPANS as u64,
-            ));
-        }
-        if written_byte_count > MAX_WRITTEN_BYTES {
-            return Ok(ineligible_limit(
-                "written-byte-count",
-                written_byte_count,
-                MAX_WRITTEN_BYTES,
-            ));
-        }
     }
 
     let file = tempfile::tempfile().map_err(|source| NativePreparedImageError::Io {
@@ -419,6 +544,35 @@ pub(crate) fn prepare(
         })?;
     let identity = FileIdentity::for_fd(std::os::fd::AsRawFd::as_raw_fd(&file))?
         .require_regular(std::os::fd::AsRawFd::as_raw_fd(&file))?;
+    let entry = PreparedGuestVa::new(image.entry())
+        .ok_or_else(|| validation("entry-representation", None, image.entry()))?;
+    let initial_stack_pointer_raw = image
+        .initial_stack_pointer()
+        .ok_or_else(|| validation("missing-initial-stack-pointer", None, 0))?;
+    let initial_stack_pointer =
+        PreparedGuestVa::new(initial_stack_pointer_raw).ok_or_else(|| {
+            validation(
+                "initial-stack-pointer-representation",
+                None,
+                initial_stack_pointer_raw,
+            )
+        })?;
+    let ro_spans = image
+        .ro_spans()
+        .iter()
+        .enumerate()
+        .map(|(index, span)| {
+            Ok(NativePreparedRoSpanV1 {
+                start: PreparedGuestVa::new(span.start).ok_or_else(|| {
+                    validation("ro-span-start-representation", Some(index), span.start)
+                })?,
+                len: PreparedGuestLen::new(span.len).ok_or_else(|| {
+                    validation("ro-span-length-representation", Some(index), span.len)
+                })?,
+                exec: span.exec,
+            })
+        })
+        .collect::<Result<Vec<_>, NativePreparedImageError>>()?;
     let mut record = NativePreparedImageV1 {
         artifact_fd: std::os::fd::AsRawFd::as_raw_fd(&file),
         original_host_fd_flags: identity.fd_flags,
@@ -427,24 +581,12 @@ pub(crate) fn prepare(
         artifact_size,
         version: PREPARED_IMAGE_VERSION,
         host_page_size,
-        entry: PreparedGuestVa::new(image.entry()),
-        initial_stack_pointer: PreparedGuestVa::new(
-            image
-                .initial_stack_pointer()
-                .ok_or_else(|| validation("missing-initial-stack-pointer", None, 0))?,
-        ),
+        entry,
+        initial_stack_pointer,
         auxv: image.linux_auxv_image().to_vec(),
         regions,
         initialized_spans,
-        ro_spans: image
-            .ro_spans()
-            .iter()
-            .map(|span| NativePreparedRoSpanV1 {
-                start: PreparedGuestVa::new(span.start),
-                len: PreparedGuestLen(span.len),
-                exec: span.exec,
-            })
-            .collect(),
+        ro_spans,
         relocations: relocations.to_vec(),
         written_byte_count,
         digest: [0; 32],
@@ -470,31 +612,30 @@ pub(crate) fn prepare(
     }))
 }
 
+#[cfg(target_os = "macos")]
 pub(crate) fn validate_for_resume(
     record: NativePreparedImageV1,
 ) -> Result<ValidatedPreparedImage, NativePreparedImageError> {
     let inherited = RawFdGuard(record.artifact_fd);
-    let inherited_identity = FileIdentity::for_fd(inherited.0)?.require_regular(inherited.0)?;
-    let expected_transit_flags = record.original_host_fd_flags & !libc::FD_CLOEXEC;
-    if inherited_identity.fd_flags != expected_transit_flags {
-        return Err(file_identity_error(
-            "artifact-transit-fd-flags",
-            inherited.0,
-            format!(
-                "expected=0x{expected_transit_flags:x}, actual=0x{:x}",
-                inherited_identity.fd_flags
-            ),
-        ));
-    }
-    verify_identity_fields(&record, &inherited_identity, inherited.0, false)?;
     let duplicate = unsafe { libc::fcntl(inherited.0, libc::F_DUPFD_CLOEXEC, 0) };
     if duplicate < 0 {
         return Err(io_error("duplicate-artifact-fd"));
     }
     let file = unsafe { File::from_raw_fd(duplicate) };
-    drop(inherited);
+
+    let inherited_flags = fd_flags_for_fd(inherited.0, "get-inherited-artifact-fd-flags")?;
+    let expected_transit_flags = record.original_host_fd_flags & !libc::FD_CLOEXEC;
+    if inherited_flags != expected_transit_flags {
+        return Err(file_identity_error(
+            "artifact-transit-fd-flags",
+            inherited.0,
+            format!("expected=0x{expected_transit_flags:x}, actual=0x{inherited_flags:x}"),
+        ));
+    }
 
     let duplicate_identity = FileIdentity::for_fd(duplicate)?.require_regular(duplicate)?;
+    verify_identity_fields(&record, &duplicate_identity, duplicate, true)?;
+    drop(inherited);
     validate_record(&record, &duplicate_identity)?;
     let actual_digest = digest_with_file_payload(&record, &file)?;
     if actual_digest != record.digest {
@@ -548,6 +689,16 @@ pub(crate) fn validate_for_resume(
     })
 }
 
+#[cfg(target_os = "macos")]
+fn fd_flags_for_fd(fd: RawFd, stage: &'static str) -> Result<i32, NativePreparedImageError> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(io_error(stage));
+    }
+    Ok(flags)
+}
+
+#[cfg(target_os = "macos")]
 fn validate_record(
     record: &NativePreparedImageV1,
     identity: &FileIdentity,
@@ -568,6 +719,16 @@ fn validate_record(
             "host-page-geometry",
             None,
             record.host_page_size,
+        ));
+    }
+    if PreparedGuestVa::new(record.entry.get()).is_none() {
+        return Err(validation("entry-representation", None, record.entry.get()));
+    }
+    if PreparedGuestVa::new(record.initial_stack_pointer.get()).is_none() {
+        return Err(validation(
+            "initial-stack-pointer-representation",
+            None,
+            record.initial_stack_pointer.get(),
         ));
     }
     verify_identity_fields(record, identity, record.artifact_fd, true)?;
@@ -611,7 +772,9 @@ fn validate_record(
     for (index, region) in record.regions.iter().enumerate() {
         let start = region.guest_start.get();
         let end = region.guest_end.get();
-        if start >= end
+        if PreparedGuestVa::new(start).is_none()
+            || PreparedGuestVa::new(end).is_none()
+            || start >= end
             || !start.is_multiple_of(record.host_page_size)
             || !end.is_multiple_of(record.host_page_size)
             || (index != 0 && start < previous_guest_end)
@@ -626,7 +789,9 @@ fn validate_record(
         let artifact_end = offset
             .checked_add(extent)
             .ok_or_else(|| validation("region-artifact-overflow", Some(index), offset))?;
-        if !offset.is_multiple_of(record.host_page_size)
+        if PreparedArtifactOffset::new(offset).is_none()
+            || PreparedGuestLen::new(extent).is_none()
+            || !offset.is_multiple_of(record.host_page_size)
             || !extent.is_multiple_of(record.host_page_size)
             || extent != align_up(region_len, record.host_page_size, "region-extent-check")?
             || artifact_end > record.artifact_size
@@ -658,22 +823,37 @@ fn validate_record(
             record.entry.get(),
         ));
     }
-    let stack_count = record
+    let stack_start = crate::memory::LINUX_STACK_TOP - crate::memory::LINUX_STACK_SIZE;
+    let stack_region_index = record
         .regions
         .iter()
-        .filter(|region| {
-            region.permissions & 0b010 != 0
-                && record.initial_stack_pointer.get() >= region.guest_start.get()
-                && record.initial_stack_pointer.get() < region.guest_end.get()
+        .position(|region| {
+            region.guest_start.get() == stack_start
+                && region.guest_end.get() == crate::memory::LINUX_STACK_TOP
         })
-        .count();
-    if stack_count != 1 {
+        .ok_or_else(|| validation("canonical-stack-region", None, stack_start))?;
+    let stack_region = &record.regions[stack_region_index];
+    if stack_region.permissions & 0b010 == 0
+        || record.initial_stack_pointer.get() < stack_start
+        || record.initial_stack_pointer.get() >= crate::memory::LINUX_STACK_TOP
+    {
         return Err(validation(
-            "stack-pointer-writable-region",
-            None,
+            "stack-pointer-canonical-region",
+            Some(stack_region_index),
             record.initial_stack_pointer.get(),
         ));
     }
+    let stack_initialized_floor = record
+        .initial_stack_pointer
+        .get()
+        .checked_sub(stack_start)
+        .ok_or_else(|| {
+            validation(
+                "stack-initialized-floor",
+                Some(stack_region_index),
+                record.initial_stack_pointer.get(),
+            )
+        })?;
 
     let mut calculated_written = 0_u64;
     let mut previous_span_end = 0_u64;
@@ -682,6 +862,24 @@ fn validate_record(
             return Err(validation("span-byte-length", Some(index), 0));
         }
         let region_index = usize::from(span.region_index.get());
+        if PreparedRegionIndex::new(region_index).is_none()
+            || PreparedGuestOffset::new(span.guest_offset.get()).is_none()
+            || PreparedArtifactOffset::new(span.artifact_offset.get()).is_none()
+            || PreparedGuestLen::new(span.byte_len.get()).is_none()
+        {
+            return Err(validation(
+                "span-domain-representation",
+                Some(index),
+                span.artifact_offset.get(),
+            ));
+        }
+        if region_index == stack_region_index && span.guest_offset.get() < stack_initialized_floor {
+            return Err(validation(
+                "stack-span-before-initial-sp",
+                Some(index),
+                span.guest_offset.get(),
+            ));
+        }
         let region = record
             .regions
             .get(region_index)
@@ -743,6 +941,14 @@ fn validate_record(
 
     for (index, span) in record.ro_spans.iter().enumerate() {
         let start = span.start.get();
+        if PreparedGuestVa::new(start).is_none() || PreparedGuestLen::new(span.len.get()).is_none()
+        {
+            return Err(validation(
+                "ro-span-domain-representation",
+                Some(index),
+                start,
+            ));
+        }
         if span.len.get() == 0 {
             return Err(validation("ro-span-length", Some(index), 0));
         }
@@ -765,29 +971,39 @@ fn validate_record(
         }
     }
     for (index, relocation) in record.relocations.iter().enumerate() {
-        let end = relocation.address.checked_add(8).ok_or_else(|| {
+        if PreparedGuestVa::new(relocation.address().get()).is_none()
+            || PreparedGuestVa::new(relocation.value().get()).is_none()
+        {
+            return Err(validation(
+                "relocation-domain-representation",
+                Some(index),
+                relocation.address().get(),
+            ));
+        }
+        let end = relocation.address().get().checked_add(8).ok_or_else(|| {
             validation(
                 "relocation-target-overflow",
                 Some(index),
-                relocation.address,
+                relocation.address().get(),
             )
         })?;
         let contained = record.regions.iter().any(|region| {
             region.permissions & 0b010 != 0
-                && relocation.address >= region.guest_start.get()
+                && relocation.address().get() >= region.guest_start.get()
                 && end <= region.guest_end.get()
         });
         if !contained {
             return Err(validation(
                 "relocation-target-writable",
                 Some(index),
-                relocation.address,
+                relocation.address().get(),
             ));
         }
     }
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
 fn push_initialized_span(
     region_index: usize,
     region: &NativePreparedRegionV1,
@@ -810,15 +1026,30 @@ fn push_initialized_span(
         .checked_add(byte_len)
         .ok_or_else(|| validation("written-byte-overflow", Some(region_index), byte_len))?;
     spans.push(NativePreparedSpanV1 {
-        region_index: PreparedRegionIndex::new(region_index)?,
-        guest_offset: PreparedGuestLen::new(guest_offset, "span-guest-offset")?,
-        artifact_offset: PreparedArtifactOffset::new(artifact_offset),
-        byte_len: PreparedGuestLen::new(byte_len, "span-byte-length")?,
+        region_index: PreparedRegionIndex::new(region_index).ok_or_else(|| {
+            validation(
+                "region-index-representation",
+                Some(region_index),
+                region_index as u64,
+            )
+        })?,
+        guest_offset: PreparedGuestOffset::new(guest_offset)
+            .ok_or_else(|| validation("span-guest-offset", Some(region_index), guest_offset))?,
+        artifact_offset: PreparedArtifactOffset::new(artifact_offset).ok_or_else(|| {
+            validation(
+                "span-artifact-offset-representation",
+                Some(region_index),
+                artifact_offset,
+            )
+        })?,
+        byte_len: PreparedGuestLen::new(byte_len)
+            .ok_or_else(|| validation("span-byte-length", Some(region_index), byte_len))?,
     });
     payloads.push(payload);
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
 fn verify_identity_fields(
     record: &NativePreparedImageV1,
     identity: &FileIdentity,
@@ -849,6 +1080,7 @@ fn verify_identity_fields(
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
 fn digest_metadata(record: &NativePreparedImageV1) -> Sha256 {
     let mut hasher = Sha256::new();
     hasher.update(PREPARED_IMAGE_MAGIC);
@@ -882,12 +1114,13 @@ fn digest_metadata(record: &NativePreparedImageV1) -> Sha256 {
     }
     hash_u64(&mut hasher, record.relocations.len() as u64);
     for relocation in &record.relocations {
-        hash_u64(&mut hasher, relocation.address);
-        hash_u64(&mut hasher, relocation.value);
+        hash_u64(&mut hasher, relocation.address().get());
+        hash_u64(&mut hasher, relocation.value().get());
     }
     hasher
 }
 
+#[cfg(target_os = "macos")]
 fn digest_with_file_payload(
     record: &NativePreparedImageV1,
     file: &File,
@@ -907,10 +1140,12 @@ fn digest_with_file_payload(
     Ok(hasher.finalize().into())
 }
 
+#[cfg(target_os = "macos")]
 fn permissions_to_wire(perms: SegmentPerms) -> u8 {
     u8::from(perms.read) | (u8::from(perms.write) << 1) | (u8::from(perms.execute) << 2)
 }
 
+#[cfg(target_os = "macos")]
 fn permissions_from_wire(
     value: u8,
     index: usize,
@@ -929,6 +1164,7 @@ fn permissions_from_wire(
     })
 }
 
+#[cfg(target_os = "macos")]
 fn align_up(
     value: u64,
     alignment: u64,
@@ -943,24 +1179,29 @@ fn align_up(
         .ok_or_else(|| validation(stage, None, value))
 }
 
+#[cfg(target_os = "macos")]
 fn host_page_size() -> Result<u64, NativePreparedImageError> {
     let value = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     u64::try_from(value).map_err(|_| io_error("host-page-size"))
 }
 
+#[cfg(target_os = "macos")]
 fn hash_u32(hasher: &mut Sha256, value: u32) {
     hasher.update(value.to_le_bytes());
 }
 
+#[cfg(target_os = "macos")]
 fn hash_u64(hasher: &mut Sha256, value: u64) {
     hasher.update(value.to_le_bytes());
 }
 
+#[cfg(target_os = "macos")]
 fn hash_bytes(hasher: &mut Sha256, bytes: &[u8]) {
     hash_u64(hasher, bytes.len() as u64);
     hasher.update(bytes);
 }
 
+#[cfg(target_os = "macos")]
 fn validation(stage: &'static str, index: Option<usize>, value: u64) -> NativePreparedImageError {
     NativePreparedImageError::Validation {
         stage,
@@ -969,6 +1210,7 @@ fn validation(stage: &'static str, index: Option<usize>, value: u64) -> NativePr
     }
 }
 
+#[cfg(target_os = "macos")]
 fn io_error(stage: &'static str) -> NativePreparedImageError {
     NativePreparedImageError::Io {
         stage,
@@ -976,10 +1218,12 @@ fn io_error(stage: &'static str) -> NativePreparedImageError {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn file_identity_error(stage: &'static str, fd: RawFd, reason: String) -> NativePreparedImageError {
     NativePreparedImageError::FileIdentity { stage, fd, reason }
 }
 
+#[cfg(target_os = "macos")]
 fn ineligible_limit(stage: &'static str, value: u64, limit: u64) -> PreparedImageDisposition {
     PreparedImageDisposition::Ineligible(PreparedImageIneligibleReason::RepresentationLimit {
         stage,
@@ -989,6 +1233,7 @@ fn ineligible_limit(stage: &'static str, value: u64, limit: u64) -> PreparedImag
 }
 
 #[cfg(test)]
+#[cfg(target_os = "macos")]
 mod tests {
     use super::*;
     use crate::elf::SegmentPerms;
@@ -1049,14 +1294,14 @@ mod tests {
     fn relocations() -> Vec<NativeRelativeRelocation> {
         let stack_target = LINUX_STACK_TOP - 0x100;
         vec![
-            NativeRelativeRelocation {
-                address: stack_target,
-                value: 0x1234,
-            },
-            NativeRelativeRelocation {
-                address: stack_target - 8,
-                value: 0x5678,
-            },
+            NativeRelativeRelocation::new(
+                PreparedGuestVa::new(stack_target).unwrap(),
+                PreparedGuestVa::new(0x1234).unwrap(),
+            ),
+            NativeRelativeRelocation::new(
+                PreparedGuestVa::new(stack_target - 8).unwrap(),
+                PreparedGuestVa::new(0x5678).unwrap(),
+            ),
         ]
     }
 
@@ -1162,12 +1407,21 @@ mod tests {
         let mut record = validated_record(&artifact);
         record.artifact_fd = fds[0];
         let error = validate_for_resume(record).expect_err("pipe must be rejected");
+        assert_eq!(
+            unsafe { libc::fcntl(fds[0], libc::F_GETFD) },
+            -1,
+            "the inherited fd must close after an owned duplicate exists"
+        );
         unsafe {
             libc::close(fds[1]);
         }
         assert!(matches!(
             error,
-            NativePreparedImageError::FileIdentity { .. }
+            NativePreparedImageError::FileIdentity {
+                stage: "artifact-file-type",
+                fd,
+                ..
+            } if fd != fds[0]
         ));
     }
 
@@ -1311,12 +1565,52 @@ mod tests {
         assert_invalid(&auxv);
     }
 
+    fn assert_constructor_ineligible_at(limits: PreparedImageLimits, expected_stage: &str) {
+        let disposition =
+            prepare_with_limits(&synthetic_image(), &relocations(), HOST_PAGE_SIZE, limits)
+                .expect("limit selection is not an artifact error");
+        assert!(matches!(
+            disposition,
+            PreparedImageDisposition::Ineligible(
+                PreparedImageIneligibleReason::RepresentationLimit { stage, .. }
+            ) if stage == expected_stage
+        ));
+    }
+
+    #[test]
+    fn constructor_rejects_sparse_extent_before_artifact_creation() {
+        let mut limits = PreparedImageLimits::v1();
+        limits.max_artifact_size = LINUX_STACK_SIZE;
+        assert_constructor_ineligible_at(limits, "artifact-size");
+    }
+
+    #[test]
+    fn constructor_rejects_projected_span_before_buffering_it() {
+        let mut limits = PreparedImageLimits::v1();
+        limits.max_initialized_spans = 1;
+        assert_constructor_ineligible_at(limits, "initialized-span-count");
+    }
+
+    #[test]
+    fn constructor_rejects_projected_payload_before_growing_run_buffer() {
+        let mut limits = PreparedImageLimits::v1();
+        limits.max_written_bytes = 1;
+        assert_constructor_ineligible_at(limits, "written-byte-count");
+    }
+
+    #[test]
+    fn constructor_rejects_auxv_before_artifact_creation() {
+        let mut limits = PreparedImageLimits::v1();
+        limits.max_auxv_bytes = 1;
+        assert_constructor_ineligible_at(limits, "auxv-bytes");
+    }
+
     #[test]
     fn prepared_image_rejects_spans_outside_region_or_artifact() {
         let artifact = prepared();
         let mut record = validated_record(&artifact);
         record.initialized_spans[0].guest_offset =
-            PreparedGuestLen(record.regions[0].guest_len().unwrap());
+            PreparedGuestOffset(record.regions[0].guest_len().unwrap());
         assert_invalid(&record);
         let mut record = validated_record(&artifact);
         record.initialized_spans[0].artifact_offset = PreparedArtifactOffset(record.artifact_size);
@@ -1343,8 +1637,41 @@ mod tests {
         permissions.regions[0].permissions = 0b1000;
         assert_invalid(&permissions);
         let mut relocation = validated_record(&artifact);
-        relocation.relocations[0].address = relocation.regions[0].guest_start.get();
+        relocation.relocations[0].address = relocation.regions[0].guest_start;
         assert_invalid(&relocation);
+    }
+
+    #[test]
+    fn prepared_image_rejects_sp_in_noncanonical_writable_region() {
+        let artifact = prepared();
+        let mut record = validated_record(&artifact);
+        record.regions[0].permissions |= 0b010;
+        record.initial_stack_pointer = record.regions[0].guest_start;
+
+        assert_invalid(&record);
+    }
+
+    #[test]
+    fn prepared_image_rejects_initialized_stack_bytes_before_sp() {
+        let artifact = prepared();
+        let mut record = validated_record(&artifact);
+        let stack_start = LINUX_STACK_TOP - LINUX_STACK_SIZE;
+        let stack_index = record
+            .regions
+            .iter()
+            .position(|region| region.guest_start.get() == stack_start)
+            .unwrap();
+        let span = record
+            .initialized_spans
+            .iter_mut()
+            .find(|span| usize::from(span.region_index.get()) == stack_index)
+            .unwrap();
+        let before_sp = record.initial_stack_pointer.get() - stack_start - 1;
+        span.guest_offset = PreparedGuestOffset(before_sp);
+        span.artifact_offset =
+            PreparedArtifactOffset(record.regions[stack_index].artifact_offset.get() + before_sp);
+
+        assert_invalid(&record);
     }
 
     #[test]
@@ -1451,5 +1778,25 @@ mod tests {
         let json = serde_json::to_vec(&artifact.record).unwrap();
         let decoded: NativePreparedImageV1 = serde_json::from_slice(&json).unwrap();
         assert_eq!(decoded, artifact.record);
+    }
+
+    #[test]
+    fn typed_wire_domains_reject_out_of_range_construction() {
+        assert!(PreparedGuestVa::new(LINUX_STACK_TOP + 1).is_none());
+        assert!(PreparedGuestLen::new(0).is_none());
+        assert!(PreparedGuestLen::new(MAX_ARTIFACT_SIZE + 1).is_none());
+        assert!(PreparedGuestOffset::new(MAX_ARTIFACT_SIZE + 1).is_none());
+        assert!(PreparedArtifactOffset::new(MAX_ARTIFACT_SIZE + 1).is_none());
+        assert!(PreparedRegionIndex::new(MAX_REGIONS).is_none());
+    }
+
+    #[test]
+    fn relative_relocation_keeps_target_and_value_in_guest_va_domain() {
+        let target = PreparedGuestVa::new(LINUX_STACK_TOP - 0x100).unwrap();
+        let value = PreparedGuestVa::new(0x1234).unwrap();
+        let relocation = NativeRelativeRelocation::new(target, value);
+
+        assert_eq!(relocation.address().get(), LINUX_STACK_TOP - 0x100);
+        assert_eq!(relocation.value().get(), 0x1234);
     }
 }

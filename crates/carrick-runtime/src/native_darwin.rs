@@ -842,10 +842,21 @@ fn native_relative_relocations(
                         reloc.r_offset
                     ))
                 })?;
-                relocations.push(NativeRelativeRelocation {
-                    address: checked_add_u64(load_bias, reloc.r_offset, "relocation address")?,
-                    value: add_load_bias(load_bias, addend)?,
-                });
+                let address_raw = checked_add_u64(load_bias, reloc.r_offset, "relocation address")?;
+                let address = crate::native_prepared_image::PreparedGuestVa::new(address_raw)
+                    .ok_or_else(|| {
+                        RuntimeError::Unsupported(format!(
+                            "native Darwin relocation address is outside the guest VA domain: 0x{address_raw:x}"
+                        ))
+                    })?;
+                let value_raw = add_load_bias(load_bias, addend)?;
+                let value = crate::native_prepared_image::PreparedGuestVa::new(value_raw)
+                    .ok_or_else(|| {
+                        RuntimeError::Unsupported(format!(
+                            "native Darwin relocation value is outside the guest VA domain: 0x{value_raw:x}"
+                        ))
+                    })?;
+                relocations.push(NativeRelativeRelocation::new(address, value));
             }
             R_AARCH64_NONE => {}
             other => {
@@ -907,7 +918,7 @@ fn apply_native_relative_relocations(
     relocations: &[NativeRelativeRelocation],
 ) -> Result<(), RuntimeError> {
     for relocation in relocations {
-        memory.write_u64(relocation.address, relocation.value)?;
+        memory.write_u64(relocation.address().get(), relocation.value().get())?;
     }
     Ok(())
 }
