@@ -731,6 +731,42 @@ fn biased_pre_post_writeback_stays_in_guest_coordinates() {
 
 #[cfg(target_arch = "aarch64")]
 #[test]
+fn biased_simd_pair_preindex_preserves_register_files_and_writeback() {
+    const BIAS: u64 = 0x80_0000_0000;
+    const GUEST: u64 = 0x7_0001_0000;
+    let host_bias = crate::native_darwin::address::NativeHostBias::new(BIAS, 16 * 1024)
+        .expect("construct host bias");
+    let mapping = crate::native_darwin::address::OwnedHostMapping::map_exact(
+        HostVa((BIAS + GUEST) as usize),
+        16 * 1024,
+        libc::PROT_READ | libc::PROT_WRITE,
+        libc::MAP_ANON | libc::MAP_PRIVATE,
+    )
+    .expect("map SIMD pair data");
+    let bytes = unsafe {
+        std::slice::from_raw_parts_mut(mapping.range().start.raw() as *mut u8, 16 * 1024)
+    };
+    for (index, byte) in bytes[32..64].iter_mut().enumerate() {
+        *byte = (index as u8).wrapping_mul(3).wrapping_add(1);
+    }
+
+    let mut stack = vec![0_u8; 16 * 1024];
+    let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    snapshot.x[1] = GUEST;
+    run_biased_single_memory(
+        0xadc1_0821, // ldp q1, q2, [x1, #32]!
+        GuestVa(0xc000),
+        host_bias,
+        &mut snapshot,
+    );
+
+    assert_eq!(snapshot.x[1], GUEST + 32);
+    assert_eq!(snapshot.v[1], bytes[32..48]);
+    assert_eq!(snapshot.v[2], bytes[48..64]);
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
 fn biased_simd_structure_post_index_matches_memequal_load() {
     const BIAS: u64 = 0x80_0000_0000;
     const GUEST: u64 = 0xa_0001_0000;
