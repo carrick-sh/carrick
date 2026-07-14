@@ -1452,20 +1452,14 @@ fn emit_biased_memory(
         super::types::MemoryClass::Scalar | super::types::MemoryClass::Pair
     ) && memory.writeback != super::types::MemoryWriteback::None
         && format!("{:?}", memory.op).starts_with("LD")
+        && super::decode::decoded_writeback_destination_overlaps_base(memory.word, guest)
     {
-        let encoded_base = (memory.word >> 5) & 0x1f;
-        let first_destination = memory.word & 0x1f;
-        let second_destination = (memory.word >> 10) & 0x1f;
-        let pair_overlap =
-            memory.class == super::types::MemoryClass::Pair && second_destination == encoded_base;
-        if first_destination == encoded_base || pair_overlap {
-            return Err(unsupported_action(
-                plan,
-                guest,
-                memory.word,
-                "constrained writeback load overlaps its base register",
-            ));
-        }
+        return Err(unsupported_action(
+            plan,
+            guest,
+            memory.word,
+            "constrained writeback load overlaps its base register",
+        ));
     }
     if let super::types::MemoryBase::Literal(target) = memory.base {
         let materialized = if target.raw() < super::super::address::BIASED_GUEST_LITERAL_TARGET_END
@@ -2918,6 +2912,23 @@ mod tests {
                 Err(DsrError::UnsupportedBlockAction { .. })
             ));
         }
+    }
+
+    #[test]
+    fn biased_simd_pair_writeback_does_not_alias_gpr_base_by_register_number() {
+        let word = 0xadc1_0821; // ldp q1, q2, [x1, #32]!
+        let mut plan = copy_plan();
+        plan.instructions = vec![PlannedInst {
+            guest: GuestVa(0x4000),
+            action: super::super::decode::classify(word, GuestVa(0x4000))
+                .expect("classify Go cgo SIMD pair load"),
+        }];
+        let host_bias =
+            crate::native_darwin::address::NativeHostBias::new(0x80_0000_0000, 16 * 1024)
+                .expect("construct host bias");
+        let mut cache = TranslationCache::new(16 * 1024).expect("allocate SIMD pair cache");
+        emit_block(&mut cache, &plan, EmitAddressMode::Biased { host_bias })
+            .expect("SIMD pair destination numbering must not overlap its GPR base");
     }
 
     #[test]
