@@ -611,6 +611,7 @@ version = "0.1.0"
 dependencies = [
  "carrick-abi",
  "libc",
+ "tempfile",
 ]
 
 [[package]]

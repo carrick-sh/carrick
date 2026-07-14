@@ -637,22 +637,21 @@ where
     run_image_in_child(image, dispatcher, max_traps, relative_relocations, plan)
 }
 
+type LoadedNativeExecveImage = (
+    AddressSpace,
+    Vec<NativeRelativeRelocation>,
+    String,
+    Vec<Vec<u8>>,
+    [u8; 32],
+);
+
 fn load_native_execve_image(
     dispatcher: &SyscallDispatcher,
     path: &str,
     argv: Vec<Vec<u8>>,
     env: Vec<Vec<u8>>,
     plan: &ExecutionPlan,
-) -> Result<
-    (
-        AddressSpace,
-        Vec<NativeRelativeRelocation>,
-        String,
-        Vec<Vec<u8>>,
-        [u8; 32],
-    ),
-    crate::linux_abi::LinuxErrno,
-> {
+) -> Result<LoadedNativeExecveImage, crate::linux_abi::LinuxErrno> {
     let geometry = plan
         .page_geometry
         .native_geometry()
@@ -742,6 +741,7 @@ pub(crate) fn resume_guest_from_capsule(
     }
     dispatcher.set_cwd(&guest.cwd);
     dispatcher.set_stream_stdio(guest.stream_stdio);
+    dispatcher.restore_native_reexec_process_state(&guest.process_state);
     dispatcher
         .restore_native_reexec_fd_table(&guest.fd_table)
         .map_err(|error| anyhow::anyhow!("restore native guest fd table: {error}"))?;
