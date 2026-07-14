@@ -208,7 +208,10 @@ pub fn run_carrick(
     let mut cmd = Command::new(&argv[0]); // nosemgrep
     cmd.args(&argv[1..]);
     // Scope comes from `--name <run_id>` in the argv now (carrick derives the
-    // proctitle/kill id from it) — no bespoke CARRICK_RUN_ID env needed.
+    // proctitle/kill id from it). Remove an operator's inherited outer scope:
+    // CARRICK_RUN_ID deliberately has precedence over --name, which otherwise
+    // makes every concurrent case share one cleanup identity.
+    clear_inherited_carrick_run_id(&mut cmd);
     // Hvf still sets the insecure-registry env on the LOCAL process; Kvm already
     // carried it INTO the guest argv (`env …`), so only set it for Hvf.
     if lane.needs_local_registry_env()
@@ -228,6 +231,10 @@ pub fn run_carrick(
         Engine::Carrick,
         Some(cleanup),
     )
+}
+
+fn clear_inherited_carrick_run_id(cmd: &mut Command) {
+    cmd.env_remove("CARRICK_RUN_ID");
 }
 
 pub fn run_docker(
@@ -443,6 +450,17 @@ fn kill_scoped(pid: i32, run_id: &str, engine: Engine, cleanup: Option<&CarrickC
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn carrick_command_removes_inherited_outer_run_id() {
+        let mut command = Command::new("carrick");
+        command.env("CARRICK_RUN_ID", "outer-scope");
+        clear_inherited_carrick_run_id(&mut command);
+
+        assert!(command.get_envs().any(|(key, value)| {
+            key == std::ffi::OsStr::new("CARRICK_RUN_ID") && value.is_none()
+        }));
+    }
     use crate::lane::DockerPlatform;
 
     #[test]
