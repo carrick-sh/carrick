@@ -1247,12 +1247,26 @@ mod imp {
     /// (user_us, system_us) CPU time for the current thread, from
     /// `thread_info(THREAD_BASIC_INFO)`. Used by `getrusage(RUSAGE_THREAD)`.
     pub fn self_thread_cpu_us() -> Option<(u64, u64)> {
+        // SAFETY: pthread_mach_thread_np on the current pthread is always valid.
+        thread_cpu_us_for_port(unsafe { libc::pthread_mach_thread_np(libc::pthread_self()) })
+    }
+
+    /// (user_us, system_us) CPU time for an ARBITRARY host thread identified
+    /// by its mach port, from `thread_info(THREAD_BASIC_INFO)`.
+    /// `thread_info` accepts any `thread_act_t` this task holds a send right
+    /// to, not only the calling thread's own port -- exactly like
+    /// `thread_run_state_char` above, which already reads a different
+    /// `thread_info` flavor for a foreign thread. `port` is expected to come
+    /// from `current_thread_port()`, captured on the target thread itself and
+    /// stored for later cross-thread reads (no ownership transfer, so no
+    /// `mach_port_deallocate` is needed here either).
+    pub fn thread_cpu_us_for_port(port: libc::mach_port_t) -> Option<(u64, u64)> {
         let mut info: libc::thread_basic_info = unsafe { std::mem::zeroed() };
         let mut count = libc::THREAD_BASIC_INFO_COUNT;
         // SAFETY: matching flavor/count and a zeroed buffer of the right type.
         let kr = unsafe {
             libc::thread_info(
-                libc::pthread_mach_thread_np(libc::pthread_self()),
+                port,
                 libc::THREAD_BASIC_INFO as libc::thread_flavor_t,
                 &mut info as *mut _ as libc::thread_info_t,
                 &mut count,
@@ -1640,6 +1654,13 @@ mod imp {
     pub fn current_thread_port() -> u32 {
         0
     }
+    /// No cross-thread CPU accounting primitive exists on this host the way
+    /// mach `thread_info` does on macOS (there is no non-self `RUSAGE_THREAD`
+    /// analog on Linux/FreeBSD): inert here, matching every other
+    /// mach-specific accessor in this stub `imp`.
+    pub fn thread_cpu_us_for_port(_port: u32) -> Option<(u64, u64)> {
+        None
+    }
     pub fn self_resource_usage() -> Option<ResourceUsage> {
         #[cfg(target_os = "linux")]
         {
@@ -1863,7 +1884,7 @@ pub use imp::self_cpu_total_ns;
 pub use imp::{
     current_thread_port, is_guest_process, pid_info, reserve_self_direct_vm_range,
     resident_bytes_in_ranges, self_resource_usage, self_thread_cpu_us, self_vm_region_count,
-    thread_run_state_char,
+    thread_cpu_us_for_port, thread_run_state_char,
 };
 
 /// Mach port type alias for the registry (real on macOS, u32 elsewhere).

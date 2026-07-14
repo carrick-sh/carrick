@@ -1539,6 +1539,12 @@ fn finalize_native_thread_exit(
 ) -> NativeThreadLoopOutcome {
     translator.finalize_profile_epoch();
     if thread_runtime.finish_thread(dispatcher, memory) {
+        // This exit turned out to be the process's last live thread after
+        // all -- the same "everyone else dies at `libc::_exit()` with zero
+        // chance to flush" seam as `exit_group`. Drain whatever sibling
+        // slots remain (ordinarily none, since `finish_thread` reporting
+        // "last" already implies no other live thread; a no-op then).
+        translator.drain_sibling_profiles_before_process_exit();
         NativeThreadLoopOutcome::ProcessExit(code)
     } else {
         NativeThreadLoopOutcome::ThreadDone
@@ -1660,6 +1666,14 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
     let mut traps = 0_usize;
 
     loop {
+        // Republish (register, the first time) this thread's profiling state
+        // for a foreign `exit_group` drain -- see `SiblingSnapshot`. Every
+        // loop-top is a fully reconciled boundary: the prior iteration's
+        // counters (if any) are already fully advanced by this point. A
+        // no-op when profiling is disabled.
+        if PROFILE {
+            translator.publish_sibling_snapshot();
+        }
         traps = traps.saturating_add(1);
         if traps > max_traps {
             return Err(RuntimeError::TrapLimitExceeded { max_traps });
@@ -1671,6 +1685,8 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
         // the only native instruction engine now.
         if crate::fork_quiesce::exec_replacing_other_thread(thread_runtime.tid()) {
             if thread_runtime.finish_thread(&dispatcher, &memory) {
+                translator.finalize_profile_epoch();
+                translator.drain_sibling_profiles_before_process_exit();
                 return Ok(NativeThreadLoopOutcome::ProcessExit(0));
             }
             return Ok(NativeThreadLoopOutcome::ExecReplacedThread);
@@ -2005,6 +2021,12 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
             }
             DispatchOutcome::Exit { code } => {
                 translator.finalize_profile_epoch();
+                // `exit_group` (or `exit(2)` as the last live thread): every
+                // OTHER live guest thread of this process dies unconditionally
+                // and instantly at the `libc::_exit()` below, with zero chance
+                // to flush its own NATIVEPERF record -- emit one for each of
+                // them now, before that happens.
+                translator.drain_sibling_profiles_before_process_exit();
                 if NATIVE_FORKED_GUEST_CHILD.load(std::sync::atomic::Ordering::Acquire) {
                     dispatcher.cleanup_sysv_ipc_on_process_exit();
                     crate::exec_helpers::forked_child_exit(
@@ -2163,6 +2185,8 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                     }
                     NativeForkFlow::RetireForExec => {
                         if thread_runtime.finish_thread(&dispatcher, &memory) {
+                            translator.finalize_profile_epoch();
+                            translator.drain_sibling_profiles_before_process_exit();
                             return Ok(NativeThreadLoopOutcome::ProcessExit(0));
                         }
                         return Ok(NativeThreadLoopOutcome::ExecReplacedThread);
@@ -2294,6 +2318,8 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                             NativeExecTeardownFlow::Proceed => {}
                             NativeExecTeardownFlow::RetireForExec => {
                                 if thread_runtime.finish_thread(&dispatcher, &memory) {
+                                    translator.finalize_profile_epoch();
+                                    translator.drain_sibling_profiles_before_process_exit();
                                     return Ok(NativeThreadLoopOutcome::ProcessExit(0));
                                 }
                                 return Ok(NativeThreadLoopOutcome::ExecReplacedThread);

@@ -629,6 +629,48 @@ pub(super) fn flush_gauges(thread_cpu_baseline_ns: u64) -> Result<FlushGauges, P
     })
 }
 
+/// Total CPU (user + system) consumed by an ARBITRARY host thread of this
+/// process, identified by the mach port it captured on itself (via
+/// `crate::host_proc::current_thread_port`) and published for a foreign
+/// reader. Unlike `current_thread_cpu_total_ns`, this can be called from any
+/// thread about ANY other -- it is how `exit_group`'s "last thread standing"
+/// reads a still-running sibling's real, live CPU total instead of the
+/// sibling's own (necessarily self-only) accounting.
+pub(in crate::native_darwin) fn thread_cpu_total_ns_for_port(
+    port: libc::mach_port_t,
+) -> Result<u64, ProfileError> {
+    let (user_us, system_us) = crate::host_proc::thread_cpu_us_for_port(port)
+        .ok_or(ProfileError::ThreadUsageUnavailable)?;
+    user_us
+        .checked_add(system_us)
+        .and_then(|total_us| total_us.checked_mul(1_000))
+        .ok_or(ProfileError::TimeOverflow)
+}
+
+/// Like [`flush_gauges`], but for a sibling thread this process is about to
+/// lose to `exit_group`'s unconditional `libc::_exit()`: `thread_cpu_ns` is
+/// read LIVE from the sibling's mach port (never stale, unlike the rest of
+/// its record which comes from its last self-published snapshot -- see
+/// `ThreadTranslator::publish_sibling_snapshot`), and the process/startup
+/// gauges are the calling (foreign) thread's own live reads, exactly as any
+/// other flush on this process would report them.
+pub(super) fn flush_gauges_for_port(
+    port: libc::mach_port_t,
+    thread_cpu_baseline_ns: u64,
+) -> Result<FlushGauges, ProfileError> {
+    let thread_cpu_ns =
+        thread_cpu_since_baseline(thread_cpu_total_ns_for_port(port)?, thread_cpu_baseline_ns);
+    let process_cpu_ns = process_cpu_total_ns()?;
+    let (startup_wall_ns, startup_cpu_ns) =
+        PROCESS_STARTUP.claim(monotonic_ticks(), process_cpu_ns)?;
+    Ok(FlushGauges {
+        thread_cpu_ns,
+        startup_wall_ns,
+        startup_cpu_ns,
+        process_cpu_ns,
+    })
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct CompleteThreadRecord {
     pub(super) pid: libc::pid_t,
@@ -805,6 +847,12 @@ pub(super) fn write_protocol_frames_to_fd(
     Ok(())
 }
 
+/// `Clone, Copy`: a `ThreadBudget` is a plain bag of counters (no handles, no
+/// allocation), which is what lets a guest thread republish a cheap point-in-
+/// time COPY of it into the cross-thread sibling registry every DSR loop
+/// iteration (see `ThreadTranslator::publish_sibling_snapshot`) without
+/// touching a lock any hotter than the registry's own.
+#[derive(Clone, Copy)]
 pub(super) struct ThreadBudget {
     enabled: bool,
     pid: libc::pid_t,
