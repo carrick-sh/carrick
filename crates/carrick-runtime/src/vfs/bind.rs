@@ -39,6 +39,13 @@ use super::{
 use crate::host_to_linux_errno;
 use crate::linux_abi::{LINUX_EBUSY, LINUX_EINVAL, LINUX_ENOENT, LINUX_ENXIO, LINUX_EROFS};
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct NativeReexecBindMountV1 {
+    pub(crate) mount_point: String,
+    pub(crate) host_path: PathBuf,
+    pub(crate) readonly: bool,
+}
+
 pub struct BindVfs {
     mount_point: String,
     host_path: PathBuf,
@@ -334,6 +341,14 @@ fn real_stat_from_host(
 }
 
 impl Vfs for BindVfs {
+    fn native_reexec_bind_mount(&self) -> Option<NativeReexecBindMountV1> {
+        Some(NativeReexecBindMountV1 {
+            mount_point: self.mount_point.clone(),
+            host_path: self.host_path.clone(),
+            readonly: self.readonly,
+        })
+    }
+
     fn lookup(&self, path: &str) -> Result<Metadata, VfsError> {
         let host = self.to_host(path)?;
         std::fs::metadata(&host)

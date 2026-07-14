@@ -2288,6 +2288,28 @@ impl SyscallDispatcher {
         self.fs.rootfs_vfs.overlay.native_reexec_authority()
     }
 
+    pub(crate) fn snapshot_native_reexec_bind_mounts(
+        &self,
+    ) -> Vec<crate::vfs::bind::NativeReexecBindMountV1> {
+        self.fs.vfs_mounts.native_reexec_bind_mounts()
+    }
+
+    pub(crate) fn restore_native_reexec_bind_mounts(
+        &mut self,
+        mounts: &[crate::vfs::bind::NativeReexecBindMountV1],
+    ) {
+        for mount in mounts {
+            self.register_mount(
+                mount.mount_point.as_str(),
+                Box::new(crate::vfs::BindVfs::new(
+                    mount.mount_point.clone(),
+                    mount.host_path.clone(),
+                    mount.readonly,
+                )),
+            );
+        }
+    }
+
     /// Borrow the dispatcher's rootfs. Used by the runtime when the
     /// dispatcher returns `DispatchOutcome::Execve` and the new image
     /// has to be loaded from the same image layers.
@@ -9410,6 +9432,27 @@ mod native_reexec_fd_tests {
         resumed.restore_native_reexec_process_state(&state);
 
         assert_eq!(resumed.snapshot_native_reexec_process_state(), state);
+    }
+
+    #[test]
+    fn bind_mount_round_trip_preserves_nested_exec_bytes() {
+        let host_dir = tempfile::tempdir().unwrap();
+        let host_probe = host_dir.path().join("probe");
+        std::fs::write(&host_probe, b"nested-exec-bytes").unwrap();
+
+        let mut source = SyscallDispatcher::new();
+        source.register_mount(
+            "/tmp/p",
+            Box::new(crate::vfs::BindVfs::new("/tmp/p", &host_probe, true)),
+        );
+        let snapshot = source.snapshot_native_reexec_bind_mounts();
+
+        let mut resumed = SyscallDispatcher::new();
+        resumed.restore_native_reexec_bind_mounts(&snapshot);
+        assert_eq!(
+            resumed.read_exec_file("/tmp/p"),
+            Some(b"nested-exec-bytes".to_vec())
+        );
     }
 
     #[test]

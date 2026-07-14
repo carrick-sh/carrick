@@ -49,6 +49,8 @@ pub(crate) struct NativeGuestExecV1 {
     pub(crate) exec_host_fs_fallback: bool,
     pub(crate) max_traps: u64,
     pub(crate) native_page_profile: carrick_spec::NativePageProfileRequest,
+    #[serde(default)]
+    pub(crate) bind_mounts: Vec<crate::vfs::bind::NativeReexecBindMountV1>,
     pub(crate) fd_table: crate::dispatch::fd_table::NativeReexecFdTableV1,
     pub(crate) xsig: NativeReexecXsigV1,
     pub(crate) process_state: NativeReexecProcessStateV1,
@@ -117,6 +119,7 @@ impl NativeGuestExecV1 {
             || self.rootfs.root_path.is_empty()
             || self.rootfs.root_path.len() > MAX_PATH_LEN
             || self.max_traps == 0
+            || self.bind_mounts.len() > MAX_VECTOR_ITEMS
             || self.fd_table.files.len() > MAX_VECTOR_ITEMS
             || self.fd_table.descriptions.len() > MAX_VECTOR_ITEMS
             || self.fd_table.close_on_exec_host_fds.len() > MAX_VECTOR_ITEMS
@@ -130,6 +133,19 @@ impl NativeGuestExecV1 {
             || self.process_state.rlimit_overrides.len() != 16
         {
             return Err(NativeExecCapsuleError::InvalidField("guest_exec"));
+        }
+        let mut mount_points = std::collections::HashSet::new();
+        for mount in &self.bind_mounts {
+            if mount.mount_point.is_empty()
+                || mount.mount_point.len() > MAX_PATH_LEN
+                || !std::path::Path::new(&mount.mount_point).is_absolute()
+                || mount.host_path.as_os_str().is_empty()
+                || mount.host_path.as_os_str().as_bytes().len() > MAX_PATH_LEN
+                || !mount.host_path.is_absolute()
+                || !mount_points.insert(mount.mount_point.as_str())
+            {
+                return Err(NativeExecCapsuleError::InvalidField("bind_mounts"));
+            }
         }
         Ok(())
     }
@@ -187,6 +203,7 @@ pub(crate) fn begin_guest_exec(
         .map_err(|error| anyhow::anyhow!("native guest exec fd table is ineligible: {error}"))?;
     let xsig = snapshot_xsig()?;
     let process_state = dispatcher.snapshot_native_reexec_process_state();
+    let bind_mounts = dispatcher.snapshot_native_reexec_bind_mounts();
     let mut payload = NativeExecCapsuleV1 {
         producer_pid: unsafe { libc::getpid() as u32 },
         purpose: NativeExecCapsulePurposeV1::GuestExec,
@@ -202,6 +219,7 @@ pub(crate) fn begin_guest_exec(
             exec_host_fs_fallback: dispatcher.exec_host_fs_fallback(),
             max_traps: u64::try_from(max_traps)?,
             native_page_profile,
+            bind_mounts,
             fd_table,
             xsig,
             process_state,
@@ -903,6 +921,7 @@ mod tests {
                 exec_host_fs_fallback: false,
                 max_traps: 100,
                 native_page_profile: carrick_spec::NativePageProfileRequest::Native16k,
+                bind_mounts: Vec::new(),
                 fd_table: crate::dispatch::fd_table::NativeReexecFdTableV1 {
                     files: Vec::new(),
                     descriptions: Vec::new(),
@@ -1061,6 +1080,90 @@ mod tests {
                 .is_some()
         );
         assert!(capsule_len < artifact_len / 8);
+    }
+
+    #[test]
+    fn bind_mount_snapshot_round_trips_in_capsule_order() {
+        let mut payload = sample();
+        let mounts = vec![
+            crate::vfs::bind::NativeReexecBindMountV1 {
+                mount_point: "/tmp/deeper/p".to_owned(),
+                host_path: "/host/deeper-probe".into(),
+                readonly: true,
+            },
+            crate::vfs::bind::NativeReexecBindMountV1 {
+                mount_point: "/tmp".to_owned(),
+                host_path: "/host/tmp".into(),
+                readonly: false,
+            },
+        ];
+        payload
+            .guest_exec
+            .as_mut()
+            .expect("guest payload")
+            .bind_mounts = mounts.clone();
+        let capsule = tempfile::tempfile().expect("temporary capsule");
+        let nonce = [0x29; 16];
+        write_capsule(capsule.as_raw_fd(), nonce, &payload).expect("write capsule");
+
+        let decoded = read_capsule_once(capsule.as_raw_fd(), nonce).expect("read capsule");
+        assert_eq!(
+            decoded.guest_exec.expect("guest payload").bind_mounts,
+            mounts
+        );
+    }
+
+    #[test]
+    fn legacy_v1_payload_without_bind_mounts_defaults_to_empty() {
+        let payload = sample();
+        let mut value = serde_json::to_value(payload).expect("serialize capsule");
+        value
+            .get_mut("guest_exec")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("guest payload")
+            .remove("bind_mounts");
+
+        let decoded: NativeExecCapsuleV1 =
+            serde_json::from_value(value).expect("decode prior V1 payload");
+        assert!(
+            decoded
+                .guest_exec
+                .expect("guest payload")
+                .bind_mounts
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn invalid_bind_mount_is_rejected_before_host_exec() {
+        let mut payload = sample();
+        payload
+            .guest_exec
+            .as_mut()
+            .expect("guest payload")
+            .bind_mounts = vec![crate::vfs::bind::NativeReexecBindMountV1 {
+            mount_point: "relative/path".to_owned(),
+            host_path: "/host/probe".into(),
+            readonly: true,
+        }];
+
+        let result = exec_capsule_with(payload, [0x31; 16], None, |_| {
+            panic!("invalid bind mount must not reach host exec")
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn pid_probe_capsule_remains_valid_without_guest_mount_state() {
+        let payload = NativeExecCapsuleV1 {
+            producer_pid: 42,
+            purpose: NativeExecCapsulePurposeV1::PidProbe,
+            host_executable_path: b"/bin/probe".to_vec(),
+            argv: Vec::new(),
+            env: Vec::new(),
+            guest_exec: None,
+        };
+        assert!(payload.validate().is_ok());
     }
 
     #[test]
