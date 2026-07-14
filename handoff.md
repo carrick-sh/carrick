@@ -1,116 +1,192 @@
-# Native Darwin Backend Handoff
+# Native Default Conformance and Performance Handoff
 
-Date: 2026-07-11
+Date: 2026-07-14
 
-Branch: `codex/architecture-evidence-gates` (fast-forwarded onto `main` at
-campaign close).
+Integration state: `codex/native-conformance-quality` was fast-forwarded onto
+`main` from `3cb0c7b8` through `8941ee5a` (48 commits). The branch worktree is
+intentionally retained because it contains an interrupted, uncommitted second
+review-fix wave described below.
 
-Detailed local ledger: `.superpowers/sdd/progress.md` (git-ignored). This file
-is the tracked continuation snapshot.
+## Goal and honest status
 
-## Goal Status: PROBE TARGET MET
+Make the Darwin-native backend the quality-first default, run the same real
+conformance and workload ladders expected of the release backend, remove
+stability/load blockers, and reach a full measured bless. HVF/VMM performance
+is out of scope. Native performance is correctness: a workload that is tens or
+hundreds of times slower than the Linux oracle is not ready to bless.
 
-> Reach 100% conformance probes and more than 15% strict LTP parity on the
-> native16k Darwin backend; communicate linux4k incompatibility to users.
+**Current status: NOT BLESSED.** Prepared-image/self-reexec correctness has
+advanced substantially and Node content parity is green, but Task 8 stopped on
+a pathological Go compiler/import workload. The performance measurement
+interlude has a reviewed profiler and a substantial runner/analyzer, but its
+second independent review remains rejected. No Task 3 measurement campaign has
+run and no optimization slice has been selected.
 
-| Gate | Result | Evidence |
-| --- | --- | --- |
-| native16k musl probes | **376/376 PASS (100%), measured** | `/tmp/carrick-native16k-probes-20260711-round11.log`, 228s, exit 0 |
-| strict clean LTP parity | 829/1492 (55.6%) — round-1 authority, >15% met | `/tmp/carrick-native16k-ltp-round1.jsonl` |
-| fork benchmark (all 3 gates) | PASS — fork p50 1.53x host (gate 2x), p95 1.36x (gate 3x), fork_exec 2.63x faster than HVF | `docs/2026-07-10-native-fork-benchmark-evidence.md` |
-| linux4k user statement | accurate (README page-profile section; MT shapes are typed rejections) | commit 58d858db |
-| `just ci` | run at campaign close (see final commits) | — |
+Authoritative tracked documents:
 
-The gated musl set grew 374 → 376 rows during the campaign (new probes
-`execfromthread`, `vforkexecthread`). GNU remains a report-only lane
-(368/8 at round 11, improved from 344/27 at round 6).
+- [native-default campaign ledger](docs/native-default-conformance-campaign.md)
+- [prepared-image implementation plan](docs/superpowers/plans/2026-07-13-native-prepared-image-reexec.md)
+- [prepared-image design](docs/superpowers/specs/2026-07-13-native-prepared-image-reexec-design.md)
+- [compiler performance budget design](docs/superpowers/specs/2026-07-14-native-compiler-performance-budget-design.md)
+- [compiler performance measurement plan](docs/superpowers/plans/2026-07-14-native-compiler-performance-measurement.md)
 
-**Caveat for the next session:** the strict-LTP number is the 2026-07-10
-round-1 authority; ~45 commits landed after it. The probes and unit suites
-say nothing regressed, but a fresh full LTP campaign is the right next
-validation before quoting the LTP number externally. A signed live
-"real workload" demo (beyond the probe/benchmark batteries) was also not
-re-run at close.
+The detailed controller ledger is local and git-ignored at
+`.superpowers/sdd/progress.md`. The Task 8 evidence report is retained in the
+feature worktree at
+`.worktrees/codex-native-conformance/.superpowers/sdd/task-8-report.md`.
 
-## What Landed (2026-07-10 → 2026-07-11, ~35 commits cf9dfd1c..HEAD)
+## Measured correctness ladder
 
-1. **Fork benchmark** (cf9dfd1c, bc6c680b, 7c53b70c): first native fork
-   numbers; all acceptance gates pass; native fork memory scaling tracks
-   host COW (+24% @256MiB vs HVF's +121%). `perf_fork_scale` gained argv
-   knobs (run-elf cannot inject guest env).
-2. **Native vDSO** (3fd3cd83, e69c9597): Darwin reserves host VA
-   [63 GiB, 448 GiB) — canonical vvar/vdso bases relocated to +512 GiB with
-   `AT_SYSINFO_EHDR` repoint and a vdso-page-only movz rewrite. EL0 counter
-   timeline gated by unit test.
-3. **Guest CPU time** (03e721ec..31a409be): native provider inside the
-   existing `guest_cpu` readers; `proc_pid_rusage` mach-time-unit conversion
-   fixed (cross-backend); ITIMER_VIRTUAL/PROF via shared timer-core;
-   VmRSS measured over the exact VmSize spans.
-4. **Lifecycle** (477fba6b..385e8963): async child-exit watcher (kqueue
-   EVFILT_PROC); single-scan adopted-child wait; file-identity futex keys
-   (+ unmap retirement); xsig enqueue-before-record; clone3args probe was
-   4K-hardcoded (its SIGSEGV was correct 16K behavior).
-5. **Residuals** (662fdd60..8a80b70e): host-observed death outranks
-   published run-state; native pid-ns placement honored; probeinit shim
-   gives the direct-ELF transport the oracle's process topology.
-6. **memmap** (b5683bea): geometry-neutral reshape (pagesize_sane; A2
-   blocked-grow forced by construction at any page size).
-7. **Regression waves** (post-round-7 triage): dnotify = latent missing
-   delivery cycle at sigreturn resume, exposed by the vDSO (8ccf81c7);
-   EINTR classification for non-set caught signals (9dded86b); fork-safe
-   auxiliary-thread locks — ATFORK bundle + AtomicPtr kicker (5afae824);
-   shared-futex logical dequeue + self-woken pool + phantom-credit fix
-   (73990820, e964894c, 0806a4ae).
-8. **MT fork/exec** (e2f298b4..33910df3): dispatch-boundary quiesce
-   mirroring the HVF barrier; child sibling-record retirement; cooperative
-   exec teardown; ExecReplacedThread + exited-leader park (lost-exec races
-   closed); exec-wins CAS vs vfork-suspended leader; linux4k MT shapes are
-   typed rejections pending task_c2615fa2. Native now exceeds HVF on
-   exec-from-thread and vfork-suspend-exec shapes.
-9. **keydeny container policy** (1d7d5d46..054bbb7a): launch-time
-   syscall-policy layer at dispatch entry modeling Docker's default seccomp
-   (keyring syscalls → EPERM); handlers stay honest-ENOSYS; `--security-opt`
-   on run/create/run-elf + serve API; harness mirrors suites'
-   `seccomp=unconfined` flags.
-10. **sysvsem seed race** (fb706eae): parent's post-fork Booting seed no
-    longer clobbers a child's published Blocked state (CAS-from-empty +
-    adoption hardening + reader tiebreak); proven by fault injection.
-11. **Signal hot path** (2e1ba443): lock-free empty fast path (sticky-raise
-    hints) recovered preemptsigstorm's throughput margin shaved by the
-    campaign's per-dispatch additions.
+| Rung | Current authority |
+| --- | --- |
+| Artifact/signing and exact prepared-image reducers | GREEN; 431 musl and 431 GNU native-PIE probes rebuilt, signed binary verified, exact static/dynamic/shebang/fd/process-state/fork-exec-thread reducers green |
+| Complete native probe gate | 372 PASS / 9 FAIL initially; three state-restoration failures fixed; six deliberate post-fork-without-exec pthread-guard gaps remain |
+| Node full ecosystem | 3/3 content MATCH; Carrick/Docker ratios 29.33x, 23.01x, and 18.96x |
+| Go full ecosystem | INCOMPLETE; first run reached row 99/194, then exact c94 became the stopping performance authority |
+| CPython serial | NOT RUN after the Go blocker |
+| workers=4 smoke and load | NOT RUN after the Go blocker |
+| full candidate/bless/post-bless | NOT ATTEMPTED |
 
-Every task went through independent review (spec + quality) with fix waves
-for all Critical/Important findings; evidence per task in the git-ignored
-`.superpowers/sdd/native16k-task-*-report.md` and `native16k-r*-report.md`.
+The six explicit guard gaps are `exitgroupthreads`,
+`futexforkwakegroups`, `mtsigrelease`, `procladder_epollmgr`,
+`procladder_mixed`, and `procladder_mt`. Each tries to create a pthread after
+fork without exec and reaches the intentional Darwin/libdispatch safety guard
+with `EAGAIN`. They are accepted as lower-priority esoteric gaps for now, but
+the probe gate remains honestly red.
 
-## Known Follow-Ups (task chips filed)
+Task 8 landed fixes for prepared self-reexec state transport, futex signal lock
+ordering, and SIMD/GPR DSR writeback. Exact reducers and Node show that the
+ordinary prepared-image path works. This does not substitute for the missing
+Go, CPython, load, and full-bless rungs.
 
-- task_89f76fff: structural enforcement of signal pending-hint coherence
-  (convention-only today; hottest-path hazard class).
-- task_c2615fa2: linux4k guarded-fault emulation is not MT-safe (typed
-  rejections in place).
-- task_3c89e226: wait-family adopted-child gaps (waitid, WNOHANG).
-- task_e1f4d3b4: stale bootstrap_host_pid on the off-authority bare
-  run-elf path.
-- task_b07cef09: amd64 memmap probe oracles hash-stale until fleet re-bless.
-- task_a0899be2: parallel-suite fork/port-release test flake (pre-existing,
-  reproduced with campaign tests skipped).
-- CMP_REQUEUE self_woken under-count (needs identity-carrying credit
-  design); doubly-pending set-vs-nonset sigtimedwait divergence (needs
-  scoped wait-set-only helper) — both deferred with reviewer-verified
-  worse-than-disease rationales, recorded in
-  `.superpowers/sdd/native16k-r2-loadcoupled-report.md`.
-- Untracked `docs/dynamic-syscall-rewriter.md` (a DSR RFC drafted during
-  agent work) awaits a maintainer keep/drop decision.
+## Current performance and cause
 
-## Standing Constraints (unchanged)
+The stopping real workload is `go-go_internal_srcimporter` c94:
 
-- Build with `just build` (signed); `lld` never; no `--no-verify`.
-- Clean-room: no Linux kernel/glibc/UAPI source.
-- Load sensitivity is first-class: classify races vs time-assumptions vs
-  measurement; never retry-until-green. Statistical 20-rep batteries are
-  insensitive to ~1/950-row campaign rates — lead with mechanism + fault
-  injection.
-- Never overlap Carrick and Docker phases; scoped `CARRICK_RUN_ID`s +
-  `scripts/sudo/kill.sh`.
-- Read `.agents/skills/carrick-native-debug/SKILL.md` before native triage.
+- Carrick was scoped-stopped after 1,392.649 seconds versus a 2.696-second
+  Docker oracle: **516.56x**.
+- It had 42 scoped processes, 19 runnable, and about 856-950% aggregate CPU.
+- Compiler children were active rather than deadlocked, but none completed.
+- The exact `TestImplicitsInfo` reducer reaches the typed 1,000,000-gateway
+  ceiling after 15.90 seconds.
+
+This is dominated by DSR execution shape, not a missing rebuild and not yet a
+proven AOT-cache problem. Current framed W1 evidence reaches 1,000,000 gateway
+entries in 20.02 seconds under profiling. On its hottest thread, sensitive
+exits are 85.56% of gateway entries, with exclusive emulation alone at 57.91%;
+direct plus indirect resolution is 14.37%. The representative W2 hottest
+thread has 65.16% sensitive exits (47.93% exclusive) and 34.49% resolution.
+However, W2 aggregate counts instead show about 21.94% sensitive and 56.58%
+resolution. That disagreement is one reason the analyzer is not approved: the
+selection denominator and thread scope must be explicit before choosing the
+first optimization.
+
+A persistent/AOT DSR cache remains a plausible later slice because many child
+processes rebuild cold state. It is not yet selected: recurring sensitive exits
+and per-thread/aggregate resolver behavior may dominate, and a safe cache must
+also bind guest content, page profile, translator ABI, host ISA/features, and
+relocation assumptions.
+
+DTrace overhead is accepted. Its wall time is inflated, but counts, ordering,
+exit mix, and relative distribution are proportional evidence. Signed untraced
+runs remain the only absolute wall/CPU authority.
+
+## Performance interlude implementation state
+
+### Task 1: native in-process profiler — approved
+
+`NATIVEPERF1` now emits framed, typed per-thread records with exact gateway-exit
+reconciliation and exclusive phase accounting. Profile-off code retains the
+specialized no-timer path. Signed W1 off/on controls preserved the same typed
+one-million-trap result; the on run produced 70 complete unique thread records
+and zero invalid records. Fork, cross-thread signal, and exec-thread reducers
+reassembled complete unique eras with zero invalid frames. The integrated
+workspace gate is green.
+
+### Task 2: immutable workloads and analyzer — implemented, review rejected
+
+Committed through `8941ee5a`:
+
+- immutable W1/W2 manifests and the exact W2 fixture;
+- strict tagged run/decision records and typed outcomes;
+- engine-major Carrick-then-Docker baseline scheduling;
+- warmup-inclusive Plane B ABBA scheduling;
+- scoped run IDs and cleanup receipts;
+- Docker-only preflight/replay receipts;
+- durable Plane C capture with per-PID reconciliation;
+- fixes for DTrace kind ordinals and diagnostic leakage onto guest stdout.
+
+The latest signed W2 Plane C proof completed naturally with byte-empty stdout,
+the expected work product, zero incomplete pairs/drops, 23 reconciled per-PID
+totals, and clean scoped cleanup. Retained proof:
+`target/native-compiler-task2-review/w2-plane-c-artifacts/nativeperf-w2-internal-runtime-atomic-3-c0459f8d/`.
+
+The second independent review of `7c87e60f..8941ee5a` rejected the tranche with
+0 Critical, 7 Important, and 3 Minor findings. The Important blockers are:
+
+1. Plane C cannot round-trip all of its emitted record shapes, does not preserve
+   raw temporal ordering, and does not bind the raw artifact path/hash into the
+   record.
+2. `analyze --check` validates ABBA rows but not all baseline/Plane C
+   cross-field combinations.
+3. W2 Docker replay is still fail-open because the generated shell lacks
+   fail-fast semantics.
+4. Workload selection uses hottest-thread evidence while analysis aggregates
+   all threads, which changes the decision-rule result.
+5. The decision ladder returns on count evidence before validating the
+   additive duration model and does not use `blocked_ns`.
+6. Durable W1 evidence is self-asserted: the checked-in summary is not
+   validated against a checked-in, parsed, hashed raw artifact.
+7. Untraced W1 loses its typed max-traps ceiling because the marker is parsed
+   only when a profile is present.
+
+Minor follow-ups: reject unknown flattened-profile value keys and reconcile
+phase-sensitive counts; align the plan's obsolete status-125 wording with the
+observed top-level exit 2; rewrite the three fix commit bodies that contain
+literal `\n\n` text if history is cleaned up later.
+
+### Interrupted second review-fix wave — preserved, not integrated
+
+The feature worktree contains partial uncommitted work and must not be removed:
+
+- modified `scripts/perf/test_native_compiler_budget.py` (only the initial gzip
+  evidence-test imports/root so far);
+- `scripts/perf/evidence/native-compiler-w1-current-profile-v1.log.gz`;
+- `scripts/perf/evidence/native-compiler-w2-representative-profile-v1.log.gz`;
+- `scripts/perf/evidence/real-plane-c-v1/` with compressed record, raw trace,
+  summary, and stderr artifacts.
+
+These files are evidence/fix inputs, not an approved commit. Continue from
+`/Volumes/CaseSensitive/carrick/.worktrees/codex-native-conformance` and inspect
+the diff before editing.
+
+## Exact next steps
+
+1. Finish the seven Important Task 2 review fixes with red-first hermetic tests.
+2. Prove strict parsing and hash binding against the retained raw W1/W2/Plane C
+   artifacts; rerun the real W2 Docker replay and signed Plane C path.
+3. Run the 50+ Python tests, strict manifest loads, analyzer checks, shell
+   syntax, `just ci`, and signed live proof; return to the same reviewer until
+   Critical/Important/Minor findings are zero.
+4. Run Task 3 only after Task 2 approval: untraced Plane A, profile-off/on ABBA
+   Plane B, proportional Plane C, W1/W2 and one-thread controls. Reconcile
+   hottest-thread and aggregate scopes before selecting a slice.
+5. Implement the selected dominant-term repair and require the reduced
+   compiler/import workload to complete naturally below 20x Docker, targeting
+   10x or better. Do not raise timeouts or `max_traps`.
+6. Resume at exact c94, finish Go and classify its existing differences, then
+   run CPython serial, three workers=4 smoke repeats, the full candidate,
+   overlay bless, post-bless run, and a live real-workload demonstration.
+
+## Operational constraints
+
+- Rebuild and sign with `just build` before every guest run; after runtime
+  changes, confirm the CLI was relinked and contains the expected marker.
+- Never overlap Carrick and Docker oracle phases.
+- Stamp every Carrick run with a unique `CARRICK_RUN_ID` and reap only with
+  `sudo -n scripts/sudo/kill.sh <run-id>`; verify zero descendants.
+- Preserve exact workload/input/output hashes and do not weaken work, fan-out,
+  timeouts, trap ceilings, AArch64 exclusive semantics, or signal semantics.
+- Keep measured results separate from projections. Task 8 is incomplete,
+  Task 2 is not review-approved, Task 3 has not run, and no optimization is
+  selected.
