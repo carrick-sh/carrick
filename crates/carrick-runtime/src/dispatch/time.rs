@@ -934,7 +934,7 @@ fn rlimit_cpu_secs_to_ns(secs: u64) -> Option<u64> {
 
 #[cfg(feature = "platform-macos")]
 fn publish_rlimit_cpu_signal(signum: i32) {
-    crate::host_signal::publish_process_signal(signum);
+    crate::native_darwin::deliver_native_process_signal(signum);
 }
 
 #[cfg(any(

@@ -319,6 +319,19 @@ pub struct ThreadWakePipe {
     fds: Arc<ThreadWakeFds>,
 }
 
+/// Who owns the vCPU kick that follows a normal-thread pending-signal publish.
+///
+/// Blocking-I/O waiters are woken in both modes. `SignalPump` additionally
+/// nudges HVF's pump, which owns the vCPU kick. `CallerManaged` deliberately
+/// leaves the pump untouched because the caller closes its own lost-wakeup
+/// window and kicks the relevant backend directly. Making this choice part of
+/// the publication call prevents native producers from scheduling both paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublicationWake {
+    SignalPump,
+    CallerManaged,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DrainResult {
     Drained,
@@ -348,12 +361,19 @@ impl Drop for ThreadWakePipe {
 /// tid is known. The pending store is the neutral core's; the probe + the three
 /// wake channels are HVF glue.
 pub fn publish_pending_for(tid: i32, signum: i32) {
+    publish_pending_for_with_wake(tid, signum, PublicationWake::SignalPump);
+}
+
+/// Publish a thread-directed signal with an explicit vCPU wake owner.
+pub fn publish_pending_for_with_wake(tid: i32, signum: i32, wake: PublicationWake) {
     crate::probes::signal_publish(tid, signum, 1);
     carrick_signal_core::publish_pending_for(tid, signum);
     if !wake_thread_waiter(tid) {
         notify_waiters_fallback();
     }
-    wake_signal_pump_pipe();
+    if wake == PublicationWake::SignalPump {
+        wake_signal_pump_pipe();
+    }
 }
 
 /// ATFORK-PREPARE bundle for a guest `fork`: every fork-shared signal-static
@@ -1000,11 +1020,24 @@ fn publish_pending(signum: i32) {
 /// Sets the process-directed pending slot and wakes parked waiters; the kick
 /// daemon forces any in-guest vCPU out so the runtime delivers it promptly.
 pub fn publish_process_signal(signum: i32) {
-    publish_pending(signum);
-    // Wake the pump via EVFILT_USER too: a busy-waiting guest (no parked
-    // waiter draining the self-pipe) wouldn't be re-kicked off the pipe edge
-    // alone. Safe here — this is called from a normal thread, not a handler.
-    notify_pump();
+    publish_process_signal_with_wake(signum, PublicationWake::SignalPump);
+}
+
+/// Publish a process-directed signal with an explicit vCPU wake owner.
+pub fn publish_process_signal_with_wake(signum: i32, wake: PublicationWake) {
+    let bit = thread_pending_bit(signum);
+    if bit != 0 {
+        proc_pending_fetch_or(bit);
+    }
+    notify_waiters_fallback();
+    if wake == PublicationWake::SignalPump {
+        // A busy-waiting guest has no parked waiter to drain the self-pipe, so
+        // the HVF-owned route wakes both independent pump channels. The native
+        // caller-managed route performs its ordered futex-generation + direct
+        // kick after this function returns and must not schedule this one too.
+        wake_signal_pump_pipe();
+        notify_pump();
+    }
 }
 
 /// 0 = handlers not installed yet, 1 = installed. Used to make
@@ -1498,6 +1531,26 @@ mod tests {
     }
 
     #[test]
+    fn caller_managed_process_publication_wakes_waiters_without_nudging_pump() {
+        let _g = TEST_LOCK.lock();
+        reset_after_supervisor_fork();
+        clear_proc_pending();
+        ensure_pump_pipe_for_test();
+
+        publish_process_signal_with_wake(LINUX_SIGINT, PublicationWake::CallerManaged);
+
+        assert!(has_process_pending());
+        assert!(pipe_is_readable(pending_pipe_read_fd()));
+        assert!(
+            !pipe_is_readable(pump_pipe_read_fd()),
+            "caller-managed publication must not schedule a second pump kick"
+        );
+
+        drain_pending_pipe();
+        clear_proc_pending();
+    }
+
+    #[test]
     fn drain_fd_forces_empty_pipe_nonblocking() {
         let _g = TEST_LOCK.lock();
         let (read_fd, write_fd) = open_internal_pipe().expect("internal pipe");
@@ -1568,6 +1621,27 @@ mod tests {
         assert!(!pipe_is_readable(target.read_fd()));
         assert_eq!(take_pending_for(target_tid), LINUX_SIGINT);
         drop(other);
+        drop(target);
+    }
+
+    #[test]
+    fn caller_managed_thread_publication_keeps_target_wake_without_pump_nudge() {
+        let _g = TEST_LOCK.lock();
+        reset_after_supervisor_fork();
+        ensure_pump_pipe_for_test();
+
+        let target_tid = 900_012;
+        let target = register_thread_waiter(target_tid).expect("target waiter pipe");
+        publish_pending_for_with_wake(target_tid, LINUX_SIGINT, PublicationWake::CallerManaged);
+
+        assert!(pipe_is_readable(target.read_fd()));
+        assert!(
+            !pipe_is_readable(pump_pipe_read_fd()),
+            "caller-managed targeted publication must not schedule a pump kick"
+        );
+
+        target.drain();
+        assert_eq!(take_pending_for(target_tid), LINUX_SIGINT);
         drop(target);
     }
 

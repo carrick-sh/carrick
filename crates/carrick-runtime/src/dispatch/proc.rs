@@ -3231,6 +3231,9 @@ impl SyscallDispatcher {
                     crate::host_signal::take_child_exit_parent(result)
                     && exit_signal != 0
                 {
+                    #[cfg(feature = "platform-macos")]
+                    crate::native_darwin::publish_native_pending_for(parent_tid, exit_signal);
+                    #[cfg(not(feature = "platform-macos"))]
                     crate::host_signal::publish_pending_for(parent_tid, exit_signal);
                 }
                 // The child host process is now dead; tear down its leaked host VM

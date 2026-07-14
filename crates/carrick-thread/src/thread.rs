@@ -555,6 +555,41 @@ pub struct FutexWait {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FutexInterruptGeneration(u64);
 
+// Test-only observation of the exact parking_lot validation context. A call
+// count cannot prove this invariant: `parking_lot` may legitimately return a
+// spurious wake and re-run the full predicate outside its bucket lock.
+#[cfg(test)]
+thread_local! {
+    static FUTEX_PARK_VALIDATION_ACTIVE: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+}
+
+#[cfg(test)]
+struct FutexParkValidationGuard;
+
+#[cfg(test)]
+impl FutexParkValidationGuard {
+    fn enter() -> Self {
+        FUTEX_PARK_VALIDATION_ACTIVE.with(|active| {
+            assert!(!active.replace(true), "nested futex park validation");
+        });
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for FutexParkValidationGuard {
+    fn drop(&mut self) {
+        FUTEX_PARK_VALIDATION_ACTIVE.with(|active| active.set(false));
+    }
+}
+
+#[cfg(test)]
+fn futex_park_validation_active_for_tests() -> bool {
+    FUTEX_PARK_VALIDATION_ACTIVE.with(std::cell::Cell::get)
+}
+
 struct FutexBucket {
     generation: AtomicU64,
     waiters: AtomicUsize,
@@ -773,6 +808,8 @@ impl FutexTable {
                 parking_lot_core::park(
                     key,
                     || {
+                        #[cfg(test)]
+                        let _validation = FutexParkValidationGuard::enter();
                         if bucket.generation.load(Ordering::Acquire) != wait.generation {
                             return false;
                         }
@@ -1561,8 +1598,6 @@ mod tests {
         let table = Arc::new(FutexTable::new());
         let addr = 0xf17e_10cc_u64;
         let signal_state = Mutex::new(());
-        let signal_guard = signal_state.lock().expect("lock synthetic signal state");
-        let calls = AtomicUsize::new(0);
         let reentered_while_locked = AtomicBool::new(false);
         let start = Arc::new(Barrier::new(2));
         let waker_table = Arc::clone(&table);
@@ -1578,13 +1613,12 @@ mod tests {
         let wait = table.prepare_wait(addr);
         start.wait();
         let outcome = table.wait_prepared(wait, None, &|| {
-            let call = calls.fetch_add(1, Ordering::SeqCst);
-            if call != 0 && signal_state.try_lock().is_err() {
+            if futex_park_validation_active_for_tests() {
                 reentered_while_locked.store(true, Ordering::SeqCst);
             }
+            let _signal_guard = signal_state.lock().expect("lock synthetic signal state");
             false
         });
-        drop(signal_guard);
         waker.join().expect("join futex waker");
 
         assert_eq!(outcome, FutexWaitOutcome::Woken);
