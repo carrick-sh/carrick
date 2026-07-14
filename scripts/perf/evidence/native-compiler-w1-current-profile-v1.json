@@ -33,6 +33,7 @@
     "work_units_completed": 0,
     "work_units_expected": 1
   },
+  "raw_profile_evidence_path": "native-compiler-w1-current-profile-v1.log.gz",
   "raw_profile_sha256": "8d2ebd3666908c805135e03a316d20793c9ce3621955ed9bde6bc8bc75a30945",
   "raw_profile_source": "target/native-compiler-task2-review/task2-review-w1-current-repeat-1784033729/stderr",
   "required_frames": [

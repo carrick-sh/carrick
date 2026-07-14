@@ -267,7 +267,8 @@ git commit -m "diagnostics(native): reconcile compiler DSR budgets" -m "Record e
 
 **Review reconciliation:** The implemented result wire uses strict tagged
 `run`/`decision` variants and a typed outcome (`completed`, `max-traps`, or
-`failed`). Non-completing W1 rows, including the fixed status-125 trap ceiling,
+`failed`). Non-completing W1 rows, including the trap ceiling observed as a
+top-level exit status of 2,
 are retained as baseline evidence but are deliberately rejected by decision
 analysis. Docker identity and replay checks run once in an explicit Docker-only
 preflight that writes a hashed receipt; Carrick measurement consumes that
