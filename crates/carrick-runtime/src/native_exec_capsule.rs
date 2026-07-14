@@ -557,8 +557,7 @@ pub(crate) fn resume(fd: RawFd, nonce_hex: &str) -> anyhow::Result<crate::Native
         crate::probes::DsrCacheLifecyclePhase::HostSelfReexecCapsuleBegin,
     );
     let nonce = decode_nonce(nonce_hex)?;
-    let mut payload = read_capsule_once(fd, nonce)?;
-    discard_prepared_image_before_legacy_payload_resume(&mut payload)?;
+    let payload = read_capsule_once(fd, nonce)?;
     let current_pid = current_pid as u32;
     if payload.producer_pid != current_pid {
         anyhow::bail!(
@@ -597,25 +596,6 @@ pub(crate) fn resume(fd: RawFd, nonce_hex: &str) -> anyhow::Result<crate::Native
             Ok(crate::NativeSelfReexecOutcome::GuestExit(exit_code))
         }
     }
-}
-
-fn discard_prepared_image_before_legacy_payload_resume(
-    payload: &mut NativeExecCapsuleV1,
-) -> anyhow::Result<()> {
-    if let Some(guest) = payload.guest_exec.as_mut() {
-        discard_prepared_image_before_legacy_resume(guest)?;
-    }
-    Ok(())
-}
-
-fn discard_prepared_image_before_legacy_resume(
-    guest: &mut NativeGuestExecV1,
-) -> anyhow::Result<()> {
-    let Some(record) = guest.prepared_image.take() else {
-        return Ok(());
-    };
-    crate::native_prepared_image::close_inherited_before_legacy_resume(record)
-        .map_err(|error| anyhow::anyhow!("close unused inherited prepared image: {error}"))
 }
 
 fn emit_lifecycle(tid: i32, phase: crate::probes::DsrCacheLifecyclePhase) {
@@ -859,9 +839,9 @@ mod tests {
     use super::{
         HEADER_LEN, MAX_ITEM_LEN, NativeExecCapsulePurposeV1, NativeExecCapsuleV1,
         NativeGuestExecV1, PreparedImageFailpoint, attach_prepared_image,
-        attach_prepared_image_with_failpoint, discard_prepared_image_before_legacy_resume,
-        exec_capsule_with, fail_next_artifact_fd_flag_preparation, fd_no_longer_refers_to,
-        read_capsule_once, take_last_preexec_validation_artifact, write_capsule,
+        attach_prepared_image_with_failpoint, exec_capsule_with,
+        fail_next_artifact_fd_flag_preparation, fd_no_longer_refers_to, read_capsule_once,
+        take_last_preexec_validation_artifact, write_capsule,
     };
 
     const HOST_PAGE_SIZE: u64 = 16 * 1024;
@@ -1219,7 +1199,7 @@ mod tests {
     }
 
     #[test]
-    fn interim_legacy_resume_consumes_and_closes_inherited_artifact() {
+    fn prepared_record_survives_capsule_read_for_resume_adoption() {
         let mut payload = sample();
         let artifact = attach_prepared_image(&mut payload, &synthetic_image(), &[], HOST_PAGE_SIZE)
             .expect("eligible prepared artifact");
@@ -1231,17 +1211,24 @@ mod tests {
             .as_mut()
             .expect("guest payload")
             .prepared_image = Some(artifact.record.with_artifact_fd_for_test(inherited_fd));
-        let guest = payload.guest_exec.as_mut().expect("guest payload");
+        let capsule = tempfile::tempfile().expect("temporary capsule");
+        let nonce = [0x45; 16];
+        write_capsule(capsule.as_raw_fd(), nonce, &payload).expect("write prepared capsule");
+        let decoded = read_capsule_once(capsule.as_raw_fd(), nonce).expect("read prepared capsule");
 
-        discard_prepared_image_before_legacy_resume(guest)
-            .expect("discard interim inherited artifact");
-
-        assert!(guest.prepared_image.is_none());
-        assert!(fd_no_longer_refers_to(
+        assert!(
+            decoded
+                .guest_exec
+                .as_ref()
+                .and_then(|guest| guest.prepared_image.as_ref())
+                .is_some()
+        );
+        assert!(!fd_no_longer_refers_to(
             inherited_fd,
             inherited_identity.st_dev as u64,
             inherited_identity.st_ino,
         ));
+        assert_eq!(unsafe { libc::close(inherited_fd) }, 0);
     }
 
     #[test]
