@@ -23,6 +23,11 @@ BEGIN
     self->host_reset_started = 0;
     self->host_preflight_active = 0;
     self->host_capsule_prepare_active = 0;
+    /* DTrace requires associative arrays to be assigned before a predicate
+     * reads them.  These zero sentinels declare the PID/TID keyed stores. */
+    prepared_build_started[$target, 0] = 0;
+    prepared_validate_started[$target, 0] = 0;
+    prepared_map_started[$target, 0] = 0;
 }
 
 /* Phases 37/38/25: old-process preflight and capsule preparation. */
@@ -156,6 +161,128 @@ carrick*:::dsr-cache-lifecycle
         pid, arg0, this->ns);
     @host_image_load_open[pid, arg0] = sum(-1);
     self->host_image_load_started = 0;
+}
+
+/* Phases 39/40: old-process sparse prepared-image construction. */
+carrick*:::dsr-cache-lifecycle
+/(pid == $target || progenyof($target)) && arg1 == 39 &&
+ prepared_build_started[pid, arg0] != 0/
+{
+    @prepared_build_overwrite[pid, arg0] = count();
+}
+
+carrick*:::dsr-cache-lifecycle
+/(pid == $target || progenyof($target)) && arg1 == 39 &&
+ prepared_build_started[pid, arg0] == 0/
+{
+    @prepared_build_open[pid, arg0] = sum(1);
+}
+
+carrick*:::dsr-cache-lifecycle
+/(pid == $target || progenyof($target)) && arg1 == 39/
+{
+    prepared_build_started[pid, arg0] = timestamp;
+}
+
+carrick*:::dsr-cache-lifecycle
+/(pid == $target || progenyof($target)) && arg1 == 40 &&
+ prepared_build_started[pid, arg0] == 0/
+{
+    @prepared_build_missing_begin[pid, arg0] = count();
+}
+
+carrick*:::dsr-cache-lifecycle
+/(pid == $target || progenyof($target)) && arg1 == 40 &&
+ prepared_build_started[pid, arg0] != 0/
+{
+    this->ns = timestamp - prepared_build_started[pid, arg0];
+    printf("DSRPROF1|sample|phase=host-self-reexec-prepared-build|pid=%d|tid=%d|duration_ns=%d\n",
+        pid, arg0, this->ns);
+    @prepared_build_count[pid] = count();
+    @prepared_build_open[pid, arg0] = sum(-1);
+    prepared_build_started[pid, arg0] = 0;
+}
+
+/* Phases 41/42: fresh-process inherited artifact validation. */
+carrick*:::dsr-cache-lifecycle
+/(pid == $target || progenyof($target)) && arg1 == 41 &&
+ prepared_validate_started[pid, arg0] != 0/
+{
+    @prepared_validate_overwrite[pid, arg0] = count();
+}
+
+carrick*:::dsr-cache-lifecycle
+/(pid == $target || progenyof($target)) && arg1 == 41 &&
+ prepared_validate_started[pid, arg0] == 0/
+{
+    @prepared_validate_open[pid, arg0] = sum(1);
+}
+
+carrick*:::dsr-cache-lifecycle
+/(pid == $target || progenyof($target)) && arg1 == 41/
+{
+    prepared_validate_started[pid, arg0] = timestamp;
+}
+
+carrick*:::dsr-cache-lifecycle
+/(pid == $target || progenyof($target)) && arg1 == 42 &&
+ prepared_validate_started[pid, arg0] == 0/
+{
+    @prepared_validate_missing_begin[pid, arg0] = count();
+}
+
+carrick*:::dsr-cache-lifecycle
+/(pid == $target || progenyof($target)) && arg1 == 42 &&
+ prepared_validate_started[pid, arg0] != 0/
+{
+    this->ns = timestamp - prepared_validate_started[pid, arg0];
+    printf("DSRPROF1|sample|phase=host-self-reexec-prepared-validate|pid=%d|tid=%d|duration_ns=%d\n",
+        pid, arg0, this->ns);
+    @prepared_validate_count[pid] = count();
+    @prepared_validate_open[pid, arg0] = sum(-1);
+    prepared_validate_started[pid, arg0] = 0;
+}
+
+/* Phases 43/44: prepared file-backed extent mapping.  Validate and map are
+ * nested observations within host-self-reexec-restore, not additive parts of
+ * a second restore total. */
+carrick*:::dsr-cache-lifecycle
+/(pid == $target || progenyof($target)) && arg1 == 43 &&
+ prepared_map_started[pid, arg0] != 0/
+{
+    @prepared_map_overwrite[pid, arg0] = count();
+}
+
+carrick*:::dsr-cache-lifecycle
+/(pid == $target || progenyof($target)) && arg1 == 43 &&
+ prepared_map_started[pid, arg0] == 0/
+{
+    @prepared_map_open[pid, arg0] = sum(1);
+}
+
+carrick*:::dsr-cache-lifecycle
+/(pid == $target || progenyof($target)) && arg1 == 43/
+{
+    prepared_map_started[pid, arg0] = timestamp;
+}
+
+carrick*:::dsr-cache-lifecycle
+/(pid == $target || progenyof($target)) && arg1 == 44 &&
+ prepared_map_started[pid, arg0] == 0/
+{
+    @prepared_map_missing_begin[pid, arg0] = count();
+}
+
+carrick*:::dsr-cache-lifecycle
+/(pid == $target || progenyof($target)) && arg1 == 44 &&
+ prepared_map_started[pid, arg0] != 0/
+{
+    this->ns = timestamp - prepared_map_started[pid, arg0];
+    printf("DSRPROF1|sample|phase=host-self-reexec-prepared-map|pid=%d|tid=%d|duration_ns=%d\n",
+        pid, arg0, this->ns);
+    @prepared_map_count[pid] = count();
+    @prepared_map_open[pid, arg0] = sum(-1);
+    prepared_map_started[pid, arg0] = 0;
 }
 
 carrick*:::dsr-cache-lifecycle
@@ -679,6 +806,18 @@ END
     printa("DSRPROF1|incomplete|phase=host-self-reexec-capsule|pid=%d|tid=%d|kind=open|value=%@d\n", @host_capsule_open);
     printa("DSRPROF1|incomplete|phase=host-self-reexec-dispatcher|pid=%d|tid=%d|kind=open|value=%@d\n", @host_dispatcher_open);
     printa("DSRPROF1|incomplete|phase=host-self-reexec-image-load|pid=%d|tid=%d|kind=open|value=%@d\n", @host_image_load_open);
+    printa("DSRPROF1|count|phase=host-self-reexec-prepared-build|pid=%d|value=%@d\n", @prepared_build_count);
+    printa("DSRPROF1|incomplete|phase=host-self-reexec-prepared-build|pid=%d|tid=%d|kind=open|value=%@d\n", @prepared_build_open);
+    printa("DSRPROF1|incomplete|phase=host-self-reexec-prepared-build|pid=%d|tid=%d|kind=overwrite|value=%@d\n", @prepared_build_overwrite);
+    printa("DSRPROF1|incomplete|phase=host-self-reexec-prepared-build|pid=%d|tid=%d|kind=missing-begin|value=%@d\n", @prepared_build_missing_begin);
+    printa("DSRPROF1|count|phase=host-self-reexec-prepared-validate|pid=%d|value=%@d\n", @prepared_validate_count);
+    printa("DSRPROF1|incomplete|phase=host-self-reexec-prepared-validate|pid=%d|tid=%d|kind=open|value=%@d\n", @prepared_validate_open);
+    printa("DSRPROF1|incomplete|phase=host-self-reexec-prepared-validate|pid=%d|tid=%d|kind=overwrite|value=%@d\n", @prepared_validate_overwrite);
+    printa("DSRPROF1|incomplete|phase=host-self-reexec-prepared-validate|pid=%d|tid=%d|kind=missing-begin|value=%@d\n", @prepared_validate_missing_begin);
+    printa("DSRPROF1|count|phase=host-self-reexec-prepared-map|pid=%d|value=%@d\n", @prepared_map_count);
+    printa("DSRPROF1|incomplete|phase=host-self-reexec-prepared-map|pid=%d|tid=%d|kind=open|value=%@d\n", @prepared_map_open);
+    printa("DSRPROF1|incomplete|phase=host-self-reexec-prepared-map|pid=%d|tid=%d|kind=overwrite|value=%@d\n", @prepared_map_overwrite);
+    printa("DSRPROF1|incomplete|phase=host-self-reexec-prepared-map|pid=%d|tid=%d|kind=missing-begin|value=%@d\n", @prepared_map_missing_begin);
     printa("DSRPROF1|incomplete|phase=host-self-reexec-reset|pid=%d|tid=%d|kind=open|value=%@d\n", @host_reset_open);
     printa("DSRPROF1|incomplete|phase=host-self-reexec-restore|pid=%d|tid=%d|kind=open|value=%@d\n", @host_restore_open);
 

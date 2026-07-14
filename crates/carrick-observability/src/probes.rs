@@ -227,6 +227,12 @@ dsr_ordinal_enum! {
         HostSelfReexecGuestEntry = 36,
         HostSelfReexecPreflightBegin = 37,
         HostSelfReexecCapsulePrepareBegin = 38,
+        HostSelfReexecPreparedBuildBegin = 39,
+        HostSelfReexecPreparedBuildEnd = 40,
+        HostSelfReexecPreparedValidateBegin = 41,
+        HostSelfReexecPreparedValidateEnd = 42,
+        HostSelfReexecPreparedMapBegin = 43,
+        HostSelfReexecPreparedMapEnd = 44,
     }
 }
 
@@ -306,7 +312,7 @@ mod dsr_probe_abi {
     }
 
     #[test]
-    fn resolver_cache_and_lifecycle_values_are_stable_and_unique() {
+    fn resolver_cache_and_dsr_cache_lifecycle_values_are_stable_and_unique() {
         assert_eq!(DsrResolveKind::Direct.raw(), 1);
         assert_eq!(DsrResolveKind::Indirect.raw(), 2);
         assert_unique(&DsrResolveKind::ALL.map(DsrResolveKind::raw));
@@ -373,6 +379,30 @@ mod dsr_probe_abi {
         assert_eq!(
             DsrCacheLifecyclePhase::HostSelfReexecCapsulePrepareBegin.raw(),
             38
+        );
+        assert_eq!(
+            DsrCacheLifecyclePhase::HostSelfReexecPreparedBuildBegin.raw(),
+            39
+        );
+        assert_eq!(
+            DsrCacheLifecyclePhase::HostSelfReexecPreparedBuildEnd.raw(),
+            40
+        );
+        assert_eq!(
+            DsrCacheLifecyclePhase::HostSelfReexecPreparedValidateBegin.raw(),
+            41
+        );
+        assert_eq!(
+            DsrCacheLifecyclePhase::HostSelfReexecPreparedValidateEnd.raw(),
+            42
+        );
+        assert_eq!(
+            DsrCacheLifecyclePhase::HostSelfReexecPreparedMapBegin.raw(),
+            43
+        );
+        assert_eq!(
+            DsrCacheLifecyclePhase::HostSelfReexecPreparedMapEnd.raw(),
+            44
         );
         assert_unique(&DsrCacheLifecyclePhase::ALL.map(DsrCacheLifecyclePhase::raw));
 
