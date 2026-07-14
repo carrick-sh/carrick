@@ -1518,18 +1518,27 @@ enum NativeExecTeardownFlow {
 /// concurrently that it was in fact the last one, turning this exit into a
 /// `ProcessExit` whose caller (the spawn closure) reacts with
 /// `unsafe { libc::_exit(code) }` — a hard process-wide kill with no further
-/// chance for ANY thread's stack, including this one, to unwind normally.
-/// Flushing here, before that branch is even decided, closes that race
-/// window. `ThreadTranslator`'s `Drop` still finalizes idempotently for the
-/// ordinary (non-racing) case where this function returns `ThreadDone` and
-/// the caller's own stack unwinds normally — this call just makes the flush
-/// unconditional and explicit, matching every other retiring dispatch path
-/// (`Exit`, self-reexec `Execve`, `native_die_by_signal`).
+/// chance for ANY thread's stack to unwind normally. So the two outcomes need
+/// two DIFFERENT flushes, and the branch must be taken first:
 ///
-/// Idempotent: `finalize_profile_epoch` no-ops once a record has already
-/// been taken, so `translator`'s eventual `Drop` after this call can never
-/// double-flush (the wire protocol rejects a duplicate `(pid, tid, era)`
-/// group).
+/// * last thread → `finalize_profile_epoch_at_process_exit`, which also
+///   drains any sibling still registered (see `SiblingSlot`) and flushes this
+///   thread's own record last, so it owns the process-wide resolver delta.
+/// * not the last thread → a plain `finalize_profile_epoch`: this thread
+///   retires alone and the process keeps running.
+///
+/// Flushing only AFTER `finish_thread` (rather than before, unconditionally)
+/// is safe precisely because of the sibling registry: if a CONCURRENT
+/// `exit_group` on another thread kills this one mid-`finish_thread`, that
+/// thread's drain finds this thread's still-`Live` slot and emits its record
+/// on its behalf. The race the pre-registry code had to pre-flush against is
+/// now covered by the registry itself — and covered better, since the drain
+/// also reads this thread's real CPU live from its mach port.
+///
+/// Exactly-once regardless: every emission path claims the thread's registry
+/// slot with a single map operation, so `translator`'s eventual `Drop`, a
+/// concurrent foreign drain, and this call can never between them put a
+/// duplicate `(pid, tid, era)` group on the wire (which the protocol rejects).
 fn finalize_native_thread_exit(
     translator: &mut dsr::ThreadTranslator,
     thread_runtime: &mut NativeThreadRuntime,
@@ -1537,16 +1546,16 @@ fn finalize_native_thread_exit(
     memory: &SharedNativeMemory,
     code: i32,
 ) -> NativeThreadLoopOutcome {
-    translator.finalize_profile_epoch();
     if thread_runtime.finish_thread(dispatcher, memory) {
         // This exit turned out to be the process's last live thread after
-        // all -- the same "everyone else dies at `libc::_exit()` with zero
-        // chance to flush" seam as `exit_group`. Drain whatever sibling
-        // slots remain (ordinarily none, since `finish_thread` reporting
-        // "last" already implies no other live thread; a no-op then).
-        translator.drain_sibling_profiles_before_process_exit();
+        // all: the same "everyone else dies at `libc::_exit()` with zero
+        // chance to flush" seam as `exit_group`. Drain any straggler sibling
+        // slots, then flush this thread's own record last so it owns the
+        // process-wide resolver delta.
+        translator.finalize_profile_epoch_at_process_exit();
         NativeThreadLoopOutcome::ProcessExit(code)
     } else {
+        translator.finalize_profile_epoch();
         NativeThreadLoopOutcome::ThreadDone
     }
 }
@@ -1685,8 +1694,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
         // the only native instruction engine now.
         if crate::fork_quiesce::exec_replacing_other_thread(thread_runtime.tid()) {
             if thread_runtime.finish_thread(&dispatcher, &memory) {
-                translator.finalize_profile_epoch();
-                translator.drain_sibling_profiles_before_process_exit();
+                translator.finalize_profile_epoch_at_process_exit();
                 return Ok(NativeThreadLoopOutcome::ProcessExit(0));
             }
             return Ok(NativeThreadLoopOutcome::ExecReplacedThread);
@@ -2020,13 +2028,12 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                 )?;
             }
             DispatchOutcome::Exit { code } => {
-                translator.finalize_profile_epoch();
                 // `exit_group` (or `exit(2)` as the last live thread): every
                 // OTHER live guest thread of this process dies unconditionally
                 // and instantly at the `libc::_exit()` below, with zero chance
                 // to flush its own NATIVEPERF record -- emit one for each of
-                // them now, before that happens.
-                translator.drain_sibling_profiles_before_process_exit();
+                // them now, before that happens, then this thread's own last.
+                translator.finalize_profile_epoch_at_process_exit();
                 if NATIVE_FORKED_GUEST_CHILD.load(std::sync::atomic::Ordering::Acquire) {
                     dispatcher.cleanup_sysv_ipc_on_process_exit();
                     crate::exec_helpers::forked_child_exit(
@@ -2185,8 +2192,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                     }
                     NativeForkFlow::RetireForExec => {
                         if thread_runtime.finish_thread(&dispatcher, &memory) {
-                            translator.finalize_profile_epoch();
-                            translator.drain_sibling_profiles_before_process_exit();
+                            translator.finalize_profile_epoch_at_process_exit();
                             return Ok(NativeThreadLoopOutcome::ProcessExit(0));
                         }
                         return Ok(NativeThreadLoopOutcome::ExecReplacedThread);
@@ -2318,8 +2324,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                             NativeExecTeardownFlow::Proceed => {}
                             NativeExecTeardownFlow::RetireForExec => {
                                 if thread_runtime.finish_thread(&dispatcher, &memory) {
-                                    translator.finalize_profile_epoch();
-                                    translator.drain_sibling_profiles_before_process_exit();
+                                    translator.finalize_profile_epoch_at_process_exit();
                                     return Ok(NativeThreadLoopOutcome::ProcessExit(0));
                                 }
                                 return Ok(NativeThreadLoopOutcome::ExecReplacedThread);
