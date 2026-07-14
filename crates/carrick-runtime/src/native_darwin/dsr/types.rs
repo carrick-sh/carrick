@@ -211,20 +211,69 @@ pub(in crate::native_darwin) struct SensitiveExit {
     pub(in crate::native_darwin) resume: GuestVa,
 }
 
+/// A block-planner-recognised, provably fusible AArch64 exclusive region: an
+/// exclusive load (LDXR/LDAXR family) paired with its matching exclusive
+/// store (STXR/STLXR family) across a bounded, straight-line CAS/RMW
+/// retry-loop body, with no hazardous instruction between them (see
+/// `block::try_fuse_exclusive_region` for the exact fusibility predicate).
+///
+/// This carries the semantic data Task 2 needs to lower the region to
+/// native code instead of two independent gateway traps. It deliberately
+/// does NOT carry the region's own instruction sequence: that lives in the
+/// usual place, `BlockPlan::instructions` (mirroring every other exit kind,
+/// e.g. `PlannedExit::Direct`'s target instruction is never duplicated into
+/// the exit payload either) -- see `block::try_fuse_exclusive_region`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::native_darwin) struct ExclusiveRegionExit {
+    /// Guest VA of the exclusive load -- the top of the retry loop.
+    pub(in crate::native_darwin) start: GuestVa,
+    /// Guest VA one past the region's final instruction (the retry branch).
+    pub(in crate::native_darwin) end: GuestVa,
+    /// Guest VA the retry branch targets on store failure. Always equal to
+    /// `start` for a recognised region; carried explicitly so Task 2's
+    /// emitter does not have to re-derive the invariant.
+    pub(in crate::native_darwin) retry_edge: GuestVa,
+    pub(in crate::native_darwin) load_word: u32,
+    pub(in crate::native_darwin) store_word: u32,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum InstAction {
     Copy(u32),
     Memory(MemoryAccess),
-    VirtualizedX18 { word: u32, op: bad64::Op },
-    VirtualizedX28 { word: u32, op: bad64::Op },
-    VirtualizedX18X28ReadOnly { word: u32, op: bad64::Op },
-    VirtualizedX18WriteX28Read { word: u32, op: bad64::Op },
+    VirtualizedX18 {
+        word: u32,
+        op: bad64::Op,
+    },
+    VirtualizedX28 {
+        word: u32,
+        op: bad64::Op,
+    },
+    VirtualizedX18X28ReadOnly {
+        word: u32,
+        op: bad64::Op,
+    },
+    VirtualizedX18WriteX28Read {
+        word: u32,
+        op: bad64::Op,
+    },
     PcRelative(PcRelativeInst),
     Direct(DirectExit),
     Indirect(IndirectExit),
-    Syscall { resume: GuestVa },
+    Syscall {
+        resume: GuestVa,
+    },
     Sensitive(SensitiveExit),
-    Unsupported { word: u32, op: bad64::Op },
+    /// A fused exclusive region recognised by the block planner's bounded
+    /// forward scan (`block::try_fuse_exclusive_region`). Not produced by
+    /// `decode::classify` -- recognising a region requires multi-instruction
+    /// lookahead that per-instruction decode cannot do -- so this variant
+    /// exists for Task 2 to construct/consume at the block-planning layer.
+    ExclusiveRegion(ExclusiveRegionExit),
+    Unsupported {
+        word: u32,
+        op: bad64::Op,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
