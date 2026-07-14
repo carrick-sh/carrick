@@ -234,6 +234,10 @@ def dtrace_raw_lines(pid=42):
     ]
 
 
+def supervisor_line(*, self_cpu_ns: int, children_cpu_ns: int) -> str:
+    return f"NATIVEPERF1|supervisor|self_cpu_ns={self_cpu_ns}|children_cpu_ns={children_cpu_ns}"
+
+
 def budget_frames(
     *,
     gateway_entries: int,
@@ -254,6 +258,16 @@ def budget_frames(
     startup_wall_ns: int = 0,
     startup_cpu_ns: int = 0,
     process_cpu_ns: int | None = None,
+    # Task 3 supervisor record.  A profile is a SINGLE (pid, tid, era) thread
+    # group by default here, so this is the whole profile's own supervisor:
+    # children defaults to this thread group's own process_cpu (satisfying
+    # gate2 with zero gap) and self defaults to 0 (satisfying gate1 whenever
+    # the caller's chosen cpu_ns equals that same process_cpu, matching the
+    # pre-Task-3 default). `include_supervisor=False` lets callers that
+    # concatenate multiple `budget_frames()` calls into one profile add their
+    # own combined supervisor line instead (a profile has AT MOST one).
+    supervisor_self_cpu_ns: int = 0,
+    include_supervisor: bool = True,
 ):
     lines = nativeperf_frames(pid=pid, tid=tid, era=era)
     lines[0] = lines[0].replace("gateway_entries=2", f"gateway_entries={gateway_entries}").replace(
@@ -308,6 +322,13 @@ def budget_frames(
         + f"process|startup_wall_ns={startup_wall_ns}|startup_cpu_ns={startup_cpu_ns}|"
         f"process_cpu_ns={resolved_process_cpu}"
     )
+    if include_supervisor:
+        lines.append(
+            supervisor_line(
+                self_cpu_ns=supervisor_self_cpu_ns,
+                children_cpu_ns=resolved_process_cpu,
+            )
+        )
     return lines
 
 
@@ -322,6 +343,7 @@ def profile_with_budget(
     startup_wall_ns: int = 0,
     startup_cpu_ns: int = 0,
     process_cpu_ns: int | None = None,
+    supervisor_self_cpu_ns: int = 0,
 ):
     return budget.parse_nativeperf(
         budget_frames(
@@ -334,6 +356,7 @@ def profile_with_budget(
             startup_wall_ns=startup_wall_ns,
             startup_cpu_ns=startup_cpu_ns,
             process_cpu_ns=process_cpu_ns,
+            supervisor_self_cpu_ns=supervisor_self_cpu_ns,
         )
     )
 
@@ -354,7 +377,17 @@ def strict_abba_records(
     profile, profiled_wall_ns=105, untraced_cpu_ns=100, profiled_cpu_ns=None
 ):
     if profiled_cpu_ns is None:
-        profiled_cpu_ns = _process_cpu_total(profile)
+        # gate1 requires cpu_ns == supervisor.self + supervisor.children; the
+        # v2 fixture builders above set supervisor.children == Sigma guest
+        # process_cpu by construction, so this generalizes the old
+        # `_process_cpu_total` default (self==0 reduces to the same value)
+        # while letting supervisor-cpu-rung tests set a nonzero self.
+        if profile.supervisor is not None:
+            profiled_cpu_ns = (
+                profile.supervisor.self_cpu_ns + profile.supervisor.children_cpu_ns
+            )
+        else:
+            profiled_cpu_ns = _process_cpu_total(profile)
     records = []
     for label in budget.abba_schedule(samples=5):
         plane = "untraced" if label.startswith("off-") else "profiled"
@@ -802,6 +835,67 @@ class NativePerfV2Tests(unittest.TestCase):
         with self.assertRaisesRegex(budget.BudgetError, "mixed"):
             budget.parse_result_row(encoded)
 
+    def test_supervisor_record_parses_and_is_at_most_one_per_profile(self):
+        lines = nativeperf_frames_v2() + [
+            supervisor_line(self_cpu_ns=5, children_cpu_ns=90)
+        ]
+        profile = budget.parse_nativeperf(lines)
+        self.assertEqual(profile.supervisor, budget.SupervisorRecord(5, 90))
+
+    def test_supervisor_record_absent_by_default(self):
+        profile = budget.parse_nativeperf(nativeperf_frames_v2())
+        self.assertIsNone(profile.supervisor)
+
+    def test_duplicate_supervisor_record_is_rejected(self):
+        lines = nativeperf_frames_v2() + [
+            supervisor_line(self_cpu_ns=5, children_cpu_ns=90),
+            supervisor_line(self_cpu_ns=6, children_cpu_ns=91),
+        ]
+        with self.assertRaisesRegex(budget.BudgetError, "duplicate supervisor"):
+            budget.parse_nativeperf(lines)
+
+    def test_supervisor_record_alongside_v1_groups_is_rejected(self):
+        lines = nativeperf_frames() + [
+            supervisor_line(self_cpu_ns=5, children_cpu_ns=90)
+        ]
+        with self.assertRaisesRegex(
+            budget.BudgetError, "supervisor record requires a NATIVEPERF v2 profile"
+        ):
+            budget.parse_nativeperf(lines)
+
+    def test_supervisor_record_rejects_unknown_or_missing_fields(self):
+        with self.assertRaisesRegex(budget.BudgetError, "unknown supervisor field"):
+            budget.parse_nativeperf(
+                nativeperf_frames_v2()
+                + ["NATIVEPERF1|supervisor|self_cpu_ns=1|children_cpu_ns=2|surprise=3"]
+            )
+        with self.assertRaisesRegex(budget.BudgetError, "missing supervisor field"):
+            budget.parse_nativeperf(
+                nativeperf_frames_v2() + ["NATIVEPERF1|supervisor|self_cpu_ns=1"]
+            )
+
+    def test_supervisor_record_round_trips_through_the_wire(self):
+        lines = nativeperf_frames_v2() + [
+            supervisor_line(self_cpu_ns=12, children_cpu_ns=90)
+        ]
+        profile = budget.parse_nativeperf(lines)
+        record = budget.RunRecord.synthetic(profile=profile, schedule_label="on-1")
+        encoded = budget.run_record_json(record)
+        self.assertEqual(
+            encoded["profile"]["supervisor"],
+            {"self_cpu_ns": 12, "children_cpu_ns": 90},
+        )
+        decoded = budget.parse_result_row(encoded)
+        self.assertEqual(decoded.profile.supervisor, profile.supervisor)
+        self.assertEqual(decoded.profile, profile)
+        # A profile with no supervisor round-trips a null, not a missing key.
+        no_supervisor = budget.parse_nativeperf(nativeperf_frames_v2())
+        without = budget.run_record_json(
+            budget.RunRecord.synthetic(profile=no_supervisor, schedule_label="on-1")
+        )
+        self.assertIsNone(without["profile"]["supervisor"])
+        self.assertIsNone(budget.parse_result_row(without).profile.supervisor)
+
 
 class AdditiveCpuEvidenceV2Tests(unittest.TestCase):
     def test_v1_profile_is_rejected_by_additive_attribution(self):
@@ -811,17 +905,25 @@ class AdditiveCpuEvidenceV2Tests(unittest.TestCase):
         ):
             budget.derive_additive_cpu_evidence(profile, cpu_ns=100)
 
+    def test_missing_supervisor_record_on_v2_profile_is_rejected(self):
+        profile = budget.parse_nativeperf(nativeperf_frames_v2())
+        self.assertIsNone(profile.supervisor)
+        with self.assertRaisesRegex(budget.BudgetError, "supervisor record required"):
+            budget.derive_additive_cpu_evidence(profile, cpu_ns=90)
+
     def test_helper_cpu_negative_is_rejected(self):
-        lines = nativeperf_frames_v2(thread_cpu_ns=50, process_cpu_ns=40, startup_cpu_ns=0)
+        lines = nativeperf_frames_v2(
+            thread_cpu_ns=50, process_cpu_ns=40, startup_cpu_ns=0
+        ) + [supervisor_line(self_cpu_ns=0, children_cpu_ns=40)]
         profile = budget.parse_nativeperf(lines)
         with self.assertRaisesRegex(budget.BudgetError, "helper CPU derivation is negative"):
             budget.derive_additive_cpu_evidence(profile, cpu_ns=40)
 
     def test_process_cpu_per_pid_uses_max_gauge_across_groups(self):
-        lines = nativeperf_frames_v2(
-            tid=11, thread_cpu_ns=10, process_cpu_ns=50, startup_cpu_ns=0
-        ) + nativeperf_frames_v2(
-            tid=12, thread_cpu_ns=10, process_cpu_ns=80, startup_cpu_ns=0
+        lines = (
+            nativeperf_frames_v2(tid=11, thread_cpu_ns=10, process_cpu_ns=50, startup_cpu_ns=0)
+            + nativeperf_frames_v2(tid=12, thread_cpu_ns=10, process_cpu_ns=80, startup_cpu_ns=0)
+            + [supervisor_line(self_cpu_ns=0, children_cpu_ns=80)]
         )
         profile = budget.parse_nativeperf(lines)
         additive = budget.derive_additive_cpu_evidence(profile, cpu_ns=80)
@@ -830,6 +932,8 @@ class AdditiveCpuEvidenceV2Tests(unittest.TestCase):
         self.assertEqual(additive.helper_cpu_ns, 60)
         self.assertEqual(additive.startup_cpu_ns, 0)
         self.assertEqual(additive.blocked_cpu_ns, 0)
+        self.assertEqual(additive.supervisor_self_cpu_ns, 0)
+        self.assertEqual(additive.supervisor_children_cpu_ns, 80)
 
     def test_two_eras_of_the_same_pid_and_tid_sum_per_era_thread_cpu(self):
         """Regression fixture for the exec-surviving-thread attribution bug:
@@ -863,7 +967,11 @@ class AdditiveCpuEvidenceV2Tests(unittest.TestCase):
             startup_wall_ns=100,
             startup_cpu_ns=0,
         )
-        profile = budget.parse_nativeperf(pre_exec + post_exec)
+        profile = budget.parse_nativeperf(
+            pre_exec
+            + post_exec
+            + [supervisor_line(self_cpu_ns=0, children_cpu_ns=43_000_000)]
+        )
 
         additive = budget.derive_additive_cpu_evidence(profile, cpu_ns=43_000_000)
 
@@ -872,16 +980,66 @@ class AdditiveCpuEvidenceV2Tests(unittest.TestCase):
         self.assertGreaterEqual(additive.helper_cpu_ns, 0)
         self.assertEqual(additive.helper_cpu_ns, 43_000_000 - (15_000_000 + 27_482_000))
 
-    def test_additive_residual_gate_rejects_both_signed_directions(self):
-        lines = nativeperf_frames_v2(thread_cpu_ns=40, process_cpu_ns=40, startup_cpu_ns=0)
+    def test_gate1_rejects_supervisor_cpu_mismatch_both_directions(self):
+        # gate1: abs(cpu_ns - (self+children)) <= 2% * cpu_ns. children==
+        # process_cpu_total(40) and self==0 by construction, so gate2's gap
+        # is always zero here and gate1 is the only gate exercised — this is
+        # the same scenario the old single residual gate covered.
+        lines = nativeperf_frames_v2(
+            thread_cpu_ns=40, process_cpu_ns=40, startup_cpu_ns=0
+        ) + [supervisor_line(self_cpu_ns=0, children_cpu_ns=40)]
         profile = budget.parse_nativeperf(lines)
-        with self.assertRaisesRegex(budget.BudgetError, "2%"):
+        with self.assertRaisesRegex(budget.BudgetError, "supervisor CPU.*2%"):
             budget.derive_additive_cpu_evidence(profile, cpu_ns=100)
-        with self.assertRaisesRegex(budget.BudgetError, "2%"):
+        with self.assertRaisesRegex(budget.BudgetError, "supervisor CPU.*2%"):
             budget.derive_additive_cpu_evidence(profile, cpu_ns=10)
         reconciled = budget.derive_additive_cpu_evidence(profile, cpu_ns=40)
         self.assertEqual(reconciled.residual_ns, 0)
         self.assertEqual(reconciled.residual_share, 0.0)
+        self.assertEqual(reconciled.supervisor_self_cpu_ns, 0)
+        self.assertEqual(reconciled.supervisor_children_cpu_ns, 40)
+
+    def test_gate2_rejects_children_cpu_below_guest_process_cpu(self):
+        # children(30) < guest process CPU(40); gate1 passes by construction
+        # (self=10, children=30, cpu_ns=40=10+30) so gate2 is the one that
+        # fires.
+        lines = nativeperf_frames_v2(
+            thread_cpu_ns=30, process_cpu_ns=40, startup_cpu_ns=0
+        ) + [supervisor_line(self_cpu_ns=10, children_cpu_ns=30)]
+        profile = budget.parse_nativeperf(lines)
+        with self.assertRaisesRegex(
+            budget.BudgetError, "supervisor children CPU is less than guest process CPU"
+        ):
+            budget.derive_additive_cpu_evidence(profile, cpu_ns=40)
+
+    def test_gate2_rejects_children_cpu_exceeding_guest_process_cpu_by_more_than_2_percent(
+        self,
+    ):
+        # children(45) - guests(40) = 5, a ~11% gap over cpu_ns=45; gate1
+        # passes by construction (self=0, children=45, cpu_ns=45).
+        lines = nativeperf_frames_v2(
+            thread_cpu_ns=40, process_cpu_ns=40, startup_cpu_ns=0
+        ) + [supervisor_line(self_cpu_ns=0, children_cpu_ns=45)]
+        profile = budget.parse_nativeperf(lines)
+        with self.assertRaisesRegex(
+            budget.BudgetError,
+            "supervisor children CPU exceeds guest process CPU.*2%",
+        ):
+            budget.derive_additive_cpu_evidence(profile, cpu_ns=45)
+
+    def test_gate2_accepts_a_small_gap_within_2_percent(self):
+        # children(41) - guests(40) = 1: a legitimate small "post-flush
+        # teardown" gap. self=59 makes self+children=100=cpu_ns (gate1 exact),
+        # and the gate2 gap share is 1/100 = 0.01, within the 2% bound.
+        lines = nativeperf_frames_v2(
+            thread_cpu_ns=40, process_cpu_ns=40, startup_cpu_ns=0
+        ) + [supervisor_line(self_cpu_ns=59, children_cpu_ns=41)]
+        profile = budget.parse_nativeperf(lines)
+        additive = budget.derive_additive_cpu_evidence(profile, cpu_ns=100)
+        self.assertEqual(additive.supervisor_self_cpu_ns, 59)
+        self.assertEqual(additive.supervisor_children_cpu_ns, 41)
+        self.assertEqual(additive.process_cpu_ns, 40)
+        self.assertEqual(additive.residual_ns, 100 - 40)
 
 
 class CaptureAndScheduleTests(unittest.TestCase):
@@ -1618,6 +1776,7 @@ class ReviewFixContractTests(unittest.TestCase):
             "NATIVEPERF1|thread|complete=1|pid=10|tid=11|era=12|frame=process|"
             "startup_wall_ns=0|startup_cpu_ns=0|process_cpu_ns=50"
         )
+        v2_lines.append(supervisor_line(self_cpu_ns=0, children_cpu_ns=50))
         profile = budget.parse_nativeperf(v2_lines)
         # 10 + 3 + 20 + 4 + 6 + 5 + 2 = 50 on-CPU ns. Blocked is
         # separately retained and never double-counted into the CPU sum.
@@ -1799,14 +1958,22 @@ class ReviewFixContractTests(unittest.TestCase):
                 budget.analyze_evidence(evidence, check=True)
 
     def test_count_evidence_exposes_explicit_thread_scope(self):
+        # derive_count_evidence never reaches the additive/supervisor gate,
+        # so this multi-pid profile carries no supervisor record at all (a
+        # profile has AT MOST one, and each budget_frames() call would add
+        # its own).
         lines = budget_frames(
-            gateway_entries=400, sensitive_exclusive=160, syscall_dispatch_ns=0
+            gateway_entries=400,
+            sensitive_exclusive=160,
+            syscall_dispatch_ns=0,
+            include_supervisor=False,
         ) + budget_frames(
             gateway_entries=240,
             sensitive_exclusive=0,
             syscall_dispatch_ns=0,
             pid=20,
             tid=21,
+            include_supervisor=False,
         )
         profile = budget.parse_nativeperf(lines)
         hottest = budget.derive_count_evidence(profile, scope="hottest-thread")
@@ -1819,15 +1986,24 @@ class ReviewFixContractTests(unittest.TestCase):
             budget.derive_count_evidence(profile, scope="everything")
 
     def test_count_scopes_must_agree_before_slice_selection(self):
+        # This profile DOES reach derive_additive_cpu_evidence (via
+        # analyze()), so it needs exactly one supervisor record: each
+        # budget_frames() call defaults process_cpu to the same 39 (the
+        # fixed exclusive-phase sum with syscall_dispatch_ns=0), so
+        # children=78 covers both pids' guest CPU with a zero gate2 gap.
         lines = budget_frames(
-            gateway_entries=400, sensitive_exclusive=160, syscall_dispatch_ns=0
+            gateway_entries=400,
+            sensitive_exclusive=160,
+            syscall_dispatch_ns=0,
+            include_supervisor=False,
         ) + budget_frames(
             gateway_entries=390,
             sensitive_exclusive=0,
             syscall_dispatch_ns=0,
             pid=20,
             tid=21,
-        )
+            include_supervisor=False,
+        ) + [supervisor_line(self_cpu_ns=0, children_cpu_ns=78)]
         profile = budget.parse_nativeperf(lines)
         records = strict_abba_records(profile)
         with self.assertRaisesRegex(budget.BudgetError, "scope"):
@@ -1925,6 +2101,28 @@ class ReviewFixContractTests(unittest.TestCase):
             decision.basis, "low-tax-measured-cpu-attribution-over-untraced-cpu"
         )
 
+    def test_supervisor_cpu_rung_selects_scheduler_slice(self):
+        # supervisor_self_cpu_ns=35 over untraced_cpu_ns=100 is a 0.35 share,
+        # the same shape as the sibling startup-cpu/helper-cpu rung tests.
+        # children defaults to this thread's own process_cpu (39), so
+        # strict_abba_records' default cpu_ns becomes self(35)+children(39)
+        # = 74, satisfying gate1/gate2 by construction.
+        profile = profile_with_budget(
+            gateway_entries=100,
+            sensitive_exclusive=10,
+            syscall_dispatch_ns=0,
+            supervisor_self_cpu_ns=35,
+        )
+        records = strict_abba_records(profile)
+        decision = budget.analyze(records)
+        self.assertEqual(decision.selected_slice, "supervisor-cpu")
+        self.assertEqual(decision.scope, "process-cpu")
+        self.assertAlmostEqual(decision.share, 0.35)
+        self.assertEqual(
+            decision.basis, "low-tax-measured-cpu-attribution-over-untraced-cpu"
+        )
+        self.assertTrue(decision.duration_evidence_usable)
+
     def test_duration_terms_below_thresholds_fail_closed(self):
         # When all duration terms (blocked-cpu, startup-cpu, helper-cpu,
         # syscall-dispatch) are held below the 30% single-select threshold,
@@ -1988,6 +2186,25 @@ class ReviewFixContractTests(unittest.TestCase):
             checked = budget.analyze_evidence(evidence, check=True)
             self.assertEqual(checked, decision)
             self.assertEqual(checked.selected_slice, "blocked-cpu")
+
+    def test_analyze_evidence_check_round_trips_a_supervisor_cpu_decision(self):
+        profile = profile_with_budget(
+            gateway_entries=100,
+            sensitive_exclusive=10,
+            syscall_dispatch_ns=0,
+            supervisor_self_cpu_ns=35,
+        )
+        records = strict_abba_records(profile)
+        decision = budget.analyze(records)
+        self.assertEqual(decision.selected_slice, "supervisor-cpu")
+        rows = [budget.run_record_json(record) for record in records]
+        rows.append(budget.decision_record_json(decision))
+        with tempfile.TemporaryDirectory() as temp:
+            evidence = pathlib.Path(temp) / "evidence.jsonl"
+            evidence.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            checked = budget.analyze_evidence(evidence, check=True)
+            self.assertEqual(checked, decision)
+            self.assertEqual(checked.selected_slice, "supervisor-cpu")
 
 
 class AnalyzerTests(unittest.TestCase):
