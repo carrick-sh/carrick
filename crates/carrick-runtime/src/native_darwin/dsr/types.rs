@@ -189,6 +189,21 @@ pub(in crate::native_darwin) enum SensitiveKind {
     IcIvau,
 }
 
+impl SensitiveKind {
+    pub(in crate::native_darwin) const fn profile_class(self) -> super::profile::SensitiveClass {
+        match self {
+            Self::Exclusive(_) => super::profile::SensitiveClass::Exclusive,
+            Self::ReadTpidr => super::profile::SensitiveClass::ReadTpidr,
+            Self::WriteTpidr => super::profile::SensitiveClass::WriteTpidr,
+            Self::ReadCtr => super::profile::SensitiveClass::ReadCtr,
+            Self::ReadDczid => super::profile::SensitiveClass::ReadDczid,
+            Self::DcZva => super::profile::SensitiveClass::DcZva,
+            Self::DcCvau => super::profile::SensitiveClass::DcCvau,
+            Self::IcIvau => super::profile::SensitiveClass::IcIvau,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::native_darwin) struct SensitiveExit {
     pub(in crate::native_darwin) kind: SensitiveKind,
@@ -268,6 +283,20 @@ pub(super) enum NativeDsrExit {
 }
 
 impl NativeDsrExit {
+    pub(super) const fn profile_class(&self) -> super::profile::ExitClass {
+        match self {
+            Self::Syscall { .. } => super::profile::ExitClass::Syscall,
+            Self::ResolveDirect { .. } => super::profile::ExitClass::ResolveDirect,
+            Self::ResolveIndirect { .. } => super::profile::ExitClass::ResolveIndirect,
+            Self::Sensitive { .. } => super::profile::ExitClass::Sensitive,
+            Self::Fault { .. } => super::profile::ExitClass::Fault,
+            Self::Kick { .. } => super::profile::ExitClass::Kick,
+            Self::KickAtEntry { .. } => super::profile::ExitClass::Kick,
+            Self::StaleGeneration { .. } => super::profile::ExitClass::StaleGeneration,
+            Self::Unsupported { .. } => super::profile::ExitClass::Unsupported,
+        }
+    }
+
     pub(super) fn probe_fields(
         self,
     ) -> (carrick_observability::probes::DsrExitKind, u64, u64, i32) {
@@ -302,6 +331,8 @@ impl NativeDsrExit {
 
 #[derive(Debug, thiserror::Error)]
 pub(in crate::native_darwin) enum DsrError {
+    #[error("DSR profile evidence invalid: {0}")]
+    Profile(#[from] super::profile::ProfileError),
     #[error("DSR PC overflow at guest PC 0x{pc:x}")]
     PcOverflow { pc: u64 },
     #[error("DSR could not decode 0x{word:08x} at guest PC 0x{pc:x}: {detail}")]
@@ -357,6 +388,7 @@ impl DsrError {
         use carrick_observability::probes::DsrOperationOutcome;
 
         match self {
+            Self::Profile(_) => DsrOperationOutcome::CachePolicy,
             Self::PcOverflow { .. } => DsrOperationOutcome::PcOverflow,
             Self::Decode { .. } => DsrOperationOutcome::Decode,
             Self::Malformed { .. } => DsrOperationOutcome::Malformed,

@@ -204,11 +204,20 @@ struct NativeUcontextSnapshot {
     far: u64,
 }
 
-type DsrPrepareAndEnterFn = fn(
+type DsrPrepareFn = fn(
     &mut dsr::ThreadTranslator,
     &SharedNativeMemory,
+    &NativeUcontextSnapshot,
+) -> Result<dsr::PreparedEntry, RuntimeError>;
+type DsrEnterFn = fn(
+    &mut dsr::ThreadTranslator,
+    dsr::PreparedEntry,
     &mut NativeUcontextSnapshot,
-) -> Result<(dsr::PreparedEntry, dsr::PreparedExit), RuntimeError>;
+) -> Result<dsr::PreparedExit, RuntimeError>;
+struct TimedDispatchOutcome {
+    outcome: DispatchOutcome,
+    blocked_ns: u64,
+}
 
 struct NativeForkRequest {
     pidfd_out: Option<u64>,
@@ -1483,31 +1492,68 @@ fn run_native_thread_loop(
     )
 }
 #[inline(never)]
-fn prepare_and_enter_dsr<const PROFILE: bool>(
+fn prepare_dsr_entry<const PROFILE: bool>(
     translator: &mut dsr::ThreadTranslator,
     memory: &SharedNativeMemory,
+    snapshot: &NativeUcontextSnapshot,
+) -> Result<dsr::PreparedEntry, RuntimeError> {
+    let mut memory = memory.lock();
+    memory
+        .prepare_dsr_execution(snapshot.pc)
+        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+    translator
+        .prepare_entry::<PROFILE>(&memory, snapshot)
+        .map_err(|error| RuntimeError::Unsupported(error.to_string()))
+}
+
+#[inline(never)]
+fn enter_dsr_prepared<const PROFILE: bool>(
+    translator: &mut dsr::ThreadTranslator,
+    prepared: dsr::PreparedEntry,
     snapshot: &mut NativeUcontextSnapshot,
-) -> Result<(dsr::PreparedEntry, dsr::PreparedExit), RuntimeError> {
-    let prepared = {
-        let mut memory = memory.lock();
-        memory
-            .prepare_dsr_execution(snapshot.pc)
-            .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
-        translator
-            .prepare_entry::<PROFILE>(&memory, snapshot)
-            .map_err(|error| RuntimeError::Unsupported(error.to_string()))?
-    };
+) -> Result<dsr::PreparedExit, RuntimeError> {
     // Translation and executable-page preparation require the shared memory
     // lock; running guest instructions must not hold it. A guest can spin
     // indefinitely between syscalls while a sibling needs this lock to publish
     // the value that ends the spin (altstacktid/mmapfileshare_mt/telemetrymap).
-    let raw_exit = translator
+    translator
         .enter_prepared::<PROFILE>(prepared, snapshot)
-        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
-    Ok((prepared, raw_exit))
+        .map_err(|error| RuntimeError::Unsupported(error.to_string()))
 }
 
 fn run_native_dsr_thread_loop(
+    dispatcher: Arc<SyscallDispatcher>,
+    memory: SharedNativeMemory,
+    reporter: Arc<CompatReporter>,
+    max_traps: usize,
+    plan: Arc<ExecutionPlan>,
+    thread_runtime: &mut NativeThreadRuntime,
+    start: NativeThreadStart,
+) -> Result<NativeThreadLoopOutcome, RuntimeError> {
+    if std::env::var_os("CARRICK_DSR_PROFILE").is_some() {
+        run_native_dsr_thread_loop_profiled::<true>(
+            dispatcher,
+            memory,
+            reporter,
+            max_traps,
+            plan,
+            thread_runtime,
+            start,
+        )
+    } else {
+        run_native_dsr_thread_loop_profiled::<false>(
+            dispatcher,
+            memory,
+            reporter,
+            max_traps,
+            plan,
+            thread_runtime,
+            start,
+        )
+    }
+}
+
+fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
     dispatcher: Arc<SyscallDispatcher>,
     memory: SharedNativeMemory,
     reporter: Arc<CompatReporter>,
@@ -1533,11 +1579,9 @@ fn run_native_dsr_thread_loop(
     let process_translator = memory.lock().dsr_process_translator()?;
     let mut translator =
         dsr::ThreadTranslator::for_process(process_translator, thread_runtime.tid().raw());
-    let prepare_and_enter: DsrPrepareAndEnterFn = if translator.profiling_enabled() {
-        prepare_and_enter_dsr::<true>
-    } else {
-        prepare_and_enter_dsr::<false>
-    };
+    debug_assert_eq!(translator.profiling_enabled(), PROFILE);
+    let prepare: DsrPrepareFn = prepare_dsr_entry::<PROFILE>;
+    let enter: DsrEnterFn = enter_dsr_prepared::<PROFILE>;
     let trace_syscalls = std::env::var_os("CARRICK_NATIVE_TRACE_SYSCALLS").is_some();
     let mut vfork_completion: Option<NativeVforkCompletion> = None;
     let mut traps = 0_usize;
@@ -1558,15 +1602,75 @@ fn run_native_dsr_thread_loop(
             }
             return Ok(NativeThreadLoopOutcome::ExecReplacedThread);
         }
+        let loop_timer = if PROFILE {
+            Some(dsr::profile::PhaseTimer::start_if::<true>())
+        } else {
+            None
+        };
         thread_runtime.park_for_fork_quiesce();
-        let (prepared, raw_exit) = prepare_and_enter(&mut translator, &memory, &mut snapshot)?;
+        if let Some(loop_timer) = loop_timer {
+            translator
+                .add_profile_phase(dsr::profile::Phase::LoopQuiesce, loop_timer)
+                .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+        }
+
+        let prepare_timer = if PROFILE {
+            Some(dsr::profile::PhaseTimer::start_if::<true>())
+        } else {
+            None
+        };
+        let prepared = prepare(&mut translator, &memory, &snapshot)?;
+        if let Some(prepare_timer) = prepare_timer {
+            translator
+                .add_profile_phase(dsr::profile::Phase::PrepareIndex, prepare_timer)
+                .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+        }
+
+        let run_timer = if PROFILE {
+            Some(dsr::profile::PhaseTimer::start_if::<true>())
+        } else {
+            None
+        };
+        let raw_exit = enter(&mut translator, prepared, &mut snapshot)?;
+        if let Some(run_timer) = run_timer {
+            translator
+                .add_profile_phase(dsr::profile::Phase::TranslatedRun, run_timer)
+                .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+        }
+
+        if PROFILE {
+            let exit_class = raw_exit.profile_class();
+            translator
+                .record_profile_exit(exit_class)
+                .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+        }
+        let finish_timer = if PROFILE {
+            Some(dsr::profile::PhaseTimer::start_if::<true>())
+        } else {
+            None
+        };
         let exit = translator
-            .finish_exit(&memory.lock(), &mut snapshot, prepared, raw_exit)
+            .finish_exit_profiled::<PROFILE>(&memory.lock(), &mut snapshot, prepared, raw_exit)
             .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+        if let Some(finish_timer) = finish_timer {
+            translator
+                .add_profile_phase(dsr::profile::Phase::FinishExit, finish_timer)
+                .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+        }
         let resume = match exit {
             dsr::ThreadExit::Syscall { resume } => resume,
             dsr::ThreadExit::Continue => continue,
             dsr::ThreadExit::Sensitive(exit) => {
+                let sensitive_timer = if PROFILE {
+                    Some(dsr::profile::PhaseTimer::start_if::<true>())
+                } else {
+                    None
+                };
+                let sensitive_class = if PROFILE {
+                    Some(exit.kind.profile_class())
+                } else {
+                    None
+                };
                 let required_register = || {
                     exit.register.ok_or_else(|| {
                         RuntimeError::Unsupported(format!(
@@ -1636,6 +1740,16 @@ fn run_native_dsr_thread_loop(
                     dsr::types::SensitiveKind::DcCvau | dsr::types::SensitiveKind::IcIvau => {}
                 }
                 snapshot.pc = exit.resume.raw();
+                if let Some(sensitive_class) = sensitive_class {
+                    translator
+                        .record_profile_sensitive(sensitive_class)
+                        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+                }
+                if let Some(sensitive_timer) = sensitive_timer {
+                    translator
+                        .add_profile_phase(dsr::profile::Phase::SensitiveEmulation, sensitive_timer)
+                        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+                }
                 continue;
             }
             dsr::ThreadExit::Fault { kind, address } => {
@@ -1731,7 +1845,12 @@ fn run_native_dsr_thread_loop(
                 .as_bytes(),
             );
         }
-        let outcome = dispatch_native_syscall(
+        let dispatch_timer = if PROFILE {
+            Some(dsr::profile::PhaseTimer::start_if::<true>())
+        } else {
+            None
+        };
+        let timed_outcome = dispatch_native_syscall::<PROFILE>(
             &dispatcher,
             request,
             &memory,
@@ -1739,6 +1858,30 @@ fn run_native_dsr_thread_loop(
             &reporter,
             trace_syscalls,
         )?;
+        if let Some(dispatch_timer) = dispatch_timer {
+            let dispatch_ns = match dispatch_timer.elapsed_ns() {
+                Ok(dispatch_ns) => dispatch_ns,
+                Err(error) => {
+                    let error = translator.invalidate_profile(error);
+                    return Err(RuntimeError::Unsupported(error.to_string()));
+                }
+            };
+            let active_dispatch_ns = match dispatch_ns.checked_sub(timed_outcome.blocked_ns) {
+                Some(active_dispatch_ns) => active_dispatch_ns,
+                None => {
+                    let error = translator
+                        .invalidate_profile(dsr::profile::ProfileError::DispatchTimeUnderflow);
+                    return Err(RuntimeError::Unsupported(error.to_string()));
+                }
+            };
+            translator
+                .add_profile_phase_ns(dsr::profile::Phase::Blocked, timed_outcome.blocked_ns)
+                .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+            translator
+                .add_profile_phase_ns(dsr::profile::Phase::SyscallDispatch, active_dispatch_ns)
+                .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+        }
+        let outcome = timed_outcome.outcome;
         if matches!(outcome, DispatchOutcome::Returned { value: 0 })
             && carrick_abi::syscall::lookup_aarch64(request.number.raw())
                 .is_some_and(|syscall| syscall.name == "rt_sigaction")
@@ -3074,13 +3217,58 @@ impl SyscallTrap for NativeSignalTrap<'_> {
     }
 }
 
-fn dispatch_native_syscall(
+fn dispatch_native_syscall<const PROFILE: bool>(
     dispatcher: &SyscallDispatcher,
     request: SyscallRequest,
     memory: &SharedNativeMemory,
     thread_runtime: &NativeThreadRuntime,
     reporter: &CompatReporter,
     trace_syscalls: bool,
+) -> Result<TimedDispatchOutcome, RuntimeError> {
+    let mut blocked_ns = 0;
+    let outcome = dispatch_native_syscall_inner::<PROFILE>(
+        dispatcher,
+        request,
+        memory,
+        thread_runtime,
+        reporter,
+        trace_syscalls,
+        &mut blocked_ns,
+    )?;
+    Ok(TimedDispatchOutcome {
+        outcome,
+        blocked_ns,
+    })
+}
+
+fn measure_native_blocked<const PROFILE: bool, T>(
+    blocked_ns: &mut u64,
+    operation: impl FnOnce() -> T,
+) -> Result<T, RuntimeError> {
+    if !PROFILE {
+        return Ok(operation());
+    }
+    let timer = dsr::profile::PhaseTimer::start_if::<PROFILE>();
+    let result = operation();
+    let elapsed_ns = timer
+        .elapsed_ns()
+        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+    *blocked_ns = blocked_ns.checked_add(elapsed_ns).ok_or_else(|| {
+        RuntimeError::Unsupported(
+            dsr::profile::ProfileError::CounterOverflow("blocked_ns").to_string(),
+        )
+    })?;
+    Ok(result)
+}
+
+fn dispatch_native_syscall_inner<const PROFILE: bool>(
+    dispatcher: &SyscallDispatcher,
+    request: SyscallRequest,
+    memory: &SharedNativeMemory,
+    thread_runtime: &NativeThreadRuntime,
+    reporter: &CompatReporter,
+    trace_syscalls: bool,
+    blocked_ns: &mut u64,
 ) -> Result<DispatchOutcome, RuntimeError> {
     let mut signal_wait_deadline = None;
     let mut fd_wait_deadline = None;
@@ -3118,18 +3306,22 @@ fn dispatch_native_syscall(
                 else {
                     return Ok(DispatchOutcome::Returned { value: on_timeout });
                 };
-                match wait_native_fds(dispatcher, thread_runtime, &fds, timeout, sig_mask) {
+                match measure_native_blocked::<PROFILE, _>(blocked_ns, || {
+                    wait_native_fds(dispatcher, thread_runtime, &fds, timeout, sig_mask)
+                })? {
                     Ok(NativeWaitResult::Ready) => continue,
                     Ok(NativeWaitResult::TimedOut) => {
                         return Ok(DispatchOutcome::Returned { value: on_timeout });
                     }
                     Err(errno) => {
                         if errno == crate::linux_abi::LINUX_EINTR
-                            && native_wait_park_if_quiesce_nudge(
-                                dispatcher,
-                                thread_runtime,
-                                sig_mask,
-                            )
+                            && measure_native_blocked::<PROFILE, _>(blocked_ns, || {
+                                native_wait_park_if_quiesce_nudge(
+                                    dispatcher,
+                                    thread_runtime,
+                                    sig_mask,
+                                )
+                            })?
                         {
                             continue;
                         }
@@ -3148,18 +3340,22 @@ fn dispatch_native_syscall(
                 else {
                     return Ok(DispatchOutcome::Returned { value: on_timeout });
                 };
-                match wait_native_poll_fds(dispatcher, thread_runtime, &fds, timeout, sig_mask) {
+                match measure_native_blocked::<PROFILE, _>(blocked_ns, || {
+                    wait_native_poll_fds(dispatcher, thread_runtime, &fds, timeout, sig_mask)
+                })? {
                     Ok(NativeWaitResult::Ready) => continue,
                     Ok(NativeWaitResult::TimedOut) => {
                         return Ok(DispatchOutcome::Returned { value: on_timeout });
                     }
                     Err(errno) => {
                         if errno == crate::linux_abi::LINUX_EINTR
-                            && native_wait_park_if_quiesce_nudge(
-                                dispatcher,
-                                thread_runtime,
-                                sig_mask,
-                            )
+                            && measure_native_blocked::<PROFILE, _>(blocked_ns, || {
+                                native_wait_park_if_quiesce_nudge(
+                                    dispatcher,
+                                    thread_runtime,
+                                    sig_mask,
+                                )
+                            })?
                         {
                             continue;
                         }
@@ -3182,7 +3378,9 @@ fn dispatch_native_syscall(
                     }
                     return Ok(DispatchOutcome::Returned { value: 0 });
                 };
-                match wait_native_fds(dispatcher, thread_runtime, &fds, timeout, sig_mask) {
+                match measure_native_blocked::<PROFILE, _>(blocked_ns, || {
+                    wait_native_fds(dispatcher, thread_runtime, &fds, timeout, sig_mask)
+                })? {
                     Ok(NativeWaitResult::Ready) => continue,
                     Ok(NativeWaitResult::TimedOut) => {
                         let mut memory = memory.lock();
@@ -3193,11 +3391,13 @@ fn dispatch_native_syscall(
                     }
                     Err(errno) => {
                         if errno == crate::linux_abi::LINUX_EINTR
-                            && native_wait_park_if_quiesce_nudge(
-                                dispatcher,
-                                thread_runtime,
-                                sig_mask,
-                            )
+                            && measure_native_blocked::<PROFILE, _>(blocked_ns, || {
+                                native_wait_park_if_quiesce_nudge(
+                                    dispatcher,
+                                    thread_runtime,
+                                    sig_mask,
+                                )
+                            })?
                         {
                             continue;
                         }
@@ -3209,14 +3409,16 @@ fn dispatch_native_syscall(
                 wait_set,
                 block_mask,
                 timeout,
-            } => match wait_native_signals(
-                dispatcher,
-                thread_runtime,
-                wait_set,
-                block_mask,
-                timeout,
-                &mut signal_wait_deadline,
-            ) {
+            } => match measure_native_blocked::<PROFILE, _>(blocked_ns, || {
+                wait_native_signals(
+                    dispatcher,
+                    thread_runtime,
+                    wait_set,
+                    block_mask,
+                    timeout,
+                    &mut signal_wait_deadline,
+                )
+            })? {
                 NativeSignalWaitResult::Ready => continue,
                 NativeSignalWaitResult::Interrupted => {
                     return Ok(DispatchOutcome::Errno {
@@ -3230,16 +3432,20 @@ fn dispatch_native_syscall(
                 }
             },
             DispatchOutcome::FutexWait { wait, timeout } => {
-                let value = wait_native_futex(dispatcher, thread_runtime, wait, timeout, 0);
+                let value = measure_native_blocked::<PROFILE, _>(blocked_ns, || {
+                    wait_native_futex(dispatcher, thread_runtime, wait, timeout, 0)
+                })?;
                 // A pure fork-quiesce nudge: park, then RE-DISPATCH the
                 // syscall (revalidating the futex word — Linux syscall
                 // restart semantics) instead of surfacing a spurious EINTR.
                 if value == crate::linux_abi::LINUX_EINTR.guest_retval()
-                    && native_wait_park_if_quiesce_nudge(
-                        dispatcher,
-                        thread_runtime,
-                        carrick_abi::WaitSigMask::NONE,
-                    )
+                    && measure_native_blocked::<PROFILE, _>(blocked_ns, || {
+                        native_wait_park_if_quiesce_nudge(
+                            dispatcher,
+                            thread_runtime,
+                            carrick_abi::WaitSigMask::NONE,
+                        )
+                    })?
                 {
                     continue;
                 }
@@ -3250,13 +3456,17 @@ fn dispatch_native_syscall(
                 timeout,
                 index,
             } => {
-                let value = wait_native_futex(dispatcher, thread_runtime, wait, timeout, index);
+                let value = measure_native_blocked::<PROFILE, _>(blocked_ns, || {
+                    wait_native_futex(dispatcher, thread_runtime, wait, timeout, index)
+                })?;
                 if value == crate::linux_abi::LINUX_EINTR.guest_retval()
-                    && native_wait_park_if_quiesce_nudge(
-                        dispatcher,
-                        thread_runtime,
-                        carrick_abi::WaitSigMask::NONE,
-                    )
+                    && measure_native_blocked::<PROFILE, _>(blocked_ns, || {
+                        native_wait_park_if_quiesce_nudge(
+                            dispatcher,
+                            thread_runtime,
+                            carrick_abi::WaitSigMask::NONE,
+                        )
+                    })?
                 {
                     continue;
                 }
@@ -3268,21 +3478,25 @@ fn dispatch_native_syscall(
                 value,
                 timeout,
             } => {
-                let retval = wait_native_shared_futex(
-                    dispatcher,
-                    thread_runtime,
-                    location,
-                    waiter_key,
-                    value,
-                    timeout,
-                    0,
-                );
-                if retval == crate::linux_abi::LINUX_EINTR.guest_retval()
-                    && native_wait_park_if_quiesce_nudge(
+                let retval = measure_native_blocked::<PROFILE, _>(blocked_ns, || {
+                    wait_native_shared_futex(
                         dispatcher,
                         thread_runtime,
-                        carrick_abi::WaitSigMask::NONE,
+                        location,
+                        waiter_key,
+                        value,
+                        timeout,
+                        0,
                     )
+                })?;
+                if retval == crate::linux_abi::LINUX_EINTR.guest_retval()
+                    && measure_native_blocked::<PROFILE, _>(blocked_ns, || {
+                        native_wait_park_if_quiesce_nudge(
+                            dispatcher,
+                            thread_runtime,
+                            carrick_abi::WaitSigMask::NONE,
+                        )
+                    })?
                 {
                     continue;
                 }
@@ -3295,21 +3509,25 @@ fn dispatch_native_syscall(
                 timeout,
                 index,
             } => {
-                let retval = wait_native_shared_futex(
-                    dispatcher,
-                    thread_runtime,
-                    location,
-                    waiter_key,
-                    value,
-                    timeout,
-                    index,
-                );
-                if retval == crate::linux_abi::LINUX_EINTR.guest_retval()
-                    && native_wait_park_if_quiesce_nudge(
+                let retval = measure_native_blocked::<PROFILE, _>(blocked_ns, || {
+                    wait_native_shared_futex(
                         dispatcher,
                         thread_runtime,
-                        carrick_abi::WaitSigMask::NONE,
+                        location,
+                        waiter_key,
+                        value,
+                        timeout,
+                        index,
                     )
+                })?;
+                if retval == crate::linux_abi::LINUX_EINTR.guest_retval()
+                    && measure_native_blocked::<PROFILE, _>(blocked_ns, || {
+                        native_wait_park_if_quiesce_nudge(
+                            dispatcher,
+                            thread_runtime,
+                            carrick_abi::WaitSigMask::NONE,
+                        )
+                    })?
                 {
                     continue;
                 }
@@ -3320,21 +3538,25 @@ fn dispatch_native_syscall(
                 waiter_key,
                 value,
             } => {
-                let retval = wait_native_shared_futex(
-                    dispatcher,
-                    thread_runtime,
-                    location,
-                    waiter_key,
-                    value,
-                    None,
-                    0,
-                );
-                if retval == crate::linux_abi::LINUX_EINTR.guest_retval() {
-                    if native_wait_park_if_quiesce_nudge(
+                let retval = measure_native_blocked::<PROFILE, _>(blocked_ns, || {
+                    wait_native_shared_futex(
                         dispatcher,
                         thread_runtime,
-                        carrick_abi::WaitSigMask::NONE,
-                    ) {
+                        location,
+                        waiter_key,
+                        value,
+                        None,
+                        0,
+                    )
+                })?;
+                if retval == crate::linux_abi::LINUX_EINTR.guest_retval() {
+                    if measure_native_blocked::<PROFILE, _>(blocked_ns, || {
+                        native_wait_park_if_quiesce_nudge(
+                            dispatcher,
+                            thread_runtime,
+                            carrick_abi::WaitSigMask::NONE,
+                        )
+                    })? {
                         continue;
                     }
                     return Ok(DispatchOutcome::Errno {
@@ -3376,13 +3598,15 @@ fn dispatch_native_syscall(
                         ));
                     }
                     crate::dispatch::BlockingHostWriteStep::Wait => {
-                        match wait_native_fds(
-                            dispatcher,
-                            thread_runtime,
-                            &[crate::io_wait::WaitFd::raw(write.host_fd(), libc::POLLOUT)],
-                            None,
-                            carrick_abi::WaitSigMask::NONE,
-                        ) {
+                        match measure_native_blocked::<PROFILE, _>(blocked_ns, || {
+                            wait_native_fds(
+                                dispatcher,
+                                thread_runtime,
+                                &[crate::io_wait::WaitFd::raw(write.host_fd(), libc::POLLOUT)],
+                                None,
+                                carrick_abi::WaitSigMask::NONE,
+                            )
+                        })? {
                             Ok(NativeWaitResult::Ready) => continue,
                             Ok(NativeWaitResult::TimedOut) => {
                                 return Ok(DispatchOutcome::Returned {
@@ -3394,11 +3618,13 @@ fn dispatch_native_syscall(
                                 // drive loop so the partial write's offset is
                                 // preserved (never re-dispatch a partial write).
                                 if errno == crate::linux_abi::LINUX_EINTR
-                                    && native_wait_park_if_quiesce_nudge(
-                                        dispatcher,
-                                        thread_runtime,
-                                        carrick_abi::WaitSigMask::NONE,
-                                    )
+                                    && measure_native_blocked::<PROFILE, _>(blocked_ns, || {
+                                        native_wait_park_if_quiesce_nudge(
+                                            dispatcher,
+                                            thread_runtime,
+                                            carrick_abi::WaitSigMask::NONE,
+                                        )
+                                    })?
                                 {
                                     continue;
                                 }
@@ -3418,18 +3644,24 @@ fn dispatch_native_syscall(
                 // this typed outcome. Native guest threads are independent host
                 // pthreads, so siblings remain able to release the conflicting
                 // lock while this thread blocks in the host fcntl.
-                return Ok(crate::dispatch::drive_blocking_record_lock(&lock));
+                return measure_native_blocked::<PROFILE, _>(blocked_ns, || {
+                    crate::dispatch::drive_blocking_record_lock(&lock)
+                });
             }
             DispatchOutcome::WaitOnProcExit { pid, sig_mask } => {
-                match wait_native_proc_exit(dispatcher, thread_runtime, pid, sig_mask) {
+                match measure_native_blocked::<PROFILE, _>(blocked_ns, || {
+                    wait_native_proc_exit(dispatcher, thread_runtime, pid, sig_mask)
+                })? {
                     Ok(NativeWaitResult::Ready) | Ok(NativeWaitResult::TimedOut) => continue,
                     Err(errno) => {
                         if errno == crate::linux_abi::LINUX_EINTR
-                            && native_wait_park_if_quiesce_nudge(
-                                dispatcher,
-                                thread_runtime,
-                                sig_mask,
-                            )
+                            && measure_native_blocked::<PROFILE, _>(blocked_ns, || {
+                                native_wait_park_if_quiesce_nudge(
+                                    dispatcher,
+                                    thread_runtime,
+                                    sig_mask,
+                                )
+                            })?
                         {
                             continue;
                         }
@@ -3438,15 +3670,19 @@ fn dispatch_native_syscall(
                 }
             }
             DispatchOutcome::WaitOnProcState { sig_mask, .. } => {
-                match wait_native_proc_state(dispatcher, thread_runtime, sig_mask) {
+                match measure_native_blocked::<PROFILE, _>(blocked_ns, || {
+                    wait_native_proc_state(dispatcher, thread_runtime, sig_mask)
+                })? {
                     Ok(NativeWaitResult::Ready) | Ok(NativeWaitResult::TimedOut) => continue,
                     Err(errno) => {
                         if errno == crate::linux_abi::LINUX_EINTR
-                            && native_wait_park_if_quiesce_nudge(
-                                dispatcher,
-                                thread_runtime,
-                                sig_mask,
-                            )
+                            && measure_native_blocked::<PROFILE, _>(blocked_ns, || {
+                                native_wait_park_if_quiesce_nudge(
+                                    dispatcher,
+                                    thread_runtime,
+                                    sig_mask,
+                                )
+                            })?
                         {
                             continue;
                         }
@@ -3459,7 +3695,9 @@ fn dispatch_native_syscall(
                 remaining,
             } => {
                 let deadline = Instant::now() + duration;
-                match wait_native_sleep_until(dispatcher, thread_runtime, deadline) {
+                match measure_native_blocked::<PROFILE, _>(blocked_ns, || {
+                    wait_native_sleep_until(dispatcher, thread_runtime, deadline)
+                })? {
                     Ok(()) => return Ok(DispatchOutcome::Returned { value: 0 }),
                     Err(crate::linux_abi::LINUX_EINTR) => {
                         let mut memory = memory.lock();

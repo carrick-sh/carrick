@@ -11,6 +11,7 @@ pub(super) mod emit;
 pub(super) mod gateway;
 #[cfg(test)]
 mod oracle;
+pub(super) mod profile;
 pub(super) mod types;
 
 #[derive(Debug)]
@@ -62,6 +63,12 @@ pub(super) struct PreparedExit {
     exit: types::NativeDsrExit,
 }
 
+impl PreparedExit {
+    pub(super) const fn profile_class(&self) -> profile::ExitClass {
+        self.exit.profile_class()
+    }
+}
+
 pub(super) struct ThreadTranslator {
     process: Arc<ProcessTranslator>,
     tid: i32,
@@ -72,7 +79,8 @@ pub(super) struct ThreadTranslator {
     )>,
     indirect_cache: gateway::IndirectTargetCache,
     stats: ResolverStats,
-    profiling: bool,
+    budget: profile::ThreadBudget,
+    nested_translation_ns: u64,
     last_kick: Option<(carrick_guest_mem::GuestVa, Option<emit::RecoveryAction>)>,
 }
 
@@ -172,7 +180,8 @@ impl ThreadTranslator {
             resume_entry: None,
             indirect_cache: gateway::IndirectTargetCache::new(),
             stats: ResolverStats::default(),
-            profiling: std::env::var_os("CARRICK_DSR_PROFILE").is_some(),
+            budget: profile::ThreadBudget::from_environment(tid),
+            nested_translation_ns: 0,
             last_kick: None,
         }
     }
@@ -191,6 +200,8 @@ impl ThreadTranslator {
         self.resume_entry = None;
         self.indirect_cache.clear();
         self.stats = ResolverStats::default();
+        self.budget.reset_after_fork_child(tid);
+        self.nested_translation_ns = 0;
         self.last_kick = None;
         let (used_bytes, block_count, generation_count) = self.process.lifecycle_snapshot();
         probes::dsr_cache_lifecycle(
@@ -229,6 +240,7 @@ impl ThreadTranslator {
         self.resume_entry = None;
         self.indirect_cache.clear();
         self.stats = ResolverStats::default();
+        self.nested_translation_ns = 0;
         self.last_kick = None;
         let (used_bytes, block_count, generation_count) = self.process.lifecycle_snapshot();
         probes::dsr_cache_lifecycle(
@@ -273,39 +285,15 @@ impl ThreadTranslator {
 
 impl Drop for ThreadTranslator {
     fn drop(&mut self) {
-        if !self.profiling {
+        if !self.budget.enabled() {
             return;
         }
         let profile = self.profile_snapshot();
-        super::child_write_stderr(
-            format!(
-                "native dsr profile gateway_entries={} syscall_exits={} \
-                 direct_resolver_exits={} indirect_resolver_exits={} \
-                 one_entry_hits={} cache_lookups={} cache_lookup_hits={} \
-                 translations={} translation_ns={} translation_decode_ns={} \
-                 translation_plan_ns={} translation_emit_ns={} \
-                 translation_publication_ns={} duplicate_publications={} \
-                 invalidated_blocks={} cache_used_bytes={} cache_capacity_bytes={}\n",
-                profile.gateway_entries,
-                profile.syscall_exits,
-                profile.direct_resolver_exits,
-                profile.resolver_exits,
-                profile.one_entry_hits,
-                profile.cache_lookups,
-                profile.cache_lookup_hits,
-                profile.translations,
-                profile.translation_ns,
-                profile.translation_decode_ns,
-                profile.translation_plan_ns,
-                profile.translation_emit_ns,
-                profile.translation_publication_ns,
-                profile.duplicate_publications,
-                profile.invalidated_blocks,
-                profile.cache_used_bytes,
-                profile.cache_capacity_bytes,
-            )
-            .as_bytes(),
-        );
+        let line = match self.budget.complete_record() {
+            Ok(record) => record.to_protocol_line_with_resolver(profile),
+            Err(error) => self.budget.invalid_protocol_line(error),
+        };
+        super::child_write_stderr(format!("{line}\n").as_bytes());
     }
 }
 
@@ -342,9 +330,10 @@ impl ProcessTranslator {
     }
 
     fn after_fork_child(&self) {
-        let state = self.state.lock();
+        let mut state = self.state.lock();
         state.cache.after_fork_child();
         state.publications.after_fork_child();
+        state.stats = ResolverStats::default();
         let capacity = u64::try_from(state.cache.capacity_bytes()).unwrap_or(u64::MAX);
         drop(state);
         probes::dsr_cache_capacity(probes::DsrCacheRole::Child, capacity);
@@ -701,12 +690,37 @@ impl ProcessState {
 }
 
 impl ThreadTranslator {
-    fn translate(
+    fn translate<const PROFILE: bool>(
         &mut self,
         memory: &super::NativeMappedMemory,
         guest: carrick_guest_mem::GuestVa,
     ) -> Result<TranslationResult, types::DsrError> {
-        self.process.state.lock().translate(self.tid, memory, guest)
+        let timer = if PROFILE {
+            Some(profile::PhaseTimer::start_if::<true>())
+        } else {
+            None
+        };
+        let translated = self.process.state.lock().translate(self.tid, memory, guest);
+        if let Some(timer) = timer {
+            let elapsed_ns = match timer.elapsed_ns() {
+                Ok(elapsed_ns) => elapsed_ns,
+                Err(error) => return Err(self.budget.invalidate(error).into()),
+            };
+            self.budget
+                .add_phase(profile::Phase::Translate, elapsed_ns)?;
+            self.nested_translation_ns = match self.nested_translation_ns.checked_add(elapsed_ns) {
+                Some(total) => total,
+                None => {
+                    return Err(self
+                        .budget
+                        .invalidate(profile::ProfileError::CounterOverflow(
+                            "nested_translation_ns",
+                        ))
+                        .into());
+                }
+            };
+        }
+        translated
     }
 
     fn guest_pc_for_cache(
@@ -716,14 +730,14 @@ impl ThreadTranslator {
         self.process.state.lock().guest_pc_for_cache(cache_pc)
     }
 
-    fn resolve_indirect(
+    fn resolve_indirect<const PROFILE: bool>(
         &mut self,
         memory: &super::NativeMappedMemory,
         _source: carrick_guest_mem::GuestVa,
         target: carrick_guest_mem::GuestVa,
     ) -> Result<(types::CacheVa, types::CodeGeneration), types::DsrError> {
         self.stats.resolver_exits = self.stats.resolver_exits.saturating_add(1);
-        let translated = self.translate(memory, target)?;
+        let translated = self.translate::<PROFILE>(memory, target)?;
         self.indirect_cache
             .publish(target, translated.generation, translated.entry);
         probes::dsr_cache_event(
@@ -859,7 +873,64 @@ impl ThreadTranslator {
     }
 
     pub(super) fn profiling_enabled(&self) -> bool {
-        self.profiling
+        self.budget.enabled()
+    }
+
+    pub(super) fn begin_profile_phase(&mut self) {
+        self.nested_translation_ns = 0;
+    }
+
+    pub(super) fn add_profile_phase(
+        &mut self,
+        phase: profile::Phase,
+        timer: profile::PhaseTimer,
+    ) -> Result<(), profile::ProfileError> {
+        let elapsed_ns = match timer.elapsed_ns() {
+            Ok(elapsed_ns) => elapsed_ns,
+            Err(error) => return Err(self.budget.invalidate(error)),
+        };
+        let exclusive_ns = if matches!(
+            phase,
+            profile::Phase::PrepareIndex | profile::Phase::FinishExit
+        ) {
+            match elapsed_ns.checked_sub(self.nested_translation_ns) {
+                Some(exclusive_ns) => exclusive_ns,
+                None => return Err(self.budget.invalidate(profile::ProfileError::TimeOverlap)),
+            }
+        } else {
+            elapsed_ns
+        };
+        self.nested_translation_ns = 0;
+        self.budget.add_phase(phase, exclusive_ns)
+    }
+
+    pub(super) fn add_profile_phase_ns(
+        &mut self,
+        phase: profile::Phase,
+        elapsed_ns: u64,
+    ) -> Result<(), profile::ProfileError> {
+        self.budget.add_phase(phase, elapsed_ns)
+    }
+
+    pub(super) fn record_profile_exit(
+        &mut self,
+        class: profile::ExitClass,
+    ) -> Result<(), profile::ProfileError> {
+        self.budget.record_exit(class)
+    }
+
+    pub(super) fn record_profile_sensitive(
+        &mut self,
+        class: profile::SensitiveClass,
+    ) -> Result<(), profile::ProfileError> {
+        self.budget.record_sensitive(class)
+    }
+
+    pub(super) fn invalidate_profile(
+        &mut self,
+        error: profile::ProfileError,
+    ) -> profile::ProfileError {
+        self.budget.invalidate(error)
     }
 
     pub(super) fn prepare_entry<const PROFILE: bool>(
@@ -868,6 +939,9 @@ impl ThreadTranslator {
         snapshot: &super::NativeUcontextSnapshot,
     ) -> Result<PreparedEntry, types::DsrError> {
         let guest = carrick_guest_mem::GuestVa(snapshot.pc);
+        if PROFILE {
+            self.begin_profile_phase();
+        }
         if PROFILE {
             probes::dsr_prepare_begin(self.tid, guest.raw());
         }
@@ -881,7 +955,7 @@ impl ThreadTranslator {
                 }
                 self.resume_entry = None;
             }
-            let translated = self.translate(memory, guest)?;
+            let translated = self.translate::<PROFILE>(memory, guest)?;
             self.resume_entry = Some((guest, translated.generation, translated.entry));
             let outcome = match translated.outcome {
                 TranslationOutcome::BlockIndexHit => probes::DsrPrepareOutcome::BlockIndexHit,
@@ -933,7 +1007,7 @@ impl ThreadTranslator {
         let mut exit = types::NativeDsrExit::Syscall {
             resume: carrick_guest_mem::GuestVa(snapshot.pc),
         };
-        if self.profiling {
+        if self.budget.enabled() {
             self.stats.gateway_entries = self.stats.gateway_entries.saturating_add(1);
         }
         if PROFILE {
@@ -972,6 +1046,7 @@ impl ThreadTranslator {
         Ok(PreparedExit { exit })
     }
 
+    #[cfg(test)]
     pub(super) fn finish_exit(
         &mut self,
         memory: &super::NativeMappedMemory,
@@ -979,7 +1054,20 @@ impl ThreadTranslator {
         prepared: PreparedEntry,
         exit: PreparedExit,
     ) -> Result<ThreadExit, types::DsrError> {
-        if self.profiling {
+        self.finish_exit_profiled::<false>(memory, snapshot, prepared, exit)
+    }
+
+    pub(super) fn finish_exit_profiled<const PROFILE: bool>(
+        &mut self,
+        memory: &super::NativeMappedMemory,
+        snapshot: &mut super::NativeUcontextSnapshot,
+        prepared: PreparedEntry,
+        exit: PreparedExit,
+    ) -> Result<ThreadExit, types::DsrError> {
+        if PROFILE {
+            self.begin_profile_phase();
+        }
+        if self.budget.enabled() {
             match exit.exit {
                 types::NativeDsrExit::Syscall { .. } => {
                     self.stats.syscall_exits = self.stats.syscall_exits.saturating_add(1);
@@ -1001,7 +1089,7 @@ impl ThreadTranslator {
                     source.raw(),
                     target.raw(),
                 );
-                if let Err(error) = self.translate(memory, target) {
+                if let Err(error) = self.translate::<PROFILE>(memory, target) {
                     probes::dsr_resolve_end(
                         self.tid,
                         probes::DsrResolveKind::Direct,
@@ -1066,20 +1154,20 @@ impl ThreadTranslator {
                         address: ThreadFaultAddress::Guest(target),
                     });
                 }
-                let (entry, target_generation) = match self.resolve_indirect(memory, source, target)
-                {
-                    Ok(resolved) => resolved,
-                    Err(error) => {
-                        probes::dsr_resolve_end(
-                            self.tid,
-                            probes::DsrResolveKind::Indirect,
-                            source.raw(),
-                            target.raw(),
-                            error.probe_outcome(),
-                        );
-                        return Err(error);
-                    }
-                };
+                let (entry, target_generation) =
+                    match self.resolve_indirect::<PROFILE>(memory, source, target) {
+                        Ok(resolved) => resolved,
+                        Err(error) => {
+                            probes::dsr_resolve_end(
+                                self.tid,
+                                probes::DsrResolveKind::Indirect,
+                                source.raw(),
+                                target.raw(),
+                                error.probe_outcome(),
+                            );
+                            return Err(error);
+                        }
+                    };
                 probes::dsr_resolve_end(
                     self.tid,
                     probes::DsrResolveKind::Indirect,
@@ -1972,6 +2060,32 @@ mod tests {
         assert_eq!(translator.tid, 37);
         translator.after_fork_child(73);
         assert_eq!(translator.tid, 73);
+    }
+
+    #[test]
+    fn fork_child_reset_does_not_mix_parent_profile_identity() {
+        let process = std::sync::Arc::new(
+            super::ProcessTranslator::new(16 * 1024).expect("create translator"),
+        );
+        process.state.lock().stats.translations = 9;
+        let mut translator = super::ThreadTranslator::for_process(process, 42);
+        translator.budget = super::profile::ThreadBudget::enabled_for_test(41, 42);
+        translator
+            .budget
+            .record_exit(super::profile::ExitClass::Syscall)
+            .expect("record parent exit");
+
+        translator.after_fork_child(73);
+
+        let record = translator
+            .budget
+            .complete_record()
+            .expect("fresh child profile");
+        assert_eq!(record.pid, unsafe { libc::getpid() });
+        assert_eq!(record.tid, 73);
+        assert_eq!(record.gateway_entries, 0);
+        assert_eq!(translator.profile_snapshot().translations, 0);
+        translator.budget = super::profile::ThreadBudget::disabled_for_test(0, 0);
     }
 
     #[test]
