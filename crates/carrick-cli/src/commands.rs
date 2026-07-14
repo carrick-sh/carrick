@@ -718,13 +718,15 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             };
 
             // NATIVEPERF v2 supervisor record: emitted exactly once, only when
-            // CARRICK_DSR_PROFILE=1 (a no-op env read otherwise), from THIS
-            // top-level process only — `Runtime::execute` above forks the guest
-            // and blocks in `waitpid_blocking` until its whole process tree is
-            // reaped, so every guest process in this run is already gone by the
-            // time we reach here, and no guest process ever reaches this call
-            // site itself (see `supervisor_perf`'s module docs). Placed before
-            // every exit path (interactive/json/raw) so it fires uniformly.
+            // CARRICK_DSR_PROFILE=1 (a no-op env read otherwise) AND this is
+            // the one true top-level process recorded at `main` entry. The pid
+            // gate matters: interactive `-t` runs fork a pty-relay supervisor
+            // and a runtime child that BOTH bubble back to this tail with the
+            // env var inherited (see `supervisor_perf`'s module docs), and
+            // only the top-level Launcher — whose blocking wait chain has
+            // already reaped the whole guest process tree by this point — may
+            // emit. Placed before every exit path (interactive/json/raw) so it
+            // fires uniformly.
             crate::supervisor_perf::emit_supervisor_record_if_profiling();
 
             // Interactive / tty: the guest's stdio already went straight to the
