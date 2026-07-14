@@ -691,6 +691,73 @@ type LoadedNativeExecveImage = (
     [u8; 32],
 );
 
+enum NativeImageSource {
+    Legacy {
+        image: AddressSpace,
+        relative_relocations: Vec<NativeRelativeRelocation>,
+    },
+    Prepared(ValidatedPreparedImage),
+}
+
+impl NativeImageSource {
+    fn image(&self) -> &AddressSpace {
+        match self {
+            Self::Legacy { image, .. } => image,
+            Self::Prepared(prepared) => &prepared.image,
+        }
+    }
+
+    fn into_image(self) -> AddressSpace {
+        match self {
+            Self::Legacy { image, .. } => image,
+            Self::Prepared(prepared) => prepared.into_image(),
+        }
+    }
+}
+
+struct ResumedImage {
+    source: NativeImageSource,
+    legacy_resolved_path: Option<String>,
+}
+
+fn select_resumed_image<F>(
+    prepared_image: Option<crate::native_prepared_image::NativePreparedImageV1>,
+    expected_executable_digest: [u8; 32],
+    legacy_loader: F,
+) -> anyhow::Result<ResumedImage>
+where
+    F: FnOnce() -> Result<LoadedNativeExecveImage, crate::linux_abi::LinuxErrno>,
+{
+    if let Some(record) = prepared_image {
+        let prepared = crate::native_prepared_image::validate_for_resume(record).map_err(
+            |error| match error {
+                crate::native_prepared_image::NativePreparedImageError::ChecksumMismatch {
+                    ..
+                } => anyhow::anyhow!("prepared-validate: checksum mismatch"),
+                error => anyhow::anyhow!("prepared-validate: {error}"),
+            },
+        )?;
+        return Ok(ResumedImage {
+            source: NativeImageSource::Prepared(prepared),
+            legacy_resolved_path: None,
+        });
+    }
+
+    let (image, relative_relocations, resolved, _resolved_argv, executable_digest) =
+        legacy_loader()
+            .map_err(|errno| anyhow::anyhow!("reload guest executable failed: {errno:?}"))?;
+    if executable_digest != expected_executable_digest {
+        anyhow::bail!("guest executable changed across native host self-reexec");
+    }
+    Ok(ResumedImage {
+        source: NativeImageSource::Legacy {
+            image,
+            relative_relocations,
+        },
+        legacy_resolved_path: Some(resolved),
+    })
+}
+
 fn load_native_execve_image(
     dispatcher: &SyscallDispatcher,
     path: &str,
@@ -767,7 +834,7 @@ fn load_native_execve_image(
 }
 
 pub(crate) fn resume_guest_from_capsule(
-    guest: crate::native_exec_capsule::NativeGuestExecV1,
+    mut guest: crate::native_exec_capsule::NativeGuestExecV1,
     argv: Vec<Vec<u8>>,
     env: Vec<Vec<u8>>,
 ) -> anyhow::Result<i32> {
@@ -792,20 +859,29 @@ pub(crate) fn resume_guest_from_capsule(
         .restore_native_reexec_fd_table(&guest.fd_table)
         .map_err(|error| anyhow::anyhow!("restore native guest fd table: {error}"))?;
     native_reexec_lifecycle(crate::probes::DsrCacheLifecyclePhase::HostSelfReexecDispatcherReady);
-    native_reexec_lifecycle(crate::probes::DsrCacheLifecyclePhase::HostSelfReexecImageLoadBegin);
-    let (image, relative_relocations, resolved, _resolved_argv, executable_digest) =
-        load_native_execve_image(
+    let prepared_image = guest.prepared_image.take();
+    let resumed = select_resumed_image(prepared_image, guest.executable_digest, || {
+        native_reexec_lifecycle(
+            crate::probes::DsrCacheLifecyclePhase::HostSelfReexecImageLoadBegin,
+        );
+        let loaded = load_native_execve_image(
             &dispatcher,
             &guest.resolved_path,
             argv.clone(),
             env.clone(),
             &plan,
-        )
-        .map_err(|errno| anyhow::anyhow!("reload guest executable failed: {errno:?}"))?;
-    native_reexec_lifecycle(crate::probes::DsrCacheLifecyclePhase::HostSelfReexecImageLoadEnd);
-    if executable_digest != guest.executable_digest {
-        anyhow::bail!("guest executable changed across native host self-reexec");
-    }
+        );
+        if loaded.is_ok() {
+            native_reexec_lifecycle(
+                crate::probes::DsrCacheLifecyclePhase::HostSelfReexecImageLoadEnd,
+            );
+        }
+        loaded
+    })?;
+    let resolved = resumed
+        .legacy_resolved_path
+        .clone()
+        .unwrap_or_else(|| guest.resolved_path.clone());
     native_reexec_lifecycle(crate::probes::DsrCacheLifecyclePhase::HostSelfReexecResetBegin);
     dispatcher.reset_memory_state_on_execve();
     dispatcher.reset_signal_handlers_on_execve();
@@ -818,7 +894,7 @@ pub(crate) fn resume_guest_from_capsule(
     );
     native_reexec_lifecycle(crate::probes::DsrCacheLifecyclePhase::HostSelfReexecResetEnd);
     native_reexec_lifecycle(crate::probes::DsrCacheLifecyclePhase::HostSelfReexecGuestEntry);
-    run_image_in_current_process(image, dispatcher, max_traps, &relative_relocations, &plan)
+    run_image_in_current_process(resumed.source, dispatcher, max_traps, &plan)
         .map_err(anyhow::Error::from)
 }
 
@@ -1001,10 +1077,12 @@ fn run_image_in_child(
         close_fd(stderr_pipe.1);
 
         match run_image_in_current_process(
-            image,
+            NativeImageSource::Legacy {
+                image,
+                relative_relocations,
+            },
             dispatcher,
             max_traps,
-            &relative_relocations,
             plan,
         ) {
             Ok(code) => unsafe { libc::_exit(code) },
@@ -1042,24 +1120,17 @@ fn run_image_in_child(
 }
 
 fn run_image_in_current_process(
-    image: AddressSpace,
+    source: NativeImageSource,
     dispatcher: SyscallDispatcher,
     max_traps: usize,
-    relative_relocations: &[NativeRelativeRelocation],
     plan: &ExecutionPlan,
 ) -> Result<i32, RuntimeError> {
-    let initial_sp = image.initial_stack_pointer().ok_or_else(|| {
+    let initial_sp = source.image().initial_stack_pointer().ok_or_else(|| {
         RuntimeError::Unsupported("native Darwin image has no initial stack".to_string())
     })?;
-    let entry = image.entry();
-    let memory = Arc::new(parking_lot::Mutex::new(NativeMappedMemory::map_for_plan(
-        &image,
-        native_memory_layout(),
-        plan.page_geometry.host_page_size,
-        plan.page_geometry.linux_page_size,
-        plan,
-        relative_relocations,
-    )?));
+    let entry = source.image().entry();
+    let (memory, image) = map_and_release_native_image_source(source, plan)?;
+    let memory = Arc::new(parking_lot::Mutex::new(memory));
     let _ = crate::ulock::preinit_waiter_table();
     // PID-namespace launch placement (container path only; `run-elf` never
     // requests it): the same identity-init fallback as the HVF threaded loop —
@@ -1142,6 +1213,42 @@ fn run_image_in_current_process(
             }
         }
     }
+}
+
+fn map_native_image_source(
+    source: &NativeImageSource,
+    plan: &ExecutionPlan,
+) -> Result<NativeMappedMemory, RuntimeError> {
+    match source {
+        NativeImageSource::Legacy {
+            image,
+            relative_relocations,
+        } => NativeMappedMemory::map_for_plan(
+            image,
+            native_memory_layout(),
+            plan.page_geometry.host_page_size,
+            plan.page_geometry.linux_page_size,
+            plan,
+            relative_relocations,
+        ),
+        NativeImageSource::Prepared(prepared) => {
+            NativeMappedMemory::map_prepared_for_plan(prepared, native_memory_layout(), plan)
+        }
+    }
+}
+
+fn map_and_release_native_image_source(
+    source: NativeImageSource,
+    plan: &ExecutionPlan,
+) -> Result<(NativeMappedMemory, AddressSpace), RuntimeError> {
+    let memory = map_native_image_source(&source, plan)?;
+    // Every prepared extent is MAP_PRIVATE and remains valid after its
+    // inherited artifact closes. Convert to the transport-neutral metadata
+    // image immediately after all mappings succeed so the fd cannot survive
+    // into guest execution or a later guest exec. On any mapping error the
+    // owned source drops here and closes the validated artifact as well.
+    let image = source.into_image();
+    Ok((memory, image))
 }
 
 enum NativeThreadStart {
@@ -13743,5 +13850,224 @@ mod tests {
                     .map(|(index, range)| (format!("biased exec owned plan {index}"), range)),
             );
         });
+    }
+
+    fn native_prepared_resume_source(path: &Path, marker: u32) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let source = path.join(format!("source-{marker:08x}"));
+        std::fs::write(&source, dsr_test_elf(&[marker])).expect("write resume source ELF");
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o755))
+            .expect("make resume source executable");
+        source
+    }
+
+    fn native_prepared_resume_load(
+        dispatcher: &SyscallDispatcher,
+        path: &Path,
+        plan: &ExecutionPlan,
+    ) -> LoadedNativeExecveImage {
+        load_native_execve_image(
+            dispatcher,
+            path.to_str().expect("UTF-8 resume path"),
+            vec![path.as_os_str().as_encoded_bytes().to_vec()],
+            Vec::new(),
+            plan,
+        )
+        .expect("load native resume fixture")
+    }
+
+    fn native_prepared_resume_record(
+        image: &AddressSpace,
+        relocations: &[NativeRelativeRelocation],
+        host_page_size: u64,
+    ) -> crate::native_prepared_image::NativePreparedImageV1 {
+        let artifact =
+            match crate::native_prepared_image::prepare(image, relocations, host_page_size)
+                .expect("prepare resume artifact")
+            {
+                crate::native_prepared_image::PreparedImageDisposition::Prepared(artifact) => {
+                    artifact
+                }
+                crate::native_prepared_image::PreparedImageDisposition::Ineligible(reason) => {
+                    panic!("resume fixture is ineligible: {reason:?}")
+                }
+            };
+        crate::native_prepared_image::resume_record_for_test(artifact)
+            .expect("create inherited resume record")
+    }
+
+    #[test]
+    fn native_prepared_resume_some_skips_legacy_loader() {
+        let (image, relocations, plan) = native_prepared_mapping_fixture(false);
+        let record =
+            native_prepared_resume_record(&image, &relocations, plan.page_geometry.host_page_size);
+        let loader_calls = Cell::new(0_u32);
+        let resumed = select_resumed_image(Some(record), [0; 32], || {
+            loader_calls.set(loader_calls.get() + 1);
+            Err(crate::linux_abi::LINUX_EIO)
+        })
+        .expect("select prepared image");
+
+        assert!(matches!(resumed.source, NativeImageSource::Prepared(_)));
+        assert_eq!(loader_calls.get(), 0);
+    }
+
+    #[test]
+    fn native_prepared_resume_none_uses_legacy_loader_and_digest() {
+        let temp = tempfile::tempdir().expect("create resume tempdir");
+        let path = native_prepared_resume_source(temp.path(), 0xd65f_03c0);
+        let dispatcher = SyscallDispatcher::new();
+        let plan = native16k_test_plan();
+        let loaded = native_prepared_resume_load(&dispatcher, &path, &plan);
+        let expected_digest = loaded.4;
+        let loader_calls = Cell::new(0_u32);
+        let resumed = select_resumed_image(None, expected_digest, || {
+            loader_calls.set(loader_calls.get() + 1);
+            Ok(loaded)
+        })
+        .expect("select legacy image");
+
+        assert!(matches!(resumed.source, NativeImageSource::Legacy { .. }));
+        assert_eq!(loader_calls.get(), 1);
+    }
+
+    #[test]
+    fn native_prepared_resume_ignores_changed_source_path() {
+        fork_test(|| {
+            set_native_test_vvar_words(Some(Vec::new()));
+            let temp = tempfile::tempdir().expect("create substitution tempdir");
+            let path = native_prepared_resume_source(temp.path(), 0xd65f_03c0);
+            let dispatcher = SyscallDispatcher::new();
+            let plan = native16k_test_plan();
+            let loaded_a = native_prepared_resume_load(&dispatcher, &path, &plan);
+            let entry = loaded_a.0.entry();
+            let record = native_prepared_resume_record(
+                &loaded_a.0,
+                &loaded_a.1,
+                plan.page_geometry.host_page_size,
+            );
+            let replacement = native_prepared_resume_source(temp.path(), 0xd503_201f);
+            std::fs::rename(&replacement, &path).expect("atomically replace executable source");
+            let loader_calls = Cell::new(0_u32);
+            let resumed = select_resumed_image(Some(record), loaded_a.4, || {
+                loader_calls.set(loader_calls.get() + 1);
+                Ok(native_prepared_resume_load(&dispatcher, &path, &plan))
+            })
+            .expect("select exact prepared bytes");
+            let artifact_fd = match &resumed.source {
+                NativeImageSource::Prepared(prepared) => prepared.file_fd(),
+                NativeImageSource::Legacy { .. } => panic!("expected prepared source"),
+            };
+            let (memory, _image) = map_and_release_native_image_source(resumed.source, &plan)
+                .expect("map exact prepared bytes");
+
+            assert_eq!(loader_calls.get(), 0);
+            assert_eq!(unsafe { libc::fcntl(artifact_fd, libc::F_GETFD) }, -1);
+            assert_eq!(
+                memory.read_bytes(entry, 4).expect("read prepared marker"),
+                0xd65f_03c0_u32.to_le_bytes()
+            );
+            set_native_test_vvar_words(None);
+        });
+    }
+
+    #[test]
+    fn native_prepared_resume_corruption_is_fatal_without_legacy_loader() {
+        use std::os::unix::fs::FileExt;
+
+        let (image, relocations, plan) = native_prepared_mapping_fixture(false);
+        let artifact = match crate::native_prepared_image::prepare(
+            &image,
+            &relocations,
+            plan.page_geometry.host_page_size,
+        )
+        .expect("prepare corruption artifact")
+        {
+            crate::native_prepared_image::PreparedImageDisposition::Prepared(artifact) => artifact,
+            crate::native_prepared_image::PreparedImageDisposition::Ineligible(reason) => {
+                panic!("corruption fixture is ineligible: {reason:?}")
+            }
+        };
+        artifact
+            .file
+            .write_all_at(&[0], 0)
+            .expect("corrupt first initialized artifact byte");
+        let record = crate::native_prepared_image::resume_record_for_test(artifact)
+            .expect("create corrupt inherited record");
+        let loader_calls = Cell::new(0_u32);
+        let error = match select_resumed_image(Some(record), [0; 32], || {
+            loader_calls.set(loader_calls.get() + 1);
+            Err(crate::linux_abi::LINUX_EIO)
+        }) {
+            Ok(_) => panic!("corrupt prepared image must be fatal"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.to_string(), "prepared-validate: checksum mismatch");
+        assert_eq!(loader_calls.get(), 0);
+    }
+
+    #[test]
+    fn native_prepared_resume_mapping_failure_is_fatal_without_legacy_loader() {
+        fork_test(|| {
+            set_native_test_vvar_words(Some(Vec::new()));
+            let (image, relocations, plan) = native_prepared_mapping_fixture(false);
+            let record = native_prepared_resume_record(
+                &image,
+                &relocations,
+                plan.page_geometry.host_page_size,
+            );
+            let loader_calls = Cell::new(0_u32);
+            let resumed = select_resumed_image(Some(record), [0; 32], || {
+                loader_calls.set(loader_calls.get() + 1);
+                Err(crate::linux_abi::LINUX_EIO)
+            })
+            .expect("select prepared image before injected map failure");
+            set_native_prepared_mapping_failpoint(Some(
+                NativePreparedMappingFailpoint::SecondRegionMap,
+            ));
+            let artifact_fd = match &resumed.source {
+                NativeImageSource::Prepared(prepared) => prepared.file_fd(),
+                NativeImageSource::Legacy { .. } => panic!("expected prepared source"),
+            };
+            let error = match map_and_release_native_image_source(resumed.source, &plan) {
+                Ok(_) => panic!("prepared mapping failure must be fatal"),
+                Err(error) => error,
+            };
+
+            assert_eq!(
+                error.to_string(),
+                "unsupported in this backend: prepared-map: injected second-region mapping failure"
+            );
+            assert_eq!(loader_calls.get(), 0);
+            assert_eq!(unsafe { libc::fcntl(artifact_fd, libc::F_GETFD) }, -1);
+            set_native_test_vvar_words(None);
+        });
+    }
+
+    #[test]
+    fn native_prepared_resume_legacy_detects_changed_source_digest() {
+        let temp = tempfile::tempdir().expect("create legacy-control tempdir");
+        let path = native_prepared_resume_source(temp.path(), 0xd65f_03c0);
+        let dispatcher = SyscallDispatcher::new();
+        let plan = native16k_test_plan();
+        let loaded_a = native_prepared_resume_load(&dispatcher, &path, &plan);
+        let replacement = native_prepared_resume_source(temp.path(), 0xd503_201f);
+        std::fs::rename(&replacement, &path).expect("atomically replace legacy source");
+        let loader_calls = Cell::new(0_u32);
+        let error = match select_resumed_image(None, loaded_a.4, || {
+            loader_calls.set(loader_calls.get() + 1);
+            Ok(native_prepared_resume_load(&dispatcher, &path, &plan))
+        }) {
+            Ok(_) => panic!("legacy substitution must fail digest validation"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "guest executable changed across native host self-reexec"
+        );
+        assert_eq!(loader_calls.get(), 1);
     }
 }

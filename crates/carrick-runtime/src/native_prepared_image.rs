@@ -191,26 +191,12 @@ pub(crate) struct NativePreparedImageV1 {
 }
 
 impl NativePreparedImageV1 {
-    /// Task 4's transport-only bridge consumes the inherited record and closes
-    /// its raw fd before entering the legacy fresh-process loader. Task 6
-    /// replaces that bridge with `validate_for_resume`, which takes ownership
-    /// through a checked duplicate before mapping the prepared image.
     #[cfg(test)]
     #[cfg(target_os = "macos")]
     pub(crate) fn with_artifact_fd_for_test(mut self, artifact_fd: RawFd) -> Self {
         self.artifact_fd = artifact_fd;
         self
     }
-}
-
-#[cfg(target_os = "macos")]
-pub(crate) fn close_inherited_before_legacy_resume(
-    record: NativePreparedImageV1,
-) -> std::io::Result<()> {
-    if unsafe { libc::close(record.artifact_fd) } < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
 }
 
 #[derive(Debug)]
@@ -256,12 +242,16 @@ impl ValidatedPreparedImage {
     pub(crate) fn host_page_size(&self) -> u64 {
         self.host_page_size
     }
+
+    pub(crate) fn into_image(self) -> AddressSpace {
+        self.image
+    }
 }
 
 #[cfg(all(test, target_os = "macos"))]
-pub(crate) fn validate_artifact_for_test(
+pub(crate) fn resume_record_for_test(
     artifact: PreparedImageArtifact,
-) -> Result<ValidatedPreparedImage, NativePreparedImageError> {
+) -> Result<NativePreparedImageV1, NativePreparedImageError> {
     let mut record = artifact.record.clone();
     let inherited = unsafe { libc::fcntl(artifact.file.as_raw_fd(), libc::F_DUPFD, 0) };
     if inherited < 0 {
@@ -277,7 +267,14 @@ pub(crate) fn validate_artifact_for_test(
             source,
         });
     }
-    validate_for_resume(record)
+    Ok(record)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn validate_artifact_for_test(
+    artifact: PreparedImageArtifact,
+) -> Result<ValidatedPreparedImage, NativePreparedImageError> {
+    validate_for_resume(resume_record_for_test(artifact)?)
 }
 
 #[derive(Debug)]
