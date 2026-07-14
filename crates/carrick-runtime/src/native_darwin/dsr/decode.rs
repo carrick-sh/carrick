@@ -656,6 +656,42 @@ pub(super) fn classify_exclusive(
     Ok(Some((kind, memory)))
 }
 
+/// The access-width/family bucket of an AArch64 exclusive-family opcode, as
+/// distinguishable from `Op` alone. `bad64` gives byte (`B`), halfword
+/// (`H`), and pair forms their own `Op` variants, but the plain-word and
+/// doubleword single-register forms (`LDXR`/`LDAXR`/`STXR`/`STLXR`) share a
+/// single `Op` regardless of whether the transfer register is `W` or `X` --
+/// so `Register` here means "word or doubleword", not "exactly one width".
+///
+/// Used only by the block planner's exclusive-region fusion scan
+/// (`block::try_fuse_exclusive_region`) to reject a load/store pairing whose
+/// `Op`s are provably width- or family-incompatible (e.g. an `ldaxr`
+/// paired with a same-base `stxrb`, or a single-register load paired with a
+/// pair-form store) before considering it for fusion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ExclusiveShape {
+    Byte,
+    Half,
+    Register,
+    Pair,
+}
+
+/// Classify `op`'s exclusive-family shape. Returns `None` for any `Op` this
+/// module does not treat as an exclusive load/store (`classify_exclusive`
+/// already restricts callers to the 16 opcodes below, so in practice this is
+/// always `Some` for an `op` that reached here -- the `None` arm exists so a
+/// caller comparing two shapes with `Option::zip` conservatively treats an
+/// unrecognised opcode as non-matching rather than panicking or guessing).
+pub(super) fn exclusive_shape(op: Op) -> Option<ExclusiveShape> {
+    match op {
+        Op::LDAXRB | Op::LDXRB | Op::STLXRB | Op::STXRB => Some(ExclusiveShape::Byte),
+        Op::LDAXRH | Op::LDXRH | Op::STLXRH | Op::STXRH => Some(ExclusiveShape::Half),
+        Op::LDAXR | Op::LDXR | Op::STLXR | Op::STXR => Some(ExclusiveShape::Register),
+        Op::LDAXP | Op::LDXP | Op::STLXP | Op::STXP => Some(ExclusiveShape::Pair),
+        _ => None,
+    }
+}
+
 pub(super) fn decoded_operands_mention_x18(word: u32, pc: GuestVa) -> bool {
     decoded_operands_mention_gpr(word, pc, 18)
 }

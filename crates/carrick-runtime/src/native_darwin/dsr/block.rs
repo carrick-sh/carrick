@@ -307,6 +307,7 @@ fn try_fuse_exclusive_region(
         return Ok(None);
     }
 
+    let load_shape = decode::exclusive_shape(load_memory.op);
     let mut instructions = vec![PlannedInst {
         guest: start,
         action: InstAction::Memory(load_memory),
@@ -321,9 +322,25 @@ fn try_fuse_exclusive_region(
         }
         let word = read(pc)?;
         if let Some((kind, memory)) = decode::classify_exclusive(word, pc)? {
+            // The store must match the load's base register (checked
+            // below) AND its access width/family: a byte-width load can
+            // only pair with a byte-width store, and a pair-form load
+            // (LDXP/LDAXP) only with a pair-form store (STXP/STLXP).
+            // `MemoryClass::Exclusive` collapses all 16 exclusive
+            // load/store opcodes into one class, so without this the base
+            // check alone would accept e.g. `ldaxr w0,[x1]` fused with a
+            // same-base `stxrb`, or a single-register load fused with a
+            // pair-form store -- both would emit width/family-inconsistent
+            // native code once a later task lowers this fusion. If either
+            // op's shape can't be determined, `zip` makes this `None`,
+            // i.e. not matching: conservative is correct.
+            let shape_matches = load_shape
+                .zip(decode::exclusive_shape(memory.op))
+                .is_some_and(|(load, store)| load == store);
             let is_matching_store = kind == decode::ExclusiveKind::Store
                 && memory.base == load_memory.base
-                && !matches!(memory.base, MemoryBase::VirtualX18 | MemoryBase::VirtualX28);
+                && !matches!(memory.base, MemoryBase::VirtualX18 | MemoryBase::VirtualX28)
+                && shape_matches;
             if !is_matching_store {
                 // Another exclusive access (a second load, or a store to a
                 // different address) inside the region: not the canonical
@@ -569,6 +586,20 @@ mod tests {
         const CMP_W0_W2: u32 = 0x6b02_001f;
         // stlxr w3, w4, [x1]
         const STLXR_W3_W4_X1: u32 = 0x8803_fc24;
+        // stxrb w3, w4, [x1] -- SAME base register as LDAXR_W0_X1, but a
+        // BYTE-width store (a width mismatch against the word-width load).
+        // Verified against bad64-sys's own encoding corpus
+        // (disassembler/test_cases.txt: "STXRB_SR32_ldstexclr
+        // size=00|001000|o2=0|L=0|o1=0|Rs=xxxxx|o0=0|Rt2=(1)(1)(1)(1)(1)|Rn=xxxxx|Rt=xxxxx",
+        // cross-checked bit-for-bit against its `08007439 stxrb w0, w25,
+        // [x1]` fixture).
+        const STXRB_W3_W4_X1: u32 = 0x0803_7c24;
+        // stxp w3, w4, w5, [x1] -- SAME base register as LDAXR_W0_X1, but the
+        // PAIR-form store family (a family mismatch against the
+        // single-register load). Verified the same way against
+        // "STXP_SP32_ldstexclp 1|sz=x|001000|o2=0|L=0|o1=1|Rs=xxxxx|o0=0|Rt2=xxxxx|Rn=xxxxx|Rt=xxxxx"
+        // and its `88201069 stxp w0, w9, w4, [x3]` fixture.
+        const STXP_W3_W4_W5_X1: u32 = 0x8823_1424;
         // svc #0
         const SVC0: u32 = 0xd400_0001;
         // mrs x0, tpidr_el0
@@ -835,6 +866,70 @@ mod tests {
                 encode_cbnz_w(GuestVa(0x400c), start, 3),
             ];
             let plan = exclusive_region_words(&words, start, load_word, true, 0x1000)
+                .expect("scan must not error");
+            assert!(plan.is_none());
+        }
+
+        // The next two tests assert `Option::is_none()` from the recogniser
+        // directly rather than the eventual `PlannedExit::Sensitive` a real
+        // block plan would fall back to: that fallback is guaranteed by
+        // `decode::classify` being unmodified by this fix (`classify` still
+        // unconditionally converts every `MemoryClass::Exclusive` access to
+        // `InstAction::Sensitive`, independent of this recogniser, and is
+        // covered by its own pre-existing tests) plus the unwired-recogniser
+        // comment on `plan_block` above -- a `None` here can only ever
+        // become `PlannedExit::Sensitive`, never a wrong fusion.
+
+        /// The false-fusible class this closes: a single-register exclusive
+        /// load (`ldaxr w0, [x1]`) paired with a same-base store of a
+        /// DIFFERENT access width (`stxrb w3, w4, [x1]`). Before requiring
+        /// width agreement, `is_matching_store` only compared `kind` and
+        /// `base`, so this wrongly fused.
+        #[test]
+        fn falls_back_on_a_width_mismatched_store_inside_the_region() {
+            let start = GuestVa(0x4000);
+            let words = [
+                LDAXR_W0_X1,
+                STXRB_W3_W4_X1,
+                encode_cbnz_w(GuestVa(0x4008), start, 3),
+            ];
+            let plan = exclusive_region_words(&words, start, LDAXR_W0_X1, true, 0x1000)
+                .expect("scan must not error");
+            assert!(plan.is_none());
+        }
+
+        /// The other false-fusible class this closes: a single-register
+        /// exclusive load paired with a same-base PAIR-form store (`stxp w3,
+        /// w4, w5, [x1]`). Before requiring family agreement, a pair-form
+        /// store passed the old `kind == Store && base == load_base` check
+        /// just like a single-register one would.
+        #[test]
+        fn falls_back_on_a_pair_form_store_inside_the_region() {
+            let start = GuestVa(0x4000);
+            let words = [
+                LDAXR_W0_X1,
+                STXP_W3_W4_W5_X1,
+                encode_cbnz_w(GuestVa(0x4008), start, 3),
+            ];
+            let plan = exclusive_region_words(&words, start, LDAXR_W0_X1, true, 0x1000)
+                .expect("scan must not error");
+            assert!(plan.is_none());
+        }
+
+        /// Minor: a store to a genuinely different (non-x18/x28) base
+        /// register than the load must still not fuse -- the pre-existing
+        /// base-register check, left intact by adding the width/family
+        /// check above.
+        #[test]
+        fn falls_back_for_a_store_to_a_different_base_register() {
+            let start = GuestVa(0x4000);
+            let store_word = with_base_register(STLXR_W3_W4_X1, 2);
+            let words = [
+                LDAXR_W0_X1,
+                store_word,
+                encode_cbnz_w(GuestVa(0x4008), start, 3),
+            ];
+            let plan = exclusive_region_words(&words, start, LDAXR_W0_X1, true, 0x1000)
                 .expect("scan must not error");
             assert!(plan.is_none());
         }
