@@ -6616,7 +6616,7 @@ impl NativeMappedMemory {
         relative_relocations: &[NativeRelativeRelocation],
         plan: &ExecutionPlan,
         dsr_tid: Option<crate::thread::ThreadId>,
-        prepared: PreparedNativeExecMapping,
+        mut prepared: PreparedNativeExecMapping,
     ) -> Result<(), RuntimeError> {
         let lifecycle = |phase| {
             if let Some(tid) = dsr_tid {
@@ -6632,6 +6632,13 @@ impl NativeMappedMemory {
         }
         let retained_target_ranges = prepared.native_layout.owned_ranges();
         let retired_ranges = subtract_host_ranges(&self.owned_host_ranges, retained_target_ranges);
+        // Everything above remains pre-PONR: it may validate and allocate,
+        // and dropping `prepared` must leave the authoritative old image
+        // untouched. From here onward replacement may retire or overwrite old
+        // mappings, so arm the already-allocated reusable guards in place.
+        // Any subsequent failure is fatal and the new layout becomes the sole
+        // rollback owner for those transferred intervals.
+        prepared.native_layout.arm_prepared_adoptions();
         for range in &retired_ranges {
             let start = range.start.raw();
             let end = range.end.raw();
@@ -10153,6 +10160,39 @@ mod tests {
                 memory
                     .read_bytes(guest_start + 0x80, 1)
                     .expect("old image remains mapped"),
+                [0x4d]
+            );
+        });
+    }
+
+    #[test]
+    fn abandoned_biased_exec_preparation_preserves_the_old_image() {
+        fork_test(|| {
+            let plan = native16k_test_plan();
+            let source = lifecycle_image(LifecycleImageKind::LowExec, 0x4d);
+            let target = lifecycle_image(LifecycleImageKind::LowExec, 0x72);
+            let memory = NativeMappedMemory::map(
+                &source,
+                native_memory_layout(),
+                plan.page_geometry.host_page_size,
+                plan.page_geometry.linux_page_size,
+            )
+            .expect("map old biased image");
+            let guest = source.regions()[0].start + 0x80;
+
+            let prepared = memory
+                .prepare_exec_mapping(&target, &plan)
+                .expect("prepare biased replacement before sibling teardown");
+            assert!(matches!(
+                prepared.native_layout.address_mode(),
+                NativeAddressMode::Biased { .. }
+            ));
+            drop(prepared);
+
+            assert_eq!(
+                memory
+                    .read_bytes(guest, 1)
+                    .expect("old image remains readable when prepared exec is abandoned"),
                 [0x4d]
             );
         });

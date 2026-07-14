@@ -79,7 +79,7 @@ impl OwnedHostMapping {
         })
     }
 
-    fn adopt_existing(range: Range<HostVa>) -> Result<Self, NativeAddressError> {
+    fn prepare_adoption(range: Range<HostVa>) -> Result<Self, NativeAddressError> {
         if range.start.raw() >= range.end.raw() {
             return Err(NativeAddressError::InvalidHostRange {
                 start: range.start.raw(),
@@ -88,8 +88,12 @@ impl OwnedHostMapping {
         }
         Ok(Self {
             range,
-            unmap_on_drop: true,
+            unmap_on_drop: false,
         })
+    }
+
+    fn arm_prepared_adoption(&mut self) {
+        self.unmap_on_drop = true;
     }
 
     #[cfg(test)]
@@ -340,6 +344,7 @@ fn checked_guest_range(start: u64, length: u64) -> Result<Range<GuestVa>, Native
 pub(super) struct NativeLayout {
     mode: NativeAddressMode,
     reservations: Vec<OwnedHostMapping>,
+    prepared_adoptions: Vec<OwnedHostMapping>,
     owned_ranges: Vec<Range<HostVa>>,
 }
 
@@ -349,6 +354,7 @@ impl NativeLayout {
         Self {
             mode: NativeAddressMode::Direct,
             reservations: Vec::new(),
+            prepared_adoptions: Vec::new(),
             owned_ranges: Vec::new(),
         }
     }
@@ -396,6 +402,7 @@ impl NativeLayout {
             return Ok(Self {
                 mode: NativeAddressMode::Direct,
                 reservations: Vec::new(),
+                prepared_adoptions: Vec::new(),
                 owned_ranges: candidate.ranges,
             });
         }
@@ -416,18 +423,21 @@ impl NativeLayout {
                 }
             };
             match candidate.try_map_excluding(reusable_owned_ranges) {
-                Ok(mut reservations) => {
-                    // A biased exec replacement transfers the old aperture's
-                    // reusable intervals into this layout. Adopt those mapped
-                    // intervals into the same RAII owner as newly reserved
-                    // target-only intervals, so the layout remains the sole
-                    // failure owner across the destructive replacement.
-                    for range in intersect_host_ranges(&candidate.ranges, reusable_owned_ranges) {
-                        reservations.push(OwnedHostMapping::adopt_existing(range)?);
+                Ok(reservations) => {
+                    // A biased exec replacement may still lose the exec race
+                    // or fail sibling teardown after this preflight. Allocate
+                    // and validate all reusable ownership metadata now, but
+                    // keep it disarmed until replacement crosses the actual
+                    // destructive ownership-transfer boundary.
+                    let reusable = intersect_host_ranges(&candidate.ranges, reusable_owned_ranges);
+                    let mut prepared_adoptions = Vec::with_capacity(reusable.len());
+                    for range in reusable {
+                        prepared_adoptions.push(OwnedHostMapping::prepare_adoption(range)?);
                     }
                     return Ok(Self {
                         mode: candidate.mode,
                         reservations,
+                        prepared_adoptions,
                         owned_ranges: candidate.ranges,
                     });
                 }
@@ -455,6 +465,17 @@ impl NativeLayout {
 
     pub(super) fn owned_ranges(&self) -> &[Range<HostVa>] {
         &self.owned_ranges
+    }
+
+    /// Transfer reusable exec ranges into this layout's rollback ownership.
+    ///
+    /// Every guard and vector slot is prepared during preflight; arming only
+    /// flips guard state and therefore cannot allocate at the point of no
+    /// return.
+    pub(super) fn arm_prepared_adoptions(&mut self) {
+        for adoption in &mut self.prepared_adoptions {
+            adoption.arm_prepared_adoption();
+        }
     }
 
     pub(super) fn reset_biased_aperture_to_guards(&self) -> Result<(), NativeAddressError> {
@@ -507,6 +528,9 @@ impl NativeLayout {
     pub(super) fn commit(mut self) -> (NativeAddressMode, Vec<Range<HostVa>>) {
         for reservation in self.reservations.drain(..) {
             let _ = reservation.commit();
+        }
+        for adoption in self.prepared_adoptions.drain(..) {
+            let _ = adoption.commit();
         }
         (self.mode, self.owned_ranges)
     }
