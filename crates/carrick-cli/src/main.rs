@@ -223,6 +223,10 @@ fn configure_process_environment() {
     install_guest_abort_banner();
 
     tracing_subscriber::fmt()
+        // CLI diagnostics must never share stdout with guest output.  The
+        // performance/conformance runners hash stdout byte-for-byte, and the
+        // trace auto-sudo warning is Carrick metadata rather than guest data.
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
