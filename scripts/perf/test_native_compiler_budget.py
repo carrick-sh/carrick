@@ -1059,6 +1059,55 @@ class AdditiveCpuEvidenceV2Tests(unittest.TestCase):
         ):
             budget.derive_additive_cpu_evidence(profile, cpu_ns=45)
 
+    def test_helper_residual_dominating_process_cpu_is_rejected(self):
+        # Mirrors the real campaign row that motivated this guard: pid 59325
+        # (the Go compiler) flushed 2 thread groups totaling 299ms of
+        # core.thread_cpu_ns against 1290ms of process_cpu_ns -- a 77% helper
+        # share -- because the guest's other worker threads exited without
+        # flushing. That unflushed CPU landed entirely in the derived helper
+        # residual and was misread as host-side "helper-cpu" machinery.
+        lines = nativeperf_frames_v2(
+            pid=59325,
+            thread_cpu_ns=299_000_000,
+            process_cpu_ns=1_290_000_000,
+            startup_cpu_ns=0,
+        ) + [supervisor_line(self_cpu_ns=0, children_cpu_ns=1_290_000_000)]
+        profile = budget.parse_nativeperf(lines)
+        with self.assertRaisesRegex(
+            budget.BudgetError,
+            r"implausible helper residual for pid 59325.*helper_cpu=991000000"
+            r".*process_cpu=1290000000.*thread_cpu=299000000",
+        ):
+            budget.derive_additive_cpu_evidence(profile, cpu_ns=1_290_000_000)
+
+    def test_helper_residual_well_under_half_passes(self):
+        # A healthy profile: helper is a small fraction of process CPU (the
+        # ordinary pumps/watchers case), well clear of the guard's 50% share.
+        lines = nativeperf_frames_v2(
+            pid=59273,
+            thread_cpu_ns=95_000_000,
+            process_cpu_ns=100_000_000,
+            startup_cpu_ns=0,
+        ) + [supervisor_line(self_cpu_ns=0, children_cpu_ns=100_000_000)]
+        profile = budget.parse_nativeperf(lines)
+        additive = budget.derive_additive_cpu_evidence(profile, cpu_ns=100_000_000)
+        self.assertEqual(additive.thread_cpu_ns, 95_000_000)
+        self.assertEqual(additive.process_cpu_ns, 100_000_000)
+        self.assertEqual(additive.helper_cpu_ns, 5_000_000)
+
+    def test_helper_residual_below_the_floor_is_not_flagged_even_at_full_share(self):
+        # A pid whose process CPU never clears the plausibility floor must
+        # not trip the guard, no matter how large its share is (guards
+        # against the floor being ignored / the share check firing on
+        # rounding noise for near-instant processes).
+        floor = budget.HELPER_PLAUSIBILITY_FLOOR_NS
+        lines = nativeperf_frames_v2(
+            thread_cpu_ns=0, process_cpu_ns=floor, startup_cpu_ns=0
+        ) + [supervisor_line(self_cpu_ns=0, children_cpu_ns=floor)]
+        profile = budget.parse_nativeperf(lines)
+        additive = budget.derive_additive_cpu_evidence(profile, cpu_ns=floor)
+        self.assertEqual(additive.helper_cpu_ns, floor)
+
     def test_gate2_accepts_a_small_gap_within_2_percent(self):
         # children(41) - guests(40) = 1: a legitimate small "post-flush
         # teardown" gap. self=59 makes self+children=100=cpu_ns (gate1 exact),
