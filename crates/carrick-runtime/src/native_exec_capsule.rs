@@ -500,7 +500,6 @@ pub(crate) fn write_capsule(
     header[52..68].copy_from_slice(&nonce);
     write_all_at(&file, &header, 0)?;
     write_all_at(&file, &encoded, HEADER_LEN as u64)?;
-    file.sync_data()?;
     Ok(())
 }
 
@@ -552,7 +551,6 @@ pub(crate) fn read_capsule_once(
     // schema, and semantic validation. A failed attempt can be diagnosed or
     // retried by the same fresh process, while a successful adoption is one-shot.
     write_all_at(&file, &CONSUMED_MAGIC, 0)?;
-    file.sync_data()?;
     Ok(payload)
 }
 
