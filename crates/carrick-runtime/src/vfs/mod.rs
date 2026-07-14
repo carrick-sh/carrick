@@ -342,6 +342,10 @@ pub struct OpenContext<'a> {
 /// guest's per-thread vCPUs; mounts that hold mutable host state (the pty
 /// table, the writable overlay) carry their own interior locking.
 pub trait Vfs: Send + Sync {
+    fn native_reexec_bind_mount(&self) -> Option<bind::NativeReexecBindMountV1> {
+        None
+    }
+
     fn lookup(&self, path: &str) -> Result<Metadata, VfsError>;
 
     fn lookup_nofollow(&self, path: &str) -> Result<Metadata, VfsError> {

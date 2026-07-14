@@ -169,6 +169,13 @@ impl VfsMounts {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+
+    pub(crate) fn native_reexec_bind_mounts(&self) -> Vec<super::bind::NativeReexecBindMountV1> {
+        self.entries
+            .iter()
+            .filter_map(|entry| entry.vfs.native_reexec_bind_mount())
+            .collect()
+    }
 }
 
 pub struct MountRef<'a> {
