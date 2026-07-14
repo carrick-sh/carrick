@@ -264,3 +264,47 @@ The repair investigation now targets the helper-cpu slice first (per the
 decision row) with supervisor-cpu (41.6 percent) as the immediate next term —
 both are host-side runtime overhead, not DSR translation. No timeout,
 `max_traps`, or semantic weakening occurred anywhere in this campaign.
+
+
+## Task 3 CORRECTED campaign (2026-07-14, signed, at 69464cea)
+
+Run after the attribution repairs (worker threads killed by `exit_group` now
+flush via a profiling-gated registry with exactly-once arbitration; per-era
+thread CPU across self-reexec; supervisor rusage record). Unattributed guest
+CPU fell from 48 percent to 6.4 percent; the heavy compiler process now
+reports 7 thread groups instead of 2.
+
+**Typed decision row** (`docs/perf-results/native-compiler-budget-v3.jsonl`,
+`analyze --check` green): `selected_slice = "sensitive-exclusive"`, share
+**47.07 percent of gateway exits**, basis reconciled-profile-counts, scope
+`hottest-thread+aggregate-threads` (BOTH scopes agree: 47.1 percent hottest,
+33.2 percent aggregate, each above the committed 30 percent rung). Profile tax
+3.08 percent, inside the 10 percent gate.
+
+The earlier scope disagreement that blocked the previous campaign was itself an
+artifact of the unflushed worker threads: with the workers' records present,
+the aggregate scope converges with the hottest thread.
+
+Measured CPU attribution (medians over five profiled ABBA runs, 4.170 s
+untraced CPU):
+
+| Term | Median | Share |
+| --- | --- | --- |
+| guest thread CPU (DSR execution) | 2.374 s | 56.9 percent |
+| supervisor self CPU | 1.800 s | 43.2 percent |
+| syscall-dispatch (thread wall, subset of guest) | 0.457 s | 11.0 percent |
+| in-process helper threads (derived) | 0.162 s | 3.9 percent |
+| blocked-segment thread CPU | 0.005 s | 0.1 percent |
+| process startup | 0.002 s | ~0 percent |
+
+Guest execution — not host machinery — is the dominant CPU term, and within it
+AArch64 exclusive-instruction emulation is the dominant gateway exit. Plane A:
+W2 14.28x Docker (3.570 s vs 0.250 s), W1 9.76x ceiling-truncated. One-thread
+control passes every gate including the plausibility guard; Plane C complete,
+23 PIDs, zero drops.
+
+**Selected repair (per the design's rung 1):** reduce the `Exclusive` sensitive
+boundary via faithful translated exclusive regions or typed atomic lowering.
+The design explicitly forbids replacing Linux atomics with a coarse lock. The
+supervisor term (43.2 percent) is the next measured target and is tracked
+separately.
