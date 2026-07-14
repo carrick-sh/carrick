@@ -2511,6 +2511,107 @@ mod tests {
         assert!(thread.take_profile_frames().is_none());
     }
 
+    /// The seam that owns the flush: `native_darwin::finalize_native_thread_exit`
+    /// is the function the real `DispatchOutcome::ThreadExit` dispatch arm
+    /// calls before a guest thread retires. Driving the actual dispatch loop
+    /// end-to-end (a real forked guest binary hitting a real `exit(2)`) is
+    /// outside what a pure unit test can reach here, so this test calls the
+    /// exact production function directly with a synthetic sibling thread and
+    /// proves the two properties the attribution defect depended on: (1) a
+    /// thread that retires via this path emits its complete NATIVEPERF
+    /// `core`/`thread_cpu_ns` record — not silently absorbed into another
+    /// pid's helper residual — and (2) that flush is exactly-once, so the
+    /// translator's later `Drop` cannot duplicate the `(pid, tid, era)`
+    /// group the wire protocol (and the Python analyzer) rejects on replay.
+    #[test]
+    fn thread_exit_flushes_the_exiting_threads_profile_record() {
+        fork_test(|| {
+            use std::io::Read as _;
+            use std::os::fd::FromRawFd as _;
+
+            // Redirect the real fd 2 to a pipe for the duration of the call:
+            // `finalize_profile_epoch` writes NATIVEPERF frames directly to
+            // `libc::STDERR_FILENO`, exactly as the production dispatch loop
+            // does, so this observes the identical wire the campaign harness
+            // parses instead of a stand-in.
+            let mut stderr_pipe = [0i32; 2];
+            assert_eq!(unsafe { libc::pipe(stderr_pipe.as_mut_ptr()) }, 0);
+            let saved_stderr = unsafe { libc::dup(libc::STDERR_FILENO) };
+            assert!(saved_stderr >= 0, "dup stderr");
+            assert_eq!(
+                unsafe { libc::dup2(stderr_pipe[1], libc::STDERR_FILENO) },
+                libc::STDERR_FILENO,
+                "redirect stderr"
+            );
+            assert_eq!(unsafe { libc::close(stderr_pipe[1]) }, 0);
+
+            let (memory, _guest) = mapped_dsr_test_memory(&[]).expect("map test memory");
+            let memory: std::sync::Arc<parking_lot::Mutex<super::super::NativeMappedMemory>> =
+                std::sync::Arc::new(parking_lot::Mutex::new(memory));
+
+            let runtime = super::super::NativeThreadRuntime::new_current();
+            // clear_child_tid=0 so `finish_thread` never dereferences guest
+            // memory: this test only exercises the profile-flush contract.
+            let sib_tid = runtime.registry.register_child(0);
+            let mut sibling = runtime.sibling(sib_tid);
+            let dispatcher = super::super::SyscallDispatcher::new();
+
+            let process = std::sync::Arc::new(
+                super::ProcessTranslator::new(16 * 1024).expect("create process translator"),
+            );
+            let mut translator = super::ThreadTranslator::for_process(process, sib_tid.raw());
+            translator.budget = super::profile::ThreadBudget::enabled_for_test(
+                unsafe { libc::getpid() },
+                sib_tid.raw(),
+            );
+            translator
+                .budget
+                .record_exit(super::profile::ExitClass::Syscall)
+                .expect("record a balanced gateway entry/exit pair");
+
+            let outcome = super::super::finalize_native_thread_exit(
+                &mut translator,
+                &mut sibling,
+                &dispatcher,
+                &memory,
+                0,
+            );
+
+            unsafe {
+                assert_eq!(
+                    libc::dup2(saved_stderr, libc::STDERR_FILENO),
+                    libc::STDERR_FILENO
+                );
+                libc::close(saved_stderr);
+            }
+            let mut captured = String::new();
+            {
+                let mut reader = unsafe { std::fs::File::from_raw_fd(stderr_pipe[0]) };
+                reader
+                    .read_to_string(&mut captured)
+                    .expect("read captured stderr");
+            }
+            runtime.registry.exit(sib_tid);
+
+            assert!(
+                matches!(outcome, super::super::NativeThreadLoopOutcome::ThreadDone),
+                "a sibling with a live process leader must retire as ThreadDone"
+            );
+            assert!(
+                captured.contains("NATIVEPERF1|thread|"),
+                "ThreadExit must flush a NATIVEPERF record before the thread retires; \
+                 captured stderr: {captured:?}"
+            );
+            assert!(captured.contains(&format!("|tid={}|", sib_tid.raw())));
+            assert!(captured.contains("|frame=core|"));
+            assert!(
+                translator.take_profile_frames().is_none(),
+                "the flush must be exactly-once: a later drop/finalize must not re-emit \
+                 the same (pid, tid, era) group"
+            );
+        });
+    }
+
     #[test]
     fn dsr_fork_child_exec_reuses_and_clears_inherited_translator() {
         let process =

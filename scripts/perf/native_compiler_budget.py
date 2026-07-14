@@ -1056,6 +1056,21 @@ ON_CPU_PHASES = (
 
 COUNT_SCOPES = ("hottest-thread", "aggregate-threads")
 
+# `helper_cpu[pid] = process_cpu[pid] - thread_cpu[pid]` is DERIVED, not
+# measured: it is everything the process's rusage gauge saw that no flushed
+# `core.thread_cpu_ns` group claimed. A large residual is normally pumps,
+# watchers, or other short-lived host-side machinery -- but it is also
+# EXACTLY what a guest thread that exited without flushing its NATIVEPERF
+# record looks like from this side of the parser (its real DSR execution CPU
+# has nowhere else to go). A campaign row once carried a Go compiler pid that
+# flushed 2 thread groups totaling 299ms against 1290ms of process CPU (77%
+# unflushed) and was silently absorbed as "helper-cpu" before that ThreadExit
+# flush gap was closed. A per-pid floor + share guards against ever silently
+# re-selecting "helper-cpu" for what is actually unattributed guest
+# execution.
+HELPER_PLAUSIBILITY_FLOOR_NS = 50_000_000
+HELPER_PLAUSIBILITY_SHARE = 0.5
+
 
 @dataclasses.dataclass(frozen=True)
 class CountEvidence:
@@ -1166,6 +1181,29 @@ def derive_additive_cpu_evidence(profile: ProfileRun, cpu_ns: int) -> AdditiveCp
                 f"thread_cpu={thread_cpu_by_pid[pid]}"
             )
         helper_cpu_by_pid[pid] = helper
+    # Upper-plausibility guard: a helper residual that dominates a pid's
+    # process CPU is implausible for legitimate host-side helper machinery
+    # (pumps/watchers) and is the exact signature of a guest thread that
+    # exited without flushing its NATIVEPERF `core.thread_cpu_ns` group --
+    # its real execution CPU landing in the derived residual instead of
+    # `thread_cpu_by_pid`. Skip pids below the floor: a tiny process_cpu can
+    # trip the share on rounding/noise alone with nothing implausible to
+    # report.
+    for pid in pids:
+        process_cpu = process_cpu_by_pid[pid]
+        if process_cpu <= HELPER_PLAUSIBILITY_FLOOR_NS:
+            continue
+        helper = helper_cpu_by_pid[pid]
+        if helper > HELPER_PLAUSIBILITY_SHARE * process_cpu:
+            raise BudgetError(
+                "implausible helper residual for pid "
+                f"{pid}: helper_cpu={helper} is more than "
+                f"{HELPER_PLAUSIBILITY_SHARE:.0%} of process_cpu={process_cpu} "
+                f"(thread_cpu={thread_cpu_by_pid[pid]}); this is the signature "
+                "of a guest thread that exited without flushing its NATIVEPERF "
+                "record -- its DSR execution CPU is landing in the derived "
+                "helper residual instead of core.thread_cpu_ns"
+            )
     process_cpu_total = sum(process_cpu_by_pid.values())
     startup_cpu_total = sum(startup_cpu_by_pid.values())
     thread_cpu_total = sum(thread_cpu_by_pid.values())

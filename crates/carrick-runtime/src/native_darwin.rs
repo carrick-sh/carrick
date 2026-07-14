@@ -1510,6 +1510,41 @@ enum NativeExecTeardownFlow {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Finalize a guest thread's DSR profile record before it retires from the
+/// thread registry, then report whether that retirement ended the process.
+///
+/// `DispatchOutcome::ThreadExit` fires for `exit(2)` from a thread the
+/// dispatcher believed had live siblings; `finish_thread` may still discover
+/// concurrently that it was in fact the last one, turning this exit into a
+/// `ProcessExit` whose caller (the spawn closure) reacts with
+/// `unsafe { libc::_exit(code) }` — a hard process-wide kill with no further
+/// chance for ANY thread's stack, including this one, to unwind normally.
+/// Flushing here, before that branch is even decided, closes that race
+/// window. `ThreadTranslator`'s `Drop` still finalizes idempotently for the
+/// ordinary (non-racing) case where this function returns `ThreadDone` and
+/// the caller's own stack unwinds normally — this call just makes the flush
+/// unconditional and explicit, matching every other retiring dispatch path
+/// (`Exit`, self-reexec `Execve`, `native_die_by_signal`).
+///
+/// Idempotent: `finalize_profile_epoch` no-ops once a record has already
+/// been taken, so `translator`'s eventual `Drop` after this call can never
+/// double-flush (the wire protocol rejects a duplicate `(pid, tid, era)`
+/// group).
+fn finalize_native_thread_exit(
+    translator: &mut dsr::ThreadTranslator,
+    thread_runtime: &mut NativeThreadRuntime,
+    dispatcher: &SyscallDispatcher,
+    memory: &SharedNativeMemory,
+    code: i32,
+) -> NativeThreadLoopOutcome {
+    translator.finalize_profile_epoch();
+    if thread_runtime.finish_thread(dispatcher, memory) {
+        NativeThreadLoopOutcome::ProcessExit(code)
+    } else {
+        NativeThreadLoopOutcome::ThreadDone
+    }
+}
+
 fn run_native_thread_loop(
     dispatcher: Arc<SyscallDispatcher>,
     memory: SharedNativeMemory,
@@ -1981,10 +2016,13 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                 return Ok(NativeThreadLoopOutcome::ProcessExit(code));
             }
             DispatchOutcome::ThreadExit { code } => {
-                if thread_runtime.finish_thread(&dispatcher, &memory) {
-                    return Ok(NativeThreadLoopOutcome::ProcessExit(code));
-                }
-                return Ok(NativeThreadLoopOutcome::ThreadDone);
+                return Ok(finalize_native_thread_exit(
+                    &mut translator,
+                    thread_runtime,
+                    &dispatcher,
+                    &memory,
+                    code,
+                ));
             }
             DispatchOutcome::CloneThread {
                 stack,
