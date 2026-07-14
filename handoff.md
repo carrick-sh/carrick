@@ -86,23 +86,24 @@ the probe gate remains honestly red.
 
 ## Current performance and cause
 
-The stopping real workload is `go-go_internal_srcimporter` c94:
+The stopping real workload is `go-go_internal_srcimporter` c94: Carrick was
+scoped-stopped after 1,392.649 seconds versus a 2.696-second Docker oracle
+(**516.56x**), and the exact `TestImplicitsInfo` reducer still reaches the
+1,000,000-gateway ceiling.
 
-- Carrick was scoped-stopped after 1,392.649 seconds versus a 2.696-second
-  Docker oracle: **516.56x**.
-- The exact `TestImplicitsInfo` reducer reaches the typed 1,000,000-gateway
-  ceiling after 15.90 seconds.
+The corrected campaign (evidence `docs/perf-results/*-v3.jsonl`) attributes
+the cost. Guest DSR execution is the dominant CPU term (56.9 percent), the
+supervisor process is second (43.2 percent), and within guest execution the
+dominant gateway exit is AArch64 exclusive-instruction emulation: **47.07
+percent of all gateway exits**, agreed by both thread scopes. Startup CPU,
+blocked-segment CPU, and in-process helper threads are each measured
+negligible-to-small and are refuted as candidate slices.
 
-This is dominated by DSR execution shape. On the W1 hottest thread, sensitive
-exits are 85.56% of gateway entries (exclusive emulation alone 57.91%);
-direct plus indirect resolution is 14.37%. The W2 hottest thread has 65.16%
-sensitive exits (47.93% exclusive) while the W2 aggregate across all threads
-shows 41.2% sensitive and 56.6% resolution. That scope disagreement is now a
-first-class analyzer concept: count evidence carries an explicit
-hottest-thread/aggregate-threads scope, the decision ladder evaluates both and
-fails closed when they disagree, and every decision names its denominator in a
-typed `scope` field. Task 3 must reconcile the scopes on measured evidence
-before any slice is selected — not by weakening the gate.
+Count evidence carries an explicit hottest-thread/aggregate-threads scope; a
+count decision requires both scopes to agree, and disagreement abstains to the
+scope-free measured-CPU rungs rather than aborting. A derived-residual
+plausibility guard rejects any profile whose unattributed CPU exceeds half a
+process's total.
 
 DTrace overhead is accepted as proportional shape evidence only; signed
 untraced runs remain the only absolute wall/CPU authority. A persistent/AOT
