@@ -1,5 +1,5 @@
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, OnceLock};
 
 use carrick_observability::probes;
 use parking_lot::Mutex;
@@ -314,6 +314,57 @@ pub(super) struct ProfileSnapshot {
     pub(super) cache_capacity_bytes: usize,
 }
 
+/// One live guest OS thread's most-recently republished profiling state,
+/// visible to every OTHER guest thread of this same process.
+///
+/// WHY THIS EXISTS: Linux `exit_group` (guest syscall 94) kills every thread
+/// of a process at once, unconditionally -- that is correct Linux semantics,
+/// and this runtime's `DispatchOutcome::Exit` handler matches it with an
+/// unconditional `libc::_exit()`. But `libc::_exit()` gives every OTHER live
+/// host OS thread backing a sibling guest thread ZERO chance to run any code
+/// of its own, `Drop` included, so a sibling's `ThreadTranslator` (a plain
+/// stack local, normally flushed by its own `Drop`) is simply never flushed:
+/// its already-consumed DSR execution CPU still lands in the host kernel's
+/// PER-PROCESS `getrusage` gauge (a live, passive counter, not something a
+/// thread has to report), but no per-thread `core.thread_cpu_ns` NATIVEPERF
+/// record for it is ever written. The Python analyzer's derived helper
+/// residual (`process_cpu - Σ flushed thread_cpu`) then silently absorbs that
+/// real guest execution as if it were profiler/runtime overhead.
+///
+/// The fix: every guest thread republishes a cheap, self-consistent COPY of
+/// its own counters here on every DSR loop iteration (`Copy`, no allocation,
+/// no correctness dependency on freshness beyond "at most one iteration
+/// old"). When `exit_group` fires, the thread that observed it -- after
+/// flushing and deregistering ITSELF exactly as before -- drains whatever
+/// other entries remain and emits a complete record for each, using the
+/// entry's last-published counters for identity/reconciliation and a LIVE
+/// cross-thread `thread_info` read (via the mach port each thread captures
+/// on itself at registration) for the one field that must never be stale:
+/// `thread_cpu_ns`.
+///
+/// Scope and lifetime: this `static` is exactly as process-scoped as
+/// `profile::PROCESS_STARTUP` -- Carrick runs each guest PROCESS as a real,
+/// separate forked host OS process, so a plain `static` here already means
+/// "this guest process's registry" with no extra plumbing. A fork child
+/// inherits a COW snapshot describing OS threads (and mach ports) that do
+/// not exist in the new process; `ThreadTranslator::after_fork_child` clears
+/// it and re-seeds the one surviving thread. A real execve resets it for
+/// free (a fresh process image reinitializes every `static`). Entirely
+/// unused (no lock ever taken, no port ever queried) when profiling is off.
+#[derive(Clone, Copy)]
+struct SiblingSnapshot {
+    budget: profile::ThreadBudget,
+    stats: ResolverStats,
+    nested_translation_ns: u64,
+    mach_port: libc::mach_port_t,
+}
+
+static SIBLING_PROFILES: OnceLock<Mutex<HashMap<i32, SiblingSnapshot>>> = OnceLock::new();
+
+fn sibling_profiles() -> &'static Mutex<HashMap<i32, SiblingSnapshot>> {
+    SIBLING_PROFILES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 impl ThreadTranslator {
     #[cfg(test)]
     pub(super) fn new(capacity: usize) -> Result<Self, types::DsrError> {
@@ -357,10 +408,22 @@ impl ThreadTranslator {
             // startup window here so its first gateway entry claims the
             // child's own bring-up cost (profile-off runs read no clocks).
             profile::reset_process_startup_after_fork_child();
+            // `fork()` only duplicates the calling thread: every OTHER entry
+            // in the inherited (COW) sibling registry names an OS thread --
+            // and a mach port -- that does not exist in this new process.
+            // Clear it before re-seeding this (the one surviving) thread,
+            // else a later `exit_group` drain in the child would `thread_info`
+            // a stale/dangling port name from the parent's port namespace.
+            sibling_profiles().lock().clear();
         }
         self.profile_finalized = false;
         self.nested_translation_ns = 0;
         self.last_kick = None;
+        // Re-register the surviving thread under its (possibly renumbered)
+        // child tid with the just-reset budget/stats, querying its mach port
+        // fresh -- the child's task port namespace is its own, so the old
+        // port value is not to be trusted even for this same thread.
+        self.publish_sibling_snapshot();
         let (used_bytes, block_count, generation_count) = self.process.lifecycle_snapshot();
         probes::dsr_cache_lifecycle(
             self.tid,
@@ -462,20 +525,37 @@ impl ThreadTranslator {
     }
 
     fn claim_profile_snapshot(&mut self) -> Result<ProfileSnapshot, profile::ProfileError> {
-        if let Some(error) = self.stats.invalid {
+        Self::claim_profile_snapshot_for(&self.process, self.stats, self.nested_translation_ns)
+    }
+
+    /// The guts of `claim_profile_snapshot`, generalized to any thread's
+    /// captured `ResolverStats` against a given process -- not just `self`'s.
+    /// This is what lets `drain_sibling_profiles_before_process_exit` compute
+    /// a sibling's resolver delta using its own last-published `stats`
+    /// (the per-thread half) against this process's CURRENT, live shared
+    /// counters (the process-wide half, safe to read from any thread under
+    /// its own lock) instead of a stale copy of those too.
+    fn claim_profile_snapshot_for(
+        process: &ProcessTranslator,
+        stats: ResolverStats,
+        nested_translation_ns: u64,
+    ) -> Result<ProfileSnapshot, profile::ProfileError> {
+        if let Some(error) = stats.invalid {
             return Err(error);
         }
-        let mut process = self.process.state.lock();
-        let delta = process.stats.checked_delta(process.reported_stats)?;
-        process.reported_stats = process.stats;
+        let mut process_state = process.state.lock();
+        let delta = process_state
+            .stats
+            .checked_delta(process_state.reported_stats)?;
+        process_state.reported_stats = process_state.stats;
         Ok(ProfileSnapshot {
-            resolver_exits: self.stats.resolver_exits,
-            one_entry_hits: self.stats.one_entry_hits,
+            resolver_exits: stats.resolver_exits,
+            one_entry_hits: stats.one_entry_hits,
             translations: delta.translations,
             duplicate_publications: delta.duplicate_publications,
-            gateway_entries: self.stats.gateway_entries,
-            syscall_exits: self.stats.syscall_exits,
-            direct_resolver_exits: self.stats.direct_resolver_exits,
+            gateway_entries: stats.gateway_entries,
+            syscall_exits: stats.syscall_exits,
+            direct_resolver_exits: stats.direct_resolver_exits,
             cache_lookups: delta.cache_lookups,
             cache_lookup_hits: delta.cache_lookup_hits,
             invalidated_blocks: delta.invalidated_blocks,
@@ -484,9 +564,9 @@ impl ThreadTranslator {
             translation_plan_ns: delta.translation_plan_ns,
             translation_emit_ns: delta.translation_emit_ns,
             translation_publication_ns: delta.translation_publication_ns,
-            nested_translation_ns: self.nested_translation_ns,
-            cache_used_bytes: process.cache.used_bytes(),
-            cache_capacity_bytes: process.cache.capacity_bytes(),
+            nested_translation_ns,
+            cache_used_bytes: process_state.cache.used_bytes(),
+            cache_capacity_bytes: process_state.cache.capacity_bytes(),
         })
     }
 
@@ -495,6 +575,9 @@ impl ThreadTranslator {
             return None;
         }
         self.profile_finalized = true;
+        // This thread is about to emit its own complete record itself: a
+        // foreign `exit_group` drain must never ALSO emit it (exactly-once).
+        self.withdraw_sibling_snapshot();
         let frames = self
             .budget
             .complete_record()
@@ -510,6 +593,88 @@ impl ThreadTranslator {
     pub(super) fn finalize_profile_epoch(&mut self) {
         if let Some(frames) = self.take_profile_frames() {
             let _ = profile::write_protocol_frames_to_fd(libc::STDERR_FILENO, &frames);
+        }
+    }
+
+    /// Register (first call) or republish (every later call) this thread's
+    /// profiling state so a FOREIGN thread can emit a complete record on its
+    /// behalf if `exit_group` kills it before it gets to flush itself. Safe
+    /// to call unconditionally at any DSR loop-iteration boundary: at that
+    /// point the prior iteration's `record_exit`/phase counters are always
+    /// fully reconciled with `self.stats` (both are only ever advanced
+    /// together, earlier in the same iteration, before control returns here),
+    /// so a snapshot taken here can always be turned into a valid, reconciled
+    /// `CompleteThreadRecord` later. A no-op (no lock, no port lookup) when
+    /// profiling is disabled.
+    pub(super) fn publish_sibling_snapshot(&self) {
+        if !self.budget.enabled() {
+            return;
+        }
+        let snapshot = SiblingSnapshot {
+            budget: self.budget,
+            stats: self.stats,
+            nested_translation_ns: self.nested_translation_ns,
+            mach_port: crate::host_proc::current_thread_port(),
+        };
+        sibling_profiles().lock().insert(self.tid, snapshot);
+    }
+
+    /// Remove this thread's slot, idempotently. Called from every self-flush
+    /// path (`take_profile_frames`, covering `finalize_profile_epoch` and the
+    /// exec handoff) so a thread that DOES get to run its own flush is never
+    /// ALSO emitted a second time by a foreign `exit_group` drain.
+    fn withdraw_sibling_snapshot(&self) {
+        if !self.budget.enabled() {
+            return;
+        }
+        sibling_profiles().lock().remove(&self.tid);
+    }
+
+    /// About to trigger a process-wide `libc::_exit()` because Linux
+    /// `exit_group` semantics (or this being the last live thread) say every
+    /// OTHER guest OS thread of this process dies right now, unconditionally,
+    /// with zero chance to run any code of its own -- `Drop` included. Emit a
+    /// complete NATIVEPERF record for every STILL-REGISTERED sibling using
+    /// its last-published counters (reconciled -- see
+    /// `publish_sibling_snapshot`) and a LIVE cross-thread `thread_info` read
+    /// of its actual CPU via the mach port it captured at registration (CPU
+    /// is never stale here, regardless of how long ago the rest of the
+    /// snapshot was published).
+    ///
+    /// Callers must flush and deregister THEIR OWN slot first (e.g. via
+    /// `finalize_profile_epoch`) -- this only drains what remains, i.e. only
+    /// genuine siblings. A no-op when profiling is disabled. Never emits a
+    /// wire `invalid` record: a sibling whose record cannot be reconstructed
+    /// (an internal invariant violation, or its port already gone -- which
+    /// should not happen for a still-registered entry, since deregistration
+    /// always runs on the owning thread's own stack before it could vanish)
+    /// is silently skipped rather than poisoning the whole profile parse,
+    /// which rejects any `invalid` record outright; skipping only degrades
+    /// back to today's known (and now guarded-against) under-attribution for
+    /// that one thread, never worse.
+    pub(super) fn drain_sibling_profiles_before_process_exit(&self) {
+        if !self.budget.enabled() {
+            return;
+        }
+        let siblings: Vec<SiblingSnapshot> =
+            sibling_profiles().lock().drain().map(|(_, v)| v).collect();
+        for snapshot in siblings {
+            let frames = (|| -> Result<Vec<String>, profile::ProfileError> {
+                let record = snapshot.budget.complete_record()?;
+                let resolver = Self::claim_profile_snapshot_for(
+                    &self.process,
+                    snapshot.stats,
+                    snapshot.nested_translation_ns,
+                )?;
+                let gauges = profile::flush_gauges_for_port(
+                    snapshot.mach_port,
+                    snapshot.budget.thread_cpu_baseline_ns(),
+                )?;
+                record.to_protocol_frames_with_resolver(resolver, gauges)
+            })();
+            if let Ok(frames) = frames {
+                let _ = profile::write_protocol_frames_to_fd(libc::STDERR_FILENO, &frames);
+            }
         }
     }
 }
@@ -2608,6 +2773,292 @@ mod tests {
                 translator.take_profile_frames().is_none(),
                 "the flush must be exactly-once: a later drop/finalize must not re-emit \
                  the same (pid, tid, era) group"
+            );
+        });
+    }
+
+    /// Extracts every complete `NATIVEPERF1|thread|...` line naming `tid` from
+    /// captured stderr text.
+    fn frames_for_tid(captured: &str, tid: i32) -> Vec<String> {
+        let needle = format!("|tid={tid}|");
+        captured
+            .lines()
+            .filter(|line| line.starts_with("NATIVEPERF1|thread|") && line.contains(&needle))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// The root cause this task fixes: Linux `exit_group` kills every OTHER
+    /// live guest OS thread of a process unconditionally, at the runtime's own
+    /// `libc::_exit()`, with zero chance for any of them to run their own
+    /// flush -- Drop included. A thread that registered a sibling slot (every
+    /// DSR loop iteration republishes one, see `publish_sibling_snapshot`) but
+    /// never got to self-flush must still have its complete NATIVEPERF record
+    /// emitted by whichever thread drains the registry before calling
+    /// `libc::_exit()`, carrying its own identity and a plausible
+    /// `thread_cpu_ns` read LIVE, cross-thread, via the mach port it captured
+    /// on itself at registration.
+    #[test]
+    fn exit_group_drain_emits_a_registered_but_unflushed_siblings_record() {
+        fork_test(|| {
+            use std::io::Read as _;
+            use std::os::fd::FromRawFd as _;
+
+            let mut stderr_pipe = [0i32; 2];
+            assert_eq!(unsafe { libc::pipe(stderr_pipe.as_mut_ptr()) }, 0);
+            let saved_stderr = unsafe { libc::dup(libc::STDERR_FILENO) };
+            assert!(saved_stderr >= 0, "dup stderr");
+            assert_eq!(
+                unsafe { libc::dup2(stderr_pipe[1], libc::STDERR_FILENO) },
+                libc::STDERR_FILENO,
+                "redirect stderr"
+            );
+            assert_eq!(unsafe { libc::close(stderr_pipe[1]) }, 0);
+
+            let pid = unsafe { libc::getpid() };
+            const SIBLING_TID: i32 = 9042;
+            let process = std::sync::Arc::new(
+                super::ProcessTranslator::new(16 * 1024).expect("create process translator"),
+            );
+
+            let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<()>(0);
+            let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(0);
+            let sibling_process = std::sync::Arc::clone(&process);
+            let sibling_thread = std::thread::spawn(move || {
+                let mut translator =
+                    super::ThreadTranslator::for_process(sibling_process, SIBLING_TID);
+                translator.budget =
+                    super::profile::ThreadBudget::enabled_for_test(pid, SIBLING_TID);
+                translator
+                    .budget
+                    .record_exit(super::profile::ExitClass::Syscall)
+                    .expect("record a balanced gateway entry/exit pair");
+                // "At DSR loop entry" -- the real call site is the top of
+                // `run_native_dsr_thread_loop_profiled`; this registers the
+                // same way.
+                translator.publish_sibling_snapshot();
+                // Burn real CPU (sleeping would advance wall time, not the
+                // thread's own `thread_info` CPU counters this test proves a
+                // FOREIGN thread can read).
+                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(20);
+                let mut spin: u64 = 0;
+                while std::time::Instant::now() < deadline {
+                    spin = spin.wrapping_add(1);
+                }
+                std::hint::black_box(spin);
+                ready_tx.send(()).expect("signal registered and warmed up");
+                // Simulate `exit_group`'s kernel-level, unconditional kill:
+                // this thread runs no more of its own code after the leader's
+                // drain runs, Drop included, so it must never reach
+                // `take_profile_frames` -- `mem::forget` instead of letting
+                // the value drop naturally.
+                release_rx.recv().expect("wait for the leader's drain");
+                std::mem::forget(translator);
+            });
+
+            ready_rx.recv().expect("sibling registered its slot");
+
+            let mut leader = super::ThreadTranslator::for_process(process, 42);
+            leader.budget = super::profile::ThreadBudget::enabled_for_test(pid, 42);
+            leader.drain_sibling_profiles_before_process_exit();
+            // Flush the leader's OWN (uninteresting, all-zero) record here,
+            // still inside the redirected-stderr window, so its `Drop` does
+            // not write directly to the real fd 2 after the restore below.
+            leader.finalize_profile_epoch();
+
+            release_tx.send(()).expect("release the sibling thread");
+            sibling_thread.join().expect("join sibling thread");
+
+            unsafe {
+                assert_eq!(
+                    libc::dup2(saved_stderr, libc::STDERR_FILENO),
+                    libc::STDERR_FILENO
+                );
+                libc::close(saved_stderr);
+            }
+            let mut captured = String::new();
+            {
+                let mut reader = unsafe { std::fs::File::from_raw_fd(stderr_pipe[0]) };
+                reader
+                    .read_to_string(&mut captured)
+                    .expect("read captured stderr");
+            }
+
+            let sibling_frames = frames_for_tid(&captured, SIBLING_TID);
+            assert_eq!(
+                sibling_frames.len(),
+                10,
+                "the drain must emit the sibling's complete 10-frame record exactly once; \
+                 captured stderr: {captured:?}"
+            );
+            for frame in [
+                "core",
+                "exits",
+                "sensitive",
+                "phases-a",
+                "phases-b",
+                "resolver-thread",
+                "resolver-process",
+                "resolver-times",
+                "cache-gauge",
+                "process",
+            ] {
+                let marker = format!("|frame={frame}|");
+                assert_eq!(
+                    sibling_frames
+                        .iter()
+                        .filter(|line| line.contains(&marker))
+                        .count(),
+                    1,
+                    "frame {frame} must appear exactly once for the drained sibling"
+                );
+            }
+            let thread_cpu_ns = protocol_value(&sibling_frames, "thread_cpu_ns");
+            assert!(
+                thread_cpu_ns > 0,
+                "a sibling thread that spun for 20ms must report a plausibly nonzero \
+                 thread_cpu_ns read live via its mach port, got {thread_cpu_ns}"
+            );
+        });
+    }
+
+    /// Exactly-once: a thread that runs its OWN flush (and so deregisters
+    /// itself) must never ALSO be re-emitted by a later foreign
+    /// `exit_group` drain -- a double emission is a duplicate `(pid, tid,
+    /// era)` group, which the Python analyzer hard-rejects on replay.
+    #[test]
+    fn exit_group_drain_never_reemits_a_thread_that_already_self_flushed() {
+        fork_test(|| {
+            use std::io::Read as _;
+            use std::os::fd::FromRawFd as _;
+
+            let mut stderr_pipe = [0i32; 2];
+            assert_eq!(unsafe { libc::pipe(stderr_pipe.as_mut_ptr()) }, 0);
+            let saved_stderr = unsafe { libc::dup(libc::STDERR_FILENO) };
+            assert!(saved_stderr >= 0, "dup stderr");
+            assert_eq!(
+                unsafe { libc::dup2(stderr_pipe[1], libc::STDERR_FILENO) },
+                libc::STDERR_FILENO,
+                "redirect stderr"
+            );
+            assert_eq!(unsafe { libc::close(stderr_pipe[1]) }, 0);
+
+            let pid = unsafe { libc::getpid() };
+            const SELF_FLUSHED_TID: i32 = 9043;
+            let process = std::sync::Arc::new(
+                super::ProcessTranslator::new(16 * 1024).expect("create process translator"),
+            );
+
+            let mut already_flushed = super::ThreadTranslator::for_process(
+                std::sync::Arc::clone(&process),
+                SELF_FLUSHED_TID,
+            );
+            already_flushed.budget =
+                super::profile::ThreadBudget::enabled_for_test(pid, SELF_FLUSHED_TID);
+            already_flushed
+                .budget
+                .record_exit(super::profile::ExitClass::Syscall)
+                .expect("record a balanced gateway entry/exit pair");
+            // Register, exactly like a real DSR loop iteration would...
+            already_flushed.publish_sibling_snapshot();
+            // ...then flush and deregister itself, exactly like the normal
+            // (non-`exit_group`) retirement paths do.
+            already_flushed.finalize_profile_epoch();
+
+            let mut leader = super::ThreadTranslator::for_process(process, 42);
+            leader.budget = super::profile::ThreadBudget::enabled_for_test(pid, 42);
+            // The `exit_group` seam: the leader's own flush already ran
+            // (mirrored here by `already_flushed.finalize_profile_epoch()`
+            // above standing in for a DIFFERENT thread's self-flush); now
+            // drain whatever siblings remain -- which must be none.
+            leader.drain_sibling_profiles_before_process_exit();
+            // Flush the leader's OWN (uninteresting, all-zero) record here,
+            // still inside the redirected-stderr window, so its `Drop` does
+            // not write directly to the real fd 2 after the restore below.
+            leader.finalize_profile_epoch();
+
+            unsafe {
+                assert_eq!(
+                    libc::dup2(saved_stderr, libc::STDERR_FILENO),
+                    libc::STDERR_FILENO
+                );
+                libc::close(saved_stderr);
+            }
+            let mut captured = String::new();
+            {
+                let mut reader = unsafe { std::fs::File::from_raw_fd(stderr_pipe[0]) };
+                reader
+                    .read_to_string(&mut captured)
+                    .expect("read captured stderr");
+            }
+
+            let frames = frames_for_tid(&captured, SELF_FLUSHED_TID);
+            assert_eq!(
+                frames.len(),
+                10,
+                "a self-flushed thread's record must appear exactly once (its own \
+                 self-flush), never a second time from the leader's drain; captured: {captured:?}"
+            );
+        });
+    }
+
+    /// Zero cost / zero effect when profiling is off: a thread whose budget
+    /// was never enabled must never register a sibling slot at all, so a
+    /// foreign drain finds (and emits) nothing for it.
+    #[test]
+    fn disabled_profiling_thread_never_registers_a_sibling_slot() {
+        fork_test(|| {
+            use std::io::Read as _;
+            use std::os::fd::FromRawFd as _;
+
+            let mut stderr_pipe = [0i32; 2];
+            assert_eq!(unsafe { libc::pipe(stderr_pipe.as_mut_ptr()) }, 0);
+            let saved_stderr = unsafe { libc::dup(libc::STDERR_FILENO) };
+            assert!(saved_stderr >= 0, "dup stderr");
+            assert_eq!(
+                unsafe { libc::dup2(stderr_pipe[1], libc::STDERR_FILENO) },
+                libc::STDERR_FILENO,
+                "redirect stderr"
+            );
+            assert_eq!(unsafe { libc::close(stderr_pipe[1]) }, 0);
+
+            let pid = unsafe { libc::getpid() };
+            const DISABLED_TID: i32 = 9044;
+            let process = std::sync::Arc::new(
+                super::ProcessTranslator::new(16 * 1024).expect("create process translator"),
+            );
+
+            let mut disabled =
+                super::ThreadTranslator::for_process(std::sync::Arc::clone(&process), DISABLED_TID);
+            disabled.budget = super::profile::ThreadBudget::disabled_for_test(pid, DISABLED_TID);
+            disabled.publish_sibling_snapshot();
+
+            let mut leader = super::ThreadTranslator::for_process(process, 42);
+            leader.budget = super::profile::ThreadBudget::enabled_for_test(pid, 42);
+            leader.drain_sibling_profiles_before_process_exit();
+            // Flush the leader's OWN (uninteresting, all-zero) record here,
+            // still inside the redirected-stderr window, so its `Drop` does
+            // not write directly to the real fd 2 after the restore below.
+            leader.finalize_profile_epoch();
+
+            unsafe {
+                assert_eq!(
+                    libc::dup2(saved_stderr, libc::STDERR_FILENO),
+                    libc::STDERR_FILENO
+                );
+                libc::close(saved_stderr);
+            }
+            let mut captured = String::new();
+            {
+                let mut reader = unsafe { std::fs::File::from_raw_fd(stderr_pipe[0]) };
+                reader
+                    .read_to_string(&mut captured)
+                    .expect("read captured stderr");
+            }
+
+            assert!(
+                frames_for_tid(&captured, DISABLED_TID).is_empty(),
+                "a profile-disabled thread must never publish a sibling slot; captured: {captured:?}"
             );
         });
     }
