@@ -265,6 +265,16 @@ git commit -m "diagnostics(native): reconcile compiler DSR budgets" -m "Record e
 - Produces: `load_manifest(path) -> WorkloadManifest`, `parse_nativeperf(lines) -> ProfileRun`, `validate_profile(run)`, `run_phase(...) -> RunRecord`, and `analyze(records) -> DecisionRecord`.
 - Manifest schema: `carrick.native-compiler-workload.v1`; result schema: `carrick.native-compiler-budget.v1`.
 
+**Review reconciliation:** The implemented result wire uses strict tagged
+`run`/`decision` variants and a typed outcome (`completed`, `max-traps`, or
+`failed`). Non-completing W1 rows, including the fixed status-125 trap ceiling,
+are retained as baseline evidence but are deliberately rejected by decision
+analysis. Docker identity and replay checks run once in an explicit Docker-only
+preflight that writes a hashed receipt; Carrick measurement consumes that
+receipt without invoking Docker. Baseline execution is engine-major (all
+Carrick W1/W2 samples and scoped cleanup, then all Docker W1/W2 samples), while
+the Plane B comparison uses the exact warmup-inclusive ABBA order.
+
 - [ ] **Step 1: Write red-first manifest and protocol parser tests**
 
 Add hermetic tests using temporary files and synthetic records:

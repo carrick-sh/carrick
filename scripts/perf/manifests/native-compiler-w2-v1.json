@@ -42,16 +42,55 @@
       ]
     ],
     "captured_argv_index": 47,
-    "docker_replay_output_sha256": [
-      "5db57566623a37fd8691cadd4e6b0eeefdc85bb3691f0e5bb5a64c3b1ae0dbf0",
-      "5db57566623a37fd8691cadd4e6b0eeefdc85bb3691f0e5bb5a64c3b1ae0dbf0"
-    ],
-    "docker_replay_stdout_sha256": [
-      "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-      "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    "docker_replays": [
+      {
+        "exit_status": 0,
+        "output_sha256": "5db57566623a37fd8691cadd4e6b0eeefdc85bb3691f0e5bb5a64c3b1ae0dbf0",
+        "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "exit_status": 0,
+        "output_sha256": "5db57566623a37fd8691cadd4e6b0eeefdc85bb3691f0e5bb5a64c3b1ae0dbf0",
+        "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
     ],
     "expected_output_guest_path": "/tmp/go-build1877453333/b018/_pkg_.a",
     "expected_output_sha256": "5db57566623a37fd8691cadd4e6b0eeefdc85bb3691f0e5bb5a64c3b1ae0dbf0",
+    "kind": "w2-toolexec",
+    "replay_environment": [
+      [
+        "CGO_ENABLED",
+        "1"
+      ],
+      [
+        "GOARCH",
+        "arm64"
+      ],
+      [
+        "GOLANG_VERSION",
+        "1.24.13"
+      ],
+      [
+        "GOOS",
+        "linux"
+      ],
+      [
+        "GOPATH",
+        "/go"
+      ],
+      [
+        "GOTOOLCHAIN",
+        "local"
+      ],
+      [
+        "HOME",
+        "/root"
+      ],
+      [
+        "PATH",
+        "/go/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      ]
+    ],
     "rejected_candidates": [
       {
         "aggregate_gateway_entries": 37543,
@@ -108,13 +147,13 @@
       "profile_stderr_sha256": "a8cb8a22ba1ccf349420418d755b0dbe36130d69545aebb6450836941d96ed39",
       "profile_summary_sha256": "4a9c759cbaf11e0c3a7bae623199a5fa87247736cfeb7f4de4143d8239735451",
       "w1_hottest": {
-        "exit_resolve_direct": 8403,
-        "exit_resolve_indirect": 298386,
-        "exit_sensitive": 692350,
+        "exit_resolve_direct": 6399,
+        "exit_resolve_indirect": 137327,
+        "exit_sensitive": 855641,
         "gateway_entries": 1000000,
-        "sensitive_exclusive": 533882
+        "sensitive_exclusive": 579097
       },
-      "w1_profile_sha256": "adce92718a89f5a3a3b849c3d55ba6af47cdf4360638c9643895ee19087d5c7c",
+    "w1_profile_sha256": "8d2ebd3666908c805135e03a316d20793c9ce3621955ed9bde6bc8bc75a30945",
       "w2_hottest": {
         "exit_resolve_direct": 3834,
         "exit_resolve_indirect": 17585,
@@ -124,6 +163,8 @@
       }
     },
     "source": "docker-toolexec",
+    "w1_profile_evidence_path": "../evidence/native-compiler-w1-current-profile-v1.json",
+    "w1_profile_evidence_sha256": "36590c640a3dd8c4e31861a72e1a09ca6da8c17c46a4fcd85899b55c5c00c7da",
     "w1_stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     "w1_stdout_sha256": "be7c8060c98794b8a1b49263accc8cce5e3b81c47180802c39c8c2439b1757d8"
   },
