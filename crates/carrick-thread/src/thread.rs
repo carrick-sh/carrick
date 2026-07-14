@@ -552,6 +552,9 @@ pub struct FutexWait {
     generation: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FutexInterruptGeneration(u64);
+
 struct FutexBucket {
     generation: AtomicU64,
     waiters: AtomicUsize,
@@ -613,13 +616,23 @@ fn reset_futex_halt_poll_ns_for_tests() {
 pub struct FutexTable {
     #[allow(clippy::type_complexity)]
     shards: Box<[ParkingMutex<HashMap<u64, Arc<FutexBucket>>>; FUTEX_SHARDS]>,
+    interrupt_generation: AtomicU64,
 }
 
 impl FutexTable {
     pub fn new() -> Self {
         Self {
             shards: Box::new(std::array::from_fn(|_| ParkingMutex::new(HashMap::new()))),
+            interrupt_generation: AtomicU64::new(0),
         }
+    }
+
+    fn interrupt_generation(&self) -> FutexInterruptGeneration {
+        FutexInterruptGeneration(self.interrupt_generation.load(Ordering::Acquire))
+    }
+
+    fn advance_interrupt_generation(&self) {
+        self.interrupt_generation.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Pick the shard for `addr`. A multiplicative (Fibonacci) hash spreads
@@ -719,6 +732,13 @@ impl FutexTable {
             if bucket.generation.load(Ordering::Acquire) != wait.generation {
                 return FutexWaitOutcome::Woken;
             }
+            // Snapshot BEFORE the full predicate. Signal/fork/exec publishers
+            // advance this generation before they acquire a parking-lot bucket
+            // to unpark waiters. If publication races between this snapshot and
+            // registration, the locked validation below observes the change and
+            // refuses to park; the next loop can run the potentially-locking
+            // predicate safely outside parking_lot.
+            let interrupt_generation = self.interrupt_generation();
             if interrupted() {
                 return FutexWaitOutcome::Interrupted;
             }
@@ -756,21 +776,17 @@ impl FutexTable {
                         if bucket.generation.load(Ordering::Acquire) != wait.generation {
                             return false;
                         }
-                        // Re-check interruptibility UNDER the park lock, not just at
-                        // the loop top. A fork quiesce (or a pending signal) can
-                        // begin AFTER the loop-top `interrupted()` check but before
-                        // this park — and the quiesce's wake is ONE-SHOT (it fires
-                        // before this thread is parked, so it misses us). Without
-                        // this guard the thread parks forever while
-                        // `is_quiescing()==true`, stalling `wait_quiesced` → the
-                        // fork times out and EAGAINs → the guest retries → a
-                        // fork-retry LIVELOCK that froze concurrent `go build`s.
-                        // Returning false here yields ParkResult::Invalid; the
-                        // loop re-checks `interrupted()` at the top and returns
-                        // Interrupted so the run loop reaches `park_if_quiescing`.
-                        // (Found by core post-mortem: a vCPU thread stuck here
-                        // while 7 siblings sat in the quiesce barrier.)
-                        if interrupted() {
+                        // The parking_lot validation callback runs with its
+                        // internal bucket locked. It MUST NOT call the full
+                        // interrupt predicate: native signal inspection takes
+                        // `SignalState`, while dropping a SignalState guard can
+                        // itself need this bucket to unpark a mutex waiter. That
+                        // SignalState→bucket / bucket→SignalState inversion
+                        // deadlocked Go's `go_internal_srcimporter` workload.
+                        // The monotonic generation is the lock-free lost-wake
+                        // guard: every signal/quiesce/exec notification advances
+                        // it before trying to unpark.
+                        if self.interrupt_generation() != interrupt_generation {
                             return false;
                         }
                         registered.set(true);
@@ -813,6 +829,7 @@ impl FutexTable {
     /// deliver that signal, so every parked thread must re-evaluate its
     /// `interrupted()` predicate now rather than waiting for a timeout deadline.
     pub fn notify_signal_pending(&self) {
+        self.advance_interrupt_generation();
         let buckets = self.all_buckets();
         for bucket in buckets {
             let key = Self::bucket_key(&bucket);
@@ -833,6 +850,7 @@ impl FutexTable {
         let Ok(token) = usize::try_from(tid.raw()) else {
             return;
         };
+        self.advance_interrupt_generation();
         let buckets = self.all_buckets();
         for bucket in buckets {
             let key = Self::bucket_key(&bucket);
@@ -1010,8 +1028,8 @@ impl Default for FutexTable {
 mod tests {
     use super::*;
     use std::ffi::OsString;
-    use std::sync::atomic::AtomicBool;
-    use std::sync::{Arc, Mutex, MutexGuard};
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::sync::{Arc, Barrier, Mutex, MutexGuard};
     use std::time::Duration;
 
     const FUTEX_HALT_POLL_ENV: &str = "CARRICK_FUTEX_HALT_POLL_NS";
@@ -1536,6 +1554,68 @@ mod tests {
         assert_eq!(outcome, FutexWaitOutcome::Interrupted);
 
         raiser.join().unwrap();
+    }
+
+    #[test]
+    fn futex_park_validation_does_not_reenter_locking_interrupt_predicate() {
+        let table = Arc::new(FutexTable::new());
+        let addr = 0xf17e_10cc_u64;
+        let signal_state = Mutex::new(());
+        let signal_guard = signal_state.lock().expect("lock synthetic signal state");
+        let calls = AtomicUsize::new(0);
+        let reentered_while_locked = AtomicBool::new(false);
+        let start = Arc::new(Barrier::new(2));
+        let waker_table = Arc::clone(&table);
+        let waker_start = Arc::clone(&start);
+        let waker = std::thread::spawn(move || {
+            waker_start.wait();
+            while waker_table.waiter_count(addr) == 0 {
+                std::thread::yield_now();
+            }
+            assert_eq!(waker_table.wake(addr, 1), 1);
+        });
+
+        let wait = table.prepare_wait(addr);
+        start.wait();
+        let outcome = table.wait_prepared(wait, None, &|| {
+            let call = calls.fetch_add(1, Ordering::SeqCst);
+            if call != 0 && signal_state.try_lock().is_err() {
+                reentered_while_locked.store(true, Ordering::SeqCst);
+            }
+            false
+        });
+        drop(signal_guard);
+        waker.join().expect("join futex waker");
+
+        assert_eq!(outcome, FutexWaitOutcome::Woken);
+        assert!(
+            !reentered_while_locked.load(Ordering::SeqCst),
+            "parking-lot validation re-entered a predicate that may lock SignalState"
+        );
+    }
+
+    #[test]
+    fn signal_notification_between_predicate_and_park_is_not_lost() {
+        let table = Arc::new(FutexTable::new());
+        let addr = 0xf17e_aced_u64;
+        let wait = table.prepare_wait(addr);
+        let pending = AtomicBool::new(false);
+        let published = AtomicBool::new(false);
+
+        let outcome = table.wait_prepared(wait, None, &|| {
+            if !published.swap(true, Ordering::SeqCst) {
+                pending.store(true, Ordering::SeqCst);
+                // There is no registered waiter yet. The generation advance is
+                // therefore the only edge that can keep the upcoming park from
+                // losing this one-shot notification.
+                table.notify_signal_pending();
+                return false;
+            }
+            pending.load(Ordering::SeqCst)
+        });
+
+        assert_eq!(outcome, FutexWaitOutcome::Interrupted);
+        assert_eq!(table.waiter_count(addr), 0);
     }
 
     #[test]
