@@ -2,10 +2,11 @@
 
 Date: 2026-07-14
 
-Integration state: `codex/native-conformance-quality` was fast-forwarded onto
-`main` from `3cb0c7b8` through `8941ee5a` (48 commits). The branch worktree is
-intentionally retained because it contains an interrupted, uncommitted second
-review-fix wave described below.
+Integration state: `codex/native-conformance-quality` carries the completed
+second review-fix wave as `5b45cc01` and `7a475d18` (rebased onto `b5297188`),
+and main is fast-forwarded to `7a475d18`. The feature worktree at
+`.worktrees/codex-native-conformance` is clean and retained as the campaign
+working copy.
 
 ## Goal and honest status
 
@@ -16,11 +17,13 @@ is out of scope. Native performance is correctness: a workload that is tens or
 hundreds of times slower than the Linux oracle is not ready to bless.
 
 **Current status: NOT BLESSED.** Prepared-image/self-reexec correctness has
-advanced substantially and Node content parity is green, but Task 8 stopped on
-a pathological Go compiler/import workload. The performance measurement
-interlude has a reviewed profiler and a substantial runner/analyzer, but its
-second independent review remains rejected. No Task 3 measurement campaign has
-run and no optimization slice has been selected.
+advanced substantially and Node content parity is green. Task 8 remains
+stopped on the pathological Go compiler/import workload. The performance
+measurement interlude is now fully review-approved: Task 1 (profiler) and
+Task 2 (immutable workloads, runner, analyzer) both passed independent review.
+The second Task 2 review's seven Important findings were fixed red-first and
+re-reviewed to a final "Ready to merge: Yes" verdict at `7a475d18`. The Task 3
+measurement campaign has NOT run and no optimization slice has been selected.
 
 Authoritative tracked documents:
 
@@ -31,8 +34,8 @@ Authoritative tracked documents:
 - [compiler performance measurement plan](docs/superpowers/plans/2026-07-14-native-compiler-performance-measurement.md)
 
 The detailed controller ledger is local and git-ignored at
-`.superpowers/sdd/progress.md`. The Task 8 evidence report is retained in the
-feature worktree at
+`.superpowers/sdd/progress.md` in the feature worktree. The Task 8 evidence
+report is retained in the feature worktree at
 `.worktrees/codex-native-conformance/.superpowers/sdd/task-8-report.md`.
 
 ## Measured correctness ladder
@@ -54,127 +57,95 @@ fork without exec and reaches the intentional Darwin/libdispatch safety guard
 with `EAGAIN`. They are accepted as lower-priority esoteric gaps for now, but
 the probe gate remains honestly red.
 
-Task 8 landed fixes for prepared self-reexec state transport, futex signal lock
-ordering, and SIMD/GPR DSR writeback. Exact reducers and Node show that the
-ordinary prepared-image path works. This does not substitute for the missing
-Go, CPython, load, and full-bless rungs.
-
 ## Current performance and cause
 
 The stopping real workload is `go-go_internal_srcimporter` c94:
 
 - Carrick was scoped-stopped after 1,392.649 seconds versus a 2.696-second
   Docker oracle: **516.56x**.
-- It had 42 scoped processes, 19 runnable, and about 856-950% aggregate CPU.
-- Compiler children were active rather than deadlocked, but none completed.
 - The exact `TestImplicitsInfo` reducer reaches the typed 1,000,000-gateway
   ceiling after 15.90 seconds.
 
-This is dominated by DSR execution shape, not a missing rebuild and not yet a
-proven AOT-cache problem. Current framed W1 evidence reaches 1,000,000 gateway
-entries in 20.02 seconds under profiling. On its hottest thread, sensitive
-exits are 85.56% of gateway entries, with exclusive emulation alone at 57.91%;
-direct plus indirect resolution is 14.37%. The representative W2 hottest
-thread has 65.16% sensitive exits (47.93% exclusive) and 34.49% resolution.
-However, W2 aggregate counts instead show about 21.94% sensitive and 56.58%
-resolution. That disagreement is one reason the analyzer is not approved: the
-selection denominator and thread scope must be explicit before choosing the
-first optimization.
+This is dominated by DSR execution shape. On the W1 hottest thread, sensitive
+exits are 85.56% of gateway entries (exclusive emulation alone 57.91%);
+direct plus indirect resolution is 14.37%. The W2 hottest thread has 65.16%
+sensitive exits (47.93% exclusive) while the W2 aggregate across all threads
+shows 41.2% sensitive and 56.6% resolution. That scope disagreement is now a
+first-class analyzer concept: count evidence carries an explicit
+hottest-thread/aggregate-threads scope, the decision ladder evaluates both and
+fails closed when they disagree, and every decision names its denominator in a
+typed `scope` field. Task 3 must reconcile the scopes on measured evidence
+before any slice is selected — not by weakening the gate.
 
-A persistent/AOT DSR cache remains a plausible later slice because many child
-processes rebuild cold state. It is not yet selected: recurring sensitive exits
-and per-thread/aggregate resolver behavior may dominate, and a safe cache must
-also bind guest content, page profile, translator ABI, host ISA/features, and
-relocation assumptions.
-
-DTrace overhead is accepted. Its wall time is inflated, but counts, ordering,
-exit mix, and relative distribution are proportional evidence. Signed untraced
-runs remain the only absolute wall/CPU authority.
+DTrace overhead is accepted as proportional shape evidence only; signed
+untraced runs remain the only absolute wall/CPU authority. A persistent/AOT
+DSR cache remains unselectable until recurring-PC and first-resolution proof
+exist; the resolver rung is deliberately dead until Plane C supplies
+source-PC recurrence.
 
 ## Performance interlude implementation state
 
 ### Task 1: native in-process profiler — approved
 
-`NATIVEPERF1` now emits framed, typed per-thread records with exact gateway-exit
-reconciliation and exclusive phase accounting. Profile-off code retains the
-specialized no-timer path. Signed W1 off/on controls preserved the same typed
-one-million-trap result; the on run produced 70 complete unique thread records
-and zero invalid records. Fork, cross-thread signal, and exec-thread reducers
-reassembled complete unique eras with zero invalid frames. The integrated
-workspace gate is green.
+`NATIVEPERF1` emits framed, typed per-thread records with exact gateway-exit
+reconciliation and exclusive phase accounting; profile-off keeps the
+specialized no-timer path. Signed off/on controls preserved the typed
+one-million-trap result.
 
-### Task 2: immutable workloads and analyzer — implemented, review rejected
+### Task 2: immutable workloads and analyzer — APPROVED
 
-Committed through `8941ee5a`:
+The second independent review confirmed all seven Important findings fixed
+with red-first tests and independently re-verified hash chains; the delta
+commit closed its one new Important finding and all actionable Minors, with a
+final "Ready to merge: Yes". What the fix waves (`5b45cc01`, `7a475d18`)
+added:
 
-- immutable W1/W2 manifests and the exact W2 fixture;
-- strict tagged run/decision records and typed outcomes;
-- engine-major Carrick-then-Docker baseline scheduling;
-- warmup-inclusive Plane B ABBA scheduling;
-- scoped run IDs and cleanup receipts;
-- Docker-only preflight/replay receipts;
-- durable Plane C capture with per-PID reconciliation;
-- fixes for DTrace kind ordinals and diagnostic leakage onto guest stdout.
+- Plane C ordering derived from the raw DTrace temporal sample stream, with
+  `dtrace.raw` name+SHA-256 bound into the typed record, raw/summary count and
+  completion reconciliation, and exact round-trip of every emitted shape.
+- Cross-field validation (engine x plane x preflight x cleanup x
+  profile/dtrace presence x gateway reconciliation x schedule-label forms) on
+  every wire row consumed by `analyze --check`.
+- Fail-fast (`set -eu`) W2 Docker replay script with an executable-sentinel
+  proof that exec is unreachable after failed materialization.
+- Explicit count-evidence thread scope with fail-closed reconciliation and a
+  typed `scope` field on every decision.
+- Unconditional additive duration-model validation before any decision and a
+  blocked/off-CPU rung (>=30% of untraced wall, saturation named in the
+  basis).
+- Durable W1 evidence: the gzipped raw profile is checked in and manifest
+  load decompresses, hashes, parses, and reconciles it (140 thread groups,
+  hottest counters, identity, max-traps marker); evidence paths cannot escape
+  the evidence root.
+- Untraced runs keep a typed max-traps outcome from the stderr marker without
+  profile identity; forged markers rejected.
+- Checked-in real artifacts under `scripts/perf/evidence/` (W1 raw profile,
+  W2 representative profile, and the post-fix Plane C run
+  `nativeperf-w2-internal-runtime-atomic-1-4472f5b0`) are parsed,
+  hash-verified, and round-tripped by the hermetic suite (71 tests).
 
-The latest signed W2 Plane C proof completed naturally with byte-empty stdout,
-the expected work product, zero incomplete pairs/drops, 23 reconciled per-PID
-totals, and clean scoped cleanup. Retained proof:
-`target/native-compiler-task2-review/w2-plane-c-artifacts/nativeperf-w2-internal-runtime-atomic-3-c0459f8d/`.
+Verification on record: 71 hermetic tests, `sh -n`, `py_compile`, CLI
+`analyze --input --check` exit 0 with scoped decision, `just fmt-check`, full
+`just ci`, regenerated W1/W2 Docker preflight receipts, two real W2 Docker
+replays reproducing work product `5db57566...` through the fail-fast script,
+and a fresh signed Plane C live run with clean scoped cleanup, 23 reconciled
+per-PID totals, and zero drops.
 
-The second independent review of `7c87e60f..8941ee5a` rejected the tranche with
-0 Critical, 7 Important, and 3 Minor findings. The Important blockers are:
-
-1. Plane C cannot round-trip all of its emitted record shapes, does not preserve
-   raw temporal ordering, and does not bind the raw artifact path/hash into the
-   record.
-2. `analyze --check` validates ABBA rows but not all baseline/Plane C
-   cross-field combinations.
-3. W2 Docker replay is still fail-open because the generated shell lacks
-   fail-fast semantics.
-4. Workload selection uses hottest-thread evidence while analysis aggregates
-   all threads, which changes the decision-rule result.
-5. The decision ladder returns on count evidence before validating the
-   additive duration model and does not use `blocked_ns`.
-6. Durable W1 evidence is self-asserted: the checked-in summary is not
-   validated against a checked-in, parsed, hashed raw artifact.
-7. Untraced W1 loses its typed max-traps ceiling because the marker is parsed
-   only when a profile is present.
-
-Minor follow-ups: reject unknown flattened-profile value keys and reconcile
-phase-sensitive counts; align the plan's obsolete status-125 wording with the
-observed top-level exit 2; rewrite the three fix commit bodies that contain
-literal `\n\n` text if history is cleaned up later.
-
-### Interrupted second review-fix wave — preserved, not integrated
-
-The feature worktree contains partial uncommitted work and must not be removed:
-
-- modified `scripts/perf/test_native_compiler_budget.py` (only the initial gzip
-  evidence-test imports/root so far);
-- `scripts/perf/evidence/native-compiler-w1-current-profile-v1.log.gz`;
-- `scripts/perf/evidence/native-compiler-w2-representative-profile-v1.log.gz`;
-- `scripts/perf/evidence/real-plane-c-v1/` with compressed record, raw trace,
-  summary, and stderr artifacts.
-
-These files are evidence/fix inputs, not an approved commit. Continue from
-`/Volumes/CaseSensitive/carrick/.worktrees/codex-native-conformance` and inspect
-the diff before editing.
+One deferred pre-existing follow-up (reviewer-accepted, ledgered): make the
+evidence-to-W1-manifest hash link mandatory when `native-compiler-w1-v1.json`
+is absent next to the manifest.
 
 ## Exact next steps
 
-1. Finish the seven Important Task 2 review fixes with red-first hermetic tests.
-2. Prove strict parsing and hash binding against the retained raw W1/W2/Plane C
-   artifacts; rerun the real W2 Docker replay and signed Plane C path.
-3. Run the 50+ Python tests, strict manifest loads, analyzer checks, shell
-   syntax, `just ci`, and signed live proof; return to the same reviewer until
-   Critical/Important/Minor findings are zero.
-4. Run Task 3 only after Task 2 approval: untraced Plane A, profile-off/on ABBA
-   Plane B, proportional Plane C, W1/W2 and one-thread controls. Reconcile
-   hottest-thread and aggregate scopes before selecting a slice.
-5. Implement the selected dominant-term repair and require the reduced
-   compiler/import workload to complete naturally below 20x Docker, targeting
-   10x or better. Do not raise timeouts or `max_traps`.
-6. Resume at exact c94, finish Go and classify its existing differences, then
+1. Run Task 3, the measurement campaign: untraced Plane A, profile-off/on
+   ABBA Plane B, proportional Plane C, on W1/W2 and the one-thread control.
+   The analyzer fails closed if the hottest-thread and aggregate scopes
+   disagree on the slice; reconcile with measured evidence.
+2. Select the dominant-term slice from the committed decision ladder and
+   implement the repair red-first. Require the reduced compiler/import
+   workload to complete naturally below 20x Docker, targeting 10x or better.
+   Do not raise timeouts or `max_traps`.
+3. Resume at exact c94, finish Go and classify its existing differences, then
    run CPython serial, three workers=4 smoke repeats, the full candidate,
    overlay bless, post-bless run, and a live real-workload demonstration.
 
@@ -188,5 +159,4 @@ the diff before editing.
 - Preserve exact workload/input/output hashes and do not weaken work, fan-out,
   timeouts, trap ceilings, AArch64 exclusive semantics, or signal semantics.
 - Keep measured results separate from projections. Task 8 is incomplete,
-  Task 2 is not review-approved, Task 3 has not run, and no optimization is
-  selected.
+  Task 3 has not run, and no optimization is selected.
