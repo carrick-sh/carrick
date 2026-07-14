@@ -213,6 +213,20 @@ dsr_ordinal_enum! {
         ExecMapProtectEnd = 22,
         ExecMapVvarBegin = 23,
         ExecMapVvarEnd = 24,
+        HostSelfReexecBegin = 25,
+        HostSelfReexecEnd = 26,
+        HostSelfReexecProbesReady = 27,
+        HostSelfReexecCapsuleBegin = 28,
+        HostSelfReexecCapsuleEnd = 29,
+        HostSelfReexecRestoreBegin = 30,
+        HostSelfReexecDispatcherReady = 31,
+        HostSelfReexecImageLoadBegin = 32,
+        HostSelfReexecImageLoadEnd = 33,
+        HostSelfReexecResetBegin = 34,
+        HostSelfReexecResetEnd = 35,
+        HostSelfReexecGuestEntry = 36,
+        HostSelfReexecPreflightBegin = 37,
+        HostSelfReexecCapsulePrepareBegin = 38,
     }
 }
 
@@ -334,6 +348,32 @@ mod dsr_probe_abi {
         assert_eq!(DsrCacheLifecyclePhase::ExecMapProtectEnd.raw(), 22);
         assert_eq!(DsrCacheLifecyclePhase::ExecMapVvarBegin.raw(), 23);
         assert_eq!(DsrCacheLifecyclePhase::ExecMapVvarEnd.raw(), 24);
+        assert_eq!(DsrCacheLifecyclePhase::HostSelfReexecBegin.raw(), 25);
+        assert_eq!(DsrCacheLifecyclePhase::HostSelfReexecEnd.raw(), 26);
+        assert_eq!(DsrCacheLifecyclePhase::HostSelfReexecProbesReady.raw(), 27);
+        assert_eq!(DsrCacheLifecyclePhase::HostSelfReexecCapsuleBegin.raw(), 28);
+        assert_eq!(DsrCacheLifecyclePhase::HostSelfReexecCapsuleEnd.raw(), 29);
+        assert_eq!(DsrCacheLifecyclePhase::HostSelfReexecRestoreBegin.raw(), 30);
+        assert_eq!(
+            DsrCacheLifecyclePhase::HostSelfReexecDispatcherReady.raw(),
+            31
+        );
+        assert_eq!(
+            DsrCacheLifecyclePhase::HostSelfReexecImageLoadBegin.raw(),
+            32
+        );
+        assert_eq!(DsrCacheLifecyclePhase::HostSelfReexecImageLoadEnd.raw(), 33);
+        assert_eq!(DsrCacheLifecyclePhase::HostSelfReexecResetBegin.raw(), 34);
+        assert_eq!(DsrCacheLifecyclePhase::HostSelfReexecResetEnd.raw(), 35);
+        assert_eq!(DsrCacheLifecyclePhase::HostSelfReexecGuestEntry.raw(), 36);
+        assert_eq!(
+            DsrCacheLifecyclePhase::HostSelfReexecPreflightBegin.raw(),
+            37
+        );
+        assert_eq!(
+            DsrCacheLifecyclePhase::HostSelfReexecCapsulePrepareBegin.raw(),
+            38
+        );
         assert_unique(&DsrCacheLifecyclePhase::ALL.map(DsrCacheLifecyclePhase::raw));
 
         assert_eq!(DsrExecMapDetailKind::Mmap.raw(), 1);
