@@ -14,9 +14,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 #[cfg(target_os = "macos")]
 use std::fs::File;
-#[cfg(target_os = "macos")]
-use std::os::fd::FromRawFd;
 use std::os::fd::RawFd;
+#[cfg(target_os = "macos")]
+use std::os::fd::{AsRawFd, FromRawFd};
 #[cfg(target_os = "macos")]
 use std::os::unix::fs::FileExt;
 
@@ -241,9 +241,43 @@ pub(crate) struct PreparedImageFileBacking {
 #[cfg(target_os = "macos")]
 pub(crate) struct ValidatedPreparedImage {
     pub(crate) file: File,
+    pub(crate) host_page_size: u64,
     pub(crate) image: AddressSpace,
     pub(crate) backings: Vec<PreparedImageFileBacking>,
     pub(crate) relocations: Vec<NativeRelativeRelocation>,
+}
+
+#[cfg(target_os = "macos")]
+impl ValidatedPreparedImage {
+    pub(crate) fn file_fd(&self) -> RawFd {
+        self.file.as_raw_fd()
+    }
+
+    pub(crate) fn host_page_size(&self) -> u64 {
+        self.host_page_size
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn validate_artifact_for_test(
+    artifact: PreparedImageArtifact,
+) -> Result<ValidatedPreparedImage, NativePreparedImageError> {
+    let mut record = artifact.record.clone();
+    let inherited = unsafe { libc::fcntl(artifact.file.as_raw_fd(), libc::F_DUPFD, 0) };
+    if inherited < 0 {
+        return Err(io_error("duplicate-test-artifact-fd"));
+    }
+    record.artifact_fd = inherited;
+    let transit_flags = record.original_host_fd_flags & !libc::FD_CLOEXEC;
+    if unsafe { libc::fcntl(inherited, libc::F_SETFD, transit_flags) } != 0 {
+        let source = std::io::Error::last_os_error();
+        unsafe { libc::close(inherited) };
+        return Err(NativePreparedImageError::Io {
+            stage: "prepare-test-artifact-fd-flags",
+            source,
+        });
+    }
+    validate_for_resume(record)
 }
 
 #[derive(Debug)]
@@ -426,10 +460,7 @@ fn prepare_with_limits(
     let mut artifact_size = 0_u64;
     let mut regions = Vec::with_capacity(image.regions().len());
     for (index, region) in image.regions().iter().enumerate() {
-        if !region.start.is_multiple_of(host_page_size)
-            || !region.end.is_multiple_of(host_page_size)
-            || region.start >= region.end
-        {
+        if !region.start.is_multiple_of(host_page_size) || region.start >= region.end {
             return Ok(ineligible_limit(
                 "region-host-page-geometry",
                 index as u64,
@@ -717,6 +748,7 @@ pub(crate) fn validate_for_resume(
         .collect();
     Ok(ValidatedPreparedImage {
         file,
+        host_page_size: record.host_page_size,
         image,
         backings,
         relocations: record.relocations,
@@ -810,7 +842,6 @@ fn validate_record(
             || PreparedGuestVa::new(end).is_none()
             || start >= end
             || !start.is_multiple_of(record.host_page_size)
-            || !end.is_multiple_of(record.host_page_size)
             || (index != 0 && start < previous_guest_end)
         {
             return Err(validation("region-guest-extent", Some(index), start));
@@ -1803,6 +1834,62 @@ mod tests {
         assert_eq!(
             native_region_copy_window(stack, Some(sp)),
             expected..stack.bytes().len()
+        );
+    }
+
+    #[test]
+    fn prepared_image_keeps_logical_4k_vvar_inside_a_16k_artifact_extent() {
+        let vvar_base = 0x20_0000_0000;
+        let vdso_base = vvar_base + HOST_PAGE_SIZE;
+        let source = AddressSpace::load_elf_bytes_with_reader_at_pie_base_without_runtime_regions(
+            &synthetic_elf(),
+            &|_| None,
+            0x400000,
+            HOST_PAGE_SIZE,
+        )
+        .expect("load subpage-vvar executable")
+        .with_vdso_bytes_at(vec![0xc0, 0x03, 0x5f, 0xd6], vvar_base, vdso_base)
+        .expect("add subpage vvar")
+        .with_linux_initial_stack_page_size(
+            [b"subpage-vvar".as_slice()],
+            std::iter::empty::<&[u8]>(),
+            HOST_PAGE_SIZE,
+        )
+        .expect("add subpage-vvar stack");
+        let artifact = match prepare(&source, &[], HOST_PAGE_SIZE).expect("prepare subpage vvar") {
+            PreparedImageDisposition::Prepared(artifact) => artifact,
+            PreparedImageDisposition::Ineligible(reason) => {
+                panic!("unexpected ineligible: {reason:?}")
+            }
+        };
+        let index = artifact
+            .record
+            .regions
+            .iter()
+            .position(|region| region.guest_start.get() == vvar_base)
+            .expect("vvar record");
+        let record = &artifact.record.regions[index];
+        assert_eq!(record.guest_end.get() - record.guest_start.get(), 0x1000);
+        assert_eq!(record.artifact_extent.get(), HOST_PAGE_SIZE);
+        let mut extent = vec![0_u8; usize::try_from(HOST_PAGE_SIZE).unwrap()];
+        artifact
+            .file
+            .read_exact_at(&mut extent, record.artifact_offset.get())
+            .expect("read vvar artifact extent");
+        assert!(extent.iter().all(|byte| *byte == 0));
+
+        let validated = validate_artifact_for_test(artifact).expect("validate subpage vvar");
+        let vvar = &validated.image.regions()[index];
+        assert_eq!((vvar.start, vvar.end), (vvar_base, vvar_base + 0x1000));
+        assert_eq!(
+            validated.backings[index].artifact_extent.get(),
+            HOST_PAGE_SIZE
+        );
+        let next = &validated.image.regions()[index + 1];
+        assert_eq!(next.start, vdso_base);
+        assert!(
+            vvar.end <= next.start,
+            "logical proc region must not inflate into padding"
         );
     }
 
