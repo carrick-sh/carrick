@@ -1031,6 +1031,11 @@ class AdditiveCpuEvidence:
     residual_share: float
     nested_translation_ns: int
     first_resolution_ns: int | None
+    thread_cpu_ns: int
+    blocked_cpu_ns: int
+    startup_cpu_ns: int
+    process_cpu_ns: int
+    helper_cpu_ns: int
 
 
 def derive_count_evidence(profile: ProfileRun, *, scope: str) -> CountEvidence:
@@ -1064,6 +1069,11 @@ def derive_count_evidence(profile: ProfileRun, *, scope: str) -> CountEvidence:
 def derive_additive_cpu_evidence(profile: ProfileRun, cpu_ns: int) -> AdditiveCpuEvidence:
     if cpu_ns <= 0:
         raise BudgetError("additive profile requires positive measured CPU time")
+    if profile.version != 2:
+        raise BudgetError(
+            "additive attribution requires NATIVEPERF v2: profile is v"
+            f"{profile.version}"
+        )
     validate_profile(profile)
     terms = tuple(
         (
@@ -1073,13 +1083,48 @@ def derive_additive_cpu_evidence(profile: ProfileRun, cpu_ns: int) -> AdditiveCp
         for frame, field, name in ON_CPU_PHASES
     )
     exclusive_sum = sum(value for _, value in terms)
-    residual = cpu_ns - exclusive_sum
-    if residual < 0:
-        raise BudgetError(
-            f"negative additive residual: cpu={cpu_ns}, exclusive={exclusive_sum}"
+    # Per-pid quantities: process_cpu is a per-flush gauge (max across a pid's
+    # thread groups, never summed — it is not a delta); startup_cpu is the
+    # validated-identical claim republished on every group of the pid;
+    # thread_cpu and blocked_cpu are additive sums across the pid's groups
+    # because each guest thread flushes its own CPU-time counters exactly
+    # once.
+    pids = sorted({thread.pid for thread in profile.threads})
+    process_cpu_by_pid: dict[int, int] = {}
+    startup_cpu_by_pid: dict[int, int] = {}
+    thread_cpu_by_pid: dict[int, int] = {}
+    blocked_cpu_by_pid: dict[int, int] = {}
+    for pid in pids:
+        pid_threads = [thread for thread in profile.threads if thread.pid == pid]
+        process_cpu_by_pid[pid] = max(
+            thread.value("process", "process_cpu_ns") for thread in pid_threads
         )
+        # validate_profile already enforces a single startup gauge per pid.
+        startup_cpu_by_pid[pid] = pid_threads[0].value("process", "startup_cpu_ns")
+        thread_cpu_by_pid[pid] = sum(
+            thread.value("core", "thread_cpu_ns") for thread in pid_threads
+        )
+        blocked_cpu_by_pid[pid] = sum(
+            thread.value("phases-b", "phase_blocked_cpu_ns") for thread in pid_threads
+        )
+    helper_cpu_by_pid: dict[int, int] = {}
+    for pid in pids:
+        helper = process_cpu_by_pid[pid] - thread_cpu_by_pid[pid]
+        if helper < 0:
+            raise BudgetError(
+                "helper CPU derivation is negative for pid "
+                f"{pid}: process_cpu={process_cpu_by_pid[pid]}, "
+                f"thread_cpu={thread_cpu_by_pid[pid]}"
+            )
+        helper_cpu_by_pid[pid] = helper
+    process_cpu_total = sum(process_cpu_by_pid.values())
+    startup_cpu_total = sum(startup_cpu_by_pid.values())
+    thread_cpu_total = sum(thread_cpu_by_pid.values())
+    blocked_cpu_total = sum(blocked_cpu_by_pid.values())
+    helper_cpu_total = sum(helper_cpu_by_pid.values())
+    residual = cpu_ns - process_cpu_total
     residual_share = residual / cpu_ns
-    if residual_share > 0.02:
+    if abs(residual_share) > 0.02:
         raise BudgetError(
             f"additive CPU reconciliation differs by more than 2%: {residual_share:.6f}"
         )
@@ -1100,6 +1145,11 @@ def derive_additive_cpu_evidence(profile: ProfileRun, cpu_ns: int) -> AdditiveCp
         # unavailable is the explicit design reconciliation: AOT cannot be
         # selected from nested translation alone.
         first_resolution_ns=None,
+        thread_cpu_ns=thread_cpu_total,
+        blocked_cpu_ns=blocked_cpu_total,
+        startup_cpu_ns=startup_cpu_total,
+        process_cpu_ns=process_cpu_total,
+        helper_cpu_ns=helper_cpu_total,
     )
 
 
@@ -1961,41 +2011,41 @@ def analyze(records: Sequence[RunRecord]) -> DecisionRecord:
             dict(evidence.exclusive_terms_ns)["syscall-dispatch"] for evidence in additive
         )
         duration_shares["syscall-dispatch"] = syscall_ns / untraced_cpu
+        # blocked-cpu/startup-cpu/helper-cpu are measured per-run CPU
+        # attribution terms (Task 2), sharing untraced CPU as their single
+        # denominator with syscall-dispatch.  The old wall-based
+        # blocked-residual rung (blocked wall / untraced wall) is retired:
+        # blocked_ns stays available on AdditiveCpuEvidence as a diagnostic
+        # only, never as a decision input.
+        duration_shares["blocked-cpu"] = (
+            statistics.median(evidence.blocked_cpu_ns for evidence in additive) / untraced_cpu
+        )
+        duration_shares["startup-cpu"] = (
+            statistics.median(evidence.startup_cpu_ns for evidence in additive) / untraced_cpu
+        )
+        duration_shares["helper-cpu"] = (
+            statistics.median(evidence.helper_cpu_ns for evidence in additive) / untraced_cpu
+        )
         if any(value < 0 or value > 1 for value in duration_shares.values()):
             raise BudgetError("duration evidence does not reconcile to untraced CPU")
-        if duration_shares["syscall-dispatch"] >= 0.30:
-            return DecisionRecord(
-                RESULT_SCHEMA,
-                "decision",
-                "syscall-dispatch",
-                duration_shares["syscall-dispatch"],
-                "low-tax-exclusive-profile-duration-over-untraced-cpu",
-                "process-cpu",
-                tuple(record.run_id for record in abba),
-                profile_tax,
-                True,
-            )
-        blocked_ns = statistics.median(evidence.blocked_ns for evidence in additive)
-        # Aggregated thread blocked time can exceed process wall; the trigger
-        # saturates at 1.0 rather than pretending to be a partition share, and
-        # the basis names the saturation so 1.0 is never ambiguous.
-        blocked_ratio = blocked_ns / off_wall
-        blocked_share = min(blocked_ratio, 1.0)
-        if blocked_share >= 0.30:
-            basis = "low-tax-blocked-off-cpu-over-untraced-wall"
-            if blocked_ratio > 1.0:
-                basis += "-saturated"
-            return DecisionRecord(
-                RESULT_SCHEMA,
-                "decision",
-                "blocked-residual",
-                blocked_share,
-                basis,
-                "process-wall",
-                tuple(record.run_id for record in abba),
-                profile_tax,
-                True,
-            )
+        for name, basis in (
+            ("syscall-dispatch", "low-tax-exclusive-profile-duration-over-untraced-cpu"),
+            ("blocked-cpu", "low-tax-measured-cpu-attribution-over-untraced-cpu"),
+            ("startup-cpu", "low-tax-measured-cpu-attribution-over-untraced-cpu"),
+            ("helper-cpu", "low-tax-measured-cpu-attribution-over-untraced-cpu"),
+        ):
+            if duration_shares[name] >= 0.30:
+                return DecisionRecord(
+                    RESULT_SCHEMA,
+                    "decision",
+                    name,
+                    duration_shares[name],
+                    basis,
+                    "process-cpu",
+                    tuple(record.run_id for record in abba),
+                    profile_tax,
+                    True,
+                )
 
     # Two-term fallback is evaluated within one denominator only.  Count and
     # CPU fractions are never added to one another.
