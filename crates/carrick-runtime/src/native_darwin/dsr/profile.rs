@@ -1,5 +1,6 @@
 use std::fmt::Write as _;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use super::types::SensitiveKind;
 
@@ -198,6 +199,12 @@ pub(in crate::native_darwin) enum ProfileError {
     PhaseMismatch(&'static str),
     #[error("profile protocol frame exceeds the atomic transport bound")]
     FrameTooLarge,
+    #[error("profile blocked CPU time exceeds blocked wall time")]
+    BlockedCpuExceedsWall,
+    #[error("per-thread CPU usage is unavailable")]
+    ThreadUsageUnavailable,
+    #[error("process CPU usage is unavailable")]
+    ProcessUsageUnavailable,
 }
 
 impl ProfileError {
@@ -213,6 +220,9 @@ impl ProfileError {
             Self::TimeOverlap => "time-overlap",
             Self::PhaseMismatch(_) => "phase-mismatch",
             Self::FrameTooLarge => "frame-too-large",
+            Self::BlockedCpuExceedsWall => "blocked-cpu-exceeds-wall",
+            Self::ThreadUsageUnavailable => "thread-usage-unavailable",
+            Self::ProcessUsageUnavailable => "process-usage-unavailable",
         }
     }
 }
@@ -294,6 +304,274 @@ fn elapsed_ns_from_ticks(
     u64::try_from(ns).map_err(|_| ProfileError::TimeOverflow)
 }
 
+/// Total CPU (user + system) consumed by the CALLING thread, in nanoseconds.
+/// Reads the host kernel's own per-thread accounting through the existing
+/// `host_proc` helper (`thread_info(THREAD_BASIC_INFO)` on macOS); the µs
+/// resolution of that interface is the measurement quantum for every consumer
+/// in this file.
+pub(in crate::native_darwin) fn current_thread_cpu_total_ns() -> Result<u64, ProfileError> {
+    let (user_us, system_us) =
+        crate::host_proc::self_thread_cpu_us().ok_or(ProfileError::ThreadUsageUnavailable)?;
+    user_us
+        .checked_add(system_us)
+        .and_then(|total_us| total_us.checked_mul(1_000))
+        .ok_or(ProfileError::TimeOverflow)
+}
+
+/// Total CPU (user + system) consumed by THIS PROCESS, in nanoseconds, from
+/// `getrusage(RUSAGE_SELF)`. Fork restarts this clock in the child; execve
+/// preserves it — both facts are load-bearing for the startup gauge below.
+pub(in crate::native_darwin) fn process_cpu_total_ns() -> Result<u64, ProfileError> {
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    // SAFETY: getrusage(RUSAGE_SELF) fills `usage` for this process; a zeroed
+    // rusage is a valid out-buffer.
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } != 0 {
+        return Err(ProfileError::ProcessUsageUnavailable);
+    }
+    let timeval_ns = |tv: libc::timeval| -> Option<u64> {
+        u64::try_from(tv.tv_sec)
+            .ok()?
+            .checked_mul(1_000_000_000)?
+            .checked_add(u64::try_from(tv.tv_usec).ok()?.checked_mul(1_000)?)
+    };
+    timeval_ns(usage.ru_utime)
+        .zip(timeval_ns(usage.ru_stime))
+        .and_then(|(user_ns, system_ns)| user_ns.checked_add(system_ns))
+        .ok_or(ProfileError::TimeOverflow)
+}
+
+const STARTUP_UNARMED: u8 = 0;
+const STARTUP_ARMED: u8 = 1;
+const STARTUP_CLAIMING: u8 = 2;
+const STARTUP_CLAIMED: u8 = 3;
+
+/// One-per-process startup attribution window: from process runtime entry
+/// (armed at bring-up) to the first gateway entry of any guest thread
+/// (claimed exactly once). After the claim the pair is a GAUGE — every reader
+/// observes the identical values, and every thread group of the pid repeats
+/// them verbatim in its `process` frame.
+///
+/// Lock-free by design (no new locks solely to record a metric): a four-state
+/// atomic word serializes the single claim; the `CLAIMING` window covers two
+/// relaxed stores and is bridged with `spin_loop`.
+pub(super) struct StartupGauge {
+    state: AtomicU8,
+    entry_ticks: AtomicU64,
+    entry_cpu_ns: AtomicU64,
+    startup_wall_ns: AtomicU64,
+    startup_cpu_ns: AtomicU64,
+}
+
+impl StartupGauge {
+    pub(super) const fn new() -> Self {
+        Self {
+            state: AtomicU8::new(STARTUP_UNARMED),
+            entry_ticks: AtomicU64::new(0),
+            entry_cpu_ns: AtomicU64::new(0),
+            startup_wall_ns: AtomicU64::new(0),
+            startup_cpu_ns: AtomicU64::new(0),
+        }
+    }
+
+    /// Record the process runtime entry baseline. The first arm wins: the
+    /// startup window is anchored at the earliest runtime entry of this
+    /// process image, and re-anchoring after a claim would fork the gauge.
+    pub(super) fn arm(&self, entry_ticks: u64, entry_cpu_ns: u64) {
+        if self
+            .state
+            .compare_exchange(
+                STARTUP_UNARMED,
+                STARTUP_CLAIMING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            self.entry_ticks.store(entry_ticks, Ordering::Relaxed);
+            self.entry_cpu_ns.store(entry_cpu_ns, Ordering::Relaxed);
+            self.state.store(STARTUP_ARMED, Ordering::Release);
+        }
+    }
+
+    /// Fork-child reset: the inherited claim describes the parent's startup,
+    /// and the child's `getrusage(RUSAGE_SELF)` clock restarts at zero (an
+    /// inherited CPU baseline would underflow). Restart the window at the
+    /// fork boundary. Runs on the single surviving post-fork thread.
+    pub(super) fn rearm(&self, entry_ticks: u64, entry_cpu_ns: u64) {
+        self.state.store(STARTUP_CLAIMING, Ordering::Release);
+        self.entry_ticks.store(entry_ticks, Ordering::Relaxed);
+        self.entry_cpu_ns.store(entry_cpu_ns, Ordering::Relaxed);
+        self.startup_wall_ns.store(0, Ordering::Relaxed);
+        self.startup_cpu_ns.store(0, Ordering::Relaxed);
+        self.state.store(STARTUP_ARMED, Ordering::Release);
+    }
+
+    /// Republish a claim produced by the pre-exec image of the SAME pid (the
+    /// host self-reexec transport): the pid's startup was already captured
+    /// exactly once, so the post-exec image repeats it verbatim rather than
+    /// measuring a second window under one pid.
+    pub(super) fn seed(&self, startup_wall_ns: u64, startup_cpu_ns: u64) {
+        self.state.store(STARTUP_CLAIMING, Ordering::Release);
+        self.startup_wall_ns
+            .store(startup_wall_ns, Ordering::Relaxed);
+        self.startup_cpu_ns.store(startup_cpu_ns, Ordering::Relaxed);
+        self.state.store(STARTUP_CLAIMED, Ordering::Release);
+    }
+
+    pub(super) fn is_claimed(&self) -> bool {
+        self.state.load(Ordering::Acquire) == STARTUP_CLAIMED
+    }
+
+    pub(super) fn claimed(&self) -> Option<(u64, u64)> {
+        self.is_claimed().then(|| {
+            (
+                self.startup_wall_ns.load(Ordering::Relaxed),
+                self.startup_cpu_ns.load(Ordering::Relaxed),
+            )
+        })
+    }
+
+    /// Claim the startup window exactly once. Racing claimers and post-claim
+    /// readers all observe the identical winning pair. An unarmed gauge
+    /// (direct harness use without a bring-up mark) claims a zero-width
+    /// window so every group still repeats one identical gauge.
+    pub(super) fn claim(
+        &self,
+        now_ticks: u64,
+        cpu_now_ns: u64,
+    ) -> Result<(u64, u64), ProfileError> {
+        loop {
+            match self.state.load(Ordering::Acquire) {
+                STARTUP_CLAIMED => {
+                    return Ok((
+                        self.startup_wall_ns.load(Ordering::Relaxed),
+                        self.startup_cpu_ns.load(Ordering::Relaxed),
+                    ));
+                }
+                STARTUP_ARMED => {
+                    // Compute the candidate BEFORE the state transition so an
+                    // error can never strand the gauge in `CLAIMING`.
+                    let entry_ticks = self.entry_ticks.load(Ordering::Acquire);
+                    let entry_cpu_ns = self.entry_cpu_ns.load(Ordering::Acquire);
+                    let wall_ns = elapsed_ns_from_ticks(entry_ticks, now_ticks, timebase())?;
+                    let cpu_ns = cpu_now_ns
+                        .checked_sub(entry_cpu_ns)
+                        .ok_or(ProfileError::CounterUnderflow("startup_cpu_ns"))?;
+                    if self
+                        .state
+                        .compare_exchange(
+                            STARTUP_ARMED,
+                            STARTUP_CLAIMING,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        self.startup_wall_ns.store(wall_ns, Ordering::Relaxed);
+                        self.startup_cpu_ns.store(cpu_ns, Ordering::Relaxed);
+                        self.state.store(STARTUP_CLAIMED, Ordering::Release);
+                        return Ok((wall_ns, cpu_ns));
+                    }
+                }
+                STARTUP_UNARMED => {
+                    if self
+                        .state
+                        .compare_exchange(
+                            STARTUP_UNARMED,
+                            STARTUP_CLAIMING,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        self.startup_wall_ns.store(0, Ordering::Relaxed);
+                        self.startup_cpu_ns.store(0, Ordering::Relaxed);
+                        self.state.store(STARTUP_CLAIMED, Ordering::Release);
+                        return Ok((0, 0));
+                    }
+                }
+                _ => std::hint::spin_loop(),
+            }
+        }
+    }
+}
+
+static PROCESS_STARTUP: StartupGauge = StartupGauge::new();
+
+/// Anchor the process startup window at native runtime entry. Environment
+/// gated: a profile-off run performs no timer or usage reads here.
+pub(in crate::native_darwin) fn mark_native_process_runtime_entry() {
+    if std::env::var_os("CARRICK_DSR_PROFILE").is_none() {
+        return;
+    }
+    let entry_ticks = monotonic_ticks();
+    let Ok(entry_cpu_ns) = process_cpu_total_ns() else {
+        // Leave the gauge unarmed: flushes then claim a visibly zero-width
+        // window instead of publishing an unbaselined measurement.
+        return;
+    };
+    PROCESS_STARTUP.arm(entry_ticks, entry_cpu_ns);
+}
+
+/// Fork-child reset for the process startup gauge (see [`StartupGauge::rearm`]).
+/// Callers gate on profiling being enabled.
+pub(super) fn reset_process_startup_after_fork_child() {
+    let entry_ticks = monotonic_ticks();
+    let entry_cpu_ns = process_cpu_total_ns().unwrap_or(0);
+    PROCESS_STARTUP.rearm(entry_ticks, entry_cpu_ns);
+}
+
+/// Republish a pre-exec claim across the host self-reexec (same pid).
+pub(in crate::native_darwin) fn seed_claimed_process_startup(
+    startup_wall_ns: u64,
+    startup_cpu_ns: u64,
+) {
+    PROCESS_STARTUP.seed(startup_wall_ns, startup_cpu_ns);
+}
+
+/// The claimed startup gauge, if the process has one (transported through the
+/// self-reexec capsule so one pid never publishes two startup windows).
+pub(in crate::native_darwin) fn claimed_process_startup() -> Option<(u64, u64)> {
+    PROCESS_STARTUP.claimed()
+}
+
+/// Claim the process startup window at a gateway entry. Cheap once claimed:
+/// a single acquire load guards the usage/timer reads.
+pub(super) fn claim_process_startup() -> Result<(), ProfileError> {
+    if PROCESS_STARTUP.is_claimed() {
+        return Ok(());
+    }
+    let now_ticks = monotonic_ticks();
+    let cpu_now_ns = process_cpu_total_ns()?;
+    PROCESS_STARTUP.claim(now_ticks, cpu_now_ns).map(|_| ())
+}
+
+/// Point-in-time gauges sampled at one thread's profile flush: this thread's
+/// total CPU, the process-wide CPU, and the once-claimed startup window.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct FlushGauges {
+    pub(super) thread_cpu_ns: u64,
+    pub(super) startup_wall_ns: u64,
+    pub(super) startup_cpu_ns: u64,
+    pub(super) process_cpu_ns: u64,
+}
+
+/// Sample the flush-moment gauges for one thread group. Claims the startup
+/// window if no gateway entry has (a flush before first guest entry ends the
+/// window at the flush).
+pub(super) fn flush_gauges() -> Result<FlushGauges, ProfileError> {
+    let thread_cpu_ns = current_thread_cpu_total_ns()?;
+    let process_cpu_ns = process_cpu_total_ns()?;
+    let (startup_wall_ns, startup_cpu_ns) =
+        PROCESS_STARTUP.claim(monotonic_ticks(), process_cpu_ns)?;
+    Ok(FlushGauges {
+        thread_cpu_ns,
+        startup_wall_ns,
+        startup_cpu_ns,
+        process_cpu_ns,
+    })
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct CompleteThreadRecord {
     pub(super) pid: libc::pid_t,
@@ -305,14 +583,15 @@ pub(super) struct CompleteThreadRecord {
     sensitive: [u64; SensitiveClass::COUNT],
     phase_ns: [u64; Phase::COUNT],
     phase_counts: [u64; Phase::COUNT],
+    blocked_cpu_ns: u64,
 }
 
 impl CompleteThreadRecord {
-    pub(super) fn to_protocol_line(&self) -> String {
+    pub(super) fn to_protocol_line(&self, thread_cpu_ns: u64) -> String {
         let mut line = self.frame_header("core");
         let _ = write!(
             line,
-            "|gateway_entries={}|reconciled_exits={}|overflowed=0",
+            "|gateway_entries={}|reconciled_exits={}|overflowed=0|thread_cpu_ns={thread_cpu_ns}",
             self.gateway_entries, self.reconciled_exits
         );
         line
@@ -328,8 +607,9 @@ impl CompleteThreadRecord {
     pub(super) fn to_protocol_frames_with_resolver(
         &self,
         resolver: super::ProfileSnapshot,
+        gauges: FlushGauges,
     ) -> Result<Vec<String>, ProfileError> {
-        let mut frames = vec![self.to_protocol_line()];
+        let mut frames = vec![self.to_protocol_line(gauges.thread_cpu_ns)];
         let mut exits = self.frame_header("exits");
         for class in ExitClass::ALL {
             let _ = write!(
@@ -364,6 +644,9 @@ impl CompleteThreadRecord {
                     phase.field_name(),
                     self.phase_counts[phase.index()]
                 );
+            }
+            if name == "phases-b" {
+                let _ = write!(frame, "|phase_blocked_cpu_ns={}", self.blocked_cpu_ns);
             }
             frames.push(frame);
         }
@@ -408,6 +691,17 @@ impl CompleteThreadRecord {
             resolver.cache_used_bytes, resolver.cache_capacity_bytes
         );
         frames.push(cache);
+        // Process attribution gauges: the once-claimed startup window repeats
+        // identically on every thread group of this pid; process_cpu_ns is a
+        // point-in-time gauge at THIS thread's flush (like cache-gauge, never
+        // a delta — readers take the per-pid max).
+        let mut process_gauges = self.frame_header("process");
+        let _ = write!(
+            process_gauges,
+            "|startup_wall_ns={}|startup_cpu_ns={}|process_cpu_ns={}",
+            gauges.startup_wall_ns, gauges.startup_cpu_ns, gauges.process_cpu_ns
+        );
+        frames.push(process_gauges);
         if frames.iter().any(|frame| {
             frame
                 .len()
@@ -464,6 +758,7 @@ pub(super) struct ThreadBudget {
     sensitive: [u64; SensitiveClass::COUNT],
     phase_ns: [u64; Phase::COUNT],
     phase_counts: [u64; Phase::COUNT],
+    blocked_cpu_ns: u64,
     invalid: Option<ProfileError>,
 }
 
@@ -488,6 +783,7 @@ impl ThreadBudget {
             sensitive: [0; SensitiveClass::COUNT],
             phase_ns: [0; Phase::COUNT],
             phase_counts: [0; Phase::COUNT],
+            blocked_cpu_ns: 0,
             invalid: None,
         }
     }
@@ -557,6 +853,23 @@ impl ThreadBudget {
         }
     }
 
+    /// Accumulate thread CPU consumed inside one blocked wait segment. The
+    /// caller measures the segment (two per-thread usage reads around the
+    /// wait closure) and the aggregate must never exceed the blocked wall
+    /// phase — `complete_record` enforces that invariant.
+    pub(super) fn add_blocked_cpu_ns(&mut self, elapsed_ns: u64) -> Result<(), ProfileError> {
+        if !self.enabled {
+            return Ok(());
+        }
+        match self.blocked_cpu_ns.checked_add(elapsed_ns) {
+            Some(value) => {
+                self.blocked_cpu_ns = value;
+                Ok(())
+            }
+            None => Err(self.invalidate(ProfileError::CounterOverflow("blocked_cpu_ns"))),
+        }
+    }
+
     pub(super) fn complete_record(&self) -> Result<CompleteThreadRecord, ProfileError> {
         if let Some(error) = self.invalid {
             return Err(error);
@@ -606,6 +919,9 @@ impl ThreadBudget {
                 return Err(ProfileError::PhaseMismatch("sensitive-emulation"));
             }
         }
+        if self.blocked_cpu_ns > self.phase_ns[Phase::Blocked.index()] {
+            return Err(ProfileError::BlockedCpuExceedsWall);
+        }
         Ok(CompleteThreadRecord {
             pid: self.pid,
             tid: self.tid,
@@ -616,6 +932,7 @@ impl ThreadBudget {
             sensitive: self.sensitive,
             phase_ns: self.phase_ns,
             phase_counts: self.phase_counts,
+            blocked_cpu_ns: self.blocked_cpu_ns,
         })
     }
 
@@ -698,8 +1015,148 @@ mod tests {
         let record = budget.complete_record().expect("reconciled record");
         assert_eq!(record.gateway_entries, ExitClass::ALL.len() as u64);
         assert_eq!(record.reconciled_exits, record.gateway_entries);
-        assert!(record.to_protocol_line().starts_with("NATIVEPERF1|thread|"));
-        assert!(record.to_protocol_line().contains("complete=1"));
+        assert!(
+            record
+                .to_protocol_line(0)
+                .starts_with("NATIVEPERF1|thread|")
+        );
+        assert!(record.to_protocol_line(0).contains("complete=1"));
+        assert!(record.to_protocol_line(7).contains("|thread_cpu_ns=7"));
+    }
+
+    fn syscall_phase_budget(blocked_wall_ns: u64) -> ThreadBudget {
+        let mut budget = ThreadBudget::enabled_for_test(41, 42);
+        budget.record_exit(ExitClass::Syscall).expect("count exit");
+        for phase in [
+            Phase::PrepareIndex,
+            Phase::TranslatedRun,
+            Phase::FinishExit,
+            Phase::LoopQuiesce,
+            Phase::SyscallDispatch,
+        ] {
+            budget.add_phase(phase, 0).expect("count phase");
+        }
+        budget
+            .add_phase(Phase::Blocked, blocked_wall_ns)
+            .expect("count blocked wall");
+        budget
+    }
+
+    #[test]
+    fn blocked_cpu_exceeding_blocked_wall_invalidates_the_record() {
+        let mut budget = syscall_phase_budget(10);
+        budget
+            .add_blocked_cpu_ns(11)
+            .expect("accumulate blocked cpu");
+        assert!(matches!(
+            budget.complete_record(),
+            Err(ProfileError::BlockedCpuExceedsWall)
+        ));
+    }
+
+    #[test]
+    fn blocked_cpu_within_blocked_wall_reaches_the_phases_frame() {
+        let mut budget = syscall_phase_budget(10);
+        budget
+            .add_blocked_cpu_ns(7)
+            .expect("accumulate blocked cpu");
+        let record = budget.complete_record().expect("reconciled record");
+        let frames = record
+            .to_protocol_frames_with_resolver(
+                super::super::ProfileSnapshot::default(),
+                FlushGauges::default(),
+            )
+            .expect("bounded frames");
+        let phases_b = frames
+            .iter()
+            .find(|frame| frame.contains("|frame=phases-b|"))
+            .expect("phases-b frame");
+        assert!(phases_b.contains("|phase_blocked_ns=10|"));
+        assert!(phases_b.contains("|phase_blocked_cpu_ns=7"));
+    }
+
+    #[test]
+    fn process_frame_repeats_startup_and_process_gauges() {
+        let budget = ThreadBudget::enabled_for_test(41, 42);
+        let record = budget.complete_record().expect("empty record");
+        let frames = record
+            .to_protocol_frames_with_resolver(
+                super::super::ProfileSnapshot::default(),
+                FlushGauges {
+                    thread_cpu_ns: 5,
+                    startup_wall_ns: 9,
+                    startup_cpu_ns: 3,
+                    process_cpu_ns: 8,
+                },
+            )
+            .expect("bounded frames");
+        assert_eq!(frames.len(), 10);
+        assert!(frames[0].contains("|frame=core|"));
+        assert!(frames[0].contains("|thread_cpu_ns=5"));
+        let process = frames
+            .iter()
+            .find(|frame| frame.contains("|frame=process|"))
+            .expect("process frame");
+        assert!(process.contains("|startup_wall_ns=9|startup_cpu_ns=3|process_cpu_ns=8"));
+    }
+
+    #[test]
+    fn startup_gauge_claims_exactly_once_and_repeats_identically() {
+        let gauge = StartupGauge::new();
+        gauge.arm(1_000, 500);
+        let first = gauge.claim(51_000, 800).expect("first claim");
+        assert_eq!(first.1, 300);
+        assert_eq!(
+            first.0,
+            elapsed_ns_from_ticks(1_000, 51_000, timebase()).expect("tick conversion")
+        );
+        // Later claims repeat the first claim verbatim: the startup window is
+        // captured exactly once per process and republished as a gauge.
+        assert_eq!(gauge.claim(999_000, 9_999).expect("repeat claim"), first);
+        assert_eq!(gauge.claimed(), Some(first));
+    }
+
+    #[test]
+    fn startup_gauge_concurrent_claims_agree() {
+        let gauge = StartupGauge::new();
+        gauge.arm(0, 0);
+        let claims = std::thread::scope(|scope| {
+            let gauge = &gauge;
+            (1..=8_u64)
+                .map(|index| {
+                    scope.spawn(move || gauge.claim(index * 1_000, index * 10).expect("claim"))
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|handle| handle.join().expect("join claimer"))
+                .collect::<Vec<_>>()
+        });
+        assert!(claims.windows(2).all(|pair| pair[0] == pair[1]));
+    }
+
+    #[test]
+    fn startup_gauge_unarmed_claim_is_zero_and_fork_rearm_restarts_the_window() {
+        let gauge = StartupGauge::new();
+        assert_eq!(gauge.claimed(), None);
+        assert_eq!(gauge.claim(123, 456).expect("unarmed claim"), (0, 0));
+        // A fork child discards the inherited claim: its rusage restarts at
+        // zero, so the startup window restarts at the fork boundary.
+        gauge.rearm(10_000, 100);
+        assert_eq!(gauge.claimed(), None);
+        let claimed = gauge.claim(10_000, 400).expect("re-claim after fork");
+        assert_eq!(claimed, (0, 300));
+    }
+
+    #[test]
+    fn startup_gauge_seed_republishes_the_producer_claim() {
+        let gauge = StartupGauge::new();
+        gauge.seed(77, 33);
+        assert_eq!(gauge.claimed(), Some((77, 33)));
+        // The seeded gauge wins over any later measurement input.
+        assert_eq!(
+            gauge.claim(999_999, 999_999).expect("seeded claim"),
+            (77, 33)
+        );
     }
 
     #[test]
@@ -746,31 +1203,52 @@ mod tests {
 
     #[test]
     fn complete_records_use_pipe_atomic_bounded_frames() {
-        let budget = ThreadBudget::enabled_for_test(41, 42);
-        let record = budget.complete_record().expect("empty complete record");
+        // Worst-case identity and counter widths: every field at its maximum
+        // decimal width must still fit one atomic PIPE_BUF write per frame.
+        let record = CompleteThreadRecord {
+            pid: libc::pid_t::MIN,
+            tid: i32::MIN,
+            era: u64::MAX,
+            gateway_entries: u64::MAX,
+            reconciled_exits: u64::MAX,
+            exits: [u64::MAX; ExitClass::COUNT],
+            sensitive: [u64::MAX; SensitiveClass::COUNT],
+            phase_ns: [u64::MAX; Phase::COUNT],
+            phase_counts: [u64::MAX; Phase::COUNT],
+            blocked_cpu_ns: u64::MAX,
+        };
+        let gauges = FlushGauges {
+            thread_cpu_ns: u64::MAX,
+            startup_wall_ns: u64::MAX,
+            startup_cpu_ns: u64::MAX,
+            process_cpu_ns: u64::MAX,
+        };
         let frames = record
-            .to_protocol_frames_with_resolver(super::super::ProfileSnapshot {
-                resolver_exits: u64::MAX,
-                one_entry_hits: u64::MAX,
-                translations: u64::MAX,
-                duplicate_publications: u64::MAX,
-                gateway_entries: u64::MAX,
-                syscall_exits: u64::MAX,
-                direct_resolver_exits: u64::MAX,
-                cache_lookups: u64::MAX,
-                cache_lookup_hits: u64::MAX,
-                invalidated_blocks: u64::MAX,
-                translation_ns: u64::MAX,
-                translation_decode_ns: u64::MAX,
-                translation_plan_ns: u64::MAX,
-                translation_emit_ns: u64::MAX,
-                translation_publication_ns: u64::MAX,
-                nested_translation_ns: u64::MAX,
-                cache_used_bytes: usize::MAX,
-                cache_capacity_bytes: usize::MAX,
-            })
+            .to_protocol_frames_with_resolver(
+                super::super::ProfileSnapshot {
+                    resolver_exits: u64::MAX,
+                    one_entry_hits: u64::MAX,
+                    translations: u64::MAX,
+                    duplicate_publications: u64::MAX,
+                    gateway_entries: u64::MAX,
+                    syscall_exits: u64::MAX,
+                    direct_resolver_exits: u64::MAX,
+                    cache_lookups: u64::MAX,
+                    cache_lookup_hits: u64::MAX,
+                    invalidated_blocks: u64::MAX,
+                    translation_ns: u64::MAX,
+                    translation_decode_ns: u64::MAX,
+                    translation_plan_ns: u64::MAX,
+                    translation_emit_ns: u64::MAX,
+                    translation_publication_ns: u64::MAX,
+                    nested_translation_ns: u64::MAX,
+                    cache_used_bytes: usize::MAX,
+                    cache_capacity_bytes: usize::MAX,
+                },
+                gauges,
+            )
             .expect("bounded frames");
-        assert!(frames.len() > 1);
+        assert_eq!(frames.len(), 10);
         for frame in frames {
             let transport_len = frame.len().checked_add(1).expect("newline length");
             assert!(
@@ -800,7 +1278,10 @@ mod tests {
                     let budget = ThreadBudget::enabled_for_test(41, tid);
                     let record = budget.complete_record().expect("empty complete record");
                     let frames = record
-                        .to_protocol_frames_with_resolver(super::super::ProfileSnapshot::default())
+                        .to_protocol_frames_with_resolver(
+                            super::super::ProfileSnapshot::default(),
+                            FlushGauges::default(),
+                        )
                         .expect("bounded frames");
                     write_protocol_frames_to_fd(write_fd, &frames).expect("write frames");
                     frames.len()

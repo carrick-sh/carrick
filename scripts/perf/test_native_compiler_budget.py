@@ -512,6 +512,29 @@ def nativeperf_frames(pid=10, tid=11, era=12):
     ]
 
 
+def nativeperf_frames_v2(
+    pid=10,
+    tid=11,
+    era=12,
+    *,
+    thread_cpu_ns=30,
+    blocked_cpu_ns=0,
+    startup_wall_ns=100,
+    startup_cpu_ns=40,
+    process_cpu_ns=90,
+):
+    prefix = f"NATIVEPERF1|thread|complete=1|pid={pid}|tid={tid}|era={era}|frame="
+    lines = nativeperf_frames(pid=pid, tid=tid, era=era)
+    lines[0] += f"|thread_cpu_ns={thread_cpu_ns}"
+    lines[4] += f"|phase_blocked_cpu_ns={blocked_cpu_ns}"
+    lines.append(
+        prefix
+        + f"process|startup_wall_ns={startup_wall_ns}|startup_cpu_ns={startup_cpu_ns}|"
+        f"process_cpu_ns={process_cpu_ns}"
+    )
+    return lines
+
+
 class NativePerfTests(unittest.TestCase):
     def test_profile_requires_complete_unique_nine_frame_groups(self):
         profile = budget.parse_nativeperf(nativeperf_frames())
@@ -609,6 +632,128 @@ class NativePerfTests(unittest.TestCase):
         duplicate[0] += "|gateway_entries=2"
         with self.assertRaisesRegex(budget.BudgetError, "duplicate protocol field"):
             budget.parse_nativeperf(duplicate)
+
+
+class NativePerfV2Tests(unittest.TestCase):
+    def test_v1_and_v2_profiles_parse_with_typed_versions(self):
+        v1 = budget.parse_nativeperf(nativeperf_frames())
+        budget.validate_profile(v1)
+        self.assertEqual(v1.version, 1)
+        self.assertEqual(v1.threads[0].frames, frozenset(FRAME_NAMES))
+        v2 = budget.parse_nativeperf(nativeperf_frames_v2())
+        budget.validate_profile(v2)
+        self.assertEqual(v2.version, 2)
+        self.assertEqual(v2.threads[0].frames, frozenset(FRAME_NAMES + ("process",)))
+        self.assertEqual(v2.threads[0].value("core", "thread_cpu_ns"), 30)
+        self.assertEqual(v2.threads[0].value("phases-b", "phase_blocked_cpu_ns"), 0)
+        self.assertEqual(v2.threads[0].value("process", "startup_wall_ns"), 100)
+        self.assertEqual(v2.threads[0].value("process", "startup_cpu_ns"), 40)
+        self.assertEqual(v2.threads[0].value("process", "process_cpu_ns"), 90)
+
+    def test_mixed_version_groups_are_rejected(self):
+        lines = nativeperf_frames(pid=10) + nativeperf_frames_v2(pid=20)
+        with self.assertRaisesRegex(budget.BudgetError, "mixed"):
+            budget.parse_nativeperf(lines)
+
+    def test_mixed_version_frames_within_a_group_are_rejected(self):
+        lines = nativeperf_frames()
+        lines[0] += "|thread_cpu_ns=30"
+        with self.assertRaisesRegex(budget.BudgetError, "mixed"):
+            budget.parse_nativeperf(lines)
+
+    def test_v1_group_with_process_frame_is_rejected(self):
+        lines = nativeperf_frames()
+        lines.append(
+            "NATIVEPERF1|thread|complete=1|pid=10|tid=11|era=12|frame=process|"
+            "startup_wall_ns=1|startup_cpu_ns=1|process_cpu_ns=2"
+        )
+        with self.assertRaisesRegex(budget.BudgetError, "mixed"):
+            budget.parse_nativeperf(lines)
+
+    def test_v2_group_requires_the_process_frame(self):
+        lines = nativeperf_frames_v2()[:-1]
+        with self.assertRaisesRegex(budget.BudgetError, "missing profile frames.*process"):
+            budget.parse_nativeperf(lines)
+
+    def test_v2_rejects_unknown_or_missing_process_fields(self):
+        unknown = nativeperf_frames_v2()
+        unknown[-1] += "|surprise=1"
+        with self.assertRaisesRegex(budget.BudgetError, "unknown field.*process"):
+            budget.parse_nativeperf(unknown)
+        missing = nativeperf_frames_v2()
+        missing[-1] = missing[-1].replace("|process_cpu_ns=90", "")
+        with self.assertRaisesRegex(budget.BudgetError, "missing field.*process"):
+            budget.parse_nativeperf(missing)
+
+    def test_v2_blocked_cpu_cannot_exceed_blocked_wall(self):
+        profile = budget.parse_nativeperf(nativeperf_frames_v2(blocked_cpu_ns=1))
+        with self.assertRaisesRegex(budget.BudgetError, "blocked CPU"):
+            budget.validate_profile(profile)
+
+    def test_v2_startup_cpu_cannot_exceed_process_cpu(self):
+        profile = budget.parse_nativeperf(
+            nativeperf_frames_v2(startup_cpu_ns=91, process_cpu_ns=90)
+        )
+        with self.assertRaisesRegex(budget.BudgetError, "startup CPU"):
+            budget.validate_profile(profile)
+
+    def test_v2_startup_gauge_must_repeat_identically_across_a_pid(self):
+        same_pid = nativeperf_frames_v2(tid=11) + nativeperf_frames_v2(
+            tid=12, process_cpu_ns=95
+        )
+        # Same pid, differing per-flush process_cpu_ns gauges: allowed (it is
+        # a point-in-time gauge, not required to be monotonic or identical).
+        budget.validate_profile(budget.parse_nativeperf(same_pid))
+        drifting = nativeperf_frames_v2(tid=11) + nativeperf_frames_v2(
+            tid=12, startup_wall_ns=101
+        )
+        with self.assertRaisesRegex(budget.BudgetError, "startup gauge"):
+            budget.validate_profile(budget.parse_nativeperf(drifting))
+        other_pid = nativeperf_frames_v2(pid=10) + nativeperf_frames_v2(
+            pid=20, startup_wall_ns=101
+        )
+        # Distinct pids own distinct startup windows.
+        budget.validate_profile(budget.parse_nativeperf(other_pid))
+
+    def test_v2_wire_round_trips_with_exact_key_sets(self):
+        profile = budget.parse_nativeperf(nativeperf_frames_v2())
+        record = budget.RunRecord.synthetic(profile=profile, schedule_label="on-1")
+        encoded = budget.run_record_json(record)
+        decoded = budget.parse_result_row(encoded)
+        self.assertEqual(decoded.profile, profile)
+        self.assertEqual(decoded.profile.version, 2)
+        extra = json.loads(json.dumps(encoded))
+        extra["profile"]["threads"][0]["values"]["process.invented"] = 1
+        with self.assertRaisesRegex(budget.BudgetError, "profile value"):
+            budget.parse_result_row(extra)
+        missing = json.loads(json.dumps(encoded))
+        del missing["profile"]["threads"][0]["values"]["process.startup_wall_ns"]
+        with self.assertRaisesRegex(budget.BudgetError, "profile value"):
+            budget.parse_result_row(missing)
+        torn = json.loads(json.dumps(encoded))
+        torn["profile"]["threads"][0]["frames"] = sorted(budget.REQUIRED_FRAMES)
+        with self.assertRaisesRegex(budget.BudgetError, "profile"):
+            budget.parse_result_row(torn)
+
+    def test_wire_rejects_mixed_version_thread_groups(self):
+        v2 = budget.parse_nativeperf(
+            nativeperf_frames_v2(pid=10) + nativeperf_frames_v2(pid=20)
+        )
+        record = budget.RunRecord.synthetic(profile=v2, schedule_label="on-1")
+        encoded = json.loads(json.dumps(budget.run_record_json(record)))
+        v1_thread = json.loads(
+            json.dumps(
+                budget.run_record_json(
+                    budget.RunRecord.synthetic(
+                        profile=budget.parse_nativeperf(nativeperf_frames(pid=20)),
+                        schedule_label="on-1",
+                    )
+                )
+            )
+        )["profile"]["threads"][0]
+        encoded["profile"]["threads"][1] = v1_thread
+        with self.assertRaisesRegex(budget.BudgetError, "mixed"):
+            budget.parse_result_row(encoded)
 
 
 class CaptureAndScheduleTests(unittest.TestCase):

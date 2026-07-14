@@ -59,6 +59,18 @@ pub(crate) struct NativeGuestExecV1 {
     pub(crate) xsig: NativeReexecXsigV1,
     pub(crate) process_state: NativeReexecProcessStateV1,
     pub(crate) prepared_image: Option<crate::native_prepared_image::NativePreparedImageV1>,
+    /// The pre-exec image's claimed startup gauge (NATIVEPERF attribution).
+    /// The host self-reexec preserves the pid, and one pid publishes exactly
+    /// one startup window: the post-exec image republishes this claim
+    /// verbatim instead of measuring a second window.
+    #[serde(default)]
+    pub(crate) profile_startup: Option<NativeReexecProfileStartupV1>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct NativeReexecProfileStartupV1 {
+    pub(crate) startup_wall_ns: u64,
+    pub(crate) startup_cpu_ns: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -285,6 +297,12 @@ pub(crate) fn begin_guest_exec(
             xsig,
             process_state,
             prepared_image: None,
+            profile_startup: crate::native_darwin::claimed_native_process_startup().map(
+                |(startup_wall_ns, startup_cpu_ns)| NativeReexecProfileStartupV1 {
+                    startup_wall_ns,
+                    startup_cpu_ns,
+                },
+            ),
         }),
     };
     let prepared_artifact = attach_prepared_image(
@@ -1032,6 +1050,10 @@ mod tests {
                     ptrace_traceme: false,
                 },
                 prepared_image: None,
+                profile_startup: Some(super::NativeReexecProfileStartupV1 {
+                    startup_wall_ns: 11,
+                    startup_cpu_ns: 5,
+                }),
             }),
         }
     }

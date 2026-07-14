@@ -214,9 +214,18 @@ type DsrEnterFn = fn(
     dsr::PreparedEntry,
     &mut NativeUcontextSnapshot,
 ) -> Result<dsr::PreparedExit, RuntimeError>;
+/// Blocked-wait accounting for one syscall dispatch: wall time inside blocked
+/// wait segments and the thread CPU consumed inside those same segments
+/// (`cpu_ns <= wall_ns` by construction; see `measure_native_blocked`).
+#[derive(Clone, Copy, Debug, Default)]
+struct NativeBlockedSpan {
+    wall_ns: u64,
+    cpu_ns: u64,
+}
+
 struct TimedDispatchOutcome {
     outcome: DispatchOutcome,
-    blocked_ns: u64,
+    blocked: NativeBlockedSpan,
 }
 
 struct NativeForkRequest {
@@ -899,6 +908,19 @@ pub(crate) fn resume_guest_from_capsule(
     argv: Vec<Vec<u8>>,
     env: Vec<Vec<u8>>,
 ) -> anyhow::Result<i32> {
+    // Startup attribution across the PID-preserving host self-reexec: the
+    // pid's startup window was captured exactly once in the pre-exec image,
+    // so republish that claim verbatim (one pid, one gauge). Without an
+    // inherited claim, measure from this post-exec runtime entry instead.
+    match guest.profile_startup {
+        Some(startup) => {
+            dsr::profile::seed_claimed_process_startup(
+                startup.startup_wall_ns,
+                startup.startup_cpu_ns,
+            );
+        }
+        None => dsr::profile::mark_native_process_runtime_entry(),
+    }
     if let Some(arena) = guest.kernel_arena {
         carrick_kernel::arena::KernelArena::init_global_from_reexec(
             carrick_kernel::arena::KernelArenaReexecAuthority {
@@ -994,6 +1016,12 @@ pub(crate) fn resume_guest_from_capsule(
         NativeCurrentProcessEntry::SelfReexecRestore,
     )
     .map_err(anyhow::Error::from)
+}
+
+/// The claimed process startup gauge, exposed for the self-reexec capsule
+/// producer so the post-exec image of the SAME pid republishes it verbatim.
+pub(crate) fn claimed_native_process_startup() -> Option<(u64, u64)> {
+    dsr::profile::claimed_process_startup()
 }
 
 fn native_reexec_lifecycle(phase: crate::probes::DsrCacheLifecyclePhase) {
@@ -1180,6 +1208,10 @@ fn run_image_in_child(
         close_fd(stdout_pipe.1);
         close_fd(stderr_pipe.1);
 
+        // Process startup attribution starts here: the guest pid is THIS
+        // child, and its rusage clock restarted at fork, so the window must
+        // anchor after the fork (env-gated; profile-off reads no clocks).
+        dsr::profile::mark_native_process_runtime_entry();
         match run_image_in_current_process(
             NativeImageSource::Legacy {
                 image,
@@ -1868,7 +1900,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                     return Err(RuntimeError::Unsupported(error.to_string()));
                 }
             };
-            let active_dispatch_ns = match dispatch_ns.checked_sub(timed_outcome.blocked_ns) {
+            let active_dispatch_ns = match dispatch_ns.checked_sub(timed_outcome.blocked.wall_ns) {
                 Some(active_dispatch_ns) => active_dispatch_ns,
                 None => {
                     let error = translator
@@ -1877,7 +1909,10 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                 }
             };
             translator
-                .add_profile_phase_ns(dsr::profile::Phase::Blocked, timed_outcome.blocked_ns)
+                .add_profile_phase_ns(dsr::profile::Phase::Blocked, timed_outcome.blocked.wall_ns)
+                .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+            translator
+                .add_profile_blocked_cpu_ns(timed_outcome.blocked.cpu_ns)
                 .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
             translator
                 .add_profile_phase_ns(dsr::profile::Phase::SyscallDispatch, active_dispatch_ns)
@@ -3259,7 +3294,7 @@ fn dispatch_native_syscall<const PROFILE: bool>(
     reporter: &CompatReporter,
     trace_syscalls: bool,
 ) -> Result<TimedDispatchOutcome, RuntimeError> {
-    let mut blocked_ns = 0;
+    let mut blocked_ns = NativeBlockedSpan::default();
     let outcome = dispatch_native_syscall_inner::<PROFILE>(
         dispatcher,
         request,
@@ -3271,25 +3306,44 @@ fn dispatch_native_syscall<const PROFILE: bool>(
     )?;
     Ok(TimedDispatchOutcome {
         outcome,
-        blocked_ns,
+        blocked: blocked_ns,
     })
 }
 
 fn measure_native_blocked<const PROFILE: bool, T>(
-    blocked_ns: &mut u64,
+    blocked_ns: &mut NativeBlockedSpan,
     operation: impl FnOnce() -> T,
 ) -> Result<T, RuntimeError> {
     if !PROFILE {
         return Ok(operation());
     }
     let timer = dsr::profile::PhaseTimer::start_if::<PROFILE>();
+    let cpu_before_ns = dsr::profile::current_thread_cpu_total_ns()
+        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
     let result = operation();
+    let cpu_after_ns = dsr::profile::current_thread_cpu_total_ns()
+        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
     let elapsed_ns = timer
         .elapsed_ns()
         .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
-    *blocked_ns = blocked_ns.checked_add(elapsed_ns).ok_or_else(|| {
+    let cpu_delta_ns = cpu_after_ns.checked_sub(cpu_before_ns).ok_or_else(|| {
+        RuntimeError::Unsupported(
+            dsr::profile::ProfileError::CounterUnderflow("blocked_cpu_ns").to_string(),
+        )
+    })?;
+    // The CPU reads sit inside the wall window, so the true segment CPU can
+    // never exceed the segment wall; the µs quantum of per-thread usage can
+    // still round the delta past a sub-µs wall. Clamp per segment to keep
+    // `phase_blocked_cpu_ns <= phase_blocked_ns` an exact invariant.
+    let cpu_delta_ns = cpu_delta_ns.min(elapsed_ns);
+    blocked_ns.wall_ns = blocked_ns.wall_ns.checked_add(elapsed_ns).ok_or_else(|| {
         RuntimeError::Unsupported(
             dsr::profile::ProfileError::CounterOverflow("blocked_ns").to_string(),
+        )
+    })?;
+    blocked_ns.cpu_ns = blocked_ns.cpu_ns.checked_add(cpu_delta_ns).ok_or_else(|| {
+        RuntimeError::Unsupported(
+            dsr::profile::ProfileError::CounterOverflow("blocked_cpu_ns").to_string(),
         )
     })?;
     Ok(result)
@@ -3302,7 +3356,7 @@ fn dispatch_native_syscall_inner<const PROFILE: bool>(
     thread_runtime: &NativeThreadRuntime,
     reporter: &CompatReporter,
     trace_syscalls: bool,
-    blocked_ns: &mut u64,
+    blocked_ns: &mut NativeBlockedSpan,
 ) -> Result<DispatchOutcome, RuntimeError> {
     let mut signal_wait_deadline = None;
     let mut fd_wait_deadline = None;
@@ -9502,6 +9556,41 @@ mod tests {
         let status = waitpid_blocking(pid).expect("wait for forked test");
         assert!(libc::WIFEXITED(status), "forked test status={status:#x}");
         assert_eq!(libc::WEXITSTATUS(status), 0);
+    }
+
+    #[test]
+    fn profile_off_blocked_measurement_is_pass_through() {
+        // The PROFILE=false monomorph must stay the specialized no-timer path:
+        // the operation result passes through and no wall/CPU accumulation
+        // happens (no timer or usage reads are reachable before the early
+        // return).
+        let mut blocked = NativeBlockedSpan::default();
+        let value =
+            measure_native_blocked::<false, _>(&mut blocked, || 7).expect("pass-through result");
+        assert_eq!(value, 7);
+        assert_eq!(blocked.wall_ns, 0);
+        assert_eq!(blocked.cpu_ns, 0);
+    }
+
+    #[test]
+    fn profiled_blocked_cpu_never_exceeds_blocked_wall() {
+        let mut blocked = NativeBlockedSpan::default();
+        let value = measure_native_blocked::<true, _>(&mut blocked, || {
+            let mut acc = 1_u64;
+            for value in 0..200_000_u64 {
+                acc = acc.wrapping_mul(31).wrapping_add(value);
+            }
+            std::hint::black_box(acc)
+        })
+        .expect("measured operation");
+        assert_ne!(value, 0);
+        assert!(blocked.wall_ns > 0);
+        assert!(
+            blocked.cpu_ns <= blocked.wall_ns,
+            "blocked cpu {} exceeds blocked wall {}",
+            blocked.cpu_ns,
+            blocked.wall_ns
+        );
     }
 
     fn direct_test_mapping_rollback(start: u64, length: u64) -> NativeMappingRollback {
