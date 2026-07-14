@@ -1405,8 +1405,18 @@ def parse_dtrace_summary(path: pathlib.Path, *, expected_run_id: str) -> DtraceE
             continue
         phase = scope.get("phase")
         pid = scope.get("pid")
-        kind = scope.get("kind")
-        ordering.append((str(phase), pid if isinstance(pid, int) else None, kind if isinstance(kind, int) else None))
+        raw_kind = scope.get("kind")
+        kind = None
+        if raw_kind is not None:
+            if (
+                not isinstance(raw_kind, str)
+                or not raw_kind.isascii()
+                or not raw_kind.isdecimal()
+                or (len(raw_kind) > 1 and raw_kind.startswith("0"))
+            ):
+                raise BudgetError("DTrace kind must be a canonical decimal string")
+            kind = int(raw_kind)
+        ordering.append((str(phase), pid if isinstance(pid, int) else None, kind))
         if metric_type == "incomplete-pair":
             raise BudgetError("DTrace summary contains an incomplete metric row")
         if metric_type != "exact":
@@ -1422,7 +1432,7 @@ def parse_dtrace_summary(path: pathlib.Path, *, expected_run_id: str) -> DtraceE
             raise BudgetError("DTrace count metric lacks typed phase/pid/count")
         phase_pid_counts[(phase, pid)] = phase_pid_counts.get((phase, pid), 0) + count
         if phase == "run":
-            if not isinstance(kind, int):
+            if kind is None:
                 raise BudgetError("DTrace run count lacks an exit kind")
             exit_mix[kind] = exit_mix.get(kind, 0) + count
     if completion_rows != 1:
