@@ -69,11 +69,16 @@ start. Smoke/full membership remains authoritative in
 | 2026-07-13 | worktree | `cpython-subprocess --lane macos-native-dsr` with native timeout scale | 1 | REGRESSION; 271/275 vs oracle 280/280; completed in 578.932 s | `target/conformance/native-cpython-subprocess-xsig-green.jsonl` | No crash/timeout; signal and shebang blockers are closed. Remaining raw failures cluster in exec-surviving credentials/groups, umask, signal disposition reporting, and closed-stdio edge cases. |
 | 2026-07-13 | worktree | CPython exec-surviving process-state reducers | 1 | credentials/groups/umask/signals 6/6 in 5.079 s; closed stdio 2/2 in 6.030 s; pre-exec `RLIMIT_NOFILE=(64,64)` preserved | focused signed workloads plus `process_state_round_trip_preserves_credentials_groups_umask_and_ignored_signals` and `stdio_closed_or_cloexec_before_exec_restores_closed` | The typed native capsule now preserves credential overrides, supplementary groups, umask, ignored dispositions, rlimit overrides, and post-exec closed stdio. |
 | 2026-07-13 | worktree | `cpython-subprocess --lane macos-native-dsr` canonical oracle refresh | 1 | MATCH; Carrick 278/278, Docker 278/278; Carrick 577.471 s, Docker 20.895 s | `target/conformance/native-cpython-subprocess-oracle-refresh.jsonl`; `scripts/conformance/oracle-cache.jsonl` | Removed a stale oracle-only `nofile=1024` cap. Unmodified Docker and Carrick both advertise a high descriptor limit and skip the same two applicability checks. The suite is fully green; performance is report-only. A worktree-only scoped-cleanup sudo warning left no Carrick process alive at Docker phase entry. |
+| 2026-07-13 | worktree before `089d5918` | canonical `perf_fork_exec`, five signed native repetitions | 1 | native p50 21.47 ms; Docker p50 0.408 ms; 52.6x | exact-source static-PIE probe; 1,100 completed spawn cycles | Process-spawn latency is a correctness blocker, not report-only. Stage timing placed 97% before the exec'd guest reached `main`; two capsule durability flushes contributed about 9.5 ms. |
+| 2026-07-13 | `089d5918` | canonical `perf_fork_exec` after removing capsule durability flushes | 1 | five native p50s 11.891-12.391 ms, median 12.102 ms; Docker median 0.392 ms; 30.8x | live exact-source static-PIE runs; 1,100 completed spawn cycles | The inherited anonymous regular file needs coherence, checksum, nonce, and one-shot consumption, not stable-storage durability. Removing both `sync_data` calls cuts p50 about 42% with all spawn cycles and the signed fork-exec-pthread gate green. The remaining ratio is still pathological. |
+| 2026-07-13 | `05e06fab` vs `089d5918` | same-host, identical-probe self-reexec A/B | 1 | fork-only 1.380 vs 1.425 ms; fork+exec 5.193 vs 12.255 ms | isolated signed historical build; current canonical probe binaries | DSR is present on both sides and fork cost is effectively unchanged. Activating PID-preserving host self-reexec adds about 7.0 ms per exec on this host; it is the dominant regression selected to preserve proven libdispatch correctness. |
+| 2026-07-13 | `458ad8df` | `dsr-fork` host-self-reexec waterfall | 1 | 220 samples per phase; natural completion; 3,084 metric rows; 0 incomplete pairs; 0 drops | `target/conformance/native-fork-exec-waterfall-r2.{raw,jsonl}` | Traced p50 attribution: preflight 1.417 ms, capsule preparation 1.329 ms, host exec 25.873 ms (startup 24.907 ms, kernel 0.745 ms, CLI dispatch 0.231 ms), capsule adoption 0.345 ms, restore 1.918 ms (dispatcher 0.654 ms, duplicate image load 1.148 ms, reset 0.019 ms). DTrace inflates startup but preserves the phase ordering and exposes the duplicate work. |
 
 ## Active failure clusters
 
 | Priority | Cluster | Authority | Current status | Target |
 | ---: | --- | --- | --- | --- |
+| P0 | Native process spawn is pathologically slower than Linux | canonical exact-source probes, same-host historical A/B, untraced phase timestamps, and complete `dsr-fork` waterfall | durable flushes fixed in `089d5918`, reducing fork+exec p50 about 42%; current median remains 12.102 ms vs Docker 0.392 ms (30.8x) | account for every millisecond, remove redundant self-reexec work without weakening libdispatch safety, then establish a non-pathological native/Docker ratio before workload laddering |
 | P0 | `THREAD_WAITERS` remains locked in a fork child | live LLDB stack plus deterministic contended-fork reducer | fixed in `6d3cf627`; four signed single-suite runs complete, multi-suite load proof pending | no CPython timeout in workers=4 smoke repeats |
 | P0 | Direct-exec target reservation rejects split dyld range | red/green Node-sized reducer plus signed eventfd/Node runs | fixed in `2a7d3046`; eventfd MATCH, Node reaches downstream thread guard; multi-suite load proof pending | no reservation collision in workers=4 smoke repeats |
 | P1 | Post-fork exec child cannot create guest threads | red/green staged reducer plus Node/Go/CPython unsafe samples and libdispatch symbolication | signed reducer + 5/5 repeats pass without bypass; Node app/V8 and Go build/runtime/sync are MATCH through self-reexec; CPython remains | `forkexecpthread`, Node, Go, and CPython run after PID-preserving host self-reexec |
@@ -99,8 +104,11 @@ start. Smoke/full membership remains authoritative in
 
 ## Current next action
 
-Run the full smoke tier at four workers to provide the first real concurrent
-load proof for the P0 fixes and the completed native self-reexec path. Attribute
-every non-MATCH row before changing code. Keep the two measured
-fork-without-exec pthread cases separate for explicit native-gap review, then
-repeat the smoke tier until stable before climbing full ecosystem lanes.
+Close the P0 native process-spawn pathology before further workload laddering.
+Preserve the PID-preserving host-exec boundary selected by the libdispatch
+evidence, but remove its redundant preflight/materialization work and remeasure
+the canonical fork/fork-exec probes after each change. Treat a persistent DSR
+cache as a later bounded optimization: current translation is only part of the
+remaining cost, and emitted blocks embed process-specific gateway and host
+addresses. Once the ratio is non-pathological, resume workers=4 smoke stability
+and climb the full ecosystem lanes.
