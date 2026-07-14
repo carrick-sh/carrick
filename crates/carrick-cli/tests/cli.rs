@@ -64,6 +64,41 @@ fn native_self_reexec_private_commands_are_hidden_and_fail_closed() {
         .stderr(contains("not a regular file"));
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn trace_auto_sudo_notice_uses_stderr_without_contaminating_target_stdout() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().expect("create fake sudo directory");
+    let sudo = temp.path().join("sudo");
+    std::fs::write(&sudo, "#!/bin/sh\nexit 73\n").expect("write fake sudo");
+    std::fs::set_permissions(&sudo, std::fs::Permissions::from_mode(0o755))
+        .expect("make fake sudo executable");
+    let output = command()
+        .env("PATH", temp.path())
+        .args([
+            "trace",
+            "--profile",
+            "dsr",
+            "--",
+            "run",
+            "alpine:latest",
+            "true",
+        ])
+        .output()
+        .expect("run trace through fake sudo");
+    assert_eq!(output.status.code(), Some(73));
+    assert!(
+        output.stdout.is_empty(),
+        "trace diagnostics contaminated target stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("carrick trace: not root; re-executing under sudo")
+    );
+}
+
 #[test]
 fn exec_backend_help_lists_only_portable_values() {
     command()
