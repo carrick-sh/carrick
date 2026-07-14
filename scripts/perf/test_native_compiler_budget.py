@@ -406,6 +406,38 @@ def strict_abba_records(
     return records
 
 
+def multi_sensitive_thread_lines(*, gateway_entries, sensitive_counts, pid, tid, era=12):
+    """One reconciled v2 thread group whose sensitive frame carries several
+    nonzero categories at once. budget_frames() only exposes a single
+    "exclusive" slot; proving that the two-term count rung's PAIR selection
+    (not just the single-kind rung) can disagree across hottest-thread vs.
+    aggregate-threads needs a richer composition. Follows the same manual
+    exit_sensitive/exit_unsupported/phase_sensitive_emulation_count
+    reconciliation as
+    test_additive_profile_model_counts_every_sensitive_kind_and_reconciles_cpu.
+    """
+    total = sum(sensitive_counts.values())
+    lines = budget_frames(
+        gateway_entries=gateway_entries,
+        sensitive_exclusive=0,
+        syscall_dispatch_ns=0,
+        pid=pid,
+        tid=tid,
+        era=era,
+        include_supervisor=False,
+    )
+    lines[1] = lines[1].replace("exit_sensitive=0", f"exit_sensitive={total}").replace(
+        f"exit_unsupported={gateway_entries}",
+        f"exit_unsupported={gateway_entries - total}",
+    )
+    for field, value in sensitive_counts.items():
+        lines[2] = lines[2].replace(f"{field}=0", f"{field}={value}")
+    lines[4] = lines[4].replace(
+        "phase_sensitive_emulation_count=0", f"phase_sensitive_emulation_count={total}"
+    )
+    return lines
+
+
 class ManifestTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -1991,6 +2023,16 @@ class ReviewFixContractTests(unittest.TestCase):
         # budget_frames() call defaults process_cpu to the same 39 (the
         # fixed exclusive-phase sum with syscall_dispatch_ns=0), so
         # children=78 covers both pids' guest CPU with a zero gate2 gap.
+        #
+        # This fixture's duration terms are all zero (no blocked/startup/
+        # helper/supervisor CPU, no syscall dispatch), so once the sensitive
+        # count rung ABSTAINS on the hottest-thread/aggregate-threads
+        # disagreement (rather than raising immediately -- see
+        # test_sensitive_scope_disagreement_abstains_letting_supervisor_cpu_decide
+        # for the case where a duration rung *does* pick up the slack), no
+        # later rung can decide either: analysis must still fail closed, now
+        # via the enriched final error that carries the disagreement detail
+        # forward instead of aborting at the count rung.
         lines = budget_frames(
             gateway_entries=400,
             sensitive_exclusive=160,
@@ -2006,8 +2048,98 @@ class ReviewFixContractTests(unittest.TestCase):
         ) + [supervisor_line(self_cpu_ns=0, children_cpu_ns=78)]
         profile = budget.parse_nativeperf(lines)
         records = strict_abba_records(profile)
-        with self.assertRaisesRegex(budget.BudgetError, "scope"):
+        with self.assertRaises(budget.BudgetError) as ctx:
             budget.analyze(records)
+        message = str(ctx.exception)
+        self.assertIn(
+            "no independently verified slice satisfies the committed rule", message
+        )
+        self.assertRegex(message, "scope")
+        self.assertIn("hottest-thread=exclusive", message)
+        self.assertIn("aggregate-threads=None", message)
+
+    def test_sensitive_scope_disagreement_abstains_letting_supervisor_cpu_decide(self):
+        # Same disagreeing-scope shape as
+        # test_count_scopes_must_agree_before_slice_selection (hottest-thread
+        # sees "exclusive" at 40%; aggregate-threads dilutes it to ~20% via
+        # the second, sensitive-free thread group) -- but this profile also
+        # carries a supervisor-cpu measured-CPU term at >=30% of untraced
+        # CPU, a scope-free rung that is real, measured evidence (the
+        # motivating case: hottest exclusive 47% vs. aggregate 22% with
+        # supervisor-cpu ~40% dominant). The count rung must ABSTAIN on the
+        # scope disagreement -- not raise -- so evaluation reaches the
+        # supervisor-cpu duration rung.
+        lines = budget_frames(
+            gateway_entries=400,
+            sensitive_exclusive=160,
+            syscall_dispatch_ns=0,
+            include_supervisor=False,
+        ) + budget_frames(
+            gateway_entries=390,
+            sensitive_exclusive=0,
+            syscall_dispatch_ns=0,
+            pid=20,
+            tid=21,
+            include_supervisor=False,
+        ) + [supervisor_line(self_cpu_ns=35, children_cpu_ns=78)]
+        profile = budget.parse_nativeperf(lines)
+        records = strict_abba_records(profile)
+        decision = budget.analyze(records)
+        self.assertEqual(decision.selected_slice, "supervisor-cpu")
+        self.assertAlmostEqual(decision.share, 0.35)
+        self.assertEqual(decision.scope, "process-cpu")
+
+    def test_sensitive_scope_agreement_still_wins_over_duration_rungs(self):
+        # A single thread group trivially agrees across both scopes; with a
+        # supervisor-cpu term that would also clear 30% if reached, this
+        # proves the count rung still fires first and wins -- agreement
+        # remains REQUIRED and sufficient for a count decision, and rung
+        # order is preserved by the abstention change.
+        profile = profile_with_budget(
+            gateway_entries=100,
+            sensitive_exclusive=40,
+            syscall_dispatch_ns=0,
+            supervisor_self_cpu_ns=35,
+        )
+        records = strict_abba_records(profile)
+        decision = budget.analyze(records)
+        self.assertEqual(decision.selected_slice, "sensitive-exclusive")
+        self.assertEqual(decision.scope, "hottest-thread+aggregate-threads")
+
+    def test_two_term_count_scope_disagreement_abstains_to_final_fail_closed(self):
+        # hottest-thread (pid 10, gateway 100) has "exclusive" (35%) and
+        # "read-tpidr" (30%) summing to a qualifying two-term pair (65%).
+        # aggregate-threads (pid 10 + pid 20) dilutes every individual kind
+        # below 30% (exclusive 18.4%, read-tpidr 15.8%, write-tpidr 28.4%)
+        # so no pair reaches the 60% two-term threshold there. The two-term
+        # count rung's selected pairs disagree (one scope even has none), so
+        # per the same abstention semantic as the single-kind rung it must
+        # not raise "disagree on the two-term slice" -- it falls through
+        # to the duration two-term rung and then the final fail-closed
+        # error (every duration term is zero here, so nothing else fires).
+        lines = (
+            multi_sensitive_thread_lines(
+                gateway_entries=100,
+                sensitive_counts={"sensitive_exclusive": 35, "sensitive_read_tpidr": 30},
+                pid=10,
+                tid=11,
+            )
+            + multi_sensitive_thread_lines(
+                gateway_entries=90,
+                sensitive_counts={"sensitive_write_tpidr": 54},
+                pid=20,
+                tid=21,
+            )
+            + [supervisor_line(self_cpu_ns=0, children_cpu_ns=78)]
+        )
+        profile = budget.parse_nativeperf(lines)
+        records = strict_abba_records(profile)
+        with self.assertRaises(budget.BudgetError) as ctx:
+            budget.analyze(records)
+        message = str(ctx.exception)
+        self.assertIn(
+            "no independently verified slice satisfies the committed rule", message
+        )
 
     def test_analyze_validates_additive_model_before_count_decision(self):
         profile = profile_with_budget(
