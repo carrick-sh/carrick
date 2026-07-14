@@ -610,6 +610,20 @@ pub(super) fn decoded_operands_mention_x28(word: u32, pc: GuestVa) -> bool {
     decoded_operands_mention_gpr(word, pc, 28)
 }
 
+pub(super) fn decoded_writeback_destination_overlaps_base(word: u32, pc: GuestVa) -> bool {
+    bad64::decode(word, pc.raw()).is_ok_and(|instruction| {
+        let operands = instruction.operands();
+        base_register(operands).is_some_and(|(base, writeback)| {
+            writeback != MemoryWriteback::None
+                && encoded_base_index(base).is_some_and(|index| {
+                    operands
+                        .iter()
+                        .any(|operand| operand_mentions_gpr_outside_memory_base(operand, index))
+                })
+        })
+    })
+}
+
 pub(super) fn decoded_operands_mention_gpr(word: u32, pc: GuestVa, index: u32) -> bool {
     bad64::decode(word, pc.raw()).is_ok_and(|instruction| {
         instruction
