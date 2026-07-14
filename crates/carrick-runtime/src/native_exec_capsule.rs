@@ -1,6 +1,6 @@
 //! Versioned kernel-backed handoff for a native fork-child host self-exec.
 
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileExt;
@@ -52,6 +52,7 @@ pub(crate) struct NativeGuestExecV1 {
     pub(crate) fd_table: crate::dispatch::fd_table::NativeReexecFdTableV1,
     pub(crate) xsig: NativeReexecXsigV1,
     pub(crate) process_state: NativeReexecProcessStateV1,
+    pub(crate) prepared_image: Option<crate::native_prepared_image::NativePreparedImageV1>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -149,12 +150,14 @@ pub(crate) fn begin_pid_probe() -> anyhow::Result<()> {
     let mut nonce = [0_u8; 16];
     getrandom::fill(&mut nonce)
         .map_err(|error| anyhow::anyhow!("generate native exec capsule nonce: {error}"))?;
-    exec_capsule(payload, nonce)
+    exec_capsule(payload, nonce, None)
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn begin_guest_exec(
     dispatcher: &crate::dispatch::SyscallDispatcher,
+    image: &crate::memory::AddressSpace,
+    relative_relocations: &[crate::native_prepared_image::NativeRelativeRelocation],
     resolved_path: String,
     argv: Vec<Vec<u8>>,
     env: Vec<Vec<u8>>,
@@ -184,7 +187,7 @@ pub(crate) fn begin_guest_exec(
         .map_err(|error| anyhow::anyhow!("native guest exec fd table is ineligible: {error}"))?;
     let xsig = snapshot_xsig()?;
     let process_state = dispatcher.snapshot_native_reexec_process_state();
-    let payload = NativeExecCapsuleV1 {
+    let mut payload = NativeExecCapsuleV1 {
         producer_pid: unsafe { libc::getpid() as u32 },
         purpose: NativeExecCapsulePurposeV1::GuestExec,
         host_executable_path: executable.as_os_str().as_bytes().to_vec(),
@@ -202,71 +205,176 @@ pub(crate) fn begin_guest_exec(
             fd_table,
             xsig,
             process_state,
+            prepared_image: None,
         }),
     };
+    let prepared_artifact = attach_prepared_image(
+        &mut payload,
+        image,
+        relative_relocations,
+        plan.page_geometry.host_page_size,
+    );
     let mut nonce = [0_u8; 16];
     getrandom::fill(&mut nonce)
         .map_err(|error| anyhow::anyhow!("generate native exec capsule nonce: {error}"))?;
-    exec_capsule(payload, nonce)
+    exec_capsule(payload, nonce, prepared_artifact)
 }
 
-fn exec_capsule(payload: NativeExecCapsuleV1, nonce: [u8; 16]) -> anyhow::Result<()> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreparedImageFailpoint {
+    #[cfg(test)]
+    Ineligible,
+    #[cfg(test)]
+    ArtifactCreation,
+    #[cfg(test)]
+    PreExecValidation,
+}
+
+fn attach_prepared_image(
+    payload: &mut NativeExecCapsuleV1,
+    image: &crate::memory::AddressSpace,
+    relative_relocations: &[crate::native_prepared_image::NativeRelativeRelocation],
+    host_page_size: u64,
+) -> Option<crate::native_prepared_image::PreparedImageArtifact> {
+    attach_prepared_image_inner(payload, image, relative_relocations, host_page_size, None)
+}
+
+#[cfg(test)]
+fn attach_prepared_image_with_failpoint(
+    payload: &mut NativeExecCapsuleV1,
+    image: &crate::memory::AddressSpace,
+    relative_relocations: &[crate::native_prepared_image::NativeRelativeRelocation],
+    host_page_size: u64,
+    failpoint: PreparedImageFailpoint,
+) -> Option<crate::native_prepared_image::PreparedImageArtifact> {
+    attach_prepared_image_inner(
+        payload,
+        image,
+        relative_relocations,
+        host_page_size,
+        Some(failpoint),
+    )
+}
+
+fn attach_prepared_image_inner(
+    payload: &mut NativeExecCapsuleV1,
+    image: &crate::memory::AddressSpace,
+    relative_relocations: &[crate::native_prepared_image::NativeRelativeRelocation],
+    host_page_size: u64,
+    failpoint: Option<PreparedImageFailpoint>,
+) -> Option<crate::native_prepared_image::PreparedImageArtifact> {
+    #[cfg(not(test))]
+    let _ = failpoint;
+    #[cfg(test)]
+    if failpoint == Some(PreparedImageFailpoint::Ineligible) {
+        tracing::debug!(
+            reason = "test failpoint",
+            "native prepared image is ineligible; using legacy self-reexec reload"
+        );
+        return None;
+    }
+    #[cfg(test)]
+    if failpoint == Some(PreparedImageFailpoint::ArtifactCreation) {
+        tracing::warn!(
+            error = "test artifact creation failpoint",
+            "native prepared image construction failed; using legacy self-reexec reload"
+        );
+        return None;
+    }
+
+    let disposition =
+        match crate::native_prepared_image::prepare(image, relative_relocations, host_page_size) {
+            Ok(disposition) => disposition,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "native prepared image construction failed; using legacy self-reexec reload"
+                );
+                return None;
+            }
+        };
+    let artifact = match disposition {
+        crate::native_prepared_image::PreparedImageDisposition::Prepared(artifact) => artifact,
+        crate::native_prepared_image::PreparedImageDisposition::Ineligible(reason) => {
+            tracing::debug!(
+                ?reason,
+                "native prepared image is ineligible; using legacy self-reexec reload"
+            );
+            return None;
+        }
+    };
+    #[cfg(test)]
+    if failpoint == Some(PreparedImageFailpoint::PreExecValidation) {
+        let artifact_fd = artifact.file.as_raw_fd();
+        let mut identity = std::mem::MaybeUninit::<libc::stat>::uninit();
+        let identity_ok = unsafe { libc::fstat(artifact_fd, identity.as_mut_ptr()) } == 0;
+        let identity = identity_ok.then(|| unsafe { identity.assume_init() });
+        tracing::warn!(
+            error = "test pre-exec validation failpoint",
+            "native prepared image self-validation failed; using legacy self-reexec reload"
+        );
+        drop(artifact);
+        let artifact_was_closed = identity.is_some_and(|identity| {
+            fd_no_longer_refers_to(artifact_fd, identity.st_dev as u64, identity.st_ino)
+        });
+        LAST_PREEXEC_VALIDATION_ARTIFACT
+            .with(|captured| captured.set(Some((artifact_fd, artifact_was_closed))));
+        return None;
+    }
+    let Some(guest) = payload.guest_exec.as_mut() else {
+        tracing::warn!(
+            "native prepared image has no guest capsule owner; using legacy self-reexec reload"
+        );
+        return None;
+    };
+    guest.prepared_image = Some(artifact.record.clone());
+    Some(artifact)
+}
+
+fn exec_capsule(
+    payload: NativeExecCapsuleV1,
+    nonce: [u8; 16],
+    prepared_artifact: Option<crate::native_prepared_image::PreparedImageArtifact>,
+) -> anyhow::Result<()> {
+    exec_capsule_with(payload, nonce, prepared_artifact, |request| {
+        unsafe {
+            libc::execve(
+                request.executable.as_ptr(),
+                request.argv.as_ptr(),
+                request.env.as_ptr(),
+            );
+        }
+        std::io::Error::last_os_error()
+    })
+}
+
+struct HostExecRequest<'a> {
+    executable: &'a CStr,
+    argv: &'a [*const libc::c_char],
+    env: &'a [*const libc::c_char],
+    #[cfg(test)]
+    capsule_fd: RawFd,
+}
+
+fn exec_capsule_with<F>(
+    payload: NativeExecCapsuleV1,
+    nonce: [u8; 16],
+    prepared_artifact: Option<crate::native_prepared_image::PreparedImageArtifact>,
+    invoke_exec: F,
+) -> anyhow::Result<()>
+where
+    F: FnOnce(HostExecRequest<'_>) -> std::io::Error,
+{
+    let payload_prepared_record = payload
+        .guest_exec
+        .as_ref()
+        .and_then(|guest| guest.prepared_image.as_ref());
+    let owned_prepared_record = prepared_artifact.as_ref().map(|artifact| &artifact.record);
+    if payload_prepared_record != owned_prepared_record {
+        anyhow::bail!("native prepared image capsule record has no matching fd owner");
+    }
     let capsule = tempfile::tempfile()?;
     write_capsule(capsule.as_raw_fd(), nonce, &payload)?;
-
-    let mut prepared_host_fds = Vec::new();
-    if let Some(guest) = &payload.guest_exec {
-        if let Err(error) = prepare_host_fd_flags(
-            guest.xsig.host_fd,
-            guest.xsig.original_host_fd_flags,
-            guest.xsig.original_host_fd_flags & !libc::FD_CLOEXEC,
-            &mut prepared_host_fds,
-        ) {
-            restore_host_fd_flags(&prepared_host_fds);
-            return Err(error);
-        }
-        for (fd, expected_flags) in guest.fd_table.survivor_host_fds() {
-            if let Err(error) = prepare_host_fd_flags(
-                fd,
-                expected_flags,
-                expected_flags & !libc::FD_CLOEXEC,
-                &mut prepared_host_fds,
-            ) {
-                restore_host_fd_flags(&prepared_host_fds);
-                return Err(error);
-            }
-        }
-        for fd in &guest.fd_table.close_on_exec_host_fds {
-            let flags = unsafe { libc::fcntl(*fd, libc::F_GETFD) };
-            if flags < 0 {
-                restore_host_fd_flags(&prepared_host_fds);
-                return Err(std::io::Error::last_os_error().into());
-            }
-            if let Err(error) =
-                prepare_host_fd_flags(*fd, flags, flags | libc::FD_CLOEXEC, &mut prepared_host_fds)
-            {
-                restore_host_fd_flags(&prepared_host_fds);
-                return Err(error);
-            }
-        }
-    }
-
-    let old_flags = unsafe { libc::fcntl(capsule.as_raw_fd(), libc::F_GETFD) };
-    if old_flags < 0 {
-        restore_host_fd_flags(&prepared_host_fds);
-        return Err(std::io::Error::last_os_error().into());
-    }
-    if unsafe {
-        libc::fcntl(
-            capsule.as_raw_fd(),
-            libc::F_SETFD,
-            old_flags & !libc::FD_CLOEXEC,
-        )
-    } < 0
-    {
-        restore_host_fd_flags(&prepared_host_fds);
-        return Err(std::io::Error::last_os_error().into());
-    }
 
     let nonce_hex = encode_nonce(nonce);
     let fd_arg = capsule.as_raw_fd().to_string();
@@ -298,19 +406,103 @@ fn exec_capsule(payload: NativeExecCapsuleV1, nonce: [u8; 16]) -> anyhow::Result
         .chain(std::iter::once(std::ptr::null()))
         .collect::<Vec<_>>();
 
+    let mut prepared_host_fds = HostFdFlagTransaction::default();
+    if let Some(guest) = &payload.guest_exec {
+        prepared_host_fds.prepare(
+            guest.xsig.host_fd,
+            guest.xsig.original_host_fd_flags,
+            guest.xsig.original_host_fd_flags & !libc::FD_CLOEXEC,
+        )?;
+        for (fd, expected_flags) in guest.fd_table.survivor_host_fds() {
+            prepared_host_fds.prepare(fd, expected_flags, expected_flags & !libc::FD_CLOEXEC)?;
+        }
+        for fd in &guest.fd_table.close_on_exec_host_fds {
+            let flags = unsafe { libc::fcntl(*fd, libc::F_GETFD) };
+            if flags < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            prepared_host_fds.prepare(*fd, flags, flags | libc::FD_CLOEXEC)?;
+        }
+    }
+
+    let old_flags = unsafe { libc::fcntl(capsule.as_raw_fd(), libc::F_GETFD) };
+    if old_flags < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    prepared_host_fds.prepare(
+        capsule.as_raw_fd(),
+        old_flags,
+        old_flags & !libc::FD_CLOEXEC,
+    )?;
+    if let Some(artifact) = &prepared_artifact {
+        let (fd, flags) = artifact.transport_fd_snapshot();
+        prepared_host_fds.prepare(fd, flags, flags & !libc::FD_CLOEXEC)?;
+    }
+
     emit_lifecycle(
         unsafe { libc::getpid() },
         crate::probes::DsrCacheLifecyclePhase::HostSelfReexecBegin,
     );
-    unsafe {
-        libc::execve(executable_c.as_ptr(), argv_ptrs.as_ptr(), env_ptrs.as_ptr());
-    }
-    let exec_error = std::io::Error::last_os_error();
-    unsafe {
-        libc::fcntl(capsule.as_raw_fd(), libc::F_SETFD, old_flags);
-    }
-    restore_host_fd_flags(&prepared_host_fds);
+    let exec_error = invoke_exec(HostExecRequest {
+        executable: &executable_c,
+        argv: &argv_ptrs,
+        env: &env_ptrs,
+        #[cfg(test)]
+        capsule_fd: capsule.as_raw_fd(),
+    });
     Err(exec_error.into())
+}
+
+#[derive(Default)]
+struct HostFdFlagTransaction {
+    prepared: Vec<(RawFd, i32)>,
+}
+
+impl HostFdFlagTransaction {
+    fn prepare(
+        &mut self,
+        fd: RawFd,
+        expected_flags: i32,
+        desired_flags: i32,
+    ) -> anyhow::Result<()> {
+        prepare_host_fd_flags(fd, expected_flags, desired_flags, &mut self.prepared)
+    }
+}
+
+impl Drop for HostFdFlagTransaction {
+    fn drop(&mut self) {
+        restore_host_fd_flags(&self.prepared);
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_ARTIFACT_FD_FLAG_PREPARATION: std::cell::Cell<Option<RawFd>> = const {
+        std::cell::Cell::new(None)
+    };
+    static LAST_PREEXEC_VALIDATION_ARTIFACT: std::cell::Cell<Option<(RawFd, bool)>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+#[cfg(test)]
+fn fail_next_artifact_fd_flag_preparation(fd: RawFd) {
+    FAIL_ARTIFACT_FD_FLAG_PREPARATION.with(|failpoint| failpoint.set(Some(fd)));
+}
+
+#[cfg(test)]
+fn take_last_preexec_validation_artifact() -> Option<(RawFd, bool)> {
+    LAST_PREEXEC_VALIDATION_ARTIFACT.with(std::cell::Cell::take)
+}
+
+#[cfg(test)]
+fn fd_no_longer_refers_to(fd: RawFd, expected_device: u64, expected_inode: u64) -> bool {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } < 0 {
+        return true;
+    }
+    let stat = unsafe { stat.assume_init() };
+    stat.st_dev as u64 != expected_device || stat.st_ino != expected_inode
 }
 
 fn prepare_host_fd_flags(
@@ -319,6 +511,17 @@ fn prepare_host_fd_flags(
     desired_flags: i32,
     prepared: &mut Vec<(i32, i32)>,
 ) -> anyhow::Result<()> {
+    #[cfg(test)]
+    if FAIL_ARTIFACT_FD_FLAG_PREPARATION.with(|failpoint| {
+        if failpoint.get() == Some(fd) {
+            failpoint.take();
+            true
+        } else {
+            false
+        }
+    }) {
+        anyhow::bail!("test artifact fd flag preparation failpoint for fd {fd}");
+    }
     let current = unsafe { libc::fcntl(fd, libc::F_GETFD) };
     if current < 0 {
         return Err(std::io::Error::last_os_error().into());
@@ -354,7 +557,8 @@ pub(crate) fn resume(fd: RawFd, nonce_hex: &str) -> anyhow::Result<crate::Native
         crate::probes::DsrCacheLifecyclePhase::HostSelfReexecCapsuleBegin,
     );
     let nonce = decode_nonce(nonce_hex)?;
-    let payload = read_capsule_once(fd, nonce)?;
+    let mut payload = read_capsule_once(fd, nonce)?;
+    discard_prepared_image_before_legacy_payload_resume(&mut payload)?;
     let current_pid = current_pid as u32;
     if payload.producer_pid != current_pid {
         anyhow::bail!(
@@ -393,6 +597,25 @@ pub(crate) fn resume(fd: RawFd, nonce_hex: &str) -> anyhow::Result<crate::Native
             Ok(crate::NativeSelfReexecOutcome::GuestExit(exit_code))
         }
     }
+}
+
+fn discard_prepared_image_before_legacy_payload_resume(
+    payload: &mut NativeExecCapsuleV1,
+) -> anyhow::Result<()> {
+    if let Some(guest) = payload.guest_exec.as_mut() {
+        discard_prepared_image_before_legacy_resume(guest)?;
+    }
+    Ok(())
+}
+
+fn discard_prepared_image_before_legacy_resume(
+    guest: &mut NativeGuestExecV1,
+) -> anyhow::Result<()> {
+    let Some(record) = guest.prepared_image.take() else {
+        return Ok(());
+    };
+    crate::native_prepared_image::close_inherited_before_legacy_resume(record)
+        .map_err(|error| anyhow::anyhow!("close unused inherited prepared image: {error}"))
 }
 
 fn emit_lifecycle(tid: i32, phase: crate::probes::DsrCacheLifecyclePhase) {
@@ -630,13 +853,18 @@ fn read_exact_at(
 
 #[cfg(test)]
 mod tests {
-    use std::os::fd::AsRawFd;
+    use std::os::fd::{AsRawFd, RawFd};
     use std::os::unix::fs::FileExt;
 
     use super::{
         HEADER_LEN, MAX_ITEM_LEN, NativeExecCapsulePurposeV1, NativeExecCapsuleV1,
-        NativeGuestExecV1, read_capsule_once, write_capsule,
+        NativeGuestExecV1, PreparedImageFailpoint, attach_prepared_image,
+        attach_prepared_image_with_failpoint, discard_prepared_image_before_legacy_resume,
+        exec_capsule_with, fail_next_artifact_fd_flag_preparation, fd_no_longer_refers_to,
+        read_capsule_once, take_last_preexec_validation_artifact, write_capsule,
     };
+
+    const HOST_PAGE_SIZE: u64 = 16 * 1024;
 
     fn sample() -> NativeExecCapsuleV1 {
         NativeExecCapsuleV1 {
@@ -689,8 +917,331 @@ mod tests {
                     nofile_soft: 1024,
                     rlimit_overrides: vec![None; 16],
                 },
+                prepared_image: None,
             }),
         }
+    }
+
+    fn synthetic_elf() -> Vec<u8> {
+        const ET_EXEC: u16 = 2;
+        const EM_AARCH64: u16 = 183;
+        const PT_LOAD: u32 = 1;
+        const PF_R_X: u32 = 5;
+        let mut elf = vec![0_u8; 0x1000];
+        elf[0..4].copy_from_slice(b"\x7fELF");
+        elf[4] = 2;
+        elf[5] = 1;
+        elf[6] = 1;
+        elf[16..18].copy_from_slice(&ET_EXEC.to_le_bytes());
+        elf[18..20].copy_from_slice(&EM_AARCH64.to_le_bytes());
+        elf[20..24].copy_from_slice(&1_u32.to_le_bytes());
+        elf[24..32].copy_from_slice(&0x400000_u64.to_le_bytes());
+        elf[32..40].copy_from_slice(&64_u64.to_le_bytes());
+        elf[52..54].copy_from_slice(&64_u16.to_le_bytes());
+        elf[54..56].copy_from_slice(&56_u16.to_le_bytes());
+        elf[56..58].copy_from_slice(&1_u16.to_le_bytes());
+        let ph = 64;
+        elf[ph..ph + 4].copy_from_slice(&PT_LOAD.to_le_bytes());
+        elf[ph + 4..ph + 8].copy_from_slice(&PF_R_X.to_le_bytes());
+        elf[ph + 16..ph + 24].copy_from_slice(&0x400000_u64.to_le_bytes());
+        elf[ph + 24..ph + 32].copy_from_slice(&0x400000_u64.to_le_bytes());
+        let file_len = elf.len() as u64;
+        elf[ph + 32..ph + 40].copy_from_slice(&file_len.to_le_bytes());
+        elf[ph + 40..ph + 48].copy_from_slice(&0x4000_u64.to_le_bytes());
+        elf[ph + 48..ph + 56].copy_from_slice(&0x1000_u64.to_le_bytes());
+        elf[0x800..0x810].copy_from_slice(b"capsule-payload!");
+        elf
+    }
+
+    fn synthetic_image() -> crate::memory::AddressSpace {
+        crate::memory::AddressSpace::load_elf_bytes_with_reader_at_pie_base_without_runtime_regions(
+            &synthetic_elf(),
+            &|_| None,
+            0x400000,
+            HOST_PAGE_SIZE,
+        )
+        .expect("load synthetic executable")
+        .with_linux_initial_stack_page_size(
+            [b"prepared-capsule".as_slice()],
+            [b"MODE=test".as_slice()],
+            HOST_PAGE_SIZE,
+        )
+        .expect("build synthetic stack")
+    }
+
+    fn set_fd_flags(fd: RawFd, flags: i32) {
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFD, flags) }, 0);
+    }
+
+    fn fd_flags(fd: RawFd) -> i32 {
+        unsafe { libc::fcntl(fd, libc::F_GETFD) }
+    }
+
+    fn host_identity(fd: RawFd) -> libc::stat {
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        assert_eq!(unsafe { libc::fstat(fd, stat.as_mut_ptr()) }, 0);
+        unsafe { stat.assume_init() }
+    }
+
+    fn install_transport_fds(
+        payload: &mut NativeExecCapsuleV1,
+        xsig: &std::fs::File,
+        survivor: &std::fs::File,
+        close_on_exec: &std::fs::File,
+    ) {
+        use crate::dispatch::fd_table::{NativeReexecDescriptionV1, NativeReexecFdV1};
+
+        set_fd_flags(xsig.as_raw_fd(), libc::FD_CLOEXEC);
+        set_fd_flags(survivor.as_raw_fd(), libc::FD_CLOEXEC);
+        set_fd_flags(close_on_exec.as_raw_fd(), 0);
+        let xsig_stat = host_identity(xsig.as_raw_fd());
+        let survivor_stat = host_identity(survivor.as_raw_fd());
+        let guest = payload.guest_exec.as_mut().expect("guest payload");
+        guest.xsig = super::NativeReexecXsigV1 {
+            host_fd: xsig.as_raw_fd(),
+            original_host_fd_flags: libc::FD_CLOEXEC,
+            host_device: xsig_stat.st_dev as u64,
+            host_inode: xsig_stat.st_ino,
+            host_size: xsig_stat.st_size as u64,
+        };
+        guest.fd_table.files = vec![NativeReexecFdV1 {
+            guest_fd: 9,
+            fd_flags: 0,
+            description_id: 0,
+        }];
+        guest.fd_table.descriptions = vec![NativeReexecDescriptionV1::File {
+            host_fd: survivor.as_raw_fd(),
+            original_host_fd_flags: libc::FD_CLOEXEC,
+            host_device: survivor_stat.st_dev as u64,
+            host_inode: survivor_stat.st_ino,
+            host_mode: survivor_stat.st_mode as u32,
+            status_flags: 0,
+            guest_path: b"/tmp/survivor".to_vec(),
+            guest_mode: 0o600,
+            guest_size: survivor_stat.st_size as u64,
+            writable: false,
+        }];
+        guest.fd_table.close_on_exec_host_fds = vec![close_on_exec.as_raw_fd()];
+    }
+
+    #[test]
+    fn prepared_record_round_trips_without_embedding_payload_bytes() {
+        let mut payload = sample();
+        let artifact = attach_prepared_image(&mut payload, &synthetic_image(), &[], HOST_PAGE_SIZE)
+            .expect("eligible prepared artifact");
+        let artifact_len = artifact.file.metadata().expect("artifact metadata").len();
+        let capsule = tempfile::tempfile().expect("temporary capsule");
+        let nonce = [0x44; 16];
+        write_capsule(capsule.as_raw_fd(), nonce, &payload).expect("write capsule");
+        let capsule_len = capsule.metadata().expect("capsule metadata").len();
+
+        let decoded = read_capsule_once(capsule.as_raw_fd(), nonce).expect("read capsule");
+        assert_eq!(decoded, payload);
+        assert!(
+            decoded
+                .guest_exec
+                .expect("guest payload")
+                .prepared_image
+                .is_some()
+        );
+        assert!(capsule_len < artifact_len / 8);
+    }
+
+    #[test]
+    fn artifact_ineligibility_and_preexec_errors_select_legacy_before_host_exec() {
+        for failpoint in [
+            PreparedImageFailpoint::Ineligible,
+            PreparedImageFailpoint::ArtifactCreation,
+            PreparedImageFailpoint::PreExecValidation,
+        ] {
+            let mut payload = sample();
+            let artifact = attach_prepared_image_with_failpoint(
+                &mut payload,
+                &synthetic_image(),
+                &[],
+                HOST_PAGE_SIZE,
+                failpoint,
+            );
+            assert!(artifact.is_none());
+            assert!(
+                payload
+                    .guest_exec
+                    .as_ref()
+                    .expect("guest payload")
+                    .prepared_image
+                    .is_none()
+            );
+            if failpoint == PreparedImageFailpoint::PreExecValidation {
+                let (_artifact_fd, artifact_was_closed) = take_last_preexec_validation_artifact()
+                    .expect("captured failed validation artifact");
+                assert!(artifact_was_closed);
+            }
+        }
+    }
+
+    #[test]
+    fn fallback_capsule_reaches_host_exec_without_a_prepared_record() {
+        let mut payload = sample();
+        assert!(
+            attach_prepared_image_with_failpoint(
+                &mut payload,
+                &synthetic_image(),
+                &[],
+                HOST_PAGE_SIZE,
+                PreparedImageFailpoint::Ineligible,
+            )
+            .is_none()
+        );
+        let xsig = tempfile::tempfile().expect("xsignal file");
+        let survivor = tempfile::tempfile().expect("survivor file");
+        let close_on_exec = tempfile::tempfile().expect("close-on-exec file");
+        install_transport_fds(&mut payload, &xsig, &survivor, &close_on_exec);
+        let nonce = [0x66; 16];
+
+        let result = exec_capsule_with(payload, nonce, None, |request| {
+            let decoded =
+                read_capsule_once(request.capsule_fd, nonce).expect("read fallback capsule");
+            assert!(
+                decoded
+                    .guest_exec
+                    .expect("guest payload")
+                    .prepared_image
+                    .is_none()
+            );
+            std::io::Error::from_raw_os_error(libc::ENOENT)
+        });
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn capsule_validation_failure_keeps_artifact_cloexec_and_closes_owner() {
+        let mut payload = sample();
+        let artifact = attach_prepared_image(&mut payload, &synthetic_image(), &[], HOST_PAGE_SIZE)
+            .expect("eligible prepared artifact");
+        let artifact_fd = artifact.file.as_raw_fd();
+        let artifact_flags = fd_flags(artifact_fd);
+        let artifact_identity = host_identity(artifact_fd);
+        payload.argv = vec![vec![0; MAX_ITEM_LEN + 1]];
+
+        let result = exec_capsule_with(payload, [0x77; 16], Some(artifact), |_| {
+            panic!("invalid capsule must not reach host exec")
+        });
+
+        assert!(result.is_err());
+        assert_ne!(artifact_flags & libc::FD_CLOEXEC, 0);
+        assert!(fd_no_longer_refers_to(
+            artifact_fd,
+            artifact_identity.st_dev as u64,
+            artifact_identity.st_ino,
+        ));
+    }
+
+    #[test]
+    fn fd_flag_transaction_restores_capsule_style_descriptor() {
+        let capsule = tempfile::tempfile().expect("capsule file");
+        set_fd_flags(capsule.as_raw_fd(), libc::FD_CLOEXEC);
+        {
+            let mut transaction = super::HostFdFlagTransaction::default();
+            transaction
+                .prepare(capsule.as_raw_fd(), libc::FD_CLOEXEC, 0)
+                .expect("prepare capsule flags");
+            assert_eq!(fd_flags(capsule.as_raw_fd()), 0);
+        }
+        assert_eq!(fd_flags(capsule.as_raw_fd()), libc::FD_CLOEXEC);
+    }
+
+    #[test]
+    fn returned_host_exec_restores_every_fd_flag_and_closes_artifact() {
+        let mut payload = sample();
+        let artifact = attach_prepared_image(&mut payload, &synthetic_image(), &[], HOST_PAGE_SIZE)
+            .expect("eligible prepared artifact");
+        let artifact_fd = artifact.file.as_raw_fd();
+        let artifact_original_flags = fd_flags(artifact_fd);
+        let artifact_identity = host_identity(artifact_fd);
+        let xsig = tempfile::tempfile().expect("xsignal file");
+        let survivor = tempfile::tempfile().expect("survivor file");
+        let close_on_exec = tempfile::tempfile().expect("close-on-exec file");
+        install_transport_fds(&mut payload, &xsig, &survivor, &close_on_exec);
+        let mut saw_exec = false;
+
+        let result = exec_capsule_with(payload, [0x33; 16], Some(artifact), |request| {
+            saw_exec = true;
+            assert_eq!(fd_flags(request.capsule_fd), 0);
+            assert_eq!(
+                fd_flags(artifact_fd),
+                artifact_original_flags & !libc::FD_CLOEXEC
+            );
+            assert_eq!(fd_flags(xsig.as_raw_fd()), 0);
+            assert_eq!(fd_flags(survivor.as_raw_fd()), 0);
+            assert_eq!(fd_flags(close_on_exec.as_raw_fd()), libc::FD_CLOEXEC);
+            std::io::Error::from_raw_os_error(libc::ENOENT)
+        });
+
+        assert!(saw_exec);
+        assert!(result.is_err());
+        assert!(fd_no_longer_refers_to(
+            artifact_fd,
+            artifact_identity.st_dev as u64,
+            artifact_identity.st_ino,
+        ));
+        assert_eq!(fd_flags(xsig.as_raw_fd()), libc::FD_CLOEXEC);
+        assert_eq!(fd_flags(survivor.as_raw_fd()), libc::FD_CLOEXEC);
+        assert_eq!(fd_flags(close_on_exec.as_raw_fd()), 0);
+    }
+
+    #[test]
+    fn artifact_flag_failure_rolls_back_prior_flags_and_closes_artifact() {
+        let mut payload = sample();
+        let artifact = attach_prepared_image(&mut payload, &synthetic_image(), &[], HOST_PAGE_SIZE)
+            .expect("eligible prepared artifact");
+        let artifact_fd = artifact.file.as_raw_fd();
+        let artifact_identity = host_identity(artifact_fd);
+        let xsig = tempfile::tempfile().expect("xsignal file");
+        let survivor = tempfile::tempfile().expect("survivor file");
+        let close_on_exec = tempfile::tempfile().expect("close-on-exec file");
+        install_transport_fds(&mut payload, &xsig, &survivor, &close_on_exec);
+        fail_next_artifact_fd_flag_preparation(artifact_fd);
+
+        let result = exec_capsule_with(payload, [0x22; 16], Some(artifact), |_| {
+            panic!("host exec must not run after artifact flag failure")
+        });
+
+        assert!(result.is_err());
+        assert!(fd_no_longer_refers_to(
+            artifact_fd,
+            artifact_identity.st_dev as u64,
+            artifact_identity.st_ino,
+        ));
+        assert_eq!(fd_flags(xsig.as_raw_fd()), libc::FD_CLOEXEC);
+        assert_eq!(fd_flags(survivor.as_raw_fd()), libc::FD_CLOEXEC);
+        assert_eq!(fd_flags(close_on_exec.as_raw_fd()), 0);
+    }
+
+    #[test]
+    fn interim_legacy_resume_consumes_and_closes_inherited_artifact() {
+        let mut payload = sample();
+        let artifact = attach_prepared_image(&mut payload, &synthetic_image(), &[], HOST_PAGE_SIZE)
+            .expect("eligible prepared artifact");
+        let inherited_fd = unsafe { libc::fcntl(artifact.file.as_raw_fd(), libc::F_DUPFD, 0) };
+        assert!(inherited_fd >= 0);
+        let inherited_identity = host_identity(inherited_fd);
+        payload
+            .guest_exec
+            .as_mut()
+            .expect("guest payload")
+            .prepared_image = Some(artifact.record.with_artifact_fd_for_test(inherited_fd));
+        let guest = payload.guest_exec.as_mut().expect("guest payload");
+
+        discard_prepared_image_before_legacy_resume(guest)
+            .expect("discard interim inherited artifact");
+
+        assert!(guest.prepared_image.is_none());
+        assert!(fd_no_longer_refers_to(
+            inherited_fd,
+            inherited_identity.st_dev as u64,
+            inherited_identity.st_ino,
+        ));
     }
 
     #[test]
