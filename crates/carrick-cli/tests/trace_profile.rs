@@ -184,6 +184,9 @@ fn fork_profile_pairs_repair_reset_and_first_prepare_latency() {
         "host-self-reexec-capsule",
         "host-self-reexec-dispatcher",
         "host-self-reexec-image-load",
+        "host-self-reexec-prepared-build",
+        "host-self-reexec-prepared-validate",
+        "host-self-reexec-prepared-map",
         "host-self-reexec-reset",
         "host-self-reexec-restore",
         "exec-reset",
@@ -206,6 +209,16 @@ fn fork_profile_pairs_repair_reset_and_first_prepare_latency() {
         assert!(
             script.contains(&format!("DSRPROF1|incomplete|phase={phase}")),
             "missing {phase} incomplete row"
+        );
+    }
+    for declaration in [
+        "prepared_build_started[$target, 0] = 0",
+        "prepared_validate_started[$target, 0] = 0",
+        "prepared_map_started[$target, 0] = 0",
+    ] {
+        assert!(
+            script.contains(declaration),
+            "missing associative-array declaration {declaration}"
         );
     }
 }

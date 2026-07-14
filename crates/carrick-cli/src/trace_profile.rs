@@ -952,6 +952,55 @@ mod tests {
     }
 
     #[test]
+    fn prepared_self_reexec_lifecycle_survives_parsing_without_legacy_load() {
+        let summary = ProfileSummary::from_lines(
+            [
+                "DSRPROF1|sample|phase=host-self-reexec-prepared-build|pid=21|tid=21|duration_ns=1200",
+                "DSRPROF1|sample|phase=host-self-reexec-prepared-validate|pid=21|tid=21|duration_ns=800",
+                "DSRPROF1|sample|phase=host-self-reexec-prepared-map|pid=21|tid=21|duration_ns=700",
+                "DSRPROF1|complete|profile=dsr-fork|bounded=0|target_exit_reason=1",
+            ],
+            ProfileCaptureStatus::default(),
+        )
+        .expect("prepared profile");
+        let phases = summary
+            .metrics
+            .iter()
+            .filter_map(|metric| metric.scope.phase.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            phases,
+            [
+                "host-self-reexec-prepared-build",
+                "host-self-reexec-prepared-map",
+                "host-self-reexec-prepared-validate",
+            ]
+        );
+        assert!(!phases.contains(&"host-self-reexec-image-load"));
+        assert!(summary.completion.complete);
+    }
+
+    #[test]
+    fn fallback_self_reexec_lifecycle_survives_parsing_without_prepared_map() {
+        let summary = ProfileSummary::from_lines(
+            [
+                "DSRPROF1|sample|phase=host-self-reexec-image-load|pid=21|tid=21|duration_ns=1700",
+                "DSRPROF1|complete|profile=dsr-fork|bounded=0|target_exit_reason=1",
+            ],
+            ProfileCaptureStatus::default(),
+        )
+        .expect("fallback profile");
+        let phases = summary
+            .metrics
+            .iter()
+            .filter_map(|metric| metric.scope.phase.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(phases, ["host-self-reexec-image-load"]);
+        assert!(!phases.contains(&"host-self-reexec-prepared-map"));
+        assert!(summary.completion.complete);
+    }
+
+    #[test]
     fn writes_provenance_rich_jsonl_atomically() {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("profile.jsonl");

@@ -729,6 +729,9 @@ where
     F: FnOnce() -> Result<LoadedNativeExecveImage, crate::linux_abi::LinuxErrno>,
 {
     if let Some(record) = prepared_image {
+        native_reexec_lifecycle(
+            crate::probes::DsrCacheLifecyclePhase::HostSelfReexecPreparedValidateBegin,
+        );
         let prepared = crate::native_prepared_image::validate_for_resume(record).map_err(
             |error| match error {
                 crate::native_prepared_image::NativePreparedImageError::ChecksumMismatch {
@@ -737,6 +740,9 @@ where
                 error => anyhow::anyhow!("prepared-validate: {error}"),
             },
         )?;
+        native_reexec_lifecycle(
+            crate::probes::DsrCacheLifecyclePhase::HostSelfReexecPreparedValidateEnd,
+        );
         return Ok(ResumedImage {
             source: NativeImageSource::Prepared(prepared),
             legacy_resolved_path: None,
@@ -1232,7 +1238,15 @@ fn map_native_image_source(
             relative_relocations,
         ),
         NativeImageSource::Prepared(prepared) => {
-            NativeMappedMemory::map_prepared_for_plan(prepared, native_memory_layout(), plan)
+            native_reexec_lifecycle(
+                crate::probes::DsrCacheLifecyclePhase::HostSelfReexecPreparedMapBegin,
+            );
+            let mapped =
+                NativeMappedMemory::map_prepared_for_plan(prepared, native_memory_layout(), plan)?;
+            native_reexec_lifecycle(
+                crate::probes::DsrCacheLifecyclePhase::HostSelfReexecPreparedMapEnd,
+            );
+            Ok(mapped)
         }
     }
 }
