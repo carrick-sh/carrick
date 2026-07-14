@@ -342,6 +342,10 @@ pub(super) struct ProfileSnapshot {
 /// on itself at registration) for the one field that must never be stale:
 /// `thread_cpu_ns`.
 ///
+/// The self-flush and the drain race each other for real; see [`SiblingSlot`]
+/// for how the map arbitrates that race so each record is emitted EXACTLY
+/// once.
+///
 /// Scope and lifetime: this `static` is exactly as process-scoped as
 /// `profile::PROCESS_STARTUP` -- Carrick runs each guest PROCESS as a real,
 /// separate forked host OS process, so a plain `static` here already means
@@ -359,9 +363,42 @@ struct SiblingSnapshot {
     mach_port: libc::mach_port_t,
 }
 
-static SIBLING_PROFILES: OnceLock<Mutex<HashMap<i32, SiblingSnapshot>>> = OnceLock::new();
+/// EXACTLY-ONCE ARBITRATION. Exactly two parties can ever emit a given
+/// thread's record: the thread ITSELF (its own retirement flush — individual
+/// `exit(2)`, `Execve` self-reexec, `native_die_by_signal`, `RetireForExec`)
+/// and a FOREIGN thread's `exit_group` drain. Those two genuinely run at the
+/// same instant on two cores, because `exit_group` fires while its siblings
+/// are still executing. If both emit, the wire carries a duplicate
+/// `(pid, tid, era)` group — which `parse_nativeperf` HARD-REJECTS, i.e. an
+/// intermittent hard failure of a real profiled campaign run, not a
+/// degradation.
+///
+/// So the map operation itself is the single arbiter: whoever's `remove` /
+/// take-under-lock observes a `Live` slot has *claimed* the exclusive right
+/// to emit that record, and the loser emits nothing.
+///
+/// The drain leaves a `Drained` TOMBSTONE rather than removing the slot
+/// outright. Without it the claim would not be total: `libc::_exit()` is not
+/// instantaneous, so between a drain (which already emitted a sibling's
+/// record) and the actual `_exit()`, that sibling can complete another DSR
+/// loop iteration, REPUBLISH a fresh `Live` slot, then reach its own
+/// retirement flush — win the claim on the slot it just re-created — and emit
+/// the very same `(pid, tid, era)` a second time. The tombstone makes
+/// "already emitted by a drain" a durable, observable fact: `publish` refuses
+/// to overwrite it, and a self-flush that finds it stands down.
+/// * `Some(snapshot)` — LIVE: registered and unclaimed. Whoever takes it (the
+///   owning thread's self-flush, or a foreign drain) has claimed the exclusive
+///   right to emit that record.
+/// * `None` — DRAINED tombstone: a foreign `exit_group` drain has already
+///   emitted this thread's record. Neither party may emit it again.
+///
+/// `Option::take()` under the registry lock IS the claim: it flips LIVE to
+/// DRAINED and hands the snapshot to exactly one caller.
+type SiblingSlot = Option<SiblingSnapshot>;
 
-fn sibling_profiles() -> &'static Mutex<HashMap<i32, SiblingSnapshot>> {
+static SIBLING_PROFILES: OnceLock<Mutex<HashMap<i32, SiblingSlot>>> = OnceLock::new();
+
+fn sibling_profiles() -> &'static Mutex<HashMap<i32, SiblingSlot>> {
     SIBLING_PROFILES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -411,9 +448,24 @@ impl ThreadTranslator {
             // `fork()` only duplicates the calling thread: every OTHER entry
             // in the inherited (COW) sibling registry names an OS thread --
             // and a mach port -- that does not exist in this new process.
-            // Clear it before re-seeding this (the one surviving) thread,
-            // else a later `exit_group` drain in the child would `thread_info`
-            // a stale/dangling port name from the parent's port namespace.
+            // Clear it (`Drained` tombstones included: they describe the
+            // PARENT's emissions, and the child re-registers from scratch)
+            // before re-seeding this, the one surviving thread; else a later
+            // `exit_group` drain in the child would `thread_info` a
+            // stale/dangling port name from the parent's port namespace.
+            //
+            // Safe to take this lock here for exactly the reason the
+            // pre-existing `self.process.state` lock above is: the fork is
+            // serialized by the quiesce barrier. The forking thread calls
+            // `fork_quiesce::set_quiescing()` and then blocks in
+            // `wait_quiesced(others, timeout)` until all `others` guest
+            // threads have PARKED in `park_if_quiescing()` (via
+            // `NativeThreadRuntime::park_for_fork_quiesce`), and only then
+            // calls `libc::fork()`. `publish_sibling_snapshot` takes this
+            // lock at the DSR loop top and releases it before that park
+            // point, and it is never held across the park -- so no thread can
+            // be holding it at the instant the child's address space is
+            // snapshotted, and the child can never inherit it locked.
             sibling_profiles().lock().clear();
         }
         self.profile_finalized = false;
@@ -524,38 +576,31 @@ impl ThreadTranslator {
         }
     }
 
+    /// Claim this process epoch's OUTSTANDING process-wide resolver delta for
+    /// the calling thread's record. The process-wide counters (translations,
+    /// cache lookups/hits, invalidated blocks, translation_*_ns, duplicate
+    /// publications) are SHARED by every thread of the process, so they are
+    /// published as a delta against a single `reported_stats` checkpoint that
+    /// this call advances: whatever accrued since the last claim is assigned
+    /// to exactly ONE record, and the next claimer starts from the new
+    /// checkpoint. That is what makes summing the per-thread records recover
+    /// the process totals exactly once (see
+    /// `process_resolver_deltas_are_counted_exactly_once_across_threads`).
     fn claim_profile_snapshot(&mut self) -> Result<ProfileSnapshot, profile::ProfileError> {
-        Self::claim_profile_snapshot_for(&self.process, self.stats, self.nested_translation_ns)
-    }
-
-    /// The guts of `claim_profile_snapshot`, generalized to any thread's
-    /// captured `ResolverStats` against a given process -- not just `self`'s.
-    /// This is what lets `drain_sibling_profiles_before_process_exit` compute
-    /// a sibling's resolver delta using its own last-published `stats`
-    /// (the per-thread half) against this process's CURRENT, live shared
-    /// counters (the process-wide half, safe to read from any thread under
-    /// its own lock) instead of a stale copy of those too.
-    fn claim_profile_snapshot_for(
-        process: &ProcessTranslator,
-        stats: ResolverStats,
-        nested_translation_ns: u64,
-    ) -> Result<ProfileSnapshot, profile::ProfileError> {
-        if let Some(error) = stats.invalid {
+        if let Some(error) = self.stats.invalid {
             return Err(error);
         }
-        let mut process_state = process.state.lock();
-        let delta = process_state
-            .stats
-            .checked_delta(process_state.reported_stats)?;
-        process_state.reported_stats = process_state.stats;
+        let mut process = self.process.state.lock();
+        let delta = process.stats.checked_delta(process.reported_stats)?;
+        process.reported_stats = process.stats;
         Ok(ProfileSnapshot {
-            resolver_exits: stats.resolver_exits,
-            one_entry_hits: stats.one_entry_hits,
+            resolver_exits: self.stats.resolver_exits,
+            one_entry_hits: self.stats.one_entry_hits,
             translations: delta.translations,
             duplicate_publications: delta.duplicate_publications,
-            gateway_entries: stats.gateway_entries,
-            syscall_exits: stats.syscall_exits,
-            direct_resolver_exits: stats.direct_resolver_exits,
+            gateway_entries: self.stats.gateway_entries,
+            syscall_exits: self.stats.syscall_exits,
+            direct_resolver_exits: self.stats.direct_resolver_exits,
             cache_lookups: delta.cache_lookups,
             cache_lookup_hits: delta.cache_lookup_hits,
             invalidated_blocks: delta.invalidated_blocks,
@@ -564,9 +609,70 @@ impl ThreadTranslator {
             translation_plan_ns: delta.translation_plan_ns,
             translation_emit_ns: delta.translation_emit_ns,
             translation_publication_ns: delta.translation_publication_ns,
+            nested_translation_ns: self.nested_translation_ns,
+            cache_used_bytes: process.cache.used_bytes(),
+            cache_capacity_bytes: process.cache.capacity_bytes(),
+        })
+    }
+
+    /// The resolver snapshot for a DRAINED SIBLING's record.
+    ///
+    /// Deliberately does NOT claim the process-wide delta: every field that is
+    /// a delta against the shared `reported_stats` checkpoint
+    /// (`translations`, `duplicate_publications`, `cache_lookups`,
+    /// `cache_lookup_hits`, `invalidated_blocks`, `translation_*_ns`) is
+    /// reported as ZERO here, BY CONSTRUCTION, and the checkpoint is left
+    /// untouched.
+    ///
+    /// WHY: the process-wide delta must be assigned exactly once per process
+    /// epoch, and the DRAINING thread's own flush -- which always runs
+    /// immediately before the drain, at every one of the `libc::_exit()` seams
+    /// (`translator.finalize_profile_epoch()` then
+    /// `translator.drain_sibling_profiles_before_process_exit()`) -- has
+    /// already claimed it via `claim_profile_snapshot`. If the drain claimed
+    /// again per sibling, only the FIRST sibling in the loop would receive the
+    /// (near-zero) residue and every later one would silently get ~0 anyway,
+    /// with the split depending on nothing but loop order: the same zeros,
+    /// arbitrarily and nondeterministically distributed. Reporting a
+    /// structural zero is the same information, stated honestly, and keeps the
+    /// "assigned exactly once, never double-counted" invariant trivially true.
+    ///
+    /// The PER-THREAD fields (`resolver_exits`, `one_entry_hits`,
+    /// `gateway_entries`, `syscall_exits`, `direct_resolver_exits`,
+    /// `nested_translation_ns`) are the sibling's OWN real counters, and the
+    /// cache POINT-IN-TIME gauges (`cache_used_bytes`/`cache_capacity_bytes`)
+    /// are real live reads -- neither is a delta, so neither is affected.
+    fn drained_sibling_profile_snapshot(
+        process: &ProcessTranslator,
+        stats: ResolverStats,
+        nested_translation_ns: u64,
+    ) -> Result<ProfileSnapshot, profile::ProfileError> {
+        if let Some(error) = stats.invalid {
+            return Err(error);
+        }
+        let process_state = process.state.lock();
+        Ok(ProfileSnapshot {
+            resolver_exits: stats.resolver_exits,
+            one_entry_hits: stats.one_entry_hits,
+            gateway_entries: stats.gateway_entries,
+            syscall_exits: stats.syscall_exits,
+            direct_resolver_exits: stats.direct_resolver_exits,
             nested_translation_ns,
+            // Point-in-time gauges, never deltas: real live reads.
             cache_used_bytes: process_state.cache.used_bytes(),
             cache_capacity_bytes: process_state.cache.capacity_bytes(),
+            // Process-wide deltas: owned by the draining thread's own record
+            // (see the doc comment above); structurally zero here.
+            translations: 0,
+            duplicate_publications: 0,
+            cache_lookups: 0,
+            cache_lookup_hits: 0,
+            invalidated_blocks: 0,
+            translation_ns: 0,
+            translation_decode_ns: 0,
+            translation_plan_ns: 0,
+            translation_emit_ns: 0,
+            translation_publication_ns: 0,
         })
     }
 
@@ -575,9 +681,15 @@ impl ThreadTranslator {
             return None;
         }
         self.profile_finalized = true;
-        // This thread is about to emit its own complete record itself: a
-        // foreign `exit_group` drain must never ALSO emit it (exactly-once).
-        self.withdraw_sibling_snapshot();
+        // EXACTLY-ONCE. A foreign `exit_group` drain races this flush for the
+        // right to emit this thread's record. The map operation is the single
+        // arbiter: emit ONLY if this thread won the claim. If the drain got
+        // there first it has already emitted this record, and emitting it
+        // again would put a duplicate `(pid, tid, era)` group on the wire --
+        // a hard parse failure, not a degradation.
+        if !self.claim_own_profile_emission() {
+            return None;
+        }
         let frames = self
             .budget
             .complete_record()
@@ -606,6 +718,11 @@ impl ThreadTranslator {
     /// so a snapshot taken here can always be turned into a valid, reconciled
     /// `CompleteThreadRecord` later. A no-op (no lock, no port lookup) when
     /// profiling is disabled.
+    ///
+    /// Never resurrects a `Drained` tombstone: once a foreign drain has
+    /// emitted this thread's record, re-registering would let a later
+    /// self-flush win a claim on the freshly re-created slot and emit the same
+    /// `(pid, tid, era)` a second time (see [`SiblingSlot`]).
     pub(super) fn publish_sibling_snapshot(&self) {
         if !self.budget.enabled() {
             return;
@@ -616,66 +733,156 @@ impl ThreadTranslator {
             nested_translation_ns: self.nested_translation_ns,
             mach_port: crate::host_proc::current_thread_port(),
         };
-        sibling_profiles().lock().insert(self.tid, snapshot);
+        let mut slots = sibling_profiles().lock();
+        match slots.get(&self.tid) {
+            // A DRAINED tombstone: a foreign drain already emitted this
+            // thread's record. Never resurrect the slot.
+            Some(None) => {}
+            _ => {
+                slots.insert(self.tid, Some(snapshot));
+            }
+        }
     }
 
-    /// Remove this thread's slot, idempotently. Called from every self-flush
-    /// path (`take_profile_frames`, covering `finalize_profile_epoch` and the
-    /// exec handoff) so a thread that DOES get to run its own flush is never
-    /// ALSO emitted a second time by a foreign `exit_group` drain.
-    fn withdraw_sibling_snapshot(&self) {
+    /// Claim the exclusive right to emit THIS thread's record, arbitrated by a
+    /// single map operation under the registry lock. Returns true iff the
+    /// caller may emit.
+    ///
+    /// - LIVE slot (`Some(_)`): this thread took it, so the drain cannot --
+    ///   emit.
+    /// - DRAINED tombstone (`Some(None)`): a foreign `exit_group` drain
+    ///   already emitted this record -- do NOT emit (and the tombstone goes
+    ///   straight back, so a later republish + self-flush cannot resurrect
+    ///   the duplicate either).
+    /// - no slot at all (`None`): this thread never registered (a
+    ///   profiling-off translator, or one that never reached a DSR
+    ///   loop-iteration boundary), so no drain can possibly know about it --
+    ///   emit.
+    ///
+    /// Profiling off: there is no registry and no claim to make, and
+    /// `take_profile_frames` has already returned `None` before reaching here,
+    /// so the profile-off path still emits nothing at all.
+    fn claim_own_profile_emission(&self) -> bool {
         if !self.budget.enabled() {
-            return;
+            return true;
         }
-        sibling_profiles().lock().remove(&self.tid);
+        let mut slots = sibling_profiles().lock();
+        match slots.remove(&self.tid) {
+            Some(Some(_)) => true,
+            Some(None) => {
+                slots.insert(self.tid, None);
+                false
+            }
+            None => true,
+        }
     }
 
     /// About to trigger a process-wide `libc::_exit()` because Linux
     /// `exit_group` semantics (or this being the last live thread) say every
     /// OTHER guest OS thread of this process dies right now, unconditionally,
     /// with zero chance to run any code of its own -- `Drop` included. Emit a
-    /// complete NATIVEPERF record for every STILL-REGISTERED sibling using
-    /// its last-published counters (reconciled -- see
-    /// `publish_sibling_snapshot`) and a LIVE cross-thread `thread_info` read
-    /// of its actual CPU via the mach port it captured at registration (CPU
-    /// is never stale here, regardless of how long ago the rest of the
-    /// snapshot was published).
+    /// complete NATIVEPERF record for every still-`Live` sibling using its
+    /// last-published counters (reconciled -- see `publish_sibling_snapshot`)
+    /// and a LIVE cross-thread `thread_info` read of its actual CPU via the
+    /// mach port it captured at registration (CPU is never stale here,
+    /// regardless of how long ago the rest of the snapshot was published).
     ///
-    /// Callers must flush and deregister THEIR OWN slot first (e.g. via
-    /// `finalize_profile_epoch`) -- this only drains what remains, i.e. only
-    /// genuine siblings. A no-op when profiling is disabled. Never emits a
-    /// wire `invalid` record: a sibling whose record cannot be reconstructed
-    /// (an internal invariant violation, or its port already gone -- which
-    /// should not happen for a still-registered entry, since deregistration
-    /// always runs on the owning thread's own stack before it could vanish)
-    /// is silently skipped rather than poisoning the whole profile parse,
-    /// which rejects any `invalid` record outright; skipping only degrades
-    /// back to today's known (and now guarded-against) under-attribution for
-    /// that one thread, never worse.
-    pub(super) fn drain_sibling_profiles_before_process_exit(&self) {
+    /// Taking a `Live` slot CLAIMS it, exactly as a self-flush would, and
+    /// leaves a `Drained` tombstone so the owning thread -- which may be
+    /// concurrently racing its own retirement flush on another core, and may
+    /// even complete another DSR iteration before the `_exit()` lands --
+    /// stands down instead of emitting a duplicate `(pid, tid, era)` group
+    /// (see [`SiblingSlot`]).
+    ///
+    /// The siblings drained here report structurally zero process-wide
+    /// resolver deltas (see `drained_sibling_profile_snapshot`); the caller,
+    /// [`Self::finalize_profile_epoch_at_process_exit`], flushes its own
+    /// record AFTER this drain and thereby claims the epoch's entire
+    /// outstanding process-wide delta exactly once.
+    ///
+    /// A no-op when profiling is disabled. Never emits a wire `invalid`
+    /// record: a sibling whose record cannot be reconstructed is reported
+    /// through `tracing::warn!` and skipped, because the profile parser
+    /// rejects any `invalid` record for the WHOLE profile -- so emitting one
+    /// would be a strictly worse failure than losing this one thread's
+    /// attribution.
+    fn drain_sibling_profiles_before_process_exit(&self) {
         if !self.budget.enabled() {
             return;
         }
-        let siblings: Vec<SiblingSnapshot> =
-            sibling_profiles().lock().drain().map(|(_, v)| v).collect();
+        let siblings: Vec<SiblingSnapshot> = {
+            let mut slots = sibling_profiles().lock();
+            // `take()` IS the claim: it flips each LIVE slot to a DRAINED
+            // tombstone and hands this thread the snapshot, so the owning
+            // thread -- which may be racing its own retirement flush on
+            // another core right now -- stands down instead of emitting a
+            // duplicate.
+            slots.values_mut().filter_map(Option::take).collect()
+        };
         for snapshot in siblings {
-            let frames = (|| -> Result<Vec<String>, profile::ProfileError> {
-                let record = snapshot.budget.complete_record()?;
-                let resolver = Self::claim_profile_snapshot_for(
-                    &self.process,
-                    snapshot.stats,
-                    snapshot.nested_translation_ns,
-                )?;
-                let gauges = profile::flush_gauges_for_port(
-                    snapshot.mach_port,
-                    snapshot.budget.thread_cpu_baseline_ns(),
-                )?;
-                record.to_protocol_frames_with_resolver(resolver, gauges)
-            })();
-            if let Ok(frames) = frames {
-                let _ = profile::write_protocol_frames_to_fd(libc::STDERR_FILENO, &frames);
+            match Self::drained_sibling_frames(&self.process, &snapshot) {
+                Ok(frames) => {
+                    let _ = profile::write_protocol_frames_to_fd(libc::STDERR_FILENO, &frames);
+                }
+                Err(error) => tracing::warn!(
+                    %error,
+                    tid = snapshot.budget.tid(),
+                    "native DSR could not reconstruct the profile record of a guest thread \
+                     killed by exit_group; its CPU stays in the derived helper residual"
+                ),
             }
         }
+    }
+
+    fn drained_sibling_frames(
+        process: &ProcessTranslator,
+        snapshot: &SiblingSnapshot,
+    ) -> Result<Vec<String>, profile::ProfileError> {
+        let record = snapshot.budget.complete_record()?;
+        let resolver = Self::drained_sibling_profile_snapshot(
+            process,
+            snapshot.stats,
+            snapshot.nested_translation_ns,
+        )?;
+        let gauges = profile::flush_gauges_for_port(
+            snapshot.mach_port,
+            snapshot.budget.thread_cpu_baseline_ns(),
+        )?;
+        record.to_protocol_frames_with_resolver(resolver, gauges)
+    }
+
+    /// The COMPLETE profile flush for a thread that is about to terminate the
+    /// WHOLE process: Linux `exit_group`, or an `exit(2)`/retirement that
+    /// turned out to be the last live thread. The imminent `libc::_exit()`
+    /// kills every other guest OS thread of this process instantly, with zero
+    /// chance for any of them to run a line of its own code, `Drop` included.
+    ///
+    /// The three steps are ORDERED, and the order is load-bearing:
+    ///
+    /// 1. Claim THIS thread's own registry slot, so the drain in step 2 cannot
+    ///    emit this thread's record from the (up to one iteration stale)
+    ///    snapshot it published at the loop top -- this thread is alive and
+    ///    running, and owns its own, current record.
+    /// 2. Drain the siblings. Each one's record is emitted with structurally
+    ///    zero process-wide resolver deltas (`drained_sibling_profile_snapshot`).
+    /// 3. Flush THIS thread's own record LAST. Its `claim_profile_snapshot`
+    ///    therefore assigns it the process epoch's ENTIRE outstanding
+    ///    process-wide resolver delta -- including everything the siblings
+    ///    accumulated right up to this instant. Nothing is dropped (as it
+    ///    would be if this thread claimed BEFORE the drain and the siblings'
+    ///    last microseconds of shared work went to nobody) and nothing is
+    ///    double-counted: the delta is assigned exactly once, to this record.
+    ///
+    /// If ANOTHER thread's `exit_group` drain has already emitted this
+    /// thread's record (two threads can call `exit_group` at once), step 1
+    /// observes the `Drained` tombstone and step 3 correctly emits nothing.
+    pub(super) fn finalize_profile_epoch_at_process_exit(&mut self) {
+        if !self.budget.enabled() {
+            return;
+        }
+        let _ = self.claim_own_profile_emission();
+        self.drain_sibling_profiles_before_process_exit();
+        self.finalize_profile_epoch();
     }
 }
 
@@ -2786,6 +2993,300 @@ mod tests {
             .filter(|line| line.starts_with("NATIVEPERF1|thread|") && line.contains(&needle))
             .map(str::to_owned)
             .collect()
+    }
+
+    /// How many complete `core` frames (i.e. how many EMITTED RECORDS -- one
+    /// `core` frame per record) name `tid` in the captured wire.
+    fn core_frames_for_tid(captured: &str, tid: i32) -> usize {
+        frames_for_tid(captured, tid)
+            .iter()
+            .filter(|line| line.contains("|frame=core|"))
+            .count()
+    }
+
+    /// EXACTLY-ONCE UNDER CONCURRENCY. The registry hands one thread's record
+    /// to exactly one of two possible emitters -- the thread's own self-flush
+    /// (individual `exit(2)` via `finalize_native_thread_exit`, an `Execve`
+    /// self-reexec, `native_die_by_signal`, or a `RetireForExec` retirement)
+    /// or a FOREIGN thread's `exit_group` drain -- and those two can genuinely
+    /// run at the same instant on two cores, since `exit_group` fires while
+    /// siblings are still executing. If both emit, the wire carries a
+    /// duplicate `(pid, tid, era)` group, which `parse_nativeperf` hard-rejects
+    /// ("duplicate frame ... for duplicate thread identity") -- an intermittent
+    /// HARD FAILURE of a real profiled campaign run, not a degradation.
+    ///
+    /// Two REAL OS threads, synchronized only through the shared registry plus
+    /// a per-iteration barrier that lines their two claims up as tightly as
+    /// the scheduler allows: one repeatedly registers-then-self-flushes, the
+    /// other repeatedly drains. Across every iteration each identity must
+    /// appear EXACTLY once on the wire -- never twice (duplicate) and never
+    /// zero times (lost).
+    #[test]
+    fn sibling_flush_is_exactly_once_when_a_drain_races_a_self_flush() {
+        fork_test(|| {
+            use std::io::Read as _;
+            use std::os::fd::FromRawFd as _;
+            use std::sync::{Arc, Barrier};
+
+            const ITERATIONS: i32 = 256;
+            const FIRST_TID: i32 = 20_000;
+
+            let mut stderr_pipe = [0i32; 2];
+            assert_eq!(unsafe { libc::pipe(stderr_pipe.as_mut_ptr()) }, 0);
+            let saved_stderr = unsafe { libc::dup(libc::STDERR_FILENO) };
+            assert!(saved_stderr >= 0, "dup stderr");
+            assert_eq!(
+                unsafe { libc::dup2(stderr_pipe[1], libc::STDERR_FILENO) },
+                libc::STDERR_FILENO,
+                "redirect stderr"
+            );
+            assert_eq!(unsafe { libc::close(stderr_pipe[1]) }, 0);
+
+            // Drain the pipe CONCURRENTLY: 256 iterations x 10 frames x up to
+            // two emitters is far past the 64 KiB pipe buffer, so a reader that
+            // only ran after the join would wedge the writers.
+            let read_fd = stderr_pipe[0];
+            let reader = std::thread::spawn(move || {
+                let mut text = String::new();
+                let mut file = unsafe { std::fs::File::from_raw_fd(read_fd) };
+                file.read_to_string(&mut text)
+                    .expect("read captured stderr");
+                text
+            });
+
+            let pid = unsafe { libc::getpid() };
+            let process = std::sync::Arc::new(
+                super::ProcessTranslator::new(16 * 1024).expect("create process translator"),
+            );
+            let barrier = Arc::new(Barrier::new(2));
+
+            let self_flusher = {
+                let process = std::sync::Arc::clone(&process);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    for index in 0..ITERATIONS {
+                        let tid = FIRST_TID + index;
+                        let mut translator = super::ThreadTranslator::for_process(
+                            std::sync::Arc::clone(&process),
+                            tid,
+                        );
+                        translator.budget =
+                            super::profile::ThreadBudget::enabled_for_test(pid, tid);
+                        // "At DSR loop entry" -- register the slot a foreign
+                        // drain could take.
+                        translator.publish_sibling_snapshot();
+                        barrier.wait();
+                        // Alternate which side is favoured so BOTH orderings
+                        // are exercised: on even iterations yield so the drain
+                        // most likely wins the claim, on odd ones go straight
+                        // for it so this thread most likely wins. Either way
+                        // the identity must land on the wire exactly once.
+                        if index % 2 == 0 {
+                            std::thread::yield_now();
+                        }
+                        // ...and race a drain with this thread's OWN
+                        // retirement flush.
+                        translator.finalize_profile_epoch();
+                    }
+                })
+            };
+            let drainer = {
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let mut leader = super::ThreadTranslator::for_process(process, 42);
+                    leader.budget = super::profile::ThreadBudget::enabled_for_test(pid, 42);
+                    for index in 0..ITERATIONS {
+                        barrier.wait();
+                        if index % 2 == 1 {
+                            std::thread::yield_now();
+                        }
+                        leader.drain_sibling_profiles_before_process_exit();
+                    }
+                    leader.finalize_profile_epoch();
+                })
+            };
+            self_flusher.join().expect("join self-flushing thread");
+            drainer.join().expect("join draining thread");
+
+            unsafe {
+                assert_eq!(
+                    libc::dup2(saved_stderr, libc::STDERR_FILENO),
+                    libc::STDERR_FILENO
+                );
+                libc::close(saved_stderr);
+            }
+            let captured = reader.join().expect("join stderr reader");
+
+            assert!(
+                !captured.contains("NATIVEPERF1|invalid|"),
+                "the race must never produce an invalid record"
+            );
+            let mut duplicated = Vec::new();
+            let mut lost = Vec::new();
+            for index in 0..ITERATIONS {
+                let tid = FIRST_TID + index;
+                match core_frames_for_tid(&captured, tid) {
+                    1 => {}
+                    0 => lost.push(tid),
+                    n => duplicated.push((tid, n)),
+                }
+            }
+            assert!(
+                duplicated.is_empty(),
+                "a drain racing a self-flush DOUBLE-emitted {} of {ITERATIONS} identities \
+                 (duplicate (pid, tid, era) groups the wire protocol rejects): {duplicated:?}",
+                duplicated.len()
+            );
+            assert!(
+                lost.is_empty(),
+                "a drain racing a self-flush LOST {} of {ITERATIONS} identities entirely: {lost:?}",
+                lost.len()
+            );
+        });
+    }
+
+    /// The process-wide resolver counters (translations, cache lookups/hits,
+    /// invalidated blocks, translation_*_ns, duplicate publications) are
+    /// SHARED by every thread of the process and are published as a delta
+    /// against ONE `reported_stats` checkpoint. So the delta must be assigned
+    /// to exactly one record per process epoch -- never split arbitrarily, and
+    /// never double-counted.
+    ///
+    /// At an `exit_group` seam the owner is the DRAINING thread's own record:
+    /// its `finalize_profile_epoch()` always runs immediately before the
+    /// drain, and claims the outstanding delta. The siblings drained after it
+    /// therefore report structurally ZERO process-wide deltas -- not "whatever
+    /// happened to still be unclaimed when the loop reached them", which
+    /// would hand the first sibling the residue and every later one ~0 purely
+    /// as a function of loop order.
+    ///
+    /// This pins that ownership. It also pins what must NOT be zeroed: the
+    /// siblings' own PER-THREAD resolver counters, and the cache
+    /// point-in-time gauges (neither is a delta).
+    #[test]
+    fn a_drain_leaves_the_process_wide_resolver_delta_to_the_draining_threads_record() {
+        fork_test(|| {
+            use std::io::Read as _;
+            use std::os::fd::FromRawFd as _;
+
+            let mut stderr_pipe = [0i32; 2];
+            assert_eq!(unsafe { libc::pipe(stderr_pipe.as_mut_ptr()) }, 0);
+            let saved_stderr = unsafe { libc::dup(libc::STDERR_FILENO) };
+            assert!(saved_stderr >= 0, "dup stderr");
+            assert_eq!(
+                unsafe { libc::dup2(stderr_pipe[1], libc::STDERR_FILENO) },
+                libc::STDERR_FILENO,
+                "redirect stderr"
+            );
+            assert_eq!(unsafe { libc::close(stderr_pipe[1]) }, 0);
+
+            let pid = unsafe { libc::getpid() };
+            const LEADER_TID: i32 = 42;
+            const SIBLING_TIDS: [i32; 2] = [9051, 9052];
+            let process = std::sync::Arc::new(
+                super::ProcessTranslator::new(16 * 1024).expect("create process translator"),
+            );
+            // The whole process epoch's shared, process-wide resolver work.
+            process
+                .state
+                .lock()
+                .stats
+                .add(super::ResolverStat::Translations, 11);
+            process
+                .state
+                .lock()
+                .stats
+                .add(super::ResolverStat::CacheLookups, 23);
+
+            // Two siblings register, then die without ever running their own
+            // flush (exit_group's hard kill) -- each with its OWN per-thread
+            // resolver counters, which must survive the drain intact.
+            let mut siblings = Vec::new();
+            for (index, tid) in SIBLING_TIDS.into_iter().enumerate() {
+                let mut sibling =
+                    super::ThreadTranslator::for_process(std::sync::Arc::clone(&process), tid);
+                sibling.budget = super::profile::ThreadBudget::enabled_for_test(pid, tid);
+                sibling
+                    .stats
+                    .add(super::ResolverStat::OneEntryHits, (index as u64) + 1);
+                sibling.publish_sibling_snapshot();
+                siblings.push(sibling);
+            }
+
+            let mut leader =
+                super::ThreadTranslator::for_process(std::sync::Arc::clone(&process), LEADER_TID);
+            leader.budget = super::profile::ThreadBudget::enabled_for_test(pid, LEADER_TID);
+            // The real `exit_group` seam: claim own slot, drain the siblings,
+            // then flush this thread's own record LAST so it claims the whole
+            // outstanding process-wide delta.
+            leader.finalize_profile_epoch_at_process_exit();
+
+            // The siblings were killed by the `_exit()`: they never run again.
+            for sibling in siblings {
+                std::mem::forget(sibling);
+            }
+
+            unsafe {
+                assert_eq!(
+                    libc::dup2(saved_stderr, libc::STDERR_FILENO),
+                    libc::STDERR_FILENO
+                );
+                libc::close(saved_stderr);
+            }
+            let mut captured = String::new();
+            {
+                let mut reader = unsafe { std::fs::File::from_raw_fd(stderr_pipe[0]) };
+                reader
+                    .read_to_string(&mut captured)
+                    .expect("read captured stderr");
+            }
+
+            // The draining thread's own record owns the whole process delta.
+            let leader_frames = frames_for_tid(&captured, LEADER_TID);
+            assert_eq!(core_frames_for_tid(&captured, LEADER_TID), 1);
+            assert_eq!(protocol_value(&leader_frames, "translations"), 11);
+            assert_eq!(protocol_value(&leader_frames, "cache_lookups"), 23);
+
+            for (index, tid) in SIBLING_TIDS.into_iter().enumerate() {
+                let frames = frames_for_tid(&captured, tid);
+                assert_eq!(
+                    core_frames_for_tid(&captured, tid),
+                    1,
+                    "each drained sibling must be emitted exactly once"
+                );
+                // Process-wide deltas: structurally zero on EVERY drained
+                // sibling -- not just the 2nd..Nth. Before this rule, the
+                // first sibling in the drain loop swallowed the (arbitrary)
+                // residue and the rest silently got 0.
+                for field in [
+                    "translations",
+                    "duplicate_publications",
+                    "cache_lookups",
+                    "cache_lookup_hits",
+                    "invalidated_blocks",
+                    "nested_translation_ns",
+                    "nested_translation_decode_ns",
+                    "nested_translation_plan_ns",
+                    "nested_translation_emit_ns",
+                    "nested_translation_publication_ns",
+                ] {
+                    assert_eq!(
+                        protocol_value(&frames, field),
+                        0,
+                        "drained sibling tid={tid} must report a structurally zero \
+                         process-wide delta for {field} (the draining thread's record owns it)"
+                    );
+                }
+                // ...but its OWN per-thread counters are real, and the cache
+                // point-in-time gauges are real live reads. Neither is a delta.
+                assert_eq!(
+                    protocol_value(&frames, "one_entry_hits"),
+                    (index as u64) + 1,
+                    "a drained sibling's per-thread resolver counters must survive intact"
+                );
+                assert_eq!(protocol_value(&frames, "cache_capacity_bytes"), 16 * 1024);
+            }
+        });
     }
 
     /// The root cause this task fixes: Linux `exit_group` kills every OTHER
