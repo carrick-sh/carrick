@@ -137,10 +137,38 @@ pub mod namespace;
 pub(crate) mod native_darwin;
 #[cfg(target_os = "macos")]
 pub(crate) mod native_exec_capsule;
-#[cfg(target_os = "macos")]
 pub(crate) mod native_prepared_image;
 pub mod network;
 pub mod page_profile;
+
+#[cfg(any(not(target_os = "macos"), test))]
+const _: fn(&crate::memory::MemoryRegion, Option<u64>) -> std::ops::Range<usize> =
+    native_prepared_image::native_region_copy_window;
+
+#[cfg(any(not(target_os = "macos"), test))]
+const _: fn(
+    native_prepared_image::PreparedGuestVa,
+    native_prepared_image::PreparedGuestVa,
+) -> native_prepared_image::NativeRelativeRelocation =
+    native_prepared_image::NativeRelativeRelocation::new;
+
+#[cfg(test)]
+mod native_cfg_topology_tests {
+    #[test]
+    fn native_darwin_unconditional_import_has_unconditional_schema_module() {
+        let source = include_str!("lib.rs");
+        let declaration = "pub(crate) mod native_prepared_image;";
+        let offset = source.find(declaration).expect("schema module declaration");
+        let preceding_line = source[..offset]
+            .lines()
+            .next_back()
+            .expect("line before schema module");
+        assert_ne!(
+            preceding_line, "#[cfg(target_os = \"macos\")]",
+            "native_darwin imports this schema on every target"
+        );
+    }
+}
 
 /// Execute the transport-only PID preservation diagnostic for the private
 /// native self-reexec path. This is intentionally exposed only as a narrow
