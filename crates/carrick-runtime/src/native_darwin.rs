@@ -860,6 +860,18 @@ pub(crate) fn resume_guest_from_capsule(
     argv: Vec<Vec<u8>>,
     env: Vec<Vec<u8>>,
 ) -> anyhow::Result<i32> {
+    if let Some(arena) = guest.kernel_arena {
+        carrick_kernel::arena::KernelArena::init_global_from_reexec(
+            carrick_kernel::arena::KernelArenaReexecAuthority {
+                fd: arena.host_fd,
+                original_fd_flags: arena.original_host_fd_flags,
+                device: arena.host_device,
+                inode: arena.host_inode,
+                size: arena.host_size,
+            },
+        )
+        .map_err(|error| anyhow::anyhow!("restore native kernel arena: {error}"))?;
+    }
     let max_traps = usize::try_from(guest.max_traps)?;
     let plan = crate::page_profile::resolve_execution_plan_for_request(
         carrick_spec::Platform::host_native(),
@@ -878,6 +890,9 @@ pub(crate) fn resume_guest_from_capsule(
     dispatcher.set_cwd(&guest.cwd);
     dispatcher.set_stream_stdio(guest.stream_stdio);
     dispatcher.restore_native_reexec_process_state(&guest.process_state);
+    if guest.process_state.ptrace_traceme != crate::guest_cpu::self_is_virtual_ptrace_tracee() {
+        anyhow::bail!("native self-reexec ptrace state disagrees with the inherited kernel arena");
+    }
     dispatcher
         .restore_native_reexec_fd_table(&guest.fd_table)
         .map_err(|error| anyhow::anyhow!("restore native guest fd table: {error}"))?;
@@ -915,6 +930,11 @@ pub(crate) fn resume_guest_from_capsule(
             .collect(),
         env,
     );
+    // The ordinary in-process exec path reports this boundary after publishing
+    // the new image. Host self-reexec must do the same before the restored image
+    // executes its first instruction; otherwise PTRACE_TRACEME silently vanishes
+    // across the transport even though the typed state itself was restored.
+    crate::exec_helpers::stop_after_traced_exec(&dispatcher);
     native_reexec_lifecycle(crate::probes::DsrCacheLifecyclePhase::HostSelfReexecResetEnd);
     run_image_in_current_process(
         resumed.source,
