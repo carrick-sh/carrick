@@ -490,6 +490,7 @@ pub(crate) struct NativeReexecFdTableV1 {
     pub(crate) files: Vec<NativeReexecFdV1>,
     pub(crate) descriptions: Vec<NativeReexecDescriptionV1>,
     pub(crate) close_on_exec_host_fds: Vec<i32>,
+    pub(crate) closed_stdio: [bool; 3],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

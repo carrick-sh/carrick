@@ -626,6 +626,33 @@ impl SyscallDispatcher {
         crate::host_signal::reset_routed_handlers_after_execve(ignored);
     }
 
+    pub(super) fn native_reexec_ignored_signals(&self) -> carrick_abi::SigSet {
+        self.signal
+            .lock()
+            .handlers
+            .iter()
+            .filter(|&(_, action)| action.sa_handler == crate::linux_abi::LINUX_SIG_IGN)
+            .fold(carrick_abi::SigSet::EMPTY, |set, (&signum, _)| {
+                set.with(signum)
+            })
+    }
+
+    pub(super) fn restore_native_reexec_ignored_signals(&self, ignored: carrick_abi::SigSet) {
+        let mut signal = self.signal.lock();
+        signal.handlers.clear();
+        for signum in 1..=64 {
+            if ignored.contains(signum) {
+                signal.handlers.insert(
+                    signum,
+                    LinuxSigaction {
+                        sa_handler: crate::linux_abi::LINUX_SIG_IGN,
+                        ..LinuxSigaction::empty()
+                    },
+                );
+            }
+        }
+    }
+
     /// Apply Linux handler-time masking for `signum`, returning the mask that
     /// `rt_sigreturn` should restore (saved in the sigframe).
     ///

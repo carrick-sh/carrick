@@ -50,6 +50,45 @@ pub(crate) struct NativeGuestExecV1 {
     pub(crate) max_traps: u64,
     pub(crate) native_page_profile: carrick_spec::NativePageProfileRequest,
     pub(crate) fd_table: crate::dispatch::fd_table::NativeReexecFdTableV1,
+    pub(crate) xsig: NativeReexecXsigV1,
+    pub(crate) process_state: NativeReexecProcessStateV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct NativeReexecXsigV1 {
+    pub(crate) host_fd: i32,
+    pub(crate) original_host_fd_flags: i32,
+    pub(crate) host_device: u64,
+    pub(crate) host_inode: u64,
+    pub(crate) host_size: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct NativeReexecProcessStateV1 {
+    pub(crate) credentials: NativeReexecCredentialsV1,
+    pub(crate) supplementary_groups_override: Option<Vec<u32>>,
+    pub(crate) ignored_signals: u64,
+    pub(crate) nofile_soft: u64,
+    pub(crate) rlimit_overrides: Vec<Option<NativeReexecRlimitV1>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct NativeReexecCredentialsV1 {
+    pub(crate) ruid: u32,
+    pub(crate) euid: u32,
+    pub(crate) suid: u32,
+    pub(crate) rgid: u32,
+    pub(crate) egid: u32,
+    pub(crate) sgid: u32,
+    pub(crate) fsuid: u32,
+    pub(crate) fsgid: u32,
+    pub(crate) umask: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct NativeReexecRlimitV1 {
+    pub(crate) current: u64,
+    pub(crate) maximum: u64,
 }
 
 impl NativeExecCapsuleV1 {
@@ -80,6 +119,14 @@ impl NativeGuestExecV1 {
             || self.fd_table.files.len() > MAX_VECTOR_ITEMS
             || self.fd_table.descriptions.len() > MAX_VECTOR_ITEMS
             || self.fd_table.close_on_exec_host_fds.len() > MAX_VECTOR_ITEMS
+            || self.xsig.host_fd < 0
+            || self
+                .process_state
+                .supplementary_groups_override
+                .as_ref()
+                .is_some_and(|groups| groups.len() > 65_536)
+            || self.process_state.credentials.umask & !0o777 != 0
+            || self.process_state.rlimit_overrides.len() != 16
         {
             return Err(NativeExecCapsuleError::InvalidField("guest_exec"));
         }
@@ -131,6 +178,8 @@ pub(crate) fn begin_guest_exec(
     let fd_table = dispatcher
         .snapshot_native_reexec_fd_table()
         .map_err(|error| anyhow::anyhow!("native guest exec fd table is ineligible: {error}"))?;
+    let xsig = snapshot_xsig()?;
+    let process_state = dispatcher.snapshot_native_reexec_process_state();
     let payload = NativeExecCapsuleV1 {
         producer_pid: unsafe { libc::getpid() as u32 },
         purpose: NativeExecCapsulePurposeV1::GuestExec,
@@ -147,6 +196,8 @@ pub(crate) fn begin_guest_exec(
             max_traps: u64::try_from(max_traps)?,
             native_page_profile,
             fd_table,
+            xsig,
+            process_state,
         }),
     };
     let mut nonce = [0_u8; 16];
@@ -161,6 +212,15 @@ fn exec_capsule(payload: NativeExecCapsuleV1, nonce: [u8; 16]) -> anyhow::Result
 
     let mut prepared_host_fds = Vec::new();
     if let Some(guest) = &payload.guest_exec {
+        if let Err(error) = prepare_host_fd_flags(
+            guest.xsig.host_fd,
+            guest.xsig.original_host_fd_flags,
+            guest.xsig.original_host_fd_flags & !libc::FD_CLOEXEC,
+            &mut prepared_host_fds,
+        ) {
+            restore_host_fd_flags(&prepared_host_fds);
+            return Err(error);
+        }
         for (fd, expected_flags) in guest.fd_table.survivor_host_fds() {
             if let Err(error) = prepare_host_fd_flags(
                 fd,
@@ -302,11 +362,61 @@ pub(crate) fn resume(fd: RawFd, nonce_hex: &str) -> anyhow::Result<crate::Native
             let guest = payload
                 .guest_exec
                 .ok_or_else(|| anyhow::anyhow!("native guest exec capsule has no guest state"))?;
+            adopt_xsig(&guest.xsig)?;
             let exit_code =
                 crate::native_darwin::resume_guest_from_capsule(guest, payload.argv, payload.env)?;
             Ok(crate::NativeSelfReexecOutcome::GuestExit(exit_code))
         }
     }
+}
+
+fn snapshot_xsig() -> anyhow::Result<NativeReexecXsigV1> {
+    let host_fd = carrick_signal_core::xsig::xsig_reexec_fd()
+        .ok_or_else(|| anyhow::anyhow!("native guest exec has no xsignal ring backing fd"))?;
+    let original_host_fd_flags = unsafe { libc::fcntl(host_fd, libc::F_GETFD) };
+    if original_host_fd_flags < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(host_fd, stat.as_mut_ptr()) } < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let stat = unsafe { stat.assume_init() };
+    Ok(NativeReexecXsigV1 {
+        host_fd,
+        original_host_fd_flags,
+        host_device: stat.st_dev as u64,
+        host_inode: stat.st_ino,
+        host_size: stat.st_size as u64,
+    })
+}
+
+fn adopt_xsig(snapshot: &NativeReexecXsigV1) -> anyhow::Result<()> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(snapshot.host_fd, stat.as_mut_ptr()) } < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let stat = unsafe { stat.assume_init() };
+    if stat.st_dev as u64 != snapshot.host_device
+        || stat.st_ino != snapshot.host_inode
+        || stat.st_size as u64 != snapshot.host_size
+    {
+        anyhow::bail!("native xsignal ring backing identity changed across self-reexec");
+    }
+    if unsafe {
+        libc::fcntl(
+            snapshot.host_fd,
+            libc::F_SETFD,
+            snapshot.original_host_fd_flags,
+        )
+    } < 0
+    {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    if !carrick_signal_core::xsig::xsig_adopt_reexec_fd(snapshot.host_fd) {
+        anyhow::bail!("native xsignal ring backing could not be adopted after self-reexec");
+    }
+    Ok(())
 }
 
 fn encode_nonce(nonce: [u8; 16]) -> String {
@@ -526,6 +636,31 @@ mod tests {
                     files: Vec::new(),
                     descriptions: Vec::new(),
                     close_on_exec_host_fds: Vec::new(),
+                    closed_stdio: [false; 3],
+                },
+                xsig: super::NativeReexecXsigV1 {
+                    host_fd: 7,
+                    original_host_fd_flags: libc::FD_CLOEXEC,
+                    host_device: 1,
+                    host_inode: 2,
+                    host_size: 4096,
+                },
+                process_state: super::NativeReexecProcessStateV1 {
+                    credentials: super::NativeReexecCredentialsV1 {
+                        ruid: 1,
+                        euid: 2,
+                        suid: 3,
+                        rgid: 4,
+                        egid: 5,
+                        sgid: 6,
+                        fsuid: 7,
+                        fsgid: 8,
+                        umask: 0o027,
+                    },
+                    supplementary_groups_override: Some(vec![9, 10]),
+                    ignored_signals: 1 << 12,
+                    nofile_soft: 1024,
+                    rlimit_overrides: vec![None; 16],
                 },
             }),
         }
