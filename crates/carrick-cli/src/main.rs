@@ -147,6 +147,13 @@ use crate::runtime_util::register_dtrace_probes;
 /// current-thread runtime that drops before the trap loop even begins,
 /// so by the time fork can fire there is no tokio state to break.
 fn main() -> anyhow::Result<()> {
+    // FIRST, before any dispatch or fork: record this process as the one
+    // true top-level `carrick` invocation. The NATIVEPERF supervisor record
+    // (supervisor_perf) is gated on this pid — interactive `-t` runs fork a
+    // pty-relay supervisor and a runtime child that BOTH bubble back through
+    // `Commands::Run`'s tail with `CARRICK_DSR_PROFILE` inherited, and only
+    // the process recorded here may emit.
+    supervisor_perf::record_top_level_pid();
     configure_process_environment();
     register_dtrace_probes();
     #[cfg(feature = "platform-macos")]
