@@ -28,6 +28,13 @@ pub struct LimaConfig {
     pub timeout_scale: f64,
 }
 
+/// Darwin-native DSR lane configuration. Its quality-first workloads are
+/// deliberately allowed more wall time without changing HVF or oracle limits.
+#[derive(Clone, Debug)]
+pub struct NativeDsrConfig {
+    pub timeout_scale: f64,
+}
+
 /// Direct Linux/KVM lane configuration. The timeout scale is kept separate from
 /// Lima: a native x86_64 KVM host should be faster than nested Lima by default,
 /// but the operator can still stretch deadlines for loaded hosts.
@@ -70,7 +77,7 @@ impl DockerPlatform {
 #[derive(Clone, Debug)]
 pub enum Lane {
     Hvf,
-    MacosNativeDsr,
+    MacosNativeDsr(NativeDsrConfig),
     Kvm(LimaConfig),
     KvmLocal(LocalKvmConfig),
     BhyveLocal(LocalBhyveConfig),
@@ -86,7 +93,7 @@ impl Lane {
         matches!(
             self,
             Lane::Hvf
-                | Lane::MacosNativeDsr
+                | Lane::MacosNativeDsr(_)
                 | Lane::KvmLocal(_)
                 | Lane::BhyveLocal(_)
                 | Lane::NvmmLocal(_)
@@ -95,7 +102,7 @@ impl Lane {
 
     pub fn docker_platform(&self) -> DockerPlatform {
         match self {
-            Lane::Hvf | Lane::MacosNativeDsr | Lane::Kvm(_) => DockerPlatform::LinuxArm64,
+            Lane::Hvf | Lane::MacosNativeDsr(_) | Lane::Kvm(_) => DockerPlatform::LinuxArm64,
             Lane::KvmLocal(_) | Lane::BhyveLocal(_) | Lane::NvmmLocal(_) => {
                 DockerPlatform::LinuxAmd64
             }
@@ -103,11 +110,12 @@ impl Lane {
     }
 
     /// The carrick-run deadline for a suite on this lane: `timeout_s` as-is on
-    /// Hvf (behavior-preserving), scaled by the lane's `timeout_scale` on Kvm.
-    /// Docker oracles always use the unscaled `timeout_s`.
+    /// Hvf (behavior-preserving), scaled by the selected bring-up lane's
+    /// `timeout_scale`. Docker oracles always use the unscaled `timeout_s`.
     pub fn scaled_timeout(&self, timeout_s: u64) -> u64 {
         match self {
-            Lane::Hvf | Lane::MacosNativeDsr => timeout_s,
+            Lane::Hvf => timeout_s,
+            Lane::MacosNativeDsr(cfg) => (timeout_s as f64 * cfg.timeout_scale).ceil() as u64,
             Lane::Kvm(cfg) => (timeout_s as f64 * cfg.timeout_scale).ceil() as u64,
             Lane::KvmLocal(cfg) => (timeout_s as f64 * cfg.timeout_scale).ceil() as u64,
             Lane::BhyveLocal(cfg) => (timeout_s as f64 * cfg.timeout_scale).ceil() as u64,
@@ -158,7 +166,7 @@ pub fn carrick_invocation_argv(
     let base = carrick_argv(suite, carrick_bin, run_id); // [carrick_bin, "run", …flags…, image, …cmd]
     match lane {
         Lane::Hvf => carrick_argv_with_exec_backend(base, &suite.image, "vmm"),
-        Lane::MacosNativeDsr => carrick_argv_with_native_dsr(base, &suite.image),
+        Lane::MacosNativeDsr(_) => carrick_argv_with_native_dsr(base, &suite.image),
         Lane::KvmLocal(_) | Lane::BhyveLocal(_) | Lane::NvmmLocal(_) => {
             let base = carrick_argv_with_exec_backend(base, &suite.image, "vmm");
             carrick_argv_with_platform(base, &suite.image, DockerPlatform::LinuxAmd64)
@@ -303,18 +311,21 @@ fn shell_quote(s: &str) -> String {
     out
 }
 
-/// Map the lane CLI strings to a `Lane`. Lima gets its own timeout scale
-/// because nested virtualization can be slower; direct local x86_64 lanes use a
-/// separate scale that defaults to 1.0.
+/// Map the lane CLI strings to a `Lane`. Native DSR, Lima, and direct local
+/// x86_64 lanes keep independent timeout scales so one bring-up lane cannot
+/// weaken another backend's deadlines.
 pub fn lane_from_args(
     lane: &str,
     lima_vm: &str,
     lima_gateway: &str,
     lima_timeout_scale: f64,
+    native_timeout_scale: f64,
     local_timeout_scale: f64,
 ) -> Lane {
     match lane {
-        "macos-native-dsr" | "native-dsr" => Lane::MacosNativeDsr,
+        "macos-native-dsr" | "native-dsr" => Lane::MacosNativeDsr(NativeDsrConfig {
+            timeout_scale: native_timeout_scale,
+        }),
         "kvm" => Lane::Kvm(LimaConfig {
             vm: lima_vm.to_string(),
             gateway: lima_gateway.to_string(),
@@ -417,13 +428,14 @@ mod tests {
             "carrick",
             "host.lima.internal",
             2.0,
+            5.0,
             1.0,
         );
         let argv = carrick_invocation_argv(&s, "target/release/carrick", "conf-1-2", &lane);
 
-        assert!(matches!(lane, Lane::MacosNativeDsr));
+        assert!(matches!(lane, Lane::MacosNativeDsr(_)));
         assert_eq!(lane.docker_platform(), DockerPlatform::LinuxArm64);
-        assert_eq!(lane.scaled_timeout(s.timeout_s), s.timeout_s);
+        assert_eq!(lane.scaled_timeout(s.timeout_s), s.timeout_s * 5);
         assert!(lane.needs_local_registry_env());
         assert_eq!(argv[0], "target/release/carrick");
         assert_eq!(argv[1], "run");
@@ -513,7 +525,14 @@ mod tests {
     #[test]
     fn bhyve_local_invocation_runs_carrick_directly_as_amd64() {
         let s = demo_suite();
-        let lane = lane_from_args("bhyve-local", "carrick", "host.lima.internal", 2.0, 1.5);
+        let lane = lane_from_args(
+            "bhyve-local",
+            "carrick",
+            "host.lima.internal",
+            2.0,
+            5.0,
+            1.5,
+        );
         let argv = carrick_invocation_argv(&s, "/root/ct/release/carrick", "conf-1-2", &lane);
 
         assert_eq!(lane.docker_platform(), DockerPlatform::LinuxAmd64);
@@ -533,7 +552,7 @@ mod tests {
     #[test]
     fn nvmm_local_invocation_runs_carrick_directly_as_amd64() {
         let s = demo_suite();
-        let lane = lane_from_args("nvmm-local", "carrick", "host.lima.internal", 2.0, 1.5);
+        let lane = lane_from_args("nvmm-local", "carrick", "host.lima.internal", 2.0, 5.0, 1.5);
         let argv = carrick_invocation_argv(&s, "/root/ct/release/carrick", "conf-1-2", &lane);
 
         assert_eq!(lane.docker_platform(), DockerPlatform::LinuxAmd64);
@@ -562,14 +581,14 @@ mod tests {
     #[test]
     fn lane_from_args_builds_kvm_with_defaults() {
         assert!(matches!(
-            lane_from_args("hvf", "carrick", "host.lima.internal", 2.0, 1.0),
+            lane_from_args("hvf", "carrick", "host.lima.internal", 2.0, 5.0, 1.0),
             Lane::Hvf
         ));
         assert!(matches!(
-            lane_from_args("native-dsr", "carrick", "host.lima.internal", 2.0, 1.0),
-            Lane::MacosNativeDsr
+            lane_from_args("native-dsr", "carrick", "host.lima.internal", 2.0, 5.0, 1.0,),
+            Lane::MacosNativeDsr(_)
         ));
-        match lane_from_args("kvm", "carrick", "host.lima.internal", 2.0, 1.0) {
+        match lane_from_args("kvm", "carrick", "host.lima.internal", 2.0, 5.0, 1.0) {
             Lane::Kvm(cfg) => {
                 assert_eq!(cfg.vm, "carrick");
                 assert_eq!(cfg.gateway, "host.lima.internal");
@@ -577,11 +596,11 @@ mod tests {
             }
             _ => panic!("expected Kvm"),
         }
-        match lane_from_args("kvm-local", "carrick", "host.lima.internal", 3.0, 1.0) {
+        match lane_from_args("kvm-local", "carrick", "host.lima.internal", 3.0, 5.0, 1.0) {
             Lane::KvmLocal(cfg) => assert_eq!(cfg.timeout_scale, 1.0),
             _ => panic!("expected KvmLocal"),
         }
-        match lane_from_args("kvm-local", "carrick", "host.lima.internal", 3.0, 1.5) {
+        match lane_from_args("kvm-local", "carrick", "host.lima.internal", 3.0, 5.0, 1.5) {
             Lane::KvmLocal(cfg) => assert_eq!(cfg.timeout_scale, 1.5),
             _ => panic!("expected KvmLocal"),
         }

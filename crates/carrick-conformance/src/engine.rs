@@ -276,7 +276,7 @@ enum CarrickCleanup {
 impl CarrickCleanup {
     fn from_lane(lane: &crate::lane::Lane) -> Self {
         match lane {
-            crate::lane::Lane::Hvf | crate::lane::Lane::MacosNativeDsr => CarrickCleanup::Hvf,
+            crate::lane::Lane::Hvf | crate::lane::Lane::MacosNativeDsr(_) => CarrickCleanup::Hvf,
             crate::lane::Lane::Kvm(cfg) => CarrickCleanup::KvmLima(cfg.clone()),
             crate::lane::Lane::KvmLocal(_) => CarrickCleanup::KvmLocal,
             crate::lane::Lane::BhyveLocal(_) => CarrickCleanup::BhyveLocal,

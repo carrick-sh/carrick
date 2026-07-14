@@ -518,7 +518,7 @@ fn build() -> (Vec<Suite>, (usize, usize, usize)) {
     cpy.dedup();
     for m in &cpy {
         let short = m.strip_prefix("test_").unwrap_or(m);
-        let mut suite = mk(
+        let suite = mk(
             format!("cpython-{short}"),
             Cpython,
             CPYTHON_IMG,
@@ -538,12 +538,6 @@ fn build() -> (Vec<Suite>, (usize, usize, usize)) {
             None,
             None,
         );
-        if m == "test_subprocess" {
-            // CPython's test_no_leaking expects to hit EMFILE before 1026
-            // opens. Docker defaults can be too high, causing the oracle to
-            // skip the assertion Carrick exercises.
-            suite.docker_flags = vec![s("--ulimit"), s("nofile=1024:1024")];
-        }
         suites.push(suite);
     }
 

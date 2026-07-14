@@ -75,6 +75,15 @@ struct Args {
     /// 1.0, which makes the gate flaky.
     #[arg(long, default_value_t = 2.0)]
     lima_timeout_scale: f64,
+    /// Timeout multiplier for the Darwin-native DSR lane. Native quality lanes
+    /// currently trade throughput for coverage, so their Carrick side gets a
+    /// larger deadline while Docker and HVF keep the manifest budget.
+    #[arg(
+        long,
+        default_value_t = 5.0,
+        env = "CARRICK_CONFORMANCE_NATIVE_TIMEOUT_SCALE"
+    )]
+    native_timeout_scale: f64,
     /// Timeout multiplier for direct local x86_64 lanes (`kvm-local`,
     /// `bhyve-local`, `nvmm-local`). Defaults to 1.0: on same-host x86_64,
     /// Carrick should be close to Docker; a timeout is a bug signal, not
@@ -203,6 +212,12 @@ fn run() -> anyhow::Result<ExitCode> {
             args.local_timeout_scale
         );
     }
+    if !args.native_timeout_scale.is_finite() || args.native_timeout_scale < 1.0 {
+        anyhow::bail!(
+            "--native-timeout-scale must be finite and >= 1.0 (got {})",
+            args.native_timeout_scale
+        );
+    }
 
     // Execution lane for the carrick side, built from the CLI args. `hvf` (the
     // default) runs the local signed binary unchanged; `kvm` wraps carrick in the
@@ -212,6 +227,7 @@ fn run() -> anyhow::Result<ExitCode> {
         &args.lima_vm,
         &args.lima_gateway,
         args.lima_timeout_scale,
+        args.native_timeout_scale,
         args.local_timeout_scale,
     );
 
