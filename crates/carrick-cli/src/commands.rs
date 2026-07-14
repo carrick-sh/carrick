@@ -717,6 +717,16 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 result.exit_code
             };
 
+            // NATIVEPERF v2 supervisor record: emitted exactly once, only when
+            // CARRICK_DSR_PROFILE=1 (a no-op env read otherwise), from THIS
+            // top-level process only — `Runtime::execute` above forks the guest
+            // and blocks in `waitpid_blocking` until its whole process tree is
+            // reaped, so every guest process in this run is already gone by the
+            // time we reach here, and no guest process ever reaches this call
+            // site itself (see `supervisor_perf`'s module docs). Placed before
+            // every exit path (interactive/json/raw) so it fires uniformly.
+            crate::supervisor_perf::emit_supervisor_record_if_profiling();
+
             // Interactive / tty: the guest's stdio already went straight to the
             // terminal; nothing to emit, just take the exit code.
             if tty || interactive {
