@@ -27,6 +27,7 @@ use crate::dispatch::{
     SyscallRequest,
 };
 use crate::memory::{AddressSpace, AddressSpaceError, MemoryRegion};
+use crate::native_prepared_image::{NativeRelativeRelocation, native_region_copy_window};
 use crate::page_profile::{
     ExecutionPlan, HostPageState, MixedPageReason, PageBacking, PagePerms, SubpageState,
     classify_host_page_state,
@@ -141,12 +142,6 @@ type DsrPrepareAndEnterFn = fn(
     &SharedNativeMemory,
     &mut NativeUcontextSnapshot,
 ) -> Result<(dsr::PreparedEntry, dsr::PreparedExit), RuntimeError>;
-
-#[derive(Clone, Copy)]
-struct NativeRelativeRelocation {
-    address: u64,
-    value: u64,
-}
 
 struct NativeForkRequest {
     pidfd_out: Option<u64>,
@@ -7959,30 +7954,6 @@ fn native_exec_map_detail(
             }
         });
     }
-}
-
-fn native_region_copy_window(
-    region: &MemoryRegion,
-    initial_stack_pointer: Option<u64>,
-) -> std::ops::Range<usize> {
-    let full = 0..region.bytes().len();
-    let stack_start = crate::memory::LINUX_STACK_TOP - crate::memory::LINUX_STACK_SIZE;
-    if region.start != stack_start || region.end != crate::memory::LINUX_STACK_TOP {
-        return full;
-    }
-    let Some(stack_pointer) = initial_stack_pointer else {
-        return full;
-    };
-    let Some(offset) = stack_pointer.checked_sub(region.start) else {
-        return full;
-    };
-    let Ok(offset) = usize::try_from(offset) else {
-        return full;
-    };
-    if offset > region.bytes().len() {
-        return full;
-    }
-    offset..region.bytes().len()
 }
 
 fn map_region(
