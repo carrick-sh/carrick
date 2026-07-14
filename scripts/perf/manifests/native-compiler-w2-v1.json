@@ -1,0 +1,221 @@
+{
+  "argv": [
+    "/usr/local/go/pkg/tool/linux_arm64/compile",
+    "-o",
+    "/tmp/go-build1877453333/b018/_pkg_.a",
+    "-trimpath",
+    "/tmp/go-build1877453333/b018=>",
+    "-p",
+    "internal/runtime/atomic",
+    "-lang=go1.24",
+    "-std",
+    "-buildid",
+    "41fzl-KwzjqO72UeDck7/41fzl-KwzjqO72UeDck7",
+    "-goversion",
+    "go1.24.13",
+    "-symabis",
+    "/tmp/go-build1877453333/b018/symabis",
+    "-c=4",
+    "-nolocalimports",
+    "-importcfg",
+    "/tmp/go-build1877453333/b018/importcfg",
+    "-pack",
+    "-asmhdr",
+    "/tmp/go-build1877453333/b018/go_asm.h",
+    "/usr/local/go/src/internal/runtime/atomic/atomic_arm64.go",
+    "/usr/local/go/src/internal/runtime/atomic/doc.go",
+    "/usr/local/go/src/internal/runtime/atomic/stubs.go",
+    "/usr/local/go/src/internal/runtime/atomic/types.go",
+    "/usr/local/go/src/internal/runtime/atomic/types_64bit.go",
+    "/usr/local/go/src/internal/runtime/atomic/unaligned.go"
+  ],
+  "capture": {
+    "candidate_count": 1,
+    "capture_environment": [
+      [
+        "CARRICK_TOOLEXEC_LOG",
+        "/capture/out/toolexec.bin"
+      ],
+      [
+        "GOFLAGS",
+        "-work -toolexec=/capture/native-compiler-toolexec.sh"
+      ]
+    ],
+    "captured_argv_index": 47,
+    "docker_replay_output_sha256": [
+      "5db57566623a37fd8691cadd4e6b0eeefdc85bb3691f0e5bb5a64c3b1ae0dbf0",
+      "5db57566623a37fd8691cadd4e6b0eeefdc85bb3691f0e5bb5a64c3b1ae0dbf0"
+    ],
+    "docker_replay_stdout_sha256": [
+      "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    ],
+    "expected_output_guest_path": "/tmp/go-build1877453333/b018/_pkg_.a",
+    "expected_output_sha256": "5db57566623a37fd8691cadd4e6b0eeefdc85bb3691f0e5bb5a64c3b1ae0dbf0",
+    "rejected_candidates": [
+      {
+        "aggregate_gateway_entries": 37543,
+        "candidate": "internal/unsafeheader",
+        "hottest_exit_resolve_direct": 4800,
+        "hottest_exit_resolve_indirect": 2809,
+        "hottest_exit_sensitive": 3368,
+        "hottest_gateway_entries": 11023,
+        "hottest_sensitive_exclusive": 3058,
+        "reason": "hottest exclusive share does not preserve W1",
+        "status": 0,
+        "stderr_sha256": "750aacaf854ab5fb9177fbcc182a729a113e6cec96cd3609cbb577dd344c0afb"
+      },
+      {
+        "aggregate_gateway_entries": 370194,
+        "candidate": "sync",
+        "hottest_exit_resolve_direct": 7405,
+        "hottest_exit_resolve_indirect": 57473,
+        "hottest_exit_sensitive": 148458,
+        "hottest_gateway_entries": 213892,
+        "hottest_sensitive_exclusive": 83451,
+        "reason": "larger than the accepted decision-equivalent child",
+        "status": 0,
+        "stderr_sha256": "0ac26abddd6bd96c9882e7b82c66e7f2bcf8c6aa4714efe18111b214b5926c51"
+      },
+      {
+        "aggregate_gateway_entries": 677527,
+        "candidate": "math",
+        "hottest_exit_resolve_direct": 2649,
+        "hottest_exit_resolve_indirect": 35338,
+        "hottest_exit_sensitive": 111378,
+        "hottest_gateway_entries": 149640,
+        "hottest_sensitive_exclusive": 54289,
+        "reason": "larger than the accepted decision-equivalent child",
+        "status": 0,
+        "stderr_sha256": "2536827da5ee18e067365c759a1b68c34c58f4177c56d827c3cb84a843f47726"
+      },
+      {
+        "aggregate_gateway_entries": 2794696,
+        "candidate": "runtime",
+        "hottest_exit_resolve_direct": 5908,
+        "hottest_exit_resolve_indirect": 86362,
+        "hottest_exit_sensitive": 906704,
+        "hottest_gateway_entries": 1000000,
+        "hottest_sensitive_exclusive": 681563,
+        "reason": "does not complete naturally under the fixed trap ceiling",
+        "status": 125,
+        "stderr_sha256": "0d7c2100460dd470bcb90cd7009bb75a7bb0d60f241d992f0073f7ae4a257e37"
+      }
+    ],
+    "representativeness": {
+      "accepted_rule": "smallest natural child preserving W1 hottest-thread exclusive decision",
+      "profile_cleanup_status": 0,
+      "profile_stderr_sha256": "a8cb8a22ba1ccf349420418d755b0dbe36130d69545aebb6450836941d96ed39",
+      "profile_summary_sha256": "4a9c759cbaf11e0c3a7bae623199a5fa87247736cfeb7f4de4143d8239735451",
+      "w1_hottest": {
+        "exit_resolve_direct": 8403,
+        "exit_resolve_indirect": 298386,
+        "exit_sensitive": 692350,
+        "gateway_entries": 1000000,
+        "sensitive_exclusive": 533882
+      },
+      "w1_profile_sha256": "adce92718a89f5a3a3b849c3d55ba6af47cdf4360638c9643895ee19087d5c7c",
+      "w2_hottest": {
+        "exit_resolve_direct": 3834,
+        "exit_resolve_indirect": 17585,
+        "exit_sensitive": 40464,
+        "gateway_entries": 62103,
+        "sensitive_exclusive": 29763
+      }
+    },
+    "source": "docker-toolexec",
+    "w1_stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "w1_stdout_sha256": "be7c8060c98794b8a1b49263accc8cce5e3b81c47180802c39c8c2439b1757d8"
+  },
+  "env": [
+    [
+      "CGO_ENABLED",
+      "1"
+    ],
+    [
+      "GOARCH",
+      "arm64"
+    ],
+    [
+      "GOLANG_VERSION",
+      "1.24.13"
+    ],
+    [
+      "GOOS",
+      "linux"
+    ],
+    [
+      "GOPATH",
+      "/go"
+    ],
+    [
+      "GOTOOLCHAIN",
+      "local"
+    ],
+    [
+      "HOME",
+      "/root"
+    ],
+    [
+      "PATH",
+      "/go/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    ]
+  ],
+  "executable_sha256": "5d3ce715273cf3bea2215369d94cbf36126aed4727a0b0d193bdb0ea3eb5f1af",
+  "expected_exit": 0,
+  "expected_stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "files": [
+    {
+      "fixture_path": "../fixtures/native-compiler-w2-v1/tmp/go-build1877453333/b010/_pkg_.a",
+      "guest_path": "/tmp/go-build1877453333/b010/_pkg_.a",
+      "sha256": "43edfc3421c619b8d02ed46b65770ec56ff794a6fa4a6991e3926c334d85805f"
+    },
+    {
+      "fixture_path": "../fixtures/native-compiler-w2-v1/tmp/go-build1877453333/b018/importcfg",
+      "guest_path": "/tmp/go-build1877453333/b018/importcfg",
+      "sha256": "31495b3a1c6de46712f4df1c041f41c0ffbab30623dce624aa0aafc84edb6842"
+    },
+    {
+      "fixture_path": "../fixtures/native-compiler-w2-v1/tmp/go-build1877453333/b018/symabis",
+      "guest_path": "/tmp/go-build1877453333/b018/symabis",
+      "sha256": "83fe0a8c388b1f3ab1658b006508019a55a55da5a16a86700eb5f8db99b099a8"
+    },
+    {
+      "fixture_path": "../fixtures/native-compiler-w2-v1/usr/local/go/src/internal/runtime/atomic/atomic_arm64.go",
+      "guest_path": "/usr/local/go/src/internal/runtime/atomic/atomic_arm64.go",
+      "sha256": "bfd104f7456854fd1028e02ac880380b284a639014be934357f1e55a4ed069db"
+    },
+    {
+      "fixture_path": "../fixtures/native-compiler-w2-v1/usr/local/go/src/internal/runtime/atomic/doc.go",
+      "guest_path": "/usr/local/go/src/internal/runtime/atomic/doc.go",
+      "sha256": "9e0cfe8821fb34bd0511f55b7e269c6b74dc9956e5d2b2db367349d1aa7695b6"
+    },
+    {
+      "fixture_path": "../fixtures/native-compiler-w2-v1/usr/local/go/src/internal/runtime/atomic/stubs.go",
+      "guest_path": "/usr/local/go/src/internal/runtime/atomic/stubs.go",
+      "sha256": "5dd8e4ce65dc4f6359ab8f18873dd1903f06d95a3fdcc5e184ffc2624a300e75"
+    },
+    {
+      "fixture_path": "../fixtures/native-compiler-w2-v1/usr/local/go/src/internal/runtime/atomic/types.go",
+      "guest_path": "/usr/local/go/src/internal/runtime/atomic/types.go",
+      "sha256": "5296242a02223a60f714e9358ea58aae52dbef7a4fdf1f90cd479b86360d0c70"
+    },
+    {
+      "fixture_path": "../fixtures/native-compiler-w2-v1/usr/local/go/src/internal/runtime/atomic/types_64bit.go",
+      "guest_path": "/usr/local/go/src/internal/runtime/atomic/types_64bit.go",
+      "sha256": "1ea374803ac8f483de8a3efa9e065157a7d2352652a4ac7bcb0dc17756daffb6"
+    },
+    {
+      "fixture_path": "../fixtures/native-compiler-w2-v1/usr/local/go/src/internal/runtime/atomic/unaligned.go",
+      "guest_path": "/usr/local/go/src/internal/runtime/atomic/unaligned.go",
+      "sha256": "4c788293b984be07a34492f389d27b707b97016e8e5c6eef2b055f0e800d05e0"
+    }
+  ],
+  "image": "localhost:5005/carrick-go-conformance:1.24",
+  "image_digest": "sha256:6199806814040f05f24d1845b3198f82a2bb982d336ffb04aa4470861cb214d6",
+  "max_traps": 1000000,
+  "name": "w2-internal-runtime-atomic",
+  "native_page_profile": "native16k",
+  "schema": "carrick.native-compiler-workload.v1",
+  "workdir": "/usr/local/go/src/go/types"
+}
