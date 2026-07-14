@@ -220,6 +220,28 @@ pub fn spawn_signal_pump(
     kicker: std::sync::Arc<dyn carrick_hal::VcpuRegistry>,
     futex: std::sync::Arc<dyn carrick_hal::PlatformFutex>,
 ) -> SignalPump {
+    spawn_signal_pump_inner(kicker, futex, true)
+}
+
+/// Spawn only the host-signal/xsignal wake half of the macOS pump. The native
+/// execution backend owns timer and child-exit delivery on dedicated fallback
+/// threads, so registering HVF's kqueue timer/proc producers as well would
+/// double-deliver those events. It still needs the pipe-to-kick/futex bridge:
+/// Darwin signals do not wake `parking_lot`'s pthread-condvar parker.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub fn spawn_signal_wake_pump(
+    kicker: std::sync::Arc<dyn carrick_hal::VcpuRegistry>,
+    futex: std::sync::Arc<dyn carrick_hal::PlatformFutex>,
+) -> SignalPump {
+    spawn_signal_pump_inner(kicker, futex, false)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn spawn_signal_pump_inner(
+    kicker: std::sync::Arc<dyn carrick_hal::VcpuRegistry>,
+    futex: std::sync::Arc<dyn carrick_hal::PlatformFutex>,
+    monitor_hvf_events: bool,
+) -> SignalPump {
     let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     let exited = ExitSignal::new();
     let thread_running = std::sync::Arc::clone(&running);
@@ -273,7 +295,9 @@ pub fn spawn_signal_pump(
             // Arm EVFILT_PROC/NOTE_EXIT for any guest child forked before the
             // pump learned its kqueue, so a fast-exiting child still yields
             // SIGCHLD. New children are armed directly by register_child_exit_watch.
-            crate::host_signal::rearm_child_watches(kq_fd);
+            if monitor_hvf_events {
+                crate::host_signal::rearm_child_watches(kq_fd);
+            }
             // Per-`which` EVFILT_TIMER ident this pump has registered, so the
             // reconcile below registers each new arm exactly once. A timer must
             // be EV_ADDed FROM THIS pump thread (the one calling kevent): a timer
@@ -290,24 +314,26 @@ pub fn spawn_signal_pump(
                 // thread's kevent context and fires into the wait below. The
                 // kevent carries the arm's generation in `udata` so a stale late
                 // fire from a superseded arm can be rejected on delivery.
-                for (which, registered) in registered_timer_ident.iter_mut().enumerate() {
-                    let target = if crate::itimer::is_armed(which) {
-                        crate::itimer::live_ident(which)
-                    } else {
-                        0
-                    };
-                    if target != *registered {
-                        if target != 0
-                            && let Some(arm) = crate::itimer::current_arm(which)
-                        {
-                            let _ = kq.apply(&[crate::darwin_kqueue::Kevent::timer(
-                                arm.ident,
-                                arm.flags,
-                                arm.delay_ns,
-                            )
-                            .with_udata_u64(arm.generation)]);
+                if monitor_hvf_events {
+                    for (which, registered) in registered_timer_ident.iter_mut().enumerate() {
+                        let target = if crate::itimer::is_armed(which) {
+                            crate::itimer::live_ident(which)
+                        } else {
+                            0
+                        };
+                        if target != *registered {
+                            if target != 0
+                                && let Some(arm) = crate::itimer::current_arm(which)
+                            {
+                                let _ = kq.apply(&[crate::darwin_kqueue::Kevent::timer(
+                                    arm.ident,
+                                    arm.flags,
+                                    arm.delay_ns,
+                                )
+                                .with_udata_u64(arm.generation)]);
+                            }
+                            *registered = target;
                         }
-                        *registered = target;
                     }
                 }
                 let n = match kq.wait(&[], &mut out, None) {
@@ -322,6 +348,9 @@ pub fn spawn_signal_pump(
                 for event in out.iter().take(n) {
                     if event.is_read() {
                         crate::host_signal::drain_pump_pipe();
+                        continue;
+                    }
+                    if !monitor_hvf_events {
                         continue;
                     }
                     if let Some(child_pid) = event.proc_exit_ident() {
@@ -465,6 +494,14 @@ pub fn spawn_signal_pump(
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 pub fn spawn_signal_pump(
+    _kicker: std::sync::Arc<dyn carrick_hal::VcpuRegistry>,
+    _futex: std::sync::Arc<dyn carrick_hal::PlatformFutex>,
+) -> SignalPump {
+    SignalPump {}
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+pub fn spawn_signal_wake_pump(
     _kicker: std::sync::Arc<dyn carrick_hal::VcpuRegistry>,
     _futex: std::sync::Arc<dyn carrick_hal::PlatformFutex>,
 ) -> SignalPump {
