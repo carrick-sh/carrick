@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import gzip
 import hashlib
 import json
 import os
@@ -466,6 +467,7 @@ def validate_w1_profile_evidence(
             "manifest_sha256",
             "raw_profile_source",
             "raw_profile_sha256",
+            "raw_profile_evidence_path",
             "complete_thread_groups",
             "frames_per_group",
             "required_frames",
@@ -549,6 +551,44 @@ def validate_w1_profile_evidence(
         or outcome["work_units_expected"] != derived.work_units_expected
     ):
         raise BudgetError("W1 evidence typed outcome does not reconcile")
+    evidence_rel = _string(raw["raw_profile_evidence_path"], "W1 raw evidence path")
+    if not evidence_rel or pathlib.PurePosixPath(evidence_rel).is_absolute():
+        raise BudgetError("W1 raw evidence path must be a relative artifact path")
+    artifact_path = (path.parent / evidence_rel).resolve()
+    try:
+        compressed = artifact_path.read_bytes()
+    except OSError as error:
+        raise BudgetError(f"W1 raw profile artifact is missing: {artifact_path}") from error
+    try:
+        raw_bytes = gzip.decompress(compressed)
+    except (OSError, gzip.BadGzipFile) as error:
+        raise BudgetError(f"W1 raw profile artifact is not gzip data: {artifact_path}") from error
+    if hashlib.sha256(raw_bytes).hexdigest() != raw["raw_profile_sha256"]:
+        raise BudgetError("W1 raw profile artifact content hash mismatch")
+    profile_lines = raw_bytes.decode("utf-8", errors="replace").splitlines()
+    profile = parse_nativeperf(profile_lines)
+    validate_profile(profile)
+    if len(profile.threads) != raw["complete_thread_groups"]:
+        raise BudgetError("W1 raw profile thread-group count differs from the summary")
+    hottest_thread = max(profile.threads, key=lambda thread: thread.gateway_entries)
+    parsed_hottest = {
+        "gateway_entries": hottest_thread.gateway_entries,
+        "exit_resolve_direct": hottest_thread.value("exits", "exit_resolve_direct"),
+        "exit_resolve_indirect": hottest_thread.value("exits", "exit_resolve_indirect"),
+        "exit_sensitive": hottest_thread.value("exits", "exit_sensitive"),
+        "sensitive_exclusive": hottest_thread.value("sensitive", "sensitive_exclusive"),
+    }
+    if parsed_hottest != {name: hottest[name] for name in HOTTEST_FIELDS} or (
+        hottest_thread.pid,
+        hottest_thread.tid,
+        hottest_thread.era,
+    ) != identity:
+        raise BudgetError("W1 raw profile hottest thread differs from the summary")
+    parsed_marker = parse_max_traps_marker(profile_lines)
+    if parsed_marker != marker:
+        raise BudgetError("W1 raw profile max-traps marker differs from the summary")
+    if reconcile_max_traps_marker(profile, parsed_marker, gateway_limit) != identity:
+        raise BudgetError("W1 raw profile ceiling does not bind the summary identity")
     cleanup = _exact_mapping(
         raw["cleanup"], {"status", "descendants_absent", "receipt_sha256"}, "W1 cleanup"
     )
@@ -847,6 +887,10 @@ def validate_profile(run: ProfileRun) -> None:
             or thread.value("phases-b", "phase_blocked_count") != syscall
         ):
             raise BudgetError(f"syscall phase reconciliation mismatch for {identity}")
+        if thread.value("phases-b", "phase_sensitive_emulation_count") != thread.value(
+            "exits", "exit_sensitive"
+        ):
+            raise BudgetError(f"sensitive emulation phase reconciliation mismatch for {identity}")
         if thread.value("resolver-thread", "gateway_entries") != gateway:
             raise BudgetError(f"resolver gateway reconciliation mismatch for {identity}")
         if thread.value("resolver-thread", "syscall_exits") != syscall:
@@ -892,8 +936,12 @@ ON_CPU_PHASES = (
 )
 
 
+COUNT_SCOPES = ("hottest-thread", "aggregate-threads")
+
+
 @dataclasses.dataclass(frozen=True)
 class CountEvidence:
+    scope: str
     sensitive_shares: tuple[tuple[str, float], ...]
     resolver_exit_share: float
     resolver_recurring_pc_verified: bool
@@ -910,27 +958,32 @@ class AdditiveCpuEvidence:
     first_resolution_ns: int | None
 
 
-def derive_count_evidence(profile: ProfileRun) -> CountEvidence:
+def derive_count_evidence(profile: ProfileRun, *, scope: str) -> CountEvidence:
+    if scope not in COUNT_SCOPES:
+        raise BudgetError(f"unknown count-evidence thread scope: {scope}")
     validate_profile(profile)
-    gateway = sum(thread.gateway_entries for thread in profile.threads)
+    threads = profile.threads
+    if scope == "hottest-thread":
+        threads = (max(threads, key=lambda thread: thread.gateway_entries),)
+    gateway = sum(thread.gateway_entries for thread in threads)
     if gateway <= 0:
         raise BudgetError("profile has no gateway exits")
     sensitive_shares = tuple(
         (
             name,
-            sum(thread.value("sensitive", field) for thread in profile.threads) / gateway,
+            sum(thread.value("sensitive", field) for thread in threads) / gateway,
         )
         for field, name in SENSITIVE_ORDER
     )
     resolver_exits = sum(
         thread.value("exits", "exit_resolve_direct")
         + thread.value("exits", "exit_resolve_indirect")
-        for thread in profile.threads
+        for thread in threads
     )
     # NATIVEPERF1 deliberately has no guest-PC cardinality.  Exit volume alone
     # cannot prove recurrence; Plane C must supply that independent fact before
     # a resolver slice is selectable.
-    return CountEvidence(sensitive_shares, resolver_exits / gateway, False)
+    return CountEvidence(scope, sensitive_shares, resolver_exits / gateway, False)
 
 
 def derive_additive_cpu_evidence(profile: ProfileRun, cpu_ns: int) -> AdditiveCpuEvidence:
@@ -978,7 +1031,7 @@ def derive_additive_cpu_evidence(profile: ProfileRun, cpu_ns: int) -> AdditiveCp
 def profile_decision_inputs(profile: ProfileRun, cpu_ns: int) -> tuple[tuple[str, float], ...]:
     if cpu_ns <= 0:
         raise BudgetError("profile decision requires positive measured CPU time")
-    counts = derive_count_evidence(profile)
+    counts = derive_count_evidence(profile, scope="hottest-thread")
     sensitive = dict(counts.sensitive_shares)
     values = {
         "sensitive_exclusive": sensitive["exclusive"],
@@ -1137,10 +1190,12 @@ class DtraceEvidence:
     complete: bool
     bounded: bool
     incomplete_pairs: int
+    raw_path: str
+    raw_sha256: str
     drops: tuple[tuple[str, int | bool], ...]
     per_pid_gateway_counts: tuple[tuple[int, int], ...]
     exit_mix: tuple[tuple[int, int], ...]
-    ordering: tuple[tuple[str, int | None, int | None], ...]
+    ordering: tuple[tuple[str, int, int | None, int], ...]
 
 
 def validate_oracle_receipt(manifest: WorkloadManifest, receipt: OracleReceipt) -> None:
@@ -1203,14 +1258,20 @@ def classify_outcome(
 ) -> RunOutcome:
     if engine not in {"carrick", "docker"}:
         raise BudgetError(f"unknown outcome engine: {engine}")
-    if max_traps_marker is not None and (
-        engine != "carrick"
-        or max_traps_marker.traps != gateway_limit
-        or gateway_entries != gateway_limit
-        or ceiling_profile_identity is None
-        or ceiling_profile_identity[1] != max_traps_marker.thread_id
-    ):
-        raise BudgetError("max-traps marker does not reconcile to the profile ceiling")
+    if max_traps_marker is not None:
+        if engine != "carrick" or max_traps_marker.traps != gateway_limit:
+            raise BudgetError("max-traps marker does not reconcile to the profile ceiling")
+        if gateway_entries is None:
+            # Untraced/dtrace planes have no profile: the marker alone types the
+            # ceiling, and a profile identity would be unverifiable.
+            if ceiling_profile_identity is not None:
+                raise BudgetError("ceiling profile identity requires profile evidence")
+        elif (
+            gateway_entries != gateway_limit
+            or ceiling_profile_identity is None
+            or ceiling_profile_identity[1] != max_traps_marker.thread_id
+        ):
+            raise BudgetError("max-traps marker does not reconcile to the profile ceiling")
     if max_traps_marker is None and ceiling_profile_identity is not None:
         raise BudgetError("ceiling profile identity lacks a max-traps marker")
     if max_traps_marker is not None:
@@ -1318,7 +1379,110 @@ def dtrace_command(binary: pathlib.Path, guest_command: Sequence[str], artifact:
     ]
 
 
-def parse_dtrace_summary(path: pathlib.Path, *, expected_run_id: str) -> DtraceEvidence:
+@dataclasses.dataclass(frozen=True)
+class DtraceRaw:
+    sha256: str
+    ordering: tuple[tuple[str, int, int | None, int], ...]
+    counts: tuple[tuple[tuple[str, int, int], int], ...]
+    bounded: bool
+    target_exit_reason: int
+
+
+DTRACE_RAW_FIELDS = {
+    "sample": {"phase", "pid", "kind", "duration_ns", "interval"},
+    "count": {"phase", "pid", "kind", "value"},
+    "incomplete": {"phase", "pid", "kind", "value"},
+    "total": {"phase", "pid", "kind", "value_ns"},
+    "minimum": {"phase", "pid", "kind", "value_ns"},
+    "maximum": {"phase", "pid", "kind", "value_ns"},
+    "high-water": {"metric", "pid", "used", "capacity"},
+    "complete": {"profile", "bounded", "target_exit_reason"},
+}
+
+
+def parse_dtrace_raw(path: pathlib.Path) -> DtraceRaw:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as error:
+        raise BudgetError(f"cannot read DTrace raw trace {path}: {error}") from error
+    ordering: list[tuple[str, int, int | None, int]] = []
+    counts: dict[tuple[str, int, int], int] = {}
+    completes: list[tuple[bool, int]] = []
+    for number, line in enumerate(lines, 1):
+        parts = line.split("|")
+        if len(parts) < 3 or parts[0] != "DSRPROF1":
+            raise BudgetError(f"malformed DTrace raw record {number}")
+        kind = parts[1]
+        required = DTRACE_RAW_FIELDS.get(kind)
+        if required is None:
+            raise BudgetError(f"unknown DTrace raw record kind on record {number}: {kind}")
+        fields: dict[str, str] = {}
+        for item in parts[2:]:
+            key, separator, value = item.partition("=")
+            if not separator or not key or key in fields:
+                raise BudgetError(f"malformed DTrace raw field on record {number}: {item}")
+            fields[key] = value
+        allowed = required | ({"tid"} if "phase" in required else set())
+        if set(fields) - allowed or required - set(fields):
+            raise BudgetError(f"DTrace raw record {number} has unknown or missing fields")
+        if completes:
+            raise BudgetError("DTrace raw records continue after the completion record")
+        if kind == "complete":
+            if fields["profile"] != "dsr" or fields["bounded"] not in {"0", "1"}:
+                raise BudgetError("DTrace raw completion record is malformed")
+            completes.append(
+                (
+                    fields["bounded"] == "1",
+                    _parse_decimal(fields["target_exit_reason"], "target_exit_reason"),
+                )
+            )
+            continue
+        if kind == "high-water":
+            if not fields["metric"]:
+                raise BudgetError(f"DTrace raw record {number} lacks a metric name")
+            _parse_decimal(fields["pid"], "pid")
+            _parse_decimal(fields["used"], "used")
+            _parse_decimal(fields["capacity"], "capacity")
+            continue
+        phase = fields["phase"]
+        if not phase:
+            raise BudgetError(f"DTrace raw record {number} lacks a phase")
+        pid = _parse_decimal(fields["pid"], "pid")
+        if kind == "incomplete":
+            # Incomplete records name the pending pair by kind; only a zero
+            # count is acceptable evidence.
+            if not fields["kind"]:
+                raise BudgetError(f"DTrace raw record {number} lacks an exit kind")
+            if _parse_decimal(fields["value"], "value") != 0:
+                raise BudgetError(f"DTrace raw record {number} reports incomplete pairs")
+            continue
+        exit_kind = _parse_decimal(fields["kind"], "kind")
+        if kind == "sample":
+            tid = _parse_decimal(fields["tid"], "tid") if "tid" in fields else None
+            _parse_decimal(fields["duration_ns"], "duration_ns")
+            _parse_decimal(fields["interval"], "interval")
+            ordering.append((phase, pid, tid, exit_kind))
+        elif kind == "count":
+            value = _parse_decimal(fields["value"], "value")
+            key = (phase, pid, exit_kind)
+            counts[key] = counts.get(key, 0) + value
+        else:
+            _parse_decimal(fields["value_ns"], "value_ns")
+    if len(completes) != 1:
+        raise BudgetError("DTrace raw trace requires exactly one final completion record")
+    bounded, target_exit_reason = completes[0]
+    return DtraceRaw(
+        sha256=_sha256_path(path),
+        ordering=tuple(ordering),
+        counts=tuple(sorted(counts.items())),
+        bounded=bounded,
+        target_exit_reason=target_exit_reason,
+    )
+
+
+def parse_dtrace_summary(
+    path: pathlib.Path, *, expected_run_id: str, raw_path: pathlib.Path
+) -> DtraceEvidence:
     rows = []
     for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
         if not line:
@@ -1387,8 +1551,8 @@ def parse_dtrace_summary(path: pathlib.Path, *, expected_run_id: str) -> DtraceE
     if completion["high_cardinality_overflow"]:
         raise BudgetError("DTrace summary overflowed cardinality")
     phase_pid_counts: dict[tuple[str, int], int] = {}
+    kind_counts: dict[tuple[str, int, int], int] = {}
     exit_mix: dict[int, int] = {}
-    ordering = []
     completion_rows = 0
     for row in rows:
         scope = row["scope"]
@@ -1416,7 +1580,6 @@ def parse_dtrace_summary(path: pathlib.Path, *, expected_run_id: str) -> DtraceE
             ):
                 raise BudgetError("DTrace kind must be a canonical decimal string")
             kind = int(raw_kind)
-        ordering.append((str(phase), pid if isinstance(pid, int) else None, kind))
         if metric_type == "incomplete-pair":
             raise BudgetError("DTrace summary contains an incomplete metric row")
         if metric_type != "exact":
@@ -1430,10 +1593,11 @@ def parse_dtrace_summary(path: pathlib.Path, *, expected_run_id: str) -> DtraceE
             phase, str
         ):
             raise BudgetError("DTrace count metric lacks typed phase/pid/count")
+        if kind is None:
+            raise BudgetError("DTrace count metric lacks an exit kind")
         phase_pid_counts[(phase, pid)] = phase_pid_counts.get((phase, pid), 0) + count
+        kind_counts[(phase, pid, kind)] = kind_counts.get((phase, pid, kind), 0) + count
         if phase == "run":
-            if kind is None:
-                raise BudgetError("DTrace run count lacks an exit kind")
             exit_mix[kind] = exit_mix.get(kind, 0) + count
     if completion_rows != 1:
         raise BudgetError("DTrace summary requires exactly one completion row")
@@ -1443,14 +1607,23 @@ def parse_dtrace_summary(path: pathlib.Path, *, expected_run_id: str) -> DtraceE
     }
     if not run_counts or run_counts != prepare_counts:
         raise BudgetError("DTrace per-PID prepare/run count mismatch")
+    raw = parse_dtrace_raw(raw_path)
+    if raw.counts != tuple(sorted(kind_counts.items())):
+        raise BudgetError("DTrace raw count aggregates do not reconcile with the summary")
+    if raw.bounded != completion["bounded"] or raw.target_exit_reason != completion[
+        "target_exit_reason"
+    ]:
+        raise BudgetError("DTrace raw completion does not reconcile with the summary")
     return DtraceEvidence(
         complete=True,
         bounded=False,
         incomplete_pairs=0,
+        raw_path=raw_path.name,
+        raw_sha256=raw.sha256,
         drops=tuple(sorted(drops.items())),
         per_pid_gateway_counts=tuple(sorted(run_counts.items())),
         exit_mix=tuple(sorted(exit_mix.items())),
-        ordering=tuple(ordering),
+        ordering=raw.ordering,
     )
 
 
@@ -1514,7 +1687,12 @@ class RunRecord:
         cpu_ns: int = 1,
     ) -> "RunRecord":
         if outcome is None:
-            outcome = RunOutcome("completed", 0, 1, 1, None, 1_000_000)
+            gateway = (
+                max(thread.gateway_entries for thread in profile.threads)
+                if profile is not None
+                else None
+            )
+            outcome = RunOutcome("completed", 0, 1, 1, gateway, 1_000_000)
         return cls(
             RESULT_SCHEMA,
             "run",
@@ -1524,7 +1702,7 @@ class RunRecord:
             repetition,
             schedule_label,
             run_id,
-            "0" * 64,
+            "b" * 64,
             "1" * 64,
             "2" * 64,
             TimeRecord(wall_ns, cpu_ns, 0, 1),
@@ -1558,6 +1736,7 @@ class DecisionRecord:
     selected_slice: str
     share: float
     basis: str
+    scope: str
     supporting_run_ids: tuple[str, ...]
     profile_tax: float | None
     duration_evidence_usable: bool
@@ -1620,36 +1799,72 @@ def analyze(records: Sequence[RunRecord]) -> DecisionRecord:
         raise BudgetError("untraced ABBA wall median must be positive")
     profile_tax = on_wall / off_wall - 1.0
     duration_usable = profile_tax <= 0.10
-    count_evidence = [
-        derive_count_evidence(record.profile) for record in profiled if record.profile is not None
+    # The additive duration model is a validity gate on every profiled run:
+    # a negative or >2% residual invalidates the evidence before any decision,
+    # including count-based ones.
+    additive = [
+        derive_additive_cpu_evidence(record.profile, record.user_ns + record.system_ns)
+        for record in profiled
+        if record.profile is not None
     ]
-    sensitive_shares = {
-        name: _mean([dict(evidence.sensitive_shares)[name] for evidence in count_evidence], name)
-        for _, name in SENSITIVE_ORDER
+    scoped_counts = {
+        scope: [
+            derive_count_evidence(record.profile, scope=scope)
+            for record in profiled
+            if record.profile is not None
+        ]
+        for scope in COUNT_SCOPES
     }
-    for _, name in SENSITIVE_ORDER:
-        share = sensitive_shares[name]
-        if share >= 0.30:
-            return DecisionRecord(
-                RESULT_SCHEMA,
-                "decision",
-                f"sensitive-{name}",
-                share,
-                "reconciled-profile-counts",
-                tuple(record.run_id for record in profiled),
-                profile_tax,
-                duration_usable,
+    scoped_sensitive = {
+        scope: {
+            name: _mean(
+                [dict(evidence.sensitive_shares)[name] for evidence in count_evidence], name
             )
-    resolver_share = _mean(
-        [evidence.resolver_exit_share for evidence in count_evidence], "resolver-exit-share"
-    )
-    if resolver_share >= 0.30 and _resolver_recurrence_verified(records):
+            for _, name in SENSITIVE_ORDER
+        }
+        for scope, count_evidence in scoped_counts.items()
+    }
+    sensitive_slice_by_scope = {
+        scope: next((name for _, name in SENSITIVE_ORDER if shares[name] >= 0.30), None)
+        for scope, shares in scoped_sensitive.items()
+    }
+    if len(set(sensitive_slice_by_scope.values())) != 1:
+        raise BudgetError(
+            "count-evidence thread scopes disagree on the sensitive slice: "
+            + ", ".join(
+                f"{scope}={name}" for scope, name in sorted(sensitive_slice_by_scope.items())
+            )
+        )
+    agreed_sensitive = sensitive_slice_by_scope["hottest-thread"]
+    if agreed_sensitive is not None:
+        return DecisionRecord(
+            RESULT_SCHEMA,
+            "decision",
+            f"sensitive-{agreed_sensitive}",
+            scoped_sensitive["hottest-thread"][agreed_sensitive],
+            "reconciled-profile-counts",
+            "hottest-thread+aggregate-threads",
+            tuple(record.run_id for record in profiled),
+            profile_tax,
+            duration_usable,
+        )
+    resolver_by_scope = {
+        scope: _mean(
+            [evidence.resolver_exit_share for evidence in count_evidence],
+            "resolver-exit-share",
+        )
+        for scope, count_evidence in scoped_counts.items()
+    }
+    if all(share >= 0.30 for share in resolver_by_scope.values()) and _resolver_recurrence_verified(
+        records
+    ):
         return DecisionRecord(
             RESULT_SCHEMA,
             "decision",
             "resolver-recurrence",
-            resolver_share,
+            resolver_by_scope["hottest-thread"],
             "reconciled-profile-counts-plus-recurring-pc-proof",
+            "hottest-thread+aggregate-threads",
             tuple(record.run_id for record in profiled),
             profile_tax,
             duration_usable,
@@ -1659,11 +1874,6 @@ def analyze(records: Sequence[RunRecord]) -> DecisionRecord:
         untraced_cpu = statistics.median(record.user_ns + record.system_ns for record in untraced)
         if untraced_cpu <= 0:
             raise BudgetError("untraced ABBA CPU median must be positive")
-        additive = [
-            derive_additive_cpu_evidence(record.profile, record.user_ns + record.system_ns)
-            for record in profiled
-            if record.profile is not None
-        ]
         syscall_ns = statistics.median(
             dict(evidence.exclusive_terms_ns)["syscall-dispatch"] for evidence in additive
         )
@@ -1677,22 +1887,31 @@ def analyze(records: Sequence[RunRecord]) -> DecisionRecord:
                 "syscall-dispatch",
                 duration_shares["syscall-dispatch"],
                 "low-tax-exclusive-profile-duration-over-untraced-cpu",
+                "process-cpu",
                 tuple(record.run_id for record in abba),
                 profile_tax,
                 True,
             )
+        blocked_ns = statistics.median(evidence.blocked_ns for evidence in additive)
+        # Aggregated thread blocked time can exceed process wall; the trigger
+        # saturates at 1.0 rather than pretending to be a partition share.
+        blocked_share = min(blocked_ns / off_wall, 1.0)
+        if blocked_share >= 0.30:
+            return DecisionRecord(
+                RESULT_SCHEMA,
+                "decision",
+                "blocked-residual",
+                blocked_share,
+                "low-tax-blocked-off-cpu-over-untraced-wall",
+                "process-wall",
+                tuple(record.run_id for record in abba),
+                profile_tax,
+                True,
+            )
+
     # Two-term fallback is evaluated within one denominator only.  Count and
     # CPU fractions are never added to one another.
-    count_terms = [(share, f"sensitive-{name}") for name, share in sensitive_shares.items()]
-    if _resolver_recurrence_verified(records):
-        count_terms.append((resolver_share, "resolver-recurrence"))
-    duration_terms = (
-        [(share, name) for name, share in duration_shares.items()] if duration_usable else []
-    )
-    for terms, basis in (
-        (count_terms, "two-term-profile-counts"),
-        (duration_terms, "two-term-profile-durations"),
-    ):
+    def two_term_best(terms: list[tuple[float, str]]) -> tuple[float, str, str] | None:
         candidates = sorted(
             (
                 (left[0] + right[0], left[1], right[1])
@@ -1702,18 +1921,53 @@ def analyze(records: Sequence[RunRecord]) -> DecisionRecord:
             ),
             key=lambda item: (item[0], item[1], item[2]),
         )
-        if candidates:
-            share, left, right = candidates[0]
-            return DecisionRecord(
-                RESULT_SCHEMA,
-                "decision",
-                f"{left}+{right}",
-                share,
-                basis,
-                tuple(record.run_id for record in profiled),
-                profile_tax,
-                duration_usable,
-            )
+        return candidates[0] if candidates else None
+
+    count_best = {}
+    for scope in COUNT_SCOPES:
+        count_terms = [
+            (share, f"sensitive-{name}") for name, share in scoped_sensitive[scope].items()
+        ]
+        if _resolver_recurrence_verified(records):
+            count_terms.append((resolver_by_scope[scope], "resolver-recurrence"))
+        count_best[scope] = two_term_best(count_terms)
+    selected_pairs = {
+        None if best is None else (best[1], best[2]) for best in count_best.values()
+    }
+    if len(selected_pairs) != 1:
+        raise BudgetError("count-evidence thread scopes disagree on the two-term slice")
+    best = count_best["hottest-thread"]
+    if best is not None:
+        share, left, right = best
+        return DecisionRecord(
+            RESULT_SCHEMA,
+            "decision",
+            f"{left}+{right}",
+            share,
+            "two-term-profile-counts",
+            "hottest-thread+aggregate-threads",
+            tuple(record.run_id for record in profiled),
+            profile_tax,
+            duration_usable,
+        )
+    duration_best = (
+        two_term_best([(share, name) for name, share in duration_shares.items()])
+        if duration_usable
+        else None
+    )
+    if duration_best is not None:
+        share, left, right = duration_best
+        return DecisionRecord(
+            RESULT_SCHEMA,
+            "decision",
+            f"{left}+{right}",
+            share,
+            "two-term-profile-durations",
+            "process-cpu",
+            tuple(record.run_id for record in profiled),
+            profile_tax,
+            duration_usable,
+        )
     if not duration_usable:
         raise BudgetError(
             f"duration evidence unavailable: ABBA profile tax {profile_tax:.3f} exceeds 0.10"
@@ -1785,6 +2039,8 @@ def _dtrace_json(evidence: DtraceEvidence | None) -> object:
         "complete": evidence.complete,
         "bounded": evidence.bounded,
         "incomplete_pairs": evidence.incomplete_pairs,
+        "raw_path": evidence.raw_path,
+        "raw_sha256": evidence.raw_sha256,
         "drops": dict(evidence.drops),
         "per_pid_gateway_counts": [list(item) for item in evidence.per_pid_gateway_counts],
         "exit_mix": [list(item) for item in evidence.exit_mix],
@@ -1867,6 +2123,18 @@ def _parse_profile_json(value: object) -> ProfileRun | None:
             raise BudgetError("profile thread frames are not the exact required set")
         if not isinstance(values, dict) or not all(isinstance(key, str) for key in values):
             raise BudgetError("profile thread values must be an object")
+        expected_keys = {
+            f"{frame}.{field}"
+            for frame, fields in FRAME_FIELDS.items()
+            for field in fields
+        }
+        unknown_keys = set(values) - expected_keys
+        missing_keys = expected_keys - set(values)
+        if unknown_keys or missing_keys:
+            raise BudgetError(
+                "profile value keys are not the exact flattened frame set: "
+                + ", ".join(sorted(unknown_keys | missing_keys))
+            )
         parsed_values = tuple(
             sorted((key, _nonnegative_int(item, f"profile value {key}")) for key, item in values.items())
         )
@@ -1893,6 +2161,8 @@ def _parse_dtrace_json(value: object) -> DtraceEvidence | None:
             "complete",
             "bounded",
             "incomplete_pairs",
+            "raw_path",
+            "raw_sha256",
             "drops",
             "per_pid_gateway_counts",
             "exit_mix",
@@ -1902,12 +2172,17 @@ def _parse_dtrace_json(value: object) -> DtraceEvidence | None:
     )
     if raw["complete"] is not True or raw["bounded"] is not False:
         raise BudgetError("DTrace typed evidence is incomplete or bounded")
+    raw_artifact_path = _string(raw["raw_path"], "DTrace raw_path")
+    if not raw_artifact_path:
+        raise BudgetError("DTrace raw_path must be a non-empty artifact name")
+    _require_hash(_string(raw["raw_sha256"], "DTrace raw_sha256"), "DTrace raw_sha256")
     drops = raw["drops"]
     if not isinstance(drops, dict) or not all(
         isinstance(key, str)
-        and isinstance(item, int)
-        and not isinstance(item, bool)
-        and item == 0
+        and (
+            item is False
+            or (isinstance(item, int) and not isinstance(item, bool) and item == 0)
+        )
         for key, item in drops.items()
     ):
         raise BudgetError("DTrace typed drops must be an object")
@@ -1930,26 +2205,92 @@ def _parse_dtrace_json(value: object) -> DtraceEvidence | None:
     for item in ordering_raw:
         if (
             not isinstance(item, list)
-            or len(item) != 3
+            or len(item) != 4
             or not isinstance(item[0], str)
+            or not item[0]
             or not isinstance(item[1], int)
             or isinstance(item[1], bool)
             or item[1] < 0
-            or not isinstance(item[2], int)
-            or isinstance(item[2], bool)
-            or item[2] < 0
+            or not (
+                item[2] is None
+                or (isinstance(item[2], int) and not isinstance(item[2], bool) and item[2] >= 0)
+            )
+            or not isinstance(item[3], int)
+            or isinstance(item[3], bool)
+            or item[3] < 0
         ):
             raise BudgetError("DTrace typed ordering is malformed")
-        ordering.append((item[0], item[1], item[2]))
+        ordering.append((item[0], item[1], item[2], item[3]))
     return DtraceEvidence(
         True,
         False,
         _nonnegative_int(raw["incomplete_pairs"], "DTrace incomplete pairs"),
+        raw_artifact_path,
+        str(raw["raw_sha256"]),
         tuple(sorted(drops.items())),
         pairs("per_pid_gateway_counts"),
         pairs("exit_mix"),
         tuple(ordering),
     )
+
+
+ABBA_LABEL_RE = re.compile(r"^(off|on)-(warmup|[1-9][0-9]*)$")
+BASELINE_LABEL_RE = re.compile(r"^baseline-(w1|w2)-(warmup|measured)-([0-9]+)$")
+DOCKER_BINARY_SENTINEL = "0" * 64
+
+
+def _validate_run_cross_fields(record: RunRecord) -> None:
+    if record.engine == "docker":
+        if record.plane != "untraced":
+            raise BudgetError("Docker rows must be untraced oracle phases")
+        if record.preflight_sha256 is not None:
+            raise BudgetError("Docker rows must not carry a Carrick preflight receipt")
+        if record.binary_sha256 != DOCKER_BINARY_SENTINEL:
+            raise BudgetError("Docker rows must carry the placeholder binary identity")
+        if record.cleanup.status != "not-required" or not record.cleanup.descendants_absent:
+            raise BudgetError("Docker rows must record not-required cleanup")
+        if record.outcome.kind == "max-traps":
+            raise BudgetError("Docker rows cannot reach the Carrick trap ceiling")
+    else:
+        if record.preflight_sha256 is None:
+            raise BudgetError("Carrick rows require a Docker-only preflight receipt")
+        if record.binary_sha256 == DOCKER_BINARY_SENTINEL:
+            raise BudgetError("Carrick rows must carry the measured binary identity")
+        if record.cleanup.status != "clean" or not record.cleanup.descendants_absent:
+            raise BudgetError("Carrick rows require clean scoped cleanup")
+    if (record.plane == "profiled") != (record.profile is not None):
+        raise BudgetError("profile evidence must match the profiled plane")
+    if (record.plane == "dtrace") != (record.dtrace is not None):
+        raise BudgetError("DTrace evidence must match the dtrace plane")
+    if record.profile is not None:
+        expected_gateway = max(
+            thread.gateway_entries for thread in record.profile.threads
+        )
+        if record.outcome.gateway_entries != expected_gateway:
+            raise BudgetError("outcome gateway count does not reconcile with the profile")
+    elif record.outcome.gateway_entries is not None:
+        raise BudgetError("gateway count requires profile evidence")
+    label = record.schedule_label
+    if label:
+        abba = ABBA_LABEL_RE.fullmatch(label)
+        baseline = BASELINE_LABEL_RE.fullmatch(label)
+        if abba:
+            if record.engine != "carrick":
+                raise BudgetError("ABBA rows must run under Carrick")
+            expected_plane = "untraced" if abba.group(1) == "off" else "profiled"
+            expected_repetition = (
+                0 if abba.group(2) == "warmup" else int(abba.group(2))
+            )
+            if record.plane != expected_plane or record.repetition != expected_repetition:
+                raise BudgetError("ABBA label does not match plane/repetition")
+        elif baseline:
+            expected_repetition = int(baseline.group(3))
+            if baseline.group(2) == "warmup" and expected_repetition != 0:
+                raise BudgetError("baseline warmup label must be repetition zero")
+            if record.plane != "untraced" or record.repetition != expected_repetition:
+                raise BudgetError("baseline label does not match plane/repetition")
+        else:
+            raise BudgetError(f"unknown schedule label: {label}")
 
 
 def parse_result_row(value: object) -> RunRecord:
@@ -2044,14 +2385,18 @@ def parse_result_row(value: object) -> RunRecord:
         raise BudgetError("outcome work-unit metadata is invalid")
     if outcome_kind == "completed" and completed != expected:
         raise BudgetError("completed outcome did not complete every work unit")
-    if outcome_kind == "max-traps" and (
-        gateway_entries != gateway_limit
-        or ceiling_marker != gateway_limit
-        or marker_thread_id is None
-        or ceiling_identity is None
-        or ceiling_identity[1] != marker_thread_id
-    ):
-        raise BudgetError("max-traps outcome lacks ceiling evidence")
+    if outcome_kind == "max-traps":
+        if ceiling_marker != gateway_limit or marker_thread_id is None:
+            raise BudgetError("max-traps outcome lacks ceiling evidence")
+        if gateway_entries is None:
+            if ceiling_identity is not None:
+                raise BudgetError("profile-less max-traps outcome carries a profile identity")
+        elif (
+            gateway_entries != gateway_limit
+            or ceiling_identity is None
+            or ceiling_identity[1] != marker_thread_id
+        ):
+            raise BudgetError("max-traps outcome lacks ceiling evidence")
     if outcome_kind != "max-traps" and any(
         value is not None for value in (ceiling_marker, marker_thread_id, ceiling_identity)
     ):
@@ -2069,7 +2414,7 @@ def parse_result_row(value: object) -> RunRecord:
     if preflight is not None:
         preflight = _string(preflight, "preflight_sha256")
         _require_hash(preflight, "preflight_sha256")
-    return RunRecord(
+    record = RunRecord(
         schema=RESULT_SCHEMA,
         record="run",
         engine=engine,
@@ -2111,6 +2456,8 @@ def parse_result_row(value: object) -> RunRecord:
         profile=_parse_profile_json(raw["profile"]),
         dtrace=_parse_dtrace_json(raw["dtrace"]),
     )
+    _validate_run_cross_fields(record)
+    return record
 
 
 def _parse_decision_row(value: object) -> DecisionRecord:
@@ -2122,6 +2469,7 @@ def _parse_decision_row(value: object) -> DecisionRecord:
             "selected_slice",
             "share",
             "basis",
+            "scope",
             "supporting_run_ids",
             "profile_tax",
             "duration_evidence_usable",
@@ -2143,12 +2491,16 @@ def _parse_decision_row(value: object) -> DecisionRecord:
         raise BudgetError("decision profile_tax must be numeric or null")
     if not isinstance(raw["duration_evidence_usable"], bool):
         raise BudgetError("decision duration_evidence_usable must be boolean")
+    scope = _string(raw["scope"], "decision scope")
+    if not scope:
+        raise BudgetError("decision scope must name the evidence denominator")
     return DecisionRecord(
         RESULT_SCHEMA,
         "decision",
         _string(raw["selected_slice"], "selected slice"),
         float(share),
         _string(raw["basis"], "decision basis"),
+        scope,
         tuple(run_ids),
         None if profile_tax is None else float(profile_tax),
         raw["duration_evidence_usable"],
@@ -2480,7 +2832,7 @@ def run_phase(
             if profile is not None
             else None
         )
-        max_traps_marker = parse_max_traps_marker(stderr_lines) if profile is not None else None
+        max_traps_marker = parse_max_traps_marker(stderr_lines)
         ceiling_identity = (
             reconcile_max_traps_marker(profile, max_traps_marker, manifest.max_traps)
             if profile is not None and max_traps_marker is not None
@@ -2501,7 +2853,9 @@ def run_phase(
         dtrace = None
         if plane == "dtrace":
             dtrace = parse_dtrace_summary(
-                artifact / "dtrace-summary.jsonl", expected_run_id=run_id
+                artifact / "dtrace-summary.jsonl",
+                expected_run_id=run_id,
+                raw_path=artifact / "dtrace.raw",
             )
         diagnostic = _read_json(artifact / "monotonic-diagnostic.json")
         monotonic = _nonnegative_int(diagnostic.get("elapsed_ns"), "monotonic elapsed_ns")
@@ -2781,9 +3135,7 @@ def capture_w2(
         subprocess.run(["docker", "rm", "-f", container], check=False, capture_output=True)
 
 
-def _replay_w2_docker(
-    manifest: WorkloadManifest, fixture_dir: pathlib.Path
-) -> tuple[subprocess.CompletedProcess[bytes], str]:
+def w2_replay_script(manifest: WorkloadManifest) -> tuple[str, pathlib.PurePosixPath]:
     copies = []
     for item in manifest.files:
         if item.fixture_path is None:
@@ -2799,7 +3151,13 @@ def _replay_w2_docker(
             output_dirs.append(f"mkdir -p {sh_quote(str(output_path.parent))}")
     if output_path is None:
         raise BudgetError("captured W2 command has no -o work product")
-    script = "; ".join([*copies, *output_dirs, 'exec "$@"'])
+    return "; ".join(["set -eu", *copies, *output_dirs, 'exec "$@"']), output_path
+
+
+def _replay_w2_docker(
+    manifest: WorkloadManifest, fixture_dir: pathlib.Path
+) -> tuple[subprocess.CompletedProcess[bytes], str]:
+    script, output_path = w2_replay_script(manifest)
     with tempfile.TemporaryDirectory(prefix="carrick-w2-output-") as output_temp:
         command = [
             "docker",
