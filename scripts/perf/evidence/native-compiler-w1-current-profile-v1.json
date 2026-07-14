@@ -1,0 +1,57 @@
+{
+  "binary_sha256": "01659e3ecc7bc1b627a2b524553c6cea05772838c826f17d04e9fbb5fdd49b97",
+  "cleanup": {
+    "descendants_absent": true,
+    "receipt_sha256": "d8e964e44fed2f5541cc23d8efd69cc424348a94baa702f52710792a7748eecf",
+    "status": "clean"
+  },
+  "complete_thread_groups": 140,
+  "frames_per_group": 9,
+  "hottest": {
+    "era": 15823862970214,
+    "exit_resolve_direct": 6399,
+    "exit_resolve_indirect": 137327,
+    "exit_sensitive": 855641,
+    "gateway_entries": 1000000,
+    "pid": 18273,
+    "sensitive_exclusive": 579097,
+    "tid": 18275
+  },
+  "manifest_sha256": "428f5da855682b39cb98acbece93bbfdbb35a63c5b18c2fde826afd52b77a40b",
+  "outcome": {
+    "ceiling_marker_thread_id": 18275,
+    "ceiling_marker_traps": 1000000,
+    "ceiling_profile_identity": [
+      18273,
+      18275,
+      15823862970214
+    ],
+    "exit_status": 2,
+    "gateway_entries": 1000000,
+    "gateway_limit": 1000000,
+    "kind": "max-traps",
+    "work_units_completed": 0,
+    "work_units_expected": 1
+  },
+  "raw_profile_sha256": "8d2ebd3666908c805135e03a316d20793c9ce3621955ed9bde6bc8bc75a30945",
+  "raw_profile_source": "target/native-compiler-task2-review/task2-review-w1-current-repeat-1784033729/stderr",
+  "required_frames": [
+    "cache-gauge",
+    "core",
+    "exits",
+    "phases-a",
+    "phases-b",
+    "resolver-process",
+    "resolver-thread",
+    "resolver-times",
+    "sensitive"
+  ],
+  "run_id": "task2-review-w1-current-repeat-1784033729",
+  "schema": "carrick.native-compiler-w1-profile-evidence.v1",
+  "timing": {
+    "peak_rss_bytes": 695058432,
+    "system_ns": 24240000000,
+    "user_ns": 44780000000,
+    "wall_ns": 20020000000
+  }
+}
