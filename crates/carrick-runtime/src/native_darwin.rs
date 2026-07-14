@@ -619,6 +619,7 @@ where
     };
 
     dispatcher.set_page_geometry(plan.page_geometry);
+    dispatcher.set_execution_backend(plan.backend);
     dispatcher.set_memory_layout(native_memory_layout());
     let argv: Vec<String> = argv.into_iter().collect();
     let env: Vec<String> = env.into_iter().collect();
@@ -682,6 +683,7 @@ where
     };
 
     dispatcher.set_page_geometry(plan.page_geometry);
+    dispatcher.set_execution_backend(plan.backend);
     dispatcher.set_memory_layout(native_memory_layout());
     let argv: Vec<String> = argv.into_iter().collect();
     let env: Vec<String> = env.into_iter().collect();
@@ -918,6 +920,7 @@ pub(crate) fn resume_guest_from_capsule(
     )?;
     let mut dispatcher = SyscallDispatcher::new();
     dispatcher.set_page_geometry(plan.page_geometry);
+    dispatcher.set_execution_backend(plan.backend);
     dispatcher.set_memory_layout(native_memory_layout());
     let backend = crate::fs_backend::HostFsBackend::attach_for_reexec(&guest.rootfs)?;
     let _ = dispatcher.set_fs_backend(Box::new(backend));
@@ -2488,13 +2491,14 @@ impl NativeThreadRuntime {
         // Only the calling thread survives fork; the copied JoinHandle names a
         // parent-only pump thread. Dropping it in the child would try to stop/
         // join a thread that cannot run, so abandon that COW guard and start a
-        // fresh wake-only pump over the child's fresh kicker/futex objects.
+        // fresh wake-only pump later, after the child registers its kick
+        // target. Starting it here lets the pump consume a durable pending
+        // edge against an empty registry and strand the signal forever.
         if let Some(inherited) = self.signal_wake_pump.take() {
             std::mem::forget(inherited);
         }
         self.forked_stale = true;
         *self = Self::new_current();
-        self.start_signal_wake_pump();
     }
 
     fn tid(&self) -> crate::thread::ThreadId {
@@ -4154,6 +4158,7 @@ fn handle_native_fork(
         dispatcher.retire_sibling_thread_signal_state(parent_tid);
         dispatcher.migrate_thread_signal_state(parent_tid, thread_runtime.tid());
         thread_runtime.prepare_kick_target()?;
+        thread_runtime.start_signal_wake_pump();
         native_trace_fork_phase("child-thread-runtime-reset");
         crate::guest_cpu::reset();
         crate::guest_cpu::complete_child_record_post_fork_child();
@@ -11416,6 +11421,55 @@ mod tests {
     static STW_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     static NATIVE_PUMP_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    #[derive(Clone)]
+    struct TestCountingKick(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl carrick_hal::VcpuKick for TestCountingKick {
+        fn kick(&self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn wait_for_test_kick(kicks: &std::sync::atomic::AtomicUsize) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while kicks.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "expected backend-owned signal kick"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    fn counting_wake_pump(
+        tid: crate::thread::ThreadId,
+    ) -> (
+        crate::vcpu_kick::SignalPump,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use carrick_hal::VcpuRegistry as _;
+
+        let registry = Arc::new(carrick_hal::GenericVcpuRegistry::new());
+        let kicks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        registry.register(tid, Box::new(TestCountingKick(Arc::clone(&kicks))));
+        let futex = Arc::new(crate::threaded_impl::hvf_futex(Arc::new(
+            crate::thread::FutexTable::new(),
+        ))) as Arc<dyn carrick_hal::PlatformFutex>;
+        let pump = crate::vcpu_kick::spawn_signal_wake_pump(
+            registry as Arc<dyn carrick_hal::VcpuRegistry>,
+            futex,
+        );
+        assert!(
+            pump.wait_until_ready(Duration::from_secs(2)),
+            "signal pump did not become ready"
+        );
+        // The startup reconciliation may legitimately kick for unrelated
+        // process-wide state left by another runtime test. Producer tests only
+        // observe work published after the pump's ready boundary.
+        kicks.store(0, std::sync::atomic::Ordering::SeqCst);
+        (pump, kicks)
+    }
+
     /// The native fork-quiesce park contract at the dispatch boundary:
     /// a sibling observing `is_quiescing()` UNREGISTERS from the kicker first
     /// (the forker's drain counts registered threads down to 1), parks at the
@@ -13041,6 +13095,148 @@ mod tests {
     }
 
     #[test]
+    fn fork_child_registers_kick_target_before_replacement_pump_consumes_pending() {
+        let _pump_guard = NATIVE_PUMP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        fork_test(|| {
+            carrick_signal_core::clear_proc_pending();
+            let mut runtime = NativeThreadRuntime::new_current();
+            runtime.reset_after_fork_child();
+            carrick_signal_core::publish_process_signal(crate::linux_abi::LINUX_SIGALRM);
+            crate::host_signal::wake_signal_pump_pipe();
+            std::thread::sleep(Duration::from_millis(50));
+
+            runtime
+                .prepare_kick_target()
+                .expect("prepare child kick target");
+            runtime.start_signal_wake_pump();
+            let state = runtime.kick_state.as_ref().expect("registered kick state");
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while state.requested_generation() == 0 {
+                assert!(
+                    Instant::now() < deadline,
+                    "replacement pump consumed the event before target registration"
+                );
+                std::thread::yield_now();
+            }
+            carrick_signal_core::clear_proc_pending();
+        });
+    }
+
+    #[test]
+    fn dispatcher_wake_owner_is_selected_by_execution_backend() {
+        let mut dispatcher = SyscallDispatcher::new();
+        assert_eq!(
+            dispatcher.async_signal_wake_owner(),
+            crate::dispatch::AsyncSignalWakeOwner::SignalPump
+        );
+        dispatcher.set_execution_backend(crate::page_profile::ExecutionBackend::NativeDarwin);
+        assert_eq!(
+            dispatcher.async_signal_wake_owner(),
+            crate::dispatch::AsyncSignalWakeOwner::NativeDirect
+        );
+        dispatcher.set_execution_backend(crate::page_profile::ExecutionBackend::Vmm);
+        assert_eq!(
+            dispatcher.async_signal_wake_owner(),
+            crate::dispatch::AsyncSignalWakeOwner::SignalPump
+        );
+    }
+
+    #[test]
+    fn vmm_synchronous_child_exit_uses_pump_while_vcpu_spins() {
+        let _pump_guard = NATIVE_PUMP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        carrick_signal_core::clear_proc_pending();
+        let _ = carrick_signal_core::xsig::xsig_drain_for_self();
+        let tid = crate::thread::ThreadId::synthetic_for_tests(0x51c4);
+        crate::host_signal::forget_thread(tid.raw());
+        let (pump, kicks) = counting_wake_pump(tid);
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.set_execution_backend(crate::page_profile::ExecutionBackend::Vmm);
+        let child = 0x51c4_0001;
+        crate::host_signal::register_child_exit_watch(
+            child,
+            tid.raw(),
+            crate::linux_abi::LINUX_SIGCHLD,
+        );
+
+        dispatcher.publish_terminal_child_exit_signal(child);
+        wait_for_test_kick(&kicks);
+
+        assert_eq!(
+            crate::host_signal::take_pending_for(tid.raw()),
+            crate::linux_abi::LINUX_SIGCHLD
+        );
+        pump.stop();
+        crate::host_signal::forget_thread(tid.raw());
+    }
+
+    #[test]
+    fn vmm_rlimit_cpu_uses_pump_while_vcpu_spins() {
+        let _pump_guard = NATIVE_PUMP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        carrick_signal_core::clear_proc_pending();
+        let _ = carrick_signal_core::xsig::xsig_drain_for_self();
+        let tid = crate::thread::ThreadId::synthetic_for_tests(0x58c0);
+        let (pump, kicks) = counting_wake_pump(tid);
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.set_execution_backend(crate::page_profile::ExecutionBackend::Vmm);
+
+        dispatcher.publish_rlimit_cpu_signal_for_test(crate::linux_abi::LINUX_SIGXCPU);
+        wait_for_test_kick(&kicks);
+
+        assert_eq!(
+            crate::host_signal::take_process_pending(),
+            crate::linux_abi::LINUX_SIGXCPU
+        );
+        pump.stop();
+    }
+
+    #[test]
+    fn native_synchronous_helpers_use_one_direct_kick() {
+        use carrick_hal::VcpuRegistry as _;
+        use std::sync::atomic::Ordering;
+
+        let _pump_guard = NATIVE_PUMP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        carrick_signal_core::clear_proc_pending();
+        let runtime = NativeThreadRuntime::new_current();
+        let kicks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        runtime.kicker.register(
+            crate::thread::ThreadId::synthetic_for_tests(0x4e41),
+            Box::new(TestCountingKick(Arc::clone(&kicks))),
+        );
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.set_execution_backend(crate::page_profile::ExecutionBackend::NativeDarwin);
+        let parent_tid = 0x4e41_0001;
+        let child = 0x4e41_0002;
+        crate::host_signal::forget_thread(parent_tid);
+        crate::host_signal::register_child_exit_watch(
+            child,
+            parent_tid,
+            crate::linux_abi::LINUX_SIGCHLD,
+        );
+
+        dispatcher.publish_terminal_child_exit_signal(child);
+        assert_eq!(kicks.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            crate::host_signal::take_pending_for(parent_tid),
+            crate::linux_abi::LINUX_SIGCHLD
+        );
+        dispatcher.publish_rlimit_cpu_signal_for_test(crate::linux_abi::LINUX_SIGXCPU);
+        assert_eq!(kicks.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            crate::host_signal::take_process_pending(),
+            crate::linux_abi::LINUX_SIGXCPU
+        );
+        crate::host_signal::forget_thread(parent_tid);
+    }
+
+    #[test]
     fn native_child_exit_publication_between_futex_predicate_and_park_is_not_lost() {
         use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -13142,6 +13338,7 @@ mod tests {
         let _pump_guard = NATIVE_PUMP_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::host_signal::install_default_handlers();
         carrick_signal_core::xsig::xsig_init();
         let _ = carrick_signal_core::xsig::xsig_drain_for_self();
         let mut runtime = NativeThreadRuntime::new_current();
@@ -13179,9 +13376,10 @@ mod tests {
                         0,
                         0,
                     ));
-                    // The real nudge handler calls `notify_pending`, whose pump
-                    // side is this async-signal-safe pipe write.
-                    crate::host_signal::wake_signal_pump_pipe();
+                    // Exercise the real SIGINFO nudge handler. It marks the
+                    // ring publication generation before its async-signal-safe
+                    // pipe writes, which is the authority the pump reconciles.
+                    crate::host_signal::xsig_nudge(std::process::id() as i32);
                 }
                 observed
             },

@@ -844,6 +844,16 @@ impl ProcState {
 }
 
 impl SyscallDispatcher {
+    pub(crate) fn publish_terminal_child_exit_signal(&self, child_pid: i32) {
+        if let Some((parent_tid, exit_signal)) =
+            crate::host_signal::take_child_exit_parent(child_pid)
+            && exit_signal != 0
+        {
+            self.async_signal_wake_owner()
+                .publish_thread_signal(parent_tid, exit_signal);
+        }
+    }
+
     /// True once this dispatcher is running in a real host child created for a
     /// guest `fork`/fork-like `clone`. Such descendants inherited the original
     /// CLI process state and must use `_exit` on guest process exit instead of
@@ -3227,15 +3237,7 @@ impl SyscallDispatcher {
             // phase (the original kill12/kill10 failure mode).
             let terminal_reap = libc::WIFEXITED(host_status) || libc::WIFSIGNALED(host_status);
             if terminal_reap {
-                if let Some((parent_tid, exit_signal)) =
-                    crate::host_signal::take_child_exit_parent(result)
-                    && exit_signal != 0
-                {
-                    #[cfg(feature = "platform-macos")]
-                    crate::native_darwin::publish_native_pending_for(parent_tid, exit_signal);
-                    #[cfg(not(feature = "platform-macos"))]
-                    crate::host_signal::publish_pending_for(parent_tid, exit_signal);
-                }
+                this.publish_terminal_child_exit_signal(result);
                 // The child host process is now dead; tear down its leaked host VM
                 // node (bhyve's named /dev/vmm/carrick-<pid>-* persists past the
                 // child's _exit). Sole, non-hanging teardown — no live holder. No-op
