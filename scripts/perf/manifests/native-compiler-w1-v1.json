@@ -1,0 +1,42 @@
+{
+  "argv": [
+    "/conformance/go_types.test",
+    "-test.v",
+    "-test.run",
+    "^TestImplicitsInfo$",
+    "-test.short"
+  ],
+  "capture": {
+    "go_version": "go version go1.24.13 linux/arm64",
+    "source": "docker-exact-w1",
+    "stdout_normalization": "go-test-duration"
+  },
+  "env": [],
+  "executable_sha256": "d46f57b7a4b0083a899a85eaa1bdc1b96292c4e13fd0836575efd66acd52fd08",
+  "expected_exit": 0,
+  "expected_stdout_sha256": "ea990fe05426f27435abe1137f9c805201092cce30c60c22ca8775ffa60e6159",
+  "files": [
+    {
+      "fixture_path": null,
+      "guest_path": "/conformance/go_types.test",
+      "sha256": "d46f57b7a4b0083a899a85eaa1bdc1b96292c4e13fd0836575efd66acd52fd08"
+    },
+    {
+      "fixture_path": null,
+      "guest_path": "/usr/local/go/VERSION",
+      "sha256": "756345ba66e44025c7756e491a40b0a2fbbbd9611e462477df64fa38c6ddaba0"
+    },
+    {
+      "fixture_path": null,
+      "guest_path": "/usr/local/go/src/go/types/api_test.go",
+      "sha256": "d3f43a575c9d3d0aed193c6a7981b64ba6331fb929b261835d7ceed6b24360bc"
+    }
+  ],
+  "image": "localhost:5005/carrick-go-conformance:1.24",
+  "image_digest": "sha256:6199806814040f05f24d1845b3198f82a2bb982d336ffb04aa4470861cb214d6",
+  "max_traps": 1000000,
+  "name": "w1-test-implicits-info",
+  "native_page_profile": "native16k",
+  "schema": "carrick.native-compiler-workload.v1",
+  "workdir": "/usr/local/go/src/go/types"
+}
