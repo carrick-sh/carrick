@@ -1793,6 +1793,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                     thread_runtime.registry.live_count(),
                     kind,
                     address,
+                    &mut translator,
                 )?;
                 continue;
             }
@@ -1805,6 +1806,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                     thread_runtime.tid(),
                     None,
                     Some(interrupted_pc),
+                    &mut translator,
                 )?;
                 continue;
             }
@@ -1901,6 +1903,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                     request.number.raw(),
                     value,
                     resume,
+                    &mut translator,
                 )?;
             }
             DispatchOutcome::Errno { errno } => {
@@ -1912,13 +1915,20 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                     request.number.raw(),
                     errno.guest_retval(),
                     resume,
+                    &mut translator,
                 )?;
             }
             DispatchOutcome::SigReturn => {
-                snapshot =
-                    complete_dsr_sigreturn(&dispatcher, &memory, snapshot, thread_runtime.tid())?;
+                snapshot = complete_dsr_sigreturn(
+                    &dispatcher,
+                    &memory,
+                    snapshot,
+                    thread_runtime.tid(),
+                    &mut translator,
+                )?;
             }
             DispatchOutcome::Exit { code } => {
+                translator.finalize_profile_epoch();
                 if NATIVE_FORKED_GUEST_CHILD.load(std::sync::atomic::Ordering::Acquire) {
                     dispatcher.cleanup_sysv_ipc_on_process_exit();
                     crate::exec_helpers::forked_child_exit(
@@ -1964,6 +1974,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                         request.number.raw(),
                         crate::linux_abi::LINUX_EOPNOTSUPP.guest_retval(),
                         resume,
+                        &mut translator,
                     )?;
                     continue;
                 }
@@ -1992,6 +2003,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                     request.number.raw(),
                     i64::from(tid.raw()),
                     resume,
+                    &mut translator,
                 )?;
             }
             DispatchOutcome::Fork {
@@ -2027,6 +2039,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                         request.number.raw(),
                         crate::linux_abi::LINUX_EOPNOTSUPP.guest_retval(),
                         resume,
+                        &mut translator,
                     )?;
                     continue;
                 }
@@ -2066,6 +2079,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                             syscall_nr,
                             value,
                             resume,
+                            &mut translator,
                         )?;
                     }
                     NativeForkFlow::RetireForExec => {
@@ -2111,9 +2125,11 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                                     request.number.raw(),
                                     crate::linux_abi::LINUX_EOPNOTSUPP.guest_retval(),
                                     resume,
+                                    &mut translator,
                                 )?;
                                 continue;
                             }
+                            translator.finalize_profile_epoch();
                             if let Err(error) = crate::native_exec_capsule::begin_guest_exec(
                                 &dispatcher,
                                 &image,
@@ -2125,6 +2141,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                                 max_traps,
                                 &plan,
                             ) {
+                                translator.start_next_profile_epoch();
                                 tracing::warn!(
                                     %error,
                                     path = resolved,
@@ -2138,6 +2155,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                                     request.number.raw(),
                                     crate::linux_abi::LINUX_EIO.guest_retval(),
                                     resume,
+                                    &mut translator,
                                 )?;
                                 continue;
                             }
@@ -2156,6 +2174,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                                 request.number.raw(),
                                 crate::linux_abi::LINUX_ENOEXEC.guest_retval(),
                                 resume,
+                                &mut translator,
                             )?;
                             continue;
                         };
@@ -2183,6 +2202,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                                     request.number.raw(),
                                     crate::linux_abi::LINUX_ENOMEM.guest_retval(),
                                     resume,
+                                    &mut translator,
                                 )?;
                                 continue;
                             }
@@ -2256,6 +2276,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                             request.number.raw(),
                             errno.guest_retval(),
                             resume,
+                            &mut translator,
                         )?;
                     }
                 }
@@ -2279,6 +2300,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                     request.number.raw(),
                     va.raw() as i64,
                     resume,
+                    &mut translator,
                 )?;
             }
             DispatchOutcome::SignalThread {
@@ -2294,10 +2316,11 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                     request.number.raw(),
                     value,
                     resume,
+                    &mut translator,
                 )?;
             }
             DispatchOutcome::SignalDeath { signum } => {
-                native_die_by_signal(&dispatcher, signum);
+                native_die_by_signal(&dispatcher, &mut translator, signum);
             }
             other => {
                 return Err(RuntimeError::Unsupported(format!(
@@ -2315,6 +2338,7 @@ fn deliver_dsr_pending_signal(
     tid: crate::thread::ThreadId,
     return_value: Option<i64>,
     interrupted_pc: Option<u64>,
+    translator: &mut dsr::ThreadTranslator,
 ) -> Result<NativeUcontextSnapshot, RuntimeError> {
     let mut memory = memory.lock();
     let mut trap = NativeSignalTrap::new(&mut memory, snapshot, None);
@@ -2330,12 +2354,13 @@ fn deliver_dsr_pending_signal(
             crate::exec_helpers::stop_by_signal(signum);
         }
         if let Some(signum) = action.term_signal {
-            native_die_by_signal(dispatcher, signum);
+            native_die_by_signal(dispatcher, translator, signum);
         }
     }
     Ok(trap.into_snapshot())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn complete_dsr_syscall(
     dispatcher: &SyscallDispatcher,
     memory: &SharedNativeMemory,
@@ -2344,6 +2369,7 @@ fn complete_dsr_syscall(
     syscall_nr: u64,
     return_value: i64,
     resume: carrick_guest_mem::GuestVa,
+    translator: &mut dsr::ThreadTranslator,
 ) -> Result<NativeUcontextSnapshot, RuntimeError> {
     let mut memory = memory.lock();
     let mut trap = NativeSignalTrap::new(&mut memory, snapshot, Some(syscall_nr));
@@ -2361,7 +2387,7 @@ fn complete_dsr_syscall(
             crate::exec_helpers::stop_by_signal(signum);
         }
         if let Some(signum) = action.term_signal {
-            native_die_by_signal(dispatcher, signum);
+            native_die_by_signal(dispatcher, translator, signum);
         }
     }
     Ok(trap.into_snapshot())
@@ -2372,6 +2398,7 @@ fn complete_dsr_sigreturn(
     memory: &SharedNativeMemory,
     snapshot: NativeUcontextSnapshot,
     tid: crate::thread::ThreadId,
+    translator: &mut dsr::ThreadTranslator,
 ) -> Result<NativeUcontextSnapshot, RuntimeError> {
     let mut memory = memory.lock();
     let mut trap = NativeSignalTrap::new(&mut memory, snapshot, None);
@@ -2381,12 +2408,13 @@ fn complete_dsr_sigreturn(
             crate::exec_helpers::stop_by_signal(signum);
         }
         if let Some(signum) = action.term_signal {
-            native_die_by_signal(dispatcher, signum);
+            native_die_by_signal(dispatcher, translator, signum);
         }
     }
     Ok(trap.into_snapshot())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn lower_dsr_fault(
     dispatcher: &SyscallDispatcher,
     memory: &SharedNativeMemory,
@@ -2395,6 +2423,7 @@ fn lower_dsr_fault(
     live_threads: usize,
     fault: dsr::ThreadFault,
     fault_address: dsr::ThreadFaultAddress,
+    translator: &mut dsr::ThreadTranslator,
 ) -> Result<NativeUcontextSnapshot, RuntimeError> {
     let host_fault = matches!(fault_address, dsr::ThreadFaultAddress::Host(_));
     let biased_host_fault = host_fault
@@ -2471,7 +2500,7 @@ fn lower_dsr_fault(
             let Some(lowered) =
                 crate::vcpu_loop::lower_el0_fault(snapshot.esr, snapshot.pc, fault_address)
             else {
-                native_die_by_signal(dispatcher, crate::linux_abi::LINUX_SIGSEGV);
+                native_die_by_signal(dispatcher, translator, crate::linux_abi::LINUX_SIGSEGV);
             };
             lowered
         }
@@ -2515,7 +2544,7 @@ fn lower_dsr_fault(
     match disposition {
         crate::vcpu_loop::FaultSignalDisposition::Injected => Ok(trap.into_snapshot()),
         crate::vcpu_loop::FaultSignalDisposition::Terminate(signum) => {
-            native_die_by_signal(dispatcher, signum)
+            native_die_by_signal(dispatcher, translator, signum)
         }
     }
 }
@@ -2540,7 +2569,12 @@ fn lower_dsr_fault_address(
     }
 }
 
-fn native_die_by_signal(dispatcher: &SyscallDispatcher, signum: i32) -> ! {
+fn native_die_by_signal(
+    dispatcher: &SyscallDispatcher,
+    translator: &mut dsr::ThreadTranslator,
+    signum: i32,
+) -> ! {
+    translator.finalize_profile_epoch();
     dispatcher.cleanup_sysv_ipc_on_process_exit();
     crate::exec_helpers::forked_child_die_by_signal(
         signum,
