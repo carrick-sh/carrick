@@ -1884,18 +1884,14 @@ class ReviewFixContractTests(unittest.TestCase):
             decision.basis, "low-tax-measured-cpu-attribution-over-untraced-cpu"
         )
 
-    def test_duration_two_term_rung_considers_all_four_terms_but_cannot_be_satisfied(self):
-        # Structural coverage for the four-term duration set now feeding the
-        # existing two-term fallback (previously a single-element list with
-        # zero candidate pairs, since it only ever held syscall-dispatch).
-        # With every individual term held below the 30% single-select
-        # threshold, no pair of two such terms can reach the pair's 60%
-        # threshold (a<0.3 and b<0.3 implies a+b<0.6) — the same structural
-        # non-reachability the pre-existing two-term COUNT rung has always
-        # had. This proves the four terms are wired into the shared
-        # two_term_best fallback (0.20+0.20=0.40 is the closest pair here,
-        # not 0.0+0.0) and that the analyzer still fails closed rather than
-        # inventing a selection.
+    def test_duration_terms_below_thresholds_fail_closed(self):
+        # When all duration terms (blocked-cpu, startup-cpu, helper-cpu,
+        # syscall-dispatch) are held below the 30% single-select threshold,
+        # no pair of two such terms can reach the pair's 60% threshold
+        # (a<0.3 and b<0.3 implies a+b<0.6). The analyzer must fail closed
+        # rather than inventing a selection. The wiring of the four terms
+        # into the two-term fallback is verified by the individual rung tests
+        # (blocked-cpu, startup-cpu, helper-cpu selectable at >=30%).
         profile = profile_with_budget(
             gateway_entries=100,
             sensitive_exclusive=5,
