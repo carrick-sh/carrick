@@ -1771,6 +1771,216 @@ pub(super) fn emit_block_with_generation_direct(
     emit_block_with_generation(cache, plan, guard, EmitAddressMode::Direct)
 }
 
+/// CLREX #0xF -- clear the calling PE's local exclusive monitor.
+const CLREX_WORD: u32 = 0xd503_3f5f;
+
+/// Emit one exit edge out of a fused exclusive region. Mirrors the generic
+/// `PlannedExit::Continue` epilogue (save guest x17, then a lazy direct-link to
+/// `target` backed by a direct gateway exit), optionally prefixed with `CLREX`
+/// when the edge leaves the region without completing the store (Hazard B). The
+/// emitted words map to `guest` so a kick/fault re-enters at a guest PC whose
+/// re-execution is idempotent (the store has run, or the branch is re-evaluated
+/// against unchanged flags).
+fn emit_region_direct_exit(
+    assembler: &mut VecAssembler<Aarch64Relocation>,
+    entries: &mut Vec<PcMapEntry>,
+    direct_links: &mut Vec<DirectLink>,
+    guest: GuestVa,
+    target: GuestVa,
+    clear_monitor: bool,
+) -> Result<(), DsrError> {
+    if clear_monitor {
+        emit_word(assembler, entries, guest, CLREX_WORD)?;
+    }
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; str x17, [x28, #136]
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; str x17, [x28, #1128]
+    );
+    let slot = current_offset(assembler)?;
+    direct_links.push(DirectLink { slot, target });
+    emit_word(assembler, entries, guest, 0x1400_0001)?;
+    emit_gateway_exit(
+        assembler,
+        entries,
+        guest,
+        target,
+        Some(guest),
+        2,
+        super::gateway::direct_exit_address(),
+    )
+}
+
+/// Lower a fused exclusive region to native code. The block prologue has already
+/// been emitted; this emits, in one straight-line block:
+///   1. the region body (`BlockPlan::instructions` = load, straight-line
+///      compare/ALU ops, an optional early-exit branch, store) VERBATIM -- the
+///      exclusive load and store are byte-identical guest words with no context
+///      store between them (Hazard A: a store between the pair clears the
+///      monitor and livelocks the guest);
+///   2. the retry branch, re-encoded so store-failure loops back to the load and
+///      store-success leaves to `end` (both edges are post-store, so the monitor
+///      is already cleared -- no CLREX);
+///   3. one exit stub per leaving edge. The store-success edge takes a plain
+///      direct exit; the compare-failure early-exit edge (if any) prefixes it
+///      with CLREX because the store never ran and the load's reservation is
+///      still live (Hazard B).
+///
+/// Fusion is Direct (native16k) only; the planner never fuses in biased mode
+/// (its verbatim emission would need an x18/x28 scratch spill inside the
+/// reservation window), so the biased arm here is defense-in-depth for the
+/// `:1442` tripwire's invariant.
+fn emit_exclusive_region(
+    assembler: &mut VecAssembler<Aarch64Relocation>,
+    entries: &mut Vec<PcMapEntry>,
+    direct_links: &mut Vec<DirectLink>,
+    plan: &BlockPlan,
+    exit: super::types::ExclusiveRegionExit,
+    mode: EmitAddressMode,
+) -> Result<(), DsrError> {
+    if let EmitAddressMode::Biased { .. } = mode {
+        return Err(unsupported_action(
+            plan,
+            exit.start,
+            exit.load_word,
+            "exclusive region fusion is unsupported in biased mode",
+        ));
+    }
+
+    let region_top = assembler.new_dynamic_label();
+    let success_exit = assembler.new_dynamic_label();
+
+    // The exclusive load is the region entry (and the retry target). Placing the
+    // label here -- after the prologue, at the load -- means the retry edge
+    // re-enters the load WITHOUT re-running the prologue's context stores, so no
+    // memory access sits between the load and the store on any iteration.
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; =>region_top
+    );
+
+    // The single optional early-exit branch: (stub label, guest PC, target).
+    let mut early_exit: Option<(dynasmrt::DynamicLabel, GuestVa, GuestVa)> = None;
+
+    for instruction in &plan.instructions {
+        match instruction.action {
+            // The exclusive load and store, and any straight-line body op, are
+            // emitted byte-identically. The planner has proved the base is a
+            // plain GPR (not x18/x28) and that no operand touches x18/x28, so no
+            // virtualization/spill is needed -- the ONLY sound lowering, since a
+            // spill would be a memory access in the reservation window.
+            InstAction::Memory(memory) => {
+                emit_word(assembler, entries, instruction.guest, memory.word)?;
+            }
+            InstAction::Copy(word) => {
+                emit_word(assembler, entries, instruction.guest, word)?;
+            }
+            // The compare-failure edge of a CAS. Re-encode it (taken -> +8) into
+            // a two-branch trampoline: not-taken continues the region body,
+            // taken jumps to the CLREX-then-exit stub emitted after the retry.
+            InstAction::Direct(direct) => {
+                let word = exit.early_exit_word.ok_or_else(|| {
+                    DsrError::BlockPolicy(format!(
+                        "fused exclusive region has a body branch but no early-exit encoding at guest PC 0x{:x}",
+                        instruction.guest.raw()
+                    ))
+                })?;
+                let stub = assembler.new_dynamic_label();
+                let cont = assembler.new_dynamic_label();
+                let relocated = relocated_direct_word(word, direct, None)?;
+                emit_word(assembler, entries, instruction.guest, relocated)?;
+                map_next(assembler, entries, instruction.guest)?;
+                dynasmrt::dynasm!(assembler
+                    ; .arch aarch64
+                    ; b =>cont
+                );
+                map_next(assembler, entries, instruction.guest)?;
+                dynasmrt::dynasm!(assembler
+                    ; .arch aarch64
+                    ; b =>stub
+                );
+                dynasmrt::dynasm!(assembler
+                    ; .arch aarch64
+                    ; =>cont
+                );
+                early_exit = Some((stub, instruction.guest, direct.target));
+            }
+            _ => {
+                return Err(DsrError::BlockPolicy(format!(
+                    "unexpected action in fused exclusive region at guest PC 0x{:x}",
+                    instruction.guest.raw()
+                )));
+            }
+        }
+    }
+
+    // The store is the last emitted instruction; the retry branch sits one
+    // instruction past it (at `end - 4`).
+    let store_guest = plan
+        .instructions
+        .last()
+        .map(|instruction| instruction.guest)
+        .ok_or_else(|| {
+            DsrError::BlockPolicy("fused exclusive region has no instructions".to_string())
+        })?;
+    let retry_pc = GuestVa(
+        store_guest
+            .raw()
+            .checked_add(4)
+            .ok_or(DsrError::PcOverflow {
+                pc: store_guest.raw(),
+            })?,
+    );
+
+    // Re-encode the retry branch (taken -> +8): store-failure loops to the load,
+    // store-success leaves to `end`. Both edges execute AFTER the store, whose
+    // completion (success or failure) already cleared the monitor -- no CLREX.
+    let InstAction::Direct(retry_direct) = super::decode::classify(exit.retry_word, retry_pc)?
+    else {
+        return Err(DsrError::BlockPolicy(format!(
+            "fused exclusive region retry branch is not a direct branch at guest PC 0x{:x}",
+            retry_pc.raw()
+        )));
+    };
+    let relocated_retry = relocated_direct_word(exit.retry_word, retry_direct, None)?;
+    emit_word(assembler, entries, retry_pc, relocated_retry)?;
+    map_next(assembler, entries, retry_pc)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; b =>success_exit
+    );
+    map_next(assembler, entries, retry_pc)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; b =>region_top
+    );
+
+    // Store-success exit: the STXR completed and cleared the monitor, so no
+    // CLREX. Mapped to the retry branch's PC so a kick re-evaluates it.
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; =>success_exit
+    );
+    emit_region_direct_exit(assembler, entries, direct_links, retry_pc, exit.end, false)?;
+
+    // Compare-failure exit (if the region had an early-exit branch): the store
+    // never ran, so the load's reservation is still live and MUST be cleared.
+    if let Some((stub, branch_guest, target)) = early_exit {
+        dynasmrt::dynasm!(assembler
+            ; .arch aarch64
+            ; =>stub
+        );
+        emit_region_direct_exit(assembler, entries, direct_links, branch_guest, target, true)?;
+    }
+
+    Ok(())
+}
+
 fn emit_block_inner(
     cache: &mut TranslationCache,
     plan: &BlockPlan,
@@ -1909,8 +2119,25 @@ fn emit_block_inner(
             });
         }
     }
-    for instruction in &plan.instructions {
-        let word = match instruction.action {
+    if let PlannedExit::ExclusiveRegion { exit, .. } = plan.exit {
+        // A fused exclusive region (LDXR/LDAXR .. STXR/STLXR CAS/RMW retry loop)
+        // is lowered to native code that executes in-guest without a gateway
+        // trap. It bypasses the generic body/exit path entirely because the
+        // load and store MUST share one emitted block with no context store
+        // between them (Hazard A) and every non-completing edge MUST clear the
+        // exclusive monitor (Hazard B) -- neither of which the generic path can
+        // express.
+        emit_exclusive_region(
+            &mut assembler,
+            &mut entries,
+            &mut direct_links,
+            plan,
+            exit,
+            mode,
+        )?;
+    } else {
+        for instruction in &plan.instructions {
+            let word = match instruction.action {
             InstAction::Copy(word) => word,
             // Direct register-based emission remains byte-identical; biased
             // mode materializes host addresses before the audited operation.
@@ -2148,156 +2375,157 @@ fn emit_block_inner(
                 )));
             }
         };
-        map_next(&assembler, &mut entries, instruction.guest)?;
-        assembler.push_u32(word);
-    }
-
-    let exit_guest = plan.exit.guest_pc();
-    map_next(&assembler, &mut entries, exit_guest)?;
-    dynasmrt::dynasm!(assembler
-        ; .arch aarch64
-        ; str x17, [x28, #136]
-    );
-    map_next(&assembler, &mut entries, exit_guest)?;
-    dynasmrt::dynasm!(assembler
-        ; .arch aarch64
-        ; str x17, [x28, #1128]
-    );
-    if let PlannedExit::Syscall { resume, .. } = plan.exit {
-        emit_gateway_exit(
-            &mut assembler,
-            &mut entries,
-            exit_guest,
-            resume,
-            None,
-            1,
-            super::gateway::syscall_exit_address(),
-        )?;
-    } else if let PlannedExit::Direct { word, exit, .. } = plan.exit {
-        if exit.kind == super::types::DirectKind::Call {
-            emit_mov_u64(
-                &mut assembler,
-                &mut entries,
-                exit_guest,
-                30,
-                exit.resume.raw(),
-            )?;
+            map_next(&assembler, &mut entries, instruction.guest)?;
+            assembler.push_u32(word);
         }
-        if matches!(
-            exit.kind,
-            super::types::DirectKind::Branch | super::types::DirectKind::Call
-        ) {
-            let slot = current_offset(&assembler)?;
-            direct_links.push(DirectLink {
-                slot,
-                target: exit.target,
-            });
-            emit_word(&mut assembler, &mut entries, exit_guest, 0x1400_0001)?;
+
+        let exit_guest = plan.exit.guest_pc();
+        map_next(&assembler, &mut entries, exit_guest)?;
+        dynasmrt::dynasm!(assembler
+            ; .arch aarch64
+            ; str x17, [x28, #136]
+        );
+        map_next(&assembler, &mut entries, exit_guest)?;
+        dynasmrt::dynasm!(assembler
+            ; .arch aarch64
+            ; str x17, [x28, #1128]
+        );
+        if let PlannedExit::Syscall { resume, .. } = plan.exit {
             emit_gateway_exit(
                 &mut assembler,
                 &mut entries,
                 exit_guest,
-                exit.target,
-                Some(exit_guest),
-                2,
-                super::gateway::direct_exit_address(),
+                resume,
+                None,
+                1,
+                super::gateway::syscall_exit_address(),
             )?;
-        } else {
-            let virtual_offset = exit
-                .register
-                .and_then(gpr_index)
-                .and_then(virtual_snapshot_offset);
-            if let Some(offset) = virtual_offset {
+        } else if let PlannedExit::Direct { word, exit, .. } = plan.exit {
+            if exit.kind == super::types::DirectKind::Call {
+                emit_mov_u64(
+                    &mut assembler,
+                    &mut entries,
+                    exit_guest,
+                    30,
+                    exit.resume.raw(),
+                )?;
+            }
+            if matches!(
+                exit.kind,
+                super::types::DirectKind::Branch | super::types::DirectKind::Call
+            ) {
+                let slot = current_offset(&assembler)?;
+                direct_links.push(DirectLink {
+                    slot,
+                    target: exit.target,
+                });
+                emit_word(&mut assembler, &mut entries, exit_guest, 0x1400_0001)?;
+                emit_gateway_exit(
+                    &mut assembler,
+                    &mut entries,
+                    exit_guest,
+                    exit.target,
+                    Some(exit_guest),
+                    2,
+                    super::gateway::direct_exit_address(),
+                )?;
+            } else {
+                let virtual_offset = exit
+                    .register
+                    .and_then(gpr_index)
+                    .and_then(virtual_snapshot_offset);
+                if let Some(offset) = virtual_offset {
+                    emit_word(
+                        &mut assembler,
+                        &mut entries,
+                        exit_guest,
+                        0xf940_0000 | ((offset / 8) << 10) | (28 << 5) | 18,
+                    )?;
+                }
                 emit_word(
                     &mut assembler,
                     &mut entries,
                     exit_guest,
-                    0xf940_0000 | ((offset / 8) << 10) | (28 << 5) | 18,
+                    relocated_direct_word(word, exit, virtual_offset.map(|_| 18))?,
+                )?;
+                let fall_slot = current_offset(&assembler)?;
+                direct_links.push(DirectLink {
+                    slot: fall_slot,
+                    target: exit.resume,
+                });
+                emit_word(&mut assembler, &mut entries, exit_guest, 0x1400_0002)?;
+                let taken_slot = current_offset(&assembler)?;
+                direct_links.push(DirectLink {
+                    slot: taken_slot,
+                    target: exit.target,
+                });
+                emit_word(&mut assembler, &mut entries, exit_guest, 0x1400_0012)?;
+                emit_gateway_exit(
+                    &mut assembler,
+                    &mut entries,
+                    exit_guest,
+                    exit.resume,
+                    Some(exit_guest),
+                    2,
+                    super::gateway::direct_exit_address(),
+                )?;
+                emit_gateway_exit(
+                    &mut assembler,
+                    &mut entries,
+                    exit_guest,
+                    exit.target,
+                    Some(exit_guest),
+                    2,
+                    super::gateway::direct_exit_address(),
                 )?;
             }
-            emit_word(
+        } else if let PlannedExit::Indirect { exit, .. } = plan.exit {
+            emit_indirect_exit(
                 &mut assembler,
                 &mut entries,
+                plan,
                 exit_guest,
-                relocated_direct_word(word, exit, virtual_offset.map(|_| 18))?,
+                exit,
+                &mut recovery,
             )?;
-            let fall_slot = current_offset(&assembler)?;
-            direct_links.push(DirectLink {
-                slot: fall_slot,
-                target: exit.resume,
-            });
-            emit_word(&mut assembler, &mut entries, exit_guest, 0x1400_0002)?;
-            let taken_slot = current_offset(&assembler)?;
-            direct_links.push(DirectLink {
-                slot: taken_slot,
-                target: exit.target,
-            });
-            emit_word(&mut assembler, &mut entries, exit_guest, 0x1400_0012)?;
+        } else if let PlannedExit::Sensitive { exit, .. } = plan.exit {
             emit_gateway_exit(
                 &mut assembler,
                 &mut entries,
                 exit_guest,
                 exit.resume,
                 Some(exit_guest),
-                2,
-                super::gateway::direct_exit_address(),
+                6,
+                super::gateway::sensitive_exit_address(),
             )?;
+        } else if let PlannedExit::Continue { target, .. } = plan.exit {
+            let slot = current_offset(&assembler)?;
+            direct_links.push(DirectLink { slot, target });
+            emit_word(&mut assembler, &mut entries, exit_guest, 0x1400_0001)?;
             emit_gateway_exit(
                 &mut assembler,
                 &mut entries,
                 exit_guest,
-                exit.target,
+                target,
                 Some(exit_guest),
                 2,
                 super::gateway::direct_exit_address(),
             )?;
+        } else if let PlannedExit::Unsupported { .. } = plan.exit {
+            emit_gateway_exit(
+                &mut assembler,
+                &mut entries,
+                exit_guest,
+                exit_guest,
+                Some(exit_guest),
+                7,
+                super::gateway::unsupported_exit_address(),
+            )?;
+        } else {
+            return Err(DsrError::BlockPolicy(
+                "virtualized register action escaped the DSR copy stream".to_string(),
+            ));
         }
-    } else if let PlannedExit::Indirect { exit, .. } = plan.exit {
-        emit_indirect_exit(
-            &mut assembler,
-            &mut entries,
-            plan,
-            exit_guest,
-            exit,
-            &mut recovery,
-        )?;
-    } else if let PlannedExit::Sensitive { exit, .. } = plan.exit {
-        emit_gateway_exit(
-            &mut assembler,
-            &mut entries,
-            exit_guest,
-            exit.resume,
-            Some(exit_guest),
-            6,
-            super::gateway::sensitive_exit_address(),
-        )?;
-    } else if let PlannedExit::Continue { target, .. } = plan.exit {
-        let slot = current_offset(&assembler)?;
-        direct_links.push(DirectLink { slot, target });
-        emit_word(&mut assembler, &mut entries, exit_guest, 0x1400_0001)?;
-        emit_gateway_exit(
-            &mut assembler,
-            &mut entries,
-            exit_guest,
-            target,
-            Some(exit_guest),
-            2,
-            super::gateway::direct_exit_address(),
-        )?;
-    } else if let PlannedExit::Unsupported { .. } = plan.exit {
-        emit_gateway_exit(
-            &mut assembler,
-            &mut entries,
-            exit_guest,
-            exit_guest,
-            Some(exit_guest),
-            7,
-            super::gateway::unsupported_exit_address(),
-        )?;
-    } else {
-        return Err(DsrError::BlockPolicy(
-            "virtualized register action escaped the DSR copy stream".to_string(),
-        ));
     }
     if let Some(stale) = stale {
         dynasmrt::dynasm!(assembler
@@ -3312,5 +3540,293 @@ mod tests {
             emitted.map().guest_for_cache(CacheOffset::published(12)),
             Some(GuestVa(0x4004))
         );
+    }
+
+    mod exclusive_region_emission {
+        use super::super::super::types::ExclusiveRegionExit;
+        use super::*;
+
+        // ldaxr w0, [x1] / cmp w0, w2 / stlxr w3, w4, [x1] -- verified encodings
+        // shared with the block planner's fusion tests.
+        const LDAXR_W0_X1: u32 = 0x885f_fc20;
+        const CMP_W0_W2: u32 = 0x6b02_001f;
+        const STLXR_W3_W4_X1: u32 = 0x8803_fc24;
+        const CLREX: u32 = 0xd503_3f5f;
+
+        fn encode_b_cond(pc: GuestVa, target: GuestVa, cond: u32) -> u32 {
+            let offset = (target.raw() as i64 - pc.raw() as i64) / 4;
+            let imm19 = (offset as u32) & 0x7_ffff;
+            0x5400_0000 | (imm19 << 5) | cond
+        }
+
+        fn encode_cbnz_w(pc: GuestVa, target: GuestVa, rt: u32) -> u32 {
+            let offset = (target.raw() as i64 - pc.raw() as i64) / 4;
+            let imm19 = (offset as u32) & 0x7_ffff;
+            0x3500_0000 | (imm19 << 5) | rt
+        }
+
+        /// Build the `ExclusiveRegion` `BlockPlan` the planner would produce for
+        /// the straight-line region `words` (load .. store) with the given retry
+        /// and optional early-exit encodings.
+        fn region_plan(
+            start: GuestVa,
+            words: &[u32],
+            retry_word: u32,
+            early_exit_word: Option<u32>,
+        ) -> BlockPlan {
+            let mut instructions = Vec::new();
+            for (index, &word) in words.iter().enumerate() {
+                let guest = GuestVa(start.raw() + (index as u64) * 4);
+                let action = if let Some((_, memory)) =
+                    super::super::super::decode::classify_exclusive(word, guest)
+                        .expect("classify region exclusive")
+                {
+                    InstAction::Memory(memory)
+                } else {
+                    super::super::super::decode::classify(word, guest)
+                        .expect("classify region body")
+                };
+                instructions.push(PlannedInst { guest, action });
+            }
+            let store_guest = GuestVa(start.raw() + ((words.len() - 1) as u64) * 4);
+            let retry_pc = GuestVa(store_guest.raw() + 4);
+            let end = GuestVa(retry_pc.raw() + 4);
+            BlockPlan {
+                start,
+                end,
+                generation: CodeGeneration::INITIAL,
+                instructions,
+                exit: PlannedExit::ExclusiveRegion {
+                    guest: start,
+                    word: words[0],
+                    exit: ExclusiveRegionExit {
+                        start,
+                        end,
+                        retry_edge: start,
+                        load_word: words[0],
+                        store_word: *words.last().unwrap(),
+                        retry_word,
+                        early_exit_word,
+                    },
+                },
+            }
+        }
+
+        fn emitted_words(emitted: &EmittedBlock) -> Vec<u32> {
+            (0..emitted.len() / 4)
+                .map(|index| unsafe {
+                    std::ptr::read_unaligned(
+                        (emitted.entry().host().raw() + index * 4) as *const u32,
+                    )
+                })
+                .collect()
+        }
+
+        fn word_touches_memory(word: u32, pc: u64) -> bool {
+            bad64::decode(word, pc).is_ok_and(|inst| {
+                inst.operands().iter().any(|operand| {
+                    matches!(
+                        operand,
+                        bad64::Operand::MemReg(_)
+                            | bad64::Operand::MemOffset { .. }
+                            | bad64::Operand::MemPreIdx { .. }
+                            | bad64::Operand::MemPostIdxImm { .. }
+                            | bad64::Operand::MemPostIdxReg(_)
+                            | bad64::Operand::MemExt { .. }
+                    )
+                })
+            })
+        }
+
+        /// (a) A minimal fused region (`ldxr; stxr; cbnz`) emits the exclusive
+        /// load and store verbatim and ADJACENT -- proving no block prologue or
+        /// context store lands between them (Hazard A).
+        #[test]
+        fn emits_load_and_store_verbatim_and_adjacent() {
+            let start = GuestVa(0x4000);
+            let store_pc = GuestVa(0x4004);
+            let retry_pc = GuestVa(0x4008);
+            let retry = encode_cbnz_w(retry_pc, start, 3);
+            let plan = region_plan(start, &[LDAXR_W0_X1, STLXR_W3_W4_X1], retry, None);
+
+            let mut cache = TranslationCache::new(16 * 1024).expect("allocate cache");
+            let emitted =
+                emit_block_direct(&mut cache, &plan).expect("emit fused minimal exclusive region");
+            let words = emitted_words(&emitted);
+
+            let load_index = words
+                .iter()
+                .position(|&word| word == LDAXR_W0_X1)
+                .expect("emitted stream must contain the exclusive load verbatim");
+            assert_eq!(
+                words[load_index + 1],
+                STLXR_W3_W4_X1,
+                "the exclusive store must immediately follow the load (no instruction between)"
+            );
+            let _ = store_pc;
+            assert!(
+                !words.contains(&CLREX),
+                "a region with no early-exit edge has no non-completing exit, so no CLREX"
+            );
+        }
+
+        /// (b) The canonical CAS region emits exactly one CLREX -- on the
+        /// compare-failure early-exit edge (Hazard B) -- and NOTHING that
+        /// touches memory sits between the exclusive load and store.
+        #[test]
+        fn emits_clrex_on_the_compare_failure_edge_only() {
+            let start = GuestVa(0x4000);
+            let branch_pc = GuestVa(0x4008);
+            let store_pc = GuestVa(0x400c);
+            let retry_pc = GuestVa(0x4010);
+            let out_pc = GuestVa(0x4014);
+            let branch = encode_b_cond(branch_pc, out_pc, 1);
+            let retry = encode_cbnz_w(retry_pc, start, 3);
+            let plan = region_plan(
+                start,
+                &[LDAXR_W0_X1, CMP_W0_W2, branch, STLXR_W3_W4_X1],
+                retry,
+                Some(branch),
+            );
+
+            let mut cache = TranslationCache::new(16 * 1024).expect("allocate cache");
+            let emitted =
+                emit_block_direct(&mut cache, &plan).expect("emit fused canonical CAS region");
+            let words = emitted_words(&emitted);
+
+            assert_eq!(
+                words.iter().filter(|&&word| word == CLREX).count(),
+                1,
+                "exactly one CLREX, on the single non-completing (compare-failure) edge"
+            );
+
+            let load_index = words
+                .iter()
+                .position(|&word| word == LDAXR_W0_X1)
+                .expect("emitted stream must contain the exclusive load verbatim");
+            let store_index = words
+                .iter()
+                .position(|&word| word == STLXR_W3_W4_X1)
+                .expect("emitted stream must contain the exclusive store verbatim");
+            assert!(store_index > load_index);
+            for (offset, &word) in words[load_index + 1..store_index].iter().enumerate() {
+                let pc =
+                    emitted.entry().host().raw() as u64 + ((load_index + 1 + offset) * 4) as u64;
+                assert!(
+                    !word_touches_memory(word, pc),
+                    "no memory access may sit between LDXR and STXR (Hazard A): 0x{word:08x}"
+                );
+            }
+            let _ = store_pc;
+
+            // Both exit edges leave to guest VAs via the direct-link resolver.
+            let targets: std::collections::BTreeSet<_> = emitted
+                .direct_links()
+                .iter()
+                .map(|link| link.target)
+                .collect();
+            assert!(
+                targets.contains(&out_pc),
+                "an exit edge resolves to `end`/`out`"
+            );
+        }
+
+        /// Every emitted word must be a valid AArch64 instruction, and the two
+        /// re-encoded region branches (the compare-failure and retry edges) must
+        /// stay the same op family and branch to their block-local trampoline
+        /// (taken -> PC+8), never to the original guest displacement.
+        #[test]
+        fn re_encoded_region_branches_decode_and_target_their_trampolines() {
+            let start = GuestVa(0x4000);
+            let branch = encode_b_cond(GuestVa(0x4008), GuestVa(0x4014), 1);
+            let retry = encode_cbnz_w(GuestVa(0x4010), start, 3);
+            let plan = region_plan(
+                start,
+                &[LDAXR_W0_X1, CMP_W0_W2, branch, STLXR_W3_W4_X1],
+                retry,
+                Some(branch),
+            );
+
+            let mut cache = TranslationCache::new(16 * 1024).expect("allocate cache");
+            let emitted = emit_block_direct(&mut cache, &plan).expect("emit fused CAS region");
+            let base = emitted.entry().host().raw() as u64;
+            let words = emitted_words(&emitted);
+
+            for (index, &word) in words.iter().enumerate() {
+                let pc = base + (index * 4) as u64;
+                assert!(
+                    bad64::decode(word, pc).is_ok(),
+                    "emitted word 0x{word:08x} at +{} must decode",
+                    index * 4
+                );
+            }
+
+            // Re-encoded branch decodes to the same op and, when taken, jumps to
+            // its own PC+8 trampoline (not the original guest displacement).
+            let relocated_target = |word: u32, pc: u64| -> Option<GuestVa> {
+                match super::super::super::decode::classify(word, GuestVa(pc)) {
+                    Ok(InstAction::Direct(direct)) => Some(direct.target),
+                    _ => None,
+                }
+            };
+            let assert_branch_targets_trampoline = |op: bad64::Op| {
+                let (pc, word) = words
+                    .iter()
+                    .enumerate()
+                    .find_map(|(index, &word)| {
+                        let pc = base + (index * 4) as u64;
+                        bad64::decode(word, pc)
+                            .ok()
+                            .filter(|inst| inst.op() == op)
+                            .map(|_| (pc, word))
+                    })
+                    .unwrap_or_else(|| panic!("re-encoded {op:?} branch must be present"));
+                assert_eq!(
+                    relocated_target(word, pc),
+                    Some(GuestVa(pc + 8)),
+                    "re-encoded {op:?} branch must target its +8 trampoline"
+                );
+            };
+            // The compare-failure edge (b.ne) and the retry edge (cbnz).
+            assert_branch_targets_trampoline(bad64::Op::B_NE);
+            assert_branch_targets_trampoline(bad64::Op::CBNZ);
+        }
+
+        /// (d) The biased path never fuses; if an exclusive `Memory` action ever
+        /// reaches biased emission the `:1442` tripwire must still fire.
+        #[test]
+        fn biased_exclusive_memory_tripwire_still_fires() {
+            let word = LDAXR_W0_X1;
+            let (_, memory) =
+                super::super::super::decode::classify_exclusive(word, GuestVa(0x4000))
+                    .expect("classify exclusive")
+                    .expect("exclusive load");
+            let mut plan = copy_plan();
+            plan.instructions = vec![PlannedInst {
+                guest: GuestVa(0x4000),
+                action: InstAction::Memory(memory),
+            }];
+            plan.end = GuestVa(0x4008);
+            plan.exit = PlannedExit::Syscall {
+                guest: GuestVa(0x4004),
+                resume: GuestVa(0x4008),
+            };
+            let bias =
+                crate::native_darwin::address::NativeHostBias::new(0x80_0000_0000, 16 * 1024)
+                    .expect("construct test host bias");
+            let mut cache = TranslationCache::new(16 * 1024).expect("allocate cache");
+            let result = emit_block(
+                &mut cache,
+                &plan,
+                EmitAddressMode::Biased { host_bias: bias },
+            );
+            match result {
+                Err(DsrError::UnsupportedBlockAction { .. }) => {}
+                Err(other) => {
+                    panic!("biased exclusive emission failed with the wrong error: {other:?}")
+                }
+                Ok(_) => panic!("biased exclusive emission must trip the :1442 tripwire"),
+            }
+        }
     }
 }
