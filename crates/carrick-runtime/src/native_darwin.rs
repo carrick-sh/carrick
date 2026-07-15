@@ -6963,7 +6963,7 @@ mod tests {
             let mut reservation = None;
 
             emulate_dsr_exclusive_access(
-                &mut memory,
+                &memory,
                 &mut snapshot,
                 &mut reservation,
                 0x885f_fc9b, // ldaxr w27, [x4]
@@ -6972,7 +6972,7 @@ mod tests {
             .expect("emulate split exclusive load");
             assert_eq!(snapshot.x[27], 1);
             emulate_dsr_exclusive_access(
-                &mut memory,
+                &memory,
                 &mut snapshot,
                 &mut reservation,
                 0x881b_fc83, // stlxr w27, w3, [x4]
@@ -6983,7 +6983,7 @@ mod tests {
             assert_eq!(memory.atomic_load(address, 4).expect("read stored word"), 2);
 
             emulate_dsr_exclusive_access(
-                &mut memory,
+                &memory,
                 &mut snapshot,
                 &mut reservation,
                 0x885f_fc9b,
@@ -6995,7 +6995,7 @@ mod tests {
                 .expect("interfere with reservation");
             snapshot.x[3] = 4;
             emulate_dsr_exclusive_access(
-                &mut memory,
+                &memory,
                 &mut snapshot,
                 &mut reservation,
                 0x881b_fc83,
@@ -7011,7 +7011,7 @@ mod tests {
             );
 
             emulate_dsr_exclusive_access(
-                &mut memory,
+                &memory,
                 &mut snapshot,
                 &mut reservation,
                 0x885f_fc9b,
@@ -7026,7 +7026,7 @@ mod tests {
                 .expect("restore observed ABA value");
             snapshot.x[3] = 5;
             emulate_dsr_exclusive_access(
-                &mut memory,
+                &memory,
                 &mut snapshot,
                 &mut reservation,
                 0x881b_fc83,
@@ -7360,7 +7360,7 @@ mod tests {
                 let mut reservation = None;
 
                 emulate_dsr_exclusive_access(
-                    &mut memory,
+                    &memory,
                     &mut snapshot,
                     &mut reservation,
                     load,
@@ -7370,7 +7370,7 @@ mod tests {
                 assert_eq!(snapshot.x[0], initial);
                 snapshot.x[0] = initial + 1;
                 emulate_dsr_exclusive_access(
-                    &mut memory,
+                    &memory,
                     &mut snapshot,
                     &mut reservation,
                     store,
