@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, OnceLock};
 
 use carrick_observability::probes;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 
 pub(super) mod block;
 pub(super) mod cache;
@@ -86,7 +86,7 @@ pub(super) struct ThreadTranslator {
 }
 
 pub(super) struct ProcessTranslator {
-    state: Mutex<ProcessState>,
+    state: RwLock<ProcessState>,
 }
 
 struct ProcessState {
@@ -553,7 +553,7 @@ impl ThreadTranslator {
 
     #[cfg(test)]
     pub(super) fn profile_snapshot(&self) -> ProfileSnapshot {
-        let process = self.process.state.lock();
+        let process = self.process.state.read();
         ProfileSnapshot {
             resolver_exits: self.stats.resolver_exits,
             one_entry_hits: self.stats.one_entry_hits,
@@ -590,7 +590,7 @@ impl ThreadTranslator {
         if let Some(error) = self.stats.invalid {
             return Err(error);
         }
-        let mut process = self.process.state.lock();
+        let mut process = self.process.state.write();
         let delta = process.stats.checked_delta(process.reported_stats)?;
         process.reported_stats = process.stats;
         Ok(ProfileSnapshot {
@@ -650,7 +650,7 @@ impl ThreadTranslator {
         if let Some(error) = stats.invalid {
             return Err(error);
         }
-        let process_state = process.state.lock();
+        let process_state = process.state.read();
         Ok(ProfileSnapshot {
             resolver_exits: stats.resolver_exits,
             one_entry_hits: stats.one_entry_hits,
@@ -895,7 +895,7 @@ impl Drop for ThreadTranslator {
 impl ProcessTranslator {
     pub(super) fn new(capacity: usize) -> Result<Self, types::DsrError> {
         let translator = Self {
-            state: Mutex::new(ProcessState {
+            state: RwLock::new(ProcessState {
                 cache: cache::TranslationCache::new(capacity)?,
                 blocks: BTreeMap::new(),
                 pending: BTreeMap::new(),
@@ -917,7 +917,7 @@ impl ProcessTranslator {
     }
 
     fn lifecycle_snapshot(&self) -> (u64, u64, u64) {
-        let state = self.state.lock();
+        let state = self.state.read();
         (
             u64::try_from(state.cache.used_bytes()).unwrap_or(u64::MAX),
             u64::try_from(state.blocks.len()).unwrap_or(u64::MAX),
@@ -926,7 +926,7 @@ impl ProcessTranslator {
     }
 
     fn after_fork_child(&self) {
-        let mut state = self.state.lock();
+        let mut state = self.state.write();
         state.cache.after_fork_child();
         state.publications.after_fork_child();
         state.stats = ResolverStats::default();
@@ -937,7 +937,7 @@ impl ProcessTranslator {
     }
 
     pub(super) fn reset_after_fork_for_exec(&self) {
-        let mut state = self.state.lock();
+        let mut state = self.state.write();
         state.published.clear();
         state.cache.reset_after_fork_for_exec();
         state.blocks.clear();
@@ -952,6 +952,30 @@ impl ProcessTranslator {
 }
 
 impl ProcessState {
+    /// Read-only warm-cache-hit lookup: the fast path for
+    /// `ThreadTranslator::translate` under `ProcessTranslator::state.read()`.
+    /// Never mutates -- callable concurrently from any number of readers.
+    ///
+    /// `blocks` is keyed by `(guest, generation)`, and `generation` here MUST
+    /// be the CALLER'S freshly observed current generation (the same value
+    /// `translate` derives from `memory.dsr_generation_observation(guest)`).
+    /// That is what makes this safe without replicating `translate`'s
+    /// `invalidate_page` step: a stale (pre-mutation) block is stored under
+    /// its OLD generation key, so once the guest page is modified, the
+    /// current generation changes and `blocks.get(&(guest, generation))` for
+    /// the NEW generation can never observe the old entry -- it simply isn't
+    /// there yet. The stale entry is only actually removed from `blocks` by
+    /// `translate`'s `invalidate_page` on the write path, but a caller keyed
+    /// on the current generation never matches it regardless, so skipping
+    /// that cleanup here is safe, not just fast.
+    fn cached_block(
+        &self,
+        guest: carrick_guest_mem::GuestVa,
+        generation: types::CodeGeneration,
+    ) -> Option<types::CacheVa> {
+        self.blocks.get(&(guest, generation)).copied()
+    }
+
     fn translate(
         &mut self,
         tid: i32,
@@ -1279,6 +1303,65 @@ impl ProcessState {
 }
 
 impl ThreadTranslator {
+    /// Two-phase translate: a fully concurrent READ fast path for a warm
+    /// cache hit, falling back to the exclusive WRITE path (the existing,
+    /// unchanged `ProcessState::translate`: invalidate + lookup + translate
+    /// + insert) on a miss.
+    ///
+    /// The generation is derived the SAME way `ProcessState::translate`
+    /// derives it (`memory.dsr_generation_observation(guest).expected()`) --
+    /// this call is `&self` on `NativeMappedMemory` and touches only the
+    /// per-page generation table (a different, cheap lock), never
+    /// `ProcessState`. Recomputing it again inside the write-path `translate`
+    /// on a miss is redundant but harmless (idempotent, no side effects on
+    /// `ProcessState`).
+    ///
+    /// See `ProcessState::cached_block` for why a hit found here can never be
+    /// a stale (pre-mutation) block, and
+    /// `docs/superpowers/specs/2026-07-15-dsr-translation-cache-read-mostly-design.md`
+    /// for the full design.
+    fn translate_read_mostly(
+        &mut self,
+        memory: &super::NativeMappedMemory,
+        guest: carrick_guest_mem::GuestVa,
+    ) -> Result<TranslationResult, types::DsrError> {
+        let generation = memory.dsr_generation_observation(guest)?.expected();
+        {
+            // Scoped so the read guard is dropped before any write-path
+            // fallback tries to acquire the write lock (RwLock is not
+            // reentrant: read-then-write on the same thread would deadlock).
+            let state = self.process.state.read();
+            if let Some(entry) = state.cached_block(guest, generation) {
+                let cache_used_bytes = u64::try_from(state.cache.used_bytes()).unwrap_or(u64::MAX);
+                drop(state);
+                probes::dsr_cache_event(
+                    self.tid,
+                    probes::DsrCacheEventKind::BlockHit,
+                    guest.raw(),
+                    generation.get(),
+                    cache_used_bytes,
+                );
+                return Ok(TranslationResult {
+                    entry,
+                    generation,
+                    outcome: TranslationOutcome::BlockIndexHit,
+                    emitted_bytes: 0,
+                    cache_used_bytes,
+                });
+            }
+        }
+        // Miss under the read guard: fall through to the exclusive write
+        // path. `ProcessState::translate` re-checks `blocks.get` itself as
+        // its very first lookup (after a no-op `invalidate_page` when the
+        // page hasn't changed), so a block another thread inserted in the
+        // read-drop-to-write-acquire gap is found there -- no duplicate
+        // translation -- and a genuine miss is translated exactly as before.
+        self.process
+            .state
+            .write()
+            .translate(self.tid, memory, guest)
+    }
+
     fn translate<const PROFILE: bool>(
         &mut self,
         memory: &super::NativeMappedMemory,
@@ -1289,7 +1372,7 @@ impl ThreadTranslator {
         } else {
             None
         };
-        let translated = self.process.state.lock().translate(self.tid, memory, guest);
+        let translated = self.translate_read_mostly(memory, guest);
         if let Some(timer) = timer {
             let elapsed_ns = match timer.elapsed_ns() {
                 Ok(elapsed_ns) => elapsed_ns,
@@ -1316,7 +1399,7 @@ impl ThreadTranslator {
         &self,
         cache_pc: carrick_guest_mem::GuestVa,
     ) -> Result<(carrick_guest_mem::GuestVa, Option<emit::RecoveryAction>), types::DsrError> {
-        self.process.state.lock().guest_pc_for_cache(cache_pc)
+        self.process.state.read().guest_pc_for_cache(cache_pc)
     }
 
     fn resolve_indirect<const PROFILE: bool>(
@@ -1341,7 +1424,7 @@ impl ThreadTranslator {
 
     #[cfg(test)]
     pub(super) fn resolver_stats(&self) -> ResolverStats {
-        let process = self.process.state.lock().stats;
+        let process = self.process.state.read().stats;
         ResolverStats {
             resolver_exits: self.stats.resolver_exits,
             one_entry_hits: self.stats.one_entry_hits,
@@ -1394,7 +1477,7 @@ impl ThreadTranslator {
         &self,
         guest: carrick_guest_mem::GuestVa,
     ) -> Vec<(types::CacheVa, emit::RecoveryAction)> {
-        let state = self.process.state.lock();
+        let state = self.process.state.read();
         state
             .published
             .iter()
@@ -1444,7 +1527,7 @@ impl ThreadTranslator {
         cache_pc: types::CacheVa,
         word: u32,
     ) -> Result<(), types::DsrError> {
-        let mut state = self.process.state.lock();
+        let mut state = self.process.state.write();
         let is_recovery = state.published.iter().any(|block| {
             let start = block.entry.host().raw();
             block.recovery.iter().any(|recovery| {
@@ -1575,7 +1658,7 @@ impl ThreadTranslator {
                 return Err(error);
             }
         };
-        let cache_range = self.process.state.lock().cache.host_range();
+        let cache_range = self.process.state.read().cache.host_range();
         let prepared = PreparedEntry {
             entry,
             generation,
@@ -1790,7 +1873,7 @@ impl ThreadTranslator {
                 let exit = self
                     .process
                     .state
-                    .lock()
+                    .read()
                     .sensitive
                     .get(&(guest_pc, generation))
                     .copied()
@@ -1806,7 +1889,7 @@ impl ThreadTranslator {
                 let (word, op) = self
                     .process
                     .state
-                    .lock()
+                    .read()
                     .unsupported
                     .get(&(guest_pc, prepared.generation))
                     .copied()
@@ -2380,7 +2463,7 @@ mod tests {
                 let (memory, guest) = mapped_dsr_test_memory(&[0xd400_0001])?;
                 let process =
                     super::ProcessTranslator::new(16 * 1024).map_err(|error| error.to_string())?;
-                let mut state = process.state.lock();
+                let mut state = process.state.write();
                 let first = state
                     .translate(0, &memory, guest)
                     .map_err(|error| error.to_string())?;
@@ -2406,6 +2489,132 @@ mod tests {
                     return Err(format!(
                         "unexpected cache used bytes: result={} snapshot={used_bytes}",
                         first.cache_used_bytes,
+                    ));
+                }
+                Ok(())
+            })();
+            if let Err(error) = &result {
+                super::super::child_write_stderr(format!("{error}\n").as_bytes());
+            }
+            unsafe { libc::_exit(i32::from(result.is_err())) };
+        }
+
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(libc::WIFEXITED(status), "child status was 0x{status:x}");
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+    }
+
+    /// Read-mostly RwLock fast path: a warm cache hit must resolve through a
+    /// SHARED `&ProcessState` (`state.read()`), never `&mut`, so concurrent
+    /// translations can proceed fully in parallel. `cached_block` is the
+    /// read-only accessor the fast path uses.
+    #[test]
+    fn read_fast_path_hits_warm_cache_without_mut_access() {
+        let child = unsafe { libc::fork() };
+        assert!(
+            child >= 0,
+            "fork failed: {}",
+            std::io::Error::last_os_error()
+        );
+        if child == 0 {
+            let result = (|| -> Result<(), String> {
+                let (memory, guest) = mapped_dsr_test_memory(&[0xd400_0001])?;
+                let process =
+                    super::ProcessTranslator::new(16 * 1024).map_err(|error| error.to_string())?;
+                // Populate the block via the write path, exactly as the real
+                // miss path does.
+                let translated = process
+                    .state
+                    .write()
+                    .translate(0, &memory, guest)
+                    .map_err(|error| error.to_string())?;
+
+                let observation = memory
+                    .dsr_generation_observation(guest)
+                    .map_err(|error| error.to_string())?;
+                // Read-only lookup: only `&ProcessState` (`.read()`) is held
+                // here -- this would not compile against a `&mut self`
+                // accessor, and it must be able to run concurrently with any
+                // other reader.
+                let hit = process
+                    .state
+                    .read()
+                    .cached_block(guest, observation.expected());
+                if hit != Some(translated.entry) {
+                    return Err(format!(
+                        "expected read fast path to hit the inserted block {:?}, got {hit:?}",
+                        translated.entry
+                    ));
+                }
+                Ok(())
+            })();
+            if let Err(error) = &result {
+                super::super::child_write_stderr(format!("{error}\n").as_bytes());
+            }
+            unsafe { libc::_exit(i32::from(result.is_err())) };
+        }
+
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(libc::WIFEXITED(status), "child status was 0x{status:x}");
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+    }
+
+    /// The cache key embeds the generation, so a stale (pre-mutation) block
+    /// must never be returned by the read fast path once the guest page has
+    /// been modified: `cached_block` is queried with the CURRENT generation,
+    /// which the old block's key does not match.
+    #[test]
+    fn read_fast_path_never_returns_a_stale_generation_block() {
+        let child = unsafe { libc::fork() };
+        assert!(
+            child >= 0,
+            "fork failed: {}",
+            std::io::Error::last_os_error()
+        );
+        if child == 0 {
+            let result = (|| -> Result<(), String> {
+                let (memory, guest) = mapped_dsr_test_memory(&[0xd400_0001])?;
+                let process =
+                    super::ProcessTranslator::new(16 * 1024).map_err(|error| error.to_string())?;
+                let first = process
+                    .state
+                    .write()
+                    .translate(0, &memory, guest)
+                    .map_err(|error| error.to_string())?;
+
+                // Mutate the guest code: bumps the page's generation, so
+                // `first`'s block is now keyed by a STALE generation.
+                let new_generation = memory
+                    .note_dsr_code_mutation(guest.raw(), 4)
+                    .map_err(|error| error.to_string())?
+                    .ok_or_else(|| "expected a DSR generation".to_string())?;
+                if new_generation == first.generation {
+                    return Err("code mutation did not change the generation".to_string());
+                }
+
+                // The read fast path, queried with the CURRENT generation,
+                // must miss -- the old block's key is (guest, OLD
+                // generation), which can never match. It must fall through
+                // to the write path, which performs the actual invalidation.
+                let hit = process.state.read().cached_block(guest, new_generation);
+                if hit.is_some() {
+                    return Err(format!(
+                        "read fast path returned a stale-generation hit: {hit:?}"
+                    ));
+                }
+
+                // The write path re-translates cleanly at the new generation.
+                let second = process
+                    .state
+                    .write()
+                    .translate(0, &memory, guest)
+                    .map_err(|error| error.to_string())?;
+                if second.generation != new_generation {
+                    return Err(format!(
+                        "expected re-translation at the new generation {new_generation:?}, got {:?}",
+                        second.generation
                     ));
                 }
                 Ok(())
@@ -2670,7 +2879,7 @@ mod tests {
         let process = std::sync::Arc::new(
             super::ProcessTranslator::new(16 * 1024).expect("create translator"),
         );
-        process.state.lock().stats.translations = 9;
+        process.state.write().stats.translations = 9;
         let mut translator = super::ThreadTranslator::for_process(process, 42);
         translator.budget = super::profile::ThreadBudget::enabled_for_test(41, 42);
         translator
@@ -2714,7 +2923,7 @@ mod tests {
         );
         let key = (PC, super::types::CodeGeneration::INITIAL);
         let entry = super::types::CacheVa::published(carrick_guest_mem::HostVa(0x1000));
-        old.state.lock().publications.get_or_publish(key, || entry);
+        old.state.read().publications.get_or_publish(key, || entry);
         let mut thread = super::ThreadTranslator::for_process(std::sync::Arc::clone(&old), 0);
         let next = std::sync::Arc::new(
             super::ProcessTranslator::new(16 * 1024).expect("create next translator"),
@@ -2723,7 +2932,7 @@ mod tests {
         thread.reset_for_exec(next);
 
         assert_eq!(
-            old.state.lock().publications.published_count(),
+            old.state.read().publications.published_count(),
             1,
             "pre-exec threads must retain old PC metadata until their Arc retires"
         );
@@ -2744,11 +2953,11 @@ mod tests {
             super::ProcessTranslator::new(16 * 1024).expect("create old translator"),
         );
         old.state
-            .lock()
+            .write()
             .stats
             .add(super::ResolverStat::Translations, 3);
         old.state
-            .lock()
+            .write()
             .stats
             .add(super::ResolverStat::TranslationNs, 11);
         let mut thread = super::ThreadTranslator::for_process(old, 42);
@@ -2762,7 +2971,7 @@ mod tests {
             super::ProcessTranslator::new(16 * 1024).expect("create next translator"),
         );
         next.state
-            .lock()
+            .write()
             .stats
             .add(super::ResolverStat::Translations, 5);
         let mut pre_exec = Vec::new();
@@ -2817,13 +3026,13 @@ mod tests {
         second.budget = super::profile::ThreadBudget::enabled_for_test(41, 43);
         process
             .state
-            .lock()
+            .write()
             .stats
             .add(super::ResolverStat::Translations, 7);
         let first_frames = first.take_profile_frames().expect("first record");
         process
             .state
-            .lock()
+            .write()
             .stats
             .add(super::ResolverStat::Translations, 5);
         let second_frames = second.take_profile_frames().expect("second record");
@@ -2869,10 +3078,10 @@ mod tests {
         );
         let mut thread = super::ThreadTranslator::for_process(std::sync::Arc::clone(&process), 42);
         thread.budget = super::profile::ThreadBudget::enabled_for_test(41, 42);
-        process.state.lock().stats.translations = u64::MAX;
+        process.state.write().stats.translations = u64::MAX;
         process
             .state
-            .lock()
+            .write()
             .stats
             .add(super::ResolverStat::Translations, 1);
 
@@ -3189,12 +3398,12 @@ mod tests {
             // The whole process epoch's shared, process-wide resolver work.
             process
                 .state
-                .lock()
+                .write()
                 .stats
                 .add(super::ResolverStat::Translations, 11);
             process
                 .state
-                .lock()
+                .write()
                 .stats
                 .add(super::ResolverStat::CacheLookups, 23);
 
@@ -3572,13 +3781,13 @@ mod tests {
         let entry = super::types::CacheVa::published(carrick_guest_mem::HostVa(0x1000));
         process
             .state
-            .lock()
+            .read()
             .publications
             .get_or_publish(key, || entry);
 
         process.reset_after_fork_for_exec();
 
-        let state = process.state.lock();
+        let state = process.state.read();
         assert_eq!(state.publications.published_count(), 0);
         assert!(state.blocks.is_empty());
         assert!(state.published.is_empty());
