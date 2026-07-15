@@ -99,7 +99,7 @@ fn biased_translator_fixture(words: &[u32], guest_code: GuestVa) -> BiasedTransl
         native_write_exec_writable_pages: BTreeSet::new(),
         linux4k_page_protections: BTreeMap::new(),
         exclusive_reservation: None,
-        exclusive_sequences: BTreeMap::new(),
+        exclusive_sequences: parking_lot::Mutex::new(BTreeMap::new()),
         host_page_size: PAGE_SIZE,
         linux_page_size: PAGE_SIZE,
         dsr_generations: super::cache::PageGenerationTable::new(PAGE_SIZE)

@@ -6283,7 +6283,14 @@ struct NativeMappedMemory {
     native_write_exec_writable_pages: BTreeSet<u64>,
     linux4k_page_protections: BTreeMap<u64, [u64; 4]>,
     exclusive_reservation: Option<NativeExclusiveReservation>,
-    exclusive_sequences: BTreeMap<NativeExclusiveLocation, NativeExclusiveSequence>,
+    // Interior mutability lets exclusive-sequence bookkeeping run through a
+    // shared `&self`, independent of `exclusive_reservation`'s `&mut self`
+    // requirement above. This is the exclusive-monitor half of unblocking
+    // the read-mostly `NativeMappedMemory` hot path; `exclusive_reservation`
+    // still forces the containing methods to take `&mut self` until it too
+    // moves to per-thread state.
+    exclusive_sequences:
+        parking_lot::Mutex<BTreeMap<NativeExclusiveLocation, NativeExclusiveSequence>>,
     host_page_size: u64,
     linux_page_size: u64,
     dsr_generations: dsr::cache::PageGenerationTable,
@@ -7006,7 +7013,7 @@ impl NativeMappedMemory {
                 native_write_exec_writable_pages: BTreeSet::new(),
                 linux4k_page_protections: BTreeMap::new(),
                 exclusive_reservation: None,
-                exclusive_sequences: BTreeMap::new(),
+                exclusive_sequences: parking_lot::Mutex::new(BTreeMap::new()),
                 host_page_size: page_sizes.host,
                 linux_page_size: page_sizes.linux,
                 dsr_generations: dsr::cache::PageGenerationTable::new(page_sizes.host)
@@ -7745,7 +7752,15 @@ impl NativeMappedMemory {
         true
     }
 
-    fn invalidate_exclusive_range(&mut self, address: u64, len: usize) {
+    /// Bumps the sequence for every tracked exclusive location that overlaps
+    /// `[address, address+len)`, or every tracked location if `address+len`
+    /// overflows. This is the `exclusive_sequences` half of
+    /// `invalidate_exclusive_range`'s work, split into its own `&self`
+    /// accessor because `exclusive_sequences` now carries its own lock: the
+    /// other half (invalidating `exclusive_reservation`) still needs
+    /// `&mut self` until a later task moves that field to per-thread state.
+    fn bump_exclusive_sequences_in_range(&self, address: u64, len: usize) {
+        let mut sequences = self.exclusive_sequences.lock();
         let end = address.checked_add(len as u64);
         if let Some(end) = end {
             // DSR exclusive locations are scalar 1/2/4/8-byte accesses. An
@@ -7763,7 +7778,7 @@ impl NativeMappedMemory {
                 address: end,
                 width: 0,
             };
-            for (location, sequence) in self.exclusive_sequences.range_mut(lower..upper) {
+            for (location, sequence) in sequences.range_mut(lower..upper) {
                 let location_end = location.address.saturating_add(location.width as u64);
                 if address < location_end {
                     *sequence = sequence.next();
@@ -7773,10 +7788,14 @@ impl NativeMappedMemory {
             // An overflowing host-mediated write is rejected by its caller,
             // but conservatively invalidate every tracked reservation before
             // that error returns.
-            for sequence in self.exclusive_sequences.values_mut() {
+            for sequence in sequences.values_mut() {
                 *sequence = sequence.next();
             }
         }
+    }
+
+    fn invalidate_exclusive_range(&mut self, address: u64, len: usize) {
+        self.bump_exclusive_sequences_in_range(address, len);
         let Some(reservation) = self.exclusive_reservation else {
             return;
         };
@@ -7904,6 +7923,22 @@ impl NativeMappedMemory {
         Ok(observed)
     }
 
+    /// Returns the current sequence for `location`, initializing it to
+    /// `NativeExclusiveSequence::INITIAL` on first observation. Preserves the
+    /// `entry().or_insert()` semantics `exclusive_load_for` always used; only
+    /// the locking moved, from the caller's `&mut self` borrow to this
+    /// accessor's own `&self` lock on `exclusive_sequences`.
+    fn exclusive_sequence_or_insert(
+        &self,
+        location: NativeExclusiveLocation,
+    ) -> NativeExclusiveSequence {
+        *self
+            .exclusive_sequences
+            .lock()
+            .entry(location)
+            .or_insert(NativeExclusiveSequence::INITIAL)
+    }
+
     fn exclusive_load(
         &mut self,
         address: u64,
@@ -7949,10 +7984,7 @@ impl NativeMappedMemory {
         };
         self.restore_temporary_host_access(&changed, address, width)?;
         let location = NativeExclusiveLocation { address, width };
-        let sequence = *self
-            .exclusive_sequences
-            .entry(location)
-            .or_insert(NativeExclusiveSequence::INITIAL);
+        let sequence = self.exclusive_sequence_or_insert(location);
         *reservation = Some(NativeExclusiveReservation {
             location,
             observed,
@@ -7974,6 +8006,36 @@ impl NativeMappedMemory {
         result
     }
 
+    /// Returns the current sequence for `location`, or
+    /// `NativeExclusiveSequence::INITIAL` if it has never been observed
+    /// (without inserting). Preserves the `get().copied().unwrap_or()`
+    /// semantics `exclusive_store_for` always used; only the locking moved,
+    /// from the caller's `&mut self` borrow to this accessor's own `&self`
+    /// lock on `exclusive_sequences`.
+    fn exclusive_sequence_or_default(
+        &self,
+        location: NativeExclusiveLocation,
+    ) -> NativeExclusiveSequence {
+        self.exclusive_sequences
+            .lock()
+            .get(&location)
+            .copied()
+            .unwrap_or(NativeExclusiveSequence::INITIAL)
+    }
+
+    /// Advances the tracked sequence for `location` past `observed_sequence`
+    /// (the value most recently compared against). Called after a
+    /// successful exclusive-store CAS.
+    fn bump_exclusive_sequence(
+        &self,
+        location: NativeExclusiveLocation,
+        observed_sequence: NativeExclusiveSequence,
+    ) {
+        self.exclusive_sequences
+            .lock()
+            .insert(location, observed_sequence.next());
+    }
+
     fn exclusive_store_for(
         &mut self,
         address: u64,
@@ -7986,11 +8048,7 @@ impl NativeMappedMemory {
             return Ok(false);
         };
         let location = NativeExclusiveLocation { address, width };
-        let sequence = self
-            .exclusive_sequences
-            .get(&location)
-            .copied()
-            .unwrap_or(NativeExclusiveSequence::INITIAL);
+        let sequence = self.exclusive_sequence_or_default(location);
         if reservation.location != location || reservation.sequence != sequence {
             return Ok(false);
         }
@@ -8041,7 +8099,7 @@ impl NativeMappedMemory {
             }
         };
         if stored {
-            self.exclusive_sequences.insert(location, sequence.next());
+            self.bump_exclusive_sequence(location, sequence);
         }
         self.restore_temporary_host_access(&changed, address, width)?;
         Ok(stored)
@@ -9929,7 +9987,7 @@ mod tests {
             native_write_exec_writable_pages: BTreeSet::new(),
             linux4k_page_protections: BTreeMap::new(),
             exclusive_reservation: None,
-            exclusive_sequences: BTreeMap::new(),
+            exclusive_sequences: parking_lot::Mutex::new(BTreeMap::new()),
             host_page_size: 16 * 1024,
             linux_page_size,
             dsr_generations: dsr::cache::PageGenerationTable::new(16 * 1024)
@@ -10041,6 +10099,43 @@ mod tests {
             .expect("emulate stale ABA store");
             assert_eq!(snapshot.x[27], 1, "ABA must invalidate reservation");
             assert_eq!(memory.atomic_load(address, 4).unwrap(), 3);
+        });
+    }
+
+    #[test]
+    fn exclusive_invalidation_works_through_shared_ref() {
+        fork_test(|| {
+            let address = 0x40_0080;
+            let mut memory = biased_test_memory(carrick_guest_mem::GuestVa(0x40_0000), 0x4000);
+            memory
+                .atomic_store(address, 4, 1)
+                .expect("seed atomic word");
+
+            // Record an exclusive reservation. This step still needs &mut self:
+            // exclusive_reservation is out of this task's scope and keeps that
+            // requirement until a later task moves it to per-thread state.
+            let observed = memory
+                .exclusive_load(address, 4, true)
+                .expect("exclusive load");
+            assert_eq!(observed, 1);
+
+            // Drive the overlapping-write invalidation through a SHARED reference:
+            // exclusive_sequences now carries its own lock, so the sequence bump
+            // that a plain data write performs is reachable via &self, independent
+            // of the &mut self that exclusive_reservation still requires above.
+            let shared: &NativeMappedMemory = &memory;
+            shared.bump_exclusive_sequences_in_range(address, 4);
+
+            // The reservation captured above is now stale: a subsequent exclusive
+            // store must observe the CAS failure and leave memory unchanged.
+            let stored = memory
+                .exclusive_store(address, 4, 2, true)
+                .expect("exclusive store attempt");
+            assert!(
+                !stored,
+                "store must fail: &self overlapping write invalidated the reservation"
+            );
+            assert_eq!(memory.atomic_load(address, 4).unwrap(), 1);
         });
     }
 
@@ -11662,7 +11757,7 @@ mod tests {
             native_write_exec_writable_pages: BTreeSet::new(),
             linux4k_page_protections: BTreeMap::new(),
             exclusive_reservation: None,
-            exclusive_sequences: BTreeMap::new(),
+            exclusive_sequences: parking_lot::Mutex::new(BTreeMap::new()),
             host_page_size: 16 * 1024,
             linux_page_size: 16 * 1024,
             dsr_generations: dsr::cache::PageGenerationTable::new(16 * 1024)
@@ -11795,7 +11890,7 @@ mod tests {
             native_write_exec_writable_pages: BTreeSet::new(),
             linux4k_page_protections: BTreeMap::new(),
             exclusive_reservation: None,
-            exclusive_sequences: BTreeMap::new(),
+            exclusive_sequences: parking_lot::Mutex::new(BTreeMap::new()),
             host_page_size: 16 * 1024,
             linux_page_size: 16 * 1024,
             dsr_generations: dsr::cache::PageGenerationTable::new(16 * 1024)
@@ -12510,7 +12605,7 @@ mod tests {
             native_write_exec_writable_pages: BTreeSet::new(),
             linux4k_page_protections: BTreeMap::new(),
             exclusive_reservation: None,
-            exclusive_sequences: BTreeMap::new(),
+            exclusive_sequences: parking_lot::Mutex::new(BTreeMap::new()),
             host_page_size: page_size,
             linux_page_size: page_size,
             dsr_generations: dsr::cache::PageGenerationTable::new(page_size)
