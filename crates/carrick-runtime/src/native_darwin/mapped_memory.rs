@@ -215,32 +215,6 @@ impl Drop for HostLiftRestoreGuard<'_> {
     }
 }
 
-/// Immutable snapshot of the guest-memory mapping tables: `regions` plus the
-/// three protection-exception maps. Held behind `arc_swap::ArcSwap` on
-/// `NativeMappedMemory` (Phase 2a of `docs/superpowers/specs/2026-07-15-
-/// mmap-writer-lockfree-reads-design.md`, refined by `.superpowers/sdd/
-/// mapping-rcu-sites.md`): readers `load()` a coherent, immutable view;
-/// writers copy-on-write (`(*mapping.load_full()).clone()`, mutate the
-/// clone, one `store()`). THIS PHASE keeps the outer `RwLock<NativeMappedMemory>`
-/// for every read and write -- moving the data's home, not the locking -- so
-/// it is behavior-identical to the pre-refactor plain-fields version and has
-/// no perf effect; a later phase lets readers use the `ArcSwap` WITHOUT the
-/// outer guard.
-///
-/// Deliberately excludes `owned_host_ranges` (already folded into the
-/// lock-free `NativeMemoryConfig`, Phase 0) and `protections`
-/// (`MemoryProtections` -- has its own interior lock and independent
-/// publish-ordering discipline; see the design doc's "protections interaction"
-/// section). `regions`/the maps are `Clone`; the whole snapshot derives
-/// `Clone` so a writer can build its next version from the current one.
-#[derive(Clone, Debug, Default)]
-pub(super) struct MappingSnapshot {
-    pub(super) regions: Vec<NativeMappedRegion>,
-    pub(super) native_page_protections: BTreeMap<u64, u64>,
-    pub(super) native_write_exec_writable_pages: BTreeSet<u64>,
-    pub(super) linux4k_page_protections: BTreeMap<u64, [u64; 4]>,
-}
-
 pub(super) struct NativeMappedMemory {
     pub(super) address_mode: NativeAddressMode,
     // Host-coordinate authority for image retirement, biased fixed remaps,
@@ -255,14 +229,11 @@ pub(super) struct NativeMappedMemory {
     // (execve), exactly like `address_mode`/`host_page_size`/
     // `linux_page_size`.
     pub(super) owned_host_ranges: Arc<Vec<std::ops::Range<carrick_guest_mem::HostVa>>>,
-    // `regions`/`native_page_protections`/`native_write_exec_writable_pages`/
-    // `linux4k_page_protections` live in a `MappingSnapshot` (above) behind
-    // this `ArcSwap` -- see its doc comment. Every read goes through
-    // `self.mapping.load()`; every write copy-on-writes a new snapshot and
-    // `store()`s it once, atomically, covering ALL of that writer's field
-    // mutations.
-    pub(super) mapping: arc_swap::ArcSwap<MappingSnapshot>,
+    pub(super) regions: Vec<NativeMappedRegion>,
     pub(super) protections: MemoryProtections,
+    pub(super) native_page_protections: BTreeMap<u64, u64>,
+    pub(super) native_write_exec_writable_pages: BTreeSet<u64>,
+    pub(super) linux4k_page_protections: BTreeMap<u64, [u64; 4]>,
     // The exclusive-monitor reservation itself now lives per guest thread
     // (`NativeThreadRuntime.exclusive_reservation`), not here. The DSR-hot
     // path already threaded it through `exclusive_load_for`/`exclusive_store_for`;
@@ -460,7 +431,6 @@ impl NativeExclusiveSequence {
     }
 }
 
-#[derive(Clone, Debug)]
 pub(super) struct NativeMappedRegion {
     pub(super) start: u64,
     pub(super) end: u64,
@@ -618,9 +588,8 @@ impl NativeMappedMemory {
         }
         let end = address.saturating_add(len as u64);
         let mut page = address & !(self.host_page_size - 1);
-        let snap = self.mapping.load();
         while page < end {
-            let prot = snap
+            let prot = self
                 .native_page_protections
                 .get(&page)
                 .copied()
@@ -641,22 +610,6 @@ impl NativeMappedMemory {
         linux_page_size: u64,
     ) -> Result<Self, RuntimeError> {
         Self::map_with_translator(image, layout, host_page_size, linux_page_size, None, None)
-    }
-
-    /// Test-only copy-on-write helper: clone the current `MappingSnapshot`,
-    /// let the closure mutate the clone (any number of field mutations), then
-    /// publish it with ONE atomic `store()` -- the same pattern every
-    /// production writer in this file follows, but usable directly on a bare
-    /// `&self` (tests build a `NativeMappedMemory` outside any
-    /// `NativeMemoryHandle`/`RwLock`, so there's no outer guard to require
-    /// `&mut self` here). Exists purely so test setup code doesn't need to
-    /// hand-roll `load_full().clone()`/`store()` at each call site.
-    #[cfg(test)]
-    pub(super) fn with_mapping_mut<R>(&self, mutate: impl FnOnce(&mut MappingSnapshot) -> R) -> R {
-        let mut snap = (*self.mapping.load_full()).clone();
-        let result = mutate(&mut snap);
-        self.mapping.store(Arc::new(snap));
-        result
     }
 
     pub(super) fn map_for_plan(
@@ -1017,13 +970,11 @@ impl NativeMappedMemory {
             let mut memory = Self {
                 address_mode,
                 owned_host_ranges,
-                mapping: arc_swap::ArcSwap::from_pointee(MappingSnapshot {
-                    regions,
-                    native_page_protections: BTreeMap::new(),
-                    native_write_exec_writable_pages: BTreeSet::new(),
-                    linux4k_page_protections: BTreeMap::new(),
-                }),
+                regions,
                 protections,
+                native_page_protections: BTreeMap::new(),
+                native_write_exec_writable_pages: BTreeSet::new(),
+                linux4k_page_protections: BTreeMap::new(),
                 exclusive_sequences: parking_lot::Mutex::new(BTreeMap::new()),
                 host_access_lifts: parking_lot::Mutex::new(std::collections::HashMap::new()),
                 host_page_size: page_sizes.host,
@@ -1196,8 +1147,7 @@ impl NativeMappedMemory {
 
     pub(super) fn set_fork_inheritance(&self, share: bool) {
         let trace = std::env::var_os("CARRICK_NATIVE_TRACE_SYSCALLS").is_some();
-        let snap = self.mapping.load();
-        for region in &snap.regions {
+        for region in &self.regions {
             if region.shared_futex || !region.guest_writable {
                 continue;
             }
@@ -1421,9 +1371,7 @@ impl NativeMappedMemory {
         let Some(end) = address.checked_add(length) else {
             return false;
         };
-        self.mapping
-            .load()
-            .regions
+        self.regions
             .iter()
             .any(|region| address >= region.start && end <= region.end)
     }
@@ -1432,25 +1380,15 @@ impl NativeMappedMemory {
         &self,
         address: u64,
         length: usize,
-    ) -> impl Iterator<Item = (u64, u64)> + 'static {
+    ) -> impl Iterator<Item = (u64, u64)> + '_ {
         let end = address.saturating_add(length as u64);
         let linux4k = self.uses_linux4k_subpages();
-        // Materialize eagerly rather than returning an iterator borrowing
-        // `self`/the loaded `Guard`: the `Guard` returned by `load()` is a
-        // temporary that would otherwise need to outlive the returned
-        // iterator (see `.superpowers/sdd/mapping-rcu-sites.md` §5 reader
-        // reference-escape check). Both callers consume this fully within
-        // their own scope, so collecting first is behavior-identical.
-        self.mapping
-            .load()
-            .regions
+        self.regions
             .iter()
             .filter(move |region| {
                 (linux4k || region.host_protects) && address < region.end && region.start < end
             })
             .map(move |region| (address.max(region.start), end.min(region.end)))
-            .collect::<Vec<_>>()
-            .into_iter()
     }
 
     pub(super) fn host_page_range(
@@ -1481,16 +1419,15 @@ impl NativeMappedMemory {
     }
 
     pub(super) fn native16k_write_exec_page(&self, address: u64) -> Option<u64> {
-        let snap = self.mapping.load();
         if self.uses_linux4k_subpages()
-            || !snap.regions.iter().any(|region| {
+            || !self.regions.iter().any(|region| {
                 region.host_protects && address >= region.start && address < region.end
             })
         {
             return None;
         }
         let page_start = address & !(self.host_page_size - 1);
-        let prot = snap
+        let prot = self
             .native_page_protections
             .get(&page_start)
             .copied()
@@ -1504,11 +1441,10 @@ impl NativeMappedMemory {
             return false;
         }
         let write_exec = crate::linux_abi::LINUX_PROT_WRITE | crate::linux_abi::LINUX_PROT_EXEC;
-        let snap = self.mapping.load();
-        snap.native_page_protections
+        self.native_page_protections
             .values()
             .copied()
-            .chain(snap.regions.iter().map(|region| region.default_prot))
+            .chain(self.regions.iter().map(|region| region.default_prot))
             .any(|prot| prot & write_exec == write_exec)
     }
 
@@ -1532,12 +1468,7 @@ impl NativeMappedMemory {
         operation_address: u64,
         operation_len: usize,
     ) -> Result<(), MemoryError> {
-        if self
-            .mapping
-            .load()
-            .native_write_exec_writable_pages
-            .contains(&page_start)
-        {
+        if self.native_write_exec_writable_pages.contains(&page_start) {
             return Ok(());
         }
         self.note_dsr_code_mutation(page_start, self.host_page_size as usize)?;
@@ -1547,14 +1478,7 @@ impl NativeMappedMemory {
             operation_address,
             operation_len,
         )?;
-        // Copy-on-write: single-field mutation (native_write_exec_writable_pages),
-        // one atomic store. Safe to re-`load_full` here rather than reuse the
-        // guard from the early check above -- this whole method runs under the
-        // caller's exclusive outer write guard, so no other writer can have
-        // interleaved (see MappingSnapshot's doc comment).
-        let mut snap = (*self.mapping.load_full()).clone();
-        snap.native_write_exec_writable_pages.insert(page_start);
-        self.mapping.store(std::sync::Arc::new(snap));
+        self.native_write_exec_writable_pages.insert(page_start);
         Ok(())
     }
 
@@ -1564,12 +1488,7 @@ impl NativeMappedMemory {
         operation_address: u64,
         operation_len: usize,
     ) -> Result<(), MemoryError> {
-        if !self
-            .mapping
-            .load()
-            .native_write_exec_writable_pages
-            .contains(&page_start)
-        {
+        if !self.native_write_exec_writable_pages.contains(&page_start) {
             return Ok(());
         }
         let page_len =
@@ -1581,12 +1500,7 @@ impl NativeMappedMemory {
             .host_address(carrick_guest_mem::GuestVa(page_start))?
             .raw() as *mut u8;
         unsafe { carrick_native_clear_icache(ptr.cast(), page_len) };
-        // Copy-on-write: only `native_write_exec_writable_pages` is mutated
-        // (below); `native_page_protections` is read-only here, but reading
-        // it off the SAME clone we're about to mutate keeps this consistent
-        // with the pre-refactor in-place-mutation semantics.
-        let mut snap = (*self.mapping.load_full()).clone();
-        let prot = snap
+        let prot = self
             .native_page_protections
             .get(&page_start)
             .copied()
@@ -1597,8 +1511,7 @@ impl NativeMappedMemory {
             operation_address,
             operation_len,
         )?;
-        snap.native_write_exec_writable_pages.remove(&page_start);
-        self.mapping.store(std::sync::Arc::new(snap));
+        self.native_write_exec_writable_pages.remove(&page_start);
         Ok(())
     }
 
@@ -1641,12 +1554,7 @@ impl NativeMappedMemory {
             return Ok(false);
         }
         if matches!(ec, 0x20 | 0x21) {
-            if !self
-                .mapping
-                .load()
-                .native_write_exec_writable_pages
-                .contains(&page_start)
-            {
+            if !self.native_write_exec_writable_pages.contains(&page_start) {
                 return Ok(false);
             }
             self.make_native16k_write_exec_page_executable(
@@ -1662,13 +1570,7 @@ impl NativeMappedMemory {
             return Ok(true);
         }
         let write_data_abort = matches!(ec, 0x24 | 0x25) && esr & (1 << 6) != 0;
-        if !write_data_abort
-            || self
-                .mapping
-                .load()
-                .native_write_exec_writable_pages
-                .contains(&page_start)
-        {
+        if !write_data_abort || self.native_write_exec_writable_pages.contains(&page_start) {
             return Ok(false);
         }
         let pc_page = pc & !(self.host_page_size - 1);
@@ -1691,9 +1593,7 @@ impl NativeMappedMemory {
     }
 
     pub(super) fn default_linux_prot_at(&self, address: u64) -> u64 {
-        self.mapping
-            .load()
-            .regions
+        self.regions
             .iter()
             .rev()
             .find(|region| address >= region.start && address < region.end)
@@ -1710,9 +1610,7 @@ impl NativeMappedMemory {
                 .unwrap_or(0)
         } else {
             let page = address & !(self.host_page_size - 1);
-            self.mapping
-                .load()
-                .native_page_protections
+            self.native_page_protections
                 .get(&page)
                 .copied()
                 .unwrap_or_else(|| self.default_linux_prot_at(address))
@@ -1736,10 +1634,9 @@ impl NativeMappedMemory {
             crate::linux_abi::LINUX_PROT_READ
         };
         let mut cursor = address;
-        let snap = self.mapping.load();
         while cursor < end {
             let page = cursor & !(self.host_page_size - 1);
-            let prot = snap
+            let prot = self
                 .native_page_protections
                 .get(&page)
                 .copied()
@@ -1753,9 +1650,7 @@ impl NativeMappedMemory {
     }
 
     pub(super) fn linux4k_host_page_protections(&self, page_start: u64) -> [u64; 4] {
-        self.mapping
-            .load()
-            .linux4k_page_protections
+        self.linux4k_page_protections
             .get(&page_start)
             .copied()
             .unwrap_or_else(|| {
@@ -2371,13 +2266,12 @@ impl NativeMappedMemory {
 
     pub(super) fn native_host_prot_for_page(&self, page_start: u64) -> libc::c_int {
         if !self.uses_linux4k_subpages() {
-            let snap = self.mapping.load();
-            let prot = snap
+            let prot = self
                 .native_page_protections
                 .get(&page_start)
                 .copied()
                 .unwrap_or_else(|| self.default_linux_prot_at(page_start));
-            if snap.native_write_exec_writable_pages.contains(&page_start) {
+            if self.native_write_exec_writable_pages.contains(&page_start) {
                 return libc::PROT_READ | libc::PROT_WRITE;
             }
             return native16k_host_prot(prot);
@@ -2847,11 +2741,6 @@ impl NativeMappedMemory {
         // clears stay per page (only pages with an executable subpage get
         // one, exactly as before), and the per-page subpage bookkeeping is
         // unchanged.
-        //
-        // Copy-on-write: single-field mutation (linux4k_page_protections),
-        // accumulated across every merged run into ONE clone, then ONE
-        // atomic store after the loop -- not a store per run.
-        let mut snap = (*self.mapping.load_full()).clone();
         let mut index = 0;
         while index < resolved.len() {
             let mut end = index + 1;
@@ -2876,12 +2765,11 @@ impl NativeMappedMemory {
                 resolved[index].host_prot,
             )?;
             for page in &resolved[index..end] {
-                snap.linux4k_page_protections
+                self.linux4k_page_protections
                     .insert(page.page_start, page.protections);
             }
             index = end;
         }
-        self.mapping.store(std::sync::Arc::new(snap));
         Ok(())
     }
 
@@ -3151,24 +3039,12 @@ impl NativeMappedMemory {
         // 8 MiB chunks this way). Clear whole host pages, matching mmap's
         // replacement granularity; Linux-4K subpage state is stale for the
         // same reason.
-        //
-        // Copy-on-write, multi-field atomic swap: this writer mutates THREE
-        // snapshot fields (the stale-entry removals below) plus `regions`
-        // (the push at the end) -- ALL of them land in ONE clone and publish
-        // via ONE `store()` at the very end, after `self.protections` (its
-        // own independent lock) is updated. That ordering -- protections
-        // reflect the new mapping BEFORE the ArcSwap publishes the new
-        // `regions` entry -- is the safe direction documented in
-        // `.superpowers/sdd/mapping-rcu-sites.md` §3/§4: a reader can only
-        // ever observe "protections says new, regions says old" (falls back
-        // to the checked/slow path, safe), never the reverse.
-        let mut snap = (*self.mapping.load_full()).clone();
         let replaced_end = guest_map_start.saturating_add(host_map_len);
         let mut replaced_page = guest_map_start;
         while replaced_page < replaced_end {
-            snap.native_page_protections.remove(&replaced_page);
-            snap.native_write_exec_writable_pages.remove(&replaced_page);
-            snap.linux4k_page_protections.remove(&replaced_page);
+            self.native_page_protections.remove(&replaced_page);
+            self.native_write_exec_writable_pages.remove(&replaced_page);
+            self.linux4k_page_protections.remove(&replaced_page);
             replaced_page = replaced_page.saturating_add(self.host_page_size);
         }
 
@@ -3190,7 +3066,7 @@ impl NativeMappedMemory {
             prot_none,
             !prot_none && final_prot & libc::PROT_WRITE == 0,
         );
-        snap.regions.push(NativeMappedRegion {
+        self.regions.push(NativeMappedRegion {
             start: address,
             end: checked_add_u64(address, len, "native alias end")?,
             host_protects: true,
@@ -3200,7 +3076,6 @@ impl NativeMappedMemory {
             shared_key_base,
             shared_key_offset,
         });
-        self.mapping.store(std::sync::Arc::new(snap));
         Ok(())
     }
 
@@ -3326,11 +3201,6 @@ impl NativeMappedMemory {
             return Err(error);
         }
 
-        // Copy-on-write, two-field atomic swap: this writer mutates BOTH
-        // `native_page_protections` and `native_write_exec_writable_pages`
-        // for every page in the range -- accumulate all of it into ONE
-        // clone, then ONE atomic `store()` after the loop.
-        let mut snap = (*self.mapping.load_full()).clone();
         for (page_start, _, _) in pages {
             // Sparse representation: every reader (`native_range_allows`,
             // `native_host_prot_for_page`, `guest_address_is_executable`,
@@ -3340,13 +3210,12 @@ impl NativeMappedMemory {
             // in `protect_range` guarantees the region (and its
             // `default_prot`) is already established here.
             if prot == self.default_linux_prot_at(page_start) {
-                snap.native_page_protections.remove(&page_start);
+                self.native_page_protections.remove(&page_start);
             } else {
-                snap.native_page_protections.insert(page_start, prot);
+                self.native_page_protections.insert(page_start, prot);
             }
-            snap.native_write_exec_writable_pages.remove(&page_start);
+            self.native_write_exec_writable_pages.remove(&page_start);
         }
-        self.mapping.store(std::sync::Arc::new(snap));
         Ok(())
     }
 }
@@ -3505,16 +3374,12 @@ impl GuestMemory for NativeMappedMemory {
         // still-mapped tail to VA-keying (the pre-file-key behavior), which is
         // strictly safer than mis-keying the reused portion.
         let end = address.saturating_add(len as u64);
-        // Copy-on-write: single-field mutation (an in-place clear of two
-        // `NativeMappedRegion` members, no push/remove), one atomic store.
-        let mut snap = (*self.mapping.load_full()).clone();
-        for region in &mut snap.regions {
+        for region in &mut self.regions {
             if region.shared_key_base != 0 && region.start < end && address < region.end {
                 region.shared_key_base = 0;
                 region.shared_key_offset = 0;
             }
         }
-        self.mapping.store(std::sync::Arc::new(snap));
         Ok(())
     }
 
@@ -3526,11 +3391,10 @@ impl GuestMemory for NativeMappedMemory {
             return None;
         }
         let end = guest_addr.checked_add(std::mem::size_of::<u32>() as u64)?;
-        let snap = self.mapping.load();
         // Newest matching region wins (`.rev()`): file aliases are pushed after
         // the boot-time shared-file arena that covers the same VA range, and
         // the alias carries the file-identity key material.
-        let region = snap.regions.iter().rev().find(|region| {
+        let region = self.regions.iter().rev().find(|region| {
             region.shared_futex && guest_addr >= region.start && end <= region.end
         })?;
         let word = self
