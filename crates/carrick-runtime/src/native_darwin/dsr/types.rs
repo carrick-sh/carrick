@@ -235,6 +235,20 @@ pub(in crate::native_darwin) struct ExclusiveRegionExit {
     pub(in crate::native_darwin) retry_edge: GuestVa,
     pub(in crate::native_darwin) load_word: u32,
     pub(in crate::native_darwin) store_word: u32,
+    /// Raw encoding of the loop's retry branch (the conditional that targets
+    /// `retry_edge` on store failure). It sits one instruction past the store
+    /// at `end - 4` and is NOT carried in `BlockPlan::instructions` (unlike the
+    /// load/store/body ops), so the emitter needs it here to re-encode the
+    /// retry edge natively.
+    pub(in crate::native_darwin) retry_word: u32,
+    /// Raw encoding of the single optional early-exit branch (the CAS
+    /// compare-failure edge). `Some` iff the region body contains a conditional
+    /// branch that leaves the loop before the store; the emitter re-encodes it
+    /// to a CLREX-then-exit stub. `None` for a plain RMW loop with no early
+    /// exit. The matching `InstAction::Direct` in `BlockPlan::instructions`
+    /// carries its target/kind; this carries only the raw word the emitter
+    /// re-encodes (a `PlannedInst`'s `InstAction::Direct` drops the word).
+    pub(in crate::native_darwin) early_exit_word: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
