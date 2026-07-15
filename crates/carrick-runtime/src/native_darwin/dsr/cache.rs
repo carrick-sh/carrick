@@ -371,7 +371,11 @@ unsafe impl Send for TranslationCache {}
 // `&self` accessors this type exposes (`used_bytes`, `capacity_bytes`,
 // `host_range`, `contains_host_pc`) only read `base`/`capacity` (fixed at
 // construction, never mutated afterward) and `cursor` (mutated only by
-// `&mut self` methods, i.e. only under the write lock). So concurrent
+// `&mut self` methods, i.e. only under the write lock). The one other
+// `&self` method, `after_fork_child`, writes NO `self` field -- it only
+// flips the calling thread's per-thread `pthread_jit_write_protect_np`
+// hardware bit -- so it cannot race another thread on this struct's memory.
+// So concurrent
 // `&self` reads across threads never race a writer, and never race each
 // other (plain reads of the same memory are data-race-free). Direct-link
 // patches into the JIT buffer's *contents* (as opposed to these struct
