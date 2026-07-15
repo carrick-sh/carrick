@@ -3202,6 +3202,12 @@ impl GuestMemory for NativeSignalTrap<'_> {
     }
 
     fn write_bytes_raw(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+        // `self.memory: &mut NativeMappedMemory`, so this still resolves to
+        // `NativeMappedMemory`'s TRAIT `write_bytes_raw(&mut self, ..)`, which
+        // now dispatches internally to the &self common path or the &mut self
+        // exec-page escalation as needed -- unchanged observable behavior.
+        // NativeSignalTrap keeps its own &mut borrow of the memory in Phase 1;
+        // Phase 2 changes what guard it holds, not this call.
         self.memory.write_bytes_raw(address, bytes)
     }
 
@@ -7798,8 +7804,97 @@ impl NativeMappedMemory {
         }
     }
 
-    fn invalidate_exclusive_range(&mut self, address: u64, len: usize) {
+    fn invalidate_exclusive_range(&self, address: u64, len: usize) {
         self.bump_exclusive_sequences_in_range(address, len);
+    }
+
+    /// Copy `bytes` into the host backing for `[address, address+bytes.len())`,
+    /// no exclusive-monitor/DSR/exec-page bookkeeping -- the shared tail of
+    /// every `write_bytes_raw` path (the common `&self` case AND the `&mut
+    /// self` exec-page escalation both finish here).
+    fn copy_bytes_to_host(&self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+        let length = bytes.len();
+        let ptr = self
+            .host_address(carrick_guest_mem::GuestVa(address))?
+            .raw() as *mut u8;
+        let changed = self.prepare_temporary_host_access(address, length, true)?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, length);
+        }
+        self.restore_temporary_host_access(&changed, address, length)?;
+        Ok(())
+    }
+
+    /// The exclusive-monitor bump plus the conditional DSR code-mutation note
+    /// that every `write_bytes_raw` path performs before touching guest RAM,
+    /// regardless of whether the write also hits a native16k write-exec page.
+    /// Returns whether the range may execute (i.e. whether the caller must
+    /// also escalate to [`Self::write_exec_page_bytes`] for the exec-page
+    /// metadata update).
+    fn invalidate_and_note_dsr_write(
+        &self,
+        address: u64,
+        length: usize,
+    ) -> Result<bool, MemoryError> {
+        self.invalidate_exclusive_range(address, length);
+        let may_execute = self.range_may_execute(address, length);
+        if may_execute {
+            self.note_dsr_code_mutation(address, length)?;
+        }
+        Ok(may_execute)
+    }
+
+    /// The COMMON (non-exec-page) guest-RAM write path: bump the exclusive
+    /// monitor, note a DSR code mutation when the range may execute, and copy
+    /// the bytes into the host backing. Takes `&self` -- the only state this
+    /// touches is the interior-mutable `exclusive_sequences` map (Task 1) and
+    /// `dsr_generations` (already interior-mutable); it never mutates
+    /// `native_write_exec_writable_pages`/`native_page_protections`, so it
+    /// never needs to run under a write lock. Callers that may hit a native16k
+    /// write-exec page must use [`Self::write_exec_page_bytes`] instead.
+    ///
+    /// DELIBERATELY named `write_bytes_raw_shared`, not `write_bytes_raw`:
+    /// this crate has many EXISTING `owned_memory.write_bytes_raw(..)` call
+    /// sites (e.g. `dsr::mod::tests`, the native16k rollback test) where
+    /// `owned_memory: NativeMappedMemory` is an owned/by-value binding, not a
+    /// `&mut self` parameter already in scope. An inherent `&self` method
+    /// SHADOWING the `GuestMemory::write_bytes_raw(&mut self, ..)` trait
+    /// method under the same name would silently steal exactly those call
+    /// sites (Rust's method resolution tries `&Self` before `&mut Self` when
+    /// expanding an owned receiver's candidate list), permanently dropping
+    /// the exec-page escalation for them with no compiler warning -- verified
+    /// empirically with a standalone repro before choosing this name.
+    fn write_bytes_raw_shared(&self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+        let length = bytes.len();
+        if !self.region_contains(address, length) {
+            return Err(MemoryError::OutOfBounds { address, length });
+        }
+        self.invalidate_and_note_dsr_write(address, length)?;
+        self.copy_bytes_to_host(address, bytes)
+    }
+
+    /// The exec-page (SMC/JIT) guest-RAM write path: same exclusive-monitor
+    /// and DSR bookkeeping as [`Self::write_bytes_raw_shared`], plus the
+    /// `native_write_exec_writable_pages`/`native_page_protections` metadata
+    /// update that a write hitting a native16k write-exec page requires.
+    /// Needs `&mut self` -- this is the ONLY reason the guest-RAM write path
+    /// as a whole still needs a mutable borrow. The trait's `write_bytes_raw`
+    /// chooses this over the shared common path based on `range_may_execute`,
+    /// exactly as the original unsplit `write_bytes_raw` always called
+    /// `prepare_native16k_write_exec_host_write` unconditionally (a no-op
+    /// off a write-exec page) -- `range_may_execute` is a safe superset of
+    /// the pages `prepare_native16k_write_exec_host_write` actually mutates
+    /// (write-exec requires the EXEC bit, so every page it would mutate is
+    /// also a page `range_may_execute` reports), so gating on it changes
+    /// nothing observable.
+    fn write_exec_page_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+        let length = bytes.len();
+        if !self.region_contains(address, length) {
+            return Err(MemoryError::OutOfBounds { address, length });
+        }
+        self.invalidate_and_note_dsr_write(address, length)?;
+        self.prepare_native16k_write_exec_host_write(address, length)?;
+        self.copy_bytes_to_host(address, bytes)
     }
 
     fn atomic_load(&self, address: u64, width: usize) -> Result<u64, MemoryError> {
@@ -8905,24 +9000,17 @@ impl GuestMemory for NativeMappedMemory {
     }
 
     fn write_bytes_raw(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
-        let length = bytes.len();
-        if !self.region_contains(address, length) {
-            return Err(MemoryError::OutOfBounds { address, length });
+        // Dispatch to the &self common path (`write_bytes_raw_shared`) unless
+        // the write may hit a native16k write-exec page, in which case the
+        // &mut self escalation (`write_exec_page_bytes`) is required for the
+        // native_write_exec_writable_pages/native_page_protections metadata
+        // update. Phase 2's hot path calls `write_bytes_raw_shared` directly
+        // through a shared reference, bypassing this dispatcher entirely.
+        if self.range_may_execute(address, bytes.len()) {
+            self.write_exec_page_bytes(address, bytes)
+        } else {
+            self.write_bytes_raw_shared(address, bytes)
         }
-        self.invalidate_exclusive_range(address, length);
-        if self.range_may_execute(address, length) {
-            self.note_dsr_code_mutation(address, length)?;
-        }
-        self.prepare_native16k_write_exec_host_write(address, length)?;
-        let ptr = self
-            .host_address(carrick_guest_mem::GuestVa(address))?
-            .raw() as *mut u8;
-        let changed = self.prepare_temporary_host_access(address, length, true)?;
-        unsafe {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, length);
-        }
-        self.restore_temporary_host_access(&changed, address, length)?;
-        Ok(())
     }
 
     fn set_no_access(&mut self, address: u64, len: usize, no_access: bool) {
@@ -10128,6 +10216,52 @@ mod tests {
                 "store must fail: &self overlapping write invalidated the reservation"
             );
             assert_eq!(memory.atomic_load(address, 4).unwrap(), 1);
+        });
+    }
+
+    #[test]
+    fn write_bytes_through_shared_ref() {
+        fork_test(|| {
+            let address = 0x40_0080;
+            let mut memory = biased_test_memory(carrick_guest_mem::GuestVa(0x40_0000), 0x4000);
+            memory
+                .atomic_store(address, 4, 1)
+                .expect("seed atomic word");
+
+            // Record an exclusive reservation into a caller-owned slot, exactly
+            // like `exclusive_invalidation_works_through_shared_ref` above.
+            let mut reservation: Option<NativeExclusiveReservation> = None;
+            let observed = memory
+                .exclusive_load(address, 4, true, &mut reservation)
+                .expect("exclusive load");
+            assert_eq!(observed, 1);
+
+            // Write to a NORMAL (non-exec: biased_test_memory's region has no
+            // PROT_EXEC bit) guest page through a SHARED &NativeMappedMemory --
+            // the whole point of the split is that this common-case write no
+            // longer needs &mut self. `write_bytes_raw_shared` is the inherent
+            // &self common path (deliberately NOT named `write_bytes_raw`,
+            // see its doc comment: that name is reserved for the GuestMemory
+            // trait's &mut self dispatcher so existing owned-value call sites
+            // keep resolving there).
+            let shared: &NativeMappedMemory = &memory;
+            shared
+                .write_bytes_raw_shared(address, &9u32.to_le_bytes())
+                .expect("write through &self must succeed");
+
+            // The write landed in guest RAM...
+            assert_eq!(memory.read_bytes(address, 4).unwrap(), 9u32.to_le_bytes());
+            // ...and it invalidated the overlapping exclusive reservation
+            // captured above, exactly as the &mut self path always did: a
+            // subsequent exclusive store must observe the CAS failure.
+            let stored = memory
+                .exclusive_store(address, 4, 2, true, &mut reservation)
+                .expect("exclusive store attempt");
+            assert!(
+                !stored,
+                "store must fail: the &self write invalidated the reservation"
+            );
+            assert_eq!(memory.atomic_load(address, 4).unwrap(), 9);
         });
     }
 
