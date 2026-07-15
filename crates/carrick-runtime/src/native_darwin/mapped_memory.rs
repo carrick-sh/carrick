@@ -3380,6 +3380,21 @@ impl GuestMemory for NativeMappedMemory {
         if !self.region_contains(address, len) {
             return None;
         }
+        // `native_range_allows` only reflects the host-mprotect-fidelity
+        // table (`native_page_protections`), which `munmap()` does NOT reset
+        // -- it stays at the last guest-upgraded prot. Software
+        // no_access/unmapped state lives in `protections` instead
+        // (`unmap_range` sets `unmapped` there without touching
+        // `native_page_protections`), so it must be consulted separately or
+        // a freed/guarded range can still look host-readable here. Mirrors
+        // the HVF reference gate (`self.range_no_access` in
+        // `carrick-vmm-hvf/src/trap.rs`).
+        if self
+            .protections()
+            .is_some_and(|p| p.range_no_access(address, len))
+        {
+            return None;
+        }
         if !self.native_range_allows(address, len, false) {
             return None;
         }
