@@ -363,6 +363,23 @@ pub(super) struct TranslationCache {
 // lock.
 unsafe impl Send for TranslationCache {}
 
+// SAFETY: `ProcessTranslator::state` is a `RwLock<ProcessState>`, so any
+// `&TranslationCache` obtained through it (via a read guard) can be held
+// concurrently by multiple threads, but NEVER at the same time as a `&mut
+// TranslationCache` (a write guard) -- the RwLock enforces reader/writer
+// mutual exclusion with the necessary acquire/release synchronization. The
+// `&self` accessors this type exposes (`used_bytes`, `capacity_bytes`,
+// `host_range`, `contains_host_pc`) only read `base`/`capacity` (fixed at
+// construction, never mutated afterward) and `cursor` (mutated only by
+// `&mut self` methods, i.e. only under the write lock). So concurrent
+// `&self` reads across threads never race a writer, and never race each
+// other (plain reads of the same memory are data-race-free). Direct-link
+// patches into the JIT buffer's *contents* (as opposed to these struct
+// fields) still go through `AtomicU32` stores with `Release` ordering plus
+// an icache flush, unchanged by this impl and only ever issued under the
+// same write lock.
+unsafe impl Sync for TranslationCache {}
+
 impl TranslationCache {
     pub(in crate::native_darwin) fn new(requested_capacity: usize) -> Result<Self, DsrError> {
         if requested_capacity == 0 {
