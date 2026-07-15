@@ -184,7 +184,114 @@ fn native_exited_leader_must_park(tid: crate::thread::ThreadId) -> bool {
 const VM_INHERIT_SHARE: libc::c_int = 0;
 const VM_INHERIT_COPY: libc::c_int = 1;
 
-type SharedNativeMemory = Arc<parking_lot::RwLock<NativeMappedMemory>>;
+/// Immutable-after-image-load memory configuration: `address_mode`,
+/// `host_page_size`, and `linux_page_size` are set once when an image is
+/// mapped and only ever rewritten (all three together) by
+/// `NativeMemoryHandle::replace_image` on execve -- a whole-process quiesce,
+/// so a plain snapshot swap is safe. Bundled as one small `Copy` value
+/// behind its own dedicated lock, separate from `NativeMappedMemory`'s big
+/// `RwLock` (which also gates region/protection-table mutation and DSR
+/// translation), so hot-path readers of just these three fields never
+/// contend with that lock. A single lock over all three (rather than
+/// independent atomics per field) also guarantees callers observe a
+/// consistent snapshot instead of a torn read mid-execve.
+#[derive(Clone, Copy, Debug)]
+struct NativeMemoryConfig {
+    address_mode: NativeAddressMode,
+    host_page_size: u64,
+    linux_page_size: u64,
+}
+
+impl NativeMemoryConfig {
+    fn from_memory(memory: &NativeMappedMemory) -> Self {
+        Self {
+            address_mode: memory.address_mode,
+            host_page_size: memory.host_page_size,
+            linux_page_size: memory.linux_page_size,
+        }
+    }
+}
+
+/// Owner of a `NativeMappedMemory`'s `RwLock`, paired with the lock-free
+/// `NativeMemoryConfig` snapshot (Task 8). `Deref`s to
+/// `RwLock<NativeMappedMemory>` so every existing `.read()`/`.write()`/
+/// `.upgradable_read()` call site through `SharedNativeMemory` keeps working
+/// unchanged; the config accessors below are additional, not a replacement
+/// for the locked struct fields (which every other internal
+/// `NativeMappedMemory` method continues to read directly).
+struct NativeMemoryHandle {
+    memory: parking_lot::RwLock<NativeMappedMemory>,
+    config: parking_lot::RwLock<NativeMemoryConfig>,
+}
+
+impl NativeMemoryHandle {
+    fn new(memory: NativeMappedMemory) -> Self {
+        let config = NativeMemoryConfig::from_memory(&memory);
+        Self {
+            memory: parking_lot::RwLock::new(memory),
+            config: parking_lot::RwLock::new(config),
+        }
+    }
+
+    /// `address_mode` without acquiring `self.memory`'s `RwLock` -- see
+    /// `NativeMemoryConfig`'s doc comment.
+    fn address_mode(&self) -> NativeAddressMode {
+        self.config.read().address_mode
+    }
+
+    /// `host_page_size` without acquiring `self.memory`'s `RwLock` -- see
+    /// `NativeMemoryConfig`'s doc comment.
+    fn host_page_size(&self) -> u64 {
+        self.config.read().host_page_size
+    }
+
+    /// `linux_page_size` without acquiring `self.memory`'s `RwLock` -- see
+    /// `NativeMemoryConfig`'s doc comment.
+    fn linux_page_size(&self) -> u64 {
+        self.config.read().linux_page_size
+    }
+
+    /// Mirrors `NativeMappedMemory::uses_linux4k_subpages`, backed by the
+    /// same immutable-after-init config, without acquiring `self.memory`'s
+    /// `RwLock`.
+    fn uses_linux4k_subpages(&self) -> bool {
+        self.host_page_size() == 16 * 1024 && self.linux_page_size() == 4 * 1024
+    }
+
+    /// Forwards to `NativeMappedMemory::replace_image` under the write
+    /// guard, then refreshes the lock-free config snapshot so subsequent
+    /// `address_mode`/`host_page_size`/`linux_page_size` reads observe the
+    /// new image immediately. This is the ONLY path that may rewrite those
+    /// three fields after image load (execve), so routing every
+    /// `SharedNativeMemory`-level `replace_image` call through here (instead
+    /// of `.write().replace_image(...)`) makes forgetting the config
+    /// refresh impossible for production callers. Tests that operate on a
+    /// bare `NativeMappedMemory` (not wrapped in a handle) still call
+    /// `NativeMappedMemory::replace_image` directly and are unaffected.
+    fn replace_image(
+        &self,
+        image: &AddressSpace,
+        relative_relocations: &[NativeRelativeRelocation],
+        plan: &ExecutionPlan,
+        dsr_tid: Option<crate::thread::ThreadId>,
+        prepared: PreparedNativeExecMapping,
+    ) -> Result<(), RuntimeError> {
+        let mut guard = self.memory.write();
+        guard.replace_image(image, relative_relocations, plan, dsr_tid, prepared)?;
+        *self.config.write() = NativeMemoryConfig::from_memory(&guard);
+        Ok(())
+    }
+}
+
+impl std::ops::Deref for NativeMemoryHandle {
+    type Target = parking_lot::RwLock<NativeMappedMemory>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.memory
+    }
+}
+
+type SharedNativeMemory = Arc<NativeMemoryHandle>;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -1274,7 +1381,7 @@ fn run_image_in_current_process(
     })?;
     let entry = source.image().entry();
     let (memory, image) = map_current_process_image_source(source, plan, process_entry)?;
-    let memory = Arc::new(parking_lot::RwLock::new(memory));
+    let memory = Arc::new(NativeMemoryHandle::new(memory));
     let _ = crate::ulock::preinit_waiter_table();
     // PID-namespace launch placement (container path only; `run-elf` never
     // requests it): the same identity-init fallback as the HVF threaded loop —
@@ -2344,7 +2451,6 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                             }
                         }
                         memory
-                            .write()
                             .replace_image(
                                 &image,
                                 &relative_relocations,
@@ -2550,11 +2656,11 @@ fn lower_dsr_fault(
     translator: &mut dsr::ThreadTranslator,
 ) -> Result<NativeUcontextSnapshot, RuntimeError> {
     let host_fault = matches!(fault_address, dsr::ThreadFaultAddress::Host(_));
-    let biased_host_fault = host_fault
-        && matches!(
-            memory.read().address_mode(),
-            NativeAddressMode::Biased { .. }
-        );
+    // Lock-free (Task 8): this only needs `address_mode`, so read it via
+    // `NativeMemoryHandle` instead of taking the big memory `RwLock` just to
+    // immediately drop the guard again.
+    let biased_host_fault =
+        host_fault && matches!(memory.address_mode(), NativeAddressMode::Biased { .. });
     let fault_address = lower_dsr_fault_address(&memory.read(), fault_address)?.raw();
     if biased_host_fault {
         let memory = memory.read();
@@ -4688,7 +4794,10 @@ fn handle_native_fork(
         // fault arm carries the matching MT rejection, so a linux4k MT guest
         // fails typed at whichever boundary it reaches first, never with a
         // host crash.
-        if memory.read().uses_linux4k_subpages() {
+        // Lock-free (Task 8): this only needs the two page sizes, so read
+        // them via `NativeMemoryHandle` instead of taking the big memory
+        // `RwLock` just to immediately drop the guard again.
+        if memory.uses_linux4k_subpages() {
             barrier.end_fork();
             return Err(RuntimeError::Unsupported(
                 "native Darwin multithreaded fork on the linux4k page profile is not yet \
@@ -11035,7 +11144,7 @@ mod tests {
     fn native_dispatch_memory_read_classified_syscall_reads_and_writes_data() {
         fork_test(|| {
             let memory = biased_test_memory(carrick_guest_mem::GuestVa(0x40_0000), 0x4000);
-            let shared: SharedNativeMemory = Arc::new(parking_lot::RwLock::new(memory));
+            let shared: SharedNativeMemory = Arc::new(NativeMemoryHandle::new(memory));
             let address = 0x40_0080u64;
             {
                 let mut dispatch_memory = NativeDispatchMemory::new_read(&shared);
@@ -11059,7 +11168,7 @@ mod tests {
     fn native_dispatch_memory_panics_on_a_mapping_mutator_call() {
         fork_test(|| {
             let memory = biased_test_memory(carrick_guest_mem::GuestVa(0x40_0000), 0x4000);
-            let shared: SharedNativeMemory = Arc::new(parking_lot::RwLock::new(memory));
+            let shared: SharedNativeMemory = Arc::new(NativeMemoryHandle::new(memory));
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let mut dispatch_memory = NativeDispatchMemory::new_read(&shared);
                 dispatch_memory.set_no_access(0x40_0080, 0x4000, true);
@@ -11087,7 +11196,7 @@ mod tests {
                     | crate::linux_abi::LINUX_PROT_WRITE
                     | crate::linux_abi::LINUX_PROT_EXEC,
             );
-            let shared: SharedNativeMemory = Arc::new(parking_lot::RwLock::new(memory));
+            let shared: SharedNativeMemory = Arc::new(NativeMemoryHandle::new(memory));
             {
                 let mut dispatch_memory = NativeDispatchMemory::new_read(&shared);
                 dispatch_memory
@@ -11106,6 +11215,27 @@ mod tests {
                 "escalated write must go through write_exec_page_bytes"
             );
             assert_eq!(guard.read_bytes(page, 4).unwrap(), [0xAAu8; 4]);
+        });
+    }
+
+    #[test]
+    fn immutable_config_reads_lock_free() {
+        fork_test(|| {
+            let memory = biased_test_memory(carrick_guest_mem::GuestVa(0x40_0000), 0x4000);
+            let expected_mode = memory.address_mode();
+            let expected_host_page_size = memory.host_page_size;
+            let expected_linux_page_size = memory.linux_page_size;
+            let shared: SharedNativeMemory = Arc::new(NativeMemoryHandle::new(memory));
+            // `parking_lot::RwLock` is not reentrant: holding a write guard
+            // on the big `RwLock<NativeMappedMemory>` here means any of
+            // these three accessors would self-deadlock this very thread if
+            // they internally acquired that same lock. Completing without
+            // hanging proves they read the separate `NativeMemoryConfig`
+            // lock instead (Task 8).
+            let _write_guard = shared.write();
+            assert_eq!(shared.address_mode(), expected_mode);
+            assert_eq!(shared.host_page_size(), expected_host_page_size);
+            assert_eq!(shared.linux_page_size(), expected_linux_page_size);
         });
     }
 
@@ -12115,6 +12245,45 @@ mod tests {
             [carrick_guest_mem::HostVa(0x4000)..carrick_guest_mem::HostVa(0x8000)],
             "direct exec must retain the overlapping Carrick-owned pages continuously"
         );
+    }
+
+    #[test]
+    fn replace_image_refreshes_the_lock_free_config() {
+        fork_test(|| {
+            let plan = native16k_test_plan();
+            let source_image = lifecycle_image(LifecycleImageKind::DirectPie, 0x31);
+            let target_image = lifecycle_image(LifecycleImageKind::LowExec, 0x72);
+            let memory = NativeMappedMemory::map(
+                &source_image,
+                native_memory_layout(),
+                plan.page_geometry.host_page_size,
+                plan.page_geometry.linux_page_size,
+            )
+            .expect("map source lifecycle image");
+            let shared: SharedNativeMemory = Arc::new(NativeMemoryHandle::new(memory));
+            assert_eq!(shared.address_mode(), NativeAddressMode::Direct);
+
+            let prepared = shared
+                .read()
+                .prepare_exec_mapping(&target_image, &plan)
+                .expect("preselect replacement layout");
+
+            shared
+                .replace_image(&target_image, &[], &plan, None, prepared)
+                .expect("replace lifecycle image");
+
+            // The execve-updated fields must be visible through the
+            // lock-free config handle -- not just through a fresh `.read()`
+            // guard on the big RwLock.
+            assert!(matches!(
+                shared.address_mode(),
+                NativeAddressMode::Biased { .. }
+            ));
+            let guard = shared.read();
+            assert_eq!(shared.address_mode(), guard.address_mode());
+            assert_eq!(shared.host_page_size(), guard.host_page_size);
+            assert_eq!(shared.linux_page_size(), guard.linux_page_size);
+        });
     }
 
     #[test]
