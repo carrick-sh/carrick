@@ -71,33 +71,36 @@ fn biased_translator_fixture(words: &[u32], guest_code: GuestVa) -> BiasedTransl
     let memory = super::super::NativeMappedMemory {
         address_mode: crate::native_darwin::address::NativeAddressMode::Biased { host_bias },
         owned_host_ranges: Arc::new(vec![mapping.range()]),
-        regions: vec![
-            super::super::NativeMappedRegion {
-                start: guest_code.raw(),
-                end: guest_code.raw() + PAGE_SIZE,
-                host_protects: false,
-                shared_futex: false,
-                guest_writable: false,
-                default_prot: crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_EXEC,
-                shared_key_base: 0,
-                shared_key_offset: 0,
-            },
-            super::super::NativeMappedRegion {
-                start: guest_data.raw(),
-                end: guest_data.raw() + PAGE_SIZE,
-                host_protects: false,
-                shared_futex: false,
-                guest_writable: true,
-                default_prot: crate::linux_abi::LINUX_PROT_READ
-                    | crate::linux_abi::LINUX_PROT_WRITE,
-                shared_key_base: 0,
-                shared_key_offset: 0,
-            },
-        ],
+        mapping: arc_swap::ArcSwap::from_pointee(super::super::MappingSnapshot {
+            regions: vec![
+                super::super::NativeMappedRegion {
+                    start: guest_code.raw(),
+                    end: guest_code.raw() + PAGE_SIZE,
+                    host_protects: false,
+                    shared_futex: false,
+                    guest_writable: false,
+                    default_prot: crate::linux_abi::LINUX_PROT_READ
+                        | crate::linux_abi::LINUX_PROT_EXEC,
+                    shared_key_base: 0,
+                    shared_key_offset: 0,
+                },
+                super::super::NativeMappedRegion {
+                    start: guest_data.raw(),
+                    end: guest_data.raw() + PAGE_SIZE,
+                    host_protects: false,
+                    shared_futex: false,
+                    guest_writable: true,
+                    default_prot: crate::linux_abi::LINUX_PROT_READ
+                        | crate::linux_abi::LINUX_PROT_WRITE,
+                    shared_key_base: 0,
+                    shared_key_offset: 0,
+                },
+            ],
+            native_page_protections: BTreeMap::new(),
+            native_write_exec_writable_pages: BTreeSet::new(),
+            linux4k_page_protections: BTreeMap::new(),
+        }),
         protections: MemoryProtections::default(),
-        native_page_protections: BTreeMap::new(),
-        native_write_exec_writable_pages: BTreeSet::new(),
-        linux4k_page_protections: BTreeMap::new(),
         exclusive_sequences: parking_lot::Mutex::new(BTreeMap::new()),
         host_access_lifts: parking_lot::Mutex::new(std::collections::HashMap::new()),
         host_page_size: PAGE_SIZE,
