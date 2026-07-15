@@ -340,3 +340,34 @@ Residual: ~1.17M psynch remains, from reader<->writer contention — Go's
 frequent `mmap` arena writers take the exclusive write guard and parking_lot's
 `RwLock` blocks readers behind a queued writer. The next perf lever is sharding
 the mapping-mutator write path so `mmap` does not globally exclude readers.
+
+## 2026-07-15 — DSR translation-cache read-mostly (residual after Phase 2)
+
+The residual host-condvar contention after the memory-lock retirement was
+pinned (rate-truthful per-event dtrace ustack + atos, not snapshots) to the DSR
+translator's global `Mutex<ProcessState>`, taken on every block-translation
+entry. Applied the same read-mostly pattern: warm cache hits
+(`blocks.get(&(guest, generation))` — the generation key encodes currency)
+resolve under a `.read()` guard concurrently; misses/invalidation/publication
+take `.write()`. Required (and review-proved-sound) an `unsafe impl Sync for
+TranslationCache` — the `!Sync` `NonNull<u8>` JIT buffer is written only under
+the write guard.
+
+Rigorous back-to-back untraced measurement (Go W1 reducer, 1M-trap ceiling,
+same load window):
+
+| metric | RwLock memory (Mutex translator) | + RwLock translator | delta |
+| --- | --- | --- | --- |
+| untraced wall | 17.33s | 15.49s | **-10.6%** |
+| untraced user CPU | 45.36s | 41.04s | **-9.5%** |
+| untraced sys CPU | 19.36s | 16.63s | **-14.1%** |
+
+Correctness: atomic/futex/thread stress suite 90/90 hazard-class; opus review
+proved the `unsafe impl Sync` sound (every `&self` method read-only or
+per-thread-W^X-bit-only) and the read-fast-path stale-free. Combined with the
+memory-lock retirement, the two read-mostly conversions cut ~22% wall / ~29%
+sys CPU on this workload.
+
+Note: dtrace-TRACED psynch counts rose under this change, an artifact of
+dtrace's heavy contention perturbation; the untraced signed run is the wall/CPU
+authority and improved. Amplification counts remain shape-only evidence.
