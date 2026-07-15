@@ -6923,21 +6923,23 @@ mod tests {
             owned_host_ranges: Arc::new(vec![
                 carrick_guest_mem::HostVa(host_start)..carrick_guest_mem::HostVa(host_start + len),
             ]),
-            regions: vec![NativeMappedRegion {
-                start: guest_start.raw(),
-                end: guest_start.raw() + len as u64,
-                host_protects: true,
-                shared_futex: false,
-                guest_writable: true,
-                default_prot: crate::linux_abi::LINUX_PROT_READ
-                    | crate::linux_abi::LINUX_PROT_WRITE,
-                shared_key_base: 0,
-                shared_key_offset: 0,
-            }],
+            mapping: arc_swap::ArcSwap::from_pointee(MappingSnapshot {
+                regions: vec![NativeMappedRegion {
+                    start: guest_start.raw(),
+                    end: guest_start.raw() + len as u64,
+                    host_protects: true,
+                    shared_futex: false,
+                    guest_writable: true,
+                    default_prot: crate::linux_abi::LINUX_PROT_READ
+                        | crate::linux_abi::LINUX_PROT_WRITE,
+                    shared_key_base: 0,
+                    shared_key_offset: 0,
+                }],
+                native_page_protections: BTreeMap::new(),
+                native_write_exec_writable_pages: BTreeSet::new(),
+                linux4k_page_protections: BTreeMap::new(),
+            }),
             protections: MemoryProtections::default(),
-            native_page_protections: BTreeMap::new(),
-            native_write_exec_writable_pages: BTreeSet::new(),
-            linux4k_page_protections: BTreeMap::new(),
             exclusive_sequences: parking_lot::Mutex::new(BTreeMap::new()),
             host_access_lifts: parking_lot::Mutex::new(std::collections::HashMap::new()),
             host_page_size: 16 * 1024,
@@ -7248,18 +7250,20 @@ mod tests {
     #[test]
     fn native_dispatch_memory_escalates_to_write_for_a_write_exec_page() {
         fork_test(|| {
-            let mut memory = biased_test_memory(carrick_guest_mem::GuestVa(0x40_0000), 0x4000);
-            let page = memory.regions[0].start;
+            let memory = biased_test_memory(carrick_guest_mem::GuestVa(0x40_0000), 0x4000);
+            let page = memory.mapping.load().regions[0].start;
             // Mark the page write+exec (the native16k SMC/JIT shape a prior
             // mmap(PROT_WRITE|PROT_EXEC) would have left behind) directly in
             // the table `range_may_execute`/`native16k_write_exec_page`
             // consult.
-            memory.native_page_protections.insert(
-                page,
-                crate::linux_abi::LINUX_PROT_READ
-                    | crate::linux_abi::LINUX_PROT_WRITE
-                    | crate::linux_abi::LINUX_PROT_EXEC,
-            );
+            memory.with_mapping_mut(|snap| {
+                snap.native_page_protections.insert(
+                    page,
+                    crate::linux_abi::LINUX_PROT_READ
+                        | crate::linux_abi::LINUX_PROT_WRITE
+                        | crate::linux_abi::LINUX_PROT_EXEC,
+                );
+            });
             let shared: SharedNativeMemory = Arc::new(NativeMemoryHandle::new(memory));
             {
                 let mut dispatch_memory = NativeDispatchMemory::new_read(&shared);
@@ -7275,7 +7279,11 @@ mod tests {
             // escalated to a real write guard, not just that the bytes
             // happen to match.
             assert!(
-                guard.native_write_exec_writable_pages.contains(&page),
+                guard
+                    .mapping
+                    .load()
+                    .native_write_exec_writable_pages
+                    .contains(&page),
                 "escalated write must go through write_exec_page_bytes"
             );
             assert_eq!(guard.read_bytes(page, 4).unwrap(), [0xAAu8; 4]);
@@ -7300,33 +7308,34 @@ mod tests {
         fork_test(|| {
             let page = 16 * 1024_u64;
             let guest = carrick_guest_mem::GuestVa(0x40_0000);
-            let mut memory =
-                biased_test_memory_with_geometry(guest, (2 * page) as usize, 16 * 1024);
+            let memory = biased_test_memory_with_geometry(guest, (2 * page) as usize, 16 * 1024);
             // `biased_test_memory_with_geometry` builds ONE region covering
             // both pages; split it into two adjacent regions so no SINGLE
             // region covers the full `[guest, guest+2*page)` span (mirrors
             // `prepare_temporary_host_access_rolls_back_committed_lifts_on_later_overlap_failure`'s
             // region-splitting setup).
-            let template = memory.regions.remove(0);
-            memory.regions.push(NativeMappedRegion {
-                start: guest.raw(),
-                end: guest.raw() + page,
-                host_protects: template.host_protects,
-                shared_futex: template.shared_futex,
-                guest_writable: template.guest_writable,
-                default_prot: template.default_prot,
-                shared_key_base: template.shared_key_base,
-                shared_key_offset: template.shared_key_offset,
-            });
-            memory.regions.push(NativeMappedRegion {
-                start: guest.raw() + page,
-                end: guest.raw() + 2 * page,
-                host_protects: template.host_protects,
-                shared_futex: template.shared_futex,
-                guest_writable: template.guest_writable,
-                default_prot: template.default_prot,
-                shared_key_base: template.shared_key_base,
-                shared_key_offset: template.shared_key_offset,
+            memory.with_mapping_mut(|snap| {
+                let template = snap.regions.remove(0);
+                snap.regions.push(NativeMappedRegion {
+                    start: guest.raw(),
+                    end: guest.raw() + page,
+                    host_protects: template.host_protects,
+                    shared_futex: template.shared_futex,
+                    guest_writable: template.guest_writable,
+                    default_prot: template.default_prot,
+                    shared_key_base: template.shared_key_base,
+                    shared_key_offset: template.shared_key_offset,
+                });
+                snap.regions.push(NativeMappedRegion {
+                    start: guest.raw() + page,
+                    end: guest.raw() + 2 * page,
+                    host_protects: template.host_protects,
+                    shared_futex: template.shared_futex,
+                    guest_writable: template.guest_writable,
+                    default_prot: template.default_prot,
+                    shared_key_base: template.shared_key_base,
+                    shared_key_offset: template.shared_key_offset,
+                });
             });
 
             assert_eq!(
@@ -7343,11 +7352,13 @@ mod tests {
         fork_test(|| {
             let page = 16 * 1024_u64;
             let guest = carrick_guest_mem::GuestVa(0x40_0000);
-            let mut memory = biased_test_memory_with_geometry(guest, page as usize, 16 * 1024);
+            let memory = biased_test_memory_with_geometry(guest, page as usize, 16 * 1024);
             // Bookkeep the page as guest PROT_NONE (e.g. a temporarily
             // lifted/guarded page): the checked copy path can lift it for
             // the duration of the copy, but a raw zero-copy pointer cannot.
-            memory.native_page_protections.insert(guest.raw(), 0);
+            memory.with_mapping_mut(|snap| {
+                snap.native_page_protections.insert(guest.raw(), 0);
+            });
             assert_eq!(
                 memory.host_ptr_for_read(guest.raw(), page as usize),
                 None,
@@ -7443,15 +7454,17 @@ mod tests {
     fn host_ptr_for_write_returns_none_for_exec_range() {
         fork_test(|| {
             let mut memory = biased_test_memory(carrick_guest_mem::GuestVa(0x40_0000), 0x4000);
-            let page = memory.regions[0].start;
+            let page = memory.mapping.load().regions[0].start;
             // Native16k SMC/JIT write-exec shape: a raw kernel write here
             // would bypass `write_exec_page_bytes`'s W^X-metadata update.
-            memory.native_page_protections.insert(
-                page,
-                crate::linux_abi::LINUX_PROT_READ
-                    | crate::linux_abi::LINUX_PROT_WRITE
-                    | crate::linux_abi::LINUX_PROT_EXEC,
-            );
+            memory.with_mapping_mut(|snap| {
+                snap.native_page_protections.insert(
+                    page,
+                    crate::linux_abi::LINUX_PROT_READ
+                        | crate::linux_abi::LINUX_PROT_WRITE
+                        | crate::linux_abi::LINUX_PROT_EXEC,
+                );
+            });
             assert_eq!(
                 memory.host_ptr_for_write(page, 4),
                 None,
@@ -7479,14 +7492,16 @@ mod tests {
     #[test]
     fn native_dispatch_memory_host_ptr_for_write_declines_exec_range() {
         fork_test(|| {
-            let mut memory = biased_test_memory(carrick_guest_mem::GuestVa(0x40_0000), 0x4000);
-            let page = memory.regions[0].start;
-            memory.native_page_protections.insert(
-                page,
-                crate::linux_abi::LINUX_PROT_READ
-                    | crate::linux_abi::LINUX_PROT_WRITE
-                    | crate::linux_abi::LINUX_PROT_EXEC,
-            );
+            let memory = biased_test_memory(carrick_guest_mem::GuestVa(0x40_0000), 0x4000);
+            let page = memory.mapping.load().regions[0].start;
+            memory.with_mapping_mut(|snap| {
+                snap.native_page_protections.insert(
+                    page,
+                    crate::linux_abi::LINUX_PROT_READ
+                        | crate::linux_abi::LINUX_PROT_WRITE
+                        | crate::linux_abi::LINUX_PROT_EXEC,
+                );
+            });
             let shared: SharedNativeMemory = Arc::new(NativeMemoryHandle::new(memory));
             let mut dispatch_memory = NativeDispatchMemory::new_read(&shared);
             assert_eq!(
@@ -9230,21 +9245,23 @@ mod tests {
         let memory = NativeMappedMemory {
             address_mode: NativeAddressMode::Direct,
             owned_host_ranges: Arc::new(Vec::new()),
-            regions: vec![NativeMappedRegion {
-                start: stack_start,
-                end: stack_end,
-                host_protects: false,
-                shared_futex: false,
-                guest_writable: true,
-                default_prot: crate::linux_abi::LINUX_PROT_READ
-                    | crate::linux_abi::LINUX_PROT_WRITE,
-                shared_key_base: 0,
-                shared_key_offset: 0,
-            }],
+            mapping: arc_swap::ArcSwap::from_pointee(MappingSnapshot {
+                regions: vec![NativeMappedRegion {
+                    start: stack_start,
+                    end: stack_end,
+                    host_protects: false,
+                    shared_futex: false,
+                    guest_writable: true,
+                    default_prot: crate::linux_abi::LINUX_PROT_READ
+                        | crate::linux_abi::LINUX_PROT_WRITE,
+                    shared_key_base: 0,
+                    shared_key_offset: 0,
+                }],
+                native_page_protections: BTreeMap::new(),
+                native_write_exec_writable_pages: BTreeSet::new(),
+                linux4k_page_protections: BTreeMap::new(),
+            }),
             protections: MemoryProtections::default(),
-            native_page_protections: BTreeMap::new(),
-            native_write_exec_writable_pages: BTreeSet::new(),
-            linux4k_page_protections: BTreeMap::new(),
             exclusive_sequences: parking_lot::Mutex::new(BTreeMap::new()),
             host_access_lifts: parking_lot::Mutex::new(std::collections::HashMap::new()),
             host_page_size: 16 * 1024,
@@ -9363,21 +9380,23 @@ mod tests {
         let memory = NativeMappedMemory {
             address_mode: NativeAddressMode::Direct,
             owned_host_ranges: Arc::new(Vec::new()),
-            regions: vec![NativeMappedRegion {
-                start: stack_start,
-                end: stack_end,
-                host_protects: false,
-                shared_futex: false,
-                guest_writable: true,
-                default_prot: crate::linux_abi::LINUX_PROT_READ
-                    | crate::linux_abi::LINUX_PROT_WRITE,
-                shared_key_base: 0,
-                shared_key_offset: 0,
-            }],
+            mapping: arc_swap::ArcSwap::from_pointee(MappingSnapshot {
+                regions: vec![NativeMappedRegion {
+                    start: stack_start,
+                    end: stack_end,
+                    host_protects: false,
+                    shared_futex: false,
+                    guest_writable: true,
+                    default_prot: crate::linux_abi::LINUX_PROT_READ
+                        | crate::linux_abi::LINUX_PROT_WRITE,
+                    shared_key_base: 0,
+                    shared_key_offset: 0,
+                }],
+                native_page_protections: BTreeMap::new(),
+                native_write_exec_writable_pages: BTreeSet::new(),
+                linux4k_page_protections: BTreeMap::new(),
+            }),
             protections: MemoryProtections::default(),
-            native_page_protections: BTreeMap::new(),
-            native_write_exec_writable_pages: BTreeSet::new(),
-            linux4k_page_protections: BTreeMap::new(),
             exclusive_sequences: parking_lot::Mutex::new(BTreeMap::new()),
             host_access_lifts: parking_lot::Mutex::new(std::collections::HashMap::new()),
             host_page_size: 16 * 1024,
@@ -10088,11 +10107,13 @@ mod tests {
                 carrick_guest_mem::HostVa(owned_start)
                     ..carrick_guest_mem::HostVa(owned_start + page_size as usize),
             ]),
-            regions: Vec::new(),
+            mapping: arc_swap::ArcSwap::from_pointee(MappingSnapshot {
+                regions: Vec::new(),
+                native_page_protections: BTreeMap::new(),
+                native_write_exec_writable_pages: BTreeSet::new(),
+                linux4k_page_protections: BTreeMap::new(),
+            }),
             protections: MemoryProtections::default(),
-            native_page_protections: BTreeMap::new(),
-            native_write_exec_writable_pages: BTreeSet::new(),
-            linux4k_page_protections: BTreeMap::new(),
             exclusive_sequences: parking_lot::Mutex::new(BTreeMap::new()),
             host_access_lifts: parking_lot::Mutex::new(std::collections::HashMap::new()),
             host_page_size: page_size,
@@ -10376,10 +10397,11 @@ mod tests {
                     // Coalesced: apply is [run PROT_READ, run final(fails)],
                     // rollback restores each page individually -> 4 calls.
                     let rollback_calls = operations.borrow();
+                    let snap = memory.mapping.load();
                     Ok(result.is_err()
                         && rollback_calls.len() == 4
-                        && memory.native_page_protections.is_empty()
-                        && memory.native_write_exec_writable_pages.is_empty()
+                        && snap.native_page_protections.is_empty()
+                        && snap.native_write_exec_writable_pages.is_empty()
                         && words_restored)
                 })
                 .unwrap_or(false);
@@ -10464,6 +10486,8 @@ mod tests {
             for index in 0..4_u64 {
                 assert_eq!(
                     memory
+                        .mapping
+                        .load()
                         .native_page_protections
                         .get(&(guest.raw() + index * page))
                         .copied(),
@@ -10471,7 +10495,7 @@ mod tests {
                     "page {index} must keep its own protection entry"
                 );
             }
-            assert_eq!(memory.native_page_protections.len(), 4);
+            assert_eq!(memory.mapping.load().native_page_protections.len(), 4);
         });
     }
 
@@ -10510,6 +10534,8 @@ mod tests {
             for index in 0..3_u64 {
                 assert_eq!(
                     memory
+                        .mapping
+                        .load()
                         .native_page_protections
                         .get(&(guest.raw() + index * page))
                         .copied(),
@@ -10528,30 +10554,32 @@ mod tests {
                 biased_test_memory_with_geometry(guest, (5 * page) as usize, 16 * 1024);
             // Two host-protected regions with a one-page hole between them:
             // pages 0-1 and pages 3-4.
-            memory.regions = vec![
-                NativeMappedRegion {
-                    start: guest.raw(),
-                    end: guest.raw() + 2 * page,
-                    host_protects: true,
-                    shared_futex: false,
-                    guest_writable: true,
-                    default_prot: crate::linux_abi::LINUX_PROT_READ
-                        | crate::linux_abi::LINUX_PROT_WRITE,
-                    shared_key_base: 0,
-                    shared_key_offset: 0,
-                },
-                NativeMappedRegion {
-                    start: guest.raw() + 3 * page,
-                    end: guest.raw() + 5 * page,
-                    host_protects: true,
-                    shared_futex: false,
-                    guest_writable: true,
-                    default_prot: crate::linux_abi::LINUX_PROT_READ
-                        | crate::linux_abi::LINUX_PROT_WRITE,
-                    shared_key_base: 0,
-                    shared_key_offset: 0,
-                },
-            ];
+            memory.with_mapping_mut(|snap| {
+                snap.regions = vec![
+                    NativeMappedRegion {
+                        start: guest.raw(),
+                        end: guest.raw() + 2 * page,
+                        host_protects: true,
+                        shared_futex: false,
+                        guest_writable: true,
+                        default_prot: crate::linux_abi::LINUX_PROT_READ
+                            | crate::linux_abi::LINUX_PROT_WRITE,
+                        shared_key_base: 0,
+                        shared_key_offset: 0,
+                    },
+                    NativeMappedRegion {
+                        start: guest.raw() + 3 * page,
+                        end: guest.raw() + 5 * page,
+                        host_protects: true,
+                        shared_futex: false,
+                        guest_writable: true,
+                        default_prot: crate::linux_abi::LINUX_PROT_READ
+                            | crate::linux_abi::LINUX_PROT_WRITE,
+                        shared_key_base: 0,
+                        shared_key_offset: 0,
+                    },
+                ];
+            });
             let calls = RefCell::new(Vec::new());
             memory
                 .protect_native16k_range_with(
@@ -10575,9 +10603,10 @@ mod tests {
                 "runs must split exactly at the non-contiguous page boundary"
             );
             // Bookkeeping only for pages inside host-protected regions.
-            assert_eq!(memory.native_page_protections.len(), 4);
+            let snap = memory.mapping.load();
+            assert_eq!(snap.native_page_protections.len(), 4);
             assert!(
-                !memory
+                !snap
                     .native_page_protections
                     .contains_key(&(guest.raw() + 2 * page)),
                 "the hole page must not gain a protection entry"
@@ -10607,9 +10636,9 @@ mod tests {
                 )
                 .expect("protect to region default");
             assert!(
-                memory.native_page_protections.is_empty(),
+                memory.mapping.load().native_page_protections.is_empty(),
                 "protecting to the region default must leave the sparse map empty, got {:?}",
-                memory.native_page_protections
+                memory.mapping.load().native_page_protections
             );
             assert!(
                 memory.native_range_allows(guest.raw(), (2 * page) as usize, false),
@@ -10643,7 +10672,12 @@ mod tests {
                 )
                 .expect("protect to non-default prot");
             assert_eq!(
-                memory.native_page_protections.get(&guest.raw()).copied(),
+                memory
+                    .mapping
+                    .load()
+                    .native_page_protections
+                    .get(&guest.raw())
+                    .copied(),
                 Some(read_only),
                 "a non-default protection must be stored explicitly"
             );
@@ -10673,7 +10707,11 @@ mod tests {
                 )
                 .expect("protect to non-default prot");
             assert!(
-                memory.native_page_protections.contains_key(&guest.raw()),
+                memory
+                    .mapping
+                    .load()
+                    .native_page_protections
+                    .contains_key(&guest.raw()),
                 "sanity: non-default protection must be stored before flipping back"
             );
             memory
@@ -10685,7 +10723,11 @@ mod tests {
                 )
                 .expect("protect back to default prot");
             assert!(
-                !memory.native_page_protections.contains_key(&guest.raw()),
+                !memory
+                    .mapping
+                    .load()
+                    .native_page_protections
+                    .contains_key(&guest.raw()),
                 "flipping back to the region default must remove the stored entry"
             );
             assert!(memory.native_range_allows(guest.raw(), page as usize, true));
@@ -10730,6 +10772,8 @@ mod tests {
             for index in 0..4_u64 {
                 assert_eq!(
                     memory
+                        .mapping
+                        .load()
                         .linux4k_page_protections
                         .get(&(guest.raw() + index * host_page))
                         .copied(),
@@ -10780,6 +10824,8 @@ mod tests {
             let read = crate::linux_abi::LINUX_PROT_READ;
             assert_eq!(
                 memory
+                    .mapping
+                    .load()
                     .linux4k_page_protections
                     .get(&(guest.raw() + 2 * host_page))
                     .copied(),
@@ -10803,9 +10849,10 @@ mod tests {
             // guard downgrade) while host page 1 resolves to plain uniform
             // PROT_READ. Both end at PROT_READ, so the syscall coalesces
             // even though only page 0 needs the icache clear.
-            memory
-                .linux4k_page_protections
-                .insert(guest.raw(), [read_exec; 4]);
+            memory.with_mapping_mut(|snap| {
+                snap.linux4k_page_protections
+                    .insert(guest.raw(), [read_exec; 4]);
+            });
             let calls = RefCell::new(Vec::new());
             memory
                 .protect_linux4k_range_with(
@@ -10825,13 +10872,13 @@ mod tests {
                 "same final host prot must coalesce even when only some pages need icache"
             );
             let read = crate::linux_abi::LINUX_PROT_READ;
+            let snap = memory.mapping.load();
             assert_eq!(
-                memory.linux4k_page_protections.get(&guest.raw()).copied(),
+                snap.linux4k_page_protections.get(&guest.raw()).copied(),
                 Some([read_exec, read, read, read]),
             );
             assert_eq!(
-                memory
-                    .linux4k_page_protections
+                snap.linux4k_page_protections
                     .get(&(guest.raw() + host_page))
                     .copied(),
                 Some([read; 4]),
@@ -10844,15 +10891,15 @@ mod tests {
         fork_test(|| {
             let page = 16 * 1024_u64;
             let guest = carrick_guest_mem::GuestVa(0x40_0000);
-            let mut memory =
-                biased_test_memory_with_geometry(guest, (3 * page) as usize, 16 * 1024);
+            let memory = biased_test_memory_with_geometry(guest, (3 * page) as usize, 16 * 1024);
             // Bookkeep all three pages as guest PROT_NONE so a supervisor
             // read must lift every page.
-            for index in 0..3_u64 {
-                memory
-                    .native_page_protections
-                    .insert(guest.raw() + index * page, 0);
-            }
+            memory.with_mapping_mut(|snap| {
+                for index in 0..3_u64 {
+                    snap.native_page_protections
+                        .insert(guest.raw() + index * page, 0);
+                }
+            });
             let calls = RefCell::new(Vec::new());
             let changed = memory
                 .prepare_temporary_host_access_with(
@@ -10888,17 +10935,16 @@ mod tests {
         fork_test(|| {
             let page = 16 * 1024_u64;
             let guest = carrick_guest_mem::GuestVa(0x40_0000);
-            let mut memory =
-                biased_test_memory_with_geometry(guest, (3 * page) as usize, 16 * 1024);
-            memory.native_page_protections.insert(guest.raw(), 0);
-            // Middle page is already readable: prepare must skip it and
-            // split the mprotect runs around it.
-            memory
-                .native_page_protections
-                .insert(guest.raw() + page, crate::linux_abi::LINUX_PROT_READ);
-            memory
-                .native_page_protections
-                .insert(guest.raw() + 2 * page, 0);
+            let memory = biased_test_memory_with_geometry(guest, (3 * page) as usize, 16 * 1024);
+            memory.with_mapping_mut(|snap| {
+                snap.native_page_protections.insert(guest.raw(), 0);
+                // Middle page is already readable: prepare must skip it and
+                // split the mprotect runs around it.
+                snap.native_page_protections
+                    .insert(guest.raw() + page, crate::linux_abi::LINUX_PROT_READ);
+                snap.native_page_protections
+                    .insert(guest.raw() + 2 * page, 0);
+            });
             let calls = RefCell::new(Vec::new());
             let changed = memory
                 .prepare_temporary_host_access_with(
@@ -10974,10 +11020,12 @@ mod tests {
         fork_test(|| {
             let page = 16 * 1024_u64;
             let guest = carrick_guest_mem::GuestVa(0x40_0000);
-            let mut memory = biased_test_memory_with_geometry(guest, page as usize, 16 * 1024);
+            let memory = biased_test_memory_with_geometry(guest, page as usize, 16 * 1024);
             // Bookkeep the single page as guest PROT_NONE so EVERY accessor must
             // lift it before it can touch the backing.
-            memory.native_page_protections.insert(guest.raw(), 0);
+            memory.with_mapping_mut(|snap| {
+                snap.native_page_protections.insert(guest.raw(), 0);
+            });
             let host_base = memory.host_address(guest).expect("host base").raw();
             let host_page = 16 * 1024_usize;
             let rw = libc::PROT_READ | libc::PROT_WRITE;
@@ -11041,39 +11089,40 @@ mod tests {
         fork_test(|| {
             let page = 16 * 1024_u64;
             let guest = carrick_guest_mem::GuestVa(0x40_0000);
-            let mut memory =
-                biased_test_memory_with_geometry(guest, (2 * page) as usize, 16 * 1024);
+            let memory = biased_test_memory_with_geometry(guest, (2 * page) as usize, 16 * 1024);
             // `host_protected_overlaps` yields ONE overlap per matching region,
             // so split the single region `biased_test_memory_with_geometry`
             // built into TWO adjacent protected regions. A read/write spanning
             // both pages then drives `prepare` through TWO overlap iterations
             // -- the multi-overlap scenario the leak needs (overlap #1 fully
             // commits, overlap #2 fails).
-            let template = memory.regions.remove(0);
-            memory.regions.push(NativeMappedRegion {
-                start: guest.raw(),
-                end: guest.raw() + page,
-                host_protects: true,
-                shared_futex: template.shared_futex,
-                guest_writable: template.guest_writable,
-                default_prot: template.default_prot,
-                shared_key_base: template.shared_key_base,
-                shared_key_offset: template.shared_key_offset,
+            memory.with_mapping_mut(|snap| {
+                let template = snap.regions.remove(0);
+                snap.regions.push(NativeMappedRegion {
+                    start: guest.raw(),
+                    end: guest.raw() + page,
+                    host_protects: true,
+                    shared_futex: template.shared_futex,
+                    guest_writable: template.guest_writable,
+                    default_prot: template.default_prot,
+                    shared_key_base: template.shared_key_base,
+                    shared_key_offset: template.shared_key_offset,
+                });
+                snap.regions.push(NativeMappedRegion {
+                    start: guest.raw() + page,
+                    end: guest.raw() + 2 * page,
+                    host_protects: true,
+                    shared_futex: template.shared_futex,
+                    guest_writable: template.guest_writable,
+                    default_prot: template.default_prot,
+                    shared_key_base: template.shared_key_base,
+                    shared_key_offset: template.shared_key_offset,
+                });
+                // Bookkeep BOTH pages as guest PROT_NONE so both overlaps need a
+                // lift.
+                snap.native_page_protections.insert(guest.raw(), 0);
+                snap.native_page_protections.insert(guest.raw() + page, 0);
             });
-            memory.regions.push(NativeMappedRegion {
-                start: guest.raw() + page,
-                end: guest.raw() + 2 * page,
-                host_protects: true,
-                shared_futex: template.shared_futex,
-                guest_writable: template.guest_writable,
-                default_prot: template.default_prot,
-                shared_key_base: template.shared_key_base,
-                shared_key_offset: template.shared_key_offset,
-            });
-            // Bookkeep BOTH pages as guest PROT_NONE so both overlaps need a
-            // lift.
-            memory.native_page_protections.insert(guest.raw(), 0);
-            memory.native_page_protections.insert(guest.raw() + page, 0);
 
             let host_base = memory.host_address(guest).expect("host base").raw();
             let host_page = 16 * 1024_usize;
@@ -11131,14 +11180,16 @@ mod tests {
         fork_test(|| {
             let page = 16 * 1024_u64;
             let guest = carrick_guest_mem::GuestVa(0x40_0000);
-            let mut memory = biased_test_memory_with_geometry(guest, page as usize, 16 * 1024);
+            let memory = biased_test_memory_with_geometry(guest, page as usize, 16 * 1024);
             // Bookkeep the page as guest PROT_NONE so `exclusive_load_for`'s
             // `prepare_temporary_host_access` call must commit a `HostLift`
             // refcount before its width match's `_ => return
             // Err(Unsupported)` arm rejects an unsupported width and returns
             // early -- exactly the prepare-then-fallible-op-then-restore
             // window `HostLiftRestoreGuard` exists to backstop.
-            memory.native_page_protections.insert(guest.raw(), 0);
+            memory.with_mapping_mut(|snap| {
+                snap.native_page_protections.insert(guest.raw(), 0);
+            });
             let mut reservation = None;
             let error = memory
                 .exclusive_load_for(guest.raw(), 16, true, &mut reservation)
@@ -11156,13 +11207,15 @@ mod tests {
         fork_test(|| {
             let page = 16 * 1024_u64;
             let guest = carrick_guest_mem::GuestVa(0x40_0000);
-            let mut memory = biased_test_memory_with_geometry(guest, page as usize, 16 * 1024);
+            let memory = biased_test_memory_with_geometry(guest, page as usize, 16 * 1024);
             // Same setup as `exclusive_load_for_restores_host_lift_on_unsupported_width_error`,
             // but drives `exclusive_store_for`'s prepare(write=true)-then-
             // width-match window. The reservation is hand-built (rather than
             // obtained via `exclusive_load_for`) so its `location.width`
             // matches the unsupported width this call passes.
-            memory.native_page_protections.insert(guest.raw(), 0);
+            memory.with_mapping_mut(|snap| {
+                snap.native_page_protections.insert(guest.raw(), 0);
+            });
             let mut reservation = Some(NativeExclusiveReservation {
                 location: NativeExclusiveLocation {
                     address: guest.raw(),
@@ -11730,7 +11783,8 @@ mod tests {
                 .expect("empty native test image should be valid");
             let memory = NativeMappedMemory::map(&image, layout, page_size, page_size)
                 .expect("native mapping set should map");
-            for region in memory.regions.iter().filter(|region| selected(region)) {
+            let snap = memory.mapping.load();
+            for region in snap.regions.iter().filter(|region| selected(region)) {
                 let start = usize::try_from(region.start).expect("native region start fits usize");
                 let len = usize::try_from(region.end - region.start)
                     .expect("native region length fits usize");
@@ -11746,7 +11800,7 @@ mod tests {
             }
             let mut status = 0;
             let waited = unsafe { libc::waitpid(child, &mut status, 0) };
-            for region in memory.regions.iter().filter(|region| selected(region)) {
+            for region in snap.regions.iter().filter(|region| selected(region)) {
                 let start = usize::try_from(region.start).expect("native region start fits usize");
                 let len = usize::try_from(region.end - region.start)
                     .expect("native region length fits usize");
@@ -12411,6 +12465,8 @@ mod tests {
                 .expect("native mapping set should map");
             let writable = |start| {
                 memory
+                    .mapping
+                    .load()
                     .regions
                     .iter()
                     .find(|region| region.start == start)

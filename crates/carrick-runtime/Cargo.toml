@@ -79,6 +79,7 @@ carrick-observability = { path = "../carrick-observability" }
 carrick-signal-core = { path = "../carrick-signal-core" }
 carrick-timer-core = { path = "../carrick-timer-core" }
 anyhow.workspace = true
+arc-swap.workspace = true
 bitflags.workspace = true
 libc.workspace = true
 camino.workspace = true
