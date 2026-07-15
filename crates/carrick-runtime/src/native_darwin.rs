@@ -3604,6 +3604,21 @@ impl GuestMemory for NativeDispatchMemory<'_> {
         self.inner().read_bytes_raw(address, length)
     }
 
+    /// Delegates through the held guard so a read-classified syscall (e.g.
+    /// `write`/`send`/`writev` reading the guest source buffer) can still
+    /// zero-copy: this only ever READS guest memory, the mapping backing is
+    /// stable for as long as this adapter's guard is held (a mapping
+    /// mutation needs `.write()`, which cannot run concurrently with our
+    /// held `.read()`), and the trait's own contract confines the returned
+    /// pointer to this dispatch. `host_ptr_for_write` is deliberately left
+    /// at the trait default (not overridden here): a write into guest RAM
+    /// needs the exec-page escalation check `write_bytes_raw` performs
+    /// BEFORE handing out a pointer, so forwarding it the same way would
+    /// bypass that check.
+    fn host_ptr_for_read(&self, address: u64, len: usize) -> Option<*const u8> {
+        self.inner().host_ptr_for_read(address, len)
+    }
+
     fn write_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
         // Mirrors `NativeMappedMemory::write_bytes`'s gate exactly (the
         // trait default's `range_no_access`-only gate is less precise: this
