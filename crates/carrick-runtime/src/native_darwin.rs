@@ -7352,6 +7352,57 @@ mod tests {
     }
 
     #[test]
+    fn host_ptr_for_read_returns_none_for_unmapped_range() {
+        fork_test(|| {
+            let page = 16 * 1024_u64;
+            let guest = carrick_guest_mem::GuestVa(0x40_0000);
+            let mut memory = biased_test_memory_with_geometry(guest, page as usize, 16 * 1024);
+            // Sanity: absent the `unmapped` bookkeeping, the range zero-copies.
+            assert!(
+                memory
+                    .host_ptr_for_read(guest.raw(), page as usize)
+                    .is_some()
+            );
+            // Mirrors `unmap_range`'s software bookkeeping: munmap() marks the
+            // range `unmapped` in `protections` but leaves the stale
+            // `native_page_protections` entry (last guest-upgraded host
+            // mprotect fidelity) untouched, exactly like a real munmap() on a
+            // shared-aperture VA the guest previously upgraded to R/W. A
+            // zero-copy read pointer must decline a freed range even though
+            // the host-mprotect-fidelity table alone would still allow it.
+            memory.set_unmapped(guest.raw(), page as usize, true);
+            assert_eq!(
+                memory.host_ptr_for_read(guest.raw(), page as usize),
+                None,
+                "an unmapped range must fall back to the checked (EFAULT-capable) copy path"
+            );
+        });
+    }
+
+    #[test]
+    fn host_ptr_for_read_returns_none_for_no_access_range() {
+        fork_test(|| {
+            let page = 16 * 1024_u64;
+            let guest = carrick_guest_mem::GuestVa(0x40_0000);
+            let mut memory = biased_test_memory_with_geometry(guest, page as usize, 16 * 1024);
+            assert!(
+                memory
+                    .host_ptr_for_read(guest.raw(), page as usize)
+                    .is_some()
+            );
+            // Software `no_access` (e.g. mprotect(PROT_NONE) tracked only in
+            // `protections`, independent of the native host-mprotect-fidelity
+            // table) must also decline zero-copy.
+            memory.set_no_access(guest.raw(), page as usize, true);
+            assert_eq!(
+                memory.host_ptr_for_read(guest.raw(), page as usize),
+                None,
+                "a no_access range must fall back to the checked (EFAULT-capable) copy path"
+            );
+        });
+    }
+
+    #[test]
     fn host_ptr_for_write_returns_pointer_for_writable_non_exec_range() {
         fork_test(|| {
             let guest = carrick_guest_mem::GuestVa(0x40_0000);
