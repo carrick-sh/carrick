@@ -2918,8 +2918,8 @@ mod tests {
             assert_eq!(unsafe { libc::close(stderr_pipe[1]) }, 0);
 
             let (memory, _guest) = mapped_dsr_test_memory(&[]).expect("map test memory");
-            let memory: std::sync::Arc<parking_lot::Mutex<super::super::NativeMappedMemory>> =
-                std::sync::Arc::new(parking_lot::Mutex::new(memory));
+            let memory: std::sync::Arc<parking_lot::RwLock<super::super::NativeMappedMemory>> =
+                std::sync::Arc::new(parking_lot::RwLock::new(memory));
 
             let runtime = super::super::NativeThreadRuntime::new_current();
             // clear_child_tid=0 so `finish_thread` never dereferences guest
