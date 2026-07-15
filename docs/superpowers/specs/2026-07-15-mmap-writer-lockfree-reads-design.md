@@ -74,3 +74,57 @@ long session.
 Cold-translation misses on the translation `RwLock` (a separate residual, and
 inherent — first-touch translation must serialize). fork/exec writers are heavy
 but rare; the snapshot helps them too but they are not the frequency driver.
+
+---
+
+## Design revision (from the access-site exploration, .superpowers/sdd/mapping-rcu-sites.md)
+
+1. **`owned_host_ranges` → NativeMemoryConfig, NOT the snapshot.** Zero incremental
+   mutations; set-once + wholesale-replaced by `replace_image` (execve), exactly
+   like address_mode/page-sizes. Fold into the existing lock-free
+   `NativeMemoryConfig`. Snapshot is thus only 4 fields: `regions`,
+   `native_page_protections`, `native_write_exec_writable_pages`,
+   `linux4k_page_protections`.
+2. **Fork is a READER.** `handle_native_fork` takes only `.read()` (OS COW does
+   the memory duplication; no table rebuild). Remove fork from the writer list —
+   it does not block readers. The real frequent writer is the anon-mmap metadata
+   update (regions + protections), which the ArcSwap handles.
+3. **NEW HAZARD (load-bearing): physical-backing replacement vs zero-copy readers.**
+   `map_host_alias`/`remap_private` (MAP_SHARED/file mmap, private repoint) do raw
+   `libc::mmap(MAP_FIXED)` replacing the physical backing at a host VA. Zero-copy
+   readers (`host_ptr_for_read`/`host_ptr_for_write_shared`, used in
+   dispatch/{fs,net,mem}.rs) hand the kernel a raw pointer into that backing.
+   Today the outer write lock excludes them transitively. An ArcSwap over the 4
+   metadata fields does NOT — so a lock-free zero-copy reader could have the kernel
+   touch a host VA while `map_host_alias` remaps it → corruption/fault.
+   **Architecture consequence:** the snapshot needs a COMPANION lock. Zero-copy
+   dispatches take a SHARED "physical-backing-stable" guard; `map_host_alias`/
+   `remap_private` take its EXCLUSIVE side. This lock is LOW-contention (only
+   zero-copy syscalls read it; only MAP_FIXED-physical-remap writers write it —
+   both far rarer than the metadata reads/writes the ArcSwap makes lock-free), so
+   it does not reintroduce the mmap-writer bottleneck (Go's frequent anon-PROT_NONE
+   arena mmap does NO physical remap — it only updates metadata → ArcSwap → no
+   reader blocking). This is the key insight: separate METADATA (ArcSwap, hot) from
+   PHYSICAL-BACKING STABILITY (small RwLock, cold).
+4. **Ordering invariant, now explicit.** `map_host_alias` updates `protections`
+   BEFORE pushing `regions` (safe direction: never "region visible without its
+   protection"). Post-refactor each multi-field snapshot swap must preserve this
+   as an audited invariant (build the full new snapshot, then one atomic store).
+5. **Density / `im` decision.** `native_page_protections`/`linux4k_page_protections`
+   can hold ~tens of thousands of entries (dense during arena reservation) → plain
+   clone-per-write is O(n) and would negate the win → structural sharing needed.
+   Options: (a) add `im` (im::OrdMap, O(log n) clone) — a new heavier dep vs the
+   project's minimal-dep philosophy; (b) representation change to a RANGE map
+   (contiguous same-prot ranges → the arena is ~1 entry, cheap plain clone, no new
+   dep) — a larger internal change but dependency-free and arguably a better
+   representation. `regions`/`native_write_exec_writable_pages` are small-N (plain
+   clone fine). DECIDE after measuring actual map density empirically.
+
+## Revised phasing
+0. Fold `owned_host_ranges` into `NativeMemoryConfig` (small, dep-free, standalone).
+1. Companion "physical-backing" RwLock: zero-copy dispatches take read; map_host_alias/
+   remap_private take write. (Correctness for hazard #3, independent of ArcSwap.)
+2. `MappingSnapshot` (4 fields) behind `ArcSwap`; readers `load()`; writers build+store
+   one atomic snapshot (ordering invariant #4). Representation per #5.
+3. Remove readers' outer-write-guard dependency for metadata lookups.
+4. Measure untraced; keep only if it gains.
