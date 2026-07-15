@@ -10586,6 +10586,117 @@ mod tests {
     }
 
     #[test]
+    fn native16k_protect_to_region_default_stores_no_entry() {
+        fork_test(|| {
+            let page = 16 * 1024_u64;
+            let guest = carrick_guest_mem::GuestVa(0x40_0000);
+            let mut memory =
+                biased_test_memory_with_geometry(guest, (2 * page) as usize, 16 * 1024);
+            // `biased_test_memory_with_geometry` sets the region's
+            // `default_prot` to READ|WRITE, so protecting to that exact
+            // value must NOT add an entry: a missing page already reads
+            // back as the region default via `default_linux_prot_at`.
+            let default_prot =
+                crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_WRITE;
+            memory
+                .protect_native16k_range_with(
+                    guest.raw(),
+                    (2 * page) as usize,
+                    default_prot,
+                    |_host_va, _len, _host_prot| Ok(()),
+                )
+                .expect("protect to region default");
+            assert!(
+                memory.native_page_protections.is_empty(),
+                "protecting to the region default must leave the sparse map empty, got {:?}",
+                memory.native_page_protections
+            );
+            assert!(
+                memory.native_range_allows(guest.raw(), (2 * page) as usize, false),
+                "a missing (sparse) page must still read back as default-readable"
+            );
+            assert!(
+                memory.native_range_allows(guest.raw(), (2 * page) as usize, true),
+                "a missing (sparse) page must still read back as default-writable"
+            );
+            assert_eq!(
+                memory.native_host_prot_for_page(guest.raw()),
+                native16k_host_prot(default_prot),
+                "a missing (sparse) page must resolve to the region default host prot"
+            );
+        });
+    }
+
+    #[test]
+    fn native16k_protect_to_non_default_prot_stores_entry() {
+        fork_test(|| {
+            let page = 16 * 1024_u64;
+            let guest = carrick_guest_mem::GuestVa(0x40_0000);
+            let mut memory = biased_test_memory_with_geometry(guest, page as usize, 16 * 1024);
+            let read_only = crate::linux_abi::LINUX_PROT_READ;
+            memory
+                .protect_native16k_range_with(
+                    guest.raw(),
+                    page as usize,
+                    read_only,
+                    |_host_va, _len, _host_prot| Ok(()),
+                )
+                .expect("protect to non-default prot");
+            assert_eq!(
+                memory.native_page_protections.get(&guest.raw()).copied(),
+                Some(read_only),
+                "a non-default protection must be stored explicitly"
+            );
+            assert!(!memory.native_range_allows(guest.raw(), page as usize, true));
+            assert_eq!(
+                memory.native_host_prot_for_page(guest.raw()),
+                native16k_host_prot(read_only),
+            );
+        });
+    }
+
+    #[test]
+    fn native16k_protect_back_to_default_removes_stored_entry() {
+        fork_test(|| {
+            let page = 16 * 1024_u64;
+            let guest = carrick_guest_mem::GuestVa(0x40_0000);
+            let mut memory = biased_test_memory_with_geometry(guest, page as usize, 16 * 1024);
+            let default_prot =
+                crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_WRITE;
+            let read_only = crate::linux_abi::LINUX_PROT_READ;
+            memory
+                .protect_native16k_range_with(
+                    guest.raw(),
+                    page as usize,
+                    read_only,
+                    |_host_va, _len, _host_prot| Ok(()),
+                )
+                .expect("protect to non-default prot");
+            assert!(
+                memory.native_page_protections.contains_key(&guest.raw()),
+                "sanity: non-default protection must be stored before flipping back"
+            );
+            memory
+                .protect_native16k_range_with(
+                    guest.raw(),
+                    page as usize,
+                    default_prot,
+                    |_host_va, _len, _host_prot| Ok(()),
+                )
+                .expect("protect back to default prot");
+            assert!(
+                !memory.native_page_protections.contains_key(&guest.raw()),
+                "flipping back to the region default must remove the stored entry"
+            );
+            assert!(memory.native_range_allows(guest.raw(), page as usize, true));
+            assert_eq!(
+                memory.native_host_prot_for_page(guest.raw()),
+                native16k_host_prot(default_prot),
+            );
+        });
+    }
+
+    #[test]
     fn linux4k_protect_coalesces_uniform_host_pages_into_one_call() {
         fork_test(|| {
             let host_page = 16 * 1024_u64;
