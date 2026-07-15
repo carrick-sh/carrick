@@ -8724,110 +8724,212 @@ impl NativeMappedMemory {
         let mut lifts: Option<
             parking_lot::MutexGuard<'_, std::collections::HashMap<u64, HostLift>>,
         > = None;
-        for (start, end) in self.host_protected_overlaps(address, len) {
-            let (page_start, page_len) = self.host_page_range(start, end)?;
-            let page_end = page_start.saturating_add(page_len as u64);
 
-            // Phase 1: under the lift-table lock, decide the mprotect target for
-            // each page that still needs lifting -- `Some(prot)` means this
-            // accessor is the first to require `prot` (a fresh lift or an
-            // upgrade of an existing one); `None` means a concurrent accessor
-            // already holds the page at >= `required`. Table state is only READ
-            // here (committed in phase 3); pages never repeat within one call,
-            // so an earlier decision cannot invalidate a later one. Pages that
-            // already grant `required` are the lock-free fast path and are
-            // skipped entirely.
-            let mut pending: Vec<(u64, libc::c_int, Option<libc::c_int>)> = Vec::new();
-            let mut page = page_start;
-            while page < page_end {
-                let restore = self.native_host_prot_for_page(page);
-                if restore & required != required {
-                    let table = lifts.get_or_insert_with(|| self.host_access_lifts.lock());
-                    let target = match table.get(&page) {
-                        None => Some(required),
-                        Some(lift) if lift.lifted_prot & required != required => {
-                            Some(lift.lifted_prot | required)
-                        }
-                        Some(_) => None,
-                    };
-                    pending.push((page, restore, target));
-                }
-                page = page.saturating_add(self.host_page_size);
-            }
+        // `host_protected_overlaps` can yield MORE THAN ONE overlap -- a
+        // read/write spanning two adjacent protected regions -- and an
+        // EARLIER overlap's phase 3 can already have committed refcounts
+        // (and mprotected pages up) before a LATER overlap's phase 1/2 fails.
+        // Run the per-overlap work in an immediately-invoked closure so `?`
+        // unwinds to a `Result` here instead of straight out of the function,
+        // which would strand the earlier overlap's commits forever (a
+        // `HostLift` whose refcount never gets decremented). This makes
+        // `prepare` all-or-nothing: on error we roll back exactly what THIS
+        // call committed before propagating.
+        let result: Result<(), MemoryError> = (|| {
+            for (start, end) in self.host_protected_overlaps(address, len) {
+                let (page_start, page_len) = self.host_page_range(start, end)?;
+                let page_end = page_start.saturating_add(page_len as u64);
 
-            // Phase 2: execute the mprotects. Contiguous pages needing the SAME
-            // target coalesce into one call (preserving the pre-refcount
-            // behavior for the single-accessor case); a page with no target
-            // (already lifted by a peer) breaks the run. Done BEFORE any table
-            // mutation so a failing mprotect leaks no refcount.
-            let mut run: Option<(u64, usize, libc::c_int)> = None;
-            for &(page, _restore, target) in &pending {
-                match target {
-                    Some(target_prot) => {
-                        run = match run {
-                            Some((run_start, run_pages, run_prot))
-                                if run_prot == target_prot
-                                    && run_start
-                                        .saturating_add(run_pages as u64 * self.host_page_size)
-                                        == page =>
-                            {
-                                Some((run_start, run_pages + 1, run_prot))
+                // Phase 1: under the lift-table lock, decide the mprotect target
+                // for each page that still needs lifting -- `Some(prot)` means
+                // this accessor is the first to require `prot` (a fresh lift or
+                // an upgrade of an existing one); `None` means a concurrent
+                // accessor already holds the page at >= `required`. Table state
+                // is only READ here (committed in phase 3); pages never repeat
+                // within one call, so an earlier decision cannot invalidate a
+                // later one. Pages that already grant `required` are the
+                // lock-free fast path and are skipped entirely.
+                let mut pending: Vec<(u64, libc::c_int, Option<libc::c_int>)> = Vec::new();
+                let mut page = page_start;
+                while page < page_end {
+                    let restore = self.native_host_prot_for_page(page);
+                    if restore & required != required {
+                        let table = lifts.get_or_insert_with(|| self.host_access_lifts.lock());
+                        let target = match table.get(&page) {
+                            None => Some(required),
+                            Some(lift) if lift.lifted_prot & required != required => {
+                                Some(lift.lifted_prot | required)
                             }
-                            Some((run_start, run_pages, run_prot)) => {
+                            Some(_) => None,
+                        };
+                        pending.push((page, restore, target));
+                    }
+                    page = page.saturating_add(self.host_page_size);
+                }
+
+                // Phase 2: execute the mprotects. Contiguous pages needing the
+                // SAME target coalesce into one call (preserving the
+                // pre-refcount behavior for the single-accessor case); a page
+                // with no target (already lifted by a peer) breaks the run.
+                // Done BEFORE any table mutation so a failing mprotect leaks no
+                // refcount FOR THIS OVERLAP (an earlier overlap's commits, if
+                // any, are unwound below).
+                let mut run: Option<(u64, usize, libc::c_int)> = None;
+                for &(page, _restore, target) in &pending {
+                    match target {
+                        Some(target_prot) => {
+                            run = match run {
+                                Some((run_start, run_pages, run_prot))
+                                    if run_prot == target_prot
+                                        && run_start.saturating_add(
+                                            run_pages as u64 * self.host_page_size,
+                                        ) == page =>
+                                {
+                                    Some((run_start, run_pages + 1, run_prot))
+                                }
+                                Some((run_start, run_pages, run_prot)) => {
+                                    set_host_prot(
+                                        self.host_address(carrick_guest_mem::GuestVa(run_start))?,
+                                        host_page_len * run_pages,
+                                        run_prot,
+                                    )?;
+                                    Some((page, 1, target_prot))
+                                }
+                                None => Some((page, 1, target_prot)),
+                            };
+                        }
+                        None => {
+                            if let Some((run_start, run_pages, run_prot)) = run.take() {
                                 set_host_prot(
                                     self.host_address(carrick_guest_mem::GuestVa(run_start))?,
                                     host_page_len * run_pages,
                                     run_prot,
                                 )?;
-                                Some((page, 1, target_prot))
                             }
-                            None => Some((page, 1, target_prot)),
-                        };
-                    }
-                    None => {
-                        if let Some((run_start, run_pages, run_prot)) = run.take() {
-                            set_host_prot(
-                                self.host_address(carrick_guest_mem::GuestVa(run_start))?,
-                                host_page_len * run_pages,
-                                run_prot,
-                            )?;
                         }
                     }
                 }
-            }
-            if let Some((run_start, run_pages, run_prot)) = run {
-                set_host_prot(
-                    self.host_address(carrick_guest_mem::GuestVa(run_start))?,
-                    host_page_len * run_pages,
-                    run_prot,
-                )?;
-            }
+                if let Some((run_start, run_pages, run_prot)) = run {
+                    set_host_prot(
+                        self.host_address(carrick_guest_mem::GuestVa(run_start))?,
+                        host_page_len * run_pages,
+                        run_prot,
+                    )?;
+                }
 
-            // Phase 3: every mprotect for this overlap landed, so commit the
-            // refcounts. A fresh page inserts refcount 1 with its original
-            // protection; an already-lifted page increments and upgrades
-            // `lifted_prot` (idempotent when no upgrade was needed). Each page is
-            // recorded once per visit in `changed` so restore decrements it once.
-            if let Some(table) = lifts.as_mut() {
-                for &(page, restore, _target) in &pending {
-                    if let Some(lift) = table.get_mut(&page) {
-                        lift.refcount = lift.refcount.saturating_add(1);
-                        lift.lifted_prot |= required;
-                    } else {
-                        table.insert(
-                            page,
-                            HostLift {
-                                refcount: 1,
-                                original_prot: restore,
-                                lifted_prot: required,
-                            },
-                        );
+                // Phase 3: every mprotect for this overlap landed, so commit the
+                // refcounts. A fresh page inserts refcount 1 with its original
+                // protection; an already-lifted page increments and upgrades
+                // `lifted_prot` (idempotent when no upgrade was needed). Each
+                // page is recorded once per visit in `changed` so restore (or
+                // this call's own rollback, on a later failure) decrements it
+                // once.
+                if let Some(table) = lifts.as_mut() {
+                    for &(page, restore, _target) in &pending {
+                        if let Some(lift) = table.get_mut(&page) {
+                            lift.refcount = lift.refcount.saturating_add(1);
+                            lift.lifted_prot |= required;
+                        } else {
+                            table.insert(
+                                page,
+                                HostLift {
+                                    refcount: 1,
+                                    original_prot: restore,
+                                    lifted_prot: required,
+                                },
+                            );
+                        }
+                        changed.push((page, restore));
                     }
-                    changed.push((page, restore));
+                }
+            }
+            Ok(())
+        })();
+
+        if let Err(err) = result {
+            // Unwind exactly what THIS call committed, under the SAME guard
+            // held since the first lift -- `rollback_prepared_lifts` must NOT
+            // re-lock `host_access_lifts` (parking_lot::Mutex is not
+            // reentrant).
+            if let Some(table) = lifts.as_mut() {
+                self.rollback_prepared_lifts(table, &changed, host_page_len, &mut set_host_prot);
+            }
+            return Err(err);
+        }
+
+        Ok(changed)
+    }
+
+    /// Undo exactly the refcounts (and, where a refcount consequently drops
+    /// to zero, the mprotect-up) that THIS `prepare_temporary_host_access`
+    /// call committed into `changed` before it failed partway through a
+    /// LATER overlap. Called with the SAME `host_access_lifts` guard
+    /// `prepare` has held since its first lift -- never re-locks (the mutex
+    /// is not reentrant, so re-locking here would deadlock).
+    ///
+    /// Best-effort on the mprotect: `prepare` is already unwinding with a
+    /// real error and cannot also surface a second one, so a rollback
+    /// mprotect failure is swallowed. The refcount is removed from the table
+    /// regardless -- `mprotect` is an absolute, idempotent set, so a later
+    /// accessor's own lift attempt still lands the page in the right state
+    /// even if this best-effort restore didn't land.
+    fn rollback_prepared_lifts<F>(
+        &self,
+        table: &mut std::collections::HashMap<u64, HostLift>,
+        changed: &[(u64, libc::c_int)],
+        host_page_len: usize,
+        set_host_prot: &mut F,
+    ) where
+        F: FnMut(carrick_guest_mem::HostVa, usize, libc::c_int) -> Result<(), MemoryError>,
+    {
+        let mut to_restore: Vec<(u64, libc::c_int)> = Vec::with_capacity(changed.len());
+        for &(page, restore) in changed {
+            match table.entry(page) {
+                std::collections::hash_map::Entry::Occupied(mut occupied) => {
+                    let refcount = {
+                        let lift = occupied.get_mut();
+                        lift.refcount = lift.refcount.saturating_sub(1);
+                        lift.refcount
+                    };
+                    if refcount == 0 {
+                        let original = occupied.get().original_prot;
+                        occupied.remove();
+                        to_restore.push((page, original));
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(_) => {
+                    // Should not happen -- `changed` only records pages this
+                    // call itself inserted or bumped -- but fall back to
+                    // restoring the recorded protection so a page is never
+                    // left stranded.
+                    to_restore.push((page, restore));
                 }
             }
         }
-        Ok(changed)
+
+        // Restore in reverse order, merging adjacent pages whose target
+        // protection is identical into one mprotect call (mirrors
+        // `restore_temporary_host_access_with`).
+        let mut entries = to_restore.iter().rev().peekable();
+        while let Some(&(page_start, restore)) = entries.next() {
+            let mut run_start = page_start;
+            let mut run_pages = 1_usize;
+            while let Some(&&(previous_page, previous_restore)) = entries.peek() {
+                if previous_restore == restore
+                    && previous_page.checked_add(self.host_page_size) == Some(run_start)
+                {
+                    run_start = previous_page;
+                    run_pages += 1;
+                    entries.next();
+                } else {
+                    break;
+                }
+            }
+            let Ok(host_va) = self.host_address(carrick_guest_mem::GuestVa(run_start)) else {
+                continue;
+            };
+            let _ = set_host_prot(host_va, host_page_len * run_pages, restore);
+        }
     }
 
     fn restore_temporary_host_access(
@@ -14316,6 +14418,96 @@ mod tests {
             assert!(
                 memory.host_access_lifts.lock().is_empty(),
                 "the last release must remove the lift entry",
+            );
+        });
+    }
+
+    #[test]
+    fn prepare_temporary_host_access_rolls_back_committed_lifts_on_later_overlap_failure() {
+        fork_test(|| {
+            let page = 16 * 1024_u64;
+            let guest = carrick_guest_mem::GuestVa(0x40_0000);
+            let mut memory =
+                biased_test_memory_with_geometry(guest, (2 * page) as usize, 16 * 1024);
+            // `host_protected_overlaps` yields ONE overlap per matching region,
+            // so split the single region `biased_test_memory_with_geometry`
+            // built into TWO adjacent protected regions. A read/write spanning
+            // both pages then drives `prepare` through TWO overlap iterations
+            // -- the multi-overlap scenario the leak needs (overlap #1 fully
+            // commits, overlap #2 fails).
+            let template = memory.regions.remove(0);
+            memory.regions.push(NativeMappedRegion {
+                start: guest.raw(),
+                end: guest.raw() + page,
+                host_protects: true,
+                shared_futex: template.shared_futex,
+                guest_writable: template.guest_writable,
+                default_prot: template.default_prot,
+                shared_key_base: template.shared_key_base,
+                shared_key_offset: template.shared_key_offset,
+            });
+            memory.regions.push(NativeMappedRegion {
+                start: guest.raw() + page,
+                end: guest.raw() + 2 * page,
+                host_protects: true,
+                shared_futex: template.shared_futex,
+                guest_writable: template.guest_writable,
+                default_prot: template.default_prot,
+                shared_key_base: template.shared_key_base,
+                shared_key_offset: template.shared_key_offset,
+            });
+            // Bookkeep BOTH pages as guest PROT_NONE so both overlaps need a
+            // lift.
+            memory.native_page_protections.insert(guest.raw(), 0);
+            memory.native_page_protections.insert(guest.raw() + page, 0);
+
+            let host_base = memory.host_address(guest).expect("host base").raw();
+            let host_page = 16 * 1024_usize;
+            let rw = libc::PROT_READ | libc::PROT_WRITE;
+            let second_page_host = host_base + host_page;
+
+            let calls = RefCell::new(Vec::new());
+            let mut set_host_prot =
+                |host_va: carrick_guest_mem::HostVa, len: usize, prot: libc::c_int| {
+                    calls.borrow_mut().push((host_va.raw(), len, prot));
+                    // Fail exactly the second overlap's lift-up mprotect --
+                    // the first overlap's page must already be committed
+                    // (refcounted + mprotected up) by the time this runs.
+                    if host_va.raw() == second_page_host {
+                        return Err(MemoryError::HostMap("synthetic lift failure".to_string()));
+                    }
+                    Ok(())
+                };
+
+            let error = memory
+                .prepare_temporary_host_access_with(
+                    guest.raw(),
+                    (2 * page) as usize,
+                    true,
+                    &mut set_host_prot,
+                )
+                .expect_err("second overlap's lift must fail");
+            assert_eq!(
+                error,
+                MemoryError::HostMap("synthetic lift failure".to_string()),
+            );
+
+            assert_eq!(
+                *calls.borrow(),
+                vec![
+                    (host_base, host_page, rw),
+                    (second_page_host, host_page, rw),
+                    (host_base, host_page, libc::PROT_NONE),
+                ],
+                "a later overlap's failure must roll back an earlier overlap's \
+                 already-committed lift back to its original protection",
+            );
+            // `prepare` is all-or-nothing: no refcount may survive a failed
+            // call, even though the first overlap fully committed before the
+            // second overlap failed.
+            assert!(
+                memory.host_access_lifts.lock().is_empty(),
+                "a failed prepare must leave the lift table exactly as it found it",
             );
         });
     }
