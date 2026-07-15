@@ -70,7 +70,7 @@ fn biased_translator_fixture(words: &[u32], guest_code: GuestVa) -> BiasedTransl
         Arc::new(super::ProcessTranslator::new(64 * 1024).expect("create live translator"));
     let memory = super::super::NativeMappedMemory {
         address_mode: crate::native_darwin::address::NativeAddressMode::Biased { host_bias },
-        owned_host_ranges: vec![mapping.range()],
+        owned_host_ranges: Arc::new(vec![mapping.range()]),
         regions: vec![
             super::super::NativeMappedRegion {
                 start: guest_code.raw(),
