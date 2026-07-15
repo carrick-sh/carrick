@@ -3202,7 +3202,18 @@ impl NativeMappedMemory {
         }
 
         for (page_start, _, _) in pages {
-            self.native_page_protections.insert(page_start, prot);
+            // Sparse representation: every reader (`native_range_allows`,
+            // `native_host_prot_for_page`, `guest_address_is_executable`,
+            // ...) already falls back to `default_linux_prot_at` for a
+            // MISSING page, so a page whose protection matches its
+            // region's default is redundant to store. `region_contains`
+            // in `protect_range` guarantees the region (and its
+            // `default_prot`) is already established here.
+            if prot == self.default_linux_prot_at(page_start) {
+                self.native_page_protections.remove(&page_start);
+            } else {
+                self.native_page_protections.insert(page_start, prot);
+            }
             self.native_write_exec_writable_pages.remove(&page_start);
         }
         Ok(())
