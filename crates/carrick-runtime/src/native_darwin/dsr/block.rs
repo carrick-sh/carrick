@@ -6,7 +6,7 @@ use super::super::NativeMappedMemory;
 use super::decode;
 use super::types::{
     CodeGeneration, DirectExit, DirectKind, DsrError, ExclusiveRegionExit, IndirectExit,
-    InstAction, MemoryBase, SensitiveExit,
+    InstAction, MemoryBase, SensitiveExit, SensitiveKind,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -19,6 +19,13 @@ pub(super) struct PlannedInst {
 pub(super) enum BlockLimit {
     PageBoundary,
     InstructionLimit,
+    /// The block was split just before a fusible exclusive region so the
+    /// exclusive load starts a fresh, self-contained fused block. Compilers
+    /// emit the CAS/RMW argument setup (address, expected, new value) BEFORE
+    /// the exclusive load, so the load is almost always reached mid-block; this
+    /// split is what lets it become a block start and fuse (see
+    /// `plan_with_reader`).
+    ExclusiveRegionSplit,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -123,6 +130,7 @@ fn plan_with_reader(
     generation: CodeGeneration,
     max_instructions: usize,
     page_size: u64,
+    allow_fusion: bool,
     mut read: impl FnMut(GuestVa) -> Result<u32, DsrError>,
 ) -> Result<BlockPlan, DsrError> {
     if max_instructions == 0 {
@@ -144,6 +152,59 @@ fn plan_with_reader(
         let word = read(pc)?;
         let action = decode::classify(word, pc)?;
         let next = checked_next(pc)?;
+        // Attempt exclusive-region fusion. A fused region must be a
+        // self-contained block whose retry edge re-enters the exclusive load
+        // with no instruction (and, critically, no block prologue / context
+        // store) between the load and the store. So the load must be the
+        // block's FIRST instruction:
+        //   - if it already is (`instructions.is_empty()`), emit the fused
+        //     region as this block;
+        //   - if the region is fusible but the load is reached mid-block
+        //     (compilers load the CAS/RMW operands before the exclusive load,
+        //     so this is the common case), END this block just before the load
+        //     with a `Continue`, so the next translation starts AT the load and
+        //     fuses. Without this split the load would never be a block start
+        //     in the uncontended case (the retry edge that targets it is not
+        //     taken), and would never fuse.
+        // When the region is not provably fusible, or `allow_fusion` is off,
+        // fall through to today's `Sensitive` exit unchanged
+        // (`try_fuse_exclusive_region` gates every hazard and returns `None`
+        // when in any doubt).
+        if allow_fusion {
+            if let InstAction::Sensitive(SensitiveExit {
+                kind: SensitiveKind::Exclusive(load_word),
+                ..
+            }) = action
+            {
+                if let Some((region_instructions, region_exit)) =
+                    try_fuse_exclusive_region(pc, load_word, allow_fusion, boundary, &mut read)?
+                {
+                    if instructions.is_empty() {
+                        return Ok(BlockPlan {
+                            start,
+                            end: region_exit.end,
+                            generation,
+                            instructions: region_instructions,
+                            exit: PlannedExit::ExclusiveRegion {
+                                guest: pc,
+                                word: load_word,
+                                exit: region_exit,
+                            },
+                        });
+                    }
+                    return Ok(BlockPlan {
+                        start,
+                        end: pc,
+                        generation,
+                        instructions,
+                        exit: PlannedExit::Continue {
+                            target: pc,
+                            limit: BlockLimit::ExclusiveRegionSplit,
+                        },
+                    });
+                }
+            }
+        }
         let exit = match action {
             InstAction::Copy(_)
             | InstAction::Memory(_)
@@ -219,11 +280,21 @@ pub(super) fn plan_block(
     generation: CodeGeneration,
     max_instructions: usize,
 ) -> Result<BlockPlan, DsrError> {
+    // Exclusive-region fusion emits the load/store verbatim, which is only sound
+    // in Direct (native16k) addressing. Biased (linux4k) mode needs a scratch
+    // base-register spill -- itself a memory access inside the reservation
+    // window -- so it keeps the trap-and-emulate path (see the emitter's
+    // biased tripwire and `try_fuse_exclusive_region`).
+    let allow_fusion = matches!(
+        memory.address_mode(),
+        super::super::address::NativeAddressMode::Direct
+    );
     plan_with_reader(
         start,
         generation,
         max_instructions,
         memory.linux_page_size,
+        allow_fusion,
         |pc| {
             memory
                 .read_u32(pc.raw())
@@ -306,6 +377,17 @@ fn try_fuse_exclusive_region(
     ) {
         return Ok(None);
     }
+    // The load's transfer register must not be x18/x28 either. native16k keeps
+    // the guest's x18/x28 in a spill slot (physical x18/x28 are carrick's own
+    // reserved registers), so emitting the exclusive verbatim would read/write
+    // the wrong register. The base is already excluded above; this covers the
+    // data register. When it is virtualized, keep the trap path -- the emulator
+    // reads the spill slots correctly.
+    if decode::decoded_operands_mention_x18(load_word, start)
+        || decode::decoded_operands_mention_x28(load_word, start)
+    {
+        return Ok(None);
+    }
 
     let load_shape = decode::exclusive_shape(load_memory.op);
     let mut instructions = vec![PlannedInst {
@@ -314,6 +396,7 @@ fn try_fuse_exclusive_region(
     }];
     let mut pc = checked_next(start)?;
     let mut found_exit_branch = false;
+    let mut early_exit_word: Option<u32> = None;
     let mut store: Option<(GuestVa, u32)> = None;
 
     for _ in 1..EXCLUSIVE_REGION_SCAN_LIMIT {
@@ -337,10 +420,23 @@ fn try_fuse_exclusive_region(
             let shape_matches = load_shape
                 .zip(decode::exclusive_shape(memory.op))
                 .is_some_and(|(load, store)| load == store);
+            // bad64 collapses the W- and X-form single-register exclusives onto
+            // one `Op`/shape, so `ldxr w`+`stxr x` share a shape. Re-derive the
+            // exact access width from the raw size field (bits [31:30]) and
+            // require an exact match on top of the shape check; a width- or
+            // sign-mismatched pair must NOT fuse -- verbatim native emission of
+            // such a pair would tear the guest's atomic.
+            let width_matches = (load_word >> 30) == (word >> 30);
+            // The store's transfer/status registers must likewise avoid x18/x28
+            // (see the load check above).
+            let store_uses_reserved = decode::decoded_operands_mention_x18(word, pc)
+                || decode::decoded_operands_mention_x28(word, pc);
             let is_matching_store = kind == decode::ExclusiveKind::Store
                 && memory.base == load_memory.base
                 && !matches!(memory.base, MemoryBase::VirtualX18 | MemoryBase::VirtualX28)
-                && shape_matches;
+                && shape_matches
+                && width_matches
+                && !store_uses_reserved;
             if !is_matching_store {
                 // Another exclusive access (a second load, or a store to a
                 // different address) inside the region: not the canonical
@@ -363,10 +459,19 @@ fn try_fuse_exclusive_region(
                 if found_exit_branch
                     || exit.target == start
                     || matches!(exit.kind, DirectKind::Branch | DirectKind::Call)
+                    // A branch testing x18/x28 would need the guest register
+                    // spilled into a scratch to evaluate natively -- another
+                    // memory access inside the reservation window. Keep the
+                    // trap path.
+                    || decode::decoded_operands_mention_x18(word, pc)
+                    || decode::decoded_operands_mention_x28(word, pc)
                 {
                     return Ok(None);
                 }
                 found_exit_branch = true;
+                // The raw word is dropped from `InstAction::Direct`; capture it
+                // so the emitter can re-encode the early-exit edge verbatim.
+                early_exit_word = Some(word);
                 instructions.push(PlannedInst { guest: pc, action });
             }
             // Everything else (an ordinary memory access, a PC-relative
@@ -396,6 +501,10 @@ fn try_fuse_exclusive_region(
     };
     if retry_exit.target != start
         || matches!(retry_exit.kind, DirectKind::Branch | DirectKind::Call)
+        // As with the early-exit branch: a retry branch testing x18/x28 would
+        // need a spill to evaluate natively. Keep the trap path.
+        || decode::decoded_operands_mention_x18(retry_word, retry_pc)
+        || decode::decoded_operands_mention_x28(retry_word, retry_pc)
     {
         return Ok(None);
     }
@@ -409,6 +518,8 @@ fn try_fuse_exclusive_region(
             retry_edge: start,
             load_word,
             store_word,
+            retry_word,
+            early_exit_word,
         },
     )))
 }
@@ -465,6 +576,7 @@ mod tests {
             CodeGeneration::INITIAL,
             max_instructions,
             page_size,
+            false,
             |pc| {
                 reads += 1;
                 let offset = usize::try_from((pc.raw() - start.raw()) / 4)
@@ -932,6 +1044,223 @@ mod tests {
             let plan = exclusive_region_words(&words, start, LDAXR_W0_X1, true, 0x1000)
                 .expect("scan must not error");
             assert!(plan.is_none());
+        }
+
+        /// Replace the encoded transfer register (Rt, bits [4:0]) of a
+        /// single-register exclusive access word.
+        fn with_data_register(word: u32, index: u32) -> u32 {
+            (word & !0x1f) | index
+        }
+
+        /// The width gate the reviewer flagged: bad64 collapses the W- and
+        /// X-form single-register exclusives onto one `Op`/shape, so
+        /// `ldaxr w0,[x1]` (32-bit) and a same-base `stlxr x3,x4,[x1]` (64-bit)
+        /// share a shape and base -- only re-deriving the raw size field
+        /// (bits [31:30]) rejects the pairing. A verbatim native emission of
+        /// such a mismatched pair would tear the guest atomic, so it must NOT
+        /// fuse.
+        #[test]
+        fn falls_back_on_a_word_load_with_a_doubleword_store() {
+            let start = GuestVa(0x4000);
+            // stlxr x3, x4, [x1] -- 64-bit form (size bits [31:30] = 0b11),
+            // versus the word-width (0b10) load. Same Op/shape and base as
+            // STLXR_W3_W4_X1.
+            let stlxr_x3_x4_x1 = STLXR_W3_W4_X1 | 0x4000_0000;
+            assert_eq!(stlxr_x3_x4_x1, 0xc803_fc24);
+            let words = [
+                LDAXR_W0_X1,
+                stlxr_x3_x4_x1,
+                encode_cbnz_w(GuestVa(0x4008), start, 3),
+            ];
+            let plan = exclusive_region_words(&words, start, LDAXR_W0_X1, true, 0x1000)
+                .expect("scan must not error");
+            assert!(plan.is_none());
+        }
+
+        /// The load's transfer register must not be x18/x28: native16k keeps the
+        /// guest's x18/x28 in a spill slot, so a verbatim `ldaxr w18,[x1]` would
+        /// clobber carrick's reserved physical x18. Keep the trap path.
+        #[test]
+        fn falls_back_when_the_load_targets_a_reserved_register() {
+            let start = GuestVa(0x4000);
+            let load_word = with_data_register(LDAXR_W0_X1, 18);
+            let words = [
+                load_word,
+                STLXR_W3_W4_X1,
+                encode_cbnz_w(GuestVa(0x4008), start, 3),
+            ];
+            let plan = exclusive_region_words(&words, start, load_word, true, 0x1000)
+                .expect("scan must not error");
+            assert!(plan.is_none());
+        }
+
+        /// The store's data/status registers must likewise avoid x18/x28.
+        #[test]
+        fn falls_back_when_the_store_uses_a_reserved_register() {
+            let start = GuestVa(0x4000);
+            let store_word = with_data_register(STLXR_W3_W4_X1, 28);
+            let words = [
+                LDAXR_W0_X1,
+                store_word,
+                encode_cbnz_w(GuestVa(0x4008), start, 3),
+            ];
+            let plan = exclusive_region_words(&words, start, LDAXR_W0_X1, true, 0x1000)
+                .expect("scan must not error");
+            assert!(plan.is_none());
+        }
+
+        /// A retry branch testing x18/x28 would need a native spill to evaluate
+        /// (a memory access in the reservation window), so it must not fuse.
+        #[test]
+        fn falls_back_when_the_retry_branch_uses_a_reserved_register() {
+            let start = GuestVa(0x4000);
+            // cbnz w18, top -- the retry branch tests carrick's reserved x18.
+            let retry = encode_cbnz_w(GuestVa(0x4008), start, 18);
+            let words = [LDAXR_W0_X1, STLXR_W3_W4_X1, retry];
+            let plan = exclusive_region_words(&words, start, LDAXR_W0_X1, true, 0x1000)
+                .expect("scan must not error");
+            assert!(plan.is_none());
+        }
+
+        /// Plan the block via the PRODUCTION planner (`plan_with_reader`), the
+        /// exact path `plan_block` drives, to exercise the wiring: a block that
+        /// starts at a fusible exclusive load produces an `ExclusiveRegion`
+        /// exit, not a zero-instruction `Sensitive` one.
+        fn plan_via_production(
+            words: &[u32],
+            start: GuestVa,
+            allow_fusion: bool,
+            page_size: u64,
+        ) -> BlockPlan {
+            plan_with_reader(
+                start,
+                CodeGeneration::INITIAL,
+                256,
+                page_size,
+                allow_fusion,
+                |pc| {
+                    let offset = usize::try_from((pc.raw() - start.raw()) / 4)
+                        .map_err(|_| DsrError::BlockPolicy("test offset overflow".to_string()))?;
+                    words
+                        .get(offset)
+                        .copied()
+                        .ok_or_else(|| DsrError::MemoryRead {
+                            pc: pc.raw(),
+                            detail: "test region exhausted".to_string(),
+                        })
+                },
+            )
+            .expect("plan production block")
+        }
+
+        fn canonical_cas(start: GuestVa) -> [u32; 6] {
+            let branch_pc = GuestVa(start.raw() + 8);
+            let retry_pc = GuestVa(start.raw() + 16);
+            let out_pc = GuestVa(start.raw() + 20);
+            [
+                LDAXR_W0_X1,
+                CMP_W0_W2,
+                encode_b_cond(branch_pc, out_pc, COND_NE),
+                STLXR_W3_W4_X1,
+                encode_cbnz_w(retry_pc, start, 3),
+                SVC0,
+            ]
+        }
+
+        #[test]
+        fn production_planner_fuses_a_leading_exclusive_region_when_allowed() {
+            let start = GuestVa(0x4000);
+            let plan = plan_via_production(&canonical_cas(start), start, true, 0x1000);
+            match plan.exit {
+                PlannedExit::ExclusiveRegion { guest, exit, .. } => {
+                    assert_eq!(guest, start);
+                    assert_eq!(exit.start, start);
+                    assert_eq!(exit.end, GuestVa(0x4014));
+                    assert_eq!(exit.store_word, STLXR_W3_W4_X1);
+                    assert_eq!(exit.retry_word, encode_cbnz_w(GuestVa(0x4010), start, 3));
+                    assert_eq!(
+                        exit.early_exit_word,
+                        Some(encode_b_cond(GuestVa(0x4008), GuestVa(0x4014), COND_NE))
+                    );
+                }
+                other => panic!("expected fused ExclusiveRegion, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn production_planner_keeps_the_trap_path_when_fusion_is_disallowed() {
+            let start = GuestVa(0x4000);
+            // Biased (linux4k) mode passes `allow_fusion = false`; the exclusive
+            // load must remain a zero-instruction Sensitive exit (the trap path,
+            // and the biased tripwire's precondition).
+            let plan = plan_via_production(&canonical_cas(start), start, false, 0x1000);
+            assert!(plan.instructions.is_empty());
+            assert!(matches!(
+                plan.exit,
+                PlannedExit::Sensitive {
+                    guest: GuestVa(0x4000),
+                    ..
+                }
+            ));
+        }
+
+        #[test]
+        fn production_planner_splits_before_a_mid_block_fusible_load() {
+            let start = GuestVa(0x4000);
+            let load_pc = GuestVa(0x4004);
+            // A NOP precedes the CAS loop, so the exclusive load is NOT the
+            // block's first instruction (this is the common shape: compilers
+            // load the CAS operands before the exclusive load). The block must
+            // END just before the load with a Continue, so the load starts a
+            // fresh, fusible block.
+            let nop = 0xd503_201f;
+            let mut words = vec![nop];
+            words.extend_from_slice(&canonical_cas(load_pc));
+            let plan = plan_via_production(&words, start, true, 0x1000);
+            assert_eq!(plan.instructions.len(), 1, "only the leading NOP");
+            assert!(matches!(
+                plan.exit,
+                PlannedExit::Continue {
+                    target: GuestVa(0x4004),
+                    limit: BlockLimit::ExclusiveRegionSplit,
+                }
+            ));
+
+            // Translating from the load PC (the split target) now fuses, because
+            // the load is the block's first instruction.
+            let load_plan = plan_via_production(&canonical_cas(load_pc), load_pc, true, 0x1000);
+            assert!(matches!(
+                load_plan.exit,
+                PlannedExit::ExclusiveRegion {
+                    guest: GuestVa(0x4004),
+                    ..
+                }
+            ));
+        }
+
+        #[test]
+        fn production_planner_does_not_split_before_a_non_fusible_mid_block_load() {
+            let start = GuestVa(0x4000);
+            // A NOP, then an exclusive load whose store is width-mismatched
+            // (not fusible). The load must stay a Sensitive (trap) exit -- no
+            // split -- so the non-fused trap path is unchanged.
+            let nop = 0xd503_201f;
+            let load = LDAXR_W0_X1;
+            let bad_store = STLXR_W3_W4_X1 | 0x4000_0000; // 64-bit store vs 32-bit load
+            let words = [
+                nop,
+                load,
+                bad_store,
+                encode_cbnz_w(GuestVa(0x400c), GuestVa(0x4004), 3),
+            ];
+            let plan = plan_via_production(&words, start, true, 0x1000);
+            assert!(matches!(
+                plan.exit,
+                PlannedExit::Sensitive {
+                    guest: GuestVa(0x4004),
+                    ..
+                }
+            ));
         }
     }
 }
