@@ -6638,6 +6638,55 @@ fn emulate_linux4k_guarded_fault(
     Ok(())
 }
 
+/// A reference-counted temporary lift of a single PROTECTED host guest page.
+///
+/// `prepare_temporary_host_access` flips a bookkept-PROTECTED page to
+/// accessible via a process-global `mprotect` so a supervisor copy can touch
+/// the backing, then `restore_temporary_host_access` flips it back. Because the
+/// non-mutating syscall path now runs under a shared memory-`RwLock` read guard
+/// (Task 6), two accessors can lift/restore the SAME page concurrently; without
+/// coordination one accessor's restore would strand another mid-copy with a
+/// PROT_NONE page (host SIGSEGV). This record keeps a page lifted while ANY
+/// accessor holds it and restores it to `original_prot` only when the LAST one
+/// leaves.
+#[derive(Debug)]
+struct HostLift {
+    /// Number of in-flight accessors currently relying on this page's lift.
+    refcount: u32,
+    /// The protection to restore once the final accessor releases -- the page's
+    /// bookkept native protection at the time of the first lift.
+    original_prot: libc::c_int,
+    /// The protection the page is currently mprotect-ed to; monotonically
+    /// upgraded (never downgraded before refcount 0) so a reader-then-writer
+    /// overlap ends up at RW and stays there until both release.
+    lifted_prot: libc::c_int,
+}
+
+/// RAII backstop that runs `restore_temporary_host_access` on drop while
+/// `armed`, so a temporary host-page lift's refcount is never stranded if the
+/// window between prepare and restore unwinds or exits early. Callers disarm it
+/// and restore explicitly on the success path to preserve restore-error
+/// propagation.
+struct HostLiftRestoreGuard<'a> {
+    memory: &'a NativeMappedMemory,
+    changed: &'a [(u64, libc::c_int)],
+    address: u64,
+    length: usize,
+    armed: bool,
+}
+
+impl Drop for HostLiftRestoreGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            // Best-effort: a Drop cannot propagate the restore error, but the
+            // refcount decrement happens regardless so no lift is leaked.
+            let _ =
+                self.memory
+                    .restore_temporary_host_access(self.changed, self.address, self.length);
+        }
+    }
+}
+
 struct NativeMappedMemory {
     address_mode: NativeAddressMode,
     // Host-coordinate authority for image retirement, biased fixed remaps,
@@ -6663,6 +6712,15 @@ struct NativeMappedMemory {
     linux_page_size: u64,
     dsr_generations: dsr::cache::PageGenerationTable,
     dsr_translator: Option<Arc<dsr::ProcessTranslator>>,
+    // Reference-counted temporary host-page lifts (see [`HostLift`]). Keyed by
+    // the guest page address recorded in each accessor's `changed` list.
+    // Interior-mutable so `prepare_temporary_host_access`/
+    // `restore_temporary_host_access` stay `&self` (REQUIRED: they run under the
+    // shared memory-`RwLock` read guard). This is a LEAF lock -- while it is
+    // held we only touch the map, call `host_address` (pure arithmetic), and
+    // `set_host_prot` (a bare `mprotect`, or the test spy); never another lock
+    // or the memory `RwLock`. The no-lift fast path never acquires it.
+    host_access_lifts: parking_lot::Mutex<std::collections::HashMap<u64, HostLift>>,
 }
 
 struct PreparedNativeExecMapping {
@@ -7381,6 +7439,7 @@ impl NativeMappedMemory {
                 native_write_exec_writable_pages: BTreeSet::new(),
                 linux4k_page_protections: BTreeMap::new(),
                 exclusive_sequences: parking_lot::Mutex::new(BTreeMap::new()),
+                host_access_lifts: parking_lot::Mutex::new(std::collections::HashMap::new()),
                 host_page_size: page_sizes.host,
                 linux_page_size: page_sizes.linux,
                 dsr_generations: dsr::cache::PageGenerationTable::new(page_sizes.host)
@@ -8168,11 +8227,22 @@ impl NativeMappedMemory {
             .host_address(carrick_guest_mem::GuestVa(address))?
             .raw() as *mut u8;
         let changed = self.prepare_temporary_host_access(address, length, true)?;
+        // Balance the lift refcount even if the copy unwinds or a future
+        // fallible step is inserted before the explicit restore below. The
+        // success path DISARMS the guard and restores explicitly so a restore
+        // error still propagates; the guard only fires on early exit.
+        let mut restore_on_unwind = HostLiftRestoreGuard {
+            memory: self,
+            changed: &changed,
+            address,
+            length,
+            armed: true,
+        };
         unsafe {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, length);
         }
-        self.restore_temporary_host_access(&changed, address, length)?;
-        Ok(())
+        restore_on_unwind.armed = false;
+        self.restore_temporary_host_access(&changed, address, length)
     }
 
     /// The exclusive-monitor bump plus the conditional DSR code-mutation note
@@ -8196,9 +8266,14 @@ impl NativeMappedMemory {
 
     /// The COMMON (non-exec-page) guest-RAM write path: bump the exclusive
     /// monitor, note a DSR code mutation when the range may execute, and copy
-    /// the bytes into the host backing. Takes `&self` -- the only state this
-    /// touches is the interior-mutable `exclusive_sequences` map (Task 1) and
-    /// `dsr_generations` (already interior-mutable); it never mutates
+    /// the bytes into the host backing. Takes `&self` -- the shared state it
+    /// touches is all interior-mutable: the `exclusive_sequences` map (Task 1),
+    /// `dsr_generations` (already interior-mutable), and -- when the copy must
+    /// temporarily lift a bookkept-PROTECTED host page -- the reference-counted
+    /// `host_access_lifts` table (Task 6), which keeps that page accessible for
+    /// the whole copy window and serializes the lift/restore `mprotect`s so two
+    /// concurrent read-guard accessors cannot strand each other with a
+    /// PROT_NONE page. It never mutates
     /// `native_write_exec_writable_pages`/`native_page_protections`, so it
     /// never needs to run under a write lock. Callers that may hit a native16k
     /// write-exec page must use [`Self::write_exec_page_bytes`] instead.
@@ -8643,36 +8718,113 @@ impl NativeMappedMemory {
         } else {
             libc::PROT_READ
         };
+        // The lift-table guard is acquired LAZILY: the common native16k case
+        // where every touched page already grants `required` never lifts a
+        // page, so it never takes the lock and stays fully concurrent.
+        let mut lifts: Option<
+            parking_lot::MutexGuard<'_, std::collections::HashMap<u64, HostLift>>,
+        > = None;
         for (start, end) in self.host_protected_overlaps(address, len) {
             let (page_start, page_len) = self.host_page_range(start, end)?;
             let page_end = page_start.saturating_add(page_len as u64);
+
+            // Phase 1: under the lift-table lock, decide the mprotect target for
+            // each page that still needs lifting -- `Some(prot)` means this
+            // accessor is the first to require `prot` (a fresh lift or an
+            // upgrade of an existing one); `None` means a concurrent accessor
+            // already holds the page at >= `required`. Table state is only READ
+            // here (committed in phase 3); pages never repeat within one call,
+            // so an earlier decision cannot invalidate a later one. Pages that
+            // already grant `required` are the lock-free fast path and are
+            // skipped entirely.
+            let mut pending: Vec<(u64, libc::c_int, Option<libc::c_int>)> = Vec::new();
             let mut page = page_start;
-            // Adjacent pages that all need the same lift merge into one
-            // mprotect call; the per-page restore records stay exact.
-            let mut run: Option<(u64, usize)> = None;
             while page < page_end {
                 let restore = self.native_host_prot_for_page(page);
                 if restore & required != required {
-                    changed.push((page, restore));
-                    run = match run {
-                        Some((run_start, run_pages)) => Some((run_start, run_pages + 1)),
-                        None => Some((page, 1)),
+                    let table = lifts.get_or_insert_with(|| self.host_access_lifts.lock());
+                    let target = match table.get(&page) {
+                        None => Some(required),
+                        Some(lift) if lift.lifted_prot & required != required => {
+                            Some(lift.lifted_prot | required)
+                        }
+                        Some(_) => None,
                     };
-                } else if let Some((run_start, run_pages)) = run.take() {
-                    set_host_prot(
-                        self.host_address(carrick_guest_mem::GuestVa(run_start))?,
-                        host_page_len * run_pages,
-                        required,
-                    )?;
+                    pending.push((page, restore, target));
                 }
                 page = page.saturating_add(self.host_page_size);
             }
-            if let Some((run_start, run_pages)) = run {
+
+            // Phase 2: execute the mprotects. Contiguous pages needing the SAME
+            // target coalesce into one call (preserving the pre-refcount
+            // behavior for the single-accessor case); a page with no target
+            // (already lifted by a peer) breaks the run. Done BEFORE any table
+            // mutation so a failing mprotect leaks no refcount.
+            let mut run: Option<(u64, usize, libc::c_int)> = None;
+            for &(page, _restore, target) in &pending {
+                match target {
+                    Some(target_prot) => {
+                        run = match run {
+                            Some((run_start, run_pages, run_prot))
+                                if run_prot == target_prot
+                                    && run_start
+                                        .saturating_add(run_pages as u64 * self.host_page_size)
+                                        == page =>
+                            {
+                                Some((run_start, run_pages + 1, run_prot))
+                            }
+                            Some((run_start, run_pages, run_prot)) => {
+                                set_host_prot(
+                                    self.host_address(carrick_guest_mem::GuestVa(run_start))?,
+                                    host_page_len * run_pages,
+                                    run_prot,
+                                )?;
+                                Some((page, 1, target_prot))
+                            }
+                            None => Some((page, 1, target_prot)),
+                        };
+                    }
+                    None => {
+                        if let Some((run_start, run_pages, run_prot)) = run.take() {
+                            set_host_prot(
+                                self.host_address(carrick_guest_mem::GuestVa(run_start))?,
+                                host_page_len * run_pages,
+                                run_prot,
+                            )?;
+                        }
+                    }
+                }
+            }
+            if let Some((run_start, run_pages, run_prot)) = run {
                 set_host_prot(
                     self.host_address(carrick_guest_mem::GuestVa(run_start))?,
                     host_page_len * run_pages,
-                    required,
+                    run_prot,
                 )?;
+            }
+
+            // Phase 3: every mprotect for this overlap landed, so commit the
+            // refcounts. A fresh page inserts refcount 1 with its original
+            // protection; an already-lifted page increments and upgrades
+            // `lifted_prot` (idempotent when no upgrade was needed). Each page is
+            // recorded once per visit in `changed` so restore decrements it once.
+            if let Some(table) = lifts.as_mut() {
+                for &(page, restore, _target) in &pending {
+                    if let Some(lift) = table.get_mut(&page) {
+                        lift.refcount = lift.refcount.saturating_add(1);
+                        lift.lifted_prot |= required;
+                    } else {
+                        table.insert(
+                            page,
+                            HostLift {
+                                refcount: 1,
+                                original_prot: restore,
+                                lifted_prot: required,
+                            },
+                        );
+                    }
+                    changed.push((page, restore));
+                }
             }
         }
         Ok(changed)
@@ -8697,16 +8849,51 @@ impl NativeMappedMemory {
     where
         F: FnMut(carrick_guest_mem::HostVa, usize, libc::c_int) -> Result<(), MemoryError>,
     {
+        // The no-lift fast path records nothing, so it never takes the lock.
+        if changed.is_empty() {
+            return Ok(());
+        }
         let host_page_len =
             usize::try_from(self.host_page_size).map_err(|_| MemoryError::OutOfBounds {
                 address,
                 length: len,
             })?;
-        // Restore in the same reverse order as before, but merge adjacent
-        // pages whose recorded original protection is identical into one
-        // mprotect call. Pages with differing restore values keep their own
-        // exact call.
-        let mut entries = changed.iter().rev().peekable();
+
+        // Under the lift-table lock, decrement each recorded page's refcount and
+        // collect the pages THIS accessor is the last to release (refcount hit
+        // 0). Pages still held by a concurrent accessor stay lifted and are not
+        // restored here. A missing entry -- e.g. a direct `restore_with` unit
+        // test, or a page whose lift was never tracked -- falls back to the
+        // recorded protection so a page is never left stranded. The mprotect
+        // stays inside the critical section: removing the entry and restoring
+        // the protection must be atomic against a concurrent `prepare` that
+        // could otherwise re-lift the page in between.
+        let mut lifts = self.host_access_lifts.lock();
+        let mut to_restore: Vec<(u64, libc::c_int)> = Vec::with_capacity(changed.len());
+        for &(page, restore) in changed {
+            match lifts.entry(page) {
+                std::collections::hash_map::Entry::Occupied(mut occupied) => {
+                    let refcount = {
+                        let lift = occupied.get_mut();
+                        lift.refcount = lift.refcount.saturating_sub(1);
+                        lift.refcount
+                    };
+                    if refcount == 0 {
+                        let original = occupied.get().original_prot;
+                        occupied.remove();
+                        to_restore.push((page, original));
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(_) => {
+                    to_restore.push((page, restore));
+                }
+            }
+        }
+
+        // Restore in the same reverse order as before, merging adjacent pages
+        // whose target protection is identical into one mprotect call. Pages
+        // with differing prots keep their own exact call.
+        let mut entries = to_restore.iter().rev().peekable();
         while let Some(&(page_start, restore)) = entries.next() {
             let mut run_start = page_start;
             let mut run_pages = 1_usize;
@@ -9352,9 +9539,19 @@ impl GuestMemory for NativeMappedMemory {
             .raw() as *const u8;
         let mut out = vec![0u8; length];
         let changed = self.prepare_temporary_host_access(address, length, false)?;
+        // See `copy_bytes_to_host`: keep the lift refcount balanced on an early
+        // exit, disarm and restore explicitly on the success path.
+        let mut restore_on_unwind = HostLiftRestoreGuard {
+            memory: self,
+            changed: &changed,
+            address,
+            length,
+            armed: true,
+        };
         unsafe {
             std::ptr::copy_nonoverlapping(ptr, out.as_mut_ptr(), length);
         }
+        restore_on_unwind.armed = false;
         self.restore_temporary_host_access(&changed, address, length)?;
         Ok(out)
     }
@@ -10428,6 +10625,7 @@ mod tests {
             native_write_exec_writable_pages: BTreeSet::new(),
             linux4k_page_protections: BTreeMap::new(),
             exclusive_sequences: parking_lot::Mutex::new(BTreeMap::new()),
+            host_access_lifts: parking_lot::Mutex::new(std::collections::HashMap::new()),
             host_page_size: 16 * 1024,
             linux_page_size,
             dsr_generations: dsr::cache::PageGenerationTable::new(16 * 1024)
@@ -12443,6 +12641,7 @@ mod tests {
             native_write_exec_writable_pages: BTreeSet::new(),
             linux4k_page_protections: BTreeMap::new(),
             exclusive_sequences: parking_lot::Mutex::new(BTreeMap::new()),
+            host_access_lifts: parking_lot::Mutex::new(std::collections::HashMap::new()),
             host_page_size: 16 * 1024,
             linux_page_size: 16 * 1024,
             dsr_generations: dsr::cache::PageGenerationTable::new(16 * 1024)
@@ -12575,6 +12774,7 @@ mod tests {
             native_write_exec_writable_pages: BTreeSet::new(),
             linux4k_page_protections: BTreeMap::new(),
             exclusive_sequences: parking_lot::Mutex::new(BTreeMap::new()),
+            host_access_lifts: parking_lot::Mutex::new(std::collections::HashMap::new()),
             host_page_size: 16 * 1024,
             linux_page_size: 16 * 1024,
             dsr_generations: dsr::cache::PageGenerationTable::new(16 * 1024)
@@ -13289,6 +13489,7 @@ mod tests {
             native_write_exec_writable_pages: BTreeSet::new(),
             linux4k_page_protections: BTreeMap::new(),
             exclusive_sequences: parking_lot::Mutex::new(BTreeMap::new()),
+            host_access_lifts: parking_lot::Mutex::new(std::collections::HashMap::new()),
             host_page_size: page_size,
             linux_page_size: page_size,
             dsr_generations: dsr::cache::PageGenerationTable::new(page_size)
@@ -14048,6 +14249,73 @@ mod tests {
                 ],
                 "adjacent pages with the same recorded prot must restore in one call; \
                  differing prots must stay exact per page"
+            );
+        });
+    }
+
+    #[test]
+    fn temporary_host_access_refcounts_overlapping_lifts() {
+        fork_test(|| {
+            let page = 16 * 1024_u64;
+            let guest = carrick_guest_mem::GuestVa(0x40_0000);
+            let mut memory = biased_test_memory_with_geometry(guest, page as usize, 16 * 1024);
+            // Bookkeep the single page as guest PROT_NONE so EVERY accessor must
+            // lift it before it can touch the backing.
+            memory.native_page_protections.insert(guest.raw(), 0);
+            let host_base = memory.host_address(guest).expect("host base").raw();
+            let host_page = 16 * 1024_usize;
+            let rw = libc::PROT_READ | libc::PROT_WRITE;
+
+            let calls = RefCell::new(Vec::new());
+            let mut record = |host_va: carrick_guest_mem::HostVa, len: usize, prot: libc::c_int| {
+                calls.borrow_mut().push((host_va.raw(), len, prot));
+                Ok(())
+            };
+
+            // Two overlapping accessors lift the SAME protected page while both
+            // hold the shared (read-guard) memory borrow. Before Task 6 the
+            // process-wide memory mutex made this impossible; now the refcounted
+            // lift table must keep the page accessible for BOTH windows and flip
+            // it back exactly once, only when the LAST accessor releases.
+            let changed_a = memory
+                .prepare_temporary_host_access_with(guest.raw(), page as usize, true, &mut record)
+                .expect("prepare A");
+            let changed_b = memory
+                .prepare_temporary_host_access_with(guest.raw(), page as usize, true, &mut record)
+                .expect("prepare B");
+            // Releasing accessor A must NOT restore -- accessor B is still
+            // mid-window and would be stranded with a PROT_NONE page.
+            memory
+                .restore_temporary_host_access_with(
+                    &changed_a,
+                    guest.raw(),
+                    page as usize,
+                    &mut record,
+                )
+                .expect("restore A");
+            // Releasing the last accessor restores the page exactly once.
+            memory
+                .restore_temporary_host_access_with(
+                    &changed_b,
+                    guest.raw(),
+                    page as usize,
+                    &mut record,
+                )
+                .expect("restore B");
+
+            assert_eq!(
+                *calls.borrow(),
+                vec![
+                    (host_base, host_page, rw),
+                    (host_base, host_page, libc::PROT_NONE),
+                ],
+                "overlapping lifts must mprotect the shared page up exactly once and \
+                 back exactly once, only at the final release",
+            );
+            // No refcount leaked: the final release removed the table entry.
+            assert!(
+                memory.host_access_lifts.lock().is_empty(),
+                "the last release must remove the lift entry",
             );
         });
     }
