@@ -2553,11 +2553,14 @@ fn lower_dsr_fault(
         host_fault && matches!(memory.address_mode(), NativeAddressMode::Biased { .. });
     let fault_address = lower_dsr_fault_address(&memory.read(), fault_address)?.raw();
     if biased_host_fault {
-        let memory = memory.read();
+        // Lock-free (Phase 0): the Biased-mode reverse translation only
+        // needs `address_mode`/`owned_host_ranges`, both served by the
+        // lock-free `NativeMemoryConfig` -- no need to take the big memory
+        // `RwLock` just for this.
         if snapshot.far != 0 {
             let far = usize::try_from(snapshot.far)
                 .ok()
-                .and_then(|far| memory.guest_fault_address(carrick_guest_mem::HostVa(far)));
+                .and_then(|far| memory.biased_guest_fault_address(carrick_guest_mem::HostVa(far)));
             snapshot.far = far
                 .ok_or_else(|| {
                     RuntimeError::Unsupported(format!(
@@ -2570,7 +2573,9 @@ fn lower_dsr_fault(
         if snapshot.fault_address != 0 {
             let snapshot_fault = usize::try_from(snapshot.fault_address)
                 .ok()
-                .and_then(|address| memory.guest_fault_address(carrick_guest_mem::HostVa(address)));
+                .and_then(|address| {
+                    memory.biased_guest_fault_address(carrick_guest_mem::HostVa(address))
+                });
             snapshot.fault_address = snapshot_fault
                 .ok_or_else(|| {
                     RuntimeError::Unsupported(format!(
@@ -6915,9 +6920,9 @@ mod tests {
         let host_bias = address::NativeHostBias::new(bias, 16 * 1024).expect("aligned bias");
         NativeMappedMemory {
             address_mode: NativeAddressMode::Biased { host_bias },
-            owned_host_ranges: vec![
+            owned_host_ranges: Arc::new(vec![
                 carrick_guest_mem::HostVa(host_start)..carrick_guest_mem::HostVa(host_start + len),
-            ],
+            ]),
             regions: vec![NativeMappedRegion {
                 start: guest_start.raw(),
                 end: guest_start.raw() + len as u64,
@@ -7500,17 +7505,20 @@ mod tests {
             let expected_mode = memory.address_mode();
             let expected_host_page_size = memory.host_page_size;
             let expected_linux_page_size = memory.linux_page_size;
+            let expected_owned_host_ranges = memory.owned_host_ranges.clone();
             let shared: SharedNativeMemory = Arc::new(NativeMemoryHandle::new(memory));
             // `parking_lot::RwLock` is not reentrant: holding a write guard
             // on the big `RwLock<NativeMappedMemory>` here means any of
-            // these three accessors would self-deadlock this very thread if
+            // these four accessors would self-deadlock this very thread if
             // they internally acquired that same lock. Completing without
             // hanging proves they read the separate `NativeMemoryConfig`
-            // lock instead (Task 8).
+            // lock instead (Task 8; `owned_host_ranges` joined it in
+            // Phase 0 of the mmap-writer lock-free-reads refactor).
             let _write_guard = shared.write();
             assert_eq!(shared.address_mode(), expected_mode);
             assert_eq!(shared.host_page_size(), expected_host_page_size);
             assert_eq!(shared.linux_page_size(), expected_linux_page_size);
+            assert_eq!(shared.owned_host_ranges(), expected_owned_host_ranges);
         });
     }
 
@@ -7681,7 +7689,7 @@ mod tests {
             .address_mode()
             .to_host(carrick_guest_mem::GuestVa(0))
             .expect("translate guest null");
-        memory.owned_host_ranges = vec![host_bias..mapped.end];
+        memory.owned_host_ranges = Arc::new(vec![host_bias..mapped.end]);
 
         assert_eq!(
             lower_dsr_fault_address(&memory, dsr::ThreadFaultAddress::Host(host_bias),)
@@ -8537,6 +8545,11 @@ mod tests {
             .expect("map source lifecycle image");
             let shared: SharedNativeMemory = Arc::new(NativeMemoryHandle::new(memory));
             assert_eq!(shared.address_mode(), NativeAddressMode::Direct);
+            let source_owned_host_ranges = shared.owned_host_ranges();
+            assert!(
+                !source_owned_host_ranges.is_empty(),
+                "source image must own at least one host range"
+            );
 
             let prepared = shared
                 .read()
@@ -8558,6 +8571,13 @@ mod tests {
             assert_eq!(shared.address_mode(), guard.address_mode());
             assert_eq!(shared.host_page_size(), guard.host_page_size);
             assert_eq!(shared.linux_page_size(), guard.linux_page_size);
+            assert_eq!(shared.owned_host_ranges(), guard.owned_host_ranges);
+            assert_ne!(
+                shared.owned_host_ranges(),
+                source_owned_host_ranges,
+                "replace_image must refresh owned_host_ranges to the new image's ranges, \
+                 not leave the pre-execve source-image ranges behind"
+            );
         });
     }
 
@@ -9209,7 +9229,7 @@ mod tests {
         let stack_end = stack_start + stack.len() as u64;
         let memory = NativeMappedMemory {
             address_mode: NativeAddressMode::Direct,
-            owned_host_ranges: Vec::new(),
+            owned_host_ranges: Arc::new(Vec::new()),
             regions: vec![NativeMappedRegion {
                 start: stack_start,
                 end: stack_end,
@@ -9342,7 +9362,7 @@ mod tests {
         let stack_end = stack_start + stack.len() as u64;
         let memory = NativeMappedMemory {
             address_mode: NativeAddressMode::Direct,
-            owned_host_ranges: Vec::new(),
+            owned_host_ranges: Arc::new(Vec::new()),
             regions: vec![NativeMappedRegion {
                 start: stack_start,
                 end: stack_end,
@@ -10064,10 +10084,10 @@ mod tests {
         let owned_start = 0x80_0000_4000_usize;
         let memory = NativeMappedMemory {
             address_mode: NativeAddressMode::Biased { host_bias: bias },
-            owned_host_ranges: vec![
+            owned_host_ranges: Arc::new(vec![
                 carrick_guest_mem::HostVa(owned_start)
                     ..carrick_guest_mem::HostVa(owned_start + page_size as usize),
-            ],
+            ]),
             regions: Vec::new(),
             protections: MemoryProtections::default(),
             native_page_protections: BTreeMap::new(),
@@ -12666,7 +12686,7 @@ mod tests {
     }
 
     fn retire_native_test_mapping(memory: &NativeMappedMemory) {
-        for range in &memory.owned_host_ranges {
+        for range in memory.owned_host_ranges.iter() {
             let len = range
                 .end
                 .raw()
