@@ -11,21 +11,31 @@ pub(super) const VM_INHERIT_SHARE: libc::c_int = 0;
 pub(super) const VM_INHERIT_COPY: libc::c_int = 1;
 
 /// Immutable-after-image-load memory configuration: `address_mode`,
-/// `host_page_size`, and `linux_page_size` are set once when an image is
-/// mapped and only ever rewritten (all three together) by
+/// `host_page_size`, `linux_page_size`, and `owned_host_ranges` are set once
+/// when an image is mapped and only ever rewritten (all together) by
 /// `NativeMemoryHandle::replace_image` on execve -- a whole-process quiesce,
-/// so a plain snapshot swap is safe. Bundled as one small `Copy` value
-/// behind its own dedicated lock, separate from `NativeMappedMemory`'s big
-/// `RwLock` (which also gates region/protection-table mutation and DSR
-/// translation), so hot-path readers of just these three fields never
-/// contend with that lock. A single lock over all three (rather than
-/// independent atomics per field) also guarantees callers observe a
-/// consistent snapshot instead of a torn read mid-execve.
-#[derive(Clone, Copy, Debug)]
+/// so a plain snapshot swap is safe. Bundled behind its own dedicated lock,
+/// separate from `NativeMappedMemory`'s big `RwLock` (which also gates
+/// region/protection-table mutation and DSR translation), so hot-path
+/// readers of just these fields never contend with that lock. A single lock
+/// over all of them (rather than independent atomics per field) also
+/// guarantees callers observe a consistent snapshot instead of a torn read
+/// mid-execve.
+///
+/// `owned_host_ranges` is `Arc`-wrapped rather than duplicated by value: it
+/// is a `Vec` (unlike the other, `Copy` fields), and `NativeMappedMemory`'s
+/// own cold-path methods (`prepare_exec_mapping`/`replace_image`/
+/// `fixed_mapping_target`) still read it directly off `self` under the big
+/// lock they already hold, exactly as before. The `Arc` here is a cheap
+/// refcount clone of that same allocation, not a second source of truth --
+/// `from_memory` (below) is the only place it's produced, always from the
+/// `NativeMappedMemory` that is about to become (or just became) canonical.
+#[derive(Clone, Debug)]
 pub(super) struct NativeMemoryConfig {
     address_mode: NativeAddressMode,
     host_page_size: u64,
     linux_page_size: u64,
+    owned_host_ranges: Arc<Vec<std::ops::Range<carrick_guest_mem::HostVa>>>,
 }
 
 impl NativeMemoryConfig {
@@ -34,6 +44,7 @@ impl NativeMemoryConfig {
             address_mode: memory.address_mode,
             host_page_size: memory.host_page_size,
             linux_page_size: memory.linux_page_size,
+            owned_host_ranges: Arc::clone(&memory.owned_host_ranges),
         }
     }
 }
@@ -77,6 +88,42 @@ impl NativeMemoryHandle {
         self.config.read().linux_page_size
     }
 
+    /// `owned_host_ranges` without acquiring `self.memory`'s `RwLock` -- see
+    /// `NativeMemoryConfig`'s doc comment. Returns a cheap `Arc` clone (a
+    /// refcount bump, not a copy of the ranges); the caller can then read
+    /// the ranges without holding ANY lock at all. Only exercised directly
+    /// by tests today (`biased_guest_fault_address`, below, is the
+    /// production caller); kept `pub(super)` as the general-purpose
+    /// lock-free accessor future hot-path callers should reach for.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn owned_host_ranges(&self) -> Arc<Vec<std::ops::Range<carrick_guest_mem::HostVa>>> {
+        Arc::clone(&self.config.read().owned_host_ranges)
+    }
+
+    /// Reverse-translates a Biased-mode host fault address to its guest VA
+    /// using only the lock-free `address_mode`/`owned_host_ranges` config --
+    /// mirrors `NativeMappedMemory::guest_fault_address`'s Biased-mode
+    /// branch exactly, without acquiring `self.memory`'s `RwLock`. Callers
+    /// must already know they're in Biased mode (checked via the
+    /// also-lock-free `address_mode()`); Direct mode still needs
+    /// `region_contains`, which remains behind the big lock pending the
+    /// later ArcSwap phases (`docs/superpowers/specs/2026-07-15-mmap-writer-
+    /// lockfree-reads-design.md`).
+    pub(super) fn biased_guest_fault_address(
+        &self,
+        address: carrick_guest_mem::HostVa,
+    ) -> Option<carrick_guest_mem::GuestVa> {
+        let config = self.config.read();
+        if !config
+            .owned_host_ranges
+            .iter()
+            .any(|range| address >= range.start && address < range.end)
+        {
+            return None;
+        }
+        config.address_mode.to_guest(address).ok()
+    }
+
     /// Mirrors `NativeMappedMemory::uses_linux4k_subpages`, backed by the
     /// same immutable-after-init config, without acquiring `self.memory`'s
     /// `RwLock`.
@@ -86,9 +133,9 @@ impl NativeMemoryHandle {
 
     /// Forwards to `NativeMappedMemory::replace_image` under the write
     /// guard, then refreshes the lock-free config snapshot so subsequent
-    /// `address_mode`/`host_page_size`/`linux_page_size` reads observe the
-    /// new image immediately. This is the ONLY path that may rewrite those
-    /// three fields after image load (execve), so routing every
+    /// `address_mode`/`host_page_size`/`linux_page_size`/`owned_host_ranges`
+    /// reads observe the new image immediately. This is the ONLY path that
+    /// may rewrite those fields after image load (execve), so routing every
     /// `SharedNativeMemory`-level `replace_image` call through here (instead
     /// of `.write().replace_image(...)`) makes forgetting the config
     /// refresh impossible for production callers. Tests that operate on a
@@ -173,8 +220,15 @@ pub(super) struct NativeMappedMemory {
     // Host-coordinate authority for image retirement, biased fixed remaps,
     // and validated reverse faults. Biased intervals are collision-reserved;
     // direct intervals are normalized planned ownership recorded after the
-    // established unreserved MAP_FIXED mapping path succeeds.
-    pub(super) owned_host_ranges: Vec<std::ops::Range<carrick_guest_mem::HostVa>>,
+    // established unreserved MAP_FIXED mapping path succeeds. `Arc`-wrapped
+    // so `NativeMemoryConfig` (above) can hold a cheap refcount-clone of the
+    // SAME allocation and serve hot-path reads without acquiring this
+    // struct's own big `RwLock` -- see `NativeMemoryConfig`'s doc comment.
+    // Never incrementally mutated (no push/insert/remove anywhere): only
+    // set at construction and wholesale-replaced by `replace_image`
+    // (execve), exactly like `address_mode`/`host_page_size`/
+    // `linux_page_size`.
+    pub(super) owned_host_ranges: Arc<Vec<std::ops::Range<carrick_guest_mem::HostVa>>>,
     pub(super) regions: Vec<NativeMappedRegion>,
     pub(super) protections: MemoryProtections,
     pub(super) native_page_protections: BTreeMap<u64, u64>,
@@ -911,7 +965,7 @@ impl NativeMappedMemory {
             protections.set_no_write(span.start, len, true);
         }
         let address_mode = native_layout.address_mode();
-        let owned_host_ranges = native_layout.owned_ranges().to_vec();
+        let owned_host_ranges = Arc::new(native_layout.owned_ranges().to_vec());
         let setup: Result<Self, RuntimeError> = (|| {
             let mut memory = Self {
                 address_mode,
