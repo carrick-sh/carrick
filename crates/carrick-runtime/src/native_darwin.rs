@@ -3606,13 +3606,24 @@ impl GuestMemory for NativeDispatchMemory<'_> {
     /// stable for as long as this adapter's guard is held (a mapping
     /// mutation needs `.write()`, which cannot run concurrently with our
     /// held `.read()`), and the trait's own contract confines the returned
-    /// pointer to this dispatch. `host_ptr_for_write` is deliberately left
-    /// at the trait default (not overridden here): a write into guest RAM
-    /// needs the exec-page escalation check `write_bytes_raw` performs
-    /// BEFORE handing out a pointer, so forwarding it the same way would
-    /// bypass that check.
+    /// pointer to this dispatch.
     fn host_ptr_for_read(&self, address: u64, len: usize) -> Option<*const u8> {
         self.inner().host_ptr_for_read(address, len)
+    }
+
+    /// Delegates to `host_ptr_for_write_shared` (a `&self` method) so a
+    /// read-classified syscall (e.g. `recv`/`readv` writing INTO the guest
+    /// destination buffer) can still zero-copy under only the memory READ
+    /// guard. This is sound even though it writes guest RAM: every gate the
+    /// shared helper checks is itself `&self`-only, the exec-page escalation
+    /// check that a checked `write_bytes_raw` performs before touching guest
+    /// RAM lives INSIDE the shared helper (`range_may_execute` forces exec
+    /// targets to `None`, i.e. the copy fallback, which then goes through
+    /// the real escalation), and the mapping can't be pulled out from under
+    /// the returned pointer mid-dispatch (`munmap`/`mprotect`/exec all need
+    /// the WRITE guard, which excludes concurrent readers).
+    fn host_ptr_for_write(&mut self, address: u64, len: usize) -> Option<*mut u8> {
+        self.inner().host_ptr_for_write_shared(address, len)
     }
 
     fn write_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
@@ -7263,6 +7274,171 @@ mod tests {
                 "escalated write must go through write_exec_page_bytes"
             );
             assert_eq!(guard.read_bytes(page, 4).unwrap(), [0xAAu8; 4]);
+        });
+    }
+
+    #[test]
+    fn host_ptr_for_read_returns_pointer_for_contiguous_readable_range() {
+        fork_test(|| {
+            let guest = carrick_guest_mem::GuestVa(0x40_0000);
+            let memory = biased_test_memory(guest, 0x4000);
+            let host_base = memory.host_address(guest).expect("host base").raw();
+            let ptr = memory
+                .host_ptr_for_read(guest.raw(), 0x4000)
+                .expect("a single mapped readable region must zero-copy");
+            assert_eq!(ptr as usize, host_base);
+        });
+    }
+
+    #[test]
+    fn host_ptr_for_read_returns_none_for_range_spanning_two_regions() {
+        fork_test(|| {
+            let page = 16 * 1024_u64;
+            let guest = carrick_guest_mem::GuestVa(0x40_0000);
+            let mut memory =
+                biased_test_memory_with_geometry(guest, (2 * page) as usize, 16 * 1024);
+            // `biased_test_memory_with_geometry` builds ONE region covering
+            // both pages; split it into two adjacent regions so no SINGLE
+            // region covers the full `[guest, guest+2*page)` span (mirrors
+            // `prepare_temporary_host_access_rolls_back_committed_lifts_on_later_overlap_failure`'s
+            // region-splitting setup).
+            let template = memory.regions.remove(0);
+            memory.regions.push(NativeMappedRegion {
+                start: guest.raw(),
+                end: guest.raw() + page,
+                host_protects: template.host_protects,
+                shared_futex: template.shared_futex,
+                guest_writable: template.guest_writable,
+                default_prot: template.default_prot,
+                shared_key_base: template.shared_key_base,
+                shared_key_offset: template.shared_key_offset,
+            });
+            memory.regions.push(NativeMappedRegion {
+                start: guest.raw() + page,
+                end: guest.raw() + 2 * page,
+                host_protects: template.host_protects,
+                shared_futex: template.shared_futex,
+                guest_writable: template.guest_writable,
+                default_prot: template.default_prot,
+                shared_key_base: template.shared_key_base,
+                shared_key_offset: template.shared_key_offset,
+            });
+
+            assert_eq!(
+                memory.host_ptr_for_read(guest.raw(), (2 * page) as usize),
+                None,
+                "a range spanning two mapped regions has no single contiguous host \
+                 backing and must fall back to the copy path"
+            );
+        });
+    }
+
+    #[test]
+    fn host_ptr_for_read_returns_none_for_guarded_range() {
+        fork_test(|| {
+            let page = 16 * 1024_u64;
+            let guest = carrick_guest_mem::GuestVa(0x40_0000);
+            let mut memory = biased_test_memory_with_geometry(guest, page as usize, 16 * 1024);
+            // Bookkeep the page as guest PROT_NONE (e.g. a temporarily
+            // lifted/guarded page): the checked copy path can lift it for
+            // the duration of the copy, but a raw zero-copy pointer cannot.
+            memory.native_page_protections.insert(guest.raw(), 0);
+            assert_eq!(
+                memory.host_ptr_for_read(guest.raw(), page as usize),
+                None,
+                "a PROT_NONE-guarded range must fall back to the copy path"
+            );
+        });
+    }
+
+    #[test]
+    fn host_ptr_for_write_returns_pointer_for_writable_non_exec_range() {
+        fork_test(|| {
+            let guest = carrick_guest_mem::GuestVa(0x40_0000);
+            let mut memory = biased_test_memory(guest, 0x4000);
+            let host_base = memory.host_address(guest).expect("host base").raw();
+            let ptr = memory
+                .host_ptr_for_write(guest.raw(), 0x4000)
+                .expect("a writable non-exec region must zero-copy");
+            assert_eq!(ptr as usize, host_base);
+        });
+    }
+
+    #[test]
+    fn host_ptr_for_write_returns_none_for_read_only_range() {
+        fork_test(|| {
+            let guest = carrick_guest_mem::GuestVa(0x40_0000);
+            let mut memory = biased_test_memory(guest, 0x4000);
+            // Guest-declared read-only (e.g. `mprotect(PROT_READ)`): the
+            // host page is still physically writable, but a guest write here
+            // must EFAULT through the checked copy path, never land through
+            // a raw host pointer.
+            memory.set_no_write(guest.raw(), 0x4000, true);
+            assert_eq!(
+                memory.host_ptr_for_write(guest.raw(), 0x4000),
+                None,
+                "a guest read-only mapping must fall back to the copy path (which EFAULTs), \
+                 never be written through a raw host pointer"
+            );
+        });
+    }
+
+    #[test]
+    fn host_ptr_for_write_returns_none_for_exec_range() {
+        fork_test(|| {
+            let mut memory = biased_test_memory(carrick_guest_mem::GuestVa(0x40_0000), 0x4000);
+            let page = memory.regions[0].start;
+            // Native16k SMC/JIT write-exec shape: a raw kernel write here
+            // would bypass `write_exec_page_bytes`'s W^X-metadata update.
+            memory.native_page_protections.insert(
+                page,
+                crate::linux_abi::LINUX_PROT_READ
+                    | crate::linux_abi::LINUX_PROT_WRITE
+                    | crate::linux_abi::LINUX_PROT_EXEC,
+            );
+            assert_eq!(
+                memory.host_ptr_for_write(page, 4),
+                None,
+                "an exec/W^X page write needs write_exec_page_bytes's metadata update, \
+                 which a raw kernel write can't perform -- must fall back to the copy path"
+            );
+        });
+    }
+
+    #[test]
+    fn native_dispatch_memory_host_ptr_for_write_zero_copies_under_read_guard() {
+        fork_test(|| {
+            let guest = carrick_guest_mem::GuestVa(0x40_0000);
+            let memory = biased_test_memory(guest, 0x4000);
+            let host_base = memory.host_address(guest).expect("host base").raw();
+            let shared: SharedNativeMemory = Arc::new(NativeMemoryHandle::new(memory));
+            let mut dispatch_memory = NativeDispatchMemory::new_read(&shared);
+            let ptr = dispatch_memory
+                .host_ptr_for_write(guest.raw(), 0x4000)
+                .expect("a writable non-exec range must zero-copy under only the read guard");
+            assert_eq!(ptr as usize, host_base);
+        });
+    }
+
+    #[test]
+    fn native_dispatch_memory_host_ptr_for_write_declines_exec_range() {
+        fork_test(|| {
+            let mut memory = biased_test_memory(carrick_guest_mem::GuestVa(0x40_0000), 0x4000);
+            let page = memory.regions[0].start;
+            memory.native_page_protections.insert(
+                page,
+                crate::linux_abi::LINUX_PROT_READ
+                    | crate::linux_abi::LINUX_PROT_WRITE
+                    | crate::linux_abi::LINUX_PROT_EXEC,
+            );
+            let shared: SharedNativeMemory = Arc::new(NativeMemoryHandle::new(memory));
+            let mut dispatch_memory = NativeDispatchMemory::new_read(&shared);
+            assert_eq!(
+                dispatch_memory.host_ptr_for_write(page, 4),
+                None,
+                "an exec-page target must fall back to the checked copy path (which itself \
+                 escalates to the write guard), never be handed a raw pointer"
+            );
         });
     }
 

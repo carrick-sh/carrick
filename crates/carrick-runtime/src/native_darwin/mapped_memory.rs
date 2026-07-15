@@ -1789,6 +1789,51 @@ impl NativeMappedMemory {
         self.copy_bytes_to_host(address, bytes)
     }
 
+    /// Host pointer for a contiguous guest range as a zero-copy write
+    /// DESTINATION (recv straight into guest memory, `writev` staged into a
+    /// borrowed `iovec`), or `None` when zero-copy doesn't apply. Takes
+    /// `&self` -- mirrors `write_bytes_raw_shared`'s `&self`-ness so
+    /// `NativeDispatchMemory`'s read-classified adapter (held under only the
+    /// memory READ guard) can still hand out a write pointer: every gate here
+    /// is itself `&self`, the returned pointer is guest RAM the kernel writes
+    /// directly (the same backing `write_bytes_raw_shared` copies into under
+    /// a read guard), and a mapping can't be pulled out from under the
+    /// pointer mid-dispatch (`munmap`/`mprotect`/exec need the WRITE guard,
+    /// which excludes concurrent readers).
+    ///
+    /// Gates, in order: `region_contains` (one contiguous mapped region --
+    /// multi-region and unmapped ranges copy instead); `native_range_allows`
+    /// with `write = true` (host-writable, i.e. not a PROT_NONE-guarded
+    /// range -- the checked copy path can temporarily lift a guarded page,
+    /// a raw pointer cannot); `guest_range_is_writable` (a guest read-only
+    /// mapping must EFAULT through the checked copy path, never be written
+    /// through a raw host pointer); and `range_may_execute` (an exec/W^X
+    /// page write needs `write_exec_page_bytes`'s W^X-metadata update, which
+    /// a raw kernel write can't perform, so exec targets MUST fall back to
+    /// the copy path). See `GuestMemory::host_ptr_for_write`.
+    pub(super) fn host_ptr_for_write_shared(&self, address: u64, len: usize) -> Option<*mut u8> {
+        if len == 0 {
+            return None;
+        }
+        if !self.region_contains(address, len) {
+            return None;
+        }
+        if !self.native_range_allows(address, len, true) {
+            return None;
+        }
+        if !self.guest_range_is_writable(address, len) {
+            return None;
+        }
+        if self.range_may_execute(address, len) {
+            return None;
+        }
+        Some(
+            self.host_address(carrick_guest_mem::GuestVa(address))
+                .ok()?
+                .raw() as *mut u8,
+        )
+    }
+
     /// The exec-page (SMC/JIT) guest-RAM write path: same exclusive-monitor
     /// and DSR bookkeeping as [`Self::write_bytes_raw_shared`], plus the
     /// `native_write_exec_writable_pages`/`native_page_protections` metadata
@@ -3321,6 +3366,35 @@ impl GuestMemory for NativeMappedMemory {
         content: &[u8],
     ) -> Result<(), MemoryError> {
         self.remap_private(va, len, content)
+    }
+
+    /// Host pointer for a contiguous, host-readable guest range (zero-copy
+    /// send source / `writev` source). `None` when the range spans more than
+    /// one mapped region, is unmapped, or is host-guarded (PROT_NONE-lifted
+    /// -- the checked copy path can temporarily lift a guarded page, a raw
+    /// pointer cannot). See `GuestMemory::host_ptr_for_read`.
+    fn host_ptr_for_read(&self, address: u64, len: usize) -> Option<*const u8> {
+        if len == 0 {
+            return None;
+        }
+        if !self.region_contains(address, len) {
+            return None;
+        }
+        if !self.native_range_allows(address, len, false) {
+            return None;
+        }
+        Some(
+            self.host_address(carrick_guest_mem::GuestVa(address))
+                .ok()?
+                .raw() as *const u8,
+        )
+    }
+
+    /// Delegates to the `&self` shared helper -- see
+    /// `host_ptr_for_write_shared`'s doc comment for the full gate list and
+    /// why it's sound to expose this through a shared borrow.
+    fn host_ptr_for_write(&mut self, address: u64, len: usize) -> Option<*mut u8> {
+        self.host_ptr_for_write_shared(address, len)
     }
 }
 
