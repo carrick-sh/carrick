@@ -184,7 +184,7 @@ fn native_exited_leader_must_park(tid: crate::thread::ThreadId) -> bool {
 const VM_INHERIT_SHARE: libc::c_int = 0;
 const VM_INHERIT_COPY: libc::c_int = 1;
 
-type SharedNativeMemory = Arc<parking_lot::Mutex<NativeMappedMemory>>;
+type SharedNativeMemory = Arc<parking_lot::RwLock<NativeMappedMemory>>;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -1274,7 +1274,7 @@ fn run_image_in_current_process(
     })?;
     let entry = source.image().entry();
     let (memory, image) = map_current_process_image_source(source, plan, process_entry)?;
-    let memory = Arc::new(parking_lot::Mutex::new(memory));
+    let memory = Arc::new(parking_lot::RwLock::new(memory));
     let _ = crate::ulock::preinit_waiter_table();
     // PID-namespace launch placement (container path only; `run-elf` never
     // requests it): the same identity-init fallback as the HVF threaded loop —
@@ -1585,10 +1585,22 @@ fn prepare_dsr_entry<const PROFILE: bool>(
     memory: &SharedNativeMemory,
     snapshot: &NativeUcontextSnapshot,
 ) -> Result<dsr::PreparedEntry, RuntimeError> {
-    let mut memory = memory.lock();
-    memory
-        .prepare_dsr_execution(snapshot.pc)
-        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+    let memory = memory.upgradable_read();
+    // `prepare_dsr_execution` only mutates SMC/JIT (write+exec) page state
+    // when the entry PC lands on a page the write-exec fault path already
+    // marked writable; every other entry is a pure read. Check the
+    // condition under the upgradable guard and only pay for a write guard
+    // on that (rare) branch.
+    let memory = if let Some(page_start) = memory.native16k_write_exec_page(snapshot.pc) {
+        let host_page_size = memory.host_page_size as usize;
+        let mut memory = parking_lot::RwLockUpgradableReadGuard::upgrade(memory);
+        memory
+            .make_native16k_write_exec_page_executable(page_start, snapshot.pc, host_page_size)
+            .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+        parking_lot::RwLockWriteGuard::downgrade(memory)
+    } else {
+        parking_lot::RwLockUpgradableReadGuard::downgrade(memory)
+    };
     translator
         .prepare_entry::<PROFILE>(&memory, snapshot)
         .map_err(|error| RuntimeError::Unsupported(error.to_string()))
@@ -1664,7 +1676,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
         },
         NativeThreadStart::Detached { context, .. } => *context,
     };
-    let process_translator = memory.lock().dsr_process_translator()?;
+    let process_translator = memory.read().dsr_process_translator()?;
     let mut translator =
         dsr::ThreadTranslator::for_process(process_translator, thread_runtime.tid().raw());
     debug_assert_eq!(translator.profiling_enabled(), PROFILE);
@@ -1747,7 +1759,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
             None
         };
         let exit = translator
-            .finish_exit_profiled::<PROFILE>(&memory.lock(), &mut snapshot, prepared, raw_exit)
+            .finish_exit_profiled::<PROFILE>(&memory.read(), &mut snapshot, prepared, raw_exit)
             .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
         if let Some(finish_timer) = finish_timer {
             translator
@@ -1784,7 +1796,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                             )
                         })?;
                         emulate_dsr_exclusive_access(
-                            &mut memory.lock(),
+                            &memory.read(),
                             &mut snapshot,
                             &mut thread_runtime.exclusive_reservation,
                             word,
@@ -1832,7 +1844,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                                     "native DSR could not read dc zva source {register}"
                                 ))
                             })?;
-                        native_dc_zva(&mut memory.lock(), address)?;
+                        native_dc_zva(&memory, address)?;
                     }
                     dsr::types::SensitiveKind::DcCvau | dsr::types::SensitiveKind::IcIvau => {}
                 }
@@ -2126,7 +2138,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
             } => {
                 let vfork_rejection = vfork
                     .is_some()
-                    .then(|| memory.lock().native16k_vfork_rejection())
+                    .then(|| memory.read().native16k_vfork_rejection())
                     .flatten();
                 if let Some(reason) = vfork_rejection {
                     let syscall_name = if request.number.raw() == 435 {
@@ -2293,7 +2305,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                         // return. A collision or allocation failure leaves the
                         // old image, sibling set, dispatcher, and DSR cache live.
                         let prepared_mapping = {
-                            let memory = memory.lock();
+                            let memory = memory.read();
                             memory.prepare_exec_mapping(&image, &plan)
                         };
                         let prepared_mapping = match prepared_mapping {
@@ -2332,7 +2344,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                             }
                         }
                         memory
-                            .lock()
+                            .write()
                             .replace_image(
                                 &image,
                                 &relative_relocations,
@@ -2362,7 +2374,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                         dispatcher.close_cloexec_fds();
                         translator.begin_exec_reset();
                         translator.begin_exec_handoff();
-                        let next_process = memory.lock().dsr_process_translator()?;
+                        let next_process = memory.read().dsr_process_translator()?;
                         translator.reset_for_exec(next_process);
                         crate::namespace::pid::mark_self_execed();
                         let cmdline = proc_argv.join(" ");
@@ -2401,7 +2413,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                 prot_none,
             } => {
                 memory
-                    .lock()
+                    .write()
                     .map_host_alias(va.raw(), len, &payload, file, prot_none)?;
                 snapshot = complete_dsr_syscall(
                     &dispatcher,
@@ -2451,8 +2463,8 @@ fn deliver_dsr_pending_signal(
     interrupted_pc: Option<u64>,
     translator: &mut dsr::ThreadTranslator,
 ) -> Result<NativeUcontextSnapshot, RuntimeError> {
-    let mut memory = memory.lock();
-    let mut trap = NativeSignalTrap::new(&mut memory, snapshot, None);
+    let memory = memory.read();
+    let mut trap = NativeSignalTrap::new(&memory, snapshot, None);
     let action = crate::vcpu_loop::deliver_pending_signal(
         &mut trap,
         dispatcher,
@@ -2482,8 +2494,8 @@ fn complete_dsr_syscall(
     resume: carrick_guest_mem::GuestVa,
     translator: &mut dsr::ThreadTranslator,
 ) -> Result<NativeUcontextSnapshot, RuntimeError> {
-    let mut memory = memory.lock();
-    let mut trap = NativeSignalTrap::new(&mut memory, snapshot, Some(syscall_nr));
+    let memory = memory.read();
+    let mut trap = NativeSignalTrap::new(&memory, snapshot, Some(syscall_nr));
     trap.complete_syscall(return_value)?;
     trap.set_pc(resume.raw());
     let action = crate::vcpu_loop::deliver_pending_signal(
@@ -2511,8 +2523,8 @@ fn complete_dsr_sigreturn(
     tid: crate::thread::ThreadId,
     translator: &mut dsr::ThreadTranslator,
 ) -> Result<NativeUcontextSnapshot, RuntimeError> {
-    let mut memory = memory.lock();
-    let mut trap = NativeSignalTrap::new(&mut memory, snapshot, None);
+    let memory = memory.read();
+    let mut trap = NativeSignalTrap::new(&memory, snapshot, None);
     let action = sigreturn_restore_and_deliver(dispatcher, &mut trap, tid)?;
     if let Some(action) = action {
         if let Some(signum) = action.stop_signal {
@@ -2540,12 +2552,12 @@ fn lower_dsr_fault(
     let host_fault = matches!(fault_address, dsr::ThreadFaultAddress::Host(_));
     let biased_host_fault = host_fault
         && matches!(
-            memory.lock().address_mode(),
+            memory.read().address_mode(),
             NativeAddressMode::Biased { .. }
         );
-    let fault_address = lower_dsr_fault_address(&memory.lock(), fault_address)?.raw();
+    let fault_address = lower_dsr_fault_address(&memory.read(), fault_address)?.raw();
     if biased_host_fault {
-        let memory = memory.lock();
+        let memory = memory.read();
         if snapshot.far != 0 {
             let far = usize::try_from(snapshot.far)
                 .ok()
@@ -2576,7 +2588,7 @@ fn lower_dsr_fault(
     if matches!(fault, dsr::ThreadFault::Host { .. })
         && let Some((page, prot)) = dispatcher.resident_fault_plan(fault_address)
     {
-        let mut memory = memory.lock();
+        let mut memory = memory.write();
         let linux_page_size = memory.linux_page_size as usize;
         if memory.protect_range(page, linux_page_size, prot).is_ok() {
             drop(memory);
@@ -2585,7 +2597,7 @@ fn lower_dsr_fault(
         }
     }
     if matches!(fault, dsr::ThreadFault::Host { .. })
-        && memory.lock().resolve_native16k_write_exec_fault(
+        && memory.write().resolve_native16k_write_exec_fault(
             fault_address,
             snapshot.pc,
             snapshot.esr,
@@ -2594,7 +2606,7 @@ fn lower_dsr_fault(
         return Ok(snapshot);
     }
     if matches!(fault, dsr::ThreadFault::Host { .. })
-        && memory.lock().linux4k_address_is_guarded(fault_address)
+        && memory.read().linux4k_address_is_guarded(fault_address)
     {
         if live_threads > 1 {
             return Err(RuntimeError::Unsupported(format!(
@@ -2603,7 +2615,7 @@ fn lower_dsr_fault(
                  guarded-page fault emulation is not multithread-safe"
             )));
         }
-        emulate_linux4k_guarded_fault(&mut memory.lock(), &mut snapshot, reservation)?;
+        emulate_linux4k_guarded_fault(&mut memory.write(), &mut snapshot, reservation)?;
         return Ok(snapshot);
     }
     let (mut signum, mut si_code, si_addr) = match fault {
@@ -2618,14 +2630,14 @@ fn lower_dsr_fault(
         }
     };
     si_code = {
-        let memory = memory.lock();
+        let memory = memory.read();
         crate::vcpu_loop::upgrade_protection_si_code(&*memory, signum, si_code, si_addr)
     };
     if signum == crate::linux_abi::LINUX_SIGSEGV
         && let Some((grow_start, grow_len)) = dispatcher.mmap_growdown_fault_plan(si_addr)
     {
         let grew = memory
-            .lock()
+            .write()
             .protect_range(
                 grow_start,
                 grow_len,
@@ -2642,8 +2654,8 @@ fn lower_dsr_fault(
         si_code = 2;
     }
     let interrupted_pc = snapshot.pc;
-    let mut memory = memory.lock();
-    let mut trap = NativeSignalTrap::new(&mut memory, snapshot, None);
+    let memory = memory.read();
+    let mut trap = NativeSignalTrap::new(&memory, snapshot, None);
     let disposition = crate::vcpu_loop::inject_fault_signal(
         &mut trap,
         dispatcher,
@@ -2715,7 +2727,15 @@ fn sigreturn_restore_and_deliver(
 }
 
 struct NativeSignalTrap<'a> {
-    memory: &'a mut NativeMappedMemory,
+    /// `&'a NativeMappedMemory` (shared, not `&mut`): every trap site
+    /// constructs this from a `SharedNativeMemory::read()` guard. Its
+    /// `GuestMemory::write_bytes_raw` impl below routes through
+    /// `write_bytes_raw_shared`, the Phase 1 `&self` common write path --
+    /// correct here because a signal frame only ever writes the guest's
+    /// DATA/signal stack (`build_sigframe`/`restore_sigframe`), never an
+    /// executable page, so the exec-page (`write_exec_page_bytes`) escalation
+    /// this deliberately skips can never legitimately apply to a trap write.
+    memory: &'a NativeMappedMemory,
     regs: NativeUcontextSnapshot,
     orig_x0: u64,
     last_syscall_nr: Option<u64>,
@@ -2922,12 +2942,11 @@ impl NativeThreadRuntime {
         dispatcher.inherit_thread_signal_mask(self.tid, tid);
         let tid_bytes = tid.raw().to_le_bytes();
         {
-            let mut memory = memory.lock();
             if request.parent_tid_addr != 0 {
-                let _ = memory.write_bytes(request.parent_tid_addr, &tid_bytes);
+                let _ = write_guest_ram_through_lock(memory, request.parent_tid_addr, &tid_bytes);
             }
             if request.child_tid_addr != 0 {
-                let _ = memory.write_bytes(request.child_tid_addr, &tid_bytes);
+                let _ = write_guest_ram_through_lock(memory, request.child_tid_addr, &tid_bytes);
             }
         }
 
@@ -3062,10 +3081,7 @@ impl NativeThreadRuntime {
         if let Some(address) = self.registry.clear_child_tid(self.tid)
             && address != 0
         {
-            {
-                let mut memory = memory.lock();
-                let _ = memory.write_bytes(address, &0_i32.to_le_bytes());
-            }
+            let _ = write_guest_ram_through_lock(memory, address, &0_i32.to_le_bytes());
             self.futex.wake(address, 1);
         }
         let last = self.registry.exit(self.tid);
@@ -3167,7 +3183,7 @@ impl Drop for NativeWaitState {
 
 impl<'a> NativeSignalTrap<'a> {
     fn new(
-        memory: &'a mut NativeMappedMemory,
+        memory: &'a NativeMappedMemory,
         regs: NativeUcontextSnapshot,
         last_syscall_nr: Option<u64>,
     ) -> Self {
@@ -3202,17 +3218,18 @@ impl GuestMemory for NativeSignalTrap<'_> {
     }
 
     fn write_bytes_raw(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
-        // `self.memory: &mut NativeMappedMemory`, so this still resolves to
-        // `NativeMappedMemory`'s TRAIT `write_bytes_raw(&mut self, ..)`, which
-        // now dispatches internally to the &self common path or the &mut self
-        // exec-page escalation as needed -- unchanged observable behavior.
-        // NativeSignalTrap keeps its own &mut borrow of the memory in Phase 1;
-        // Phase 2 changes what guard it holds, not this call.
-        self.memory.write_bytes_raw(address, bytes)
+        // `self.memory: &NativeMappedMemory` (Task 5: narrowed from `&mut` so
+        // every trap site can construct this under a `SharedNativeMemory`
+        // read guard). Routes through the `&self` common write path
+        // (`write_bytes_raw_shared`, Phase 1/Task 3) instead of the trait's
+        // `write_bytes_raw(&mut self, ..)` dispatcher -- see the struct doc
+        // comment for why a signal-frame write can never legitimately need
+        // the exec-page (`write_exec_page_bytes`) escalation that skips.
+        self.memory.write_bytes_raw_shared(address, bytes)
     }
 
     fn write_bytes_unchecked(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
-        self.memory.write_bytes_raw(address, bytes)
+        self.memory.write_bytes_raw_shared(address, bytes)
     }
 
     fn guest_range_is_writable(&self, address: u64, length: usize) -> bool {
@@ -3445,7 +3462,16 @@ fn dispatch_native_syscall_inner<const PROFILE: bool>(
     let mut fd_wait_deadline = None;
     loop {
         let outcome = {
-            let mut memory = memory.lock();
+            // MIXED site (memlock-classification.md :3440): `dispatch_threaded`
+            // takes `memory: &mut impl GuestMemory` STRUCTURALLY (dispatch/
+            // mod.rs:3244) for every syscall, mutator or not, so a `.read()`
+            // guard cannot be handed in here without either a GuestMemory
+            // wrapper adapter or restructuring that generic bound. Conservative
+            // `.write()` placeholder for Task 5, per the task brief; Task 6's
+            // `native_syscall_mutates_mappings` pre-classifier is the intended
+            // way to narrow this to `.read()` for the (large) non-mutator
+            // majority of syscalls.
+            let mut memory = memory.write();
             dispatcher.dispatch_threaded(
                 request,
                 &mut *memory,
@@ -3543,9 +3569,8 @@ fn dispatch_native_syscall_inner<const PROFILE: bool>(
                 let Some(timeout) =
                     remaining_native_wait_timeout(timeout, &mut fd_wait_deadline, Instant::now())
                 else {
-                    let mut memory = memory.lock();
                     for (addr, len) in &clear_on_timeout {
-                        let _ = memory.zero_guest_range(*addr, *len);
+                        let _ = zero_guest_ram_through_lock(memory, *addr, *len);
                     }
                     return Ok(DispatchOutcome::Returned { value: 0 });
                 };
@@ -3554,9 +3579,8 @@ fn dispatch_native_syscall_inner<const PROFILE: bool>(
                 })? {
                     Ok(NativeWaitResult::Ready) => continue,
                     Ok(NativeWaitResult::TimedOut) => {
-                        let mut memory = memory.lock();
                         for (addr, len) in &clear_on_timeout {
-                            let _ = memory.zero_guest_range(*addr, *len);
+                            let _ = zero_guest_ram_through_lock(memory, *addr, *len);
                         }
                         return Ok(DispatchOutcome::Returned { value: 0 });
                     }
@@ -3871,7 +3895,12 @@ fn dispatch_native_syscall_inner<const PROFILE: bool>(
                 })? {
                     Ok(()) => return Ok(DispatchOutcome::Returned { value: 0 }),
                     Err(crate::linux_abi::LINUX_EINTR) => {
-                        let mut memory = memory.lock();
+                        // `complete_interrupted_sleep` takes `&mut impl
+                        // GuestMemory` structurally (dispatch/mod.rs), the
+                        // same generic-bound constraint as the :3440 dispatch
+                        // site above; conservative `.write()` for a rare
+                        // (signal-interrupted-sleep) event, not the hot path.
+                        let mut memory = memory.write();
                         return Ok(crate::dispatch::complete_interrupted_sleep(
                             &mut *memory,
                             remaining,
@@ -3901,7 +3930,7 @@ fn native_clone_thread_rejection(memory: &SharedNativeMemory) -> Option<&'static
             "native Darwin cannot create guest threads in a fork child: emulated execve cannot reset the host libdispatch post-fork state",
         );
     }
-    memory.lock().native16k_clone_thread_rejection()
+    memory.read().native16k_clone_thread_rejection()
 }
 
 /// Preserve one guest deadline across internal readiness re-dispatches, even
@@ -4364,7 +4393,7 @@ fn handle_native_fork(
         // fault arm carries the matching MT rejection, so a linux4k MT guest
         // fails typed at whichever boundary it reaches first, never with a
         // host crash.
-        if memory.lock().uses_linux4k_subpages() {
+        if memory.read().uses_linux4k_subpages() {
             barrier.end_fork();
             return Err(RuntimeError::Unsupported(
                 "native Darwin multithreaded fork on the linux4k page profile is not yet \
@@ -4378,7 +4407,7 @@ fn handle_native_fork(
         // generation state across fork, and currently returns false here, so
         // native DSR does not reject this lifecycle on that removed executor's
         // patch/protection concern.
-        if memory.lock().write_exec_blocks_multithreaded_lifecycle() {
+        if memory.read().write_exec_blocks_multithreaded_lifecycle() {
             barrier.end_fork();
             return Err(RuntimeError::Unsupported(
                 "native Darwin multithreaded fork with write-exec pages is not supported"
@@ -4452,11 +4481,11 @@ fn handle_native_fork(
         barrier.end_fork();
     };
     let vfork_pipe = if request.vfork.is_some() {
-        memory.lock().set_fork_inheritance(true);
+        memory.read().set_fork_inheritance(true);
         match vfork_pipe_pair() {
             Ok(pipe) => Some(pipe),
             Err(error) => {
-                memory.lock().set_fork_inheritance(false);
+                memory.read().set_fork_inheritance(false);
                 end_fork_state(quiesced);
                 return Err(error);
             }
@@ -4480,7 +4509,7 @@ fn handle_native_fork(
             if let Some((read_fd, write_fd)) = vfork_pipe {
                 close_fd(read_fd);
                 close_fd(write_fd);
-                memory.lock().set_fork_inheritance(false);
+                memory.read().set_fork_inheritance(false);
             }
             end_fork_state(quiesced);
             return Ok(NativeForkFlow::Resume {
@@ -4524,7 +4553,7 @@ fn handle_native_fork(
         if let Some((read_fd, write_fd)) = vfork_pipe {
             close_fd(read_fd);
             close_fd(write_fd);
-            memory.lock().set_fork_inheritance(false);
+            memory.read().set_fork_inheritance(false);
         }
         end_fork_state(quiesced);
         return Ok(NativeForkFlow::Resume {
@@ -4575,14 +4604,14 @@ fn handle_native_fork(
         // (its PID) so the COW-inherited userspace getrandom state reseeds
         // instead of replaying the parent's keystream — the native counterpart
         // of the HVF child-side re-stamp in `fork_rebuild`.
-        memory.lock().restamp_vdso_rng_generation_after_fork()?;
+        memory.read().restamp_vdso_rng_generation_after_fork()?;
         crate::run_state::reinit_booting_after_fork();
         let self_tid = (crate::namespace::pid::self_ns_pid() as i32).to_le_bytes();
         if let Some(addr) = request.parent_tid_addr {
-            let _ = memory.lock().write_bytes(addr, &self_tid);
+            let _ = write_guest_ram_through_lock(memory, addr, &self_tid);
         }
         if let Some(addr) = request.child_tid_addr {
-            let _ = memory.lock().write_bytes(addr, &self_tid);
+            let _ = write_guest_ram_through_lock(memory, addr, &self_tid);
         }
         native_trace_fork_phase("child-resume");
         return Ok(NativeForkFlow::Resume {
@@ -4605,7 +4634,7 @@ fn handle_native_fork(
         close_fd(write_fd);
         let wait = wait_native_vfork_completion(read_fd, thread_runtime.tid());
         close_fd(read_fd);
-        memory.lock().set_fork_inheritance(false);
+        memory.read().set_fork_inheritance(false);
         wait
     } else {
         Ok(NativeVforkWait::Completed)
@@ -4634,12 +4663,12 @@ fn handle_native_fork(
     crate::run_state::publish_child_booting(child as u32);
     if let Some(addr) = request.pidfd_out {
         let fd = dispatcher.install_child_pidfd(child).unwrap_or(-1);
-        let _ = memory.lock().write_bytes(addr, &fd.to_le_bytes());
+        let _ = write_guest_ram_through_lock(memory, addr, &fd.to_le_bytes());
     }
     let guest_child_pid = child_ns_pid.unwrap_or(child as u32) as i32;
     if let Some(addr) = request.parent_tid_addr {
         let tid = guest_child_pid.to_le_bytes();
-        let _ = memory.lock().write_bytes(addr, &tid);
+        let _ = write_guest_ram_through_lock(memory, addr, &tid);
     }
     native_register_child_exit_watch(dispatcher, child, request.exit_signal, thread_runtime.tid());
     Ok(NativeForkFlow::Resume {
@@ -4707,7 +4736,7 @@ fn native_terminate_siblings_for_exec(
     // Direct-execution W^X boundary (311fae9e), kept narrow and explicit — see
     // the fork-side twin. DSR retires the old translator after the sibling
     // drain and therefore does not carry patched executable bytes into exec.
-    if memory.lock().write_exec_blocks_multithreaded_lifecycle() {
+    if memory.read().write_exec_blocks_multithreaded_lifecycle() {
         crate::fork_quiesce::end_exec_replacement();
         barrier.end_fork();
         return Err(RuntimeError::Unsupported(
@@ -4949,15 +4978,58 @@ fn native_after_fork_child(dispatcher: &SyscallDispatcher) {
     dispatcher.sysv_after_fork_child();
 }
 
-fn native_dc_zva(memory: &mut NativeMappedMemory, address: u64) -> Result<(), RuntimeError> {
+/// Write guest RAM through the shared memory lock, escalating to a write
+/// guard only when the range may hit a native16k write-exec (SMC/JIT) page.
+/// Mirrors `NativeMappedMemory::write_bytes`'s PROT_NONE/read-only gate plus
+/// the `write_bytes_raw_shared`/`write_exec_page_bytes` split from Phase 1
+/// (Task 3), but decides which guard to take BEFORE acquiring it, so the
+/// overwhelmingly common case (a data write) only ever takes a read guard.
+/// Used by the guest-RAM writers outside the syscall dispatch path (DC ZVA,
+/// clone/fork tid publication, select fd-set clears) whose target address is
+/// guest-controlled and so cannot be assumed non-executable the way
+/// `NativeSignalTrap`'s sigframe writes can (see its own doc comment).
+fn write_guest_ram_through_lock(
+    memory: &SharedNativeMemory,
+    address: u64,
+    bytes: &[u8],
+) -> Result<(), MemoryError> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let guard = memory.upgradable_read();
+    if guard.protections.range_write_denied(address, bytes.len()) {
+        return Err(MemoryError::OutOfBounds {
+            address,
+            length: bytes.len(),
+        });
+    }
+    if guard.range_may_execute(address, bytes.len()) {
+        let mut guard = parking_lot::RwLockUpgradableReadGuard::upgrade(guard);
+        guard.write_exec_page_bytes(address, bytes)
+    } else {
+        guard.write_bytes_raw_shared(address, bytes)
+    }
+}
+
+/// [`write_guest_ram_through_lock`], chunked over a zero-filled range (the
+/// `zero_guest_range` shape used by `select`/`pselect` fd-set clears).
+fn zero_guest_ram_through_lock(
+    memory: &SharedNativeMemory,
+    address: u64,
+    len: usize,
+) -> Result<(), MemoryError> {
+    carrick_guest_mem::zero_range_chunked(address, len, |addr, chunk| {
+        write_guest_ram_through_lock(memory, addr, chunk)
+    })
+}
+
+fn native_dc_zva(memory: &SharedNativeMemory, address: u64) -> Result<(), RuntimeError> {
     let start = address & !(NATIVE_DC_ZVA_BLOCK_SIZE as u64 - 1);
-    memory
-        .write_bytes(start, &[0; NATIVE_DC_ZVA_BLOCK_SIZE])
-        .map_err(|error| {
-            RuntimeError::Unsupported(format!(
-                "native Darwin DC ZVA failed at 0x{address:x}: {error}"
-            ))
-        })
+    write_guest_ram_through_lock(memory, start, &[0; NATIVE_DC_ZVA_BLOCK_SIZE]).map_err(|error| {
+        RuntimeError::Unsupported(format!(
+            "native Darwin DC ZVA failed at 0x{address:x}: {error}"
+        ))
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -5789,8 +5861,13 @@ fn exclusive_access_width(op: bad64::Op, transfer_reg: bad64::Reg) -> Option<usi
     }
 }
 
+/// `&NativeMappedMemory`: the DSR hot path (`LDAXR`/`STLXR` and friends fire
+/// on essentially every guest lock/atomic). Everything this touches --
+/// `native_range_allows` and `exclusive_load_for`/`exclusive_store_for` --
+/// is `&self`-safe; the reservation itself lives in the caller's
+/// `NativeThreadRuntime.exclusive_reservation`, not in `NativeMappedMemory`.
 fn emulate_dsr_exclusive_access(
-    memory: &mut NativeMappedMemory,
+    memory: &NativeMappedMemory,
     snapshot: &mut NativeUcontextSnapshot,
     reservation: &mut Option<NativeExclusiveReservation>,
     word: u32,
@@ -7558,13 +7635,6 @@ impl NativeMappedMemory {
         Ok(())
     }
 
-    fn prepare_dsr_execution(&mut self, pc: u64) -> Result<(), MemoryError> {
-        let Some(page_start) = self.native16k_write_exec_page(pc) else {
-            return Ok(());
-        };
-        self.make_native16k_write_exec_page_executable(page_start, pc, self.host_page_size as usize)
-    }
-
     fn prepare_native16k_write_exec_host_write(
         &mut self,
         address: u64,
@@ -8029,7 +8099,7 @@ impl NativeMappedMemory {
     /// implementation. `NativeMappedMemory` itself no longer owns any
     /// reservation state.
     fn exclusive_load(
-        &mut self,
+        &self,
         address: u64,
         width: usize,
         acquire: bool,
@@ -8038,8 +8108,15 @@ impl NativeMappedMemory {
         self.exclusive_load_for(address, width, acquire, reservation)
     }
 
+    /// `&self`: every call this makes -- `region_contains`, `host_address`,
+    /// `prepare_temporary_host_access`/`restore_temporary_host_access` (host
+    /// mprotect scratch-window toggling, not table mutation), and
+    /// `exclusive_sequence_or_insert` (interior-mutable `exclusive_sequences`
+    /// lock) -- is already `&self`-safe. The atomic load itself goes through
+    /// a raw host pointer, not a `self` mutation. Kept `&mut self` until
+    /// Task 5 only because nothing had narrowed the receiver yet.
     fn exclusive_load_for(
-        &mut self,
+        &self,
         address: u64,
         width: usize,
         acquire: bool,
@@ -8084,7 +8161,7 @@ impl NativeMappedMemory {
     /// `exclusive_store_for`, threading the caller-owned reservation through
     /// instead of consulting struct-embedded state.
     fn exclusive_store(
-        &mut self,
+        &self,
         address: u64,
         width: usize,
         value: u64,
@@ -8124,8 +8201,11 @@ impl NativeMappedMemory {
             .insert(location, observed_sequence.next());
     }
 
+    /// `&self`: same reasoning as `exclusive_load_for` -- the CAS goes
+    /// through a raw host pointer and `bump_exclusive_sequence` is already
+    /// `&self` (interior-mutable `exclusive_sequences` lock).
     fn exclusive_store_for(
-        &mut self,
+        &self,
         address: u64,
         width: usize,
         value: u64,
@@ -11919,7 +11999,7 @@ mod tests {
         let mut stack = vec![0_u8; 16 * 1024];
         let stack_start = stack.as_mut_ptr() as u64;
         let stack_end = stack_start + stack.len() as u64;
-        let mut memory = NativeMappedMemory {
+        let memory = NativeMappedMemory {
             address_mode: NativeAddressMode::Direct,
             owned_host_ranges: Vec::new(),
             regions: vec![NativeMappedRegion {
@@ -11956,7 +12036,7 @@ mod tests {
             *value = (0x1000_u128 + index as u128).to_le_bytes();
         }
 
-        let mut trap = NativeSignalTrap::new(&mut memory, interrupted, None);
+        let mut trap = NativeSignalTrap::new(&memory, interrupted, None);
         trap.inject_signal(
             crate::linux_abi::LINUX_SIGUSR1,
             0x5000,
@@ -12051,7 +12131,7 @@ mod tests {
         let mut stack = vec![0_u8; 16 * 1024];
         let stack_start = stack.as_mut_ptr() as u64;
         let stack_end = stack_start + stack.len() as u64;
-        let mut memory = NativeMappedMemory {
+        let memory = NativeMappedMemory {
             address_mode: NativeAddressMode::Direct,
             owned_host_ranges: Vec::new(),
             regions: vec![NativeMappedRegion {
@@ -12087,7 +12167,7 @@ mod tests {
 
         // First instance delivered: handler frame is live, guest runs at the
         // handler. (saved_sigmask = 0: the interrupted context blocked nothing.)
-        let mut trap = NativeSignalTrap::new(&mut memory, interrupted, None);
+        let mut trap = NativeSignalTrap::new(&memory, interrupted, None);
         trap.inject_signal(
             sig,
             HANDLER_PC,
