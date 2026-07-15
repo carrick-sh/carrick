@@ -8110,9 +8110,27 @@ impl NativeMappedMemory {
         len: usize,
         write: bool,
     ) -> Result<Vec<(u64, libc::c_int)>, MemoryError> {
+        self.prepare_temporary_host_access_with(address, len, write, native_host_mprotect)
+    }
+
+    fn prepare_temporary_host_access_with<F>(
+        &self,
+        address: u64,
+        len: usize,
+        write: bool,
+        mut set_host_prot: F,
+    ) -> Result<Vec<(u64, libc::c_int)>, MemoryError>
+    where
+        F: FnMut(carrick_guest_mem::HostVa, usize, libc::c_int) -> Result<(), MemoryError>,
+    {
         if len == 0 {
             return Ok(Vec::new());
         }
+        let host_page_len =
+            usize::try_from(self.host_page_size).map_err(|_| MemoryError::OutOfBounds {
+                address,
+                length: len,
+            })?;
         let mut changed = Vec::new();
         let required = if write {
             libc::PROT_READ | libc::PROT_WRITE
@@ -8123,13 +8141,32 @@ impl NativeMappedMemory {
             let (page_start, page_len) = self.host_page_range(start, end)?;
             let page_end = page_start.saturating_add(page_len as u64);
             let mut page = page_start;
+            // Adjacent pages that all need the same lift merge into one
+            // mprotect call; the per-page restore records stay exact.
+            let mut run: Option<(u64, usize)> = None;
             while page < page_end {
                 let restore = self.native_host_prot_for_page(page);
                 if restore & required != required {
-                    self.mprotect_host_page(page, required, address, len)?;
                     changed.push((page, restore));
+                    run = match run {
+                        Some((run_start, run_pages)) => Some((run_start, run_pages + 1)),
+                        None => Some((page, 1)),
+                    };
+                } else if let Some((run_start, run_pages)) = run.take() {
+                    set_host_prot(
+                        self.host_address(carrick_guest_mem::GuestVa(run_start))?,
+                        host_page_len * run_pages,
+                        required,
+                    )?;
                 }
                 page = page.saturating_add(self.host_page_size);
+            }
+            if let Some((run_start, run_pages)) = run {
+                set_host_prot(
+                    self.host_address(carrick_guest_mem::GuestVa(run_start))?,
+                    host_page_len * run_pages,
+                    required,
+                )?;
             }
         }
         Ok(changed)
@@ -8141,8 +8178,48 @@ impl NativeMappedMemory {
         address: u64,
         len: usize,
     ) -> Result<(), MemoryError> {
-        for (page_start, restore) in changed.iter().rev() {
-            self.mprotect_host_page(*page_start, *restore, address, len)?;
+        self.restore_temporary_host_access_with(changed, address, len, native_host_mprotect)
+    }
+
+    fn restore_temporary_host_access_with<F>(
+        &self,
+        changed: &[(u64, libc::c_int)],
+        address: u64,
+        len: usize,
+        mut set_host_prot: F,
+    ) -> Result<(), MemoryError>
+    where
+        F: FnMut(carrick_guest_mem::HostVa, usize, libc::c_int) -> Result<(), MemoryError>,
+    {
+        let host_page_len =
+            usize::try_from(self.host_page_size).map_err(|_| MemoryError::OutOfBounds {
+                address,
+                length: len,
+            })?;
+        // Restore in the same reverse order as before, but merge adjacent
+        // pages whose recorded original protection is identical into one
+        // mprotect call. Pages with differing restore values keep their own
+        // exact call.
+        let mut entries = changed.iter().rev().peekable();
+        while let Some(&(page_start, restore)) = entries.next() {
+            let mut run_start = page_start;
+            let mut run_pages = 1_usize;
+            while let Some(&&(previous_page, previous_restore)) = entries.peek() {
+                if previous_restore == restore
+                    && previous_page.checked_add(self.host_page_size) == Some(run_start)
+                {
+                    run_start = previous_page;
+                    run_pages += 1;
+                    entries.next();
+                } else {
+                    break;
+                }
+            }
+            set_host_prot(
+                self.host_address(carrick_guest_mem::GuestVa(run_start))?,
+                host_page_len * run_pages,
+                restore,
+            )?;
         }
         Ok(())
     }
@@ -8153,6 +8230,19 @@ impl NativeMappedMemory {
         len: usize,
         prot: u64,
     ) -> Result<(), MemoryError> {
+        self.protect_linux4k_range_with(address, len, prot, native_host_mprotect)
+    }
+
+    fn protect_linux4k_range_with<F>(
+        &mut self,
+        address: u64,
+        len: usize,
+        prot: u64,
+        mut set_host_prot: F,
+    ) -> Result<(), MemoryError>
+    where
+        F: FnMut(carrick_guest_mem::HostVa, usize, libc::c_int) -> Result<(), MemoryError>,
+    {
         if !address.is_multiple_of(self.linux_page_size)
             || !(len as u64).is_multiple_of(self.linux_page_size)
         {
@@ -8195,30 +8285,72 @@ impl NativeMappedMemory {
             page_start = page_start.saturating_add(self.host_page_size);
         }
 
+        let host_page_len =
+            usize::try_from(self.host_page_size).map_err(|_| MemoryError::OutOfBounds {
+                address,
+                length: len,
+            })?;
+        struct PlannedHostPage {
+            page_start: u64,
+            protections: [u64; 4],
+            host_prot: libc::c_int,
+            needs_icache: bool,
+            host_page: carrick_guest_mem::HostVa,
+        }
+        let mut resolved = Vec::with_capacity(plan.len());
         for (page_start, protections, state) in plan {
             let mut host_prot = match state {
                 HostPageState::Uniform16k => linux_prot_to_native(protections[0]),
                 HostPageState::MixedGuarded(_) | HostPageState::Composed16k => libc::PROT_NONE,
                 HostPageState::Unsupported(_) => return Err(MemoryError::Unsupported),
             };
-            if protections
+            let needs_icache = protections
                 .iter()
-                .any(|value| value & crate::linux_abi::LINUX_PROT_EXEC != 0)
-            {
-                let ptr = self
-                    .host_address(carrick_guest_mem::GuestVa(page_start))?
-                    .raw() as *mut u8;
-                let page_len =
-                    usize::try_from(self.host_page_size).map_err(|_| MemoryError::OutOfBounds {
-                        address,
-                        length: len,
-                    })?;
-                unsafe { carrick_native_clear_icache(ptr.cast(), page_len) };
+                .any(|value| value & crate::linux_abi::LINUX_PROT_EXEC != 0);
+            if needs_icache {
                 host_prot = (host_prot & !libc::PROT_EXEC) | libc::PROT_READ;
             }
-            self.mprotect_host_page(page_start, host_prot, address, len)?;
-            self.linux4k_page_protections
-                .insert(page_start, protections);
+            resolved.push(PlannedHostPage {
+                page_start,
+                protections,
+                host_prot,
+                needs_icache,
+                host_page: self.host_address(carrick_guest_mem::GuestVa(page_start))?,
+            });
+        }
+        // Merge maximal runs of adjacent host pages whose RESOLVED final
+        // host protection is identical into one mprotect call. The icache
+        // clears stay per page (only pages with an executable subpage get
+        // one, exactly as before), and the per-page subpage bookkeeping is
+        // unchanged.
+        let mut index = 0;
+        while index < resolved.len() {
+            let mut end = index + 1;
+            while end < resolved.len()
+                && resolved[end].host_prot == resolved[index].host_prot
+                && resolved[end - 1]
+                    .page_start
+                    .checked_add(self.host_page_size)
+                    == Some(resolved[end].page_start)
+            {
+                end += 1;
+            }
+            for page in &resolved[index..end] {
+                if page.needs_icache {
+                    let ptr = page.host_page.raw() as *mut u8;
+                    unsafe { carrick_native_clear_icache(ptr.cast(), host_page_len) };
+                }
+            }
+            set_host_prot(
+                resolved[index].host_page,
+                host_page_len * (end - index),
+                resolved[index].host_prot,
+            )?;
+            for page in &resolved[index..end] {
+                self.linux4k_page_protections
+                    .insert(page.page_start, page.protections);
+            }
+            index = end;
         }
         Ok(())
     }
@@ -8574,27 +8706,46 @@ impl NativeMappedMemory {
 
         let mut snapshots = Vec::with_capacity(pages.len());
         let apply_result = (|| {
-            for &(page_start, host_page, ptr) in &pages {
-                let old_host_prot = self.native_host_prot_for_page(page_start);
-                if prot & crate::linux_abi::LINUX_PROT_EXEC != 0 {
-                    let patched_words = Vec::new();
-                    set_host_prot(host_page, host_page_len, libc::PROT_READ)?;
-                    snapshots.push(ProtectionSnapshot {
-                        host_page,
-                        ptr,
-                        old_host_prot,
-                        patched_words,
-                    });
-                    unsafe { carrick_native_clear_icache(ptr, host_page_len) };
-                } else {
-                    snapshots.push(ProtectionSnapshot {
-                        host_page,
-                        ptr,
-                        old_host_prot,
-                        patched_words: Vec::new(),
-                    });
+            // The final host protection is uniform across this call, so a
+            // maximal run of adjacent host pages collapses into ONE
+            // mprotect per phase. Snapshots and metadata stay per page.
+            let mut index = 0;
+            while index < pages.len() {
+                let mut end = index + 1;
+                while end < pages.len()
+                    && pages[end - 1].0.checked_add(self.host_page_size) == Some(pages[end].0)
+                {
+                    end += 1;
                 }
-                set_host_prot(host_page, host_page_len, host_prot)?;
+                let run_pages = &pages[index..end];
+                let (_, run_host, run_ptr) = run_pages[0];
+                let run_len = host_page_len * run_pages.len();
+                if prot & crate::linux_abi::LINUX_PROT_EXEC != 0 {
+                    set_host_prot(run_host, run_len, libc::PROT_READ)?;
+                    for &(page_start, host_page, ptr) in run_pages {
+                        snapshots.push(ProtectionSnapshot {
+                            host_page,
+                            ptr,
+                            old_host_prot: self.native_host_prot_for_page(page_start),
+                            patched_words: Vec::new(),
+                        });
+                    }
+                    // Every page in an exec run received the icache clear
+                    // before coalescing; the run-wide clear covers exactly
+                    // the same pages.
+                    unsafe { carrick_native_clear_icache(run_ptr, run_len) };
+                } else {
+                    for &(page_start, host_page, ptr) in run_pages {
+                        snapshots.push(ProtectionSnapshot {
+                            host_page,
+                            ptr,
+                            old_host_prot: self.native_host_prot_for_page(page_start),
+                            patched_words: Vec::new(),
+                        });
+                    }
+                }
+                set_host_prot(run_host, run_len, host_prot)?;
+                index = end;
             }
             Ok(())
         })();
@@ -8764,22 +8915,7 @@ impl GuestMemory for NativeMappedMemory {
         let result = if self.uses_linux4k_subpages() {
             self.protect_linux4k_range(address, len, prot)
         } else {
-            self.protect_native16k_range_with(
-                address,
-                len,
-                prot,
-                |host_page, page_len, host_prot| {
-                    let ptr = host_page.raw() as *mut libc::c_void;
-                    if unsafe { libc::mprotect(ptr, page_len, host_prot) } != 0 {
-                        return Err(MemoryError::HostMap(format!(
-                            "mprotect native Darwin host page 0x{:x}: {}",
-                            host_page.raw(),
-                            std::io::Error::last_os_error()
-                        )));
-                    }
-                    Ok(())
-                },
-            )
+            self.protect_native16k_range_with(address, len, prot, native_host_mprotect)
         };
         result?;
         if old_exec || prot & crate::linux_abi::LINUX_PROT_EXEC != 0 {
@@ -8890,6 +9026,25 @@ fn native16k_host_prot(prot: u64) -> libc::c_int {
         host_prot = (host_prot & !libc::PROT_EXEC) | libc::PROT_READ;
     }
     host_prot
+}
+
+/// Applies one host `mprotect` over a contiguous run of host pages. This is
+/// the production `set_host_prot` for the injectable protect/prepare/restore
+/// loops; tests substitute a recording spy to assert call coalescing.
+fn native_host_mprotect(
+    host_page: carrick_guest_mem::HostVa,
+    len: usize,
+    host_prot: libc::c_int,
+) -> Result<(), MemoryError> {
+    let ptr = host_page.raw() as *mut libc::c_void;
+    if unsafe { libc::mprotect(ptr, len, host_prot) } != 0 {
+        return Err(MemoryError::HostMap(format!(
+            "mprotect native Darwin host page 0x{:x}: {}",
+            host_page.raw(),
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Default)]
@@ -9729,6 +9884,14 @@ mod tests {
         guest_start: carrick_guest_mem::GuestVa,
         len: usize,
     ) -> NativeMappedMemory {
+        biased_test_memory_with_geometry(guest_start, len, 16 * 1024)
+    }
+
+    fn biased_test_memory_with_geometry(
+        guest_start: carrick_guest_mem::GuestVa,
+        len: usize,
+        linux_page_size: u64,
+    ) -> NativeMappedMemory {
         let mapped = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -9768,7 +9931,7 @@ mod tests {
             exclusive_reservation: None,
             exclusive_sequences: BTreeMap::new(),
             host_page_size: 16 * 1024,
-            linux_page_size: 16 * 1024,
+            linux_page_size,
             dsr_generations: dsr::cache::PageGenerationTable::new(16 * 1024)
                 .expect("generation table"),
             dsr_translator: None,
@@ -12598,7 +12761,10 @@ mod tests {
                             let call = calls.get() + 1;
                             calls.set(call);
                             operations.borrow_mut().push((host_page, host_prot));
-                            if call == 4 {
+                            // The two coalesced pages protect in two calls:
+                            // the run-wide PROT_READ phase, then the final
+                            // run-wide protection. Fail the LATE call.
+                            if call == 2 {
                                 return Err(MemoryError::HostMap(
                                     "injected final protection failure".to_string(),
                                 ));
@@ -12623,9 +12789,11 @@ mod tests {
                     let words_restored = writable
                         && memory.read_u32(layout.mmap_base).ok() == Some(SVC_0)
                         && memory.read_u32(layout.mmap_base + page_size).ok() == Some(SVC_0);
+                    // Coalesced: apply is [run PROT_READ, run final(fails)],
+                    // rollback restores each page individually -> 4 calls.
                     let rollback_calls = operations.borrow();
                     Ok(result.is_err()
-                        && rollback_calls.len() >= 6
+                        && rollback_calls.len() == 4
                         && memory.native_page_protections.is_empty()
                         && memory.native_write_exec_writable_pages.is_empty()
                         && words_restored)
@@ -12681,6 +12849,429 @@ mod tests {
         assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
         assert!(libc::WIFEXITED(status), "child status was 0x{status:x}");
         assert_eq!(libc::WEXITSTATUS(status), 0);
+    }
+
+    #[test]
+    fn native16k_protect_coalesces_contiguous_same_prot_pages_into_one_call() {
+        fork_test(|| {
+            let page = 16 * 1024_u64;
+            let guest = carrick_guest_mem::GuestVa(0x40_0000);
+            let mut memory =
+                biased_test_memory_with_geometry(guest, (4 * page) as usize, 16 * 1024);
+            let calls = RefCell::new(Vec::new());
+            memory
+                .protect_native16k_range_with(
+                    guest.raw(),
+                    (4 * page) as usize,
+                    crate::linux_abi::LINUX_PROT_READ,
+                    |host_page, len, host_prot| {
+                        calls.borrow_mut().push((host_page.raw(), len, host_prot));
+                        Ok(())
+                    },
+                )
+                .expect("protect contiguous run");
+            let host_base = memory.host_address(guest).expect("host base").raw();
+            assert_eq!(
+                calls.into_inner(),
+                vec![(host_base, (4 * page) as usize, libc::PROT_READ)],
+                "a contiguous same-protection run must be ONE host mprotect call"
+            );
+            // Per-page bookkeeping must be unchanged by syscall coalescing.
+            for index in 0..4_u64 {
+                assert_eq!(
+                    memory
+                        .native_page_protections
+                        .get(&(guest.raw() + index * page))
+                        .copied(),
+                    Some(crate::linux_abi::LINUX_PROT_READ),
+                    "page {index} must keep its own protection entry"
+                );
+            }
+            assert_eq!(memory.native_page_protections.len(), 4);
+        });
+    }
+
+    #[test]
+    fn native16k_exec_protect_coalesces_both_phases_over_the_run() {
+        fork_test(|| {
+            let page = 16 * 1024_u64;
+            let guest = carrick_guest_mem::GuestVa(0x40_0000);
+            let mut memory =
+                biased_test_memory_with_geometry(guest, (3 * page) as usize, 16 * 1024);
+            let prot = crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_EXEC;
+            let calls = RefCell::new(Vec::new());
+            memory
+                .protect_native16k_range_with(
+                    guest.raw(),
+                    (3 * page) as usize,
+                    prot,
+                    |host_page, len, host_prot| {
+                        calls.borrow_mut().push((host_page.raw(), len, host_prot));
+                        Ok(())
+                    },
+                )
+                .expect("protect exec run");
+            let host_base = memory.host_address(guest).expect("host base").raw();
+            // Exec protection keeps its two-phase shape (icache-visible
+            // PROT_READ window, then the final downgraded protection), but
+            // each phase covers the whole contiguous run in one call.
+            assert_eq!(
+                calls.into_inner(),
+                vec![
+                    (host_base, (3 * page) as usize, libc::PROT_READ),
+                    (host_base, (3 * page) as usize, native16k_host_prot(prot)),
+                ],
+                "exec runs must issue exactly one call per phase over the run"
+            );
+            for index in 0..3_u64 {
+                assert_eq!(
+                    memory
+                        .native_page_protections
+                        .get(&(guest.raw() + index * page))
+                        .copied(),
+                    Some(prot),
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn native16k_protect_splits_coalesced_runs_at_region_gaps() {
+        fork_test(|| {
+            let page = 16 * 1024_u64;
+            let guest = carrick_guest_mem::GuestVa(0x40_0000);
+            let mut memory =
+                biased_test_memory_with_geometry(guest, (5 * page) as usize, 16 * 1024);
+            // Two host-protected regions with a one-page hole between them:
+            // pages 0-1 and pages 3-4.
+            memory.regions = vec![
+                NativeMappedRegion {
+                    start: guest.raw(),
+                    end: guest.raw() + 2 * page,
+                    host_protects: true,
+                    shared_futex: false,
+                    guest_writable: true,
+                    default_prot: crate::linux_abi::LINUX_PROT_READ
+                        | crate::linux_abi::LINUX_PROT_WRITE,
+                    shared_key_base: 0,
+                    shared_key_offset: 0,
+                },
+                NativeMappedRegion {
+                    start: guest.raw() + 3 * page,
+                    end: guest.raw() + 5 * page,
+                    host_protects: true,
+                    shared_futex: false,
+                    guest_writable: true,
+                    default_prot: crate::linux_abi::LINUX_PROT_READ
+                        | crate::linux_abi::LINUX_PROT_WRITE,
+                    shared_key_base: 0,
+                    shared_key_offset: 0,
+                },
+            ];
+            let calls = RefCell::new(Vec::new());
+            memory
+                .protect_native16k_range_with(
+                    guest.raw(),
+                    (5 * page) as usize,
+                    crate::linux_abi::LINUX_PROT_READ,
+                    |host_page, len, host_prot| {
+                        calls.borrow_mut().push((host_page.raw(), len, host_prot));
+                        Ok(())
+                    },
+                )
+                .expect("protect across gap");
+            let host_base = memory.host_address(guest).expect("host base").raw();
+            let host_page = 16 * 1024_usize;
+            assert_eq!(
+                calls.into_inner(),
+                vec![
+                    (host_base, 2 * host_page, libc::PROT_READ),
+                    (host_base + 3 * host_page, 2 * host_page, libc::PROT_READ),
+                ],
+                "runs must split exactly at the non-contiguous page boundary"
+            );
+            // Bookkeeping only for pages inside host-protected regions.
+            assert_eq!(memory.native_page_protections.len(), 4);
+            assert!(
+                !memory
+                    .native_page_protections
+                    .contains_key(&(guest.raw() + 2 * page)),
+                "the hole page must not gain a protection entry"
+            );
+        });
+    }
+
+    #[test]
+    fn linux4k_protect_coalesces_uniform_host_pages_into_one_call() {
+        fork_test(|| {
+            let host_page = 16 * 1024_u64;
+            let guest = carrick_guest_mem::GuestVa(0x40_0000);
+            let mut memory =
+                biased_test_memory_with_geometry(guest, (4 * host_page) as usize, 4 * 1024);
+            let prot = crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_WRITE;
+            let calls = RefCell::new(Vec::new());
+            memory
+                .protect_linux4k_range_with(
+                    guest.raw(),
+                    (4 * host_page) as usize,
+                    prot,
+                    |host_va, len, host_prot| {
+                        calls.borrow_mut().push((host_va.raw(), len, host_prot));
+                        Ok(())
+                    },
+                )
+                .expect("protect uniform linux4k run");
+            let host_base = memory.host_address(guest).expect("host base").raw();
+            assert_eq!(
+                calls.into_inner(),
+                vec![(
+                    host_base,
+                    (4 * host_page) as usize,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                )],
+                "uniform linux4k host pages must merge into one mprotect call"
+            );
+            // Per-host-page subpage bookkeeping stays per page.
+            for index in 0..4_u64 {
+                assert_eq!(
+                    memory
+                        .linux4k_page_protections
+                        .get(&(guest.raw() + index * host_page))
+                        .copied(),
+                    Some([prot; 4]),
+                    "host page {index} must keep its own subpage protections"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn linux4k_protect_splits_runs_where_final_host_prot_differs() {
+        fork_test(|| {
+            let host_page = 16 * 1024_u64;
+            let linux_page = 4 * 1024_u64;
+            let guest = carrick_guest_mem::GuestVa(0x40_0000);
+            let mut memory =
+                biased_test_memory_with_geometry(guest, (3 * host_page) as usize, linux_page);
+            // Cover host pages 0-1 fully and only the first 4k subpage of
+            // host page 2: pages 0-1 become uniform READ (host PROT_READ),
+            // page 2 becomes mixed READ/RW (host PROT_NONE guard).
+            let calls = RefCell::new(Vec::new());
+            memory
+                .protect_linux4k_range_with(
+                    guest.raw(),
+                    (2 * host_page + linux_page) as usize,
+                    crate::linux_abi::LINUX_PROT_READ,
+                    |host_va, len, host_prot| {
+                        calls.borrow_mut().push((host_va.raw(), len, host_prot));
+                        Ok(())
+                    },
+                )
+                .expect("protect split linux4k run");
+            let host_base = memory.host_address(guest).expect("host base").raw();
+            assert_eq!(
+                calls.into_inner(),
+                vec![
+                    (host_base, 2 * 16 * 1024_usize, libc::PROT_READ),
+                    (
+                        host_base + 2 * 16 * 1024_usize,
+                        16 * 1024_usize,
+                        libc::PROT_NONE
+                    ),
+                ],
+                "the run must split exactly where the resolved host prot changes"
+            );
+            let rw = crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_WRITE;
+            let read = crate::linux_abi::LINUX_PROT_READ;
+            assert_eq!(
+                memory
+                    .linux4k_page_protections
+                    .get(&(guest.raw() + 2 * host_page))
+                    .copied(),
+                Some([read, rw, rw, rw]),
+                "the mixed page must keep exact per-subpage protections"
+            );
+        });
+    }
+
+    #[test]
+    fn linux4k_protect_coalesces_across_exec_icache_subset_pages() {
+        fork_test(|| {
+            let host_page = 16 * 1024_u64;
+            let linux_page = 4 * 1024_u64;
+            let guest = carrick_guest_mem::GuestVa(0x40_0000);
+            let mut memory =
+                biased_test_memory_with_geometry(guest, (2 * host_page) as usize, linux_page);
+            let read_exec = crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_EXEC;
+            // Seed host page 0 with an executable first subpage so the
+            // protect below leaves it exec-mixed (icache clear + PROT_READ
+            // guard downgrade) while host page 1 resolves to plain uniform
+            // PROT_READ. Both end at PROT_READ, so the syscall coalesces
+            // even though only page 0 needs the icache clear.
+            memory
+                .linux4k_page_protections
+                .insert(guest.raw(), [read_exec; 4]);
+            let calls = RefCell::new(Vec::new());
+            memory
+                .protect_linux4k_range_with(
+                    guest.raw() + linux_page,
+                    (2 * host_page - linux_page) as usize,
+                    crate::linux_abi::LINUX_PROT_READ,
+                    |host_va, len, host_prot| {
+                        calls.borrow_mut().push((host_va.raw(), len, host_prot));
+                        Ok(())
+                    },
+                )
+                .expect("protect exec-subset linux4k run");
+            let host_base = memory.host_address(guest).expect("host base").raw();
+            assert_eq!(
+                calls.into_inner(),
+                vec![(host_base, 2 * 16 * 1024_usize, libc::PROT_READ)],
+                "same final host prot must coalesce even when only some pages need icache"
+            );
+            let read = crate::linux_abi::LINUX_PROT_READ;
+            assert_eq!(
+                memory.linux4k_page_protections.get(&guest.raw()).copied(),
+                Some([read_exec, read, read, read]),
+            );
+            assert_eq!(
+                memory
+                    .linux4k_page_protections
+                    .get(&(guest.raw() + host_page))
+                    .copied(),
+                Some([read; 4]),
+            );
+        });
+    }
+
+    #[test]
+    fn temporary_host_access_prepare_coalesces_contiguous_pages() {
+        fork_test(|| {
+            let page = 16 * 1024_u64;
+            let guest = carrick_guest_mem::GuestVa(0x40_0000);
+            let mut memory =
+                biased_test_memory_with_geometry(guest, (3 * page) as usize, 16 * 1024);
+            // Bookkeep all three pages as guest PROT_NONE so a supervisor
+            // read must lift every page.
+            for index in 0..3_u64 {
+                memory
+                    .native_page_protections
+                    .insert(guest.raw() + index * page, 0);
+            }
+            let calls = RefCell::new(Vec::new());
+            let changed = memory
+                .prepare_temporary_host_access_with(
+                    guest.raw(),
+                    (3 * page) as usize,
+                    false,
+                    |host_va, len, host_prot| {
+                        calls.borrow_mut().push((host_va.raw(), len, host_prot));
+                        Ok(())
+                    },
+                )
+                .expect("prepare temporary access");
+            let host_base = memory.host_address(guest).expect("host base").raw();
+            assert_eq!(
+                calls.into_inner(),
+                vec![(host_base, 3 * 16 * 1024_usize, libc::PROT_READ)],
+                "contiguous pages needing the same lift must be ONE mprotect call"
+            );
+            // The restore bookkeeping stays per page.
+            assert_eq!(
+                changed,
+                vec![
+                    (guest.raw(), libc::PROT_NONE),
+                    (guest.raw() + page, libc::PROT_NONE),
+                    (guest.raw() + 2 * page, libc::PROT_NONE),
+                ],
+            );
+        });
+    }
+
+    #[test]
+    fn temporary_host_access_prepare_splits_runs_at_satisfied_pages() {
+        fork_test(|| {
+            let page = 16 * 1024_u64;
+            let guest = carrick_guest_mem::GuestVa(0x40_0000);
+            let mut memory =
+                biased_test_memory_with_geometry(guest, (3 * page) as usize, 16 * 1024);
+            memory.native_page_protections.insert(guest.raw(), 0);
+            // Middle page is already readable: prepare must skip it and
+            // split the mprotect runs around it.
+            memory
+                .native_page_protections
+                .insert(guest.raw() + page, crate::linux_abi::LINUX_PROT_READ);
+            memory
+                .native_page_protections
+                .insert(guest.raw() + 2 * page, 0);
+            let calls = RefCell::new(Vec::new());
+            let changed = memory
+                .prepare_temporary_host_access_with(
+                    guest.raw(),
+                    (3 * page) as usize,
+                    false,
+                    |host_va, len, host_prot| {
+                        calls.borrow_mut().push((host_va.raw(), len, host_prot));
+                        Ok(())
+                    },
+                )
+                .expect("prepare split access");
+            let host_base = memory.host_address(guest).expect("host base").raw();
+            let host_page = 16 * 1024_usize;
+            assert_eq!(
+                calls.into_inner(),
+                vec![
+                    (host_base, host_page, libc::PROT_READ),
+                    (host_base + 2 * host_page, host_page, libc::PROT_READ),
+                ],
+                "an already-satisfied page must split the coalesced run"
+            );
+            assert_eq!(
+                changed,
+                vec![
+                    (guest.raw(), libc::PROT_NONE),
+                    (guest.raw() + 2 * page, libc::PROT_NONE),
+                ],
+            );
+        });
+    }
+
+    #[test]
+    fn temporary_host_access_restore_coalesces_adjacent_same_prot_pages() {
+        fork_test(|| {
+            let page = 16 * 1024_u64;
+            let guest = carrick_guest_mem::GuestVa(0x40_0000);
+            let memory = biased_test_memory_with_geometry(guest, (3 * page) as usize, 16 * 1024);
+            // Page 0 restores to PROT_READ; pages 1-2 restore to PROT_NONE.
+            let changed = vec![
+                (guest.raw(), libc::PROT_READ),
+                (guest.raw() + page, libc::PROT_NONE),
+                (guest.raw() + 2 * page, libc::PROT_NONE),
+            ];
+            let calls = RefCell::new(Vec::new());
+            memory
+                .restore_temporary_host_access_with(
+                    &changed,
+                    guest.raw(),
+                    (3 * page) as usize,
+                    |host_va, len, host_prot| {
+                        calls.borrow_mut().push((host_va.raw(), len, host_prot));
+                        Ok(())
+                    },
+                )
+                .expect("restore temporary access");
+            let host_base = memory.host_address(guest).expect("host base").raw();
+            let host_page = 16 * 1024_usize;
+            assert_eq!(
+                calls.into_inner(),
+                vec![
+                    (host_base + host_page, 2 * host_page, libc::PROT_NONE),
+                    (host_base, host_page, libc::PROT_READ),
+                ],
+                "adjacent pages with the same recorded prot must restore in one call; \
+                 differing prots must stay exact per page"
+            );
+        });
     }
 
     #[test]
