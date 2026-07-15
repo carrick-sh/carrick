@@ -1888,6 +1888,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                     snapshot,
                     thread_runtime.tid(),
                     thread_runtime.registry.live_count(),
+                    &mut thread_runtime.exclusive_reservation,
                     kind,
                     address,
                     &mut translator,
@@ -2531,6 +2532,7 @@ fn lower_dsr_fault(
     mut snapshot: NativeUcontextSnapshot,
     tid: crate::thread::ThreadId,
     live_threads: usize,
+    reservation: &mut Option<NativeExclusiveReservation>,
     fault: dsr::ThreadFault,
     fault_address: dsr::ThreadFaultAddress,
     translator: &mut dsr::ThreadTranslator,
@@ -2601,7 +2603,7 @@ fn lower_dsr_fault(
                  guarded-page fault emulation is not multithread-safe"
             )));
         }
-        emulate_linux4k_guarded_fault(&mut memory.lock(), &mut snapshot)?;
+        emulate_linux4k_guarded_fault(&mut memory.lock(), &mut snapshot, reservation)?;
         return Ok(snapshot);
     }
     let (mut signum, mut si_code, si_addr) = match fault {
@@ -5908,6 +5910,7 @@ fn emulate_dsr_exclusive_access(
 fn emulate_linux4k_guarded_exclusive_access(
     memory: &mut NativeMappedMemory,
     snapshot: &mut NativeUcontextSnapshot,
+    reservation: &mut Option<NativeExclusiveReservation>,
     instruction: &bad64::Instruction,
     fault_address: u64,
 ) -> Result<(), RuntimeError> {
@@ -5994,7 +5997,7 @@ fn emulate_linux4k_guarded_exclusive_access(
 
     if load {
         let value = memory
-            .exclusive_load(address, width, acquire)
+            .exclusive_load(address, width, acquire, reservation)
             .map_err(|error| {
                 RuntimeError::Unsupported(format!(
                     "native linux4k exclusive load failed at 0x{address:x}: {error}"
@@ -6012,7 +6015,7 @@ fn emulate_linux4k_guarded_exclusive_access(
             ))
         })?;
         let stored = memory
-            .exclusive_store(address, width, value, release)
+            .exclusive_store(address, width, value, release, reservation)
             .map_err(|error| {
                 RuntimeError::Unsupported(format!(
                     "native linux4k exclusive store failed at 0x{address:x}: {error}"
@@ -6038,6 +6041,7 @@ fn emulate_linux4k_guarded_exclusive_access(
 fn emulate_linux4k_guarded_fault(
     memory: &mut NativeMappedMemory,
     snapshot: &mut NativeUcontextSnapshot,
+    reservation: &mut Option<NativeExclusiveReservation>,
 ) -> Result<(), RuntimeError> {
     let fault_address = if snapshot.fault_address != 0 {
         snapshot.fault_address
@@ -6132,6 +6136,7 @@ fn emulate_linux4k_guarded_fault(
         return emulate_linux4k_guarded_exclusive_access(
             memory,
             snapshot,
+            reservation,
             &instruction,
             fault_address,
         );
@@ -6282,13 +6287,13 @@ struct NativeMappedMemory {
     native_page_protections: BTreeMap<u64, u64>,
     native_write_exec_writable_pages: BTreeSet<u64>,
     linux4k_page_protections: BTreeMap<u64, [u64; 4]>,
-    exclusive_reservation: Option<NativeExclusiveReservation>,
-    // Interior mutability lets exclusive-sequence bookkeeping run through a
-    // shared `&self`, independent of `exclusive_reservation`'s `&mut self`
-    // requirement above. This is the exclusive-monitor half of unblocking
-    // the read-mostly `NativeMappedMemory` hot path; `exclusive_reservation`
-    // still forces the containing methods to take `&mut self` until it too
-    // moves to per-thread state.
+    // The exclusive-monitor reservation itself now lives per guest thread
+    // (`NativeThreadRuntime.exclusive_reservation`), not here. The DSR-hot
+    // path already threaded it through `exclusive_load_for`/`exclusive_store_for`;
+    // the single-threaded-gated linux4k guarded path (`emulate_linux4k_guarded_*`)
+    // now does the same via `exclusive_load`/`exclusive_store`. Only the shared
+    // sequence bookkeeping below remains on the struct, behind its own interior
+    // lock so it stays reachable through a shared `&self`.
     exclusive_sequences:
         parking_lot::Mutex<BTreeMap<NativeExclusiveLocation, NativeExclusiveSequence>>,
     host_page_size: u64,
@@ -7012,7 +7017,6 @@ impl NativeMappedMemory {
                 native_page_protections: BTreeMap::new(),
                 native_write_exec_writable_pages: BTreeSet::new(),
                 linux4k_page_protections: BTreeMap::new(),
-                exclusive_reservation: None,
                 exclusive_sequences: parking_lot::Mutex::new(BTreeMap::new()),
                 host_page_size: page_sizes.host,
                 linux_page_size: page_sizes.linux,
@@ -7754,11 +7758,11 @@ impl NativeMappedMemory {
 
     /// Bumps the sequence for every tracked exclusive location that overlaps
     /// `[address, address+len)`, or every tracked location if `address+len`
-    /// overflows. This is the `exclusive_sequences` half of
-    /// `invalidate_exclusive_range`'s work, split into its own `&self`
-    /// accessor because `exclusive_sequences` now carries its own lock: the
-    /// other half (invalidating `exclusive_reservation`) still needs
-    /// `&mut self` until a later task moves that field to per-thread state.
+    /// overflows. This is `invalidate_exclusive_range`'s entire job: every
+    /// exclusive reservation now lives in caller-owned state (per guest
+    /// thread), so bumping the shared sequence a reservation was captured
+    /// against is sufficient to invalidate it on the next CAS -- there is no
+    /// struct-embedded reservation left to null out here.
     fn bump_exclusive_sequences_in_range(&self, address: u64, len: usize) {
         let mut sequences = self.exclusive_sequences.lock();
         let end = address.checked_add(len as u64);
@@ -7796,24 +7800,6 @@ impl NativeMappedMemory {
 
     fn invalidate_exclusive_range(&mut self, address: u64, len: usize) {
         self.bump_exclusive_sequences_in_range(address, len);
-        let Some(reservation) = self.exclusive_reservation else {
-            return;
-        };
-        let Some(end) = address.checked_add(len as u64) else {
-            self.exclusive_reservation = None;
-            return;
-        };
-        let Some(reservation_end) = reservation
-            .location
-            .address
-            .checked_add(reservation.location.width as u64)
-        else {
-            self.exclusive_reservation = None;
-            return;
-        };
-        if address < reservation_end && reservation.location.address < end {
-            self.exclusive_reservation = None;
-        }
     }
 
     fn atomic_load(&self, address: u64, width: usize) -> Result<u64, MemoryError> {
@@ -7939,16 +7925,22 @@ impl NativeMappedMemory {
             .or_insert(NativeExclusiveSequence::INITIAL)
     }
 
+    /// Entry point for the single-threaded-gated linux4k guarded exclusive
+    /// path (`emulate_linux4k_guarded_exclusive_access`). Unlike the
+    /// DSR-hot path, which calls `exclusive_load_for` directly, this keeps
+    /// its own name to mirror `exclusive_store` below; both simply thread
+    /// the caller-owned `reservation` (the current guest thread's
+    /// `NativeThreadRuntime.exclusive_reservation`) through to the `_for`
+    /// implementation. `NativeMappedMemory` itself no longer owns any
+    /// reservation state.
     fn exclusive_load(
         &mut self,
         address: u64,
         width: usize,
         acquire: bool,
+        reservation: &mut Option<NativeExclusiveReservation>,
     ) -> Result<u64, MemoryError> {
-        let mut reservation = self.exclusive_reservation.take();
-        let result = self.exclusive_load_for(address, width, acquire, &mut reservation);
-        self.exclusive_reservation = reservation;
-        result
+        self.exclusive_load_for(address, width, acquire, reservation)
     }
 
     fn exclusive_load_for(
@@ -7993,17 +7985,18 @@ impl NativeMappedMemory {
         Ok(observed)
     }
 
+    /// See `exclusive_load`: the linux4k guarded counterpart of
+    /// `exclusive_store_for`, threading the caller-owned reservation through
+    /// instead of consulting struct-embedded state.
     fn exclusive_store(
         &mut self,
         address: u64,
         width: usize,
         value: u64,
         release: bool,
+        reservation: &mut Option<NativeExclusiveReservation>,
     ) -> Result<bool, MemoryError> {
-        let mut reservation = self.exclusive_reservation.take();
-        let result = self.exclusive_store_for(address, width, value, release, &mut reservation);
-        self.exclusive_reservation = reservation;
-        result
+        self.exclusive_store_for(address, width, value, release, reservation)
     }
 
     /// Returns the current sequence for `location`, or
@@ -9986,7 +9979,6 @@ mod tests {
             native_page_protections: BTreeMap::new(),
             native_write_exec_writable_pages: BTreeSet::new(),
             linux4k_page_protections: BTreeMap::new(),
-            exclusive_reservation: None,
             exclusive_sequences: parking_lot::Mutex::new(BTreeMap::new()),
             host_page_size: 16 * 1024,
             linux_page_size,
@@ -10111,31 +10103,86 @@ mod tests {
                 .atomic_store(address, 4, 1)
                 .expect("seed atomic word");
 
-            // Record an exclusive reservation. This step still needs &mut self:
-            // exclusive_reservation is out of this task's scope and keeps that
-            // requirement until a later task moves it to per-thread state.
+            // Record an exclusive reservation into a caller-owned slot: memory
+            // no longer has an `exclusive_reservation` field of its own.
+            let mut reservation: Option<NativeExclusiveReservation> = None;
             let observed = memory
-                .exclusive_load(address, 4, true)
+                .exclusive_load(address, 4, true, &mut reservation)
                 .expect("exclusive load");
             assert_eq!(observed, 1);
 
             // Drive the overlapping-write invalidation through a SHARED reference:
-            // exclusive_sequences now carries its own lock, so the sequence bump
-            // that a plain data write performs is reachable via &self, independent
-            // of the &mut self that exclusive_reservation still requires above.
+            // exclusive_sequences carries its own lock, so the sequence bump that a
+            // plain data write performs is reachable via &self, independent of the
+            // &mut self the CAS attempt below still requires.
             let shared: &NativeMappedMemory = &memory;
             shared.bump_exclusive_sequences_in_range(address, 4);
 
             // The reservation captured above is now stale: a subsequent exclusive
             // store must observe the CAS failure and leave memory unchanged.
             let stored = memory
-                .exclusive_store(address, 4, 2, true)
+                .exclusive_store(address, 4, 2, true, &mut reservation)
                 .expect("exclusive store attempt");
             assert!(
                 !stored,
                 "store must fail: &self overlapping write invalidated the reservation"
             );
             assert_eq!(memory.atomic_load(address, 4).unwrap(), 1);
+        });
+    }
+
+    #[test]
+    fn linux4k_exclusive_load_store_round_trip_uses_explicit_reservation() {
+        fork_test(|| {
+            let address = 0x40_0080;
+            let mut memory = biased_test_memory(carrick_guest_mem::GuestVa(0x40_0000), 0x4000);
+            memory
+                .atomic_store(address, 4, 1)
+                .expect("seed atomic word");
+
+            // NativeMappedMemory no longer owns an `exclusive_reservation` field:
+            // the linux4k guarded exclusive path (`emulate_linux4k_guarded_exclusive_access`)
+            // threads a per-thread reservation into `exclusive_load`/`exclusive_store`
+            // exactly like `NativeThreadRuntime.exclusive_reservation` does for the
+            // DSR-hot path. This local variable is the only place the reservation
+            // lives across the two calls below.
+            let mut reservation: Option<NativeExclusiveReservation> = None;
+
+            let observed = memory
+                .exclusive_load(address, 4, true, &mut reservation)
+                .expect("exclusive load");
+            assert_eq!(observed, 1);
+            assert!(
+                reservation.is_some(),
+                "load must populate the caller-owned reservation slot"
+            );
+
+            let stored = memory
+                .exclusive_store(address, 4, 2, true, &mut reservation)
+                .expect("exclusive store attempt");
+            assert!(stored, "unchanged reservation must store");
+            assert!(reservation.is_none(), "store consumes the reservation");
+            assert_eq!(memory.atomic_load(address, 4).unwrap(), 2);
+
+            // ABA / interference: reload the reservation, let an unrelated write
+            // invalidate it via the shared `exclusive_sequences` map, then confirm
+            // the CAS fails using ONLY the caller-supplied reservation -- there is
+            // no struct-embedded state left to consult.
+            memory
+                .exclusive_load(address, 4, true, &mut reservation)
+                .expect("reload reservation");
+            memory
+                .atomic_store(address, 4, 9)
+                .expect("interfere with reservation");
+            let interfered = memory
+                .exclusive_store(address, 4, 3, true, &mut reservation)
+                .expect("exclusive store attempt after interference");
+            assert!(!interfered, "interfered reservation must fail to store");
+            assert!(
+                reservation.is_none(),
+                "failed store still consumes the reservation"
+            );
+            assert_eq!(memory.atomic_load(address, 4).unwrap(), 9);
         });
     }
 
@@ -11756,7 +11803,6 @@ mod tests {
             native_page_protections: BTreeMap::new(),
             native_write_exec_writable_pages: BTreeSet::new(),
             linux4k_page_protections: BTreeMap::new(),
-            exclusive_reservation: None,
             exclusive_sequences: parking_lot::Mutex::new(BTreeMap::new()),
             host_page_size: 16 * 1024,
             linux_page_size: 16 * 1024,
@@ -11889,7 +11935,6 @@ mod tests {
             native_page_protections: BTreeMap::new(),
             native_write_exec_writable_pages: BTreeSet::new(),
             linux4k_page_protections: BTreeMap::new(),
-            exclusive_reservation: None,
             exclusive_sequences: parking_lot::Mutex::new(BTreeMap::new()),
             host_page_size: 16 * 1024,
             linux_page_size: 16 * 1024,
@@ -12604,7 +12649,6 @@ mod tests {
             native_page_protections: BTreeMap::new(),
             native_write_exec_writable_pages: BTreeSet::new(),
             linux4k_page_protections: BTreeMap::new(),
-            exclusive_reservation: None,
             exclusive_sequences: parking_lot::Mutex::new(BTreeMap::new()),
             host_page_size: page_size,
             linux_page_size: page_size,
@@ -13546,6 +13590,7 @@ mod tests {
                 .and_then(|mut memory| {
                     let pc = layout.mmap_base;
                     let address = layout.mmap_base + host_page_size + linux_page_size;
+                    let mut reservation: Option<NativeExclusiveReservation> = None;
                     write_linux4k_test_instruction(&mut memory, pc, host_page_size, 0xf940_0020)?;
                     memory
                         .protect_range(
@@ -13564,7 +13609,7 @@ mod tests {
                         ..NativeUcontextSnapshot::default()
                     };
                     snapshot.x[1] = address;
-                    emulate_linux4k_guarded_fault(&mut memory, &mut snapshot)?;
+                    emulate_linux4k_guarded_fault(&mut memory, &mut snapshot, &mut reservation)?;
                     if snapshot.x[0] != 0x1122_3344_5566_7788 || snapshot.pc != pc + 4 {
                         return Err(RuntimeError::Unsupported(format!(
                             "emulated load produced x0=0x{:x} pc=0x{:x}",
@@ -13575,7 +13620,7 @@ mod tests {
                     snapshot.pc = pc;
                     snapshot.fault_address = address;
                     snapshot.v[0] = [0; 16];
-                    emulate_linux4k_guarded_fault(&mut memory, &mut snapshot)?;
+                    emulate_linux4k_guarded_fault(&mut memory, &mut snapshot, &mut reservation)?;
                     let mut expected = [0_u8; 16];
                     expected[..8].copy_from_slice(&0x1122_3344_5566_7788_u64.to_le_bytes());
                     if snapshot.v[0] != expected || snapshot.pc != pc + 4 {
@@ -13591,7 +13636,7 @@ mod tests {
                     snapshot.pc = pc;
                     snapshot.fault_address = address + 16;
                     snapshot.v[0] = [0; 16];
-                    emulate_linux4k_guarded_fault(&mut memory, &mut snapshot)?;
+                    emulate_linux4k_guarded_fault(&mut memory, &mut snapshot, &mut reservation)?;
                     if snapshot.v[0] != [0xa5; 16] || snapshot.pc != pc + 4 {
                         return Err(RuntimeError::Unsupported(format!(
                             "emulated q load produced v0={:02x?} pc=0x{:x}",
@@ -13606,7 +13651,7 @@ mod tests {
                     snapshot.fault_address = address;
                     snapshot.v[0] = [0; 16];
                     snapshot.v[1] = [0; 16];
-                    emulate_linux4k_guarded_fault(&mut memory, &mut snapshot)?;
+                    emulate_linux4k_guarded_fault(&mut memory, &mut snapshot, &mut reservation)?;
                     if snapshot.v[0] != expected
                         || snapshot.v[1] != [0xa5; 16]
                         || snapshot.pc != pc + 4
@@ -13646,6 +13691,7 @@ mod tests {
                 .and_then(|mut memory| {
                     let pc = layout.mmap_base;
                     let address = layout.mmap_base + host_page_size + linux_page_size;
+                    let mut reservation: Option<NativeExclusiveReservation> = None;
                     write_linux4k_test_instruction(&mut memory, pc, host_page_size, 0x885f_fc40)?;
                     memory
                         .protect_range(
@@ -13665,7 +13711,7 @@ mod tests {
                         ..NativeUcontextSnapshot::default()
                     };
                     snapshot.x[2] = address;
-                    emulate_linux4k_guarded_fault(&mut memory, &mut snapshot)?;
+                    emulate_linux4k_guarded_fault(&mut memory, &mut snapshot, &mut reservation)?;
                     if snapshot.x[0] != 7 || snapshot.pc != pc + 4 {
                         return Err(RuntimeError::Unsupported(format!(
                             "emulated ldaxr produced x0={} pc=0x{:x}",
@@ -13676,7 +13722,7 @@ mod tests {
                     write_linux4k_test_instruction(&mut memory, pc, host_page_size, 0x8803_fc44)?;
                     snapshot.pc = pc;
                     snapshot.x[4] = 9;
-                    emulate_linux4k_guarded_fault(&mut memory, &mut snapshot)?;
+                    emulate_linux4k_guarded_fault(&mut memory, &mut snapshot, &mut reservation)?;
                     let stored = memory
                         .read_bytes_raw(address, std::mem::size_of::<u32>())
                         .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
@@ -13690,14 +13736,14 @@ mod tests {
 
                     write_linux4k_test_instruction(&mut memory, pc, host_page_size, 0x885f_fc40)?;
                     snapshot.pc = pc;
-                    emulate_linux4k_guarded_fault(&mut memory, &mut snapshot)?;
+                    emulate_linux4k_guarded_fault(&mut memory, &mut snapshot, &mut reservation)?;
                     memory
                         .write_bytes_unchecked(address, &11_u32.to_le_bytes())
                         .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
                     write_linux4k_test_instruction(&mut memory, pc, host_page_size, 0x8803_fc44)?;
                     snapshot.pc = pc;
                     snapshot.x[4] = 13;
-                    emulate_linux4k_guarded_fault(&mut memory, &mut snapshot)?;
+                    emulate_linux4k_guarded_fault(&mut memory, &mut snapshot, &mut reservation)?;
                     let stored = memory
                         .read_bytes_raw(address, std::mem::size_of::<u32>())
                         .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
@@ -13741,6 +13787,7 @@ mod tests {
                 .and_then(|mut memory| {
                     let pc = layout.mmap_base;
                     let address = layout.mmap_base + host_page_size + linux_page_size;
+                    let mut reservation: Option<NativeExclusiveReservation> = None;
                     write_linux4k_test_instruction(&mut memory, pc, host_page_size, 0xf820_0020)?;
                     memory
                         .protect_range(
@@ -13761,7 +13808,7 @@ mod tests {
                     };
                     snapshot.x[0] = 5;
                     snapshot.x[1] = address;
-                    emulate_linux4k_guarded_fault(&mut memory, &mut snapshot)?;
+                    emulate_linux4k_guarded_fault(&mut memory, &mut snapshot, &mut reservation)?;
                     let stored = memory
                         .read_bytes_raw(address, std::mem::size_of::<u64>())
                         .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
@@ -13780,7 +13827,7 @@ mod tests {
                     snapshot.pc = pc;
                     snapshot.x[0] = 0;
                     snapshot.fault_address = address;
-                    emulate_linux4k_guarded_fault(&mut memory, &mut snapshot)?;
+                    emulate_linux4k_guarded_fault(&mut memory, &mut snapshot, &mut reservation)?;
                     if snapshot.x[0] != 17 || snapshot.pc != pc + 4 {
                         return Err(RuntimeError::Unsupported(format!(
                             "emulated ldar produced value={} pc=0x{:x}",
