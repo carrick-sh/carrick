@@ -100,7 +100,6 @@ fn biased_translator_fixture(words: &[u32], guest_code: GuestVa) -> BiasedTransl
             native_write_exec_writable_pages: BTreeSet::new(),
             linux4k_page_protections: BTreeMap::new(),
         }),
-        mapping_write: parking_lot::Mutex::new(()),
         protections: MemoryProtections::default(),
         exclusive_sequences: parking_lot::Mutex::new(BTreeMap::new()),
         host_access_lifts: parking_lot::Mutex::new(std::collections::HashMap::new()),
