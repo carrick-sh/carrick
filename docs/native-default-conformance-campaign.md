@@ -308,3 +308,35 @@ boundary via faithful translated exclusive regions or typed atomic lowering.
 The design explicitly forbids replacing Linux atomics with a coarse lock. The
 supervisor term (43.2 percent) is the next measured target and is tracked
 separately.
+
+## 2026-07-15 — Native memory-lock retirement Phase 2 (Mutex→RwLock) measured
+
+Retired the process-wide `Arc<parking_lot::Mutex<NativeMappedMemory>>` big lock
+to a read-mostly `RwLock` (design/plan under `docs/superpowers/{specs,plans}/
+2026-07-14-native-memory-lock-*`). The read-mostly hot syscall/trap path now
+runs concurrently; only mapping-mutating syscalls (mmap/munmap/mprotect/
+madvise/brk/exec + the mlock/shm family) take the exclusive write guard.
+Correctness backbone: a read guard yields `&NativeMappedMemory`, so a mutator
+cannot compile under it (all metadata fields are plain, no interior-mutability
+back door). Two MT hazards the refactor surfaced were fixed: concurrent
+host-page lift/restore (reference-counted) and its partial-failure rollback.
+
+Rigorous back-to-back measurement on the Go W1 reducer (go_types.test
+`TestImplicitsInfo`, 1M-trap ceiling), same load, Phase-1 (Mutex) rebuilt and
+measured minutes after Phase-2 (RwLock):
+
+| metric | Phase-1 (Mutex) | Phase-2 (RwLock) | delta |
+| --- | --- | --- | --- |
+| psynch cvwait+cvsignal (host condvar) | 2.34M | 1.17M | **-50%** |
+| untraced wall | 19.28s | 16.83s | **-12.7%** |
+| untraced sys CPU | 21.83s | 17.94s | **-17.8%** |
+| untraced user CPU | 43.44s | 43.10s | flat |
+
+Correctness: full native probe gate + the atomic/futex/thread stress suite
+(9 hazard-class probes 10/10 each; `exitgroupthreads` remains the pre-existing
+post-fork pthread-guard gap) + `just ci` green at each phase boundary.
+
+Residual: ~1.17M psynch remains, from reader<->writer contention — Go's
+frequent `mmap` arena writers take the exclusive write guard and parking_lot's
+`RwLock` blocks readers behind a queued writer. The next perf lever is sharding
+the mapping-mutator write path so `mmap` does not globally exclude readers.
