@@ -8484,6 +8484,17 @@ impl NativeMappedMemory {
             });
         }
         let changed = self.prepare_temporary_host_access(address, width, false)?;
+        // Balance the lift refcount even if `host_address` or the width
+        // match below returns early -- see `copy_bytes_to_host`. The success
+        // path DISARMS the guard and restores explicitly so a restore error
+        // still propagates; the guard only fires on early exit.
+        let mut restore_on_unwind = HostLiftRestoreGuard {
+            memory: self,
+            changed: &changed,
+            address,
+            length: width,
+            armed: true,
+        };
         let ptr = self
             .host_address(carrick_guest_mem::GuestVa(address))?
             .raw() as *mut u8;
@@ -8501,6 +8512,7 @@ impl NativeMappedMemory {
                 _ => return Err(MemoryError::Unsupported),
             }
         };
+        restore_on_unwind.armed = false;
         self.restore_temporary_host_access(&changed, address, width)?;
         let location = NativeExclusiveLocation { address, width };
         let sequence = self.exclusive_sequence_or_insert(location);
@@ -8576,6 +8588,17 @@ impl NativeMappedMemory {
             return Ok(false);
         }
         let changed = self.prepare_temporary_host_access(address, width, true)?;
+        // Balance the lift refcount even if `host_address` or the width
+        // match below returns early -- see `copy_bytes_to_host`. The success
+        // path DISARMS the guard and restores explicitly so a restore error
+        // still propagates; the guard only fires on early exit.
+        let mut restore_on_unwind = HostLiftRestoreGuard {
+            memory: self,
+            changed: &changed,
+            address,
+            length: width,
+            armed: true,
+        };
         let ptr = self
             .host_address(carrick_guest_mem::GuestVa(address))?
             .raw() as *mut u8;
@@ -8624,6 +8647,7 @@ impl NativeMappedMemory {
         if stored {
             self.bump_exclusive_sequence(location, sequence);
         }
+        restore_on_unwind.armed = false;
         self.restore_temporary_host_access(&changed, address, width)?;
         Ok(stored)
     }
@@ -14508,6 +14532,62 @@ mod tests {
             assert!(
                 memory.host_access_lifts.lock().is_empty(),
                 "a failed prepare must leave the lift table exactly as it found it",
+            );
+        });
+    }
+
+    #[test]
+    fn exclusive_load_for_restores_host_lift_on_unsupported_width_error() {
+        fork_test(|| {
+            let page = 16 * 1024_u64;
+            let guest = carrick_guest_mem::GuestVa(0x40_0000);
+            let mut memory = biased_test_memory_with_geometry(guest, page as usize, 16 * 1024);
+            // Bookkeep the page as guest PROT_NONE so `exclusive_load_for`'s
+            // `prepare_temporary_host_access` call must commit a `HostLift`
+            // refcount before its width match's `_ => return
+            // Err(Unsupported)` arm rejects an unsupported width and returns
+            // early -- exactly the prepare-then-fallible-op-then-restore
+            // window `HostLiftRestoreGuard` exists to backstop.
+            memory.native_page_protections.insert(guest.raw(), 0);
+            let mut reservation = None;
+            let error = memory
+                .exclusive_load_for(guest.raw(), 16, true, &mut reservation)
+                .expect_err("width 16 is not a supported exclusive-load width");
+            assert_eq!(error, MemoryError::Unsupported);
+            assert!(
+                memory.host_access_lifts.lock().is_empty(),
+                "an error between prepare and restore must not strand the host-lift refcount",
+            );
+        });
+    }
+
+    #[test]
+    fn exclusive_store_for_restores_host_lift_on_unsupported_width_error() {
+        fork_test(|| {
+            let page = 16 * 1024_u64;
+            let guest = carrick_guest_mem::GuestVa(0x40_0000);
+            let mut memory = biased_test_memory_with_geometry(guest, page as usize, 16 * 1024);
+            // Same setup as `exclusive_load_for_restores_host_lift_on_unsupported_width_error`,
+            // but drives `exclusive_store_for`'s prepare(write=true)-then-
+            // width-match window. The reservation is hand-built (rather than
+            // obtained via `exclusive_load_for`) so its `location.width`
+            // matches the unsupported width this call passes.
+            memory.native_page_protections.insert(guest.raw(), 0);
+            let mut reservation = Some(NativeExclusiveReservation {
+                location: NativeExclusiveLocation {
+                    address: guest.raw(),
+                    width: 16,
+                },
+                observed: 0,
+                sequence: NativeExclusiveSequence::INITIAL,
+            });
+            let error = memory
+                .exclusive_store_for(guest.raw(), 16, 0, true, &mut reservation)
+                .expect_err("width 16 is not a supported exclusive-store width");
+            assert_eq!(error, MemoryError::Unsupported);
+            assert!(
+                memory.host_access_lifts.lock().is_empty(),
+                "an error between prepare and restore must not strand the host-lift refcount",
             );
         });
     }
