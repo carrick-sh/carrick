@@ -3449,6 +3449,276 @@ fn measure_native_blocked<const PROFILE: bool, T>(
     Ok(result)
 }
 
+/// Whether AArch64 canonical syscall `nr` (`crate::linux_abi::syscall::lookup_aarch64`)
+/// can mutate `NativeMappedMemory`'s mapping/protection tables (`regions`,
+/// `owned_host_ranges`, `protections`, `native_page_protections`,
+/// `native_write_exec_writable_pages`, `linux4k_page_protections`) -- i.e.
+/// whether its handler, reached through `dispatch_threaded`, calls one of the
+/// eight structural `&mut self` `GuestMemory` methods (`protect_range`/
+/// `unmap_range`/`unmap_alias_range`/`set_no_access`/`set_no_write`/
+/// `set_unmapped`/`set_mapping_protection`/`repoint_private`) DIRECTLY --
+/// as opposed to only a guest-RAM CONTENT write (`write_bytes`/
+/// `write_bytes_raw`/`zero_backing`), which `NativeDispatchMemory` (below)
+/// already handles correctly under a `.read()` guard via on-demand
+/// escalation. Used at the `:3440` MIXED site
+/// (`.superpowers/sdd/memlock-classification.md`, Section 1) to pick
+/// `.write()` (`true`) vs `.read()` (`false`).
+///
+/// Two groups:
+/// - The plan's mm/exec-family list: mmap/munmap/mprotect/madvise/mremap/
+///   brk/execve/execveat. `brk`'s handler never touches `cx.memory` at all
+///   and `madvise`'s only reaches the escalation-safe `zero_backing` path
+///   (MADV_DONTNEED) today -- both kept `true` per the plan's explicit spec
+///   rather than assuming that stays true as the handlers evolve.
+/// - `shmdt`/`mlock`/`mlock2`/`mlockall`: NOT in the plan's literal list,
+///   added here after grepping every `dispatch/*.rs` call site of the eight
+///   mutator methods above (`grep -rn` across the whole `dispatch/` tree
+///   turns up hits ONLY in `mem.rs` and `sysv.rs`):
+///     - `shmdt` (`dispatch/sysv.rs`): calls `cx.memory.unmap_alias_range`
+///       then `cx.memory.set_unmapped` directly.
+///     - `mlock`/`mlock2` (`dispatch/mem.rs`): `populate_resident_range` ->
+///       `protect_range`.
+///     - `mlockall` (`dispatch/mem.rs`, `MCL_CURRENT`): `lock_current_mappings`
+///       -> `populate_resident_range` -> `protect_range`.
+///
+///   `munlock`/`munlockall` were also audited and do NOT reach a mutator
+///   (their bookkeeping lives in the separate `sysv`/`mem` `Mutex`, not
+///   `NativeMappedMemory`) -- correctly `false`. `shmat`/`shmget`/`shmctl`
+///   were audited too: `shmat` only touches a separate `Mutex` and returns
+///   `DispatchOutcome::MapHostAlias`, whose actual mapping mutation happens
+///   OUTSIDE `dispatch_threaded` in a caller that already takes its own
+///   `.write()` (native_darwin.rs `MapHostAlias` arm) -- also `false`.
+///
+/// See `mapping_mutator_numbers_match_linux_abi_names` (native_darwin.rs
+/// tests) for the per-number cross-check against `crate::linux_abi`.
+fn native_syscall_mutates_mappings(nr: u64) -> bool {
+    matches!(
+        nr,
+        197   // shmdt
+            | 214 // brk
+            | 215 // munmap
+            | 216 // mremap
+            | 221 // execve
+            | 222 // mmap
+            | 226 // mprotect
+            | 228 // mlock
+            | 230 // mlockall
+            | 233 // madvise
+            | 281 // execveat
+            | 284 // mlock2
+    )
+}
+
+/// One end of [`NativeDispatchMemory`]'s held guard: starts `Read`, and
+/// [`NativeDispatchMemory::ensure_write`] escalates it to `Write` (at most
+/// once per dispatch) the first time a write targets a page that may
+/// execute.
+enum NativeDispatchGuard<'a> {
+    Read(parking_lot::RwLockReadGuard<'a, NativeMappedMemory>),
+    Write(parking_lot::RwLockWriteGuard<'a, NativeMappedMemory>),
+}
+
+impl NativeDispatchGuard<'_> {
+    fn inner(&self) -> &NativeMappedMemory {
+        match self {
+            Self::Read(guard) => guard,
+            Self::Write(guard) => guard,
+        }
+    }
+}
+
+/// `GuestMemory` adapter for the `:3440` dispatch site's `.read()` path (a
+/// syscall `native_syscall_mutates_mappings` classifies `false`). Mirrors
+/// `NativeSignalTrap`'s shared-ref adapter (Task 5) but covers the FULL
+/// `GuestMemory` surface `dispatch_threaded` needs generically, not just
+/// `write_bytes_raw` -- Task 5's report flagged this as exactly Task 6's
+/// scope.
+///
+/// - Pure reads (`protections`/`read_bytes_raw`/`guest_range_is_writable`/
+///   `supports_concurrent_exec_protection`/`shared_futex_location`) delegate
+///   straight through the held guard: `&self`, no escalation, identical
+///   whether the guard is `Read` or `Write`.
+/// - `write_bytes_raw` (and, through the trait's default `zero_backing`/
+///   `zero_guest_range`, every other guest-RAM content write) escalates
+///   `Read` -> `Write` on demand, at most once per dispatch, the first time
+///   the target range may execute -- `write_guest_ram_through_lock`'s
+///   pattern (Task 5), scoped to the whole dispatch instead of one write
+///   call. A syscall's write target is guest-controlled and so CANNOT be
+///   assumed non-executable the way a signal frame can
+///   (`NativeSignalTrap`'s doc comment): a JIT can legitimately `read(2)`
+///   bytecode straight into an RWX buffer, and skipping the escalation would
+///   risk a host-process SIGSEGV in `copy_bytes_to_host`, not just a missed
+///   optimization.
+/// - The genuine mapping-table mutators (`protect_range`/`unmap_range`/
+///   `unmap_alias_range`/`set_no_access`/`set_no_write`/`set_unmapped`/
+///   `set_mapping_protection`/`repoint_private`) are UNREACHABLE for a `nr`
+///   `native_syscall_mutates_mappings` classifies `false` -- every handler
+///   that calls them is in that function's `true` set, so it gets a real
+///   `NativeMappedMemory` directly and never constructs this adapter. They
+///   panic here instead of silently no-op'ing (the trait's own default for
+///   all eight) so a classification bug fails loudly in testing instead of
+///   silently corrupting protection state.
+struct NativeDispatchMemory<'a> {
+    lock: &'a SharedNativeMemory,
+    guard: Option<NativeDispatchGuard<'a>>,
+}
+
+impl<'a> NativeDispatchMemory<'a> {
+    fn new_read(lock: &'a SharedNativeMemory) -> Self {
+        Self {
+            lock,
+            guard: Some(NativeDispatchGuard::Read(lock.read())),
+        }
+    }
+
+    fn inner(&self) -> &NativeMappedMemory {
+        match &self.guard {
+            Some(guard) => guard.inner(),
+            None => unreachable!("NativeDispatchMemory guard is always Some between calls"),
+        }
+    }
+
+    /// Escalate the held guard to `Write`, a no-op if already escalated.
+    fn ensure_write(&mut self) -> &mut NativeMappedMemory {
+        if !matches!(self.guard, Some(NativeDispatchGuard::Write(_))) {
+            // Drop the read guard BEFORE acquiring a write guard on the same
+            // lock: reversing the order self-deadlocks (`parking_lot::RwLock`
+            // is not recursive -- `.write()` blocks on this thread's own
+            // live `.read()`, which nothing else can ever release).
+            self.guard = None;
+            self.guard = Some(NativeDispatchGuard::Write(self.lock.write()));
+        }
+        match &mut self.guard {
+            Some(NativeDispatchGuard::Write(guard)) => guard,
+            _ => unreachable!("just escalated to Write"),
+        }
+    }
+}
+
+impl GuestMemory for NativeDispatchMemory<'_> {
+    fn protections(&self) -> Option<&MemoryProtections> {
+        self.inner().protections()
+    }
+
+    fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+        self.inner().read_bytes_raw(address, length)
+    }
+
+    fn write_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+        // Mirrors `NativeMappedMemory::write_bytes`'s gate exactly (the
+        // trait default's `range_no_access`-only gate is less precise: this
+        // backend also EFAULTs a write into a read-only mapping).
+        if !bytes.is_empty()
+            && self
+                .inner()
+                .protections
+                .range_write_denied(address, bytes.len())
+        {
+            return Err(MemoryError::OutOfBounds {
+                address,
+                length: bytes.len(),
+            });
+        }
+        self.write_bytes_raw(address, bytes)
+    }
+
+    fn write_bytes_raw(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+        if self.inner().range_may_execute(address, bytes.len()) {
+            return self.ensure_write().write_exec_page_bytes(address, bytes);
+        }
+        self.inner().write_bytes_raw_shared(address, bytes)
+    }
+
+    fn write_bytes_unchecked(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        if !self.inner().region_contains(address, bytes.len()) {
+            return Err(MemoryError::OutOfBounds {
+                address,
+                length: bytes.len(),
+            });
+        }
+        self.write_bytes_raw(address, bytes)
+    }
+
+    fn guest_range_is_writable(&self, address: u64, length: usize) -> bool {
+        self.inner().guest_range_is_writable(address, length)
+    }
+
+    fn supports_concurrent_exec_protection(&self) -> bool {
+        self.inner().supports_concurrent_exec_protection()
+    }
+
+    fn shared_futex_location(
+        &self,
+        guest_addr: u64,
+    ) -> Option<carrick_guest_mem::SharedFutexLocation> {
+        self.inner().shared_futex_location(guest_addr)
+    }
+
+    fn set_no_access(&mut self, _address: u64, _len: usize, _no_access: bool) {
+        unreachable!(
+            "native_syscall_mutates_mappings classified this syscall read-only, \
+             but its handler called set_no_access (a mapping-table mutator)"
+        );
+    }
+
+    fn set_no_write(&mut self, _address: u64, _len: usize, _no_write: bool) {
+        unreachable!(
+            "native_syscall_mutates_mappings classified this syscall read-only, \
+             but its handler called set_no_write (a mapping-table mutator)"
+        );
+    }
+
+    fn set_unmapped(&mut self, _address: u64, _len: usize, _unmapped: bool) {
+        unreachable!(
+            "native_syscall_mutates_mappings classified this syscall read-only, \
+             but its handler called set_unmapped (a mapping-table mutator)"
+        );
+    }
+
+    fn set_mapping_protection(
+        &mut self,
+        _address: u64,
+        _len: usize,
+        _no_access: bool,
+        _no_write: bool,
+    ) {
+        unreachable!(
+            "native_syscall_mutates_mappings classified this syscall read-only, \
+             but its handler called set_mapping_protection (a mapping-table mutator)"
+        );
+    }
+
+    fn protect_range(&mut self, _address: u64, _len: usize, _prot: u64) -> Result<(), MemoryError> {
+        unreachable!(
+            "native_syscall_mutates_mappings classified this syscall read-only, \
+             but its handler called protect_range (a mapping-table mutator)"
+        );
+    }
+
+    fn unmap_range(&mut self, _address: u64, _len: usize) -> Result<(), MemoryError> {
+        unreachable!(
+            "native_syscall_mutates_mappings classified this syscall read-only, \
+             but its handler called unmap_range (a mapping-table mutator)"
+        );
+    }
+
+    fn repoint_private(
+        &mut self,
+        _va: u64,
+        _overlay_ipa: u64,
+        _len: usize,
+        _content: &[u8],
+    ) -> Result<(), MemoryError> {
+        unreachable!(
+            "native_syscall_mutates_mappings classified this syscall read-only, \
+             but its handler called repoint_private (a mapping-table mutator)"
+        );
+    }
+}
+
 fn dispatch_native_syscall_inner<const PROFILE: bool>(
     dispatcher: &SyscallDispatcher,
     request: SyscallRequest,
@@ -3462,24 +3732,34 @@ fn dispatch_native_syscall_inner<const PROFILE: bool>(
     let mut fd_wait_deadline = None;
     loop {
         let outcome = {
-            // MIXED site (memlock-classification.md :3440): `dispatch_threaded`
-            // takes `memory: &mut impl GuestMemory` STRUCTURALLY (dispatch/
-            // mod.rs:3244) for every syscall, mutator or not, so a `.read()`
-            // guard cannot be handed in here without either a GuestMemory
-            // wrapper adapter or restructuring that generic bound. Conservative
-            // `.write()` placeholder for Task 5, per the task brief; Task 6's
-            // `native_syscall_mutates_mappings` pre-classifier is the intended
-            // way to narrow this to `.read()` for the (large) non-mutator
-            // majority of syscalls.
-            let mut memory = memory.write();
-            dispatcher.dispatch_threaded(
-                request,
-                &mut *memory,
-                reporter,
-                thread_runtime.tid(),
-                &thread_runtime.registry,
-                &thread_runtime.futex,
-            )?
+            // MIXED site (memlock-classification.md :3440): pre-classify by
+            // syscall nr (`native_syscall_mutates_mappings`, Task 6) so only
+            // the small minority of mapping-mutating syscalls take `.write()`
+            // -- everything else (read/write/futex/getpid/clock_gettime/
+            // nanosleep/epoll/... ) takes `.read()` via `NativeDispatchMemory`,
+            // whose `write_bytes_raw` still escalates to a real write guard
+            // for the rare guest-controlled write-exec-page case.
+            if native_syscall_mutates_mappings(request.number.raw()) {
+                let mut memory = memory.write();
+                dispatcher.dispatch_threaded(
+                    request,
+                    &mut *memory,
+                    reporter,
+                    thread_runtime.tid(),
+                    &thread_runtime.registry,
+                    &thread_runtime.futex,
+                )?
+            } else {
+                let mut memory = NativeDispatchMemory::new_read(memory);
+                dispatcher.dispatch_threaded(
+                    request,
+                    &mut memory,
+                    reporter,
+                    thread_runtime.tid(),
+                    &thread_runtime.registry,
+                    &thread_runtime.futex,
+                )?
+            }
         };
         if trace_syscalls {
             child_write_stderr(
@@ -10342,6 +10622,151 @@ mod tests {
                 "store must fail: the &self write invalidated the reservation"
             );
             assert_eq!(memory.atomic_load(address, 4).unwrap(), 9);
+        });
+    }
+
+    // Task 6: `native_syscall_mutates_mappings` pre-classifier + the
+    // `NativeDispatchMemory` read-guard adapter it enables at :3440.
+
+    #[test]
+    fn mapping_mutators_take_write_guard() {
+        for nr in [222u64, 215, 226, 233, 216, 214, 221, 281] {
+            assert!(
+                native_syscall_mutates_mappings(nr),
+                "nr {nr} should be a mapping mutator"
+            );
+        }
+        for nr in [63u64, 64, 98, 172, 113] {
+            assert!(!native_syscall_mutates_mappings(nr), "nr {nr} should not");
+        }
+    }
+
+    #[test]
+    fn non_mutator_mm_and_ipc_syscalls_stay_read_classified() {
+        // munlock/munlockall: audited, bookkeeping lives in a separate
+        // Mutex, never touch NativeMappedMemory. shmget/shmctl/shmat:
+        // audited, shmat only touches a separate Mutex and defers its
+        // actual mapping mutation to a MapHostAlias arm outside
+        // dispatch_threaded (which takes its own .write()). mincore: read-only
+        // by nature.
+        for nr in [194u64, 195, 196, 229, 231, 232] {
+            assert!(
+                !native_syscall_mutates_mappings(nr),
+                "nr {nr} should not be classified as a mapping mutator"
+            );
+        }
+    }
+
+    #[test]
+    fn mapping_mutator_numbers_match_linux_abi_names() {
+        // Cross-checks every number `native_syscall_mutates_mappings` uses
+        // against `crate::linux_abi::syscall::lookup_aarch64`'s name, so a future
+        // syscall-table renumbering can't silently desync the classifier
+        // from what it thinks it's matching.
+        let expected: &[(u64, &str)] = &[
+            (197, "shmdt"),
+            (214, "brk"),
+            (215, "munmap"),
+            (216, "mremap"),
+            (221, "execve"),
+            (222, "mmap"),
+            (226, "mprotect"),
+            (228, "mlock"),
+            (230, "mlockall"),
+            (233, "madvise"),
+            (281, "execveat"),
+            (284, "mlock2"),
+        ];
+        for &(nr, name) in expected {
+            let entry = crate::linux_abi::syscall::lookup_aarch64(nr)
+                .unwrap_or_else(|| panic!("nr {nr} missing from the aarch64 syscall table"));
+            assert_eq!(
+                entry.name, name,
+                "nr {nr} is named {:?} in linux_abi, expected {name:?}",
+                entry.name
+            );
+            assert!(
+                native_syscall_mutates_mappings(nr),
+                "nr {nr} ({name}) should be classified as a mapping mutator"
+            );
+        }
+    }
+
+    #[test]
+    fn native_dispatch_memory_read_classified_syscall_reads_and_writes_data() {
+        fork_test(|| {
+            let memory = biased_test_memory(carrick_guest_mem::GuestVa(0x40_0000), 0x4000);
+            let shared: SharedNativeMemory = Arc::new(parking_lot::RwLock::new(memory));
+            let address = 0x40_0080u64;
+            {
+                let mut dispatch_memory = NativeDispatchMemory::new_read(&shared);
+                dispatch_memory
+                    .write_bytes(address, &42u32.to_le_bytes())
+                    .expect("write through a read-classified guard must succeed");
+                assert_eq!(
+                    dispatch_memory.read_bytes(address, 4).unwrap(),
+                    42u32.to_le_bytes()
+                );
+            }
+            // The write is visible outside the adapter too (it landed in the
+            // real NativeMappedMemory behind the RwLock, not some adapter-local
+            // buffer).
+            let guard = shared.read();
+            assert_eq!(guard.read_bytes(address, 4).unwrap(), 42u32.to_le_bytes());
+        });
+    }
+
+    #[test]
+    fn native_dispatch_memory_panics_on_a_mapping_mutator_call() {
+        fork_test(|| {
+            let memory = biased_test_memory(carrick_guest_mem::GuestVa(0x40_0000), 0x4000);
+            let shared: SharedNativeMemory = Arc::new(parking_lot::RwLock::new(memory));
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut dispatch_memory = NativeDispatchMemory::new_read(&shared);
+                dispatch_memory.set_no_access(0x40_0080, 0x4000, true);
+            }));
+            assert!(
+                result.is_err(),
+                "a mapping-mutator call through the read-classified adapter must panic \
+                 loudly, never silently no-op (the trait's own default for all eight)"
+            );
+        });
+    }
+
+    #[test]
+    fn native_dispatch_memory_escalates_to_write_for_a_write_exec_page() {
+        fork_test(|| {
+            let mut memory = biased_test_memory(carrick_guest_mem::GuestVa(0x40_0000), 0x4000);
+            let page = memory.regions[0].start;
+            // Mark the page write+exec (the native16k SMC/JIT shape a prior
+            // mmap(PROT_WRITE|PROT_EXEC) would have left behind) directly in
+            // the table `range_may_execute`/`native16k_write_exec_page`
+            // consult.
+            memory.native_page_protections.insert(
+                page,
+                crate::linux_abi::LINUX_PROT_READ
+                    | crate::linux_abi::LINUX_PROT_WRITE
+                    | crate::linux_abi::LINUX_PROT_EXEC,
+            );
+            let shared: SharedNativeMemory = Arc::new(parking_lot::RwLock::new(memory));
+            {
+                let mut dispatch_memory = NativeDispatchMemory::new_read(&shared);
+                dispatch_memory
+                    .write_bytes_raw(page, &[0xAAu8; 4])
+                    .expect("a write-exec-page write must escalate and succeed, not fail");
+            }
+            let guard = shared.read();
+            // `native_write_exec_writable_pages` is mutated ONLY by
+            // `make_native16k_write_exec_page_writable`, a `&mut self`
+            // method the `&self` common path (`write_bytes_raw_shared`)
+            // never calls -- its presence here proves the adapter actually
+            // escalated to a real write guard, not just that the bytes
+            // happen to match.
+            assert!(
+                guard.native_write_exec_writable_pages.contains(&page),
+                "escalated write must go through write_exec_page_bytes"
+            );
+            assert_eq!(guard.read_bytes(page, 4).unwrap(), [0xAAu8; 4]);
         });
     }
 
