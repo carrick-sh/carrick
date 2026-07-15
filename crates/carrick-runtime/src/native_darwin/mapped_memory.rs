@@ -262,6 +262,25 @@ pub(super) struct NativeMappedMemory {
     // `store()`s it once, atomically, covering ALL of that writer's field
     // mutations.
     pub(super) mapping: arc_swap::ArcSwap<MappingSnapshot>,
+    // Serializes a METADATA writer's `mapping` read-modify-write
+    // (`load_full().clone()` -> mutate -> `store()`) -- Phase 2c
+    // (`docs/superpowers/specs/2026-07-15-mmap-writer-lockfree-reads-design.md`).
+    // Metadata writers (`protect_native16k_range_with_shared`/
+    // `protect_linux4k_range_with_shared`/`make_native16k_write_exec_page_
+    // writable_shared`/`_executable_shared`) run under only the OUTER
+    // `.read()` guard (concurrent with readers and with each other), so
+    // without this lock two concurrent metadata writers' `load_full().clone()`
+    // could race and one's `store()` would silently lose the other's edit. A
+    // LEAF lock: held ONLY around the clone+mutate+store tail of each
+    // writer, never across another lock acquisition (host mprotect syscalls,
+    // icache clears, and `self.protections`'s own lock all happen OUTSIDE
+    // this lock's scope), and always acquired AFTER the outer `RwLock` (never
+    // the reverse), so there is no lock-inversion hazard with the outer
+    // guard. PHYSICAL writers (`map_host_alias`/`remap_private`/`unmap_range`/
+    // `replace_image`) still require the outer `.write()`, which excludes
+    // every `.read()` holder -- including every metadata writer contending on
+    // THIS mutex -- so a physical writer never needs to take this lock itself.
+    pub(super) mapping_write: parking_lot::Mutex<()>,
     pub(super) protections: MemoryProtections,
     // The exclusive-monitor reservation itself now lives per guest thread
     // (`NativeThreadRuntime.exclusive_reservation`), not here. The DSR-hot
@@ -624,7 +643,7 @@ impl NativeMappedMemory {
                 .native_page_protections
                 .get(&page)
                 .copied()
-                .unwrap_or_else(|| self.default_linux_prot_at(page));
+                .unwrap_or_else(|| self.default_linux_prot_at_in(&snap, page));
             if prot & crate::linux_abi::LINUX_PROT_EXEC != 0 {
                 return true;
             }
@@ -1023,6 +1042,7 @@ impl NativeMappedMemory {
                     native_write_exec_writable_pages: BTreeSet::new(),
                     linux4k_page_protections: BTreeMap::new(),
                 }),
+                mapping_write: parking_lot::Mutex::new(()),
                 protections,
                 exclusive_sequences: parking_lot::Mutex::new(BTreeMap::new()),
                 host_access_lifts: parking_lot::Mutex::new(std::collections::HashMap::new()),
@@ -1494,7 +1514,7 @@ impl NativeMappedMemory {
             .native_page_protections
             .get(&page_start)
             .copied()
-            .unwrap_or_else(|| self.default_linux_prot_at(address));
+            .unwrap_or_else(|| self.default_linux_prot_at_in(&snap, address));
         let write_exec = crate::linux_abi::LINUX_PROT_WRITE | crate::linux_abi::LINUX_PROT_EXEC;
         (prot & write_exec == write_exec).then_some(page_start)
     }
@@ -1526,8 +1546,35 @@ impl NativeMappedMemory {
         )
     }
 
+    /// `&mut self` trait/call-site entry -- delegates to the `&self` shared
+    /// helper (Phase 2c: METADATA writers run under only the outer `.read()`
+    /// guard, see `mapping_write`'s doc comment). Kept so existing `&mut
+    /// self` call sites (e.g. `resolve_native16k_write_exec_fault`, the
+    /// `&mut NativeMappedMemory` DSR-handler path, and test call sites) need
+    /// no changes.
     pub(super) fn make_native16k_write_exec_page_writable(
         &mut self,
+        page_start: u64,
+        operation_address: u64,
+        operation_len: usize,
+    ) -> Result<(), MemoryError> {
+        self.make_native16k_write_exec_page_writable_shared(
+            page_start,
+            operation_address,
+            operation_len,
+        )
+    }
+
+    /// METADATA writer (Phase 2c): mutates ONLY `native_write_exec_writable_pages`
+    /// via the `mapping_write`-guarded read-modify-write, so it runs safely
+    /// under a shared `&self` -- i.e. under the dispatch's outer `.read()`
+    /// guard, concurrent with readers and with other metadata writers. The
+    /// host `mprotect` (a real kernel side effect, not Rust-level shared
+    /// state) and `note_dsr_code_mutation` (already interior-mutable) happen
+    /// OUTSIDE the `mapping_write` lock; only the clone+mutate+store tail is
+    /// serialized against concurrent metadata writers.
+    pub(super) fn make_native16k_write_exec_page_writable_shared(
+        &self,
         page_start: u64,
         operation_address: u64,
         operation_len: usize,
@@ -1547,19 +1594,41 @@ impl NativeMappedMemory {
             operation_address,
             operation_len,
         )?;
-        // Copy-on-write: single-field mutation (native_write_exec_writable_pages),
-        // one atomic store. Safe to re-`load_full` here rather than reuse the
-        // guard from the early check above -- this whole method runs under the
-        // caller's exclusive outer write guard, so no other writer can have
-        // interleaved (see MappingSnapshot's doc comment).
+        // Copy-on-write, serialized by `mapping_write` against concurrent
+        // metadata writers: single-field mutation
+        // (native_write_exec_writable_pages), one atomic store.
+        let _guard = self.mapping_write.lock();
         let mut snap = (*self.mapping.load_full()).clone();
         snap.native_write_exec_writable_pages.insert(page_start);
         self.mapping.store(std::sync::Arc::new(snap));
         Ok(())
     }
 
+    /// `&mut self` trait/call-site entry -- see
+    /// `make_native16k_write_exec_page_writable`'s doc comment.
     pub(super) fn make_native16k_write_exec_page_executable(
         &mut self,
+        page_start: u64,
+        operation_address: u64,
+        operation_len: usize,
+    ) -> Result<(), MemoryError> {
+        self.make_native16k_write_exec_page_executable_shared(
+            page_start,
+            operation_address,
+            operation_len,
+        )
+    }
+
+    /// METADATA writer (Phase 2c) -- see
+    /// `make_native16k_write_exec_page_writable_shared`'s doc comment. The
+    /// `native_page_protections` read for the final host `mprotect` target
+    /// is taken off the SAME loaded snapshot the eventual write builds from
+    /// (reader-coherence discipline, `default_linux_prot_at_in`), so the two
+    /// stay consistent even if a concurrent metadata writer stores a newer
+    /// snapshot in between -- the read here just observes "old or new",
+    /// never a torn mix.
+    pub(super) fn make_native16k_write_exec_page_executable_shared(
+        &self,
         page_start: u64,
         operation_address: u64,
         operation_len: usize,
@@ -1581,22 +1650,23 @@ impl NativeMappedMemory {
             .host_address(carrick_guest_mem::GuestVa(page_start))?
             .raw() as *mut u8;
         unsafe { carrick_native_clear_icache(ptr.cast(), page_len) };
-        // Copy-on-write: only `native_write_exec_writable_pages` is mutated
-        // (below); `native_page_protections` is read-only here, but reading
-        // it off the SAME clone we're about to mutate keeps this consistent
-        // with the pre-refactor in-place-mutation semantics.
-        let mut snap = (*self.mapping.load_full()).clone();
-        let prot = snap
+        let read_snap = self.mapping.load();
+        let prot = read_snap
             .native_page_protections
             .get(&page_start)
             .copied()
-            .unwrap_or_else(|| self.default_linux_prot_at(page_start));
+            .unwrap_or_else(|| self.default_linux_prot_at_in(&read_snap, page_start));
         self.mprotect_host_page(
             page_start,
             native16k_host_prot(prot),
             operation_address,
             operation_len,
         )?;
+        drop(read_snap);
+        // Copy-on-write, serialized by `mapping_write`: only
+        // `native_write_exec_writable_pages` is mutated (below).
+        let _guard = self.mapping_write.lock();
+        let mut snap = (*self.mapping.load_full()).clone();
         snap.native_write_exec_writable_pages.remove(&page_start);
         self.mapping.store(std::sync::Arc::new(snap));
         Ok(())
@@ -1690,10 +1760,16 @@ impl NativeMappedMemory {
         Ok(true)
     }
 
-    pub(super) fn default_linux_prot_at(&self, address: u64) -> u64 {
-        self.mapping
-            .load()
-            .regions
+    /// `regions`-only default-protection lookup against a CALLER-SUPPLIED
+    /// snapshot, so a reader that also consults `native_page_protections`/
+    /// `native_write_exec_writable_pages`/`linux4k_page_protections` can
+    /// `load()` ONCE and use that SAME snapshot for both the page-map read
+    /// and this fallback -- never a second, independently-timed `load()`.
+    /// Every hot reader below (`range_may_execute`, `native_range_allows`,
+    /// `native16k_write_exec_page`, `native_host_prot_for_page`,
+    /// `guest_address_is_executable`) threads its own `snap` through here.
+    pub(super) fn default_linux_prot_at_in(&self, snap: &MappingSnapshot, address: u64) -> u64 {
+        snap.regions
             .iter()
             .rev()
             .find(|region| address >= region.start && address < region.end)
@@ -1701,21 +1777,20 @@ impl NativeMappedMemory {
     }
 
     pub(super) fn guest_address_is_executable(&self, address: u64) -> bool {
+        let snap = self.mapping.load();
         let prot = if self.uses_linux4k_subpages() {
             let host_page = address & !(self.host_page_size - 1);
             let subpage = ((address - host_page) / self.linux_page_size) as usize;
-            self.linux4k_host_page_protections(host_page)
+            self.linux4k_host_page_protections_in(&snap, host_page)
                 .get(subpage)
                 .copied()
                 .unwrap_or(0)
         } else {
             let page = address & !(self.host_page_size - 1);
-            self.mapping
-                .load()
-                .native_page_protections
+            snap.native_page_protections
                 .get(&page)
                 .copied()
-                .unwrap_or_else(|| self.default_linux_prot_at(address))
+                .unwrap_or_else(|| self.default_linux_prot_at_in(&snap, address))
         };
         prot & crate::linux_abi::LINUX_PROT_EXEC != 0
     }
@@ -1724,8 +1799,9 @@ impl NativeMappedMemory {
         if len == 0 {
             return false;
         }
+        let snap = self.mapping.load();
         if self.uses_linux4k_subpages() {
-            return self.linux4k_range_allows(address, len, write);
+            return self.linux4k_range_allows_in(&snap, address, len, write);
         }
         let Some(end) = address.checked_add(len as u64) else {
             return false;
@@ -1736,14 +1812,13 @@ impl NativeMappedMemory {
             crate::linux_abi::LINUX_PROT_READ
         };
         let mut cursor = address;
-        let snap = self.mapping.load();
         while cursor < end {
             let page = cursor & !(self.host_page_size - 1);
             let prot = snap
                 .native_page_protections
                 .get(&page)
                 .copied()
-                .unwrap_or_else(|| self.default_linux_prot_at(cursor));
+                .unwrap_or_else(|| self.default_linux_prot_at_in(&snap, cursor));
             if prot & required == 0 {
                 return false;
             }
@@ -1752,15 +1827,25 @@ impl NativeMappedMemory {
         true
     }
 
+    /// Single-`load()` convenience wrapper -- see `linux4k_host_page_protections_in`.
     pub(super) fn linux4k_host_page_protections(&self, page_start: u64) -> [u64; 4] {
-        self.mapping
-            .load()
-            .linux4k_page_protections
+        self.linux4k_host_page_protections_in(&self.mapping.load(), page_start)
+    }
+
+    /// Reader-coherence variant of `linux4k_host_page_protections` against a
+    /// CALLER-SUPPLIED snapshot -- see `default_linux_prot_at_in`.
+    pub(super) fn linux4k_host_page_protections_in(
+        &self,
+        snap: &MappingSnapshot,
+        page_start: u64,
+    ) -> [u64; 4] {
+        snap.linux4k_page_protections
             .get(&page_start)
             .copied()
             .unwrap_or_else(|| {
                 std::array::from_fn(|index| {
-                    self.default_linux_prot_at(
+                    self.default_linux_prot_at_in(
+                        snap,
                         page_start.saturating_add(index as u64 * self.linux_page_size),
                     )
                 })
@@ -1788,8 +1873,27 @@ impl NativeMappedMemory {
         )
     }
 
+    /// Single-`load()` convenience wrapper -- see `linux4k_range_allows_in`.
     pub(super) fn linux4k_range_allows(&self, address: u64, len: usize, write: bool) -> bool {
-        if !self.uses_linux4k_subpages() || len == 0 {
+        if !self.uses_linux4k_subpages() {
+            return false;
+        }
+        self.linux4k_range_allows_in(&self.mapping.load(), address, len, write)
+    }
+
+    /// Reader-coherence variant of `linux4k_range_allows` against a
+    /// CALLER-SUPPLIED snapshot -- see `default_linux_prot_at_in`. Callers
+    /// that already checked `uses_linux4k_subpages()` (e.g.
+    /// `native_range_allows`) pass their own loaded `snap` straight through;
+    /// this never re-`load()`s.
+    pub(super) fn linux4k_range_allows_in(
+        &self,
+        snap: &MappingSnapshot,
+        address: u64,
+        len: usize,
+        write: bool,
+    ) -> bool {
+        if len == 0 {
             return false;
         }
         let Some(end) = address.checked_add(len as u64) else {
@@ -1804,7 +1908,7 @@ impl NativeMappedMemory {
         while cursor < end {
             let host_page = cursor & !(self.host_page_size - 1);
             let subpage = ((cursor - host_page) / self.linux_page_size) as usize;
-            let protections = self.linux4k_host_page_protections(host_page);
+            let protections = self.linux4k_host_page_protections_in(snap, host_page);
             if protections
                 .get(subpage)
                 .is_none_or(|prot| prot & required == 0)
@@ -2370,19 +2474,19 @@ impl NativeMappedMemory {
     }
 
     pub(super) fn native_host_prot_for_page(&self, page_start: u64) -> libc::c_int {
+        let snap = self.mapping.load();
         if !self.uses_linux4k_subpages() {
-            let snap = self.mapping.load();
             let prot = snap
                 .native_page_protections
                 .get(&page_start)
                 .copied()
-                .unwrap_or_else(|| self.default_linux_prot_at(page_start));
+                .unwrap_or_else(|| self.default_linux_prot_at_in(&snap, page_start));
             if snap.native_write_exec_writable_pages.contains(&page_start) {
                 return libc::PROT_READ | libc::PROT_WRITE;
             }
             return native16k_host_prot(prot);
         }
-        let protections = self.linux4k_host_page_protections(page_start);
+        let protections = self.linux4k_host_page_protections_in(&snap, page_start);
         match self.classify_linux4k_host_page(protections) {
             HostPageState::Uniform16k => linux_prot_to_native(protections[0]),
             HostPageState::MixedGuarded(_) | HostPageState::Composed16k => libc::PROT_NONE,
@@ -2748,17 +2852,45 @@ impl NativeMappedMemory {
         Ok(())
     }
 
-    pub(super) fn protect_linux4k_range(
-        &mut self,
+    /// METADATA writer (Phase 2c), `&self` -- see
+    /// `protect_linux4k_range_with_shared`'s doc comment.
+    pub(super) fn protect_linux4k_range_shared(
+        &self,
         address: u64,
         len: usize,
         prot: u64,
     ) -> Result<(), MemoryError> {
-        self.protect_linux4k_range_with(address, len, prot, native_host_mprotect)
+        self.protect_linux4k_range_with_shared(address, len, prot, native_host_mprotect)
     }
 
+    /// `&mut self` entry -- see `make_native16k_write_exec_page_writable`'s
+    /// doc comment. Only test call sites use the `&mut self` form directly
+    /// today (production always goes through `protect_range` ->
+    /// `protect_range_shared` -> `protect_linux4k_range_shared`), so this is
+    /// dead code in a non-test production build without the allow below.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn protect_linux4k_range_with<F>(
         &mut self,
+        address: u64,
+        len: usize,
+        prot: u64,
+        set_host_prot: F,
+    ) -> Result<(), MemoryError>
+    where
+        F: FnMut(carrick_guest_mem::HostVa, usize, libc::c_int) -> Result<(), MemoryError>,
+    {
+        self.protect_linux4k_range_with_shared(address, len, prot, set_host_prot)
+    }
+
+    /// METADATA writer (Phase 2c): mutates ONLY `linux4k_page_protections`
+    /// via the `mapping_write`-guarded read-modify-write (accumulated across
+    /// every merged run into ONE clone, ONE atomic store after the loop --
+    /// unchanged from the pre-Phase-2c shape). `&self` -- runs under the
+    /// dispatch's outer `.read()` guard, concurrent with readers and other
+    /// metadata writers. The host `mprotect`s and icache clears (real kernel
+    /// side effects) happen OUTSIDE the `mapping_write` lock.
+    pub(super) fn protect_linux4k_range_with_shared<F>(
+        &self,
         address: u64,
         len: usize,
         prot: u64,
@@ -2848,10 +2980,11 @@ impl NativeMappedMemory {
         // one, exactly as before), and the per-page subpage bookkeeping is
         // unchanged.
         //
-        // Copy-on-write: single-field mutation (linux4k_page_protections),
-        // accumulated across every merged run into ONE clone, then ONE
-        // atomic store after the loop -- not a store per run.
-        let mut snap = (*self.mapping.load_full()).clone();
+        // Host mprotects/icache clears land FIRST (real kernel side effects,
+        // outside `mapping_write`); the table publish is a separate pass
+        // afterward. Behavior-identical to the pre-Phase-2c interleaved
+        // version: on an early `?` failure, NEITHER version ever reaches
+        // `store()`, so no partial table state is ever published either way.
         let mut index = 0;
         while index < resolved.len() {
             let mut end = index + 1;
@@ -2875,11 +3008,17 @@ impl NativeMappedMemory {
                 host_page_len * (end - index),
                 resolved[index].host_prot,
             )?;
-            for page in &resolved[index..end] {
-                snap.linux4k_page_protections
-                    .insert(page.page_start, page.protections);
-            }
             index = end;
+        }
+        // Copy-on-write, serialized by `mapping_write` against concurrent
+        // metadata writers: single-field mutation (linux4k_page_protections),
+        // accumulated across every resolved page into ONE clone, ONE atomic
+        // store.
+        let _guard = self.mapping_write.lock();
+        let mut snap = (*self.mapping.load_full()).clone();
+        for page in &resolved {
+            snap.linux4k_page_protections
+                .insert(page.page_start, page.protections);
         }
         self.mapping.store(std::sync::Arc::new(snap));
         Ok(())
@@ -3204,8 +3343,35 @@ impl NativeMappedMemory {
         Ok(())
     }
 
+    /// `&mut self` entry -- see `make_native16k_write_exec_page_writable`'s
+    /// doc comment. Only test call sites use the `&mut self` form directly
+    /// today (production always goes through `protect_range` ->
+    /// `protect_range_shared` -> `protect_native16k_range_with_shared`), so
+    /// this is dead code in a non-test production build without the allow
+    /// below.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn protect_native16k_range_with<F>(
         &mut self,
+        address: u64,
+        len: usize,
+        prot: u64,
+        set_host_prot: F,
+    ) -> Result<(), MemoryError>
+    where
+        F: FnMut(carrick_guest_mem::HostVa, usize, libc::c_int) -> Result<(), MemoryError>,
+    {
+        self.protect_native16k_range_with_shared(address, len, prot, set_host_prot)
+    }
+
+    /// METADATA writer (Phase 2c): mutates ONLY `native_page_protections`
+    /// (sparse) and `native_write_exec_writable_pages` via the
+    /// `mapping_write`-guarded read-modify-write. `&self` -- runs under the
+    /// dispatch's outer `.read()` guard, concurrent with readers and other
+    /// metadata writers. The host `mprotect`s/icache clears/rollback (real
+    /// kernel side effects) happen entirely OUTSIDE the `mapping_write` lock;
+    /// only the two-field clone+mutate+store tail is serialized.
+    pub(super) fn protect_native16k_range_with_shared<F>(
+        &self,
         address: u64,
         len: usize,
         prot: u64,
@@ -3326,20 +3492,27 @@ impl NativeMappedMemory {
             return Err(error);
         }
 
-        // Copy-on-write, two-field atomic swap: this writer mutates BOTH
+        // Copy-on-write, two-field atomic swap, serialized by `mapping_write`
+        // against concurrent metadata writers: this writer mutates BOTH
         // `native_page_protections` and `native_write_exec_writable_pages`
         // for every page in the range -- accumulate all of it into ONE
         // clone, then ONE atomic `store()` after the loop.
+        let _guard = self.mapping_write.lock();
         let mut snap = (*self.mapping.load_full()).clone();
         for (page_start, _, _) in pages {
             // Sparse representation: every reader (`native_range_allows`,
             // `native_host_prot_for_page`, `guest_address_is_executable`,
-            // ...) already falls back to `default_linux_prot_at` for a
+            // ...) already falls back to `default_linux_prot_at_in` for a
             // MISSING page, so a page whose protection matches its
             // region's default is redundant to store. `region_contains`
             // in `protect_range` guarantees the region (and its
-            // `default_prot`) is already established here.
-            if prot == self.default_linux_prot_at(page_start) {
+            // `default_prot`) is already established here. `regions` cannot
+            // change while `mapping_write` is held (only a PHYSICAL writer
+            // under the outer `.write()` mutates it, which is excluded for
+            // the whole duration this call holds the outer `.read()`), so
+            // reading the default off the SAME `snap` we're about to store
+            // is exact, not just "old or new".
+            if prot == self.default_linux_prot_at_in(&snap, page_start) {
                 snap.native_page_protections.remove(&page_start);
             } else {
                 snap.native_page_protections.insert(page_start, prot);
@@ -3348,6 +3521,74 @@ impl NativeMappedMemory {
         }
         self.mapping.store(std::sync::Arc::new(snap));
         Ok(())
+    }
+
+    /// METADATA writer (Phase 2c), `&self` -- the shared-borrow counterpart
+    /// of the `GuestMemory::protect_range` trait method (which delegates
+    /// here). Dispatches to `protect_linux4k_range_shared`/
+    /// `protect_native16k_range_with_shared`, both pure metadata writers, so
+    /// the whole call is sound under only the outer `.read()` guard (no
+    /// physical `MAP_FIXED` remap, no escalation). `note_dsr_code_mutation`
+    /// is already interior-mutable (`dsr_generations`).
+    pub(super) fn protect_range_shared(
+        &self,
+        address: u64,
+        len: usize,
+        prot: u64,
+    ) -> Result<(), MemoryError> {
+        if len == 0 {
+            return Ok(());
+        }
+        if !self.region_contains(address, len) {
+            return Err(MemoryError::OutOfBounds {
+                address,
+                length: len,
+            });
+        }
+        let old_exec = self.range_may_execute(address, len);
+        let result = if self.uses_linux4k_subpages() {
+            self.protect_linux4k_range_shared(address, len, prot)
+        } else {
+            self.protect_native16k_range_with_shared(address, len, prot, native_host_mprotect)
+        };
+        result?;
+        if old_exec || prot & crate::linux_abi::LINUX_PROT_EXEC != 0 {
+            self.note_dsr_code_mutation(address, len)?;
+        }
+        Ok(())
+    }
+
+    /// METADATA writer (Phase 2c), `&self` -- `protections` is a SEPARATE,
+    /// already-independently-locked structure (its own interior
+    /// `parking_lot::RwLock`, not the `mapping` ArcSwap), so this never
+    /// touches `mapping_write` at all. Backs `GuestMemory::set_no_access`.
+    pub(super) fn set_no_access_shared(&self, address: u64, len: usize, no_access: bool) {
+        self.protections.set_no_access(address, len, no_access);
+    }
+
+    /// See `set_no_access_shared`. Backs `GuestMemory::set_no_write`.
+    pub(super) fn set_no_write_shared(&self, address: u64, len: usize, no_write: bool) {
+        self.protections.set_no_write(address, len, no_write);
+    }
+
+    /// See `set_no_access_shared`. Backs `GuestMemory::set_unmapped`. Never
+    /// touches `regions`/the `mapping` snapshot -- munmap's region-removal
+    /// bookkeeping (`unmap_range`'s `shared_key_base` clear) is a SEPARATE
+    /// PHYSICAL-writer step, not part of this call.
+    pub(super) fn set_unmapped_shared(&self, address: u64, len: usize, unmapped: bool) {
+        self.protections.set_unmapped(address, len, unmapped);
+    }
+
+    /// See `set_no_access_shared`. Backs `GuestMemory::set_mapping_protection`.
+    pub(super) fn set_mapping_protection_shared(
+        &self,
+        address: u64,
+        len: usize,
+        no_access: bool,
+        no_write: bool,
+    ) {
+        self.protections
+            .set_mapping_protection(address, len, no_access, no_write);
     }
 }
 
@@ -3438,15 +3679,15 @@ impl GuestMemory for NativeMappedMemory {
     }
 
     fn set_no_access(&mut self, address: u64, len: usize, no_access: bool) {
-        self.protections.set_no_access(address, len, no_access);
+        self.set_no_access_shared(address, len, no_access);
     }
 
     fn set_no_write(&mut self, address: u64, len: usize, no_write: bool) {
-        self.protections.set_no_write(address, len, no_write);
+        self.set_no_write_shared(address, len, no_write);
     }
 
     fn set_unmapped(&mut self, address: u64, len: usize, unmapped: bool) {
-        self.protections.set_unmapped(address, len, unmapped);
+        self.set_unmapped_shared(address, len, unmapped);
     }
 
     fn set_mapping_protection(
@@ -3456,8 +3697,7 @@ impl GuestMemory for NativeMappedMemory {
         no_access: bool,
         no_write: bool,
     ) {
-        self.protections
-            .set_mapping_protection(address, len, no_access, no_write);
+        self.set_mapping_protection_shared(address, len, no_access, no_write);
     }
 
     fn guest_range_is_writable(&self, address: u64, length: usize) -> bool {
@@ -3465,26 +3705,7 @@ impl GuestMemory for NativeMappedMemory {
     }
 
     fn protect_range(&mut self, address: u64, len: usize, prot: u64) -> Result<(), MemoryError> {
-        if len == 0 {
-            return Ok(());
-        }
-        if !self.region_contains(address, len) {
-            return Err(MemoryError::OutOfBounds {
-                address,
-                length: len,
-            });
-        }
-        let old_exec = self.range_may_execute(address, len);
-        let result = if self.uses_linux4k_subpages() {
-            self.protect_linux4k_range(address, len, prot)
-        } else {
-            self.protect_native16k_range_with(address, len, prot, native_host_mprotect)
-        };
-        result?;
-        if old_exec || prot & crate::linux_abi::LINUX_PROT_EXEC != 0 {
-            self.note_dsr_code_mutation(address, len)?;
-        }
-        Ok(())
+        self.protect_range_shared(address, len, prot)
     }
 
     fn supports_concurrent_exec_protection(&self) -> bool {
