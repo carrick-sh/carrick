@@ -3451,44 +3451,53 @@ fn measure_native_blocked<const PROFILE: bool, T>(
 }
 
 /// Whether AArch64 canonical syscall `nr` (`crate::linux_abi::syscall::lookup_aarch64`)
-/// can mutate `NativeMappedMemory`'s mapping/protection tables (`regions`,
-/// `owned_host_ranges`, `protections`, `native_page_protections`,
-/// `native_write_exec_writable_pages`, `linux4k_page_protections`) -- i.e.
-/// whether its handler, reached through `dispatch_threaded`, calls one of the
-/// eight structural `&mut self` `GuestMemory` methods (`protect_range`/
-/// `unmap_range`/`unmap_alias_range`/`set_no_access`/`set_no_write`/
-/// `set_unmapped`/`set_mapping_protection`/`repoint_private`) DIRECTLY --
-/// as opposed to only a guest-RAM CONTENT write (`write_bytes`/
-/// `write_bytes_raw`/`zero_backing`), which `NativeDispatchMemory` (below)
-/// already handles correctly under a `.read()` guard via on-demand
-/// escalation. Used at the `:3440` MIXED site
-/// (`.superpowers/sdd/memlock-classification.md`, Section 1) to pick
-/// `.write()` (`true`) vs `.read()` (`false`).
+/// needs the OUTER `RwLock<NativeMappedMemory>`'s exclusive `.write()` guard
+/// -- as opposed to `.read()` via the `NativeDispatchMemory` adapter (below),
+/// under which every `GuestMemory` call the handler makes is either a pure
+/// read, a METADATA mutation (mutates only the `mapping` `ArcSwap` via a
+/// `mapping_write`-serialized `&self` helper -- `mapped_memory.rs`'s
+/// `protect_range_shared`/`set_*_shared` family -- concurrent with readers
+/// and other metadata writers), or a PHYSICAL mutation that
+/// `NativeDispatchMemory::ensure_write` escalates to a real `.write()`
+/// on demand (Phase 2c,
+/// `docs/superpowers/specs/2026-07-15-mmap-writer-lockfree-reads-design.md`).
+/// `true` here means "handler needs `.write()` FOR THE WHOLE DISPATCH" --
+/// either because it reaches a PHYSICAL writer unconditionally/commonly
+/// enough that pre-classifying is simpler than escalating, or because its
+/// mutation is a multi-store composite that must be atomic w.r.t. readers.
 ///
-/// Two groups:
-/// - The plan's mm/exec-family list: mmap/munmap/mprotect/madvise/mremap/
-///   brk/execve/execveat. `brk`'s handler never touches `cx.memory` at all
-///   and `madvise`'s only reaches the escalation-safe `zero_backing` path
-///   (MADV_DONTNEED) today -- both kept `true` per the plan's explicit spec
-///   rather than assuming that stays true as the handlers evolve.
-/// - `shmdt`/`mlock`/`mlock2`/`mlockall`: NOT in the plan's literal list,
-///   added here after grepping every `dispatch/*.rs` call site of the eight
-///   mutator methods above (`grep -rn` across the whole `dispatch/` tree
-///   turns up hits ONLY in `mem.rs` and `sysv.rs`):
-///     - `shmdt` (`dispatch/sysv.rs`): calls `cx.memory.unmap_alias_range`
-///       then `cx.memory.set_unmapped` directly.
-///     - `mlock`/`mlock2` (`dispatch/mem.rs`): `populate_resident_range` ->
-///       `protect_range`.
-///     - `mlockall` (`dispatch/mem.rs`, `MCL_CURRENT`): `lock_current_mappings`
-///       -> `populate_resident_range` -> `protect_range`.
+/// - `munmap`(215)/`execve`(221)/`execveat`(281): PHYSICAL almost always
+///   (`unmap_range`/`replace_image`) -- kept pre-classified `true` rather
+///   than routed through the escalation path (simpler; these are the
+///   INFREQUENT mutators, so pre-classifying costs nothing).
+/// - `mmap`(222)/`mprotect`(226)/`madvise`(233)/`brk`(214)/`mremap`(216):
+///   reclassified `false` in Phase 2c. Their COMMON case is METADATA-only
+///   (`set_mapping_protection`/`set_no_access`/`protect_range` -- e.g. the
+///   frequent anon `PROT_NONE` arena reservation and ordinary `mprotect`),
+///   so they now take `.read()` and run CONCURRENT with readers -- this is
+///   the phase's actual perf win. `mmap`'s alias path returns
+///   `DispatchOutcome::MapHostAlias` without calling any `GuestMemory`
+///   mutator (the real `map_host_alias` mutation happens OUTSIDE
+///   `dispatch_threaded`, in the `MapHostAlias` arm, which already takes its
+///   own fresh `.write()` -- unaffected by this reclassification). `mremap`
+///   DOES call the PHYSICAL `unmap_range` directly (shrink-tail and
+///   move-source reclaim) -- `NativeDispatchMemory::unmap_range` escalates
+///   via `ensure_write`. `mmap`'s `MAP_FIXED|MAP_PRIVATE|ANON`-over-shared-
+///   aperture branch calls the PHYSICAL `repoint_private` -- also escalates.
+///   `brk`'s handler never touches `cx.memory` at all.
+/// - `shmdt`(197)/`mlock`(228)/`mlockall`(230)/`mlock2`(284): unchanged
+///   `true`, NOT reclassified by this phase (out of the phase's explicit
+///   scope; `mlock`/`mlock2`/`mlockall` only reach the now-metadata-safe
+///   `protect_range`, so reclassifying them is a plausible FOLLOW-UP, not
+///   done here). `shmdt` (`dispatch/sysv.rs`) calls
+///   `cx.memory.unmap_alias_range` (PHYSICAL) then `cx.memory.set_unmapped`
+///   directly.
 ///
 ///   `munlock`/`munlockall` were also audited and do NOT reach a mutator
 ///   (their bookkeeping lives in the separate `sysv`/`mem` `Mutex`, not
 ///   `NativeMappedMemory`) -- correctly `false`. `shmat`/`shmget`/`shmctl`
 ///   were audited too: `shmat` only touches a separate `Mutex` and returns
-///   `DispatchOutcome::MapHostAlias`, whose actual mapping mutation happens
-///   OUTSIDE `dispatch_threaded` in a caller that already takes its own
-///   `.write()` (native_darwin.rs `MapHostAlias` arm) -- also `false`.
+///   `DispatchOutcome::MapHostAlias` -- also `false`.
 ///
 /// See `mapping_mutator_numbers_match_linux_abi_names` (native_darwin.rs
 /// tests) for the per-number cross-check against `crate::linux_abi`.
@@ -3496,15 +3505,10 @@ fn native_syscall_mutates_mappings(nr: u64) -> bool {
     matches!(
         nr,
         197   // shmdt
-            | 214 // brk
             | 215 // munmap
-            | 216 // mremap
             | 221 // execve
-            | 222 // mmap
-            | 226 // mprotect
             | 228 // mlock
             | 230 // mlockall
-            | 233 // madvise
             | 281 // execveat
             | 284 // mlock2
     )
@@ -3535,6 +3539,11 @@ impl NativeDispatchGuard<'_> {
 /// `write_bytes_raw` -- Task 5's report flagged this as exactly Task 6's
 /// scope.
 ///
+/// Phase 2c (`docs/superpowers/specs/2026-07-15-mmap-writer-lockfree-reads-
+/// design.md`) widened the `false`-classified set to include `mmap`/
+/// `mprotect`/`madvise`/`brk`/`mremap`, whose COMMON case is metadata-only.
+/// Every method below now falls into exactly one of three buckets:
+///
 /// - Pure reads (`protections`/`read_bytes_raw`/`guest_range_is_writable`/
 ///   `supports_concurrent_exec_protection`/`shared_futex_location`) delegate
 ///   straight through the held guard: `&self`, no escalation, identical
@@ -3550,15 +3559,22 @@ impl NativeDispatchGuard<'_> {
 ///   bytecode straight into an RWX buffer, and skipping the escalation would
 ///   risk a host-process SIGSEGV in `copy_bytes_to_host`, not just a missed
 ///   optimization.
-/// - The genuine mapping-table mutators (`protect_range`/`unmap_range`/
-///   `unmap_alias_range`/`set_no_access`/`set_no_write`/`set_unmapped`/
-///   `set_mapping_protection`/`repoint_private`) are UNREACHABLE for a `nr`
-///   `native_syscall_mutates_mappings` classifies `false` -- every handler
-///   that calls them is in that function's `true` set, so it gets a real
-///   `NativeMappedMemory` directly and never constructs this adapter. They
-///   panic here instead of silently no-op'ing (the trait's own default for
-///   all eight) so a classification bug fails loudly in testing instead of
-///   silently corrupting protection state.
+/// - `set_no_access`/`set_no_write`/`set_unmapped`/`set_mapping_protection`/
+///   `protect_range`: METADATA mutators (`mapped_memory.rs`'s `*_shared`
+///   family). `set_*` touch ONLY `protections` (its own independent lock,
+///   never the `mapping` `ArcSwap`, never `regions`). `protect_range` mutates
+///   the `mapping` snapshot but ONLY via the `mapping_write`-serialized `&self`
+///   read-modify-write -- sound under a shared `.read()`, concurrent with
+///   readers and other metadata writers, no escalation needed.
+/// - `unmap_range` (and, through the trait's default, `unmap_alias_range`)
+///   and `repoint_private`: PHYSICAL mutators (raw `libc::mmap(MAP_FIXED)`
+///   replacing host backing, or a composite that must be atomic w.r.t.
+///   readers) -- `ensure_write()` escalates `Read` -> `Write` on demand,
+///   exactly like the `write_bytes_raw` escalation, before delegating to the
+///   real `&mut NativeMappedMemory` method. `map_host_alias` is NOT part of
+///   the `GuestMemory` trait at all -- its mutation happens OUTSIDE
+///   `dispatch_threaded` entirely (the `MapHostAlias` outcome arm takes its
+///   own fresh `.write()`), so this adapter never needs to reach it.
 struct NativeDispatchMemory<'a> {
     lock: &'a SharedNativeMemory,
     guard: Option<NativeDispatchGuard<'a>>,
@@ -3684,65 +3700,69 @@ impl GuestMemory for NativeDispatchMemory<'_> {
         self.inner().shared_futex_location(guest_addr)
     }
 
-    fn set_no_access(&mut self, _address: u64, _len: usize, _no_access: bool) {
-        unreachable!(
-            "native_syscall_mutates_mappings classified this syscall read-only, \
-             but its handler called set_no_access (a mapping-table mutator)"
-        );
+    /// METADATA mutator (Phase 2c): touches only `protections` (its own
+    /// independent lock), never `mapping`/`regions` -- delegates straight
+    /// through the held guard, no escalation, sound under `.read()`.
+    fn set_no_access(&mut self, address: u64, len: usize, no_access: bool) {
+        self.inner().set_no_access_shared(address, len, no_access);
     }
 
-    fn set_no_write(&mut self, _address: u64, _len: usize, _no_write: bool) {
-        unreachable!(
-            "native_syscall_mutates_mappings classified this syscall read-only, \
-             but its handler called set_no_write (a mapping-table mutator)"
-        );
+    /// See `set_no_access`.
+    fn set_no_write(&mut self, address: u64, len: usize, no_write: bool) {
+        self.inner().set_no_write_shared(address, len, no_write);
     }
 
-    fn set_unmapped(&mut self, _address: u64, _len: usize, _unmapped: bool) {
-        unreachable!(
-            "native_syscall_mutates_mappings classified this syscall read-only, \
-             but its handler called set_unmapped (a mapping-table mutator)"
-        );
+    /// See `set_no_access`. Never removes a `regions` entry (munmap's actual
+    /// region-removal bookkeeping is the PHYSICAL `unmap_range`, below).
+    fn set_unmapped(&mut self, address: u64, len: usize, unmapped: bool) {
+        self.inner().set_unmapped_shared(address, len, unmapped);
     }
 
+    /// See `set_no_access`.
     fn set_mapping_protection(
         &mut self,
-        _address: u64,
-        _len: usize,
-        _no_access: bool,
-        _no_write: bool,
+        address: u64,
+        len: usize,
+        no_access: bool,
+        no_write: bool,
     ) {
-        unreachable!(
-            "native_syscall_mutates_mappings classified this syscall read-only, \
-             but its handler called set_mapping_protection (a mapping-table mutator)"
-        );
+        self.inner()
+            .set_mapping_protection_shared(address, len, no_access, no_write);
     }
 
-    fn protect_range(&mut self, _address: u64, _len: usize, _prot: u64) -> Result<(), MemoryError> {
-        unreachable!(
-            "native_syscall_mutates_mappings classified this syscall read-only, \
-             but its handler called protect_range (a mapping-table mutator)"
-        );
+    /// METADATA mutator (Phase 2c): mutates the `mapping` `ArcSwap` only via
+    /// the `mapping_write`-serialized `&self` read-modify-write
+    /// (`protect_range_shared`) -- sound under `.read()`, concurrent with
+    /// readers and other metadata writers, no escalation.
+    fn protect_range(&mut self, address: u64, len: usize, prot: u64) -> Result<(), MemoryError> {
+        self.inner().protect_range_shared(address, len, prot)
     }
 
-    fn unmap_range(&mut self, _address: u64, _len: usize) -> Result<(), MemoryError> {
-        unreachable!(
-            "native_syscall_mutates_mappings classified this syscall read-only, \
-             but its handler called unmap_range (a mapping-table mutator)"
-        );
+    /// PHYSICAL mutator (Phase 2c): `unmap_range` clears a region's
+    /// file-identity futex key in place -- a real mutation of a `regions`
+    /// entry that must be atomic w.r.t. readers, so it escalates to a real
+    /// `.write()` before delegating (mirrors `write_bytes_raw`'s escalation).
+    /// The trait's default `unmap_alias_range` calls `self.unmap_range(..)`,
+    /// so it resolves to this override too -- no separate override needed.
+    fn unmap_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
+        self.ensure_write().unmap_range(address, len)
     }
 
+    /// PHYSICAL mutator (Phase 2c): does a raw `libc::mmap(MAP_FIXED)`
+    /// repointing a live host VA's backing (via `remap_private`) -- the
+    /// physical-backing hazard the outer `.write()` exists to fence
+    /// (`.superpowers/sdd/mapping-rcu-sites.md` hazard #3): a zero-copy
+    /// reader holding only `.read()` must never have the kernel touch a host
+    /// VA this call is mid-remap on. Escalates before delegating.
     fn repoint_private(
         &mut self,
-        _va: u64,
-        _overlay_ipa: u64,
-        _len: usize,
-        _content: &[u8],
+        va: u64,
+        overlay_ipa: u64,
+        len: usize,
+        content: &[u8],
     ) -> Result<(), MemoryError> {
-        unreachable!(
-            "native_syscall_mutates_mappings classified this syscall read-only, \
-             but its handler called repoint_private (a mapping-table mutator)"
-        );
+        self.ensure_write()
+            .repoint_private(va, overlay_ipa, len, content)
     }
 }
 
@@ -6939,6 +6959,7 @@ mod tests {
                 native_write_exec_writable_pages: BTreeSet::new(),
                 linux4k_page_protections: BTreeMap::new(),
             }),
+            mapping_write: parking_lot::Mutex::new(()),
             protections: MemoryProtections::default(),
             exclusive_sequences: parking_lot::Mutex::new(BTreeMap::new()),
             host_access_lifts: parking_lot::Mutex::new(std::collections::HashMap::new()),
@@ -7139,12 +7160,48 @@ mod tests {
         });
     }
 
+    /// Phase 2c reader-coherence TDD: `default_linux_prot_at_in` must read
+    /// off the CALLER-SUPPLIED snapshot, never a fresh `self.mapping.load()`
+    /// -- the cross-snapshot mix the fix eliminates for every hot reader
+    /// (`range_may_execute`/`native_range_allows`/`native16k_write_exec_page`/
+    /// `native_host_prot_for_page`/`guest_address_is_executable`). Proven by
+    /// mutating the LIVE snapshot after capturing an older one: a call with
+    /// the OLD snapshot must still see the OLD value.
+    #[test]
+    fn default_linux_prot_at_in_uses_the_supplied_snapshot_not_a_fresh_load() {
+        fork_test(|| {
+            let memory = biased_test_memory(carrick_guest_mem::GuestVa(0x40_0000), 0x4000);
+            let old_snap = memory.mapping.load_full();
+            let old_prot = memory.default_linux_prot_at_in(&old_snap, 0x40_0080);
+            assert_eq!(
+                old_prot,
+                crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_WRITE
+            );
+            memory.with_mapping_mut(|snap| {
+                snap.regions[0].default_prot = crate::linux_abi::LINUX_PROT_READ;
+            });
+            assert_eq!(
+                memory.default_linux_prot_at_in(&old_snap, 0x40_0080),
+                old_prot,
+                "a call with the OLD snapshot must see the OLD value, proving it \
+                 never internally re-`load()`s a newer one"
+            );
+            assert_eq!(
+                memory.default_linux_prot_at_in(&memory.mapping.load(), 0x40_0080),
+                crate::linux_abi::LINUX_PROT_READ,
+                "a freshly loaded snapshot must observe the mutation"
+            );
+        });
+    }
+
     // Task 6: `native_syscall_mutates_mappings` pre-classifier + the
     // `NativeDispatchMemory` read-guard adapter it enables at :3440.
 
     #[test]
     fn mapping_mutators_take_write_guard() {
-        for nr in [222u64, 215, 226, 233, 216, 214, 221, 281] {
+        // munmap/execve/execveat are PHYSICAL almost always -- still
+        // pre-classified `true` (Phase 2c did not touch these).
+        for nr in [215u64, 221, 281] {
             assert!(
                 native_syscall_mutates_mappings(nr),
                 "nr {nr} should be a mapping mutator"
@@ -7152,6 +7209,23 @@ mod tests {
         }
         for nr in [63u64, 64, 98, 172, 113] {
             assert!(!native_syscall_mutates_mappings(nr), "nr {nr} should not");
+        }
+    }
+
+    #[test]
+    fn metadata_only_mm_syscalls_are_read_classified() {
+        // Phase 2c (`docs/superpowers/specs/2026-07-15-mmap-writer-lockfree-
+        // reads-design.md`): mmap/mprotect/madvise/brk/mremap now take
+        // `.read()` -- their common case is metadata-only, and
+        // `NativeDispatchMemory` escalates on demand for the rare PHYSICAL
+        // branches (mmap's alias path never even reaches a `GuestMemory`
+        // mutator; mremap's tail/source reclaim and mmap's
+        // shared-aperture-repoint branch escalate via `ensure_write`).
+        for nr in [222u64, 226, 233, 214, 216] {
+            assert!(
+                !native_syscall_mutates_mappings(nr),
+                "nr {nr} should be read-classified since Phase 2c"
+            );
         }
     }
 
@@ -7173,25 +7247,30 @@ mod tests {
 
     #[test]
     fn mapping_mutator_numbers_match_linux_abi_names() {
-        // Cross-checks every number `native_syscall_mutates_mappings` uses
-        // against `crate::linux_abi::syscall::lookup_aarch64`'s name, so a future
-        // syscall-table renumbering can't silently desync the classifier
-        // from what it thinks it's matching.
-        let expected: &[(u64, &str)] = &[
+        // Cross-checks every number `native_syscall_mutates_mappings`
+        // discusses against `crate::linux_abi::syscall::lookup_aarch64`'s
+        // name, so a future syscall-table renumbering can't silently desync
+        // the classifier from what it thinks it's matching. Split into the
+        // still-`.write()`-classified set and the Phase 2c-reclassified
+        // `.read()` set (both get the name cross-check; only the first
+        // asserts `true`).
+        let write_classified: &[(u64, &str)] = &[
             (197, "shmdt"),
-            (214, "brk"),
             (215, "munmap"),
-            (216, "mremap"),
             (221, "execve"),
-            (222, "mmap"),
-            (226, "mprotect"),
             (228, "mlock"),
             (230, "mlockall"),
-            (233, "madvise"),
             (281, "execveat"),
             (284, "mlock2"),
         ];
-        for &(nr, name) in expected {
+        let read_classified: &[(u64, &str)] = &[
+            (214, "brk"),
+            (216, "mremap"),
+            (222, "mmap"),
+            (226, "mprotect"),
+            (233, "madvise"),
+        ];
+        for &(nr, name) in write_classified.iter().chain(read_classified) {
             let entry = crate::linux_abi::syscall::lookup_aarch64(nr)
                 .unwrap_or_else(|| panic!("nr {nr} missing from the aarch64 syscall table"));
             assert_eq!(
@@ -7199,9 +7278,17 @@ mod tests {
                 "nr {nr} is named {:?} in linux_abi, expected {name:?}",
                 entry.name
             );
+        }
+        for &(nr, name) in write_classified {
             assert!(
                 native_syscall_mutates_mappings(nr),
                 "nr {nr} ({name}) should be classified as a mapping mutator"
+            );
+        }
+        for &(nr, name) in read_classified {
+            assert!(
+                !native_syscall_mutates_mappings(nr),
+                "nr {nr} ({name}) should be read-classified since Phase 2c"
             );
         }
     }
@@ -7230,19 +7317,133 @@ mod tests {
         });
     }
 
+    /// Phase 2c TDD: `protect_range_shared` compiles and works through a bare
+    /// `&NativeMappedMemory` -- would NOT compile if it needed `&mut self`.
+    /// Mirrors `write_bytes_through_shared_ref`'s pattern for the mmap-writer
+    /// metadata path.
     #[test]
-    fn native_dispatch_memory_panics_on_a_mapping_mutator_call() {
+    fn protect_range_through_shared_ref() {
         fork_test(|| {
             let memory = biased_test_memory(carrick_guest_mem::GuestVa(0x40_0000), 0x4000);
-            let shared: SharedNativeMemory = Arc::new(NativeMemoryHandle::new(memory));
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let mut dispatch_memory = NativeDispatchMemory::new_read(&shared);
-                dispatch_memory.set_no_access(0x40_0080, 0x4000, true);
-            }));
+            let page = memory.mapping.load().regions[0].start;
+            assert!(memory.native_range_allows(page, 0x4000, true));
+            let shared: &NativeMappedMemory = &memory;
+            shared
+                .protect_range_shared(page, 0x4000, crate::linux_abi::LINUX_PROT_READ)
+                .expect("a metadata-only protect_range must succeed through &self");
             assert!(
-                result.is_err(),
-                "a mapping-mutator call through the read-classified adapter must panic \
-                 loudly, never silently no-op (the trait's own default for all eight)"
+                !memory.native_range_allows(page, 0x4000, true),
+                "the protection change must be visible after the &self call returns"
+            );
+        });
+    }
+
+    /// Phase 2c correctness TDD: `mapping_write` must serialize the
+    /// `mapping` `ArcSwap` read-modify-write so concurrent metadata writers
+    /// (running under only the outer `.read()` guard in production) never
+    /// lose one another's update. Proven directly against
+    /// `&NativeMappedMemory` (the outer `RwLock` is not involved at all --
+    /// this isolates `mapping_write`'s own correctness) with real OS threads
+    /// racing on the SAME `ArcSwap`, each writing a DISTINCT page: a lost
+    /// update would silently drop one thread's insert.
+    #[test]
+    fn concurrent_metadata_writers_do_not_lose_updates() {
+        fork_test(|| {
+            const PAGES: u64 = 48;
+            const HOST_PAGE: u64 = 16 * 1024;
+            let memory = biased_test_memory_with_geometry(
+                carrick_guest_mem::GuestVa(0x40_0000),
+                (PAGES * HOST_PAGE) as usize,
+                16 * 1024,
+            );
+            let base = memory.mapping.load().regions[0].start;
+            let shared = std::sync::Arc::new(memory);
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(PAGES as usize));
+            let threads: Vec<_> = (0..PAGES)
+                .map(|i| {
+                    let shared = std::sync::Arc::clone(&shared);
+                    let barrier = std::sync::Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        let addr = base + i * HOST_PAGE;
+                        barrier.wait();
+                        shared
+                            .protect_range_shared(
+                                addr,
+                                HOST_PAGE as usize,
+                                crate::linux_abi::LINUX_PROT_READ,
+                            )
+                            .expect("concurrent protect_range_shared must succeed");
+                    })
+                })
+                .collect();
+            for t in threads {
+                t.join().expect("writer thread must not panic");
+            }
+            let snap = shared.mapping.load();
+            for i in 0..PAGES {
+                let addr = base + i * HOST_PAGE;
+                assert_eq!(
+                    snap.native_page_protections.get(&addr).copied(),
+                    Some(crate::linux_abi::LINUX_PROT_READ),
+                    "page index {i} (addr=0x{addr:x}) update must not have been lost \
+                     to a concurrent metadata writer"
+                );
+            }
+        });
+    }
+
+    /// Phase 2c TDD: a metadata mutator (`set_no_access`/`protect_range`)
+    /// reached through the READ-classified `NativeDispatchMemory` adapter
+    /// must succeed WITHOUT escalating to `Write` -- proving it runs
+    /// concurrent with readers (the phase's actual perf win), replacing the
+    /// old must-panic assertion this call used to trigger.
+    #[test]
+    fn native_dispatch_memory_metadata_mutators_stay_read_classified() {
+        fork_test(|| {
+            let memory = biased_test_memory(carrick_guest_mem::GuestVa(0x40_0000), 0x4000);
+            let page = memory.mapping.load().regions[0].start;
+            let shared: SharedNativeMemory = Arc::new(NativeMemoryHandle::new(memory));
+            {
+                let mut dispatch_memory = NativeDispatchMemory::new_read(&shared);
+                dispatch_memory.set_no_access(page, 0x4000, true);
+                dispatch_memory
+                    .protect_range(page, 0x4000, crate::linux_abi::LINUX_PROT_READ)
+                    .expect("a metadata-only protect_range must succeed under a read guard");
+                assert!(
+                    matches!(dispatch_memory.guard, Some(NativeDispatchGuard::Read(_))),
+                    "protect_range/set_no_access are pure metadata mutators: \
+                     they must NOT escalate to Write"
+                );
+            }
+            let guard = shared.read();
+            assert!(
+                guard.protections().unwrap().range_no_access(page, 0x4000),
+                "set_no_access must have landed"
+            );
+            assert!(
+                !guard.native_range_allows(page, 0x4000, true),
+                "protect_range must have landed"
+            );
+        });
+    }
+
+    /// Phase 2c TDD: `unmap_range` reached through the READ-classified
+    /// adapter is a PHYSICAL mutator and MUST escalate to a real `Write`
+    /// guard before it runs (the physical-backing hazard --
+    /// `.superpowers/sdd/mapping-rcu-sites.md` hazard #3).
+    #[test]
+    fn native_dispatch_memory_unmap_range_escalates_to_write() {
+        fork_test(|| {
+            let memory = biased_test_memory(carrick_guest_mem::GuestVa(0x40_0000), 0x4000);
+            let page = memory.mapping.load().regions[0].start;
+            let shared: SharedNativeMemory = Arc::new(NativeMemoryHandle::new(memory));
+            let mut dispatch_memory = NativeDispatchMemory::new_read(&shared);
+            dispatch_memory
+                .unmap_range(page, 0x4000)
+                .expect("unmap_range must succeed after escalating");
+            assert!(
+                matches!(dispatch_memory.guard, Some(NativeDispatchGuard::Write(_))),
+                "unmap_range is a PHYSICAL mutator: it must escalate to Write"
             );
         });
     }
@@ -9261,6 +9462,7 @@ mod tests {
                 native_write_exec_writable_pages: BTreeSet::new(),
                 linux4k_page_protections: BTreeMap::new(),
             }),
+            mapping_write: parking_lot::Mutex::new(()),
             protections: MemoryProtections::default(),
             exclusive_sequences: parking_lot::Mutex::new(BTreeMap::new()),
             host_access_lifts: parking_lot::Mutex::new(std::collections::HashMap::new()),
@@ -9396,6 +9598,7 @@ mod tests {
                 native_write_exec_writable_pages: BTreeSet::new(),
                 linux4k_page_protections: BTreeMap::new(),
             }),
+            mapping_write: parking_lot::Mutex::new(()),
             protections: MemoryProtections::default(),
             exclusive_sequences: parking_lot::Mutex::new(BTreeMap::new()),
             host_access_lifts: parking_lot::Mutex::new(std::collections::HashMap::new()),
@@ -10113,6 +10316,7 @@ mod tests {
                 native_write_exec_writable_pages: BTreeSet::new(),
                 linux4k_page_protections: BTreeMap::new(),
             }),
+            mapping_write: parking_lot::Mutex::new(()),
             protections: MemoryProtections::default(),
             exclusive_sequences: parking_lot::Mutex::new(BTreeMap::new()),
             host_access_lifts: parking_lot::Mutex::new(std::collections::HashMap::new()),
