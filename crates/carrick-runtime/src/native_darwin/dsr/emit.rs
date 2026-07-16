@@ -227,6 +227,20 @@ pub(super) struct DirectLink {
 }
 
 impl EmittedBlock {
+    pub(super) fn from_artifact_parts(
+        code: PublishedCode,
+        entries: Vec<PcMapEntry>,
+        direct_links: Vec<DirectLink>,
+        recovery: Vec<RecoveryEntry>,
+    ) -> Result<Self, DsrError> {
+        Ok(Self {
+            code,
+            map: InstructionMap::new(entries)?,
+            direct_links,
+            recovery,
+        })
+    }
+
     pub(super) const fn entry(&self) -> CacheVa {
         self.code.entry()
     }
