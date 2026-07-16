@@ -635,6 +635,11 @@ fn emit_pc_relative_literal(
     )
 }
 
+#[allow(
+    clippy::needless_option_as_deref,
+    clippy::too_many_arguments,
+    reason = "gateway emission reborrows optional recording across its fixed exit payload"
+)]
 fn emit_gateway_exit(
     assembler: &mut VecAssembler<Aarch64Relocation>,
     entries: &mut Vec<PcMapEntry>,
@@ -730,6 +735,10 @@ fn relocated_direct_word(
     Ok(relocated)
 }
 
+#[allow(
+    clippy::needless_option_as_deref,
+    reason = "indirect exit emission reborrows optional recording across its resolver paths"
+)]
 fn emit_indirect_exit(
     assembler: &mut VecAssembler<Aarch64Relocation>,
     entries: &mut Vec<PcMapEntry>,
@@ -2063,6 +2072,10 @@ const CLREX_WORD: u32 = 0xd503_3f5f;
 /// emitted words map to `guest` so a kick/fault re-enters at a guest PC whose
 /// re-execution is idempotent (the store has run, or the branch is re-evaluated
 /// against unchanged flags).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the exit edge carries its complete mapping and direct-link context"
+)]
 fn emit_region_direct_exit(
     assembler: &mut VecAssembler<Aarch64Relocation>,
     entries: &mut Vec<PcMapEntry>,
@@ -2186,6 +2199,7 @@ fn exclusive_access_width(memory: super::types::MemoryAccess) -> Result<u64, Dsr
 }
 
 #[allow(
+    clippy::needless_option_as_deref,
     clippy::too_many_arguments,
     reason = "the fused region and its recovery/exit metadata are one lowering unit"
 )]
@@ -2679,6 +2693,7 @@ fn emit_biased_exclusive_region(
 /// separately tested scratch-based lowering only for plans whose structural
 /// analysis supplied a safe two-register scratch plan.
 #[allow(
+    clippy::needless_option_as_deref,
     clippy::too_many_arguments,
     reason = "direct and biased exclusive lowering share the planned region payload"
 )]
@@ -2862,6 +2877,10 @@ fn emit_exclusive_region(
     Ok(())
 }
 
+#[allow(
+    clippy::needless_option_as_deref,
+    reason = "block lowering reborrows optional recording across independent emission paths"
+)]
 fn emit_block_inner(
     cache: &mut TranslationCache,
     plan: &BlockPlan,
