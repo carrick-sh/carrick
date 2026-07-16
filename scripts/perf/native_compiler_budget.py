@@ -110,9 +110,10 @@ FRAME_FIELDS_V2 = {
     "process": {"startup_wall_ns", "startup_cpu_ns", "process_cpu_ns"},
 }
 REQUIRED_FRAMES_V2 = frozenset(FRAME_FIELDS_V2)
-# NATIVEPERF v3 adds reconciled exclusive-fusion execution counters and
-# process-wide unique-site gauges. The class order is stable and mirrors the
-# producer's exhaustive `ExclusiveFusionClass::ALL` array.
+# NATIVEPERF v3 adds reconciled exclusive-fusion execution counters,
+# per-exec-epoch unique-site gauges, and the epoch identity on `core`. The
+# class order is stable and mirrors the producer's exhaustive
+# `ExclusiveFusionClass::ALL` array.
 FUSION_CLASSES = (
     ("fusion_fused_direct", "fused-direct"),
     ("fusion_fused_biased", "fused-biased"),
@@ -140,6 +141,7 @@ _FUSION_FIELDS_A = {field for field, _ in FUSION_CLASSES[:8]}
 _FUSION_FIELDS_B = {field for field, _ in FUSION_CLASSES[8:]}
 FRAME_FIELDS_V3 = {
     **{frame: set(fields) for frame, fields in FRAME_FIELDS_V2.items()},
+    "core": FRAME_FIELDS_V2["core"] | {"exec_epoch"},
     "fusion-exec-a": set(_FUSION_FIELDS_A),
     "fusion-exec-b": set(_FUSION_FIELDS_B),
     "fusion-sites-a": set(_FUSION_FIELDS_A),
@@ -812,6 +814,7 @@ class ProfileThread:
     era: int
     frames: frozenset[str]
     values: tuple[tuple[str, int], ...]
+    exec_epoch: int = 0
 
     @property
     def gateway_entries(self) -> int:
@@ -956,15 +959,18 @@ def parse_nativeperf(lines: Iterable[str]) -> ProfileRun:
     threads: list[ProfileThread] = []
     profile_versions: set[int] = set()
     for (pid, tid, era), frames in sorted(groups.items()):
-        versions = group_versions.get((pid, tid, era), set())
+        key = (pid, tid, era)
+        versions = group_versions.get(key, set())
         if versions == {2, 3}:
             version = 3
         elif len(versions) > 1:
             raise BudgetError(
-                f"mixed native profile contract versions for {(pid, tid, era)}"
+                f"mixed native profile contract versions for {key}"
             )
         else:
             version = versions.pop() if versions else 1
+        if version == 3 and "exec_epoch" not in frames.get("core", {}):
+            raise BudgetError(f"NATIVEPERF v3 group is missing exec_epoch: {key}")
         required = {
             1: REQUIRED_FRAMES,
             2: REQUIRED_FRAMES_V2,
@@ -973,7 +979,7 @@ def parse_nativeperf(lines: Iterable[str]) -> ProfileRun:
         missing = required - set(frames)
         if missing:
             raise BudgetError(
-                f"missing profile frames for {(pid, tid, era)}: {', '.join(sorted(missing))}"
+                f"missing profile frames for {key}: {', '.join(sorted(missing))}"
             )
         profile_versions.add(version)
         values = tuple(
@@ -983,7 +989,8 @@ def parse_nativeperf(lines: Iterable[str]) -> ProfileRun:
                 for field, value in frame_values.items()
             )
         )
-        threads.append(ProfileThread(pid, tid, era, frozenset(frames), values))
+        exec_epoch = frames["core"].get("exec_epoch", 0)
+        threads.append(ProfileThread(pid, tid, era, frozenset(frames), values, exec_epoch))
     if len(profile_versions) > 1:
         raise BudgetError(
             "mixed native profile contract versions across thread groups"
@@ -1000,10 +1007,10 @@ def parse_nativeperf(lines: Iterable[str]) -> ProfileRun:
 def validate_profile(run: ProfileRun) -> None:
     if not run.threads:
         raise BudgetError("native profile has no complete threads")
-    identities: set[tuple[int, int, int]] = set()
+    identities: set[tuple[int, int, int, int]] = set()
     startup_by_pid: dict[int, tuple[int, int]] = {}
     for thread in run.threads:
-        identity = (thread.pid, thread.tid, thread.era)
+        identity = (thread.pid, thread.tid, thread.era, thread.exec_epoch)
         if identity in identities:
             raise BudgetError(f"duplicate thread identity: {identity}")
         identities.add(identity)
@@ -1095,26 +1102,27 @@ def validate_profile(run: ProfileRun) -> None:
 
 
 def fusion_coverage(profile: ProfileRun) -> dict[str, object]:
-    """Aggregate v3 execution deltas and per-process unique-site gauges."""
+    """Aggregate v3 execution deltas and per-exec-epoch unique-site gauges."""
     validate_profile(profile)
     if profile.version != 3:
         raise BudgetError(
             f"exclusive fusion coverage requires NATIVEPERF v3: got v{profile.version}"
         )
     execution_counts = {label: 0 for _, label in FUSION_CLASSES}
-    unique_sites_by_pid: dict[int, dict[str, int]] = {}
+    unique_sites_by_exec_epoch: dict[tuple[int, int], dict[str, int]] = {}
     for thread in profile.threads:
         for index, (field, label) in enumerate(FUSION_CLASSES):
             frame = "fusion-exec-a" if index < 8 else "fusion-exec-b"
             execution_counts[label] += thread.value(frame, field)
             site_frame = "fusion-sites-a" if index < 8 else "fusion-sites-b"
-            per_pid = unique_sites_by_pid.setdefault(
-                thread.pid, {name: 0 for _, name in FUSION_CLASSES}
+            per_epoch = unique_sites_by_exec_epoch.setdefault(
+                (thread.pid, thread.exec_epoch),
+                {name: 0 for _, name in FUSION_CLASSES},
             )
-            per_pid[label] = max(per_pid[label], thread.value(site_frame, field))
+            per_epoch[label] = max(per_epoch[label], thread.value(site_frame, field))
     residual = sum(execution_counts.values())
     unique_site_counts = {
-        label: sum(per_pid[label] for per_pid in unique_sites_by_pid.values())
+        label: sum(per_epoch[label] for per_epoch in unique_sites_by_exec_epoch.values())
         for _, label in FUSION_CLASSES
     }
     execution_shares = {
@@ -2421,6 +2429,7 @@ def _profile_json(profile: ProfileRun | None) -> object:
                 "pid": thread.pid,
                 "tid": thread.tid,
                 "era": thread.era,
+                **({"exec_epoch": thread.exec_epoch} if profile.version == 3 else {}),
                 "frames": sorted(thread.frames),
                 "values": dict(thread.values),
             }
@@ -2526,7 +2535,17 @@ def _parse_profile_json(value: object) -> ProfileRun | None:
     threads = []
     profile_versions: set[int] = set()
     for entry in threads_raw:
-        thread = _exact_mapping(entry, {"pid", "tid", "era", "frames", "values"}, "profile thread")
+        if not isinstance(entry, dict):
+            raise BudgetError("profile thread must be an object")
+        base_fields = {"pid", "tid", "era", "frames", "values"}
+        unknown_fields = set(entry) - (base_fields | {"exec_epoch"})
+        missing_fields = base_fields - set(entry)
+        if unknown_fields or missing_fields:
+            raise BudgetError(
+                "profile thread has invalid fields: "
+                + ", ".join(sorted(unknown_fields | missing_fields))
+            )
+        thread = entry
         frames = thread["frames"]
         values = thread["values"]
         if not isinstance(frames, list):
@@ -2542,6 +2561,10 @@ def _parse_profile_json(value: object) -> ProfileRun | None:
             fields_by_frame = FRAME_FIELDS_V3
         else:
             raise BudgetError("profile thread frames are not the exact required set")
+        if version == 3 and "exec_epoch" not in thread:
+            raise BudgetError("NATIVEPERF v3 profile thread is missing exec_epoch")
+        if version != 3 and "exec_epoch" in thread:
+            raise BudgetError("exec_epoch requires a NATIVEPERF v3 profile thread")
         profile_versions.add(version)
         if not isinstance(values, dict) or not all(isinstance(key, str) for key in values):
             raise BudgetError("profile thread values must be an object")
@@ -2560,6 +2583,9 @@ def _parse_profile_json(value: object) -> ProfileRun | None:
         parsed_values = tuple(
             sorted((key, _nonnegative_int(item, f"profile value {key}")) for key, item in values.items())
         )
+        exec_epoch = _nonnegative_int(thread.get("exec_epoch", 0), "profile exec epoch")
+        if version == 3 and dict(parsed_values)["core.exec_epoch"] != exec_epoch:
+            raise BudgetError("profile exec epoch differs from core frame identity")
         threads.append(
             ProfileThread(
                 _nonnegative_int(thread["pid"], "profile pid"),
@@ -2567,6 +2593,7 @@ def _parse_profile_json(value: object) -> ProfileRun | None:
                 _nonnegative_int(thread["era"], "profile era"),
                 frozenset(frames),
                 parsed_values,
+                exec_epoch,
             )
         )
     if len(profile_versions) > 1:

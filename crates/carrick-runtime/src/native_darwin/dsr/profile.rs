@@ -7,6 +7,28 @@ use super::types::{ExclusiveFusionDisposition, ExclusiveFusionRejection, Sensiti
 pub(super) const PROTOCOL_PREFIX: &str = "NATIVEPERF1";
 pub(super) const DARWIN_PIPE_BUF: usize = 512;
 
+/// Reserved fail-closed identity. Valid exec epochs are `0..u64::MAX`; an
+/// attempted increment from the final valid epoch publishes this sentinel and
+/// invalidates profiling without affecting guest exec semantics.
+const INVALID_EXEC_EPOCH: u64 = u64::MAX;
+static PROFILE_EXEC_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+fn next_exec_epoch(current: u64) -> u64 {
+    current.checked_add(1).unwrap_or(INVALID_EXEC_EPOCH)
+}
+
+pub(in crate::native_darwin) fn next_profile_exec_epoch_for_reexec() -> u64 {
+    next_exec_epoch(PROFILE_EXEC_EPOCH.load(Ordering::Acquire))
+}
+
+pub(in crate::native_darwin) fn seed_profile_exec_epoch_after_reexec(epoch: u64) {
+    PROFILE_EXEC_EPOCH.store(epoch, Ordering::Release);
+}
+
+pub(super) fn reset_profile_exec_epoch_after_fork_child() {
+    PROFILE_EXEC_EPOCH.store(0, Ordering::Release);
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(usize)]
 pub(in crate::native_darwin) enum ExitClass {
@@ -772,6 +794,7 @@ pub(super) struct CompleteThreadRecord {
     pub(super) pid: libc::pid_t,
     pub(super) tid: i32,
     pub(super) era: u64,
+    pub(super) exec_epoch: u64,
     pub(super) gateway_entries: u64,
     pub(super) reconciled_exits: u64,
     exits: [u64; ExitClass::COUNT],
@@ -787,8 +810,8 @@ impl CompleteThreadRecord {
         let mut line = self.frame_header("core");
         let _ = write!(
             line,
-            "|gateway_entries={}|reconciled_exits={}|overflowed=0|thread_cpu_ns={thread_cpu_ns}",
-            self.gateway_entries, self.reconciled_exits
+            "|gateway_entries={}|reconciled_exits={}|overflowed=0|thread_cpu_ns={thread_cpu_ns}|exec_epoch={}",
+            self.gateway_entries, self.reconciled_exits, self.exec_epoch
         );
         line
     }
@@ -988,6 +1011,7 @@ pub(super) struct ThreadBudget {
     pid: libc::pid_t,
     tid: i32,
     era: u64,
+    exec_epoch: u64,
     gateway_entries: u64,
     exits: [u64; ExitClass::COUNT],
     sensitive: [u64; SensitiveClass::COUNT],
@@ -1007,6 +1031,7 @@ impl ThreadBudget {
             // SAFETY: `getpid` has no preconditions.
             unsafe { libc::getpid() },
             tid,
+            PROFILE_EXEC_EPOCH.load(Ordering::Acquire),
         );
         if enabled {
             // Consume the baseline installed at post-exec runtime re-entry
@@ -1021,12 +1046,13 @@ impl ThreadBudget {
         budget
     }
 
-    fn new(enabled: bool, pid: libc::pid_t, tid: i32) -> Self {
-        Self {
+    fn new(enabled: bool, pid: libc::pid_t, tid: i32, exec_epoch: u64) -> Self {
+        let mut budget = Self {
             enabled,
             pid,
             tid,
             era: if enabled { monotonic_ticks() } else { 0 },
+            exec_epoch,
             gateway_entries: 0,
             exits: [0; ExitClass::COUNT],
             sensitive: [0; SensitiveClass::COUNT],
@@ -1036,7 +1062,11 @@ impl ThreadBudget {
             blocked_cpu_ns: 0,
             thread_cpu_baseline_ns: 0,
             invalid: None,
+        };
+        if enabled && exec_epoch == INVALID_EXEC_EPOCH {
+            budget.invalid = Some(ProfileError::CounterOverflow("profile_exec_epoch"));
         }
+        budget
     }
 
     pub(super) fn enabled(&self) -> bool {
@@ -1215,6 +1245,7 @@ impl ThreadBudget {
             pid: self.pid,
             tid: self.tid,
             era: self.era,
+            exec_epoch: self.exec_epoch,
             gateway_entries: self.gateway_entries,
             reconciled_exits,
             exits: self.exits,
@@ -1228,10 +1259,11 @@ impl ThreadBudget {
 
     pub(super) fn invalid_protocol_line(&self, error: ProfileError) -> String {
         format!(
-            "{PROTOCOL_PREFIX}|invalid|complete=0|pid={}|tid={}|era={}|reason={}",
+            "{PROTOCOL_PREFIX}|invalid|complete=0|pid={}|tid={}|era={}|exec_epoch={}|reason={}",
             self.pid,
             self.tid,
             self.era,
+            self.exec_epoch,
             error.protocol_reason()
         )
     }
@@ -1243,6 +1275,7 @@ impl ThreadBudget {
             // SAFETY: `getpid` has no preconditions.
             unsafe { libc::getpid() },
             tid,
+            0,
         );
     }
 
@@ -1250,6 +1283,7 @@ impl ThreadBudget {
         let enabled = self.enabled;
         let pid = self.pid;
         let tid = self.tid;
+        let next_exec_epoch = next_exec_epoch(self.exec_epoch);
         let next_era = self.era.checked_add(1).map(|minimum| {
             if enabled {
                 monotonic_ticks().max(minimum)
@@ -1257,7 +1291,10 @@ impl ThreadBudget {
                 minimum
             }
         });
-        *self = Self::new(enabled, pid, tid);
+        *self = Self::new(enabled, pid, tid, next_exec_epoch);
+        if enabled {
+            PROFILE_EXEC_EPOCH.store(next_exec_epoch, Ordering::Release);
+        }
         match next_era {
             Some(era) => self.era = era,
             None => {
@@ -1273,14 +1310,14 @@ impl ThreadBudget {
 
     #[cfg(test)]
     pub(super) fn enabled_for_test(pid: libc::pid_t, tid: i32) -> Self {
-        let mut budget = Self::new(true, pid, tid);
+        let mut budget = Self::new(true, pid, tid, 0);
         budget.era = 0;
         budget
     }
 
     #[cfg(test)]
     pub(super) fn disabled_for_test(pid: libc::pid_t, tid: i32) -> Self {
-        Self::new(false, pid, tid)
+        Self::new(false, pid, tid, 0)
     }
 
     /// Directly install an era CPU baseline, bypassing the process-global
@@ -1531,6 +1568,25 @@ mod tests {
     }
 
     #[test]
+    fn exec_epoch_exhaustion_invalidates_profile_without_wrapping_identity() {
+        let mut budget = ThreadBudget::enabled_for_test(41, 42);
+        budget.exec_epoch = u64::MAX - 1;
+
+        budget.reset_after_exec();
+
+        assert_eq!(budget.exec_epoch, INVALID_EXEC_EPOCH);
+        assert!(matches!(
+            budget.complete_record(),
+            Err(ProfileError::CounterOverflow("profile_exec_epoch"))
+        ));
+        assert!(
+            budget
+                .invalid_protocol_line(ProfileError::CounterOverflow("profile_exec_epoch"))
+                .contains("|exec_epoch=18446744073709551615|reason=counter-overflow")
+        );
+    }
+
+    #[test]
     fn sensitive_classes_have_stable_protocol_names() {
         assert_eq!(
             SensitiveClass::from(SensitiveKind::Exclusive(0)).as_str(),
@@ -1563,6 +1619,7 @@ mod tests {
             pid: libc::pid_t::MIN,
             tid: i32::MIN,
             era: u64::MAX,
+            exec_epoch: u64::MAX - 1,
             gateway_entries: u64::MAX,
             reconciled_exits: u64::MAX,
             exits: [u64::MAX; ExitClass::COUNT],
