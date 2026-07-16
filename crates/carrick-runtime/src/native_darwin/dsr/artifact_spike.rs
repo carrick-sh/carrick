@@ -1,6 +1,10 @@
 #![allow(dead_code)]
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::File;
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::fs::FileExt;
+use std::sync::OnceLock;
 
 use super::cache::TranslationCache;
 use super::emit::{
@@ -10,6 +14,171 @@ use super::emit::{
 use super::types::{CacheOffset, DsrError};
 
 const MOV_WIDE_IMM16_MASK: u32 = 0x001f_ffe0;
+const ARTIFACT_STORE_SIZE: u64 = 256 * 1024 * 1024;
+static ARTIFACT_AUTHORITY: OnceLock<ArtifactAuthority> = OnceLock::new();
+
+#[derive(Debug)]
+pub(in crate::native_darwin) struct ArtifactAuthority {
+    file: File,
+    authority_nonce: [u8; 16],
+}
+
+impl ArtifactAuthority {
+    fn create() -> Result<Self, DsrError> {
+        let file = tempfile::tempfile().map_err(|error| DsrError::Host {
+            operation: "create translation artifact spike authority",
+            error,
+        })?;
+        file.set_len(ARTIFACT_STORE_SIZE)
+            .map_err(|error| DsrError::Host {
+                operation: "size translation artifact spike authority",
+                error,
+            })?;
+        let mut authority_nonce = [0_u8; 16];
+        getrandom::fill(&mut authority_nonce).map_err(|error| {
+            DsrError::CachePolicy(format!("generate artifact authority nonce: {error}"))
+        })?;
+        file.write_all_at(&authority_nonce, 0)
+            .map_err(|error| DsrError::Host {
+                operation: "write translation artifact spike nonce",
+                error,
+            })?;
+        Ok(Self {
+            file,
+            authority_nonce,
+        })
+    }
+
+    #[cfg(test)]
+    fn create_for_test() -> Result<Self, DsrError> {
+        Self::create()
+    }
+
+    pub(in crate::native_darwin) fn snapshot(
+        &self,
+    ) -> Result<crate::native_exec_capsule::NativeReexecArtifactSpikeV1, DsrError> {
+        let fd = self.file.as_raw_fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags < 0 {
+            return Err(DsrError::Host {
+                operation: "read artifact authority fd flags",
+                error: std::io::Error::last_os_error(),
+            });
+        }
+        let mut identity = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe { libc::fstat(fd, identity.as_mut_ptr()) } != 0 {
+            return Err(DsrError::Host {
+                operation: "stat artifact authority",
+                error: std::io::Error::last_os_error(),
+            });
+        }
+        let identity = unsafe { identity.assume_init() };
+        Ok(crate::native_exec_capsule::NativeReexecArtifactSpikeV1 {
+            host_fd: fd,
+            original_host_fd_flags: flags,
+            host_device: identity.st_dev as u64,
+            host_inode: identity.st_ino,
+            host_size: identity.st_size as u64,
+            authority_nonce: self.authority_nonce,
+        })
+    }
+
+    #[cfg(test)]
+    fn file(&self) -> &File {
+        &self.file
+    }
+}
+
+fn adopt(
+    snapshot: &crate::native_exec_capsule::NativeReexecArtifactSpikeV1,
+) -> Result<ArtifactAuthority, DsrError> {
+    let mut identity = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(snapshot.host_fd, identity.as_mut_ptr()) } != 0 {
+        return Err(DsrError::Host {
+            operation: "stat inherited artifact authority",
+            error: std::io::Error::last_os_error(),
+        });
+    }
+    let identity = unsafe { identity.assume_init() };
+    if identity.st_dev as u64 != snapshot.host_device
+        || identity.st_ino != snapshot.host_inode
+        || identity.st_size as u64 != snapshot.host_size
+        || snapshot.host_size != ARTIFACT_STORE_SIZE
+    {
+        return Err(DsrError::CachePolicy(
+            "inherited artifact authority identity mismatch".to_string(),
+        ));
+    }
+    let file = unsafe { File::from_raw_fd(snapshot.host_fd) };
+    let mut authority_nonce = [0_u8; 16];
+    file.read_exact_at(&mut authority_nonce, 0)
+        .map_err(|error| DsrError::Host {
+            operation: "read inherited artifact authority nonce",
+            error,
+        })?;
+    if authority_nonce != snapshot.authority_nonce {
+        return Err(DsrError::CachePolicy(
+            "inherited artifact authority nonce mismatch".to_string(),
+        ));
+    }
+    if unsafe {
+        libc::fcntl(
+            file.as_raw_fd(),
+            libc::F_SETFD,
+            snapshot.original_host_fd_flags,
+        )
+    } != 0
+    {
+        return Err(DsrError::Host {
+            operation: "restore inherited artifact authority fd flags",
+            error: std::io::Error::last_os_error(),
+        });
+    }
+    Ok(ArtifactAuthority {
+        file,
+        authority_nonce,
+    })
+}
+
+pub(in crate::native_darwin) fn ensure_authority_if_enabled() -> Result<(), DsrError> {
+    if std::env::var_os("CARRICK_DSR_ARTIFACT_SPIKE").as_deref() != Some(std::ffi::OsStr::new("1"))
+        || ARTIFACT_AUTHORITY.get().is_some()
+    {
+        return Ok(());
+    }
+    let authority = ArtifactAuthority::create()?;
+    ARTIFACT_AUTHORITY.set(authority).map_err(|_| {
+        DsrError::CachePolicy("artifact authority initialized concurrently".to_string())
+    })
+}
+
+pub(crate) fn authority_snapshot_if_enabled()
+-> anyhow::Result<Option<crate::native_exec_capsule::NativeReexecArtifactSpikeV1>> {
+    ensure_authority_if_enabled()
+        .map_err(|error| anyhow::anyhow!("create artifact spike authority: {error}"))?;
+    ARTIFACT_AUTHORITY
+        .get()
+        .map(ArtifactAuthority::snapshot)
+        .transpose()
+        .map_err(|error| anyhow::anyhow!("snapshot artifact spike authority: {error}"))
+}
+
+pub(crate) fn adopt_for_resume(
+    snapshot: &crate::native_exec_capsule::NativeReexecArtifactSpikeV1,
+) -> anyhow::Result<()> {
+    let authority = adopt(snapshot)
+        .map_err(|error| anyhow::anyhow!("adopt artifact spike authority: {error}"))?;
+    ARTIFACT_AUTHORITY
+        .set(authority)
+        .map_err(|_| anyhow::anyhow!("artifact spike authority was already initialized"))
+}
+
+#[cfg(test)]
+fn adopt_for_test(
+    snapshot: &crate::native_exec_capsule::NativeReexecArtifactSpikeV1,
+) -> Result<ArtifactAuthority, DsrError> {
+    adopt(snapshot)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum GatewayKind {
@@ -681,6 +850,7 @@ mod tests {
     };
     use crate::native_darwin::dsr::types::CacheOffset;
     use carrick_guest_mem::GuestVa;
+    use std::os::fd::AsRawFd;
 
     const IMM16_MASK: u32 = 0x001f_ffe0;
 
@@ -776,5 +946,32 @@ mod tests {
             assert_eq!(fresh_fn(), 42);
             assert_eq!(replay_fn(), 42);
         }
+    }
+
+    #[test]
+    fn authority_snapshot_preserves_identity_and_nonce() {
+        let authority = ArtifactAuthority::create_for_test().expect("authority");
+        let snapshot = authority.snapshot().expect("snapshot");
+        let adopted_fd = unsafe { libc::fcntl(snapshot.host_fd, libc::F_DUPFD_CLOEXEC, 0) };
+        assert!(adopted_fd >= 0);
+        let mut inherited = snapshot;
+        inherited.host_fd = adopted_fd;
+        let adopted = adopt_for_test(&inherited).expect("adopt matching authority");
+        assert_eq!(
+            adopted
+                .snapshot()
+                .expect("adopted snapshot")
+                .authority_nonce,
+            snapshot.authority_nonce
+        );
+        assert_ne!(adopted.file().as_raw_fd(), authority.file().as_raw_fd());
+    }
+
+    #[test]
+    fn authority_rejects_substituted_fd() {
+        let authority = ArtifactAuthority::create_for_test().expect("authority");
+        let mut snapshot = authority.snapshot().expect("snapshot");
+        snapshot.host_inode ^= 1;
+        assert!(adopt_for_test(&snapshot).is_err());
     }
 }
