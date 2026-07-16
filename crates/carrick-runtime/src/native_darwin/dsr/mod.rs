@@ -4,6 +4,7 @@ use std::sync::{Arc, OnceLock};
 use carrick_observability::probes;
 use parking_lot::{Mutex, RwLock};
 
+pub(super) mod artifact_spike;
 pub(super) mod block;
 pub(super) mod cache;
 pub(super) mod decode;
