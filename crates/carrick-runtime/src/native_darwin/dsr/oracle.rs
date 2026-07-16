@@ -2074,6 +2074,7 @@ fn dsr_sensitive_flow_reports_guest_pc_and_resume() {
                 register: Some(bad64::Reg::X0),
                 resume: GuestVa(0x1a_004),
             },
+            fusion: None,
         },
     };
     let emitted = emit_block_with_generation_direct(

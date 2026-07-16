@@ -605,7 +605,7 @@ fn classify_memory(
 /// Whether an AArch64 exclusive-family instruction acquires (`Load`) or
 /// releases (`Store`) the exclusive monitor. Used only by the block
 /// planner's bounded exclusive-region fusion scan
-/// (`block::try_fuse_exclusive_region`): `classify` itself does not
+/// (`block::analyze_exclusive_region`): `classify` itself does not
 /// distinguish these -- it converts every `MemoryClass::Exclusive` access to
 /// a `Sensitive` boundary before this distinction would matter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -664,7 +664,7 @@ pub(super) fn classify_exclusive(
 /// so `Register` here means "word or doubleword", not "exactly one width".
 ///
 /// Used only by the block planner's exclusive-region fusion scan
-/// (`block::try_fuse_exclusive_region`) to reject a load/store pairing whose
+/// (`block::analyze_exclusive_region`) to reject a load/store pairing whose
 /// `Op`s are provably width- or family-incompatible (e.g. an `ldaxr`
 /// paired with a same-base `stxrb`, or a single-register load paired with a
 /// pair-form store) before considering it for fusion.
