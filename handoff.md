@@ -200,3 +200,58 @@ emitter for the nonzero canonical `eligible-backend-disabled` class. This is
 only a 19.360408% pre-change opportunity projection. `not-load` is the actual
 dominant rejection and `biased-no-safe-scratch` is second; no enablement or
 performance result has been claimed yet.
+
+## Biased exclusive-fusion measured result (2026-07-15)
+
+Task 6 measured enabled commit `ae9bc594` with signed binary SHA-256
+`41896a3519845a1b40056653281f012c4b0c20399a06f2c8f25d23d3ec0bdab8`.
+The implementation passes the serial stress and focused correctness gates:
+
+- `futexrequeue`, `futexwakeexact`, and `sigreenter`: 10/10 Docker matches each.
+- `perf_futex_pingpong`: 10/10 normalized report-only samples; Carrick p50
+  7.750 us, Docker p50 14.667 us at `BENCH_NPROC=4`. Exact `run-probe.sh`
+  output is intentionally non-diffable because it includes latency and host
+  `nproc`; do not claim 40 literal output matches.
+- Current `go-runtime` and `go-sync`: MATCH, 52/52 each against cached oracles.
+- `just ci`: green through every local gate.
+
+The deterministic post census is
+`scripts/perf/evidence/native-exclusive-fusion-coverage-post-biased-v1.json`
+(SHA-256
+`99bde122b4efc7763f5238a9e48bcb53a90edce583206ebf8531b3472a859a41`).
+It records 3,554,347 residual exclusive gateways, down 2,358,235 (39.8850
+percent) from the 5,912,582 pre-census. `eligible-backend-disabled` fell from
+1,144,700 executions to zero. The remaining executions split almost exactly:
+`biased-no-safe-scratch` 1,777,174 (50.00001406728156 percent) and `not-load`
+1,777,173 (49.999985932718444 percent). `fused-biased` has 17,709 unique sites
+but zero residual executions, as intended.
+
+Treat that coverage as directional. The first enabled profile retained a
+reconciled million-entry profile but the downstream Go compiler failed before
+the exact ceiling marker was retained; a repeat retained the marker but exposed
+a strict nested-subphase accounting failure. A temporary disabled-policy A/B
+reconciled and reproduced the pre-enablement shape. This is profiling-contract
+fragility/measurement debt, not yet a demonstrated runtime correctness bug.
+
+The authoritative untraced W1 run reached the unchanged 1,000,000-gateway
+ceiling and improved only modestly versus the pinned single pre-run: wall
+15.49→15.12 s (-2.39 percent), user 41.04→38.98 s (-5.02 percent), system
+16.63→15.29 s (-8.06 percent), total CPU 57.67→54.27 s (-5.90 percent).
+Do not call this a step-function win. Exact c94 was stopped at the user's bound
+after 142.189 s versus the cached 3.069 s oracle (46.33x), with no result; the
+scoped run was reaped cleanly and must not be rerun merely to reconfirm that it
+exceeds the order-of-magnitude cutoff.
+
+### Next work
+
+1. Fix the NATIVEPERF nested-subphase accounting fragility so the enabled W1
+   profile reconciles reliably without relying on a failed-outcome record.
+2. If continuing exclusive fusion, design against the measured
+   `biased-no-safe-scratch` class (1,777,174 executions), while recognizing it
+   is tied within one execution of `not-load`; preserve the existing typed
+   recovery and fallback rules.
+3. Require a fresh untraced W1 and bounded c94 result to show a material win
+   before promoting another optimization. Do not raise the gateway ceiling or
+   timeout, and keep Docker phases separate.
+4. Resume the broader Go/CPython/native-default ladder only after the compiler
+   blocker has materially improved.
