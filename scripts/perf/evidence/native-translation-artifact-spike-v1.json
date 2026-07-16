@@ -27,11 +27,60 @@
       "replay_ns": 33962916,
       "failure": "runtime: split stack overflow"
     },
-    "uncached_control": {
+    "uncached_control_1m_ceiling": {
       "inner_ns": 14803096583,
       "exit_code": 1,
       "failure": "guest did not exit after 1000000 traps"
+    },
+    "uncached_control_complete": {
+      "inner_ns": 58736915875,
+      "host_wall_ns": 62100000000,
+      "exit_code": 0,
+      "work_product_exit_code": 0,
+      "work_product_stdout": "42",
+      "max_traps": 18446744073709551615
+    },
+    "uncached_control_profiled": {
+      "inner_ns": 61484979874,
+      "host_wall_ns": 63570000000,
+      "exit_code": 0,
+      "profile_version": 3,
+      "complete_thread_groups": 832,
+      "processes": 214,
+      "aggregate_gateway_entries": 19057383,
+      "hottest_thread_gateway_entries": 1520928,
+      "descendant_cpu_ns": 109234585000,
+      "translation_ns": 58308975785,
+      "nested_translation_ns": 28375762430,
+      "translation_publication_ns": 8406043578
+    },
+    "docker_oracle": {
+      "inner_ns": 1447321668,
+      "host_wall_ns": 1700000000,
+      "exit_code": 0,
+      "work_product_exit_code": 0,
+      "work_product_stdout": "42"
     }
+  },
+  "authority": {
+    "native_to_docker_inner_wall_ratio": 40.583,
+    "one_million_traps_interpretation": "invalid completion threshold: the successful profile required 19057383 aggregate gateway entries and its hottest thread exceeded the ceiling at 1520928 entries",
+    "pathology": "translation consumed 58308975785 ns, 53.38% of 109234585000 ns descendant CPU"
+  },
+  "reduction": {
+    "two_consecutive_go_env": {
+      "exit_code": 0,
+      "cross_process_hits": 32886,
+      "interpretation": "simple Go startup and cross-exec reuse are correct"
+    },
+    "cgo_build_p1": {
+      "exit_code": 2,
+      "cross_process_hits": 16209,
+      "failure": "runtime: split stack overflow",
+      "bad_stack_pointer": "0xfffffefbd0",
+      "interpretation": "forcing Go package parallelism to one does not remove the deterministic replay corruption"
+    },
+    "next_diagnostic": "compare replayed code and recovery metadata with a fresh emission at build-only artifact hits, then fall back before execution on the first mismatch"
   },
   "gates": {
     "cross_process_hits_gt_zero": "pass",
@@ -44,5 +93,5 @@
     "correctness_and_cleanup": "fail"
   },
   "verdict": "STOP",
-  "reason": "The spike proves real cross-process reuse and low replay CPU, but both cache-enabled signed runs deterministically corrupt Go stack state. The uncached control also fails its existing trap ceiling, so no valid successful paired speedup can be claimed. Do not proceed to production cache implementation."
+  "reason": "The spike proves real cross-process reuse and low replay CPU, but both cache-enabled signed runs deterministically corrupt Go stack state. The uncached control completes correctly in 58.737 seconds versus Docker's 1.447 seconds (40.583x), and a successful process-tree profile attributes 58.309 CPU-seconds to translation. One million traps was only an invalid early cutoff. The cache remains the highest-leverage step-function hypothesis, but no successful paired speedup can be claimed until replay correctness is fixed; do not proceed to a production cache implementation."
 }

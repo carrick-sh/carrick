@@ -282,3 +282,37 @@ retry fault-and-kick tests proving registers, NZCV, PC, and monitor cleanup.
 The next performance campaign therefore starts from the correctness-qualified
 sensitive fallback and targets the compiler's process-lifecycle multiplication,
 not another exclusive-fusion expansion.
+
+## Native translation-artifact completion authority (2026-07-16)
+
+The one-file cgo feasibility workload now has a successful, startup-excluded
+control and a separate Docker oracle. The exact build completes under the
+uncached native backend in 58.736915875 seconds and under native arm64 Docker
+in 1.447321668 seconds: native is 40.583x slower. Both builds exit zero and the
+produced binary exits zero with output `42`. The scoped native run reaped cleanly.
+
+The old 1,000,000-trap result was only a harness cutoff, not evidence of a hang
+or eventual failure. A successful process-tree profile records 19,057,383
+aggregate gateway entries across 214 PIDs and 832 complete thread/exec groups;
+the hottest thread alone reaches 1,520,928 entries. Descendant CPU is
+109.234585 seconds, of which translation accounts for 58.308976 seconds
+(53.38 percent), including 28.375762 seconds of nested translation and
+8.406044 seconds of publication.
+
+This establishes a real step-function target and keeps cross-process
+translation reuse as the highest-leverage hypothesis. The current artifact
+spike is not promotable: two signed cache-enabled runs obtain more than 15,000
+cross-process hits with about 34 ms replay CPU, but both deterministically fail
+with Go split-stack overflow. Diagnose and fix that replay-state corruption,
+then require a successful native/Docker pair before claiming speedup. The
+authority record is
+`scripts/perf/evidence/native-translation-artifact-spike-v1.json`.
+
+The first reducer split is also recorded there. Two consecutive `go env GOROOT`
+executions pass after 32,886 cross-process hits, so simple Go startup and
+cross-exec reuse are not generally broken. The same cgo build with `go build
+-p=1` still fails after 16,209 hits with the deterministic bad SP
+`0xfffffefbd0`, ruling out Go package parallelism. The next diagnostic slice is
+replay-vs-fresh validation of emitted words and recovery metadata at build-only
+hits, falling back before executing the first mismatch. Do not broaden the
+artifact cache until that comparison identifies and closes the missing state.
