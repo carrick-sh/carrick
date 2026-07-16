@@ -1,0 +1,48 @@
+{
+  "schema": "carrick-native-translation-artifact-spike-v1",
+  "date": "2026-07-16",
+  "workload": {
+    "image": "localhost:5005/carrick-go-conformance:1.24",
+    "description": "one-file cgo build timed inside an already-started native container",
+    "native_page_profile": "native16k",
+    "pid_namespace": "private",
+    "container_startup_included": false
+  },
+  "signed_runs": {
+    "spike_1": {
+      "inner_ns": 1112188125,
+      "exit_code": 2,
+      "lookups": 36672,
+      "cross_process_hits": 15652,
+      "inserts": 20562,
+      "replay_ns": 33932095,
+      "failure": "runtime: split stack overflow"
+    },
+    "spike_2": {
+      "inner_ns": 1098593583,
+      "exit_code": 2,
+      "lookups": 36626,
+      "cross_process_hits": 15666,
+      "inserts": 20511,
+      "replay_ns": 33962916,
+      "failure": "runtime: split stack overflow"
+    },
+    "uncached_control": {
+      "inner_ns": 14803096583,
+      "exit_code": 1,
+      "failure": "guest did not exit after 1000000 traps"
+    }
+  },
+  "gates": {
+    "cross_process_hits_gt_zero": "pass",
+    "translation_publication_reduction_gte_0_80": "not_measurable_from_a_successful_pair",
+    "wall_speedup_gte_1_70": "not_measurable_from_a_successful_pair",
+    "replay_cpu_ratio_lt_0_20": {
+      "status": "pass_directionally",
+      "ratio": 0.030915
+    },
+    "correctness_and_cleanup": "fail"
+  },
+  "verdict": "STOP",
+  "reason": "The spike proves real cross-process reuse and low replay CPU, but both cache-enabled signed runs deterministically corrupt Go stack state. The uncached control also fails its existing trap ceiling, so no valid successful paired speedup can be claimed. Do not proceed to production cache implementation."
+}

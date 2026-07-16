@@ -4,7 +4,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::FileExt;
+use std::ptr::NonNull;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use sha2::{Digest, Sha256};
 
@@ -25,6 +27,7 @@ const ARTIFACT_MAX_PROBES: u64 = 64;
 const ARTIFACT_RECORD_MAGIC: [u8; 8] = *b"CARTV1\0\0";
 const ARTIFACT_RECORD_HEADER: usize = 8 + 32 + 8 + 32;
 const ARTIFACT_MAX_RECORD: usize = 4 * 1024 * 1024;
+const ARTIFACT_COUNTER_OFFSET: usize = 64;
 static ARTIFACT_AUTHORITY: OnceLock<ArtifactAuthority> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -107,6 +110,33 @@ impl From<WireArtifactTemplate> for ArtifactTemplate {
 
 pub(super) struct ArtifactStore {
     file: File,
+    counters: NonNull<SharedArtifactCounters>,
+}
+
+#[repr(C)]
+struct SharedArtifactCounters {
+    lookups: AtomicU64,
+    hits: AtomicU64,
+    inserts: AtomicU64,
+    replay_ns: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct ArtifactCounterSnapshot {
+    pub(super) lookups: u64,
+    pub(super) hits: u64,
+    pub(super) inserts: u64,
+    pub(super) replay_ns: u64,
+}
+
+unsafe impl Send for ArtifactStore {}
+unsafe impl Sync for ArtifactStore {}
+
+impl Drop for ArtifactStore {
+    fn drop(&mut self) {
+        let page = (self.counters.as_ptr() as usize & !4095) as *mut libc::c_void;
+        let _ = unsafe { libc::munmap(page, 4096) };
+    }
 }
 
 struct ArtifactFileLock {
@@ -122,6 +152,26 @@ impl Drop for ArtifactFileLock {
 }
 
 impl ArtifactStore {
+    fn counters(&self) -> &SharedArtifactCounters {
+        unsafe { self.counters.as_ref() }
+    }
+
+    pub(super) fn snapshot(&self) -> ArtifactCounterSnapshot {
+        let counters = self.counters();
+        ArtifactCounterSnapshot {
+            lookups: counters.lookups.load(Ordering::Acquire),
+            hits: counters.hits.load(Ordering::Acquire),
+            inserts: counters.inserts.load(Ordering::Acquire),
+            replay_ns: counters.replay_ns.load(Ordering::Acquire),
+        }
+    }
+
+    pub(super) fn record_replay_ns(&self, elapsed: u64) {
+        self.counters()
+            .replay_ns
+            .fetch_add(elapsed, Ordering::Relaxed);
+    }
+
     fn lock(&self, operation: i32) -> Result<ArtifactFileLock, DsrError> {
         if unsafe { libc::flock(self.file.as_raw_fd(), operation) } != 0 {
             return Err(DsrError::Host {
@@ -135,8 +185,13 @@ impl ArtifactStore {
     }
 
     pub(super) fn lookup(&self, key: ArtifactKey) -> Result<Option<ArtifactTemplate>, DsrError> {
+        self.counters().lookups.fetch_add(1, Ordering::Relaxed);
         let _lock = self.lock(libc::LOCK_SH)?;
-        self.lookup_locked(key)
+        let result = self.lookup_locked(key)?;
+        if result.is_some() {
+            self.counters().hits.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(result)
     }
 
     fn lookup_locked(&self, key: ArtifactKey) -> Result<Option<ArtifactTemplate>, DsrError> {
@@ -252,6 +307,7 @@ impl ArtifactStore {
                 operation: "publish translation artifact record",
                 error,
             })?;
+        self.counters().inserts.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 }
@@ -351,13 +407,35 @@ impl ArtifactAuthority {
     }
 
     pub(super) fn map_store(&self) -> Result<ArtifactStore, DsrError> {
-        self.file
-            .try_clone()
-            .map(|file| ArtifactStore { file })
-            .map_err(|error| DsrError::Host {
-                operation: "clone translation artifact store authority",
-                error,
-            })
+        let file = self.file.try_clone().map_err(|error| DsrError::Host {
+            operation: "clone translation artifact store authority",
+            error,
+        })?;
+        let mapping = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if mapping == libc::MAP_FAILED {
+            return Err(DsrError::Host {
+                operation: "map translation artifact counters",
+                error: std::io::Error::last_os_error(),
+            });
+        }
+        let counters = unsafe {
+            NonNull::new_unchecked(
+                mapping
+                    .cast::<u8>()
+                    .add(ARTIFACT_COUNTER_OFFSET)
+                    .cast::<SharedArtifactCounters>(),
+            )
+        };
+        Ok(ArtifactStore { file, counters })
     }
 
     #[cfg(test)]
@@ -1316,6 +1394,10 @@ mod tests {
         let key = ArtifactKey::from_source(GuestVa(0x4000), &template.source_words);
         writer.insert(key, &template).expect("insert artifact");
         assert_eq!(reader.lookup(key).expect("lookup artifact"), Some(template));
+        let counters = writer.snapshot();
+        assert_eq!(counters.lookups, 1);
+        assert_eq!(counters.hits, 1);
+        assert_eq!(counters.inserts, 1);
     }
 
     #[test]

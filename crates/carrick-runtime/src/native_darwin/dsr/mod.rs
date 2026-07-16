@@ -90,6 +90,27 @@ pub(super) struct ProcessTranslator {
     state: RwLock<ProcessState>,
 }
 
+impl Drop for ProcessTranslator {
+    fn drop(&mut self) {
+        if std::env::var_os("CARRICK_DSR_ARTIFACT_REPORT").as_deref()
+            != Some(std::ffi::OsStr::new("1"))
+        {
+            return;
+        }
+        if let Some(store) = &self.state.get_mut().artifact_store {
+            let snapshot = store.snapshot();
+            eprintln!(
+                "CARRICK_ARTIFACT pid={} lookups={} cross_process_hits={} inserts={} replay_ns={}",
+                unsafe { libc::getpid() },
+                snapshot.lookups,
+                snapshot.hits,
+                snapshot.inserts,
+                snapshot.replay_ns,
+            );
+        }
+    }
+}
+
 struct ProcessState {
     cache: cache::TranslationCache,
     artifact_store: Option<artifact_spike::ArtifactStore>,
@@ -1158,9 +1179,15 @@ impl ProcessState {
                     generation.get(),
                     mode,
                 )?;
+                let replay_started = std::time::Instant::now();
                 if let Ok(emitted) =
                     artifact_spike::replay_artifact(&mut self.cache, &template, &bindings)
                 {
+                    if let Some(store) = &self.artifact_store {
+                        store.record_replay_ns(
+                            u64::try_from(replay_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                        );
+                    }
                     if observation.current() != generation {
                         return Err(types::DsrError::GenerationChanged {
                             page: guest.raw(),
