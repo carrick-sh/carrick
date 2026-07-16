@@ -863,6 +863,20 @@ mod tests {
         const AUTIA1716: u32 = 0xd503_219f;
         const PACIASP: u32 = 0xd503_233f;
         const XPACLRI: u32 = 0xd503_20ff;
+        // Pointer-authenticated indirect control flow. These words were
+        // assembled with GNU binutils 2.45 for `.arch armv8.3-a`.
+        const BLRAA_X16_X11: u32 = 0xd73f_0a0b;
+        const BLRAAZ_X16: u32 = 0xd63f_0a1f;
+        const BLRAB_X16_X11: u32 = 0xd73f_0e0b;
+        const BLRABZ_X16: u32 = 0xd63f_0e1f;
+        const BRAA_X16_X11: u32 = 0xd71f_0a0b;
+        const BRAAZ_X16: u32 = 0xd61f_0a1f;
+        const BRAB_X16_X11: u32 = 0xd71f_0e0b;
+        const BRABZ_X16: u32 = 0xd61f_0e1f;
+        const RETAA: u32 = 0xd65f_0bff;
+        const RETAB: u32 = 0xd65f_0fff;
+        const ERETAA: u32 = 0xd69f_0bff;
+        const ERETAB: u32 = 0xd69f_0fff;
         // ldr x0, [x1] -- an ordinary (non-exclusive) memory access.
         const LDR_X0_X1: u32 = 0xf940_0020;
         const COND_NE: u32 = 1;
@@ -1714,6 +1728,53 @@ mod tests {
         fn biased_scratch_fails_closed_for_implicit_lr_copies() {
             for word in [PACIASP, XPACLRI] {
                 assert_implicit_copy_fails_closed(word);
+            }
+        }
+
+        fn assert_authenticated_control_flow_rejected(word: u32) {
+            let start = GuestVa(0x4000);
+            let words = [
+                LDAXR_W0_X1,
+                word,
+                STLXR_W3_W4_X1,
+                encode_cbnz_w(GuestVa(0x400c), start, 3),
+            ];
+            let analysis = exclusive_region_words(
+                &words,
+                start,
+                LDAXR_W0_X1,
+                ExclusiveFusionPolicy::Direct,
+                0x1000,
+            )
+            .expect("scan authenticated control flow");
+            assert_eq!(
+                analysis,
+                ExclusiveRegionAnalysis::Rejected(ExclusiveFusionRejection::UnsupportedControlFlow),
+                "word=0x{word:08x}"
+            );
+        }
+
+        #[test]
+        fn blraa_is_rejected_as_unsupported_control_flow() {
+            assert_authenticated_control_flow_rejected(BLRAA_X16_X11);
+        }
+
+        #[test]
+        fn authenticated_branch_call_and_return_families_are_control_flow() {
+            for word in [
+                BLRAAZ_X16,
+                BLRAB_X16_X11,
+                BLRABZ_X16,
+                BRAA_X16_X11,
+                BRAAZ_X16,
+                BRAB_X16_X11,
+                BRABZ_X16,
+                RETAA,
+                RETAB,
+                ERETAA,
+                ERETAB,
+            ] {
+                assert_authenticated_control_flow_rejected(word);
             }
         }
 

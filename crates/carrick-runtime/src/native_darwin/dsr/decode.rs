@@ -69,6 +69,28 @@ fn branch_condition(op: Op) -> Option<bad64::Condition> {
     }
 }
 
+fn is_authenticated_control_flow(op: Op) -> bool {
+    matches!(
+        op,
+        Op::BLRAA
+            | Op::BLRAAZ
+            | Op::BLRAB
+            | Op::BLRABZ
+            | Op::BRAA
+            | Op::BRAAZ
+            | Op::BRAB
+            | Op::BRABZ
+            | Op::RETAA
+            | Op::RETAASPPC
+            | Op::RETAASPPCR
+            | Op::RETAB
+            | Op::RETABSPPC
+            | Op::RETABSPPCR
+            | Op::ERETAA
+            | Op::ERETAB
+    )
+}
+
 fn immediate_u8(operands: &[Operand]) -> Option<u8> {
     operands.iter().find_map(|operand| match operand {
         Operand::Imm32 { imm, .. } | Operand::Imm64 { imm, .. } => {
@@ -747,12 +769,13 @@ pub(super) fn copied_instruction_mentions_gpr(word: u32, pc: GuestVa, index: u32
     if branch_condition(op).is_some() || op == Op::NOP {
         return Some(false);
     }
-    let has_explicit_scratch_domain_gpr = (0..=30).any(|candidate| {
-        operands
-            .iter()
-            .any(|operand| operand_mentions_gpr(operand, candidate))
-    });
-    has_explicit_scratch_domain_gpr.then(|| {
+    // This is deliberately a positive model, not an inference from a nonempty
+    // operand array. Some operations (for example BLRAA) expose explicit GPRs
+    // while omitting additional architectural GPR effects. Add an operation
+    // here only after auditing bad64's operand model for every encoding that
+    // shares it. CMP is the data-processing operation required by the
+    // canonical CAS-loop recognizer and reports both source GPRs.
+    matches!(op, Op::CMP).then(|| {
         operands
             .iter()
             .any(|operand| operand_mentions_gpr(operand, index))
@@ -833,6 +856,9 @@ pub(super) fn classify(word: u32, pc: GuestVa) -> Result<InstAction, DsrError> {
     })?;
     let op = instruction.op();
     let operands = instruction.operands();
+    if is_authenticated_control_flow(op) {
+        return Ok(InstAction::Unsupported { word, op });
+    }
     let mentions_x18 = operands
         .iter()
         .any(|operand| operand_mentions_gpr(operand, 18));
@@ -1055,6 +1081,28 @@ mod tests {
                 })) if encoded == word
             ));
         }
+    }
+
+    #[test]
+    fn copied_gpr_model_fails_closed_for_mixed_implicit_effects() {
+        // blraa x16, x11: bad64 reports the two explicit source operands but
+        // not the architectural x30 link-register write.
+        let word = 0xd73f_0a0b;
+        let instruction = bad64::decode(word, PC.raw()).expect("decode blraa");
+        assert_eq!(instruction.op(), Op::BLRAA);
+        assert!(
+            instruction
+                .operands()
+                .iter()
+                .any(|operand| operand_mentions_gpr(operand, 16))
+        );
+        assert!(
+            instruction
+                .operands()
+                .iter()
+                .any(|operand| operand_mentions_gpr(operand, 11))
+        );
+        assert_eq!(copied_instruction_mentions_gpr(word, PC, 30), None);
     }
 
     #[test]
