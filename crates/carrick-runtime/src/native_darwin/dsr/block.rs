@@ -401,12 +401,14 @@ fn biased_exclusive_scratch(
         .chain((0_u32..=8).rev())
         .chain([30, 29, 27])
     {
-        let used = instructions.iter().any(|inst| {
-            let word = match inst.action {
-                InstAction::Copy(word) | InstAction::Memory(MemoryAccess { word, .. }) => word,
-                _ => return true,
-            };
-            decode::decoded_operands_mention_gpr(word, inst.guest, index)
+        let used = instructions.iter().any(|inst| match inst.action {
+            InstAction::Copy(word) => {
+                decode::copied_instruction_mentions_gpr(word, inst.guest, index).unwrap_or(true)
+            }
+            InstAction::Memory(MemoryAccess { word, .. }) => {
+                decode::decoded_operands_mention_gpr(word, inst.guest, index)
+            }
+            _ => true,
         }) || decode::decoded_operands_mention_gpr(retry_word, retry_pc, index);
         if !used {
             selected.push(DsrScratchGpr::new(index)?);
@@ -856,6 +858,11 @@ mod tests {
         // chkfeat x16 -- explicitly accepted by the DSR decoder because bad64
         // predates FEAT_CHK and cannot decode this fixed encoding.
         const CHKFEAT_X16: u32 = 0xd503_251f;
+        // Pointer-authentication HINT aliases with architecturally implicit
+        // GPRs. bad64 decodes these ops but reports no explicit operands.
+        const AUTIA1716: u32 = 0xd503_219f;
+        const PACIASP: u32 = 0xd503_233f;
+        const XPACLRI: u32 = 0xd503_20ff;
         // ldr x0, [x1] -- an ordinary (non-exclusive) memory access.
         const LDR_X0_X1: u32 = 0xf940_0020;
         const COND_NE: u32 = 1;
@@ -1653,6 +1660,61 @@ mod tests {
             };
             assert_eq!(scratch.address.index(), 17);
             assert_eq!(scratch.bias.index(), 15, "x16 is an operand of chkfeat");
+        }
+
+        fn assert_implicit_copy_fails_closed(word: u32) {
+            let decoded = bad64::decode(word, 0x4004).expect("decode implicit-register copy");
+            assert!(
+                decoded.operands().is_empty(),
+                "test requires an incomplete bad64 operand model: {decoded:?}"
+            );
+
+            let start = GuestVa(0x4000);
+            let words = [
+                LDAXR_W0_X1,
+                word,
+                STLXR_W3_W4_X1,
+                encode_cbnz_w(GuestVa(0x400c), start, 3),
+            ];
+            let biased =
+                plan_via_production(&words, start, ExclusiveFusionPolicy::BiasedDisabled, 0x1000);
+            assert!(matches!(
+                biased.exit,
+                PlannedExit::Sensitive {
+                    fusion: Some(ExclusiveFusionSite {
+                        disposition: ExclusiveFusionDisposition::Rejected(
+                            ExclusiveFusionRejection::BiasedNoSafeScratch
+                        ),
+                        biased_scratch: None,
+                        ..
+                    }),
+                    ..
+                }
+            ));
+
+            let direct = plan_via_production(&words, start, ExclusiveFusionPolicy::Direct, 0x1000);
+            assert!(matches!(
+                direct.exit,
+                PlannedExit::ExclusiveRegion {
+                    fusion: ExclusiveFusionSite {
+                        disposition: ExclusiveFusionDisposition::FusedDirect,
+                        ..
+                    },
+                    ..
+                }
+            ));
+        }
+
+        #[test]
+        fn biased_scratch_fails_closed_for_autia1716_implicit_pair() {
+            assert_implicit_copy_fails_closed(AUTIA1716);
+        }
+
+        #[test]
+        fn biased_scratch_fails_closed_for_implicit_lr_copies() {
+            for word in [PACIASP, XPACLRI] {
+                assert_implicit_copy_fails_closed(word);
+            }
         }
 
         #[test]
