@@ -2399,10 +2399,12 @@ fn recover_rewrite_state(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::decode::classify;
     use super::types::{
         DirectKind, IndirectKind, InstAction, MemoryBase, MemoryClass, MemoryVirtualization,
-        PcRelativeKind, SensitiveKind,
+        MemoryWriteback, PcRelativeKind, SensitiveKind,
     };
     use carrick_guest_mem::{GuestMemory, GuestVa};
     use proptest::prelude::*;
@@ -4223,6 +4225,126 @@ mod tests {
             blind_spots.is_empty(),
             "bad64 operand audit missed x18/x28 references:\n{}",
             blind_spots.join("\n")
+        );
+    }
+
+    #[test]
+    #[ignore = "set CARRICK_DSR_SCAN_CORPUS to audit a directory of AArch64 ELFs"]
+    fn dsr_static_elf_instruction_contract_audit() {
+        let root = std::path::PathBuf::from(
+            std::env::var("CARRICK_DSR_SCAN_CORPUS").expect("CARRICK_DSR_SCAN_CORPUS"),
+        );
+        let mut paths = std::fs::read_dir(&root)
+            .expect("read scan corpus")
+            .map(|entry| entry.expect("read corpus entry").path())
+            .filter(|path| path.is_file())
+            .collect::<Vec<_>>();
+        paths.sort();
+
+        let mut decoded_words = 0_u64;
+        let mut contract_gaps = BTreeSet::new();
+        for path in paths {
+            let output = std::process::Command::new(
+                std::env::var("CARRICK_DSR_OBJDUMP")
+                    .unwrap_or_else(|_| "aarch64-linux-gnu-objdump".to_string()),
+            )
+            .arg("-d")
+            .arg(&path)
+            .output()
+            .expect("run AArch64 objdump");
+            if !output.status.success() {
+                continue;
+            }
+            let disassembly = String::from_utf8(output.stdout).expect("objdump UTF-8");
+            for line in disassembly.lines() {
+                let mut fields = line.split_ascii_whitespace();
+                let Some(pc_text) = fields.next().and_then(|field| field.strip_suffix(':')) else {
+                    continue;
+                };
+                let Some(word_text) = fields.next() else {
+                    continue;
+                };
+                let (Ok(pc_raw), Ok(word)) = (
+                    u64::from_str_radix(pc_text, 16),
+                    u32::from_str_radix(word_text, 16),
+                ) else {
+                    continue;
+                };
+                let pc = GuestVa(pc_raw);
+                let Ok(instruction) = bad64::decode(word, pc.raw()) else {
+                    continue;
+                };
+                decoded_words += 1;
+                let text = instruction.to_string();
+                let has_memory_operand = instruction.operands().iter().any(|operand| {
+                    matches!(
+                        operand,
+                        bad64::Operand::MemReg(_)
+                            | bad64::Operand::MemOffset { .. }
+                            | bad64::Operand::MemPreIdx { .. }
+                            | bad64::Operand::MemPostIdxReg(_)
+                            | bad64::Operand::MemPostIdxImm { .. }
+                            | bad64::Operand::MemExt { .. }
+                    )
+                });
+                let expected_writeback = has_memory_operand
+                    .then(|| text.rfind(']'))
+                    .flatten()
+                    .and_then(|close| {
+                        let suffix = text[close + 1..].trim_start();
+                        if suffix.starts_with('!') {
+                            Some(MemoryWriteback::PreIndex)
+                        } else if suffix.starts_with(',') {
+                            Some(MemoryWriteback::PostIndex)
+                        } else {
+                            None
+                        }
+                    });
+                let classified = classify(word, pc);
+                if let Some(expected) = expected_writeback {
+                    let actual = match &classified {
+                        Ok(InstAction::Memory(memory)) => Some(memory.writeback),
+                        _ => None,
+                    };
+                    if actual != Some(expected) {
+                        contract_gaps.insert(format!(
+                                "{}:0x{:x}: 0x{word:08x} writeback={actual:?}, expected={expected:?}: {text}",
+                                path.display(),
+                                pc.raw(),
+                            ));
+                    }
+                }
+
+                let mentions_reserved = super::decode::decoded_operands_mention_x18(word, pc)
+                    || super::decode::decoded_operands_mention_x28(word, pc);
+                if mentions_reserved
+                    && matches!(
+                        &classified,
+                        Ok(InstAction::Unsupported { .. })
+                            | Ok(InstAction::Memory(super::types::MemoryAccess {
+                                virtualization: MemoryVirtualization::Unsupported,
+                                ..
+                            }))
+                            | Err(_)
+                    )
+                {
+                    contract_gaps.insert(format!(
+                        "{}:0x{:x}: 0x{word:08x} reserved-register action={classified:?}: {text}",
+                        path.display(),
+                        pc.raw(),
+                    ));
+                }
+            }
+        }
+        assert!(
+            decoded_words > 0,
+            "scan corpus contained no decoded AArch64 words"
+        );
+        assert!(
+            contract_gaps.is_empty(),
+            "AArch64 corpus contract gaps ({} across {decoded_words} decoded words):\n{}",
+            contract_gaps.len(),
+            contract_gaps.into_iter().collect::<Vec<_>>().join("\n")
         );
     }
 

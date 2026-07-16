@@ -160,6 +160,7 @@ pub(super) enum RecoveryAction {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum BiasedExclusiveResume {
     Load,
+    Exact,
     Retry,
 }
 
@@ -1240,6 +1241,16 @@ fn biased_base(memory: super::types::MemoryAccess) -> Result<BiasedBase, DsrErro
     }
 }
 
+fn biased_base_load_word(base: BiasedBase, destination: u32) -> Option<u32> {
+    match base {
+        BiasedBase::Register(register) => Some(0xaa00_03e0 | (register << 16) | destination),
+        BiasedBase::StackPointer => Some(0x9100_03e0 | destination),
+        BiasedBase::VirtualX18 => Some(0xf940_0000 | ((144 / 8) << 10) | (28 << 5) | destination),
+        BiasedBase::VirtualX28 => Some(0xf940_0000 | ((224 / 8) << 10) | (28 << 5) | destination),
+        BiasedBase::None => None,
+    }
+}
+
 fn rewritten_biased_virtual_word(
     memory: super::types::MemoryAccess,
     guest: GuestVa,
@@ -1592,20 +1603,14 @@ fn emit_biased_memory(
             }
         }
     }
-    let load_base = match base {
-        BiasedBase::Register(register) => 0xaa00_03e0 | (register << 16) | base_scratch,
-        BiasedBase::StackPointer => 0x9100_03e0 | base_scratch,
-        BiasedBase::VirtualX18 => 0xf940_0000 | ((144 / 8) << 10) | (28 << 5) | base_scratch,
-        BiasedBase::VirtualX28 => 0xf940_0000 | ((224 / 8) << 10) | (28 << 5) | base_scratch,
-        BiasedBase::None => {
-            return Err(unsupported_action(
-                plan,
-                guest,
-                memory.word,
-                "biased non-literal memory has no base",
-            ));
-        }
-    };
+    let load_base = biased_base_load_word(base, base_scratch).ok_or_else(|| {
+        unsupported_action(
+            plan,
+            guest,
+            memory.word,
+            "biased non-literal memory has no base",
+        )
+    })?;
     emit_with_biased_recovery(assembler, entries, recovery, guest, load_base, action)?;
     emit_biased_effective_guest_address(
         assembler,
@@ -1752,6 +1757,146 @@ fn emit_biased_memory(
     Ok(())
 }
 
+fn biased_dc_zva_base(register: bad64::Reg) -> Option<BiasedBase> {
+    let register = gpr_index(register)?;
+    Some(match register {
+        18 => BiasedBase::VirtualX18,
+        28 => BiasedBase::VirtualX28,
+        _ => BiasedBase::Register(register),
+    })
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "DC ZVA lowering keeps address translation and recovery metadata together"
+)]
+fn emit_biased_dc_zva(
+    assembler: &mut VecAssembler<Aarch64Relocation>,
+    entries: &mut Vec<PcMapEntry>,
+    plan: &BlockPlan,
+    guest: GuestVa,
+    word: u32,
+    register: bad64::Reg,
+    host_bias: super::super::address::NativeHostBias,
+    recovery: &mut Vec<RecoveryEntry>,
+) -> Result<(), DsrError> {
+    let base = biased_dc_zva_base(register).ok_or_else(|| {
+        unsupported_action(plan, guest, word, "dc zva source is not a rewritable GPR")
+    })?;
+    let scratch = biased_scratch_registers(word, guest, &[], 2)
+        .ok_or_else(|| unsupported_action(plan, guest, word, "no safe dc zva scratch"))?;
+    let base_scratch = scratch[0];
+    let bias_scratch = scratch[1];
+    let scratch_registers = [base_scratch, bias_scratch, 0, 0];
+
+    for (index, register) in scratch.iter().copied().enumerate() {
+        let offset = BIASED_SCRATCH_CONTEXT_OFFSETS[index];
+        emit_word(
+            assembler,
+            entries,
+            guest,
+            0xf900_0000 | ((offset / 8) << 10) | (28 << 5) | register,
+        )?;
+    }
+    let mut action = BiasedMemoryRecovery {
+        scratch_registers,
+        scratch_count: 2,
+        base_scratch,
+        base,
+        base_coordinate: BiasedBaseCoordinate::Guest,
+        commit_base: false,
+        virtual_x18_scratch: None,
+        virtual_x28_scratch: None,
+        host_bias,
+        instruction_complete: false,
+    };
+    let load_base = biased_base_load_word(base, base_scratch).ok_or_else(|| {
+        unsupported_action(plan, guest, word, "dc zva has no biased address base")
+    })?;
+    emit_with_biased_recovery(assembler, entries, recovery, guest, load_base, action)?;
+    emit_with_biased_recovery(
+        assembler,
+        entries,
+        recovery,
+        guest,
+        0xd340_fc00 | (BIASED_FAST_ADDRESS_BITS << 16) | (base_scratch << 5) | 18,
+        action,
+    )?; // lsr x18, guest_address, #BIASED_FAST_ADDRESS_BITS
+    emit_with_biased_recovery(
+        assembler,
+        entries,
+        recovery,
+        guest,
+        0xb400_0052, // cbz x18, +8
+        action,
+    )?;
+    emit_with_biased_recovery(
+        assembler,
+        entries,
+        recovery,
+        guest,
+        0xf900_0000 | ((1200 / 8) << 10) | (28 << 5) | base_scratch,
+        action,
+    )?;
+    // x18 is Carrick-owned inside translated code and may have held the guest
+    // address. Reload the source before applying the process's host bias.
+    emit_with_biased_recovery(assembler, entries, recovery, guest, load_base, action)?;
+    emit_with_biased_recovery(
+        assembler,
+        entries,
+        recovery,
+        guest,
+        0xf940_0000 | ((1192 / 8) << 10) | (28 << 5) | bias_scratch,
+        action,
+    )?;
+    emit_with_biased_recovery(
+        assembler,
+        entries,
+        recovery,
+        guest,
+        0x8b00_0000 | (bias_scratch << 16) | (base_scratch << 5) | base_scratch,
+        action,
+    )?;
+    emit_with_biased_recovery(
+        assembler,
+        entries,
+        recovery,
+        guest,
+        0xb400_0052, // cbz x18, +8
+        action,
+    )?;
+    emit_with_biased_recovery(
+        assembler,
+        entries,
+        recovery,
+        guest,
+        0xb251_0000 | (base_scratch << 5) | base_scratch,
+        action,
+    )?; // orr address, address, #1 << 47
+    emit_with_biased_recovery(
+        assembler,
+        entries,
+        recovery,
+        guest,
+        (word & !0x1f) | base_scratch,
+        action,
+    )?;
+    action.instruction_complete = true;
+
+    for (index, register) in scratch.iter().copied().enumerate().rev() {
+        let offset = BIASED_SCRATCH_CONTEXT_OFFSETS[index];
+        emit_with_biased_recovery(
+            assembler,
+            entries,
+            recovery,
+            guest,
+            0xf940_0000 | ((offset / 8) << 10) | (28 << 5) | register,
+            action,
+        )?;
+    }
+    Ok(())
+}
+
 pub(super) fn emit_block(
     cache: &mut TranslationCache,
     plan: &BlockPlan,
@@ -1798,32 +1943,33 @@ fn emit_region_direct_exit(
     assembler: &mut VecAssembler<Aarch64Relocation>,
     entries: &mut Vec<PcMapEntry>,
     direct_links: &mut Vec<DirectLink>,
-    guest: GuestVa,
+    map_guest: GuestVa,
+    source_guest: GuestVa,
     target: GuestVa,
     clear_monitor: bool,
 ) -> Result<(), DsrError> {
     if clear_monitor {
-        emit_word(assembler, entries, guest, CLREX_WORD)?;
+        emit_word(assembler, entries, map_guest, CLREX_WORD)?;
     }
-    map_next(assembler, entries, guest)?;
+    map_next(assembler, entries, map_guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
         ; str x17, [x28, #136]
     );
-    map_next(assembler, entries, guest)?;
+    map_next(assembler, entries, map_guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
         ; str x17, [x28, #1128]
     );
     let slot = current_offset(assembler)?;
     direct_links.push(DirectLink { slot, target });
-    emit_word(assembler, entries, guest, 0x1400_0001)?;
+    emit_word(assembler, entries, map_guest, 0x1400_0001)?;
     emit_gateway_exit(
         assembler,
         entries,
-        guest,
+        map_guest,
         target,
-        Some(guest),
+        Some(source_guest),
         2,
         super::gateway::direct_exit_address(),
     )
@@ -2103,10 +2249,10 @@ fn emit_biased_exclusive_region(
                     assembler,
                     entries,
                     recovery,
-                    exit.start,
+                    instruction.guest,
                     rewritten,
                     scratch,
-                    load_resume,
+                    BiasedExclusiveResume::Exact,
                 )?;
             }
             InstAction::Copy(word) => {
@@ -2114,10 +2260,10 @@ fn emit_biased_exclusive_region(
                     assembler,
                     entries,
                     recovery,
-                    exit.start,
+                    instruction.guest,
                     word,
                     scratch,
-                    load_resume,
+                    BiasedExclusiveResume::Exact,
                 )?;
             }
             InstAction::Direct(direct) => {
@@ -2135,28 +2281,33 @@ fn emit_biased_exclusive_region(
                     assembler,
                     entries,
                     recovery,
-                    exit.start,
+                    instruction.guest,
                     relocated,
                     scratch,
-                    load_resume,
+                    BiasedExclusiveResume::Exact,
                 )?;
+                let fallthrough = GuestVa(instruction.guest.raw().checked_add(4).ok_or(
+                    DsrError::PcOverflow {
+                        pc: instruction.guest.raw(),
+                    },
+                )?);
                 emit_biased_exclusive_branch(
                     assembler,
                     entries,
                     recovery,
-                    exit.start,
+                    fallthrough,
                     cont,
                     scratch,
-                    load_resume,
+                    BiasedExclusiveResume::Exact,
                 )?;
                 emit_biased_exclusive_branch(
                     assembler,
                     entries,
                     recovery,
-                    exit.start,
+                    direct.target,
                     restore,
                     scratch,
-                    load_resume,
+                    BiasedExclusiveResume::Exact,
                 )?;
                 dynasmrt::dynasm!(assembler
                     ; .arch aarch64
@@ -2210,19 +2361,19 @@ fn emit_biased_exclusive_region(
         assembler,
         entries,
         recovery,
-        retry_pc,
+        exit.end,
         success_restore,
         scratch,
-        retry_resume,
+        BiasedExclusiveResume::Exact,
     )?;
     emit_biased_exclusive_branch(
         assembler,
         entries,
         recovery,
-        retry_pc,
+        exit.start,
         region_top,
         scratch,
-        retry_resume,
+        BiasedExclusiveResume::Exact,
     )?;
 
     let restore_address = 0xf940_0000 | ((1120 / 8) << 10) | (28 << 5) | address;
@@ -2235,31 +2386,31 @@ fn emit_biased_exclusive_region(
         assembler,
         entries,
         recovery,
-        retry_pc,
+        exit.end,
         restore_address,
         scratch,
-        retry_resume,
+        BiasedExclusiveResume::Exact,
     )?;
     emit_biased_exclusive_word(
         assembler,
         entries,
         recovery,
-        retry_pc,
+        exit.end,
         restore_bias,
         scratch,
-        retry_resume,
+        BiasedExclusiveResume::Exact,
     )?;
     emit_biased_exclusive_branch(
         assembler,
         entries,
         recovery,
-        retry_pc,
+        exit.end,
         success_tail,
         scratch,
-        retry_resume,
+        BiasedExclusiveResume::Exact,
     )?;
 
-    if let Some((restore, tail, _, _)) = early_exit {
+    if let Some((restore, tail, _, target)) = early_exit {
         dynasmrt::dynasm!(assembler
             ; .arch aarch64
             ; =>restore
@@ -2268,37 +2419,37 @@ fn emit_biased_exclusive_region(
             assembler,
             entries,
             recovery,
-            exit.start,
+            target,
             CLREX_WORD,
             scratch,
-            load_resume,
+            BiasedExclusiveResume::Exact,
         )?;
         emit_biased_exclusive_word(
             assembler,
             entries,
             recovery,
-            exit.start,
+            target,
             restore_address,
             scratch,
-            load_resume,
+            BiasedExclusiveResume::Exact,
         )?;
         emit_biased_exclusive_word(
             assembler,
             entries,
             recovery,
-            exit.start,
+            target,
             restore_bias,
             scratch,
-            load_resume,
+            BiasedExclusiveResume::Exact,
         )?;
         emit_biased_exclusive_branch(
             assembler,
             entries,
             recovery,
-            exit.start,
+            target,
             tail,
             scratch,
-            load_resume,
+            BiasedExclusiveResume::Exact,
         )?;
     }
 
@@ -2338,7 +2489,15 @@ fn emit_biased_exclusive_region(
         ; .arch aarch64
         ; =>success_tail
     );
-    emit_region_direct_exit(assembler, entries, direct_links, retry_pc, exit.end, false)?;
+    emit_region_direct_exit(
+        assembler,
+        entries,
+        direct_links,
+        exit.end,
+        retry_pc,
+        exit.end,
+        false,
+    )?;
     if let Some((_, tail, branch_guest, target)) = early_exit {
         dynasmrt::dynasm!(assembler
             ; .arch aarch64
@@ -2348,6 +2507,7 @@ fn emit_biased_exclusive_region(
             assembler,
             entries,
             direct_links,
+            target,
             branch_guest,
             target,
             false,
@@ -2535,7 +2695,15 @@ fn emit_exclusive_region(
         ; .arch aarch64
         ; =>success_exit
     );
-    emit_region_direct_exit(assembler, entries, direct_links, retry_pc, exit.end, false)?;
+    emit_region_direct_exit(
+        assembler,
+        entries,
+        direct_links,
+        exit.end,
+        retry_pc,
+        exit.end,
+        false,
+    )?;
 
     // Compare-failure exit (if the region had an early-exit branch): the store
     // never ran, so the load's reservation is still live and MUST be cleared.
@@ -2544,7 +2712,15 @@ fn emit_exclusive_region(
             ; .arch aarch64
             ; =>stub
         );
-        emit_region_direct_exit(assembler, entries, direct_links, branch_guest, target, true)?;
+        emit_region_direct_exit(
+            assembler,
+            entries,
+            direct_links,
+            target,
+            branch_guest,
+            target,
+            true,
+        )?;
     }
 
     Ok(())
@@ -2885,6 +3061,18 @@ fn emit_block_inner(
                 )?;
                 continue;
             }
+            InstAction::VirtualizedX28WriteX18Read { word, .. } => {
+                emit_dual_virtual(
+                    &mut assembler,
+                    &mut entries,
+                    plan,
+                    instruction.guest,
+                    word,
+                    Some(28),
+                    &mut recovery,
+                )?;
+                continue;
+            }
             InstAction::PcRelative(relative)
                 if matches!(
                     relative.kind,
@@ -3059,16 +3247,42 @@ fn emit_block_inner(
                 exit,
                 &mut recovery,
             )?;
-        } else if let PlannedExit::Sensitive { exit, .. } = plan.exit {
-            emit_gateway_exit(
-                &mut assembler,
-                &mut entries,
-                exit_guest,
-                exit.resume,
-                Some(exit_guest),
-                6,
-                super::gateway::sensitive_exit_address(),
-            )?;
+        } else if let PlannedExit::Sensitive { word, exit, .. } = plan.exit {
+            if let EmitAddressMode::Biased { host_bias } = mode
+                && exit.kind == super::types::SensitiveKind::DcZva
+                && let Some(register) = exit.register
+                && biased_dc_zva_base(register).is_some()
+            {
+                emit_biased_dc_zva(
+                    &mut assembler,
+                    &mut entries,
+                    plan,
+                    exit_guest,
+                    word,
+                    register,
+                    host_bias,
+                    &mut recovery,
+                )?;
+                emit_region_direct_exit(
+                    &mut assembler,
+                    &mut entries,
+                    &mut direct_links,
+                    exit.resume,
+                    exit_guest,
+                    exit.resume,
+                    false,
+                )?;
+            } else {
+                emit_gateway_exit(
+                    &mut assembler,
+                    &mut entries,
+                    exit_guest,
+                    exit.resume,
+                    Some(exit_guest),
+                    6,
+                    super::gateway::sensitive_exit_address(),
+                )?;
+            }
         } else if let PlannedExit::Continue { target, .. } = plan.exit {
             let slot = current_offset(&assembler)?;
             direct_links.push(DirectLink { slot, target });
@@ -3620,6 +3834,59 @@ mod tests {
     }
 
     #[test]
+    fn biased_dc_zva_lowers_inline_and_links_to_its_resume_pc() {
+        let guest = GuestVa(0x4000);
+        let resume = GuestVa(0x4004);
+        let word = 0xd50b_7420; // dc zva, x0
+        let plan = BlockPlan {
+            start: guest,
+            end: resume,
+            generation: CodeGeneration::INITIAL,
+            instructions: Vec::new(),
+            exit: PlannedExit::Sensitive {
+                guest,
+                word,
+                exit: SensitiveExit {
+                    kind: SensitiveKind::DcZva,
+                    register: Some(bad64::Reg::X0),
+                    resume,
+                },
+                fusion: None,
+            },
+        };
+        let host_bias =
+            super::super::super::address::NativeHostBias::new(0x80_0000_0000, 16 * 1024)
+                .expect("valid bias");
+        let mut cache = TranslationCache::new(16 * 1024).expect("allocate translation cache");
+        let emitted = emit_block(&mut cache, &plan, EmitAddressMode::Biased { host_bias })
+            .expect("emit inline biased dc zva");
+        let words = (0..emitted.len() / 4).map(|index| unsafe {
+            std::ptr::read_unaligned((emitted.entry().host().raw() + index * 4) as *const u32)
+        });
+
+        assert!(
+            emitted
+                .direct_links()
+                .iter()
+                .any(|link| link.target == resume),
+            "inline dc zva must stay in the translated chain"
+        );
+        assert!(
+            words
+                .into_iter()
+                .any(|emitted_word| emitted_word & !0x1f == word & !0x1f),
+            "inline lowering must execute a host dc zva"
+        );
+        assert!(emitted.recovery().iter().any(|entry| {
+            matches!(
+                entry.action,
+                RecoveryAction::RecoverBiasedMemory(recovery)
+                    if recovery.instruction_complete
+            )
+        }));
+    }
+
+    #[test]
     fn direct_memory_emission_matches_full_copy_block_bytes() {
         let word = 0xf940_0020;
         let mut memory = copy_plan();
@@ -3742,18 +4009,29 @@ mod tests {
     #[test]
     fn biased_simd_post_index_does_not_alias_gpr_base_by_register_number() {
         let word = 0x4cdf_2c00; // ld1 {v0.2d-v3.2d}, [x0], #64
+        let action = super::super::decode::classify(word, GuestVa(0x4000))
+            .expect("classify Go SIMD post-index load");
+        assert!(matches!(
+            action,
+            InstAction::Memory(memory) if memory.writeback == MemoryWriteback::PostIndex
+        ));
         let mut plan = copy_plan();
         plan.instructions = vec![PlannedInst {
             guest: GuestVa(0x4000),
-            action: super::super::decode::classify(word, GuestVa(0x4000))
-                .expect("classify Go SIMD post-index load"),
+            action,
         }];
         let host_bias =
             crate::native_darwin::address::NativeHostBias::new(0x80_0000_0000, 16 * 1024)
                 .expect("construct host bias");
         let mut cache = TranslationCache::new(16 * 1024).expect("allocate SIMD cache");
-        emit_block(&mut cache, &plan, EmitAddressMode::Biased { host_bias })
+        let emitted = emit_block(&mut cache, &plan, EmitAddressMode::Biased { host_bias })
             .expect("SIMD destination numbering must not overlap its GPR base");
+        assert!(emitted.recovery().iter().any(|entry| {
+            matches!(
+                entry.action,
+                RecoveryAction::RecoverBiasedMemory(recovery) if recovery.commit_base
+            )
+        }));
     }
 
     #[test]
@@ -3841,6 +4119,29 @@ mod tests {
             action.instruction_complete
                 && action.virtual_x18_scratch.is_none()
                 && action.virtual_x28_scratch.is_none()
+        }));
+    }
+
+    #[test]
+    fn dual_virtual_move_commits_x28_snapshot() {
+        let word = 0xaa12_03fc; // mov x28, x18
+        let mut plan = copy_plan();
+        plan.instructions = vec![PlannedInst {
+            guest: GuestVa(0x4000),
+            action: super::super::decode::classify(word, GuestVa(0x4000))
+                .expect("classify dual virtual move"),
+        }];
+        let mut cache = TranslationCache::new(16 * 1024).expect("allocate dual cache");
+        let emitted =
+            emit_block(&mut cache, &plan, EmitAddressMode::Direct).expect("emit dual virtual move");
+        assert!(emitted.recovery().iter().any(|entry| {
+            matches!(
+                entry.action,
+                RecoveryAction::CommitDualVirtualAndRestore {
+                    virtual_register: 28,
+                    ..
+                }
+            )
         }));
     }
 
@@ -4342,15 +4643,15 @@ mod tests {
                 .iter()
                 .position(|word| *word == rewritten_store)
                 .expect("rewritten store");
-            for index in [load, store] {
+            for (index, expected_guest) in [(load, GuestVa(0x4000)), (store, GuestVa(0x400c))] {
                 let offset = CacheOffset::published((index * 4) as u32);
-                assert_eq!(emitted.map().guest_for_cache(offset), Some(GuestVa(0x4000)));
+                assert_eq!(emitted.map().guest_for_cache(offset), Some(expected_guest));
                 assert!(emitted.recovery().iter().any(|entry| {
                     entry.cache == offset
                         && matches!(
                             entry.action,
                             RecoveryAction::RecoverBiasedExclusive(BiasedExclusiveRecovery {
-                                resume: BiasedExclusiveResume::Load,
+                                resume: BiasedExclusiveResume::Exact,
                                 ..
                             })
                         )
@@ -4388,7 +4689,7 @@ mod tests {
         }
 
         #[test]
-        fn biased_exclusive_emitted_map_resumes_load_before_store_and_retry_after_store() {
+        fn biased_exclusive_emitted_map_resumes_each_guest_instruction_exactly() {
             let emitted = emit_test_biased_cas().expect("emit biased CAS");
             let words = emitted_words(&emitted);
             let rewritten_load = with_base_register(LDAXR_W0_X1, 17);
@@ -4433,25 +4734,80 @@ mod tests {
                 })
                 .expect("post-store recovery entry");
 
-            for entry in [pre_load, between_pair] {
-                assert_eq!(
-                    emitted.map().guest_for_cache(entry.cache),
-                    Some(GuestVa(0x4000))
-                );
-                assert!(matches!(
-                    entry.action,
-                    RecoveryAction::RecoverBiasedExclusive(BiasedExclusiveRecovery {
-                        resume: BiasedExclusiveResume::Load,
-                        ..
-                    })
-                ));
-                assert!(!entry.action.instruction_complete());
-            }
+            assert_eq!(
+                emitted.map().guest_for_cache(pre_load.cache),
+                Some(GuestVa(0x4000))
+            );
+            assert_eq!(
+                emitted.map().guest_for_cache(between_pair.cache),
+                Some(GuestVa(0x4004))
+            );
+            assert!(!pre_load.action.instruction_complete());
+            assert!(!between_pair.action.instruction_complete());
             assert_eq!(
                 emitted.map().guest_for_cache(post_store.cache),
                 Some(GuestVa(0x4010))
             );
             assert!(!post_store.action.instruction_complete());
+        }
+
+        #[test]
+        fn biased_exclusive_recovery_preserves_captured_state_at_every_boundary() {
+            let emitted = emit_test_biased_cas().expect("emit biased CAS");
+            let recoveries = emitted
+                .recovery()
+                .iter()
+                .filter(|entry| matches!(entry.action, RecoveryAction::RecoverBiasedExclusive(_)))
+                .collect::<Vec<_>>();
+            assert!(
+                !recoveries.is_empty(),
+                "biased region must publish recovery metadata"
+            );
+
+            for entry in recoveries {
+                let mut snapshot = crate::native_darwin::NativeUcontextSnapshot::default();
+                for (index, value) in snapshot.x.iter_mut().enumerate() {
+                    *value = 0x1000 + index as u64;
+                }
+                snapshot.pstate = 0xa000_0000;
+                let before = snapshot.x;
+                let before_pstate = snapshot.pstate;
+
+                super::super::super::recover_rewrite_state(
+                    &mut snapshot,
+                    entry.action,
+                    0x1717,
+                    0x1616,
+                    0,
+                    0,
+                    0,
+                )
+                .expect("recover biased exclusive boundary");
+
+                for (index, original) in before.into_iter().enumerate() {
+                    let expected = match index {
+                        17 => 0x1717,
+                        16 => 0x1616,
+                        _ => original,
+                    };
+                    assert_eq!(
+                        snapshot.x[index],
+                        expected,
+                        "cache offset {} changed guest x{index}",
+                        entry.cache.get()
+                    );
+                }
+                assert_eq!(snapshot.pstate, before_pstate);
+                let guest = emitted
+                    .map()
+                    .guest_for_cache(entry.cache)
+                    .expect("recovery boundary must have a guest PC");
+                assert_eq!(
+                    super::super::super::recovery_resume_pc(guest, Some(entry.action))
+                        .expect("recover mapped guest PC"),
+                    guest.raw()
+                );
+            }
         }
 
         #[test]
