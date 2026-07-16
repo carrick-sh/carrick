@@ -731,6 +731,34 @@ pub(super) fn decoded_operands_mention_gpr(word: u32, pc: GuestVa, index: u32) -
     })
 }
 
+/// Return whether a copied instruction mentions `index` only when its GPR-use
+/// model is complete enough for scratch allocation. `None` is the fail-closed
+/// result: bad64 can name an instruction while omitting architecturally fixed
+/// registers from its operand array (notably pointer-authentication HINT
+/// aliases), so an empty/non-GPR operand model must not be treated as proof
+/// that every scratch register is free.
+pub(super) fn copied_instruction_mentions_gpr(word: u32, pc: GuestVa, index: u32) -> Option<bool> {
+    if word == CHKFEAT_X16 {
+        return Some(index == 16);
+    }
+    let instruction = bad64::decode(word, pc.raw()).ok()?;
+    let op = instruction.op();
+    let operands = instruction.operands();
+    if branch_condition(op).is_some() || op == Op::NOP {
+        return Some(false);
+    }
+    let has_explicit_scratch_domain_gpr = (0..=30).any(|candidate| {
+        operands
+            .iter()
+            .any(|operand| operand_mentions_gpr(operand, candidate))
+    });
+    has_explicit_scratch_domain_gpr.then(|| {
+        operands
+            .iter()
+            .any(|operand| operand_mentions_gpr(operand, index))
+    })
+}
+
 fn direct(
     pc: GuestVa,
     word: u32,
