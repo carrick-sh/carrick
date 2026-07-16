@@ -323,6 +323,10 @@ pub(super) enum InstAction {
         word: u32,
         op: bad64::Op,
     },
+    VirtualizedX28WriteX18Read {
+        word: u32,
+        op: bad64::Op,
+    },
     PcRelative(PcRelativeInst),
     Direct(DirectExit),
     Indirect(IndirectExit),
