@@ -6,6 +6,9 @@ use std::sync::atomic::AtomicU64;
 use carrick_guest_mem::{GuestVa, HostVa};
 use dynasmrt::{DynasmApi, DynasmLabelApi, VecAssembler, aarch64::Aarch64Relocation};
 
+use super::artifact_spike::{
+    ArtifactRecord, ArtifactRecording, GatewayKind, MaterializedValue, ProcessValue,
+};
 use super::block::{BlockPlan, PlannedExit};
 use super::cache::{PublishedCode, TranslationCache};
 use super::types::{CacheOffset, CacheVa, CodeGeneration, DsrError, InstAction};
@@ -304,8 +307,13 @@ fn emit_mov_u64(
     entries: &mut Vec<PcMapEntry>,
     guest: GuestVa,
     register: u32,
-    value: u64,
+    value: MaterializedValue,
+    recording: Option<&mut ArtifactRecording>,
 ) -> Result<(), DsrError> {
+    if let Some(recording) = recording {
+        recording.record_mov_wide(current_offset(assembler)?, register, value)?;
+    }
+    let value = value.raw();
     for halfword in 0..4_u32 {
         map_next(assembler, entries, guest)?;
         let immediate = ((value >> (halfword * 16)) & 0xffff) as u32;
@@ -634,16 +642,31 @@ fn emit_gateway_exit(
     target: GuestVa,
     source: Option<GuestVa>,
     status: u32,
-    gateway: u64,
+    gateway: GatewayKind,
+    mut recording: Option<&mut ArtifactRecording>,
 ) -> Result<(), DsrError> {
-    emit_mov_u64(assembler, entries, guest, 17, target.raw())?;
+    emit_mov_u64(
+        assembler,
+        entries,
+        guest,
+        17,
+        MaterializedValue::Guest(target.raw()),
+        recording.as_deref_mut(),
+    )?;
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
         ; str x17, [x28, #1080]
     );
     if let Some(source) = source {
-        emit_mov_u64(assembler, entries, guest, 17, source.raw())?;
+        emit_mov_u64(
+            assembler,
+            entries,
+            guest,
+            17,
+            MaterializedValue::Guest(source.raw()),
+            recording.as_deref_mut(),
+        )?;
         map_next(assembler, entries, guest)?;
         dynasmrt::dynasm!(assembler
             ; .arch aarch64
@@ -660,7 +683,22 @@ fn emit_gateway_exit(
         ; .arch aarch64
         ; str w17, [x28, #1096]
     );
-    emit_mov_u64(assembler, entries, guest, 17, gateway)?;
+    let gateway_address = match gateway {
+        GatewayKind::Syscall => super::gateway::syscall_exit_address(),
+        GatewayKind::Direct => super::gateway::direct_exit_address(),
+        GatewayKind::Indirect => super::gateway::indirect_exit_address(),
+        GatewayKind::Sensitive => super::gateway::sensitive_exit_address(),
+        GatewayKind::Unsupported => super::gateway::unsupported_exit_address(),
+        GatewayKind::Signal => super::gateway::signal_exit_address(),
+    };
+    emit_mov_u64(
+        assembler,
+        entries,
+        guest,
+        17,
+        MaterializedValue::Process(ProcessValue::Gateway(gateway), gateway_address),
+        recording.as_deref_mut(),
+    )?;
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
@@ -699,6 +737,7 @@ fn emit_indirect_exit(
     guest: GuestVa,
     exit: super::types::IndirectExit,
     recovery: &mut Vec<RecoveryEntry>,
+    mut recording: Option<&mut ArtifactRecording>,
 ) -> Result<(), DsrError> {
     let register = gpr_index(exit.register)
         .ok_or_else(|| unsupported_action(plan, guest, 0, "indirect exit with non-GPR target"))?;
@@ -768,7 +807,14 @@ fn emit_indirect_exit(
     );
     let link = (exit.kind == super::types::IndirectKind::Call).then_some(exit.resume);
     if let Some(link) = link {
-        emit_mov_u64(assembler, entries, guest, 30, link.raw())?;
+        emit_mov_u64(
+            assembler,
+            entries,
+            guest,
+            30,
+            MaterializedValue::Guest(link.raw()),
+            recording.as_deref_mut(),
+        )?;
     }
     // A per-thread direct-mapped cache keeps repeated indirect calls and
     // returns inside translated code. Restore every guest-visible scratch
@@ -892,14 +938,28 @@ fn emit_indirect_exit(
         ; .arch aarch64
         ; ldr x16, [x28, #1120]
     );
-    emit_mov_u64(assembler, entries, guest, 17, guest.raw())?;
+    emit_mov_u64(
+        assembler,
+        entries,
+        guest,
+        17,
+        MaterializedValue::Guest(guest.raw()),
+        recording.as_deref_mut(),
+    )?;
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
         ; str x17, [x28, #1088]
     );
     if let Some(link) = link {
-        emit_mov_u64(assembler, entries, guest, 17, link.raw())?;
+        emit_mov_u64(
+            assembler,
+            entries,
+            guest,
+            17,
+            MaterializedValue::Guest(link.raw()),
+            recording.as_deref_mut(),
+        )?;
         map_next(assembler, entries, guest)?;
         dynasmrt::dynasm!(assembler
             ; .arch aarch64
@@ -937,7 +997,11 @@ fn emit_indirect_exit(
         entries,
         guest,
         17,
-        super::gateway::indirect_exit_address(),
+        MaterializedValue::Process(
+            ProcessValue::Gateway(GatewayKind::Indirect),
+            super::gateway::indirect_exit_address(),
+        ),
+        recording.as_deref_mut(),
     )?;
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
@@ -1916,7 +1980,7 @@ pub(super) fn emit_block(
     plan: &BlockPlan,
     mode: EmitAddressMode,
 ) -> Result<EmittedBlock, DsrError> {
-    emit_block_inner(cache, plan, None, mode)
+    emit_block_inner(cache, plan, None, mode, None)
 }
 
 pub(super) fn emit_block_direct(
@@ -1932,7 +1996,36 @@ pub(super) fn emit_block_with_generation(
     guard: GenerationGuard,
     mode: EmitAddressMode,
 ) -> Result<EmittedBlock, DsrError> {
-    emit_block_inner(cache, plan, Some(guard), mode)
+    emit_block_inner(cache, plan, Some(guard), mode, None)
+}
+
+pub(super) fn emit_block_recording_artifact(
+    cache: &mut TranslationCache,
+    plan: &BlockPlan,
+    guard: GenerationGuard,
+    mode: EmitAddressMode,
+    source_words: Vec<u32>,
+) -> Result<(EmittedBlock, ArtifactRecord), DsrError> {
+    let mut recording = ArtifactRecording::default();
+    if let EmitAddressMode::Biased { host_bias } = mode {
+        recording.bind(ProcessValue::HostBias, host_bias.get())?;
+    }
+    let emitted = emit_block_inner(cache, plan, Some(guard), mode, Some(&mut recording))?;
+    let words = (0..emitted.len() / std::mem::size_of::<u32>())
+        .map(|index| unsafe {
+            std::ptr::read_unaligned(
+                (emitted.entry().host().raw() + index * std::mem::size_of::<u32>()) as *const u32,
+            )
+        })
+        .collect();
+    let artifact = recording.finish(
+        words,
+        emitted.map().entries().to_vec(),
+        emitted.recovery().to_vec(),
+        emitted.direct_links().to_vec(),
+        source_words,
+    )?;
+    Ok((emitted, artifact))
 }
 
 pub(super) fn emit_block_with_generation_direct(
@@ -1961,6 +2054,7 @@ fn emit_region_direct_exit(
     source_guest: GuestVa,
     target: GuestVa,
     clear_monitor: bool,
+    recording: Option<&mut ArtifactRecording>,
 ) -> Result<(), DsrError> {
     if clear_monitor {
         emit_word(assembler, entries, map_guest, CLREX_WORD)?;
@@ -1985,7 +2079,8 @@ fn emit_region_direct_exit(
         target,
         Some(source_guest),
         2,
-        super::gateway::direct_exit_address(),
+        GatewayKind::Direct,
+        recording,
     )
 }
 
@@ -2040,12 +2135,13 @@ fn emit_biased_exclusive_mov_u64(
     recovery: &mut Vec<RecoveryEntry>,
     guest: GuestVa,
     register: u32,
-    value: u64,
+    value: MaterializedValue,
     scratch: super::types::BiasedExclusiveScratch,
     resume: BiasedExclusiveResume,
+    recording: Option<&mut ArtifactRecording>,
 ) -> Result<(), DsrError> {
     let start = current_offset(assembler)?;
-    emit_mov_u64(assembler, entries, guest, register, value)?;
+    emit_mov_u64(assembler, entries, guest, register, value, recording)?;
     let end = current_offset(assembler)?;
     for offset in (start.get()..end.get()).step_by(4) {
         recovery.push(RecoveryEntry {
@@ -2085,6 +2181,7 @@ fn emit_biased_exclusive_region(
     exit: super::types::ExclusiveRegionExit,
     scratch: super::types::BiasedExclusiveScratch,
     host_bias: super::super::address::NativeHostBias,
+    mut recording: Option<&mut ArtifactRecording>,
 ) -> Result<(), DsrError> {
     let address = scratch.address.index();
     let bias = scratch.bias.index();
@@ -2231,9 +2328,10 @@ fn emit_biased_exclusive_region(
         recovery,
         exit.start,
         bias,
-        host_bias.get(),
+        MaterializedValue::Process(ProcessValue::HostBias, host_bias.get()),
         scratch,
         load_resume,
+        recording.as_deref_mut(),
     )?;
     emit_biased_exclusive_word(
         assembler,
@@ -2511,6 +2609,7 @@ fn emit_biased_exclusive_region(
         retry_pc,
         exit.end,
         false,
+        recording.as_deref_mut(),
     )?;
     if let Some((_, tail, branch_guest, target)) = early_exit {
         dynasmrt::dynasm!(assembler
@@ -2525,6 +2624,7 @@ fn emit_biased_exclusive_region(
             branch_guest,
             target,
             false,
+            recording.as_deref_mut(),
         )?;
     }
     dynasmrt::dynasm!(assembler
@@ -2538,7 +2638,8 @@ fn emit_biased_exclusive_region(
         exit.fallback.resume,
         Some(exit.start),
         6,
-        super::gateway::sensitive_exit_address(),
+        GatewayKind::Sensitive,
+        recording.as_deref_mut(),
     )
 }
 
@@ -2573,6 +2674,7 @@ fn emit_exclusive_region(
     exit: super::types::ExclusiveRegionExit,
     fusion: super::types::ExclusiveFusionSite,
     mode: EmitAddressMode,
+    mut recording: Option<&mut ArtifactRecording>,
 ) -> Result<(), DsrError> {
     if let EmitAddressMode::Biased { host_bias } = mode {
         let scratch = fusion.biased_scratch.ok_or_else(|| {
@@ -2592,6 +2694,7 @@ fn emit_exclusive_region(
             exit,
             scratch,
             host_bias,
+            recording.as_deref_mut(),
         );
     }
 
@@ -2717,6 +2820,7 @@ fn emit_exclusive_region(
         retry_pc,
         exit.end,
         false,
+        recording.as_deref_mut(),
     )?;
 
     // Compare-failure exit (if the region had an early-exit branch): the store
@@ -2734,6 +2838,7 @@ fn emit_exclusive_region(
             branch_guest,
             target,
             true,
+            recording.as_deref_mut(),
         )?;
     }
 
@@ -2745,6 +2850,7 @@ fn emit_block_inner(
     plan: &BlockPlan,
     guard: Option<GenerationGuard>,
     mode: EmitAddressMode,
+    mut recording: Option<&mut ArtifactRecording>,
 ) -> Result<EmittedBlock, DsrError> {
     let mut assembler = VecAssembler::<Aarch64Relocation>::new(0);
     let mut entries = Vec::with_capacity(plan.instructions.len() + 8);
@@ -2817,7 +2923,14 @@ fn emit_block_inner(
             action: RecoveryAction::RestoreGenerationGuardRegisters,
         });
         let guard_ready = current_offset(&assembler)?;
-        emit_mov_u64(&mut assembler, &mut entries, plan.start, 16, guard.address)?;
+        emit_mov_u64(
+            &mut assembler,
+            &mut entries,
+            plan.start,
+            16,
+            MaterializedValue::Process(ProcessValue::GenerationAddress, guard.address),
+            recording.as_deref_mut(),
+        )?;
         map_next(&assembler, &mut entries, plan.start)?;
         dynasmrt::dynasm!(assembler
             ; .arch aarch64
@@ -2828,7 +2941,8 @@ fn emit_block_inner(
             &mut entries,
             plan.start,
             17,
-            guard.expected.get(),
+            MaterializedValue::Process(ProcessValue::GenerationExpected, guard.expected.get()),
+            recording.as_deref_mut(),
         )?;
         map_next(&assembler, &mut entries, plan.start)?;
         dynasmrt::dynasm!(assembler
@@ -2895,6 +3009,7 @@ fn emit_block_inner(
             exit,
             fusion,
             mode,
+            recording.as_deref_mut(),
         )?;
     } else {
         for instruction in &plan.instructions {
@@ -3171,7 +3286,8 @@ fn emit_block_inner(
                 resume,
                 None,
                 1,
-                super::gateway::syscall_exit_address(),
+                GatewayKind::Syscall,
+                recording.as_deref_mut(),
             )?;
         } else if let PlannedExit::Direct { word, exit, .. } = plan.exit {
             if exit.kind == super::types::DirectKind::Call {
@@ -3180,7 +3296,8 @@ fn emit_block_inner(
                     &mut entries,
                     exit_guest,
                     30,
-                    exit.resume.raw(),
+                    MaterializedValue::Guest(exit.resume.raw()),
+                    recording.as_deref_mut(),
                 )?;
             }
             if matches!(
@@ -3200,7 +3317,8 @@ fn emit_block_inner(
                     exit.target,
                     Some(exit_guest),
                     2,
-                    super::gateway::direct_exit_address(),
+                    GatewayKind::Direct,
+                    recording.as_deref_mut(),
                 )?;
             } else {
                 let virtual_offset = exit
@@ -3240,7 +3358,8 @@ fn emit_block_inner(
                     exit.resume,
                     Some(exit_guest),
                     2,
-                    super::gateway::direct_exit_address(),
+                    GatewayKind::Direct,
+                    recording.as_deref_mut(),
                 )?;
                 emit_gateway_exit(
                     &mut assembler,
@@ -3249,7 +3368,8 @@ fn emit_block_inner(
                     exit.target,
                     Some(exit_guest),
                     2,
-                    super::gateway::direct_exit_address(),
+                    GatewayKind::Direct,
+                    recording.as_deref_mut(),
                 )?;
             }
         } else if let PlannedExit::Indirect { exit, .. } = plan.exit {
@@ -3260,6 +3380,7 @@ fn emit_block_inner(
                 exit_guest,
                 exit,
                 &mut recovery,
+                recording.as_deref_mut(),
             )?;
         } else if let PlannedExit::Sensitive { word, exit, .. } = plan.exit {
             if let EmitAddressMode::Biased { host_bias } = mode
@@ -3285,6 +3406,7 @@ fn emit_block_inner(
                     exit_guest,
                     exit.resume,
                     false,
+                    recording.as_deref_mut(),
                 )?;
             } else {
                 emit_gateway_exit(
@@ -3294,7 +3416,8 @@ fn emit_block_inner(
                     exit.resume,
                     Some(exit_guest),
                     6,
-                    super::gateway::sensitive_exit_address(),
+                    GatewayKind::Sensitive,
+                    recording.as_deref_mut(),
                 )?;
             }
         } else if let PlannedExit::Continue { target, .. } = plan.exit {
@@ -3308,7 +3431,8 @@ fn emit_block_inner(
                 target,
                 Some(exit_guest),
                 2,
-                super::gateway::direct_exit_address(),
+                GatewayKind::Direct,
+                recording.as_deref_mut(),
             )?;
         } else if let PlannedExit::Unsupported { .. } = plan.exit {
             emit_gateway_exit(
@@ -3318,7 +3442,8 @@ fn emit_block_inner(
                 exit_guest,
                 Some(exit_guest),
                 7,
-                super::gateway::unsupported_exit_address(),
+                GatewayKind::Unsupported,
+                recording.as_deref_mut(),
             )?;
         } else {
             return Err(DsrError::BlockPolicy(
@@ -3367,7 +3492,8 @@ fn emit_block_inner(
             plan.start,
             Some(plan.start),
             2,
-            super::gateway::direct_exit_address(),
+            GatewayKind::Direct,
+            recording.as_deref_mut(),
         )?;
     }
     let bytes = assembler
@@ -3520,6 +3646,56 @@ mod tests {
                 resume: GuestVa(0x400c),
             },
         }
+    }
+
+    #[test]
+    fn recorded_emission_normalizes_process_bindings_and_replays_metadata() {
+        let plan = copy_plan();
+        let source_words = vec![0xd503_201f, 0x9100_0400, 0xd400_0001];
+        let first_generation = AtomicU64::new(1);
+        let second_generation = AtomicU64::new(9);
+        let first_bias =
+            super::super::super::address::NativeHostBias::new(0x80_0000_0000, 16 * 1024)
+                .expect("first bias");
+        let second_bias =
+            super::super::super::address::NativeHostBias::new(0x90_0000_0000, 16 * 1024)
+                .expect("second bias");
+        let mut first_cache = TranslationCache::new(64 * 1024).expect("first cache");
+        let (first, first_artifact) = emit_block_recording_artifact(
+            &mut first_cache,
+            &plan,
+            GenerationGuard::new(&first_generation, CodeGeneration::claimed(1)),
+            EmitAddressMode::Biased {
+                host_bias: first_bias,
+            },
+            source_words.clone(),
+        )
+        .expect("record first emission");
+        let mut second_cache = TranslationCache::new(64 * 1024).expect("second cache");
+        let (second, second_artifact) = emit_block_recording_artifact(
+            &mut second_cache,
+            &plan,
+            GenerationGuard::new(&second_generation, CodeGeneration::claimed(9)),
+            EmitAddressMode::Biased {
+                host_bias: second_bias,
+            },
+            source_words,
+        )
+        .expect("record second emission");
+
+        assert_eq!(first_artifact.template, second_artifact.template);
+        assert_ne!(first_artifact.bindings, second_artifact.bindings);
+        let mut replay_cache = TranslationCache::new(64 * 1024).expect("replay cache");
+        let replay = super::super::artifact_spike::replay_artifact(
+            &mut replay_cache,
+            &first_artifact.template,
+            &second_artifact.bindings,
+        )
+        .expect("replay first template with second bindings");
+        assert_eq!(second.map().entries(), replay.map().entries());
+        assert_eq!(second.recovery(), replay.recovery());
+        assert_eq!(second.direct_links(), replay.direct_links());
+        assert_ne!(first.entry(), replay.entry());
     }
 
     fn emitted_words_for_all_gateway_exits() -> Vec<Vec<u32>> {
