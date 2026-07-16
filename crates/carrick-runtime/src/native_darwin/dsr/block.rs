@@ -853,6 +853,9 @@ mod tests {
         const SVC0: u32 = 0xd400_0001;
         // mrs x0, tpidr_el0
         const MRS_TPIDR: u32 = 0xd53b_d040;
+        // chkfeat x16 -- explicitly accepted by the DSR decoder because bad64
+        // predates FEAT_CHK and cannot decode this fixed encoding.
+        const CHKFEAT_X16: u32 = 0xd503_251f;
         // ldr x0, [x1] -- an ordinary (non-exclusive) memory access.
         const LDR_X0_X1: u32 = 0xf940_0020;
         const COND_NE: u32 = 1;
@@ -1622,6 +1625,34 @@ mod tests {
                     ..
                 }
             ));
+        }
+
+        #[test]
+        fn biased_scratch_accounts_for_explicitly_modeled_chkfeat_x16() {
+            let start = GuestVa(0x4000);
+            let retry_pc = GuestVa(0x400c);
+            let words = [
+                LDAXR_W0_X1,
+                CHKFEAT_X16,
+                STLXR_W3_W4_X1,
+                encode_cbnz_w(retry_pc, start, 3),
+            ];
+            let plan =
+                plan_via_production(&words, start, ExclusiveFusionPolicy::BiasedDisabled, 0x1000);
+            let PlannedExit::Sensitive {
+                fusion:
+                    Some(ExclusiveFusionSite {
+                        disposition: ExclusiveFusionDisposition::EligibleBackendDisabled,
+                        biased_scratch: Some(scratch),
+                        ..
+                    }),
+                ..
+            } = plan.exit
+            else {
+                panic!("expected an eligible biased fallback, got {:?}", plan.exit);
+            };
+            assert_eq!(scratch.address.index(), 17);
+            assert_eq!(scratch.bias.index(), 15, "x16 is an operand of chkfeat");
         }
 
         #[test]

@@ -9,6 +9,8 @@ use super::types::{
     MemoryWriteback, PcRelativeInst, PcRelativeKind, SensitiveExit, SensitiveKind,
 };
 
+const CHKFEAT_X16: u32 = 0xd503_251f;
+
 fn resume_pc(pc: GuestVa) -> Result<GuestVa, DsrError> {
     pc.raw()
         .checked_add(4)
@@ -715,6 +717,12 @@ pub(super) fn decoded_writeback_destination_overlaps_base(word: u32, pc: GuestVa
 }
 
 pub(super) fn decoded_operands_mention_gpr(word: u32, pc: GuestVa, index: u32) -> bool {
+    // Keep operand accounting aligned with `classify`'s explicit model for
+    // instructions newer than bad64. Treating this decode failure as having no
+    // operands would let scratch selection clobber chkfeat's architectural x16.
+    if word == CHKFEAT_X16 {
+        return index == 16;
+    }
     bad64::decode(word, pc.raw()).is_ok_and(|instruction| {
         instruction
             .operands()
@@ -787,7 +795,7 @@ pub(super) fn classify(word: u32, pc: GuestVa) -> Result<InstAction, DsrError> {
     // Armv8.9 alias and rejects the otherwise copy-safe instruction. x16 is an
     // ordinary guest register while translated code is running, so native
     // execution preserves both the implemented and HINT behaviors.
-    if word == 0xd503_251f {
+    if word == CHKFEAT_X16 {
         return Ok(InstAction::Copy(word));
     }
     let instruction = bad64::decode(word, pc.raw()).map_err(|error| DsrError::Decode {
