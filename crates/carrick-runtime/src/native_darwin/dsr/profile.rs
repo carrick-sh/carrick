@@ -2,7 +2,7 @@ use std::fmt::Write as _;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
-use super::types::SensitiveKind;
+use super::types::{ExclusiveFusionDisposition, ExclusiveFusionRejection, SensitiveKind};
 
 pub(super) const PROTOCOL_PREFIX: &str = "NATIVEPERF1";
 pub(super) const DARWIN_PIPE_BUF: usize = 512;
@@ -117,6 +117,99 @@ impl From<SensitiveKind> for SensitiveClass {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(usize)]
+pub(in crate::native_darwin) enum ExclusiveFusionClass {
+    FusedDirect,
+    FusedBiased,
+    EligibleBackendDisabled,
+    NotLoad,
+    VirtualizedBase,
+    VirtualizedOperand,
+    PageBoundary,
+    ScanLimitOrNoStore,
+    MismatchedStore,
+    UnsupportedBodyMemoryOrSensitive,
+    UnsupportedControlFlow,
+    InvalidRetryEdge,
+    BiasedNoSafeScratch,
+    BiasedAddressFormUnsupported,
+    AnalysisUnavailable,
+}
+
+impl ExclusiveFusionClass {
+    pub(super) const ALL: [Self; 15] = [
+        Self::FusedDirect,
+        Self::FusedBiased,
+        Self::EligibleBackendDisabled,
+        Self::NotLoad,
+        Self::VirtualizedBase,
+        Self::VirtualizedOperand,
+        Self::PageBoundary,
+        Self::ScanLimitOrNoStore,
+        Self::MismatchedStore,
+        Self::UnsupportedBodyMemoryOrSensitive,
+        Self::UnsupportedControlFlow,
+        Self::InvalidRetryEdge,
+        Self::BiasedNoSafeScratch,
+        Self::BiasedAddressFormUnsupported,
+        Self::AnalysisUnavailable,
+    ];
+    pub(super) const COUNT: usize = Self::ALL.len();
+
+    pub(super) const fn index(self) -> usize {
+        self as usize
+    }
+
+    const fn field_name(self) -> &'static str {
+        match self {
+            Self::FusedDirect => "fused_direct",
+            Self::FusedBiased => "fused_biased",
+            Self::EligibleBackendDisabled => "eligible_backend_disabled",
+            Self::NotLoad => "not_load",
+            Self::VirtualizedBase => "virtualized_base",
+            Self::VirtualizedOperand => "virtualized_operand",
+            Self::PageBoundary => "page_boundary",
+            Self::ScanLimitOrNoStore => "scan_limit_or_no_store",
+            Self::MismatchedStore => "mismatched_store",
+            Self::UnsupportedBodyMemoryOrSensitive => "unsupported_body_memory_or_sensitive",
+            Self::UnsupportedControlFlow => "unsupported_control_flow",
+            Self::InvalidRetryEdge => "invalid_retry_edge",
+            Self::BiasedNoSafeScratch => "biased_no_safe_scratch",
+            Self::BiasedAddressFormUnsupported => "biased_address_form_unsupported",
+            Self::AnalysisUnavailable => "analysis_unavailable",
+        }
+    }
+}
+
+impl From<ExclusiveFusionDisposition> for ExclusiveFusionClass {
+    fn from(disposition: ExclusiveFusionDisposition) -> Self {
+        match disposition {
+            ExclusiveFusionDisposition::FusedDirect => Self::FusedDirect,
+            ExclusiveFusionDisposition::FusedBiased => Self::FusedBiased,
+            ExclusiveFusionDisposition::EligibleBackendDisabled => Self::EligibleBackendDisabled,
+            ExclusiveFusionDisposition::Rejected(rejection) => match rejection {
+                ExclusiveFusionRejection::NotLoad => Self::NotLoad,
+                ExclusiveFusionRejection::VirtualizedBase => Self::VirtualizedBase,
+                ExclusiveFusionRejection::VirtualizedOperand => Self::VirtualizedOperand,
+                ExclusiveFusionRejection::PageBoundary => Self::PageBoundary,
+                ExclusiveFusionRejection::ScanLimitOrNoStore => Self::ScanLimitOrNoStore,
+                ExclusiveFusionRejection::MismatchedStore => Self::MismatchedStore,
+                ExclusiveFusionRejection::UnsupportedBodyMemoryOrSensitive => {
+                    Self::UnsupportedBodyMemoryOrSensitive
+                }
+                ExclusiveFusionRejection::UnsupportedControlFlow => Self::UnsupportedControlFlow,
+                ExclusiveFusionRejection::InvalidRetryEdge => Self::InvalidRetryEdge,
+                ExclusiveFusionRejection::BiasedNoSafeScratch => Self::BiasedNoSafeScratch,
+                ExclusiveFusionRejection::BiasedAddressFormUnsupported => {
+                    Self::BiasedAddressFormUnsupported
+                }
+                ExclusiveFusionRejection::AnalysisUnavailable => Self::AnalysisUnavailable,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
 pub(in crate::native_darwin) enum Phase {
     PrepareIndex,
     Translate,
@@ -197,6 +290,8 @@ pub(in crate::native_darwin) enum ProfileError {
     TimeOverlap,
     #[error("profile phase counts do not reconcile: {0}")]
     PhaseMismatch(&'static str),
+    #[error("exclusive fusion counts do not reconcile")]
+    ExclusiveFusionMismatch,
     #[error("profile protocol frame exceeds the atomic transport bound")]
     FrameTooLarge,
     #[error("profile blocked CPU time exceeds blocked wall time")]
@@ -219,6 +314,7 @@ impl ProfileError {
             Self::DispatchTimeUnderflow => "dispatch-time-underflow",
             Self::TimeOverlap => "time-overlap",
             Self::PhaseMismatch(_) => "phase-mismatch",
+            Self::ExclusiveFusionMismatch => "exclusive-fusion-mismatch",
             Self::FrameTooLarge => "frame-too-large",
             Self::BlockedCpuExceedsWall => "blocked-cpu-exceeds-wall",
             Self::ThreadUsageUnavailable => "thread-usage-unavailable",
@@ -680,6 +776,7 @@ pub(super) struct CompleteThreadRecord {
     pub(super) reconciled_exits: u64,
     exits: [u64; ExitClass::COUNT],
     sensitive: [u64; SensitiveClass::COUNT],
+    exclusive_fusion: [u64; ExclusiveFusionClass::COUNT],
     phase_ns: [u64; Phase::COUNT],
     phase_counts: [u64; Phase::COUNT],
     blocked_cpu_ns: u64,
@@ -729,6 +826,39 @@ impl CompleteThreadRecord {
             );
         }
         frames.push(sensitive);
+        for (name, classes, values) in [
+            (
+                "fusion-exec-a",
+                &ExclusiveFusionClass::ALL[..8],
+                &self.exclusive_fusion,
+            ),
+            (
+                "fusion-exec-b",
+                &ExclusiveFusionClass::ALL[8..],
+                &self.exclusive_fusion,
+            ),
+            (
+                "fusion-sites-a",
+                &ExclusiveFusionClass::ALL[..8],
+                &resolver.exclusive_fusion_sites,
+            ),
+            (
+                "fusion-sites-b",
+                &ExclusiveFusionClass::ALL[8..],
+                &resolver.exclusive_fusion_sites,
+            ),
+        ] {
+            let mut frame = self.frame_header(name);
+            for &class in classes {
+                let _ = write!(
+                    frame,
+                    "|fusion_{}={}",
+                    class.field_name(),
+                    values[class.index()]
+                );
+            }
+            frames.push(frame);
+        }
         for (name, phases) in [
             ("phases-a", &Phase::ALL[..4]),
             ("phases-b", &Phase::ALL[4..]),
@@ -861,6 +991,7 @@ pub(super) struct ThreadBudget {
     gateway_entries: u64,
     exits: [u64; ExitClass::COUNT],
     sensitive: [u64; SensitiveClass::COUNT],
+    exclusive_fusion: [u64; ExclusiveFusionClass::COUNT],
     phase_ns: [u64; Phase::COUNT],
     phase_counts: [u64; Phase::COUNT],
     blocked_cpu_ns: u64,
@@ -899,6 +1030,7 @@ impl ThreadBudget {
             gateway_entries: 0,
             exits: [0; ExitClass::COUNT],
             sensitive: [0; SensitiveClass::COUNT],
+            exclusive_fusion: [0; ExclusiveFusionClass::COUNT],
             phase_ns: [0; Phase::COUNT],
             phase_counts: [0; Phase::COUNT],
             blocked_cpu_ns: 0,
@@ -961,6 +1093,23 @@ impl ThreadBudget {
                 Ok(())
             }
             None => Err(self.invalidate(ProfileError::CounterOverflow("sensitive"))),
+        }
+    }
+
+    pub(super) fn record_exclusive_fusion(
+        &mut self,
+        class: ExclusiveFusionClass,
+    ) -> Result<(), ProfileError> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let counter = &mut self.exclusive_fusion[class.index()];
+        match counter.checked_add(1) {
+            Some(value) => {
+                *counter = value;
+                Ok(())
+            }
+            None => Err(self.invalidate(ProfileError::CounterOverflow("exclusive_fusion"))),
         }
     }
 
@@ -1052,6 +1201,16 @@ impl ThreadBudget {
         if self.blocked_cpu_ns > self.phase_ns[Phase::Blocked.index()] {
             return Err(ProfileError::BlockedCpuExceedsWall);
         }
+        let exclusive_fusion =
+            self.exclusive_fusion
+                .into_iter()
+                .try_fold(0_u64, |sum, value| {
+                    sum.checked_add(value)
+                        .ok_or(ProfileError::CounterOverflow("exclusive_fusion"))
+                })?;
+        if exclusive_fusion != self.sensitive[SensitiveClass::Exclusive.index()] {
+            return Err(ProfileError::ExclusiveFusionMismatch);
+        }
         Ok(CompleteThreadRecord {
             pid: self.pid,
             tid: self.tid,
@@ -1060,6 +1219,7 @@ impl ThreadBudget {
             reconciled_exits,
             exits: self.exits,
             sensitive: self.sensitive,
+            exclusive_fusion: self.exclusive_fusion,
             phase_ns: self.phase_ns,
             phase_counts: self.phase_counts,
             blocked_cpu_ns: self.blocked_cpu_ns,
@@ -1255,7 +1415,7 @@ mod tests {
                 },
             )
             .expect("bounded frames");
-        assert_eq!(frames.len(), 10);
+        assert_eq!(frames.len(), 14);
         assert!(frames[0].contains("|frame=core|"));
         assert!(frames[0].contains("|thread_cpu_ns=5"));
         let process = frames
@@ -1263,6 +1423,35 @@ mod tests {
             .find(|frame| frame.contains("|frame=process|"))
             .expect("process frame");
         assert!(process.contains("|startup_wall_ns=9|startup_cpu_ns=3|process_cpu_ns=8"));
+    }
+
+    #[test]
+    fn exclusive_fusion_frames_reconcile_and_fit_pipe_buf() {
+        let mut budget = ThreadBudget::enabled_for_test(41, 42);
+        budget
+            .record_exit(ExitClass::Sensitive)
+            .expect("sensitive exit");
+        budget
+            .record_sensitive(SensitiveClass::Exclusive)
+            .expect("exclusive");
+        budget
+            .record_exclusive_fusion(ExclusiveFusionClass::EligibleBackendDisabled)
+            .expect("fusion disposition");
+        let record = budget.complete_record().expect("complete record");
+        let mut snapshot = super::super::ProfileSnapshot::default();
+        snapshot.exclusive_fusion_sites[ExclusiveFusionClass::EligibleBackendDisabled.index()] = 1;
+        let frames = record
+            .to_protocol_frames_with_resolver(snapshot, FlushGauges::default())
+            .expect("serialize frames");
+        assert!(
+            frames
+                .iter()
+                .all(|frame| frame.len() + 1 <= DARWIN_PIPE_BUF)
+        );
+        assert!(frames.iter().any(|frame| {
+            frame.contains("frame=fusion-exec-a")
+                && frame.contains("fusion_eligible_backend_disabled=1")
+        }));
     }
 
     #[test]
@@ -1378,6 +1567,7 @@ mod tests {
             reconciled_exits: u64::MAX,
             exits: [u64::MAX; ExitClass::COUNT],
             sensitive: [u64::MAX; SensitiveClass::COUNT],
+            exclusive_fusion: [u64::MAX; ExclusiveFusionClass::COUNT],
             phase_ns: [u64::MAX; Phase::COUNT],
             phase_counts: [u64::MAX; Phase::COUNT],
             blocked_cpu_ns: u64::MAX,
@@ -1409,11 +1599,12 @@ mod tests {
                     nested_translation_ns: u64::MAX,
                     cache_used_bytes: usize::MAX,
                     cache_capacity_bytes: usize::MAX,
+                    exclusive_fusion_sites: [u64::MAX; ExclusiveFusionClass::COUNT],
                 },
                 gauges,
             )
             .expect("bounded frames");
-        assert_eq!(frames.len(), 10);
+        assert_eq!(frames.len(), 14);
         for frame in frames {
             let transport_len = frame.len().checked_add(1).expect("newline length");
             assert!(

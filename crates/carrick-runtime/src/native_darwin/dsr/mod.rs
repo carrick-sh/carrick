@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, OnceLock};
 
 use carrick_observability::probes;
@@ -95,12 +95,19 @@ struct ProcessState {
     pending: BTreeMap<(carrick_guest_mem::GuestVa, types::CodeGeneration), Vec<cache::LinkSite>>,
     stats: ResolverStats,
     reported_stats: ResolverStats,
-    sensitive: BTreeMap<(carrick_guest_mem::GuestVa, types::CodeGeneration), types::SensitiveExit>,
+    sensitive: BTreeMap<(carrick_guest_mem::GuestVa, types::CodeGeneration), SensitiveMetadata>,
+    exclusive_fusion_sites: [BTreeSet<(u64, u32)>; profile::ExclusiveFusionClass::COUNT],
     unsupported: BTreeMap<(carrick_guest_mem::GuestVa, types::CodeGeneration), (u32, bad64::Op)>,
     published: Vec<PublishedBlock>,
     dependencies: cache::PageBlockDependencies,
     publications: cache::ConcurrentPublicationIndex,
     profiling: bool,
+}
+
+#[derive(Clone, Copy)]
+struct SensitiveMetadata {
+    exit: types::SensitiveExit,
+    fusion: Option<types::ExclusiveFusionSite>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -312,6 +319,7 @@ pub(super) struct ProfileSnapshot {
     pub(super) nested_translation_ns: u64,
     pub(super) cache_used_bytes: usize,
     pub(super) cache_capacity_bytes: usize,
+    pub(super) exclusive_fusion_sites: [u64; profile::ExclusiveFusionClass::COUNT],
 }
 
 /// One live guest OS thread's most-recently republished profiling state,
@@ -573,6 +581,7 @@ impl ThreadTranslator {
             nested_translation_ns: self.nested_translation_ns,
             cache_used_bytes: process.cache.used_bytes(),
             cache_capacity_bytes: process.cache.capacity_bytes(),
+            exclusive_fusion_sites: process.exclusive_fusion_site_counts(),
         }
     }
 
@@ -612,6 +621,7 @@ impl ThreadTranslator {
             nested_translation_ns: self.nested_translation_ns,
             cache_used_bytes: process.cache.used_bytes(),
             cache_capacity_bytes: process.cache.capacity_bytes(),
+            exclusive_fusion_sites: process.exclusive_fusion_site_counts(),
         })
     }
 
@@ -673,6 +683,7 @@ impl ThreadTranslator {
             translation_plan_ns: 0,
             translation_emit_ns: 0,
             translation_publication_ns: 0,
+            exclusive_fusion_sites: process_state.exclusive_fusion_site_counts(),
         })
     }
 
@@ -902,6 +913,7 @@ impl ProcessTranslator {
                 stats: ResolverStats::default(),
                 reported_stats: ResolverStats::default(),
                 sensitive: BTreeMap::new(),
+                exclusive_fusion_sites: std::array::from_fn(|_| BTreeSet::new()),
                 unsupported: BTreeMap::new(),
                 published: Vec::new(),
                 dependencies: cache::PageBlockDependencies::default(),
@@ -952,6 +964,20 @@ impl ProcessTranslator {
 }
 
 impl ProcessState {
+    fn record_exclusive_fusion_site(&mut self, site: types::ExclusiveFusionSite) {
+        if !self.profiling {
+            return;
+        }
+        let class = profile::ExclusiveFusionClass::from(site.disposition);
+        self.exclusive_fusion_sites[class.index()].insert((site.guest.raw(), site.word));
+    }
+
+    fn exclusive_fusion_site_counts(&self) -> [u64; profile::ExclusiveFusionClass::COUNT] {
+        std::array::from_fn(|index| {
+            u64::try_from(self.exclusive_fusion_sites[index].len()).unwrap_or(u64::MAX)
+        })
+    }
+
     /// Read-only warm-cache-hit lookup: the fast path for
     /// `ThreadTranslator::translate` under `ProcessTranslator::state.read()`.
     /// Never mutates -- callable concurrently from any number of readers.
@@ -1068,13 +1094,37 @@ impl ProcessState {
                         observed: observation.current().get(),
                     });
                 }
-                if let block::PlannedExit::Sensitive {
-                    guest: sensitive_guest,
-                    exit,
-                    ..
-                } = block.exit
-                {
-                    self.sensitive.insert((sensitive_guest, generation), exit);
+                match block.exit {
+                    block::PlannedExit::Sensitive {
+                        guest: sensitive_guest,
+                        exit,
+                        fusion,
+                        ..
+                    } => {
+                        if let Some(site) = fusion {
+                            self.record_exclusive_fusion_site(site);
+                        }
+                        self.sensitive.insert(
+                            (sensitive_guest, generation),
+                            SensitiveMetadata { exit, fusion },
+                        );
+                    }
+                    block::PlannedExit::ExclusiveRegion {
+                        guest: sensitive_guest,
+                        exit,
+                        fusion,
+                        ..
+                    } => {
+                        self.record_exclusive_fusion_site(fusion);
+                        self.sensitive.insert(
+                            (sensitive_guest, generation),
+                            SensitiveMetadata {
+                                exit: exit.fallback,
+                                fusion: Some(fusion),
+                            },
+                        );
+                    }
+                    _ => {}
                 }
                 if let block::PlannedExit::Unsupported {
                     guest: unsupported_guest,
@@ -1870,7 +1920,7 @@ impl ThreadTranslator {
                 generation,
                 ..
             } => {
-                let exit = self
+                let metadata = self
                     .process
                     .state
                     .read()
@@ -1883,7 +1933,16 @@ impl ThreadTranslator {
                             guest_pc.raw()
                         ))
                     })?;
-                ThreadExit::Sensitive(exit)
+                if PROFILE {
+                    if let Some(site) = metadata.fusion {
+                        self.budget
+                            .record_exclusive_fusion(profile::ExclusiveFusionClass::from(
+                                site.disposition,
+                            ))
+                            .map_err(|error| types::DsrError::BlockPolicy(error.to_string()))?;
+                    }
+                }
+                ThreadExit::Sensitive(metadata.exit)
             }
             types::NativeDsrExit::Unsupported { guest_pc, .. } => {
                 let (word, op) = self
@@ -2917,6 +2976,49 @@ mod tests {
     }
 
     #[test]
+    fn exclusive_fusion_sites_deduplicate_across_generations() {
+        let process = std::sync::Arc::new(
+            super::ProcessTranslator::new(16 * 1024).expect("create translator"),
+        );
+        let site = super::types::ExclusiveFusionSite {
+            guest: PC,
+            word: 0x885f_7c20,
+            disposition: super::types::ExclusiveFusionDisposition::EligibleBackendDisabled,
+            biased_scratch: None,
+        };
+        {
+            let mut state = process.state.write();
+            state.profiling = true;
+            for generation in [
+                super::types::CodeGeneration::INITIAL,
+                super::types::CodeGeneration::claimed(1),
+            ] {
+                state.record_exclusive_fusion_site(site);
+                state.sensitive.insert(
+                    (site.guest, generation),
+                    super::SensitiveMetadata {
+                        exit: super::types::SensitiveExit {
+                            kind: super::types::SensitiveKind::Exclusive(site.word),
+                            register: None,
+                            resume: GuestVa(site.guest.raw() + 4),
+                        },
+                        fusion: Some(site),
+                    },
+                );
+            }
+        }
+        let mut translator = super::ThreadTranslator::for_process(process, 0);
+        translator.budget = super::profile::ThreadBudget::enabled_for_test(41, 42);
+        let snapshot = translator.profile_snapshot();
+        assert_eq!(
+            snapshot.exclusive_fusion_sites
+                [super::profile::ExclusiveFusionClass::EligibleBackendDisabled.index()],
+            1
+        );
+        translator.budget = super::profile::ThreadBudget::disabled_for_test(0, 0);
+    }
+
+    #[test]
     fn dsr_exec_switch_keeps_retiring_translator_metadata_alive() {
         let old = std::sync::Arc::new(
             super::ProcessTranslator::new(16 * 1024).expect("create old translator"),
@@ -3056,7 +3158,7 @@ mod tests {
 
         let frames = thread.take_profile_frames().expect("attribution frames");
 
-        assert_eq!(frames.len(), 10);
+        assert_eq!(frames.len(), 14);
         assert!(frames.iter().any(|frame| frame.contains("|frame=process|")));
         assert!(
             frames
@@ -3597,14 +3699,18 @@ mod tests {
             let sibling_frames = frames_for_tid(&captured, SIBLING_TID);
             assert_eq!(
                 sibling_frames.len(),
-                10,
-                "the drain must emit the sibling's complete 10-frame record exactly once; \
+                14,
+                "the drain must emit the sibling's complete 14-frame record exactly once; \
                  captured stderr: {captured:?}"
             );
             for frame in [
                 "core",
                 "exits",
                 "sensitive",
+                "fusion-exec-a",
+                "fusion-exec-b",
+                "fusion-sites-a",
+                "fusion-sites-b",
                 "phases-a",
                 "phases-b",
                 "resolver-thread",
@@ -3705,7 +3811,7 @@ mod tests {
             let frames = frames_for_tid(&captured, SELF_FLUSHED_TID);
             assert_eq!(
                 frames.len(),
-                10,
+                14,
                 "a self-flushed thread's record must appear exactly once (its own \
                  self-flush), never a second time from the leader's drain; captured: {captured:?}"
             );
