@@ -581,6 +581,29 @@ fn memory_class(op: Op, operands: &[Operand]) -> Option<MemoryClass> {
     }
 }
 
+fn simd_structure_immediate_post_index(op: Op, operands: &[Operand]) -> bool {
+    matches!(
+        op,
+        Op::LD1
+            | Op::LD1R
+            | Op::LD2
+            | Op::LD2R
+            | Op::LD3
+            | Op::LD3R
+            | Op::LD4
+            | Op::LD4R
+            | Op::ST1
+            | Op::ST2
+            | Op::ST3
+            | Op::ST4
+    ) && operands.windows(2).any(|pair| {
+        matches!(
+            pair,
+            [Operand::MemReg(_), Operand::Imm32 { shift: None, .. }]
+        )
+    })
+}
+
 fn has_memory_operand(operands: &[Operand]) -> bool {
     operands.iter().any(|operand| {
         matches!(
@@ -612,9 +635,16 @@ fn classify_memory(
     } else {
         memory_effective_address(operands).ok_or_else(|| malformed(pc, word, op))?
     };
-    let writeback = base_register(operands)
+    let mut writeback = base_register(operands)
         .map(|(_, writeback)| writeback)
         .unwrap_or(MemoryWriteback::None);
+    // bad64 represents the immediate post-index form of Advanced SIMD
+    // structure loads/stores as `MemReg(base), Imm32(increment)`, rather than
+    // `MemPostIdxImm`. The architectural base update is still mandatory: Go's
+    // string scanner uses `ld1 {vN.16b}, [xN], #16` as its loop cursor.
+    if writeback == MemoryWriteback::None && simd_structure_immediate_post_index(op, operands) {
+        writeback = MemoryWriteback::PostIndex;
+    }
     Ok(Some(MemoryAccess {
         word,
         op,
@@ -773,9 +803,14 @@ pub(super) fn copied_instruction_mentions_gpr(word: u32, pc: GuestVa, index: u32
     // operand array. Some operations (for example BLRAA) expose explicit GPRs
     // while omitting additional architectural GPR effects. Add an operation
     // here only after auditing bad64's operand model for every encoding that
-    // shares it. CMP is the data-processing operation required by the
-    // canonical CAS-loop recognizer and reports both source GPRs.
-    matches!(op, Op::CMP).then(|| {
+    // shares it. CMP is the data-processing operation required by canonical
+    // compare-and-swap loops. ADD, AND, and ORR are the single-instruction
+    // bodies emitted by Go's arm64 atomic add/and/or fallbacks. These four
+    // operations have no architecturally implicit GPR effects and bad64
+    // reports every explicit GPR operand for their scalar, SIMD, and SVE
+    // encodings; non-GPR vector/predicate operands cannot collide with the
+    // scalar scratch allocator.
+    matches!(op, Op::CMP | Op::ADD | Op::AND | Op::ORR).then(|| {
         operands
             .iter()
             .any(|operand| operand_mentions_gpr(operand, index))
@@ -874,15 +909,23 @@ pub(super) fn classify(word: u32, pc: GuestVa) -> Result<InstAction, DsrError> {
 
     let virtualized = || {
         if mentions_x18 && mentions_x28 {
-            let writes_x18_from_x28 = matches!(
-                operands,
-                [
-                    Operand::Reg { reg: destination, .. },
-                    Operand::Reg { reg: source, .. },
-                    ..
-                ] if register_matches_gpr(*destination, 18)
-                    && register_matches_gpr(*source, 28)
-            );
+            // Every ALU family in this allowlist has one explicit destination
+            // as its first operand and otherwise only reads its operands. This
+            // covers every dual-virtual shape found by the Go+cgo executable
+            // corpus audit while preserving fail-closed handling elsewhere.
+            let audited_alu_destination = matches!(
+                op,
+                Op::ADD | Op::SUB | Op::AND | Op::BIC | Op::BICS | Op::EOR | Op::ROR | Op::MOV
+            )
+            .then(|| match operands.first() {
+                Some(Operand::Reg {
+                    reg: destination, ..
+                }) if register_matches_gpr(*destination, 18) => Some(18),
+                Some(Operand::Reg {
+                    reg: destination, ..
+                }) if register_matches_gpr(*destination, 28) => Some(28),
+                _ => None,
+            });
             let loads_x18_from_x28 = matches!(
                 (op, operands),
                 (
@@ -905,8 +948,12 @@ pub(super) fn classify(word: u32, pc: GuestVa) -> Result<InstAction, DsrError> {
                 ) if register_matches_gpr(*destination, 18)
                     && register_matches_gpr(*base, 28)
             );
-            if (matches!(op, Op::ADD | Op::SUB) && writes_x18_from_x28) || loads_x18_from_x28 {
+            if audited_alu_destination == Some(Some(18)) || loads_x18_from_x28 {
                 InstAction::VirtualizedX18WriteX28Read { word, op }
+            } else if audited_alu_destination == Some(Some(28)) {
+                InstAction::VirtualizedX28WriteX18Read { word, op }
+            } else if audited_alu_destination == Some(None) {
+                InstAction::VirtualizedX18X28ReadOnly { word, op }
             } else if matches!(
                 (op, operands),
                 (
@@ -950,6 +997,7 @@ pub(super) fn classify(word: u32, pc: GuestVa) -> Result<InstAction, DsrError> {
                 InstAction::VirtualizedX18WriteX28Read { .. } => {
                     MemoryVirtualization::X18WriteX28Read
                 }
+                InstAction::VirtualizedX28WriteX18Read { .. } => MemoryVirtualization::Unsupported,
                 InstAction::Unsupported { .. } => MemoryVirtualization::Unsupported,
                 _ => MemoryVirtualization::None,
             };
@@ -1116,6 +1164,8 @@ mod tests {
             (0x5800_0040, MemoryClass::Literal, MemoryWriteback::None),
             // Standard Advanced SIMD post-index register form.
             (0x4cc2_7020, MemoryClass::Simd, MemoryWriteback::PostIndex),
+            // Go's string scanner: `ld1 {v1.16b}, [x2], #16`.
+            (0x4cdf_7041, MemoryClass::Simd, MemoryWriteback::PostIndex),
             // Standard scalar register-offset form (`MemExt` in bad64).
             (0xf862_6820, MemoryClass::Scalar, MemoryWriteback::None),
         ];
@@ -1138,6 +1188,51 @@ mod tests {
             classify(0xf940_0380, PC), // ldr x0, [x28]
             Ok(InstAction::Memory(memory)) if memory.base == MemoryBase::VirtualX28
         ));
+    }
+
+    #[test]
+    fn classifies_move_from_virtual_x18_to_virtual_x28() {
+        let word = 0xaa12_03fc; // mov x28, x18
+        assert!(matches!(
+            classify(word, PC),
+            Ok(InstAction::VirtualizedX28WriteX18Read {
+                word: observed,
+                op: Op::MOV,
+            }) if observed == word
+        ));
+    }
+
+    #[test]
+    fn classifies_bic_writing_virtual_x18_from_virtual_x28() {
+        let word = 0x8a3c_0212; // bic x18, x16, x28
+        assert!(matches!(
+            classify(word, PC),
+            Ok(InstAction::VirtualizedX18WriteX28Read {
+                word: observed,
+                op: Op::BIC,
+            }) if observed == word
+        ));
+    }
+
+    #[test]
+    fn classifies_audited_dual_virtual_alu_destinations() {
+        let cases = [
+            (0x1200_1392, Some(18)), // and w18, w28, #0x1f
+            (0x0b1c_025c, Some(28)), // add w28, w18, w28
+            (0x4b12_0388, None),     // sub w8, w28, w18
+        ];
+        for (word, destination) in cases {
+            let action = classify(word, PC).expect("classify audited dual-virtual ALU");
+            assert!(
+                match destination {
+                    Some(18) => matches!(action, InstAction::VirtualizedX18WriteX28Read { .. }),
+                    Some(28) => matches!(action, InstAction::VirtualizedX28WriteX18Read { .. }),
+                    None => matches!(action, InstAction::VirtualizedX18X28ReadOnly { .. }),
+                    _ => false,
+                },
+                "word=0x{word:08x}, action={action:?}"
+            );
+        }
     }
 
     #[test]
