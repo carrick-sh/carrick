@@ -384,17 +384,71 @@ The campaign-level terminal gate is approximately 1.0x Docker p50 on the exact
 inner-container compiler workload, with correctness and bounded fan-out still
 green.
 
+## Feasibility spike hard gate
+
+Do not begin the full production implementation from this spec. First build an
+opt-in, bounded feasibility spike whose only purpose is to prove or falsify the
+performance hypothesis on the exact inner-container cgo reducer.
+
+The spike implements only the minimum end-to-end path needed for representative
+reuse:
+
+- one container-lifetime authority fd carried through the existing native exec
+  capsule;
+- fresh emission normalized into instruction words, PC/recovery metadata,
+  unresolved direct links, and exhaustive typed process relocations;
+- a bounded append-only shared store with coarse process-shared locking and a
+  deliberately simple lookup structure;
+- validated replay into each consumer's private `MAP_JIT` cache;
+- counters for eligibility, committed artifacts, cross-process hits, replay
+  CPU, fresh translation CPU, and validation misses;
+- an opt-in environment switch that is absent from the user-facing CLI and is
+  disabled by default.
+
+The spike does not implement the production index, lock-free publication,
+complete mutation matrix, default enablement, broad conformance promotion,
+eviction, compaction, persistence, or long-term compatibility policy. Its
+format may be replaced after the measurement gate. It must still be memory-safe,
+generation-safe, typed, checksummed, bounded, and fail closed; "prototype" does
+not authorize executing unvalidated code.
+
+Run the spike against the exact same Docker identity and inner cgo command used
+for the 47.9 ms oracle and approximately 2.55 s Carrick baseline. Measure at
+least three unprofiled Carrick repetitions after one untimed warm-up, with
+Carrick and Docker in separate phases. Profiling remains directional and must
+not replace unprofiled wall authority.
+
+Proceed to a separate full-scale implementation plan only if every spike gate
+passes:
+
+- a later host process consumes artifacts produced by an earlier sibling
+  process in the same container;
+- artifact hits cover enough work to reduce aggregate translation plus
+  publication CPU by at least 80%;
+- the exact one-file cgo unprofiled p50 improves by at least 1.7x;
+- normalized output and exit status remain identical;
+- no `SIGILL`, malformed replay, stale-generation execution, timeout, or scoped
+  orphan occurs;
+- replay CPU is less than 20% of the fresh translation plus publication CPU it
+  replaces.
+
+If any gate fails, stop before production hardening. Preserve the measurements,
+classify whether eligibility, hit rate, replay cost, or the original CPU model
+was wrong, and select the next measured performance term. Do not expand the
+prototype merely because substantial code has already been written.
+
 ## Implementation boundaries
 
-The first implementation plan should split the work into independently proven
-slices:
+The first implementation plan covers only the feasibility spike and its hard
+measurement gate. If and only if that gate passes, write a new production plan
+that splits the remaining work into independently proven slices:
 
 1. typed artifact schema, authority fd, validator, and mutation tests;
 2. emitter normalization and exhaustive relocation recording;
 3. private-cache replay and equivalence oracle;
 4. append/index concurrency and capsule lifecycle;
-5. live opt-in measurement before default enablement;
-6. correctness and performance promotion gates.
+5. correctness and performance promotion gates;
+6. default enablement.
 
 The default path must not consume shared artifacts until the replay oracle,
 capsule lifecycle tests, corpus audit, and live bounded reducer all pass. A
