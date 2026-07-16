@@ -1280,10 +1280,21 @@ impl ThreadBudget {
     }
 
     pub(super) fn reset_after_exec(&mut self) {
+        let next_exec_epoch = next_exec_epoch(self.exec_epoch);
+        self.reset_profile_era(next_exec_epoch);
+        if self.enabled {
+            PROFILE_EXEC_EPOCH.store(next_exec_epoch, Ordering::Release);
+        }
+    }
+
+    pub(super) fn reset_same_image_profile_era(&mut self) {
+        self.reset_profile_era(self.exec_epoch);
+    }
+
+    fn reset_profile_era(&mut self, exec_epoch: u64) {
         let enabled = self.enabled;
         let pid = self.pid;
         let tid = self.tid;
-        let next_exec_epoch = next_exec_epoch(self.exec_epoch);
         let next_era = self.era.checked_add(1).map(|minimum| {
             if enabled {
                 monotonic_ticks().max(minimum)
@@ -1291,10 +1302,7 @@ impl ThreadBudget {
                 minimum
             }
         });
-        *self = Self::new(enabled, pid, tid, next_exec_epoch);
-        if enabled {
-            PROFILE_EXEC_EPOCH.store(next_exec_epoch, Ordering::Release);
-        }
+        *self = Self::new(enabled, pid, tid, exec_epoch);
         match next_era {
             Some(era) => self.era = era,
             None => {
