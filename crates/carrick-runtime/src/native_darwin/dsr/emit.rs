@@ -160,14 +160,14 @@ pub(super) enum RecoveryAction {
     RecoverBiasedExclusive(BiasedExclusiveRecovery),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(super) enum BiasedExclusiveResume {
     Load,
     Exact,
     Retry,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(super) struct BiasedExclusiveRecovery {
     pub(super) scratch: super::types::BiasedExclusiveScratch,
     pub(super) resume: BiasedExclusiveResume,
@@ -188,7 +188,7 @@ impl RecoveryAction {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(super) enum BiasedBase {
     Register(u32),
     StackPointer,
@@ -197,7 +197,7 @@ pub(super) enum BiasedBase {
     None,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(super) enum BiasedBaseCoordinate {
     Host,
     Guest,
@@ -2006,6 +2006,21 @@ pub(super) fn emit_block_recording_artifact(
     mode: EmitAddressMode,
     source_words: Vec<u32>,
 ) -> Result<(EmittedBlock, ArtifactRecord), DsrError> {
+    let (emitted, artifact) =
+        emit_block_recording_artifact_optional(cache, plan, guard, mode, source_words)?;
+    let artifact = artifact.ok_or_else(|| {
+        DsrError::CachePolicy("emitted block was ineligible for artifact recording".to_string())
+    })?;
+    Ok((emitted, artifact))
+}
+
+pub(super) fn emit_block_recording_artifact_optional(
+    cache: &mut TranslationCache,
+    plan: &BlockPlan,
+    guard: GenerationGuard,
+    mode: EmitAddressMode,
+    source_words: Vec<u32>,
+) -> Result<(EmittedBlock, Option<ArtifactRecord>), DsrError> {
     let mut recording = ArtifactRecording::default();
     if let EmitAddressMode::Biased { host_bias } = mode {
         recording.bind(ProcessValue::HostBias, host_bias.get())?;
@@ -2018,13 +2033,15 @@ pub(super) fn emit_block_recording_artifact(
             )
         })
         .collect();
-    let artifact = recording.finish(
-        words,
-        emitted.map().entries().to_vec(),
-        emitted.recovery().to_vec(),
-        emitted.direct_links().to_vec(),
-        source_words,
-    )?;
+    let artifact = recording
+        .finish(
+            words,
+            emitted.map().entries().to_vec(),
+            emitted.recovery().to_vec(),
+            emitted.direct_links().to_vec(),
+            source_words,
+        )
+        .ok();
     Ok((emitted, artifact))
 }
 

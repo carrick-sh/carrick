@@ -6,6 +6,8 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::FileExt;
 use std::sync::OnceLock;
 
+use sha2::{Digest, Sha256};
+
 use super::cache::TranslationCache;
 use super::emit::{
     BiasedBase, BiasedBaseCoordinate, BiasedExclusiveRecovery, DirectLink, EmittedBlock,
@@ -15,7 +17,264 @@ use super::types::{CacheOffset, DsrError};
 
 const MOV_WIDE_IMM16_MASK: u32 = 0x001f_ffe0;
 const ARTIFACT_STORE_SIZE: u64 = 256 * 1024 * 1024;
+const ARTIFACT_CURSOR_OFFSET: u64 = 16;
+const ARTIFACT_INDEX_OFFSET: u64 = 4096;
+const ARTIFACT_INDEX_SLOTS: u64 = 32 * 1024;
+const ARTIFACT_RECORD_OFFSET: u64 = ARTIFACT_INDEX_OFFSET + ARTIFACT_INDEX_SLOTS * 8;
+const ARTIFACT_MAX_PROBES: u64 = 64;
+const ARTIFACT_RECORD_MAGIC: [u8; 8] = *b"CARTV1\0\0";
+const ARTIFACT_RECORD_HEADER: usize = 8 + 32 + 8 + 32;
+const ARTIFACT_MAX_RECORD: usize = 4 * 1024 * 1024;
 static ARTIFACT_AUTHORITY: OnceLock<ArtifactAuthority> = OnceLock::new();
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ArtifactKey([u8; 32]);
+
+impl ArtifactKey {
+    pub(super) fn from_source(start: carrick_guest_mem::GuestVa, words: &[u32]) -> Self {
+        let mut digest = Sha256::new();
+        digest.update(b"carrick-artifact-spike-v1");
+        digest.update(start.raw().to_le_bytes());
+        digest.update((words.len() as u64).to_le_bytes());
+        for word in words {
+            digest.update(word.to_le_bytes());
+        }
+        Self(digest.finalize().into())
+    }
+
+    fn first_slot(self) -> u64 {
+        u64::from_le_bytes(self.0[..8].try_into().unwrap_or([0; 8])) % ARTIFACT_INDEX_SLOTS
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct WireArtifactTemplate {
+    words: Vec<u32>,
+    map: Vec<(u64, u32)>,
+    recovery: Vec<PortableRecoveryEntry>,
+    direct_links: Vec<(u32, u64)>,
+    relocations: Vec<ArtifactRelocation>,
+    source_words: Vec<u32>,
+}
+
+impl From<&ArtifactTemplate> for WireArtifactTemplate {
+    fn from(template: &ArtifactTemplate) -> Self {
+        Self {
+            words: template.words.clone(),
+            map: template
+                .map
+                .iter()
+                .map(|entry| (entry.guest.raw(), entry.cache.get()))
+                .collect(),
+            recovery: template.recovery.clone(),
+            direct_links: template
+                .direct_links
+                .iter()
+                .map(|link| (link.slot.get(), link.target.raw()))
+                .collect(),
+            relocations: template.relocations.clone(),
+            source_words: template.source_words.clone(),
+        }
+    }
+}
+
+impl From<WireArtifactTemplate> for ArtifactTemplate {
+    fn from(template: WireArtifactTemplate) -> Self {
+        Self {
+            words: template.words,
+            map: template
+                .map
+                .into_iter()
+                .map(|(guest, cache)| PcMapEntry {
+                    guest: carrick_guest_mem::GuestVa(guest),
+                    cache: CacheOffset::published(cache),
+                })
+                .collect(),
+            recovery: template.recovery,
+            direct_links: template
+                .direct_links
+                .into_iter()
+                .map(|(slot, target)| DirectLink {
+                    slot: CacheOffset::published(slot),
+                    target: carrick_guest_mem::GuestVa(target),
+                })
+                .collect(),
+            relocations: template.relocations,
+            source_words: template.source_words,
+        }
+    }
+}
+
+pub(super) struct ArtifactStore {
+    file: File,
+}
+
+struct ArtifactFileLock {
+    fd: i32,
+}
+
+impl Drop for ArtifactFileLock {
+    fn drop(&mut self) {
+        unsafe {
+            libc::flock(self.fd, libc::LOCK_UN);
+        }
+    }
+}
+
+impl ArtifactStore {
+    fn lock(&self, operation: i32) -> Result<ArtifactFileLock, DsrError> {
+        if unsafe { libc::flock(self.file.as_raw_fd(), operation) } != 0 {
+            return Err(DsrError::Host {
+                operation: "lock translation artifact store",
+                error: std::io::Error::last_os_error(),
+            });
+        }
+        Ok(ArtifactFileLock {
+            fd: self.file.as_raw_fd(),
+        })
+    }
+
+    pub(super) fn lookup(&self, key: ArtifactKey) -> Result<Option<ArtifactTemplate>, DsrError> {
+        let _lock = self.lock(libc::LOCK_SH)?;
+        self.lookup_locked(key)
+    }
+
+    fn lookup_locked(&self, key: ArtifactKey) -> Result<Option<ArtifactTemplate>, DsrError> {
+        for probe in 0..ARTIFACT_MAX_PROBES {
+            let slot = (key.first_slot() + probe) % ARTIFACT_INDEX_SLOTS;
+            let mut offset_bytes = [0_u8; 8];
+            read_store_exact(
+                &self.file,
+                &mut offset_bytes,
+                ARTIFACT_INDEX_OFFSET + slot * 8,
+            )?;
+            let offset = u64::from_le_bytes(offset_bytes);
+            if offset == 0 {
+                return Ok(None);
+            }
+            let mut header = [0_u8; ARTIFACT_RECORD_HEADER];
+            read_store_exact(&self.file, &mut header, offset)?;
+            if header[..8] != ARTIFACT_RECORD_MAGIC {
+                return Err(DsrError::CachePolicy(format!(
+                    "artifact record at 0x{offset:x} has invalid magic"
+                )));
+            }
+            if header[8..40] != key.0 {
+                continue;
+            }
+            let length = usize::try_from(u64::from_le_bytes(
+                header[40..48].try_into().unwrap_or([0; 8]),
+            ))
+            .map_err(|_| DsrError::CachePolicy("artifact record length overflow".to_string()))?;
+            if length == 0 || length > ARTIFACT_MAX_RECORD {
+                return Err(DsrError::CachePolicy(format!(
+                    "artifact record length is invalid: {length}"
+                )));
+            }
+            let mut payload = vec![0_u8; length];
+            read_store_exact(
+                &self.file,
+                &mut payload,
+                offset + ARTIFACT_RECORD_HEADER as u64,
+            )?;
+            let checksum: [u8; 32] = Sha256::digest(&payload).into();
+            if header[48..80] != checksum {
+                return Err(DsrError::CachePolicy(
+                    "artifact record checksum mismatch".to_string(),
+                ));
+            }
+            let wire: WireArtifactTemplate = serde_json::from_slice(&payload).map_err(|error| {
+                DsrError::CachePolicy(format!("decode artifact record: {error}"))
+            })?;
+            return Ok(Some(wire.into()));
+        }
+        Ok(None)
+    }
+
+    pub(super) fn insert(
+        &self,
+        key: ArtifactKey,
+        template: &ArtifactTemplate,
+    ) -> Result<(), DsrError> {
+        let _lock = self.lock(libc::LOCK_EX)?;
+        if self.lookup_locked(key)?.is_some() {
+            return Ok(());
+        }
+        let mut empty_slot = None;
+        for probe in 0..ARTIFACT_MAX_PROBES {
+            let slot = (key.first_slot() + probe) % ARTIFACT_INDEX_SLOTS;
+            let mut bytes = [0_u8; 8];
+            read_store_exact(&self.file, &mut bytes, ARTIFACT_INDEX_OFFSET + slot * 8)?;
+            if u64::from_le_bytes(bytes) == 0 {
+                empty_slot = Some(slot);
+                break;
+            }
+        }
+        let slot = empty_slot.ok_or_else(|| {
+            DsrError::CachePolicy("artifact index probe budget exhausted".to_string())
+        })?;
+        let payload = serde_json::to_vec(&WireArtifactTemplate::from(template))
+            .map_err(|error| DsrError::CachePolicy(format!("encode artifact record: {error}")))?;
+        if payload.is_empty() || payload.len() > ARTIFACT_MAX_RECORD {
+            return Err(DsrError::CachePolicy(format!(
+                "artifact payload length is invalid: {}",
+                payload.len()
+            )));
+        }
+        let mut cursor_bytes = [0_u8; 8];
+        read_store_exact(&self.file, &mut cursor_bytes, ARTIFACT_CURSOR_OFFSET)?;
+        let cursor = u64::from_le_bytes(cursor_bytes);
+        let end = cursor
+            .checked_add(ARTIFACT_RECORD_HEADER as u64)
+            .and_then(|value| value.checked_add(payload.len() as u64))
+            .ok_or_else(|| DsrError::CachePolicy("artifact store cursor overflow".to_string()))?;
+        if cursor < ARTIFACT_RECORD_OFFSET || end > ARTIFACT_STORE_SIZE {
+            return Err(DsrError::CachePolicy("artifact store is full".to_string()));
+        }
+        let checksum: [u8; 32] = Sha256::digest(&payload).into();
+        let mut header = Vec::with_capacity(ARTIFACT_RECORD_HEADER);
+        header.extend_from_slice(&ARTIFACT_RECORD_MAGIC);
+        header.extend_from_slice(&key.0);
+        header.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        header.extend_from_slice(&checksum);
+        self.file
+            .write_all_at(&payload, cursor + ARTIFACT_RECORD_HEADER as u64)
+            .and_then(|()| self.file.write_all_at(&header, cursor))
+            .and_then(|()| {
+                self.file
+                    .write_all_at(&end.to_le_bytes(), ARTIFACT_CURSOR_OFFSET)
+            })
+            .and_then(|()| {
+                self.file
+                    .write_all_at(&cursor.to_le_bytes(), ARTIFACT_INDEX_OFFSET + slot * 8)
+            })
+            .map_err(|error| DsrError::Host {
+                operation: "publish translation artifact record",
+                error,
+            })?;
+        Ok(())
+    }
+}
+
+fn read_store_exact(file: &File, mut bytes: &mut [u8], mut offset: u64) -> Result<(), DsrError> {
+    while !bytes.is_empty() {
+        let read = file
+            .read_at(bytes, offset)
+            .map_err(|error| DsrError::Host {
+                operation: "read translation artifact store",
+                error,
+            })?;
+        if read == 0 {
+            return Err(DsrError::CachePolicy(
+                "translation artifact store ended unexpectedly".to_string(),
+            ));
+        }
+        let (_, rest) = bytes.split_at_mut(read);
+        bytes = rest;
+        offset = offset.saturating_add(read as u64);
+    }
+    Ok(())
+}
 
 #[derive(Debug)]
 pub(in crate::native_darwin) struct ArtifactAuthority {
@@ -43,6 +302,14 @@ impl ArtifactAuthority {
                 operation: "write translation artifact spike nonce",
                 error,
             })?;
+        file.write_all_at(
+            &ARTIFACT_RECORD_OFFSET.to_le_bytes(),
+            ARTIFACT_CURSOR_OFFSET,
+        )
+        .map_err(|error| DsrError::Host {
+            operation: "initialize translation artifact spike cursor",
+            error,
+        })?;
         Ok(Self {
             file,
             authority_nonce,
@@ -81,6 +348,16 @@ impl ArtifactAuthority {
             host_size: identity.st_size as u64,
             authority_nonce: self.authority_nonce,
         })
+    }
+
+    pub(super) fn map_store(&self) -> Result<ArtifactStore, DsrError> {
+        self.file
+            .try_clone()
+            .map(|file| ArtifactStore { file })
+            .map_err(|error| DsrError::Host {
+                operation: "clone translation artifact store authority",
+                error,
+            })
     }
 
     #[cfg(test)]
@@ -163,6 +440,14 @@ pub(crate) fn authority_snapshot_if_enabled()
         .map_err(|error| anyhow::anyhow!("snapshot artifact spike authority: {error}"))
 }
 
+pub(super) fn store_if_enabled() -> Result<Option<ArtifactStore>, DsrError> {
+    ensure_authority_if_enabled()?;
+    ARTIFACT_AUTHORITY
+        .get()
+        .map(ArtifactAuthority::map_store)
+        .transpose()
+}
+
 pub(crate) fn adopt_for_resume(
     snapshot: &crate::native_exec_capsule::NativeReexecArtifactSpikeV1,
 ) -> anyhow::Result<()> {
@@ -180,7 +465,9 @@ fn adopt_for_test(
     adopt(snapshot)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub(super) enum GatewayKind {
     Syscall,
     Direct,
@@ -190,7 +477,9 @@ pub(super) enum GatewayKind {
     Signal,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub(super) enum ProcessValue {
     Gateway(GatewayKind),
     GenerationAddress,
@@ -234,6 +523,45 @@ impl ArtifactBindings {
             )));
         }
         Ok(())
+    }
+
+    pub(super) fn for_replay(
+        generation_address: u64,
+        generation_expected: u64,
+        mode: super::emit::EmitAddressMode,
+    ) -> Result<Self, DsrError> {
+        let mut bindings = Self::from_values([
+            (ProcessValue::GenerationAddress, generation_address),
+            (ProcessValue::GenerationExpected, generation_expected),
+            (
+                ProcessValue::Gateway(GatewayKind::Syscall),
+                super::gateway::syscall_exit_address(),
+            ),
+            (
+                ProcessValue::Gateway(GatewayKind::Direct),
+                super::gateway::direct_exit_address(),
+            ),
+            (
+                ProcessValue::Gateway(GatewayKind::Indirect),
+                super::gateway::indirect_exit_address(),
+            ),
+            (
+                ProcessValue::Gateway(GatewayKind::Sensitive),
+                super::gateway::sensitive_exit_address(),
+            ),
+            (
+                ProcessValue::Gateway(GatewayKind::Unsupported),
+                super::gateway::unsupported_exit_address(),
+            ),
+            (
+                ProcessValue::Gateway(GatewayKind::Signal),
+                super::gateway::signal_exit_address(),
+            ),
+        ])?;
+        if let super::emit::EmitAddressMode::Biased { host_bias } = mode {
+            bindings.bind(ProcessValue::HostBias, host_bias.get())?;
+        }
+        Ok(bindings)
     }
 }
 
@@ -400,7 +728,7 @@ pub(super) struct ArtifactRecord {
     pub(super) bindings: ArtifactBindings,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(super) struct ArtifactRelocation {
     pub(super) first_word: u32,
     pub(super) register: u8,
@@ -408,7 +736,7 @@ pub(super) struct ArtifactRelocation {
     pub(super) expected_opcode_mask: [u32; 4],
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct PortableBiasedMemoryRecovery {
     scratch_registers: [u32; 4],
     scratch_count: u8,
@@ -421,7 +749,7 @@ struct PortableBiasedMemoryRecovery {
     instruction_complete: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum PortableRecoveryAction {
     Noop,
     RestoreGuestX17,
@@ -687,7 +1015,7 @@ impl PortableRecoveryAction {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct PortableRecoveryEntry {
     cache: CacheOffset,
     action: PortableRecoveryAction,
@@ -704,6 +1032,10 @@ pub(super) struct ArtifactTemplate {
 }
 
 impl ArtifactTemplate {
+    pub(super) fn source_words(&self) -> &[u32] {
+        &self.source_words
+    }
+
     #[allow(
         clippy::too_many_arguments,
         reason = "an artifact template owns code and all replay metadata"
@@ -973,5 +1305,27 @@ mod tests {
         let mut snapshot = authority.snapshot().expect("snapshot");
         snapshot.host_inode ^= 1;
         assert!(adopt_for_test(&snapshot).is_err());
+    }
+
+    #[test]
+    fn second_mapping_reads_committed_artifact() {
+        let authority = ArtifactAuthority::create_for_test().expect("authority");
+        let writer = authority.map_store().expect("writer mapping");
+        let reader = authority.map_store().expect("reader mapping");
+        let (template, _) = emit_artifact_fixture(0x1000_0000, 0x2000_0000);
+        let key = ArtifactKey::from_source(GuestVa(0x4000), &template.source_words);
+        writer.insert(key, &template).expect("insert artifact");
+        assert_eq!(reader.lookup(key).expect("lookup artifact"), Some(template));
+    }
+
+    #[test]
+    fn source_mismatched_record_never_replays() {
+        let authority = ArtifactAuthority::create_for_test().expect("authority");
+        let store = authority.map_store().expect("store mapping");
+        let (template, _) = emit_artifact_fixture(0x1000_0000, 0x2000_0000);
+        let key = ArtifactKey::from_source(GuestVa(0x4000), &template.source_words);
+        store.insert(key, &template).expect("insert artifact");
+        let mismatch = ArtifactKey::from_source(GuestVa(0x4000), &[0xd503_201f]);
+        assert_eq!(store.lookup(mismatch).expect("mismatched lookup"), None);
     }
 }

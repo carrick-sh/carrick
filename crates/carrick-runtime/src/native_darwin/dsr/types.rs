@@ -34,7 +34,9 @@ impl BlockId {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub(super) struct CacheOffset(u32);
 
 impl CacheOffset {
@@ -211,7 +213,9 @@ pub(in crate::native_darwin) struct SensitiveExit {
     pub(in crate::native_darwin) resume: GuestVa,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub(super) struct DsrScratchGpr(u8);
 
 impl DsrScratchGpr {
@@ -224,7 +228,7 @@ impl DsrScratchGpr {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(super) struct BiasedExclusiveScratch {
     pub(super) address: DsrScratchGpr,
     pub(super) bias: DsrScratchGpr,
