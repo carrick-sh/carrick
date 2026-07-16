@@ -15,6 +15,8 @@ mod oracle;
 pub(super) mod profile;
 pub(super) mod types;
 
+const ARTIFACT_KEY_PREFIX_INSTRUCTIONS: usize = 16;
+
 #[derive(Debug)]
 pub(super) enum ThreadExit {
     Syscall {
@@ -100,12 +102,13 @@ impl Drop for ProcessTranslator {
         if let Some(store) = &self.state.get_mut().artifact_store {
             let snapshot = store.snapshot();
             eprintln!(
-                "CARRICK_ARTIFACT pid={} lookups={} cross_process_hits={} inserts={} replay_ns={}",
+                "CARRICK_ARTIFACT pid={} lookups={} cross_process_hits={} inserts={} replay_ns={} sealed={}",
                 unsafe { libc::getpid() },
                 snapshot.lookups,
                 snapshot.hits,
                 snapshot.inserts,
                 snapshot.replay_ns,
+                snapshot.sealed,
             );
         }
     }
@@ -1038,6 +1041,10 @@ impl ProcessState {
         self.blocks.get(&(guest, generation)).copied()
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "publication consumes the complete translation result and profiling context"
+    )]
     fn publish_emitted(
         &mut self,
         tid: i32,
@@ -1156,32 +1163,40 @@ impl ProcessState {
         );
         probes::dsr_translate_begin(tid, guest.raw(), generation.get());
         let translation_started = self.profiling.then(std::time::Instant::now);
-        let artifact_source_words = self
-            .artifact_store
-            .as_ref()
-            .and_then(|_| memory.instruction_fingerprint_words(guest, 256).ok());
-        let artifact_key = artifact_source_words
-            .as_ref()
-            .map(|words| artifact_spike::ArtifactKey::from_source(guest, words));
+        let artifact_address_mode: emit::EmitAddressMode = memory.address_mode().into();
+        let artifact_key_words = self.artifact_store.as_ref().and_then(|store| {
+            if !store.accepting_inserts() {
+                if !store.may_contain_guest(guest, artifact_address_mode) {
+                    return None;
+                }
+            }
+            memory
+                .instruction_fingerprint_words(guest, ARTIFACT_KEY_PREFIX_INSTRUCTIONS)
+                .ok()
+        });
+        let artifact_key = artifact_key_words.as_ref().map(|words| {
+            artifact_spike::ArtifactKey::from_source(guest, words, artifact_address_mode)
+        });
         let result = (|| -> Result<TranslationResult, types::DsrError> {
             let artifact_template = artifact_key.and_then(|artifact_key| {
                 self.artifact_store
                     .as_ref()
                     .and_then(|store| store.lookup(artifact_key).ok().flatten())
             });
-            if let (Some(template), Some(source_words)) =
-                (artifact_template, artifact_source_words.as_ref())
-                && template.source_words() == source_words
+            if !artifact_spike::validate_fresh_enabled()
+                && let Some(template) = artifact_template.as_ref()
+                && memory
+                    .instruction_fingerprint_words(guest, template.source_words().len())
+                    .is_ok_and(|words| template.matches_source(&words))
             {
-                let mode: emit::EmitAddressMode = memory.address_mode().into();
                 let bindings = artifact_spike::ArtifactBindings::for_replay(
                     observation.current_atomic() as *const std::sync::atomic::AtomicU64 as u64,
                     generation.get(),
-                    mode,
+                    artifact_address_mode,
                 )?;
                 let replay_started = std::time::Instant::now();
                 if let Ok(emitted) =
-                    artifact_spike::replay_artifact(&mut self.cache, &template, &bindings)
+                    artifact_spike::replay_artifact(&mut self.cache, template, &bindings)
                 {
                     if let Some(store) = &self.artifact_store {
                         store.record_replay_ns(
@@ -1234,6 +1249,20 @@ impl ProcessState {
                 generation.get(),
             );
             let block = block_result?;
+            let artifact_source_words = self.artifact_store.as_ref().and_then(|_| {
+                let word_count = usize::try_from(
+                    block
+                        .end
+                        .raw()
+                        .saturating_sub(block.start.raw())
+                        .checked_div(4)?,
+                )
+                .ok()?;
+                memory
+                    .instruction_fingerprint_words(guest, word_count)
+                    .ok()
+                    .filter(|words| words.len() == word_count)
+            });
 
             probes::dsr_translate_subphase_begin(
                 tid,
@@ -1313,7 +1342,10 @@ impl ProcessState {
             );
             let emit_started = self.profiling.then(std::time::Instant::now);
             let emitted_result = (|| {
-                let artifact_eligible = self.artifact_store.is_some()
+                let artifact_eligible = self
+                    .artifact_store
+                    .as_ref()
+                    .is_some_and(artifact_spike::ArtifactStore::accepting_inserts)
                     && artifact_key.is_some()
                     && artifact_source_words.is_some()
                     && matches!(
@@ -1342,10 +1374,44 @@ impl ProcessState {
                         None,
                     )
                 };
-                if let (Some(store), Some(artifact_key), Some(artifact)) =
-                    (self.artifact_store.as_ref(), artifact_key, artifact)
-                {
+                if let (Some(store), Some(artifact_key), Some(artifact)) = (
+                    self.artifact_store.as_ref(),
+                    artifact_key,
+                    artifact.as_ref(),
+                ) {
+                    if artifact_spike::validate_fresh_enabled()
+                        && let Some(stored) = artifact_template.as_ref()
+                        && let Some(mismatch) = stored.mismatch_summary(&artifact.template)
+                    {
+                        return Err(types::DsrError::CachePolicy(format!(
+                            "artifact fresh-validation mismatch at guest 0x{:x} in \
+                             {artifact_address_mode:?}: {mismatch}",
+                            guest.raw()
+                        )));
+                    }
+                    if artifact_spike::validate_fresh_enabled() && artifact_template.is_some() {
+                        let replay_bindings = artifact_spike::ArtifactBindings::for_replay(
+                            observation.current_atomic() as *const std::sync::atomic::AtomicU64
+                                as u64,
+                            generation.get(),
+                            artifact_address_mode,
+                        )?;
+                        if let Some(mismatch) = artifact.bindings.mismatch_summary(&replay_bindings)
+                        {
+                            return Err(types::DsrError::CachePolicy(format!(
+                                "artifact fresh-validation binding mismatch at guest 0x{:x} in \
+                                 {artifact_address_mode:?}: {mismatch}",
+                                guest.raw()
+                            )));
+                        }
+                    }
                     let _ = store.insert(artifact_key, &artifact.template);
+                } else if artifact_spike::validate_fresh_enabled() && artifact_template.is_some() {
+                    return Err(types::DsrError::CachePolicy(format!(
+                        "artifact fresh-validation could not record guest 0x{:x} in \
+                         {artifact_address_mode:?}",
+                        guest.raw()
+                    )));
                 }
                 let emitted_bytes = u64::try_from(emitted.len()).unwrap_or(u64::MAX);
                 probes::dsr_cache_event(

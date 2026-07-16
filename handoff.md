@@ -299,20 +299,43 @@ the hottest thread alone reaches 1,520,928 entries. Descendant CPU is
 (53.38 percent), including 28.375762 seconds of nested translation and
 8.406044 seconds of publication.
 
-This establishes a real step-function target and keeps cross-process
-translation reuse as the highest-leverage hypothesis. The current artifact
-spike is not promotable: two signed cache-enabled runs obtain more than 15,000
-cross-process hits with about 34 ms replay CPU, but both deterministically fail
-with Go split-stack overflow. Diagnose and fix that replay-state corruption,
-then require a successful native/Docker pair before claiming speedup. The
-authority record is
-`scripts/perf/evidence/native-translation-artifact-spike-v1.json`.
+The replay corruption is now attributed and fixed in the spike. Artifact keys
+previously aliased direct and biased native address modes even though their
+emitted blocks are not interchangeable. A red-first key test now separates the
+mode class while retaining reuse across different biased host bases. Fresh
+validation also compares normalized templates and every replay binding; it ran
+without a mismatch through the bounded compiler window. The deterministic Go
+split-stack failure disappeared, and the exact cache-enabled build now
+completes correctly with output `42`.
 
-The first reducer split is also recorded there. Two consecutive `go env GOROOT`
-executions pass after 32,886 cross-process hits, so simple Go startup and
-cross-exec reuse are not generally broken. The same cgo build with `go build
--p=1` still fails after 16,209 hits with the deterministic bad SP
-`0xfffffefbd0`, ruling out Go package parallelism. The next diagnostic slice is
-replay-vs-fresh validation of emitted words and recovery metadata at build-only
-hits, falling back before executing the first mismatch. Do not broaden the
-artifact cache until that comparison identifies and closes the missing state.
+That correctness result does **not** justify a production cache. The best
+bounded point uses a shared atomic index, seals failed insertions at capacity,
+stores complete block source behind a short lookup prefix, and uses a shared
+guest-PC/address-mode filter after sealing. It completes in 60.471553292
+seconds versus the successful 58.736915875-second uncached control: cache is
+still 1.029532x slower, not within 1x and nowhere near a step function. It
+records 71,244 cross-process hits with 186.064 ms replay CPU.
+
+Capacity and warm-cache sensitivity reject the fine-grained design rather than
+merely asking for more tuning. Second-touch admission raises hits to 220,346
+without reducing wall (60.923604292 seconds). Doubling the sparse store to 512
+MiB raises hits to 931,094 but regresses wall to 73.567581958 seconds. Finally,
+two builds in one container used separate empty Go build caches: the population
+build took 68.705315333 seconds and the fully pre-warmed Carrick-cache build
+took 70.093390208 seconds. Population removal therefore does not expose a
+hidden speedup. The negative capacity code was reverted; the bounded 256 MiB
+diagnostic remains.
+
+The authority record is
+`scripts/perf/evidence/native-translation-artifact-spike-v1.json` and its
+verdict is `STOP_PER_BLOCK_ARTIFACT_CACHE`. Do not turn the high hit counts into
+a full implementation. Any next cache experiment must amortize at a much
+coarser executable/page bundle boundary and prove wall improvement before
+production work.
+
+Keep one correctness issue separate from cache attribution. Cache-disabled
+`-p=1` and parallel builds independently reproduced late build-archive
+`EFAULT` failures after 23.531563875 and 11.665446834 seconds. Those failures
+are native load/correctness debt; they cannot be cited as artifact replay
+corruption, and the successful uncached/cache authority runs remain the wall
+comparison.

@@ -62,10 +62,107 @@
       "work_product_stdout": "42"
     }
   },
+  "followup_runs": {
+    "address_mode_key_serialized_cgo": {
+      "inner_ns": 70487633874,
+      "exit_code": 1,
+      "lookups": 1622144,
+      "cross_process_hits": 23743,
+      "inserts": 19626,
+      "replay_ns": 75466345,
+      "failure": "internal/runtime/math: read build archive: bad address",
+      "attribution": "not cache-specific: cache-disabled -p=1 reproduced the same EFAULT class after 23531563875 ns"
+    },
+    "atomic_index_sealed_store": {
+      "inner_ns": 75078144458,
+      "exit_code": 0,
+      "work_product_stdout": "42",
+      "lookups": 4943602,
+      "cross_process_hits": 71307,
+      "inserts": 19635,
+      "replay_ns": 185365117,
+      "interpretation": "correct replay, but miss probes dominate"
+    },
+    "compact_block_source": {
+      "inner_ns": 66217951542,
+      "exit_code": 0,
+      "work_product_stdout": "42",
+      "lookups": 4943592,
+      "cross_process_hits": 71319,
+      "inserts": 20331,
+      "replay_ns": 183566143
+    },
+    "guest_pc_mode_filter": {
+      "inner_ns": 60471553292,
+      "exit_code": 0,
+      "work_product_stdout": "42",
+      "lookups": 364194,
+      "cross_process_hits": 71244,
+      "inserts": 20336,
+      "replay_ns": 186063508,
+      "cache_to_uncached_inner_wall_ratio": 1.029532,
+      "interpretation": "best bounded correct cache point; within 2.95 percent but slower, not a step function"
+    },
+    "first_word_filter": {
+      "inner_ns": 60671623709,
+      "exit_code": 0,
+      "work_product_stdout": "42",
+      "lookups": 98986,
+      "cross_process_hits": 71334,
+      "inserts": 20345,
+      "replay_ns": 188406946,
+      "interpretation": "fewer probes did not reduce wall"
+    },
+    "second_touch_admission_256m": {
+      "inner_ns": 60923604292,
+      "exit_code": 0,
+      "work_product_stdout": "42",
+      "lookups": 309303,
+      "cross_process_hits": 220346,
+      "inserts": 21886,
+      "replay_ns": 791176477,
+      "interpretation": "3.09x more hits than the best bounded point did not reduce wall"
+    },
+    "second_touch_admission_512m": {
+      "inner_ns": 73567581958,
+      "exit_code": 0,
+      "work_product_stdout": "42",
+      "lookups": 1107117,
+      "cross_process_hits": 931094,
+      "inserts": 43122,
+      "replay_ns": 3639318142,
+      "cache_to_uncached_inner_wall_ratio": 1.252493,
+      "interpretation": "13.07x more hits than the best bounded point regressed wall by 21.66 percent versus that point"
+    },
+    "warm_cache_pair_separate_go_caches": {
+      "first_inner_ns": 68705315333,
+      "second_inner_ns": 70093390208,
+      "first_exit_code": 0,
+      "second_exit_code": 0,
+      "work_product_stdout": "42",
+      "final_lookups": 1797217,
+      "final_cross_process_hits": 1234976,
+      "final_inserts": 42735,
+      "final_replay_ns": 4512610102,
+      "second_to_first_inner_wall_ratio": 1.020203,
+      "interpretation": "a pre-warmed Carrick cache did not speed a second build with an independent empty Go cache"
+    },
+    "cache_disabled_attribution_failures": {
+      "serialized_inner_ns": 23531563875,
+      "serialized_failure": "internal/race: read build archive: bad address",
+      "parallel_inner_ns": 11665446834,
+      "parallel_failure": "internal/runtime/atomic: read object while archiving: bad address",
+      "interpretation": "late build-archive EFAULT is a separate native correctness/load issue and cannot be attributed to artifact replay"
+    }
+  },
   "authority": {
     "native_to_docker_inner_wall_ratio": 40.583,
     "one_million_traps_interpretation": "invalid completion threshold: the successful profile required 19057383 aggregate gateway entries and its hottest thread exceeded the ceiling at 1520928 entries",
-    "pathology": "translation consumed 58308975785 ns, 53.38% of 109234585000 ns descendant CPU"
+    "pathology": "translation consumed 58308975785 ns, 53.38% of 109234585000 ns descendant CPU",
+    "best_correct_cache_to_uncached_inner_wall_ratio": 1.029532,
+    "capacity_hit_scale": 13.069,
+    "capacity_wall_regression_ratio": 1.216565,
+    "warm_second_to_first_inner_wall_ratio": 1.020203
   },
   "reduction": {
     "two_consecutive_go_env": {
@@ -73,25 +170,29 @@
       "cross_process_hits": 32886,
       "interpretation": "simple Go startup and cross-exec reuse are correct"
     },
-    "cgo_build_p1": {
+    "cgo_build_p1_before_address_mode_key": {
       "exit_code": 2,
       "cross_process_hits": 16209,
       "failure": "runtime: split stack overflow",
       "bad_stack_pointer": "0xfffffefbd0",
       "interpretation": "forcing Go package parallelism to one does not remove the deterministic replay corruption"
     },
-    "next_diagnostic": "compare replayed code and recovery metadata with a fresh emission at build-only artifact hits, then fall back before execution on the first mismatch"
+    "root_cause": "artifact keys aliased direct and biased address modes even though their emitted blocks are not interchangeable",
+    "fresh_validation": "normalized templates and replay bindings matched through a bounded 85-second fresh-emission run; address-mode keying removed the deterministic split-stack corruption",
+    "native_correctness_debt": "cache-disabled serialized and parallel builds independently reproduce late build-archive EFAULT failures"
   },
   "gates": {
     "cross_process_hits_gt_zero": "pass",
     "translation_publication_reduction_gte_0_80": "not_measurable_from_a_successful_pair",
-    "wall_speedup_gte_1_70": "not_measurable_from_a_successful_pair",
+    "wall_speedup_gte_1_70": "fail",
+    "within_1x_uncached_wall": "fail: best correct cache point is 1.029532x uncached",
+    "warm_cache_step_function": "fail: second build is 1.020203x first build",
     "replay_cpu_ratio_lt_0_20": {
       "status": "pass_directionally",
-      "ratio": 0.030915
+      "ratio": 0.003077
     },
-    "correctness_and_cleanup": "fail"
+    "correctness_and_cleanup": "pass for best bounded cache point; separate cache-disabled EFAULT debt remains"
   },
-  "verdict": "STOP",
-  "reason": "The spike proves real cross-process reuse and low replay CPU, but both cache-enabled signed runs deterministically corrupt Go stack state. The uncached control completes correctly in 58.737 seconds versus Docker's 1.447 seconds (40.583x), and a successful process-tree profile attributes 58.309 CPU-seconds to translation. One million traps was only an invalid early cutoff. The cache remains the highest-leverage step-function hypothesis, but no successful paired speedup can be claimed until replay correctness is fixed; do not proceed to a production cache implementation."
+  "verdict": "STOP_PER_BLOCK_ARTIFACT_CACHE",
+  "reason": "Address-mode keying fixes the deterministic replay corruption and the best bounded cache point completes correctly with output 42, but it takes 60.472 seconds versus the 58.737-second uncached control (1.029532x slower). Scaling from 71,244 to 931,094 hits regresses wall to 73.568 seconds, and a fully pre-warmed second build with an independent empty Go cache is 1.020203x slower than its first build. Per-block JSON artifact lookup/replay is therefore not the step-function architecture; do not proceed to a production implementation. Preserve the separate cache-disabled build-archive EFAULT as native correctness debt."
 }
