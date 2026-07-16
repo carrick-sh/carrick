@@ -469,6 +469,16 @@ impl TranslationCache {
         })
     }
 
+    pub(super) fn publish_words(&mut self, words: &[u32]) -> Result<PublishedCode, DsrError> {
+        let len = words
+            .len()
+            .checked_mul(std::mem::size_of::<u32>())
+            .ok_or_else(|| DsrError::CachePolicy("artifact replay length overflow".to_string()))?;
+        let mut writer = self.begin_write(len)?;
+        writer.write_words(words)?;
+        writer.publish()
+    }
+
     /// Repair the per-thread MAP_JIT protection bit inherited by the sole
     /// surviving thread after `fork(2)`.  Quiescence guarantees no writer is
     /// live at the fork instant, so the child always starts executable-only.
