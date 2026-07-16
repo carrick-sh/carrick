@@ -55,6 +55,180 @@ impl ArtifactBindings {
             .copied()
             .ok_or_else(|| DsrError::CachePolicy(format!("missing artifact binding for {kind:?}")))
     }
+
+    fn bind(&mut self, kind: ProcessValue, value: u64) -> Result<(), DsrError> {
+        if let Some(existing) = self.values.insert(kind, value)
+            && existing != value
+        {
+            return Err(DsrError::CachePolicy(format!(
+                "conflicting artifact binding for {kind:?}: 0x{existing:x} versus 0x{value:x}"
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum MaterializedValue {
+    Guest(u64),
+    Process(ProcessValue, u64),
+}
+
+impl MaterializedValue {
+    pub(super) const fn raw(self) -> u64 {
+        match self {
+            Self::Guest(value) | Self::Process(_, value) => value,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingRelocation {
+    first_word: u32,
+    register: u8,
+    value: ProcessValue,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct ArtifactRecording {
+    bindings: BTreeMap<ProcessValue, u64>,
+    relocations: Vec<PendingRelocation>,
+}
+
+impl ArtifactRecording {
+    pub(super) fn bind(&mut self, kind: ProcessValue, value: u64) -> Result<(), DsrError> {
+        let mut bindings = ArtifactBindings {
+            values: std::mem::take(&mut self.bindings),
+        };
+        let result = bindings.bind(kind, value);
+        self.bindings = bindings.values;
+        result
+    }
+
+    pub(super) fn record_mov_wide(
+        &mut self,
+        first_byte: CacheOffset,
+        register: u32,
+        value: MaterializedValue,
+    ) -> Result<(), DsrError> {
+        let MaterializedValue::Process(kind, raw) = value else {
+            return Ok(());
+        };
+        self.bind(kind, raw)?;
+        let first_word = first_byte.get().checked_div(4).ok_or_else(|| {
+            DsrError::CachePolicy("artifact relocation offset overflow".to_string())
+        })?;
+        self.relocations.push(PendingRelocation {
+            first_word,
+            register: u8::try_from(register).map_err(|_| {
+                DsrError::CachePolicy(format!(
+                    "artifact MOV-wide register does not fit u8: {register}"
+                ))
+            })?,
+            value: kind,
+        });
+        Ok(())
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "finishing a recording captures code and all replay metadata"
+    )]
+    pub(super) fn finish(
+        self,
+        words: Vec<u32>,
+        map: Vec<PcMapEntry>,
+        recovery: Vec<RecoveryEntry>,
+        direct_links: Vec<DirectLink>,
+        source_words: Vec<u32>,
+    ) -> Result<ArtifactRecord, DsrError> {
+        let bindings = ArtifactBindings {
+            values: self.bindings,
+        };
+        let recorded_starts = self
+            .relocations
+            .iter()
+            .map(|relocation| relocation.first_word)
+            .collect::<BTreeSet<_>>();
+        for first in 0..words.len().saturating_sub(3) {
+            let sequence = &words[first..first + 4];
+            let register = sequence[0] & 0x1f;
+            let is_mov_wide = sequence.iter().enumerate().all(|(halfword, word)| {
+                let expected = if halfword == 0 {
+                    0xd280_0000
+                } else {
+                    0xf280_0000
+                } | ((halfword as u32) << 21)
+                    | register;
+                (*word & !MOV_WIDE_IMM16_MASK) == expected
+            });
+            if !is_mov_wide {
+                continue;
+            }
+            let materialized =
+                sequence
+                    .iter()
+                    .enumerate()
+                    .fold(0_u64, |value, (halfword, word)| {
+                        value | (u64::from((word & MOV_WIDE_IMM16_MASK) >> 5) << (halfword * 16))
+                    });
+            let exact_process_value = bindings.values.values().any(|value| *value == materialized);
+            let biased_literal = bindings
+                .values
+                .get(&ProcessValue::HostBias)
+                .is_some_and(|bias| {
+                    materialized >= *bias
+                        && materialized.saturating_sub(*bias)
+                            < super::super::address::BIASED_GUEST_LITERAL_TARGET_END
+                });
+            let first = u32::try_from(first).map_err(|_| {
+                DsrError::CachePolicy("artifact MOV-wide index exceeds u32".to_string())
+            })?;
+            if (exact_process_value || biased_literal) && !recorded_starts.contains(&first) {
+                return Err(DsrError::CachePolicy(format!(
+                    "unrecorded process-derived MOV-wide value 0x{materialized:x} at word {first}"
+                )));
+            }
+        }
+        let relocations = self
+            .relocations
+            .into_iter()
+            .map(|pending| {
+                let first = usize::try_from(pending.first_word).map_err(|_| {
+                    DsrError::CachePolicy("artifact relocation index overflow".to_string())
+                })?;
+                let slice = words.get(first..first.saturating_add(4)).ok_or_else(|| {
+                    DsrError::CachePolicy(format!(
+                        "recorded artifact relocation at word {first} is incomplete"
+                    ))
+                })?;
+                Ok(ArtifactRelocation {
+                    first_word: pending.first_word,
+                    register: pending.register,
+                    value: pending.value,
+                    expected_opcode_mask: std::array::from_fn(|index| {
+                        slice[index] & !MOV_WIDE_IMM16_MASK
+                    }),
+                })
+            })
+            .collect::<Result<Vec<_>, DsrError>>()?;
+        let template = ArtifactTemplate::normalize(
+            words,
+            map,
+            recovery,
+            direct_links,
+            source_words,
+            relocations,
+            &bindings,
+        )?;
+        Ok(ArtifactRecord { template, bindings })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ArtifactRecord {
+    pub(super) template: ArtifactTemplate,
+    pub(super) bindings: ArtifactBindings,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
