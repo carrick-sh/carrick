@@ -2265,7 +2265,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                                 max_traps,
                                 &plan,
                             ) {
-                                translator.start_next_profile_epoch();
+                                translator.start_next_profile_era_same_image();
                                 tracing::warn!(
                                     %error,
                                     path = resolved,

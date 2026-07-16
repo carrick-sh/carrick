@@ -879,6 +879,7 @@ class NativePerfV2Tests(unittest.TestCase):
         )
         coverage = budget.fusion_coverage(budget.parse_nativeperf(lines))
         self.assertEqual(coverage["unique_site_counts"]["eligible-backend-disabled"], 1)
+        self.assertEqual(coverage["execution_counts"]["eligible-backend-disabled"], 2)
 
     def test_fusion_coverage_sums_distinct_sites_across_exec_epochs(self):
         lines = (

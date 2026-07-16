@@ -554,8 +554,17 @@ impl ThreadTranslator {
     }
 
     pub(super) fn start_next_profile_epoch(&mut self) {
-        self.stats = ResolverStats::default();
+        self.reset_profile_accumulators();
         self.budget.reset_after_exec();
+    }
+
+    pub(super) fn start_next_profile_era_same_image(&mut self) {
+        self.reset_profile_accumulators();
+        self.budget.reset_same_image_profile_era();
+    }
+
+    fn reset_profile_accumulators(&mut self) {
+        self.stats = ResolverStats::default();
         self.profile_finalized = false;
         self.nested_translation_ns = 0;
     }
@@ -3056,6 +3065,43 @@ mod tests {
             })
         );
         assert!(frames.iter().any(|frame| {
+            frame.contains("|frame=fusion-sites-a|")
+                && frame.contains("|fusion_eligible_backend_disabled=1|")
+        }));
+    }
+
+    #[test]
+    fn failed_self_reexec_restart_preserves_image_epoch_and_catalog() {
+        let process = std::sync::Arc::new(
+            super::ProcessTranslator::new(16 * 1024).expect("create translator"),
+        );
+        {
+            let mut state = process.state.write();
+            state.profiling = true;
+            state.record_exclusive_fusion_site(super::types::ExclusiveFusionSite {
+                guest: GuestVa(0x1000),
+                word: 0x885f_7c20,
+                disposition: super::types::ExclusiveFusionDisposition::EligibleBackendDisabled,
+                biased_scratch: None,
+            });
+        }
+        let mut thread = super::ThreadTranslator::for_process(process, 42);
+        thread.budget = super::profile::ThreadBudget::enabled_for_test(41, 42);
+        let before = thread.take_profile_frames().expect("pre-attempt frames");
+
+        thread.start_next_profile_era_same_image();
+
+        let after = thread.take_profile_frames().expect("rollback frames");
+        assert_eq!(
+            protocol_value(&after, "exec_epoch"),
+            protocol_value(&before, "exec_epoch"),
+            "a failed self-reexec did not replace the image"
+        );
+        assert!(
+            protocol_value(&after, "era") > protocol_value(&before, "era"),
+            "rollback must still start a distinct thread profiling era"
+        );
+        assert!(after.iter().any(|frame| {
             frame.contains("|frame=fusion-sites-a|")
                 && frame.contains("|fusion_eligible_backend_disabled=1|")
         }));
