@@ -339,12 +339,16 @@ pub(super) fn plan_block(
     generation: CodeGeneration,
     max_instructions: usize,
 ) -> Result<BlockPlan, DsrError> {
-    // Direct mode keeps its existing fused execution. Biased mode uses the
-    // shared recognizer and fuses only candidates with a complete scratch plan.
+    // Direct mode keeps its existing fused execution. Biased execution stays
+    // fail-closed until forced asynchronous recovery proves that every guest
+    // register and NZCV mutation in an accepted region can be rolled back.
+    // The disabled policy still measures eligible sites and exercises the
+    // typed emitter in focused tests without exposing incomplete recovery to
+    // production guests.
     let fusion_policy = match memory.address_mode() {
         super::super::address::NativeAddressMode::Direct => ExclusiveFusionPolicy::Direct,
         super::super::address::NativeAddressMode::Biased { .. } => {
-            ExclusiveFusionPolicy::BiasedEnabled
+            ExclusiveFusionPolicy::BiasedDisabled
         }
     };
     plan_with_reader(
@@ -481,6 +485,13 @@ fn analyze_exclusive_region(
                 ExclusiveFusionRejection::VirtualizedBase,
             ));
         }
+        if policy != ExclusiveFusionPolicy::Direct
+            && matches!(load_memory.base, MemoryBase::Register(register) if register == bad64::Reg::SP)
+        {
+            return Ok(ExclusiveRegionAnalysis::Rejected(
+                ExclusiveFusionRejection::BiasedAddressFormUnsupported,
+            ));
+        }
         // The load's transfer register must not be x18/x28 either. native16k keeps
         // the guest's x18/x28 in a spill slot (physical x18/x28 are carrick's own
         // reserved registers), so emitting the exclusive verbatim would read/write
@@ -504,6 +515,7 @@ fn analyze_exclusive_region(
         let mut pc = checked_next(start)?;
         let mut found_exit_branch = false;
         let mut early_exit_word: Option<u32> = None;
+        let mut early_exit_target: Option<GuestVa> = None;
         let mut store: Option<(GuestVa, u32)> = None;
 
         for _ in 1..EXCLUSIVE_REGION_SCAN_LIMIT {
@@ -591,6 +603,7 @@ fn analyze_exclusive_region(
                         ));
                     }
                     found_exit_branch = true;
+                    early_exit_target = Some(exit.target);
                     // The raw word is dropped from `InstAction::Direct`; capture it
                     // so the emitter can re-encode the early-exit edge verbatim.
                     early_exit_word = Some(word);
@@ -670,6 +683,13 @@ fn analyze_exclusive_region(
         }
 
         let end = checked_next(retry_pc)?;
+        if early_exit_target
+            .is_some_and(|target| target.raw() >= start.raw() && target.raw() < end.raw())
+        {
+            return Ok(ExclusiveRegionAnalysis::Rejected(
+                ExclusiveFusionRejection::UnsupportedControlFlow,
+            ));
+        }
         let biased_scratch = biased_exclusive_scratch(&scratch_instructions, retry_pc, retry_word);
         Ok(ExclusiveRegionAnalysis::Candidate {
             instructions,
@@ -1156,6 +1176,34 @@ mod tests {
         }
 
         #[test]
+        fn falls_back_when_an_early_conditional_branch_targets_inside_the_region() {
+            let start = GuestVa(0x4000);
+            let branch_pc = GuestVa(0x4008);
+            let store_pc = GuestVa(0x400c);
+            let retry_pc = GuestVa(0x4010);
+            let words = [
+                LDAXR_W0_X1,
+                CMP_W0_W2,
+                encode_b_cond(branch_pc, store_pc, COND_NE),
+                STLXR_W3_W4_X1,
+                encode_cbnz_w(retry_pc, start, 3),
+            ];
+            for policy in [
+                ExclusiveFusionPolicy::Direct,
+                ExclusiveFusionPolicy::BiasedEnabled,
+            ] {
+                let analysis = exclusive_region_words(&words, start, LDAXR_W0_X1, policy, 0x1000)
+                    .expect("scan must not error");
+                assert_eq!(
+                    analysis,
+                    ExclusiveRegionAnalysis::Rejected(
+                        ExclusiveFusionRejection::UnsupportedControlFlow
+                    )
+                );
+            }
+        }
+
+        #[test]
         fn falls_back_on_a_syscall_inside_the_region() {
             let start = GuestVa(0x4000);
             let words = [
@@ -1573,9 +1621,11 @@ mod tests {
         }
 
         fn plan_biased_memory_via_production(words: &[u32]) -> BlockPlan {
+            static FIXTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
             const BIAS: u64 = 0x80_0000_0000;
             const PAGE_SIZE: u64 = 16 * 1024;
             const GUEST_CODE: GuestVa = GuestVa(0x21_0000_0000);
+            let _fixture_guard = FIXTURE_LOCK.lock().expect("lock biased planner fixture");
             let host_bias = crate::native_darwin::address::NativeHostBias::new(BIAS, PAGE_SIZE)
                 .expect("construct biased planner host bias");
             let mapping = crate::native_darwin::address::OwnedHostMapping::map_exact(
@@ -1634,17 +1684,17 @@ mod tests {
         }
 
         #[test]
-        fn production_biased_exclusive_planner_fuses_only_safe_scratch_candidates() {
+        fn production_biased_exclusive_planner_records_only_safe_scratch_candidates() {
             let start = GuestVa(0x21_0000_0000);
             let eligible = plan_biased_memory_via_production(&canonical_cas(start));
             assert!(matches!(
                 eligible.exit,
-                PlannedExit::ExclusiveRegion {
-                    fusion: ExclusiveFusionSite {
-                        disposition: ExclusiveFusionDisposition::FusedBiased,
+                PlannedExit::Sensitive {
+                    fusion: Some(ExclusiveFusionSite {
+                        disposition: ExclusiveFusionDisposition::EligibleBackendDisabled,
                         biased_scratch: Some(_),
                         ..
-                    },
+                    }),
                     ..
                 }
             ));
@@ -1669,6 +1719,45 @@ mod tests {
                     fusion: Some(ExclusiveFusionSite {
                         disposition: ExclusiveFusionDisposition::Rejected(
                             ExclusiveFusionRejection::BiasedNoSafeScratch
+                        ),
+                        biased_scratch: None,
+                        ..
+                    }),
+                    ..
+                }
+            ));
+        }
+
+        #[test]
+        fn production_biased_planner_falls_back_for_sp_based_exclusive_region() {
+            let start = GuestVa(0x21_0000_0000);
+            let load_word = with_base_register(LDAXR_W0_X1, 31);
+            let store_word = with_base_register(STLXR_W3_W4_X1, 31);
+            let words = [
+                load_word,
+                CMP_W0_W2,
+                store_word,
+                encode_cbnz_w(GuestVa(start.raw() + 12), start, 3),
+            ];
+            let direct = plan_via_production(&words, start, ExclusiveFusionPolicy::Direct, 0x1000);
+            assert!(matches!(
+                direct.exit,
+                PlannedExit::ExclusiveRegion {
+                    fusion: ExclusiveFusionSite {
+                        disposition: ExclusiveFusionDisposition::FusedDirect,
+                        ..
+                    },
+                    ..
+                }
+            ));
+
+            let plan = plan_biased_memory_via_production(&words);
+            assert!(matches!(
+                plan.exit,
+                PlannedExit::Sensitive {
+                    fusion: Some(ExclusiveFusionSite {
+                        disposition: ExclusiveFusionDisposition::Rejected(
+                            ExclusiveFusionRejection::BiasedAddressFormUnsupported
                         ),
                         biased_scratch: None,
                         ..
