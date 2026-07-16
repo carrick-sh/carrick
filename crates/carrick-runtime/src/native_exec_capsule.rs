@@ -65,12 +65,43 @@ pub(crate) struct NativeGuestExecV1 {
     /// verbatim instead of measuring a second window.
     #[serde(default)]
     pub(crate) profile_startup: Option<NativeReexecProfileStartupV1>,
+    /// Cumulative per-pid exclusive-fusion site identities. The post-exec
+    /// translator restores this exact catalog before translating the new
+    /// image, preserving both cross-era uniqueness and retranslation dedupe.
+    #[serde(default)]
+    pub(crate) profile_exclusive_fusion_sites: Vec<NativeReexecExclusiveFusionSiteV1>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct NativeReexecProfileStartupV1 {
     pub(crate) startup_wall_ns: u64,
     pub(crate) startup_cpu_ns: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct NativeReexecExclusiveFusionSiteV1 {
+    pub(crate) class: NativeReexecExclusiveFusionClassV1,
+    pub(crate) guest_pc: u64,
+    pub(crate) instruction: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum NativeReexecExclusiveFusionClassV1 {
+    FusedDirect,
+    FusedBiased,
+    EligibleBackendDisabled,
+    NotLoad,
+    VirtualizedBase,
+    VirtualizedOperand,
+    PageBoundary,
+    ScanLimitOrNoStore,
+    MismatchedStore,
+    UnsupportedBodyMemoryOrSensitive,
+    UnsupportedControlFlow,
+    InvalidRetryEdge,
+    BiasedNoSafeScratch,
+    BiasedAddressFormUnsupported,
+    AnalysisUnavailable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -232,6 +263,7 @@ pub(crate) fn begin_guest_exec(
     env: Vec<Vec<u8>>,
     executable_digest: [u8; 32],
     max_traps: usize,
+    profile_exclusive_fusion_sites: Vec<NativeReexecExclusiveFusionSiteV1>,
     plan: &crate::page_profile::ExecutionPlan,
 ) -> anyhow::Result<()> {
     emit_lifecycle(
@@ -303,6 +335,7 @@ pub(crate) fn begin_guest_exec(
                     startup_cpu_ns,
                 },
             ),
+            profile_exclusive_fusion_sites,
         }),
     };
     let prepared_artifact = attach_prepared_image(
@@ -1054,6 +1087,11 @@ mod tests {
                     startup_wall_ns: 11,
                     startup_cpu_ns: 5,
                 }),
+                profile_exclusive_fusion_sites: vec![super::NativeReexecExclusiveFusionSiteV1 {
+                    class: super::NativeReexecExclusiveFusionClassV1::EligibleBackendDisabled,
+                    guest_pc: 0x1000,
+                    instruction: 0x885f_7c20,
+                }],
             }),
         }
     }
@@ -1289,6 +1327,27 @@ mod tests {
             serde_json::from_value(value).expect("decode prior V1 payload");
         let guest = decoded.guest_exec.expect("guest payload");
         assert!(guest.profile_startup.is_none());
+    }
+
+    #[test]
+    fn legacy_v1_payload_without_fusion_sites_defaults_to_empty() {
+        let payload = sample();
+        let mut value = serde_json::to_value(payload).expect("serialize capsule");
+        value
+            .get_mut("guest_exec")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("guest payload")
+            .remove("profile_exclusive_fusion_sites");
+
+        let decoded: NativeExecCapsuleV1 =
+            serde_json::from_value(value).expect("decode prior V1 payload");
+        assert!(
+            decoded
+                .guest_exec
+                .expect("guest payload")
+                .profile_exclusive_fusion_sites
+                .is_empty()
+        );
     }
 
     #[test]

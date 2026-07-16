@@ -530,6 +530,9 @@ impl ThreadTranslator {
         if let Some(frames) = self.take_profile_frames() {
             sink(&frames);
         }
+        if !Arc::ptr_eq(&self.process, &next) {
+            next.inherit_exclusive_fusion_sites(&self.process);
+        }
         self.process = next;
         self.resume_entry = None;
         self.indirect_cache.clear();
@@ -717,6 +720,12 @@ impl ThreadTranslator {
         if let Some(frames) = self.take_profile_frames() {
             let _ = profile::write_protocol_frames_to_fd(libc::STDERR_FILENO, &frames);
         }
+    }
+
+    pub(super) fn exclusive_fusion_sites_for_reexec(
+        &self,
+    ) -> Vec<crate::native_exec_capsule::NativeReexecExclusiveFusionSiteV1> {
+        self.process.exclusive_fusion_sites_for_reexec()
     }
 
     /// Register (first call) or republish (every later call) this thread's
@@ -937,6 +946,61 @@ impl ProcessTranslator {
         )
     }
 
+    /// A PID-preserving exec replaces the translation cache but not the
+    /// process identity used by NATIVEPERF's process gauges. Carry the
+    /// cumulative unique-site catalog into the replacement translator so the
+    /// analyzer's per-PID maximum observes the union across every exec era.
+    fn inherit_exclusive_fusion_sites(&self, prior: &Self) {
+        let prior = prior.state.read();
+        let mut next = self.state.write();
+        if !next.profiling {
+            return;
+        }
+        for (next_sites, prior_sites) in next
+            .exclusive_fusion_sites
+            .iter_mut()
+            .zip(&prior.exclusive_fusion_sites)
+        {
+            next_sites.extend(prior_sites.iter().copied());
+        }
+    }
+
+    fn exclusive_fusion_sites_for_reexec(
+        &self,
+    ) -> Vec<crate::native_exec_capsule::NativeReexecExclusiveFusionSiteV1> {
+        let state = self.state.read();
+        if !state.profiling {
+            return Vec::new();
+        }
+        profile::ExclusiveFusionClass::ALL
+            .into_iter()
+            .zip(&state.exclusive_fusion_sites)
+            .flat_map(|(class, sites)| {
+                sites.iter().map(move |&(guest_pc, instruction)| {
+                    crate::native_exec_capsule::NativeReexecExclusiveFusionSiteV1 {
+                        class: native_reexec_fusion_class(class),
+                        guest_pc,
+                        instruction,
+                    }
+                })
+            })
+            .collect()
+    }
+
+    pub(super) fn restore_exclusive_fusion_sites_from_reexec(
+        &self,
+        sites: &[crate::native_exec_capsule::NativeReexecExclusiveFusionSiteV1],
+    ) {
+        let mut state = self.state.write();
+        if !state.profiling {
+            return;
+        }
+        for site in sites {
+            let class = fusion_class_from_native_reexec(site.class);
+            state.exclusive_fusion_sites[class.index()].insert((site.guest_pc, site.instruction));
+        }
+    }
+
     fn after_fork_child(&self) {
         let mut state = self.state.write();
         state.cache.after_fork_child();
@@ -960,6 +1024,60 @@ impl ProcessTranslator {
         state.unsupported.clear();
         state.dependencies = cache::PageBlockDependencies::default();
         state.publications.reset_for_exec();
+    }
+}
+
+fn native_reexec_fusion_class(
+    class: profile::ExclusiveFusionClass,
+) -> crate::native_exec_capsule::NativeReexecExclusiveFusionClassV1 {
+    use crate::native_exec_capsule::NativeReexecExclusiveFusionClassV1 as Reexec;
+    match class {
+        profile::ExclusiveFusionClass::FusedDirect => Reexec::FusedDirect,
+        profile::ExclusiveFusionClass::FusedBiased => Reexec::FusedBiased,
+        profile::ExclusiveFusionClass::EligibleBackendDisabled => Reexec::EligibleBackendDisabled,
+        profile::ExclusiveFusionClass::NotLoad => Reexec::NotLoad,
+        profile::ExclusiveFusionClass::VirtualizedBase => Reexec::VirtualizedBase,
+        profile::ExclusiveFusionClass::VirtualizedOperand => Reexec::VirtualizedOperand,
+        profile::ExclusiveFusionClass::PageBoundary => Reexec::PageBoundary,
+        profile::ExclusiveFusionClass::ScanLimitOrNoStore => Reexec::ScanLimitOrNoStore,
+        profile::ExclusiveFusionClass::MismatchedStore => Reexec::MismatchedStore,
+        profile::ExclusiveFusionClass::UnsupportedBodyMemoryOrSensitive => {
+            Reexec::UnsupportedBodyMemoryOrSensitive
+        }
+        profile::ExclusiveFusionClass::UnsupportedControlFlow => Reexec::UnsupportedControlFlow,
+        profile::ExclusiveFusionClass::InvalidRetryEdge => Reexec::InvalidRetryEdge,
+        profile::ExclusiveFusionClass::BiasedNoSafeScratch => Reexec::BiasedNoSafeScratch,
+        profile::ExclusiveFusionClass::BiasedAddressFormUnsupported => {
+            Reexec::BiasedAddressFormUnsupported
+        }
+        profile::ExclusiveFusionClass::AnalysisUnavailable => Reexec::AnalysisUnavailable,
+    }
+}
+
+fn fusion_class_from_native_reexec(
+    class: crate::native_exec_capsule::NativeReexecExclusiveFusionClassV1,
+) -> profile::ExclusiveFusionClass {
+    use crate::native_exec_capsule::NativeReexecExclusiveFusionClassV1 as Reexec;
+    match class {
+        Reexec::FusedDirect => profile::ExclusiveFusionClass::FusedDirect,
+        Reexec::FusedBiased => profile::ExclusiveFusionClass::FusedBiased,
+        Reexec::EligibleBackendDisabled => profile::ExclusiveFusionClass::EligibleBackendDisabled,
+        Reexec::NotLoad => profile::ExclusiveFusionClass::NotLoad,
+        Reexec::VirtualizedBase => profile::ExclusiveFusionClass::VirtualizedBase,
+        Reexec::VirtualizedOperand => profile::ExclusiveFusionClass::VirtualizedOperand,
+        Reexec::PageBoundary => profile::ExclusiveFusionClass::PageBoundary,
+        Reexec::ScanLimitOrNoStore => profile::ExclusiveFusionClass::ScanLimitOrNoStore,
+        Reexec::MismatchedStore => profile::ExclusiveFusionClass::MismatchedStore,
+        Reexec::UnsupportedBodyMemoryOrSensitive => {
+            profile::ExclusiveFusionClass::UnsupportedBodyMemoryOrSensitive
+        }
+        Reexec::UnsupportedControlFlow => profile::ExclusiveFusionClass::UnsupportedControlFlow,
+        Reexec::InvalidRetryEdge => profile::ExclusiveFusionClass::InvalidRetryEdge,
+        Reexec::BiasedNoSafeScratch => profile::ExclusiveFusionClass::BiasedNoSafeScratch,
+        Reexec::BiasedAddressFormUnsupported => {
+            profile::ExclusiveFusionClass::BiasedAddressFormUnsupported
+        }
+        Reexec::AnalysisUnavailable => profile::ExclusiveFusionClass::AnalysisUnavailable,
     }
 }
 
@@ -3047,6 +3165,102 @@ mod tests {
             .find_map(|field| field.strip_prefix(&format!("{key}=")))
             .and_then(|value| value.parse().ok())
             .unwrap_or_else(|| panic!("missing protocol field {key}"))
+    }
+
+    fn protocol_frame_value(frames: &[String], frame: &str, key: &str) -> u64 {
+        frames
+            .iter()
+            .find(|line| line.contains(&format!("|frame={frame}|")))
+            .into_iter()
+            .flat_map(|line| line.split('|'))
+            .find_map(|field| field.strip_prefix(&format!("{key}=")))
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_else(|| panic!("missing protocol field {frame}.{key}"))
+    }
+
+    #[test]
+    fn exec_handoff_keeps_unique_fusion_sites_cumulative_for_the_pid() {
+        let old = std::sync::Arc::new(
+            super::ProcessTranslator::new(16 * 1024).expect("create old translator"),
+        );
+        let next = std::sync::Arc::new(
+            super::ProcessTranslator::new(16 * 1024).expect("create next translator"),
+        );
+        let site = |guest, word| super::types::ExclusiveFusionSite {
+            guest: GuestVa(guest),
+            word,
+            disposition: super::types::ExclusiveFusionDisposition::EligibleBackendDisabled,
+            biased_scratch: None,
+        };
+        {
+            let mut state = old.state.write();
+            state.profiling = true;
+            state.record_exclusive_fusion_site(site(0x1000, 0x885f_7c20));
+        }
+        next.state.write().profiling = true;
+        let mut thread = super::ThreadTranslator::for_process(old, 42);
+        thread.budget = super::profile::ThreadBudget::enabled_for_test(41, 42);
+        let mut prior_frames = None;
+
+        thread.reset_for_exec_with_sink(next, |frames| {
+            prior_frames = Some(frames.to_vec());
+        });
+        thread
+            .process
+            .state
+            .write()
+            .record_exclusive_fusion_site(site(0x2000, 0x885f_7c41));
+        let next_frames = thread.take_profile_frames().expect("next era frames");
+        let prior_frames = prior_frames.expect("prior era frames");
+
+        assert_eq!(
+            protocol_frame_value(
+                &prior_frames,
+                "fusion-sites-a",
+                "fusion_eligible_backend_disabled"
+            ),
+            1
+        );
+        assert_eq!(
+            protocol_frame_value(
+                &next_frames,
+                "fusion-sites-a",
+                "fusion_eligible_backend_disabled"
+            ),
+            2,
+            "the same PID's post-exec gauge must include both distinct sites"
+        );
+    }
+
+    #[test]
+    fn self_reexec_catalog_preserves_identity_and_dedupe() {
+        let old = super::ProcessTranslator::new(16 * 1024).expect("create old translator");
+        let next = super::ProcessTranslator::new(16 * 1024).expect("create next translator");
+        let site = |guest, word| super::types::ExclusiveFusionSite {
+            guest: GuestVa(guest),
+            word,
+            disposition: super::types::ExclusiveFusionDisposition::EligibleBackendDisabled,
+            biased_scratch: None,
+        };
+        {
+            let mut state = old.state.write();
+            state.profiling = true;
+            state.record_exclusive_fusion_site(site(0x1000, 0x885f_7c20));
+        }
+        let catalog = old.exclusive_fusion_sites_for_reexec();
+        next.state.write().profiling = true;
+
+        next.restore_exclusive_fusion_sites_from_reexec(&catalog);
+        next.restore_exclusive_fusion_sites_from_reexec(&catalog);
+        next.state
+            .write()
+            .record_exclusive_fusion_site(site(0x2000, 0x885f_7c41));
+
+        assert_eq!(
+            next.state.read().exclusive_fusion_site_counts()
+                [super::profile::ExclusiveFusionClass::EligibleBackendDisabled.index()],
+            2
+        );
     }
 
     #[test]

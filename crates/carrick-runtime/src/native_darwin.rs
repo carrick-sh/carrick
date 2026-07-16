@@ -905,6 +905,7 @@ pub(crate) fn resume_guest_from_capsule(
     argv: Vec<Vec<u8>>,
     env: Vec<Vec<u8>>,
 ) -> anyhow::Result<i32> {
+    let profile_exclusive_fusion_sites = std::mem::take(&mut guest.profile_exclusive_fusion_sites);
     // Startup attribution across the PID-preserving host self-reexec: the
     // pid's startup window was captured exactly once in the pre-exec image,
     // so republish that claim verbatim (one pid, one gauge). Without an
@@ -1017,6 +1018,7 @@ pub(crate) fn resume_guest_from_capsule(
         max_traps,
         &plan,
         NativeCurrentProcessEntry::SelfReexecRestore,
+        &profile_exclusive_fusion_sites,
     )
     .map_err(anyhow::Error::from)
 }
@@ -1224,6 +1226,7 @@ fn run_image_in_child(
             max_traps,
             plan,
             NativeCurrentProcessEntry::Initial,
+            &[],
         ) {
             Ok(code) => unsafe { libc::_exit(code) },
             Err(err) => {
@@ -1265,12 +1268,20 @@ fn run_image_in_current_process(
     max_traps: usize,
     plan: &ExecutionPlan,
     process_entry: NativeCurrentProcessEntry,
+    profile_exclusive_fusion_sites: &[
+        crate::native_exec_capsule::NativeReexecExclusiveFusionSiteV1
+    ],
 ) -> Result<i32, RuntimeError> {
     let initial_sp = source.image().initial_stack_pointer().ok_or_else(|| {
         RuntimeError::Unsupported("native Darwin image has no initial stack".to_string())
     })?;
     let entry = source.image().entry();
     let (memory, image) = map_current_process_image_source(source, plan, process_entry)?;
+    if !profile_exclusive_fusion_sites.is_empty() {
+        memory
+            .dsr_process_translator()?
+            .restore_exclusive_fusion_sites_from_reexec(profile_exclusive_fusion_sites);
+    }
     let memory = Arc::new(NativeMemoryHandle::new(memory));
     let _ = crate::ulock::preinit_waiter_table();
     // PID-namespace launch placement (container path only; `run-elf` never
@@ -2248,6 +2259,11 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                                 )?;
                                 continue;
                             }
+                            let profile_exclusive_fusion_sites = if PROFILE {
+                                translator.exclusive_fusion_sites_for_reexec()
+                            } else {
+                                Vec::new()
+                            };
                             translator.finalize_profile_epoch();
                             if let Err(error) = crate::native_exec_capsule::begin_guest_exec(
                                 &dispatcher,
@@ -2258,6 +2274,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                                 capsule_env,
                                 executable_digest,
                                 max_traps,
+                                profile_exclusive_fusion_sites,
                                 &plan,
                             ) {
                                 translator.start_next_profile_epoch();
