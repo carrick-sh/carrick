@@ -9,6 +9,17 @@
 
 mod address;
 mod dsr;
+
+pub(crate) fn artifact_spike_authority_snapshot_if_enabled()
+-> anyhow::Result<Option<crate::native_exec_capsule::NativeReexecArtifactSpikeV1>> {
+    dsr::artifact_spike::authority_snapshot_if_enabled()
+}
+
+pub(crate) fn adopt_artifact_spike_for_resume(
+    snapshot: &crate::native_exec_capsule::NativeReexecArtifactSpikeV1,
+) -> anyhow::Result<()> {
+    dsr::artifact_spike::adopt_for_resume(snapshot)
+}
 mod mapped_memory;
 
 use address::{NativeAddressMode, NativeLayout};
