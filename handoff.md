@@ -244,14 +244,18 @@ exceeds the order-of-magnitude cutoff.
 
 ### Next work
 
-1. Fix the NATIVEPERF nested-subphase accounting fragility so the enabled W1
-   profile reconciles reliably without relying on a failed-outcome record.
+1. Keep the compiler step-function blocker first. Do not rerun unchanged c94:
+   the current enabled result was already 46.33x the Docker oracle. Evaluate
+   the next runtime change with the bounded exact c94 lane and require material
+   improvement before resuming the broader Go/CPython/native-default ladder.
 2. If continuing exclusive fusion, design against the measured
    `biased-no-safe-scratch` class (1,777,174 executions), while recognizing it
    is tied within one execution of `not-load`; preserve the existing typed
    recovery and fallback rules.
-3. Require a fresh untraced W1 and bounded c94 result to show a material win
-   before promoting another optimization. Do not raise the gateway ceiling or
+3. Use a fresh untraced W1 and bounded c94 result to prove a material win before
+   promoting another optimization. Do not raise the gateway ceiling or
    timeout, and keep Docker phases separate.
-4. Resume the broader Go/CPython/native-default ladder only after the compiler
-   blocker has materially improved.
+4. Treat the NATIVEPERF nested-subphase accounting fragility as optional,
+   supporting measurement debt. Fix it when a profiled census is needed to
+   select or explain the next runtime change, but do not let it block the
+   c94-first performance campaign.
