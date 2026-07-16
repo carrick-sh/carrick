@@ -65,43 +65,16 @@ pub(crate) struct NativeGuestExecV1 {
     /// verbatim instead of measuring a second window.
     #[serde(default)]
     pub(crate) profile_startup: Option<NativeReexecProfileStartupV1>,
-    /// Cumulative per-pid exclusive-fusion site identities. The post-exec
-    /// translator restores this exact catalog before translating the new
-    /// image, preserving both cross-era uniqueness and retranslation dedupe.
+    /// Bounded identity for the guest image's profiling epoch. The exact site
+    /// catalog remains process-local and is never added to this capsule.
     #[serde(default)]
-    pub(crate) profile_exclusive_fusion_sites: Vec<NativeReexecExclusiveFusionSiteV1>,
+    pub(crate) profile_exec_epoch: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct NativeReexecProfileStartupV1 {
     pub(crate) startup_wall_ns: u64,
     pub(crate) startup_cpu_ns: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct NativeReexecExclusiveFusionSiteV1 {
-    pub(crate) class: NativeReexecExclusiveFusionClassV1,
-    pub(crate) guest_pc: u64,
-    pub(crate) instruction: u32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum NativeReexecExclusiveFusionClassV1 {
-    FusedDirect,
-    FusedBiased,
-    EligibleBackendDisabled,
-    NotLoad,
-    VirtualizedBase,
-    VirtualizedOperand,
-    PageBoundary,
-    ScanLimitOrNoStore,
-    MismatchedStore,
-    UnsupportedBodyMemoryOrSensitive,
-    UnsupportedControlFlow,
-    InvalidRetryEdge,
-    BiasedNoSafeScratch,
-    BiasedAddressFormUnsupported,
-    AnalysisUnavailable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -263,7 +236,6 @@ pub(crate) fn begin_guest_exec(
     env: Vec<Vec<u8>>,
     executable_digest: [u8; 32],
     max_traps: usize,
-    profile_exclusive_fusion_sites: Vec<NativeReexecExclusiveFusionSiteV1>,
     plan: &crate::page_profile::ExecutionPlan,
 ) -> anyhow::Result<()> {
     emit_lifecycle(
@@ -335,7 +307,7 @@ pub(crate) fn begin_guest_exec(
                     startup_cpu_ns,
                 },
             ),
-            profile_exclusive_fusion_sites,
+            profile_exec_epoch: crate::native_darwin::next_native_profile_exec_epoch_for_reexec(),
         }),
     };
     let prepared_artifact = attach_prepared_image(
@@ -1087,11 +1059,7 @@ mod tests {
                     startup_wall_ns: 11,
                     startup_cpu_ns: 5,
                 }),
-                profile_exclusive_fusion_sites: vec![super::NativeReexecExclusiveFusionSiteV1 {
-                    class: super::NativeReexecExclusiveFusionClassV1::EligibleBackendDisabled,
-                    guest_pc: 0x1000,
-                    instruction: 0x885f_7c20,
-                }],
+                profile_exec_epoch: 7,
             }),
         }
     }
@@ -1330,23 +1298,23 @@ mod tests {
     }
 
     #[test]
-    fn legacy_v1_payload_without_fusion_sites_defaults_to_empty() {
+    fn legacy_v1_payload_without_profile_exec_epoch_defaults_to_zero() {
         let payload = sample();
         let mut value = serde_json::to_value(payload).expect("serialize capsule");
         value
             .get_mut("guest_exec")
             .and_then(serde_json::Value::as_object_mut)
             .expect("guest payload")
-            .remove("profile_exclusive_fusion_sites");
+            .remove("profile_exec_epoch");
 
         let decoded: NativeExecCapsuleV1 =
             serde_json::from_value(value).expect("decode prior V1 payload");
-        assert!(
+        assert_eq!(
             decoded
                 .guest_exec
                 .expect("guest payload")
-                .profile_exclusive_fusion_sites
-                .is_empty()
+                .profile_exec_epoch,
+            0
         );
     }
 
@@ -1652,6 +1620,56 @@ mod tests {
         let decoded = read_capsule_once(file.as_raw_fd(), nonce).expect("read capsule");
         assert_eq!(decoded, sample());
         assert!(read_capsule_once(file.as_raw_fd(), nonce).is_err());
+    }
+
+    #[test]
+    fn profile_exec_epoch_is_bounded_and_authenticated() {
+        let mut low = sample();
+        low.guest_exec
+            .as_mut()
+            .expect("guest payload")
+            .profile_exec_epoch = 0;
+        let mut high = low.clone();
+        high.guest_exec
+            .as_mut()
+            .expect("guest payload")
+            .profile_exec_epoch = u64::MAX;
+        let nonce = [0x71; 16];
+        let low_file = tempfile::tempfile().expect("low epoch capsule");
+        let high_file = tempfile::tempfile().expect("high epoch capsule");
+        write_capsule(low_file.as_raw_fd(), nonce, &low).expect("write low epoch capsule");
+        write_capsule(high_file.as_raw_fd(), nonce, &high).expect("write high epoch capsule");
+        let mut low_header = [0_u8; HEADER_LEN];
+        let mut high_header = [0_u8; HEADER_LEN];
+        low_file
+            .read_exact_at(&mut low_header, 0)
+            .expect("read low epoch header");
+        high_file
+            .read_exact_at(&mut high_header, 0)
+            .expect("read high epoch header");
+
+        assert!(
+            low_file
+                .metadata()
+                .expect("low metadata")
+                .len()
+                .abs_diff(high_file.metadata().expect("high metadata").len())
+                <= 24,
+            "the scalar epoch must add only a constant-size encoding"
+        );
+        assert_ne!(
+            &low_header[20..52],
+            &high_header[20..52],
+            "the authenticated payload digest must cover exec_epoch"
+        );
+        assert_eq!(
+            read_capsule_once(high_file.as_raw_fd(), nonce)
+                .expect("read high epoch capsule")
+                .guest_exec
+                .expect("guest payload")
+                .profile_exec_epoch,
+            u64::MAX
+        );
     }
 
     #[test]

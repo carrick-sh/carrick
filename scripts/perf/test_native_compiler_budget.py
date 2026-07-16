@@ -647,9 +647,11 @@ def nativeperf_frames_v2(
     return lines
 
 
-def nativeperf_frames_v3(pid=10, tid=11, era=12):
+def nativeperf_frames_v3(pid=10, tid=11, era=12, exec_epoch=0):
     prefix = f"NATIVEPERF1|thread|complete=1|pid={pid}|tid={tid}|era={era}|frame="
-    return nativeperf_frames_v2(pid=pid, tid=tid, era=era) + [
+    inherited = nativeperf_frames_v2(pid=pid, tid=tid, era=era)
+    inherited[0] += f"|exec_epoch={exec_epoch}"
+    return inherited + [
         prefix
         + "fusion-exec-a|fusion_fused_direct=0|fusion_fused_biased=0|"
         "fusion_eligible_backend_disabled=0|fusion_not_load=0|"
@@ -676,9 +678,9 @@ def nativeperf_frames_v3(pid=10, tid=11, era=12):
 
 
 def nativeperf_frames_v3_with_exclusive(
-    pid=10, tid=11, era=12, *, executions=1, unique_sites=1
+    pid=10, tid=11, era=12, exec_epoch=0, *, executions=1, unique_sites=1
 ):
-    lines = nativeperf_frames_v3(pid=pid, tid=tid, era=era)
+    lines = nativeperf_frames_v3(pid=pid, tid=tid, era=era, exec_epoch=exec_epoch)
     lines[1] = lines[1].replace("exit_resolve_direct=1", "exit_resolve_direct=0").replace(
         "exit_sensitive=0", "exit_sensitive=1"
     )
@@ -827,6 +829,12 @@ class NativePerfV2Tests(unittest.TestCase):
         ):
             budget.parse_nativeperf(nativeperf_frames_v3()[:-1])
 
+    def test_v3_requires_exec_epoch_identity(self):
+        missing = nativeperf_frames_v3()
+        missing[0] = missing[0].replace("|exec_epoch=0", "")
+        with self.assertRaisesRegex(budget.BudgetError, "missing exec_epoch"):
+            budget.parse_nativeperf(missing)
+
     def test_v3_wire_round_trip_uses_the_exact_frame_contract(self):
         profile = budget.parse_nativeperf(nativeperf_frames_v3())
         record = budget.RunRecord.synthetic(profile=profile, schedule_label="on-1")
@@ -839,17 +847,50 @@ class NativePerfV2Tests(unittest.TestCase):
         with self.assertRaisesRegex(budget.BudgetError, "profile value"):
             budget.parse_result_row(extra)
 
-    def test_fusion_coverage_sums_executions_and_maxes_sites_per_process(self):
+    def test_fusion_coverage_sums_exec_epochs_and_maxes_thread_eras(self):
         lines = (
-            nativeperf_frames_v3_with_exclusive(pid=10, tid=11, era=1, unique_sites=1)
-            + nativeperf_frames_v3_with_exclusive(pid=10, tid=11, era=2, unique_sites=2)
-            + nativeperf_frames_v3_with_exclusive(pid=20, tid=21, era=1, unique_sites=3)
+            nativeperf_frames_v3_with_exclusive(
+                pid=10, tid=11, era=1, exec_epoch=0, unique_sites=1
+            )
+            + nativeperf_frames_v3_with_exclusive(
+                pid=10, tid=11, era=2, exec_epoch=0, unique_sites=1
+            )
+            + nativeperf_frames_v3_with_exclusive(
+                pid=10, tid=11, era=3, exec_epoch=1, unique_sites=1
+            )
+            + nativeperf_frames_v3_with_exclusive(
+                pid=20, tid=21, era=1, exec_epoch=0, unique_sites=3
+            )
         )
         coverage = budget.fusion_coverage(budget.parse_nativeperf(lines))
-        self.assertEqual(coverage["residual_exclusive_gateways"], 3)
-        self.assertEqual(coverage["execution_counts"]["eligible-backend-disabled"], 3)
+        self.assertEqual(coverage["residual_exclusive_gateways"], 4)
+        self.assertEqual(coverage["execution_counts"]["eligible-backend-disabled"], 4)
         self.assertEqual(coverage["execution_shares"]["eligible-backend-disabled"], 1.0)
         self.assertEqual(coverage["unique_site_counts"]["eligible-backend-disabled"], 5)
+
+    def test_fusion_coverage_deduplicates_retranslations_within_exec_epoch(self):
+        lines = (
+            nativeperf_frames_v3_with_exclusive(
+                pid=10, tid=11, era=1, exec_epoch=7, unique_sites=1
+            )
+            + nativeperf_frames_v3_with_exclusive(
+                pid=10, tid=11, era=2, exec_epoch=7, unique_sites=1
+            )
+        )
+        coverage = budget.fusion_coverage(budget.parse_nativeperf(lines))
+        self.assertEqual(coverage["unique_site_counts"]["eligible-backend-disabled"], 1)
+
+    def test_fusion_coverage_sums_distinct_sites_across_exec_epochs(self):
+        lines = (
+            nativeperf_frames_v3_with_exclusive(
+                pid=10, tid=11, era=1, exec_epoch=0, unique_sites=1
+            )
+            + nativeperf_frames_v3_with_exclusive(
+                pid=10, tid=11, era=2, exec_epoch=1, unique_sites=1
+            )
+        )
+        coverage = budget.fusion_coverage(budget.parse_nativeperf(lines))
+        self.assertEqual(coverage["unique_site_counts"]["eligible-backend-disabled"], 2)
 
     def test_fusion_coverage_command_writes_run_provenance(self):
         profile = budget.parse_nativeperf(nativeperf_frames_v3_with_exclusive())
