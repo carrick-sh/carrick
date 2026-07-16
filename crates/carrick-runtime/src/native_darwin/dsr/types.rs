@@ -211,18 +211,69 @@ pub(in crate::native_darwin) struct SensitiveExit {
     pub(in crate::native_darwin) resume: GuestVa,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct DsrScratchGpr(u8);
+
+impl DsrScratchGpr {
+    pub(super) fn new(index: u32) -> Option<Self> {
+        (index <= 30).then_some(Self(index as u8))
+    }
+
+    pub(super) const fn index(self) -> u32 {
+        self.0 as u32
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct BiasedExclusiveScratch {
+    pub(super) address: DsrScratchGpr,
+    pub(super) bias: DsrScratchGpr,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ExclusiveFusionRejection {
+    NotLoad,
+    VirtualizedBase,
+    VirtualizedOperand,
+    PageBoundary,
+    ScanLimitOrNoStore,
+    MismatchedStore,
+    UnsupportedBodyMemoryOrSensitive,
+    UnsupportedControlFlow,
+    InvalidRetryEdge,
+    BiasedNoSafeScratch,
+    BiasedAddressFormUnsupported,
+    AnalysisUnavailable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ExclusiveFusionDisposition {
+    FusedDirect,
+    FusedBiased,
+    EligibleBackendDisabled,
+    Rejected(ExclusiveFusionRejection),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ExclusiveFusionSite {
+    pub(super) guest: GuestVa,
+    pub(super) word: u32,
+    pub(super) disposition: ExclusiveFusionDisposition,
+    pub(super) biased_scratch: Option<BiasedExclusiveScratch>,
+}
+
 /// A block-planner-recognised, provably fusible AArch64 exclusive region: an
 /// exclusive load (LDXR/LDAXR family) paired with its matching exclusive
 /// store (STXR/STLXR family) across a bounded, straight-line CAS/RMW
 /// retry-loop body, with no hazardous instruction between them (see
-/// `block::try_fuse_exclusive_region` for the exact fusibility predicate).
+/// `block::analyze_exclusive_region` for the exact fusibility predicate).
 ///
 /// This carries the semantic data Task 2 needs to lower the region to
 /// native code instead of two independent gateway traps. It deliberately
 /// does NOT carry the region's own instruction sequence: that lives in the
 /// usual place, `BlockPlan::instructions` (mirroring every other exit kind,
 /// e.g. `PlannedExit::Direct`'s target instruction is never duplicated into
-/// the exit payload either) -- see `block::try_fuse_exclusive_region`.
+/// the exit payload either) -- see `block::analyze_exclusive_region`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::native_darwin) struct ExclusiveRegionExit {
     /// Guest VA of the exclusive load -- the top of the retry loop.
@@ -249,6 +300,7 @@ pub(in crate::native_darwin) struct ExclusiveRegionExit {
     /// carries its target/kind; this carries only the raw word the emitter
     /// re-encodes (a `PlannedInst`'s `InstAction::Direct` drops the word).
     pub(in crate::native_darwin) early_exit_word: Option<u32>,
+    pub(in crate::native_darwin) fallback: SensitiveExit,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -279,7 +331,7 @@ pub(super) enum InstAction {
     },
     Sensitive(SensitiveExit),
     /// A fused exclusive region recognised by the block planner's bounded
-    /// forward scan (`block::try_fuse_exclusive_region`). Not produced by
+    /// forward scan (`block::analyze_exclusive_region`). Not produced by
     /// `decode::classify` -- recognising a region requires multi-instruction
     /// lookahead that per-instruction decode cannot do -- so this variant
     /// exists for Task 2 to construct/consume at the block-planning layer.
