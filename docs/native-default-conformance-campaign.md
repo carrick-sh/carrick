@@ -431,3 +431,92 @@ slice. Its 1,144,700 pre-change executions are a projected removable gateway
 opportunity only; no performance win or post-enablement reduction has been
 measured. The actual dominant residual rejection remains `not-load`, followed
 by `biased-no-safe-scratch`, and both remain typed follow-up classes.
+
+## 2026-07-15 — Biased exclusive-fusion post-enablement measurement
+
+This checkpoint measures commit `ae9bc594` with the production biased planner
+enabled. The signed release binary passed `codesign --verify --verbose=2`,
+retained `__dof_carrick`, and had SHA-256
+`41896a3519845a1b40056653281f012c4b0c20399a06f2c8f25d23d3ec0bdab8`.
+The pinned Docker preflight remained
+`0827a725bc77d12c1938636042474accbcb3869d99ed90424135c10d5f03fcd9`,
+and the committed oracle cache remained byte-identical at
+`caf07aa59b6ae4a1c7fd9a5ba95ec4f53ea2fa90f85405b83379c449009e32df`.
+Carrick and Docker phases did not overlap.
+
+Correctness stress was serial. `futexrequeue`, `futexwakeexact`, and
+`sigreenter` each matched Docker 10/10 (30 exact probe matches). The planned
+`run-probe.sh perf_futex_pingpong` comparison is not a valid exact-output gate:
+the probe intentionally prints machine-dependent latency and `nproc` fields.
+The repository's normalized report-only perf verifier instead completed 10/10
+Carrick samples with no timeout, nonzero exit, or missing metric: Carrick p50
+7.750 us versus Docker p50 14.667 us at `BENCH_NPROC=4`. This is a stress
+receipt, not a performance threshold. The focused current-name `go-runtime`
+and `go-sync` lanes both MATCHED their cached Docker oracles, 52/52 each
+(`target/conformance/native-exclusive-focused.jsonl`, SHA-256
+`a3d491235343171c824d3646d6eb4ffe4b1b61525747d4f749571d0a3dbbb36e`).
+The plan's older `go-go_runtime`/`go-go_sync` selectors matched no suites and
+were corrected to the live declarations before measuring.
+
+The durable post census is
+`scripts/perf/evidence/native-exclusive-fusion-coverage-post-biased-v1.json`
+(SHA-256
+`99bde122b4efc7763f5238a9e48bcb53a90edce583206ebf8531b3472a859a41`).
+It is byte-identical to the first render from
+`target/conformance/native-exclusive-coverage-post.jsonl` (SHA-256
+`90ba932cfc7b740bdc176534cb964675e91b6781fb9b723d6df6f3a3118d9f58`).
+
+| Fusion disposition | Pre executions | Post executions | Post share | Post unique sites |
+| --- | ---: | ---: | ---: | ---: |
+| `not-load` | 2,942,205 | 1,777,173 | 49.999985932718444% | 19,392 |
+| `biased-no-safe-scratch` | 1,825,677 | 1,777,174 | 50.00001406728156% | 19,392 |
+| `eligible-backend-disabled` | 1,144,700 | 0 | 0% | 0 |
+| `fused-biased` | 0 | 0 | 0% | 17,709 |
+| `fused-direct` | 0 | 0 | 0% | 599 |
+| all other typed rejections | 0 | 0 | 0% | 0 |
+| **Residual exclusive gateways** | **5,912,582** | **3,554,347** | **100%** | — |
+
+The promoted class therefore collapses to zero and residual execution falls by
+2,358,235 gateways (39.8850 percent). That is measured coverage movement, not
+a projected performance win. This profile run was cleanly reaped but its typed
+outcome was `failed`: it recorded 1,000,000 gateway entries, then the downstream
+Go compiler exited before the exact ceiling marker was retained. A bounded
+repeat retained the marker but the strict parser rejected one process whose
+nested translation subphases exceeded its reported total. A temporary
+disabled-policy A/B control did reconcile at 1,000,000 gateways and reproduced
+the pre-enablement distribution (5,892,659 residual; 19.2914 percent
+`eligible-backend-disabled`). This localizes the discrepancy to profiling
+contract fragility under this process tree; it is tracked as measurement debt,
+not classified as a guest-correctness failure. Consequently the post census is
+directional and the untraced run below is the only performance authority.
+
+The signed untraced W1 run
+`nativeperf-w1-test-implicits-info-1-6f2eaf9f` reached the unchanged 1,000,000
+gateway ceiling and cleaned up with zero descendants. Against the pinned
+pre-change single run, the result was a small improvement rather than a step
+function:
+
+| Metric | Pre-change | Post-enabled | One-run delta |
+| --- | ---: | ---: | ---: |
+| wall | 15.49 s | 15.12 s | -0.37 s (-2.39%) |
+| user CPU | 41.04 s | 38.98 s | -2.06 s (-5.02%) |
+| system CPU | 16.63 s | 15.29 s | -1.34 s (-8.06%) |
+| total CPU | 57.67 s | 54.27 s | -3.40 s (-5.90%) |
+
+The exact c94 lane did not approach the required step function. At the user's
+bounded cutoff it had consumed 142.189 s versus the unchanged cached Docker
+oracle's 3.069 s (46.33x), with no Carrick result. Scoped cleanup stopped run
+`conf-19101-c00` and left no descendant. The interrupted harness row is
+`target/conformance/native-perf-c94-post-biased.jsonl` (SHA-256
+`591e76e2bde607a11ba6f9528fd0bfad286df5e44161365e51758e22f4b165d1`).
+It is not a natural crash verdict and was not rerun because it was already more
+than an order of magnitude slower than the oracle.
+
+`just ci` passed after measurement: formatting, clippy, typed-domain lint,
+dependency policy, support-matrix drift, compile, docs, 1,045 host library
+tests, 296 primary integration tests, and the remaining workspace tests were
+green. The next evidence-ranked runtime rejection is
+`biased-no-safe-scratch`: 1,777,174 executions, only one execution above
+`not-load`, at 50.00001406728156 percent. The near tie must not be overstated;
+any next lowering design must preserve typed recovery and prove a measurable
+untraced gain before promotion.
