@@ -647,6 +647,57 @@ def nativeperf_frames_v2(
     return lines
 
 
+def nativeperf_frames_v3(pid=10, tid=11, era=12):
+    prefix = f"NATIVEPERF1|thread|complete=1|pid={pid}|tid={tid}|era={era}|frame="
+    return nativeperf_frames_v2(pid=pid, tid=tid, era=era) + [
+        prefix
+        + "fusion-exec-a|fusion_fused_direct=0|fusion_fused_biased=0|"
+        "fusion_eligible_backend_disabled=0|fusion_not_load=0|"
+        "fusion_virtualized_base=0|fusion_virtualized_operand=0|"
+        "fusion_page_boundary=0|fusion_scan_limit_or_no_store=0",
+        prefix
+        + "fusion-exec-b|fusion_mismatched_store=0|"
+        "fusion_unsupported_body_memory_or_sensitive=0|"
+        "fusion_unsupported_control_flow=0|fusion_invalid_retry_edge=0|"
+        "fusion_biased_no_safe_scratch=0|"
+        "fusion_biased_address_form_unsupported=0|fusion_analysis_unavailable=0",
+        prefix
+        + "fusion-sites-a|fusion_fused_direct=0|fusion_fused_biased=0|"
+        "fusion_eligible_backend_disabled=0|fusion_not_load=0|"
+        "fusion_virtualized_base=0|fusion_virtualized_operand=0|"
+        "fusion_page_boundary=0|fusion_scan_limit_or_no_store=0",
+        prefix
+        + "fusion-sites-b|fusion_mismatched_store=0|"
+        "fusion_unsupported_body_memory_or_sensitive=0|"
+        "fusion_unsupported_control_flow=0|fusion_invalid_retry_edge=0|"
+        "fusion_biased_no_safe_scratch=0|"
+        "fusion_biased_address_form_unsupported=0|fusion_analysis_unavailable=0",
+    ]
+
+
+def nativeperf_frames_v3_with_exclusive(
+    pid=10, tid=11, era=12, *, executions=1, unique_sites=1
+):
+    lines = nativeperf_frames_v3(pid=pid, tid=tid, era=era)
+    lines[1] = lines[1].replace("exit_resolve_direct=1", "exit_resolve_direct=0").replace(
+        "exit_sensitive=0", "exit_sensitive=1"
+    )
+    lines[2] = lines[2].replace("sensitive_exclusive=0", "sensitive_exclusive=1")
+    lines[4] = lines[4].replace(
+        "phase_sensitive_emulation_count=0", "phase_sensitive_emulation_count=1"
+    )
+    lines[5] = lines[5].replace("direct_resolver_exits=1", "direct_resolver_exits=0")
+    lines[-4] = lines[-4].replace(
+        "fusion_eligible_backend_disabled=0",
+        f"fusion_eligible_backend_disabled={executions}",
+    )
+    lines[-2] = lines[-2].replace(
+        "fusion_eligible_backend_disabled=0",
+        f"fusion_eligible_backend_disabled={unique_sites}",
+    )
+    return lines
+
+
 class NativePerfTests(unittest.TestCase):
     def test_profile_requires_complete_unique_nine_frame_groups(self):
         profile = budget.parse_nativeperf(nativeperf_frames())
@@ -747,6 +798,97 @@ class NativePerfTests(unittest.TestCase):
 
 
 class NativePerfV2Tests(unittest.TestCase):
+    def test_v3_reconciles_exclusive_fusion_execution_counts(self):
+        profile = budget.parse_nativeperf(nativeperf_frames_v3())
+        budget.validate_profile(profile)
+        self.assertEqual(profile.version, 3)
+        self.assertEqual(
+            sum(
+                profile.threads[0].value(frame, field)
+                for frame in ("fusion-exec-a", "fusion-exec-b")
+                for field in budget.FRAME_FIELDS_V3[frame]
+            ),
+            profile.threads[0].value("sensitive", "sensitive_exclusive"),
+        )
+
+    def test_v3_rejects_unreconciled_fusion_counts(self):
+        lines = nativeperf_frames_v3()
+        lines = [line.replace("fusion_not_load=0", "fusion_not_load=1") for line in lines]
+        with self.assertRaisesRegex(budget.BudgetError, "fusion execution mismatch"):
+            budget.validate_profile(budget.parse_nativeperf(lines))
+
+    def test_v3_rejects_unknown_fields_and_missing_frames(self):
+        unknown = nativeperf_frames_v3()
+        unknown[-1] += "|surprise=1"
+        with self.assertRaisesRegex(budget.BudgetError, "unknown field.*fusion-sites-b"):
+            budget.parse_nativeperf(unknown)
+        with self.assertRaisesRegex(
+            budget.BudgetError, "missing profile frames.*fusion-sites-b"
+        ):
+            budget.parse_nativeperf(nativeperf_frames_v3()[:-1])
+
+    def test_v3_wire_round_trip_uses_the_exact_frame_contract(self):
+        profile = budget.parse_nativeperf(nativeperf_frames_v3())
+        record = budget.RunRecord.synthetic(profile=profile, schedule_label="on-1")
+        encoded = budget.run_record_json(record)
+        decoded = budget.parse_result_row(encoded)
+        self.assertEqual(decoded.profile, profile)
+        self.assertEqual(decoded.profile.version, 3)
+        extra = json.loads(json.dumps(encoded))
+        extra["profile"]["threads"][0]["values"]["fusion-exec-a.invented"] = 1
+        with self.assertRaisesRegex(budget.BudgetError, "profile value"):
+            budget.parse_result_row(extra)
+
+    def test_fusion_coverage_sums_executions_and_maxes_sites_per_process(self):
+        lines = (
+            nativeperf_frames_v3_with_exclusive(pid=10, tid=11, era=1, unique_sites=1)
+            + nativeperf_frames_v3_with_exclusive(pid=10, tid=11, era=2, unique_sites=2)
+            + nativeperf_frames_v3_with_exclusive(pid=20, tid=21, era=1, unique_sites=3)
+        )
+        coverage = budget.fusion_coverage(budget.parse_nativeperf(lines))
+        self.assertEqual(coverage["residual_exclusive_gateways"], 3)
+        self.assertEqual(coverage["execution_counts"]["eligible-backend-disabled"], 3)
+        self.assertEqual(coverage["execution_shares"]["eligible-backend-disabled"], 1.0)
+        self.assertEqual(coverage["unique_site_counts"]["eligible-backend-disabled"], 5)
+
+    def test_fusion_coverage_command_writes_run_provenance(self):
+        profile = budget.parse_nativeperf(nativeperf_frames_v3_with_exclusive())
+        record = budget.RunRecord.synthetic(
+            profile=profile, run_id="coverage-run", schedule_label="on-1"
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            input_path = pathlib.Path(temp) / "input.jsonl"
+            output_path = pathlib.Path(temp) / "coverage.json"
+            input_path.write_text(
+                json.dumps(budget.run_record_json(record)) + "\n", encoding="utf-8"
+            )
+            self.assertEqual(
+                budget.main(
+                    [
+                        "fusion-coverage",
+                        "--input",
+                        str(input_path),
+                        "--output",
+                        str(output_path),
+                    ]
+                ),
+                0,
+            )
+            rendered = json.loads(output_path.read_text(encoding="utf-8"))
+        self.assertEqual(rendered["schema"], budget.FUSION_COVERAGE_SCHEMA)
+        self.assertEqual(rendered["run_id"], "coverage-run")
+        self.assertEqual(rendered["binary_sha256"], "b" * 64)
+
+    def test_v3_retains_v2_additive_cpu_attribution(self):
+        profile = budget.parse_nativeperf(
+            nativeperf_frames_v3_with_exclusive()
+            + [supervisor_line(self_cpu_ns=0, children_cpu_ns=90)]
+        )
+        additive = budget.derive_additive_cpu_evidence(profile, cpu_ns=90)
+        self.assertEqual(additive.process_cpu_ns, 90)
+        self.assertEqual(additive.thread_cpu_ns, 30)
+        self.assertEqual(additive.helper_cpu_ns, 60)
+
     def test_v1_and_v2_profiles_parse_with_typed_versions(self):
         v1 = budget.parse_nativeperf(nativeperf_frames())
         budget.validate_profile(v1)

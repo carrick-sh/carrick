@@ -29,6 +29,7 @@ from collections.abc import Iterable, Mapping, Sequence
 
 WORKLOAD_SCHEMA = "carrick.native-compiler-workload.v1"
 RESULT_SCHEMA = "carrick.native-compiler-budget.v1"
+FUSION_COVERAGE_SCHEMA = "carrick.native-exclusive-fusion-coverage.v1"
 PROTOCOL_PREFIX = "NATIVEPERF1"
 FRAME_FIELDS = {
     "core": {"gateway_entries", "reconciled_exits", "overflowed"},
@@ -109,6 +110,42 @@ FRAME_FIELDS_V2 = {
     "process": {"startup_wall_ns", "startup_cpu_ns", "process_cpu_ns"},
 }
 REQUIRED_FRAMES_V2 = frozenset(FRAME_FIELDS_V2)
+# NATIVEPERF v3 adds reconciled exclusive-fusion execution counters and
+# process-wide unique-site gauges. The class order is stable and mirrors the
+# producer's exhaustive `ExclusiveFusionClass::ALL` array.
+FUSION_CLASSES = (
+    ("fusion_fused_direct", "fused-direct"),
+    ("fusion_fused_biased", "fused-biased"),
+    ("fusion_eligible_backend_disabled", "eligible-backend-disabled"),
+    ("fusion_not_load", "not-load"),
+    ("fusion_virtualized_base", "virtualized-base"),
+    ("fusion_virtualized_operand", "virtualized-operand"),
+    ("fusion_page_boundary", "page-boundary"),
+    ("fusion_scan_limit_or_no_store", "scan-limit-or-no-store"),
+    ("fusion_mismatched_store", "mismatched-store"),
+    (
+        "fusion_unsupported_body_memory_or_sensitive",
+        "unsupported-body-memory-or-sensitive",
+    ),
+    ("fusion_unsupported_control_flow", "unsupported-control-flow"),
+    ("fusion_invalid_retry_edge", "invalid-retry-edge"),
+    ("fusion_biased_no_safe_scratch", "biased-no-safe-scratch"),
+    (
+        "fusion_biased_address_form_unsupported",
+        "biased-address-form-unsupported",
+    ),
+    ("fusion_analysis_unavailable", "analysis-unavailable"),
+)
+_FUSION_FIELDS_A = {field for field, _ in FUSION_CLASSES[:8]}
+_FUSION_FIELDS_B = {field for field, _ in FUSION_CLASSES[8:]}
+FRAME_FIELDS_V3 = {
+    **{frame: set(fields) for frame, fields in FRAME_FIELDS_V2.items()},
+    "fusion-exec-a": set(_FUSION_FIELDS_A),
+    "fusion-exec-b": set(_FUSION_FIELDS_B),
+    "fusion-sites-a": set(_FUSION_FIELDS_A),
+    "fusion-sites-b": set(_FUSION_FIELDS_B),
+}
+REQUIRED_FRAMES_V3 = frozenset(FRAME_FIELDS_V3)
 # The supervisor record (`NATIVEPERF1|supervisor|...`) is a v2-era, per-PROFILE
 # (not per-thread-group) record: the top-level `carrick run` process's own
 # getrusage(RUSAGE_SELF)/getrusage(RUSAGE_CHILDREN) CPU. It is a top-level
@@ -830,25 +867,32 @@ def _protocol_fields(line: str) -> tuple[str, dict[str, str]]:
 
 
 def _frame_contract(frame: str, extras: set[str]) -> tuple[int | None, set[str]]:
-    """Match one frame's field set against the v1/v2 contracts.
+    """Match one frame's field set against the v1/v2/v3 contracts.
 
-    Returns (version, field set): version 1 or 2 for the contract-splitting
-    frames (core / phases-b / process), None for the version-neutral frames.
+    Returns (version, field set): version 1, 2, or 3 for contract-splitting
+    frames, and None for version-neutral frames.
     Raises the same unknown/missing diagnostics as the historical v1 parser.
     """
     fields_v1 = FRAME_FIELDS.get(frame)
     fields_v2 = FRAME_FIELDS_V2.get(frame)
-    if fields_v1 is None and fields_v2 is None:
+    fields_v3 = FRAME_FIELDS_V3.get(frame)
+    if fields_v1 is None and fields_v2 is None and fields_v3 is None:
         raise BudgetError(f"unknown profile frame: {frame}")
     if fields_v1 is not None and extras == fields_v1:
         return (None if fields_v1 == fields_v2 else 1), fields_v1
     if fields_v2 is not None and extras == fields_v2:
         return (None if fields_v1 == fields_v2 else 2), fields_v2
-    allowed = (fields_v1 or set()) | (fields_v2 or set())
+    if fields_v3 is not None and extras == fields_v3:
+        if fields_v2 == fields_v3:
+            return (None if fields_v1 == fields_v3 else 2), fields_v3
+        return 3, fields_v3
+    allowed = (fields_v1 or set()) | (fields_v2 or set()) | (fields_v3 or set())
     unknown = extras - allowed
     if unknown:
         raise BudgetError(f"unknown field(s) in {frame}: {', '.join(sorted(unknown))}")
-    missing = (fields_v1 if fields_v1 is not None else fields_v2) - extras
+    expected = fields_v1 or fields_v2 or fields_v3
+    assert expected is not None
+    missing = expected - extras
     if not missing:
         raise BudgetError(f"malformed field set in {frame}")
     raise BudgetError(f"missing field(s) in {frame}: {', '.join(sorted(missing))}")
@@ -913,12 +957,19 @@ def parse_nativeperf(lines: Iterable[str]) -> ProfileRun:
     profile_versions: set[int] = set()
     for (pid, tid, era), frames in sorted(groups.items()):
         versions = group_versions.get((pid, tid, era), set())
-        if len(versions) > 1:
+        if versions == {2, 3}:
+            version = 3
+        elif len(versions) > 1:
             raise BudgetError(
                 f"mixed native profile contract versions for {(pid, tid, era)}"
             )
-        version = versions.pop() if versions else 1
-        required = REQUIRED_FRAMES if version == 1 else REQUIRED_FRAMES_V2
+        else:
+            version = versions.pop() if versions else 1
+        required = {
+            1: REQUIRED_FRAMES,
+            2: REQUIRED_FRAMES_V2,
+            3: REQUIRED_FRAMES_V3,
+        }[version]
         missing = required - set(frames)
         if missing:
             raise BudgetError(
@@ -938,7 +989,7 @@ def parse_nativeperf(lines: Iterable[str]) -> ProfileRun:
             "mixed native profile contract versions across thread groups"
         )
     resolved_version = profile_versions.pop() if profile_versions else 1
-    if supervisor is not None and resolved_version != 2:
+    if supervisor is not None and resolved_version < 2:
         raise BudgetError(
             "supervisor record requires a NATIVEPERF v2 profile: "
             f"profile is v{resolved_version}"
@@ -971,6 +1022,16 @@ def validate_profile(run: ProfileRun) -> None:
         )
         if sensitive != thread.value("exits", "exit_sensitive"):
             raise BudgetError(f"sensitive reconciliation mismatch for {identity}")
+        if run.version == 3:
+            fusion_executions = sum(
+                thread.value(frame, field)
+                for frame in ("fusion-exec-a", "fusion-exec-b")
+                for field in FRAME_FIELDS_V3[frame]
+            )
+            if fusion_executions != thread.value(
+                "sensitive", "sensitive_exclusive"
+            ):
+                raise BudgetError(f"fusion execution mismatch for {identity}")
         for field in (
             "phase_prepare_index_count",
             "phase_translated_run_count",
@@ -1012,7 +1073,7 @@ def validate_profile(run: ProfileRun) -> None:
         # Resolver time is a process-epoch delta assigned exactly once; it is
         # intentionally not compared with one thread's prepare phase.  The
         # cache-gauge frame is likewise a point-in-time gauge, never a delta.
-        if run.version == 2:
+        if run.version >= 2:
             if thread.value("phases-b", "phase_blocked_cpu_ns") > thread.value(
                 "phases-b", "phase_blocked_ns"
             ):
@@ -1031,6 +1092,41 @@ def validate_profile(run: ProfileRun) -> None:
                 raise BudgetError(
                     f"startup gauge differs across pid {thread.pid} thread groups"
                 )
+
+
+def fusion_coverage(profile: ProfileRun) -> dict[str, object]:
+    """Aggregate v3 execution deltas and per-process unique-site gauges."""
+    validate_profile(profile)
+    if profile.version != 3:
+        raise BudgetError(
+            f"exclusive fusion coverage requires NATIVEPERF v3: got v{profile.version}"
+        )
+    execution_counts = {label: 0 for _, label in FUSION_CLASSES}
+    unique_sites_by_pid: dict[int, dict[str, int]] = {}
+    for thread in profile.threads:
+        for index, (field, label) in enumerate(FUSION_CLASSES):
+            frame = "fusion-exec-a" if index < 8 else "fusion-exec-b"
+            execution_counts[label] += thread.value(frame, field)
+            site_frame = "fusion-sites-a" if index < 8 else "fusion-sites-b"
+            per_pid = unique_sites_by_pid.setdefault(
+                thread.pid, {name: 0 for _, name in FUSION_CLASSES}
+            )
+            per_pid[label] = max(per_pid[label], thread.value(site_frame, field))
+    residual = sum(execution_counts.values())
+    unique_site_counts = {
+        label: sum(per_pid[label] for per_pid in unique_sites_by_pid.values())
+        for _, label in FUSION_CLASSES
+    }
+    execution_shares = {
+        label: (count / residual if residual else 0.0)
+        for label, count in execution_counts.items()
+    }
+    return {
+        "residual_exclusive_gateways": residual,
+        "execution_counts": execution_counts,
+        "execution_shares": execution_shares,
+        "unique_site_counts": unique_site_counts,
+    }
 
 
 SENSITIVE_ORDER = (
@@ -1129,15 +1225,15 @@ def derive_count_evidence(profile: ProfileRun, *, scope: str) -> CountEvidence:
 def derive_additive_cpu_evidence(profile: ProfileRun, cpu_ns: int) -> AdditiveCpuEvidence:
     if cpu_ns <= 0:
         raise BudgetError("additive profile requires positive measured CPU time")
-    if profile.version != 2:
+    if profile.version < 2:
         raise BudgetError(
-            "additive attribution requires NATIVEPERF v2: profile is v"
+            "additive attribution requires NATIVEPERF v2 or newer: profile is v"
             f"{profile.version}"
         )
     validate_profile(profile)
     if profile.supervisor is None:
         raise BudgetError(
-            "supervisor record required for NATIVEPERF v2 additive attribution"
+            "supervisor record required for NATIVEPERF v2+ additive attribution"
         )
     terms = tuple(
         (
@@ -2441,6 +2537,9 @@ def _parse_profile_json(value: object) -> ProfileRun | None:
         elif frames == sorted(REQUIRED_FRAMES_V2):
             version = 2
             fields_by_frame = FRAME_FIELDS_V2
+        elif frames == sorted(REQUIRED_FRAMES_V3):
+            version = 3
+            fields_by_frame = FRAME_FIELDS_V3
         else:
             raise BudgetError("profile thread frames are not the exact required set")
         profile_versions.add(version)
@@ -2473,7 +2572,7 @@ def _parse_profile_json(value: object) -> ProfileRun | None:
     if len(profile_versions) > 1:
         raise BudgetError("mixed native profile contract versions across thread groups")
     resolved_version = profile_versions.pop() if profile_versions else 1
-    if supervisor is not None and resolved_version != 2:
+    if supervisor is not None and resolved_version < 2:
         raise BudgetError(
             "supervisor record requires a NATIVEPERF v2 profile: "
             f"profile is v{resolved_version}"
@@ -3536,6 +3635,40 @@ def _analyze_command(path: pathlib.Path, *, check: bool) -> int:
     return 0
 
 
+def _fusion_coverage_command(input_path: pathlib.Path, output_path: pathlib.Path) -> int:
+    records: list[RunRecord] = []
+    for line_number, line in enumerate(
+        input_path.read_text(encoding="utf-8").splitlines(), 1
+    ):
+        if not line:
+            continue
+        try:
+            raw = json.loads(line, object_pairs_hook=_pairs_no_duplicates)
+        except json.JSONDecodeError as error:
+            raise BudgetError(
+                f"invalid fusion coverage JSON row {line_number}: {error}"
+            ) from error
+        if not isinstance(raw, dict) or raw.get("record") != "run":
+            raise BudgetError("fusion coverage input must contain only run records")
+        records.append(parse_result_row(raw))
+    if len(records) != 1:
+        raise BudgetError("fusion coverage input must contain exactly one run record")
+    record = records[0]
+    if record.engine != "carrick" or record.plane != "profiled":
+        raise BudgetError("fusion coverage requires one profiled Carrick run")
+    if record.profile is None:
+        raise BudgetError("fusion coverage run has no native profile")
+    summary = {
+        "schema": FUSION_COVERAGE_SCHEMA,
+        "run_id": record.run_id,
+        "binary_sha256": record.binary_sha256,
+        **fusion_coverage(record.profile),
+    }
+    _atomic_write_json(output_path, summary)
+    print(json.dumps(summary, sort_keys=True))
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -3576,6 +3709,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     analyze_parser = subparsers.add_parser("analyze")
     analyze_parser.add_argument("--input", type=pathlib.Path, required=True)
     analyze_parser.add_argument("--check", action="store_true")
+    fusion_coverage_parser = subparsers.add_parser("fusion-coverage")
+    fusion_coverage_parser.add_argument("--input", type=pathlib.Path, required=True)
+    fusion_coverage_parser.add_argument("--output", type=pathlib.Path, required=True)
     args = parser.parse_args(argv)
     try:
         if args.command == "validate":
@@ -3654,6 +3790,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         if args.command == "analyze":
             return _analyze_command(args.input, check=args.check)
+        if args.command == "fusion-coverage":
+            return _fusion_coverage_command(args.input, args.output)
         raise AssertionError(args.command)
     except (BudgetError, OSError, subprocess.SubprocessError) as error:
         print(f"native_compiler_budget: {error}", file=sys.stderr)
