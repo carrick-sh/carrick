@@ -371,3 +371,63 @@ sys CPU on this workload.
 Note: dtrace-TRACED psynch counts rose under this change, an artifact of
 dtrace's heavy contention perturbation; the untraced signed run is the wall/CPU
 authority and improved. Amplification counts remain shape-only evidence.
+
+## 2026-07-15 — Pre-enablement biased exclusive-fusion coverage census
+
+This is directional profile evidence, not performance authority. The Docker
+identity preflight completed before the Carrick phase; the phases did not
+overlap. The measured release binary was built with `just build`, passed
+`codesign --verify --verbose=2`, retained `__dof_carrick`, and had SHA-256
+`6ccc04c421074ead087607714d17483642dbe754b9d41eacb4154b6eafbd78ec`.
+
+Commands:
+
+```text
+python3 scripts/perf/native_compiler_budget.py preflight scripts/perf/manifests/native-compiler-w1-v1.json --output target/conformance/native-exclusive-coverage-preflight.json
+just build
+codesign --verify --verbose=2 target/release/carrick
+python3 scripts/perf/native_compiler_budget.py run scripts/perf/manifests/native-compiler-w1-v1.json --engine carrick --plane profiled --repetition 1 --artifacts target/conformance/native-exclusive-coverage-pre-artifacts --results target/conformance/native-exclusive-coverage-pre.jsonl --preflight target/conformance/native-exclusive-coverage-preflight.json
+python3 scripts/perf/native_compiler_budget.py fusion-coverage --input target/conformance/native-exclusive-coverage-pre.jsonl --output scripts/perf/evidence/native-exclusive-fusion-coverage-pre-biased-v1.json
+python3 -m json.tool scripts/perf/evidence/native-exclusive-fusion-coverage-pre-biased-v1.json
+```
+
+Run ID: `nativeperf-w1-test-implicits-info-1-40d365ee`. The strict profile
+parser and fusion renderer reconciled all 5,912,582 residual
+`sensitive_exclusive` executions. The run reached the unchanged 1,000,000
+gateway ceiling (`max-traps`, exit 2) in 17.930 s wall; this ceiling was not
+raised. Scoped cleanup exited 0, reported `clean`, and proved descendants
+absent (`remaining carrick procs ... = 0`). The pinned Docker preflight receipt
+SHA-256 is `0827a725bc77d12c1938636042474accbcb3869d99ed90424135c10d5f03fcd9`;
+the raw run JSONL SHA-256 is
+`973599f8babea83fe605ad2d632d35bfdc2f55a7ee7ab9de176fb98968a0fbf8`.
+
+| Fusion disposition | Executions | Share of residual exclusive | Unique sites |
+| --- | ---: | ---: | ---: |
+| `not-load` | 2,942,205 | 49.76176228930102% | 36,123 |
+| `biased-no-safe-scratch` | 1,825,677 | 30.87782968591387% | 19,129 |
+| `eligible-backend-disabled` | 1,144,700 | 19.36040802478511% | 17,459 |
+| `fused-direct` | 0 | 0% | 600 |
+| `fused-biased` | 0 | 0% | 0 |
+| `virtualized-base` | 0 | 0% | 0 |
+| `virtualized-operand` | 0 | 0% | 0 |
+| `page-boundary` | 0 | 0% | 0 |
+| `scan-limit-or-no-store` | 0 | 0% | 0 |
+| `mismatched-store` | 0 | 0% | 0 |
+| `unsupported-body-memory-or-sensitive` | 0 | 0% | 0 |
+| `unsupported-control-flow` | 0 | 0% | 0 |
+| `invalid-retry-edge` | 0 | 0% | 0 |
+| `biased-address-form-unsupported` | 0 | 0% | 0 |
+| `analysis-unavailable` | 0 | 0% | 0 |
+
+The execution counts sum exactly to the residual exclusive count, the shares
+sum to 1, and every site gauge is nonnegative. `fused-direct` has translated
+site breadth but no residual execution because these measured executions are
+from biased-mode processes; site breadth is diagnostic and is not summed into
+the execution invariant.
+
+**Task 4 selection:** `eligible-backend-disabled` is nonzero, so the canonical
+already-recognized biased class is eligible for the next disabled-emitter
+slice. Its 1,144,700 pre-change executions are a projected removable gateway
+opportunity only; no performance win or post-enablement reduction has been
+measured. The actual dominant residual rejection remains `not-load`, followed
+by `biased-no-safe-scratch`, and both remain typed follow-up classes.

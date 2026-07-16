@@ -151,3 +151,52 @@ maps, items 5 above) were kept. Design + evidence:
 Authoritative tracked docs: `docs/native-default-conformance-campaign.md`
 (ledger with the measured before/after tables), the specs/plans under
 `docs/superpowers/{specs,plans}/2026-07-1[45]-*`.
+
+## Biased exclusive-fusion census checkpoint (2026-07-15)
+
+Task 3 of `docs/superpowers/plans/2026-07-15-biased-exclusive-fusion-coverage.md`
+is complete. Docker identity preflight and Carrick profiling ran as strictly
+separate phases. The measured binary was built and signed with `just build`,
+passed `codesign --verify --verbose=2`, and had SHA-256
+`6ccc04c421074ead087607714d17483642dbe754b9d41eacb4154b6eafbd78ec`.
+
+Exact commands:
+
+```text
+python3 scripts/perf/native_compiler_budget.py preflight scripts/perf/manifests/native-compiler-w1-v1.json --output target/conformance/native-exclusive-coverage-preflight.json
+just build
+codesign --verify --verbose=2 target/release/carrick
+python3 scripts/perf/native_compiler_budget.py run scripts/perf/manifests/native-compiler-w1-v1.json --engine carrick --plane profiled --repetition 1 --artifacts target/conformance/native-exclusive-coverage-pre-artifacts --results target/conformance/native-exclusive-coverage-pre.jsonl --preflight target/conformance/native-exclusive-coverage-preflight.json
+python3 scripts/perf/native_compiler_budget.py fusion-coverage --input target/conformance/native-exclusive-coverage-pre.jsonl --output scripts/perf/evidence/native-exclusive-fusion-coverage-pre-biased-v1.json
+python3 -m json.tool scripts/perf/evidence/native-exclusive-fusion-coverage-pre-biased-v1.json
+```
+
+Run `nativeperf-w1-test-implicits-info-1-40d365ee` reached the unchanged
+1,000,000-gateway ceiling with strict profile reconciliation. Cleanup was
+`clean`, exited 0, and found zero scoped descendants. The deterministic census
+is `scripts/perf/evidence/native-exclusive-fusion-coverage-pre-biased-v1.json`.
+
+| Fusion disposition | Executions | Share | Unique sites |
+| --- | ---: | ---: | ---: |
+| `not-load` | 2,942,205 | 49.76176228930102% | 36,123 |
+| `biased-no-safe-scratch` | 1,825,677 | 30.87782968591387% | 19,129 |
+| `eligible-backend-disabled` | 1,144,700 | 19.36040802478511% | 17,459 |
+| `fused-direct` | 0 | 0% | 600 |
+| `fused-biased` | 0 | 0% | 0 |
+| `virtualized-base` | 0 | 0% | 0 |
+| `virtualized-operand` | 0 | 0% | 0 |
+| `page-boundary` | 0 | 0% | 0 |
+| `scan-limit-or-no-store` | 0 | 0% | 0 |
+| `mismatched-store` | 0 | 0% | 0 |
+| `unsupported-body-memory-or-sensitive` | 0 | 0% | 0 |
+| `unsupported-control-flow` | 0 | 0% | 0 |
+| `invalid-retry-edge` | 0 | 0% | 0 |
+| `biased-address-form-unsupported` | 0 | 0% | 0 |
+| `analysis-unavailable` | 0 | 0% | 0 |
+
+Counts sum exactly to 5,912,582 residual exclusive gateways; shares sum to 1;
+all site counts are nonnegative. Task 4 is selected to build the disabled
+emitter for the nonzero canonical `eligible-backend-disabled` class. This is
+only a 19.360408% pre-change opportunity projection. `not-load` is the actual
+dominant rejection and `biased-no-safe-scratch` is second; no enablement or
+performance result has been claimed yet.
