@@ -2339,6 +2339,11 @@ fn recover_rewrite_state(
                 "biased recovery escaped its typed handler".to_string(),
             ));
         }
+        emit::RecoveryAction::RecoverBiasedExclusive(_) => {
+            return Err(types::DsrError::CachePolicy(
+                "disabled biased exclusive recovery reached runtime handling".to_string(),
+            ));
+        }
     };
     let index = usize::try_from(register)
         .map_err(|_| types::DsrError::CachePolicy("rewrite scratch index overflow".to_string()))?;
@@ -2454,6 +2459,33 @@ mod tests {
         assert_eq!(snapshot.x[0], 3_u64.wrapping_sub(0x80_0000_0000));
         assert_eq!(snapshot.x[9], 0xaa);
         assert_eq!(snapshot.x[10], 0xbb);
+    }
+
+    #[test]
+    fn disabled_biased_exclusive_recovery_fails_closed() {
+        let action = super::emit::RecoveryAction::RecoverBiasedExclusive(
+            super::emit::BiasedExclusiveRecovery {
+                scratch: super::types::BiasedExclusiveScratch {
+                    address: super::types::DsrScratchGpr::new(17).expect("x17 scratch"),
+                    bias: super::types::DsrScratchGpr::new(16).expect("x16 scratch"),
+                },
+                resume: super::emit::BiasedExclusiveResume::Load,
+            },
+        );
+        assert!(!action.instruction_complete());
+        assert_eq!(
+            super::recovery_resume_pc(PC, Some(action)).expect("retry current load"),
+            PC.raw()
+        );
+
+        let mut snapshot = super::super::NativeUcontextSnapshot::default();
+        let error = super::recover_rewrite_state(&mut snapshot, action, 0, 0, 0, 0, 0)
+            .expect_err("Task 4 recovery must remain unreachable and fail closed");
+        assert!(matches!(
+            error,
+            super::types::DsrError::CachePolicy(detail)
+                if detail == "disabled biased exclusive recovery reached runtime handling"
+        ));
     }
 
     #[test]

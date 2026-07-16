@@ -154,6 +154,19 @@ pub(super) enum RecoveryAction {
         virtual_scratch: u32,
     },
     RecoverBiasedMemory(BiasedMemoryRecovery),
+    RecoverBiasedExclusive(BiasedExclusiveRecovery),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum BiasedExclusiveResume {
+    Load,
+    Retry,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct BiasedExclusiveRecovery {
+    pub(super) scratch: super::types::BiasedExclusiveScratch,
+    pub(super) resume: BiasedExclusiveResume,
 }
 
 impl RecoveryAction {
@@ -1816,6 +1829,545 @@ fn emit_region_direct_exit(
     )
 }
 
+fn emit_biased_exclusive_word(
+    assembler: &mut VecAssembler<Aarch64Relocation>,
+    entries: &mut Vec<PcMapEntry>,
+    recovery: &mut Vec<RecoveryEntry>,
+    guest: GuestVa,
+    word: u32,
+    scratch: super::types::BiasedExclusiveScratch,
+    resume: BiasedExclusiveResume,
+) -> Result<(), DsrError> {
+    recovery.push(RecoveryEntry {
+        cache: current_offset(assembler)?,
+        action: RecoveryAction::RecoverBiasedExclusive(BiasedExclusiveRecovery { scratch, resume }),
+    });
+    emit_word(assembler, entries, guest, word)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "biased exclusive recovery metadata advances with each emitted word"
+)]
+fn emit_biased_exclusive_branch(
+    assembler: &mut VecAssembler<Aarch64Relocation>,
+    entries: &mut Vec<PcMapEntry>,
+    recovery: &mut Vec<RecoveryEntry>,
+    guest: GuestVa,
+    target: dynasmrt::DynamicLabel,
+    scratch: super::types::BiasedExclusiveScratch,
+    resume: BiasedExclusiveResume,
+) -> Result<(), DsrError> {
+    recovery.push(RecoveryEntry {
+        cache: current_offset(assembler)?,
+        action: RecoveryAction::RecoverBiasedExclusive(BiasedExclusiveRecovery { scratch, resume }),
+    });
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; b =>target
+    );
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "biased exclusive recovery metadata advances with each materialization word"
+)]
+fn emit_biased_exclusive_mov_u64(
+    assembler: &mut VecAssembler<Aarch64Relocation>,
+    entries: &mut Vec<PcMapEntry>,
+    recovery: &mut Vec<RecoveryEntry>,
+    guest: GuestVa,
+    register: u32,
+    value: u64,
+    scratch: super::types::BiasedExclusiveScratch,
+    resume: BiasedExclusiveResume,
+) -> Result<(), DsrError> {
+    let start = current_offset(assembler)?;
+    emit_mov_u64(assembler, entries, guest, register, value)?;
+    let end = current_offset(assembler)?;
+    for offset in (start.get()..end.get()).step_by(4) {
+        recovery.push(RecoveryEntry {
+            cache: CacheOffset::published(offset),
+            action: RecoveryAction::RecoverBiasedExclusive(BiasedExclusiveRecovery {
+                scratch,
+                resume,
+            }),
+        });
+    }
+    Ok(())
+}
+
+fn exclusive_access_width(memory: super::types::MemoryAccess) -> Result<u64, DsrError> {
+    let element_width = 1_u64
+        .checked_shl(memory.word >> 30)
+        .ok_or_else(|| DsrError::BlockPolicy("exclusive access width overflow".to_string()))?;
+    if super::decode::exclusive_shape(memory.op) == Some(super::decode::ExclusiveShape::Pair) {
+        element_width
+            .checked_mul(2)
+            .ok_or_else(|| DsrError::BlockPolicy("exclusive pair width overflow".to_string()))
+    } else {
+        Ok(element_width)
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the fused region and its recovery/exit metadata are one lowering unit"
+)]
+fn emit_biased_exclusive_region(
+    assembler: &mut VecAssembler<Aarch64Relocation>,
+    entries: &mut Vec<PcMapEntry>,
+    direct_links: &mut Vec<DirectLink>,
+    recovery: &mut Vec<RecoveryEntry>,
+    plan: &BlockPlan,
+    exit: super::types::ExclusiveRegionExit,
+    scratch: super::types::BiasedExclusiveScratch,
+    host_bias: super::super::address::NativeHostBias,
+) -> Result<(), DsrError> {
+    let address = scratch.address.index();
+    let bias = scratch.bias.index();
+    let load_memory = plan
+        .instructions
+        .first()
+        .and_then(|instruction| match instruction.action {
+            InstAction::Memory(memory) => Some(memory),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            DsrError::BlockPolicy("biased exclusive region has no load instruction".to_string())
+        })?;
+    let super::types::MemoryBase::Register(base) = load_memory.base else {
+        return Err(unsupported_action(
+            plan,
+            exit.start,
+            exit.load_word,
+            "biased exclusive region has a non-register base",
+        ));
+    };
+    let base = gpr_index(base).ok_or_else(|| {
+        unsupported_action(
+            plan,
+            exit.start,
+            exit.load_word,
+            "biased exclusive region has a non-GPR base",
+        )
+    })?;
+    let access_width = exclusive_access_width(load_memory)?;
+    let access_tail = u32::try_from(access_width.saturating_sub(1)).map_err(|_| {
+        DsrError::BlockPolicy("biased exclusive access tail exceeds u32".to_string())
+    })?;
+
+    let slow_restore = assembler.new_dynamic_label();
+    let slow_tail = assembler.new_dynamic_label();
+    let region_top = assembler.new_dynamic_label();
+    let success_restore = assembler.new_dynamic_label();
+    let success_tail = assembler.new_dynamic_label();
+
+    // Both scratch values are saved before either register changes. Recovery
+    // begins at the first scratch-mutating instruction, when both context
+    // slots hold the complete guest state.
+    emit_word(
+        assembler,
+        entries,
+        exit.start,
+        0xf900_0000 | ((1120 / 8) << 10) | (28 << 5) | address,
+    )?;
+    // At the second spill boundary neither scratch has changed yet. A Noop is
+    // the complete recovery action until this store publishes the bias value;
+    // the following scratch-mutating instruction begins typed dual restore.
+    recovery.push(RecoveryEntry {
+        cache: current_offset(assembler)?,
+        action: RecoveryAction::Noop,
+    });
+    emit_word(
+        assembler,
+        entries,
+        exit.start,
+        0xf900_0000 | ((1128 / 8) << 10) | (28 << 5) | bias,
+    )?;
+
+    let load_resume = BiasedExclusiveResume::Load;
+    emit_biased_exclusive_word(
+        assembler,
+        entries,
+        recovery,
+        exit.start,
+        0xaa00_03e0 | (base << 16) | address,
+        scratch,
+        load_resume,
+    )?;
+
+    // Validate both the base and the inclusive access end without changing
+    // NZCV. Checking the base first proves the subsequent small add cannot
+    // wrap u64; checking the end rejects an access that crosses the aperture.
+    emit_biased_exclusive_word(
+        assembler,
+        entries,
+        recovery,
+        exit.start,
+        0xd340_fc00 | (BIASED_FAST_ADDRESS_BITS << 16) | (address << 5) | bias,
+        scratch,
+        load_resume,
+    )?;
+    emit_biased_exclusive_word(
+        assembler,
+        entries,
+        recovery,
+        exit.start,
+        0xb400_0040 | bias, // cbz bias, +8
+        scratch,
+        load_resume,
+    )?;
+    emit_biased_exclusive_branch(
+        assembler,
+        entries,
+        recovery,
+        exit.start,
+        slow_restore,
+        scratch,
+        load_resume,
+    )?;
+    emit_biased_exclusive_word(
+        assembler,
+        entries,
+        recovery,
+        exit.start,
+        0x9100_0000 | (access_tail << 10) | (address << 5) | bias,
+        scratch,
+        load_resume,
+    )?;
+    emit_biased_exclusive_word(
+        assembler,
+        entries,
+        recovery,
+        exit.start,
+        0xd340_fc00 | (BIASED_FAST_ADDRESS_BITS << 16) | (bias << 5) | bias,
+        scratch,
+        load_resume,
+    )?;
+    emit_biased_exclusive_word(
+        assembler,
+        entries,
+        recovery,
+        exit.start,
+        0xb400_0040 | bias, // cbz bias, +8
+        scratch,
+        load_resume,
+    )?;
+    emit_biased_exclusive_branch(
+        assembler,
+        entries,
+        recovery,
+        exit.start,
+        slow_restore,
+        scratch,
+        load_resume,
+    )?;
+    emit_biased_exclusive_mov_u64(
+        assembler,
+        entries,
+        recovery,
+        exit.start,
+        bias,
+        host_bias.get(),
+        scratch,
+        load_resume,
+    )?;
+    emit_biased_exclusive_word(
+        assembler,
+        entries,
+        recovery,
+        exit.start,
+        0x8b00_0000 | (bias << 16) | (address << 5) | address,
+        scratch,
+        load_resume,
+    )?;
+
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; =>region_top
+    );
+    let mut early_exit: Option<(
+        dynasmrt::DynamicLabel,
+        dynasmrt::DynamicLabel,
+        GuestVa,
+        GuestVa,
+    )> = None;
+    for instruction in &plan.instructions {
+        match instruction.action {
+            InstAction::Memory(memory) => {
+                let rewritten = (memory.word & !(0x1f << 5)) | (address << 5);
+                emit_biased_exclusive_word(
+                    assembler,
+                    entries,
+                    recovery,
+                    exit.start,
+                    rewritten,
+                    scratch,
+                    load_resume,
+                )?;
+            }
+            InstAction::Copy(word) => {
+                emit_biased_exclusive_word(
+                    assembler,
+                    entries,
+                    recovery,
+                    exit.start,
+                    word,
+                    scratch,
+                    load_resume,
+                )?;
+            }
+            InstAction::Direct(direct) => {
+                let word = exit.early_exit_word.ok_or_else(|| {
+                    DsrError::BlockPolicy(format!(
+                        "fused biased exclusive region has a body branch but no early-exit encoding at guest PC 0x{:x}",
+                        instruction.guest.raw()
+                    ))
+                })?;
+                let restore = assembler.new_dynamic_label();
+                let tail = assembler.new_dynamic_label();
+                let cont = assembler.new_dynamic_label();
+                let relocated = relocated_direct_word(word, direct, None)?;
+                emit_biased_exclusive_word(
+                    assembler,
+                    entries,
+                    recovery,
+                    exit.start,
+                    relocated,
+                    scratch,
+                    load_resume,
+                )?;
+                emit_biased_exclusive_branch(
+                    assembler,
+                    entries,
+                    recovery,
+                    exit.start,
+                    cont,
+                    scratch,
+                    load_resume,
+                )?;
+                emit_biased_exclusive_branch(
+                    assembler,
+                    entries,
+                    recovery,
+                    exit.start,
+                    restore,
+                    scratch,
+                    load_resume,
+                )?;
+                dynasmrt::dynasm!(assembler
+                    ; .arch aarch64
+                    ; =>cont
+                );
+                early_exit = Some((restore, tail, instruction.guest, direct.target));
+            }
+            _ => {
+                return Err(DsrError::BlockPolicy(format!(
+                    "unexpected action in fused biased exclusive region at guest PC 0x{:x}",
+                    instruction.guest.raw()
+                )));
+            }
+        }
+    }
+
+    let store_guest = plan
+        .instructions
+        .last()
+        .map(|instruction| instruction.guest)
+        .ok_or_else(|| {
+            DsrError::BlockPolicy("fused biased exclusive region has no instructions".to_string())
+        })?;
+    let retry_pc = GuestVa(
+        store_guest
+            .raw()
+            .checked_add(4)
+            .ok_or(DsrError::PcOverflow {
+                pc: store_guest.raw(),
+            })?,
+    );
+    let InstAction::Direct(retry_direct) = super::decode::classify(exit.retry_word, retry_pc)?
+    else {
+        return Err(DsrError::BlockPolicy(format!(
+            "fused biased exclusive region retry branch is not direct at guest PC 0x{:x}",
+            retry_pc.raw()
+        )));
+    };
+    let retry_resume = BiasedExclusiveResume::Retry;
+    let relocated_retry = relocated_direct_word(exit.retry_word, retry_direct, None)?;
+    emit_biased_exclusive_word(
+        assembler,
+        entries,
+        recovery,
+        retry_pc,
+        relocated_retry,
+        scratch,
+        retry_resume,
+    )?;
+    emit_biased_exclusive_branch(
+        assembler,
+        entries,
+        recovery,
+        retry_pc,
+        success_restore,
+        scratch,
+        retry_resume,
+    )?;
+    emit_biased_exclusive_branch(
+        assembler,
+        entries,
+        recovery,
+        retry_pc,
+        region_top,
+        scratch,
+        retry_resume,
+    )?;
+
+    let restore_address = 0xf940_0000 | ((1120 / 8) << 10) | (28 << 5) | address;
+    let restore_bias = 0xf940_0000 | ((1128 / 8) << 10) | (28 << 5) | bias;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; =>success_restore
+    );
+    emit_biased_exclusive_word(
+        assembler,
+        entries,
+        recovery,
+        retry_pc,
+        restore_address,
+        scratch,
+        retry_resume,
+    )?;
+    emit_biased_exclusive_word(
+        assembler,
+        entries,
+        recovery,
+        retry_pc,
+        restore_bias,
+        scratch,
+        retry_resume,
+    )?;
+    emit_biased_exclusive_branch(
+        assembler,
+        entries,
+        recovery,
+        retry_pc,
+        success_tail,
+        scratch,
+        retry_resume,
+    )?;
+
+    if let Some((restore, tail, _, _)) = early_exit {
+        dynasmrt::dynasm!(assembler
+            ; .arch aarch64
+            ; =>restore
+        );
+        emit_biased_exclusive_word(
+            assembler,
+            entries,
+            recovery,
+            exit.start,
+            CLREX_WORD,
+            scratch,
+            load_resume,
+        )?;
+        emit_biased_exclusive_word(
+            assembler,
+            entries,
+            recovery,
+            exit.start,
+            restore_address,
+            scratch,
+            load_resume,
+        )?;
+        emit_biased_exclusive_word(
+            assembler,
+            entries,
+            recovery,
+            exit.start,
+            restore_bias,
+            scratch,
+            load_resume,
+        )?;
+        emit_biased_exclusive_branch(
+            assembler,
+            entries,
+            recovery,
+            exit.start,
+            tail,
+            scratch,
+            load_resume,
+        )?;
+    }
+
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; =>slow_restore
+    );
+    emit_biased_exclusive_word(
+        assembler,
+        entries,
+        recovery,
+        exit.start,
+        restore_address,
+        scratch,
+        load_resume,
+    )?;
+    emit_biased_exclusive_word(
+        assembler,
+        entries,
+        recovery,
+        exit.start,
+        restore_bias,
+        scratch,
+        load_resume,
+    )?;
+    emit_biased_exclusive_branch(
+        assembler,
+        entries,
+        recovery,
+        exit.start,
+        slow_tail,
+        scratch,
+        load_resume,
+    )?;
+
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; =>success_tail
+    );
+    emit_region_direct_exit(assembler, entries, direct_links, retry_pc, exit.end, false)?;
+    if let Some((_, tail, branch_guest, target)) = early_exit {
+        dynasmrt::dynasm!(assembler
+            ; .arch aarch64
+            ; =>tail
+        );
+        emit_region_direct_exit(
+            assembler,
+            entries,
+            direct_links,
+            branch_guest,
+            target,
+            false,
+        )?;
+    }
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; =>slow_tail
+    );
+    emit_gateway_exit(
+        assembler,
+        entries,
+        exit.start,
+        exit.fallback.resume,
+        Some(exit.start),
+        6,
+        super::gateway::sensitive_exit_address(),
+    )
+}
+
 /// Lower a fused exclusive region to native code. The block prologue has already
 /// been emitted; this emits, in one straight-line block:
 ///   1. the region body (`BlockPlan::instructions` = load, straight-line
@@ -1831,25 +2383,43 @@ fn emit_region_direct_exit(
 ///      with CLREX because the store never ran and the load's reservation is
 ///      still live (Hazard B).
 ///
-/// Fusion is Direct (native16k) only; the planner never fuses in biased mode
-/// (its verbatim emission would need an x18/x28 scratch spill inside the
-/// reservation window), so the biased arm here is defense-in-depth for the
-/// `:1442` tripwire's invariant.
+/// Direct mode keeps the established verbatim lowering. Biased mode has a
+/// separately tested scratch-based lowering, but the production planner still
+/// selects `BiasedDisabled`, so that path is emitted only by focused tests until
+/// its runtime recovery handler is enabled in the next task.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "direct and biased exclusive lowering share the planned region payload"
+)]
 fn emit_exclusive_region(
     assembler: &mut VecAssembler<Aarch64Relocation>,
     entries: &mut Vec<PcMapEntry>,
     direct_links: &mut Vec<DirectLink>,
+    recovery: &mut Vec<RecoveryEntry>,
     plan: &BlockPlan,
     exit: super::types::ExclusiveRegionExit,
+    fusion: super::types::ExclusiveFusionSite,
     mode: EmitAddressMode,
 ) -> Result<(), DsrError> {
-    if let EmitAddressMode::Biased { .. } = mode {
-        return Err(unsupported_action(
+    if let EmitAddressMode::Biased { host_bias } = mode {
+        let scratch = fusion.biased_scratch.ok_or_else(|| {
+            unsupported_action(
+                plan,
+                exit.start,
+                exit.load_word,
+                "biased exclusive region has no scratch plan",
+            )
+        })?;
+        return emit_biased_exclusive_region(
+            assembler,
+            entries,
+            direct_links,
+            recovery,
             plan,
-            exit.start,
-            exit.load_word,
-            "exclusive region fusion is unsupported in biased mode",
-        ));
+            exit,
+            scratch,
+            host_bias,
+        );
     }
 
     let region_top = assembler.new_dynamic_label();
@@ -2119,7 +2689,7 @@ fn emit_block_inner(
             });
         }
     }
-    if let PlannedExit::ExclusiveRegion { exit, .. } = plan.exit {
+    if let PlannedExit::ExclusiveRegion { exit, fusion, .. } = plan.exit {
         // A fused exclusive region (LDXR/LDAXR .. STXR/STLXR CAS/RMW retry loop)
         // is lowered to native code that executes in-guest without a gateway
         // trap. It bypasses the generic body/exit path entirely because the
@@ -2131,8 +2701,10 @@ fn emit_block_inner(
             &mut assembler,
             &mut entries,
             &mut direct_links,
+            &mut recovery,
             plan,
             exit,
+            fusion,
             mode,
         )?;
     } else {
@@ -3545,7 +4117,8 @@ mod tests {
 
     mod exclusive_region_emission {
         use super::super::super::types::{
-            ExclusiveFusionDisposition, ExclusiveFusionSite, ExclusiveRegionExit,
+            BiasedExclusiveScratch, DsrScratchGpr, ExclusiveFusionDisposition, ExclusiveFusionSite,
+            ExclusiveRegionExit,
         };
         use super::*;
 
@@ -3555,6 +4128,19 @@ mod tests {
         const CMP_W0_W2: u32 = 0x6b02_001f;
         const STLXR_W3_W4_X1: u32 = 0x8803_fc24;
         const CLREX: u32 = 0xd503_3f5f;
+
+        struct TestEmittedBlock {
+            _cache: TranslationCache,
+            emitted: EmittedBlock,
+        }
+
+        impl std::ops::Deref for TestEmittedBlock {
+            type Target = EmittedBlock;
+
+            fn deref(&self) -> &Self::Target {
+                &self.emitted
+            }
+        }
 
         fn encode_b_cond(pc: GuestVa, target: GuestVa, cond: u32) -> u32 {
             let offset = (target.raw() as i64 - pc.raw() as i64) / 4;
@@ -3566,6 +4152,10 @@ mod tests {
             let offset = (target.raw() as i64 - pc.raw() as i64) / 4;
             let imm19 = (offset as u32) & 0x7_ffff;
             0x3500_0000 | (imm19 << 5) | rt
+        }
+
+        fn with_base_register(word: u32, register: u32) -> u32 {
+            (word & !(0x1f << 5)) | (register << 5)
         }
 
         /// Build the `ExclusiveRegion` `BlockPlan` the planner would produce for
@@ -3636,6 +4226,37 @@ mod tests {
                 .collect()
         }
 
+        fn emit_test_biased_cas() -> Result<TestEmittedBlock, DsrError> {
+            let start = GuestVa(0x4000);
+            let branch = encode_b_cond(GuestVa(0x4008), GuestVa(0x4014), 1);
+            let retry = encode_cbnz_w(GuestVa(0x4010), start, 3);
+            let mut plan = region_plan(
+                start,
+                &[LDAXR_W0_X1, CMP_W0_W2, branch, STLXR_W3_W4_X1],
+                retry,
+                Some(branch),
+            );
+            let scratch = BiasedExclusiveScratch {
+                address: DsrScratchGpr::new(17).expect("x17 scratch"),
+                bias: DsrScratchGpr::new(16).expect("x16 scratch"),
+            };
+            let PlannedExit::ExclusiveRegion { fusion, .. } = &mut plan.exit else {
+                panic!("test plan must be an exclusive region");
+            };
+            fusion.disposition = ExclusiveFusionDisposition::FusedBiased;
+            fusion.biased_scratch = Some(scratch);
+
+            let host_bias =
+                crate::native_darwin::address::NativeHostBias::new(0x80_0000_0000, 16 * 1024)
+                    .expect("construct test host bias");
+            let mut cache = TranslationCache::new(16 * 1024).expect("allocate cache");
+            let emitted = emit_block(&mut cache, &plan, EmitAddressMode::Biased { host_bias })?;
+            Ok(TestEmittedBlock {
+                _cache: cache,
+                emitted,
+            })
+        }
+
         fn word_touches_memory(word: u32, pc: u64) -> bool {
             bad64::decode(word, pc).is_ok_and(|inst| {
                 inst.operands().iter().any(|operand| {
@@ -3650,6 +4271,199 @@ mod tests {
                     )
                 })
             })
+        }
+
+        #[test]
+        fn biased_region_rewrites_only_the_exclusive_base_and_keeps_pair_clean() {
+            let emitted = emit_test_biased_cas().expect("emit biased CAS");
+            let words = emitted_words(&emitted);
+            let rewritten_load = with_base_register(LDAXR_W0_X1, 17);
+            let rewritten_store = with_base_register(STLXR_W3_W4_X1, 17);
+            let load = words
+                .iter()
+                .position(|word| *word == rewritten_load)
+                .expect("rewritten load");
+            let store = words
+                .iter()
+                .position(|word| *word == rewritten_store)
+                .expect("rewritten store");
+            assert!(!words.contains(&LDAXR_W0_X1));
+            assert!(!words.contains(&STLXR_W3_W4_X1));
+            for (offset, word) in words[load + 1..store].iter().copied().enumerate() {
+                let pc = emitted.entry().host().raw() as u64 + ((load + 1 + offset) * 4) as u64;
+                assert!(
+                    !word_touches_memory(word, pc),
+                    "memory word 0x{word:08x} inside pair"
+                );
+            }
+        }
+
+        #[test]
+        fn biased_region_recovery_covers_every_post_spill_instruction() {
+            let emitted = emit_test_biased_cas().expect("emit biased CAS");
+            let words = emitted_words(&emitted);
+            let save_address = 0xf900_0000 | ((1120 / 8) << 10) | (28 << 5) | 17;
+            let save_bias = 0xf900_0000 | ((1128 / 8) << 10) | (28 << 5) | 16;
+            let first_spill = words
+                .iter()
+                .position(|word| *word == save_address)
+                .expect("address scratch spill");
+            assert_eq!(words[first_spill + 1], save_bias);
+            assert!(emitted.recovery().iter().any(|entry| {
+                entry.cache.get() == ((first_spill + 1) * 4) as u32
+                    && entry.action == RecoveryAction::Noop
+            }));
+            let offsets = emitted
+                .recovery()
+                .iter()
+                .filter(|entry| matches!(entry.action, RecoveryAction::RecoverBiasedExclusive(_)))
+                .map(|entry| entry.cache.get())
+                .collect::<Vec<_>>();
+            assert!(
+                offsets.len() > 4,
+                "prelude, pair, retry, and restores need recovery"
+            );
+            assert_eq!(offsets[0], ((first_spill + 2) * 4) as u32);
+            assert!(offsets.windows(2).all(|pair| pair[1] == pair[0] + 4));
+            assert!(offsets.iter().all(|offset| {
+                emitted
+                    .recovery()
+                    .iter()
+                    .find(|entry| entry.cache.get() == *offset)
+                    .is_some_and(|entry| !entry.action.instruction_complete())
+            }));
+
+            let rewritten_load = with_base_register(LDAXR_W0_X1, 17);
+            let rewritten_store = with_base_register(STLXR_W3_W4_X1, 17);
+            let load = words
+                .iter()
+                .position(|word| *word == rewritten_load)
+                .expect("rewritten load");
+            let store = words
+                .iter()
+                .position(|word| *word == rewritten_store)
+                .expect("rewritten store");
+            for index in [load, store] {
+                let offset = CacheOffset::published((index * 4) as u32);
+                assert_eq!(emitted.map().guest_for_cache(offset), Some(GuestVa(0x4000)));
+                assert!(emitted.recovery().iter().any(|entry| {
+                    entry.cache == offset
+                        && matches!(
+                            entry.action,
+                            RecoveryAction::RecoverBiasedExclusive(BiasedExclusiveRecovery {
+                                resume: BiasedExclusiveResume::Load,
+                                ..
+                            })
+                        )
+                }));
+            }
+            let retry = words[store + 1..]
+                .iter()
+                .enumerate()
+                .find_map(|(offset, word)| {
+                    let index = store + 1 + offset;
+                    bad64::decode(
+                        *word,
+                        emitted.entry().host().raw() as u64 + (index * 4) as u64,
+                    )
+                    .ok()
+                    .filter(|instruction| instruction.op() == bad64::Op::CBNZ)
+                    .map(|_| index)
+                })
+                .expect("rewritten retry branch");
+            let retry_offset = CacheOffset::published((retry * 4) as u32);
+            assert_eq!(
+                emitted.map().guest_for_cache(retry_offset),
+                Some(GuestVa(0x4010))
+            );
+            assert!(emitted.recovery().iter().any(|entry| {
+                entry.cache == retry_offset
+                    && matches!(
+                        entry.action,
+                        RecoveryAction::RecoverBiasedExclusive(BiasedExclusiveRecovery {
+                            resume: BiasedExclusiveResume::Retry,
+                            ..
+                        })
+                    )
+            }));
+        }
+
+        #[test]
+        fn biased_region_slow_stub_restores_scratches_before_sensitive_exit() {
+            let emitted = emit_test_biased_cas().expect("emit biased CAS");
+            let words = emitted_words(&emitted);
+            let base = emitted.entry().host().raw() as u64;
+            let lsr_address = 0xd340_fc00 | (BIASED_FAST_ADDRESS_BITS << 16) | (17 << 5) | 16;
+            let validation = words
+                .iter()
+                .position(|word| *word == lsr_address)
+                .expect("address aperture validation");
+            let slow_branch = validation + 2;
+            let slow_pc = base + (slow_branch * 4) as u64;
+            let InstAction::Direct(slow) =
+                super::super::super::decode::classify(words[slow_branch], GuestVa(slow_pc))
+                    .expect("decode slow branch")
+            else {
+                panic!("invalid-address edge must branch to its restore stub");
+            };
+            let slow_restore =
+                usize::try_from((slow.target.raw() - base) / 4).expect("slow restore index");
+            let restore_address = 0xf940_0000 | ((1120 / 8) << 10) | (28 << 5) | 17;
+            let restore_bias = 0xf940_0000 | ((1128 / 8) << 10) | (28 << 5) | 16;
+            assert_eq!(
+                &words[slow_restore..slow_restore + 2],
+                &[restore_address, restore_bias]
+            );
+
+            let tail_branch = slow_restore + 2;
+            let tail_pc = base + (tail_branch * 4) as u64;
+            let InstAction::Direct(tail) =
+                super::super::super::decode::classify(words[tail_branch], GuestVa(tail_pc))
+                    .expect("decode slow-tail branch")
+            else {
+                panic!("restored slow edge must branch to the sensitive tail");
+            };
+            let slow_tail =
+                usize::try_from((tail.target.raw() - base) / 4).expect("slow tail index");
+            let status_six = 0x5280_0000 | (6 << 5) | 17;
+            let status = words[slow_tail..]
+                .iter()
+                .position(|word| *word == status_six)
+                .map(|offset| slow_tail + offset)
+                .expect("status-6 sensitive exit");
+            let target_store = 0xf900_0000 | ((1080 / 8) << 10) | (28 << 5) | 17;
+            let target = words[slow_tail..status]
+                .iter()
+                .position(|word| *word == target_store)
+                .map(|offset| slow_tail + offset)
+                .expect("sensitive exit target store");
+            let target_value = [
+                0xd280_0000 | (0x4004 << 5) | 17,
+                0xf280_0000 | (1 << 21) | 17,
+                0xf280_0000 | (2 << 21) | 17,
+                0xf280_0000 | (3 << 21) | 17,
+            ];
+            assert_eq!(
+                &words[target - target_value.len()..target],
+                &target_value,
+                "slow sensitive exit target must use the published fallback resume PC"
+            );
+            let source_store = 0xf900_0000 | ((1088 / 8) << 10) | (28 << 5) | 17;
+            let source = words[..status]
+                .iter()
+                .rposition(|word| *word == source_store)
+                .expect("sensitive exit source store");
+            let source_value = [
+                0xd280_0000 | (0x4000 << 5) | 17,
+                0xf280_0000 | (1 << 21) | 17,
+                0xf280_0000 | (2 << 21) | 17,
+                0xf280_0000 | (3 << 21) | 17,
+            ];
+            assert_eq!(
+                &words[source - source_value.len()..source],
+                &source_value,
+                "slow sensitive exit source must be the original load PC"
+            );
         }
 
         /// (a) A minimal fused region (`ldxr; stxr; cbnz`) emits the exclusive
