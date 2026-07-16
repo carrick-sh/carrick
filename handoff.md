@@ -259,3 +259,26 @@ exceeds the order-of-magnitude cutoff.
    supporting measurement debt. Fix it when a profiled census is needed to
    select or explain the next runtime change, but do not let it block the
    c94-first performance campaign.
+
+### Production promotion withdrawn after whole-branch review
+
+The post-measurement whole-branch review found two concrete fallback holes and
+an incomplete asynchronous-recovery proof. The planner now rejects SP-based
+biased regions as `biased-address-form-unsupported`, rejects early conditional
+branches targeting any instruction inside the recognized region, and keeps
+direct SP fusion intact. Red-first production-planner regressions cover both.
+
+More importantly, forced-recovery analysis showed that resuming at the load is
+not sufficient for the recognizer's general `Copy` body: scratch restoration
+does not roll back arbitrary guest-register or NZCV mutations already executed
+before an asynchronous fault/kick. Since the measured wall benefit was only
+2.39 percent, production biased fusion is fail-closed again as
+`BiasedDisabled`. The recognizer, typed census, disabled emitter, and focused
+emitter/recovery tests remain as experimental coverage infrastructure; the
+enabled measurements above are historical evidence, not current production
+behavior. Do not re-enable without deterministic prelude/in-region/early-exit/
+retry fault-and-kick tests proving registers, NZCV, PC, and monitor cleanup.
+
+The next performance campaign therefore starts from the correctness-qualified
+sensitive fallback and targets the compiler's process-lifecycle multiplication,
+not another exclusive-fusion expansion.
