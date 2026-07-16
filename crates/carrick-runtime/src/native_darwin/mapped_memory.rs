@@ -2789,6 +2789,29 @@ impl NativeMappedMemory {
         Ok(u32::from_le_bytes(word))
     }
 
+    pub(super) fn instruction_fingerprint_words(
+        &self,
+        start: carrick_guest_mem::GuestVa,
+        max_instructions: usize,
+    ) -> Result<Vec<u32>, RuntimeError> {
+        let page_end = (start.raw() | self.linux_page_size.saturating_sub(1)).saturating_add(1);
+        let requested = max_instructions
+            .checked_mul(std::mem::size_of::<u32>())
+            .ok_or_else(|| RuntimeError::Unsupported("instruction fingerprint overflow".into()))?;
+        let available = usize::try_from(page_end.saturating_sub(start.raw())).unwrap_or(usize::MAX);
+        let length = requested.min(available);
+        let bytes = self.read_bytes_raw(start.raw(), length).map_err(|error| {
+            RuntimeError::Unsupported(format!(
+                "native Darwin instruction fingerprint failed at 0x{:x}: {error}",
+                start.raw()
+            ))
+        })?;
+        Ok(bytes
+            .chunks_exact(std::mem::size_of::<u32>())
+            .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+            .collect())
+    }
+
     pub(super) fn write_u64(&mut self, address: u64, value: u64) -> Result<(), RuntimeError> {
         if !self.region_contains(address, std::mem::size_of::<u64>()) {
             return Err(RuntimeError::Unsupported(format!(
