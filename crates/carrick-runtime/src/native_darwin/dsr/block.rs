@@ -168,8 +168,9 @@ fn plan_with_reader(
         //     fuses. Without this split the load would never be a block start
         //     in the uncontended case (the retry edge that targets it is not
         //     taken), and would never fuse.
-        // Biased execution remains disabled, but the shared analysis records
-        // why every exclusive site did or did not qualify.
+        // Biased execution is enabled only when the shared analysis can attach
+        // a complete scratch plan; every rejected site retains its sensitive
+        // fallback and typed disposition.
         let mut exclusive_fusion = None;
         if let InstAction::Sensitive(SensitiveExit {
             kind: SensitiveKind::Exclusive(load_word),
@@ -338,13 +339,12 @@ pub(super) fn plan_block(
     generation: CodeGeneration,
     max_instructions: usize,
 ) -> Result<BlockPlan, DsrError> {
-    // Direct mode keeps its existing fused execution. Biased mode shares the
-    // recognizer and records a scratch plan, but remains on the trap-and-emulate
-    // path until the biased emitter is enabled.
+    // Direct mode keeps its existing fused execution. Biased mode uses the
+    // shared recognizer and fuses only candidates with a complete scratch plan.
     let fusion_policy = match memory.address_mode() {
         super::super::address::NativeAddressMode::Direct => ExclusiveFusionPolicy::Direct,
         super::super::address::NativeAddressMode::Biased { .. } => {
-            ExclusiveFusionPolicy::BiasedDisabled
+            ExclusiveFusionPolicy::BiasedEnabled
         }
     };
     plan_with_reader(
@@ -1570,6 +1570,112 @@ mod tests {
                 encode_cbnz_w(retry_pc, start, 3),
                 SVC0,
             ]
+        }
+
+        fn plan_biased_memory_via_production(words: &[u32]) -> BlockPlan {
+            const BIAS: u64 = 0x80_0000_0000;
+            const PAGE_SIZE: u64 = 16 * 1024;
+            const GUEST_CODE: GuestVa = GuestVa(0x21_0000_0000);
+            let host_bias = crate::native_darwin::address::NativeHostBias::new(BIAS, PAGE_SIZE)
+                .expect("construct biased planner host bias");
+            let mapping = crate::native_darwin::address::OwnedHostMapping::map_exact(
+                carrick_guest_mem::HostVa((BIAS + GUEST_CODE.raw()) as usize),
+                PAGE_SIZE as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANON | libc::MAP_PRIVATE,
+            )
+            .expect("map biased planner fixture");
+            let code = words
+                .iter()
+                .flat_map(|word| word.to_le_bytes())
+                .collect::<Vec<_>>();
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    code.as_ptr(),
+                    mapping.range().start.raw() as *mut u8,
+                    code.len(),
+                );
+            }
+            let memory = crate::native_darwin::NativeMappedMemory {
+                address_mode: crate::native_darwin::address::NativeAddressMode::Biased {
+                    host_bias,
+                },
+                owned_host_ranges: std::sync::Arc::new(vec![mapping.range()]),
+                regions: vec![crate::native_darwin::NativeMappedRegion {
+                    start: GUEST_CODE.raw(),
+                    end: GUEST_CODE.raw() + PAGE_SIZE,
+                    host_protects: false,
+                    shared_futex: false,
+                    guest_writable: false,
+                    default_prot: crate::linux_abi::LINUX_PROT_READ
+                        | crate::linux_abi::LINUX_PROT_EXEC,
+                    shared_key_base: 0,
+                    shared_key_offset: 0,
+                }],
+                protections: crate::native_darwin::MemoryProtections::default(),
+                native_page_protections: std::collections::BTreeMap::new(),
+                native_write_exec_writable_pages: std::collections::BTreeSet::new(),
+                linux4k_page_protections: std::collections::BTreeMap::new(),
+                exclusive_sequences: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
+                host_page_size: PAGE_SIZE,
+                linux_page_size: PAGE_SIZE,
+                dsr_generations: super::super::super::cache::PageGenerationTable::new(PAGE_SIZE)
+                    .expect("construct planner generation table"),
+                dsr_translator: None,
+                host_access_lifts: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            };
+            plan_block(
+                &memory,
+                GUEST_CODE,
+                CodeGeneration::INITIAL,
+                EXCLUSIVE_REGION_SCAN_LIMIT,
+            )
+            .expect("plan biased memory through production policy")
+        }
+
+        #[test]
+        fn production_biased_exclusive_planner_fuses_only_safe_scratch_candidates() {
+            let start = GuestVa(0x21_0000_0000);
+            let eligible = plan_biased_memory_via_production(&canonical_cas(start));
+            assert!(matches!(
+                eligible.exit,
+                PlannedExit::ExclusiveRegion {
+                    fusion: ExclusiveFusionSite {
+                        disposition: ExclusiveFusionDisposition::FusedBiased,
+                        biased_scratch: Some(_),
+                        ..
+                    },
+                    ..
+                }
+            ));
+
+            let scratch_order = [
+                17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 30, 29, 27,
+            ];
+            let mut saturated = vec![LDAXR_W0_X1];
+            saturated.extend(
+                scratch_order
+                    .chunks(2)
+                    .map(|pair| encode_cmp_w(pair[0], pair.get(1).copied().unwrap_or(pair[0]))),
+            );
+            saturated.push(STLXR_W3_W4_X1);
+            let retry_pc = GuestVa(start.raw() + saturated.len() as u64 * 4);
+            saturated.push(encode_cbnz_w(retry_pc, start, 3));
+
+            let rejected = plan_biased_memory_via_production(&saturated);
+            assert!(matches!(
+                rejected.exit,
+                PlannedExit::Sensitive {
+                    fusion: Some(ExclusiveFusionSite {
+                        disposition: ExclusiveFusionDisposition::Rejected(
+                            ExclusiveFusionRejection::BiasedNoSafeScratch
+                        ),
+                        biased_scratch: None,
+                        ..
+                    }),
+                    ..
+                }
+            ));
         }
 
         #[test]

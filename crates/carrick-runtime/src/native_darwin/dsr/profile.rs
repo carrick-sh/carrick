@@ -1488,11 +1488,7 @@ mod tests {
         let frames = record
             .to_protocol_frames_with_resolver(snapshot, FlushGauges::default())
             .expect("serialize frames");
-        assert!(
-            frames
-                .iter()
-                .all(|frame| frame.len() + 1 <= DARWIN_PIPE_BUF)
-        );
+        assert!(frames.iter().all(|frame| frame.len() < DARWIN_PIPE_BUF));
         assert!(frames.iter().any(|frame| {
             frame.contains("frame=fusion-exec-a")
                 && frame.contains("fusion_eligible_backend_disabled=1")

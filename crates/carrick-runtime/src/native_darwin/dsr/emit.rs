@@ -2383,10 +2383,9 @@ fn emit_biased_exclusive_region(
 ///      with CLREX because the store never ran and the load's reservation is
 ///      still live (Hazard B).
 ///
-/// Direct mode keeps the established verbatim lowering. Biased mode has a
-/// separately tested scratch-based lowering, but the production planner still
-/// selects `BiasedDisabled`, so that path is emitted only by focused tests until
-/// its runtime recovery handler is enabled in the next task.
+/// Direct mode keeps the established verbatim lowering. Biased mode uses the
+/// separately tested scratch-based lowering only for plans whose structural
+/// analysis supplied a safe two-register scratch plan.
 #[allow(
     clippy::too_many_arguments,
     reason = "direct and biased exclusive lowering share the planned region payload"
@@ -4386,6 +4385,73 @@ mod tests {
                         })
                     )
             }));
+        }
+
+        #[test]
+        fn biased_exclusive_emitted_map_resumes_load_before_store_and_retry_after_store() {
+            let emitted = emit_test_biased_cas().expect("emit biased CAS");
+            let words = emitted_words(&emitted);
+            let rewritten_load = with_base_register(LDAXR_W0_X1, 17);
+            let rewritten_store = with_base_register(STLXR_W3_W4_X1, 17);
+            let load = words
+                .iter()
+                .position(|word| *word == rewritten_load)
+                .expect("rewritten load");
+            let store = words
+                .iter()
+                .position(|word| *word == rewritten_store)
+                .expect("rewritten store");
+            let pre_load = emitted
+                .recovery()
+                .iter()
+                .find(|entry| {
+                    entry.cache.get() < (load * 4) as u32
+                        && matches!(entry.action, RecoveryAction::RecoverBiasedExclusive(_))
+                })
+                .expect("pre-load recovery entry");
+            let between_pair = emitted
+                .recovery()
+                .iter()
+                .find(|entry| {
+                    entry.cache.get() > (load * 4) as u32
+                        && entry.cache.get() < (store * 4) as u32
+                        && matches!(entry.action, RecoveryAction::RecoverBiasedExclusive(_))
+                })
+                .expect("between-pair recovery entry");
+            let post_store = emitted
+                .recovery()
+                .iter()
+                .find(|entry| {
+                    entry.cache.get() > (store * 4) as u32
+                        && matches!(
+                            entry.action,
+                            RecoveryAction::RecoverBiasedExclusive(BiasedExclusiveRecovery {
+                                resume: BiasedExclusiveResume::Retry,
+                                ..
+                            })
+                        )
+                })
+                .expect("post-store recovery entry");
+
+            for entry in [pre_load, between_pair] {
+                assert_eq!(
+                    emitted.map().guest_for_cache(entry.cache),
+                    Some(GuestVa(0x4000))
+                );
+                assert!(matches!(
+                    entry.action,
+                    RecoveryAction::RecoverBiasedExclusive(BiasedExclusiveRecovery {
+                        resume: BiasedExclusiveResume::Load,
+                        ..
+                    })
+                ));
+                assert!(!entry.action.instruction_complete());
+            }
+            assert_eq!(
+                emitted.map().guest_for_cache(post_store.cache),
+                Some(GuestVa(0x4010))
+            );
+            assert!(!post_store.action.instruction_complete());
         }
 
         #[test]
