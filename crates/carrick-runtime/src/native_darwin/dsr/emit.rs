@@ -2760,6 +2760,7 @@ mod tests {
                 register: Some(bad64::Reg::X0),
                 resume: GuestVa(0x400c),
             },
+            fusion: None,
         };
 
         let mut continuation = copy_plan();
@@ -3543,7 +3544,9 @@ mod tests {
     }
 
     mod exclusive_region_emission {
-        use super::super::super::types::ExclusiveRegionExit;
+        use super::super::super::types::{
+            ExclusiveFusionDisposition, ExclusiveFusionSite, ExclusiveRegionExit,
+        };
         use super::*;
 
         // ldaxr w0, [x1] / cmp w0, w2 / stlxr w3, w4, [x1] -- verified encodings
@@ -3607,6 +3610,17 @@ mod tests {
                         store_word: *words.last().unwrap(),
                         retry_word,
                         early_exit_word,
+                        fallback: SensitiveExit {
+                            kind: SensitiveKind::Exclusive(words[0]),
+                            register: None,
+                            resume: GuestVa(start.raw() + 4),
+                        },
+                    },
+                    fusion: ExclusiveFusionSite {
+                        guest: start,
+                        word: words[0],
+                        disposition: ExclusiveFusionDisposition::FusedDirect,
+                        biased_scratch: None,
                     },
                 },
             }
