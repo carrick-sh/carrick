@@ -4,7 +4,7 @@ use std::sync::{Arc, OnceLock};
 use carrick_observability::probes;
 use parking_lot::{Mutex, RwLock};
 
-pub(super) mod artifact_spike;
+pub(crate) mod artifact_spike;
 pub(super) mod block;
 pub(super) mod cache;
 pub(super) mod decode;
@@ -916,6 +916,7 @@ impl Drop for ThreadTranslator {
 
 impl ProcessTranslator {
     pub(super) fn new(capacity: usize) -> Result<Self, types::DsrError> {
+        artifact_spike::ensure_authority_if_enabled()?;
         let translator = Self {
             state: RwLock::new(ProcessState {
                 cache: cache::TranslationCache::new(capacity)?,

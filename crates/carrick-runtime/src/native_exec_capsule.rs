@@ -54,6 +54,8 @@ pub(crate) struct NativeGuestExecV1 {
     #[serde(default)]
     pub(crate) shared_futex_waiters: Option<NativeReexecWaiterTableV1>,
     #[serde(default)]
+    pub(crate) artifact_spike: Option<NativeReexecArtifactSpikeV1>,
+    #[serde(default)]
     pub(crate) bind_mounts: Vec<crate::vfs::bind::NativeReexecBindMountV1>,
     pub(crate) fd_table: crate::dispatch::fd_table::NativeReexecFdTableV1,
     pub(crate) xsig: NativeReexecXsigV1,
@@ -93,6 +95,16 @@ pub(crate) struct NativeReexecWaiterTableV1 {
     pub(crate) host_device: u64,
     pub(crate) host_inode: u64,
     pub(crate) host_size: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct NativeReexecArtifactSpikeV1 {
+    pub(crate) host_fd: i32,
+    pub(crate) original_host_fd_flags: i32,
+    pub(crate) host_device: u64,
+    pub(crate) host_inode: u64,
+    pub(crate) host_size: u64,
+    pub(crate) authority_nonce: [u8; 16],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -175,6 +187,9 @@ impl NativeGuestExecV1 {
             || self
                 .shared_futex_waiters
                 .is_some_and(|waiters| waiters.host_fd < 0 || waiters.host_size == 0)
+            || self
+                .artifact_spike
+                .is_some_and(|artifact| artifact.host_fd < 0 || artifact.host_size == 0)
             || (self.process_state.ptrace_traceme && self.kernel_arena.is_none())
             || self.bind_mounts.len() > MAX_VECTOR_ITEMS
             || self.fd_table.files.len() > MAX_VECTOR_ITEMS
@@ -279,6 +294,7 @@ pub(crate) fn begin_guest_exec(
             host_size: authority.size,
         }
     })?;
+    let artifact_spike = crate::native_darwin::artifact_spike_authority_snapshot_if_enabled()?;
     let mut payload = NativeExecCapsuleV1 {
         producer_pid: unsafe { libc::getpid() as u32 },
         purpose: NativeExecCapsulePurposeV1::GuestExec,
@@ -296,6 +312,7 @@ pub(crate) fn begin_guest_exec(
             native_page_profile,
             kernel_arena: Some(kernel_arena),
             shared_futex_waiters: Some(shared_futex_waiters),
+            artifact_spike,
             bind_mounts,
             fd_table,
             xsig,
@@ -537,6 +554,13 @@ where
                 waiters.original_host_fd_flags & !libc::FD_CLOEXEC,
             )?;
         }
+        if let Some(artifact) = guest.artifact_spike {
+            prepared_host_fds.prepare(
+                artifact.host_fd,
+                artifact.original_host_fd_flags,
+                artifact.original_host_fd_flags & !libc::FD_CLOEXEC,
+            )?;
+        }
         prepared_host_fds.prepare(
             guest.xsig.host_fd,
             guest.xsig.original_host_fd_flags,
@@ -731,6 +755,9 @@ pub(crate) fn resume(fd: RawFd, nonce_hex: &str) -> anyhow::Result<crate::Native
             let guest = payload
                 .guest_exec
                 .ok_or_else(|| anyhow::anyhow!("native guest exec capsule has no guest state"))?;
+            if let Some(artifact) = &guest.artifact_spike {
+                crate::native_darwin::adopt_artifact_spike_for_resume(artifact)?;
+            }
             adopt_xsig(&guest.xsig)?;
             emit_lifecycle(
                 current_pid as i32,
@@ -1021,6 +1048,7 @@ mod tests {
                 native_page_profile: carrick_spec::NativePageProfileRequest::Native16k,
                 kernel_arena: None,
                 shared_futex_waiters: None,
+                artifact_spike: None,
                 bind_mounts: Vec::new(),
                 fd_table: crate::dispatch::fd_table::NativeReexecFdTableV1 {
                     files: Vec::new(),
@@ -1436,6 +1464,41 @@ mod tests {
         });
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn artifact_authority_survives_capsule_exec() {
+        let authority = tempfile::tempfile().expect("artifact authority");
+        authority
+            .set_len(256 * 1024 * 1024)
+            .expect("size artifact authority");
+        let nonce = [0x5a; 16];
+        authority
+            .write_all_at(&nonce, 0)
+            .expect("write authority nonce");
+        let fd = authority.as_raw_fd();
+        let original_flags = fd_flags(fd);
+        let identity = host_identity(fd);
+        let mut payload = sample();
+        payload
+            .guest_exec
+            .as_mut()
+            .expect("guest payload")
+            .artifact_spike = Some(super::NativeReexecArtifactSpikeV1 {
+            host_fd: fd,
+            original_host_fd_flags: original_flags,
+            host_device: identity.st_dev as u64,
+            host_inode: identity.st_ino,
+            host_size: identity.st_size as u64,
+            authority_nonce: nonce,
+        });
+
+        let result = exec_capsule_with(payload, [0x44; 16], None, |_| {
+            assert_eq!(fd_flags(fd) & libc::FD_CLOEXEC, 0);
+            std::io::Error::from_raw_os_error(libc::ENOEXEC)
+        });
+        assert!(result.is_err());
+        assert_eq!(fd_flags(fd), original_flags);
     }
 
     #[test]
