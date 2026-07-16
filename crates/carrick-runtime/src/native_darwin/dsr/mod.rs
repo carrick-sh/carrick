@@ -2107,6 +2107,17 @@ fn recover_rewrite_state(
     saved_indirect_x15: u64,
     saved_indirect_x30: u64,
 ) -> Result<(), types::DsrError> {
+    if let emit::RecoveryAction::RecoverBiasedExclusive(recovery) = action {
+        let address = usize::try_from(recovery.scratch.address.index()).map_err(|_| {
+            types::DsrError::CachePolicy("biased exclusive address scratch overflow".to_string())
+        })?;
+        let bias = usize::try_from(recovery.scratch.bias.index()).map_err(|_| {
+            types::DsrError::CachePolicy("biased exclusive bias scratch overflow".to_string())
+        })?;
+        snapshot.x[address] = saved_scratch;
+        snapshot.x[bias] = saved_context_scratch;
+        return Ok(());
+    }
     if let emit::RecoveryAction::RecoverBiasedMemory(recovery) = action {
         let saved_values = [
             saved_scratch,
@@ -2341,7 +2352,7 @@ fn recover_rewrite_state(
         }
         emit::RecoveryAction::RecoverBiasedExclusive(_) => {
             return Err(types::DsrError::CachePolicy(
-                "disabled biased exclusive recovery reached runtime handling".to_string(),
+                "biased exclusive recovery escaped its typed handler".to_string(),
             ));
         }
     };
@@ -2462,7 +2473,7 @@ mod tests {
     }
 
     #[test]
-    fn disabled_biased_exclusive_recovery_fails_closed() {
+    fn biased_exclusive_recovery_restores_both_scratch_registers() {
         let action = super::emit::RecoveryAction::RecoverBiasedExclusive(
             super::emit::BiasedExclusiveRecovery {
                 scratch: super::types::BiasedExclusiveScratch {
@@ -2474,18 +2485,35 @@ mod tests {
         );
         assert!(!action.instruction_complete());
         assert_eq!(
-            super::recovery_resume_pc(PC, Some(action)).expect("retry current load"),
+            super::recovery_resume_pc(PC, Some(action)).expect("resume exclusive load"),
             PC.raw()
         );
 
         let mut snapshot = super::super::NativeUcontextSnapshot::default();
-        let error = super::recover_rewrite_state(&mut snapshot, action, 0, 0, 0, 0, 0)
-            .expect_err("Task 4 recovery must remain unreachable and fail closed");
-        assert!(matches!(
-            error,
-            super::types::DsrError::CachePolicy(detail)
-                if detail == "disabled biased exclusive recovery reached runtime handling"
-        ));
+        snapshot.x[17] = 0xaaaa;
+        snapshot.x[16] = 0xbbbb;
+        super::recover_rewrite_state(&mut snapshot, action, 0x1717, 0x1616, 0, 0, 0)
+            .expect("recover biased exclusive scratch state");
+        assert_eq!(snapshot.x[17], 0x1717);
+        assert_eq!(snapshot.x[16], 0x1616);
+    }
+
+    #[test]
+    fn biased_exclusive_retry_recovery_is_not_instruction_complete() {
+        let action = super::emit::RecoveryAction::RecoverBiasedExclusive(
+            super::emit::BiasedExclusiveRecovery {
+                scratch: super::types::BiasedExclusiveScratch {
+                    address: super::types::DsrScratchGpr::new(17).expect("x17 scratch"),
+                    bias: super::types::DsrScratchGpr::new(16).expect("x16 scratch"),
+                },
+                resume: super::emit::BiasedExclusiveResume::Retry,
+            },
+        );
+        assert!(!action.instruction_complete());
+        assert_eq!(
+            super::recovery_resume_pc(GuestVa(0x4010), Some(action)).expect("resume guest retry"),
+            0x4010
+        );
     }
 
     #[test]

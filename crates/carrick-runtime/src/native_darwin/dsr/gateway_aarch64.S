@@ -117,6 +117,7 @@ _carrick_dsr_enter_raw:
 .globl _carrick_dsr_exit_unsupported
 .globl _carrick_dsr_exit_signal
 _carrick_dsr_exit_signal:
+    clrex
     // The signal handler already captured the full guest state. It switches
     // to a 16-byte recovery slot below the saved host SP and writes the active
     // context pointer there, avoiding Darwin's unreliable custom-x28 register
