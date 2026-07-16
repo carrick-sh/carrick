@@ -92,6 +92,7 @@ pub(super) struct ProcessTranslator {
 
 struct ProcessState {
     cache: cache::TranslationCache,
+    artifact_store: Option<artifact_spike::ArtifactStore>,
     blocks: BTreeMap<(carrick_guest_mem::GuestVa, types::CodeGeneration), types::CacheVa>,
     pending: BTreeMap<(carrick_guest_mem::GuestVa, types::CodeGeneration), Vec<cache::LinkSite>>,
     stats: ResolverStats,
@@ -114,6 +115,7 @@ struct SensitiveMetadata {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TranslationOutcome {
     BlockIndexHit,
+    ArtifactReplay,
     Translated,
 }
 
@@ -920,6 +922,7 @@ impl ProcessTranslator {
         let translator = Self {
             state: RwLock::new(ProcessState {
                 cache: cache::TranslationCache::new(capacity)?,
+                artifact_store: artifact_spike::store_if_enabled()?,
                 blocks: BTreeMap::new(),
                 pending: BTreeMap::new(),
                 stats: ResolverStats::default(),
@@ -1014,6 +1017,68 @@ impl ProcessState {
         self.blocks.get(&(guest, generation)).copied()
     }
 
+    fn publish_emitted(
+        &mut self,
+        tid: i32,
+        memory: &super::NativeMappedMemory,
+        key: (carrick_guest_mem::GuestVa, types::CodeGeneration),
+        source_page: carrick_guest_mem::GuestVa,
+        observation: cache::PageGenerationObservation,
+        emitted: emit::EmittedBlock,
+        emitted_bytes: u64,
+        outcome: TranslationOutcome,
+    ) -> Result<TranslationResult, types::DsrError> {
+        let entry = emitted.entry();
+        let published_entry = self
+            .publications
+            .get_or_publish_profiled(tid, key, || entry);
+        if published_entry != entry {
+            self.stats.add(ResolverStat::DuplicatePublications, 1);
+            return Ok(TranslationResult {
+                entry: published_entry,
+                generation: key.1,
+                outcome,
+                emitted_bytes,
+                cache_used_bytes: u64::try_from(self.cache.used_bytes()).unwrap_or(u64::MAX),
+            });
+        }
+        self.published.push(PublishedBlock {
+            entry,
+            len: emitted.len(),
+            map: emitted.map().entries().to_vec(),
+            recovery: emitted.recovery().to_vec(),
+            _generation: observation,
+        });
+        let links = emitted.direct_links().to_vec();
+        self.blocks.insert(key, entry);
+        self.dependencies.record(source_page, key.0, key.1);
+        for link in links {
+            let target_generation = memory.dsr_generation_observation(link.target)?.expected();
+            let target_key = (link.target, target_generation);
+            let site = cache::LinkSite {
+                source: entry,
+                slot: link.slot,
+            };
+            if let Some(target) = self.blocks.get(&target_key) {
+                self.cache.patch_direct_branch(site, *target)?;
+            } else {
+                self.pending.entry(target_key).or_default().push(site);
+            }
+        }
+        if let Some(sites) = self.pending.remove(&key) {
+            for site in sites {
+                self.cache.patch_direct_branch(site, entry)?;
+            }
+        }
+        Ok(TranslationResult {
+            entry,
+            generation: key.1,
+            outcome,
+            emitted_bytes,
+            cache_used_bytes: u64::try_from(self.cache.used_bytes()).unwrap_or(u64::MAX),
+        })
+    }
+
     fn translate(
         &mut self,
         tid: i32,
@@ -1070,7 +1135,59 @@ impl ProcessState {
         );
         probes::dsr_translate_begin(tid, guest.raw(), generation.get());
         let translation_started = self.profiling.then(std::time::Instant::now);
+        let artifact_source_words = self
+            .artifact_store
+            .as_ref()
+            .and_then(|_| memory.instruction_fingerprint_words(guest, 256).ok());
+        let artifact_key = artifact_source_words
+            .as_ref()
+            .map(|words| artifact_spike::ArtifactKey::from_source(guest, words));
         let result = (|| -> Result<TranslationResult, types::DsrError> {
+            let artifact_template = artifact_key.and_then(|artifact_key| {
+                self.artifact_store
+                    .as_ref()
+                    .and_then(|store| store.lookup(artifact_key).ok().flatten())
+            });
+            if let (Some(template), Some(source_words)) =
+                (artifact_template, artifact_source_words.as_ref())
+                && template.source_words() == source_words
+            {
+                let mode: emit::EmitAddressMode = memory.address_mode().into();
+                let bindings = artifact_spike::ArtifactBindings::for_replay(
+                    observation.current_atomic() as *const std::sync::atomic::AtomicU64 as u64,
+                    generation.get(),
+                    mode,
+                )?;
+                if let Ok(emitted) =
+                    artifact_spike::replay_artifact(&mut self.cache, &template, &bindings)
+                {
+                    if observation.current() != generation {
+                        return Err(types::DsrError::GenerationChanged {
+                            page: guest.raw(),
+                            expected: generation.get(),
+                            observed: observation.current().get(),
+                        });
+                    }
+                    let emitted_bytes = u64::try_from(emitted.len()).unwrap_or(u64::MAX);
+                    probes::dsr_cache_event(
+                        tid,
+                        probes::DsrCacheEventKind::BlockPublish,
+                        guest.raw(),
+                        generation.get(),
+                        u64::try_from(self.cache.used_bytes()).unwrap_or(u64::MAX),
+                    );
+                    return self.publish_emitted(
+                        tid,
+                        memory,
+                        key,
+                        source_page,
+                        observation,
+                        emitted,
+                        emitted_bytes,
+                        TranslationOutcome::ArtifactReplay,
+                    );
+                }
+            }
             probes::dsr_translate_subphase_begin(
                 tid,
                 probes::DsrTranslationSubphase::Decode,
@@ -1169,12 +1286,40 @@ impl ProcessState {
             );
             let emit_started = self.profiling.then(std::time::Instant::now);
             let emitted_result = (|| {
-                let emitted = emit::emit_block_with_generation(
-                    &mut self.cache,
-                    &block,
-                    emit::GenerationGuard::new(observation.current_atomic(), generation),
-                    memory.address_mode().into(),
-                )?;
+                let artifact_eligible = self.artifact_store.is_some()
+                    && artifact_key.is_some()
+                    && artifact_source_words.is_some()
+                    && matches!(
+                        block.exit,
+                        block::PlannedExit::Syscall { .. }
+                            | block::PlannedExit::Direct { .. }
+                            | block::PlannedExit::Indirect { .. }
+                            | block::PlannedExit::Continue { .. }
+                    );
+                let (emitted, artifact) = if artifact_eligible {
+                    emit::emit_block_recording_artifact_optional(
+                        &mut self.cache,
+                        &block,
+                        emit::GenerationGuard::new(observation.current_atomic(), generation),
+                        memory.address_mode().into(),
+                        artifact_source_words.clone().unwrap_or_default(),
+                    )?
+                } else {
+                    (
+                        emit::emit_block_with_generation(
+                            &mut self.cache,
+                            &block,
+                            emit::GenerationGuard::new(observation.current_atomic(), generation),
+                            memory.address_mode().into(),
+                        )?,
+                        None,
+                    )
+                };
+                if let (Some(store), Some(artifact_key), Some(artifact)) =
+                    (self.artifact_store.as_ref(), artifact_key, artifact)
+                {
+                    let _ = store.insert(artifact_key, &artifact.template);
+                }
                 let emitted_bytes = u64::try_from(emitted.len()).unwrap_or(u64::MAX);
                 probes::dsr_cache_event(
                     tid,
@@ -1216,60 +1361,16 @@ impl ProcessState {
                 generation.get(),
             );
             let publication_started = self.profiling.then(std::time::Instant::now);
-            let entry = emitted.entry();
-            let publication_result = (|| -> Result<TranslationResult, types::DsrError> {
-                let published_entry = self
-                    .publications
-                    .get_or_publish_profiled(tid, key, || entry);
-                if published_entry != entry {
-                    self.stats.add(ResolverStat::DuplicatePublications, 1);
-                    return Ok(TranslationResult {
-                        entry: published_entry,
-                        generation,
-                        outcome: TranslationOutcome::Translated,
-                        emitted_bytes,
-                        cache_used_bytes: u64::try_from(self.cache.used_bytes())
-                            .unwrap_or(u64::MAX),
-                    });
-                }
-                self.published.push(PublishedBlock {
-                    entry,
-                    len: emitted.len(),
-                    map: emitted.map().entries().to_vec(),
-                    recovery: emitted.recovery().to_vec(),
-                    _generation: observation,
-                });
-                let links = emitted.direct_links().to_vec();
-                self.blocks.insert(key, entry);
-                self.dependencies.record(source_page, guest, generation);
-
-                for link in links {
-                    let target_generation =
-                        memory.dsr_generation_observation(link.target)?.expected();
-                    let target_key = (link.target, target_generation);
-                    let site = cache::LinkSite {
-                        source: entry,
-                        slot: link.slot,
-                    };
-                    if let Some(target) = self.blocks.get(&target_key) {
-                        self.cache.patch_direct_branch(site, *target)?;
-                    } else {
-                        self.pending.entry(target_key).or_default().push(site);
-                    }
-                }
-                if let Some(sites) = self.pending.remove(&key) {
-                    for site in sites {
-                        self.cache.patch_direct_branch(site, entry)?;
-                    }
-                }
-                Ok(TranslationResult {
-                    entry,
-                    generation,
-                    outcome: TranslationOutcome::Translated,
-                    emitted_bytes,
-                    cache_used_bytes: u64::try_from(self.cache.used_bytes()).unwrap_or(u64::MAX),
-                })
-            })();
+            let publication_result = self.publish_emitted(
+                tid,
+                memory,
+                key,
+                source_page,
+                observation,
+                emitted,
+                emitted_bytes,
+                TranslationOutcome::Translated,
+            );
             if let Some(started) = publication_started {
                 self.stats
                     .add_elapsed(ResolverStat::TranslationPublicationNs, started.elapsed());
@@ -1701,7 +1802,9 @@ impl ThreadTranslator {
             self.resume_entry = Some((guest, translated.generation, translated.entry));
             let outcome = match translated.outcome {
                 TranslationOutcome::BlockIndexHit => probes::DsrPrepareOutcome::BlockIndexHit,
-                TranslationOutcome::Translated => probes::DsrPrepareOutcome::Translated,
+                TranslationOutcome::ArtifactReplay | TranslationOutcome::Translated => {
+                    probes::DsrPrepareOutcome::Translated
+                }
             };
             Ok((translated.entry, translated.generation, outcome))
         })();
