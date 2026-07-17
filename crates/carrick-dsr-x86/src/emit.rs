@@ -39,7 +39,8 @@ use iced_x86::{
 
 use crate::block::{X86Block, X86Exit};
 use crate::gateway::{
-    CTX_EXIT_INDIRECT_ADDR, CTX_EXIT_SYSCALL_ADDR, CTX_SCRATCH, CTX_SCRATCH2, SNAP_GUEST_R15,
+    CTX_EXIT_INDIRECT_ADDR, CTX_EXIT_SENSITIVE_ADDR, CTX_EXIT_SYSCALL_ADDR, CTX_SCRATCH,
+    CTX_SCRATCH2, SNAP_GUEST_R15,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -85,9 +86,28 @@ pub fn emit_block(source: &[u8], block: &X86Block) -> Result<Vec<u8>, EmitError>
             out.extend_from_slice(&jmp_indirect_r15(CTX_EXIT_INDIRECT_ADDR));
             Ok(out)
         }
-        X86Exit::Sensitive { .. } => Err(EmitError::Unsupported("sensitive")),
+        X86Exit::Sensitive { va, .. } => {
+            // The sensitive instruction itself is NOT emitted: the body runs,
+            // then the sensitive stub returns to Rust, which services the
+            // instruction from the block's typed `kind` (rdtsc/cpuid/
+            // fsgsbase/gs-access) against the snapshot and re-enters after
+            // it. The caller pre-fills `exit_resume` with the instruction's
+            // VA so the run loop knows where servicing starts.
+            let mut out = emit_copy_body(source, block, va)?;
+            out.extend_from_slice(&jmp_indirect_r15(CTX_EXIT_SENSITIVE_ADDR));
+            Ok(out)
+        }
         X86Exit::Unsupported { .. } => Err(EmitError::Unsupported("unsupported-instruction")),
-        X86Exit::Continue { .. } => Err(EmitError::Unsupported("continue")),
+        X86Exit::Continue { target, .. } => {
+            // A structural boundary (page end / instruction cap), not a real
+            // terminator: every planned instruction emits, then execution
+            // exits through the indirect stub. The caller pre-fills
+            // `exit_resume` with `target`, so the captured snapshot resumes
+            // at the continuation VA.
+            let mut out = emit_copy_body(source, block, target)?;
+            out.extend_from_slice(&jmp_indirect_r15(CTX_EXIT_INDIRECT_ADDR));
+            Ok(out)
+        }
     }
 }
 
@@ -483,6 +503,24 @@ mod tests {
             out.windows(3).any(|w| w == [0x83, 0x00, 0x01]),
             "re-encoded RMW against the scratch base"
         );
+    }
+
+    #[test]
+    fn continue_exit_emits_body_and_indirect_exit() {
+        // Three nops with a 2-instruction cap: a structural Continue, not a
+        // terminator. The body emits and control exits via the indirect stub
+        // (exit_resume carries the continuation VA at run time).
+        static IMG: &[u8] = &[0x90, 0x90, 0x90];
+        let reader = |va: u64| {
+            let off = (va - BASE) as usize;
+            IMG.get(off..).map(|s| s.to_vec()).unwrap_or_default()
+        };
+        let block = plan_block(BASE, 2, 4096, reader).expect("plan");
+        assert!(matches!(block.exit, X86Exit::Continue { .. }));
+        let out = emit_block(IMG, &block).expect("emit");
+        assert_eq!(&out[..2], &[0x90, 0x90], "both capped instructions emit");
+        assert_eq!(out.len(), 2 + 7);
+        assert_eq!(out[2], 0x41, "REX.B prefix of the indirect exit jmp");
     }
 
     #[test]
