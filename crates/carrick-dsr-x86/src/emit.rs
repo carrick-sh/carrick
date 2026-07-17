@@ -17,7 +17,7 @@
 //! emitter rung.
 
 use crate::block::{X86Block, X86Exit};
-use crate::gateway::CTX_EXIT_SYSCALL_ADDR;
+use crate::gateway::{CTX_EXIT_INDIRECT_ADDR, CTX_EXIT_SYSCALL_ADDR};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum EmitError {
@@ -57,7 +57,23 @@ pub fn emit_block(source: &[u8], block: &X86Block) -> Result<Vec<u8>, EmitError>
             out.extend_from_slice(&jmp_indirect_r15(CTX_EXIT_SYSCALL_ADDR));
             Ok(out)
         }
-        X86Exit::ControlFlow { .. } => Err(EmitError::Unsupported("control-flow")),
+        X86Exit::ControlFlow { va, .. } => {
+            // Copy the straight-line body up to (not including) the branch,
+            // then exit to Rust, which resolves the target from the captured
+            // guest state (see `cflow::resolve`). The branch itself is not
+            // executed on the host — its semantics are applied in Rust.
+            let copy_len = (va - block.start) as usize;
+            if source.len() < copy_len {
+                return Err(EmitError::ShortSource {
+                    need: copy_len,
+                    got: source.len(),
+                });
+            }
+            let mut out = Vec::with_capacity(copy_len + 7);
+            out.extend_from_slice(&source[..copy_len]);
+            out.extend_from_slice(&jmp_indirect_r15(CTX_EXIT_INDIRECT_ADDR));
+            Ok(out)
+        }
         X86Exit::Sensitive { .. } => Err(EmitError::Unsupported("sensitive")),
         X86Exit::Unsupported { .. } => Err(EmitError::Unsupported("unsupported-instruction")),
         X86Exit::Continue { .. } => Err(EmitError::Unsupported("continue")),
@@ -88,17 +104,20 @@ mod tests {
     }
 
     #[test]
-    fn control_flow_is_not_lowered_yet() {
+    fn control_flow_lowers_to_the_indirect_exit() {
         const BASE: u64 = 0x40_0000;
-        static IMG: &[u8] = &[0xeb, 0x00]; // jmp +0
+        // nop (90); jmp +0 (eb 00) — one copy byte, then the branch exit.
+        static IMG: &[u8] = &[0x90, 0xeb, 0x00];
         let reader = |va: u64| {
             let off = (va - BASE) as usize;
             IMG.get(off..).map(|s| s.to_vec()).unwrap_or_default()
         };
         let block = plan_block(BASE, 256, 4096, reader).expect("plan");
-        assert_eq!(
-            emit_block(IMG, &block),
-            Err(EmitError::Unsupported("control-flow"))
-        );
+        let out = emit_block(IMG, &block).expect("emit");
+        // 1 copied body byte (the nop) + the 7-byte indirect exit; the branch
+        // (eb 00) is dropped — Rust resolves the target.
+        assert_eq!(&out[..1], &[0x90]);
+        assert_eq!(out.len(), 1 + 7);
+        assert_eq!(out[1], 0x41, "REX.B prefix of the exit jmp");
     }
 }

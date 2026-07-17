@@ -24,6 +24,7 @@
 //! decoded length for the planner's stride.
 
 pub mod block;
+pub mod cflow;
 pub mod decode;
 pub mod emit;
 pub mod gateway;
