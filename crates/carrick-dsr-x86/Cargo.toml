@@ -23,3 +23,4 @@ cc = "1"
 [dev-dependencies]
 carrick-native-freebsd = { path = "../carrick-native-freebsd" }
 libc.workspace = true
+goblin.workspace = true
