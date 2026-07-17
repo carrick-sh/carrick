@@ -4,9 +4,10 @@ use bad64::{Imm, Op, Operand, Reg, SysReg};
 use carrick_guest_mem::GuestVa;
 
 use super::types::{
-    DirectExit, DirectKind, DsrError, IndirectExit, IndirectKind, InstAction, MemoryAccess,
-    MemoryBase, MemoryClass, MemoryEffectiveAddress, MemoryIndexExtend, MemoryVirtualization,
-    MemoryWriteback, PcRelativeInst, PcRelativeKind, SensitiveExit, SensitiveKind,
+    CounterDestination, CounterRead, DirectExit, DirectKind, DsrError, IndirectExit, IndirectKind,
+    InstAction, MemoryAccess, MemoryBase, MemoryClass, MemoryEffectiveAddress, MemoryIndexExtend,
+    MemoryVirtualization, MemoryWriteback, PcRelativeInst, PcRelativeKind, SensitiveExit,
+    SensitiveKind,
 };
 
 const CHKFEAT_X16: u32 = 0xd503_251f;
@@ -219,6 +220,36 @@ fn encoded_base_index(register: Reg) -> Option<u32> {
         Some(31)
     } else {
         None
+    }
+}
+
+fn counter_destination(register: Reg) -> Option<CounterDestination> {
+    if register == Reg::XZR {
+        return Some(CounterDestination::Discard);
+    }
+    let index = (register as u32).checked_sub(Reg::X0 as u32)?;
+    (index <= 30).then_some(CounterDestination::Gpr(index as u8))
+}
+
+pub(super) fn counter_register(
+    word: u32,
+    pc: GuestVa,
+    destination: CounterDestination,
+) -> Result<Option<Reg>, DsrError> {
+    if destination == CounterDestination::Discard {
+        return Ok(None);
+    }
+    let instruction = bad64::decode(word, pc.raw()).map_err(|error| DsrError::Decode {
+        pc: pc.raw(),
+        word,
+        detail: format!("{error:?}"),
+    })?;
+    match instruction.operands() {
+        [
+            Operand::Reg { reg, .. },
+            Operand::SysReg(SysReg::CNTVCT_EL0),
+        ] if counter_destination(*reg) == Some(destination) => Ok(Some(*reg)),
+        _ => Err(malformed(pc, word, instruction.op())),
     }
 }
 
@@ -1068,12 +1099,14 @@ pub(super) fn classify(word: u32, pc: GuestVa) -> Result<InstAction, DsrError> {
                 sensitive(pc, SensitiveKind::ReadDczid, Some(*reg))
             }
             [
-                Operand::Reg { .. },
-                Operand::SysReg(SysReg::CNTVCT_EL0 | SysReg::CNTFRQ_EL0),
-            ] => {
-                // Native16k executes these host-readable EL0 registers
-                // directly. Keeping them in-cache is also essential for the
-                // guest vDSO and timing-heavy workloads.
+                Operand::Reg { reg, .. },
+                Operand::SysReg(SysReg::CNTVCT_EL0),
+            ] => counter_destination(*reg)
+                .map(|destination| InstAction::CounterRead(CounterRead { destination }))
+                .ok_or_else(|| malformed(pc, word, op)),
+            [Operand::Reg { .. }, Operand::SysReg(SysReg::CNTFRQ_EL0)] => {
+                // CNTFRQ_EL0 describes the architectural counter frequency
+                // and remains a direct host-readable register access.
                 Ok(virtualized())
             }
             [Operand::Reg { .. }, Operand::SysReg(SysReg::NZCV)] => Ok(virtualized()),

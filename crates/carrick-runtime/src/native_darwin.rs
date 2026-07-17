@@ -1833,6 +1833,21 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                                 ))
                             })?;
                     }
+                    dsr::types::SensitiveKind::ReadCounter => {
+                        #[cfg(target_os = "macos")]
+                        if let Some(register) = exit.register {
+                            let ticks = dsr::mach_absolute_time_ticks();
+                            if !native_snapshot_write_reg(&mut snapshot, register, ticks) {
+                                return Err(RuntimeError::Unsupported(format!(
+                                    "native DSR could not write counter result to {register}"
+                                )));
+                            }
+                        }
+                        #[cfg(not(target_os = "macos"))]
+                        return Err(RuntimeError::Unsupported(
+                            "native DSR counter fallback requires macOS".to_string(),
+                        ));
+                    }
                     dsr::types::SensitiveKind::ReadCtr => {
                         let register = required_register()?;
                         if !native_snapshot_write_reg(&mut snapshot, register, NATIVE_CTR_EL0) {
