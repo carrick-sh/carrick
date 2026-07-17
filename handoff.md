@@ -314,7 +314,22 @@ that skips the save). The exit stub captures rflags BEFORE the flag-clobbering
 `cmpl` that gates fxsave. The cflow hot path no longer allocates a Vec per
 branch (borrowed slice from the guest image).
 
-**Direct-branch chaining (task #9) — the design, fully worked out:**
+**Direct-branch chaining LANDED (task #9):** implemented per the design below.
+A block ending in a direct jmp/jcc now patches to jump straight to its
+successor's translated code (cold-stub + rel32 patch), so hot loops run
+entirely in the JIT. Proven: a 50M-iteration pure compute loop runs with
+`traps == 1` (zero per-iteration round-trips) and the correct result
+(`exit_code == 192`); dtrace shows execution parked in the JIT cache. Every
+exit self-sets its resume VA; the run loop dispatches on exit-status +
+snapshot.rip (the exiting block may differ from the entered one), distinguishes
+chain-miss from genuine-indirect via `chain_patch_site`, and sets `save_fpu=1`
+for chainable entries. Files: `emit::emit_block_linked`/`emit_cold_stub`,
+`gateway` `chain_patch_site`/`CTX_CHAIN_PATCH`, `native_freebsd` run loop +
+`patch_slot`. The remaining ceiling for HEAVY real workloads (std Rust
+`println!`, cpython) is now rung-2 SERVICING (a std/musl startup spin on an
+unserviced futex — task #8), not translation speed.
+
+The original design, for reference:
 
 Goal: for a direct `jmp rel`/`jcc rel` terminator, jump straight from the
 block's translated code to the TARGET block's translated code, keeping guest
