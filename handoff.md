@@ -1,6 +1,6 @@
 # Native Backend Performance & Correctness Handoff
 
-Date: 2026-07-15. Branch `codex/native-conformance-quality` (this baton lands on
+Date: 2026-07-16. Branch `codex/biased-exclusive-fusion-coverage` (this baton lands on
 `main` via fast-forward). The Darwin-native backend (no-VMM DSR path that runs
 Linux/AArch64 binaries directly on macOS/AArch64) has had a large,
 measured, whole-branch-reviewed performance and durability pass.
@@ -381,3 +381,16 @@ refresh ran; Docker was unavailable, so the Rust-only static probe was linked
 locally with `rust-lld` and executed only under the signed Carrick artifact.
 Fresh serialized `RUST_TEST_THREADS=1 just ci` completed with exit 0 in 28.29
 seconds after the probe and handoff were present.
+
+Final whole-branch review removed raw `CNTVCT_EL0` from capability, scale, and
+vvar-frequency acquisition. Commpage mode discovery now uses fallible
+`mach_vm_read_overwrite`; mode 0, mode 2, unknown values, and an unreadable mode
+select the scaled `mach_absolute_time` fallback when the exact scale is
+representable, otherwise `Unsupported`. Only explicit divergence diagnostics
+retain the raw counter pair.
+
+The post-review signed artifact has SHA-256
+`2eab8e4da479f9339679c670a558936e0610c283c243d9c0e5d3e414c9ac1494`.
+Native16k run `final-counter-review-20260716-11751` executed the focused
+`clockcoherence` probe with all three checks true, exited zero, and reaped to
+zero scoped descendants.

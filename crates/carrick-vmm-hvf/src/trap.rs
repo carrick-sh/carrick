@@ -180,12 +180,13 @@ use std::collections::HashMap;
 
 mod sysreg;
 use sysreg::*;
-// The vvar clock calibration sources (EL0 counter/frequency reads + the
-// CLOCK_UPTIME_RAW monotonic base). Exported so the Darwin-native backend's
-// vvar stamper calibrates from the IDENTICAL sources as `populate_vdso_data_page`
-// below — one timeline definition, not a per-backend re-derivation.
+// The vvar clock calibration sources (a frequency-only EL0 read plus the
+// CLOCK_UPTIME_RAW monotonic base). The raw counter pair remains exported for
+// explicit divergence diagnostics, not production calibration. The
+// Darwin-native backend's vvar stamper uses the identical frequency/uptime
+// sources as `populate_vdso_data_page` below.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub use sysreg::{host_clock_uptime_ns, host_counter};
+pub use sysreg::{host_clock_uptime_ns, host_counter, host_counter_frequency};
 
 // Process-wide PROT_NONE bookkeeping is a neutral-core abstraction shared with
 // every other backend (KVM included) — see carrick_mem::protections. Both hold
@@ -3821,7 +3822,7 @@ impl HvfVmState {
         // Independent of the clock data (getrandom needs no calibrated counter),
         // so stamp it first and unconditionally.
         self.stamp_rng_generation();
-        let (_, freq) = host_counter();
+        let freq = host_counter_frequency();
         if freq == 0 {
             return;
         }

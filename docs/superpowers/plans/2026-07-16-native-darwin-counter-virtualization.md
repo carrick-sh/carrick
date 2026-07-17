@@ -6,7 +6,7 @@
 
 **Architecture:** Decode `CNTVCT_EL0` into a typed counter action. A focused counter module selects a host source from Darwin's commpage mode: mode 1 uses `CNTVCT_EL0`, mode 3 uses `S3_4_C15_C10_6`, and other modes terminate at a correctness-first `mach_absolute_time` sensitive exit. Known modes emit a seqlocked commpage-offset sequence inside DSR and participate in signal/kick recovery and artifact normalization.
 
-**Tech Stack:** Rust 1.96.0, edition 2024, bad64, dynasmrt AArch64 emission, Darwin commpage timebase, `libc::mach_absolute_time`, Carrick DSR execution oracle, signed native16k runtime.
+**Tech Stack:** Rust 1.96.0, edition 2024, bad64, dynasmrt AArch64 emission, Darwin commpage timebase, `mach2::vm::mach_vm_read_overwrite`, `libc::mach_absolute_time`, Carrick DSR execution oracle, signed native16k runtime.
 
 ## Global Constraints
 
@@ -91,7 +91,12 @@ pub(super) const fn counter_word(source: HostCounterSource, destination: u32) ->
 }
 ```
 
-On aarch64 macOS, cache a volatile byte read at `COMMPAGE_MODE_ADDRESS` in a `OnceLock`. Off-target builds select fallback. Implement `mach_absolute_time_ticks()` with the existing `libc::mach_absolute_time` binding.
+On aarch64 macOS, cache a fallible `mach_vm_read_overwrite` of the byte at
+`COMMPAGE_MODE_ADDRESS` in a `OnceLock`. An unreadable mode selects fallback;
+frequency and scale acquisition use a frequency-only `CNTFRQ_EL0` helper and
+never sample raw `CNTVCT_EL0`. Off-target builds select unsupported. Implement
+`mach_absolute_time_ticks()` with the existing `libc::mach_absolute_time`
+binding.
 
 - [ ] **Step 4: Verify GREEN and commit**
 
@@ -179,7 +184,7 @@ Execute a one-instruction x2 counter plan and bracket it with `host_clock_uptime
 let before = crate::trap::host_clock_uptime_ns();
 enter_translated(emitted.entry(), &mut snapshot, &mut exit).expect("execute counter");
 let after = crate::trap::host_clock_uptime_ns();
-let observed = ticks_to_ns(snapshot.x[2], crate::trap::host_counter().1);
+let observed = ticks_to_ns(snapshot.x[2], crate::trap::host_counter_frequency());
 assert!(before.saturating_sub(1_000) <= observed);
 assert!(observed <= after.saturating_add(1_000));
 ```

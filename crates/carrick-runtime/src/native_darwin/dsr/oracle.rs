@@ -1153,7 +1153,7 @@ fn dsr_virtual_counter_preserves_destination_matrix() {
         CounterDestination::Gpr(28),
         CounterDestination::Discard,
     ];
-    let frequency = crate::trap::host_counter().1;
+    let frequency = crate::trap::host_counter_frequency();
 
     for (case, destination) in destinations.into_iter().enumerate() {
         let guest = GuestVa(0x19_100 + (case as u64 * 0x100));
@@ -1240,7 +1240,8 @@ fn dsr_virtual_counter_kicks_retry_before_and_preserve_after_commit() {
         let after = crate::trap::host_clock_uptime_ns();
         let committed_value = completed.then_some(snapshot.x[15]);
         if let Some(committed_value) = committed_value {
-            let observed = counter_ticks_to_ns(committed_value, crate::trap::host_counter().1);
+            let observed =
+                counter_ticks_to_ns(committed_value, crate::trap::host_counter_frequency());
             assert!(before.saturating_sub(1_000) <= observed);
             assert!(observed <= after.saturating_add(1_000));
         }
