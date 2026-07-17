@@ -339,3 +339,45 @@ Keep one correctness issue separate from cache attribution. Cache-disabled
 are native load/correctness debt; they cannot be cited as artifact replay
 corruption, and the successful uncached/cache authority runs remain the wall
 comparison.
+
+## Native virtual-counter completion authority (2026-07-16)
+
+The obsolete host hazard gate still failed before replacement, as required:
+raw `CNTVCT_EL0` was 53,553,547,703,683 ns while `CLOCK_UPTIME_RAW` was
+22,316,672,218,500 ns, a suspend-created 31,236,875,485,183 ns split. The new
+gate executes the emitted guest-visible DSR counter twice around the uptime
+read, retains the `CNTFRQ_EL0` frequency and monotonicity assertions, and
+passes on the same host without rebooting.
+
+The live commpage selects mode 3 (`AppleTimebase`) and the measured
+Mach-to-`CNTFRQ_EL0` scale reduces exactly to 125/3. Modes 1 and 3 remain
+inline. Unproved modes fail over to scaled `mach_absolute_time` through the
+typed sensitive boundary; an absent or non-representable exact scale remains
+unsupported instead of approximating or exposing raw `CNTVCT_EL0`.
+
+`just build` produced the signed release artifact; `codesign --verify` passed
+and the embedded entitlement contains `com.apple.security.hypervisor`. The
+required signed native16k `clock_gettime04` workload used run ID
+`native-counter-task4-20260716T212329-58430`, exited 3 in 0.82 seconds, and was
+reaped with zero scoped descendants. It stopped in the already-baselined LTP
+private-PID harness failure (`Main test process might have exit` / `Test
+killed`) before clock assertions, rather than reporting a suspend-sized
+vDSO/syscall divergence; `scripts/conformance/baseline.jsonl` records the same
+Carrick broken verdict for this case. Treat the exact DSR gate as the clock
+coherence unit authority and this LTP run as baseline-noise evidence, not as a
+newly passing LTP result. Removing `--pid private` did not change that
+classification: run `native-counter-hostpid-20260716T212551-63576` exited 3 in
+0.33 seconds with the identical pre-assertion harness kill and zero scoped
+descendants.
+
+Actual signed guest clock behavior is demonstrated separately by the focused
+`clockcoherence` probe. Run `native-clockcoherence-20260716T212750-65359`
+resolved `__kernel_clock_gettime`, bracketed its `CLOCK_MONOTONIC` result
+between two raw `SYS_clock_gettime` reads, and repeated the same check for
+`CLOCK_REALTIME`. It exited 0 in 0.34 seconds with all three booleans true and
+zero scoped descendants. The bracket admits 1 ms of scheduling/conversion
+slack, far below the measured 31,236-second suspend divergence. No oracle
+refresh ran; Docker was unavailable, so the Rust-only static probe was linked
+locally with `rust-lld` and executed only under the signed Carrick artifact.
+Fresh serialized `RUST_TEST_THREADS=1 just ci` completed with exit 0 in 28.29
+seconds after the probe and handoff were present.

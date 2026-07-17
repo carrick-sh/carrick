@@ -12616,39 +12616,42 @@ mod tests {
         assert!(native_image_needs_eager_relocations(&elf));
     }
 
-    /// Empirical hazard gate for the native vDSO (see `stamp_vdso_vvar`):
-    /// natively the guest's vDSO clock code reads the RAW `cntvct_el0` /
-    /// `cntfrq_el0` at EL0, while the dispatcher's clock paths and the stamped
-    /// vvar realtime offset are based on CLOCK_UPTIME_RAW. This proves, on the
-    /// host actually running the suite, that (a) EL0 reads of both registers
-    /// do not fault in a plain Darwin userspace process and (b) the raw
-    /// counter and CLOCK_UPTIME_RAW share ONE timeline: two raw reads
-    /// bracketing a CLOCK_UPTIME_RAW read must enclose it (modulo conversion
-    /// rounding). If a host ever diverges (e.g. a raw counter that keeps
-    /// ticking through suspend while CLOCK_UPTIME_RAW does not — the behavior
-    /// HVF documents for older hosts in trap.rs), this fails and the native
-    /// vDSO clock stamping must be re-based before trusting native clocks
-    /// there.
+    /// Empirical hazard gate for the native vDSO (see `stamp_vdso_vvar`).
+    /// The guest-visible counter is a DSR-adjusted read, not Darwin's raw
+    /// `CNTVCT_EL0`: two translated reads must bracket `CLOCK_UPTIME_RAW` in
+    /// the preserved `CNTFRQ_EL0` domain and remain monotonic on this already
+    /// suspended host. Known host modes must stay inline so clock-heavy vDSO
+    /// workloads do not acquire a sensitive gateway transition.
     #[test]
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    fn native_el0_counter_reads_track_clock_uptime_raw() {
-        let (ticks_before, freq) = crate::trap::host_counter();
-        assert!(freq > 0, "CNTFRQ_EL0 read zero at EL0");
+    fn native_virtual_counter_reads_track_clock_uptime_raw() {
+        assert!(
+            dsr::host_counter_plan_is_inline_for_test(),
+            "this host must use an inline DSR counter plan"
+        );
+        let ticks_before =
+            dsr::execute_virtual_counter_for_test().expect("execute first virtual counter read");
         let uptime_ns = crate::trap::host_clock_uptime_ns();
-        let (ticks_after, _) = crate::trap::host_counter();
-        assert!(ticks_after >= ticks_before, "CNTVCT_EL0 went backwards");
+        let ticks_after =
+            dsr::execute_virtual_counter_for_test().expect("execute second virtual counter read");
+        let (_, freq) = crate::trap::host_counter();
+        assert!(freq > 0, "CNTFRQ_EL0 read zero at EL0");
+        assert!(
+            ticks_after >= ticks_before,
+            "DSR-adjusted counter went backwards"
+        );
         let to_ns = |ticks: u64| (ticks as u128 * 1_000_000_000 / u128::from(freq)) as u64;
         // One counter tick + 1µs of conversion rounding slack.
         let slack_ns = 1_000_000_000 / freq + 1_000;
-        let raw_before_ns = to_ns(ticks_before);
-        let raw_after_ns = to_ns(ticks_after);
+        let adjusted_before_ns = to_ns(ticks_before);
+        let adjusted_after_ns = to_ns(ticks_after);
         assert!(
-            raw_before_ns <= uptime_ns + slack_ns,
-            "raw CNTVCT ({raw_before_ns} ns) is ahead of CLOCK_UPTIME_RAW ({uptime_ns} ns): timelines diverge"
+            adjusted_before_ns <= uptime_ns + slack_ns,
+            "DSR-adjusted counter ({adjusted_before_ns} ns) is ahead of CLOCK_UPTIME_RAW ({uptime_ns} ns): timelines diverge"
         );
         assert!(
-            uptime_ns <= raw_after_ns + slack_ns,
-            "raw CNTVCT ({raw_after_ns} ns) is behind CLOCK_UPTIME_RAW ({uptime_ns} ns): timelines diverge"
+            uptime_ns <= adjusted_after_ns + slack_ns,
+            "DSR-adjusted counter ({adjusted_after_ns} ns) is behind CLOCK_UPTIME_RAW ({uptime_ns} ns): timelines diverge"
         );
     }
 
