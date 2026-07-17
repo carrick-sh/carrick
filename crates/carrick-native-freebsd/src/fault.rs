@@ -1,0 +1,168 @@
+//! The FreeBSD/amd64 guest-fault shim: turns host signals raised by
+//! translated guest code into typed gateway exits.
+//!
+//! When SIGSEGV/SIGBUS/SIGFPE/SIGILL interrupts execution INSIDE the
+//! registered code cache, the handler reads the amd64 `mcontext_t`, records
+//! the fault (signal, `si_code`, `si_addr`, host RIP) through the gateway
+//! context still pinned in `mc_r15`, and rewrites `mc_rip` to the lane's
+//! signal exit stub. `sigreturn` then "resumes" at the stub with the guest's
+//! registers live, and the gateway's shared exit tail surfaces the fault as
+//! a `Signal` exit to the run loop — a guest fault, not a host crash.
+//! Faults OUTSIDE the code cache restore the pre-install disposition and
+//! return, so the faulting instruction re-fires into the old handler (or the
+//! default core dump): host bugs stay loud.
+//!
+//! ## Handler discipline (load-bearing)
+//!
+//! The handler can run while the GUEST fs base is installed (the gateway
+//! swaps fsbase for the whole translated run), so host TLS is poison here:
+//! no allocation, no panic paths, no `std` conveniences — only signal-async
+//! reads of process globals and raw stores through the context pointer. The
+//! kernel's `sigreturn` restores the interrupted `mc_fsbase` itself, and the
+//! signal exit stub restores the host base from the context afterwards.
+//!
+//! This shim deliberately does not know the gateway context's layout: the
+//! lane hands it the signal-stub address and the byte offset of the neutral
+//! [`FaultRecord`](carrick_dsr::fault::FaultRecord) inside the context.
+
+use std::io;
+use std::mem::MaybeUninit;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use carrick_dsr::fault::FaultRecord;
+
+/// The signals a translated guest instruction can raise synchronously.
+const GUEST_FAULT_SIGNALS: [libc::c_int; 4] =
+    [libc::SIGSEGV, libc::SIGBUS, libc::SIGFPE, libc::SIGILL];
+
+// Process-global shim state. Plain atomics — the handler must be able to
+// read them without locks, TLS, or allocation. A zero code-cache base means
+// "nothing registered": the handler treats every fault as a host fault.
+static CODE_BASE: AtomicU64 = AtomicU64::new(0);
+static CODE_LEN: AtomicU64 = AtomicU64::new(0);
+static SIGNAL_STUB: AtomicU64 = AtomicU64::new(0);
+static FAULT_RECORD_OFFSET: AtomicU64 = AtomicU64::new(0);
+
+// The dispositions replaced at install time, restored when a fault is NOT
+// ours. Written once by `install_fault_redirect` before any redirect can
+// fire; the handler only reads.
+static OLD_ACTIONS: [AtomicU64; 4] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+fn signal_index(signal: libc::c_int) -> Option<usize> {
+    GUEST_FAULT_SIGNALS.iter().position(|&s| s == signal)
+}
+
+/// Register the dual-map JIT's EXEC alias as the translated-code region. A
+/// fault whose RIP lands inside `[exec_base, exec_base + len)` is a guest
+/// fault; everything else stays a host fault. One region per process (the
+/// runtime owns one code cache); re-registering replaces the previous one.
+pub fn register_code_region(exec_base: u64, len: u64) {
+    // Order matters for a concurrent fault: publish the length first so a
+    // nonzero base never pairs with a stale zero length.
+    CODE_LEN.store(len, Ordering::Release);
+    CODE_BASE.store(exec_base, Ordering::Release);
+}
+
+/// Remove the registered region (e.g. when the cache unmaps in tests). Any
+/// later fault is treated as a host fault.
+pub fn unregister_code_region() {
+    CODE_BASE.store(0, Ordering::Release);
+    CODE_LEN.store(0, Ordering::Release);
+}
+
+/// Install the guest-fault redirect for SIGSEGV/SIGBUS/SIGFPE/SIGILL.
+///
+/// `signal_stub` is the lane's signal exit stub (e.g.
+/// `carrick_dsr_x86::gateway::signal_stub_addr()`); `fault_record_offset` is
+/// the byte offset of the [`FaultRecord`] inside the object the pinned
+/// context register (`%r15`) points at during translated execution (e.g.
+/// `carrick_dsr_x86::gateway::CTX_FAULT_RECORD`).
+pub fn install_fault_redirect(signal_stub: u64, fault_record_offset: u32) -> io::Result<()> {
+    SIGNAL_STUB.store(signal_stub, Ordering::Release);
+    FAULT_RECORD_OFFSET.store(u64::from(fault_record_offset), Ordering::Release);
+
+    for (i, &signal) in GUEST_FAULT_SIGNALS.iter().enumerate() {
+        // SAFETY: a well-formed sigaction installation; the handler obeys
+        // the module's signal-async discipline.
+        unsafe {
+            let mut action: libc::sigaction = MaybeUninit::zeroed().assume_init();
+            action.sa_sigaction = native_fault_handler as unsafe extern "C" fn(_, _, _) as usize;
+            // SA_ONSTACK: honor a sigaltstack when the thread set one up (the
+            // runtime's thread loop does — a guest stack overflow cannot run
+            // the handler on the very stack that overflowed).
+            action.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
+            libc::sigemptyset(&mut action.sa_mask);
+            let mut old: libc::sigaction = MaybeUninit::zeroed().assume_init();
+            if libc::sigaction(signal, &action, &mut old) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // Preserve the replaced disposition's handler for the not-ours
+            // path. (Flags/mask are not round-tripped: the not-ours path
+            // reinstalls the handler address with default flags, which is
+            // faithful for SIG_DFL/SIG_IGN — the common pre-install states —
+            // and close enough for a crash-reporting predecessor.)
+            OLD_ACTIONS[i].store(old.sa_sigaction as u64, Ordering::Release);
+        }
+    }
+    Ok(())
+}
+
+/// The signal handler. Signal-async discipline: NO TLS (the guest fs base
+/// may be live), no allocation, no panics — straight-line loads/stores only.
+unsafe extern "C" fn native_fault_handler(
+    signal: libc::c_int,
+    info: *mut libc::siginfo_t,
+    ucontext: *mut libc::c_void,
+) {
+    // SAFETY: the kernel hands a valid ucontext_t/siginfo_t to SA_SIGINFO
+    // handlers; all global reads are atomic.
+    unsafe {
+        let uc = ucontext.cast::<libc::ucontext_t>();
+        let mc = &mut (*uc).uc_mcontext;
+
+        let base = CODE_BASE.load(Ordering::Acquire);
+        let len = CODE_LEN.load(Ordering::Acquire);
+        let stub = SIGNAL_STUB.load(Ordering::Acquire);
+        let rip = mc.mc_rip as u64;
+
+        let in_translated_code =
+            base != 0 && stub != 0 && rip >= base && rip < base.saturating_add(len);
+        if in_translated_code {
+            // Translated execution pins the gateway context in %r15; the
+            // fault record lives at the lane-provided offset inside it.
+            let ctx = mc.mc_r15 as u64;
+            let record = (ctx + FAULT_RECORD_OFFSET.load(Ordering::Acquire)) as *mut FaultRecord;
+            (*record).signal = signal;
+            (*record).code = (*info).si_code;
+            (*record).addr = (*info).si_addr as u64;
+            (*record).host_rip = rip;
+            // Land in the signal exit stub on sigreturn; every guest
+            // register (and the guest fsbase) is restored by the kernel, and
+            // the stub's shared tail captures them into the snapshot.
+            mc.mc_rip = stub as libc::register_t;
+            return;
+        }
+
+        // Not ours: put back the replaced disposition and return. The
+        // faulting instruction re-executes and the fault re-fires into the
+        // old handler / default action (core dump) — host bugs stay loud.
+        let old_handler = signal_index(signal)
+            .map(|i| OLD_ACTIONS[i].load(Ordering::Acquire))
+            .unwrap_or(libc::SIG_DFL as u64);
+        let mut action: libc::sigaction = MaybeUninit::zeroed().assume_init();
+        action.sa_sigaction = old_handler as usize;
+        action.sa_flags =
+            if old_handler == libc::SIG_DFL as u64 || old_handler == libc::SIG_IGN as u64 {
+                0
+            } else {
+                libc::SA_SIGINFO
+            };
+        libc::sigemptyset(&mut action.sa_mask);
+        libc::sigaction(signal, &action, std::ptr::null_mut());
+    }
+}

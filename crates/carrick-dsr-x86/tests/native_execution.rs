@@ -194,6 +194,99 @@ fn translated_x86_guest_writes_and_exits_natively() {
     }
 }
 
+/// A guest that FAULTS: it dereferences an unmapped address mid-block. The
+/// FreeBSD fault shim must surface this as a typed `Signal` gateway exit
+/// with an accurate fault record — not kill the process — and the host must
+/// keep running normally afterwards.
+#[test]
+fn translated_x86_guest_fault_becomes_a_signal_exit() {
+    use carrick_dsr_x86::gateway::{CTX_FAULT_RECORD, signal_stub_addr};
+    use carrick_native_freebsd::fault;
+
+    let jit = FreebsdHostJit;
+    jit.supported().expect("host JIT supported");
+    let region = jit.map_code_cache(64 * 1024).expect("map code cache");
+
+    fault::install_fault_redirect(signal_stub_addr(), CTX_FAULT_RECORD)
+        .expect("install fault redirect");
+    fault::register_code_region(region.exec_base.as_ptr() as u64, 64 * 1024);
+
+    let stack = map_rw(64 * 1024);
+    let stack_top = stack as u64 + 64 * 1024;
+
+    // An address that is definitely unmapped: a fresh mapping, immediately
+    // unmapped again.
+    let probe = map_rw(4096);
+    unsafe { libc::munmap(probe.cast(), 4096) };
+    let bad_va = probe as u64;
+
+    const GUEST_CODE_BASE: u64 = 0x60_0000;
+    let mut program: Vec<u8> = Vec::new();
+    // movabs rax, bad_va; mov eax, [rax] — faults on the load
+    program.extend_from_slice(&[0x48, 0xb8]);
+    program.extend_from_slice(&bad_va.to_le_bytes());
+    program.extend_from_slice(&[0x8b, 0x00]);
+    // (never reached) exit_group(3)
+    program.extend_from_slice(&[0xbf, 0x03, 0x00, 0x00, 0x00]);
+    program.extend_from_slice(&[0xb8]);
+    program.extend_from_slice(&(SYS_EXIT_GROUP as u32).to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0x05]);
+
+    let read_guest = |va: u64| -> Vec<u8> {
+        let off = (va - GUEST_CODE_BASE) as usize;
+        program.get(off..).map(|s| s.to_vec()).unwrap_or_default()
+    };
+
+    let block = plan_block(GUEST_CODE_BASE, 256, 4096, read_guest).expect("plan");
+    let src = read_guest(block.start);
+    let end_off = (block.end - block.start) as usize;
+    let translated = emit_block(&src[..end_off.min(src.len())], &block).expect("emit");
+    let exec = region.exec_base.as_ptr();
+    let write = region.write_ptr_for(exec).expect("write alias");
+    unsafe {
+        std::ptr::copy_nonoverlapping(translated.as_ptr(), write, translated.len());
+    }
+    jit.flush_icache(exec, translated.len());
+
+    let mut snapshot = X86UcontextSnapshot::new();
+    snapshot.gpr[reg::RSP] = stack_top;
+    let resume = match block.exit {
+        X86Exit::Syscall { resume, .. } => resume,
+        other => panic!("unexpected exit: {other:?}"),
+    };
+
+    let mut ctx = X86DsrContext::new(snapshot, exec as u64, resume);
+    // SAFETY: freshly translated block ending in an exit stub; valid rsp.
+    let raw = unsafe { carrick_dsr_x86::enter_translated(&mut ctx) };
+    assert_eq!(
+        X86ExitStatus::from_raw(raw),
+        Some(X86ExitStatus::Signal),
+        "the guest fault must surface as a typed Signal exit, not a crash"
+    );
+    assert_eq!(ctx.fault.signal, libc::SIGSEGV, "fault signal recorded");
+    assert_eq!(ctx.fault.addr, bad_va, "si_addr is the unmapped guest VA");
+    let cache_base = region.exec_base.as_ptr() as u64;
+    assert!(
+        ctx.fault.host_rip >= cache_base && ctx.fault.host_rip < cache_base + 64 * 1024,
+        "fault RIP inside the code cache (host_rip=0x{:x})",
+        ctx.fault.host_rip
+    );
+    // The faulting guest's rax (the bad pointer) survived into the snapshot
+    // via the shared exit tail.
+    assert_eq!(ctx.snapshot.gpr[reg::RAX], bad_va);
+
+    // The host is intact: normal faulting behaviour is restored for host
+    // code, and ordinary work (allocation, syscalls) still succeeds.
+    fault::unregister_code_region();
+    let alive = vec![42u8; 1024];
+    assert_eq!(alive[512], 42);
+
+    unsafe {
+        jit.unmap(&region);
+        libc::munmap(stack.cast(), 64 * 1024);
+    }
+}
+
 /// A guest whose control flow goes through an INDIRECT call: `call [rax]`
 /// loads a helper's address from a function-pointer table in guest memory
 /// (the PLT/vtable shape), the helper writes the message and `ret`s, and the
