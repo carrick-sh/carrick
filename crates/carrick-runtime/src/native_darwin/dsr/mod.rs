@@ -7,6 +7,7 @@ use parking_lot::{Mutex, RwLock};
 pub(crate) mod artifact_spike;
 pub(super) mod block;
 pub(super) mod cache;
+pub(super) mod counter;
 pub(super) mod decode;
 pub(super) mod emit;
 pub(super) mod gateway;
