@@ -352,6 +352,275 @@ fn translated_x86_guest_reaches_data_rip_relatively() {
     }
 }
 
+/// A guest that channels everything through virtualized r15: the message
+/// pointer lives in r15 (`movabs r15` / `add r15` / `mov rsi, r15`), so every
+/// instruction must be renamed against the snapshot's r15 slot — the live
+/// r15 is the DSR context pointer throughout.
+#[test]
+fn translated_x86_guest_computes_through_virtualized_r15() {
+    let jit = FreebsdHostJit;
+    jit.supported().expect("host JIT supported");
+    let region = jit.map_code_cache(64 * 1024).expect("map code cache");
+
+    let data = map_rw(4096);
+    // "..no" at +0; the guest writes 2 bytes from data+2 ("no" would mean the
+    // r15 arithmetic didn't happen; "AB" at +2 is the expected message).
+    unsafe {
+        std::ptr::copy_nonoverlapping(b"..AB".as_ptr(), data, 4);
+    }
+    let data_va = data as u64;
+
+    let mut fds = [0i32; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+    let (read_fd, write_fd) = (fds[0], fds[1]);
+
+    let stack = map_rw(64 * 1024);
+    let stack_top = stack as u64 + 64 * 1024;
+
+    const GUEST_CODE_BASE: u64 = 0x30_0000;
+    let mut program: Vec<u8> = Vec::new();
+    // movabs r15, data_va       (49 bf imm64)
+    program.extend_from_slice(&[0x49, 0xbf]);
+    program.extend_from_slice(&data_va.to_le_bytes());
+    // add r15, 2                (49 83 c7 02) — r15 arithmetic must stick
+    program.extend_from_slice(&[0x49, 0x83, 0xc7, 0x02]);
+    // mov rsi, r15              (4c 89 fe) — read the virtualized value back
+    program.extend_from_slice(&[0x4c, 0x89, 0xfe]);
+    // mov edx, 2; mov edi, fd; mov eax, write; syscall
+    program.extend_from_slice(&[0xba, 0x02, 0x00, 0x00, 0x00]);
+    program.extend_from_slice(&[0xbf]);
+    program.extend_from_slice(&(write_fd as u32).to_le_bytes());
+    program.extend_from_slice(&[0xb8]);
+    program.extend_from_slice(&(SYS_WRITE as u32).to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0x05]);
+    // exit_group(11)
+    program.extend_from_slice(&[0xbf, 0x0b, 0x00, 0x00, 0x00]);
+    program.extend_from_slice(&[0xb8]);
+    program.extend_from_slice(&(SYS_EXIT_GROUP as u32).to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0x05]);
+
+    let read_guest = |va: u64| -> Vec<u8> {
+        let off = (va - GUEST_CODE_BASE) as usize;
+        program.get(off..).map(|s| s.to_vec()).unwrap_or_default()
+    };
+
+    let mut cursor = 0usize;
+    let translate = |guest_va: u64, cursor: &mut usize| -> (u64, X86Exit) {
+        let block = plan_block(guest_va, 256, 4096, read_guest).expect("plan");
+        let src = read_guest(block.start);
+        let end_off = (block.end - block.start) as usize;
+        let translated = emit_block(&src[..end_off.min(src.len())], &block).expect("emit");
+        let exec = unsafe { region.exec_base.as_ptr().add(*cursor) };
+        let write = region.write_ptr_for(exec).expect("write alias");
+        unsafe {
+            std::ptr::copy_nonoverlapping(translated.as_ptr(), write, translated.len());
+        }
+        jit.flush_icache(exec, translated.len());
+        *cursor += translated.len();
+        (exec as u64, block.exit)
+    };
+
+    let mut snapshot = X86UcontextSnapshot::new();
+    snapshot.gpr[reg::RSP] = stack_top;
+    let mut next_guest_va = GUEST_CODE_BASE;
+    let mut exit_code: Option<i32> = None;
+
+    for _ in 0..8 {
+        let (exec, exit) = translate(next_guest_va, &mut cursor);
+        let resume = match exit {
+            X86Exit::Syscall { resume, .. } => resume,
+            other => panic!("r15 guest produced non-syscall exit: {other:?}"),
+        };
+        let mut ctx = X86DsrContext::new(snapshot, exec, resume);
+        // SAFETY: freshly translated block ending in an exit stub; valid rsp.
+        let raw = unsafe { carrick_dsr_x86::enter_translated(&mut ctx) };
+        assert_eq!(X86ExitStatus::from_raw(raw), Some(X86ExitStatus::Syscall));
+        snapshot = ctx.snapshot;
+
+        match snapshot.gpr[reg::RAX] {
+            SYS_WRITE => {
+                assert_eq!(
+                    snapshot.gpr[reg::R15],
+                    data_va + 2,
+                    "guest r15 (movabs+add) must round-trip through the snapshot"
+                );
+                assert_eq!(snapshot.gpr[reg::RSI], data_va + 2, "rsi read from r15");
+                let n = unsafe {
+                    libc::write(
+                        snapshot.gpr[reg::RDI] as i32,
+                        snapshot.gpr[reg::RSI] as *const libc::c_void,
+                        snapshot.gpr[reg::RDX] as usize,
+                    )
+                };
+                assert!(n >= 0, "host write: {}", std::io::Error::last_os_error());
+                snapshot.gpr[reg::RAX] = n as u64;
+                next_guest_va = snapshot.rip;
+            }
+            SYS_EXIT_GROUP => {
+                exit_code = Some(snapshot.gpr[reg::RDI] as i32);
+                break;
+            }
+            other => panic!("unexpected syscall {other}"),
+        }
+    }
+
+    unsafe { libc::close(write_fd) };
+    let mut captured = [0u8; 8];
+    let n = unsafe { libc::read(read_fd, captured.as_mut_ptr().cast(), captured.len()) };
+    unsafe { libc::close(read_fd) };
+    assert!(n >= 0);
+    assert_eq!(
+        &captured[..n as usize],
+        b"AB",
+        "r15-addressed bytes written"
+    );
+    assert_eq!(exit_code, Some(11));
+
+    unsafe {
+        jit.unmap(&region);
+        libc::munmap(data.cast(), 4096);
+        libc::munmap(stack.cast(), 64 * 1024);
+    }
+}
+
+/// A guest whose data flows only through `fs:`-prefixed TLS reads: the
+/// gateway must install `guest_fsbase` for the run (and restore the host's
+/// on exit — the test process would die messily otherwise, since Rust/libc
+/// TLS lives behind the real fs base).
+#[test]
+fn translated_x86_guest_reads_tls_through_swapped_fsbase() {
+    use carrick_dsr_x86::gateway::fsgsbase_supported;
+    assert!(
+        fsgsbase_supported(),
+        "this rig (Ryzen 7840HS) must expose FSGSBASE for the native lane"
+    );
+
+    let jit = FreebsdHostJit;
+    jit.supported().expect("host JIT supported");
+    let region = jit.map_code_cache(64 * 1024).expect("map code cache");
+
+    // The guest "TLS block": pointer to the message at fs:[8], length at
+    // fs:[16], message bytes at +24.
+    let tls = map_rw(4096);
+    let tls_va = tls as u64;
+    let msg = b"tls\n";
+    unsafe {
+        std::ptr::copy_nonoverlapping(msg.as_ptr(), tls.add(24), msg.len());
+        std::ptr::write_unaligned(tls.add(8).cast::<u64>(), tls_va + 24);
+        std::ptr::write_unaligned(tls.add(16).cast::<u32>(), msg.len() as u32);
+    }
+
+    let mut fds = [0i32; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+    let (read_fd, write_fd) = (fds[0], fds[1]);
+
+    let stack = map_rw(64 * 1024);
+    let stack_top = stack as u64 + 64 * 1024;
+
+    const GUEST_CODE_BASE: u64 = 0x40_0000;
+    let mut program: Vec<u8> = Vec::new();
+    // mov rsi, fs:[8]           (64 48 8b 34 25 08 00 00 00)
+    program.extend_from_slice(&[0x64, 0x48, 0x8b, 0x34, 0x25, 0x08, 0x00, 0x00, 0x00]);
+    // mov edx, fs:[16]          (64 8b 14 25 10 00 00 00)
+    program.extend_from_slice(&[0x64, 0x8b, 0x14, 0x25, 0x10, 0x00, 0x00, 0x00]);
+    // mov edi, fd; mov eax, write; syscall
+    program.extend_from_slice(&[0xbf]);
+    program.extend_from_slice(&(write_fd as u32).to_le_bytes());
+    program.extend_from_slice(&[0xb8]);
+    program.extend_from_slice(&(SYS_WRITE as u32).to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0x05]);
+    // exit_group(13)
+    program.extend_from_slice(&[0xbf, 0x0d, 0x00, 0x00, 0x00]);
+    program.extend_from_slice(&[0xb8]);
+    program.extend_from_slice(&(SYS_EXIT_GROUP as u32).to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0x05]);
+
+    let read_guest = |va: u64| -> Vec<u8> {
+        let off = (va - GUEST_CODE_BASE) as usize;
+        program.get(off..).map(|s| s.to_vec()).unwrap_or_default()
+    };
+
+    let mut cursor = 0usize;
+    let translate = |guest_va: u64, cursor: &mut usize| -> (u64, X86Exit) {
+        let block = plan_block(guest_va, 256, 4096, read_guest).expect("plan");
+        let src = read_guest(block.start);
+        let end_off = (block.end - block.start) as usize;
+        let translated = emit_block(&src[..end_off.min(src.len())], &block).expect("emit");
+        let exec = unsafe { region.exec_base.as_ptr().add(*cursor) };
+        let write = region.write_ptr_for(exec).expect("write alias");
+        unsafe {
+            std::ptr::copy_nonoverlapping(translated.as_ptr(), write, translated.len());
+        }
+        jit.flush_icache(exec, translated.len());
+        *cursor += translated.len();
+        (exec as u64, block.exit)
+    };
+
+    let mut snapshot = X86UcontextSnapshot::new();
+    snapshot.gpr[reg::RSP] = stack_top;
+    let mut next_guest_va = GUEST_CODE_BASE;
+    let mut exit_code: Option<i32> = None;
+
+    for _ in 0..8 {
+        let (exec, exit) = translate(next_guest_va, &mut cursor);
+        let resume = match exit {
+            X86Exit::Syscall { resume, .. } => resume,
+            other => panic!("tls guest produced non-syscall exit: {other:?}"),
+        };
+        let mut ctx = X86DsrContext::new(snapshot, exec, resume);
+        // The guest's Linux thread pointer — what a real dispatcher installs
+        // when servicing arch_prctl(ARCH_SET_FS).
+        ctx.guest_fsbase = tls_va;
+        // SAFETY: freshly translated block ending in an exit stub; valid rsp.
+        let raw = unsafe { carrick_dsr_x86::enter_translated(&mut ctx) };
+        assert_eq!(X86ExitStatus::from_raw(raw), Some(X86ExitStatus::Syscall));
+        snapshot = ctx.snapshot;
+
+        // Reaching this Rust code at all proves the host fs base came back
+        // (thread-local errno/TLS would explode otherwise); assert the guest
+        // side too.
+        match snapshot.gpr[reg::RAX] {
+            SYS_WRITE => {
+                assert_eq!(
+                    snapshot.gpr[reg::RSI],
+                    tls_va + 24,
+                    "mov rsi, fs:[8] must read through the GUEST fs base"
+                );
+                assert_eq!(snapshot.gpr[reg::RDX], msg.len() as u64, "fs:[16] length");
+                let n = unsafe {
+                    libc::write(
+                        snapshot.gpr[reg::RDI] as i32,
+                        snapshot.gpr[reg::RSI] as *const libc::c_void,
+                        snapshot.gpr[reg::RDX] as usize,
+                    )
+                };
+                assert!(n >= 0, "host write: {}", std::io::Error::last_os_error());
+                snapshot.gpr[reg::RAX] = n as u64;
+                next_guest_va = snapshot.rip;
+            }
+            SYS_EXIT_GROUP => {
+                exit_code = Some(snapshot.gpr[reg::RDI] as i32);
+                break;
+            }
+            other => panic!("unexpected syscall {other}"),
+        }
+    }
+
+    unsafe { libc::close(write_fd) };
+    let mut captured = [0u8; 16];
+    let n = unsafe { libc::read(read_fd, captured.as_mut_ptr().cast(), captured.len()) };
+    unsafe { libc::close(read_fd) };
+    assert!(n >= 0);
+    assert_eq!(&captured[..n as usize], b"tls\n", "TLS-sourced write");
+    assert_eq!(exit_code, Some(13));
+
+    unsafe {
+        jit.unmap(&region);
+        libc::munmap(tls.cast(), 4096);
+        libc::munmap(stack.cast(), 64 * 1024);
+    }
+}
+
 /// A guest with a real loop: `for i in 0..iters { write(fd, data, 3) }` then
 /// `exit_group(iters)`, driving the `dec`/`jnz` control-flow path.
 fn guest_loop_program(data_va: u64, write_fd: u64, iters: u32) -> Vec<u8> {

@@ -29,8 +29,11 @@ pub enum X86SensitiveKind {
     /// `rdfsbase`/`wrfsbase`/`rdgsbase`/`wrgsbase` — direct segment-base
     /// access (FSGSBASE); interacts with `arch_prctl` TLS emulation.
     SegmentBase { write: bool, gs: bool },
-    /// An fs- or gs-prefixed memory access — the guest-TLS load/store
-    /// surface whose virtualization strategy the M2 gateway design owns.
+    /// A gs-prefixed memory access. `fs:` accesses copy through (the gateway
+    /// installs the guest fs base for the whole translated run — see
+    /// `gateway_x86_64.S`), but 64-bit Linux userspace leaves `%gs` to
+    /// niche uses the lane has no virtualization story for yet, so they
+    /// stay a typed sensitive exit (fail-closed at emit).
     SegmentPrefixed { gs: bool },
 }
 
@@ -136,17 +139,13 @@ fn classify_decoded(inst: &Instruction) -> X86InstClass {
         }
         _ => {}
     }
-    // fs/gs-prefixed memory access: the guest-TLS surface. Checked before
-    // control flow so a `jmp fs:[...]`-style oddity lands Sensitive (the
-    // gateway must resolve the base before it can even compute the target).
-    match inst.segment_prefix() {
-        Register::FS => {
-            return X86InstClass::Sensitive(X86SensitiveKind::SegmentPrefixed { gs: false });
-        }
-        Register::GS => {
-            return X86InstClass::Sensitive(X86SensitiveKind::SegmentPrefixed { gs: true });
-        }
-        _ => {}
+    // Segment-prefixed memory access. `fs:` (the guest-TLS surface) copies
+    // through: the gateway swaps the real fs base to the guest's for the
+    // whole translated run, so the copied access resolves against guest TLS
+    // with zero rewriting. `gs:` stays fail-closed (checked before control
+    // flow so a `jmp gs:[...]` oddity lands Sensitive, not ControlFlow).
+    if inst.segment_prefix() == Register::GS {
+        return X86InstClass::Sensitive(X86SensitiveKind::SegmentPrefixed { gs: true });
     }
     match inst.flow_control() {
         FlowControl::Next => {}
@@ -244,13 +243,18 @@ mod tests {
     }
 
     #[test]
-    fn fs_prefixed_tls_access_is_sensitive() {
+    fn fs_prefixed_tls_access_copies_through_but_gs_stays_sensitive() {
         // 64 48 8b 04 25 28 00 00 00    mov rax, fs:[0x28]  (glibc canary read)
+        // Copy-safe: the gateway installs the guest fs base for the whole
+        // translated run, so the copied access hits guest TLS directly.
         let c = one(&[0x64, 0x48, 0x8b, 0x04, 0x25, 0x28, 0x00, 0x00, 0x00]);
         assert_eq!(c.len, 9);
+        assert_eq!(c.class, X86InstClass::Copy);
+        // 65 48 8b 04 25 28 00 00 00    mov rax, gs:[0x28] — no gs story yet.
+        let g = one(&[0x65, 0x48, 0x8b, 0x04, 0x25, 0x28, 0x00, 0x00, 0x00]);
         assert_eq!(
-            c.class,
-            X86InstClass::Sensitive(X86SensitiveKind::SegmentPrefixed { gs: false })
+            g.class,
+            X86InstClass::Sensitive(X86SensitiveKind::SegmentPrefixed { gs: true })
         );
     }
 

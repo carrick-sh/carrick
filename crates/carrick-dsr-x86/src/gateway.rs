@@ -129,6 +129,21 @@ pub struct X86DsrContext {
     /// the GPR — all `mov`s, so guest rflags survive. Never read by Rust or
     /// the gateway asm; live only within one rewritten instruction sequence.
     pub scratch: u64,
+    /// Second spill slot, used when one rewritten instruction needs two
+    /// scratch GPRs (a RIP-relative operand AND a virtualized-r15 rename in
+    /// the same instruction). Same lifetime rules as `scratch`.
+    pub scratch2: u64,
+    /// The guest's `%fs` segment base (its Linux thread pointer, set via
+    /// `arch_prctl(ARCH_SET_FS)` / `wrfsbase` servicing). When nonzero, the
+    /// gateway installs it with `wrfsbase` on entry — making plain
+    /// `fs:`-prefixed guest TLS accesses copy-through-safe — and restores
+    /// [`host_fsbase`](Self::host_fsbase) on exit. Zero means "guest has no
+    /// TLS yet": no swap happens (zero is never a real Linux thread pointer).
+    pub guest_fsbase: u64,
+    /// Where the gateway parks the host's `%fs` base across a translated run
+    /// (written by the enter trampoline via `rdfsbase`, read back by the exit
+    /// stubs). Only meaningful while `guest_fsbase != 0`.
+    pub host_fsbase: u64,
 }
 
 /// Byte offset of [`X86DsrContext::exit_syscall_addr`] for `jmp *disp(%r15)`.
@@ -140,6 +155,15 @@ pub const CTX_EXIT_SENSITIVE_ADDR: i32 = 752;
 /// Byte offset of [`X86DsrContext::scratch`] for the emitter's RIP-relative
 /// rewrite spill (`mov [r15+CTX_SCRATCH], reg` / restore).
 pub const CTX_SCRATCH: i32 = 760;
+/// Byte offset of [`X86DsrContext::scratch2`] (second rewrite spill).
+pub const CTX_SCRATCH2: i32 = 768;
+/// Byte offset of [`X86DsrContext::guest_fsbase`] (mirrored in the `.S`).
+pub const CTX_GUEST_FSBASE: i32 = 776;
+/// Byte offset of [`X86DsrContext::host_fsbase`] (mirrored in the `.S`).
+pub const CTX_HOST_FSBASE: i32 = 784;
+/// Byte offset of the virtualized guest `%r15` slot inside the snapshot
+/// (`gpr[15]`): the emitter's r15-rename loads/stores it directly.
+pub const SNAP_GUEST_R15: i32 = 120;
 /// Byte offset of [`X86DsrContext::entry`] (unused by emitted code — the
 /// trampoline reads it — but asserted for parity with the `.S`).
 pub const CTX_ENTRY: i32 = 712;
@@ -158,6 +182,9 @@ impl X86DsrContext {
             exit_indirect_addr: 0,
             exit_sensitive_addr: 0,
             scratch: 0,
+            scratch2: 0,
+            guest_fsbase: 0,
+            host_fsbase: 0,
         }
     }
 }
@@ -180,9 +207,35 @@ const _: () = assert!(std::mem::offset_of!(X86DsrContext, exit_indirect_addr) ==
 const _: () = assert!(std::mem::offset_of!(X86DsrContext, exit_sensitive_addr) == 752);
 const _: () = assert!(std::mem::offset_of!(X86DsrContext, scratch) == 760);
 const _: () = assert!(std::mem::offset_of!(X86DsrContext, scratch) as i32 == CTX_SCRATCH);
+const _: () = assert!(std::mem::offset_of!(X86DsrContext, scratch2) as i32 == CTX_SCRATCH2);
+const _: () = assert!(std::mem::offset_of!(X86DsrContext, guest_fsbase) as i32 == CTX_GUEST_FSBASE);
+const _: () = assert!(std::mem::offset_of!(X86DsrContext, host_fsbase) as i32 == CTX_HOST_FSBASE);
+const _: () = assert!(
+    std::mem::offset_of!(X86UcontextSnapshot, gpr) + 15 * 8 == SNAP_GUEST_R15 as usize,
+    "the emitter's r15 rename addresses gpr[15] directly"
+);
 const _: () =
     assert!(std::mem::offset_of!(X86DsrContext, exit_syscall_addr) as i32 == CTX_EXIT_SYSCALL_ADDR);
 const _: () = assert!(std::mem::offset_of!(X86DsrContext, entry) as i32 == CTX_ENTRY);
+
+/// Whether this CPU exposes the FSGSBASE instructions
+/// (`rdfsbase`/`wrfsbase`), which the gateway's fs-base swap uses (CPUID
+/// leaf 7 subleaf 0, EBX bit 0). The kernel must also have enabled
+/// CR4.FSGSBASE — FreeBSD does so whenever the CPU has it — and the
+/// execution tests prove the pair end-to-end. A runtime without this must
+/// refuse guests that set a TLS base rather than approximate.
+#[cfg(target_arch = "x86_64")]
+pub fn fsgsbase_supported() -> bool {
+    // cpuid is unprivileged; leaf 7 exists on every x86_64 CPU new enough to
+    // run this code (the intrinsic is safe on x86_64 targets).
+    let leaf7 = core::arch::x86_64::__cpuid_count(7, 0);
+    leaf7.ebx & 1 != 0
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub fn fsgsbase_supported() -> bool {
+    false
+}
 
 // The assembled gateway is the ONE target boundary in this crate. build.rs
 // assembles gateway_x86_64.S on target_arch = "x86_64" (any OS — the asm is
