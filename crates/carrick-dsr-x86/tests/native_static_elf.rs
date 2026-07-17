@@ -183,7 +183,9 @@ fn runs_a_real_static_pie_linux_elf_natively() {
     let stack = map_rw(256 * 1024);
     let stack_top = stack as u64 + 256 * 1024;
     let scratch = map_rw(4096);
-    unsafe { std::ptr::copy_nonoverlapping(c"tinyguest".to_bytes_with_nul().as_ptr(), scratch, 10) };
+    unsafe {
+        std::ptr::copy_nonoverlapping(c"tinyguest".to_bytes_with_nul().as_ptr(), scratch, 10)
+    };
     let arg0 = scratch as u64;
     let random_ptr = scratch as u64 + 16;
     let rsp = build_initial_stack(stack_top, arg0, random_ptr);

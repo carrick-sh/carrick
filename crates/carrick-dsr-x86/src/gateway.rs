@@ -151,6 +151,16 @@ pub struct X86DsrContext {
     /// point — [`FaultRecord::host_rip`](carrick_dsr::fault::FaultRecord)
     /// is authoritative.
     pub fault: carrick_dsr::fault::FaultRecord,
+    /// Whether the enter/exit trampoline should `fxrstor`/`fxsave` the guest
+    /// FPU/vector state (the 512-byte `snapshot.fxsave` area) around this
+    /// block. Set per block from [`X86Block::uses_fpu`](crate::block::X86Block):
+    /// integer-only blocks (the majority) leave it 0 and skip the save/restore
+    /// entirely. Correctness across a non-saving block is preserved because the
+    /// `snapshot.fxsave` area still holds the last FPU-using block's guest
+    /// state, which the next FPU-using block's `fxrstor` reloads. Nonzero =
+    /// save/restore.
+    pub save_fpu: u32,
+    pub save_fpu_pad: u32,
 }
 
 /// Byte offset of [`X86DsrContext::exit_syscall_addr`] for `jmp *disp(%r15)`.
@@ -168,6 +178,9 @@ pub const CTX_SCRATCH2: i32 = 768;
 pub const CTX_GUEST_FSBASE: i32 = 776;
 /// Byte offset of [`X86DsrContext::host_fsbase`] (mirrored in the `.S`).
 pub const CTX_HOST_FSBASE: i32 = 784;
+/// Byte offset of [`X86DsrContext::save_fpu`] (mirrored in the `.S`): the
+/// per-block flag gating the FPU save/restore.
+pub const CTX_SAVE_FPU: i32 = 816;
 /// Byte offset of the virtualized guest `%r15` slot inside the snapshot
 /// (`gpr[15]`): the emitter's r15-rename loads/stores it directly.
 pub const SNAP_GUEST_R15: i32 = 120;
@@ -196,6 +209,11 @@ impl X86DsrContext {
             guest_fsbase: 0,
             host_fsbase: 0,
             fault: carrick_dsr::fault::FaultRecord::new(),
+            // Default: save/restore the FPU area (the always-correct behavior).
+            // The runtime driver sets it per block from `X86Block::uses_fpu`;
+            // in-crate tests keep the conservative default.
+            save_fpu: 1,
+            save_fpu_pad: 0,
         }
     }
 }
@@ -226,6 +244,7 @@ const _: () = assert!(
     "the emitter's r15 rename addresses gpr[15] directly"
 );
 const _: () = assert!(std::mem::offset_of!(X86DsrContext, fault) as u32 == CTX_FAULT_RECORD);
+const _: () = assert!(std::mem::offset_of!(X86DsrContext, save_fpu) as i32 == CTX_SAVE_FPU);
 const _: () =
     assert!(std::mem::offset_of!(X86DsrContext, exit_syscall_addr) as i32 == CTX_EXIT_SYSCALL_ADDR);
 const _: () = assert!(std::mem::offset_of!(X86DsrContext, entry) as i32 == CTX_ENTRY);

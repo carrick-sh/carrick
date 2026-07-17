@@ -19,6 +19,9 @@ pub struct PlannedInst {
     pub va: u64,
     pub len: u8,
     pub class: X86InstClass,
+    /// Whether this instruction touches FPU/vector state (see
+    /// [`X86Block::uses_fpu`]).
+    pub uses_fpu: bool,
 }
 
 /// Why a block ended and what the translator must do at its boundary.
@@ -75,6 +78,12 @@ pub struct X86Block {
     pub end: u64,
     pub instructions: Vec<PlannedInst>,
     pub exit: X86Exit,
+    /// Whether any emitted (copy-through) instruction in this block touches
+    /// SSE/AVX/x87/MMX state. When false the gateway can skip the
+    /// `fxsave`/`fxrstor` of the 512-byte FPU area around the block — the
+    /// common case in integer code. The terminator (syscall/branch/sensitive)
+    /// never touches FPU, so only the body matters.
+    pub uses_fpu: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -115,26 +124,20 @@ pub fn plan_block(
 
     loop {
         if instructions.len() >= max_instructions {
-            return Ok(X86Block {
+            return Ok(continue_block(
                 start,
-                end: va,
+                va,
+                BlockLimit::InstructionLimit,
                 instructions,
-                exit: X86Exit::Continue {
-                    target: va,
-                    limit: BlockLimit::InstructionLimit,
-                },
-            });
+            ));
         }
         if va >= limit {
-            return Ok(X86Block {
+            return Ok(continue_block(
                 start,
-                end: va,
+                va,
+                BlockLimit::PageBoundary,
                 instructions,
-                exit: X86Exit::Continue {
-                    target: va,
-                    limit: BlockLimit::PageBoundary,
-                },
-            });
+            ));
         }
 
         let bytes = read(va);
@@ -146,15 +149,12 @@ pub fn plan_block(
                 // An instruction that would cross the page boundary belongs to
                 // the next page's generation; stop before it.
                 if next > limit {
-                    return Ok(X86Block {
+                    return Ok(continue_block(
                         start,
-                        end: va,
+                        va,
+                        BlockLimit::PageBoundary,
                         instructions,
-                        exit: X86Exit::Continue {
-                            target: va,
-                            limit: BlockLimit::PageBoundary,
-                        },
-                    });
+                    ));
                 }
                 match c.class {
                     X86InstClass::Copy => {
@@ -162,6 +162,7 @@ pub fn plan_block(
                             va,
                             len: c.len,
                             class: c.class,
+                            uses_fpu: c.uses_fpu,
                         });
                         va = next;
                     }
@@ -224,15 +225,12 @@ pub fn plan_block(
             // faulted in). A genuine mid-page truncation cannot occur because
             // `read` supplies up to 15 bytes.
             Err(X86DecodeError::Truncated { .. }) if va < limit => {
-                return Ok(X86Block {
+                return Ok(continue_block(
                     start,
-                    end: va,
+                    va,
+                    BlockLimit::PageBoundary,
                     instructions,
-                    exit: X86Exit::Continue {
-                        target: va,
-                        limit: BlockLimit::PageBoundary,
-                    },
-                });
+                ));
             }
             Err(e) => return Err(e.into()),
         }
@@ -240,11 +238,31 @@ pub fn plan_block(
 }
 
 fn terminate(start: u64, end: u64, instructions: Vec<PlannedInst>, exit: X86Exit) -> X86Block {
+    let uses_fpu = instructions.iter().any(|i| i.uses_fpu);
     X86Block {
         start,
         end,
         instructions,
         exit,
+        uses_fpu,
+    }
+}
+
+/// A structural (`Continue`) block: the whole planned run is the body, and
+/// execution continues by translating `target`.
+fn continue_block(
+    start: u64,
+    target: u64,
+    limit: BlockLimit,
+    instructions: Vec<PlannedInst>,
+) -> X86Block {
+    let uses_fpu = instructions.iter().any(|i| i.uses_fpu);
+    X86Block {
+        start,
+        end: target,
+        instructions,
+        exit: X86Exit::Continue { target, limit },
+        uses_fpu,
     }
 }
 

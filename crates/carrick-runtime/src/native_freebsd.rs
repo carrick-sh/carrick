@@ -499,11 +499,13 @@ where
     // the whole run. Cursor is monotonic (no wrap): distinct blocks are
     // bounded by the guest's code size.
     const CODE_CACHE_LEN: usize = 4 * 1024 * 1024;
-    let mut cache: std::collections::HashMap<u64, (u64, X86Exit), VaBuildHasher> =
+    // Cache entry: (exec VA, block exit, uses_fpu). `uses_fpu` drives the
+    // gateway's per-block FPU save/restore skip.
+    let mut cache: std::collections::HashMap<u64, (u64, X86Exit, bool), VaBuildHasher> =
         std::collections::HashMap::default();
 
     'run: while traps < max_traps {
-        let (exec, exit) = if let Some(&hit) = cache.get(&next) {
+        let (exec, exit, uses_fpu) = if let Some(&hit) = cache.get(&next) {
             hit
         } else {
             let block = match plan_block(next, 256, PAGE, read_guest) {
@@ -541,7 +543,7 @@ where
             unsafe { std::ptr::copy_nonoverlapping(translated.as_ptr(), wptr, translated.len()) };
             jit.flush_icache(exec, translated.len());
             cursor += translated.len();
-            let entry = (exec as u64, block.exit);
+            let entry = (exec as u64, block.exit, block.uses_fpu);
             cache.insert(next, entry);
             entry
         };
@@ -559,6 +561,8 @@ where
 
         let mut ctx = X86DsrContext::new(snapshot, exec as u64, resume);
         ctx.guest_fsbase = guest_fsbase;
+        // Skip the 512-byte FPU save/restore for integer-only blocks.
+        ctx.save_fpu = u32::from(uses_fpu);
         // SAFETY: exec holds a freshly translated block ending in an exit stub;
         // rsp is a valid guest stack.
         let raw = unsafe { carrick_dsr_x86::enter_translated(&mut ctx) };
