@@ -5,18 +5,177 @@
 //! the small immutable-config wrapper (`NativeMemoryHandle`/
 //! `NativeMemoryConfig`) that lets hot-path readers avoid its `RwLock`.
 
-use super::*;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+use std::sync::OnceLock;
+
+use carrick_dsr::address::{
+    NATIVE_DARWIN_SIGRETURN_TRAMPOLINE_BASE, NativeAddressMode, NativeLayout,
+};
+use carrick_dsr::page_geometry::{
+    HostPageState, MixedPageReason, PageBacking, PageGeometry, PagePerms, SubpageState,
+    classify_host_page_state,
+};
+#[cfg(any(test, feature = "test-hooks"))]
+use carrick_dsr::test_hooks::{
+    NATIVE_TEST_FAIL_EXEC_AFTER_SETUP, NATIVE_TEST_REEXEC_LIFECYCLE,
+    NATIVE_TEST_SUPPLEMENTAL_ROLLBACKS, NATIVE_TEST_VVAR_WORDS, NativePreparedMappingFailpoint,
+    take_native_prepared_mapping_failpoint,
+};
+use carrick_guest_mem::protections::MemoryProtections;
+use carrick_guest_mem::{GuestMemory, MemoryError};
+use carrick_mem::memory::{AddressSpace, MemoryLayout, MemoryRegion};
+
+use crate::prepared_image::{
+    NativeRelativeRelocation, PreparedImageFileBacking, ValidatedPreparedImage,
+    native_region_copy_window,
+};
+
+/// Path-compat alias for the translator layer this module grew up next to:
+/// the moved code keeps addressing it as `dsr::…` exactly as it did inside
+/// `native_darwin/`, with the cache/typed-vocabulary halves resolving to
+/// their extracted homes.
+mod dsr {
+    pub use crate::translator::*;
+    pub use crate::types;
+    pub use carrick_dsr::cache;
+}
+
+/// Native-lane relocations of the canonical Linux vvar/vdso pages (see the
+/// pre-extraction `native_darwin.rs` doc comment for the Darwin VA-hole
+/// rationale). Moved here with the memory model that maps and stamps them;
+/// the runtime re-imports them through this module.
+pub const NATIVE_DARWIN_VVAR_BASE: u64 = carrick_mem::vdso::LINUX_VVAR_BASE + (0x80 << 32);
+pub const NATIVE_DARWIN_VDSO_BASE: u64 = carrick_mem::vdso::LINUX_VDSO_BASE + (0x80 << 32);
+const _: () = assert!(NATIVE_DARWIN_VVAR_BASE & ((1 << 32) - 1) == 0);
+const _: () = assert!(NATIVE_DARWIN_VVAR_BASE >> 32 <= u16::MAX as u64);
+const _: () = assert!(carrick_mem::vdso::LINUX_VVAR_BASE & ((1 << 32) - 1) == 0);
+
+/// True in a host process created by a GUEST `fork` (not the run-elf root
+/// child, which the CLI forks for isolation). Guest-forked children must exit
+/// through `exec_helpers::forked_child_exit` so their guest CPU is published
+/// for the parent's wait4/waitid child-time accounting (the HVF loop's
+/// `is_forked_guest_process` branch); the root child's exit is reported to the
+/// CLI, which does no such accounting. Survives execve (same host process).
+/// Process-global native-backend state; moved here (its only non-runtime
+/// reader is `prepare_exec_mapping`) with a runtime re-export.
+pub static NATIVE_FORKED_GUEST_CHILD: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Host clock calibration seam for vvar stamping: returns
+/// `(counter_freq_hz, clock_uptime_raw_ns)`. The runtime installs its Darwin
+/// sources (`trap::host_counter_frequency` / `trap::host_clock_uptime_ns`) at
+/// every native-backend entry point, alongside the probe sink and host JIT;
+/// uninstalled the stamper sees `freq == 0` and skips the clock words --
+/// byte-identical to the pre-extraction off-target stub. First-install-wins,
+/// idempotent.
+static VVAR_CLOCK_SOURCES: OnceLock<fn() -> (u64, u64)> = OnceLock::new();
+
+/// Install the process-wide vvar clock-calibration sources.
+pub fn install_vvar_clock_sources(sources: fn() -> (u64, u64)) {
+    let _ = VVAR_CLOCK_SOURCES.set(sources);
+}
+
+fn native_vvar_clock_sources() -> (u64, u64) {
+    VVAR_CLOCK_SOURCES.get().map_or((0, 0), |sources| sources())
+}
+
+/// Best-effort raw write to host stderr for post-fork child paths where the
+/// allocator and locks may not be safe. Moved from `native_darwin.rs` (which
+/// re-imports it): the memory model's exec-map trace path is a caller.
+pub fn child_write_stderr(bytes: &[u8]) {
+    let mut written = 0usize;
+    while written < bytes.len() {
+        let ptr = unsafe { bytes.as_ptr().add(written) };
+        let rc = unsafe {
+            libc::write(
+                libc::STDERR_FILENO,
+                ptr.cast::<libc::c_void>(),
+                bytes.len() - written,
+            )
+        };
+        if rc <= 0 {
+            break;
+        }
+        let Ok(n) = usize::try_from(rc) else {
+            break;
+        };
+        written = written.saturating_add(n);
+    }
+}
+
+/// Native-lane guest arena layout constants (moved with the memory model
+/// that maps them; the runtime re-imports them through this module — see the
+/// pre-extraction `native_darwin.rs` doc comments for the Darwin VA
+/// rationale).
+pub const NATIVE_DARWIN_HEAP_BASE: u64 = 0x8_0000_0000;
+pub const NATIVE_DARWIN_HEAP_SIZE: u64 = 128 * 1024 * 1024;
+pub const NATIVE_DARWIN_MMAP_BASE: u64 = 0xa0_0000_0000;
+pub const NATIVE_DARWIN_MMAP_SIZE: u64 = 32 * 1024 * 1024 * 1024;
+
+pub fn native_memory_layout() -> MemoryLayout {
+    MemoryLayout {
+        heap_base: NATIVE_DARWIN_HEAP_BASE,
+        heap_size: NATIVE_DARWIN_HEAP_SIZE,
+        mmap_base: NATIVE_DARWIN_MMAP_BASE,
+        mmap_size: NATIVE_DARWIN_MMAP_SIZE,
+    }
+}
+
+/// Record a self-reexec lifecycle phase: test capture (when the hooks are
+/// compiled in) plus the `dsr__cache__lifecycle` probe through the seam sink
+/// (the runtime forwarder converts to the USDT mirror at the probe edge,
+/// exactly as the pre-extraction `native_reexec_lifecycle` did inline).
+pub fn native_reexec_lifecycle(phase: carrick_dsr::probes::DsrCacheLifecyclePhase) {
+    #[cfg(any(test, feature = "test-hooks"))]
+    NATIVE_TEST_REEXEC_LIFECYCLE.with(|slot| {
+        if let Some(phases) = slot.borrow_mut().as_mut() {
+            phases.push(phase);
+        }
+    });
+    let tid = unsafe { libc::getpid() };
+    carrick_dsr::probes::dsr_cache_lifecycle(tid, phase, 0, 0, 0);
+}
+
+pub fn apply_native_relative_relocations(
+    memory: &mut NativeMappedMemory,
+    relocations: &[NativeRelativeRelocation],
+) -> Result<(), NativeMemoryError> {
+    for relocation in relocations {
+        memory.write_u64(relocation.address().get(), relocation.value().get())?;
+    }
+    Ok(())
+}
+
+/// Make freshly written guest EXEC-page bytes visible to instruction fetch,
+/// through the installed host JIT seam (`translator::install_host_jit`) —
+/// the Darwin impl calls the same `carrick_native_clear_icache` C shim the
+/// pre-extraction code invoked directly. With no host installed this is a
+/// no-op: that is the pure-mapping test configuration (and any x86 host),
+/// where there is no split I/D cache hazard to clear.
+fn native_clear_icache(start: *mut libc::c_void, len: usize) {
+    if let Some(jit) = crate::translator::installed_host_jit() {
+        jit.flush_icache(start.cast_const().cast::<u8>(), len);
+    }
+}
 
 // Explicit imports beat the glob above: the mapping machinery speaks
 // `NativeMemoryError` internally (carrick-dsr's error vocabulary) and these
-// helpers shadow native_darwin.rs's RuntimeError-returning wrappers of the
+// helpers shadow native_darwin.rs's NativeMemoryError-returning wrappers of the
 // same names. Only the public boundary functions of this module — the ones
-// called from outside mapped_memory.rs — still return `RuntimeError`,
+// called from outside mapped_memory.rs — still return `NativeMemoryError`,
 // converting at `?` / `.into()` via the `From` impl in run_result.rs.
 use carrick_dsr::native_error::{NativeMemoryError, align_up_u64, checked_add_u64, last_io_error};
 
-pub(super) const VM_INHERIT_SHARE: libc::c_int = 0;
-pub(super) const VM_INHERIT_COPY: libc::c_int = 1;
+pub const VM_INHERIT_SHARE: libc::c_int = 0;
+pub const VM_INHERIT_COPY: libc::c_int = 1;
+
+// Load-bearing on Darwin (lazy commit for the giant PROT_NONE arena
+// reservations); libc deprecates it on FreeBSD, where mappings were never
+// implicitly reserved and the bit has been a no-op since FreeBSD 11 —
+// identical semantics, so keep the flag and silence the deprecation once.
+#[allow(deprecated)]
+const MAP_NORESERVE: libc::c_int = libc::MAP_NORESERVE;
 
 /// Immutable-after-image-load memory configuration: `address_mode`,
 /// `host_page_size`, `linux_page_size`, and `owned_host_ranges` are set once
@@ -39,7 +198,7 @@ pub(super) const VM_INHERIT_COPY: libc::c_int = 1;
 /// `from_memory` (below) is the only place it's produced, always from the
 /// `NativeMappedMemory` that is about to become (or just became) canonical.
 #[derive(Clone, Debug)]
-pub(super) struct NativeMemoryConfig {
+pub struct NativeMemoryConfig {
     address_mode: NativeAddressMode,
     host_page_size: u64,
     linux_page_size: u64,
@@ -47,7 +206,7 @@ pub(super) struct NativeMemoryConfig {
 }
 
 impl NativeMemoryConfig {
-    pub(super) fn from_memory(memory: &NativeMappedMemory) -> Self {
+    pub fn from_memory(memory: &NativeMappedMemory) -> Self {
         Self {
             address_mode: memory.address_mode,
             host_page_size: memory.host_page_size,
@@ -64,13 +223,13 @@ impl NativeMemoryConfig {
 /// unchanged; the config accessors below are additional, not a replacement
 /// for the locked struct fields (which every other internal
 /// `NativeMappedMemory` method continues to read directly).
-pub(super) struct NativeMemoryHandle {
+pub struct NativeMemoryHandle {
     memory: parking_lot::RwLock<NativeMappedMemory>,
     config: parking_lot::RwLock<NativeMemoryConfig>,
 }
 
 impl NativeMemoryHandle {
-    pub(super) fn new(memory: NativeMappedMemory) -> Self {
+    pub fn new(memory: NativeMappedMemory) -> Self {
         let config = NativeMemoryConfig::from_memory(&memory);
         Self {
             memory: parking_lot::RwLock::new(memory),
@@ -80,19 +239,19 @@ impl NativeMemoryHandle {
 
     /// `address_mode` without acquiring `self.memory`'s `RwLock` -- see
     /// `NativeMemoryConfig`'s doc comment.
-    pub(super) fn address_mode(&self) -> NativeAddressMode {
+    pub fn address_mode(&self) -> NativeAddressMode {
         self.config.read().address_mode
     }
 
     /// `host_page_size` without acquiring `self.memory`'s `RwLock` -- see
     /// `NativeMemoryConfig`'s doc comment.
-    pub(super) fn host_page_size(&self) -> u64 {
+    pub fn host_page_size(&self) -> u64 {
         self.config.read().host_page_size
     }
 
     /// `linux_page_size` without acquiring `self.memory`'s `RwLock` -- see
     /// `NativeMemoryConfig`'s doc comment.
-    pub(super) fn linux_page_size(&self) -> u64 {
+    pub fn linux_page_size(&self) -> u64 {
         self.config.read().linux_page_size
     }
 
@@ -101,10 +260,10 @@ impl NativeMemoryHandle {
     /// refcount bump, not a copy of the ranges); the caller can then read
     /// the ranges without holding ANY lock at all. Only exercised directly
     /// by tests today (`biased_guest_fault_address`, below, is the
-    /// production caller); kept `pub(super)` as the general-purpose
+    /// production caller); kept `pub` as the general-purpose
     /// lock-free accessor future hot-path callers should reach for.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(super) fn owned_host_ranges(&self) -> Arc<Vec<std::ops::Range<carrick_guest_mem::HostVa>>> {
+    pub fn owned_host_ranges(&self) -> Arc<Vec<std::ops::Range<carrick_guest_mem::HostVa>>> {
         Arc::clone(&self.config.read().owned_host_ranges)
     }
 
@@ -117,7 +276,7 @@ impl NativeMemoryHandle {
     /// `region_contains`, which remains behind the big lock pending the
     /// later ArcSwap phases (`docs/superpowers/specs/2026-07-15-mmap-writer-
     /// lockfree-reads-design.md`).
-    pub(super) fn biased_guest_fault_address(
+    pub fn biased_guest_fault_address(
         &self,
         address: carrick_guest_mem::HostVa,
     ) -> Option<carrick_guest_mem::GuestVa> {
@@ -135,7 +294,7 @@ impl NativeMemoryHandle {
     /// Mirrors `NativeMappedMemory::uses_linux4k_subpages`, backed by the
     /// same immutable-after-init config, without acquiring `self.memory`'s
     /// `RwLock`.
-    pub(super) fn uses_linux4k_subpages(&self) -> bool {
+    pub fn uses_linux4k_subpages(&self) -> bool {
         self.host_page_size() == 16 * 1024 && self.linux_page_size() == 4 * 1024
     }
 
@@ -149,16 +308,16 @@ impl NativeMemoryHandle {
     /// refresh impossible for production callers. Tests that operate on a
     /// bare `NativeMappedMemory` (not wrapped in a handle) still call
     /// `NativeMappedMemory::replace_image` directly and are unaffected.
-    pub(super) fn replace_image(
+    pub fn replace_image(
         &self,
         image: &AddressSpace,
         relative_relocations: &[NativeRelativeRelocation],
-        plan: &ExecutionPlan,
-        dsr_tid: Option<crate::thread::ThreadId>,
+        geometry: PageGeometry,
+        dsr_tid: Option<i32>,
         prepared: PreparedNativeExecMapping,
-    ) -> Result<(), RuntimeError> {
+    ) -> Result<(), NativeMemoryError> {
         let mut guard = self.memory.write();
-        guard.replace_image(image, relative_relocations, plan, dsr_tid, prepared)?;
+        guard.replace_image(image, relative_relocations, geometry, dsr_tid, prepared)?;
         *self.config.write() = NativeMemoryConfig::from_memory(&guard);
         Ok(())
     }
@@ -172,7 +331,7 @@ impl std::ops::Deref for NativeMemoryHandle {
     }
 }
 
-pub(super) type SharedNativeMemory = Arc<NativeMemoryHandle>;
+pub type SharedNativeMemory = Arc<NativeMemoryHandle>;
 
 /// A reference-counted temporary lift of a single PROTECTED host guest page.
 ///
@@ -186,7 +345,7 @@ pub(super) type SharedNativeMemory = Arc<NativeMemoryHandle>;
 /// accessor holds it and restores it to `original_prot` only when the LAST one
 /// leaves.
 #[derive(Debug)]
-pub(super) struct HostLift {
+pub struct HostLift {
     /// Number of in-flight accessors currently relying on this page's lift.
     refcount: u32,
     /// The protection to restore once the final accessor releases -- the page's
@@ -203,7 +362,7 @@ pub(super) struct HostLift {
 /// window between prepare and restore unwinds or exits early. Callers disarm it
 /// and restore explicitly on the success path to preserve restore-error
 /// propagation.
-pub(super) struct HostLiftRestoreGuard<'a> {
+pub struct HostLiftRestoreGuard<'a> {
     memory: &'a NativeMappedMemory,
     changed: &'a [(u64, libc::c_int)],
     address: u64,
@@ -223,8 +382,8 @@ impl Drop for HostLiftRestoreGuard<'_> {
     }
 }
 
-pub(super) struct NativeMappedMemory {
-    pub(super) address_mode: NativeAddressMode,
+pub struct NativeMappedMemory {
+    pub address_mode: NativeAddressMode,
     // Host-coordinate authority for image retirement, biased fixed remaps,
     // and validated reverse faults. Biased intervals are collision-reserved;
     // direct intervals are normalized planned ownership recorded after the
@@ -236,12 +395,12 @@ pub(super) struct NativeMappedMemory {
     // set at construction and wholesale-replaced by `replace_image`
     // (execve), exactly like `address_mode`/`host_page_size`/
     // `linux_page_size`.
-    pub(super) owned_host_ranges: Arc<Vec<std::ops::Range<carrick_guest_mem::HostVa>>>,
-    pub(super) regions: Vec<NativeMappedRegion>,
-    pub(super) protections: MemoryProtections,
-    pub(super) native_page_protections: BTreeMap<u64, u64>,
-    pub(super) native_write_exec_writable_pages: BTreeSet<u64>,
-    pub(super) linux4k_page_protections: BTreeMap<u64, [u64; 4]>,
+    pub owned_host_ranges: Arc<Vec<std::ops::Range<carrick_guest_mem::HostVa>>>,
+    pub regions: Vec<NativeMappedRegion>,
+    pub protections: MemoryProtections,
+    pub native_page_protections: BTreeMap<u64, u64>,
+    pub native_write_exec_writable_pages: BTreeSet<u64>,
+    pub linux4k_page_protections: BTreeMap<u64, [u64; 4]>,
     // The exclusive-monitor reservation itself now lives per guest thread
     // (`NativeThreadRuntime.exclusive_reservation`), not here. The DSR-hot
     // path already threaded it through `exclusive_load_for`/`exclusive_store_for`;
@@ -249,12 +408,12 @@ pub(super) struct NativeMappedMemory {
     // now does the same via `exclusive_load`/`exclusive_store`. Only the shared
     // sequence bookkeeping below remains on the struct, behind its own interior
     // lock so it stays reachable through a shared `&self`.
-    pub(super) exclusive_sequences:
+    pub exclusive_sequences:
         parking_lot::Mutex<BTreeMap<NativeExclusiveLocation, NativeExclusiveSequence>>,
-    pub(super) host_page_size: u64,
-    pub(super) linux_page_size: u64,
-    pub(super) dsr_generations: dsr::cache::PageGenerationTable,
-    pub(super) dsr_translator: Option<Arc<dsr::ProcessTranslator>>,
+    pub host_page_size: u64,
+    pub linux_page_size: u64,
+    pub dsr_generations: dsr::cache::PageGenerationTable,
+    pub dsr_translator: Option<Arc<dsr::ProcessTranslator>>,
     // Reference-counted temporary host-page lifts (see [`HostLift`]). Keyed by
     // the guest page address recorded in each accessor's `changed` list.
     // Interior-mutable so `prepare_temporary_host_access`/
@@ -263,36 +422,36 @@ pub(super) struct NativeMappedMemory {
     // held we only touch the map, call `host_address` (pure arithmetic), and
     // `set_host_prot` (a bare `mprotect`, or the test spy); never another lock
     // or the memory `RwLock`. The no-lift fast path never acquires it.
-    pub(super) host_access_lifts: parking_lot::Mutex<std::collections::HashMap<u64, HostLift>>,
+    pub host_access_lifts: parking_lot::Mutex<std::collections::HashMap<u64, HostLift>>,
 }
 
-pub(super) struct PreparedNativeExecMapping {
-    pub(super) native_layout: NativeLayout,
-    pub(super) process_translator: Arc<dsr::ProcessTranslator>,
-    pub(super) reset_inherited_translator: bool,
-    pub(super) direct_target_reservations: Vec<crate::host_proc::DirectVmReservation>,
-    pub(super) rollback_plan: NativeMappingRollbackPlan,
+pub struct PreparedNativeExecMapping {
+    pub native_layout: NativeLayout,
+    pub process_translator: Arc<dsr::ProcessTranslator>,
+    pub reset_inherited_translator: bool,
+    pub direct_target_reservations: Vec<carrick_host::host_proc::DirectVmReservation>,
+    pub rollback_plan: NativeMappingRollbackPlan,
 }
 
 #[derive(Clone, Copy)]
-pub(super) enum NativeImageBacking<'a> {
+pub enum NativeImageBacking<'a> {
     AnonymousBytes,
     Prepared(&'a ValidatedPreparedImage),
 }
 
 impl NativeImageBacking<'_> {
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(super) fn is_prepared(self) -> bool {
+    pub fn is_prepared(self) -> bool {
         matches!(self, Self::Prepared(_))
     }
 }
 
-pub(super) struct NativeMappingRollbackPlan {
-    pub(super) supplemental_ranges: Vec<std::ops::Range<carrick_guest_mem::HostVa>>,
+pub struct NativeMappingRollbackPlan {
+    pub supplemental_ranges: Vec<std::ops::Range<carrick_guest_mem::HostVa>>,
 }
 
 impl NativeMappingRollbackPlan {
-    pub(super) fn for_fresh_layout(layout: &NativeLayout) -> Self {
+    pub fn for_fresh_layout(layout: &NativeLayout) -> Self {
         let supplemental_ranges = match layout.address_mode() {
             NativeAddressMode::Direct => layout.owned_ranges().to_vec(),
             NativeAddressMode::Biased { .. } => Vec::new(),
@@ -302,7 +461,7 @@ impl NativeMappingRollbackPlan {
         }
     }
 
-    pub(super) fn direct_exec(
+    pub fn direct_exec(
         owned_ranges: &[std::ops::Range<carrick_guest_mem::HostVa>],
         mut reservation_ranges: Vec<std::ops::Range<carrick_guest_mem::HostVa>>,
     ) -> Self {
@@ -313,7 +472,7 @@ impl NativeMappingRollbackPlan {
     }
 }
 
-pub(super) struct NativeMappingRollback {
+pub struct NativeMappingRollback {
     supplemental_ranges: Vec<std::ops::Range<carrick_guest_mem::HostVa>>,
     mapped_supplemental_ranges: Vec<std::ops::Range<carrick_guest_mem::HostVa>>,
     host_page_size: usize,
@@ -321,7 +480,7 @@ pub(super) struct NativeMappingRollback {
 }
 
 impl NativeMappingRollback {
-    pub(super) fn new(
+    pub fn new(
         plan: NativeMappingRollbackPlan,
         host_page_size: u64,
         capacity: usize,
@@ -344,7 +503,7 @@ impl NativeMappingRollback {
         })
     }
 
-    pub(super) fn track_mapping(&mut self, start: carrick_guest_mem::HostVa, length: usize) {
+    pub fn track_mapping(&mut self, start: carrick_guest_mem::HostVa, length: usize) {
         if length == 0 || self.supplemental_ranges.is_empty() {
             return;
         }
@@ -364,7 +523,7 @@ impl NativeMappingRollback {
         normalize_host_ranges(&mut self.mapped_supplemental_ranges);
     }
 
-    pub(super) fn commit(mut self) {
+    pub fn commit(mut self) {
         self.armed = false;
     }
 }
@@ -389,63 +548,63 @@ impl Drop for NativeMappingRollback {
 }
 
 #[derive(Clone, Copy)]
-pub(super) struct NativeMappingPageSizes {
+pub struct NativeMappingPageSizes {
     host: u64,
     linux: u64,
 }
 
-pub(super) struct NativeMappingOptions<'a> {
+pub struct NativeMappingOptions<'a> {
     reusable_translator: Option<Arc<dsr::ProcessTranslator>>,
-    exec_map_dsr_tid: Option<crate::thread::ThreadId>,
+    exec_map_dsr_tid: Option<i32>,
     relative_relocations: &'a [NativeRelativeRelocation],
     backing: NativeImageBacking<'a>,
     rollback_plan: NativeMappingRollbackPlan,
 }
 
-pub(super) struct NativeByteRegionOptions {
+pub struct NativeByteRegionOptions {
     final_prot: libc::c_int,
     executable: bool,
-    exec_map_dsr_tid: Option<crate::thread::ThreadId>,
+    exec_map_dsr_tid: Option<i32>,
 }
 
 #[derive(Clone, Copy)]
-pub(super) struct PreparedRegionMapping {
+pub struct PreparedRegionMapping {
     mapped: *mut libc::c_void,
     mapped_length: usize,
     logical_length: u64,
 }
 
 #[derive(Clone, Copy)]
-pub(super) struct NativeExclusiveReservation {
-    pub(super) location: NativeExclusiveLocation,
-    pub(super) observed: u64,
-    pub(super) sequence: NativeExclusiveSequence,
+pub struct NativeExclusiveReservation {
+    pub location: NativeExclusiveLocation,
+    pub observed: u64,
+    pub sequence: NativeExclusiveSequence,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(super) struct NativeExclusiveLocation {
-    pub(super) address: u64,
-    pub(super) width: usize,
+pub struct NativeExclusiveLocation {
+    pub address: u64,
+    pub width: usize,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) struct NativeExclusiveSequence(u64);
+pub struct NativeExclusiveSequence(u64);
 
 impl NativeExclusiveSequence {
-    pub(super) const INITIAL: Self = Self(0);
+    pub const INITIAL: Self = Self(0);
 
-    pub(super) fn next(self) -> Self {
+    pub fn next(self) -> Self {
         Self(self.0.wrapping_add(1))
     }
 }
 
-pub(super) struct NativeMappedRegion {
-    pub(super) start: u64,
-    pub(super) end: u64,
-    pub(super) host_protects: bool,
-    pub(super) shared_futex: bool,
-    pub(super) guest_writable: bool,
-    pub(super) default_prot: u64,
+pub struct NativeMappedRegion {
+    pub start: u64,
+    pub end: u64,
+    pub host_protects: bool,
+    pub shared_futex: bool,
+    pub guest_writable: bool,
+    pub default_prot: u64,
     /// File-identity futex-key base (`trap::shared_file_key_base`) for a
     /// direct host `MAP_SHARED` FILE mapping, else 0. Two processes mapping
     /// the same file at DIFFERENT guest addresses (native exec rebuilds the
@@ -454,26 +613,26 @@ pub(super) struct NativeMappedRegion {
     /// key; a guest-VA key made the exec'd child's FUTEX_WAKE miss the
     /// parent's registered waiter (ltpcheckpointexec). 0 keeps VA-keying:
     /// anon MAP_SHARED is fork-inherited at the SAME VA everywhere.
-    pub(super) shared_key_base: u64,
+    pub shared_key_base: u64,
     /// File offset of `start` for `shared_key_base != 0` regions.
-    pub(super) shared_key_offset: u64,
+    pub shared_key_offset: u64,
 }
 
-pub(super) fn native_region_linux_prot(read: bool, write: bool, exec: bool) -> u64 {
+pub fn native_region_linux_prot(read: bool, write: bool, exec: bool) -> u64 {
     let mut prot = 0;
     if read {
-        prot |= crate::linux_abi::LINUX_PROT_READ;
+        prot |= carrick_abi::LINUX_PROT_READ;
     }
     if write {
-        prot |= crate::linux_abi::LINUX_PROT_WRITE;
+        prot |= carrick_abi::LINUX_PROT_WRITE;
     }
     if exec {
-        prot |= crate::linux_abi::LINUX_PROT_EXEC;
+        prot |= carrick_abi::LINUX_PROT_EXEC;
     }
     prot
 }
 
-pub(super) fn normalize_host_ranges(ranges: &mut Vec<std::ops::Range<carrick_guest_mem::HostVa>>) {
+pub fn normalize_host_ranges(ranges: &mut Vec<std::ops::Range<carrick_guest_mem::HostVa>>) {
     ranges.sort_unstable_by_key(|range| range.start.raw());
     let mut write = 0;
     for read in 0..ranges.len() {
@@ -489,7 +648,7 @@ pub(super) fn normalize_host_ranges(ranges: &mut Vec<std::ops::Range<carrick_gue
     ranges.truncate(write);
 }
 
-pub(super) fn subtract_host_ranges(
+pub fn subtract_host_ranges(
     owned: &[std::ops::Range<carrick_guest_mem::HostVa>],
     retained: &[std::ops::Range<carrick_guest_mem::HostVa>],
 ) -> Vec<std::ops::Range<carrick_guest_mem::HostVa>> {
@@ -520,11 +679,11 @@ pub(super) fn subtract_host_ranges(
 }
 
 impl NativeMappedMemory {
-    pub(super) fn address_mode(&self) -> NativeAddressMode {
+    pub fn address_mode(&self) -> NativeAddressMode {
         self.address_mode
     }
 
-    pub(super) fn host_address(
+    pub fn host_address(
         &self,
         address: carrick_guest_mem::GuestVa,
     ) -> Result<carrick_guest_mem::HostVa, MemoryError> {
@@ -533,7 +692,7 @@ impl NativeMappedMemory {
             .map_err(|error| MemoryError::HostMap(error.to_string()))
     }
 
-    pub(super) fn guest_fault_address(
+    pub fn guest_fault_address(
         &self,
         address: carrick_guest_mem::HostVa,
     ) -> Option<carrick_guest_mem::GuestVa> {
@@ -551,17 +710,15 @@ impl NativeMappedMemory {
         self.region_contains(guest.raw(), 1).then_some(guest)
     }
 
-    pub(super) fn dsr_process_translator(
-        &self,
-    ) -> Result<Arc<dsr::ProcessTranslator>, RuntimeError> {
+    pub fn dsr_process_translator(&self) -> Result<Arc<dsr::ProcessTranslator>, NativeMemoryError> {
         self.dsr_translator.as_ref().map(Arc::clone).ok_or_else(|| {
-            RuntimeError::Unsupported(
+            NativeMemoryError::Unsupported(
                 "native DSR process translator is unavailable outside DSR mode".to_string(),
             )
         })
     }
 
-    pub(super) fn note_dsr_code_mutation(
+    pub fn note_dsr_code_mutation(
         &self,
         address: u64,
         len: usize,
@@ -583,14 +740,14 @@ impl NativeMappedMemory {
             .map_err(|error| MemoryError::HostMap(error.to_string()))
     }
 
-    pub(super) fn dsr_generation_observation(
+    pub fn dsr_generation_observation(
         &self,
         pc: carrick_guest_mem::GuestVa,
     ) -> Result<dsr::cache::PageGenerationObservation, dsr::types::DsrError> {
         Ok(self.dsr_generations.observe(pc)?)
     }
 
-    pub(super) fn range_may_execute(&self, address: u64, len: usize) -> bool {
+    pub fn range_may_execute(&self, address: u64, len: usize) -> bool {
         if len == 0 {
             return false;
         }
@@ -602,7 +759,7 @@ impl NativeMappedMemory {
                 .get(&page)
                 .copied()
                 .unwrap_or_else(|| self.default_linux_prot_at(page));
-            if prot & crate::linux_abi::LINUX_PROT_EXEC != 0 {
+            if prot & carrick_abi::LINUX_PROT_EXEC != 0 {
                 return true;
             }
             page = page.saturating_add(self.host_page_size);
@@ -610,24 +767,27 @@ impl NativeMappedMemory {
         false
     }
 
-    #[cfg(test)]
-    pub(super) fn map(
+    // Test-only entry, kept always-compiled: cross-crate `cfg(test)` does
+    // not compose and the runtime's still-resident native test suites
+    // construct memory through these.
+    #[doc(hidden)]
+    pub fn map(
         image: &AddressSpace,
         layout: MemoryLayout,
         host_page_size: u64,
         linux_page_size: u64,
-    ) -> Result<Self, RuntimeError> {
+    ) -> Result<Self, NativeMemoryError> {
         Self::map_with_translator(image, layout, host_page_size, linux_page_size, None, None)
     }
 
-    pub(super) fn map_for_plan(
+    pub fn map_for_plan(
         image: &AddressSpace,
         layout: MemoryLayout,
         host_page_size: u64,
         linux_page_size: u64,
-        _plan: &ExecutionPlan,
+        _geometry: PageGeometry,
         relative_relocations: &[NativeRelativeRelocation],
-    ) -> Result<Self, RuntimeError> {
+    ) -> Result<Self, NativeMemoryError> {
         let native_layout = NativeLayout::for_image(image, layout, host_page_size)
             .map_err(|error| NativeMemoryError::Unsupported(error.to_string()))?;
         let rollback_plan = NativeMappingRollbackPlan::for_fresh_layout(&native_layout);
@@ -650,23 +810,22 @@ impl NativeMappedMemory {
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(super) fn map_prepared_for_plan(
+    pub fn map_prepared_for_plan(
         prepared: &ValidatedPreparedImage,
         layout: MemoryLayout,
-        plan: &ExecutionPlan,
-    ) -> Result<Self, RuntimeError> {
+        geometry: PageGeometry,
+    ) -> Result<Self, NativeMemoryError> {
         let native_layout =
-            NativeLayout::for_image(&prepared.image, layout, plan.page_geometry.host_page_size)
-                .map_err(|error| {
-                    NativeMemoryError::Unsupported(format!("prepared-map: {error}"))
-                })?;
+            NativeLayout::for_image(&prepared.image, layout, geometry.host_page_size).map_err(
+                |error| NativeMemoryError::Unsupported(format!("prepared-map: {error}")),
+            )?;
         let rollback_plan = NativeMappingRollbackPlan::for_fresh_layout(&native_layout);
         Self::map_with_layout(
             &prepared.image,
             layout,
             NativeMappingPageSizes {
-                host: plan.page_geometry.host_page_size,
-                linux: plan.page_geometry.linux_page_size,
+                host: geometry.host_page_size,
+                linux: geometry.linux_page_size,
             },
             native_layout,
             NativeMappingOptions {
@@ -679,15 +838,16 @@ impl NativeMappedMemory {
         )
     }
 
-    #[cfg(test)]
-    pub(super) fn map_with_translator(
+    // See `map` -- always-compiled for the runtime's test suites.
+    #[doc(hidden)]
+    pub fn map_with_translator(
         image: &AddressSpace,
         layout: MemoryLayout,
         host_page_size: u64,
         linux_page_size: u64,
         reusable_translator: Option<Arc<dsr::ProcessTranslator>>,
-        exec_map_dsr_tid: Option<crate::thread::ThreadId>,
-    ) -> Result<Self, RuntimeError> {
+        exec_map_dsr_tid: Option<i32>,
+    ) -> Result<Self, NativeMemoryError> {
         let native_layout = NativeLayout::for_image(image, layout, host_page_size)
             .map_err(|error| NativeMemoryError::Unsupported(error.to_string()))?;
         let rollback_plan = NativeMappingRollbackPlan::for_fresh_layout(&native_layout);
@@ -709,13 +869,13 @@ impl NativeMappedMemory {
         )
     }
 
-    pub(super) fn map_with_layout(
+    pub fn map_with_layout(
         image: &AddressSpace,
         layout: MemoryLayout,
         page_sizes: NativeMappingPageSizes,
         native_layout: NativeLayout,
         options: NativeMappingOptions<'_>,
-    ) -> Result<Self, RuntimeError> {
+    ) -> Result<Self, NativeMemoryError> {
         let NativeMappingOptions {
             reusable_translator,
             exec_map_dsr_tid,
@@ -795,13 +955,13 @@ impl NativeMappedMemory {
             if region.start == NATIVE_DARWIN_VDSO_BASE && region.perms.execute {
                 native_exec_map_detail(
                     exec_map_dsr_tid,
-                    crate::probes::DsrCacheLifecyclePhase::ExecMapVvarBegin,
+                    carrick_dsr::probes::DsrCacheLifecyclePhase::ExecMapVvarBegin,
                     region.len(),
                 );
                 relocate_vdso_vvar_loads(region, &native_layout)?;
                 native_exec_map_detail(
                     exec_map_dsr_tid,
-                    crate::probes::DsrCacheLifecyclePhase::ExecMapVvarEnd,
+                    carrick_dsr::probes::DsrCacheLifecyclePhase::ExecMapVvarEnd,
                     0,
                 );
             }
@@ -839,13 +999,13 @@ impl NativeMappedMemory {
             host_protects: true,
             shared_futex: false,
             guest_writable: false,
-            default_prot: crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_EXEC,
+            default_prot: carrick_abi::LINUX_PROT_READ | carrick_abi::LINUX_PROT_EXEC,
             shared_key_base: 0,
             shared_key_offset: 0,
         });
         native_exec_map_detail(
             exec_map_dsr_tid,
-            crate::probes::DsrCacheLifecyclePhase::ExecMapMmapBegin,
+            carrick_dsr::probes::DsrCacheLifecyclePhase::ExecMapMmapBegin,
             layout.heap_size,
         );
         map_anonymous_region(
@@ -857,7 +1017,7 @@ impl NativeMappedMemory {
         )?;
         native_exec_map_detail(
             exec_map_dsr_tid,
-            crate::probes::DsrCacheLifecyclePhase::ExecMapMmapEnd,
+            carrick_dsr::probes::DsrCacheLifecyclePhase::ExecMapMmapEnd,
             0,
         );
         regions.push(NativeMappedRegion {
@@ -866,13 +1026,13 @@ impl NativeMappedMemory {
             host_protects: false,
             shared_futex: false,
             guest_writable: true,
-            default_prot: crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_WRITE,
+            default_prot: carrick_abi::LINUX_PROT_READ | carrick_abi::LINUX_PROT_WRITE,
             shared_key_base: 0,
             shared_key_offset: 0,
         });
         native_exec_map_detail(
             exec_map_dsr_tid,
-            crate::probes::DsrCacheLifecyclePhase::ExecMapMmapBegin,
+            carrick_dsr::probes::DsrCacheLifecyclePhase::ExecMapMmapBegin,
             layout.mmap_size,
         );
         map_anonymous_region(
@@ -884,7 +1044,7 @@ impl NativeMappedMemory {
         )?;
         native_exec_map_detail(
             exec_map_dsr_tid,
-            crate::probes::DsrCacheLifecyclePhase::ExecMapMmapEnd,
+            carrick_dsr::probes::DsrCacheLifecyclePhase::ExecMapMmapEnd,
             0,
         );
         regions.push(NativeMappedRegion {
@@ -894,7 +1054,7 @@ impl NativeMappedMemory {
             shared_futex: false,
             guest_writable: true,
             default_prot: if page_sizes.linux == page_sizes.host {
-                crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_WRITE
+                carrick_abi::LINUX_PROT_READ | carrick_abi::LINUX_PROT_WRITE
             } else {
                 0
             },
@@ -903,63 +1063,63 @@ impl NativeMappedMemory {
         });
         native_exec_map_detail(
             exec_map_dsr_tid,
-            crate::probes::DsrCacheLifecyclePhase::ExecMapMmapBegin,
-            crate::memory::LINUX_SHARED_FILE_SIZE,
+            carrick_dsr::probes::DsrCacheLifecyclePhase::ExecMapMmapBegin,
+            carrick_mem::memory::LINUX_SHARED_FILE_SIZE,
         );
         map_anonymous_region(
-            crate::memory::LINUX_SHARED_FILE_BASE,
-            crate::memory::LINUX_SHARED_FILE_SIZE,
+            carrick_mem::memory::LINUX_SHARED_FILE_BASE,
+            carrick_mem::memory::LINUX_SHARED_FILE_SIZE,
             true,
             &native_layout,
             &mut rollback,
         )?;
         native_exec_map_detail(
             exec_map_dsr_tid,
-            crate::probes::DsrCacheLifecyclePhase::ExecMapMmapEnd,
+            carrick_dsr::probes::DsrCacheLifecyclePhase::ExecMapMmapEnd,
             0,
         );
         regions.push(NativeMappedRegion {
-            start: crate::memory::LINUX_SHARED_FILE_BASE,
+            start: carrick_mem::memory::LINUX_SHARED_FILE_BASE,
             end: checked_add_u64(
-                crate::memory::LINUX_SHARED_FILE_BASE,
-                crate::memory::LINUX_SHARED_FILE_SIZE,
+                carrick_mem::memory::LINUX_SHARED_FILE_BASE,
+                carrick_mem::memory::LINUX_SHARED_FILE_SIZE,
                 "native shared aperture end",
             )?,
             host_protects: true,
             shared_futex: true,
             guest_writable: true,
-            default_prot: crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_WRITE,
+            default_prot: carrick_abi::LINUX_PROT_READ | carrick_abi::LINUX_PROT_WRITE,
             shared_key_base: 0,
             shared_key_offset: 0,
         });
         native_exec_map_detail(
             exec_map_dsr_tid,
-            crate::probes::DsrCacheLifecyclePhase::ExecMapMmapBegin,
-            crate::memory::LINUX_PRIVATE_OVERLAY_SIZE,
+            carrick_dsr::probes::DsrCacheLifecyclePhase::ExecMapMmapBegin,
+            carrick_mem::memory::LINUX_PRIVATE_OVERLAY_SIZE,
         );
         map_anonymous_region(
-            crate::memory::LINUX_PRIVATE_OVERLAY_BASE,
-            crate::memory::LINUX_PRIVATE_OVERLAY_SIZE,
+            carrick_mem::memory::LINUX_PRIVATE_OVERLAY_BASE,
+            carrick_mem::memory::LINUX_PRIVATE_OVERLAY_SIZE,
             false,
             &native_layout,
             &mut rollback,
         )?;
         native_exec_map_detail(
             exec_map_dsr_tid,
-            crate::probes::DsrCacheLifecyclePhase::ExecMapMmapEnd,
+            carrick_dsr::probes::DsrCacheLifecyclePhase::ExecMapMmapEnd,
             0,
         );
         regions.push(NativeMappedRegion {
-            start: crate::memory::LINUX_PRIVATE_OVERLAY_BASE,
+            start: carrick_mem::memory::LINUX_PRIVATE_OVERLAY_BASE,
             end: checked_add_u64(
-                crate::memory::LINUX_PRIVATE_OVERLAY_BASE,
-                crate::memory::LINUX_PRIVATE_OVERLAY_SIZE,
+                carrick_mem::memory::LINUX_PRIVATE_OVERLAY_BASE,
+                carrick_mem::memory::LINUX_PRIVATE_OVERLAY_SIZE,
                 "native private overlay aperture end",
             )?,
             host_protects: false,
             shared_futex: false,
             guest_writable: true,
-            default_prot: crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_WRITE,
+            default_prot: carrick_abi::LINUX_PROT_READ | carrick_abi::LINUX_PROT_WRITE,
             shared_key_base: 0,
             shared_key_offset: 0,
         });
@@ -976,7 +1136,7 @@ impl NativeMappedMemory {
         }
         let address_mode = native_layout.address_mode();
         let owned_host_ranges = Arc::new(native_layout.owned_ranges().to_vec());
-        let setup: Result<Self, RuntimeError> = (|| {
+        let setup: Result<Self, NativeMemoryError> = (|| {
             let mut memory = Self {
                 address_mode,
                 owned_host_ranges,
@@ -1005,8 +1165,8 @@ impl NativeMappedMemory {
             // here (`replace_image`), so both get a freshly stamped vvar.
             native_exec_map_detail(
                 exec_map_dsr_tid,
-                crate::probes::DsrCacheLifecyclePhase::ExecMapVvarBegin,
-                crate::vdso::LINUX_VVAR_SIZE,
+                carrick_dsr::probes::DsrCacheLifecyclePhase::ExecMapVvarBegin,
+                carrick_mem::vdso::LINUX_VVAR_SIZE,
             );
             #[cfg(any(test, feature = "test-hooks"))]
             if backing.is_prepared()
@@ -1020,7 +1180,7 @@ impl NativeMappedMemory {
             memory.stamp_vdso_vvar()?;
             native_exec_map_detail(
                 exec_map_dsr_tid,
-                crate::probes::DsrCacheLifecyclePhase::ExecMapVvarEnd,
+                carrick_dsr::probes::DsrCacheLifecyclePhase::ExecMapVvarEnd,
                 0,
             );
             #[cfg(any(test, feature = "test-hooks"))]
@@ -1056,7 +1216,7 @@ impl NativeMappedMemory {
     /// freshly mapped image — the native counterpart of the HVF vvar stamper
     /// (`populate_vdso_data_page` in carrick-vmm-hvf/src/trap.rs). It uses the
     /// same calibration sources and publishes the SAME realtime offset via
-    /// [`crate::vdso::set_realtime_off_ns`], so the userspace vDSO fast paths
+    /// [`carrick_mem::vdso::set_realtime_off_ns`], so the userspace vDSO fast paths
     /// and the trapping syscall clock paths cannot drift apart
     /// (clock_gettime04 coherence). No-op when the image carries no vDSO
     /// (CARRICK_DISABLE_VDSO).
@@ -1068,7 +1228,7 @@ impl NativeMappedMemory {
     /// Unknown modes use the correctness-first scaled fallback. The resulting
     /// guest-visible timeline is gated empirically by
     /// `native_virtual_counter_reads_track_clock_uptime_raw`.
-    pub(super) fn stamp_vdso_vvar(&self) -> Result<(), RuntimeError> {
+    pub fn stamp_vdso_vvar(&self) -> Result<(), NativeMemoryError> {
         if !self.vvar_region_is_mapped() {
             return Ok(());
         }
@@ -1081,7 +1241,7 @@ impl NativeMappedMemory {
         // re-stamped in a forked child, so the userspace getrandom blob
         // reseeds instead of reusing a COW-inherited keystream.
         let pid = unsafe { libc::getpid() } as u64;
-        let mut words = vec![(crate::vdso::VVAR_OFF_RNG_GENERATION, pid)];
+        let mut words = vec![(carrick_mem::vdso::VVAR_OFF_RNG_GENERATION, pid)];
         let (freq, mono_ns) = native_vvar_clock_sources();
         if freq != 0 {
             let unix_ns = std::time::SystemTime::now()
@@ -1089,9 +1249,9 @@ impl NativeMappedMemory {
                 .map(|d| d.as_nanos() as u64)
                 .unwrap_or(0);
             let realtime_off = unix_ns.wrapping_sub(mono_ns);
-            crate::vdso::set_realtime_off_ns(realtime_off);
-            words.push((crate::vdso::VVAR_OFF_FREQ, freq));
-            words.push((crate::vdso::VVAR_OFF_REALTIME_OFF_NS, realtime_off));
+            carrick_mem::vdso::set_realtime_off_ns(realtime_off);
+            words.push((carrick_mem::vdso::VVAR_OFF_FREQ, freq));
+            words.push((carrick_mem::vdso::VVAR_OFF_REALTIME_OFF_NS, realtime_off));
         }
         self.write_vvar_words(&words)
     }
@@ -1101,18 +1261,18 @@ impl NativeMappedMemory {
     /// The child's distinct generation forces the userspace getrandom blob to
     /// reseed instead of replaying the parent's keystream (gated by the
     /// getrandomvdsofork probe). No-op when the vDSO is disabled.
-    pub(super) fn restamp_vdso_rng_generation_after_fork(&self) -> Result<(), RuntimeError> {
+    pub fn restamp_vdso_rng_generation_after_fork(&self) -> Result<(), NativeMemoryError> {
         if !self.vvar_region_is_mapped() {
             return Ok(());
         }
         let pid = unsafe { libc::getpid() } as u64;
-        self.write_vvar_words(&[(crate::vdso::VVAR_OFF_RNG_GENERATION, pid)])
+        self.write_vvar_words(&[(carrick_mem::vdso::VVAR_OFF_RNG_GENERATION, pid)])
     }
 
-    pub(super) fn vvar_region_is_mapped(&self) -> bool {
+    pub fn vvar_region_is_mapped(&self) -> bool {
         self.region_contains(
             NATIVE_DARWIN_VVAR_BASE,
-            crate::vdso::LINUX_VVAR_SIZE as usize,
+            carrick_mem::vdso::LINUX_VVAR_SIZE as usize,
         )
     }
 
@@ -1121,8 +1281,8 @@ impl NativeMappedMemory {
     /// the duration of the write. Every caller runs before guest code can
     /// observe the page (boot mapping, execve replacement, a fresh
     /// single-threaded fork child), so the transient writability is invisible.
-    pub(super) fn write_vvar_words(&self, words: &[(usize, u64)]) -> Result<(), RuntimeError> {
-        let vvar_end = NATIVE_DARWIN_VVAR_BASE + crate::vdso::LINUX_VVAR_SIZE;
+    pub fn write_vvar_words(&self, words: &[(usize, u64)]) -> Result<(), NativeMemoryError> {
+        let vvar_end = NATIVE_DARWIN_VVAR_BASE + carrick_mem::vdso::LINUX_VVAR_SIZE;
         let (page_start, page_len) = self
             .host_page_range(NATIVE_DARWIN_VVAR_BASE, vvar_end)
             .map_err(|_| {
@@ -1137,7 +1297,7 @@ impl NativeMappedMemory {
         }
         for &(offset, value) in words {
             debug_assert!(
-                offset + std::mem::size_of::<u64>() <= crate::vdso::LINUX_VVAR_SIZE as usize
+                offset + std::mem::size_of::<u64>() <= carrick_mem::vdso::LINUX_VVAR_SIZE as usize
             );
             let address = NATIVE_DARWIN_VVAR_BASE + offset as u64;
             let bytes = value.to_le_bytes();
@@ -1159,7 +1319,7 @@ impl NativeMappedMemory {
         Ok(())
     }
 
-    pub(super) fn set_fork_inheritance(&self, share: bool) {
+    pub fn set_fork_inheritance(&self, share: bool) {
         let trace = std::env::var_os("CARRICK_NATIVE_TRACE_SYSCALLS").is_some();
         for region in &self.regions {
             if region.shared_futex || !region.guest_writable {
@@ -1189,15 +1349,15 @@ impl NativeMappedMemory {
         }
     }
 
-    pub(super) fn prepare_exec_mapping(
+    pub fn prepare_exec_mapping(
         &self,
         image: &AddressSpace,
-        plan: &ExecutionPlan,
-    ) -> Result<PreparedNativeExecMapping, RuntimeError> {
+        geometry: PageGeometry,
+    ) -> Result<PreparedNativeExecMapping, NativeMemoryError> {
         let native_layout = NativeLayout::for_exec(
             image,
             native_memory_layout(),
-            plan.page_geometry.host_page_size,
+            geometry.host_page_size,
             &self.owned_host_ranges,
         )
         .map_err(|error| NativeMemoryError::Unsupported(error.to_string()))?;
@@ -1239,10 +1399,13 @@ impl NativeMappedMemory {
                         range.end.raw()
                     ))
                 })? as u64;
-            match crate::host_proc::reserve_self_direct_vm_range(range.start.raw() as u64, length)
-                .map_err(|error| NativeMemoryError::Unsupported(error.to_string()))?
+            match carrick_host::host_proc::reserve_self_direct_vm_range(
+                range.start.raw() as u64,
+                length,
+            )
+            .map_err(|error| NativeMemoryError::Unsupported(error.to_string()))?
             {
-                crate::host_proc::DirectVmReservationOutcome::Reserved(reservation) => {
+                carrick_host::host_proc::DirectVmReservationOutcome::Reserved(reservation) => {
                     for (start, length) in reservation.owned_spans() {
                         let end = start.checked_add(length).ok_or_else(|| {
                             NativeMemoryError::Unsupported(format!(
@@ -1264,7 +1427,7 @@ impl NativeMappedMemory {
                     }
                     direct_target_reservations.push(reservation);
                 }
-                crate::host_proc::DirectVmReservationOutcome::DelegatedDyldPmapEmpty => {}
+                carrick_host::host_proc::DirectVmReservationOutcome::DelegatedDyldPmapEmpty => {}
             }
         }
         let rollback_plan = match native_layout.address_mode() {
@@ -1285,20 +1448,20 @@ impl NativeMappedMemory {
         })
     }
 
-    pub(super) fn replace_image(
+    pub fn replace_image(
         &mut self,
         image: &AddressSpace,
         relative_relocations: &[NativeRelativeRelocation],
-        plan: &ExecutionPlan,
-        dsr_tid: Option<crate::thread::ThreadId>,
+        geometry: PageGeometry,
+        dsr_tid: Option<i32>,
         mut prepared: PreparedNativeExecMapping,
-    ) -> Result<(), RuntimeError> {
+    ) -> Result<(), NativeMemoryError> {
         let lifecycle = |phase| {
             if let Some(tid) = dsr_tid {
-                crate::probes::dsr_cache_lifecycle(tid.raw(), phase, 0, 0, 0);
+                carrick_dsr::probes::dsr_cache_lifecycle(tid, phase, 0, 0, 0);
             }
         };
-        lifecycle(crate::probes::DsrCacheLifecyclePhase::ExecImageUnmapBegin);
+        lifecycle(carrick_dsr::probes::DsrCacheLifecyclePhase::ExecImageUnmapBegin);
         if self.owned_host_ranges.is_empty() {
             return Err(NativeMemoryError::Unsupported(
                 "native Darwin execve cannot retire an address space without owned host ranges"
@@ -1330,9 +1493,9 @@ impl NativeMappedMemory {
                 .into());
             }
         }
-        lifecycle(crate::probes::DsrCacheLifecyclePhase::ExecImageUnmapEnd);
-        lifecycle(crate::probes::DsrCacheLifecyclePhase::ExecImageMapBegin);
-        lifecycle(crate::probes::DsrCacheLifecyclePhase::ExecRelocationBegin);
+        lifecycle(carrick_dsr::probes::DsrCacheLifecyclePhase::ExecImageUnmapEnd);
+        lifecycle(carrick_dsr::probes::DsrCacheLifecyclePhase::ExecImageMapBegin);
+        lifecycle(carrick_dsr::probes::DsrCacheLifecyclePhase::ExecRelocationBegin);
         let PreparedNativeExecMapping {
             native_layout,
             process_translator,
@@ -1349,8 +1512,8 @@ impl NativeMappedMemory {
             image,
             native_memory_layout(),
             NativeMappingPageSizes {
-                host: plan.page_geometry.host_page_size,
-                linux: plan.page_geometry.linux_page_size,
+                host: geometry.host_page_size,
+                linux: geometry.linux_page_size,
             },
             native_layout,
             NativeMappingOptions {
@@ -1361,9 +1524,9 @@ impl NativeMappedMemory {
                 rollback_plan,
             },
         )?;
-        lifecycle(crate::probes::DsrCacheLifecyclePhase::ExecRelocationEnd);
-        lifecycle(crate::probes::DsrCacheLifecyclePhase::ExecImageMapEnd);
-        lifecycle(crate::probes::DsrCacheLifecyclePhase::ExecCacheResetBegin);
+        lifecycle(carrick_dsr::probes::DsrCacheLifecyclePhase::ExecRelocationEnd);
+        lifecycle(carrick_dsr::probes::DsrCacheLifecyclePhase::ExecImageMapEnd);
+        lifecycle(carrick_dsr::probes::DsrCacheLifecyclePhase::ExecCacheResetBegin);
         if let Some(translator) = inherited_translator {
             // A fork child cannot allocate a fresh JIT cache safely, so exec
             // reuses its inherited mapping. Keep the old cache intact until
@@ -1375,12 +1538,12 @@ impl NativeMappedMemory {
         for reservation in direct_target_reservations {
             reservation.commit();
         }
-        lifecycle(crate::probes::DsrCacheLifecyclePhase::ExecCacheResetEnd);
+        lifecycle(carrick_dsr::probes::DsrCacheLifecyclePhase::ExecCacheResetEnd);
         *self = replacement;
         Ok(())
     }
 
-    pub(super) fn region_contains(&self, address: u64, length: usize) -> bool {
+    pub fn region_contains(&self, address: u64, length: usize) -> bool {
         let Ok(length) = u64::try_from(length) else {
             return false;
         };
@@ -1392,7 +1555,7 @@ impl NativeMappedMemory {
             .any(|region| address >= region.start && end <= region.end)
     }
 
-    pub(super) fn host_protected_overlaps(
+    pub fn host_protected_overlaps(
         &self,
         address: u64,
         length: usize,
@@ -1407,11 +1570,7 @@ impl NativeMappedMemory {
             .map(move |region| (address.max(region.start), end.min(region.end)))
     }
 
-    pub(super) fn host_page_range(
-        &self,
-        start: u64,
-        end: u64,
-    ) -> Result<(u64, usize), MemoryError> {
+    pub fn host_page_range(&self, start: u64, end: u64) -> Result<(u64, usize), MemoryError> {
         let page_size = self.host_page_size;
         let page_start = start & !(page_size - 1);
         let page_end = end
@@ -1430,11 +1589,11 @@ impl NativeMappedMemory {
         Ok((page_start, len))
     }
 
-    pub(super) fn uses_linux4k_subpages(&self) -> bool {
+    pub fn uses_linux4k_subpages(&self) -> bool {
         self.host_page_size == 16 * 1024 && self.linux_page_size == 4 * 1024
     }
 
-    pub(super) fn native16k_write_exec_page(&self, address: u64) -> Option<u64> {
+    pub fn native16k_write_exec_page(&self, address: u64) -> Option<u64> {
         if self.uses_linux4k_subpages()
             || !self.regions.iter().any(|region| {
                 region.host_protects && address >= region.start && address < region.end
@@ -1448,15 +1607,15 @@ impl NativeMappedMemory {
             .get(&page_start)
             .copied()
             .unwrap_or_else(|| self.default_linux_prot_at(address));
-        let write_exec = crate::linux_abi::LINUX_PROT_WRITE | crate::linux_abi::LINUX_PROT_EXEC;
+        let write_exec = carrick_abi::LINUX_PROT_WRITE | carrick_abi::LINUX_PROT_EXEC;
         (prot & write_exec == write_exec).then_some(page_start)
     }
 
-    pub(super) fn has_native16k_write_exec_pages(&self) -> bool {
+    pub fn has_native16k_write_exec_pages(&self) -> bool {
         if self.host_page_size != 16 * 1024 || self.linux_page_size != self.host_page_size {
             return false;
         }
-        let write_exec = crate::linux_abi::LINUX_PROT_WRITE | crate::linux_abi::LINUX_PROT_EXEC;
+        let write_exec = carrick_abi::LINUX_PROT_WRITE | carrick_abi::LINUX_PROT_EXEC;
         self.native_page_protections
             .values()
             .copied()
@@ -1464,21 +1623,21 @@ impl NativeMappedMemory {
             .any(|prot| prot & write_exec == write_exec)
     }
 
-    pub(super) fn write_exec_blocks_multithreaded_lifecycle(&self) -> bool {
+    pub fn write_exec_blocks_multithreaded_lifecycle(&self) -> bool {
         false
     }
 
-    pub(super) fn native16k_clone_thread_rejection(&self) -> Option<&'static str> {
+    pub fn native16k_clone_thread_rejection(&self) -> Option<&'static str> {
         None
     }
 
-    pub(super) fn native16k_vfork_rejection(&self) -> Option<&'static str> {
+    pub fn native16k_vfork_rejection(&self) -> Option<&'static str> {
         self.has_native16k_write_exec_pages().then_some(
             "native16k cannot vfork while write-exec pages are present because vfork shares writable mappings",
         )
     }
 
-    pub(super) fn make_native16k_write_exec_page_writable(
+    pub fn make_native16k_write_exec_page_writable(
         &mut self,
         page_start: u64,
         operation_address: u64,
@@ -1498,7 +1657,7 @@ impl NativeMappedMemory {
         Ok(())
     }
 
-    pub(super) fn make_native16k_write_exec_page_executable(
+    pub fn make_native16k_write_exec_page_executable(
         &mut self,
         page_start: u64,
         operation_address: u64,
@@ -1515,7 +1674,7 @@ impl NativeMappedMemory {
         let ptr = self
             .host_address(carrick_guest_mem::GuestVa(page_start))?
             .raw() as *mut u8;
-        unsafe { carrick_native_clear_icache(ptr.cast(), page_len) };
+        native_clear_icache(ptr.cast(), page_len);
         let prot = self
             .native_page_protections
             .get(&page_start)
@@ -1531,7 +1690,7 @@ impl NativeMappedMemory {
         Ok(())
     }
 
-    pub(super) fn prepare_native16k_write_exec_host_write(
+    pub fn prepare_native16k_write_exec_host_write(
         &mut self,
         address: u64,
         len: usize,
@@ -1555,12 +1714,12 @@ impl NativeMappedMemory {
         Ok(())
     }
 
-    pub(super) fn resolve_native16k_write_exec_fault(
+    pub fn resolve_native16k_write_exec_fault(
         &mut self,
         fault_address: u64,
         pc: u64,
         esr: u64,
-    ) -> Result<bool, RuntimeError> {
+    ) -> Result<bool, NativeMemoryError> {
         let Some(page_start) = self.native16k_write_exec_page(fault_address) else {
             return Ok(false);
         };
@@ -1608,7 +1767,7 @@ impl NativeMappedMemory {
         Ok(true)
     }
 
-    pub(super) fn default_linux_prot_at(&self, address: u64) -> u64 {
+    pub fn default_linux_prot_at(&self, address: u64) -> u64 {
         self.regions
             .iter()
             .rev()
@@ -1616,7 +1775,7 @@ impl NativeMappedMemory {
             .map_or(0, |region| region.default_prot)
     }
 
-    pub(super) fn guest_address_is_executable(&self, address: u64) -> bool {
+    pub fn guest_address_is_executable(&self, address: u64) -> bool {
         let prot = if self.uses_linux4k_subpages() {
             let host_page = address & !(self.host_page_size - 1);
             let subpage = ((address - host_page) / self.linux_page_size) as usize;
@@ -1631,10 +1790,10 @@ impl NativeMappedMemory {
                 .copied()
                 .unwrap_or_else(|| self.default_linux_prot_at(address))
         };
-        prot & crate::linux_abi::LINUX_PROT_EXEC != 0
+        prot & carrick_abi::LINUX_PROT_EXEC != 0
     }
 
-    pub(super) fn native_range_allows(&self, address: u64, len: usize, write: bool) -> bool {
+    pub fn native_range_allows(&self, address: u64, len: usize, write: bool) -> bool {
         if len == 0 {
             return false;
         }
@@ -1645,9 +1804,9 @@ impl NativeMappedMemory {
             return false;
         };
         let required = if write {
-            crate::linux_abi::LINUX_PROT_WRITE
+            carrick_abi::LINUX_PROT_WRITE
         } else {
-            crate::linux_abi::LINUX_PROT_READ
+            carrick_abi::LINUX_PROT_READ
         };
         let mut cursor = address;
         while cursor < end {
@@ -1665,7 +1824,7 @@ impl NativeMappedMemory {
         true
     }
 
-    pub(super) fn linux4k_host_page_protections(&self, page_start: u64) -> [u64; 4] {
+    pub fn linux4k_host_page_protections(&self, page_start: u64) -> [u64; 4] {
         self.linux4k_page_protections
             .get(&page_start)
             .copied()
@@ -1678,28 +1837,28 @@ impl NativeMappedMemory {
             })
     }
 
-    pub(super) fn classify_linux4k_host_page(&self, protections: [u64; 4]) -> HostPageState {
+    pub fn classify_linux4k_host_page(&self, protections: [u64; 4]) -> HostPageState {
         let subpages = protections.map(|prot| {
             SubpageState::new(
                 PageBacking::Anonymous,
                 PagePerms {
-                    read: prot & crate::linux_abi::LINUX_PROT_READ != 0,
-                    write: prot & crate::linux_abi::LINUX_PROT_WRITE != 0,
-                    exec: prot & crate::linux_abi::LINUX_PROT_EXEC != 0,
+                    read: prot & carrick_abi::LINUX_PROT_READ != 0,
+                    write: prot & carrick_abi::LINUX_PROT_WRITE != 0,
+                    exec: prot & carrick_abi::LINUX_PROT_EXEC != 0,
                 },
             )
         });
         classify_host_page_state(
-            crate::page_profile::PageGeometry {
+            carrick_dsr::page_geometry::PageGeometry {
                 host_page_size: self.host_page_size,
                 linux_page_size: self.linux_page_size,
-                native_profile: Some(carrick_spec::NativePageProfile::Linux4kOn16k),
+                native_profile: Some(carrick_guest_mem::NativePageProfile::Linux4kOn16k),
             },
             subpages,
         )
     }
 
-    pub(super) fn linux4k_range_allows(&self, address: u64, len: usize, write: bool) -> bool {
+    pub fn linux4k_range_allows(&self, address: u64, len: usize, write: bool) -> bool {
         if !self.uses_linux4k_subpages() || len == 0 {
             return false;
         }
@@ -1707,9 +1866,9 @@ impl NativeMappedMemory {
             return false;
         };
         let required = if write {
-            crate::linux_abi::LINUX_PROT_WRITE
+            carrick_abi::LINUX_PROT_WRITE
         } else {
-            crate::linux_abi::LINUX_PROT_READ
+            carrick_abi::LINUX_PROT_READ
         };
         let mut cursor = address;
         while cursor < end {
@@ -1735,7 +1894,7 @@ impl NativeMappedMemory {
     /// thread), so bumping the shared sequence a reservation was captured
     /// against is sufficient to invalidate it on the next CAS -- there is no
     /// struct-embedded reservation left to null out here.
-    pub(super) fn bump_exclusive_sequences_in_range(&self, address: u64, len: usize) {
+    pub fn bump_exclusive_sequences_in_range(&self, address: u64, len: usize) {
         let mut sequences = self.exclusive_sequences.lock();
         let end = address.checked_add(len as u64);
         if let Some(end) = end {
@@ -1770,7 +1929,7 @@ impl NativeMappedMemory {
         }
     }
 
-    pub(super) fn invalidate_exclusive_range(&self, address: u64, len: usize) {
+    pub fn invalidate_exclusive_range(&self, address: u64, len: usize) {
         self.bump_exclusive_sequences_in_range(address, len);
     }
 
@@ -1778,7 +1937,7 @@ impl NativeMappedMemory {
     /// no exclusive-monitor/DSR/exec-page bookkeeping -- the shared tail of
     /// every `write_bytes_raw` path (the common `&self` case AND the `&mut
     /// self` exec-page escalation both finish here).
-    pub(super) fn copy_bytes_to_host(&self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+    pub fn copy_bytes_to_host(&self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
         let length = bytes.len();
         let ptr = self
             .host_address(carrick_guest_mem::GuestVa(address))?
@@ -1808,7 +1967,7 @@ impl NativeMappedMemory {
     /// Returns whether the range may execute (i.e. whether the caller must
     /// also escalate to [`Self::write_exec_page_bytes`] for the exec-page
     /// metadata update).
-    pub(super) fn invalidate_and_note_dsr_write(
+    pub fn invalidate_and_note_dsr_write(
         &self,
         address: u64,
         length: usize,
@@ -1846,11 +2005,7 @@ impl NativeMappedMemory {
     /// expanding an owned receiver's candidate list), permanently dropping
     /// the exec-page escalation for them with no compiler warning -- verified
     /// empirically with a standalone repro before choosing this name.
-    pub(super) fn write_bytes_raw_shared(
-        &self,
-        address: u64,
-        bytes: &[u8],
-    ) -> Result<(), MemoryError> {
+    pub fn write_bytes_raw_shared(&self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
         let length = bytes.len();
         if !self.region_contains(address, length) {
             return Err(MemoryError::OutOfBounds { address, length });
@@ -1881,7 +2036,7 @@ impl NativeMappedMemory {
     /// page write needs `write_exec_page_bytes`'s W^X-metadata update, which
     /// a raw kernel write can't perform, so exec targets MUST fall back to
     /// the copy path). See `GuestMemory::host_ptr_for_write`.
-    pub(super) fn host_ptr_for_write_shared(&self, address: u64, len: usize) -> Option<*mut u8> {
+    pub fn host_ptr_for_write_shared(&self, address: u64, len: usize) -> Option<*mut u8> {
         if len == 0 {
             return None;
         }
@@ -1918,11 +2073,7 @@ impl NativeMappedMemory {
     /// (write-exec requires the EXEC bit, so every page it would mutate is
     /// also a page `range_may_execute` reports), so gating on it changes
     /// nothing observable.
-    pub(super) fn write_exec_page_bytes(
-        &mut self,
-        address: u64,
-        bytes: &[u8],
-    ) -> Result<(), MemoryError> {
+    pub fn write_exec_page_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
         let length = bytes.len();
         if !self.region_contains(address, length) {
             return Err(MemoryError::OutOfBounds { address, length });
@@ -1932,7 +2083,7 @@ impl NativeMappedMemory {
         self.copy_bytes_to_host(address, bytes)
     }
 
-    pub(super) fn atomic_load(&self, address: u64, width: usize) -> Result<u64, MemoryError> {
+    pub fn atomic_load(&self, address: u64, width: usize) -> Result<u64, MemoryError> {
         if !matches!(width, 1 | 2 | 4 | 8)
             || !address.is_multiple_of(width as u64)
             || !self.region_contains(address, width)
@@ -1968,7 +2119,7 @@ impl NativeMappedMemory {
         Ok(observed)
     }
 
-    pub(super) fn atomic_store(
+    pub fn atomic_store(
         &mut self,
         address: u64,
         width: usize,
@@ -2003,7 +2154,7 @@ impl NativeMappedMemory {
         self.restore_temporary_host_access(&changed, address, width)
     }
 
-    pub(super) fn atomic_fetch_add(
+    pub fn atomic_fetch_add(
         &mut self,
         address: u64,
         width: usize,
@@ -2049,7 +2200,7 @@ impl NativeMappedMemory {
     /// `entry().or_insert()` semantics `exclusive_load_for` always used; only
     /// the locking moved, from the caller's `&mut self` borrow to this
     /// accessor's own `&self` lock on `exclusive_sequences`.
-    pub(super) fn exclusive_sequence_or_insert(
+    pub fn exclusive_sequence_or_insert(
         &self,
         location: NativeExclusiveLocation,
     ) -> NativeExclusiveSequence {
@@ -2068,7 +2219,7 @@ impl NativeMappedMemory {
     /// `NativeThreadRuntime.exclusive_reservation`) through to the `_for`
     /// implementation. `NativeMappedMemory` itself no longer owns any
     /// reservation state.
-    pub(super) fn exclusive_load(
+    pub fn exclusive_load(
         &self,
         address: u64,
         width: usize,
@@ -2085,7 +2236,7 @@ impl NativeMappedMemory {
     /// lock) -- is already `&self`-safe. The atomic load itself goes through
     /// a raw host pointer, not a `self` mutation. Kept `&mut self` until
     /// Task 5 only because nothing had narrowed the receiver yet.
-    pub(super) fn exclusive_load_for(
+    pub fn exclusive_load_for(
         &self,
         address: u64,
         width: usize,
@@ -2142,7 +2293,7 @@ impl NativeMappedMemory {
     /// See `exclusive_load`: the linux4k guarded counterpart of
     /// `exclusive_store_for`, threading the caller-owned reservation through
     /// instead of consulting struct-embedded state.
-    pub(super) fn exclusive_store(
+    pub fn exclusive_store(
         &self,
         address: u64,
         width: usize,
@@ -2159,7 +2310,7 @@ impl NativeMappedMemory {
     /// semantics `exclusive_store_for` always used; only the locking moved,
     /// from the caller's `&mut self` borrow to this accessor's own `&self`
     /// lock on `exclusive_sequences`.
-    pub(super) fn exclusive_sequence_or_default(
+    pub fn exclusive_sequence_or_default(
         &self,
         location: NativeExclusiveLocation,
     ) -> NativeExclusiveSequence {
@@ -2173,7 +2324,7 @@ impl NativeMappedMemory {
     /// Advances the tracked sequence for `location` past `observed_sequence`
     /// (the value most recently compared against). Called after a
     /// successful exclusive-store CAS.
-    pub(super) fn bump_exclusive_sequence(
+    pub fn bump_exclusive_sequence(
         &self,
         location: NativeExclusiveLocation,
         observed_sequence: NativeExclusiveSequence,
@@ -2186,7 +2337,7 @@ impl NativeMappedMemory {
     /// `&self`: same reasoning as `exclusive_load_for` -- the CAS goes
     /// through a raw host pointer and `bump_exclusive_sequence` is already
     /// `&self` (interior-mutable `exclusive_sequences` lock).
-    pub(super) fn exclusive_store_for(
+    pub fn exclusive_store_for(
         &self,
         address: u64,
         width: usize,
@@ -2267,7 +2418,7 @@ impl NativeMappedMemory {
         Ok(stored)
     }
 
-    pub(super) fn linux4k_address_is_guarded(&self, address: u64) -> bool {
+    pub fn linux4k_address_is_guarded(&self, address: u64) -> bool {
         if !self.uses_linux4k_subpages() {
             return false;
         }
@@ -2280,7 +2431,7 @@ impl NativeMappedMemory {
         )
     }
 
-    pub(super) fn native_host_prot_for_page(&self, page_start: u64) -> libc::c_int {
+    pub fn native_host_prot_for_page(&self, page_start: u64) -> libc::c_int {
         if !self.uses_linux4k_subpages() {
             let prot = self
                 .native_page_protections
@@ -2300,7 +2451,7 @@ impl NativeMappedMemory {
         }
     }
 
-    pub(super) fn mprotect_host_page(
+    pub fn mprotect_host_page(
         &self,
         page_start: u64,
         host_prot: libc::c_int,
@@ -2324,7 +2475,7 @@ impl NativeMappedMemory {
         Ok(())
     }
 
-    pub(super) fn prepare_temporary_host_access(
+    pub fn prepare_temporary_host_access(
         &self,
         address: u64,
         len: usize,
@@ -2333,7 +2484,7 @@ impl NativeMappedMemory {
         self.prepare_temporary_host_access_with(address, len, write, native_host_mprotect)
     }
 
-    pub(super) fn prepare_temporary_host_access_with<F>(
+    pub fn prepare_temporary_host_access_with<F>(
         &self,
         address: u64,
         len: usize,
@@ -2512,7 +2663,7 @@ impl NativeMappedMemory {
     /// regardless -- `mprotect` is an absolute, idempotent set, so a later
     /// accessor's own lift attempt still lands the page in the right state
     /// even if this best-effort restore didn't land.
-    pub(super) fn rollback_prepared_lifts<F>(
+    pub fn rollback_prepared_lifts<F>(
         &self,
         table: &mut std::collections::HashMap<u64, HostLift>,
         changed: &[(u64, libc::c_int)],
@@ -2571,7 +2722,7 @@ impl NativeMappedMemory {
         }
     }
 
-    pub(super) fn restore_temporary_host_access(
+    pub fn restore_temporary_host_access(
         &self,
         changed: &[(u64, libc::c_int)],
         address: u64,
@@ -2580,7 +2731,7 @@ impl NativeMappedMemory {
         self.restore_temporary_host_access_with(changed, address, len, native_host_mprotect)
     }
 
-    pub(super) fn restore_temporary_host_access_with<F>(
+    pub fn restore_temporary_host_access_with<F>(
         &self,
         changed: &[(u64, libc::c_int)],
         address: u64,
@@ -2658,7 +2809,7 @@ impl NativeMappedMemory {
         Ok(())
     }
 
-    pub(super) fn protect_linux4k_range(
+    pub fn protect_linux4k_range(
         &mut self,
         address: u64,
         len: usize,
@@ -2667,7 +2818,7 @@ impl NativeMappedMemory {
         self.protect_linux4k_range_with(address, len, prot, native_host_mprotect)
     }
 
-    pub(super) fn protect_linux4k_range_with<F>(
+    pub fn protect_linux4k_range_with<F>(
         &mut self,
         address: u64,
         len: usize,
@@ -2740,7 +2891,7 @@ impl NativeMappedMemory {
             };
             let needs_icache = protections
                 .iter()
-                .any(|value| value & crate::linux_abi::LINUX_PROT_EXEC != 0);
+                .any(|value| value & carrick_abi::LINUX_PROT_EXEC != 0);
             if needs_icache {
                 host_prot = (host_prot & !libc::PROT_EXEC) | libc::PROT_READ;
             }
@@ -2772,7 +2923,7 @@ impl NativeMappedMemory {
             for page in &resolved[index..end] {
                 if page.needs_icache {
                     let ptr = page.host_page.raw() as *mut u8;
-                    unsafe { carrick_native_clear_icache(ptr.cast(), host_page_len) };
+                    native_clear_icache(ptr.cast(), host_page_len);
                 }
             }
             set_host_prot(
@@ -2789,7 +2940,7 @@ impl NativeMappedMemory {
         Ok(())
     }
 
-    pub(super) fn read_u32(&self, address: u64) -> Result<u32, RuntimeError> {
+    pub fn read_u32(&self, address: u64) -> Result<u32, NativeMemoryError> {
         let bytes = self
             .read_bytes_raw(address, std::mem::size_of::<u32>())
             .map_err(|error| {
@@ -2805,11 +2956,11 @@ impl NativeMappedMemory {
         Ok(u32::from_le_bytes(word))
     }
 
-    pub(super) fn instruction_fingerprint_words(
+    pub fn instruction_fingerprint_words(
         &self,
         start: carrick_guest_mem::GuestVa,
         max_instructions: usize,
-    ) -> Result<Vec<u32>, RuntimeError> {
+    ) -> Result<Vec<u32>, NativeMemoryError> {
         let page_end = (start.raw() | self.linux_page_size.saturating_sub(1)).saturating_add(1);
         let requested = max_instructions
             .checked_mul(std::mem::size_of::<u32>())
@@ -2830,7 +2981,7 @@ impl NativeMappedMemory {
             .collect())
     }
 
-    pub(super) fn write_u64(&mut self, address: u64, value: u64) -> Result<(), RuntimeError> {
+    pub fn write_u64(&mut self, address: u64, value: u64) -> Result<(), NativeMemoryError> {
         if !self.region_contains(address, std::mem::size_of::<u64>()) {
             return Err(NativeMemoryError::Unsupported(format!(
                 "native Darwin relocation outside mapped guest memory at 0x{address:x}"
@@ -2845,7 +2996,7 @@ impl NativeMappedMemory {
         Ok(())
     }
 
-    pub(super) fn fixed_mapping_target(
+    pub fn fixed_mapping_target(
         &self,
         guest_start: u64,
         length: usize,
@@ -2859,7 +3010,7 @@ impl NativeMappedMemory {
         Ok((host_start, flags))
     }
 
-    pub(super) fn remap_private(
+    pub fn remap_private(
         &mut self,
         address: u64,
         len: usize,
@@ -2881,7 +3032,7 @@ impl NativeMappedMemory {
         let (host_start, flags) = self.fixed_mapping_target(
             page_start,
             page_len,
-            libc::MAP_ANON | libc::MAP_NORESERVE | libc::MAP_PRIVATE,
+            libc::MAP_ANON | MAP_NORESERVE | libc::MAP_PRIVATE,
         )?;
         let mut page = self.read_bytes_raw(page_start, page_len)?;
         let offset = usize::try_from(address.saturating_sub(page_start)).map_err(|_| {
@@ -2915,14 +3066,14 @@ impl NativeMappedMemory {
         Ok(())
     }
 
-    pub(super) fn map_host_alias(
+    pub fn map_host_alias(
         &mut self,
         address: u64,
         len: u64,
         payload: &[u8],
         file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
         prot_none: bool,
-    ) -> Result<(), RuntimeError> {
+    ) -> Result<(), NativeMemoryError> {
         let map_len = align_up_u64(len, self.host_page_size, "native alias length")?;
         let map_len_usize = usize::try_from(map_len).map_err(|_| {
             NativeMemoryError::Unsupported(format!(
@@ -2957,7 +3108,7 @@ impl NativeMappedMemory {
             Some((fd, offset, prot)) => (
                 libc::PROT_READ | libc::PROT_WRITE,
                 prot,
-                libc::MAP_ANON | libc::MAP_SHARED | libc::MAP_NORESERVE,
+                libc::MAP_ANON | libc::MAP_SHARED | MAP_NORESERVE,
                 fd,
                 offset,
                 false,
@@ -2965,7 +3116,7 @@ impl NativeMappedMemory {
             None => (
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_ANON | libc::MAP_PRIVATE | libc::MAP_NORESERVE,
+                libc::MAP_ANON | libc::MAP_PRIVATE | MAP_NORESERVE,
                 -1,
                 0,
                 false,
@@ -2997,7 +3148,7 @@ impl NativeMappedMemory {
         // key there would count waiters that no physical wake can reach.
         let (shared_key_base, shared_key_offset) = if direct_file {
             (
-                crate::trap::shared_file_key_base(fd),
+                carrick_host::futex_key::shared_file_key_base(fd),
                 u64::try_from(offset).unwrap_or_default(),
             )
         } else {
@@ -3035,15 +3186,20 @@ impl NativeMappedMemory {
                         offset.saturating_add(copied as libc::off_t),
                     )
                 };
-                match rc.host_syscall_errno() {
-                    Ok(0) => break,
-                    Ok(n) => copied = copied.saturating_add(n as usize),
-                    Err(errno) if errno == crate::linux_abi::LINUX_EINTR => {}
-                    Err(errno) => {
+                // Host-errno check (was `host_syscall_errno` + the Linux mapping
+                // while this lived in the runtime; EINTR is identical in both
+                // errno spaces, and the number below is now the HOST errno).
+                match rc {
+                    0 => break,
+                    n if n > 0 => copied = copied.saturating_add(n as usize),
+                    _ => {
+                        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                        if errno == libc::EINTR {
+                            continue;
+                        }
                         unsafe { libc::close(fd) };
                         return Err(NativeMemoryError::Unsupported(format!(
-                            "native Darwin alias pread failed with errno {}",
-                            errno.get()
+                            "native Darwin alias pread failed with errno {errno}"
                         ))
                         .into());
                     }
@@ -3125,7 +3281,7 @@ impl NativeMappedMemory {
         Ok(())
     }
 
-    pub(super) fn protect_native16k_range_with<F>(
+    pub fn protect_native16k_range_with<F>(
         &mut self,
         address: u64,
         len: usize,
@@ -3184,7 +3340,7 @@ impl NativeMappedMemory {
                 let run_pages = &pages[index..end];
                 let (_, run_host, run_ptr) = run_pages[0];
                 let run_len = host_page_len * run_pages.len();
-                if prot & crate::linux_abi::LINUX_PROT_EXEC != 0 {
+                if prot & carrick_abi::LINUX_PROT_EXEC != 0 {
                     set_host_prot(run_host, run_len, libc::PROT_READ)?;
                     for &(page_start, host_page, ptr) in run_pages {
                         snapshots.push(ProtectionSnapshot {
@@ -3197,7 +3353,7 @@ impl NativeMappedMemory {
                     // Every page in an exec run received the icache clear
                     // before coalescing; the run-wide clear covers exactly
                     // the same pages.
-                    unsafe { carrick_native_clear_icache(run_ptr, run_len) };
+                    native_clear_icache(run_ptr, run_len);
                 } else {
                     for &(page_start, host_page, ptr) in run_pages {
                         snapshots.push(ProtectionSnapshot {
@@ -3228,7 +3384,7 @@ impl NativeMappedMemory {
                                 let word = snapshot.ptr.cast::<u8>().add(offset).cast::<u32>();
                                 std::ptr::write_unaligned(word, original);
                             }
-                            carrick_native_clear_icache(snapshot.ptr, host_page_len);
+                            native_clear_icache(snapshot.ptr, host_page_len);
                         },
                         Err(restore_error) => rollback_error = Some(restore_error),
                     }
@@ -3396,7 +3552,7 @@ impl GuestMemory for NativeMappedMemory {
             self.protect_native16k_range_with(address, len, prot, native_host_mprotect)
         };
         result?;
-        if old_exec || prot & crate::linux_abi::LINUX_PROT_EXEC != 0 {
+        if old_exec || prot & carrick_abi::LINUX_PROT_EXEC != 0 {
             self.note_dsr_code_mutation(address, len)?;
         }
         Ok(())
@@ -3461,7 +3617,7 @@ impl GuestMemory for NativeMappedMemory {
             let file_offset = region
                 .shared_key_offset
                 .saturating_add(guest_addr - region.start);
-            crate::trap::shared_futex_waiter_key(region.shared_key_base, file_offset)
+            carrick_host::futex_key::shared_futex_waiter_key(region.shared_key_base, file_offset)
         };
         Some(carrick_guest_mem::SharedFutexLocation::Direct {
             word: carrick_guest_mem::HostVa(word),
@@ -3524,27 +3680,27 @@ impl GuestMemory for NativeMappedMemory {
     }
 }
 
-pub(super) fn linux_prot_to_native(prot: u64) -> libc::c_int {
+pub fn linux_prot_to_native(prot: u64) -> libc::c_int {
     let mut host_prot = 0;
-    if prot & crate::linux_abi::LINUX_PROT_READ != 0 {
+    if prot & carrick_abi::LINUX_PROT_READ != 0 {
         host_prot |= libc::PROT_READ;
     }
-    if prot & crate::linux_abi::LINUX_PROT_WRITE != 0 {
+    if prot & carrick_abi::LINUX_PROT_WRITE != 0 {
         host_prot |= libc::PROT_WRITE;
     }
-    if prot & crate::linux_abi::LINUX_PROT_EXEC != 0 {
+    if prot & carrick_abi::LINUX_PROT_EXEC != 0 {
         host_prot |= libc::PROT_EXEC;
     }
     host_prot
 }
 
-pub(super) fn native16k_host_prot(prot: u64) -> libc::c_int {
+pub fn native16k_host_prot(prot: u64) -> libc::c_int {
     let mut host_prot = linux_prot_to_native(prot);
-    let write_exec = crate::linux_abi::LINUX_PROT_WRITE | crate::linux_abi::LINUX_PROT_EXEC;
+    let write_exec = carrick_abi::LINUX_PROT_WRITE | carrick_abi::LINUX_PROT_EXEC;
     if prot & write_exec == write_exec {
         host_prot &= !libc::PROT_WRITE;
     }
-    if prot & crate::linux_abi::LINUX_PROT_EXEC != 0 {
+    if prot & carrick_abi::LINUX_PROT_EXEC != 0 {
         host_prot = (host_prot & !libc::PROT_EXEC) | libc::PROT_READ;
     }
     host_prot
@@ -3553,7 +3709,7 @@ pub(super) fn native16k_host_prot(prot: u64) -> libc::c_int {
 /// Applies one host `mprotect` over a contiguous run of host pages. This is
 /// the production `set_host_prot` for the injectable protect/prepare/restore
 /// loops; tests substitute a recording spy to assert call coalescing.
-pub(super) fn native_host_mprotect(
+pub fn native_host_mprotect(
     host_page: carrick_guest_mem::HostVa,
     len: usize,
     host_prot: libc::c_int,
@@ -3570,20 +3726,24 @@ pub(super) fn native_host_mprotect(
 }
 
 #[derive(Clone, Copy, Default)]
-pub(super) struct NativeExecMapDetailTotal {
+pub struct NativeExecMapDetailTotal {
     duration_ns: u64,
     bytes: u64,
     operations: u64,
 }
 
-pub(super) struct NativeExecMapProfile {
-    tid: crate::thread::ThreadId,
-    active: Option<(crate::probes::DsrExecMapDetailKind, std::time::Instant, u64)>,
+pub struct NativeExecMapProfile {
+    tid: i32,
+    active: Option<(
+        carrick_dsr::probes::DsrExecMapDetailKind,
+        std::time::Instant,
+        u64,
+    )>,
     totals: [NativeExecMapDetailTotal; 5],
 }
 
 impl NativeExecMapProfile {
-    pub(super) fn new(tid: crate::thread::ThreadId) -> Self {
+    pub fn new(tid: i32) -> Self {
         Self {
             tid,
             active: None,
@@ -3591,11 +3751,11 @@ impl NativeExecMapProfile {
         }
     }
 
-    pub(super) fn begin(&mut self, kind: crate::probes::DsrExecMapDetailKind, bytes: u64) {
+    pub fn begin(&mut self, kind: carrick_dsr::probes::DsrExecMapDetailKind, bytes: u64) {
         self.active = Some((kind, std::time::Instant::now(), bytes));
     }
 
-    pub(super) fn end(&mut self, kind: crate::probes::DsrExecMapDetailKind) {
+    pub fn end(&mut self, kind: carrick_dsr::probes::DsrExecMapDetailKind) {
         let Some((active_kind, started, bytes)) = self.active.take() else {
             return;
         };
@@ -3611,13 +3771,13 @@ impl NativeExecMapProfile {
         total.operations = total.operations.saturating_add(1);
     }
 
-    pub(super) fn emit(self) {
-        for (kind, total) in crate::probes::DsrExecMapDetailKind::ALL
+    pub fn emit(self) {
+        for (kind, total) in carrick_dsr::probes::DsrExecMapDetailKind::ALL
             .into_iter()
             .zip(self.totals)
         {
-            crate::probes::dsr_exec_map_detail(
-                self.tid.raw(),
+            carrick_dsr::probes::dsr_exec_map_detail(
+                self.tid,
                 kind,
                 total.duration_ns,
                 total.bytes,
@@ -3632,7 +3792,7 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-pub(super) fn native_exec_map_profile_start(dsr_tid: Option<crate::thread::ThreadId>) {
+pub fn native_exec_map_profile_start(dsr_tid: Option<i32>) {
     let profile = if std::env::var_os("CARRICK_DSR_PROFILE").is_some() {
         dsr_tid.map(NativeExecMapProfile::new)
     } else {
@@ -3641,7 +3801,7 @@ pub(super) fn native_exec_map_profile_start(dsr_tid: Option<crate::thread::Threa
     NATIVE_EXEC_MAP_PROFILE.with(|slot| *slot.borrow_mut() = profile);
 }
 
-pub(super) fn native_exec_map_profile_finish() {
+pub fn native_exec_map_profile_finish() {
     NATIVE_EXEC_MAP_PROFILE.with(|slot| {
         if let Some(profile) = slot.borrow_mut().take() {
             profile.emit();
@@ -3649,15 +3809,15 @@ pub(super) fn native_exec_map_profile_finish() {
     });
 }
 
-pub(super) fn native_exec_map_detail(
-    dsr_tid: Option<crate::thread::ThreadId>,
-    phase: crate::probes::DsrCacheLifecyclePhase,
+pub fn native_exec_map_detail(
+    dsr_tid: Option<i32>,
+    phase: carrick_dsr::probes::DsrCacheLifecyclePhase,
     bytes: u64,
 ) {
     if dsr_tid.is_none() {
         return;
     }
-    use crate::probes::{DsrCacheLifecyclePhase as Phase, DsrExecMapDetailKind as Kind};
+    use carrick_dsr::probes::{DsrCacheLifecyclePhase as Phase, DsrExecMapDetailKind as Kind};
     let boundary = match phase {
         Phase::ExecMapMmapBegin => Some((Kind::Mmap, true)),
         Phase::ExecMapMmapEnd => Some((Kind::Mmap, false)),
@@ -3684,29 +3844,27 @@ pub(super) fn native_exec_map_detail(
     }
 }
 
-pub(super) fn finalize_image_region_mapping(
+pub fn finalize_image_region_mapping(
     region: &MemoryRegion,
     mapped: *mut libc::c_void,
     mapped_length: usize,
     logical_length: u64,
-    exec_map_dsr_tid: Option<crate::thread::ThreadId>,
+    exec_map_dsr_tid: Option<i32>,
     _prepared: bool,
 ) -> Result<(), NativeMemoryError> {
     if region.perms.execute {
         native_exec_map_detail(
             exec_map_dsr_tid,
-            crate::probes::DsrCacheLifecyclePhase::ExecMapIcacheBegin,
+            carrick_dsr::probes::DsrCacheLifecyclePhase::ExecMapIcacheBegin,
             logical_length,
         );
-        unsafe {
-            carrick_native_clear_icache(
-                mapped,
-                usize::try_from(logical_length).unwrap_or(mapped_length),
-            )
-        };
+        native_clear_icache(
+            mapped,
+            usize::try_from(logical_length).unwrap_or(mapped_length),
+        );
         native_exec_map_detail(
             exec_map_dsr_tid,
-            crate::probes::DsrCacheLifecyclePhase::ExecMapIcacheEnd,
+            carrick_dsr::probes::DsrCacheLifecyclePhase::ExecMapIcacheEnd,
             0,
         );
     }
@@ -3728,7 +3886,7 @@ pub(super) fn finalize_image_region_mapping(
     }
     native_exec_map_detail(
         exec_map_dsr_tid,
-        crate::probes::DsrCacheLifecyclePhase::ExecMapProtectBegin,
+        carrick_dsr::probes::DsrCacheLifecyclePhase::ExecMapProtectBegin,
         logical_length,
     );
     if unsafe { libc::mprotect(mapped, mapped_length, protection) } != 0 {
@@ -3739,19 +3897,19 @@ pub(super) fn finalize_image_region_mapping(
     }
     native_exec_map_detail(
         exec_map_dsr_tid,
-        crate::probes::DsrCacheLifecyclePhase::ExecMapProtectEnd,
+        carrick_dsr::probes::DsrCacheLifecyclePhase::ExecMapProtectEnd,
         0,
     );
     Ok(())
 }
 
-pub(super) fn map_region(
+pub fn map_region(
     region: &MemoryRegion,
-    exec_map_dsr_tid: Option<crate::thread::ThreadId>,
+    exec_map_dsr_tid: Option<i32>,
     initial_stack_pointer: Option<u64>,
     native_layout: &NativeLayout,
     rollback: &mut NativeMappingRollback,
-) -> Result<(), RuntimeError> {
+) -> Result<(), NativeMemoryError> {
     let length_u64 = region.end.checked_sub(region.start).ok_or_else(|| {
         NativeMemoryError::Unsupported("native Darwin empty inverted region".to_string())
     })?;
@@ -3776,15 +3934,11 @@ pub(super) fn map_region(
     };
     native_exec_map_detail(
         exec_map_dsr_tid,
-        crate::probes::DsrCacheLifecyclePhase::ExecMapMmapBegin,
+        carrick_dsr::probes::DsrCacheLifecyclePhase::ExecMapMmapBegin,
         length_u64,
     );
     let flags = native_layout
-        .fixed_mapping_flags(
-            host_start,
-            length,
-            libc::MAP_ANON | libc::MAP_NORESERVE | share,
-        )
+        .fixed_mapping_flags(host_start, length, libc::MAP_ANON | MAP_NORESERVE | share)
         .map_err(|error| NativeMemoryError::Unsupported(error.to_string()))?;
     let mapped = unsafe {
         libc::mmap(
@@ -3814,7 +3968,7 @@ pub(super) fn map_region(
     rollback.track_mapping(host_start, length);
     native_exec_map_detail(
         exec_map_dsr_tid,
-        crate::probes::DsrCacheLifecyclePhase::ExecMapMmapEnd,
+        carrick_dsr::probes::DsrCacheLifecyclePhase::ExecMapMmapEnd,
         0,
     );
 
@@ -3824,7 +3978,7 @@ pub(super) fn map_region(
     if !copy_bytes.is_empty() {
         native_exec_map_detail(
             exec_map_dsr_tid,
-            crate::probes::DsrCacheLifecyclePhase::ExecMapCopyBegin,
+            carrick_dsr::probes::DsrCacheLifecyclePhase::ExecMapCopyBegin,
             u64::try_from(copy_bytes.len()).unwrap_or(u64::MAX),
         );
         unsafe {
@@ -3836,7 +3990,7 @@ pub(super) fn map_region(
         }
         native_exec_map_detail(
             exec_map_dsr_tid,
-            crate::probes::DsrCacheLifecyclePhase::ExecMapCopyEnd,
+            carrick_dsr::probes::DsrCacheLifecyclePhase::ExecMapCopyEnd,
             0,
         );
     }
@@ -3844,12 +3998,12 @@ pub(super) fn map_region(
     Ok(())
 }
 
-pub(super) fn map_prepared_region_extent(
+pub fn map_prepared_region_extent(
     region_index: usize,
     region: &MemoryRegion,
     backing: PreparedImageFileBacking,
     prepared: &ValidatedPreparedImage,
-    exec_map_dsr_tid: Option<crate::thread::ThreadId>,
+    exec_map_dsr_tid: Option<i32>,
     native_layout: &NativeLayout,
     rollback: &mut NativeMappingRollback,
 ) -> Result<PreparedRegionMapping, NativeMemoryError> {
@@ -3894,7 +4048,7 @@ pub(super) fn map_prepared_region_extent(
     let address = host_start.raw() as *mut libc::c_void;
     native_exec_map_detail(
         exec_map_dsr_tid,
-        crate::probes::DsrCacheLifecyclePhase::ExecMapMmapBegin,
+        carrick_dsr::probes::DsrCacheLifecyclePhase::ExecMapMmapBegin,
         length_u64,
     );
     let flags = native_layout
@@ -3926,7 +4080,7 @@ pub(super) fn map_prepared_region_extent(
     rollback.track_mapping(host_start, length);
     native_exec_map_detail(
         exec_map_dsr_tid,
-        crate::probes::DsrCacheLifecyclePhase::ExecMapMmapEnd,
+        carrick_dsr::probes::DsrCacheLifecyclePhase::ExecMapMmapEnd,
         0,
     );
 
@@ -3937,7 +4091,7 @@ pub(super) fn map_prepared_region_extent(
     })
 }
 
-pub(super) fn map_bytes_region(
+pub fn map_bytes_region(
     start: u64,
     length_u64: u64,
     bytes: &[u8],
@@ -3971,14 +4125,14 @@ pub(super) fn map_bytes_region(
     let addr = host_start.raw() as *mut libc::c_void;
     native_exec_map_detail(
         exec_map_dsr_tid,
-        crate::probes::DsrCacheLifecyclePhase::ExecMapMmapBegin,
+        carrick_dsr::probes::DsrCacheLifecyclePhase::ExecMapMmapBegin,
         length_u64,
     );
     let flags = native_layout
         .fixed_mapping_flags(
             host_start,
             length,
-            libc::MAP_ANON | libc::MAP_NORESERVE | libc::MAP_PRIVATE,
+            libc::MAP_ANON | MAP_NORESERVE | libc::MAP_PRIVATE,
         )
         .map_err(|error| NativeMemoryError::Unsupported(error.to_string()))?;
     let mapped = unsafe {
@@ -4005,13 +4159,13 @@ pub(super) fn map_bytes_region(
     rollback.track_mapping(host_start, length);
     native_exec_map_detail(
         exec_map_dsr_tid,
-        crate::probes::DsrCacheLifecyclePhase::ExecMapMmapEnd,
+        carrick_dsr::probes::DsrCacheLifecyclePhase::ExecMapMmapEnd,
         0,
     );
     if !bytes.is_empty() {
         native_exec_map_detail(
             exec_map_dsr_tid,
-            crate::probes::DsrCacheLifecyclePhase::ExecMapCopyBegin,
+            carrick_dsr::probes::DsrCacheLifecyclePhase::ExecMapCopyBegin,
             u64::try_from(bytes.len()).unwrap_or(u64::MAX),
         );
         unsafe {
@@ -4019,20 +4173,20 @@ pub(super) fn map_bytes_region(
         }
         native_exec_map_detail(
             exec_map_dsr_tid,
-            crate::probes::DsrCacheLifecyclePhase::ExecMapCopyEnd,
+            carrick_dsr::probes::DsrCacheLifecyclePhase::ExecMapCopyEnd,
             0,
         );
     }
     if executable {
         native_exec_map_detail(
             exec_map_dsr_tid,
-            crate::probes::DsrCacheLifecyclePhase::ExecMapIcacheBegin,
+            carrick_dsr::probes::DsrCacheLifecyclePhase::ExecMapIcacheBegin,
             u64::try_from(bytes.len()).unwrap_or(u64::MAX),
         );
-        unsafe { carrick_native_clear_icache(mapped, bytes.len()) };
+        native_clear_icache(mapped, bytes.len());
         native_exec_map_detail(
             exec_map_dsr_tid,
-            crate::probes::DsrCacheLifecyclePhase::ExecMapIcacheEnd,
+            carrick_dsr::probes::DsrCacheLifecyclePhase::ExecMapIcacheEnd,
             0,
         );
     }
@@ -4043,7 +4197,7 @@ pub(super) fn map_bytes_region(
     };
     native_exec_map_detail(
         exec_map_dsr_tid,
-        crate::probes::DsrCacheLifecyclePhase::ExecMapProtectBegin,
+        carrick_dsr::probes::DsrCacheLifecyclePhase::ExecMapProtectBegin,
         length_u64,
     );
     let protect = unsafe { libc::mprotect(mapped, length, final_prot) };
@@ -4054,19 +4208,19 @@ pub(super) fn map_bytes_region(
     }
     native_exec_map_detail(
         exec_map_dsr_tid,
-        crate::probes::DsrCacheLifecyclePhase::ExecMapProtectEnd,
+        carrick_dsr::probes::DsrCacheLifecyclePhase::ExecMapProtectEnd,
         0,
     );
     Ok(())
 }
 
-pub(super) fn map_anonymous_region(
+pub fn map_anonymous_region(
     start: u64,
     length: u64,
     shared: bool,
     native_layout: &NativeLayout,
     rollback: &mut NativeMappingRollback,
-) -> Result<(), RuntimeError> {
+) -> Result<(), NativeMemoryError> {
     let length = usize::try_from(length).map_err(|_| {
         NativeMemoryError::Unsupported(format!(
             "native Darwin anonymous region too large: 0x{start:x}+0x{length:x}"
@@ -4086,11 +4240,7 @@ pub(super) fn map_anonymous_region(
         libc::MAP_PRIVATE
     };
     let flags = native_layout
-        .fixed_mapping_flags(
-            host_start,
-            length,
-            libc::MAP_ANON | libc::MAP_NORESERVE | share,
-        )
+        .fixed_mapping_flags(host_start, length, libc::MAP_ANON | MAP_NORESERVE | share)
         .map_err(|error| NativeMemoryError::Unsupported(error.to_string()))?;
     let mapped = unsafe {
         libc::mmap(
@@ -4120,7 +4270,7 @@ pub(super) fn map_anonymous_region(
     Ok(())
 }
 
-pub(super) fn set_native_region_fork_inheritance(
+pub fn set_native_region_fork_inheritance(
     address: *mut libc::c_void,
     len: usize,
     share: bool,
@@ -4141,7 +4291,7 @@ pub(super) fn set_native_region_fork_inheritance(
 }
 
 /// `movz Xd, #imm16, lsl #32` (sf=1, opc=10, hw=10), any destination register.
-pub(super) const fn movz_x_lsl32(imm16: u16) -> u32 {
+pub const fn movz_x_lsl32(imm16: u16) -> u32 {
     0xd2c0_0000 | ((imm16 as u32) << 5)
 }
 
@@ -4152,7 +4302,7 @@ pub(super) const fn movz_x_lsl32(imm16: u16) -> u32 {
 /// multiples (const-asserted above), so retargeting is a pure immediate swap.
 /// This pass runs ONLY on carrick's own vDSO page — never on guest-owned code,
 /// where an immediate rewrite would corrupt legitimate instructions.
-pub(super) fn relocate_vdso_vvar_loads(
+pub fn relocate_vdso_vvar_loads(
     region: &MemoryRegion,
     native_layout: &NativeLayout,
 ) -> Result<(), NativeMemoryError> {
@@ -4180,7 +4330,7 @@ pub(super) fn relocate_vdso_vvar_loads(
             unsafe { std::ptr::write_unaligned(ptr, relocated | (word & RD_MASK)) };
         }
     }
-    unsafe { carrick_native_clear_icache(base.cast(), length) };
+    native_clear_icache(base.cast(), length);
     let final_prot = libc::PROT_READ;
     if unsafe { libc::mprotect(base.cast(), length, final_prot) } != 0 {
         return Err(last_io_error("restore native Darwin vdso page protections"));

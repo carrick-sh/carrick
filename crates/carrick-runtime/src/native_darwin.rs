@@ -23,12 +23,30 @@ pub(crate) fn adopt_artifact_spike_for_resume(
 ) -> anyhow::Result<()> {
     dsr::artifact_spike::adopt_for_resume(snapshot)
 }
-mod mapped_memory;
+// The native guest-memory model (NativeMappedMemory + handle/config, the
+// exec-mapping machinery) and the bad64 fault-path emulation moved to
+// `carrick_dsr_aarch64::{mapped_memory, emulate}` as the
+// extraction-completing slice (see
+// docs/superpowers/specs/2026-07-17-native-backend-portability-seams-design.md);
+// re-imported here so every existing unqualified call path resolves
+// unchanged (`pub(crate)` because a handful of sibling runtime modules
+// reach these items through `native_darwin::…`).
+pub(crate) use carrick_dsr_aarch64::emulate::*;
+pub(crate) use carrick_dsr_aarch64::mapped_memory::*;
 
-use address::{NATIVE_DARWIN_SIGRETURN_TRAMPOLINE_BASE, NativeAddressMode, NativeLayout};
-use mapped_memory::*;
-
+use address::{NATIVE_DARWIN_SIGRETURN_TRAMPOLINE_BASE, NativeAddressMode};
+// Test-only imports the lib half stopped needing when the memory model and
+// translator moved to the arch crate (the JIT-entangled test suites below
+// still build fixtures with them).
+#[cfg(test)]
+use crate::dispatch::MemoryLayout;
+#[cfg(test)]
+use crate::native_prepared_image::native_region_copy_window;
+#[cfg(test)]
+use address::NativeLayout;
+#[cfg(test)]
 use std::collections::{BTreeMap, BTreeSet};
+
 use std::io::Read;
 use std::os::fd::{FromRawFd, RawFd};
 use std::path::{Path, PathBuf};
@@ -39,18 +57,11 @@ use std::time::{Duration, Instant};
 
 use crate::compat::{CompatReport, CompatReporter, SyscallArgs};
 use crate::dispatch::{
-    DispatchOutcome, GuestMemory, HostSyscallResult, MemoryError, MemoryLayout, SyscallDispatcher,
-    SyscallRequest,
+    DispatchOutcome, GuestMemory, MemoryError, SyscallDispatcher, SyscallRequest,
 };
-use crate::memory::{AddressSpace, AddressSpaceError, MemoryRegion};
-use crate::native_prepared_image::{
-    NativeRelativeRelocation, PreparedImageFileBacking, ValidatedPreparedImage,
-    native_region_copy_window,
-};
-use crate::page_profile::{
-    ExecutionPlan, HostPageState, MixedPageReason, PageBacking, PagePerms, SubpageState,
-    classify_host_page_state,
-};
+use crate::memory::{AddressSpace, AddressSpaceError};
+use crate::native_prepared_image::{NativeRelativeRelocation, ValidatedPreparedImage};
+use crate::page_profile::ExecutionPlan;
 use crate::runtime::{RunResult, RuntimeError, maybe_dump_debug_state};
 use carrick_guest_mem::protections::MemoryProtections;
 use carrick_hal::{
@@ -65,45 +76,16 @@ use sha2::Digest;
 const SVC_0: u32 = 0xd400_0001;
 const NATIVE_CTR_EL0: u64 = 0x8444_4004;
 const NATIVE_DCZID_EL0: u64 = 0x4;
-const NATIVE_DC_ZVA_BLOCK_SIZE: usize = 64;
 const NATIVE_DARWIN_PIE_BASE: u64 = 0x4_0000_0000;
 // NATIVE_DARWIN_SIGRETURN_TRAMPOLINE_BASE and NATIVE_DARWIN_HARD_PAGEZERO_END
 // moved to `carrick_dsr::address` with the address-layout machinery. The
 // trampoline base is re-imported above so unqualified references here and
 // the `use super::*` glob into `mapped_memory` keep resolving; the hard
 // page-zero end is only referenced by the moved address code itself.
-const NATIVE_DARWIN_HEAP_BASE: u64 = 0x8_0000_0000;
-const NATIVE_DARWIN_HEAP_SIZE: u64 = 128 * 1024 * 1024;
-// Darwin places randomized malloc zones in 0x70_0000_0000..0x80_0000_0000.
-// MAP_FIXED would silently replace them, corrupting the host process. Keep the
-// native direct-mapped arena above Carrick's shared/private aperture windows.
-const NATIVE_DARWIN_MMAP_BASE: u64 = 0xa0_0000_0000;
-const NATIVE_DARWIN_MMAP_SIZE: u64 = 32 * 1024 * 1024 * 1024;
-// The canonical Linux vvar/vdso VAs (0x2E_0000_0000/0x2E_0001_0000) sit inside
-// a Darwin-reserved host VA hole: mmap(MAP_FIXED) and mach_vm_allocate refuse
-// [63 GiB, 448 GiB) with EACCES/KERN_NO_SPACE in any Darwin process (measured
-// on macOS 27, entitlements make no difference), and native guest VAs ARE host
-// VAs. Relocate both pages by +512 GiB into the proven-mappable high span the
-// other native windows already occupy (above the 0x70..0x80 GiB*4 randomized
-// malloc zones, disjoint from the 0x90/0x98 apertures, the 0xA0..0xA8 mmap
-// arena, and the ~1 TiB stack). The vvar base must stay a multiple of 1<<32
-// whose high half fits one `movz #imm16, lsl #32` — the injected vDSO page's
-// hardcoded vvar loads are rewritten to it at map time.
-const NATIVE_DARWIN_VVAR_BASE: u64 = carrick_mem::vdso::LINUX_VVAR_BASE + (0x80 << 32);
-const NATIVE_DARWIN_VDSO_BASE: u64 = carrick_mem::vdso::LINUX_VDSO_BASE + (0x80 << 32);
-const _: () = assert!(NATIVE_DARWIN_VVAR_BASE & ((1 << 32) - 1) == 0);
-const _: () = assert!(NATIVE_DARWIN_VVAR_BASE >> 32 <= u16::MAX as u64);
-const _: () = assert!(carrick_mem::vdso::LINUX_VVAR_BASE & ((1 << 32) - 1) == 0);
-
-/// True in a host process created by a GUEST `fork` (not the run-elf root
-/// child, which the CLI forks for isolation). Guest-forked children must exit
-/// through `exec_helpers::forked_child_exit` so their guest CPU is published
-/// for the parent's wait4/waitid child-time accounting (the HVF loop's
-/// `is_forked_guest_process` branch); the root child's exit is reported to the
-/// CLI, which does no such accounting. Survives execve (same host process).
-static NATIVE_FORKED_GUEST_CHILD: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
+// The heap/mmap arena constants, the relocated vvar/vdso bases, and the
+// NATIVE_FORKED_GUEST_CHILD process flag moved to
+// `carrick_dsr_aarch64::mapped_memory` with the memory model; the re-import
+// glob above keeps every unqualified reference here resolving.
 // The native test failpoints/captures moved to `carrick_dsr::test_hooks`
 // (cross-crate `cfg(test)` does not compose once mapped_memory.rs moves into
 // carrick-dsr). The hook STATE compiles in for this crate's own test builds
@@ -116,11 +98,9 @@ static NATIVE_FORKED_GUEST_CHILD: std::sync::atomic::AtomicBool =
 // the seam phase enum (`carrick_dsr::probes::DsrCacheLifecyclePhase`), not
 // the USDT mirror — `native_reexec_lifecycle` converts at the probe edge.
 #[cfg(any(test, feature = "test-hooks"))]
-use carrick_dsr::test_hooks::{
-    NATIVE_TEST_FAIL_EXEC_AFTER_SETUP, NATIVE_TEST_REEXEC_LIFECYCLE,
-    NATIVE_TEST_SUPPLEMENTAL_ROLLBACKS, NATIVE_TEST_VVAR_WORDS, NativePreparedMappingFailpoint,
-    take_native_prepared_mapping_failpoint,
-};
+use carrick_dsr::test_hooks::NATIVE_TEST_FAIL_EXEC_AFTER_SETUP;
+#[cfg(any(test, feature = "test-hooks"))]
+use carrick_dsr::test_hooks::NativePreparedMappingFailpoint;
 #[cfg(test)]
 use carrick_dsr::test_hooks::{
     set_native_prepared_mapping_failpoint, set_native_reexec_lifecycle_capture,
@@ -995,25 +975,9 @@ pub(crate) fn next_native_profile_exec_epoch_for_reexec() -> u64 {
     dsr::profile::next_profile_exec_epoch_for_reexec()
 }
 
-fn native_reexec_lifecycle(phase: carrick_dsr::probes::DsrCacheLifecyclePhase) {
-    #[cfg(any(test, feature = "test-hooks"))]
-    NATIVE_TEST_REEXEC_LIFECYCLE.with(|slot| {
-        if let Some(phases) = slot.borrow_mut().as_mut() {
-            phases.push(phase);
-        }
-    });
-    let tid = unsafe { libc::getpid() };
-    crate::probes::dsr_cache_lifecycle(tid, native_dsr_lifecycle_phase(phase), 0, 0, 0);
-}
-
-fn native_memory_layout() -> MemoryLayout {
-    MemoryLayout {
-        heap_base: NATIVE_DARWIN_HEAP_BASE,
-        heap_size: NATIVE_DARWIN_HEAP_SIZE,
-        mmap_base: NATIVE_DARWIN_MMAP_BASE,
-        mmap_size: NATIVE_DARWIN_MMAP_SIZE,
-    }
-}
+// `native_reexec_lifecycle` and `native_memory_layout` moved to
+// `carrick_dsr_aarch64::mapped_memory` (re-imported above); the lifecycle
+// probe now reaches the USDT provider through the seam sink below.
 
 /// Forwarder behind `carrick_dsr::probes` — the usdt-free probe seam the
 /// extracted DSR code fires through — onto the real
@@ -1090,6 +1054,106 @@ fn native_dsr_exec_map_detail_kind(
     }
 }
 
+fn native_dsr_exit_kind(kind: carrick_dsr::probes::DsrExitKind) -> crate::probes::DsrExitKind {
+    use crate::probes::DsrExitKind as Usdt;
+    use carrick_dsr::probes::DsrExitKind as Seam;
+    match kind {
+        Seam::Syscall => Usdt::Syscall,
+        Seam::DirectResolver => Usdt::DirectResolver,
+        Seam::IndirectResolver => Usdt::IndirectResolver,
+        Seam::Fault => Usdt::Fault,
+        Seam::Kick => Usdt::Kick,
+        Seam::Sensitive => Usdt::Sensitive,
+        Seam::Unsupported => Usdt::Unsupported,
+    }
+}
+
+fn native_dsr_prepare_outcome(
+    outcome: carrick_dsr::probes::DsrPrepareOutcome,
+) -> crate::probes::DsrPrepareOutcome {
+    use crate::probes::DsrPrepareOutcome as Usdt;
+    use carrick_dsr::probes::DsrPrepareOutcome as Seam;
+    match outcome {
+        Seam::ResumeEntryHit => Usdt::ResumeEntryHit,
+        Seam::BlockIndexHit => Usdt::BlockIndexHit,
+        Seam::Translated => Usdt::Translated,
+        Seam::Failed => Usdt::Failed,
+    }
+}
+
+fn native_dsr_operation_outcome(
+    outcome: carrick_dsr::probes::DsrOperationOutcome,
+) -> crate::probes::DsrOperationOutcome {
+    use crate::probes::DsrOperationOutcome as Usdt;
+    use carrick_dsr::probes::DsrOperationOutcome as Seam;
+    match outcome {
+        Seam::Success => Usdt::Success,
+        Seam::PcOverflow => Usdt::PcOverflow,
+        Seam::Decode => Usdt::Decode,
+        Seam::Malformed => Usdt::Malformed,
+        Seam::BlockPolicy => Usdt::BlockPolicy,
+        Seam::MemoryRead => Usdt::MemoryRead,
+        Seam::UnsupportedBlockAction => Usdt::UnsupportedBlockAction,
+        Seam::Assembler => Usdt::Assembler,
+        Seam::Gateway => Usdt::Gateway,
+        Seam::CachePolicy => Usdt::CachePolicy,
+        Seam::GenerationChanged => Usdt::GenerationChanged,
+        Seam::Host => Usdt::Host,
+        Seam::CacheCapacity => Usdt::CacheCapacity,
+        Seam::InvalidTarget => Usdt::InvalidTarget,
+    }
+}
+
+fn native_dsr_resolve_kind(
+    kind: carrick_dsr::probes::DsrResolveKind,
+) -> crate::probes::DsrResolveKind {
+    use crate::probes::DsrResolveKind as Usdt;
+    use carrick_dsr::probes::DsrResolveKind as Seam;
+    match kind {
+        Seam::Direct => Usdt::Direct,
+        Seam::Indirect => Usdt::Indirect,
+    }
+}
+
+fn native_dsr_cache_event_kind(
+    kind: carrick_dsr::probes::DsrCacheEventKind,
+) -> crate::probes::DsrCacheEventKind {
+    use crate::probes::DsrCacheEventKind as Usdt;
+    use carrick_dsr::probes::DsrCacheEventKind as Seam;
+    match kind {
+        Seam::BlockHit => Usdt::BlockHit,
+        Seam::BlockMiss => Usdt::BlockMiss,
+        Seam::TargetPublish => Usdt::TargetPublish,
+        Seam::Invalidate => Usdt::Invalidate,
+        Seam::BlockPublish => Usdt::BlockPublish,
+        Seam::CapacityFailure => Usdt::CapacityFailure,
+    }
+}
+
+fn native_dsr_cache_role(role: carrick_dsr::probes::DsrCacheRole) -> crate::probes::DsrCacheRole {
+    use crate::probes::DsrCacheRole as Usdt;
+    use carrick_dsr::probes::DsrCacheRole as Seam;
+    match role {
+        Seam::Common => Usdt::Common,
+        Seam::Parent => Usdt::Parent,
+        Seam::Child => Usdt::Child,
+    }
+}
+
+fn native_dsr_translation_subphase(
+    subphase: carrick_dsr::probes::DsrTranslationSubphase,
+) -> crate::probes::DsrTranslationSubphase {
+    use crate::probes::DsrTranslationSubphase as Usdt;
+    use carrick_dsr::probes::DsrTranslationSubphase as Seam;
+    match subphase {
+        Seam::Decode => Usdt::Decode,
+        Seam::Plan => Usdt::Plan,
+        Seam::Emit => Usdt::Emit,
+        Seam::PublicationIndex => Usdt::PublicationIndex,
+        Seam::DuplicateWait => Usdt::DuplicateWait,
+    }
+}
+
 impl carrick_dsr::probes::DsrProbeSink for NativeDsrProbeForwarder {
     fn dsr_cache_lifecycle(
         &self,
@@ -1124,6 +1188,141 @@ impl carrick_dsr::probes::DsrProbeSink for NativeDsrProbeForwarder {
             operations,
         );
     }
+
+    fn dsr_prepare_begin(&self, tid: i32, guest_pc: u64) {
+        crate::probes::dsr_prepare_begin(tid, guest_pc);
+    }
+
+    fn dsr_prepare_end(
+        &self,
+        tid: i32,
+        guest_pc: u64,
+        cache_pc: u64,
+        generation: u64,
+        outcome: carrick_dsr::probes::DsrPrepareOutcome,
+    ) {
+        crate::probes::dsr_prepare_end(
+            tid,
+            guest_pc,
+            cache_pc,
+            generation,
+            native_dsr_prepare_outcome(outcome),
+        );
+    }
+
+    fn dsr_run_begin(&self, tid: i32, guest_pc: u64, cache_pc: u64, generation: u64) {
+        crate::probes::dsr_run_begin(tid, guest_pc, cache_pc, generation);
+    }
+
+    fn dsr_run_end(
+        &self,
+        tid: i32,
+        kind: carrick_dsr::probes::DsrExitKind,
+        guest_pc: u64,
+        target_pc: u64,
+        status: i32,
+    ) {
+        crate::probes::dsr_run_end(tid, native_dsr_exit_kind(kind), guest_pc, target_pc, status);
+    }
+
+    fn dsr_translate_begin(&self, tid: i32, guest_pc: u64, generation: u64) {
+        crate::probes::dsr_translate_begin(tid, guest_pc, generation);
+    }
+
+    fn dsr_translate_end(
+        &self,
+        tid: i32,
+        guest_pc: u64,
+        cache_pc: u64,
+        emitted_bytes: u64,
+        outcome: carrick_dsr::probes::DsrOperationOutcome,
+    ) {
+        crate::probes::dsr_translate_end(
+            tid,
+            guest_pc,
+            cache_pc,
+            emitted_bytes,
+            native_dsr_operation_outcome(outcome),
+        );
+    }
+
+    fn dsr_translate_subphase_begin(
+        &self,
+        tid: i32,
+        subphase: carrick_dsr::probes::DsrTranslationSubphase,
+        guest_pc: u64,
+        generation: u64,
+    ) {
+        crate::probes::dsr_translate_subphase_begin(
+            tid,
+            native_dsr_translation_subphase(subphase),
+            guest_pc,
+            generation,
+        );
+    }
+
+    fn dsr_translate_subphase_end(
+        &self,
+        tid: i32,
+        subphase: carrick_dsr::probes::DsrTranslationSubphase,
+        guest_pc: u64,
+        generation: u64,
+    ) {
+        crate::probes::dsr_translate_subphase_end(
+            tid,
+            native_dsr_translation_subphase(subphase),
+            guest_pc,
+            generation,
+        );
+    }
+
+    fn dsr_resolve_begin(
+        &self,
+        tid: i32,
+        kind: carrick_dsr::probes::DsrResolveKind,
+        source_pc: u64,
+        target_pc: u64,
+    ) {
+        crate::probes::dsr_resolve_begin(tid, native_dsr_resolve_kind(kind), source_pc, target_pc);
+    }
+
+    fn dsr_resolve_end(
+        &self,
+        tid: i32,
+        kind: carrick_dsr::probes::DsrResolveKind,
+        source_pc: u64,
+        target_pc: u64,
+        outcome: carrick_dsr::probes::DsrOperationOutcome,
+    ) {
+        crate::probes::dsr_resolve_end(
+            tid,
+            native_dsr_resolve_kind(kind),
+            source_pc,
+            target_pc,
+            native_dsr_operation_outcome(outcome),
+        );
+    }
+
+    fn dsr_cache_event(
+        &self,
+        tid: i32,
+        kind: carrick_dsr::probes::DsrCacheEventKind,
+        guest_pc: u64,
+        generation: u64,
+        used_bytes: u64,
+    ) {
+        crate::probes::dsr_cache_event(
+            tid,
+            native_dsr_cache_event_kind(kind),
+            guest_pc,
+            generation,
+            used_bytes,
+        );
+    }
+
+    fn dsr_cache_capacity(&self, role: carrick_dsr::probes::DsrCacheRole, capacity_bytes: u64) {
+        crate::probes::dsr_cache_capacity(native_dsr_cache_role(role), capacity_bytes);
+    }
 }
 
 /// Install the USDT forwarder as `carrick_dsr::probes`' process-wide sink.
@@ -1138,6 +1337,14 @@ impl carrick_dsr::probes::DsrProbeSink for NativeDsrProbeForwarder {
 fn install_native_probe_sink() {
     static FORWARDER: NativeDsrProbeForwarder = NativeDsrProbeForwarder;
     carrick_dsr::probes::install_probe_sink(&FORWARDER);
+    // The extraction-completing slice made two more runtime-owned host
+    // facts into installed seams with the same idempotent,
+    // first-install-wins discipline; install them at the same entry points
+    // so no moved code can observe an uninstalled seam:
+    //  * the Darwin W^X JIT behind the translation cache, and
+    //  * the vvar clock calibration sources for the vDSO stamper.
+    carrick_dsr_aarch64::translator::install_host_jit(darwin_jit::active_host_jit());
+    carrick_dsr_aarch64::mapped_memory::install_vvar_clock_sources(native_vvar_clock_sources);
 }
 
 /// Attach the shared vDSO (same ELF image + `CARRICK_DISABLE_VDSO` /
@@ -1255,16 +1462,6 @@ fn add_load_bias(load_bias: u64, addend: i64) -> Result<u64, RuntimeError> {
             ))
         })
     }
-}
-
-fn apply_native_relative_relocations(
-    memory: &mut NativeMappedMemory,
-    relocations: &[NativeRelativeRelocation],
-) -> Result<(), RuntimeError> {
-    for relocation in relocations {
-        memory.write_u64(relocation.address().get(), relocation.value().get())?;
-    }
-    Ok(())
 }
 
 fn run_image_in_child(
@@ -1447,17 +1644,19 @@ fn map_native_image_source(
         NativeImageSource::Legacy {
             image,
             relative_relocations,
-        } => NativeMappedMemory::map_for_plan(
+        } => Ok(NativeMappedMemory::map_for_plan(
             image,
             native_memory_layout(),
             plan.page_geometry.host_page_size,
             plan.page_geometry.linux_page_size,
-            plan,
+            plan.page_geometry,
             relative_relocations,
-        ),
-        NativeImageSource::Prepared(prepared) => {
-            NativeMappedMemory::map_prepared_for_plan(prepared, native_memory_layout(), plan)
-        }
+        )?),
+        NativeImageSource::Prepared(prepared) => Ok(NativeMappedMemory::map_prepared_for_plan(
+            prepared,
+            native_memory_layout(),
+            plan.page_geometry,
+        )?),
     }
 }
 
@@ -2407,7 +2606,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                         // old image, sibling set, dispatcher, and DSR cache live.
                         let prepared_mapping = {
                             let memory = memory.read();
-                            memory.prepare_exec_mapping(&image, &plan)
+                            memory.prepare_exec_mapping(&image, plan.page_geometry)
                         };
                         let prepared_mapping = match prepared_mapping {
                             Ok(prepared) => prepared,
@@ -2448,8 +2647,8 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                             .replace_image(
                                 &image,
                                 &relative_relocations,
-                                &plan,
-                                Some(thread_runtime.tid()),
+                                plan.page_geometry,
+                                Some(thread_runtime.tid().raw()),
                                 prepared_mapping,
                             )
                             .map_err(|error| {
@@ -5392,1386 +5591,6 @@ fn native_after_fork_child(dispatcher: &SyscallDispatcher) {
     dispatcher.sysv_after_fork_child();
 }
 
-/// Write guest RAM through the shared memory lock, escalating to a write
-/// guard only when the range may hit a native16k write-exec (SMC/JIT) page.
-/// Mirrors `NativeMappedMemory::write_bytes`'s PROT_NONE/read-only gate plus
-/// the `write_bytes_raw_shared`/`write_exec_page_bytes` split from Phase 1
-/// (Task 3), but decides which guard to take BEFORE acquiring it, so the
-/// overwhelmingly common case (a data write) only ever takes a read guard.
-/// Used by the guest-RAM writers outside the syscall dispatch path (DC ZVA,
-/// clone/fork tid publication, select fd-set clears) whose target address is
-/// guest-controlled and so cannot be assumed non-executable the way
-/// `NativeSignalTrap`'s sigframe writes can (see its own doc comment).
-fn write_guest_ram_through_lock(
-    memory: &SharedNativeMemory,
-    address: u64,
-    bytes: &[u8],
-) -> Result<(), MemoryError> {
-    if bytes.is_empty() {
-        return Ok(());
-    }
-    let guard = memory.upgradable_read();
-    if guard.protections.range_write_denied(address, bytes.len()) {
-        return Err(MemoryError::OutOfBounds {
-            address,
-            length: bytes.len(),
-        });
-    }
-    if guard.range_may_execute(address, bytes.len()) {
-        let mut guard = parking_lot::RwLockUpgradableReadGuard::upgrade(guard);
-        guard.write_exec_page_bytes(address, bytes)
-    } else {
-        guard.write_bytes_raw_shared(address, bytes)
-    }
-}
-
-/// [`write_guest_ram_through_lock`], chunked over a zero-filled range (the
-/// `zero_guest_range` shape used by `select`/`pselect` fd-set clears).
-fn zero_guest_ram_through_lock(
-    memory: &SharedNativeMemory,
-    address: u64,
-    len: usize,
-) -> Result<(), MemoryError> {
-    carrick_guest_mem::zero_range_chunked(address, len, |addr, chunk| {
-        write_guest_ram_through_lock(memory, addr, chunk)
-    })
-}
-
-fn native_dc_zva(memory: &SharedNativeMemory, address: u64) -> Result<(), RuntimeError> {
-    let start = address & !(NATIVE_DC_ZVA_BLOCK_SIZE as u64 - 1);
-    write_guest_ram_through_lock(memory, start, &[0; NATIVE_DC_ZVA_BLOCK_SIZE]).map_err(|error| {
-        RuntimeError::Unsupported(format!(
-            "native Darwin DC ZVA failed at 0x{address:x}: {error}"
-        ))
-    })
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum NativeScalarAccessKind {
-    Load { sign_extend: bool },
-    Store,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct NativeScalarAccess {
-    kind: NativeScalarAccessKind,
-    width: usize,
-    destination_width: usize,
-}
-
-fn bad64_gpr_index(reg: bad64::Reg) -> Option<(usize, usize)> {
-    let raw = reg as u32;
-    let w0 = bad64::Reg::W0 as u32;
-    let w30 = bad64::Reg::W30 as u32;
-    if (w0..=w30).contains(&raw) {
-        return Some(((raw - w0) as usize, 4));
-    }
-    let x0 = bad64::Reg::X0 as u32;
-    let x30 = bad64::Reg::X30 as u32;
-    if (x0..=x30).contains(&raw) {
-        return Some(((raw - x0) as usize, 8));
-    }
-    None
-}
-
-fn bad64_transfer_width(reg: bad64::Reg) -> Option<usize> {
-    bad64_gpr_index(reg).map(|(_, width)| width).or_else(|| {
-        if reg == bad64::Reg::WZR {
-            Some(4)
-        } else if reg == bad64::Reg::XZR {
-            Some(8)
-        } else {
-            None
-        }
-    })
-}
-
-fn native_snapshot_read_reg(snapshot: &NativeUcontextSnapshot, reg: bad64::Reg) -> Option<u64> {
-    if let Some((index, width)) = bad64_gpr_index(reg) {
-        let value = snapshot.x.get(index).copied()?;
-        return Some(if width == 4 {
-            value & u64::from(u32::MAX)
-        } else {
-            value
-        });
-    }
-    if reg == bad64::Reg::WZR || reg == bad64::Reg::XZR {
-        return Some(0);
-    }
-    if reg == bad64::Reg::SP || reg == bad64::Reg::WSP {
-        return Some(snapshot.sp);
-    }
-    None
-}
-
-fn native_snapshot_write_reg(
-    snapshot: &mut NativeUcontextSnapshot,
-    reg: bad64::Reg,
-    value: u64,
-) -> bool {
-    if let Some((index, width)) = bad64_gpr_index(reg) {
-        let Some(slot) = snapshot.x.get_mut(index) else {
-            return false;
-        };
-        *slot = if width == 4 {
-            value & u64::from(u32::MAX)
-        } else {
-            value
-        };
-        return true;
-    }
-    if reg == bad64::Reg::WZR || reg == bad64::Reg::XZR {
-        return true;
-    }
-    if reg == bad64::Reg::SP || reg == bad64::Reg::WSP {
-        snapshot.sp = value;
-        return true;
-    }
-    false
-}
-
-fn add_bad64_imm(base: u64, imm: bad64::Imm) -> u64 {
-    match imm {
-        bad64::Imm::Signed(value) => base.wrapping_add_signed(value),
-        bad64::Imm::Unsigned(value) => base.wrapping_add(value),
-    }
-}
-
-fn extend_bad64_index(value: u64, shift: Option<bad64::Shift>) -> Option<u64> {
-    match shift {
-        None => Some(value),
-        Some(bad64::Shift::LSL(amount) | bad64::Shift::UXTX(amount)) => {
-            Some(value.wrapping_shl(amount))
-        }
-        Some(bad64::Shift::SXTX(amount)) => Some((value as i64 as u64).wrapping_shl(amount)),
-        Some(bad64::Shift::UXTW(amount)) => Some(u64::from(value as u32).wrapping_shl(amount)),
-        Some(bad64::Shift::SXTW(amount)) => {
-            Some((value as u32 as i32 as i64 as u64).wrapping_shl(amount))
-        }
-        _ => None,
-    }
-}
-
-fn decode_native_scalar_address(
-    snapshot: &NativeUcontextSnapshot,
-    operand: bad64::Operand,
-) -> Option<(u64, Option<(bad64::Reg, u64)>)> {
-    match operand {
-        bad64::Operand::MemReg(base) => Some((native_snapshot_read_reg(snapshot, base)?, None)),
-        bad64::Operand::MemOffset {
-            reg: base,
-            offset,
-            mul_vl: false,
-            arrspec: None,
-        } => Some((
-            add_bad64_imm(native_snapshot_read_reg(snapshot, base)?, offset),
-            None,
-        )),
-        bad64::Operand::MemPreIdx { reg: base, imm } => {
-            let address = add_bad64_imm(native_snapshot_read_reg(snapshot, base)?, imm);
-            Some((address, Some((base, address))))
-        }
-        bad64::Operand::MemPostIdxImm { reg: base, imm } => {
-            let address = native_snapshot_read_reg(snapshot, base)?;
-            Some((address, Some((base, add_bad64_imm(address, imm)))))
-        }
-        bad64::Operand::MemExt {
-            regs: [base, index],
-            shift,
-            arrspec: None,
-        } => {
-            let base = native_snapshot_read_reg(snapshot, base)?;
-            let index = native_snapshot_read_reg(snapshot, index)?;
-            Some((base.wrapping_add(extend_bad64_index(index, shift)?), None))
-        }
-        _ => None,
-    }
-}
-
-fn decode_native_scalar_access(op: bad64::Op, transfer_width: usize) -> Option<NativeScalarAccess> {
-    use bad64::Op;
-
-    let access = match op {
-        Op::LDR | Op::LDUR => NativeScalarAccess {
-            kind: NativeScalarAccessKind::Load { sign_extend: false },
-            width: transfer_width,
-            destination_width: transfer_width,
-        },
-        Op::LDRB | Op::LDURB => NativeScalarAccess {
-            kind: NativeScalarAccessKind::Load { sign_extend: false },
-            width: 1,
-            destination_width: transfer_width,
-        },
-        Op::LDRH | Op::LDURH => NativeScalarAccess {
-            kind: NativeScalarAccessKind::Load { sign_extend: false },
-            width: 2,
-            destination_width: transfer_width,
-        },
-        Op::LDRSB | Op::LDURSB => NativeScalarAccess {
-            kind: NativeScalarAccessKind::Load { sign_extend: true },
-            width: 1,
-            destination_width: transfer_width,
-        },
-        Op::LDRSH | Op::LDURSH => NativeScalarAccess {
-            kind: NativeScalarAccessKind::Load { sign_extend: true },
-            width: 2,
-            destination_width: transfer_width,
-        },
-        Op::LDRSW | Op::LDURSW if transfer_width == 8 => NativeScalarAccess {
-            kind: NativeScalarAccessKind::Load { sign_extend: true },
-            width: 4,
-            destination_width: 8,
-        },
-        Op::STR | Op::STUR => NativeScalarAccess {
-            kind: NativeScalarAccessKind::Store,
-            width: transfer_width,
-            destination_width: transfer_width,
-        },
-        Op::STRB | Op::STURB => NativeScalarAccess {
-            kind: NativeScalarAccessKind::Store,
-            width: 1,
-            destination_width: transfer_width,
-        },
-        Op::STRH | Op::STURH => NativeScalarAccess {
-            kind: NativeScalarAccessKind::Store,
-            width: 2,
-            destination_width: transfer_width,
-        },
-        _ => return None,
-    };
-    Some(access)
-}
-
-fn native_load_value(bytes: &[u8], sign_extend: bool, destination_width: usize) -> u64 {
-    let mut value = 0u64;
-    for (index, byte) in bytes.iter().enumerate() {
-        value |= u64::from(*byte) << (index * 8);
-    }
-    if sign_extend && !bytes.is_empty() && bytes.len() < std::mem::size_of::<u64>() {
-        let shift = 64 - bytes.len() * 8;
-        value = ((value << shift) as i64 >> shift) as u64;
-    }
-    if destination_width == 4 {
-        value & u64::from(u32::MAX)
-    } else {
-        value
-    }
-}
-
-fn bad64_single_vector_index(operand: bad64::Operand) -> Option<usize> {
-    let bad64::Operand::MultiReg {
-        regs,
-        arrspec: Some(bad64::ArrSpec::SixteenBytes(None)),
-    } = operand
-    else {
-        return None;
-    };
-    let reg = regs[0]?;
-    if regs[1..].iter().any(Option::is_some) {
-        return None;
-    }
-    let raw = reg as u32;
-    let first = bad64::Reg::V0 as u32;
-    let last = bad64::Reg::V31 as u32;
-    (first..=last)
-        .contains(&raw)
-        .then_some((raw - first) as usize)
-}
-
-fn bad64_vector_index_and_width(reg: bad64::Reg) -> Option<(usize, usize)> {
-    let raw = reg as u32;
-    let classes = [
-        (bad64::Reg::B0 as u32, bad64::Reg::B31 as u32, 1),
-        (bad64::Reg::H0 as u32, bad64::Reg::H31 as u32, 2),
-        (bad64::Reg::S0 as u32, bad64::Reg::S31 as u32, 4),
-        (bad64::Reg::D0 as u32, bad64::Reg::D31 as u32, 8),
-        (bad64::Reg::Q0 as u32, bad64::Reg::Q31 as u32, 16),
-        (bad64::Reg::V0 as u32, bad64::Reg::V31 as u32, 16),
-    ];
-    classes.iter().find_map(|(first, last, width)| {
-        (*first..=*last)
-            .contains(&raw)
-            .then(|| ((raw - *first) as usize, *width))
-    })
-}
-
-fn emulate_linux4k_guarded_vector_register_access(
-    memory: &mut NativeMappedMemory,
-    snapshot: &mut NativeUcontextSnapshot,
-    instruction: &bad64::Instruction,
-    vector_reg: bad64::Reg,
-    memory_operand: bad64::Operand,
-    fault_address: u64,
-) -> Result<(), RuntimeError> {
-    let (vector_index, width) = bad64_vector_index_and_width(vector_reg).ok_or_else(|| {
-        RuntimeError::Unsupported(format!(
-            "native linux4k guarded vector fault does not support register {vector_reg}"
-        ))
-    })?;
-    let write = match instruction.op() {
-        bad64::Op::LDR | bad64::Op::LDUR => false,
-        bad64::Op::STR | bad64::Op::STUR => true,
-        _ => {
-            return Err(RuntimeError::Unsupported(format!(
-                "native linux4k guarded vector fault does not support {instruction}"
-            )));
-        }
-    };
-    let (address, writeback) =
-        decode_native_scalar_address(snapshot, memory_operand).ok_or_else(|| {
-            RuntimeError::Unsupported(format!(
-                "native linux4k guarded vector fault does not support addressing for {instruction}"
-            ))
-        })?;
-    let access_end = address.checked_add(width as u64).ok_or_else(|| {
-        RuntimeError::Unsupported("native linux4k guarded vector access overflow".to_string())
-    })?;
-    if fault_address < address || fault_address >= access_end {
-        return Err(RuntimeError::Unsupported(format!(
-            "native linux4k guarded fault address 0x{fault_address:x} is outside {instruction} access 0x{address:x}..0x{access_end:x}"
-        )));
-    }
-    if !memory.linux4k_range_allows(address, width, write) {
-        return Err(RuntimeError::Unsupported(format!(
-            "native linux4k guarded {instruction} violates guest permissions at 0x{address:x}"
-        )));
-    }
-    let slot = snapshot.v.get_mut(vector_index).ok_or_else(|| {
-        RuntimeError::Unsupported(format!(
-            "native linux4k guarded vector index {vector_index} is out of range"
-        ))
-    })?;
-    if write {
-        memory
-            .write_bytes_raw(address, &slot[..width])
-            .map_err(|error| {
-                RuntimeError::Unsupported(format!(
-                    "native linux4k guarded vector store failed at 0x{address:x}: {error}"
-                ))
-            })?;
-    } else {
-        let bytes = memory.read_bytes_raw(address, width).map_err(|error| {
-            RuntimeError::Unsupported(format!(
-                "native linux4k guarded vector load failed at 0x{address:x}: {error}"
-            ))
-        })?;
-        slot.fill(0);
-        slot[..width].copy_from_slice(&bytes);
-    }
-    if let Some((base, value)) = writeback
-        && !native_snapshot_write_reg(snapshot, base, value)
-    {
-        return Err(RuntimeError::Unsupported(format!(
-            "native linux4k guarded vector fault could not update base register {base}"
-        )));
-    }
-    snapshot.pc = snapshot.pc.checked_add(4).ok_or_else(|| {
-        RuntimeError::Unsupported("native linux4k guarded vector PC overflow".to_string())
-    })?;
-    Ok(())
-}
-
-fn emulate_linux4k_guarded_pair_access(
-    memory: &mut NativeMappedMemory,
-    snapshot: &mut NativeUcontextSnapshot,
-    instruction: &bad64::Instruction,
-    fault_address: u64,
-) -> Result<(), RuntimeError> {
-    let [
-        bad64::Operand::Reg {
-            reg: first_reg,
-            arrspec: None,
-        },
-        bad64::Operand::Reg {
-            reg: second_reg,
-            arrspec: None,
-        },
-        memory_operand,
-    ] = instruction.operands()
-    else {
-        return Err(RuntimeError::Unsupported(format!(
-            "native linux4k guarded pair fault does not support operands for {instruction}"
-        )));
-    };
-    let write = matches!(instruction.op(), bad64::Op::STP | bad64::Op::STNP);
-    if !matches!(
-        instruction.op(),
-        bad64::Op::LDP | bad64::Op::LDNP | bad64::Op::LDPSW | bad64::Op::STP | bad64::Op::STNP
-    ) {
-        return Err(RuntimeError::Unsupported(format!(
-            "native linux4k guarded pair fault does not support {instruction}"
-        )));
-    }
-    let vector_regs =
-        bad64_vector_index_and_width(*first_reg).zip(bad64_vector_index_and_width(*second_reg));
-    let gpr_regs = bad64_transfer_width(*first_reg).zip(bad64_transfer_width(*second_reg));
-    let element_width = if let Some(((first_index, first_width), (second_index, second_width))) =
-        vector_regs
-    {
-        if first_width != second_width || instruction.op() == bad64::Op::LDPSW {
-            return Err(RuntimeError::Unsupported(format!(
-                "native linux4k guarded pair has incompatible vector registers for {instruction}"
-            )));
-        }
-        let _ = (first_index, second_index);
-        first_width
-    } else if let Some((first_width, second_width)) = gpr_regs {
-        if first_width != second_width {
-            return Err(RuntimeError::Unsupported(format!(
-                "native linux4k guarded pair has incompatible GPR widths for {instruction}"
-            )));
-        }
-        if instruction.op() == bad64::Op::LDPSW {
-            if first_width != 8 {
-                return Err(RuntimeError::Unsupported(format!(
-                    "native linux4k guarded LDPSW requires X registers: {instruction}"
-                )));
-            }
-            4
-        } else {
-            first_width
-        }
-    } else {
-        return Err(RuntimeError::Unsupported(format!(
-            "native linux4k guarded pair requires matching GPR or vector registers: {instruction}"
-        )));
-    };
-    let (address, writeback) =
-        decode_native_scalar_address(snapshot, *memory_operand).ok_or_else(|| {
-            RuntimeError::Unsupported(format!(
-                "native linux4k guarded pair fault does not support addressing for {instruction}"
-            ))
-        })?;
-    let total_width = element_width * 2;
-    let access_end = address.checked_add(total_width as u64).ok_or_else(|| {
-        RuntimeError::Unsupported("native linux4k guarded pair access overflow".to_string())
-    })?;
-    if fault_address < address || fault_address >= access_end {
-        return Err(RuntimeError::Unsupported(format!(
-            "native linux4k guarded fault address 0x{fault_address:x} is outside {instruction} access 0x{address:x}..0x{access_end:x}"
-        )));
-    }
-    if !memory.linux4k_range_allows(address, total_width, write) {
-        return Err(RuntimeError::Unsupported(format!(
-            "native linux4k guarded {instruction} violates guest permissions at 0x{address:x}"
-        )));
-    }
-    if let Some((base, _)) = writeback {
-        let base_index = bad64_gpr_index(base).map(|(index, _)| index);
-        if base_index == bad64_gpr_index(*first_reg).map(|(index, _)| index)
-            || base_index == bad64_gpr_index(*second_reg).map(|(index, _)| index)
-        {
-            return Err(RuntimeError::Unsupported(format!(
-                "native linux4k guarded pair rejects overlapping writeback for {instruction}"
-            )));
-        }
-    }
-
-    if let Some(((first_index, _), (second_index, _))) = vector_regs {
-        if write {
-            let first = snapshot.v[first_index];
-            let second = snapshot.v[second_index];
-            memory
-                .write_bytes_raw(address, &first[..element_width])
-                .and_then(|()| {
-                    memory.write_bytes_raw(
-                        address.saturating_add(element_width as u64),
-                        &second[..element_width],
-                    )
-                })
-                .map_err(|error| {
-                    RuntimeError::Unsupported(format!(
-                        "native linux4k guarded vector pair store failed at 0x{address:x}: {error}"
-                    ))
-                })?;
-        } else {
-            let bytes = memory
-                .read_bytes_raw(address, total_width)
-                .map_err(|error| {
-                    RuntimeError::Unsupported(format!(
-                        "native linux4k guarded vector pair load failed at 0x{address:x}: {error}"
-                    ))
-                })?;
-            snapshot.v[first_index].fill(0);
-            snapshot.v[first_index][..element_width].copy_from_slice(&bytes[..element_width]);
-            snapshot.v[second_index].fill(0);
-            snapshot.v[second_index][..element_width].copy_from_slice(&bytes[element_width..]);
-        }
-    } else if write {
-        let first = native_snapshot_read_reg(snapshot, *first_reg).ok_or_else(|| {
-            RuntimeError::Unsupported(format!(
-                "native linux4k guarded pair could not read {first_reg}"
-            ))
-        })?;
-        let second = native_snapshot_read_reg(snapshot, *second_reg).ok_or_else(|| {
-            RuntimeError::Unsupported(format!(
-                "native linux4k guarded pair could not read {second_reg}"
-            ))
-        })?;
-        memory
-            .write_bytes_raw(address, &first.to_le_bytes()[..element_width])
-            .and_then(|()| {
-                memory.write_bytes_raw(
-                    address.saturating_add(element_width as u64),
-                    &second.to_le_bytes()[..element_width],
-                )
-            })
-            .map_err(|error| {
-                RuntimeError::Unsupported(format!(
-                    "native linux4k guarded GPR pair store failed at 0x{address:x}: {error}"
-                ))
-            })?;
-    } else {
-        let bytes = memory
-            .read_bytes_raw(address, total_width)
-            .map_err(|error| {
-                RuntimeError::Unsupported(format!(
-                    "native linux4k guarded GPR pair load failed at 0x{address:x}: {error}"
-                ))
-            })?;
-        let sign_extend = instruction.op() == bad64::Op::LDPSW;
-        let first = native_load_value(&bytes[..element_width], sign_extend, 8);
-        let second = native_load_value(&bytes[element_width..], sign_extend, 8);
-        if !native_snapshot_write_reg(snapshot, *first_reg, first)
-            || !native_snapshot_write_reg(snapshot, *second_reg, second)
-        {
-            return Err(RuntimeError::Unsupported(format!(
-                "native linux4k guarded pair could not update registers for {instruction}"
-            )));
-        }
-    }
-    if let Some((base, value)) = writeback
-        && !native_snapshot_write_reg(snapshot, base, value)
-    {
-        return Err(RuntimeError::Unsupported(format!(
-            "native linux4k guarded pair could not update base register {base}"
-        )));
-    }
-    snapshot.pc = snapshot.pc.checked_add(4).ok_or_else(|| {
-        RuntimeError::Unsupported("native linux4k guarded pair PC overflow".to_string())
-    })?;
-    Ok(())
-}
-
-fn emulate_linux4k_guarded_vector_access(
-    memory: &mut NativeMappedMemory,
-    snapshot: &mut NativeUcontextSnapshot,
-    instruction: &bad64::Instruction,
-    fault_address: u64,
-) -> Result<(), RuntimeError> {
-    let [vector_operand, memory_operand] = instruction.operands() else {
-        return Err(RuntimeError::Unsupported(format!(
-            "native linux4k guarded vector fault does not support operands for {instruction}"
-        )));
-    };
-    let vector_index = bad64_single_vector_index(*vector_operand).ok_or_else(|| {
-        RuntimeError::Unsupported(format!(
-            "native linux4k guarded vector fault supports one .16b register, got {instruction}"
-        ))
-    })?;
-    let (address, writeback) =
-        decode_native_scalar_address(snapshot, *memory_operand).ok_or_else(|| {
-            RuntimeError::Unsupported(format!(
-                "native linux4k guarded vector fault does not support addressing for {instruction}"
-            ))
-        })?;
-    let access_end = address.checked_add(16).ok_or_else(|| {
-        RuntimeError::Unsupported("native linux4k guarded vector access overflow".to_string())
-    })?;
-    if fault_address < address || fault_address >= access_end {
-        return Err(RuntimeError::Unsupported(format!(
-            "native linux4k guarded fault address 0x{fault_address:x} is outside {instruction} access 0x{address:x}..0x{access_end:x}"
-        )));
-    }
-    let write = instruction.op() == bad64::Op::ST1;
-    if !memory.linux4k_range_allows(address, 16, write) {
-        return Err(RuntimeError::Unsupported(format!(
-            "native linux4k guarded {instruction} violates guest permissions at 0x{address:x}"
-        )));
-    }
-    match instruction.op() {
-        bad64::Op::LD1 => {
-            let bytes = memory.read_bytes_raw(address, 16).map_err(|error| {
-                RuntimeError::Unsupported(format!(
-                    "native linux4k guarded vector load failed at 0x{address:x}: {error}"
-                ))
-            })?;
-            let Some(slot) = snapshot.v.get_mut(vector_index) else {
-                return Err(RuntimeError::Unsupported(format!(
-                    "native linux4k guarded vector index {vector_index} is out of range"
-                )));
-            };
-            slot.copy_from_slice(&bytes);
-        }
-        bad64::Op::ST1 => {
-            let value = snapshot.v.get(vector_index).ok_or_else(|| {
-                RuntimeError::Unsupported(format!(
-                    "native linux4k guarded vector index {vector_index} is out of range"
-                ))
-            })?;
-            memory.write_bytes_raw(address, value).map_err(|error| {
-                RuntimeError::Unsupported(format!(
-                    "native linux4k guarded vector store failed at 0x{address:x}: {error}"
-                ))
-            })?;
-        }
-        _ => {
-            return Err(RuntimeError::Unsupported(format!(
-                "native linux4k guarded vector fault does not support {instruction}"
-            )));
-        }
-    }
-    if let Some((base, value)) = writeback
-        && !native_snapshot_write_reg(snapshot, base, value)
-    {
-        return Err(RuntimeError::Unsupported(format!(
-            "native linux4k guarded vector fault could not update base register {base}"
-        )));
-    }
-    snapshot.pc = snapshot.pc.checked_add(4).ok_or_else(|| {
-        RuntimeError::Unsupported("native linux4k guarded vector PC overflow".to_string())
-    })?;
-    Ok(())
-}
-
-fn atomic_add_access_width(op: bad64::Op, result_reg: bad64::Reg) -> Option<usize> {
-    match op {
-        bad64::Op::LDADDB | bad64::Op::LDADDAB | bad64::Op::LDADDALB | bad64::Op::LDADDLB => {
-            Some(1)
-        }
-        bad64::Op::LDADDH | bad64::Op::LDADDAH | bad64::Op::LDADDALH | bad64::Op::LDADDLH => {
-            Some(2)
-        }
-        bad64::Op::LDADD | bad64::Op::LDADDA | bad64::Op::LDADDAL | bad64::Op::LDADDL => {
-            bad64_transfer_width(result_reg)
-        }
-        _ => None,
-    }
-}
-
-fn atomic_add_ordering(
-    op: bad64::Op,
-    result_reg: bad64::Reg,
-) -> Option<std::sync::atomic::Ordering> {
-    let acquire = matches!(
-        op,
-        bad64::Op::LDADDA
-            | bad64::Op::LDADDAB
-            | bad64::Op::LDADDAH
-            | bad64::Op::LDADDAL
-            | bad64::Op::LDADDALB
-            | bad64::Op::LDADDALH
-    ) && !matches!(result_reg, bad64::Reg::WZR | bad64::Reg::XZR);
-    let release = matches!(
-        op,
-        bad64::Op::LDADDL
-            | bad64::Op::LDADDLB
-            | bad64::Op::LDADDLH
-            | bad64::Op::LDADDAL
-            | bad64::Op::LDADDALB
-            | bad64::Op::LDADDALH
-    );
-    atomic_add_access_width(op, result_reg)?;
-    Some(match (acquire, release) {
-        (false, false) => std::sync::atomic::Ordering::Relaxed,
-        (true, false) => std::sync::atomic::Ordering::Acquire,
-        (false, true) => std::sync::atomic::Ordering::Release,
-        (true, true) => std::sync::atomic::Ordering::AcqRel,
-    })
-}
-
-fn emulate_linux4k_guarded_atomic_add(
-    memory: &mut NativeMappedMemory,
-    snapshot: &mut NativeUcontextSnapshot,
-    instruction: &bad64::Instruction,
-    fault_address: u64,
-) -> Result<(), RuntimeError> {
-    let [
-        bad64::Operand::Reg {
-            reg: addend_reg,
-            arrspec: None,
-        },
-        bad64::Operand::Reg {
-            reg: result_reg,
-            arrspec: None,
-        },
-        memory_operand,
-    ] = instruction.operands()
-    else {
-        return Err(RuntimeError::Unsupported(format!(
-            "native linux4k atomic add does not support operands for {instruction}"
-        )));
-    };
-    let width = atomic_add_access_width(instruction.op(), *result_reg).ok_or_else(|| {
-        RuntimeError::Unsupported(format!(
-            "native linux4k atomic add does not support width for {instruction}"
-        ))
-    })?;
-    if bad64_transfer_width(*addend_reg).is_none() || bad64_transfer_width(*result_reg).is_none() {
-        return Err(RuntimeError::Unsupported(format!(
-            "native linux4k atomic add requires GPR operands for {instruction}"
-        )));
-    }
-    let ordering = atomic_add_ordering(instruction.op(), *result_reg).ok_or_else(|| {
-        RuntimeError::Unsupported(format!(
-            "native linux4k atomic add does not support ordering for {instruction}"
-        ))
-    })?;
-    let (address, writeback) =
-        decode_native_scalar_address(snapshot, *memory_operand).ok_or_else(|| {
-            RuntimeError::Unsupported(format!(
-                "native linux4k atomic add does not support addressing for {instruction}"
-            ))
-        })?;
-    if writeback.is_some() {
-        return Err(RuntimeError::Unsupported(format!(
-            "native linux4k atomic add rejects writeback for {instruction}"
-        )));
-    }
-    let access_end = address.checked_add(width as u64).ok_or_else(|| {
-        RuntimeError::Unsupported("native linux4k atomic add access overflow".to_string())
-    })?;
-    if fault_address < address || fault_address >= access_end {
-        return Err(RuntimeError::Unsupported(format!(
-            "native linux4k guarded fault address 0x{fault_address:x} is outside {instruction} access 0x{address:x}..0x{access_end:x}"
-        )));
-    }
-    if !memory.linux4k_range_allows(address, width, false)
-        || !memory.linux4k_range_allows(address, width, true)
-    {
-        return Err(RuntimeError::Unsupported(format!(
-            "native linux4k guarded {instruction} violates guest permissions at 0x{address:x}"
-        )));
-    }
-    let addend = native_snapshot_read_reg(snapshot, *addend_reg).ok_or_else(|| {
-        RuntimeError::Unsupported(format!(
-            "native linux4k atomic add could not read {addend_reg}"
-        ))
-    })?;
-    let old = memory
-        .atomic_fetch_add(address, width, addend, ordering)
-        .map_err(|error| {
-            RuntimeError::Unsupported(format!(
-                "native linux4k atomic add failed at 0x{address:x}: {error}"
-            ))
-        })?;
-    if !native_snapshot_write_reg(snapshot, *result_reg, old) {
-        return Err(RuntimeError::Unsupported(format!(
-            "native linux4k atomic add could not write {result_reg}"
-        )));
-    }
-    snapshot.pc = snapshot.pc.checked_add(4).ok_or_else(|| {
-        RuntimeError::Unsupported("native linux4k atomic add PC overflow".to_string())
-    })?;
-    Ok(())
-}
-
-fn ordered_atomic_access_width(op: bad64::Op, transfer_reg: bad64::Reg) -> Option<usize> {
-    match op {
-        bad64::Op::LDARB | bad64::Op::LDAPRB | bad64::Op::STLRB | bad64::Op::STLLRB => Some(1),
-        bad64::Op::LDARH | bad64::Op::LDAPRH | bad64::Op::STLRH | bad64::Op::STLLRH => Some(2),
-        bad64::Op::LDAR | bad64::Op::LDAPR | bad64::Op::STLR | bad64::Op::STLLR => {
-            bad64_transfer_width(transfer_reg)
-        }
-        _ => None,
-    }
-}
-
-fn emulate_linux4k_guarded_ordered_atomic_access(
-    memory: &mut NativeMappedMemory,
-    snapshot: &mut NativeUcontextSnapshot,
-    instruction: &bad64::Instruction,
-    fault_address: u64,
-) -> Result<(), RuntimeError> {
-    let [
-        bad64::Operand::Reg {
-            reg: transfer_reg,
-            arrspec: None,
-        },
-        memory_operand,
-    ] = instruction.operands()
-    else {
-        return Err(RuntimeError::Unsupported(format!(
-            "native linux4k ordered atomic access does not support operands for {instruction}"
-        )));
-    };
-    let load = matches!(
-        instruction.op(),
-        bad64::Op::LDAR
-            | bad64::Op::LDARB
-            | bad64::Op::LDARH
-            | bad64::Op::LDAPR
-            | bad64::Op::LDAPRB
-            | bad64::Op::LDAPRH
-    );
-    let width = ordered_atomic_access_width(instruction.op(), *transfer_reg).ok_or_else(|| {
-        RuntimeError::Unsupported(format!(
-            "native linux4k ordered atomic access does not support width for {instruction}"
-        ))
-    })?;
-    let (address, writeback) =
-        decode_native_scalar_address(snapshot, *memory_operand).ok_or_else(|| {
-            RuntimeError::Unsupported(format!(
-                "native linux4k ordered atomic access does not support addressing for {instruction}"
-            ))
-        })?;
-    if writeback.is_some() {
-        return Err(RuntimeError::Unsupported(format!(
-            "native linux4k ordered atomic access rejects writeback for {instruction}"
-        )));
-    }
-    let access_end = address.checked_add(width as u64).ok_or_else(|| {
-        RuntimeError::Unsupported("native linux4k ordered atomic access overflow".to_string())
-    })?;
-    if fault_address < address || fault_address >= access_end {
-        return Err(RuntimeError::Unsupported(format!(
-            "native linux4k guarded fault address 0x{fault_address:x} is outside {instruction} access 0x{address:x}..0x{access_end:x}"
-        )));
-    }
-    if !memory.linux4k_range_allows(address, width, !load) {
-        return Err(RuntimeError::Unsupported(format!(
-            "native linux4k guarded {instruction} violates guest permissions at 0x{address:x}"
-        )));
-    }
-    if load {
-        let value = memory.atomic_load(address, width).map_err(|error| {
-            RuntimeError::Unsupported(format!(
-                "native linux4k ordered atomic load failed at 0x{address:x}: {error}"
-            ))
-        })?;
-        if !native_snapshot_write_reg(snapshot, *transfer_reg, value) {
-            return Err(RuntimeError::Unsupported(format!(
-                "native linux4k ordered atomic load could not write {transfer_reg}"
-            )));
-        }
-    } else {
-        let value = native_snapshot_read_reg(snapshot, *transfer_reg).ok_or_else(|| {
-            RuntimeError::Unsupported(format!(
-                "native linux4k ordered atomic store could not read {transfer_reg}"
-            ))
-        })?;
-        memory
-            .atomic_store(address, width, value)
-            .map_err(|error| {
-                RuntimeError::Unsupported(format!(
-                    "native linux4k ordered atomic store failed at 0x{address:x}: {error}"
-                ))
-            })?;
-    }
-    snapshot.pc = snapshot.pc.checked_add(4).ok_or_else(|| {
-        RuntimeError::Unsupported("native linux4k ordered atomic PC overflow".to_string())
-    })?;
-    Ok(())
-}
-
-fn exclusive_access_width(op: bad64::Op, transfer_reg: bad64::Reg) -> Option<usize> {
-    match op {
-        bad64::Op::LDAXRB | bad64::Op::LDXRB | bad64::Op::STLXRB | bad64::Op::STXRB => Some(1),
-        bad64::Op::LDAXRH | bad64::Op::LDXRH | bad64::Op::STLXRH | bad64::Op::STXRH => Some(2),
-        bad64::Op::LDAXR | bad64::Op::LDXR | bad64::Op::STLXR | bad64::Op::STXR => {
-            bad64_transfer_width(transfer_reg)
-        }
-        _ => None,
-    }
-}
-
-/// `&NativeMappedMemory`: the DSR hot path (`LDAXR`/`STLXR` and friends fire
-/// on essentially every guest lock/atomic). Everything this touches --
-/// `native_range_allows` and `exclusive_load_for`/`exclusive_store_for` --
-/// is `&self`-safe; the reservation itself lives in the caller's
-/// `NativeThreadRuntime.exclusive_reservation`, not in `NativeMappedMemory`.
-fn emulate_dsr_exclusive_access(
-    memory: &NativeMappedMemory,
-    snapshot: &mut NativeUcontextSnapshot,
-    reservation: &mut Option<NativeExclusiveReservation>,
-    word: u32,
-    guest_pc: u64,
-) -> Result<(), RuntimeError> {
-    let instruction = bad64::decode(word, guest_pc).map_err(|error| {
-        RuntimeError::Unsupported(format!(
-            "native DSR could not decode exclusive word 0x{word:08x} at 0x{guest_pc:x}: {error:?}"
-        ))
-    })?;
-    let load = matches!(
-        instruction.op(),
-        bad64::Op::LDAXR
-            | bad64::Op::LDAXRB
-            | bad64::Op::LDAXRH
-            | bad64::Op::LDXR
-            | bad64::Op::LDXRB
-            | bad64::Op::LDXRH
-    );
-    let acquire = matches!(
-        instruction.op(),
-        bad64::Op::LDAXR | bad64::Op::LDAXRB | bad64::Op::LDAXRH
-    );
-    let release = matches!(
-        instruction.op(),
-        bad64::Op::STLXR | bad64::Op::STLXRB | bad64::Op::STLXRH
-    );
-    let (status_reg, transfer_reg, memory_operand) = if load {
-        let [
-            bad64::Operand::Reg {
-                reg: transfer_reg,
-                arrspec: None,
-            },
-            memory_operand,
-        ] = instruction.operands()
-        else {
-            return Err(RuntimeError::Unsupported(format!(
-                "native DSR exclusive load does not support operands for {instruction}"
-            )));
-        };
-        (None, *transfer_reg, *memory_operand)
-    } else {
-        let [
-            bad64::Operand::Reg {
-                reg: status_reg,
-                arrspec: None,
-            },
-            bad64::Operand::Reg {
-                reg: transfer_reg,
-                arrspec: None,
-            },
-            memory_operand,
-        ] = instruction.operands()
-        else {
-            return Err(RuntimeError::Unsupported(format!(
-                "native DSR exclusive store does not support operands for {instruction}"
-            )));
-        };
-        (Some(*status_reg), *transfer_reg, *memory_operand)
-    };
-    let width = exclusive_access_width(instruction.op(), transfer_reg).ok_or_else(|| {
-        RuntimeError::Unsupported(format!(
-            "native DSR exclusive access does not support width for {instruction}"
-        ))
-    })?;
-    let (address, writeback) =
-        decode_native_scalar_address(snapshot, memory_operand).ok_or_else(|| {
-            RuntimeError::Unsupported(format!(
-                "native DSR exclusive access does not support addressing for {instruction}"
-            ))
-        })?;
-    if writeback.is_some() {
-        return Err(RuntimeError::Unsupported(format!(
-            "native DSR exclusive access rejects writeback for {instruction}"
-        )));
-    }
-    if !memory.native_range_allows(address, width, !load) {
-        return Err(RuntimeError::Unsupported(format!(
-            "native DSR exclusive {instruction} violates guest permissions at 0x{address:x}"
-        )));
-    }
-
-    if load {
-        let value = memory
-            .exclusive_load_for(address, width, acquire, reservation)
-            .map_err(|error| {
-                RuntimeError::Unsupported(format!(
-                    "native DSR exclusive load failed at 0x{address:x}: {error}"
-                ))
-            })?;
-        if !native_snapshot_write_reg(snapshot, transfer_reg, value) {
-            return Err(RuntimeError::Unsupported(format!(
-                "native DSR exclusive load could not write {transfer_reg}"
-            )));
-        }
-    } else {
-        let value = native_snapshot_read_reg(snapshot, transfer_reg).ok_or_else(|| {
-            RuntimeError::Unsupported(format!(
-                "native DSR exclusive store could not read {transfer_reg}"
-            ))
-        })?;
-        let stored = memory
-            .exclusive_store_for(address, width, value, release, reservation)
-            .map_err(|error| {
-                RuntimeError::Unsupported(format!(
-                    "native DSR exclusive store failed at 0x{address:x}: {error}"
-                ))
-            })?;
-        let status_reg = status_reg.ok_or_else(|| {
-            RuntimeError::Unsupported(format!(
-                "native DSR exclusive store lacks status register for {instruction}"
-            ))
-        })?;
-        if !native_snapshot_write_reg(snapshot, status_reg, u64::from(!stored)) {
-            return Err(RuntimeError::Unsupported(format!(
-                "native DSR exclusive store could not write {status_reg}"
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn emulate_linux4k_guarded_exclusive_access(
-    memory: &mut NativeMappedMemory,
-    snapshot: &mut NativeUcontextSnapshot,
-    reservation: &mut Option<NativeExclusiveReservation>,
-    instruction: &bad64::Instruction,
-    fault_address: u64,
-) -> Result<(), RuntimeError> {
-    let load = matches!(
-        instruction.op(),
-        bad64::Op::LDAXR
-            | bad64::Op::LDAXRB
-            | bad64::Op::LDAXRH
-            | bad64::Op::LDXR
-            | bad64::Op::LDXRB
-            | bad64::Op::LDXRH
-    );
-    let acquire = matches!(
-        instruction.op(),
-        bad64::Op::LDAXR | bad64::Op::LDAXRB | bad64::Op::LDAXRH
-    );
-    let release = matches!(
-        instruction.op(),
-        bad64::Op::STLXR | bad64::Op::STLXRB | bad64::Op::STLXRH
-    );
-
-    let (status_reg, transfer_reg, memory_operand) = if load {
-        let [
-            bad64::Operand::Reg {
-                reg: transfer_reg,
-                arrspec: None,
-            },
-            memory_operand,
-        ] = instruction.operands()
-        else {
-            return Err(RuntimeError::Unsupported(format!(
-                "native linux4k exclusive load does not support operands for {instruction}"
-            )));
-        };
-        (None, *transfer_reg, *memory_operand)
-    } else {
-        let [
-            bad64::Operand::Reg {
-                reg: status_reg,
-                arrspec: None,
-            },
-            bad64::Operand::Reg {
-                reg: transfer_reg,
-                arrspec: None,
-            },
-            memory_operand,
-        ] = instruction.operands()
-        else {
-            return Err(RuntimeError::Unsupported(format!(
-                "native linux4k exclusive store does not support operands for {instruction}"
-            )));
-        };
-        (Some(*status_reg), *transfer_reg, *memory_operand)
-    };
-    let width = exclusive_access_width(instruction.op(), transfer_reg).ok_or_else(|| {
-        RuntimeError::Unsupported(format!(
-            "native linux4k exclusive access does not support width for {instruction}"
-        ))
-    })?;
-    let (address, writeback) =
-        decode_native_scalar_address(snapshot, memory_operand).ok_or_else(|| {
-            RuntimeError::Unsupported(format!(
-                "native linux4k exclusive access does not support addressing for {instruction}"
-            ))
-        })?;
-    if writeback.is_some() {
-        return Err(RuntimeError::Unsupported(format!(
-            "native linux4k exclusive access rejects writeback for {instruction}"
-        )));
-    }
-    let access_end = address.checked_add(width as u64).ok_or_else(|| {
-        RuntimeError::Unsupported("native linux4k exclusive access overflow".to_string())
-    })?;
-    if fault_address < address || fault_address >= access_end {
-        return Err(RuntimeError::Unsupported(format!(
-            "native linux4k guarded fault address 0x{fault_address:x} is outside {instruction} access 0x{address:x}..0x{access_end:x}"
-        )));
-    }
-    if !memory.linux4k_range_allows(address, width, !load) {
-        return Err(RuntimeError::Unsupported(format!(
-            "native linux4k guarded {instruction} violates guest permissions at 0x{address:x}"
-        )));
-    }
-
-    if load {
-        let value = memory
-            .exclusive_load(address, width, acquire, reservation)
-            .map_err(|error| {
-                RuntimeError::Unsupported(format!(
-                    "native linux4k exclusive load failed at 0x{address:x}: {error}"
-                ))
-            })?;
-        if !native_snapshot_write_reg(snapshot, transfer_reg, value) {
-            return Err(RuntimeError::Unsupported(format!(
-                "native linux4k exclusive load could not write {transfer_reg}"
-            )));
-        }
-    } else {
-        let value = native_snapshot_read_reg(snapshot, transfer_reg).ok_or_else(|| {
-            RuntimeError::Unsupported(format!(
-                "native linux4k exclusive store could not read {transfer_reg}"
-            ))
-        })?;
-        let stored = memory
-            .exclusive_store(address, width, value, release, reservation)
-            .map_err(|error| {
-                RuntimeError::Unsupported(format!(
-                    "native linux4k exclusive store failed at 0x{address:x}: {error}"
-                ))
-            })?;
-        let status_reg = status_reg.ok_or_else(|| {
-            RuntimeError::Unsupported(format!(
-                "native linux4k exclusive store lacks status register for {instruction}"
-            ))
-        })?;
-        if !native_snapshot_write_reg(snapshot, status_reg, u64::from(!stored)) {
-            return Err(RuntimeError::Unsupported(format!(
-                "native linux4k exclusive store could not write {status_reg}"
-            )));
-        }
-    }
-    snapshot.pc = snapshot.pc.checked_add(4).ok_or_else(|| {
-        RuntimeError::Unsupported("native linux4k exclusive PC overflow".to_string())
-    })?;
-    Ok(())
-}
-
-fn emulate_linux4k_guarded_fault(
-    memory: &mut NativeMappedMemory,
-    snapshot: &mut NativeUcontextSnapshot,
-    reservation: &mut Option<NativeExclusiveReservation>,
-) -> Result<(), RuntimeError> {
-    let fault_address = if snapshot.fault_address != 0 {
-        snapshot.fault_address
-    } else {
-        snapshot.far
-    };
-    if !memory.linux4k_address_is_guarded(fault_address) {
-        return Err(RuntimeError::Unsupported(format!(
-            "native Darwin signal {} at 0x{fault_address:x} was not a guarded linux4k page (pc=0x{:x} sp=0x{:x} lr=0x{:x} x16=0x{:x} x17=0x{:x} x18=0x{:x} esr=0x{:x})",
-            snapshot.signal,
-            snapshot.pc,
-            snapshot.sp,
-            snapshot.x[30],
-            snapshot.x[16],
-            snapshot.x[17],
-            snapshot.x[18],
-            snapshot.esr
-        )));
-    }
-    let word = memory.read_u32(snapshot.pc)?;
-    let instruction = bad64::decode(word, snapshot.pc).map_err(|error| {
-        RuntimeError::Unsupported(format!(
-            "native linux4k guarded fault could not decode instruction 0x{word:08x} at 0x{:x}: {error}",
-            snapshot.pc
-        ))
-    })?;
-    if std::env::var_os("CARRICK_NATIVE_TRACE_SYSCALLS").is_some() {
-        child_write_stderr(
-            format!(
-                "native trace pid={} guarded pc=0x{:x} addr=0x{fault_address:x} esr=0x{:x} word=0x{word:08x} instruction={instruction}\n",
-                unsafe { libc::getpid() },
-                snapshot.pc,
-                snapshot.esr
-            )
-            .as_bytes(),
-        );
-    }
-    if matches!(
-        instruction.op(),
-        bad64::Op::LDADD
-            | bad64::Op::LDADDA
-            | bad64::Op::LDADDAB
-            | bad64::Op::LDADDAH
-            | bad64::Op::LDADDAL
-            | bad64::Op::LDADDALB
-            | bad64::Op::LDADDALH
-            | bad64::Op::LDADDB
-            | bad64::Op::LDADDH
-            | bad64::Op::LDADDL
-            | bad64::Op::LDADDLB
-            | bad64::Op::LDADDLH
-    ) {
-        return emulate_linux4k_guarded_atomic_add(memory, snapshot, &instruction, fault_address);
-    }
-    if matches!(
-        instruction.op(),
-        bad64::Op::LDAR
-            | bad64::Op::LDARB
-            | bad64::Op::LDARH
-            | bad64::Op::LDAPR
-            | bad64::Op::LDAPRB
-            | bad64::Op::LDAPRH
-            | bad64::Op::STLR
-            | bad64::Op::STLRB
-            | bad64::Op::STLRH
-            | bad64::Op::STLLR
-            | bad64::Op::STLLRB
-            | bad64::Op::STLLRH
-    ) {
-        return emulate_linux4k_guarded_ordered_atomic_access(
-            memory,
-            snapshot,
-            &instruction,
-            fault_address,
-        );
-    }
-    if matches!(
-        instruction.op(),
-        bad64::Op::LDAXR
-            | bad64::Op::LDAXRB
-            | bad64::Op::LDAXRH
-            | bad64::Op::LDXR
-            | bad64::Op::LDXRB
-            | bad64::Op::LDXRH
-            | bad64::Op::STLXR
-            | bad64::Op::STLXRB
-            | bad64::Op::STLXRH
-            | bad64::Op::STXR
-            | bad64::Op::STXRB
-            | bad64::Op::STXRH
-    ) {
-        return emulate_linux4k_guarded_exclusive_access(
-            memory,
-            snapshot,
-            reservation,
-            &instruction,
-            fault_address,
-        );
-    }
-    if matches!(instruction.op(), bad64::Op::LD1 | bad64::Op::ST1) {
-        return emulate_linux4k_guarded_vector_access(
-            memory,
-            snapshot,
-            &instruction,
-            fault_address,
-        );
-    }
-    if matches!(
-        instruction.op(),
-        bad64::Op::LDP | bad64::Op::LDNP | bad64::Op::LDPSW | bad64::Op::STP | bad64::Op::STNP
-    ) {
-        return emulate_linux4k_guarded_pair_access(memory, snapshot, &instruction, fault_address);
-    }
-    if let [
-        bad64::Operand::Reg {
-            reg: vector_reg,
-            arrspec: None,
-        },
-        memory_operand,
-    ] = instruction.operands()
-        && bad64_vector_index_and_width(*vector_reg).is_some()
-    {
-        return emulate_linux4k_guarded_vector_register_access(
-            memory,
-            snapshot,
-            &instruction,
-            *vector_reg,
-            *memory_operand,
-            fault_address,
-        );
-    }
-    let [transfer_operand, memory_operand] = instruction.operands() else {
-        return Err(RuntimeError::Unsupported(format!(
-            "native linux4k guarded fault does not support operands for {instruction} at 0x{:x}",
-            snapshot.pc
-        )));
-    };
-    let bad64::Operand::Reg {
-        reg: transfer_reg,
-        arrspec: None,
-    } = *transfer_operand
-    else {
-        return Err(RuntimeError::Unsupported(format!(
-            "native linux4k guarded fault requires a scalar GPR transfer for {instruction} at 0x{:x}",
-            snapshot.pc
-        )));
-    };
-    let transfer_width = bad64_transfer_width(transfer_reg).ok_or_else(|| {
-        RuntimeError::Unsupported(format!(
-            "native linux4k guarded fault does not support transfer register {transfer_reg} for {instruction}"
-        ))
-    })?;
-    let access =
-        decode_native_scalar_access(instruction.op(), transfer_width).ok_or_else(|| {
-            RuntimeError::Unsupported(format!(
-                "native linux4k guarded fault does not support instruction {instruction} at 0x{:x}",
-                snapshot.pc
-            ))
-        })?;
-    let (address, writeback) = decode_native_scalar_address(snapshot, *memory_operand)
-        .ok_or_else(|| {
-            RuntimeError::Unsupported(format!(
-                "native linux4k guarded fault does not support addressing for {instruction} at 0x{:x}",
-                snapshot.pc
-            ))
-        })?;
-    let access_end = address.checked_add(access.width as u64).ok_or_else(|| {
-        RuntimeError::Unsupported("native linux4k guarded access overflow".to_string())
-    })?;
-    if fault_address < address || fault_address >= access_end {
-        return Err(RuntimeError::Unsupported(format!(
-            "native linux4k guarded fault address 0x{fault_address:x} is outside {instruction} access 0x{address:x}..0x{access_end:x}"
-        )));
-    }
-    let write = matches!(access.kind, NativeScalarAccessKind::Store);
-    if !memory.linux4k_range_allows(address, access.width, write) {
-        return Err(RuntimeError::Unsupported(format!(
-            "native linux4k guarded {instruction} violates guest permissions at 0x{address:x}"
-        )));
-    }
-    if let Some((base, _)) = writeback
-        && bad64_gpr_index(base).map(|(index, _)| index)
-            == bad64_gpr_index(transfer_reg).map(|(index, _)| index)
-    {
-        return Err(RuntimeError::Unsupported(format!(
-            "native linux4k guarded fault rejects overlapping writeback for {instruction}"
-        )));
-    }
-
-    match access.kind {
-        NativeScalarAccessKind::Load { sign_extend } => {
-            let bytes = memory
-                .read_bytes_raw(address, access.width)
-                .map_err(|error| {
-                    RuntimeError::Unsupported(format!(
-                        "native linux4k guarded load failed at 0x{address:x}: {error}"
-                    ))
-                })?;
-            let value = native_load_value(&bytes, sign_extend, access.destination_width);
-            if !native_snapshot_write_reg(snapshot, transfer_reg, value) {
-                return Err(RuntimeError::Unsupported(format!(
-                    "native linux4k guarded fault could not write {transfer_reg}"
-                )));
-            }
-        }
-        NativeScalarAccessKind::Store => {
-            let value = native_snapshot_read_reg(snapshot, transfer_reg).ok_or_else(|| {
-                RuntimeError::Unsupported(format!(
-                    "native linux4k guarded fault could not read {transfer_reg}"
-                ))
-            })?;
-            memory
-                .write_bytes_raw(address, &value.to_le_bytes()[..access.width])
-                .map_err(|error| {
-                    RuntimeError::Unsupported(format!(
-                        "native linux4k guarded store failed at 0x{address:x}: {error}"
-                    ))
-                })?;
-        }
-    }
-    if let Some((base, value)) = writeback
-        && !native_snapshot_write_reg(snapshot, base, value)
-    {
-        return Err(RuntimeError::Unsupported(format!(
-            "native linux4k guarded fault could not update base register {base}"
-        )));
-    }
-    snapshot.pc = snapshot.pc.checked_add(4).ok_or_else(|| {
-        RuntimeError::Unsupported("native linux4k guarded PC overflow".to_string())
-    })?;
-    Ok(())
-}
-
 fn pipe_pair() -> Result<(RawFd, RawFd), RuntimeError> {
     let mut fds = [0; 2];
     let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
@@ -6813,27 +5632,6 @@ fn child_dup2_or_exit(from: RawFd, to: RawFd) {
     if rc < 0 {
         child_write_stderr(b"native Darwin child error: dup2 failed\n");
         unsafe { libc::_exit(125) };
-    }
-}
-
-fn child_write_stderr(bytes: &[u8]) {
-    let mut written = 0usize;
-    while written < bytes.len() {
-        let ptr = unsafe { bytes.as_ptr().add(written) };
-        let rc = unsafe {
-            libc::write(
-                libc::STDERR_FILENO,
-                ptr.cast::<libc::c_void>(),
-                bytes.len() - written,
-            )
-        };
-        if rc <= 0 {
-            break;
-        }
-        let Ok(n) = usize::try_from(rc) else {
-            break;
-        };
-        written = written.saturating_add(n);
     }
 }
 
@@ -8173,7 +6971,7 @@ mod tests {
             unsafe { (target_start as *mut u8).write(0x5e) };
 
             let error = memory
-                .prepare_exec_mapping(&target, &plan)
+                .prepare_exec_mapping(&target, plan.page_geometry)
                 .err()
                 .expect("target-only direct collision must fail before retirement");
             assert!(
@@ -8547,13 +7345,13 @@ mod tests {
             let source_mode = memory.address_mode();
             let source_process = memory.dsr_process_translator().expect("source translator");
             let prepared = memory
-                .prepare_exec_mapping(&target_image, &plan)
+                .prepare_exec_mapping(&target_image, plan.page_geometry)
                 .expect("preselect replacement layout");
             let prepared_mode = prepared.native_layout.address_mode();
             let prepared_process = Arc::clone(&prepared.process_translator);
 
             memory
-                .replace_image(&target_image, &[], &plan, None, prepared)
+                .replace_image(&target_image, &[], plan.page_geometry, None, prepared)
                 .expect("replace lifecycle image");
 
             let expected_target_biased = matches!(target, LifecycleImageKind::LowExec);
@@ -8658,11 +7456,11 @@ mod tests {
 
             let prepared = shared
                 .read()
-                .prepare_exec_mapping(&target_image, &plan)
+                .prepare_exec_mapping(&target_image, plan.page_geometry)
                 .expect("preselect replacement layout");
 
             shared
-                .replace_image(&target_image, &[], &plan, None, prepared)
+                .replace_image(&target_image, &[], plan.page_geometry, None, prepared)
                 .expect("replace lifecycle image");
 
             // The execve-updated fields must be visible through the
@@ -8728,7 +7526,7 @@ mod tests {
             .expect("build target beyond biased ceiling");
 
             let error = memory
-                .prepare_exec_mapping(&invalid_target, &plan)
+                .prepare_exec_mapping(&invalid_target, plan.page_geometry)
                 .err()
                 .expect("target beyond biased ceiling must fail before retirement");
             assert!(
@@ -8762,7 +7560,7 @@ mod tests {
             let guest = source.regions()[0].start + 0x80;
 
             let prepared = memory
-                .prepare_exec_mapping(&target, &plan)
+                .prepare_exec_mapping(&target, plan.page_geometry)
                 .expect("prepare biased replacement before sibling teardown");
             assert!(matches!(
                 prepared.native_layout.address_mode(),
@@ -8843,7 +7641,7 @@ mod tests {
             if child == 0 {
                 NATIVE_FORKED_GUEST_CHILD.store(true, std::sync::atomic::Ordering::Release);
                 let prepared = memory
-                    .prepare_exec_mapping(&target, &plan)
+                    .prepare_exec_mapping(&target, plan.page_geometry)
                     .expect("prepare fork-child replacement without allocating a translator");
                 let prepared_mode = prepared.native_layout.address_mode();
                 // The inherited Carrick-owned aperture is reusable authority;
@@ -8856,7 +7654,7 @@ mod tests {
                     unsafe { libc::_exit(2) };
                 }
                 if memory
-                    .replace_image(&target, &[], &plan, None, prepared)
+                    .replace_image(&target, &[], plan.page_geometry, None, prepared)
                     .is_err()
                 {
                     unsafe { libc::_exit(3) };
@@ -10233,6 +9031,7 @@ mod tests {
             let image = AddressSpace::from_regions(0, Vec::new())
                 .expect("empty native test image should be valid");
             let rejected = NativeMappedMemory::map(&image, layout, page_size, page_size)
+                .map_err(RuntimeError::from)
                 .and_then(|mut memory| {
                     let write_exec = crate::linux_abi::LINUX_PROT_READ
                         | crate::linux_abi::LINUX_PROT_WRITE
@@ -10274,6 +9073,7 @@ mod tests {
             let image = AddressSpace::from_regions(0, Vec::new())
                 .expect("empty native test image should be valid");
             let accepted = NativeMappedMemory::map(&image, layout, page_size, page_size)
+                .map_err(RuntimeError::from)
                 .and_then(|mut memory| {
                     let write_exec = crate::linux_abi::LINUX_PROT_READ
                         | crate::linux_abi::LINUX_PROT_WRITE
@@ -10281,11 +9081,13 @@ mod tests {
                     memory
                         .protect_range(layout.mmap_base, page_size as usize, write_exec)
                         .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
-                    memory.resolve_native16k_write_exec_fault(
-                        layout.mmap_base,
-                        NATIVE_DARWIN_PIE_BASE,
-                        (0x25_u64 << 26) | (1 << 6) | 0x04,
-                    )
+                    memory
+                        .resolve_native16k_write_exec_fault(
+                            layout.mmap_base,
+                            NATIVE_DARWIN_PIE_BASE,
+                            (0x25_u64 << 26) | (1 << 6) | 0x04,
+                        )
+                        .map_err(RuntimeError::from)
                 })
                 .unwrap_or(true);
             unsafe { libc::_exit(i32::from(accepted)) };
@@ -10312,6 +9114,7 @@ mod tests {
             let image = AddressSpace::from_regions(0, Vec::new())
                 .expect("empty native test image should be valid");
             let accepted = NativeMappedMemory::map(&image, layout, page_size, page_size)
+                .map_err(RuntimeError::from)
                 .and_then(|mut memory| {
                     let write_exec = crate::linux_abi::LINUX_PROT_READ
                         | crate::linux_abi::LINUX_PROT_WRITE
@@ -10319,20 +9122,25 @@ mod tests {
                     memory
                         .protect_range(layout.mmap_base, page_size as usize, write_exec)
                         .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
-                    if !memory.resolve_native16k_write_exec_fault(
-                        layout.mmap_base,
-                        NATIVE_DARWIN_PIE_BASE,
-                        (0x25_u64 << 26) | (1 << 6) | 0x0f,
-                    )? {
+                    if !memory
+                        .resolve_native16k_write_exec_fault(
+                            layout.mmap_base,
+                            NATIVE_DARWIN_PIE_BASE,
+                            (0x25_u64 << 26) | (1 << 6) | 0x0f,
+                        )
+                        .map_err(RuntimeError::from)?
+                    {
                         return Err(RuntimeError::Unsupported(
                             "permission write fault was not resolved".to_string(),
                         ));
                     }
-                    memory.resolve_native16k_write_exec_fault(
-                        layout.mmap_base,
-                        layout.mmap_base,
-                        (0x21_u64 << 26) | 0x04,
-                    )
+                    memory
+                        .resolve_native16k_write_exec_fault(
+                            layout.mmap_base,
+                            layout.mmap_base,
+                            (0x21_u64 << 26) | 0x04,
+                        )
+                        .map_err(RuntimeError::from)
                 })
                 .unwrap_or(true);
             unsafe { libc::_exit(i32::from(accepted)) };
@@ -10361,6 +9169,7 @@ mod tests {
             let accepted = NativeMappedMemory::map_with_translator(
                 &image, layout, page_size, page_size, None, None,
             )
+            .map_err(RuntimeError::from)
             .and_then(|mut memory| {
                 let write_exec = crate::linux_abi::LINUX_PROT_READ
                     | crate::linux_abi::LINUX_PROT_WRITE
@@ -10396,6 +9205,7 @@ mod tests {
             let image = AddressSpace::from_regions(0, Vec::new())
                 .expect("empty native test image should be valid");
             let rejected = NativeMappedMemory::map(&image, layout, page_size, page_size)
+                .map_err(RuntimeError::from)
                 .and_then(|mut memory| {
                     let write_exec = crate::linux_abi::LINUX_PROT_READ
                         | crate::linux_abi::LINUX_PROT_WRITE
@@ -10432,6 +9242,7 @@ mod tests {
             let image = AddressSpace::from_regions(0, Vec::new())
                 .expect("empty native test image should be valid");
             let restored = NativeMappedMemory::map(&image, layout, page_size, page_size)
+                .map_err(RuntimeError::from)
                 .and_then(|mut memory| {
                     memory
                         .write_bytes_raw(layout.mmap_base, &SVC_0.to_le_bytes())
@@ -10514,6 +9325,7 @@ mod tests {
             let preserved = NativeMappedMemory::map_with_translator(
                 &image, layout, page_size, page_size, None, None,
             )
+            .map_err(RuntimeError::from)
             .and_then(|mut memory| {
                 memory
                     .protect_range(layout.mmap_base, page_size as usize, 0)
@@ -10528,7 +9340,9 @@ mod tests {
                         crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_EXEC,
                     )
                     .map_err(|err| RuntimeError::Unsupported(format!("test protect: {err}")))?;
-                memory.read_u32(layout.mmap_base)
+                memory
+                    .read_u32(layout.mmap_base)
+                    .map_err(RuntimeError::from)
             })
             .is_ok_and(|word| word == SVC_0);
             unsafe { libc::_exit(i32::from(!preserved)) };
@@ -11390,6 +10204,7 @@ mod tests {
             let image = AddressSpace::from_regions(0, Vec::new())
                 .expect("empty native test image should be valid");
             let guarded = NativeMappedMemory::map(&image, layout, host_page_size, linux_page_size)
+                .map_err(RuntimeError::from)
                 .and_then(|mut memory| {
                     let address = layout.mmap_base + linux_page_size;
                     memory
@@ -11461,6 +10276,7 @@ mod tests {
             let image = AddressSpace::from_regions(0, Vec::new())
                 .expect("empty native test image should be valid");
             let emulated = NativeMappedMemory::map(&image, layout, host_page_size, linux_page_size)
+                .map_err(RuntimeError::from)
                 .and_then(|mut memory| {
                     let pc = layout.mmap_base;
                     let address = layout.mmap_base + host_page_size + linux_page_size;
@@ -11562,6 +10378,7 @@ mod tests {
             let image = AddressSpace::from_regions(0, Vec::new())
                 .expect("empty native test image should be valid");
             let emulated = NativeMappedMemory::map(&image, layout, host_page_size, linux_page_size)
+                .map_err(RuntimeError::from)
                 .and_then(|mut memory| {
                     let pc = layout.mmap_base;
                     let address = layout.mmap_base + host_page_size + linux_page_size;
@@ -11658,6 +10475,7 @@ mod tests {
             let image = AddressSpace::from_regions(0, Vec::new())
                 .expect("empty native test image should be valid");
             let emulated = NativeMappedMemory::map(&image, layout, host_page_size, linux_page_size)
+                .map_err(RuntimeError::from)
                 .and_then(|mut memory| {
                     let pc = layout.mmap_base;
                     let address = layout.mmap_base + host_page_size + linux_page_size;
@@ -11737,6 +10555,7 @@ mod tests {
             let image = AddressSpace::from_regions(0, Vec::new())
                 .expect("empty native test image should be valid");
             let zeroed = NativeMappedMemory::map(&image, layout, page_size, page_size)
+                .map_err(RuntimeError::from)
                 .and_then(|mut memory| {
                     memory
                         .write_bytes_unchecked(layout.mmap_base, &[0xff; 16])
@@ -13124,7 +11943,7 @@ mod tests {
                 native_memory_layout(),
                 plan.page_geometry.host_page_size,
                 plan.page_geometry.linux_page_size,
-                &plan,
+                plan.page_geometry,
                 &no_relocations,
             )
             .expect("map anonymous fixture");
@@ -13143,7 +11962,7 @@ mod tests {
             let prepared = NativeMappedMemory::map_prepared_for_plan(
                 &validated,
                 native_memory_layout(),
-                &plan,
+                plan.page_geometry,
             )
             .expect("map prepared fixture");
             assert_eq!(validated.image.entry(), image.entry());
@@ -13207,7 +12026,7 @@ mod tests {
                 native_memory_layout(),
                 plan.page_geometry.host_page_size,
                 plan.page_geometry.linux_page_size,
-                &plan,
+                plan.page_geometry,
                 &relocations,
             )
             .expect("map relocated anonymous fixture");
@@ -13228,7 +12047,7 @@ mod tests {
             let prepared = NativeMappedMemory::map_prepared_for_plan(
                 &validated,
                 native_memory_layout(),
-                &plan,
+                plan.page_geometry,
             )
             .expect("map relocated prepared fixture");
             let prepared_word = u64::from_le_bytes(
@@ -13272,7 +12091,11 @@ mod tests {
             );
             assert!(take_native_test_supplemental_rollbacks().is_empty());
             set_native_prepared_mapping_failpoint(Some(failpoint));
-            let error = match NativeMappedMemory::map_prepared_for_plan(&validated, layout, &plan) {
+            let error = match NativeMappedMemory::map_prepared_for_plan(
+                &validated,
+                layout,
+                plan.page_geometry,
+            ) {
                 Ok(_) => panic!("prepared mapping failpoint must fail"),
                 Err(error) => error,
             };
@@ -13355,7 +12178,11 @@ mod tests {
                 validated_prepared_mapping_fixture(&image, &[], plan.page_geometry.host_page_size);
             assert!(take_native_test_supplemental_rollbacks().is_empty());
             set_native_prepared_mapping_failpoint(Some(NativePreparedMappingFailpoint::VvarStamp));
-            let error = match NativeMappedMemory::map_prepared_for_plan(&validated, layout, &plan) {
+            let error = match NativeMappedMemory::map_prepared_for_plan(
+                &validated,
+                layout,
+                plan.page_geometry,
+            ) {
                 Ok(_) => panic!("biased late failpoint must fail"),
                 Err(error) => error,
             };
@@ -13393,7 +12220,7 @@ mod tests {
             )
             .expect("map Direct replacement source");
             let prepared = memory
-                .prepare_exec_mapping(&target, &plan)
+                .prepare_exec_mapping(&target, plan.page_geometry)
                 .expect("reserve Direct replacement target");
             assert_eq!(
                 prepared.native_layout.address_mode(),
@@ -13422,8 +12249,8 @@ mod tests {
                 .replace_image(
                     &target,
                     &[],
-                    &plan,
-                    Some(crate::thread::ThreadId::main_from_host_pid()),
+                    plan.page_geometry,
+                    Some(crate::thread::ThreadId::main_from_host_pid().raw()),
                     prepared,
                 )
                 .expect_err("Direct replacement late failpoint must fail");
@@ -13461,7 +12288,7 @@ mod tests {
             )
             .expect("map biased replacement source");
             let prepared = memory
-                .prepare_exec_mapping(&target, &plan)
+                .prepare_exec_mapping(&target, plan.page_geometry)
                 .expect("adopt biased replacement aperture");
             assert!(matches!(
                 prepared.native_layout.address_mode(),
@@ -13480,8 +12307,8 @@ mod tests {
             let error = match memory.replace_image(
                 &target,
                 &[],
-                &plan,
-                Some(crate::thread::ThreadId::main_from_host_pid()),
+                plan.page_geometry,
+                Some(crate::thread::ThreadId::main_from_host_pid().raw()),
                 prepared,
             ) {
                 Ok(()) => panic!("biased replacement late failpoint must fail"),
@@ -13769,7 +12596,7 @@ mod tests {
                 NativeMappedMemory::map_prepared_for_plan(
                     &validated,
                     native_memory_layout(),
-                    &plan,
+                    plan.page_geometry,
                 )
                 .is_err()
             );
@@ -13799,7 +12626,7 @@ mod tests {
                 NativeMappedMemory::map_prepared_for_plan(
                     &validated,
                     native_memory_layout(),
-                    &plan,
+                    plan.page_geometry,
                 )
                 .is_err()
             );

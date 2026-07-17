@@ -11,6 +11,10 @@
 //! from the runtime's csrc/native_darwin.c and are not linkable from the
 //! arch crate before the host-seam slice (M0.6).
 
+// `allow(unused_imports)`: the runtime LIB no longer names `dsr::gateway::*`
+// since the translator orchestration moved to the arch crate; the re-export
+// stays for the oracle and the gateway microbenchmarks below.
+#[allow(unused_imports)]
 pub(in crate::native_darwin) use carrick_dsr_aarch64::gateway::*;
 
 #[cfg(test)]

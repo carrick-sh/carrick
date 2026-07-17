@@ -97,13 +97,19 @@ sync with `rustup update stable`.
 
 ## Repository map
 
-25-crate Cargo workspace under [`crates/`](crates/) (see
+27-crate Cargo workspace under [`crates/`](crates/) (see
 [`crates/README.md`](crates/README.md)). Dependency direction:
 `cli → engine → {image, runtime} → spec`. The HAL/platform split
 ([`docs/hal.md`](docs/hal.md)) separates platform-neutral contracts from
 per-VMM and per-host implementations so KVM/bhyve/NVMM can share the runtime
 without pulling in HVF/applevisor. Use the `carrick-vmm-*` names for VMM crates
 (`carrick-vmm-hvf`, not the historical `carrick-hvf`).
+
+**Native (DSR) backend** (no-VMM same-ISA translation; extraction staged per
+[`docs/superpowers/specs/2026-07-17-native-backend-portability-seams-design.md`](docs/superpowers/specs/2026-07-17-native-backend-portability-seams-design.md))
+- `carrick-dsr` — platform-neutral DSR core: translation cache + publication index behind the `NativeHostJit` host seam, profiling census, page-geometry vocabulary, probe-sink seam, test hooks. Kept `ring`/`usdt`-free so a non-mac rig can darwin-cross-check it.
+- `carrick-dsr-aarch64` — the AArch64 guest-ISA lane: bad64/dynasmrt decode/emit, block planner + exclusive fusion, gateway (`gateway_aarch64.S`), counter virtualization, artifact store, mapped memory + translator. Compiles on every host; only the gateway's assembled surface is macos/aarch64-gated.
+- Integration glue (thread loop, dispatch adapter, signal lowering, exec capsule) still lives in `carrick-runtime/src/native_darwin*` pending the lane seam; a `carrick-dsr-x86` + `carrick-native-{darwin,freebsd}` split is the planned FreeBSD/amd64 bring-up path.
 
 **VMM backends** (hypervisor implementations over `carrick-hal`)
 - `carrick-vmm-hvf` — macOS Hypervisor.framework backend; the mature one (trap loop, vCPU cluster).

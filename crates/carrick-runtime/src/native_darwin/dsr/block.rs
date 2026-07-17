@@ -4,52 +4,22 @@
 //! docs/superpowers/specs/2026-07-17-native-backend-portability-seams-design.md);
 //! re-exported so existing `super::block::*` call paths resolve unchanged.
 //!
-//! `plan_block(memory: &NativeMappedMemory, ...)` could not move this slice
-//! (`NativeMappedMemory` is still a runtime type): it stays here as a thin
-//! wrapper composing the moved `plan_with_reader` core with the runtime
-//! memory-reader closure. The three production-biased planner tests that
-//! construct a live `NativeMappedMemory` stay with it.
+//! `plan_block(memory: &NativeMappedMemory, ...)` moved with the memory
+//! model in the extraction-completing slice (`NativeMappedMemory` now lives
+//! in the arch crate) and is covered by the glob re-export above; the three
+//! production-biased planner tests that construct a live
+//! `NativeMappedMemory` stay here (they run through the Darwin host JIT).
 
+// `allow(unused_imports)`: since the translator orchestration moved to the
+// arch crate the runtime LIB no longer names `dsr::block::*`; the re-export
+// stays for the still-runtime-resident planner tests and the oracle.
+#[allow(unused_imports)]
 pub(in crate::native_darwin) use carrick_dsr_aarch64::block::*;
 
-use super::super::NativeMappedMemory;
+#[cfg(test)]
 use super::types::{CodeGeneration, DsrError};
+#[cfg(test)]
 use carrick_guest_mem::GuestVa;
-
-pub(super) fn plan_block(
-    memory: &NativeMappedMemory,
-    start: GuestVa,
-    generation: CodeGeneration,
-    max_instructions: usize,
-) -> Result<BlockPlan, DsrError> {
-    // Direct mode keeps its existing fused execution. Biased execution stays
-    // fail-closed until forced asynchronous recovery proves that every guest
-    // register and NZCV mutation in an accepted region can be rolled back.
-    // The disabled policy still measures eligible sites and exercises the
-    // typed emitter in focused tests without exposing incomplete recovery to
-    // production guests.
-    let fusion_policy = match memory.address_mode() {
-        super::super::address::NativeAddressMode::Direct => ExclusiveFusionPolicy::Direct,
-        super::super::address::NativeAddressMode::Biased { .. } => {
-            ExclusiveFusionPolicy::BiasedDisabled
-        }
-    };
-    plan_with_reader(
-        start,
-        generation,
-        max_instructions,
-        memory.linux_page_size,
-        fusion_policy,
-        |pc| {
-            memory
-                .read_u32(pc.raw())
-                .map_err(|error| DsrError::MemoryRead {
-                    pc: pc.raw(),
-                    detail: error.to_string(),
-                })
-        },
-    )
-}
 
 #[cfg(test)]
 mod tests {

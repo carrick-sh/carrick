@@ -109,23 +109,11 @@ pub(crate) fn el0_fault_signal(esr: u64) -> Option<(i32, i32)> {
     }
 }
 
-/// Map an EL0 synchronous *debug* exception `ESR_EL1` to the Linux
-/// `(SIGTRAP, si_code)` the kernel would deliver, or `None` if it isn't a debug
-/// class (leaving it to `el0_fault_signal`).
-pub(crate) fn el0_debug_signal(esr: u64) -> Option<(i32, i32)> {
-    const SIGTRAP: i32 = 5;
-    const TRAP_BRKPT: i32 = 1; // software breakpoint (BRK)
-    const TRAP_TRACE: i32 = 2; // process trace trap (single-step)
-    const TRAP_HWBKPT: i32 = 4; // hardware breakpoint/watchpoint
-    let ec = (esr >> 26) & 0x3f;
-    match ec {
-        0x3c => Some((SIGTRAP, TRAP_BRKPT)),         // BRK (AArch64)
-        0x32 | 0x33 => Some((SIGTRAP, TRAP_TRACE)),  // software step
-        0x30 | 0x31 => Some((SIGTRAP, TRAP_HWBKPT)), // HW breakpoint
-        0x34 | 0x35 => Some((SIGTRAP, TRAP_HWBKPT)), // watchpoint
-        _ => None,
-    }
-}
+// `el0_debug_signal` (a pure AArch64 ESR_EL1 architectural fact) moved to
+// `carrick_dsr_aarch64::esr` with the DSR translator extraction (its exit
+// dispatch is a second consumer); re-exported so the HVF lowering below and
+// every `el0_debug_signal` call path resolve unchanged.
+pub(crate) use carrick_dsr_aarch64::esr::el0_debug_signal;
 
 /// Upgrade `SEGV_MAPERR` to `SEGV_ACCERR` when Carrick's protection metadata
 /// says the faulting VA belongs to a live mapping that denies the access.

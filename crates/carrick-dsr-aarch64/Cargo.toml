@@ -19,9 +19,13 @@ default = []
 test-hooks = ["carrick-dsr/test-hooks"]
 
 [dependencies]
+carrick-abi = { path = "../carrick-abi" }
 carrick-dsr = { path = "../carrick-dsr" }
 carrick-guest-mem = { path = "../carrick-guest-mem" }
 carrick-host = { path = "../carrick-host" }
+carrick-mem = { path = "../carrick-mem" }
+parking_lot.workspace = true
+tracing.workspace = true
 # bad64/dynasmrt are UNCONDITIONAL: both are pure Rust and compile on every
 # host, which is the point of this crate -- the AArch64 translator builds
 # everywhere; only the gateway's assembled/linked half (gateway_aarch64.S and
@@ -41,6 +45,15 @@ thiserror.workspace = true
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
 # Only the commpage timebase-mode read (counter.rs) touches Mach APIs.
 mach2.workspace = true
+
+[dev-dependencies]
+# Self-referential feature enablement for the crate's OWN test builds: the
+# test-hooks state in carrick-dsr sits behind `cfg(any(test, feature =
+# "test-hooks"))` IN CARRICK-DSR, and cross-crate `cfg(test)` does not
+# compose -- so the dev-dep turns the feature on whenever this crate's tests
+# build (cargo feature unification), exactly the pattern carrick-runtime
+# uses (see carrick-dsr/src/test_hooks.rs).
+carrick-dsr = { path = "../carrick-dsr", features = ["test-hooks"] }
 
 [build-dependencies]
 # UNCONDITIONAL build-dependency on purpose: a `[target.'cfg(...)'.build-dependencies]`
