@@ -601,8 +601,14 @@ where
             }
             Some(X86ExitStatus::Indirect) => match exit {
                 X86Exit::ControlFlow { va, .. } => {
-                    let branch = read_guest(va);
-                    match cflow::resolve(&branch, va, &mut snapshot) {
+                    // Read the branch bytes as a borrowed slice straight from
+                    // the guest image (guest VA == host VA) — no per-branch
+                    // allocation on this hot path (dtrace flagged the Vec copy).
+                    let hi = (va + 16).min(span_end);
+                    // SAFETY: [va, hi) is inside the mapped image span.
+                    let branch =
+                        unsafe { std::slice::from_raw_parts(va as *const u8, (hi - va) as usize) };
+                    match cflow::resolve(branch, va, &mut snapshot) {
                         Ok(t) => next = t,
                         Err(e) => {
                             fault_detail = Some(format!("cflow resolve at 0x{va:x}: {e}"));
