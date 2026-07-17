@@ -16,6 +16,11 @@ mod oracle;
 pub(super) mod profile;
 pub(super) mod types;
 
+#[cfg(target_os = "macos")]
+pub(super) fn mach_absolute_time_ticks() -> u64 {
+    counter::mach_absolute_time_ticks()
+}
+
 const ARTIFACT_KEY_PREFIX_INSTRUCTIONS: usize = 16;
 
 #[derive(Debug)]
@@ -2602,8 +2607,8 @@ mod tests {
 
     use super::decode::classify;
     use super::types::{
-        DirectKind, IndirectKind, InstAction, MemoryBase, MemoryClass, MemoryVirtualization,
-        MemoryWriteback, PcRelativeKind, SensitiveKind,
+        CounterDestination, CounterRead, DirectKind, IndirectKind, InstAction, MemoryBase,
+        MemoryClass, MemoryVirtualization, MemoryWriteback, PcRelativeKind, SensitiveKind,
     };
     use carrick_guest_mem::{GuestMemory, GuestVa};
     use proptest::prelude::*;
@@ -4635,25 +4640,28 @@ mod tests {
     fn dsr_counter_register_reads_execute_directly() {
         assert!(matches!(
             classify(0xd53b_e042, PC),
-            Ok(InstAction::Copy(0xd53b_e042))
+            Ok(InstAction::CounterRead(CounterRead {
+                destination: CounterDestination::Gpr(2)
+            }))
         ));
         assert!(matches!(
-            classify(0xd53b_e002, PC),
-            Ok(InstAction::Copy(0xd53b_e002))
+            classify(0xd53b_e05f, PC),
+            Ok(InstAction::CounterRead(CounterRead {
+                destination: CounterDestination::Discard
+            }))
         ));
+        assert!(matches!(classify(0xd53b_e002, PC), Ok(InstAction::Copy(_))));
         assert!(matches!(
             classify(0xd53b_e052, PC),
-            Ok(InstAction::VirtualizedX18 {
-                word: 0xd53b_e052,
-                ..
-            })
+            Ok(InstAction::CounterRead(CounterRead {
+                destination: CounterDestination::Gpr(18)
+            }))
         ));
         assert!(matches!(
             classify(0xd53b_e05c, PC),
-            Ok(InstAction::VirtualizedX28 {
-                word: 0xd53b_e05c,
-                ..
-            })
+            Ok(InstAction::CounterRead(CounterRead {
+                destination: CounterDestination::Gpr(28)
+            }))
         ));
     }
 

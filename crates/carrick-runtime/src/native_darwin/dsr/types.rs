@@ -177,6 +177,17 @@ pub(super) struct MemoryAccess {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CounterDestination {
+    Gpr(u8),
+    Discard,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct CounterRead {
+    pub(super) destination: CounterDestination,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::native_darwin) enum SensitiveKind {
     /// AArch64 exclusive load/store lowered at a typed DSR boundary.  A DSR
     /// block transition performs host stores, so the hardware reservation
@@ -184,6 +195,7 @@ pub(in crate::native_darwin) enum SensitiveKind {
     Exclusive(u32),
     ReadTpidr,
     WriteTpidr,
+    ReadCounter,
     ReadCtr,
     ReadDczid,
     DcZva,
@@ -197,6 +209,7 @@ impl SensitiveKind {
             Self::Exclusive(_) => super::profile::SensitiveClass::Exclusive,
             Self::ReadTpidr => super::profile::SensitiveClass::ReadTpidr,
             Self::WriteTpidr => super::profile::SensitiveClass::WriteTpidr,
+            Self::ReadCounter => super::profile::SensitiveClass::ReadCounter,
             Self::ReadCtr => super::profile::SensitiveClass::ReadCtr,
             Self::ReadDczid => super::profile::SensitiveClass::ReadDczid,
             Self::DcZva => super::profile::SensitiveClass::DcZva,
@@ -310,6 +323,7 @@ pub(in crate::native_darwin) struct ExclusiveRegionExit {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum InstAction {
     Copy(u32),
+    CounterRead(CounterRead),
     Memory(MemoryAccess),
     VirtualizedX18 {
         word: u32,

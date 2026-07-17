@@ -79,6 +79,7 @@ pub(in crate::native_darwin) enum SensitiveClass {
     Exclusive,
     ReadTpidr,
     WriteTpidr,
+    ReadCounter,
     ReadCtr,
     ReadDczid,
     DcZva,
@@ -87,10 +88,11 @@ pub(in crate::native_darwin) enum SensitiveClass {
 }
 
 impl SensitiveClass {
-    pub(super) const ALL: [Self; 8] = [
+    pub(super) const ALL: [Self; 9] = [
         Self::Exclusive,
         Self::ReadTpidr,
         Self::WriteTpidr,
+        Self::ReadCounter,
         Self::ReadCtr,
         Self::ReadDczid,
         Self::DcZva,
@@ -109,6 +111,7 @@ impl SensitiveClass {
             Self::Exclusive => "exclusive",
             Self::ReadTpidr => "read-tpidr",
             Self::WriteTpidr => "write-tpidr",
+            Self::ReadCounter => "read-counter",
             Self::ReadCtr => "read-ctr",
             Self::ReadDczid => "read-dczid",
             Self::DcZva => "dc-zva",
@@ -122,6 +125,7 @@ impl SensitiveClass {
             Self::Exclusive => "exclusive",
             Self::ReadTpidr => "read_tpidr",
             Self::WriteTpidr => "write_tpidr",
+            Self::ReadCounter => "read_counter",
             Self::ReadCtr => "read_ctr",
             Self::ReadDczid => "read_dczid",
             Self::DcZva => "dc_zva",
@@ -1600,7 +1604,11 @@ mod tests {
             SensitiveClass::from(SensitiveKind::DcZva).as_str(),
             "dc-zva"
         );
-        assert_eq!(SensitiveClass::ALL.len(), 8);
+        assert_eq!(
+            SensitiveClass::from(SensitiveKind::ReadCounter).as_str(),
+            "read-counter"
+        );
+        assert_eq!(SensitiveClass::ALL.len(), 9);
     }
 
     #[test]

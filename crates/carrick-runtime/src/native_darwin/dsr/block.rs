@@ -3,11 +3,13 @@
 use carrick_guest_mem::GuestVa;
 
 use super::super::NativeMappedMemory;
+use super::counter::{self, HostCounterSource};
 use super::decode;
 use super::types::{
-    BiasedExclusiveScratch, CodeGeneration, DirectExit, DirectKind, DsrError, DsrScratchGpr,
-    ExclusiveFusionDisposition, ExclusiveFusionRejection, ExclusiveFusionSite, ExclusiveRegionExit,
-    IndirectExit, InstAction, MemoryAccess, MemoryBase, SensitiveExit, SensitiveKind,
+    BiasedExclusiveScratch, CodeGeneration, CounterDestination, CounterRead, DirectExit,
+    DirectKind, DsrError, DsrScratchGpr, ExclusiveFusionDisposition, ExclusiveFusionRejection,
+    ExclusiveFusionSite, ExclusiveRegionExit, IndirectExit, InstAction, MemoryAccess, MemoryBase,
+    SensitiveExit, SensitiveKind,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -133,6 +135,26 @@ fn plan_with_reader(
     max_instructions: usize,
     page_size: u64,
     fusion_policy: ExclusiveFusionPolicy,
+    read: impl FnMut(GuestVa) -> Result<u32, DsrError>,
+) -> Result<BlockPlan, DsrError> {
+    plan_with_reader_for_counter_source(
+        start,
+        generation,
+        max_instructions,
+        page_size,
+        fusion_policy,
+        counter::host_counter_source(),
+        read,
+    )
+}
+
+fn plan_with_reader_for_counter_source(
+    start: GuestVa,
+    generation: CodeGeneration,
+    max_instructions: usize,
+    page_size: u64,
+    fusion_policy: ExclusiveFusionPolicy,
+    counter_source: HostCounterSource,
     mut read: impl FnMut(GuestVa) -> Result<u32, DsrError>,
 ) -> Result<BlockPlan, DsrError> {
     if max_instructions == 0 {
@@ -256,7 +278,29 @@ fn plan_with_reader(
             }
         }
         let exit = match action {
+            InstAction::CounterRead(CounterRead { destination })
+                if counter::counter_word(
+                    counter_source,
+                    match destination {
+                        CounterDestination::Gpr(index) => u32::from(index),
+                        CounterDestination::Discard => 31,
+                    },
+                )
+                .is_none() =>
+            {
+                Some(PlannedExit::Sensitive {
+                    guest: pc,
+                    word,
+                    exit: SensitiveExit {
+                        kind: SensitiveKind::ReadCounter,
+                        register: decode::counter_register(word, pc, destination)?,
+                        resume: next,
+                    },
+                    fusion: None,
+                })
+            }
             InstAction::Copy(_)
+            | InstAction::CounterRead(_)
             | InstAction::Memory(_)
             | InstAction::PcRelative(_)
             | InstAction::VirtualizedX18 { .. }
@@ -625,6 +669,7 @@ fn analyze_exclusive_region(
                 // itself a memory access that would break the exclusive pair's
                 // forward-progress guarantee. Fall back to the trap path.
                 InstAction::Memory(_)
+                | InstAction::CounterRead(_)
                 | InstAction::Sensitive(_)
                 | InstAction::Syscall { .. }
                 | InstAction::VirtualizedX18 { .. }
@@ -724,6 +769,7 @@ fn analyze_exclusive_region(
 
 #[cfg(test)]
 mod tests {
+    use super::super::counter::HostCounterSource;
     use super::*;
 
     fn plan_words(
@@ -754,6 +800,43 @@ mod tests {
         )
         .expect("plan test block");
         (plan, reads)
+    }
+
+    #[test]
+    fn counter_fallback_terminates_at_sensitive_exit() {
+        let start = GuestVa(0x4800);
+        let mut reads = 0;
+        let plan = plan_with_reader_for_counter_source(
+            start,
+            CodeGeneration::INITIAL,
+            16,
+            0x1000,
+            ExclusiveFusionPolicy::BiasedDisabled,
+            HostCounterSource::MachAbsoluteTime,
+            |pc| {
+                reads += 1;
+                assert_eq!(pc, start);
+                Ok(0xd53b_e042)
+            },
+        )
+        .expect("plan counter fallback");
+
+        assert_eq!(reads, 1);
+        assert!(plan.instructions.is_empty());
+        assert_eq!(plan.end, GuestVa(0x4804));
+        assert!(matches!(
+            plan.exit,
+            PlannedExit::Sensitive {
+                guest,
+                word: 0xd53b_e042,
+                exit: SensitiveExit {
+                    kind: SensitiveKind::ReadCounter,
+                    register: Some(bad64::Reg::X2),
+                    resume,
+                },
+                fusion: None,
+            } if guest == start && resume == GuestVa(0x4804)
+        ));
     }
 
     #[test]
