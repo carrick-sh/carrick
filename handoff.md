@@ -37,7 +37,10 @@ What exists now:
 - carrick-runtime keeps integration glue (thread loop, dispatch adapter,
   signal lowering, exec capsule, oracle + JIT-entangled test suites) behind
   re-export shims; `darwin_jit.rs` holds the transitional DarwinHostJit.
-- platform-freebsd census: 432 errors at session start -> **24 lib errors**,
+- platform-freebsd: 432 errors at session start -> **BUILD + CLIPPY GREEN**
+  (commit 9ac8fe92; carrick binary executes on FreeBSD; runtime lib tests 562
+  pass / 5 pre-existing lane gaps / 3 native tests hang pending the real
+  host shim). The former 24-error tail below is FIXED — kept for context:
   all of them the M0.8 integration tail: native_exec_capsule (12+2, macOS
   module gate), host_signal stub gaps (publish_process_signal_with_wake,
   install_default_handlers, hold_signal_locks_for_fork), vcpu_kick ×2,
