@@ -245,6 +245,30 @@ service Sensitive kinds (rdtsc/cpuid host passthrough is honest same-ISA), (d)
 flip the page_profile FreeBSD/amd64 arm (4k host page — no 16k geometry). Then
 the 433 prebuilt musl probes run under `--exec-backend native`.
 
+### M2-runtime rung 1 LANDED: static x86 ELFs run through the real dispatcher
+
+`crates/carrick-runtime/src/native_freebsd.rs` (`run_elf_native_dispatch`,
+gated `cfg(freebsd, x86_64)`) is the x86 sibling of the Darwin native driver.
+It loads a static-pie ELF (identity map, guest VA == host VA), translates it
+through the carrick-dsr-x86 gateway, and adapts each `syscall` exit into the
+same `RawSyscall` the VMM engine produces (`X8664GuestArch::normalize_syscall`
+→ `SyscallRequest::from_raw` → `dispatch_threaded`) — the shared dispatcher,
+reused not reimplemented. arch_prctl(SET_FS) → `guest_fsbase`; rdtsc/cpuid are
+honest same-ISA host passthrough; guest faults become typed Signal exits. The
+page_profile FreeBSD/amd64 arm resolves a 4 KiB Native plan;
+`--exec-backend native` is the DEFAULT and never runs bhyve (a stray VMM run
+can fault the host VM — bhyve only on explicit `--exec-backend vmm`).
+Verified: `tests/native_freebsd_x86.rs` runs the no_std static-pie fixture,
+write+exit_group serviced by the real dispatcher (exit 21, stdout buffered).
+
+**Rung 2 (next, task #8):** a real static-pie musl probe SIGSEGVs the HOST
+through the production path — a bad guest pointer during musl startup reaches
+`IdentityGuestMemory`'s UNGATED raw read on the DISPATCH path (the in-JIT
+fault shim only catches faults whose RIP is inside the code cache; a
+dispatch-path read is host code). Rung 2 needs a protection model on the
+identity memory (or a syscall-path fault guard), proper auxv/TLS/AT_SYSINFO
+setup, and the blocking-wait/thread/fork/signal dispatch outcomes.
+
 ### Census evidence (real musl already translates)
 
 A throwaway harness ran a real prebuilt static-pie **musl** probe
