@@ -156,8 +156,32 @@ pub(super) enum RecoveryAction {
         virtual_register: u32,
         virtual_scratch: u32,
     },
+    RecoverCounterRead(CounterReadRecovery),
     RecoverBiasedMemory(BiasedMemoryRecovery),
     RecoverBiasedExclusive(BiasedExclusiveRecovery),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(super) enum CounterScratchDestination {
+    X15,
+    X16,
+    X17,
+}
+
+impl CounterScratchDestination {
+    pub(super) const fn register(self) -> u32 {
+        match self {
+            Self::X15 => 15,
+            Self::X16 => 16,
+            Self::X17 => 17,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(super) struct CounterReadRecovery {
+    pub(super) committed_scratch_destination: Option<CounterScratchDestination>,
+    pub(super) instruction_complete: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -182,6 +206,7 @@ impl RecoveryAction {
             | Self::CommitVirtualizedAndRestoreScratch { .. }
             | Self::CommitVirtualizedAndRestoreScratchAndContext { .. }
             | Self::CommitDualVirtualAndRestore { .. } => true,
+            Self::RecoverCounterRead(recovery) => recovery.instruction_complete,
             Self::RecoverBiasedMemory(recovery) => recovery.instruction_complete,
             _ => false,
         }
@@ -1302,6 +1327,295 @@ fn emit_virtualized_register(
         },
     });
     emit_word(assembler, entries, guest, restore_context)?;
+    Ok(())
+}
+
+fn emit_counter_recovery_word(
+    assembler: &mut VecAssembler<Aarch64Relocation>,
+    entries: &mut Vec<PcMapEntry>,
+    recovery: &mut Vec<RecoveryEntry>,
+    guest: GuestVa,
+    word: u32,
+    action: CounterReadRecovery,
+) -> Result<(), DsrError> {
+    recovery.push(RecoveryEntry {
+        cache: current_offset(assembler)?,
+        action: RecoveryAction::RecoverCounterRead(action),
+    });
+    emit_word(assembler, entries, guest, word)
+}
+
+fn emit_counter_mov_u64(
+    assembler: &mut VecAssembler<Aarch64Relocation>,
+    entries: &mut Vec<PcMapEntry>,
+    recovery: &mut Vec<RecoveryEntry>,
+    guest: GuestVa,
+    register: u32,
+    value: u64,
+    action: CounterReadRecovery,
+) -> Result<(), DsrError> {
+    for halfword in 0..4_u32 {
+        let immediate = ((value >> (halfword * 16)) & 0xffff) as u32;
+        if halfword != 0 && immediate == 0 {
+            continue;
+        }
+        let base = if halfword == 0 {
+            0xd280_0000
+        } else {
+            0xf280_0000
+        };
+        emit_counter_recovery_word(
+            assembler,
+            entries,
+            recovery,
+            guest,
+            base | (halfword << 21) | (immediate << 5) | register,
+            action,
+        )?;
+    }
+    Ok(())
+}
+
+fn emit_counter_read(
+    assembler: &mut VecAssembler<Aarch64Relocation>,
+    entries: &mut Vec<PcMapEntry>,
+    recovery: &mut Vec<RecoveryEntry>,
+    guest: GuestVa,
+    counter: super::types::CounterRead,
+    source: super::counter::HostCounterSource,
+    scale: super::counter::CounterScale,
+) -> Result<(), DsrError> {
+    const SCRATCH: [(u32, u32); 3] = [(15, 1160), (16, 1120), (17, 1128)];
+    let destination = match counter.destination {
+        super::types::CounterDestination::Gpr(register) if register <= 30 => {
+            Some(u32::from(register))
+        }
+        super::types::CounterDestination::Gpr(register) => {
+            return Err(DsrError::BlockPolicy(format!(
+                "counter destination x{register} is outside the architectural GPR file"
+            )));
+        }
+        super::types::CounterDestination::Discard => None,
+    };
+    let scratch_destination = match destination {
+        Some(15) => Some(CounterScratchDestination::X15),
+        Some(16) => Some(CounterScratchDestination::X16),
+        Some(17) => Some(CounterScratchDestination::X17),
+        _ => None,
+    };
+    let pre_commit = CounterReadRecovery {
+        committed_scratch_destination: None,
+        instruction_complete: false,
+    };
+    let post_commit = CounterReadRecovery {
+        committed_scratch_destination: scratch_destination,
+        instruction_complete: true,
+    };
+
+    // Capturing all three physical scratch values before changing any of them
+    // lets a signal/kick rebuild the exact pre-instruction guest state.
+    for (register, offset) in SCRATCH {
+        emit_word(
+            assembler,
+            entries,
+            guest,
+            0xf900_0000 | ((offset / 8) << 10) | (28 << 5) | register,
+        )?;
+    }
+
+    let retry = assembler.new_dynamic_label();
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; =>retry
+    );
+    emit_counter_mov_u64(
+        assembler,
+        entries,
+        recovery,
+        guest,
+        15,
+        super::counter::COMMPAGE_TIMEBASE_ADDRESS,
+        pre_commit,
+    )?;
+    emit_counter_recovery_word(
+        assembler,
+        entries,
+        recovery,
+        guest,
+        0xf940_01f0, // ldr x16, [x15] -- offset before
+        pre_commit,
+    )?;
+    let counter_word = super::counter::counter_word(source, 17).ok_or_else(|| {
+        DsrError::BlockPolicy(format!(
+            "counter source {source:?} reached inline emission without a proved word"
+        ))
+    })?;
+    emit_counter_recovery_word(
+        assembler,
+        entries,
+        recovery,
+        guest,
+        counter_word,
+        pre_commit,
+    )?;
+    emit_counter_recovery_word(
+        assembler,
+        entries,
+        recovery,
+        guest,
+        0xf940_01ef, // ldr x15, [x15] -- offset after
+        pre_commit,
+    )?;
+    emit_counter_recovery_word(
+        assembler,
+        entries,
+        recovery,
+        guest,
+        0xca0f_0210, // eor x16, x16, x15 -- compare without changing NZCV
+        pre_commit,
+    )?;
+    recovery.push(RecoveryEntry {
+        cache: current_offset(assembler)?,
+        action: RecoveryAction::RecoverCounterRead(pre_commit),
+    });
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; cbnz x16, =>retry
+    );
+    emit_counter_recovery_word(
+        assembler,
+        entries,
+        recovery,
+        guest,
+        0x8b0f_0231, // add x17, x17, x15 -- wrapping signed-offset adjustment
+        pre_commit,
+    )?;
+
+    if scale.numerator() != 1 || scale.denominator() != 1 {
+        // floor(ticks * numerator / denominator), decomposed so the
+        // multiplication cannot overflow before division. Both reduced scale
+        // terms are u32, so remainder * numerator fits in u64 exactly.
+        emit_counter_mov_u64(
+            assembler,
+            entries,
+            recovery,
+            guest,
+            15,
+            u64::from(scale.denominator()),
+            pre_commit,
+        )?;
+        emit_counter_recovery_word(
+            assembler,
+            entries,
+            recovery,
+            guest,
+            0x9acf_0a30, // udiv x16, x17, x15 -- quotient
+            pre_commit,
+        )?;
+        emit_counter_recovery_word(
+            assembler,
+            entries,
+            recovery,
+            guest,
+            0x9b0f_c60f, // msub x15, x16, x15, x17 -- remainder
+            pre_commit,
+        )?;
+        emit_counter_mov_u64(
+            assembler,
+            entries,
+            recovery,
+            guest,
+            17,
+            u64::from(scale.numerator()),
+            pre_commit,
+        )?;
+        emit_counter_recovery_word(
+            assembler,
+            entries,
+            recovery,
+            guest,
+            0x9b11_7e10, // mul x16, x16, x17
+            pre_commit,
+        )?;
+        emit_counter_recovery_word(
+            assembler,
+            entries,
+            recovery,
+            guest,
+            0x9b11_7def, // mul x15, x15, x17
+            pre_commit,
+        )?;
+        emit_counter_mov_u64(
+            assembler,
+            entries,
+            recovery,
+            guest,
+            17,
+            u64::from(scale.denominator()),
+            pre_commit,
+        )?;
+        emit_counter_recovery_word(
+            assembler,
+            entries,
+            recovery,
+            guest,
+            0x9ad1_09ef, // udiv x15, x15, x17
+            pre_commit,
+        )?;
+        emit_counter_recovery_word(
+            assembler,
+            entries,
+            recovery,
+            guest,
+            0x8b0f_0211, // add x17, x16, x15
+            pre_commit,
+        )?;
+    }
+
+    match destination {
+        Some(18) => emit_counter_recovery_word(
+            assembler,
+            entries,
+            recovery,
+            guest,
+            0xf900_0000 | ((144 / 8) << 10) | (28 << 5) | 17,
+            pre_commit,
+        )?,
+        Some(28) => emit_counter_recovery_word(
+            assembler,
+            entries,
+            recovery,
+            guest,
+            0xf900_0000 | ((224 / 8) << 10) | (28 << 5) | 17,
+            pre_commit,
+        )?,
+        Some(17) | None => {}
+        Some(register) => emit_counter_recovery_word(
+            assembler,
+            entries,
+            recovery,
+            guest,
+            0xaa11_03e0 | register, // mov Xd, x17
+            pre_commit,
+        )?,
+    }
+
+    // Recovery from any cleanup word performs the remaining restores itself,
+    // preserves an aliased committed destination, and resumes at guest PC+4.
+    for (register, offset) in SCRATCH.into_iter().rev() {
+        if Some(register) == destination {
+            continue;
+        }
+        emit_counter_recovery_word(
+            assembler,
+            entries,
+            recovery,
+            guest,
+            0xf940_0000 | ((offset / 8) << 10) | (28 << 5) | register,
+            post_commit,
+        )?;
+    }
     Ok(())
 }
 
@@ -3266,6 +3580,26 @@ fn emit_block_inner(
                 )?;
                 continue;
             }
+            InstAction::CounterRead(counter) => {
+                let super::counter::HostCounterPlan::Inline { source, scale } =
+                    super::counter::host_counter_plan()
+                else {
+                    return Err(DsrError::BlockPolicy(format!(
+                        "non-inline counter plan reached emission at guest PC 0x{:x}",
+                        instruction.guest.raw()
+                    )));
+                };
+                emit_counter_read(
+                    &mut assembler,
+                    &mut entries,
+                    &mut recovery,
+                    instruction.guest,
+                    counter,
+                    source,
+                    scale,
+                )?;
+                continue;
+            }
             InstAction::Direct(_) => {
                 return Err(unsupported_action(
                     plan,
@@ -3284,10 +3618,6 @@ fn emit_block_inner(
             }
             InstAction::Syscall { .. }
             | InstAction::Sensitive(_)
-            // Counter lowering is owned by the next task. The planner keeps
-            // proved host sources inline now, while this staging arm rejects
-            // emission until their recovery-aware sequence exists.
-            | InstAction::CounterRead(_)
             // `plan.instructions` never contains this today: block.rs's
             // exclusive-region recogniser (Task 1 of the fusion plan) is not
             // yet wired into `plan_block`, and even once it is, the region's

@@ -1836,7 +1836,12 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                     dsr::types::SensitiveKind::ReadCounter => {
                         #[cfg(target_os = "macos")]
                         if let Some(register) = exit.register {
-                            let ticks = dsr::mach_absolute_time_ticks();
+                            let ticks = dsr::fallback_counter_ticks().ok_or_else(|| {
+                                RuntimeError::Unsupported(
+                                    "native DSR counter fallback has no exact host scale"
+                                        .to_string(),
+                                )
+                            })?;
                             if !native_snapshot_write_reg(&mut snapshot, register, ticks) {
                                 return Err(RuntimeError::Unsupported(format!(
                                     "native DSR could not write counter result to {register}"

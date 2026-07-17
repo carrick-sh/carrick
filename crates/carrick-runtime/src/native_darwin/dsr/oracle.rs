@@ -12,9 +12,10 @@ use super::emit::{
 };
 use super::gateway::{IndirectTargetCache, enter_translated, enter_translated_with_cache};
 use super::types::{
-    CodeGeneration, DirectExit, DirectKind, DsrError, IndirectExit, IndirectKind, InstAction,
-    MemoryAccess, MemoryBase, MemoryClass, MemoryVirtualization, MemoryWriteback, NativeDsrExit,
-    PcRelativeInst, PcRelativeKind, SensitiveExit, SensitiveKind,
+    CodeGeneration, CounterDestination, CounterRead, DirectExit, DirectKind, DsrError,
+    IndirectExit, IndirectKind, InstAction, MemoryAccess, MemoryBase, MemoryClass,
+    MemoryVirtualization, MemoryWriteback, NativeDsrExit, PcRelativeInst, PcRelativeKind,
+    SensitiveExit, SensitiveKind,
 };
 
 static SIGNAL_ORACLE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -1053,6 +1054,211 @@ fn seeded_snapshot(stack_pointer: u64) -> NativeUcontextSnapshot {
         *vector = (0x2200_0000_0000_0000_0000_0000_0000_0000_u128 | index as u128).to_le_bytes();
     }
     snapshot
+}
+
+fn virtual_counter_plan(guest: GuestVa, destination: CounterDestination) -> BlockPlan {
+    BlockPlan {
+        start: guest,
+        end: GuestVa(guest.raw() + 8),
+        generation: CodeGeneration::INITIAL,
+        instructions: vec![PlannedInst {
+            guest,
+            action: InstAction::CounterRead(CounterRead { destination }),
+        }],
+        exit: PlannedExit::Syscall {
+            guest: GuestVa(guest.raw() + 4),
+            resume: GuestVa(guest.raw() + 8),
+        },
+    }
+}
+
+fn counter_ticks_to_ns(ticks: u64, frequency: u64) -> u64 {
+    u64::try_from((u128::from(ticks) * 1_000_000_000) / u128::from(frequency))
+        .expect("counter nanoseconds fit u64")
+}
+
+#[test]
+fn dsr_virtual_counter_tracks_suspend_excluding_uptime() {
+    let guest = GuestVa(0x19_000);
+    let mut cache = TranslationCache::new(16 * 1024).expect("allocate counter cache");
+    let emitted = emit_block_direct(
+        &mut cache,
+        &virtual_counter_plan(guest, CounterDestination::Gpr(2)),
+    )
+    .expect("emit virtual counter");
+    assert_eq!(
+        emitted.map().entries().len(),
+        emitted.len() / std::mem::size_of::<u32>(),
+        "every emitted word must have a guest-PC mapping"
+    );
+    let exit_offset = emitted
+        .map()
+        .entries()
+        .iter()
+        .find(|entry| entry.guest == GuestVa(guest.raw() + 4))
+        .expect("counter block exit mapping")
+        .cache;
+    assert!(
+        emitted
+            .map()
+            .entries()
+            .iter()
+            .filter(|entry| entry.cache.get() < exit_offset.get())
+            .all(|entry| entry.guest == guest),
+        "every inline counter word must map to the counter PC"
+    );
+    let mut stack = vec![0_u8; 16 * 1024];
+    let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    let mut exit = NativeDsrExit::Syscall {
+        resume: GuestVa(guest.raw() + 8),
+    };
+
+    let before = crate::trap::host_clock_uptime_ns();
+    enter_translated(emitted.entry(), &mut snapshot, &mut exit).expect("execute counter");
+    let after = crate::trap::host_clock_uptime_ns();
+    let (raw_counter, frequency) = crate::trap::host_counter();
+    let observed = counter_ticks_to_ns(snapshot.x[2], frequency);
+    // SAFETY: Darwin maps the fixed commpage timebase field read-only in every
+    // process; this extra read is failure diagnostics, not the oracle value.
+    let live_offset =
+        unsafe { (super::counter::COMMPAGE_TIMEBASE_ADDRESS as *const u64).read_volatile() };
+    let mach_ticks = super::counter::mach_absolute_time_ticks();
+
+    assert!(
+        before.saturating_sub(1_000) <= observed,
+        "counter precedes uptime: before={before} observed={observed} after={after} ticks={} raw={raw_counter} freq={frequency} offset=0x{live_offset:x} mach={mach_ticks}",
+        snapshot.x[2],
+    );
+    assert!(
+        observed <= after.saturating_add(1_000),
+        "counter exceeds uptime: before={before} observed={observed} after={after} ticks={}",
+        snapshot.x[2]
+    );
+    assert_eq!(
+        exit,
+        NativeDsrExit::Syscall {
+            resume: GuestVa(guest.raw() + 8)
+        }
+    );
+}
+
+#[test]
+fn dsr_virtual_counter_preserves_destination_matrix() {
+    let destinations = [
+        CounterDestination::Gpr(2),
+        CounterDestination::Gpr(15),
+        CounterDestination::Gpr(16),
+        CounterDestination::Gpr(17),
+        CounterDestination::Gpr(18),
+        CounterDestination::Gpr(28),
+        CounterDestination::Discard,
+    ];
+
+    for (case, destination) in destinations.into_iter().enumerate() {
+        let guest = GuestVa(0x19_100 + (case as u64 * 0x100));
+        let mut cache = TranslationCache::new(16 * 1024).expect("allocate matrix cache");
+        let emitted = emit_block_direct(&mut cache, &virtual_counter_plan(guest, destination))
+            .expect("emit matrix counter");
+        let mut stack = vec![0_u8; 16 * 1024];
+        let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+        let expected = snapshot;
+        let mut exit = NativeDsrExit::Syscall {
+            resume: GuestVa(guest.raw() + 8),
+        };
+
+        enter_translated(emitted.entry(), &mut snapshot, &mut exit)
+            .expect("execute matrix counter");
+
+        for register in 0..31 {
+            let is_destination = destination == CounterDestination::Gpr(register as u8);
+            if is_destination {
+                assert_ne!(
+                    snapshot.x[register], expected.x[register],
+                    "x{register} destination was not committed"
+                );
+            } else {
+                assert_eq!(
+                    snapshot.x[register], expected.x[register],
+                    "x{register} changed for {destination:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn dsr_virtual_counter_kicks_retry_before_and_preserve_after_commit() {
+    let _signal_oracle = install_signal_handlers_for_oracle();
+    let guest = GuestVa(0x20_0020_0000);
+    let words = [0xd53b_e04f, 0xd400_0001]; // mrs x15, cntvct_el0; svc #0
+
+    for completed in [false, true] {
+        let mut fixture = biased_translator_fixture(&words, guest);
+        let mut stack = vec![0_u8; 16 * 1024];
+        let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+        snapshot.pc = guest.raw();
+        snapshot.x[27] = 1;
+        let original = snapshot;
+        let prepared = fixture
+            .translator
+            .prepare_entry::<false>(&fixture.memory, &snapshot)
+            .expect("prepare counter kick");
+        let (cache_pc, _action) = fixture
+            .translator
+            .recovery_points_for_test(guest)
+            .into_iter()
+            .find(|(_, action)| action.instruction_complete() == completed)
+            .expect("counter recovery phase");
+        fixture
+            .translator
+            .patch_recovery_word_for_test(cache_pc, 0xf940_0369) // ldr x9, [x27], x27=1
+            .expect("patch counter recovery point");
+        let fault = fixture
+            .translator
+            .enter_prepared::<false>(prepared, &mut snapshot)
+            .expect("capture counter recovery state");
+        let NativeDsrExit::Fault {
+            guest_pc: resume,
+            rewrite_scratch,
+            rewrite_context_scratch,
+            generation_pstate_scratch,
+            indirect_x15_scratch,
+            indirect_x30_scratch,
+            ..
+        } = fault.exit
+        else {
+            panic!("expected patched counter fault, got {:?}", fault.exit);
+        };
+        let kick = super::PreparedExit {
+            exit: NativeDsrExit::Kick {
+                resume,
+                rewrite_scratch,
+                rewrite_context_scratch,
+                generation_pstate_scratch,
+                indirect_x15_scratch,
+                indirect_x30_scratch,
+            },
+        };
+
+        assert!(matches!(
+            fixture
+                .translator
+                .finish_exit(&fixture.memory, &mut snapshot, prepared, kick)
+                .expect("finish counter kick"),
+            super::ThreadExit::Kick
+        ));
+        assert_eq!(snapshot.pc, guest.raw() + if completed { 4 } else { 0 });
+        for register in 0..31 {
+            if completed && register == 15 {
+                assert_ne!(snapshot.x[register], original.x[register]);
+            } else {
+                assert_eq!(
+                    snapshot.x[register], original.x[register],
+                    "completed={completed} x{register} sentinel"
+                );
+            }
+        }
+    }
 }
 
 fn run_full_state_oracle() -> Result<(), DsrError> {

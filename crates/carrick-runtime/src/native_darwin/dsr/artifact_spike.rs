@@ -987,6 +987,7 @@ enum PortableRecoveryAction {
         virtual_register: u32,
         virtual_scratch: u32,
     },
+    RecoverCounterRead(super::emit::CounterReadRecovery),
     RecoverBiasedMemory(PortableBiasedMemoryRecovery),
     RecoverBiasedExclusive(BiasedExclusiveRecovery),
 }
@@ -1070,6 +1071,7 @@ impl PortableRecoveryAction {
                 virtual_register,
                 virtual_scratch,
             },
+            RecoveryAction::RecoverCounterRead(recovery) => Self::RecoverCounterRead(recovery),
             RecoveryAction::RecoverBiasedMemory(recovery) => {
                 let bound_bias = bindings.value(ProcessValue::HostBias)?;
                 if recovery.host_bias.get() != bound_bias {
@@ -1174,6 +1176,7 @@ impl PortableRecoveryAction {
                 virtual_register,
                 virtual_scratch,
             },
+            Self::RecoverCounterRead(recovery) => RecoveryAction::RecoverCounterRead(recovery),
             Self::RecoverBiasedMemory(recovery) => {
                 let raw_bias = bindings.value(ProcessValue::HostBias)?;
                 let host_bias =
@@ -1415,14 +1418,18 @@ pub(super) fn replay_artifact(
 mod tests {
     use super::*;
     use crate::native_darwin::address::NativeHostBias;
+    use crate::native_darwin::dsr::block::{BlockPlan, PlannedExit, PlannedInst};
     use crate::native_darwin::dsr::cache::TranslationCache;
     use crate::native_darwin::dsr::emit::{
         BiasedBase, BiasedBaseCoordinate, BiasedMemoryRecovery, DirectLink, EmitAddressMode,
-        PcMapEntry, RecoveryAction, RecoveryEntry,
+        GenerationGuard, PcMapEntry, RecoveryAction, RecoveryEntry,
     };
-    use crate::native_darwin::dsr::types::CacheOffset;
+    use crate::native_darwin::dsr::types::{
+        CacheOffset, CodeGeneration, CounterDestination, CounterRead, InstAction,
+    };
     use carrick_guest_mem::GuestVa;
     use std::os::fd::AsRawFd;
+    use std::sync::atomic::AtomicU64;
 
     const IMM16_MASK: u32 = 0x001f_ffe0;
 
@@ -1567,6 +1574,58 @@ mod tests {
                 std::mem::transmute(replay.entry().host().raw());
             assert_eq!(fresh_fn(), 42);
             assert_eq!(replay_fn(), 42);
+        }
+    }
+
+    #[test]
+    fn counter_artifact_replay_matches_fresh_metadata() {
+        let guest = GuestVa(0x6000);
+        let source_words = vec![0xd53b_e042, 0xd400_0001];
+        let plan = BlockPlan {
+            start: guest,
+            end: GuestVa(guest.raw() + 8),
+            generation: CodeGeneration::INITIAL,
+            instructions: vec![PlannedInst {
+                guest,
+                action: InstAction::CounterRead(CounterRead {
+                    destination: CounterDestination::Gpr(2),
+                }),
+            }],
+            exit: PlannedExit::Syscall {
+                guest: GuestVa(guest.raw() + 4),
+                resume: GuestVa(guest.raw() + 8),
+            },
+        };
+        let generation = AtomicU64::new(CodeGeneration::INITIAL.get());
+        let guard = GenerationGuard::new(&generation, CodeGeneration::INITIAL);
+        let mut fresh_cache = TranslationCache::new(16 * 1024).expect("fresh counter cache");
+        let (fresh, record) = super::super::emit::emit_block_recording_artifact(
+            &mut fresh_cache,
+            &plan,
+            guard,
+            EmitAddressMode::Direct,
+            source_words,
+        )
+        .expect("record counter artifact");
+        let mut replay_cache = TranslationCache::new(16 * 1024).expect("replay counter cache");
+        let replay = replay_artifact(&mut replay_cache, &record.template, &record.bindings)
+            .expect("replay counter artifact");
+
+        assert_eq!(fresh.map().entries(), replay.map().entries());
+        assert_eq!(fresh.recovery(), replay.recovery());
+        assert_eq!(fresh.direct_links(), replay.direct_links());
+        assert_eq!(fresh.len(), replay.len());
+        for offset in (0..fresh.len()).step_by(std::mem::size_of::<u32>()) {
+            // SAFETY: both published blocks contain `len` executable bytes,
+            // and the loop visits aligned-width words wholly within them.
+            let fresh_word = unsafe {
+                std::ptr::read_unaligned((fresh.entry().host().raw() + offset) as *const u32)
+            };
+            // SAFETY: same published-block bounds argument as `fresh_word`.
+            let replay_word = unsafe {
+                std::ptr::read_unaligned((replay.entry().host().raw() + offset) as *const u32)
+            };
+            assert_eq!(fresh_word, replay_word, "counter replay word {offset}");
         }
     }
 

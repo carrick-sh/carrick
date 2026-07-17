@@ -159,14 +159,17 @@ Commit as `fix(runtime): type native virtual counter reads` with red-first evide
 ### Task 3: Inline Commpage Lowering and Recovery
 
 **Files:**
+- Modify: `crates/carrick-runtime/src/native_darwin/dsr/counter.rs`
 - Modify: `crates/carrick-runtime/src/native_darwin/dsr/emit.rs`
 - Modify: `crates/carrick-runtime/src/native_darwin/dsr/mod.rs`
 - Modify: `crates/carrick-runtime/src/native_darwin/dsr/artifact_spike.rs`
 - Modify: `crates/carrick-runtime/src/native_darwin/dsr/oracle.rs`
+- Modify: `crates/carrick-runtime/src/native_darwin.rs`
 
 **Interfaces:**
 - Consumes Task 2's typed action and Task 1's counter word/address.
-- Produces `emit_counter_read(...)` and `RecoveryAction::RecoverCounterRead`.
+- Produces `emit_counter_read(...)`, a reduced source-to-`CNTFRQ` scale, and
+  `RecoveryAction::RecoverCounterRead`.
 
 - [ ] **Step 1: Add suspended-host and destination-matrix oracle tests**
 
@@ -200,9 +203,15 @@ read mode-selected counter
 load offset_after
 compare offsets and retry if different
 add stable offset
+for Mach-tick sources, multiply/divide by the reduced runtime-derived scale
 commit GPR, virtual x18/x28, or discard
 restore non-destination scratch registers
 ```
+
+Mode 1 uses identity scale. Mode 3 and fallback `mach_absolute_time` ticks use
+`mach_timebase_info` and host `CNTFRQ_EL0` to derive the exact reduced ratio;
+this host must produce 125/3. The fallback handler applies the same conversion.
+Do not hard-code one host's timebase, and do not change `CNTFRQ_EL0` or vvar.
 
 Every emitted word maps to the guest counter PC. The live offset is loaded at execution and never stored in an artifact. `RecoverCounterRead` restores scratch and retries before commit; after commit it preserves the destination and resumes at PC+4.
 
