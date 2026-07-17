@@ -1,6 +1,6 @@
 #![allow(dead_code)] // Staged DSR contracts are consumed by Tasks 3-5.
 
-use carrick_guest_mem::{GuestVa, HostVa};
+use carrick_guest_mem::GuestVa;
 
 // Moved verbatim to `carrick_dsr::vocabulary` as part of the staged
 // native-backend extraction (see
@@ -10,65 +10,15 @@ pub(in crate::native_darwin) use carrick_dsr::vocabulary::{
     ExclusiveFusionDisposition, ExclusiveFusionRejection, SensitiveKind,
 };
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(in crate::native_darwin) struct CodeGeneration(u64);
-
-impl CodeGeneration {
-    pub(super) const INITIAL: Self = Self(0);
-
-    pub(super) const fn claimed(value: u64) -> Self {
-        Self(value)
-    }
-
-    pub(super) fn next(self) -> Option<Self> {
-        self.0.checked_add(1).map(Self)
-    }
-
-    pub(super) const fn get(self) -> u64 {
-        self.0
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(super) struct BlockId(u64);
-
-impl BlockId {
-    pub(super) const fn claimed(value: u64) -> Self {
-        Self(value)
-    }
-
-    pub(super) const fn get(self) -> u64 {
-        self.0
-    }
-}
-
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
-)]
-pub(super) struct CacheOffset(u32);
-
-impl CacheOffset {
-    pub(super) const fn published(value: u32) -> Self {
-        Self(value)
-    }
-
-    pub(super) const fn get(self) -> u32 {
-        self.0
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(super) struct CacheVa(HostVa);
-
-impl CacheVa {
-    pub(super) const fn published(value: HostVa) -> Self {
-        Self(value)
-    }
-
-    pub(super) const fn host(self) -> HostVa {
-        self.0
-    }
-}
+// Moved verbatim to `carrick_dsr::ids` as part of the staged native-backend
+// extraction; re-exported so existing `super::types::*` call paths resolve
+// unchanged.
+// `BlockId` is staged contract surface with no runtime consumer yet (the
+// pre-move definition sat under this file's `allow(dead_code)`).
+#[allow(unused_imports)]
+pub(in crate::native_darwin) use carrick_dsr::ids::{
+    BlockId, CacheOffset, CacheVa, CodeGeneration,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum DirectKind {
@@ -470,6 +420,38 @@ pub(in crate::native_darwin) enum DsrError {
         operation: &'static str,
         error: std::io::Error,
     },
+}
+
+// The extracted cache (`carrick_dsr::cache`) reports its own typed
+// `CacheError`; map each variant back onto the pre-extraction `DsrError`
+// counterpart so every runtime `?` site keeps producing identical errors.
+impl From<carrick_dsr::cache::CacheError> for DsrError {
+    fn from(error: carrick_dsr::cache::CacheError) -> Self {
+        use carrick_dsr::cache::CacheError;
+
+        match error {
+            CacheError::Policy(detail) => Self::CachePolicy(detail),
+            CacheError::Capacity {
+                requested,
+                used,
+                capacity,
+            } => Self::CacheCapacity {
+                requested,
+                used,
+                capacity,
+            },
+            CacheError::GenerationChanged {
+                page,
+                expected,
+                observed,
+            } => Self::GenerationChanged {
+                page,
+                expected,
+                observed,
+            },
+            CacheError::Host { operation, error } => Self::Host { operation, error },
+        }
+    }
 }
 
 impl DsrError {

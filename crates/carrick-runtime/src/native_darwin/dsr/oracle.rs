@@ -540,7 +540,11 @@ fn biased_memory_families_access_guest_data() {
                 resume: GuestVa(0x4008),
             },
         };
-        let mut cache = TranslationCache::new(16 * 1024).expect("allocate biased cache");
+        let mut cache = TranslationCache::new(
+            16 * 1024,
+            crate::native_darwin::darwin_jit::active_host_jit(),
+        )
+        .expect("allocate biased cache");
         let emitted = emit_block(&mut cache, &plan, mode).expect("emit biased fixture");
         let mut stack = vec![0_u8; 16 * 1024];
         let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
@@ -619,7 +623,11 @@ fn biased_memory_preserves_nzcv_for_the_following_conditional_instruction() {
             resume: GuestVa(0x500c),
         },
     };
-    let mut cache = TranslationCache::new(16 * 1024).expect("allocate NZCV oracle cache");
+    let mut cache = TranslationCache::new(
+        16 * 1024,
+        crate::native_darwin::darwin_jit::active_host_jit(),
+    )
+    .expect("allocate NZCV oracle cache");
     let emitted = emit_block(
         &mut cache,
         &plan,
@@ -667,7 +675,11 @@ fn run_biased_single_memory(
             resume: GuestVa(guest_pc.raw() + 8),
         },
     };
-    let mut cache = TranslationCache::new(16 * 1024).expect("allocate single-memory cache");
+    let mut cache = TranslationCache::new(
+        16 * 1024,
+        crate::native_darwin::darwin_jit::active_host_jit(),
+    )
+    .expect("allocate single-memory cache");
     let emitted = emit_block(
         &mut cache,
         &plan,
@@ -857,7 +869,11 @@ fn biased_memequal_vector_sequence_compares_equal_blocks() {
             resume: GuestVa(syscall.raw() + 4),
         },
     };
-    let mut cache = TranslationCache::new(16 * 1024).expect("allocate memequal cache");
+    let mut cache = TranslationCache::new(
+        16 * 1024,
+        crate::native_darwin::darwin_jit::active_host_jit(),
+    )
+    .expect("allocate memequal cache");
     let emitted = emit_block(
         &mut cache,
         &plan,
@@ -922,7 +938,11 @@ fn biased_literal_load_commits_virtual_x18() {
             resume: GuestVa(0xd008),
         },
     };
-    let mut cache = TranslationCache::new(16 * 1024).expect("allocate literal cache");
+    let mut cache = TranslationCache::new(
+        16 * 1024,
+        crate::native_darwin::darwin_jit::active_host_jit(),
+    )
+    .expect("allocate literal cache");
     let emitted = emit_block(
         &mut cache,
         &plan,
@@ -1080,7 +1100,11 @@ fn counter_ticks_to_ns(ticks: u64, frequency: u64) -> u64 {
 #[test]
 fn dsr_virtual_counter_tracks_suspend_excluding_uptime() {
     let guest = GuestVa(0x19_000);
-    let mut cache = TranslationCache::new(16 * 1024).expect("allocate counter cache");
+    let mut cache = TranslationCache::new(
+        16 * 1024,
+        crate::native_darwin::darwin_jit::active_host_jit(),
+    )
+    .expect("allocate counter cache");
     let emitted = emit_block_direct(
         &mut cache,
         &virtual_counter_plan(guest, CounterDestination::Gpr(2)),
@@ -1157,7 +1181,11 @@ fn dsr_virtual_counter_preserves_destination_matrix() {
 
     for (case, destination) in destinations.into_iter().enumerate() {
         let guest = GuestVa(0x19_100 + (case as u64 * 0x100));
-        let mut cache = TranslationCache::new(16 * 1024).expect("allocate matrix cache");
+        let mut cache = TranslationCache::new(
+            16 * 1024,
+            crate::native_darwin::darwin_jit::active_host_jit(),
+        )
+        .expect("allocate matrix cache");
         let emitted = emit_block_direct(&mut cache, &virtual_counter_plan(guest, destination))
             .expect("emit matrix counter");
         let mut stack = vec![0_u8; 16 * 1024];
@@ -1311,7 +1339,10 @@ fn run_full_state_oracle() -> Result<(), DsrError> {
             resume: GuestVa(0x4008),
         },
     };
-    let mut cache = TranslationCache::new(16 * 1024)?;
+    let mut cache = TranslationCache::new(
+        16 * 1024,
+        crate::native_darwin::darwin_jit::active_host_jit(),
+    )?;
     let emitted = emit_block_direct(&mut cache, &plan)?;
     let mut exit = NativeDsrExit::Syscall {
         resume: GuestVa(0x4008),
@@ -1398,7 +1429,11 @@ fn dsr_pc_relative_adr_materializes_guest_target() {
             resume: GuestVa(0x4008),
         },
     };
-    let mut cache = TranslationCache::new(16 * 1024).expect("allocate PC-relative cache");
+    let mut cache = TranslationCache::new(
+        16 * 1024,
+        crate::native_darwin::darwin_jit::active_host_jit(),
+    )
+    .expect("allocate PC-relative cache");
     let emitted = emit_block_direct(&mut cache, &plan).expect("emit ADR relocation");
     let mut exit = NativeDsrExit::Syscall {
         resume: GuestVa(0x4008),
@@ -1431,7 +1466,11 @@ fn dsr_pc_relative_literal_load_reads_guest_address() {
             resume: GuestVa(0x5008),
         },
     };
-    let mut cache = TranslationCache::new(16 * 1024).expect("allocate literal-load cache");
+    let mut cache = TranslationCache::new(
+        16 * 1024,
+        crate::native_darwin::darwin_jit::active_host_jit(),
+    )
+    .expect("allocate literal-load cache");
     let emitted = emit_block_direct(&mut cache, &plan).expect("emit literal-load relocation");
     let mut exit = NativeDsrExit::Syscall {
         resume: GuestVa(0x5008),
@@ -1495,7 +1534,11 @@ fn dsr_pc_relative_literals_cover_integer_simd_prefetch_and_virtual_x18() {
             resume: GuestVa(exit_pc.raw() + 4),
         },
     };
-    let mut cache = TranslationCache::new(16 * 1024).expect("allocate literal matrix cache");
+    let mut cache = TranslationCache::new(
+        16 * 1024,
+        crate::native_darwin::darwin_jit::active_host_jit(),
+    )
+    .expect("allocate literal matrix cache");
     let emitted = emit_block_direct(&mut cache, &plan).expect("emit literal relocation matrix");
     for offset in (0..emitted.len()).step_by(4) {
         let address = emitted.entry().host().raw() + offset;
@@ -1543,7 +1586,11 @@ fn dsr_pc_relative_adrp_writes_virtual_guest_x18_without_clobbering_x17() {
             resume: GuestVa(0x7008),
         },
     };
-    let mut cache = TranslationCache::new(16 * 1024).expect("allocate ADRP cache");
+    let mut cache = TranslationCache::new(
+        16 * 1024,
+        crate::native_darwin::darwin_jit::active_host_jit(),
+    )
+    .expect("allocate ADRP cache");
     let emitted = emit_block_direct(&mut cache, &plan).expect("emit ADRP relocation");
     let mut exit = NativeDsrExit::Syscall {
         resume: GuestVa(0x7008),
@@ -1576,7 +1623,11 @@ fn dsr_direct_flow_unresolved_branch_reports_guest_target() {
             },
         },
     };
-    let mut cache = TranslationCache::new(16 * 1024).expect("allocate direct-flow cache");
+    let mut cache = TranslationCache::new(
+        16 * 1024,
+        crate::native_darwin::darwin_jit::active_host_jit(),
+    )
+    .expect("allocate direct-flow cache");
     let emitted = emit_block_direct(&mut cache, &plan).expect("emit unresolved direct branch");
     let mut exit = NativeDsrExit::ResolveDirect {
         source: GuestVa(0x8000),
@@ -1604,14 +1655,14 @@ fn patch_direct_target(
         .iter()
         .find(|link| link.target == guest_target)
         .expect("find direct link target");
+    let site = super::cache::LinkSite {
+        source: source.entry(),
+        slot: link.slot,
+    };
+    let word =
+        super::encode_aarch64_direct_branch(site, target.entry()).expect("encode direct link");
     cache
-        .patch_direct_branch(
-            super::cache::LinkSite {
-                source: source.entry(),
-                slot: link.slot,
-            },
-            target.entry(),
-        )
+        .patch_code_word(site, word)
         .expect("patch direct link");
 }
 
@@ -1633,7 +1684,11 @@ fn syscall_plan(start: GuestVa, word: u32) -> BlockPlan {
 
 #[test]
 fn dsr_direct_flow_linked_branch_stays_in_translated_code_and_preserves_x17() {
-    let mut cache = TranslationCache::new(32 * 1024).expect("allocate linked-flow cache");
+    let mut cache = TranslationCache::new(
+        32 * 1024,
+        crate::native_darwin::darwin_jit::active_host_jit(),
+    )
+    .expect("allocate linked-flow cache");
     let source_plan = BlockPlan {
         start: GuestVa(0xa000),
         end: GuestVa(0xa008),
@@ -1681,7 +1736,11 @@ fn dsr_direct_flow_linked_branch_stays_in_translated_code_and_preserves_x17() {
 
 #[test]
 fn dsr_direct_flow_conditional_edges_select_taken_and_fallthrough_links() {
-    let mut cache = TranslationCache::new(64 * 1024).expect("allocate conditional-flow cache");
+    let mut cache = TranslationCache::new(
+        64 * 1024,
+        crate::native_darwin::darwin_jit::active_host_jit(),
+    )
+    .expect("allocate conditional-flow cache");
     let source_plan = BlockPlan {
         start: GuestVa(0xc000),
         end: GuestVa(0xc004),
@@ -1731,7 +1790,11 @@ fn dsr_direct_flow_conditional_edges_select_taken_and_fallthrough_links() {
 
 #[test]
 fn dsr_direct_flow_linked_call_observes_guest_lr() {
-    let mut cache = TranslationCache::new(32 * 1024).expect("allocate call-flow cache");
+    let mut cache = TranslationCache::new(
+        32 * 1024,
+        crate::native_darwin::darwin_jit::active_host_jit(),
+    )
+    .expect("allocate call-flow cache");
     let call_plan = BlockPlan {
         start: GuestVa(0xd000),
         end: GuestVa(0xd004),
@@ -1809,7 +1872,11 @@ fn dsr_direct_flow_condition_codes_and_virtual_x18_bits_choose_guest_edges() {
                 exit,
             },
         };
-        let mut cache = TranslationCache::new(16 * 1024).expect("allocate condition cache");
+        let mut cache = TranslationCache::new(
+            16 * 1024,
+            crate::native_darwin::darwin_jit::active_host_jit(),
+        )
+        .expect("allocate condition cache");
         let emitted = emit_block_direct(&mut cache, &plan).expect("emit condition edge");
         let mut stack = vec![0_u8; 16 * 1024];
         let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
@@ -1870,7 +1937,11 @@ fn dsr_guarded_link_after_virtual_x18_condition_preserves_guest_x17() {
             resume: GuestVa(target_guest.raw() + 8),
         },
     };
-    let mut cache = TranslationCache::new(32 * 1024).expect("allocate virtual-edge cache");
+    let mut cache = TranslationCache::new(
+        32 * 1024,
+        crate::native_darwin::darwin_jit::active_host_jit(),
+    )
+    .expect("allocate virtual-edge cache");
     let source = super::emit::emit_block_with_generation_direct(
         &mut cache,
         &source_plan,
@@ -1901,7 +1972,11 @@ fn dsr_guarded_link_after_virtual_x18_condition_preserves_guest_x17() {
 
 #[test]
 fn dsr_direct_flow_linked_backward_loop_reaches_fallthrough() {
-    let mut cache = TranslationCache::new(32 * 1024).expect("allocate loop-flow cache");
+    let mut cache = TranslationCache::new(
+        32 * 1024,
+        crate::native_darwin::darwin_jit::active_host_jit(),
+    )
+    .expect("allocate loop-flow cache");
     let loop_plan = BlockPlan {
         start: GuestVa(0xf000),
         end: GuestVa(0xf008),
@@ -1948,7 +2023,11 @@ fn dsr_direct_flow_linked_backward_loop_reaches_fallthrough() {
 
 #[test]
 fn dsr_indirect_flow_unresolved_return_reports_guest_register_target() {
-    let mut cache = TranslationCache::new(16 * 1024).expect("allocate indirect-flow cache");
+    let mut cache = TranslationCache::new(
+        16 * 1024,
+        crate::native_darwin::darwin_jit::active_host_jit(),
+    )
+    .expect("allocate indirect-flow cache");
     let plan = BlockPlan {
         start: GuestVa(0x13_000),
         end: GuestVa(0x13_004),
@@ -1986,7 +2065,11 @@ fn dsr_indirect_flow_unresolved_return_reports_guest_register_target() {
 
 #[test]
 fn dsr_indirect_flow_blr_sets_guest_link_and_alternates_targets() {
-    let mut cache = TranslationCache::new(16 * 1024).expect("allocate BLR cache");
+    let mut cache = TranslationCache::new(
+        16 * 1024,
+        crate::native_darwin::darwin_jit::active_host_jit(),
+    )
+    .expect("allocate BLR cache");
     let plan = BlockPlan {
         start: GuestVa(0x15_000),
         end: GuestVa(0x15_004),
@@ -2027,7 +2110,11 @@ fn dsr_indirect_flow_blr_sets_guest_link_and_alternates_targets() {
 
 #[test]
 fn dsr_indirect_flow_branch_reads_virtual_guest_x18() {
-    let mut cache = TranslationCache::new(16 * 1024).expect("allocate x18 branch cache");
+    let mut cache = TranslationCache::new(
+        16 * 1024,
+        crate::native_darwin::darwin_jit::active_host_jit(),
+    )
+    .expect("allocate x18 branch cache");
     let plan = BlockPlan {
         start: GuestVa(0x18_000),
         end: GuestVa(0x18_004),
@@ -2088,7 +2175,11 @@ fn dsr_indirect_cache_keeps_old_index_aliases_hot() {
             resume: GuestVa(target.raw() + 4),
         },
     };
-    let mut code = TranslationCache::new(32 * 1024).expect("allocate alias oracle");
+    let mut code = TranslationCache::new(
+        32 * 1024,
+        crate::native_darwin::darwin_jit::active_host_jit(),
+    )
+    .expect("allocate alias oracle");
     let first_block =
         emit_block_direct(&mut code, &target_plan(first)).expect("emit first alias target");
     let second_block =
@@ -2143,7 +2234,11 @@ fn dsr_indirect_flow_cache_hit_stays_in_translated_code() {
     let target_guest = GuestVa(0x18_200);
     let target_generation = CodeGeneration::claimed(2);
     let generation = std::sync::atomic::AtomicU64::new(target_generation.get());
-    let mut code = TranslationCache::new(16 * 1024).expect("allocate indirect cache-hit code");
+    let mut code = TranslationCache::new(
+        16 * 1024,
+        crate::native_darwin::darwin_jit::active_host_jit(),
+    )
+    .expect("allocate indirect cache-hit code");
     // Production blocks carry a generation guard.  That guard must observe
     // the original guest x17 after an inline-cache hit, not the x17 scratch
     // used to hold the indirect target.
@@ -2240,7 +2335,11 @@ fn dsr_indirect_flow_cached_blr_sets_guest_link_register() {
     let source_guest = GuestVa(0x18_300);
     let target_guest = GuestVa(0x18_400);
     let resume_guest = GuestVa(source_guest.raw() + 4);
-    let mut code = TranslationCache::new(16 * 1024).expect("allocate cached BLR code");
+    let mut code = TranslationCache::new(
+        16 * 1024,
+        crate::native_darwin::darwin_jit::active_host_jit(),
+    )
+    .expect("allocate cached BLR code");
     let target = emit_block_direct(
         &mut code,
         &BlockPlan {
@@ -2296,7 +2395,11 @@ fn dsr_indirect_flow_cached_blr_sets_guest_link_register() {
 fn dsr_sensitive_flow_reports_guest_pc_and_resume() {
     use std::sync::atomic::AtomicU64;
 
-    let mut cache = TranslationCache::new(16 * 1024).expect("allocate sensitive cache");
+    let mut cache = TranslationCache::new(
+        16 * 1024,
+        crate::native_darwin::darwin_jit::active_host_jit(),
+    )
+    .expect("allocate sensitive cache");
     let generation = CodeGeneration::claimed(1);
     let current_generation = AtomicU64::new(generation.get());
     let plan = BlockPlan {
@@ -2341,7 +2444,11 @@ fn dsr_sensitive_flow_reports_guest_pc_and_resume() {
 
 #[test]
 fn dsr_virtual_x18_rewrites_destination_and_distinct_x17_operand() {
-    let mut cache = TranslationCache::new(16 * 1024).expect("allocate x18 rewrite cache");
+    let mut cache = TranslationCache::new(
+        16 * 1024,
+        crate::native_darwin::darwin_jit::active_host_jit(),
+    )
+    .expect("allocate x18 rewrite cache");
     let plan = BlockPlan {
         start: GuestVa(0x1b_000),
         end: GuestVa(0x1b_00c),
@@ -2378,7 +2485,11 @@ fn dsr_virtual_x18_rewrites_destination_and_distinct_x17_operand() {
 
 #[test]
 fn dsr_virtual_x18_madd_then_aliasing_loads_preserve_computed_address() {
-    let mut cache = TranslationCache::new(16 * 1024).expect("allocate x18 alias cache");
+    let mut cache = TranslationCache::new(
+        16 * 1024,
+        crate::native_darwin::darwin_jit::active_host_jit(),
+    )
+    .expect("allocate x18 alias cache");
     let plan = BlockPlan {
         start: GuestVa(0x1b_080),
         end: GuestVa(0x1b_090),
@@ -2431,7 +2542,11 @@ fn dsr_virtual_x18_madd_then_aliasing_loads_preserve_computed_address() {
 
 #[test]
 fn dsr_virtual_x28_rewrites_destination_and_distinct_x17_operand() {
-    let mut cache = TranslationCache::new(16 * 1024).expect("allocate x28 rewrite cache");
+    let mut cache = TranslationCache::new(
+        16 * 1024,
+        crate::native_darwin::darwin_jit::active_host_jit(),
+    )
+    .expect("allocate x28 rewrite cache");
     let plan = BlockPlan {
         start: GuestVa(0x1b_100),
         end: GuestVa(0x1b_10c),
@@ -2490,7 +2605,11 @@ fn dsr_dual_virtual_read_only_store_uses_guest_x18_and_x28() {
             resume: GuestVa(guest.raw() + 12),
         },
     };
-    let mut cache = TranslationCache::new(16 * 1024).expect("allocate dual rewrite cache");
+    let mut cache = TranslationCache::new(
+        16 * 1024,
+        crate::native_darwin::darwin_jit::active_host_jit(),
+    )
+    .expect("allocate dual rewrite cache");
     let emitted = emit_block_direct(&mut cache, &plan).expect("emit dual virtual store");
     let mut stored = [0_u64; 24];
     let mut stack = vec![0_u8; 16 * 1024];
@@ -2532,7 +2651,11 @@ fn dsr_dual_virtual_add_commits_guest_x18_from_guest_x28() {
             resume: GuestVa(guest.raw() + 8),
         },
     };
-    let mut cache = TranslationCache::new(16 * 1024).expect("allocate dual add cache");
+    let mut cache = TranslationCache::new(
+        16 * 1024,
+        crate::native_darwin::darwin_jit::active_host_jit(),
+    )
+    .expect("allocate dual add cache");
     let emitted = emit_block_direct(&mut cache, &plan).expect("emit dual virtual add");
     let mut stack = vec![0_u8; 16 * 1024];
     let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
@@ -2569,7 +2692,11 @@ fn dsr_dual_virtual_load_commits_guest_x18_and_ordinary_destination() {
             resume: GuestVa(guest.raw() + 8),
         },
     };
-    let mut cache = TranslationCache::new(16 * 1024).expect("allocate dual load cache");
+    let mut cache = TranslationCache::new(
+        16 * 1024,
+        crate::native_darwin::darwin_jit::active_host_jit(),
+    )
+    .expect("allocate dual load cache");
     let emitted = emit_block_direct(&mut cache, &plan).expect("emit dual virtual load");
     let mut source = [0_u64; 29];
     source[27] = 0x1515_1515_1515_1515;
@@ -2607,7 +2734,11 @@ fn dsr_generation_guard_rejects_stale_block_before_guest_instruction() {
             resume: GuestVa(guest.raw() + 8),
         },
     };
-    let mut cache = TranslationCache::new(16 * 1024).expect("allocate generation guard cache");
+    let mut cache = TranslationCache::new(
+        16 * 1024,
+        crate::native_darwin::darwin_jit::active_host_jit(),
+    )
+    .expect("allocate generation guard cache");
     let emitted = super::emit::emit_block_with_generation_direct(
         &mut cache,
         &plan,
@@ -2643,7 +2774,11 @@ fn dsr_generation_guard_rejects_stale_block_before_guest_instruction() {
 #[test]
 fn dsr_signal_fault_reconstructs_copied_instruction_pc() {
     let _signal_oracle = install_signal_handlers_for_oracle();
-    let mut cache = TranslationCache::new(16 * 1024).expect("allocate fault cache");
+    let mut cache = TranslationCache::new(
+        16 * 1024,
+        crate::native_darwin::darwin_jit::active_host_jit(),
+    )
+    .expect("allocate fault cache");
     let plan = BlockPlan {
         start: GuestVa(0x1c_000),
         end: GuestVa(0x1c_008),
@@ -2702,7 +2837,11 @@ fn dsr_signal_fault_reconstructs_copied_instruction_pc() {
 fn dsr_signal_fault_recovers_context_when_physical_x28_is_zero() {
     let _signal_oracle = install_signal_handlers_for_oracle();
     let guest = GuestVa(0x1c_100);
-    let mut cache = TranslationCache::new(16 * 1024).expect("allocate x28 recovery cache");
+    let mut cache = TranslationCache::new(
+        16 * 1024,
+        crate::native_darwin::darwin_jit::active_host_jit(),
+    )
+    .expect("allocate x28 recovery cache");
     let emitted = emit_block_direct(
         &mut cache,
         &BlockPlan {
@@ -2763,7 +2902,11 @@ fn dsr_concurrency_kick_exits_guarded_linked_loop_without_corrupting_guest_state
 
     let _signal_oracle = install_signal_handlers_for_oracle();
     let guest = GuestVa(0x1c_200);
-    let mut cache = TranslationCache::new(16 * 1024).expect("allocate kick cache");
+    let mut cache = TranslationCache::new(
+        16 * 1024,
+        crate::native_darwin::darwin_jit::active_host_jit(),
+    )
+    .expect("allocate kick cache");
     let generation = AtomicU64::new(CodeGeneration::INITIAL.get());
     let emitted = super::emit::emit_block_with_generation_direct(
         &mut cache,
@@ -2798,15 +2941,13 @@ fn dsr_concurrency_kick_exits_guarded_linked_loop_without_corrupting_guest_state
     )
     .expect("emit kick loop");
     let link = emitted.direct_links()[0];
-    cache
-        .patch_direct_branch(
-            super::cache::LinkSite {
-                source: emitted.entry(),
-                slot: link.slot,
-            },
-            emitted.entry(),
-        )
-        .expect("link kick loop");
+    let site = super::cache::LinkSite {
+        source: emitted.entry(),
+        slot: link.slot,
+    };
+    let word =
+        super::encode_aarch64_direct_branch(site, emitted.entry()).expect("encode kick loop link");
+    cache.patch_code_word(site, word).expect("link kick loop");
     let target = unsafe { libc::pthread_self() };
     let mut signal_set = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
     let mut old_set = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
@@ -2923,7 +3064,11 @@ fn dsr_concurrency_kick_exits_guarded_linked_loop_without_corrupting_guest_state
 fn dsr_pending_kick_during_gateway_entry_keeps_guest_pc() {
     let _signal_oracle = install_signal_handlers_for_oracle();
     let guest = GuestVa(0x1c_300);
-    let mut cache = TranslationCache::new(16 * 1024).expect("allocate entry-kick cache");
+    let mut cache = TranslationCache::new(
+        16 * 1024,
+        crate::native_darwin::darwin_jit::active_host_jit(),
+    )
+    .expect("allocate entry-kick cache");
     let emitted = emit_block_direct(
         &mut cache,
         &BlockPlan {
@@ -2979,7 +3124,11 @@ fn dsr_pending_kick_during_gateway_entry_keeps_guest_pc() {
 fn dsr_host_window_kick_is_deferred_to_next_gateway_entry() {
     let _signal_oracle = install_signal_handlers_for_oracle();
     let guest = GuestVa(0x1c_340);
-    let mut cache = TranslationCache::new(16 * 1024).expect("allocate host-window cache");
+    let mut cache = TranslationCache::new(
+        16 * 1024,
+        crate::native_darwin::darwin_jit::active_host_jit(),
+    )
+    .expect("allocate host-window cache");
     let emitted = emit_block_direct(
         &mut cache,
         &BlockPlan {
@@ -3062,7 +3211,11 @@ fn dsr_reinstall_clears_inherited_host_window_kick() {
         0
     );
     let guest = GuestVa(0x1c_360);
-    let mut cache = TranslationCache::new(16 * 1024).expect("allocate reinstall cache");
+    let mut cache = TranslationCache::new(
+        16 * 1024,
+        crate::native_darwin::darwin_jit::active_host_jit(),
+    )
+    .expect("allocate reinstall cache");
     let emitted = emit_block_direct(
         &mut cache,
         &BlockPlan {
@@ -3105,7 +3258,11 @@ fn dsr_phase_zero_host_kick_keeps_original_guest_snapshot() {
 
     let _signal_oracle = install_signal_handlers_for_oracle();
     let guest = GuestVa(0x1c_380);
-    let mut cache = TranslationCache::new(16 * 1024).expect("allocate host-kick cache");
+    let mut cache = TranslationCache::new(
+        16 * 1024,
+        crate::native_darwin::darwin_jit::active_host_jit(),
+    )
+    .expect("allocate host-kick cache");
     let emitted = emit_block_direct(
         &mut cache,
         &BlockPlan {
@@ -3154,7 +3311,11 @@ fn dsr_phase_zero_host_kick_keeps_original_guest_snapshot() {
 #[test]
 fn dsr_signal_fault_recovers_scratch_in_expanded_x18_load() {
     let _signal_oracle = install_signal_handlers_for_oracle();
-    let mut cache = TranslationCache::new(16 * 1024).expect("allocate x18 fault cache");
+    let mut cache = TranslationCache::new(
+        16 * 1024,
+        crate::native_darwin::darwin_jit::active_host_jit(),
+    )
+    .expect("allocate x18 fault cache");
     let guest_pc = GuestVa(0x1d_000);
     let plan = BlockPlan {
         start: guest_pc,
@@ -3237,7 +3398,11 @@ fn dsr_signal_fault_recovers_scratch_in_expanded_x18_load() {
 #[test]
 fn dsr_signal_fault_preserves_destination_in_expanded_literal_load() {
     let _signal_oracle = install_signal_handlers_for_oracle();
-    let mut cache = TranslationCache::new(16 * 1024).expect("allocate literal fault cache");
+    let mut cache = TranslationCache::new(
+        16 * 1024,
+        crate::native_darwin::darwin_jit::active_host_jit(),
+    )
+    .expect("allocate literal fault cache");
     let guest_pc = GuestVa(0x1e_000);
     let plan = BlockPlan {
         start: guest_pc,

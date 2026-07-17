@@ -28,6 +28,8 @@
 //! while it is in flight the runtime re-exports these modules under their old
 //! paths so call sites are unchanged.
 
+pub mod cache;
 pub mod host;
+pub mod ids;
 pub mod profile;
 pub mod vocabulary;
