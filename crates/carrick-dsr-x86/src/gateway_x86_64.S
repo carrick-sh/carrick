@@ -16,6 +16,8 @@
 .equ CTX_ENTRY,       712
 .equ CTX_EXIT_RESUME, 720
 .equ CTX_EXIT_STATUS, 728
+.equ CTX_GUEST_FSBASE, 776
+.equ CTX_HOST_FSBASE,  784
 
 .text
 
@@ -34,6 +36,17 @@ carrick_dsr_x86_enter_raw:
     // Pin r15 = ctx for the duration of translated execution.
     movq %rdi, %r15
 
+    // Install the guest fs base (Linux thread pointer) when the guest has
+    // one; fs:-prefixed guest TLS accesses then copy through verbatim.
+    // guest_fsbase == 0 means "no guest TLS yet" — skip the swap entirely.
+    // (rax/rcx are dead here: guest GPRs load below.)
+    movq CTX_GUEST_FSBASE(%r15), %rax
+    testq %rax, %rax
+    jz 1f
+    rdfsbase %rcx
+    movq %rcx, CTX_HOST_FSBASE(%r15)
+    wrfsbase %rax
+1:
     // Restore guest SSE/x87, then guest rflags (host stack still active).
     fxrstor SNAP_FXSAVE(%r15)
     pushq SNAP_RFLAGS(%r15)
@@ -116,6 +129,17 @@ carrick_dsr_x86_exit_common:
     // Resume RIP = pre-filled per-block resume target.
     movq CTX_EXIT_RESUME(%r15), %rax
     movq %rax, SNAP_RIP(%r15)
+
+    // Restore the host fs base if the guest's was installed at entry. The
+    // guest cannot have CHANGED fsbase inside a block (wrfsbase/arch_prctl
+    // classify Sensitive and exit), so guest_fsbase needs no re-read. Guest
+    // rflags are already captured — test/jz are safe here.
+    movq CTX_GUEST_FSBASE(%r15), %rax
+    testq %rax, %rax
+    jz 2f
+    movq CTX_HOST_FSBASE(%r15), %rax
+    wrfsbase %rax
+2:
 
     // Restore host callee-saved; return status in %eax. Restore host r15 last.
     movl CTX_EXIT_STATUS(%r15), %eax
