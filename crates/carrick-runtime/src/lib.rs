@@ -284,6 +284,12 @@ pub fn current_thread_states() -> Vec<(thread::ThreadId, char)> {
 ))]
 pub mod trap {
     pub use carrick_hal::{ForkOutcome, RawSyscall, SyscallTrap, TrapError};
+    // Portable helpers the native (DSR) backend shares with the HVF trap
+    // layer; real impls for every host OS live in carrick-host (the HVF trap
+    // module re-exports the same symbols on macOS, so `crate::trap::…`
+    // resolves identically on both platform arms).
+    pub use carrick_host::clock::host_clock_uptime_ns;
+    pub use carrick_host::futex_key::{shared_file_key_base, shared_futex_waiter_key};
     pub const HVF_PAGE_SIZE: u64 = 0x4000;
 
     // Cross-process VM-topology bookkeeping the shared threaded loop references
@@ -344,6 +350,10 @@ pub mod vcpu_loop;
 pub mod threaded_loop;
 
 pub(crate) mod container_policy;
+// Platform-NEUTRAL debug-state snapshot + vDSO attach policy (moved out of the
+// macOS `runtime.rs` arm; both `runtime` arms re-export them so the original
+// `crate::runtime::…` call-site paths resolve on every platform).
+pub mod debug_state;
 #[cfg(feature = "platform-macos")]
 pub mod execute;
 pub mod pty_relay;
@@ -351,6 +361,7 @@ pub mod rootfs;
 #[cfg(feature = "platform-macos")]
 pub mod runtime;
 pub(crate) mod seccomp;
+pub(crate) mod vdso_policy;
 pub mod vfs;
 #[cfg(feature = "platform-macos")]
 pub use execute::Runtime;
@@ -475,6 +486,16 @@ pub mod runtime {
     //! shared loop (Phase 2 + Phase 4 complete), not stubbed `Unsupported`.
     use carrick_guest_mem::GuestMemory;
     use carrick_hal::SyscallTrap;
+
+    // Same `crate::runtime::…` re-export surface as the macOS arm (see
+    // `runtime.rs`): the neutral vDSO attach policy + debug-state snapshot,
+    // referenced by the native backend on every platform.
+    #[allow(unused_imports)]
+    pub(crate) use crate::vdso_policy::{
+        vdso_enabled_for_debug, with_optional_vdso, with_optional_vdso_at,
+    };
+
+    pub use crate::debug_state::{DebugRegionSnapshot, DebugStateSnapshot, maybe_dump_debug_state};
 
     use crate::compat::CompatReporter;
     use crate::dispatch::{DispatchOutcome, SyscallDispatcher, SyscallRequest};
@@ -1565,6 +1586,26 @@ pub mod host_signal {
         publish_pending_for, take_pending_for, take_pending_in_for,
     };
 
+    /// Who owns the vCPU kick after a pending-signal publish (mirrors the HVF
+    /// module's enum so publication call sites compile on every platform).
+    /// These lanes have no HVF signal pump: publication is the neutral core's
+    /// and the caller always manages its own kick (the ActiveGlue kick path),
+    /// so both variants degrade to a plain publish. The FreeBSD NATIVE lane
+    /// will replace this with the real thread-waiter wake registry when the
+    /// native backend's wake plumbing moves to a neutral home.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum PublicationWake {
+        SignalPump,
+        CallerManaged,
+    }
+
+    /// Publish a thread-directed signal with an explicit wake owner. See
+    /// [`PublicationWake`]: no pump exists here, so the wake mode does not
+    /// change behaviour — the caller's own kick closes the lost-wakeup window.
+    pub fn publish_pending_for_with_wake(tid: i32, signum: i32, _wake: PublicationWake) {
+        carrick_signal_core::publish_pending_for(tid, signum);
+    }
+
     // The active backend's host-signal glue (Review-P1 #6 seam). One cfg-selected
     // type alias replaces the per-function backend fanout below: every signal op
     // is now ONE generic call through the shared `carrick_signal_core::host_glue`
@@ -1949,6 +1990,27 @@ pub mod io_wait {
             F: Fn() -> bool,
         {
             ppoll_wait(self.tid, fds, timeout, block_mask, should_interrupt)
+        }
+
+        /// Wait for a child stop/continue notification (mirrors the macOS
+        /// waiter's kqueue-less arm): an empty-fd park whose 50 ms timeout is
+        /// the lost-edge backstop; a kick/pending-signal edge prompts
+        /// immediate re-dispatch via `should_interrupt`.
+        pub fn wait_proc_state_with_dispatch_pending<F>(
+            &self,
+            block_mask: SigBlockMask,
+            should_interrupt: F,
+        ) -> WaitResult
+        where
+            F: Fn() -> bool,
+        {
+            ppoll_wait(
+                self.tid,
+                &[],
+                Some(Duration::from_millis(50)),
+                block_mask,
+                should_interrupt,
+            )
         }
 
         /// `poll(2)`-flavoured wait. On Linux this is the same `ppoll` as

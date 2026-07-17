@@ -147,46 +147,17 @@ use crate::trap::{HvfTrapEngine, TrapError};
 // `carrick_runtime::runtime::SyscallTrap` path (used by the runtime_loop tests
 // and the engine crate) is unchanged.
 pub use crate::trap::SyscallTrap;
-use serde::Serialize;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum VdsoDebugMode {
-    Full,
-    Disabled,
-    NoGetrandom,
-    NoFastpaths,
-    ClockSyscalls,
-}
+// vDSO attach policy (`VdsoDebugMode`, `with_optional_vdso[_at]`,
+// `vdso_enabled_for_debug`) and the `--debug-state-path` snapshot moved to the
+// platform-NEUTRAL `crate::vdso_policy` / `crate::debug_state` modules so the
+// native backend resolves them on every host OS. Re-exported here so the
+// original `crate::runtime::…` paths are unchanged on this arm.
+pub(crate) use crate::vdso_policy::{
+    debug_env_flag_enabled, vdso_enabled_for_debug, with_optional_vdso, with_optional_vdso_at,
+};
 
-pub(crate) fn vdso_enabled_for_debug() -> bool {
-    vdso_debug_mode() != VdsoDebugMode::Disabled
-}
-
-fn vdso_debug_mode() -> VdsoDebugMode {
-    vdso_debug_mode_from_env(
-        std::env::var("CARRICK_DISABLE_VDSO").ok().as_deref(),
-        std::env::var("CARRICK_VDSO_MODE").ok().as_deref(),
-    )
-}
-
-fn vdso_debug_mode_from_env(disable: Option<&str>, mode: Option<&str>) -> VdsoDebugMode {
-    if debug_env_flag_enabled(disable) {
-        return VdsoDebugMode::Disabled;
-    }
-    match mode {
-        Some("no-getrandom" | "nogetrandom" | "without-getrandom") => VdsoDebugMode::NoGetrandom,
-        Some("no-fastpaths" | "nofastpaths" | "minimal") => VdsoDebugMode::NoFastpaths,
-        Some("clock-syscalls" | "clocksyscalls" | "clock-syscall") => VdsoDebugMode::ClockSyscalls,
-        _ => VdsoDebugMode::Full,
-    }
-}
-
-fn debug_env_flag_enabled(value: Option<&str>) -> bool {
-    matches!(
-        value,
-        Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
-    )
-}
+pub use crate::debug_state::{DebugRegionSnapshot, DebugStateSnapshot, maybe_dump_debug_state};
 
 pub(crate) fn hardware_tso_for_debug(requested: bool) -> bool {
     requested && !debug_env_flag_enabled(std::env::var("CARRICK_DISABLE_TSO").ok().as_deref())
@@ -195,104 +166,6 @@ pub(crate) fn hardware_tso_for_debug(requested: bool) -> bool {
 #[cfg(test)]
 fn hardware_tso_for_debug_from_env(requested: bool, disable: Option<&str>) -> bool {
     requested && !debug_env_flag_enabled(disable)
-}
-
-pub(crate) fn with_optional_vdso<A: carrick_hal::GuestArch>(
-    image: AddressSpace,
-) -> Result<AddressSpace, AddressSpaceError> {
-    with_optional_vdso_at::<A>(
-        image,
-        crate::vdso::LINUX_VVAR_BASE,
-        crate::vdso::LINUX_VDSO_BASE,
-    )
-}
-
-/// [`with_optional_vdso`] with caller-chosen vvar/vdso guest VAs — the Darwin
-/// native backend relocates both pages out of the Darwin-reserved host VA hole
-/// the canonical bases sit in (see `AddressSpace::with_vdso_bytes_at`). The
-/// same `CARRICK_DISABLE_VDSO` / `CARRICK_VDSO_MODE` debug controls apply.
-pub(crate) fn with_optional_vdso_at<A: carrick_hal::GuestArch>(
-    image: AddressSpace,
-    vvar_base: u64,
-    vdso_base: u64,
-) -> Result<AddressSpace, AddressSpaceError> {
-    let vdso_bytes = match vdso_debug_mode() {
-        VdsoDebugMode::Full => A::vdso_bytes(),
-        VdsoDebugMode::Disabled => return Ok(image),
-        // Debug variants are aarch64-only escape hatches; only the production
-        // image routes through GuestArch.
-        VdsoDebugMode::NoGetrandom => crate::vdso::vdso_image_bytes_without_getrandom(),
-        VdsoDebugMode::NoFastpaths => crate::vdso::vdso_image_bytes_without_fastpaths(),
-        VdsoDebugMode::ClockSyscalls => crate::vdso::vdso_image_bytes_with_clock_syscalls(),
-    };
-    image.with_vdso_bytes_at(vdso_bytes, vvar_base, vdso_base)
-}
-
-/// JSON-serialisable snapshot of the guest layout the trap engine is about
-/// to run. Written by `run-elf --debug-state-path` / `run --debug-state-path`
-/// before vCPU launch so the lldb plugin can resolve guest addresses back
-/// to image / segment context.
-#[derive(Debug, Clone, Serialize, serde::Deserialize)]
-pub struct DebugStateSnapshot {
-    pub entry: u64,
-    pub initial_stack_pointer: Option<u64>,
-    pub el0_trampoline_entry: Option<u64>,
-    pub el1_vectors_base: Option<u64>,
-    pub stage1_page_tables_base: Option<u64>,
-    pub regions: Vec<DebugRegionSnapshot>,
-}
-
-#[derive(Debug, Clone, Serialize, serde::Deserialize)]
-pub struct DebugRegionSnapshot {
-    pub start: u64,
-    pub end: u64,
-    pub read: bool,
-    pub write: bool,
-    pub execute: bool,
-}
-
-impl DebugStateSnapshot {
-    pub fn from_address_space(image: &AddressSpace) -> Self {
-        Self {
-            entry: image.entry(),
-            initial_stack_pointer: image.initial_stack_pointer(),
-            el0_trampoline_entry: image.el0_trampoline_entry(),
-            el1_vectors_base: image.el1_vectors_base(),
-            stage1_page_tables_base: image.stage1_page_tables_base(),
-            regions: image
-                .regions()
-                .iter()
-                .map(|region| DebugRegionSnapshot {
-                    start: region.start,
-                    end: region.end,
-                    read: region.perms.read,
-                    write: region.perms.write,
-                    execute: region.perms.execute,
-                })
-                .collect(),
-        }
-    }
-
-    pub fn write_to(&self, path: &Path) -> std::io::Result<()> {
-        let bytes = serde_json::to_vec_pretty(self)
-            .map_err(|e| std::io::Error::other(format!("serialize: {e}")))?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(path, bytes)
-    }
-}
-
-/// Write a debug-state snapshot iff a path was provided. Returns the path
-/// back so the CLI can mention it.
-pub fn maybe_dump_debug_state(image: &AddressSpace, path: Option<&PathBuf>) -> Option<PathBuf> {
-    let path = path?;
-    let snapshot = DebugStateSnapshot::from_address_space(image);
-    if let Err(err) = snapshot.write_to(path) {
-        eprintln!("warning: failed to write debug state to {path:?}: {err}");
-        return None;
-    }
-    Some(path.clone())
 }
 
 pub const DEFAULT_MAX_TRAPS: usize = 1_000_000;
@@ -2421,46 +2294,8 @@ mod tests {
         assert_eq!(argv, vec![b"/bin/true".to_vec()]);
     }
 
-    #[test]
-    fn vdso_debug_control_is_opt_out() {
-        assert_eq!(vdso_debug_mode_from_env(None, None), VdsoDebugMode::Full);
-        assert_eq!(
-            vdso_debug_mode_from_env(Some("0"), None),
-            VdsoDebugMode::Full
-        );
-        assert_eq!(
-            vdso_debug_mode_from_env(Some("false"), None),
-            VdsoDebugMode::Full
-        );
-        assert_eq!(
-            vdso_debug_mode_from_env(None, Some("no-getrandom")),
-            VdsoDebugMode::NoGetrandom
-        );
-        assert_eq!(
-            vdso_debug_mode_from_env(None, Some("no-fastpaths")),
-            VdsoDebugMode::NoFastpaths
-        );
-        assert_eq!(
-            vdso_debug_mode_from_env(None, Some("clock-syscalls")),
-            VdsoDebugMode::ClockSyscalls
-        );
-        assert_eq!(
-            vdso_debug_mode_from_env(Some("1"), Some("no-getrandom")),
-            VdsoDebugMode::Disabled
-        );
-        assert_eq!(
-            vdso_debug_mode_from_env(Some("true"), None),
-            VdsoDebugMode::Disabled
-        );
-        assert_eq!(
-            vdso_debug_mode_from_env(Some("yes"), None),
-            VdsoDebugMode::Disabled
-        );
-        assert_eq!(
-            vdso_debug_mode_from_env(Some("on"), None),
-            VdsoDebugMode::Disabled
-        );
-    }
+    // `vdso_debug_control_is_opt_out` moved to `crate::vdso_policy` with the
+    // code it tests.
 
     #[test]
     fn hardware_tso_debug_control_only_suppresses_requested_tso() {

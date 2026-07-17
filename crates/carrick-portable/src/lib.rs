@@ -1608,6 +1608,97 @@ mod bsd_extattr_tests {
     }
 }
 
+/// Absolute host path of an open descriptor. The path-based fallbacks need it:
+/// symlink xattr ops cannot go through an fd (cap-std can't open a symlink —
+/// its `O_NOFOLLOW` conflicts with `O_SYMLINK`), so the link's own xattrs are
+/// reached by absolute path. Per-OS kernel facility:
+///   * Darwin/NetBSD — `fcntl(F_GETPATH)` into a `PATH_MAX` buffer.
+///   * FreeBSD — `fcntl(F_KINFO)` (`kinfo_file.kf_path`; FreeBSD has no
+///     `F_GETPATH`).
+///   * Linux — `readlink("/proc/self/fd/<fd>")`.
+/// `None` when the kernel cannot name the fd (unlinked vnode, no path cached).
+pub fn fd_abs_path(fd: std::os::fd::RawFd) -> Option<std::path::PathBuf> {
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "netbsd"))]
+    {
+        let mut buf = [0u8; libc::PATH_MAX as usize];
+        // SAFETY: buf is PATH_MAX bytes, the size F_GETPATH writes up to.
+        let rc = unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr() as *mut libc::c_char) };
+        if rc < 0 {
+            return None;
+        }
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        if end == 0 {
+            return None;
+        }
+        use std::os::unix::ffi::OsStringExt;
+        Some(std::path::PathBuf::from(std::ffi::OsString::from_vec(
+            buf[..end].to_vec(),
+        )))
+    }
+    #[cfg(target_os = "freebsd")]
+    {
+        // SAFETY: a zeroed kinfo_file with kf_structsize set is the documented
+        // F_KINFO input; the kernel fills kf_path NUL-terminated.
+        let mut kif: libc::kinfo_file = unsafe { core::mem::zeroed() };
+        kif.kf_structsize = core::mem::size_of::<libc::kinfo_file>() as libc::c_int;
+        // SAFETY: kif is a valid kinfo_file we own for the duration of the call.
+        let rc = unsafe { libc::fcntl(fd, libc::F_KINFO, &mut kif as *mut libc::kinfo_file) };
+        if rc < 0 {
+            return None;
+        }
+        let bytes: Vec<u8> = kif
+            .kf_path
+            .iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c as u8)
+            .collect();
+        if bytes.is_empty() {
+            return None;
+        }
+        use std::os::unix::ffi::OsStringExt;
+        Some(std::path::PathBuf::from(std::ffi::OsString::from_vec(
+            bytes,
+        )))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_link(format!("/proc/self/fd/{fd}")).ok()
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "netbsd",
+        target_os = "freebsd",
+        target_os = "linux"
+    )))]
+    {
+        let _ = fd;
+        None
+    }
+}
+
+#[cfg(test)]
+mod fd_abs_path_tests {
+    #[test]
+    fn open_directory_reports_its_absolute_path() {
+        use std::os::fd::AsRawFd;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = std::fs::File::open(dir.path()).expect("open dir");
+        let got = super::fd_abs_path(f.as_raw_fd()).expect("fd_abs_path");
+        // Compare canonicalized: the tempdir path may traverse symlinks
+        // (/tmp → /private/tmp on Darwin) while the kernel reports the real path.
+        assert_eq!(
+            got,
+            std::fs::canonicalize(dir.path()).expect("canonicalize")
+        );
+    }
+
+    #[test]
+    fn invalid_fd_reports_none() {
+        assert_eq!(super::fd_abs_path(-1), None);
+    }
+}
+
 /// Host-neutral tests for the PURE transforms (no syscalls). These run on the
 /// macOS CI host — the very point of hoisting the logic here — covering the BSD
 /// xattr-namespace mapping, the SysV `ipc_perm` packing/masking, and the
