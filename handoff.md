@@ -269,6 +269,41 @@ dispatch-path read is host code). Rung 2 needs a protection model on the
 identity memory (or a syscall-path fault guard), proper auxv/TLS/AT_SYSINFO
 setup, and the blocking-wait/thread/fork/signal dispatch outcomes.
 
+### Perf ceiling found (dtrace): direct-branch chaining is the next lever
+
+The guest brk/mmap arenas are now backed (`GuestArenas::reserve` — MAP_FIXED RW
+at heap 256 GiB/128 MiB, mmap 384 GiB/32 GiB), so real static-pie **musl**
+probes run to completion through the real dispatcher: `brkheapgrow` and
+`mmapreuse` exit 0, `roreadwrite`/`protnonesyscall` run and emit output. A
+block cache (guest-VA keyed, `VaHasher` FxHash-style — the default SipHash
+showed up in an lldb backtrace as the hot per-lookup cost) avoids
+re-translation. `examples/native_run.rs` is the standalone single-run driver
+for lldb/dtrace attach.
+
+Diagnosis method (per the rig's tooling): lldb backtrace to see WHERE a run is
+parked, dtrace `profile-997` to see where time GOES across the whole run
+(`dtrace -n 'profile-997 /pid==N/ { @[ustack()]=count(); } tick-Ns{exit(0)}'`).
+Both pointed the same way:
+- Micro-probe "hangs" were NOT deadlocks: `bigread` deliberately
+  `read(fd, 1<<46)` → the dispatcher's read handler eagerly `vec![0u8; 1<<46]`
+  (70 TB alloc) and also `fork()`s (unserviced) — a pathological probe, not a
+  lane bug.
+- A real std Rust static-musl binary (Vec/iterators/`println!`) EXECUTES
+  (dtrace shows JIT-cache guest code + host memcpy dominating, no futex
+  deadlock) but its heavy startup runs far more blocks than a bare probe and
+  each guest branch is an UNCHAINED gateway round-trip (fxsave/fxrstor of the
+  512-byte SSE area + full enter/exit per block). It does not finish within
+  minutes.
+
+**Therefore the highest-value next step is DIRECT-BRANCH CHAINING** (design
+non-goal #6, deferred until a real binary ran — it now does): patch resolved
+blocks together so hot loops run without returning to Rust per branch. This
+matters more for real workloads (std Rust / cpython / go — AGENTS.md: "LTP
+parity is NOT workload coverage") than grinding rung-2 fork/threads for
+micro-probes. A cheaper interim win: make `fxsave`/`fxrstor` conditional on the
+block actually using SSE/x87 (most don't), which needs the block planner to
+flag SSE use.
+
 ### Census evidence (real musl already translates)
 
 A throwaway harness ran a real prebuilt static-pie **musl** probe
