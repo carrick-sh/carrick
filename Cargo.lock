@@ -422,6 +422,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "carrick-dsr"
+version = "0.1.0"
+dependencies = [
+ "carrick-host",
+ "libc",
+ "thiserror",
+]
+
+[[package]]
 name = "carrick-engine"
 version = "0.1.0"
 dependencies = [
@@ -561,6 +570,7 @@ dependencies = [
  "camino",
  "cap-std",
  "carrick-abi",
+ "carrick-dsr",
  "carrick-guest-mem",
  "carrick-hal",
  "carrick-host",
