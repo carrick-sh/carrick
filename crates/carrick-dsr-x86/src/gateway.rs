@@ -123,6 +123,12 @@ pub struct X86DsrContext {
     pub exit_syscall_addr: u64,
     pub exit_indirect_addr: u64,
     pub exit_sensitive_addr: u64,
+    /// Spill slot for the emitter's RIP-relative rewrite: emitted code saves
+    /// one guest GPR here (`mov [r15+CTX_SCRATCH], reg`), materializes the
+    /// absolute guest VA in it, runs the re-encoded instruction, and restores
+    /// the GPR — all `mov`s, so guest rflags survive. Never read by Rust or
+    /// the gateway asm; live only within one rewritten instruction sequence.
+    pub scratch: u64,
 }
 
 /// Byte offset of [`X86DsrContext::exit_syscall_addr`] for `jmp *disp(%r15)`.
@@ -131,6 +137,9 @@ pub const CTX_EXIT_SYSCALL_ADDR: i32 = 736;
 pub const CTX_EXIT_INDIRECT_ADDR: i32 = 744;
 /// Byte offset of [`X86DsrContext::exit_sensitive_addr`].
 pub const CTX_EXIT_SENSITIVE_ADDR: i32 = 752;
+/// Byte offset of [`X86DsrContext::scratch`] for the emitter's RIP-relative
+/// rewrite spill (`mov [r15+CTX_SCRATCH], reg` / restore).
+pub const CTX_SCRATCH: i32 = 760;
 /// Byte offset of [`X86DsrContext::entry`] (unused by emitted code — the
 /// trampoline reads it — but asserted for parity with the `.S`).
 pub const CTX_ENTRY: i32 = 712;
@@ -148,6 +157,7 @@ impl X86DsrContext {
             exit_syscall_addr: 0,
             exit_indirect_addr: 0,
             exit_sensitive_addr: 0,
+            scratch: 0,
         }
     }
 }
@@ -168,6 +178,8 @@ const _: () = assert!(std::mem::offset_of!(X86DsrContext, exit_status) == 728);
 const _: () = assert!(std::mem::offset_of!(X86DsrContext, exit_syscall_addr) == 736);
 const _: () = assert!(std::mem::offset_of!(X86DsrContext, exit_indirect_addr) == 744);
 const _: () = assert!(std::mem::offset_of!(X86DsrContext, exit_sensitive_addr) == 752);
+const _: () = assert!(std::mem::offset_of!(X86DsrContext, scratch) == 760);
+const _: () = assert!(std::mem::offset_of!(X86DsrContext, scratch) as i32 == CTX_SCRATCH);
 const _: () =
     assert!(std::mem::offset_of!(X86DsrContext, exit_syscall_addr) as i32 == CTX_EXIT_SYSCALL_ADDR);
 const _: () = assert!(std::mem::offset_of!(X86DsrContext, entry) as i32 == CTX_ENTRY);
