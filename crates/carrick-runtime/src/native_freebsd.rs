@@ -379,6 +379,34 @@ enum Step {
     Fault(String),
 }
 
+/// A minimal multiply-based hasher for the guest-VA block cache. The default
+/// `HashMap` uses SipHash (DoS-resistant but slow), and an lldb backtrace of a
+/// hot guest loop showed SipHash dominating — the cache is looked up once per
+/// block per iteration, millions of times. The keys are our OWN guest VAs (no
+/// adversarial input), so a single FxHash-style multiply is both correct and
+/// far cheaper. Only `write_u64` is exercised (u64 keys); other inputs fold in
+/// byte-wise so the impl is still a valid `Hasher`.
+#[derive(Default)]
+struct VaHasher(u64);
+
+impl std::hash::Hasher for VaHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_u64(u64::from(b));
+        }
+    }
+    fn write_u64(&mut self, value: u64) {
+        // FxHash's rotate-xor-multiply step (rustc's `rustc-hash`).
+        const K: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+        self.0 = (self.0.rotate_left(5) ^ value).wrapping_mul(K);
+    }
+}
+
+type VaBuildHasher = std::hash::BuildHasherDefault<VaHasher>;
+
 /// Serializes in-process runs. This driver mutates PROCESS-GLOBAL state — the
 /// fixed guest arenas (MAP_FIXED at the layout addresses) and the process-wide
 /// fault-redirect sigaction/code-region registration — so two concurrent runs
@@ -462,40 +490,64 @@ where
     let mut fault_detail: Option<String> = None;
     let mut trap_limit_hit = false;
 
-    'run: while traps < max_traps {
-        let block = match plan_block(next, 256, PAGE, read_guest) {
-            Ok(b) => b,
-            Err(e) => {
-                fault_detail = Some(format!("plan_block at 0x{next:x}: {e}"));
-                break;
-            }
-        };
-        let body = read_block(&block);
-        let translated = match emit_block(&body, &block) {
-            Ok(t) => t,
-            Err(e) => {
-                fault_detail = Some(format!("emit_block at 0x{next:x} ({:?}): {e}", block.exit));
-                break;
-            }
-        };
-        // SAFETY: the JIT region is mapped for the run; blocks are tiny.
-        let exec = unsafe { region.exec_base.as_ptr().add(cursor) };
-        let wptr = match region.write_ptr_for(exec) {
-            Some(p) => p,
-            None => {
-                fault_detail = Some("JIT write alias out of range".to_string());
-                break;
-            }
-        };
-        // SAFETY: wptr is the RW alias of exec; translated fits the cache.
-        unsafe { std::ptr::copy_nonoverlapping(translated.as_ptr(), wptr, translated.len()) };
-        jit.flush_icache(exec, translated.len());
-        cursor += translated.len();
-        if cursor > 4 * 1024 * 1024 - 4096 {
-            cursor = 0;
-        }
+    // Translated-block cache keyed by guest VA. Without it a hot guest loop
+    // re-plans and re-emits the SAME block every iteration (bigread/aliassize
+    // execute millions of blocks — the earlier "hangs" were re-translation
+    // cost, not deadlock, per an lldb backtrace parked in the emit closure).
+    // Guest text is read-only here (no self-modifying-code handling yet), so a
+    // guest VA always translates to the same bytes — the entry is valid for
+    // the whole run. Cursor is monotonic (no wrap): distinct blocks are
+    // bounded by the guest's code size.
+    const CODE_CACHE_LEN: usize = 4 * 1024 * 1024;
+    let mut cache: std::collections::HashMap<u64, (u64, X86Exit), VaBuildHasher> =
+        std::collections::HashMap::default();
 
-        let resume = match block.exit {
+    'run: while traps < max_traps {
+        let (exec, exit) = if let Some(&hit) = cache.get(&next) {
+            hit
+        } else {
+            let block = match plan_block(next, 256, PAGE, read_guest) {
+                Ok(b) => b,
+                Err(e) => {
+                    fault_detail = Some(format!("plan_block at 0x{next:x}: {e}"));
+                    break;
+                }
+            };
+            let body = read_block(&block);
+            let translated = match emit_block(&body, &block) {
+                Ok(t) => t,
+                Err(e) => {
+                    fault_detail =
+                        Some(format!("emit_block at 0x{next:x} ({:?}): {e}", block.exit));
+                    break;
+                }
+            };
+            if cursor + translated.len() > CODE_CACHE_LEN {
+                fault_detail = Some(format!(
+                    "JIT code cache exhausted ({CODE_CACHE_LEN} bytes) translating 0x{next:x}"
+                ));
+                break;
+            }
+            // SAFETY: the JIT region is mapped for the run; cursor is in range.
+            let exec = unsafe { region.exec_base.as_ptr().add(cursor) };
+            let wptr = match region.write_ptr_for(exec) {
+                Some(p) => p,
+                None => {
+                    fault_detail = Some("JIT write alias out of range".to_string());
+                    break;
+                }
+            };
+            // SAFETY: wptr is the RW alias of exec; translated fits.
+            unsafe { std::ptr::copy_nonoverlapping(translated.as_ptr(), wptr, translated.len()) };
+            jit.flush_icache(exec, translated.len());
+            cursor += translated.len();
+            let entry = (exec as u64, block.exit);
+            cache.insert(next, entry);
+            entry
+        };
+        let exec = exec as *const u8;
+
+        let resume = match exit {
             X86Exit::Syscall { resume, .. } => resume,
             X86Exit::ControlFlow { va, .. } | X86Exit::Sensitive { va, .. } => va,
             X86Exit::Continue { target, .. } => target,
@@ -543,7 +595,7 @@ where
                     }
                 }
             }
-            Some(X86ExitStatus::Indirect) => match block.exit {
+            Some(X86ExitStatus::Indirect) => match exit {
                 X86Exit::ControlFlow { va, .. } => {
                     let branch = read_guest(va);
                     match cflow::resolve(&branch, va, &mut snapshot) {
@@ -558,7 +610,7 @@ where
                 _ => unreachable!("Indirect exit only from ControlFlow/Continue"),
             },
             Some(X86ExitStatus::Sensitive) => {
-                if let X86Exit::Sensitive { va, len, kind } = block.exit {
+                if let X86Exit::Sensitive { va, len, kind } = exit {
                     match service_sensitive(kind, &mut snapshot) {
                         Ok(()) => next = va + len as u64,
                         Err(detail) => {
