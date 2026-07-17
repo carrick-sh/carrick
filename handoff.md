@@ -81,6 +81,38 @@ What exists now:
    parity + a `FreebsdNativeLocal` conformance lane. The Docker oracle on
    this box runs native amd64 — a real x86 oracle, which macOS never had.
 
+
+## Late-session addendum (same day): M0.7 + M0.8 core landed too
+
+Three more commits past the green build (12 total):
+
+- **carrick-native-freebsd** — REAL dual-mapped W^X JIT (SHM_ANON, RX+RW
+  views, no protection flips; tests prove written bytes EXECUTE on this
+  rig). Fork-sharing hazard documented: MAP_SHARED dual maps are shared
+  across fork (Darwin MAP_JIT is CoW) — M1 must add a region-remap hook to
+  the host seam before any forking guest runs on this lane.
+- **carrick-dsr-x86** — decode rung over iced-x86 (new workspace dep,
+  decoder+instr_info): variable-length classification with the full
+  sensitive catalog (syscall/int80/rdtsc(p)/cpuid/{rd,wr}{fs,gs}base/
+  fs-gs-prefixed); lock-prefixed RMWs = Copy (no fusion apparatus on x86);
+  Truncated vs Undecodable are distinct so the planner can re-fetch at
+  page boundaries. Plan IR/emitter/gateway deliberately absent pending
+  their design docs.
+- **ExecutionBackend::Native + capability table** (M0.8 core): the
+  (host OS, host ISA) lane table lives in page_profile's resolver;
+  FreeBSD/amd64 reports the honest bring-up reason. Fixed a REAL policy
+  bug: non-macOS run_oci silently substituted the VMM for
+  `--exec-backend native` (the default!) — now `carrick run` on FreeBSD
+  exits 125 with the typed error, and `--exec-backend vmm` still runs.
+  The FreeBSD host JIT is wired into active_host_jit().
+- **Discovery:** the bhyve VMM lane RUNS linux/amd64 guests on this rig
+  (verified live: alpine sh -c echo). M2's differential/oracle work has a
+  local lane; the box also has native amd64 Docker for the real oracle.
+- Deferred deliberately: the native_darwin -> native module rename (do it
+  AFTER the macOS verification pass so the mac diff stays reviewable),
+  and M0.6 (carrick-native-darwin host crate — needs a mac to verify;
+  its shape is fully specced by darwin_jit.rs + csrc/native_darwin.c).
+
 ## Rig facts and hazards (this FreeBSD box)
 
 - Toolchain: FreeBSD-native rustc 1.96.0 with aarch64-apple-darwin std
