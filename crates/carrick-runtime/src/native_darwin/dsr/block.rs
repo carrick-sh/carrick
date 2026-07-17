@@ -3,7 +3,7 @@
 use carrick_guest_mem::GuestVa;
 
 use super::super::NativeMappedMemory;
-use super::counter::{self, HostCounterSource};
+use super::counter::{self, HostCounterPlan};
 use super::decode;
 use super::types::{
     BiasedExclusiveScratch, CodeGeneration, CounterDestination, CounterRead, DirectExit,
@@ -137,24 +137,24 @@ fn plan_with_reader(
     fusion_policy: ExclusiveFusionPolicy,
     read: impl FnMut(GuestVa) -> Result<u32, DsrError>,
 ) -> Result<BlockPlan, DsrError> {
-    plan_with_reader_for_counter_source(
+    plan_with_reader_for_counter_plan(
         start,
         generation,
         max_instructions,
         page_size,
         fusion_policy,
-        counter::host_counter_source(),
+        counter::host_counter_plan(),
         read,
     )
 }
 
-fn plan_with_reader_for_counter_source(
+fn plan_with_reader_for_counter_plan(
     start: GuestVa,
     generation: CodeGeneration,
     max_instructions: usize,
     page_size: u64,
     fusion_policy: ExclusiveFusionPolicy,
-    counter_source: HostCounterSource,
+    counter_plan: HostCounterPlan,
     mut read: impl FnMut(GuestVa) -> Result<u32, DsrError>,
 ) -> Result<BlockPlan, DsrError> {
     if max_instructions == 0 {
@@ -279,14 +279,17 @@ fn plan_with_reader_for_counter_source(
         }
         let exit = match action {
             InstAction::CounterRead(CounterRead { destination })
-                if counter::counter_word(
-                    counter_source,
-                    match destination {
-                        CounterDestination::Gpr(index) => u32::from(index),
-                        CounterDestination::Discard => 31,
-                    },
-                )
-                .is_none() =>
+                if !matches!(
+                    counter_plan,
+                    HostCounterPlan::Inline { source, .. }
+                        if counter::counter_word(
+                            source,
+                            match destination {
+                                CounterDestination::Gpr(index) => u32::from(index),
+                                CounterDestination::Discard => 31,
+                            },
+                        ).is_some()
+                ) =>
             {
                 Some(PlannedExit::Sensitive {
                     guest: pc,
@@ -769,7 +772,6 @@ fn analyze_exclusive_region(
 
 #[cfg(test)]
 mod tests {
-    use super::super::counter::HostCounterSource;
     use super::*;
 
     fn plan_words(
@@ -806,13 +808,16 @@ mod tests {
     fn counter_fallback_terminates_at_sensitive_exit() {
         let start = GuestVa(0x4800);
         let mut reads = 0;
-        let plan = plan_with_reader_for_counter_source(
+        let plan = plan_with_reader_for_counter_plan(
             start,
             CodeGeneration::INITIAL,
             16,
             0x1000,
             ExclusiveFusionPolicy::BiasedDisabled,
-            HostCounterSource::MachAbsoluteTime,
+            HostCounterPlan::Fallback {
+                scale: super::super::counter::CounterScale::new(1, 1)
+                    .expect("identity counter scale"),
+            },
             |pc| {
                 reads += 1;
                 assert_eq!(pc, start);
@@ -837,6 +842,48 @@ mod tests {
                 fusion: None,
             } if guest == start && resume == GuestVa(0x4804)
         ));
+    }
+
+    #[test]
+    fn counter_mode_one_stays_inline() {
+        let start = GuestVa(0x4900);
+        let words = [0xd53b_e042, 0xd400_0001];
+        let mut reads = 0;
+        let plan = plan_with_reader_for_counter_plan(
+            start,
+            CodeGeneration::INITIAL,
+            16,
+            0x1000,
+            ExclusiveFusionPolicy::BiasedDisabled,
+            HostCounterPlan::Inline {
+                source: super::super::counter::HostCounterSource::Cntvct,
+                scale: super::super::counter::CounterScale::new(1, 1)
+                    .expect("identity counter scale"),
+            },
+            |pc| {
+                let index =
+                    usize::try_from((pc.raw() - start.raw()) / 4).expect("counter word index");
+                reads += 1;
+                words
+                    .get(index)
+                    .copied()
+                    .ok_or_else(|| DsrError::MemoryRead {
+                        pc: pc.raw(),
+                        detail: "counter test exhausted".to_string(),
+                    })
+            },
+        )
+        .expect("plan inline mode-one counter");
+
+        assert_eq!(reads, 2);
+        assert_eq!(plan.instructions.len(), 1);
+        assert!(matches!(
+            plan.instructions[0].action,
+            InstAction::CounterRead(CounterRead {
+                destination: CounterDestination::Gpr(2)
+            })
+        ));
+        assert!(matches!(plan.exit, PlannedExit::Syscall { .. }));
     }
 
     #[test]
