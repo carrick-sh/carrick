@@ -76,6 +76,11 @@ a small typed plan. The current host reports mode 3, for which Apple's
 `S3_4_C15_C10_6`; older mode 1 hosts use `CNTVCT_EL0`. Both explicitly known
 modes receive an inline DSR plan:
 
+Discover the mode with `mach_vm_read_overwrite` against `mach_task_self` rather
+than dereferencing the fixed address. A short or failed read is an unreadable
+mode and selects the same fallback as an unknown value. Scale acquisition reads
+only `CNTFRQ_EL0`; it never samples raw `CNTVCT_EL0`.
+
 1. materialize the fixed commpage timebase address in a Carrick scratch
    register;
 2. load the signed/wrapping counter offset;
@@ -144,7 +149,7 @@ retain one timeline without changing the shared vvar ABI.
 ## Error handling
 
 - An unreadable or unknown commpage mode selects the gateway fallback; it does
-  not abort native startup.
+  not abort native startup or fault while probing the fixed address.
 - The inline sequence retries only while Darwin changes the offset. It has no
   user-controlled address or unbounded host allocation.
 - On supported aarch64 macOS, the fallback uses the total

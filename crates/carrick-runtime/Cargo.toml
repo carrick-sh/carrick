@@ -112,6 +112,7 @@ applevisor.workspace = true
 applevisor-sys.workspace = true
 bad64.workspace = true
 dynasmrt.workspace = true
+mach2.workspace = true
 
 [build-dependencies]
 cc = "1"

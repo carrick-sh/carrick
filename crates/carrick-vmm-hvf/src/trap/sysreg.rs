@@ -70,10 +70,11 @@ pub fn decode_el0_sys64_read(esr: u64) -> Option<(u8, El0SysRegRead)> {
     Some((rt, reg))
 }
 
-/// Read the host's ARM generic-timer virtual count and frequency at EL0. With
-/// `CNTKCTL_EL1.EL0VCTEN` set, the guest reads the SAME counter via CNTVCT_EL0,
-/// so these calibrate the vDSO's clock conversion. (macOS allows EL0 reads of
-/// both registers.)
+/// Read the host's raw ARM generic-timer virtual count and frequency at EL0.
+///
+/// Keep this pair for diagnostics and oracles that intentionally compare the
+/// raw, suspend-including counter with Darwin uptime. Frequency-only production
+/// paths use [`host_counter_frequency`] so they never execute `CNTVCT_EL0`.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub fn host_counter() -> (u64, u64) {
     let (cntvct, cntfrq): (u64, u64);
@@ -83,6 +84,21 @@ pub fn host_counter() -> (u64, u64) {
         core::arch::asm!("mrs {}, cntfrq_el0", out(reg) cntfrq, options(nomem, nostack));
     }
     (cntvct, cntfrq)
+}
+
+/// Read only the host ARM generic-timer frequency at EL0.
+///
+/// Capability and scale planning must not sample `CNTVCT_EL0`: that counter
+/// includes host suspend on Apple Silicon and is not the Darwin uptime source
+/// exposed to native guests. macOS permits the frequency read at EL0.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub fn host_counter_frequency() -> u64 {
+    let cntfrq: u64;
+    // SAFETY: cntfrq_el0 is an unprivileged read on aarch64 macOS.
+    unsafe {
+        core::arch::asm!("mrs {}, cntfrq_el0", out(reg) cntfrq, options(nomem, nostack));
+    }
+    cntfrq
 }
 
 /// Read the host's CTR_EL0 (cache type) and DCZID_EL0 (DC ZVA block id) at EL0.

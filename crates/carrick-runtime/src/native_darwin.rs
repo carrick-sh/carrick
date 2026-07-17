@@ -1081,8 +1081,10 @@ fn with_native_vdso(image: AddressSpace) -> Result<AddressSpace, AddressSpaceErr
 /// zero-frequency guard; the native backend only ever RUNS on aarch64 macOS.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn native_vvar_clock_sources() -> (u64, u64) {
-    let (_, freq) = crate::trap::host_counter();
-    (freq, crate::trap::host_clock_uptime_ns())
+    (
+        crate::trap::host_counter_frequency(),
+        crate::trap::host_clock_uptime_ns(),
+    )
 }
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
@@ -12634,7 +12636,7 @@ mod tests {
         let uptime_ns = crate::trap::host_clock_uptime_ns();
         let ticks_after =
             dsr::execute_virtual_counter_for_test().expect("execute second virtual counter read");
-        let (_, freq) = crate::trap::host_counter();
+        let freq = crate::trap::host_counter_frequency();
         assert!(freq > 0, "CNTFRQ_EL0 read zero at EL0");
         assert!(
             ticks_after >= ticks_before,

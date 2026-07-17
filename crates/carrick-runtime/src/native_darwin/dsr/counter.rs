@@ -81,16 +81,16 @@ fn scale_from_timebase(numerator: u32, denominator: u32, frequency: u64) -> Opti
     CounterScale::new(numerator, denominator)
 }
 
-pub(super) fn plan_for_mode(mode: u8, host_scale: Option<CounterScale>) -> HostCounterPlan {
+pub(super) fn plan_for_mode(mode: Option<u8>, host_scale: Option<CounterScale>) -> HostCounterPlan {
     match mode {
-        1 => HostCounterPlan::Inline {
+        Some(1) => HostCounterPlan::Inline {
             source: HostCounterSource::Cntvct,
             scale: CounterScale {
                 numerator: 1,
                 denominator: 1,
             },
         },
-        3 => host_scale.map_or(HostCounterPlan::Unsupported, |scale| {
+        Some(3) => host_scale.map_or(HostCounterPlan::Unsupported, |scale| {
             HostCounterPlan::Inline {
                 source: HostCounterSource::AppleTimebase,
                 scale,
@@ -114,6 +114,30 @@ pub(super) const fn counter_word(source: HostCounterSource, destination: u32) ->
     }
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn host_commpage_mode() -> Option<u8> {
+    let mut mode = 0_u8;
+    let mut bytes_read = 0_u64;
+    let destination = u64::try_from(std::ptr::addr_of_mut!(mode) as usize).ok()?;
+    // SAFETY: the destination is a writable one-byte local, the source is read
+    // through the current task's VM API, and success is accepted only when the
+    // kernel reports that the complete mode byte was copied.
+    let status = unsafe {
+        mach2::vm::mach_vm_read_overwrite(
+            mach2::traps::mach_task_self(),
+            COMMPAGE_MODE_ADDRESS,
+            1,
+            destination,
+            &mut bytes_read,
+        )
+    };
+    if status == mach2::kern_return::KERN_SUCCESS && bytes_read == 1 {
+        Some(mode)
+    } else {
+        None
+    }
+}
+
 #[allow(deprecated)]
 pub(super) fn host_counter_scale() -> Option<CounterScale> {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -125,7 +149,7 @@ pub(super) fn host_counter_scale() -> Option<CounterScale> {
             if unsafe { libc::mach_timebase_info(&mut info) } != libc::KERN_SUCCESS {
                 return None;
             }
-            let (_, frequency) = crate::trap::host_counter();
+            let frequency = crate::trap::host_counter_frequency();
             scale_from_timebase(info.numer, info.denom, frequency)
         })
     }
@@ -141,9 +165,7 @@ pub(super) fn host_counter_plan() -> HostCounterPlan {
     {
         static PLAN: OnceLock<HostCounterPlan> = OnceLock::new();
         *PLAN.get_or_init(|| {
-            // SAFETY: Darwin maps the commpage read-only at a fixed userspace
-            // address, and the mode field is one byte at the documented offset.
-            let mode = unsafe { (COMMPAGE_MODE_ADDRESS as *const u8).read_volatile() };
+            let mode = host_commpage_mode();
             plan_for_mode(mode, host_counter_scale())
         })
     }
@@ -180,20 +202,20 @@ mod tests {
     fn known_modes_select_inline_sources() {
         let host_scale = CounterScale::new(125, 3).expect("host scale");
         assert_eq!(
-            plan_for_mode(1, None),
+            plan_for_mode(Some(1), None),
             HostCounterPlan::Inline {
                 source: HostCounterSource::Cntvct,
                 scale: CounterScale::new(1, 1).expect("identity scale"),
             }
         );
         assert_eq!(
-            plan_for_mode(3, Some(host_scale)),
+            plan_for_mode(Some(3), Some(host_scale)),
             HostCounterPlan::Inline {
                 source: HostCounterSource::AppleTimebase,
                 scale: host_scale,
             }
         );
-        assert_eq!(plan_for_mode(3, None), HostCounterPlan::Unsupported);
+        assert_eq!(plan_for_mode(Some(3), None), HostCounterPlan::Unsupported);
     }
 
     #[test]
@@ -201,11 +223,33 @@ mod tests {
         let scale = CounterScale::new(125, 3).expect("host scale");
         for mode in [0, 2, 4, u8::MAX] {
             assert_eq!(
-                plan_for_mode(mode, Some(scale)),
+                plan_for_mode(Some(mode), Some(scale)),
                 HostCounterPlan::Fallback { scale }
             );
-            assert_eq!(plan_for_mode(mode, None), HostCounterPlan::Unsupported);
+            assert_eq!(
+                plan_for_mode(Some(mode), None),
+                HostCounterPlan::Unsupported
+            );
         }
+    }
+
+    #[test]
+    fn injected_timebase_scale_is_exact_or_unsupported() {
+        assert_eq!(
+            scale_from_timebase(125, 3, 1_000_000_000),
+            CounterScale::new(125, 3)
+        );
+        assert_eq!(scale_from_timebase(u32::MAX, 1, u64::MAX), None);
+    }
+
+    #[test]
+    fn unreadable_mode_selects_scaled_fallback_without_a_raw_counter_provider() {
+        let scale = CounterScale::new(125, 3).expect("host scale");
+        assert_eq!(
+            plan_for_mode(None, Some(scale)),
+            HostCounterPlan::Fallback { scale }
+        );
+        assert_eq!(plan_for_mode(None, None), HostCounterPlan::Unsupported);
     }
 
     #[test]
@@ -242,7 +286,7 @@ mod tests {
     #[test]
     fn host_scale_converts_mach_ticks_into_cntfrq_domain() {
         let scale = host_counter_scale().expect("representable host counter scale");
-        let (_, frequency) = crate::trap::host_counter();
+        let frequency = crate::trap::host_counter_frequency();
         if frequency == 1_000_000_000 {
             assert_eq!(
                 scale,
@@ -273,7 +317,7 @@ mod tests {
     fn unknown_mode_fallback_uses_host_scale() {
         let scale = host_counter_scale().expect("representable host counter scale");
         assert_eq!(
-            plan_for_mode(0, Some(scale)),
+            plan_for_mode(Some(0), Some(scale)),
             HostCounterPlan::Fallback { scale }
         );
         let before = scale.apply(mach_absolute_time_ticks());
