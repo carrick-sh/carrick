@@ -137,6 +137,52 @@ Three more commits past the green build (12 total):
   through the host seam (address.rs tests for hint-honoring are
   cfg(macos) with this documented).
 
+
+## M2 execution landed: translated x86 RUNS natively on FreeBSD/amd64
+
+The native lane now EXECUTES (design:
+docs/superpowers/specs/2026-07-17-x86-dsr-execution-design.md), proven by
+in-crate integration tests that run on this box (no runtime dependency):
+
+- **carrick-dsr-x86** now has: `block` (planner over the classifier),
+  `gateway` (X86UcontextSnapshot + repr(C) X86DsrContext + gateway_x86_64.S,
+  r15 = ctx pointer, enter/exit share one host frame), `emit` (copy-through +
+  syscall/indirect exit via `jmp *disp(%r15)`), `cflow` (branch resolution in
+  Rust from the captured snapshot: jmp/jcc/call/ret).
+- **tests/native_execution.rs** (gated freebsd+x86_64): (1) hand-assembled
+  write("hi\n")+exit_group(7) runs natively, syscalls trapped; (2) a real
+  dec/jnz LOOP runs 4 iterations, conditional branch resolved from guest
+  flags each time. Both green on FreeBSD 15.1/amd64.
+
+### Exact next rungs to a REAL static binary running natively
+
+1. **RIP-relative fixup** in the emitter — real compiled code uses
+   `lea/mov [rip+disp]` constantly; copy-through currently assumes none
+   (guests reach data via movabs). Recompute disp32 against the cache VA, or
+   exit-and-emulate the RIP-relative access. THE biggest blocker to real code.
+2. **Register/TLS virtualization** — guest r15 is skipped by the gateway
+   (virtualized); an instruction that READS r15 needs materialization. And
+   fs/gs base: musl/glibc set the thread pointer via arch_prctl(ARCH_SET_FS);
+   the gateway must swap fsbase on enter/exit (FSGSBASE), the x86 analog of
+   the aarch64 TPIDR/x18 handling. Needed for any libc guest.
+3. **Fault handling** — a FreeBSD sigaction shim reading the amd64 mcontext_t,
+   snapshotting guest state and redirecting to a signal exit stub (the
+   carrick_dsr_x86_exit_signal analog; the .S has no signal stub yet). Belongs
+   in carrick-native-freebsd. Needed so guest faults become Linux signals, not
+   host crashes.
+4. **Indirect branches** in cflow (jmp/call r/m) — read the operand from the
+   snapshot/memory. Needed for PLT/vtable/switch code.
+5. **Runtime dispatcher wiring (M2-runtime)** — replace the in-test syscall
+   servicer with the real SyscallDispatcher and flip the FreeBSD/amd64 arm of
+   the page_profile capability table from the bring-up error to a real native
+   run path. This needs a ProcessTranslator-lite for x86 (block cache via
+   NativeHostJit — already host-neutral) + x86 ELF load (carrick-mem has
+   pml4/x86 layout helpers) + the thread loop. Largest remaining chunk;
+   everything above it is proven.
+6. **Direct-branch chaining** — the perf fast path (patch resolved blocks
+   together); correctness does not depend on it. Do it after a real binary
+   runs, guided by measurement.
+
 ## Verification discipline used (keep it)
 
 Every slice: carrick-dsr/-aarch64 build+test on FreeBSD, darwin cross-check
