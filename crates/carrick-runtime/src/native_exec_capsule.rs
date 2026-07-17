@@ -107,6 +107,40 @@ pub(crate) struct NativeReexecArtifactSpikeV1 {
     pub(crate) authority_nonce: [u8; 16],
 }
 
+// The artifact-spike authority itself moved to `carrick-dsr-aarch64`, which
+// speaks the plain `ArtifactSpikeReexecConfig` carrier; the V1 capsule
+// schema stays here (it is the serialized re-exec wire format). These two
+// mappings are the ONLY place the pairing is spelled out.
+impl From<carrick_dsr_aarch64::artifact_spike::ArtifactSpikeReexecConfig>
+    for NativeReexecArtifactSpikeV1
+{
+    fn from(config: carrick_dsr_aarch64::artifact_spike::ArtifactSpikeReexecConfig) -> Self {
+        Self {
+            host_fd: config.host_fd,
+            original_host_fd_flags: config.original_host_fd_flags,
+            host_device: config.host_device,
+            host_inode: config.host_inode,
+            host_size: config.host_size,
+            authority_nonce: config.authority_nonce,
+        }
+    }
+}
+
+impl From<&NativeReexecArtifactSpikeV1>
+    for carrick_dsr_aarch64::artifact_spike::ArtifactSpikeReexecConfig
+{
+    fn from(snapshot: &NativeReexecArtifactSpikeV1) -> Self {
+        Self {
+            host_fd: snapshot.host_fd,
+            original_host_fd_flags: snapshot.original_host_fd_flags,
+            host_device: snapshot.host_device,
+            host_inode: snapshot.host_inode,
+            host_size: snapshot.host_size,
+            authority_nonce: snapshot.authority_nonce,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct NativeReexecXsigV1 {
     pub(crate) host_fd: i32,

@@ -24,12 +24,13 @@ fn main() {
         }
         _ => {}
     }
+    // gateway_aarch64.S moved to carrick-dsr-aarch64 (whose build.rs
+    // assembles it under this same target gate); the runtime keeps only the
+    // C trap shim.
     if os == "macos" && arch == "aarch64" {
         println!("cargo:rerun-if-changed=csrc/native_darwin.c");
-        println!("cargo:rerun-if-changed=src/native_darwin/dsr/gateway_aarch64.S");
         cc::Build::new()
             .file("csrc/native_darwin.c")
-            .file("src/native_darwin/dsr/gateway_aarch64.S")
             .warnings(true)
             .compile("carrick_native_darwin");
     }
