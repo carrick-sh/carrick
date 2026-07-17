@@ -54,9 +54,11 @@ impl JitRegion {
 
 /// Host W^X JIT plumbing for the translation cache. Implementations are
 /// stateless (all state lives in the [`JitRegion`]); every method is safe to
-/// call from any guest thread. This is the translation SLOW path — trait
-/// dispatch cost is irrelevant; translated code never calls back through it.
-pub trait NativeHostJit {
+/// call from any guest thread — hence the `Send + Sync` supertraits, which
+/// let the cache hold a `&'static dyn NativeHostJit` across threads. This is
+/// the translation SLOW path — trait dispatch cost is irrelevant; translated
+/// code never calls back through it.
+pub trait NativeHostJit: Send + Sync {
     /// Fail-closed capability probe (Darwin: per-thread JIT write protection
     /// must be supported; others: whatever the mapping strategy requires).
     /// Called once before the first `map_code_cache`.

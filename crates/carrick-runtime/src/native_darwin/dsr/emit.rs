@@ -4075,7 +4075,11 @@ mod tests {
         let second_bias =
             super::super::super::address::NativeHostBias::new(0x90_0000_0000, 16 * 1024)
                 .expect("second bias");
-        let mut first_cache = TranslationCache::new(64 * 1024).expect("first cache");
+        let mut first_cache = TranslationCache::new(
+            64 * 1024,
+            crate::native_darwin::darwin_jit::active_host_jit(),
+        )
+        .expect("first cache");
         let (first, first_artifact) = emit_block_recording_artifact(
             &mut first_cache,
             &plan,
@@ -4086,7 +4090,11 @@ mod tests {
             source_words.clone(),
         )
         .expect("record first emission");
-        let mut second_cache = TranslationCache::new(64 * 1024).expect("second cache");
+        let mut second_cache = TranslationCache::new(
+            64 * 1024,
+            crate::native_darwin::darwin_jit::active_host_jit(),
+        )
+        .expect("second cache");
         let (second, second_artifact) = emit_block_recording_artifact(
             &mut second_cache,
             &plan,
@@ -4100,7 +4108,11 @@ mod tests {
 
         assert_eq!(first_artifact.template, second_artifact.template);
         assert_ne!(first_artifact.bindings, second_artifact.bindings);
-        let mut replay_cache = TranslationCache::new(64 * 1024).expect("replay cache");
+        let mut replay_cache = TranslationCache::new(
+            64 * 1024,
+            crate::native_darwin::darwin_jit::active_host_jit(),
+        )
+        .expect("replay cache");
         let replay = super::super::artifact_spike::replay_artifact(
             &mut replay_cache,
             &first_artifact.template,
@@ -4168,7 +4180,11 @@ mod tests {
             op: bad64::Op::UDF,
         };
 
-        let mut cache = TranslationCache::new(128 * 1024).expect("allocate exit emission cache");
+        let mut cache = TranslationCache::new(
+            128 * 1024,
+            crate::native_darwin::darwin_jit::active_host_jit(),
+        )
+        .expect("allocate exit emission cache");
         [
             syscall,
             direct,
@@ -4251,8 +4267,11 @@ mod tests {
         });
 
         let measure_jit_window = |logical_blocks: usize| {
-            let mut cache =
-                TranslationCache::new(32 * 1024 * 1024).expect("allocate emission benchmark cache");
+            let mut cache = TranslationCache::new(
+                32 * 1024 * 1024,
+                crate::native_darwin::darwin_jit::active_host_jit(),
+            )
+            .expect("allocate emission benchmark cache");
             let words = WORDS.repeat(logical_blocks);
             measure_emission_component(2_000, 1, logical_blocks, || {
                 let mut writer = cache
@@ -4268,8 +4287,11 @@ mod tests {
 
         let generation = std::sync::atomic::AtomicU64::new(CodeGeneration::INITIAL.get());
         let plan = copy_plan();
-        let mut cache = TranslationCache::new(32 * 1024 * 1024)
-            .expect("allocate full emission benchmark cache");
+        let mut cache = TranslationCache::new(
+            32 * 1024 * 1024,
+            crate::native_darwin::darwin_jit::active_host_jit(),
+        )
+        .expect("allocate full emission benchmark cache");
         let full_guarded_emit = measure_emission_component(4_000, 1, 1, || {
             std::hint::black_box(
                 emit_block_with_generation_direct(
@@ -4303,7 +4325,11 @@ mod tests {
 
     #[test]
     fn dsr_emit_copy_only_block_decodes_back_with_exact_maps() {
-        let mut cache = TranslationCache::new(16 * 1024).expect("allocate translation cache");
+        let mut cache = TranslationCache::new(
+            16 * 1024,
+            crate::native_darwin::darwin_jit::active_host_jit(),
+        )
+        .expect("allocate translation cache");
         let emitted = emit_block_direct(&mut cache, &copy_plan()).expect("emit copy-only block");
         assert_eq!(emitted.len(), 72);
         let original_words = [0xd503_201f, 0x9100_0400];
@@ -4372,7 +4398,11 @@ mod tests {
                 resume: GuestVa(0x4008),
             },
         };
-        let mut cache = TranslationCache::new(16 * 1024).expect("allocate translation cache");
+        let mut cache = TranslationCache::new(
+            16 * 1024,
+            crate::native_darwin::darwin_jit::active_host_jit(),
+        )
+        .expect("allocate translation cache");
         let emitted = emit_block_direct(&mut cache, &plan).expect("emit direct memory block");
         let pointer = (emitted.entry().host().raw() + 8) as *const u32;
         assert_eq!(unsafe { std::ptr::read_unaligned(pointer) }, word);
@@ -4392,7 +4422,11 @@ mod tests {
             guest: GuestVa(0x4004),
             resume: GuestVa(0x4008),
         };
-        let mut cache = TranslationCache::new(16 * 1024).expect("allocate translation cache");
+        let mut cache = TranslationCache::new(
+            16 * 1024,
+            crate::native_darwin::darwin_jit::active_host_jit(),
+        )
+        .expect("allocate translation cache");
         let emitted = emit_block(&mut cache, &plan, EmitAddressMode::Direct)
             .expect("emit direct memory block");
         let words = (0..emitted.len() / 4).map(|index| unsafe {
@@ -4418,7 +4452,11 @@ mod tests {
         let host_bias =
             super::super::super::address::NativeHostBias::new(0x80_0000_0000, 16 * 1024)
                 .expect("valid bias");
-        let mut cache = TranslationCache::new(16 * 1024).expect("allocate translation cache");
+        let mut cache = TranslationCache::new(
+            16 * 1024,
+            crate::native_darwin::darwin_jit::active_host_jit(),
+        )
+        .expect("allocate translation cache");
         let emitted = emit_block(&mut cache, &plan, EmitAddressMode::Biased { host_bias })
             .expect("emit biased memory block");
         let words: Vec<u32> = (0..emitted.len() / 4)
@@ -4462,7 +4500,11 @@ mod tests {
         let host_bias =
             super::super::super::address::NativeHostBias::new(0x80_0000_0000, 16 * 1024)
                 .expect("valid bias");
-        let mut cache = TranslationCache::new(16 * 1024).expect("allocate translation cache");
+        let mut cache = TranslationCache::new(
+            16 * 1024,
+            crate::native_darwin::darwin_jit::active_host_jit(),
+        )
+        .expect("allocate translation cache");
         let emitted = emit_block(&mut cache, &plan, EmitAddressMode::Biased { host_bias })
             .expect("emit inline biased dc zva");
         let words = (0..emitted.len() / 4).map(|index| unsafe {
@@ -4506,9 +4548,16 @@ mod tests {
         };
         let mut copy = memory.clone();
         copy.instructions[0].action = InstAction::Copy(word);
-        let mut memory_cache =
-            TranslationCache::new(16 * 1024).expect("allocate direct memory cache");
-        let mut copy_cache = TranslationCache::new(16 * 1024).expect("allocate direct copy cache");
+        let mut memory_cache = TranslationCache::new(
+            16 * 1024,
+            crate::native_darwin::darwin_jit::active_host_jit(),
+        )
+        .expect("allocate direct memory cache");
+        let mut copy_cache = TranslationCache::new(
+            16 * 1024,
+            crate::native_darwin::darwin_jit::active_host_jit(),
+        )
+        .expect("allocate direct copy cache");
         let memory_emitted = emit_block(&mut memory_cache, &memory, EmitAddressMode::Direct)
             .expect("emit typed direct memory");
         let copy_emitted = emit_block(&mut copy_cache, &copy, EmitAddressMode::Direct)
@@ -4541,7 +4590,11 @@ mod tests {
         let host_bias =
             crate::native_darwin::address::NativeHostBias::new(0x80_0000_0000, 16 * 1024)
                 .expect("construct host bias");
-        let mut cache = TranslationCache::new(16 * 1024).expect("allocate translation cache");
+        let mut cache = TranslationCache::new(
+            16 * 1024,
+            crate::native_darwin::darwin_jit::active_host_jit(),
+        )
+        .expect("allocate translation cache");
         assert!(matches!(
             emit_block(&mut cache, &plan, EmitAddressMode::Biased { host_bias },),
             Err(DsrError::UnsupportedBlockAction { .. })
@@ -4565,7 +4618,11 @@ mod tests {
             let host_bias =
                 crate::native_darwin::address::NativeHostBias::new(0x80_0000_0000, 16 * 1024)
                     .expect("construct host bias");
-            let mut cache = TranslationCache::new(16 * 1024).expect("allocate translation cache");
+            let mut cache = TranslationCache::new(
+                16 * 1024,
+                crate::native_darwin::darwin_jit::active_host_jit(),
+            )
+            .expect("allocate translation cache");
             emit_block(&mut cache, &plan, EmitAddressMode::Biased { host_bias })
                 .unwrap_or_else(|error| panic!("0x{word:08x} did not lower: {error}"));
         }
@@ -4586,7 +4643,11 @@ mod tests {
             let host_bias =
                 crate::native_darwin::address::NativeHostBias::new(0x80_0000_0000, 16 * 1024)
                     .expect("construct host bias");
-            let mut cache = TranslationCache::new(16 * 1024).expect("allocate overlap cache");
+            let mut cache = TranslationCache::new(
+                16 * 1024,
+                crate::native_darwin::darwin_jit::active_host_jit(),
+            )
+            .expect("allocate overlap cache");
             assert!(matches!(
                 emit_block(&mut cache, &plan, EmitAddressMode::Biased { host_bias },),
                 Err(DsrError::UnsupportedBlockAction { .. })
@@ -4606,7 +4667,11 @@ mod tests {
         let host_bias =
             crate::native_darwin::address::NativeHostBias::new(0x80_0000_0000, 16 * 1024)
                 .expect("construct host bias");
-        let mut cache = TranslationCache::new(16 * 1024).expect("allocate SIMD pair cache");
+        let mut cache = TranslationCache::new(
+            16 * 1024,
+            crate::native_darwin::darwin_jit::active_host_jit(),
+        )
+        .expect("allocate SIMD pair cache");
         emit_block(&mut cache, &plan, EmitAddressMode::Biased { host_bias })
             .expect("SIMD pair destination numbering must not overlap its GPR base");
     }
@@ -4628,7 +4693,11 @@ mod tests {
         let host_bias =
             crate::native_darwin::address::NativeHostBias::new(0x80_0000_0000, 16 * 1024)
                 .expect("construct host bias");
-        let mut cache = TranslationCache::new(16 * 1024).expect("allocate SIMD cache");
+        let mut cache = TranslationCache::new(
+            16 * 1024,
+            crate::native_darwin::darwin_jit::active_host_jit(),
+        )
+        .expect("allocate SIMD cache");
         let emitted = emit_block(&mut cache, &plan, EmitAddressMode::Biased { host_bias })
             .expect("SIMD destination numbering must not overlap its GPR base");
         assert!(emitted.recovery().iter().any(|entry| {
@@ -4659,7 +4728,11 @@ mod tests {
         let host_bias =
             crate::native_darwin::address::NativeHostBias::new(0x80_0000_0000, 16 * 1024)
                 .expect("construct host bias");
-        let mut cache = TranslationCache::new(16 * 1024).expect("allocate recovery cache");
+        let mut cache = TranslationCache::new(
+            16 * 1024,
+            crate::native_darwin::darwin_jit::active_host_jit(),
+        )
+        .expect("allocate recovery cache");
         let emitted = emit_block(&mut cache, &plan, EmitAddressMode::Biased { host_bias })
             .expect("emit writeback recovery matrix");
         let actions = emitted
@@ -4706,7 +4779,11 @@ mod tests {
         let host_bias =
             crate::native_darwin::address::NativeHostBias::new(0x80_0000_0000, 16 * 1024)
                 .expect("construct host bias");
-        let mut cache = TranslationCache::new(16 * 1024).expect("allocate dual cache");
+        let mut cache = TranslationCache::new(
+            16 * 1024,
+            crate::native_darwin::darwin_jit::active_host_jit(),
+        )
+        .expect("allocate dual cache");
         let emitted = emit_block(&mut cache, &plan, EmitAddressMode::Biased { host_bias })
             .expect("emit dual virtual load");
         let final_actions = emitted
@@ -4736,7 +4813,11 @@ mod tests {
             action: super::super::decode::classify(word, GuestVa(0x4000))
                 .expect("classify dual virtual move"),
         }];
-        let mut cache = TranslationCache::new(16 * 1024).expect("allocate dual cache");
+        let mut cache = TranslationCache::new(
+            16 * 1024,
+            crate::native_darwin::darwin_jit::active_host_jit(),
+        )
+        .expect("allocate dual cache");
         let emitted =
             emit_block(&mut cache, &plan, EmitAddressMode::Direct).expect("emit dual virtual move");
         assert!(emitted.recovery().iter().any(|entry| {
@@ -4772,7 +4853,11 @@ mod tests {
                 resume: GuestVa(0x4008),
             },
         };
-        let mut cache = TranslationCache::new(16 * 1024).expect("allocate translation cache");
+        let mut cache = TranslationCache::new(
+            16 * 1024,
+            crate::native_darwin::darwin_jit::active_host_jit(),
+        )
+        .expect("allocate translation cache");
         let emitted = emit_block_direct(&mut cache, &plan).expect("emit direct SVE memory block");
         let pointer = (emitted.entry().host().raw() + 8) as *const u32;
         assert_eq!(unsafe { std::ptr::read_unaligned(pointer) }, word);
@@ -4803,7 +4888,11 @@ mod tests {
                 resume: GuestVa(0x4008),
             },
         };
-        let mut cache = TranslationCache::new(16 * 1024).expect("allocate translation cache");
+        let mut cache = TranslationCache::new(
+            16 * 1024,
+            crate::native_darwin::darwin_jit::active_host_jit(),
+        )
+        .expect("allocate translation cache");
         emit_block_direct(&mut cache, &plan).expect("emit direct SVE x18-index memory block");
     }
 
@@ -4812,7 +4901,11 @@ mod tests {
         use std::sync::atomic::AtomicU64;
 
         let generation = AtomicU64::new(CodeGeneration::INITIAL.get());
-        let mut cache = TranslationCache::new(16 * 1024).expect("allocate translation cache");
+        let mut cache = TranslationCache::new(
+            16 * 1024,
+            crate::native_darwin::darwin_jit::active_host_jit(),
+        )
+        .expect("allocate translation cache");
         let emitted = emit_block_with_generation_direct(
             &mut cache,
             &copy_plan(),
@@ -4847,7 +4940,11 @@ mod tests {
             destination: Some(bad64::Reg::X0),
             word: 0x1000_8000,
         });
-        let mut cache = TranslationCache::new(16 * 1024).expect("allocate translation cache");
+        let mut cache = TranslationCache::new(
+            16 * 1024,
+            crate::native_darwin::darwin_jit::active_host_jit(),
+        )
+        .expect("allocate translation cache");
         let emitted = emit_block_direct(&mut cache, &plan).expect("emit relocated ADR");
         assert!(emitted.len() > 36);
     }
@@ -4867,7 +4964,11 @@ mod tests {
                 bit: None,
             },
         };
-        let mut cache = TranslationCache::new(16 * 1024).expect("allocate translation cache");
+        let mut cache = TranslationCache::new(
+            16 * 1024,
+            crate::native_darwin::darwin_jit::active_host_jit(),
+        )
+        .expect("allocate translation cache");
         let emitted = emit_block_direct(&mut cache, &direct).expect("emit direct link");
         assert_eq!(emitted.direct_links().len(), 1);
         assert_eq!(emitted.direct_links()[0].target, GuestVa(0x4010));
@@ -4899,7 +5000,11 @@ mod tests {
                 resume: GuestVa(0x400c),
             },
         };
-        let mut cache = TranslationCache::new(16 * 1024).expect("allocate return cache");
+        let mut cache = TranslationCache::new(
+            16 * 1024,
+            crate::native_darwin::darwin_jit::active_host_jit(),
+        )
+        .expect("allocate return cache");
         let emitted = emit_block_direct(&mut cache, &plan).expect("emit return resolver");
         let words = (0..emitted.len() / 4)
             .map(|index| unsafe {
@@ -4933,7 +5038,11 @@ mod tests {
         };
         plans.push(indirect);
 
-        let mut cache = TranslationCache::new(32 * 1024).expect("allocate translation cache");
+        let mut cache = TranslationCache::new(
+            32 * 1024,
+            crate::native_darwin::darwin_jit::active_host_jit(),
+        )
+        .expect("allocate translation cache");
         for plan in plans {
             let emitted = emit_block_direct(&mut cache, &plan).expect("emit mapped block");
             for offset in (0..emitted.len()).step_by(4) {
@@ -4959,7 +5068,11 @@ mod tests {
                 resume: GuestVa(0x400c),
             },
         };
-        let mut cache = TranslationCache::new(16 * 1024).expect("allocate translation cache");
+        let mut cache = TranslationCache::new(
+            16 * 1024,
+            crate::native_darwin::darwin_jit::active_host_jit(),
+        )
+        .expect("allocate translation cache");
         let emitted = emit_block_direct(&mut cache, &indirect).expect("emit indirect resolver");
         let resolver = emitted
             .recovery()
@@ -5010,7 +5123,11 @@ mod tests {
             target: GuestVa(0x4004),
             limit: BlockLimit::InstructionLimit,
         };
-        let mut cache = TranslationCache::new(16 * 1024).expect("allocate translation cache");
+        let mut cache = TranslationCache::new(
+            16 * 1024,
+            crate::native_darwin::darwin_jit::active_host_jit(),
+        )
+        .expect("allocate translation cache");
         let emitted = emit_block_direct(&mut cache, &plan).expect("emit bounded block");
         assert_eq!(emitted.direct_links().len(), 1);
         assert_eq!(emitted.direct_links()[0].target, GuestVa(0x4004));
@@ -5154,7 +5271,11 @@ mod tests {
             let host_bias =
                 crate::native_darwin::address::NativeHostBias::new(0x80_0000_0000, 16 * 1024)
                     .expect("construct test host bias");
-            let mut cache = TranslationCache::new(16 * 1024).expect("allocate cache");
+            let mut cache = TranslationCache::new(
+                16 * 1024,
+                crate::native_darwin::darwin_jit::active_host_jit(),
+            )
+            .expect("allocate cache");
             let emitted = emit_block(&mut cache, &plan, EmitAddressMode::Biased { host_bias })?;
             Ok(TestEmittedBlock {
                 _cache: cache,
@@ -5504,7 +5625,11 @@ mod tests {
             let retry = encode_cbnz_w(retry_pc, start, 3);
             let plan = region_plan(start, &[LDAXR_W0_X1, STLXR_W3_W4_X1], retry, None);
 
-            let mut cache = TranslationCache::new(16 * 1024).expect("allocate cache");
+            let mut cache = TranslationCache::new(
+                16 * 1024,
+                crate::native_darwin::darwin_jit::active_host_jit(),
+            )
+            .expect("allocate cache");
             let emitted =
                 emit_block_direct(&mut cache, &plan).expect("emit fused minimal exclusive region");
             let words = emitted_words(&emitted);
@@ -5544,7 +5669,11 @@ mod tests {
                 Some(branch),
             );
 
-            let mut cache = TranslationCache::new(16 * 1024).expect("allocate cache");
+            let mut cache = TranslationCache::new(
+                16 * 1024,
+                crate::native_darwin::darwin_jit::active_host_jit(),
+            )
+            .expect("allocate cache");
             let emitted =
                 emit_block_direct(&mut cache, &plan).expect("emit fused canonical CAS region");
             let words = emitted_words(&emitted);
@@ -5602,7 +5731,11 @@ mod tests {
                 Some(branch),
             );
 
-            let mut cache = TranslationCache::new(16 * 1024).expect("allocate cache");
+            let mut cache = TranslationCache::new(
+                16 * 1024,
+                crate::native_darwin::darwin_jit::active_host_jit(),
+            )
+            .expect("allocate cache");
             let emitted = emit_block_direct(&mut cache, &plan).expect("emit fused CAS region");
             let base = emitted.entry().host().raw() as u64;
             let words = emitted_words(&emitted);
@@ -5669,7 +5802,11 @@ mod tests {
             let bias =
                 crate::native_darwin::address::NativeHostBias::new(0x80_0000_0000, 16 * 1024)
                     .expect("construct test host bias");
-            let mut cache = TranslationCache::new(16 * 1024).expect("allocate cache");
+            let mut cache = TranslationCache::new(
+                16 * 1024,
+                crate::native_darwin::darwin_jit::active_host_jit(),
+            )
+            .expect("allocate cache");
             let result = emit_block(
                 &mut cache,
                 &plan,

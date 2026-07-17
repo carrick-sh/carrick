@@ -425,8 +425,12 @@ dependencies = [
 name = "carrick-dsr"
 version = "0.1.0"
 dependencies = [
+ "carrick-guest-mem",
  "carrick-host",
  "libc",
+ "parking_lot",
+ "proptest",
+ "serde",
  "thiserror",
 ]
 

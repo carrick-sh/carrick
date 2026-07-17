@@ -579,7 +579,7 @@ impl NativeMappedMemory {
         &self,
         pc: carrick_guest_mem::GuestVa,
     ) -> Result<dsr::cache::PageGenerationObservation, dsr::types::DsrError> {
-        self.dsr_generations.observe(pc)
+        Ok(self.dsr_generations.observe(pc)?)
     }
 
     pub(super) fn range_may_execute(&self, address: u64, len: usize) -> bool {

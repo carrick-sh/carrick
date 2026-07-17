@@ -8,6 +8,9 @@
 //! explicitly rather than falling back to HVF.
 
 mod address;
+// Transitional Darwin `NativeHostJit` impl for the extracted `carrick_dsr`
+// translation cache (migrates to `carrick-native-darwin` in a later slice).
+mod darwin_jit;
 mod dsr;
 
 pub(crate) fn artifact_spike_authority_snapshot_if_enabled()

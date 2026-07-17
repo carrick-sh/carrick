@@ -1558,9 +1558,17 @@ mod tests {
     #[test]
     fn replay_matches_fresh_metadata_and_guest_result() {
         let (template, bindings) = emit_artifact_fixture(0x1000_0000, 0x2000_0000);
-        let mut fresh_cache = TranslationCache::new(16 * 1024).expect("fresh cache");
+        let mut fresh_cache = TranslationCache::new(
+            16 * 1024,
+            crate::native_darwin::darwin_jit::active_host_jit(),
+        )
+        .expect("fresh cache");
         let fresh = replay_artifact(&mut fresh_cache, &template, &bindings).expect("fresh replay");
-        let mut replay_cache = TranslationCache::new(16 * 1024).expect("replay cache");
+        let mut replay_cache = TranslationCache::new(
+            16 * 1024,
+            crate::native_darwin::darwin_jit::active_host_jit(),
+        )
+        .expect("replay cache");
         let replay = replay_artifact(&mut replay_cache, &template, &bindings).expect("replay");
 
         assert_eq!(fresh.map().entries(), replay.map().entries());
@@ -1598,7 +1606,11 @@ mod tests {
         };
         let generation = AtomicU64::new(CodeGeneration::INITIAL.get());
         let guard = GenerationGuard::new(&generation, CodeGeneration::INITIAL);
-        let mut fresh_cache = TranslationCache::new(16 * 1024).expect("fresh counter cache");
+        let mut fresh_cache = TranslationCache::new(
+            16 * 1024,
+            crate::native_darwin::darwin_jit::active_host_jit(),
+        )
+        .expect("fresh counter cache");
         let (fresh, record) = super::super::emit::emit_block_recording_artifact(
             &mut fresh_cache,
             &plan,
@@ -1607,7 +1619,11 @@ mod tests {
             source_words,
         )
         .expect("record counter artifact");
-        let mut replay_cache = TranslationCache::new(16 * 1024).expect("replay counter cache");
+        let mut replay_cache = TranslationCache::new(
+            16 * 1024,
+            crate::native_darwin::darwin_jit::active_host_jit(),
+        )
+        .expect("replay counter cache");
         let replay = replay_artifact(&mut replay_cache, &record.template, &record.bindings)
             .expect("replay counter artifact");
 

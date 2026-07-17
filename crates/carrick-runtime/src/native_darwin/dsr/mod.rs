@@ -47,7 +47,10 @@ pub(super) fn execute_virtual_counter_for_test() -> Result<u64, types::DsrError>
             resume: carrick_guest_mem::GuestVa(guest.raw() + 8),
         },
     };
-    let mut cache = cache::TranslationCache::new(16 * 1024)?;
+    let mut cache = cache::TranslationCache::new(
+        16 * 1024,
+        crate::native_darwin::darwin_jit::active_host_jit(),
+    )?;
     let emitted = emit::emit_block_direct(&mut cache, &plan)?;
     let mut stack = vec![0_u8; 16 * 1024];
     let mut snapshot = super::NativeUcontextSnapshot {
@@ -62,6 +65,43 @@ pub(super) fn execute_virtual_counter_for_test() -> Result<u64, types::DsrError>
 }
 
 const ARTIFACT_KEY_PREFIX_INSTRUCTIONS: usize = 16;
+
+/// Encode the AArch64 `B` instruction that links `site` to `target`.
+///
+/// The guest-ISA half of the pre-extraction `patch_direct_branch`: the
+/// extracted cache (`carrick_dsr::cache`) is ISA-neutral and only patches
+/// fully encoded words via `TranslationCache::patch_code_word`, so the
+/// displacement computation, `B`-range check, and opcode encoding stay here
+/// with the rest of the AArch64 layer.
+fn encode_aarch64_direct_branch(
+    site: cache::LinkSite,
+    target: types::CacheVa,
+) -> Result<u32, types::DsrError> {
+    let source = site
+        .source
+        .host()
+        .raw()
+        .checked_add(site.slot.get() as usize)
+        .ok_or_else(|| types::DsrError::CachePolicy("direct-link source overflow".to_string()))?;
+    if !source.is_multiple_of(4) {
+        return Err(types::DsrError::CachePolicy(format!(
+            "direct-link source is not instruction aligned: 0x{source:x}"
+        )));
+    }
+    let displacement = (target.host().raw() as i128) - (source as i128);
+    if displacement % 4 != 0 {
+        return Err(types::DsrError::CachePolicy(format!(
+            "direct-link displacement is not instruction aligned: {displacement}"
+        )));
+    }
+    let words = displacement / 4;
+    if !(-(1_i128 << 25)..(1_i128 << 25)).contains(&words) {
+        return Err(types::DsrError::CachePolicy(format!(
+            "direct-link target is outside AArch64 B range: {displacement} bytes"
+        )));
+    }
+    Ok(0x1400_0000 | ((words as i64 as u32) & 0x03ff_ffff))
+}
 
 #[derive(Debug)]
 pub(super) enum ThreadExit {
@@ -973,7 +1013,10 @@ impl ProcessTranslator {
         artifact_spike::ensure_authority_if_enabled()?;
         let translator = Self {
             state: RwLock::new(ProcessState {
-                cache: cache::TranslationCache::new(capacity)?,
+                cache: cache::TranslationCache::new(
+                    capacity,
+                    crate::native_darwin::darwin_jit::active_host_jit(),
+                )?,
                 artifact_store: artifact_spike::store_if_enabled()?,
                 blocks: BTreeMap::new(),
                 pending: BTreeMap::new(),
@@ -1085,9 +1128,24 @@ impl ProcessState {
         outcome: TranslationOutcome,
     ) -> Result<TranslationResult, types::DsrError> {
         let entry = emitted.entry();
+        // The extracted publication index is probe-free; fire the exact
+        // pre-extraction DuplicateWait subphase probes from its observer.
         let published_entry = self
             .publications
-            .get_or_publish_profiled(tid, key, || entry);
+            .get_or_publish_observed(key, || entry, &|event| match event {
+                cache::PublicationWaitEvent::WaitBegin => probes::dsr_translate_subphase_begin(
+                    tid,
+                    probes::DsrTranslationSubphase::DuplicateWait,
+                    key.0.raw(),
+                    key.1.get(),
+                ),
+                cache::PublicationWaitEvent::WaitEnd => probes::dsr_translate_subphase_end(
+                    tid,
+                    probes::DsrTranslationSubphase::DuplicateWait,
+                    key.0.raw(),
+                    key.1.get(),
+                ),
+            });
         if published_entry != entry {
             self.stats.add(ResolverStat::DuplicatePublications, 1);
             return Ok(TranslationResult {
@@ -1116,14 +1174,16 @@ impl ProcessState {
                 slot: link.slot,
             };
             if let Some(target) = self.blocks.get(&target_key) {
-                self.cache.patch_direct_branch(site, *target)?;
+                let word = encode_aarch64_direct_branch(site, *target)?;
+                self.cache.patch_code_word(site, word)?;
             } else {
                 self.pending.entry(target_key).or_default().push(site);
             }
         }
         if let Some(sites) = self.pending.remove(&key) {
             for site in sites {
-                self.cache.patch_direct_branch(site, entry)?;
+                let word = encode_aarch64_direct_branch(site, entry)?;
+                self.cache.patch_code_word(site, word)?;
             }
         }
         Ok(TranslationResult {
@@ -1827,7 +1887,7 @@ impl ThreadTranslator {
                 cache_pc.host().raw()
             )));
         }
-        state.cache.patch_word_for_test(cache_pc, word)
+        Ok(state.cache.patch_word_for_test(cache_pc, word)?)
     }
 
     pub(super) fn profiling_enabled(&self) -> bool {
@@ -4798,7 +4858,12 @@ mod tests {
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
         if pid == 0 {
-            let result = super::cache::TranslationCache::new(16 * 1024).and_then(|mut cache| {
+            let result = super::cache::TranslationCache::new(
+                16 * 1024,
+                crate::native_darwin::darwin_jit::active_host_jit(),
+            )
+            .map_err(super::types::DsrError::from)
+            .and_then(|mut cache| {
                 let mut writer = cache.begin_write(8)?;
                 writer.write_words(&[0xd280_0540, 0xd65f_03c0])?; // mov x0,#42; ret
                 let published = writer.publish()?;
@@ -4830,8 +4895,11 @@ mod tests {
 
     #[test]
     fn dsr_cache_second_publication_executes_new_instructions() {
-        let mut cache =
-            super::cache::TranslationCache::new(16 * 1024).expect("allocate translation cache");
+        let mut cache = super::cache::TranslationCache::new(
+            16 * 1024,
+            crate::native_darwin::darwin_jit::active_host_jit(),
+        )
+        .expect("allocate translation cache");
         let mut first_writer = cache.begin_write(8).expect("begin first cache write");
         first_writer
             .write_words(&[0xd280_0540, 0xd65f_03c0])
@@ -4877,8 +4945,11 @@ mod tests {
     #[test]
     fn dsr_cache_write_and_execute_phases_are_disjoint() {
         assert_child_faults(|| {
-            let mut cache =
-                super::cache::TranslationCache::new(16 * 1024).expect("allocate translation cache");
+            let mut cache = super::cache::TranslationCache::new(
+                16 * 1024,
+                crate::native_darwin::darwin_jit::active_host_jit(),
+            )
+            .expect("allocate translation cache");
             let mut writer = cache.begin_write(8).expect("begin cache write");
             writer
                 .write_words(&[0xd280_0540, 0xd65f_03c0])
@@ -4889,8 +4960,11 @@ mod tests {
         });
 
         assert_child_faults(|| {
-            let mut cache =
-                super::cache::TranslationCache::new(16 * 1024).expect("allocate translation cache");
+            let mut cache = super::cache::TranslationCache::new(
+                16 * 1024,
+                crate::native_darwin::darwin_jit::active_host_jit(),
+            )
+            .expect("allocate translation cache");
             let mut writer = cache.begin_write(8).expect("begin cache write");
             writer
                 .write_words(&[0xd280_0540, 0xd65f_03c0])
@@ -4903,8 +4977,11 @@ mod tests {
 
     #[test]
     fn dsr_cache_published_code_is_fork_inherited() {
-        let mut cache =
-            super::cache::TranslationCache::new(16 * 1024).expect("allocate translation cache");
+        let mut cache = super::cache::TranslationCache::new(
+            16 * 1024,
+            crate::native_darwin::darwin_jit::active_host_jit(),
+        )
+        .expect("allocate translation cache");
         let mut writer = cache.begin_write(8).expect("begin cache write");
         writer
             .write_words(&[0xd280_0540, 0xd65f_03c0])
@@ -4926,26 +5003,32 @@ mod tests {
 
     #[test]
     fn dsr_cache_child_discards_inherited_unpublished_write() {
-        let mut cache =
-            super::cache::TranslationCache::new(16 * 1024).expect("allocate translation cache");
+        let mut cache = super::cache::TranslationCache::new(
+            16 * 1024,
+            crate::native_darwin::darwin_jit::active_host_jit(),
+        )
+        .expect("allocate translation cache");
         let writer = cache.begin_write(8).expect("begin inherited cache write");
 
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
         if pid == 0 {
             drop(writer);
-            let result = cache.begin_write(8).and_then(|mut clean_writer| {
-                clean_writer.write_words(&[0xd280_00e0, 0xd65f_03c0])?;
-                let published = clean_writer.publish()?;
-                let function: extern "C" fn() -> u64 =
-                    unsafe { std::mem::transmute(published.entry().host().raw()) };
-                if function() != 7 {
-                    return Err(super::types::DsrError::CachePolicy(
-                        "child clean transaction returned the wrong value".to_string(),
-                    ));
-                }
-                Ok(())
-            });
+            let result = cache
+                .begin_write(8)
+                .map_err(super::types::DsrError::from)
+                .and_then(|mut clean_writer| {
+                    clean_writer.write_words(&[0xd280_00e0, 0xd65f_03c0])?;
+                    let published = clean_writer.publish()?;
+                    let function: extern "C" fn() -> u64 =
+                        unsafe { std::mem::transmute(published.entry().host().raw()) };
+                    if function() != 7 {
+                        return Err(super::types::DsrError::CachePolicy(
+                            "child clean transaction returned the wrong value".to_string(),
+                        ));
+                    }
+                    Ok(())
+                });
             unsafe { libc::_exit(i32::from(result.is_err())) };
         }
         let mut status = 0;
@@ -4958,15 +5041,18 @@ mod tests {
 
     #[test]
     fn dsr_cache_exhaustion_is_a_typed_error() {
-        let mut cache =
-            super::cache::TranslationCache::new(1).expect("allocate one-page translation cache");
+        let mut cache = super::cache::TranslationCache::new(
+            1,
+            crate::native_darwin::darwin_jit::active_host_jit(),
+        )
+        .expect("allocate one-page translation cache");
         let error = match cache.begin_write(16 * 1024 + 4) {
             Ok(_) => panic!("oversized write should exhaust cache"),
             Err(error) => error,
         };
         assert!(matches!(
             error,
-            super::types::DsrError::CacheCapacity {
+            super::cache::CacheError::Capacity {
                 requested: 16_388,
                 used: 0,
                 capacity: 16_384,
