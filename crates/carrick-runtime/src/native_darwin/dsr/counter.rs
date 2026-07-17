@@ -10,14 +10,95 @@ const MRS_APPLE_TIMEBASE_X0: u32 = 0xd53c_fac0;
 pub(super) enum HostCounterSource {
     Cntvct,
     AppleTimebase,
-    MachAbsoluteTime,
 }
 
-pub(super) const fn source_for_mode(mode: u8) -> HostCounterSource {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct CounterScale {
+    numerator: u32,
+    denominator: u32,
+}
+
+impl CounterScale {
+    pub(super) fn new(numerator: u32, denominator: u32) -> Option<Self> {
+        if numerator == 0 || denominator == 0 {
+            return None;
+        }
+        let divisor = gcd(u128::from(numerator), u128::from(denominator));
+        Some(Self {
+            numerator: u32::try_from(u128::from(numerator) / divisor).ok()?,
+            denominator: u32::try_from(u128::from(denominator) / divisor).ok()?,
+        })
+    }
+
+    pub(super) const fn numerator(self) -> u32 {
+        self.numerator
+    }
+
+    pub(super) const fn denominator(self) -> u32 {
+        self.denominator
+    }
+
+    pub(super) fn apply(self, ticks: u64) -> u64 {
+        let denominator = u64::from(self.denominator);
+        let quotient = ticks / denominator;
+        let remainder = ticks % denominator;
+        quotient
+            .wrapping_mul(u64::from(self.numerator))
+            .wrapping_add(remainder * u64::from(self.numerator) / u64::from(self.denominator))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum HostCounterPlan {
+    Inline {
+        source: HostCounterSource,
+        scale: CounterScale,
+    },
+    Fallback {
+        scale: CounterScale,
+    },
+    Unsupported,
+}
+
+fn gcd(mut left: u128, mut right: u128) -> u128 {
+    while right != 0 {
+        let remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    left
+}
+
+fn scale_from_timebase(numerator: u32, denominator: u32, frequency: u64) -> Option<CounterScale> {
+    if numerator == 0 || denominator == 0 || frequency == 0 {
+        return None;
+    }
+    let numerator = u128::from(numerator).checked_mul(u128::from(frequency))?;
+    let denominator = u128::from(denominator).checked_mul(1_000_000_000)?;
+    let divisor = gcd(numerator, denominator);
+    let numerator = u32::try_from(numerator / divisor).ok()?;
+    let denominator = u32::try_from(denominator / divisor).ok()?;
+    CounterScale::new(numerator, denominator)
+}
+
+pub(super) fn plan_for_mode(mode: u8, host_scale: Option<CounterScale>) -> HostCounterPlan {
     match mode {
-        1 => HostCounterSource::Cntvct,
-        3 => HostCounterSource::AppleTimebase,
-        _ => HostCounterSource::MachAbsoluteTime,
+        1 => HostCounterPlan::Inline {
+            source: HostCounterSource::Cntvct,
+            scale: CounterScale {
+                numerator: 1,
+                denominator: 1,
+            },
+        },
+        3 => host_scale.map_or(HostCounterPlan::Unsupported, |scale| {
+            HostCounterPlan::Inline {
+                source: HostCounterSource::AppleTimebase,
+                scale,
+            }
+        }),
+        _ => host_scale.map_or(HostCounterPlan::Unsupported, |scale| {
+            HostCounterPlan::Fallback { scale }
+        }),
     }
 }
 
@@ -25,7 +106,6 @@ pub(super) const fn counter_word(source: HostCounterSource, destination: u32) ->
     let base = match source {
         HostCounterSource::Cntvct => MRS_CNTVCT_X0,
         HostCounterSource::AppleTimebase => MRS_APPLE_TIMEBASE_X0,
-        HostCounterSource::MachAbsoluteTime => return None,
     };
     if destination <= 31 {
         Some(base | destination)
@@ -34,21 +114,43 @@ pub(super) const fn counter_word(source: HostCounterSource, destination: u32) ->
     }
 }
 
-pub(super) fn host_counter_source() -> HostCounterSource {
+#[allow(deprecated)]
+pub(super) fn host_counter_scale() -> Option<CounterScale> {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
-        static MODE: OnceLock<u8> = OnceLock::new();
-        let mode = *MODE.get_or_init(|| {
-            // SAFETY: Darwin maps the commpage read-only at a fixed userspace
-            // address, and the mode field is one byte at the documented offset.
-            unsafe { (COMMPAGE_MODE_ADDRESS as *const u8).read_volatile() }
-        });
-        source_for_mode(mode)
+        static SCALE: OnceLock<Option<CounterScale>> = OnceLock::new();
+        *SCALE.get_or_init(|| {
+            let mut info = libc::mach_timebase_info { numer: 0, denom: 0 };
+            // SAFETY: the call initializes the fixed-size out parameter.
+            if unsafe { libc::mach_timebase_info(&mut info) } != libc::KERN_SUCCESS {
+                return None;
+            }
+            let (_, frequency) = crate::trap::host_counter();
+            scale_from_timebase(info.numer, info.denom, frequency)
+        })
     }
 
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
     {
-        HostCounterSource::MachAbsoluteTime
+        None
+    }
+}
+
+pub(super) fn host_counter_plan() -> HostCounterPlan {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        static PLAN: OnceLock<HostCounterPlan> = OnceLock::new();
+        *PLAN.get_or_init(|| {
+            // SAFETY: Darwin maps the commpage read-only at a fixed userspace
+            // address, and the mode field is one byte at the documented offset.
+            let mode = unsafe { (COMMPAGE_MODE_ADDRESS as *const u8).read_volatile() };
+            plan_for_mode(mode, host_counter_scale())
+        })
+    }
+
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    {
+        HostCounterPlan::Unsupported
     }
 }
 
@@ -61,20 +163,48 @@ pub(super) fn mach_absolute_time_ticks() -> u64 {
     unsafe { libc::mach_absolute_time() }
 }
 
+#[cfg(target_os = "macos")]
+pub(super) fn fallback_counter_ticks() -> Option<u64> {
+    let scale = match host_counter_plan() {
+        HostCounterPlan::Inline { scale, .. } | HostCounterPlan::Fallback { scale } => scale,
+        HostCounterPlan::Unsupported => return None,
+    };
+    Some(scale.apply(mach_absolute_time_ticks()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn known_modes_select_inline_sources() {
-        assert_eq!(source_for_mode(1), HostCounterSource::Cntvct);
-        assert_eq!(source_for_mode(3), HostCounterSource::AppleTimebase);
+        let host_scale = CounterScale::new(125, 3).expect("host scale");
+        assert_eq!(
+            plan_for_mode(1, None),
+            HostCounterPlan::Inline {
+                source: HostCounterSource::Cntvct,
+                scale: CounterScale::new(1, 1).expect("identity scale"),
+            }
+        );
+        assert_eq!(
+            plan_for_mode(3, Some(host_scale)),
+            HostCounterPlan::Inline {
+                source: HostCounterSource::AppleTimebase,
+                scale: host_scale,
+            }
+        );
+        assert_eq!(plan_for_mode(3, None), HostCounterPlan::Unsupported);
     }
 
     #[test]
     fn unproved_modes_select_fallback() {
+        let scale = CounterScale::new(125, 3).expect("host scale");
         for mode in [0, 2, 4, u8::MAX] {
-            assert_eq!(source_for_mode(mode), HostCounterSource::MachAbsoluteTime);
+            assert_eq!(
+                plan_for_mode(mode, Some(scale)),
+                HostCounterPlan::Fallback { scale }
+            );
+            assert_eq!(plan_for_mode(mode, None), HostCounterPlan::Unsupported);
         }
     }
 
@@ -88,16 +218,15 @@ mod tests {
             counter_word(HostCounterSource::AppleTimebase, 2),
             Some(0xd53c_fac2)
         );
-        assert_eq!(counter_word(HostCounterSource::MachAbsoluteTime, 2), None);
         assert_eq!(counter_word(HostCounterSource::Cntvct, 32), None);
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
-    fn host_counter_source_is_stable() {
-        let first = host_counter_source();
-        let second = host_counter_source();
-        eprintln!("host counter source: {first:?}");
+    fn host_counter_plan_is_stable() {
+        let first = host_counter_plan();
+        let second = host_counter_plan();
+        eprintln!("host counter plan: {first:?}");
         assert_eq!(first, second);
     }
 
@@ -107,5 +236,49 @@ mod tests {
         let before = mach_absolute_time_ticks();
         let after = mach_absolute_time_ticks();
         assert!(after >= before);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn host_scale_converts_mach_ticks_into_cntfrq_domain() {
+        let scale = host_counter_scale().expect("representable host counter scale");
+        let (_, frequency) = crate::trap::host_counter();
+        if frequency == 1_000_000_000 {
+            assert_eq!(
+                scale,
+                CounterScale::new(125, 3).expect("known reduced scale")
+            );
+        }
+        let before = crate::trap::host_clock_uptime_ns();
+        let ticks = scale.apply(mach_absolute_time_ticks());
+        let after = crate::trap::host_clock_uptime_ns();
+        let observed = u64::try_from(u128::from(ticks) * 1_000_000_000 / u128::from(frequency))
+            .expect("scaled counter nanoseconds fit u64");
+        assert!(before.saturating_sub(1_000) <= observed);
+        assert!(observed <= after.saturating_add(1_000));
+    }
+
+    #[test]
+    fn scale_uses_exact_quotient_remainder_arithmetic() {
+        let scale = CounterScale::new(125, 3).expect("reduced scale");
+        let ticks = u64::MAX - 1;
+        let modulus = u128::from(u64::MAX) + 1;
+        let exact = u64::try_from((u128::from(ticks) * 125 / 3) % modulus)
+            .expect("reduced exact result fits u64");
+        assert_eq!(scale.apply(ticks), exact);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn unknown_mode_fallback_uses_host_scale() {
+        let scale = host_counter_scale().expect("representable host counter scale");
+        assert_eq!(
+            plan_for_mode(0, Some(scale)),
+            HostCounterPlan::Fallback { scale }
+        );
+        let before = scale.apply(mach_absolute_time_ticks());
+        let observed = fallback_counter_ticks().expect("scaled fallback counter");
+        let after = scale.apply(mach_absolute_time_ticks());
+        assert!(before <= observed && observed <= after);
     }
 }

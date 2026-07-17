@@ -1,7 +1,14 @@
 # Native Darwin Counter Virtualization Design
 
 Date: 2026-07-16
-Status: approved for implementation
+Status: approved for implementation; mode-3 unit contract amended from live proof
+
+Implementation evidence corrected one assumption in the original design. On
+this host, mode 3 plus the commpage offset produces `mach_absolute_time` ticks
+(24 MHz, with a `mach_timebase_info` ratio of 125/3), while `CNTFRQ_EL0`
+reports 1 GHz. The inline and fallback paths therefore must scale Mach ticks
+into the architectural counter domain; an add-only sequence is not coherent
+with the preserved vvar frequency.
 
 ## Problem
 
@@ -41,8 +48,8 @@ suspend and therefore produces the same suspend-excluding timeline as
 
 - Changing HVF counter virtualization. HVF already supplies a guest counter
   aligned with `CLOCK_UPTIME_RAW`.
-- Changing `CNTFRQ_EL0`; its frequency remains directly readable and matches
-  the counter tick unit.
+- Changing `CNTFRQ_EL0`; its frequency remains directly readable. Sources that
+  use Mach ticks are converted into that architectural counter domain.
 - Changing Linux clock-id policy, realtime-offset semantics, or the vvar ELF
   contract.
 - General access to Darwin commpage data from guest code.
@@ -74,7 +81,20 @@ modes receive an inline DSR plan:
 2. load the signed/wrapping counter offset;
 3. read the mode-selected host counter into the guest destination;
 4. reload and compare the offset, retrying if Darwin changed it concurrently;
-5. add the stable offset to the raw counter.
+5. add the stable offset to the raw counter;
+6. for the Apple timebase source, apply a reduced rational scale derived from
+   `mach_timebase_info` and `CNTFRQ_EL0` before committing the destination.
+
+Mode 1 reads `CNTVCT_EL0` and uses the identity scale. Mode 3 and the fallback
+API return Mach ticks. Their conversion to architectural ticks is:
+
+```text
+mach_ticks * (timebase_numer * CNTFRQ) / (timebase_denom * 1_000_000_000)
+```
+
+The ratio is reduced before emission. On the measured host it is exactly
+125/3. If a future ratio cannot be represented safely by the inline lowering,
+Carrick must take the correctness boundary rather than approximate it.
 
 The offset is read for every guest counter read, so a process that remains
 alive across a later host suspend automatically observes Darwin's updated
@@ -95,10 +115,12 @@ pointer or other host memory becomes guest-visible.
 The host-side mode classifier recognizes only counter encodings Carrick has
 explicitly tested: mode 1 `CNTVCT_EL0` and mode 3 `S3_4_C15_C10_6`. Mode 0,
 mode 2 (`CNTVCTSS_EL0`), and unknown values must not emit a guessed instruction
-or use raw `CNTVCT`. They lower the read to a typed sensitive exit whose handler
-calls `mach_absolute_time` and writes the result to the architectural
-destination. Mode 2 can move inline only after its encoding and behavior have
-their own red-first proof on a host that selects it.
+or use raw `CNTVCT`. They lower the read to a typed sensitive exit whose
+handler calls `mach_absolute_time`, converts those ticks into the
+`CNTFRQ_EL0` domain with the same reduced ratio as the inline path, and writes
+the result to the architectural destination. Mode 2 can move inline only after
+its encoding and behavior have their own red-first proof on a host that selects
+it.
 
 This fallback is slower but correct, and it confines any performance impact to
 future Darwin/CPU combinations until their mode receives its own red-first
@@ -107,8 +129,9 @@ silent performance regression.
 
 ### Clock and vvar coherence
 
-The adjusted counter is in the same tick unit as `CNTFRQ_EL0`. Therefore the
-existing aarch64 vDSO math converts it directly to suspend-excluding nanoseconds.
+After source-specific scaling, the adjusted counter is in the same tick unit
+as `CNTFRQ_EL0`. Therefore the existing aarch64 vDSO math converts it directly
+to suspend-excluding nanoseconds.
 The vvar continues to publish:
 
 - `VVAR_OFF_FREQ = CNTFRQ_EL0`;

@@ -17,8 +17,8 @@ pub(super) mod profile;
 pub(super) mod types;
 
 #[cfg(target_os = "macos")]
-pub(super) fn mach_absolute_time_ticks() -> u64 {
-    counter::mach_absolute_time_ticks()
+pub(super) fn fallback_counter_ticks() -> Option<u64> {
+    counter::fallback_counter_ticks()
 }
 
 const ARTIFACT_KEY_PREFIX_INSTRUCTIONS: usize = 16;
@@ -1758,6 +1758,7 @@ impl ThreadTranslator {
                             | emit::RecoveryAction::RestoreDualVirtualReadOnly { .. }
                             | emit::RecoveryAction::RestoreDualVirtualReadOnlyCompleted { .. }
                             | emit::RecoveryAction::CommitDualVirtualAndRestore { .. }
+                            | emit::RecoveryAction::RecoverCounterRead(_)
                             | emit::RecoveryAction::RecoverBiasedMemory(_)
                     ) {
                         return None;
@@ -2311,6 +2312,27 @@ fn recover_rewrite_state(
     saved_indirect_x15: u64,
     saved_indirect_x30: u64,
 ) -> Result<(), types::DsrError> {
+    if let emit::RecoveryAction::RecoverCounterRead(recovery) = action {
+        let committed = recovery
+            .instruction_complete
+            .then_some(recovery.committed_scratch_destination)
+            .flatten()
+            .map(emit::CounterScratchDestination::register);
+        for (register, saved) in [
+            (15_u32, saved_indirect_x15),
+            (16, saved_scratch),
+            (17, saved_context_scratch),
+        ] {
+            if committed == Some(register) {
+                continue;
+            }
+            let index = usize::try_from(register).map_err(|_| {
+                types::DsrError::CachePolicy("counter scratch index overflow".to_string())
+            })?;
+            snapshot.x[index] = saved;
+        }
+        return Ok(());
+    }
     if let emit::RecoveryAction::RecoverBiasedExclusive(recovery) = action {
         let address = usize::try_from(recovery.scratch.address.index()).map_err(|_| {
             types::DsrError::CachePolicy("biased exclusive address scratch overflow".to_string())
@@ -2557,6 +2579,11 @@ fn recover_rewrite_state(
         emit::RecoveryAction::RecoverBiasedExclusive(_) => {
             return Err(types::DsrError::CachePolicy(
                 "biased exclusive recovery escaped its typed handler".to_string(),
+            ));
+        }
+        emit::RecoveryAction::RecoverCounterRead(_) => {
+            return Err(types::DsrError::CachePolicy(
+                "counter recovery escaped its typed handler".to_string(),
             ));
         }
     };
