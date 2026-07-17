@@ -13,7 +13,9 @@
 //! address space), so `snapshot.gpr[RSP]` is a live host pointer. A guest with
 //! an unmapped stack faults through the (M2-runtime) signal shim, not here.
 
-use iced_x86::{ConditionCode, Decoder, DecoderOptions, FlowControl, Instruction};
+use iced_x86::{
+    Code, ConditionCode, Decoder, DecoderOptions, FlowControl, Instruction, OpKind, Register,
+};
 
 use crate::gateway::{X86UcontextSnapshot, reg};
 
@@ -55,18 +57,85 @@ pub fn resolve(
             push64(snapshot, fallthrough);
             Ok(target)
         }
-        FlowControl::Return => Ok(pop64(snapshot)),
+        FlowControl::IndirectBranch => indirect_target(&inst, va, snapshot),
+        FlowControl::IndirectCall => {
+            // Read the target BEFORE the push (an rsp-based memory operand
+            // must see the pre-call rsp, exactly like hardware).
+            let target = indirect_target(&inst, va, snapshot)?;
+            push64(snapshot, fallthrough);
+            Ok(target)
+        }
+        FlowControl::Return => {
+            let target = pop64(snapshot);
+            // `ret imm16` additionally releases the callee-popped argument
+            // bytes after the return address.
+            if inst.code() == Code::Retnq_imm16 {
+                snapshot.gpr[reg::RSP] =
+                    snapshot.gpr[reg::RSP].wrapping_add(u64::from(inst.immediate16()));
+            }
+            Ok(target)
+        }
         _ => Err(CflowError::Unsupported { va }),
     }
 }
 
-/// Absolute target of a near rel8/rel32 branch. Indirect (register/memory)
-/// branches are not lowered yet.
+/// Absolute target of a near rel8/rel32 branch.
 fn rel_target(inst: &Instruction, va: u64) -> Result<u64, CflowError> {
     match inst.op0_kind() {
-        iced_x86::OpKind::NearBranch64 => Ok(inst.near_branch64()),
+        OpKind::NearBranch64 => Ok(inst.near_branch64()),
         _ => Err(CflowError::Unsupported { va }),
     }
+}
+
+/// Target of an indirect `jmp/call r/m64`: the register value, or a 64-bit
+/// load from the resolved effective address (guest VA == host VA natively).
+/// Far forms and segment-prefixed operands (the base would need the swapped
+/// fs/gs base, which is not live here on the host side) stay unsupported.
+fn indirect_target(
+    inst: &Instruction,
+    va: u64,
+    snapshot: &X86UcontextSnapshot,
+) -> Result<u64, CflowError> {
+    match inst.op0_kind() {
+        OpKind::Register => gpr_value(inst.op0_register(), snapshot, va),
+        OpKind::Memory => {
+            if inst.segment_prefix() == Register::FS || inst.segment_prefix() == Register::GS {
+                return Err(CflowError::Unsupported { va });
+            }
+            let mut addr = inst.memory_displacement64();
+            let base = inst.memory_base();
+            if base != Register::None && base != Register::RIP {
+                // RIP-relative displacement64 is already absolute (the
+                // decoder ran with the branch VA as IP).
+                addr = addr.wrapping_add(gpr_value(base, snapshot, va)?);
+            }
+            let index = inst.memory_index();
+            if index != Register::None {
+                let scaled = gpr_value(index, snapshot, va)?
+                    .wrapping_mul(u64::from(inst.memory_index_scale()));
+                addr = addr.wrapping_add(scaled);
+            }
+            // SAFETY: addr is a guest VA == host VA in the native mapping
+            // model; a bad guest pointer faults through the signal shim.
+            Ok(unsafe { (addr as *const u64).read_unaligned() })
+        }
+        _ => Err(CflowError::Unsupported { va }),
+    }
+}
+
+/// The 64-bit value of a full-width GPR from the snapshot (indirect branch
+/// operands are always 64-bit in long mode). The snapshot's gpr array is in
+/// x86 encoding order, which is exactly iced's RAX..R15 enum order.
+fn gpr_value(
+    register: Register,
+    snapshot: &X86UcontextSnapshot,
+    va: u64,
+) -> Result<u64, CflowError> {
+    if !matches!(register as u32, r if (Register::RAX as u32..=Register::R15 as u32).contains(&r)) {
+        return Err(CflowError::Unsupported { va });
+    }
+    let index = (register as u32 - Register::RAX as u32) as usize;
+    Ok(snapshot.gpr[index])
 }
 
 fn push64(snapshot: &mut X86UcontextSnapshot, value: u64) {
@@ -179,11 +248,74 @@ mod tests {
     }
 
     #[test]
-    fn indirect_branch_is_unsupported_for_now() {
+    fn indirect_register_branch_reads_the_snapshot() {
         // ff e0  jmp rax
         let mut s = snap();
+        s.gpr[reg::RAX] = 0x77_0000;
+        assert_eq!(resolve(&[0xff, 0xe0], VA, &mut s).unwrap(), 0x77_0000);
+        // ff e7  jmp rdi
+        s.gpr[reg::RDI] = 0x88_0000;
+        assert_eq!(resolve(&[0xff, 0xe7], VA, &mut s).unwrap(), 0x88_0000);
+        // 41 ff e7  jmp r15 — the VIRTUALIZED register resolves from the
+        // snapshot like any other (the live r15 is the context pointer, but
+        // cflow never touches live registers).
+        s.gpr[reg::R15] = 0x99_0000;
+        assert_eq!(resolve(&[0x41, 0xff, 0xe7], VA, &mut s).unwrap(), 0x99_0000);
+    }
+
+    #[test]
+    fn indirect_memory_branch_loads_the_target() {
+        // A function-pointer table in this process's memory (guest VA == host
+        // VA in the native model).
+        let table: Vec<u64> = vec![0x11_0000, 0x22_0000, 0x33_0000];
+        let mut s = snap();
+        s.gpr[reg::RAX] = table.as_ptr() as u64;
+        s.gpr[reg::RCX] = 2;
+        // ff 20         jmp [rax]
+        assert_eq!(resolve(&[0xff, 0x20], VA, &mut s).unwrap(), 0x11_0000);
+        // ff 24 c8      jmp [rax+rcx*8] — scaled index (switch-table shape)
+        assert_eq!(resolve(&[0xff, 0x24, 0xc8], VA, &mut s).unwrap(), 0x33_0000);
+        // ff 60 08      jmp [rax+8] — displacement (PLT/vtable shape)
+        assert_eq!(resolve(&[0xff, 0x60, 0x08], VA, &mut s).unwrap(), 0x22_0000);
+    }
+
+    #[test]
+    fn indirect_call_pushes_the_return_address_after_reading_the_target() {
+        let stack = vec![0u8; 4096];
+        let top = stack.as_ptr() as u64 + 4096;
+        let mut s = snap();
+        s.gpr[reg::RSP] = top;
+        s.gpr[reg::RDX] = 0x55_0000;
+        // ff d2  call rdx
+        let target = resolve(&[0xff, 0xd2], VA, &mut s).unwrap();
+        assert_eq!(target, 0x55_0000);
+        assert_eq!(s.gpr[reg::RSP], top - 8);
+        // The pushed return address is the fallthrough (VA + 2).
+        let pushed = unsafe { ((top - 8) as *const u64).read_unaligned() };
+        assert_eq!(pushed, VA + 2);
+    }
+
+    #[test]
+    fn ret_imm16_releases_callee_popped_bytes() {
+        let stack = vec![0u8; 4096];
+        let top = stack.as_ptr() as u64 + 4096;
+        let mut s = snap();
+        // A return address at [top-24] with 16 bytes of stack args above it.
+        s.gpr[reg::RSP] = top - 24;
+        unsafe { ((top - 24) as *mut u64).write_unaligned(0x66_0000) };
+        // c2 10 00  ret 0x10
+        assert_eq!(resolve(&[0xc2, 0x10, 0x00], VA, &mut s).unwrap(), 0x66_0000);
+        assert_eq!(s.gpr[reg::RSP], top, "rsp released ra + 16 arg bytes");
+    }
+
+    #[test]
+    fn segment_prefixed_indirect_branches_stay_unsupported() {
+        // 64 ff 20  jmp fs:[rax] — the host-side resolver has no live guest
+        // fs base to honor; fail closed.
+        let mut s = snap();
+        s.gpr[reg::RAX] = 0x1000;
         assert_eq!(
-            resolve(&[0xff, 0xe0], VA, &mut s),
+            resolve(&[0x64, 0xff, 0x20], VA, &mut s),
             Err(CflowError::Unsupported { va: VA })
         );
     }
