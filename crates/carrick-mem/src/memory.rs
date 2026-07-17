@@ -402,6 +402,32 @@ pub fn mmap_arena_size() -> u64 {
         resolve_arena_size(requested)
     })
 }
+
+/// Guest heap + mmap-arena placement: the four knobs the syscall dispatcher's
+/// `mem` subsystem (brk/mmap accounting) and the native (DSR) backend's
+/// address-layout selection share. Moved here from the runtime's
+/// `dispatch::mem` as part of the staged native-backend extraction
+/// (docs/superpowers/specs/2026-07-17-native-backend-portability-seams-design.md)
+/// so `carrick-dsr` can consume it without a runtime dependency; the runtime
+/// re-exports it under the old `crate::dispatch::MemoryLayout` path.
+#[derive(Clone, Copy)]
+pub struct MemoryLayout {
+    pub heap_base: u64,
+    pub heap_size: u64,
+    pub mmap_base: u64,
+    pub mmap_size: u64,
+}
+
+impl MemoryLayout {
+    pub fn hvf_default() -> Self {
+        Self {
+            heap_base: LINUX_HEAP_BASE,
+            heap_size: LINUX_HEAP_SIZE,
+            mmap_base: LINUX_MMAP_BASE,
+            mmap_size: mmap_arena_size(),
+        }
+    }
+}
 // Stable shared aperture for guest MAP_SHARED mmaps. The whole window is
 // hv_vm_map'd ONCE at boot (host MAP_ANON|MAP_SHARED|MAP_NORESERVE; see
 // `linux_runtime_regions`), then guest MAP_SHARED|MAP_ANON and MAP_SHARED file
