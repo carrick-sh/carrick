@@ -40,9 +40,76 @@ use carrick_native_freebsd::{FreebsdHostJit, fault};
 use goblin::elf::Elf;
 use goblin::elf::program_header::PT_LOAD;
 
+use carrick_mem::memory::{LINUX_HEAP_BASE, LINUX_HEAP_SIZE, LINUX_MMAP_BASE, mmap_arena_size};
+
 use crate::compat::{CompatReport, CompatReporter};
 use crate::dispatch::{DispatchOutcome, SyscallDispatcher, SyscallRequest};
 use crate::run_result::{RunResult, RuntimeError};
+
+/// The guest brk-heap and mmap arenas, reserved as real host backing at the
+/// dispatcher's fixed layout addresses (`MemoryLayout::hvf_default`: heap at
+/// 384-ish GiB, mmap arena at 384 GiB). The dispatcher's `brk`/`mmap`
+/// handlers hand out addresses INSIDE these arenas and expect the
+/// `GuestMemory` to have backing there (`brk` only moves a pointer; `mmap`
+/// zeroes the new region THROUGH the memory). In the identity model that
+/// backing is real host pages at the same VA. FreeBSD overcommits anonymous
+/// RW maps (pages commit on first touch), so reserving the full 32 GiB mmap
+/// arena is cheap. A guest `mmap(PROT_NONE)` guard page reads back as zero
+/// rather than faulting — a fidelity gap, not a crash; enforcing guest-visible
+/// per-page protection is a later rung.
+struct GuestArenas {
+    heap: u64,
+    heap_len: usize,
+    mmap: u64,
+    mmap_len: usize,
+}
+
+impl GuestArenas {
+    fn reserve() -> Result<Self, RuntimeError> {
+        let heap_len = LINUX_HEAP_SIZE as usize;
+        let mmap_len = mmap_arena_size() as usize;
+        let heap = reserve_fixed_rw(LINUX_HEAP_BASE, heap_len).ok_or_else(|| {
+            RuntimeError::Unsupported(format!(
+                "reserve guest heap arena at 0x{LINUX_HEAP_BASE:x} ({heap_len} bytes) failed"
+            ))
+        })?;
+        let mmap = match reserve_fixed_rw(LINUX_MMAP_BASE, mmap_len) {
+            Some(a) => a,
+            None => {
+                // SAFETY: unmapping the heap arena we just reserved.
+                unsafe { libc::munmap(heap as *mut libc::c_void, heap_len) };
+                return Err(RuntimeError::Unsupported(format!(
+                    "reserve guest mmap arena at 0x{LINUX_MMAP_BASE:x} ({mmap_len} bytes) failed"
+                )));
+            }
+        };
+        Ok(Self {
+            heap,
+            heap_len,
+            mmap,
+            mmap_len,
+        })
+    }
+
+    fn teardown(&self) {
+        // SAFETY: unmapping the arenas this struct reserved.
+        unsafe {
+            libc::munmap(self.heap as *mut libc::c_void, self.heap_len);
+            libc::munmap(self.mmap as *mut libc::c_void, self.mmap_len);
+        }
+    }
+}
+
+/// Reserve `[base, base+len)` as anonymous RW at EXACTLY `base` (MAP_FIXED).
+/// Returns `None` if the kernel could not place it there.
+fn reserve_fixed_rw(base: u64, len: usize) -> Option<u64> {
+    let p = map_prot(len, libc::PROT_READ | libc::PROT_WRITE, Some(base));
+    if p as isize == -1 || p as u64 != base {
+        None
+    } else {
+        Some(p as u64)
+    }
+}
 
 /// `ARCH_SET_FS` (arch_prctl(2)) — the musl/glibc TLS thread-pointer set.
 const ARCH_SET_FS: u64 = 0x1002;
@@ -312,6 +379,14 @@ enum Step {
     Fault(String),
 }
 
+/// Serializes in-process runs. This driver mutates PROCESS-GLOBAL state — the
+/// fixed guest arenas (MAP_FIXED at the layout addresses) and the process-wide
+/// fault-redirect sigaction/code-region registration — so two concurrent runs
+/// in one process would clobber each other's arenas and fault state. Real
+/// usage forks a process per guest (single run per process); the lock makes
+/// the in-process case (e.g. parallel test threads) safe by serializing.
+static RUN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Run a static x86_64 Linux ELF natively on FreeBSD/amd64 through the shared
 /// dispatcher. The `dispatcher` is fully constructed by the caller (rootfs,
 /// fd table, identity, container policy) exactly as the VMM path receives it.
@@ -326,6 +401,10 @@ where
     A: IntoIterator<Item = String>,
     E: IntoIterator<Item = String>,
 {
+    // Held for the whole run: the fixed arenas and the process-wide fault
+    // shim cannot be shared across concurrent in-process runs.
+    let _run_guard = RUN_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
     let argv: Vec<String> = argv.into_iter().collect();
     let bytes = std::fs::read(path)
         .map_err(|e| RuntimeError::Unsupported(format!("read {}: {e}", path.display())))?;
@@ -341,6 +420,12 @@ where
     fault::install_fault_redirect(signal_stub_addr(), CTX_FAULT_RECORD)
         .map_err(|e| RuntimeError::Unsupported(format!("install fault redirect: {e}")))?;
     fault::register_code_region(region.exec_base.as_ptr() as u64, 4 * 1024 * 1024);
+
+    // Back the guest brk-heap and mmap arenas with real host pages at the
+    // dispatcher's fixed layout addresses, so `brk`/`mmap` (which move a
+    // pointer / zero a region THROUGH the memory) resolve onto live backing
+    // instead of faulting the host.
+    let arenas = GuestArenas::reserve()?;
 
     let reporter = Arc::new(CompatReporter::default());
     let tid = crate::thread::ThreadId::main_from_host_pid();
@@ -500,6 +585,7 @@ where
     // SAFETY: nothing executes from the JIT region after the loop returns.
     unsafe { jit.unmap(&region) };
     image.teardown();
+    arenas.teardown();
 
     // Drain the guest's stdout/stderr. Unless the caller enabled live
     // streaming (`set_stream_stdio`), the dispatcher accumulates fd 1/2 writes
