@@ -2,6 +2,14 @@
 
 use carrick_guest_mem::{GuestVa, HostVa};
 
+// Moved verbatim to `carrick_dsr::vocabulary` as part of the staged
+// native-backend extraction (see
+// docs/superpowers/specs/2026-07-17-native-backend-portability-seams-design.md);
+// re-exported so existing `super::types::*` call paths resolve unchanged.
+pub(in crate::native_darwin) use carrick_dsr::vocabulary::{
+    ExclusiveFusionDisposition, ExclusiveFusionRejection, SensitiveKind,
+};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(in crate::native_darwin) struct CodeGeneration(u64);
 
@@ -188,38 +196,6 @@ pub(super) struct CounterRead {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in crate::native_darwin) enum SensitiveKind {
-    /// AArch64 exclusive load/store lowered at a typed DSR boundary.  A DSR
-    /// block transition performs host stores, so the hardware reservation
-    /// cannot be carried faithfully across translated basic blocks.
-    Exclusive(u32),
-    ReadTpidr,
-    WriteTpidr,
-    ReadCounter,
-    ReadCtr,
-    ReadDczid,
-    DcZva,
-    DcCvau,
-    IcIvau,
-}
-
-impl SensitiveKind {
-    pub(in crate::native_darwin) const fn profile_class(self) -> super::profile::SensitiveClass {
-        match self {
-            Self::Exclusive(_) => super::profile::SensitiveClass::Exclusive,
-            Self::ReadTpidr => super::profile::SensitiveClass::ReadTpidr,
-            Self::WriteTpidr => super::profile::SensitiveClass::WriteTpidr,
-            Self::ReadCounter => super::profile::SensitiveClass::ReadCounter,
-            Self::ReadCtr => super::profile::SensitiveClass::ReadCtr,
-            Self::ReadDczid => super::profile::SensitiveClass::ReadDczid,
-            Self::DcZva => super::profile::SensitiveClass::DcZva,
-            Self::DcCvau => super::profile::SensitiveClass::DcCvau,
-            Self::IcIvau => super::profile::SensitiveClass::IcIvau,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::native_darwin) struct SensitiveExit {
     pub(in crate::native_darwin) kind: SensitiveKind,
     pub(in crate::native_darwin) register: Option<bad64::Reg>,
@@ -245,30 +221,6 @@ impl DsrScratchGpr {
 pub(super) struct BiasedExclusiveScratch {
     pub(super) address: DsrScratchGpr,
     pub(super) bias: DsrScratchGpr,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum ExclusiveFusionRejection {
-    NotLoad,
-    VirtualizedBase,
-    VirtualizedOperand,
-    PageBoundary,
-    ScanLimitOrNoStore,
-    MismatchedStore,
-    UnsupportedBodyMemoryOrSensitive,
-    UnsupportedControlFlow,
-    InvalidRetryEdge,
-    BiasedNoSafeScratch,
-    BiasedAddressFormUnsupported,
-    AnalysisUnavailable,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum ExclusiveFusionDisposition {
-    FusedDirect,
-    FusedBiased,
-    EligibleBackendDisabled,
-    Rejected(ExclusiveFusionRejection),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

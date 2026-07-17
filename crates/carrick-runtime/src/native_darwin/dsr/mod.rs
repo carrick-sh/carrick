@@ -372,28 +372,10 @@ impl ResolverStats {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(super) struct ProfileSnapshot {
-    pub(super) resolver_exits: u64,
-    pub(super) one_entry_hits: u64,
-    pub(super) translations: u64,
-    pub(super) duplicate_publications: u64,
-    pub(super) gateway_entries: u64,
-    pub(super) syscall_exits: u64,
-    pub(super) direct_resolver_exits: u64,
-    pub(super) cache_lookups: u64,
-    pub(super) cache_lookup_hits: u64,
-    pub(super) invalidated_blocks: u64,
-    pub(super) translation_ns: u64,
-    pub(super) translation_decode_ns: u64,
-    pub(super) translation_plan_ns: u64,
-    pub(super) translation_emit_ns: u64,
-    pub(super) translation_publication_ns: u64,
-    pub(super) nested_translation_ns: u64,
-    pub(super) cache_used_bytes: usize,
-    pub(super) cache_capacity_bytes: usize,
-    pub(super) exclusive_fusion_sites: [u64; profile::ExclusiveFusionClass::COUNT],
-}
+// Moved into `carrick_dsr::profile` (all fields `pub`) with the census; the
+// re-export keeps the bare `ProfileSnapshot` name and every field access in
+// this module unchanged.
+pub(super) use profile::ProfileSnapshot;
 
 /// One live guest OS thread's most-recently republished profiling state,
 /// visible to every OTHER guest thread of this same process.

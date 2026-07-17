@@ -39,6 +39,61 @@ pub fn host_clock_uptime_ns() -> u64 {
     (ts.tv_sec as u64).wrapping_mul(1_000_000_000) + ts.tv_nsec as u64
 }
 
+/// Raw host monotonic tick counter for interval timing (the DSR profiler's
+/// phase clock). Darwin: `mach_absolute_time` (ticks; scale via
+/// [`tick_scale`]). Elsewhere: [`host_clock_uptime_ns`] (already nanoseconds;
+/// [`tick_scale`] is 1/1).
+#[inline]
+pub fn monotonic_ticks() -> u64 {
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: `mach_absolute_time` has no arguments and returns the
+        // monotonic host uptime counter.
+        #[allow(deprecated)]
+        unsafe {
+            libc::mach_absolute_time()
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        host_clock_uptime_ns()
+    }
+}
+
+/// ticks→ns scale for [`monotonic_ticks`]: `ns = ticks * numer / denom`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TickScale {
+    pub numer: u32,
+    pub denom: u32,
+}
+
+/// `None` when the host cannot report a usable timebase (fail-closed: callers
+/// invalidate their measurement rather than guessing a scale).
+pub fn tick_scale() -> Option<TickScale> {
+    #[cfg(target_os = "macos")]
+    {
+        #[allow(deprecated)]
+        {
+            let mut info = libc::mach_timebase_info { numer: 0, denom: 0 };
+            // SAFETY: the call initializes the fixed-size out parameter.
+            if unsafe { libc::mach_timebase_info(&mut info) } != libc::KERN_SUCCESS
+                || info.denom == 0
+            {
+                return None;
+            }
+            Some(TickScale {
+                numer: info.numer,
+                denom: info.denom,
+            })
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // monotonic_ticks already returns nanoseconds off-Darwin.
+        Some(TickScale { numer: 1, denom: 1 })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -49,5 +104,14 @@ mod tests {
         let b = host_clock_uptime_ns();
         assert_ne!(a, 0, "host uptime clock must be readable");
         assert!(b >= a, "uptime must not run backwards: {a} then {b}");
+    }
+
+    #[test]
+    fn tick_scale_is_available_and_ticks_advance() {
+        let scale = tick_scale().expect("host timebase");
+        assert_ne!(scale.denom, 0);
+        let a = monotonic_ticks();
+        let b = monotonic_ticks();
+        assert!(b >= a, "ticks must not run backwards: {a} then {b}");
     }
 }

@@ -171,6 +171,9 @@ impl DirectVmReservation {
         spans
     }
 
+    // The `mut` is exercised only by the macOS arm below; keep the signature
+    // identical across platforms without tripping unused_mut off-Darwin.
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
     pub fn commit(mut self) {
         #[cfg(target_os = "macos")]
         {
