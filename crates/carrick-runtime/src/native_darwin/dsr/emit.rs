@@ -3895,9 +3895,9 @@ fn emit_block_inner(
 mod tests {
     use super::super::block::{BlockLimit, PlannedInst};
     use super::super::types::{
-        CodeGeneration, DirectExit, DirectKind, IndirectExit, IndirectKind, MemoryAccess,
-        MemoryBase, MemoryClass, MemoryWriteback, PcRelativeInst, PcRelativeKind, SensitiveExit,
-        SensitiveKind,
+        CodeGeneration, CounterDestination, CounterRead, DirectExit, DirectKind, IndirectExit,
+        IndirectKind, MemoryAccess, MemoryBase, MemoryClass, MemoryWriteback, PcRelativeInst,
+        PcRelativeKind, SensitiveExit, SensitiveKind,
     };
     use super::*;
 
@@ -4016,6 +4016,51 @@ mod tests {
                 resume: GuestVa(0x400c),
             },
         }
+    }
+
+    #[test]
+    fn dsr_virtual_counter_mode_one_emits_inline_machine_code() {
+        let guest = GuestVa(0x3f00);
+        let mut assembler = VecAssembler::<Aarch64Relocation>::new(0);
+        let mut entries = Vec::new();
+        let mut recovery = Vec::new();
+        let scale =
+            super::super::counter::CounterScale::new(1, 1).expect("identity mode-one scale");
+
+        emit_counter_read(
+            &mut assembler,
+            &mut entries,
+            &mut recovery,
+            guest,
+            CounterRead {
+                destination: CounterDestination::Gpr(2),
+            },
+            super::super::counter::HostCounterSource::Cntvct,
+            scale,
+        )
+        .expect("emit injected mode-one counter");
+        let bytes = assembler.finalize().expect("finalize mode-one counter");
+        let words = bytes
+            .chunks_exact(std::mem::size_of::<u32>())
+            .map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+            .collect::<Vec<_>>();
+
+        assert_eq!(entries.len(), words.len());
+        assert!(entries.iter().all(|entry| entry.guest == guest));
+        assert!(
+            words.contains(
+                &super::super::counter::counter_word(
+                    super::super::counter::HostCounterSource::Cntvct,
+                    17,
+                )
+                .expect("mode-one counter word")
+            )
+        );
+        assert!(
+            recovery
+                .iter()
+                .any(|entry| matches!(entry.action, RecoveryAction::RecoverCounterRead(_)))
+        );
     }
 
     #[test]
