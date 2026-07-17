@@ -194,6 +194,152 @@ fn translated_x86_guest_writes_and_exits_natively() {
     }
 }
 
+/// A guest whose control flow goes through an INDIRECT call: `call [rax]`
+/// loads a helper's address from a function-pointer table in guest memory
+/// (the PLT/vtable shape), the helper writes the message and `ret`s, and the
+/// caller exits. Exercises `cflow::resolve`'s memory-indirect and return
+/// paths across natively executed blocks.
+#[test]
+fn translated_x86_guest_calls_through_a_function_pointer_table() {
+    use carrick_dsr_x86::cflow;
+
+    let jit = FreebsdHostJit;
+    jit.supported().expect("host JIT supported");
+    let region = jit.map_code_cache(64 * 1024).expect("map code cache");
+
+    let data = map_rw(4096);
+    let msg = b"fp\n";
+    unsafe { std::ptr::copy_nonoverlapping(msg.as_ptr(), data, msg.len()) };
+    let msg_va = data as u64;
+    let table_va = data as u64 + 64;
+
+    let mut fds = [0i32; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+    let (read_fd, write_fd) = (fds[0], fds[1]);
+
+    let stack = map_rw(64 * 1024);
+    let stack_top = stack as u64 + 64 * 1024;
+
+    const GUEST_CODE_BASE: u64 = 0x50_0000;
+    let mut main_code: Vec<u8> = Vec::new();
+    // movabs rax, table_va; call [rax]
+    main_code.extend_from_slice(&[0x48, 0xb8]);
+    main_code.extend_from_slice(&table_va.to_le_bytes());
+    main_code.extend_from_slice(&[0xff, 0x10]);
+    // exit_group(21)
+    main_code.extend_from_slice(&[0xbf, 0x15, 0x00, 0x00, 0x00]);
+    main_code.extend_from_slice(&[0xb8]);
+    main_code.extend_from_slice(&(SYS_EXIT_GROUP as u32).to_le_bytes());
+    main_code.extend_from_slice(&[0x0f, 0x05]);
+    let helper_va = GUEST_CODE_BASE + main_code.len() as u64;
+    // helper: write(fd, msg, 3); ret
+    let mut helper: Vec<u8> = Vec::new();
+    helper.extend_from_slice(&[0xbf]);
+    helper.extend_from_slice(&(write_fd as u32).to_le_bytes());
+    helper.extend_from_slice(&[0x48, 0xbe]);
+    helper.extend_from_slice(&msg_va.to_le_bytes());
+    helper.extend_from_slice(&[0xba, 0x03, 0x00, 0x00, 0x00]);
+    helper.extend_from_slice(&[0xb8]);
+    helper.extend_from_slice(&(SYS_WRITE as u32).to_le_bytes());
+    helper.extend_from_slice(&[0x0f, 0x05]);
+    helper.extend_from_slice(&[0xc3]);
+    let mut program = main_code;
+    program.extend_from_slice(&helper);
+
+    // The function-pointer table entry: helper's guest VA.
+    unsafe { std::ptr::write_unaligned(table_va as *mut u64, helper_va) };
+
+    let read_guest = |va: u64| -> Vec<u8> {
+        let off = (va - GUEST_CODE_BASE) as usize;
+        program.get(off..).map(|s| s.to_vec()).unwrap_or_default()
+    };
+
+    let mut cursor = 0usize;
+    let translate = |guest_va: u64, cursor: &mut usize| -> (u64, X86Exit) {
+        let block = plan_block(guest_va, 256, 4096, read_guest).expect("plan");
+        let src = read_guest(block.start);
+        let end_off = (block.end - block.start) as usize;
+        let translated = emit_block(&src[..end_off.min(src.len())], &block).expect("emit");
+        let exec = unsafe { region.exec_base.as_ptr().add(*cursor) };
+        let write = region.write_ptr_for(exec).expect("write alias");
+        unsafe {
+            std::ptr::copy_nonoverlapping(translated.as_ptr(), write, translated.len());
+        }
+        jit.flush_icache(exec, translated.len());
+        *cursor += translated.len();
+        (exec as u64, block.exit)
+    };
+
+    let mut snapshot = X86UcontextSnapshot::new();
+    snapshot.gpr[reg::RSP] = stack_top;
+    let mut next_guest_va = GUEST_CODE_BASE;
+    let mut wrote = false;
+    let mut exit_code: Option<i32> = None;
+
+    for _ in 0..16 {
+        let (exec, exit) = translate(next_guest_va, &mut cursor);
+        let (expect_status, resume) = match exit {
+            X86Exit::Syscall { resume, .. } => (X86ExitStatus::Syscall, resume),
+            X86Exit::ControlFlow { va, .. } => (X86ExitStatus::Indirect, va),
+            other => panic!("unexpected exit: {other:?}"),
+        };
+        let mut ctx = X86DsrContext::new(snapshot, exec, resume);
+        // SAFETY: freshly translated block ending in an exit stub; valid rsp.
+        let raw = unsafe { carrick_dsr_x86::enter_translated(&mut ctx) };
+        assert_eq!(X86ExitStatus::from_raw(raw), Some(expect_status));
+        snapshot = ctx.snapshot;
+
+        match exit {
+            X86Exit::Syscall { .. } => match snapshot.gpr[reg::RAX] {
+                SYS_WRITE => {
+                    let n = unsafe {
+                        libc::write(
+                            snapshot.gpr[reg::RDI] as i32,
+                            snapshot.gpr[reg::RSI] as *const libc::c_void,
+                            snapshot.gpr[reg::RDX] as usize,
+                        )
+                    };
+                    assert!(n >= 0);
+                    snapshot.gpr[reg::RAX] = n as u64;
+                    wrote = true;
+                    next_guest_va = snapshot.rip;
+                }
+                SYS_EXIT_GROUP => {
+                    exit_code = Some(snapshot.gpr[reg::RDI] as i32);
+                    break;
+                }
+                other => panic!("unexpected syscall {other}"),
+            },
+            X86Exit::ControlFlow { va, .. } => {
+                let branch_bytes = read_guest(va);
+                next_guest_va =
+                    cflow::resolve(&branch_bytes, va, &mut snapshot).expect("resolve branch");
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    unsafe { libc::close(write_fd) };
+    let mut captured = [0u8; 16];
+    let n = unsafe { libc::read(read_fd, captured.as_mut_ptr().cast(), captured.len()) };
+    unsafe { libc::close(read_fd) };
+    assert!(n >= 0);
+
+    assert!(wrote, "the helper must have run");
+    assert_eq!(&captured[..n as usize], b"fp\n");
+    assert_eq!(
+        exit_code,
+        Some(21),
+        "ret must return into main's exit sequence"
+    );
+
+    unsafe {
+        jit.unmap(&region);
+        libc::munmap(data.cast(), 4096);
+        libc::munmap(stack.cast(), 64 * 1024);
+    }
+}
+
 /// Assemble a guest that reaches its data ONLY through RIP-relative
 /// addressing: `lea rsi, [rip+d1]` for the message pointer and
 /// `mov edx, [rip+d2]` for the length stored in the data page. Verbatim
