@@ -21,6 +21,46 @@ pub(super) fn fallback_counter_ticks() -> Option<u64> {
     counter::fallback_counter_ticks()
 }
 
+#[cfg(test)]
+pub(super) fn host_counter_plan_is_inline_for_test() -> bool {
+    matches!(
+        counter::host_counter_plan(),
+        counter::HostCounterPlan::Inline { .. }
+    )
+}
+
+#[cfg(test)]
+pub(super) fn execute_virtual_counter_for_test() -> Result<u64, types::DsrError> {
+    let guest = carrick_guest_mem::GuestVa(0x19_000);
+    let plan = block::BlockPlan {
+        start: guest,
+        end: carrick_guest_mem::GuestVa(guest.raw() + 8),
+        generation: types::CodeGeneration::INITIAL,
+        instructions: vec![block::PlannedInst {
+            guest,
+            action: types::InstAction::CounterRead(types::CounterRead {
+                destination: types::CounterDestination::Gpr(2),
+            }),
+        }],
+        exit: block::PlannedExit::Syscall {
+            guest: carrick_guest_mem::GuestVa(guest.raw() + 4),
+            resume: carrick_guest_mem::GuestVa(guest.raw() + 8),
+        },
+    };
+    let mut cache = cache::TranslationCache::new(16 * 1024)?;
+    let emitted = emit::emit_block_direct(&mut cache, &plan)?;
+    let mut stack = vec![0_u8; 16 * 1024];
+    let mut snapshot = super::NativeUcontextSnapshot {
+        sp: stack.as_mut_ptr() as u64 + stack.len() as u64,
+        ..super::NativeUcontextSnapshot::default()
+    };
+    let mut exit = types::NativeDsrExit::Syscall {
+        resume: carrick_guest_mem::GuestVa(guest.raw() + 8),
+    };
+    gateway::enter_translated(emitted.entry(), &mut snapshot, &mut exit)?;
+    Ok(snapshot.x[2])
+}
+
 const ARTIFACT_KEY_PREFIX_INSTRUCTIONS: usize = 16;
 
 #[derive(Debug)]
