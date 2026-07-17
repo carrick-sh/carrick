@@ -16,3 +16,10 @@ carrick-dsr = { path = "../carrick-dsr" }
 carrick-guest-mem = { path = "../carrick-guest-mem" }
 iced-x86.workspace = true
 thiserror.workspace = true
+
+[build-dependencies]
+cc = "1"
+
+[dev-dependencies]
+carrick-native-freebsd = { path = "../carrick-native-freebsd" }
+libc.workspace = true

@@ -467,7 +467,10 @@ version = "0.1.0"
 dependencies = [
  "carrick-dsr",
  "carrick-guest-mem",
+ "carrick-native-freebsd",
+ "cc",
  "iced-x86",
+ "libc",
  "thiserror",
 ]
 
