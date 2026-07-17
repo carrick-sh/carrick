@@ -161,8 +161,20 @@ pub struct X86DsrContext {
     /// save/restore.
     pub save_fpu: u32,
     pub save_fpu_pad: u32,
+    /// Set by a chainable branch's COLD stub to the absolute address of the
+    /// 4-byte rel32 field of the patchable `jmp` that reached it (see
+    /// `emit::emit_block_linked`). When nonzero after an `Indirect` exit, the
+    /// run loop is at a CHAIN MISS: `snapshot.rip` holds the (already resolved)
+    /// target guest VA, and the loop translates it and patches the rel32 at
+    /// this address to jump straight there next time. Zero on a genuine
+    /// indirect branch. The driver clears it before every enter.
+    pub chain_patch_site: u64,
 }
 
+/// Byte offset of [`X86DsrContext::exit_resume`] — the guest VA the exit stub
+/// copies to `snapshot.rip`. Emitted exits SELF-SET this (so a chained-into
+/// block does not depend on the driver pre-setting it).
+pub const CTX_EXIT_RESUME: i32 = 720;
 /// Byte offset of [`X86DsrContext::exit_syscall_addr`] for `jmp *disp(%r15)`.
 pub const CTX_EXIT_SYSCALL_ADDR: i32 = 736;
 /// Byte offset of [`X86DsrContext::exit_indirect_addr`].
@@ -181,6 +193,9 @@ pub const CTX_HOST_FSBASE: i32 = 784;
 /// Byte offset of [`X86DsrContext::save_fpu`] (mirrored in the `.S`): the
 /// per-block flag gating the FPU save/restore.
 pub const CTX_SAVE_FPU: i32 = 816;
+/// Byte offset of [`X86DsrContext::chain_patch_site`] — a chainable branch's
+/// cold stub writes the patch-site address here.
+pub const CTX_CHAIN_PATCH: i32 = 824;
 /// Byte offset of the virtualized guest `%r15` slot inside the snapshot
 /// (`gpr[15]`): the emitter's r15-rename loads/stores it directly.
 pub const SNAP_GUEST_R15: i32 = 120;
@@ -214,6 +229,7 @@ impl X86DsrContext {
             // in-crate tests keep the conservative default.
             save_fpu: 1,
             save_fpu_pad: 0,
+            chain_patch_site: 0,
         }
     }
 }
@@ -245,6 +261,9 @@ const _: () = assert!(
 );
 const _: () = assert!(std::mem::offset_of!(X86DsrContext, fault) as u32 == CTX_FAULT_RECORD);
 const _: () = assert!(std::mem::offset_of!(X86DsrContext, save_fpu) as i32 == CTX_SAVE_FPU);
+const _: () =
+    assert!(std::mem::offset_of!(X86DsrContext, chain_patch_site) as i32 == CTX_CHAIN_PATCH);
+const _: () = assert!(std::mem::offset_of!(X86DsrContext, exit_resume) as i32 == CTX_EXIT_RESUME);
 const _: () =
     assert!(std::mem::offset_of!(X86DsrContext, exit_syscall_addr) as i32 == CTX_EXIT_SYSCALL_ADDR);
 const _: () = assert!(std::mem::offset_of!(X86DsrContext, entry) as i32 == CTX_ENTRY);

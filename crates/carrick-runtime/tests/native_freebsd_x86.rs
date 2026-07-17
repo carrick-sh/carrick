@@ -72,3 +72,49 @@ fn native_backend_runs_a_real_musl_probe_with_a_grown_heap() {
         "musl brk/heap must work through the real dispatcher; got {out:?}"
     );
 }
+
+/// Direct-branch chaining, proven end-to-end: a `#![no_std]` guest runs a
+/// 50-million-iteration PURE compute loop (no syscall inside the loop, only a
+/// final `exit_group`) — source `crates/carrick-dsr-x86/tests/fixtures/
+/// computeloop.rs`. Two assertions together prove chaining:
+///
+/// - `traps == 1`: the ONLY syscall is the final exit. The loop's conditional
+///   back-edge executed natively in the JIT cache every iteration; without
+///   chaining each of the 50M iterations would round-trip to Rust (and the
+///   test would run for many seconds).
+/// - `exit_code == 192`: the low byte of `sum(3*i + 1 for i in 0..50_000_000)`
+///   — the loop's control flow, register state, and flags stayed correct
+///   across the entire chain.
+#[test]
+fn direct_branch_chaining_runs_a_compute_loop_without_round_trips() {
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../carrick-dsr-x86/tests/fixtures/computeloop-x86_64-linux"
+    );
+    if !std::path::Path::new(fixture).exists() {
+        eprintln!("skipping: compute-loop fixture not present ({fixture})");
+        return;
+    }
+
+    let start = std::time::Instant::now();
+    let result = carrick_runtime::runtime::run_elf_native_dispatch(fixture.as_ref())
+        .expect("chained compute loop must run to completion");
+    let elapsed = start.elapsed();
+
+    assert_eq!(
+        result.traps, 1,
+        "a chained 50M-iteration loop makes ONE syscall (the final exit); \
+         traps={} means the back-edge round-tripped to Rust",
+        result.traps
+    );
+    assert_eq!(
+        result.exit_code, 192,
+        "sum(3i+1, i in 0..50M) mod 256 == 192 — chaining preserved the loop's result"
+    );
+    // Not a hard perf gate (CI variance), but a chained 50M-iteration loop is
+    // sub-second here; unchained it is minutes. Flag a gross regression.
+    assert!(
+        elapsed.as_secs() < 20,
+        "chained compute loop took {elapsed:?} — chaining likely broke"
+    );
+}
