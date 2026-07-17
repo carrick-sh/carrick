@@ -33,14 +33,14 @@
 //! instruction's own flag effects are exactly the guest's.
 
 use iced_x86::{
-    Code, Decoder, DecoderOptions, Encoder, Instruction, InstructionInfoFactory, MemoryOperand,
-    Mnemonic, OpAccess, OpKind, Register,
+    Code, ConditionCode, Decoder, DecoderOptions, Encoder, FlowControl, Instruction,
+    InstructionInfoFactory, MemoryOperand, Mnemonic, OpAccess, OpKind, Register,
 };
 
 use crate::block::{X86Block, X86Exit};
 use crate::gateway::{
-    CTX_EXIT_INDIRECT_ADDR, CTX_EXIT_SENSITIVE_ADDR, CTX_EXIT_SYSCALL_ADDR, CTX_SCRATCH,
-    CTX_SCRATCH2, SNAP_GUEST_R15,
+    CTX_CHAIN_PATCH, CTX_EXIT_INDIRECT_ADDR, CTX_EXIT_RESUME, CTX_EXIT_SENSITIVE_ADDR,
+    CTX_EXIT_SYSCALL_ADDR, CTX_SCRATCH, CTX_SCRATCH2, SNAP_GUEST_R15,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -63,6 +63,41 @@ pub enum EmitError {
 fn jmp_indirect_r15(disp: i32) -> [u8; 7] {
     let d = disp.to_le_bytes();
     [0x41, 0xFF, 0xA7, d[0], d[1], d[2], d[3]]
+}
+
+/// `mov [r15+disp32], rax` — REX.WB (0x49) + 89 /r + ModRM(mod=10, reg=000=rax,
+/// rm=111=r15) + disp32.
+fn mov_ctx_from_rax(disp: i32) -> [u8; 7] {
+    let d = disp.to_le_bytes();
+    [0x49, 0x89, 0x87, d[0], d[1], d[2], d[3]]
+}
+
+/// `mov rax, [r15+disp32]` — REX.WB (0x49) + 8B /r + ModRM(mod=10, reg=000=rax,
+/// rm=111=r15) + disp32.
+fn mov_rax_from_ctx(disp: i32) -> [u8; 7] {
+    let d = disp.to_le_bytes();
+    [0x49, 0x8B, 0x87, d[0], d[1], d[2], d[3]]
+}
+
+/// Emit the SELF-SET of `exit_resume` to `resume_va`, preserving `rax` through
+/// the context scratch slot (the exit stub saves every guest GPR, so this must
+/// not clobber one). All `mov`s — guest rflags are untouched:
+/// ```text
+///   mov [r15+CTX_SCRATCH], rax      ; save rax
+///   movabs rax, resume_va           ; the resume guest VA
+///   mov [r15+CTX_EXIT_RESUME], rax  ; publish it
+///   mov rax, [r15+CTX_SCRATCH]      ; restore rax
+/// ```
+/// Chaining requires this: a block reached by a direct-branch jump from
+/// another block was never entered with the driver's per-block `exit_resume`
+/// pre-set, so each exit must carry its own resume VA.
+fn emit_self_set_resume(resume_va: u64, out: &mut Vec<u8>) {
+    out.extend_from_slice(&mov_ctx_from_rax(CTX_SCRATCH));
+    out.push(0x48);
+    out.push(0xB8); // movabs rax, imm64
+    out.extend_from_slice(&resume_va.to_le_bytes());
+    out.extend_from_slice(&mov_ctx_from_rax(CTX_EXIT_RESUME));
+    out.extend_from_slice(&mov_rax_from_ctx(CTX_SCRATCH));
 }
 
 /// Emit the translated bytes for `block`. `source` is the guest bytes for
@@ -107,6 +142,254 @@ pub fn emit_block(source: &[u8], block: &X86Block) -> Result<Vec<u8>, EmitError>
             let mut out = emit_copy_body(source, block, target)?;
             out.extend_from_slice(&jmp_indirect_r15(CTX_EXIT_INDIRECT_ADDR));
             Ok(out)
+        }
+    }
+}
+
+/// One chainable outgoing edge of a translated block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChainEdge {
+    /// Guest VA of the successor block this edge branches to.
+    pub target_va: u64,
+    /// Byte offset within the emitted block of the 4-byte `rel32` of this
+    /// edge's patchable `jmp` slot. The runtime patches it to
+    /// `target_exec - (block_exec + rel32_off + 4)` once the target is
+    /// translated; until then the slot jumps to a cold stub that exits to Rust.
+    pub rel32_off: usize,
+}
+
+/// A translated block plus its chainable edges (empty ⇒ the terminator exits
+/// to Rust as `emit_block` does: syscall/sensitive/continue/indirect/call/ret).
+#[derive(Clone, Debug)]
+pub struct LinkedBlock {
+    pub bytes: Vec<u8>,
+    pub edges: Vec<ChainEdge>,
+}
+
+/// The bytes of one chain-miss COLD stub (52 bytes). Reached when a patchable
+/// slot still points here (target not yet translated). It records the slot's
+/// `rel32` address (so the run loop can patch it), publishes the resolved
+/// target VA as the resume, and exits to Rust via the indirect stub. `slot_off`
+/// is the block-relative offset of the slot's `rel32`; `cold_off` is where this
+/// stub begins in the block; both are needed to compute the RIP-relative `lea`.
+fn emit_cold_stub(slot_rel32_off: usize, target_va: u64, cold_off: usize, out: &mut Vec<u8>) {
+    let start = out.len();
+    debug_assert_eq!(start, cold_off);
+    // mov [r15+CTX_SCRATCH], rax  — save rax.
+    out.extend_from_slice(&mov_ctx_from_rax(CTX_SCRATCH));
+    // lea rax, [rip+disp32]  (48 8d 05 <disp32>) — rax = &slot.rel32.
+    // disp is relative to the END of the lea (cold_off + 7 + 7 == +14).
+    let lea_end = cold_off + 14;
+    let disp = slot_rel32_off as i64 - lea_end as i64;
+    out.extend_from_slice(&[0x48, 0x8d, 0x05]);
+    out.extend_from_slice(&(disp as i32).to_le_bytes());
+    // mov [r15+CTX_CHAIN_PATCH], rax — record the patch site.
+    out.extend_from_slice(&mov_ctx_from_rax(CTX_CHAIN_PATCH));
+    // movabs rax, target_va — the resolved successor guest VA.
+    out.push(0x48);
+    out.push(0xB8);
+    out.extend_from_slice(&target_va.to_le_bytes());
+    // mov [r15+CTX_EXIT_RESUME], rax — publish the resume.
+    out.extend_from_slice(&mov_ctx_from_rax(CTX_EXIT_RESUME));
+    // mov rax, [r15+CTX_SCRATCH] — restore rax.
+    out.extend_from_slice(&mov_rax_from_ctx(CTX_SCRATCH));
+    // jmp *CTX_EXIT_INDIRECT_ADDR(r15) — exit to Rust.
+    out.extend_from_slice(&jmp_indirect_r15(CTX_EXIT_INDIRECT_ADDR));
+    debug_assert_eq!(out.len() - start, COLD_STUB_LEN);
+}
+
+/// Byte length of one [`emit_cold_stub`].
+const COLD_STUB_LEN: usize = 52;
+
+/// The second opcode byte of the `0F 8x` near `jcc rel32` for a condition.
+fn jcc_rel32_opcode(cc: ConditionCode) -> Option<u8> {
+    Some(match cc {
+        ConditionCode::o => 0x80,
+        ConditionCode::no => 0x81,
+        ConditionCode::b => 0x82,
+        ConditionCode::ae => 0x83,
+        ConditionCode::e => 0x84,
+        ConditionCode::ne => 0x85,
+        ConditionCode::be => 0x86,
+        ConditionCode::a => 0x87,
+        ConditionCode::s => 0x88,
+        ConditionCode::ns => 0x89,
+        ConditionCode::p => 0x8A,
+        ConditionCode::np => 0x8B,
+        ConditionCode::l => 0x8C,
+        ConditionCode::ge => 0x8D,
+        ConditionCode::le => 0x8E,
+        ConditionCode::g => 0x8F,
+        ConditionCode::None => return None,
+    })
+}
+
+/// How a block's terminating branch chains.
+enum BranchChain {
+    /// `jmp rel` — one successor.
+    Jmp { target: u64 },
+    /// `jcc rel` — taken vs fall-through successors.
+    Jcc {
+        opcode: u8,
+        taken: u64,
+        fallthrough: u64,
+    },
+    /// `call`/`ret`/indirect — not chained; resolved in Rust from the snapshot.
+    Resolve,
+}
+
+/// Classify a block's terminating branch for chaining.
+fn classify_branch(bytes: &[u8], va: u64) -> BranchChain {
+    let mut decoder = Decoder::with_ip(64, bytes, va, DecoderOptions::NONE);
+    let inst = decoder.decode();
+    if inst.is_invalid() {
+        return BranchChain::Resolve;
+    }
+    match inst.flow_control() {
+        FlowControl::UnconditionalBranch if inst.op0_kind() == OpKind::NearBranch64 => {
+            BranchChain::Jmp {
+                target: inst.near_branch64(),
+            }
+        }
+        FlowControl::ConditionalBranch if inst.op0_kind() == OpKind::NearBranch64 => {
+            match jcc_rel32_opcode(inst.condition_code()) {
+                Some(opcode) => BranchChain::Jcc {
+                    opcode,
+                    taken: inst.near_branch64(),
+                    fallthrough: va + inst.len() as u64,
+                },
+                None => BranchChain::Resolve,
+            }
+        }
+        _ => BranchChain::Resolve,
+    }
+}
+
+/// Emit a block with direct-branch CHAINING. Identical to [`emit_block`] except
+/// that a block ending in a direct `jmp`/`jcc` gets patchable jump slots (one
+/// per successor) that initially target cold stubs and are later patched by the
+/// runtime to jump straight to the successor's translated code — so a hot loop
+/// runs without a gateway round-trip per branch. Every exit SELF-SETS its
+/// resume VA (a chained-into block was not entered with the driver's per-block
+/// `exit_resume`). `call`/`ret`/indirect branches, syscalls, sensitive
+/// instructions, and continues keep the resolve-in-Rust exit.
+pub fn emit_block_linked(source: &[u8], block: &X86Block) -> Result<LinkedBlock, EmitError> {
+    let no_edges = |bytes| LinkedBlock {
+        bytes,
+        edges: Vec::new(),
+    };
+    match block.exit {
+        X86Exit::Syscall { va, resume, .. } => {
+            let mut out = emit_copy_body(source, block, va)?;
+            emit_self_set_resume(resume, &mut out);
+            out.extend_from_slice(&jmp_indirect_r15(CTX_EXIT_SYSCALL_ADDR));
+            Ok(no_edges(out))
+        }
+        X86Exit::Sensitive { va, .. } => {
+            // The run loop re-decodes the sensitive instruction at the resume
+            // VA to recover its kind, so resume = the instruction's own VA.
+            let mut out = emit_copy_body(source, block, va)?;
+            emit_self_set_resume(va, &mut out);
+            out.extend_from_slice(&jmp_indirect_r15(CTX_EXIT_SENSITIVE_ADDR));
+            Ok(no_edges(out))
+        }
+        X86Exit::Continue { target, .. } => {
+            // A structural boundary falls through to the next block — emit it
+            // as a chainable unconditional jump so page-spanning straight-line
+            // code links block-to-block instead of round-tripping.
+            let mut out = emit_copy_body(source, block, target)?;
+            let slot_off = out.len();
+            let cold_off = slot_off + 5;
+            let rel = cold_off as i64 - (slot_off + 5) as i64;
+            out.push(0xE9);
+            out.extend_from_slice(&(rel as i32).to_le_bytes());
+            emit_cold_stub(slot_off + 1, target, cold_off, &mut out);
+            Ok(LinkedBlock {
+                bytes: out,
+                edges: vec![ChainEdge {
+                    target_va: target,
+                    rel32_off: slot_off + 1,
+                }],
+            })
+        }
+        X86Exit::Unsupported { .. } => Err(EmitError::Unsupported("unsupported-instruction")),
+        X86Exit::ControlFlow { va, len } => {
+            let off = (va - block.start) as usize;
+            let branch = source
+                .get(off..off + len as usize)
+                .ok_or(EmitError::ShortSource {
+                    need: off + len as usize,
+                    got: source.len(),
+                })?;
+            match classify_branch(branch, va) {
+                BranchChain::Resolve => {
+                    // call/ret/indirect: exit to Rust; the run loop re-decodes
+                    // the branch at the resume VA and resolves it.
+                    let mut out = emit_copy_body(source, block, va)?;
+                    emit_self_set_resume(va, &mut out);
+                    out.extend_from_slice(&jmp_indirect_r15(CTX_EXIT_INDIRECT_ADDR));
+                    Ok(no_edges(out))
+                }
+                BranchChain::Jmp { target } => {
+                    let mut out = emit_copy_body(source, block, va)?;
+                    // jmpSlot: E9 <rel32 -> coldJ>  (patchable).
+                    let slot_off = out.len();
+                    let cold_off = slot_off + 5;
+                    let rel = cold_off as i64 - (slot_off + 5) as i64;
+                    out.push(0xE9);
+                    out.extend_from_slice(&(rel as i32).to_le_bytes());
+                    emit_cold_stub(slot_off + 1, target, cold_off, &mut out);
+                    Ok(LinkedBlock {
+                        bytes: out,
+                        edges: vec![ChainEdge {
+                            target_va: target,
+                            rel32_off: slot_off + 1,
+                        }],
+                    })
+                }
+                BranchChain::Jcc {
+                    opcode,
+                    taken,
+                    fallthrough,
+                } => {
+                    let mut out = emit_copy_body(source, block, va)?;
+                    // jcc rel32 -> takenSlot (0F 8x <rel32>), 6 bytes.
+                    let jcc_off = out.len();
+                    let fall_slot_off = jcc_off + 6;
+                    let taken_slot_off = fall_slot_off + 5;
+                    let cold_f_off = taken_slot_off + 5;
+                    let cold_t_off = cold_f_off + COLD_STUB_LEN;
+                    // jcc -> takenSlot
+                    out.push(0x0F);
+                    out.push(opcode);
+                    let jcc_rel = taken_slot_off as i64 - (jcc_off + 6) as i64;
+                    out.extend_from_slice(&(jcc_rel as i32).to_le_bytes());
+                    // fallSlot: E9 -> coldF
+                    let fall_rel = cold_f_off as i64 - (fall_slot_off + 5) as i64;
+                    out.push(0xE9);
+                    out.extend_from_slice(&(fall_rel as i32).to_le_bytes());
+                    // takenSlot: E9 -> coldT
+                    let taken_rel = cold_t_off as i64 - (taken_slot_off + 5) as i64;
+                    out.push(0xE9);
+                    out.extend_from_slice(&(taken_rel as i32).to_le_bytes());
+                    // cold stubs
+                    emit_cold_stub(fall_slot_off + 1, fallthrough, cold_f_off, &mut out);
+                    emit_cold_stub(taken_slot_off + 1, taken, cold_t_off, &mut out);
+                    Ok(LinkedBlock {
+                        bytes: out,
+                        edges: vec![
+                            ChainEdge {
+                                target_va: taken,
+                                rel32_off: taken_slot_off + 1,
+                            },
+                            ChainEdge {
+                                target_va: fallthrough,
+                                rel32_off: fall_slot_off + 1,
+                            },
+                        ],
+                    })
+                }
+            }
         }
     }
 }
@@ -397,6 +680,104 @@ mod tests {
         };
         let block = plan_block(BASE, 256, 4096, reader).expect("plan");
         emit_block(img, &block).expect("emit")
+    }
+
+    fn plan_and_emit_linked(img: &[u8]) -> LinkedBlock {
+        let reader = |va: u64| {
+            let off = (va - BASE) as usize;
+            img.get(off..).map(|s| s.to_vec()).unwrap_or_default()
+        };
+        let block = plan_block(BASE, 256, 4096, reader).expect("plan");
+        emit_block_linked(img, &block).expect("emit-linked")
+    }
+
+    /// Follow a `jmp rel32`/`jcc rel32`/`E9` at byte offset `at` in `bytes`
+    /// (placed at exec base 0) and return the absolute target offset.
+    fn follow_rel32(bytes: &[u8], at: usize, rel32_at: usize) -> usize {
+        let rel = i32::from_le_bytes(bytes[rel32_at..rel32_at + 4].try_into().unwrap());
+        let next = rel32_at + 4;
+        let _ = at;
+        (next as i64 + rel as i64) as usize
+    }
+
+    #[test]
+    fn linked_unconditional_jmp_slot_targets_cold_stub_then_edge_patchable() {
+        // nop (90); jmp +0 (eb 00) — one copy byte then an unconditional jmp.
+        static IMG: &[u8] = &[0x90, 0xeb, 0x00];
+        let lb = plan_and_emit_linked(IMG);
+        assert_eq!(lb.bytes[0], 0x90, "the nop copies");
+        // jmp slot at offset 1: E9 <rel32>.
+        assert_eq!(lb.bytes[1], 0xE9, "patchable jmp slot opcode");
+        // The one edge's rel32 is at offset 2, and initially targets the cold
+        // stub which begins right after the 5-byte slot (offset 6).
+        assert_eq!(lb.edges.len(), 1);
+        assert_eq!(lb.edges[0].rel32_off, 2);
+        assert_eq!(lb.edges[0].target_va, BASE + 3, "jmp +0 target = VA after");
+        let cold = follow_rel32(&lb.bytes, 1, 2);
+        assert_eq!(cold, 6, "slot initially jumps to the cold stub at +6");
+        // Cold stub: mov [r15+scratch], rax (49 89 87 ..).
+        assert_eq!(&lb.bytes[cold..cold + 3], &[0x49, 0x89, 0x87]);
+        // Its lea rax,[rip+disp] must point at the slot's rel32 (offset 2).
+        assert_eq!(&lb.bytes[cold + 7..cold + 10], &[0x48, 0x8d, 0x05]);
+        let lea_disp = i32::from_le_bytes(lb.bytes[cold + 10..cold + 14].try_into().unwrap());
+        assert_eq!(
+            (cold as i64 + 14 + lea_disp as i64) as usize,
+            2,
+            "cold stub's lea resolves to the slot rel32 address"
+        );
+    }
+
+    #[test]
+    fn linked_conditional_jcc_has_two_slots_and_cold_stubs() {
+        // 74 02  je +2  (taken = VA+4, fallthrough = VA+2).
+        static IMG: &[u8] = &[0x74, 0x02];
+        let lb = plan_and_emit_linked(IMG);
+        // jcc rel32 at offset 0: 0F 84 (je) <rel32> -> takenSlot.
+        assert_eq!(&lb.bytes[0..2], &[0x0F, 0x84], "je rel32");
+        let taken_slot = follow_rel32(&lb.bytes, 0, 2);
+        assert_eq!(taken_slot, 11, "jcc targets takenSlot at +11 (6+5)");
+        // fallSlot at +6, takenSlot at +11 (both E9).
+        assert_eq!(lb.bytes[6], 0xE9, "fall slot");
+        assert_eq!(lb.bytes[11], 0xE9, "taken slot");
+        // Two edges: taken (VA+4) at takenSlot+1=12, fallthrough (VA+2) at
+        // fallSlot+1=7.
+        assert_eq!(lb.edges.len(), 2);
+        assert_eq!(lb.edges[0].target_va, BASE + 4);
+        assert_eq!(lb.edges[0].rel32_off, 12);
+        assert_eq!(lb.edges[1].target_va, BASE + 2);
+        assert_eq!(lb.edges[1].rel32_off, 7);
+        // Slots initially target their cold stubs.
+        let cold_f = follow_rel32(&lb.bytes, 6, 7);
+        let cold_t = follow_rel32(&lb.bytes, 11, 12);
+        assert_eq!(cold_f, 16, "fall slot -> coldF at +16");
+        assert_eq!(cold_t, 16 + COLD_STUB_LEN, "taken slot -> coldT");
+        // Each cold stub materializes its target via movabs (48 b8 ..) at +21.
+        let f_imm = u64::from_le_bytes(lb.bytes[cold_f + 23..cold_f + 31].try_into().unwrap());
+        assert_eq!(f_imm, BASE + 2, "coldF resume = fallthrough");
+        let t_imm = u64::from_le_bytes(lb.bytes[cold_t + 23..cold_t + 31].try_into().unwrap());
+        assert_eq!(t_imm, BASE + 4, "coldT resume = taken");
+    }
+
+    #[test]
+    fn linked_indirect_and_syscall_exits_carry_no_edges() {
+        // ff e0  jmp rax — indirect, not chainable.
+        static IND: &[u8] = &[0xff, 0xe0];
+        assert!(plan_and_emit_linked(IND).edges.is_empty());
+        // b8 3c 00 00 00; 0f 05 — mov eax,60; syscall.
+        static SYS: &[u8] = &[0xb8, 0x3c, 0x00, 0x00, 0x00, 0x0f, 0x05];
+        let lb = plan_and_emit_linked(SYS);
+        assert!(lb.edges.is_empty());
+        // The syscall block self-sets its resume (movabs of VA+7) before the
+        // syscall exit stub.
+        let needle = {
+            let mut v = vec![0x48, 0xb8];
+            v.extend_from_slice(&(BASE + 7).to_le_bytes());
+            v
+        };
+        assert!(
+            lb.bytes.windows(needle.len()).any(|w| w == needle),
+            "syscall exit self-sets resume = VA after syscall"
+        );
     }
 
     #[test]

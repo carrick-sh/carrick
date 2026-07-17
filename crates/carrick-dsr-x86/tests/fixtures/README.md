@@ -21,3 +21,12 @@ The guest computes a loop sum, `write(1, msg, len)` (msg reached
 RIP-relatively — the emitter's absolute-VA rewrite), and `exit_group(sum)`
 (sum == 0+1+…+6 == 21). It has no relocations (pure RIP-relative codegen) and
 no TLS, so the loader needs no relocation pass and no `arch_prctl` servicing.
+
+`computeloop-x86_64-linux` — a `#![no_std]` guest (`computeloop.rs`, built the
+same way) running a 50-million-iteration PURE compute loop (no syscall inside
+the loop) then `exit_group(sum & 0xff)`. It is the direct-branch-chaining
+regression: the runtime test asserts `traps == 1` (the loop's conditional
+back-edge ran natively in the JIT every iteration — unchained it would
+round-trip to Rust 50M times) and `exit_code == 192` (the correct
+`sum(3i+1, i in 0..50M) mod 256`, proving chaining preserved control flow and
+register state).

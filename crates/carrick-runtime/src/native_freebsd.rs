@@ -28,11 +28,12 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use carrick_dsr::host::NativeHostJit;
-use carrick_dsr_x86::block::{X86Block, X86Exit};
+use carrick_dsr::host::{JitRegion, NativeHostJit};
+use carrick_dsr_x86::block::X86Block;
+use carrick_dsr_x86::decode::{X86InstClass, classify};
 use carrick_dsr_x86::gateway::{CTX_FAULT_RECORD, reg, signal_stub_addr};
 use carrick_dsr_x86::{
-    X86DsrContext, X86ExitStatus, X86UcontextSnapshot, cflow, emit::emit_block, plan_block,
+    X86DsrContext, X86ExitStatus, X86UcontextSnapshot, cflow, emit::emit_block_linked, plan_block,
 };
 use carrick_guest_mem::{GuestMemory, X8664SyscallFrame};
 use carrick_hal::x8664_arch::{SyscallNorm, X8664GuestArch};
@@ -407,6 +408,28 @@ impl std::hash::Hasher for VaHasher {
 
 type VaBuildHasher = std::hash::BuildHasherDefault<VaHasher>;
 
+/// Patch a chainable branch's 5-byte `jmp` slot to jump straight to a
+/// translated successor block. `patch_abs` is the exec-alias address of the
+/// slot's 4-byte `rel32` field; `next_abs` is the address just after it (the
+/// jmp's own next-instruction address the rel32 is relative to); `target_exec`
+/// is the successor's exec VA. Both endpoints live in the <4 MiB JIT cache, so
+/// the displacement always fits `i32`. The write goes through the region's RW
+/// alias (the exec alias is not writable).
+fn patch_slot(
+    region: &JitRegion,
+    jit: &FreebsdHostJit,
+    patch_abs: u64,
+    next_abs: u64,
+    target_exec: u64,
+) {
+    let rel = (target_exec as i64 - next_abs as i64) as i32;
+    if let Some(w) = region.write_ptr_for(patch_abs as *mut u8) {
+        // SAFETY: `w` is the RW alias of the 4-byte rel32 field inside the JIT.
+        unsafe { std::ptr::copy_nonoverlapping(rel.to_le_bytes().as_ptr(), w, 4) };
+        jit.flush_icache(patch_abs as *mut u8, 4);
+    }
+}
+
 /// Serializes in-process runs. This driver mutates PROCESS-GLOBAL state — the
 /// fixed guest arenas (MAP_FIXED at the layout addresses) and the process-wide
 /// fault-redirect sigaction/code-region registration — so two concurrent runs
@@ -490,22 +513,22 @@ where
     let mut fault_detail: Option<String> = None;
     let mut trap_limit_hit = false;
 
-    // Translated-block cache keyed by guest VA. Without it a hot guest loop
-    // re-plans and re-emits the SAME block every iteration (bigread/aliassize
-    // execute millions of blocks — the earlier "hangs" were re-translation
-    // cost, not deadlock, per an lldb backtrace parked in the emit closure).
-    // Guest text is read-only here (no self-modifying-code handling yet), so a
-    // guest VA always translates to the same bytes — the entry is valid for
-    // the whole run. Cursor is monotonic (no wrap): distinct blocks are
-    // bounded by the guest's code size.
+    // Translated-block cache keyed by guest VA: `(exec VA, has_edges,
+    // uses_fpu)`. Guest text is read-only here (no self-modifying code), so a
+    // VA always translates to the same bytes and the entry is valid for the
+    // whole run. Cursor is monotonic. `has_edges` means the block ends in a
+    // chainable direct branch; `uses_fpu` drives the FPU save/restore skip.
     const CODE_CACHE_LEN: usize = 4 * 1024 * 1024;
-    // Cache entry: (exec VA, block exit, uses_fpu). `uses_fpu` drives the
-    // gateway's per-block FPU save/restore skip.
-    let mut cache: std::collections::HashMap<u64, (u64, X86Exit, bool), VaBuildHasher> =
+    let mut cache: std::collections::HashMap<u64, (u64, bool, bool), VaBuildHasher> =
+        std::collections::HashMap::default();
+    // Chain edges awaiting their target's translation: `target_va -> [(rel32
+    // patch address, next-instruction address)]`. When `target_va` is
+    // translated, every waiting slot is patched to jump straight to it.
+    let mut pending: std::collections::HashMap<u64, Vec<(u64, u64)>, VaBuildHasher> =
         std::collections::HashMap::default();
 
     'run: while traps < max_traps {
-        let (exec, exit, uses_fpu) = if let Some(&hit) = cache.get(&next) {
+        let (exec, has_edges, uses_fpu) = if let Some(&hit) = cache.get(&next) {
             hit
         } else {
             let block = match plan_block(next, 256, PAGE, read_guest) {
@@ -516,7 +539,7 @@ where
                 }
             };
             let body = read_block(&block);
-            let translated = match emit_block(&body, &block) {
+            let linked = match emit_block_linked(&body, &block) {
                 Ok(t) => t,
                 Err(e) => {
                     fault_detail =
@@ -524,7 +547,7 @@ where
                     break;
                 }
             };
-            if cursor + translated.len() > CODE_CACHE_LEN {
+            if cursor + linked.bytes.len() > CODE_CACHE_LEN {
                 fault_detail = Some(format!(
                     "JIT code cache exhausted ({CODE_CACHE_LEN} bytes) translating 0x{next:x}"
                 ));
@@ -539,35 +562,54 @@ where
                     break;
                 }
             };
-            // SAFETY: wptr is the RW alias of exec; translated fits.
-            unsafe { std::ptr::copy_nonoverlapping(translated.as_ptr(), wptr, translated.len()) };
-            jit.flush_icache(exec, translated.len());
-            cursor += translated.len();
-            let entry = (exec as u64, block.exit, block.uses_fpu);
+            // SAFETY: wptr is the RW alias of exec; linked.bytes fits.
+            unsafe {
+                std::ptr::copy_nonoverlapping(linked.bytes.as_ptr(), wptr, linked.bytes.len())
+            };
+            jit.flush_icache(exec, linked.bytes.len());
+            cursor += linked.bytes.len();
+            let exec_u64 = exec as u64;
+            let entry = (exec_u64, !linked.edges.is_empty(), block.uses_fpu);
             cache.insert(next, entry);
+            // Register this block's outgoing edges; patch any whose target is
+            // already translated (a self-edge sees this block, now cached).
+            for edge in &linked.edges {
+                let patch_abs = exec_u64 + edge.rel32_off as u64;
+                let next_abs = patch_abs + 4;
+                if let Some(&(target_exec, _, _)) = cache.get(&edge.target_va) {
+                    patch_slot(&region, &jit, patch_abs, next_abs, target_exec);
+                } else {
+                    pending
+                        .entry(edge.target_va)
+                        .or_default()
+                        .push((patch_abs, next_abs));
+                }
+            }
+            // Patch any earlier-translated blocks that were waiting for THIS VA.
+            if let Some(waiters) = pending.remove(&next) {
+                for (patch_abs, next_abs) in waiters {
+                    patch_slot(&region, &jit, patch_abs, next_abs, exec_u64);
+                }
+            }
             entry
         };
-        let exec = exec as *const u8;
 
-        let resume = match exit {
-            X86Exit::Syscall { resume, .. } => resume,
-            X86Exit::ControlFlow { va, .. } | X86Exit::Sensitive { va, .. } => va,
-            X86Exit::Continue { target, .. } => target,
-            X86Exit::Unsupported { va } => {
-                fault_detail = Some(format!("undecodable/privileged guest insn at 0x{va:x}"));
-                break;
-            }
-        };
-
-        let mut ctx = X86DsrContext::new(snapshot, exec as u64, resume);
+        let mut ctx = X86DsrContext::new(snapshot, exec, next);
         ctx.guest_fsbase = guest_fsbase;
-        // Skip the 512-byte FPU save/restore for integer-only blocks.
-        ctx.save_fpu = u32::from(uses_fpu);
-        // SAFETY: exec holds a freshly translated block ending in an exit stub;
-        // rsp is a valid guest stack.
+        // A chainable block runs many blocks with live FPU state, so the
+        // per-block skip is unsound across a chain — restore/save around any
+        // chainable entry; keep the skip only for blocks that exit immediately.
+        ctx.save_fpu = if has_edges { 1 } else { u32::from(uses_fpu) };
+        // Cleared so a stale value can't misread a genuine indirect exit as a
+        // chain miss; only a cold stub sets it.
+        ctx.chain_patch_site = 0;
+        // SAFETY: exec holds a freshly translated block ending in an exit stub
+        // (or chaining to one); rsp is a valid guest stack.
         let raw = unsafe { carrick_dsr_x86::enter_translated(&mut ctx) };
         snapshot = ctx.snapshot;
 
+        // With chaining the EXITING block may differ from the entered one, so
+        // dispatch on the exit STATUS + snapshot.rip, not the entered block.
         match X86ExitStatus::from_raw(raw) {
             Some(X86ExitStatus::Signal) => {
                 fault_detail = Some(format!(
@@ -599,11 +641,16 @@ where
                     }
                 }
             }
-            Some(X86ExitStatus::Indirect) => match exit {
-                X86Exit::ControlFlow { va, .. } => {
-                    // Read the branch bytes as a borrowed slice straight from
-                    // the guest image (guest VA == host VA) — no per-branch
-                    // allocation on this hot path (dtrace flagged the Vec copy).
+            Some(X86ExitStatus::Indirect) => {
+                if ctx.chain_patch_site != 0 {
+                    // Chain miss: a cold stub already resolved the successor VA
+                    // into snapshot.rip; the pending machinery patches the slot
+                    // when the target is translated (this iteration or later).
+                    next = snapshot.rip;
+                } else {
+                    // Genuine indirect branch (call/ret/jmp r/m): re-decode it
+                    // at the self-set resume VA and resolve from the snapshot.
+                    let va = snapshot.rip;
                     let hi = (va + 16).min(span_end);
                     // SAFETY: [va, hi) is inside the mapped image span.
                     let branch =
@@ -616,20 +663,36 @@ where
                         }
                     }
                 }
-                X86Exit::Continue { target, .. } => next = target,
-                _ => unreachable!("Indirect exit only from ControlFlow/Continue"),
-            },
+            }
             Some(X86ExitStatus::Sensitive) => {
-                if let X86Exit::Sensitive { va, len, kind } = exit {
-                    match service_sensitive(kind, &mut snapshot) {
-                        Ok(()) => next = va + len as u64,
-                        Err(detail) => {
-                            fault_detail = Some(detail);
+                // Re-decode the sensitive instruction at the self-set resume VA
+                // to recover its kind and length.
+                let va = snapshot.rip;
+                let hi = (va + 16).min(span_end);
+                // SAFETY: [va, hi) is inside the mapped image span.
+                let bytes =
+                    unsafe { std::slice::from_raw_parts(va as *const u8, (hi - va) as usize) };
+                match classify(bytes, va) {
+                    Ok(c) => match c.class {
+                        X86InstClass::Sensitive(kind) => {
+                            match service_sensitive(kind, &mut snapshot) {
+                                Ok(()) => next = va + c.len as u64,
+                                Err(detail) => {
+                                    fault_detail = Some(detail);
+                                    break;
+                                }
+                            }
+                        }
+                        other => {
+                            fault_detail =
+                                Some(format!("sensitive exit at 0x{va:x} decoded as {other:?}"));
                             break;
                         }
+                    },
+                    Err(e) => {
+                        fault_detail = Some(format!("sensitive re-decode at 0x{va:x}: {e}"));
+                        break;
                     }
-                } else {
-                    unreachable!("Sensitive status only from a Sensitive exit");
                 }
             }
             None => {
