@@ -9,7 +9,9 @@
 //! `carrick-dsr-aarch64`'s `decode::classify`; the per-ISA IRs stay private
 //! to each arch crate by design.
 
-use iced_x86::{Code, Decoder, DecoderOptions, FlowControl, Instruction, Register};
+use iced_x86::{
+    Code, Decoder, DecoderOptions, FlowControl, Instruction, InstructionInfoFactory, Register,
+};
 
 /// The x86_64 sensitive-instruction catalog (design-doc fixed set). Each is
 /// an instruction the translator must REWRITE rather than copy: it either
@@ -43,6 +45,14 @@ pub enum X86SensitiveKind {
 pub struct X86Classified {
     pub len: u8,
     pub class: X86InstClass,
+    /// Whether the instruction touches SSE/AVX (xmm/ymm/zmm), x87 (st), or
+    /// MMX (mm) register state. The block planner ORs this across a block so
+    /// the gateway can SKIP the `fxsave`/`fxrstor` of the 512-byte FPU area
+    /// around blocks that never touch it (the common case in integer-heavy
+    /// code). Conservative: any FPU/vector register use — read or write,
+    /// explicit or implicit — sets it, so skipping is only ever done when the
+    /// block provably leaves FPU/vector state untouched.
+    pub uses_fpu: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,7 +103,42 @@ pub fn classify(bytes: &[u8], va: u64) -> Result<X86Classified, X86DecodeError> 
     }
     let len = inst.len() as u8;
     let class = classify_decoded(&inst);
-    Ok(X86Classified { len, class })
+    let uses_fpu = instruction_uses_fpu(&inst);
+    Ok(X86Classified {
+        len,
+        class,
+        uses_fpu,
+    })
+}
+
+/// Whether the instruction reads or writes any SSE/AVX (xmm/ymm/zmm), x87
+/// (st), MMX (mm), or the SSE control/status word — including IMPLICIT uses
+/// (e.g. x87 ops that reference `st` implicitly). Uses `InstructionInfoFactory`
+/// so nothing FPU/vector escapes detection; the cost is paid once per block at
+/// translation time (cached thereafter).
+fn instruction_uses_fpu(inst: &Instruction) -> bool {
+    // Instructions that touch the SSE control/status word or the whole FPU
+    // area WITHOUT naming a vector register operand — they still mutate state
+    // inside the fxsave image, so a block containing one must not skip the
+    // save/restore.
+    if matches!(
+        inst.code(),
+        Code::Ldmxcsr_m32
+            | Code::Stmxcsr_m32
+            | Code::VEX_Vldmxcsr_m32
+            | Code::VEX_Vstmxcsr_m32
+            | Code::Fxsave_m512byte
+            | Code::Fxsave64_m512byte
+            | Code::Fxrstor_m512byte
+            | Code::Fxrstor64_m512byte
+    ) {
+        return true;
+    }
+    let mut info = InstructionInfoFactory::new();
+    info.info(inst).used_registers().iter().any(|used| {
+        let r = used.register();
+        r.is_xmm() || r.is_ymm() || r.is_zmm() || r.is_st() || r.is_mm()
+    })
 }
 
 fn classify_decoded(inst: &Instruction) -> X86InstClass {
@@ -256,6 +301,23 @@ mod tests {
             g.class,
             X86InstClass::Sensitive(X86SensitiveKind::SegmentPrefixed { gs: true })
         );
+    }
+
+    #[test]
+    fn fpu_use_is_detected_for_the_gateway_save_skip() {
+        // Integer ops: no FPU.
+        assert!(!one(&[0x48, 0x89, 0xd8]).uses_fpu); // mov rax, rbx
+        assert!(!one(&[0x48, 0x01, 0xd8]).uses_fpu); // add rax, rbx
+        assert!(!one(&[0x90]).uses_fpu); // nop
+        // SSE: movss xmm0, xmm1 (f3 0f 10 c1) touches xmm.
+        assert!(one(&[0xf3, 0x0f, 0x10, 0xc1]).uses_fpu);
+        // SSE2 packed: paddd xmm0, xmm1 (66 0f fe c1).
+        assert!(one(&[0x66, 0x0f, 0xfe, 0xc1]).uses_fpu);
+        // x87: fld st(0) implicitly (d9 c0) touches st.
+        assert!(one(&[0xd9, 0xc0]).uses_fpu);
+        // ldmxcsr [rax] (0f ae 10) touches the SSE control word with no xmm
+        // operand — still must be flagged.
+        assert!(one(&[0x0f, 0xae, 0x10]).uses_fpu);
     }
 
     #[test]

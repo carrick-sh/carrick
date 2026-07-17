@@ -63,6 +63,124 @@ fn map_rw(len: usize) -> *mut u8 {
     p.cast()
 }
 
+/// Conditional FPU save/restore correctness: a value placed in `xmm0` must
+/// survive across a syscall round-trip AND across an INTEGER-only block that
+/// SKIPS the fxsave/fxrstor (`save_fpu = 0`). Between blocks the host services
+/// syscalls in Rust, whose own SSE use clobbers the physical xmm registers —
+/// so the guest value only survives if the FPU-using blocks save/restore it
+/// through the snapshot and the skipping block leaves that snapshot untouched.
+/// Mirrors the driver: `ctx.save_fpu = block.uses_fpu`.
+#[test]
+fn conditional_fpu_save_preserves_xmm_across_a_skipping_block() {
+    let jit = FreebsdHostJit;
+    jit.supported().expect("host JIT supported");
+    let region = jit.map_code_cache(64 * 1024).expect("map code cache");
+
+    let stack = map_rw(64 * 1024);
+    let stack_top = stack as u64 + 64 * 1024;
+
+    const MAGIC: u64 = 0x0000_0000_0000_00A7;
+    const GUEST_CODE_BASE: u64 = 0x70_0000;
+    let mut program: Vec<u8> = Vec::new();
+    // Block A (uses xmm -> saves): movabs rax, MAGIC; movq xmm0, rax; getpid; syscall
+    program.extend_from_slice(&[0x48, 0xb8]);
+    program.extend_from_slice(&MAGIC.to_le_bytes());
+    program.extend_from_slice(&[0x66, 0x48, 0x0f, 0x6e, 0xc0]); // movq xmm0, rax
+    program.extend_from_slice(&[0xb8, 0x27, 0x00, 0x00, 0x00]); // mov eax, 39 (getpid)
+    program.extend_from_slice(&[0x0f, 0x05]); // syscall
+    // Block B (INTEGER only -> skips FPU): mov eax, 39 (getpid); syscall
+    program.extend_from_slice(&[0xb8, 0x27, 0x00, 0x00, 0x00]);
+    program.extend_from_slice(&[0x0f, 0x05]);
+    // Block C (uses xmm -> restores): movq rax, xmm0; mov edi, eax; exit_group
+    program.extend_from_slice(&[0x66, 0x48, 0x0f, 0x7e, 0xc0]); // movq rax, xmm0
+    program.extend_from_slice(&[0x89, 0xc7]); // mov edi, eax
+    program.extend_from_slice(&[0xb8]);
+    program.extend_from_slice(&(SYS_EXIT_GROUP as u32).to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0x05]);
+
+    let read_guest = |va: u64| -> Vec<u8> {
+        let off = (va - GUEST_CODE_BASE) as usize;
+        program.get(off..).map(|s| s.to_vec()).unwrap_or_default()
+    };
+
+    let mut cursor = 0usize;
+    let translate = |guest_va: u64, cursor: &mut usize| -> (u64, X86Exit, bool) {
+        let block = plan_block(guest_va, 256, 4096, read_guest).expect("plan");
+        let src = read_guest(block.start);
+        let end_off = (block.end - block.start) as usize;
+        let translated = emit_block(&src[..end_off.min(src.len())], &block).expect("emit");
+        let exec = unsafe { region.exec_base.as_ptr().add(*cursor) };
+        let write = region.write_ptr_for(exec).expect("write alias");
+        unsafe {
+            std::ptr::copy_nonoverlapping(translated.as_ptr(), write, translated.len());
+        }
+        jit.flush_icache(exec, translated.len());
+        *cursor += translated.len();
+        (exec as u64, block.exit, block.uses_fpu)
+    };
+
+    let mut snapshot = X86UcontextSnapshot::new();
+    snapshot.gpr[reg::RSP] = stack_top;
+    let mut next_guest_va = GUEST_CODE_BASE;
+    let mut exit_code: Option<i32> = None;
+    let mut saw_integer_skip = false;
+
+    for _ in 0..8 {
+        let (exec, exit, uses_fpu) = translate(next_guest_va, &mut cursor);
+        if !uses_fpu {
+            saw_integer_skip = true;
+        }
+        let resume = match exit {
+            X86Exit::Syscall { resume, .. } => resume,
+            other => panic!("fpu guest produced non-syscall exit: {other:?}"),
+        };
+        let mut ctx = X86DsrContext::new(snapshot, exec, resume);
+        // Mirror the driver: skip the FPU save/restore for integer blocks.
+        ctx.save_fpu = u32::from(uses_fpu);
+        // SAFETY: freshly translated block ending in an exit stub; valid rsp.
+        let raw = unsafe { carrick_dsr_x86::enter_translated(&mut ctx) };
+        assert_eq!(X86ExitStatus::from_raw(raw), Some(X86ExitStatus::Syscall));
+        snapshot = ctx.snapshot;
+
+        match snapshot.gpr[reg::RAX] {
+            39 => {
+                // Service getpid: return a pid AND deliberately clobber the
+                // physical xmm registers (as real host syscall servicing does)
+                // so a missing save/restore would corrupt the guest value.
+                unsafe {
+                    std::arch::asm!(
+                        "pxor xmm0, xmm0",
+                        "pcmpeqd xmm0, xmm0", // xmm0 = all ones — nothing like MAGIC
+                        out("xmm0") _,
+                    );
+                }
+                snapshot.gpr[reg::RAX] = 4242;
+                next_guest_va = snapshot.rip;
+            }
+            SYS_EXIT_GROUP => {
+                exit_code = Some(snapshot.gpr[reg::RDI] as i32);
+                break;
+            }
+            other => panic!("unexpected syscall {other}"),
+        }
+    }
+
+    assert!(
+        saw_integer_skip,
+        "the middle block must be integer-only (exercise the skip path)"
+    );
+    assert_eq!(
+        exit_code,
+        Some(MAGIC as i32),
+        "xmm0 must survive the syscall round-trips and the skipping block"
+    );
+
+    unsafe {
+        jit.unmap(&region);
+        libc::munmap(stack.cast(), 64 * 1024);
+    }
+}
+
 #[test]
 fn translated_x86_guest_writes_and_exits_natively() {
     let jit = FreebsdHostJit;

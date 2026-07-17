@@ -18,6 +18,7 @@
 .equ CTX_EXIT_STATUS, 728
 .equ CTX_GUEST_FSBASE, 776
 .equ CTX_HOST_FSBASE,  784
+.equ CTX_SAVE_FPU,     816
 
 .text
 
@@ -47,8 +48,14 @@ carrick_dsr_x86_enter_raw:
     movq %rcx, CTX_HOST_FSBASE(%r15)
     wrfsbase %rax
 1:
-    // Restore guest SSE/x87, then guest rflags (host stack still active).
+    // Restore guest SSE/x87 ONLY when this block touches FPU/vector state
+    // (save_fpu != 0). Integer-only blocks skip the 512-byte fxrstor; the
+    // snapshot area still holds the last FPU-using block's guest state for the
+    // next FPU-using block. Then restore guest rflags (host stack active).
+    cmpl $0, CTX_SAVE_FPU(%r15)
+    je 3f
     fxrstor SNAP_FXSAVE(%r15)
+3:
     pushq SNAP_RFLAGS(%r15)
     popfq
 
@@ -128,15 +135,23 @@ carrick_dsr_x86_exit_common:
     movq %r14, SNAP_GPR+112(%r15)
     movq %rsp, SNAP_GPR+32(%r15)     // guest rsp
 
-    // Capture guest SSE/x87 (xmm/x87 still hold guest values here).
-    fxsave SNAP_FXSAVE(%r15)
-
-    // Switch to the host stack, then capture guest rflags (still intact —
-    // only `mov`/`fxsave` ran since the guest, none touch flags).
+    // Switch to the host stack, then capture guest rflags FIRST — only `mov`s
+    // ran since the guest, so flags are still intact. This MUST precede the
+    // FPU conditional below, whose `cmpl` clobbers flags.
     movq HOST_RSP(%r15), %rsp
     pushfq
     popq %rax
     movq %rax, SNAP_RFLAGS(%r15)
+
+    // Capture guest SSE/x87 only when this block used FPU/vector state; an
+    // integer-only block left the snapshot's fxsave area untouched, so its
+    // stored guest state stays valid. Guest xmm/x87 are still live here (only
+    // mov/pushfq/popq ran since the guest — none touch them); rflags are
+    // already saved, so the flag-clobbering `cmpl` is safe.
+    cmpl $0, CTX_SAVE_FPU(%r15)
+    je 4f
+    fxsave SNAP_FXSAVE(%r15)
+4:
 
     // Resume RIP = pre-filled per-block resume target.
     movq CTX_EXIT_RESUME(%r15), %rax
