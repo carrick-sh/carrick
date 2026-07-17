@@ -304,6 +304,67 @@ micro-probes. A cheaper interim win: make `fxsave`/`fxrstor` conditional on the
 block actually using SSE/x87 (most don't), which needs the block planner to
 flag SSE use.
 
+### Conditional fxsave landed; direct-branch chaining fully designed (next)
+
+The gateway now skips the 512-byte fxsave/fxrstor for integer-only blocks
+(`X86Block::uses_fpu` from the classifier; `X86DsrContext::save_fpu` per block).
+Correctness proven by `conditional_fpu_save_preserves_xmm_across_a_skipping_block`
+(xmm value survives host-SSE-clobbering syscall servicing AND an integer block
+that skips the save). The exit stub captures rflags BEFORE the flag-clobbering
+`cmpl` that gates fxsave. The cflow hot path no longer allocates a Vec per
+branch (borrowed slice from the guest image).
+
+**Direct-branch chaining (task #9) — the design, fully worked out:**
+
+Goal: for a direct `jmp rel`/`jcc rel` terminator, jump straight from the
+block's translated code to the TARGET block's translated code, keeping guest
+state live in registers — no gateway round-trip per branch (the hot-loop win).
+
+Cross-cutting subtlety (the reason it's not a small add): with chaining, a block
+can be *chained into*, so it can no longer rely on the DRIVER pre-setting
+`ctx.exit_resume` before enter. **Every exit-carrying block must SELF-SET its
+resume VA** before its exit stub. So the emit for syscall/sensitive/continue/
+controlflow-cold each gain a resume-self-set that preserves a scratch GPR
+(the exit stub saves all GPRs, so the self-set must not clobber one):
+```
+mov [r15+CTX_SCRATCH], rax ; movabs rax, resume_va
+mov [r15+CTX_EXIT_RESUME], rax ; mov rax, [r15+CTX_SCRATCH]
+```
+This is additive/safe for non-chained blocks (the self-set equals what the
+driver pre-set), so it can land + be tested FIRST, before any chaining.
+
+Chainable ControlFlow emit (after the self-set groundwork):
+```
+[copy body]
+jcc rel32 -> takenSlot          ; guest condition (map iced ConditionCode->0F 8x)
+fallSlot:  jmp rel32 -> coldF    ; PATCHABLE (edge: fallthrough VA)
+takenSlot: jmp rel32 -> coldT    ; PATCHABLE (edge: taken target VA)
+coldF: <self-set resume=fallthrough; jmp *CTX_EXIT_INDIRECT(r15)>
+coldT: <self-set resume=taken;       jmp *CTX_EXIT_INDIRECT(r15)>
+```
+(unconditional jmp = one slot/edge; call/ret/indirect keep the indirect exit —
+no chaining, cflow::resolve handles the stack). `emit_block_linked` returns
+`(bytes, Vec<ChainEdge{target_va, rel32_off}>)`.
+
+Run loop: `cache: guest_va->exec`, `pending: target_va->[(patch_abs, next_abs)]`.
+On translating block B at exec_B: register each edge in `pending[target]`, and
+if `target` already cached, patch its slot immediately (rel32 = target_exec -
+next_abs, both in the <4 MiB JIT cache so it fits i32; write via the RW alias).
+When a cold stub exits (target not yet linked), translate the target, which
+patches the waiting edge; next iteration chains directly.
+
+FPU interaction: a chain enters ONCE and runs many blocks with live FPU, so the
+per-block `save_fpu` skip is unsound across a chain (an integer head that skips
+fxrstor, chaining into an FPU block, would run on host FPU garbage). Resolution:
+**set `save_fpu = 1` whenever the entered block is chainable** (ControlFlow/
+Continue); keep the per-block skip only for blocks that exit immediately
+(Syscall/Sensitive). Chaining subsumes the fxsave benefit for hot loops anyway
+(the whole loop is one restore + one save).
+
+Self-modifying code: guest text is treated read-only (no SMC handling); a real
+guest that rewrites code would need page-generation invalidation of the cache +
+edges (aarch64 lane has the mechanism to mirror).
+
 ### Census evidence (real musl already translates)
 
 A throwaway harness ran a real prebuilt static-pie **musl** probe
