@@ -2655,27 +2655,15 @@ fn read_socket_xattr(dir: &cap_std::fs::Dir, rel: &Path) -> bool {
     }
 }
 
-/// Read the guest owner (uid, gid) xattrs for `rel`. Either may be `None`.
-/// Absolute host path of `rel` under the cap-std sandbox `dir` (macOS F_GETPATH
-/// on the dir fd). Symlink xattr ops need it: cap-std can't open a symlink (its
-/// O_NOFOLLOW conflicts with O_SYMLINK), so the link's own xattrs are reached by
-/// a path-based setxattr/getxattr with XATTR_NOFOLLOW. `rel` is sandbox-validated.
-#[cfg(target_os = "macos")]
+/// Absolute host path of `rel` under the cap-std sandbox `dir` (per-OS dir-fd
+/// path lookup via `carrick_portable::fd_abs_path` — F_GETPATH on
+/// Darwin/NetBSD, F_KINFO on FreeBSD, /proc on Linux). Symlink xattr ops need
+/// it: cap-std can't open a symlink (its O_NOFOLLOW conflicts with O_SYMLINK),
+/// so the link's own xattrs are reached by a path-based setxattr/getxattr with
+/// XATTR_NOFOLLOW. `rel` is sandbox-validated.
 fn sandbox_abs_path(dir: &cap_std::fs::Dir, rel: &Path) -> Option<std::path::PathBuf> {
     use std::os::fd::AsRawFd;
-    let mut buf = [0u8; libc::PATH_MAX as usize];
-    let rc = unsafe {
-        libc::fcntl(
-            dir.as_raw_fd(),
-            libc::F_GETPATH,
-            buf.as_mut_ptr() as *mut libc::c_char,
-        )
-    };
-    if rc < 0 {
-        return None;
-    }
-    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-    Some(std::path::Path::new(std::str::from_utf8(&buf[..end]).ok()?).join(rel))
+    Some(carrick_portable::fd_abs_path(dir.as_raw_fd())?.join(rel))
 }
 
 /// Path-based u32 xattr read (macOS). Unlike `with_entry_fd` + `fget_u32_xattr`,

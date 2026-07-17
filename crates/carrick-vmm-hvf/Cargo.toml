@@ -51,5 +51,10 @@ applevisor-sys.workspace = true
 [target.'cfg(any(target_os = "macos", target_os = "freebsd"))'.dependencies]
 carrick-host-bsd = { path = "../carrick-host-bsd" }
 
-[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.build-dependencies]
+# Unconditional on purpose: build scripts compile on the HOST, so a
+# target-cfg'd build-dep vanishes when cross-CHECKING the darwin lane from a
+# non-mac box (the FreeBSD native-lane rig validates macOS Rust via
+# `cargo check --target aarch64-apple-darwin`). build.rs still gates the
+# actual C compile on the macos/aarch64 target.
+[build-dependencies]
 cc = "1"

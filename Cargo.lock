@@ -467,6 +467,7 @@ dependencies = [
  "carrick-kernel",
  "libc",
  "mach2",
+ "tempfile",
 ]
 
 [[package]]
@@ -545,6 +546,7 @@ name = "carrick-portable"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "tempfile",
 ]
 
 [[package]]

@@ -14,8 +14,14 @@
 //! emulation fork-coherent and correct across a process tree without carrick
 //! having to maintain shadow bookkeeping that a `fork(2)` would desynchronise.
 //!
-//! The five modules and the host fact each turns into a Linux surface:
+//! The modules and the host fact each turns into a Linux surface:
 //!
+//!  - [`clock`] — the host UPTIME clock (per-OS clock id) that guest
+//!    virtual-counter synthesis derives from; raw hardware counters keep
+//!    ticking through host suspend and must not be sampled instead.
+//!  - [`futex_key`] — mapping-independent `(st_dev, st_ino, offset)` waiter
+//!    keys for `MAP_SHARED` file futex words, shared by the HVF trap layer
+//!    and the native (DSR) backend.
 //!  - [`host_facts`] — process-invariant machine facts, chiefly the
 //!    Linux-visible logical-CPU count (from `sysctl`, preferring the Apple
 //!    Silicon performance cluster) and the short hostname (from
@@ -53,6 +59,8 @@
 //! re-exports every module here under its original `crate::<module>` path, so
 //! call sites are unchanged.
 
+pub mod clock;
+pub mod futex_key;
 pub mod guest_cpu;
 pub mod host_facts;
 pub mod host_mapping;

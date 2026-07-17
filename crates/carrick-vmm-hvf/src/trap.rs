@@ -471,39 +471,12 @@ struct AliasBacking {
     shared_key_offset: u64,
 }
 
+// Futex-word keying for `MAP_SHARED` file mappings lives in
+// `carrick_host::futex_key` (portable POSIX) so the native (DSR) backend
+// derives its waiter keys with the SAME scheme on every host OS. Re-exported
+// here because this trap layer is where the keys are consumed on HVF.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn mix_futex_key(mut x: u64) -> u64 {
-    x ^= x >> 30;
-    x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    x ^= x >> 27;
-    x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
-    x ^ (x >> 31)
-}
-
-/// File-identity base for a `MAP_SHARED` file futex-word key: a hash of the
-/// backing file's `(st_dev, st_ino)`, `0` when the fd cannot be stat'd (the
-/// caller falls back to address-keying). Public because the Darwin-NATIVE
-/// backend derives its waiter keys with the SAME scheme: two processes mapping
-/// the same file at different addresses (an exec'd child re-attaching an LTP
-/// checkpoint page) must land in one waiter-count slot.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub fn shared_file_key_base(fd: libc::c_int) -> u64 {
-    let mut st: libc::stat = unsafe { core::mem::zeroed() };
-    if unsafe { libc::fstat(fd, &mut st) } != 0 {
-        return 0;
-    }
-    let key = mix_futex_key((st.st_dev as u64) ^ (st.st_ino as u64).rotate_left(32));
-    if key == 0 { 1 } else { key }
-}
-
-/// Mapping-independent waiter key for a shared file futex word: the file's
-/// [`shared_file_key_base`] mixed with the word's file offset.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub fn shared_futex_waiter_key(base: u64, file_offset: u64) -> usize {
-    let key = mix_futex_key(base ^ file_offset.rotate_left(17));
-    let key = if key == 0 { 1 } else { key };
-    key as usize
-}
+pub use carrick_host::futex_key::{shared_file_key_base, shared_futex_waiter_key};
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn alias_registry() -> &'static parking_lot::Mutex<Vec<AliasBacking>> {
