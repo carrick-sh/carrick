@@ -11,6 +11,13 @@ path = "src/lib.rs"
 [lints]
 workspace = true
 
+[features]
+default = []
+# Forwards to carrick-dsr's test-hooks so a consumer that dev-depends on THIS
+# crate with the feature also lights up the shared hook state (see the note
+# in carrick-dsr/Cargo.toml).
+test-hooks = ["carrick-dsr/test-hooks"]
+
 [dependencies]
 carrick-dsr = { path = "../carrick-dsr" }
 carrick-guest-mem = { path = "../carrick-guest-mem" }

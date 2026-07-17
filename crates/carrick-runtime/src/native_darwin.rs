@@ -104,76 +104,29 @@ const _: () = assert!(carrick_mem::vdso::LINUX_VVAR_BASE & ((1 << 32) - 1) == 0)
 static NATIVE_FORKED_GUEST_CHILD: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+// The native test failpoints/captures moved to `carrick_dsr::test_hooks`
+// (cross-crate `cfg(test)` does not compose once mapped_memory.rs moves into
+// carrick-dsr). The hook STATE compiles in for this crate's own test builds
+// via the [dev-dependencies] re-declaration of carrick-dsr with
+// `features = ["test-hooks"]` (cargo feature unification); production builds
+// never enable the feature. The check sites below stay behind
+// `cfg(any(test, feature = "test-hooks"))` so the same code also compiles
+// when a downstream consumer opts into carrick-runtime's forwarding
+// `test-hooks` feature. NOTE: `NATIVE_TEST_REEXEC_LIFECYCLE` now captures
+// the seam phase enum (`carrick_dsr::probes::DsrCacheLifecyclePhase`), not
+// the USDT mirror — `native_reexec_lifecycle` converts at the probe edge.
+#[cfg(any(test, feature = "test-hooks"))]
+use carrick_dsr::test_hooks::{
+    NATIVE_TEST_FAIL_EXEC_AFTER_SETUP, NATIVE_TEST_REEXEC_LIFECYCLE,
+    NATIVE_TEST_SUPPLEMENTAL_ROLLBACKS, NATIVE_TEST_VVAR_WORDS, NativePreparedMappingFailpoint,
+    take_native_prepared_mapping_failpoint,
+};
 #[cfg(test)]
-thread_local! {
-    static NATIVE_TEST_FAIL_EXEC_AFTER_SETUP: std::cell::Cell<bool> = const {
-        std::cell::Cell::new(false)
-    };
-    static NATIVE_TEST_PREPARED_MAPPING_FAILPOINT:
-        std::cell::Cell<Option<NativePreparedMappingFailpoint>> = const {
-            std::cell::Cell::new(None)
-        };
-    static NATIVE_TEST_VVAR_WORDS:
-        std::cell::RefCell<Option<Vec<(usize, u64)>>> = const {
-            std::cell::RefCell::new(None)
-        };
-    static NATIVE_TEST_SUPPLEMENTAL_ROLLBACKS:
-        std::cell::RefCell<Vec<std::ops::Range<carrick_guest_mem::HostVa>>> = const {
-            std::cell::RefCell::new(Vec::new())
-        };
-    static NATIVE_TEST_REEXEC_LIFECYCLE:
-        std::cell::RefCell<Option<Vec<crate::probes::DsrCacheLifecyclePhase>>> = const {
-            std::cell::RefCell::new(None)
-        };
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum NativePreparedMappingFailpoint {
-    SecondRegionMap,
-    Relocation,
-    VvarStamp,
-    FinalProtection,
-}
-
-#[cfg(test)]
-fn set_native_prepared_mapping_failpoint(failpoint: Option<NativePreparedMappingFailpoint>) {
-    NATIVE_TEST_PREPARED_MAPPING_FAILPOINT.with(|slot| slot.set(failpoint));
-}
-
-#[cfg(test)]
-fn take_native_prepared_mapping_failpoint(failpoint: NativePreparedMappingFailpoint) -> bool {
-    NATIVE_TEST_PREPARED_MAPPING_FAILPOINT.with(|slot| {
-        if slot.get() == Some(failpoint) {
-            slot.set(None);
-            true
-        } else {
-            false
-        }
-    })
-}
-
-#[cfg(test)]
-fn set_native_test_vvar_words(words: Option<Vec<(usize, u64)>>) {
-    NATIVE_TEST_VVAR_WORDS.with(|slot| *slot.borrow_mut() = words);
-}
-
-#[cfg(test)]
-fn take_native_test_supplemental_rollbacks() -> Vec<std::ops::Range<carrick_guest_mem::HostVa>> {
-    NATIVE_TEST_SUPPLEMENTAL_ROLLBACKS.with(|slot| std::mem::take(&mut *slot.borrow_mut()))
-}
-
-#[cfg(test)]
-fn set_native_reexec_lifecycle_capture(enabled: bool) {
-    NATIVE_TEST_REEXEC_LIFECYCLE.with(|slot| {
-        *slot.borrow_mut() = enabled.then(Vec::new);
-    });
-}
-
-#[cfg(test)]
-fn take_native_reexec_lifecycle_capture() -> Vec<crate::probes::DsrCacheLifecyclePhase> {
-    NATIVE_TEST_REEXEC_LIFECYCLE.with(|slot| slot.borrow_mut().take().unwrap_or_default())
-}
+use carrick_dsr::test_hooks::{
+    set_native_prepared_mapping_failpoint, set_native_reexec_lifecycle_capture,
+    set_native_test_vvar_words, take_native_reexec_lifecycle_capture,
+    take_native_test_supplemental_rollbacks,
+};
 
 /// Set by the exec teardown at its success point (BEFORE it lowers the
 /// transient exec-replacement owner), never cleared for the life of the
@@ -798,7 +751,7 @@ where
 {
     if let Some(record) = prepared_image {
         native_reexec_lifecycle(
-            crate::probes::DsrCacheLifecyclePhase::HostSelfReexecPreparedValidateBegin,
+            carrick_dsr::probes::DsrCacheLifecyclePhase::HostSelfReexecPreparedValidateBegin,
         );
         let prepared = crate::native_prepared_image::validate_for_resume(record).map_err(
             |error| match error {
@@ -809,7 +762,7 @@ where
             },
         )?;
         native_reexec_lifecycle(
-            crate::probes::DsrCacheLifecyclePhase::HostSelfReexecPreparedValidateEnd,
+            carrick_dsr::probes::DsrCacheLifecyclePhase::HostSelfReexecPreparedValidateEnd,
         );
         return Ok(ResumedImage {
             source: NativeImageSource::Prepared(prepared),
@@ -980,11 +933,13 @@ pub(crate) fn resume_guest_from_capsule(
     dispatcher
         .restore_native_reexec_fd_table(&guest.fd_table)
         .map_err(|error| anyhow::anyhow!("restore native guest fd table: {error}"))?;
-    native_reexec_lifecycle(crate::probes::DsrCacheLifecyclePhase::HostSelfReexecDispatcherReady);
+    native_reexec_lifecycle(
+        carrick_dsr::probes::DsrCacheLifecyclePhase::HostSelfReexecDispatcherReady,
+    );
     let prepared_image = guest.prepared_image.take();
     let resumed = select_resumed_image(prepared_image, guest.executable_digest, || {
         native_reexec_lifecycle(
-            crate::probes::DsrCacheLifecyclePhase::HostSelfReexecImageLoadBegin,
+            carrick_dsr::probes::DsrCacheLifecyclePhase::HostSelfReexecImageLoadBegin,
         );
         let loaded = load_native_execve_image(
             &dispatcher,
@@ -995,7 +950,7 @@ pub(crate) fn resume_guest_from_capsule(
         );
         if loaded.is_ok() {
             native_reexec_lifecycle(
-                crate::probes::DsrCacheLifecyclePhase::HostSelfReexecImageLoadEnd,
+                carrick_dsr::probes::DsrCacheLifecyclePhase::HostSelfReexecImageLoadEnd,
             );
         }
         loaded
@@ -1004,7 +959,7 @@ pub(crate) fn resume_guest_from_capsule(
         .legacy_resolved_path
         .clone()
         .unwrap_or_else(|| guest.resolved_path.clone());
-    native_reexec_lifecycle(crate::probes::DsrCacheLifecyclePhase::HostSelfReexecResetBegin);
+    native_reexec_lifecycle(carrick_dsr::probes::DsrCacheLifecyclePhase::HostSelfReexecResetBegin);
     dispatcher.reset_memory_state_on_execve();
     dispatcher.reset_signal_handlers_on_execve();
     dispatcher.set_executable_identity(
@@ -1019,7 +974,7 @@ pub(crate) fn resume_guest_from_capsule(
     // executes its first instruction; otherwise PTRACE_TRACEME silently vanishes
     // across the transport even though the typed state itself was restored.
     crate::exec_helpers::stop_after_traced_exec(&dispatcher);
-    native_reexec_lifecycle(crate::probes::DsrCacheLifecyclePhase::HostSelfReexecResetEnd);
+    native_reexec_lifecycle(carrick_dsr::probes::DsrCacheLifecyclePhase::HostSelfReexecResetEnd);
     run_image_in_current_process(
         resumed.source,
         dispatcher,
@@ -1040,15 +995,15 @@ pub(crate) fn next_native_profile_exec_epoch_for_reexec() -> u64 {
     dsr::profile::next_profile_exec_epoch_for_reexec()
 }
 
-fn native_reexec_lifecycle(phase: crate::probes::DsrCacheLifecyclePhase) {
-    #[cfg(test)]
+fn native_reexec_lifecycle(phase: carrick_dsr::probes::DsrCacheLifecyclePhase) {
+    #[cfg(any(test, feature = "test-hooks"))]
     NATIVE_TEST_REEXEC_LIFECYCLE.with(|slot| {
         if let Some(phases) = slot.borrow_mut().as_mut() {
             phases.push(phase);
         }
     });
     let tid = unsafe { libc::getpid() };
-    crate::probes::dsr_cache_lifecycle(tid, phase, 0, 0, 0);
+    crate::probes::dsr_cache_lifecycle(tid, native_dsr_lifecycle_phase(phase), 0, 0, 0);
 }
 
 fn native_memory_layout() -> MemoryLayout {
@@ -1276,26 +1231,13 @@ fn native_image_needs_eager_relocations(elf: &Elf<'_>) -> bool {
     elf.header.e_type == ET_DYN && elf.interpreter.is_none()
 }
 
+// Runtime-error edge of `carrick_dsr::native_error::checked_add_u64` for the
+// native_darwin.rs callers that still speak `RuntimeError` directly.
+// `mapped_memory.rs` imports the carrick-dsr helpers (NativeMemoryError)
+// instead; `align_up_u64` moved with them outright (its only users were
+// there).
 fn checked_add_u64(a: u64, b: u64, context: &str) -> Result<u64, RuntimeError> {
-    a.checked_add(b).ok_or_else(|| {
-        RuntimeError::Unsupported(format!("native Darwin {context} overflow: 0x{a:x}+0x{b:x}"))
-    })
-}
-
-fn align_up_u64(value: u64, align: u64, context: &str) -> Result<u64, RuntimeError> {
-    if align == 0 || !align.is_power_of_two() {
-        return Err(RuntimeError::Unsupported(format!(
-            "native Darwin {context} invalid alignment: {align}"
-        )));
-    }
-    value
-        .checked_add(align - 1)
-        .map(|v| v & !(align - 1))
-        .ok_or_else(|| {
-            RuntimeError::Unsupported(format!(
-                "native Darwin {context} overflow: 0x{value:x} align 0x{align:x}"
-            ))
-        })
+    carrick_dsr::native_error::checked_add_u64(a, b, context).map_err(RuntimeError::from)
 }
 
 fn add_load_bias(load_bias: u64, addend: i64) -> Result<u64, RuntimeError> {
@@ -1546,7 +1488,9 @@ fn map_current_process_image_source(
 ) -> Result<(NativeMappedMemory, AddressSpace), RuntimeError> {
     let mapped = map_and_release_native_image_source(source, plan)?;
     if process_entry == NativeCurrentProcessEntry::SelfReexecRestore {
-        native_reexec_lifecycle(crate::probes::DsrCacheLifecyclePhase::HostSelfReexecGuestEntry);
+        native_reexec_lifecycle(
+            carrick_dsr::probes::DsrCacheLifecyclePhase::HostSelfReexecGuestEntry,
+        );
     }
     Ok(mapped)
 }
@@ -2372,7 +2316,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
             DispatchOutcome::Execve { path, argv, env } => {
                 if NATIVE_FORKED_GUEST_CHILD.load(std::sync::atomic::Ordering::Acquire) {
                     native_reexec_lifecycle(
-                        crate::probes::DsrCacheLifecyclePhase::HostSelfReexecPreflightBegin,
+                        carrick_dsr::probes::DsrCacheLifecyclePhase::HostSelfReexecPreflightBegin,
                     );
                 }
                 let capsule_env = env.clone();
@@ -6934,11 +6878,12 @@ fn waitpid_blocking(pid: libc::pid_t) -> Result<libc::c_int, RuntimeError> {
     }
 }
 
+// Runtime-error edge of `carrick_dsr::native_error::last_io_error` (same
+// captured `errno`, same "{context}: {os error}" message via the
+// `From<NativeMemoryError>` conversion in run_result.rs). mapped_memory.rs
+// imports the carrick-dsr helper directly.
 fn last_io_error(context: &str) -> RuntimeError {
-    RuntimeError::FsBackend(anyhow::anyhow!(
-        "{context}: {}",
-        std::io::Error::last_os_error()
-    ))
+    RuntimeError::from(carrick_dsr::native_error::last_io_error(context))
 }
 
 #[cfg(test)]
@@ -13774,11 +13719,11 @@ mod tests {
             assert_eq!(
                 take_native_reexec_lifecycle_capture(),
                 vec![
-                    crate::probes::DsrCacheLifecyclePhase::HostSelfReexecPreparedValidateBegin,
-                    crate::probes::DsrCacheLifecyclePhase::HostSelfReexecPreparedValidateEnd,
-                    crate::probes::DsrCacheLifecyclePhase::HostSelfReexecPreparedMapBegin,
-                    crate::probes::DsrCacheLifecyclePhase::HostSelfReexecPreparedMapEnd,
-                    crate::probes::DsrCacheLifecyclePhase::HostSelfReexecGuestEntry,
+                    carrick_dsr::probes::DsrCacheLifecyclePhase::HostSelfReexecPreparedValidateBegin,
+                    carrick_dsr::probes::DsrCacheLifecyclePhase::HostSelfReexecPreparedValidateEnd,
+                    carrick_dsr::probes::DsrCacheLifecyclePhase::HostSelfReexecPreparedMapBegin,
+                    carrick_dsr::probes::DsrCacheLifecyclePhase::HostSelfReexecPreparedMapEnd,
+                    carrick_dsr::probes::DsrCacheLifecyclePhase::HostSelfReexecGuestEntry,
                 ]
             );
             set_native_test_vvar_words(None);
@@ -13830,7 +13775,7 @@ mod tests {
             );
             assert_eq!(
                 take_native_reexec_lifecycle_capture(),
-                vec![crate::probes::DsrCacheLifecyclePhase::HostSelfReexecPreparedMapBegin]
+                vec![carrick_dsr::probes::DsrCacheLifecyclePhase::HostSelfReexecPreparedMapBegin]
             );
             set_native_test_vvar_words(None);
         });
@@ -13861,8 +13806,8 @@ mod tests {
             assert_eq!(
                 take_native_reexec_lifecycle_capture(),
                 vec![
-                    crate::probes::DsrCacheLifecyclePhase::HostSelfReexecPreparedMapBegin,
-                    crate::probes::DsrCacheLifecyclePhase::HostSelfReexecPreparedMapEnd,
+                    carrick_dsr::probes::DsrCacheLifecyclePhase::HostSelfReexecPreparedMapBegin,
+                    carrick_dsr::probes::DsrCacheLifecyclePhase::HostSelfReexecPreparedMapEnd,
                 ]
             );
             set_native_test_vvar_words(None);

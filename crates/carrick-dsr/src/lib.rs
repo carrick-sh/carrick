@@ -32,6 +32,10 @@ pub mod address;
 pub mod cache;
 pub mod host;
 pub mod ids;
+pub mod native_error;
+pub mod page_geometry;
 pub mod probes;
 pub mod profile;
+#[cfg(any(test, feature = "test-hooks"))]
+pub mod test_hooks;
 pub mod vocabulary;

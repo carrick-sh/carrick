@@ -7,6 +7,14 @@
 
 use super::*;
 
+// Explicit imports beat the glob above: the mapping machinery speaks
+// `NativeMemoryError` internally (carrick-dsr's error vocabulary) and these
+// helpers shadow native_darwin.rs's RuntimeError-returning wrappers of the
+// same names. Only the public boundary functions of this module — the ones
+// called from outside mapped_memory.rs — still return `RuntimeError`,
+// converting at `?` / `.into()` via the `From` impl in run_result.rs.
+use carrick_dsr::native_error::{NativeMemoryError, align_up_u64, checked_add_u64, last_io_error};
+
 pub(super) const VM_INHERIT_SHARE: libc::c_int = 0;
 pub(super) const VM_INHERIT_COPY: libc::c_int = 1;
 
@@ -273,7 +281,7 @@ pub(super) enum NativeImageBacking<'a> {
 }
 
 impl NativeImageBacking<'_> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(super) fn is_prepared(self) -> bool {
         matches!(self, Self::Prepared(_))
     }
@@ -317,14 +325,14 @@ impl NativeMappingRollback {
         plan: NativeMappingRollbackPlan,
         host_page_size: u64,
         capacity: usize,
-    ) -> Result<Self, RuntimeError> {
+    ) -> Result<Self, NativeMemoryError> {
         let host_page_size = usize::try_from(host_page_size).map_err(|_| {
-            RuntimeError::Unsupported(format!(
+            NativeMemoryError::Unsupported(format!(
                 "native rollback host page size is not representable: 0x{host_page_size:x}"
             ))
         })?;
         if !host_page_size.is_power_of_two() {
-            return Err(RuntimeError::Unsupported(format!(
+            return Err(NativeMemoryError::Unsupported(format!(
                 "native rollback host page size is invalid: 0x{host_page_size:x}"
             )));
         }
@@ -371,7 +379,7 @@ impl Drop for NativeMappingRollback {
             if length == 0 {
                 continue;
             }
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
             NATIVE_TEST_SUPPLEMENTAL_ROLLBACKS.with(|slot| slot.borrow_mut().push(range.clone()));
             unsafe {
                 libc::munmap(range.start.raw() as *mut libc::c_void, length);
@@ -621,7 +629,7 @@ impl NativeMappedMemory {
         relative_relocations: &[NativeRelativeRelocation],
     ) -> Result<Self, RuntimeError> {
         let native_layout = NativeLayout::for_image(image, layout, host_page_size)
-            .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+            .map_err(|error| NativeMemoryError::Unsupported(error.to_string()))?;
         let rollback_plan = NativeMappingRollbackPlan::for_fresh_layout(&native_layout);
         Self::map_with_layout(
             image,
@@ -649,7 +657,9 @@ impl NativeMappedMemory {
     ) -> Result<Self, RuntimeError> {
         let native_layout =
             NativeLayout::for_image(&prepared.image, layout, plan.page_geometry.host_page_size)
-                .map_err(|error| RuntimeError::Unsupported(format!("prepared-map: {error}")))?;
+                .map_err(|error| {
+                    NativeMemoryError::Unsupported(format!("prepared-map: {error}"))
+                })?;
         let rollback_plan = NativeMappingRollbackPlan::for_fresh_layout(&native_layout);
         Self::map_with_layout(
             &prepared.image,
@@ -679,7 +689,7 @@ impl NativeMappedMemory {
         exec_map_dsr_tid: Option<crate::thread::ThreadId>,
     ) -> Result<Self, RuntimeError> {
         let native_layout = NativeLayout::for_image(image, layout, host_page_size)
-            .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+            .map_err(|error| NativeMemoryError::Unsupported(error.to_string()))?;
         let rollback_plan = NativeMappingRollbackPlan::for_fresh_layout(&native_layout);
         Self::map_with_layout(
             image,
@@ -721,7 +731,7 @@ impl NativeMappedMemory {
             NativeImageBacking::AnonymousBytes => None,
             NativeImageBacking::Prepared(prepared) => {
                 native_reexec_lifecycle(
-                    crate::probes::DsrCacheLifecyclePhase::HostSelfReexecPreparedMapBegin,
+                    carrick_dsr::probes::DsrCacheLifecyclePhase::HostSelfReexecPreparedMapBegin,
                 );
                 let mappings = image
                     .regions()
@@ -733,7 +743,7 @@ impl NativeMappedMemory {
                             .get(region_index)
                             .copied()
                             .ok_or_else(|| {
-                                RuntimeError::Unsupported(format!(
+                                NativeMemoryError::Unsupported(format!(
                                     "prepared-map: missing file backing for region {region_index}"
                                 ))
                             })?;
@@ -747,9 +757,9 @@ impl NativeMappedMemory {
                             &mut rollback,
                         )
                     })
-                    .collect::<Result<Vec<_>, RuntimeError>>()?;
+                    .collect::<Result<Vec<_>, NativeMemoryError>>()?;
                 native_reexec_lifecycle(
-                    crate::probes::DsrCacheLifecyclePhase::HostSelfReexecPreparedMapEnd,
+                    carrick_dsr::probes::DsrCacheLifecyclePhase::HostSelfReexecPreparedMapEnd,
                 );
                 Some(mappings)
             }
@@ -768,7 +778,7 @@ impl NativeMappedMemory {
                         .as_ref()
                         .and_then(|mappings| mappings.get(region_index))
                         .ok_or_else(|| {
-                            RuntimeError::Unsupported(format!(
+                            NativeMemoryError::Unsupported(format!(
                                 "prepared-map: missing mapped region {region_index}"
                             ))
                         })?;
@@ -957,7 +967,7 @@ impl NativeMappedMemory {
         for span in image.ro_spans() {
             let _span_end = checked_add_u64(span.start, span.len, "read-only ELF span end")?;
             let len = usize::try_from(span.len).map_err(|_| {
-                RuntimeError::Unsupported(format!(
+                NativeMemoryError::Unsupported(format!(
                     "native Darwin read-only ELF span too large: 0x{:x}+0x{:x}",
                     span.start, span.len
                 ))
@@ -980,13 +990,13 @@ impl NativeMappedMemory {
                 host_page_size: page_sizes.host,
                 linux_page_size: page_sizes.linux,
                 dsr_generations: dsr::cache::PageGenerationTable::new(page_sizes.host)
-                    .map_err(|error| RuntimeError::Unsupported(error.to_string()))?,
+                    .map_err(|error| NativeMemoryError::Unsupported(error.to_string()))?,
                 dsr_translator: if let Some(translator) = reusable_translator {
                     Some(translator)
                 } else {
                     Some(Arc::new(
                         dsr::ProcessTranslator::new(64 * 1024 * 1024)
-                            .map_err(|error| RuntimeError::Unsupported(error.to_string()))?,
+                            .map_err(|error| NativeMemoryError::Unsupported(error.to_string()))?,
                     ))
                 },
             };
@@ -998,13 +1008,14 @@ impl NativeMappedMemory {
                 crate::probes::DsrCacheLifecyclePhase::ExecMapVvarBegin,
                 crate::vdso::LINUX_VVAR_SIZE,
             );
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
             if backing.is_prepared()
                 && take_native_prepared_mapping_failpoint(NativePreparedMappingFailpoint::VvarStamp)
             {
-                return Err(RuntimeError::Unsupported(
+                return Err(NativeMemoryError::Unsupported(
                     "prepared-map: injected vvar stamping failure".to_string(),
-                ));
+                )
+                .into());
             }
             memory.stamp_vdso_vvar()?;
             native_exec_map_detail(
@@ -1012,25 +1023,26 @@ impl NativeMappedMemory {
                 crate::probes::DsrCacheLifecyclePhase::ExecMapVvarEnd,
                 0,
             );
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
             if backing.is_prepared()
                 && take_native_prepared_mapping_failpoint(
                     NativePreparedMappingFailpoint::Relocation,
                 )
             {
-                return Err(RuntimeError::Unsupported(
+                return Err(NativeMemoryError::Unsupported(
                     "prepared-map: injected relocation failure".to_string(),
-                ));
+                )
+                .into());
             }
             apply_native_relative_relocations(&mut memory, relative_relocations)?;
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
             if exec_map_dsr_tid.is_some()
                 && NATIVE_TEST_FAIL_EXEC_AFTER_SETUP.with(|failpoint| failpoint.replace(false))
             {
-                return Err(RuntimeError::Unsupported(
+                return Err(NativeMemoryError::Unsupported(
                     "injected native exec failure after target mapping, vvar setup, and relocations"
                         .to_string(),
-                ));
+                ).into());
             }
             Ok(memory)
         })();
@@ -1060,7 +1072,7 @@ impl NativeMappedMemory {
         if !self.vvar_region_is_mapped() {
             return Ok(());
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-hooks"))]
         if let Some(words) = NATIVE_TEST_VVAR_WORDS.with(|slot| slot.borrow().clone()) {
             return self.write_vvar_words(&words);
         }
@@ -1114,14 +1126,14 @@ impl NativeMappedMemory {
         let (page_start, page_len) = self
             .host_page_range(NATIVE_DARWIN_VVAR_BASE, vvar_end)
             .map_err(|_| {
-                RuntimeError::Unsupported("native Darwin vvar page range overflow".to_string())
+                NativeMemoryError::Unsupported("native Darwin vvar page range overflow".to_string())
             })?;
         let page_ptr = self
             .host_address(carrick_guest_mem::GuestVa(page_start))
-            .map_err(|error| RuntimeError::Unsupported(error.to_string()))?
+            .map_err(|error| NativeMemoryError::Unsupported(error.to_string()))?
             .raw() as *mut libc::c_void;
         if unsafe { libc::mprotect(page_ptr, page_len, libc::PROT_READ | libc::PROT_WRITE) } != 0 {
-            return Err(last_io_error("mprotect native Darwin vvar page writable"));
+            return Err(last_io_error("mprotect native Darwin vvar page writable").into());
         }
         for &(offset, value) in words {
             debug_assert!(
@@ -1135,14 +1147,14 @@ impl NativeMappedMemory {
                 std::ptr::copy_nonoverlapping(
                     bytes.as_ptr(),
                     self.host_address(carrick_guest_mem::GuestVa(address))
-                        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?
+                        .map_err(|error| NativeMemoryError::Unsupported(error.to_string()))?
                         .raw() as *mut u8,
                     bytes.len(),
                 );
             }
         }
         if unsafe { libc::mprotect(page_ptr, page_len, libc::PROT_READ) } != 0 {
-            return Err(last_io_error("restore native Darwin vvar page read-only"));
+            return Err(last_io_error("restore native Darwin vvar page read-only").into());
         }
         Ok(())
     }
@@ -1188,7 +1200,7 @@ impl NativeMappedMemory {
             plan.page_geometry.host_page_size,
             &self.owned_host_ranges,
         )
-        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+        .map_err(|error| NativeMemoryError::Unsupported(error.to_string()))?;
         let target_only = if matches!(native_layout.address_mode(), NativeAddressMode::Direct) {
             // Every Carrick-owned overlap can transfer continuously into a
             // Direct replacement, regardless of the source address mode.
@@ -1206,7 +1218,7 @@ impl NativeMappedMemory {
         } else {
             Arc::new(
                 dsr::ProcessTranslator::new(64 * 1024 * 1024)
-                    .map_err(|error| RuntimeError::Unsupported(error.to_string()))?,
+                    .map_err(|error| NativeMemoryError::Unsupported(error.to_string()))?,
             )
         };
         // This is the final pre-PONR screen. The layout, target-only range
@@ -1221,30 +1233,30 @@ impl NativeMappedMemory {
                 .raw()
                 .checked_sub(range.start.raw())
                 .ok_or_else(|| {
-                    RuntimeError::Unsupported(format!(
+                    NativeMemoryError::Unsupported(format!(
                         "native direct exec target range is inverted: 0x{:x}..0x{:x}",
                         range.start.raw(),
                         range.end.raw()
                     ))
                 })? as u64;
             match crate::host_proc::reserve_self_direct_vm_range(range.start.raw() as u64, length)
-                .map_err(|error| RuntimeError::Unsupported(error.to_string()))?
+                .map_err(|error| NativeMemoryError::Unsupported(error.to_string()))?
             {
                 crate::host_proc::DirectVmReservationOutcome::Reserved(reservation) => {
                     for (start, length) in reservation.owned_spans() {
                         let end = start.checked_add(length).ok_or_else(|| {
-                            RuntimeError::Unsupported(format!(
+                            NativeMemoryError::Unsupported(format!(
                                 "native direct exec reservation range overflows: 0x{start:x}+0x{length:x}"
                             ))
                         })?;
                         direct_reservation_ranges.push(
                             carrick_guest_mem::HostVa(usize::try_from(start).map_err(|_| {
-                                RuntimeError::Unsupported(format!(
+                                NativeMemoryError::Unsupported(format!(
                                     "native direct exec reservation start is not representable: 0x{start:x}"
                                 ))
                             })?)
                                 ..carrick_guest_mem::HostVa(usize::try_from(end).map_err(|_| {
-                                    RuntimeError::Unsupported(format!(
+                                    NativeMemoryError::Unsupported(format!(
                                         "native direct exec reservation end is not representable: 0x{end:x}"
                                     ))
                                 })?),
@@ -1288,10 +1300,11 @@ impl NativeMappedMemory {
         };
         lifecycle(crate::probes::DsrCacheLifecyclePhase::ExecImageUnmapBegin);
         if self.owned_host_ranges.is_empty() {
-            return Err(RuntimeError::Unsupported(
+            return Err(NativeMemoryError::Unsupported(
                 "native Darwin execve cannot retire an address space without owned host ranges"
                     .to_string(),
-            ));
+            )
+            .into());
         }
         let retained_target_ranges = prepared.native_layout.owned_ranges();
         let retired_ranges = subtract_host_ranges(&self.owned_host_ranges, retained_target_ranges);
@@ -1306,14 +1319,15 @@ impl NativeMappedMemory {
             let start = range.start.raw();
             let end = range.end.raw();
             let len = end.checked_sub(start).ok_or_else(|| {
-                RuntimeError::Unsupported(format!(
+                NativeMemoryError::Unsupported(format!(
                     "native Darwin execve owned range is inverted: 0x{start:x}..0x{end:x}"
                 ))
             })?;
             if len != 0 && unsafe { libc::munmap(start as *mut libc::c_void, len) } != 0 {
                 return Err(last_io_error(&format!(
                     "munmap native Darwin execve owned range 0x{start:x}..0x{end:x}"
-                )));
+                ))
+                .into());
             }
         }
         lifecycle(crate::probes::DsrCacheLifecyclePhase::ExecImageUnmapEnd);
@@ -1328,7 +1342,7 @@ impl NativeMappedMemory {
         } = prepared;
         native_layout
             .reset_biased_aperture_to_guards()
-            .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+            .map_err(|error| NativeMemoryError::Unsupported(error.to_string()))?;
         let inherited_translator =
             reset_inherited_translator.then(|| Arc::clone(&process_translator));
         let replacement = Self::map_with_layout(
@@ -1565,7 +1579,7 @@ impl NativeMappedMemory {
                 self.host_page_size as usize,
             )
             .map_err(|error| {
-                RuntimeError::Unsupported(format!(
+                NativeMemoryError::Unsupported(format!(
                     "native16k could not make guest write-exec page 0x{page_start:x} executable: {error}"
                 ))
             })?;
@@ -1577,9 +1591,9 @@ impl NativeMappedMemory {
         }
         let pc_page = pc & !(self.host_page_size - 1);
         if pc_page == page_start {
-            return Err(RuntimeError::Unsupported(format!(
+            return Err(NativeMemoryError::Unsupported(format!(
                 "native16k cannot write a guest RWX page while executing from the same 16K host page at pc=0x{pc:x} addr=0x{fault_address:x}"
-            )));
+            )).into());
         }
         self.make_native16k_write_exec_page_writable(
             page_start,
@@ -1587,7 +1601,7 @@ impl NativeMappedMemory {
             self.host_page_size as usize,
         )
         .map_err(|error| {
-            RuntimeError::Unsupported(format!(
+            NativeMemoryError::Unsupported(format!(
                 "native16k could not make guest write-exec page 0x{page_start:x} writable: {error}"
             ))
         })?;
@@ -2779,12 +2793,12 @@ impl NativeMappedMemory {
         let bytes = self
             .read_bytes_raw(address, std::mem::size_of::<u32>())
             .map_err(|error| {
-                RuntimeError::Unsupported(format!(
+                NativeMemoryError::Unsupported(format!(
                     "native Darwin instruction read failed at 0x{address:x}: {error}"
                 ))
             })?;
         let word: [u8; 4] = bytes.try_into().map_err(|_| {
-            RuntimeError::Unsupported(format!(
+            NativeMemoryError::Unsupported(format!(
                 "native Darwin instruction read was short at 0x{address:x}"
             ))
         })?;
@@ -2799,11 +2813,13 @@ impl NativeMappedMemory {
         let page_end = (start.raw() | self.linux_page_size.saturating_sub(1)).saturating_add(1);
         let requested = max_instructions
             .checked_mul(std::mem::size_of::<u32>())
-            .ok_or_else(|| RuntimeError::Unsupported("instruction fingerprint overflow".into()))?;
+            .ok_or_else(|| {
+                NativeMemoryError::Unsupported("instruction fingerprint overflow".into())
+            })?;
         let available = usize::try_from(page_end.saturating_sub(start.raw())).unwrap_or(usize::MAX);
         let length = requested.min(available);
         let bytes = self.read_bytes_raw(start.raw(), length).map_err(|error| {
-            RuntimeError::Unsupported(format!(
+            NativeMemoryError::Unsupported(format!(
                 "native Darwin instruction fingerprint failed at 0x{:x}: {error}",
                 start.raw()
             ))
@@ -2816,13 +2832,14 @@ impl NativeMappedMemory {
 
     pub(super) fn write_u64(&mut self, address: u64, value: u64) -> Result<(), RuntimeError> {
         if !self.region_contains(address, std::mem::size_of::<u64>()) {
-            return Err(RuntimeError::Unsupported(format!(
+            return Err(NativeMemoryError::Unsupported(format!(
                 "native Darwin relocation outside mapped guest memory at 0x{address:x}"
-            )));
+            ))
+            .into());
         }
         let ptr = self
             .host_address(carrick_guest_mem::GuestVa(address))
-            .map_err(|error| RuntimeError::Unsupported(error.to_string()))?
+            .map_err(|error| NativeMemoryError::Unsupported(error.to_string()))?
             .raw() as *mut u64;
         unsafe { std::ptr::write_unaligned(ptr, value) };
         Ok(())
@@ -2908,7 +2925,7 @@ impl NativeMappedMemory {
     ) -> Result<(), RuntimeError> {
         let map_len = align_up_u64(len, self.host_page_size, "native alias length")?;
         let map_len_usize = usize::try_from(map_len).map_err(|_| {
-            RuntimeError::Unsupported(format!(
+            NativeMemoryError::Unsupported(format!(
                 "native Darwin alias too large: 0x{address:x}+0x{len:x}"
             ))
         })?;
@@ -2919,7 +2936,7 @@ impl NativeMappedMemory {
         let page_delta = address.saturating_sub(page_start);
         let host_map_len = align_up_u64(
             page_delta.checked_add(len).ok_or_else(|| {
-                RuntimeError::Unsupported(format!(
+                NativeMemoryError::Unsupported(format!(
                     "native Darwin alias host length overflow: 0x{address:x}+0x{len:x}"
                 ))
             })?,
@@ -2927,7 +2944,7 @@ impl NativeMappedMemory {
             "native alias host length",
         )?;
         let host_map_len_usize = usize::try_from(host_map_len).map_err(|_| {
-            RuntimeError::Unsupported(format!(
+            NativeMemoryError::Unsupported(format!(
                 "native Darwin alias too large: 0x{address:x}+0x{len:x}"
             ))
         })?;
@@ -2969,7 +2986,7 @@ impl NativeMappedMemory {
                     if file.is_some() {
                         unsafe { libc::close(fd) };
                     }
-                    return Err(RuntimeError::Unsupported(error.to_string()));
+                    return Err(NativeMemoryError::Unsupported(error.to_string()).into());
                 }
             };
         let addr = host_start.raw() as *mut libc::c_void;
@@ -2998,12 +3015,12 @@ impl NativeMappedMemory {
         };
         if mapped != libc::MAP_FAILED && file.is_some() && !direct_file {
             let copy_len = usize::try_from(len).map_err(|_| {
-                RuntimeError::Unsupported(format!(
+                NativeMemoryError::Unsupported(format!(
                     "native Darwin alias guest length too large: 0x{address:x}+0x{len:x}"
                 ))
             })?;
             let copy_offset = usize::try_from(page_delta).map_err(|_| {
-                RuntimeError::Unsupported(format!(
+                NativeMemoryError::Unsupported(format!(
                     "native Darwin alias page delta too large: 0x{page_delta:x}"
                 ))
             })?;
@@ -3024,10 +3041,11 @@ impl NativeMappedMemory {
                     Err(errno) if errno == crate::linux_abi::LINUX_EINTR => {}
                     Err(errno) => {
                         unsafe { libc::close(fd) };
-                        return Err(RuntimeError::Unsupported(format!(
+                        return Err(NativeMemoryError::Unsupported(format!(
                             "native Darwin alias pread failed with errno {}",
                             errno.get()
-                        )));
+                        ))
+                        .into());
                     }
                 }
             }
@@ -3038,7 +3056,8 @@ impl NativeMappedMemory {
                     return Err(last_io_error(&format!(
                         "mprotect native Darwin alias 0x{page_start:x}..0x{:x}",
                         page_start.saturating_add(host_map_len)
-                    )));
+                    ))
+                    .into());
                 }
             }
         }
@@ -3049,12 +3068,14 @@ impl NativeMappedMemory {
             return Err(last_io_error(&format!(
                 "mmap native Darwin alias 0x{address:x}..0x{:x}",
                 address.saturating_add(host_map_len)
-            )));
+            ))
+            .into());
         }
         if mapped != addr {
-            return Err(RuntimeError::Unsupported(format!(
+            return Err(NativeMemoryError::Unsupported(format!(
                 "native Darwin mmap did not honor MAP_FIXED for alias 0x{address:x}"
-            )));
+            ))
+            .into());
         }
 
         // MAP_FIXED replaces the physical host pages, so none of the prior
@@ -3081,7 +3102,7 @@ impl NativeMappedMemory {
         }
 
         let len_usize = usize::try_from(len).map_err(|_| {
-            RuntimeError::Unsupported(format!(
+            NativeMemoryError::Unsupported(format!(
                 "native Darwin alias guest length too large: 0x{address:x}+0x{len:x}"
             ))
         })?;
@@ -3670,7 +3691,7 @@ pub(super) fn finalize_image_region_mapping(
     logical_length: u64,
     exec_map_dsr_tid: Option<crate::thread::ThreadId>,
     _prepared: bool,
-) -> Result<(), RuntimeError> {
+) -> Result<(), NativeMemoryError> {
     if region.perms.execute {
         native_exec_map_detail(
             exec_map_dsr_tid,
@@ -3690,11 +3711,11 @@ pub(super) fn finalize_image_region_mapping(
         );
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     if _prepared
         && take_native_prepared_mapping_failpoint(NativePreparedMappingFailpoint::FinalProtection)
     {
-        return Err(RuntimeError::Unsupported(
+        return Err(NativeMemoryError::Unsupported(
             "prepared-map: injected final protection failure".to_string(),
         ));
     }
@@ -3732,10 +3753,10 @@ pub(super) fn map_region(
     rollback: &mut NativeMappingRollback,
 ) -> Result<(), RuntimeError> {
     let length_u64 = region.end.checked_sub(region.start).ok_or_else(|| {
-        RuntimeError::Unsupported("native Darwin empty inverted region".to_string())
+        NativeMemoryError::Unsupported("native Darwin empty inverted region".to_string())
     })?;
     let length = usize::try_from(length_u64).map_err(|_| {
-        RuntimeError::Unsupported(format!(
+        NativeMemoryError::Unsupported(format!(
             "native Darwin region too large: 0x{:x}..0x{:x}",
             region.start, region.end
         ))
@@ -3746,7 +3767,7 @@ pub(super) fn map_region(
     let host_start = native_layout
         .address_mode()
         .to_host(carrick_guest_mem::GuestVa(region.start))
-        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+        .map_err(|error| NativeMemoryError::Unsupported(error.to_string()))?;
     let addr = host_start.raw() as *mut libc::c_void;
     let share = if region.shared {
         libc::MAP_SHARED
@@ -3764,7 +3785,7 @@ pub(super) fn map_region(
             length,
             libc::MAP_ANON | libc::MAP_NORESERVE | share,
         )
-        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+        .map_err(|error| NativeMemoryError::Unsupported(error.to_string()))?;
     let mapped = unsafe {
         libc::mmap(
             addr,
@@ -3779,14 +3800,16 @@ pub(super) fn map_region(
         return Err(last_io_error(&format!(
             "mmap native Darwin region 0x{:x}..0x{:x}",
             region.start, region.end
-        )));
+        ))
+        .into());
     }
     if mapped != addr {
         unsafe { libc::munmap(mapped, length) };
-        return Err(RuntimeError::Unsupported(format!(
+        return Err(NativeMemoryError::Unsupported(format!(
             "native Darwin mmap did not honor MAP_FIXED for 0x{:x}",
             region.start
-        )));
+        ))
+        .into());
     }
     rollback.track_mapping(host_start, length);
     native_exec_map_detail(
@@ -3829,18 +3852,18 @@ pub(super) fn map_prepared_region_extent(
     exec_map_dsr_tid: Option<crate::thread::ThreadId>,
     native_layout: &NativeLayout,
     rollback: &mut NativeMappingRollback,
-) -> Result<PreparedRegionMapping, RuntimeError> {
-    #[cfg(test)]
+) -> Result<PreparedRegionMapping, NativeMemoryError> {
+    #[cfg(any(test, feature = "test-hooks"))]
     if region_index == 1
         && take_native_prepared_mapping_failpoint(NativePreparedMappingFailpoint::SecondRegionMap)
     {
-        return Err(RuntimeError::Unsupported(
+        return Err(NativeMemoryError::Unsupported(
             "prepared-map: injected second-region mapping failure".to_string(),
         ));
     }
 
     let length_u64 = region.end.checked_sub(region.start).ok_or_else(|| {
-        RuntimeError::Unsupported("prepared-map: empty or inverted region".to_string())
+        NativeMemoryError::Unsupported("prepared-map: empty or inverted region".to_string())
     })?;
     let expected_extent = align_up_u64(
         length_u64,
@@ -3848,18 +3871,18 @@ pub(super) fn map_prepared_region_extent(
         "prepared artifact region extent",
     )?;
     if backing.artifact_extent.get() != expected_extent {
-        return Err(RuntimeError::Unsupported(format!(
+        return Err(NativeMemoryError::Unsupported(format!(
             "prepared-map: region {region_index} extent mismatch: artifact=0x{:x}, expected=0x{expected_extent:x}",
             backing.artifact_extent.get()
         )));
     }
     let length = usize::try_from(expected_extent).map_err(|_| {
-        RuntimeError::Unsupported(format!(
+        NativeMemoryError::Unsupported(format!(
             "prepared-map: region {region_index} is too large: 0x{expected_extent:x}"
         ))
     })?;
     let artifact_offset = libc::off_t::try_from(backing.artifact_offset.get()).map_err(|_| {
-        RuntimeError::Unsupported(format!(
+        NativeMemoryError::Unsupported(format!(
             "prepared-map: region {region_index} artifact offset is not representable: 0x{:x}",
             backing.artifact_offset.get()
         ))
@@ -3867,7 +3890,7 @@ pub(super) fn map_prepared_region_extent(
     let host_start = native_layout
         .address_mode()
         .to_host(carrick_guest_mem::GuestVa(region.start))
-        .map_err(|error| RuntimeError::Unsupported(format!("prepared-map: {error}")))?;
+        .map_err(|error| NativeMemoryError::Unsupported(format!("prepared-map: {error}")))?;
     let address = host_start.raw() as *mut libc::c_void;
     native_exec_map_detail(
         exec_map_dsr_tid,
@@ -3876,7 +3899,7 @@ pub(super) fn map_prepared_region_extent(
     );
     let flags = native_layout
         .fixed_mapping_flags(host_start, length, libc::MAP_PRIVATE)
-        .map_err(|error| RuntimeError::Unsupported(format!("prepared-map: {error}")))?;
+        .map_err(|error| NativeMemoryError::Unsupported(format!("prepared-map: {error}")))?;
     let mapped = unsafe {
         libc::mmap(
             address,
@@ -3895,7 +3918,7 @@ pub(super) fn map_prepared_region_extent(
     }
     if mapped != address {
         unsafe { libc::munmap(mapped, length) };
-        return Err(RuntimeError::Unsupported(format!(
+        return Err(NativeMemoryError::Unsupported(format!(
             "prepared-map: mmap region {region_index} returned {:p}, expected {:p}",
             mapped, address
         )));
@@ -3921,14 +3944,14 @@ pub(super) fn map_bytes_region(
     options: NativeByteRegionOptions,
     native_layout: &NativeLayout,
     rollback: &mut NativeMappingRollback,
-) -> Result<(), RuntimeError> {
+) -> Result<(), NativeMemoryError> {
     let NativeByteRegionOptions {
         final_prot,
         executable,
         exec_map_dsr_tid,
     } = options;
     let length = usize::try_from(length_u64).map_err(|_| {
-        RuntimeError::Unsupported(format!(
+        NativeMemoryError::Unsupported(format!(
             "native Darwin byte region too large: 0x{start:x}+0x{length_u64:x}"
         ))
     })?;
@@ -3936,7 +3959,7 @@ pub(super) fn map_bytes_region(
         return Ok(());
     }
     if bytes.len() > length {
-        return Err(RuntimeError::Unsupported(format!(
+        return Err(NativeMemoryError::Unsupported(format!(
             "native Darwin byte region payload too large: {} > {length}",
             bytes.len()
         )));
@@ -3944,7 +3967,7 @@ pub(super) fn map_bytes_region(
     let host_start = native_layout
         .address_mode()
         .to_host(carrick_guest_mem::GuestVa(start))
-        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+        .map_err(|error| NativeMemoryError::Unsupported(error.to_string()))?;
     let addr = host_start.raw() as *mut libc::c_void;
     native_exec_map_detail(
         exec_map_dsr_tid,
@@ -3957,7 +3980,7 @@ pub(super) fn map_bytes_region(
             length,
             libc::MAP_ANON | libc::MAP_NORESERVE | libc::MAP_PRIVATE,
         )
-        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+        .map_err(|error| NativeMemoryError::Unsupported(error.to_string()))?;
     let mapped = unsafe {
         libc::mmap(
             addr,
@@ -3975,7 +3998,7 @@ pub(super) fn map_bytes_region(
     }
     if mapped != addr {
         unsafe { libc::munmap(mapped, length) };
-        return Err(RuntimeError::Unsupported(format!(
+        return Err(NativeMemoryError::Unsupported(format!(
             "native Darwin mmap did not honor MAP_FIXED for byte region 0x{start:x}"
         )));
     }
@@ -4045,7 +4068,7 @@ pub(super) fn map_anonymous_region(
     rollback: &mut NativeMappingRollback,
 ) -> Result<(), RuntimeError> {
     let length = usize::try_from(length).map_err(|_| {
-        RuntimeError::Unsupported(format!(
+        NativeMemoryError::Unsupported(format!(
             "native Darwin anonymous region too large: 0x{start:x}+0x{length:x}"
         ))
     })?;
@@ -4055,7 +4078,7 @@ pub(super) fn map_anonymous_region(
     let host_start = native_layout
         .address_mode()
         .to_host(carrick_guest_mem::GuestVa(start))
-        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+        .map_err(|error| NativeMemoryError::Unsupported(error.to_string()))?;
     let addr = host_start.raw() as *mut libc::c_void;
     let share = if shared {
         libc::MAP_SHARED
@@ -4068,7 +4091,7 @@ pub(super) fn map_anonymous_region(
             length,
             libc::MAP_ANON | libc::MAP_NORESERVE | share,
         )
-        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+        .map_err(|error| NativeMemoryError::Unsupported(error.to_string()))?;
     let mapped = unsafe {
         libc::mmap(
             addr,
@@ -4083,13 +4106,15 @@ pub(super) fn map_anonymous_region(
         return Err(last_io_error(&format!(
             "mmap native Darwin anonymous region 0x{start:x}..0x{:x}",
             start.saturating_add(length as u64)
-        )));
+        ))
+        .into());
     }
     if mapped != addr {
         unsafe { libc::munmap(mapped, length) };
-        return Err(RuntimeError::Unsupported(format!(
+        return Err(NativeMemoryError::Unsupported(format!(
             "native Darwin mmap did not honor MAP_FIXED for anonymous region 0x{start:x}"
-        )));
+        ))
+        .into());
     }
     rollback.track_mapping(host_start, length);
     Ok(())
@@ -4130,9 +4155,9 @@ pub(super) const fn movz_x_lsl32(imm16: u16) -> u32 {
 pub(super) fn relocate_vdso_vvar_loads(
     region: &MemoryRegion,
     native_layout: &NativeLayout,
-) -> Result<(), RuntimeError> {
+) -> Result<(), NativeMemoryError> {
     let length = usize::try_from(region.len()).map_err(|_| {
-        RuntimeError::Unsupported(format!(
+        NativeMemoryError::Unsupported(format!(
             "native Darwin vDSO region is too large: 0x{:x}",
             region.len()
         ))
@@ -4140,7 +4165,7 @@ pub(super) fn relocate_vdso_vvar_loads(
     let base = native_layout
         .address_mode()
         .to_host(carrick_guest_mem::GuestVa(region.start))
-        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?
+        .map_err(|error| NativeMemoryError::Unsupported(error.to_string()))?
         .raw() as *mut u8;
     let canonical = movz_x_lsl32((carrick_mem::vdso::LINUX_VVAR_BASE >> 32) as u16);
     let relocated = movz_x_lsl32((NATIVE_DARWIN_VVAR_BASE >> 32) as u16);

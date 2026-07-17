@@ -168,6 +168,30 @@ impl HostVa {
     }
 }
 
+/// Resolved native page profile for a run — how Linux page semantics map
+/// onto the host's page size on the native (DSR) execution backend.
+///
+/// Relocated from `carrick-spec` (which re-exports it, so spec-side paths
+/// are unchanged) during the staged native-DSR extraction: the neutral
+/// page-geometry vocabulary in `carrick-dsr` embeds this leaf type, and
+/// carrick-dsr must stay off carrick-spec's heavyweight (oci-client/rustls)
+/// dependency graph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativePageProfile {
+    Native16k,
+    Linux4kOn16k,
+}
+
+/// The page-size triple a resolved native run executes under. See
+/// [`NativePageProfile`] for why this lives here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct NativePageGeometry {
+    pub host_page_size: u64,
+    pub linux_page_size: u64,
+    pub profile: NativePageProfile,
+}
+
 /// Fork-coherent host location for a guest `MAP_SHARED` futex word.
 ///
 /// [`SharedFutexLocation::Direct`] means the host address is the actual guest

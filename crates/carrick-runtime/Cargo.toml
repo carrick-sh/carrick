@@ -46,6 +46,14 @@ trace-hvf = ["carrick-vmm-hvf/trace-hvf"]
 trace-syscalls = ["carrick-vmm-hvf?/trace-syscalls", "carrick-observability/trace-syscalls"]
 debug-stats = ["carrick-vmm-hvf/debug-stats"]
 trace-elf = ["carrick-mem/trace-elf"]
+# Native test failpoints/captures (carrick_dsr::test_hooks). Never enabled by
+# production builds. This crate's own unit tests get the hook STATE through
+# the [dev-dependencies] re-declaration of carrick-dsr/carrick-dsr-aarch64
+# below (cargo feature unification applies dev-dep features to every test
+# target's dependency graph); the check sites in native_darwin compile under
+# `cfg(any(test, feature = "test-hooks"))`, so an external consumer can also
+# opt in explicitly via this forwarding feature.
+test-hooks = ["carrick-dsr/test-hooks", "carrick-dsr-aarch64/test-hooks"]
 
 # Platform backend selection (exactly one active at a time). carrick-cli's
 # `default` enables `platform-macos`; a `platform-linux` build links NO HVF.
@@ -136,3 +144,8 @@ carrick-test-support = { path = "../carrick-test-support" }
 tempfile.workspace = true
 carrick-image = { path = "../carrick-image" }
 proptest.workspace = true
+# The dev-dep feature-unification trick for the native test hooks: test
+# builds of this crate compile carrick-dsr WITH the hook state; production
+# consumers (carrick-cli) never enable it. See `test-hooks` in [features].
+carrick-dsr = { path = "../carrick-dsr", features = ["test-hooks"] }
+carrick-dsr-aarch64 = { path = "../carrick-dsr-aarch64", features = ["test-hooks"] }
