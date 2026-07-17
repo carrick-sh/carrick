@@ -309,19 +309,12 @@ pub enum NativePageProfileRequest {
     Linux4k,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum NativePageProfile {
-    Native16k,
-    Linux4kOn16k,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NativePageGeometry {
-    pub host_page_size: u64,
-    pub linux_page_size: u64,
-    pub profile: NativePageProfile,
-}
+// Relocated to `carrick-guest-mem` (see the note there) so the extracted
+// native-DSR crates can embed these leaf types without inheriting this
+// crate's oci-client/reqwest graph; re-exported so every
+// `carrick_spec::NativePageProfile` / `carrick_spec::NativePageGeometry`
+// path (CLI, engine, runtime) is unchanged.
+pub use carrick_guest_mem::{NativePageGeometry, NativePageProfile};
 
 /// `carrick run --pid <mode>` — which PID namespace the container runs in,
 /// mirroring `docker run --pid`. `Private` (the default) places the container

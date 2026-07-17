@@ -11,7 +11,17 @@ path = "src/lib.rs"
 [lints]
 workspace = true
 
+[features]
+default = []
+# Compiles in the native test-hook state (`src/test_hooks.rs`) for OTHER
+# crates' test builds. Cross-crate `cfg(test)` does not compose, so
+# carrick-runtime's [dev-dependencies] re-declare carrick-dsr with this
+# feature: cargo's feature unification turns the hooks on for runtime test
+# builds while production builds never see them.
+test-hooks = []
+
 [dependencies]
+carrick-abi = { path = "../carrick-abi" }
 carrick-guest-mem = { path = "../carrick-guest-mem" }
 carrick-host = { path = "../carrick-host" }
 carrick-mem = { path = "../carrick-mem" }

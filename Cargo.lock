@@ -425,6 +425,7 @@ dependencies = [
 name = "carrick-dsr"
 version = "0.1.0"
 dependencies = [
+ "carrick-abi",
  "carrick-guest-mem",
  "carrick-host",
  "carrick-mem",
@@ -659,6 +660,7 @@ name = "carrick-spec"
 version = "0.1.0"
 dependencies = [
  "camino",
+ "carrick-guest-mem",
  "clap",
  "oci-client",
  "serde",
