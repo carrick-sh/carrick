@@ -1,3 +1,119 @@
+# Native Backend Portability (FreeBSD/x86_64 bring-up) Handoff
+
+Date: 2026-07-17. Branch `main` (7 commits, `refactor(host)`..`refactor(runtime)`
+series). Session goal: bring the native (DSR) backend up on x86_64 + FreeBSD
+with clean seams — crate extraction, not scattered cfg's. Authoritative design:
+`docs/superpowers/specs/2026-07-17-native-backend-portability-seams-design.md`.
+
+## Honest status
+
+The EXTRACTION phase (M0.1–M0.5 of the design's ladder) is complete and
+committed. No FreeBSD-native execution exists yet — the x86_64 DSR lane
+(decode/emit/gateway) and the FreeBSD host crate are still ahead (M0.6–M0.9,
+then M1–M3). The reference macOS/AArch64 lane is believed behavior-identical
+but is NOT yet verified on a mac: **the first act of the next macOS session
+must be `just ci` + a signed conformance smoke** (this rig cannot compile the
+platform-macos arm: no Apple SDK for `ring`, and `usdt` 0.6.0 bakes host-arch
+registers into probe asm).
+
+What exists now:
+
+- `carrick-dsr` — platform-neutral DSR core (48 tests green on FreeBSD):
+  translation cache + publication behind the `NativeHostJit` trait
+  (`JitRegion {exec_base, write_base}` accommodates Darwin's per-thread
+  MAP_JIT toggle AND a dual-mapped RW/RX host with zero cfg at call sites),
+  profiling census, page-geometry vocabulary, probe-sink seam (usdt-free —
+  ordinal-exact mirrored enums, runtime installs a forwarder), test-hooks
+  feature (dev-dep unification trick), NativeMemoryError boundary.
+- `carrick-dsr-aarch64` — the whole AArch64 translator (81 tests green on
+  FreeBSD — first non-Darwin execution of any of them): decode (bad64),
+  block planner + exclusive fusion, emitter (dynasmrt), gateway + .S (ONE
+  cfg boundary; fail-closed off-lane), counter virtualization, artifact
+  store, NativeUcontextSnapshot, NativeMappedMemory + ProcessTranslator
+  (mm embeds the translator — that entanglement is WHY it's in the arch
+  crate; purity deferred), emulation blobs, prepared-image schema.
+  bad64/dynasmrt are unconditional deps (pure Rust) so the crate compiles
+  and unit-tests on every host.
+- carrick-runtime keeps integration glue (thread loop, dispatch adapter,
+  signal lowering, exec capsule, oracle + JIT-entangled test suites) behind
+  re-export shims; `darwin_jit.rs` holds the transitional DarwinHostJit.
+- platform-freebsd census: 432 errors at session start -> **24 lib errors**,
+  all of them the M0.8 integration tail: native_exec_capsule (12+2, macOS
+  module gate), host_signal stub gaps (publish_process_signal_with_wake,
+  install_default_handlers, hold_signal_locks_for_fork), vcpu_kick ×2,
+  threaded_impl, HostFsBackend::attach_for_reexec (cfg(macos), is POSIX),
+  and 4 pre-existing FreeBSD type-width E0308s (dispatch/proc ×2, sysv,
+  vfs/proc).
+
+## Exact next steps (the ladder's remaining rungs)
+
+1. **macOS verification of the extraction** (BLOCKING for reference-lane
+   claims): `just ci`, then a signed native16k conformance smoke. Watch the
+   runtime's native test module (mechanical path edits landed there that
+   this rig cannot compile) and the moved-test parity (oracle 49 + emit
+   ~1900-line suites stayed runtime-side on purpose).
+2. **M0.6** — carrick-native-darwin host crate: move csrc/native_darwin.c
+   byte-identical + DarwinHostJit + custom-x18 ABI + commpage/mach clock
+   glue out of the runtime. This unblocks moving the oracle/emit test
+   suites into the arch crate.
+3. **M0.7** — carrick-native-freebsd skeleton (dual-mapped RW/RX JIT impl —
+   real; sigaction trap shim reading FreeBSD amd64 mcontext — skeleton;
+   SIGPIPE+atomic kick transport is portable POSIX, reuse nearly verbatim)
+   + carrick-dsr-x86 skeleton (iced-x86 decode + dynasmrt x64, typed
+   Unsupported until M2).
+4. **M0.8** — runtime lane seam: native_darwin -> native, ONE cfg'd lane
+   alias; ExecutionBackend::NativeDarwin -> Native; page_profile gate
+   becomes a capability table keyed (host os, arch, page geometry) —
+   FreeBSD/amd64 is uniform 4k/4k, NO composed-16k machinery; un-gate the
+   exec capsule (it is plain POSIX: fork + execve + fd inheritance, no
+   mach); fix the 24-error tail (the three host_signal fns, vcpu_kick /
+   threaded_impl mirrors, attach_for_reexec un-gate, 4 type-width casts).
+5. **M0.9** — gates: platform-freebsd cargo build green, freebsd clippy
+   green, `just check-matrix`, handoff update.
+6. **M1..M3** (design doc): FreeBSD host layer live (trap transport +
+   fsbase swap discipline — the x86 TPIDR/x18 analog), then minimal x86_64
+   DSR (variable-length planner via decoder-reported lengths; sensitive
+   catalog syscall/int80/rdtsc(p)/cpuid/wrfsbase-gsbase; lock-prefixed
+   atomics copy through natively — NO fusion apparatus), then lifecycle
+   parity + a `FreebsdNativeLocal` conformance lane. The Docker oracle on
+   this box runs native amd64 — a real x86 oracle, which macOS never had.
+
+## Rig facts and hazards (this FreeBSD box)
+
+- Toolchain: FreeBSD-native rustc 1.96.0 with aarch64-apple-darwin std
+  installed. Darwin cross-`check` works ONLY for ring/usdt-free crates —
+  carrick-dsr and carrick-dsr-aarch64 are kept that way ON PURPOSE (the
+  probe sink exists for this). Both were cross-checked clean, including
+  cross-assembling gateway_aarch64.S to arm64 Mach-O.
+- **Linuxulator path-shadow hazard (cost this session real time):** Claude
+  Code runs under the Linuxulator; when `/compat/linux/root/carrick`
+  exists, Linux-side absolute paths to `/root/carrick` resolve INTO that
+  shadow (harness file-writes to top-level repo files can land there, and
+  a shell `cd /root/carrick` silently enters it, breaking git). Fix: anchor
+  every shell command with `cd -P /rescue/../root/carrick` and verify
+  writes with `git status`; ground-truth the filesystem with FreeBSD-native
+  `/rescue/ls` when in doubt. The harness auto-recreates
+  `/compat/linux/root/carrick/.claude`; do not fight it, just avoid
+  harness-side writes to TOP-LEVEL repo files (nested crate paths have
+  been safe empirically).
+- `_umtx_op` futex, `fcntl(F_KINFO)`, kqueue all work from this shell.
+- FreeBSD mmap ignores exact non-MAP_FIXED hints (empirically +13.6 MiB
+  off) — the M1 FreeBSD lane must probe placement with MAP_FIXED|MAP_EXCL
+  through the host seam (address.rs tests for hint-honoring are
+  cfg(macos) with this documented).
+
+## Verification discipline used (keep it)
+
+Every slice: carrick-dsr/-aarch64 build+test on FreeBSD, darwin cross-check
+of both, platform-freebsd error census strictly non-increasing with the
+before/after class table in the commit message, `cargo fmt --all`. Pure
+moves verified by rename detection; behavior deltas called out explicitly
+(host-errno diagnostic in alias-pread; transitional pub/#[doc(hidden)]
+arch internals; ThreadBudget/for_test un-gating). Subagent claims were
+re-verified independently before each commit.
+
+---
+
 # Native Backend Performance & Correctness Handoff
 
 Date: 2026-07-16. Branch `codex/biased-exclusive-fusion-coverage` (this baton lands on
