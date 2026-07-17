@@ -469,6 +469,7 @@ dependencies = [
  "carrick-guest-mem",
  "carrick-native-freebsd",
  "cc",
+ "goblin",
  "iced-x86",
  "libc",
  "thiserror",
