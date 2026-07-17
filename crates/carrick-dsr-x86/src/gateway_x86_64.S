@@ -97,6 +97,18 @@ carrick_dsr_x86_exit_sensitive:
     movl $6, CTX_EXIT_STATUS(%r15)   // X86ExitStatus::Sensitive
     jmp carrick_dsr_x86_exit_common
 
+// Guest-fault exit: the host signal shim rewrites the interrupted context's
+// RIP to land here, so sigreturn "resumes" at this stub with the guest's
+// registers live (r15 still == ctx) and the fault already recorded in the
+// context's FaultRecord. The shared tail then captures guest state exactly
+// like any other exit. NOTE: snapshot.rip gets the per-block exit_resume —
+// the FaultRecord's host_rip is the authoritative fault location.
+.globl carrick_dsr_x86_exit_signal
+.p2align 4
+carrick_dsr_x86_exit_signal:
+    movl $4, CTX_EXIT_STATUS(%r15)   // X86ExitStatus::Signal
+    jmp carrick_dsr_x86_exit_common
+
 .globl carrick_dsr_x86_exit_common
 carrick_dsr_x86_exit_common:
     // Save guest GPRs (movs preserve flags). Skip r15 (== ctx).

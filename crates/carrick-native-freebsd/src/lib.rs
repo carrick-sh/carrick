@@ -1,18 +1,19 @@
 //! `carrick-native-freebsd` — the FreeBSD/amd64 host layer for the native
 //! (DSR) backend.
 //!
-//! First rung (M0.7 of the seams design,
-//! docs/superpowers/specs/2026-07-17-native-backend-portability-seams-design.md):
-//! the REAL dual-mapped W^X JIT backend. The trap transport (sigaction shim
-//! reading the amd64 `mcontext_t`), the SIGPIPE kick plumbing, and the
-//! fsbase-swap discipline land with M1 once the x86 gateway design exists to
-//! consume them; nothing here speculates their shapes.
+//! Two rungs of the seams design
+//! (docs/superpowers/specs/2026-07-17-native-backend-portability-seams-design.md)
+//! live here: the dual-mapped W^X JIT backend (M0.7) and the guest-fault
+//! shim ([`fault`]) that turns SIGSEGV/SIGBUS/SIGFPE/SIGILL inside the code
+//! cache into typed gateway `Signal` exits. The SIGPIPE kick plumbing lands
+//! with the runtime thread loop.
 //!
 //! The whole crate is FreeBSD-only by construction; other targets compile it
 //! to nothing (same `#![cfg]` pattern as `carrick-host-bsd`).
 
 #![cfg(target_os = "freebsd")]
 
+pub mod fault;
 pub mod jit;
 
 pub use jit::FreebsdHostJit;

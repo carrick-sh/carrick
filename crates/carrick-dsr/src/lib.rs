@@ -30,6 +30,7 @@
 
 pub mod address;
 pub mod cache;
+pub mod fault;
 pub mod host;
 pub mod ids;
 pub mod native_error;

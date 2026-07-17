@@ -144,6 +144,13 @@ pub struct X86DsrContext {
     /// (written by the enter trampoline via `rdfsbase`, read back by the exit
     /// stubs). Only meaningful while `guest_fsbase != 0`.
     pub host_fsbase: u64,
+    /// Where the host-OS seam's signal shim records a guest fault before
+    /// redirecting to the signal exit stub (see `carrick_dsr::fault`). Only
+    /// meaningful when the gateway returns [`X86ExitStatus::Signal`]; note
+    /// `snapshot.rip` holds the per-block `exit_resume` then, NOT the fault
+    /// point — [`FaultRecord::host_rip`](carrick_dsr::fault::FaultRecord)
+    /// is authoritative.
+    pub fault: carrick_dsr::fault::FaultRecord,
 }
 
 /// Byte offset of [`X86DsrContext::exit_syscall_addr`] for `jmp *disp(%r15)`.
@@ -164,6 +171,9 @@ pub const CTX_HOST_FSBASE: i32 = 784;
 /// Byte offset of the virtualized guest `%r15` slot inside the snapshot
 /// (`gpr[15]`): the emitter's r15-rename loads/stores it directly.
 pub const SNAP_GUEST_R15: i32 = 120;
+/// Byte offset of [`X86DsrContext::fault`] — handed to the host-OS seam's
+/// signal shim, which writes the record through `r15 + CTX_FAULT_RECORD`.
+pub const CTX_FAULT_RECORD: u32 = 792;
 /// Byte offset of [`X86DsrContext::entry`] (unused by emitted code — the
 /// trampoline reads it — but asserted for parity with the `.S`).
 pub const CTX_ENTRY: i32 = 712;
@@ -185,6 +195,7 @@ impl X86DsrContext {
             scratch2: 0,
             guest_fsbase: 0,
             host_fsbase: 0,
+            fault: carrick_dsr::fault::FaultRecord::new(),
         }
     }
 }
@@ -214,6 +225,7 @@ const _: () = assert!(
     std::mem::offset_of!(X86UcontextSnapshot, gpr) + 15 * 8 == SNAP_GUEST_R15 as usize,
     "the emitter's r15 rename addresses gpr[15] directly"
 );
+const _: () = assert!(std::mem::offset_of!(X86DsrContext, fault) as u32 == CTX_FAULT_RECORD);
 const _: () =
     assert!(std::mem::offset_of!(X86DsrContext, exit_syscall_addr) as i32 == CTX_EXIT_SYSCALL_ADDR);
 const _: () = assert!(std::mem::offset_of!(X86DsrContext, entry) as i32 == CTX_ENTRY);
@@ -249,6 +261,14 @@ mod native_gateway {
         fn carrick_dsr_x86_exit_syscall();
         fn carrick_dsr_x86_exit_indirect();
         fn carrick_dsr_x86_exit_sensitive();
+        fn carrick_dsr_x86_exit_signal();
+    }
+
+    /// Absolute address of the signal exit stub — what the host-OS seam's
+    /// fault shim installs as the redirected RIP after recording a guest
+    /// fault (paired with [`super::CTX_FAULT_RECORD`]).
+    pub fn signal_stub_addr() -> u64 {
+        carrick_dsr_x86_exit_signal as *const () as u64
     }
 
     /// Absolute addresses of the three exit stubs. Emitted code branches to
@@ -283,7 +303,7 @@ mod native_gateway {
 }
 
 #[cfg(target_arch = "x86_64")]
-pub use native_gateway::{enter_translated, exit_stub_addresses};
+pub use native_gateway::{enter_translated, exit_stub_addresses, signal_stub_addr};
 
 /// Off-x86 fail-closed complement: the gateway only exists on x86_64. This
 /// keeps the crate compiling (and unit-testable) on other host arches, where
