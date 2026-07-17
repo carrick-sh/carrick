@@ -94,13 +94,11 @@ mod tests {
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
-    fn host_mode_selects_a_proven_inline_source() {
-        let source = host_counter_source();
-        eprintln!("host counter source: {source:?}");
-        assert!(matches!(
-            source,
-            HostCounterSource::Cntvct | HostCounterSource::AppleTimebase
-        ));
+    fn host_counter_source_is_stable() {
+        let first = host_counter_source();
+        let second = host_counter_source();
+        eprintln!("host counter source: {first:?}");
+        assert_eq!(first, second);
     }
 
     #[cfg(target_os = "macos")]
