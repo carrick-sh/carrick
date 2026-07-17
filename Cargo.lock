@@ -587,6 +587,7 @@ dependencies = [
  "goblin",
  "hickory-proto",
  "libc",
+ "mach2",
  "oci-client",
  "parking_lot",
  "parking_lot_core",
