@@ -1,0 +1,18 @@
+[package]
+name = "carrick-dsr-x86"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "carrick_dsr_x86"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+carrick-dsr = { path = "../carrick-dsr" }
+carrick-guest-mem = { path = "../carrick-guest-mem" }
+iced-x86.workspace = true
+thiserror.workspace = true
