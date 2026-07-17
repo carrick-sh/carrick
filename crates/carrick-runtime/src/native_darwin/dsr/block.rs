@@ -387,17 +387,16 @@ pub(super) fn plan_block(
     generation: CodeGeneration,
     max_instructions: usize,
 ) -> Result<BlockPlan, DsrError> {
-    // Direct mode keeps its existing fused execution. Biased execution fuses
-    // only candidates with a complete scratch plan. Its emitted recovery map
-    // resumes every architectural instruction and resolved edge at the exact
-    // guest boundary; the signal gateway clears the physical exclusive monitor
-    // before restoring scratch state, so an interrupted store naturally fails
-    // and follows the guest's retry edge without rolling back captured guest
-    // registers or NZCV.
+    // Direct mode keeps its existing fused execution. Biased execution stays
+    // fail-closed until forced asynchronous recovery proves that every guest
+    // register and NZCV mutation in an accepted region can be rolled back.
+    // The disabled policy still measures eligible sites and exercises the
+    // typed emitter in focused tests without exposing incomplete recovery to
+    // production guests.
     let fusion_policy = match memory.address_mode() {
         super::super::address::NativeAddressMode::Direct => ExclusiveFusionPolicy::Direct,
         super::super::address::NativeAddressMode::Biased { .. } => {
-            ExclusiveFusionPolicy::BiasedEnabled
+            ExclusiveFusionPolicy::BiasedDisabled
         }
     };
     plan_with_reader(
@@ -1817,17 +1816,17 @@ mod tests {
         }
 
         #[test]
-        fn production_biased_exclusive_planner_fuses_only_safe_scratch_candidates() {
+        fn production_biased_exclusive_planner_records_only_safe_scratch_candidates() {
             let start = GuestVa(0x21_0000_0000);
             let eligible = plan_biased_memory_via_production(&canonical_cas(start));
             assert!(matches!(
                 eligible.exit,
-                PlannedExit::ExclusiveRegion {
-                    fusion: ExclusiveFusionSite {
-                        disposition: ExclusiveFusionDisposition::FusedBiased,
+                PlannedExit::Sensitive {
+                    fusion: Some(ExclusiveFusionSite {
+                        disposition: ExclusiveFusionDisposition::EligibleBackendDisabled,
                         biased_scratch: Some(_),
                         ..
-                    },
+                    }),
                     ..
                 }
             ));
@@ -1862,7 +1861,7 @@ mod tests {
         }
 
         #[test]
-        fn production_biased_planner_fuses_audited_go_atomic_alu_bodies() {
+        fn production_biased_planner_records_audited_go_atomic_alu_bodies() {
             let start = GuestVa(0x21_0000_0000);
             let cases = [
                 ("add", 0x8b01_0042), // add x2, x2, x1
@@ -1878,17 +1877,17 @@ mod tests {
                     encode_cbnz_w(GuestVa(start.raw() + 12), start, 3),
                 ];
                 let plan = plan_biased_memory_via_production(&words);
-                let PlannedExit::ExclusiveRegion {
+                let PlannedExit::Sensitive {
                     fusion:
-                        ExclusiveFusionSite {
-                            disposition: ExclusiveFusionDisposition::FusedBiased,
+                        Some(ExclusiveFusionSite {
+                            disposition: ExclusiveFusionDisposition::EligibleBackendDisabled,
                             biased_scratch: Some(scratch),
                             ..
-                        },
+                        }),
                     ..
                 } = plan.exit
                 else {
-                    panic!("Go atomic {name} body did not retain a safe biased scratch plan");
+                    panic!("Go atomic {name} body did not record a safe biased scratch plan");
                 };
                 for used in [0, 1, 2, 3, 4, 27] {
                     assert_ne!(scratch.address.index(), used, "{name} address scratch");
