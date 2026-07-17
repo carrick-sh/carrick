@@ -3284,6 +3284,10 @@ fn emit_block_inner(
             }
             InstAction::Syscall { .. }
             | InstAction::Sensitive(_)
+            // Counter lowering is owned by the next task. The planner keeps
+            // proved host sources inline now, while this staging arm rejects
+            // emission until their recovery-aware sequence exists.
+            | InstAction::CounterRead(_)
             // `plan.instructions` never contains this today: block.rs's
             // exclusive-region recogniser (Task 1 of the fusion plan) is not
             // yet wired into `plan_block`, and even once it is, the region's
