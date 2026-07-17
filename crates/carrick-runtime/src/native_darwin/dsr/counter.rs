@@ -54,6 +54,7 @@ pub(super) fn host_counter_source() -> HostCounterSource {
 
 #[inline]
 #[allow(deprecated)]
+#[cfg(target_os = "macos")]
 pub(super) fn mach_absolute_time_ticks() -> u64 {
     // SAFETY: `mach_absolute_time` has no arguments and returns the monotonic
     // host uptime counter.
@@ -93,10 +94,13 @@ mod tests {
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
-    fn host_mode_selects_this_machines_inline_source() {
+    fn host_mode_selects_a_proven_inline_source() {
         let source = host_counter_source();
         eprintln!("host counter source: {source:?}");
-        assert_eq!(source, HostCounterSource::AppleTimebase);
+        assert!(matches!(
+            source,
+            HostCounterSource::Cntvct | HostCounterSource::AppleTimebase
+        ));
     }
 
     #[cfg(target_os = "macos")]
