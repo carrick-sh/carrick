@@ -47,16 +47,27 @@ pub mod reg {
 }
 
 impl X86UcontextSnapshot {
-    /// A zeroed snapshot with the default rflags (bit 1 is reserved-1). A
-    /// caller sets `rip`, `gpr[RSP]`, and argument registers before entry.
+    /// A snapshot with Linux's initial register/FPU state. A caller sets `rip`,
+    /// `gpr[RSP]`, and argument registers before entry.
     pub fn new() -> Self {
+        // The gateway `fxrstor`s this area on entry, so it must hold a VALID
+        // initial FXSAVE image, not zeros: a zeroed image sets `FCW=0` and
+        // `MXCSR=0`, which UNMASKS every x87/SSE exception and picks
+        // round-to-nearest-with-wrong-flags — a guest's first FP/SSE op would
+        // then trap or misbehave. Linux hands a fresh process `FCW=0x037F`
+        // (all exceptions masked, 64-bit precision, round-to-nearest) and
+        // `MXCSR=0x1F80` (all SSE exceptions masked). FXSAVE layout: FCW at
+        // byte 0, MXCSR at byte 24.
+        let mut fxsave = [0u8; 512];
+        fxsave[0..2].copy_from_slice(&0x037Fu16.to_le_bytes());
+        fxsave[24..28].copy_from_slice(&0x0000_1F80u32.to_le_bytes());
         Self {
             gpr: [0; 16],
             rip: 0,
             // EFLAGS bit 1 is always set; everything else clear (IF is not
             // meaningful at CPL 3 and the guest never observes it).
             rflags: 0x0000_0000_0000_0002,
-            fxsave: [0; 512],
+            fxsave,
         }
     }
 }
@@ -161,13 +172,17 @@ pub struct X86DsrContext {
     /// save/restore.
     pub save_fpu: u32,
     pub save_fpu_pad: u32,
-    /// Set by a chainable branch's COLD stub to the absolute address of the
-    /// 4-byte rel32 field of the patchable `jmp` that reached it (see
-    /// `emit::emit_block_linked`). When nonzero after an `Indirect` exit, the
-    /// run loop is at a CHAIN MISS: `snapshot.rip` holds the (already resolved)
-    /// target guest VA, and the loop translates it and patches the rel32 at
-    /// this address to jump straight there next time. Zero on a genuine
-    /// indirect branch. The driver clears it before every enter.
+    /// A CHAIN-MISS flag, set nonzero by a chainable branch's COLD stub (see
+    /// `emit::emit_block_linked`). When nonzero after an `Indirect` exit the
+    /// run loop is at a chain miss — `snapshot.rip` holds the already-resolved
+    /// successor guest VA, so the loop just continues there (and its
+    /// `pending`-edge registry patches the missed slot when that VA is
+    /// translated). Zero on a genuine indirect branch (`jmp/call r/m`), which
+    /// the loop resolves from the snapshot instead. The driver clears it before
+    /// every enter. The stub records the patch-site ADDRESS here (not just a
+    /// bare 1) so the value is also usable for diagnostics or a future
+    /// direct-patch path; the run loop currently consults only its
+    /// nonzero-ness.
     pub chain_patch_site: u64,
 }
 
@@ -349,4 +364,29 @@ pub use native_gateway::{enter_translated, exit_stub_addresses, signal_stub_addr
 #[cfg(not(target_arch = "x86_64"))]
 pub unsafe fn enter_translated(_context: &mut X86DsrContext) -> i32 {
     -1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn initial_snapshot_seeds_linux_fpu_control_words() {
+        // A fresh snapshot's fxsave image must carry Linux's initial FP control
+        // state, since the gateway fxrstors it before the guest's first FP/SSE
+        // op. FCW at byte 0 = 0x037F; MXCSR at byte 24 = 0x1F80.
+        let s = X86UcontextSnapshot::new();
+        assert_eq!(
+            u16::from_le_bytes([s.fxsave[0], s.fxsave[1]]),
+            0x037F,
+            "FCW"
+        );
+        assert_eq!(
+            u32::from_le_bytes([s.fxsave[24], s.fxsave[25], s.fxsave[26], s.fxsave[27]]),
+            0x1F80,
+            "MXCSR"
+        );
+        // The rest of the image (FSW, tag word, ST/XMM regs) stays zeroed.
+        assert!(s.fxsave[28..].iter().all(|&b| b == 0));
+    }
 }
