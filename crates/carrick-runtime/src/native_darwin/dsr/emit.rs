@@ -11,6 +11,10 @@
 //! until the host-seam slice (M0.6). The pure assembler-shape test moved
 //! with the emitter; `copy_plan` is duplicated on both sides.
 
+// `allow(unused_imports)`: the runtime LIB no longer names `dsr::emit::*`
+// since the translator orchestration moved to the arch crate; the re-export
+// stays for the oracle and the emitter test suite below.
+#[allow(unused_imports)]
 pub(in crate::native_darwin) use carrick_dsr_aarch64::emit::*;
 
 #[cfg(test)]

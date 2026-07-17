@@ -1,6 +1,6 @@
 # Carrick Crate Map
 
-Carrick is a 25-crate Cargo workspace. The product path is:
+Carrick is a 27-crate Cargo workspace. The product path is:
 
 ```text
 carrick-cli -> carrick-engine -> { carrick-image, carrick-runtime } -> carrick-spec
@@ -52,6 +52,13 @@ Platform code is selected by Cargo features. The default feature is
 | `carrick-vmm-nvmm` | NetBSD/NVMM backend; x86_64 lane through the shared x86 engine plus NVMM-specific host/VMM glue. |
 | `carrick-x86` | Shared x86_64 engine: long-mode bring-up, register/snapshot model, fault tables, VDSO helpers, generic `X86EngineCore<V>`. |
 | `carrick-aarch64` | Shared AArch64 engine (`Aarch64EngineCore`) used by the HVF AArch64 path (and shared with the KVM AArch64 lane). |
+
+## Native (DSR) Backend
+
+| Crate | Role |
+| --- | --- |
+| `carrick-dsr` | Platform-neutral DSR core: translation cache + publication behind the `NativeHostJit` seam, profiling census, page-geometry vocabulary, probe-sink seam, test hooks. Deliberately `ring`/`usdt`-free (darwin-cross-checkable from a non-mac rig). |
+| `carrick-dsr-aarch64` | AArch64 guest-ISA lane: bad64/dynasmrt decode + emit, block planner + exclusive fusion, gateway (`gateway_aarch64.S`), counter virtualization, artifact store, mapped memory + translator. Compiles on every host; only the gateway's assembled surface is macos/aarch64-gated. |
 
 ## Test and Harness Support
 

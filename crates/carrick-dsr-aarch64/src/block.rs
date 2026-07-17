@@ -2069,3 +2069,43 @@ mod tests {
         }
     }
 }
+
+/// Plan a block by reading guest words through the live memory model.
+///
+/// Moved from the runtime's `dsr::block` shim once `NativeMappedMemory`
+/// arrived in this crate: it composes the pure `plan_with_reader` core with
+/// the memory-reader closure and the address-mode fusion policy.
+pub fn plan_block(
+    memory: &crate::mapped_memory::NativeMappedMemory,
+    start: carrick_guest_mem::GuestVa,
+    generation: crate::types::CodeGeneration,
+    max_instructions: usize,
+) -> Result<BlockPlan, crate::types::DsrError> {
+    // Direct mode keeps its existing fused execution. Biased execution stays
+    // fail-closed until forced asynchronous recovery proves that every guest
+    // register and NZCV mutation in an accepted region can be rolled back.
+    // The disabled policy still measures eligible sites and exercises the
+    // typed emitter in focused tests without exposing incomplete recovery to
+    // production guests.
+    let fusion_policy = match memory.address_mode() {
+        carrick_dsr::address::NativeAddressMode::Direct => ExclusiveFusionPolicy::Direct,
+        carrick_dsr::address::NativeAddressMode::Biased { .. } => {
+            ExclusiveFusionPolicy::BiasedDisabled
+        }
+    };
+    plan_with_reader(
+        start,
+        generation,
+        max_instructions,
+        memory.linux_page_size,
+        fusion_policy,
+        |pc| {
+            memory
+                .read_u32(pc.raw())
+                .map_err(|error| crate::types::DsrError::MemoryRead {
+                    pc: pc.raw(),
+                    detail: error.to_string(),
+                })
+        },
+    )
+}

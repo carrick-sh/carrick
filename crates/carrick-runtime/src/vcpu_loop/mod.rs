@@ -364,11 +364,15 @@ pub(crate) use quiesce::{fork_barrier, pt_barrier};
 use signal::deliver_fault_signal;
 pub(crate) use signal::is_default_ignore_signal;
 pub(crate) use signal::{
-    FaultSignalDisposition, deliver_pending_signal, el0_debug_signal, inject_fault_signal,
-    lower_el0_fault, partial_write_interrupt_outcome, raise_sigpipe_for_blocking_write,
-    signal_progress_count, signal_wait_expired, signal_wait_remaining, signal_wait_slice,
-    upgrade_protection_si_code,
+    FaultSignalDisposition, deliver_pending_signal, inject_fault_signal, lower_el0_fault,
+    partial_write_interrupt_outcome, raise_sigpipe_for_blocking_write, signal_progress_count,
+    signal_wait_expired, signal_wait_remaining, signal_wait_slice, upgrade_protection_si_code,
 };
+// Test-only consumer since the DSR translator (the lib-side caller) moved to
+// the arch crate; the ESR decode itself lives in carrick_dsr_aarch64::esr and
+// signal.rs re-exports it.
+#[cfg(test)]
+use signal::el0_debug_signal;
 
 // ===================================================================
 // Cross-platform kernel-half state.
