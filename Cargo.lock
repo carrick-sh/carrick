@@ -625,6 +625,7 @@ dependencies = [
  "carrick-abi",
  "carrick-dsr",
  "carrick-dsr-aarch64",
+ "carrick-dsr-x86",
  "carrick-guest-mem",
  "carrick-hal",
  "carrick-host",
