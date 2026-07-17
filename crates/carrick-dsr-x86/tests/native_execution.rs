@@ -194,6 +194,164 @@ fn translated_x86_guest_writes_and_exits_natively() {
     }
 }
 
+/// Assemble a guest that reaches its data ONLY through RIP-relative
+/// addressing: `lea rsi, [rip+d1]` for the message pointer and
+/// `mov edx, [rip+d2]` for the length stored in the data page. Verbatim
+/// copy-through would compute both against the JIT-cache RIP and read
+/// garbage; only the absolute-VA rewrite makes this guest work.
+///
+/// `code_base` is the guest VA of the first instruction; `msg_va`/`len_va`
+/// are absolute VAs inside the mapped data page. The caller picks `code_base`
+/// near the data page so the disp32s fit (as a real loaded image would).
+fn guest_rip_relative_program(code_base: u64, msg_va: u64, len_va: u64, write_fd: u64) -> Vec<u8> {
+    let mut c = Vec::new();
+    let rel32 = |target: u64, next_ip: u64| -> [u8; 4] {
+        let disp = target.wrapping_sub(next_ip) as i64 as i32;
+        assert_eq!(
+            next_ip.wrapping_add(disp as i64 as u64),
+            target,
+            "test layout must keep RIP-relative displacements in i32 range"
+        );
+        disp.to_le_bytes()
+    };
+    // lea rsi, [rip+d1]    (48 8d 35 d1) — message pointer
+    let next_ip = code_base + c.len() as u64 + 7;
+    c.extend_from_slice(&[0x48, 0x8d, 0x35]);
+    c.extend_from_slice(&rel32(msg_va, next_ip));
+    // mov edx, [rip+d2]    (8b 15 d2) — length loaded FROM guest memory
+    let next_ip = code_base + c.len() as u64 + 6;
+    c.extend_from_slice(&[0x8b, 0x15]);
+    c.extend_from_slice(&rel32(len_va, next_ip));
+    // mov edi, write_fd; mov eax, write; syscall
+    c.extend_from_slice(&[0xbf]);
+    c.extend_from_slice(&(write_fd as u32).to_le_bytes());
+    c.extend_from_slice(&[0xb8]);
+    c.extend_from_slice(&(SYS_WRITE as u32).to_le_bytes());
+    c.extend_from_slice(&[0x0f, 0x05]);
+    // exit_group(9)
+    c.extend_from_slice(&[0xbf, 0x09, 0x00, 0x00, 0x00]);
+    c.extend_from_slice(&[0xb8]);
+    c.extend_from_slice(&(SYS_EXIT_GROUP as u32).to_le_bytes());
+    c.extend_from_slice(&[0x0f, 0x05]);
+    c
+}
+
+#[test]
+fn translated_x86_guest_reaches_data_rip_relatively() {
+    let jit = FreebsdHostJit;
+    jit.supported().expect("host JIT supported");
+    let region = jit.map_code_cache(64 * 1024).expect("map code cache");
+
+    // Data page: "ok\n" at +0, the write length (3u32) at +8. The guest reads
+    // BOTH through RIP-relative operands.
+    let data = map_rw(4096);
+    let msg = b"ok\n";
+    unsafe {
+        std::ptr::copy_nonoverlapping(msg.as_ptr(), data, msg.len());
+        std::ptr::write_unaligned(data.add(8).cast::<u32>(), msg.len() as u32);
+    }
+    let msg_va = data as u64;
+    let len_va = data as u64 + 8;
+
+    let mut fds = [0i32; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+    let (read_fd, write_fd) = (fds[0], fds[1]);
+
+    let stack = map_rw(64 * 1024);
+    let stack_top = stack as u64 + 64 * 1024;
+
+    // Guest code VA near the data page (like a loaded image's text next to
+    // its rodata) so the rel32 displacements are representable. The code VA
+    // itself needs no mapping — it is only the translation-source coordinate.
+    let guest_code_base = msg_va.wrapping_sub(0x10_000);
+    let program = guest_rip_relative_program(guest_code_base, msg_va, len_va, write_fd as u64);
+    let read_guest = |va: u64| -> Vec<u8> {
+        let off = va.wrapping_sub(guest_code_base) as usize;
+        program.get(off..).map(|s| s.to_vec()).unwrap_or_default()
+    };
+
+    let mut cursor = 0usize;
+    let translate = |guest_va: u64, cursor: &mut usize| -> (u64, X86Exit) {
+        let block = plan_block(guest_va, 256, 4096, read_guest).expect("plan");
+        let src = read_guest(block.start);
+        let end_off = (block.end - block.start) as usize;
+        let translated = emit_block(&src[..end_off.min(src.len())], &block).expect("emit");
+        let exec = unsafe { region.exec_base.as_ptr().add(*cursor) };
+        let write = region.write_ptr_for(exec).expect("write alias");
+        unsafe {
+            std::ptr::copy_nonoverlapping(translated.as_ptr(), write, translated.len());
+        }
+        jit.flush_icache(exec, translated.len());
+        *cursor += translated.len();
+        (exec as u64, block.exit)
+    };
+
+    let mut snapshot = X86UcontextSnapshot::new();
+    snapshot.gpr[reg::RSP] = stack_top;
+    let mut next_guest_va = guest_code_base;
+    let mut exit_code: Option<i32> = None;
+
+    for _ in 0..8 {
+        let (exec, exit) = translate(next_guest_va, &mut cursor);
+        let resume = match exit {
+            X86Exit::Syscall { resume, .. } => resume,
+            other => panic!("rip-relative guest produced non-syscall exit: {other:?}"),
+        };
+
+        let mut ctx = X86DsrContext::new(snapshot, exec, resume);
+        // SAFETY: `exec` holds a freshly translated block ending in the
+        // syscall exit stub; rsp is a valid guest stack.
+        let raw = unsafe { carrick_dsr_x86::enter_translated(&mut ctx) };
+        assert_eq!(X86ExitStatus::from_raw(raw), Some(X86ExitStatus::Syscall));
+        snapshot = ctx.snapshot;
+
+        match snapshot.gpr[reg::RAX] {
+            SYS_WRITE => {
+                assert_eq!(
+                    snapshot.gpr[reg::RSI],
+                    msg_va,
+                    "lea rsi, [rip+d] must materialize the ABSOLUTE message VA"
+                );
+                assert_eq!(
+                    snapshot.gpr[reg::RDX],
+                    msg.len() as u64,
+                    "mov edx, [rip+d] must load the length from guest memory"
+                );
+                let n = unsafe {
+                    libc::write(
+                        snapshot.gpr[reg::RDI] as i32,
+                        snapshot.gpr[reg::RSI] as *const libc::c_void,
+                        snapshot.gpr[reg::RDX] as usize,
+                    )
+                };
+                assert!(n >= 0, "host write: {}", std::io::Error::last_os_error());
+                snapshot.gpr[reg::RAX] = n as u64;
+                next_guest_va = snapshot.rip;
+            }
+            SYS_EXIT_GROUP => {
+                exit_code = Some(snapshot.gpr[reg::RDI] as i32);
+                break;
+            }
+            other => panic!("unexpected syscall {other}"),
+        }
+    }
+
+    unsafe { libc::close(write_fd) };
+    let mut captured = [0u8; 16];
+    let n = unsafe { libc::read(read_fd, captured.as_mut_ptr().cast(), captured.len()) };
+    unsafe { libc::close(read_fd) };
+    assert!(n >= 0, "pipe read failed");
+
+    assert_eq!(&captured[..n as usize], b"ok\n");
+    assert_eq!(exit_code, Some(9), "guest must exit_group(9)");
+
+    unsafe {
+        jit.unmap(&region);
+        libc::munmap(data.cast(), 4096);
+        libc::munmap(stack.cast(), 64 * 1024);
+    }
+}
+
 /// A guest with a real loop: `for i in 0..iters { write(fd, data, 3) }` then
 /// `exit_group(iters)`, driving the `dec`/`jnz` control-flow path.
 fn guest_loop_program(data_va: u64, write_fd: u64, iters: u32) -> Vec<u8> {
