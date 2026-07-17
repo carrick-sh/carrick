@@ -135,6 +135,11 @@ pub mod interactive_supervisor;
 pub mod layer_cache;
 pub mod namespace;
 pub(crate) mod native_darwin;
+// The FreeBSD/amd64 native (DSR) driver: executes a static x86_64 Linux ELF
+// through the carrick-dsr-x86 gateway and services its syscalls via the shared
+// SyscallDispatcher. Target-gated (the whole module is `cfg(freebsd, x86_64)`).
+#[cfg(all(target_os = "freebsd", target_arch = "x86_64"))]
+pub(crate) mod native_freebsd;
 // The native fork-child host self-exec capsule: plain POSIX (fork + execve +
 // current_exe + FD_CLOEXEC fd transport — no Mach dependency), so it compiles
 // on every host the native (DSR) backend targets. Un-gated as part of the
@@ -871,6 +876,25 @@ pub mod runtime {
         let engine = carrick_vmm_bhyve::run_elf::build_x86_engine_shared(path)
             .map_err(|e| RuntimeError::Unsupported(format!("build_x86_engine_shared: {e}")))?;
         run_threaded_bhyve_loop(engine, make_linux_dispatcher(), DEFAULT_MAX_TRAPS)
+    }
+
+    /// Run a static x86_64 ELF through the NATIVE (DSR) backend — no VMM. The
+    /// ELF is translated block-at-a-time through the `carrick-dsr-x86` gateway
+    /// and its Linux syscalls flow through the SAME `SyscallDispatcher` the
+    /// bhyve lane feeds ([`crate::native_freebsd`]). This is the
+    /// `--exec-backend native` (default) path on FreeBSD/amd64; the bhyve VMM
+    /// runs only on an explicit `--exec-backend vmm` request — important on a
+    /// host where a stray VMM run can fault the VM.
+    #[cfg(all(feature = "platform-freebsd", target_arch = "x86_64"))]
+    pub fn run_elf_native_dispatch(path: &std::path::Path) -> Result<RunResult, RuntimeError> {
+        let argv0 = path.to_string_lossy().into_owned();
+        crate::native_freebsd::run_static_x86_elf(
+            path,
+            make_linux_dispatcher(),
+            [argv0],
+            std::iter::empty::<String>(),
+            DEFAULT_MAX_TRAPS,
+        )
     }
 
     #[cfg(feature = "platform-netbsd")]

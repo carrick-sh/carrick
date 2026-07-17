@@ -125,10 +125,9 @@ fn resolve_execution_plan_for_request_for_host(
                 (HostOs::Macos, Platform::Aarch64) => {
                     native_plan(native_page_profile, host_page_size)
                 }
-                (HostOs::FreeBsd, Platform::Amd64) => Err(RuntimeError::Unsupported(
-                    "FreeBSD/x86_64 native lane is in bring-up: the x86_64 DSR translator is not yet implemented; pass --exec-backend vmm to request the platform VMM"
-                        .to_string(),
-                )),
+                (HostOs::FreeBsd, Platform::Amd64) => {
+                    x86_native_plan(native_page_profile, host_page_size)
+                }
                 (os, isa) => Err(RuntimeError::Unsupported(format!(
                     "no native execution lane for {os:?}/{isa:?} host; pass --exec-backend vmm to request the platform VMM"
                 ))),
@@ -182,6 +181,40 @@ fn native_plan(
         diagnostics: vec![format!(
             "native page profile selected: profile={profile:?} host_page_size={host_page_size} linux_page_size={linux_page_size}"
         )],
+    })
+}
+
+/// The FreeBSD/amd64 native-lane plan. x86_64 is natively 4 KiB, matching the
+/// Linux page size, so there is no 16k-geometry policy (the Darwin lane's
+/// `native_plan` juggles a 16k host page under a 4k or 16k guest); the driver
+/// uses a plain identity map. A non-Auto native page-profile request is
+/// therefore meaningless here and refused rather than silently ignored.
+fn x86_native_plan(
+    request: NativePageProfileRequest,
+    host_page_size: u64,
+) -> Result<ExecutionPlan, RuntimeError> {
+    if request != NativePageProfileRequest::Auto {
+        return Err(RuntimeError::Unsupported(format!(
+            "the FreeBSD/x86_64 native lane has no page-profile knob (x86_64 is natively 4 KiB); \
+             got {request:?}"
+        )));
+    }
+    if host_page_size != DEFAULT_LINUX_PAGE_SIZE {
+        return Err(RuntimeError::Unsupported(format!(
+            "the FreeBSD/x86_64 native lane requires a {DEFAULT_LINUX_PAGE_SIZE}-byte host page, got {host_page_size}"
+        )));
+    }
+    Ok(ExecutionPlan {
+        backend: ExecutionBackend::Native,
+        page_geometry: PageGeometry {
+            host_page_size: DEFAULT_LINUX_PAGE_SIZE,
+            linux_page_size: DEFAULT_LINUX_PAGE_SIZE,
+            // No 16k-on-4k profile: the identity driver needs no native
+            // geometry, so `native_geometry()` stays None and the aarch64
+            // 16k-only paths are never reached on this lane.
+            native_profile: None,
+        },
+        diagnostics: vec!["FreeBSD/x86_64 native lane (identity DSR map)".to_string()],
     })
 }
 
@@ -325,11 +358,11 @@ mod tests {
     }
 
     #[test]
-    fn freebsd_amd64_lane_reports_bring_up_not_wrong_os() {
-        // The FreeBSD/amd64 lane EXISTS in the capability table; until the
-        // x86_64 translator lands it must fail with the bring-up reason,
-        // not the misleading "requires macOS host" of the pre-table gate.
-        let err = resolve_execution_plan_for_host(
+    fn freebsd_amd64_lane_resolves_the_native_identity_plan() {
+        // The FreeBSD/amd64 native lane is LIVE (M2-runtime): `--exec-backend
+        // native` resolves a 4 KiB identity plan, not the old bring-up error
+        // and never the VMM.
+        let plan = resolve_execution_plan_for_host(
             &spec_with_platform(
                 Platform::Amd64,
                 ExecBackendRequest::Native,
@@ -338,14 +371,32 @@ mod tests {
             caps(HostOs::FreeBsd, Platform::Amd64),
             DEFAULT_LINUX_PAGE_SIZE,
         )
-        .expect_err("freebsd lane is not yet executable");
+        .expect("freebsd/amd64 native lane resolves a plan");
 
+        assert_eq!(plan.backend, ExecutionBackend::Native);
+        assert_eq!(plan.page_geometry.host_page_size, DEFAULT_LINUX_PAGE_SIZE);
+        assert_eq!(plan.page_geometry.linux_page_size, DEFAULT_LINUX_PAGE_SIZE);
+        // The identity driver needs no native page geometry.
+        assert_eq!(plan.page_geometry.native_geometry(), None);
+    }
+
+    #[test]
+    fn freebsd_amd64_native_rejects_a_page_profile_knob() {
+        // x86_64 is natively 4 KiB — there is no 16k-geometry policy, so a
+        // non-Auto native page-profile request is refused, not ignored.
+        let err = resolve_execution_plan_for_host(
+            &spec_with_platform(
+                Platform::Amd64,
+                ExecBackendRequest::Native,
+                NativePageProfileRequest::Native16k,
+            ),
+            caps(HostOs::FreeBsd, Platform::Amd64),
+            DEFAULT_LINUX_PAGE_SIZE,
+        )
+        .expect_err("no page-profile knob on the x86 lane");
         assert!(matches!(
             err,
-            RuntimeError::Unsupported(message)
-                if message.contains("bring-up")
-                    && message.contains("x86_64 DSR translator")
-                    && message.contains("--exec-backend vmm")
+            RuntimeError::Unsupported(message) if message.contains("no page-profile knob")
         ));
     }
 
