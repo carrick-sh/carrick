@@ -1153,6 +1153,7 @@ fn dsr_virtual_counter_preserves_destination_matrix() {
         CounterDestination::Gpr(28),
         CounterDestination::Discard,
     ];
+    let frequency = crate::trap::host_counter().1;
 
     for (case, destination) in destinations.into_iter().enumerate() {
         let guest = GuestVa(0x19_100 + (case as u64 * 0x100));
@@ -1161,20 +1162,28 @@ fn dsr_virtual_counter_preserves_destination_matrix() {
             .expect("emit matrix counter");
         let mut stack = vec![0_u8; 16 * 1024];
         let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+        snapshot.pstate = 0xa000_0000;
         let expected = snapshot;
         let mut exit = NativeDsrExit::Syscall {
             resume: GuestVa(guest.raw() + 8),
         };
 
+        let before = crate::trap::host_clock_uptime_ns();
         enter_translated(emitted.entry(), &mut snapshot, &mut exit)
             .expect("execute matrix counter");
+        let after = crate::trap::host_clock_uptime_ns();
 
         for register in 0..31 {
             let is_destination = destination == CounterDestination::Gpr(register as u8);
             if is_destination {
-                assert_ne!(
-                    snapshot.x[register], expected.x[register],
-                    "x{register} destination was not committed"
+                let observed = counter_ticks_to_ns(snapshot.x[register], frequency);
+                assert!(
+                    before.saturating_sub(1_000) <= observed,
+                    "x{register} counter precedes uptime: before={before} observed={observed} after={after}"
+                );
+                assert!(
+                    observed <= after.saturating_add(1_000),
+                    "x{register} counter exceeds uptime: before={before} observed={observed} after={after}"
                 );
             } else {
                 assert_eq!(
@@ -1183,6 +1192,16 @@ fn dsr_virtual_counter_preserves_destination_matrix() {
                 );
             }
         }
+        assert_eq!(
+            snapshot.pstate, expected.pstate,
+            "NZCV changed for {destination:?}"
+        );
+        assert_eq!(
+            exit,
+            NativeDsrExit::Syscall {
+                resume: GuestVa(guest.raw() + 8)
+            }
+        );
     }
 }
 
@@ -1213,10 +1232,18 @@ fn dsr_virtual_counter_kicks_retry_before_and_preserve_after_commit() {
             .translator
             .patch_recovery_word_for_test(cache_pc, 0xf940_0369) // ldr x9, [x27], x27=1
             .expect("patch counter recovery point");
+        let before = crate::trap::host_clock_uptime_ns();
         let fault = fixture
             .translator
             .enter_prepared::<false>(prepared, &mut snapshot)
             .expect("capture counter recovery state");
+        let after = crate::trap::host_clock_uptime_ns();
+        let committed_value = completed.then_some(snapshot.x[15]);
+        if let Some(committed_value) = committed_value {
+            let observed = counter_ticks_to_ns(committed_value, crate::trap::host_counter().1);
+            assert!(before.saturating_sub(1_000) <= observed);
+            assert!(observed <= after.saturating_add(1_000));
+        }
         let NativeDsrExit::Fault {
             guest_pc: resume,
             rewrite_scratch,
@@ -1250,7 +1277,10 @@ fn dsr_virtual_counter_kicks_retry_before_and_preserve_after_commit() {
         assert_eq!(snapshot.pc, guest.raw() + if completed { 4 } else { 0 });
         for register in 0..31 {
             if completed && register == 15 {
-                assert_ne!(snapshot.x[register], original.x[register]);
+                assert_eq!(
+                    snapshot.x[register],
+                    committed_value.expect("committed x15 value")
+                );
             } else {
                 assert_eq!(
                     snapshot.x[register], original.x[register],
@@ -1258,6 +1288,7 @@ fn dsr_virtual_counter_kicks_retry_before_and_preserve_after_commit() {
                 );
             }
         }
+        assert_eq!(snapshot.pstate, original.pstate);
     }
 }
 

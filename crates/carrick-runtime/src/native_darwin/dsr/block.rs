@@ -845,7 +845,7 @@ mod tests {
     }
 
     #[test]
-    fn counter_mode_one_stays_inline() {
+    fn dsr_virtual_counter_mode_one_plan_has_no_sensitive_exit() {
         let start = GuestVa(0x4900);
         let words = [0xd53b_e042, 0xd400_0001];
         let mut reads = 0;
