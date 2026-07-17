@@ -157,7 +157,7 @@ impl Runtime {
             rosetta_license_notice();
         }
         let execution_plan = crate::page_profile::resolve_execution_plan(spec)?;
-        if execution_plan.backend != crate::page_profile::ExecutionBackend::NativeDarwin {
+        if execution_plan.backend != crate::page_profile::ExecutionBackend::Native {
             debug_assert_eq!(
                 execution_plan.page_geometry.linux_page_size,
                 crate::page_profile::DEFAULT_LINUX_PAGE_SIZE
@@ -339,28 +339,27 @@ impl Runtime {
                     .debug_state_path
                     .as_ref()
                     .map(|p| PathBuf::from(p.as_std_path()));
-                let run_result = if execution_plan.backend
-                    == crate::page_profile::ExecutionBackend::NativeDarwin
-                {
-                    crate::native_darwin::run_elf_from_dispatcher_debug(
-                        &spec.executable,
-                        dispatcher,
-                        spec.argv.clone(),
-                        env,
-                        spec.max_traps,
-                        debug_path.as_ref(),
-                        &execution_plan,
-                    )
-                } else {
-                    run_elf_from_dispatcher_debug(
-                        &spec.executable,
-                        dispatcher,
-                        spec.argv.clone(),
-                        env,
-                        spec.max_traps,
-                        debug_path.as_ref(),
-                    )
-                };
+                let run_result =
+                    if execution_plan.backend == crate::page_profile::ExecutionBackend::Native {
+                        crate::native_darwin::run_elf_from_dispatcher_debug(
+                            &spec.executable,
+                            dispatcher,
+                            spec.argv.clone(),
+                            env,
+                            spec.max_traps,
+                            debug_path.as_ref(),
+                            &execution_plan,
+                        )
+                    } else {
+                        run_elf_from_dispatcher_debug(
+                            &spec.executable,
+                            dispatcher,
+                            spec.argv.clone(),
+                            env,
+                            spec.max_traps,
+                            debug_path.as_ref(),
+                        )
+                    };
                 match run_result {
                     Ok(r) => r,
                     Err(e) if is_entrypoint_not_found(&e) => {
@@ -453,29 +452,28 @@ impl Runtime {
                     .debug_state_path
                     .as_ref()
                     .map(|p| PathBuf::from(p.as_std_path()));
-                let run_result = if execution_plan.backend
-                    == crate::page_profile::ExecutionBackend::NativeDarwin
-                {
-                    crate::native_darwin::run_elf_from_dispatcher_debug(
-                        &spec.executable,
-                        dispatcher,
-                        spec.argv.clone(),
-                        env,
-                        spec.max_traps,
-                        debug_path.as_ref(),
-                        &execution_plan,
-                    )
-                } else {
-                    run_rootfs_elf_with_hvf_args_and_dispatcher_debug(
-                        &spec.executable,
-                        &rootfs,
-                        dispatcher,
-                        spec.argv.clone(),
-                        env,
-                        spec.max_traps,
-                        debug_path.as_ref(),
-                    )
-                };
+                let run_result =
+                    if execution_plan.backend == crate::page_profile::ExecutionBackend::Native {
+                        crate::native_darwin::run_elf_from_dispatcher_debug(
+                            &spec.executable,
+                            dispatcher,
+                            spec.argv.clone(),
+                            env,
+                            spec.max_traps,
+                            debug_path.as_ref(),
+                            &execution_plan,
+                        )
+                    } else {
+                        run_rootfs_elf_with_hvf_args_and_dispatcher_debug(
+                            &spec.executable,
+                            &rootfs,
+                            dispatcher,
+                            spec.argv.clone(),
+                            env,
+                            spec.max_traps,
+                            debug_path.as_ref(),
+                        )
+                    };
                 match run_result {
                     Ok(r) => r,
                     Err(e) if is_entrypoint_not_found(&e) => {

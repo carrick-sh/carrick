@@ -80,11 +80,19 @@ mod darwin {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) use darwin::active_host_jit;
 
+// The REAL FreeBSD host JIT (dual-mapped RW/RX SHM object; see
+// carrick-native-freebsd for the design incl. the fork-sharing hazard that
+// gates guest execution until M1's region-remap hook).
+#[cfg(target_os = "freebsd")]
+pub(crate) use carrick_native_freebsd::active_host_jit;
+
 /// Fail-closed placeholder for targets without a native host JIT yet: the
 /// capability probe rejects, so `TranslationCache::new` returns a typed cache
-/// policy error instead of ever mapping code. The real FreeBSD host lands
-/// with `carrick-native-freebsd` (M0.7 of the seams design).
-#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+/// policy error instead of ever mapping code.
+#[cfg(not(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    target_os = "freebsd"
+)))]
 mod unsupported {
     use carrick_dsr::host::{JitRegion, NativeHostJit};
 
@@ -119,5 +127,8 @@ mod unsupported {
     }
 }
 
-#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+#[cfg(not(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    target_os = "freebsd"
+)))]
 pub(crate) use unsupported::active_host_jit;

@@ -629,6 +629,7 @@ dependencies = [
  "carrick-image",
  "carrick-kernel",
  "carrick-mem",
+ "carrick-native-freebsd",
  "carrick-observability",
  "carrick-portable",
  "carrick-signal-core",

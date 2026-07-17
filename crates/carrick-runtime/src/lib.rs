@@ -1475,6 +1475,24 @@ pub mod runtime {
         use carrick_hal::GuestArch as _;
         use std::path::PathBuf;
 
+        // Honor the exec-backend REQUEST before doing anything: previously
+        // this arm silently ran the VMM even under `--exec-backend native`
+        // (the default!), substituting a backend the user did not ask for.
+        // The capability table errors typed for hosts whose native lane is
+        // absent or still in bring-up; if it ever resolves Native here, this
+        // module has no native run path yet — fail closed, never substitute.
+        let plan = crate::page_profile::resolve_execution_plan_for_request(
+            spec.platform,
+            spec.exec_backend,
+            spec.native_page_profile,
+        )?;
+        if plan.backend != crate::page_profile::ExecutionBackend::Vmm {
+            return Err(RuntimeError::Unsupported(
+                "native execution plan resolved, but this platform arm has no native run path wired yet; pass --exec-backend vmm"
+                    .to_string(),
+            ));
+        }
+
         // 0. Docker's container init is a SESSION LEADER (runc setsid()s before
         //    exec'ing the entrypoint): a leader's own setpgid() is EPERM
         //    (ltp-setpgid01 case 1), getsid(0) == getpid(), and there is no

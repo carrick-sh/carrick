@@ -6824,7 +6824,7 @@ mod tests {
         std::io::Write::write_all(&mut file, &dsr_low_et_exec_test_elf(&words))
             .expect("write low ET_EXEC fixture");
         let plan = ExecutionPlan {
-            backend: crate::page_profile::ExecutionBackend::NativeDarwin,
+            backend: crate::page_profile::ExecutionBackend::Native,
             page_geometry: crate::page_profile::PageGeometry {
                 host_page_size: 16 * 1024,
                 linux_page_size: 16 * 1024,
@@ -7001,7 +7001,7 @@ mod tests {
 
     fn native16k_test_plan() -> ExecutionPlan {
         ExecutionPlan {
-            backend: crate::page_profile::ExecutionBackend::NativeDarwin,
+            backend: crate::page_profile::ExecutionBackend::Native,
             page_geometry: crate::page_profile::PageGeometry {
                 host_page_size: 16 * 1024,
                 linux_page_size: 16 * 1024,
@@ -7828,7 +7828,7 @@ mod tests {
         std::io::Write::write_all(&mut file, &dsr_straight_line_syscall_elf())
             .expect("write DSR ELF fixture");
         let plan = ExecutionPlan {
-            backend: crate::page_profile::ExecutionBackend::NativeDarwin,
+            backend: crate::page_profile::ExecutionBackend::Native,
             page_geometry: crate::page_profile::PageGeometry {
                 host_page_size: 16 * 1024,
                 linux_page_size: 16 * 1024,
@@ -7867,7 +7867,7 @@ mod tests {
         std::io::Write::write_all(&mut file, &dsr_test_elf(&words))
             .expect("write DSR loop ELF fixture");
         let plan = ExecutionPlan {
-            backend: crate::page_profile::ExecutionBackend::NativeDarwin,
+            backend: crate::page_profile::ExecutionBackend::Native,
             page_geometry: crate::page_profile::PageGeometry {
                 host_page_size: 16 * 1024,
                 linux_page_size: 16 * 1024,
@@ -7908,7 +7908,7 @@ mod tests {
         std::io::Write::write_all(&mut file, &dsr_test_elf(&words))
             .expect("write DSR guard ELF fixture");
         let plan = ExecutionPlan {
-            backend: crate::page_profile::ExecutionBackend::NativeDarwin,
+            backend: crate::page_profile::ExecutionBackend::Native,
             page_geometry: crate::page_profile::PageGeometry {
                 host_page_size: 16 * 1024,
                 linux_page_size: 16 * 1024,
@@ -7943,7 +7943,7 @@ mod tests {
         std::io::Write::write_all(&mut file, &dsr_test_elf(&words))
             .expect("write DSR return ELF fixture");
         let plan = ExecutionPlan {
-            backend: crate::page_profile::ExecutionBackend::NativeDarwin,
+            backend: crate::page_profile::ExecutionBackend::Native,
             page_geometry: crate::page_profile::PageGeometry {
                 host_page_size: 16 * 1024,
                 linux_page_size: 16 * 1024,
@@ -7967,7 +7967,7 @@ mod tests {
     #[test]
     fn dsr_indirect_flow_runtime_lowers_invalid_targets_to_guest_signals() {
         let plan = ExecutionPlan {
-            backend: crate::page_profile::ExecutionBackend::NativeDarwin,
+            backend: crate::page_profile::ExecutionBackend::Native,
             page_geometry: crate::page_profile::PageGeometry {
                 host_page_size: 16 * 1024,
                 linux_page_size: 16 * 1024,
@@ -8019,7 +8019,7 @@ mod tests {
         std::io::Write::write_all(&mut file, &dsr_test_elf(&words))
             .expect("write DSR sensitive ELF");
         let plan = ExecutionPlan {
-            backend: crate::page_profile::ExecutionBackend::NativeDarwin,
+            backend: crate::page_profile::ExecutionBackend::Native,
             page_geometry: crate::page_profile::PageGeometry {
                 host_page_size: 16 * 1024,
                 linux_page_size: 16 * 1024,
@@ -8049,7 +8049,7 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().expect("create DSR fault ELF");
         std::io::Write::write_all(&mut file, &dsr_test_elf(&words)).expect("write DSR fault ELF");
         let plan = ExecutionPlan {
-            backend: crate::page_profile::ExecutionBackend::NativeDarwin,
+            backend: crate::page_profile::ExecutionBackend::Native,
             page_geometry: crate::page_profile::PageGeometry {
                 host_page_size: 16 * 1024,
                 linux_page_size: 16 * 1024,
@@ -8081,7 +8081,7 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().expect("create DSR brk ELF");
         std::io::Write::write_all(&mut file, &dsr_test_elf(&words)).expect("write DSR brk ELF");
         let plan = ExecutionPlan {
-            backend: crate::page_profile::ExecutionBackend::NativeDarwin,
+            backend: crate::page_profile::ExecutionBackend::Native,
             page_geometry: crate::page_profile::PageGeometry {
                 host_page_size: 16 * 1024,
                 linux_page_size: 16 * 1024,
@@ -11112,7 +11112,7 @@ mod tests {
             dispatcher.async_signal_wake_owner(),
             crate::dispatch::AsyncSignalWakeOwner::SignalPump
         );
-        dispatcher.set_execution_backend(crate::page_profile::ExecutionBackend::NativeDarwin);
+        dispatcher.set_execution_backend(crate::page_profile::ExecutionBackend::Native);
         assert_eq!(
             dispatcher.async_signal_wake_owner(),
             crate::dispatch::AsyncSignalWakeOwner::NativeDirect
@@ -11198,7 +11198,7 @@ mod tests {
             Box::new(TestCountingKick(Arc::clone(&kicks))),
         );
         let mut dispatcher = SyscallDispatcher::new();
-        dispatcher.set_execution_backend(crate::page_profile::ExecutionBackend::NativeDarwin);
+        dispatcher.set_execution_backend(crate::page_profile::ExecutionBackend::Native);
         let parent_tid = 0x4e41_0001;
         let child = 0x4e41_0002;
         crate::host_signal::forget_thread(parent_tid);
