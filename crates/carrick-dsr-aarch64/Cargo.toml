@@ -1,0 +1,43 @@
+[package]
+name = "carrick-dsr-aarch64"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "carrick_dsr_aarch64"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+carrick-dsr = { path = "../carrick-dsr" }
+carrick-guest-mem = { path = "../carrick-guest-mem" }
+carrick-host = { path = "../carrick-host" }
+# bad64/dynasmrt are UNCONDITIONAL: both are pure Rust and compile on every
+# host, which is the point of this crate -- the AArch64 translator builds
+# everywhere; only the gateway's assembled/linked half (gateway_aarch64.S and
+# the C trap shim it calls into) is target-gated (build.rs + the single cfg
+# boundary in gateway.rs).
+bad64.workspace = true
+dynasmrt.workspace = true
+anyhow.workspace = true
+getrandom.workspace = true
+libc.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+# Only the commpage timebase-mode read (counter.rs) touches Mach APIs.
+mach2.workspace = true
+
+[build-dependencies]
+# UNCONDITIONAL build-dependency on purpose: a `[target.'cfg(...)'.build-dependencies]`
+# gate resolves against the HOST triple and breaks `--target aarch64-apple-darwin`
+# cross-checks from a non-Darwin rig (see the carrick-vmm-hvf Cargo.toml note from
+# the earlier extraction slice). The target gating lives INSIDE build.rs instead.
+cc = "1"

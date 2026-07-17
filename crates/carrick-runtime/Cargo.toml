@@ -73,6 +73,10 @@ carrick-host-linux = { path = "../carrick-host-linux", optional = true }
 carrick-vmm-bhyve = { path = "../carrick-vmm-bhyve", optional = true }
 carrick-vmm-nvmm = { path = "../carrick-vmm-nvmm", optional = true }
 carrick-dsr = { path = "../carrick-dsr" }
+# The AArch64 guest-ISA translator crate. UNCONDITIONAL: it compiles on every
+# host (bad64/dynasmrt are pure Rust); only its assembled gateway is
+# target-gated inside the crate itself.
+carrick-dsr-aarch64 = { path = "../carrick-dsr-aarch64" }
 carrick-host = { path = "../carrick-host" }
 carrick-kernel = { path = "../carrick-kernel" }
 carrick-mem = { path = "../carrick-mem" }
@@ -111,12 +115,21 @@ carrick-spec = { path = "../carrick-spec" }
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
 applevisor.workspace = true
 applevisor-sys.workspace = true
+# bad64 stays: the aarch64 emulation blobs in native_darwin.rs / dsr/mod.rs
+# and the runtime-resident DSR oracle still decode with it (they move to the
+# arch crate in the M0.4-completing slice). dynasmrt moved entirely to
+# carrick-dsr-aarch64.
 bad64.workspace = true
-dynasmrt.workspace = true
 mach2.workspace = true
 
 [build-dependencies]
 cc = "1"
+
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dev-dependencies]
+# The emission component microbenchmark (dsr/emit.rs shim tests) measures raw
+# dynasmrt assembler cost head-to-head with the JIT cache write window; the
+# runtime LIB no longer uses dynasmrt (it moved to carrick-dsr-aarch64).
+dynasmrt.workspace = true
 
 [dev-dependencies]
 carrick-test-support = { path = "../carrick-test-support" }

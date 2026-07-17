@@ -200,23 +200,11 @@ fn native_exited_leader_must_park(tid: crate::thread::ThreadId) -> bool {
         || crate::fork_quiesce::exec_replacing_other_thread(tid)
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct NativeUcontextSnapshot {
-    x: [u64; 31],
-    sp: u64,
-    pc: u64,
-    pstate: u64,
-    v: [[u8; 16]; 32],
-    fpsr: u32,
-    fpcr: u32,
-    event_kind: i32,
-    signal: libc::c_int,
-    signal_code: libc::c_int,
-    fault_address: u64,
-    esr: u64,
-    far: u64,
-}
+// Moved verbatim to `carrick_dsr_aarch64::snapshot` as part of the staged
+// native-backend extraction (the C mirror in csrc/native_darwin.c and the
+// gateway offset asserts pin its layout); re-exported so the existing use
+// sites and the C-mirror contract stay unchanged.
+pub(crate) use carrick_dsr_aarch64::snapshot::NativeUcontextSnapshot;
 
 type DsrPrepareFn = fn(
     &mut dsr::ThreadTranslator,
