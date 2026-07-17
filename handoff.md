@@ -183,6 +183,48 @@ in-crate integration tests that run on this box (no runtime dependency):
    together); correctness does not depend on it. Do it after a real binary
    runs, guided by measurement.
 
+## M2 rungs 1–4 landed: the emitter/gateway surface is real-binary ready
+
+All four blockers above M2-runtime are DONE, each live-verified by a
+native-execution test on FreeBSD 15.1/amd64 (7 tests total; vmm is a dead
+end on this rig — the fleet direction is the native lane):
+
+1. **RIP-relative rewrite** — placement-independent: `lea` lowers to
+   `mov r, imm` of the absolute guest VA; every other rip-rel access spills
+   a free GPR to `X86DsrContext::scratch`, materializes the target, and
+   re-encodes with it as base (iced-x86 encoder; workspace iced gained the
+   `encoder` feature). Proven red-first: the rip-rel guest SIGSEGVs under
+   the old emitter.
+2. **r15 + fsbase virtualization** — guest r15 RENAMES to a scratch backed
+   by the snapshot slot (stored back when written; combines with rip-rel
+   via a second scratch slot). The gateway wrfsbase-swaps `guest_fsbase` on
+   enter/exit (skip when 0); plain `fs:` accesses now COPY THROUGH
+   (reclassified Copy); `gs:` and wrfsbase/rdtsc/cpuid stay Sensitive.
+   `fsgsbase_supported()` (CPUID.7.EBX[0]) is the capability gate.
+3. **Fault shim** — `carrick_dsr::fault::FaultRecord` (neutral), signal
+   exit stub, and `carrick-native-freebsd::fault`: SIGSEGV/BUS/FPE/ILL with
+   RIP inside the registered code cache record (signal, si_code, si_addr,
+   host RIP) through `mc_r15` + `CTX_FAULT_RECORD` and redirect `mc_rip` to
+   the stub → typed `Signal` exit. Handler touches NO TLS (guest fsbase may
+   be live). On Signal, `snapshot.rip` is exit_resume — `fault.host_rip` is
+   authoritative. Not-ours faults reinstall the old disposition and re-fire.
+4. **Indirect branches + ret imm16** — cflow resolves `jmp/call r/m`
+   (register from snapshot incl. virtualized r15; memory via
+   base+index*scale+disp with target read through guest VA == host VA);
+   indirect call reads the target before the push; `ret imm16` releases arg
+   bytes. Plus: `Continue` (page/insn-cap) and `Sensitive` exits now emit
+   (body + indirect/sensitive stub; caller pre-fills `exit_resume`).
+
+M2-runtime (rung 5) is next and is the LAST step to a real static binary:
+wire ProcessTranslator-lite for x86 over the gateway, service syscalls via
+the real SyscallDispatcher (`X8664GuestArch::normalize_syscall` +
+`service_arch_prctl` from carrick-hal are directly reusable — arch_prctl's
+SET_FS maps to `ctx.guest_fsbase`), service Sensitive kinds
+(rdtsc/cpuid host passthrough is honest on same-ISA), flip the
+page_profile FreeBSD/amd64 arm (4k host page — no 16k geometry games),
+and run the 433 prebuilt musl x86_64 static-pie probes under
+`--exec-backend native`.
+
 ## Verification discipline used (keep it)
 
 Every slice: carrick-dsr/-aarch64 build+test on FreeBSD, darwin cross-check
