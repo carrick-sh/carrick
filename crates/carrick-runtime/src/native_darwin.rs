@@ -25,7 +25,7 @@ pub(crate) fn adopt_artifact_spike_for_resume(
 }
 mod mapped_memory;
 
-use address::{NativeAddressMode, NativeLayout};
+use address::{NATIVE_DARWIN_SIGRETURN_TRAMPOLINE_BASE, NativeAddressMode, NativeLayout};
 use mapped_memory::*;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -67,7 +67,11 @@ const NATIVE_CTR_EL0: u64 = 0x8444_4004;
 const NATIVE_DCZID_EL0: u64 = 0x4;
 const NATIVE_DC_ZVA_BLOCK_SIZE: usize = 64;
 const NATIVE_DARWIN_PIE_BASE: u64 = 0x4_0000_0000;
-const NATIVE_DARWIN_SIGRETURN_TRAMPOLINE_BASE: u64 = 0x7_0000_0000;
+// NATIVE_DARWIN_SIGRETURN_TRAMPOLINE_BASE and NATIVE_DARWIN_HARD_PAGEZERO_END
+// moved to `carrick_dsr::address` with the address-layout machinery. The
+// trampoline base is re-imported above so unqualified references here and
+// the `use super::*` glob into `mapped_memory` keep resolving; the hard
+// page-zero end is only referenced by the moved address code itself.
 const NATIVE_DARWIN_HEAP_BASE: u64 = 0x8_0000_0000;
 const NATIVE_DARWIN_HEAP_SIZE: u64 = 128 * 1024 * 1024;
 // Darwin places randomized malloc zones in 0x70_0000_0000..0x80_0000_0000.
@@ -90,7 +94,6 @@ const NATIVE_DARWIN_VDSO_BASE: u64 = carrick_mem::vdso::LINUX_VDSO_BASE + (0x80 
 const _: () = assert!(NATIVE_DARWIN_VVAR_BASE & ((1 << 32) - 1) == 0);
 const _: () = assert!(NATIVE_DARWIN_VVAR_BASE >> 32 <= u16::MAX as u64);
 const _: () = assert!(carrick_mem::vdso::LINUX_VVAR_BASE & ((1 << 32) - 1) == 0);
-const NATIVE_DARWIN_HARD_PAGEZERO_END: u64 = 0x1_0000_0000;
 
 /// True in a host process created by a GUEST `fork` (not the run-elf root
 /// child, which the CLI forks for isolation). Guest-forked children must exit
@@ -641,6 +644,7 @@ where
     A: IntoIterator<Item = String>,
     E: IntoIterator<Item = String>,
 {
+    install_native_probe_sink();
     let Some(geometry) = plan.page_geometry.native_geometry() else {
         return Err(RuntimeError::Unsupported(
             "native Darwin run-elf selected without native page geometry".to_string(),
@@ -705,6 +709,7 @@ where
     A: IntoIterator<Item = String>,
     E: IntoIterator<Item = String>,
 {
+    install_native_probe_sink();
     let Some(geometry) = plan.page_geometry.native_geometry() else {
         return Err(RuntimeError::Unsupported(
             "native Darwin container launch selected without native page geometry".to_string(),
@@ -919,6 +924,7 @@ pub(crate) fn resume_guest_from_capsule(
     argv: Vec<Vec<u8>>,
     env: Vec<Vec<u8>>,
 ) -> anyhow::Result<i32> {
+    install_native_probe_sink();
     dsr::profile::seed_profile_exec_epoch_after_reexec(guest.profile_exec_epoch);
     // Startup attribution across the PID-preserving host self-reexec: the
     // pid's startup window was captured exactly once in the pre-exec image,
@@ -1064,6 +1070,131 @@ fn native_memory_layout() -> MemoryLayout {
         mmap_base: NATIVE_DARWIN_MMAP_BASE,
         mmap_size: NATIVE_DARWIN_MMAP_SIZE,
     }
+}
+
+/// Forwarder behind `carrick_dsr::probes` — the usdt-free probe seam the
+/// extracted DSR code fires through — onto the real
+/// `carrick-observability` USDT probes. The mirrored enums map 1:1; both
+/// matches are exhaustive on BOTH sides (every observability variant appears
+/// exactly once on a right-hand side), so adding a variant to either enum
+/// alone breaks this build instead of silently dropping or skewing probes.
+struct NativeDsrProbeForwarder;
+
+fn native_dsr_lifecycle_phase(
+    phase: carrick_dsr::probes::DsrCacheLifecyclePhase,
+) -> crate::probes::DsrCacheLifecyclePhase {
+    use crate::probes::DsrCacheLifecyclePhase as Usdt;
+    use carrick_dsr::probes::DsrCacheLifecyclePhase as Seam;
+    match phase {
+        Seam::ForkChildRepairBegin => Usdt::ForkChildRepairBegin,
+        Seam::ForkChildRepairEnd => Usdt::ForkChildRepairEnd,
+        Seam::ExecResetBegin => Usdt::ExecResetBegin,
+        Seam::ExecResetEnd => Usdt::ExecResetEnd,
+        Seam::ExecImageUnmapBegin => Usdt::ExecImageUnmapBegin,
+        Seam::ExecImageUnmapEnd => Usdt::ExecImageUnmapEnd,
+        Seam::ExecImageMapBegin => Usdt::ExecImageMapBegin,
+        Seam::ExecImageMapEnd => Usdt::ExecImageMapEnd,
+        Seam::ExecCacheResetBegin => Usdt::ExecCacheResetBegin,
+        Seam::ExecCacheResetEnd => Usdt::ExecCacheResetEnd,
+        Seam::ExecRelocationBegin => Usdt::ExecRelocationBegin,
+        Seam::ExecRelocationEnd => Usdt::ExecRelocationEnd,
+        Seam::ExecTranslatorHandoffBegin => Usdt::ExecTranslatorHandoffBegin,
+        Seam::ExecTranslatorHandoffEnd => Usdt::ExecTranslatorHandoffEnd,
+        Seam::ExecMapMmapBegin => Usdt::ExecMapMmapBegin,
+        Seam::ExecMapMmapEnd => Usdt::ExecMapMmapEnd,
+        Seam::ExecMapCopyBegin => Usdt::ExecMapCopyBegin,
+        Seam::ExecMapCopyEnd => Usdt::ExecMapCopyEnd,
+        Seam::ExecMapIcacheBegin => Usdt::ExecMapIcacheBegin,
+        Seam::ExecMapIcacheEnd => Usdt::ExecMapIcacheEnd,
+        Seam::ExecMapProtectBegin => Usdt::ExecMapProtectBegin,
+        Seam::ExecMapProtectEnd => Usdt::ExecMapProtectEnd,
+        Seam::ExecMapVvarBegin => Usdt::ExecMapVvarBegin,
+        Seam::ExecMapVvarEnd => Usdt::ExecMapVvarEnd,
+        Seam::HostSelfReexecBegin => Usdt::HostSelfReexecBegin,
+        Seam::HostSelfReexecEnd => Usdt::HostSelfReexecEnd,
+        Seam::HostSelfReexecProbesReady => Usdt::HostSelfReexecProbesReady,
+        Seam::HostSelfReexecCapsuleBegin => Usdt::HostSelfReexecCapsuleBegin,
+        Seam::HostSelfReexecCapsuleEnd => Usdt::HostSelfReexecCapsuleEnd,
+        Seam::HostSelfReexecRestoreBegin => Usdt::HostSelfReexecRestoreBegin,
+        Seam::HostSelfReexecDispatcherReady => Usdt::HostSelfReexecDispatcherReady,
+        Seam::HostSelfReexecImageLoadBegin => Usdt::HostSelfReexecImageLoadBegin,
+        Seam::HostSelfReexecImageLoadEnd => Usdt::HostSelfReexecImageLoadEnd,
+        Seam::HostSelfReexecResetBegin => Usdt::HostSelfReexecResetBegin,
+        Seam::HostSelfReexecResetEnd => Usdt::HostSelfReexecResetEnd,
+        Seam::HostSelfReexecGuestEntry => Usdt::HostSelfReexecGuestEntry,
+        Seam::HostSelfReexecPreflightBegin => Usdt::HostSelfReexecPreflightBegin,
+        Seam::HostSelfReexecCapsulePrepareBegin => Usdt::HostSelfReexecCapsulePrepareBegin,
+        Seam::HostSelfReexecPreparedBuildBegin => Usdt::HostSelfReexecPreparedBuildBegin,
+        Seam::HostSelfReexecPreparedBuildEnd => Usdt::HostSelfReexecPreparedBuildEnd,
+        Seam::HostSelfReexecPreparedValidateBegin => Usdt::HostSelfReexecPreparedValidateBegin,
+        Seam::HostSelfReexecPreparedValidateEnd => Usdt::HostSelfReexecPreparedValidateEnd,
+        Seam::HostSelfReexecPreparedMapBegin => Usdt::HostSelfReexecPreparedMapBegin,
+        Seam::HostSelfReexecPreparedMapEnd => Usdt::HostSelfReexecPreparedMapEnd,
+    }
+}
+
+fn native_dsr_exec_map_detail_kind(
+    kind: carrick_dsr::probes::DsrExecMapDetailKind,
+) -> crate::probes::DsrExecMapDetailKind {
+    use crate::probes::DsrExecMapDetailKind as Usdt;
+    use carrick_dsr::probes::DsrExecMapDetailKind as Seam;
+    match kind {
+        Seam::Mmap => Usdt::Mmap,
+        Seam::Copy => Usdt::Copy,
+        Seam::Icache => Usdt::Icache,
+        Seam::Protect => Usdt::Protect,
+        Seam::Vvar => Usdt::Vvar,
+    }
+}
+
+impl carrick_dsr::probes::DsrProbeSink for NativeDsrProbeForwarder {
+    fn dsr_cache_lifecycle(
+        &self,
+        tid: i32,
+        phase: carrick_dsr::probes::DsrCacheLifecyclePhase,
+        used_bytes: u64,
+        block_count: u64,
+        generation_count: u64,
+    ) {
+        crate::probes::dsr_cache_lifecycle(
+            tid,
+            native_dsr_lifecycle_phase(phase),
+            used_bytes,
+            block_count,
+            generation_count,
+        );
+    }
+
+    fn dsr_exec_map_detail(
+        &self,
+        tid: i32,
+        kind: carrick_dsr::probes::DsrExecMapDetailKind,
+        duration_ns: u64,
+        bytes: u64,
+        operations: u64,
+    ) {
+        crate::probes::dsr_exec_map_detail(
+            tid,
+            native_dsr_exec_map_detail_kind(kind),
+            duration_ns,
+            bytes,
+            operations,
+        );
+    }
+}
+
+/// Install the USDT forwarder as `carrick_dsr::probes`' process-wide sink.
+/// Idempotent (first-install-wins in the seam), so it is called at every
+/// native-backend entry point — `run_static_elf` /
+/// `run_elf_from_dispatcher_debug` (fresh boots) and
+/// `resume_guest_from_capsule` (the PID-preserving self-reexec, a fresh
+/// process image whose OnceLock starts empty) — each strictly before any
+/// image mapping or DSR machinery runs, so no seam probe can fire
+/// uninstalled. Guest-forked children inherit the already-installed sink
+/// through fork's address-space copy.
+fn install_native_probe_sink() {
+    static FORWARDER: NativeDsrProbeForwarder = NativeDsrProbeForwarder;
+    carrick_dsr::probes::install_probe_sink(&FORWARDER);
 }
 
 /// Attach the shared vDSO (same ELF image + `CARRICK_DISABLE_VDSO` /

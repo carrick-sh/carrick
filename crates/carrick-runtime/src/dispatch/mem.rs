@@ -170,24 +170,12 @@ pub(super) struct MemState {
     // `crate::memory::alloc_alias_ipa`.
 }
 
-#[derive(Clone, Copy)]
-pub(crate) struct MemoryLayout {
-    pub heap_base: u64,
-    pub heap_size: u64,
-    pub mmap_base: u64,
-    pub mmap_size: u64,
-}
-
-impl MemoryLayout {
-    pub(crate) fn hvf_default() -> Self {
-        Self {
-            heap_base: LINUX_HEAP_BASE,
-            heap_size: LINUX_HEAP_SIZE,
-            mmap_base: LINUX_MMAP_BASE,
-            mmap_size: crate::memory::mmap_arena_size(),
-        }
-    }
-}
+// Moved to `carrick_mem::memory::MemoryLayout` as part of the staged
+// native-backend extraction (docs/superpowers/specs/
+// 2026-07-17-native-backend-portability-seams-design.md) so `carrick-dsr` can
+// share it; re-exported so every `crate::dispatch::MemoryLayout` call site is
+// unchanged.
+pub(crate) use carrick_mem::memory::MemoryLayout;
 
 impl MemState {
     pub(super) fn new() -> Self {
