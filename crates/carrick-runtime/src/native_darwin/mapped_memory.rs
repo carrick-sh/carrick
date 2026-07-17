@@ -1049,11 +1049,13 @@ impl NativeMappedMemory {
     /// (clock_gettime04 coherence). No-op when the image carries no vDSO
     /// (CARRICK_DISABLE_VDSO).
     ///
-    /// Natively the guest's `mrs cntvct_el0` reads the HOST counter directly
-    /// (there is no CNTVOFF virtualization), so this stamping is correct only
-    /// while the raw counter and CLOCK_UPTIME_RAW share one timeline on the
-    /// host. That equivalence is gated empirically by the
-    /// `native_el0_counter_reads_track_clock_uptime_raw` test below.
+    /// Natively DSR translates the guest's `mrs cntvct_el0` into an adjusted
+    /// suspend-excluding counter read. Known host counter modes remain inline:
+    /// they apply Darwin's live uptime offset and convert into the preserved
+    /// `CNTFRQ_EL0` domain, matching this `CLOCK_UPTIME_RAW` calibration.
+    /// Unknown modes use the correctness-first scaled fallback. The resulting
+    /// guest-visible timeline is gated empirically by
+    /// `native_virtual_counter_reads_track_clock_uptime_raw`.
     pub(super) fn stamp_vdso_vvar(&self) -> Result<(), RuntimeError> {
         if !self.vvar_region_is_mapped() {
             return Ok(());
