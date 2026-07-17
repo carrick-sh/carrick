@@ -292,17 +292,15 @@ where
                 options.debug_state_path,
             )
         }
-        crate::page_profile::ExecutionBackend::NativeDarwin => {
-            crate::native_darwin::run_static_elf(
-                path.as_ref(),
-                dispatcher,
-                argv,
-                env,
-                options.max_traps,
-                options.debug_state_path,
-                &plan,
-            )
-        }
+        crate::page_profile::ExecutionBackend::Native => crate::native_darwin::run_static_elf(
+            path.as_ref(),
+            dispatcher,
+            argv,
+            env,
+            options.max_traps,
+            options.debug_state_path,
+            &plan,
+        ),
     }
 }
 

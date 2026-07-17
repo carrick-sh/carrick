@@ -24,7 +24,12 @@ pub use carrick_dsr::page_geometry::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ExecutionBackend {
     Vmm,
-    NativeDarwin,
+    /// The native (DSR) backend. Host-neutral by design — which (host OS,
+    /// host ISA) lanes actually exist is the capability table's business in
+    /// `resolve_execution_plan_for_request_for_host`, not this enum's.
+    /// (Renamed from `NativeDarwin` when the FreeBSD/x86_64 lane bring-up
+    /// started; Darwin/AArch64 is the reference lane.)
+    Native,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,19 +108,31 @@ fn resolve_execution_plan_for_request_for_host(
             diagnostics: Vec::new(),
         }),
         ExecBackendRequest::Native => {
-            if host_caps.host_os != HostOs::Macos {
-                return Err(RuntimeError::Unsupported(format!(
-                    "native Darwin execution backend requires macOS host, got {:?}; pass --exec-backend vmm to request the platform VMM",
-                    host_caps.host_os
-                )));
-            }
+            // Same-ISA is a lane-independent requirement of the native
+            // model: guest ISA == host ISA, always (cross-ISA stays VMM /
+            // Rosetta).
             if host_caps.host_execution(platform) != HostExecution::Native {
                 return Err(RuntimeError::Unsupported(format!(
                     "native execution backend does not support cross-ISA guest platform {:?} on {:?} host; pass --exec-backend vmm to request the platform VMM",
                     platform, host_caps.host_isa
                 )));
             }
-            native_plan(native_page_profile, host_page_size)
+            // The native-lane capability table: which (host OS, host ISA)
+            // pairs have a working DSR translator + host layer, and each
+            // lane's page-geometry policy. Flipping a lane on is ONE arm
+            // here (plus its plan fn) — nothing else consults the host OS.
+            match (host_caps.host_os, host_caps.host_isa) {
+                (HostOs::Macos, Platform::Aarch64) => {
+                    native_plan(native_page_profile, host_page_size)
+                }
+                (HostOs::FreeBsd, Platform::Amd64) => Err(RuntimeError::Unsupported(
+                    "FreeBSD/x86_64 native lane is in bring-up: the x86_64 DSR translator is not yet implemented; pass --exec-backend vmm to request the platform VMM"
+                        .to_string(),
+                )),
+                (os, isa) => Err(RuntimeError::Unsupported(format!(
+                    "no native execution lane for {os:?}/{isa:?} host; pass --exec-backend vmm to request the platform VMM"
+                ))),
+            }
         }
     }
 }
@@ -156,7 +173,7 @@ fn native_plan(
         NativePageProfile::Linux4kOn16k => DEFAULT_LINUX_PAGE_SIZE,
     };
     Ok(ExecutionPlan {
-        backend: ExecutionBackend::NativeDarwin,
+        backend: ExecutionBackend::Native,
         page_geometry: PageGeometry {
             host_page_size,
             linux_page_size,
@@ -263,7 +280,7 @@ mod tests {
         )
         .expect("default backend should resolve to native");
 
-        assert_eq!(plan.backend, ExecutionBackend::NativeDarwin);
+        assert_eq!(plan.backend, ExecutionBackend::Native);
     }
 
     #[test]
@@ -290,19 +307,44 @@ mod tests {
     }
 
     #[test]
-    fn native_backend_requires_macos_host() {
+    fn native_lane_table_rejects_hosts_without_a_lane() {
         let err = resolve_execution_plan_for_host(
             &spec(ExecBackendRequest::Native, NativePageProfileRequest::Auto),
             caps(HostOs::Linux, Platform::Aarch64),
             DARWIN_NATIVE_PAGE_SIZE,
         )
-        .expect_err("native backend must reject non-macos hosts");
+        .expect_err("native backend must reject hosts without a lane");
 
         assert!(matches!(
             err,
             RuntimeError::Unsupported(message)
-                if message.contains("macOS")
+                if message.contains("no native execution lane")
                     && message.contains("Linux")
+                    && message.contains("--exec-backend vmm")
+        ));
+    }
+
+    #[test]
+    fn freebsd_amd64_lane_reports_bring_up_not_wrong_os() {
+        // The FreeBSD/amd64 lane EXISTS in the capability table; until the
+        // x86_64 translator lands it must fail with the bring-up reason,
+        // not the misleading "requires macOS host" of the pre-table gate.
+        let err = resolve_execution_plan_for_host(
+            &spec_with_platform(
+                Platform::Amd64,
+                ExecBackendRequest::Native,
+                NativePageProfileRequest::Auto,
+            ),
+            caps(HostOs::FreeBsd, Platform::Amd64),
+            DEFAULT_LINUX_PAGE_SIZE,
+        )
+        .expect_err("freebsd lane is not yet executable");
+
+        assert!(matches!(
+            err,
+            RuntimeError::Unsupported(message)
+                if message.contains("bring-up")
+                    && message.contains("x86_64 DSR translator")
                     && message.contains("--exec-backend vmm")
         ));
     }
@@ -311,7 +353,7 @@ mod tests {
     fn native16k_plan_has_no_instruction_vehicle_policy() {
         let plan = native_plan(NativePageProfileRequest::Native16k, DARWIN_NATIVE_PAGE_SIZE)
             .expect("native16k plan");
-        assert_eq!(plan.backend, ExecutionBackend::NativeDarwin);
+        assert_eq!(plan.backend, ExecutionBackend::Native);
         assert_eq!(
             plan.page_geometry.native_profile,
             Some(NativePageProfile::Native16k)
@@ -331,7 +373,7 @@ mod tests {
 
         if supported_current_lane {
             let plan = result.expect("linux4k native plan on Darwin 16K AArch64");
-            assert_eq!(plan.backend, ExecutionBackend::NativeDarwin);
+            assert_eq!(plan.backend, ExecutionBackend::Native);
             assert_eq!(plan.page_geometry.host_page_size, 16_384);
             assert_eq!(
                 plan.page_geometry.native_geometry(),

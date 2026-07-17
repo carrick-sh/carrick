@@ -120,6 +120,12 @@ zerocopy.workspace = true
 carrick-spec = { path = "../carrick-spec" }
 
 
+# The real FreeBSD native-lane host layer (dual-mapped W^X JIT); selected by
+# target, not feature — the lane is a property of the host, and the crate
+# compiles to nothing elsewhere.
+[target.'cfg(target_os = "freebsd")'.dependencies]
+carrick-native-freebsd = { path = "../carrick-native-freebsd" }
+
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
 applevisor.workspace = true
 applevisor-sys.workspace = true
