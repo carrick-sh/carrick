@@ -215,15 +215,45 @@ end on this rig — the fleet direction is the native lane):
    bytes. Plus: `Continue` (page/insn-cap) and `Sensitive` exits now emit
    (body + indirect/sensitive stub; caller pre-fills `exit_resume`).
 
-M2-runtime (rung 5) is next and is the LAST step to a real static binary:
-wire ProcessTranslator-lite for x86 over the gateway, service syscalls via
-the real SyscallDispatcher (`X8664GuestArch::normalize_syscall` +
-`service_arch_prctl` from carrick-hal are directly reusable — arch_prctl's
-SET_FS maps to `ctx.guest_fsbase`), service Sensitive kinds
-(rdtsc/cpuid host passthrough is honest on same-ISA), flip the
-page_profile FreeBSD/amd64 arm (4k host page — no 16k geometry games),
-and run the 433 prebuilt musl x86_64 static-pie probes under
-`--exec-backend native`.
+### M2-runtime is an ADAPTER, not a rewrite (the key architecture fact)
+
+The conformance probes ARE static-pie x86_64 ELFs — the same shape a
+standalone loader already runs (`carrick-dsr-x86/tests/native_static_elf.rs`
+runs a real rustc/LLVM `-O` no_std static-pie guest end to end: RIP-relative
+rodata, a compiler-lowered loop, write + exit_group(21), all native on
+FreeBSD/amd64). What a REAL musl probe needs beyond that is Linux-semantics
+syscall SERVICING — and that machinery already exists and is backend-neutral,
+shared with the x86 VMM lanes (bhyve/KVM/NVMM via `carrick-x86`):
+
+- `SyscallDispatcher::dispatch_threaded` (dispatch/mod.rs:3238) — the one
+  dispatcher every backend feeds; handlers take `&mut impl GuestMemory`.
+- `GuestMemory` trait (carrick-guest-mem/src/lib.rs:283) — native satisfies
+  it with an identity map (guest VA == host VA).
+- `X8664GuestArch::normalize_syscall` + `service_arch_prctl`
+  (carrick-hal/src/x8664_arch.rs:149) — decode rax + rdi/rsi/rdx/r10/r8/r9,
+  desugar fork/vfork→clone, service arch_prctl(SET_FS/GS). The x86 VMM engine
+  already calls these (carrick-x86/src/engine.rs:874); the native lane calls
+  the SAME functions, mapping arch_prctl(ARCH_SET_FS) → `ctx.guest_fsbase`.
+
+The aarch64 native lane builds `SyscallRequest::new(x8, [x0..x5])` from its
+gateway snapshot (native_darwin.rs:2311) and feeds `dispatch_native_syscall`.
+The x86 native lane builds the identical request from `X86UcontextSnapshot`
+(rax + rdi/rsi/rdx/r10/r8/r9). So M2-runtime = (a) add `carrick-dsr-x86` dep
+to carrick-runtime, (b) an x86 sibling of `run_native_dsr_thread_loop` that
+adapts the snapshot ↔ `SyscallRequest` and does the identity ELF map, (c)
+service Sensitive kinds (rdtsc/cpuid host passthrough is honest same-ISA), (d)
+flip the page_profile FreeBSD/amd64 arm (4k host page — no 16k geometry). Then
+the 433 prebuilt musl probes run under `--exec-backend native`.
+
+### Census evidence (real musl already translates)
+
+A throwaway harness ran a real prebuilt static-pie **musl** probe
+(`roreadwrite`) through the gateway with a minimal in-test servicer and
+executed **142 translated blocks of real musl startup** before faulting at a
+small address (nsys=0 — musl sets up TLS/stack before its first syscall). The
+fault was a setup/servicer gap (minimal auxv/TLS), NOT a translator bug — the
+translation pipeline handles real libc code today; wiring the real dispatcher
++ proper ELF/auxv/TLS setup is what closes the gap.
 
 ## Verification discipline used (keep it)
 
