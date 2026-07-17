@@ -34,6 +34,10 @@ pub(crate) struct ExecutionPlan {
     pub diagnostics: Vec<String>,
 }
 
+// Called only by the macOS `runtime` arm today (`run_oci`/`run_elf` planning);
+// the non-macOS arms plan via `resolve_execution_plan_for_request` until M0.8
+// wires the native run path on every host.
+#[cfg_attr(not(feature = "platform-macos"), allow(dead_code))]
 pub(crate) fn resolve_execution_plan(spec: &RunSpec) -> Result<ExecutionPlan, RuntimeError> {
     resolve_execution_plan_for_request_for_host(
         spec.platform,

@@ -3001,6 +3001,7 @@ fn mmap_address_uses_alias(address: u64, length: u64, layout: MemoryLayout) -> b
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::{LINUX_HEAP_BASE, LINUX_MMAP_BASE};
     use std::cell::Cell;
 
     struct CountingMmapMemory {

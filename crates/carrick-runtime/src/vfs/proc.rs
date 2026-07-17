@@ -369,6 +369,9 @@ fn host_threads_max() -> Option<KernelThreadLimit> {
     host_rlimit_nproc().or_else(host_kernel_threads_max)
 }
 
+// `rlim_t` width varies per host OS, so the fallible conversion below is
+// load-bearing on FreeBSD (signed) and an identity elsewhere (u64).
+#[allow(clippy::useless_conversion)]
 fn host_rlimit_nproc() -> Option<KernelThreadLimit> {
     let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
     // SAFETY: `getrlimit` initializes the passed `rlimit` on success.
@@ -380,7 +383,13 @@ fn host_rlimit_nproc() -> Option<KernelThreadLimit> {
     if limit.rlim_cur == libc::RLIM_INFINITY || limit.rlim_cur == 0 {
         None
     } else {
-        Some(KernelThreadLimit::new(limit.rlim_cur))
+        // `rlim_t` is signed on FreeBSD (i64) and unsigned elsewhere; a
+        // negative soft limit names no real bound, so it degrades to None
+        // (the caller's kernel-threads-max fallback) instead of wrapping.
+        // The conversion is an identity where `rlim_t` is already u64.
+        u64::try_from(limit.rlim_cur)
+            .ok()
+            .map(KernelThreadLimit::new)
     }
 }
 

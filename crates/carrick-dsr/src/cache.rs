@@ -303,8 +303,10 @@ impl ConcurrentPublicationIndex {
         self.changed.notify_all();
     }
 
-    #[cfg(test)]
-    pub(crate) fn published_count(&self) -> usize {
+    // `test-hooks` + pub (not crate-private `cfg(test)`): the runtime's
+    // native test module reads this cross-crate — see `crate::test_hooks`.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn published_count(&self) -> usize {
         self.state
             .lock()
             .values()

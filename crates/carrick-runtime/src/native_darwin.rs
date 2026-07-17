@@ -244,12 +244,14 @@ impl NativeKickState {
         unsafe { carrick_native_kick_state_unbind_current(self.raw.as_ptr()) };
     }
 
-    #[cfg(test)]
+    // Gated exactly like the C shim's test-only accessors they call (the
+    // fail-closed complement declines to stub test-only entry points).
+    #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
     fn requested_generation(&self) -> u64 {
         unsafe { carrick_native_kick_state_requested(self.raw.as_ptr()) }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
     fn acknowledged_generation(&self) -> u64 {
         unsafe { carrick_native_kick_state_acknowledged(self.raw.as_ptr()) }
     }
@@ -527,6 +529,10 @@ impl carrick_hal::TimerDelivery for NativeTimerDelivery {
     }
 }
 
+// The C trap/kick shim (`csrc/native_darwin.c`) is genuinely Darwin+aarch64:
+// x18 guest-ABI switching, `__darwin_mcontext64` snapshots, and the MAP_JIT
+// cache bounds all live there, and build.rs only compiles it for that target.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 unsafe extern "C" {
     fn carrick_native_install_dsr_signal_handlers() -> libc::c_int;
     #[cfg(test)]
@@ -552,6 +558,71 @@ unsafe extern "C" {
     fn carrick_native_clear_icache(start: *mut libc::c_void, len: usize);
 }
 
+// FAIL-CLOSED complement of the Darwin C shim (M1 item: the per-host native
+// shim crates — carrick-native-darwin / carrick-native-freebsd, M0.6/M0.7 —
+// replace these). Same names and signatures so every call site compiles
+// unchanged; every entry answers "this host has no native trap/kick shim yet":
+//   * handler install reports failure (callers surface a typed install error
+//     and the native run loop refuses to start — nothing silently runs a
+//     guest without trap handlers);
+//   * kick-state creation returns null (surfaces as a create error before any
+//     guest thread can rely on a kick that would never arrive);
+//   * the remaining entries are unreachable by construction (they all require
+//     a state pointer only a successful create can produce) and abort loudly
+//     rather than pretend to act.
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+mod native_shim_fail_closed {
+    /// No shim: report failure so `prepare_kick_target` / the DSR run paths
+    /// error out instead of running a guest without trap handlers.
+    pub(super) unsafe fn carrick_native_install_dsr_signal_handlers() -> libc::c_int {
+        1
+    }
+
+    /// No shim: a null state makes `NativeKickState::new` fail closed.
+    pub(super) unsafe fn carrick_native_kick_state_create() -> *mut libc::c_void {
+        std::ptr::null_mut()
+    }
+
+    pub(super) unsafe fn carrick_native_kick_state_destroy(_state: *mut libc::c_void) {
+        unreachable!("native kick state cannot exist without a host shim");
+    }
+
+    pub(super) unsafe fn carrick_native_kick_state_request(
+        _state: *mut libc::c_void,
+    ) -> libc::c_int {
+        unreachable!("native kick state cannot exist without a host shim");
+    }
+
+    pub(super) unsafe fn carrick_native_kick_state_acknowledge(_state: *mut libc::c_void) {
+        unreachable!("native kick state cannot exist without a host shim");
+    }
+
+    pub(super) unsafe fn carrick_native_kick_state_bind_current(
+        _state: *mut libc::c_void,
+    ) -> libc::c_int {
+        unreachable!("native kick state cannot exist without a host shim");
+    }
+
+    pub(super) unsafe fn carrick_native_kick_state_unbind_current(_state: *mut libc::c_void) {
+        unreachable!("native kick state cannot exist without a host shim");
+    }
+
+    /// Declaration parity with the Darwin extern block: the only caller
+    /// (`native_darwin::darwin_jit`) is itself Darwin-only, so this arm is
+    /// never referenced — kept so the stub surface stays byte-for-byte the
+    /// extern contract the M1 host shim crates will implement.
+    #[allow(dead_code)]
+    pub(super) unsafe fn carrick_native_clear_icache(_start: *mut libc::c_void, _len: usize) {
+        unreachable!("native JIT cache cannot exist without a host shim");
+    }
+}
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+use native_shim_fail_closed::*;
+
+// Reachable only through the macOS `runtime`/`execute` arms today; the native
+// run path is wired into the non-macOS arms in M0.8 (native/ integration), at
+// which point these `cfg_attr(dead_code)` allowances come off.
+#[cfg_attr(not(feature = "platform-macos"), allow(dead_code))]
 pub(crate) fn run_static_elf<A, E>(
     path: &Path,
     mut dispatcher: SyscallDispatcher,
@@ -617,6 +688,8 @@ where
     run_image_in_child(image, dispatcher, max_traps, relative_relocations, plan)
 }
 
+// See `run_static_elf`: macOS-arm-only until M0.8.
+#[cfg_attr(not(feature = "platform-macos"), allow(dead_code))]
 pub(crate) fn run_elf_from_dispatcher_debug<A, E>(
     path: &str,
     mut dispatcher: SyscallDispatcher,
@@ -1376,6 +1449,8 @@ fn native_vvar_clock_sources() -> (u64, u64) {
     (0, 0)
 }
 
+// See `run_static_elf`: macOS-arm-only until M0.8.
+#[cfg_attr(not(feature = "platform-macos"), allow(dead_code))]
 fn canonical_host_executable_path(path: &Path) -> String {
     path.canonicalize()
         .unwrap_or_else(|_| path.to_path_buf())
@@ -1464,6 +1539,8 @@ fn add_load_bias(load_bias: u64, addend: i64) -> Result<u64, RuntimeError> {
     }
 }
 
+// See `run_static_elf`: macOS-arm-only until M0.8.
+#[cfg_attr(not(feature = "platform-macos"), allow(dead_code))]
 fn run_image_in_child(
     image: AddressSpace,
     dispatcher: SyscallDispatcher,
@@ -1676,6 +1753,10 @@ fn map_and_release_native_image_source(
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NativeCurrentProcessEntry {
+    // `Initial` is only constructed by the boot-time `run_image_in_child`
+    // path (macOS-arm-only until M0.8, like `run_static_elf`); the reexec
+    // restore arm constructs `SelfReexecRestore` on every platform.
+    #[cfg_attr(not(feature = "platform-macos"), allow(dead_code))]
     Initial,
     SelfReexecRestore,
 }
@@ -5627,6 +5708,8 @@ fn close_fd(fd: RawFd) {
     }
 }
 
+// See `run_static_elf`: macOS-arm-only until M0.8.
+#[cfg_attr(not(feature = "platform-macos"), allow(dead_code))]
 fn child_dup2_or_exit(from: RawFd, to: RawFd) {
     let rc = unsafe { libc::dup2(from, to) };
     if rc < 0 {
@@ -5635,6 +5718,8 @@ fn child_dup2_or_exit(from: RawFd, to: RawFd) {
     }
 }
 
+// See `run_static_elf`: macOS-arm-only until M0.8.
+#[cfg_attr(not(feature = "platform-macos"), allow(dead_code))]
 fn read_pipe_to_end(fd: RawFd) -> Result<Vec<u8>, std::io::Error> {
     let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
     let mut out = Vec::new();
@@ -5642,6 +5727,8 @@ fn read_pipe_to_end(fd: RawFd) -> Result<Vec<u8>, std::io::Error> {
     Ok(out)
 }
 
+// See `run_static_elf`: macOS-arm-only until M0.8.
+#[cfg_attr(not(feature = "platform-macos"), allow(dead_code))]
 fn join_reader(
     handle: thread::JoinHandle<Result<Vec<u8>, std::io::Error>>,
     stream: &str,
@@ -5657,6 +5744,8 @@ fn join_reader(
     }
 }
 
+// See `run_static_elf`: macOS-arm-only until M0.8.
+#[cfg_attr(not(feature = "platform-macos"), allow(dead_code))]
 fn waitpid_blocking(pid: libc::pid_t) -> Result<libc::c_int, RuntimeError> {
     let mut status = 0;
     loop {
@@ -8735,6 +8824,9 @@ mod tests {
         assert_eq!(state_for(), Some('R'));
     }
 
+    // Reads the C shim's kick-state generations: gated exactly like the
+    // shim itself (M0.6 moves both behind the host-seam crate).
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn native_kick_state_coalesces_until_acknowledged() {
         let state = NativeKickState::new().expect("create native kick state");
@@ -8750,6 +8842,9 @@ mod tests {
         assert_eq!(state.requested_generation(), 3);
     }
 
+    // Reads the C shim's kick-state generations: gated exactly like the
+    // shim itself (M0.6 moves both behind the host-seam crate).
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn native_kick_handler_ignores_ordinary_broken_pipe() {
         std::thread::spawn(|| {
@@ -8795,6 +8890,9 @@ mod tests {
         .expect("join native broken-pipe test thread");
     }
 
+    // Exercises the C shim's transport-signal unblock helper: gated exactly
+    // like the shim itself (M0.6 moves both behind the host-seam crate).
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn native_bridge_unblocks_host_transport_signals_per_thread() {
         std::thread::spawn(|| {
@@ -8834,6 +8932,9 @@ mod tests {
         .expect("join native transport signal test thread");
     }
 
+    // Exercises the C shim's guest/host ABI window switches: gated exactly
+    // like the shim itself (M0.6 moves both behind the host-seam crate).
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn dsr_gateway_keeps_kicks_deliverable_across_host_and_guest_windows() {
         std::thread::spawn(|| {
@@ -8877,6 +8978,9 @@ mod tests {
         .expect("join DSR kick-mask test thread");
     }
 
+    // Mach VM (`vm_deallocate`/`mach_task_self_`) probe of the pagezero
+    // reallocation guard: Darwin-only by construction.
+    #[cfg(target_os = "macos")]
     #[test]
     #[allow(deprecated)] // libc exposes mach_task_self_ as the stable self-task port.
     fn native_pagezero_min_offset_rejects_reallocation() {
@@ -10618,7 +10722,11 @@ mod tests {
         assert_ne!(mapped, libc::MAP_FAILED);
         let word = mapped.cast::<u32>();
         unsafe { word.write(0) };
-        assert!(set_native_region_fork_inheritance(mapped, page_size, true));
+        assert!(set_native_region_fork_inheritance(
+            carrick_guest_mem::HostVa(mapped as usize),
+            page_size,
+            true
+        ));
 
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
@@ -10629,7 +10737,11 @@ mod tests {
             }
         }
 
-        assert!(set_native_region_fork_inheritance(mapped, page_size, false));
+        assert!(set_native_region_fork_inheritance(
+            carrick_guest_mem::HostVa(mapped as usize),
+            page_size,
+            false
+        ));
         let mut status = 0;
         assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
         assert!(libc::WIFEXITED(status));
@@ -10659,7 +10771,7 @@ mod tests {
                 let len = usize::try_from(region.end - region.start)
                     .expect("native region length fits usize");
                 assert!(set_native_region_fork_inheritance(
-                    start as *mut libc::c_void,
+                    carrick_guest_mem::HostVa(start),
                     len,
                     true,
                 ));
@@ -10674,7 +10786,11 @@ mod tests {
                 let start = usize::try_from(region.start).expect("native region start fits usize");
                 let len = usize::try_from(region.end - region.start)
                     .expect("native region length fits usize");
-                let _ = set_native_region_fork_inheritance(start as *mut libc::c_void, len, false);
+                let _ = set_native_region_fork_inheritance(
+                    carrick_guest_mem::HostVa(start),
+                    len,
+                    false,
+                );
             }
             let ok = waited == child && libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0;
             unsafe { libc::_exit(i32::from(!ok)) };
@@ -10956,6 +11072,9 @@ mod tests {
         });
     }
 
+    // Drives the real pump pipe + C-shim kick state: Darwin-only until the
+    // native lane's host shim lands (M0.6/M0.7).
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn fork_child_registers_kick_target_before_replacement_pump_consumes_pending() {
         let _pump_guard = NATIVE_PUMP_TEST_LOCK
@@ -11005,6 +11124,9 @@ mod tests {
         );
     }
 
+    // HVF signal-pump semantics (real pump wake): Darwin-only until the
+    // native lane grows its own wake pump (M1).
+    #[cfg(target_os = "macos")]
     #[test]
     fn vmm_synchronous_child_exit_uses_pump_while_vcpu_spins() {
         let _pump_guard = NATIVE_PUMP_TEST_LOCK
@@ -11035,6 +11157,9 @@ mod tests {
         crate::host_signal::forget_thread(tid.raw());
     }
 
+    // HVF signal-pump semantics (real pump wake): Darwin-only until the
+    // native lane grows its own wake pump (M1).
+    #[cfg(target_os = "macos")]
     #[test]
     fn vmm_rlimit_cpu_uses_pump_while_vcpu_spins() {
         let _pump_guard = NATIVE_PUMP_TEST_LOCK
@@ -11146,6 +11271,9 @@ mod tests {
         crate::host_signal::forget_thread(parent_tid);
     }
 
+    // HVF signal-pump semantics (real pump kqueue/self-pipe): Darwin-only
+    // until the native lane grows its own wake pump (M1).
+    #[cfg(target_os = "macos")]
     #[test]
     fn native_host_signal_pump_closes_private_futex_park_window() {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -11193,6 +11321,9 @@ mod tests {
         carrick_signal_core::clear_proc_pending();
     }
 
+    // HVF signal-pump semantics (real pump kqueue/self-pipe): Darwin-only
+    // until the native lane grows its own wake pump (M1).
+    #[cfg(target_os = "macos")]
     #[test]
     fn native_xsignal_nudge_pump_closes_private_futex_park_window() {
         use std::sync::atomic::{AtomicBool, Ordering};

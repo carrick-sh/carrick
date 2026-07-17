@@ -1616,6 +1616,7 @@ mod bsd_extattr_tests {
 ///   * FreeBSD — `fcntl(F_KINFO)` (`kinfo_file.kf_path`; FreeBSD has no
 ///     `F_GETPATH`).
 ///   * Linux — `readlink("/proc/self/fd/<fd>")`.
+///
 /// `None` when the kernel cannot name the fd (unlinked vnode, no path cached).
 pub fn fd_abs_path(fd: std::os::fd::RawFd) -> Option<std::path::PathBuf> {
     #[cfg(any(target_os = "macos", target_os = "ios", target_os = "netbsd"))]

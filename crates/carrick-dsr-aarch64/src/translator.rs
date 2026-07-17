@@ -1337,10 +1337,9 @@ impl ProcessState {
         let translation_started = self.profiling.then(std::time::Instant::now);
         let artifact_address_mode: emit::EmitAddressMode = memory.address_mode().into();
         let artifact_key_words = self.artifact_store.as_ref().and_then(|store| {
-            if !store.accepting_inserts() {
-                if !store.may_contain_guest(guest, artifact_address_mode) {
-                    return None;
-                }
+            if !store.accepting_inserts() && !store.may_contain_guest(guest, artifact_address_mode)
+            {
+                return None;
             }
             memory
                 .instruction_fingerprint_words(guest, ARTIFACT_KEY_PREFIX_INSTRUCTIONS)
@@ -2311,14 +2310,12 @@ impl ThreadTranslator {
                             guest_pc.raw()
                         ))
                     })?;
-                if PROFILE {
-                    if let Some(site) = metadata.fusion {
-                        self.budget
-                            .record_exclusive_fusion(profile::ExclusiveFusionClass::from(
-                                site.disposition,
-                            ))
-                            .map_err(|error| types::DsrError::BlockPolicy(error.to_string()))?;
-                    }
+                if PROFILE && let Some(site) = metadata.fusion {
+                    self.budget
+                        .record_exclusive_fusion(profile::ExclusiveFusionClass::from(
+                            site.disposition,
+                        ))
+                        .map_err(|error| types::DsrError::BlockPolicy(error.to_string()))?;
                 }
                 ThreadExit::Sensitive(metadata.exit)
             }

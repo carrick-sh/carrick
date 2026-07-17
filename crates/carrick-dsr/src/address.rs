@@ -113,7 +113,10 @@ impl OwnedHostMapping {
         self.unmap_on_drop = true;
     }
 
-    #[cfg(test)]
+    // `test-hooks` (not bare `cfg(test)`): the runtime's native test module
+    // drives this cross-crate, and cross-crate `cfg(test)` does not compose —
+    // see the module note in `crate::test_hooks`.
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn range(&self) -> Range<HostVa> {
         self.range.clone()
     }

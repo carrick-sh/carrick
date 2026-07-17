@@ -463,6 +463,12 @@ pub struct StartupGauge {
     startup_cpu_ns: AtomicU64,
 }
 
+impl Default for StartupGauge {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl StartupGauge {
     pub const fn new() -> Self {
         Self {
@@ -1327,7 +1333,9 @@ impl ThreadBudget {
     /// single-shot slot that production code consumes through
     /// `from_environment`. Lets tests exercise the era-delta computation
     /// deterministically without racing a real self-reexec.
-    #[cfg(test)]
+    // `test-hooks` (not bare `cfg(test)`): driven cross-crate by the
+    // runtime's native test module — see `crate::test_hooks`.
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn install_thread_cpu_baseline_ns_for_test(&mut self, baseline_ns: u64) {
         self.thread_cpu_baseline_ns = baseline_ns;
     }

@@ -944,7 +944,7 @@ impl NativeMappedMemory {
                         })?;
                     finalize_image_region_mapping(
                         region,
-                        mapped.mapped,
+                        carrick_guest_mem::HostVa(mapped.mapped as usize),
                         mapped.mapped_length,
                         mapped.logical_length,
                         exec_map_dsr_tid,
@@ -1293,7 +1293,7 @@ impl NativeMappedMemory {
             .map_err(|error| NativeMemoryError::Unsupported(error.to_string()))?
             .raw() as *mut libc::c_void;
         if unsafe { libc::mprotect(page_ptr, page_len, libc::PROT_READ | libc::PROT_WRITE) } != 0 {
-            return Err(last_io_error("mprotect native Darwin vvar page writable").into());
+            return Err(last_io_error("mprotect native Darwin vvar page writable"));
         }
         for &(offset, value) in words {
             debug_assert!(
@@ -1314,7 +1314,7 @@ impl NativeMappedMemory {
             }
         }
         if unsafe { libc::mprotect(page_ptr, page_len, libc::PROT_READ) } != 0 {
-            return Err(last_io_error("restore native Darwin vvar page read-only").into());
+            return Err(last_io_error("restore native Darwin vvar page read-only"));
         }
         Ok(())
     }
@@ -1331,8 +1331,7 @@ impl NativeMappedMemory {
             let Ok(len) = usize::try_from(region.end.saturating_sub(region.start)) else {
                 continue;
             };
-            let changed =
-                set_native_region_fork_inheritance(start.raw() as *mut libc::c_void, len, share);
+            let changed = set_native_region_fork_inheritance(start, len, share);
             if trace {
                 child_write_stderr(
                     format!(
@@ -1466,8 +1465,7 @@ impl NativeMappedMemory {
             return Err(NativeMemoryError::Unsupported(
                 "native Darwin execve cannot retire an address space without owned host ranges"
                     .to_string(),
-            )
-            .into());
+            ));
         }
         let retained_target_ranges = prepared.native_layout.owned_ranges();
         let retired_ranges = subtract_host_ranges(&self.owned_host_ranges, retained_target_ranges);
@@ -1489,8 +1487,7 @@ impl NativeMappedMemory {
             if len != 0 && unsafe { libc::munmap(start as *mut libc::c_void, len) } != 0 {
                 return Err(last_io_error(&format!(
                     "munmap native Darwin execve owned range 0x{start:x}..0x{end:x}"
-                ))
-                .into());
+                )));
             }
         }
         lifecycle(carrick_dsr::probes::DsrCacheLifecyclePhase::ExecImageUnmapEnd);
@@ -1752,7 +1749,7 @@ impl NativeMappedMemory {
         if pc_page == page_start {
             return Err(NativeMemoryError::Unsupported(format!(
                 "native16k cannot write a guest RWX page while executing from the same 16K host page at pc=0x{pc:x} addr=0x{fault_address:x}"
-            )).into());
+            )));
         }
         self.make_native16k_write_exec_page_writable(
             page_start,
@@ -2985,8 +2982,7 @@ impl NativeMappedMemory {
         if !self.region_contains(address, std::mem::size_of::<u64>()) {
             return Err(NativeMemoryError::Unsupported(format!(
                 "native Darwin relocation outside mapped guest memory at 0x{address:x}"
-            ))
-            .into());
+            )));
         }
         let ptr = self
             .host_address(carrick_guest_mem::GuestVa(address))
@@ -3137,7 +3133,7 @@ impl NativeMappedMemory {
                     if file.is_some() {
                         unsafe { libc::close(fd) };
                     }
-                    return Err(NativeMemoryError::Unsupported(error.to_string()).into());
+                    return Err(NativeMemoryError::Unsupported(error.to_string()));
                 }
             };
         let addr = host_start.raw() as *mut libc::c_void;
@@ -3200,8 +3196,7 @@ impl NativeMappedMemory {
                         unsafe { libc::close(fd) };
                         return Err(NativeMemoryError::Unsupported(format!(
                             "native Darwin alias pread failed with errno {errno}"
-                        ))
-                        .into());
+                        )));
                     }
                 }
             }
@@ -3212,8 +3207,7 @@ impl NativeMappedMemory {
                     return Err(last_io_error(&format!(
                         "mprotect native Darwin alias 0x{page_start:x}..0x{:x}",
                         page_start.saturating_add(host_map_len)
-                    ))
-                    .into());
+                    )));
                 }
             }
         }
@@ -3224,14 +3218,12 @@ impl NativeMappedMemory {
             return Err(last_io_error(&format!(
                 "mmap native Darwin alias 0x{address:x}..0x{:x}",
                 address.saturating_add(host_map_len)
-            ))
-            .into());
+            )));
         }
         if mapped != addr {
             return Err(NativeMemoryError::Unsupported(format!(
                 "native Darwin mmap did not honor MAP_FIXED for alias 0x{address:x}"
-            ))
-            .into());
+            )));
         }
 
         // MAP_FIXED replaces the physical host pages, so none of the prior
@@ -3846,12 +3838,15 @@ pub fn native_exec_map_detail(
 
 pub fn finalize_image_region_mapping(
     region: &MemoryRegion,
-    mapped: *mut libc::c_void,
+    mapped: carrick_guest_mem::HostVa,
     mapped_length: usize,
     logical_length: u64,
     exec_map_dsr_tid: Option<i32>,
     _prepared: bool,
 ) -> Result<(), NativeMemoryError> {
+    // Typed host address at the public boundary (same seam as
+    // `native_host_mprotect`); the raw pointer exists only past this line.
+    let mapped = mapped.raw() as *mut libc::c_void;
     if region.perms.execute {
         native_exec_map_detail(
             exec_map_dsr_tid,
@@ -3954,16 +3949,14 @@ pub fn map_region(
         return Err(last_io_error(&format!(
             "mmap native Darwin region 0x{:x}..0x{:x}",
             region.start, region.end
-        ))
-        .into());
+        )));
     }
     if mapped != addr {
         unsafe { libc::munmap(mapped, length) };
         return Err(NativeMemoryError::Unsupported(format!(
             "native Darwin mmap did not honor MAP_FIXED for 0x{:x}",
             region.start
-        ))
-        .into());
+        )));
     }
     rollback.track_mapping(host_start, length);
     native_exec_map_detail(
@@ -3994,7 +3987,14 @@ pub fn map_region(
             0,
         );
     }
-    finalize_image_region_mapping(region, mapped, length, length_u64, exec_map_dsr_tid, false)?;
+    finalize_image_region_mapping(
+        region,
+        carrick_guest_mem::HostVa(mapped as usize),
+        length,
+        length_u64,
+        exec_map_dsr_tid,
+        false,
+    )?;
     Ok(())
 }
 
@@ -4256,22 +4256,20 @@ pub fn map_anonymous_region(
         return Err(last_io_error(&format!(
             "mmap native Darwin anonymous region 0x{start:x}..0x{:x}",
             start.saturating_add(length as u64)
-        ))
-        .into());
+        )));
     }
     if mapped != addr {
         unsafe { libc::munmap(mapped, length) };
         return Err(NativeMemoryError::Unsupported(format!(
             "native Darwin mmap did not honor MAP_FIXED for anonymous region 0x{start:x}"
-        ))
-        .into());
+        )));
     }
     rollback.track_mapping(host_start, length);
     Ok(())
 }
 
 pub fn set_native_region_fork_inheritance(
-    address: *mut libc::c_void,
+    address: carrick_guest_mem::HostVa,
     len: usize,
     share: bool,
 ) -> bool {
@@ -4287,7 +4285,9 @@ pub fn set_native_region_fork_inheritance(
     } else {
         VM_INHERIT_COPY
     };
-    unsafe { minherit(address, len, inherit) == 0 }
+    // Typed host address at the public boundary (same seam as
+    // `native_host_mprotect`); the raw pointer exists only at the deref site.
+    unsafe { minherit(address.raw() as *mut libc::c_void, len, inherit) == 0 }
 }
 
 /// `movz Xd, #imm16, lsl #32` (sf=1, opc=10, hw=10), any destination register.

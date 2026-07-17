@@ -135,7 +135,11 @@ pub mod interactive_supervisor;
 pub mod layer_cache;
 pub mod namespace;
 pub(crate) mod native_darwin;
-#[cfg(target_os = "macos")]
+// The native fork-child host self-exec capsule: plain POSIX (fork + execve +
+// current_exe + FD_CLOEXEC fd transport — no Mach dependency), so it compiles
+// on every host the native (DSR) backend targets. Un-gated as part of the
+// FreeBSD native-lane bring-up; anything genuinely Darwin-only inside is gated
+// narrowly at its own site.
 pub(crate) mod native_exec_capsule;
 pub(crate) mod native_prepared_image;
 pub mod network;
@@ -193,20 +197,17 @@ mod native_cfg_topology_tests {
 /// Execute the transport-only PID preservation diagnostic for the private
 /// native self-reexec path. This is intentionally exposed only as a narrow
 /// function rather than publishing the internal capsule schema.
-#[cfg(target_os = "macos")]
 pub fn native_self_reexec_pid_probe() -> anyhow::Result<()> {
     native_exec_capsule::begin_pid_probe()
 }
 
 /// Result of consuming the private native host-self-exec capsule.
-#[cfg(target_os = "macos")]
 pub enum NativeSelfReexecOutcome {
     PidProbe { before: u32, after: u32 },
     GuestExit(i32),
 }
 
 /// Consume a private native self-reexec PID probe capsule.
-#[cfg(target_os = "macos")]
 pub fn resume_native_self_reexec(
     capsule_fd: i32,
     nonce: &str,
@@ -346,6 +347,81 @@ pub mod trap {
 
     /// Dump cross-thread kick statistics at process exit. No-op on Linux.
     pub fn dump_kick_stats() {}
+}
+
+// Non-macOS mirror of the HVF `threaded_impl` surface the native (DSR) backend
+// consumes: exactly one symbol, the `PlatformFutex` constructor. Each lane
+// re-exports its REAL kick-backend futex (the same `FutexTableFutex<S>` the
+// threaded loop's `HostBackend::make_futex` builds: bare-`SYS_futex` on Linux,
+// `_umtx_op` on FreeBSD, `__futex` on NetBSD) under the original `hvf_futex`
+// call-site name, so `crate::threaded_impl::hvf_futex(table)` resolves to a
+// fully functional shared+private futex on every platform arm — a real
+// implementation, not a degrade.
+#[cfg(any(
+    feature = "platform-linux",
+    feature = "platform-freebsd",
+    feature = "platform-netbsd"
+))]
+pub mod threaded_impl {
+    #[cfg(feature = "platform-freebsd")]
+    pub use carrick_vmm_bhyve::make_bhyve_futex as hvf_futex;
+    #[cfg(feature = "platform-linux")]
+    pub use carrick_vmm_kvm::make_kvm_futex as hvf_futex;
+    #[cfg(feature = "platform-netbsd")]
+    pub use carrick_vmm_nvmm::make_nvmm_futex as hvf_futex;
+}
+
+// Non-macOS mirror of the HVF `vcpu_kick` surface the native (DSR) backend
+// consumes: the wake-only signal-pump handle. The HVF original bridges the
+// host-signal self-pipe to `kicker.kick_all()` + `futex.notify_signal_pending()`
+// because Darwin signals do not wake `parking_lot`'s pthread-condvar parker.
+// These lanes have no such pipe (host handler installs belong to the
+// kick-backend pump — see the `host_signal` stub's `install_default_handlers`),
+// so the mirror is an inert handle, exactly like the HVF crate's own
+// non-aarch64 stub arm. CORRECTNESS NOTE for the future FreeBSD native lane
+// (M1): with no pump thread, durable pending state published from OUTSIDE the
+// caller-managed kick paths (host signal ingress, a sibling's xsignal nudge) is
+// only reconciled at the next dispatch boundary; the native lane's real wake
+// pump replaces this in M1.
+#[cfg(any(
+    feature = "platform-linux",
+    feature = "platform-freebsd",
+    feature = "platform-netbsd"
+))]
+pub mod vcpu_kick {
+    /// Inert wake-pump handle (see the module note): no thread is spawned, so
+    /// `stop` has nothing to join and readiness is immediate.
+    pub struct SignalPump {}
+
+    /// No-op, but load-bearing for the shared ownership protocol: the native
+    /// fork path `std::mem::forget`s an inherited pump handle in the child (a
+    /// COW copy whose thread belongs to the parent), which is only a
+    /// meaningful — and lint-clean — statement about NOT running teardown if
+    /// the handle actually has teardown.
+    impl Drop for SignalPump {
+        fn drop(&mut self) {}
+    }
+
+    impl SignalPump {
+        /// No pump thread exists; there is nothing to stop or join.
+        pub fn stop(self) {}
+
+        /// Immediately ready: there is no pipe/kqueue installation or startup
+        /// reconciliation boundary to wait for.
+        pub fn wait_until_ready(&self, _timeout: std::time::Duration) -> bool {
+            true
+        }
+    }
+
+    /// Spawn only the host-signal/xsignal wake half of the pump (HVF
+    /// signature). Inert here — see the module note for what this loses and
+    /// when the native lane replaces it.
+    pub fn spawn_signal_wake_pump(
+        _kicker: std::sync::Arc<dyn carrick_hal::VcpuRegistry>,
+        _futex: std::sync::Arc<dyn carrick_hal::PlatformFutex>,
+    ) -> SignalPump {
+        SignalPump {}
+    }
 }
 pub mod overlay;
 pub mod pathcodec;
@@ -1603,7 +1679,8 @@ pub mod host_signal {
     // `deliver_pending_signal` itself on the next loop iteration.
     pub use carrick_signal_core::{
         NO_PENDING_SIGNAL, forget_thread, has_process_pending, last_sender_for,
-        publish_pending_for, take_pending_for, take_pending_in_for,
+        publish_pending_for, publish_process_signal, take_pending_for, take_pending_in_for,
+        take_process_pending,
     };
 
     /// Who owns the vCPU kick after a pending-signal publish (mirrors the HVF
@@ -1624,6 +1701,68 @@ pub mod host_signal {
     /// change behaviour — the caller's own kick closes the lost-wakeup window.
     pub fn publish_pending_for_with_wake(tid: i32, signum: i32, _wake: PublicationWake) {
         carrick_signal_core::publish_pending_for(tid, signum);
+    }
+
+    /// Publish a process-directed signal with an explicit wake owner (mirrors
+    /// the HVF `publish_process_signal_with_wake`: pending-bit publish + waiter
+    /// wake + optional pump nudge). The load-bearing pending store IS the
+    /// neutral core's (`publish_process_signal` sets the process-directed
+    /// pending bit); like [`publish_pending_for_with_wake`] there is no HVF
+    /// signal pump on these lanes, so the wake mode does not change behaviour.
+    /// The native backend's only caller today uses `CallerManaged` and performs
+    /// its own ordered kick-all right after this returns, which faithfully
+    /// reproduces the HVF caller-managed contract. CORRECTNESS NOTE for the
+    /// future FreeBSD native lane (M1): a `SignalPump`-owned publication here
+    /// silently loses the pump wake — a guest thread busy in native code with
+    /// no parked waiter is only interrupted at its next syscall/trap boundary.
+    /// The native lane's real wake pump replaces this degrade in M1.
+    pub fn publish_process_signal_with_wake(signum: i32, _wake: PublicationWake) {
+        carrick_signal_core::publish_process_signal(signum);
+    }
+
+    /// Install the host-level default signal handlers (the HVF original wires
+    /// host SIGINT → guest pending publish, opens the self-pipe, and installs
+    /// the cross-process xsignal SIGINFO nudge handler). On these lanes the
+    /// kick-backend signal pump (`carrick_hal::signal_pump::start_pump`,
+    /// started by the fork coordinator's `start_signal_pump`) owns the host
+    /// handler installs, so there is nothing left for this entry point to do —
+    /// except keep the shared xsignal/FASYNC rings mapped, which is idempotent
+    /// and matches the tail of the HVF install. CORRECTNESS NOTE for the future
+    /// FreeBSD native lane (M1): the native run loop calls this WITHOUT
+    /// starting a kick-backend pump, so until the native lane grows its own
+    /// handler install, a host-delivered SIGINT takes the host default action
+    /// (terminating carrick) instead of routing to the guest, and a sibling's
+    /// xsignal nudge is only drained at the next dispatch boundary. The native
+    /// lane replaces this in M1.
+    pub fn install_default_handlers() {
+        carrick_signal_core::xsig::xsig_init();
+        carrick_signal_core::fasync::fasync_init();
+    }
+
+    /// ATFORK-PREPARE bundle for a guest `fork` (mirrors HVF's
+    /// `SignalForkLocks`): every fork-shared signal-static mutex a NON-forking
+    /// auxiliary thread can hold while publishing — the child-watch tables and
+    /// the THREAD_PENDING store. Both guards are the platform-NEUTRAL
+    /// `carrick-signal-core` ones, i.e. the REAL locks these lanes use; the
+    /// only HVF member with no analogue here is its `THREAD_WAITERS` self-pipe
+    /// registry (the waiter on these lanes is a stateless `ppoll` woken by the
+    /// kick's EINTR — see the `reset_after_supervisor_fork` note), so there is
+    /// no third guard to hold.
+    pub struct SignalForkLocks {
+        _child_watch: carrick_signal_core::child_watch::ChildWatchForkGuard,
+        _thread_pending: carrick_signal_core::ThreadPendingForkGuard,
+    }
+
+    /// Acquire the atfork-prepare bundle (see [`SignalForkLocks`]). Call
+    /// immediately before `libc::fork()`; drop immediately after in both
+    /// processes, strictly before any child-side signal reinit.
+    pub fn hold_signal_locks_for_fork() -> SignalForkLocks {
+        let child_watch = carrick_signal_core::child_watch::hold_for_fork();
+        let thread_pending = carrick_signal_core::hold_thread_pending_for_fork();
+        SignalForkLocks {
+            _child_watch: child_watch,
+            _thread_pending: thread_pending,
+        }
     }
 
     // The active backend's host-signal glue (Review-P1 #6 seam). One cfg-selected
