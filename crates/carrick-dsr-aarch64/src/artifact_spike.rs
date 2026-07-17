@@ -508,6 +508,9 @@ impl ArtifactAuthority {
         Ok(ArtifactSpikeReexecConfig {
             host_fd: fd,
             original_host_fd_flags: flags,
+            // `st_dev` is i32 on Darwin and u64 on FreeBSD; the widening cast
+            // is load-bearing on some targets and an identity on others.
+            #[allow(clippy::unnecessary_cast)]
             host_device: identity.st_dev as u64,
             host_inode: identity.st_ino,
             host_size: identity.st_size as u64,
@@ -567,6 +570,9 @@ fn adopt(snapshot: &ArtifactSpikeReexecConfig) -> Result<ArtifactAuthority, DsrE
         });
     }
     let identity = unsafe { identity.assume_init() };
+    // Per-OS `st_dev` width (i32 on Darwin, u64 on FreeBSD) makes the cast
+    // conditional — load-bearing there, an identity here.
+    #[allow(clippy::unnecessary_cast)]
     if identity.st_dev as u64 != snapshot.host_device
         || identity.st_ino != snapshot.host_inode
         || identity.st_size as u64 != snapshot.host_size

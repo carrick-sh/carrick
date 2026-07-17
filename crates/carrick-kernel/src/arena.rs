@@ -221,6 +221,9 @@ impl KernelArena {
         Ok(KernelArenaReexecAuthority {
             fd: self._fd,
             original_fd_flags: flags,
+            // `st_dev` is i32 on Darwin and u64 on FreeBSD; the widening cast
+            // is load-bearing on some targets and an identity on others.
+            #[allow(clippy::unnecessary_cast)]
             device: stat.st_dev as u64,
             inode: stat.st_ino,
             size: stat.st_size as u64,
@@ -294,6 +297,9 @@ impl KernelArena {
             return Err(std::io::Error::last_os_error());
         }
         let stat = unsafe { stat.assume_init() };
+        // Per-OS `st_dev` width (i32 on Darwin, u64 on FreeBSD) makes the
+        // cast conditional — load-bearing there, an identity here.
+        #[allow(clippy::unnecessary_cast)]
         if stat.st_dev as u64 != authority.device
             || stat.st_ino != authority.inode
             || stat.st_size as u64 != authority.size

@@ -617,7 +617,6 @@ use crate::linux_abi::{
 };
 #[cfg(test)]
 use crate::linux_abi::{LINUX_MAP_PRIVATE, LINUX_MAP_SHARED};
-use crate::memory::{LINUX_HEAP_BASE, LINUX_HEAP_SIZE, LINUX_MMAP_BASE};
 use crate::overlay::OverlayEntry;
 use crate::rootfs::{RootFs, RootFsDirEntry, RootFsEntryKind, RootFsError, RootFsMetadata};
 // Canonical-number lookups: carrick's canonical syscall numbering IS the

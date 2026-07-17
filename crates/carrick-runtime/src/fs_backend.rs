@@ -1429,30 +1429,15 @@ fn host_root_prefix(dir: &cap_std::fs::Dir) -> Option<String> {
     }
 }
 
-/// Byte-preserving F_GETPATH of a cap-std root for native reexec authority.
-#[cfg(target_os = "macos")]
+/// Byte-preserving absolute path of a cap-std root for native reexec
+/// authority, via the per-OS kernel facility in
+/// [`carrick_portable::fd_abs_path`] (`F_GETPATH` on Darwin/NetBSD, `F_KINFO`
+/// on FreeBSD, `/proc/self/fd` on Linux).
 fn host_root_path(dir: &cap_std::fs::Dir) -> Option<PathBuf> {
     use std::os::fd::AsRawFd;
-    use std::os::unix::ffi::OsStringExt;
-
-    let mut buf = [0_u8; libc::PATH_MAX as usize];
-    let rc = unsafe {
-        libc::fcntl(
-            dir.as_raw_fd(),
-            libc::F_GETPATH,
-            buf.as_mut_ptr() as *mut libc::c_char,
-        )
-    };
-    if rc < 0 {
-        return None;
-    }
-    let end = buf.iter().position(|byte| *byte == 0).unwrap_or(buf.len());
-    Some(PathBuf::from(std::ffi::OsString::from_vec(
-        buf[..end].to_vec(),
-    )))
+    carrick_portable::fd_abs_path(dir.as_raw_fd())
 }
 
-#[cfg(target_os = "macos")]
 fn host_dir_identity(fd: i32) -> std::io::Result<(u64, u64)> {
     let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
     if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } < 0 {
@@ -1670,13 +1655,13 @@ impl HostFsBackend {
     }
 
     /// Snapshot the current contained root for native host self-reexec.
-    #[cfg(target_os = "macos")]
     pub fn native_reexec_authority(&self) -> std::io::Result<HostFsReexecAuthority> {
         use std::os::fd::AsRawFd;
         use std::os::unix::ffi::OsStrExt;
 
-        let root_path = host_root_path(&self.dir)
-            .ok_or_else(|| std::io::Error::other("F_GETPATH failed for host filesystem root"))?;
+        let root_path = host_root_path(&self.dir).ok_or_else(|| {
+            std::io::Error::other("kernel could not name the host filesystem root fd")
+        })?;
         let (device, inode) = host_dir_identity(self.dir.as_raw_fd())?;
         let current_pid = unsafe { libc::getpid() as u32 };
         Ok(HostFsReexecAuthority {
@@ -1692,7 +1677,6 @@ impl HostFsBackend {
     }
 
     /// Reopen the exact overlay described by a validated reexec authority.
-    #[cfg(target_os = "macos")]
     pub fn attach_for_reexec(authority: &HostFsReexecAuthority) -> std::io::Result<Self> {
         use std::os::fd::AsRawFd;
         use std::os::unix::ffi::OsStringExt;
@@ -2313,7 +2297,6 @@ impl HostFsBackend {
     }
 }
 
-#[cfg(target_os = "macos")]
 fn native_reexec_transfers_cleanup(owner_pid: u32, current_pid: u32, owns_root: bool) -> bool {
     owns_root && owner_pid == current_pid
 }

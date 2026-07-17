@@ -155,6 +155,8 @@ mod tests {
 
     #[test]
     fn recorded_emission_normalizes_process_bindings_and_replays_metadata() {
+        use std::sync::atomic::AtomicU64;
+
         let plan = copy_plan();
         let source_words = vec![0xd503_201f, 0x9100_0400, 0xd400_0001];
         let first_generation = AtomicU64::new(1);

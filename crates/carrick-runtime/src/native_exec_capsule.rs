@@ -1059,6 +1059,17 @@ mod tests {
 
     const HOST_PAGE_SIZE: u64 = 16 * 1024;
 
+    /// The prepared-artifact fixtures encode the 16 KiB host page geometry,
+    /// and a prepared record is BOUND to the running host's page size by
+    /// design (`validate_record` in `carrick_dsr_aarch64::prepared_image`
+    /// rejects any record whose `host_page_size` differs from the live
+    /// `sysconf` value). On a 4 KiB-page host the fixtures can never
+    /// validate; the geometry-bound tests skip rather than fake the kernel's
+    /// page size, and run unchanged on any 16 KiB host.
+    fn host_page_geometry_matches_fixtures() -> bool {
+        unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 == HOST_PAGE_SIZE }
+    }
+
     fn sample() -> NativeExecCapsuleV1 {
         NativeExecCapsuleV1 {
             producer_pid: 42,
@@ -1230,6 +1241,9 @@ mod tests {
 
     #[test]
     fn prepared_record_round_trips_without_embedding_payload_bytes() {
+        if !host_page_geometry_matches_fixtures() {
+            return;
+        }
         let mut payload = sample();
         let artifact = attach_prepared_image(&mut payload, &synthetic_image(), &[], HOST_PAGE_SIZE)
             .expect("eligible prepared artifact");
@@ -1414,6 +1428,9 @@ mod tests {
 
     #[test]
     fn artifact_ineligibility_and_preexec_errors_select_legacy_before_host_exec() {
+        if !host_page_geometry_matches_fixtures() {
+            return;
+        }
         for failpoint in [
             PreparedImageFailpoint::Ineligible,
             PreparedImageFailpoint::ArtifactCreation,
@@ -1537,6 +1554,9 @@ mod tests {
 
     #[test]
     fn capsule_validation_failure_keeps_artifact_cloexec_and_closes_owner() {
+        if !host_page_geometry_matches_fixtures() {
+            return;
+        }
         let mut payload = sample();
         let artifact = attach_prepared_image(&mut payload, &synthetic_image(), &[], HOST_PAGE_SIZE)
             .expect("eligible prepared artifact");
@@ -1574,6 +1594,9 @@ mod tests {
 
     #[test]
     fn returned_host_exec_restores_every_fd_flag_and_closes_artifact() {
+        if !host_page_geometry_matches_fixtures() {
+            return;
+        }
         let mut payload = sample();
         let artifact = attach_prepared_image(&mut payload, &synthetic_image(), &[], HOST_PAGE_SIZE)
             .expect("eligible prepared artifact");
@@ -1649,6 +1672,9 @@ mod tests {
 
     #[test]
     fn artifact_flag_failure_rolls_back_prior_flags_and_closes_artifact() {
+        if !host_page_geometry_matches_fixtures() {
+            return;
+        }
         let mut payload = sample();
         let artifact = attach_prepared_image(&mut payload, &synthetic_image(), &[], HOST_PAGE_SIZE)
             .expect("eligible prepared artifact");
@@ -1677,6 +1703,9 @@ mod tests {
 
     #[test]
     fn prepared_record_survives_capsule_read_for_resume_adoption() {
+        if !host_page_geometry_matches_fixtures() {
+            return;
+        }
         let mut payload = sample();
         let artifact = attach_prepared_image(&mut payload, &synthetic_image(), &[], HOST_PAGE_SIZE)
             .expect("eligible prepared artifact");

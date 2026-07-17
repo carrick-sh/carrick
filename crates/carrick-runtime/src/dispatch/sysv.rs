@@ -712,7 +712,12 @@ fn scoped_host_sem_key_for_scope(scope: &str, key: i32) -> libc::key_t {
         hash = hash.wrapping_mul(0x0100_0193);
     }
     let raw = (hash & 0x7fff_ffff) as i32;
-    if raw == LINUX_IPC_PRIVATE { 1 } else { raw }
+    let scoped = if raw == LINUX_IPC_PRIVATE { 1 } else { raw };
+    // The scoped key is computed in the non-negative i32 hash domain above;
+    // it escapes into the host's `key_t` only at this libc return boundary
+    // (a lossless widen where `key_t` is i64, as on FreeBSD; identity where
+    // it is i32 — same escape as `scoped_host_sem_key`'s IPC_PRIVATE arm).
+    scoped as libc::key_t
 }
 
 fn shm_nattch_path(path: &std::path::Path) -> PathBuf {

@@ -163,12 +163,10 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
     };
 
     match command {
-        #[cfg(feature = "platform-macos")]
         Commands::NativeExecPidProbe => {
             carrick_runtime::native_self_reexec_pid_probe()?;
             anyhow::bail!("native self-reexec unexpectedly returned successfully")
         }
-        #[cfg(feature = "platform-macos")]
         Commands::NativeExecResume { capsule_fd, nonce } => {
             match carrick_runtime::resume_native_self_reexec(capsule_fd, &nonce)? {
                 carrick_runtime::NativeSelfReexecOutcome::PidProbe { before, after } => {

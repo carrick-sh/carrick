@@ -109,11 +109,9 @@ impl From<PullArg> for carrick_image::PullPolicy {
 #[derive(Debug, Subcommand)]
 pub(crate) enum Commands {
     /// Internal transport-only diagnostic for the native host self-reexec path.
-    #[cfg(feature = "platform-macos")]
     #[command(name = "__native-exec-pid-probe", hide = true)]
     NativeExecPidProbe,
     /// Internal resume entry. A valid one-shot capsule is mandatory.
-    #[cfg(feature = "platform-macos")]
     #[command(name = "__native-exec-resume", hide = true)]
     NativeExecResume {
         #[arg(long)]

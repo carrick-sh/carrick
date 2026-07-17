@@ -19,7 +19,11 @@ pub(super) mod counter;
 pub(super) mod decode;
 pub(super) mod emit;
 pub(super) mod gateway;
-#[cfg(test)]
+// The live-execution oracle installs the Darwin C-shim trap handlers, reads
+// the Mach counter, and runs translated AArch64 through the assembled
+// gateway — Darwin/AArch64-only by construction until the host-seam slice
+// (M0.6) gives other hosts a real shim.
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 mod oracle;
 pub(super) mod profile;
 pub(super) mod types;

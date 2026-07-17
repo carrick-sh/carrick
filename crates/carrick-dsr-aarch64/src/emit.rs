@@ -277,6 +277,10 @@ impl EmittedBlock {
         self.code.len()
     }
 
+    pub const fn is_empty(&self) -> bool {
+        self.code.len() == 0
+    }
+
     pub const fn map(&self) -> &InstructionMap {
         &self.map
     }

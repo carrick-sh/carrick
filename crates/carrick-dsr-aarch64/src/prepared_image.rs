@@ -4,21 +4,16 @@
 // production code.
 #![allow(dead_code)]
 
-#[cfg(target_os = "macos")]
 use carrick_mem::elf::{RoSpan, SegmentPerms};
 use carrick_mem::memory::AddressSpace;
 use carrick_mem::memory::MemoryRegion;
-#[cfg(target_os = "macos")]
 use carrick_mem::memory::{AddressSpaceMetadata, MemoryRegionMetadata};
 use serde::{Deserialize, Serialize};
-#[cfg(target_os = "macos")]
 use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::os::fd::AsRawFd;
-#[cfg(target_os = "macos")]
 use std::os::fd::FromRawFd;
 use std::os::fd::RawFd;
-#[cfg(target_os = "macos")]
 use std::os::unix::fs::FileExt;
 
 const PREPARED_IMAGE_MAGIC: &[u8; 16] = b"CARRICK-PREP-V1\0";
@@ -30,7 +25,6 @@ const MAX_WRITTEN_BYTES: u64 = 536_870_912;
 const MAX_AUXV_BYTES: usize = 65_536;
 
 #[derive(Debug, Clone, Copy)]
-#[cfg(target_os = "macos")]
 struct PreparedImageLimits {
     max_regions: usize,
     max_initialized_spans: usize,
@@ -39,7 +33,6 @@ struct PreparedImageLimits {
     max_auxv_bytes: usize,
 }
 
-#[cfg(target_os = "macos")]
 impl PreparedImageLimits {
     const fn v1() -> Self {
         Self {
@@ -192,8 +185,9 @@ pub struct NativePreparedImageV1 {
 }
 
 impl NativePreparedImageV1 {
-    #[cfg(test)]
-    #[cfg(target_os = "macos")]
+    // `test-hooks` (not bare `cfg(test)`): driven cross-crate by the
+    // runtime's native test module — see `carrick_dsr::test_hooks`.
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn with_artifact_fd_for_test(mut self, artifact_fd: RawFd) -> Self {
         self.artifact_fd = artifact_fd;
         self
@@ -201,13 +195,11 @@ impl NativePreparedImageV1 {
 }
 
 #[derive(Debug)]
-#[cfg(target_os = "macos")]
 pub struct PreparedImageArtifact {
     pub record: NativePreparedImageV1,
     pub file: File,
 }
 
-#[cfg(target_os = "macos")]
 impl PreparedImageArtifact {
     pub fn transport_fd_snapshot(&self) -> (RawFd, i32) {
         debug_assert_eq!(
@@ -251,7 +243,9 @@ impl ValidatedPreparedImage {
     }
 }
 
-#[cfg(all(test, target_os = "macos"))]
+// `test-hooks` (not bare `cfg(test)`): driven cross-crate by the runtime's
+// native test module — see `carrick_dsr::test_hooks`.
+#[cfg(any(test, feature = "test-hooks"))]
 pub fn resume_record_for_test(
     artifact: PreparedImageArtifact,
 ) -> Result<NativePreparedImageV1, NativePreparedImageError> {
@@ -273,7 +267,9 @@ pub fn resume_record_for_test(
     Ok(record)
 }
 
-#[cfg(all(test, target_os = "macos"))]
+// `test-hooks` (not bare `cfg(test)`): driven cross-crate by the runtime's
+// native test module — see `carrick_dsr::test_hooks`.
+#[cfg(any(test, feature = "test-hooks"))]
 pub fn validate_artifact_for_test(
     artifact: PreparedImageArtifact,
 ) -> Result<ValidatedPreparedImage, NativePreparedImageError> {
@@ -281,7 +277,6 @@ pub fn validate_artifact_for_test(
 }
 
 #[derive(Debug)]
-#[cfg(target_os = "macos")]
 pub enum PreparedImageDisposition {
     Prepared(PreparedImageArtifact),
     Ineligible(PreparedImageIneligibleReason),
@@ -329,7 +324,6 @@ pub enum NativePreparedImageError {
 }
 
 #[derive(Debug, Clone, Copy)]
-#[cfg(target_os = "macos")]
 struct FileIdentity {
     device: u64,
     inode: u64,
@@ -338,7 +332,6 @@ struct FileIdentity {
     fd_flags: i32,
 }
 
-#[cfg(target_os = "macos")]
 impl FileIdentity {
     fn for_fd(fd: RawFd) -> Result<Self, NativePreparedImageError> {
         let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
@@ -351,6 +344,10 @@ impl FileIdentity {
             return Err(io_error("get-artifact-fd-flags"));
         }
         Ok(Self {
+            // `st_dev` width/signedness varies per host OS (i32 on Darwin,
+            // u64 on FreeBSD), so the fallible conversion is load-bearing on
+            // some targets and an identity on others.
+            #[allow(clippy::useless_conversion)]
             device: u64::try_from(stat.st_dev).map_err(|_| {
                 file_identity_error("negative-artifact-device", fd, stat.st_dev.to_string())
             })?,
@@ -375,10 +372,8 @@ impl FileIdentity {
     }
 }
 
-#[cfg(target_os = "macos")]
 struct RawFdGuard(RawFd);
 
-#[cfg(target_os = "macos")]
 impl Drop for RawFdGuard {
     fn drop(&mut self) {
         unsafe {
@@ -411,7 +406,6 @@ pub fn native_region_copy_window(
     offset..region.bytes().len()
 }
 
-#[cfg(target_os = "macos")]
 pub fn prepare(
     image: &AddressSpace,
     relocations: &[NativeRelativeRelocation],
@@ -425,7 +419,6 @@ pub fn prepare(
     )
 }
 
-#[cfg(target_os = "macos")]
 fn prepare_with_limits(
     image: &AddressSpace,
     relocations: &[NativeRelativeRelocation],
@@ -677,7 +670,6 @@ fn prepare_with_limits(
     }))
 }
 
-#[cfg(target_os = "macos")]
 pub fn validate_for_resume(
     record: NativePreparedImageV1,
 ) -> Result<ValidatedPreparedImage, NativePreparedImageError> {
@@ -755,7 +747,6 @@ pub fn validate_for_resume(
     })
 }
 
-#[cfg(target_os = "macos")]
 fn fd_flags_for_fd(fd: RawFd, stage: &'static str) -> Result<i32, NativePreparedImageError> {
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
     if flags < 0 {
@@ -764,7 +755,6 @@ fn fd_flags_for_fd(fd: RawFd, stage: &'static str) -> Result<i32, NativePrepared
     Ok(flags)
 }
 
-#[cfg(target_os = "macos")]
 fn validate_record(
     record: &NativePreparedImageV1,
     identity: &FileIdentity,
@@ -1068,7 +1058,6 @@ fn validate_record(
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
 fn push_initialized_span(
     region_index: usize,
     region: &NativePreparedRegionV1,
@@ -1114,7 +1103,6 @@ fn push_initialized_span(
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
 fn verify_identity_fields(
     record: &NativePreparedImageV1,
     identity: &FileIdentity,
@@ -1145,7 +1133,6 @@ fn verify_identity_fields(
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
 fn digest_metadata(record: &NativePreparedImageV1) -> Sha256 {
     let mut hasher = Sha256::new();
     hasher.update(PREPARED_IMAGE_MAGIC);
@@ -1185,7 +1172,6 @@ fn digest_metadata(record: &NativePreparedImageV1) -> Sha256 {
     hasher
 }
 
-#[cfg(target_os = "macos")]
 fn digest_with_file_payload(
     record: &NativePreparedImageV1,
     file: &File,
@@ -1205,12 +1191,10 @@ fn digest_with_file_payload(
     Ok(hasher.finalize().into())
 }
 
-#[cfg(target_os = "macos")]
 fn permissions_to_wire(perms: SegmentPerms) -> u8 {
     u8::from(perms.read) | (u8::from(perms.write) << 1) | (u8::from(perms.execute) << 2)
 }
 
-#[cfg(target_os = "macos")]
 fn permissions_from_wire(
     value: u8,
     index: usize,
@@ -1229,7 +1213,6 @@ fn permissions_from_wire(
     })
 }
 
-#[cfg(target_os = "macos")]
 fn align_up(
     value: u64,
     alignment: u64,
@@ -1244,29 +1227,24 @@ fn align_up(
         .ok_or_else(|| validation(stage, None, value))
 }
 
-#[cfg(target_os = "macos")]
 fn host_page_size() -> Result<u64, NativePreparedImageError> {
     let value = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     u64::try_from(value).map_err(|_| io_error("host-page-size"))
 }
 
-#[cfg(target_os = "macos")]
 fn hash_u32(hasher: &mut Sha256, value: u32) {
     hasher.update(value.to_le_bytes());
 }
 
-#[cfg(target_os = "macos")]
 fn hash_u64(hasher: &mut Sha256, value: u64) {
     hasher.update(value.to_le_bytes());
 }
 
-#[cfg(target_os = "macos")]
 fn hash_bytes(hasher: &mut Sha256, bytes: &[u8]) {
     hash_u64(hasher, bytes.len() as u64);
     hasher.update(bytes);
 }
 
-#[cfg(target_os = "macos")]
 fn validation(stage: &'static str, index: Option<usize>, value: u64) -> NativePreparedImageError {
     NativePreparedImageError::Validation {
         stage,
@@ -1275,7 +1253,6 @@ fn validation(stage: &'static str, index: Option<usize>, value: u64) -> NativePr
     }
 }
 
-#[cfg(target_os = "macos")]
 fn io_error(stage: &'static str) -> NativePreparedImageError {
     NativePreparedImageError::Io {
         stage,
@@ -1283,12 +1260,10 @@ fn io_error(stage: &'static str) -> NativePreparedImageError {
     }
 }
 
-#[cfg(target_os = "macos")]
 fn file_identity_error(stage: &'static str, fd: RawFd, reason: String) -> NativePreparedImageError {
     NativePreparedImageError::FileIdentity { stage, fd, reason }
 }
 
-#[cfg(target_os = "macos")]
 fn ineligible_limit(stage: &'static str, value: u64, limit: u64) -> PreparedImageDisposition {
     PreparedImageDisposition::Ineligible(PreparedImageIneligibleReason::RepresentationLimit {
         stage,
@@ -1298,7 +1273,6 @@ fn ineligible_limit(stage: &'static str, value: u64, limit: u64) -> PreparedImag
 }
 
 #[cfg(test)]
-#[cfg(target_os = "macos")]
 mod tests {
     use super::*;
     use carrick_mem::elf::SegmentPerms;
@@ -1308,6 +1282,18 @@ mod tests {
     use std::os::unix::fs::{FileExt, MetadataExt};
 
     const HOST_PAGE_SIZE: u64 = 16 * 1024;
+
+    /// The sparse-artifact fixtures below encode the 16 KiB host page
+    /// geometry, and a prepared record is BOUND to the running host's page
+    /// size by design (`validate_record` rejects any record whose
+    /// `host_page_size` differs from the live `sysconf` value — the same
+    /// fail-closed check a real resume performs). On a 4 KiB-page host the
+    /// fixtures can therefore never validate; the geometry-bound tests skip
+    /// rather than fake the kernel's page size, and run unchanged on any
+    /// 16 KiB host (Apple Silicon today, other 16 KiB hosts as they appear).
+    fn host_page_geometry_matches_fixtures() -> bool {
+        unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 == HOST_PAGE_SIZE }
+    }
 
     fn synthetic_elf() -> Vec<u8> {
         const ET_EXEC: u16 = 2;
@@ -1409,6 +1395,9 @@ mod tests {
 
     #[test]
     fn prepared_image_round_trips_sparse_bytes_and_metadata() {
+        if !host_page_geometry_matches_fixtures() {
+            return;
+        }
         let source = synthetic_image();
         let artifact = match prepare(&source, &relocations(), HOST_PAGE_SIZE).unwrap() {
             PreparedImageDisposition::Prepared(artifact) => artifact,
@@ -1455,6 +1444,9 @@ mod tests {
 
     #[test]
     fn prepared_image_rejects_bad_version_and_host_page_geometry() {
+        if !host_page_geometry_matches_fixtures() {
+            return;
+        }
         let artifact = prepared();
         let mut record = validated_record(&artifact);
         record.version += 1;
@@ -1466,6 +1458,9 @@ mod tests {
 
     #[test]
     fn prepared_image_rejects_non_regular_artifact_fds() {
+        if !host_page_geometry_matches_fixtures() {
+            return;
+        }
         let artifact = prepared();
         let mut fds = [0; 2];
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
@@ -1492,6 +1487,9 @@ mod tests {
 
     #[test]
     fn prepared_image_rejects_fd_identity_size_and_flag_mismatches() {
+        if !host_page_geometry_matches_fixtures() {
+            return;
+        }
         let artifact = prepared();
         for mutate in [
             |r: &mut NativePreparedImageV1| r.artifact_device ^= 1,
@@ -1507,6 +1505,9 @@ mod tests {
 
     #[test]
     fn prepared_image_rejects_truncated_and_extended_artifacts() {
+        if !host_page_geometry_matches_fixtures() {
+            return;
+        }
         for delta in [-1_i64, 1] {
             let artifact = prepared();
             let raw = artifact.file.into_raw_fd();
@@ -1523,6 +1524,9 @@ mod tests {
 
     #[test]
     fn prepared_image_rejects_invalid_region_extents() {
+        if !host_page_geometry_matches_fixtures() {
+            return;
+        }
         type RecordMutation = Box<dyn Fn(&mut NativePreparedImageV1)>;
 
         let artifact = prepared();
@@ -1550,6 +1554,9 @@ mod tests {
 
     #[test]
     fn prepared_image_limits_are_ineligible_at_construction_and_invalid_on_import() {
+        if !host_page_geometry_matches_fixtures() {
+            return;
+        }
         let shared = AddressSpace::from_metadata(carrick_mem::memory::AddressSpaceMetadata {
             entry: carrick_guest_mem::GuestVa(0x4000),
             initial_stack_pointer: carrick_guest_mem::GuestVa(0x8000),
@@ -1672,6 +1679,9 @@ mod tests {
 
     #[test]
     fn prepared_image_rejects_spans_outside_region_or_artifact() {
+        if !host_page_geometry_matches_fixtures() {
+            return;
+        }
         let artifact = prepared();
         let mut record = validated_record(&artifact);
         record.initialized_spans[0].guest_offset =
@@ -1684,6 +1694,9 @@ mod tests {
 
     #[test]
     fn prepared_image_rejects_stack_ro_permission_and_relocation_corruption() {
+        if !host_page_geometry_matches_fixtures() {
+            return;
+        }
         let artifact = prepared();
         let mut stack = validated_record(&artifact);
         stack.initial_stack_pointer = PreparedGuestVa(0);
@@ -1708,6 +1721,9 @@ mod tests {
 
     #[test]
     fn prepared_image_rejects_sp_in_noncanonical_writable_region() {
+        if !host_page_geometry_matches_fixtures() {
+            return;
+        }
         let artifact = prepared();
         let mut record = validated_record(&artifact);
         record.regions[0].permissions |= 0b010;
@@ -1718,6 +1734,9 @@ mod tests {
 
     #[test]
     fn prepared_image_rejects_initialized_stack_bytes_before_sp() {
+        if !host_page_geometry_matches_fixtures() {
+            return;
+        }
         let artifact = prepared();
         let mut record = validated_record(&artifact);
         let stack_start = LINUX_STACK_TOP - LINUX_STACK_SIZE;
@@ -1741,6 +1760,9 @@ mod tests {
 
     #[test]
     fn prepared_image_checksum_detects_initialized_byte_changes() {
+        if !host_page_geometry_matches_fixtures() {
+            return;
+        }
         let artifact = prepared();
         let span = &artifact.record.initialized_spans[0];
         let mut byte = [0_u8; 1];
@@ -1762,6 +1784,9 @@ mod tests {
 
     #[test]
     fn prepared_stack_is_sparse_and_preserves_zero_prefix_and_suffix() {
+        if !host_page_geometry_matches_fixtures() {
+            return;
+        }
         let source = synthetic_image();
         let artifact = match prepare(&source, &relocations(), HOST_PAGE_SIZE).unwrap() {
             PreparedImageDisposition::Prepared(artifact) => artifact,
@@ -1839,6 +1864,9 @@ mod tests {
 
     #[test]
     fn prepared_image_keeps_logical_4k_vvar_inside_a_16k_artifact_extent() {
+        if !host_page_geometry_matches_fixtures() {
+            return;
+        }
         let vvar_base = 0x20_0000_0000;
         let vdso_base = vvar_base + HOST_PAGE_SIZE;
         let source = AddressSpace::load_elf_bytes_with_reader_at_pie_base_without_runtime_regions(
@@ -1895,6 +1923,9 @@ mod tests {
 
     #[test]
     fn wire_records_are_serde_round_trippable() {
+        if !host_page_geometry_matches_fixtures() {
+            return;
+        }
         let artifact = prepared();
         let json = serde_json::to_vec(&artifact.record).unwrap();
         let decoded: NativePreparedImageV1 = serde_json::from_slice(&json).unwrap();

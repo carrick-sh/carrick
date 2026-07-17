@@ -443,19 +443,37 @@ fn ptrace_wait_target_for_wait4(host_target: i32) -> PtraceWaitTarget {
     }
 }
 
+// `libc::id_t` is u32 on Darwin and i64 on FreeBSD, so the fallible pid
+// conversion below is load-bearing on some targets and an identity on others.
+#[allow(clippy::useless_conversion)]
 fn ptrace_wait_target_for_waitid(
     host_idtype: libc::idtype_t,
     host_id: libc::id_t,
 ) -> PtraceWaitTarget {
+    // `host_id` re-enters the typed pid domain here. It was built from a host
+    // pid/pgid that already fits u32 (`ns_to_host_or_self` /
+    // `ns_to_host_pgid` / `pidfd_host_pid` all return u32 host ids; the
+    // `getpgrp` sentinel resolution is a positive pid_t), so this conversion
+    // is lossless by construction even where `libc::id_t` is a wider signed
+    // type (FreeBSD's i64). A value outside u32 names no real host process;
+    // degrade it to the conservative `Any` target (matches every lease)
+    // rather than wrapping into an unrelated pid.
+    let typed_host_id = u32::try_from(host_id).ok();
     if host_idtype == libc::P_PID {
-        PtraceWaitTarget::Exact(HostPid(host_id))
+        match typed_host_id {
+            Some(pid) => PtraceWaitTarget::Exact(HostPid(pid)),
+            None => PtraceWaitTarget::Any,
+        }
     } else if host_idtype == libc::P_PGID {
         let pgid = if host_id == 0 {
-            (unsafe { libc::getpgrp() }) as u32
+            u32::try_from(unsafe { libc::getpgrp() }).ok()
         } else {
-            host_id
+            typed_host_id
         };
-        PtraceWaitTarget::ProcessGroup(HostPgid(pgid))
+        match pgid {
+            Some(pgid) => PtraceWaitTarget::ProcessGroup(HostPgid(pgid)),
+            None => PtraceWaitTarget::Any,
+        }
     } else {
         PtraceWaitTarget::Any
     }
