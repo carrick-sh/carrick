@@ -1934,6 +1934,12 @@ fn run_x86_thread(
                         // safe. Every prior translation pointed into the old
                         // shared region — clear the caches and re-JIT from
                         // scratch into the new one.
+                        // The tid the parent thread was running as: fork(2)
+                        // clones only this thread, but the rebuilt child registry
+                        // re-anchors the main tid to the child's own host pid, so
+                        // the per-tid signal state (mask + SA_ONSTACK alt stack)
+                        // is orphaned under the parent's tid unless re-keyed.
+                        let parent_tid = tid;
                         match fork_child_rebuild(&active) {
                             Ok(child) => {
                                 active = child;
@@ -1948,6 +1954,20 @@ fn run_x86_thread(
                                 // the empty pending-signal set, so the child does
                                 // not observe the parent's inherited proc state.
                                 native_after_fork_child(&active.dispatcher);
+                                // Re-key the forking thread's own signal state to
+                                // the child's new main tid (fork inherits the
+                                // sigaltstack + blocked mask per POSIX), after
+                                // retiring the parent's SIBLING per-tid entries
+                                // (those threads don't exist in the child and
+                                // could collide with the child's tid base).
+                                // `forkaltstack`: without this the inherited alt
+                                // stack is lost.
+                                active
+                                    .dispatcher
+                                    .retire_sibling_thread_signal_state(parent_tid);
+                                active
+                                    .dispatcher
+                                    .migrate_thread_signal_state(parent_tid, tid);
                             }
                             Err(detail) => {
                                 fault_detail = Some(detail);
