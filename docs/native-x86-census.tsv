@@ -134,7 +134,7 @@ OK	getrandomvdsoloop
 OK	getsocknameval
 EXIT_NONZERO	host_gateway_client
 OK	hugepage
-EXIT_FALSE	icmp
+OK	icmp
 OK	ioctlcluster
 OK	iopriovhangup
 OK	iouring

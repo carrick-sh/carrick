@@ -536,6 +536,7 @@ pub(crate) enum NativeReexecDescriptionV1 {
         status_flags: u64,
         family: i32,
         type_: i32,
+        protocol: i32,
     },
 }
 
@@ -938,6 +939,10 @@ pub(super) enum OpenDescription {
         host_fd: HostFdRef,
         family: i32,
         type_: i32,
+        /// Linux protocol requested at socket creation. Kept separately from
+        /// the host backing protocol because compatibility sockets (UDPLITE,
+        /// FreeBSD ping sockets) may use a different host protocol.
+        protocol: i32,
         /// Linux-visible MCAST_* memberships. Darwin has no protocol-independent
         /// MCAST_* optnames, so these are bookkeeping only; accepted sockets start
         /// empty because Linux does not copy listener memberships across accept.
