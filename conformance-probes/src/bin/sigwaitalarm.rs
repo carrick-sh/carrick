@@ -94,17 +94,13 @@ fn main() {
             libc::_exit(child_sigwait_alarm());
         }
 
+        let self_path = std::ffi::CString::new(std::env::args().next().unwrap_or_default())
+            .expect("argv0");
+        let child_arg = c"child";
         let pid = libc::fork();
         if pid == 0 {
-            let path = b"/tmp/p\0";
-            let arg0 = b"/tmp/p\0";
-            let arg1 = b"child\0";
-            let argv = [
-                arg0.as_ptr() as *const libc::c_char,
-                arg1.as_ptr() as *const libc::c_char,
-                std::ptr::null(),
-            ];
-            libc::execv(path.as_ptr() as *const libc::c_char, argv.as_ptr());
+            let argv = [self_path.as_ptr(), child_arg.as_ptr(), std::ptr::null()];
+            libc::execv(self_path.as_ptr(), argv.as_ptr());
             libc::_exit(127);
         }
         let (child_exited, status) = wait_child_with_timeout(pid);
