@@ -323,6 +323,20 @@ impl GuestMemory for IdentityGuestMemory {
         Ok(unsafe { std::slice::from_raw_parts(address as *const u8, length).to_vec() })
     }
 
+    fn write_bytes(
+        &mut self,
+        address: u64,
+        bytes: &[u8],
+    ) -> Result<(), carrick_guest_mem::MemoryError> {
+        if !bytes.is_empty() && IDENTITY_PROTECTIONS.range_write_denied(address, bytes.len()) {
+            return Err(carrick_guest_mem::MemoryError::OutOfBounds {
+                address,
+                length: bytes.len(),
+            });
+        }
+        self.write_bytes_raw(address, bytes)
+    }
+
     fn write_bytes_raw(
         &mut self,
         address: u64,
