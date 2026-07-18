@@ -1550,7 +1550,7 @@ const JIT_SLICE_LEN: usize = CODE_CACHE_LEN;
 /// handed out (and returned on thread exit) from a free-list, so a program
 /// that recycles threads reuses the space. `clone` fails with EAGAIN if all
 /// slices are in use at once.
-const JIT_SLICE_COUNT: usize = 256;
+const JIT_SLICE_COUNT: usize = 129;
 
 /// The process-exit rendezvous. `exit_group` from any guest thread — or the
 /// LAST thread's `exit(2)` — terminates the whole process with the recorded
