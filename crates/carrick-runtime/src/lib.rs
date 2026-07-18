@@ -923,7 +923,7 @@ pub mod runtime {
     /// Signal-wait, proc-exit, futex, fork, and clone-thread outcomes are not
     /// serviced here yet (later slices) — they fall through to the caller, which
     /// surfaces `RuntimeError::Unsupported`.
-    fn service_syscall<M: GuestMemory>(
+    pub(crate) fn service_syscall<M: GuestMemory>(
         dispatcher: &mut SyscallDispatcher,
         request: SyscallRequest,
         memory: &mut M,

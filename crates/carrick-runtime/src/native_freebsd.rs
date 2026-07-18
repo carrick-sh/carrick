@@ -517,9 +517,10 @@ where
 
     let reporter = Arc::new(CompatReporter::default());
     let tid = crate::thread::ThreadId::main_from_host_pid();
-    let registry = crate::thread::ThreadRegistry::new(tid);
-    let futex = crate::thread::FutexTable::new();
     let mut memory = IdentityGuestMemory;
+    // The single-threaded blocking-I/O waiter (fd wait / poll / select / sleep
+    // / blocking write), shared with the KVM/bhyve single-thread loop.
+    let mut waiter = crate::io_wait::ThreadWaiter::new(tid);
 
     // All guest-code reads go through the segment-aware `image.code_bytes`,
     // which never crosses an unmapped gap between PT_LOAD segments.
@@ -625,8 +626,14 @@ where
             let linked = match emit_block_linked(&body, &block) {
                 Ok(t) => t,
                 Err(e) => {
-                    fault_detail =
-                        Some(format!("emit_block at 0x{next:x} ({:?}): {e}", block.exit));
+                    // Loud: include the terminator VA's bytes so an unsupported
+                    // instruction is identifiable without a debugger round-trip.
+                    let at = block.exit.va();
+                    fault_detail = Some(format!(
+                        "emit_block at 0x{next:x} ({:?}): {e} — insn bytes at 0x{at:x} = {:02x?}",
+                        block.exit,
+                        image.code_bytes(at),
+                    ));
                     break;
                 }
             };
@@ -707,9 +714,7 @@ where
                     &mut dispatcher,
                     &mut memory,
                     &reporter,
-                    tid,
-                    &registry,
-                    &futex,
+                    &mut waiter,
                     &mut snapshot,
                     &mut guest_fsbase,
                 ) {
@@ -817,18 +822,17 @@ where
 }
 
 /// Adapt a `syscall` gateway exit into the shared dispatcher. Builds the same
-/// [`carrick_hal::RawSyscall`] the x86 VMM engine produces, feeds
-/// [`SyscallDispatcher::dispatch_threaded`], writes the return value into
-/// `snapshot.rax`, and returns the resume RIP. `arch_prctl(SET_FS)` sets
-/// `guest_fsbase` (VMM state has no analog here).
-#[allow(clippy::too_many_arguments)]
+/// [`carrick_hal::RawSyscall`] the x86 VMM engine produces, drives it through
+/// the shared single-threaded [`crate::runtime::service_syscall`] (which
+/// services the blocking-I/O outcomes — fd wait / poll / select / sleep /
+/// blocking write — by parking on the `waiter` and re-dispatching), writes the
+/// terminal return value into `snapshot.rax`, and returns the resume RIP.
+/// `arch_prctl(SET_FS)` sets `guest_fsbase` (VMM state has no analog here).
 fn service_syscall(
     dispatcher: &mut SyscallDispatcher,
     memory: &mut IdentityGuestMemory,
     reporter: &CompatReporter,
-    tid: crate::thread::ThreadId,
-    registry: &crate::thread::ThreadRegistry,
-    futex: &crate::thread::FutexTable,
+    waiter: &mut crate::io_wait::ThreadWaiter,
     snapshot: &mut X86UcontextSnapshot,
     guest_fsbase: &mut u64,
 ) -> Step {
@@ -854,7 +858,7 @@ fn service_syscall(
 
     let request = SyscallRequest::from_raw(raw).with_current_guest_sp(Some(snapshot.gpr[reg::RSP]));
     let outcome =
-        match dispatcher.dispatch_threaded(request, memory, reporter, tid, registry, futex) {
+        match crate::runtime::service_syscall(dispatcher, request, memory, reporter, waiter) {
             Ok(o) => o,
             Err(e) => return Step::Fault(format!("dispatch error: {e:?}")),
         };
@@ -875,8 +879,8 @@ fn service_syscall(
         // (handlers, siginfo) is a later rung.
         DispatchOutcome::SignalDeath { signum } => Step::Exit(128 + signum),
         other => Step::Fault(format!(
-            "native x86 first-rung driver does not service dispatch outcome {other:?} yet \
-             (threads/fork/blocking-waits are a later rung)"
+            "native x86 driver does not service dispatch outcome {other:?} yet \
+             (threads/fork/futex/signal-wait are later rungs)"
         )),
     }
 }
