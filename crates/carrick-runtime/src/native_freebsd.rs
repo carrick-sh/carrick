@@ -735,6 +735,7 @@ fn run_pending_signals(
     syscall_nr: Option<u64>,
     orig_rax: u64,
 ) -> Option<i32> {
+    drain_native_child_exit_watches(false);
     let mut trap = NativeX86Trap {
         snap: snapshot,
         last_syscall_nr: syscall_nr,
@@ -798,26 +799,32 @@ extern "C" fn native_pumped_signal_handler(
     carrick_hal::signal_pump::poke();
 }
 
-/// Install [`native_pumped_signal_handler`] for the four pumped standard signals
-/// on their HOST numbers. Called once pre-fork (idempotent across reused runs);
-/// `libc::fork` inherits the host sigactions so every guest descendant routes
-/// these to its own guest disposition. `SA_SIGINFO` (to read `si_pid`), NO
-/// `SA_RESTART` so a delivery to a run-loop thread EINTRs its in-progress wait.
+static NATIVE_CHILD_EXIT_DIRTY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Host SIGCHLD is only a wakeup. The requested Linux clone exit signal lives
+/// in the child-watch record and may be SIGCHLD, another signal, or zero; an
+/// async handler cannot safely lock that table or call waitid.
+extern "C" fn native_sigchld_handler(_sig: i32) {
+    NATIVE_CHILD_EXIT_DIRTY.store(true, std::sync::atomic::Ordering::Release);
+    carrick_hal::signal_pump::poke();
+}
+
+fn drain_native_child_exit_watches(force: bool) {
+    if force || NATIVE_CHILD_EXIT_DIRTY.swap(false, std::sync::atomic::Ordering::AcqRel) {
+        carrick_hal::signal_pump::publish_exited_child_watches();
+    }
+}
+
+/// Install guest signal routing on host numbers. Ordinary process signals can
+/// publish directly; SIGCHLD uses the deferred child-watch scanner above so the
+/// guest receives the clone-requested exit signal rather than a hardcoded CHLD.
 fn install_native_pumped_handlers() {
     for &linux_sig in &[
         carrick_abi::LINUX_SIGHUP,
         carrick_abi::LINUX_SIGINT,
         carrick_abi::LINUX_SIGQUIT,
         carrick_abi::LINUX_SIGTERM,
-        // SIGCHLD: a guest child is a real host child, so its exit delivers a
-        // host SIGCHLD to this process. Route it to the guest so a guest SIGCHLD
-        // handler runs when a non-waited child (a sibling, or a subreaper-adopted
-        // orphan) exits (`waitsiblingsigchld`, `childsubreaper`'s
-        // sigchld_from_orphan). The routed publish does NOT reap — the guest's
-        // own wait4 still consumes the zombie; a SIG_DFL (default-ignore) SIGCHLD
-        // is dropped at delivery and the wait's block mask keeps it from
-        // spuriously interrupting.
-        carrick_abi::LINUX_SIGCHLD,
     ] {
         let host = crate::host_signal::linux_to_host_signum(linux_sig);
         // SAFETY: zeroed sigaction = "no flags, empty mask"; we set a valid
@@ -829,6 +836,16 @@ fn install_native_pumped_handlers() {
             action.sa_flags = libc::SA_SIGINFO;
             libc::sigaction(host, &action, std::ptr::null_mut());
         }
+    }
+
+    // SAFETY: valid handler and host SIGCHLD. No SA_RESTART: the interrupted
+    // wait reaches a safe point that resolves the child watch with waitid.
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = native_sigchld_handler as *const () as libc::sighandler_t;
+        libc::sigemptyset(&mut action.sa_mask);
+        action.sa_flags = libc::SA_NOCLDSTOP;
+        libc::sigaction(libc::SIGCHLD, &action, std::ptr::null_mut());
     }
 }
 
@@ -1808,6 +1825,7 @@ fn fork_child_rebuild(parent: &Arc<SharedRun>) -> Result<Arc<SharedRun>, String>
 /// (`procprctlview`, `childsubreaper`, `forkaltstack`, `forkexecpthread`);
 /// `mem`/`sysv`/`epoll` drop inherited mm/SysV/epoll fork state.
 fn native_after_fork_child(dispatcher: &SyscallDispatcher) {
+    NATIVE_CHILD_EXIT_DIRTY.store(false, std::sync::atomic::Ordering::Release);
     dispatcher.clear_output_buffers();
     crate::event_ring::reinit_after_fork();
     crate::host_signal::reinit_after_fork();
@@ -2706,6 +2724,7 @@ fn service_syscall(
             parent_tid_addr,
             child_tid_addr,
             child_stack,
+            exit_signal,
             ..
         } => service_fork(
             dispatcher,
@@ -2714,6 +2733,8 @@ fn service_syscall(
                 parent_tid_addr,
                 child_tid_addr,
                 child_stack,
+                parent_tid: tid.raw(),
+                exit_signal,
             },
             snapshot,
             memory,
@@ -3255,6 +3276,7 @@ fn service_syscall_threaded(
     // raise lands there), matching the shared KVM servicer.
     let signal_pending = |mask: carrick_abi::WaitSigMask| {
         move || {
+            drain_native_child_exit_watches(false);
             dispatcher.drain_xsignals_process_directed();
             crate::host_signal::has_unblocked_pending_for(tid.raw(), mask.block_mask())
                 || dispatcher.has_deliverable_dispatch_pending_for_wait(tid, mask)
@@ -3263,6 +3285,7 @@ fn service_syscall_threaded(
     let mut poll_deadline: Option<std::time::Instant> = None;
     let mut sleep_deadline: Option<std::time::Instant> = None;
     loop {
+        drain_native_child_exit_watches(false);
         let outcome =
             dispatcher.dispatch_threaded(request, memory, reporter, tid, registry, futex)?;
         match outcome {
@@ -3425,6 +3448,7 @@ fn service_syscall_threaded(
                 // promptly and the re-dispatch's `take_pending_in_from` /
                 // `take_pending_in_for` returns the signum.
                 let pending = move || {
+                    drain_native_child_exit_watches(false);
                     dispatcher.drain_xsignals_process_directed();
                     crate::host_signal::has_unblocked_pending_for(tid.raw(), block_mask)
                         || dispatcher.has_deliverable_dispatch_pending_for_wait(
@@ -3514,6 +3538,8 @@ struct NativeForkRequest {
     parent_tid_addr: Option<u64>,
     child_tid_addr: Option<u64>,
     child_stack: u64,
+    parent_tid: i32,
+    exit_signal: u32,
 }
 
 /// Perform a guest `fork()` as a host `fork()`. Sets guest `rax` (0 in the
@@ -3594,6 +3620,15 @@ fn service_fork(
         // may already have replaced the process-global child stash.
         crate::guest_cpu::publish_prepared_child_record_parent_ref(prepared, pid as u32);
         crate::namespace::pid::notify_child_registered();
+        crate::host_signal::register_child_exit_watch(
+            pid,
+            request.parent_tid,
+            i32::try_from(request.exit_signal).unwrap_or(0),
+        );
+        // Close the fast-child race: SIGCHLD may have arrived before the watch
+        // was published. A forced WNOWAIT scan observes the zombie without
+        // consuming it, leaving guest wait4/waitid responsible for the reap.
+        drain_native_child_exit_watches(true);
         let guest_pid = child_ns_pid.unwrap_or(pid as u32);
         snapshot.gpr[reg::RAX] = u64::from(guest_pid);
         if let Some(addr) = request.parent_tid_addr {

@@ -112,8 +112,8 @@ fn main() {
             clone_rc_positive = clone_rc_positive,
             // Linux: true (exit_signal honored). carrick today: false.
             exit_signal_is_usr1 = got_usr1,
-            // Linux: false. carrick today: true (hardcoded SIGCHLD).
-            exit_signal_is_chld = got_chld,
+            // Linux: the requested SIGUSR1 replaces the default SIGCHLD.
+            exit_signal_is_not_chld = !got_chld,
         );
     }
 }
