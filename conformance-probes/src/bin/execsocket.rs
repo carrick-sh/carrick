@@ -11,6 +11,18 @@ use std::ffi::CString;
 use std::time::{Duration, Instant};
 
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--write-stdout") {
+        let bytes = b"child-ok";
+        let written = unsafe {
+            libc::write(
+                libc::STDOUT_FILENO,
+                bytes.as_ptr().cast::<libc::c_void>(),
+                bytes.len(),
+            )
+        };
+        std::process::exit(if written == bytes.len() as isize { 0 } else { 103 });
+    }
+
     unsafe {
         let mut sv = [0i32; 2];
         if libc::socketpair(
@@ -37,18 +49,11 @@ fn main() {
             }
             libc::close(sv[1]);
 
-            let sh = CString::new("/bin/sh").unwrap();
-            let arg0 = CString::new("sh").unwrap();
-            let argc = CString::new("-c").unwrap();
-            let script = CString::new("printf %s child-ok").unwrap();
-            let argv = [
-                arg0.as_ptr(),
-                argc.as_ptr(),
-                script.as_ptr(),
-                core::ptr::null(),
-            ];
+            let exe = CString::new(std::env::args().next().unwrap_or_default()).unwrap();
+            let mode = CString::new("--write-stdout").unwrap();
+            let argv = [exe.as_ptr(), mode.as_ptr(), core::ptr::null()];
             let envp = [core::ptr::null()];
-            libc::execve(sh.as_ptr(), argv.as_ptr(), envp.as_ptr());
+            libc::execve(exe.as_ptr(), argv.as_ptr(), envp.as_ptr());
             libc::_exit(127);
         }
         if pid < 0 {

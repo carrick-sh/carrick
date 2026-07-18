@@ -2,8 +2,8 @@
 //!
 //! Mirrors the child-process shape used by Node/libuv: create a CLOEXEC pipe,
 //! fork, dup the write end onto stdout (dup2 must clear FD_CLOEXEC on fd 1),
-//! close the original pipe fds, exec a shell that writes to stdout, and have
-//! the parent read the bytes then EOF. A wrong fd lifetime shows up as EPIPE in
+//! close the original pipe fds, self-exec a marker mode that writes to stdout,
+//! and have the parent read the bytes then EOF. A wrong fd lifetime shows up as EPIPE in
 //! the exec'd child or as no bytes/EOF in the parent.
 
 use conformance_probes::{errno, report};
@@ -11,6 +11,18 @@ use std::ffi::CString;
 use std::time::{Duration, Instant};
 
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--write-stdout") {
+        let bytes = b"child-ok";
+        let written = unsafe {
+            libc::write(
+                libc::STDOUT_FILENO,
+                bytes.as_ptr().cast::<libc::c_void>(),
+                bytes.len(),
+            )
+        };
+        std::process::exit(if written == bytes.len() as isize { 0 } else { 103 });
+    }
+
     unsafe {
         let mut pipefd = [0i32; 2];
         if libc::pipe2(pipefd.as_mut_ptr(), libc::O_CLOEXEC) != 0 {
@@ -31,18 +43,11 @@ fn main() {
             }
             libc::close(pipefd[1]);
 
-            let sh = CString::new("/bin/sh").unwrap();
-            let arg0 = CString::new("sh").unwrap();
-            let argc = CString::new("-c").unwrap();
-            let script = CString::new("printf %s child-ok").unwrap();
-            let argv = [
-                arg0.as_ptr(),
-                argc.as_ptr(),
-                script.as_ptr(),
-                core::ptr::null(),
-            ];
+            let exe = CString::new(std::env::args().next().unwrap_or_default()).unwrap();
+            let mode = CString::new("--write-stdout").unwrap();
+            let argv = [exe.as_ptr(), mode.as_ptr(), core::ptr::null()];
             let envp = [core::ptr::null()];
-            libc::execve(sh.as_ptr(), argv.as_ptr(), envp.as_ptr());
+            libc::execve(exe.as_ptr(), argv.as_ptr(), envp.as_ptr());
             libc::_exit(127);
         }
         if pid < 0 {
