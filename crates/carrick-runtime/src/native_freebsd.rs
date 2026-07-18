@@ -341,7 +341,7 @@ fn deliver_x86_signal(
         orig_x0: orig_rax,
         fault_esr: 0,
         fpsimd_enabled: false,
-        sigreturn_trampoline_base: 0,
+        sigreturn_trampoline_base: shared.image.sigreturn_trampoline,
     };
     let mut engine = SigframeEngine { snap: snapshot };
     match X8664GuestArch::build_sigframe(&mut engine, params) {
@@ -365,6 +365,134 @@ fn restore_x86_sigreturn(
     Ok(snapshot.rip)
 }
 
+/// A minimal [`carrick_hal::SyscallTrap`] over the live snapshot, just enough to
+/// drive the SHARED [`crate::vcpu_loop::deliver_pending_signal`] — which owns
+/// all the async-delivery policy (blocked/ignored signals, queued siginfo from
+/// rt_sigqueueinfo, SI_USER synthesis, child-exit siginfo, SA_RESTART). Only
+/// `inject_signal`, `restore_from_sigframe`, and `last_syscall_nr` are
+/// exercised; the VMM-shaped methods are never reached on this lane.
+struct NativeX86Trap<'a> {
+    snap: &'a mut X86UcontextSnapshot,
+    last_syscall_nr: Option<u64>,
+    orig_rax: u64,
+    sigreturn_trampoline: u64,
+}
+
+impl carrick_hal::SyscallTrap for NativeX86Trap<'_> {
+    fn next_syscall(&mut self) -> Result<Option<carrick_hal::RawSyscall>, carrick_hal::TrapError> {
+        Err(carrick_hal::TrapError::UnsupportedPlatform)
+    }
+    fn current_pc(&self) -> Result<u64, carrick_hal::TrapError> {
+        Ok(self.snap.rip)
+    }
+    fn complete_syscall(&mut self, _return_value: i64) -> Result<(), carrick_hal::TrapError> {
+        Ok(())
+    }
+    fn fork(&mut self) -> Result<carrick_hal::ForkOutcome, carrick_hal::TrapError> {
+        Err(carrick_hal::TrapError::UnsupportedPlatform)
+    }
+    fn execve_into(
+        &mut self,
+        _new_image: &carrick_mem::memory::AddressSpace,
+    ) -> Result<(), carrick_hal::TrapError> {
+        Err(carrick_hal::TrapError::UnsupportedPlatform)
+    }
+    fn last_syscall_nr(&self) -> Option<u64> {
+        self.last_syscall_nr
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn inject_signal(
+        &mut self,
+        signum: i32,
+        handler: u64,
+        sa_restorer: u64,
+        pending_syscall_retval: Option<i64>,
+        interrupted_pc: Option<u64>,
+        altstack: Option<(u64, u64)>,
+        saved_sigmask: u64,
+        fault_siginfo: Option<(i32, u64)>,
+        queued_siginfo: Option<carrick_abi::LinuxSiginfo>,
+        restart_syscall: bool,
+    ) -> Result<(), carrick_hal::TrapError> {
+        // Real x86 `syscall` stashes the user return RIP in RCX; the shared
+        // builder reads RCX as the syscall-boundary resume_rip. The DSR gateway
+        // instead leaves the resume VA in `snapshot.rip` and does NOT clobber
+        // RCX, so mirror hardware here (only on the syscall-boundary path,
+        // where interrupted_pc is None) — otherwise the handler returns through
+        // a garbage RIP.
+        if interrupted_pc.is_none() {
+            self.snap.gpr[reg::RCX] = self.snap.rip;
+        }
+        let params = carrick_hal::sigframe::InjectParams {
+            signum,
+            handler,
+            sa_restorer,
+            pending_syscall_retval,
+            interrupted_pc,
+            altstack,
+            saved_sigmask,
+            fault_siginfo,
+            queued_siginfo,
+            restart_syscall,
+            pstate_source: self.snap.rflags,
+            orig_x0: self.orig_rax,
+            fault_esr: 0,
+            fpsimd_enabled: false,
+            sigreturn_trampoline_base: self.sigreturn_trampoline,
+        };
+        let mut engine = SigframeEngine { snap: self.snap };
+        X8664GuestArch::build_sigframe(&mut engine, params).map(|_| ())
+    }
+    fn restore_from_sigframe(&mut self) -> Result<u64, carrick_hal::TrapError> {
+        let mut engine = SigframeEngine { snap: self.snap };
+        let restore = X8664GuestArch::restore_sigframe(&mut engine, false)?;
+        Ok(restore.saved_pc)
+    }
+}
+
+/// Deliver any pending, deliverable signals into the guest at a syscall-return
+/// safe point (reuses the shared policy engine). If a default-action signal has
+/// no handler, terminates/stops the process accordingly. Mutates `snapshot` to
+/// enter a handler when one is delivered.
+fn run_pending_signals(
+    shared: &Arc<SharedRun>,
+    tid: crate::thread::ThreadId,
+    snapshot: &mut X86UcontextSnapshot,
+    last_retval: Option<i64>,
+    syscall_nr: Option<u64>,
+    orig_rax: u64,
+) {
+    let mut trap = NativeX86Trap {
+        snap: snapshot,
+        last_syscall_nr: syscall_nr,
+        orig_rax,
+        sigreturn_trampoline: shared.image.sigreturn_trampoline,
+    };
+    let action = crate::vcpu_loop::deliver_pending_signal(
+        &mut trap,
+        &shared.dispatcher,
+        last_retval,
+        tid,
+        None,
+    );
+    match action {
+        Ok(Some(action)) => {
+            if let Some(sig) = action.stop_signal {
+                crate::exec_helpers::stop_by_signal(sig);
+            }
+            if let Some(sig) = action.term_signal {
+                crate::exec_helpers::forked_child_die_by_signal(
+                    sig,
+                    shared.dispatcher.stdout(),
+                    shared.dispatcher.stderr(),
+                );
+            }
+        }
+        Ok(None) => {}
+        Err(_) => {}
+    }
+}
+
 /// A loaded static-pie ELF in the host address space (guest VA == host VA).
 struct LoadedImage {
     span_base: u64,
@@ -373,9 +501,13 @@ struct LoadedImage {
     stack: u64,
     stack_len: usize,
     rsp: u64,
-    /// Kept mapped for the lifetime of the run (argv/AT_RANDOM scratch).
+    /// Kept mapped for the lifetime of the run (argv/AT_RANDOM scratch); its
+    /// tail also holds the rt_sigreturn trampoline.
     scratch: u64,
     scratch_len: usize,
+    /// Guest VA of the `mov $15,%eax; syscall` rt_sigreturn trampoline, used as
+    /// a signal frame's return address when the handler had no `sa_restorer`.
+    sigreturn_trampoline: u64,
     /// The page-rounded [start, end) VA ranges of the mapped PT_LOAD segments,
     /// sorted and coalesced. The reserved span can contain UNMAPPED gaps
     /// between segments; the block planner must not read across one (it would
@@ -530,6 +662,26 @@ fn load_static_pie(bytes: &[u8], argv: &[String]) -> Result<LoadedImage, Runtime
         bias,
     );
 
+    // The rt_sigreturn trampoline: when a guest signal handler was registered
+    // WITHOUT an explicit sa_restorer (Linux falls back to the kernel VDSO
+    // `__kernel_rt_sigreturn`), the sigframe's pretcode points here so the
+    // handler's `ret` lands on `mov $15, %eax; syscall` (rt_sigreturn). Placed
+    // in the scratch page's tail (argv data lives at its head) and published as
+    // a translatable code segment.
+    const SIGRETURN_STUB: [u8; 7] = [0xB8, 0x0F, 0x00, 0x00, 0x00, 0x0F, 0x05];
+    let sigreturn_trampoline = scratch as u64 + PAGE - SIGRETURN_STUB.len() as u64;
+    // SAFETY: writing into the mapped RW scratch page's tail.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            SIGRETURN_STUB.as_ptr(),
+            sigreturn_trampoline as *mut u8,
+            SIGRETURN_STUB.len(),
+        );
+    }
+    // Publish the whole scratch page as a translatable segment so the block
+    // planner can read the trampoline bytes.
+    segments.push((scratch as u64, scratch as u64 + PAGE));
+
     // Sort + coalesce adjacent segments so `code_bytes` can read across
     // touching PT_LOADs but never across a real gap.
     segments.sort_unstable();
@@ -550,6 +702,7 @@ fn load_static_pie(bytes: &[u8], argv: &[String]) -> Result<LoadedImage, Runtime
         rsp,
         scratch: scratch as u64,
         scratch_len: PAGE as usize,
+        sigreturn_trampoline,
         segments: coalesced,
     })
 }
@@ -1596,7 +1749,12 @@ fn service_syscall(
         SyscallNorm::Plain(raw) => raw,
     };
 
+    // The guest's original RAX (= x86 syscall number) so an SA_RESTART restart
+    // re-executes the `syscall` with the right number, and the canonical number
+    // for the restartable-syscall check.
+    let orig_rax = frame.rax;
     let request = SyscallRequest::from_raw(raw).with_current_guest_sp(Some(snapshot.gpr[reg::RSP]));
+    let syscall_nr = request.number.raw();
     let outcome = match service_syscall_threaded(
         dispatcher, request, memory, reporter, waiter, tid, registry, futex,
     ) {
@@ -1605,13 +1763,20 @@ fn service_syscall(
     };
 
     match outcome {
+        // A syscall that returns to the guest: write the retval, then deliver
+        // any pending, deliverable signals at this syscall-return safe point
+        // (self/kill-raised signals, SIGCHLD, rt_sigqueueinfo, …). If a handler
+        // is entered, `snapshot.rip` now points at it.
         DispatchOutcome::Returned { value } => {
             snapshot.gpr[reg::RAX] = value as u64;
-            Step::Continue(resume)
+            run_pending_signals(shared, tid, snapshot, Some(value), Some(syscall_nr), orig_rax);
+            Step::Continue(snapshot.rip)
         }
         DispatchOutcome::Errno { errno } => {
-            snapshot.gpr[reg::RAX] = (-(errno.get() as i64)) as u64;
-            Step::Continue(resume)
+            let retval = -(errno.get() as i64);
+            snapshot.gpr[reg::RAX] = retval as u64;
+            run_pending_signals(shared, tid, snapshot, Some(retval), Some(syscall_nr), orig_rax);
+            Step::Continue(snapshot.rip)
         }
         DispatchOutcome::Exit { code } => Step::Exit(code),
         // A default-action fatal signal with no guest handler (abort/raise/
