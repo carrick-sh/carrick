@@ -1,5 +1,5 @@
 use carrick_spec::{NetworkMode, NetworkNamespaceSpec};
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LinuxNetworkModel {
@@ -79,21 +79,43 @@ impl LinuxNetworkModel {
                     name: format!("eth{idx}"),
                     loopback: false,
                     has_ipv4: true,
-                    has_ipv6: false,
+                    // Docker attaches a link-local IPv6 (fe80::/64) to every veth
+                    // even in an IPv4-only bridge, so a guest enumerating IPv6
+                    // interfaces (getifaddrs AF_INET6, /proc/net/if_inet6,
+                    // /proc/net/igmp6) sees eth0 — keep netlink and procfs
+                    // correlated on the same name.
+                    has_ipv6: true,
                 }),
         );
 
-        let mut addresses = vec![LinuxNetworkAddress {
-            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
-            prefix_len: 8,
-            link_name: "lo".to_string(),
-        }];
-        addresses.extend(attachments.iter().enumerate().map(|(idx, attachment)| {
+        // Loopback carries ::1/128; each uplink carries a link-local fe80::1/64
+        // (matches /proc/net/if_inet6's per-interface row). Enumerating IPv6
+        // interfaces must find at least one UP AF_INET6 iface.
+        let mut addresses = vec![
             LinuxNetworkAddress {
-                addr: IpAddr::V4(attachment.ipv4),
-                prefix_len: 24,
-                link_name: format!("eth{idx}"),
-            }
+                addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                prefix_len: 8,
+                link_name: "lo".to_string(),
+            },
+            LinuxNetworkAddress {
+                addr: IpAddr::V6(Ipv6Addr::LOCALHOST),
+                prefix_len: 128,
+                link_name: "lo".to_string(),
+            },
+        ];
+        addresses.extend(attachments.iter().enumerate().flat_map(|(idx, attachment)| {
+            [
+                LinuxNetworkAddress {
+                    addr: IpAddr::V4(attachment.ipv4),
+                    prefix_len: 24,
+                    link_name: format!("eth{idx}"),
+                },
+                LinuxNetworkAddress {
+                    addr: IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)),
+                    prefix_len: 64,
+                    link_name: format!("eth{idx}"),
+                },
+            ]
         }));
 
         let primary_gateway = attachments
@@ -461,7 +483,7 @@ mod tests {
                     name: "eth0".to_string(),
                     loopback: false,
                     has_ipv4: true,
-                    has_ipv6: false,
+                    has_ipv6: true,
                 },
             ]
         );
