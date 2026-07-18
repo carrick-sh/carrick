@@ -2255,7 +2255,15 @@ fn service_syscall(
             timeout,
             ..
         } => {
+            // Reflect the parked thread as 'S' (interruptible sleep) in the
+            // registry so `/proc/<tid>/stat` synthesis reports it as sleeping
+            // while it blocks on the shared word, then back to 'R' once woken —
+            // matching the private-futex path (`wait_x86_futex`). LTP futex
+            // helpers (e.g. `threadstatstate`, which passes FUTEX_PRIVATE_FLAG=0
+            // and so lands here) poll for state `S`.
+            crate::thread::set_current_thread_state(tid, 'S');
             let retval = shared_futex_wait_umtx(location.wait_addr().raw(), value, timeout);
+            crate::thread::set_current_thread_state(tid, 'R');
             snapshot.gpr[reg::RAX] = retval as u64;
             if let Some(sig) =
                 run_pending_signals(shared, tid, snapshot, Some(retval), Some(syscall_nr), orig_rax)
@@ -2273,7 +2281,9 @@ fn service_syscall(
             index,
             ..
         } => {
+            crate::thread::set_current_thread_state(tid, 'S');
             let retval = shared_futex_wait_umtx(location.wait_addr().raw(), value, timeout);
+            crate::thread::set_current_thread_state(tid, 'R');
             let retval = if retval == 0 { index } else { retval };
             snapshot.gpr[reg::RAX] = retval as u64;
             if let Some(sig) =
