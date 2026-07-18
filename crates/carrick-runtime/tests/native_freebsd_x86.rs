@@ -118,3 +118,39 @@ fn direct_branch_chaining_runs_a_compute_loop_without_round_trips() {
         "chained compute loop took {elapsed:?} — chaining likely broke"
     );
 }
+
+/// A REAL std Rust binary runs to completion natively: a `Vec` of computed
+/// squares, iterators, and `println!` formatting (Debug of the Vec + a sum),
+/// through the real dispatcher — source
+/// `crates/carrick-dsr-x86/tests/fixtures/hello_std.rs`. Exercises full musl +
+/// std startup (TLS via arch_prctl, signal/sigaltstack setup, brk/mmap heap,
+/// RIP-relative rodata, PLT/indirect calls, a page-spanning instruction) and
+/// the buffered-stdout write path. This is the "Rust ecosystem runs natively"
+/// end-to-end proof.
+#[test]
+fn native_backend_runs_a_real_std_rust_binary() {
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../carrick-dsr-x86/tests/fixtures/hello-std-x86_64-linux"
+    );
+    if !std::path::Path::new(fixture).exists() {
+        eprintln!("skipping: std Rust fixture not present ({fixture})");
+        return;
+    }
+
+    let result = carrick_runtime::runtime::run_elf_native_dispatch(fixture.as_ref())
+        .expect("std Rust binary must run to completion natively");
+
+    // exit(sum(n^2, n in 1..=10) % 256) = 385 % 256 = 129.
+    assert_eq!(
+        result.exit_code,
+        129,
+        "std Rust exit = 385 % 256 = 129; stdout was {:?}",
+        String::from_utf8_lossy(&result.stdout)
+    );
+    let out = String::from_utf8_lossy(&result.stdout);
+    assert!(
+        out.contains("squares=[1, 4, 9, 16, 25, 36, 49, 64, 81, 100]") && out.contains("sum=385"),
+        "std Rust println! formatting must work through the dispatcher; got {out:?}"
+    );
+}
