@@ -448,6 +448,9 @@ enum ThreadRunOutcome {
 enum Step {
     Continue(u64),
     Exit(i32),
+    /// A `exit(2)` from a thread that was NOT the last live thread: end just
+    /// this host thread (the run loop returns `ThreadDone`).
+    ThreadEnd,
     Fault(String),
     /// A `fork()` just made THIS process a fork child (guest `rax` already set
     /// to 0). The run loop marks itself a descendant so its eventual exit
@@ -511,8 +514,250 @@ fn patch_slot(
 /// fault-redirect sigaction/code-region registration — so two concurrent runs
 /// in one process would clobber each other's arenas and fault state. Real
 /// usage forks a process per guest (single run per process); the lock makes
-/// the in-process case (e.g. parallel test threads) safe by serializing.
+/// the in-process case (e.g. parallel test threads) safe by serializing. Held
+/// at RUN granularity (not per guest thread): a run's guest threads share the
+/// one code cache + fault shim set up under this lock.
 static RUN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Per-guest-thread JIT code-cache slice size. A guest thread bump-allocates
+/// its translated blocks within its own slice, so concurrent threads never
+/// collide in the cache. The identity code pages are shared and immutable, so
+/// re-JITing the same guest block per thread is correct (just not compact).
+const JIT_SLICE_LEN: usize = CODE_CACHE_LEN;
+/// Number of concurrent guest-thread JIT slices. The whole cache is ONE
+/// contiguous reservation registered once with the fault shim; slices are
+/// handed out (and returned on thread exit) from a free-list, so a program
+/// that recycles threads reuses the space. `clone` fails with EAGAIN if all
+/// slices are in use at once.
+const JIT_SLICE_COUNT: usize = 128;
+
+/// The process-exit rendezvous. `exit_group` from any guest thread — or the
+/// LAST thread's `exit(2)` — terminates the whole process with the recorded
+/// code. The initial (host) thread owns surfacing the `RunResult`, so a sibling
+/// that exits records the code + flag here and the initial thread observes it
+/// (at a run-loop boundary, blocking-wait interrupt, or by waiting on the
+/// condvar once its own guest thread has ended).
+struct ExitState {
+    code: std::sync::Mutex<Option<i32>>,
+    cv: std::sync::Condvar,
+    requested: std::sync::atomic::AtomicBool,
+}
+
+impl ExitState {
+    fn new() -> Self {
+        Self {
+            code: std::sync::Mutex::new(None),
+            cv: std::sync::Condvar::new(),
+            requested: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Record the process exit code (first writer wins) and wake any waiter.
+    fn request(&self, code: i32) {
+        let mut guard = self.code.lock().unwrap_or_else(|p| p.into_inner());
+        if guard.is_none() {
+            *guard = Some(code);
+        }
+        self.requested
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.cv.notify_all();
+    }
+
+    fn requested(&self) -> bool {
+        self.requested.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Block until a process exit code is recorded (used by the initial thread
+    /// after its OWN guest thread exited but siblings are still live).
+    fn wait_for_code(&self) -> i32 {
+        let mut guard = self.code.lock().unwrap_or_else(|p| p.into_inner());
+        while guard.is_none() {
+            guard = self.cv.wait(guard).unwrap_or_else(|p| p.into_inner());
+        }
+        guard.unwrap()
+    }
+
+    fn code(&self) -> Option<i32> {
+        *self.code.lock().unwrap_or_else(|p| p.into_inner())
+    }
+}
+
+/// Everything a guest thread needs that is SHARED across the whole run: the
+/// interior-mutable dispatcher, the thread registry + futex table, the loaded
+/// image, the one contiguous JIT code cache, and the exit rendezvous. Cloned
+/// (Arc) into every spawned host thread.
+struct SharedRun {
+    dispatcher: Arc<SyscallDispatcher>,
+    registry: Arc<crate::thread::ThreadRegistry>,
+    futex: Arc<crate::thread::FutexTable>,
+    reporter: Arc<CompatReporter>,
+    image: Arc<LoadedImage>,
+    region: JitRegion,
+    jit: FreebsdHostJit,
+    max_traps: usize,
+    /// Free JIT-slice offsets (`i * JIT_SLICE_LEN`). Popped on spawn, pushed
+    /// back on thread exit.
+    free_slices: std::sync::Mutex<Vec<usize>>,
+    /// Join handles of spawned guest-thread host threads.
+    threads: std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>,
+    exit: ExitState,
+}
+
+// SAFETY: the only non-`Send`/`Sync` field is `region`'s `NonNull` code-cache
+// pointers. The region is immutable for the whole run; each guest thread writes
+// ONLY into its own non-overlapping slice (via `write_ptr_for`) and executes
+// only from that slice, so there is no data race on the shared reservation.
+unsafe impl Send for SharedRun {}
+unsafe impl Sync for SharedRun {}
+
+impl SharedRun {
+    fn alloc_slice(&self) -> Option<usize> {
+        self.free_slices
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .pop()
+    }
+
+    fn free_slice(&self, off: usize) {
+        self.free_slices
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(off);
+    }
+
+    fn any_threads_spawned(&self) -> bool {
+        !self
+            .threads
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_empty()
+    }
+}
+
+/// A guest `clone(CLONE_VM|CLONE_THREAD…)` request, normalized from the
+/// dispatch outcome plus the parent's live register/TLS state.
+struct CloneThreadRequest {
+    parent_snapshot: X86UcontextSnapshot,
+    resume: u64,
+    parent_fsbase: u64,
+    stack: u64,
+    tls: Option<u64>,
+    parent_tid_addr: u64,
+    child_tid_addr: u64,
+    clear_child_tid_addr: u64,
+}
+
+/// Spawn a guest thread for a `CloneThread` outcome: register the child tid,
+/// write the parent/child tid words, seed a cloned snapshot (rax=0, rsp=child
+/// stack, fsbase=tls if CLONE_SETTLS), and run the per-thread loop on a fresh
+/// host thread over its own JIT slice. Returns the child tid, or a negated
+/// Linux errno the parent's `clone` should return.
+fn spawn_clone_thread(
+    shared: &Arc<SharedRun>,
+    parent_tid: crate::thread::ThreadId,
+    req: CloneThreadRequest,
+) -> Result<crate::thread::ThreadId, i64> {
+    let slice_off = match shared.alloc_slice() {
+        Some(off) => off,
+        // Out of JIT slices: Linux `clone` reports EAGAIN when it cannot
+        // allocate a task's resources.
+        None => return Err(crate::linux_abi::LINUX_EAGAIN.guest_retval()),
+    };
+
+    let child_tid = shared.registry.register_child(req.clear_child_tid_addr);
+    shared
+        .dispatcher
+        .inherit_thread_signal_mask(parent_tid, child_tid);
+
+    // Write the child tid into the parent/child tid words (identity memory).
+    let tid_bytes = (child_tid.raw() as u32).to_le_bytes();
+    if req.parent_tid_addr != 0 {
+        // SAFETY: identity map — a guest-writable word.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                tid_bytes.as_ptr(),
+                req.parent_tid_addr as *mut u8,
+                4,
+            );
+        }
+    }
+    if req.child_tid_addr != 0 {
+        // SAFETY: identity map — a guest-writable word.
+        unsafe {
+            std::ptr::copy_nonoverlapping(tid_bytes.as_ptr(), req.child_tid_addr as *mut u8, 4);
+        }
+    }
+
+    // Clone the parent's register snapshot for the child: rax=0 (clone's child
+    // return), rsp=child stack, resume at the post-syscall RIP.
+    let mut child_snapshot = req.parent_snapshot;
+    child_snapshot.gpr[reg::RAX] = 0;
+    if req.stack != 0 {
+        child_snapshot.gpr[reg::RSP] = req.stack;
+    }
+    child_snapshot.rip = req.resume;
+    let child_fsbase = req.tls.unwrap_or(req.parent_fsbase);
+
+    let child_shared = Arc::clone(shared);
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let spawn = std::thread::Builder::new()
+        .name(format!("carrick-guest-tid-{}", child_tid.raw()))
+        .spawn(move || {
+            // Publish readiness only AFTER the child is registered so the
+            // parent's `clone` returns to a guest that can already observe the
+            // child tid as live.
+            let _ = ready_tx.send(());
+            let mut memory = IdentityGuestMemory;
+            let mut waiter = crate::io_wait::ThreadWaiter::new(child_tid);
+            let outcome = run_x86_thread(
+                ThreadStart::Detached {
+                    snapshot: child_snapshot,
+                    fsbase: child_fsbase,
+                },
+                &child_shared,
+                child_tid,
+                slice_off,
+                JIT_SLICE_LEN,
+                &mut memory,
+                &mut waiter,
+            );
+            child_shared.free_slice(slice_off);
+            match outcome {
+                ThreadRunOutcome::Exit { code, .. } => child_shared.exit.request(code),
+                ThreadRunOutcome::TrapLimit { .. } => child_shared.exit.request(125),
+                ThreadRunOutcome::Fault { detail, .. } => {
+                    let msg = format!("native x86 guest thread {}: {detail}\n", child_tid.raw());
+                    // SAFETY: a straight write to host stderr.
+                    unsafe {
+                        libc::write(2, msg.as_ptr().cast(), msg.len());
+                    }
+                    child_shared.exit.request(125);
+                }
+                // A plain thread exit (`exit(2)`, not last): nothing to do — the
+                // host thread just ends and its slice is already freed.
+                ThreadRunOutcome::ThreadDone { .. } => {}
+            }
+        });
+    let handle = match spawn {
+        Ok(handle) => handle,
+        Err(err) => {
+            // Undo the registration/slice on a spawn failure.
+            shared.registry.exit(child_tid);
+            shared.dispatcher.forget_thread_signal_state(child_tid);
+            shared.free_slice(slice_off);
+            let _ = err;
+            return Err(crate::linux_abi::LINUX_EAGAIN.guest_retval());
+        }
+    };
+    // Wait until the child thread has started (it is already registered).
+    let _ = ready_rx.recv();
+    shared
+        .threads
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .push(handle);
+    Ok(child_tid)
+}
 
 /// Run a static x86_64 Linux ELF natively on FreeBSD/amd64 through the shared
 /// dispatcher. The `dispatcher` is fully constructed by the caller (rootfs,
@@ -540,13 +785,17 @@ where
     let jit = FreebsdHostJit;
     jit.supported()
         .map_err(|e| RuntimeError::Unsupported(format!("host JIT unsupported: {e:?}")))?;
+    // ONE contiguous code cache covering every guest thread's slice, registered
+    // with the fault shim exactly once (the handler reads the per-thread fault
+    // record via %r15, so a single covering span is all it needs).
+    let cache_len = JIT_SLICE_LEN * JIT_SLICE_COUNT;
     let region = jit
-        .map_code_cache(4 * 1024 * 1024)
+        .map_code_cache(cache_len)
         .map_err(|e| RuntimeError::Unsupported(format!("map code cache: {e:?}")))?;
 
     fault::install_fault_redirect(signal_stub_addr(), CTX_FAULT_RECORD)
         .map_err(|e| RuntimeError::Unsupported(format!("install fault redirect: {e}")))?;
-    fault::register_code_region(region.exec_base.as_ptr() as u64, 4 * 1024 * 1024);
+    fault::register_code_region(region.exec_base.as_ptr() as u64, cache_len as u64);
 
     // Back the guest brk-heap and mmap arenas with real host pages at the
     // dispatcher's fixed layout addresses, so `brk`/`mmap` (which move a
@@ -554,12 +803,7 @@ where
     // instead of faulting the host.
     let arenas = GuestArenas::reserve()?;
 
-    let reporter = Arc::new(CompatReporter::default());
     let tid = crate::thread::ThreadId::main_from_host_pid();
-    let mut memory = IdentityGuestMemory;
-    // The single-threaded blocking-I/O waiter (fd wait / poll / select / sleep
-    // / blocking write), shared with the KVM/bhyve single-thread loop.
-    let mut waiter = crate::io_wait::ThreadWaiter::new(tid);
 
     // Shared, thread-safe syscall machinery. The dispatcher is interior-mutable
     // (`dispatch_threaded(&self, …)`), so guest `clone` threads drive the SAME
@@ -567,58 +811,92 @@ where
     // rendezvous the futex/clone/exit outcomes read. Publishing the registry +
     // futex table lets the shared `/proc/<tid>` synthesis and helper-thread
     // signal wakes reach this process's live threads.
-    let dispatcher = Arc::new(dispatcher);
     let registry = Arc::new(crate::thread::ThreadRegistry::new(tid));
     crate::thread::set_current_registry(Arc::clone(&registry));
     let futex = Arc::new(crate::thread::FutexTable::new());
     crate::thread::set_current_futex_table(&futex);
 
-    // The process's initial guest thread runs inline on THIS host thread,
-    // owning the whole code cache. (Guest `clone` threads carve their own
-    // slice and run on spawned host threads — a later step.)
+    let free_slices: Vec<usize> = (0..JIT_SLICE_COUNT).map(|i| i * JIT_SLICE_LEN).collect();
+    let shared = Arc::new(SharedRun {
+        dispatcher: Arc::new(dispatcher),
+        registry,
+        futex,
+        reporter: Arc::new(CompatReporter::default()),
+        image: Arc::new(image),
+        region,
+        jit,
+        max_traps,
+        free_slices: std::sync::Mutex::new(free_slices),
+        threads: std::sync::Mutex::new(Vec::new()),
+        exit: ExitState::new(),
+    });
+
+    // The process's initial guest thread runs inline on THIS host thread over
+    // its own JIT slice. Guest `clone` threads carve their own slice and run on
+    // spawned host threads.
+    let main_slice = shared.alloc_slice().expect("at least one JIT slice");
+    let mut memory = IdentityGuestMemory;
+    // The blocking-I/O waiter (fd wait / poll / select / sleep / blocking
+    // write), shared with the KVM/bhyve single-thread loop.
+    let mut waiter = crate::io_wait::ThreadWaiter::new(tid);
     let outcome = run_x86_thread(
         ThreadStart::Initial {
-            entry: image.entry,
-            rsp: image.rsp,
+            entry: shared.image.entry,
+            rsp: shared.image.rsp,
         },
-        &image,
-        &region,
-        &jit,
-        0,
-        CODE_CACHE_LEN,
-        &dispatcher,
-        &mut memory,
-        &reporter,
-        &mut waiter,
+        &shared,
         tid,
-        &registry,
-        &futex,
-        max_traps,
+        main_slice,
+        JIT_SLICE_LEN,
+        &mut memory,
+        &mut waiter,
     );
+    shared.free_slice(main_slice);
 
-    fault::unregister_code_region();
-    // SAFETY: nothing executes from the JIT region after the loop returns.
-    unsafe { jit.unmap(&region) };
-    image.teardown();
-    arenas.teardown();
-
-    // Drain the guest's stdout/stderr. Unless the caller enabled live
-    // streaming (`set_stream_stdio`), the dispatcher accumulates fd 1/2 writes
-    // in its internal buffers; surface them in the RunResult exactly as the
-    // VMM lanes' buffered path does.
-    let stdout = dispatcher.stdout();
-    let stderr = dispatcher.stderr();
-
-    let (exit_code, traps, trap_limit_hit) = match outcome {
-        ThreadRunOutcome::Exit { code, traps } => (code, traps, false),
-        ThreadRunOutcome::ThreadDone { traps } => (0, traps, false),
-        ThreadRunOutcome::TrapLimit { traps } => (125, traps, true),
-        ThreadRunOutcome::Fault { detail, traps: _ } => {
-            return Err(RuntimeError::Unsupported(format!(
-                "native x86 run stopped before exit: {detail}"
-            )));
+    // Resolve the process exit code. If the initial guest thread itself
+    // `exit(2)`'d while siblings are still live, block until a sibling records
+    // the process exit (the last thread to exit, or an `exit_group`).
+    let (exit_code, traps, trap_limit_hit, fault) = match outcome {
+        ThreadRunOutcome::Exit { code, traps } => {
+            shared.exit.request(code);
+            (code, traps, false, None)
         }
+        ThreadRunOutcome::ThreadDone { traps } => {
+            let code = shared.exit.wait_for_code();
+            (code, traps, false, None)
+        }
+        ThreadRunOutcome::TrapLimit { traps } => {
+            shared.exit.request(125);
+            (125, traps, true, None)
+        }
+        ThreadRunOutcome::Fault { detail, traps } => (125, traps, false, Some(detail)),
     };
+
+    // Drain the guest's stdout/stderr from the SHARED dispatcher buffer (every
+    // guest thread's writes accumulate here); surface them in the RunResult
+    // exactly as the VMM lanes' buffered path does.
+    let stdout = shared.dispatcher.stdout();
+    let stderr = shared.dispatcher.stderr();
+
+    // Teardown only when this run never spawned a guest thread. With live
+    // siblings still executing from the shared code cache / guest arenas,
+    // unmapping either would fault them; a multi-threaded probe run terminates
+    // the whole process right after this returns (native_run `process::exit`),
+    // so the OS reclaims everything. The single-thread path (the in-process
+    // test harness, which reuses the process across runs) still tears down.
+    if !shared.any_threads_spawned() {
+        fault::unregister_code_region();
+        // SAFETY: nothing executes from the JIT region in the single-thread case.
+        unsafe { shared.jit.unmap(&shared.region) };
+        shared.image.teardown();
+        arenas.teardown();
+    }
+
+    if let Some(detail) = fault {
+        return Err(RuntimeError::Unsupported(format!(
+            "native x86 run stopped before exit: {detail}"
+        )));
+    }
 
     Ok(RunResult {
         exit_code,
@@ -640,20 +918,17 @@ where
 #[allow(clippy::too_many_arguments)]
 fn run_x86_thread(
     start: ThreadStart,
-    image: &LoadedImage,
-    region: &JitRegion,
-    jit: &FreebsdHostJit,
+    shared: &Arc<SharedRun>,
+    tid: crate::thread::ThreadId,
     slice_off: usize,
     slice_len: usize,
-    dispatcher: &SyscallDispatcher,
     memory: &mut IdentityGuestMemory,
-    reporter: &CompatReporter,
     waiter: &mut crate::io_wait::ThreadWaiter,
-    tid: crate::thread::ThreadId,
-    registry: &crate::thread::ThreadRegistry,
-    futex: &crate::thread::FutexTable,
-    max_traps: usize,
 ) -> ThreadRunOutcome {
+    let image = &shared.image;
+    let region = &shared.region;
+    let jit = &shared.jit;
+    let max_traps = shared.max_traps;
     // All guest-code reads go through the segment-aware `image.code_bytes`,
     // which never crosses an unmapped gap between PT_LOAD segments.
     let read_guest = |va: u64| -> Vec<u8> { image.code_bytes(va).to_vec() };
@@ -715,6 +990,16 @@ fn run_x86_thread(
     let mut history: Vec<u64> = Vec::new();
 
     'run: while traps < max_traps {
+        // Another guest thread requested process exit (`exit_group`, or the
+        // last thread's `exit(2)`): stop this thread's loop and surface the
+        // recorded code. The initial thread turns this into the `RunResult`;
+        // a sibling thread just ends (its closure re-requests idempotently).
+        if shared.exit.requested() {
+            return ThreadRunOutcome::Exit {
+                code: shared.exit.code().unwrap_or(0),
+                traps,
+            };
+        }
         history.push(next);
         if history.len() > 64 {
             history.remove(0);
@@ -851,17 +1136,19 @@ fn run_x86_thread(
             Some(X86ExitStatus::Syscall) => {
                 traps += 1;
                 match service_syscall(
-                    dispatcher,
+                    shared,
                     memory,
-                    reporter,
                     waiter,
                     tid,
-                    registry,
-                    futex,
                     &mut snapshot,
                     &mut guest_fsbase,
                 ) {
                     Step::Continue(rip) => next = rip,
+                    Step::ThreadEnd => {
+                        // This thread exited via `exit(2)` and was NOT the last
+                        // live thread: end just this host thread.
+                        return ThreadRunOutcome::ThreadDone { traps };
+                    }
                     Step::BecameForkChild(rip) => {
                         // This process is now a fork descendant; its exit must
                         // be reaped by the parent, not returned up.
@@ -960,16 +1247,17 @@ fn run_x86_thread(
 /// `arch_prctl(SET_FS)` sets `guest_fsbase` (VMM state has no analog here).
 #[allow(clippy::too_many_arguments)]
 fn service_syscall(
-    dispatcher: &SyscallDispatcher,
+    shared: &Arc<SharedRun>,
     memory: &mut IdentityGuestMemory,
-    reporter: &CompatReporter,
     waiter: &mut crate::io_wait::ThreadWaiter,
     tid: crate::thread::ThreadId,
-    registry: &crate::thread::ThreadRegistry,
-    futex: &crate::thread::FutexTable,
     snapshot: &mut X86UcontextSnapshot,
     guest_fsbase: &mut u64,
 ) -> Step {
+    let dispatcher = &shared.dispatcher;
+    let reporter = &shared.reporter;
+    let registry = &shared.registry;
+    let futex = &shared.futex;
     let frame = X8664SyscallFrame {
         rax: snapshot.gpr[reg::RAX],
         rdi: snapshot.gpr[reg::RDI],
@@ -1071,9 +1359,64 @@ fn service_syscall(
             snapshot.gpr[reg::RAX] = value as u64;
             Step::Continue(resume)
         }
+        // Thread-creating `clone(CLONE_VM|CLONE_THREAD…)`: spawn a real host
+        // thread sharing this (identity) address space. `clone` returns the
+        // child tid in the parent; the child starts at the post-syscall RIP
+        // with rax=0.
+        DispatchOutcome::CloneThread {
+            stack,
+            tls,
+            flags: _,
+            parent_tid_addr,
+            child_tid_addr,
+            clear_child_tid_addr,
+        } => {
+            let req = CloneThreadRequest {
+                parent_snapshot: *snapshot,
+                resume,
+                parent_fsbase: *guest_fsbase,
+                stack,
+                tls,
+                parent_tid_addr,
+                child_tid_addr,
+                clear_child_tid_addr,
+            };
+            match spawn_clone_thread(shared, tid, req) {
+                Ok(child_tid) => {
+                    snapshot.gpr[reg::RAX] = i64::from(child_tid.raw()) as u64;
+                }
+                Err(errno) => {
+                    snapshot.gpr[reg::RAX] = errno as u64;
+                }
+            }
+            Step::Continue(resume)
+        }
+        // A single thread exited via `exit(2)` (NOT exit_group): wake its
+        // CLONE_CHILD_CLEARTID futex (glibc/musl `pthread_join` waits on it),
+        // retire it from the registry, and end just this host thread — unless
+        // it was the last live thread, in which case the whole process exits.
+        DispatchOutcome::ThreadExit { code } => {
+            if let Some(addr) = registry.clear_child_tid(tid)
+                && addr != 0
+            {
+                // SAFETY: identity map — the guest's own clear-tid word.
+                unsafe {
+                    std::ptr::write_bytes(addr as *mut u8, 0, 4);
+                }
+                futex.wake(addr, 1);
+            }
+            let last = registry.exit(tid);
+            crate::thread::set_current_thread_state(tid, 'Z');
+            dispatcher.forget_thread_signal_state(tid);
+            if last {
+                Step::Exit(code)
+            } else {
+                Step::ThreadEnd
+            }
+        }
         other => Step::Fault(format!(
             "native x86 driver does not service dispatch outcome {other:?} yet \
-             (threads/execve/futex are later rungs)"
+             (execve/vfork are later rungs)"
         )),
     }
 }
