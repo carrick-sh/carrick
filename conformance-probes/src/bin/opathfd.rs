@@ -51,13 +51,16 @@ fn main() {
     let w = unsafe { libc::write(fd, buf.as_ptr() as *const libc::c_void, 1) };
     println!("write_ebadf={}", w == -1 && errno() == libc::EBADF);
 
-    // fchmod() → -1 / EBADF.
-    let fc = unsafe { libc::fchmod(fd, 0o600) };
+    // Use the raw syscall: musl's libc wrapper retries EBADF through
+    // fchmodat(/proc/self/fd/N), which tests libc fallback rather than the
+    // kernel O_PATH contract.
+    let fc = unsafe { libc::syscall(libc::SYS_fchmod, fd, 0o600) };
     println!("fchmod_ebadf={}", fc == -1 && errno() == libc::EBADF);
 
     // fchown() → -1 / EBADF (chown to -1/-1 == no-op IDs, still rejected for
-    // O_PATH before any ownership check runs).
-    let fo = unsafe { libc::fchown(fd, u32::MAX, u32::MAX) };
+    // O_PATH before any ownership check runs). Bypass musl's fchownat fallback
+    // for the same reason as fchmod above.
+    let fo = unsafe { libc::syscall(libc::SYS_fchown, fd, u32::MAX, u32::MAX) };
     println!("fchown_ebadf={}", fo == -1 && errno() == libc::EBADF);
 
     // fgetxattr() → -1 / EBADF (the fd has no I/O access; xattr query is denied
