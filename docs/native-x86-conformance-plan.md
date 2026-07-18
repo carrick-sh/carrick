@@ -299,10 +299,37 @@ with zero HANG/OTHER.
 
 Reliable serial census, all 432 targets. Raw data: `docs/native-x86-census.tsv`.
 
-| Date | OK | Notable |
+> **Metric correction (important).** The 250/281/355 figures below were an
+> *exit-0* proxy, which **overcounts** — many probes exit 0 while printing a
+> failed assertion. The true gate diffs probe output vs a Docker oracle (aarch64
+> `carrick run`), unavailable on this FreeBSD rig. Honest local proxy: **exit-0
+> AND no `=false`/panic** (probes phrase invariants positively, so `=false` =
+> failure). All numbers from here use the strict metric. See
+> [[native-x86-conformance-metric]].
+
+| Date | OK (metric) | Notable |
 |------|-----|---------|
-| baseline | 250 / 432 (58%) | blocking-I/O + fork + file-mmap landed |
-| **Rung A landed** | **281 / 432 (65%)** | guest threads + futex via `dispatch_threaded`; +31 net, 0 real regressions |
+| baseline | 250 / 432 (exit-0) | blocking-I/O + fork + file-mmap landed |
+| Rung A | 281 / 432 (exit-0) | guest threads + futex via `dispatch_threaded` |
+| fork-cache fix | 355 / 432 (exit-0) | private JIT cache per fork child |
+| **honest re-baseline** | **245 / 428 (STRICT)** | after threads+futex+fork-cache; exit-0 was +110 inflated |
+
+**Strict bucket breakdown (the real work-list):**
+
+| Bucket | Count | Meaning → rung |
+|--------|-------|------|
+| `EXIT_FALSE` | **113** | ran clean, WRONG answer = servicing correctness bug — biggest lever |
+| `EMIT` | 26 | container networking / `hlt` (Rung B) |
+| `TIMEOUT` | 17 | slow (some true-but-slow passers) / hang |
+| `OUT` | 10 | unhandled outcomes: Execve ×3, SignalThread ×5, WaitOnSharedWord ×2 |
+| `FAULT` | 10 | guest faults |
+| `OTHER` | 7 | misc |
+
+**Pivot: signal delivery is now the clear #1 rung.** ~38 signal-family probes are
+spread across `EXIT_FALSE` (signals, siginfo, saresethand, sigactionresetinfo,
+selfraise, sigqueueusr1, tgsigqueue, rtsigqueueinfo, pendingunblock, signalfd4,
+sigwait*, …), `OUT:SignalThread` (×5), and `FAULT`. Delivering signals into guest
+handlers clears a chunk of THREE buckets at once — the highest ROI available.
 
 Rung A delta (+31 net): the CloneThread cluster (threadspawn, threadstatuscount,
 manythreads, threadbarrier, …) plus FAULT-tagged clone/futex probes that flipped
