@@ -1,42 +1,26 @@
-//! Reducer for LTP ioctl_loop setup: the Docker oracle exposes loop-device
-//! support through /proc/config.gz.
-
-use std::ffi::CString;
+//! Reducer for LTP ioctl_loop setup: the Linux oracle exposes loop-device
+//! support through `/proc/config.gz`.
+//!
+//! Decode the proc file in-process so the probe tests the kernel-facing surface
+//! itself rather than depending on `/bin/sh`, `gzip`, and `grep` being installed
+//! in a minimal standalone rootfs.
 
 use conformance_probes::report;
+use flate2::read::GzDecoder;
+use std::io::Read;
 
 fn main() {
-    let shell = CString::new("/bin/sh").unwrap();
-    let arg0 = CString::new("sh").unwrap();
-    let arg1 = CString::new("-c").unwrap();
-    let script =
-        CString::new("gzip -dc /proc/config.gz 2>/dev/null | grep -qx CONFIG_BLK_DEV_LOOP=y")
-            .unwrap();
-
-    let pid = unsafe { libc::fork() };
-    if pid < 0 {
-        report!(fork_ok = false);
-        return;
-    }
-    if pid == 0 {
-        unsafe {
-            libc::execl(
-                shell.as_ptr(),
-                arg0.as_ptr(),
-                arg1.as_ptr(),
-                script.as_ptr(),
-                core::ptr::null::<libc::c_char>(),
-            );
-            libc::_exit(127);
-        }
-    }
-
-    let mut status = 0;
-    let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
-    let exited = waited == pid && libc::WIFEXITED(status);
-    let code = if exited { libc::WEXITSTATUS(status) } else { -1 };
+    let mut config = String::new();
+    let decoded = std::fs::File::open("/proc/config.gz")
+        .ok()
+        .and_then(|file| {
+            let mut decoder = GzDecoder::new(file);
+            decoder.read_to_string(&mut config).ok()
+        })
+        .is_some();
+    let loop_enabled = decoded && config.lines().any(|line| line == "CONFIG_BLK_DEV_LOOP=y");
     report!(
-        fork_ok = true,
-        proc_config_loop_enabled = exited && code == 0,
+        proc_config_decoded = decoded,
+        proc_config_loop_enabled = loop_enabled,
     );
 }
