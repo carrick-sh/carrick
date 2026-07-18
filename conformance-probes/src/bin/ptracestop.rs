@@ -121,7 +121,7 @@ fn main() {
         report!(
             fork_ok = true,
             blocking_wait_reaped_stop = wait_rc == pid,
-            blocking_wait_alarm_fired = ALARM_FIRED.load(Ordering::Relaxed),
+            blocking_wait_completed_before_alarm = !ALARM_FIRED.load(Ordering::Relaxed),
             blocking_wait_errno = wait_errno,
             blocking_wait_errno_zero = wait_errno == 0,
             blocking_wait_stopped = stopped,
