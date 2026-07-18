@@ -363,7 +363,25 @@ Reliable serial census, all 432 targets. Raw data: `docs/native-x86-census.tsv`.
 | signals + dispatcher + die-by-signal | 282 / 428 (exit=0 STRICT) | honest; +37 net over 245. die-by-signal fix dropped OTHER crashes 32→8 |
 | wave 2 (parallel: driver + dispatcher) | 294 / 428 (~295 true) | +12 net. vDSO, io-waiter signal-interruptibility, setitimer; sysvsemstat/accounting/waitpgid |
 | wave 3 (parallel: driver + dispatcher) | 304 / 428 (~305 true) | +10 net. shared futex, fork-child resets, unmap_range + PROT_NONE gate, altstack, epollpri |
-| **wave 4 (parallel: driver + networking)** | **314 / 428 (~315 true)** | +10 net. container bridge network (8 bridge_*), execve/Rung E (execfromthread/execsig/execthreads), threadstatstate recovered |
+| wave 4 (parallel: driver + networking) | 314 / 428 (~315 true) | +10 net. container bridge network, execve/Rung E, threadstatstate recovered |
+| **wave 5 (parallel: driver + dispatcher)** | **334 / 428** | +20 net. cross-process signals (sigqueue/pause/sigwait/sigtimedwait), procctl reaper + SIGCHLD, shared FUTEX_WAKE count, netifmcast+schedprio |
+
+**Wave-5 detail (+20):** driver — cross-process xsignal ring (`sigqueueusr1`,`bsd_signal_xlate`), pumped standard signals (`pauseinterrupt2`), sigwait/sigtimedwait wake (`sigwaitthread`,`sigtimedwaitintr`,`sigwaitblock`), EINTR wait4 (`waitrestart`), shared FUTEX_WAKE count (`futexwakecount`,`futexsharedalias`), procctl reaper + SIGCHLD routing (`childsubreaper`,`waitsiblingsigchld`) — cascaded to `sigchld`,`cloneexithandled`,`clone3exithandled`,`mtforkcorrupt`,`ltpcheckpoint`,`sysvsem`,`waitexitstorm`,`killfault`; dispatcher — `netifmcast` (bridge eth0 IPv6), `schedprio` (EFAULT non-canonical param).
+- **2 regressions (reaper trade-off): `pidnsinitreap`, `reparenttoinit`** — native_run now reaps all orphans (procctl), so they don't reparent to init(pid 1) as these expect. Fix: make reaping pid-1/subreaper-aware (only reap when the guest is a subreaper or IS guest-init). Net reaper change strongly positive.
+- More not-bugs/arch-locked confirmed: `signalfd4` (aarch64 #74=fsync), `futexpingpong` (pass-condition IS a `=false`), `threadcommname`/`schedthread` (aarch64 syscall numbers).
+
+## Session summary: 245 → 334 (+89 net)
+
+From a threadless/signal-less/fork-fragile driver to guest threads + futex + full
+signal delivery + robust fork + container networking + execve + timers/vDSO +
+broad dispatcher correctness. **334/428 = 78% raw, ~83% of the ~398–403 winnable**
+(unwinnable: ~12 arch-locked, 8 harness-dependent net, ~7 rootfs-blocked execve,
+icmp host-cap). Remaining winnable backlog: reaper pid-1 fix; `forkfault`/
+`mprotectexec` (fault-engine faulting-insn retry + translate-on-demand from live
+guest memory); `sysvmsg`/`sysvmsgwake` (WaitOnSharedWord in the driver re-dispatch
+loop); central `IdentityGuestMemory` raw-access non-canonical guard (fixes
+`mlock2`/`schedthread` host-crashes); vDSO getrandom/gettimeofday x86 blobs;
+`pidnsorphanreap`; ptrace family.
 
 **Wave-4 detail:** networking — wired `make_native_dispatcher` to `bridge_default` (reused existing VMM/macOS container synthesis, ZERO new code) → 8 `bridge_*` probes; driver — execve/Rung E in-process image replacement (`execfromthread`/`execsig`/`execthreads`), `threadstatstate` regression fixed (shared-futex waiter now marks `/proc` state `'S'`). `openat2resolve` census-flaky (passes standalone). **1 real regression: `netifmcast`** — the bridge hides `en0`/shows only `eth0`, which lacks the multicast interface it wants; fix = set `IFF_MULTICAST` on synthesized `eth0` (net networking still +7).
 
