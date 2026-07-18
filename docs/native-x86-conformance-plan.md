@@ -301,7 +301,16 @@ Reliable serial census, all 432 targets. Raw data: `docs/native-x86-census.tsv`.
 
 | Date | OK | Notable |
 |------|-----|---------|
-| baseline (this census) | **250 / 432 (58%)** | blocking-I/O + fork + file-mmap landed |
+| baseline | 250 / 432 (58%) | blocking-I/O + fork + file-mmap landed |
+| **Rung A landed** | **281 / 432 (65%)** | guest threads + futex via `dispatch_threaded`; +31 net, 0 real regressions |
+
+Rung A delta (+31 net): the CloneThread cluster (threadspawn, threadstatuscount,
+manythreads, threadbarrier, …) plus FAULT-tagged clone/futex probes that flipped
+as predicted (clonebasic, futexrequeue, futexdeadline, futexrealtime, …) and a
+few adjacent (ioctlcluster, memfdcreate, prctlerrors). The 4 census "regressions"
+(cloneexithandled, epollforkeventfd, mmaprecl, zerolenio) were verified to pass
+exit 0 when run directly — census flakiness under the new thread-spawn load, not
+real. Census timeout bumped 6→10s to remove it.
 
 Failing-bucket breakdown at baseline:
 
