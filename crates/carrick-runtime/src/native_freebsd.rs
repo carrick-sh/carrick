@@ -233,12 +233,51 @@ fn identity_raw_range_valid(address: u64, length: usize) -> bool {
             .is_some_and(|end| end < X86_64_USER_END_EXCLUSIVE)
 }
 
+/// Non-faulting host-VMA check before a syscall path forms an identity slice.
+/// Initial ELF/stack mappings are not all represented in dispatcher protection
+/// metadata, so canonicality alone is insufficient: musl deliberately probes
+/// below the main stack with `mremap`, and an unchecked raw read there would
+/// fault the host runtime instead of returning a Linux errno.
+fn identity_host_range_mapped(address: u64, length: usize) -> bool {
+    if length == 0 {
+        return true;
+    }
+    let Some(end) = address.checked_add(length as u64) else {
+        return false;
+    };
+    let start = address & !(PAGE - 1);
+    let Some(aligned_end) = end.checked_add(PAGE - 1).map(|value| value & !(PAGE - 1)) else {
+        return false;
+    };
+    let mut cursor = start;
+    let mut residency = [0i8; 256];
+    while cursor < aligned_end {
+        let remaining_pages = (aligned_end - cursor) / PAGE;
+        let pages = remaining_pages.min(residency.len() as u64) as usize;
+        // SAFETY: `residency` has one byte per queried page; mincore only
+        // inspects VMA metadata and returns ENOMEM for a hole without faulting.
+        if unsafe {
+            libc::mincore(
+                cursor as *mut libc::c_void,
+                pages * PAGE as usize,
+                residency.as_mut_ptr(),
+            )
+        } != 0
+        {
+            return false;
+        }
+        cursor += pages as u64 * PAGE;
+    }
+    true
+}
+
 #[cfg(test)]
 mod identity_raw_range_tests {
     use super::{
-        SharedWaitAssignment, freebsd_shared_waiter_key, identity_raw_range_valid,
-        init_shared_waiter_table, shared_futex_requeue_umtx, shared_futex_wake_umtx,
-        shared_waiter_slot, take_shared_wait_assignment, wait_requeued_umtx,
+        SharedWaitAssignment, freebsd_shared_waiter_key, identity_host_range_mapped,
+        identity_raw_range_valid, init_shared_waiter_table, shared_futex_requeue_umtx,
+        shared_futex_wake_umtx, shared_waiter_slot, take_shared_wait_assignment,
+        wait_requeued_umtx,
     };
     use std::os::fd::AsRawFd;
 
@@ -261,6 +300,24 @@ mod identity_raw_range_tests {
     fn zero_length_access_never_forms_a_pointer() {
         assert!(identity_raw_range_valid(0, 0));
         assert!(identity_raw_range_valid(u64::MAX, 0));
+    }
+
+    #[test]
+    fn host_range_check_rejects_a_real_unmapped_hole() {
+        let page = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(page, libc::MAP_FAILED);
+        assert!(identity_host_range_mapped(page as u64, 4096));
+        unsafe { libc::munmap(page, 4096) };
+        assert!(!identity_host_range_mapped(page as u64, 4096));
     }
 
     #[test]
@@ -494,7 +551,9 @@ impl GuestMemory for IdentityGuestMemory {
         // A null-page, wrapping, or non-canonical guest range is never a valid
         // Linux userspace mapping. Surface it as EFAULT before constructing a
         // host slice (`mlock2`, legacy-aio, and sched-thread bad-pointer probes).
-        if !identity_raw_range_valid(address, length) {
+        if !identity_raw_range_valid(address, length)
+            || !identity_host_range_mapped(address, length)
+        {
             return Err(carrick_guest_mem::MemoryError::OutOfBounds { address, length });
         }
         // SAFETY: identity map — `address` is a host VA; the caller asserts the
@@ -524,7 +583,9 @@ impl GuestMemory for IdentityGuestMemory {
         if bytes.is_empty() {
             return Ok(());
         }
-        if !identity_raw_range_valid(address, bytes.len()) {
+        if !identity_raw_range_valid(address, bytes.len())
+            || !identity_host_range_mapped(address, bytes.len())
+        {
             return Err(carrick_guest_mem::MemoryError::OutOfBounds {
                 address,
                 length: bytes.len(),

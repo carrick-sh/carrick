@@ -2182,8 +2182,9 @@ impl SyscallDispatcher {
                 // tracks the new size/position), so we return the unchanged base.
                 // (Unlike the arena shrink below we do NOT eagerly unmap the tail
                 // here — invalidating a high-VA alias tail needs trap-engine
-                // coordination; no caller reads it. A grow would mean relocating
-                // a file/shared backing, which we don't do → EINVAL as before.)
+                // coordination; no caller reads it. A grow without MAYMOVE cannot
+                // be placed in situ, which Linux reports as ENOMEM. Musl relies on
+                // that distinction while probing the main stack VMA.)
                 if memory.read_bytes(old_address.0, 1).is_err() {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
@@ -2192,7 +2193,7 @@ impl SyscallDispatcher {
                         value: old_address.0 as i64,
                     });
                 }
-                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
             }
             if new_size <= old_size {
                 // Linux mremap shrink unmaps the freed tail [old+new_size,
