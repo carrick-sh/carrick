@@ -387,6 +387,41 @@ impl GuestMemory for IdentityGuestMemory {
         Ok(())
     }
 
+    fn repoint_private(
+        &mut self,
+        va: u64,
+        _overlay_ipa: u64,
+        len: usize,
+        content: &[u8],
+    ) -> Result<(), carrick_guest_mem::MemoryError> {
+        // VMM backends repoint stage-1 into a private overlay IPA. Identity
+        // execution has no page tables, so replace this process's mapping at the
+        // guest VA with an anonymous MAP_PRIVATE object. Across host fork this
+        // detaches the child from the inherited shared object exactly like
+        // Linux MAP_FIXED|MAP_PRIVATE.
+        let mapped = unsafe {
+            libc::mmap(
+                va as *mut libc::c_void,
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_FIXED | libc::MAP_ANON | libc::MAP_PRIVATE,
+                -1,
+                0,
+            )
+        };
+        if mapped == libc::MAP_FAILED || mapped as u64 != va {
+            return Err(carrick_guest_mem::MemoryError::OutOfBounds {
+                address: va,
+                length: len,
+            });
+        }
+        if !content.is_empty() {
+            self.write_bytes_raw(va, content)?;
+        }
+        IDENTITY_PROTECTIONS.set_mapping_protection(va, len, false, false);
+        Ok(())
+    }
+
     /// Scrub a reused/`MAP_FIXED` anonymous region to zero. If a prior
     /// `unmap_range` left this VA a hole, the default raw-write scrub would fault
     /// the host, so first re-establish zero-filled RW backing with an anonymous
