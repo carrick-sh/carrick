@@ -2724,6 +2724,7 @@ fn service_syscall(
             parent_tid_addr,
             child_tid_addr,
             child_stack,
+            pidfd_out,
             exit_signal,
             ..
         } => service_fork(
@@ -2733,6 +2734,7 @@ fn service_syscall(
                 parent_tid_addr,
                 child_tid_addr,
                 child_stack,
+                pidfd_out,
                 parent_tid: tid.raw(),
                 exit_signal,
             },
@@ -3538,6 +3540,7 @@ struct NativeForkRequest {
     parent_tid_addr: Option<u64>,
     child_tid_addr: Option<u64>,
     child_stack: u64,
+    pidfd_out: Option<u64>,
     parent_tid: i32,
     exit_signal: u32,
 }
@@ -3586,10 +3589,35 @@ fn service_fork(
         }
     };
 
+    // CLONE_PIDFD must be atomic from the guest's perspective: the child cannot
+    // run user code before the parent installs its pidfd and output pointer. A
+    // private host pipe gates only that path; it never enters the guest fd table.
+    let pidfd_gate = if request.pidfd_out.is_some() {
+        let mut fds = [-1; 2];
+        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+            crate::guest_cpu::abort_prepared_child_record();
+            drop(fork_guard);
+            let errno = std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EMFILE);
+            snapshot.gpr[reg::RAX] = (-(errno as i64)) as u64;
+            return Step::Continue(resume);
+        }
+        Some(fds)
+    } else {
+        None
+    };
+
     // SAFETY: a plain process fork; the child re-enters the same run loop with
     // a COW copy of every mapping.
     let pid = unsafe { libc::fork() };
     if pid < 0 {
+        if let Some([read_fd, write_fd]) = pidfd_gate {
+            unsafe {
+                libc::close(read_fd);
+                libc::close(write_fd);
+            }
+        }
         // Keep serialization until the process-global pending-record stash is
         // cleared. Dropping the guard first lets a sibling prepare its record,
         // which this failure path would then abort instead of our own.
@@ -3606,6 +3634,23 @@ fn service_fork(
         // Child: complete the record inherited from the serialized pre-fork
         // preparation before it can fork children or expose process identity.
         crate::guest_cpu::complete_child_record_post_fork_child();
+        if let Some([read_fd, write_fd]) = pidfd_gate {
+            unsafe { libc::close(write_fd) };
+            let mut release = 0u8;
+            let mut rc;
+            loop {
+                rc = unsafe {
+                    libc::read(read_fd, (&mut release as *mut u8).cast::<libc::c_void>(), 1)
+                };
+                if rc >= 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                    break;
+                }
+            }
+            unsafe { libc::close(read_fd) };
+            if rc != 1 || release != 1 {
+                unsafe { libc::_exit(127) };
+            }
+        }
         snapshot.gpr[reg::RAX] = 0;
         if request.child_stack != 0 {
             snapshot.gpr[reg::RSP] = request.child_stack;
@@ -3616,8 +3661,37 @@ fn service_fork(
         }
         Step::BecameForkChild(resume)
     } else {
-        // Parent: publish by the exact prepared-record reference. A later fork
-        // may already have replaced the process-global child stash.
+        if let Some([read_fd, _]) = pidfd_gate {
+            unsafe { libc::close(read_fd) };
+        }
+        let installed_pidfd = if request.pidfd_out.is_some() {
+            match dispatcher.install_child_pidfd(pid) {
+                Ok(fd) => Some(fd),
+                Err(errno) => {
+                    // The child is still behind the private gate. Remove it and
+                    // the unpublished process record so clone fails atomically.
+                    unsafe {
+                        libc::kill(pid, libc::SIGKILL);
+                        if let Some([_, write_fd]) = pidfd_gate {
+                            libc::close(write_fd);
+                        }
+                        let mut status = 0;
+                        while libc::waitpid(pid, &mut status, 0) < 0
+                            && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
+                        {
+                        }
+                    }
+                    crate::guest_cpu::abort_prepared_child_record();
+                    snapshot.gpr[reg::RAX] = errno.guest_retval() as u64;
+                    return Step::Continue(resume);
+                }
+            }
+        } else {
+            None
+        };
+
+        // Parent: publish by the exact prepared-record reference only after all
+        // fallible CLONE_PIDFD setup has succeeded.
         crate::guest_cpu::publish_prepared_child_record_parent_ref(prepared, pid as u32);
         crate::namespace::pid::notify_child_registered();
         crate::host_signal::register_child_exit_watch(
@@ -3625,15 +3699,24 @@ fn service_fork(
             request.parent_tid,
             i32::try_from(request.exit_signal).unwrap_or(0),
         );
-        // Close the fast-child race: SIGCHLD may have arrived before the watch
-        // was published. A forced WNOWAIT scan observes the zombie without
-        // consuming it, leaving guest wait4/waitid responsible for the reap.
-        drain_native_child_exit_watches(true);
+        if let (Some(addr), Some(pidfd)) = (request.pidfd_out, installed_pidfd) {
+            let _ = memory.write_bytes(addr, &pidfd.to_le_bytes());
+        }
         let guest_pid = child_ns_pid.unwrap_or(pid as u32);
         snapshot.gpr[reg::RAX] = u64::from(guest_pid);
         if let Some(addr) = request.parent_tid_addr {
             let _ = memory.write_bytes(addr, &guest_pid.to_le_bytes());
         }
+        if let Some([_, write_fd]) = pidfd_gate {
+            let release = 1u8;
+            let _ =
+                unsafe { libc::write(write_fd, (&release as *const u8).cast::<libc::c_void>(), 1) };
+            unsafe { libc::close(write_fd) };
+        }
+        // Close the fast-child race for ungated forks and publish any child that
+        // exited immediately after the pidfd gate opened. WNOWAIT leaves the
+        // zombie for the guest's wait syscall.
+        drain_native_child_exit_watches(true);
         Step::Continue(resume)
     }
 }
