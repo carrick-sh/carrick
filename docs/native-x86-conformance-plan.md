@@ -221,6 +221,36 @@ trace with the loud breadcrumbs + dtrace USDT + gcore/JIT-disasm playbook in
 AGENTS.md, find the divergence, fix the underlying servicing bug. Likely a
 cluster with 1–3 shared root causes.
 
+## Rung C bucket, triaged from probe sources (56 `FAULT:signal11`)
+
+Reading the probe headers splits the 56 into four groups — only two are true
+"Rung C" work; the rest belong to Rung A or a new signal rung:
+
+- **Downstream of Rung A (clone/futex) — will likely flip when A lands, no extra
+  work:** `clonebasic`, `clonestack`, `clone3pidfdsig`, `futexpingpong`,
+  `futexshare`, `futexsharedalias`, `futexwakeexact`, `futexforkrequeue`,
+  `futexforkwakegroups`. → **Rung A over-delivers** beyond its 44.
+- **Signal delivery to guest handlers (NEW Rung, the next-biggest after A):**
+  deliver a signal into the guest's installed handler with correct
+  `siginfo.si_addr`/`si_code` and `ucontext`, and return via the guest's
+  `rt_sigreturn`. Probes: `faultaddr`, `kill*`, `sig*` (`sigchld`, `signalexit`,
+  `sigpairrace`, `sigbadstack`, `sigtimedwaitintr`, `sigwaitblock`), `xsignal`,
+  `xprocsigign`, `pauseinterrupt2`, `ppollsig`. ~15–18 probes. The current lane
+  maps `SignalDeath → exit(128+signum)`, which is wrong for both handler
+  delivery and death fidelity.
+- **Signal-death fidelity:** a guest that dies by signal must actually die by
+  that signal so the parent's `wait4` reports `WIFSIGNALED && WTERMSIG==sig`
+  (today it exits `128+sig`, so `wait4` sees `WIFEXITED`). Probes: `abortdeath`,
+  `signalexit`, `ptracesigdeath`, `killgroup`. Fix: `raise(sig)` with default
+  disposition in the child instead of `_exit`. Small, high-leverage.
+- **True Rung C — protection enforcement:** guest stores to non-writable pages
+  must `SIGSEGV`/`SEGV_ACCERR` (the identity model currently maps guest pages
+  with host perms, so guest `.rodata`/`PROT_READ`/`PROT_NONE` are effectively
+  writable). Probes: `roprotect`, `rosharedbus`, parts of `mapfixed*`. Requires
+  honoring guest-requested protections on the guest's *own* accesses.
+- **Big separate features (defer):** `ptrace*`, `pidns*`, `seccompenforce`,
+  `iouring`.
+
 ## Rung C — Protection faults + diverse signal-11
 
 ~25 probes. Two sub-groups:
