@@ -364,24 +364,24 @@ Reliable serial census, all 432 targets. Raw data: `docs/native-x86-census.tsv`.
 | wave 2 (parallel: driver + dispatcher) | 294 / 428 (~295 true) | +12 net. vDSO, io-waiter signal-interruptibility, setitimer; sysvsemstat/accounting/waitpgid |
 | wave 3 (parallel: driver + dispatcher) | 304 / 428 (~305 true) | +10 net. shared futex, fork-child resets, unmap_range + PROT_NONE gate, altstack, epollpri |
 | wave 4 (parallel: driver + networking) | 314 / 428 (~315 true) | +10 net. container bridge network, execve/Rung E, threadstatstate recovered |
-| **wave 5 (parallel: driver + dispatcher)** | **334 / 428** | +20 net. cross-process signals (sigqueue/pause/sigwait/sigtimedwait), procctl reaper + SIGCHLD, shared FUTEX_WAKE count, netifmcast+schedprio |
+| wave 5 (parallel: driver + dispatcher) | 334 / 428 | +20 net. cross-process signals, procctl reaper + SIGCHLD, shared FUTEX_WAKE count, netifmcast+schedprio |
+| **wave 6 (lifecycle + shared-word + VMA safety)** | **344 / 428** | +10 net. init/subreaper orphan lifecycle, SysV message waits, fail-closed identity VMAs; zero host-crash buckets |
+
+**Wave-6 detail (+10):** fork now prepares/publishes the shared child record and exits through the common adoption helper; init-reaper adoption is exposed as guest PID 1 while an explicit child subreaper retains its PID (`pidnsinitreap`,`reparenttoinit`,`pidnsorphanreap`, cascading to `ptracekillcont`). A host-neutral shared-word seam (Darwin ulock / FreeBSD umtx / Linux futex / NetBSD futex), stable pre-fork SysV scope, and native re-dispatch make `sysvmsg`/`sysvmsgwake` pass. Fail-closed identity VMA initialization plus real high-alias backing removed the remaining native-run host crashes and cascaded to `futexwakeexact`,`mremapsharedshrink`,`procstatstate`,`shmnestedfork`. `mlock2`,`legacyaio`,`roprotect`,`schedthread` now fail as clean probe assertions instead of crashing the host; `mlock2` still lacks direct-guest first-touch residency tracking, and `legacyaio`/`schedthread` are aarch64-numbered on this x86 corpus. The parallel census timed out `mtsigrelease` once; the checked-in result records its immediate focused 5/5 rerun.
 
 **Wave-5 detail (+20):** driver — cross-process xsignal ring (`sigqueueusr1`,`bsd_signal_xlate`), pumped standard signals (`pauseinterrupt2`), sigwait/sigtimedwait wake (`sigwaitthread`,`sigtimedwaitintr`,`sigwaitblock`), EINTR wait4 (`waitrestart`), shared FUTEX_WAKE count (`futexwakecount`,`futexsharedalias`), procctl reaper + SIGCHLD routing (`childsubreaper`,`waitsiblingsigchld`) — cascaded to `sigchld`,`cloneexithandled`,`clone3exithandled`,`mtforkcorrupt`,`ltpcheckpoint`,`sysvsem`,`waitexitstorm`,`killfault`; dispatcher — `netifmcast` (bridge eth0 IPv6), `schedprio` (EFAULT non-canonical param).
-- **2 regressions (reaper trade-off): `pidnsinitreap`, `reparenttoinit`** — native_run now reaps all orphans (procctl), so they don't reparent to init(pid 1) as these expect. Fix: make reaping pid-1/subreaper-aware (only reap when the guest is a subreaper or IS guest-init). Net reaper change strongly positive.
 - More not-bugs/arch-locked confirmed: `signalfd4` (aarch64 #74=fsync), `futexpingpong` (pass-condition IS a `=false`), `threadcommname`/`schedthread` (aarch64 syscall numbers).
 
-## Session summary: 245 → 334 (+89 net)
+## Session summary: 245 → 344 (+99 net)
 
 From a threadless/signal-less/fork-fragile driver to guest threads + futex + full
 signal delivery + robust fork + container networking + execve + timers/vDSO +
-broad dispatcher correctness. **334/428 = 78% raw, ~83% of the ~398–403 winnable**
+broad dispatcher correctness. **344/428 = 80% raw, ~85–86% of the ~398–403 winnable**
 (unwinnable: ~12 arch-locked, 8 harness-dependent net, ~7 rootfs-blocked execve,
-icmp host-cap). Remaining winnable backlog: reaper pid-1 fix; `forkfault`/
-`mprotectexec` (fault-engine faulting-insn retry + translate-on-demand from live
-guest memory); `sysvmsg`/`sysvmsgwake` (WaitOnSharedWord in the driver re-dispatch
-loop); central `IdentityGuestMemory` raw-access non-canonical guard (fixes
-`mlock2`/`schedthread` host-crashes); vDSO getrandom/gettimeofday x86 blobs;
-`pidnsorphanreap`; ptrace family.
+icmp host-cap). Remaining winnable backlog: `forkfault`/`mprotectexec`
+(fault-engine faulting-insn retry + translate-on-demand from live guest memory);
+vDSO getrandom/gettimeofday x86 blobs; precise direct-guest protection/residency
+faults (`roprotect`,`mlock2`); exit-signal/clone3 tails; ptrace family.
 
 **Wave-4 detail:** networking — wired `make_native_dispatcher` to `bridge_default` (reused existing VMM/macOS container synthesis, ZERO new code) → 8 `bridge_*` probes; driver — execve/Rung E in-process image replacement (`execfromthread`/`execsig`/`execthreads`), `threadstatstate` regression fixed (shared-futex waiter now marks `/proc` state `'S'`). `openat2resolve` census-flaky (passes standalone). **1 real regression: `netifmcast`** — the bridge hides `en0`/shows only `eth0`, which lacks the multicast interface it wants; fix = set `IFF_MULTICAST` on synthesized `eth0` (net networking still +7).
 
@@ -400,7 +400,7 @@ Beyond arch-locked (~10), two more categories are unwinnable under single-proces
   dynamic PIE the static-PIE loader can't load. execve itself works.
 - **Host-capability:** `icmp` (unprivileged ICMP sockets absent on FreeBSD host).
 
-So **314/~315 is ~78% of the ~398–403 winnable set** (73% of the raw 428).
+So **344 is ~85–86% of the ~398–403 winnable set** (80% of the raw 428).
 
 **Wave-3 detail:** driver — `futexshare` (real cause: shared-futex location was `None`; `_umtx_op` non-private key spans fork), `procprctlview` (fork-child resets), `mremapmove`/`mremapshrink`/`protnonesyscall` (real `unmap_range` + a process-wide `MemoryProtections` gate on `IdentityGuestMemory` — the syscall EFAULT gate now fires), `forkaltstack`, `sigbadstack`; dispatcher — `epollpri` (don't arm the kqueue OOB filter on FreeBSD). The protection gate also flipped `aliassize` (the pre-existing host segfault) and `fcntllock`. `killfault`/`forkfpreclaim` census-flaky (pass standalone). **1 real regression: `threadstatstate`** (wave-3 drift; to fix). **Highest-leverage remaining driver fix already landed** (the `MemoryProtections` gate) — expect more PROT_NONE/`SEGV_ACCERR` probes reachable now.
 
