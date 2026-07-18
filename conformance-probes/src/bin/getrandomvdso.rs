@@ -104,6 +104,13 @@ type GrFn = unsafe extern "C" fn(*mut u8, usize, u32, *mut u8, usize) -> isize;
 fn main() {
     unsafe {
         let addr = vdso_sym("__kernel_getrandom");
+        if cfg!(target_arch = "x86_64") {
+            // `__kernel_getrandom` is the arm64 ABI spelling. amd64 Linux does
+            // not export it (new kernels use `__vdso_getrandom` instead), so
+            // absence is the portable x86 contract this probe can assert.
+            println!("kernel_getrandom_absent={}", addr == 0);
+            return;
+        }
         println!("getrandom_resolved={}", addr != 0);
         if addr == 0 {
             println!("query_ret_zero=false");

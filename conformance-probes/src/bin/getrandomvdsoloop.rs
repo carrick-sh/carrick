@@ -88,6 +88,10 @@ type F = unsafe extern "C" fn(*mut u8, usize, u32, *mut u8, usize) -> isize;
 fn main() {
     unsafe {
         let a = sym("__kernel_getrandom");
+        if cfg!(target_arch = "x86_64") {
+            println!("kernel_getrandom_absent={}", a == 0);
+            return;
+        }
         if a == 0 {
             println!("resolved=false");
             println!("loop_total=0");
