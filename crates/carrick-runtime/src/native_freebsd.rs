@@ -133,7 +133,103 @@ const NEG_EINVAL: i64 = -22;
 /// is a genuine EFAULT the handlers surface).
 struct IdentityGuestMemory;
 
+/// Process-wide syscall-path protection metadata for the identity lane. Because
+/// `IdentityGuestMemory` is a stateless unit struct constructed at every call
+/// site, the VMA-classification sets (`no_access` / `no_write` / post-`munmap`
+/// `unmapped`) live in ONE global that every instance's `protections()` gate
+/// reads. The dispatcher's mmap/munmap/mprotect handlers already publish into
+/// this via `set_no_access`/`set_unmapped`/`set_mapping_protection`, so a syscall
+/// that touches a `PROT_NONE` or freed guest range returns `EFAULT` instead of
+/// raw-faulting the host, and `mincore` (which probes through gated `read_bytes`)
+/// reports the freed range unmapped. Fork inherits the parent's COW mappings, so
+/// the child correctly starts from a copy of this set.
+static IDENTITY_PROTECTIONS: std::sync::LazyLock<
+    carrick_guest_mem::protections::MemoryProtections,
+> = std::sync::LazyLock::new(carrick_guest_mem::protections::MemoryProtections::default);
+
+/// Re-establish host backing for `[address, address+len)` IFF it overlaps a
+/// tracked `munmap` hole. Guest `munmap`/`mremap`-shrink genuinely releases the
+/// pages (so JIT accesses fault and `mincore` reports unmapped), but when the
+/// dispatcher then re-establishes a mapping over that VA (mmap-reuse, mremap
+/// grow tail / move destination) the host pages must exist again before its
+/// zero/copy raw writes touch them — otherwise the runtime itself faults. A
+/// `MAP_FIXED` anonymous RW remap fills the hole with zeroed pages; ranges with
+/// no hole (e.g. a live-data `mprotect`) are left untouched so content survives.
+fn ensure_identity_backed(address: u64, len: usize) {
+    if len == 0 || address < PAGE {
+        return;
+    }
+    if !IDENTITY_PROTECTIONS.range_unmapped(address, len) {
+        return;
+    }
+    // SAFETY: identity VA; MAP_FIXED atomically fills the freed hole with fresh
+    // zero-filled anonymous RW pages. The hole-only guard above keeps this from
+    // clobbering live mappings.
+    unsafe {
+        libc::mmap(
+            address as *mut libc::c_void,
+            len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_FIXED | libc::MAP_ANON | libc::MAP_PRIVATE,
+            -1,
+            0,
+        );
+    }
+    // The range is mapped again — drop its unmapped/no-access gate.
+    IDENTITY_PROTECTIONS.set_unmapped(address, len, false);
+}
+
 impl GuestMemory for IdentityGuestMemory {
+    fn protections(
+        &self,
+    ) -> Option<&carrick_guest_mem::protections::MemoryProtections> {
+        Some(&IDENTITY_PROTECTIONS)
+    }
+
+    fn set_no_access(&mut self, address: u64, len: usize, no_access: bool) {
+        if !no_access {
+            // Transition back to accessible: re-establish backing if this range
+            // was a munmap hole, so a following raw scrub/copy does not fault.
+            ensure_identity_backed(address, len);
+        }
+        IDENTITY_PROTECTIONS.set_no_access(address, len, no_access);
+    }
+
+    fn set_no_write(&mut self, address: u64, len: usize, no_write: bool) {
+        IDENTITY_PROTECTIONS.set_no_write(address, len, no_write);
+    }
+
+    fn set_unmapped(&mut self, address: u64, len: usize, unmapped: bool) {
+        // Route straight to the shared metadata's `set_unmapped` — the trait
+        // DEFAULT would call `set_no_access(true)`, which reclassifies the hole
+        // out of the `unmapped` set (that setter clears it), and then
+        // `ensure_identity_backed`'s `range_unmapped` check would miss the hole
+        // and never re-back a reused munmap range (a guest fault on mremap-grow).
+        if !unmapped {
+            ensure_identity_backed(address, len);
+        }
+        IDENTITY_PROTECTIONS.set_unmapped(address, len, unmapped);
+    }
+
+    fn set_mapping_protection(&mut self, address: u64, len: usize, no_access: bool, no_write: bool) {
+        // Establishing a mapping over a range that was a munmap hole (mmap-reuse,
+        // mremap grow tail / move destination) must re-back the host pages FIRST,
+        // so the dispatcher's subsequent zero/copy raw writes land on real pages
+        // instead of faulting the host. A guest `mprotect` on LIVE data hits no
+        // hole, so its content is left intact (no re-map).
+        ensure_identity_backed(address, len);
+        IDENTITY_PROTECTIONS.set_mapping_protection(address, len, no_access, no_write);
+    }
+
+    fn protect_range(&mut self, address: u64, len: usize, _prot: u64) -> Result<(), carrick_guest_mem::MemoryError> {
+        // Guest-visible protection ENFORCEMENT on live pages is a later rung; here
+        // we only re-establish backing for a freed range so a grown/reused mapping
+        // is usable (the identity lane keeps JIT accesses lenient — the syscall
+        // path is gated by `protections()`).
+        ensure_identity_backed(address, len);
+        Ok(())
+    }
+
     fn read_bytes_raw(
         &self,
         address: u64,
@@ -177,6 +273,66 @@ impl GuestMemory for IdentityGuestMemory {
         unsafe {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), address as *mut u8, bytes.len());
         }
+        Ok(())
+    }
+
+    /// Guest `munmap`/`mremap`-shrink actually releases the host pages, so the
+    /// freed range faults on access (guest `SIGSEGV`/`SEGV_MAPERR`) and `mincore`
+    /// reports it unmapped (ENOMEM) — matching Linux. A no-op left the identity
+    /// arena pages mapped+RW, so a raw read of a freed tail still succeeded and
+    /// `mincore` said mapped (`mremapshrink`, `mremapmove`, `mremapsharedshrink`).
+    /// `munmap` at the identity VA (guest VA == host VA) creates a genuine hole;
+    /// a later guest mmap that reuses this VA re-establishes backing through
+    /// `zero_backing` (which re-maps the hole before scrubbing it).
+    fn unmap_range(&mut self, address: u64, len: usize) -> Result<(), carrick_guest_mem::MemoryError> {
+        if len == 0 || address < PAGE {
+            return Ok(());
+        }
+        // SAFETY: identity VA; releasing guest-owned host pages. A partial/failed
+        // munmap is non-fatal here — the range is being torn down regardless.
+        unsafe {
+            libc::munmap(address as *mut libc::c_void, len);
+        }
+        // Record the hole so a syscall-path read/write returns EFAULT (not a host
+        // fault) and mincore reports it unmapped; a guest JIT access still faults
+        // the real hole and is caught by the fault shim as SEGV_MAPERR.
+        IDENTITY_PROTECTIONS.set_unmapped(address, len, true);
+        Ok(())
+    }
+
+    /// Scrub a reused/`MAP_FIXED` anonymous region to zero. If a prior
+    /// `unmap_range` left this VA a hole, the default raw-write scrub would fault
+    /// the host, so first re-establish zero-filled RW backing with an anonymous
+    /// `MAP_FIXED` remap (which both maps and zeroes); an already-mapped region is
+    /// scrubbed in place. Callers exclude file/alias regions, so the anonymous
+    /// remap never clobbers file-backed content.
+    fn zero_backing(&mut self, address: u64, len: usize) -> Result<(), carrick_guest_mem::MemoryError> {
+        if len == 0 {
+            return Ok(());
+        }
+        // SAFETY: identity VA. MAP_FIXED atomically replaces any current mapping
+        // (or fills a munmap hole) with fresh zero-filled anonymous RW pages.
+        let p = unsafe {
+            libc::mmap(
+                address as *mut libc::c_void,
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_FIXED | libc::MAP_ANON | libc::MAP_PRIVATE,
+                -1,
+                0,
+            )
+        };
+        if p == libc::MAP_FAILED || p as u64 != address {
+            // Remap failed (out of arena, etc.): fall back to a gated raw scrub,
+            // which is correct whenever the range is already mapped.
+            return carrick_guest_mem::zero_range_chunked(address, len, |addr, bytes| {
+                self.write_bytes_raw(addr, bytes)
+            });
+        }
+        // The range is mapped + zeroed again: clear any stale unmapped/no-access
+        // gate so a reused hole is syscall-accessible.
+        IDENTITY_PROTECTIONS.set_mapping_protection(address, len, false, false);
+        // Fresh anonymous pages are already zero.
         Ok(())
     }
 
