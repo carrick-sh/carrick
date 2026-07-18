@@ -58,8 +58,7 @@ fn main() {
             child_map_fixed_ok = b[0] != 0,
             // Linux: true (child's private write stayed in the child).
             parent_value_preserved = parent_val == 0xAA,
-            // carrick (bug): true (child write leaked through to the parent).
-            parent_clobbered_by_child = parent_val == 0xBB,
+            parent_not_clobbered_by_child = parent_val != 0xBB,
         );
     }
 }
