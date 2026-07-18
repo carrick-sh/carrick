@@ -1842,7 +1842,9 @@ fn service_syscall(
         DispatchOutcome::FutexWait { wait, timeout } => {
             let value = wait_x86_futex(futex, tid, wait, timeout, 0);
             snapshot.gpr[reg::RAX] = value as u64;
-            Step::Continue(resume)
+            // A signal-interrupted futex (EINTR) delivers its handler here.
+            run_pending_signals(shared, tid, snapshot, Some(value), Some(syscall_nr), orig_rax);
+            Step::Continue(snapshot.rip)
         }
         DispatchOutcome::FutexWaitv {
             wait,
@@ -1852,6 +1854,30 @@ fn service_syscall(
             // On a wake, `futex_waitv` returns the INDEX of the woken futex.
             let value = wait_x86_futex(futex, tid, wait, timeout, index);
             snapshot.gpr[reg::RAX] = value as u64;
+            run_pending_signals(shared, tid, snapshot, Some(value), Some(syscall_nr), orig_rax);
+            Step::Continue(snapshot.rip)
+        }
+        // `tgkill`/`tkill` targeting a SIBLING guest thread: publish the signal
+        // pending for the target and unpark it (a futex/blocking waiter observes
+        // the pending signal and returns EINTR, delivering the handler at its
+        // next syscall boundary). Completes with 0, or -ESRCH if the target
+        // already exited.
+        DispatchOutcome::SignalThread {
+            tid: target,
+            signum,
+        } => {
+            let retval = if registry.is_live(target) {
+                crate::host_signal::publish_pending_for_with_wake(
+                    target.raw(),
+                    signum,
+                    crate::host_signal::PublicationWake::CallerManaged,
+                );
+                futex.notify_signal_pending_for(target);
+                0
+            } else {
+                crate::linux_abi::LINUX_ESRCH.guest_retval()
+            };
+            snapshot.gpr[reg::RAX] = retval as u64;
             Step::Continue(resume)
         }
         // Thread-creating `clone(CLONE_VM|CLONE_THREAD…)`: spawn a real host
@@ -1927,11 +1953,13 @@ fn service_syscall(
     }
 }
 
-/// Park this thread on `wait` until woken, timed out, or interrupted, and map
-/// the outcome to the Linux futex return value. `woken_value` is 0 for
-/// `FUTEX_WAIT` and the woken index for `futex_waitv`. The interrupt predicate
-/// is a no-op for now — signal-driven futex interruption is a later rung; a
-/// sibling `FUTEX_WAKE` (generation advance) and the timeout already work.
+/// Park this thread on `wait` until woken, timed out, or interrupted by a
+/// pending (deliverable) signal, and map the outcome to the Linux futex return
+/// value. `woken_value` is 0 for `FUTEX_WAIT` and the woken index for
+/// `futex_waitv`. A sibling `tgkill`/`tkill` publishes a thread-directed signal
+/// and calls `notify_signal_pending_for`, which unparks this waiter; the
+/// interrupt predicate then observes the pending signal and returns EINTR so
+/// the syscall boundary delivers the handler.
 fn wait_x86_futex(
     futex: &crate::thread::FutexTable,
     tid: crate::thread::ThreadId,
@@ -1943,7 +1971,10 @@ fn wait_x86_futex(
     // `/proc/<tid>/stat` synthesis reports it as sleeping while it blocks, then
     // back to 'R' (running) once it is woken.
     crate::thread::set_current_thread_state(tid, 'S');
-    let outcome = futex.wait_prepared_for_thread(wait, timeout, tid, &|| false);
+    let interrupted = || {
+        crate::host_signal::has_unblocked_pending_for(tid.raw(), carrick_abi::SigBlockMask::NONE)
+    };
+    let outcome = futex.wait_prepared_for_thread(wait, timeout, tid, &interrupted);
     crate::thread::set_current_thread_state(tid, 'R');
     match outcome {
         crate::thread::FutexWaitOutcome::Woken => woken_value,
