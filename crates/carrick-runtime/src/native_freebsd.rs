@@ -208,6 +208,10 @@ impl LoadedImage {
 
 const PAGE: u64 = 4096;
 const GUEST_STACK_LEN: usize = 8 * 1024 * 1024;
+/// Per-run JIT code-cache size. In the single-thread case one guest thread
+/// owns the whole span; with guest threads it is carved into per-thread slices
+/// (see `run_static_x86_elf`).
+const CODE_CACHE_LEN: usize = 4 * 1024 * 1024;
 
 fn map_prot(len: usize, prot: i32, fixed_at: Option<u64>) -> *mut u8 {
     let (addr, flags) = match fixed_at {
@@ -409,6 +413,36 @@ fn build_initial_stack(stack_top: u64, scratch: u64, argv: &[String], elf: &Elf,
     rsp
 }
 
+/// How a guest thread's per-thread run loop is seeded.
+enum ThreadStart {
+    /// The process's initial thread: start at the ELF entry with a fresh
+    /// snapshot and the initial stack pointer.
+    Initial { entry: u64, rsp: u64 },
+    /// A `clone(CLONE_VM|CLONE_THREAD…)` child: resume from a cloned snapshot
+    /// (rax already 0, rsp already the child stack) with the child's fsbase.
+    #[allow(dead_code)]
+    Detached {
+        snapshot: X86UcontextSnapshot,
+        fsbase: u64,
+    },
+}
+
+/// Terminal outcome of a guest thread's per-thread run loop.
+enum ThreadRunOutcome {
+    /// The guest exited (`exit_group`, or `exit(2)` as the last live thread):
+    /// the whole process should terminate with `code`.
+    Exit { code: i32, traps: usize },
+    /// This single thread exited (`exit(2)`, not last): only this host thread
+    /// ends. Carries whether it was the last live thread for the caller.
+    #[allow(dead_code)]
+    ThreadDone { traps: usize },
+    /// The run loop hit the trap limit with no exit/fault.
+    TrapLimit { traps: usize },
+    /// The run loop stopped on an unserviced condition (guest fault, an
+    /// unsupported instruction, or an unhandled dispatch outcome).
+    Fault { detail: String, traps: usize },
+}
+
 /// The result of running one translated block through the gateway: where to go
 /// next, or a terminal signal.
 enum Step {
@@ -527,6 +561,81 @@ where
     // / blocking write), shared with the KVM/bhyve single-thread loop.
     let mut waiter = crate::io_wait::ThreadWaiter::new(tid);
 
+    // The process's initial guest thread runs inline on THIS host thread,
+    // owning the whole code cache. (Guest `clone` threads carve their own
+    // slice and run on spawned host threads — a later step.)
+    let outcome = run_x86_thread(
+        ThreadStart::Initial {
+            entry: image.entry,
+            rsp: image.rsp,
+        },
+        &image,
+        &region,
+        &jit,
+        0,
+        CODE_CACHE_LEN,
+        &mut dispatcher,
+        &mut memory,
+        &reporter,
+        &mut waiter,
+        max_traps,
+    );
+
+    fault::unregister_code_region();
+    // SAFETY: nothing executes from the JIT region after the loop returns.
+    unsafe { jit.unmap(&region) };
+    image.teardown();
+    arenas.teardown();
+
+    // Drain the guest's stdout/stderr. Unless the caller enabled live
+    // streaming (`set_stream_stdio`), the dispatcher accumulates fd 1/2 writes
+    // in its internal buffers; surface them in the RunResult exactly as the
+    // VMM lanes' buffered path does.
+    let stdout = dispatcher.stdout();
+    let stderr = dispatcher.stderr();
+
+    let (exit_code, traps, trap_limit_hit) = match outcome {
+        ThreadRunOutcome::Exit { code, traps } => (code, traps, false),
+        ThreadRunOutcome::ThreadDone { traps } => (0, traps, false),
+        ThreadRunOutcome::TrapLimit { traps } => (125, traps, true),
+        ThreadRunOutcome::Fault { detail, traps: _ } => {
+            return Err(RuntimeError::Unsupported(format!(
+                "native x86 run stopped before exit: {detail}"
+            )));
+        }
+    };
+
+    Ok(RunResult {
+        exit_code,
+        stdout,
+        stderr,
+        traps,
+        report: CompatReport::default(),
+        trap_limit_hit,
+    })
+}
+
+/// Run one guest thread's translate/execute/service loop to completion. The
+/// process's initial thread runs this inline; a `clone` child runs it on its
+/// own host thread. `slice_off`/`slice_len` bound this thread's non-overlapping
+/// window into the shared JIT code cache (its own cursor + block cache), so
+/// concurrent threads never collide in the cache. All guest memory is identity-
+/// mapped, so the block cache is per-thread but the translated bytes are the
+/// same for a given VA.
+#[allow(clippy::too_many_arguments)]
+fn run_x86_thread(
+    start: ThreadStart,
+    image: &LoadedImage,
+    region: &JitRegion,
+    jit: &FreebsdHostJit,
+    slice_off: usize,
+    slice_len: usize,
+    dispatcher: &mut SyscallDispatcher,
+    memory: &mut IdentityGuestMemory,
+    reporter: &CompatReporter,
+    waiter: &mut crate::io_wait::ThreadWaiter,
+    max_traps: usize,
+) -> ThreadRunOutcome {
     // All guest-code reads go through the segment-aware `image.code_bytes`,
     // which never crosses an unmapped gap between PT_LOAD segments.
     let read_guest = |va: u64| -> Vec<u8> { image.code_bytes(va).to_vec() };
@@ -552,15 +661,22 @@ where
         out
     };
 
-    let mut snapshot = X86UcontextSnapshot::new();
-    snapshot.gpr[reg::RSP] = image.rsp;
-    let mut guest_fsbase = 0u64;
-    let mut next = image.entry;
-    let mut cursor = 0usize;
+    let (mut snapshot, mut guest_fsbase, mut next) = match start {
+        ThreadStart::Initial { entry, rsp } => {
+            let mut snapshot = X86UcontextSnapshot::new();
+            snapshot.gpr[reg::RSP] = rsp;
+            (snapshot, 0u64, entry)
+        }
+        ThreadStart::Detached { snapshot, fsbase } => {
+            let next = snapshot.rip;
+            (snapshot, fsbase, next)
+        }
+    };
+    let mut cursor = slice_off;
+    let cursor_limit = slice_off + slice_len;
     let mut traps = 0usize;
     let mut exit_code: Option<i32> = None;
     let mut fault_detail: Option<String> = None;
-    let mut trap_limit_hit = false;
     // True once this process is a `fork()` descendant (see `Step::Exit`).
     let mut forked = false;
 
@@ -569,7 +685,6 @@ where
     // VA always translates to the same bytes and the entry is valid for the
     // whole run. Cursor is monotonic. `has_edges` means the block ends in a
     // chainable direct branch; `uses_fpu` drives the FPU save/restore skip.
-    const CODE_CACHE_LEN: usize = 4 * 1024 * 1024;
     let mut cache: std::collections::HashMap<u64, (u64, bool, bool), VaBuildHasher> =
         std::collections::HashMap::default();
     // Chain edges awaiting their target's translation: `target_va -> [(rel32
@@ -644,9 +759,9 @@ where
                     break;
                 }
             };
-            if cursor + linked.bytes.len() > CODE_CACHE_LEN {
+            if cursor + linked.bytes.len() > cursor_limit {
                 fault_detail = Some(format!(
-                    "JIT code cache exhausted ({CODE_CACHE_LEN} bytes) translating 0x{next:x}"
+                    "JIT code cache slice exhausted ({slice_len} bytes) translating 0x{next:x}"
                 ));
                 break;
             }
@@ -674,7 +789,7 @@ where
                 let patch_abs = exec_u64 + edge.rel32_off as u64;
                 let next_abs = patch_abs + 4;
                 if let Some(&(target_exec, _, _)) = cache.get(&edge.target_va) {
-                    patch_slot(&region, &jit, patch_abs, next_abs, target_exec);
+                    patch_slot(region, jit, patch_abs, next_abs, target_exec);
                 } else {
                     pending
                         .entry(edge.target_va)
@@ -685,7 +800,7 @@ where
             // Patch any earlier-translated blocks that were waiting for THIS VA.
             if let Some(waiters) = pending.remove(&next) {
                 for (patch_abs, next_abs) in waiters {
-                    patch_slot(&region, &jit, patch_abs, next_abs, exec_u64);
+                    patch_slot(region, jit, patch_abs, next_abs, exec_u64);
                 }
             }
             entry
@@ -718,10 +833,10 @@ where
             Some(X86ExitStatus::Syscall) => {
                 traps += 1;
                 match service_syscall(
-                    &mut dispatcher,
-                    &mut memory,
-                    &reporter,
-                    &mut waiter,
+                    dispatcher,
+                    memory,
+                    reporter,
+                    waiter,
                     &mut snapshot,
                     &mut guest_fsbase,
                 ) {
@@ -805,41 +920,14 @@ where
         }
     }
 
-    if traps >= max_traps && exit_code.is_none() && fault_detail.is_none() {
-        trap_limit_hit = true;
+    if let Some(detail) = fault_detail {
+        return ThreadRunOutcome::Fault { detail, traps };
     }
-
-    fault::unregister_code_region();
-    // SAFETY: nothing executes from the JIT region after the loop returns.
-    unsafe { jit.unmap(&region) };
-    image.teardown();
-    arenas.teardown();
-
-    // Drain the guest's stdout/stderr. Unless the caller enabled live
-    // streaming (`set_stream_stdio`), the dispatcher accumulates fd 1/2 writes
-    // in its internal buffers; surface them in the RunResult exactly as the
-    // VMM lanes' buffered path does.
-    let stdout = dispatcher.stdout();
-    let stderr = dispatcher.stderr();
-
-    let exit_code = match (exit_code, &fault_detail) {
-        (Some(code), _) => code,
-        (None, Some(detail)) => {
-            return Err(RuntimeError::Unsupported(format!(
-                "native x86 run stopped before exit: {detail}"
-            )));
-        }
-        (None, None) => 125,
-    };
-
-    Ok(RunResult {
-        exit_code,
-        stdout,
-        stderr,
-        traps,
-        report: CompatReport::default(),
-        trap_limit_hit,
-    })
+    if let Some(code) = exit_code {
+        return ThreadRunOutcome::Exit { code, traps };
+    }
+    // The while-condition failed with no exit and no fault: the trap limit.
+    ThreadRunOutcome::TrapLimit { traps }
 }
 
 /// Adapt a `syscall` gateway exit into the shared dispatcher. Builds the same
