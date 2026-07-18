@@ -855,6 +855,17 @@ impl SyscallDispatcher {
                     this.io
                         .nofile_soft
                         .store(soft, std::sync::atomic::Ordering::Relaxed);
+                    // Back the guest's fd soft limit with real host descriptors.
+                    // Host-backed opens (regular files, /dev/null and other char
+                    // devices, sockets, pipes) each consume a native_run fd, so a
+                    // guest that raises RLIMIT_NOFILE and then opens up to that many
+                    // fds would hit the HOST process's RLIMIT_NOFILE (EMFILE) long
+                    // before its own limit — Linux never does, because the guest's
+                    // fds ARE kernel fds. Raise our own soft limit to cover the
+                    // guest's, plus headroom for carrick's internal descriptors
+                    // (event ring, epoll/kqueue, host stdio). Only ever raises, and
+                    // is clamped to the host's hard limit.
+                    raise_host_nofile_backing(soft);
                 } else {
                     // Every other resource round-trips through the per-process
                     // override table so a subsequent get reads back what was set.
@@ -870,6 +881,48 @@ impl SyscallDispatcher {
             }
             Ok(DispatchOutcome::Returned { value: 0 })
         }
+    }
+}
+
+/// Raise the HOST (native_run) process's soft `RLIMIT_NOFILE` so the guest's
+/// host-backed descriptors have real fds to sit on when the guest raises its own
+/// `RLIMIT_NOFILE`. `guest_soft` is the guest's new fd soft cap; we target that
+/// plus headroom for carrick's internal fds, clamped to the host's hard limit.
+/// Only ever raises — never lowers the host soft limit (which could starve
+/// carrick's own descriptors) — and is a no-op if the host already covers it.
+fn raise_host_nofile_backing(guest_soft: u64) {
+    // Headroom for native_run's own descriptors: event ring, epoll/kqueue,
+    // host stdio, per-thread waiters, and the dispatcher's transient host fds.
+    const HOST_FD_HEADROOM: u64 = 256;
+    let mut rl = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `rl` is a valid, writable rlimit; RLIMIT_NOFILE is a valid resource.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } != 0 {
+        return;
+    }
+    let cur_soft = rl.rlim_cur as u64;
+    // The host hard limit ceilings any raise. A non-positive / INFINITY hard
+    // value (rlim_max <= 0 when reinterpreted) means "no finite cap" → use the
+    // desired target directly.
+    let hard = rl.rlim_max;
+    let desired = guest_soft.saturating_add(HOST_FD_HEADROOM);
+    let target = if hard > 0 && (hard as u64) < desired {
+        hard as u64
+    } else {
+        desired
+    };
+    if target <= cur_soft {
+        return;
+    }
+    let new = libc::rlimit {
+        rlim_cur: target as libc::rlim_t,
+        rlim_max: rl.rlim_max,
+    };
+    // SAFETY: `new` is a valid rlimit whose soft <= hard (target clamped to hard).
+    unsafe {
+        libc::setrlimit(libc::RLIMIT_NOFILE, &new);
     }
 }
 
