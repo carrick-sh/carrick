@@ -454,6 +454,12 @@ impl carrick_hal::SyscallTrap for NativeX86Trap<'_> {
 /// safe point (reuses the shared policy engine). If a default-action signal has
 /// no handler, terminates/stops the process accordingly. Mutates `snapshot` to
 /// enter a handler when one is delivered.
+/// Deliver pending, deliverable signals at a syscall-return safe point.
+/// Returns `Some(signum)` if a default-action fatal signal with no guest handler
+/// must TERMINATE this guest — the caller routes it as [`Step::SignalDeath`] so
+/// the run loop can die-by-signal (fork child) or report `exit=128+signum`
+/// (top-level) rather than the runner dying by the signal itself. `None` means
+/// continue (nothing pending, or a handler was entered — `snapshot.rip` updated).
 fn run_pending_signals(
     shared: &Arc<SharedRun>,
     tid: crate::thread::ThreadId,
@@ -461,7 +467,7 @@ fn run_pending_signals(
     last_retval: Option<i64>,
     syscall_nr: Option<u64>,
     orig_rax: u64,
-) {
+) -> Option<i32> {
     let mut trap = NativeX86Trap {
         snap: snapshot,
         last_syscall_nr: syscall_nr,
@@ -481,16 +487,15 @@ fn run_pending_signals(
                 crate::exec_helpers::stop_by_signal(sig);
             }
             if let Some(sig) = action.term_signal {
-                crate::exec_helpers::forked_child_die_by_signal(
-                    sig,
-                    shared.dispatcher.stdout(),
-                    shared.dispatcher.stderr(),
-                );
+                // Terminating signal, no handler: hand the decision (die vs
+                // report) up to the run loop, which knows `forked`.
+                return Some(sig);
             }
         }
         Ok(None) => {}
         Err(_) => {}
     }
+    None
 }
 
 /// A loaded static-pie ELF in the host address space (guest VA == host VA).
@@ -818,6 +823,13 @@ enum Step {
     /// `_exit`s directly (reaped by the parent's `wait4`) instead of returning
     /// a `RunResult` up through `native_run`.
     BecameForkChild(u64),
+    /// A default-action fatal signal with no guest handler. A fork DESCENDANT
+    /// must die BY the signal so its parent's `wait4` sees `WIFSIGNALED`; the
+    /// TOP-LEVEL guest instead reports `exit=128+signum` so the driver returns a
+    /// `RunResult` (native_run / the `carrick run` supervisor report it) rather
+    /// than the runner dying by the signal itself. The run loop decides which,
+    /// since only it knows the `forked` flag.
+    SignalDeath(i32),
 }
 
 /// A minimal multiply-based hasher for the guest-VA block cache. The default
@@ -1566,20 +1578,34 @@ fn run_x86_thread(
                     false,
                 ) {
                     Ok(true) => next = snapshot.rip,
-                    // No handler: die by the signal (WIFSIGNALED), draining
-                    // buffered output first.
-                    Ok(false) => crate::exec_helpers::forked_child_die_by_signal(
-                        linux_sig,
-                        active.dispatcher.stdout(),
-                        active.dispatcher.stderr(),
-                    ),
+                    // No handler: a fork descendant dies BY the signal
+                    // (WIFSIGNALED) so its parent's wait4 sees it; the top-level
+                    // guest reports exit=128+signum instead of the runner dying
+                    // by the signal. Buffered output is drained either way.
+                    Ok(false) => {
+                        if forked {
+                            crate::exec_helpers::forked_child_die_by_signal(
+                                linux_sig,
+                                active.dispatcher.stdout(),
+                                active.dispatcher.stderr(),
+                            );
+                        }
+                        exit_code = Some(128 + linux_sig);
+                        break 'run;
+                    }
                     // The frame could not be written to the guest stack
-                    // (force_sigsegv): die by SIGSEGV.
-                    Err(()) => crate::exec_helpers::forked_child_die_by_signal(
-                        crate::linux_abi::LINUX_SIGSEGV,
-                        active.dispatcher.stdout(),
-                        active.dispatcher.stderr(),
-                    ),
+                    // (force_sigsegv): SIGSEGV.
+                    Err(()) => {
+                        if forked {
+                            crate::exec_helpers::forked_child_die_by_signal(
+                                crate::linux_abi::LINUX_SIGSEGV,
+                                active.dispatcher.stdout(),
+                                active.dispatcher.stderr(),
+                            );
+                        }
+                        exit_code = Some(128 + crate::linux_abi::LINUX_SIGSEGV);
+                        break 'run;
+                    }
                 }
             }
             Some(X86ExitStatus::Syscall) => {
@@ -1636,6 +1662,21 @@ fn run_x86_thread(
                             unsafe { libc::_exit(code) };
                         }
                         exit_code = Some(code);
+                        break 'run;
+                    }
+                    Step::SignalDeath(signum) => {
+                        // Fork descendant: die BY the signal so the parent's
+                        // wait4 sees WIFSIGNALED. Top-level guest: report
+                        // exit=128+signum so the driver returns a RunResult
+                        // instead of the runner dying by the signal itself.
+                        if forked {
+                            crate::exec_helpers::forked_child_die_by_signal(
+                                signum,
+                                active.dispatcher.stdout(),
+                                active.dispatcher.stderr(),
+                            );
+                        }
+                        exit_code = Some(128 + signum);
                         break 'run;
                     }
                     Step::Fault(detail) => {
@@ -1769,13 +1810,21 @@ fn service_syscall(
         // is entered, `snapshot.rip` now points at it.
         DispatchOutcome::Returned { value } => {
             snapshot.gpr[reg::RAX] = value as u64;
-            run_pending_signals(shared, tid, snapshot, Some(value), Some(syscall_nr), orig_rax);
+            if let Some(sig) =
+                run_pending_signals(shared, tid, snapshot, Some(value), Some(syscall_nr), orig_rax)
+            {
+                return Step::SignalDeath(sig);
+            }
             Step::Continue(snapshot.rip)
         }
         DispatchOutcome::Errno { errno } => {
             let retval = -(errno.get() as i64);
             snapshot.gpr[reg::RAX] = retval as u64;
-            run_pending_signals(shared, tid, snapshot, Some(retval), Some(syscall_nr), orig_rax);
+            if let Some(sig) =
+                run_pending_signals(shared, tid, snapshot, Some(retval), Some(syscall_nr), orig_rax)
+            {
+                return Step::SignalDeath(sig);
+            }
             Step::Continue(snapshot.rip)
         }
         DispatchOutcome::Exit { code } => Step::Exit(code),
@@ -1789,13 +1838,7 @@ fn service_syscall(
         // BSD where the mapped host signal is not Linux-faithful a sigdeath
         // marker lets the parent's wait4 reconstruct WIFSIGNALED(signum). Never
         // returns.
-        DispatchOutcome::SignalDeath { signum } => {
-            crate::exec_helpers::forked_child_die_by_signal(
-                signum,
-                dispatcher.stdout(),
-                dispatcher.stderr(),
-            )
-        }
+        DispatchOutcome::SignalDeath { signum } => Step::SignalDeath(signum),
         // fork()/clone(SIGCHLD): in the identity model a guest fork is a REAL
         // host fork — the child inherits the whole address space (guest memory,
         // JIT cache, arenas) copy-on-write, and is a real host child so the
@@ -1843,7 +1886,11 @@ fn service_syscall(
             let value = wait_x86_futex(futex, tid, wait, timeout, 0);
             snapshot.gpr[reg::RAX] = value as u64;
             // A signal-interrupted futex (EINTR) delivers its handler here.
-            run_pending_signals(shared, tid, snapshot, Some(value), Some(syscall_nr), orig_rax);
+            if let Some(sig) =
+                run_pending_signals(shared, tid, snapshot, Some(value), Some(syscall_nr), orig_rax)
+            {
+                return Step::SignalDeath(sig);
+            }
             Step::Continue(snapshot.rip)
         }
         DispatchOutcome::FutexWaitv {
@@ -1854,7 +1901,11 @@ fn service_syscall(
             // On a wake, `futex_waitv` returns the INDEX of the woken futex.
             let value = wait_x86_futex(futex, tid, wait, timeout, index);
             snapshot.gpr[reg::RAX] = value as u64;
-            run_pending_signals(shared, tid, snapshot, Some(value), Some(syscall_nr), orig_rax);
+            if let Some(sig) =
+                run_pending_signals(shared, tid, snapshot, Some(value), Some(syscall_nr), orig_rax)
+            {
+                return Step::SignalDeath(sig);
+            }
             Step::Continue(snapshot.rip)
         }
         // `tgkill`/`tkill` targeting a SIBLING guest thread: publish the signal
@@ -1940,11 +1991,7 @@ fn service_syscall(
         // resume at the saved RIP (NOT advanced past the syscall).
         DispatchOutcome::SigReturn => match restore_x86_sigreturn(shared, tid, snapshot) {
             Ok(rip) => Step::Continue(rip),
-            Err(()) => crate::exec_helpers::forked_child_die_by_signal(
-                crate::linux_abi::LINUX_SIGSEGV,
-                dispatcher.stdout(),
-                dispatcher.stderr(),
-            ),
+            Err(()) => Step::SignalDeath(crate::linux_abi::LINUX_SIGSEGV),
         },
         other => Step::Fault(format!(
             "native x86 driver does not service dispatch outcome {other:?} yet \
