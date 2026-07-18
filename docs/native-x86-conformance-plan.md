@@ -360,7 +360,13 @@ Reliable serial census, all 432 targets. Raw data: `docs/native-x86-census.tsv`.
 | fork-cache fix | 355 / 432 (exit-0) | private JIT cache per fork child |
 | honest re-baseline | 245 / 428 (STRICT) | after threads+futex+fork-cache; exit-0 was +110 inflated |
 | signals + dispatcher | 292 / 428 (loose exit=) | overcounted — classifier accepted any `exit=`, incl. `exit=134` aborts |
-| **signals + dispatcher + die-by-signal** | **282 / 428 (exit=0 STRICT)** | honest; +37 net over 245. die-by-signal fix dropped OTHER crashes 32→8 |
+| signals + dispatcher + die-by-signal | 282 / 428 (exit=0 STRICT) | honest; +37 net over 245. die-by-signal fix dropped OTHER crashes 32→8 |
+| **wave 2 (parallel: driver + dispatcher)** | **294 / 428 (~295 true)** | +12 net. vDSO, io-waiter signal-interruptibility (cascaded to timers/pause/select), setitimer delivery; sysvsemstat/accounting/waitpgid. `forkfpreclaim` is census-flaky (passes standalone → true ~295). |
+
+**Wave-2 detail (294→~295):** driver — `preemptsigstorm` (timer_delivery::register was missing), `clockcoherence` (x86-64 vDSO + AT_SYSINFO_EHDR), io-waiter interruptibility cascaded to `nanosleeprem`/`selecttimeout`/`posixtimers`/`timersettimeabs`/`pauseeintr`/`pselecteintr`/`acceptsock`/`blockingpipewrite`/`epollexclusive`; dispatcher — `sysvsemstat`/`accounting`/`waitpgid`.
+- **`dnotify` was NOT a real regression** — its 2 `=false` are the correct Linux answer (strict-metric artifact); moved to the verified-correct-`=false` list.
+- **1 real regression: `futexshare`** (`=false`) — the io-waiter interruptibility likely injects a spurious EINTR/wake on a shared futex; to fix.
+- Verified-correct-`=false` (strict-metric false negatives, NOT bugs — add to the true count): `dnotify`, `coredumpbit`, `unicodenorm`, `fsmeta`, `symlinkmknod`, `ppollunblock`(residual), plus the earlier `timeclock`/`fsetfl`/`opathfd`/`openat2valid`/`fifonode`.
 
 Honest classifier now requires **`exit=0`** (a fatal-signal `exit=134` is not a
 pass — it lands in `EXIT_NONZERO`). Buckets at 282: `EXIT_FALSE` 79 (ran clean,
