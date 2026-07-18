@@ -3178,6 +3178,21 @@ impl SyscallDispatcher {
                     if host_target < -1 && errno == LINUX_EINVAL {
                         return Ok(DispatchOutcome::errno(LINUX_ESRCH));
                     }
+                    // Linux/FreeBSD surface ECHILD (rather than macOS's EINVAL)
+                    // for a pid < -1 wait. Linux distinguishes a process group
+                    // that does NOT EXIST (→ ESRCH; LTP waitpid04 / probe
+                    // waitpgid pass INT_MIN, an unrepresentable pgid) from a real
+                    // group with no waitable children (→ ECHILD). kill(pgid, 0)
+                    // reports ESRCH only for a nonexistent group, so probe with
+                    // it and remap only that case — every valid-group ECHILD
+                    // passes through unchanged.
+                    if host_target < -1
+                        && errno == crate::linux_abi::LINUX_ECHILD
+                        && unsafe { libc::kill(host_target, 0) } == -1
+                        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                    {
+                        return Ok(DispatchOutcome::errno(LINUX_ESRCH));
+                    }
                     return Ok(DispatchOutcome::errno(errno));
                 }
             };
