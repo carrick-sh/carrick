@@ -446,6 +446,18 @@ impl RegAccess for SigframeEngine<'_> {
 }
 
 impl GuestMemory for SigframeEngine<'_> {
+    /// Gate the sigframe build/restore on the SAME syscall-path protections the
+    /// identity backend enforces: `build_sigframe` writes the frame through the
+    /// permission-checked `write_bytes`, so a SA_ONSTACK handler whose alternate
+    /// stack is `PROT_NONE`/unmapped (tracked no-access) makes that write EFAULT
+    /// → `build_sigframe` returns Err → the caller force-`SIGSEGV`s the guest,
+    /// matching Linux `force_sigsegv` (`sigbadstack`).
+    fn protections(
+        &self,
+    ) -> Option<&carrick_guest_mem::protections::MemoryProtections> {
+        Some(&IDENTITY_PROTECTIONS)
+    }
+
     fn read_bytes_raw(
         &self,
         address: u64,
