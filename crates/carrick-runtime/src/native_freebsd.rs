@@ -1853,6 +1853,10 @@ where
     // Held for the whole run: the fixed arenas and the process-wide fault
     // shim cannot be shared across concurrent in-process runs.
     let _run_guard = RUN_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    // Guest instructions execute as ordinary host instructions on this lane,
+    // so host process CPU accounting is authoritative (and is inherited by
+    // fork children for wait4/waitid RUSAGE_CHILDREN rollup).
+    crate::guest_cpu::set_native_host_provider();
 
     let argv: Vec<Vec<u8>> = argv.into_iter().map(|a| a.into_bytes()).collect();
     let env: Vec<Vec<u8>> = _env.into_iter().map(|e| e.into_bytes()).collect();

@@ -62,8 +62,8 @@ fn monotonic_ns() -> u64 {
 
 // ---- Native-backend provider ----
 //
-// The Darwin-native exec backend runs guest code directly as host execution,
-// which is the INVERSE of the VMM backends: guest cycles DO accrue to the host
+// A native exec backend runs guest code directly as host execution, which is
+// the INVERSE of the VMM backends: guest cycles DO accrue to the host
 // process/thread CPU counters, and the `hv_vcpu_run` bracketing above never
 // fires. The provider seam is therefore a process-global mode switch INSIDE the
 // readers, not recording calls at native execution boundaries: (a) Darwin's own
@@ -77,10 +77,15 @@ fn monotonic_ns() -> u64 {
 // through the same native entry).
 static NATIVE_DARWIN_PROVIDER: AtomicBool = AtomicBool::new(false);
 
-/// Switch the process-total CPU readers to Darwin's own process accounting.
-/// Called once when the native exec backend enters its run loop.
-pub fn set_native_darwin_provider() {
+/// Switch process-total CPU readers to the native host's process accounting.
+/// Called once when a no-VMM backend enters its run loop.
+pub fn set_native_host_provider() {
     NATIVE_DARWIN_PROVIDER.store(true, Ordering::Release);
+}
+
+/// Compatibility spelling for the Darwin native lane.
+pub fn set_native_darwin_provider() {
+    set_native_host_provider();
 }
 
 /// Whether guest CPU time is sourced from Darwin's process accounting (native
@@ -94,14 +99,31 @@ pub(crate) fn clear_native_darwin_provider_for_test() {
     NATIVE_DARWIN_PROVIDER.store(false, Ordering::Release);
 }
 
-/// Darwin's answer for this process's guest CPU total (user + system ns).
-/// `None` off-macOS or if libproc fails; callers fall back to the slot table.
+/// The native host's process CPU total (user + system ns).
 fn native_self_cpu_ns() -> Option<u64> {
     #[cfg(target_os = "macos")]
     {
         crate::host_proc::self_cpu_total_ns()
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "freebsd")]
+    {
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } != 0 {
+            return None;
+        }
+        let timeval_ns = |value: libc::timeval| {
+            u64::try_from(value.tv_sec)
+                .unwrap_or(0)
+                .saturating_mul(1_000_000_000)
+                .saturating_add(
+                    u64::try_from(value.tv_usec)
+                        .unwrap_or(0)
+                        .saturating_mul(1_000),
+                )
+        };
+        Some(timeval_ns(usage.ru_utime).saturating_add(timeval_ns(usage.ru_stime)))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
     {
         None
     }
