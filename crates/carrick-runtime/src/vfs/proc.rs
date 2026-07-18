@@ -2395,7 +2395,15 @@ fn synthetic_proc_self_status(ctx: &SyntheticProcContext) -> String {
     } else {
         None
     };
-    let rss_kb = measured_native_rss_kb.unwrap_or(host.resident_bytes / 1024);
+    // VmRSS ≤ VmSize is a hard kernel invariant (resident pages are a subset of
+    // the mapped virtual size). When the per-span residency walk is unavailable
+    // (`resident_bytes_in_ranges` returns None on the FreeBSD/native lane), the
+    // fallback whole-process host RSS also carries the carrick runtime itself and
+    // can exceed the modeled guest VmSize — so clamp to keep the pair coherent
+    // (probe accounting: status_vmrss_le_vmsize).
+    let rss_kb = measured_native_rss_kb
+        .unwrap_or(host.resident_bytes / 1024)
+        .min(vsize_kb);
     let peak_kb = vsize_kb.max(host.maxrss_bytes / 1024);
     let hwm_kb = host.maxrss_bytes / 1024;
     // Pid/Tgid must match what getpid()/gettid() return — in a PID namespace
