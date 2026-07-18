@@ -3438,6 +3438,49 @@ impl SyscallDispatcher {
                 };
                 return self.write_sem_stat(cx, selector, arg, creds);
             }
+            LINUX_IPC_STAT => {
+                // Fill the aarch64 semid64_ds from carrick's OWNED metadata so
+                // the ipc64_perm (mode/owner ids) and sem_otime/sem_ctime carry
+                // real values — the host-forwarded path below only knows the
+                // host semid and returns a zeroed perm/times buffer on the
+                // bring-up lanes (probe sysvsemstat / LTP semctl01).
+                let guest_semid = match GuestSemId::from_syscall_arg(semid) {
+                    Ok(guest_semid) => guest_semid,
+                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                };
+                let state = self.sysv.lock();
+                let Some(meta) = state.semaphores.get(&guest_semid) else {
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                };
+                if !meta.can_read(creds) {
+                    return Ok(DispatchOutcome::errno(LINUX_EACCES));
+                }
+                let meta = meta.clone();
+                drop(state);
+                if arg != 0 {
+                    let out = LinuxSemidDs {
+                        sem_perm: LinuxIpcPerm {
+                            key: meta.key,
+                            uid: meta.uid,
+                            gid: meta.gid,
+                            cuid: meta.cuid,
+                            cgid: meta.cgid,
+                            mode: meta.mode.perms(),
+                            seq: 0,
+                            ..Default::default()
+                        },
+                        sem_otime: meta.otime,
+                        sem_ctime: meta.ctime,
+                        sem_nsems: meta.nsems as u64,
+                        __unused3: 0,
+                        __unused4: 0,
+                    };
+                    if cx.memory.write_bytes(arg, out.as_bytes()).is_err() {
+                        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                    }
+                }
+                return Ok(DispatchOutcome::Returned { value: 0 });
+            }
             _ => {}
         }
 
