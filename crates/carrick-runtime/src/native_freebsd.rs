@@ -2590,6 +2590,10 @@ fn run_x86_thread(
                                         break;
                                     }
                                 }
+                                // PTRACE_TRACEME survives exec and reports the
+                                // mandatory SIGTRAP stop before the replacement
+                                // image runs its first instruction.
+                                crate::exec_helpers::stop_after_traced_exec(&active.dispatcher);
                                 // Reset this thread's JIT caches + register state
                                 // and resume at the new entry. Every translated
                                 // block pointed into the old image's code; clear

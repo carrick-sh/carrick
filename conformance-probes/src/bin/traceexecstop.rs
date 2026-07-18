@@ -120,7 +120,7 @@ fn main() {
             exec_stopped = stopped,
             exec_stopsig = stopsig,
             exec_stopsig_is_sigtrap = stopsig == libc::SIGTRAP,
-            exec_exited_instead = exited_instead,
+            exec_did_not_exit_instead = !exited_instead,
             exec_early_exit_status = early_exit_status,
             ptrace_cont_ok = cont_ok,
             ptrace_cont_errno = cont_errno,
