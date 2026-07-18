@@ -1749,6 +1749,10 @@ where
     // the guest on this pump-less lane (see the handler doc); pre-fork so every
     // descendant inherits the routing.
     install_native_pumped_handlers();
+    // Fork-shared cross-process futex waiter-count table, so a shared FUTEX_WAKE
+    // can report how many waiters it woke (Linux semantics; native _umtx_op does
+    // not). Pre-fork so every descendant maps the same physical pages.
+    init_shared_waiter_table();
 
     let free_slices: Vec<usize> = (0..JIT_SLICE_COUNT).map(|i| i * JIT_SLICE_LEN).collect();
     let shared = Arc::new(SharedRun {
@@ -2748,6 +2752,100 @@ fn service_syscall(
     }
 }
 
+// Cross-process shared-futex WAITER COUNT table. FreeBSD's native
+// `_umtx_op(UMTX_OP_WAKE)` returns 0, not the number of threads it woke; Linux
+// `FUTEX_WAKE` returns that count (FreeBSD's OWN linuxulator does too, via
+// `umtxq_signal_mask` returning the woken count into `td_retval[0]` — but that
+// path is only reachable through the Linux-ABI sysent, and it keys futexes as
+// `TYPE_FUTEX` where native `_umtx_op(UMTX_OP_WAIT_UINT)` uses `TYPE_SIMPLE_WAIT`,
+// so a native binary cannot borrow it). We reconstruct the count the same way
+// the kernel does — by tracking how many waiters are parked on each key — in a
+// small MAP_SHARED table inherited across `fork` (identity: the guest futex word
+// is a host VA identical in every process). Each shared waiter increments its
+// word's slot before parking and decrements after; a WAKE returns
+// `min(requested, parked)`. This unblocks `futexwakecount` (asserts the woken
+// count is >= N) and `futexsharedalias` (asserts a single wake returns exactly 1).
+#[repr(C)]
+struct WaiterSlot {
+    /// Host VA of the 4-byte futex word this slot counts, or 0 when free.
+    key: std::sync::atomic::AtomicU64,
+    /// Live parked-waiter count on `key`.
+    count: std::sync::atomic::AtomicU32,
+    _pad: u32,
+}
+const WAITER_SLOTS: usize = 1024;
+static SHARED_WAITER_TABLE: std::sync::atomic::AtomicPtr<WaiterSlot> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+/// Allocate the fork-shared waiter-count table (idempotent). MUST run pre-fork so
+/// every descendant maps the SAME physical pages (MAP_SHARED|MAP_ANON survives
+/// `fork` as genuinely shared).
+fn init_shared_waiter_table() {
+    use std::sync::atomic::Ordering;
+    if !SHARED_WAITER_TABLE.load(Ordering::Acquire).is_null() {
+        return;
+    }
+    let bytes = WAITER_SLOTS * std::mem::size_of::<WaiterSlot>();
+    // SAFETY: a fresh anonymous shared mapping; zero-filled (key 0 = free).
+    let p = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            bytes,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED | libc::MAP_ANON,
+            -1,
+            0,
+        )
+    };
+    if p == libc::MAP_FAILED {
+        return;
+    }
+    // First writer wins; a loser unmaps its spare (another thread already
+    // published, exceedingly unlikely under RUN_LOCK but kept correct).
+    if SHARED_WAITER_TABLE
+        .compare_exchange(
+            std::ptr::null_mut(),
+            p as *mut WaiterSlot,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_err()
+    {
+        // SAFETY: `p` is our own fresh mapping; nobody else references it.
+        unsafe { libc::munmap(p, bytes) };
+    }
+}
+
+/// The `WaiterSlot` for host-VA `word`, claiming a free slot on first use
+/// (open-addressed, linear probe). `None` if the table is unmapped or full.
+fn shared_waiter_slot(word: usize) -> Option<&'static WaiterSlot> {
+    use std::sync::atomic::Ordering;
+    let base = SHARED_WAITER_TABLE.load(Ordering::Acquire);
+    if base.is_null() {
+        return None;
+    }
+    // SAFETY: `base` is a live mapping of exactly WAITER_SLOTS entries.
+    let table = unsafe { std::slice::from_raw_parts(base, WAITER_SLOTS) };
+    let key = word as u64;
+    let mut idx = (word >> 2) % WAITER_SLOTS;
+    for _ in 0..WAITER_SLOTS {
+        let slot = &table[idx];
+        let cur = slot.key.load(Ordering::Acquire);
+        if cur == key {
+            return Some(slot);
+        }
+        if cur == 0 {
+            match slot.key.compare_exchange(0, key, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return Some(slot),
+                Err(existing) if existing == key => return Some(slot),
+                Err(_) => {} // lost the slot to a different key; probe on
+            }
+        }
+        idx = (idx + 1) % WAITER_SLOTS;
+    }
+    None
+}
+
 // FreeBSD `_umtx_op(2)` — the host primitive for a cross-PROCESS futex. The
 // NON-private op keys on the shared VM object + offset, so a wait/wake on a
 // guest `MAP_SHARED` word (identity: guest VA == host VA) reaches a peer parked
@@ -2779,6 +2877,14 @@ fn shared_futex_wait_umtx(word: usize, value: u32, timeout: Option<std::time::Du
         ),
         None => (std::ptr::null_mut(), std::ptr::null_mut()),
     };
+    // Announce this parked waiter in the fork-shared count table so a peer's
+    // WAKE can report how many it woke (Linux FUTEX_WAKE semantics). Incremented
+    // BEFORE the park and decremented AFTER it returns, for every exit path.
+    use std::sync::atomic::Ordering;
+    let slot = shared_waiter_slot(word);
+    if let Some(s) = slot {
+        s.count.fetch_add(1, Ordering::SeqCst);
+    }
     // SAFETY: `word` is an identity host VA of a guest-mapped, 4-byte-aligned
     // shared futex word; `_umtx_op` only reads it. `libc::syscall` returns -1 and
     // sets errno on failure.
@@ -2792,6 +2898,9 @@ fn shared_futex_wait_umtx(word: usize, value: u32, timeout: Option<std::time::Du
             uaddr2,
         )
     };
+    if let Some(s) = slot {
+        s.count.fetch_sub(1, Ordering::SeqCst);
+    }
     let rc = rc as libc::c_long;
     if rc == 0 {
         return 0;
@@ -2808,14 +2917,20 @@ fn shared_futex_wait_umtx(word: usize, value: u32, timeout: Option<std::time::Du
 }
 
 /// Cross-process shared-futex WAKE via `_umtx_op(UMTX_OP_WAKE)`: wake up to
-/// `count` waiters parked (possibly in another forked process) on `word`. FreeBSD
-/// `_umtx_op` does NOT report how many were woken, and a shared waiter parks on
-/// the umtx (not the in-process parking-lot table), so the true local count is
-/// unavailable — this returns 0, matching Linux's `FUTEX_WAKE` "no waiters woken"
-/// on a page nothing is parked on (`futexghost`). A guest that genuinely needs
-/// the woken count for a SHARED futex is out of scope; the in-scope probes either
-/// ignore the retval (`futexshare` parent) or assert exactly this 0.
+/// `count` waiters parked (possibly in another forked process) on `word`, and
+/// return how many were woken — the Linux `FUTEX_WAKE` retval. FreeBSD's native
+/// `_umtx_op(UMTX_OP_WAKE)` returns 0 rather than the count (unlike its own
+/// linuxulator futex), so we read the fork-shared waiter-count table
+/// [`shared_waiter_slot`] BEFORE the wake and return `min(count, parked)` — the
+/// same number `umtxq_signal_mask` would have reported. Zero parked yields 0,
+/// matching Linux on a page nothing is parked on (`futexghost`).
 fn shared_futex_wake_umtx(word: usize, count: u32) -> i64 {
+    use std::sync::atomic::Ordering;
+    // Snapshot the parked count BEFORE waking: the woken waiters race to
+    // decrement as they leave the kernel, so a post-wake read would undercount.
+    let parked = shared_waiter_slot(word)
+        .map(|s| s.count.load(Ordering::SeqCst))
+        .unwrap_or(0);
     // SAFETY: as in `shared_futex_wait_umtx`; WAKE neither reads nor writes the word.
     let _ = unsafe {
         libc::syscall(
@@ -2827,7 +2942,7 @@ fn shared_futex_wake_umtx(word: usize, count: u32) -> i64 {
             std::ptr::null_mut::<libc::c_void>(),
         )
     };
-    0
+    i64::from(count.min(parked))
 }
 
 /// Park this thread on `wait` until woken, timed out, or interrupted by a
