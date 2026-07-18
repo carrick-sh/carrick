@@ -861,14 +861,17 @@ impl SyscallDispatcher {
                     value: i64::from(crate::namespace::pid::self_ns_ppid()),
                 });
             }
-            let bootstrap_host_pid = this.proc.lock().bootstrap_host_pid;
-            let value = if std::process::id() == bootstrap_host_pid {
-                LINUX_BOOTSTRAP_PID as i64
-            } else if let Some(parent) = crate::guest_cpu::adopted_parent_for_self() {
-                i64::from(parent)
-            } else {
-                unsafe { libc::getppid() as i64 }
+            let (bootstrap_host_pid, subreaper_ancestor) = {
+                let proc = this.proc.lock();
+                (proc.bootstrap_host_pid, proc.subreaper_ancestor)
             };
+            let value = identity_guest_ppid(
+                std::process::id(),
+                bootstrap_host_pid,
+                unsafe { libc::getppid() as u32 },
+                crate::guest_cpu::adopted_parent_for_self(),
+                subreaper_ancestor,
+            );
             Ok(DispatchOutcome::Returned { value })
         }
 
@@ -983,6 +986,64 @@ fn linux_capability_data_words(version: u32) -> usize {
         1
     } else {
         2
+    }
+}
+
+/// Translate the identity-namespace parent relationship exposed to the guest.
+///
+/// The FreeBSD native lane acquires host reaper status so the top-level runtime
+/// process can reap guest orphans. That makes the host report the runtime's pid
+/// as an orphan's parent. Unless the guest explicitly selected that process as
+/// a child subreaper, the observable Linux parent is still init (PID 1); the
+/// host pid is an implementation detail. Direct children keep their real parent,
+/// and an explicit subreaper remains observable by its guest process id.
+fn identity_guest_ppid(
+    current: u32,
+    bootstrap: u32,
+    host_ppid: u32,
+    adopted_parent: Option<u32>,
+    subreaper_ancestor: u32,
+) -> i64 {
+    if current == bootstrap {
+        return LINUX_BOOTSTRAP_PID as i64;
+    }
+    match adopted_parent {
+        Some(parent)
+            if parent == bootstrap && host_ppid == bootstrap && subreaper_ancestor == 0 =>
+        {
+            LINUX_BOOTSTRAP_PID as i64
+        }
+        Some(parent) => i64::from(parent),
+        None => i64::from(host_ppid),
+    }
+}
+
+#[cfg(test)]
+mod ppid_tests {
+    use super::identity_guest_ppid;
+    use crate::linux_abi::LINUX_BOOTSTRAP_PID;
+
+    #[test]
+    fn direct_child_observes_its_real_guest_parent() {
+        assert_eq!(identity_guest_ppid(200, 100, 100, None, 0), 100);
+    }
+
+    #[test]
+    fn init_reaper_adoption_is_exposed_as_pid_one() {
+        assert_eq!(
+            identity_guest_ppid(300, 100, 100, Some(100), 0),
+            LINUX_BOOTSTRAP_PID as i64
+        );
+    }
+
+    #[test]
+    fn explicit_subreaper_adoption_keeps_the_subreaper_pid() {
+        assert_eq!(identity_guest_ppid(300, 100, 100, Some(100), 100), 100);
+    }
+
+    #[test]
+    fn clone_parent_keeps_recorded_parent_when_host_parent_differs() {
+        assert_eq!(identity_guest_ppid(300, 100, 200, Some(100), 0), 100);
     }
 }
 

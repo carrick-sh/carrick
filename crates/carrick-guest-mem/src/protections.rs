@@ -130,6 +130,16 @@ pub struct MemoryProtections {
 }
 
 impl MemoryProtections {
+    /// Replace all protection state with one initially-unmapped address range.
+    /// Native identity backends use this at process-image start so every raw
+    /// syscall pointer is fail-closed until the loader or mmap path publishes a
+    /// live VMA. The update is atomic to readers under the one state lock.
+    pub fn reset_to_unmapped(&self, address: u64, len: usize) {
+        let mut state = self.state.write();
+        *state = ProtectionState::default();
+        state.unmapped.set(address, len, true);
+    }
+
     /// Seed the PROT_NONE set from an existing range list. The no-write set starts
     /// empty; use [`Self::from_snapshot`] when cloning full syscall-path protection
     /// state across fork.
@@ -336,6 +346,22 @@ mod tests {
         assert!(cloned.range_no_access(0x8800, 0x10));
         assert!(cloned.range_unmapped(0x8800, 0x10));
         assert!(!cloned.range_prot_none(0x8800, 0x10));
+    }
+
+    #[test]
+    fn reset_to_unmapped_replaces_prior_state_and_allows_live_subranges() {
+        let p = MemoryProtections::default();
+        p.set_no_access(0x1000, 0x1000, true);
+        p.set_no_write(0x3000, 0x1000, true);
+
+        p.reset_to_unmapped(0x1_0000, 0x10_0000);
+        assert!(!p.range_no_access(0x1000, 1));
+        assert!(!p.range_no_write(0x3000, 1));
+        assert!(p.range_unmapped(0x1_0000, 1));
+
+        p.set_mapping_protection(0x2_0000, 0x1000, false, false);
+        assert!(!p.range_no_access(0x2_0000, 0x1000));
+        assert!(p.range_unmapped(0x2_1000, 1));
     }
 
     #[test]

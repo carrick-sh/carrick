@@ -1465,6 +1465,7 @@ impl SyscallDispatcher {
                         len: length,
                         payload: Vec::new(),
                         file: Some((dup_fd, offset as libc::off_t, host_prot)),
+                        shared: true,
                         prot_none,
                     });
                 }
@@ -1832,6 +1833,7 @@ impl SyscallDispatcher {
                     len: length,
                     payload: bytes,
                     file: None,
+                    shared: map_sharing == MmapSharing::Shared,
                     prot_none,
                 });
             }
