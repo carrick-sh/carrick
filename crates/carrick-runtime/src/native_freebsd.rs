@@ -1676,6 +1676,17 @@ where
         tid,
     );
 
+    // Cross-process guest-signal plumbing. MUST run pre-fork (before any guest
+    // `fork` inside `run_x86_thread`) so the `MAP_SHARED` xsignal ring + FASYNC
+    // table are inherited by every descendant, and the nudge handler is armed in
+    // both parent and child. Without it, a guest `sigqueue`/`kill`/`tgkill` to a
+    // forked sibling process could not enqueue into the ring (`xsig_enqueue`
+    // returned false → the dispatcher reported EAGAIN, e.g. `sigqueueusr1`'s
+    // `queue_ok=false`), and a delivered nudge (host `SIGRTMIN+1`) would take the
+    // host default action and terminate the receiver instead of draining the
+    // ring. Idempotent across the reused in-process test-harness runs.
+    carrick_signal_core::host_glue::init_xsig::<crate::host_signal::ActiveGlue>();
+
     let free_slices: Vec<usize> = (0..JIT_SLICE_COUNT).map(|i| i * JIT_SLICE_LEN).collect();
     let shared = Arc::new(SharedRun {
         dispatcher: Arc::new(dispatcher),
