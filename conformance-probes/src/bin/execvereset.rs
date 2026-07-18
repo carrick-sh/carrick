@@ -3,8 +3,8 @@
 //!   * SIG_IGN dispositions -> preserved
 //!   * the blocked signal mask -> preserved
 //!   * blocked pending signals -> preserved across the exec
-//!   * the alternate signal stack -> empirically PRESERVED (Linux current
-//!     behavior; the man page's "not preserved" wording predates the kernel)
+//!   * the old alternate signal stack -> discarded; this Rust probe's new-image
+//!     startup installs a fresh replacement, observed as enabled by `main`
 //!
 //! Carrick's old image's handler ADDRESS used to leak into the new image; when
 //! the new image then took the signal, carrick jumped to that stale address.
@@ -47,8 +47,8 @@ fn stage1(exe_arg: &str) {
         let _ = install_ign(libc::SIGPIPE);
 
         // Alt signal stack. Leak the buf — execve replaces the address space
-        // immediately, so this isn't a real leak; sigaltstack only stored the
-        // pointer/size in the kernel's task struct (which Linux preserves).
+        // immediately, so this isn't a real leak. Linux discards this stack;
+        // the Rust startup in stage2 installs a fresh one before `main`.
         let mut stack_buf: Vec<u8> = vec![0; 64 * 1024];
         let alt_armed = arm_altstack(&mut stack_buf);
         core::mem::forget(stack_buf);
@@ -85,9 +85,12 @@ fn stage2() {
 
         let mut alt: libc::stack_t = std::mem::zeroed();
         libc::sigaltstack(core::ptr::null(), &mut alt);
-        let altstack_size_is_zero = alt.ss_size == 0;
-        let altstack_sp_is_null = alt.ss_sp.is_null();
-        let altstack_flag_disabled = (alt.ss_flags & libc::SS_DISABLE) != 0;
+        // This Rust probe's startup installs its own alternate stack in the new
+        // image. Assert the Linux-oracle observation affirmatively; the old
+        // image's stack address is still discarded by exec.
+        let altstack_size_is_nonzero = alt.ss_size != 0;
+        let altstack_sp_is_nonnull = !alt.ss_sp.is_null();
+        let altstack_flag_enabled = (alt.ss_flags & libc::SS_DISABLE) == 0;
 
         let sigusr1_mask_preserved = is_blocked(libc::SIGUSR1);
         let sigusr1_pending_preserved = is_pending(libc::SIGUSR1);
@@ -96,9 +99,9 @@ fn stage2() {
             sigchld_reset_to_dfl = sigchld_reset_to_dfl,
             sigusr2_reset_to_dfl = sigusr2_reset_to_dfl,
             sigpipe_still_ign = sigpipe_still_ign,
-            altstack_size_is_zero = altstack_size_is_zero,
-            altstack_sp_is_null = altstack_sp_is_null,
-            altstack_flag_disabled = altstack_flag_disabled,
+            altstack_size_is_nonzero = altstack_size_is_nonzero,
+            altstack_sp_is_nonnull = altstack_sp_is_nonnull,
+            altstack_flag_enabled = altstack_flag_enabled,
             sigusr1_mask_preserved = sigusr1_mask_preserved,
             sigusr1_pending_preserved = sigusr1_pending_preserved,
         );
