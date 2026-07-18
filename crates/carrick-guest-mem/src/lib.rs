@@ -516,6 +516,19 @@ pub trait GuestMemory {
         Ok(())
     }
 
+    /// Optional live residency vector for a backend whose guest pages are
+    /// directly queryable at host level. One byte per guest page, with bit 0
+    /// matching Linux `mincore(2)`. Translation/page-table backends return
+    /// `None` and let the dispatcher use its portable residency metadata.
+    fn resident_pages(
+        &self,
+        _start: GuestVa,
+        _page_count: u64,
+        _page_size: u64,
+    ) -> Option<Vec<u8>> {
+        None
+    }
+
     /// Fork-coherent host location for the guest futex word at `guest_addr`, but
     /// ONLY when it lies in a guest `MAP_SHARED` region. Returns `None` for
     /// private/anon guest memory, which stays in-process via the parking-lot

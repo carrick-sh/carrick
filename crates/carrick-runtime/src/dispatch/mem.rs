@@ -2146,7 +2146,7 @@ impl SyscallDispatcher {
             }
             let pages = length.div_ceil(page_size);
             let bytes = this
-                .mincore_residency_vector(address.0, pages, page_size)
+                .mincore_residency_vector(memory, address.0, pages, page_size)
                 .unwrap_or_else(|| vec![1u8; pages as usize]);
             memory.write_bytes(vec.0, &bytes)?;
             Ok(DispatchOutcome::Returned { value: 0 })
@@ -2682,10 +2682,12 @@ impl SyscallDispatcher {
     /// stay resident, matching the prior conservative default.
     fn mincore_residency_vector(
         &self,
+        memory: &impl GuestMemory,
         address: u64,
         pages: u64,
         page_size: u64,
     ) -> Option<Vec<u8>> {
+        let live_residency = memory.resident_pages(GuestVa(address), pages, page_size);
         let mem = self.mem.lock();
         let mut out = Vec::with_capacity(usize::try_from(pages).ok()?);
         for index in 0..pages {
@@ -2696,6 +2698,10 @@ impl SyscallDispatcher {
                 .any(|m| page >= m.start && page < m.end);
             let resident = if in_dynamic {
                 ranges_contain_page(&mem.resident_ranges, page)
+                    || live_residency
+                        .as_ref()
+                        .and_then(|vector| vector.get(index as usize))
+                        .is_some_and(|byte| byte & 1 != 0)
             } else {
                 true
             };
@@ -3893,16 +3899,17 @@ mod tests {
             crate::vfs::GuestMemoryRange::new(GuestVa(base), GuestVa(base.saturating_add(length)))
                 .expect("valid locked range");
         locked_ranges_insert(&mut dispatcher.mem.lock().locked_ranges, range);
+        let memory = LinearMemory::new(base, vec![0; length as usize]);
 
         assert_eq!(
-            dispatcher.mincore_residency_vector(base, 2, LINUX_PAGE_SIZE),
+            dispatcher.mincore_residency_vector(&memory, base, 2, LINUX_PAGE_SIZE),
             Some(vec![0, 0]),
             "MLOCK_ONFAULT accounting alone must not make pages resident"
         );
 
         dispatcher.mark_range_resident(base, LINUX_PAGE_SIZE);
         assert_eq!(
-            dispatcher.mincore_residency_vector(base, 2, LINUX_PAGE_SIZE),
+            dispatcher.mincore_residency_vector(&memory, base, 2, LINUX_PAGE_SIZE),
             Some(vec![1, 0]),
             "only the populated page becomes resident"
         );
@@ -3929,7 +3936,7 @@ mod tests {
             .commit_mmap_locked_range(&mut memory, Some(range))
             .expect("populate MAP_LOCKED range");
         assert_eq!(
-            map_locked.mincore_residency_vector(base, 2, LINUX_PAGE_SIZE),
+            map_locked.mincore_residency_vector(&memory, base, 2, LINUX_PAGE_SIZE),
             Some(vec![1, 1]),
             "MAP_LOCKED must populate the mapping"
         );
@@ -3946,7 +3953,7 @@ mod tests {
             .lock_current_mappings(&mut memory, false)
             .expect("populate MCL_CURRENT mappings");
         assert_eq!(
-            mlockall.mincore_residency_vector(base, 2, LINUX_PAGE_SIZE),
+            mlockall.mincore_residency_vector(&memory, base, 2, LINUX_PAGE_SIZE),
             Some(vec![1, 1]),
             "MCL_CURRENT without MCL_ONFAULT must populate current mappings"
         );
@@ -3961,7 +3968,7 @@ mod tests {
             String::new(),
         );
         assert_eq!(
-            alias_locked.mincore_residency_vector(base, 2, LINUX_PAGE_SIZE),
+            alias_locked.mincore_residency_vector(&memory, base, 2, LINUX_PAGE_SIZE),
             Some(vec![1, 1]),
             "deferred host aliases must publish eager MAP_LOCKED residency"
         );
