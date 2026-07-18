@@ -289,6 +289,24 @@ until 432/432.
 - **Never run vmm on this rig.** Native is default; the census invokes
   `native_run` directly.
 
+## Achievable ceiling on the x86_64 native lane (arch-locked probes)
+
+The conformance corpus is written **aarch64-first** (its gate is macOS/HVF +
+Docker on aarch64). Most probes are arch-generic — the frequent "aarch64"
+mentions in probe sources are *comments* over arch-generic `libc::SYS_*` code, so
+they pass fine on x86_64. But a **small set (~5–10) are genuinely arch-locked**:
+they read aarch64 structs/registers directly and cannot pass on this x86_64 lane
+regardless of runtime work. Confirmed examples:
+- `faultaddr` — casts `uc_mcontext` to an aarch64 `sigcontext` (`fault_addr_match`
+  reads x86_64 register R8, never the fault VA). `si_addr_match` still passes.
+- `nativex18` — reads the aarch64 `x18` platform register (no x86_64 equivalent).
+- `mailboxregs`, `ctrel0` — aarch64 register/timer reads.
+- `vdsosymbols`, `perf_dsr_*` — aarch64 vDSO / DSR-internal specifics.
+
+So the **winnable ceiling on this lane is ~418–423 / 428**, and the canonical
+"ALL probes" target is the aarch64 gate (not runnable on this FreeBSD x86 rig).
+Track these as *excluded (arch-locked)*, not as open work.
+
 ## Definition of done
 
 432/432 conformance probes OK under `native_run`, the integration suite green,
