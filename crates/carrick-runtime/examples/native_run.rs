@@ -13,17 +13,25 @@ fn main() {
         if let Err(e) = carrick_runtime::probes::register_dtrace_probes() {
             eprintln!("[native_run] warning: USDT probe registration failed: {e}");
         }
-        let Some(path) = std::env::args().nth(1) else {
-            eprintln!("usage: native_run <elf>");
+        let mut host_args = std::env::args();
+        let _runner = host_args.next();
+        let Some(path) = host_args.next() else {
+            eprintln!("usage: native_run <elf> [guest-arg ...]");
             std::process::exit(2);
         };
-        match carrick_runtime::runtime::run_elf_native_dispatch(std::path::Path::new(&path)) {
+        let guest_argv = std::iter::once(path.clone()).chain(host_args);
+        match carrick_runtime::runtime::run_elf_native_dispatch_with_process(
+            std::path::Path::new(&path),
+            guest_argv,
+            ["PATH=/bin:/usr/bin".to_string()],
+        ) {
             Ok(r) => {
                 eprintln!(
-                    "[native_run] exit={} traps={} stdout={:?}",
+                    "[native_run] exit={} traps={} stdout={:?} stderr={:?}",
                     r.exit_code,
                     r.traps,
-                    String::from_utf8_lossy(&r.stdout)
+                    String::from_utf8_lossy(&r.stdout),
+                    String::from_utf8_lossy(&r.stderr)
                 );
                 std::process::exit(r.exit_code);
             }

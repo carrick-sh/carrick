@@ -888,14 +888,29 @@ pub mod runtime {
     #[cfg(all(feature = "platform-freebsd", target_arch = "x86_64"))]
     pub fn run_elf_native_dispatch(path: &std::path::Path) -> Result<RunResult, RuntimeError> {
         let argv0 = path.to_string_lossy().into_owned();
+        run_elf_native_dispatch_with_process(path, [argv0], std::iter::empty::<String>())
+    }
+
+    /// Run a static x86_64 ELF through the native backend with an explicit
+    /// guest argument vector. This is primarily the standalone workload/LTP
+    /// bring-up surface; the first item must be the guest-visible `argv[0]`.
+    #[cfg(all(feature = "platform-freebsd", target_arch = "x86_64"))]
+    pub fn run_elf_native_dispatch_with_args(
+        path: &std::path::Path,
+        argv: impl IntoIterator<Item = String>,
+    ) -> Result<RunResult, RuntimeError> {
+        run_elf_native_dispatch_with_process(path, argv, std::iter::empty::<String>())
+    }
+
+    /// Run a static x86_64 ELF with explicit guest arguments and environment.
+    #[cfg(all(feature = "platform-freebsd", target_arch = "x86_64"))]
+    pub fn run_elf_native_dispatch_with_process(
+        path: &std::path::Path,
+        argv: impl IntoIterator<Item = String>,
+        env: impl IntoIterator<Item = String>,
+    ) -> Result<RunResult, RuntimeError> {
         let dispatcher = make_native_dispatcher(path);
-        crate::native_freebsd::run_static_x86_elf(
-            path,
-            dispatcher,
-            [argv0],
-            std::iter::empty::<String>(),
-            DEFAULT_MAX_TRAPS,
-        )
+        crate::native_freebsd::run_static_x86_elf(path, dispatcher, argv, env, DEFAULT_MAX_TRAPS)
     }
 
     /// Dispatcher for the NATIVE (DSR) ELF runner with Docker-stable container
@@ -941,10 +956,20 @@ pub mod runtime {
         };
 
         let mut dispatcher = SyscallDispatcher::with_network(runtime_network.clone());
+        dispatcher.set_native_x86_64(true);
         dispatcher.set_guest_hostname(guest_hostname.clone());
 
-        let scratch_root = std::env::temp_dir().join("carrick-native-scratch");
-        match HostFsBackend::new_in(&scratch_root) {
+        // The standalone native runner defaults to an isolated scratch root,
+        // but workload bring-up (notably static-musl LTP) may supply a prepared
+        // Linux rootfs containing helper executables and data files. Keep this
+        // explicit: silently exposing the FreeBSD host root would make execve
+        // pick up incompatible host binaries.
+        let prepared_root = std::env::var_os("CARRICK_NATIVE_ROOTFS").map(std::path::PathBuf::from);
+        let host_backend = match prepared_root.as_deref() {
+            Some(root) => HostFsBackend::attach(root),
+            None => HostFsBackend::new_in(&std::env::temp_dir().join("carrick-native-scratch")),
+        };
+        match host_backend {
             Ok(host) => {
                 let mut backend: Box<dyn FsBackend> = Box::new(host);
                 // Dirs + /etc/{passwd,group,nsswitch} baseline (host-net hosts

@@ -736,7 +736,7 @@ pub(crate) fn synthetic_file(path: &str, ctx: &SyntheticProcContext) -> Option<V
     }
     match path {
         "/proc/cmdline" => Some(synthetic_proc_cmdline().to_vec()),
-        "/proc/config.gz" => Some(synthetic_proc_config_gz()),
+        "/proc/config.gz" => Some(synthetic_proc_config_gz(ctx.guest_arch)),
         "/proc/cpuinfo" => Some(synthetic_proc_cpuinfo(ctx.guest_arch)),
         "/proc/devices" => Some(synthetic_proc_devices().to_vec()),
         "/proc/diskstats" => Some(synthetic_proc_diskstats().to_vec()),
@@ -2878,16 +2878,26 @@ nodev\tsysfs\n\
 nodev\toverlay\n"
 }
 
-fn synthetic_proc_config_gz() -> Vec<u8> {
+fn synthetic_proc_config_gz(guest_arch: GuestReportedArch) -> Vec<u8> {
     use std::io::Write;
     use std::sync::OnceLock;
-    static CACHE: OnceLock<Vec<u8>> = OnceLock::new();
-    CACHE
+    static AARCH64_CACHE: OnceLock<Vec<u8>> = OnceLock::new();
+    static X86_64_CACHE: OnceLock<Vec<u8>> = OnceLock::new();
+    let cache = match guest_arch {
+        GuestReportedArch::Aarch64 => &AARCH64_CACHE,
+        GuestReportedArch::X86_64 => &X86_64_CACHE,
+    };
+    cache
         .get_or_init(|| {
-            let body = "\
+            let arch_config = match guest_arch {
+                GuestReportedArch::Aarch64 => "CONFIG_ARM64=y\n",
+                GuestReportedArch::X86_64 => "CONFIG_X86_64=y\n",
+            };
+            let body = format!(
+                "\
 # Synthesised by carrick for /proc/config.gz\n\
 CONFIG_64BIT=y\n\
-CONFIG_ARM64=y\n\
+{arch_config}\
 CONFIG_MMU=y\n\
 CONFIG_EVENTFD=y\n\
 CONFIG_SIGNALFD=y\n\
@@ -2919,7 +2929,8 @@ CONFIG_UTS_NS=y\n\
 CONFIG_IPC_NS=y\n\
 CONFIG_PID_NS=y\n\
 CONFIG_NET_NS=y\n\
-CONFIG_USER_NS=y\n";
+CONFIG_USER_NS=y\n"
+            );
             let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
             let _ = enc.write_all(body.as_bytes());
             enc.finish().unwrap_or_default()
@@ -4085,14 +4096,29 @@ mod tests {
     }
 
     #[test]
-    fn proc_config_reports_loop_device_support() {
+    fn proc_config_reports_loop_device_support_and_guest_isa() {
         use std::io::Read;
 
-        let gz = synthetic_proc_config_gz();
-        let mut decoder = flate2::read::GzDecoder::new(&gz[..]);
-        let mut config = String::new();
-        decoder.read_to_string(&mut config).unwrap();
-        assert!(config.contains("CONFIG_BLK_DEV_LOOP=y"));
+        for (arch, expected, excluded) in [
+            (
+                GuestReportedArch::Aarch64,
+                "CONFIG_ARM64=y",
+                "CONFIG_X86_64=y",
+            ),
+            (
+                GuestReportedArch::X86_64,
+                "CONFIG_X86_64=y",
+                "CONFIG_ARM64=y",
+            ),
+        ] {
+            let gz = synthetic_proc_config_gz(arch);
+            let mut decoder = flate2::read::GzDecoder::new(&gz[..]);
+            let mut config = String::new();
+            decoder.read_to_string(&mut config).unwrap();
+            assert!(config.contains("CONFIG_BLK_DEV_LOOP=y"));
+            assert!(config.contains(expected));
+            assert!(!config.contains(excluded));
+        }
     }
 
     #[test]
