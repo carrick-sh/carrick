@@ -113,7 +113,7 @@ OK	fstatatflags
 OK	fsx
 OK	futexdeadline
 OK	futexextra
-EXIT_FALSE	futexforkrequeue
+OK	futexforkrequeue
 OK	futexforkwakegroups
 OK	futexghost
 OK	futexpilock

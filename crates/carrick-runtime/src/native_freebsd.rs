@@ -235,7 +235,11 @@ fn identity_raw_range_valid(address: u64, length: usize) -> bool {
 
 #[cfg(test)]
 mod identity_raw_range_tests {
-    use super::{freebsd_shared_waiter_key, identity_raw_range_valid};
+    use super::{
+        SharedWaitAssignment, freebsd_shared_waiter_key, identity_raw_range_valid,
+        init_shared_waiter_table, shared_futex_requeue_umtx, shared_futex_wake_umtx,
+        shared_waiter_slot, take_shared_wait_assignment, wait_requeued_umtx,
+    };
     use std::os::fd::AsRawFd;
 
     #[test]
@@ -291,6 +295,65 @@ mod identity_raw_range_tests {
             libc::munmap(first, LEN);
             libc::munmap(second, LEN);
         }
+    }
+
+    #[test]
+    fn shared_requeue_credit_survives_wake_before_destination_park() {
+        use std::sync::atomic::Ordering;
+
+        init_shared_waiter_table();
+        let words = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(words, libc::MAP_FAILED);
+        let from_word = words as usize;
+        let to_word = from_word + 4;
+        let from_key = from_word;
+        let to_key = to_word;
+        let source = shared_waiter_slot(from_key).expect("source waiter slot");
+        source.count.store(1, Ordering::SeqCst);
+
+        assert_eq!(
+            shared_futex_requeue_umtx(from_word, from_key, to_key, 0, 1),
+            (0, 1)
+        );
+        let assignment = take_shared_wait_assignment(Some(source));
+        source.count.store(0, Ordering::SeqCst);
+        let SharedWaitAssignment::Requeue {
+            waiter_key,
+            generation,
+        } = assignment
+        else {
+            panic!("waiter was not assigned to the destination");
+        };
+
+        // Wake BEFORE the moved waiter begins its destination park. The logical
+        // credit must make the subsequent wait complete without blocking.
+        assert_eq!(shared_futex_wake_umtx(to_word, to_key, 1), 1);
+        assert_eq!(
+            wait_requeued_umtx(
+                waiter_key,
+                generation,
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(1)),
+            ),
+            0
+        );
+        assert_eq!(
+            shared_waiter_slot(to_key)
+                .expect("destination waiter slot")
+                .logical_requeued
+                .load(Ordering::SeqCst),
+            0
+        );
+
+        unsafe { libc::munmap(words, 4096) };
     }
 }
 
@@ -3081,11 +3144,11 @@ fn service_syscall(
             }
             Step::Continue(snapshot.rip)
         }
-        // `FUTEX_CMP_REQUEUE`/`FUTEX_REQUEUE` across shared words: wake `wake`
-        // waiters on `from`, then move the rest onto `to`. `_umtx_op` has no
-        // requeue op, so approximate it by waking `wake` on `from` and `requeue`
-        // on `to` (the guest re-checks its predicate and re-waits as needed —
-        // Linux-observable behavior, just without the internal re-parking).
+        // `FUTEX_CMP_REQUEUE`/`FUTEX_REQUEUE` across shared words. FreeBSD umtx
+        // cannot atomically relink queues, so the fork-shared waiter table
+        // publishes direct-vs-destination assignments before physically
+        // releasing the selected source waiters; moved waiters transparently
+        // continue their original wait on `to`.
         DispatchOutcome::SharedFutexRequeue {
             from,
             to,
@@ -3093,14 +3156,19 @@ fn service_syscall(
             requeue,
             ..
         } => {
-            let woken = shared_futex_wake_umtx(from.wait_addr().raw(), from.waiter_key(), wake);
-            let moved = shared_futex_wake_umtx(to.wait_addr().raw(), to.waiter_key(), requeue);
-            snapshot.gpr[reg::RAX] = (woken + moved) as u64;
+            let (woken, moved) = shared_futex_requeue_umtx(
+                from.wait_addr().raw(),
+                from.waiter_key(),
+                to.waiter_key(),
+                wake,
+                requeue,
+            );
+            snapshot.gpr[reg::RAX] = u64::from(woken + moved);
             if let Some(sig) = run_pending_signals(
                 shared,
                 tid,
                 snapshot,
-                Some(woken + moved),
+                Some(i64::from(woken + moved)),
                 Some(syscall_nr),
                 orig_rax,
             ) {
@@ -3227,7 +3295,17 @@ struct WaiterSlot {
     key: std::sync::atomic::AtomicU64,
     /// Live parked-waiter count on `key`.
     count: std::sync::atomic::AtomicU32,
-    _pad: u32,
+    /// Requeue assignments consumed by waiters physically released from this
+    /// source bucket. Direct-wake assignments are consumed before moves.
+    requeue_direct: std::sync::atomic::AtomicU32,
+    requeue_moved: std::sync::atomic::AtomicU32,
+    requeue_to_key: std::sync::atomic::AtomicU64,
+    requeue_to_generation: std::sync::atomic::AtomicU32,
+    /// Requeued waiters park on this internal generation rather than re-checking
+    /// the destination guest word. Credits make wake-before-park lossless.
+    logical_generation: std::sync::atomic::AtomicU32,
+    logical_requeued: std::sync::atomic::AtomicU32,
+    logical_wake: std::sync::atomic::AtomicU32,
 }
 const WAITER_SLOTS: usize = 1024;
 static SHARED_WAITER_TABLE: std::sync::atomic::AtomicPtr<WaiterSlot> =
@@ -3318,68 +3396,307 @@ const UMTX_OP_WAKE: libc::c_int = 3;
 // `uaddr` (4th) arg equals `sizeof(struct timespec)`; `uaddr2` (5th) points at it.
 const UMTX_TIMESPEC_SIZE: usize = std::mem::size_of::<libc::timespec>();
 
+enum SharedWaitAssignment {
+    Direct,
+    Requeue { waiter_key: usize, generation: u32 },
+}
+
+fn consume_waiter_assignment(counter: &std::sync::atomic::AtomicU32) -> bool {
+    use std::sync::atomic::Ordering;
+    let mut current = counter.load(Ordering::Acquire);
+    while current != 0 {
+        match counter.compare_exchange_weak(
+            current,
+            current - 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return true,
+            Err(next) => current = next,
+        }
+    }
+    false
+}
+
+fn take_shared_wait_assignment(slot: Option<&WaiterSlot>) -> SharedWaitAssignment {
+    use std::sync::atomic::Ordering;
+    let Some(slot) = slot else {
+        return SharedWaitAssignment::Direct;
+    };
+    if consume_waiter_assignment(&slot.requeue_direct) {
+        return SharedWaitAssignment::Direct;
+    }
+    if consume_waiter_assignment(&slot.requeue_moved) {
+        return SharedWaitAssignment::Requeue {
+            waiter_key: slot.requeue_to_key.load(Ordering::Acquire) as usize,
+            generation: slot.requeue_to_generation.load(Ordering::Acquire),
+        };
+    }
+    SharedWaitAssignment::Direct
+}
+
+fn decrement_logical_requeued(slot: &WaiterSlot) {
+    use std::sync::atomic::Ordering;
+    let _ = slot
+        .logical_requeued
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            Some(count.saturating_sub(1))
+        });
+}
+
+fn reserve_logical_wakes(slot: &WaiterSlot, requested: u32) -> u32 {
+    use std::sync::atomic::Ordering;
+    let mut credits = slot.logical_wake.load(Ordering::Acquire);
+    loop {
+        let pending = slot.logical_requeued.load(Ordering::Acquire);
+        let reserved = requested.min(pending.saturating_sub(credits));
+        if reserved == 0 {
+            return 0;
+        }
+        match slot.logical_wake.compare_exchange_weak(
+            credits,
+            credits.saturating_add(reserved),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return reserved,
+            Err(next) => credits = next,
+        }
+    }
+}
+
+/// Complete a logically requeued wait. The destination slot's internal
+/// generation + wake credits close the wake-before-park race without depending
+/// on the destination guest VA being identical in every process.
+fn wait_requeued_umtx(
+    waiter_key: usize,
+    mut generation: u32,
+    deadline: Option<std::time::Instant>,
+) -> i64 {
+    use std::sync::atomic::Ordering;
+    let Some(slot) = shared_waiter_slot(waiter_key) else {
+        return crate::linux_abi::LINUX_EAGAIN.guest_retval();
+    };
+    loop {
+        if consume_waiter_assignment(&slot.logical_wake) {
+            decrement_logical_requeued(slot);
+            return 0;
+        }
+        let remaining = match deadline {
+            Some(deadline) => {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    decrement_logical_requeued(slot);
+                    return crate::linux_abi::LINUX_ETIMEDOUT.guest_retval();
+                }
+                Some(remaining)
+            }
+            None => None,
+        };
+        let current = slot.logical_generation.load(Ordering::Acquire);
+        if current != generation {
+            generation = current;
+            continue;
+        }
+        // Bound each host park so a wake racing before umtx enrollment is
+        // observed from its already-published logical credit within 20 ms.
+        let slice = remaining
+            .unwrap_or(std::time::Duration::from_millis(20))
+            .min(std::time::Duration::from_millis(20));
+        let ts = libc::timespec {
+            tv_sec: slice.as_secs() as libc::time_t,
+            tv_nsec: slice.subsec_nanos() as libc::c_long,
+        };
+        let uaddr = UMTX_TIMESPEC_SIZE as *mut libc::c_void;
+        let uaddr2 = (&ts as *const libc::timespec)
+            .cast_mut()
+            .cast::<libc::c_void>();
+        let generation_word = (&slot.logical_generation as *const std::sync::atomic::AtomicU32)
+            .cast_mut()
+            .cast::<libc::c_void>();
+        // SAFETY: the generation word lives in the pre-fork MAP_SHARED waiter
+        // table and remains mapped for the run's lifetime.
+        let rc = unsafe {
+            libc::syscall(
+                SYS_UMTX_OP,
+                generation_word,
+                UMTX_OP_WAIT_UINT,
+                generation as libc::c_ulong,
+                uaddr,
+                uaddr2,
+            )
+        } as libc::c_long;
+        if rc == 0 {
+            generation = slot.logical_generation.load(Ordering::Acquire);
+            continue;
+        }
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        match errno {
+            libc::EAGAIN => {
+                generation = slot.logical_generation.load(Ordering::Acquire);
+            }
+            libc::EINTR => {
+                if consume_waiter_assignment(&slot.logical_wake) {
+                    decrement_logical_requeued(slot);
+                    return 0;
+                }
+                decrement_logical_requeued(slot);
+                return crate::linux_abi::LINUX_EINTR.guest_retval();
+            }
+            libc::ETIMEDOUT => {
+                // Slice timeout, not necessarily the guest deadline. Loop to
+                // re-check logical credit and the absolute deadline.
+            }
+            _ => {
+                decrement_logical_requeued(slot);
+                return crate::linux_abi::LINUX_EAGAIN.guest_retval();
+            }
+        }
+    }
+}
+
 /// Cross-process shared-futex WAIT via `_umtx_op(UMTX_OP_WAIT_UINT)`. `word` is a
 /// live host address of the 4-byte futex word; the kernel re-checks `*word ==
 /// value` atomically before parking (closing the classic set-then-wake race with
 /// a peer process), then blocks until a `shared_futex_wake_umtx` on the same page
-/// wakes it, the relative `timeout` elapses, or a signal interrupts. Returns the
-/// Linux `FUTEX_WAIT` retval: 0 (woken), `-EAGAIN` (value mismatch), `-ETIMEDOUT`,
-/// or `-EINTR`.
+/// wakes it, the relative `timeout` elapses, or a signal interrupts. A waiter
+/// selected by `FUTEX_REQUEUE` transparently continues on the destination while
+/// retaining the original absolute deadline. Returns the Linux `FUTEX_WAIT`
+/// retval: 0 (woken), `-EAGAIN` (value mismatch), `-ETIMEDOUT`, or `-EINTR`.
 fn shared_futex_wait_umtx(
     word: usize,
     waiter_key: usize,
     value: u32,
     timeout: Option<std::time::Duration>,
 ) -> i64 {
-    let ts = timeout.map(|d| libc::timespec {
-        tv_sec: d.as_secs() as libc::time_t,
-        tv_nsec: d.subsec_nanos() as libc::c_long,
-    });
-    let (uaddr, uaddr2) = match &ts {
-        Some(ts) => (
-            UMTX_TIMESPEC_SIZE as *mut libc::c_void,
-            ts as *const libc::timespec as *mut libc::c_void,
-        ),
-        None => (std::ptr::null_mut(), std::ptr::null_mut()),
-    };
-    // Announce this parked waiter under its stable backing key so a peer's WAKE
-    // can report how many it woke even when it mapped the same file at another
-    // VA after exec (Linux FUTEX_WAKE semantics). Incremented
-    // BEFORE the park and decremented AFTER it returns, for every exit path.
     use std::sync::atomic::Ordering;
-    let slot = shared_waiter_slot(waiter_key);
-    if let Some(s) = slot {
-        s.count.fetch_add(1, Ordering::SeqCst);
+    let deadline = timeout.and_then(|duration| std::time::Instant::now().checked_add(duration));
+    let (word, waiter_key, value) = (word, waiter_key, value);
+    loop {
+        let remaining = match deadline {
+            Some(deadline) => {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    return crate::linux_abi::LINUX_ETIMEDOUT.guest_retval();
+                }
+                Some(remaining)
+            }
+            None => None,
+        };
+        let ts = remaining.map(|duration| libc::timespec {
+            tv_sec: duration.as_secs() as libc::time_t,
+            tv_nsec: duration.subsec_nanos() as libc::c_long,
+        });
+        let (uaddr, uaddr2) = match &ts {
+            Some(ts) => (
+                UMTX_TIMESPEC_SIZE as *mut libc::c_void,
+                ts as *const libc::timespec as *mut libc::c_void,
+            ),
+            None => (std::ptr::null_mut(), std::ptr::null_mut()),
+        };
+        // Announce this parked waiter under its stable backing key so a peer's
+        // WAKE can report how many it woke even when it mapped the same file at
+        // another VA after exec. Increment before the park and decrement after
+        // every return path.
+        let slot = shared_waiter_slot(waiter_key);
+        if let Some(slot) = slot {
+            slot.count.fetch_add(1, Ordering::SeqCst);
+        }
+        // SAFETY: `word` is an identity host VA of a guest-mapped,
+        // 4-byte-aligned shared futex word; `_umtx_op` only reads it.
+        let rc = unsafe {
+            libc::syscall(
+                SYS_UMTX_OP,
+                word as *mut u32 as *mut libc::c_void,
+                UMTX_OP_WAIT_UINT,
+                value as libc::c_ulong,
+                uaddr,
+                uaddr2,
+            )
+        } as libc::c_long;
+        if let Some(slot) = slot {
+            slot.count.fetch_sub(1, Ordering::SeqCst);
+        }
+        if rc == 0 {
+            match take_shared_wait_assignment(slot) {
+                SharedWaitAssignment::Direct => return 0,
+                SharedWaitAssignment::Requeue {
+                    waiter_key: next_key,
+                    generation,
+                } => return wait_requeued_umtx(next_key, generation, deadline),
+            }
+        }
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        return match errno {
+            libc::ETIMEDOUT => crate::linux_abi::LINUX_ETIMEDOUT.guest_retval(),
+            libc::EINTR => crate::linux_abi::LINUX_EINTR.guest_retval(),
+            // `*word != value` at entry (a peer already advanced it): Linux
+            // returns EAGAIN and the guest retry loop re-reads the word.
+            libc::EAGAIN => crate::linux_abi::LINUX_EAGAIN.guest_retval(),
+            _ => crate::linux_abi::LINUX_EAGAIN.guest_retval(),
+        };
     }
-    // SAFETY: `word` is an identity host VA of a guest-mapped, 4-byte-aligned
-    // shared futex word; `_umtx_op` only reads it. `libc::syscall` returns -1 and
-    // sets errno on failure.
+}
+
+/// Implement Linux `FUTEX_REQUEUE` over FreeBSD's non-requeueing umtx ABI.
+/// The source waiters are physically released, but each consumes an assignment
+/// from the fork-shared slot: the first `wake_count` return to the guest and the
+/// next `requeue_count` transparently park on the destination. Publishing the
+/// assignments before `_umtx_op(WAKE)` closes the assignment race.
+fn shared_futex_requeue_umtx(
+    from_word: usize,
+    from_key: usize,
+    to_key: usize,
+    wake_count: u32,
+    requeue_count: u32,
+) -> (u32, u32) {
+    use std::sync::atomic::Ordering;
+    let Some(slot) = shared_waiter_slot(from_key) else {
+        return (0, 0);
+    };
+    let parked = slot.count.load(Ordering::SeqCst);
+    let direct = parked.min(wake_count);
+    let destination = shared_waiter_slot(to_key);
+    let moved = if destination.is_some() {
+        parked.saturating_sub(direct).min(requeue_count)
+    } else {
+        0
+    };
+    let total = direct.saturating_add(moved);
+    if total == 0 {
+        return (0, 0);
+    }
+    let generation = destination
+        .map(|slot| {
+            slot.logical_requeued.fetch_add(moved, Ordering::AcqRel);
+            slot.logical_generation.load(Ordering::Acquire)
+        })
+        .unwrap_or(0);
+    slot.requeue_to_key.store(to_key as u64, Ordering::Relaxed);
+    slot.requeue_to_generation
+        .store(generation, Ordering::Relaxed);
+    slot.requeue_moved.store(moved, Ordering::Release);
+    slot.requeue_direct.store(direct, Ordering::Release);
+
+    // SAFETY: source is the live shared futex word. The side-table assignments
+    // are visible before the physical wake, so every released waiter either
+    // returns directly or continues at the destination.
     let rc = unsafe {
         libc::syscall(
             SYS_UMTX_OP,
-            word as *mut u32 as *mut libc::c_void,
-            UMTX_OP_WAIT_UINT,
-            value as libc::c_ulong,
-            uaddr,
-            uaddr2,
+            from_word as *mut u32 as *mut libc::c_void,
+            UMTX_OP_WAKE,
+            total as libc::c_ulong,
+            std::ptr::null_mut::<libc::c_void>(),
+            std::ptr::null_mut::<libc::c_void>(),
         )
     };
-    if let Some(s) = slot {
-        s.count.fetch_sub(1, Ordering::SeqCst);
+    if rc < 0 {
+        slot.requeue_direct.store(0, Ordering::Release);
+        slot.requeue_moved.store(0, Ordering::Release);
+        return (0, 0);
     }
-    let rc = rc as libc::c_long;
-    if rc == 0 {
-        return 0;
-    }
-    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-    match errno {
-        libc::ETIMEDOUT => crate::linux_abi::LINUX_ETIMEDOUT.guest_retval(),
-        libc::EINTR => crate::linux_abi::LINUX_EINTR.guest_retval(),
-        // `*word != value` at entry (a peer already advanced it): Linux returns
-        // EAGAIN, and the guest's retry loop re-reads the now-changed word.
-        libc::EAGAIN => crate::linux_abi::LINUX_EAGAIN.guest_retval(),
-        _ => crate::linux_abi::LINUX_EAGAIN.guest_retval(),
-    }
+    (direct, moved)
 }
 
 /// Cross-process shared-futex WAKE via `_umtx_op(UMTX_OP_WAKE)`: wake up to
@@ -3393,23 +3710,51 @@ fn shared_futex_wait_umtx(
 /// matching Linux on a page nothing is parked on (`futexghost`).
 fn shared_futex_wake_umtx(word: usize, waiter_key: usize, count: u32) -> i64 {
     use std::sync::atomic::Ordering;
-    // Snapshot the parked count BEFORE waking: the woken waiters race to
-    // decrement as they leave the kernel, so a post-wake read would undercount.
-    let parked = shared_waiter_slot(waiter_key)
-        .map(|s| s.count.load(Ordering::SeqCst))
-        .unwrap_or(0);
-    // SAFETY: as in `shared_futex_wait_umtx`; WAKE neither reads nor writes the word.
-    let _ = unsafe {
-        libc::syscall(
-            SYS_UMTX_OP,
-            word as *mut u32 as *mut libc::c_void,
-            UMTX_OP_WAKE,
-            count as libc::c_ulong,
-            std::ptr::null_mut::<libc::c_void>(),
-            std::ptr::null_mut::<libc::c_void>(),
-        )
+    let Some(slot) = shared_waiter_slot(waiter_key) else {
+        return 0;
     };
-    i64::from(count.min(parked))
+    // Logically requeued waiters are counted even before they park on the
+    // destination's internal generation. Reserve their credits first; this
+    // makes a destination wake lossless across the requeue-to-park window.
+    let logical_woke = reserve_logical_wakes(slot, count);
+    if logical_woke != 0 {
+        slot.logical_generation.fetch_add(1, Ordering::AcqRel);
+        let generation_word = (&slot.logical_generation as *const std::sync::atomic::AtomicU32)
+            .cast_mut()
+            .cast::<libc::c_void>();
+        // SAFETY: the generation word is in the run-lifetime MAP_SHARED table.
+        // Credits, not the physical wake count, select exactly which waiters
+        // complete, so waking all sleepers is safe.
+        unsafe {
+            libc::syscall(
+                SYS_UMTX_OP,
+                generation_word,
+                UMTX_OP_WAKE,
+                u32::MAX as libc::c_ulong,
+                std::ptr::null_mut::<libc::c_void>(),
+                std::ptr::null_mut::<libc::c_void>(),
+            )
+        };
+    }
+    let remaining = count.saturating_sub(logical_woke);
+    // Snapshot ordinary parked waiters before waking; released waiters race to
+    // decrement as they return from the kernel.
+    let normal_woke = remaining.min(slot.count.load(Ordering::SeqCst));
+    if normal_woke != 0 {
+        // SAFETY: as in `shared_futex_wait_umtx`; WAKE neither reads nor writes
+        // the guest word.
+        unsafe {
+            libc::syscall(
+                SYS_UMTX_OP,
+                word as *mut u32 as *mut libc::c_void,
+                UMTX_OP_WAKE,
+                normal_woke as libc::c_ulong,
+                std::ptr::null_mut::<libc::c_void>(),
+                std::ptr::null_mut::<libc::c_void>(),
+            )
+        };
+    }
+    i64::from(logical_woke.saturating_add(normal_woke))
 }
 
 /// Park this thread on `wait` until woken, timed out, or interrupted by a
