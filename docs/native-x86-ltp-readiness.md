@@ -61,9 +61,10 @@ process, eventfd, futex, and time tests under native DSR.
   a durable sweep harness must capture the whole process group, not only the
   top-level `RunResult` buffers.
 - The remaining conformance-probe gaps in
-  `docs/native-x86-conformance-plan.md` remain real blockers, especially exact
-  cross-process futex requeue and live protection/fault retry. Shared-file futex
-  identity across exec is now covered by `ltpcheckpointexec`.
+  `docs/native-x86-conformance-plan.md` remain real blockers, especially live
+  protection/fault retry. Shared-file futex identity across exec and exact
+  cross-process requeue are now covered by `ltpcheckpointexec` and
+  `futexforkrequeue`.
 
 ## Next gate
 

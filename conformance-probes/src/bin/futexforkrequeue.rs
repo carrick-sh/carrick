@@ -189,7 +189,7 @@ fn main() {
                 );
                 libc::close(ready_pipe[1]);
                 let timeout = libc::timespec {
-                    tv_sec: 10,
+                    tv_sec: 60,
                     tv_nsec: 0,
                 };
                 let rc = futex_wait(word0, 0, &timeout);
@@ -213,7 +213,11 @@ fn main() {
 
         let ready = read_ready(ready_pipe[0], Instant::now() + Duration::from_secs(20));
         libc::close(ready_pipe[0]);
-        std::thread::sleep(Duration::from_millis(250));
+        // The ready byte is emitted immediately before FUTEX_WAIT, so it proves
+        // intent but not kernel enrollment. Carrick's translated fork children
+        // take longer to cross that final boundary than native Linux processes;
+        // leave a bounded enrollment window rather than racing the requeue.
+        std::thread::sleep(Duration::from_secs(2));
 
         let moved = futex_cmp_requeue(word0, WAKE_COUNT, REQUEUE_COUNT, word1, 0);
         let returned_after_requeue = wait_for_returned(
