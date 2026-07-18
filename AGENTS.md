@@ -282,6 +282,48 @@ Use **real debuggers, not `eprintln!`** — and never ship debug spam. Full guid
   hypotheses, not facts. Also verify *how you read the result* — empty output may
   mean "ran but unreadable," not "didn't happen."
 
+### Debugging the FreeBSD/amd64 native (DSR) lane
+
+The x86_64 native lane (`carrick-runtime/src/native_freebsd.rs`, driver
+`runtime::run_elf_native_dispatch`) runs guest code from a JIT cache with the
+`carrick-dsr-x86` gateway. `carrick trace` targets the container/VMM run, not
+this bare in-process runner — use these instead. **Don't timeout-and-grep; get
+ground truth.** (Worked example: a real std Rust binary spun; the tools below
+pinned it to a `jmp .` self-loop from an empty page-spanning `Continue` block in
+one pass, after hours of grep-guessing got nowhere.)
+
+- **`cargo run -p carrick-runtime --example native_run -- <elf>`** is the
+  standalone single-run driver to attach a debugger/tracer to (build with
+  `--no-default-features --features platform-freebsd`). It registers the carrick
+  USDT provider so probes are live.
+- **dtrace USDT (the real observability path — no env logging).** Probe names use
+  HYPHENS: `carrick<PID>:::syscall-return` (not `syscall__return`). USDT probes
+  register *after* the process starts, so use **`-Z`** (bind late) and `-c` to
+  launch under trace. Guest syscall census:
+  `dtrace -Zq -c "…/native_run <elf>" -n 'carrick*:::syscall-return { @[copyinstr(arg1)] = count(); } tick-3s { exit(0); }'`.
+  `syscall-entry` arg0 is the CANONICAL (asm-generic) number post-normalization.
+- **dtrace `profile` provider to read guest state during a spin.** Guest code runs
+  in the JIT with `%r15` = the DSR context; `exit_resume` at `r15+720` holds the
+  chain-entry guest VA:
+  `dtrace -q -p PID -n 'profile-4999 { @[*(uint64_t*)copyin(uregs[R_R15]+720,8)] = count(); } tick-3s { printa(@); exit(0); }'`
+  — the dominant address is the spinning block's guest VA.
+- **gcore + disassemble the JIT.** `gcore -c core PID`, then
+  `lldb …/native_run -c core -o "register read rip r15" -o "disassemble -b -s \$rip"`.
+  lldb can't unwind the JIT frame yet, BUT the core holds the guest's **live
+  registers** (the gateway loaded them into the real CPU) and the JIT bytes at
+  `rip` are the translated guest instructions — disassembling them shows exactly
+  what the guest is doing. NOTE: the core is ~34 GB (the 32 GiB mmap arena);
+  export `CARRICK_MMAP_ARENA_GIB=1` to shrink it.
+- **Make unhandled scenarios LOUD.** The driver's no-progress / unsupported paths
+  print a breadcrumb (recent block VAs, the mapped segments, the raw guest bytes
+  at the fault). Keep extending that to every unhandled path — a rich fault string
+  beats a debugger round-trip. Never let a failure surface as an empty result a
+  `grep` can hide.
+- **TODO (unwind through the JIT):** teach the carrick lldb scripts to unwind the
+  JIT→gateway→Rust frames (synthesize unwind info from the gateway's saved
+  `host_rsp`/`host_callee` in the ctx at `%r15`), so `bt` reaches
+  `run_static_x86_elf` and its locals (`next`, `image.segments`, the block cache).
+
 ---
 
 ## Engineering standards
