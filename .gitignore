@@ -14,3 +14,6 @@
 # Python bytecode (the .py sources are tracked; the cache is not)
 __pycache__/
 *.pyc
+
+# JIT/guest core dumps from native_run debugging
+*.core
