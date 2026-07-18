@@ -64,7 +64,7 @@ fn main() {
         report!(
             child_exited_clean = libc::WIFEXITED(status),
             child_read_efault = libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
-            child_killed_by_signal = libc::WIFSIGNALED(status),
+            child_not_killed_by_signal = !libc::WIFSIGNALED(status),
         );
     }
 }
