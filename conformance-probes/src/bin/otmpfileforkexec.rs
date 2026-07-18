@@ -28,6 +28,21 @@ fn open_tmpfile(access: libc::c_int) -> libc::c_int {
 }
 
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--write-fd") {
+        let fd = std::env::args()
+            .nth(2)
+            .and_then(|value| value.parse::<libc::c_int>().ok())
+            .unwrap_or(-1);
+        let written = unsafe {
+            libc::write(
+                fd,
+                PAYLOAD.as_ptr().cast::<libc::c_void>(),
+                PAYLOAD.len(),
+            )
+        };
+        std::process::exit(if written == PAYLOAD.len() as isize { 0 } else { 126 });
+    }
+
     // 1. O_RDONLY | O_TMPFILE must fail EINVAL (write access is mandatory).
     let ro = open_tmpfile(libc::O_RDONLY);
     let rdonly_einval =
@@ -47,25 +62,22 @@ fn main() {
         return;
     }
 
-    // 3. Fork + exec a child that writes PAYLOAD to the inherited fd via
-    //    /bin/sh. The child references the fd by number (it is NOT O_CLOEXEC),
-    //    proving exec-inheritance, then the parent reads it back.
+    // 3. Fork + self-exec a child that writes PAYLOAD to the inherited fd.
+    //    The child references the fd by number (it is NOT O_CLOEXEC), proving
+    //    exec-inheritance without depending on a shell in the probe rootfs.
     let child_pid = unsafe { libc::fork() };
     if child_pid == 0 {
-        // Child: exec `sh -c 'printf %s PAYLOAD >&FD'`. Using a shell forces a
-        // real execve so this exercises exec-inheritance, not just fork.
-        let cmd = format!("printf %s '{PAYLOAD}' >&{fd}");
-        let sh = CString::new("/bin/sh").unwrap();
-        let dash_c = CString::new("-c").unwrap();
-        let cmd_c = CString::new(cmd).unwrap();
+        let exe = CString::new(std::env::args().next().unwrap_or_default()).unwrap();
+        let mode = CString::new("--write-fd").unwrap();
+        let fd_arg = CString::new(fd.to_string()).unwrap();
         let argv = [
-            sh.as_ptr(),
-            dash_c.as_ptr(),
-            cmd_c.as_ptr(),
+            exe.as_ptr(),
+            mode.as_ptr(),
+            fd_arg.as_ptr(),
             std::ptr::null(),
         ];
         unsafe {
-            libc::execv(sh.as_ptr(), argv.as_ptr());
+            libc::execv(exe.as_ptr(), argv.as_ptr());
             libc::_exit(127);
         }
     }

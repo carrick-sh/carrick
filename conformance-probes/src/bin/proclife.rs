@@ -13,6 +13,12 @@ fn errno() -> i32 {
 }
 
 fn main() {
+    match std::env::args().nth(1).as_deref() {
+        Some("--exit-zero") => std::process::exit(0),
+        Some("--exit-one") => std::process::exit(1),
+        _ => {}
+    }
+
     exit_status_normal();
     exit_status_signalled();
     execve_exit_codes();
@@ -68,17 +74,22 @@ fn exit_status_signalled() {
 
 /// fork()+execve() /bin/true and /bin/false; verify the inherited exit codes.
 fn execve_exit_codes() {
-    for (label, path, want) in [
-        ("true", b"/bin/true\0".as_ref(), 0),
-        ("false", b"/bin/false\0".as_ref(), 1),
+    let path = std::ffi::CString::new(std::env::args().next().unwrap_or_default()).unwrap();
+    for (label, mode, want) in [
+        ("true", b"--exit-zero\0".as_ref(), 0),
+        ("false", b"--exit-one\0".as_ref(), 1),
     ] {
         let pid = unsafe { libc::fork() };
         if pid == 0 {
-            let argv = [path.as_ptr() as *const libc::c_char, std::ptr::null()];
+            let argv = [
+                path.as_ptr() as *const libc::c_char,
+                mode.as_ptr() as *const libc::c_char,
+                std::ptr::null(),
+            ];
             let envp = [std::ptr::null()];
             unsafe {
                 libc::execve(
-                    path.as_ptr() as *const libc::c_char,
+                    path.as_ptr(),
                     argv.as_ptr(),
                     envp.as_ptr(),
                 );

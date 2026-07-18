@@ -9,22 +9,34 @@
 //! itertools/base64. The fix carries argv/env as raw bytes through the execve
 //! path.
 //!
-//! Deterministic: fork a child that execve's a no-op binary (/bin/true, which
-//! ignores argv+env) with a non-UTF-8 arg AND a non-UTF-8 env var; the parent
-//! reaps it. If execve honoured the bytes, /bin/true runs and exits 0; if carrick
+//! Deterministic: fork a child that execve's this probe into a marker mode with
+//! a non-UTF-8 arg AND a non-UTF-8 env var; the parent reaps it. If execve
+//! honoured the bytes, the marker validates them and exits 0; if carrick
 //! still rejected them, the child's post-exec `_exit(127)` fires. Prints booleans.
 
 use std::ffi::CString;
+use std::os::unix::ffi::OsStrExt;
 use std::ptr;
 
 fn main() {
+    const ARG_BYTES: &[u8] = b"weird-\xe7\x77\xf0";
+    const ENV_BYTES: &[u8] = b"g-\xe7\x77\xf0";
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg.as_os_str().as_bytes() == ARG_BYTES)
+    {
+        let env_ok = std::env::var_os("CARRICK_GUARD")
+            .is_some_and(|value| value.as_os_str().as_bytes() == ENV_BYTES);
+        std::process::exit(if env_ok { 0 } else { 126 });
+    }
+
     // argv[1] and an env var both carry invalid-UTF-8 bytes (0xe7 0x77 0xf0,
     // exactly the regrtest guard shape). CString only forbids interior NULs —
     // non-UTF-8 is fine.
-    let prog = CString::new("/bin/true").unwrap();
-    let arg0 = CString::new("/bin/true").unwrap();
-    let arg1 = CString::new(&b"weird-\xe7\x77\xf0"[..]).unwrap();
-    let envv = CString::new(&b"CARRICK_GUARD=g-\xe7\x77\xf0"[..]).unwrap();
+    let prog = CString::new(std::env::args().next().unwrap_or_default()).unwrap();
+    let arg0 = prog.clone();
+    let arg1 = CString::new(ARG_BYTES).unwrap();
+    let envv = CString::new([b"CARRICK_GUARD=".as_slice(), ENV_BYTES].concat()).unwrap();
 
     let argv = [arg0.as_ptr(), arg1.as_ptr(), ptr::null()];
     let envp = [envv.as_ptr(), ptr::null()];
@@ -45,7 +57,7 @@ fn main() {
     let exited = libc::WIFEXITED(status);
     let code = libc::WEXITSTATUS(status);
     println!("child_reaped={}", w == pid);
-    // /bin/true exits 0 when execve honoured the non-UTF-8 argv/env; a 127 means
-    // execve failed (the bug).
+    // The marker mode exits 0 when execve preserved the non-UTF-8 argv/env; a
+    // 127 means execve failed (the bug).
     println!("execve_nonutf8_ok={}", exited && code == 0);
 }

@@ -3,15 +3,19 @@
 //! os.execve(fd, ...) / test_posix.test_fexecve relies on it. carrick had no
 //! execveat handler at all → ENOSYS ("Function not implemented").
 //!
-//!  * fexecve_runs: fexecve of an open fd on /bin/true execs and the child
-//!    exits 0.
+//!  * fexecve_runs: fexecve of an open fd on this probe re-enters a marker
+//!    child mode and exits 0.
 
 use conformance_probes::report;
 
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--fexec-child") {
+        return;
+    }
+
     unsafe {
-        let path = b"/bin/true\0".as_ptr() as *const libc::c_char;
-        let fd = libc::open(path, libc::O_RDONLY);
+        let path = std::ffi::CString::new(std::env::args().next().unwrap_or_default()).unwrap();
+        let fd = libc::open(path.as_ptr(), libc::O_RDONLY);
         if fd < 0 {
             report!(fexecve_runs = false);
             return;
@@ -19,7 +23,8 @@ fn main() {
         let pid = libc::fork();
         if pid == 0 {
             let argv = [
-                b"/bin/true\0".as_ptr() as *const libc::c_char,
+                path.as_ptr(),
+                b"--fexec-child\0".as_ptr() as *const libc::c_char,
                 std::ptr::null(),
             ];
             let envp = [std::ptr::null::<libc::c_char>()];
