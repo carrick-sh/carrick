@@ -547,6 +547,9 @@ pub(super) fn canonical_socket_errno(
 const HOST_STREAM_BUF_TARGET: libc::c_int = 16 * 1024 * 1024;
 const HOST_STREAM_BUF_REQUIRED: libc::c_int = 8 * 1024 * 1024;
 
+// Only referenced from the macOS-gated widening test now that widening reads
+// back nothing in the hot path (best-effort). Keep it for that coverage.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn host_socket_buffer_size(host_fd: i32, opt: libc::c_int) -> Result<libc::c_int, LinuxErrno> {
     let mut size: libc::c_int = 0;
     let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
@@ -596,9 +599,13 @@ fn set_host_socket_buffer_size(
 /// semantics differ.
 ///
 /// The host may reject or silently clamp a large `setsockopt(SO_*BUF)` request,
-/// so this function retries at the required floor and then verifies the actual
-/// kernel value. Falling below the required floor is a setup failure (`ENOBUFS`)
-/// rather than a latent guest timeout.
+/// so this function retries at the required floor and then reads back the actual
+/// kernel value. Widening is a BEST-EFFORT host-backing optimization: Linux
+/// `socket(2)` never fails for buffer-sizing reasons, so a host that caps the
+/// send/recv buffer below the desired floor (e.g. FreeBSD's default
+/// `kern.ipc.maxsockbuf`, which is smaller than 8 MiB) must NOT turn a valid
+/// socket creation into `ENOBUFS`. We set the largest value the host accepts and
+/// proceed with whatever backing capacity results.
 pub(super) fn widen_stream_socket_buffers(
     host_fd: i32,
     family: i32,
@@ -611,13 +618,11 @@ pub(super) fn widen_stream_socket_buffers(
         return Ok(());
     }
     for opt in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
+        // Prefer the target; if the host rejects it, drop to the required floor.
+        // Both are best-effort — a host that caps below either value keeps its
+        // own maximum rather than failing the socket.
         if set_host_socket_buffer_size(host_fd, opt, HOST_STREAM_BUF_TARGET).is_err() {
-            set_host_socket_buffer_size(host_fd, opt, HOST_STREAM_BUF_REQUIRED)?;
-        }
-        let actual =
-            host_socket_buffer_size(host_fd, opt).map_err(|_| crate::linux_abi::LINUX_ENOBUFS)?;
-        if actual < HOST_STREAM_BUF_REQUIRED {
-            return Err(crate::linux_abi::LINUX_ENOBUFS);
+            let _ = set_host_socket_buffer_size(host_fd, opt, HOST_STREAM_BUF_REQUIRED);
         }
     }
     Ok(())
