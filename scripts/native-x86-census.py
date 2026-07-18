@@ -13,9 +13,11 @@ TIMEOUT = int(sys.argv[5]) if len(sys.argv) > 5 else 20
 
 def classify(o, timed_out):
     has_exit  = "[native_run] exit=" in o
+    is_exit0  = "[native_run] exit=0" in o
     has_false = ("=false" in o) or ("panic" in o.lower())
-    if has_exit and not has_false: return "OK"
-    if has_exit and has_false:     return "EXIT_FALSE"
+    if has_exit and not is_exit0:  return "EXIT_NONZERO"   # e.g. exit=134 (abort)
+    if is_exit0 and not has_false: return "OK"
+    if is_exit0 and has_false:     return "EXIT_FALSE"
     if timed_out:                  return "TIMEOUT"
     if "dispatch outcome" in o:
         seg = o.split("outcome",1)[1].split()[0] if "outcome" in o else "?"

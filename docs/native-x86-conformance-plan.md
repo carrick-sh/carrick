@@ -359,7 +359,15 @@ Reliable serial census, all 432 targets. Raw data: `docs/native-x86-census.tsv`.
 | Rung A | 281 / 432 (exit-0) | guest threads + futex via `dispatch_threaded` |
 | fork-cache fix | 355 / 432 (exit-0) | private JIT cache per fork child |
 | honest re-baseline | 245 / 428 (STRICT) | after threads+futex+fork-cache; exit-0 was +110 inflated |
-| **signals + dispatcher** | **292 / 428 (STRICT)** | +47 net; signal delivery + dispatcher socket-buffer/rlimit fixes (net cluster cascaded) |
+| signals + dispatcher | 292 / 428 (loose exit=) | overcounted — classifier accepted any `exit=`, incl. `exit=134` aborts |
+| **signals + dispatcher + die-by-signal** | **282 / 428 (exit=0 STRICT)** | honest; +37 net over 245. die-by-signal fix dropped OTHER crashes 32→8 |
+
+Honest classifier now requires **`exit=0`** (a fatal-signal `exit=134` is not a
+pass — it lands in `EXIT_NONZERO`). Buckets at 282: `EXIT_FALSE` 79 (ran clean,
+wrong answer), `EXIT_NONZERO` 37 (mostly `bridge_*` container-networking aborts,
+now clean reports not crashes), `TIMEOUT` 17, `OTHER` 8 (down from 32 — the
+top-level die-by-signal fix), `OUT` 5. Still-open regressions: `dnotify`,
+`preemptsigstorm` (both `EXIT_FALSE`, signal-related).
 
 **+47 delta (245→292), verified real (reproduced serially, NOT load artifacts):**
 signal delivery (~17) + the dispatcher's best-effort socket-buffer fix cascading
