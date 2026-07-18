@@ -14,6 +14,7 @@ static SI_ADDR: AtomicU64 = AtomicU64::new(0);
 static FAULT_ADDR: AtomicU64 = AtomicU64::new(0);
 
 // aarch64 struct sigcontext: { u64 fault_address; u64 regs[31]; u64 sp; u64 pc; ... }
+#[cfg(target_arch = "aarch64")]
 #[repr(C)]
 struct Aarch64SigContext {
     fault_address: u64,
@@ -24,15 +25,25 @@ struct Aarch64SigContext {
     // __reserved[...] follows; we only need the head.
 }
 
+unsafe fn ucontext_fault_address(ucontext: *mut libc::c_void) -> u64 {
+    let uc = ucontext as *const libc::ucontext_t;
+    #[cfg(target_arch = "aarch64")]
+    {
+        let mc = &(*uc).uc_mcontext as *const _ as *const Aarch64SigContext;
+        (*mc).fault_address
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        (*uc).uc_mcontext.gregs[libc::REG_CR2 as usize] as u64
+    }
+}
+
 extern "C" fn handler(_sig: i32, info: *mut libc::siginfo_t, ucontext: *mut libc::c_void) {
     // si_addr lives at a fixed offset in siginfo_t; libc exposes it via si_addr().
     unsafe {
         let addr = (*info).si_addr() as u64;
         SI_ADDR.store(addr, Ordering::SeqCst);
-        // ucontext_t -> uc_mcontext (struct sigcontext) -> fault_address.
-        let uc = ucontext as *const libc::ucontext_t;
-        let mc = &(*uc).uc_mcontext as *const _ as *const Aarch64SigContext;
-        FAULT_ADDR.store((*mc).fault_address, Ordering::SeqCst);
+        FAULT_ADDR.store(ucontext_fault_address(ucontext), Ordering::SeqCst);
     }
     // Can't return (would re-fault); exit deterministically from the handler.
     let si = SI_ADDR.load(Ordering::SeqCst);
@@ -46,7 +57,7 @@ extern "C" fn handler(_sig: i32, info: *mut libc::siginfo_t, ucontext: *mut libc
 fn main() {
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = handler as usize;
+        sa.sa_sigaction = handler as *const () as usize;
         sa.sa_flags = libc::SA_SIGINFO;
         libc::sigemptyset(&mut sa.sa_mask);
         if libc::sigaction(libc::SIGSEGV, &sa, std::ptr::null_mut()) != 0 {
