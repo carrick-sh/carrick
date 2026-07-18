@@ -2482,7 +2482,12 @@ fn run_x86_thread(
                                     argv_strings,
                                     env.clone(),
                                 );
-                                active.dispatcher.forget_thread_signal_state(tid);
+                                // `reset_signal_handlers_on_execve` deliberately
+                                // preserves this surviving thread's blocked mask
+                                // and pending signals while clearing its altstack
+                                // and old-image handler frames. Do not retire the
+                                // whole per-thread record here: that is an exit
+                                // operation and would violate execve semantics.
                                 // Retire the old image, then map the new one. The
                                 // vDSO/vvar live at FIXED VAs, so the old must be
                                 // unmapped BEFORE the new maps over them.
