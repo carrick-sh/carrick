@@ -730,6 +730,15 @@ fn install_native_pumped_handlers() {
         carrick_abi::LINUX_SIGINT,
         carrick_abi::LINUX_SIGQUIT,
         carrick_abi::LINUX_SIGTERM,
+        // SIGCHLD: a guest child is a real host child, so its exit delivers a
+        // host SIGCHLD to this process. Route it to the guest so a guest SIGCHLD
+        // handler runs when a non-waited child (a sibling, or a subreaper-adopted
+        // orphan) exits (`waitsiblingsigchld`, `childsubreaper`'s
+        // sigchld_from_orphan). The routed publish does NOT reap — the guest's
+        // own wait4 still consumes the zombie; a SIG_DFL (default-ignore) SIGCHLD
+        // is dropped at delivery and the wait's block mask keeps it from
+        // spuriously interrupting.
+        carrick_abi::LINUX_SIGCHLD,
     ] {
         let host = crate::host_signal::linux_to_host_signum(linux_sig);
         // SAFETY: zeroed sigaction = "no flags, empty mask"; we set a valid
@@ -1753,6 +1762,16 @@ where
     // can report how many waiters it woke (Linux semantics; native _umtx_op does
     // not). Pre-fork so every descendant maps the same physical pages.
     init_shared_waiter_table();
+    // Act as the guest's PID-namespace init: become a FreeBSD reaper so an
+    // orphaned guest grandchild (its middle parent exited) REPARENTS to this
+    // process instead of host init, letting the guest's wait4(-1) reap it —
+    // pid_namespaces(7) "pid 1 reaps orphans" (`pidnsorphanreap`), and the
+    // reparent target for PR_SET_CHILD_SUBREAPER (`childsubreaper`). Idempotent:
+    // a second acquire returns EBUSY, ignored.
+    // SAFETY: procctl with a valid cmd + NULL data.
+    unsafe {
+        libc::procctl(libc::P_PID, 0, libc::PROC_REAP_ACQUIRE, std::ptr::null_mut());
+    }
 
     let free_slices: Vec<usize> = (0..JIT_SLICE_COUNT).map(|i| i * JIT_SLICE_LEN).collect();
     let shared = Arc::new(SharedRun {
