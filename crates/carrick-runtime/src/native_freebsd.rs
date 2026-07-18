@@ -917,6 +917,26 @@ fn service_syscall(
             memory,
             resume,
         ),
+        // A file-backed (or high-VA anonymous) mmap: in the identity model the
+        // guest VA IS the host VA, so map the file (or copy the payload) right
+        // there over the reserved arena, then PROT_NONE it if requested.
+        DispatchOutcome::MapHostAlias {
+            va,
+            len,
+            payload,
+            file,
+            prot_none,
+            ..
+        } => service_map_host_alias(
+            va.raw(),
+            len,
+            &payload,
+            file,
+            prot_none,
+            snapshot,
+            memory,
+            resume,
+        ),
         other => Step::Fault(format!(
             "native x86 driver does not service dispatch outcome {other:?} yet \
              (threads/execve/futex are later rungs)"
@@ -963,6 +983,56 @@ fn service_fork(
         }
         Step::Continue(resume)
     }
+}
+
+/// Install a file-backed or high-VA anonymous mmap at guest VA `va` (== host
+/// VA). A `Some((fd, offset, prot))` maps the file `MAP_SHARED|MAP_FIXED` over
+/// the reserved arena (guest writes hit the page cache, coherent across fork);
+/// otherwise the arena is already RW-backed and the `payload` snapshot is
+/// copied in. `prot_none` then makes the range guest-inaccessible.
+#[allow(clippy::too_many_arguments)]
+fn service_map_host_alias(
+    va: u64,
+    len: u64,
+    payload: &[u8],
+    file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
+    prot_none: bool,
+    snapshot: &mut X86UcontextSnapshot,
+    memory: &mut IdentityGuestMemory,
+    resume: u64,
+) -> Step {
+    let len_usize = len as usize;
+    if let Some((fd, offset, host_prot)) = file {
+        // SAFETY: `va` is a page-aligned host VA inside the reserved mmap arena;
+        // MAP_FIXED replaces the anon backing with the file mapping.
+        let p = unsafe {
+            libc::mmap(
+                va as *mut libc::c_void,
+                len_usize,
+                host_prot,
+                libc::MAP_SHARED | libc::MAP_FIXED,
+                fd,
+                offset,
+            )
+        };
+        // The fd is a dup the runtime owns; close it after mapping.
+        unsafe { libc::close(fd) };
+        if p as u64 != va {
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(12);
+            snapshot.gpr[reg::RAX] = (-(errno as i64)) as u64;
+            return Step::Continue(resume);
+        }
+    } else if !payload.is_empty() {
+        // Anonymous snapshot: the arena page is already RW-backed; copy it in.
+        let _ = memory.write_bytes(va, payload);
+    }
+    if prot_none {
+        // SAFETY: making the guest's own mapping inaccessible so its access
+        // faults (SEGV) as Linux would.
+        unsafe { libc::mprotect(va as *mut libc::c_void, len_usize, libc::PROT_NONE) };
+    }
+    snapshot.gpr[reg::RAX] = va;
+    Step::Continue(resume)
 }
 
 /// Service `arch_prctl(code, addr)`: SET_FS installs the guest thread pointer
