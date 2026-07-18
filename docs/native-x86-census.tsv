@@ -176,7 +176,7 @@ OK	memmap
 OK	mincoreedge
 OK	mkdirsetgid
 OK	mknoddevnode
-EXIT_FALSE	mlock2
+OK	mlock2
 OK	mmapcluster
 OK	mmapdevzero
 OK	mmapexecshared

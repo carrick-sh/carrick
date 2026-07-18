@@ -274,11 +274,12 @@ fn identity_host_range_mapped(address: u64, length: usize) -> bool {
 #[cfg(test)]
 mod identity_raw_range_tests {
     use super::{
-        SharedWaitAssignment, freebsd_shared_waiter_key, identity_host_range_mapped,
-        identity_raw_range_valid, init_shared_waiter_table, shared_futex_requeue_umtx,
-        shared_futex_wake_umtx, shared_waiter_slot, take_shared_wait_assignment,
-        wait_requeued_umtx,
+        IdentityGuestMemory, SharedWaitAssignment, freebsd_shared_waiter_key,
+        identity_host_range_mapped, identity_raw_range_valid, init_shared_waiter_table,
+        shared_futex_requeue_umtx, shared_futex_wake_umtx, shared_waiter_slot,
+        take_shared_wait_assignment, wait_requeued_umtx,
     };
+    use carrick_guest_mem::GuestMemory;
     use std::os::fd::AsRawFd;
 
     #[test]
@@ -318,6 +319,29 @@ mod identity_raw_range_tests {
         assert!(identity_host_range_mapped(page as u64, 4096));
         unsafe { libc::munmap(page, 4096) };
         assert!(!identity_host_range_mapped(page as u64, 4096));
+    }
+
+    #[test]
+    fn direct_host_pointer_validation_does_not_make_pages_resident() {
+        let page = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                8192,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(page, libc::MAP_FAILED);
+        let memory = IdentityGuestMemory;
+        let start = carrick_guest_mem::GuestVa(page as u64);
+        assert_eq!(memory.resident_pages(start, 2, 4096), Some(vec![0, 0]));
+        assert!(memory.host_ptr_for_read(page as u64, 8192).is_some());
+        assert_eq!(memory.resident_pages(start, 2, 4096), Some(vec![0, 0]));
+        unsafe { (page as *mut u8).write_volatile(0) };
+        assert_eq!(memory.resident_pages(start, 2, 4096), Some(vec![1, 0]));
+        unsafe { libc::munmap(page, 8192) };
     }
 
     #[test]
@@ -700,6 +724,54 @@ impl GuestMemory for IdentityGuestMemory {
         IDENTITY_PROTECTIONS.set_mapping_protection(address, len, false, false);
         // Fresh anonymous pages are already zero.
         Ok(())
+    }
+
+    fn host_ptr_for_read(&self, address: u64, len: usize) -> Option<*const u8> {
+        (identity_raw_range_valid(address, len)
+            && identity_host_range_mapped(address, len)
+            && !IDENTITY_PROTECTIONS.range_no_access(address, len))
+        .then_some(address as *const u8)
+    }
+
+    fn host_ptr_for_write(&mut self, address: u64, len: usize) -> Option<*mut u8> {
+        (identity_raw_range_valid(address, len)
+            && identity_host_range_mapped(address, len)
+            && !IDENTITY_PROTECTIONS.range_write_denied(address, len))
+        .then_some(address as *mut u8)
+    }
+
+    fn resident_pages(
+        &self,
+        start: carrick_guest_mem::GuestVa,
+        page_count: u64,
+        page_size: u64,
+    ) -> Option<Vec<u8>> {
+        let pages = usize::try_from(page_count).ok()?;
+        let len = page_count.checked_mul(page_size)?;
+        let len = usize::try_from(len).ok()?;
+        if pages == 0 {
+            return Some(Vec::new());
+        }
+        let mut residency = vec![0i8; pages];
+        // SAFETY: identity guest VA is the live host mapping. `residency` has
+        // exactly one byte per queried FreeBSD page; this lane's guest and host
+        // page sizes are both 4 KiB.
+        if unsafe {
+            libc::mincore(
+                start.raw() as *mut libc::c_void,
+                len,
+                residency.as_mut_ptr(),
+            )
+        } != 0
+        {
+            return None;
+        }
+        Some(
+            residency
+                .into_iter()
+                .map(|byte| u8::from(byte & 1 != 0))
+                .collect(),
+        )
     }
 
     /// A SHARED (non-`FUTEX_PRIVATE`) futex word resolves to a fork-coherent host
