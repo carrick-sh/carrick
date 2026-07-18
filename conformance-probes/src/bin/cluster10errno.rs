@@ -15,6 +15,12 @@
 use conformance_probes::errno;
 use std::ffi::CString;
 
+// libc omits the asm-generic symbol on aarch64 even though the syscall exists.
+#[cfg(target_arch = "aarch64")]
+const SYS_FADVISE64: libc::c_long = 223;
+#[cfg(target_arch = "x86_64")]
+const SYS_FADVISE64: libc::c_long = libc::SYS_fadvise64;
+
 fn open(path: &str, flags: i32, mode: u32) -> i32 {
     let c = CString::new(path).unwrap();
     unsafe { libc::open(c.as_ptr(), flags, mode as libc::c_uint) }
@@ -23,7 +29,7 @@ fn open(path: &str, flags: i32, mode: u32) -> i32 {
 fn main() {
     unsafe {
         // (1) pidfd_open(self, 0): success + FD_CLOEXEC on the returned fd.
-        let pidfd = libc::syscall(434, libc::getpid() as libc::c_long, 0i64) as i32;
+        let pidfd = libc::syscall(libc::SYS_pidfd_open, libc::getpid() as libc::c_long, 0i64) as i32;
         let pidfd_ok = pidfd >= 0;
         let pidfd_cloexec = pidfd_ok && {
             let f = libc::fcntl(pidfd, libc::F_GETFD);
@@ -41,7 +47,13 @@ fn main() {
             libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC,
             0o644,
         );
-        let rc = libc::syscall(223, fd as libc::c_long, 0i64, 0i64, 999i64);
+        let rc = libc::syscall(
+            SYS_FADVISE64,
+            fd as libc::c_long,
+            0i64,
+            0i64,
+            999i64,
+        );
         println!(
             "fadvise_bad_advice_einval={}",
             rc == -1 && errno() == libc::EINVAL
@@ -53,7 +65,13 @@ fn main() {
         // (3) posix_fadvise on a pipe read-end → ESPIPE.
         let mut fds = [0i32; 2];
         let fadvise_pipe_espipe = if libc::pipe(fds.as_mut_ptr()) == 0 {
-            let rc = libc::syscall(223, fds[0] as libc::c_long, 0i64, 0i64, 0i64);
+            let rc = libc::syscall(
+                SYS_FADVISE64,
+                fds[0] as libc::c_long,
+                0i64,
+                0i64,
+                0i64,
+            );
             let ok = rc == -1 && errno() == libc::ESPIPE;
             libc::close(fds[0]);
             libc::close(fds[1]);
