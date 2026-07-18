@@ -1064,14 +1064,17 @@ impl SyscallDispatcher {
         self.install_fd(description, LINUX_FD_CLOEXEC)
     }
 
-    /// Allocate a pidfd referring to freshly-forked `child_pid` and return its
-    /// guest fd, or `None` if installation failed. Called by the runtime's
-    /// `CLONE_PIDFD` fork path (in the parent) to satisfy the clone pidfd-out
-    /// pointer. Public because the runtime drives fork from outside `dispatch`.
-    pub fn install_child_pidfd(&self, child_pid: i32) -> Option<i32> {
+    /// Allocate a pidfd referring to freshly-forked `child_pid`. Called by the
+    /// runtime's `CLONE_PIDFD` parent setup before releasing the child. Preserve
+    /// the allocation/watch errno so clone can fail atomically rather than
+    /// returning a child with an invalid pidfd output.
+    pub fn install_child_pidfd(&self, child_pid: i32) -> Result<i32, crate::linux_abi::LinuxErrno> {
         match self.open_pidfd(child_pid, 0) {
-            DispatchOutcome::Returned { value } => i32::try_from(value).ok(),
-            _ => None,
+            DispatchOutcome::Returned { value } => {
+                i32::try_from(value).map_err(|_| crate::linux_abi::LINUX_EMFILE)
+            }
+            DispatchOutcome::Errno { errno } => Err(errno),
+            _ => Err(crate::linux_abi::LINUX_EMFILE),
         }
     }
 
