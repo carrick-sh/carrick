@@ -103,20 +103,25 @@ impl LinuxNetworkModel {
                 link_name: "lo".to_string(),
             },
         ];
-        addresses.extend(attachments.iter().enumerate().flat_map(|(idx, attachment)| {
-            [
-                LinuxNetworkAddress {
-                    addr: IpAddr::V4(attachment.ipv4),
-                    prefix_len: 24,
-                    link_name: format!("eth{idx}"),
-                },
-                LinuxNetworkAddress {
-                    addr: IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)),
-                    prefix_len: 64,
-                    link_name: format!("eth{idx}"),
-                },
-            ]
-        }));
+        addresses.extend(
+            attachments
+                .iter()
+                .enumerate()
+                .flat_map(|(idx, attachment)| {
+                    [
+                        LinuxNetworkAddress {
+                            addr: IpAddr::V4(attachment.ipv4),
+                            prefix_len: 24,
+                            link_name: format!("eth{idx}"),
+                        },
+                        LinuxNetworkAddress {
+                            addr: IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)),
+                            prefix_len: 64,
+                            link_name: format!("eth{idx}"),
+                        },
+                    ]
+                }),
+        );
 
         let primary_gateway = attachments
             .first()
