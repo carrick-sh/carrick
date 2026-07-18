@@ -513,6 +513,12 @@ struct LoadedImage {
     /// Guest VA of the `mov $15,%eax; syscall` rt_sigreturn trampoline, used as
     /// a signal frame's return address when the handler had no `sa_restorer`.
     sigreturn_trampoline: u64,
+    /// Guest VA where the synthesized x86-64 vDSO ELF is mapped (published as
+    /// `AT_SYSINFO_EHDR`), or 0 if the vDSO could not be mapped. The vvar page
+    /// lives at the fixed `LINUX_VVAR_BASE` the vDSO code references directly.
+    vdso_base: u64,
+    /// Page-rounded length of the mapped vDSO image, for teardown.
+    vdso_len: usize,
     /// The page-rounded [start, end) VA ranges of the mapped PT_LOAD segments,
     /// sorted and coalesced. The reserved span can contain UNMAPPED gaps
     /// between segments; the block planner must not read across one (it would
@@ -547,6 +553,13 @@ impl LoadedImage {
             libc::munmap(self.span_base as *mut libc::c_void, self.span_len);
             libc::munmap(self.stack as *mut libc::c_void, self.stack_len);
             libc::munmap(self.scratch as *mut libc::c_void, self.scratch_len);
+            if self.vdso_base != 0 {
+                libc::munmap(self.vdso_base as *mut libc::c_void, self.vdso_len);
+                libc::munmap(
+                    crate::vdso::LINUX_VVAR_BASE as *mut libc::c_void,
+                    crate::vdso::LINUX_VVAR_SIZE as usize,
+                );
+            }
         }
     }
 }
@@ -659,12 +672,64 @@ fn load_static_pie(bytes: &[u8], argv: &[String]) -> Result<LoadedImage, Runtime
     }
     let scratch = map_prot(PAGE as usize, libc::PROT_READ | libc::PROT_WRITE, None);
 
+    // Map the synthesized x86-64 vDSO so `getauxval(AT_SYSINFO_EHDR)` resolves
+    // and `__vdso_clock_gettime`/`__vdso_gettimeofday`/`__vdso_time` resolve to
+    // real, callable stubs. The vvar page is left zeroed: with `VVAR_OFF_FREQ`
+    // == 0 the clock fast paths branch to the real x86-64 syscalls (which
+    // already work) BEFORE any `rdtsc`, so no TSC calibration or rdtsc lowering
+    // is needed — the symbols just need to resolve and call through. The vDSO
+    // code references the vvar at the fixed absolute `LINUX_VVAR_BASE`, so that
+    // page must be mapped there exactly; the ELF image itself is position-
+    // independent and published to the guest via `AT_SYSINFO_EHDR`.
+    let (vdso_base, vdso_len) = {
+        let vvar_base = crate::vdso::LINUX_VVAR_BASE;
+        let vdso_base = crate::vdso::LINUX_VDSO_BASE;
+        let vvar = map_prot(
+            crate::vdso::LINUX_VVAR_SIZE as usize,
+            libc::PROT_READ | libc::PROT_WRITE,
+            Some(vvar_base),
+        );
+        let vdso_bytes = crate::vdso::x8664_vdso_image_bytes();
+        let vdso_len = ((vdso_bytes.len() as u64 + PAGE - 1) & !(PAGE - 1)) as usize;
+        let vdso = map_prot(
+            vdso_len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            Some(vdso_base),
+        );
+        if vvar as u64 == vvar_base && vdso as u64 == vdso_base {
+            // SAFETY: `vvar` is the freshly-mapped RW vvar page; zero its whole
+            // size so `VVAR_OFF_FREQ` reads 0 (syscall fallback).
+            unsafe { std::ptr::write_bytes(vvar as *mut u8, 0, crate::vdso::LINUX_VVAR_SIZE as usize) };
+            // SAFETY: `vdso` is the freshly-mapped RW page(s); the image fits.
+            unsafe {
+                std::ptr::copy_nonoverlapping(vdso_bytes.as_ptr(), vdso as *mut u8, vdso_bytes.len())
+            };
+            // Publish the vDSO code page(s) as a translatable segment so the
+            // block planner can read/execute the resolved stubs.
+            segments.push((vdso_base, vdso_base + vdso_len as u64));
+            (vdso_base, vdso_len)
+        } else {
+            // Could not place the vvar/vDSO at their required VAs — run without
+            // a vDSO (auxv omits AT_SYSINFO_EHDR; the guest uses raw syscalls).
+            if vvar as isize != -1 && vvar as u64 != vvar_base {
+                // SAFETY: unmap the misplaced vvar mapping we just made.
+                unsafe { libc::munmap(vvar as *mut libc::c_void, crate::vdso::LINUX_VVAR_SIZE as usize) };
+            }
+            if vdso as isize != -1 && vdso as u64 != vdso_base {
+                // SAFETY: unmap the misplaced vDSO mapping we just made.
+                unsafe { libc::munmap(vdso as *mut libc::c_void, vdso_len) };
+            }
+            (0, 0)
+        }
+    };
+
     let rsp = build_initial_stack(
         stack as u64 + GUEST_STACK_LEN as u64,
         scratch as u64,
         argv,
         &elf,
         bias,
+        vdso_base,
     );
 
     // The rt_sigreturn trampoline: when a guest signal handler was registered
@@ -708,6 +773,8 @@ fn load_static_pie(bytes: &[u8], argv: &[String]) -> Result<LoadedImage, Runtime
         scratch: scratch as u64,
         scratch_len: PAGE as usize,
         sigreturn_trampoline,
+        vdso_base,
+        vdso_len,
         segments: coalesced,
     })
 }
@@ -716,13 +783,21 @@ fn load_static_pie(bytes: &[u8], argv: &[String]) -> Result<LoadedImage, Runtime
 /// `[argc][argv..][NULL][envp NULL][auxv..][AT_NULL]`, with argv strings and a
 /// 16-byte AT_RANDOM block in the scratch page. Returns the guest rsp (argc),
 /// 16-aligned. Envp is empty in this first rung.
-fn build_initial_stack(stack_top: u64, scratch: u64, argv: &[String], elf: &Elf, bias: u64) -> u64 {
+fn build_initial_stack(
+    stack_top: u64,
+    scratch: u64,
+    argv: &[String],
+    elf: &Elf,
+    bias: u64,
+    vdso_base: u64,
+) -> u64 {
     const AT_NULL: u64 = 0;
     const AT_PHDR: u64 = 3;
     const AT_PHENT: u64 = 4;
     const AT_PHNUM: u64 = 5;
     const AT_PAGESZ: u64 = 6;
     const AT_ENTRY: u64 = 9;
+    const AT_SYSINFO_EHDR: u64 = 33;
     const AT_RANDOM: u64 = 25;
 
     // Lay argv strings + AT_RANDOM into the scratch page.
@@ -756,15 +831,22 @@ fn build_initial_stack(stack_top: u64, scratch: u64, argv: &[String], elf: &Elf,
     words.push(0); // argv NULL
     words.push(0); // envp NULL
     // auxv pairs
-    for (k, v) in [
+    let mut auxv: Vec<(u64, u64)> = vec![
         (AT_PHDR, phdr_va),
         (AT_PHENT, elf.header.e_phentsize as u64),
         (AT_PHNUM, elf.header.e_phnum as u64),
         (AT_PAGESZ, PAGE),
         (AT_ENTRY, elf.entry + bias),
         (AT_RANDOM, random_ptr),
-        (AT_NULL, 0),
-    ] {
+    ];
+    // Only advertise the vDSO when it was successfully mapped; a 0 base would
+    // make `getauxval(AT_SYSINFO_EHDR)` resolve to a null pointer the guest
+    // would then parse as an ELF.
+    if vdso_base != 0 {
+        auxv.push((AT_SYSINFO_EHDR, vdso_base));
+    }
+    auxv.push((AT_NULL, 0));
+    for (k, v) in auxv {
         words.push(k);
         words.push(v);
     }
@@ -1228,6 +1310,23 @@ where
     crate::thread::set_current_registry(Arc::clone(&registry));
     let futex = Arc::new(crate::thread::FutexTable::new());
     crate::thread::set_current_futex_table(&futex);
+
+    // Wire process-directed interval-timer delivery (setitimer/alarm/POSIX
+    // timers). The dispatch arm (dispatch/time.rs) finds no owning backend on
+    // this lane and spawns the shared wall-clock fallback thread, whose fire
+    // action calls `crate::timer_delivery::deliver`. That path only publishes
+    // (into the shared process-directed pending mask) + kicks when a delivery
+    // handle is registered; without this call `deliver` is a silent no-op and
+    // SIGALRM/SIGVTALRM/SIGPROF never reach the guest (`preemptsigstorm`'s
+    // `alrm_delivered=false`). A busy guest thread consumes the published
+    // signal at its next syscall-return safe point; the kicker is a no-op until
+    // guest threads register a kick handle, which they do not need here.
+    let timer_kicker: Arc<carrick_hal::GenericVcpuRegistry> =
+        Arc::new(carrick_hal::GenericVcpuRegistry::new());
+    crate::timer_delivery::register(
+        Arc::clone(&timer_kicker) as Arc<dyn carrick_hal::VcpuRegistry>,
+        tid,
+    );
 
     let free_slices: Vec<usize> = (0..JIT_SLICE_COUNT).map(|i| i * JIT_SLICE_LEN).collect();
     let shared = Arc::new(SharedRun {
@@ -2051,6 +2150,29 @@ fn service_syscall_threaded(
 ) -> Result<DispatchOutcome, crate::dispatch::DispatchError> {
     use crate::io_wait::{WaitFd, WaitResult};
     const EINTR: crate::linux_abi::LinuxErrno = crate::linux_abi::LINUX_EINTR;
+    // A blocking wait (sleep/poll/select/proc-exit) must break with EINTR when a
+    // deliverable (unblocked) signal becomes pending for this thread, so the run
+    // loop's syscall-return `run_pending_signals` enters the handler. Guest
+    // signals are published into the shared pending mask (self/kill-raise, a
+    // sibling `tgkill`, an itimer/alarm timer, an async child-exit) WITHOUT a
+    // host signal being sent, so — unlike the futex wait, which already carries
+    // this predicate — the plain `ppoll` slice would otherwise run to its
+    // timeout and never surface EINTR. `ppoll_wait_inner` caps each slice at a
+    // short backstop and re-checks this predicate, so the latency is bounded.
+    // The predicate honors the wait's atomic sigmask policy: for `ppoll`/
+    // `pselect6` (`WaitSigMask::Replace`) a signal the temporary mask unblocks
+    // must interrupt even if the thread persistently blocks it (`ppollunblock`
+    // raises a blocked SIGUSR1, then unblocks it via ppoll's mask). It checks
+    // BOTH the shared host_signal pending set (self/kill/timer/child-exit) and
+    // the dispatcher's own per-thread pending set (a blocked-then-unblocked
+    // raise lands there), matching the shared KVM servicer.
+    let signal_pending = |mask: carrick_abi::WaitSigMask| {
+        move || {
+            dispatcher.drain_xsignals_process_directed();
+            crate::host_signal::has_unblocked_pending_for(tid.raw(), mask.block_mask())
+                || dispatcher.has_deliverable_dispatch_pending_for_wait(tid, mask)
+        }
+    };
     let mut poll_deadline: Option<std::time::Instant> = None;
     let mut sleep_deadline: Option<std::time::Instant> = None;
     loop {
@@ -2061,7 +2183,12 @@ fn service_syscall_threaded(
                 timeout,
                 on_timeout,
                 sig_mask,
-            } => match waiter.wait(&fds, timeout, sig_mask.block_mask()) {
+            } => match waiter.wait_with_dispatch_pending(
+                &fds,
+                timeout,
+                sig_mask.block_mask(),
+                signal_pending(sig_mask),
+            ) {
                 WaitResult::Ready => continue,
                 WaitResult::TimedOut => {
                     return Ok(DispatchOutcome::Returned { value: on_timeout });
@@ -2092,7 +2219,12 @@ fn service_syscall_threaded(
                         None
                     }
                 };
-                match waiter.wait_poll(&fds, timeout, sig_mask.block_mask()) {
+                match waiter.wait_poll_with_dispatch_pending(
+                    &fds,
+                    timeout,
+                    sig_mask.block_mask(),
+                    signal_pending(sig_mask),
+                ) {
                     WaitResult::Ready => continue,
                     WaitResult::TimedOut => {
                         return Ok(DispatchOutcome::Returned { value: on_timeout });
@@ -2108,7 +2240,12 @@ fn service_syscall_threaded(
                 timeout,
                 sig_mask,
                 clear_on_timeout,
-            } => match waiter.wait(&fds, timeout, sig_mask.block_mask()) {
+            } => match waiter.wait_with_dispatch_pending(
+                &fds,
+                timeout,
+                sig_mask.block_mask(),
+                signal_pending(sig_mask),
+            ) {
                 WaitResult::Ready => continue,
                 WaitResult::TimedOut => {
                     for (addr, len) in &clear_on_timeout {
@@ -2131,7 +2268,12 @@ fn service_syscall_threaded(
                 if now >= deadline {
                     return Ok(DispatchOutcome::Returned { value: 0 });
                 }
-                match waiter.wait(&[], Some(deadline - now), carrick_abi::SigBlockMask::NONE) {
+                match waiter.wait_with_dispatch_pending(
+                    &[],
+                    Some(deadline - now),
+                    carrick_abi::SigBlockMask::NONE,
+                    signal_pending(carrick_abi::WaitSigMask::NONE),
+                ) {
                     WaitResult::Ready | WaitResult::TimedOut => {
                         if std::time::Instant::now() >= deadline {
                             return Ok(DispatchOutcome::Returned { value: 0 });
@@ -2198,7 +2340,11 @@ fn service_syscall_threaded(
                 WaitResult::Errno(errno) => return Ok(DispatchOutcome::Errno { errno }),
             },
             DispatchOutcome::WaitOnProcExit { pid, sig_mask } => {
-                match waiter.wait_proc_exit(pid, sig_mask.block_mask()) {
+                match waiter.wait_proc_exit_with_dispatch_pending(
+                    pid,
+                    sig_mask.block_mask(),
+                    signal_pending(sig_mask),
+                ) {
                     WaitResult::Ready => continue,
                     WaitResult::Interrupted | WaitResult::TimedOut => {
                         return Ok(DispatchOutcome::Errno {
