@@ -1395,11 +1395,23 @@ fn service_syscall(
             Step::Continue(resume)
         }
         DispatchOutcome::Exit { code } => Step::Exit(code),
-        // A default-action fatal signal from the syscall path (e.g. the guest
-        // raised SIGKILL/SIGTERM through kill/tgkill): the guest is dead. Linux
-        // wait status is 128+signum; the full signal-delivery machinery
-        // (handlers, siginfo) is a later rung.
-        DispatchOutcome::SignalDeath { signum } => Step::Exit(128 + signum),
+        // A default-action fatal signal with no guest handler (abort/raise/
+        // kill/tgkill of SIGABRT/SIGTERM/SIGKILL…): the process must actually
+        // DIE BY that signal so a parent's wait4 reports WIFSIGNALED &&
+        // WTERMSIG==signum (not a plain exit of 128+signum). This drains the
+        // guest's stdout/stderr, resets the host disposition to default,
+        // unblocks it, and raises it — killing the whole process (all host
+        // threads). A fork descendant dies here too (its parent reaps it); on a
+        // BSD where the mapped host signal is not Linux-faithful a sigdeath
+        // marker lets the parent's wait4 reconstruct WIFSIGNALED(signum). Never
+        // returns.
+        DispatchOutcome::SignalDeath { signum } => {
+            crate::exec_helpers::forked_child_die_by_signal(
+                signum,
+                dispatcher.stdout(),
+                dispatcher.stderr(),
+            )
+        }
         // fork()/clone(SIGCHLD): in the identity model a guest fork is a REAL
         // host fork — the child inherits the whole address space (guest memory,
         // JIT cache, arenas) copy-on-write, and is a real host child so the
