@@ -157,12 +157,20 @@ Shared primitives in the `carrick-thread` crate (`crate::thread`) are reused
 **Concurrency-model finding (verified).** The single-thread path calls
 `crate::runtime::service_syscall` → `dispatcher.dispatch(&mut self, …)`. That is
 **not** shareable across threads. `native_darwin` instead drives
-`dispatcher.dispatch_threaded(&self, …)` (interior-mutable, thread-safe) via
-`dispatch_native_syscall` (`native_darwin.rs:3774`/`:4133`, `dispatch_threaded`
-call at `:4155`/`:4165`) with an `Arc<SyscallDispatcher>`. So Rung A's servicer
-must move from the `&mut dispatch` path to the `dispatch_threaded` path — this is
-the load-bearing change and the main regression risk (blocking waits are then
-serviced by the threaded machinery, not the local `ThreadWaiter` loop).
+`dispatcher.dispatch_threaded(&self, …)` (interior-mutable, thread-safe,
+`dispatch/mod.rs:3238`) with an `Arc<SyscallDispatcher>`, threading a `tid` +
+`&ThreadRegistry` + `&FutexTable`. So Rung A's servicer moves from the `&mut
+dispatch` path to `dispatch_threaded`.
+
+**Coverage is equal — verified, so the switch is safe.** Both
+`dispatch_inner` (`:3514`, the `&mut` path) and `dispatch_threaded_shared`
+(`:3298`) delegate to the *same* `dispatch_normalized(&self, …)` handler core
+(`:2020`) and fall back to the same ENOSYS on an unknown number. The threaded
+path additionally runs `dispatch_threaded_independent` first (futex/tgkill,
+`:3391`). So switching the *main* thread to `dispatch_threaded` does not lose
+syscall coverage vs today. The one new piece is a threaded copy of the blocking
+`WaitOn*` loop in `crate::runtime::service_syscall` (identical body, calling
+`dispatch_threaded` instead of `dispatch`).
 
 **Implementation checklist (turn-key, in dependency order):**
 
