@@ -888,9 +888,10 @@ pub mod runtime {
     #[cfg(all(feature = "platform-freebsd", target_arch = "x86_64"))]
     pub fn run_elf_native_dispatch(path: &std::path::Path) -> Result<RunResult, RuntimeError> {
         let argv0 = path.to_string_lossy().into_owned();
+        let dispatcher = make_native_dispatcher(path);
         crate::native_freebsd::run_static_x86_elf(
             path,
-            make_native_dispatcher(),
+            dispatcher,
             [argv0],
             std::iter::empty::<String>(),
             DEFAULT_MAX_TRAPS,
@@ -909,12 +910,19 @@ pub mod runtime {
     /// `SyscallDispatcher::with_network` + `seed_guest_baseline`). Set
     /// `CARRICK_NATIVE_NET_HOST=1` to fall back to the host-net dispatcher.
     #[cfg(all(feature = "platform-freebsd", target_arch = "x86_64"))]
-    fn make_native_dispatcher() -> SyscallDispatcher {
+    fn make_native_dispatcher(executable: &std::path::Path) -> SyscallDispatcher {
         use crate::fs_backend::{FsBackend, HostFsBackend};
 
         if std::env::var_os("CARRICK_NATIVE_NET_HOST").is_some() {
             return make_linux_dispatcher();
         }
+
+        let executable_name = executable
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("native-probe");
+        let guest_executable = format!("/run/carrick/{executable_name}");
+        let executable_bytes = std::fs::read(executable).ok();
 
         let guest_hostname = crate::execute::guest_hostname().to_string();
         let spec = carrick_spec::NetworkNamespaceSpec::bridge_default(
@@ -961,6 +969,19 @@ pub mod runtime {
                 let _ = backend.set_file_contents("/etc/hosts", hosts.into_bytes());
                 let _ = backend
                     .set_file_contents("/etc/hostname", format!("{guest_hostname}\n").into_bytes());
+                // The bare native runner loads its first image directly from a
+                // host path, outside the guest VFS. Materialize that ELF inside
+                // the scratch root so `/proc/self/exe`, self-exec, and
+                // fexecve(execveat+AT_EMPTY_PATH) all name a real guest file.
+                // This mirrors an OCI rootfs, where the executable is already
+                // present, instead of leaking a host path into procfs.
+                if let Some(bytes) = executable_bytes {
+                    let _ = backend.make_dir("/run");
+                    let _ = backend.make_dir("/run/carrick");
+                    let _ = backend.set_file_contents(&guest_executable, bytes);
+                    let _ = backend.set_mode(&guest_executable, 0o755);
+                    dispatcher.set_executable_path(guest_executable);
+                }
                 let _ = dispatcher.set_fs_backend(backend);
             }
             Err(e) => {

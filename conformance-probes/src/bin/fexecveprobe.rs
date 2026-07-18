@@ -14,7 +14,7 @@ fn main() {
     }
 
     unsafe {
-        let path = std::ffi::CString::new(std::env::args().next().unwrap_or_default()).unwrap();
+        let path = c"/proc/self/exe";
         let fd = libc::open(path.as_ptr(), libc::O_RDONLY);
         if fd < 0 {
             report!(fexecve_runs = false);
