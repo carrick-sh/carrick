@@ -86,8 +86,27 @@ use super::*;
 use crate::network::{BindTarget, ConnectTarget, GuestSocketAddr, HostSocketAddr};
 use carrick_spec::PortProtocol;
 
+const LINUX_IPPROTO_ICMP: i32 = 1;
+const LINUX_ICMP_ECHO_REQUEST: u8 = 8;
+const LINUX_ICMP_ECHO_REPLY: u8 = 0;
+
 const EPOLL_REBIND_REASON_IO_REARM: u32 = 1;
 const EPOLL_REBIND_REASON_CLOSE_DETACH: u32 = 2;
+
+fn internet_checksum(bytes: &[u8]) -> u16 {
+    let mut sum = 0u32;
+    let mut chunks = bytes.chunks_exact(2);
+    for chunk in &mut chunks {
+        sum = sum.wrapping_add(u32::from(u16::from_be_bytes([chunk[0], chunk[1]])));
+    }
+    if let Some(&last) = chunks.remainder().first() {
+        sum = sum.wrapping_add(u32::from(last) << 8);
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
 const EPOLL_REBIND_REASON_WAIT_SAMPLE: u32 = 3;
 const EPOLL_REBIND_REASON_CTL_DEL: u32 = 4;
 const MCAST_JOIN_GROUP: i32 = 42;
@@ -1600,6 +1619,20 @@ impl SyscallDispatcher {
             .host_syscall_errno()
         {
             Ok(value) => value,
+            // FreeBSD has no Linux-style datagram ICMP ping socket. Keep a real
+            // nonblocking UDP fd as the poll/close carrier; loopback echo
+            // request/reply semantics are synthesized at sendto/recvfrom below.
+            Err(errno)
+                if errno == linux_errno::EPROTONOSUPPORT
+                    && family == LINUX_AF_INET
+                    && base_type == LINUX_SOCK_DGRAM
+                    && protocol == LINUX_IPPROTO_ICMP =>
+            {
+                match (unsafe { libc::socket(host_family, host_type, 0) }).host_syscall_errno() {
+                    Ok(value) => value,
+                    Err(errno) => return DispatchOutcome::errno(errno),
+                }
+            }
             Err(errno) => return DispatchOutcome::errno(errno),
         };
         // The host fd is always nonblocking; Carrick preserves the guest's
@@ -1619,6 +1652,7 @@ impl SyscallDispatcher {
                 host_fd: HostFdRef::new(host_fd),
                 family,
                 type_: base_type,
+                protocol,
                 base: OpenDescriptionBase::new(status_flags),
                 mcast_memberships: Vec::new(),
                 synthetic_recv: std::collections::VecDeque::new(),
@@ -1688,6 +1722,7 @@ impl SyscallDispatcher {
                 host_fd: HostFdRef::new(host_fd),
                 family: libc::AF_UNIX,
                 type_: so_type,
+                protocol: 0,
                 base: OpenDescriptionBase::new(LINUX_O_RDWR),
                 mcast_memberships: Vec::new(),
                 synthetic_recv: std::collections::VecDeque::new(),
@@ -1967,6 +2002,16 @@ impl SyscallDispatcher {
         }
     }
 
+    fn socket_guest_protocol(&self, fd: i32) -> Option<i32> {
+        let open_file = self.open_file(fd)?;
+        let open = open_file.description.read();
+        match &*open {
+            OpenDescription::HostSocket { protocol, .. } => Some(*protocol),
+            OpenDescription::Netlink { protocol, .. } => Some(*protocol),
+            _ => None,
+        }
+    }
+
     fn socket_reuseport(&self, fd: i32) -> bool {
         self.open_file(fd).is_some_and(|of| {
             matches!(&*of.description.read(), OpenDescription::HostSocket { base, .. } if base.so_reuseport())
@@ -2088,6 +2133,42 @@ impl SyscallDispatcher {
         Ok(())
     }
 
+    fn maybe_queue_icmp_echo_reply(
+        &self,
+        fd: i32,
+        request: &[u8],
+        requested: std::net::SocketAddr,
+    ) -> bool {
+        if self.socket_guest_protocol(fd) != Some(LINUX_IPPROTO_ICMP)
+            || self.socket_guest_type(fd) != Some(LINUX_SOCK_DGRAM)
+            || !requested.ip().is_loopback()
+            || request.len() < 8
+            || request[0] != LINUX_ICMP_ECHO_REQUEST
+            || request[1] != 0
+        {
+            return false;
+        }
+        let Some(source) = socket_addr_to_linux_sockaddr(requested) else {
+            return false;
+        };
+        let mut response = request.to_vec();
+        response[0] = LINUX_ICMP_ECHO_REPLY;
+        response[2..4].fill(0);
+        let checksum = internet_checksum(&response);
+        response[2..4].copy_from_slice(&checksum.to_be_bytes());
+        let Some(open_file) = self.open_file(fd) else {
+            return false;
+        };
+        let mut open = open_file.description.write();
+        let OpenDescription::HostSocket { synthetic_recv, .. } = &mut *open else {
+            return false;
+        };
+        synthetic_recv.push_back((response, source));
+        drop(open);
+        self.notify_inmem_epoll();
+        true
+    }
+
     fn maybe_queue_dns_response(
         &self,
         fd: i32,
@@ -2130,14 +2211,13 @@ impl SyscallDispatcher {
             && matches!(addr.ip(), std::net::IpAddr::V4(ip) if ip == self.network.spec.gateway_v4)
     }
 
-    fn connected_dns_peer(&self, fd: i32) -> Option<std::net::SocketAddr> {
+    fn connected_guest_peer_addr(&self, fd: i32) -> Option<std::net::SocketAddr> {
         self.network
             .provider
             .guest_visible_peer_addr(fd)
             .ok()
             .flatten()
             .map(|addr| addr.0)
-            .filter(|addr| self.is_dns_gateway_addr(*addr))
     }
 
     pub(in crate::dispatch) fn accept_common(
@@ -2151,7 +2231,7 @@ impl SyscallDispatcher {
         let fd = fd.0;
         let addr_addr = addr.0;
         let addrlen_addr = addrlen.0;
-        let (host_fd, family, type_) = {
+        let (host_fd, family, type_, protocol) = {
             let Some(open_file) = self.open_file(fd) else {
                 return DispatchOutcome::errno(LINUX_EBADF);
             };
@@ -2163,8 +2243,9 @@ impl SyscallDispatcher {
                     host_fd,
                     family,
                     type_,
+                    protocol,
                     ..
-                } => (host_fd.raw(), *family, *type_),
+                } => (host_fd.raw(), *family, *type_, *protocol),
                 _ => {
                     return DispatchOutcome::errno(LINUX_ENOTSOCK);
                 }
@@ -2297,6 +2378,7 @@ impl SyscallDispatcher {
                 host_fd: HostFdRef::new(new_host),
                 family,
                 type_,
+                protocol,
                 base: OpenDescriptionBase::new(status_flags),
                 mcast_memberships: Vec::new(),
                 synthetic_recv: std::collections::VecDeque::new(),
@@ -2554,6 +2636,43 @@ impl SyscallDispatcher {
         DispatchOutcome::Returned {
             value: received as i64,
         }
+    }
+}
+
+#[cfg(test)]
+mod icmp_ping_tests {
+    use super::*;
+
+    #[test]
+    fn loopback_echo_reply_is_queued_with_valid_checksum() {
+        let dispatcher = SyscallDispatcher::new();
+        let fd = match dispatcher.host_socket_install(
+            LINUX_AF_INET,
+            LINUX_SOCK_DGRAM,
+            LINUX_IPPROTO_ICMP,
+        ) {
+            DispatchOutcome::Returned { value } => value as i32,
+            other => panic!("ping socket creation failed: {other:?}"),
+        };
+        assert_eq!(
+            dispatcher.socket_guest_protocol(fd),
+            Some(LINUX_IPPROTO_ICMP)
+        );
+
+        let mut request = [0u8; 8];
+        request[0] = LINUX_ICMP_ECHO_REQUEST;
+        request[4..6].copy_from_slice(&0x1234u16.to_be_bytes());
+        request[6..8].copy_from_slice(&1u16.to_be_bytes());
+        let checksum = internet_checksum(&request);
+        request[2..4].copy_from_slice(&checksum.to_be_bytes());
+        let loopback = "127.0.0.1:0".parse().unwrap();
+        assert!(dispatcher.maybe_queue_icmp_echo_reply(fd, &request, loopback));
+
+        let (reply, source) = dispatcher.synthetic_datagram_drain(fd).unwrap();
+        assert_eq!(reply[0], LINUX_ICMP_ECHO_REPLY);
+        assert_eq!(reply[1], 0);
+        assert_eq!(internet_checksum(&reply), 0);
+        assert_eq!(source, socket_addr_to_linux_sockaddr(loopback).unwrap());
     }
 }
 
@@ -4655,6 +4774,7 @@ impl SyscallDispatcher {
                     host_fd: HostFdRef::new(host_fds[0]),
                     family,
                     type_: base_type,
+                    protocol,
                     base: OpenDescriptionBase::new(status_flags),
                     mcast_memberships: Vec::new(),
                     synthetic_recv: std::collections::VecDeque::new(),
@@ -4666,6 +4786,7 @@ impl SyscallDispatcher {
                     host_fd: HostFdRef::new(host_fds[1]),
                     family,
                     type_: base_type,
+                    protocol,
                     base: OpenDescriptionBase::new(status_flags),
                     mcast_memberships: Vec::new(),
                     synthetic_recv: std::collections::VecDeque::new(),
@@ -5393,13 +5514,18 @@ impl SyscallDispatcher {
                     Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                 }
             };
-            if family == libc::AF_INET
+            if family == LINUX_AF_INET
                 && let Some(protocol) = this.socket_port_protocol(fd)
                 && let Some(requested) = host_addr
                     .as_deref()
                     .and_then(host_sockaddr_to_socket_addr)
-                    .or_else(|| this.connected_dns_peer(fd))
+                    .or_else(|| this.connected_guest_peer_addr(fd))
             {
+                if let Ok(bytes) = memory.read_bytes(buf_addr, len)
+                    && this.maybe_queue_icmp_echo_reply(fd, &bytes, requested)
+                {
+                    return Ok(DispatchOutcome::Returned { value: len as i64 });
+                }
                 if protocol == PortProtocol::Udp
                     && this.socket_guest_type(fd) == Some(LINUX_SOCK_DGRAM)
                     && let Ok(bytes) = memory.read_bytes(buf_addr, len)
@@ -6309,18 +6435,21 @@ impl SyscallDispatcher {
                 Err(errno) => return Ok(DispatchOutcome::errno(errno)),
             }
         };
-        if family == libc::AF_INET
-            && self.socket_port_protocol(fd) == Some(PortProtocol::Udp)
+        if family == LINUX_AF_INET
             && self.socket_guest_type(fd) == Some(LINUX_SOCK_DGRAM)
             && let Some(requested) = host_addr
                 .as_deref()
                 .and_then(host_sockaddr_to_socket_addr)
-                .or_else(|| self.connected_dns_peer(fd))
-            && self.maybe_queue_dns_response(fd, &data, requested)
+                .or_else(|| self.connected_guest_peer_addr(fd))
         {
-            return Ok(DispatchOutcome::Returned {
-                value: data.len() as i64,
-            });
+            if self.maybe_queue_icmp_echo_reply(fd, &data, requested)
+                || self.socket_port_protocol(fd) == Some(PortProtocol::Udp)
+                    && self.maybe_queue_dns_response(fd, &data, requested)
+            {
+                return Ok(DispatchOutcome::Returned {
+                    value: data.len() as i64,
+                });
+            }
         }
         // SCM_RIGHTS ancillary data (passing fds over AF_UNIX). Read the guest's
         // Linux-layout control buffer, extract the guest fds, map each to its

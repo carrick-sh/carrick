@@ -2663,6 +2663,7 @@ impl SyscallDispatcher {
                         host_fd,
                         family,
                         type_,
+                        protocol,
                         mcast_memberships,
                         synthetic_recv,
                     } => {
@@ -2696,6 +2697,7 @@ impl SyscallDispatcher {
                             status_flags: base.status_flags(),
                             family: *family,
                             type_: *type_,
+                            protocol: *protocol,
                         }
                     }
                     other => {
@@ -2839,6 +2841,7 @@ impl SyscallDispatcher {
                     status_flags,
                     family,
                     type_,
+                    protocol,
                 } => {
                     let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
                     if unsafe { libc::fstat(*host_fd, stat.as_mut_ptr()) } < 0 {
@@ -2889,6 +2892,7 @@ impl SyscallDispatcher {
                         host_fd: HostFdRef::new(*host_fd),
                         family: *family,
                         type_: *type_,
+                        protocol: *protocol,
                         mcast_memberships: Vec::new(),
                         synthetic_recv: VecDeque::new(),
                     }
@@ -9681,6 +9685,7 @@ mod native_reexec_fd_tests {
                     host_fd: HostFdRef::new(sockets[0]),
                     family: crate::linux_abi::LINUX_AF_UNIX,
                     type_: crate::linux_abi::LINUX_SOCK_STREAM,
+                    protocol: 0,
                     mcast_memberships: Vec::new(),
                     synthetic_recv: VecDeque::new(),
                 })),
