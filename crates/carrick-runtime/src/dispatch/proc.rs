@@ -895,6 +895,14 @@ impl SyscallDispatcher {
         std::process::id() != self.proc.lock().bootstrap_host_pid
     }
 
+    /// Host pid of the top-level guest process. The FreeBSD native backend uses
+    /// it as the fallback orphan-adoption target after acquiring host reaper
+    /// status; syscall-facing code translates that implementation pid back to
+    /// guest init PID 1 unless the guest explicitly selected a subreaper.
+    pub(crate) fn bootstrap_host_pid(&self) -> u32 {
+        self.proc.lock().bootstrap_host_pid
+    }
+
     /// True after the process successfully called `ptrace(PTRACE_TRACEME)`.
     pub(crate) fn is_ptrace_traceme(&self) -> bool {
         self.proc.lock().ptrace_traceme

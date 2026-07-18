@@ -679,10 +679,32 @@ impl SysvIpcService {
     }
 }
 
+static SYSV_FALLBACK_ROOT_PID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Freeze the no-run-id SysV IPC scope before a backend creates its first guest
+/// process. Descendants must keep using the top-level runtime pid: recomputing
+/// `pid-{getpid()}` after a host fork splits one guest IPC namespace into one
+/// directory namespace per process.
+pub(crate) fn init_sysv_run_scope() {
+    let _ = SYSV_FALLBACK_ROOT_PID.compare_exchange(
+        0,
+        std::process::id(),
+        std::sync::atomic::Ordering::AcqRel,
+        std::sync::atomic::Ordering::Acquire,
+    );
+}
+
 fn sysv_run_scope() -> String {
     let raw = std::env::var("CARRICK_RUN_ID").unwrap_or_else(|_| {
-        std::env::var("CARRICK_CONTAINER_ID")
-            .unwrap_or_else(|_| format!("pid-{}", std::process::id()))
+        std::env::var("CARRICK_CONTAINER_ID").unwrap_or_else(|_| {
+            let frozen = SYSV_FALLBACK_ROOT_PID.load(std::sync::atomic::Ordering::Acquire);
+            let root_pid = if frozen == 0 {
+                std::process::id()
+            } else {
+                frozen
+            };
+            format!("pid-{root_pid}")
+        })
     });
     raw.chars()
         .map(|c| {
@@ -1554,7 +1576,7 @@ impl MsgQueueWaitWord {
 
     fn wake_all(&self) {
         unsafe { self.ptr.as_ref() }.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        let _ = carrick_host::ulock::wake(self.addr(), true);
+        let _ = carrick_host::shared_word::wake(self.addr(), true);
     }
 }
 
@@ -1955,6 +1977,10 @@ fn sysvipc_msg_table_from_files() -> String {
 // ===================================================================
 
 impl SyscallDispatcher {
+    pub(crate) fn init_sysv_run_scope(&self) {
+        init_sysv_run_scope();
+    }
+
     pub(crate) fn sysv_after_fork_child(&self) {
         let mut state = self.sysv.lock();
         SysvIpcService::after_fork_child();
@@ -2229,6 +2255,7 @@ impl SyscallDispatcher {
                 len: map_len,
                 payload: Vec::new(),
                 file: Some((host_fd, 0, host_prot)),
+                shared: true,
                 // shmat is always at least readable (SHM_RDONLY or RW).
                 prot_none: false,
             })

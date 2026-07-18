@@ -1272,6 +1272,9 @@ pub enum DispatchOutcome {
         /// the runtime owns and closes after mapping. `None` → anonymous (the
         /// high-VA / `payload`-snapshot path).
         file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
+        /// Whether an anonymous alias must remain coherent across host `fork`.
+        /// Ignored for a file mapping (its `MAP_SHARED` backing is explicit).
+        shared: bool,
         /// The guest asked for `PROT_NONE`: after installing the alias mapping
         /// the runtime must make the range guest-INACCESSIBLE (invalidate the
         /// fresh leaves), so the guest's own access faults (SIGSEGV/ACCERR)

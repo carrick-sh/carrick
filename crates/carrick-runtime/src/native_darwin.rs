@@ -2791,6 +2791,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                 payload,
                 file,
                 prot_none,
+                ..
             } => {
                 memory
                     .write()

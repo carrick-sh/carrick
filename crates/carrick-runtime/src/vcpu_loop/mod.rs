@@ -2316,6 +2316,7 @@ where
                     payload,
                     file,
                     prot_none,
+                    ..
                 } => {
                     engine.map_host_alias(va, ipa, len, &payload, file)?;
                     if prot_none && let Ok(l) = usize::try_from(len) {

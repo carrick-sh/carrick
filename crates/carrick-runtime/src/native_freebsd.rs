@@ -133,6 +133,51 @@ const NEG_EINVAL: i64 = -22;
 /// is a genuine EFAULT the handlers surface).
 struct IdentityGuestMemory;
 
+/// Linux x86-64 userspace occupies the low canonical half. Reject a raw range
+/// before turning it into a host pointer if it crosses that boundary, wraps, or
+/// exceeds Rust's slice size limit. This is a syscall-memory boundary: malformed
+/// guest pointers must become EFAULT, never a host SIGSEGV or slice UB.
+fn identity_raw_range_valid(address: u64, length: usize) -> bool {
+    if length == 0 {
+        return true;
+    }
+    const X86_64_USER_END_EXCLUSIVE: u64 = 1 << 47;
+    // Carrick exposes Linux's default `/proc/sys/vm/mmap_min_addr` (64 KiB);
+    // no guest mapping can legally back a syscall pointer below it.
+    const LINUX_MMAP_MIN_ADDR: u64 = 0x1_0000;
+    address >= LINUX_MMAP_MIN_ADDR
+        && length <= isize::MAX as usize
+        && address
+            .checked_add(length.saturating_sub(1) as u64)
+            .is_some_and(|end| end < X86_64_USER_END_EXCLUSIVE)
+}
+
+#[cfg(test)]
+mod identity_raw_range_tests {
+    use super::identity_raw_range_valid;
+
+    #[test]
+    fn accepts_low_canonical_guest_ranges() {
+        assert!(identity_raw_range_valid(0x1_0000, 1));
+        assert!(identity_raw_range_valid((1 << 47) - 4096, 4096));
+    }
+
+    #[test]
+    fn rejects_null_wrapping_and_noncanonical_ranges() {
+        assert!(!identity_raw_range_valid(0, 1));
+        assert!(!identity_raw_range_valid(0x1000, 1));
+        assert!(!identity_raw_range_valid(u64::MAX - 1, 4));
+        assert!(!identity_raw_range_valid(1 << 47, 1));
+        assert!(!identity_raw_range_valid((1 << 47) - 1, 2));
+    }
+
+    #[test]
+    fn zero_length_access_never_forms_a_pointer() {
+        assert!(identity_raw_range_valid(0, 0));
+        assert!(identity_raw_range_valid(u64::MAX, 0));
+    }
+}
+
 /// Process-wide syscall-path protection metadata for the identity lane. Because
 /// `IdentityGuestMemory` is a stateless unit struct constructed at every call
 /// site, the VMA-classification sets (`no_access` / `no_write` / post-`munmap`
@@ -159,18 +204,34 @@ fn ensure_identity_backed(address: u64, len: usize) {
     if len == 0 || address < PAGE {
         return;
     }
-    if !IDENTITY_PROTECTIONS.range_unmapped(address, len) {
+    let tracked_hole = IDENTITY_PROTECTIONS.range_unmapped(address, len);
+    let mut residency = 0u8;
+    // `mincore` is a non-faulting host mapping query. A fresh shared-aperture
+    // allocation (high guest VA) was boot-backed on VMM lanes but has no host
+    // mapping in the identity lane, while a recycled low-arena range is marked
+    // explicitly as a hole. Either case needs backing before dispatcher code
+    // touches it; an existing live/PROT_NONE mapping must remain intact.
+    let start_is_mapped = unsafe {
+        libc::mincore(
+            address as *mut libc::c_void,
+            PAGE as usize,
+            (&mut residency as *mut u8).cast::<libc::c_char>(),
+        ) == 0
+    };
+    if !tracked_hole && start_is_mapped {
         return;
     }
-    // SAFETY: identity VA; MAP_FIXED atomically fills the freed hole with fresh
-    // zero-filled anonymous RW pages. The hole-only guard above keeps this from
-    // clobbering live mappings.
+    // SAFETY: identity VA; MAP_FIXED atomically fills the absent/freed range
+    // with fresh zero-filled anonymous RW pages. Use MAP_SHARED because the only
+    // initially-unbacked dispatcher allocation is the shared aperture; a later
+    // MapHostAlias outcome replaces private/file aliases with their exact
+    // backing before returning to the guest.
     unsafe {
         libc::mmap(
             address as *mut libc::c_void,
             len,
             libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_FIXED | libc::MAP_ANON | libc::MAP_PRIVATE,
+            libc::MAP_FIXED | libc::MAP_ANON | libc::MAP_SHARED,
             -1,
             0,
         );
@@ -180,9 +241,7 @@ fn ensure_identity_backed(address: u64, len: usize) {
 }
 
 impl GuestMemory for IdentityGuestMemory {
-    fn protections(
-        &self,
-    ) -> Option<&carrick_guest_mem::protections::MemoryProtections> {
+    fn protections(&self) -> Option<&carrick_guest_mem::protections::MemoryProtections> {
         Some(&IDENTITY_PROTECTIONS)
     }
 
@@ -211,7 +270,13 @@ impl GuestMemory for IdentityGuestMemory {
         IDENTITY_PROTECTIONS.set_unmapped(address, len, unmapped);
     }
 
-    fn set_mapping_protection(&mut self, address: u64, len: usize, no_access: bool, no_write: bool) {
+    fn set_mapping_protection(
+        &mut self,
+        address: u64,
+        len: usize,
+        no_access: bool,
+        no_write: bool,
+    ) {
         // Establishing a mapping over a range that was a munmap hole (mmap-reuse,
         // mremap grow tail / move destination) must re-back the host pages FIRST,
         // so the dispatcher's subsequent zero/copy raw writes land on real pages
@@ -221,7 +286,12 @@ impl GuestMemory for IdentityGuestMemory {
         IDENTITY_PROTECTIONS.set_mapping_protection(address, len, no_access, no_write);
     }
 
-    fn protect_range(&mut self, address: u64, len: usize, _prot: u64) -> Result<(), carrick_guest_mem::MemoryError> {
+    fn protect_range(
+        &mut self,
+        address: u64,
+        len: usize,
+        _prot: u64,
+    ) -> Result<(), carrick_guest_mem::MemoryError> {
         // Guest-visible protection ENFORCEMENT on live pages is a later rung; here
         // we only re-establish backing for a freed range so a grown/reused mapping
         // is usable (the identity lane keeps JIT accesses lenient — the syscall
@@ -242,11 +312,10 @@ impl GuestMemory for IdentityGuestMemory {
         if length == 0 {
             return Ok(Vec::new());
         }
-        // A guest pointer in the null page is never a valid mapping (Linux
-        // leaves page 0 unmapped for userspace), so surface it as a memory
-        // error the handler turns into EFAULT — a bad syscall pointer must not
-        // fault the host (and `from_raw_parts` UB-checks reject a null base).
-        if address < PAGE {
+        // A null-page, wrapping, or non-canonical guest range is never a valid
+        // Linux userspace mapping. Surface it as EFAULT before constructing a
+        // host slice (`mlock2`, legacy-aio, and sched-thread bad-pointer probes).
+        if !identity_raw_range_valid(address, length) {
             return Err(carrick_guest_mem::MemoryError::OutOfBounds { address, length });
         }
         // SAFETY: identity map — `address` is a host VA; the caller asserts the
@@ -262,7 +331,7 @@ impl GuestMemory for IdentityGuestMemory {
         if bytes.is_empty() {
             return Ok(());
         }
-        if address < PAGE {
+        if !identity_raw_range_valid(address, bytes.len()) {
             return Err(carrick_guest_mem::MemoryError::OutOfBounds {
                 address,
                 length: bytes.len(),
@@ -284,7 +353,11 @@ impl GuestMemory for IdentityGuestMemory {
     /// `munmap` at the identity VA (guest VA == host VA) creates a genuine hole;
     /// a later guest mmap that reuses this VA re-establishes backing through
     /// `zero_backing` (which re-maps the hole before scrubbing it).
-    fn unmap_range(&mut self, address: u64, len: usize) -> Result<(), carrick_guest_mem::MemoryError> {
+    fn unmap_range(
+        &mut self,
+        address: u64,
+        len: usize,
+    ) -> Result<(), carrick_guest_mem::MemoryError> {
         if len == 0 || address < PAGE {
             return Ok(());
         }
@@ -306,7 +379,11 @@ impl GuestMemory for IdentityGuestMemory {
     /// `MAP_FIXED` remap (which both maps and zeroes); an already-mapped region is
     /// scrubbed in place. Callers exclude file/alias regions, so the anonymous
     /// remap never clobbers file-backed content.
-    fn zero_backing(&mut self, address: u64, len: usize) -> Result<(), carrick_guest_mem::MemoryError> {
+    fn zero_backing(
+        &mut self,
+        address: u64,
+        len: usize,
+    ) -> Result<(), carrick_guest_mem::MemoryError> {
         if len == 0 {
             return Ok(());
         }
@@ -422,7 +499,11 @@ impl RegAccess for SigframeEngine<'_> {
     fn get_sys_reg(&self, _r: carrick_hal::SysReg) -> Result<u64, carrick_hal::OsError> {
         Ok(0)
     }
-    fn set_sys_reg(&mut self, _r: carrick_hal::SysReg, _v: u64) -> Result<(), carrick_hal::OsError> {
+    fn set_sys_reg(
+        &mut self,
+        _r: carrick_hal::SysReg,
+        _v: u64,
+    ) -> Result<(), carrick_hal::OsError> {
         Ok(())
     }
     fn get_vreg(&self, _n: u32) -> Result<u128, carrick_hal::OsError> {
@@ -452,9 +533,7 @@ impl GuestMemory for SigframeEngine<'_> {
     /// stack is `PROT_NONE`/unmapped (tracked no-access) makes that write EFAULT
     /// → `build_sigframe` returns Err → the caller force-`SIGSEGV`s the guest,
     /// matching Linux `force_sigsegv` (`sigbadstack`).
-    fn protections(
-        &self,
-    ) -> Option<&carrick_guest_mem::protections::MemoryProtections> {
+    fn protections(&self) -> Option<&carrick_guest_mem::protections::MemoryProtections> {
         Some(&IDENTITY_PROTECTIONS)
     }
 
@@ -745,8 +824,7 @@ fn install_native_pumped_handlers() {
         // `extern "C"` SA_SIGINFO handler on a valid host signum.
         unsafe {
             let mut action: libc::sigaction = std::mem::zeroed();
-            action.sa_sigaction =
-                native_pumped_signal_handler as *const () as libc::sighandler_t;
+            action.sa_sigaction = native_pumped_signal_handler as *const () as libc::sighandler_t;
             libc::sigemptyset(&mut action.sa_mask);
             action.sa_flags = libc::SA_SIGINFO;
             libc::sigaction(host, &action, std::ptr::null_mut());
@@ -781,6 +859,42 @@ struct LoadedImage {
     /// fault or decode garbage), so `code_bytes` reads only up to the end of
     /// the range containing a VA.
     segments: Vec<(u64, u64)>,
+}
+
+/// Reset the identity backend's syscall-pointer gate for a fresh process image.
+/// Start with the complete low-canonical userspace range unmapped, then publish
+/// only the loader-owned image/stack plus the persistent heap+mmap arenas. Every
+/// later guest mmap/mprotect/munmap updates the same interval set through the
+/// `GuestMemory` hooks. This makes an arbitrary canonical-but-unmapped pointer
+/// EFAULT before Rust constructs a host slice.
+fn reset_identity_vmas(image: &LoadedImage) {
+    const USER_START: u64 = 0x1_0000;
+    const USER_END_EXCLUSIVE: u64 = 1 << 47;
+    IDENTITY_PROTECTIONS.reset_to_unmapped(USER_START, (USER_END_EXCLUSIVE - USER_START) as usize);
+    for &(start, end) in &image.segments {
+        IDENTITY_PROTECTIONS.set_mapping_protection(start, (end - start) as usize, false, false);
+    }
+    IDENTITY_PROTECTIONS.set_mapping_protection(image.stack, image.stack_len, false, false);
+    IDENTITY_PROTECTIONS.set_mapping_protection(
+        LINUX_HEAP_BASE,
+        LINUX_HEAP_SIZE as usize,
+        false,
+        false,
+    );
+    IDENTITY_PROTECTIONS.set_mapping_protection(
+        LINUX_MMAP_BASE,
+        mmap_arena_size() as usize,
+        false,
+        false,
+    );
+    if image.vdso_base != 0 {
+        IDENTITY_PROTECTIONS.set_mapping_protection(
+            crate::vdso::LINUX_VVAR_BASE,
+            crate::vdso::LINUX_VVAR_SIZE as usize,
+            false,
+            false,
+        );
+    }
 }
 
 impl LoadedImage {
@@ -958,10 +1072,16 @@ fn load_static_pie(
         if vvar as u64 == vvar_base && vdso as u64 == vdso_base {
             // SAFETY: `vvar` is the freshly-mapped RW vvar page; zero its whole
             // size so `VVAR_OFF_FREQ` reads 0 (syscall fallback).
-            unsafe { std::ptr::write_bytes(vvar as *mut u8, 0, crate::vdso::LINUX_VVAR_SIZE as usize) };
+            unsafe {
+                std::ptr::write_bytes(vvar as *mut u8, 0, crate::vdso::LINUX_VVAR_SIZE as usize)
+            };
             // SAFETY: `vdso` is the freshly-mapped RW page(s); the image fits.
             unsafe {
-                std::ptr::copy_nonoverlapping(vdso_bytes.as_ptr(), vdso as *mut u8, vdso_bytes.len())
+                std::ptr::copy_nonoverlapping(
+                    vdso_bytes.as_ptr(),
+                    vdso as *mut u8,
+                    vdso_bytes.len(),
+                )
             };
             // Publish the vDSO code page(s) as a translatable segment so the
             // block planner can read/execute the resolved stubs.
@@ -972,7 +1092,12 @@ fn load_static_pie(
             // a vDSO (auxv omits AT_SYSINFO_EHDR; the guest uses raw syscalls).
             if vvar as isize != -1 && vvar as u64 != vvar_base {
                 // SAFETY: unmap the misplaced vvar mapping we just made.
-                unsafe { libc::munmap(vvar as *mut libc::c_void, crate::vdso::LINUX_VVAR_SIZE as usize) };
+                unsafe {
+                    libc::munmap(
+                        vvar as *mut libc::c_void,
+                        crate::vdso::LINUX_VVAR_SIZE as usize,
+                    )
+                };
             }
             if vdso as isize != -1 && vdso as u64 != vdso_base {
                 // SAFETY: unmap the misplaced vDSO mapping we just made.
@@ -1207,7 +1332,7 @@ enum ThreadStart {
     /// (rax already 0, rsp already the child stack) with the child's fsbase.
     #[allow(dead_code)]
     Detached {
-        snapshot: X86UcontextSnapshot,
+        snapshot: Box<X86UcontextSnapshot>,
         fsbase: u64,
     },
 }
@@ -1320,6 +1445,34 @@ fn patch_slot(
 /// at RUN granularity (not per guest thread): a run's guest threads share the
 /// one code cache + fault shim set up under this lock.
 static RUN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+// `guest_cpu::prepare_child_record_pre_fork` publishes its record reference
+// through a process-global child-side stash. Serialize prepare+fork so a sibling
+// guest thread cannot replace that stash before this fork snapshots it. An
+// atomic guard is deliberate: unlike a pthread/std mutex it has no inherited
+// waiter queue to strand in the multithreaded fork child; parent and child each
+// release their COW copy with one store immediately after fork.
+static FORK_IN_PROGRESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+struct NativeForkGuard;
+
+impl NativeForkGuard {
+    fn acquire() -> Self {
+        use std::sync::atomic::Ordering;
+        while FORK_IN_PROGRESS
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            std::thread::yield_now();
+        }
+        Self
+    }
+}
+
+impl Drop for NativeForkGuard {
+    fn drop(&mut self) {
+        FORK_IN_PROGRESS.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
 
 /// Per-guest-thread JIT code-cache slice size. A guest thread bump-allocates
 /// its translated blocks within its own slice, so concurrent threads never
@@ -1522,11 +1675,7 @@ fn spawn_clone_thread(
     if req.parent_tid_addr != 0 {
         // SAFETY: identity map — a guest-writable word.
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                tid_bytes.as_ptr(),
-                req.parent_tid_addr as *mut u8,
-                4,
-            );
+            std::ptr::copy_nonoverlapping(tid_bytes.as_ptr(), req.parent_tid_addr as *mut u8, 4);
         }
     }
     if req.child_tid_addr != 0 {
@@ -1559,7 +1708,7 @@ fn spawn_clone_thread(
             let mut waiter = crate::io_wait::ThreadWaiter::new(child_tid);
             let outcome = run_x86_thread(
                 ThreadStart::Detached {
-                    snapshot: child_snapshot,
+                    snapshot: Box::new(child_snapshot),
                     fsbase: child_fsbase,
                 },
                 &child_shared,
@@ -1713,6 +1862,7 @@ where
     // pointer / zero a region THROUGH the memory) resolve onto live backing
     // instead of faulting the host.
     let arenas = GuestArenas::reserve()?;
+    reset_identity_vmas(&image);
 
     let tid = crate::thread::ThreadId::main_from_host_pid();
 
@@ -1758,6 +1908,11 @@ where
     // the guest on this pump-less lane (see the handler doc); pre-fork so every
     // descendant inherits the routing.
     install_native_pumped_handlers();
+    // Freeze runtime-owned IPC object names before any guest fork. Without an
+    // explicit run/container id the fallback scope is based on the top-level
+    // runtime pid; descendants must inherit it rather than recomputing their own
+    // pid and losing the parent's SysV message queues.
+    dispatcher.init_sysv_run_scope();
     // Fork-shared cross-process futex waiter-count table, so a shared FUTEX_WAKE
     // can report how many waiters it woke (Linux semantics; native _umtx_op does
     // not). Pre-fork so every descendant maps the same physical pages.
@@ -1770,7 +1925,12 @@ where
     // a second acquire returns EBUSY, ignored.
     // SAFETY: procctl with a valid cmd + NULL data.
     unsafe {
-        libc::procctl(libc::P_PID, 0, libc::PROC_REAP_ACQUIRE, std::ptr::null_mut());
+        libc::procctl(
+            libc::P_PID,
+            0,
+            libc::PROC_REAP_ACQUIRE,
+            std::ptr::null_mut(),
+        );
     }
 
     let free_slices: Vec<usize> = (0..JIT_SLICE_COUNT).map(|i| i * JIT_SLICE_LEN).collect();
@@ -1791,7 +1951,9 @@ where
     // The process's initial guest thread runs inline on THIS host thread over
     // its own JIT slice. Guest `clone` threads carve their own slice and run on
     // spawned host threads.
-    let main_slice = shared.alloc_slice().expect("at least one JIT slice");
+    let main_slice = shared.alloc_slice().ok_or_else(|| {
+        RuntimeError::Unsupported("native x86 main thread has no JIT slice".to_string())
+    })?;
     let mut memory = IdentityGuestMemory;
     // The blocking-I/O waiter (fd wait / poll / select / sleep / blocking
     // write), shared with the KVM/bhyve single-thread loop.
@@ -1926,6 +2088,7 @@ fn run_x86_thread(
             (snapshot, 0u64, entry)
         }
         ThreadStart::Detached { snapshot, fsbase } => {
+            let snapshot = *snapshot;
             let next = snapshot.rip;
             (snapshot, fsbase, next)
         }
@@ -2242,13 +2405,18 @@ fn run_x86_thread(
                         }
                     }
                     Step::Exit(code) => {
-                        // A fork child exits directly so the parent's wait4
-                        // reaps it (and native_run prints only the top-level
-                        // process's RunResult).
+                        // A fork child exits through the shared lifecycle helper:
+                        // besides `_exit`, it reparents the child's descendants in
+                        // Carrick's fork-coherent child table and publishes terminal
+                        // state for an adopted orphan. A raw `_exit` left `wait4(-1)`
+                        // believing there were no children after the direct child
+                        // died (`pidnsorphanreap`).
                         if forked {
-                            // SAFETY: _exit performs no unwinding; the child's
-                            // COW mappings are released by the kernel.
-                            unsafe { libc::_exit(code) };
+                            crate::exec_helpers::forked_child_exit(
+                                code,
+                                active.dispatcher.stdout(),
+                                active.dispatcher.stderr(),
+                            );
                         }
                         exit_code = Some(code);
                         break 'run;
@@ -2292,8 +2460,7 @@ fn run_x86_thread(
                                 // the shared image, so none faults on a mapping
                                 // torn out from under it. Then this thread is the
                                 // sole survivor and owns the exec.
-                                let siblings =
-                                    active.registry.live_count().saturating_sub(1);
+                                let siblings = active.registry.live_count().saturating_sub(1);
                                 if siblings > 0 {
                                     active.exit.request_exec_stop();
                                     active.exit.wait_exec_acks(siblings);
@@ -2323,6 +2490,7 @@ fn run_x86_thread(
                                 old.teardown();
                                 match load_static_pie(&bytes, &argv, &env) {
                                     Ok(new_image) => {
+                                        reset_identity_vmas(&new_image);
                                         image = Arc::new(new_image);
                                     }
                                     Err(e) => {
@@ -2484,9 +2652,14 @@ fn service_syscall(
         // is entered, `snapshot.rip` now points at it.
         DispatchOutcome::Returned { value } => {
             snapshot.gpr[reg::RAX] = value as u64;
-            if let Some(sig) =
-                run_pending_signals(shared, tid, snapshot, Some(value), Some(syscall_nr), orig_rax)
-            {
+            if let Some(sig) = run_pending_signals(
+                shared,
+                tid,
+                snapshot,
+                Some(value),
+                Some(syscall_nr),
+                orig_rax,
+            ) {
                 return Step::SignalDeath(sig);
             }
             Step::Continue(snapshot.rip)
@@ -2494,9 +2667,14 @@ fn service_syscall(
         DispatchOutcome::Errno { errno } => {
             let retval = -(errno.get() as i64);
             snapshot.gpr[reg::RAX] = retval as u64;
-            if let Some(sig) =
-                run_pending_signals(shared, tid, snapshot, Some(retval), Some(syscall_nr), orig_rax)
-            {
+            if let Some(sig) = run_pending_signals(
+                shared,
+                tid,
+                snapshot,
+                Some(retval),
+                Some(syscall_nr),
+                orig_rax,
+            ) {
                 return Step::SignalDeath(sig);
             }
             Step::Continue(snapshot.rip)
@@ -2519,14 +2697,19 @@ fn service_syscall(
         // parent's wait4 reaps it via host waitpid. The dispatcher's proc model
         // already distinguishes the child by `getpid() != bootstrap_host_pid`.
         DispatchOutcome::Fork {
+            clone_parent,
             parent_tid_addr,
             child_tid_addr,
             child_stack,
             ..
         } => service_fork(
-            parent_tid_addr,
-            child_tid_addr,
-            child_stack,
+            dispatcher,
+            NativeForkRequest {
+                clone_parent,
+                parent_tid_addr,
+                child_tid_addr,
+                child_stack,
+            },
             snapshot,
             memory,
             resume,
@@ -2539,6 +2722,7 @@ fn service_syscall(
             len,
             payload,
             file,
+            shared,
             prot_none,
             ..
         } => service_map_host_alias(
@@ -2546,6 +2730,7 @@ fn service_syscall(
             len,
             &payload,
             file,
+            shared,
             prot_none,
             snapshot,
             memory,
@@ -2560,9 +2745,14 @@ fn service_syscall(
             let value = wait_x86_futex(futex, tid, wait, timeout, 0);
             snapshot.gpr[reg::RAX] = value as u64;
             // A signal-interrupted futex (EINTR) delivers its handler here.
-            if let Some(sig) =
-                run_pending_signals(shared, tid, snapshot, Some(value), Some(syscall_nr), orig_rax)
-            {
+            if let Some(sig) = run_pending_signals(
+                shared,
+                tid,
+                snapshot,
+                Some(value),
+                Some(syscall_nr),
+                orig_rax,
+            ) {
                 return Step::SignalDeath(sig);
             }
             Step::Continue(snapshot.rip)
@@ -2575,9 +2765,14 @@ fn service_syscall(
             // On a wake, `futex_waitv` returns the INDEX of the woken futex.
             let value = wait_x86_futex(futex, tid, wait, timeout, index);
             snapshot.gpr[reg::RAX] = value as u64;
-            if let Some(sig) =
-                run_pending_signals(shared, tid, snapshot, Some(value), Some(syscall_nr), orig_rax)
-            {
+            if let Some(sig) = run_pending_signals(
+                shared,
+                tid,
+                snapshot,
+                Some(value),
+                Some(syscall_nr),
+                orig_rax,
+            ) {
                 return Step::SignalDeath(sig);
             }
             Step::Continue(snapshot.rip)
@@ -2604,9 +2799,14 @@ fn service_syscall(
             let retval = shared_futex_wait_umtx(location.wait_addr().raw(), value, timeout);
             crate::thread::set_current_thread_state(tid, 'R');
             snapshot.gpr[reg::RAX] = retval as u64;
-            if let Some(sig) =
-                run_pending_signals(shared, tid, snapshot, Some(retval), Some(syscall_nr), orig_rax)
-            {
+            if let Some(sig) = run_pending_signals(
+                shared,
+                tid,
+                snapshot,
+                Some(retval),
+                Some(syscall_nr),
+                orig_rax,
+            ) {
                 return Step::SignalDeath(sig);
             }
             Step::Continue(snapshot.rip)
@@ -2625,9 +2825,14 @@ fn service_syscall(
             crate::thread::set_current_thread_state(tid, 'R');
             let retval = if retval == 0 { index } else { retval };
             snapshot.gpr[reg::RAX] = retval as u64;
-            if let Some(sig) =
-                run_pending_signals(shared, tid, snapshot, Some(retval), Some(syscall_nr), orig_rax)
-            {
+            if let Some(sig) = run_pending_signals(
+                shared,
+                tid,
+                snapshot,
+                Some(retval),
+                Some(syscall_nr),
+                orig_rax,
+            ) {
                 return Step::SignalDeath(sig);
             }
             Step::Continue(snapshot.rip)
@@ -2639,9 +2844,14 @@ fn service_syscall(
         } => {
             let retval = shared_futex_wake_umtx(location.wait_addr().raw(), count);
             snapshot.gpr[reg::RAX] = retval as u64;
-            if let Some(sig) =
-                run_pending_signals(shared, tid, snapshot, Some(retval), Some(syscall_nr), orig_rax)
-            {
+            if let Some(sig) = run_pending_signals(
+                shared,
+                tid,
+                snapshot,
+                Some(retval),
+                Some(syscall_nr),
+                orig_rax,
+            ) {
                 return Step::SignalDeath(sig);
             }
             Step::Continue(snapshot.rip)
@@ -2854,7 +3064,10 @@ fn shared_waiter_slot(word: usize) -> Option<&'static WaiterSlot> {
             return Some(slot);
         }
         if cur == 0 {
-            match slot.key.compare_exchange(0, key, Ordering::AcqRel, Ordering::Acquire) {
+            match slot
+                .key
+                .compare_exchange(0, key, Ordering::AcqRel, Ordering::Acquire)
+            {
                 Ok(_) => return Some(slot),
                 Err(existing) if existing == key => return Some(slot),
                 Err(_) => {} // lost the slot to a different key; probe on
@@ -2989,8 +3202,12 @@ fn wait_x86_futex(
     crate::thread::set_current_thread_state(tid, 'R');
     match outcome {
         crate::thread::FutexWaitOutcome::Woken => woken_value,
-        crate::thread::FutexWaitOutcome::TimedOut => crate::linux_abi::LINUX_ETIMEDOUT.guest_retval(),
-        crate::thread::FutexWaitOutcome::Interrupted => crate::linux_abi::LINUX_EINTR.guest_retval(),
+        crate::thread::FutexWaitOutcome::TimedOut => {
+            crate::linux_abi::LINUX_ETIMEDOUT.guest_retval()
+        }
+        crate::thread::FutexWaitOutcome::Interrupted => {
+            crate::linux_abi::LINUX_EINTR.guest_retval()
+        }
     }
 }
 
@@ -3041,7 +3258,8 @@ fn service_syscall_threaded(
     let mut poll_deadline: Option<std::time::Instant> = None;
     let mut sleep_deadline: Option<std::time::Instant> = None;
     loop {
-        let outcome = dispatcher.dispatch_threaded(request, memory, reporter, tid, registry, futex)?;
+        let outcome =
+            dispatcher.dispatch_threaded(request, memory, reporter, tid, registry, futex)?;
         match outcome {
             DispatchOutcome::WaitOnFds {
                 fds,
@@ -3252,13 +3470,31 @@ fn service_syscall_threaded(
                 }
             }
             DispatchOutcome::WaitOnProcState { sig_mask, .. } => {
-                match waiter.wait_proc_state_with_dispatch_pending(sig_mask.block_mask(), || false) {
+                match waiter.wait_proc_state_with_dispatch_pending(sig_mask.block_mask(), || false)
+                {
                     WaitResult::Ready | WaitResult::TimedOut => continue,
                     WaitResult::Interrupted => {
                         return Ok(DispatchOutcome::Errno { errno: EINTR });
                     }
                     WaitResult::Errno(errno) => return Ok(DispatchOutcome::Errno { errno }),
                 }
+            }
+            DispatchOutcome::WaitOnSharedWord {
+                location, value, ..
+            } => {
+                // Runtime-owned fork-shared state (currently SysV message
+                // queues): the word change is only a wake hint, never the
+                // syscall result. Park through FreeBSD's cross-process umtx,
+                // then re-dispatch under fresh queue state. A value race before
+                // the park is EAGAIN and means the same thing: re-check now.
+                let retval = carrick_host::shared_word::wait(location.wait_addr().raw(), value, 0);
+                if retval == 0 {
+                    continue;
+                }
+                if retval == crate::linux_abi::LINUX_EINTR.guest_retval() {
+                    return Ok(DispatchOutcome::Errno { errno: EINTR });
+                }
+                return Ok(DispatchOutcome::Returned { value: retval });
             }
             // Terminal + thread-specific (Returned/Errno/Exit/CloneThread/
             // FutexWait/ThreadExit/…): the caller drives these.
@@ -3267,42 +3503,96 @@ fn service_syscall_threaded(
     }
 }
 
+/// Runtime-owned fields of a process-creating clone outcome.
+struct NativeForkRequest {
+    clone_parent: bool,
+    parent_tid_addr: Option<u64>,
+    child_tid_addr: Option<u64>,
+    child_stack: u64,
+}
+
 /// Perform a guest `fork()` as a host `fork()`. Sets guest `rax` (0 in the
 /// child, the child pid in the parent), runs the child on `child_stack` if
 /// given, and honors CLONE_PARENT_SETTID / CLONE_CHILD_SETTID. Returns
 /// [`Step::BecameForkChild`] in the child so the run loop `_exit`s it directly.
 fn service_fork(
-    parent_tid_addr: Option<u64>,
-    child_tid_addr: Option<u64>,
-    child_stack: u64,
+    dispatcher: &SyscallDispatcher,
+    request: NativeForkRequest,
     snapshot: &mut X86UcontextSnapshot,
     memory: &mut IdentityGuestMemory,
     resume: u64,
 ) -> Step {
+    let fork_guard = NativeForkGuard::acquire();
+    let current = std::process::id();
+    let child_parent = if request.clone_parent {
+        dispatcher.clone_parent_host_pid()
+    } else {
+        current
+    };
+    let explicit_subreaper = dispatcher.subreaper_for_fork_child();
+    // FreeBSD's PROC_REAP_ACQUIRE makes the top-level native process act as
+    // the guest's init. When no guest explicitly selected a subreaper, retain
+    // that init as the orphan-adoption target in the fork-coherent child table.
+    // `ProcState::subreaper_ancestor` remains zero, which lets getppid expose
+    // this implementation adoption as guest PID 1 rather than the host pid.
+    let child_subreaper = if explicit_subreaper == 0 {
+        dispatcher.bootstrap_host_pid()
+    } else {
+        explicit_subreaper
+    };
+    let child_ns_pid = crate::namespace::pid::allocate_child_ns_pid_pre_fork();
+    let prepared = match crate::guest_cpu::prepare_child_record_pre_fork(
+        child_parent,
+        child_subreaper,
+        child_ns_pid.unwrap_or(0),
+        request.clone_parent && child_parent != current,
+        0,
+    ) {
+        Ok(record) => record,
+        Err(_) => {
+            snapshot.gpr[reg::RAX] = crate::linux_abi::LINUX_EAGAIN.guest_retval() as u64;
+            return Step::Continue(resume);
+        }
+    };
+
     // SAFETY: a plain process fork; the child re-enters the same run loop with
     // a COW copy of every mapping.
     let pid = unsafe { libc::fork() };
     if pid < 0 {
+        // Keep serialization until the process-global pending-record stash is
+        // cleared. Dropping the guard first lets a sibling prepare its record,
+        // which this failure path would then abort instead of our own.
+        crate::guest_cpu::abort_prepared_child_record();
+        drop(fork_guard);
         let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(11);
         snapshot.gpr[reg::RAX] = (-(errno as i64)) as u64;
         return Step::Continue(resume);
     }
+    // This thread owned the atomic guard at fork. Dropping the COW copy is one
+    // release-store in each process and precedes all child-side locks.
+    drop(fork_guard);
     if pid == 0 {
-        // Child.
+        // Child: complete the record inherited from the serialized pre-fork
+        // preparation before it can fork children or expose process identity.
+        crate::guest_cpu::complete_child_record_post_fork_child();
         snapshot.gpr[reg::RAX] = 0;
-        if child_stack != 0 {
-            snapshot.gpr[reg::RSP] = child_stack;
+        if request.child_stack != 0 {
+            snapshot.gpr[reg::RSP] = request.child_stack;
         }
-        if let Some(addr) = child_tid_addr {
-            let cpid = unsafe { libc::getpid() } as u32;
+        if let Some(addr) = request.child_tid_addr {
+            let cpid = crate::namespace::pid::self_ns_pid();
             let _ = memory.write_bytes(addr, &cpid.to_le_bytes());
         }
         Step::BecameForkChild(resume)
     } else {
-        // Parent.
-        snapshot.gpr[reg::RAX] = pid as u64;
-        if let Some(addr) = parent_tid_addr {
-            let _ = memory.write_bytes(addr, &(pid as u32).to_le_bytes());
+        // Parent: publish by the exact prepared-record reference. A later fork
+        // may already have replaced the process-global child stash.
+        crate::guest_cpu::publish_prepared_child_record_parent_ref(prepared, pid as u32);
+        crate::namespace::pid::notify_child_registered();
+        let guest_pid = child_ns_pid.unwrap_or(pid as u32);
+        snapshot.gpr[reg::RAX] = u64::from(guest_pid);
+        if let Some(addr) = request.parent_tid_addr {
+            let _ = memory.write_bytes(addr, &guest_pid.to_le_bytes());
         }
         Step::Continue(resume)
     }
@@ -3319,6 +3609,7 @@ fn service_map_host_alias(
     len: u64,
     payload: &[u8],
     file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
+    shared: bool,
     prot_none: bool,
     snapshot: &mut X86UcontextSnapshot,
     memory: &mut IdentityGuestMemory,
@@ -3345,9 +3636,38 @@ fn service_map_host_alias(
             snapshot.gpr[reg::RAX] = (-(errno as i64)) as u64;
             return Step::Continue(resume);
         }
-    } else if !payload.is_empty() {
-        // Anonymous snapshot: the arena page is already RW-backed; copy it in.
-        let _ = memory.write_bytes(va, payload);
+    } else {
+        // Anonymous alias mappings live outside the pre-reserved low mmap
+        // arena, so install real backing at the identity VA before either the
+        // guest or a syscall-path validation touches it. Preserve MAP_SHARED
+        // across host fork; private aliases use ordinary CoW backing.
+        let flags = libc::MAP_FIXED
+            | libc::MAP_ANON
+            | if shared {
+                libc::MAP_SHARED
+            } else {
+                libc::MAP_PRIVATE
+            };
+        // SAFETY: `va` is the dispatcher-selected page-aligned guest identity
+        // address and `len_usize` is its validated mapping length.
+        let p = unsafe {
+            libc::mmap(
+                va as *mut libc::c_void,
+                len_usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                flags,
+                -1,
+                0,
+            )
+        };
+        if p as u64 != va {
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(12);
+            snapshot.gpr[reg::RAX] = (-(errno as i64)) as u64;
+            return Step::Continue(resume);
+        }
+        if !payload.is_empty() {
+            let _ = memory.write_bytes(va, payload);
+        }
     }
     if prot_none {
         // SAFETY: making the guest's own mapping inaccessible so its access
