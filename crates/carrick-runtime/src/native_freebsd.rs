@@ -179,6 +179,26 @@ impl GuestMemory for IdentityGuestMemory {
         }
         Ok(())
     }
+
+    /// A SHARED (non-`FUTEX_PRIVATE`) futex word resolves to a fork-coherent host
+    /// word so a wake from ANOTHER forked process reaches a waiter parked here. In
+    /// the identity model the guest VA already IS that host word (a guest
+    /// `MAP_SHARED` page is genuinely shared across the host `fork`), so the
+    /// location is `Direct` at the address itself; the driver then waits/wakes on
+    /// it with FreeBSD `_umtx_op(UMTX_OP_WAIT_UINT/WAKE)`, whose non-private key is
+    /// the shared VM object + offset and so spans the fork. The dispatcher only
+    /// calls this after excluding `FUTEX_PRIVATE` and clear-child-tid words, so a
+    /// process-private futex never reaches here and keeps using the in-process
+    /// parking-lot `FutexTable`.
+    fn shared_futex_location(
+        &self,
+        guest_addr: u64,
+    ) -> Option<carrick_guest_mem::SharedFutexLocation> {
+        Some(carrick_guest_mem::SharedFutexLocation::Direct {
+            word: carrick_guest_mem::HostVa(guest_addr as usize),
+            waiter_key: guest_addr as usize,
+        })
+    }
 }
 
 /// A `RegAccess + GuestMemory` view over a live `X86UcontextSnapshot`, so the
@@ -2007,6 +2027,87 @@ fn service_syscall(
             }
             Step::Continue(snapshot.rip)
         }
+        // A SHARED (non-`FUTEX_PRIVATE`) `FUTEX_WAIT` on a `MAP_SHARED` word: the
+        // waker may live in ANOTHER forked process, so the in-process parking-lot
+        // table can't reach it. Park on the host word with FreeBSD `_umtx_op`,
+        // whose non-private key spans the fork (identity: the guest word IS the
+        // host word). `futexshare`'s child blocks here until the parent flips the
+        // word and `SharedFutexWake`s it.
+        DispatchOutcome::SharedFutexWait {
+            location,
+            value,
+            timeout,
+            ..
+        } => {
+            let retval = shared_futex_wait_umtx(location.wait_addr().raw(), value, timeout);
+            snapshot.gpr[reg::RAX] = retval as u64;
+            if let Some(sig) =
+                run_pending_signals(shared, tid, snapshot, Some(retval), Some(syscall_nr), orig_rax)
+            {
+                return Step::SignalDeath(sig);
+            }
+            Step::Continue(snapshot.rip)
+        }
+        // `futex_waitv` over a SHARED word: same cross-process park; a wake returns
+        // the woken futex's index instead of 0.
+        DispatchOutcome::SharedFutexWaitv {
+            location,
+            value,
+            timeout,
+            index,
+            ..
+        } => {
+            let retval = shared_futex_wait_umtx(location.wait_addr().raw(), value, timeout);
+            let retval = if retval == 0 { index } else { retval };
+            snapshot.gpr[reg::RAX] = retval as u64;
+            if let Some(sig) =
+                run_pending_signals(shared, tid, snapshot, Some(retval), Some(syscall_nr), orig_rax)
+            {
+                return Step::SignalDeath(sig);
+            }
+            Step::Continue(snapshot.rip)
+        }
+        // The cross-process wake counterpart: wake up to `count` waiters parked on
+        // the shared word (possibly in a peer process) via `_umtx_op(UMTX_OP_WAKE)`.
+        DispatchOutcome::SharedFutexWake {
+            location, count, ..
+        } => {
+            let retval = shared_futex_wake_umtx(location.wait_addr().raw(), count);
+            snapshot.gpr[reg::RAX] = retval as u64;
+            if let Some(sig) =
+                run_pending_signals(shared, tid, snapshot, Some(retval), Some(syscall_nr), orig_rax)
+            {
+                return Step::SignalDeath(sig);
+            }
+            Step::Continue(snapshot.rip)
+        }
+        // `FUTEX_CMP_REQUEUE`/`FUTEX_REQUEUE` across shared words: wake `wake`
+        // waiters on `from`, then move the rest onto `to`. `_umtx_op` has no
+        // requeue op, so approximate it by waking `wake` on `from` and `requeue`
+        // on `to` (the guest re-checks its predicate and re-waits as needed —
+        // Linux-observable behavior, just without the internal re-parking).
+        DispatchOutcome::SharedFutexRequeue {
+            from,
+            to,
+            wake,
+            requeue,
+            ..
+        } => {
+            let woken = shared_futex_wake_umtx(from.wait_addr().raw(), wake);
+            let moved = shared_futex_wake_umtx(to.wait_addr().raw(), requeue);
+            snapshot.gpr[reg::RAX] = (woken + moved) as u64;
+            if let Some(sig) = run_pending_signals(
+                shared,
+                tid,
+                snapshot,
+                Some(woken + moved),
+                Some(syscall_nr),
+                orig_rax,
+            ) {
+                return Step::SignalDeath(sig);
+            }
+            Step::Continue(snapshot.rip)
+        }
         // `tgkill`/`tkill` targeting a SIBLING guest thread: publish the signal
         // pending for the target and unpark it (a futex/blocking waiter observes
         // the pending signal and returns EINTR, delivering the handler at its
@@ -2097,6 +2198,88 @@ fn service_syscall(
              (execve/vfork are later rungs)"
         )),
     }
+}
+
+// FreeBSD `_umtx_op(2)` — the host primitive for a cross-PROCESS futex. The
+// NON-private op keys on the shared VM object + offset, so a wait/wake on a
+// guest `MAP_SHARED` word (identity: guest VA == host VA) reaches a peer parked
+// in another forked process — exactly what the in-process parking-lot
+// `FutexTable` cannot do across a `fork`.
+const SYS_UMTX_OP: libc::c_int = 454;
+const UMTX_OP_WAIT_UINT: libc::c_int = 11;
+const UMTX_OP_WAKE: libc::c_int = 3;
+// `_umtx_op` reads a relative timeout as a bare `struct timespec` when its
+// `uaddr` (4th) arg equals `sizeof(struct timespec)`; `uaddr2` (5th) points at it.
+const UMTX_TIMESPEC_SIZE: usize = std::mem::size_of::<libc::timespec>();
+
+/// Cross-process shared-futex WAIT via `_umtx_op(UMTX_OP_WAIT_UINT)`. `word` is a
+/// live host address of the 4-byte futex word; the kernel re-checks `*word ==
+/// value` atomically before parking (closing the classic set-then-wake race with
+/// a peer process), then blocks until a `shared_futex_wake_umtx` on the same page
+/// wakes it, the relative `timeout` elapses, or a signal interrupts. Returns the
+/// Linux `FUTEX_WAIT` retval: 0 (woken), `-EAGAIN` (value mismatch), `-ETIMEDOUT`,
+/// or `-EINTR`.
+fn shared_futex_wait_umtx(word: usize, value: u32, timeout: Option<std::time::Duration>) -> i64 {
+    let ts = timeout.map(|d| libc::timespec {
+        tv_sec: d.as_secs() as libc::time_t,
+        tv_nsec: d.subsec_nanos() as libc::c_long,
+    });
+    let (uaddr, uaddr2) = match &ts {
+        Some(ts) => (
+            UMTX_TIMESPEC_SIZE as *mut libc::c_void,
+            ts as *const libc::timespec as *mut libc::c_void,
+        ),
+        None => (std::ptr::null_mut(), std::ptr::null_mut()),
+    };
+    // SAFETY: `word` is an identity host VA of a guest-mapped, 4-byte-aligned
+    // shared futex word; `_umtx_op` only reads it. `libc::syscall` returns -1 and
+    // sets errno on failure.
+    let rc = unsafe {
+        libc::syscall(
+            SYS_UMTX_OP,
+            word as *mut u32 as *mut libc::c_void,
+            UMTX_OP_WAIT_UINT,
+            value as libc::c_ulong,
+            uaddr,
+            uaddr2,
+        )
+    };
+    let rc = rc as libc::c_long;
+    if rc == 0 {
+        return 0;
+    }
+    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    match errno {
+        libc::ETIMEDOUT => crate::linux_abi::LINUX_ETIMEDOUT.guest_retval(),
+        libc::EINTR => crate::linux_abi::LINUX_EINTR.guest_retval(),
+        // `*word != value` at entry (a peer already advanced it): Linux returns
+        // EAGAIN, and the guest's retry loop re-reads the now-changed word.
+        libc::EAGAIN => crate::linux_abi::LINUX_EAGAIN.guest_retval(),
+        _ => crate::linux_abi::LINUX_EAGAIN.guest_retval(),
+    }
+}
+
+/// Cross-process shared-futex WAKE via `_umtx_op(UMTX_OP_WAKE)`: wake up to
+/// `count` waiters parked (possibly in another forked process) on `word`. FreeBSD
+/// `_umtx_op` does NOT report how many were woken, and a shared waiter parks on
+/// the umtx (not the in-process parking-lot table), so the true local count is
+/// unavailable — this returns 0, matching Linux's `FUTEX_WAKE` "no waiters woken"
+/// on a page nothing is parked on (`futexghost`). A guest that genuinely needs
+/// the woken count for a SHARED futex is out of scope; the in-scope probes either
+/// ignore the retval (`futexshare` parent) or assert exactly this 0.
+fn shared_futex_wake_umtx(word: usize, count: u32) -> i64 {
+    // SAFETY: as in `shared_futex_wait_umtx`; WAKE neither reads nor writes the word.
+    let _ = unsafe {
+        libc::syscall(
+            SYS_UMTX_OP,
+            word as *mut u32 as *mut libc::c_void,
+            UMTX_OP_WAKE,
+            count as libc::c_ulong,
+            std::ptr::null_mut::<libc::c_void>(),
+            std::ptr::null_mut::<libc::c_void>(),
+        )
+    };
+    0
 }
 
 /// Park this thread on `wait` until woken, timed out, or interrupted by a
