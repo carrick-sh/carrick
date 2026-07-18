@@ -39,15 +39,37 @@ unlocked) × (whether it unblocks later rungs), against implementation cost:
 | Rung | Bucket (census tag) | Probes | Unblocks | Cost |
 |------|--------|-------|----------|------|
 | **A** | CloneThread threading core (`OUT:CloneThread`) + futex (`HANG` futex\*, `OUT:WaitOnSharedWord`) | **44** + ~6 | most of the tail | High (concurrency model change) |
-| **B** | Instruction-encoding gaps (`EMIT`, mostly `bridge_*`) | **24** | — | Medium (add missing rewrites) |
+| **B** | Container networking (`EMIT`/`hlt`, all `bridge_*`) | **24** | — | High (rtnetlink + `/proc/net` + `/sys/class/net` + DNS) |
 | **C** | Faults: protection enforcement + diverse SIGSEGV (`FAULT:signal11`) | **56** | — | Medium (many may already be *correct* faults — triage first) |
-| **D** | No-progress: decode/control-flow gaps (`NOPROG`) | **15** | — | Medium |
+| **D** | No-progress: guest-generated code + cflow gaps (`NOPROG`) | **15** | — | Mixed (guest-JIT is Medium-High; cflow forms are small) |
 | **E** | `execve` in-process image replacement (`OUT:Execve`) | **7** | — | Medium |
 | **F** | Long tail (remaining `HANG/OTHER`, `SigReturn`) | remainder | — | Iterative |
 
 Rung A is first: largest single actionable bucket *and* the infrastructure
 (shared thread-runtime, per-thread JIT, threaded dispatch) that the futex probes
 and much of the tail depend on.
+
+### Bucket triage — actual root causes (verified, not guessed)
+
+- **B / `EMIT` (24, `bridge_*`)** — *not* an emitter gap. The unlowered
+  "instruction" is `f4` = **`hlt`**, which is musl's `a_crash()` on x86_64. The
+  `bridge_*` probes call `getifaddrs`/rtnetlink, read `/proc/net` + `/sys/class/net`,
+  and resolve DNS; with no container network identity in the native lane,
+  `eth0_ipv4()` finds nothing and the probe aborts into `hlt`. So this bucket is
+  **container networking**, a large rung. *Sub-task worth doing regardless:* lower
+  a userspace `hlt` to a clean guest `SIGSEGV` (Linux #GP semantics) so it faults
+  the guest instead of aborting the translator — hardening, but it will not by
+  itself flip these probes.
+- **D / `NOPROG` (15)** — three sub-causes: (1) **guest-generated executable
+  code** — `mprotectexec` mmaps a page, marks it PROT_EXEC, writes code, and jumps
+  in; the translator only knows the ELF PT_LOADs, so the jump target (`0x6000003000`)
+  reads empty. Fix: translate-on-demand from *live guest memory* (the arenas/mmap
+  regions), not just the static image. (2) **missing `cflow` branch form** —
+  `killrt` hits "branch form … not lowered yet" in `cflow::resolve`; small,
+  additive. (3) **execve churn** — stale segments after exec (needs Rung E).
+- **C / `FAULT:signal11` (56)** — triage before coding: many are probes whose
+  *designed* behavior is to fault (protection tests), which the coarse census tags
+  as failures. Split "faulted as designed" from "we broke a working program."
 
 > **Triage note on Rung C (56 faults):** a `FAULT:signal11` census tag means the
 > guest took SIGSEGV — for many probes (`protnone*`, `bsd_signal_xlate`, the
@@ -132,9 +154,52 @@ Shared primitives in the `carrick-thread` crate (`crate::thread`) are reused
 - Signal delivery to a specific guest thread.
 - Teardown: `exit_group` from any thread must stop *all* threads.
 
+**Concurrency-model finding (verified).** The single-thread path calls
+`crate::runtime::service_syscall` → `dispatcher.dispatch(&mut self, …)`. That is
+**not** shareable across threads. `native_darwin` instead drives
+`dispatcher.dispatch_threaded(&self, …)` (interior-mutable, thread-safe) via
+`dispatch_native_syscall` (`native_darwin.rs:3774`/`:4133`, `dispatch_threaded`
+call at `:4155`/`:4165`) with an `Arc<SyscallDispatcher>`. So Rung A's servicer
+must move from the `&mut dispatch` path to the `dispatch_threaded` path — this is
+the load-bearing change and the main regression risk (blocking waits are then
+serviced by the threaded machinery, not the local `ThreadWaiter` loop).
+
+**Implementation checklist (turn-key, in dependency order):**
+
+1. **Extract the run loop.** Pull `native_freebsd.rs:555–806` into
+   `run_x86_thread(start: ThreadStart, shared: &SharedRun, rt: &mut FreebsdThreadRuntime)`,
+   where `ThreadStart::{ Initial { entry, rsp }, Detached { snapshot, fsbase } }`
+   (copy `NativeThreadStart`, `native_darwin.rs:2026`). Keep behavior identical
+   for the `Initial` case first; build + run the 4 integration tests + a census
+   spot-check; commit while still single-threaded and green. *(De-risks the
+   mechanical extraction from the semantic change.)*
+2. **Switch the servicer to `dispatch_threaded`.** Replace the local
+   `service_syscall`'s `crate::runtime::service_syscall(&mut dispatcher…)` with a
+   `dispatch_native_syscall`-style call on `Arc<SyscallDispatcher>`. Re-census —
+   this is where a regression would show; gate on the OK count not dropping.
+   Commit.
+3. **`FreebsdThreadRuntime`** (port `NativeThreadRuntime`, `native_darwin.rs:3129`):
+   `{ tid, registry: Arc<ThreadRegistry>, futex: Arc<FutexTable>, waiter,
+   threads: Arc<Mutex<Vec<JoinHandle<()>>>, … }` + `new_current()` + `sibling(tid)`.
+4. **Single contiguous code cache.** Reserve one large JIT region up front,
+   register it once with `fault::register_code_region`, and hand each thread a
+   non-overlapping slice `(exec_base+off, len)` with its own cursor/cache/pending.
+   No fault-shim change.
+5. **`spawn_clone_thread`** (port `native_darwin.rs:3317`): `register_child`,
+   `inherit_thread_signal_mask`, write parent/child tids, clone the snapshot with
+   `RAX=0` / `RSP=stack` / `guest_fsbase=tls`, `std::thread::Builder::spawn` the
+   per-thread `run_x86_thread(ThreadStart::Detached…)`, readiness `sync_channel`.
+6. **Handle the new outcomes** at `native_freebsd.rs:940` (replace the `other =>
+   Step::Fault`): `CloneThread → spawn_clone_thread`; `FutexWait`/`FutexWaitv →
+   futex.wait_prepared_for_thread`; `ThreadExit →` registry `exit` + clear-tid
+   futex wake (port `finalize_native_thread_exit`, `native_darwin.rs:1903`);
+   `exit_group` from any thread stops all.
+7. **`RUN_LOCK` stays at *run* granularity** (arenas + fault shim are still set up
+   once per run) — do **not** hold it per guest thread. Verify with a CloneThread
+   probe that two guest threads run concurrently.
+
 **Done when:** the CloneThread + futex probes pass and the 4 integration tests +
-prior OK probes still pass with `RUN_LOCK` removed (run the full census, not just
-`--test-threads=1`).
+prior OK probes still pass (run the full census, not just `--test-threads=1`).
 
 ---
 
