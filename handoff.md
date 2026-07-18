@@ -380,6 +380,45 @@ Self-modifying code: guest text is treated read-only (no SMC handling); a real
 guest that rewrites code would need page-generation invalidation of the cache +
 edges (aarch64 lane has the mechanism to mirror).
 
+### Conformance-probe census + rung-2 servicing (2026-07-17)
+
+Goal: run ALL 432 x86_64 musl conformance probes under `--exec-backend native`.
+Method: `native_run <elf>` (the example) per probe; census script buckets by
+outcome. Baseline was **202/432 OK (47%)**. Landed this session:
+- **Blocking-I/O** (reuse): the driver now drives each syscall through the
+  shared `runtime::service_syscall<M>` (WaitOnFds/Poll/Select/Sleep/
+  BlockingWrite/WaitOnSignals/WaitOnProcExit) — +~14 probes.
+- **fork()** (`service_fork`): identity-model guest fork = host `fork()` (COW
+  address space; real host child → wait4 reaps via host waitpid; dispatcher
+  detects the child by `getpid()!=bootstrap_host_pid`). A fork child `_exit`s
+  directly (`Step::BecameForkChild`). Unlocked the 101-probe Fork bucket's
+  fork+wait cases (cloneexitsig/cloneexithandled/clone3exithandled exit 0).
+- **MapHostAlias** (`service_map_host_alias`): file mmap = `mmap(MAP_FIXED|
+  MAP_SHARED)` at the guest VA (== host VA) over the reserved arena; +some.
+Result: ~56%+ OK on a representative sample (census plumbing struggles to
+finish because fork-heavy probes orphan children — use `timeout -s KILL` +
+per-probe cleanup; some like forkbomb need reaping).
+
+**Remaining buckets (prioritized for the next rungs):**
+- **CloneThread (~22)** — pthread_create. A guest thread = a host thread
+  SHARING the address space; needs: a shared thread-runtime (Arc ThreadRegistry
+  + FutexTable + reporter), thread-safe or per-thread JIT (the block cache +
+  cursor currently assume one thread), dispatch_threaded (not the single-thread
+  `dispatch`) for thread-aware syscalls, and REMOVING the process-global
+  RUN_LOCK (it serializes in-process runs — incompatible with concurrent
+  guest threads). Biggest remaining chunk.
+- **FutexWait / SharedFutex (~few + many mmap probes)** — needs the shared
+  FutexTable + dispatch_threaded; unlocks the futex* probes (which also use
+  MapHostAlias, now done).
+- **UNSUPP_INSN / hlt (~21)** — `bridge_*`/`perf_*` probes reach a `hlt` (0xf4)
+  trap guard; a control-flow/servicing bug lets the guest reach a noreturn's
+  fallthrough. Needs the loud emit breadcrumb + recent_blocks to trace.
+- **FAULT signal 11 (~25)** — diverse: unserviced clone/execve → guest
+  null-deref; the protection "NOT-GATED" tests (identity memory doesn't enforce
+  guest PROT_NONE/RO on the guest's OWN accesses); the fork stress probes.
+- **Execve (~5)** — replace the image in-process (analog of native_darwin's
+  exec capsule) + re-enter the run loop.
+
 ### Census evidence (real musl already translates)
 
 A throwaway harness ran a real prebuilt static-pie **musl** probe
