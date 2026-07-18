@@ -37,6 +37,7 @@ use carrick_dsr_x86::{
 };
 use carrick_guest_mem::{GuestMemory, X8664SyscallFrame};
 use carrick_hal::x8664_arch::{SyscallNorm, X8664GuestArch};
+use carrick_hal::{GuestArch, Reg, RegAccess};
 use carrick_native_freebsd::{FreebsdHostJit, fault};
 use goblin::elf::Elf;
 use goblin::elf::program_header::PT_LOAD;
@@ -178,6 +179,190 @@ impl GuestMemory for IdentityGuestMemory {
         }
         Ok(())
     }
+}
+
+/// A `RegAccess + GuestMemory` view over a live `X86UcontextSnapshot`, so the
+/// shared, byte-exact x86-64 `rt_sigframe` builder/restorer
+/// ([`X8664GuestArch::build_sigframe`] / [`restore_sigframe`]) drives THIS
+/// lane's snapshot directly. Register reads/writes hit the snapshot fields;
+/// memory reads/writes are identity (guest VA == host VA). FP save/restore is
+/// disabled for now (`fpsimd_enabled = false`), so the vector getters are never
+/// called.
+struct SigframeEngine<'a> {
+    snap: &'a mut X86UcontextSnapshot,
+}
+
+impl RegAccess for SigframeEngine<'_> {
+    fn get_reg(&self, r: Reg) -> Result<u64, carrick_hal::OsError> {
+        Ok(match r {
+            Reg::Rax => self.snap.gpr[reg::RAX],
+            Reg::Rbx => self.snap.gpr[reg::RBX],
+            Reg::Rcx => self.snap.gpr[reg::RCX],
+            Reg::Rdx => self.snap.gpr[reg::RDX],
+            Reg::Rsi => self.snap.gpr[reg::RSI],
+            Reg::Rdi => self.snap.gpr[reg::RDI],
+            Reg::Rbp => self.snap.gpr[reg::RBP],
+            Reg::Rsp => self.snap.gpr[reg::RSP],
+            Reg::R8 => self.snap.gpr[reg::R8],
+            Reg::R9 => self.snap.gpr[reg::R9],
+            Reg::R10 => self.snap.gpr[reg::R10],
+            Reg::R11 => self.snap.gpr[reg::R11],
+            Reg::R12 => self.snap.gpr[reg::R12],
+            Reg::R13 => self.snap.gpr[reg::R13],
+            Reg::R14 => self.snap.gpr[reg::R14],
+            Reg::R15 => self.snap.gpr[reg::R15],
+            Reg::Rip => self.snap.rip,
+            Reg::Rflags => self.snap.rflags,
+            // aarch64 register views are never used on this lane.
+            _ => 0,
+        })
+    }
+
+    fn set_reg(&mut self, r: Reg, v: u64) -> Result<(), carrick_hal::OsError> {
+        match r {
+            Reg::Rax => self.snap.gpr[reg::RAX] = v,
+            Reg::Rbx => self.snap.gpr[reg::RBX] = v,
+            Reg::Rcx => self.snap.gpr[reg::RCX] = v,
+            Reg::Rdx => self.snap.gpr[reg::RDX] = v,
+            Reg::Rsi => self.snap.gpr[reg::RSI] = v,
+            Reg::Rdi => self.snap.gpr[reg::RDI] = v,
+            Reg::Rbp => self.snap.gpr[reg::RBP] = v,
+            Reg::Rsp => self.snap.gpr[reg::RSP] = v,
+            Reg::R8 => self.snap.gpr[reg::R8] = v,
+            Reg::R9 => self.snap.gpr[reg::R9] = v,
+            Reg::R10 => self.snap.gpr[reg::R10] = v,
+            Reg::R11 => self.snap.gpr[reg::R11] = v,
+            Reg::R12 => self.snap.gpr[reg::R12] = v,
+            Reg::R13 => self.snap.gpr[reg::R13] = v,
+            Reg::R14 => self.snap.gpr[reg::R14] = v,
+            Reg::R15 => self.snap.gpr[reg::R15] = v,
+            Reg::Rip => self.snap.rip = v,
+            Reg::Rflags => self.snap.rflags = v,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn get_sys_reg(&self, _r: carrick_hal::SysReg) -> Result<u64, carrick_hal::OsError> {
+        Ok(0)
+    }
+    fn set_sys_reg(&mut self, _r: carrick_hal::SysReg, _v: u64) -> Result<(), carrick_hal::OsError> {
+        Ok(())
+    }
+    fn get_vreg(&self, _n: u32) -> Result<u128, carrick_hal::OsError> {
+        Ok(0)
+    }
+    fn set_vreg(&mut self, _n: u32, _v: u128) -> Result<(), carrick_hal::OsError> {
+        Ok(())
+    }
+    fn get_fpcr(&self) -> Result<u64, carrick_hal::OsError> {
+        Ok(0)
+    }
+    fn set_fpcr(&mut self, _v: u64) -> Result<(), carrick_hal::OsError> {
+        Ok(())
+    }
+    fn get_fpsr(&self) -> Result<u64, carrick_hal::OsError> {
+        Ok(0)
+    }
+    fn set_fpsr(&mut self, _v: u64) -> Result<(), carrick_hal::OsError> {
+        Ok(())
+    }
+}
+
+impl GuestMemory for SigframeEngine<'_> {
+    fn read_bytes_raw(
+        &self,
+        address: u64,
+        length: usize,
+    ) -> Result<Vec<u8>, carrick_guest_mem::MemoryError> {
+        IdentityGuestMemory.read_bytes_raw(address, length)
+    }
+
+    fn write_bytes_raw(
+        &mut self,
+        address: u64,
+        bytes: &[u8],
+    ) -> Result<(), carrick_guest_mem::MemoryError> {
+        IdentityGuestMemory.write_bytes_raw(address, bytes)
+    }
+}
+
+/// Deliver `signum` (a LINUX signal number) into the guest's registered
+/// handler by building the x86-64 `rt_sigframe` on the guest stack and
+/// redirecting `snapshot` to the handler (SA_SIGINFO ABI: rdi=signum,
+/// rsi=&siginfo, rdx=&ucontext). Returns `Ok(true)` when a handler ran,
+/// `Ok(false)` when the guest installed no handler (caller applies the
+/// default action), or `Err(())` when the frame could not be written to the
+/// guest stack (Linux force_sigsegv — caller dies by SIGSEGV).
+#[allow(clippy::too_many_arguments)]
+fn deliver_x86_signal(
+    shared: &Arc<SharedRun>,
+    tid: crate::thread::ThreadId,
+    snapshot: &mut X86UcontextSnapshot,
+    signum: i32,
+    fault_siginfo: Option<(i32, u64)>,
+    queued_siginfo: Option<carrick_abi::LinuxSiginfo>,
+    pending_syscall_retval: Option<i64>,
+    interrupted_pc: Option<u64>,
+    orig_rax: u64,
+    restart_syscall: bool,
+) -> Result<bool, ()> {
+    let dispatcher = &shared.dispatcher;
+    let Some(action) = dispatcher.registered_signal_handler(signum) else {
+        return Ok(false);
+    };
+    let altstack = if action.sa_flags & crate::linux_abi::LINUX_SA_ONSTACK != 0 {
+        dispatcher.signal_altstack(tid)
+    } else {
+        None
+    };
+    let sa_restorer = if action.sa_flags & crate::linux_abi::LINUX_SA_RESTORER != 0 {
+        action.sa_restorer
+    } else {
+        0
+    };
+    // Blocks the signal (+ sa_mask) for the handler and applies SA_RESETHAND,
+    // returning the pre-handler mask to embed in the frame (restored by
+    // rt_sigreturn).
+    let saved_sigmask = dispatcher.enter_signal_handler(tid, signum, action).raw();
+    let rflags = snapshot.rflags;
+    let params = carrick_hal::sigframe::InjectParams {
+        signum,
+        handler: action.sa_handler,
+        sa_restorer,
+        pending_syscall_retval,
+        interrupted_pc,
+        altstack,
+        saved_sigmask,
+        fault_siginfo,
+        queued_siginfo,
+        restart_syscall,
+        pstate_source: rflags,
+        orig_x0: orig_rax,
+        fault_esr: 0,
+        fpsimd_enabled: false,
+        sigreturn_trampoline_base: 0,
+    };
+    let mut engine = SigframeEngine { snap: snapshot };
+    match X8664GuestArch::build_sigframe(&mut engine, params) {
+        Ok(_) => Ok(true),
+        Err(_) => Err(()),
+    }
+}
+
+/// Restore guest state from the x86-64 `rt_sigframe` at the guest stack on
+/// `rt_sigreturn(2)`, restore the saved signal mask, and return the resume RIP.
+fn restore_x86_sigreturn(
+    shared: &Arc<SharedRun>,
+    tid: crate::thread::ThreadId,
+    snapshot: &mut X86UcontextSnapshot,
+) -> Result<u64, ()> {
+    let mut engine = SigframeEngine { snap: snapshot };
+    let restore = X8664GuestArch::restore_sigframe(&mut engine, false).map_err(|_| ())?;
+    shared
+        .dispatcher
+        .restore_signal_mask(tid, carrick_abi::SigSet::from_raw(restore.sigmask));
+    Ok(snapshot.rip)
 }
 
 /// A loaded static-pie ELF in the host address space (guest VA == host VA).
@@ -1204,11 +1389,45 @@ fn run_x86_thread(
         // dispatch on the exit STATUS + snapshot.rip, not the entered block.
         match X86ExitStatus::from_raw(raw) {
             Some(X86ExitStatus::Signal) => {
-                fault_detail = Some(format!(
-                    "guest fault: signal {} at guest addr 0x{:x} (host_rip 0x{:x})",
-                    ctx.fault.signal, ctx.fault.addr, ctx.fault.host_rip
-                ));
-                break;
+                // A synchronous guest fault (SIGSEGV/SIGBUS/SIGFPE/SIGILL). The
+                // shim recorded the HOST signal + si_code + faulting DATA
+                // address; translate the signal to Linux and, if the guest
+                // installed a handler, deliver it (build the x86-64 rt_sigframe
+                // and enter the handler). `snapshot.rip` holds the block's
+                // exit_resume (the gateway does not capture the exact faulting
+                // instruction), which is the resume point a returning handler
+                // would land on — fine for the common exit/longjmp handlers.
+                let linux_sig = crate::host_signal::host_to_linux_signum(ctx.fault.signal);
+                let fault_pc = snapshot.rip;
+                let fault_info = Some((ctx.fault.code, ctx.fault.addr));
+                match deliver_x86_signal(
+                    &active,
+                    tid,
+                    &mut snapshot,
+                    linux_sig,
+                    fault_info,
+                    None,
+                    None,
+                    Some(fault_pc),
+                    0,
+                    false,
+                ) {
+                    Ok(true) => next = snapshot.rip,
+                    // No handler: die by the signal (WIFSIGNALED), draining
+                    // buffered output first.
+                    Ok(false) => crate::exec_helpers::forked_child_die_by_signal(
+                        linux_sig,
+                        active.dispatcher.stdout(),
+                        active.dispatcher.stderr(),
+                    ),
+                    // The frame could not be written to the guest stack
+                    // (force_sigsegv): die by SIGSEGV.
+                    Err(()) => crate::exec_helpers::forked_child_die_by_signal(
+                        crate::linux_abi::LINUX_SIGSEGV,
+                        active.dispatcher.stdout(),
+                        active.dispatcher.stderr(),
+                    ),
+                }
             }
             Some(X86ExitStatus::Syscall) => {
                 traps += 1;
@@ -1525,6 +1744,17 @@ fn service_syscall(
                 Step::ThreadEnd
             }
         }
+        // `rt_sigreturn(2)`: pop the x86-64 rt_sigframe the handler is returning
+        // through, restore the pre-signal register state + signal mask, and
+        // resume at the saved RIP (NOT advanced past the syscall).
+        DispatchOutcome::SigReturn => match restore_x86_sigreturn(shared, tid, snapshot) {
+            Ok(rip) => Step::Continue(rip),
+            Err(()) => crate::exec_helpers::forked_child_die_by_signal(
+                crate::linux_abi::LINUX_SIGSEGV,
+                dispatcher.stdout(),
+                dispatcher.stderr(),
+            ),
+        },
         other => Step::Fault(format!(
             "native x86 driver does not service dispatch outcome {other:?} yet \
              (execve/vfork are later rungs)"
