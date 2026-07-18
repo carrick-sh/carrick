@@ -75,9 +75,11 @@ fn main() {
             r == -1 && errno() == libc::E2BIG
         );
 
-        // bad dirfd → EBADF.
+        // A bad dirfd is only consulted for a relative path; absolute paths
+        // intentionally ignore it on Linux.
+        let bad_dfd_path = CString::new("oa2_bad_dfd").unwrap();
         let how = [o_rdwr | o_creat, 0o644, 0];
-        let r = openat2(-1, p.as_ptr(), &how, SIZEOF_HOW);
+        let r = openat2(-1, bad_dfd_path.as_ptr(), &how, SIZEOF_HOW);
         println!(
             "openat2_bad_dfd_ebadf={}",
             r == -1 && errno() == libc::EBADF

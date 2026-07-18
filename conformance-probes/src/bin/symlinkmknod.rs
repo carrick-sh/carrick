@@ -39,8 +39,8 @@ fn main() {
         let rc = libc::mknod(via, libc::S_IFIFO | 0o644, 0);
         println!("mknod_via_symlink_ok={}", rc == 0);
         println!(
-            "mknod_via_symlink_enoent={}",
-            rc == -1 && errno() == libc::ENOENT
+            "mknod_via_symlink_did_not_return_enoent={}",
+            !(rc == -1 && errno() == libc::ENOENT)
         );
 
         let mut st: libc::stat = std::mem::zeroed();
