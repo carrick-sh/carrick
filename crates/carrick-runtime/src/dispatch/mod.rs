@@ -6618,7 +6618,7 @@ mod routing_tests {
     use crate::linux_abi::{
         CARRICK_PRIVATE_X86_ALARM, CARRICK_PRIVATE_X86_DUP2, CARRICK_PRIVATE_X86_FSTAT,
         CARRICK_PRIVATE_X86_LSTAT, CARRICK_PRIVATE_X86_NEWFSTATAT, CARRICK_PRIVATE_X86_POLL,
-        CARRICK_PRIVATE_X86_SELECT, CARRICK_PRIVATE_X86_STAT,
+        CARRICK_PRIVATE_X86_SELECT, CARRICK_PRIVATE_X86_STAT, CARRICK_PRIVATE_X86_TIME,
     };
 
     /// Every syscall number routed by the dispatcher, enumerated from the full
@@ -6829,6 +6829,7 @@ mod routing_tests {
         114,
         115,
         CARRICK_PRIVATE_X86_ALARM,
+        CARRICK_PRIVATE_X86_TIME,
         153,
         163,
         165,
@@ -6893,7 +6894,7 @@ mod routing_tests {
         // expanded), which exceeds the original table's 235 arms.
         assert_eq!(
             ROUTED_NUMBERS.len(),
-            242,
+            243,
             "ROUTED_NUMBERS lost entries — the characterization set must stay complete"
         );
     }

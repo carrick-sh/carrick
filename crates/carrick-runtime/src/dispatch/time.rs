@@ -74,6 +74,7 @@ syscall_table! {
     114 => clock_getres,
     115 => clock_nanosleep,
     carrick_abi::CARRICK_PRIVATE_X86_ALARM => x86_alarm,
+    carrick_abi::CARRICK_PRIVATE_X86_TIME => x86_time,
     153 => times,
     163 => getrlimit,
     165 => getrusage,
@@ -626,6 +627,19 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             Ok(adjtimex_bootstrap(memory, address.0))
+        }
+
+        fn x86_time(this, cx, result: GuestPtr) {
+            let seconds = i64::try_from(realtime_duration().as_secs()).unwrap_or(i64::MAX);
+            if result.0 != 0
+                && cx
+                    .memory
+                    .write_bytes(result.0, &seconds.to_ne_bytes())
+                    .is_err()
+            {
+                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+            }
+            Ok(DispatchOutcome::Returned { value: seconds })
         }
 
         fn gettimeofday(this, cx, timeval: GuestPtr, timezone: GuestPtr) {

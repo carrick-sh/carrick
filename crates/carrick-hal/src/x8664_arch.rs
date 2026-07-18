@@ -717,6 +717,9 @@ const X86_NR_DUP2: u64 = 33;
 /// x86-64 `alarm(2)` (syscalls(2)). Desugars to a private dispatcher shim
 /// because asm-generic has no canonical alarm syscall.
 const X86_NR_ALARM: u64 = 37;
+/// x86-64 `time(2)` (syscalls(2)). Desugars to a private dispatcher shim
+/// because asm-generic has no canonical `time(time_t *)` syscall.
+const X86_NR_TIME: u64 = 201;
 /// x86-64 `access(2)` (syscalls(2)). Desugars to canonical `faccessat(2)` with
 /// `AT_FDCWD` and flags=0 because asm-generic only exposes `faccessat`.
 const X86_NR_ACCESS: u64 = 21;
@@ -1061,6 +1064,14 @@ impl X8664GuestArch {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
                 native_number: NativeNr(x86_number),
                 number: CanonicalNr(carrick_abi::CARRICK_PRIVATE_X86_ALARM),
+                args: [args[0], 0, 0, 0, 0, 0],
+            });
+        }
+        if x86_number == X86_NR_TIME {
+            return SyscallNorm::Plain(RawSyscall {
+                guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                native_number: NativeNr(x86_number),
+                number: CanonicalNr(carrick_abi::CARRICK_PRIVATE_X86_TIME),
                 args: [args[0], 0, 0, 0, 0, 0],
             });
         }
@@ -1500,6 +1511,17 @@ mod normalize_tests {
                 assert_eq!(rs.args, [5, 0, 0, 0, 0, 0]);
             }
             _ => panic!("alarm must be Plain"),
+        }
+    }
+
+    #[test]
+    fn time_normalizes_to_private_legacy_dispatch_number() {
+        match X8664GuestArch::normalize_syscall(&frame(201, [0x1234, 0xBAD, 0, 0, 0, 0])) {
+            SyscallNorm::Plain(rs) => {
+                assert_eq!(rs.number.raw(), carrick_abi::CARRICK_PRIVATE_X86_TIME);
+                assert_eq!(rs.args, [0x1234, 0, 0, 0, 0, 0]);
+            }
+            _ => panic!("time must be Plain"),
         }
     }
 

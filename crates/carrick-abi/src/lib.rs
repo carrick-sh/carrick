@@ -2678,6 +2678,7 @@ enum PrivateX86Ordinal {
     Select,
     EpollCreate,
     Alarm,
+    Time,
 }
 
 /// The private numbers grow DOWN from `u64::MAX - 0x20`, far outside any real
@@ -2775,13 +2776,20 @@ pub const CARRICK_PRIVATE_X86_EPOLL_CREATE: u64 =
 /// no canonical `alarm` entry. Route it privately so glibc/CPython can use the
 /// same interval-timer state and SIGALRM delivery path as `setitimer`.
 pub const CARRICK_PRIVATE_X86_ALARM: u64 = private_x86_number(PrivateX86Ordinal::Alarm);
+/// Carrick-internal normalized syscall number for x86_64 `time(2)`.
+///
+/// x86_64 exposes legacy `time(time_t *)` as syscall 201, while asm-generic
+/// implements libc `time()` through newer clock syscalls and has no canonical
+/// entry. The private handler returns realtime seconds and optionally writes
+/// the same 64-bit `time_t` through the guest pointer.
+pub const CARRICK_PRIVATE_X86_TIME: u64 = private_x86_number(PrivateX86Ordinal::Time);
 
 // Every CARRICK_PRIVATE_X86_* number must be UNIQUE: a collision silently
 // routes one syscall through another's handler (alarm(2) briefly shared
 // 0x2a with epoll_create, so guest alarm() returned fresh epoll FDS — LTP
 // alarm02's "invalid retval 4/5/6"). Compile-time, like the SIG* table.
 const _: () = {
-    const PRIVATE_X86: [u64; 12] = [
+    const PRIVATE_X86: [u64; 13] = [
         CARRICK_PRIVATE_X86_DUP2,
         CARRICK_PRIVATE_X86_STAT,
         CARRICK_PRIVATE_X86_FSTAT,
@@ -2794,6 +2802,7 @@ const _: () = {
         CARRICK_PRIVATE_X86_SELECT,
         CARRICK_PRIVATE_X86_EPOLL_CREATE,
         CARRICK_PRIVATE_X86_ALARM,
+        CARRICK_PRIVATE_X86_TIME,
     ];
     let mut i = 0;
     while i < PRIVATE_X86.len() {
