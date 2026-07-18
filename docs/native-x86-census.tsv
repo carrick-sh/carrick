@@ -161,7 +161,7 @@ OK	linkstat
 OK	linuxsysinfo
 OK	loopbacksubnet
 OK	ltpcheckpoint
-EXIT_FALSE	ltpcheckpointexec
+OK	ltpcheckpointexec
 OK	lutimesym
 OK	lxattr
 OK	mailboxregs

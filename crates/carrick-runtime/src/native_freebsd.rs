@@ -133,6 +133,87 @@ const NEG_EINVAL: i64 = -22;
 /// is a genuine EFAULT the handlers surface).
 struct IdentityGuestMemory;
 
+/// Resolve a mapped vnode page to a process-independent futex waiter key using
+/// FreeBSD's documented `kern.proc.vmmap` ABI. Linux keys a shared futex by its
+/// backing object and byte offset, not by the caller's VA; after exec the same
+/// checkpoint file is commonly remapped at a different address. `_umtx_op`
+/// already uses that backing identity for the physical wait/wake. Carrick needs
+/// the same identity for its fork-shared waiter-count side table so WAKE returns
+/// Linux's count rather than a false zero.
+fn freebsd_shared_waiter_key(address: usize) -> Option<usize> {
+    let pid = unsafe { libc::getpid() };
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_VMMAP, pid];
+    let mut needed = 0usize;
+    // SAFETY: first sysctl call requests the required buffer size only.
+    if unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as u32,
+            std::ptr::null_mut(),
+            &mut needed,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+        || needed < std::mem::size_of::<libc::kinfo_vmentry>()
+    {
+        return None;
+    }
+    let mut bytes = vec![0u8; needed];
+    // SAFETY: `bytes` owns `needed` writable bytes and this is a read-only MIB.
+    if unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as u32,
+            bytes.as_mut_ptr().cast(),
+            &mut needed,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+    {
+        return None;
+    }
+    let mut cursor = 0usize;
+    while cursor
+        .checked_add(std::mem::size_of::<libc::kinfo_vmentry>())
+        .is_some_and(|end| end <= needed)
+    {
+        // SAFETY: the bounds check above covers one complete ABI entry. Sysctl
+        // entries need not be naturally aligned inside the byte buffer.
+        let entry = unsafe {
+            std::ptr::read_unaligned(bytes.as_ptr().add(cursor).cast::<libc::kinfo_vmentry>())
+        };
+        let entry_size = usize::try_from(entry.kve_structsize).ok()?;
+        if entry_size == 0
+            || cursor
+                .checked_add(entry_size)
+                .is_none_or(|end| end > needed)
+        {
+            break;
+        }
+        let address = address as u64;
+        if entry.kve_start <= address && address < entry.kve_end && entry.kve_vn_fileid != 0 {
+            let backing_offset = entry
+                .kve_offset
+                .checked_add(address.saturating_sub(entry.kve_start))?;
+            // Stable 64-bit avalanche over vnode fsid/fileid + byte offset.
+            let mut key = entry.kve_vn_fsid
+                ^ entry.kve_vn_fileid.rotate_left(21)
+                ^ backing_offset.rotate_left(42)
+                ^ 0x9e37_79b9_7f4a_7c15;
+            key ^= key >> 30;
+            key = key.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            key ^= key >> 27;
+            key = key.wrapping_mul(0x94d0_49bb_1331_11eb);
+            key ^= key >> 31;
+            return Some((key as usize) | 1);
+        }
+        cursor += entry_size;
+    }
+    None
+}
+
 /// Linux x86-64 userspace occupies the low canonical half. Reject a raw range
 /// before turning it into a host pointer if it crosses that boundary, wraps, or
 /// exceeds Rust's slice size limit. This is a syscall-memory boundary: malformed
@@ -154,7 +235,8 @@ fn identity_raw_range_valid(address: u64, length: usize) -> bool {
 
 #[cfg(test)]
 mod identity_raw_range_tests {
-    use super::identity_raw_range_valid;
+    use super::{freebsd_shared_waiter_key, identity_raw_range_valid};
+    use std::os::fd::AsRawFd;
 
     #[test]
     fn accepts_low_canonical_guest_ranges() {
@@ -175,6 +257,40 @@ mod identity_raw_range_tests {
     fn zero_length_access_never_forms_a_pointer() {
         assert!(identity_raw_range_valid(0, 0));
         assert!(identity_raw_range_valid(u64::MAX, 0));
+    }
+
+    #[test]
+    fn shared_waiter_key_follows_vnode_offset_not_mapping_address() {
+        const LEN: usize = 8192;
+        let file = tempfile::tempfile().expect("temporary backing file");
+        file.set_len(LEN as u64).expect("size backing file");
+        let map = || unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                LEN,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        let first = map();
+        let second = map();
+        assert_ne!(first, libc::MAP_FAILED);
+        assert_ne!(second, libc::MAP_FAILED);
+        assert_ne!(first, second);
+
+        let first_key = freebsd_shared_waiter_key(first as usize).expect("first vnode key");
+        let alias_key = freebsd_shared_waiter_key(second as usize).expect("alias vnode key");
+        let next_page_key =
+            freebsd_shared_waiter_key(first as usize + 4096).expect("second-page vnode key");
+        assert_eq!(first_key, alias_key);
+        assert_ne!(first_key, next_page_key);
+
+        unsafe {
+            libc::munmap(first, LEN);
+            libc::munmap(second, LEN);
+        }
     }
 }
 
@@ -476,9 +592,10 @@ impl GuestMemory for IdentityGuestMemory {
         &self,
         guest_addr: u64,
     ) -> Option<carrick_guest_mem::SharedFutexLocation> {
+        let host_addr = guest_addr as usize;
         Some(carrick_guest_mem::SharedFutexLocation::Direct {
-            word: carrick_guest_mem::HostVa(guest_addr as usize),
-            waiter_key: guest_addr as usize,
+            word: carrick_guest_mem::HostVa(host_addr),
+            waiter_key: freebsd_shared_waiter_key(host_addr).unwrap_or(host_addr),
         })
     }
 }
@@ -2893,7 +3010,12 @@ fn service_syscall(
             // helpers (e.g. `threadstatstate`, which passes FUTEX_PRIVATE_FLAG=0
             // and so lands here) poll for state `S`.
             crate::thread::set_current_thread_state(tid, 'S');
-            let retval = shared_futex_wait_umtx(location.wait_addr().raw(), value, timeout);
+            let retval = shared_futex_wait_umtx(
+                location.wait_addr().raw(),
+                location.waiter_key(),
+                value,
+                timeout,
+            );
             crate::thread::set_current_thread_state(tid, 'R');
             snapshot.gpr[reg::RAX] = retval as u64;
             if let Some(sig) = run_pending_signals(
@@ -2918,7 +3040,12 @@ fn service_syscall(
             ..
         } => {
             crate::thread::set_current_thread_state(tid, 'S');
-            let retval = shared_futex_wait_umtx(location.wait_addr().raw(), value, timeout);
+            let retval = shared_futex_wait_umtx(
+                location.wait_addr().raw(),
+                location.waiter_key(),
+                value,
+                timeout,
+            );
             crate::thread::set_current_thread_state(tid, 'R');
             let retval = if retval == 0 { index } else { retval };
             snapshot.gpr[reg::RAX] = retval as u64;
@@ -2939,7 +3066,8 @@ fn service_syscall(
         DispatchOutcome::SharedFutexWake {
             location, count, ..
         } => {
-            let retval = shared_futex_wake_umtx(location.wait_addr().raw(), count);
+            let retval =
+                shared_futex_wake_umtx(location.wait_addr().raw(), location.waiter_key(), count);
             snapshot.gpr[reg::RAX] = retval as u64;
             if let Some(sig) = run_pending_signals(
                 shared,
@@ -2965,8 +3093,8 @@ fn service_syscall(
             requeue,
             ..
         } => {
-            let woken = shared_futex_wake_umtx(from.wait_addr().raw(), wake);
-            let moved = shared_futex_wake_umtx(to.wait_addr().raw(), requeue);
+            let woken = shared_futex_wake_umtx(from.wait_addr().raw(), from.waiter_key(), wake);
+            let moved = shared_futex_wake_umtx(to.wait_addr().raw(), to.waiter_key(), requeue);
             snapshot.gpr[reg::RAX] = (woken + moved) as u64;
             if let Some(sig) = run_pending_signals(
                 shared,
@@ -3093,7 +3221,9 @@ fn service_syscall(
 // count is >= N) and `futexsharedalias` (asserts a single wake returns exactly 1).
 #[repr(C)]
 struct WaiterSlot {
-    /// Host VA of the 4-byte futex word this slot counts, or 0 when free.
+    /// Stable shared-backing waiter key for this slot, or 0 when free. Unlike
+    /// the host VA, this remains identical when the same file offset is mapped
+    /// at a different address after exec.
     key: std::sync::atomic::AtomicU64,
     /// Live parked-waiter count on `key`.
     count: std::sync::atomic::AtomicU32,
@@ -3142,9 +3272,10 @@ fn init_shared_waiter_table() {
     }
 }
 
-/// The `WaiterSlot` for host-VA `word`, claiming a free slot on first use
-/// (open-addressed, linear probe). `None` if the table is unmapped or full.
-fn shared_waiter_slot(word: usize) -> Option<&'static WaiterSlot> {
+/// The `WaiterSlot` for a stable shared-backing `waiter_key`, claiming a free
+/// slot on first use (open-addressed, linear probe). `None` if the table is
+/// unmapped or full.
+fn shared_waiter_slot(waiter_key: usize) -> Option<&'static WaiterSlot> {
     use std::sync::atomic::Ordering;
     let base = SHARED_WAITER_TABLE.load(Ordering::Acquire);
     if base.is_null() {
@@ -3152,8 +3283,8 @@ fn shared_waiter_slot(word: usize) -> Option<&'static WaiterSlot> {
     }
     // SAFETY: `base` is a live mapping of exactly WAITER_SLOTS entries.
     let table = unsafe { std::slice::from_raw_parts(base, WAITER_SLOTS) };
-    let key = word as u64;
-    let mut idx = (word >> 2) % WAITER_SLOTS;
+    let key = waiter_key as u64;
+    let mut idx = (waiter_key >> 2) % WAITER_SLOTS;
     for _ in 0..WAITER_SLOTS {
         let slot = &table[idx];
         let cur = slot.key.load(Ordering::Acquire);
@@ -3194,7 +3325,12 @@ const UMTX_TIMESPEC_SIZE: usize = std::mem::size_of::<libc::timespec>();
 /// wakes it, the relative `timeout` elapses, or a signal interrupts. Returns the
 /// Linux `FUTEX_WAIT` retval: 0 (woken), `-EAGAIN` (value mismatch), `-ETIMEDOUT`,
 /// or `-EINTR`.
-fn shared_futex_wait_umtx(word: usize, value: u32, timeout: Option<std::time::Duration>) -> i64 {
+fn shared_futex_wait_umtx(
+    word: usize,
+    waiter_key: usize,
+    value: u32,
+    timeout: Option<std::time::Duration>,
+) -> i64 {
     let ts = timeout.map(|d| libc::timespec {
         tv_sec: d.as_secs() as libc::time_t,
         tv_nsec: d.subsec_nanos() as libc::c_long,
@@ -3206,11 +3342,12 @@ fn shared_futex_wait_umtx(word: usize, value: u32, timeout: Option<std::time::Du
         ),
         None => (std::ptr::null_mut(), std::ptr::null_mut()),
     };
-    // Announce this parked waiter in the fork-shared count table so a peer's
-    // WAKE can report how many it woke (Linux FUTEX_WAKE semantics). Incremented
+    // Announce this parked waiter under its stable backing key so a peer's WAKE
+    // can report how many it woke even when it mapped the same file at another
+    // VA after exec (Linux FUTEX_WAKE semantics). Incremented
     // BEFORE the park and decremented AFTER it returns, for every exit path.
     use std::sync::atomic::Ordering;
-    let slot = shared_waiter_slot(word);
+    let slot = shared_waiter_slot(waiter_key);
     if let Some(s) = slot {
         s.count.fetch_add(1, Ordering::SeqCst);
     }
@@ -3250,14 +3387,15 @@ fn shared_futex_wait_umtx(word: usize, value: u32, timeout: Option<std::time::Du
 /// return how many were woken — the Linux `FUTEX_WAKE` retval. FreeBSD's native
 /// `_umtx_op(UMTX_OP_WAKE)` returns 0 rather than the count (unlike its own
 /// linuxulator futex), so we read the fork-shared waiter-count table
-/// [`shared_waiter_slot`] BEFORE the wake and return `min(count, parked)` — the
+/// [`shared_waiter_slot`] under the stable shared-backing key BEFORE the wake
+/// and return `min(count, parked)` — the
 /// same number `umtxq_signal_mask` would have reported. Zero parked yields 0,
 /// matching Linux on a page nothing is parked on (`futexghost`).
-fn shared_futex_wake_umtx(word: usize, count: u32) -> i64 {
+fn shared_futex_wake_umtx(word: usize, waiter_key: usize, count: u32) -> i64 {
     use std::sync::atomic::Ordering;
     // Snapshot the parked count BEFORE waking: the woken waiters race to
     // decrement as they leave the kernel, so a post-wake read would undercount.
-    let parked = shared_waiter_slot(word)
+    let parked = shared_waiter_slot(waiter_key)
         .map(|s| s.count.load(Ordering::SeqCst))
         .unwrap_or(0);
     // SAFETY: as in `shared_futex_wait_umtx`; WAKE neither reads nor writes the word.
