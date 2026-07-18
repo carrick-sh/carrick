@@ -16,10 +16,6 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-const SYS_GETTID: libc::c_long = 178;
-const SYS_SCHED_SETAFFINITY: libc::c_long = 122;
-const SYS_SCHED_GETAFFINITY: libc::c_long = 123;
-
 fn main() {
     let tid = Arc::new(AtomicI32::new(0));
     let stop = Arc::new(AtomicBool::new(false));
@@ -27,7 +23,7 @@ fn main() {
     let stop_w = Arc::clone(&stop);
     let worker = thread::spawn(move || {
         tid_w.store(
-            unsafe { libc::syscall(SYS_GETTID) as i32 },
+            unsafe { libc::syscall(libc::SYS_gettid) as i32 },
             Ordering::Release,
         );
         while !stop_w.load(Ordering::Acquire) {
@@ -45,7 +41,7 @@ fn main() {
         // cpu_set_t is 128 bytes (glibc CPU_SETSIZE=1024).
         let mut mask = [0u8; 128];
         let getr = libc::syscall(
-            SYS_SCHED_GETAFFINITY,
+            libc::SYS_sched_getaffinity,
             t as libc::c_long,
             128 as libc::c_long,
             mask.as_mut_ptr() as libc::c_long,
@@ -56,7 +52,7 @@ fn main() {
             0
         };
         let setr = libc::syscall(
-            SYS_SCHED_SETAFFINITY,
+            libc::SYS_sched_setaffinity,
             t as libc::c_long,
             128 as libc::c_long,
             mask.as_ptr() as libc::c_long,

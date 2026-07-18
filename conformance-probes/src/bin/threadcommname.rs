@@ -19,7 +19,6 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-const SYS_GETTID: libc::c_long = 178;
 const PR_SET_NAME: libc::c_int = 15;
 
 fn set_name(name: &str) {
@@ -51,7 +50,7 @@ fn main() {
     let worker = thread::spawn(move || {
         set_name("worker-thread");
         wtid_w.store(
-            unsafe { libc::syscall(SYS_GETTID) as i32 },
+            unsafe { libc::syscall(libc::SYS_gettid) as i32 },
             Ordering::Release,
         );
         while !stop_w.load(Ordering::Acquire) {
@@ -69,7 +68,7 @@ fn main() {
     // Capture the main tid only now that the process is multi-threaded: a
     // PID-namespaced single-threaded gettid() reports the ns-pid (tgid), which
     // differs from the per-thread id the registry / pthread_getname_np use.
-    let main_tid = unsafe { libc::syscall(SYS_GETTID) as i32 };
+    let main_tid = unsafe { libc::syscall(libc::SYS_gettid) as i32 };
     let worker_comm = read_comm(wt);
     let main_comm = read_comm(main_tid);
     // Do NOT print the raw tids — main_tid/wt are non-deterministic (carrick

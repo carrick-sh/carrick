@@ -6,12 +6,6 @@
 
 use conformance_probes::{errno, report};
 
-const SYS_IO_SETUP: libc::c_long = 0;
-const SYS_IO_DESTROY: libc::c_long = 1;
-const SYS_IO_SUBMIT: libc::c_long = 2;
-const SYS_IO_CANCEL: libc::c_long = 3;
-const SYS_IO_GETEVENTS: libc::c_long = 4;
-
 const IOCB_CMD_PREAD: u16 = 0;
 const IOCB_CMD_PWRITE: u16 = 1;
 
@@ -33,23 +27,32 @@ struct Iocb {
 }
 
 unsafe fn io_setup(nr: u64, ctx: *mut u64) -> libc::c_long {
-    unsafe { libc::syscall(SYS_IO_SETUP, nr, ctx) }
+    unsafe { libc::syscall(libc::SYS_io_setup, nr, ctx) }
 }
 
 unsafe fn io_destroy(ctx: u64) -> libc::c_long {
-    unsafe { libc::syscall(SYS_IO_DESTROY, ctx) }
+    unsafe { libc::syscall(libc::SYS_io_destroy, ctx) }
 }
 
 unsafe fn io_submit(ctx: u64, nr: i64, iocbpp: *mut *mut Iocb) -> libc::c_long {
-    unsafe { libc::syscall(SYS_IO_SUBMIT, ctx, nr, iocbpp) }
+    unsafe { libc::syscall(libc::SYS_io_submit, ctx, nr, iocbpp) }
 }
 
 unsafe fn io_cancel(ctx: u64, iocb: *mut Iocb, event: *mut u8) -> libc::c_long {
-    unsafe { libc::syscall(SYS_IO_CANCEL, ctx, iocb, event) }
+    unsafe { libc::syscall(libc::SYS_io_cancel, ctx, iocb, event) }
 }
 
 unsafe fn io_getevents(ctx: u64) -> libc::c_long {
-    unsafe { libc::syscall(SYS_IO_GETEVENTS, ctx, 0, 0, core::ptr::null_mut::<u8>(), 0usize) }
+    unsafe {
+        libc::syscall(
+            libc::SYS_io_getevents,
+            ctx,
+            0,
+            0,
+            core::ptr::null_mut::<u8>(),
+            0usize,
+        )
+    }
 }
 
 fn syscall_errno(rc: libc::c_long) -> i32 {
