@@ -538,6 +538,11 @@ fn child_is_terminally_waitable(pid: u32) -> bool {
 /// Read a `struct sched_param { int sched_priority; }` out of guest memory
 /// at `address` (or EFAULT on a bad pointer). The struct's only field is the
 /// priority on Linux (sched_setattr is a separate richer entry point).
+/// First non-canonical x86_64 user virtual address: user space occupies the low
+/// canonical half `[0, 0x0000_8000_0000_0000)`. A guest pointer at or above this
+/// is non-canonical and can never be a valid mapping.
+const NONCANONICAL_USER_VA: u64 = 0x0000_8000_0000_0000;
+
 fn sched_read_param_priority<M: GuestMemory>(
     cx: &mut SyscallCtx<M>,
     address: GuestPtr,
@@ -546,6 +551,16 @@ fn sched_read_param_priority<M: GuestMemory>(
         // NULL param: kept as the legacy "-1" sentinel so the time-sharing
         // policies' prio!=0 check yields EINVAL (unchanged behavior).
         return Ok(-1);
+    }
+    // A non-canonical user pointer (>= the x86_64 low-half canonical ceiling) can
+    // never name a valid guest mapping — every guest VA lives in the low canonical
+    // half (identity: guest VA == host VA, and host user maps sit far below this
+    // ceiling). Reject it as EFAULT here: on the identity native lane a raw read of
+    // such an address (e.g. `sched_setscheduler(0, 0, usize::MAX)`, schedprio's
+    // bad-ptr case) would fault the HOST rather than return an error the handler
+    // can turn into EFAULT. (LINUX_NONCANONICAL_USER_VA == 0x0000_8000_0000_0000.)
+    if address.0 >= NONCANONICAL_USER_VA {
+        return Err(LINUX_EFAULT);
     }
     let memory = &*cx.memory;
     match memory.read_bytes(address.0, 4) {
