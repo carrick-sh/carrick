@@ -782,6 +782,46 @@ fn spawn_clone_thread(
     Ok(child_tid)
 }
 
+/// Build a fresh, PRIVATE `SharedRun` for a `fork()` child. The parent's code
+/// cache is a `SHM_ANON` `MAP_SHARED` dual-map, so it survives fork as the SAME
+/// physical pages — a child that re-JITs into it at its own cursor clobbers the
+/// parent's live code. Map a brand-new SHM_ANON cache (private to this child),
+/// register it with the fault shim (re-registration replaces the parent-
+/// inherited region in this child process), and give the child its own thread
+/// registry + futex table (fork copied only the calling thread, so the child's
+/// thread group is just itself). The dispatcher (its COW copy), reporter,
+/// image (COW-identical VAs), and max_traps carry over. Slice 0 is reserved for
+/// the child's main thread; guest threads it spawns take slices 1..N.
+fn fork_child_rebuild(parent: &Arc<SharedRun>) -> Result<Arc<SharedRun>, String> {
+    let cache_len = JIT_SLICE_LEN * JIT_SLICE_COUNT;
+    let region = parent
+        .jit
+        .map_code_cache(cache_len)
+        .map_err(|e| format!("fork child: map fresh code cache: {e:?}"))?;
+    fault::register_code_region(region.exec_base.as_ptr() as u64, cache_len as u64);
+
+    let tid = crate::thread::ThreadId::main_from_host_pid();
+    let registry = Arc::new(crate::thread::ThreadRegistry::new(tid));
+    crate::thread::set_current_registry(Arc::clone(&registry));
+    let futex = Arc::new(crate::thread::FutexTable::new());
+    crate::thread::set_current_futex_table(&futex);
+
+    let free_slices: Vec<usize> = (1..JIT_SLICE_COUNT).map(|i| i * JIT_SLICE_LEN).collect();
+    Ok(Arc::new(SharedRun {
+        dispatcher: Arc::clone(&parent.dispatcher),
+        registry,
+        futex,
+        reporter: Arc::clone(&parent.reporter),
+        image: Arc::clone(&parent.image),
+        region,
+        jit: FreebsdHostJit,
+        max_traps: parent.max_traps,
+        free_slices: std::sync::Mutex::new(free_slices),
+        threads: std::sync::Mutex::new(Vec::new()),
+        exit: ExitState::new(),
+    }))
+}
+
 /// Run a static x86_64 Linux ELF natively on FreeBSD/amd64 through the shared
 /// dispatcher. The `dispatcher` is fully constructed by the caller (rootfs,
 /// fd table, identity, container policy) exactly as the VMM path receives it.
@@ -948,9 +988,15 @@ fn run_x86_thread(
     memory: &mut IdentityGuestMemory,
     waiter: &mut crate::io_wait::ThreadWaiter,
 ) -> ThreadRunOutcome {
-    let image = &shared.image;
-    let region = &shared.region;
-    let jit = &shared.jit;
+    // The "active" shared run: normally the caller's, but a `fork()` child
+    // swaps to a FRESH private code cache (its own `SharedRun`) so it never
+    // re-JITs into pages the parent also writes (the SHM_ANON code cache is
+    // MAP_SHARED and survives fork). The image is COW-identical after fork (the
+    // guest's code pages keep their VAs), so it stays borrowed from the caller.
+    let mut active = Arc::clone(shared);
+    let mut tid = tid;
+    let image = Arc::clone(&shared.image);
+    let jit = FreebsdHostJit;
     let max_traps = shared.max_traps;
     // All guest-code reads go through the segment-aware `image.code_bytes`,
     // which never crosses an unmapped gap between PT_LOAD segments.
@@ -989,7 +1035,7 @@ fn run_x86_thread(
         }
     };
     let mut cursor = slice_off;
-    let cursor_limit = slice_off + slice_len;
+    let mut cursor_limit = slice_off + slice_len;
     let mut traps = 0usize;
     let mut exit_code: Option<i32> = None;
     let mut fault_detail: Option<String> = None;
@@ -1016,12 +1062,16 @@ fn run_x86_thread(
         // Another guest thread requested process exit (`exit_group`, or the
         // last thread's `exit(2)`): stop this thread's loop and surface the
         // recorded code. The initial thread turns this into the `RunResult`;
-        // a sibling thread just ends (its closure re-requests idempotently).
-        if shared.exit.requested() {
-            return ThreadRunOutcome::Exit {
-                code: shared.exit.code().unwrap_or(0),
-                traps,
-            };
+        // a sibling thread just ends (its closure re-requests idempotently). A
+        // fork descendant `_exit`s directly so the parent's wait4 reaps it.
+        if active.exit.requested() {
+            let code = active.exit.code().unwrap_or(0);
+            if forked {
+                // SAFETY: _exit performs no unwinding; the child's COW mappings
+                // are released by the kernel.
+                unsafe { libc::_exit(code) };
+            }
+            return ThreadRunOutcome::Exit { code, traps };
         }
         history.push(next);
         if history.len() > 64 {
@@ -1030,6 +1080,10 @@ fn run_x86_thread(
         let (exec, has_edges, uses_fpu) = if let Some(&hit) = cache.get(&next) {
             hit
         } else {
+            // This thread's JIT region (the fork child swapped `active` to its
+            // own private cache). Re-borrowed each translation so a mid-run swap
+            // is picked up; the borrow never outlives this branch.
+            let region = &active.region;
             // Plan bounded to the 4 KiB guest page so a block stays within one
             // mapped PT_LOAD segment (segments are page-aligned; a larger span
             // could read across an unmapped gap between them). `plan_block`
@@ -1115,7 +1169,7 @@ fn run_x86_thread(
                 let patch_abs = exec_u64 + edge.rel32_off as u64;
                 let next_abs = patch_abs + 4;
                 if let Some(&(target_exec, _, _)) = cache.get(&edge.target_va) {
-                    patch_slot(region, jit, patch_abs, next_abs, target_exec);
+                    patch_slot(region, &jit, patch_abs, next_abs, target_exec);
                 } else {
                     pending
                         .entry(edge.target_va)
@@ -1126,7 +1180,7 @@ fn run_x86_thread(
             // Patch any earlier-translated blocks that were waiting for THIS VA.
             if let Some(waiters) = pending.remove(&next) {
                 for (patch_abs, next_abs) in waiters {
-                    patch_slot(region, jit, patch_abs, next_abs, exec_u64);
+                    patch_slot(region, &jit, patch_abs, next_abs, exec_u64);
                 }
             }
             entry
@@ -1159,7 +1213,7 @@ fn run_x86_thread(
             Some(X86ExitStatus::Syscall) => {
                 traps += 1;
                 match service_syscall(
-                    shared,
+                    &active,
                     memory,
                     waiter,
                     tid,
@@ -1177,6 +1231,28 @@ fn run_x86_thread(
                         // be reaped by the parent, not returned up.
                         forked = true;
                         next = rip;
+                        // Swap onto a FRESH private code cache: the parent's
+                        // SHM_ANON cache is MAP_SHARED and survives fork, so
+                        // re-JITing into it at our own cursor would clobber the
+                        // parent's live code (deterministic SIGBUS). Fork copied
+                        // only this thread, so rebuilding execution state is
+                        // safe. Every prior translation pointed into the old
+                        // shared region — clear the caches and re-JIT from
+                        // scratch into the new one.
+                        match fork_child_rebuild(&active) {
+                            Ok(child) => {
+                                active = child;
+                                tid = active.registry.main_tid();
+                                cursor = 0;
+                                cursor_limit = JIT_SLICE_LEN;
+                                cache.clear();
+                                pending.clear();
+                            }
+                            Err(detail) => {
+                                fault_detail = Some(detail);
+                                break;
+                            }
+                        }
                     }
                     Step::Exit(code) => {
                         // A fork child exits directly so the parent's wait4
