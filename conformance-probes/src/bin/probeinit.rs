@@ -16,6 +16,15 @@
 //! child that reparents to it and propagate the probe's exit status
 //! (`128+signal` for a signalled probe, sh-style).
 fn main() {
+    // The strict standalone census builds every bin, including this transport
+    // helper. Outside the injection wrapper there is intentionally no /tmp/p;
+    // report that non-invocation as a successful applicability check instead of
+    // manufacturing a command-not-found failure.
+    if unsafe { libc::access(c"/tmp/p".as_ptr(), libc::X_OK) } != 0 {
+        println!("transport_helper_not_invoked=true");
+        return;
+    }
+
     unsafe {
         let probe = libc::fork();
         if probe == 0 {
