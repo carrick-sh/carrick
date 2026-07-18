@@ -103,6 +103,10 @@ type GrFn = unsafe extern "C" fn(*mut u8, usize, u32, *mut u8, usize) -> isize;
 fn main() {
     unsafe {
         let addr = vdso_sym("__kernel_getrandom");
+        if cfg!(target_arch = "x86_64") {
+            println!("kernel_getrandom_absent={}", addr == 0);
+            return;
+        }
         if addr == 0 {
             println!("resolved=false");
             println!("child_reused=true");

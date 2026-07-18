@@ -1,12 +1,8 @@
-//! The vDSO exposed via `AT_SYSINFO_EHDR` exports the complete canonical
-//! aarch64 symbol set. Real Linux aarch64 (`arch/arm64/kernel/vdso/vdso.lds.S`,
-//! version `LINUX_2.6.39`) exports exactly four `__kernel_*` symbols:
-//! `__kernel_clock_gettime`, `__kernel_gettimeofday`, `__kernel_clock_getres`,
-//! `__kernel_rt_sigreturn`. carrick must export all four so libc/Go resolve the
-//! fast clock path AND so unwinders/debuggers recognise the signal-return
-//! trampoline by name. This probe hand-walks the vDSO's `.dynsym` (no goblin in
-//! the probe crate) and prints one boolean per symbol — no addresses/times — so
-//! it diffs byte-for-byte carrick-vs-Linux.
+//! The vDSO exposed via `AT_SYSINFO_EHDR` exports the canonical symbol set for
+//! the guest ISA. aarch64 uses four `__kernel_*` names; x86_64 uses
+//! `__vdso_clock_gettime`, `__vdso_gettimeofday`, `__vdso_clock_getres`, and
+//! `__vdso_time`. This probe hand-walks `.dynsym` (no goblin in the probe crate)
+//! and prints deterministic presence booleans.
 
 use std::ptr;
 
@@ -42,11 +38,19 @@ unsafe fn cstr_eq(p: u64, want: &str) -> bool {
 
 fn main() {
     // Order is fixed so the output is deterministic across machines.
+    #[cfg(target_arch = "aarch64")]
     let names = [
         "__kernel_clock_gettime",
         "__kernel_gettimeofday",
         "__kernel_clock_getres",
         "__kernel_rt_sigreturn",
+    ];
+    #[cfg(target_arch = "x86_64")]
+    let names = [
+        "__vdso_clock_gettime",
+        "__vdso_gettimeofday",
+        "__vdso_clock_getres",
+        "__vdso_time",
     ];
     let mut found = [false; 4];
 
@@ -116,6 +120,9 @@ fn main() {
     println!("has_clock_gettime={}", found[0]);
     println!("has_gettimeofday={}", found[1]);
     println!("has_clock_getres={}", found[2]);
+    #[cfg(target_arch = "aarch64")]
     println!("has_rt_sigreturn={}", found[3]);
-    println!("all_four_present={}", found.iter().all(|&b| b));
+    #[cfg(target_arch = "x86_64")]
+    println!("has_time={}", found[3]);
+    println!("all_expected_present={}", found.iter().all(|&b| b));
 }

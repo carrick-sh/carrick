@@ -4,7 +4,7 @@
 //! SHARED (cross-process, no `FUTEX_PRIVATE_FLAG`) futex path — exactly what
 //! carrick routes through Darwin `os_sync`/`__ulock`. On real Linux a
 //! `FUTEX_WAKE` always reaches a parked `FUTEX_WAIT`, so no waiter ever blocks to
-//! its timeout: `lost_wake_detected=false`. A dropped cross-process wake makes a
+//! its timeout: `no_lost_wake=true`. A dropped cross-process wake makes a
 //! waiter block until its 2s timeout while the peer has ALREADY advanced the
 //! flag — that mismatch (ETIMEDOUT yet the word moved) is the lost wake.
 //!
@@ -135,9 +135,6 @@ fn main() {
     let mut st = 0;
     unsafe { libc::waitpid(pid, &mut st, 0) };
     // Linux: the ping-pong always completes via wakes -> no lost wake.
-    println!(
-        "lost_wake_detected={}",
-        unsafe { lost.read_volatile() } != 0
-    );
+    println!("no_lost_wake={}", unsafe { lost.read_volatile() } == 0);
     println!("completed=true");
 }
