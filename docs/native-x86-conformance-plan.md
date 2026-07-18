@@ -21,7 +21,8 @@
   depth rather than basic execution breadth.
 
 The exact current scoreboard is recorded below and in
-`docs/native-x86-census.tsv`.
+`docs/native-x86-census.tsv`. The initial static-musl LTP execution gate is
+recorded in `docs/native-x86-ltp-readiness.md`.
 
 ## Strategy principles
 
