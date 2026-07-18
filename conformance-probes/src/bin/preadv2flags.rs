@@ -11,7 +11,6 @@
 use conformance_probes::report;
 
 const RWF_HIPRI: u64 = 0x0000_0001;
-const SYS_PREADV2: libc::c_long = 286;
 
 fn main() {
     unsafe {
@@ -46,7 +45,7 @@ fn main() {
             },
         ];
         // aarch64 preadv2(fd, iov, iovcnt, pos_lo, pos_hi, flags); offset 3.
-        let ret = libc::syscall(SYS_PREADV2, fd, iov.as_ptr(), 3, 3, 0, RWF_HIPRI);
+        let ret = libc::syscall(libc::SYS_preadv2, fd, iov.as_ptr(), 3, 3, 0, RWF_HIPRI);
 
         let content_ok = &b0 == b"t1tt2" && &b1 == b"t3t" && &b2 == b"5t";
         report!(

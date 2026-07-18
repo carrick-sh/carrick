@@ -278,7 +278,6 @@ fn fstat_type(fd: i32) -> String {
 // raw syscall (aarch64 nr 291) against a locally-declared struct. Only the
 // fields up to stx_mode are read; the buffer is sized to the full 256-byte
 // kernel statx struct so the kernel never writes past it.
-const SYS_STATX: libc::c_long = 291;
 const STATX_TYPE: u32 = 0x0001;
 
 #[repr(C)]
@@ -305,7 +304,7 @@ fn statx_type(path: &str, flags: i32) -> String {
     let mut stx: Statx = unsafe { std::mem::zeroed() };
     let rc = unsafe {
         libc::syscall(
-            SYS_STATX,
+            libc::SYS_statx,
             libc::AT_FDCWD,
             c.as_ptr(),
             flags,

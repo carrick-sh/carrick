@@ -17,7 +17,7 @@ fn main() {
     unsafe {
         reset_errno();
         let add_key = libc::syscall(
-            217,
+            libc::SYS_add_key,
             c"user".as_ptr(),
             c"carrick_probe".as_ptr(),
             payload.as_ptr(),
@@ -28,7 +28,7 @@ fn main() {
 
         reset_errno();
         let request_key = libc::syscall(
-            218,
+            libc::SYS_request_key,
             c"user".as_ptr(),
             c"missing_carrick_probe".as_ptr(),
             c"".as_ptr(),
@@ -37,11 +37,12 @@ fn main() {
         let request_key_errno = errno();
 
         reset_errno();
-        let keyctl_join = libc::syscall(219, 1_i64, c"carrick_probe".as_ptr());
+        let keyctl_join =
+            libc::syscall(libc::SYS_keyctl, 1_i64, c"carrick_probe".as_ptr());
         let keyctl_join_errno = errno();
 
         reset_errno();
-        let keyctl_get_keyring_id = libc::syscall(219, 0_i64);
+        let keyctl_get_keyring_id = libc::syscall(libc::SYS_keyctl, 0_i64);
         let keyctl_get_keyring_id_errno = errno();
 
         report!(

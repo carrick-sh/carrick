@@ -1,4 +1,4 @@
-//! signalfd4 (syscall 74) flag handling: SFD_CLOEXEC (== O_CLOEXEC) sets
+//! signalfd4 flag handling: SFD_CLOEXEC (== O_CLOEXEC) sets
 //! FD_CLOEXEC on the returned fd; SFD_NONBLOCK (== O_NONBLOCK) sets O_NONBLOCK;
 //! an unknown flag bit → EINVAL. macOS has no signalfd, so carrick emulates the
 //! fd; these are pure fd-flag checks (no signals are read), matching LTP
@@ -7,7 +7,6 @@
 
 use conformance_probes::errno;
 
-const SYS_SIGNALFD4: libc::c_long = 74;
 
 fn main() {
     unsafe {
@@ -16,7 +15,7 @@ fn main() {
 
         // SFD_CLOEXEC → FD_CLOEXEC on the returned fd.
         let fd_ce = libc::syscall(
-            SYS_SIGNALFD4,
+            libc::SYS_signalfd4,
             -1i64,
             &mask as *const u64,
             sz,
@@ -34,7 +33,7 @@ fn main() {
 
         // SFD_NONBLOCK → O_NONBLOCK on the returned fd.
         let fd_nb = libc::syscall(
-            SYS_SIGNALFD4,
+            libc::SYS_signalfd4,
             -1i64,
             &mask as *const u64,
             sz,
@@ -50,7 +49,13 @@ fn main() {
         }
 
         // An unknown flag bit → EINVAL.
-        let bad = libc::syscall(SYS_SIGNALFD4, -1i64, &mask as *const u64, sz, 0x4000i64) as i32;
+        let bad = libc::syscall(
+            libc::SYS_signalfd4,
+            -1i64,
+            &mask as *const u64,
+            sz,
+            0x4000i64,
+        ) as i32;
         println!(
             "signalfd4_bad_flag_einval={}",
             bad == -1 && errno() == libc::EINVAL

@@ -9,7 +9,6 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-const SYS_EXIT_GROUP: libc::c_long = 94;
 
 fn child() -> ! {
     let started = Arc::new(AtomicBool::new(false));
@@ -29,7 +28,7 @@ fn child() -> ! {
     }
 
     unsafe {
-        libc::syscall(SYS_EXIT_GROUP, 37i32);
+        libc::syscall(libc::SYS_exit_group, 37i32);
         libc::_exit(99);
     }
 }
