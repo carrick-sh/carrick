@@ -1274,6 +1274,28 @@ fn fork_child_rebuild(parent: &Arc<SharedRun>) -> Result<Arc<SharedRun>, String>
     }))
 }
 
+/// Run the dispatcher + runtime fork-child resets in a fresh fork descendant, so
+/// the child starts with the POSIX-correct post-`fork` state instead of the
+/// parent's inherited process-global bookkeeping. Mirrors
+/// `native_darwin::native_after_fork_child`: clear buffered stdout/stderr (the
+/// child must not re-flush the parent's pending bytes), reinit the event ring +
+/// host-signal (empty pending set, no inherited timers) + FIFO beacons, and run
+/// each dispatcher subsystem's fork-child hook — `proc_after_fork_child` resets
+/// timerslack to the default, re-seeds the subreaper ancestor to the child
+/// itself, and clears inherited itimers/membarrier registration
+/// (`procprctlview`, `childsubreaper`, `forkaltstack`, `forkexecpthread`);
+/// `mem`/`sysv`/`epoll` drop inherited mm/SysV/epoll fork state.
+fn native_after_fork_child(dispatcher: &SyscallDispatcher) {
+    dispatcher.clear_output_buffers();
+    crate::event_ring::reinit_after_fork();
+    crate::host_signal::reinit_after_fork();
+    crate::dispatch::reset_fifo_beacons_after_fork_child();
+    dispatcher.epoll_after_fork_child();
+    dispatcher.proc_after_fork_child();
+    dispatcher.mem_after_fork_child();
+    dispatcher.sysv_after_fork_child();
+}
+
 /// Run a static x86_64 Linux ELF natively on FreeBSD/amd64 through the shared
 /// dispatcher. The `dispatcher` is fully constructed by the caller (rootfs,
 /// fd table, identity, container policy) exactly as the VMM path receives it.
@@ -1764,6 +1786,12 @@ fn run_x86_thread(
                                 cursor_limit = JIT_SLICE_LEN;
                                 cache.clear();
                                 pending.clear();
+                                // POSIX fork-child resets on the (shared)
+                                // dispatcher + runtime globals: timerslack /
+                                // subreaper-ancestor / itimers / membarrier and
+                                // the empty pending-signal set, so the child does
+                                // not observe the parent's inherited proc state.
+                                native_after_fork_child(&active.dispatcher);
                             }
                             Err(detail) => {
                                 fault_detail = Some(detail);
