@@ -3055,21 +3055,47 @@ fn service_syscall_threaded(
                 wait_set,
                 block_mask,
                 timeout,
-            } => match waiter.wait(&[], timeout, block_mask) {
-                WaitResult::Ready => continue,
-                WaitResult::Interrupted => {
-                    if dispatcher.signal_wait_should_eintr(waiter.tid(), wait_set, block_mask) {
-                        return Ok(DispatchOutcome::Errno { errno: EINTR });
+            } => {
+                // A `sigwait`/`sigtimedwait` target signal can become pending
+                // WITHOUT any host signal being sent: a sibling guest thread's
+                // `kill(getpid(), sig)` publishes it process-directed via
+                // `raise_for_self`, and a `tgkill` of a wait-set signal marks it
+                // in the dispatcher's own pending set. A bare `ppoll` park (no
+                // predicate) only wakes on a host EINTR, so a BOUNDED
+                // sigtimedwait ran to its full timeout and returned EAGAIN
+                // instead of dequeuing the signal (`sigwaitthread`,
+                // `sigwaitalarm`). Poll both pending stores so the park breaks
+                // promptly and the re-dispatch's `take_pending_in_from` /
+                // `take_pending_in_for` returns the signum.
+                let pending = move || {
+                    dispatcher.drain_xsignals_process_directed();
+                    crate::host_signal::has_unblocked_pending_for(tid.raw(), block_mask)
+                        || dispatcher.has_deliverable_dispatch_pending_for_wait(
+                            tid,
+                            carrick_abi::WaitSigMask::Replace(carrick_abi::SigSet::from_raw(
+                                block_mask.raw(),
+                            )),
+                        )
+                };
+                match waiter.wait_with_dispatch_pending(&[], timeout, block_mask, pending) {
+                    WaitResult::Ready => continue,
+                    WaitResult::Interrupted => {
+                        // A pending signal OUTSIDE the wait set completes with
+                        // EINTR; a wait-set signal (or a spurious wake) re-dispatches
+                        // so `rt_sigtimedwait` dequeues + returns it.
+                        if dispatcher.signal_wait_should_eintr(waiter.tid(), wait_set, block_mask) {
+                            return Ok(DispatchOutcome::Errno { errno: EINTR });
+                        }
+                        continue;
                     }
-                    continue;
+                    WaitResult::TimedOut => {
+                        return Ok(DispatchOutcome::Errno {
+                            errno: crate::linux_abi::LINUX_EAGAIN,
+                        });
+                    }
+                    WaitResult::Errno(errno) => return Ok(DispatchOutcome::Errno { errno }),
                 }
-                WaitResult::TimedOut => {
-                    return Ok(DispatchOutcome::Errno {
-                        errno: crate::linux_abi::LINUX_EAGAIN,
-                    });
-                }
-                WaitResult::Errno(errno) => return Ok(DispatchOutcome::Errno { errno }),
-            },
+            }
             DispatchOutcome::WaitOnProcExit { pid, sig_mask } => {
                 match waiter.wait_proc_exit_with_dispatch_pending(
                     pid,
