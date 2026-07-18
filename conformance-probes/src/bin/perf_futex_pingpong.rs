@@ -11,7 +11,6 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
-const SYS_FUTEX_AARCH64: libc::c_long = 98;
 const FUTEX_WAIT: i32 = 0;
 const FUTEX_WAKE: i32 = 1;
 const FUTEX_PRIVATE_FLAG: i32 = 128;
@@ -20,7 +19,7 @@ const ITERS: usize = 5000;
 
 unsafe fn futex_wait(addr: *const i32, expected: i32) -> i64 {
     libc::syscall(
-        SYS_FUTEX_AARCH64,
+        libc::SYS_futex,
         addr,
         FUTEX_WAIT | FUTEX_PRIVATE_FLAG,
         expected,
@@ -29,7 +28,7 @@ unsafe fn futex_wait(addr: *const i32, expected: i32) -> i64 {
 }
 
 unsafe fn futex_wake(addr: *const i32, n: i32) -> i64 {
-    libc::syscall(SYS_FUTEX_AARCH64, addr, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, n) as i64
+    libc::syscall(libc::SYS_futex, addr, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, n) as i64
 }
 
 fn nproc() -> usize {

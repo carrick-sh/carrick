@@ -20,7 +20,6 @@ const SET_MTIME: i64 = 1_700_000_000;
 
 // musl's libc crate binding doesn't expose `statx`; issue the raw syscall
 // (aarch64 nr 291) against a locally-declared struct mirroring the kernel's.
-const SYS_STATX: libc::c_long = 291;
 const STATX_ALL: u32 = 0x0fff; // request all basic fields
 const AT_EMPTY_PATH: i32 = 0x1000;
 
@@ -129,7 +128,7 @@ fn main() {
     let mut stx: Statx = unsafe { std::mem::zeroed() };
     let xrc = unsafe {
         libc::syscall(
-            SYS_STATX,
+            libc::SYS_statx,
             fd,
             empty.as_ptr(),
             AT_EMPTY_PATH,

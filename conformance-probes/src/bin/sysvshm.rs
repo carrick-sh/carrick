@@ -5,7 +5,6 @@ const SHM_STAT_ANY: i32 = 15;
 const SHM_INFO: i32 = 14;
 const SHM_RDONLY: i32 = 0o10000;
 const SHM_RND: i32 = 0o20000;
-const SYS_REMAP_FILE_PAGES: libc::c_long = 234;
 
 fn errno() -> i32 {
     std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
@@ -155,7 +154,7 @@ fn main() {
         let stat_any_errno = errno();
 
         reset_errno();
-        let remap_invalid = libc::syscall(SYS_REMAP_FILE_PAGES, 0, 0, 0, 0, 0);
+        let remap_invalid = libc::syscall(libc::SYS_remap_file_pages, 0, 0, 0, 0, 0);
         let remap_invalid_errno = errno();
 
         cleanup_shm(shmid);

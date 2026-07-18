@@ -26,7 +26,6 @@
 use conformance_probes::{errno, report};
 use std::ffi::CString;
 
-const SYS_LINKAT: libc::c_long = 37; // aarch64 linkat
 const AT_FDCWD: libc::c_int = -100;
 const AT_SYMLINK_FOLLOW: libc::c_int = 0x400;
 const AT_SYMLINK_NOFOLLOW: libc::c_int = 0x100;
@@ -37,7 +36,7 @@ const BOGUS_HIGH_BIT: libc::c_int = 0x0400_0000; // not any defined AT_* flag
 /// path and the failure path deterministically.
 unsafe fn linkat(oldpath: &CStr2, newpath: &CStr2, flags: libc::c_int) -> i64 {
     let rc = libc::syscall(
-        SYS_LINKAT,
+        libc::SYS_linkat,
         AT_FDCWD,
         oldpath.ptr(),
         AT_FDCWD,
