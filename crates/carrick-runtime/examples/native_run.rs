@@ -4,6 +4,15 @@
 fn main() {
     #[cfg(all(target_os = "freebsd", target_arch = "x86_64"))]
     {
+        // Register the carrick USDT provider so the dispatcher's
+        // `carrick:::syscall__entry` / `syscall__return` (and the dsr__*)
+        // probes fire — trace a run with e.g.
+        //   dtrace -n 'carrick*:::syscall__return { @[copyinstr(arg1)] = count(); }'
+        // This is the real observability path (the CLI does the same); no
+        // env-gated logging needed.
+        if let Err(e) = carrick_runtime::probes::register_dtrace_probes() {
+            eprintln!("[native_run] warning: USDT probe registration failed: {e}");
+        }
         let Some(path) = std::env::args().nth(1) else {
             eprintln!("usage: native_run <elf>");
             std::process::exit(2);

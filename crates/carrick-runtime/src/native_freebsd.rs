@@ -29,7 +29,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use carrick_dsr::host::{JitRegion, NativeHostJit};
-use carrick_dsr_x86::block::X86Block;
+use carrick_dsr_x86::block::{X86Block, X86Exit};
 use carrick_dsr_x86::decode::{X86InstClass, classify};
 use carrick_dsr_x86::gateway::{CTX_FAULT_RECORD, reg, signal_stub_addr};
 use carrick_dsr_x86::{
@@ -168,6 +168,29 @@ struct LoadedImage {
     /// Kept mapped for the lifetime of the run (argv/AT_RANDOM scratch).
     scratch: u64,
     scratch_len: usize,
+    /// The page-rounded [start, end) VA ranges of the mapped PT_LOAD segments,
+    /// sorted and coalesced. The reserved span can contain UNMAPPED gaps
+    /// between segments; the block planner must not read across one (it would
+    /// fault or decode garbage), so `code_bytes` reads only up to the end of
+    /// the range containing a VA.
+    segments: Vec<(u64, u64)>,
+}
+
+impl LoadedImage {
+    /// Up to 16 guest code bytes at `va`, bounded to the END of the mapped
+    /// segment containing `va` — so a read never crosses an unmapped gap.
+    /// Empty when `va` is not in any mapped segment (a guest that jumped off
+    /// mapped code).
+    fn code_bytes(&self, va: u64) -> &[u8] {
+        for &(start, end) in &self.segments {
+            if va >= start && va < end {
+                let hi = (va + 16).min(end);
+                // SAFETY: [va, hi) is inside a mapped segment (guest VA == host VA).
+                return unsafe { std::slice::from_raw_parts(va as *const u8, (hi - va) as usize) };
+            }
+        }
+        &[]
+    }
 }
 
 impl LoadedImage {
@@ -235,6 +258,7 @@ fn load_static_pie(bytes: &[u8], argv: &[String]) -> Result<LoadedImage, Runtime
         ));
     }
     let bias = span as u64 - lo;
+    let mut segments: Vec<(u64, u64)> = Vec::new();
 
     for ph in &elf.program_headers {
         if ph.p_type != PT_LOAD {
@@ -242,6 +266,7 @@ fn load_static_pie(bytes: &[u8], argv: &[String]) -> Result<LoadedImage, Runtime
         }
         let seg_lo = (ph.p_vaddr & !(PAGE - 1)) + bias;
         let seg_hi = ((ph.p_vaddr + ph.p_memsz + PAGE - 1) & !(PAGE - 1)) + bias;
+        segments.push((seg_lo, seg_hi));
         // The translator READS guest code (execution runs from the JIT cache),
         // so no host PROT_EXEC is needed; every segment is mapped R + W so its
         // file bytes and the guest's own writes land. (Enforcing per-segment
@@ -293,6 +318,17 @@ fn load_static_pie(bytes: &[u8], argv: &[String]) -> Result<LoadedImage, Runtime
         bias,
     );
 
+    // Sort + coalesce adjacent segments so `code_bytes` can read across
+    // touching PT_LOADs but never across a real gap.
+    segments.sort_unstable();
+    let mut coalesced: Vec<(u64, u64)> = Vec::with_capacity(segments.len());
+    for (s, e) in segments {
+        match coalesced.last_mut() {
+            Some(last) if s <= last.1 => last.1 = last.1.max(e),
+            _ => coalesced.push((s, e)),
+        }
+    }
+
     Ok(LoadedImage {
         span_base: span as u64,
         span_len,
@@ -302,6 +338,7 @@ fn load_static_pie(bytes: &[u8], argv: &[String]) -> Result<LoadedImage, Runtime
         rsp,
         scratch: scratch as u64,
         scratch_len: PAGE as usize,
+        segments: coalesced,
     })
 }
 
@@ -484,23 +521,29 @@ where
     let futex = crate::thread::FutexTable::new();
     let mut memory = IdentityGuestMemory;
 
-    let span_base = image.span_base;
-    let span_end = image.span_base + image.span_len as u64;
-    let read_guest = |va: u64| -> Vec<u8> {
-        if va < span_base || va >= span_end {
-            return Vec::new();
-        }
-        let end = (va + 16).min(span_end);
-        // SAFETY: within the mapped image span.
-        unsafe { std::slice::from_raw_parts(va as *const u8, (end - va) as usize).to_vec() }
-    };
-    // Read the full body of a block (may exceed the 16-byte plan peek).
+    // All guest-code reads go through the segment-aware `image.code_bytes`,
+    // which never crosses an unmapped gap between PT_LOAD segments.
+    let read_guest = |va: u64| -> Vec<u8> { image.code_bytes(va).to_vec() };
+    // Read the full body of a block. A block is planned within one segment, so
+    // reading up to that segment's end (via repeated 16-byte-bounded reads
+    // would be O(n); instead read the one contiguous run) is safe. `code_bytes`
+    // is segment-bounded, so extend from `base` across the block by reading the
+    // segment run that contains it.
     let read_block = |block: &X86Block| -> Vec<u8> {
         let base = block.start;
         let want = block.end.max(block.exit.va());
-        let hi = (want + 16).min(span_end);
-        // SAFETY: within the mapped image span.
-        unsafe { std::slice::from_raw_parts(base as *const u8, (hi - base) as usize).to_vec() }
+        let mut out = Vec::new();
+        let mut va = base;
+        // Gather the block's bytes segment-run by 16-byte code_bytes reads.
+        while va < want + 16 {
+            let chunk = image.code_bytes(va);
+            if chunk.is_empty() {
+                break;
+            }
+            out.extend_from_slice(chunk);
+            va += chunk.len() as u64;
+        }
+        out
     };
 
     let mut snapshot = X86UcontextSnapshot::new();
@@ -526,11 +569,25 @@ where
     // translated, every waiting slot is patched to jump straight to it.
     let mut pending: std::collections::HashMap<u64, Vec<(u64, u64)>, VaBuildHasher> =
         std::collections::HashMap::default();
+    // Breadcrumb ring: the last guest VAs entered, for diagnosing where an
+    // unhandled scenario was reached from.
+    let mut history: Vec<u64> = Vec::new();
 
     'run: while traps < max_traps {
+        history.push(next);
+        if history.len() > 64 {
+            history.remove(0);
+        }
         let (exec, has_edges, uses_fpu) = if let Some(&hit) = cache.get(&next) {
             hit
         } else {
+            // Plan bounded to the 4 KiB guest page so a block stays within one
+            // mapped PT_LOAD segment (segments are page-aligned; a larger span
+            // could read across an unmapped gap between them). `plan_block`
+            // always includes its first instruction even if it spans the page
+            // boundary (an internal, in-segment boundary), so it never returns
+            // an empty `Continue{target: start}` — which the chainer would turn
+            // into an infinite self-jump.
             let block = match plan_block(next, 256, PAGE, read_guest) {
                 Ok(b) => b,
                 Err(e) => {
@@ -538,6 +595,32 @@ where
                     break;
                 }
             };
+            // Defensive: a block that plans zero instructions AND only
+            // CONTINUES at its own start makes no progress (a page-spanning
+            // instruction that could not be planned, or the guest ran off
+            // mapped code). A block whose first instruction is a TERMINATOR
+            // (call/jmp/jcc/syscall/sensitive) also has zero copy-instructions
+            // and `exit.va() == start` — that is normal, so match only the
+            // `Continue` shape. Emit a LOUD breadcrumb on the real no-progress
+            // case so an unhandled scenario is debuggable without guessing.
+            let empty_self_continue = block.instructions.is_empty()
+                && matches!(block.exit, X86Exit::Continue { target, .. } if target == next);
+            if empty_self_continue {
+                let bytes = image.code_bytes(next);
+                let in_seg = image.segments.iter().any(|&(s, e)| next >= s && next < e);
+                let recent: Vec<String> = history
+                    .iter()
+                    .rev()
+                    .take(8)
+                    .map(|v| format!("0x{v:x}"))
+                    .collect();
+                fault_detail = Some(format!(
+                    "no-progress block at 0x{next:x}: exit={:?} in_segment={in_seg} \
+                     bytes={:02x?} segments={:x?} recent_blocks={:?}",
+                    block.exit, bytes, image.segments, recent,
+                ));
+                break;
+            }
             let body = read_block(&block);
             let linked = match emit_block_linked(&body, &block) {
                 Ok(t) => t,
@@ -651,10 +734,7 @@ where
                     // Genuine indirect branch (call/ret/jmp r/m): re-decode it
                     // at the self-set resume VA and resolve from the snapshot.
                     let va = snapshot.rip;
-                    let hi = (va + 16).min(span_end);
-                    // SAFETY: [va, hi) is inside the mapped image span.
-                    let branch =
-                        unsafe { std::slice::from_raw_parts(va as *const u8, (hi - va) as usize) };
+                    let branch = image.code_bytes(va);
                     match cflow::resolve(branch, va, &mut snapshot) {
                         Ok(t) => next = t,
                         Err(e) => {
@@ -668,10 +748,7 @@ where
                 // Re-decode the sensitive instruction at the self-set resume VA
                 // to recover its kind and length.
                 let va = snapshot.rip;
-                let hi = (va + 16).min(span_end);
-                // SAFETY: [va, hi) is inside the mapped image span.
-                let bytes =
-                    unsafe { std::slice::from_raw_parts(va as *const u8, (hi - va) as usize) };
+                let bytes = image.code_bytes(va);
                 match classify(bytes, va) {
                     Ok(c) => match c.class {
                         X86InstClass::Sensitive(kind) => {
@@ -719,7 +796,6 @@ where
     let stdout = dispatcher.stdout();
     let stderr = dispatcher.stderr();
 
-    let _ = span_end;
     let exit_code = match (exit_code, &fault_detail) {
         (Some(code), _) => code,
         (None, Some(detail)) => {

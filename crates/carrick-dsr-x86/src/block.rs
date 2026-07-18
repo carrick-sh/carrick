@@ -147,8 +147,14 @@ pub fn plan_block(
                     .checked_add(c.len as u64)
                     .ok_or(X86BlockError::VaOverflow { va })?;
                 // An instruction that would cross the page boundary belongs to
-                // the next page's generation; stop before it.
-                if next > limit {
+                // the next page's generation; stop before it — UNLESS it is the
+                // block's first instruction, which must always be included so a
+                // block never makes zero progress. A first instruction that
+                // spans the boundary spans an INTERNAL page boundary (code does
+                // not span a segment's end), so the bytes are contiguous; an
+                // empty `Continue{target: start}` block would otherwise let a
+                // caller that chains blocks emit an infinite self-jump.
+                if next > limit && !instructions.is_empty() {
                     return Ok(continue_block(
                         start,
                         va,
@@ -397,6 +403,41 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn first_instruction_spanning_a_page_is_included_not_dropped() {
+        // A 5-byte `mov edi, 1` at BASE+6 spans the 8-byte page boundary at
+        // BASE+8. As the block's FIRST instruction it must be INCLUDED (the
+        // bytes are contiguous within a segment), then the block continues past
+        // it — a plan must never make zero progress, which would let a chaining
+        // caller emit an infinite self-jump.
+        static IMG: &[u8] = &[
+            0x90, 0x90, 0x90, 0x90, 0x90, 0x90, // 6 nops
+            0xbf, 0x01, 0x00, 0x00, 0x00, // mov edi, 1 at offset 6
+            0x90,
+        ];
+        let page: u64 = 8;
+        let start = BASE + 6;
+        let reader = |va: u64| {
+            let off = (va - BASE) as usize;
+            IMG.get(off..).map(|s| s.to_vec()).unwrap_or_default()
+        };
+        let block = plan_block(start, 256, page, reader).expect("plan");
+        assert_eq!(
+            block.instructions.len(),
+            1,
+            "the spanning first insn is kept"
+        );
+        assert_eq!(block.instructions[0].va, start);
+        assert_eq!(block.instructions[0].len, 5);
+        assert_eq!(
+            block.exit,
+            X86Exit::Continue {
+                target: BASE + 11,
+                limit: BlockLimit::PageBoundary,
+            }
+        );
     }
 
     #[test]
