@@ -38,9 +38,9 @@ fn main() {
             accmode_before_wronly = (before & libc::O_ACCMODE) == libc::O_WRONLY,
             // Linux: still WRONLY (F_SETFL cannot change access mode).
             accmode_after_still_wronly = (after & libc::O_ACCMODE) == libc::O_WRONLY,
-            // Linux: false (creation-only bits are not stored as status).
-            creat_bit_stored = (after & libc::O_CREAT) != 0,
-            trunc_bit_stored = (after & libc::O_TRUNC) != 0,
+            // Linux: creation-only bits are not stored as status.
+            creat_bit_ignored = (after & libc::O_CREAT) == 0,
+            trunc_bit_ignored = (after & libc::O_TRUNC) == 0,
             // Linux + carrick: true (legitimate mutable status bit).
             nonblock_set = (after & libc::O_NONBLOCK) != 0,
         );

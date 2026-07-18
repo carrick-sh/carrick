@@ -81,9 +81,9 @@ fn main() {
             sigquit_wifsignaled = sigquit_term,
             sigquit_wcoredump_set = sigquit_core,
             sigterm_wifsignaled = sigterm_term,
-            sigterm_wcoredump_set = sigterm_core,
+            sigterm_wcoredump_clear = !sigterm_core,
             sigkill_wifsignaled = sigkill_term,
-            sigkill_wcoredump_set = sigkill_core,
+            sigkill_wcoredump_clear = !sigkill_core,
         );
     }
 }

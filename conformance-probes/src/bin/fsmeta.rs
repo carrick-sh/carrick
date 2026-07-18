@@ -6,7 +6,7 @@
 //! Deterministic only: no timestamps, pids, addresses, or inode numbers.
 
 use std::fs;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 
 fn main() {
     // getcwd via std (exercises getcwd(2)).
@@ -41,9 +41,9 @@ fn main() {
     std::os::unix::fs::symlink("tgt", "/tmp/probe/lnk").ok();
     match fs::symlink_metadata("/tmp/probe/lnk") {
         Ok(m) => println!(
-            "lstat_symlink is_symlink={} is_file={}",
+            "lstat_symlink is_symlink={} is_not_file={}",
             m.file_type().is_symlink(),
-            m.is_file()
+            !m.is_file()
         ),
         Err(e) => println!("lstat_symlink=ERR:{}", e.raw_os_error().unwrap_or(-1)),
     }
@@ -87,8 +87,8 @@ fn main() {
     fs::write("/tmp/probe/r1", b"x").ok();
     fs::rename("/tmp/probe/r1", "/tmp/probe/r2").ok();
     println!(
-        "rename src_exists={} dst_exists={}",
-        fs::metadata("/tmp/probe/r1").is_ok(),
+        "rename src_gone={} dst_exists={}",
+        fs::metadata("/tmp/probe/r1").is_err(),
         fs::metadata("/tmp/probe/r2").is_ok()
     );
 }

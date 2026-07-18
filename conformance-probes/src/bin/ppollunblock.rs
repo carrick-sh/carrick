@@ -55,7 +55,7 @@ fn main() {
         report!(
             ppoll_returned = true,
             ppoll_eintr = r < 0 && e == libc::EINTR,
-            ppoll_timed_out = r == 0,
+            ppoll_did_not_time_out = r != 0,
         );
     }
 }

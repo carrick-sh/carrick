@@ -115,7 +115,7 @@ fn main() {
             libc::closedir(dirp);
         }
         println!("readdir_has_nfc={}", saw_nfc);
-        println!("readdir_has_nfd={}", saw_nfd);
+        println!("readdir_excludes_nfd={}", !saw_nfd);
 
         // Cleanup (best-effort).
         libc::unlink(nfc.as_ptr());

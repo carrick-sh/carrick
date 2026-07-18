@@ -58,7 +58,7 @@ fn main() {
 
         // 4. empty FIFO: writable (buffer has space), not readable (no data).
         println!("writable_when_empty={}", select_ready(fd, false));
-        println!("readable_when_empty={}", select_ready(fd, true));
+        println!("not_readable_when_empty={}", !select_ready(fd, true));
 
         // 5. write through the O_RDWR fd, then it becomes readable.
         let w = libc::write(fd, b"hi".as_ptr() as *const _, 2);

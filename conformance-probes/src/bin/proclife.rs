@@ -8,8 +8,6 @@
 //! Deterministic only: no pids, timestamps, or addresses are printed; values
 //! are reduced to fixed exit codes, booleans, and stable relationships.
 
-use std::process::exit;
-
 fn errno() -> i32 {
     std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
 }
@@ -36,11 +34,11 @@ fn exit_status_normal() {
     let mut status: libc::c_int = 0;
     let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
     println!(
-        "exit_normal reaped_match={} ifexited={} exitstatus={} ifsignaled={}",
+        "exit_normal reaped_match={} ifexited={} exitstatus={} not_signaled={}",
         waited == pid,
         libc::WIFEXITED(status),
         libc::WEXITSTATUS(status),
-        libc::WIFSIGNALED(status),
+        !libc::WIFSIGNALED(status),
     );
 }
 
@@ -60,11 +58,11 @@ fn exit_status_signalled() {
     let mut status: libc::c_int = 0;
     let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
     println!(
-        "exit_signalled reaped_match={} ifsignaled={} termsig={} ifexited={}",
+        "exit_signalled reaped_match={} ifsignaled={} termsig={} not_exited={}",
         waited == pid,
         libc::WIFSIGNALED(status),
         libc::WTERMSIG(status),
-        libc::WIFEXITED(status),
+        !libc::WIFEXITED(status),
     );
 }
 
