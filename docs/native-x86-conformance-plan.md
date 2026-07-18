@@ -1,4 +1,4 @@
-# FreeBSD/amd64 Native (DSR) Backend — Path to All 432 Conformance Probes
+# FreeBSD/amd64 Native (DSR) Backend — Path to All 428 Conformance Probes
 
 > Status doc. Goal: every x86_64 musl conformance probe passing under
 > `--exec-backend native` on FreeBSD/amd64. This is the roadmap and the
@@ -6,15 +6,22 @@
 
 ## Where we are
 
-- **Baseline:** 202/432 (47%) at the start of the threading push.
-- **Landed this arc:** blocking-I/O reuse, `fork()` (host fork), file-backed
-  `mmap` (`MapHostAlias`). Sampled census ≈ **58%**.
-- **Execution core is proven:** real `std` Rust runs natively through the real
-  backend-neutral `SyscallDispatcher`; direct-branch chaining works; conditional
-  fxsave landed. What remains is *breadth of servicing*, not the engine.
+- **Current strict census:** **407/428 (95.1%)** on FreeBSD/amd64. The checked-in
+  census is a low-parallelism complete run with six immediately focused reruns
+  replacing resource-contaminated results (`clone3signalflight`, `dnotify`,
+  `mtidlesleep`, `procconfigloop`, `sysvmsgwake`, `traceexecstop`).
+- **Standalone runtime backlog:** 10 probes: four live-protection/fault-retry
+  cases, two cross-exec/shared-futex cases, two vfork cases, first-touch
+  residency, main-stack discovery, and FreeBSD's missing datagram ICMP socket.
+- **Harness-dependent backlog:** 11 client/server or published-network probes
+  require the coordinated conformance harness and are not valid standalone
+  `native_run` failures.
+- **Execution core is proven:** real Rust and musl workloads run natively through
+  the backend-neutral `SyscallDispatcher`; the remaining work is narrow semantic
+  depth rather than basic execution breadth.
 
-The exact current scoreboard (per-bucket counts) is filled in from the
-reliable serial census — see **Scoreboard** below.
+The exact current scoreboard is recorded below and in
+`docs/native-x86-census.tsv`.
 
 ## Strategy principles
 
@@ -32,8 +39,10 @@ reliable serial census — see **Scoreboard** below.
 
 ## The buckets → rungs, ordered by ROI
 
-From the reliable serial census of all 432 targets (`docs/native-x86-census.tsv`),
-**baseline 250 OK (58%)**. Actionable failing buckets, ordered by (probes
+The original reliable serial census covered 432 build artifacts; the canonical
+probe corpus now contains 428 binaries. The table below is the historical rung
+ordering from the 250-OK baseline. Actionable failing buckets were ordered by
+(probes
 unlocked) × (whether it unblocks later rungs), against implementation cost:
 
 | Rung | Bucket (census tag) | Probes | Unblocks | Cost |
@@ -271,7 +280,7 @@ stack/auxv, reset the run loop. The loader (`load_static_pie`,
 ## Rung E — Long tail
 
 Whatever the post-A–D census surfaces. Iterate: census → bucket → fix → re-census
-until 432/432.
+until 428/428.
 
 ---
 
@@ -301,49 +310,36 @@ strict count and the exit-0 count; strict is a safe lower bound. When strict
 flags a probe, confirm the `=false` line is actually wrong before treating it as
 work.
 
-## Next-work list (scoped from the parallel wave)
+## Next-work list
 
-- **vDSO cluster (driver):** `build_initial_stack` (native_freebsd.rs:601) builds
-  auxv with **no `AT_SYSINFO_EHDR`** and maps no vDSO, so `getauxval(AT_SYSINFO_EHDR)`
-  is 0. Map the Linux vDSO + add the auxv entry → `clockcoherence`,
-  `getrandomvdso`, `getrandomvdsofork`, `getrandomvdsoloop`, `vdsogtod` (5).
-- **io-waiter signal-interruptibility (driver/io_wait):** the futex wait is now
-  signal-interruptible, but `ppoll`/`pause`/`select` are not, so a pending
-  timer/alarm signal can't break them → `posixtimers`, `timersettimeabs`,
-  `nanosleeprem`, `selecttimeout`, `pauseeintr`, `ppollunblock`,
-  `waitsiblingsigchld`.
-- **cross-process sigqueue via fork (signal follow-up):** `sigqueueusr1`,
-  `rtsigqueueinfo`, `tgsigqueue`, `sigchld` livelock (cross-*thread* works).
-- **More arch-locked** (add to the excluded set): `preadv2flags` (x86 #286 =
-  timerfd_settime), `fdstat` statx portion (x86 #291 = signalfd4).
+1. Preserve shared-futex identity and waiter/requeue state across fork and exec
+   (`futexforkrequeue`, `ltpcheckpointexec`).
+2. Design a coordinated protection/fault-retry contract: enforce live host
+   protections, translate executable mappings from current guest bytes, and
+   resume at the exact faulting instruction (`forkfault`, `mprotectexec`,
+   `roprotect`).
+3. Publish an accurate native main-stack VMA/size to guest libc
+   (`recursionguard`) and track first-touch residency for `mlock2`.
+4. Implement real `CLONE_VM|CLONE_VFORK` address-space sharing and parent
+   suspension (`vforkvmshare`, `vforkexecthread`).
+5. Add a Linux-compatible datagram ICMP implementation rather than relying on
+   FreeBSD, which returns `EPROTONOSUPPORT` for `SOCK_DGRAM/IPPROTO_ICMP`.
+6. Run the paired network scenarios under their intended harness and begin the
+   native LTP readiness baseline.
 
-## Achievable ceiling on the x86_64 native lane (arch-locked probes)
-
-The conformance corpus is written **aarch64-first** (its gate is macOS/HVF +
-Docker on aarch64). Most probes are arch-generic — the frequent "aarch64"
-mentions in probe sources are *comments* over arch-generic `libc::SYS_*` code, so
-they pass fine on x86_64. But a **small set (~5–10) are genuinely arch-locked**:
-they read aarch64 structs/registers directly and cannot pass on this x86_64 lane
-regardless of runtime work. Confirmed examples:
-- `faultaddr` — casts `uc_mcontext` to an aarch64 `sigcontext` (`fault_addr_match`
-  reads x86_64 register R8, never the fault VA). `si_addr_match` still passes.
-- `nativex18` — reads the aarch64 `x18` platform register (no x86_64 equivalent).
-- `mailboxregs`, `ctrel0` — aarch64 register/timer reads.
-- `vdsosymbols`, `perf_dsr_*` — aarch64 vDSO / DSR-internal specifics.
-
-So the **winnable ceiling on this lane is ~418–423 / 428**, and the canonical
-"ALL probes" target is the aarch64 gate (not runnable on this FreeBSD x86 rig).
-Track these as *excluded (arch-locked)*, not as open work.
+The earlier architecture-locked ceiling is obsolete. Probe syscall numbers,
+vDSO expectations, fault-register decoding, and architecture-specific reducers
+now select by guest ISA, so the intended x86_64 ceiling is the full corpus.
 
 ## Definition of done
 
-432/432 conformance probes OK under `native_run`, the integration suite green,
+428/428 conformance probes OK under the intended harness, the integration suite green,
 macOS reference lane still compile-clean (darwin cross-check), and a clean census
 with zero HANG/OTHER.
 
 ## Scoreboard
 
-Reliable serial census, all 432 targets. Raw data: `docs/native-x86-census.tsv`.
+Strict census, all 428 current targets. Raw data: `docs/native-x86-census.tsv`.
 
 > **Metric correction (important).** The 250/281/355 figures below were an
 > *exit-0* proxy, which **overcounts** — many probes exit 0 while printing a
@@ -365,42 +361,50 @@ Reliable serial census, all 432 targets. Raw data: `docs/native-x86-census.tsv`.
 | wave 3 (parallel: driver + dispatcher) | 304 / 428 (~305 true) | +10 net. shared futex, fork-child resets, unmap_range + PROT_NONE gate, altstack, epollpri |
 | wave 4 (parallel: driver + networking) | 314 / 428 (~315 true) | +10 net. container bridge network, execve/Rung E, threadstatstate recovered |
 | wave 5 (parallel: driver + dispatcher) | 334 / 428 | +20 net. cross-process signals, procctl reaper + SIGCHLD, shared FUTEX_WAKE count, netifmcast+schedprio |
-| **wave 6 (lifecycle + shared-word + VMA safety)** | **344 / 428** | +10 net. init/subreaper orphan lifecycle, SysV message waits, fail-closed identity VMAs; zero host-crash buckets |
+| wave 6 (lifecycle + shared-word + VMA safety) | 344 / 428 | +10 net. init/subreaper orphan lifecycle, SysV message waits, fail-closed identity VMAs; zero host-crash buckets |
+| **wave 7 (ABI, exec/fork, memory, probes)** | **407 / 428** | +63 net. x86 syscall normalization, self-contained exec, clone/pidfd lifecycle, live exec images, identity mappings, vDSO, ptrace exec-stop, and strict-census cleanup |
+
+**Wave-7 detail (+63):** x86-only syscalls now use collision-free private canonical numbers and probe sources use target `libc::SYS_*` values. The initial ELF is materialized under `/run/carrick`, exec preserves the Linux signal state that survives replacement, clone exit signals and `CLONE_PIDFD` are published atomically, replacement images are visible to post-exec threads, identity mappings support private repointing and read-only metadata, and native CPU accounting uses host `RUSAGE_SELF`. The x86 fault address comes from `REG_CR2`; the vDSO and standalone reducers now assert guest-ISA-specific semantics. The final focused fix publishes the mandatory traced-exec `SIGTRAP` boundary. Strict-census false negatives were removed by expressing expected negative observations as affirmative invariants.
 
 **Wave-6 detail (+10):** fork now prepares/publishes the shared child record and exits through the common adoption helper; init-reaper adoption is exposed as guest PID 1 while an explicit child subreaper retains its PID (`pidnsinitreap`,`reparenttoinit`,`pidnsorphanreap`, cascading to `ptracekillcont`). A host-neutral shared-word seam (Darwin ulock / FreeBSD umtx / Linux futex / NetBSD futex), stable pre-fork SysV scope, and native re-dispatch make `sysvmsg`/`sysvmsgwake` pass. Fail-closed identity VMA initialization plus real high-alias backing removed the remaining native-run host crashes and cascaded to `futexwakeexact`,`mremapsharedshrink`,`procstatstate`,`shmnestedfork`. `mlock2`,`legacyaio`,`roprotect`,`schedthread` now fail as clean probe assertions instead of crashing the host; `mlock2` still lacks direct-guest first-touch residency tracking, and `legacyaio`/`schedthread` are aarch64-numbered on this x86 corpus. The parallel census timed out `mtsigrelease` once; the checked-in result records its immediate focused 5/5 rerun.
 
 **Wave-5 detail (+20):** driver — cross-process xsignal ring (`sigqueueusr1`,`bsd_signal_xlate`), pumped standard signals (`pauseinterrupt2`), sigwait/sigtimedwait wake (`sigwaitthread`,`sigtimedwaitintr`,`sigwaitblock`), EINTR wait4 (`waitrestart`), shared FUTEX_WAKE count (`futexwakecount`,`futexsharedalias`), procctl reaper + SIGCHLD routing (`childsubreaper`,`waitsiblingsigchld`) — cascaded to `sigchld`,`cloneexithandled`,`clone3exithandled`,`mtforkcorrupt`,`ltpcheckpoint`,`sysvsem`,`waitexitstorm`,`killfault`; dispatcher — `netifmcast` (bridge eth0 IPv6), `schedprio` (EFAULT non-canonical param).
-- More not-bugs/arch-locked confirmed: `signalfd4` (aarch64 #74=fsync), `futexpingpong` (pass-condition IS a `=false`), `threadcommname`/`schedthread` (aarch64 syscall numbers).
+- At this historical point, `signalfd4`, `threadcommname`, and `schedthread` still used aarch64 syscall numbers; wave 7 made them guest-ISA-neutral. `futexpingpong` also had a negatively phrased pass condition, now expressed affirmatively.
 
-## Session summary: 245 → 344 (+99 net)
+## Session summary: 245 → 407 (+162 net)
 
-From a threadless/signal-less/fork-fragile driver to guest threads + futex + full
-signal delivery + robust fork + container networking + execve + timers/vDSO +
-broad dispatcher correctness. **344/428 = 80% raw, ~85–86% of the ~398–403 winnable**
-(unwinnable: ~12 arch-locked, 8 harness-dependent net, ~7 rootfs-blocked execve,
-icmp host-cap). Remaining winnable backlog: `forkfault`/`mprotectexec`
-(fault-engine faulting-insn retry + translate-on-demand from live guest memory);
-vDSO getrandom/gettimeofday x86 blobs; precise direct-guest protection/residency
-faults (`roprotect`,`mlock2`); exit-signal/clone3 tails; ptrace family.
+The lane advanced from a threadless, signal-less, fork-fragile driver to real
+guest threads and futexes, full signal delivery, robust fork/exec lifecycle,
+container-network identity, timers/vDSO, ptrace stop boundaries, and broad
+backend-neutral dispatcher coverage. **407/428 = 95.1% strict standalone.**
+
+The 21 non-OK rows split cleanly:
+- **Harness-dependent networking (11 binaries):** `bridge_compose_client/server`,
+  `bridge_publish_tcp`, `host_gateway_client`, `multi_network_client/server`,
+  `multi_network_dns_client`, `perf_net_xclient/xserver`, and
+  `udp_published_client/server`. These are coordinated scenarios, not valid
+  independent `native_run` checks.
+- **Live protection/fault retry (4):** `forkfault`, `mprotectexec`, `roprotect`,
+  and `recursionguard` need exact faulting-instruction retry, protection
+  enforcement, or accurate native main-stack discovery.
+- **Shared-futex/exec (2):** `futexforkrequeue`, `ltpcheckpointexec`.
+- **vfork semantics (2):** `vforkvmshare`, `vforkexecthread`.
+- **Host/memory capability (2):** `icmp` (FreeBSD lacks Linux datagram ping
+  sockets) and `mlock2` (first-touch residency tracking).
+
+The next native LTP readiness gate can start now for syscall breadth, but these
+semantic gaps remain release blockers and must not be hidden as baseline excuses.
 
 **Wave-4 detail:** networking — wired `make_native_dispatcher` to `bridge_default` (reused existing VMM/macOS container synthesis, ZERO new code) → 8 `bridge_*` probes; driver — execve/Rung E in-process image replacement (`execfromthread`/`execsig`/`execthreads`), `threadstatstate` regression fixed (shared-futex waiter now marks `/proc` state `'S'`). `openat2resolve` census-flaky (passes standalone). **1 real regression: `netifmcast`** — the bridge hides `en0`/shows only `eth0`, which lacks the multicast interface it wants; fix = set `IFF_MULTICAST` on synthesized `eth0` (net networking still +7).
 
-## Effective ceiling (refined) — ~398–403 winnable on this rig
+## Effective standalone ceiling
 
-Beyond arch-locked (~10), two more categories are unwinnable under single-process
-`native_run` on this FreeBSD rig, for infra reasons not runtime bugs:
-- **Harness-dependent networking (8):** `bridge_compose_client/server`,
-  `multi_network_client`, `multi_network_dns_client`, `host_gateway_client`,
-  `udp_published_client/server`, `bridge_publish_tcp` — need a concurrent
-  client/server peer the conformance harness launches (server now correctly
-  `bind`s + blocks instead of aborting; just no peer).
-- **Rootfs-blocked execve (~7):** `execpipe`, `execsocket`, `procconfigloop`,
-  `proclife`, `otmpfileforkexec`, `execvenonutf8`, `fexecveprobe` — need a
-  loadable static guest `/bin/sh`/`/bin/true`; the only host `/bin/true` is a
-  dynamic PIE the static-PIE loader can't load. execve itself works.
-- **Host-capability:** `icmp` (unprivileged ICMP sockets absent on FreeBSD host).
-
-So **344 is ~85–86% of the ~398–403 winnable set** (80% of the raw 428).
+There is no longer an architecture-locked or rootfs-blocked exclusion set: the
+x86-specific probe fixes and self-contained exec reducers removed those limits.
+The strict standalone result is **407/428**. Eleven client/server binaries need
+the coordinated network harness for a meaningful verdict; the other ten
+standalone failures are genuine runtime or host-compatibility work. The intended
+harness ceiling remains **428/428**, not a blessed partial score.
 
 **Wave-3 detail:** driver — `futexshare` (real cause: shared-futex location was `None`; `_umtx_op` non-private key spans fork), `procprctlview` (fork-child resets), `mremapmove`/`mremapshrink`/`protnonesyscall` (real `unmap_range` + a process-wide `MemoryProtections` gate on `IdentityGuestMemory` — the syscall EFAULT gate now fires), `forkaltstack`, `sigbadstack`; dispatcher — `epollpri` (don't arm the kqueue OOB filter on FreeBSD). The protection gate also flipped `aliassize` (the pre-existing host segfault) and `fcntllock`. `killfault`/`forkfpreclaim` census-flaky (pass standalone). **1 real regression: `threadstatstate`** (wave-3 drift; to fix). **Highest-leverage remaining driver fix already landed** (the `MemoryProtections` gate) — expect more PROT_NONE/`SEGV_ACCERR` probes reachable now.
 
