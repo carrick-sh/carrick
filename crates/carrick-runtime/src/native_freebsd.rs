@@ -415,6 +415,11 @@ enum Step {
     Continue(u64),
     Exit(i32),
     Fault(String),
+    /// A `fork()` just made THIS process a fork child (guest `rax` already set
+    /// to 0). The run loop marks itself a descendant so its eventual exit
+    /// `_exit`s directly (reaped by the parent's `wait4`) instead of returning
+    /// a `RunResult` up through `native_run`.
+    BecameForkChild(u64),
 }
 
 /// A minimal multiply-based hasher for the guest-VA block cache. The default
@@ -556,6 +561,8 @@ where
     let mut exit_code: Option<i32> = None;
     let mut fault_detail: Option<String> = None;
     let mut trap_limit_hit = false;
+    // True once this process is a `fork()` descendant (see `Step::Exit`).
+    let mut forked = false;
 
     // Translated-block cache keyed by guest VA: `(exec VA, has_edges,
     // uses_fpu)`. Guest text is read-only here (no self-modifying code), so a
@@ -719,7 +726,21 @@ where
                     &mut guest_fsbase,
                 ) {
                     Step::Continue(rip) => next = rip,
+                    Step::BecameForkChild(rip) => {
+                        // This process is now a fork descendant; its exit must
+                        // be reaped by the parent, not returned up.
+                        forked = true;
+                        next = rip;
+                    }
                     Step::Exit(code) => {
+                        // A fork child exits directly so the parent's wait4
+                        // reaps it (and native_run prints only the top-level
+                        // process's RunResult).
+                        if forked {
+                            // SAFETY: _exit performs no unwinding; the child's
+                            // COW mappings are released by the kernel.
+                            unsafe { libc::_exit(code) };
+                        }
                         exit_code = Some(code);
                         break 'run;
                     }
@@ -878,10 +899,69 @@ fn service_syscall(
         // wait status is 128+signum; the full signal-delivery machinery
         // (handlers, siginfo) is a later rung.
         DispatchOutcome::SignalDeath { signum } => Step::Exit(128 + signum),
+        // fork()/clone(SIGCHLD): in the identity model a guest fork is a REAL
+        // host fork — the child inherits the whole address space (guest memory,
+        // JIT cache, arenas) copy-on-write, and is a real host child so the
+        // parent's wait4 reaps it via host waitpid. The dispatcher's proc model
+        // already distinguishes the child by `getpid() != bootstrap_host_pid`.
+        DispatchOutcome::Fork {
+            parent_tid_addr,
+            child_tid_addr,
+            child_stack,
+            ..
+        } => service_fork(
+            parent_tid_addr,
+            child_tid_addr,
+            child_stack,
+            snapshot,
+            memory,
+            resume,
+        ),
         other => Step::Fault(format!(
             "native x86 driver does not service dispatch outcome {other:?} yet \
-             (threads/fork/futex/signal-wait are later rungs)"
+             (threads/execve/futex are later rungs)"
         )),
+    }
+}
+
+/// Perform a guest `fork()` as a host `fork()`. Sets guest `rax` (0 in the
+/// child, the child pid in the parent), runs the child on `child_stack` if
+/// given, and honors CLONE_PARENT_SETTID / CLONE_CHILD_SETTID. Returns
+/// [`Step::BecameForkChild`] in the child so the run loop `_exit`s it directly.
+fn service_fork(
+    parent_tid_addr: Option<u64>,
+    child_tid_addr: Option<u64>,
+    child_stack: u64,
+    snapshot: &mut X86UcontextSnapshot,
+    memory: &mut IdentityGuestMemory,
+    resume: u64,
+) -> Step {
+    // SAFETY: a plain process fork; the child re-enters the same run loop with
+    // a COW copy of every mapping.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(11);
+        snapshot.gpr[reg::RAX] = (-(errno as i64)) as u64;
+        return Step::Continue(resume);
+    }
+    if pid == 0 {
+        // Child.
+        snapshot.gpr[reg::RAX] = 0;
+        if child_stack != 0 {
+            snapshot.gpr[reg::RSP] = child_stack;
+        }
+        if let Some(addr) = child_tid_addr {
+            let cpid = unsafe { libc::getpid() } as u32;
+            let _ = memory.write_bytes(addr, &cpid.to_le_bytes());
+        }
+        Step::BecameForkChild(resume)
+    } else {
+        // Parent.
+        snapshot.gpr[reg::RAX] = pid as u64;
+        if let Some(addr) = parent_tid_addr {
+            let _ = memory.write_bytes(addr, &(pid as u32).to_le_bytes());
+        }
+        Step::Continue(resume)
     }
 }
 
