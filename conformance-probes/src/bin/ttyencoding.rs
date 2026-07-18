@@ -95,7 +95,7 @@ fn main() {
         report!(
             setup_ok = true,
             // A pipe is never a tty, and TCGETS on it is ENOTTY.
-            pipe_isatty = pipe_isatty,
+            pipe_is_not_tty = !pipe_isatty,
             pipe_tcgets_enotty = (pipe_tcgets == Some(false)),
             pipe_isatty_matches_tcgets = (pipe_isatty == (pipe_tcgets == Some(true))),
             // A pty slave is a tty, and TCGETS on it succeeds.
@@ -103,7 +103,7 @@ fn main() {
             pty_tcgets_ok = (pty_tcgets == Some(true)),
             pty_isatty_matches_tcgets = (pty_isatty == (pty_tcgets == Some(true))),
             // The harness feeds stdin a pipe on both sides: not a tty.
-            stdin_isatty = stdin_isatty,
+            stdin_is_not_tty = !stdin_isatty,
             stdin_isatty_matches_tcgets = (stdin_isatty == (stdin_tcgets == Some(true))),
         );
 

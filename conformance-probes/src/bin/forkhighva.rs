@@ -45,6 +45,6 @@ fn main() {
         let child_ok = libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 0;
         let child_signalled = libc::WIFSIGNALED(st);
         println!("child_highva_map_ok={child_ok}");
-        println!("child_died_by_signal={child_signalled}");
+        println!("child_survived={}", !child_signalled);
     }
 }

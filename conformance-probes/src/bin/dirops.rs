@@ -17,7 +17,7 @@ fn main() {
     fs::create_dir("/tmp/d1").ok();
     println!("mkdir_d1 exists={}", fs::metadata("/tmp/d1").is_ok());
     fs::remove_dir("/tmp/d1").ok();
-    println!("rmdir_d1 exists={}", fs::metadata("/tmp/d1").is_ok());
+    println!("rmdir_d1 gone={}", fs::metadata("/tmp/d1").is_err());
 
     // mkdir -p style: create nested /tmp/d2/a/b, confirm leaf + each ancestor.
     fs::create_dir_all("/tmp/d2/a/b").ok();
@@ -79,7 +79,7 @@ fn main() {
     fs::create_dir_all("/tmp/rd").ok();
     fs::write("/tmp/rd/inside", b"x").ok();
     fs::rename("/tmp/rd", "/tmp/rd2").ok();
-    println!("rename_dir rd_exists={}", fs::metadata("/tmp/rd").is_ok());
+    println!("rename_dir source_gone={}", fs::metadata("/tmp/rd").is_err());
     println!(
         "rename_dir rd2_file_exists={}",
         fs::metadata("/tmp/rd2/inside").is_ok()
@@ -88,7 +88,7 @@ fn main() {
     // unlink a regular file.
     fs::write("/tmp/u1", b"u").ok();
     fs::remove_file("/tmp/u1").ok();
-    println!("unlink_u1 exists={}", fs::metadata("/tmp/u1").is_ok());
+    println!("unlink_u1 gone={}", fs::metadata("/tmp/u1").is_err());
 
     // rmdir on a NON-EMPTY directory → ENOTEMPTY(39); after removing the file
     // it succeeds (rc 0) and the directory is gone.

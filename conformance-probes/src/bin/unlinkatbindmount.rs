@@ -53,7 +53,7 @@ fn main() {
             report!(
                 unlinkat_pre_exists = false,
                 unlinkat_returned_zero = false,
-                unlinkat_post_exists = true,
+                unlinkat_post_missing = false,
                 unlinkat_post_errno_enoent = false,
                 unlink_open_ok = false,
                 unlink_returned_zero = false,
@@ -72,7 +72,7 @@ fn main() {
         let post_access = libc::access(path1.as_ptr() as *const libc::c_char, libc::F_OK);
         let post_errno = if post_access < 0 { errno() } else { 0 };
         report!(
-            unlinkat_post_exists = post_access == 0,
+            unlinkat_post_missing = post_access != 0,
             unlinkat_post_errno_enoent = post_errno == libc::ENOENT,
         );
 

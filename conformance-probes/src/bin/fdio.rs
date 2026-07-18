@@ -115,7 +115,10 @@ fn main() {
 
             // Initially no FD_CLOEXEC.
             let fd0 = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-            println!("fcntl_cloexec_initial={}", (fd0 & libc::FD_CLOEXEC) != 0);
+            println!(
+                "fcntl_cloexec_initial_clear={}",
+                (fd0 & libc::FD_CLOEXEC) == 0
+            );
             unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
             let fd1 = unsafe { libc::fcntl(fd, libc::F_GETFD) };
             println!("fcntl_cloexec_set={}", (fd1 & libc::FD_CLOEXEC) != 0);
