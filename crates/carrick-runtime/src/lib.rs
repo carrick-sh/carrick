@@ -890,11 +890,86 @@ pub mod runtime {
         let argv0 = path.to_string_lossy().into_owned();
         crate::native_freebsd::run_static_x86_elf(
             path,
-            make_linux_dispatcher(),
+            make_native_dispatcher(),
             [argv0],
             std::iter::empty::<String>(),
             DEFAULT_MAX_TRAPS,
         )
+    }
+
+    /// Dispatcher for the NATIVE (DSR) ELF runner with Docker-stable container
+    /// bridge network identity. Unlike [`make_linux_dispatcher`] (host-net, used
+    /// by the bhyve lane), the native lane synthesizes a container bridge: an
+    /// `eth0` with a non-loopback `172.31.x` IPv4, rtnetlink link/addr/route
+    /// dumps, `/proc/net/*`, `/sys/class/net/*`, and a runtime-managed
+    /// `/etc/hosts` + `/etc/resolv.conf`. This is exactly the shape the
+    /// `bridge_*` conformance probes assert (they `getifaddrs`/rtnetlink and abort
+    /// into musl `a_crash` when no container network is present). Mirrors the
+    /// canonical container wiring in `execute.rs` (`RuntimeNetwork::create` +
+    /// `SyscallDispatcher::with_network` + `seed_guest_baseline`). Set
+    /// `CARRICK_NATIVE_NET_HOST=1` to fall back to the host-net dispatcher.
+    #[cfg(all(feature = "platform-freebsd", target_arch = "x86_64"))]
+    fn make_native_dispatcher() -> SyscallDispatcher {
+        use crate::fs_backend::{FsBackend, HostFsBackend};
+
+        if std::env::var_os("CARRICK_NATIVE_NET_HOST").is_some() {
+            return make_linux_dispatcher();
+        }
+
+        let guest_hostname = crate::execute::guest_hostname().to_string();
+        let spec = carrick_spec::NetworkNamespaceSpec::bridge_default(
+            Some(guest_hostname.clone()),
+            Vec::new(),
+            Vec::new(),
+        );
+        let runtime_network = match crate::network::RuntimeNetwork::create(&spec) {
+            Ok(network) => std::sync::Arc::new(network),
+            Err(e) => {
+                eprintln!(
+                    "carrick-native: bridge network setup failed ({e}); falling back to host net"
+                );
+                return make_linux_dispatcher();
+            }
+        };
+
+        let mut dispatcher = SyscallDispatcher::with_network(runtime_network.clone());
+        dispatcher.set_guest_hostname(guest_hostname.clone());
+
+        let scratch_root = std::env::temp_dir().join("carrick-native-scratch");
+        match HostFsBackend::new_in(&scratch_root) {
+            Ok(host) => {
+                let mut backend: Box<dyn FsBackend> = Box::new(host);
+                // Dirs + /etc/{passwd,group,nsswitch} baseline (host-net hosts
+                // written here are overwritten just below).
+                seed_linux_baseline(&mut *backend);
+                // `/etc/hosts` is runtime-managed (Docker regenerates it on every
+                // start): render the bridge model's self-entry (eth0 IP →
+                // hostname) plus gateway aliases so the guest resolves its own
+                // name and the eth0 IP is reflected in `/etc/hosts`.
+                let model = crate::network::model::LinuxNetworkModel::from_spec(&spec);
+                let hosts_entries = runtime_network.guest_hosts_entries().unwrap_or_default();
+                let hosts = model
+                    .hosts_config(
+                        &spec,
+                        hosts_entries
+                            .into_iter()
+                            .map(|entry| (entry.addr, entry.names)),
+                        &[],
+                        &guest_hostname,
+                    )
+                    .render();
+                let _ = backend.set_file_contents("/etc/hosts", hosts.into_bytes());
+                let _ = backend
+                    .set_file_contents("/etc/hostname", format!("{guest_hostname}\n").into_bytes());
+                let _ = dispatcher.set_fs_backend(backend);
+            }
+            Err(e) => {
+                eprintln!(
+                    "carrick-native: host fs backend unavailable ({e}); guest filesystem is empty"
+                );
+            }
+        }
+        dispatcher
     }
 
     #[cfg(feature = "platform-netbsd")]
