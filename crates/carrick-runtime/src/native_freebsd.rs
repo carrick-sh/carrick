@@ -3102,11 +3102,17 @@ fn service_syscall_threaded(
                     sig_mask.block_mask(),
                     signal_pending(sig_mask),
                 ) {
+                    // Ready (child exited) -> re-dispatch the waitid to reap.
                     WaitResult::Ready => continue,
+                    // A deliverable signal interrupted the blocking wait4/waitid:
+                    // return EINTR so the run loop's delivery tail runs the guest
+                    // handler and, for SA_RESTART, restarts the syscall (LTP's
+                    // SAFE_WAITPID under an SA_RESTART SIGALRM heartbeat —
+                    // `waitrestart`). Returning ECHILD here (the old behaviour)
+                    // told the guest it had no children mid-wait, aborting the
+                    // reap. Matches the shared single-thread lane (runtime.rs).
                     WaitResult::Interrupted | WaitResult::TimedOut => {
-                        return Ok(DispatchOutcome::Errno {
-                            errno: crate::linux_abi::LINUX_ECHILD,
-                        });
+                        return Ok(DispatchOutcome::Errno { errno: EINTR });
                     }
                     WaitResult::Errno(errno) => return Ok(DispatchOutcome::Errno { errno }),
                 }
