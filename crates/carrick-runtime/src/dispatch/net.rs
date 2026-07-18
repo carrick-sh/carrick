@@ -521,6 +521,20 @@ impl SyscallDispatcher {
         if interest.oob && !self.fd_supports_epoll_oob(fd) {
             interest.oob = false;
         }
+        // FreeBSD/NetBSD kqueue has no usable OOB filter — `register_io` with an
+        // OOB interest returns ENOTSUP and would fail the whole `epoll_ctl(ADD)`.
+        // Unlike macOS (whose `poll(2)` never surfaces `POLLPRI`, so the
+        // EVFILT_EXCEPT/NOTE_OOB filter is the only OOB signal), FreeBSD/NetBSD
+        // native `poll(2)` DOES report `POLLPRI`, so EPOLLPRI readiness is
+        // computed by the `libc::poll(POLLPRI)` recompute in `epoll_ready_events`
+        // — the kqueue OOB filter is both unsupported and unnecessary here. Drop
+        // it from the host registration only; the guest's requested EPOLLPRI
+        // interest is unaffected (readiness still keys off `event.events`).
+        // (probe `epollpri`.)
+        #[cfg(any(feature = "platform-freebsd", feature = "platform-netbsd"))]
+        {
+            interest.oob = false;
+        }
         interest
     }
 
