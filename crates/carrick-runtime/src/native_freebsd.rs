@@ -776,7 +776,11 @@ fn map_prot(len: usize, prot: i32, fixed_at: Option<u64>) -> *mut u8 {
 /// copies the file bytes. The fixture/probe ELFs carry only R_X86_64_RELATIVE
 /// (or none); this first rung requires a no-reloc / RELATIVE-only image and
 /// applies RELATIVE relocations against the bias.
-fn load_static_pie(bytes: &[u8], argv: &[String]) -> Result<LoadedImage, RuntimeError> {
+fn load_static_pie(
+    bytes: &[u8],
+    argv: &[Vec<u8>],
+    env: &[Vec<u8>],
+) -> Result<LoadedImage, RuntimeError> {
     let elf =
         Elf::parse(bytes).map_err(|e| RuntimeError::Unsupported(format!("parse ELF: {e}")))?;
     if !elf.is_64 {
@@ -838,7 +842,6 @@ fn load_static_pie(bytes: &[u8], argv: &[String]) -> Result<LoadedImage, Runtime
     // Apply R_X86_64_RELATIVE relocations (type 8): *(base+off) = base+addend.
     // Any other relocation type means a dynamic image this first rung does not
     // support — fail closed rather than run miscomputed addresses.
-    const R_X86_64_RELATIVE: u32 = 8;
     for rela in elf.dynrelas.iter() {
         if rela.r_type != R_X86_64_RELATIVE {
             return Err(RuntimeError::Unsupported(format!(
@@ -915,6 +918,7 @@ fn load_static_pie(bytes: &[u8], argv: &[String]) -> Result<LoadedImage, Runtime
         stack as u64 + GUEST_STACK_LEN as u64,
         scratch as u64,
         argv,
+        env,
         &elf,
         bias,
         vdso_base,
@@ -967,14 +971,88 @@ fn load_static_pie(bytes: &[u8], argv: &[String]) -> Result<LoadedImage, Runtime
     })
 }
 
+/// Only the R_X86_64_RELATIVE dynamic reloc type is supported by the loader.
+const R_X86_64_RELATIVE: u32 = 8;
+
+/// Cheaply verify an ELF is loadable by [`load_static_pie`] (64-bit, has a
+/// PT_LOAD, and carries only RELATIVE dynamic relocations) WITHOUT mapping
+/// anything. Run before retiring the old image on execve so an unloadable
+/// target fails the syscall with an errno while the old image is still live,
+/// instead of tearing down and then faulting past the point of no return.
+fn validate_loadable(bytes: &[u8]) -> Result<(), crate::linux_abi::LinuxErrno> {
+    let elf = Elf::parse(bytes).map_err(|_| crate::linux_abi::LINUX_ENOEXEC)?;
+    if !elf.is_64 {
+        return Err(crate::linux_abi::LINUX_ENOEXEC);
+    }
+    if !elf.program_headers.iter().any(|ph| ph.p_type == PT_LOAD) {
+        return Err(crate::linux_abi::LINUX_ENOEXEC);
+    }
+    if elf
+        .dynrelas
+        .iter()
+        .any(|rela| rela.r_type != R_X86_64_RELATIVE)
+    {
+        return Err(crate::linux_abi::LINUX_ENOEXEC);
+    }
+    Ok(())
+}
+
+/// Resolve + read an `execve(2)` target through the dispatcher's exec path
+/// (rootfs/overlay/mounts, then the host-FS fallback), following `#!` shebangs,
+/// and validate that the resulting bytes are loadable. Returns the file bytes,
+/// the resolved absolute path, and the (possibly shebang-rewritten) argv. All
+/// failures return a Linux errno the guest observes from the failed `execve` —
+/// nothing is torn down here, so the old image survives a failed exec. Mirrors
+/// `native_darwin::load_native_execve_image` but for the simpler static-PIE
+/// FreeBSD loader.
+#[allow(clippy::type_complexity)]
+fn load_execve_image(
+    dispatcher: &SyscallDispatcher,
+    path: &str,
+    argv: Vec<Vec<u8>>,
+) -> Result<(Vec<u8>, String, Vec<Vec<u8>>), crate::linux_abi::LinuxErrno> {
+    // Linux requires a non-empty argv; a guest that passes an empty vector gets
+    // argv[0] = the program path (matching musl/glibc's fallback).
+    let argv = if argv.is_empty() {
+        vec![path.as_bytes().to_vec()]
+    } else {
+        argv
+    };
+    let raw = path.to_string();
+    let absolute = dispatcher.resolve_exec_path(path);
+    let (resolved, argv) = crate::exec_helpers::resolve_shebang(dispatcher, absolute, argv)?;
+    let host_fallback = dispatcher.exec_host_fs_fallback();
+    // Host-FS fallback tries the resolved (cwd-absolutized) path first, then the
+    // RAW guest path relative to the runner's cwd — the native lane runs a probe
+    // by a host-relative path and its self-`execve(argv[0])` re-execs that same
+    // relative string, which resolve_exec_path would absolutize away from the
+    // host file. Matches the initial `std::fs::read(path)` load.
+    let file = dispatcher
+        .read_exec_file(&resolved)
+        .or_else(|| {
+            if host_fallback {
+                std::fs::read(&resolved)
+                    .ok()
+                    .or_else(|| std::fs::read(&raw).ok())
+            } else {
+                None
+            }
+        })
+        .ok_or(crate::linux_abi::LINUX_ENOENT)?;
+    validate_loadable(&file)?;
+    Ok((file, resolved, argv))
+}
+
 /// Build the Linux x86_64 initial stack:
-/// `[argc][argv..][NULL][envp NULL][auxv..][AT_NULL]`, with argv strings and a
-/// 16-byte AT_RANDOM block in the scratch page. Returns the guest rsp (argc),
-/// 16-aligned. Envp is empty in this first rung.
+/// `[argc][argv..][NULL][envp..][NULL][auxv..][AT_NULL]`, with argv/env byte
+/// strings and a 16-byte AT_RANDOM block in the scratch page. Returns the guest
+/// rsp (argc), 16-aligned. argv/env are opaque Linux-ABI byte strings (a guest
+/// execve may pass non-UTF-8 args/env), NUL-terminated in the scratch page.
 fn build_initial_stack(
     stack_top: u64,
     scratch: u64,
-    argv: &[String],
+    argv: &[Vec<u8>],
+    env: &[Vec<u8>],
     elf: &Elf,
     bias: u64,
     vdso_base: u64,
@@ -997,17 +1075,19 @@ fn build_initial_stack(
         std::ptr::write_bytes(random_ptr as *mut u8, 0x5a, 16);
     }
     cur += 16;
-    let mut arg_ptrs = Vec::with_capacity(argv.len());
-    for a in argv {
-        let bytes = a.as_bytes();
-        // SAFETY: within the scratch page (argv for a probe is tiny).
+    // Lay argv, then env, byte strings (NUL-terminated) into the scratch page.
+    let mut place = |bytes: &[u8]| -> u64 {
+        let at = cur;
+        // SAFETY: within the scratch page (argv/env for a probe is tiny).
         unsafe {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), cur as *mut u8, bytes.len());
-            *((cur + bytes.len() as u64) as *mut u8) = 0;
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), at as *mut u8, bytes.len());
+            *((at + bytes.len() as u64) as *mut u8) = 0;
         }
-        arg_ptrs.push(cur);
         cur += bytes.len() as u64 + 1;
-    }
+        at
+    };
+    let arg_ptrs: Vec<u64> = argv.iter().map(|a| place(a)).collect();
+    let env_ptrs: Vec<u64> = env.iter().map(|e| place(e)).collect();
 
     let phdr_va = elf.header.e_phoff + bias;
 
@@ -1017,6 +1097,7 @@ fn build_initial_stack(
     words.push(argv.len() as u64); // argc
     words.extend(arg_ptrs.iter().copied()); // argv[]
     words.push(0); // argv NULL
+    words.extend(env_ptrs.iter().copied()); // envp[]
     words.push(0); // envp NULL
     // auxv pairs
     let mut auxv: Vec<(u64, u64)> = vec![
@@ -1100,6 +1181,16 @@ enum Step {
     /// than the runner dying by the signal itself. The run loop decides which,
     /// since only it knows the `forked` flag.
     SignalDeath(i32),
+    /// `execve(2)`/`execveat(2)`: replace the current process image in place. The
+    /// run loop retires the old `LoadedImage`, loads the new static-PIE ELF into
+    /// the identity space, rebuilds the initial stack + auxv from the raw argv/
+    /// env bytes, resets the dispatcher's memory/signal exec state and the per-
+    /// thread JIT caches, and resumes at the new entry (execve does not return).
+    Execve {
+        path: String,
+        argv: Vec<Vec<u8>>,
+        env: Vec<Vec<u8>>,
+    },
 }
 
 /// A minimal multiply-based hasher for the guest-VA block cache. The default
@@ -1184,6 +1275,15 @@ struct ExitState {
     code: std::sync::Mutex<Option<i32>>,
     cv: std::sync::Condvar,
     requested: std::sync::atomic::AtomicBool,
+    /// Set by a thread performing `execve(2)` while siblings are live: all OTHER
+    /// guest threads must STOP running guest code (Linux kills the thread group,
+    /// keeping only the execing task) WITHOUT recording a process exit code —
+    /// the new image's eventual exit decides that.
+    exec_stop: std::sync::atomic::AtomicBool,
+    /// How many siblings have acknowledged `exec_stop` by leaving their run
+    /// loop. The execing thread waits on this before retiring the old image so
+    /// no sibling faults on a mapping being torn out from under it.
+    exec_acks: std::sync::atomic::AtomicUsize,
 }
 
 impl ExitState {
@@ -1192,7 +1292,44 @@ impl ExitState {
             code: std::sync::Mutex::new(None),
             cv: std::sync::Condvar::new(),
             requested: std::sync::atomic::AtomicBool::new(false),
+            exec_stop: std::sync::atomic::AtomicBool::new(false),
+            exec_acks: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// Signal every OTHER guest thread to stop for an `execve` takeover.
+    fn request_exec_stop(&self) {
+        self.exec_acks
+            .store(0, std::sync::atomic::Ordering::Release);
+        self.exec_stop
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    fn exec_stop_requested(&self) -> bool {
+        self.exec_stop.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// A sibling acknowledges it has left its run loop for the exec takeover.
+    fn ack_exec_stop(&self) {
+        self.exec_acks
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// Block (bounded spin) until at least `n` siblings have acked the stop, so
+    /// the execing thread can safely retire the old image. Bounded so a sibling
+    /// wedged in an uninterruptible host call cannot hang exec forever.
+    fn wait_exec_acks(&self, n: usize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while self.exec_acks.load(std::sync::atomic::Ordering::Acquire) < n {
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        // The takeover is complete; clear the flag so the new image's own
+        // future threads are not spuriously stopped.
+        self.exec_stop
+            .store(false, std::sync::atomic::Ordering::Release);
     }
 
     /// Record the process exit code (first writer wins) and wake any waiter.
@@ -1482,10 +1619,11 @@ where
     // shim cannot be shared across concurrent in-process runs.
     let _run_guard = RUN_LOCK.lock().unwrap_or_else(|p| p.into_inner());
 
-    let argv: Vec<String> = argv.into_iter().collect();
+    let argv: Vec<Vec<u8>> = argv.into_iter().map(|a| a.into_bytes()).collect();
+    let env: Vec<Vec<u8>> = _env.into_iter().map(|e| e.into_bytes()).collect();
     let bytes = std::fs::read(path)
         .map_err(|e| RuntimeError::Unsupported(format!("read {}: {e}", path.display())))?;
-    let image = load_static_pie(&bytes, &argv)?;
+    let image = load_static_pie(&bytes, &argv, &env)?;
 
     let jit = FreebsdHostJit;
     jit.supported()
@@ -1654,18 +1792,20 @@ fn run_x86_thread(
     // guest's code pages keep their VAs), so it stays borrowed from the caller.
     let mut active = Arc::clone(shared);
     let mut tid = tid;
-    let image = Arc::clone(&shared.image);
+    // Mutable so an in-place `execve` can retire this and swap in the new image;
+    // every guest-code reader below re-borrows it, so the swap is picked up. All
+    // guest-code reads go through the segment-aware `image.code_bytes`, which
+    // never crosses an unmapped gap between PT_LOAD segments.
+    let mut image = Arc::clone(&shared.image);
     let jit = FreebsdHostJit;
     let max_traps = shared.max_traps;
-    // All guest-code reads go through the segment-aware `image.code_bytes`,
-    // which never crosses an unmapped gap between PT_LOAD segments.
-    let read_guest = |va: u64| -> Vec<u8> { image.code_bytes(va).to_vec() };
     // Read the full body of a block. A block is planned within one segment, so
     // reading up to that segment's end (via repeated 16-byte-bounded reads
     // would be O(n); instead read the one contiguous run) is safe. `code_bytes`
     // is segment-bounded, so extend from `base` across the block by reading the
-    // segment run that contains it.
-    let read_block = |block: &X86Block| -> Vec<u8> {
+    // segment run that contains it. Takes the image explicitly (not a captured
+    // borrow) so an `execve` image swap is observed on the next block.
+    let read_block = |image: &LoadedImage, block: &X86Block| -> Vec<u8> {
         let base = block.start;
         let want = block.end.max(block.exit.va());
         let mut out = Vec::new();
@@ -1716,6 +1856,10 @@ fn run_x86_thread(
     // Breadcrumb ring: the last guest VAs entered, for diagnosing where an
     // unhandled scenario was reached from.
     let mut history: Vec<u64> = Vec::new();
+    // True once THIS thread performed an in-process `execve` takeover: it keeps
+    // running the new image and must ignore the `exec_stop` it raised for its
+    // (now-retired) siblings.
+    let mut exec_owner = false;
 
     'run: while traps < max_traps {
         // Another guest thread requested process exit (`exit_group`, or the
@@ -1731,6 +1875,16 @@ fn run_x86_thread(
                 unsafe { libc::_exit(code) };
             }
             return ThreadRunOutcome::Exit { code, traps };
+        }
+        // A sibling thread is taking over the process via `execve`: Linux kills
+        // the rest of the thread group, keeping only the execing task. Stop
+        // running guest code and END this host thread WITHOUT recording a
+        // process exit code (the new image decides that). Ack so the execing
+        // thread knows it is safe to retire the old image. The execing thread
+        // itself (`exec_owner`) ignores its own signal and keeps running.
+        if !exec_owner && active.exit.exec_stop_requested() {
+            active.exit.ack_exec_stop();
+            return ThreadRunOutcome::ThreadDone { traps };
         }
         history.push(next);
         if history.len() > 64 {
@@ -1750,6 +1904,9 @@ fn run_x86_thread(
             // boundary (an internal, in-segment boundary), so it never returns
             // an empty `Continue{target: start}` — which the chainer would turn
             // into an infinite self-jump.
+            // Fresh per-iteration reader over the CURRENT image (an execve may
+            // have swapped it), bounded to the mapped segment containing `va`.
+            let read_guest = |va: u64| -> Vec<u8> { image.code_bytes(va).to_vec() };
             let block = match plan_block(next, 256, PAGE, read_guest) {
                 Ok(b) => b,
                 Err(e) => {
@@ -1783,7 +1940,7 @@ fn run_x86_thread(
                 ));
                 break;
             }
-            let body = read_block(&block);
+            let body = read_block(&image, &block);
             let linked = match emit_block_linked(&body, &block) {
                 Ok(t) => t,
                 Err(e) => {
@@ -2013,6 +2170,87 @@ fn run_x86_thread(
                         }
                         exit_code = Some(128 + signum);
                         break 'run;
+                    }
+                    Step::Execve { path, argv, env } => {
+                        // In-process image replacement. `snapshot.rip` is the
+                        // post-syscall resume the guest returns to if the exec
+                        // FAILS (an error return from execve). Resolve + read +
+                        // validate the target while the OLD image is still live;
+                        // only on success do we retire it (Linux's exec point of
+                        // no return). Sibling guest threads: Linux execve kills
+                        // the whole thread group, keeping only the execing task.
+                        match load_execve_image(&active.dispatcher, &path, argv) {
+                            Err(errno) => {
+                                // Exec failed with the old image intact: return
+                                // the errno to the guest and resume.
+                                snapshot.gpr[reg::RAX] = (-(errno.get() as i64)) as u64;
+                                next = snapshot.rip;
+                            }
+                            Ok((bytes, resolved, argv)) => {
+                                // Retire every sibling guest thread: after exec
+                                // only the execing task survives (`execfromthread`
+                                // execs from a non-leader while main keeps
+                                // running). Signal siblings to stop and WAIT for
+                                // them to leave their run loops before touching
+                                // the shared image, so none faults on a mapping
+                                // torn out from under it. Then this thread is the
+                                // sole survivor and owns the exec.
+                                let siblings =
+                                    active.registry.live_count().saturating_sub(1);
+                                if siblings > 0 {
+                                    active.exit.request_exec_stop();
+                                    active.exit.wait_exec_acks(siblings);
+                                }
+                                active.registry.remove_all_except(tid);
+                                exec_owner = true;
+                                // Reset the dispatcher's per-process exec state:
+                                // fresh brk/mmap bookkeeping, signal handlers to
+                                // default, close O_CLOEXEC fds, new /proc identity.
+                                active.dispatcher.reset_memory_state_on_execve();
+                                active.dispatcher.reset_signal_handlers_on_execve();
+                                active.dispatcher.close_cloexec_fds();
+                                let argv_strings: Vec<String> = argv
+                                    .iter()
+                                    .map(|a| String::from_utf8_lossy(a).into_owned())
+                                    .collect();
+                                active.dispatcher.set_executable_identity(
+                                    resolved,
+                                    argv_strings,
+                                    env.clone(),
+                                );
+                                active.dispatcher.forget_thread_signal_state(tid);
+                                // Retire the old image, then map the new one. The
+                                // vDSO/vvar live at FIXED VAs, so the old must be
+                                // unmapped BEFORE the new maps over them.
+                                let old = std::mem::replace(&mut image, Arc::clone(&shared.image));
+                                old.teardown();
+                                match load_static_pie(&bytes, &argv, &env) {
+                                    Ok(new_image) => {
+                                        image = Arc::new(new_image);
+                                    }
+                                    Err(e) => {
+                                        // Past the point of no return: the old
+                                        // image is gone. Fail the run loudly.
+                                        fault_detail = Some(format!(
+                                            "execve load after image retirement: {e:?}"
+                                        ));
+                                        break;
+                                    }
+                                }
+                                // Reset this thread's JIT caches + register state
+                                // and resume at the new entry. Every translated
+                                // block pointed into the old image's code; clear
+                                // them so the new image re-JITs from scratch.
+                                cache.clear();
+                                pending.clear();
+                                cursor = slice_off;
+                                cursor_limit = slice_off + slice_len;
+                                guest_fsbase = 0;
+                                snapshot = X86UcontextSnapshot::new();
+                                snapshot.gpr[reg::RSP] = image.rsp;
+                                next = image.entry;
+                            }
+                        }
                     }
                     Step::Fault(detail) => {
                         fault_detail = Some(detail);
@@ -2419,9 +2657,15 @@ fn service_syscall(
             Ok(rip) => Step::Continue(rip),
             Err(()) => Step::SignalDeath(crate::linux_abi::LINUX_SIGSEGV),
         },
+        // `execve(2)`/`execveat(2)`: the dispatcher resolved the target and
+        // handed the raw argv/env byte strings out. The image swap must happen
+        // in the run loop (it owns the `LoadedImage` + JIT caches), so surface a
+        // dedicated Step. `snapshot.rip` is the post-syscall resume the run loop
+        // uses for the error path (a failed exec returns errno to the guest).
+        DispatchOutcome::Execve { path, argv, env } => Step::Execve { path, argv, env },
         other => Step::Fault(format!(
             "native x86 driver does not service dispatch outcome {other:?} yet \
-             (execve/vfork are later rungs)"
+             (vfork is a later rung)"
         )),
     }
 }
