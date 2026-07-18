@@ -362,7 +362,27 @@ Reliable serial census, all 432 targets. Raw data: `docs/native-x86-census.tsv`.
 | signals + dispatcher | 292 / 428 (loose exit=) | overcounted — classifier accepted any `exit=`, incl. `exit=134` aborts |
 | signals + dispatcher + die-by-signal | 282 / 428 (exit=0 STRICT) | honest; +37 net over 245. die-by-signal fix dropped OTHER crashes 32→8 |
 | wave 2 (parallel: driver + dispatcher) | 294 / 428 (~295 true) | +12 net. vDSO, io-waiter signal-interruptibility, setitimer; sysvsemstat/accounting/waitpgid |
-| **wave 3 (parallel: driver + dispatcher)** | **304 / 428 (~305 true)** | +10 net. shared futex (_umtx_op), fork-child resets, real unmap_range + PROT_NONE EFAULT gate, fork altstack, epollpri |
+| wave 3 (parallel: driver + dispatcher) | 304 / 428 (~305 true) | +10 net. shared futex, fork-child resets, unmap_range + PROT_NONE gate, altstack, epollpri |
+| **wave 4 (parallel: driver + networking)** | **314 / 428 (~315 true)** | +10 net. container bridge network (8 bridge_*), execve/Rung E (execfromthread/execsig/execthreads), threadstatstate recovered |
+
+**Wave-4 detail:** networking — wired `make_native_dispatcher` to `bridge_default` (reused existing VMM/macOS container synthesis, ZERO new code) → 8 `bridge_*` probes; driver — execve/Rung E in-process image replacement (`execfromthread`/`execsig`/`execthreads`), `threadstatstate` regression fixed (shared-futex waiter now marks `/proc` state `'S'`). `openat2resolve` census-flaky (passes standalone). **1 real regression: `netifmcast`** — the bridge hides `en0`/shows only `eth0`, which lacks the multicast interface it wants; fix = set `IFF_MULTICAST` on synthesized `eth0` (net networking still +7).
+
+## Effective ceiling (refined) — ~398–403 winnable on this rig
+
+Beyond arch-locked (~10), two more categories are unwinnable under single-process
+`native_run` on this FreeBSD rig, for infra reasons not runtime bugs:
+- **Harness-dependent networking (8):** `bridge_compose_client/server`,
+  `multi_network_client`, `multi_network_dns_client`, `host_gateway_client`,
+  `udp_published_client/server`, `bridge_publish_tcp` — need a concurrent
+  client/server peer the conformance harness launches (server now correctly
+  `bind`s + blocks instead of aborting; just no peer).
+- **Rootfs-blocked execve (~7):** `execpipe`, `execsocket`, `procconfigloop`,
+  `proclife`, `otmpfileforkexec`, `execvenonutf8`, `fexecveprobe` — need a
+  loadable static guest `/bin/sh`/`/bin/true`; the only host `/bin/true` is a
+  dynamic PIE the static-PIE loader can't load. execve itself works.
+- **Host-capability:** `icmp` (unprivileged ICMP sockets absent on FreeBSD host).
+
+So **314/~315 is ~78% of the ~398–403 winnable set** (73% of the raw 428).
 
 **Wave-3 detail:** driver — `futexshare` (real cause: shared-futex location was `None`; `_umtx_op` non-private key spans fork), `procprctlview` (fork-child resets), `mremapmove`/`mremapshrink`/`protnonesyscall` (real `unmap_range` + a process-wide `MemoryProtections` gate on `IdentityGuestMemory` — the syscall EFAULT gate now fires), `forkaltstack`, `sigbadstack`; dispatcher — `epollpri` (don't arm the kqueue OOB filter on FreeBSD). The protection gate also flipped `aliassize` (the pre-existing host segfault) and `fcntllock`. `killfault`/`forkfpreclaim` census-flaky (pass standalone). **1 real regression: `threadstatstate`** (wave-3 drift; to fix). **Highest-leverage remaining driver fix already landed** (the `MemoryProtections` gate) — expect more PROT_NONE/`SEGV_ACCERR` probes reachable now.
 
