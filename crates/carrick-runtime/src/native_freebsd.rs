@@ -686,6 +686,65 @@ fn run_pending_signals(
     None
 }
 
+/// ASYNC-SIGNAL-SAFE host handler for the four "pumped" standard signals
+/// (SIGHUP/SIGINT/SIGQUIT/SIGTERM). On the VMM lanes these are owned by the
+/// kick-backend signal pump, which catches the host signal and routes it into
+/// the guest; the native lane has NO pump, so without this handler a sibling
+/// guest process's cross-process `kill(child, SIGINT)` (which the dispatcher
+/// delivers as a direct `libc::kill` — these signals are is_claimed-excluded
+/// from the routed-handler mirror AND, outside a pid namespace, from the xsig
+/// ring route) takes the HOST default action and TERMINATES the receiver
+/// instead of running its guest handler (`pauseinterrupt2`, `waitrestart`,
+/// `waitsiblingsigchld`). Mirrors `carrick_signal_core`'s `shared_routed_handler`
+/// verbatim: translate host→Linux signum, record the sender pid, publish the
+/// signal process-directed pending, and poke so a parked run-loop wait breaks.
+/// The generic `deliver_pending_signal` then honors the guest disposition
+/// (handler → inject frame; SIG_IGN → drop; SIG_DFL → default action, i.e.
+/// die-by-signal for a fork child so its parent's wait4 sees WIFSIGNALED).
+extern "C" fn native_pumped_signal_handler(
+    host_sig: i32,
+    info: *mut libc::siginfo_t,
+    _ctx: *mut libc::c_void,
+) {
+    let linux_sig = crate::host_signal::host_to_linux_signum(host_sig);
+    if !info.is_null() {
+        // One atomic store — async-signal-safe.
+        let si_pid = unsafe { (*info).si_pid() };
+        carrick_signal_core::record_sender(linux_sig, si_pid);
+    }
+    carrick_signal_core::publish_process_signal(linux_sig);
+    // No pump on this lane: the host-signal delivery itself EINTRs the parked
+    // wait, and the io_wait predicate re-checks pending; the poke matches the
+    // nudge handler and is a harmless no-op when no self-pipe is armed.
+    carrick_hal::signal_pump::poke();
+}
+
+/// Install [`native_pumped_signal_handler`] for the four pumped standard signals
+/// on their HOST numbers. Called once pre-fork (idempotent across reused runs);
+/// `libc::fork` inherits the host sigactions so every guest descendant routes
+/// these to its own guest disposition. `SA_SIGINFO` (to read `si_pid`), NO
+/// `SA_RESTART` so a delivery to a run-loop thread EINTRs its in-progress wait.
+fn install_native_pumped_handlers() {
+    for &linux_sig in &[
+        carrick_abi::LINUX_SIGHUP,
+        carrick_abi::LINUX_SIGINT,
+        carrick_abi::LINUX_SIGQUIT,
+        carrick_abi::LINUX_SIGTERM,
+    ] {
+        let host = crate::host_signal::linux_to_host_signum(linux_sig);
+        // SAFETY: zeroed sigaction = "no flags, empty mask"; we set a valid
+        // `extern "C"` SA_SIGINFO handler on a valid host signum.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction =
+                native_pumped_signal_handler as *const () as libc::sighandler_t;
+            libc::sigemptyset(&mut action.sa_mask);
+            action.sa_flags = libc::SA_SIGINFO;
+            libc::sigaction(host, &action, std::ptr::null_mut());
+        }
+    }
+}
+
 /// A loaded static-pie ELF in the host address space (guest VA == host VA).
 struct LoadedImage {
     span_base: u64,
@@ -1686,6 +1745,10 @@ where
     // host default action and terminate the receiver instead of draining the
     // ring. Idempotent across the reused in-process test-harness runs.
     carrick_signal_core::host_glue::init_xsig::<crate::host_signal::ActiveGlue>();
+    // Route the pump-owned standard signals (SIGHUP/SIGINT/SIGQUIT/SIGTERM) to
+    // the guest on this pump-less lane (see the handler doc); pre-fork so every
+    // descendant inherits the routing.
+    install_native_pumped_handlers();
 
     let free_slices: Vec<usize> = (0..JIT_SLICE_COUNT).map(|i| i * JIT_SLICE_LEN).collect();
     let shared = Arc::new(SharedRun {
