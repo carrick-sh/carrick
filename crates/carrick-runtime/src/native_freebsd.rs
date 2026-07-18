@@ -1229,6 +1229,23 @@ where
     let futex = Arc::new(crate::thread::FutexTable::new());
     crate::thread::set_current_futex_table(&futex);
 
+    // Wire process-directed interval-timer delivery (setitimer/alarm/POSIX
+    // timers). The dispatch arm (dispatch/time.rs) finds no owning backend on
+    // this lane and spawns the shared wall-clock fallback thread, whose fire
+    // action calls `crate::timer_delivery::deliver`. That path only publishes
+    // (into the shared process-directed pending mask) + kicks when a delivery
+    // handle is registered; without this call `deliver` is a silent no-op and
+    // SIGALRM/SIGVTALRM/SIGPROF never reach the guest (`preemptsigstorm`'s
+    // `alrm_delivered=false`). A busy guest thread consumes the published
+    // signal at its next syscall-return safe point; the kicker is a no-op until
+    // guest threads register a kick handle, which they do not need here.
+    let timer_kicker: Arc<carrick_hal::GenericVcpuRegistry> =
+        Arc::new(carrick_hal::GenericVcpuRegistry::new());
+    crate::timer_delivery::register(
+        Arc::clone(&timer_kicker) as Arc<dyn carrick_hal::VcpuRegistry>,
+        tid,
+    );
+
     let free_slices: Vec<usize> = (0..JIT_SLICE_COUNT).map(|i| i * JIT_SLICE_LEN).collect();
     let shared = Arc::new(SharedRun {
         dispatcher: Arc::new(dispatcher),
