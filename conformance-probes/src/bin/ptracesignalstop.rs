@@ -100,7 +100,7 @@ unsafe fn wait_changed(pid: i32, options: i32) -> WaitStatus {
 
 unsafe fn wait_blocking_with_alarm(pid: i32) -> WaitStatus {
     let mut sa: libc::sigaction = core::mem::zeroed();
-    sa.sa_sigaction = on_alarm as usize;
+    sa.sa_sigaction = on_alarm as *const () as usize;
     libc::sigemptyset(&mut sa.sa_mask);
     libc::sigaction(libc::SIGALRM, &sa, core::ptr::null_mut());
 
@@ -315,7 +315,7 @@ fn main() {
             sigterm_stopped = sigterm.stopped,
             sigterm_stopsig = sigterm.stopsig,
             sigterm_stopsig_is_sigterm = sigterm.stopsig == libc::SIGTERM,
-            sigterm_exited_instead = sigterm.exited_instead,
+            sigterm_not_exited_instead = !sigterm.exited_instead,
             sigterm_exit_status = sigterm.exit_status,
             sigterm_cont_ok = sigterm.cont_ok,
             sigterm_cont_errno = sigterm.cont_errno,
@@ -328,7 +328,7 @@ fn main() {
             blocking_sigterm_stopsig = blocking_sigterm.stopsig,
             blocking_sigterm_stopsig_is_sigterm = blocking_sigterm.stopsig == libc::SIGTERM,
             blocking_sigterm_wait_errno = blocking_sigterm.wait_errno,
-            blocking_sigterm_wait_eintr = blocking_sigterm.wait_errno == libc::EINTR,
+            blocking_sigterm_wait_not_eintr = blocking_sigterm.wait_errno != libc::EINTR,
             blocking_sigterm_cont_ok = blocking_sigterm.cont_ok,
             blocking_sigterm_final_reaped = blocking_sigterm.final_reaped,
             blocking_sigterm_final_exited = blocking_sigterm.final_exited,
@@ -339,7 +339,7 @@ fn main() {
             blocking_sighup_stopsig = blocking_sighup.stopsig,
             blocking_sighup_stopsig_is_sighup = blocking_sighup.stopsig == libc::SIGHUP,
             blocking_sighup_wait_errno = blocking_sighup.wait_errno,
-            blocking_sighup_wait_eintr = blocking_sighup.wait_errno == libc::EINTR,
+            blocking_sighup_wait_not_eintr = blocking_sighup.wait_errno != libc::EINTR,
             blocking_sighup_cont_ok = blocking_sighup.cont_ok,
             blocking_sighup_final_reaped = blocking_sighup.final_reaped,
             blocking_sighup_final_exited = blocking_sighup.final_exited,
@@ -351,7 +351,8 @@ fn main() {
             delayed_blocking_sighup_stopsig_is_sighup =
                 delayed_blocking_sighup.stopsig == libc::SIGHUP,
             delayed_blocking_sighup_wait_errno = delayed_blocking_sighup.wait_errno,
-            delayed_blocking_sighup_wait_eintr = delayed_blocking_sighup.wait_errno == libc::EINTR,
+            delayed_blocking_sighup_wait_not_eintr =
+                delayed_blocking_sighup.wait_errno != libc::EINTR,
             delayed_blocking_sighup_cont_ok = delayed_blocking_sighup.cont_ok,
             delayed_blocking_sighup_final_reaped = delayed_blocking_sighup.final_reaped,
             delayed_blocking_sighup_final_exited = delayed_blocking_sighup.final_exited,
@@ -361,7 +362,7 @@ fn main() {
             sigstop_stopped = sigstop.stopped,
             sigstop_stopsig = sigstop.stopsig,
             sigstop_stopsig_is_sigstop = sigstop.stopsig == libc::SIGSTOP,
-            sigstop_exited_instead = sigstop.exited_instead,
+            sigstop_not_exited_instead = !sigstop.exited_instead,
             sigstop_exit_status = sigstop.exit_status,
             sigstop_cont_ok = sigstop.cont_ok,
             sigstop_cont_errno = sigstop.cont_errno,
@@ -371,7 +372,7 @@ fn main() {
             sigcont_fork_ok = sigcont.fork_ok,
             sigcont_reaped_stop = sigcont.reaped_stop,
             sigcont_stopped = sigcont.stopped,
-            sigcont_exited_instead = sigcont.exited_instead,
+            sigcont_not_exited_instead = !sigcont.exited_instead,
             sigcont_exit_status = sigcont.exit_status,
             sigcont_cont_ok = sigcont.cont_ok,
             sigcont_cont_errno = sigcont.cont_errno,
@@ -381,7 +382,7 @@ fn main() {
             sigrtmin_fork_ok = sigrtmin.fork_ok,
             sigrtmin_reaped_stop = sigrtmin.reaped_stop,
             sigrtmin_stopped = sigrtmin.stopped,
-            sigrtmin_exited_instead = sigrtmin.exited_instead,
+            sigrtmin_not_exited_instead = !sigrtmin.exited_instead,
             sigrtmin_exit_status = sigrtmin.exit_status,
             sigrtmin_cont_ok = sigrtmin.cont_ok,
             sigrtmin_cont_errno = sigrtmin.cont_errno,
@@ -391,7 +392,7 @@ fn main() {
             sigrtmax_fork_ok = sigrtmax.fork_ok,
             sigrtmax_reaped_stop = sigrtmax.reaped_stop,
             sigrtmax_stopped = sigrtmax.stopped,
-            sigrtmax_exited_instead = sigrtmax.exited_instead,
+            sigrtmax_not_exited_instead = !sigrtmax.exited_instead,
             sigrtmax_exit_status = sigrtmax.exit_status,
             sigrtmax_cont_ok = sigrtmax.cont_ok,
             sigrtmax_cont_errno = sigrtmax.cont_errno,

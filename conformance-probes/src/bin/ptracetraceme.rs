@@ -98,7 +98,7 @@ fn main() {
             traceme_stopped = stopped,
             traceme_stopsig = stop_sig,
             traceme_stopsig_is_sigstop = stop_sig == libc::SIGSTOP,
-            traceme_exited_before_stop = exited_before_stop,
+            traceme_stopped_before_exit = !exited_before_stop,
             traceme_early_exit_status = early_exit_status,
             traceme_repeat_eperm = !exited_before_stop || early_exit_status != 71,
             ptrace_cont_ok = cont_ok,
