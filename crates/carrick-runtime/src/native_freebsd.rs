@@ -519,7 +519,7 @@ static RUN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// fd table, identity, container policy) exactly as the VMM path receives it.
 pub(crate) fn run_static_x86_elf<A, E>(
     path: &Path,
-    mut dispatcher: SyscallDispatcher,
+    dispatcher: SyscallDispatcher,
     argv: A,
     _env: E,
     max_traps: usize,
@@ -561,6 +561,18 @@ where
     // / blocking write), shared with the KVM/bhyve single-thread loop.
     let mut waiter = crate::io_wait::ThreadWaiter::new(tid);
 
+    // Shared, thread-safe syscall machinery. The dispatcher is interior-mutable
+    // (`dispatch_threaded(&self, …)`), so guest `clone` threads drive the SAME
+    // dispatcher; the thread registry + futex table are the cross-thread
+    // rendezvous the futex/clone/exit outcomes read. Publishing the registry +
+    // futex table lets the shared `/proc/<tid>` synthesis and helper-thread
+    // signal wakes reach this process's live threads.
+    let dispatcher = Arc::new(dispatcher);
+    let registry = Arc::new(crate::thread::ThreadRegistry::new(tid));
+    crate::thread::set_current_registry(Arc::clone(&registry));
+    let futex = Arc::new(crate::thread::FutexTable::new());
+    crate::thread::set_current_futex_table(&futex);
+
     // The process's initial guest thread runs inline on THIS host thread,
     // owning the whole code cache. (Guest `clone` threads carve their own
     // slice and run on spawned host threads — a later step.)
@@ -574,10 +586,13 @@ where
         &jit,
         0,
         CODE_CACHE_LEN,
-        &mut dispatcher,
+        &dispatcher,
         &mut memory,
         &reporter,
         &mut waiter,
+        tid,
+        &registry,
+        &futex,
         max_traps,
     );
 
@@ -630,10 +645,13 @@ fn run_x86_thread(
     jit: &FreebsdHostJit,
     slice_off: usize,
     slice_len: usize,
-    dispatcher: &mut SyscallDispatcher,
+    dispatcher: &SyscallDispatcher,
     memory: &mut IdentityGuestMemory,
     reporter: &CompatReporter,
     waiter: &mut crate::io_wait::ThreadWaiter,
+    tid: crate::thread::ThreadId,
+    registry: &crate::thread::ThreadRegistry,
+    futex: &crate::thread::FutexTable,
     max_traps: usize,
 ) -> ThreadRunOutcome {
     // All guest-code reads go through the segment-aware `image.code_bytes`,
@@ -837,6 +855,9 @@ fn run_x86_thread(
                     memory,
                     reporter,
                     waiter,
+                    tid,
+                    registry,
+                    futex,
                     &mut snapshot,
                     &mut guest_fsbase,
                 ) {
@@ -937,11 +958,15 @@ fn run_x86_thread(
 /// blocking write — by parking on the `waiter` and re-dispatching), writes the
 /// terminal return value into `snapshot.rax`, and returns the resume RIP.
 /// `arch_prctl(SET_FS)` sets `guest_fsbase` (VMM state has no analog here).
+#[allow(clippy::too_many_arguments)]
 fn service_syscall(
-    dispatcher: &mut SyscallDispatcher,
+    dispatcher: &SyscallDispatcher,
     memory: &mut IdentityGuestMemory,
     reporter: &CompatReporter,
     waiter: &mut crate::io_wait::ThreadWaiter,
+    tid: crate::thread::ThreadId,
+    registry: &crate::thread::ThreadRegistry,
+    futex: &crate::thread::FutexTable,
     snapshot: &mut X86UcontextSnapshot,
     guest_fsbase: &mut u64,
 ) -> Step {
@@ -966,11 +991,12 @@ fn service_syscall(
     };
 
     let request = SyscallRequest::from_raw(raw).with_current_guest_sp(Some(snapshot.gpr[reg::RSP]));
-    let outcome =
-        match crate::runtime::service_syscall(dispatcher, request, memory, reporter, waiter) {
-            Ok(o) => o,
-            Err(e) => return Step::Fault(format!("dispatch error: {e:?}")),
-        };
+    let outcome = match service_syscall_threaded(
+        dispatcher, request, memory, reporter, waiter, tid, registry, futex,
+    ) {
+        Ok(o) => o,
+        Err(e) => return Step::Fault(format!("dispatch error: {e:?}")),
+    };
 
     match outcome {
         DispatchOutcome::Returned { value } => {
@@ -1025,10 +1051,243 @@ fn service_syscall(
             memory,
             resume,
         ),
+        // `FUTEX_WAIT`/`futex_waitv` whose value-check passed under the
+        // dispatcher lock: park on the shared futex table until a sibling's
+        // `FUTEX_WAKE` advances the generation, the timeout elapses, or a
+        // signal interrupts. The dispatcher could not block under its own lock,
+        // so it handed the prepared wait token out here.
+        DispatchOutcome::FutexWait { wait, timeout } => {
+            let value = wait_x86_futex(futex, tid, wait, timeout, 0);
+            snapshot.gpr[reg::RAX] = value as u64;
+            Step::Continue(resume)
+        }
+        DispatchOutcome::FutexWaitv {
+            wait,
+            timeout,
+            index,
+        } => {
+            // On a wake, `futex_waitv` returns the INDEX of the woken futex.
+            let value = wait_x86_futex(futex, tid, wait, timeout, index);
+            snapshot.gpr[reg::RAX] = value as u64;
+            Step::Continue(resume)
+        }
         other => Step::Fault(format!(
             "native x86 driver does not service dispatch outcome {other:?} yet \
              (threads/execve/futex are later rungs)"
         )),
+    }
+}
+
+/// Park this thread on `wait` until woken, timed out, or interrupted, and map
+/// the outcome to the Linux futex return value. `woken_value` is 0 for
+/// `FUTEX_WAIT` and the woken index for `futex_waitv`. The interrupt predicate
+/// is a no-op for now — signal-driven futex interruption is a later rung; a
+/// sibling `FUTEX_WAKE` (generation advance) and the timeout already work.
+fn wait_x86_futex(
+    futex: &crate::thread::FutexTable,
+    tid: crate::thread::ThreadId,
+    wait: crate::thread::FutexWait,
+    timeout: Option<std::time::Duration>,
+    woken_value: i64,
+) -> i64 {
+    match futex.wait_prepared_for_thread(wait, timeout, tid, &|| false) {
+        crate::thread::FutexWaitOutcome::Woken => woken_value,
+        crate::thread::FutexWaitOutcome::TimedOut => crate::linux_abi::LINUX_ETIMEDOUT.guest_retval(),
+        crate::thread::FutexWaitOutcome::Interrupted => crate::linux_abi::LINUX_EINTR.guest_retval(),
+    }
+}
+
+/// The thread-aware sibling of [`crate::runtime::service_syscall`]: dispatch one
+/// syscall through `dispatch_threaded(&self, …, tid, registry, futex)` and
+/// service the blocking-I/O outcomes (fd wait / poll / select / sleep /
+/// blocking write / signal / proc wait) inline on the `waiter`, re-dispatching
+/// on readiness. Interior mutability makes it shareable across guest threads;
+/// the body mirrors the single-threaded servicer exactly, only the dispatch
+/// call differs. Terminal and thread-specific outcomes (Returned/Errno/Exit/
+/// CloneThread/FutexWait/ThreadExit/…) fall through to the caller.
+#[allow(clippy::too_many_arguments)]
+fn service_syscall_threaded(
+    dispatcher: &SyscallDispatcher,
+    request: SyscallRequest,
+    memory: &mut IdentityGuestMemory,
+    reporter: &CompatReporter,
+    waiter: &mut crate::io_wait::ThreadWaiter,
+    tid: crate::thread::ThreadId,
+    registry: &crate::thread::ThreadRegistry,
+    futex: &crate::thread::FutexTable,
+) -> Result<DispatchOutcome, crate::dispatch::DispatchError> {
+    use crate::io_wait::{WaitFd, WaitResult};
+    const EINTR: crate::linux_abi::LinuxErrno = crate::linux_abi::LINUX_EINTR;
+    let mut poll_deadline: Option<std::time::Instant> = None;
+    let mut sleep_deadline: Option<std::time::Instant> = None;
+    loop {
+        let outcome = dispatcher.dispatch_threaded(request, memory, reporter, tid, registry, futex)?;
+        match outcome {
+            DispatchOutcome::WaitOnFds {
+                fds,
+                timeout,
+                on_timeout,
+                sig_mask,
+            } => match waiter.wait(&fds, timeout, sig_mask.block_mask()) {
+                WaitResult::Ready => continue,
+                WaitResult::TimedOut => {
+                    return Ok(DispatchOutcome::Returned { value: on_timeout });
+                }
+                WaitResult::Interrupted => {
+                    return Ok(DispatchOutcome::Errno { errno: EINTR });
+                }
+                WaitResult::Errno(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            },
+            DispatchOutcome::WaitOnPollFds {
+                fds,
+                timeout,
+                on_timeout,
+                sig_mask,
+            } => {
+                let timeout = match timeout {
+                    Some(duration) => {
+                        let deadline = *poll_deadline
+                            .get_or_insert_with(|| std::time::Instant::now() + duration);
+                        let now = std::time::Instant::now();
+                        if now >= deadline {
+                            return Ok(DispatchOutcome::Returned { value: on_timeout });
+                        }
+                        Some(deadline - now)
+                    }
+                    None => {
+                        poll_deadline = None;
+                        None
+                    }
+                };
+                match waiter.wait_poll(&fds, timeout, sig_mask.block_mask()) {
+                    WaitResult::Ready => continue,
+                    WaitResult::TimedOut => {
+                        return Ok(DispatchOutcome::Returned { value: on_timeout });
+                    }
+                    WaitResult::Interrupted => {
+                        return Ok(DispatchOutcome::Errno { errno: EINTR });
+                    }
+                    WaitResult::Errno(errno) => return Ok(DispatchOutcome::Errno { errno }),
+                }
+            }
+            DispatchOutcome::WaitOnFdsSelect {
+                fds,
+                timeout,
+                sig_mask,
+                clear_on_timeout,
+            } => match waiter.wait(&fds, timeout, sig_mask.block_mask()) {
+                WaitResult::Ready => continue,
+                WaitResult::TimedOut => {
+                    for (addr, len) in &clear_on_timeout {
+                        let _ = memory.zero_guest_range(*addr, *len);
+                    }
+                    return Ok(DispatchOutcome::Returned { value: 0 });
+                }
+                WaitResult::Interrupted => {
+                    return Ok(DispatchOutcome::Errno { errno: EINTR });
+                }
+                WaitResult::Errno(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            },
+            DispatchOutcome::WaitOnSleep {
+                duration,
+                remaining,
+            } => {
+                let deadline =
+                    *sleep_deadline.get_or_insert_with(|| std::time::Instant::now() + duration);
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    return Ok(DispatchOutcome::Returned { value: 0 });
+                }
+                match waiter.wait(&[], Some(deadline - now), carrick_abi::SigBlockMask::NONE) {
+                    WaitResult::Ready | WaitResult::TimedOut => {
+                        if std::time::Instant::now() >= deadline {
+                            return Ok(DispatchOutcome::Returned { value: 0 });
+                        }
+                        continue;
+                    }
+                    WaitResult::Interrupted => {
+                        return Ok(crate::dispatch::complete_interrupted_sleep(
+                            memory,
+                            remaining,
+                            deadline.saturating_duration_since(std::time::Instant::now()),
+                        ));
+                    }
+                    WaitResult::Errno(errno) => return Ok(DispatchOutcome::Errno { errno }),
+                }
+            }
+            DispatchOutcome::BlockingHostWrite(mut write) => loop {
+                match crate::dispatch::drive_blocking_host_write(&mut write) {
+                    crate::dispatch::BlockingHostWriteStep::Done(o) => return Ok(o),
+                    crate::dispatch::BlockingHostWriteStep::Wait => {
+                        match waiter.wait(
+                            &[WaitFd::raw(write.host_fd(), libc::POLLOUT)],
+                            None,
+                            carrick_abi::SigBlockMask::NONE,
+                        ) {
+                            WaitResult::Ready => continue,
+                            WaitResult::Interrupted | WaitResult::TimedOut => {
+                                return Ok(DispatchOutcome::Returned {
+                                    value: write.offset() as i64,
+                                });
+                            }
+                            WaitResult::Errno(errno) => {
+                                if write.offset() > 0 {
+                                    return Ok(DispatchOutcome::Returned {
+                                        value: write.offset() as i64,
+                                    });
+                                }
+                                return Ok(DispatchOutcome::Errno { errno });
+                            }
+                        }
+                    }
+                }
+            },
+            DispatchOutcome::BlockingRecordLock(lock) => {
+                return Ok(crate::dispatch::drive_blocking_record_lock(&lock));
+            }
+            DispatchOutcome::WaitOnSignals {
+                wait_set,
+                block_mask,
+                timeout,
+            } => match waiter.wait(&[], timeout, block_mask) {
+                WaitResult::Ready => continue,
+                WaitResult::Interrupted => {
+                    if dispatcher.signal_wait_should_eintr(waiter.tid(), wait_set, block_mask) {
+                        return Ok(DispatchOutcome::Errno { errno: EINTR });
+                    }
+                    continue;
+                }
+                WaitResult::TimedOut => {
+                    return Ok(DispatchOutcome::Errno {
+                        errno: crate::linux_abi::LINUX_EAGAIN,
+                    });
+                }
+                WaitResult::Errno(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            },
+            DispatchOutcome::WaitOnProcExit { pid, sig_mask } => {
+                match waiter.wait_proc_exit(pid, sig_mask.block_mask()) {
+                    WaitResult::Ready => continue,
+                    WaitResult::Interrupted | WaitResult::TimedOut => {
+                        return Ok(DispatchOutcome::Errno {
+                            errno: crate::linux_abi::LINUX_ECHILD,
+                        });
+                    }
+                    WaitResult::Errno(errno) => return Ok(DispatchOutcome::Errno { errno }),
+                }
+            }
+            DispatchOutcome::WaitOnProcState { sig_mask, .. } => {
+                match waiter.wait_proc_state_with_dispatch_pending(sig_mask.block_mask(), || false) {
+                    WaitResult::Ready | WaitResult::TimedOut => continue,
+                    WaitResult::Interrupted => {
+                        return Ok(DispatchOutcome::Errno { errno: EINTR });
+                    }
+                    WaitResult::Errno(errno) => return Ok(DispatchOutcome::Errno { errno }),
+                }
+            }
+            // Terminal + thread-specific (Returned/Errno/Exit/CloneThread/
+            // FutexWait/ThreadExit/…): the caller drives these.
+            terminal => return Ok(terminal),
+        }
     }
 }
 
