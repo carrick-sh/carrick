@@ -1456,7 +1456,13 @@ fn wait_x86_futex(
     timeout: Option<std::time::Duration>,
     woken_value: i64,
 ) -> i64 {
-    match futex.wait_prepared_for_thread(wait, timeout, tid, &|| false) {
+    // Reflect the parked thread as 'S' (interruptible sleep) in the registry so
+    // `/proc/<tid>/stat` synthesis reports it as sleeping while it blocks, then
+    // back to 'R' (running) once it is woken.
+    crate::thread::set_current_thread_state(tid, 'S');
+    let outcome = futex.wait_prepared_for_thread(wait, timeout, tid, &|| false);
+    crate::thread::set_current_thread_state(tid, 'R');
+    match outcome {
         crate::thread::FutexWaitOutcome::Woken => woken_value,
         crate::thread::FutexWaitOutcome::TimedOut => crate::linux_abi::LINUX_ETIMEDOUT.guest_retval(),
         crate::thread::FutexWaitOutcome::Interrupted => crate::linux_abi::LINUX_EINTR.guest_retval(),
