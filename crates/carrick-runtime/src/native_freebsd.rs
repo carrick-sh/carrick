@@ -2150,6 +2150,29 @@ fn service_syscall_threaded(
 ) -> Result<DispatchOutcome, crate::dispatch::DispatchError> {
     use crate::io_wait::{WaitFd, WaitResult};
     const EINTR: crate::linux_abi::LinuxErrno = crate::linux_abi::LINUX_EINTR;
+    // A blocking wait (sleep/poll/select/proc-exit) must break with EINTR when a
+    // deliverable (unblocked) signal becomes pending for this thread, so the run
+    // loop's syscall-return `run_pending_signals` enters the handler. Guest
+    // signals are published into the shared pending mask (self/kill-raise, a
+    // sibling `tgkill`, an itimer/alarm timer, an async child-exit) WITHOUT a
+    // host signal being sent, so — unlike the futex wait, which already carries
+    // this predicate — the plain `ppoll` slice would otherwise run to its
+    // timeout and never surface EINTR. `ppoll_wait_inner` caps each slice at a
+    // short backstop and re-checks this predicate, so the latency is bounded.
+    // The predicate honors the wait's atomic sigmask policy: for `ppoll`/
+    // `pselect6` (`WaitSigMask::Replace`) a signal the temporary mask unblocks
+    // must interrupt even if the thread persistently blocks it (`ppollunblock`
+    // raises a blocked SIGUSR1, then unblocks it via ppoll's mask). It checks
+    // BOTH the shared host_signal pending set (self/kill/timer/child-exit) and
+    // the dispatcher's own per-thread pending set (a blocked-then-unblocked
+    // raise lands there), matching the shared KVM servicer.
+    let signal_pending = |mask: carrick_abi::WaitSigMask| {
+        move || {
+            dispatcher.drain_xsignals_process_directed();
+            crate::host_signal::has_unblocked_pending_for(tid.raw(), mask.block_mask())
+                || dispatcher.has_deliverable_dispatch_pending_for_wait(tid, mask)
+        }
+    };
     let mut poll_deadline: Option<std::time::Instant> = None;
     let mut sleep_deadline: Option<std::time::Instant> = None;
     loop {
@@ -2160,7 +2183,12 @@ fn service_syscall_threaded(
                 timeout,
                 on_timeout,
                 sig_mask,
-            } => match waiter.wait(&fds, timeout, sig_mask.block_mask()) {
+            } => match waiter.wait_with_dispatch_pending(
+                &fds,
+                timeout,
+                sig_mask.block_mask(),
+                signal_pending(sig_mask),
+            ) {
                 WaitResult::Ready => continue,
                 WaitResult::TimedOut => {
                     return Ok(DispatchOutcome::Returned { value: on_timeout });
@@ -2191,7 +2219,12 @@ fn service_syscall_threaded(
                         None
                     }
                 };
-                match waiter.wait_poll(&fds, timeout, sig_mask.block_mask()) {
+                match waiter.wait_poll_with_dispatch_pending(
+                    &fds,
+                    timeout,
+                    sig_mask.block_mask(),
+                    signal_pending(sig_mask),
+                ) {
                     WaitResult::Ready => continue,
                     WaitResult::TimedOut => {
                         return Ok(DispatchOutcome::Returned { value: on_timeout });
@@ -2207,7 +2240,12 @@ fn service_syscall_threaded(
                 timeout,
                 sig_mask,
                 clear_on_timeout,
-            } => match waiter.wait(&fds, timeout, sig_mask.block_mask()) {
+            } => match waiter.wait_with_dispatch_pending(
+                &fds,
+                timeout,
+                sig_mask.block_mask(),
+                signal_pending(sig_mask),
+            ) {
                 WaitResult::Ready => continue,
                 WaitResult::TimedOut => {
                     for (addr, len) in &clear_on_timeout {
@@ -2230,7 +2268,12 @@ fn service_syscall_threaded(
                 if now >= deadline {
                     return Ok(DispatchOutcome::Returned { value: 0 });
                 }
-                match waiter.wait(&[], Some(deadline - now), carrick_abi::SigBlockMask::NONE) {
+                match waiter.wait_with_dispatch_pending(
+                    &[],
+                    Some(deadline - now),
+                    carrick_abi::SigBlockMask::NONE,
+                    signal_pending(carrick_abi::WaitSigMask::NONE),
+                ) {
                     WaitResult::Ready | WaitResult::TimedOut => {
                         if std::time::Instant::now() >= deadline {
                             return Ok(DispatchOutcome::Returned { value: 0 });
@@ -2297,7 +2340,11 @@ fn service_syscall_threaded(
                 WaitResult::Errno(errno) => return Ok(DispatchOutcome::Errno { errno }),
             },
             DispatchOutcome::WaitOnProcExit { pid, sig_mask } => {
-                match waiter.wait_proc_exit(pid, sig_mask.block_mask()) {
+                match waiter.wait_proc_exit_with_dispatch_pending(
+                    pid,
+                    sig_mask.block_mask(),
+                    signal_pending(sig_mask),
+                ) {
                     WaitResult::Ready => continue,
                     WaitResult::Interrupted | WaitResult::TimedOut => {
                         return Ok(DispatchOutcome::Errno {
