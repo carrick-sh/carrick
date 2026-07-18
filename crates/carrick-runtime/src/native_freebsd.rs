@@ -2240,11 +2240,15 @@ fn run_x86_thread(
                                 // Reset this thread's JIT caches + register state
                                 // and resume at the new entry. Every translated
                                 // block pointed into the old image's code; clear
-                                // them so the new image re-JITs from scratch.
+                                // the block/pending maps so the new image re-JITs
+                                // from scratch. The cursor stays MONOTONIC within
+                                // this thread's current JIT window (a fork child
+                                // runs from a different window base than
+                                // `slice_off`, so re-seeding from `slice_off`
+                                // would be wrong) — the old blocks become dead
+                                // space, harmless for the probe's single exec.
                                 cache.clear();
                                 pending.clear();
-                                cursor = slice_off;
-                                cursor_limit = slice_off + slice_len;
                                 guest_fsbase = 0;
                                 snapshot = X86UcontextSnapshot::new();
                                 snapshot.gpr[reg::RSP] = image.rsp;
