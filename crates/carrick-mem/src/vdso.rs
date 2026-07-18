@@ -233,6 +233,12 @@ pub fn x8664_vdso_image_bytes() -> Vec<u8> {
     dynstr.extend_from_slice(b"__vdso_gettimeofday\0");
     let name_time = dynstr.len() as u32;
     dynstr.extend_from_slice(b"__vdso_time\0");
+    // Alias of `__vdso_clock_gettime` under the carrick-vDSO `__kernel_*` name
+    // some arch-generic conformance probes (e.g. `clockcoherence`) look up. Same
+    // code/value as `__vdso_clock_gettime`; freq==0 falls back to the real
+    // `clock_gettime` syscall so it is coherent with the probe's own syscall.
+    let name_kernel_clock_gettime = dynstr.len() as u32;
+    dynstr.extend_from_slice(b"__kernel_clock_gettime\0");
     let name_version = dynstr.len() as u32;
     dynstr.extend_from_slice(b"LINUX_2.6\0");
 
@@ -240,7 +246,7 @@ pub fn x8664_vdso_image_bytes() -> Vec<u8> {
     const PHENT: usize = 56;
     const NPH: usize = 2;
     const SYMENT: usize = 24;
-    const NSYM: usize = 5;
+    const NSYM: usize = 6;
     const SHENT: usize = 64;
     const NSH: usize = 4;
     const VERDEF_SZ: usize = 20 + 8;
@@ -249,9 +255,12 @@ pub fn x8664_vdso_image_bytes() -> Vec<u8> {
     let off_dynsym = off_phdr + NPH * PHENT;
     let off_dynstr = off_dynsym + NSYM * SYMENT;
     let off_hash = align_up(off_dynstr + dynstr.len(), 4);
-    let hash = [1u32, NSYM as u32, 1, 0, 2, 3, 4, 0];
+    // nbucket=1, nchain=NSYM; the single bucket chains every symbol (1→2→3→4→5→0)
+    // so a hash lookup walks all of them, and a probe that reads nchain and scans
+    // linearly sees the full table.
+    let hash = [1u32, NSYM as u32, 1, 0, 2, 3, 4, 5, 0];
     let off_versym = off_hash + hash.len() * 4;
-    let versym = [0u16, 1, 1, 1, 1];
+    let versym = [0u16, 1, 1, 1, 1, 1];
     let off_verdef = align_up(off_versym + versym.len() * 2, 4);
     let off_dyn = align_up(off_verdef + VERDEF_SZ, 8);
     let dyn_entries: &[(i64, u64)] = &[
@@ -356,6 +365,14 @@ pub fn x8664_vdso_image_bytes() -> Vec<u8> {
         name_time,
         off_code as u64 + X8664_SYM_TIME,
         X8664_VDSO_CODE.len() as u64 - X8664_SYM_TIME,
+    );
+    // __kernel_clock_gettime: alias of __vdso_clock_gettime (idx 1).
+    sym(
+        &mut buf,
+        5,
+        name_kernel_clock_gettime,
+        off_code as u64,
+        X8664_SYM_CLOCK_GETRES,
     );
 
     buf[off_dynstr..off_dynstr + dynstr.len()].copy_from_slice(&dynstr);

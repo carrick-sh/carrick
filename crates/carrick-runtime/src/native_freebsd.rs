@@ -513,6 +513,12 @@ struct LoadedImage {
     /// Guest VA of the `mov $15,%eax; syscall` rt_sigreturn trampoline, used as
     /// a signal frame's return address when the handler had no `sa_restorer`.
     sigreturn_trampoline: u64,
+    /// Guest VA where the synthesized x86-64 vDSO ELF is mapped (published as
+    /// `AT_SYSINFO_EHDR`), or 0 if the vDSO could not be mapped. The vvar page
+    /// lives at the fixed `LINUX_VVAR_BASE` the vDSO code references directly.
+    vdso_base: u64,
+    /// Page-rounded length of the mapped vDSO image, for teardown.
+    vdso_len: usize,
     /// The page-rounded [start, end) VA ranges of the mapped PT_LOAD segments,
     /// sorted and coalesced. The reserved span can contain UNMAPPED gaps
     /// between segments; the block planner must not read across one (it would
@@ -547,6 +553,13 @@ impl LoadedImage {
             libc::munmap(self.span_base as *mut libc::c_void, self.span_len);
             libc::munmap(self.stack as *mut libc::c_void, self.stack_len);
             libc::munmap(self.scratch as *mut libc::c_void, self.scratch_len);
+            if self.vdso_base != 0 {
+                libc::munmap(self.vdso_base as *mut libc::c_void, self.vdso_len);
+                libc::munmap(
+                    crate::vdso::LINUX_VVAR_BASE as *mut libc::c_void,
+                    crate::vdso::LINUX_VVAR_SIZE as usize,
+                );
+            }
         }
     }
 }
@@ -659,12 +672,64 @@ fn load_static_pie(bytes: &[u8], argv: &[String]) -> Result<LoadedImage, Runtime
     }
     let scratch = map_prot(PAGE as usize, libc::PROT_READ | libc::PROT_WRITE, None);
 
+    // Map the synthesized x86-64 vDSO so `getauxval(AT_SYSINFO_EHDR)` resolves
+    // and `__vdso_clock_gettime`/`__vdso_gettimeofday`/`__vdso_time` resolve to
+    // real, callable stubs. The vvar page is left zeroed: with `VVAR_OFF_FREQ`
+    // == 0 the clock fast paths branch to the real x86-64 syscalls (which
+    // already work) BEFORE any `rdtsc`, so no TSC calibration or rdtsc lowering
+    // is needed — the symbols just need to resolve and call through. The vDSO
+    // code references the vvar at the fixed absolute `LINUX_VVAR_BASE`, so that
+    // page must be mapped there exactly; the ELF image itself is position-
+    // independent and published to the guest via `AT_SYSINFO_EHDR`.
+    let (vdso_base, vdso_len) = {
+        let vvar_base = crate::vdso::LINUX_VVAR_BASE;
+        let vdso_base = crate::vdso::LINUX_VDSO_BASE;
+        let vvar = map_prot(
+            crate::vdso::LINUX_VVAR_SIZE as usize,
+            libc::PROT_READ | libc::PROT_WRITE,
+            Some(vvar_base),
+        );
+        let vdso_bytes = crate::vdso::x8664_vdso_image_bytes();
+        let vdso_len = ((vdso_bytes.len() as u64 + PAGE - 1) & !(PAGE - 1)) as usize;
+        let vdso = map_prot(
+            vdso_len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            Some(vdso_base),
+        );
+        if vvar as u64 == vvar_base && vdso as u64 == vdso_base {
+            // SAFETY: `vvar` is the freshly-mapped RW vvar page; zero its whole
+            // size so `VVAR_OFF_FREQ` reads 0 (syscall fallback).
+            unsafe { std::ptr::write_bytes(vvar as *mut u8, 0, crate::vdso::LINUX_VVAR_SIZE as usize) };
+            // SAFETY: `vdso` is the freshly-mapped RW page(s); the image fits.
+            unsafe {
+                std::ptr::copy_nonoverlapping(vdso_bytes.as_ptr(), vdso as *mut u8, vdso_bytes.len())
+            };
+            // Publish the vDSO code page(s) as a translatable segment so the
+            // block planner can read/execute the resolved stubs.
+            segments.push((vdso_base, vdso_base + vdso_len as u64));
+            (vdso_base, vdso_len)
+        } else {
+            // Could not place the vvar/vDSO at their required VAs — run without
+            // a vDSO (auxv omits AT_SYSINFO_EHDR; the guest uses raw syscalls).
+            if vvar as isize != -1 && vvar as u64 != vvar_base {
+                // SAFETY: unmap the misplaced vvar mapping we just made.
+                unsafe { libc::munmap(vvar as *mut libc::c_void, crate::vdso::LINUX_VVAR_SIZE as usize) };
+            }
+            if vdso as isize != -1 && vdso as u64 != vdso_base {
+                // SAFETY: unmap the misplaced vDSO mapping we just made.
+                unsafe { libc::munmap(vdso as *mut libc::c_void, vdso_len) };
+            }
+            (0, 0)
+        }
+    };
+
     let rsp = build_initial_stack(
         stack as u64 + GUEST_STACK_LEN as u64,
         scratch as u64,
         argv,
         &elf,
         bias,
+        vdso_base,
     );
 
     // The rt_sigreturn trampoline: when a guest signal handler was registered
@@ -708,6 +773,8 @@ fn load_static_pie(bytes: &[u8], argv: &[String]) -> Result<LoadedImage, Runtime
         scratch: scratch as u64,
         scratch_len: PAGE as usize,
         sigreturn_trampoline,
+        vdso_base,
+        vdso_len,
         segments: coalesced,
     })
 }
@@ -716,13 +783,21 @@ fn load_static_pie(bytes: &[u8], argv: &[String]) -> Result<LoadedImage, Runtime
 /// `[argc][argv..][NULL][envp NULL][auxv..][AT_NULL]`, with argv strings and a
 /// 16-byte AT_RANDOM block in the scratch page. Returns the guest rsp (argc),
 /// 16-aligned. Envp is empty in this first rung.
-fn build_initial_stack(stack_top: u64, scratch: u64, argv: &[String], elf: &Elf, bias: u64) -> u64 {
+fn build_initial_stack(
+    stack_top: u64,
+    scratch: u64,
+    argv: &[String],
+    elf: &Elf,
+    bias: u64,
+    vdso_base: u64,
+) -> u64 {
     const AT_NULL: u64 = 0;
     const AT_PHDR: u64 = 3;
     const AT_PHENT: u64 = 4;
     const AT_PHNUM: u64 = 5;
     const AT_PAGESZ: u64 = 6;
     const AT_ENTRY: u64 = 9;
+    const AT_SYSINFO_EHDR: u64 = 33;
     const AT_RANDOM: u64 = 25;
 
     // Lay argv strings + AT_RANDOM into the scratch page.
@@ -756,15 +831,22 @@ fn build_initial_stack(stack_top: u64, scratch: u64, argv: &[String], elf: &Elf,
     words.push(0); // argv NULL
     words.push(0); // envp NULL
     // auxv pairs
-    for (k, v) in [
+    let mut auxv: Vec<(u64, u64)> = vec![
         (AT_PHDR, phdr_va),
         (AT_PHENT, elf.header.e_phentsize as u64),
         (AT_PHNUM, elf.header.e_phnum as u64),
         (AT_PAGESZ, PAGE),
         (AT_ENTRY, elf.entry + bias),
         (AT_RANDOM, random_ptr),
-        (AT_NULL, 0),
-    ] {
+    ];
+    // Only advertise the vDSO when it was successfully mapped; a 0 base would
+    // make `getauxval(AT_SYSINFO_EHDR)` resolve to a null pointer the guest
+    // would then parse as an ELF.
+    if vdso_base != 0 {
+        auxv.push((AT_SYSINFO_EHDR, vdso_base));
+    }
+    auxv.push((AT_NULL, 0));
+    for (k, v) in auxv {
         words.push(k);
         words.push(v);
     }
