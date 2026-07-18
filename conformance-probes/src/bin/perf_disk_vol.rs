@@ -1,4 +1,4 @@
-//! Perf probe: bulk file IO over a directory (env `BENCH_DIR`, default `/mnt`),
+//! Perf probe: bulk file IO over a directory (`BENCH_DIR`, default `/tmp`),
 //! for the volume-mount-vs-virtiofs disk test. Writes a SIZE-byte file (fsync),
 //! then reads it back, reporting write & read throughput in MB/s (HIGHER is
 //! better). Under `carrick run --fs host -v <host>:/mnt` and
@@ -24,7 +24,7 @@ fn nproc() -> usize {
 }
 
 fn main() {
-    let dir = std::env::var("BENCH_DIR").unwrap_or_else(|_| "/mnt".to_string());
+    let dir = std::env::var("BENCH_DIR").unwrap_or_else(|_| "/tmp".to_string());
     let path = format!("{dir}/carrick_bench_vol.dat");
     let chunk = vec![0xABu8; CHUNK];
 
