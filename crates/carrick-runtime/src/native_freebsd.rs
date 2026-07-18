@@ -138,8 +138,22 @@ impl GuestMemory for IdentityGuestMemory {
         address: u64,
         length: usize,
     ) -> Result<Vec<u8>, carrick_guest_mem::MemoryError> {
-        // SAFETY: identity map — `address` is a host VA. A length-0 read is a
-        // no-op; otherwise the caller asserts the range is guest-mapped.
+        // A length-0 read is a no-op — but `from_raw_parts` still requires a
+        // non-null, aligned pointer even for len 0, and a syscall with an empty
+        // buffer at a null/unset pointer is legal (e.g. clone's ptid/ctid when
+        // the flag is off), so short-circuit rather than form a slice from null.
+        if length == 0 {
+            return Ok(Vec::new());
+        }
+        // A guest pointer in the null page is never a valid mapping (Linux
+        // leaves page 0 unmapped for userspace), so surface it as a memory
+        // error the handler turns into EFAULT — a bad syscall pointer must not
+        // fault the host (and `from_raw_parts` UB-checks reject a null base).
+        if address < PAGE {
+            return Err(carrick_guest_mem::MemoryError::OutOfBounds { address, length });
+        }
+        // SAFETY: identity map — `address` is a host VA; the caller asserts the
+        // range is guest-mapped.
         Ok(unsafe { std::slice::from_raw_parts(address as *const u8, length).to_vec() })
     }
 
@@ -148,6 +162,15 @@ impl GuestMemory for IdentityGuestMemory {
         address: u64,
         bytes: &[u8],
     ) -> Result<(), carrick_guest_mem::MemoryError> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        if address < PAGE {
+            return Err(carrick_guest_mem::MemoryError::OutOfBounds {
+                address,
+                length: bytes.len(),
+            });
+        }
         // SAFETY: identity map — `address` is a host VA into a guest-writable
         // mapping.
         unsafe {
