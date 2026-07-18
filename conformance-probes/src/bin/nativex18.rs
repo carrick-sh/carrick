@@ -84,5 +84,5 @@ fn main() {
 
 #[cfg(not(target_arch = "aarch64"))]
 fn main() {
-    report!(setup_ok = false, guarded_load_ok = false, x18_preserved = false);
+    report!(aarch64_x18_not_applicable = true);
 }
