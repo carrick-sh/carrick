@@ -358,7 +358,25 @@ Reliable serial census, all 432 targets. Raw data: `docs/native-x86-census.tsv`.
 | baseline | 250 / 432 (exit-0) | blocking-I/O + fork + file-mmap landed |
 | Rung A | 281 / 432 (exit-0) | guest threads + futex via `dispatch_threaded` |
 | fork-cache fix | 355 / 432 (exit-0) | private JIT cache per fork child |
-| **honest re-baseline** | **245 / 428 (STRICT)** | after threads+futex+fork-cache; exit-0 was +110 inflated |
+| honest re-baseline | 245 / 428 (STRICT) | after threads+futex+fork-cache; exit-0 was +110 inflated |
+| **signals + dispatcher** | **292 / 428 (STRICT)** | +47 net; signal delivery + dispatcher socket-buffer/rlimit fixes (net cluster cascaded) |
+
+**+47 delta (245→292), verified real (reproduced serially, NOT load artifacts):**
+signal delivery (~17) + the dispatcher's best-effort socket-buffer fix cascading
+to a networking cluster (`connrefused`, `netpoll`, `perf_net_tcp_rr/stream`,
+`sidecar_loopback_*`, `splicenetpoll`, `spliceunixpoll`, `loopbacksubnet`, …) +
+`rlimitnofile`, `getsocknameval`, `sockoptdomainproto`, `iouring`, `seccompenforce`.
+
+**Real regressions to fix (reproduce serially):**
+- `dnotify`, `preemptsigstorm` — OK→FAIL (both signal-related; signal work changed
+  their behavior).
+- **Top-level die-by-signal robustness bug:** the signal-death / sync-fault "die"
+  path makes native_run die *by the signal* even for the **top-level** guest
+  (correct only for forked children). So a top-level guest fault now **crashes
+  native_run** (segfault/abort) instead of reporting `exit=128+sig` — this turned
+  the old clean `FAULT`/`EMIT` reports into 32 `OTHER`-bucket crashes. Not new
+  probe failures (those probes weren't OK before), but a robustness + measurement
+  regression: native_run must catch a top-level fatal signal and report it.
 
 **Strict bucket breakdown (the real work-list):**
 
