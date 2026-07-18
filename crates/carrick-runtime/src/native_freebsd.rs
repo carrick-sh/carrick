@@ -608,7 +608,7 @@ fn deliver_x86_signal(
         orig_x0: orig_rax,
         fault_esr: 0,
         fpsimd_enabled: false,
-        sigreturn_trampoline_base: shared.image.sigreturn_trampoline,
+        sigreturn_trampoline_base: shared.current_image().sigreturn_trampoline,
     };
     let mut engine = SigframeEngine { snap: snapshot };
     match X8664GuestArch::build_sigframe(&mut engine, params) {
@@ -740,7 +740,7 @@ fn run_pending_signals(
         snap: snapshot,
         last_syscall_nr: syscall_nr,
         orig_rax,
-        sigreturn_trampoline: shared.image.sigreturn_trampoline,
+        sigreturn_trampoline: shared.current_image().sigreturn_trampoline,
     };
     let action = crate::vcpu_loop::deliver_pending_signal(
         &mut trap,
@@ -1609,7 +1609,7 @@ struct SharedRun {
     registry: Arc<crate::thread::ThreadRegistry>,
     futex: Arc<crate::thread::FutexTable>,
     reporter: Arc<CompatReporter>,
-    image: Arc<LoadedImage>,
+    image: std::sync::RwLock<Arc<LoadedImage>>,
     region: JitRegion,
     jit: FreebsdHostJit,
     max_traps: usize,
@@ -1629,6 +1629,14 @@ unsafe impl Send for SharedRun {}
 unsafe impl Sync for SharedRun {}
 
 impl SharedRun {
+    fn current_image(&self) -> Arc<LoadedImage> {
+        Arc::clone(&self.image.read().unwrap_or_else(|p| p.into_inner()))
+    }
+
+    fn publish_image(&self, image: Arc<LoadedImage>) {
+        *self.image.write().unwrap_or_else(|p| p.into_inner()) = image;
+    }
+
     fn alloc_slice(&self) -> Option<usize> {
         self.free_slices
             .lock()
@@ -1803,7 +1811,7 @@ fn fork_child_rebuild(parent: &Arc<SharedRun>) -> Result<Arc<SharedRun>, String>
         registry,
         futex,
         reporter: Arc::clone(&parent.reporter),
-        image: Arc::clone(&parent.image),
+        image: std::sync::RwLock::new(parent.current_image()),
         region,
         jit: FreebsdHostJit,
         max_traps: parent.max_traps,
@@ -1961,7 +1969,7 @@ where
         registry,
         futex,
         reporter: Arc::new(CompatReporter::default()),
-        image: Arc::new(image),
+        image: std::sync::RwLock::new(Arc::new(image)),
         region,
         jit,
         max_traps,
@@ -1980,10 +1988,11 @@ where
     // The blocking-I/O waiter (fd wait / poll / select / sleep / blocking
     // write), shared with the KVM/bhyve single-thread loop.
     let mut waiter = crate::io_wait::ThreadWaiter::new(tid);
+    let initial_image = shared.current_image();
     let outcome = run_x86_thread(
         ThreadStart::Initial {
-            entry: shared.image.entry,
-            rsp: shared.image.rsp,
+            entry: initial_image.entry,
+            rsp: initial_image.rsp,
         },
         &shared,
         tid,
@@ -2029,7 +2038,7 @@ where
         fault::unregister_code_region();
         // SAFETY: nothing executes from the JIT region in the single-thread case.
         unsafe { shared.jit.unmap(&shared.region) };
-        shared.image.teardown();
+        shared.current_image().teardown();
         arenas.teardown();
     }
 
@@ -2077,7 +2086,7 @@ fn run_x86_thread(
     // every guest-code reader below re-borrows it, so the swap is picked up. All
     // guest-code reads go through the segment-aware `image.code_bytes`, which
     // never crosses an unmapped gap between PT_LOAD segments.
-    let mut image = Arc::clone(&shared.image);
+    let mut image = shared.current_image();
     let jit = FreebsdHostJit;
     let max_traps = shared.max_traps;
     // Read the full body of a block. A block is planned within one segment, so
@@ -2513,12 +2522,15 @@ fn run_x86_thread(
                                 // Retire the old image, then map the new one. The
                                 // vDSO/vvar live at FIXED VAs, so the old must be
                                 // unmapped BEFORE the new maps over them.
-                                let old = std::mem::replace(&mut image, Arc::clone(&shared.image));
-                                old.teardown();
+                                image.teardown();
                                 match load_static_pie(&bytes, &argv, &env) {
                                     Ok(new_image) => {
                                         reset_identity_vmas(&new_image);
                                         image = Arc::new(new_image);
+                                        // Future clone threads must start from
+                                        // this replacement image, not the
+                                        // pre-exec image retained in SharedRun.
+                                        active.publish_image(Arc::clone(&image));
                                     }
                                     Err(e) => {
                                         // Past the point of no return: the old
