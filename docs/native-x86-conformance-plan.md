@@ -289,6 +289,34 @@ until 432/432.
 - **Never run vmm on this rig.** Native is default; the census invokes
   `native_run` directly.
 
+## Metric nuance: strict is a LOWER bound
+
+The strict proxy (no `=false`) also has **false negatives** — a few probes print
+`=false` as the *correct* Linux answer, so strict marks them fail when they pass.
+Verified-correct-`=false` (NOT bugs): `timeclock` (sub-second cputime),
+`fsetfl` (Linux stores neither O_CREAT/O_TRUNC), `opathfd` (musl `/proc/self/fd`
+fallback), `openat2valid` (absolute path ignores dirfd), `fifonode` (empty FIFO).
+So the true pass rate is **strict + these** — the honest number sits between the
+strict count and the exit-0 count; strict is a safe lower bound. When strict
+flags a probe, confirm the `=false` line is actually wrong before treating it as
+work.
+
+## Next-work list (scoped from the parallel wave)
+
+- **vDSO cluster (driver):** `build_initial_stack` (native_freebsd.rs:601) builds
+  auxv with **no `AT_SYSINFO_EHDR`** and maps no vDSO, so `getauxval(AT_SYSINFO_EHDR)`
+  is 0. Map the Linux vDSO + add the auxv entry → `clockcoherence`,
+  `getrandomvdso`, `getrandomvdsofork`, `getrandomvdsoloop`, `vdsogtod` (5).
+- **io-waiter signal-interruptibility (driver/io_wait):** the futex wait is now
+  signal-interruptible, but `ppoll`/`pause`/`select` are not, so a pending
+  timer/alarm signal can't break them → `posixtimers`, `timersettimeabs`,
+  `nanosleeprem`, `selecttimeout`, `pauseeintr`, `ppollunblock`,
+  `waitsiblingsigchld`.
+- **cross-process sigqueue via fork (signal follow-up):** `sigqueueusr1`,
+  `rtsigqueueinfo`, `tgsigqueue`, `sigchld` livelock (cross-*thread* works).
+- **More arch-locked** (add to the excluded set): `preadv2flags` (x86 #286 =
+  timerfd_settime), `fdstat` statx portion (x86 #291 = signalfd4).
+
 ## Achievable ceiling on the x86_64 native lane (arch-locked probes)
 
 The conformance corpus is written **aarch64-first** (its gate is macOS/HVF +
