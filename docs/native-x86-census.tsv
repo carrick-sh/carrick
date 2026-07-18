@@ -305,7 +305,7 @@ OK	ptyforkreopen
 OK	ptypair
 OK	readpasteof
 OK	readwronly
-EXIT_FALSE	recursionguard
+OK	recursionguard
 OK	recverrqueue
 OK	recvmsgtrunc
 OK	renameexchange
