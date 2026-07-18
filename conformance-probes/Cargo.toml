@@ -26,6 +26,7 @@ name = "conformance_probes"
 path = "src/lib.rs"
 
 [dependencies]
+flate2 = "1"
 libc = "0.2"
 
 [profile.release]
