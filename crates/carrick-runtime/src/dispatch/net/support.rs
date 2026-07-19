@@ -936,12 +936,38 @@ fn linux_guest_interfaces(
     ifaces: Vec<HostIface>,
     addrs: Vec<HostAddr>,
 ) -> (Vec<HostIface>, Vec<HostAddr>) {
+    // Darwin's primary links are normally `en*`, but FreeBSD commonly uses
+    // `vtnet*`, `em*`, or `igb*` and Linux uses `eth*`. Restricting the guest
+    // uplink to Darwin names made a FreeBSD native guest appear loopback-only;
+    // glibc AI_ADDRCONFIG then discarded every IPv4 DNS answer. Prefer familiar
+    // physical/uplink names, with any non-loopback interface as a final
+    // portable fallback.
     let eth_host_name = ifaces
         .iter()
-        .map(|iface| iface.name.as_str())
-        .filter(|name| name.starts_with("en"))
-        .min()
-        .map(str::to_owned);
+        .filter(|iface| iface.arphrd != LINUX_ARPHRD_LOOPBACK)
+        .min_by_key(|iface| {
+            let name = iface.name.as_str();
+            let active = iface.linux_flags & (LINUX_IFF_UP | LINUX_IFF_RUNNING)
+                == (LINUX_IFF_UP | LINUX_IFF_RUNNING);
+            let has_ipv4 = addrs
+                .iter()
+                .any(|addr| addr.name == name && addr.family == LINUX_AF_INET as u8);
+            let rank = if name
+                .strip_prefix("en")
+                .is_some_and(|suffix| suffix.starts_with(|c: char| c.is_ascii_digit()))
+            {
+                0
+            } else if ["eth", "vtnet", "em", "igb", "re", "ix"]
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+            {
+                1
+            } else {
+                2
+            };
+            (!active, !has_ipv4, rank, name)
+        })
+        .map(|iface| iface.name.clone());
 
     let mut out_ifaces = Vec::new();
     let mut have_lo = false;
@@ -2980,6 +3006,94 @@ mod tests {
         let addr_names: Vec<_> = addrs.iter().map(|addr| addr.name.as_str()).collect();
         assert_eq!(addr_names, ["lo", "eth0"]);
         assert!(addrs.iter().all(|addr| addr.index == 1 || addr.index == 2));
+    }
+
+    #[test]
+    fn guest_interface_view_accepts_freebsd_uplink_names() {
+        let ifaces = vec![
+            HostIface {
+                name: "lo0".to_owned(),
+                index: 1,
+                arphrd: LINUX_ARPHRD_LOOPBACK,
+                linux_flags: LINUX_IFF_UP | LINUX_IFF_LOOPBACK | LINUX_IFF_RUNNING,
+                hw_addr: Vec::new(),
+            },
+            HostIface {
+                name: "cni0".to_owned(),
+                index: 2,
+                arphrd: LINUX_ARPHRD_ETHER,
+                linux_flags: LINUX_IFF_UP | LINUX_IFF_RUNNING,
+                hw_addr: vec![2, 0, 0, 0, 0, 2],
+            },
+            HostIface {
+                name: "enc0".to_owned(),
+                index: 3,
+                arphrd: LINUX_ARPHRD_ETHER,
+                linux_flags: LINUX_IFF_UP | LINUX_IFF_RUNNING,
+                hw_addr: Vec::new(),
+            },
+            HostIface {
+                name: "en0".to_owned(),
+                index: 4,
+                arphrd: LINUX_ARPHRD_ETHER,
+                linux_flags: 0,
+                hw_addr: vec![2, 0, 0, 0, 0, 4],
+            },
+            HostIface {
+                name: "vtnet0".to_owned(),
+                index: 5,
+                arphrd: LINUX_ARPHRD_ETHER,
+                linux_flags: LINUX_IFF_UP | LINUX_IFF_RUNNING,
+                hw_addr: vec![2, 0, 0, 0, 0, 5],
+            },
+        ];
+        let addrs = vec![
+            HostAddr {
+                index: 1,
+                name: "lo0".to_owned(),
+                family: LINUX_AF_INET as u8,
+                addr: vec![127, 0, 0, 1],
+                prefixlen: 8,
+                scope: LINUX_RT_SCOPE_HOST,
+            },
+            HostAddr {
+                index: 2,
+                name: "cni0".to_owned(),
+                family: LINUX_AF_INET as u8,
+                addr: vec![10, 88, 0, 1],
+                prefixlen: 16,
+                scope: LINUX_RT_SCOPE_UNIVERSE,
+            },
+            HostAddr {
+                index: 4,
+                name: "en0".to_owned(),
+                family: LINUX_AF_INET as u8,
+                addr: vec![192, 0, 2, 4],
+                prefixlen: 24,
+                scope: LINUX_RT_SCOPE_UNIVERSE,
+            },
+            HostAddr {
+                index: 5,
+                name: "vtnet0".to_owned(),
+                family: LINUX_AF_INET as u8,
+                addr: vec![10, 14, 14, 189],
+                prefixlen: 24,
+                scope: LINUX_RT_SCOPE_UNIVERSE,
+            },
+        ];
+
+        let (ifaces, addrs) = linux_guest_interfaces(ifaces, addrs);
+        assert_eq!(
+            ifaces
+                .iter()
+                .map(|iface| iface.name.as_str())
+                .collect::<Vec<_>>(),
+            ["lo", "eth0"]
+        );
+        assert!(addrs.iter().any(|addr| {
+            addr.name == "eth0" && addr.addr == [10, 14, 14, 189] && addr.index == 2
+        }));
+        assert!(!addrs.iter().any(|addr| addr.addr == [10, 88, 0, 1]));
     }
 
     #[test]
