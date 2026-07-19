@@ -83,6 +83,11 @@ fn main() {
     }
     let secs = start.elapsed().as_secs_f64();
     stop.store(true, Ordering::Relaxed);
+    // A cloned TcpStream shares one socket: dropping only the sender handle
+    // leaves the receiver handle's write half open, so an echo server (or a
+    // bidirectional published-port proxy) never observes EOF and the drain
+    // thread blocks forever. Half-close explicitly before joining it.
+    let _ = sender.shutdown(std::net::Shutdown::Write);
     drop(sender);
     let _ = drain.join();
     let mbps = (bytes as f64) / 1.0e6 / secs;
