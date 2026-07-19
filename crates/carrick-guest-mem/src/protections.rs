@@ -62,6 +62,18 @@ impl RangeSet {
             .is_some_and(|&(s, e)| address < e && s < end)
     }
 
+    /// True if one merged interval fully covers `[address,address+length)`.
+    fn covers(&self, address: u64, length: usize) -> bool {
+        let end = address.saturating_add(length as u64);
+        if end <= address {
+            return false;
+        }
+        let idx = self.ranges.partition_point(|&(_, e)| e <= address);
+        self.ranges
+            .get(idx)
+            .is_some_and(|&(s, e)| s <= address && e >= end)
+    }
+
     /// Add (`present=true`, merging adjacent/overlapping) or remove
     /// (`present=false`, splitting a partially-cleared range into the surviving
     /// ends) the range `[address, address+len)`, keeping the set sorted + merged.
@@ -117,6 +129,7 @@ struct ProtectionState {
     no_access: RangeSet,
     unmapped: RangeSet,
     no_write: RangeSet,
+    executable: RangeSet,
 }
 
 /// The process-wide host-side protection sets a backend enforces on the syscall
@@ -164,6 +177,7 @@ impl MemoryProtections {
             no_access: state.no_access.snapshot(),
             unmapped: state.unmapped.snapshot(),
             no_write: state.no_write.snapshot(),
+            executable: state.executable.snapshot(),
         }
     }
 
@@ -174,6 +188,7 @@ impl MemoryProtections {
                 no_access: RangeSet::from_ranges(snapshot.no_access),
                 unmapped: RangeSet::from_ranges(snapshot.unmapped),
                 no_write: RangeSet::from_ranges(snapshot.no_write),
+                executable: RangeSet::from_ranges(snapshot.executable),
             }),
         }
     }
@@ -229,6 +244,7 @@ impl MemoryProtections {
         if unmapped {
             state.no_access.set(address, len, false);
             state.no_write.set(address, len, false);
+            state.executable.set(address, len, false);
         }
         state.unmapped.set(address, len, unmapped);
     }
@@ -247,6 +263,36 @@ impl MemoryProtections {
             state.unmapped.set(address, len, false);
         }
         state.no_write.set(address, len, no_write);
+    }
+
+    /// True when the complete range is executable. Executability is kept
+    /// separate from read/write denial because Linux permits execute-only VMAs
+    /// and DSR reads their bytes through a host-readable translation view.
+    pub fn range_executable(&self, address: u64, length: usize) -> bool {
+        if length == 0 {
+            return false;
+        }
+        let state = self.state.read();
+        state.executable.covers(address, length)
+            && !state.unmapped.contains(address, length)
+            && !state.no_access.contains(address, length)
+    }
+
+    /// True when any executable interval overlaps the queried range.
+    pub fn range_has_executable(&self, address: u64, length: usize) -> bool {
+        if length == 0 {
+            return false;
+        }
+        self.state.read().executable.contains(address, length)
+    }
+
+    /// Publish or revoke executable permission for a live VMA.
+    pub fn set_executable(&self, address: u64, len: usize, executable: bool) {
+        let mut state = self.state.write();
+        if executable {
+            state.unmapped.set(address, len, false);
+        }
+        state.executable.set(address, len, executable);
     }
 
     /// Publish the complete protection state of a live mapping atomically.
@@ -272,6 +318,7 @@ pub struct ProtectionSnapshot {
     pub no_access: Vec<(u64, u64)>,
     pub unmapped: Vec<(u64, u64)>,
     pub no_write: Vec<(u64, u64)>,
+    pub executable: Vec<(u64, u64)>,
 }
 
 #[cfg(test)]
@@ -294,6 +341,21 @@ mod tests {
         assert_eq!(p.snapshot(), vec![(0x1000, 0x1800), (0x2800, 0x3000)]);
         assert!(!p.range_no_access(0x1800, 0x1000));
         assert!(p.range_no_access(0x1700, 0x100));
+    }
+
+    #[test]
+    fn executable_ranges_require_full_live_coverage() {
+        let p = MemoryProtections::default();
+        p.set_executable(0x1000, 0x2000, true);
+        assert!(p.range_executable(0x1000, 0x2000));
+        assert!(p.range_executable(0x1800, 1));
+        assert!(!p.range_executable(0x0800, 0x1000));
+        assert!(!p.range_executable(0x2000, 0x2000));
+        assert!(p.range_has_executable(0x0800, 0x1000));
+        assert!(!p.range_has_executable(0x4000, 0x1000));
+        p.set_unmapped(0x2000, 0x1000, true);
+        assert!(!p.range_executable(0x1000, 0x2000));
+        assert!(p.range_executable(0x1000, 0x1000));
     }
 
     #[test]

@@ -108,7 +108,7 @@ fn emit_self_set_resume(resume_va: u64, out: &mut Vec<u8>) {
 pub fn emit_block(source: &[u8], block: &X86Block) -> Result<Vec<u8>, EmitError> {
     match block.exit {
         X86Exit::Syscall { va, .. } => {
-            let mut out = emit_copy_body(source, block, va)?;
+            let (mut out, _) = emit_copy_body(source, block, va)?;
             out.extend_from_slice(&jmp_indirect_r15(CTX_EXIT_SYSCALL_ADDR));
             Ok(out)
         }
@@ -117,7 +117,7 @@ pub fn emit_block(source: &[u8], block: &X86Block) -> Result<Vec<u8>, EmitError>
             // then exit to Rust, which resolves the target from the captured
             // guest state (see `cflow::resolve`). The branch itself is not
             // executed on the host — its semantics are applied in Rust.
-            let mut out = emit_copy_body(source, block, va)?;
+            let (mut out, _) = emit_copy_body(source, block, va)?;
             out.extend_from_slice(&jmp_indirect_r15(CTX_EXIT_INDIRECT_ADDR));
             Ok(out)
         }
@@ -128,7 +128,7 @@ pub fn emit_block(source: &[u8], block: &X86Block) -> Result<Vec<u8>, EmitError>
             // fsgsbase/gs-access) against the snapshot and re-enters after
             // it. The caller pre-fills `exit_resume` with the instruction's
             // VA so the run loop knows where servicing starts.
-            let mut out = emit_copy_body(source, block, va)?;
+            let (mut out, _) = emit_copy_body(source, block, va)?;
             out.extend_from_slice(&jmp_indirect_r15(CTX_EXIT_SENSITIVE_ADDR));
             Ok(out)
         }
@@ -139,7 +139,7 @@ pub fn emit_block(source: &[u8], block: &X86Block) -> Result<Vec<u8>, EmitError>
             // exits through the indirect stub. The caller pre-fills
             // `exit_resume` with `target`, so the captured snapshot resumes
             // at the continuation VA.
-            let mut out = emit_copy_body(source, block, target)?;
+            let (mut out, _) = emit_copy_body(source, block, target)?;
             out.extend_from_slice(&jmp_indirect_r15(CTX_EXIT_INDIRECT_ADDR));
             Ok(out)
         }
@@ -164,6 +164,22 @@ pub struct ChainEdge {
 pub struct LinkedBlock {
     pub bytes: Vec<u8>,
     pub edges: Vec<ChainEdge>,
+    /// Reverse map for synchronous host faults in emitted guest instructions.
+    pub fault_map: Vec<FaultMapEntry>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScratchRestore {
+    pub snapshot_gpr: usize,
+    pub scratch_index: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FaultMapEntry {
+    pub emitted_start: usize,
+    pub emitted_end: usize,
+    pub guest_va: u64,
+    pub restores: Vec<ScratchRestore>,
 }
 
 /// The bytes of one chain-miss COLD stub (52 bytes). Reached when a patchable
@@ -274,30 +290,31 @@ fn classify_branch(bytes: &[u8], va: u64) -> BranchChain {
 /// `exit_resume`). `call`/`ret`/indirect branches, syscalls, sensitive
 /// instructions, and continues keep the resolve-in-Rust exit.
 pub fn emit_block_linked(source: &[u8], block: &X86Block) -> Result<LinkedBlock, EmitError> {
-    let no_edges = |bytes| LinkedBlock {
+    let no_edges = |bytes, fault_map| LinkedBlock {
         bytes,
         edges: Vec::new(),
+        fault_map,
     };
     match block.exit {
         X86Exit::Syscall { va, resume, .. } => {
-            let mut out = emit_copy_body(source, block, va)?;
+            let (mut out, fault_map) = emit_copy_body(source, block, va)?;
             emit_self_set_resume(resume, &mut out);
             out.extend_from_slice(&jmp_indirect_r15(CTX_EXIT_SYSCALL_ADDR));
-            Ok(no_edges(out))
+            Ok(no_edges(out, fault_map))
         }
         X86Exit::Sensitive { va, .. } => {
             // The run loop re-decodes the sensitive instruction at the resume
             // VA to recover its kind, so resume = the instruction's own VA.
-            let mut out = emit_copy_body(source, block, va)?;
+            let (mut out, fault_map) = emit_copy_body(source, block, va)?;
             emit_self_set_resume(va, &mut out);
             out.extend_from_slice(&jmp_indirect_r15(CTX_EXIT_SENSITIVE_ADDR));
-            Ok(no_edges(out))
+            Ok(no_edges(out, fault_map))
         }
         X86Exit::Continue { target, .. } => {
             // A structural boundary falls through to the next block — emit it
             // as a chainable unconditional jump so page-spanning straight-line
             // code links block-to-block instead of round-tripping.
-            let mut out = emit_copy_body(source, block, target)?;
+            let (mut out, fault_map) = emit_copy_body(source, block, target)?;
             let slot_off = out.len();
             let cold_off = slot_off + 5;
             let rel = cold_off as i64 - (slot_off + 5) as i64;
@@ -310,6 +327,7 @@ pub fn emit_block_linked(source: &[u8], block: &X86Block) -> Result<LinkedBlock,
                     target_va: target,
                     rel32_off: slot_off + 1,
                 }],
+                fault_map,
             })
         }
         X86Exit::Unsupported { .. } => Err(EmitError::Unsupported("unsupported-instruction")),
@@ -325,13 +343,13 @@ pub fn emit_block_linked(source: &[u8], block: &X86Block) -> Result<LinkedBlock,
                 BranchChain::Resolve => {
                     // call/ret/indirect: exit to Rust; the run loop re-decodes
                     // the branch at the resume VA and resolves it.
-                    let mut out = emit_copy_body(source, block, va)?;
+                    let (mut out, fault_map) = emit_copy_body(source, block, va)?;
                     emit_self_set_resume(va, &mut out);
                     out.extend_from_slice(&jmp_indirect_r15(CTX_EXIT_INDIRECT_ADDR));
-                    Ok(no_edges(out))
+                    Ok(no_edges(out, fault_map))
                 }
                 BranchChain::Jmp { target } => {
-                    let mut out = emit_copy_body(source, block, va)?;
+                    let (mut out, fault_map) = emit_copy_body(source, block, va)?;
                     // jmpSlot: E9 <rel32 -> coldJ>  (patchable).
                     let slot_off = out.len();
                     let cold_off = slot_off + 5;
@@ -345,6 +363,7 @@ pub fn emit_block_linked(source: &[u8], block: &X86Block) -> Result<LinkedBlock,
                             target_va: target,
                             rel32_off: slot_off + 1,
                         }],
+                        fault_map,
                     })
                 }
                 BranchChain::Jcc {
@@ -352,7 +371,7 @@ pub fn emit_block_linked(source: &[u8], block: &X86Block) -> Result<LinkedBlock,
                     taken,
                     fallthrough,
                 } => {
-                    let mut out = emit_copy_body(source, block, va)?;
+                    let (mut out, fault_map) = emit_copy_body(source, block, va)?;
                     // jcc rel32 -> takenSlot (0F 8x <rel32>), 6 bytes.
                     let jcc_off = out.len();
                     let fall_slot_off = jcc_off + 6;
@@ -387,6 +406,7 @@ pub fn emit_block_linked(source: &[u8], block: &X86Block) -> Result<LinkedBlock,
                                 rel32_off: fall_slot_off + 1,
                             },
                         ],
+                        fault_map,
                     })
                 }
             }
@@ -401,7 +421,7 @@ fn emit_copy_body(
     source: &[u8],
     block: &X86Block,
     terminator_va: u64,
-) -> Result<Vec<u8>, EmitError> {
+) -> Result<(Vec<u8>, Vec<FaultMapEntry>), EmitError> {
     let copy_len = (terminator_va - block.start) as usize;
     if source.len() < copy_len {
         return Err(EmitError::ShortSource {
@@ -410,12 +430,15 @@ fn emit_copy_body(
         });
     }
     let mut out = Vec::with_capacity(copy_len + 7);
+    let mut fault_map = Vec::with_capacity(block.instructions.len());
     for planned in &block.instructions {
         let off = (planned.va - block.start) as usize;
         let bytes = &source[off..off + planned.len as usize];
-        emit_one(bytes, planned.va, &mut out)?;
+        if let Some(entry) = emit_one(bytes, planned.va, &mut out)? {
+            fault_map.push(entry);
+        }
     }
-    Ok(out)
+    Ok((out, fault_map))
 }
 
 /// How one instruction touches virtualized guest `%r15`.
@@ -426,7 +449,7 @@ struct R15Use {
 /// Emit one Copy-class instruction: verbatim unless it has a RIP-relative
 /// memory operand (rewrite against the absolute guest VA) or touches
 /// virtualized guest r15 (rename it to a scratch backed by the snapshot).
-fn emit_one(bytes: &[u8], va: u64, out: &mut Vec<u8>) -> Result<(), EmitError> {
+fn emit_one(bytes: &[u8], va: u64, out: &mut Vec<u8>) -> Result<Option<FaultMapEntry>, EmitError> {
     let mut decoder = Decoder::with_ip(64, bytes, va, DecoderOptions::NONE);
     let inst: Instruction = decoder.decode();
     if inst.is_invalid() {
@@ -435,8 +458,14 @@ fn emit_one(bytes: &[u8], va: u64, out: &mut Vec<u8>) -> Result<(), EmitError> {
     let ip_rel = inst.is_ip_rel_memory_operand();
     let r15_use = r15_usage(&inst);
     if !ip_rel && r15_use.is_none() {
+        let emitted_start = out.len();
         out.extend_from_slice(bytes);
-        return Ok(());
+        return Ok(Some(FaultMapEntry {
+            emitted_start,
+            emitted_end: out.len(),
+            guest_va: va,
+            restores: Vec::new(),
+        }));
     }
 
     // `lea` (not involving r15) never touches memory or flags — it IS an
@@ -448,14 +477,16 @@ fn emit_one(bytes: &[u8], va: u64, out: &mut Vec<u8>) -> Result<(), EmitError> {
         if dst.size() == 8 {
             let mov = Instruction::with2(Code::Mov_r64_imm64, dst, target)
                 .map_err(|_| EmitError::Reencode { va })?;
-            return encode_into(&mov, va, out);
+            encode_into(&mov, va, out)?;
+            return Ok(None);
         }
         if dst.size() == 4 {
             // 32-bit lea truncates the address; mov r32, imm32 matches that
             // (and zero-extends to 64 bits, exactly like lea r32 does).
             let mov = Instruction::with2(Code::Mov_r32_imm32, dst, target as u32)
                 .map_err(|_| EmitError::Reencode { va })?;
-            return encode_into(&mov, va, out);
+            encode_into(&mov, va, out)?;
+            return Ok(None);
         }
         // 16-bit lea is exotic; the generic rewrite below handles it (the
         // re-encoded `lea r16, [scratch]` keeps the truncation semantics).
@@ -513,7 +544,9 @@ fn emit_one(bytes: &[u8], va: u64, out: &mut Vec<u8>) -> Result<(), EmitError> {
         rewritten.set_memory_displacement64(0);
     }
 
+    let emitted_start = out.len();
     encode_into(&rewritten, va, out)?;
+    let emitted_end = out.len();
 
     if let (Some(rename), Some(R15Use { written: true })) = (rename, &r15_use) {
         let snap = MemoryOperand::with_base_displ(Register::R15, i64::from(SNAP_GUEST_R15));
@@ -528,7 +561,45 @@ fn emit_one(bytes: &[u8], va: u64, out: &mut Vec<u8>) -> Result<(), EmitError> {
             .map_err(|_| EmitError::Reencode { va })?;
         encode_into(&restore, va, out)?;
     }
-    Ok(())
+    let restores = spilled
+        .iter()
+        .enumerate()
+        .filter_map(|(scratch_index, (register, _))| {
+            snapshot_gpr_index(*register).map(|snapshot_gpr| ScratchRestore {
+                snapshot_gpr,
+                scratch_index,
+            })
+        })
+        .collect();
+    Ok(Some(FaultMapEntry {
+        emitted_start,
+        emitted_end,
+        guest_va: va,
+        restores,
+    }))
+}
+
+fn snapshot_gpr_index(register: Register) -> Option<usize> {
+    use crate::gateway::reg;
+    Some(match register.full_register() {
+        Register::RAX => reg::RAX,
+        Register::RCX => reg::RCX,
+        Register::RDX => reg::RDX,
+        Register::RBX => reg::RBX,
+        Register::RSP => reg::RSP,
+        Register::RBP => reg::RBP,
+        Register::RSI => reg::RSI,
+        Register::RDI => reg::RDI,
+        Register::R8 => reg::R8,
+        Register::R9 => reg::R9,
+        Register::R10 => reg::R10,
+        Register::R11 => reg::R11,
+        Register::R12 => reg::R12,
+        Register::R13 => reg::R13,
+        Register::R14 => reg::R14,
+        Register::R15 => reg::R15,
+        _ => return None,
+    })
 }
 
 /// Replace every appearance of (any width of) r15 in the instruction's
@@ -859,6 +930,40 @@ mod tests {
         assert_eq!(&out[..3], &[0x49, 0x89, 0x8f], "spills rcx, not rax");
         // Rewritten load: mov eax, [rcx] = 8b 01.
         assert_eq!(&out[17..19], &[0x8b, 0x01]);
+    }
+
+    #[test]
+    fn linked_fault_map_tracks_exact_verbatim_instruction() {
+        // mov [rax],rbx; syscall
+        let linked = plan_and_emit_linked(&[0x48, 0x89, 0x18, 0x0f, 0x05]);
+        assert_eq!(linked.fault_map.len(), 1);
+        assert_eq!(
+            linked.fault_map[0],
+            FaultMapEntry {
+                emitted_start: 0,
+                emitted_end: 3,
+                guest_va: BASE,
+                restores: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn linked_fault_map_restores_rip_relative_scratch() {
+        // mov edx,[rip+0x20]; syscall. The memory operation is emitted only
+        // after rax is spilled and materializes the absolute guest address.
+        let linked = plan_and_emit_linked(&[0x8b, 0x15, 0x20, 0, 0, 0, 0x0f, 0x05]);
+        assert_eq!(linked.fault_map.len(), 1);
+        assert_eq!(linked.fault_map[0].emitted_start, 17);
+        assert_eq!(linked.fault_map[0].emitted_end, 19);
+        assert_eq!(linked.fault_map[0].guest_va, BASE);
+        assert_eq!(
+            linked.fault_map[0].restores,
+            vec![ScratchRestore {
+                snapshot_gpr: crate::gateway::reg::RAX,
+                scratch_index: 0,
+            }]
+        );
     }
 
     #[test]

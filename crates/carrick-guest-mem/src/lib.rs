@@ -292,6 +292,13 @@ pub trait GuestMemory {
         None
     }
 
+    /// Whether [`Self::protections`] is a fail-closed map of the complete guest
+    /// userspace range. Such backends can validate VMA existence without
+    /// touching host backing that may currently be PROT_NONE.
+    fn has_complete_mapping_metadata(&self) -> bool {
+        false
+    }
+
     /// PERMISSION-CHECKED guest read. DEFAULT: run the inaccessible-range gate
     /// (`protections()`), then delegate to [`read_bytes_raw`](Self::read_bytes_raw).
     /// Backends must NOT override this — implement `read_bytes_raw` instead so the
