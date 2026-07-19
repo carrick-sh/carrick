@@ -1163,6 +1163,21 @@ pub unsafe fn sendfile_to_socket(file_fd: i32, sock_fd: i32, offset: i64, count:
     }
 }
 
+/// FreeBSD `minherit(2)` modes. The libc crate does not currently expose the
+/// function or constants, so keep the stable FreeBSD syscall ABI in this
+/// portability shim rather than declaring an ad-hoc C symbol in the runtime.
+#[cfg(target_os = "freebsd")]
+pub const FREEBSD_INHERIT_SHARE: i32 = 0;
+#[cfg(target_os = "freebsd")]
+pub const FREEBSD_INHERIT_COPY: i32 = 1;
+
+#[cfg(target_os = "freebsd")]
+#[inline]
+pub unsafe fn freebsd_minherit(addr: *mut libc::c_void, len: usize, inherit: i32) -> i32 {
+    const FREEBSD_SYS_MINHERIT: libc::c_int = 250;
+    unsafe { libc::syscall(FREEBSD_SYS_MINHERIT, addr, len, inherit) as i32 }
+}
+
 /// Peer credentials `(pid, uid, gid)` of a connected `AF_UNIX` `host_fd`,
 /// best-effort (`0` where unavailable). Linux exposes them in one call via
 /// `SO_PEERCRED` -> `struct ucred`; Darwin has no single equivalent, so we read

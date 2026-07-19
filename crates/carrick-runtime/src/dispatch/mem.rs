@@ -601,6 +601,34 @@ impl SyscallDispatcher {
         }
     }
 
+    /// Private VMAs added after image construction. Native vfork backends use
+    /// these ranges in addition to their fixed image/arena mappings so
+    /// `CLONE_VM` also covers high aliases selected by `mmap(MAP_FIXED)`.
+    pub(crate) fn private_dynamic_mapping_ranges(&self) -> Vec<(u64, usize)> {
+        self.dynamic_mapping_ranges(ProcMapSharing::Private)
+    }
+
+    /// Shared VMAs must be excluded from a temporary `INHERIT_SHARE`/COPY
+    /// cycle: FreeBSD documents that changing a `MAP_SHARED` mapping to
+    /// `INHERIT_COPY` permanently severs its backing-store sharing.
+    pub(crate) fn shared_dynamic_mapping_ranges(&self) -> Vec<(u64, usize)> {
+        self.dynamic_mapping_ranges(ProcMapSharing::Shared)
+    }
+
+    fn dynamic_mapping_ranges(&self, sharing: ProcMapSharing) -> Vec<(u64, usize)> {
+        self.mem
+            .lock()
+            .dynamic_maps
+            .iter()
+            .filter(|map| map.sharing == sharing)
+            .filter_map(|map| {
+                usize::try_from(map.end.saturating_sub(map.start))
+                    .ok()
+                    .map(|len| (map.start, len))
+            })
+            .collect()
+    }
+
     fn dynamic_mapping_overlaps(&self, start: u64, len: u64) -> bool {
         dynamic_mapping_overlaps_sorted(&self.mem.lock().dynamic_maps, start, len)
     }

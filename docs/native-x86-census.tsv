@@ -411,9 +411,9 @@ OK	usernsmap
 OK	usernswrite
 OK	vdsogtod
 OK	vdsosymbols
-EXIT_NONZERO	vforkexecthread
+OK	vforkexecthread
 OK	vforkpid
-EXIT_FALSE	vforkvmshare
+OK	vforkvmshare
 OK	vmsplicepipe
 OK	waitexitstorm
 OK	waitidcputime
