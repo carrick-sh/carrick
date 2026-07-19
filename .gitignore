@@ -11,6 +11,7 @@
 # Editor / agent-tool session state (never publish)
 .antigravitycli/
 .gemini/
+/.pi/
 # Python bytecode (the .py sources are tracked; the cache is not)
 __pycache__/
 *.pyc
