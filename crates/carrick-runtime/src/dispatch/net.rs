@@ -2182,7 +2182,13 @@ impl SyscallDispatcher {
             return false;
         };
         let Some(response) = crate::network::dns::build_a_response(request, |name| {
-            self.network.resolve_dns_name(name).unwrap_or_default()
+            match self.network.resolve_dns_name(name) {
+                Ok(service_addrs) if service_addrs.is_empty() => {
+                    crate::network::dns::resolve_host_a(name)
+                }
+                Ok(service_addrs) => service_addrs,
+                Err(_) => Vec::new(),
+            }
         }) else {
             return false;
         };

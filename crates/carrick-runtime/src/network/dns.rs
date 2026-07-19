@@ -2,9 +2,26 @@ use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
 use hickory_proto::rr::rdata::A;
 use hickory_proto::rr::{RData, Record, RecordType};
 use hickory_proto::serialize::binary::{BinEncodable, BinEncoder};
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, ToSocketAddrs};
 
 const DNS_TTL_SECS: u32 = 0;
+
+pub fn resolve_host_a(name: &str) -> Vec<Ipv4Addr> {
+    let mut addrs = (name, 0)
+        .to_socket_addrs()
+        .map(|resolved| {
+            resolved
+                .filter_map(|addr| match addr.ip() {
+                    std::net::IpAddr::V4(addr) => Some(addr),
+                    std::net::IpAddr::V6(_) => None,
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    addrs.sort_unstable();
+    addrs.dedup();
+    addrs
+}
 
 pub fn build_a_response<F>(request: &[u8], mut lookup: F) -> Option<Vec<u8>>
 where
@@ -57,6 +74,11 @@ mod tests {
     use super::*;
     use hickory_proto::op::{Message, Query};
     use hickory_proto::rr::Name;
+
+    #[test]
+    fn host_lookup_filters_to_ipv4() {
+        assert_eq!(resolve_host_a("127.0.0.1"), vec![Ipv4Addr::LOCALHOST]);
+    }
 
     #[test]
     fn builds_a_record_response() {
