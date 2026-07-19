@@ -440,6 +440,68 @@ fn bridge_named_probe_args(
     args
 }
 
+fn native_bound_named_probe_args(
+    platform: &str,
+    image: &str,
+    name: &str,
+    probe: &std::path::Path,
+    env: &[(&str, String)],
+) -> Vec<String> {
+    let mut args = vec![
+        "run".to_string(),
+        "--platform".to_string(),
+        platform.to_string(),
+        "--raw".to_string(),
+        "--fs".to_string(),
+        "host".to_string(),
+        "--net".to_string(),
+        "bridge".to_string(),
+        "--name".to_string(),
+        name.to_string(),
+        "--volume".to_string(),
+        format!("{}:/tmp/p:ro", probe.display()),
+    ];
+    for (key, value) in env {
+        args.push("-e".to_string());
+        args.push(format!("{key}={value}"));
+    }
+    args.extend([image.to_string(), "/tmp/p".to_string()]);
+    args
+}
+
+fn native_bound_publish_probe_args(
+    platform: &str,
+    image: &str,
+    host_port: u16,
+    probe: &std::path::Path,
+) -> Vec<String> {
+    let mut args = native_bound_named_probe_args(platform, image, "published", probe, &[]);
+    let command_start = args.len().saturating_sub(2);
+    args.splice(
+        command_start..command_start,
+        ["-p".to_string(), format!("127.0.0.1:{host_port}:8080")],
+    );
+    args
+}
+
+fn run_native_bound_named_probe(
+    bin: &PathBuf,
+    lane: Lane,
+    name: &str,
+    env: &[(&str, String)],
+    probe: &std::path::Path,
+) -> String {
+    let mut command = Command::new(bin);
+    command.args(native_bound_named_probe_args(
+        lane.platform,
+        lane.image,
+        name,
+        probe,
+        env,
+    ));
+    run_carrick_probe_process(command, None, CASE_DEADLINE)
+}
+
 fn free_loopback_port() -> u16 {
     let listener =
         std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("reserve port");
@@ -563,21 +625,36 @@ fn run_bridge_publish_probe(
     bin: &PathBuf,
     lane: Lane,
     host_port: u16,
-    stdin_bytes: &[u8],
+    probe: &std::path::Path,
 ) -> String {
     use std::io::{BufRead, Read, Write};
     use std::os::unix::process::CommandExt;
     use std::sync::mpsc;
 
     let run_id = case_run_id();
-    let mut child = Command::new(bin)
-        .args(bridge_publish_probe_args(
+    let native = std::env::var("CARRICK_EXEC_BACKEND").as_deref() == Ok("native");
+    let mut command = Command::new(bin);
+    if native {
+        command.args(native_bound_publish_probe_args(
             lane.platform,
             lane.image,
             host_port,
-        ))
+            probe,
+        ));
+    } else {
+        command.args(bridge_publish_probe_args(
+            lane.platform,
+            lane.image,
+            host_port,
+        ));
+    }
+    let mut child = command
         .env("CARRICK_RUN_ID", &run_id)
-        .stdin(std::process::Stdio::piped())
+        .stdin(if native {
+            std::process::Stdio::null()
+        } else {
+            std::process::Stdio::piped()
+        })
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .process_group(0)
@@ -585,9 +662,12 @@ fn run_bridge_publish_probe(
         .expect("spawn bridge publish probe");
     let pid = child.id() as i32;
 
-    {
+    if !native {
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .encode(std::fs::read(probe).expect("read bridge publish probe"))
+            .into_bytes();
         let mut stdin = child.stdin.take().expect("carrick stdin");
-        let bytes = stdin_bytes.to_vec();
         std::thread::spawn(move || {
             let _ = stdin.write_all(&bytes);
         });
@@ -675,32 +755,51 @@ fn run_bridge_publish_probe(
 fn run_bridge_compose_pair(
     bin: &PathBuf,
     lane: Lane,
-    server_stdin: &[u8],
-    client_stdin: &[u8],
+    server_probe: &std::path::Path,
+    client_probe: &std::path::Path,
 ) -> (String, String) {
     use std::io::{BufRead, Read, Write};
     use std::os::unix::process::CommandExt;
     use std::sync::mpsc;
 
     let run_id = case_run_id();
-    let mut server = Command::new(bin)
-        .args(bridge_named_probe_args(
+    let native = std::env::var("CARRICK_EXEC_BACKEND").as_deref() == Ok("native");
+    let mut server_command = Command::new(bin);
+    if native {
+        server_command.args(native_bound_named_probe_args(
+            lane.platform,
+            lane.image,
+            "db",
+            server_probe,
+            &[],
+        ));
+    } else {
+        server_command.args(bridge_named_probe_args(
             lane.platform,
             lane.image,
             "db",
             &[],
-        ))
+        ));
+    }
+    let mut server = server_command
         .env("CARRICK_RUN_ID", &run_id)
-        .stdin(std::process::Stdio::piped())
+        .stdin(if native {
+            std::process::Stdio::null()
+        } else {
+            std::process::Stdio::piped()
+        })
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .process_group(0)
         .spawn()
         .expect("spawn compose server probe");
     let server_pid = server.id() as i32;
-    {
+    if !native {
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .encode(std::fs::read(server_probe).expect("read compose server probe"))
+            .into_bytes();
         let mut stdin = server.stdin.take().expect("server stdin");
-        let bytes = server_stdin.to_vec();
         std::thread::spawn(move || {
             let _ = stdin.write_all(&bytes);
         });
@@ -766,7 +865,15 @@ fn run_bridge_compose_pair(
     }
 
     let _target_ip = server_ip.expect("server ip recorded");
-    let client_out = run_bridge_named_probe(bin, lane, "web", &[], client_stdin);
+    let client_out = if native {
+        run_native_bound_named_probe(bin, lane, "web", &[], client_probe)
+    } else {
+        use base64::Engine as _;
+        let client_stdin = base64::engine::general_purpose::STANDARD
+            .encode(std::fs::read(client_probe).expect("read compose client probe"))
+            .into_bytes();
+        run_bridge_named_probe(bin, lane, "web", &[], &client_stdin)
+    };
 
     let wait_deadline = Instant::now() + Duration::from_secs(15);
     let server_out = loop {
@@ -1023,7 +1130,7 @@ fn conformance_bridge_publish_tcp() {
         eprintln!("SKIP conformance_bridge_publish_tcp: target/release/carrick not built");
         return;
     };
-    let lane = ARM64;
+    let lane = same_isa_lane();
     if !lane_runnable_here(&lane) {
         eprintln!(
             "SKIP conformance_bridge_publish_tcp: host ({}) cannot run {} guests",
@@ -1039,11 +1146,7 @@ fn conformance_bridge_publish_tcp() {
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
-    if !docker_ok {
-        eprintln!("SKIP conformance_bridge_publish_tcp: Docker not reachable");
-        return;
-    }
-    let probe = probes_dir("aarch64-unknown-linux-musl").join("bridge_publish_tcp");
+    let probe = probes_dir(musl_target_for_lane(&lane)).join("bridge_publish_tcp");
     if !probe.exists() {
         eprintln!(
             "SKIP conformance_bridge_publish_tcp: probe not built ({})",
@@ -1054,12 +1157,7 @@ fn conformance_bridge_publish_tcp() {
 
     ensure_signed(&bin);
     let host_port = free_loopback_port();
-    let raw = std::fs::read(&probe).expect("read bridge_publish_tcp probe");
-    use base64::Engine as _;
-    let encoded = base64::engine::general_purpose::STANDARD
-        .encode(raw)
-        .into_bytes();
-    let carrick_out = run_bridge_publish_probe(&bin, lane, host_port, &encoded);
+    let carrick_out = run_bridge_publish_probe(&bin, lane, host_port, &probe);
     assert!(
         carrick_out.contains("bridge_publish_listener_ready=true"),
         "missing listener-ready line in output:\n{carrick_out}"
@@ -1068,11 +1166,19 @@ fn conformance_bridge_publish_tcp() {
         carrick_out.contains("bridge_publish_tcp_ok=true"),
         "missing completion line in output:\n{carrick_out}"
     );
-    let docker_host_port = free_loopback_port();
-    let docker_out = run_docker_bridge_publish_probe(lane, docker_host_port, &encoded)
-        .expect("docker bridge publish probe");
-    if let Some(diff) = diff_lines(&carrick_out, &docker_out) {
-        panic!("bridge publish tcp conformance mismatch:\n{diff}");
+    if docker_ok {
+        use base64::Engine as _;
+        let encoded = base64::engine::general_purpose::STANDARD
+            .encode(std::fs::read(&probe).expect("read bridge_publish_tcp probe"))
+            .into_bytes();
+        let docker_host_port = free_loopback_port();
+        let docker_out = run_docker_bridge_publish_probe(lane, docker_host_port, &encoded)
+            .expect("docker bridge publish probe");
+        if let Some(diff) = diff_lines(&carrick_out, &docker_out) {
+            panic!("bridge publish tcp conformance mismatch:\n{diff}");
+        }
+    } else {
+        eprintln!("NOTE conformance_bridge_publish_tcp: Docker oracle unavailable");
     }
 }
 
@@ -1351,7 +1457,7 @@ fn conformance_bridge_compose_pair() {
         eprintln!("SKIP conformance_bridge_compose_pair: target/release/carrick not built");
         return;
     };
-    let lane = ARM64;
+    let lane = same_isa_lane();
     if !lane_runnable_here(&lane) {
         eprintln!(
             "SKIP conformance_bridge_compose_pair: host ({}) cannot run {} guests",
@@ -1360,7 +1466,7 @@ fn conformance_bridge_compose_pair() {
         );
         return;
     }
-    let probes = probes_dir("aarch64-unknown-linux-musl");
+    let probes = probes_dir(musl_target_for_lane(&lane));
     let server_probe = probes.join("bridge_compose_server");
     if !server_probe.exists() {
         eprintln!(
@@ -1379,16 +1485,8 @@ fn conformance_bridge_compose_pair() {
     }
 
     ensure_signed(&bin);
-    use base64::Engine as _;
-    let server_encoded = base64::engine::general_purpose::STANDARD
-        .encode(std::fs::read(&server_probe).expect("read bridge_compose_server probe"))
-        .into_bytes();
-    let client_encoded = base64::engine::general_purpose::STANDARD
-        .encode(std::fs::read(&client_probe).expect("read bridge_compose_client probe"))
-        .into_bytes();
-
     let (server_out, client_out) =
-        run_bridge_compose_pair(&bin, lane, &server_encoded, &client_encoded);
+        run_bridge_compose_pair(&bin, lane, &server_probe, &client_probe);
     assert!(
         client_out.contains("bridge_compose_client_connect_ok=true"),
         "missing client completion line:\nserver:\n{server_out}\nclient:\n{client_out}"
@@ -1534,6 +1632,21 @@ fn rosetta_available() -> bool {
 /// Net effect: macOS keeps gating ARM64 and runs amd64 via Rosetta (report-only
 /// — see `set_gates_here`); the x86_64 fleet gates AMD64 and SKIPs ARM64 instead
 /// of erroring on it.
+fn same_isa_lane() -> Lane {
+    if cfg!(target_arch = "x86_64") {
+        AMD64
+    } else {
+        ARM64
+    }
+}
+
+fn musl_target_for_lane(lane: &Lane) -> &'static str {
+    match lane.platform {
+        "linux/amd64" => "x86_64-unknown-linux-musl",
+        _ => "aarch64-unknown-linux-musl",
+    }
+}
+
 fn lane_runnable_here(lane: &Lane) -> bool {
     match lane.platform {
         // aarch64 guests need an aarch64 host (no cross-ISA execution).
