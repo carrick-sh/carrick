@@ -1911,13 +1911,21 @@ impl SyscallDispatcher {
             }
 
             let locked_range = this.prepare_mmap_locked_range(map_flags, address, length)?;
-            // Stamp the file content via the UNCHECKED path: this is carrick
-            // loading the mapping, not a guest write. The final prot may be
-            // read-only, and the dynamic loader's `mmap(whole-lib, PROT_READ)`
-            // placeholder may have already marked this range `no_write` before
-            // it `MAP_FIXED`s each segment in — so the checked `write_bytes`
-            // (x86's read-only write gate) would wrongly EFAULT our own load.
-            let _ = memory.write_bytes_unchecked(address, &bytes);
+            // Stamp file content through the unchecked path: this is carrick
+            // loading the mapping, not a guest write. The dynamic loader often
+            // reserves a whole DSO as PROT_NONE before MAP_FIXED segment loads;
+            // on identity-native backends that is a real host mprotect, so make
+            // the backing temporarily writable before memcpy and apply the
+            // requested Linux permission immediately afterward.
+            if !bytes.is_empty() {
+                let rw = crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_WRITE;
+                if memory.protect_range(address, length_usize, rw).is_err() && in_arena {
+                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                }
+                if memory.write_bytes_unchecked(address, &bytes).is_err() {
+                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                }
+            }
             memory.set_mapping_protection(
                 address,
                 length_usize,
