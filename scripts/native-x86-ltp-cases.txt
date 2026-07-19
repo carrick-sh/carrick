@@ -2,8 +2,27 @@
 # Format: <case-name> <path-relative-to---ltp-bin-root> [guest-arg ...]
 # Fixture version: LTP 20260529.
 getpid01 getpid/getpid01
+getpid02 getpid/getpid02
 uname01 uname/uname01
+uname02 uname/uname02
+uname04 uname/uname04
 eventfd01 eventfd/eventfd01
+eventfd02 eventfd/eventfd02
+eventfd03 eventfd/eventfd03
+eventfd04 eventfd/eventfd04
+eventfd05 eventfd/eventfd05
+eventfd06 eventfd/eventfd06
 fork01 fork/fork01
 futex_wait01 futex/futex_wait01
+futex_wait03 futex/futex_wait03
+futex_wait04 futex/futex_wait04
+futex_wait_bitset01 futex/futex_wait_bitset01
+futex_waitv01 futex/futex_waitv01
+futex_waitv02 futex/futex_waitv02
+futex_waitv03 futex/futex_waitv03
+futex_wake01 futex/futex_wake01
+futex_wake03 futex/futex_wake03
 clock_gettime01 clock_gettime/clock_gettime01
+clock_gettime02 clock_gettime/clock_gettime02
+clock_gettime03 clock_gettime/clock_gettime03
+clock_gettime04 clock_gettime/clock_gettime04

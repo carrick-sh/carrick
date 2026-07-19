@@ -44,6 +44,7 @@ case.c:10: TFAIL: mismatch
         self.assertEqual(GATE.local_status(0, False, passed), "pass")
         self.assertEqual(GATE.local_status(0, False, broken), "ltp_failure")
         self.assertEqual(GATE.local_status(0, False, configured_out), "conf")
+        self.assertEqual(GATE.local_status(32, False, configured_out), "conf")
         self.assertEqual(GATE.local_status(0, False, empty), "no_assertions")
         self.assertEqual(GATE.local_status(125, False, passed), "runner_error")
         self.assertEqual(GATE.local_status(None, True, passed), "timeout")

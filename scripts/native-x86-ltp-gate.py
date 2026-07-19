@@ -94,6 +94,9 @@ def local_status(exit_code: int | None, timed_out: bool, counts: dict[str, int])
         return "runner_error"
     if counts["TFAIL"] or counts["TBROK"]:
         return "ltp_failure"
+    if counts["TCONF"] and not counts["TPASS"]:
+        # LTP uses a nonzero process status for a clean configuration skip.
+        return "conf"
     if exit_code != 0:
         return "nonzero_exit"
     if counts["TPASS"]:
@@ -196,7 +199,6 @@ def run_case(
         "exit_code": exit_code,
         "timed_out": timed_out,
         "local_status": status,
-        "oracle_status": "pending",
         "assertions": assertions,
         "counts": counts,
         "wall_ms": elapsed_ms,
