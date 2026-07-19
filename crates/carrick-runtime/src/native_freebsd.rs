@@ -42,7 +42,7 @@ use carrick_hal::x8664_arch::{SyscallNorm, X8664GuestArch};
 use carrick_hal::{GuestArch, Reg, RegAccess};
 use carrick_native_freebsd::{FreebsdHostJit, fault};
 use goblin::elf::Elf;
-use goblin::elf::header::{ET_DYN, ET_EXEC};
+use goblin::elf::header::{EM_X86_64, ET_DYN, ET_EXEC};
 use goblin::elf::program_header::{PF_R, PF_W, PF_X, PT_LOAD};
 
 use carrick_mem::memory::{LINUX_HEAP_BASE, LINUX_HEAP_SIZE, LINUX_MMAP_BASE, mmap_arena_size};
@@ -116,14 +116,14 @@ fn reserve_fixed_rw(base: u64, len: usize) -> Option<u64> {
     }
 }
 
-fn remap_vfork_exec_arenas() -> Result<(), RuntimeError> {
+fn remap_exec_arenas() -> Result<(), RuntimeError> {
     for (base, len, name) in [
         (LINUX_HEAP_BASE, LINUX_HEAP_SIZE as usize, "heap"),
         (LINUX_MMAP_BASE, mmap_arena_size() as usize, "mmap"),
     ] {
         if reserve_fixed_rw(base, len).is_none() {
             return Err(RuntimeError::Unsupported(format!(
-                "vfork exec: remap private {name} arena at 0x{base:x} ({len} bytes) failed"
+                "exec: remap private {name} arena at 0x{base:x} ({len} bytes) failed"
             )));
         }
     }
@@ -293,9 +293,9 @@ mod identity_raw_range_tests {
     use super::{
         IdentityGuestMemory, PublishedFaultEntry, SharedWaitAssignment,
         exclude_vfork_shared_ranges, freebsd_shared_waiter_key, identity_host_range_mapped,
-        identity_raw_range_valid, init_shared_waiter_table, recover_x86_fault_snapshot,
-        shared_futex_requeue_umtx, shared_futex_wake_umtx, shared_waiter_slot,
-        take_shared_wait_assignment, wait_requeued_umtx,
+        identity_raw_range_valid, init_shared_waiter_table, parse_loadable_elf,
+        recover_x86_fault_snapshot, shared_futex_requeue_umtx, shared_futex_wake_umtx,
+        shared_waiter_slot, take_shared_wait_assignment, wait_requeued_umtx,
     };
     use carrick_guest_mem::GuestMemory;
     use std::os::fd::AsRawFd;
@@ -478,6 +478,21 @@ mod identity_raw_range_tests {
         );
         assert_eq!(snapshot.rip, 0x4010);
         assert_eq!(snapshot.gpr[carrick_dsr_x86::gateway::reg::RAX], 0x1234);
+    }
+
+    #[test]
+    fn elf_preflight_rejects_wrong_machine_and_non_executable_type() {
+        let mut elf = std::fs::read(std::env::current_exe().expect("current test executable"))
+            .expect("read current test executable");
+        assert!(parse_loadable_elf(&elf, false).is_ok());
+
+        let original_machine = [elf[18], elf[19]];
+        elf[18..20].copy_from_slice(&goblin::elf::header::EM_AARCH64.to_le_bytes());
+        assert!(parse_loadable_elf(&elf, false).is_err());
+        elf[18..20].copy_from_slice(&original_machine);
+
+        elf[16..18].copy_from_slice(&goblin::elf::header::ET_REL.to_le_bytes());
+        assert!(parse_loadable_elf(&elf, false).is_err());
     }
 
     #[test]
@@ -1313,8 +1328,9 @@ fn install_native_pumped_handlers() {
 
 /// A loaded static-pie ELF in the host address space (guest VA == host VA).
 struct LoadedImage {
-    span_base: u64,
-    span_len: usize,
+    /// Main executable and optional PT_INTERP reservations. They are distinct
+    /// VM spans and must both survive until exec/teardown.
+    spans: Vec<(u64, usize)>,
     entry: u64,
     stack: u64,
     stack_len: usize,
@@ -1397,7 +1413,9 @@ impl LoadedImage {
         // SAFETY: teardown of mappings this loader owns; nothing executes from
         // them once the run loop has returned.
         unsafe {
-            libc::munmap(self.span_base as *mut libc::c_void, self.span_len);
+            for &(span_base, span_len) in &self.spans {
+                libc::munmap(span_base as *mut libc::c_void, span_len);
+            }
             libc::munmap(self.stack as *mut libc::c_void, self.stack_len);
             libc::munmap(self.scratch as *mut libc::c_void, self.scratch_len);
             if self.vdso_base != 0 {
@@ -1430,24 +1448,23 @@ fn map_prot(len: usize, prot: i32, fixed_at: Option<u64>) -> *mut u8 {
     unsafe { libc::mmap(addr, len, prot, flags, -1, 0) }.cast()
 }
 
-/// Map a static x86_64 ELF so guest VA == host VA. Static PIE (`ET_DYN`)
-/// reserves its span at a host-selected bias; fixed static executables
-/// (`ET_EXEC`, including Kaniko) reserve their linked span at its exact VA.
-/// PT_LOAD segments then replace that reservation with MAP_FIXED backing. Only
-/// R_X86_64_RELATIVE dynamic relocations are accepted, applied against the
-/// selected bias.
-fn load_static_pie(
-    bytes: &[u8],
-    argv: &[Vec<u8>],
-    env: &[Vec<u8>],
-) -> Result<LoadedImage, RuntimeError> {
-    let elf =
-        Elf::parse(bytes).map_err(|e| RuntimeError::Unsupported(format!("parse ELF: {e}")))?;
-    if !elf.is_64 {
-        return Err(RuntimeError::Unsupported(
-            "native x86 lane requires a 64-bit ELF".to_string(),
-        ));
-    }
+struct MappedElf {
+    span: (u64, usize),
+    bias: u64,
+    entry: u64,
+    phdr: u64,
+    segments: Vec<(u64, u64)>,
+    protections: Vec<(u64, u64, u64)>,
+}
+
+/// Map one x86_64 ELF into the identity address space without involving the
+/// dynamic linker. `apply_relative_relocations` is only for self-relocating
+/// static PIE; a PT_INTERP executable and its interpreter perform their own
+/// relocations after the kernel-style initial entry contract is established.
+fn map_one_elf(bytes: &[u8], apply_relative_relocations: bool) -> Result<MappedElf, RuntimeError> {
+    let elf = parse_loadable_elf(bytes, apply_relative_relocations).map_err(|_| {
+        RuntimeError::Unsupported("native x86 lane requires a loadable x86_64 ELF".to_string())
+    })?;
 
     let mut lo = u64::MAX;
     let mut hi = 0u64;
@@ -1463,11 +1480,9 @@ fn load_static_pie(
         ));
     }
     let span_len = (hi - lo) as usize;
-
     let (span, bias) = match elf.header.e_type {
         ET_DYN => {
             let span = map_prot(span_len, libc::PROT_NONE, None);
-            // mmap signals failure with MAP_FAILED ((void*)-1), never NULL.
             if span as isize == -1 {
                 return Err(RuntimeError::Unsupported(
                     "reserve guest PIE span failed".to_string(),
@@ -1490,9 +1505,9 @@ fn load_static_pie(
             )));
         }
     };
-    let mut segments: Vec<(u64, u64)> = Vec::new();
-    let mut segment_protections: Vec<(u64, u64, u64)> = Vec::new();
 
+    let mut segments = Vec::new();
+    let mut protections = Vec::new();
     for ph in &elf.program_headers {
         if ph.p_type != PT_LOAD {
             continue;
@@ -1510,39 +1525,83 @@ fn load_static_pie(
         if ph.p_flags & PF_X != 0 {
             guest_prot |= crate::linux_abi::LINUX_PROT_EXEC;
         }
-        segment_protections.push((seg_lo, seg_hi, guest_prot));
-        // The translator READS guest code (execution runs from the JIT cache),
-        // so no host PROT_EXEC is needed; every segment is mapped R + W so its
-        // file bytes and the guest's own writes land. (Enforcing per-segment
-        // read-only protection is a later rung; it does not affect correctness
-        // of the identity model, only guest-visible write faults.)
-        let prot = libc::PROT_READ | libc::PROT_WRITE;
-        let addr = map_prot((seg_hi - seg_lo) as usize, prot, Some(seg_lo));
+        protections.push((seg_lo, seg_hi, guest_prot));
+        let addr = map_prot(
+            (seg_hi - seg_lo) as usize,
+            libc::PROT_READ | libc::PROT_WRITE,
+            Some(seg_lo),
+        );
         if addr as u64 != seg_lo {
             return Err(RuntimeError::Unsupported(format!(
                 "MAP_FIXED segment at 0x{seg_lo:x} failed"
             )));
         }
-        let dst = (ph.p_vaddr + bias) as *mut u8;
-        let src = &bytes[ph.p_offset as usize..(ph.p_offset + ph.p_filesz) as usize];
-        // SAFETY: dst is inside the just-mapped RW segment; src is in-bounds.
-        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len()) };
+        let file_start = ph.p_offset as usize;
+        let file_end = (ph.p_offset + ph.p_filesz) as usize;
+        let src = bytes.get(file_start..file_end).ok_or_else(|| {
+            RuntimeError::Unsupported("ELF PT_LOAD file range is out of bounds".to_string())
+        })?;
+        // SAFETY: destination is inside the freshly mapped RW segment.
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr(), (ph.p_vaddr + bias) as *mut u8, src.len())
+        };
     }
 
-    // Apply R_X86_64_RELATIVE relocations (type 8): *(base+off) = base+addend.
-    // Any other relocation type means a dynamic image this first rung does not
-    // support — fail closed rather than run miscomputed addresses.
-    for rela in elf.dynrelas.iter() {
-        if rela.r_type != R_X86_64_RELATIVE {
-            return Err(RuntimeError::Unsupported(format!(
-                "native x86 lane: unsupported dynamic relocation type {} (only R_X86_64_RELATIVE)",
-                rela.r_type
-            )));
+    if apply_relative_relocations {
+        for rela in elf.dynrelas.iter() {
+            if rela.r_type != R_X86_64_RELATIVE {
+                return Err(RuntimeError::Unsupported(format!(
+                    "native x86 lane: unsupported static relocation type {}",
+                    rela.r_type
+                )));
+            }
+            let where_ = rela.r_offset + bias;
+            let value = bias.wrapping_add(rela.r_addend.unwrap_or(0) as u64);
+            // SAFETY: validated static PIE relocation into its mapped image.
+            unsafe { (where_ as *mut u64).write_unaligned(value) };
         }
-        let where_ = rela.r_offset + bias;
-        let value = bias.wrapping_add(rela.r_addend.unwrap_or(0) as u64);
-        // SAFETY: the reloc offset is inside a mapped RW segment.
-        unsafe { (where_ as *mut u64).write_unaligned(value) };
+    }
+
+    let phdr = elf
+        .program_headers
+        .iter()
+        .find(|ph| {
+            elf.header.e_phoff >= ph.p_offset
+                && elf.header.e_phoff < ph.p_offset.saturating_add(ph.p_filesz)
+        })
+        .map(|ph| bias + ph.p_vaddr + (elf.header.e_phoff - ph.p_offset))
+        .unwrap_or(bias + elf.header.e_phoff);
+    Ok(MappedElf {
+        span: (span as u64, span_len),
+        bias,
+        entry: elf.entry + bias,
+        phdr,
+        segments,
+        protections,
+    })
+}
+
+/// Map the main ELF and optional PT_INTERP, then build the kernel-style entry
+/// stack. Dynamic relocation belongs to the interpreter, not Carrick.
+fn load_static_pie(
+    bytes: &[u8],
+    interpreter_bytes: Option<&[u8]>,
+    argv: &[Vec<u8>],
+    env: &[Vec<u8>],
+) -> Result<LoadedImage, RuntimeError> {
+    let elf =
+        Elf::parse(bytes).map_err(|e| RuntimeError::Unsupported(format!("parse ELF: {e}")))?;
+    let main = map_one_elf(bytes, interpreter_bytes.is_none())?;
+    let interpreter = interpreter_bytes
+        .map(|bytes| map_one_elf(bytes, false))
+        .transpose()?;
+    let mut segments = main.segments.clone();
+    let mut segment_protections = main.protections.clone();
+    let mut spans = vec![main.span];
+    if let Some(interpreter) = &interpreter {
+        segments.extend(interpreter.segments.iter().copied());
+        segment_protections.extend(interpreter.protections.iter().copied());
+        spans.push(interpreter.span);
     }
 
     let stack = map_prot(GUEST_STACK_LEN, libc::PROT_READ | libc::PROT_WRITE, None);
@@ -1626,7 +1685,9 @@ fn load_static_pie(
         argv,
         env,
         &elf,
-        bias,
+        main.phdr,
+        main.entry,
+        interpreter.as_ref().map_or(0, |image| image.bias),
         vdso_base,
     );
 
@@ -1671,9 +1732,8 @@ fn load_static_pie(
     }
 
     Ok(LoadedImage {
-        span_base: span as u64,
-        span_len,
-        entry: elf.entry + bias,
+        spans,
+        entry: interpreter.as_ref().map_or(main.entry, |image| image.entry),
         stack: stack as u64,
         stack_len: GUEST_STACK_LEN,
         rsp,
@@ -1690,27 +1750,71 @@ fn load_static_pie(
 /// Only the R_X86_64_RELATIVE dynamic reloc type is supported by the loader.
 const R_X86_64_RELATIVE: u32 = 8;
 
-/// Cheaply verify an ELF is loadable by [`load_static_pie`] (64-bit, has a
-/// PT_LOAD, and carries only RELATIVE dynamic relocations) WITHOUT mapping
-/// anything. Run before retiring the old image on execve so an unloadable
-/// target fails the syscall with an errno while the old image is still live,
-/// instead of tearing down and then faulting past the point of no return.
-fn validate_loadable(bytes: &[u8]) -> Result<(), crate::linux_abi::LinuxErrno> {
+/// Parse and preflight everything the in-process mapper can reject without
+/// actually reserving virtual addresses. Exec performs this before retiring
+/// the old image, so malformed main/interpreter images return ENOEXEC rather
+/// than becoming a fatal post-point-of-no-return load failure.
+fn parse_loadable_elf(
+    bytes: &[u8],
+    apply_relative_relocations: bool,
+) -> Result<Elf<'_>, crate::linux_abi::LinuxErrno> {
     let elf = Elf::parse(bytes).map_err(|_| crate::linux_abi::LINUX_ENOEXEC)?;
-    if !elf.is_64 {
-        return Err(crate::linux_abi::LINUX_ENOEXEC);
-    }
-    if !elf.program_headers.iter().any(|ph| ph.p_type == PT_LOAD) {
-        return Err(crate::linux_abi::LINUX_ENOEXEC);
-    }
-    if elf
-        .dynrelas
-        .iter()
-        .any(|rela| rela.r_type != R_X86_64_RELATIVE)
+    if !elf.is_64
+        || elf.header.e_machine != EM_X86_64
+        || !matches!(elf.header.e_type, ET_DYN | ET_EXEC)
     {
         return Err(crate::linux_abi::LINUX_ENOEXEC);
     }
-    Ok(())
+    let mut has_load = false;
+    for ph in &elf.program_headers {
+        if ph.p_type != PT_LOAD {
+            continue;
+        }
+        has_load = true;
+        if ph.p_filesz > ph.p_memsz
+            || ph
+                .p_offset
+                .checked_add(ph.p_filesz)
+                .is_none_or(|end| end > bytes.len() as u64)
+            || ph
+                .p_vaddr
+                .checked_add(ph.p_memsz)
+                .and_then(|end| end.checked_add(PAGE - 1))
+                .is_none()
+        {
+            return Err(crate::linux_abi::LINUX_ENOEXEC);
+        }
+    }
+    if !has_load
+        || (apply_relative_relocations
+            && elf
+                .dynrelas
+                .iter()
+                .any(|rela| rela.r_type != R_X86_64_RELATIVE))
+    {
+        return Err(crate::linux_abi::LINUX_ENOEXEC);
+    }
+    Ok(elf)
+}
+
+fn validate_loadable(bytes: &[u8]) -> Result<(), crate::linux_abi::LinuxErrno> {
+    let elf = Elf::parse(bytes).map_err(|_| crate::linux_abi::LINUX_ENOEXEC)?;
+    parse_loadable_elf(bytes, elf.interpreter.is_none()).map(|_| ())
+}
+
+fn load_interpreter_bytes(
+    dispatcher: &SyscallDispatcher,
+    executable: &[u8],
+) -> Result<Option<Vec<u8>>, crate::linux_abi::LinuxErrno> {
+    let elf = Elf::parse(executable).map_err(|_| crate::linux_abi::LINUX_ENOEXEC)?;
+    let Some(path) = elf.interpreter else {
+        return Ok(None);
+    };
+    let bytes = dispatcher
+        .read_exec_file(path)
+        .ok_or(crate::linux_abi::LINUX_ENOENT)?;
+    parse_loadable_elf(&bytes, false)?;
+    Ok(Some(bytes))
 }
 
 /// Resolve + read an `execve(2)` target through the dispatcher's exec path
@@ -1726,7 +1830,7 @@ fn load_execve_image(
     dispatcher: &SyscallDispatcher,
     path: &str,
     argv: Vec<Vec<u8>>,
-) -> Result<(Vec<u8>, String, Vec<Vec<u8>>), crate::linux_abi::LinuxErrno> {
+) -> Result<(Vec<u8>, Option<Vec<u8>>, String, Vec<Vec<u8>>), crate::linux_abi::LinuxErrno> {
     // Linux requires a non-empty argv; a guest that passes an empty vector gets
     // argv[0] = the program path (matching musl/glibc's fallback).
     let argv = if argv.is_empty() {
@@ -1756,7 +1860,8 @@ fn load_execve_image(
         })
         .ok_or(crate::linux_abi::LINUX_ENOENT)?;
     validate_loadable(&file)?;
-    Ok((file, resolved, argv))
+    let interpreter = load_interpreter_bytes(dispatcher, &file)?;
+    Ok((file, interpreter, resolved, argv))
 }
 
 /// Build the Linux x86_64 initial stack:
@@ -1770,7 +1875,9 @@ fn build_initial_stack(
     argv: &[Vec<u8>],
     env: &[Vec<u8>],
     elf: &Elf,
-    bias: u64,
+    phdr_va: u64,
+    main_entry: u64,
+    interpreter_base: u64,
     vdso_base: u64,
 ) -> u64 {
     const AT_NULL: u64 = 0;
@@ -1778,6 +1885,7 @@ fn build_initial_stack(
     const AT_PHENT: u64 = 4;
     const AT_PHNUM: u64 = 5;
     const AT_PAGESZ: u64 = 6;
+    const AT_BASE: u64 = 7;
     const AT_ENTRY: u64 = 9;
     const AT_SYSINFO_EHDR: u64 = 33;
     const AT_RANDOM: u64 = 25;
@@ -1805,8 +1913,6 @@ fn build_initial_stack(
     let arg_ptrs: Vec<u64> = argv.iter().map(|a| place(a)).collect();
     let env_ptrs: Vec<u64> = env.iter().map(|e| place(e)).collect();
 
-    let phdr_va = elf.header.e_phoff + bias;
-
     // Build the stack image bottom-up as a word vector, then place it so argc
     // lands 16-aligned.
     let mut words: Vec<u64> = Vec::new();
@@ -1821,9 +1927,12 @@ fn build_initial_stack(
         (AT_PHENT, elf.header.e_phentsize as u64),
         (AT_PHNUM, elf.header.e_phnum as u64),
         (AT_PAGESZ, PAGE),
-        (AT_ENTRY, elf.entry + bias),
+        (AT_ENTRY, main_entry),
         (AT_RANDOM, random_ptr),
     ];
+    if interpreter_base != 0 {
+        auxv.push((AT_BASE, interpreter_base));
+    }
     // Only advertise the vDSO when it was successfully mapped; a 0 base would
     // make `getauxval(AT_SYSINFO_EHDR)` resolve to a null pointer the guest
     // would then parse as an ELF.
@@ -2462,7 +2571,13 @@ pub(crate) fn run_static_x86_elf_bytes(
     // fork children for wait4/waitid RUSAGE_CHILDREN rollup).
     crate::guest_cpu::set_native_host_provider();
 
-    let image = load_static_pie(bytes, &argv, &env)?;
+    let interpreter = load_interpreter_bytes(&dispatcher, bytes).map_err(|errno| {
+        RuntimeError::Unsupported(format!(
+            "resolve native x86 PT_INTERP failed with Linux errno {}",
+            errno.get()
+        ))
+    })?;
+    let image = load_static_pie(bytes, interpreter.as_deref(), &argv, &env)?;
 
     let jit = FreebsdHostJit;
     jit.supported()
@@ -3062,6 +3177,21 @@ fn run_x86_thread(
                     // by the signal. Buffered output is drained either way.
                     Ok(false) => {
                         if forked {
+                            let message = format!(
+                                "native x86 fork child {} fatal signal {linux_sig} at \
+                                 pc=0x{fault_pc:x} addr=0x{:x} code={fault_code}; \
+                                 rsp=0x{:x} rdi=0x{:x} rsi=0x{:x}; bytes={:02x?}; \
+                                 segments={:x?}\n",
+                                tid.raw(),
+                                ctx.fault.addr,
+                                snapshot.gpr[reg::RSP],
+                                snapshot.gpr[reg::RDI],
+                                snapshot.gpr[reg::RSI],
+                                code_bytes(fault_pc),
+                                image.segments,
+                            );
+                            // SAFETY: best-effort breadcrumb on a fatal child path.
+                            unsafe { libc::write(2, message.as_ptr().cast(), message.len()) };
                             crate::exec_helpers::forked_child_die_by_signal(
                                 linux_sig,
                                 active.dispatcher.stdout(),
@@ -3208,7 +3338,7 @@ fn run_x86_thread(
                                 snapshot.gpr[reg::RAX] = (-(errno.get() as i64)) as u64;
                                 next = snapshot.rip;
                             }
-                            Ok((bytes, resolved, argv)) => {
+                            Ok((bytes, interpreter, resolved, argv)) => {
                                 // Retire every sibling guest thread: after exec
                                 // only the execing task survives (`execfromthread`
                                 // execs from a non-leader while main keeps
@@ -3224,7 +3354,6 @@ fn run_x86_thread(
                                 }
                                 active.registry.remove_all_except(tid);
                                 exec_owner = true;
-                                let vfork_exec = vfork_completion_fd.is_some();
                                 // Reset the dispatcher's per-process exec state:
                                 // fresh brk/mmap bookkeeping, signal handlers to
                                 // default, close O_CLOEXEC fds, new /proc identity.
@@ -3250,20 +3379,18 @@ fn run_x86_thread(
                                 // vDSO/vvar live at FIXED VAs, so the old must be
                                 // unmapped BEFORE the new maps over them.
                                 image.teardown();
-                                // The heap and mmap arenas survive ordinary
-                                // in-process exec. A vfork child, however,
-                                // inherited them with INHERIT_SHARE; replace
-                                // them with fresh private objects so the new
-                                // image's later forks are CoW and cannot share
-                                // allocator state with either vfork ancestor.
-                                if vfork_exec && let Err(error) = remap_vfork_exec_arenas() {
+                                // Linux exec installs a fresh address space.
+                                // Replace the persistent identity heap/mmap
+                                // arenas for every exec, not just vfork: stale
+                                // allocator bytes and host protections from the
+                                // old image otherwise corrupt the replacement
+                                // dynamic linker's early state.
+                                if let Err(error) = remap_exec_arenas() {
                                     notify_vfork_completion(&mut vfork_completion_fd);
-                                    fault_detail = Some(format!(
-                                        "replace vfork-shared exec arenas: {error:?}"
-                                    ));
+                                    fault_detail = Some(format!("replace exec arenas: {error:?}"));
                                     break;
                                 }
-                                match load_static_pie(&bytes, &argv, &env) {
+                                match load_static_pie(&bytes, interpreter.as_deref(), &argv, &env) {
                                     Ok(new_image) => {
                                         reset_identity_vmas(&new_image);
                                         image = Arc::new(new_image);
