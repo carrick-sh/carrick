@@ -14,6 +14,38 @@
 #![cfg(all(target_os = "freebsd", target_arch = "x86_64"))]
 
 #[test]
+fn native_backend_enters_dynamic_interpreter_with_linux_auxv() {
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../carrick-dsr-x86/tests/fixtures/dynamic-main-x86_64-linux"
+    );
+    let interpreter = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../carrick-dsr-x86/tests/fixtures/dynamic-interpreter-x86_64-linux"
+    );
+    let root = tempfile::tempdir().expect("dynamic fixture root");
+    std::fs::create_dir(root.path().join("lib")).expect("fixture lib directory");
+    std::fs::copy(
+        interpreter,
+        root.path().join("lib/carrick-dynamic-interpreter"),
+    )
+    .expect("install fixture interpreter");
+    let prior_root = std::env::var_os("CARRICK_NATIVE_ROOTFS");
+    // SAFETY: this integration binary's native runs are process-serialized by
+    // the backend; the temporary root remains alive until the run returns.
+    unsafe { std::env::set_var("CARRICK_NATIVE_ROOTFS", root.path()) };
+    let result = carrick_runtime::runtime::run_elf_native_dispatch(fixture.as_ref());
+    match prior_root {
+        Some(value) => unsafe { std::env::set_var("CARRICK_NATIVE_ROOTFS", value) },
+        None => unsafe { std::env::remove_var("CARRICK_NATIVE_ROOTFS") },
+    }
+    let result = result.expect("native x86 dynamic ELF must enter PT_INTERP");
+
+    assert_eq!(result.exit_code, 23, "interpreter validated the entry auxv");
+    assert_eq!(result.stdout, b"dynamic-elf ok\n");
+}
+
+#[test]
 fn native_backend_runs_a_static_x86_elf_through_the_real_dispatcher() {
     let fixture = concat!(
         env!("CARGO_MANIFEST_DIR"),
