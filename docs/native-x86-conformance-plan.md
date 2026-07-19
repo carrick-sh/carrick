@@ -6,12 +6,11 @@
 
 ## Where we are
 
-- **Current strict census:** **412/428 (96.3%)** on FreeBSD/amd64. The checked-in
-  census is a low-parallelism complete run with six immediately focused reruns
-  replacing resource-contaminated results (`clone3signalflight`, `dnotify`,
-  `mtidlesleep`, `procconfigloop`, `sysvmsgwake`, `traceexecstop`).
-- **Standalone runtime backlog:** 5 probes: three live-protection/fault-retry
-  cases and two vfork cases.
+- **Current strict census:** **414/428 (96.7%)** on FreeBSD/amd64. The checked-in
+  census is a low-parallelism complete run with focused reruns replacing
+  resource-contaminated results; the two vfork rows were verified individually
+  after the shared-VM implementation landed.
+- **Standalone runtime backlog:** 3 live-protection/fault-retry probes.
 - **Harness-dependent backlog:** 11 client/server or published-network probes
   require the coordinated conformance harness and are not valid standalone
   `native_run` failures.
@@ -316,9 +315,7 @@ work.
    protections, translate executable mappings from current guest bytes, and
    resume at the exact faulting instruction (`forkfault`, `mprotectexec`,
    `roprotect`).
-2. Implement real `CLONE_VM|CLONE_VFORK` address-space sharing and parent
-   suspension (`vforkvmshare`, `vforkexecthread`).
-3. Run the paired network scenarios under their intended harness and continue the
+2. Run the paired network scenarios under their intended harness and continue the
    native LTP readiness baseline.
 
 The earlier architecture-locked ceiling is obsolete. Probe syscall numbers,
@@ -356,7 +353,10 @@ Strict census, all 428 current targets. Raw data: `docs/native-x86-census.tsv`.
 | wave 4 (parallel: driver + networking) | 314 / 428 (~315 true) | +10 net. container bridge network, execve/Rung E, threadstatstate recovered |
 | wave 5 (parallel: driver + dispatcher) | 334 / 428 | +20 net. cross-process signals, procctl reaper + SIGCHLD, shared FUTEX_WAKE count, netifmcast+schedprio |
 | wave 6 (lifecycle + shared-word + VMA safety) | 344 / 428 | +10 net. init/subreaper orphan lifecycle, SysV message waits, fail-closed identity VMAs; zero host-crash buckets |
-| **wave 7 (ABI, exec/fork, memory, probes)** | **412 / 428** | +68 net. x86 syscall normalization, self-contained exec, clone/pidfd lifecycle, live exec images, identity mappings, vDSO, ptrace exec-stop, and strict-census cleanup |
+| wave 7 (ABI, exec/fork, memory, probes) | 412 / 428 | +68 net. x86 syscall normalization, self-contained exec, clone/pidfd lifecycle, live exec images, identity mappings, vDSO, ptrace exec-stop, and strict-census cleanup |
+| **wave 8 (vfork shared VM)** | **414 / 428** | +2. FreeBSD `minherit(INHERIT_SHARE)` guest mappings, parent suspension, and exec/_exit completion |
+
+**Wave-8 detail (+2):** `CLONE_VM|CLONE_VFORK` temporarily gives private guest VMAs FreeBSD `INHERIT_SHARE`, excluding existing `MAP_SHARED` ranges so restoring `INHERIT_COPY` cannot sever their backing-store coherence. The parent parks in one host `poll(2)` until child exec/exit or an execing sibling wakes it through a nonblocking rendezvous pipe. Fork serialization remains held across the shared-inheritance window. Exec acknowledgement now uses the existing condvar rather than a `sched_yield` loop; `truss -cf` verifies the vfork/exec reducer issues zero `sched_yield` calls instead of roughly 600,000.
 
 **Wave-7 detail (+66):** x86-only syscalls now use collision-free private canonical numbers and probe sources use target `libc::SYS_*` values. The initial ELF is materialized under `/run/carrick`, exec preserves the Linux signal state that survives replacement, clone exit signals and `CLONE_PIDFD` are published atomically, replacement images are visible to post-exec threads, identity mappings support private repointing and read-only metadata, and native CPU accounting uses host `RUSAGE_SELF`. The x86 fault address comes from `REG_CR2`; the vDSO and standalone reducers now assert guest-ISA-specific semantics. The final focused fixes publish the mandatory traced-exec `SIGTRAP` boundary and key shared-file futex counts by FreeBSD vnode offset so checkpoint wake counts survive remapping across exec. Cross-process requeue uses fork-shared direct/move assignments plus destination wake credits, preserving exact counts and wake-before-park semantics over FreeBSD umtx. Non-faulting host-VMA checks and Linux's ENOMEM mremap-grow result let musl discover the full native main stack. Optional backend residency vectors combine FreeBSD's live `mincore` state with portable eager-population metadata, preserving `MLOCK_ONFAULT` first-touch behavior. A protocol-aware socket description and synthetic loopback echo queue provide Linux datagram ICMP semantics where FreeBSD has no ping socket. Strict-census false negatives were removed by expressing expected negative observations as affirmative invariants.
 
@@ -365,14 +365,14 @@ Strict census, all 428 current targets. Raw data: `docs/native-x86-census.tsv`.
 **Wave-5 detail (+20):** driver — cross-process xsignal ring (`sigqueueusr1`,`bsd_signal_xlate`), pumped standard signals (`pauseinterrupt2`), sigwait/sigtimedwait wake (`sigwaitthread`,`sigtimedwaitintr`,`sigwaitblock`), EINTR wait4 (`waitrestart`), shared FUTEX_WAKE count (`futexwakecount`,`futexsharedalias`), procctl reaper + SIGCHLD routing (`childsubreaper`,`waitsiblingsigchld`) — cascaded to `sigchld`,`cloneexithandled`,`clone3exithandled`,`mtforkcorrupt`,`ltpcheckpoint`,`sysvsem`,`waitexitstorm`,`killfault`; dispatcher — `netifmcast` (bridge eth0 IPv6), `schedprio` (EFAULT non-canonical param).
 - At this historical point, `signalfd4`, `threadcommname`, and `schedthread` still used aarch64 syscall numbers; wave 7 made them guest-ISA-neutral. `futexpingpong` also had a negatively phrased pass condition, now expressed affirmatively.
 
-## Session summary: 245 → 412 (+167 net)
+## Session summary: 245 → 414 (+169 net)
 
 The lane advanced from a threadless, signal-less, fork-fragile driver to real
 guest threads and futexes, full signal delivery, robust fork/exec lifecycle,
 container-network identity, timers/vDSO, ptrace stop boundaries, and broad
-backend-neutral dispatcher coverage. **412/428 = 96.3% strict standalone.**
+backend-neutral dispatcher coverage. **414/428 = 96.7% strict standalone.**
 
-The 16 non-OK rows split cleanly:
+The 14 non-OK rows split cleanly:
 - **Harness-dependent networking (11 binaries):** `bridge_compose_client/server`,
   `bridge_publish_tcp`, `host_gateway_client`, `multi_network_client/server`,
   `multi_network_dns_client`, `perf_net_xclient/xserver`, and
@@ -380,7 +380,6 @@ The 16 non-OK rows split cleanly:
   independent `native_run` checks.
 - **Live protection/fault retry (3):** `forkfault`, `mprotectexec`, and
   `roprotect` need exact faulting-instruction retry and protection enforcement.
-- **vfork semantics (2):** `vforkvmshare`, `vforkexecthread`.
 
 The next native LTP readiness gate can start now for syscall breadth, but these
 semantic gaps remain release blockers and must not be hidden as baseline excuses.
@@ -391,8 +390,8 @@ semantic gaps remain release blockers and must not be hidden as baseline excuses
 
 There is no longer an architecture-locked or rootfs-blocked exclusion set: the
 x86-specific probe fixes and self-contained exec reducers removed those limits.
-The strict standalone result is **412/428**. Eleven client/server binaries need
-the coordinated network harness for a meaningful verdict; the other five
+The strict standalone result is **414/428**. Eleven client/server binaries need
+the coordinated network harness for a meaningful verdict; the other three
 standalone failures are genuine runtime or host-compatibility work. The intended
 harness ceiling remains **428/428**, not a blessed partial score.
 

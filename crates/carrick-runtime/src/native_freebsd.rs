@@ -274,10 +274,10 @@ fn identity_host_range_mapped(address: u64, length: usize) -> bool {
 #[cfg(test)]
 mod identity_raw_range_tests {
     use super::{
-        IdentityGuestMemory, SharedWaitAssignment, freebsd_shared_waiter_key,
-        identity_host_range_mapped, identity_raw_range_valid, init_shared_waiter_table,
-        shared_futex_requeue_umtx, shared_futex_wake_umtx, shared_waiter_slot,
-        take_shared_wait_assignment, wait_requeued_umtx,
+        IdentityGuestMemory, SharedWaitAssignment, exclude_vfork_shared_ranges,
+        freebsd_shared_waiter_key, identity_host_range_mapped, identity_raw_range_valid,
+        init_shared_waiter_table, shared_futex_requeue_umtx, shared_futex_wake_umtx,
+        shared_waiter_slot, take_shared_wait_assignment, wait_requeued_umtx,
     };
     use carrick_guest_mem::GuestMemory;
     use std::os::fd::AsRawFd;
@@ -435,6 +435,22 @@ mod identity_raw_range_tests {
         );
 
         unsafe { libc::munmap(words, 4096) };
+    }
+
+    #[test]
+    fn vfork_inheritance_excludes_existing_shared_vmas() {
+        assert_eq!(
+            exclude_vfork_shared_ranges(
+                vec![(0x1000, 0x8000), (0x20_000, 0x1000)],
+                &[(0x3000, 0x2000), (0x7000, 0x1000)],
+            ),
+            vec![
+                (0x1000, 0x2000),
+                (0x5000, 0x2000),
+                (0x8000, 0x1000),
+                (0x20_000, 0x1000),
+            ]
+        );
     }
 }
 
@@ -1734,6 +1750,15 @@ enum ThreadRunOutcome {
 
 /// The result of running one translated block through the gateway: where to go
 /// next, or a terminal signal.
+fn notify_vfork_completion(fd: &mut Option<i32>) {
+    let Some(fd) = fd.take() else {
+        return;
+    };
+    let byte = 1u8;
+    let _ = unsafe { libc::write(fd, (&byte as *const u8).cast::<libc::c_void>(), 1) };
+    unsafe { libc::close(fd) };
+}
+
 enum Step {
     Continue(u64),
     Exit(i32),
@@ -1745,7 +1770,10 @@ enum Step {
     /// to 0). The run loop marks itself a descendant so its eventual exit
     /// `_exit`s directly (reaped by the parent's `wait4`) instead of returning
     /// a `RunResult` up through `native_run`.
-    BecameForkChild(u64),
+    BecameForkChild {
+        resume: u64,
+        vfork_completion_fd: Option<i32>,
+    },
     /// A default-action fatal signal with no guest handler. A fork DESCENDANT
     /// must die BY the signal so its parent's `wait4` sees `WIFSIGNALED`; the
     /// TOP-LEVEL guest instead reports `exit=128+signum` so the driver returns a
@@ -1884,16 +1912,30 @@ struct ExitState {
     /// loop. The execing thread waits on this before retiring the old image so
     /// no sibling faults on a mapping being torn out from under it.
     exec_acks: std::sync::atomic::AtomicUsize,
+    /// A vfork parent sleeps in host `poll(2)`, not a timed polling loop. An
+    /// execing sibling writes this nonblocking pipe to retire that parent at
+    /// once, avoiding both latency and repeated host syscalls.
+    vfork_waiting: std::sync::atomic::AtomicBool,
+    vfork_wake: [i32; 2],
 }
 
 impl ExitState {
     fn new() -> Self {
+        let mut vfork_wake = [-1; 2];
+        // Failure is non-fatal: vfork wait checks the atomic before blocking,
+        // while the normal FreeBSD path has a real pipe and zero polling.
+        if unsafe { libc::pipe2(vfork_wake.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0
+        {
+            vfork_wake = [-1; 2];
+        }
         Self {
             code: std::sync::Mutex::new(None),
             cv: std::sync::Condvar::new(),
             requested: std::sync::atomic::AtomicBool::new(false),
             exec_stop: std::sync::atomic::AtomicBool::new(false),
             exec_acks: std::sync::atomic::AtomicUsize::new(0),
+            vfork_waiting: std::sync::atomic::AtomicBool::new(false),
+            vfork_wake,
         }
     }
 
@@ -1903,29 +1945,66 @@ impl ExitState {
             .store(0, std::sync::atomic::Ordering::Release);
         self.exec_stop
             .store(true, std::sync::atomic::Ordering::Release);
+        if self
+            .vfork_waiting
+            .load(std::sync::atomic::Ordering::Acquire)
+            && self.vfork_wake[1] >= 0
+        {
+            let byte = 1u8;
+            let _ = unsafe {
+                libc::write(
+                    self.vfork_wake[1],
+                    (&byte as *const u8).cast::<libc::c_void>(),
+                    1,
+                )
+            };
+        }
     }
 
     fn exec_stop_requested(&self) -> bool {
         self.exec_stop.load(std::sync::atomic::Ordering::Acquire)
     }
 
+    fn begin_vfork_wait(&self) {
+        self.vfork_waiting
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    fn end_vfork_wait(&self) {
+        self.vfork_waiting
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    fn vfork_wake_fd(&self) -> i32 {
+        self.vfork_wake[0]
+    }
+
     /// A sibling acknowledges it has left its run loop for the exec takeover.
     fn ack_exec_stop(&self) {
         self.exec_acks
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.cv.notify_all();
     }
 
-    /// Block (bounded spin) until at least `n` siblings have acked the stop, so
-    /// the execing thread can safely retire the old image. Bounded so a sibling
-    /// wedged in an uninterruptible host call cannot hang exec forever.
+    /// Park until at least `n` siblings have acked the stop. A condvar avoids
+    /// amplifying one guest exec into hundreds of thousands of host
+    /// `sched_yield(2)` calls while retaining the existing three-second
+    /// backstop for an uninterruptible sibling.
     fn wait_exec_acks(&self, n: usize) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut guard = self.code.lock().unwrap_or_else(|p| p.into_inner());
         while self.exec_acks.load(std::sync::atomic::Ordering::Acquire) < n {
-            if std::time::Instant::now() >= deadline {
+            let now = std::time::Instant::now();
+            if now >= deadline {
                 break;
             }
-            std::thread::yield_now();
+            let waited = self
+                .cv
+                .wait_timeout(guard, deadline.saturating_duration_since(now));
+            let (next_guard, _) = waited.unwrap_or_else(|p| p.into_inner());
+            guard = next_guard;
         }
+        drop(guard);
         // The takeover is complete; clear the flag so the new image's own
         // future threads are not spuriously stopped.
         self.exec_stop
@@ -1959,6 +2038,16 @@ impl ExitState {
 
     fn code(&self) -> Option<i32> {
         *self.code.lock().unwrap_or_else(|p| p.into_inner())
+    }
+}
+
+impl Drop for ExitState {
+    fn drop(&mut self) {
+        for fd in self.vfork_wake {
+            if fd >= 0 {
+                unsafe { libc::close(fd) };
+            }
+        }
     }
 }
 
@@ -2493,6 +2582,9 @@ fn run_x86_thread(
     let mut fault_detail: Option<String> = None;
     // True once this process is a `fork()` descendant (see `Step::Exit`).
     let mut forked = false;
+    // Write end inherited by a CLONE_VFORK child. Closing on `_exit` produces
+    // EOF; successful in-process exec explicitly writes then closes it.
+    let mut vfork_completion_fd: Option<i32> = None;
 
     // Translated-block cache keyed by guest VA: `(exec VA, has_edges,
     // uses_fpu)`. Guest text is read-only here (no self-modifying code), so a
@@ -2743,10 +2835,14 @@ fn run_x86_thread(
                         // live thread: end just this host thread.
                         return ThreadRunOutcome::ThreadDone { traps };
                     }
-                    Step::BecameForkChild(rip) => {
+                    Step::BecameForkChild {
+                        resume: rip,
+                        vfork_completion_fd: completion_fd,
+                    } => {
                         // This process is now a fork descendant; its exit must
                         // be reaped by the parent, not returned up.
                         forked = true;
+                        vfork_completion_fd = completion_fd;
                         next = rip;
                         // Swap onto a FRESH private code cache: the parent's
                         // SHM_ANON cache is MAP_SHARED and survives fork, so
@@ -2860,6 +2956,10 @@ fn run_x86_thread(
                                 }
                                 active.registry.remove_all_except(tid);
                                 exec_owner = true;
+                                // Linux releases a vfork-suspended parent at the
+                                // successful exec point of no return, before the
+                                // replacement image executes.
+                                notify_vfork_completion(&mut vfork_completion_fd);
                                 // Reset the dispatcher's per-process exec state:
                                 // fresh brk/mmap bookkeeping, signal handlers to
                                 // default, close O_CLOEXEC fds, new /proc identity.
@@ -3108,9 +3208,9 @@ fn service_syscall(
             child_stack,
             pidfd_out,
             exit_signal,
-            ..
+            vfork,
         } => service_fork(
-            dispatcher,
+            shared,
             NativeForkRequest {
                 clone_parent,
                 parent_tid_addr,
@@ -3119,6 +3219,7 @@ fn service_syscall(
                 pidfd_out,
                 parent_tid: tid.raw(),
                 exit_signal,
+                vfork,
             },
             snapshot,
             memory,
@@ -4228,6 +4329,178 @@ struct NativeForkRequest {
     pidfd_out: Option<u64>,
     parent_tid: i32,
     exit_signal: u32,
+    vfork: Option<u64>,
+}
+
+struct NativeVforkShare {
+    ranges: Vec<(u64, usize)>,
+    pipe: [i32; 2],
+}
+
+fn exclude_vfork_shared_ranges(
+    ranges: Vec<(u64, usize)>,
+    exclusions: &[(u64, usize)],
+) -> Vec<(u64, usize)> {
+    let mut result = Vec::new();
+    for (start, len) in ranges {
+        let Some(end) = start.checked_add(len as u64) else {
+            continue;
+        };
+        let mut pieces = vec![(start, end)];
+        for &(exclude_start, exclude_len) in exclusions {
+            let exclude_end = exclude_start.saturating_add(exclude_len as u64);
+            let mut next = Vec::new();
+            for (piece_start, piece_end) in pieces {
+                if exclude_end <= piece_start || exclude_start >= piece_end {
+                    next.push((piece_start, piece_end));
+                    continue;
+                }
+                if piece_start < exclude_start {
+                    next.push((piece_start, exclude_start));
+                }
+                if exclude_end < piece_end {
+                    next.push((exclude_end, piece_end));
+                }
+            }
+            pieces = next;
+        }
+        result.extend(pieces.into_iter().filter_map(|(piece_start, piece_end)| {
+            usize::try_from(piece_end.saturating_sub(piece_start))
+                .ok()
+                .filter(|len| *len != 0)
+                .map(|len| (piece_start, len))
+        }));
+    }
+    result.sort_unstable_by_key(|&(start, _)| start);
+    let mut coalesced: Vec<(u64, usize)> = Vec::new();
+    for (start, len) in result {
+        if let Some((last_start, last_len)) = coalesced.last_mut() {
+            let last_end = last_start.saturating_add(*last_len as u64);
+            if start <= last_end {
+                let end = start.saturating_add(len as u64).max(last_end);
+                *last_len = (end - *last_start) as usize;
+                continue;
+            }
+        }
+        coalesced.push((start, len));
+    }
+    coalesced
+}
+
+impl NativeVforkShare {
+    fn prepare(shared: &SharedRun) -> std::io::Result<Self> {
+        let image = shared.current_image();
+        let mut ranges: Vec<(u64, usize)> = image
+            .segments
+            .iter()
+            .filter_map(|&(start, end)| {
+                usize::try_from(end.saturating_sub(start))
+                    .ok()
+                    .map(|len| (start, len))
+            })
+            .collect();
+        ranges.extend([
+            (image.stack, image.stack_len),
+            (image.scratch, image.scratch_len),
+            (LINUX_HEAP_BASE, LINUX_HEAP_SIZE as usize),
+            (LINUX_MMAP_BASE, mmap_arena_size() as usize),
+        ]);
+        ranges.extend(shared.dispatcher.private_dynamic_mapping_ranges());
+        // Existing MAP_SHARED mappings already cross fork correctly. Never run
+        // them through INHERIT_COPY on restoration: FreeBSD documents that this
+        // permanently severs their backing-store sharing.
+        ranges =
+            exclude_vfork_shared_ranges(ranges, &shared.dispatcher.shared_dynamic_mapping_ranges());
+        let mut applied = 0usize;
+        for &(start, len) in &ranges {
+            if unsafe {
+                carrick_portable::freebsd_minherit(
+                    start as *mut libc::c_void,
+                    len,
+                    carrick_portable::FREEBSD_INHERIT_SHARE,
+                )
+            } != 0
+            {
+                for &(rollback_start, rollback_len) in ranges[..applied].iter().rev() {
+                    unsafe {
+                        carrick_portable::freebsd_minherit(
+                            rollback_start as *mut libc::c_void,
+                            rollback_len,
+                            carrick_portable::FREEBSD_INHERIT_COPY,
+                        )
+                    };
+                }
+                return Err(std::io::Error::last_os_error());
+            }
+            applied += 1;
+        }
+        let mut pipe = [-1; 2];
+        if unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+            for &(start, len) in ranges.iter().rev() {
+                unsafe {
+                    carrick_portable::freebsd_minherit(
+                        start as *mut libc::c_void,
+                        len,
+                        carrick_portable::FREEBSD_INHERIT_COPY,
+                    )
+                };
+            }
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self { ranges, pipe })
+    }
+
+    fn restore_parent_inheritance(&self) {
+        for &(start, len) in self.ranges.iter().rev() {
+            unsafe {
+                carrick_portable::freebsd_minherit(
+                    start as *mut libc::c_void,
+                    len,
+                    carrick_portable::FREEBSD_INHERIT_COPY,
+                )
+            };
+        }
+    }
+}
+
+fn wait_native_vfork_completion(read_fd: i32, exit: &ExitState) -> bool {
+    loop {
+        if exit.exec_stop_requested() {
+            return false;
+        }
+        let wake_fd = exit.vfork_wake_fd();
+        let mut pollfds = [
+            libc::pollfd {
+                fd: read_fd,
+                events: libc::POLLIN | libc::POLLHUP,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: wake_fd,
+                events: libc::POLLIN | libc::POLLHUP,
+                revents: 0,
+            },
+        ];
+        // The normal path blocks in one host syscall until child completion or
+        // sibling exec. Only the pipe-creation fallback uses a bounded wait.
+        let timeout = if wake_fd >= 0 { -1 } else { 20 };
+        let rc = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as u32, timeout) };
+        if rc < 0 {
+            // Signals are wake hints: re-check exec_stop and the completion fd.
+            continue;
+        }
+        if exit.exec_stop_requested() {
+            return false;
+        }
+        if pollfds[0].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+            let mut byte = 0u8;
+            let read =
+                unsafe { libc::read(read_fd, (&mut byte as *mut u8).cast::<libc::c_void>(), 1) };
+            if read >= 0 {
+                return true;
+            }
+        }
+    }
 }
 
 /// Perform a guest `fork()` as a host `fork()`. Sets guest `rax` (0 in the
@@ -4235,13 +4508,14 @@ struct NativeForkRequest {
 /// given, and honors CLONE_PARENT_SETTID / CLONE_CHILD_SETTID. Returns
 /// [`Step::BecameForkChild`] in the child so the run loop `_exit`s it directly.
 fn service_fork(
-    dispatcher: &SyscallDispatcher,
+    shared: &Arc<SharedRun>,
     request: NativeForkRequest,
     snapshot: &mut X86UcontextSnapshot,
     memory: &mut IdentityGuestMemory,
     resume: u64,
 ) -> Step {
-    let fork_guard = NativeForkGuard::acquire();
+    let dispatcher = &shared.dispatcher;
+    let mut fork_guard = Some(NativeForkGuard::acquire());
     let current = std::process::id();
     let child_parent = if request.clone_parent {
         dispatcher.clone_parent_host_pid()
@@ -4293,10 +4567,38 @@ fn service_fork(
         None
     };
 
-    // SAFETY: a plain process fork; the child re-enters the same run loop with
-    // a COW copy of every mapping.
+    let vfork_share = if request.vfork.is_some() {
+        match NativeVforkShare::prepare(shared) {
+            Ok(state) => Some(state),
+            Err(error) => {
+                if let Some([read_fd, write_fd]) = pidfd_gate {
+                    unsafe {
+                        libc::close(read_fd);
+                        libc::close(write_fd);
+                    }
+                }
+                crate::guest_cpu::abort_prepared_child_record();
+                drop(fork_guard);
+                let errno = error.raw_os_error().unwrap_or(libc::EAGAIN);
+                snapshot.gpr[reg::RAX] = (-(errno as i64)) as u64;
+                return Step::Continue(resume);
+            }
+        }
+    } else {
+        None
+    };
+
+    // SAFETY: a plain process fork. Ordinary forks inherit guest mappings CoW;
+    // CLONE_VFORK mappings were temporarily marked INHERIT_SHARE above.
     let pid = unsafe { libc::fork() };
     if pid < 0 {
+        if let Some(state) = &vfork_share {
+            unsafe {
+                libc::close(state.pipe[0]);
+                libc::close(state.pipe[1]);
+            }
+            state.restore_parent_inheritance();
+        }
         if let Some([read_fd, write_fd]) = pidfd_gate {
             unsafe {
                 libc::close(read_fd);
@@ -4312,10 +4614,14 @@ fn service_fork(
         snapshot.gpr[reg::RAX] = (-(errno as i64)) as u64;
         return Step::Continue(resume);
     }
-    // This thread owned the atomic guard at fork. Dropping the COW copy is one
-    // release-store in each process and precedes all child-side locks.
-    drop(fork_guard);
+    // Ordinary fork releases serialization immediately. A vfork parent keeps
+    // it across the INHERIT_SHARE window so a sibling fork cannot accidentally
+    // inherit shared guest mappings. The child's COW guard copy is independent.
+    if vfork_share.is_none() {
+        drop(fork_guard.take());
+    }
     if pid == 0 {
+        drop(fork_guard.take());
         // Child: complete the record inherited from the serialized pre-fork
         // preparation before it can fork children or expose process identity.
         crate::guest_cpu::complete_child_record_post_fork_child();
@@ -4344,8 +4650,18 @@ fn service_fork(
             let cpid = crate::namespace::pid::self_ns_pid();
             let _ = memory.write_bytes(addr, &cpid.to_le_bytes());
         }
-        Step::BecameForkChild(resume)
+        let vfork_completion_fd = vfork_share.as_ref().map(|state| {
+            unsafe { libc::close(state.pipe[0]) };
+            state.pipe[1]
+        });
+        Step::BecameForkChild {
+            resume,
+            vfork_completion_fd,
+        }
     } else {
+        if let Some(state) = &vfork_share {
+            unsafe { libc::close(state.pipe[1]) };
+        }
         if let Some([read_fd, _]) = pidfd_gate {
             unsafe { libc::close(read_fd) };
         }
@@ -4367,6 +4683,10 @@ fn service_fork(
                         }
                     }
                     crate::guest_cpu::abort_prepared_child_record();
+                    if let Some(state) = &vfork_share {
+                        unsafe { libc::close(state.pipe[0]) };
+                        state.restore_parent_inheritance();
+                    }
                     snapshot.gpr[reg::RAX] = errno.guest_retval() as u64;
                     return Step::Continue(resume);
                 }
@@ -4397,6 +4717,18 @@ fn service_fork(
             let _ =
                 unsafe { libc::write(write_fd, (&release as *const u8).cast::<libc::c_void>(), 1) };
             unsafe { libc::close(write_fd) };
+        }
+        if let Some(state) = &vfork_share {
+            shared.exit.begin_vfork_wait();
+            let completed = wait_native_vfork_completion(state.pipe[0], &shared.exit);
+            shared.exit.end_vfork_wait();
+            unsafe { libc::close(state.pipe[0]) };
+            state.restore_parent_inheritance();
+            drop(fork_guard.take());
+            if !completed {
+                shared.exit.ack_exec_stop();
+                return Step::ThreadEnd;
+            }
         }
         // Close the fast-child race for ungated forks and publish any child that
         // exited immediately after the pidfd gate opened. WNOWAIT leaves the
