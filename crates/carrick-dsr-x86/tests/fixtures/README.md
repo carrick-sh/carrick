@@ -30,3 +30,18 @@ back-edge ran natively in the JIT every iteration — unchained it would
 round-trip to Rust 50M times) and `exit_code == 192` (the correct
 `sum(3i+1, i in 0..50M) mod 256`, proving chaining preserved control flow and
 register state).
+
+`dynamic-main-x86_64-linux` carries a `PT_INTERP` whose main entry is an
+intentional `ud2` sentinel. `dynamic-interpreter-x86_64-linux` is a
+relocation-free static PIE that walks the kernel entry stack, requires nonzero
+`AT_PHDR`, `AT_PHNUM`, `AT_BASE`, and `AT_ENTRY`, writes `dynamic-elf ok`, and
+exits 23. Regenerate both with FreeBSD clang/lld:
+
+```sh
+clang --target=x86_64-linux-musl -nostdlib -fuse-ld=lld -pie \
+  -Wl,--no-dynamic-linker -Wl,-e,_start \
+  -o dynamic-interpreter-x86_64-linux dynamic-interpreter.S
+clang --target=x86_64-linux-musl -nostdlib -fuse-ld=lld -pie \
+  -Wl,--dynamic-linker,/lib/carrick-dynamic-interpreter -Wl,-e,_start \
+  -o dynamic-main-x86_64-linux dynamic-main.S
+```
