@@ -1545,10 +1545,18 @@ fn lane_runnable_here(lane: &Lane) -> bool {
     }
 }
 
-/// A requested same-ISA native campaign must not spill into the macOS Rosetta
-/// lane. Other backends retain the ordinary host-runnable matrix.
+/// A requested same-ISA native campaign must select the guest ISA matching the
+/// host. This excludes macOS Rosetta while allowing the FreeBSD/amd64 native
+/// DSR lane instead of hard-coding native execution to AArch64.
+fn lane_allowed_for_native_host(lane: &Lane, host_arch: &str) -> bool {
+    matches!(
+        (lane.platform, host_arch),
+        ("linux/arm64", "aarch64") | ("linux/amd64", "x86_64")
+    )
+}
+
 fn lane_allowed_for_backend(lane: &Lane, exec_backend: Option<&str>) -> bool {
-    exec_backend != Some("native") || lane.platform == "linux/arm64"
+    exec_backend != Some("native") || lane_allowed_for_native_host(lane, std::env::consts::ARCH)
 }
 
 /// Whether a probe set's DIFFs should fail the gate ON THIS HOST. A probe set is
@@ -4262,8 +4270,10 @@ fn probe_gates_decision_allowlist_logic() {
 
 #[test]
 fn native_probe_campaign_selects_only_same_isa_lane() {
-    assert!(lane_allowed_for_backend(&ARM64, Some("native")));
-    assert!(!lane_allowed_for_backend(&AMD64, Some("native")));
+    assert!(lane_allowed_for_native_host(&ARM64, "aarch64"));
+    assert!(!lane_allowed_for_native_host(&AMD64, "aarch64"));
+    assert!(lane_allowed_for_native_host(&AMD64, "x86_64"));
+    assert!(!lane_allowed_for_native_host(&ARM64, "x86_64"));
     assert!(lane_allowed_for_backend(&ARM64, Some("vmm")));
     assert!(lane_allowed_for_backend(&AMD64, None));
 }
