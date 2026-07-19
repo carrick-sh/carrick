@@ -42,6 +42,7 @@ use carrick_hal::x8664_arch::{SyscallNorm, X8664GuestArch};
 use carrick_hal::{GuestArch, Reg, RegAccess};
 use carrick_native_freebsd::{FreebsdHostJit, fault};
 use goblin::elf::Elf;
+use goblin::elf::header::{ET_DYN, ET_EXEC};
 use goblin::elf::program_header::{PF_R, PF_W, PF_X, PT_LOAD};
 
 use carrick_mem::memory::{LINUX_HEAP_BASE, LINUX_HEAP_SIZE, LINUX_MMAP_BASE, mmap_arena_size};
@@ -1429,11 +1430,12 @@ fn map_prot(len: usize, prot: i32, fixed_at: Option<u64>) -> *mut u8 {
     unsafe { libc::mmap(addr, len, prot, flags, -1, 0) }.cast()
 }
 
-/// Map a static-pie ELF at a load bias so guest VA == host VA. Reserves the
-/// whole v-span (kernel picks the bias), maps each PT_LOAD with MAP_FIXED, and
-/// copies the file bytes. The fixture/probe ELFs carry only R_X86_64_RELATIVE
-/// (or none); this first rung requires a no-reloc / RELATIVE-only image and
-/// applies RELATIVE relocations against the bias.
+/// Map a static x86_64 ELF so guest VA == host VA. Static PIE (`ET_DYN`)
+/// reserves its span at a host-selected bias; fixed static executables
+/// (`ET_EXEC`, including Kaniko) reserve their linked span at its exact VA.
+/// PT_LOAD segments then replace that reservation with MAP_FIXED backing. Only
+/// R_X86_64_RELATIVE dynamic relocations are accepted, applied against the
+/// selected bias.
 fn load_static_pie(
     bytes: &[u8],
     argv: &[Vec<u8>],
@@ -1462,14 +1464,32 @@ fn load_static_pie(
     }
     let span_len = (hi - lo) as usize;
 
-    let span = map_prot(span_len, libc::PROT_NONE, None);
-    // mmap signals failure with MAP_FAILED ((void*)-1), never NULL.
-    if span as isize == -1 {
-        return Err(RuntimeError::Unsupported(
-            "reserve guest span failed".to_string(),
-        ));
-    }
-    let bias = span as u64 - lo;
+    let (span, bias) = match elf.header.e_type {
+        ET_DYN => {
+            let span = map_prot(span_len, libc::PROT_NONE, None);
+            // mmap signals failure with MAP_FAILED ((void*)-1), never NULL.
+            if span as isize == -1 {
+                return Err(RuntimeError::Unsupported(
+                    "reserve guest PIE span failed".to_string(),
+                ));
+            }
+            (span, span as u64 - lo)
+        }
+        ET_EXEC => {
+            let span = map_prot(span_len, libc::PROT_NONE, Some(lo));
+            if span as isize == -1 || span as u64 != lo {
+                return Err(RuntimeError::Unsupported(format!(
+                    "reserve fixed guest executable span at 0x{lo:x} failed"
+                )));
+            }
+            (span, 0)
+        }
+        other => {
+            return Err(RuntimeError::Unsupported(format!(
+                "native x86 lane requires ET_DYN or ET_EXEC, found ELF type {other}"
+            )));
+        }
+    };
     let mut segments: Vec<(u64, u64)> = Vec::new();
     let mut segment_protections: Vec<(u64, u64, u64)> = Vec::new();
 
@@ -2905,11 +2925,24 @@ fn run_x86_thread(
                     break;
                 }
             };
-            if cursor + linked.bytes.len() > cursor_limit {
+            if linked.bytes.len() > slice_len {
                 fault_detail = Some(format!(
-                    "JIT code cache slice exhausted ({slice_len} bytes) translating 0x{next:x}"
+                    "single translated block exceeds the {slice_len}-byte JIT slice at 0x{next:x}"
                 ));
                 break;
+            }
+            if cursor + linked.bytes.len() > cursor_limit {
+                // The guest is back at a gateway boundary, so no code in this
+                // thread's private slice is executing. Recycle the whole slice
+                // instead of imposing a lifetime translation-volume limit:
+                // large static Go programs such as Kaniko execute far more than
+                // 4 MiB of distinct emitted code during startup. Guest return
+                // addresses remain guest VAs, so dropping every block/edge map
+                // and translating `next` at the slice base is safe.
+                cursor = cursor_limit - slice_len;
+                cache.clear();
+                pending.clear();
+                fault_entries.clear();
             }
             // SAFETY: the JIT region is mapped for the run; cursor is in range.
             let exec = unsafe { region.exec_base.as_ptr().add(cursor) };
