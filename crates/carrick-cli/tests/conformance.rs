@@ -752,6 +752,114 @@ fn run_bridge_publish_probe(
     }
 }
 
+fn run_native_service_pair(
+    bin: &PathBuf,
+    lane: Lane,
+    server_name: &str,
+    server_env: &[(&str, String)],
+    server_probe: &std::path::Path,
+    ready_line: &str,
+    pre_client: Option<(&str, &[(&str, String)], &std::path::Path)>,
+    client_name: &str,
+    client_env: &[(&str, String)],
+    client_probe: &std::path::Path,
+) -> (String, String, Option<String>) {
+    use std::io::{BufRead, Read};
+    use std::os::unix::process::CommandExt;
+    use std::sync::mpsc;
+
+    let run_id = case_run_id();
+    let mut server = Command::new(bin)
+        .args(native_bound_named_probe_args(
+            lane.platform,
+            lane.image,
+            server_name,
+            server_probe,
+            server_env,
+        ))
+        .env("CARRICK_RUN_ID", &run_id)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .expect("spawn native service probe");
+    let server_pid = server.id() as i32;
+    let stdout = server.stdout.take().expect("server stdout");
+    let stderr = server.stderr.take().expect("server stderr");
+    let (line_tx, line_rx) = mpsc::channel::<String>();
+    let stdout_reader = std::thread::spawn(move || {
+        let mut out = String::new();
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = reader.read_line(&mut line).unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            out.push_str(&line);
+            let _ = line_tx.send(line.trim_end().to_string());
+        }
+        out
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut err = String::new();
+        let mut reader = std::io::BufReader::new(stderr);
+        let _ = reader.read_to_string(&mut err);
+        err
+    });
+
+    let ready_deadline = Instant::now() + CASE_DEADLINE;
+    let mut ready = false;
+    while Instant::now() < ready_deadline {
+        match line_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(line) if line == ready_line => {
+                ready = true;
+                break;
+            }
+            Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    if !ready {
+        unsafe { libc::kill(-server_pid, libc::SIGKILL) };
+        scoped_kill_guests(&run_id);
+        let _ = server.wait();
+        let out = stdout_reader.join().unwrap_or_default();
+        let err = stderr_reader.join().unwrap_or_default();
+        return (
+            normalize(&format!("{out}{err}<TIMEOUT waiting for {ready_line}>")),
+            String::new(),
+            None,
+        );
+    }
+
+    let pre_client_out = pre_client
+        .map(|(name, env, probe)| run_native_bound_named_probe(bin, lane, name, env, probe));
+    let client_out = run_native_bound_named_probe(bin, lane, client_name, client_env, client_probe);
+    let deadline = Instant::now() + CASE_DEADLINE;
+    let server_out = loop {
+        match server.try_wait().expect("poll native service probe") {
+            Some(_) => {
+                let out = stdout_reader.join().unwrap_or_default();
+                let err = stderr_reader.join().unwrap_or_default();
+                break normalize(&format!("{out}{err}"));
+            }
+            None if Instant::now() >= deadline => {
+                unsafe { libc::kill(-server_pid, libc::SIGKILL) };
+                scoped_kill_guests(&run_id);
+                let _ = server.wait();
+                let out = stdout_reader.join().unwrap_or_default();
+                let err = stderr_reader.join().unwrap_or_default();
+                break normalize(&format!("{out}{err}<TIMEOUT waiting for service exit>"));
+            }
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
+    };
+    (server_out, client_out, pre_client_out)
+}
+
 fn run_bridge_compose_pair(
     bin: &PathBuf,
     lane: Lane,
@@ -1506,6 +1614,261 @@ fn conformance_bridge_compose_pair() {
     assert!(
         server_out.contains("bridge_compose_server_done=true"),
         "server did not complete:\nserver:\n{server_out}\nclient:\n{client_out}"
+    );
+}
+
+#[test]
+fn conformance_native_udp_service_pair() {
+    let _serial = CONFORMANCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if std::env::var("CARRICK_EXEC_BACKEND").as_deref() != Ok("native") {
+        eprintln!("SKIP conformance_native_udp_service_pair: native backend not requested");
+        return;
+    }
+    let Some(bin) = carrick_bin() else {
+        eprintln!("SKIP conformance_native_udp_service_pair: carrick not built");
+        return;
+    };
+    let lane = same_isa_lane();
+    let probes = probes_dir(musl_target_for_lane(&lane));
+    let server = probes.join("udp_published_server");
+    let client = probes.join("udp_published_client");
+    if !server.is_file() || !client.is_file() {
+        eprintln!("SKIP conformance_native_udp_service_pair: probes not built");
+        return;
+    }
+    let port = free_loopback_port();
+    let server_env = [
+        ("CARRICK_PROBE_LABEL", "udp_server".to_string()),
+        ("CARRICK_PROBE_PORT", port.to_string()),
+        ("CARRICK_PROBE_EXPECTS", "1".to_string()),
+    ];
+    let client_env = [
+        ("CARRICK_PROBE_LABEL", "udp_client".to_string()),
+        ("CARRICK_PROBE_TARGET", "udp-server".to_string()),
+        ("CARRICK_PROBE_PORT", port.to_string()),
+    ];
+    let (server_out, client_out, _) = run_native_service_pair(
+        &bin,
+        lane,
+        "udp-server",
+        &server_env,
+        &server,
+        "udp_server_ready=true",
+        None,
+        "udp-client",
+        &client_env,
+        &client,
+    );
+    assert!(
+        client_out.contains("udp_client_response=pong"),
+        "UDP client failed:\nserver:\n{server_out}\nclient:\n{client_out}"
+    );
+    assert!(
+        server_out.contains("udp_server_done=true"),
+        "UDP server failed:\nserver:\n{server_out}\nclient:\n{client_out}"
+    );
+}
+
+#[test]
+fn conformance_native_multi_network_roles() {
+    let _serial = CONFORMANCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if std::env::var("CARRICK_EXEC_BACKEND").as_deref() != Ok("native") {
+        eprintln!("SKIP conformance_native_multi_network_roles: native backend not requested");
+        return;
+    }
+    let Some(bin) = carrick_bin() else {
+        eprintln!("SKIP conformance_native_multi_network_roles: carrick not built");
+        return;
+    };
+    let lane = same_isa_lane();
+    let probes = probes_dir(musl_target_for_lane(&lane));
+    let server = probes.join("multi_network_server");
+    let client = probes.join("multi_network_client");
+    let dns = probes.join("multi_network_dns_client");
+    if !server.is_file() || !client.is_file() || !dns.is_file() {
+        eprintln!("SKIP conformance_native_multi_network_roles: probes not built");
+        return;
+    }
+    let port = free_loopback_port();
+    let server_env = [
+        ("CARRICK_PROBE_LABEL", "multi_server".to_string()),
+        ("CARRICK_PROBE_BRIDGE_PORT", port.to_string()),
+    ];
+    let dns_env = [
+        ("CARRICK_PROBE_LABEL", "multi_dns".to_string()),
+        ("CARRICK_PROBE_TARGET", "multi-server".to_string()),
+        ("CARRICK_PROBE_EXPECT", "success".to_string()),
+    ];
+    let client_env = [
+        ("CARRICK_PROBE_LABEL", "multi_client".to_string()),
+        ("CARRICK_PROBE_TARGET", "multi-server".to_string()),
+        ("CARRICK_PROBE_PORT", port.to_string()),
+        ("CARRICK_PROBE_EXPECT", "success".to_string()),
+    ];
+    let (server_out, client_out, dns_out) = run_native_service_pair(
+        &bin,
+        lane,
+        "multi-server",
+        &server_env,
+        &server,
+        "multi_server_bridge_server_ready=true",
+        Some(("multi-dns", &dns_env, &dns)),
+        "multi-client",
+        &client_env,
+        &client,
+    );
+    let dns_out = dns_out.unwrap_or_default();
+    assert!(
+        dns_out.contains("multi_dns_dns_ok=true"),
+        "multi-network DNS failed:\n{dns_out}"
+    );
+    assert!(
+        client_out.contains("multi_client_response=pong"),
+        "multi-network client failed:\nserver:\n{server_out}\nclient:\n{client_out}"
+    );
+    assert!(
+        server_out.contains("multi_server_server_done=true"),
+        "multi-network server failed:\n{server_out}"
+    );
+
+    let isolated_client_env = [
+        ("CARRICK_PROBE_LABEL", "isolated_client".to_string()),
+        ("CARRICK_PROBE_TARGET", "missing-service".to_string()),
+        ("CARRICK_PROBE_PORT", port.to_string()),
+        ("CARRICK_PROBE_EXPECT", "failure".to_string()),
+    ];
+    let isolated_dns_env = [
+        ("CARRICK_PROBE_LABEL", "isolated_dns".to_string()),
+        ("CARRICK_PROBE_TARGET", "missing-service".to_string()),
+        ("CARRICK_PROBE_EXPECT", "failure".to_string()),
+    ];
+    let isolated_client =
+        run_native_bound_named_probe(&bin, lane, "isolated-client", &isolated_client_env, &client);
+    let isolated_dns =
+        run_native_bound_named_probe(&bin, lane, "isolated-dns", &isolated_dns_env, &dns);
+    assert!(
+        isolated_client.contains("isolated_client_isolated=true"),
+        "multi-network client isolation failed:\n{isolated_client}"
+    );
+    assert!(
+        isolated_dns.contains("isolated_dns_dns_isolated=true"),
+        "multi-network DNS isolation failed:\n{isolated_dns}"
+    );
+}
+
+#[test]
+fn conformance_native_cross_boundary_network() {
+    use std::io::BufRead;
+    use std::os::unix::process::CommandExt;
+
+    let _serial = CONFORMANCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if std::env::var("CARRICK_EXEC_BACKEND").as_deref() != Ok("native") {
+        eprintln!("SKIP conformance_native_cross_boundary_network: native backend not requested");
+        return;
+    }
+    let Some(bin) = carrick_bin() else {
+        eprintln!("SKIP conformance_native_cross_boundary_network: carrick not built");
+        return;
+    };
+    let lane = same_isa_lane();
+    let server_probe = probes_dir(musl_target_for_lane(&lane)).join("perf_net_xserver");
+    let client = repo_path("bench-native/target/release/perf_net_xclient");
+    if !server_probe.is_file() || !client.is_file() {
+        eprintln!("SKIP conformance_native_cross_boundary_network: probes not built");
+        return;
+    }
+    let port = free_loopback_port();
+    let env = [("PORT", port.to_string())];
+    let run_id = case_run_id();
+    let mut server_args = native_bound_named_probe_args(
+        lane.platform,
+        lane.image,
+        "perf-server",
+        &server_probe,
+        &env,
+    );
+    let command_start = server_args.len().saturating_sub(2);
+    server_args.splice(
+        command_start..command_start,
+        ["-p".to_string(), format!("127.0.0.1:{port}:{port}")],
+    );
+    let mut server = Command::new(&bin)
+        .args(server_args)
+        .env("CARRICK_RUN_ID", &run_id)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .expect("spawn cross-boundary server");
+    let server_pid = server.id() as i32;
+    let mut stdout = std::io::BufReader::new(server.stdout.take().expect("server stdout"));
+    let mut ready = String::new();
+    stdout.read_line(&mut ready).expect("read server readiness");
+    assert_eq!(ready.trim(), format!("xserver_listening={port}"));
+
+    let client_out = Command::new(client)
+        .env("PORT", port.to_string())
+        .output()
+        .expect("run native cross-boundary client");
+    unsafe { libc::kill(-server_pid, libc::SIGKILL) };
+    scoped_kill_guests(&run_id);
+    let _ = server.wait();
+    let stdout = String::from_utf8_lossy(&client_out.stdout);
+    let stderr = String::from_utf8_lossy(&client_out.stderr);
+    assert!(
+        client_out.status.success()
+            && stdout.contains("xrtt_p50_us=")
+            && stdout.contains("xrtt_p95_us=")
+            && stdout.contains("xstream_mbps="),
+        "cross-boundary client failed:\n{stdout}{stderr}"
+    );
+}
+
+#[test]
+fn conformance_native_host_gateway() {
+    use std::io::{Read, Write};
+
+    let _serial = CONFORMANCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if std::env::var("CARRICK_EXEC_BACKEND").as_deref() != Ok("native") {
+        eprintln!("SKIP conformance_native_host_gateway: native backend not requested");
+        return;
+    }
+    let Some(bin) = carrick_bin() else {
+        eprintln!("SKIP conformance_native_host_gateway: carrick not built");
+        return;
+    };
+    let lane = same_isa_lane();
+    let probe = probes_dir(musl_target_for_lane(&lane)).join("host_gateway_client");
+    if !probe.is_file() {
+        eprintln!("SKIP conformance_native_host_gateway: probe not built");
+        return;
+    }
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .expect("bind host gateway fixture");
+    let port = listener.local_addr().expect("host gateway addr").port();
+    let fixture = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept host gateway client");
+        let mut request = [0u8; 18];
+        stream
+            .read_exact(&mut request)
+            .expect("read host gateway request");
+        assert_eq!(&request, b"host-gateway-ping\n");
+        stream
+            .write_all(b"host-gateway-pong\n")
+            .expect("write host gateway response");
+    });
+    let env = [
+        ("CARRICK_PROBE_LABEL", "host_gateway".to_string()),
+        ("CARRICK_PROBE_PORT", port.to_string()),
+        ("CARRICK_PROBE_EXPECT_GATEWAY", "172.31.0.1".to_string()),
+    ];
+    let out = run_native_bound_named_probe(&bin, lane, "gateway-client", &env, &probe);
+    fixture.join().expect("host gateway fixture");
+    assert!(
+        out.contains("host_gateway_connect_ok=true")
+            && out.contains("host_gateway_response=host-gateway-pong"),
+        "host gateway probe failed:\n{out}"
     );
 }
 
