@@ -2302,13 +2302,30 @@ pub(crate) fn run_static_x86_elf<A, E>(
     path: &Path,
     dispatcher: SyscallDispatcher,
     argv: A,
-    _env: E,
+    env: E,
     max_traps: usize,
 ) -> Result<RunResult, RuntimeError>
 where
     A: IntoIterator<Item = String>,
     E: IntoIterator<Item = String>,
 {
+    let argv = argv.into_iter().map(String::into_bytes).collect();
+    let env = env.into_iter().map(String::into_bytes).collect();
+    let bytes = std::fs::read(path)
+        .map_err(|e| RuntimeError::Unsupported(format!("read {}: {e}", path.display())))?;
+    run_static_x86_elf_bytes(&bytes, dispatcher, argv, env, max_traps)
+}
+
+/// Run an already-resolved static x86_64 ELF image. OCI execution uses this
+/// entry so it can load the executable through the container VFS without
+/// materializing a second host-path copy or rebuilding a VMM address space.
+pub(crate) fn run_static_x86_elf_bytes(
+    bytes: &[u8],
+    dispatcher: SyscallDispatcher,
+    argv: Vec<Vec<u8>>,
+    env: Vec<Vec<u8>>,
+    max_traps: usize,
+) -> Result<RunResult, RuntimeError> {
     // Held for the whole run: the fixed arenas and the process-wide fault
     // shim cannot be shared across concurrent in-process runs.
     let _run_guard = RUN_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -2317,11 +2334,7 @@ where
     // fork children for wait4/waitid RUSAGE_CHILDREN rollup).
     crate::guest_cpu::set_native_host_provider();
 
-    let argv: Vec<Vec<u8>> = argv.into_iter().map(|a| a.into_bytes()).collect();
-    let env: Vec<Vec<u8>> = _env.into_iter().map(|e| e.into_bytes()).collect();
-    let bytes = std::fs::read(path)
-        .map_err(|e| RuntimeError::Unsupported(format!("read {}: {e}", path.display())))?;
-    let image = load_static_pie(&bytes, &argv, &env)?;
+    let image = load_static_pie(bytes, &argv, &env)?;
 
     let jit = FreebsdHostJit;
     jit.supported()

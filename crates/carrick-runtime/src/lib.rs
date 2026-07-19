@@ -1616,27 +1616,18 @@ pub mod runtime {
         Build: FnOnce(&crate::memory::AddressSpace) -> Result<E, RuntimeError>,
         Run: FnOnce(E, SyscallDispatcher, usize) -> Result<RunResult, RuntimeError>,
     {
-        use crate::fs_backend::HostFsBackend;
+        use crate::fs_backend::{FsBackend, HostFsBackend};
         use carrick_hal::GuestArch as _;
         use std::path::PathBuf;
 
-        // Honor the exec-backend REQUEST before doing anything: previously
-        // this arm silently ran the VMM even under `--exec-backend native`
-        // (the default!), substituting a backend the user did not ask for.
-        // The capability table errors typed for hosts whose native lane is
-        // absent or still in bring-up; if it ever resolves Native here, this
-        // module has no native run path yet — fail closed, never substitute.
+        // Resolve the requested backend before rootfs construction. FreeBSD
+        // native OCI runs share the exact extraction/dispatcher preparation
+        // below, then branch only at the execution-engine boundary.
         let plan = crate::page_profile::resolve_execution_plan_for_request(
             spec.platform,
             spec.exec_backend,
             spec.native_page_profile,
         )?;
-        if plan.backend != crate::page_profile::ExecutionBackend::Vmm {
-            return Err(RuntimeError::Unsupported(
-                "native execution plan resolved, but this platform arm has no native run path wired yet; pass --exec-backend vmm"
-                    .to_string(),
-            ));
-        }
 
         // 0. Docker's container init is a SESSION LEADER (runc setsid()s before
         //    exec'ing the entrypoint): a leader's own setpgid() is EPERM
@@ -1686,13 +1677,34 @@ pub mod runtime {
             .filter(|hostname| !hostname.is_empty())
             .map(str::to_owned)
             .unwrap_or_else(|| crate::execute::guest_hostname().to_owned());
+        let runtime_network = std::sync::Arc::new(
+            crate::network::RuntimeNetwork::create(&spec.network)
+                .map_err(|e| RuntimeError::Unsupported(format!("network setup failed: {e}")))?,
+        );
+        let hosts_entries = runtime_network
+            .guest_hosts_entries()
+            .map_err(|e| RuntimeError::Unsupported(format!("network hosts setup failed: {e}")))?;
         seed_linux_baseline_gaps(&mut host, &guest_hostname);
+        let network_model = crate::network::model::LinuxNetworkModel::from_spec(&spec.network);
+        let hosts = network_model
+            .hosts_config(
+                &spec.network,
+                hosts_entries
+                    .into_iter()
+                    .map(|entry| (entry.addr, entry.names)),
+                &spec.extra_hosts,
+                &guest_hostname,
+            )
+            .render();
+        let _ = host.set_file_contents("/etc/hosts", hosts.into_bytes());
 
         // 2. Build the dispatcher rooted at the extracted rootfs. This is a
         //    sandboxed container fs (extracted OCI layers on a cap-std overlay):
         //    forbid the execve host-fs fallback so a target absent from the
         //    rootfs ENOENTs instead of escaping to the host binary.
-        let mut dispatcher = SyscallDispatcher::new();
+        let mut dispatcher = SyscallDispatcher::with_network(runtime_network);
+        dispatcher.set_page_geometry(plan.page_geometry);
+        dispatcher.set_execution_backend(plan.backend);
         dispatcher.set_guest_hostname(guest_hostname);
         dispatcher.sandbox_exec_to_container();
         dispatcher.set_executable_path(spec.executable.clone());
@@ -1761,6 +1773,19 @@ pub mod runtime {
                 resolved.clone(),
             )))
         })?;
+        #[cfg(all(feature = "platform-freebsd", target_arch = "x86_64"))]
+        if plan.backend == crate::page_profile::ExecutionBackend::Native {
+            dispatcher.set_native_x86_64(true);
+            let env = spec.envp.iter().map(|s| s.as_bytes().to_vec()).collect();
+            return crate::native_freebsd::run_static_x86_elf_bytes(
+                &bytes,
+                dispatcher,
+                argv,
+                env,
+                spec.max_traps,
+            );
+        }
+
         let vdso = E::Arch::vdso_bytes();
         let vdso_enabled = !vdso.is_empty();
         let mut image = crate::exec_helpers::build_run_image_for_execfn(
