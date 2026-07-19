@@ -1,0 +1,9 @@
+# FreeBSD native-x86 static-musl LTP readiness cases.
+# Format: <case-name> <path-relative-to---ltp-bin-root> [guest-arg ...]
+# Fixture version: LTP 20260529.
+getpid01 getpid/getpid01
+uname01 uname/uname01
+eventfd01 eventfd/eventfd01
+fork01 fork/fork01
+futex_wait01 futex/futex_wait01
+clock_gettime01 clock_gettime/clock_gettime01

@@ -26,13 +26,24 @@ fn main() {
             ["PATH=/bin:/usr/bin".to_string()],
         ) {
             Ok(r) => {
-                eprintln!(
-                    "[native_run] exit={} traps={} stdout={:?} stderr={:?}",
-                    r.exit_code,
-                    r.traps,
-                    String::from_utf8_lossy(&r.stdout),
-                    String::from_utf8_lossy(&r.stderr)
-                );
+                if std::env::var_os("CARRICK_NATIVE_RAW_OUTPUT").is_some() {
+                    use std::io::Write as _;
+                    let stdout_ok = std::io::stdout().write_all(&r.stdout).is_ok();
+                    let stderr_ok = std::io::stderr().write_all(&r.stderr).is_ok();
+                    eprintln!("[native_run] exit={} traps={}", r.exit_code, r.traps);
+                    if !stdout_ok || !stderr_ok {
+                        eprintln!("[native_run] failed to forward captured guest output");
+                        std::process::exit(125);
+                    }
+                } else {
+                    eprintln!(
+                        "[native_run] exit={} traps={} stdout={:?} stderr={:?}",
+                        r.exit_code,
+                        r.traps,
+                        String::from_utf8_lossy(&r.stdout),
+                        String::from_utf8_lossy(&r.stderr)
+                    );
+                }
                 std::process::exit(r.exit_code);
             }
             Err(e) => {
