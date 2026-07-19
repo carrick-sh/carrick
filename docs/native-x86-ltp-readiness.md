@@ -1,8 +1,8 @@
 # FreeBSD/amd64 native LTP readiness
 
 Status: automated static-musl execution gate established on FreeBSD 15.1/amd64.
-The curated local gate is green; this is not yet a native-Linux oracle parity
-baseline.
+The goal of this lane is direct Carrick execution, not Docker/Podman result
+comparison. The current curated gate is green.
 
 ## Why a separate fixture is required
 
@@ -75,30 +75,53 @@ python3.11 scripts/native-x86-ltp-gate.py \
 ```
 
 The case declaration is `scripts/native-x86-ltp-cases.txt`; execution is
-intentionally serial. A local pass records `oracle_status: "pending"` — it must
-not be reported as Linux parity until the same hashed binaries have run on a
-native amd64 Linux host.
+intentionally serial. The expanded gate currently runs **25 cases**: 23 pass
+with **194 TPASS**, while `eventfd06` and `clock_gettime03` cleanly report TCONF
+for unavailable libaio and `CONFIG_TIME_NS` respectively.
+
+## Carrick-built OCI fixture
+
+Carrick now runs Kaniko's fixed-address static Go executable through native DSR,
+including JIT-slice recycling for its larger translation working set. The image
+packager builds a scratch linux/amd64 image with Carrick itself, embeds hashes
+for every static LTP binary and helper, then runs `getpid01` from the image:
+
+```sh
+CARGO_BUILD_JOBS=1 cargo build -p carrick-cli \
+  --no-default-features --features platform-freebsd
+
+target/debug/carrick pull --platform linux/amd64 \
+  gcr.io/kaniko-project/executor:v1.24.0
+
+python3.11 scripts/native-x86-ltp-image.py \
+  --ltp-bin-root /path/to/ltp/testcases/kernel/syscalls \
+  --rootfs /path/to/static-musl-root \
+  --tag carrick-ltp-static-musl:20260529
+```
+
+Podman is not involved in the execution verdict. Carrick builds the OCI image
+and Carrick's native backend runs it.
 
 ## Honest limitations
 
-- These runs establish execution readiness only. They have not yet been diffed
-  against the canonical native-amd64 Linux oracle.
 - The static-musl fixture is a bring-up lane, not a substitute for eventual
   dynamic Ubuntu/glibc support.
-- The gate now captures the whole process group, but only the six curated
-  readiness cases are declared; it is not yet a broad syscall sweep.
-- The current conformance-probe corpus is 428/428 under its intended harness,
-  including live protection/fault retry. Shared-file futex identity across exec
-  and exact cross-process requeue are covered by `ltpcheckpointexec` and
-  `futexforkrequeue`; this does not replace Linux-oracle LTP parity.
+- The gate covers 25 curated cases, not the full syscall tree. The first wider
+  sweep exposed three real next targets: `futex_wait02` leaves descendants,
+  `futex_wait05` exceeds its timeout-latency threshold, and `futex_wake04`
+  requires writable `/proc/sys/vm/drop_caches` support.
+- `eventfd06` and `clock_gettime03` execute correctly but are configuration
+  skips, not syscall coverage.
+- The current conformance-probe corpus remains 428/428 under its intended
+  harness, including live protection/fault retry.
 
 ## Next gate
 
-1. Automate the pinned static-musl LTP build and prepared-root assembly, with an
-   ELF/hash manifest for every artifact.
-2. Run the same hashed binaries on native amd64 Linux and compare ordered
-   TPASS/TFAIL/TBROK/TCONF lines, not summary counts alone.
-3. Add syscall-amplification and accepted wall/CPU baselines before broadening
-   beyond the curated serial sweep.
-4. Reduce each confirmed divergence to a deterministic conformance probe before
-   changing the runtime.
+1. Make the pinned static-musl cross-build reproducible, then package the wider
+   result with `native-x86-ltp-image.py`.
+2. Fix `futex_wait02`, the `futex_wait05` timeout amplification, and the
+   `futex_wake04` proc-control dependency without baseline excuses.
+3. Continue adding syscall areas serially, reducing each failure before changing
+   the runtime.
+4. Add syscall-amplification and accepted wall/CPU baselines for representative
+   cases.
