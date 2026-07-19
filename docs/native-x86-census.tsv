@@ -99,7 +99,7 @@ OK	flocklock
 OK	forkaltstack
 OK	forkcow
 OK	forkexecpthread
-EXIT_FALSE	forkfault
+OK	forkfault
 OK	forkfpreclaim
 OK	forkhighva
 OK	forkshared
@@ -187,7 +187,7 @@ OK	mmapmunmap
 OK	mmaprecl
 OK	mmapreuse
 OK	mmapzerofill
-EXIT_FALSE	mprotectexec
+OK	mprotectexec
 OK	mqueue
 OK	mremapgrow
 OK	mremapmove
@@ -314,7 +314,7 @@ OK	rlimitnofile
 OK	rlimitresource
 OK	rlimitroundtrip
 OK	robustlist
-EXIT_FALSE	roprotect
+OK	roprotect
 OK	roreadwrite
 OK	rosharedbus
 OK	rtsigqueueinfo

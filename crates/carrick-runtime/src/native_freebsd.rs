@@ -33,14 +33,16 @@ use carrick_dsr_x86::block::{X86Block, X86Exit};
 use carrick_dsr_x86::decode::{X86InstClass, classify};
 use carrick_dsr_x86::gateway::{CTX_FAULT_RECORD, reg, signal_stub_addr};
 use carrick_dsr_x86::{
-    X86DsrContext, X86ExitStatus, X86UcontextSnapshot, cflow, emit::emit_block_linked, plan_block,
+    X86DsrContext, X86ExitStatus, X86UcontextSnapshot, cflow,
+    emit::{ScratchRestore, emit_block_linked},
+    plan_block,
 };
 use carrick_guest_mem::{GuestMemory, X8664SyscallFrame};
 use carrick_hal::x8664_arch::{SyscallNorm, X8664GuestArch};
 use carrick_hal::{GuestArch, Reg, RegAccess};
 use carrick_native_freebsd::{FreebsdHostJit, fault};
 use goblin::elf::Elf;
-use goblin::elf::program_header::PT_LOAD;
+use goblin::elf::program_header::{PF_R, PF_W, PF_X, PT_LOAD};
 
 use carrick_mem::memory::{LINUX_HEAP_BASE, LINUX_HEAP_SIZE, LINUX_MMAP_BASE, mmap_arena_size};
 
@@ -274,10 +276,11 @@ fn identity_host_range_mapped(address: u64, length: usize) -> bool {
 #[cfg(test)]
 mod identity_raw_range_tests {
     use super::{
-        IdentityGuestMemory, SharedWaitAssignment, exclude_vfork_shared_ranges,
-        freebsd_shared_waiter_key, identity_host_range_mapped, identity_raw_range_valid,
-        init_shared_waiter_table, shared_futex_requeue_umtx, shared_futex_wake_umtx,
-        shared_waiter_slot, take_shared_wait_assignment, wait_requeued_umtx,
+        IdentityGuestMemory, PublishedFaultEntry, SharedWaitAssignment,
+        exclude_vfork_shared_ranges, freebsd_shared_waiter_key, identity_host_range_mapped,
+        identity_raw_range_valid, init_shared_waiter_table, recover_x86_fault_snapshot,
+        shared_futex_requeue_umtx, shared_futex_wake_umtx, shared_waiter_slot,
+        take_shared_wait_assignment, wait_requeued_umtx,
     };
     use carrick_guest_mem::GuestMemory;
     use std::os::fd::AsRawFd;
@@ -438,6 +441,31 @@ mod identity_raw_range_tests {
     }
 
     #[test]
+    fn x86_fault_recovery_restores_guest_pc_and_spilled_register() {
+        let mut snapshot = carrick_dsr_x86::X86UcontextSnapshot::new();
+        snapshot.gpr[carrick_dsr_x86::gateway::reg::RAX] = 0xdead;
+        let mut context = carrick_dsr_x86::X86DsrContext::new(snapshot, 0x8000, 0x4000);
+        context.fault.host_rip = 0x8012;
+        context.scratch = 0x1234;
+        let entries = [PublishedFaultEntry {
+            host_start: 0x8010,
+            host_end: 0x8014,
+            guest_va: 0x4010,
+            restores: vec![carrick_dsr_x86::emit::ScratchRestore {
+                snapshot_gpr: carrick_dsr_x86::gateway::reg::RAX,
+                scratch_index: 0,
+            }],
+        }];
+
+        assert_eq!(
+            recover_x86_fault_snapshot(&entries, &context, &mut snapshot),
+            Some(0x4010)
+        );
+        assert_eq!(snapshot.rip, 0x4010);
+        assert_eq!(snapshot.gpr[carrick_dsr_x86::gateway::reg::RAX], 0x1234);
+    }
+
+    #[test]
     fn vfork_inheritance_excludes_existing_shared_vmas() {
         assert_eq!(
             exclude_vfork_shared_ranges(
@@ -467,6 +495,11 @@ mod identity_raw_range_tests {
 static IDENTITY_PROTECTIONS: std::sync::LazyLock<
     carrick_guest_mem::protections::MemoryProtections,
 > = std::sync::LazyLock::new(carrick_guest_mem::protections::MemoryProtections::default);
+/// Advances on mapping/protection transitions that can change executable bytes
+/// or eligibility. Threads invalidate their translated metadata at the next
+/// gateway boundary; no host syscall is added to block entry.
+static IDENTITY_CODE_GENERATION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
 
 /// Re-establish host backing for `[address, address+len)` IFF it overlaps a
 /// tracked `munmap` hole. Guest `munmap`/`mremap`-shrink genuinely releases the
@@ -521,6 +554,14 @@ impl GuestMemory for IdentityGuestMemory {
         Some(&IDENTITY_PROTECTIONS)
     }
 
+    fn has_complete_mapping_metadata(&self) -> bool {
+        true
+    }
+
+    fn supports_concurrent_exec_protection(&self) -> bool {
+        true
+    }
+
     fn set_no_access(&mut self, address: u64, len: usize, no_access: bool) {
         if !no_access {
             // Transition back to accessible: re-establish backing if this range
@@ -566,13 +607,37 @@ impl GuestMemory for IdentityGuestMemory {
         &mut self,
         address: u64,
         len: usize,
-        _prot: u64,
+        prot: u64,
     ) -> Result<(), carrick_guest_mem::MemoryError> {
-        // Guest-visible protection ENFORCEMENT on live pages is a later rung; here
-        // we only re-establish backing for a freed range so a grown/reused mapping
-        // is usable (the identity lane keeps JIT accesses lenient — the syscall
-        // path is gated by `protections()`).
         ensure_identity_backed(address, len);
+        let had_executable = IDENTITY_PROTECTIONS.range_has_executable(address, len);
+        let readable =
+            prot & (crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_EXEC) != 0;
+        let writable = prot & crate::linux_abi::LINUX_PROT_WRITE != 0;
+        let executable = prot & crate::linux_abi::LINUX_PROT_EXEC != 0;
+        // DSR never executes guest pages directly: executable mappings need a
+        // host-readable translation view, not host PROT_EXEC. Enforce guest
+        // stores with host read-only pages and PROT_NONE with inaccessible ones.
+        let host_prot = match (readable, writable) {
+            (_, true) => libc::PROT_READ | libc::PROT_WRITE,
+            (true, false) => libc::PROT_READ,
+            (false, false) => libc::PROT_NONE,
+        };
+        if unsafe { libc::mprotect(address as *mut libc::c_void, len, host_prot) } != 0 {
+            return Err(carrick_guest_mem::MemoryError::OutOfBounds {
+                address,
+                length: len,
+            });
+        }
+        IDENTITY_PROTECTIONS.set_mapping_protection(address, len, prot == 0, !writable);
+        IDENTITY_PROTECTIONS.set_executable(address, len, executable);
+        // Data-only mmap/mprotect churn (especially one stack per pthread) does
+        // not invalidate translated code. Rebuild only when execute permission
+        // changes; otherwise every new thread forces every sibling to discard
+        // and duplicate its JIT cache.
+        if had_executable != executable {
+            IDENTITY_CODE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
         Ok(())
     }
 
@@ -655,6 +720,7 @@ impl GuestMemory for IdentityGuestMemory {
         if len == 0 || address < PAGE {
             return Ok(());
         }
+        let had_executable = IDENTITY_PROTECTIONS.range_has_executable(address, len);
         // SAFETY: identity VA; releasing guest-owned host pages. A partial/failed
         // munmap is non-fatal here — the range is being torn down regardless.
         unsafe {
@@ -664,6 +730,9 @@ impl GuestMemory for IdentityGuestMemory {
         // fault) and mincore reports it unmapped; a guest JIT access still faults
         // the real hole and is caught by the fault shim as SEGV_MAPERR.
         IDENTITY_PROTECTIONS.set_unmapped(address, len, true);
+        if had_executable {
+            IDENTITY_CODE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
         Ok(())
     }
 
@@ -1254,6 +1323,10 @@ struct LoadedImage {
     /// fault or decode garbage), so `code_bytes` reads only up to the end of
     /// the range containing a VA.
     segments: Vec<(u64, u64)>,
+    /// Requested Linux R/W/X flags for each loader-owned mapping. Unlike
+    /// `segments`, these are not coalesced because adjacent PT_LOADs commonly
+    /// carry different permissions.
+    segment_protections: Vec<(u64, u64, u64)>,
 }
 
 /// Reset the identity backend's syscall-pointer gate for a fresh process image.
@@ -1266,10 +1339,21 @@ fn reset_identity_vmas(image: &LoadedImage) {
     const USER_START: u64 = 0x1_0000;
     const USER_END_EXCLUSIVE: u64 = 1 << 47;
     IDENTITY_PROTECTIONS.reset_to_unmapped(USER_START, (USER_END_EXCLUSIVE - USER_START) as usize);
-    for &(start, end) in &image.segments {
-        IDENTITY_PROTECTIONS.set_mapping_protection(start, (end - start) as usize, false, false);
+    let mut memory = IdentityGuestMemory;
+    for &(start, end, prot) in &image.segment_protections {
+        let len = (end - start) as usize;
+        // Loader mappings already have backing. Publish them live before
+        // protect_range so its mmap-hole recovery cannot MAP_FIXED fresh zero
+        // pages over the loaded ELF/vDSO bytes.
+        IDENTITY_PROTECTIONS.set_mapping_protection(start, len, false, false);
+        let _ = memory.protect_range(start, len, prot);
     }
     IDENTITY_PROTECTIONS.set_mapping_protection(image.stack, image.stack_len, false, false);
+    let _ = memory.protect_range(
+        image.stack,
+        image.stack_len,
+        crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_WRITE,
+    );
     IDENTITY_PROTECTIONS.set_mapping_protection(
         LINUX_HEAP_BASE,
         LINUX_HEAP_SIZE as usize,
@@ -1289,23 +1373,6 @@ fn reset_identity_vmas(image: &LoadedImage) {
             false,
             false,
         );
-    }
-}
-
-impl LoadedImage {
-    /// Up to 16 guest code bytes at `va`, bounded to the END of the mapped
-    /// segment containing `va` — so a read never crosses an unmapped gap.
-    /// Empty when `va` is not in any mapped segment (a guest that jumped off
-    /// mapped code).
-    fn code_bytes(&self, va: u64) -> &[u8] {
-        for &(start, end) in &self.segments {
-            if va >= start && va < end {
-                let hi = (va + 16).min(end);
-                // SAFETY: [va, hi) is inside a mapped segment (guest VA == host VA).
-                return unsafe { std::slice::from_raw_parts(va as *const u8, (hi - va) as usize) };
-            }
-        }
-        &[]
     }
 }
 
@@ -1390,6 +1457,7 @@ fn load_static_pie(
     }
     let bias = span as u64 - lo;
     let mut segments: Vec<(u64, u64)> = Vec::new();
+    let mut segment_protections: Vec<(u64, u64, u64)> = Vec::new();
 
     for ph in &elf.program_headers {
         if ph.p_type != PT_LOAD {
@@ -1398,6 +1466,17 @@ fn load_static_pie(
         let seg_lo = (ph.p_vaddr & !(PAGE - 1)) + bias;
         let seg_hi = ((ph.p_vaddr + ph.p_memsz + PAGE - 1) & !(PAGE - 1)) + bias;
         segments.push((seg_lo, seg_hi));
+        let mut guest_prot = 0u64;
+        if ph.p_flags & PF_R != 0 {
+            guest_prot |= crate::linux_abi::LINUX_PROT_READ;
+        }
+        if ph.p_flags & PF_W != 0 {
+            guest_prot |= crate::linux_abi::LINUX_PROT_WRITE;
+        }
+        if ph.p_flags & PF_X != 0 {
+            guest_prot |= crate::linux_abi::LINUX_PROT_EXEC;
+        }
+        segment_protections.push((seg_lo, seg_hi, guest_prot));
         // The translator READS guest code (execution runs from the JIT cache),
         // so no host PROT_EXEC is needed; every segment is mapped R + W so its
         // file bytes and the guest's own writes land. (Enforcing per-segment
@@ -1481,6 +1560,11 @@ fn load_static_pie(
             // Publish the vDSO code page(s) as a translatable segment so the
             // block planner can read/execute the resolved stubs.
             segments.push((vdso_base, vdso_base + vdso_len as u64));
+            segment_protections.push((
+                vdso_base,
+                vdso_base + vdso_len as u64,
+                crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_EXEC,
+            ));
             (vdso_base, vdso_len)
         } else {
             // Could not place the vvar/vDSO at their required VAs — run without
@@ -1531,6 +1615,15 @@ fn load_static_pie(
     // Publish the whole scratch page as a translatable segment so the block
     // planner can read the trampoline bytes.
     segments.push((scratch as u64, scratch as u64 + PAGE));
+    // argv strings and AT_RANDOM remain writable, while the tail hosts the
+    // translated rt_sigreturn stub: Linux page granularity makes this RWX.
+    segment_protections.push((
+        scratch as u64,
+        scratch as u64 + PAGE,
+        crate::linux_abi::LINUX_PROT_READ
+            | crate::linux_abi::LINUX_PROT_WRITE
+            | crate::linux_abi::LINUX_PROT_EXEC,
+    ));
 
     // Sort + coalesce adjacent segments so `code_bytes` can read across
     // touching PT_LOADs but never across a real gap.
@@ -1556,6 +1649,7 @@ fn load_static_pie(
         vdso_base,
         vdso_len,
         segments: coalesced,
+        segment_protections,
     })
 }
 
@@ -2522,6 +2616,30 @@ pub(crate) fn run_static_x86_elf_bytes(
     })
 }
 
+#[derive(Clone, Debug)]
+struct PublishedFaultEntry {
+    host_start: u64,
+    host_end: u64,
+    guest_va: u64,
+    restores: Vec<ScratchRestore>,
+}
+
+fn recover_x86_fault_snapshot(
+    entries: &[PublishedFaultEntry],
+    context: &X86DsrContext,
+    snapshot: &mut X86UcontextSnapshot,
+) -> Option<u64> {
+    let entry = entries.iter().find(|entry| {
+        context.fault.host_rip >= entry.host_start && context.fault.host_rip < entry.host_end
+    })?;
+    let scratch = [context.scratch, context.scratch2];
+    for restore in &entry.restores {
+        snapshot.gpr[restore.snapshot_gpr] = *scratch.get(restore.scratch_index)?;
+    }
+    snapshot.rip = entry.guest_va;
+    Some(entry.guest_va)
+}
+
 /// Run one guest thread's translate/execute/service loop to completion. The
 /// process's initial thread runs this inline; a `clone` child runs it on its
 /// own host thread. `slice_off`/`slice_len` bound this thread's non-overlapping
@@ -2553,25 +2671,32 @@ fn run_x86_thread(
     let mut image = shared.current_image();
     let jit = FreebsdHostJit;
     let max_traps = shared.max_traps;
-    // Read the full body of a block. A block is planned within one segment, so
-    // reading up to that segment's end (via repeated 16-byte-bounded reads
-    // would be O(n); instead read the one contiguous run) is safe. `code_bytes`
-    // is segment-bounded, so extend from `base` across the block by reading the
-    // segment run that contains it. Takes the image explicitly (not a captured
-    // borrow) so an `execve` image swap is observed on the next block.
-    let read_block = |image: &LoadedImage, block: &X86Block| -> Vec<u8> {
-        let base = block.start;
+    // DSR may execute loader text, vDSO/signal stubs, or executable anonymous
+    // mmap pages. Read through the identity map, page-bounded, and only when
+    // the live VMA carries Linux PROT_EXEC. Host pages remain readable because
+    // translation—not direct execution—consumes these bytes.
+    let code_bytes = |va: u64| -> Vec<u8> {
+        if !IDENTITY_PROTECTIONS.range_executable(va, 1) {
+            return Vec::new();
+        }
+        let len = (0..16usize)
+            .take_while(|offset| IDENTITY_PROTECTIONS.range_executable(va + *offset as u64, 1))
+            .count();
+        IdentityGuestMemory
+            .read_bytes_raw(va, len)
+            .unwrap_or_default()
+    };
+    let read_block = |block: &X86Block| -> Vec<u8> {
         let want = block.end.max(block.exit.va());
         let mut out = Vec::new();
-        let mut va = base;
-        // Gather the block's bytes segment-run by 16-byte code_bytes reads.
-        while va < want + 16 {
-            let chunk = image.code_bytes(va);
+        let mut va = block.start;
+        while va < want.saturating_add(16) {
+            let chunk = code_bytes(va);
             if chunk.is_empty() {
                 break;
             }
-            out.extend_from_slice(chunk);
             va += chunk.len() as u64;
+            out.extend_from_slice(&chunk);
         }
         out
     };
@@ -2611,6 +2736,8 @@ fn run_x86_thread(
     // translated, every waiting slot is patched to jump straight to it.
     let mut pending: std::collections::HashMap<u64, Vec<(u64, u64)>, VaBuildHasher> =
         std::collections::HashMap::default();
+    let mut fault_entries: Vec<PublishedFaultEntry> = Vec::new();
+    let mut code_generation = IDENTITY_CODE_GENERATION.load(std::sync::atomic::Ordering::Acquire);
     // Breadcrumb ring: the last guest VAs entered, for diagnosing where an
     // unhandled scenario was reached from.
     let mut history: Vec<u64> = Vec::new();
@@ -2644,9 +2771,63 @@ fn run_x86_thread(
             active.exit.ack_exec_stop();
             return ThreadRunOutcome::ThreadDone { traps };
         }
+        let current_generation =
+            IDENTITY_CODE_GENERATION.load(std::sync::atomic::Ordering::Acquire);
+        if current_generation != code_generation {
+            cache.clear();
+            pending.clear();
+            fault_entries.clear();
+            code_generation = current_generation;
+        }
         history.push(next);
         if history.len() > 64 {
             history.remove(0);
+        }
+        if !IDENTITY_PROTECTIONS.range_executable(next, 1) {
+            let code = if IDENTITY_PROTECTIONS.range_unmapped(next, 1) {
+                crate::linux_abi::LINUX_SEGV_MAPERR
+            } else {
+                crate::linux_abi::LINUX_SEGV_ACCERR
+            };
+            match deliver_x86_signal(
+                &active,
+                tid,
+                &mut snapshot,
+                crate::linux_abi::LINUX_SIGSEGV,
+                Some((code, next)),
+                None,
+                None,
+                Some(next),
+                0,
+                false,
+            ) {
+                Ok(true) => {
+                    next = snapshot.rip;
+                    continue;
+                }
+                Ok(false) => {
+                    if forked {
+                        crate::exec_helpers::forked_child_die_by_signal(
+                            crate::linux_abi::LINUX_SIGSEGV,
+                            active.dispatcher.stdout(),
+                            active.dispatcher.stderr(),
+                        );
+                    }
+                    exit_code = Some(128 + crate::linux_abi::LINUX_SIGSEGV);
+                    break 'run;
+                }
+                Err(()) => {
+                    if forked {
+                        crate::exec_helpers::forked_child_die_by_signal(
+                            crate::linux_abi::LINUX_SIGSEGV,
+                            active.dispatcher.stdout(),
+                            active.dispatcher.stderr(),
+                        );
+                    }
+                    exit_code = Some(128 + crate::linux_abi::LINUX_SIGSEGV);
+                    break 'run;
+                }
+            }
         }
         let (exec, has_edges, uses_fpu) = if let Some(&hit) = cache.get(&next) {
             hit
@@ -2662,10 +2843,7 @@ fn run_x86_thread(
             // boundary (an internal, in-segment boundary), so it never returns
             // an empty `Continue{target: start}` — which the chainer would turn
             // into an infinite self-jump.
-            // Fresh per-iteration reader over the CURRENT image (an execve may
-            // have swapped it), bounded to the mapped segment containing `va`.
-            let read_guest = |va: u64| -> Vec<u8> { image.code_bytes(va).to_vec() };
-            let block = match plan_block(next, 256, PAGE, read_guest) {
+            let block = match plan_block(next, 256, PAGE, code_bytes) {
                 Ok(b) => b,
                 Err(e) => {
                     fault_detail = Some(format!("plan_block at 0x{next:x}: {e}"));
@@ -2683,7 +2861,7 @@ fn run_x86_thread(
             let empty_self_continue = block.instructions.is_empty()
                 && matches!(block.exit, X86Exit::Continue { target, .. } if target == next);
             if empty_self_continue {
-                let bytes = image.code_bytes(next);
+                let bytes = code_bytes(next);
                 let in_seg = image.segments.iter().any(|&(s, e)| next >= s && next < e);
                 let recent: Vec<String> = history
                     .iter()
@@ -2698,7 +2876,7 @@ fn run_x86_thread(
                 ));
                 break;
             }
-            let body = read_block(&image, &block);
+            let body = read_block(&block);
             let linked = match emit_block_linked(&body, &block) {
                 Ok(t) => t,
                 Err(e) => {
@@ -2708,7 +2886,7 @@ fn run_x86_thread(
                     fault_detail = Some(format!(
                         "emit_block at 0x{next:x} ({:?}): {e} — insn bytes at 0x{at:x} = {:02x?}",
                         block.exit,
-                        image.code_bytes(at),
+                        code_bytes(at),
                     ));
                     break;
                 }
@@ -2733,8 +2911,14 @@ fn run_x86_thread(
                 std::ptr::copy_nonoverlapping(linked.bytes.as_ptr(), wptr, linked.bytes.len())
             };
             jit.flush_icache(exec, linked.bytes.len());
-            cursor += linked.bytes.len();
             let exec_u64 = exec as u64;
+            fault_entries.extend(linked.fault_map.iter().map(|entry| PublishedFaultEntry {
+                host_start: exec_u64 + entry.emitted_start as u64,
+                host_end: exec_u64 + entry.emitted_end as u64,
+                guest_va: entry.guest_va,
+                restores: entry.restores.clone(),
+            }));
+            cursor += linked.bytes.len();
             let entry = (exec_u64, !linked.edges.is_empty(), block.uses_fpu);
             cache.insert(next, entry);
             // Register this block's outgoing edges; patch any whose target is
@@ -2779,16 +2963,39 @@ fn run_x86_thread(
         match X86ExitStatus::from_raw(raw) {
             Some(X86ExitStatus::Signal) => {
                 // A synchronous guest fault (SIGSEGV/SIGBUS/SIGFPE/SIGILL). The
-                // shim recorded the HOST signal + si_code + faulting DATA
-                // address; translate the signal to Linux and, if the guest
-                // installed a handler, deliver it (build the x86-64 rt_sigframe
-                // and enter the handler). `snapshot.rip` holds the block's
-                // exit_resume (the gateway does not capture the exact faulting
-                // instruction), which is the resume point a returning handler
-                // would land on — fine for the common exit/longjmp handlers.
+                // shim recorded the host JIT RIP and data address. Reverse-map
+                // that RIP to the exact guest instruction and restore emitter
+                // scratch registers before building the signal frame, so a
+                // handler can mprotect the page and retry precisely.
                 let linux_sig = crate::host_signal::host_to_linux_signum(ctx.fault.signal);
-                let fault_pc = snapshot.rip;
-                let fault_info = Some((ctx.fault.code, ctx.fault.addr));
+                let Some(fault_pc) =
+                    recover_x86_fault_snapshot(&fault_entries, &ctx, &mut snapshot)
+                else {
+                    fault_detail = Some(format!(
+                        "native x86 fault at unregistered JIT RIP 0x{:x} addr=0x{:x}",
+                        ctx.fault.host_rip, ctx.fault.addr
+                    ));
+                    break 'run;
+                };
+                // Shared-anonymous mappings begin inaccessible so first touch
+                // can update portable residency metadata. This is an internal
+                // demand fault, not a guest SIGSEGV: restore the requested
+                // protection and retry the exact instruction.
+                if let Some((page, prot)) = active.dispatcher.resident_fault_plan(ctx.fault.addr)
+                    && memory.protect_range(page, PAGE as usize, prot).is_ok()
+                {
+                    active.dispatcher.commit_resident_fault(page);
+                    next = fault_pc;
+                    continue;
+                }
+                let fault_code = if linux_sig == crate::linux_abi::LINUX_SIGSEGV
+                    && IDENTITY_PROTECTIONS.range_fault_is_access_error(ctx.fault.addr, 1)
+                {
+                    crate::linux_abi::LINUX_SEGV_ACCERR
+                } else {
+                    ctx.fault.code
+                };
+                let fault_info = Some((fault_code, ctx.fault.addr));
                 match deliver_x86_signal(
                     &active,
                     tid,
@@ -2879,6 +3086,7 @@ fn run_x86_thread(
                                 cursor_limit = JIT_SLICE_LEN;
                                 cache.clear();
                                 pending.clear();
+                                fault_entries.clear();
                                 // POSIX fork-child resets on the (shared)
                                 // dispatcher + runtime globals: timerslack /
                                 // subreaper-ancestor / itimers / membarrier and
@@ -3032,6 +3240,7 @@ fn run_x86_thread(
                                 // space, harmless for the probe's single exec.
                                 cache.clear();
                                 pending.clear();
+                                fault_entries.clear();
                                 guest_fsbase = 0;
                                 snapshot = X86UcontextSnapshot::new();
                                 snapshot.gpr[reg::RSP] = image.rsp;
@@ -3055,8 +3264,8 @@ fn run_x86_thread(
                     // Genuine indirect branch (call/ret/jmp r/m): re-decode it
                     // at the self-set resume VA and resolve from the snapshot.
                     let va = snapshot.rip;
-                    let branch = image.code_bytes(va);
-                    match cflow::resolve(branch, va, &mut snapshot) {
+                    let branch = code_bytes(va);
+                    match cflow::resolve(&branch, va, &mut snapshot) {
                         Ok(t) => next = t,
                         Err(e) => {
                             fault_detail = Some(format!("cflow resolve at 0x{va:x}: {e}"));
@@ -3069,8 +3278,8 @@ fn run_x86_thread(
                 // Re-decode the sensitive instruction at the self-set resume VA
                 // to recover its kind and length.
                 let va = snapshot.rip;
-                let bytes = image.code_bytes(va);
-                match classify(bytes, va) {
+                let bytes = code_bytes(va);
+                match classify(&bytes, va) {
                     Ok(c) => match c.class {
                         X86InstClass::Sensitive(kind) => {
                             match service_sensitive(kind, &mut snapshot) {
@@ -3247,6 +3456,7 @@ fn service_syscall(
             payload,
             file,
             shared,
+            prot,
             prot_none,
             ..
         } => service_map_host_alias(
@@ -3255,6 +3465,7 @@ fn service_syscall(
             &payload,
             file,
             shared,
+            prot,
             prot_none,
             snapshot,
             memory,
@@ -4763,20 +4974,32 @@ fn service_map_host_alias(
     payload: &[u8],
     file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
     shared: bool,
-    prot_none: bool,
+    prot: u64,
+    _prot_none: bool,
     snapshot: &mut X86UcontextSnapshot,
     memory: &mut IdentityGuestMemory,
     resume: u64,
 ) -> Step {
     let len_usize = len as usize;
-    if let Some((fd, offset, host_prot)) = file {
+    if let Some((fd, offset, _host_prot)) = file {
         // SAFETY: `va` is a page-aligned host VA inside the reserved mmap arena;
         // MAP_FIXED replaces the anon backing with the file mapping.
         let p = unsafe {
             libc::mmap(
                 va as *mut libc::c_void,
                 len_usize,
-                host_prot,
+                // Map writable for initialization when requested; executable
+                // DSR pages need host READ, never host EXEC.
+                if prot & crate::linux_abi::LINUX_PROT_WRITE != 0 {
+                    libc::PROT_READ | libc::PROT_WRITE
+                } else if prot
+                    & (crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_EXEC)
+                    != 0
+                {
+                    libc::PROT_READ
+                } else {
+                    libc::PROT_NONE
+                },
                 libc::MAP_SHARED | libc::MAP_FIXED,
                 fd,
                 offset,
@@ -4789,6 +5012,11 @@ fn service_map_host_alias(
             snapshot.gpr[reg::RAX] = (-(errno as i64)) as u64;
             return Step::Continue(resume);
         }
+        // The explicit MAP_FIXED file mapping is now the authoritative
+        // backing. Clear the old arena-hole marker before protect_range, or
+        // ensure_identity_backed would replace this live alias with anonymous
+        // memory and sever MAP_SHARED coherence.
+        IDENTITY_PROTECTIONS.set_unmapped(va, len_usize, false);
     } else {
         // Anonymous alias mappings live outside the pre-reserved low mmap
         // arena, so install real backing at the identity VA before either the
@@ -4818,14 +5046,14 @@ fn service_map_host_alias(
             snapshot.gpr[reg::RAX] = (-(errno as i64)) as u64;
             return Step::Continue(resume);
         }
+        IDENTITY_PROTECTIONS.set_unmapped(va, len_usize, false);
         if !payload.is_empty() {
-            let _ = memory.write_bytes(va, payload);
+            let _ = memory.write_bytes_raw(va, payload);
         }
     }
-    if prot_none {
-        // SAFETY: making the guest's own mapping inaccessible so its access
-        // faults (SEGV) as Linux would.
-        unsafe { libc::mprotect(va as *mut libc::c_void, len_usize, libc::PROT_NONE) };
+    if memory.protect_range(va, len_usize, prot).is_err() {
+        snapshot.gpr[reg::RAX] = crate::linux_abi::LINUX_ENOMEM.guest_retval() as u64;
+        return Step::Continue(resume);
     }
     snapshot.gpr[reg::RAX] = va;
     Step::Continue(resume)

@@ -295,6 +295,13 @@ fn validate_mlock_range(
     page_size: u64,
 ) -> Result<(), LinuxErrno> {
     let len = range_len_usize(range)?;
+    if memory.has_complete_mapping_metadata()
+        && memory
+            .protections()
+            .is_some_and(|protections| !protections.range_unmapped(range.start().raw(), len))
+    {
+        return Ok(());
+    }
     if !populate && memory.host_ptr_for_read(range.start().raw(), len).is_some() {
         return Ok(());
     }
@@ -1352,6 +1359,12 @@ impl SyscallDispatcher {
                     prot_none,
                     !prot_none && !prot_flags.contains(LinuxProtFlags::WRITE),
                 );
+                if memory
+                    .protect_range(requested.0, length_usize, prot)
+                    .is_err()
+                {
+                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                }
                 this.commit_eager_locked_range(locked_range);
                 this.record_dynamic_mapping(
                     requested.0,
@@ -1494,6 +1507,7 @@ impl SyscallDispatcher {
                         payload: Vec::new(),
                         file: Some((dup_fd, offset as libc::off_t, host_prot)),
                         shared: true,
+                        prot,
                         prot_none,
                     });
                 }
@@ -1540,9 +1554,38 @@ impl SyscallDispatcher {
                     );
                     if prot_none {
                         let _ = memory.protect_range(addr, map_len_usize, 0);
-                    } else {
+                    } else if memory
+                        .resident_pages(
+                            GuestVa(addr),
+                            1,
+                            this.linux_page_size(),
+                        )
+                        .is_none()
+                    {
+                        // Backends without live host residency use a temporary
+                        // inaccessible mapping to observe the first touch.
                         let _ = memory.protect_range(addr, map_len_usize, 0);
                         this.track_resident_fault_range(addr, length, prot_flags);
+                        // The temporary backing state is not the guest VMA
+                        // permission. Preserve the requested Linux metadata.
+                        memory.set_mapping_protection(
+                            addr,
+                            map_len_usize,
+                            false,
+                            !prot_flags.contains(LinuxProtFlags::WRITE),
+                        );
+                        if let Some(protections) = memory.protections() {
+                            protections.set_executable(
+                                addr,
+                                map_len_usize,
+                                prot_flags.contains(LinuxProtFlags::EXEC),
+                            );
+                        }
+                    } else {
+                        // Native identity mappings expose real host residency;
+                        // apply the requested guest permission directly without
+                        // manufacturing a demand fault.
+                        let _ = memory.protect_range(addr, map_len_usize, prot);
                     }
                     if let Err(errno) = this.commit_mmap_locked_range(memory, locked_range) {
                         memory.set_mapping_protection(addr, map_len_usize, false, false);
@@ -1862,6 +1905,7 @@ impl SyscallDispatcher {
                     payload: bytes,
                     file: None,
                     shared: map_sharing == MmapSharing::Shared,
+                    prot,
                     prot_none,
                 });
             }
@@ -2430,11 +2474,13 @@ impl SyscallDispatcher {
             // while the explicit unmapped set catches retained arena backing
             // after munmap across the whole rounded range. Probe BEFORE changing
             // protection metadata so a hole cannot be resurrected as a VMA.
-            if cx
+            let metadata_says_unmapped = cx
                 .memory
                 .protections()
-                .is_some_and(|p| p.range_unmapped(address.0, len))
-                || cx.memory.read_bytes_raw(address.0, 1).is_err()
+                .is_some_and(|p| p.range_unmapped(address.0, len));
+            let needs_backing_probe = !cx.memory.has_complete_mapping_metadata();
+            if metadata_says_unmapped
+                || (needs_backing_probe && cx.memory.read_bytes_raw(address.0, 1).is_err())
             {
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
             }

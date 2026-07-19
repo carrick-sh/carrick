@@ -2256,6 +2256,11 @@ impl SyscallDispatcher {
                 payload: Vec::new(),
                 file: Some((host_fd, 0, host_prot)),
                 shared: true,
+                prot: if attach_flags.contains(ShmAttachFlags::RDONLY) {
+                    crate::linux_abi::LINUX_PROT_READ
+                } else {
+                    crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_WRITE
+                },
                 // shmat is always at least readable (SHM_RDONLY or RW).
                 prot_none: false,
             })

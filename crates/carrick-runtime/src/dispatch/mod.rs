@@ -1275,6 +1275,10 @@ pub enum DispatchOutcome {
         /// Whether an anonymous alias must remain coherent across host `fork`.
         /// Ignored for a file mapping (its `MAP_SHARED` backing is explicit).
         shared: bool,
+        /// Complete Linux `PROT_*` mask. Identity-native backends need all
+        /// R/W/X bits to enforce guest accesses and translation eligibility;
+        /// VMM backends may continue using `prot_none` for their leaf fast path.
+        prot: u64,
         /// The guest asked for `PROT_NONE`: after installing the alias mapping
         /// the runtime must make the range guest-INACCESSIBLE (invalidate the
         /// fresh leaves), so the guest's own access faults (SIGSEGV/ACCERR)
