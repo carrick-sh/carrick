@@ -1109,8 +1109,16 @@ fn proxy_tcp_stream(mut inbound: TcpStream, target: SocketAddr) -> io::Result<()
     let mut outbound = TcpStream::connect(target)?;
     let mut inbound_clone = inbound.try_clone()?;
     let mut outbound_clone = outbound.try_clone()?;
-    let left = thread::spawn(move || io::copy(&mut inbound_clone, &mut outbound));
-    let right = thread::spawn(move || io::copy(&mut outbound_clone, &mut inbound));
+    let left = thread::spawn(move || {
+        let copied = io::copy(&mut inbound_clone, &mut outbound);
+        let _ = outbound.shutdown(std::net::Shutdown::Write);
+        copied
+    });
+    let right = thread::spawn(move || {
+        let copied = io::copy(&mut outbound_clone, &mut inbound);
+        let _ = inbound.shutdown(std::net::Shutdown::Write);
+        copied
+    });
     let _ = left.join();
     let _ = right.join();
     Ok(())
@@ -2082,6 +2090,41 @@ mod tests {
         server.join().expect("server thread");
 
         assert_eq!(&reply, b"ok");
+    }
+
+    #[test]
+    fn tcp_proxy_propagates_half_close_in_both_directions() {
+        let target_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("target bind");
+        let target_addr = target_listener.local_addr().expect("target addr");
+        let target = thread::spawn(move || {
+            let (mut stream, _) = target_listener.accept().expect("target accept");
+            let mut request = Vec::new();
+            stream.read_to_end(&mut request).expect("target read EOF");
+            assert_eq!(request, b"ping");
+            stream.write_all(b"pong").expect("target write response");
+            stream
+                .shutdown(std::net::Shutdown::Write)
+                .expect("target half-close");
+        });
+
+        let proxy_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("proxy bind");
+        let proxy_addr = proxy_listener.local_addr().expect("proxy addr");
+        let proxy = thread::spawn(move || {
+            let (inbound, _) = proxy_listener.accept().expect("proxy accept");
+            proxy_tcp_stream(inbound, target_addr).expect("proxy stream");
+        });
+
+        let mut client = TcpStream::connect(proxy_addr).expect("client connect");
+        client.write_all(b"ping").expect("client write request");
+        client
+            .shutdown(std::net::Shutdown::Write)
+            .expect("client half-close");
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).expect("client read EOF");
+
+        target.join().expect("target thread");
+        proxy.join().expect("proxy thread");
+        assert_eq!(response, b"pong");
     }
 
     #[test]
