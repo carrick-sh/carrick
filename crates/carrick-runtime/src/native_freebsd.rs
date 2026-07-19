@@ -115,6 +115,20 @@ fn reserve_fixed_rw(base: u64, len: usize) -> Option<u64> {
     }
 }
 
+fn remap_vfork_exec_arenas() -> Result<(), RuntimeError> {
+    for (base, len, name) in [
+        (LINUX_HEAP_BASE, LINUX_HEAP_SIZE as usize, "heap"),
+        (LINUX_MMAP_BASE, mmap_arena_size() as usize, "mmap"),
+    ] {
+        if reserve_fixed_rw(base, len).is_none() {
+            return Err(RuntimeError::Unsupported(format!(
+                "vfork exec: remap private {name} arena at 0x{base:x} ({len} bytes) failed"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// `ARCH_SET_FS` (arch_prctl(2)) — the musl/glibc TLS thread-pointer set.
 const ARCH_SET_FS: u64 = 0x1002;
 /// `ARCH_SET_GS`.
@@ -3177,10 +3191,7 @@ fn run_x86_thread(
                                 }
                                 active.registry.remove_all_except(tid);
                                 exec_owner = true;
-                                // Linux releases a vfork-suspended parent at the
-                                // successful exec point of no return, before the
-                                // replacement image executes.
-                                notify_vfork_completion(&mut vfork_completion_fd);
+                                let vfork_exec = vfork_completion_fd.is_some();
                                 // Reset the dispatcher's per-process exec state:
                                 // fresh brk/mmap bookkeeping, signal handlers to
                                 // default, close O_CLOEXEC fds, new /proc identity.
@@ -3206,6 +3217,19 @@ fn run_x86_thread(
                                 // vDSO/vvar live at FIXED VAs, so the old must be
                                 // unmapped BEFORE the new maps over them.
                                 image.teardown();
+                                // The heap and mmap arenas survive ordinary
+                                // in-process exec. A vfork child, however,
+                                // inherited them with INHERIT_SHARE; replace
+                                // them with fresh private objects so the new
+                                // image's later forks are CoW and cannot share
+                                // allocator state with either vfork ancestor.
+                                if vfork_exec && let Err(error) = remap_vfork_exec_arenas() {
+                                    notify_vfork_completion(&mut vfork_completion_fd);
+                                    fault_detail = Some(format!(
+                                        "replace vfork-shared exec arenas: {error:?}"
+                                    ));
+                                    break;
+                                }
                                 match load_static_pie(&bytes, &argv, &env) {
                                     Ok(new_image) => {
                                         reset_identity_vmas(&new_image);
@@ -3214,6 +3238,10 @@ fn run_x86_thread(
                                         // this replacement image, not the
                                         // pre-exec image retained in SharedRun.
                                         active.publish_image(Arc::clone(&image));
+                                        // The exec point of no return is the
+                                        // installed replacement image, not the
+                                        // dispatcher's earlier path resolution.
+                                        notify_vfork_completion(&mut vfork_completion_fd);
                                     }
                                     Err(e) => {
                                         // Past the point of no return: the old
@@ -3310,6 +3338,36 @@ fn run_x86_thread(
     }
 
     if let Some(detail) = fault_detail {
+        if forked {
+            let recent: Vec<String> = history
+                .iter()
+                .rev()
+                .take(12)
+                .rev()
+                .map(|va| format!("0x{va:x}"))
+                .collect();
+            let message = format!(
+                "native x86 fork child {} stopped after {traps} traps: {detail}; \
+                 rip=0x{:x} rsp=0x{:x} rdi=0x{:x}; segments={:?}; recent=[{}]\n",
+                tid.raw(),
+                snapshot.rip,
+                snapshot.gpr[reg::RSP],
+                snapshot.gpr[reg::RDI],
+                image.segments,
+                recent.join(", ")
+            );
+            // SAFETY: a single best-effort diagnostic write on an already
+            // failing fork-child path; avoids losing the root cause when the
+            // descendant cannot return a RunResult to the original runner.
+            unsafe {
+                libc::write(2, message.as_ptr().cast(), message.len());
+            }
+            crate::exec_helpers::forked_child_exit(
+                125,
+                active.dispatcher.stdout(),
+                active.dispatcher.stderr(),
+            );
+        }
         return ThreadRunOutcome::Fault { detail, traps };
     }
     if let Some(code) = exit_code {
@@ -4611,30 +4669,33 @@ fn exclude_vfork_shared_ranges(
     coalesced
 }
 
+fn native_private_inheritance_ranges(shared: &SharedRun) -> Vec<(u64, usize)> {
+    let image = shared.current_image();
+    let mut ranges: Vec<(u64, usize)> = image
+        .segments
+        .iter()
+        .filter_map(|&(start, end)| {
+            usize::try_from(end.saturating_sub(start))
+                .ok()
+                .map(|len| (start, len))
+        })
+        .collect();
+    ranges.extend([
+        (image.stack, image.stack_len),
+        (image.scratch, image.scratch_len),
+        (LINUX_HEAP_BASE, LINUX_HEAP_SIZE as usize),
+        (LINUX_MMAP_BASE, mmap_arena_size() as usize),
+    ]);
+    ranges.extend(shared.dispatcher.private_dynamic_mapping_ranges());
+    // Existing MAP_SHARED mappings already cross fork correctly. Never run
+    // them through INHERIT_COPY: FreeBSD documents that this permanently
+    // severs their backing-store sharing.
+    exclude_vfork_shared_ranges(ranges, &shared.dispatcher.shared_dynamic_mapping_ranges())
+}
+
 impl NativeVforkShare {
     fn prepare(shared: &SharedRun) -> std::io::Result<Self> {
-        let image = shared.current_image();
-        let mut ranges: Vec<(u64, usize)> = image
-            .segments
-            .iter()
-            .filter_map(|&(start, end)| {
-                usize::try_from(end.saturating_sub(start))
-                    .ok()
-                    .map(|len| (start, len))
-            })
-            .collect();
-        ranges.extend([
-            (image.stack, image.stack_len),
-            (image.scratch, image.scratch_len),
-            (LINUX_HEAP_BASE, LINUX_HEAP_SIZE as usize),
-            (LINUX_MMAP_BASE, mmap_arena_size() as usize),
-        ]);
-        ranges.extend(shared.dispatcher.private_dynamic_mapping_ranges());
-        // Existing MAP_SHARED mappings already cross fork correctly. Never run
-        // them through INHERIT_COPY on restoration: FreeBSD documents that this
-        // permanently severs their backing-store sharing.
-        ranges =
-            exclude_vfork_shared_ranges(ranges, &shared.dispatcher.shared_dynamic_mapping_ranges());
+        let ranges = native_private_inheritance_ranges(shared);
         let mut applied = 0usize;
         for &(start, len) in &ranges {
             if unsafe {
