@@ -97,7 +97,7 @@ impl SyscallDispatcher {
             OpenStatSource::Record(record) => Ok(record),
             OpenStatSource::HostStream {
                 host_fd,
-                label,
+                identity,
                 fallback_mode,
             } => {
                 // fstat the real host fd to recover the Linux file type: a host
@@ -118,6 +118,15 @@ impl SyscallDispatcher {
                 } else {
                     fallback_mode
                 };
+                // Preserve open-description identity in guest stat records.
+                // A constant label made every HostPipe-backed object share one
+                // synthetic inode: after `2>&1 >/dev/null`, GNU m4 therefore
+                // mistook stderr's pipe for stdout's /dev/null and discarded
+                // `dumpdef`, leaving autom4te with an empty builtin table.
+                // Include the Linux file type because host inode numbers can
+                // collide across devices; use `pipe_id` for identity because
+                // BSD gives the two ends of one pipe different host inodes.
+                let label = host_stream_stat_label(identity, mode & LINUX_S_IFMT);
                 Ok(StatRecord::synthetic(&label, 0, mode))
             }
             // An open Directory or in-memory File: its fd-stat must report the
@@ -186,5 +195,79 @@ impl SyscallDispatcher {
                 Ok(StatRecord::from_metadata(&metadata))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn host_stream_file(
+        host_fd: i32,
+        pipe_id: u64,
+        is_read_end: bool,
+        write_kind: HostWriteKind,
+    ) -> OpenFile {
+        OpenFile::new(
+            Arc::new(RwLock::new(OpenDescription::HostPipe {
+                base: OpenDescriptionBase::new(if is_read_end {
+                    LINUX_O_RDONLY
+                } else {
+                    LINUX_O_WRONLY
+                }),
+                host_fd: HostFdRef::new(host_fd),
+                is_read_end,
+                pipe_id,
+                pty: None,
+                bidirectional: false,
+                write_kind,
+            })),
+            0,
+        )
+    }
+
+    #[test]
+    fn host_stream_stats_distinguish_devices_and_preserve_pipe_identity() {
+        let dispatcher = SyscallDispatcher::new();
+        let mut pipe_fds = [-1; 2];
+        // SAFETY: `pipe_fds` has space for both output descriptors.
+        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
+        // SAFETY: static NUL-terminated path; returned fd is owned below.
+        let null_fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY) };
+        assert!(null_fd >= 0);
+
+        let pipe_identity = host_inode_pipe_id(pipe_fds[0]);
+        let null_identity = host_inode_pipe_id(null_fd);
+        assert_ne!(pipe_identity, 0);
+        assert_ne!(null_identity, 0);
+        {
+            let mut files = dispatcher.io.open_files.write();
+            files.insert(
+                20,
+                host_stream_file(pipe_fds[0], pipe_identity, true, HostWriteKind::PipeLike),
+            );
+            files.insert(
+                21,
+                host_stream_file(pipe_fds[1], pipe_identity, false, HostWriteKind::PipeLike),
+            );
+            files.insert(
+                22,
+                host_stream_file(null_fd, null_identity, false, HostWriteKind::RegularFile),
+            );
+        }
+
+        let pipe_read = dispatcher.fd_stat_record(20).expect("pipe read stat");
+        let pipe_write = dispatcher.fd_stat_record(21).expect("pipe write stat");
+        let null = dispatcher.fd_stat_record(22).expect("null stat");
+        assert_eq!(pipe_read.ino, pipe_write.ino);
+        assert_ne!(pipe_read.ino, null.ino);
+        assert_eq!(pipe_read.mode & LINUX_S_IFMT, LINUX_S_IFIFO);
+        assert_eq!(null.mode & LINUX_S_IFMT, LINUX_S_IFCHR);
+
+        let pipe_link = dispatcher
+            .open_file(20)
+            .and_then(|file| file.description.read().readlink_target())
+            .expect("pipe readlink target");
+        assert_eq!(pipe_link, format!("pipe:[{}]", pipe_read.ino));
     }
 }
