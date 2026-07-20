@@ -1654,6 +1654,16 @@ impl SyscallDispatcher {
         } else {
             true
         };
+        // Validate O_DIRECTORY before a mount can apply O_TRUNC/O_CREAT. Linux
+        // rejects a non-directory without mutating it; checking only after
+        // `try_vfs_open` had already truncated or created bind-mounted files.
+        if open_flags.contains(LinuxOpenFlags::DIRECTORY) {
+            match self.inotify_path_kind(&path) {
+                Some(false) => return Ok(DispatchOutcome::errno(LINUX_ENOTDIR)),
+                None if want_create => return Ok(DispatchOutcome::errno(LINUX_EINVAL)),
+                _ => {}
+            }
+        }
         let vfs_outcome = self.try_vfs_open(&path, access, flags, vfs_create_mode);
         match vfs_outcome {
             VfsOpenAttempt::Installed(fd) => {
@@ -1678,6 +1688,12 @@ impl SyscallDispatcher {
                         self.close_open_file_and_free_pty(&open_file);
                     }
                     self.note_fd_closed(fd);
+                    if (0..3).contains(&fd) {
+                        // Installation reused a deliberately closed stdio slot
+                        // and cleared its marker. The rejected open must leave
+                        // that slot closed, just as if no open had occurred.
+                        self.io.closed_stdio.lock()[fd as usize] = true;
+                    }
                     return Ok(DispatchOutcome::errno(errno));
                 }
                 // inotify: a VFS-mount open bypasses the rootfs tail below, so
@@ -11796,17 +11812,28 @@ mod tests {
         );
 
         let before = dispatcher.open_fd_numbers();
-        let outcome = dispatcher
+        for flags in [
+            crate::linux_abi::LINUX_O_PATH | LINUX_O_DIRECTORY,
+            LINUX_O_WRONLY | LINUX_O_TRUNC | LINUX_O_DIRECTORY,
+        ] {
+            let outcome = dispatcher
+                .open_at_path_string(LINUX_AT_FDCWD, "/bind/target", flags, 0, &reporter)
+                .unwrap();
+            assert_eq!(outcome, DispatchOutcome::errno(LINUX_ENOTDIR));
+            assert_eq!(dispatcher.open_fd_numbers(), before);
+            assert_eq!(std::fs::read(host.path().join("target")).unwrap(), b"old");
+        }
+        let create = dispatcher
             .open_at_path_string(
                 LINUX_AT_FDCWD,
-                "/bind/target",
-                crate::linux_abi::LINUX_O_PATH | LINUX_O_DIRECTORY,
-                0,
+                "/bind/missing",
+                LINUX_O_WRONLY | LINUX_O_CREAT | LINUX_O_DIRECTORY,
+                0o600,
                 &reporter,
             )
             .unwrap();
-        assert_eq!(outcome, DispatchOutcome::errno(LINUX_ENOTDIR));
-        assert_eq!(dispatcher.open_fd_numbers(), before);
+        assert_eq!(create, DispatchOutcome::errno(LINUX_EINVAL));
+        assert!(!host.path().join("missing").exists());
 
         assert!(matches!(
             dispatcher
@@ -11836,7 +11863,55 @@ mod tests {
         memory.write_bytes(0x4100, b"security.test\0").unwrap();
         memory.write_bytes(0x4200, b"x").unwrap();
 
+        let target = XattrTarget::Path {
+            path: GuestPtr(0x4000),
+            follow: true,
+        };
         let outcome = dispatcher
+            .setxattr(
+                &mut memory,
+                target,
+                GuestPtr(0x4100),
+                GuestPtr(0x4200),
+                1,
+                0,
+            )
+            .unwrap();
+        assert_eq!(outcome, DispatchOutcome::errno(LINUX_ENOTSUP));
+
+        let invalid = dispatcher
+            .setxattr(
+                &mut memory,
+                target,
+                GuestPtr(0x4100),
+                GuestPtr(0x4200),
+                1,
+                (crate::linux_abi::LINUX_XATTR_CREATE | crate::linux_abi::LINUX_XATTR_REPLACE)
+                    as u64,
+            )
+            .unwrap();
+        assert_eq!(invalid, DispatchOutcome::errno(LINUX_EINVAL));
+
+        let mut readonly = SyscallDispatcher::new();
+        readonly.register_mount(
+            "/bind",
+            Box::new(crate::vfs::BindVfs::new("/bind", host.path(), true)),
+        );
+        let readonly_result = readonly
+            .setxattr(
+                &mut memory,
+                target,
+                GuestPtr(0x4100),
+                GuestPtr(0x4200),
+                1,
+                0,
+            )
+            .unwrap();
+        assert_eq!(readonly_result, DispatchOutcome::errno(LINUX_EROFS));
+
+        memory.write_bytes(0x4000, b"/dev/null\0").unwrap();
+        memory.write_bytes(0x4100, b"user.test\0").unwrap();
+        let device = SyscallDispatcher::new()
             .setxattr(
                 &mut memory,
                 XattrTarget::Path {
@@ -11849,7 +11924,7 @@ mod tests {
                 0,
             )
             .unwrap();
-        assert_eq!(outcome, DispatchOutcome::errno(LINUX_ENOTSUP));
+        assert_eq!(device, DispatchOutcome::errno(LINUX_EPERM));
     }
 
     #[test]

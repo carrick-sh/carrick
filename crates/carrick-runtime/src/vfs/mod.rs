@@ -422,6 +422,13 @@ pub trait Vfs: Send + Sync {
         Err(crate::linux_abi::LINUX_EROFS)
     }
 
+    /// Error returned when this mount cannot service setxattr. Mounts may
+    /// distinguish an immutable filesystem (EROFS) from an unsupported xattr
+    /// operation/namespace (EOPNOTSUPP) without adding an xattr data API.
+    fn setxattr_unsupported_errno(&self) -> crate::linux_abi::LinuxErrno {
+        crate::linux_abi::LINUX_ENOTSUP
+    }
+
     fn create_socket(&self, _path: &str, _mode: u32) -> Result<(), VfsError> {
         Err(crate::linux_abi::LINUX_EROFS)
     }
