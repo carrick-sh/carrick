@@ -1657,6 +1657,29 @@ impl SyscallDispatcher {
         let vfs_outcome = self.try_vfs_open(&path, access, flags, vfs_create_mode);
         match vfs_outcome {
             VfsOpenAttempt::Installed(fd) => {
+                // VFS mounts return before the overlay/rootfs O_DIRECTORY gate
+                // below. Enforce it here too: GNU mv opens its destination with
+                // O_PATH|O_DIRECTORY to decide whether to append the source
+                // basename. Accepting a regular bind-mounted file made mv try
+                // `dest/source` and left configure's conftest files stale.
+                let directory_errno = if open_flags.contains(LinuxOpenFlags::DIRECTORY) {
+                    match self.fd_stat_record(fd) {
+                        Ok(record) if record.mode & LINUX_S_IFMT == LINUX_S_IFDIR => None,
+                        Ok(_) => Some(LINUX_ENOTDIR),
+                        Err(errno) => Some(errno),
+                    }
+                } else {
+                    None
+                };
+                if let Some(errno) = directory_errno {
+                    let removed = self.io.open_files.write().remove(&fd);
+                    self.io.fd_open_paths.write().remove(&fd);
+                    if let Some(open_file) = removed {
+                        self.close_open_file_and_free_pty(&open_file);
+                    }
+                    self.note_fd_closed(fd);
+                    return Ok(DispatchOutcome::errno(errno));
+                }
                 // inotify: a VFS-mount open bypasses the rootfs tail below, so
                 // synthesize its events here. A freshly-created child is
                 // IN_CREATE on the parent dir; every successful open is IN_OPEN
@@ -11759,6 +11782,44 @@ mod tests {
             0,
             "unmounted rootfs/overlay opens should fall through before building OpenContext"
         );
+    }
+
+    #[test]
+    fn bind_mount_rejects_o_directory_for_regular_file() {
+        let host = tempfile::tempdir().unwrap();
+        std::fs::write(host.path().join("target"), b"old").unwrap();
+        let reporter = CompatReporter::default();
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.register_mount(
+            "/bind",
+            Box::new(crate::vfs::BindVfs::new("/bind", host.path(), false)),
+        );
+
+        let before = dispatcher.open_fd_numbers();
+        let outcome = dispatcher
+            .open_at_path_string(
+                LINUX_AT_FDCWD,
+                "/bind/target",
+                crate::linux_abi::LINUX_O_PATH | LINUX_O_DIRECTORY,
+                0,
+                &reporter,
+            )
+            .unwrap();
+        assert_eq!(outcome, DispatchOutcome::errno(LINUX_ENOTDIR));
+        assert_eq!(dispatcher.open_fd_numbers(), before);
+
+        assert!(matches!(
+            dispatcher
+                .open_at_path_string(
+                    LINUX_AT_FDCWD,
+                    "/bind",
+                    crate::linux_abi::LINUX_O_PATH | LINUX_O_DIRECTORY,
+                    0,
+                    &reporter,
+                )
+                .unwrap(),
+            DispatchOutcome::Returned { .. }
+        ));
     }
 
     #[test]
