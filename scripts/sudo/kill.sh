@@ -37,14 +37,14 @@ fi
 
 if [ "$run_id" = "--all" ]; then
     # Global sledgehammer (manual recovery only): every renamed guest + trace fronts.
-    scan() { ps -axo pid=,command= | awk '!/awk/ && ($0 ~ /carrick:/ || $0 ~ /release\/carrick trace/) {print $1}'; }
+    scan() { ps -axww -o pid= -o command= | awk '!/awk/ && ($0 ~ /carrick:/ || $0 ~ /release\/carrick trace/) {print $1}'; }
     desc="ALL carrick guests"
 else
     # Scoped: LITERAL, anchored match of the delimited token "carrick:<id>:",
     # plus trace front-ends that carry the same run id in argv.
     needle="carrick:$run_id:"
     scan() {
-        ps -axo pid=,command= | awk \
+        ps -axww -o pid= -o command= | awk \
             -v n="$needle" \
             -v env="CARRICK_RUN_ID=$run_id" \
             -v name="--name $run_id" \
