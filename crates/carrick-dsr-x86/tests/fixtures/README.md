@@ -68,3 +68,21 @@ clang --target=x86_64-linux-gnu -DBUSY_SIBLING -nostdlib -static \
   -Wl,--build-id=none -o exitgroup-sibling-busy-x86_64-linux \
   exitgroup-sibling-futex.S
 ```
+
+`identity-loop-x86_64-linux` executes 1,000 `getpid` and 1,000 `gettid`
+syscalls before `exit_group`. The native integration gate requires one Rust
+trap total, proving both identity calls remain inside the chained JIT path.
+
+```sh
+clang --target=x86_64-linux-gnu -nostdlib -static -Wl,--build-id=none \
+  -o identity-loop-x86_64-linux identity-loop.S
+```
+
+`identity-seccomp-x86_64-linux` installs an allow-all seccomp filter before 20
+identity calls. Its integration test requires all 23 syscalls to trap, proving
+the live atomic gate disables already-translated identity paths immediately.
+
+```sh
+clang --target=x86_64-linux-gnu -nostdlib -static -Wl,--build-id=none \
+  -o identity-seccomp-x86_64-linux identity-seccomp.S
+```

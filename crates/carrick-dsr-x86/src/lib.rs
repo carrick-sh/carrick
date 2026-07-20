@@ -31,4 +31,6 @@ pub mod gateway;
 
 pub use block::{BlockLimit, PlannedInst, X86Block, X86BlockError, X86Exit, plan_block};
 pub use decode::{X86Classified, X86DecodeError, X86InstClass, X86SensitiveKind, classify};
-pub use gateway::{X86DsrContext, X86ExitStatus, X86UcontextSnapshot, enter_translated};
+pub use gateway::{
+    X86DsrContext, X86ExitStatus, X86IdentityStamp, X86UcontextSnapshot, enter_translated,
+};

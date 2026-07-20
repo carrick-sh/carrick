@@ -40,7 +40,8 @@ use iced_x86::{
 use crate::block::{X86Block, X86Exit};
 use crate::gateway::{
     CTX_CHAIN_PATCH, CTX_EXIT_INDIRECT_ADDR, CTX_EXIT_RESUME, CTX_EXIT_SENSITIVE_ADDR,
-    CTX_EXIT_SYSCALL_ADDR, CTX_SCRATCH, CTX_SCRATCH2, SNAP_GUEST_R15,
+    CTX_EXIT_SYSCALL_ADDR, CTX_IDENTITY_LIVE_GATE, CTX_IDENTITY_PID, CTX_IDENTITY_TID, CTX_SCRATCH,
+    CTX_SCRATCH2, SNAP_GUEST_R15, X86IdentitySyscall,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -77,6 +78,42 @@ fn mov_ctx_from_rax(disp: i32) -> [u8; 7] {
 fn mov_rax_from_ctx(disp: i32) -> [u8; 7] {
     let d = disp.to_le_bytes();
     [0x49, 0x8B, 0x87, d[0], d[1], d[2], d[3]]
+}
+
+fn mov_ctx_from_rcx(disp: i32) -> [u8; 7] {
+    let d = disp.to_le_bytes();
+    [0x49, 0x89, 0x8F, d[0], d[1], d[2], d[3]]
+}
+
+fn mov_rcx_from_ctx(disp: i32) -> [u8; 7] {
+    let d = disp.to_le_bytes();
+    [0x49, 0x8B, 0x8F, d[0], d[1], d[2], d[3]]
+}
+
+/// Emit `jrcxz rel8`. Unlike cmp/test + jcc, this does not alter guest RFLAGS.
+fn emit_jrcxz(out: &mut Vec<u8>) -> usize {
+    out.push(0xE3);
+    let rel8_off = out.len();
+    out.push(0);
+    rel8_off
+}
+
+fn patch_local_rel8(out: &mut [u8], rel8_off: usize, target_off: usize) {
+    let displacement = target_off as i64 - (rel8_off + 1) as i64;
+    debug_assert!(i8::try_from(displacement).is_ok());
+    out[rel8_off] = displacement as i8 as u8;
+}
+
+fn emit_jmp_rel32(out: &mut Vec<u8>) -> usize {
+    out.push(0xE9);
+    let rel32_off = out.len();
+    out.extend_from_slice(&0_i32.to_le_bytes());
+    rel32_off
+}
+
+fn patch_local_rel32(out: &mut [u8], rel32_off: usize, target_off: usize) {
+    let displacement = target_off as i64 - (rel32_off + 4) as i64;
+    out[rel32_off..rel32_off + 4].copy_from_slice(&(displacement as i32).to_le_bytes());
 }
 
 /// Emit the SELF-SET of `exit_resume` to `resume_va`, preserving `rax` through
@@ -217,6 +254,73 @@ fn emit_cold_stub(slot_rel32_off: usize, target_va: u64, cold_off: usize, out: &
 /// Byte length of one [`emit_cold_stub`].
 const COLD_STUB_LEN: usize = 52;
 
+fn statically_known_identity_syscall(
+    source: &[u8],
+    block: &X86Block,
+    syscall_va: u64,
+) -> Option<X86IdentitySyscall> {
+    let last = block.instructions.last()?;
+    if last.va.checked_add(u64::from(last.len))? != syscall_va {
+        return None;
+    }
+    let start = usize::try_from(last.va.checked_sub(block.start)?).ok()?;
+    let end = start.checked_add(usize::from(last.len))?;
+    let mut decoder = Decoder::with_ip(64, source.get(start..end)?, last.va, DecoderOptions::NONE);
+    let inst = decoder.decode();
+    let raw = match (inst.code(), inst.op0_register()) {
+        (Code::Mov_r32_imm32, Register::EAX) => inst.immediate32(),
+        (Code::Mov_r64_imm64, Register::RAX) => u32::try_from(inst.immediate64()).ok()?,
+        (Code::Mov_rm64_imm32, Register::RAX) => u32::try_from(inst.immediate32to64()).ok()?,
+        _ => return None,
+    };
+    X86IdentitySyscall::from_static_x86_ordinal(raw)
+}
+
+/// Emit a statically identified getpid/gettid as a live-gated context load plus
+/// one patchable successor edge. `jrcxz` tests the pointer and atomic value
+/// without modifying RFLAGS; RAX/RCX are restored exactly on the fallback.
+fn emit_identity_syscall_or_fallback(
+    identity: X86IdentitySyscall,
+    resume: u64,
+    out: &mut Vec<u8>,
+) -> ChainEdge {
+    out.extend_from_slice(&mov_ctx_from_rax(CTX_SCRATCH));
+    out.extend_from_slice(&mov_ctx_from_rcx(CTX_SCRATCH2));
+    out.extend_from_slice(&mov_rcx_from_ctx(CTX_IDENTITY_LIVE_GATE));
+    let null_to_fallback = emit_jrcxz(out);
+    out.extend_from_slice(&[0x8B, 0x09]); // mov ecx, dword ptr [rcx]
+    let disabled_to_fallback = emit_jrcxz(out);
+
+    let result_offset = match identity {
+        X86IdentitySyscall::GetPid => CTX_IDENTITY_PID,
+        X86IdentitySyscall::GetTid => CTX_IDENTITY_TID,
+    };
+    out.extend_from_slice(&mov_rax_from_ctx(result_offset));
+    out.extend_from_slice(&mov_rcx_from_ctx(CTX_SCRATCH2));
+    let identity_to_slot = emit_jmp_rel32(out);
+
+    let fallback = out.len();
+    out.extend_from_slice(&mov_rax_from_ctx(CTX_SCRATCH));
+    out.extend_from_slice(&mov_rcx_from_ctx(CTX_SCRATCH2));
+    emit_self_set_resume(resume, out);
+    out.extend_from_slice(&jmp_indirect_r15(CTX_EXIT_SYSCALL_ADDR));
+
+    let slot_off = out.len();
+    let cold_off = slot_off + 5;
+    out.push(0xE9);
+    out.extend_from_slice(&0_i32.to_le_bytes());
+    emit_cold_stub(slot_off + 1, resume, cold_off, out);
+
+    patch_local_rel8(out, null_to_fallback, fallback);
+    patch_local_rel8(out, disabled_to_fallback, fallback);
+    patch_local_rel32(out, identity_to_slot, slot_off);
+
+    ChainEdge {
+        target_va: resume,
+        rel32_off: slot_off + 1,
+    }
+}
+
 /// The second opcode byte of the `0F 8x` near `jcc rel32` for a condition.
 fn jcc_rel32_opcode(cc: ConditionCode) -> Option<u8> {
     Some(match cc {
@@ -296,11 +400,23 @@ pub fn emit_block_linked(source: &[u8], block: &X86Block) -> Result<LinkedBlock,
         fault_map,
     };
     match block.exit {
-        X86Exit::Syscall { va, resume, .. } => {
+        X86Exit::Syscall { va, resume, int80 } => {
             let (mut out, fault_map) = emit_copy_body(source, block, va)?;
-            emit_self_set_resume(resume, &mut out);
-            out.extend_from_slice(&jmp_indirect_r15(CTX_EXIT_SYSCALL_ADDR));
-            Ok(no_edges(out, fault_map))
+            if let Some(identity) = (!int80)
+                .then(|| statically_known_identity_syscall(source, block, va))
+                .flatten()
+            {
+                let edge = emit_identity_syscall_or_fallback(identity, resume, &mut out);
+                Ok(LinkedBlock {
+                    bytes: out,
+                    edges: vec![edge],
+                    fault_map,
+                })
+            } else {
+                emit_self_set_resume(resume, &mut out);
+                out.extend_from_slice(&jmp_indirect_r15(CTX_EXIT_SYSCALL_ADDR));
+                Ok(no_edges(out, fault_map))
+            }
         }
         X86Exit::Sensitive { va, .. } => {
             // The run loop re-decodes the sensitive instruction at the resume
@@ -830,15 +946,16 @@ mod tests {
     }
 
     #[test]
-    fn linked_indirect_and_syscall_exits_carry_no_edges() {
+    fn only_static_identity_syscalls_gain_a_chain_edge() {
         // ff e0  jmp rax — indirect, not chainable.
         static IND: &[u8] = &[0xff, 0xe0];
         assert!(plan_and_emit_linked(IND).edges.is_empty());
-        // b8 3c 00 00 00; 0f 05 — mov eax,60; syscall.
+        // mov eax,60; syscall — ordinary exit_group remains the compact
+        // dispatcher path and does not force FPU preservation/chaining.
         static SYS: &[u8] = &[0xb8, 0x3c, 0x00, 0x00, 0x00, 0x0f, 0x05];
         let lb = plan_and_emit_linked(SYS);
         assert!(lb.edges.is_empty());
-        // The syscall block self-sets its resume (movabs of VA+7) before the
+        // The fallback self-sets its resume (movabs of VA+7) before the
         // syscall exit stub.
         let needle = {
             let mut v = vec![0x48, 0xb8];
@@ -849,6 +966,17 @@ mod tests {
             lb.bytes.windows(needle.len()).any(|w| w == needle),
             "syscall exit self-sets resume = VA after syscall"
         );
+
+        // mov eax,39; syscall — statically known getpid gains exactly one
+        // patchable edge to the post-syscall VA.
+        static GETPID: &[u8] = &[0xb8, 0x27, 0x00, 0x00, 0x00, 0x0f, 0x05];
+        let getpid = plan_and_emit_linked(GETPID);
+        assert_eq!(getpid.edges.len(), 1);
+        assert_eq!(getpid.edges[0].target_va, BASE + 7);
+
+        // int 0x80 uses the i386 syscall table: ordinal 39 is not getpid.
+        static INT80_39: &[u8] = &[0xb8, 0x27, 0x00, 0x00, 0x00, 0xcd, 0x80];
+        assert!(plan_and_emit_linked(INT80_39).edges.is_empty());
     }
 
     #[test]
