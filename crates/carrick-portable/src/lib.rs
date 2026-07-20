@@ -1171,6 +1171,12 @@ pub const FREEBSD_INHERIT_SHARE: i32 = 0;
 #[cfg(target_os = "freebsd")]
 pub const FREEBSD_INHERIT_COPY: i32 = 1;
 
+/// Apply FreeBSD's inheritance policy to the mapped range `[addr, addr+len)`.
+///
+/// # Safety
+///
+/// `addr` and `len` must describe a valid mapped range in the calling process,
+/// and `inherit` must be a mode accepted by `minherit(2)`.
 #[cfg(target_os = "freebsd")]
 #[inline]
 pub unsafe fn freebsd_minherit(addr: *mut libc::c_void, len: usize, inherit: i32) -> i32 {
