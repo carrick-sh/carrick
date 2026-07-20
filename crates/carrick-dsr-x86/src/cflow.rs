@@ -58,7 +58,11 @@ impl ControlFlowPlan {
         match inst.flow_control() {
             FlowControl::UnconditionalBranch => rel_target(inst, va),
             FlowControl::ConditionalBranch => {
-                if condition_holds(inst.condition_code(), snapshot.rflags) {
+                let taken = match counter_branch_taken(inst, snapshot) {
+                    Some(taken) => taken,
+                    None => condition_holds(inst.condition_code(), snapshot.rflags),
+                };
+                if taken {
                     rel_target(inst, va)
                 } else {
                     Ok(fallthrough)
@@ -184,6 +188,88 @@ const ZF: u64 = 1 << 6;
 const SF: u64 = 1 << 7;
 const OF: u64 = 1 << 11;
 
+#[derive(Clone, Copy)]
+enum CounterWidth {
+    Cx,
+    Ecx,
+    Rcx,
+}
+
+#[derive(Clone, Copy)]
+enum CounterBranch {
+    Zero(CounterWidth),
+    Loop(CounterWidth),
+    LoopEqual(CounterWidth),
+    LoopNotEqual(CounterWidth),
+}
+
+fn counter_branch_kind(code: Code) -> Option<CounterBranch> {
+    use CounterBranch::{Loop, LoopEqual, LoopNotEqual, Zero};
+    use CounterWidth::{Cx, Ecx, Rcx};
+    Some(match code {
+        Code::Jcxz_rel8_16 | Code::Jcxz_rel8_32 => Zero(Cx),
+        Code::Jecxz_rel8_16 | Code::Jecxz_rel8_32 | Code::Jecxz_rel8_64 => Zero(Ecx),
+        Code::Jrcxz_rel8_16 | Code::Jrcxz_rel8_64 => Zero(Rcx),
+        Code::Loop_rel8_16_CX | Code::Loop_rel8_32_CX => Loop(Cx),
+        Code::Loop_rel8_16_ECX | Code::Loop_rel8_32_ECX | Code::Loop_rel8_64_ECX => Loop(Ecx),
+        Code::Loop_rel8_16_RCX | Code::Loop_rel8_64_RCX => Loop(Rcx),
+        Code::Loope_rel8_16_CX | Code::Loope_rel8_32_CX => LoopEqual(Cx),
+        Code::Loope_rel8_16_ECX | Code::Loope_rel8_32_ECX | Code::Loope_rel8_64_ECX => {
+            LoopEqual(Ecx)
+        }
+        Code::Loope_rel8_16_RCX | Code::Loope_rel8_64_RCX => LoopEqual(Rcx),
+        Code::Loopne_rel8_16_CX | Code::Loopne_rel8_32_CX => LoopNotEqual(Cx),
+        Code::Loopne_rel8_16_ECX | Code::Loopne_rel8_32_ECX | Code::Loopne_rel8_64_ECX => {
+            LoopNotEqual(Ecx)
+        }
+        Code::Loopne_rel8_16_RCX | Code::Loopne_rel8_64_RCX => LoopNotEqual(Rcx),
+        _ => return None,
+    })
+}
+
+fn counter_value(snapshot: &X86UcontextSnapshot, width: CounterWidth) -> u64 {
+    match width {
+        CounterWidth::Cx => snapshot.gpr[reg::RCX] & u64::from(u16::MAX),
+        CounterWidth::Ecx => snapshot.gpr[reg::RCX] & u64::from(u32::MAX),
+        CounterWidth::Rcx => snapshot.gpr[reg::RCX],
+    }
+}
+
+fn decrement_counter(snapshot: &mut X86UcontextSnapshot, width: CounterWidth) -> u64 {
+    let old = snapshot.gpr[reg::RCX];
+    match width {
+        CounterWidth::Cx => {
+            let low = (old as u16).wrapping_sub(1);
+            snapshot.gpr[reg::RCX] = (old & !u64::from(u16::MAX)) | u64::from(low);
+            u64::from(low)
+        }
+        CounterWidth::Ecx => {
+            let low = (old as u32).wrapping_sub(1);
+            snapshot.gpr[reg::RCX] = u64::from(low);
+            u64::from(low)
+        }
+        CounterWidth::Rcx => {
+            let value = old.wrapping_sub(1);
+            snapshot.gpr[reg::RCX] = value;
+            value
+        }
+    }
+}
+
+fn counter_branch_taken(inst: &Instruction, snapshot: &mut X86UcontextSnapshot) -> Option<bool> {
+    let kind = counter_branch_kind(inst.code())?;
+    Some(match kind {
+        CounterBranch::Zero(width) => counter_value(snapshot, width) == 0,
+        CounterBranch::Loop(width) => decrement_counter(snapshot, width) != 0,
+        CounterBranch::LoopEqual(width) => {
+            decrement_counter(snapshot, width) != 0 && snapshot.rflags & ZF != 0
+        }
+        CounterBranch::LoopNotEqual(width) => {
+            decrement_counter(snapshot, width) != 0 && snapshot.rflags & ZF == 0
+        }
+    })
+}
+
 fn condition_holds(code: ConditionCode, flags: u64) -> bool {
     let cf = flags & CF != 0;
     let pf = flags & PF != 0;
@@ -242,6 +328,37 @@ mod tests {
         assert_eq!(resolve(&[0x74, 0x05], VA, &mut s).unwrap(), taken_va);
         s.rflags &= !ZF;
         assert_eq!(resolve(&[0x74, 0x05], VA, &mut s).unwrap(), fall_va);
+    }
+
+    #[test]
+    fn counter_branches_use_and_update_rcx_without_changing_flags() {
+        let mut s = snap();
+        s.rflags = 0x202 | ZF;
+        let flags = s.rflags;
+
+        // e3 05  jrcxz +5: tests RCX directly and does not decrement it. GNU
+        // GMP's __gmpn_add_n uses this exact shape for limb counts below four;
+        // treating ConditionCode::None as false wrapped RCX and ran off-heap.
+        s.gpr[reg::RCX] = 0;
+        assert_eq!(resolve(&[0xe3, 0x05], VA, &mut s).unwrap(), VA + 7);
+        assert_eq!(s.gpr[reg::RCX], 0);
+        s.gpr[reg::RCX] = 1;
+        assert_eq!(resolve(&[0xe3, 0x05], VA, &mut s).unwrap(), VA + 2);
+        assert_eq!(s.gpr[reg::RCX], 1);
+
+        // e2 fe  loop -2: decrements RCX and branches while nonzero.
+        s.gpr[reg::RCX] = 2;
+        assert_eq!(resolve(&[0xe2, 0xfe], VA, &mut s).unwrap(), VA);
+        assert_eq!(s.gpr[reg::RCX], 1);
+        s.gpr[reg::RCX] = 1;
+        assert_eq!(resolve(&[0xe2, 0xfe], VA, &mut s).unwrap(), VA + 2);
+        assert_eq!(s.gpr[reg::RCX], 0);
+
+        // e1 fe  loope -2: also requires ZF, but preserves all flags.
+        s.gpr[reg::RCX] = 2;
+        assert_eq!(resolve(&[0xe1, 0xfe], VA, &mut s).unwrap(), VA);
+        assert_eq!(s.gpr[reg::RCX], 1);
+        assert_eq!(s.rflags, flags);
     }
 
     #[test]
