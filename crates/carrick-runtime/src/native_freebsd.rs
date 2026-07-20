@@ -254,10 +254,10 @@ fn identity_raw_range_valid(address: u64, length: usize) -> bool {
 mod identity_raw_range_tests {
     use super::{
         IDENTITY_PROTECTIONS, IdentityGuestMemory, PublishedFaultEntry, SharedWaitAssignment,
-        exclude_vfork_shared_ranges, freebsd_shared_waiter_key, identity_raw_range_valid,
-        init_shared_waiter_table, parse_loadable_elf, recover_x86_fault_snapshot,
-        shared_futex_requeue_umtx, shared_futex_wake_umtx, shared_waiter_slot,
-        take_shared_wait_assignment, wait_requeued_umtx,
+        calibrate_x86_vvar_clock, exclude_vfork_shared_ranges, freebsd_shared_waiter_key,
+        host_clock_ns, identity_raw_range_valid, init_shared_waiter_table, parse_loadable_elf,
+        recover_x86_fault_snapshot, shared_futex_requeue_umtx, shared_futex_wake_umtx,
+        shared_waiter_slot, take_shared_wait_assignment, tsc_ns, wait_requeued_umtx,
     };
     use carrick_guest_mem::GuestMemory;
     use std::os::fd::AsRawFd;
@@ -427,6 +427,25 @@ mod identity_raw_range_tests {
         );
         assert_eq!(snapshot.rip, 0x4010);
         assert_eq!(snapshot.gpr[carrick_dsr_x86::gateway::reg::RAX], 0x1234);
+    }
+
+    #[test]
+    fn calibrated_x86_vvar_tracks_host_clocks() {
+        let clock = calibrate_x86_vvar_clock().expect("FreeBSD amd64 TSC frequency");
+        let tsc = unsafe { std::arch::x86_64::_rdtsc() };
+        let counter_ns = tsc_ns(tsc, clock.frequency);
+        let vvar_realtime = counter_ns.wrapping_add(clock.realtime_off_ns);
+        let vvar_monotonic = counter_ns.wrapping_add(clock.monotonic_off_ns);
+        let host_realtime = host_clock_ns(libc::CLOCK_REALTIME).expect("host realtime");
+        let host_monotonic = host_clock_ns(libc::CLOCK_MONOTONIC).expect("host monotonic");
+        assert!(
+            vvar_realtime.abs_diff(host_realtime) < 50_000_000,
+            "vvar realtime calibration drifted: vvar={vvar_realtime}, host={host_realtime}"
+        );
+        assert!(
+            vvar_monotonic.abs_diff(host_monotonic) < 50_000_000,
+            "vvar monotonic calibration drifted: vvar={vvar_monotonic}, host={host_monotonic}"
+        );
     }
 
     #[test]
@@ -1385,6 +1404,85 @@ const GUEST_STACK_LEN: usize = 8 * 1024 * 1024;
 /// (see `run_static_x86_elf`).
 const CODE_CACHE_LEN: usize = 4 * 1024 * 1024;
 
+#[derive(Debug, Clone, Copy)]
+struct X86VvarClock {
+    frequency: u64,
+    realtime_off_ns: u64,
+    monotonic_off_ns: u64,
+}
+
+fn freebsd_tsc_frequency() -> Option<u64> {
+    let mut frequency = 0u64;
+    let mut len = std::mem::size_of::<u64>();
+    // SAFETY: the name is NUL-terminated; output points to a writable u64 and
+    // `len` advertises its exact size. FreeBSD exports this on amd64 when TSC
+    // is available, independently of the selected host timecounter.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            c"machdep.tsc_freq".as_ptr(),
+            (&mut frequency as *mut u64).cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (rc == 0 && len == std::mem::size_of::<u64>() && frequency != 0).then_some(frequency)
+}
+
+fn host_clock_ns(clock: libc::clockid_t) -> Option<u64> {
+    let mut value = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `value` is a valid output timespec.
+    (unsafe { libc::clock_gettime(clock, &mut value) } == 0).then(|| {
+        (value.tv_sec as u64)
+            .wrapping_mul(1_000_000_000)
+            .wrapping_add(value.tv_nsec as u64)
+    })
+}
+
+fn tsc_ns(tsc: u64, frequency: u64) -> u64 {
+    ((tsc as u128 * 1_000_000_000u128) / frequency as u128) as u64
+}
+
+fn tsc_clock_offset(clock: libc::clockid_t, frequency: u64) -> Option<u64> {
+    // Bracket clock_gettime with TSC reads and use their midpoint. This bounds
+    // calibration error to half the host call latency while retaining the exact
+    // frequency FreeBSD reports for this virtual/physical CPU.
+    let before = unsafe { std::arch::x86_64::_rdtsc() };
+    let clock_ns = host_clock_ns(clock)?;
+    let after = unsafe { std::arch::x86_64::_rdtsc() };
+    let midpoint = before.wrapping_add(after.wrapping_sub(before) / 2);
+    Some(clock_ns.wrapping_sub(tsc_ns(midpoint, frequency)))
+}
+
+fn calibrate_x86_vvar_clock() -> Option<X86VvarClock> {
+    let frequency = freebsd_tsc_frequency()?;
+    Some(X86VvarClock {
+        frequency,
+        realtime_off_ns: tsc_clock_offset(libc::CLOCK_REALTIME, frequency)?,
+        monotonic_off_ns: tsc_clock_offset(libc::CLOCK_MONOTONIC, frequency)?,
+    })
+}
+
+fn stamp_x86_vvar(vvar: *mut u8) -> Option<X86VvarClock> {
+    let clock = calibrate_x86_vvar_clock()?;
+    for (offset, value) in [
+        (crate::vdso::VVAR_OFF_FREQ, clock.frequency),
+        (crate::vdso::VVAR_OFF_REALTIME_OFF_NS, clock.realtime_off_ns),
+        (
+            crate::vdso::VVAR_OFF_MONOTONIC_OFF_NS,
+            clock.monotonic_off_ns,
+        ),
+    ] {
+        // SAFETY: the caller provides the freshly mapped writable vvar page;
+        // every published field is an aligned u64 wholly inside that page.
+        unsafe { vvar.add(offset).cast::<u64>().write(value) };
+    }
+    Some(clock)
+}
+
 fn map_prot(len: usize, prot: i32, fixed_at: Option<u64>) -> *mut u8 {
     let (addr, flags) = match fixed_at {
         Some(a) => (
@@ -1563,12 +1661,12 @@ fn load_static_pie(
 
     // Map the synthesized x86-64 vDSO so `getauxval(AT_SYSINFO_EHDR)` resolves
     // and `__vdso_clock_gettime`/`__vdso_gettimeofday`/`__vdso_time` resolve to
-    // real, callable stubs. The vvar page is left zeroed: with `VVAR_OFF_FREQ`
-    // == 0 the clock fast paths branch to the real x86-64 syscalls (which
-    // already work) BEFORE any `rdtsc`, so no TSC calibration or rdtsc lowering
-    // is needed — the symbols just need to resolve and call through. The vDSO
-    // code references the vvar at the fixed absolute `LINUX_VVAR_BASE`, so that
-    // page must be mapped there exactly; the ELF image itself is position-
+    // real, callable fast paths. Stamp FreeBSD's invariant-TSC frequency and
+    // calibrated realtime/monotonic offsets into the vvar page; if calibration
+    // is unavailable, its zero frequency deliberately selects the syscall
+    // fallback. The vDSO code references the vvar at the fixed absolute
+    // `LINUX_VVAR_BASE`, so that page must be mapped there exactly; the image is
+    // position-
     // independent and published to the guest via `AT_SYSINFO_EHDR`.
     let (vdso_base, vdso_len) = {
         let vvar_base = crate::vdso::LINUX_VVAR_BASE;
@@ -1586,11 +1684,12 @@ fn load_static_pie(
             Some(vdso_base),
         );
         if vvar as u64 == vvar_base && vdso as u64 == vdso_base {
-            // SAFETY: `vvar` is the freshly-mapped RW vvar page; zero its whole
-            // size so `VVAR_OFF_FREQ` reads 0 (syscall fallback).
+            // SAFETY: `vvar` is the freshly-mapped RW vvar page. Zeroing first
+            // keeps frequency=0 as the fail-safe syscall fallback.
             unsafe {
                 std::ptr::write_bytes(vvar as *mut u8, 0, crate::vdso::LINUX_VVAR_SIZE as usize)
             };
+            let _ = stamp_x86_vvar(vvar);
             // SAFETY: `vdso` is the freshly-mapped RW page(s); the image fits.
             unsafe {
                 std::ptr::copy_nonoverlapping(
