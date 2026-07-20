@@ -100,6 +100,15 @@ impl SyscallDispatcher {
         let value = memory
             .read_bytes(value_ptr.0, size)
             .map_err(|_| DispatchError::Errno(LINUX_EFAULT))?;
+        // VFS mounts do not yet expose an xattr operation. Do not fall through
+        // to the rootfs overlay: the mounted path is absent there, which
+        // misleadingly returned ENODATA ("attribute missing") for setxattr.
+        // EOPNOTSUPP is Linux's filesystem-does-not-support-this-namespace
+        // result and lets tools such as GNU install skip optional metadata while
+        // still applying the requested mode through fchmod.
+        if self.fs.vfs_mounts.resolve(&resolved).is_some() {
+            return Ok(DispatchOutcome::errno(LINUX_ENOTSUP));
+        }
         self.fs
             .rootfs_vfs
             .overlay

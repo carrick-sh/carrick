@@ -11823,6 +11823,36 @@ mod tests {
     }
 
     #[test]
+    fn bind_mount_setxattr_reports_unsupported_instead_of_missing() {
+        let host = tempfile::tempdir().unwrap();
+        std::fs::write(host.path().join("target"), b"payload").unwrap();
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.register_mount(
+            "/bind",
+            Box::new(crate::vfs::BindVfs::new("/bind", host.path(), false)),
+        );
+        let mut memory = LinearMemory::new(0x4000, vec![0; 0x400]);
+        memory.write_bytes(0x4000, b"/bind/target\0").unwrap();
+        memory.write_bytes(0x4100, b"security.test\0").unwrap();
+        memory.write_bytes(0x4200, b"x").unwrap();
+
+        let outcome = dispatcher
+            .setxattr(
+                &mut memory,
+                XattrTarget::Path {
+                    path: GuestPtr(0x4000),
+                    follow: true,
+                },
+                GuestPtr(0x4100),
+                GuestPtr(0x4200),
+                1,
+                0,
+            )
+            .unwrap();
+        assert_eq!(outcome, DispatchOutcome::errno(LINUX_ENOTSUP));
+    }
+
+    #[test]
     fn memory_file_open_does_not_duplicate_path_record_for_proc_fd() {
         reset_fd_open_path_inserts();
 
