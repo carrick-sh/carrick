@@ -242,6 +242,39 @@ pub(crate) fn parse_shebang(head: &[u8]) -> Option<(String, Option<String>)> {
     Some((interp, optarg))
 }
 
+fn flush_fork_child_fd(fd: libc::c_int, mut bytes: &[u8]) {
+    while !bytes.is_empty() {
+        // SAFETY: `bytes` is a live readable slice and `fd` is inherited from
+        // the parent. This path is terminal and performs no Rust allocation.
+        let written = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
+        if written > 0 {
+            bytes = &bytes[written as usize..];
+            continue;
+        }
+        if written == 0 {
+            return;
+        }
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        if errno == libc::EINTR {
+            continue;
+        }
+        if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
+            let mut pollfd = libc::pollfd {
+                fd,
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            // SAFETY: one valid pollfd; retry EINTR/EAGAIN through the loop.
+            if unsafe { libc::poll(&mut pollfd, 1, -1) } >= 0
+                || std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
+            {
+                continue;
+            }
+        }
+        return;
+    }
+}
+
 /// Called from a forked child when the guest hits `exit_group`. Flushes any
 /// buffered guest stdout/stderr to the host's fd 1/fd 2 (inherited from the
 /// parent process) and then calls `_exit(2)` to bypass Rust's normal Drop
@@ -283,10 +316,8 @@ pub(crate) fn forked_child_exit(
         (code & 0xff) << 8,
         adopted_parent.is_some(),
     );
-    let stdout_buf = stdout_buf.as_ref();
-    let stderr_buf = stderr_buf.as_ref();
-    let _ = unsafe { libc::write(1, stdout_buf.as_ptr() as *const _, stdout_buf.len()) };
-    let _ = unsafe { libc::write(2, stderr_buf.as_ptr() as *const _, stderr_buf.len()) };
+    flush_fork_child_fd(1, stdout_buf.as_ref());
+    flush_fork_child_fd(2, stderr_buf.as_ref());
     unsafe { libc::_exit(code) };
 }
 
@@ -364,10 +395,8 @@ pub(crate) fn forked_child_die_by_signal(
         signum & 0x7f,
         adopted_parent.is_some(),
     );
-    let stdout_buf = stdout_buf.as_ref();
-    let stderr_buf = stderr_buf.as_ref();
-    let _ = unsafe { libc::write(1, stdout_buf.as_ptr() as *const _, stdout_buf.len()) };
-    let _ = unsafe { libc::write(2, stderr_buf.as_ptr() as *const _, stderr_buf.len()) };
+    flush_fork_child_fd(1, stdout_buf.as_ref());
+    flush_fork_child_fd(2, stderr_buf.as_ref());
     stop_for_debug_signal(signum);
     let host_signum = crate::host_signal::linux_to_host_signum(signum);
     #[cfg(not(target_os = "linux"))]

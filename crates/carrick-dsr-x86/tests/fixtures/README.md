@@ -69,6 +69,16 @@ clang --target=x86_64-linux-gnu -DBUSY_SIBLING -nostdlib -static \
   exitgroup-sibling-futex.S
 ```
 
+`fork-child-sibling-exitgroup-output-x86_64-linux` covers the fork-child
+lifecycle path: a sibling publishes `exit_group` while the child's initial
+thread is parked, and 128 KiB of buffered output must survive terminal cleanup.
+
+```sh
+clang --target=x86_64-linux-gnu -nostdlib -static -Wl,--build-id=none \
+  -o fork-child-sibling-exitgroup-output-x86_64-linux \
+  fork-child-sibling-exitgroup-output.S
+```
+
 `identity-loop-x86_64-linux` executes 1,000 `getpid` and 1,000 `gettid`
 syscalls before `exit_group`. The native integration gate requires one Rust
 trap total, proving both identity calls remain inside the chained JIT path.
