@@ -3417,6 +3417,18 @@ fn run_x86_thread(
                     // guest reports exit=128+signum instead of the runner dying
                     // by the signal. Buffered output is drained either way.
                     Ok(false) => {
+                        crate::probes::native_x86_fault(
+                            fault_pc,
+                            ctx.fault.addr,
+                            snapshot.gpr[reg::RSP],
+                            snapshot.gpr[reg::RAX],
+                            snapshot.gpr[reg::RCX],
+                            snapshot.gpr[reg::RDX],
+                            snapshot.gpr[reg::RDI],
+                            snapshot.gpr[reg::RSI],
+                            snapshot.gpr[reg::R8],
+                            snapshot.rflags,
+                        );
                         if forked {
                             let message = format!(
                                 "native x86 fork child {} fatal signal {linux_sig} at \
@@ -3636,6 +3648,12 @@ fn run_x86_thread(
                                 }
                                 match load_static_pie(&bytes, interpreter.as_deref(), &argv, &env) {
                                     Ok(new_image) => {
+                                        crate::probes::execve_loaded(
+                                            &path,
+                                            new_image.entry,
+                                            new_image.rsp,
+                                            new_image.segments.len() as u64,
+                                        );
                                         reset_identity_vmas(&new_image);
                                         image = Arc::new(new_image);
                                         // Future clone threads must start from
@@ -4200,7 +4218,10 @@ fn service_syscall(
         // in the run loop (it owns the `LoadedImage` + JIT caches), so surface a
         // dedicated Step. `snapshot.rip` is the post-syscall resume the run loop
         // uses for the error path (a failed exec returns errno to the guest).
-        DispatchOutcome::Execve { path, argv, env } => Step::Execve { path, argv, env },
+        DispatchOutcome::Execve { path, argv, env } => {
+            crate::probes::execve_argv(&path, &argv);
+            Step::Execve { path, argv, env }
+        }
         other => Step::Fault(format!(
             "native x86 driver does not service dispatch outcome {other:?} yet \
              (vfork is a later rung)"
