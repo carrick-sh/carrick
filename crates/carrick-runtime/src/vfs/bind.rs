@@ -642,6 +642,14 @@ impl Vfs for BindVfs {
         std::fs::set_permissions(&host, std::fs::Permissions::from_mode(mode)).map_err(map_io_error)
     }
 
+    fn setxattr_unsupported_errno(&self) -> crate::linux_abi::LinuxErrno {
+        if self.readonly {
+            LINUX_EROFS
+        } else {
+            crate::linux_abi::LINUX_ENOTSUP
+        }
+    }
+
     fn create_socket(&self, path: &str, mode: u32) -> Result<(), VfsError> {
         if self.readonly {
             return Err(LINUX_EROFS);

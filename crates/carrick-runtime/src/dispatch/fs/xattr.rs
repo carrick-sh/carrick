@@ -76,6 +76,12 @@ impl SyscallDispatcher {
         let follow = target.follow();
         let resolved = self.xattr_target_path(memory, target)?;
         let name = read_guest_c_string(memory, name_ptr.0)?;
+        let flags = i32::try_from(flags).map_err(|_| DispatchError::Errno(LINUX_EINVAL))?;
+        let valid_flags =
+            crate::linux_abi::LINUX_XATTR_CREATE | crate::linux_abi::LINUX_XATTR_REPLACE;
+        if flags & !valid_flags != 0 || flags == valid_flags {
+            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+        }
         // Linux restricts the `user.*` namespace to regular files and
         // directories: setxattr(user.*) on a FIFO, char/block device, or socket
         // is EPERM (setxattr02). The path variant follows symlinks, so a symlink
@@ -83,20 +89,32 @@ impl SyscallDispatcher {
         // not EPERM). Device markers carry their S_IFCHR/S_IFBLK type bits in the
         // stored mode; a plain regular file reports `File` with no device bits.
         // Skipped when the backend can't report a type (e.g. `--fs memory`).
-        if name.starts_with("user.")
-            && let Some(real) = self.fs.rootfs_vfs.overlay.real_stat(&resolved, true)
-        {
-            let type_bits = real.mode & LINUX_S_IFMT;
-            let regular_or_dir = matches!(real.kind, RootFsEntryKind::Directory)
-                || (matches!(real.kind, RootFsEntryKind::File)
-                    && type_bits != LINUX_S_IFCHR
-                    && type_bits != LINUX_S_IFBLK);
-            if !regular_or_dir {
+        if name.starts_with("user.") {
+            let regular_or_dir = if let Some(mount) = self.fs.vfs_mounts.resolve(&resolved) {
+                mount.vfs.lookup(&mount.full_path).ok().map(|metadata| {
+                    matches!(
+                        metadata.kind,
+                        crate::vfs::EntryKind::File | crate::vfs::EntryKind::Directory
+                    )
+                })
+            } else {
+                self.fs
+                    .rootfs_vfs
+                    .overlay
+                    .real_stat(&resolved, true)
+                    .map(|real| {
+                        let type_bits = real.mode & LINUX_S_IFMT;
+                        matches!(real.kind, RootFsEntryKind::Directory)
+                            || (matches!(real.kind, RootFsEntryKind::File)
+                                && type_bits != LINUX_S_IFCHR
+                                && type_bits != LINUX_S_IFBLK)
+                    })
+            };
+            if regular_or_dir == Some(false) {
                 return Ok(DispatchOutcome::errno(LINUX_EPERM));
             }
         }
         let size = size as usize;
-        let flags = flags as i32;
         let value = memory
             .read_bytes(value_ptr.0, size)
             .map_err(|_| DispatchError::Errno(LINUX_EFAULT))?;
@@ -106,8 +124,10 @@ impl SyscallDispatcher {
         // EOPNOTSUPP is Linux's filesystem-does-not-support-this-namespace
         // result and lets tools such as GNU install skip optional metadata while
         // still applying the requested mode through fchmod.
-        if self.fs.vfs_mounts.resolve(&resolved).is_some() {
-            return Ok(DispatchOutcome::errno(LINUX_ENOTSUP));
+        if let Some(mount) = self.fs.vfs_mounts.resolve(&resolved) {
+            return Ok(DispatchOutcome::errno(
+                mount.vfs.setxattr_unsupported_errno(),
+            ));
         }
         self.fs
             .rootfs_vfs
