@@ -26,28 +26,27 @@
 //! then re-parses and dispatches the forwarded carrick command via
 //! [`crate::commands::run_cli`] as the unprivileged user.
 //!
-//! The whole module is `cfg(target_os = "macos")`: libdtrace is the only tracer,
-//! and it is macOS-only.
+//! The module is available on Darwin and FreeBSD, both of which ship libdtrace.
+//! Their process-control ABIs are normalized by `carrick-runtime`'s consumer.
 
-// Used only by the macOS-only (`cfg(target_os = "macos")`) tracer functions below
-// — the whole module is effectively macOS-only (libdtrace is the only tracer).
-#[cfg(target_os = "macos")]
+// Used only by the BSD-family libdtrace tracer functions below.
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
 use anyhow::{Context, bail};
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
 use crate::args::Cli;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
 use clap::Parser;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
 use std::ffi::{OsStr, OsString};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
 use std::path::Path;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
 use crate::trace_profile::TraceProfileKind;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
 pub(crate) struct TraceSudoInvocation<'a> {
     pub(crate) executable: &'a Path,
     pub(crate) flowindent: bool,
@@ -62,7 +61,7 @@ pub(crate) struct TraceSudoInvocation<'a> {
     pub(crate) command: &'a [String],
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
 pub(crate) fn trace_sudo_argv(invocation: &TraceSudoInvocation<'_>) -> Vec<OsString> {
     let mut argv = vec![
         invocation.executable.as_os_str().to_owned(),
@@ -114,7 +113,7 @@ pub(crate) fn trace_sudo_argv(invocation: &TraceSudoInvocation<'_>) -> Vec<OsStr
     argv
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
 pub(crate) fn current_supplementary_groups() -> Vec<u32> {
     let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
     if count <= 0 {
@@ -129,7 +128,7 @@ pub(crate) fn current_supplementary_groups() -> Vec<u32> {
     groups.into_iter().collect()
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
 pub(crate) fn trace_drop_credentials(
     trace_uid: Option<u32>,
     trace_gid: Option<u32>,
@@ -151,7 +150,7 @@ pub(crate) fn trace_drop_credentials(
     })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
 fn normalize_trace_groups(primary_gid: u32, groups: &[u32]) -> Vec<u32> {
     let mut normalized = if groups.is_empty() {
         vec![primary_gid]
@@ -164,7 +163,7 @@ fn normalize_trace_groups(primary_gid: u32, groups: &[u32]) -> Vec<u32> {
     normalized
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
 pub(crate) fn exec_trace_child(
     trace_uid: u32,
     trace_gid: u32,
@@ -194,7 +193,7 @@ pub(crate) fn exec_trace_child(
     crate::commands::run_cli(Cli::parse_from(argv))
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(all(test, any(target_os = "macos", target_os = "freebsd")))]
 mod tests {
     use super::*;
 

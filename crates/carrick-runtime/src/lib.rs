@@ -121,7 +121,7 @@ pub mod cred_ipc;
 pub(crate) mod darwin_fs;
 pub mod deadlock_watchdog;
 pub mod dispatch;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
 pub mod dtrace_consumer;
 pub mod event_mux;
 pub mod event_ring;

@@ -6,7 +6,7 @@
 //! `libdtrace`: it opens a handle, compiles a D program, spawns/grabs a victim
 //! process, and pumps a consume loop. carrick links `libdtrace` directly and
 //! *is* that client, in-process. The motivation is fidelity over a subprocess:
-//! carrick needs to follow a guest across `fork`/`clone` into real macOS child
+//! carrick needs to follow a guest across `fork`/`clone` into real host child
 //! processes (and sibling vCPU threads) that re-register their USDT probes, drop
 //! to the invoking user's credentials, and outlive their parent — control that
 //! is awkward-to-impossible to drive through a separate `dtrace(1)` you only talk
@@ -42,7 +42,7 @@
 //!
 //! ## Output sink + the sudo ownership trap
 //!
-//! Output defaults to the parent's `stdout` (`STDOUT_FP`, macOS's
+//! Output defaults to the parent's `stdout` (`STDOUT_FP`, the BSD-family
 //! `__stdoutp`). `--trace-out` redirects it to a file so trace lines never
 //! intermix with an interactive (`-t`) guest's own stdio. Because the libdtrace
 //! parent runs as root but the human invoked `carrick trace` under `sudo`, a
@@ -62,12 +62,12 @@
 //! With a caller-supplied script (`opts.script.is_some()`) we *linger*: the user
 //! is responsible for bounding their own program (the carrick-trace skill
 //! mandates a `tick-Ns { exit(0) }`), and we keep draining so that (a) a guest
-//! that forked real macOS children/sibling-vCPU threads is still traced after the
+//! that forked real host children/sibling-vCPU threads is still traced after the
 //! first process exits, and (b) a fast-crashing guest still flushes its buffered
 //! events and the final `END` aggregation. The outer `timeout` the CLI wraps
 //! every run in is the backstop.
 
-#![cfg(target_os = "macos")]
+#![cfg(any(target_os = "macos", target_os = "freebsd"))]
 
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_uint, c_void};
@@ -234,13 +234,23 @@ unsafe extern "C" {
         argv: *const *const c_char,
     ) -> *mut DtraceProg;
     fn dtrace_program_exec(hdl: *mut DtraceHdl, prog: *mut DtraceProg, info: *mut c_void) -> c_int;
+    #[cfg(target_os = "macos")]
     fn dtrace_proc_create(
         hdl: *mut DtraceHdl,
         file: *const c_char,
         argv: *const *const c_char,
     ) -> *mut PsProchandle;
+    #[cfg(target_os = "freebsd")]
+    fn dtrace_proc_create(
+        hdl: *mut DtraceHdl,
+        file: *const c_char,
+        argv: *const *const c_char,
+        child_callback: Option<extern "C" fn(*mut c_void)>,
+        child_arg: *mut c_void,
+    ) -> *mut PsProchandle;
     fn dtrace_proc_release(hdl: *mut DtraceHdl, proc: *mut PsProchandle);
     fn dtrace_proc_continue(hdl: *mut DtraceHdl, proc: *mut PsProchandle);
+    #[cfg(target_os = "macos")]
     fn dtrace_proc_state(hdl: *mut DtraceHdl, proc: *mut PsProchandle) -> c_int;
     fn dtrace_go(hdl: *mut DtraceHdl) -> c_int;
     fn dtrace_handle_drop(hdl: *mut DtraceHdl, callback: HandleDropFn, arg: *mut c_void) -> c_int;
@@ -261,7 +271,7 @@ unsafe extern "C" {
 #[repr(C)]
 struct libc_file(c_void);
 
-// macOS exposes `stdout` as a macro that resolves to `__stdoutp`.
+// Darwin and FreeBSD expose `stdout` as a macro resolving to `__stdoutp`.
 unsafe extern "C" {
     #[link_name = "__stdoutp"]
     static STDOUT_FP: *mut libc_file;
@@ -269,6 +279,12 @@ unsafe extern "C" {
     fn fopen(path: *const c_char, mode: *const c_char) -> *mut libc_file;
     fn fclose(stream: *mut libc_file) -> c_int;
     fn fileno(stream: *mut libc_file) -> c_int;
+}
+
+#[cfg(target_os = "freebsd")]
+#[link(name = "proc")]
+unsafe extern "C" {
+    fn proc_state(proc: *mut PsProchandle) -> c_int;
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -398,7 +414,11 @@ impl DtraceProcess {
         file: *const c_char,
         argv: *const *const c_char,
     ) -> Result<Self, DTraceError> {
+        #[cfg(target_os = "macos")]
         let proc_h = unsafe { dtrace_proc_create(hdl.as_ptr(), file, argv) };
+        #[cfg(target_os = "freebsd")]
+        let proc_h =
+            unsafe { dtrace_proc_create(hdl.as_ptr(), file, argv, None, std::ptr::null_mut()) };
         if proc_h.is_null() {
             Err(DTraceError::ProcCreate(hdl.errmsg()))
         } else {
@@ -587,7 +607,7 @@ pub fn run_child_under_dtrace(
 
     // When a custom D script is supplied, the user is responsible for bounding
     // it (the skill mandates a `tick-Ns { exit(0) }`), so we let it OUTLIVE the
-    // directly-spawned child: a guest `fork`/`clone` becomes a real macOS child
+    // directly-spawned child: a guest `fork`/`clone` becomes a real host child
     // (or sibling vCPU thread) that re-registers its probes and can outlive its
     // parent, and a fast-crashing guest still has buffered events plus a
     // `tick`/`END` aggregation to drain. We stop only when the script itself
@@ -605,8 +625,11 @@ pub fn run_child_under_dtrace(
         // live stream stays live even when the traced child never exits (e.g.
         // a deadlock we're trying to diagnose).
         unsafe { fflush(out.fp()) };
-        let proc_state = unsafe { dtrace_proc_state(hdl.as_ptr(), proc_h.as_ptr()) };
-        let child_terminal = proc_state == PS_DEAD || proc_state == PS_UNDEAD;
+        #[cfg(target_os = "macos")]
+        let child_state = unsafe { dtrace_proc_state(hdl.as_ptr(), proc_h.as_ptr()) };
+        #[cfg(target_os = "freebsd")]
+        let child_state = unsafe { proc_state(proc_h.as_ptr()) };
+        let child_terminal = child_state == PS_DEAD || child_state == PS_UNDEAD;
         if interrupted.load(Ordering::Acquire) {
             report.interrupted = true;
             break;
@@ -746,7 +769,7 @@ mod tests {
     }
 
     #[test]
-    fn macos_drop_ordinals_and_categories_are_pinned() {
+    fn bsd_dtrace_drop_ordinals_and_categories_are_pinned() {
         assert_eq!(DTRACEDROP_PRINCIPAL, 0);
         assert_eq!(DTRACEDROP_AGGREGATION, 1);
         assert_eq!(DTRACEDROP_DYNAMIC, 2);

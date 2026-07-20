@@ -63,7 +63,7 @@ impl TraceProfileKind {
         matches!(self, Self::Dsr | Self::DsrFork)
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
     pub(crate) fn bundled_script(self) -> &'static str {
         match self {
             Self::Dsr => carrick_runtime::dtrace_consumer::BUNDLED_DSR_PROFILE_D,
@@ -191,7 +191,7 @@ pub(crate) struct ProfileCaptureStatus {
     pub(crate) interrupted: bool,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
 impl From<carrick_runtime::dtrace_consumer::DTraceRunReport> for ProfileCaptureStatus {
     fn from(report: carrick_runtime::dtrace_consumer::DTraceRunReport) -> Self {
         Self {
