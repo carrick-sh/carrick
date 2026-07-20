@@ -317,12 +317,17 @@ impl SyscallDispatcher {
     pub(crate) fn identity_snapshot(&self) -> IdentitySnapshot {
         let c = self.cred_snapshot();
         IdentitySnapshot {
-            pid: crate::namespace::pid::self_ns_pid(),
+            pid: self.identity_pid(),
             uid: c.ruid,
             euid: c.euid,
             gid: c.rgid,
             egid: c.egid,
         }
+    }
+
+    /// Namespace-visible process identity without taking the credential lock.
+    pub(crate) fn identity_pid(&self) -> u32 {
+        crate::namespace::pid::self_ns_pid()
     }
 
     pub(super) fn getpid(&self) -> DispatchOutcome {

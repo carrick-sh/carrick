@@ -109,6 +109,51 @@ impl X86ExitStatus {
     }
 }
 
+/// Raw x86_64 syscall ordinals eligible for the immutable identity fast path.
+/// These are native x86 UAPI numbers read from live `%rax`, not Carrick's
+/// canonical asm-generic syscall numbers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum X86IdentitySyscall {
+    GetPid = 39,
+    GetTid = 186,
+}
+
+impl X86IdentitySyscall {
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
+
+    pub const fn from_static_x86_ordinal(raw: u32) -> Option<Self> {
+        match raw {
+            39 => Some(Self::GetPid),
+            186 => Some(Self::GetTid),
+            _ => None,
+        }
+    }
+}
+
+/// Per-thread identity values consumed directly by emitted code. This is a
+/// JIT/assembly wire structure; construction remains typed on the Rust side.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct X86IdentityStamp {
+    /// Host VA of an aligned `AtomicU32`: 1 enables, 0 forces dispatch.
+    pub live_gate: u64,
+    pub pid: u64,
+    pub tid: u64,
+}
+
+impl X86IdentityStamp {
+    pub const fn live(live_gate: u64, pid: u32, tid: u32) -> Self {
+        Self {
+            live_gate,
+            pid: pid as u64,
+            tid: tid as u64,
+        }
+    }
+}
+
 /// The gateway context. `#[repr(C, align(16))]` with a fixed field order; the
 /// `gateway_x86_64.S` `.equ` offsets mirror the `offset_of!` asserts below.
 #[repr(C, align(16))]
@@ -187,6 +232,9 @@ pub struct X86DsrContext {
     /// direct-patch path; the run loop currently consults only its
     /// nonzero-ness.
     pub chain_patch_site: u64,
+    /// Namespace identity stamped at each chainable Rust→JIT entry, plus a
+    /// live gate that closes when seccomp must observe these syscalls.
+    pub identity: X86IdentityStamp,
 }
 
 /// Byte offset of [`X86DsrContext::exit_resume`] — the guest VA the exit stub
@@ -214,6 +262,10 @@ pub const CTX_SAVE_FPU: i32 = 816;
 /// Byte offset of [`X86DsrContext::chain_patch_site`] — a chainable branch's
 /// cold stub writes the patch-site address here.
 pub const CTX_CHAIN_PATCH: i32 = 824;
+/// Byte offsets of the x86 identity fast-path wire fields.
+pub const CTX_IDENTITY_LIVE_GATE: i32 = 832;
+pub const CTX_IDENTITY_PID: i32 = 840;
+pub const CTX_IDENTITY_TID: i32 = 848;
 /// Byte offset of the virtualized guest `%r15` slot inside the snapshot
 /// (`gpr[15]`): the emitter's r15-rename loads/stores it directly.
 pub const SNAP_GUEST_R15: i32 = 120;
@@ -248,6 +300,7 @@ impl X86DsrContext {
             save_fpu: 1,
             save_fpu_pad: 0,
             chain_patch_site: 0,
+            identity: X86IdentityStamp::default(),
         }
     }
 }
@@ -281,6 +334,19 @@ const _: () = assert!(std::mem::offset_of!(X86DsrContext, fault) as u32 == CTX_F
 const _: () = assert!(std::mem::offset_of!(X86DsrContext, save_fpu) as i32 == CTX_SAVE_FPU);
 const _: () =
     assert!(std::mem::offset_of!(X86DsrContext, chain_patch_site) as i32 == CTX_CHAIN_PATCH);
+const _: () = assert!(
+    std::mem::offset_of!(X86DsrContext, identity)
+        + std::mem::offset_of!(X86IdentityStamp, live_gate)
+        == CTX_IDENTITY_LIVE_GATE as usize
+);
+const _: () = assert!(
+    std::mem::offset_of!(X86DsrContext, identity) + std::mem::offset_of!(X86IdentityStamp, pid)
+        == CTX_IDENTITY_PID as usize
+);
+const _: () = assert!(
+    std::mem::offset_of!(X86DsrContext, identity) + std::mem::offset_of!(X86IdentityStamp, tid)
+        == CTX_IDENTITY_TID as usize
+);
 const _: () = assert!(std::mem::offset_of!(X86DsrContext, exit_resume) as i32 == CTX_EXIT_RESUME);
 const _: () =
     assert!(std::mem::offset_of!(X86DsrContext, exit_syscall_addr) as i32 == CTX_EXIT_SYSCALL_ADDR);

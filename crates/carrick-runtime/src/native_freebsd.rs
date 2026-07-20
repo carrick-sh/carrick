@@ -33,7 +33,7 @@ use carrick_dsr_x86::block::{X86Block, X86Exit};
 use carrick_dsr_x86::decode::{X86InstClass, classify};
 use carrick_dsr_x86::gateway::{CTX_FAULT_RECORD, kick_stub_addr, reg, signal_stub_addr};
 use carrick_dsr_x86::{
-    X86DsrContext, X86ExitStatus, X86UcontextSnapshot, cflow,
+    X86DsrContext, X86ExitStatus, X86IdentityStamp, X86UcontextSnapshot, cflow,
     emit::{ScratchRestore, emit_block_linked},
     plan_block,
 };
@@ -3284,6 +3284,14 @@ fn run_x86_thread(
 
         let mut ctx = X86DsrContext::new(snapshot, exec, next);
         ctx.guest_fsbase = guest_fsbase;
+        if has_edges
+            && let Some(live_gate) = active.dispatcher.identity_fast_path_word()
+            && let Some(guest_tid) = crate::dispatch::guest_visible_tid(tid, &active.registry)
+        {
+            let live_gate = live_gate as *const std::sync::atomic::AtomicU32 as u64;
+            ctx.identity =
+                X86IdentityStamp::live(live_gate, active.dispatcher.identity_pid(), guest_tid);
+        }
         // A chainable block runs many blocks with live FPU state, so the
         // per-block skip is unsound across a chain — restore/save around any
         // chainable entry; keep the skip only for blocks that exit immediately.

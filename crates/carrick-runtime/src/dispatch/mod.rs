@@ -3240,6 +3240,19 @@ impl SyscallDispatcher {
             })
     }
 
+    /// Live gate consumed by native JIT contexts. The launch-time policy is
+    /// immutable once execution starts; guest seccomp transitions flip the
+    /// returned atomic word from 1 to 0 before publishing their filter.
+    pub(crate) fn identity_fast_path_word(&self) -> Option<&std::sync::atomic::AtomicU32> {
+        if self.container_policy.as_ref().is_some_and(|policy| {
+            policy.denies_any(crate::container_policy::IDENTITY_FAST_PATH_SYSCALLS)
+        }) {
+            None
+        } else {
+            Some(self.seccomp.identity_fast_path_word())
+        }
+    }
+
     // (see `watch_addr` below)
 
     /// Multi-threaded dispatch through a shared dispatcher reference. Handlers

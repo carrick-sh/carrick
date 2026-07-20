@@ -112,6 +112,38 @@ fn exit_group_asynchronously_kicks_a_sibling_spinning_in_jit_code() {
 }
 
 #[test]
+fn native_identity_syscalls_chain_without_rust_traps() {
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../carrick-dsr-x86/tests/fixtures/identity-loop-x86_64-linux"
+    );
+    let result = carrick_runtime::runtime::run_elf_native_dispatch(fixture.as_ref())
+        .expect("identity loop must run natively");
+
+    assert_eq!(result.exit_code, 0);
+    assert_eq!(
+        result.traps, 1,
+        "1000 getpid + 1000 gettid calls must stay in JIT; only exit_group traps"
+    );
+}
+
+#[test]
+fn native_identity_fast_path_disables_live_for_seccomp() {
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../carrick-dsr-x86/tests/fixtures/identity-seccomp-x86_64-linux"
+    );
+    let result = carrick_runtime::runtime::run_elf_native_dispatch(fixture.as_ref())
+        .expect("allow-all seccomp identity fixture must run");
+
+    assert_eq!(result.exit_code, 0);
+    assert_eq!(
+        result.traps, 23,
+        "prctl + seccomp + 20 identity calls + exit_group must all dispatch"
+    );
+}
+
+#[test]
 fn native_backend_runs_a_static_x86_elf_through_the_real_dispatcher() {
     let fixture = concat!(
         env!("CARGO_MANIFEST_DIR"),

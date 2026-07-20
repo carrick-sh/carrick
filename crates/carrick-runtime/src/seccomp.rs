@@ -69,6 +69,7 @@
 //! is exact; see the `tests` module for the canonical libseccomp shape.
 
 use parking_lot::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 // Linux AUDIT_ARCH for the guest. Filters compare seccomp_data.arch against
 // this; an aarch64 guest sees AUDIT_ARCH_AARCH64, an x86_64 guest
@@ -276,20 +277,43 @@ fn load_operand(ins: &SockFilter, data: &SeccompData) -> u32 {
 /// Per-process installed seccomp filters. Filters stack (each `seccomp` /
 /// `prctl(PR_SET_SECCOMP)` call adds one); a syscall is checked against all of
 /// them and the most restrictive action wins.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct SeccompState {
     filters: Mutex<Vec<Vec<SockFilter>>>,
     strict: Mutex<bool>,
+    /// Live JIT gate: 1 only while no guest-installed filter exists. Emitted
+    /// identity code reads this aligned atomic word directly with acquire-safe
+    /// x86 load semantics, so a sibling's seccomp install disables every active
+    /// context without waiting for a Rust gateway boundary.
+    identity_fast_path_allowed: AtomicU32,
+}
+
+impl Default for SeccompState {
+    fn default() -> Self {
+        Self {
+            filters: Mutex::new(Vec::new()),
+            strict: Mutex::new(false),
+            identity_fast_path_allowed: AtomicU32::new(1),
+        }
+    }
 }
 
 impl SeccompState {
     /// Install a parsed filter program (appended to the stack).
     pub(crate) fn install(&self, prog: Vec<SockFilter>) {
-        self.filters.lock().push(prog);
+        let mut filters = self.filters.lock();
+        self.identity_fast_path_allowed.store(0, Ordering::Release);
+        filters.push(prog);
     }
 
     pub(crate) fn install_strict(&self) {
-        *self.strict.lock() = true;
+        let mut strict = self.strict.lock();
+        self.identity_fast_path_allowed.store(0, Ordering::Release);
+        *strict = true;
+    }
+
+    pub(crate) fn identity_fast_path_word(&self) -> &AtomicU32 {
+        &self.identity_fast_path_allowed
     }
 
     pub(crate) fn is_active(&self) -> bool {
@@ -348,6 +372,14 @@ fn action_severity(action_word: u32) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn installing_a_filter_closes_the_live_identity_gate() {
+        let state = SeccompState::default();
+        assert_eq!(state.identity_fast_path_word().load(Ordering::Acquire), 1);
+        state.install(Vec::new());
+        assert_eq!(state.identity_fast_path_word().load(Ordering::Acquire), 0);
+    }
 
     /// Build the canonical "deny one syscall number with EPERM, allow the rest"
     /// filter libseccomp would emit:
