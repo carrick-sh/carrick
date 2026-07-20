@@ -3299,6 +3299,8 @@ pub const LINUX_WAIT4_SUPPORTED_FLAGS: u64 = LINUX_WNOHANG
 pub const LINUX_STATX_BASIC_STATS: u32 = 0x7ff;
 pub const LINUX_STATX_RESERVED: u64 = 0x8000_0000;
 pub const LINUX_IOV_MAX: usize = 1024;
+/// Linux's conventional maximum aggregate argv+env payload for `execve(2)`.
+pub const LINUX_ARG_MAX: usize = 2 * 1024 * 1024;
 pub const LINUX_OPEN_HOW_SIZE: u64 = core::mem::size_of::<LinuxOpenHow>() as u64;
 /// Linux AF_* values for the families we support. Linux constants happen
 /// to overlap with macOS's only for AF_UNSPEC / AF_UNIX / AF_INET — the

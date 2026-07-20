@@ -3374,6 +3374,7 @@ impl SyscallDispatcher {
             // regrtest's PYTHONREGRTEST_UNICODE_GUARD) doesn't EINVAL the execve.
             let argv = read_guest_string_array_bytes(memory, argv_addr.0)?;
             let env = read_guest_string_array_bytes(memory, envp_addr.0)?;
+            validate_exec_vector_size(&argv, &env)?;
 
             Ok(DispatchOutcome::Execve { path, argv, env })
         }
@@ -3420,6 +3421,7 @@ impl SyscallDispatcher {
             };
             let argv = read_guest_string_array_bytes(memory, argv_addr.0)?;
             let env = read_guest_string_array_bytes(memory, envp_addr.0)?;
+            validate_exec_vector_size(&argv, &env)?;
             Ok(DispatchOutcome::Execve { path, argv, env })
         }
 

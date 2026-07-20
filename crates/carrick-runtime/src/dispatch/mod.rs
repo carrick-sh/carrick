@@ -6030,6 +6030,42 @@ fn read_guest_string_array_bytes(
     Err(LINUX_E2BIG)
 }
 
+fn validate_exec_vector_size(argv: &[Vec<u8>], env: &[Vec<u8>]) -> Result<(), LinuxErrno> {
+    let pointer_bytes = argv
+        .len()
+        .checked_add(env.len())
+        .and_then(|count| count.checked_add(2))
+        .and_then(|count| count.checked_mul(std::mem::size_of::<u64>()))
+        .ok_or(LINUX_E2BIG)?;
+    let total = argv
+        .iter()
+        .chain(env)
+        .try_fold(pointer_bytes, |total, item| {
+            item.len()
+                .checked_add(1)
+                .and_then(|item_len| total.checked_add(item_len))
+        })
+        .ok_or(LINUX_E2BIG)?;
+    if total > crate::linux_abi::LINUX_ARG_MAX {
+        return Err(LINUX_E2BIG);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod exec_vector_tests {
+    use super::*;
+
+    #[test]
+    fn exec_vector_rejects_payload_beyond_linux_arg_max() {
+        let allowed = vec![vec![b'x'; crate::linux_abi::LINUX_ARG_MAX - 32]];
+        assert!(validate_exec_vector_size(&allowed, &[]).is_ok());
+
+        let oversized = vec![vec![b'x'; crate::linux_abi::LINUX_ARG_MAX]];
+        assert_eq!(validate_exec_vector_size(&oversized, &[]), Err(LINUX_E2BIG));
+    }
+}
+
 /// Adapter from the VFS-trait [`Metadata`](crate::vfs::Metadata) back to
 /// [`RootFsMetadata`] for the dispatcher's existing stat/statx
 /// writers, which still take the rootfs-shaped struct. Used by every

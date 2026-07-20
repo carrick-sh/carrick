@@ -27,6 +27,71 @@ pub enum CflowError {
     Unsupported { va: u64 },
 }
 
+/// Predecoded control-flow instruction. Hot indirect sites (especially `ret`)
+/// reuse this plan instead of rebuilding iced-x86's decoder tables on every
+/// gateway round-trip.
+#[derive(Clone, Debug)]
+pub struct ControlFlowPlan {
+    instruction: Instruction,
+    va: u64,
+    fallthrough: u64,
+}
+
+impl ControlFlowPlan {
+    pub fn decode(bytes: &[u8], va: u64) -> Result<Self, CflowError> {
+        let mut decoder = Decoder::with_ip(64, bytes, va, DecoderOptions::NONE);
+        let instruction = decoder.decode();
+        if instruction.is_invalid() {
+            return Err(CflowError::Undecodable { va });
+        }
+        Ok(Self {
+            fallthrough: va + instruction.len() as u64,
+            instruction,
+            va,
+        })
+    }
+
+    pub fn resolve(&self, snapshot: &mut X86UcontextSnapshot) -> Result<u64, CflowError> {
+        let inst = &self.instruction;
+        let va = self.va;
+        let fallthrough = self.fallthrough;
+        match inst.flow_control() {
+            FlowControl::UnconditionalBranch => rel_target(inst, va),
+            FlowControl::ConditionalBranch => {
+                if condition_holds(inst.condition_code(), snapshot.rflags) {
+                    rel_target(inst, va)
+                } else {
+                    Ok(fallthrough)
+                }
+            }
+            FlowControl::Call => {
+                let target = rel_target(inst, va)?;
+                push64(snapshot, fallthrough);
+                Ok(target)
+            }
+            FlowControl::IndirectBranch => indirect_target(inst, va, snapshot),
+            FlowControl::IndirectCall => {
+                // Read the target BEFORE the push (an rsp-based memory operand
+                // must see the pre-call rsp, exactly like hardware).
+                let target = indirect_target(inst, va, snapshot)?;
+                push64(snapshot, fallthrough);
+                Ok(target)
+            }
+            FlowControl::Return => {
+                let target = pop64(snapshot);
+                // `ret imm16` additionally releases the callee-popped argument
+                // bytes after the return address.
+                if inst.code() == Code::Retnq_imm16 {
+                    snapshot.gpr[reg::RSP] =
+                        snapshot.gpr[reg::RSP].wrapping_add(u64::from(inst.immediate16()));
+                }
+                Ok(target)
+            }
+            _ => Err(CflowError::Unsupported { va }),
+        }
+    }
+}
+
 /// Resolve the branch that terminates a block. `bytes` starts at the branch
 /// instruction, `va` is its guest VA. Returns the next guest VA to translate.
 /// For `call`/`ret`, mutates `snapshot.gpr[RSP]` and the guest stack.
@@ -35,48 +100,7 @@ pub fn resolve(
     va: u64,
     snapshot: &mut X86UcontextSnapshot,
 ) -> Result<u64, CflowError> {
-    let mut decoder = Decoder::with_ip(64, bytes, va, DecoderOptions::NONE);
-    let inst: Instruction = decoder.decode();
-    if inst.is_invalid() {
-        return Err(CflowError::Undecodable { va });
-    }
-    let len = inst.len() as u64;
-    let fallthrough = va + len;
-
-    match inst.flow_control() {
-        FlowControl::UnconditionalBranch => rel_target(&inst, va),
-        FlowControl::ConditionalBranch => {
-            if condition_holds(inst.condition_code(), snapshot.rflags) {
-                rel_target(&inst, va)
-            } else {
-                Ok(fallthrough)
-            }
-        }
-        FlowControl::Call => {
-            let target = rel_target(&inst, va)?;
-            push64(snapshot, fallthrough);
-            Ok(target)
-        }
-        FlowControl::IndirectBranch => indirect_target(&inst, va, snapshot),
-        FlowControl::IndirectCall => {
-            // Read the target BEFORE the push (an rsp-based memory operand
-            // must see the pre-call rsp, exactly like hardware).
-            let target = indirect_target(&inst, va, snapshot)?;
-            push64(snapshot, fallthrough);
-            Ok(target)
-        }
-        FlowControl::Return => {
-            let target = pop64(snapshot);
-            // `ret imm16` additionally releases the callee-popped argument
-            // bytes after the return address.
-            if inst.code() == Code::Retnq_imm16 {
-                snapshot.gpr[reg::RSP] =
-                    snapshot.gpr[reg::RSP].wrapping_add(u64::from(inst.immediate16()));
-            }
-            Ok(target)
-        }
-        _ => Err(CflowError::Unsupported { va }),
-    }
+    ControlFlowPlan::decode(bytes, va)?.resolve(snapshot)
 }
 
 /// Absolute target of a near rel8/rel32 branch.

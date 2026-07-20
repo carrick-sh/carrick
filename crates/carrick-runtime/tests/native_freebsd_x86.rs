@@ -95,6 +95,50 @@ fn immediate_child_exit_group_does_not_deadlock_clone_publication() {
 }
 
 #[test]
+fn native_fork_child_output_helper() {
+    if std::env::var_os("CARRICK_NATIVE_FORK_OUTPUT_HELPER").is_none() {
+        return;
+    }
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../carrick-dsr-x86/tests/fixtures/fork-child-sibling-exitgroup-output-x86_64-linux"
+    );
+    let result = carrick_runtime::runtime::run_elf_native_dispatch(fixture.as_ref())
+        .expect("fork child sibling exit_group must complete");
+    assert_eq!(result.exit_code, 0);
+}
+
+#[test]
+fn fork_child_sibling_exit_group_flushes_buffered_output() {
+    let output =
+        std::process::Command::new(std::env::current_exe().expect("integration test path"))
+            .args(["--exact", "native_fork_child_output_helper", "--nocapture"])
+            .env("CARRICK_NATIVE_FORK_OUTPUT_HELPER", "1")
+            .output()
+            .expect("launch isolated stdout-capturing helper");
+
+    assert!(
+        output.status.success(),
+        "helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let marker = b"fork-child-output\n";
+    assert!(
+        output
+            .stdout
+            .windows(marker.len())
+            .any(|window| window == marker),
+        "fork child output was lost: {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(
+        output.stdout.iter().filter(|&&byte| byte == 0).count(),
+        131_072,
+        "fork child output was truncated by a partial host write"
+    );
+}
+
+#[test]
 fn exit_group_asynchronously_kicks_a_sibling_spinning_in_jit_code() {
     let fixture = concat!(
         env!("CARGO_MANIFEST_DIR"),

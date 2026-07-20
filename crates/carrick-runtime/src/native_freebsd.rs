@@ -1730,7 +1730,6 @@ fn load_static_pie(
 
     let rsp = build_initial_stack(
         stack as u64 + GUEST_STACK_LEN as u64,
-        scratch as u64,
         argv,
         env,
         &elf,
@@ -1738,14 +1737,13 @@ fn load_static_pie(
         main.entry,
         interpreter.as_ref().map_or(0, |image| image.bias),
         vdso_base,
-    );
+    )?;
 
     // The rt_sigreturn trampoline: when a guest signal handler was registered
     // WITHOUT an explicit sa_restorer (Linux falls back to the kernel VDSO
     // `__kernel_rt_sigreturn`), the sigframe's pretcode points here so the
     // handler's `ret` lands on `mov $15, %eax; syscall` (rt_sigreturn). Placed
-    // in the scratch page's tail (argv data lives at its head) and published as
-    // a translatable code segment.
+    // in the scratch page and published as a translatable code segment.
     const SIGRETURN_STUB: [u8; 7] = [0xB8, 0x0F, 0x00, 0x00, 0x00, 0x0F, 0x05];
     let sigreturn_trampoline = scratch as u64 + PAGE - SIGRETURN_STUB.len() as u64;
     // SAFETY: writing into the mapped RW scratch page's tail.
@@ -1759,8 +1757,8 @@ fn load_static_pie(
     // Publish the whole scratch page as a translatable segment so the block
     // planner can read the trampoline bytes.
     segments.push((scratch as u64, scratch as u64 + PAGE));
-    // argv strings and AT_RANDOM remain writable, while the tail hosts the
-    // translated rt_sigreturn stub: Linux page granularity makes this RWX.
+    // The page hosts the translated rt_sigreturn stub. It remains RWX for the
+    // existing native signal-frame/trampoline contract.
     segment_protections.push((
         scratch as u64,
         scratch as u64 + PAGE,
@@ -1915,12 +1913,12 @@ fn load_execve_image(
 
 /// Build the Linux x86_64 initial stack:
 /// `[argc][argv..][NULL][envp..][NULL][auxv..][AT_NULL]`, with argv/env byte
-/// strings and a 16-byte AT_RANDOM block in the scratch page. Returns the guest
+/// strings and a 16-byte AT_RANDOM block in the mapped stack. Returns the guest
 /// rsp (argc), 16-aligned. argv/env are opaque Linux-ABI byte strings (a guest
-/// execve may pass non-UTF-8 args/env), NUL-terminated in the scratch page.
+/// execve may pass non-UTF-8 args/env). Keeping them on the 8 MiB stack avoids
+/// the former one-page scratch overflow on ordinary autotools command lines.
 fn build_initial_stack(
     stack_top: u64,
-    scratch: u64,
     argv: &[Vec<u8>],
     env: &[Vec<u8>],
     elf: &Elf,
@@ -1928,7 +1926,7 @@ fn build_initial_stack(
     main_entry: u64,
     interpreter_base: u64,
     vdso_base: u64,
-) -> u64 {
+) -> Result<u64, RuntimeError> {
     const AT_NULL: u64 = 0;
     const AT_PHDR: u64 = 3;
     const AT_PHENT: u64 = 4;
@@ -1939,38 +1937,58 @@ fn build_initial_stack(
     const AT_SYSINFO_EHDR: u64 = 33;
     const AT_RANDOM: u64 = 25;
 
-    // Lay argv strings + AT_RANDOM into the scratch page.
-    let mut cur = scratch;
-    let random_ptr = cur;
-    // 16 pseudo-random bytes (fixed here; a later rung seeds from the host).
-    // SAFETY: scratch is a mapped RW page with room for these small writes.
-    unsafe {
-        std::ptr::write_bytes(random_ptr as *mut u8, 0x5a, 16);
-    }
-    cur += 16;
-    // Lay argv, then env, byte strings (NUL-terminated) into the scratch page.
-    let mut place = |bytes: &[u8]| -> u64 {
-        let at = cur;
-        // SAFETY: within the scratch page (argv/env for a probe is tiny).
+    let stack_bottom = stack_top
+        .checked_sub(GUEST_STACK_LEN as u64)
+        .ok_or_else(|| RuntimeError::Unsupported("native x86 initial stack underflow".into()))?;
+    let mut cur = stack_top;
+    let mut place = |bytes: &[u8]| -> Result<u64, RuntimeError> {
+        let len = u64::try_from(bytes.len())
+            .ok()
+            .and_then(|len| len.checked_add(1))
+            .ok_or_else(|| {
+                RuntimeError::Unsupported("native x86 exec arguments too large".into())
+            })?;
+        cur = cur
+            .checked_sub(len)
+            .filter(|at| *at >= stack_bottom)
+            .ok_or_else(|| {
+                RuntimeError::Unsupported("native x86 exec arguments exceed stack".into())
+            })?;
+        // SAFETY: the checked range lies inside the mapped guest stack.
         unsafe {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), at as *mut u8, bytes.len());
-            *((at + bytes.len() as u64) as *mut u8) = 0;
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), cur as *mut u8, bytes.len());
+            *((cur + len - 1) as *mut u8) = 0;
         }
-        cur += bytes.len() as u64 + 1;
-        at
+        Ok(cur)
     };
-    let arg_ptrs: Vec<u64> = argv.iter().map(|a| place(a)).collect();
-    let env_ptrs: Vec<u64> = env.iter().map(|e| place(e)).collect();
+    let mut arg_ptrs = Vec::with_capacity(argv.len());
+    for arg in argv {
+        arg_ptrs.push(place(arg)?);
+    }
+    let mut env_ptrs = Vec::with_capacity(env.len());
+    for variable in env {
+        env_ptrs.push(place(variable)?);
+    }
 
-    // Build the stack image bottom-up as a word vector, then place it so argc
-    // lands 16-aligned.
+    // Keep AT_RANDOM naturally aligned below the strings.
+    cur &= !0xf;
+    cur = cur
+        .checked_sub(16)
+        .filter(|at| *at >= stack_bottom)
+        .ok_or_else(|| {
+            RuntimeError::Unsupported("native x86 exec arguments exceed stack".into())
+        })?;
+    let random_ptr = cur;
+    // SAFETY: the checked range lies inside the mapped guest stack.
+    unsafe { std::ptr::write_bytes(random_ptr as *mut u8, 0x5a, 16) };
+
+    // Build the pointer/auxv image and place it below all strings.
     let mut words: Vec<u64> = Vec::new();
     words.push(argv.len() as u64); // argc
     words.extend(arg_ptrs.iter().copied()); // argv[]
     words.push(0); // argv NULL
     words.extend(env_ptrs.iter().copied()); // envp[]
     words.push(0); // envp NULL
-    // auxv pairs
     let mut auxv: Vec<(u64, u64)> = vec![
         (AT_PHDR, phdr_va),
         (AT_PHENT, elf.header.e_phentsize as u64),
@@ -1994,14 +2012,21 @@ fn build_initial_stack(
         words.push(v);
     }
 
-    let bytes = (words.len() * 8) as u64;
+    let bytes = u64::try_from(words.len())
+        .ok()
+        .and_then(|len| len.checked_mul(8))
+        .ok_or_else(|| RuntimeError::Unsupported("native x86 exec vector too large".into()))?;
     // 16-align argc; the ABI wants (rsp) 16-aligned at _start.
-    let rsp = (stack_top - bytes) & !0xf;
+    let rsp = cur
+        .checked_sub(bytes)
+        .map(|value| value & !0xf)
+        .filter(|at| *at >= stack_bottom)
+        .ok_or_else(|| RuntimeError::Unsupported("native x86 exec vector exceeds stack".into()))?;
     for (i, w) in words.iter().enumerate() {
-        // SAFETY: within the guest stack mapping.
+        // SAFETY: the checked vector lies inside the mapped guest stack.
         unsafe { ((rsp + (i as u64) * 8) as *mut u64).write(*w) };
     }
-    rsp
+    Ok(rsp)
 }
 
 /// How a guest thread's per-thread run loop is seeded.
@@ -3056,6 +3081,11 @@ fn run_x86_thread(
     // chainable direct branch; `uses_fpu` drives the FPU save/restore skip.
     let mut cache: std::collections::HashMap<u64, (u64, bool, bool), VaBuildHasher> =
         std::collections::HashMap::default();
+    // Predecoded plans for genuine indirect exits. Perl/m4 execute millions of
+    // returns; decoding the same `ret` with iced-x86 on every trip dominated
+    // their runtime even though the translated block itself was cached.
+    let mut cflow_plans: std::collections::HashMap<u64, cflow::ControlFlowPlan, VaBuildHasher> =
+        std::collections::HashMap::default();
     // Chain edges awaiting their target's translation: `target_va -> [(rel32
     // patch address, next-instruction address)]`. When `target_va` is
     // translated, every waiting slot is patched to jump straight to it.
@@ -3076,13 +3106,16 @@ fn run_x86_thread(
         // last thread's `exit(2)`): stop this thread's loop and surface the
         // recorded code. The initial thread turns this into the `RunResult`;
         // a sibling thread just ends (its closure re-requests idempotently). A
-        // fork descendant `_exit`s directly so the parent's wait4 reaps it.
+        // fork descendant exits through the same lifecycle helper as a direct
+        // syscall path, preserving buffered output and orphan publication.
         if active.exit.requested() {
             let code = active.exit.code().unwrap_or(0);
             if forked {
-                // SAFETY: _exit performs no unwinding; the child's COW mappings
-                // are released by the kernel.
-                unsafe { libc::_exit(code) };
+                crate::exec_helpers::forked_child_exit(
+                    code,
+                    active.dispatcher.stdout(),
+                    active.dispatcher.stderr(),
+                );
             }
             return ThreadRunOutcome::Exit { code, traps };
         }
@@ -3100,6 +3133,7 @@ fn run_x86_thread(
             IDENTITY_CODE_GENERATION.load(std::sync::atomic::Ordering::Acquire);
         if current_generation != code_generation {
             cache.clear();
+            cflow_plans.clear();
             pending.clear();
             fault_entries.clear();
             code_generation = current_generation;
@@ -3202,6 +3236,18 @@ fn run_x86_thread(
                 break;
             }
             let body = read_block(&block);
+            let control_flow_plan = match block.exit {
+                X86Exit::ControlFlow { va, .. } => {
+                    match cflow::ControlFlowPlan::decode(&code_bytes(va), va) {
+                        Ok(plan) => Some((va, plan)),
+                        Err(error) => {
+                            fault_detail = Some(format!("cflow plan at 0x{va:x}: {error}"));
+                            break;
+                        }
+                    }
+                }
+                _ => None,
+            };
             let linked = match emit_block_linked(&body, &block) {
                 Ok(t) => t,
                 Err(e) => {
@@ -3232,6 +3278,7 @@ fn run_x86_thread(
                 // and translating `next` at the slice base is safe.
                 cursor = cursor_limit - slice_len;
                 cache.clear();
+                cflow_plans.clear();
                 pending.clear();
                 fault_entries.clear();
             }
@@ -3259,6 +3306,9 @@ fn run_x86_thread(
             cursor += linked.bytes.len();
             let entry = (exec_u64, !linked.edges.is_empty(), block.uses_fpu);
             cache.insert(next, entry);
+            if let Some((va, plan)) = control_flow_plan {
+                cflow_plans.insert(va, plan);
+            }
             // Register this block's outgoing edges; patch any whose target is
             // already translated (a self-edge sees this block, now cached).
             for edge in &linked.edges {
@@ -3455,6 +3505,7 @@ fn run_x86_thread(
                                 cursor = 0;
                                 cursor_limit = JIT_SLICE_LEN;
                                 cache.clear();
+                                cflow_plans.clear();
                                 pending.clear();
                                 fault_entries.clear();
                                 // POSIX fork-child resets on the (shared)
@@ -3620,6 +3671,7 @@ fn run_x86_thread(
                                 // would be wrong) — the old blocks become dead
                                 // space, harmless for the probe's single exec.
                                 cache.clear();
+                                cflow_plans.clear();
                                 pending.clear();
                                 fault_entries.clear();
                                 guest_fsbase = 0;
@@ -3642,11 +3694,14 @@ fn run_x86_thread(
                     // when the target is translated (this iteration or later).
                     next = snapshot.rip;
                 } else {
-                    // Genuine indirect branch (call/ret/jmp r/m): re-decode it
-                    // at the self-set resume VA and resolve from the snapshot.
+                    // Genuine indirect branch (call/ret/jmp r/m): reuse the
+                    // plan decoded when its translated block was published.
                     let va = snapshot.rip;
-                    let branch = code_bytes(va);
-                    match cflow::resolve(&branch, va, &mut snapshot) {
+                    let Some(plan) = cflow_plans.get(&va) else {
+                        fault_detail = Some(format!("missing cflow plan at 0x{va:x}"));
+                        break;
+                    };
+                    match plan.resolve(&mut snapshot) {
                         Ok(t) => next = t,
                         Err(e) => {
                             fault_detail = Some(format!("cflow resolve at 0x{va:x}: {e}"));
@@ -5581,5 +5636,41 @@ fn service_sensitive(
         SegmentBase { .. } | SegmentPrefixed { .. } | Syscall | Int80 => Err(format!(
             "native x86 first-rung driver does not service sensitive {kind:?} yet"
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn initial_stack_keeps_large_exec_vectors_inside_the_stack_mapping() {
+        let bytes =
+            include_bytes!("../../carrick-dsr-x86/tests/fixtures/identity-loop-x86_64-linux");
+        let elf = Elf::parse(bytes).unwrap();
+        let mut stack = vec![0_u8; GUEST_STACK_LEN];
+        let stack_bottom = stack.as_mut_ptr() as u64;
+        let stack_top = stack_bottom + stack.len() as u64;
+        let argv: Vec<Vec<u8>> = (0..160)
+            .map(|index| format!("argument-{index:03}-{}", "x".repeat(40)).into_bytes())
+            .collect();
+        let env = vec![b"PATH=/bin:/usr/bin".to_vec()];
+
+        let rsp =
+            build_initial_stack(stack_top, &argv, &env, &elf, 0x400040, 0x401000, 0, 0).unwrap();
+
+        assert!(rsp >= stack_bottom);
+        assert!(rsp < stack_top);
+        // SAFETY: `rsp` and the vector slots were written into `stack` above.
+        assert_eq!(unsafe { *(rsp as *const u64) }, argv.len() as u64);
+        for (index, expected) in argv.iter().enumerate() {
+            // SAFETY: each argv slot is within the checked stack vector.
+            let ptr = unsafe { *((rsp + 8 + index as u64 * 8) as *const u64) };
+            assert!((stack_bottom..stack_top).contains(&ptr));
+            // SAFETY: every pointed-to argument was copied into `stack` with a
+            // trailing NUL; `expected.len()` remains within that allocation.
+            let actual = unsafe { std::slice::from_raw_parts(ptr as *const u8, expected.len()) };
+            assert_eq!(actual, expected);
+        }
     }
 }
