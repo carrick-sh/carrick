@@ -612,6 +612,14 @@ mod real {
         /// means the base held 0x11=17. Lets a trace see the faulting access
         /// WITHOUT an eprintln rebuild. Fires only at the fault.
         fn vcpu__fault__regs(_: u64, _: u64, _: u64, _: u64, _: u32, _: u64) {}
+        /// Native x86 synchronous guest fault captured before fatal-signal
+        /// teardown. Args: host pid, guest PC, fault VA, RSP, RCX, RFLAGS.
+        /// Scalars remain readable after an immediately exiting fork child.
+        fn native__x86__fault(_: u32, _: u64, _: u64, _: u64, _: u64, _: u64) {}
+        /// Companion register payload for `native__x86__fault`. Args: host pid,
+        /// RAX, RDX, RDI, RSI, R8. Split because the USDT backend supports six
+        /// arguments per probe.
+        fn native__x86__fault__regs(_: u32, _: u64, _: u64, _: u64, _: u64, _: u64) {}
         /// Fires from `map_host_alias` (the post-boot high-VA hv_vm_map path) with
         /// the MANAGER's L0..L3 stage-1 descriptors for the alias VA + whether this
         /// is a forked child and whether the page-table build succeeded (rc: 0 ok,
@@ -1659,6 +1667,24 @@ mod real {
     /// that kills the process before DTrace's action runs. Fires only at the fault.
     pub fn vcpu_fault_regs(esr: u64, elr: u64, far: u64, insn: u64, rn: u32, xrn: u64) {
         carrick_usdt::vcpu__fault__regs!(|| (esr, elr, far, insn, rn, xrn));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn native_x86_fault(
+        pc: u64,
+        fault_address: u64,
+        rsp: u64,
+        rax: u64,
+        rcx: u64,
+        rdx: u64,
+        rdi: u64,
+        rsi: u64,
+        r8: u64,
+        rflags: u64,
+    ) {
+        let pid = std::process::id();
+        carrick_usdt::native__x86__fault!(|| (pid, pc, fault_address, rsp, rcx, rflags));
+        carrick_usdt::native__x86__fault__regs!(|| (pid, rax, rdx, rdi, rsi, r8));
     }
 
     /// Emit a high-VA alias page-table walk. See `pt__alias__walk`. `flag` bit0 =
