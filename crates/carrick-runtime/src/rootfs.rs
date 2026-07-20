@@ -346,6 +346,21 @@ fn apply_tar_to_dir<R: Read>(
                 .ok_or_else(|| RootFsError::UnsafePath(path.display().to_string()))?
                 .into_owned();
             let target = normalize_layer_path(&link_name)?;
+            if target == path {
+                return Err(RootFsError::UnsafePath(path.display().to_string()));
+            }
+            // A new-layer hardlink replaces the path from lower layers. Remove
+            // that destination before linking: falling back to `create(path)`
+            // while it is already a hardlink to `target` truncates BOTH names.
+            match dir.remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(_) => match dir.remove_dir_all(&path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                },
+            }
             match dir.hard_link(&target, dir, &path) {
                 Ok(()) => {}
                 Err(_) => {
@@ -1002,6 +1017,55 @@ mod tests {
             .read("/lib/ld-linux-aarch64.so.1")
             .expect("walk parent symlink");
         assert_eq!(bytes, b"FAKE-LD");
+    }
+
+    #[test]
+    fn later_layer_hardlink_replaces_existing_alias_without_truncating_target() {
+        use cap_std::ambient_authority;
+        use tar::{Builder, EntryType, Header};
+
+        fn hardlink_layer(include_target: bool) -> Vec<u8> {
+            let mut bytes = Vec::new();
+            {
+                let mut builder = Builder::new(&mut bytes);
+                if include_target {
+                    let body: &[u8] = b"ELF-perl-interpreter";
+                    let mut header = Header::new_gnu();
+                    header.set_path("usr/bin/perl").unwrap();
+                    header.set_size(body.len() as u64);
+                    header.set_mode(0o755);
+                    header.set_cksum();
+                    builder.append(&header, body).unwrap();
+                }
+                let mut header = Header::new_gnu();
+                header.set_path("usr/bin/perl5.38.2").unwrap();
+                header.set_entry_type(EntryType::Link);
+                header.set_size(0);
+                header.set_mode(0o755);
+                header.set_link_name("/usr/bin/perl").unwrap();
+                header.set_cksum();
+                builder.append(&header, std::io::empty()).unwrap();
+                builder.finish().unwrap();
+            }
+            bytes
+        }
+
+        let scratch = tempfile::tempdir().unwrap();
+        let dir = cap_std::fs::Dir::open_ambient_dir(scratch.path(), ambient_authority()).unwrap();
+        let mut stats = ExtractStats::default();
+        let mut base = tar::Archive::new(std::io::Cursor::new(hardlink_layer(true)));
+        apply_tar_to_dir(&mut base, &dir, &mut stats).unwrap();
+        let mut update = tar::Archive::new(std::io::Cursor::new(hardlink_layer(false)));
+        apply_tar_to_dir(&mut update, &dir, &mut stats).unwrap();
+
+        assert_eq!(
+            std::fs::read(scratch.path().join("usr/bin/perl")).unwrap(),
+            b"ELF-perl-interpreter"
+        );
+        assert_eq!(
+            std::fs::read(scratch.path().join("usr/bin/perl5.38.2")).unwrap(),
+            b"ELF-perl-interpreter"
+        );
     }
 
     #[test]
