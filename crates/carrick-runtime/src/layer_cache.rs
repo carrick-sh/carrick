@@ -30,6 +30,9 @@ use sha2::{Digest, Sha256};
 /// Name of the persistent cache directory, placed beside the per-run scratch
 /// dirs under the scratch root (same volume, which `clonefile` requires).
 const CACHE_DIR: &str = ".carrick-layer-cache";
+/// Bump whenever composed extraction semantics change. Digest-only keys would
+/// otherwise keep serving trees materialized by an older, buggy extractor.
+const CACHE_FORMAT_VERSION: &[u8] = b"v2-hardlink-replacement";
 
 /// Try to seed `scratch` (an existing, empty per-run dir) from the clonefile
 /// cache for `layer_paths`. Returns `Ok(true)` when the scratch was populated
@@ -132,6 +135,8 @@ fn mount_overlay(lower: &Path, upper: &Path, work: &Path, merged: &Path) -> std:
 /// folding in the length is belt-and-suspenders against a truncated blob.
 fn stack_key(layer_paths: &[PathBuf]) -> std::io::Result<String> {
     let mut hasher = Sha256::new();
+    hasher.update(CACHE_FORMAT_VERSION);
+    hasher.update(b"\0");
     for path in layer_paths {
         let name = path
             .file_name()
