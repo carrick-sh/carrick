@@ -907,12 +907,12 @@ pub(super) enum OpenDescription {
         /// fork-coherent FASYNC (signal-driven I/O) join key: arming the read
         /// end stores `pipe_id` in the shared registry, and a write-end write in
         /// any process looks the SAME `pipe_id` up to deliver the I/O signal.
-        /// Keyed by pipe id rather than the per-fd host inode because macOS
-        /// gives a pipe's two ends DIFFERENT `st_ino` (Linux shares one), so an
-        /// inode key armed on the read end would never match the write-end
-        /// trigger. Assigned at pipe creation from the host inode of one end
-        /// (globally unique, and fixed before any fork). `0` for ends with no
-        /// real pipe object to share (e.g. a duped stdio grab).
+        /// Keyed by pipe id rather than the per-fd host inode because BSD gives
+        /// a pipe's two ends DIFFERENT `st_ino` (Linux shares one), so an inode
+        /// key armed on the read end would never match the write-end trigger.
+        /// Assigned at pipe creation from a stable hash of one end's host
+        /// `(st_dev, st_ino)` and fixed before any fork. `0` only when the host
+        /// descriptor could not be statted.
         pipe_id: u64,
         /// `Some` iff this fd is a pty master/slave end. Data I/O is
         /// identical to a plain host pipe; this only changes ioctl
@@ -1159,9 +1159,11 @@ impl OpenDescription {
             }
             // An anonymous pipe end (no recorded /dev path); a chardev like
             // /dev/null carries its path in fd_open_paths and is resolved earlier.
-            OpenDescription::HostPipe { .. }
-            | OpenDescription::PipeReader { .. }
-            | OpenDescription::PipeWriter { .. } => {
+            OpenDescription::HostPipe { pipe_id, .. } => {
+                let stat_label = host_stream_stat_label(*pipe_id, LINUX_S_IFIFO);
+                format!("pipe:[{}]", inode_for_path(Path::new(&stat_label)))
+            }
+            OpenDescription::PipeReader { .. } | OpenDescription::PipeWriter { .. } => {
                 format!("pipe:[{}]", inode_for_path(Path::new("pipe:[carrick]")))
             }
             OpenDescription::HostSocket { .. } | OpenDescription::Netlink { .. } => {
@@ -1289,6 +1291,10 @@ impl StatRecord {
     }
 }
 
+pub(super) fn host_stream_stat_label(identity: u64, linux_type: u32) -> String {
+    format!("host-stream:{identity}:{linux_type}")
+}
+
 #[derive(Debug, Clone)]
 pub(super) enum OpenStatSource {
     Record(StatRecord),
@@ -1327,7 +1333,10 @@ pub(super) enum OpenStatSource {
         /// Borrowed Copy VIEW of the description's owned fd (see
         /// [`OpenStatSource::HostFile::host_fd`]).
         host_fd: HostFd,
-        label: String,
+        /// Stable identity shared by every guest fd for the same stream. For
+        /// pipes this is the common `pipe_id`, rather than the host inode,
+        /// because BSD assigns different inodes to the two pipe ends.
+        identity: u64,
         fallback_mode: u32,
     },
 }
@@ -1493,7 +1502,12 @@ impl OpenDescription {
                     LINUX_S_IFIFO | 0o600,
                 ))
             }
-            OpenDescription::HostPipe { pty, host_fd, .. } => {
+            OpenDescription::HostPipe {
+                pty,
+                host_fd,
+                pipe_id,
+                ..
+            } => {
                 if let Some(role) = pty {
                     // A pty SLAVE reports its /dev/pts/N path so its st_ino
                     // matches stat("/dev/pts/N"): glibc's ttyname_r readlinks
@@ -1518,7 +1532,7 @@ impl OpenDescription {
                     // Linux file type instead of always claiming S_IFIFO.
                     OpenStatSource::HostStream {
                         host_fd: host_fd.view(),
-                        label: "pipe:[carrick]".to_string(),
+                        identity: *pipe_id,
                         fallback_mode: LINUX_S_IFIFO | 0o600,
                     }
                 }

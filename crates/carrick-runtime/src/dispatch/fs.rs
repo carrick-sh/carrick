@@ -191,18 +191,28 @@ fn get_last_error() -> i32 {
     carrick_portable::errno()
 }
 
-/// Derive a globally-unique carrick pipe id from a host fd's inode, used to
+/// Derive a stable opaque Carrick stream identity from a host fd, used to
 /// stamp BOTH ends of a freshly-created pipe with one shared FASYNC join key.
-/// The host inode is globally unique and is read here at pipe creation (before
-/// any fork), so the value both ends store is identical and fork-stable. Returns
-/// `0` if the fstat fails (FASYNC delivery then degrades for that pipe, never
-/// crashes); `0` is never a valid armed key.
+/// Include both host device and inode: inode numbers are only unique within a
+/// device, and Carrick adopts streams from devfs and several filesystems. The
+/// value is read before fork and copied to the other pipe end, so both ends
+/// retain one Linux identity even though BSD assigns them different inodes.
+/// Returns `0` if fstat fails; `0` is never a valid armed FASYNC key.
 fn host_inode_pipe_id(host_fd: i32) -> u64 {
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     if unsafe { libc::fstat(host_fd, &mut st) } != 0 {
         return 0;
     }
-    st.st_ino as u64
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in (st.st_dev as u64)
+        .to_le_bytes()
+        .into_iter()
+        .chain((st.st_ino as u64).to_le_bytes())
+    {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    if hash == 0 { 1 } else { hash }
 }
 
 fn host_pipe_readable_bytes(host_fd: i32) -> Result<usize, LinuxErrno> {
@@ -5193,12 +5203,12 @@ impl SyscallDispatcher {
             read_base.set_pipe_capacity_cell(Arc::clone(&cap_cell));
             let mut write_base = OpenDescriptionBase::new(LINUX_O_WRONLY | nonblock);
             write_base.set_pipe_capacity_cell(cap_cell);
-            // One globally-unique pipe id shared by BOTH ends — the fork-coherent
-            // FASYNC join key (LTP fcntl31 arms the read end, the forked child
-            // writes the write end). Derived from the read end's host inode:
-            // globally unique, and assigned here at creation before any fork, so
-            // both ends inherit the SAME id. (macOS gives the two ends DIFFERENT
-            // st_ino, so a per-fd inode key would never match across ends.)
+            // One stable pipe id shared by BOTH ends — the fork-coherent FASYNC
+            // join key (LTP fcntl31 arms the read end, the forked child writes
+            // the write end). Derived from the read end's host (device, inode)
+            // pair and assigned before any fork, so both ends inherit the SAME
+            // id. BSD gives the two ends DIFFERENT st_ino values, so a per-fd
+            // inode key would never match across ends.
             let pipe_id = host_inode_pipe_id(host_read);
             let read_open = OpenFile::new(
                 Arc::new(RwLock::new(OpenDescription::HostPipe {
